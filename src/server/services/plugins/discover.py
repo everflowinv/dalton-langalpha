@@ -13,11 +13,20 @@ normalize transports, map ``${VAR}`` credential references into declared
 unchanged. The stored and exported form is always the canonical one.
 """
 
-import json
 import re
 from dataclasses import dataclass
 from typing import Any
 
+# DALTON-HOOK(plugin-json-budget): enforce byte, bracket-depth, node, and output budgets on plugin JSON.
+from src.dalton.plugin_json_budget import (
+    JsonBudgetError,
+    budget_error_sentinel,
+    dumps_json_with_budget,
+    loads_json_with_budget,
+    parse_manifest_with_budget,
+    sanitize_json_surrogates,
+    split_inline_mcp_servers,
+)
 from src.server.models.plugin import Diagnostic
 from src.server.services.plugins.errors import PluginAmbiguous, PluginFatal
 from src.server.services.plugins.extension import NAMESPACE, prefix_problem
@@ -77,28 +86,27 @@ def _read_json(raw: bytes) -> Any:
     encode, so such a string reads as null and each reader drops it as it
     drops any other value it cannot use.
     """
+    # DALTON-HOOK(plugin-json-budget): enforce byte, depth, and node budgets before/after json.loads.
     try:
-        return _encodable(json.loads(raw.decode("utf-8")))
+        doc = loads_json_with_budget(raw, check_surrogates=False)
+    except JsonBudgetError:
+        try:
+            split = split_inline_mcp_servers(raw)
+        except JsonBudgetError:
+            return None
+        if split is None:
+            return None
+        try:
+            doc = loads_json_with_budget(split[0], check_surrogates=False)
+        except (ValueError, RecursionError):
+            return None
     except (ValueError, RecursionError):
         return None
+    return _encodable(doc)
 
 
 def _encodable(value: Any) -> Any:
-    if isinstance(value, str):
-        try:
-            value.encode("utf-8")
-        except UnicodeEncodeError:
-            return None
-        return value
-    if isinstance(value, list):
-        return [_encodable(item) for item in value]
-    if isinstance(value, dict):
-        return {
-            key: _encodable(item)
-            for key, item in value.items()
-            if _encodable(key) is not None
-        }
-    return value
+    return sanitize_json_surrogates(value)
 
 
 def _manifest_preview(raw: bytes) -> tuple[str | None, str | None, str | None]:
@@ -450,8 +458,14 @@ def _synthesize_secrets(
     return list(refs)
 
 
+# DALTON-HOOK(plugin-json-budget): track MCP source target and enforce JSON budgets.
 def _take_mcp_document(
-    out: dict[str, bytes], manifest: dict[str, Any], vendor_dir: str | None
+    out: dict[str, bytes],
+    manifest: dict[str, Any],
+    vendor_dir: str | None,
+    *,
+    manifest_path: str = "plugin.json",
+    mcp_target_out: list[str] | None = None,
 ) -> dict[str, Any] | bytes | None:
     """Find the package's MCP document and take it out of the tree.
 
@@ -465,6 +479,9 @@ def _take_mcp_document(
     """
     declared = manifest.pop("mcpServers", None)
     if isinstance(declared, dict):
+        # DALTON-HOOK(plugin-json-budget): record inline MCP target path for budget diagnostics.
+        if mcp_target_out is not None:
+            mcp_target_out.append(f"{manifest_path} (mcpServers)")
         # The inline form carries the server map itself, not a whole document.
         return {"mcpServers": declared}
     paths: list[str] = []
@@ -480,8 +497,13 @@ def _take_mcp_document(
         raw = out.pop(path, None)
         if raw is None:
             continue
+        if mcp_target_out is not None:
+            mcp_target_out.append(path)
         try:
-            parsed = json.loads(raw.decode("utf-8"))
+            # DALTON-HOOK(plugin-json-budget): enforce byte, depth, and node budgets before/after json.loads.
+            parsed = loads_json_with_budget(raw, target=path)
+        except JsonBudgetError as err:
+            return budget_error_sentinel(err)
         except (ValueError, RecursionError):
             return raw
         return parsed if isinstance(parsed, dict) else raw
@@ -519,15 +541,12 @@ def adapt_dialect(
         )
 
     manifest_raw = out.pop(manifest_path)
-    manifest: dict[str, Any] | None = None
-    try:
-        parsed = json.loads(manifest_raw.decode("utf-8"))
-        if isinstance(parsed, dict):
-            manifest = parsed
-    except (ValueError, RecursionError):
-        pass
+    # DALTON-HOOK(plugin-json-budget): parse manifest with budget and isolate inline mcpServers errors.
+    manifest, manifest_err_raw, inline_mcp_err_raw = parse_manifest_with_budget(
+        manifest_raw, manifest_path=manifest_path
+    )
     if manifest is None:
-        out["plugin.json"] = manifest_raw
+        out["plugin.json"] = manifest_err_raw if manifest_err_raw is not None else manifest_raw
         return out, diagnostics
 
     if _canonical_schema(manifest, PLUGIN_SCHEMA) and canonical:
@@ -546,7 +565,19 @@ def adapt_dialect(
         manifest["author"] = {"name": manifest["author"]}
 
     refs: dict[str, list[dict[str, str]]] = {}
-    mcp_doc = _take_mcp_document(out, manifest, vendor_dir)
+    mcp_targets: list[str] = []
+    mcp_doc = (
+        inline_mcp_err_raw
+        if inline_mcp_err_raw is not None
+        else _take_mcp_document(
+            out,
+            manifest,
+            vendor_dir,
+            manifest_path=manifest_path,
+            mcp_target_out=mcp_targets,
+        )
+    )
+    mcp_target = mcp_targets[-1] if mcp_targets else "mcp.json"
     if isinstance(mcp_doc, bytes):
         out["mcp.json"] = mcp_doc
     elif mcp_doc is not None:
@@ -573,7 +604,11 @@ def adapt_dialect(
                     if isinstance(entry, dict):
                         _adapt_entry(entry)
                         _strip_env_refs(key, entry, refs)
-        out["mcp.json"] = json.dumps(mcp_doc, indent=2).encode("utf-8")
+        # DALTON-HOOK(plugin-json-budget): indent=2 serialization with pre-format output budget.
+        try:
+            out["mcp.json"] = dumps_json_with_budget(mcp_doc, target=mcp_target)
+        except JsonBudgetError as err:
+            out["mcp.json"] = budget_error_sentinel(err)
 
     for var in _synthesize_secrets(manifest, refs):
         targets = ", ".join(
@@ -593,5 +628,9 @@ def adapt_dialect(
             )
         )
 
-    out["plugin.json"] = json.dumps(manifest, indent=2).encode("utf-8")
+    # DALTON-HOOK(plugin-json-budget): indent=2 serialization with pre-format output budget.
+    try:
+        out["plugin.json"] = dumps_json_with_budget(manifest, target=manifest_path)
+    except JsonBudgetError as err:
+        out["plugin.json"] = budget_error_sentinel(err)
     return out, diagnostics

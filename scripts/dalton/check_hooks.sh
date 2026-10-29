@@ -196,6 +196,12 @@ ALLOWED_HOOKS=(
   # Backlog P6a: periodic 3-way browser memory attribution sampler started in
   # the server lifespan (src/server/app/setup.py, src/observability/browser_memory.py).
   "browser-memory-sampler"
+  # P7/A6: plugin discovery, manifest, MCP config, and catalog JSON parsing/
+  # formatting enforce raw byte, pre-parse string-aware bracket depth, post-
+  # parse AST node count, and compact output budgets while isolating inline
+  # mcpServers failures (discover.py, mcp.py, manifest.py, marketplace.py;
+  # src/dalton/plugin_json_budget.py).
+  "plugin-json-budget"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

@@ -65,3 +65,6 @@ tests/unit/ptc_agent/core/sandbox/test_import_name_package_map.py
 web/src/pages/Onboarding/__tests__/deployedTasks.dalton.test.ts
 # Batch 5/F: yfinance fundamentals missing-value output contract (null, not "N/A").
 tests/unit/mcp_servers/test_yf_fundamentals_null.py
+# P7/A6: plugin JSON budget helper and unit tests.
+src/dalton/plugin_json_budget.py
+tests/unit/server/services/test_plugin_json_budget.py
