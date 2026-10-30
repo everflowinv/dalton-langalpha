@@ -18,6 +18,12 @@ HINT = (
     "This turn started on its own: if it finds nothing the user needs to hear, end it with"
     ' schedule_wakeup(quiet="<what you checked and found>") instead of replying.'
 )
+# DALTON-HOOK(wake-reply-language): a turn a wakeup started also carries the
+# reply-language line (R4/21).
+LANG = (
+    "This notice is system wording, not the user's. When you reply, write in the "
+    "language this thread's user writes in."
+)
 LINES = [
     "NVDA pullback: Check 7 of 24 of the series you set at 09:57 EDT. Next check at 10:35 EDT.",
     "NVDA breakdown: NVDA hit your trigger (below $200.00): it traded at $199.85 at 10:31 EDT.",
@@ -33,7 +39,8 @@ def test_several_notices_share_one_block_with_no_quiet_hint():
 
 def test_a_turn_the_wakeup_started_adds_the_quiet_hint_before_the_close():
     block = render_wake_block(LINES, started_turn=True)
-    assert block == "\n".join(["<wakeup>", NOTE, *LINES, HINT, "</wakeup>"])
+    # DALTON-HOOK(wake-reply-language): the language line rides with the hint.
+    assert block == "\n".join(["<wakeup>", NOTE, *LINES, HINT, LANG, "</wakeup>"])
 
 
 def test_the_report_inbox_renders_a_wakeup_group_as_that_block():

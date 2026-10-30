@@ -45,8 +45,9 @@
 | §5 五类预期身份区分 | 指引、卖方一致预期、具体机构预测、买方门槛、作者判断；分歧不取平均 | `~/.openclaw/workspace/skills/bullbear-discussion/SKILL.md`<br>`bullbear-discussion/references/common_task.md` | L73, L76<br>L33–47 |
 | §6 电话会提问口径 | 分析师提问数字未经管理层确认标"分析师提问口径，管理层未确认" | `bullbear-discussion/references/common_task.md` | L40–47 |
 | §7 "本轮未取得" vs "未披露" | 检索未命中写"本轮未取得"，限定在已覆盖范围 | `company-deepdive-mx-0911/references/common_rules.md` | L33 |
-| §8 数字底表原则 | 目标公司数字只取底表，不用相近数字顶替 | `company-deepdive-mx-0911/references/execution.md` | L66–68 |
-| §9–§10 合规口径与引用上限 | 专家合规全文；Guidepoint ≤20 词，其他 ≤3 句 | `bullbear-discussion/references/common_task.md`<br>`docs/dalton/dev-guide/P0D-P1-data-and-onboarding.md` | L136–154<br>§P0-D.2, §P1.1 (L922–930, L937) |
+| §8 推导与事实的边界 | 推算标"推算"+列假设、措辞降级；未披露≠不存在、组合均值不能识别单笔、有限检索不能推出"从不"（三条正反例） | 2026-10-30 生产复盘 R4（AMZN RPO 增量、MSFT RPO 期限、GOOGL 有限检索三案例），`REVIEW_24H_codex.md` §5 | thread 5b546b32 / 6a517794 / 2e02ccfb |
+| §9 数字底表原则 | 目标公司数字只取底表，不用相近数字顶替 | `company-deepdive-mx-0911/references/execution.md` | L66–68 |
+| §10–§11 合规口径与引用上限 | 专家合规全文；Guidepoint ≤20 词，其他 ≤3 句 | `bullbear-discussion/references/common_task.md`<br>`docs/dalton/dev-guide/P0D-P1-data-and-onboarding.md` | L136–154<br>§P0-D.2, §P1.1 (L922–930, L937) |
 
 ---
 

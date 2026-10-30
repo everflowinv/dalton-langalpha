@@ -32,3 +32,6 @@ def test_cancel_rows_and_quiet_hint_are_the_approved_strings():
     assert wording.CANCEL_ROW_SETTING_OFF == approved.CANCEL_ROW_SETTING_OFF
     assert wording.WAKE_QUIET_HINT == approved.WAKE_QUIET_HINT
     assert wording.WAKE_NOTE == approved.WAKE_NOTE
+    # DALTON-HOOK(wake-reply-language): the reply-language line is approved
+    # wording too.
+    assert wording.WAKE_REPLY_LANGUAGE == approved.WAKE_REPLY_LANGUAGE

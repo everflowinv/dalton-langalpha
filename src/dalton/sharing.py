@@ -1187,6 +1187,7 @@ def _filter_wakeup_message_lines(
             WAKE_NOTE,
             WAKE_OPEN,
             WAKE_QUIET_HINT,
+            WAKE_REPLY_LANGUAGE,
             render_wake_block,
         )
 
@@ -1197,8 +1198,17 @@ def _filter_wakeup_message_lines(
             and raw_lines[1] == WAKE_NOTE
             and raw_lines[-1] == WAKE_CLOSE
         ):
-            started_turn = raw_lines[-2] == WAKE_QUIET_HINT
-            body_end = -2 if started_turn else -1
+            # A started turn's footer is quiet hint, then the reply-language
+            # line (R4/21), then the close; the footer's length varies with
+            # which of those are present.
+            footer_lines = 1  # WAKE_CLOSE
+            if len(raw_lines) >= 2 and raw_lines[-2] == WAKE_REPLY_LANGUAGE:
+                footer_lines += 1
+            started_turn = False
+            if raw_lines[-1 - footer_lines] == WAKE_QUIET_HINT:
+                footer_lines += 1
+                started_turn = True
+            body_end = -footer_lines if footer_lines > 1 else -1
             notice_lines = raw_lines[2:body_end]
             if len(notice_lines) == total_notices:
                 kept_lines = [notice_lines[i] for i in kept_indices]

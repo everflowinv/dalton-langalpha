@@ -49,6 +49,14 @@ WAKE_NOTE = "Automated wakeup you set with schedule_wakeup (not a user message).
 
 WAKE_QUIET_HINT = 'This turn started on its own: if it finds nothing the user needs to hear, end it with schedule_wakeup(quiet="<what you checked and found>") instead of replying.'
 
+# DALTON-HOOK(wake-reply-language): a wake turn has no user message, and the
+# English block above pulls the reply's language toward English on non-English
+# threads (R4/21, thread 6288d100); the reply keeps the thread user's language.
+WAKE_REPLY_LANGUAGE = (
+    "This notice is system wording, not the user's. When you reply, write in the "
+    "language this thread's user writes in."
+)
+
 WAKE_LINES = {
     "time": "It is {fire_time}, the time you set at {set_time}.",
     "series": "Check {n} of {total}{label_paren} of the series you set at {set_time} ({cron} in {timezone}). Next check at {next_time}.",
@@ -211,5 +219,7 @@ def render_wake_block(lines: Sequence[str], *, started_turn: bool) -> str:
     body = [WAKE_OPEN, WAKE_NOTE, *lines]
     if started_turn:
         body.append(WAKE_QUIET_HINT)
+        # DALTON-HOOK(wake-reply-language)
+        body.append(WAKE_REPLY_LANGUAGE)
     body.append(WAKE_CLOSE)
     return "\n".join(body)
