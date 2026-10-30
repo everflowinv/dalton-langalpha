@@ -1,6 +1,6 @@
 {
   "name": "dalton-earnings-flash",
-  "description": "财报快讯的完成契约：快讯落盘 research/（不进 drafts/、不发布、无 check_draft）+ 事件五词初判 verdict（对应 dalton-earnings-flash SKILL Step 10、12 与输出模板）。",
+  "description": "财报快讯的完成契约：快讯落盘 research/（不进 drafts/、不发布、无 check_draft）+ 事件五词初判 verdict（对应 dalton-earnings-flash SKILL Step 10、12 与输出模板）。用户指定交付文件名时传 note_path（research/ 下的 .md），快讯核对改按该实际路径。",
   "params_required": [
     "ticker",
     "quarter",
@@ -12,6 +12,7 @@
       "artifacts": [
         {
           "path": "research/{as_of}-flash-{quarter}.md",
+          "path_param": "note_path",
           "min_bytes": 300,
           "variant_glob": "research/*-flash-{quarter}.md",
           "fresh_this_run": true

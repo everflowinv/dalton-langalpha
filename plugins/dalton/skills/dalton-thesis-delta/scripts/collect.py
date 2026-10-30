@@ -7,15 +7,22 @@ collect.py — 每晚 thesis 增量包采集与状态提交脚本（PS.11）
   1. collect --ticker <TICKER> --workspace-dir <DIR> [--since YYYY-MM-DD] [--no-ae] [--no-web]
      - 读取覆盖阈值（优先 <workspace_dir>/research/tracker/thresholds.json，回退 config/default-thresholds.json）
      - 拉取一致预期快照并写入 <workspace_dir>/data/consensus/<YYYY-MM-DD_HHMM>.json
-     - 与上一份一致预期快照比对（若 fetched_at 相同则跳过对比），生成 deltas 与 auto_flags
-     - 检索未在 seen.json 中的六个内部来源（company-wiki, guidepoint, funda-ai, sales-notes, tmtb, alphaengine）与 SEC filing（前推2天）
+     - 与上一份一致预期快照比对（若 fetched_at 相同则跳过对比），生成 deltas 与 auto_flags；
+       跨快照比较先按真实财报期间（period_end）对齐，期间滚动/缺期间信息不算修正，
+       对齐结果见 deltas["period_alignment"] 并在 packet.md 披露
+     - 检索未在 seen.json 中的六个内部来源（company-wiki, guidepoint, funda-ai, sales-notes, tmtb, alphaengine）与 SEC filing（前推2天）；
+       AlphaEngine 按"覆盖边界"窗口采集（窗口起点 = ae_covered_until，翻页达上限
+       未扫完时把 {window, cursor, query} 续采状态写进 packet 的 ae_state）
      - 写入 <workspace_dir>/research/tracker/<run_id>/packet.json 与 packet.md
      - 注意：collect 阶段绝不修改 seen.json
 
   2. commit --workspace-dir <DIR> --run-id <RUN_ID> --material yes|no --summary "..."
      - 读取 <workspace_dir>/research/tracker/<run_id>/packet.json
      - 将本轮所有新文档/公告/帖子 ID 并入 <workspace_dir>/research/tracker/seen.json
-     - 更新 <workspace_dir>/research/tracker/last_run.json
+     - 更新 <workspace_dir>/research/tracker/last_run.json，含 AlphaEngine 状态：
+       ae_covered_until（已完整覆盖到的日期，只在窗口完整扫完时推进，与全局
+       until 解耦——没扫完的区间永远落在下一轮窗口里）与 ae_resume（未扫完时
+       的 {window, cursor, query} 续采状态；本轮未运行 AE 时原样保留上一份）
      - 追加一行记录到 <workspace_dir>/research/tracker/updates.log
 
   3. status --workspace-dir <DIR> [--ticker <TICKER>]
@@ -58,6 +65,60 @@ DEFAULT_SEC_FORMS = [
 INTERNAL_ROUTES = ["company-wiki", "guidepoint", "funda-ai", "sales-notes", "tmtb"]
 ALL_INTERNAL_SOURCES = [*INTERNAL_ROUTES, "alphaengine"]
 _GP_LIBRARY_TS_RE = re.compile(r"library_ts:([A-Za-z0-9-]+)")
+
+# 一致预期快照里可比对的四个相对期间键。同名键在不同快照里可能指向不同真实期间
+# （0q 从 3Q26 滚到 4Q26），跨快照比较必须先按 period_end 对齐，见
+# compute_consensus_deltas。
+_PERIOD_KEYS = ("0q", "+1q", "0y", "+1y")
+
+
+def _period_end_of(row: dict[str, Any]) -> str | None:
+    """从一行预期数据里取真实期间结束日（Yahoo 的 endDate，YYYY-MM-DD）。
+
+    快照行由 fetch_consensus_snapshot 写入 ``period_end``；也接受
+    ``endDate``/``periodEndDate`` 拼写，取不到一律 None——调用方把 None 当
+    "无期间信息"，绝不按同名相对键猜测对齐。"""
+    for key in ("period_end", "endDate", "periodEndDate"):
+        val = row.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()[:10]
+    return None
+
+
+def _period_granularity(per: str) -> str | None:
+    """相对期间键的粒度：``0q/+1q`` 是季度、``0y/+1y`` 是年度，其他 None。
+
+    跨快照配对只在同粒度内进行：Q4 与财年常共用一个结束日，只按结束日配对
+    会把全年 EPS 配到旧季度上（codex r1 #1：+317% 级假修正）。"""
+    if per.endswith("q"):
+        return "q"
+    if per.endswith("y"):
+        return "y"
+    return None
+
+
+def _extract_period_end_dates(ticker_obj: Any) -> dict[str, str]:
+    """从 yfinance 的原始 earningsTrend 列表取每个相对期间的真实结束日。
+
+    Yahoo 的 earningsTrend 每个期间都带 endDate；yfinance 的公开 DataFrame
+    （earnings_estimate / revenue_estimate）在构造时把它丢掉了，所以这里从
+    Analysis 对象缓存的原始列表读回。属性是 yfinance 的内部缓存，版本漂移或
+    结构变化时返回空 dict——下游按"无期间信息"处理，不算修正。"""
+    try:
+        analysis = getattr(ticker_obj, "_analysis", None)
+        trend = getattr(analysis, "_earnings_trend", None)
+    except Exception:  # noqa: BLE001 - 内部属性读取失败即无期间信息
+        return {}
+    out: dict[str, str] = {}
+    if isinstance(trend, list):
+        for item in trend:
+            if not isinstance(item, dict):
+                continue
+            per = item.get("period")
+            end = item.get("endDate")
+            if isinstance(per, str) and per and isinstance(end, str) and end.strip():
+                out[per] = end.strip()[:10]
+    return out
 
 
 def now_et() -> datetime:
@@ -290,6 +351,17 @@ def fetch_consensus_snapshot(ticker: str, benchmark: str = "QQQ") -> dict[str, A
             except Exception as e:
                 out[field] = {"error": str(e)[:200]}
 
+        # 跨快照的预期修正要按真实期间对齐（同名 0q 可能已滚动到下一季度），
+        # 把 Yahoo 原始 trend 里的 endDate 盖章进两张预期表；取不到就不盖，
+        # compute_consensus_deltas 按"无期间信息"拒绝比较。
+        period_ends = _extract_period_end_dates(t)
+        for field in ("earnings_estimate", "revenue_estimate"):
+            table = out.get(field)
+            if isinstance(table, dict) and period_ends:
+                for per, row in table.items():
+                    if isinstance(row, dict) and period_ends.get(per):
+                        row["period_end"] = period_ends[per]
+
         try:
             out["price_targets"] = clean_val(dict(t.analyst_price_targets or {}))
         except Exception as e:
@@ -356,38 +428,71 @@ def compute_consensus_deltas(
         "down": rev_1y.get("downLast7Days"),
     }
 
-    # 若 prev 存在且 fetched_at 与 cur 不同（排除周末/节假日未更新快照），计算对上次运行的变化
+    # 若 prev 存在且 fetched_at 与 cur 不同（排除周末/节假日未更新快照），计算对上次运行的变化。
+    # 跨快照比较先按真实财报期间（period_end）对齐：同名 0q/+1q 在两份快照里可能已是
+    # 不同季度（0q 从 3Q26 滚到 4Q26），同名直减会把期间滚动误报成预期上修/下修。
+    # 对不齐（滚动、任一侧无期间信息）的期间不算 vs_last，对齐结果记入
+    # deltas["period_alignment"] 供 packet 披露。
     if prev and prev.get("fetched_at") != cur.get("fetched_at"):
-        cur_ee = cur.get("earnings_estimate") if isinstance(cur.get("earnings_estimate"), dict) else {}
-        prev_ee = prev.get("earnings_estimate") if isinstance(prev.get("earnings_estimate"), dict) else {}
-        cur_re = cur.get("revenue_estimate") if isinstance(cur.get("revenue_estimate"), dict) else {}
-        prev_re = prev.get("revenue_estimate") if isinstance(prev.get("revenue_estimate"), dict) else {}
         top_cur_ccy = str(cur.get("currency") or "").strip().upper()
         top_prev_ccy = str(prev.get("currency") or "").strip().upper()
-        for per in ("0q", "+1q", "0y", "+1y"):
-            cur_e_row = cur_ee.get(per) if isinstance(cur_ee.get(per), dict) else {}
-            prev_e_row = prev_ee.get(per) if isinstance(prev_ee.get(per), dict) else {}
-            c_e_ccy = str(cur_e_row.get("currency") or top_cur_ccy).strip().upper()
-            p_e_ccy = str(prev_e_row.get("currency") or top_prev_ccy).strip().upper()
-            if c_e_ccy and p_e_ccy and c_e_ccy != p_e_ccy:
-                deltas[f"eps_{per}_vs_last_pct"] = None
-                deltas["currency_mismatch"] = True
-            else:
-                c_e = cur_e_row.get("avg")
-                p_e = prev_e_row.get("avg")
-                deltas[f"eps_{per}_vs_last_pct"] = pct_diff(c_e, p_e)
-
-            cur_r_row = cur_re.get(per) if isinstance(cur_re.get(per), dict) else {}
-            prev_r_row = prev_re.get(per) if isinstance(prev_re.get(per), dict) else {}
-            c_r_ccy = str(cur_r_row.get("currency") or top_cur_ccy).strip().upper()
-            p_r_ccy = str(prev_r_row.get("currency") or top_prev_ccy).strip().upper()
-            if c_r_ccy and p_r_ccy and c_r_ccy != p_r_ccy:
-                deltas[f"rev_{per}_vs_last_pct"] = None
-                deltas["currency_mismatch"] = True
-            else:
-                c_r = cur_r_row.get("avg")
-                p_r = prev_r_row.get("avg")
-                deltas[f"rev_{per}_vs_last_pct"] = pct_diff(c_r, p_r)
+        period_alignment: dict[str, Any] = {}
+        for table_key, prefix in (("earnings_estimate", "eps"), ("revenue_estimate", "rev")):
+            cur_tbl = cur.get(table_key) if isinstance(cur.get(table_key), dict) else {}
+            prev_tbl = prev.get(table_key) if isinstance(prev.get(table_key), dict) else {}
+            alignment: dict[str, Any] = {}
+            period_alignment[table_key] = alignment
+            # 期间身份 =（粒度, 结束日）：Q4 与财年常共用一个结束日，跨粒度配对
+            # 会把全年预期配到旧季度上，产生百分之几百的假修正。
+            prev_by_period: dict[tuple[str, str], tuple[str, dict[str, Any]]] = {}
+            for prev_key, prev_row in prev_tbl.items():
+                if not isinstance(prev_row, dict):
+                    continue
+                prev_end = _period_end_of(prev_row)
+                prev_gran = _period_granularity(str(prev_key))
+                if prev_end and prev_gran and (prev_gran, prev_end) not in prev_by_period:
+                    prev_by_period[(prev_gran, prev_end)] = (str(prev_key), prev_row)
+            for per in _PERIOD_KEYS:
+                cur_row = cur_tbl.get(per) if isinstance(cur_tbl.get(per), dict) else {}
+                cur_end = _period_end_of(cur_row)
+                cur_gran = _period_granularity(per)
+                delta_key = f"{prefix}_{per}_vs_last_pct"
+                if cur_end is None or cur_gran is None:
+                    alignment[per] = {"compare": "no_period_info", "side": "current"}
+                    deltas[delta_key] = None
+                    continue
+                if not prev_by_period:
+                    alignment[per] = {"compare": "no_period_info", "side": "previous"}
+                    deltas[delta_key] = None
+                    continue
+                if (cur_gran, cur_end) not in prev_by_period:
+                    # 期间滚动：本次 0q 的真实期间在上一份快照的任何键下都不存在
+                    # （上一份是更早的季度/年度），不算修正，只标注。
+                    rolled: dict[str, Any] = {"compare": "rolled", "cur_period_end": cur_end}
+                    prev_same_key_row = (
+                        prev_tbl.get(per) if isinstance(prev_tbl.get(per), dict) else {}
+                    )
+                    prev_same_end = _period_end_of(prev_same_key_row)
+                    if prev_same_end:
+                        rolled["prev_same_key_period_end"] = prev_same_end
+                    alignment[per] = rolled
+                    deltas[delta_key] = None
+                    continue
+                # 同粒度下同一真实期间在上一份里可能挂在别的相对键下（上一份的
+                # +1q 就是本次滚动后的 0q）——对齐后比较才是真正的预期修正。
+                matched_key, prev_row = prev_by_period[(cur_gran, cur_end)]
+                matched: dict[str, Any] = {"compare": "matched", "period_end": cur_end}
+                if matched_key != per:
+                    matched["prev_key"] = matched_key
+                alignment[per] = matched
+                cur_ccy = str(cur_row.get("currency") or top_cur_ccy).strip().upper()
+                prev_ccy = str(prev_row.get("currency") or top_prev_ccy).strip().upper()
+                if cur_ccy and prev_ccy and cur_ccy != prev_ccy:
+                    deltas[delta_key] = None
+                    deltas["currency_mismatch"] = True
+                else:
+                    deltas[delta_key] = pct_diff(cur_row.get("avg"), prev_row.get("avg"))
+        deltas["period_alignment"] = period_alignment
 
         cur_pt = (cur.get("price_targets") or {}).get("mean") if isinstance(cur.get("price_targets"), dict) else None
         prev_pt = (prev.get("price_targets") or {}).get("mean") if isinstance(prev.get("price_targets"), dict) else None
@@ -1119,14 +1224,167 @@ def can_short_circuit(
     return total_new == 0
 
 
+def _is_cursor_invalid_error(res: dict[str, Any], data: dict[str, Any]) -> bool:
+    """游标不可复用的两类错误（researchdata_bridge 的既有分类）：
+    e_cursor_expired（已失效或过期）与 e_cursor_filter_mismatch（翻页筛选条件
+    与签发时不一致——日期窗口、查询词任一变化都会触发，生产契约见
+    dalton-conventions/references/evidence-and-sources.md:170）。两者都要求
+    丢弃 cursor 从窗口起点重查、禁止重复提交旧 cursor。"""
+    code = str(data.get("error_code") or "").strip().lower()
+    text = str(res.get("error") or data.get("error") or "").strip().lower()
+    for token in ("e_cursor_expired", "e_cursor_filter_mismatch"):
+        if token in code or token in text:
+            return True
+    return "已失效或过期" in text or "保持与上一页完全相同的" in text
+
+
+def _scan_alphaengine_pages(
+    meta: dict[str, Any],
+    since: str,
+    until: str,
+    start_cursor: str | None = None,
+    budget: int = MAX_CURSOR_PAGES,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """跑一轮 AlphaEngine 游标翻页，返回 (items, scan)。
+
+    ``budget`` 是本段扫描的页数上限（调用方在"先续扫原窗口、再扫新窗口"的两段
+    式采集里分配总预算，全轮仍受 MAX_CURSOR_PAGES 约束）。``start_cursor``
+    只能与签发它的原窗口一起使用（调用方负责原样重放）。游标失效
+    （e_cursor_expired / e_cursor_filter_mismatch）时：预算尚有余量则丢弃
+    cursor 从窗口起点重扫（已取页作废）；预算已尽则保持未完成——已取页照常
+    入包、resume 无 cursor（下轮从窗口起点重扫）。seen 去重由调用方负责。
+    scan 含 ok/completed/incomplete/pages/has_more/cursor/status/error/
+    incomplete_reason/total_upstream/cursor_invalid_restart。"""
+    budget = max(0, min(int(budget), MAX_CURSOR_PAGES))
+    base_tool_name, base_req_args = build_internal_route_request("alphaengine", meta, since, until)
+    items: list[dict[str, Any]] = []
+    cursor: str | None = start_cursor
+    pages_fetched = 0
+    ok = True
+    err_msg: str | None = None
+    status_val: Any = "ok"
+    incomplete = False
+    incomplete_reason: str | None = None
+    last_has_more = start_cursor is not None
+    total_upstream: Any = None
+    cursor_invalid_restart = False
+
+    while pages_fetched < budget:
+        req_args = json.loads(json.dumps(base_req_args))
+        sent_cursor = cursor
+        if sent_cursor:
+            req_args.setdefault("params", {})["cursor"] = sent_cursor
+        res = call_bridge_jsonrpc(base_tool_name, req_args)
+        pages_fetched += 1
+        data = res.get("data") if isinstance(res.get("data"), dict) else {}
+        page_items, page_info = _extract_route_items_with_page_info(data)
+        page_ok = bool(res.get("ok", False))
+        page_err = res.get("error") or data.get("error")
+        page_status = data.get("status") or res.get("status")
+        page_has_more = bool(page_info.get("has_more"))
+        page_cursor = page_info.get("cursor")
+        if page_info.get("total_upstream") is not None:
+            total_upstream = page_info.get("total_upstream")
+
+        if not page_ok and _is_bridge_no_match(res, data):
+            # 无匹配（或中间空页）视为上游已正常响应
+            page_ok = True
+            page_err = None
+            page_status = "empty" if not page_has_more else "ok"
+
+        if not page_ok:
+            if sent_cursor and _is_cursor_invalid_error(res, data) and not cursor_invalid_restart:
+                if pages_fetched >= budget:
+                    # 预算已尽：本轮不再重扫——保持未完成，已取页照常入包，
+                    # cursor 丢弃（下轮从窗口起点重扫，seen 去重兜底）。
+                    ok = True
+                    err_msg = str(page_err or page_status or "unknown_error")
+                    status_val = "incomplete"
+                    incomplete = True
+                    cursor = None
+                    incomplete_reason = (
+                        f"未完成: 第 {pages_fetched} 页游标失效（{err_msg}），"
+                        "本轮预算已尽，下轮从窗口起点重扫"
+                    )
+                    break
+                # 预算尚有余量：丢弃 cursor，从窗口起点重扫（本轮总预算不重置），
+                # 已取页作废，seen 去重兜底。
+                cursor_invalid_restart = True
+                items = []
+                cursor = None
+                last_has_more = False
+                ok = True
+                err_msg = None
+                status_val = "ok"
+                incomplete = False
+                incomplete_reason = None
+                continue
+            ok = False
+            err_msg = str(page_err or page_status or "unknown_error")
+            status_val = page_status or "error"
+            if pages_fetched > 1 or last_has_more:
+                incomplete = True
+                incomplete_reason = f"未完成: 第 {pages_fetched} 页取数失败（{err_msg}）"
+            break
+
+        items.extend(page_items)
+        status_val = page_status or "ok"
+        last_has_more = page_has_more
+        cursor = page_cursor
+
+        if not page_has_more:
+            break
+
+        if not page_cursor:
+            incomplete = True
+            incomplete_reason = "未完成: 上游返回 has_more=true 但缺少下一页 cursor"
+            status_val = "incomplete"
+            break
+
+        if pages_fetched >= budget:
+            incomplete = True
+            incomplete_reason = (
+                f"未完成: 已达本轮翻页预算（{budget} 页）但 has_more 仍为 true"
+            )
+            status_val = "incomplete"
+            break
+
+    scan = {
+        "ok": ok,
+        "completed": bool(ok and not incomplete),
+        "incomplete": incomplete,
+        "pages": pages_fetched,
+        "has_more": last_has_more,
+        "cursor": cursor,
+        "status": "incomplete" if incomplete else status_val,
+        "error": err_msg,
+    }
+    if cursor_invalid_restart:
+        scan["cursor_invalid_restart"] = True
+    if total_upstream is not None:
+        scan["total_upstream"] = total_upstream
+    if incomplete_reason:
+        scan["incomplete_reason"] = incomplete_reason
+    return items, scan
+
+
 def collect_internal_and_ae(
     meta: dict[str, Any],
     since: str,
     until: str,
     seen: set[str],
     skip_ae: bool = False,
+    ae_covered_until: str | None = None,
+    ae_resume: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """采集六个内部研究来源（company-wiki, guidepoint, funda-ai, sales-notes, tmtb, alphaengine）新增文档。"""
+    """采集六个内部研究来源（company-wiki, guidepoint, funda-ai, sales-notes, tmtb, alphaengine）新增文档。
+
+    AlphaEngine 的窗口与进度按"覆盖边界"模型运行：本轮窗口起点 =
+    ``ae_covered_until``（已完整覆盖到的日期；``build_internal_route_request``
+    内部再前推 3 天安全回看，seen 去重），终点 = 本轮 ``until``。窗口没扫完时
+    边界不动，未扫区间因此永远落在下一轮窗口里；上一轮留下的 ``ae_resume``
+    （cursor + 窗口 + 查询词）在窗口起点与查询词一致时从 cursor 续扫，否则丢弃
+    cursor 从窗口起点重扫。"""
     internal_new: dict[str, Any] = {}
     internal_status: dict[str, Any] = {}
     ae_new: dict[str, Any] = {}
@@ -1257,105 +1515,138 @@ def collect_internal_and_ae(
                 }
 
     if skip_ae:
-        ae_status.append({"skipped": "--no-ae", "ok": True})
-        internal_status["alphaengine"] = {"ok": True, "skipped": "--no-ae", "status": "skipped"}
+        # 本轮没跑 AE：把本轮起算用的覆盖边界与上一份续采状态原样带回 commit
+        # （旧格式状态首次迁移时固化由旧 until 推出的初始边界，不得写 null）。
+        skipped_state = {
+            "ran": False,
+            "covered_until": str(ae_covered_until or since),
+            "resume": ae_resume if isinstance(ae_resume, dict) else None,
+        }
+        ae_status.append({"skipped": "--no-ae", "ok": True, "ae_state": skipped_state})
+        internal_status["alphaengine"] = {
+            "ok": True,
+            "skipped": "--no-ae",
+            "status": "skipped",
+            "ae_state": skipped_state,
+        }
     else:
-        base_tool_name, base_req_args = build_internal_route_request("alphaengine", meta, since, until)
+        # 覆盖边界 C：本轮窗口 = [C, 本轮 until]（route 构造内部再前推 3 天安全
+        # 回看，seen 去重）；边界只在窗口完整扫完时推进，与全局 last_run.until
+        # 解耦——没扫完的区间永远落在下一轮窗口里。
+        boundary = min(str(ae_covered_until or since), until)
+        # cursor 只对签发它的那组筛选条件有效（evidence-and-sources.md:170）：
+        # 续采必须原样重放签发窗口 {since, until} + 查询词，不能换成本轮 until，
+        # 否则上游返回 e_cursor_filter_mismatch。查询词变化则 cursor 作废。
+        resume_window: tuple[str, str] | None = None
+        resume_cursor: str | None = None
+        if isinstance(ae_resume, dict) and str(ae_resume.get("query") or "") == str(
+            meta.get("name") or ""
+        ):
+            rwin = ae_resume.get("window") if isinstance(ae_resume.get("window"), dict) else {}
+            if rwin.get("since") and rwin.get("until"):
+                resume_window = (str(rwin["since"]), str(rwin["until"]))
+                raw_cur = ae_resume.get("cursor")
+                resume_cursor = str(raw_cur) if raw_cur else None
+
+        # 两段式：先续扫签发 cursor 的原窗口；原窗口完整扫完且预算有余量时，
+        # 再扫新窗口 [推进后的边界, 本轮 until]，否则新窗口留到下一轮。
         items: list[dict[str, Any]] = []
-        cursor: str | None = None
-        pages_fetched = 0
-        ok = True
-        err_msg: str | None = None
-        status_val: Any = "ok"
-        incomplete = False
-        incomplete_reason: str | None = None
-        last_has_more = False
-        total_upstream: Any = None
-
-        while pages_fetched < MAX_CURSOR_PAGES:
-            req_args = json.loads(json.dumps(base_req_args))
-            if cursor:
-                req_args.setdefault("params", {})["cursor"] = cursor
-            res = call_bridge_jsonrpc(base_tool_name, req_args)
-            pages_fetched += 1
-            data = res.get("data") if isinstance(res.get("data"), dict) else {}
-            page_items, page_info = _extract_route_items_with_page_info(data)
-            page_ok = bool(res.get("ok", False))
-            page_err = res.get("error") or data.get("error")
-            page_status = data.get("status") or res.get("status")
-            page_has_more = bool(page_info.get("has_more"))
-            page_cursor = page_info.get("cursor")
-            if page_info.get("total_upstream") is not None:
-                total_upstream = page_info.get("total_upstream")
-
-            if not page_ok and _is_bridge_no_match(res, data):
-                # 无匹配（或中间空页）视为上游已正常响应
-                page_ok = True
-                page_err = None
-                page_status = "empty" if not page_has_more else "ok"
-
-            if not page_ok:
-                ok = False
-                err_msg = str(page_err or page_status or "unknown_error")
-                status_val = page_status or "error"
-                if pages_fetched > 1 or last_has_more:
-                    incomplete = True
-                    incomplete_reason = f"未完成: 第 {pages_fetched} 页取数失败（{err_msg}）"
+        scans: list[tuple[tuple[str, str], dict[str, Any]]] = []
+        pages_total = 0
+        covered = boundary
+        resume_out: dict[str, Any] | None = None
+        deferred_reason: str | None = None
+        queue: list[tuple[str, str, str | None]] = []
+        if resume_window is not None:
+            queue.append((resume_window[0], resume_window[1], resume_cursor))
+        else:
+            queue.append((boundary, until, None))
+        while queue:
+            w_since, w_until, w_cursor = queue.pop(0)
+            w_items, scan = _scan_alphaengine_pages(
+                meta,
+                w_since,
+                w_until,
+                start_cursor=w_cursor,
+                budget=MAX_CURSOR_PAGES - pages_total,
+            )
+            items.extend(w_items)
+            pages_total += int(scan.get("pages") or 0)
+            scans.append(((w_since, w_until), scan))
+            if not scan["completed"]:
+                # 未扫完：进度停在已扫到的位置——resume 保留本段窗口（cursor 为
+                # None 表示下轮从该窗口起点重扫）。
+                resume_out = {
+                    "window": {"since": w_since, "until": w_until},
+                    "cursor": scan.get("cursor"),
+                    "query": meta["name"],
+                }
                 break
+            covered = max(covered, w_until)
+            if resume_window is not None and w_until < until and pages_total < MAX_CURSOR_PAGES:
+                # 原窗口扫完、预算有余：追扫新窗口（起点 = 推进后的边界）。
+                queue.append((covered, until, None))
+                resume_window = None  # 只追加一次
 
-            items.extend(page_items)
-            status_val = page_status or "ok"
-            last_has_more = page_has_more
-            cursor = page_cursor
+        ok = all(bool(s.get("ok")) for _, s in scans)
+        # 原窗口续扫完成但新窗口因预算耗尽未扫（covered < until）：同样未完成，
+        # 新窗口留到下一轮（resume=None，下轮窗口从推进后的边界起算）。
+        incomplete = resume_out is not None or covered < until
+        if incomplete and resume_out is None:
+            deferred_reason = (
+                f"未完成: 原窗口已扫完、本轮预算已尽，新窗口 [{covered}, {until}] 留待下轮"
+            )
+        err_msg = next((s.get("error") for _, s in reversed(scans) if s.get("error")), None)
+        incomplete_reason = next(
+            (s.get("incomplete_reason") for _, s in reversed(scans) if s.get("incomplete_reason")),
+            deferred_reason,
+        )
+        status_val = "incomplete" if incomplete else next(
+            (s.get("status") for _, s in reversed(scans) if s.get("status")), "ok"
+        )
+        total_upstream = next(
+            (s.get("total_upstream") for _, s in reversed(scans) if s.get("total_upstream") is not None),
+            None,
+        )
+        last_scan = scans[-1][1] if scans else {}
 
-            if not page_has_more:
-                break
-
-            if not page_cursor:
-                incomplete = True
-                incomplete_reason = "未完成: 上游返回 has_more=true 但缺少下一页 cursor"
-                status_val = "incomplete"
-                break
-
-            if pages_fetched >= MAX_CURSOR_PAGES:
-                incomplete = True
-                incomplete_reason = (
-                    f"未完成: 已达单源翻页上限（{MAX_CURSOR_PAGES} 页）但 has_more 仍为 true"
-                )
-                status_val = "incomplete"
-                break
+        # 毫无进展的失败轮（首页即失败且窗口起点=终点一类）与 skip 同样处理：
+        # 带回本轮起算用的边界与上一份续采状态——旧格式状态首次迁移时固化，
+        # 不留 null（codex r2 #3）。
+        ran = bool(ok or incomplete)
+        ae_state: dict[str, Any] = {"ran": ran}
+        if ran:
+            ae_state["covered_until"] = covered
+            ae_state["resume"] = resume_out
+        else:
+            ae_state["covered_until"] = boundary
+            ae_state["resume"] = ae_resume if isinstance(ae_resume, dict) else None
 
         ae_status_entry: dict[str, Any] = {
             "query": meta["name"],
             "ok": ok,
             "completed": bool(ok and not incomplete),
             "incomplete": incomplete,
-            "pages": pages_fetched,
-            "has_more": last_has_more,
-            "cursor": cursor,
+            "pages": pages_total,
+            "has_more": bool(last_scan.get("has_more")),
+            "cursor": last_scan.get("cursor"),
             "returned": len(items),
-            "status": "incomplete" if incomplete else status_val,
+            "status": status_val,
             "error": err_msg,
+            "ae_state": ae_state,
         }
+        if resume_cursor is not None:
+            ae_status_entry["resumed_from_cursor"] = resume_cursor
+        if any(s.get("cursor_invalid_restart") for _, s in scans):
+            ae_status_entry["cursor_invalid_restart"] = True
+        int_ae_entry: dict[str, Any] = dict(ae_status_entry)
         if total_upstream is not None:
             ae_status_entry["total_upstream"] = total_upstream
+            int_ae_entry["total_upstream"] = total_upstream
         if incomplete_reason:
             ae_status_entry["incomplete_reason"] = incomplete_reason
+            int_ae_entry["incomplete_reason"] = incomplete_reason
         ae_status.append(ae_status_entry)
-
-        int_ae_entry: dict[str, Any] = {
-            "ok": ok,
-            "completed": bool(ok and not incomplete),
-            "incomplete": incomplete,
-            "pages": pages_fetched,
-            "has_more": last_has_more,
-            "cursor": cursor,
-            "returned": len(items),
-            "status": "incomplete" if incomplete else status_val,
-            **({"error": err_msg} if err_msg else {}),
-            **({"incomplete_reason": incomplete_reason} if incomplete_reason else {}),
-            **({"total_upstream": total_upstream} if total_upstream is not None else {}),
-        }
         internal_status["alphaengine"] = int_ae_entry
 
         for r in items:
@@ -1496,6 +1787,34 @@ def render_packet_md(pk: dict[str, Any]) -> str:
         lines.append(f"- **目标价**：均值 {pt.get('mean')}｜中位数 {pt.get('median')}｜区间 {pt.get('low')} 至 {pt.get('high')}")
     lines.append(f"- **修正差值（deltas）**：`{json.dumps(pk.get('deltas') or {}, ensure_ascii=False)}`")
 
+    # 与上一份快照比较时的期间对齐披露：滚动与无期间信息都不算修正，必须让
+    # 分析师看见"为什么没有 vs_last 数字"，而不是当成数据缺失去补采。
+    pa = pk.get("deltas", {}).get("period_alignment") if isinstance(pk.get("deltas"), dict) else None
+    if isinstance(pa, dict) and pa:
+        lines.append("- **期间对齐（较上次运行的变化先按真实财报期间匹配）**：")
+        for table, align in pa.items():
+            if not isinstance(align, dict):
+                continue
+            for per, info in align.items():
+                if not isinstance(info, dict):
+                    continue
+                if info.get("compare") == "rolled":
+                    old_end = info.get("prev_same_key_period_end") or "未知"
+                    lines.append(
+                        f"  - 期间滚动：{table} {per} 由截至 {old_end} 滚动到截至 "
+                        f"{info.get('cur_period_end')}，是统计窗口前移，不算预期修正，未计算较上次变化"
+                    )
+                elif info.get("compare") == "no_period_info":
+                    side = "旧快照" if info.get("side") == "previous" else "本次快照"
+                    lines.append(
+                        f"  - {side}无期间信息，{table} {per} 无法按真实期间比较，未计算较上次变化"
+                    )
+                elif info.get("compare") == "matched" and info.get("prev_key"):
+                    lines.append(
+                        f"  - {table} {per} 与上一份快照的 {info['prev_key']} 是同一期间"
+                        f"（截至 {info.get('period_end')}），较上次变化即对该期间计算"
+                    )
+
     lines.extend(["", "## 三、内部库新文档（company-wiki / guidepoint / funda-ai / sales-notes / tmtb）"])
     int_status = internal_obj.get("status") if isinstance(internal_obj.get("status"), dict) else {}
     if int_status:
@@ -1535,6 +1854,29 @@ def render_packet_md(pk: dict[str, Any]) -> str:
     ae_st_entry = int_status.get("alphaengine")
     if isinstance(ae_st_entry, dict) and not ae_st_entry.get("ok", False):
         lines.append(f"- ⚠️ **alphaengine 本轮取数失败（{ae_st_entry.get('error') or ae_st_entry.get('status') or 'unknown_error'}）**")
+    ae_state = ae_st_entry.get("ae_state") if isinstance(ae_st_entry, dict) else None
+    ae_resume_out = (
+        ae_state.get("resume") if isinstance(ae_state, dict) and isinstance(ae_state.get("resume"), dict) else None
+    )
+    if isinstance(ae_resume_out, dict):
+        rwin = ae_resume_out.get("window") if isinstance(ae_resume_out.get("window"), dict) else {}
+        cur = ae_resume_out.get("cursor")
+        cur_part = (
+            f"已扫至 cursor `{cur}` 之后仍有更多文档" if cur else "无有效 cursor（本轮游标失效或首页即失败）"
+        )
+        lines.append(
+            f"- ⚠️ **alphaengine 本轮未扫完**：窗口 {rwin.get('since')} 至 {rwin.get('until')} "
+            f"{cur_part}；覆盖边界停在 "
+            f"{ae_state.get('covered_until') if isinstance(ae_state, dict) else '?'}，"
+            "下轮窗口仍从该边界起算并优先从 cursor 续扫（游标只对签发它的原窗口有效，"
+            "失效或失配则从窗口起点重扫），未扫区间的文档不会丢；"
+            "本轮报告必须披露该来源不完整，不得当作'本轮无新文档'"
+        )
+    elif isinstance(ae_st_entry, dict) and ae_st_entry.get("resumed_from_cursor"):
+        lines.append(
+            f"- **续采完成**：从上一轮 cursor `{ae_st_entry.get('resumed_from_cursor')}` "
+            "续扫，窗口已完整覆盖"
+        )
     ae_new = ae_obj.get("new") or {}
     if ae_new:
         for did, info in ae_new.items():
@@ -1574,6 +1916,17 @@ def latest_previous_snapshot(consensus_dir: Path, current_file: Path, last_run_h
     if not files:
         return None
     return load_json(files[-1], None)
+
+
+def _ae_state_of(last_run: dict[str, Any]) -> tuple[str | None, dict[str, Any] | None]:
+    """读 last_run.json 里 AlphaEngine 的（覆盖边界, 续采状态）。
+
+    覆盖边界 ``ae_covered_until`` 是已完整扫完的日期（不含未扫完窗口）；旧状态
+    文件没有该键时由调用方以旧 ``until`` 兜底。``ae_resume`` 为 None 表示没有
+    待续采的游标。"""
+    covered = last_run.get("ae_covered_until")
+    resume = last_run.get("ae_resume") if isinstance(last_run.get("ae_resume"), dict) else None
+    return (str(covered) if covered else None), resume
 
 
 def cmd_collect(args: argparse.Namespace) -> int:
@@ -1630,8 +1983,20 @@ def cmd_collect(args: argparse.Namespace) -> int:
 
     prev_snap = latest_previous_snapshot(P["consensus"], snap_path, last_run.get("snapshot_file"), ws_dir)
 
-    # 2. 检索内部库、AlphaEngine、SEC
-    internal_data, ae_data = collect_internal_and_ae(meta, since, until, seen, skip_ae=args.no_ae)
+    # 2. 检索内部库、AlphaEngine、SEC；AlphaEngine 按"覆盖边界"窗口采集：
+    #    窗口起点 = ae_covered_until（旧状态文件没有该键时以旧 until 兜底）
+    ae_covered_until, ae_resume_prev = _ae_state_of(last_run)
+    if not ae_covered_until:
+        ae_covered_until = str(last_run.get("until") or since)
+    internal_data, ae_data = collect_internal_and_ae(
+        meta,
+        since,
+        until,
+        seen,
+        skip_ae=args.no_ae,
+        ae_covered_until=ae_covered_until,
+        ae_resume=ae_resume_prev,
+    )
     sec_data = collect_sec_filings(meta, since, seen)
 
     # 3. 计算一致预期变化与自动触发提示
@@ -1653,6 +2018,12 @@ def cmd_collect(args: argparse.Namespace) -> int:
     )
 
     rel_snap = str(snap_path.relative_to(ws_dir))
+    ae_status_now = internal_data["status"].get("alphaengine")
+    ae_state = (
+        ae_status_now.get("ae_state")
+        if isinstance(ae_status_now, dict) and isinstance(ae_status_now.get("ae_state"), dict)
+        else {"ran": False}
+    )
     packet = {
         "ticker": ticker,
         "run_id": run_id,
@@ -1667,6 +2038,9 @@ def cmd_collect(args: argparse.Namespace) -> int:
         "all_sources_ok": all_sources_ok,
         "failed_sources": failed_sources,
         "short_circuit_eligible": short_circuit_eligible,
+        # AE 覆盖边界与续采状态：ran=false（--no-ae / 首页即失败）时 commit 原样
+        # 保留上一份状态；代理在报告里须按 packet.md 的披露说明该来源本轮不完整。
+        "ae_state": ae_state,
         "internal_status": internal_data["status"],
         "internal": internal_data,
         "alphaengine": ae_data,
@@ -1695,6 +2069,7 @@ def cmd_collect(args: argparse.Namespace) -> int:
         "internal_status": internal_data["status"],
         "alphaengine_status": ae_data["status"],
         "sec_status": sec_data["status"],
+        "ae_state": ae_state,
         "counts": {
             "internal": len(internal_data["new"]),
             "alphaengine": len(ae_data["new"]),
@@ -1730,6 +2105,23 @@ def cmd_commit(args: argparse.Namespace) -> int:
     dump_json(P["seen"], sorted(seen))
 
     committed_at = now_et().isoformat()
+    # AE 状态：packet 的 ae_state 总是携带本轮结算值（ran=false 的跳过轮/失败轮
+    # 也带回本轮起算用的覆盖边界与上一份续采状态——旧格式状态首次迁移时固化，
+    # 不写 null）；只有旧 packet（无 ae_state）才从上一份 last_run 原样保留。
+    ae_state = pk.get("ae_state") if isinstance(pk.get("ae_state"), dict) else {}
+    if ae_state.get("covered_until"):
+        ae_covered_until = ae_state.get("covered_until")
+        ae_resume_out = (
+            ae_state.get("resume") if isinstance(ae_state.get("resume"), dict) else None
+        )
+    else:
+        prev_last_run = load_json(P["last_run"], {})
+        ae_covered_until = prev_last_run.get("ae_covered_until")
+        ae_resume_out = (
+            prev_last_run.get("ae_resume")
+            if isinstance(prev_last_run.get("ae_resume"), dict)
+            else None
+        )
     last_run_obj = {
         "ticker": pk.get("ticker") or args.ticker,
         "run_id": args.run_id,
@@ -1739,6 +2131,11 @@ def cmd_commit(args: argparse.Namespace) -> int:
         "snapshot_file": pk.get("snapshot_file"),
         "material": args.material,
         "summary": args.summary.strip(),
+        # AlphaEngine 覆盖边界（只在窗口完整扫完时推进，与全局 until 解耦）与
+        # 未扫完时的续采状态（cursor 绑定签发它的原窗口）；旧状态文件没有这
+        # 两个键时 collect 以旧 until 兜底并在首轮固化。
+        "ae_covered_until": ae_covered_until,
+        "ae_resume": ae_resume_out,
     }
     dump_json(P["last_run"], last_run_obj)
 
@@ -1793,26 +2190,47 @@ def cmd_self_test() -> int:
 
     prev = {
         "fetched_at": "2026-10-17T21:00:00-04:00",
-        "earnings_estimate": {"+1y": {"avg": 30.0}},
-        "revenue_estimate": {"+1y": {"avg": 200e9}},
+        "earnings_estimate": {"+1y": {"avg": 30.0, "period_end": "2027-12-31"}},
+        "revenue_estimate": {"+1y": {"avg": 200e9, "period_end": "2027-12-31"}},
         "price_targets": {"mean": 600.0},
     }
     cur = {
         "fetched_at": "2026-10-18T21:00:00-04:00",
-        "earnings_estimate": {"+1y": {"avg": 30.6}},  # +2.0% vs last
-        "revenue_estimate": {"+1y": {"avg": 202e9}},  # +1.0% vs last
+        "earnings_estimate": {
+            "+1y": {"avg": 30.6, "period_end": "2027-12-31"},  # +2.0% vs last
+            # 0q 滚动：上一份 0q 截至 2026-09-30，本次 0q 截至 2026-12-31，
+            # 同名直减会得到 +3.39% 的假上修，必须拒绝。
+            "0q": {"avg": 1.03, "period_end": "2026-12-31"},
+        },
+        "revenue_estimate": {
+            "+1y": {"avg": 202e9, "period_end": "2027-12-31"},  # +1.0% vs last
+            "0q": {"avg": 2.07e9, "period_end": "2026-12-31"},
+        },
         "eps_trend": {"+1y": {"current": 30.6, "7daysAgo": 29.8}},  # +2.68% vs 7d
         "eps_revisions": {"+1y": {"upLast7days": 8, "downLast7Days": 6}},
         "price_targets": {"mean": 618.0},  # +3.0% vs last
         "price": {"chg_1d_pct": -4.5, "chg_5d_pct": -8.2, "benchmark": "QQQ", "bench_chg_1d_pct": -0.8, "bench_chg_5d_pct": -1.5},
     }
+    prev_rolled = {
+        "fetched_at": "2026-10-16T21:00:00-04:00",
+        "earnings_estimate": {"0q": {"avg": 0.996, "period_end": "2026-09-30"}},
+        "revenue_estimate": {"0q": {"avg": 2.002e9, "period_end": "2026-09-30"}},
+    }
     deltas, flags = compute_consensus_deltas(cur, prev, thr, sec_new_count=1)
+    deltas_roll, flags_roll = compute_consensus_deltas(cur, prev_rolled, thr, sec_new_count=0)
     checks = {
         "default_thresholds_exact": thr_ok,
         "eps_fy1_delta_2pct": deltas.get("eps_+1y_vs_last_pct") == 2.0,
         "rev_fy1_delta_1pct": deltas.get("rev_+1y_vs_last_pct") == 1.0,
         "pt_delta_3pct": deltas.get("target_price_vs_last_pct") == 3.0,
         "flags_triggered": len(flags) == 8,
+        # 旧 0q(截至 09-30) 与新 0q(截至 12-31) 期间不同：不算修正、不触发阈值。
+        "period_roll_not_a_revision": (
+            deltas_roll.get("eps_0q_vs_last_pct") is None
+            and deltas_roll.get("rev_0q_vs_last_pct") is None
+            and (deltas_roll.get("period_alignment") or {}).get("earnings_estimate", {}).get("0q", {}).get("compare") == "rolled"
+            and not any("0q" in f for f in flags_roll)
+        ),
     }
     ok = all(checks.values())
     print(json.dumps({"ok": ok, "checks": checks, "sample_flags": flags}, ensure_ascii=False, indent=2))
