@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import logging
-import re
 from collections.abc import Sequence
 from typing import Any
 
@@ -18,7 +17,6 @@ from src.dalton.autonomy.schedule import (
 from src.dalton.coverage import get_user_tier, set_user_coverage_tier
 from src.server.database import automation as auto_db
 from src.server.database import workspace as ws_db
-from src.server.database.home_workspace import is_home_row
 from src.server.database.pool import get_db_connection
 
 logger = logging.getLogger(__name__)
@@ -26,11 +24,6 @@ logger = logging.getLogger(__name__)
 LABEL_ENABLED_ZH = "自动跟踪：开启（盯盘每 30 分钟 · 内部资料北京时间 11:00 扫描，Core 每交易日、Watch 每周 · 涨跌 ±4% 触发）"
 LABEL_DISABLED_ZH = "自动跟踪：关闭"
 LABEL_INCOMPLETE_ZH = "自动跟踪：不完整"
-
-_TICKER_FROM_AUTO_NAME_RE = re.compile(
-    r"^dalton-([a-z0-9.]+)-(?:watch|delta|move-up|move-down|earn-.*)$"
-)
-_CLEAN_TICKER_RE = re.compile(r"^([A-Za-z0-9]{1,10}(?:\.[A-Za-z]{1,4})?)")
 
 
 async def resolve_default_tier(
@@ -58,13 +51,12 @@ async def resolve_default_tier(
 
 
 def _extract_ticker_from_text(raw: str | None) -> str | None:
-    cleaned = str(raw or "").strip()
-    if not cleaned or cleaned.lower() == "home" or "_" in cleaned:
-        return None
-    m = _CLEAN_TICKER_RE.match(cleaned)
-    if m:
-        return m.group(1).upper()
-    return None
+    # Moved to src.dalton.coverage.identity (sector layer P0 round 2: one
+    # resolver, one ticker rule). Kept as a re-export because knowledge.py and
+    # tests import it from here.
+    from src.dalton.coverage.identity import _extract_ticker_from_text as _impl
+
+    return _impl(raw)
 
 
 async def resolve_workspace_id_by_ticker(ticker: str, user_id: str) -> str | None:
@@ -122,50 +114,37 @@ async def _resolve_workspace_ticker(
     workspace_id: str,
     existing_rows: list[dict[str, Any]] | None = None,
 ) -> str:
-    """Resolve the uppercase company ticker from workspace metadata, name, knowledge doc, or existing automations."""
+    """Resolve the uppercase company ticker for a workspace, or raise.
+
+    Thin wrapper over the shared coverage-identity resolver (sector layer P0
+    round 2): tracking, the board and the director probe all take "is this
+    workspace a company / what is its ticker" from the same single resolver,
+    so the three can no longer disagree. Home keeps its historical error
+    message; a registered sector unit and an unclassified workspace (no
+    metadata ticker, no company knowledge doc, no exact ticker name, no
+    `dalton-<t>-*` automations) both raise — nothing is guessed.
+    """
     ws: dict[str, Any] | None = None
     try:
         ws = await ws_db.get_workspace(str(workspace_id))
     except Exception as exc:
         logger.debug("[DALTON_TRACKING] get_workspace(%s) failed: %s", workspace_id, exc)
 
-    if ws:
-        if is_home_row(ws) or bool(ws.get("is_home")):
-            raise ValueError("Home workspace does not support company auto-tracking")
-        meta = ws.get("metadata") if isinstance(ws.get("metadata"), dict) else {}
-        meta_ticker = _extract_ticker_from_text(
-            meta.get("ticker") or ws.get("ticker")
+    from src.dalton.coverage.identity import resolve_workspace_coverage_identity
+
+    identity = await resolve_workspace_coverage_identity(
+        ws if ws is not None else {"workspace_id": str(workspace_id)},
+        automations=existing_rows,
+    )
+    if identity.is_home:
+        raise ValueError("Home workspace does not support company auto-tracking")
+    if identity.is_sector:
+        raise ValueError(
+            f"Workspace '{workspace_id}' is a registered sector coverage unit; a sector never carries a ticker"
         )
-        if meta_ticker:
-            return meta_ticker
-
-    try:
-        from src.dalton.database import knowledge as db_knowledge
-
-        company_row = await db_knowledge.latest_valid_version(str(workspace_id), "company")
-        if company_row and isinstance(company_row.get("content"), dict):
-            doc_ticker = _extract_ticker_from_text(company_row["content"].get("ticker"))
-            if doc_ticker:
-                return doc_ticker
-    except Exception:
-        pass
-
-    if ws:
-        name_ticker = _extract_ticker_from_text(ws.get("name"))
-        if name_ticker:
-            return name_ticker
-
-    for r in existing_rows or []:
-        if str(r.get("workspace_id") or "") and str(r.get("workspace_id")) != str(workspace_id):
-            continue
-        r_meta = r.get("metadata") if isinstance(r.get("metadata"), dict) else {}
-        if r_meta.get("ticker"):
-            return str(r_meta["ticker"]).strip().upper()
-        m = _TICKER_FROM_AUTO_NAME_RE.match(str(r.get("name") or "").strip().lower())
-        if m:
-            return m.group(1).upper()
-
-    raise ValueError(f"Unable to resolve company ticker for workspace '{workspace_id}'")
+    if not identity.is_company or not identity.ticker:
+        raise ValueError(f"Unable to resolve company ticker for workspace '{workspace_id}'")
+    return identity.ticker
 
 
 def _filter_company_automations(

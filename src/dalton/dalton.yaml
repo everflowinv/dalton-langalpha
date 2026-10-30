@@ -8,6 +8,12 @@ credentials:
 colleague_dispatch:
   enabled: false
 
+# 覆盖单元登记表（d023，行业层 P0）。默认关闭：关闭时工作区覆盖身份只走兼容
+# 规则（公司知识文档 → 隐式公司；Home → 无单元；其余 → 未分类），不读
+# dalton_coverage_units 表；打开后，绑定到工作区的 active 单元优先于兼容规则。
+coverage_units:
+  enabled: false
+
 network:
   # The host proxy runs in fake-IP mode: inside the backend container DNS answers
   # every public host with an address in 198.18.0.0/15 (benchmarking space, which

@@ -9,10 +9,12 @@ from zoneinfo import ZoneInfo
 
 from psycopg.rows import dict_row
 
-from src.dalton.autonomy.due import validation_is_due, workspace_market_timezone
+from src.dalton.autonomy.due import ticker_market_timezone, validation_is_due
 from src.dalton.budget.service import get_budget_today
 from src.dalton.coverage import get_user_coverage
-from src.dalton.settings import get_dalton_settings
+from src.dalton.coverage.identity import resolve_workspace_coverage_identity
+from src.dalton.database.coverage_units import load_active_units_by_workspace
+from src.dalton.settings import get_dalton_settings, is_coverage_units_enabled
 from src.server.database.pool import get_db_connection
 
 logger = logging.getLogger(__name__)
@@ -144,7 +146,7 @@ async def build_coverage_board(
                 if user_id is not None:
                     await cur.execute(
                         """
-                        SELECT workspace_id, name, description, status, updated_at
+                        SELECT workspace_id, user_id, name, description, status, updated_at
                         FROM workspaces
                         WHERE status <> 'deleted' AND user_id = %s
                         ORDER BY name ASC
@@ -154,7 +156,7 @@ async def build_coverage_board(
                 else:
                     await cur.execute(
                         """
-                        SELECT workspace_id, name, description, status, updated_at
+                        SELECT workspace_id, user_id, name, description, status, updated_at
                         FROM workspaces
                         WHERE status <> 'deleted'
                         ORDER BY name ASC
@@ -162,6 +164,62 @@ async def build_coverage_board(
                     )
                 ws_rows = await cur.fetchall()
                 user_ws_ids = {str(r["workspace_id"]) for r in ws_rows}
+
+                # 行业层 P0：开关打开时一次性取每个工作区绑定的 active 单元；
+                # 关闭时不发这条查询。
+                units_by_ws: dict[str, dict[str, Any]] = {}
+                if ws_rows and is_coverage_units_enabled():
+                    try:
+                        units_by_ws = await load_active_units_by_workspace(
+                            [str(r["workspace_id"]) for r in ws_rows], conn=conn
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[DALTON_BOARD] coverage unit lookup failed: %s", exc
+                        )
+                        units_by_ws = {}
+
+                # 行业层 P0 round 2（codex #4）：兼容回退还需要该用户已有的
+                # dalton-* 自动化行——没有文档、只有自动化的老公司工作区在开关
+                # 关闭时也要照常出现在看板上。与 tracking 的回退同一条规则：
+                # 不过滤状态（暂停也是已验证的跟踪信息）。
+                autos_by_user: dict[str, list[dict[str, Any]]] = {}
+                try:
+                    # 与 tracking 的筛选和顺序一致（codex r2 #1/#2）：它按
+                    # strip().lower().startswith("dalton-") 过滤、按 file_name
+                    # 排序取第一条，这里用 lower(btrim(name)) LIKE 等价筛选，
+                    # 并保持 ORDER BY file_name 的确定顺序。
+                    if user_id is not None and ws_rows:
+                        await cur.execute(
+                            """
+                            SELECT user_id, workspace_id::text AS workspace_id, name, metadata
+                            FROM automations
+                            WHERE strpos(lower(name), 'dalton-') > 0 AND user_id = %s
+                            ORDER BY file_name
+                            """,
+                            (user_id,),
+                        )
+                    elif ws_rows:
+                        await cur.execute(
+                            """
+                            SELECT user_id, workspace_id::text AS workspace_id, name, metadata
+                            FROM automations
+                            WHERE strpos(lower(name), 'dalton-') > 0
+                            ORDER BY file_name
+                            """
+                        )
+                    for ar in await cur.fetchall() or []:
+                        # The SQL only prefilters; tracking's own rule (Python strip(), which
+                        # also drops tabs and other whitespace btrim keeps) decides.
+                        if (
+                            isinstance(ar, dict)
+                            and ar.get("user_id")
+                            and str(ar.get("name") or "").strip().lower().startswith("dalton-")
+                        ):
+                            autos_by_user.setdefault(str(ar["user_id"]), []).append(dict(ar))
+                except Exception as exc:
+                    logger.warning("[DALTON_BOARD] dalton automation preload failed: %s", exc)
+                    autos_by_user = {}
 
                 await cur.execute(
                     """
@@ -271,17 +329,29 @@ async def build_coverage_board(
 
         for ws in ws_rows:
             ws_id = str(ws["workspace_id"])
-            ws_name = str(ws.get("name") or "").strip().upper()
             docs = kv_by_ws.get(ws_id) or {}
             thesis_content = (docs.get("thesis") or {}).get("content") or {}
             agenda_content = (docs.get("agenda") or {}).get("content") or {}
             company_content = (docs.get("company") or {}).get("content") or {}
 
-            # 标的与交易所时区来自同一共享解析（与总监探针一致）：company 文档
-            # ticker（+exchange）→ 论点文档 ticker → 工作区名。
-            ticker, market_tz = workspace_market_timezone(company_content, thesis_content, ws_name)
-            if not ticker:
+            # 行业层 P0 round 2：身份与 ticker 一律来自共享解析器（codex #2/#3）。
+            # Home、已登记行业单元无条件不进公司看板（名称再像 ticker 也不行）；
+            # ticker 与交易所时区都用解析结果，不再从文档或名称重取。
+            identity = await resolve_workspace_coverage_identity(
+                ws,
+                company_content=(
+                    (docs.get("company") or {}).get("content") if "company" in docs else None
+                ),
+                thesis_content=(
+                    (docs.get("thesis") or {}).get("content") if "thesis" in docs else None
+                ),
+                registered_units=units_by_ws,
+                automations=autos_by_user.get(str(ws.get("user_id") or ""), []),
+            )
+            if not identity.is_company or not identity.ticker:
                 continue
+            ticker = identity.ticker
+            market_tz = ticker_market_timezone(ticker, company_content)
 
             cov_meta = cov_map.get(ticker) or {}
             house_view = thesis_content.get("house_view") or {}
