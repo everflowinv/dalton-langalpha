@@ -21,6 +21,10 @@ from unittest.mock import create_autospec, patch
 
 import pytest
 
+from src.ptc_agent.agent.middleware.background_subagent.registry import (
+    BackgroundTaskRegistry,
+)
+from src.ptc_agent.agent.middleware.background_subagent.task import BackgroundTask
 from src.server.database.runs import subagent_runs as sr_db
 from src.server.services import background_registry_store
 from src.server.services.runs import coordinator, executor, subagent_collection
@@ -28,26 +32,38 @@ from src.server.services.writer_guard import GuardSessionLost, WriterGuard
 
 
 class _FakeRegistry:
-    """Hand-written registry double: owned tasks with hung writers.
+    """The REAL BackgroundTaskRegistry holding real BackgroundTasks with hung
+    writers, under fixed task ids so the ledger rows can name them.
 
-    ``live_writers_where`` returns real never-completing Tasks (hashable,
-    awaitable — what asyncio.wait in the drain requires) tagged with the
-    task_id the ownership predicate reads.
+    Production 10-30: the first version of this double tagged ``task_id``
+    onto the asyncio handles it returned, so the deadline's lookup passed
+    here while the real registry's bare handles carry no task_id and every
+    workflow fell back to the flat 1800s. Real objects keep that honest.
     """
 
     def __init__(self, *task_ids: str):
-        self._tasks = []
+        self._registry = BackgroundTaskRegistry("t-1")
+        self._handles = []
         for task_id in task_ids:
-            task = asyncio.get_running_loop().create_task(asyncio.Event().wait())
-            task.task_id = task_id
-            self._tasks.append(task)
+            handle = asyncio.get_running_loop().create_task(asyncio.Event().wait())
+            self._handles.append(handle)
+            task = BackgroundTask(
+                tool_call_id=f"call-{task_id}",
+                task_id=task_id,
+                description=task_id,
+                prompt="",
+                subagent_type="workflow",
+                asyncio_task=handle,
+            )
+            self._registry._tasks[task.tool_call_id] = task
+            self._registry._task_id_to_tool_call_id[task_id] = task.tool_call_id
 
     async def live_writers_where(self, pred):
-        return [t for t in self._tasks if pred(t)]
+        return await self._registry.live_writers_where(pred)
 
     def settle(self):
-        for task in self._tasks:
-            task.cancel()
+        for handle in self._handles:
+            handle.cancel()
 
 
 class _RegistryStore:

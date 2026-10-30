@@ -1195,13 +1195,24 @@ class LocalRunExecutor:
             )
             if not bg_registry:
                 return
-            writers = await bg_registry.live_writers_where(
-                lambda t: guard.owns_task_ns(t.task_id)
-            )
+            # DALTON-HOOK(tail-drain-outlives-workflows): the handles that
+            # come back are bare asyncio Tasks with no task_id, so the owning
+            # task ids are collected here, where the predicate sees the
+            # BackgroundTask, for the per-workflow deadline to match on.
+            live_task_ids: set[str] = set()
+
+            def _owned(task) -> bool:
+                if not guard.owns_task_ns(task.task_id):
+                    return False
+                if task.live_writers:
+                    live_task_ids.add(task.task_id)
+                return True
+
+            writers = await bg_registry.live_writers_where(_owned)
             if not writers:
                 return
             deadline, basis = await self._tail_drain_deadline(
-                thread_id, run_id, drain_started, writers
+                thread_id, run_id, drain_started, live_task_ids
             )
             remaining = deadline - time.time()
             if remaining <= 0:
@@ -1222,7 +1233,11 @@ class LocalRunExecutor:
     # per writer — a live root workflow's own run_timeout window, everyone
     # else the flat tail allowance.
     async def _tail_drain_deadline(
-        self, thread_id: str, run_id: str, drain_started: float, writers: list
+        self,
+        thread_id: str,
+        run_id: str,
+        drain_started: float,
+        live_task_ids: set[str],
     ) -> tuple[float, str]:
         """When the drain may give up on these writers, and why (for the
         timeout's wording): each live ROOT workflow run gets its own
@@ -1268,7 +1283,6 @@ class LocalRunExecutor:
                 "(open-workflow read failed)",
             )
         run_timeout = float(get_workflow_orchestration_config().run_timeout)
-        live_ids = {getattr(w, "task_id", None) for w in writers}
         deadline = flat_deadline
         basis_parts = [flat_basis]
         for row in open_workflows:
@@ -1277,7 +1291,7 @@ class LocalRunExecutor:
             # non-workflow writer, not to run_timeout.
             if row.get("parent_run_id") is None:
                 continue
-            if row.get("task_id") not in live_ids:
+            if row.get("task_id") not in live_task_ids:
                 continue
             started = row.get("started_at")
             if started is None:
