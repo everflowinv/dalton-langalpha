@@ -4533,9 +4533,26 @@ def _hint_conflicts_with_category(category: str, hint: str) -> bool:
 
 # Upstream "found nothing for that concept/attachment/filing/item/accession"
 # messages (SEC): a completed lookup with nothing to show, not an outage.
+# R2a-1 (2026-10-29 DASH/NOW): upstream also answers "No matching 10-Q filing
+# found" — "no matching <form> filing(s) [found]" and "no <form> filings found".
+# The form name is a whitespace/hyphen/slash token sequence: digit-bearing types
+# (10-Q, 8-K, 20-F, S-1, DEF 14A, Form 4, 13F-HR, SC 13D, 424B2, and the /A
+# amendments 10-K/A, SC 13D/A, …) or an all-caps digit-free type (FWP from the
+# thesis-delta filing monitor's DEFAULT_SEC_FORMS). Lowercase prose ("quarterly",
+# "annual") is never a form type, keeping ordinary sentences out.
+_SEC_FORM_NAME_FRAGMENT = (
+    r"(?:"
+    r"(?=[A-Za-z0-9/\s-]*\d)[A-Za-z0-9/-]+(?:\s+[A-Za-z0-9/-]+)*"
+    r"|(?-i:[A-Z]{2,})(?:[/-][A-Za-z0-9]+)*(?:\s+(?-i:[A-Z]{2,})(?:[/-][A-Za-z0-9]+)*)*"
+    r")"
+)
 _SEC_OBJECT_NOT_FOUND_RE = re.compile(
     r"(?i)\b(?:"
     r"no\s+(?:concepts?|attachments?|filings?|items?|accessions?)\s+(?:matching|found)"
+    r"|no\s+matching\s+(?:" + _SEC_FORM_NAME_FRAGMENT + r"\s+)?"
+    r"(?:filings?|concepts?|attachments?|items?|accessions?)(?:\s+found)?"
+    r"|no\s+" + _SEC_FORM_NAME_FRAGMENT + r"\s+"
+    r"(?:filings?|concepts?|attachments?|items?|accessions?)\s+(?:matching\s+)?found"
     r"|(?:requested\s+)?(?:concept|attachment|filing|item|accession(?:\s+number)?)"
     r"(?:\s+(?:'[^']*'|\"[^\"]*\"|[A-Za-z0-9_.:-]+))?\s+(?:was\s+|is\s+)?not\s+found"
     r")\b"
@@ -4970,7 +4987,10 @@ def _classify_error_category_and_hint(
             )
     elif category == "没有匹配":
         if sec_no_match:
-            hint = "先用 search-concepts / list-filings / attachments 拿到可用的名称或 ID 再读，不要猜"
+            # R2a fix1-2: the failing call may be list-filings itself, so the
+            # advice must not be "go list filings for an ID" — it is a finished
+            # lookup that found nothing under these conditions.
+            hint = "该条件下没有找到文件，可放宽表单 / 日期条件"
         elif ae_doc_not_found:
             hint = (
                 "该文档在上游不存在（E_UPSTREAM_API: 数据不存在，同一轮其他文档可正常读取）；"
@@ -5234,6 +5254,31 @@ def _apply_error_and_empty_contract(
 
     failed = bool(unwrapped_check["failed"] or payload.get("error"))
     if failed:
+        # R2a fix1-2 (2026-10-29 DASH/NOW): SEC's "No matching <form> filing
+        # found" family is a completed lookup that found nothing under the
+        # caller's conditions — the agent contract for a true no-match is
+        # `ok: true` + empty results + `empty_reason` (same shape/field names
+        # as the generic no-match branch below), never `ok: false`/`error`,
+        # which the agent reads as "fix params or retry another source".
+        if tool_name in ("finance", "macro", "research") and _is_sec_object_not_found(
+            route, payload
+        ):
+            payload["ok"] = True
+            if str(payload.get("status") or "").strip().lower() in ("error", "no_match", ""):
+                payload["status"] = "empty"
+            payload.pop("error", None)
+            payload.pop("error_code", None)
+            payload.pop("fallback", None)
+            payload["empty_reason"] = str(payload.get("empty_reason") or "no_matching_records")
+            if isinstance(payload.get("data"), dict):
+                payload["data"].pop("error", None)
+                payload["data"]["ok"] = True
+            if "results" not in payload and "rows" not in payload and not isinstance(
+                payload.get("data"), (dict, list)
+            ):
+                payload["results"] = []
+            payload["hint"] = "该条件下没有找到文件，可放宽表单 / 日期条件"
+            return
         data_dict = payload.get("data") if isinstance(payload.get("data"), dict) else {}
         fb_obj = payload.get("fallback") if "fallback" in payload else data_dict.get("fallback")
         fb_dict = fb_obj if isinstance(fb_obj, dict) else {}

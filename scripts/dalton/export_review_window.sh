@@ -13,7 +13,9 @@
 #
 # --since/--until accept docker-logs syntax (RFC3339, '2026-10-27T23:00:00',
 # or relative like '90m'); for the bridge files the same value is parsed as a
-# plain 'YYYY-MM-DD[ HH:MM:SS]' timestamp to drop lines outside the window.
+# plain 'YYYY-MM-DD[ HH:MM:SS]' timestamp to drop lines outside the window, and
+# for `docker logs` itself it is re-rendered as RFC3339 with the local offset
+# (R2a-3): docker rejects '2026-10-27 09:00' with "parsing time … extra text".
 #
 # Env overrides: DALTON_BACKEND_CONTAINER (default dalton-langalpha-backend-1),
 # DALTON_LOG_DIR (default ~/Library/Logs). This script only reads logs and
@@ -58,9 +60,21 @@ if ! plain_since="$("$PYTHON_BIN" "$REDACTOR" --normalize-window "$SINCE")"; the
   echo "error: invalid --since timestamp: $SINCE" >&2
   exit 2
 fi
+# R2a-3: docker logs takes only RFC3339 (or a relative duration) — 'YYYY-MM-DD
+# HH:MM' fails with "extra text", which silently left the backend logs out of
+# every export. Same parsing as the bridge window, re-rendered with the local
+# offset (DST-aware).
+if ! docker_since="$("$PYTHON_BIN" "$REDACTOR" --docker-window "$SINCE")"; then
+  echo "error: invalid --since timestamp: $SINCE" >&2
+  exit 2
+fi
 line_window_args=(--since "$plain_since")
 if [[ -n "$UNTIL" ]]; then
   if ! plain_until="$("$PYTHON_BIN" "$REDACTOR" --normalize-window "$UNTIL")"; then
+    echo "error: invalid --until timestamp: $UNTIL" >&2
+    exit 2
+  fi
+  if ! docker_until="$("$PYTHON_BIN" "$REDACTOR" --docker-window "$UNTIL")"; then
     echo "error: invalid --until timestamp: $UNTIL" >&2
     exit 2
   fi
@@ -108,9 +122,9 @@ emit_redacted_file() {
   } >>"$OUTFILE"
 }
 
-docker_logs_args=(logs --since "$SINCE")
+docker_logs_args=(logs --since "$docker_since")
 if [[ -n "$UNTIL" ]]; then
-  docker_logs_args+=(--until "$UNTIL")
+  docker_logs_args+=(--until "$docker_until")
 fi
 docker_logs_args+=("--timestamps" "$BACKEND_CONTAINER")
 

@@ -29,6 +29,19 @@ logger = logging.getLogger(__name__)
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL | re.IGNORECASE)
 
+# R2a-2 (2026-10-28 HSAI×15 / Visa×5): cheap, idempotent assist tasks that may
+# re-send after an indeterminate journal row. These tasks call one explicit
+# model without ``fallback_models``, so the own-chain subscription allowance
+# never applied and a single ConnectError locked the task's journal row
+# "indeterminate" forever (every retry hit the same invocation_id and was
+# refused with "可能已经计费").
+_RESEND_AFTER_INDETERMINATE_TASKS = frozenset({"language.review"})
+
+# R2a fix1: the allowlisted re-send is cumulative-capped in the journal — the
+# original send plus ONE re-send per request hash. Without the cap every
+# check_language call re-sent the same possibly-charged request forever.
+_RESEND_AFTER_INDETERMINATE_MAX_ATTEMPTS = 2
+
 
 @dataclass
 class AssistResult:
@@ -291,7 +304,25 @@ async def assist_json(
             return resolve_model_billing_and_provider(m)[0] == "oauth"
 
         def _resend_for(m: str) -> bool:
-            return bool(resend_indeterminate) or (own_chain and _is_subscription(m))
+            if resend_indeterminate:
+                return True
+            # R2a-2: a whitelisted cheap/idempotent task may re-send once per
+            # call after an indeterminate result even without its own model
+            # chain — same subscription-only guard, so a cash-billed model
+            # keeps the double-charge protection.
+            if task in _RESEND_AFTER_INDETERMINATE_TASKS and _is_subscription(m):
+                return True
+            return own_chain and _is_subscription(m)
+
+        def _resend_cap_for(m: str) -> int | None:
+            # The cumulative cap binds only the allowlist allowance: a caller
+            # that opted in explicitly, or the audit chain's own subscription
+            # rule, keeps its own (uncapped) policy.
+            if resend_indeterminate or own_chain:
+                return None
+            if task in _RESEND_AFTER_INDETERMINATE_TASKS and _is_subscription(m):
+                return _RESEND_AFTER_INDETERMINATE_MAX_ATTEMPTS
+            return None
 
         # Every candidate passes the policy check (L21) before anything is sent, so a
         # forbidden fallback fails fast rather than after a primary result is discarded.
@@ -341,6 +372,7 @@ async def assist_json(
             workspace_id=workspace_id,
             thread_id=thread_id,
             resend_indeterminate=_resend_for(resolved_model),
+            resend_max_attempts=_resend_cap_for(resolved_model),
             raise_on_error=False,
             persist_raw=persist_raw,
             skip_journal=skip_journal,
@@ -397,6 +429,7 @@ async def assist_json(
                     workspace_id=workspace_id,
                     thread_id=thread_id,
                     resend_indeterminate=_resend_for(fb_cand),
+                    resend_max_attempts=_resend_cap_for(fb_cand),
                     raise_on_error=False,
                     persist_raw=persist_raw,
                     skip_journal=skip_journal,

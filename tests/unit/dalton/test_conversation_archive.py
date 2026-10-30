@@ -892,6 +892,7 @@ async def test_extraction_verbatim_quote_validation_and_speaker_rules(
         request_hash: str,
         stale_after_s: int = 900,
         resend_indeterminate: bool = False,
+        resend_max_attempts: int | None = None,
         conn: Any = None,
     ) -> tuple[str, dict[str, Any] | None]:
         if not journal_saved_responses:

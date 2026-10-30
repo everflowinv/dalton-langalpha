@@ -6,7 +6,7 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, Mapping
 
 from psycopg.rows import dict_row
 
@@ -120,21 +120,36 @@ async def fetch_journal_by_scope(
 get_journal_by_scope = fetch_journal_by_scope
 
 
+def _resend_capped(row: Mapping[str, Any] | None, resend_max_attempts: int | None) -> bool:
+    """True when the cumulative re-send cap for this invocation is reached
+    (R2a fix1): the original send plus the allowed re-sends have all ended
+    uncertain, so another send would be an unbounded retry of a call the
+    provider may already have billed."""
+    if resend_max_attempts is None or row is None:
+        return False
+    try:
+        attempt = int(row.get("attempt") or 1)
+    except (TypeError, ValueError):
+        attempt = 1
+    return attempt >= max(resend_max_attempts, 1)
+
+
 async def inspect_journal_state(
     invocation_id: str,
     *,
     request_hash: str,
     stale_after_s: int = 900,
     resend_indeterminate: bool = False,
+    resend_max_attempts: int | None = None,
     conn: Any = None,
 ) -> tuple[str, dict[str, Any] | None]:
     """Inspect existing journal row before budget admission or claim.
 
     Returns `(action, row)` where `action` is one of:
-    - `'proceed'`: no row exists, or row is `'failed'`, or row is `'indeterminate'` with `resend_indeterminate=True`
+    - `'proceed'`: no row exists, or row is `'failed'`, or row is `'indeterminate'` with `resend_indeterminate=True` and the attempt cap not reached (`resend_max_attempts`)
     - `'done'`: row is already `'done'` (replay cached response)
     - `'in_flight'`: row is `'pending'` and within `stale_after_s`
-    - `'indeterminate'`: row is `'indeterminate'` (or stale `'pending'` transitioned to `'indeterminate'`) and `resend_indeterminate=False`
+    - `'indeterminate'`: row is `'indeterminate'` (or stale `'pending'` transitioned to `'indeterminate'`) and `resend_indeterminate=False` or the attempt cap is reached
     - `'conflict'`: row exists with a different `request_hash`
     """
     async def _do_inspect(c: Any) -> tuple[str, dict[str, Any] | None]:
@@ -159,7 +174,7 @@ async def inspect_journal_state(
 
             if state == "pending":
                 if _is_stale(row.get("claimed_at"), stale_after_s):
-                    if resend_indeterminate:
+                    if resend_indeterminate and not _resend_capped(row, resend_max_attempts):
                         return "proceed", row
                     await cur.execute(
                         """
@@ -177,7 +192,7 @@ async def inspect_journal_state(
                 return "in_flight", row
 
             if state == "indeterminate":
-                if resend_indeterminate:
+                if resend_indeterminate and not _resend_capped(row, resend_max_attempts):
                     return "proceed", row
                 return "indeterminate", row
 
@@ -203,6 +218,7 @@ async def claim_journal_invocation(
     request_hash: str,
     stale_after_s: int = 900,
     resend_indeterminate: bool = False,
+    resend_max_attempts: int | None = None,
     conn: Any = None,
 ) -> tuple[str, dict[str, Any]]:
     """Atomically claim or evaluate an invocation in `dalton_llm_journal` (P0N.7 §3).
@@ -211,7 +227,7 @@ async def claim_journal_invocation(
     - `'claimed'`: caller now owns the `'pending'` invocation and must send the request
     - `'done'`: already completed; caller should replay `row['response']`
     - `'in_flight'`: another worker is currently executing this invocation
-    - `'indeterminate'`: prior attempt crashed/timed out; do not resend unless `resend_indeterminate=True`
+    - `'indeterminate'`: prior attempt crashed/timed out; do not resend unless `resend_indeterminate=True` and the attempt cap (`resend_max_attempts`) is not reached
     - `'conflict'`: `invocation_id` exists with a mismatched `request_hash`
     """
     # DALTON-HOOK(team-credentials): keep user_id as caller and stamp credential_user_id in usage JSONB only when sharing is enabled
@@ -312,7 +328,10 @@ async def claim_journal_invocation(
             if state == "pending":
                 if not _is_stale(existing.get("claimed_at"), stale_after_s):
                     return "in_flight", existing
-                if not resend_indeterminate:
+                if not (
+                    resend_indeterminate
+                    and not _resend_capped(existing, resend_max_attempts)
+                ):
                     await cur.execute(
                         """
                         UPDATE dalton_llm_journal
@@ -331,7 +350,10 @@ async def claim_journal_invocation(
                         "error_kind": "crash",
                     }
 
-            if state == "indeterminate" and not resend_indeterminate:
+            if state == "indeterminate" and not (
+                resend_indeterminate
+                and not _resend_capped(existing, resend_max_attempts)
+            ):
                 return "indeterminate", existing
 
             # Either state == 'failed', response was pruned on 'done', or resend_indeterminate=True

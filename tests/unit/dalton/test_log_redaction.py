@@ -17,6 +17,7 @@ if str(SCRIPTS_DALTON) not in sys.path:
 import researchdata_bridge as rb  # noqa: E402
 from log_redaction import (  # noqa: E402
     clean_log_field,
+    format_docker_window,
     http_status_from_text,
     main,
     parse_window_timestamp,
@@ -440,3 +441,147 @@ def test_a_forged_status_value_cannot_split_a_log_line_or_leak_a_token():
     )
     assert "\n" not in cleaned and "\x1b" not in cleaned
     assert "0123456789abcdef0123456789abcdef" not in cleaned
+
+
+# ------------------------------- R2a-3: docker logs needs RFC3339 + local offset
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("2026-10-27 09:00", "2026-10-27T09:00:00-04:00"),
+        ("2026-10-27T09:00:00", "2026-10-27T09:00:00-04:00"),
+        ("2026-10-27 09:00:00", "2026-10-27T09:00:00-04:00"),
+        # Winter date renders the EST offset even when run in summer (DST-aware).
+        ("2026-01-15T09:00:00", "2026-01-15T09:00:00-05:00"),
+        # A UTC instant converts to the local wall clock and takes that date's offset.
+        ("2026-01-15T12:00:00Z", "2026-01-15T07:00:00-05:00"),
+        ("2026-10-27T16:00:00Z", "2026-10-27T12:00:00-04:00"),
+    ],
+)
+def test_docker_window_formats_rfc3339_with_local_offset(
+    monkeypatch: pytest.MonkeyPatch, raw: str, expected: str
+) -> None:
+    monkeypatch.setenv("TZ", "America/New_York")
+    assert format_docker_window(raw) == expected
+
+
+def test_docker_window_resolves_relative_durations_against_now() -> None:
+    from zoneinfo import ZoneInfo
+
+    ny = ZoneInfo("America/New_York")
+    now = datetime(2026, 10, 28, 12, 0, 0, tzinfo=ny)
+    assert format_docker_window("90m", now=now) == "2026-10-28T10:30:00-04:00"
+    assert format_docker_window("2h", now=now) == "2026-10-28T10:00:00-04:00"
+    # A relative window crossing the fall-back change keeps the real elapsed span.
+    dst_now = datetime(2026, 11, 1, 2, 30, 0, tzinfo=ny)
+    assert format_docker_window("2h", now=dst_now) == "2026-11-01T01:30:00-04:00"
+
+
+# R2a fix1-5: the fractional seconds the operator wrote must survive into the
+# docker argument verbatim (docker/Go RFC3339 accepts up to nano precision) —
+# a truncated boundary silently includes or excludes edge log lines.
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("2026-10-27T09:00:00.900-04:00", "2026-10-27T09:00:00.900-04:00"),
+        ("2026-10-27T09:00:00.9-04:00", "2026-10-27T09:00:00.9-04:00"),
+        # UTC instant converts to the local wall clock and keeps its fraction.
+        ("2026-10-27T13:00:00.25Z", "2026-10-27T09:00:00.25-04:00"),
+        ("2026-10-27 09:00:00.123456789", "2026-10-27T09:00:00.123456789-04:00"),
+        # Inputs without a fraction keep whole seconds.
+        ("2026-10-27 09:00", "2026-10-27T09:00:00-04:00"),
+        ("2026-10-27T09:00:00-04:00", "2026-10-27T09:00:00-04:00"),
+    ],
+)
+def test_docker_window_preserves_input_fractional_seconds(
+    monkeypatch: pytest.MonkeyPatch, raw: str, expected: str
+) -> None:
+    monkeypatch.setenv("TZ", "America/New_York")
+    assert format_docker_window(raw) == expected
+
+
+def test_docker_window_cli_prints_one_line_and_rejects_garbage(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    monkeypatch.setenv("TZ", "America/New_York")
+    assert main(["--docker-window", "2026-10-27 09:00"]) == 0
+    assert capsys.readouterr().out.strip() == "2026-10-27T09:00:00-04:00"
+    assert main(["--docker-window", "not-a-timestamp"]) == 2
+    assert "error" in capsys.readouterr().err
+
+
+def test_export_script_hands_docker_rfc3339_with_local_offset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The backend-logs leg once passed the raw '--since 2026-10-27 09:00' to
+    `docker logs`, which failed with 'parsing time … extra text' and silently
+    exported no backend logs. A fake docker on PATH must now receive RFC3339
+    with the local offset."""
+    from zoneinfo import ZoneInfo
+
+    monkeypatch.setenv("TZ", "America/New_York")
+    assert ZoneInfo("America/New_York") is not None  # pin the zone the offsets assume
+
+    script = SCRIPTS_DALTON / "export_review_window.sh"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    args_file = tmp_path / "docker_args.txt"
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$1" == "inspect" ]]; then\n'
+        '  echo "sha256:fakeimage"\n'
+        "  exit 0\n"
+        "fi\n"
+        "printf '%s\\n' \"$@\" > \"$CAPTURE_ARGS\"\n"
+        'echo "2026-10-27 09:00:01,000 [INFO] stdout line"\n'
+        'echo "2026-10-27 09:00:02,000 [ERROR] stderr line" >&2\n',
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "dalton-researchdata-bridge.err.log").write_text(
+        "2026-10-27 09:00:03,000 [INFO] inside window\n", encoding="utf-8"
+    )
+
+    out_file = tmp_path / "exported.txt"
+    proc = subprocess.run(
+        [
+            "bash",
+            str(script),
+            "--since",
+            "2026-10-27 09:00",
+            "--until",
+            "2026-10-27 09:30",
+            "-o",
+            str(out_file),
+        ],
+        env={
+            **os.environ,
+            "TZ": "America/New_York",
+            "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+            "DALTON_LOG_DIR": str(log_dir),
+            "DALTON_PYTHON": sys.executable,
+            "CAPTURE_ARGS": str(args_file),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    docker_args = args_file.read_text(encoding="utf-8").splitlines()
+    assert docker_args[:6] == [
+        "logs",
+        "--since",
+        "2026-10-27T09:00:00-04:00",
+        "--until",
+        "2026-10-27T09:30:00-04:00",
+        "--timestamps",
+    ]
+    # The header still shows the operator's original spelling for readability.
+    header = out_file.read_text(encoding="utf-8")
+    assert "since: 2026-10-27 09:00" in header
+    assert "inside window" in header  # bridge leg unaffected
