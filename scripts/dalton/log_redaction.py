@@ -15,11 +15,14 @@ CLI (used by ``scripts/dalton/export_review_window.sh``):
 
     python3 log_redaction.py INFILE OUTFILE [--since TS] [--until TS]
     python3 log_redaction.py --normalize-window '2h'        # prints 'YYYY-MM-DD HH:MM:SS'
+    python3 log_redaction.py --docker-window '2026-10-27 09:00'  # prints RFC3339 + local offset
 
 ``--since``/``--until`` keep only lines whose leading ``YYYY-MM-DD HH:MM:SS``
 timestamp (the Python logging default both bridges write) falls in the window;
 lines with no parseable timestamp are kept (fail-open) so a stack trace or
-continuation line is never dropped silently.
+continuation line is never dropped silently. ``--docker-window`` normalizes the
+same accepted inputs into RFC3339 with the local offset — the only absolute form
+``docker logs --since/--until`` takes.
 """
 
 from __future__ import annotations
@@ -226,7 +229,7 @@ _DOCKER_RELATIVE_RE = re.compile(
 )
 _RFC3339_RE = re.compile(
     r"^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})"
-    r"(?:\.\d+)?(?P<tz>Z|[+-]\d{2}:?\d{2})?$"
+    r"(?P<frac>\.\d+)?(?P<tz>Z|[+-]\d{2}:?\d{2})?$"
 )
 
 
@@ -332,6 +335,37 @@ def _tz_offset(tz: str) -> timedelta:
     return sign * timedelta(hours=hours, minutes=minutes)
 
 
+def format_docker_timestamp(
+    naive_local: datetime, *, now: datetime | None = None, fraction: str = ""
+) -> str:
+    """Render a naive local datetime (as ``parse_window_timestamp`` returns) as
+    RFC3339 with the offset of that instant's own local date (R2a-3).
+
+    ``docker logs --since/--until`` only accepts RFC3339 or a relative duration —
+    a plain ``2026-10-27 09:00`` dies with ``parsing time … extra text`` — and a
+    UTC 'Z' rendering would silently shift the window for a local-time operator,
+    so the local offset (DST-aware) is the form the export script hands docker.
+    ``fraction`` (R2a fix1-5) is the input's own fractional-second text (``.900``)
+    appended verbatim rather than a datetime microsecond value, so the precision
+    the caller wrote — 1 to 9 digits — survives into the docker argument."""
+    tz = _local_tz(now)
+    aware = naive_local.replace(tzinfo=tz) if tz is not None else naive_local.astimezone()
+    offset = aware.strftime("%z")  # ±HHMM (±HHMMSS only for pre-railway zones)
+    if len(offset) >= 5:
+        offset = f"{offset[:3]}:{offset[3:5]}"
+    return aware.strftime("%Y-%m-%dT%H:%M:%S") + fraction + offset
+
+
+def format_docker_window(raw: str, *, now: datetime | None = None) -> str:
+    """Parse a ``--since``/``--until`` value and print it in the one timestamp
+    form ``docker logs`` accepts: RFC3339 with the local offset, keeping the
+    input's fractional seconds when it carried any."""
+    naive = parse_window_timestamp(raw, now=now)
+    rfc = _RFC3339_RE.match(raw.strip())
+    fraction = rfc.group("frac") or "" if rfc is not None else ""
+    return format_docker_timestamp(naive, now=now, fraction=fraction)
+
+
 # ``2026-10-27 23:00:01,123`` (Python logging default asctime) or RFC3339
 # ``2026-10-27T23:00:01.123456789Z`` (docker logs --timestamps).
 _LINE_TIMESTAMP_RE = re.compile(
@@ -415,6 +449,11 @@ def main(argv: list[str] | None = None) -> int:
         metavar="TS",
         help="print TS normalized to 'YYYY-MM-DD HH:MM:SS' (for the shell script) and exit",
     )
+    parser.add_argument(
+        "--docker-window",
+        metavar="TS",
+        help="print TS normalized to RFC3339 with the local offset (for docker logs --since/--until) and exit",
+    )
     args = parser.parse_args(argv)
 
     if args.normalize_window is not None:
@@ -424,6 +463,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 2
         print(normalized.strftime("%Y-%m-%d %H:%M:%S"))
+        return 0
+
+    if args.docker_window is not None:
+        try:
+            docker_ts = format_docker_window(args.docker_window)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(docker_ts)
         return 0
 
     if not args.infile or not args.outfile:

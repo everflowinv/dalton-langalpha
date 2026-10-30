@@ -489,6 +489,12 @@ async def _run_check_language_locked(
                 deadline=deadline,
             )
         if not res.ok:
+            if res.status == "indeterminate":
+                # R2a-2: the one allowed re-send after an uncertain previous
+                # call also ended uncertain. Name the condition instead of the
+                # journal's "可能已经计费" wording, which reads like a dead end —
+                # the next check_language call re-sends rather than being locked.
+                raise RuntimeError("语言审查服务暂时不可用，可稍后重试或跳过")
             raise RuntimeError(f"第 {round} 轮语言审查调用失败（{res.error or res.status}）")
         chunk_issues, chunk_dropped = _collect_issues(res, section)
         dropped_issue_types[0] += chunk_dropped

@@ -9,6 +9,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 SCRIPTS_DALTON = Path(__file__).resolve().parents[3] / "scripts" / "dalton"
 if str(SCRIPTS_DALTON) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DALTON))
@@ -82,8 +84,11 @@ def test_sec_no_matching_concepts_is_a_no_match_with_an_id_hint():
         "finance", "sec", "search-concepts", payload
     )
     assert category == "没有匹配"
-    assert "list-filings" in hint
-    assert "不要猜" in hint
+    # R2a fix1-2: the hint must not send the agent off to list-filings for an
+    # ID — the failing call may be list-filings itself.
+    assert "list-filings" not in hint
+    assert "该条件下没有找到文件" in hint
+    assert "放宽" in hint
 
 
 def test_sec_attachment_not_found_is_a_no_match():
@@ -110,8 +115,13 @@ def test_sec_concept_not_found_in_data_error_is_no_match():
         payload,
         {"route": "sec", "operation": "facts", "ticker": "AAPL", "concept": "NoSuchConceptXyz123"},
     )
-    assert payload["error_category"] == "没有匹配"
-    assert payload["hint"] == "先用 search-concepts / list-filings / attachments 拿到可用的名称或 ID 再读，不要猜"
+    # R2a fix1-2: a confirmed SEC no-match is a successful empty result, not an
+    # error the agent would retry or report as an outage.
+    assert payload["ok"] is True
+    assert payload["status"] == "empty"
+    assert payload["empty_reason"] == "no_matching_records"
+    assert payload["hint"] == "该条件下没有找到文件，可放宽表单 / 日期条件"
+    assert not payload.get("error")
 
 
 def test_sec_object_not_found_variants_and_non_sec_isolation():
@@ -127,7 +137,7 @@ def test_sec_object_not_found_variants_and_non_sec_isolation():
             "finance", "sec", "facts", payload
         )
         assert category == "没有匹配", err_msg
-        assert hint == "先用 search-concepts / list-filings / attachments 拿到可用的名称或 ID 再读，不要猜"
+        assert hint == "该条件下没有找到文件，可放宽表单 / 日期条件"
 
     # Generic upstream 404 or non-SEC route must NOT be misclassified as "没有匹配".
     upstream_outage = {
@@ -245,3 +255,165 @@ def test_the_catalog_still_advertises_ticker_with_the_folding_note():
         spec = rb.ROUTE_CONTRACT_SPECS[route]
         assert "ticker" in spec["accepted_params"], route
         assert "并入 query" in spec["param_formats"]["ticker"], route
+
+
+# R2a-1 (2026-10-29 DASH 07:30 / NOW 08:55): upstream's "No matching <form>
+# filing found" wording — a completed lookup with nothing to show — was missed
+# by _SEC_OBJECT_NOT_FOUND_RE and classified 上游不可用 ("稍后重试"), so the agent
+# retried a lookup that could never match.
+def test_sec_no_matching_form_filing_wording_is_a_no_match():
+    production_wordings = (
+        "No matching 10-Q filing found",
+        "No matching 10-K filings found",
+        "No matching 8-K filing found",
+        "No matching 20-F filings found",
+        "No matching S-1 filing found",
+        "No matching DEF 14A filings found",
+        "No matching Form 4 filings found",
+        "No matching 13F-HR filing found",
+        "No matching filings",
+        "No matching filings found",
+        "no 10-Q filings found",
+        "no 8-K filings found",
+        "no DEF 14A filings found",
+        "no Form 4 filings found",
+        "no 13F-HR filings found",
+    )
+    for err_msg in production_wordings:
+        payload = {"ok": False, "status": "error", "data": {"error": err_msg}}
+        category, hint = rb._classify_error_category_and_hint(
+            "finance", "sec", "list-filings", payload
+        )
+        assert category == "没有匹配", err_msg
+        # The hint says "nothing under these conditions", never "retry later".
+        assert "暂不可用" not in hint and "稍后重试" not in hint, err_msg
+
+    # The same wording on the top-level error field classifies identically.
+    top_level = {"ok": False, "status": "error", "error": "No matching 10-Q filing found"}
+    category_top, _ = rb._classify_error_category_and_hint(
+        "finance", "sec", "list-filings", top_level
+    )
+    assert category_top == "没有匹配"
+
+
+def test_sec_no_matching_form_filing_contract_is_a_successful_empty_result():
+    payload = {"ok": False, "status": "error", "data": {"error": "No matching 10-Q filing found"}}
+    rb._apply_error_and_empty_contract(
+        "finance",
+        "sec",
+        "list-filings",
+        payload,
+        {"route": "sec", "operation": "list-filings", "ticker": "DASH"},
+    )
+    # R2a fix1-2: same shape and field names as the generic no-match contract.
+    assert payload["ok"] is True
+    assert payload["status"] == "empty"
+    assert payload["empty_reason"] == "no_matching_records"
+    assert payload["hint"] == "该条件下没有找到文件，可放宽表单 / 日期条件"
+    assert not payload.get("error")
+    assert payload["data"] == {"ok": True}
+
+
+def test_sec_no_match_is_a_successful_empty_result():
+    """R2a fix1-2: production wordings (and both payload shapes) convert to
+    `ok: true` + empty + `empty_reason`, never `ok: false`/`error`."""
+    for payload in (
+        {"ok": False, "status": "error", "data": {"error": "No matching 10-Q filing found"}},
+        {"ok": False, "status": "error", "error": "no 8-K filings found"},
+        {
+            "ok": False,
+            "status": "error",
+            "data": {"error": "No matching DEF 14A filings found"},
+        },
+    ):
+        p = dict(payload)
+        rb._apply_error_and_empty_contract("finance", "sec", "list-filings", p, {"route": "sec"})
+        assert p["ok"] is True, p
+        assert p["status"] == "empty"
+        assert p["empty_reason"] == "no_matching_records"
+        assert p["hint"] == "该条件下没有找到文件，可放宽表单 / 日期条件"
+        assert not p.get("error") and not p.get("error_category")
+
+    # A genuine outage on the same route stays an error — only the no-match
+    # wording converts.
+    outage = {"ok": False, "status": "error", "data": {"error": "HTTP 502 Bad Gateway"}}
+    rb._apply_error_and_empty_contract("finance", "sec", "list-filings", outage, {"route": "sec"})
+    assert outage["ok"] is False
+    assert outage.get("error_category") == "上游不可用"
+
+
+# R2a fix1-3: every form in the thesis-delta filing monitor's DEFAULT_SEC_FORMS
+# (8-K, 10-Q, 10-K, 6-K, 20-F, S-3ASR, 424B2, 424B5, FWP, 4, SC 13D, SC 13G)
+# plus the /A amendments, in both upstream wordings, is a no-match.
+SEC_MONITOR_FORMS = (
+    "8-K",
+    "10-Q",
+    "10-K",
+    "6-K",
+    "20-F",
+    "S-3ASR",
+    "424B2",
+    "424B5",
+    "FWP",
+    "4",
+    "SC 13D",
+    "SC 13G",
+    "10-K/A",
+    "10-Q/A",
+    "8-K/A",
+    "S-1/A",
+    "SC 13D/A",
+    "424B2/A",
+    "6-K/A",
+    "20-F/A",
+    "S-3ASR/A",
+)
+
+
+@pytest.mark.parametrize("form", SEC_MONITOR_FORMS)
+@pytest.mark.parametrize("template", ["No matching {f} filing found", "no {f} filings found"])
+def test_every_monitor_form_and_amendment_is_a_no_match(form: str, template: str):
+    err_msg = template.format(f=form)
+    payload = {"ok": False, "status": "error", "data": {"error": err_msg}}
+    category, hint = rb._classify_error_category_and_hint(
+        "finance", "sec", "list-filings", payload
+    )
+    assert category == "没有匹配", err_msg
+    contract = {"ok": False, "status": "error", "data": {"error": err_msg}}
+    rb._apply_error_and_empty_contract(
+        "finance", "sec", "list-filings", contract, {"route": "sec"}
+    )
+    assert contract["ok"] is True and contract["empty_reason"] == "no_matching_records", err_msg
+
+
+def test_lowercase_prose_is_not_a_form_name():
+    for err_msg in (
+        "no matching quarterly filings found",
+        "no matching annual filings found",
+    ):
+        payload = {"ok": False, "status": "error", "data": {"error": err_msg}}
+        contract = dict(payload)
+        rb._apply_error_and_empty_contract(
+            "finance", "sec", "list-filings", contract, {"route": "sec"}
+        )
+        # Ordinary prose about filings is not a recognized no-match wording, so
+        # it keeps the failure contract instead of converting to empty.
+        assert contract["ok"] is False, err_msg
+
+
+@pytest.mark.parametrize(
+    "err_msg",
+    (
+        "HTTP 502 Bad Gateway from upstream",
+        "upstream request timed out after 30s",
+        "internal error while listing filings",
+        "SEC upstream returned HTTP 500 (internal server error)",
+        "connect error: connection refused",
+    ),
+)
+def test_real_upstream_errors_are_not_misread_as_sec_no_match(err_msg):
+    payload = {"ok": False, "status": "error", "data": {"error": err_msg}}
+    category, _ = rb._classify_error_category_and_hint(
+        "finance", "sec", "list-filings", payload
+    )
+    assert category != "没有匹配", err_msg

@@ -248,6 +248,10 @@ class DeadlineBeforeSendError(Exception):
     """The caller's deadline passed before the request went upstream: nothing was sent."""
 
 
+# The ledger note for a resend is best-effort: never wait on it for long.
+_RESEND_NOTE_TIMEOUT_S = 2.0
+
+
 def _classify_exception(
     exc: BaseException,
     *,
@@ -619,6 +623,7 @@ async def dalton_complete(
     timeout_s: float = 300.0,
     stale_after_s: int = 900,
     resend_indeterminate: bool = False,
+    resend_max_attempts: int | None = None,
     invocation_id: str | None = None,
     workspace_id: str | None = None,
     thread_id: str | None = None,
@@ -700,6 +705,7 @@ async def dalton_complete(
             request_hash=request_hash,
             stale_after_s=stale_after_s,
             resend_indeterminate=resend_indeterminate,
+            resend_max_attempts=resend_max_attempts,
         )
     )
 
@@ -857,6 +863,7 @@ async def dalton_complete(
             request_hash=request_hash,
             stale_after_s=stale_after_s,
             resend_indeterminate=resend_indeterminate,
+            resend_max_attempts=resend_max_attempts,
         )
     )
     attempt = int(claimed_row.get("attempt") or 1)
@@ -907,6 +914,21 @@ async def dalton_complete(
     # after the upstream LLM already returned is ALWAYS recorded as `indeterminate`
     # (never `failed`), preventing double billing on retry.
     llm_call_completed = False
+    # R2a-2 / R2a fix1-4 (2026-10-28 language review lock-ups): this worker owns
+    # the claim, so it may really repeat a call whose previous attempt ended
+    # uncertain ('indeterminate', or a stale 'pending' read as a crash) and may
+    # already have been billed. The ledger note is written only once the request
+    # has actually gone out (see the `finally` below): never before the send, so
+    # writing it cannot eat into the send's deadline, and a call that dies before
+    # sending leaves no note. A worker that lost the race (`in_flight`) or
+    # replayed a cached result returned earlier and records nothing.
+    is_resend = (
+        resend_indeterminate
+        and claim_action == "claimed"
+        and existing_row is not None
+        and str(existing_row.get("state") or "") in ("indeterminate", "pending")
+    )
+    resend_sent = False
     cash_dec: Decimal | None = None
     notional_dec: Decimal | None = None
     try:
@@ -928,6 +950,7 @@ async def dalton_complete(
             send_timeout_s = min(timeout_s, deadline - time.monotonic())
             if send_timeout_s <= 0:
                 raise DeadlineBeforeSendError("deadline reached before the request was sent")
+        resend_sent = is_resend
         raw_result = await asyncio.wait_for(
             llm_service.complete(
                 user_id=user_id,
@@ -1053,6 +1076,30 @@ async def dalton_complete(
             ),
             raise_on_error=raise_on_error,
         )
+    finally:
+        if resend_sent:
+            # Bounded: a note stuck on a database lock must not hold up the
+            # call's own result, its exception, or a cancellation in progress.
+            try:
+                await asyncio.wait_for(
+                    record_provider_event(
+                        provider or "unknown",
+                        "journal_resend_indeterminate",
+                        user_id=eff_user_id,
+                        model_key=effective_model,
+                        detail={
+                            "invocation_id": inv_id,
+                            "purpose": purpose,
+                            "previous_state": str(existing_row.get("state") or ""),
+                            "previous_attempt": int(existing_row.get("attempt") or 1),
+                            "note": "因上次状态不确定而重发",
+                        },
+                        best_effort=True,
+                    ),
+                    timeout=_RESEND_NOTE_TIMEOUT_S,
+                )
+            except TimeoutError:
+                logger.warning("[DaltonComplete] resend note for %s timed out; skipped", inv_id)
 
 
 journaled_complete = dalton_complete
