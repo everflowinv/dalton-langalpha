@@ -10,6 +10,7 @@ import asyncio
 import dataclasses
 import functools
 import hashlib
+import json  # DALTON-HOOK(wrapper-gap-recovery)
 import shlex
 import time
 from collections.abc import Awaitable, Callable, Sequence
@@ -35,6 +36,7 @@ from ptc_agent.core.sandbox.retry import RetryPolicy
 from ptc_agent.core.sandbox.runtime import ExecResult
 
 from ..paths import SandboxLayout, WorkspaceLayout
+from ..project_context import current_project  # DALTON-HOOK(wrapper-gap-recovery)
 
 if TYPE_CHECKING:
     from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
@@ -541,6 +543,109 @@ async def run_foreground(
     return outcome
 
 
+# DALTON-HOOK(wrapper-gap-recovery): appended to a failed run's output when
+# the import it failed on is exactly one of the generated wrapper modules
+# (``tools.<server>``, server named by the registry the wrappers were built
+# from). The auto-install path deliberately never installs local names, so
+# without this the agent sees a bare ModuleNotFoundError and reports the
+# outage as "no such data" — 48h review item 11 (MSFT thread, 2026-10-28)
+# lost two evidence branches to exactly that reading.
+_WRAPPER_IMPORT_HINT = (
+    "The failed tools.<server> import above is a data-channel outage, not a "
+    "finding that the data does not exist. Record it honestly as a "
+    "data-fetch failure, or switch to another source; do not report the data "
+    "as absent."
+)
+
+
+def _note_wrapper_import_gap(
+    outcome: _jobs.Ended, server_names: frozenset[str]
+) -> _jobs.Ended:
+    """The outcome with the wrapper-gap hint appended, when it names one.
+
+    ``raised`` is the run's own ``ModuleNotFoundError`` record. The hint is
+    for the exact full name of a wrapper this sandbox generated — a server
+    the registry names, which is the set ``install_tool_modules`` builds
+    wrappers from. A misspelled server (``tools.research_data``) or a deeper
+    import (``tools.researchdata.foo``) is the agent's own code being wrong,
+    and a channel-outage note there would send it hunting other sources
+    instead of fixing the line.
+    """
+    head, sep, server = (outcome.raised or "").strip().partition(".")
+    if (
+        head != "tools"
+        or not (sep and server)
+        or "." in server
+        or server not in server_names
+    ):
+        return outcome
+    logger.warning(
+        "Code run failed importing an MCP wrapper module",
+        command_id=outcome.ref.command_id,
+        raised=outcome.raised,
+    )
+    return dataclasses.replace(
+        outcome,
+        output=f"{outcome.output}\n{_WRAPPER_IMPORT_HINT}"
+        if outcome.output
+        else _WRAPPER_IMPORT_HINT,
+    )
+
+
+# DALTON-HOOK(wrapper-gap-recovery): the hint's install-record read is
+# optional, so it is bounded and never mends the channel it rides.
+_WRAPPER_RECORD_READ_TIMEOUT_S = 5
+
+
+def _wrapper_import_candidate(raised: str | None) -> str | None:
+    """The ``<server>`` of a bare ``tools.<server>`` import failure, else None."""
+    head, sep, server = (raised or "").strip().partition(".")
+    if head != "tools" or not (sep and server) or "." in server:
+        return None
+    return server
+
+
+async def _installed_wrapper_servers(sandbox: "PTCSandbox") -> frozenset[str]:
+    """The wrapper names this workspace's own install recorded, or none.
+
+    The registry is the computer's shared view: a sibling workspace's sync
+    swaps it, so a name it no longer lists says nothing about the folder
+    this run works in. ``mcp_client_config.json``, which
+    ``install_tool_modules`` writes beside the wrappers, is per-workspace
+    and names exactly the servers that folder's symlinks were built for.
+    Unreadable, slow, or stamped with another workspace's id, it answers
+    empty: the hint is only for a name this workspace really had. The read
+    is one exec under a hard deadline with reconnect off, so an already
+    finished failure is never held up, and the runtime is left as found.
+    """
+    workspace = sandbox.workspace()
+    try:
+        result = await asyncio.wait_for(
+            sandbox._runtime_call(
+                sandbox.runtime.exec,
+                f"cat {shlex.quote(workspace.mcp_client_config)}",
+                timeout=_WRAPPER_RECORD_READ_TIMEOUT_S,
+                retry_policy=RetryPolicy.SAFE,
+                allow_reconnect=False,
+                retries=1,
+                total_timeout=_WRAPPER_RECORD_READ_TIMEOUT_S,
+            ),
+            timeout=_WRAPPER_RECORD_READ_TIMEOUT_S,
+        )
+        if int(getattr(result, "exit_code", 1)) != 0:
+            return frozenset()
+        raw = getattr(result, "stdout", "") or ""
+        view = json.loads(raw) if raw.strip() else None
+    except Exception:  # noqa: BLE001 - unreadable answers empty, hint stays silent
+        return frozenset()
+    if not isinstance(view, dict) or not isinstance(view.get("servers"), dict):
+        return frozenset()
+    ctx = current_project()
+    if ctx is not None and view.get("workspace_id") != ctx.workspace_id:
+        return frozenset()
+    return frozenset(view["servers"])
+
+
 async def start_code_job(
     sandbox: "PTCSandbox",
     code: str,
@@ -582,7 +687,15 @@ async def start_code_job(
         if package is not None:
             package = mcp_setup.pip_package_for_import(package)
         if package is None:
-            return outcome
+            # DALTON-HOOK(wrapper-gap-recovery): the local-name filter drops
+            # ``tools.<server>`` here; the run's result must still tell the
+            # agent what kind of failure it was — but only when the name is
+            # one of the wrappers this workspace actually had installed, read
+            # from its own install record rather than the shared registry.
+            if _wrapper_import_candidate(outcome.raised) is None:
+                return outcome
+            server_names = await _installed_wrapper_servers(sandbox)
+            return _note_wrapper_import_gap(outcome, server_names)
         logger.info(
             "Attempting auto-install and retry",
             command_id=outcome.ref.command_id,

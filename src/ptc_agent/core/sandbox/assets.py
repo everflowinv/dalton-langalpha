@@ -500,6 +500,78 @@ async def _compute_sandbox_manifest(
     }
 
 
+#: The wrapper-existence probe's per-attempt exec timeout, and its whole
+#: budget. The probe is an optional check riding the fast path, so it must
+#: never hold an acquisition hostage to a stuck exec channel: every
+#: provider's exec honors ``timeout``, the retry loop gets one retry and a
+#: deadline of its own, and the wait_for wall cancels even a call the
+#: provider would keep waiting on. Past the budget the probe reads as
+#: unverifiable — no re-install, no blocked acquisition.
+_WRAPPER_PROBE_EXEC_TIMEOUT_S = 8
+_WRAPPER_PROBE_BUDGET_S = 10.0
+
+
+async def _missing_tool_modules(
+    sandbox: "PTCSandbox", project: ProjectContext
+) -> list[str] | None:
+    """Servers whose wrapper module the workspace can no longer import.
+
+    One batched ``test -f`` over the workspace overlay — ``-f`` follows the
+    symlink, so a dangling link and a missing union target read the same.
+    None when the check cannot answer (no runtime or registry yet, no
+    servers, or the probe itself failed or timed out): unverifiable is not
+    missing, and a probe the sandbox will not answer must not turn every
+    sync into a re-install.
+    """
+    # DALTON-HOOK(wrapper-gap-recovery): the manifest is a record of what a
+    # completed sync uploaded, not a statement about the disk. Anything that
+    # deletes a wrapper afterwards — a prune gone wide, the agent's own rm, a
+    # partial restore — hides behind a matching hash while every
+    # ``from tools.<server> import ...`` fails in the workspace (48h review
+    # item 11: the MSFT thread's researchdata wrappers).
+    if sandbox.runtime is None or sandbox.mcp_registry is None:
+        return None
+    tools_by_server = sandbox.mcp_registry.get_all_tools()
+    if not tools_by_server:
+        return None
+    overlay = sandbox.workspace(project).tools
+    probe = "; ".join(
+        f"[ -f {shlex.quote(f'{overlay}/{name}.py')} ] || printf '%s\\n' {shlex.quote(name)}"
+        for name in sorted(tools_by_server)
+    )
+    try:
+        result = await asyncio.wait_for(
+            sandbox._runtime_call(
+                sandbox.runtime.exec,
+                probe,
+                timeout=_WRAPPER_PROBE_EXEC_TIMEOUT_S,
+                retry_policy=RetryPolicy.SAFE,
+                # An optional check must not mend the connection it rides: a
+                # reconnect closes the old provider and its task is shielded,
+                # so a probe that tripped one would return "unverifiable"
+                # while a reconnect it started keeps mutating the runtime
+                # under the acquisition. No reconnect, no rebind — whatever
+                # the channel does, this call leaves it as it found it.
+                allow_reconnect=False,
+                retries=2,
+                total_timeout=_WRAPPER_PROBE_BUDGET_S,
+            ),
+            timeout=_WRAPPER_PROBE_BUDGET_S,
+        )
+    except TimeoutError:
+        logger.warning("Tool wrapper existence probe timed out")
+        return None
+    except Exception as e:  # noqa: BLE001 - a failed probe is not a missing module
+        logger.warning("Tool wrapper existence probe failed", error=str(e))
+        return None
+    if result.exit_code != 0:
+        return None
+    missing = [
+        line.strip() for line in (result.stdout or "").splitlines() if line.strip()
+    ]
+    return missing or None
+
+
 async def _read_unified_manifest(sandbox: "PTCSandbox") -> dict[str, Any] | None:
     """Read the unified manifest from the sandbox.
 
@@ -894,6 +966,20 @@ async def sync_sandbox_assets(
                 ):
                     changed_modules.add(mod_name)
 
+        # DALTON-HOOK(wrapper-gap-recovery): verify what the manifest claims
+        # only on the branch that would otherwise skip the install, so the
+        # settled fast path pays one batched existence probe instead of a
+        # re-upload, and a found gap forces exactly one re-install.
+        wrapper_gap: list[str] | None = None
+        if "tool_modules" not in changed_modules and not overlay_missing:
+            wrapper_gap = await sandbox._missing_tool_modules(project)
+            if wrapper_gap:
+                logger.info(
+                    "Tool wrapper modules missing from the sandbox; forcing a re-sync",
+                    servers=wrapper_gap,
+                )
+                changed_modules.add("tool_modules")
+
         if not changed_modules:
             # `is None` guard (like the slow path): the cached manifest may
             # already hold the merged local+agent-installed view — overwriting
@@ -1012,6 +1098,16 @@ async def sync_sandbox_assets(
             )
             refreshed.append("tool_modules")
             _mark_sync("tool_modules")
+            # DALTON-HOOK(wrapper-gap-recovery): the forced re-sync answers
+            # for itself. Still missing means something outside the sync is
+            # deleting the files, which the operator has to see named.
+            if wrapper_gap is not None:
+                still_missing = await sandbox._missing_tool_modules(project)
+                if still_missing:
+                    logger.warning(
+                        "Tool wrapper modules still missing after a forced re-sync",
+                        servers=still_missing,
+                    )
             try:
                 await sandbox._start_internal_mcp_servers()
             except Exception as e:

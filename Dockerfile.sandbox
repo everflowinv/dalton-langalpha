@@ -45,6 +45,11 @@ RUN apt-get update \
         # pdftotext needs for Chinese PDFs, and `file` the type probe the wiki
         # ingest and PDF handlers shell out to; both absent from upstream's list.
         poppler-utils poppler-data file pandoc qpdf fuse3 \
+        # DALTON-HOOK(sandbox-ffprobe): ffmpeg ships ffprobe, which the ASR
+        # pipeline (scripts/dalton/asr_jobs.py) probes audio duration with —
+        # absent from upstream's list (48h review item 12: recording probes
+        # failed on the sandbox image).
+        ffmpeg \
         libreoffice-writer libreoffice-calc libreoffice-impress libreoffice-draw \
         fonts-noto-cjk fonts-dejavu-core fonts-opensymbol \
     # -- uv (Python package manager) — relocate BOTH uv and uvx; the MCP

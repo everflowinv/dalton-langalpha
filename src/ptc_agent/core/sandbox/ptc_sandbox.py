@@ -1184,6 +1184,13 @@ class PTCSandbox:
             self, project=project, tool_version=tool_version
         )
 
+    async def _missing_tool_modules(
+        self, project: ProjectContext
+    ) -> list[str] | None:
+        # DALTON-HOOK(wrapper-gap-recovery): the sync's wrapper-existence
+        # probe, a same-name delegator like every other assets helper.
+        return await _assets._missing_tool_modules(self, project)
+
     async def workspace_overlay_missing(
         self, *, workspace_id: str, dir_name: str | None
     ) -> bool:

@@ -256,6 +256,16 @@ ALLOWED_HOOKS=(
   # R3a-4: a subagent's usage row reports its task run's own terminal state,
   # not a blanket completed (runs/subagent_usage.py).
   "subagent-usage-status"
+  # R5-11 (48h review): the sync probes that enabled servers' wrapper modules
+  # still exist in the workspace overlay before skipping the install, forces
+  # one re-sync on a gap, warns when it stays missing, and a code run that
+  # dies importing tools.<server> is told it is a data-channel outage, not
+  # absent data (assets.py, ptc_sandbox.py, execution.py).
+  "wrapper-gap-recovery"
+  # R5-12 (48h review): the sandbox image installs ffmpeg, which ships the
+  # ffprobe the ASR pipeline probes recording duration with
+  # (Dockerfile.sandbox).
+  "sandbox-ffprobe"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
