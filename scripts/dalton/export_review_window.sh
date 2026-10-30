@@ -20,6 +20,15 @@
 # Env overrides: DALTON_BACKEND_CONTAINER (default dalton-langalpha-backend-1),
 # DALTON_LOG_DIR (default ~/Library/Logs). This script only reads logs and
 # never touches .env, tokens, or the database.
+#
+# The header names each running version separately (24h review item 22): the
+# host repo HEAD, the backend image's id and creation time, the backend
+# container's start time, and each bridge's server_version from the newest
+# "Listening on …" startup line in its logs ("unknown" when it never logged
+# one). When the container started later than --since, the header says the
+# backend logs only cover after the container start — the earlier ones were
+# lost with the container rebuild. Values lifted out of log lines still pass
+# through the redactor before they reach the header.
 
 set -euo pipefail
 
@@ -130,6 +139,77 @@ docker_logs_args+=("--timestamps" "$BACKEND_CONTAINER")
 
 commit="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
 image_id="$(docker inspect --format '{{.Image}}' "$BACKEND_CONTAINER" 2>/dev/null || echo unknown)"
+image_created="unknown"
+if [[ "$image_id" != "unknown" ]]; then
+  image_created="$(docker image inspect --format '{{.Created}}' "$image_id" 2>/dev/null || echo unknown)"
+fi
+container_started="$(docker inspect --format '{{.State.StartedAt}}' "$BACKEND_CONTAINER" 2>/dev/null || echo unknown)"
+
+# 24h review item 22: one commit field could not say which version the host
+# repo, the backend image and the two bridge processes each ran, and a
+# container rebuild that lost the early logs read as an empty window. The
+# bridges name their version on every startup line, so the most recent
+# "Listening on … server_version=" line answers which build served the
+# window's tail; anything read out of a log still passes the redactor.
+bridge_server_version() {
+  # bridge_server_version <log...>: version from the newest startup line
+  # that carries one, compared by each line's own leading timestamp across
+  # every file — a restart's record may sit in either log, so file order
+  # decides nothing. A line whose head is not a timestamp (an unlogged
+  # rewrite, a stray echo) does not compete. Every step is guarded: a
+  # missing log file or a failed grep answers "unknown" rather than
+  # aborting the export under `set -euo pipefail`.
+  # The sed keeps one "timestamp<T>version" word per qualifying line (the
+  # date/time separator is normalized to T so the C-locale sort compares
+  # instants, not spellings); bash 3.2 takes it from there.
+  local picked
+  picked="$(
+    {
+      grep -h 'Listening on' "$@" 2>/dev/null || true
+    } | sed -n 's/^\([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}\)[T ]\([0-9]\{2\}:[0-9]\{2\}:[0-9]\{2\}\)\([.,][0-9]\{1,9\}\)\{0,1\} .*server_version=\([^ ,)]*\).*/\1T\2\3 \4/p' \
+    | LC_ALL=C sort -r | head -n 1
+  )"
+  picked="${picked#* }"
+  printf '%s' "${picked:-unknown}"
+}
+redacted_version() {
+  # A value lifted out of a log line is log content until proven otherwise.
+  local v out
+  v="$(bridge_server_version "$@")"
+  if [[ "$v" == "unknown" ]]; then
+    printf '%s' "$v"
+    return
+  fi
+  out="$(printf '%s' "$v" | "$PYTHON_BIN" "$REDACTOR" - - 2>/dev/null)" || out=""
+  printf '%s' "${out:-unknown}"
+}
+research_version="$(redacted_version "$RESEARCH_ERR_LOG" "$RESEARCH_OUT_LOG")"
+websearch_version="$(redacted_version "$WEBSEARCH_ERR_LOG" "$WEBSEARCH_OUT_LOG")"
+
+backend_coverage="$(
+  "$PYTHON_BIN" - "$(dirname "$REDACTOR")" "$container_started" "$docker_since" <<'PY' 2>/dev/null
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from log_redaction import parse_window_timestamp
+
+started, since = sys.argv[2], sys.argv[3]
+try:
+    started_dt = parse_window_timestamp(started)
+    since_dt = parse_window_timestamp(since)
+except ValueError:
+    print("unknown (container start or window start unreadable)")
+    raise SystemExit(0)
+if started_dt > since_dt:
+    print(
+        f"backend logs only cover after {started} (container start); "
+        "logs from before that were lost with the container rebuild"
+    )
+else:
+    print(f"full window (container started {started}, before --since)")
+PY
+)" || backend_coverage="unknown (coverage comparison failed)"
+
 timezone="$(date +%Z%z) ($(readlink /etc/localtime 2>/dev/null || echo '?'))"
 
 {
@@ -139,6 +219,11 @@ timezone="$(date +%Z%z) ($(readlink /etc/localtime 2>/dev/null || echo '?'))"
   echo "commit: $commit"
   echo "backend_container: $BACKEND_CONTAINER"
   echo "backend_image_id: $image_id"
+  echo "backend_image_created: $image_created"
+  echo "backend_container_started: $container_started"
+  echo "backend_log_coverage: $backend_coverage"
+  echo "researchdata_bridge_server_version: $research_version"
+  echo "websearch_bridge_server_version: $websearch_version"
   echo "timezone: $timezone"
   echo "host: $(hostname)"
   echo "generated: $(date '+%Y-%m-%d %H:%M:%S %Z')"

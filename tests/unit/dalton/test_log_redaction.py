@@ -316,7 +316,9 @@ def test_export_script_captures_docker_stderr_and_fails_on_invalid_window(
     fake_docker = fake_bin / "docker"
     fake_docker.write_text(
         "#!/usr/bin/env bash\n"
+        'if [[ "$1 $2" == "image inspect" ]]; then echo "2026-10-01T08:00:00Z"; exit 0; fi\n'
         'if [[ "$1" == "inspect" ]]; then\n'
+        '  if [[ "$*" == *"{{.State.StartedAt}}"* ]]; then echo "2026-10-27T02:30:00Z"; exit 0; fi\n'
         '  echo "sha256:fakeimage"\n'
         "  exit 0\n"
         "fi\n"
@@ -530,7 +532,9 @@ def test_export_script_hands_docker_rfc3339_with_local_offset(
     fake_docker = fake_bin / "docker"
     fake_docker.write_text(
         "#!/usr/bin/env bash\n"
+        'if [[ "$1 $2" == "image inspect" ]]; then echo "2026-10-01T08:00:00Z"; exit 0; fi\n'
         'if [[ "$1" == "inspect" ]]; then\n'
+        '  if [[ "$*" == *"{{.State.StartedAt}}"* ]]; then echo "2026-10-27T02:30:00Z"; exit 0; fi\n'
         '  echo "sha256:fakeimage"\n'
         "  exit 0\n"
         "fi\n"
