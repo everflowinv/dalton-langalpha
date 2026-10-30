@@ -53,6 +53,57 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger(__name__)
 
+# DALTON-HOOK(grep-content-cap): the wire bound for one content search.
+# Unpaged asks get the flat base. A paged ask adds a per-entry allowance to
+# its own depth: the page's ``-m offset+head_limit`` bounds the event
+# COUNT, never the bytes, so a single 16 MiB line under ``head_limit=1``
+# still crossed the wire whole (codex r2 #1: 16,777,410 bytes returned,
+# ~80 MiB Python peak, for 208 displayed characters). 4 KiB per event
+# covers a rendered line's whole budget (GREP_LINE_CHARS 500 plus its path
+# and JSON envelope) with margin, so no real page is lost while one event
+# can no longer outweigh its slot; the ceiling keeps a pathological deep
+# page from re-creating the unbounded class.
+_GREP_CONTENT_WIRE_BYTES = 2 * 1024 * 1024
+_GREP_WIRE_PER_ENTRY_BYTES = 4 * 1024
+_GREP_WIRE_MAX_BYTES = 64 * 1024 * 1024
+
+
+def _grep_wire_cap_bytes(bound: int | None) -> int:
+    """The byte bound of one content search collecting ``bound`` events
+    (None: the unpaged flat base)."""
+    if bound is None:
+        return _GREP_CONTENT_WIRE_BYTES
+    return min(
+        _GREP_CONTENT_WIRE_BYTES + bound * _GREP_WIRE_PER_ENTRY_BYTES,
+        _GREP_WIRE_MAX_BYTES,
+    )
+
+# DALTON-HOOK(grep-content-cap)
+_GREP_CONTENT_WIRE_NOTE = (
+    "[Grep content results for {path} stopped at the {mb} MB limit on what "
+    "one search may bring back; more matches existed. Narrow the path or "
+    "glob, or page with head_limit and offset.]"
+)
+
+# DALTON-HOOK(grep-content-cap)
+_GREP_LONG_LINE_NOTE = (
+    "[Grep content results for {path}: the first matching line alone "
+    "exceeds the {mb} MB limit one search may bring back, so no lines were "
+    "returned. Narrow the path or glob, or Read the file with offset/limit "
+    "instead.]"
+)
+
+
+class _CappedGrep(list):
+    """DALTON-HOOK(grep-content-cap): a content answer that hit the wire
+    cap, carrying its note the way every route answer does (``notes``,
+    read duck-typed — this layer cannot import the agent backends' carrier
+    without a circular import)."""
+
+    def __init__(self, entries, notes):
+        super().__init__(entries)
+        self.notes = tuple(notes)
+
 # DALTON-HOOK(sandbox-inline-write-limit): the inline write ships the base64 payload inside one
 # `sh -c` argument, and Linux caps a single argv string at MAX_ARG_STRLEN (128 KiB), so on the
 # Docker runtime any text between ~96 and 256 KiB failed with exit 255 ("argument list too
@@ -1026,6 +1077,21 @@ async def agrep_content(
             # so these keys cannot match inside a line's text.
             limit = f"-m {bound} " if bound else ""
             cmd_str += f" | grep {limit}-F -e '\"type\":\"match\"' -e '\"type\":\"context\"'"
+            # DALTON-HOOK(grep-content-cap): the byte bound applies to every
+            # content ask, paged or not — ``-m`` bounds the event count,
+            # never the bytes — scaled to the ask's own depth (see
+            # ``_grep_wire_cap_bytes``). A few bytes past the cap are
+            # requested so the shell side itself proves the cap was hit —
+            # in bytes, not the decoder's character count — and iconv -c
+            # drops a trailing multi-byte character the cut may have split,
+            # so what crosses the wire is always decodable text (cat covers
+            # a machine with no iconv; its input is then whatever iconv
+            # left unread, everything when it never ran).
+            wire_cap = _grep_wire_cap_bytes(bound)
+            cmd_str += (
+                f" | head -c {wire_cap + 3}"
+                " | { iconv -c -f UTF-8 -t UTF-8 2>/dev/null || cat; }"
+            )
         elif bound:
             cmd_str += f" | head -n {bound}"
         cmd_str += "; exit ${lost:-$?}"
@@ -1044,6 +1110,35 @@ async def agrep_content(
             )
 
         output = result.stdout.strip() if result.stdout else ""
+        # DALTON-HOOK(grep-content-cap): the cap asks for a few bytes past
+        # its bound, so a stream longer than the bound proves itself in
+        # bytes — a multibyte tail that decodes to fewer characters cannot
+        # hide it (iconv may have dropped up to three split bytes at the
+        # cut, which a bound-sized stream still clears). A capped stream is
+        # cut back to its last complete line: the cut can land between
+        # characters of the last JSON event, and rendering a torn line would
+        # show the model a fragment of JSON as if it were the match.
+        wire_capped = (
+            output_mode == "content"
+            and len((result.stdout or "").encode("utf-8", "replace")) >= wire_cap
+        )
+        if wire_capped:
+            cut = (result.stdout or "").rfind("\n")
+            safe = (result.stdout or "")[: cut + 1] if cut != -1 else ""
+            if not safe.strip():
+                # Not even one event fits: the first matching line alone
+                # outgrew the cap. Say that plainly — no torn JSON, and no
+                # "no matches" either.
+                return _CappedGrep(
+                    [],
+                    [
+                        _GREP_LONG_LINE_NOTE.format(
+                            path=logged_path(path),
+                            mb=wire_cap // (1024 * 1024),
+                        )
+                    ],
+                )
+            output = safe.strip()
         if not output:
             return []
 
@@ -1086,6 +1181,19 @@ async def agrep_content(
             results_strs = results_strs[offset:]
         if head_limit:
             results_strs = results_strs[:head_limit]
+        # DALTON-HOOK(grep-content-cap): the note rides the answer the way
+        # the in-memory routes' notes do; the tool and the composite both
+        # read ``notes`` off whatever a route handed back.
+        if wire_capped:
+            return _CappedGrep(
+                results_strs,
+                [
+                    _GREP_CONTENT_WIRE_NOTE.format(
+                        path=logged_path(path),
+                        mb=wire_cap // (1024 * 1024),
+                    )
+                ],
+            )
         return results_strs
 
     except Exception as e:

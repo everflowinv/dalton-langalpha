@@ -104,3 +104,14 @@ src/dalton/transcription_storage.py
 tests/unit/dalton/test_transcription_storage.py
 # R1: grouped handoff tallies keep unfinished reports apart.
 web/src/pages/ChatAgent/components/analystHandoff/__tests__/HandoffGroup.unfinished.test.tsx
+# R3a-1: 402/quota-429 classification and the run-scoped bench of exhausted
+# candidates (error_classification + model_resilience middleware).
+tests/unit/llms/test_quota_exhaustion_classification.py
+tests/unit/middleware/test_model_quota_exhaustion.py
+# R3a-2: Grep refuses every-line patterns; content collection is bounded at
+# the sandbox wire and the tool's rendered answer.
+tests/unit/ptc_agent/agent/tools/test_grep_content_cap.py
+# R3a-4: a subagent usage row reports its task run's terminal state.
+tests/unit/server/services/test_subagent_usage_terminal_status.py
+# R3a-5: a dispatch whose declared files are missing/empty is partial.
+tests/unit/middleware/workflow/test_partial_artifacts.py

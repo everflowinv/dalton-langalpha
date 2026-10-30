@@ -377,7 +377,7 @@ const check =
         `只读核对以下文件是否存在并计算 sha256（用 bash 的 test -e 与 sha256sum，不写任何文件）。只返回下面列出的文件，一个不能少、不能多、不能夹带其他条目：\n${deliverables
           .map((p) => '- ' + p)
           .join('\n')}\n返回 files 字符串数组：存在的文件写 “<路径>|<sha256>”，不存在的只写 “<路径>”（不带竖线）。`,
-        { agentType: 'dalton-evidence', label: '产物核验', phase: '产物核验', schema: HASH }
+        { agentType: 'dalton-evidence', label: '产物核验', phase: '产物核验', schema: HASH, checkFiles: false }
       )
 const SHA_RE = /^[0-9a-f]{64}$/
 const expected = new Set(deliverables)

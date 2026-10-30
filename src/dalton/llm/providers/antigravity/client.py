@@ -29,6 +29,7 @@ same Gemini wire shape.
 
 import json
 import logging
+import math
 import re
 import time
 import uuid
@@ -98,6 +99,63 @@ class AntigravityApiError(RuntimeError):
         self.status = status
         self.status_code = status
         self.body = body
+
+
+# The subscription's quota refusal, as the backend words it (seen 34× on
+# 10/30): a 429 that is really an allowance, naming how long it lasts.
+_ANTIGRAVITY_QUOTA_MARKER = "individual quota reached"
+
+# "... Resets in 6h49m18s." — every unit optional except at least one.
+_ANTIGRAVITY_RESETS_RE = re.compile(
+    r"resets in (?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:(\d+)s)?",
+    re.IGNORECASE,
+)
+
+
+def _iter_error_texts(err: BaseException):
+    seen: set[int] = set()
+    current: BaseException | None = err
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield str(current)
+        body = getattr(current, "body", None)
+        if body:
+            yield str(body)
+        current = current.__cause__ or current.__context__
+
+
+def antigravity_quota_reset_seconds(err: BaseException | None) -> float | None:
+    """Seconds until the account's Antigravity allowance refills, for a 429
+    whose body says the quota is reached; ``None`` for anything else.
+
+    A quota refusal without a readable reset still counts as exhausted for the
+    run (``math.inf``): the marker says an allowance ran out, which no retry
+    this side of a top-up answers. A plain rate-limit 429 never carries the
+    marker and stays a short, retryable refusal.
+    """
+    if not isinstance(err, BaseException):
+        return None
+    status = getattr(err, "status_code", None)
+    if status is None:
+        response = getattr(err, "response", None)
+        status = getattr(response, "status_code", None)
+    if status != 429:
+        return None
+    text = " ".join(_iter_error_texts(err)).lower()
+    if _ANTIGRAVITY_QUOTA_MARKER not in text:
+        return None
+    hours = minutes = seconds = 0.0
+    matched_unit = False
+    for match in _ANTIGRAVITY_RESETS_RE.finditer(text):
+        h, m, s = match.group(1), match.group(2), match.group(3)
+        if not (h or m or s):
+            continue
+        matched_unit = True
+        hours, minutes, seconds = float(h or 0), float(m or 0), float(s or 0)
+    if not matched_unit:
+        return math.inf
+    total = hours * 3600.0 + minutes * 60.0 + seconds
+    return total if total > 0 else math.inf
 
 
 def _normalize_thinking_level(value: Any) -> Optional[str]:

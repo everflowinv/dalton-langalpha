@@ -9,12 +9,15 @@ separate because ptc_agent code must not import from src/server.
 
 from __future__ import annotations
 
+import math
 import re
 
 # Client-side errors that fail identically on every retry of the same model:
 # bad request shape, auth, unknown model, oversized payload, unsupported
 # params. 408 and 429 are absent on purpose — those are transient.
-NON_RETRYABLE_STATUSES: frozenset[int] = frozenset({400, 401, 403, 404, 405, 413, 422})
+# DALTON-HOOK(quota-exhaustion): 402 (payment required) sits here too — the
+# account behind the key is out of balance, which no backoff waits out.
+NON_RETRYABLE_STATUSES: frozenset[int] = frozenset({400, 401, 402, 403, 404, 405, 413, 422})
 
 # Raised by our own or an SDK's code on input it cannot handle: a field the
 # provider never sent, a value of the wrong type, a method a proxy's payload
@@ -199,3 +202,58 @@ def is_retryable_error(exc: BaseException, status_code: int | None = None) -> bo
     if status_code is None:
         return not is_programming_error(exc)
     return status_code not in NON_RETRYABLE_STATUSES
+
+
+# DALTON-HOOK(quota-exhaustion): the quota/billing half of error
+# classification, shared by the model-resilience middleware with
+# ``is_retryable_error``. Kept here so every caller classifies one way.
+def quota_exhaustion_seconds(
+    exc: BaseException, status_code: int | None = None
+) -> float | None:
+    """Seconds until the account's quota or balance might refill, for an
+    error that is an allowance running out rather than a transient limit;
+    ``None`` when the error says nothing of the kind.
+
+    ``math.inf`` means no refill is coming inside any run: a 402 (payment
+    required) or a provider's own billing prose. A horizon the error names is
+    returned as seconds, for the caller to weigh against what it can wait
+    out. Transient 429s and every other error answer ``None`` and keep their
+    existing retry handling.
+    """
+    if status_code is None:
+        status_code = extract_status_code(exc)
+    if status_code == 402:
+        return math.inf
+    try:
+        from src.dalton.llm.providers.xai_grok.client import classify_xai_error
+
+        if classify_xai_error(exc, require_xai_origin=True) == "billing":
+            return math.inf
+    except Exception:
+        pass
+    try:
+        # Antigravity's quota 429 names its reset ("Individual quota reached …
+        # Resets in 6h49m18s"), so the horizon is read from the refusal itself.
+        from src.dalton.llm.providers.antigravity.client import (
+            antigravity_quota_reset_seconds,
+        )
+
+        horizon = antigravity_quota_reset_seconds(exc)
+        if horizon is not None:
+            return horizon
+    except Exception:
+        pass
+    if status_code == 429:
+        # A numeric Retry-After header is a horizon too; the HTTP-date form
+        # is not parsed — providers that mean hours say so in the body.
+        for current in _iter_exception_chain(exc):
+            response = getattr(current, "response", None)
+            headers = getattr(response, "headers", None)
+            raw = headers.get("Retry-After") if hasattr(headers, "get") else None
+            if raw is None:
+                continue
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                continue
+    return None

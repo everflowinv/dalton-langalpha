@@ -30,6 +30,9 @@ _XAI_BILLING_MARKERS: tuple[str, ...] = (
     "used all credits",
     "monthly spending limit",
     "need a grok subscription",
+    # 402 from cli-chat-proxy.grok.com, seen 1,922× on 10/30: the account's
+    # Grok Build balance is gone until it is paid, not a transient refusal.
+    "usage balance exhausted",
 )
 
 _XAI_RATE_LIMIT_MARKERS: tuple[str, ...] = (

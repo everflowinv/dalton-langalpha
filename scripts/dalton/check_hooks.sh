@@ -234,6 +234,19 @@ ALLOWED_HOOKS=(
   # a fact (turn_context.py, turn.py, context_stack.py, turn.md.j2,
   # request_prep.py, ptc_run.py).
   "turn-row-model-line"
+  # R3a-1: 402 / balance-exhausted refusals and quota 429s whose reset
+  # outlasts the backoff budget are not retried and bench the candidate for
+  # the rest of the run (error_classification.py, model_resilience.py;
+  # provider prose in src/dalton).
+  "quota-exhaustion"
+  # R3a-2: a Grep pattern that matches every line is refused before any route
+  # runs; content collection is bounded at the sandbox wire and the in-memory
+  # routes' line count, and the tool's rendered answer at 200k chars
+  # (grep.py, files.py, langgraph_store.py, db_json_route.py, composite.py).
+  "grep-content-cap"
+  # R3a-4: a subagent's usage row reports its task run's own terminal state,
+  # not a blanket completed (runs/subagent_usage.py).
+  "subagent-usage-status"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

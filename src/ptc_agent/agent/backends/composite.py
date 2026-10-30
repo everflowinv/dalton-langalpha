@@ -146,14 +146,41 @@ def _page(entries: list[Any], offset: int, head_limit: int | None) -> list[Any]:
     return entries[start:]
 
 
+def _takes_paged(route: FilesystemRoute) -> bool:
+    """Whether ``route``'s ``agrep_rich`` declares the ``paged`` flag —
+    discovered by parameter name, so a route that never heard of it (the
+    transcript route's ``**_``) is handed no argument it cannot see."""
+    import inspect
+
+    try:
+        parameters = inspect.signature(route.agrep_rich).parameters
+    except (TypeError, ValueError):
+        return False
+    return "paged" in parameters
+
+
 def _walked(
-    route: FilesystemRoute, searches: Callable[[str], bool], head_limit: int | None
+    route: FilesystemRoute,
+    searches: Callable[[str], bool],
+    head_limit: int | None,
+    *,
+    paged: bool = False,
 ) -> dict[str, Any]:
     """What a route that ``takes_walk`` is told of the walk: which of its
-    files it searches, and how many entries the page needs at most."""
+    files it searches, and how many entries the page needs at most.
+
+    DALTON-HOOK(grep-content-cap): ``paged`` tells a route the caller
+    slices the page itself (the walk filter below must see the whole route
+    answer before the page can be cut), so the route drops its unpaged
+    collection cap. Only routes whose ``agrep_rich`` names the flag get it.
+    """
     if getattr(route, "takes_walk", False):
-        return {"searches": searches, "head_limit": head_limit}
-    return {"head_limit": None}
+        walked = {"searches": searches, "head_limit": head_limit}
+    else:
+        walked = {"head_limit": None}
+    if paged and _takes_paged(route):
+        walked["paged"] = True
+    return walked
 
 
 def _answer(entries: list[Any], answers: Sequence[Any]) -> list[Any]:
@@ -638,7 +665,11 @@ class CompositeFilesystemBackend:
                         lines_context=lines_context,
                         multiline=multiline,
                         offset=0,
-                        **_walked(route, searches, wanted),
+                        # DALTON-HOOK(grep-content-cap): the route is told
+                        # the caller slices the page itself.
+                        **_walked(
+                            route, searches, wanted, paged=head_limit is not None
+                        ),
                     )
                     for where in wheres
                 )
@@ -680,17 +711,32 @@ class CompositeFilesystemBackend:
         if walk is not None:
             starts = self._grep_starts(normalized, self._routes_below(normalized))
             searched = await _matched(functools.partial(reads, starts, walk), glob)
-            # No limit: which of a route's entries survive rg's own is only
-            # known once both have answered.
+            # No head_limit: which of a route's entries survive rg's own is
+            # only known once both have answered — but a paged ask says so
+            # (DALTON-HOOK(grep-content-cap)), so a route that caps its
+            # unpaged collection can skip the cap for this one.
             told = [
                 _walked(
-                    route, functools.partial(_finds_below, walk, start, route, rel), None
+                    route,
+                    functools.partial(_finds_below, walk, start, route, rel),
+                    None,
+                    paged=head_limit is not None,
                 )
                 for route, rel, start, _ in searched
             ]
+        # DALTON-HOOK(grep-content-cap): a paged Grep bounds the sandbox's
+        # collection by its own page (offset+head_limit) instead of None —
+        # the merge below concatenates the sandbox's hits before the routes'
+        # additions, so a page that ends inside the sandbox part is served
+        # whole while the unbounded ask (None) still gets the collection
+        # bound. Without the bound the sandbox's own byte cap would cut the
+        # stream before a deep page begins.
+        page_bound = (
+            max(0, offset) + head_limit if head_limit is not None and head_limit > 0 else None
+        )
         sandbox_result, *route_results = await asyncio.gather(
             self._sandbox.agrep_rich(
-                pattern, path=normalized, head_limit=None, offset=0, **sandbox_kwargs
+                pattern, path=normalized, head_limit=page_bound, offset=0, **sandbox_kwargs
             ),
             *(
                 self._route_grep(
@@ -738,4 +784,7 @@ class CompositeFilesystemBackend:
 
         if walk is not None and searched:
             combined.extend(await _matched(functools.partial(added, walk), glob))
-        return _answer(_page(combined, offset, head_limit), route_results)
+        # DALTON-HOOK(grep-content-cap): the sandbox's answer may itself
+        # carry notes (its content wire cap); the merge keeps only its
+        # entries, so it joins the routes' answers here.
+        return _answer(_page(combined, offset, head_limit), [sandbox_result, *route_results])

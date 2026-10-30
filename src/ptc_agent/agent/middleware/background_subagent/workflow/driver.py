@@ -54,6 +54,7 @@ from src.dalton.workflows.journal import (
     WorkflowJournal,
     artifact_records,
     engine_safe,
+    missing_declared_artifacts,
     prompt_digest,
 )
 
@@ -155,6 +156,10 @@ class _ChildRun:
     schema_valid: bool | None = None
     truncated: bool = False
     tokens_used: int = 0
+    # DALTON-HOOK(workflow-journal): artifacts the child's own files/file
+    # declared that are missing or empty on disk — set only on an otherwise
+    # ok child, where it means the dispatch is partial, not done (R3a #5).
+    partial_artifacts: list[str] = field(default_factory=list)
 
     @property
     def duration_s(self) -> float:
@@ -179,6 +184,9 @@ class _ChildRun:
             "result": self.content,
             "result_json": self.parsed,
             "schema_valid": self.schema_valid,
+            # DALTON-HOOK(workflow-journal): named here so the run's own
+            # record says which declared deliverables are missing or empty.
+            "partial_artifacts": list(self.partial_artifacts),
             "error": error,
             "truncated": self.truncated,
             "full_result_ref": {"task_id": task_id} if task_id else None,
@@ -480,6 +488,7 @@ class WorkflowDriver:
             label=label,
             phase=phase,
             schema=schema,
+            check_files=rec["check_files"],
         )
         if schema is None:
             # DALTON-HOOK(workflow-journal): `engine_safe` guards the engine
@@ -488,9 +497,13 @@ class WorkflowDriver:
             if child.status == "ok":
                 return engine_safe(child.content)
             return None
-        if child.schema_valid:
+        # DALTON-HOOK(workflow-journal): a partial dispatch (declared
+        # artifacts missing or empty) hands the script the same null a
+        # failed child does, so no stage rides on a deliverable that is not
+        # on disk.
+        if child.schema_valid and not child.partial_artifacts:
             return engine_safe(child.parsed)
-        if child.status != "invalid_schema":
+        if child.status != "invalid_schema" or child.partial_artifacts:
             return None
 
         if self._cap_reached():
@@ -514,8 +527,16 @@ class WorkflowDriver:
             label=label,
             phase=phase,
             schema=schema,
+            check_files=rec["check_files"],
         )
-        return engine_safe(retry.parsed) if retry.schema_valid else None
+        # DALTON-HOOK(workflow-journal): the retry inherits the partial gate
+        # too — a redispatch whose artifacts are still missing still hands
+        # the script null.
+        return (
+            engine_safe(retry.parsed)
+            if retry.schema_valid and not retry.partial_artifacts
+            else None
+        )
 
     async def _dispatch_child(
         self,
@@ -526,6 +547,7 @@ class WorkflowDriver:
         label: str,
         phase: str | None,
         schema: dict[str, Any] | None,
+        check_files: bool,
     ) -> _ChildRun:
         sem = self._sem
         if sem is None:
@@ -599,6 +621,36 @@ class WorkflowDriver:
                 run.status = "invalid_schema"
                 run.error = schema_error
 
+        # DALTON-HOOK(workflow-journal): an ok answer whose own files are
+        # missing or empty is a partial dispatch, not a success — the child
+        # executed and answered, but the deliverable the workflow runs for
+        # is not on disk (R3a #5: knowledge-revision.json never written,
+        # branch files blocked at the time limit and reported as gaps).
+        # Judged before the frames and records below, so every view of the
+        # child — the journal entry, the per-child record, the child_done
+        # frame, the script's null — carries the verdict. ``error`` is the
+        # one existing wire status that says non-success without claiming a
+        # timeout or a schema problem; the error text names the files.
+        # Probe dispatches (checkFiles: false) report files that may
+        # legitimately not exist and are not judged.
+        if run.status == "ok" and check_files:
+            ok_value = engine_safe(
+                run.parsed if schema is not None else run.content
+            )
+            missing = await missing_declared_artifacts(self.spec.backend, ok_value)
+            if missing:
+                run.partial_artifacts = missing
+                run.error = "声明的产物缺失或为空：" + "；".join(missing)
+                run.status = "error"
+                logger.warning(
+                    "[workflow] dispatch declared artifacts that are missing "
+                    "or empty; recorded partial",
+                    label=label,
+                    phase=phase,
+                    missing=missing,
+                    thread_id=self.spec.thread_id,
+                )
+
         run.ended_at = time.time()
         if run.content is not None:
             run.content, run.truncated = truncate_to_bytes(
@@ -621,7 +673,27 @@ class WorkflowDriver:
         # pending one, keyed by the logical call's prompt (rec["prompt"]), not a
         # schema-retry prompt, so resume finds a retried success too; only an ``ok`` entry with artifact digests is ever
         # replayable, so a failed or in-flight child never comes back as work.
-        if run.status == "ok":
+        # Partial is judged before ``run.status`` (which it has already set to
+        # ``error`` for the frames) so the journal keeps its own word for it.
+        if run.partial_artifacts:
+            result_value = run.parsed if schema is not None else run.content
+            await self._journal.append(
+                {
+                    "seq": seq,
+                    "label": label,
+                    "phase": phase,
+                    "prompt_sha256": prompt_digest(rec["prompt"]),
+                    "status": "partial",
+                    "result": engine_safe(result_value),
+                    "result_kind": "parsed" if schema is not None else "text",
+                    "artifacts": [],
+                    "missing_artifacts": list(run.partial_artifacts),
+                    "error": run.error,
+                    "replayable": False,
+                    "recorded_at": time.time(),
+                }
+            )
+        elif run.status == "ok":
             result_value = run.parsed if schema is not None else run.content
             result_value = engine_safe(result_value)
             records = await artifact_records(self.spec.backend, result_value)

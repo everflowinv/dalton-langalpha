@@ -79,10 +79,43 @@ async def _persist_takes(
     user_id: str,
     is_byok: bool,
 ) -> None:
+    from src.server.database.runs.subagent_runs import get_task_run_statuses
     from src.server.services.persistence.usage import UsagePersistenceService
 
     if not claimed:
         return
+
+    # DALTON-HOOK(subagent-usage-status): the row reports the task run's own
+    # terminal state, not a blanket completed — a failed run keeps the usage
+    # it really spent (that is unchanged) but stops reading as a success in
+    # the usage table. The four values are persist_usage's documented status
+    # vocabulary; anything else read at billing time (no ledger row yet, a
+    # pre-ledger task, a race with finalize) keeps the old default rather
+    # than inventing a verdict.
+    terminal_status = {
+        "completed": "completed",
+        "error": "error",
+        "cancelled": "cancelled",
+        "interrupted": "interrupted",
+    }
+    run_ids = [take.settle_run_id for take in claimed if take.settle_run_id]
+    try:
+        ledger_statuses = (
+            await get_task_run_statuses(run_ids) if run_ids else {}
+        )
+    except Exception as error:
+        # The label is not worth the bill: billing must survive a ledger
+        # read that fails, so the rows fall back to the old default rather
+        # than losing the usage entirely.
+        logger.error(
+            "[SubagentUsage] task-run status lookup failed; billing with "
+            "status=completed for %d take(s) in thread_id=%s: %s",
+            len(claimed),
+            thread_id,
+            error,
+            exc_info=True,
+        )
+        ledger_statuses = {}
 
     persisted_count = 0
     persisted_records = 0
@@ -109,13 +142,18 @@ async def _persist_takes(
                 usage_service._token_usage["agent_id"] = task.agent_id
                 usage_service._token_usage["subagent_type"] = task.subagent_type
 
+            # DALTON-HOOK(subagent-usage-status): the resolved terminal state
+            # rides the row (completed only when the run really completed).
+            run_status = ledger_statuses.get(take.settle_run_id or "")
+            status = terminal_status.get(run_status or "", "completed")
+
             # settle_task_run_id makes the usage insert and the ledger's
             # billing-settle stamp one transaction; on failure (False) the
             # row stays countable for the recovery sweep to degraded-settle.
             persisted = await usage_service.persist_usage(
                 response_id=response_id,
                 msg_type="task",
-                status="completed",
+                status=status,  # DALTON-HOOK(subagent-usage-status)
                 is_byok=is_byok,
                 settle_task_run_id=take.settle_run_id,
             )
