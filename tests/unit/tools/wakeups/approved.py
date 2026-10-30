@@ -144,6 +144,13 @@ WAKE_QUIET_HINT = (
     'schedule_wakeup(quiet="<what you checked and found>") instead of replying.'
 )
 
+# DALTON-HOOK(wake-reply-language): approved with the R4/21 addition; shown on
+# a turn a wakeup started, after the quiet hint.
+WAKE_REPLY_LANGUAGE = (
+    "This notice is system wording, not the user's. When you reply, write in the "
+    "language this thread's user writes in."
+)
+
 WAKE_NOTE = "Automated wakeup you set with schedule_wakeup (not a user message)."
 
 CANCEL_ROW_ONE = (

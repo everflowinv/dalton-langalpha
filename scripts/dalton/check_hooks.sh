@@ -181,6 +181,15 @@ ALLOWED_HOOKS=(
   # turn on its completion notification, never by sleep/poll loops
   # (subagent_coordination.md.j2).
   "subagent-no-sleep-poll"
+  # R4/15: a delegating agent may not invent search/read caps for a subtask
+  # ("最多 3 次检索、只读 4–5 篇") from a remembered quota failure; caps come
+  # from the user's ask or a real quota error this run, quoted verbatim
+  # (subagent_coordination.md.j2, battery-peers 3c9614a6 case).
+  "subagent-no-self-quotas"
+  # R4/21: a turn a schedule_wakeup fire started carries a line keeping the
+  # reply in the thread user's language; the English wake block was pulling
+  # final replies into English on Chinese threads (wording.py, 6288d100 case).
+  "wake-reply-language"
   # Backlog A1a: direct upload storage safety — write-access re-verification
   # inside path_write_lock before final pull_direct, computer-scoped space
   # reservation under advisory lock, and explicit 413 when direct_available()

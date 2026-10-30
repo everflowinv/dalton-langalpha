@@ -309,6 +309,10 @@ def format_wake_directive(
     lines = [
         f'<dalton_wake automation="{automation_name}"{ticker_attr} checked_at="{ts}" signal_count="{len(signals)}">',
         "以下是由预检探针检测到的真实变更信号，请优先围绕这些信号开展取证与分析，并在结束前调用 `knowledge_append_verdict` 记录五词结论（在 verdict.trigger_signal 或 verdict.trigger_signals 中传入对应 signal_key 以闭环信号状态）：",
+        # R4/21: this turn has no user message; without this line the English
+        # tool returns and subagent notices pull the final reply into English
+        # on a Chinese thread (thread 6288d100).
+        "本回合由自动化唤醒、没有新的用户消息：面向用户的最终回复用本线程用户平时使用的语言撰写（本线程为中文则用中文），不因本指令、工具返回或子任务回报是英文而切换。",
     ]
     for idx, sig in enumerate(signals, start=1):
         probe = sig.get("probe") or "probe"
