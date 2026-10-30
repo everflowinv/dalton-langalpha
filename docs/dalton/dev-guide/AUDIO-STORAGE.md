@@ -24,6 +24,7 @@
 - 对象键前缀规则两侧**必须完全一致**（后端 `resolve_full_key` 与桥 `SourceObjectStore.resolve_full_key`），否则后端上传的对象桥会找不到；该一致性由 `tests/unit/dalton/test_transcription_storage.py` 的 `test_resolve_full_key_matches_bridge_source_object_store` 钉死。
 - 分片上传的行为与全局实现一致：每个分片的字节长度签入预签名 URL（`sign_upload_part` 的 `ContentLength` 绑定），`list_uploaded_parts` 返回 `{"part_number", "size", "etag"}` 且以存储侧清单为准。
 - 沙箱向 `host.docker.internal` 的分片 PUT 走沙箱普通出网，不经出口代理；部署时确认 Docker 沙箱内能解析 `host.docker.internal`（Docker Desktop 内建；原生 Linux 不会自动解析，本仓库由 Compose 与 Docker 沙箱 provider 添加的 `host.docker.internal:host-gateway` 映射提供，Docker Engine 需 20.10+）。
+- `VOLC_TOS_ENDPOINT`（桥经 boto3 把音频分片上传到火山 TOS 临时对象、预签名与删除，见 `scripts/dalton/seed_asr_client.py` 的 `VolcTosClient`）可填火山原生端点（`tos-<region>.volces.com` / `tos-<region>.ivolces.com`）或 S3 兼容端点（`tos-s3-<region>.volces.com` / `tos-s3-<region>.ivolces.com`），代码会自动把原生端点映射为 S3 兼容端点使用（boto3 走 S3 协议，打原生端点会 400；未配置时默认 `tos-s3-cn-beijing.volces.com`）。
 
 ---
 

@@ -44,6 +44,10 @@ STATUS_PROCESSING = "20000001"
 STATUS_QUEUED = "20000002"
 STATUS_SILENT = "20000003"
 
+# S3-compatible TOS endpoint: boto3 speaks the S3 protocol, which native TOS
+# endpoints (`tos-<region>.volces.com`) reject with 400.
+DEFAULT_TOS_ENDPOINT = "tos-s3-cn-beijing.volces.com"
+
 TOS_PRESIGN_EXPIRY = 7200  # 2 hours (covers queue and fetch window)
 MULTIPART_THRESHOLD = 20 * 1024 * 1024  # 20 MiB
 MULTIPART_PART_SIZE = 10 * 1024 * 1024  # 10 MiB chunks
@@ -233,7 +237,7 @@ class SeedAsrCredentials:
     tos_sk: str = field(repr=False)
     tos_bucket: str
     tos_region: str = "cn-beijing"
-    tos_endpoint: str = "tos-cn-beijing.volces.com"
+    tos_endpoint: str = DEFAULT_TOS_ENDPOINT
 
     def __repr__(self) -> str:
         return (
@@ -274,8 +278,8 @@ class SeedAsrCredentials:
         tos_bucket = str(env.get("VOLC_TOS_BUCKET") or "").strip()
         tos_region = str(env.get("VOLC_TOS_REGION") or "cn-beijing").strip() or "cn-beijing"
         tos_endpoint = (
-            str(env.get("VOLC_TOS_ENDPOINT") or "tos-cn-beijing.volces.com").strip()
-            or "tos-cn-beijing.volces.com"
+            str(env.get("VOLC_TOS_ENDPOINT") or DEFAULT_TOS_ENDPOINT).strip()
+            or DEFAULT_TOS_ENDPOINT
         )
 
         missing: list[str] = []
@@ -472,19 +476,46 @@ def build_submit_payload(
     }
 
 
-def _normalize_tos_endpoint(endpoint: str) -> tuple[str, str]:
-    """Normalize TOS endpoint into `(endpoint_url_with_scheme, addressing_style)`."""
-    cleaned = str(endpoint or "tos-cn-beijing.volces.com").strip().rstrip("/")
+# `tos-<region>.volces.com` / `tos-<region>.ivolces.com` (native TOS endpoint),
+# excluding `tos-s3-…` (already S3-compatible). Region labels are `cn-beijing`,
+# `ap-southeast-1`, … — alphanumeric with inner hyphens.
+_NATIVE_TOS_HOST_RE = re.compile(
+    r"^tos-(?!s3(?:-|$))([a-z0-9](?:[a-z0-9-]*[a-z0-9])?)\.(ivolces|volces)\.com$"
+)
+
+
+def _normalize_tos_endpoint(
+    endpoint: str,
+) -> tuple[str, str, tuple[str, str] | None]:
+    """Normalize TOS endpoint into `(endpoint_url_with_scheme, addressing_style, native_remap)`.
+
+    A native TOS host (`tos-<region>.volces.com` / `tos-<region>.ivolces.com`, what the
+    Volcengine `tos` SDK uses) is remapped to the S3-compatible host `tos-s3-<region>…`,
+    with `native_remap = (native_host, s3_host)` so the caller can log it — boto3 speaks
+    the S3 protocol, which native endpoints reject with 400. `tos-s3-…` hosts, custom
+    domains, localhost and IPs pass through unchanged; scheme and port are preserved.
+    Localhost / IPs keep path addressing, everything else stays virtual-hosted.
+    """
+    cleaned = str(endpoint or DEFAULT_TOS_ENDPOINT).strip().rstrip("/")
     if "://" not in cleaned:
         endpoint_url = f"https://{cleaned}"
     else:
         endpoint_url = cleaned
-    host_part = endpoint_url.split("://", 1)[1].split("/", 1)[0].split(":", 1)[0].lower()
+    scheme, rest = endpoint_url.split("://", 1)
+    authority = rest.split("/", 1)[0]
+    host_part = authority.split(":", 1)[0].lower()
+    suffix = authority[len(host_part) :] + rest[len(authority) :]
+    native_remap: tuple[str, str] | None = None
+    native_match = _NATIVE_TOS_HOST_RE.match(host_part)
+    if native_match:
+        s3_host = f"tos-s3-{native_match.group(1)}.{native_match.group(2)}.com"
+        endpoint_url = f"{scheme}://{s3_host}{suffix}"
+        native_remap = (host_part, s3_host)
     if host_part in ("localhost", "127.0.0.1", "::1") or re.fullmatch(
         r"\d+\.\d+\.\d+\.\d+", host_part
     ):
-        return endpoint_url, "path"
-    return endpoint_url, "virtual"
+        return endpoint_url, "path", native_remap
+    return endpoint_url, "virtual", native_remap
 
 
 class S3ClientProtocol:
@@ -590,9 +621,17 @@ class VolcTosClient:
                 "to enable audio transcription)",
                 retryable=False,
             ) from exc
-        endpoint_url, addressing_style = _normalize_tos_endpoint(
+        endpoint_url, addressing_style, native_remap = _normalize_tos_endpoint(
             self.credentials.tos_endpoint
         )
+        if native_remap is not None:
+            logger.info(
+                "VOLC_TOS_ENDPOINT is the native TOS endpoint %s; mapped to the "
+                "S3-compatible endpoint %s (boto3 speaks the S3 protocol, which "
+                "native TOS endpoints reject)",
+                native_remap[0],
+                native_remap[1],
+            )
         self._s3_client = boto3.client(
             "s3",
             endpoint_url=endpoint_url,
