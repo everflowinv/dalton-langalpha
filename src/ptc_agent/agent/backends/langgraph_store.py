@@ -16,7 +16,7 @@ import re2
 import structlog
 from langgraph.store.base import BaseStore
 
-from ptc_agent.agent.backends.results import EditTextResult
+from ptc_agent.agent.backends.results import EditTextResult, GrepAnswer  # DALTON-HOOK(grep-content-cap): GrepAnswer
 from ptc_agent.agent.backends.sandbox import SandboxBackend
 from ptc_agent.agent.backends.store_cache import RequestScopedStoreCache
 from ptc_agent.core.sandbox.grep_render import _GREP_WINDOWS_PER_LINE, GREP_LINE_CHARS, GrepLine, cut_grep_line
@@ -226,6 +226,71 @@ def _cut(line: str, matches: Iterator[Any]) -> str:
     ]
     rest = sum(1 for _ in matches)
     return cut_grep_line(line.encode(), placed, total=len(placed) + rest)
+
+
+# DALTON-HOOK(grep-content-cap): lines one content search of the in-memory
+# routes collects when the Grep sets no page — the same bound the transcript
+# route lives under. These routes hold their files' text either way; this
+# caps the collected answer built from it.
+CONTENT_MAX_LINES = 10_000
+
+# DALTON-HOOK(grep-content-cap)
+CONTENT_LINES_NOTE = (
+    "[Grep content results stopped at the {lines:,} matching-line limit one "
+    "search collects when no page is asked; more matches may exist. Narrow "
+    "the path or glob, or page with head_limit and offset.]"
+)
+
+
+def capped_content_grep(
+    texts: Iterable[tuple[str, str]],
+    compiled: Any,
+    *,
+    show_line_numbers: bool,
+    head_limit: int | None,
+    offset: int,
+    paged: bool = False,
+) -> list[Any]:
+    """``grep_texts`` for content mode with the collection bound and its
+    note: a paged ask is collected to its own page's depth, an unpaged one
+    stops at ``CONTENT_MAX_LINES`` and says so.
+
+    DALTON-HOOK(grep-content-cap): ``paged`` is the composite's flag that
+    the caller slices the page itself — the walk filter above it must see
+    the whole route answer before the page can be cut — so the unpaged
+    collection cap and its note stand down (this route's data is bounded by
+    its rows; the page is the caller's)."""
+    if paged:
+        return grep_texts(
+            texts,
+            compiled,
+            "content",
+            show_line_numbers=show_line_numbers,
+            head_limit=head_limit,
+            offset=offset,
+        )
+    if head_limit:
+        return grep_texts(
+            texts,
+            compiled,
+            "content",
+            show_line_numbers=show_line_numbers,
+            head_limit=head_limit,
+            offset=offset,
+            max_lines=max(CONTENT_MAX_LINES, max(0, offset) + head_limit),
+        )
+    collected = grep_texts(
+        texts,
+        compiled,
+        "content",
+        show_line_numbers=show_line_numbers,
+        head_limit=None,
+        offset=0,
+        max_lines=CONTENT_MAX_LINES,
+    )
+    if len(collected) >= CONTENT_MAX_LINES:
+        return GrepAnswer(collected, [CONTENT_LINES_NOTE.format(lines=CONTENT_MAX_LINES)])
+    return collected[max(0, offset):]
 
 
 def grep_texts(
@@ -795,6 +860,7 @@ class StoreBackend:
         multiline: bool = False,
         head_limit: int | None = None,
         offset: int = 0,
+        paged: bool = False,  # DALTON-HOOK(grep-content-cap)
     ) -> Any:
         """Regex search. Context/multiline flags and ``type`` are accepted but ignored."""
         compiled = compile_grep(pattern, case_insensitive)
@@ -819,6 +885,22 @@ class StoreBackend:
             content = self._content_from_value(item.value)
             if content is not None:
                 texts.append((self._absolute(key), content))
+        if output_mode == "content":
+            # DALTON-HOOK(grep-content-cap): the collection bound and its
+            # note live in one helper both store routes share.
+            return capped_content_grep(
+                texts,
+                compiled,
+                show_line_numbers=show_line_numbers,
+                head_limit=head_limit,
+                offset=offset,
+                paged=paged,
+            )
         return grep_texts(
-            texts, compiled, output_mode, show_line_numbers=show_line_numbers, head_limit=head_limit, offset=offset
+            texts,
+            compiled,
+            output_mode,
+            show_line_numbers=show_line_numbers,
+            head_limit=head_limit,
+            offset=offset,
         )

@@ -44,12 +44,16 @@ from tests.unit.middleware.workflow.conftest import FakeBackend, workflow_script
 def make_fs_backend(files: dict[str, str] | None = None) -> Any:
     """A spec'd ``SandboxBackend`` serving a dict filesystem whose writes
     read back (the journal's append is read-modify-write) and whose glob
-    walks the same store — the two behaviors the journal needs."""
+    walks the same store — the two behaviors the journal needs. An absent
+    path answers ``FileNotFoundError``, the one read result that says
+    missing outright, so the artifact probe's read fallback can see it."""
     backend = create_autospec(SandboxBackend, instance=True)
     store = dict(files or {})
 
     async def _aread_text(path: str) -> str | None:
-        return store.get(path)
+        if path not in store:
+            raise FileNotFoundError(path)
+        return store[path]
 
     async def _awrite_text(path: str, content: str) -> bool:
         store[path] = content
@@ -401,9 +405,10 @@ _SCHEMA_FILES = {
 
 @pytest.mark.asyncio
 async def test_ok_result_with_empty_files_is_never_replayable() -> None:
-    """The journal record for an empty-files ok answer carries
-    ``replayable: false`` — there is nothing to pin, so a resume must run
-    the dispatch again rather than resurrect the emptiness."""
+    """The journal record for an empty-files ok answer is partial — the child
+    reported writing nothing (R3a #5: the branch whose Write the time limit
+    refused), so the script gets null and a resume must run the dispatch
+    again rather than resurrect the emptiness."""
     empty = {"files": [], "summary": "未落盘，本轮超时"}
     driver, _, backend = await _make_driver(
         make_fs_backend(),
@@ -412,14 +417,15 @@ async def test_ok_result_with_empty_files_is_never_replayable() -> None:
 
     value = await driver.agent("fetch it", {"label": "支线", "schema": _SCHEMA_FILES})
 
-    assert value == empty
+    assert value is None
     journal = json.loads(
         backend.writes[f".agents/threads/short-1/workflows/{driver.wf_task_id}/journal/支线.json"]
     )
     outcome = journal["dispatches"][-1]
-    assert outcome["status"] == "ok"
+    assert outcome["status"] == "partial"
     assert outcome["replayable"] is False
     assert outcome["artifacts"] == []
+    assert outcome["missing_artifacts"]
 
 
 @pytest.mark.asyncio
@@ -477,14 +483,15 @@ async def test_block_fill_resume_chain_reads_the_new_content() -> None:
     new_content = "主线程补齐后的估值稿：ln(P1/P0) 分解与可比表 v2"
     filled = {"files": [path], "summary": "written"}
 
-    # Step 1: ok with empty files — the block-shaped record.
+    # Step 1: ok with empty files — a partial record (R3a #5), the block-
+    # shaped answer a workflow leaves behind.
     empty = {"files": [], "summary": "未落盘"}
     driver1, dispatcher1, backend1 = await _make_driver(
         make_fs_backend({"research/valuation.md": "占位"}),
         behaviors=[Immediate({"success": True, "result": json.dumps(empty)})],
     )
     value1 = await driver1.agent(prompt, {"label": "估值历史与可比", "schema": schema})
-    assert value1 == empty
+    assert value1 is None
     assert len(dispatcher1.calls) == 1
     journal1_path = (
         f".agents/threads/short-1/workflows/{driver1.wf_task_id}/journal/估值历史与可比.json"
@@ -917,9 +924,9 @@ async def test_journal_error_is_sanitized_and_clipped() -> None:
 
 @pytest.mark.asyncio
 async def test_unverifiable_artifact_makes_the_entry_non_replayable() -> None:
-    """A child that declares a file whose digest cannot be computed is
-    journaled replayable=false — a later resume re-dispatches rather than
-    trusting a partial pin."""
+    """A child that declares a file that is not on disk is a partial
+    dispatch (R3a #5): journaled partial and non-replayable — a later resume
+    re-dispatches rather than trusting a pin of nothing."""
     payload = {"files": ["research/gone.md"], "summary": "declared"}
     backend = make_fs_backend()  # no research/gone.md on disk
     driver, dispatcher, _ = await _make_driver(
@@ -939,15 +946,16 @@ async def test_unverifiable_artifact_makes_the_entry_non_replayable() -> None:
     original = driver_mod.extract_result_content
     driver_mod.extract_result_content = _extract
     try:
-        await driver.agent("declare and fail to hash", {"label": "支线", "schema": schema})
+        value = await driver.agent("declare and fail to hash", {"label": "支线", "schema": schema})
     finally:
         driver_mod.extract_result_content = original
+    assert value is None
 
     journal = json.loads(
         backend.writes[f".agents/threads/short-1/workflows/{driver.wf_task_id}/journal/支线.json"]
     )
     outcome = journal["dispatches"][-1]
-    assert outcome["status"] == "ok"
+    assert outcome["status"] == "partial"
     assert outcome["replayable"] is False
     assert outcome["artifacts"] == []
 
@@ -1690,6 +1698,13 @@ _GENERIC_OUT = {
     "sha256": "a" * 64,
 }
 
+# The default child must be as honest as a real one: it declares
+# research/generic.md, so it writes it too (R3a #5 made a declared-but-
+# unwritten file a partial dispatch, not an ok answer). Built per dispatch —
+# ``Writes`` is defined further down this module.
+def _generic_writes(_prompt, _backend):
+    return Writes(_ok(_GENERIC_OUT), {"research/generic.md": "generic 产物"})
+
 
 @dataclass
 class Writes:
@@ -1883,7 +1898,7 @@ async def test_real_script_block_fill_resume_chain() -> None:
             "估值取数": Immediate(_ok({"files": [], "summary": "未落盘，本轮超时"})),
             "支线核验": _probe_answer,
         },
-        default=Immediate(_ok(_GENERIC_OUT)),
+        default=_generic_writes,
     )
     assert outcome1.status == "completed", outcome1.error
     result1 = outcome1.result
@@ -1894,7 +1909,7 @@ async def test_real_script_block_fill_resume_chain() -> None:
     assert "估值历史与可比" not in dispatched1, "no write stage off an empty fetch"
     assert "初筛成稿" not in dispatched1
     fetch1 = _journal_entry_of(backend1, driver1, "估值取数")
-    assert fetch1["status"] == "ok" and fetch1["replayable"] is False
+    assert fetch1["status"] == "partial" and fetch1["replayable"] is False
 
     # Step 2: the main thread fills the data file in the workspace (run 1's
     # store — make_fs_backend copies its argument, so the fill goes here).
@@ -1953,12 +1968,10 @@ async def test_real_script_block_fill_resume_chain() -> None:
                 )
             ),
         },
-        default=Immediate(_ok(_GENERIC_OUT)),
+        default=_generic_writes,
         journal_source=source1,
     )
     assert outcome2.status == "completed", outcome2.error
-    # The reviewer was scripted to block; the run ends at that verdict, past
-    # the branch gate that stopped run 1.
     assert outcome2.result["ok"] is False
     assert outcome2.result["blocked"] == "测试收尾 block"
     assert any(item.startswith("审稿 block") for item in outcome2.result["incomplete"])

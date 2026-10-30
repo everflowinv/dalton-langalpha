@@ -38,6 +38,8 @@ def test_defaults_and_unknown_options_are_ignored() -> None:
         "label": None,
         "phase": None,
         "schema": None,
+        # DALTON-HOOK(workflow-journal): checkFiles normalizes into the rec.
+        "check_files": True,
     }
 
 
@@ -233,3 +235,14 @@ def test_a_reply_too_deep_to_decode_fails_its_own_child() -> None:
 
     shallow = "[" * 100 + "1" + "]" * 100
     assert parse_schema_result(shallow, {"type": "object"})[0] is False
+
+
+# DALTON-HOOK(workflow-journal): the probe opt-out must be a boolean.
+@pytest.mark.parametrize("value", ["no", 1, None])
+def test_checkfiles_must_be_a_boolean(value: Any) -> None:
+    with pytest.raises(DispatchValidationError, match="checkFiles"):
+        _validate(opts={"checkFiles": value})
+
+
+def test_checkfiles_false_normalizes_through() -> None:
+    assert _validate(opts={"checkFiles": False})["check_files"] is False

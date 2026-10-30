@@ -215,6 +215,114 @@ def prompt_digest(prompt: str) -> str:
     return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
 
 
+async def _probe_declared_paths(backend: Any, paths: list[str]) -> dict[str, str]:
+    """Each declared path's existence verdict: ``ok`` (exists, non-empty),
+    ``missing``, ``empty``, or ``unknown`` — never guessed.
+
+    One shell probe per batch when the backend can execute: ``test -s`` on
+    the backend-normalized absolute path, which is the same spelling a Write
+    of that declared path resolved to (a virtual leading-``/`` path, a
+    ``./``-relative one and a ``../sibling`` workspace-relative one all land
+    where the workflow's own file writes did; a path normalization refuses —
+    a ``..`` crossing a store mount — is ``unknown``, not missing). Binaries
+    answer as well as text: ``test -s`` never decodes. Backends that cannot
+    execute fall back to text reads, where only ``FileNotFoundError`` says
+    missing — every other failure (decode included) is ``unknown``, and the
+    generic layer's ``None`` is both absent and unreadable, so it stays
+    ``unknown`` too: an artifact is never called missing on evidence that
+    cannot tell.
+    """
+    verdicts: dict[str, str] = {}
+    resolved: list[tuple[str, str]] = []
+    normalize = getattr(backend, "normalize_path", None)
+    for path in paths:
+        try:
+            normalized = normalize(path) if normalize is not None else path
+            # A normalizer that does not answer a string is not one; the
+            # raw declared path is what the read fallback understands.
+            absolute = normalized if isinstance(normalized, str) else path
+        except Exception:
+            verdicts[path] = "unknown"
+            continue
+        resolved.append((path, absolute))
+
+    execute = getattr(backend, "aexecute", None)
+    if execute is not None and resolved:
+        script_parts = []
+        for index, (_, absolute) in enumerate(resolved):
+            script_parts.append(
+                f"if test -s {shlex.quote(absolute)}; then echo {index} ok; "
+                f"elif test -e {shlex.quote(absolute)}; then echo {index} empty; "
+                f"else echo {index} missing; fi"
+            )
+        try:
+            response = await execute("; ".join(script_parts))
+            raw_output = getattr(response, "output", None)
+            if not isinstance(raw_output, str):
+                # An exec answer with nothing string-readable is no answer:
+                # say unknown the honest way, through the read fallback.
+                raise TypeError("exec returned no readable output")
+            answered: dict[str, str] = {}
+            for line in raw_output.splitlines():
+                parts = line.split(None, 1)
+                if len(parts) == 2 and parts[1].strip() in ("ok", "empty", "missing"):
+                    answered[parts[0].strip()] = parts[1].strip()
+            # The probe echoes each path's index; a path whose line never
+            # came back was not confirmed, which is ``unknown``, not missing.
+            for index, (path, _) in enumerate(resolved):
+                verdicts[path] = answered.get(str(index), "unknown")
+            return verdicts
+        except Exception:
+            logger.debug("workflow artifact existence probe failed", exc_info=True)
+
+    for path, absolute in resolved:
+        try:
+            text = await backend.aread_text(absolute)
+        except FileNotFoundError:
+            verdicts[path] = "missing"
+            continue
+        except Exception:
+            verdicts[path] = "unknown"
+            continue
+        if text is None:
+            verdicts[path] = "unknown"
+        elif text == "":
+            verdicts[path] = "empty"
+        else:
+            verdicts[path] = "ok"
+    return verdicts
+
+
+async def missing_declared_artifacts(backend: Any, result: Any) -> list[str]:
+    """The declared artifacts a child's own ``files``/``file`` names that are
+    not on disk (or hold nothing), as human-readable violation strings — the
+    dispatch cannot count as done while any of them stands.
+
+    Existence is probed, not hashed: a binary artifact (an .xlsx through a
+    text-reading fallback) or an unhashable path is ``unknown`` and never
+    counted missing — only a confirmed absence or a zero-byte file is a
+    violation. A result that declares the field but parses to no path at all
+    is the same verdict by another door: the child reported writing nothing
+    (the schema-valid ``{files: [], summary: "write was refused at the time
+    limit"}`` answer), which is exactly the "successfully empty" branch the
+    replay guard already refuses. A result with no artifact field declares
+    nothing and is not judged here.
+    """
+    if not isinstance(result, dict) or not declares_artifact_field(result):
+        return []
+    paths = declared_artifact_paths(result)
+    if not paths:
+        return ["声明了 files/file 但未写出任何文件"]
+    verdicts = await _probe_declared_paths(backend, paths)
+    violations: list[str] = []
+    for path, verdict in verdicts.items():
+        if verdict == "missing":
+            violations.append(f"{path}（不存在）")
+        elif verdict == "empty":
+            violations.append(f"{path}（空文件）")
+    return violations
+
+
 class WorkflowJournal:
     """One run's dispatch journal plus its workspace progress marker.
 

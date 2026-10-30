@@ -100,6 +100,13 @@ def validate_dispatch(
     if schema is not None:
         _validate_schema(schema, caps)
 
+    # DALTON-HOOK(workflow-journal): a read-only probe dispatch (branch
+    # verification, the deliverables hash check) reports files that may
+    # legitimately not exist — it opts out of the declared-artifact check.
+    check_files = opts.get("checkFiles", True)
+    if not isinstance(check_files, bool):
+        raise DispatchValidationError("opts.checkFiles must be a boolean")
+
     effective_prompt = compose_child_prompt(prompt, schema)
     check_prompt_cap(effective_prompt, caps)
 
@@ -109,6 +116,7 @@ def validate_dispatch(
         "label": normalized_label,
         "phase": normalized_phase,
         "schema": schema,
+        "check_files": check_files,
     }
 
 

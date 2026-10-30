@@ -201,6 +201,31 @@ def format_conflict_lead(
     return f"发现 {cnt} 处冲突。"
 
 
+def format_audit_status(audit: "AuditResult") -> str:
+    """The 核验状态 line, in three shapes.
+
+    ``passed`` keeps its blocking-only meaning (uncertain never blocks; the
+    PM decides). What it must stop saying is "✅ 通过" over an audit that
+    judged almost nothing — R3a #3: 1,100 figures, 0 verified, 1,088
+    uncertain rendered as a pass. So a pass with any uncertain figures
+    reads as waiting on the PM, with the count and its share of the draft;
+    any uncertain count above zero takes that shape, no ratio threshold.
+    """
+    if not audit.passed:
+        return "❌ 存在未核实或冲突数字"
+    if not audit.uncertain:
+        return "✅ 通过"
+    share = (
+        f"{len(audit.uncertain) * 100 // audit.figures}%"
+        if audit.figures > 0
+        else "?"
+    )
+    return (
+        f"⚠️ 无冲突，但 {len(audit.uncertain)} 个数字（{share}）未能核验，"
+        "待 PM 决定"
+    )
+
+
 def format_audit_counts_phrase(
     verified: int,
     contradicted: int,
@@ -1768,7 +1793,7 @@ def render_audit_md(audit: AuditResult, *, draft_path: str = "") -> str:
             f"- **核验摘要**：{summary_str}",
             f"- **草稿哈希**：`{audit.draft_sha256[:16]}…`",
             f"- **数字总数**：{audit.figures}（{counts_str}{unc_str}；豁免 {audit.exempt}、附带 {len(audit.incidental)}）",
-            f"- **核验状态**：{'✅ 通过' if audit.passed else '❌ 存在未核实或冲突数字'}",
+            f"- **核验状态**：{format_audit_status(audit)}",
             "",
         ]
     )

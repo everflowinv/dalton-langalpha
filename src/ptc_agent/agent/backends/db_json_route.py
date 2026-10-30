@@ -36,7 +36,13 @@ from typing import Any, ClassVar, Literal, NamedTuple
 import psycopg
 import structlog
 
-from ptc_agent.agent.backends.langgraph_store import ReadOnlyStoreError, compile_grep, grep_texts, lock_for_namespace
+from ptc_agent.agent.backends.langgraph_store import (
+    ReadOnlyStoreError,
+    capped_content_grep,  # DALTON-HOOK(grep-content-cap)
+    compile_grep,
+    grep_texts,
+    lock_for_namespace,
+)
 from ptc_agent.agent.backends.read_window import shows_whole_file
 from ptc_agent.agent.backends.results import EditTextResult, WriteTextResult
 from ptc_agent.agent.backends.sandbox import SandboxBackend
@@ -905,6 +911,7 @@ class DbJsonRoute:
         multiline: bool = False,
         head_limit: int | None = None,
         offset: int = 0,
+        paged: bool = False,  # DALTON-HOOK(grep-content-cap)
     ) -> Any:
         # Context-window args (lines_after / lines_before / lines_context / multiline)
         # are accepted for signature parity with the sandbox grep but are not
@@ -949,6 +956,22 @@ class DbJsonRoute:
             for filename, content in sorted(contents.items())
             if searched(filename)
         ]
+        if output_mode == "content":
+            # DALTON-HOOK(grep-content-cap): the shared collection bound and
+            # its note.
+            return capped_content_grep(
+                texts,
+                compiled,
+                show_line_numbers=show_line_numbers,
+                head_limit=head_limit,
+                offset=offset,
+                paged=paged,
+            )
         return grep_texts(
-            texts, compiled, output_mode, show_line_numbers=show_line_numbers, head_limit=head_limit, offset=offset
+            texts,
+            compiled,
+            output_mode,
+            show_line_numbers=show_line_numbers,
+            head_limit=head_limit,
+            offset=offset,
         )

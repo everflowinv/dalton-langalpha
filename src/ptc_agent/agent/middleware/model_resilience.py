@@ -52,6 +52,7 @@ from src.llms.error_classification import (
     is_mid_stream_error,
     is_retryable_error,
     is_stalled_stream,
+    quota_exhaustion_seconds,  # DALTON-HOOK(quota-exhaustion)
 )
 from src.llms.input_transformations import INPUT_TRANSFORMATIONS, REPEATED, thinking_drops
 from src.llms.provider_compaction import is_compaction_request
@@ -275,6 +276,27 @@ class _AttemptRecord:
     attempts: int
 
 
+def _stable_lane(namespace: str) -> str:  # DALTON-HOOK(quota-exhaustion)
+    """The stable lane of a checkpoint namespace: everything after the last
+    ``NS_SEP`` — the per-execution segment — dropped.
+
+    LangGraph composes a nested node's namespace as
+    ``<parent>{NS_SEP}<node>{NS_END}<task id>`` (``NS_SEP`` is ``|`` and
+    ``NS_END`` is ``:`` — ``langgraph/pregel/_algo.py`` ``checkpoint_ns =
+    f"{parent_ns}{NS_SEP}{name}"`` / ``task_checkpoint_ns =
+    f"{checkpoint_ns}{NS_END}{task_id}"``), and the task id is minted per
+    execution: the main agent's model calls read ``model:<uuid>`` on one
+    call and a fresh uuid the next. LangGraph's own subgraph plumbing
+    derives the stable parent the same way — ``split(NS_SEP)[:-1]``
+    (``langgraph/pregel/_tools.py``, ``pregel/_messages.py``). The main
+    graph collapses to the root (``""``); a subagent keeps its
+    ``task:<id>`` prefix.
+    """
+    from langgraph.constants import NS_SEP
+
+    return NS_SEP.join(namespace.split(NS_SEP)[:-1])
+
+
 class ModelResilienceMiddleware(AgentMiddleware):
     """Retry + fallback across models with client-visible progress events.
 
@@ -320,6 +342,18 @@ class ModelResilienceMiddleware(AgentMiddleware):
         # id of the client they replace (kept alongside, so the id cannot be reused). Lives
         # on this per-build instance only; every later call of the turn uses the fresh one.
         self._oauth_replacements: dict[int, tuple[Any, Any]] = {}
+        # DALTON-HOOK(quota-exhaustion): candidates this run has judged out of
+        # quota — a 402 balance refusal or a quota 429 whose reset outlasts
+        # every backoff below — as ``name -> (refills_at_monotonic, refusal)``.
+        # Instance state, like the OAuth replacements above: the instance is
+        # built per turn and shared with its subagents, so the memory lasts
+        # exactly one run and crosses no process boundary. A named horizon
+        # re-admits the candidate once it has elapsed, so a short Retry-After
+        # never benches a model for a whole turn.
+        self._quota_exhausted: dict[str, tuple[float, Exception]] = {}
+        # DALTON-HOOK(quota-exhaustion): (lane, benched, switched-to) pairs a
+        # bench-driven switch has already announced this run.
+        self._quota_notified: set[tuple[str, str, str]] = set()
 
     def _current_client(self, client: Any) -> Any:  # DALTON-HOOK(oauth-dispatch)
         hit = self._oauth_replacements.get(id(client))
@@ -493,6 +527,35 @@ class ModelResilienceMiddleware(AgentMiddleware):
     def _hands_up(self, exc: Exception) -> bool:
         return self.compacts_overflow and is_context_overflow(exc)
 
+    def _raise_run_exhausted(  # DALTON-HOOK(quota-exhaustion)
+        self, records: list[_AttemptRecord], candidates: list[tuple[str, Any | None]]
+    ) -> NoReturn:
+        """The total-exhaustion raise, quota-aware.
+
+        Every candidate benched leaves no attempt to trace — the refusal
+        itself surfaces (the primary's when it is among them), never an
+        empty-record crash. And when the primary sits this call out on a
+        bench while the remaining candidates failed, the error the user sees
+        is the primary's remembered refusal — the model they configured —
+        with the fallback attempts riding along in the trace, not the last
+        fallback's failure dressed up as the primary's.
+        """
+        if not records and self._quota_exhausted and candidates:
+            remembered = self._quota_exhausted.get(candidates[0][0])
+            raise (remembered if remembered is not None
+                   else next(iter(self._quota_exhausted.values())))[1]
+        if records and candidates:
+            benched = self._quota_exhausted.get(candidates[0][0])
+            if benched is not None and self._quota_skipped(candidates[0][0]):
+                primary = _AttemptRecord(
+                    candidates[0][0],
+                    benched[1],
+                    extract_status_code(benched[1]),
+                    0,
+                )
+                return self._raise_exhausted([primary, *records])
+        return self._raise_exhausted(records)
+
     def _raise_overflow(self, records: list[_AttemptRecord], exc: Exception) -> NoReturn:
         """Hand an overflow up to compaction, which sits outside this middleware.
 
@@ -524,11 +587,15 @@ class ModelResilienceMiddleware(AgentMiddleware):
         index: int,
         refused_at: float | None,
     ) -> int | None:
+        # DALTON-HOOK(quota-exhaustion): a candidate benched as out of quota
+        # is named by no switch — announcing a move to a model this call
+        # would never dial misleads the user's trace.
         return next(
             (
                 j
                 for j in range(index + 1, len(candidates))
-                if self._worth_trying(request, candidates[j], refused_at)
+                if not self._quota_skipped(candidates[j][0])
+                and self._worth_trying(request, candidates[j], refused_at)
             ),
             None,
         )
@@ -542,6 +609,114 @@ class ModelResilienceMiddleware(AgentMiddleware):
             return False
         lease = gate.lease
         return bool(lease.should_stop(lease.spend()))
+
+    def _retry_budget_s(self) -> float:  # DALTON-HOOK(quota-exhaustion)
+        """The whole backoff this middleware could wait out on one candidate,
+        without jitter — the yardstick a quota reset horizon is weighed
+        against."""
+        return sum(
+            min(self.initial_delay * (self.backoff_factor**i), self.max_delay)
+            for i in range(self.max_retries)
+        )
+
+    def _quota_horizon_s(self, exc: Exception) -> float | None:  # DALTON-HOOK(quota-exhaustion)
+        try:
+            return quota_exhaustion_seconds(exc)
+        except Exception:
+            return None
+
+    def _quota_skipped(self, name: str) -> bool:  # DALTON-HOOK(quota-exhaustion)
+        """Whether ``name`` is still benched as out of quota for this run."""
+        benched = self._quota_exhausted.get(name)
+        return benched is not None and time.monotonic() < benched[0]
+
+    def _remember_quota_exhausted(  # DALTON-HOOK(quota-exhaustion)
+        self, name: str, horizon: float, exc: Exception
+    ) -> None:
+        """Benches ``name`` until its horizon passes. A fresh refusal writes
+        a fresh deadline whenever the last bench has lapsed — an expired
+        entry must never stand between the run and a re-armed bench — while a
+        bench still live keeps its earliest refill."""
+        benched = self._quota_exhausted.get(name)
+        if benched is not None and time.monotonic() < benched[0]:
+            return
+        self._quota_exhausted[name] = (time.monotonic() + horizon, exc)
+
+    def _lane(self) -> str:  # DALTON-HOOK(quota-exhaustion)
+        """Which lane this call runs on: the main graph, or the subagent
+        namespace a subgraph runs in. A bench notice has to reach the main
+        lane even when a subagent armed the bench (subagent frames never
+        ride the main stream), so the once-per-run notice guard is keyed
+        per lane — on the lane's STABLE key, or every model call would be
+        its own lane (see ``_stable_lane``)."""
+        try:
+            from langgraph.config import get_config
+
+            namespace = (
+                get_config().get("configurable") or {}
+            ).get("checkpoint_ns") or ""
+            return _stable_lane(namespace)
+        except Exception:
+            return ""
+
+
+    def _emit_fallback_once(  # DALTON-HOOK(quota-exhaustion)
+        self,
+        record: _AttemptRecord,
+        to_model: str,
+        to_client: Any,
+        request: ModelRequest,
+        *,
+        from_is_primary: bool,
+    ) -> None:
+        """``_emit_fallback`` behind the run's once-per-lane-per-switch
+        guard: a failure-driven switch and the later bench-driven skip of
+        the same pair announce as one, whichever comes first. The lane key
+        is the STABLE one — the raw namespace's per-execution segment would
+        make every model call its own lane (codex r2 #3: four calls, four
+        notices)."""
+        key = (self._lane(), record.model, to_model)
+        if key in self._quota_notified:
+            return
+        self._quota_notified.add(key)
+        self._emit_fallback(
+            record, to_model, to_client, request, from_is_primary=from_is_primary
+        )
+
+    def _notify_bench_switch(  # DALTON-HOOK(quota-exhaustion)
+        self,
+        request: ModelRequest,
+        candidates: list[tuple[str, Any | None]],
+        index: int,
+    ) -> None:
+        """The fallback notice for a switch the bench itself made: an earlier
+        candidate sits this call out on quota, so the call starts on
+        ``candidates[index]``. Shaped exactly like a failure-driven switch,
+        and emitted at most once per lane and switch pair per run — a
+        subagent's notice neither satisfies nor suppresses the main
+        agent's."""
+        benched_name: str | None = None
+        for name, _ in candidates[:index]:
+            if self._quota_skipped(name):
+                benched_name = name
+        if benched_name is None:
+            return
+        remembered = self._quota_exhausted.get(benched_name)
+        if remembered is None:
+            return
+        to_name, to_client = candidates[index]
+        self._emit_fallback_once(
+            _AttemptRecord(
+                benched_name,
+                remembered[1],
+                extract_status_code(remembered[1]),
+                0,
+            ),
+            to_name,
+            to_client,
+            request,
+            from_is_primary=candidates[0][0] == benched_name,
+        )
 
     def _candidates(self, request: ModelRequest) -> list[tuple[str, Any | None]]:
         primary = (self._primary_display_name(request), None)
@@ -701,7 +876,18 @@ class ModelResilienceMiddleware(AgentMiddleware):
         refused_at: float | None = None
         overflow: Exception | None = None
 
+        tried_any = False
         for index, (name, client) in enumerate(candidates):
+            # DALTON-HOOK(quota-exhaustion): a candidate this run already
+            # judged out of quota is not re-asked — the refusal that benched
+            # it answers identically until the account is topped up. A call
+            # that therefore starts on a fallback announces the switch once,
+            # exactly as a failure-driven switch does.
+            if self._quota_skipped(name):
+                continue
+            if not tried_any:
+                tried_any = True
+                self._notify_bench_switch(request, candidates, index)
             if not self._worth_trying(request, candidates[index], refused_at):
                 continue
             req = request if client is None else request.override(model=client)
@@ -717,8 +903,18 @@ class ModelResilienceMiddleware(AgentMiddleware):
                     status, recovery = self._decide(
                         exc, attempts, req, escalated=escalated
                     )
+                    # DALTON-HOOK(quota-exhaustion): a quota refusal whose
+                    # reset horizon outlasts every backoff this run could wait
+                    # gives up on the candidate now, however retryable a 429
+                    # reads on its own, and the run benches it.
+                    horizon = self._quota_horizon_s(exc)
+                    benched = horizon is not None and horizon > self._retry_budget_s()
+                    if benched:
+                        recovery = None
                     if recovery is None:
                         records.append(_AttemptRecord(name, exc, status, attempts))
+                        if benched:
+                            self._remember_quota_exhausted(name, horizon, exc)
                         if self._hands_up(exc):
                             overflow = exc
                             refused_at = max(refused_at or 0, _window(req.model) or math.inf)
@@ -736,7 +932,7 @@ class ModelResilienceMiddleware(AgentMiddleware):
             following = self._next_tried(request, candidates, index, refused_at)
             if following is not None:
                 to_model, to_client = candidates[following]
-                self._emit_fallback(
+                self._emit_fallback_once(
                     records[-1],
                     to_model,
                     to_client,
@@ -746,7 +942,9 @@ class ModelResilienceMiddleware(AgentMiddleware):
 
         if overflow is not None:
             self._raise_overflow(records, overflow)
-        return self._raise_exhausted(records)
+        # DALTON-HOOK(quota-exhaustion): the quota-aware total-exhaustion
+        # raise — see ``_raise_run_exhausted``.
+        return self._raise_run_exhausted(records, candidates)
 
     async def awrap_model_call(
         self,
@@ -761,7 +959,18 @@ class ModelResilienceMiddleware(AgentMiddleware):
         refused_at: float | None = None
         overflow: Exception | None = None
 
+        tried_any = False
         for index, (name, client) in enumerate(candidates):
+            # DALTON-HOOK(quota-exhaustion): a candidate this run already
+            # judged out of quota is not re-asked — the refusal that benched
+            # it answers identically until the account is topped up. A call
+            # that therefore starts on a fallback announces the switch once,
+            # exactly as a failure-driven switch does.
+            if self._quota_skipped(name):
+                continue
+            if not tried_any:
+                tried_any = True
+                self._notify_bench_switch(request, candidates, index)
             if not self._worth_trying(request, candidates[index], refused_at):
                 continue
             req = request if client is None else request.override(model=client)
@@ -795,8 +1004,18 @@ class ModelResilienceMiddleware(AgentMiddleware):
                     status, recovery = self._decide(
                         exc, attempts, req, escalated=escalated
                     )
+                    # DALTON-HOOK(quota-exhaustion): a quota refusal whose
+                    # reset horizon outlasts every backoff this run could wait
+                    # gives up on the candidate now, however retryable a 429
+                    # reads on its own, and the run benches it.
+                    horizon = self._quota_horizon_s(exc)
+                    benched = horizon is not None and horizon > self._retry_budget_s()
+                    if benched:
+                        recovery = None
                     if recovery is None:
                         records.append(_AttemptRecord(name, exc, status, attempts))
+                        if benched:
+                            self._remember_quota_exhausted(name, horizon, exc)
                         if self._hands_up(exc):
                             overflow = exc
                             refused_at = max(refused_at or 0, _window(req.model) or math.inf)
@@ -814,7 +1033,7 @@ class ModelResilienceMiddleware(AgentMiddleware):
             following = self._next_tried(request, candidates, index, refused_at)
             if following is not None:
                 to_model, to_client = candidates[following]
-                self._emit_fallback(
+                self._emit_fallback_once(
                     records[-1],
                     to_model,
                     to_client,
@@ -824,4 +1043,6 @@ class ModelResilienceMiddleware(AgentMiddleware):
 
         if overflow is not None:
             self._raise_overflow(records, overflow)
-        return self._raise_exhausted(records)
+        # DALTON-HOOK(quota-exhaustion): the quota-aware total-exhaustion
+        # raise — see ``_raise_run_exhausted``.
+        return self._raise_run_exhausted(records, candidates)

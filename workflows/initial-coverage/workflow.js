@@ -77,7 +77,7 @@ const probeBranchFiles = async (paths) => {
     `只读核验以下支线产物文件是否存在、非空白且达到字节数下限（不写任何文件）。逐个执行 bash：f='<路径>'；n=<字节数下限>；test -e "$f" && [ "$(wc -c < "$f")" -ge "$n" ] && [ -n "$(tr -d '[:space:]' < "$f")" ] && echo "$f|ok" || echo "$f|missing"。返回 files 数组：每项为上述一行的原样输出（<路径>|ok 或 <路径>|missing）：\n${entries
       .map(([p, min]) => `- ${p}（至少 ${min} 字节）`)
       .join('\n')}`,
-    { agentType: 'dalton-evidence', label: '支线核验', phase: '取证', schema: PROBE_OUT }
+    { agentType: 'dalton-evidence', label: '支线核验', phase: '取证', schema: PROBE_OUT, checkFiles: false }
   )
   if (r === null || typeof r !== 'object' || !Array.isArray(r.files)) return null
   const answered = new Set()
@@ -385,7 +385,7 @@ const check =
         `只读核对以下文件是否存在并计算 sha256（用 bash 的 test -e 与 sha256sum，不写任何文件）：\n${deliverables
           .map((p) => '- ' + p)
           .join('\n')}\n返回 files 字符串数组：存在的文件写 “<路径>|<sha256>”，不存在的只写 “<路径>”（不带竖线）。`,
-        { agentType: 'dalton-evidence', label: '产物核验', phase: '产物核验', schema: HASH }
+        { agentType: 'dalton-evidence', label: '产物核验', phase: '产物核验', schema: HASH, checkFiles: false }
       )
 const SHA_RE = /^[0-9a-f]{64}$/
 const expected = new Set(deliverables)

@@ -47,6 +47,32 @@ def _needs_backtracking(pattern: str) -> bool:
     return False
 
 
+# DALTON-HOOK(grep-content-cap): the whole rendered answer one content Grep
+# may return to the model. 200k chars is ~50k tokens at the 4-chars-per-token
+# convention the eviction middleware uses — several pages of matches, yet
+# small enough that one Grep result cannot crowd out the context it lands in.
+# The backends cap collection (the sandbox route at the wire, the in-memory
+# routes per line); this shapes what the tool says from whatever they return.
+_CONTENT_OUTPUT_CHARS = 200_000
+
+# DALTON-HOOK(grep-content-cap)
+_CONTENT_TRUNCATED_NOTE = (
+    "[Grep content results truncated at "
+    f"{_CONTENT_OUTPUT_CHARS:,} characters; more matches existed. "
+    "Narrow the path or glob, or page with head_limit and offset.]"
+)
+
+# DALTON-HOOK(grep-content-cap): an empty pattern — or any pattern that
+# matches the empty string, such as ``x*`` or ``^`` — matches every line of
+# every file under the path, which is the OOM shape (10/30: a content Grep
+# with pattern_length=0 took the backend to 4.15 GB). Reading a whole tree is
+# what Read and Glob are for.
+_EMPTY_MATCH_ERROR = (
+    "ERROR: pattern matches every line (it is empty or matches the empty "
+    "string). Give a concrete pattern, or use Read / Glob to look at files."
+)
+
+
 def create_grep_tool(backend: FilesystemBackend) -> BaseTool:
     """Factory function to create Grep tool.
 
@@ -102,7 +128,7 @@ def create_grep_tool(backend: FilesystemBackend) -> BaseTool:
         try:
             # Validate regex pattern to prevent crashes from malformed patterns
             try:
-                re.compile(pattern)
+                compiled = re.compile(pattern)
             except re.error as e:
                 error_msg = f"Invalid regex pattern: {e}"
                 logger.info("Invalid regex pattern", pattern_length=len(pattern))
@@ -114,6 +140,14 @@ def create_grep_tool(backend: FilesystemBackend) -> BaseTool:
                     "look-around, backreferences or atomic groups. Rewrite the "
                     "pattern without them."
                 )
+            # DALTON-HOOK(grep-content-cap): refused before any route is
+            # asked, in every output mode — the matches-every-line shapes are
+            # useless in files_with_matches and count modes too.
+            if compiled.search("") is not None:
+                logger.info(
+                    "Regex pattern matches every line", pattern_length=len(pattern)
+                )
+                return _EMPTY_MATCH_ERROR
 
             # Normalize virtual path to absolute sandbox path
             normalized_path = backend.normalize_path(search_path)
@@ -155,6 +189,12 @@ def create_grep_tool(backend: FilesystemBackend) -> BaseTool:
             # What a search left out, such as files a route stopped before.
             notes = "".join(f"\n\n{note}" for note in getattr(results, "notes", ()))
             if not results:
+                # DALTON-HOOK(grep-content-cap): an empty answer whose note says
+                # a match was withheld for size is not "no matches" — leading
+                # with that would tell the model the text is absent.
+                if "the first matching line alone" in notes:
+                    logger.info("Grep match withheld for size", path=logged_path(search_path))
+                    return notes.strip()
                 logger.info("No matches found", path=logged_path(search_path))
                 return f"No matches found for pattern '{pattern}' in '{search_path}'{notes}"
 
@@ -165,14 +205,29 @@ def create_grep_tool(backend: FilesystemBackend) -> BaseTool:
                     virtual_path = backend.virtualize_path(file_path)
                     result += f"{virtual_path}\n"
             elif output_mode == "content":
-                result = f"Matches for pattern '{pattern}':\n\n"
+                header = f"Matches for pattern '{pattern}':\n\n"
+                # DALTON-HOOK(grep-content-cap): assembled from parts — a
+                # repeated += over a huge list is quadratic — and stopped at
+                # the character budget, so the model never receives a whole
+                # tree of matches however much a route collected.
+                parts = [header]
+                used = len(header)
+                truncated = False
                 for entry in results:
                     # A line names its file by the path it holds, as a path
                     # may hold the `:` or `-` that ends it in the text. A
                     # group's `--` and an error name none.
                     if isinstance(entry, GrepLine):
                         entry = entry.at(backend.virtualize_path(entry.path))
-                    result += f"{entry}\n"
+                    piece = f"{entry}\n"
+                    if used + len(piece) > _CONTENT_OUTPUT_CHARS:
+                        truncated = True
+                        break
+                    parts.append(piece)
+                    used += len(piece)
+                if truncated:
+                    parts.append(f"\n{_CONTENT_TRUNCATED_NOTE}")
+                result = "".join(parts)
             elif output_mode == "count":
                 result = f"Match counts for pattern '{pattern}':\n"
                 for file_path, count in results:
