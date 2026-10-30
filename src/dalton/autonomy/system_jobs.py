@@ -17,12 +17,12 @@ from src.dalton.autonomy.schedule import (
     user_automations_lock,
 )
 from src.dalton.autonomy.tracking import (
-    _TICKER_FROM_AUTO_NAME_RE,
     disable_tracking,
     enable_tracking,
     get_tracking_status,
     resolve_workspace_id_by_ticker,
 )
+from src.dalton.coverage.identity import _TICKER_FROM_AUTO_NAME_RE
 from src.dalton.settings import (
     get_dalton_bridge_admin_token,
     get_dalton_bridge_base_url,

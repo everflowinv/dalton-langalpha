@@ -7,9 +7,11 @@ import logging
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
-from src.dalton.autonomy.due import validation_is_due, workspace_market_timezone
+from src.dalton.autonomy.due import ticker_market_timezone, validation_is_due
 from src.dalton.autonomy.probes import ProbeSignal
-from src.dalton.settings import get_dalton_settings
+from src.dalton.coverage.identity import resolve_workspace_coverage_identity
+from src.dalton.database.coverage_units import load_active_units_by_workspace
+from src.dalton.settings import get_dalton_settings, is_coverage_units_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -190,10 +192,12 @@ async def _check_db_actionable_work(
                     await cur.execute(
                         """
                         SELECT DISTINCT ON (dkv.workspace_id, dkv.doc_key)
-                               dkv.workspace_id, dkv.doc_key, dkv.content, ws.name AS ws_name
+                               dkv.workspace_id, dkv.doc_key, dkv.content,
+                               ws.name AS ws_name, ws.user_id AS ws_user_id,
+                               ws.status AS ws_status
                         FROM dalton_knowledge_versions dkv
                         JOIN (
-                            SELECT workspace_id, name FROM workspaces
+                            SELECT workspace_id, user_id, name, status FROM workspaces
                             WHERE user_id = %s AND status <> 'deleted'
                         ) ws ON ws.workspace_id = dkv.workspace_id
                         WHERE dkv.doc_key IN ('agenda', 'company', 'thesis')
@@ -206,10 +210,12 @@ async def _check_db_actionable_work(
                     await cur.execute(
                         """
                         SELECT DISTINCT ON (dkv.workspace_id, dkv.doc_key)
-                               dkv.workspace_id, dkv.doc_key, dkv.content, ws.name AS ws_name
+                               dkv.workspace_id, dkv.doc_key, dkv.content,
+                               ws.name AS ws_name, ws.user_id AS ws_user_id,
+                               ws.status AS ws_status
                         FROM dalton_knowledge_versions dkv
                         JOIN (
-                            SELECT workspace_id, name FROM workspaces
+                            SELECT workspace_id, user_id, name, status FROM workspaces
                             WHERE status <> 'deleted'
                         ) ws ON ws.workspace_id = dkv.workspace_id
                         WHERE dkv.doc_key IN ('agenda', 'company', 'thesis')
@@ -225,20 +231,100 @@ async def _check_db_actionable_work(
                 for r in agenda_rows or []:
                     ws_id = str(r.get("workspace_id") or "")
                     entry = ws_docs.setdefault(
-                        ws_id, {"ws_name": str(r.get("ws_name") or ""), "agenda": None, "company": {}, "thesis": {}}
+                        ws_id,
+                        {
+                            "ws_name": str(r.get("ws_name") or ""),
+                            "ws_user_id": str(r.get("ws_user_id") or ""),
+                            # 真实 status 一起带下去：is_home_row 靠 status='unbound'
+                            # 识别账号合并遗留的旧 Home（codex r2 #4）。
+                            "ws_status": str(r.get("ws_status") or ""),
+                            "agenda": None,
+                            "company": None,
+                            "thesis": None,
+                        },
                     )
                     content = r.get("content") if isinstance(r.get("content"), dict) else {}
                     doc_key = str(r.get("doc_key") or "")
                     if doc_key in ("agenda", "company", "thesis"):
                         entry[doc_key] = content
+                # 行业层 P0：开关打开时取这些工作区绑定的 active 单元；关闭时不查。
+                units_by_ws: dict[str, dict[str, Any]] = {}
+                if ws_docs and is_coverage_units_enabled():
+                    try:
+                        units_by_ws = await load_active_units_by_workspace(
+                            list(ws_docs.keys()), conn=conn
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[DALTON_DIRECTOR_PROBE] coverage unit lookup failed: %s", exc
+                        )
+                        units_by_ws = {}
+                # 行业层 P0 round 2（codex #4）：兼容回退需要这些用户的 dalton-*
+                # 自动化行（与 tracking 同一条规则，不过滤状态）。空 workspace_id
+                # 的行按 legacy 规则归属同一用户的工作区。
+                autos_by_user: dict[str, list[dict[str, Any]]] = {}
+                try:
+                    if ws_docs:
+                        involved_users = sorted(
+                            {str(e["ws_user_id"]) for e in ws_docs.values() if e["ws_user_id"]}
+                        )
+                        if involved_users:
+                            await cur.execute(
+                                """
+                                SELECT user_id, workspace_id::text AS workspace_id, name, metadata
+                                FROM automations
+                                WHERE strpos(lower(name), 'dalton-') > 0
+                                  AND user_id = ANY(%s)
+                                  AND (workspace_id = ANY(%s::uuid[]) OR workspace_id IS NULL)
+                                ORDER BY file_name
+                                """,
+                                (
+                                    involved_users,
+                                    list(ws_docs.keys()),
+                                ),
+                            )
+                            for ar in await cur.fetchall() or []:
+                                # The SQL only prefilters; tracking's own rule (Python strip(), which
+                                # also drops tabs and other whitespace btrim keeps) decides.
+                                if (
+                                    isinstance(ar, dict)
+                                    and ar.get("user_id")
+                                    and str(ar.get("name") or "").strip().lower().startswith("dalton-")
+                                ):
+                                    autos_by_user.setdefault(str(ar["user_id"]), []).append(
+                                        dict(ar)
+                                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[DALTON_DIRECTOR_PROBE] dalton automation preload failed: %s", exc
+                    )
+                    autos_by_user = {}
                 agenda_docs = []
                 doc_markets: list[tuple[str, ZoneInfo]] = []
                 for ws_id, entry in ws_docs.items():
                     if not isinstance(entry["agenda"], dict):
                         continue
+                    # 行业层 P0 round 2：身份与 ticker 一律来自共享解析器（codex
+                    # #2/#3）。Home、已登记行业单元无条件不计公司待办；ticker 与
+                    # 交易所时区都用解析结果——否则"腾讯"绑定 0700.HK 单元时验证
+                    # 项会按工作区名推断的美东时区算到期。
+                    identity = await resolve_workspace_coverage_identity(
+                        {
+                            "workspace_id": ws_id,
+                            "user_id": entry["ws_user_id"],
+                            "name": entry["ws_name"],
+                            "status": entry["ws_status"],
+                        },
+                        company_content=entry["company"],
+                        thesis_content=entry["thesis"],
+                        registered_units=units_by_ws,
+                        automations=autos_by_user.get(entry["ws_user_id"], []),
+                    )
+                    if not identity.is_company or not identity.ticker:
+                        continue
                     agenda_docs.append(entry["agenda"])
                     doc_markets.append(
-                        workspace_market_timezone(entry["company"], entry["thesis"], entry["ws_name"])
+                        (identity.ticker, ticker_market_timezone(identity.ticker, entry["company"]))
                     )
                 ag_counts = _count_agenda_actionable(
                     agenda_docs, now_dt=now_dt, now_date=now_date, doc_markets=doc_markets

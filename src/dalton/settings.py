@@ -179,6 +179,18 @@ class DaltonColleagueDispatchConfig(BaseModel):
     enabled: bool = False
 
 
+class DaltonCoverageUnitsConfig(BaseModel):
+    """Coverage-unit identity registry switch (`dalton_coverage_units`, d023, sector layer P0).
+
+    Off (the default): workspace coverage identity uses the compatible rules only
+    (company knowledge doc → implicit company; Home; everything else unclassified)
+    and the registry table is never read. On: a registered active unit bound to
+    the workspace wins over the compatible rules.
+    """
+
+    enabled: bool = False
+
+
 # A fake-IP exemption may never reach these, whatever the config says: they are
 # the internal services and metadata endpoint the fetch guard exists to protect.
 NEVER_EXEMPT_NETWORKS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = tuple(
@@ -305,6 +317,9 @@ class DaltonConfig(BaseModel):
     colleague_dispatch: DaltonColleagueDispatchConfig = Field(
         default_factory=DaltonColleagueDispatchConfig
     )
+    coverage_units: DaltonCoverageUnitsConfig = Field(
+        default_factory=DaltonCoverageUnitsConfig
+    )
     models: DaltonModelsConfig = Field(default_factory=DaltonModelsConfig)
     budget: DaltonBudgetDefaults = Field(default_factory=DaltonBudgetDefaults)
     knowledge: DaltonKnowledgeConfig = Field(default_factory=DaltonKnowledgeConfig)
@@ -375,6 +390,14 @@ def is_colleague_dispatch_enabled() -> bool:
     if env_flag is not None:
         return env_flag.strip().lower() in ("1", "true", "yes")
     return get_dalton_config().colleague_dispatch.enabled
+
+
+def is_coverage_units_enabled() -> bool:
+    """Whether the coverage-unit registry (`dalton_coverage_units`, d023) takes part in identity resolution."""
+    env_flag = os.getenv("DALTON_COVERAGE_UNITS_ENABLED")
+    if env_flag is not None:
+        return env_flag.strip().lower() in ("1", "true", "yes")
+    return get_dalton_config().coverage_units.enabled
 
 
 def is_budget_gate_enabled() -> bool:

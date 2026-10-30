@@ -35,24 +35,42 @@ def market_timezone(ticker: str) -> ZoneInfo:
     return ZoneInfo(_MARKET_TIMEZONES.get(infer_market(ticker), "America/New_York"))
 
 
+def ticker_market_timezone(ticker: str, company_content: Any = None) -> ZoneInfo:
+    """A company ticker's exchange timezone: the company doc's `exchange` when the
+    doc's own ticker is exactly this one, else the market inferred from the
+    ticker suffix.
+
+    The doc's exchange belongs to the doc's ticker. When identity resolution
+    picked a different ticker (a registered unit's `BABA` over a legacy
+    `9988.HK / HKEX` doc), the stale exchange must not drag a US stock onto the
+    Hong Kong clock (sector layer P0 round 3, codex r2 #3). The board and the
+    director probe get the ticker from the shared coverage-identity resolver
+    and only ask this for its timezone.
+    """
+    company = company_content if isinstance(company_content, dict) else {}
+    doc_ticker = str(company.get("ticker") or "").strip().upper()
+    exchange = str(company.get("exchange") or "").strip().upper()
+    if ticker and doc_ticker == ticker and exchange in _EXCHANGE_TIMEZONES:
+        return ZoneInfo(_EXCHANGE_TIMEZONES[exchange])
+    return market_timezone(ticker)
+
+
 def workspace_market_timezone(
     company_content: Any,
     thesis_content: Any,
     ws_name: str,
 ) -> tuple[str, ZoneInfo]:
-    """工作区 → (标的, 交易所时区)，议程探针、总监探针与看板共用的同一来源
-    顺序：company 文档的 ticker（有 exchange 字段时用它定交易所）→ 论点文档
-    的 ticker → 工作区名。工作区名常是中文公司名（如"腾讯"），拿它推断会把
-    港股 / A 股当美股（美东），比正确答案晚约 12 小时。"""
+    """工作区 → (标的, 交易所时区)，历史共享解析：company 文档的 ticker（有
+    exchange 字段时用它定交易所）→ 论点文档的 ticker → 工作区名。工作区名常是
+    中文公司名（如"腾讯"），拿它推断会把港股 / A 股当美股（美东），比正确答案
+    晚约 12 小时。身份与 ticker 的现行单一来源是 `coverage.identity`
+    （round 2 起看板与总监探针改走那边），此函数保留给旧调用与其测试。"""
     company = company_content if isinstance(company_content, dict) else {}
     thesis = thesis_content if isinstance(thesis_content, dict) else {}
     ticker = str(
         company.get("ticker") or thesis.get("ticker") or ws_name or ""
     ).strip().upper()
-    exchange = str(company.get("exchange") or "").strip().upper()
-    if exchange in _EXCHANGE_TIMEZONES:
-        return ticker, ZoneInfo(_EXCHANGE_TIMEZONES[exchange])
-    return ticker, market_timezone(ticker)
+    return ticker, ticker_market_timezone(ticker, company)
 
 
 def parse_due_moment(val: Any, default_tz: ZoneInfo) -> Optional[datetime]:
