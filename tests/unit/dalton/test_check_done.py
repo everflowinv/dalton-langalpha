@@ -10,12 +10,16 @@ silently passing. Verdict rows carry the REAL ``dalton_verdicts`` columns
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import os
+import re
 import time
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from fnmatch import fnmatch
+from pathlib import Path
 from typing import Any
 from unittest.mock import create_autospec
 
@@ -92,6 +96,7 @@ def _make_backend(
     execute_error: bool = False,
     read_none_paths: frozenset[str] | set[str] = frozenset(),
     scan_rc: int = 0,
+    realpaths: dict[str, str] | None = None,
 ) -> Any:
     """A spec'd sandbox backend serving ``files`` and scripted commands.
 
@@ -104,11 +109,16 @@ def _make_backend(
     to exit code 1 with an error string, never a marker). Reads answer None
     for paths in ``read_none_paths`` and for EMPTY files, exactly as the
     real read layer does (empty file and UTF-8 decode failure both read as
-    None, not as an exception).
+    None, not as an exception). ``realpaths`` maps a workspace-relative path
+    to its ``realpath -e`` resolution (a symlink's target); the empty string
+    means the resolution fails (rc 1), and unmapped paths resolve inside the
+    fake workspace root like ordinary files.
     """
     backend = create_autospec(SandboxBackend, instance=True)
     now = int(time.time())
     mtimes = mtimes or {}
+    realpaths = realpaths or {}
+    fake_root = "/fake-ws"
 
     async def _aread_text(path: str) -> str | None:
         if read_error:
@@ -134,6 +144,16 @@ def _make_backend(
         marker = " && "
         if body.startswith("cd ") and marker in body:
             body = body.split(marker, 1)[1]
+        if body.startswith("realpath -- "):
+            target = body.removeprefix("realpath -- ").strip().strip("'\"")
+            if target == ".":
+                return _Response(fake_root, 0)
+            if target in realpaths:
+                resolved = realpaths[target]
+                if not resolved:
+                    return _Response("", 1)  # resolution fails (missing target)
+                return _Response(resolved, 0)
+            return _Response(f"{fake_root}/{target}", 0)
         if body.startswith("wc -c"):
             path = body.removeprefix("wc -c < ").strip().strip("'\"")
             content = files.get(path)
@@ -1700,6 +1720,292 @@ async def test_earnings_flash_needs_research_note_and_earnings_verdict(
     assert any("缺少推送稿" in m and FLASH_PUSH in m for m in gap["missing"])
 
 
+@pytest.mark.asyncio
+async def test_flash_note_path_param_checks_the_user_named_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A user-named delivery file (audit #14: DHI's update note) is what the
+    flash contract checks when note_path is passed — never the conventional
+    research/<D>-flash-<quarter>.md this run did not write."""
+    _patch_knowledge(monkeypatch, [])
+    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", trigger_kind="earnings")])
+    push_text = "## 结论\n更新。\n"
+    note_path = "research/2026-10-23-update-FY26Q3.md"
+    files = {
+        note_path: "快讯更新" * 120,
+        FLASH_PUSH: push_text,
+        f"{FLASH_PUSH}.language.json": _language_json(push_text),
+    }
+    result = await run_check_done(
+        workflow="dalton-earnings-flash",
+        params={
+            "ticker": "META",
+            "quarter": "FY26Q3",
+            "as_of": "2026-10-23",
+            "note_path": note_path,
+        },
+        backend=_make_backend(files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert result["done"], result["missing"]
+    # 未传 note_path 时仍核对默认路径，由既有的
+    # test_earnings_flash_needs_research_note_and_earnings_verdict 锁定
+    # （后端无任何 flash 文件时缺项点名 research/<D>-flash-<季度>.md）。
+
+
+@pytest.mark.asyncio
+async def test_flash_note_path_shape_violations_are_gaps_not_blessings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit note_path must stay inside the workspace, under research/,
+    with the declared .md suffix — the contract must not be usable to bless an
+    unrelated file (each bad path exists and is fresh, so only the shape
+    validation stands between it and a pass)."""
+    _patch_knowledge(monkeypatch, [])
+    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", trigger_kind="earnings")])
+    push_text = "## 结论\n更新。\n"
+    for bad_path, needle in (
+        ("drafts/2026-10-23-update.md", "不在契约声明的 research/ 下"),
+        ("research/2026-10-23-update.txt", "扩展名"),
+        ("../outside-workspace.md", "越出工作区"),
+    ):
+        files = {
+            bad_path: "用户点名的交付文件" * 60,
+            FLASH_PUSH: push_text,
+            f"{FLASH_PUSH}.language.json": _language_json(push_text),
+        }
+        result = await run_check_done(
+            workflow="dalton-earnings-flash",
+            params={
+                "ticker": "META",
+                "quarter": "FY26Q3",
+                "as_of": "2026-10-23",
+                "note_path": bad_path,
+            },
+            backend=_make_backend(files),
+            workspace_id=WS,
+            thread_id="short-1",
+        )
+        assert not result["done"], bad_path
+        assert any(needle in m and bad_path in m for m in result["missing"]), bad_path
+
+
+@pytest.mark.asyncio
+async def test_flash_note_path_symlink_escape_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """audit r1 #6: ``research/update.md`` symlinked outside the workspace
+    passes every string check (research/ root, .md suffix, file present) —
+    only resolving the real path IN the sandbox catches it. An in-workspace
+    symlink into another top-level directory is rejected the same way."""
+    _patch_knowledge(monkeypatch, [])
+    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", trigger_kind="earnings")])
+    push_text = "## 结论\n更新。\n"
+    for link, target, needle in (
+        ("research/2026-10-23-update.md", "/etc/passwd", "真实路径越出当前工作区"),
+        ("research/2026-10-23-update.md", "/fake-ws/drafts/real-note.md", "解析后的真实文件不在契约声明的 research/ 下"),
+    ):
+        files = {
+            link: "用户点名的交付文件" * 60,
+            FLASH_PUSH: push_text,
+            f"{FLASH_PUSH}.language.json": _language_json(push_text),
+        }
+        result = await run_check_done(
+            workflow="dalton-earnings-flash",
+            params={
+                "ticker": "META",
+                "quarter": "FY26Q3",
+                "as_of": "2026-10-23",
+                "note_path": link,
+            },
+            backend=_make_backend(files, realpaths={link: target}),
+            workspace_id=WS,
+            thread_id="short-1",
+        )
+        assert not result["done"], target
+        assert any(needle in m and link in m for m in result["missing"]), target
+
+
+@pytest.mark.asyncio
+async def test_flash_note_path_unresolvable_reports_string_only_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the sandbox cannot resolve the real path, the string checks stand
+    (the file is valid, the check passes) and the result says real-path
+    resolution was not performed."""
+    _patch_knowledge(monkeypatch, [])
+    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", trigger_kind="earnings")])
+    push_text = "## 结论\n更新。\n"
+    note_path = "research/2026-10-23-update-FY26Q3.md"
+    files = {
+        note_path: "快讯更新" * 120,
+        FLASH_PUSH: push_text,
+        f"{FLASH_PUSH}.language.json": _language_json(push_text),
+    }
+    result = await run_check_done(
+        workflow="dalton-earnings-flash",
+        params={
+            "ticker": "META",
+            "quarter": "FY26Q3",
+            "as_of": "2026-10-23",
+            "note_path": note_path,
+        },
+        # Empty target: realpath exits 1 — resolution unavailable.
+        backend=_make_backend(files, realpaths={note_path: ""}),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert result["done"], result["missing"]
+    assert any("未能解析真实路径" in w and note_path in w for w in result["warnings"])
+
+
+class _LocalShellBackend:
+    """最小本地执行 backend（audit r2 #4 的符号链接语义测试专用）。
+
+    仓库的测试辅助都是字典文件表 + 命令脚本（`_make_backend`），模拟不出
+    "normpath 折叠与 realpath 解析指向不同文件"的真实语义，所以这里用真实
+    文件系统：`aexecute` 以真实 shell 在工作区目录内执行命令，
+    `aread_text`/`aglob_paths` 读真实文件。唯一例外是 `stat -c %Y`：生产沙箱
+    是 Linux（GNU stat），macOS 的 BSD stat 不认这个写法，进程内翻译成
+    os.stat；realpath / wc / test / find 走真实 shell。"""
+
+    def __init__(self, workspace_dir: str) -> None:
+        self.workspace_dir = workspace_dir
+
+    async def aread_text(self, path: str) -> str | None:
+        target = Path(path) if path.startswith("/") else Path(self.workspace_dir) / path
+        try:
+            return target.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None
+
+    async def aglob_paths(self, pattern: str, path: str = ".") -> list[str]:
+        root = Path(self.workspace_dir)
+        return sorted(str(m.relative_to(root)) for m in root.glob(pattern) if m.is_file())
+
+    async def aexecute(self, command: str, *, timeout: int | None = None) -> Any:
+        class _Response:
+            def __init__(self, output: str, exit_code: int) -> None:
+                self.output = output
+                self.exit_code = exit_code
+
+        body = command
+        if body.startswith("cd ") and " && " in body:
+            body = body.split(" && ", 1)[1]
+        stat_match = re.fullmatch(r"stat -c %Y (.+)", body)
+        if stat_match:
+            target = stat_match.group(1).strip().strip("'\"")
+            p = Path(target) if target.startswith("/") else Path(self.workspace_dir) / target
+            try:
+                return _Response(str(int(p.stat().st_mtime)), 0)
+            except OSError:
+                return _Response("", 1)
+        proc = await asyncio.create_subprocess_shell(
+            body,
+            cwd=self.workspace_dir,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        out, _ = await proc.communicate()
+        return _Response(out.decode("utf-8", "replace"), proc.returncode or 0)
+
+
+@pytest.mark.asyncio
+async def test_flash_note_path_symlink_dir_with_dotdot_is_rejected_on_real_fs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """audit r2 #4，真实文件系统复现：``research/hop -> /outside/subdir``，
+    传入 ``research/hop/../report.md``——字符串层 normpath 会把它折叠成工作区内
+    的 ``research/report.md``（工作区里恰好存在），而 shell 实际读取的是
+    ``/outside/report.md``。校验必须按原始路径在沙箱内解析并判越界，后续
+    wc/stat 也必须用解析后的真实路径（同一个文件）。"""
+    _patch_knowledge(monkeypatch, [])
+    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", trigger_kind="earnings")])
+    push_text = "## 结论\n更新。\n"
+    ws = tmp_path / "ws"
+    (ws / "research" / "push").mkdir(parents=True)
+    # 工作区内的同名文件：让"normpath 先折叠"的旧实现对位校验通过。
+    (ws / "research" / "report.md").write_text("工作区内的真实文件" * 40, encoding="utf-8")
+    # 工作区外的链接目标：外部文件也满足大小要求，只有真实路径解析能拦住。
+    # hop -> outside/subdir，于是 research/hop/../report.md 解析到 outside/report.md
+    # （链接目标目录的父级，工作区之外）。
+    outside = tmp_path / "outside" / "subdir"
+    outside.mkdir(parents=True)
+    (tmp_path / "outside" / "report.md").write_text("外部文件内容" * 60, encoding="utf-8")
+    os.symlink(outside, ws / "research" / "hop")
+    flash_push = ws / "research" / "push" / "2026-10-23-earnings-flash-FY26Q3.md"
+    flash_push.write_text(push_text, encoding="utf-8")
+    (ws / "research" / "push" / "2026-10-23-earnings-flash-FY26Q3.md.language.json").write_text(
+        _language_json(push_text), encoding="utf-8"
+    )
+    backend = _LocalShellBackend(str(ws))
+
+    params = {
+        "ticker": "META",
+        "quarter": "FY26Q3",
+        "as_of": "2026-10-23",
+        "note_path": "research/hop/../report.md",
+    }
+    result = await run_check_done(
+        workflow="dalton-earnings-flash",
+        params=params,
+        backend=backend,
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert not result["done"], result["missing"]
+    assert any(
+        "真实路径越出当前工作区" in m and "research/hop/../report.md" in m
+        for m in result["missing"]
+    )
+
+    # 正向对照（同一真实工作区、同一 backend）：普通文件通过，证明上一条的
+    # 缺项来自真实路径解析，而不是本地 backend 本身坏掉。
+    ok_result = await run_check_done(
+        workflow="dalton-earnings-flash",
+        params={**params, "note_path": "research/report.md"},
+        backend=_LocalShellBackend(str(ws)),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert ok_result["done"], ok_result["missing"]
+
+
+
+@pytest.mark.asyncio
+async def test_flash_note_path_symlink_to_wrong_suffix_is_rejected_on_real_fs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """audit r3：``research/report.md`` 链接到工作区内的 ``research/report.txt``——
+    原始拼写的扩展名合规，真实文件不是。真实路径也要按契约扩展名校验。"""
+    _patch_knowledge(monkeypatch, [])
+    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", trigger_kind="earnings")])
+    push_text = "## 结论\n更新。\n"
+    ws = tmp_path / "ws"
+    (ws / "research" / "push").mkdir(parents=True)
+    (ws / "research" / "report.txt").write_text("纯文本" * 200, encoding="utf-8")
+    os.symlink(ws / "research" / "report.txt", ws / "research" / "report.md")
+    flash_push = ws / "research" / "push" / "2026-10-23-earnings-flash-FY26Q3.md"
+    flash_push.write_text(push_text, encoding="utf-8")
+    (ws / "research" / "push" / "2026-10-23-earnings-flash-FY26Q3.md.language.json").write_text(
+        _language_json(push_text), encoding="utf-8"
+    )
+    result = await run_check_done(
+        workflow="dalton-earnings-flash",
+        params={
+            "ticker": "META",
+            "quarter": "FY26Q3",
+            "as_of": "2026-10-23",
+            "note_path": "research/report.md",
+        },
+        backend=_LocalShellBackend(str(ws)),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert not result["done"], result["missing"]
+    assert any("真实文件扩展名须为 .md" in m for m in result["missing"])
+
 MOVE_PARAMS = {"ticker": "META", "as_of": "2026-10-23"}
 MOVE_FILES = {"research/2026-10-23-stock-move.md": "归因" * 200}
 
@@ -2905,6 +3211,57 @@ async def test_window_scan_catches_files_the_dispatches_never_reported(
     assert not result["done"]
     assert any(f"{fresh}.language.json" in m and "缺少语言审查记录" in m for m in result["missing"])
     assert not any(stale in m for m in result["missing"])
+
+
+@pytest.mark.asyncio
+async def test_run_language_scan_covers_main_agent_notes_not_machine_packets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The run path KEEPS the mtime scan (audit r1 #5): the dispatch list is
+    not a complete write ledger, so a formal note the MAIN agent wrote outside
+    the contract (research/final-note.md, never dispatched) is still pulled
+    into review — while machine collection packets stay out of scope (the
+    round-1 tracker exclusion, kept)."""
+    files = _preview_files()
+    run_dir = ".agents/threads/short-1/workflows/task-run-8"
+    files[f"{run_dir}/status.json"] = json.dumps(
+        {"run_id": "task-run-8", "name": "dalton-earnings-preview", "status": "completed", "updated_at": 50.0}
+    )
+    files[f"{run_dir}/journal/成稿.json"] = json.dumps(
+        {
+            "label": "成稿",
+            "dispatches": [
+                {
+                    "label": "成稿",
+                    "status": "ok",
+                    "seq": 1,
+                    "recorded_at": time.time() - 3600,
+                    "result": {"files": [PREVIEW_DRAFT]},
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )
+    # In-window, reviewable, never reported by any dispatch and not declared:
+    # the main agent's own note owes review.
+    files["research/final-note.md"] = "主代理另写的正式稿" * 60
+    # In-window and reviewable-looking, but a machine collection packet.
+    files["research/tracker/20261023-0100/packet.md"] = "机器采集包" * 60
+    _patch_knowledge(monkeypatch, ["drivers", "debate"])
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", trigger_kind="earnings")])
+
+    result = await run_check_done(
+        workflow="dalton-earnings-preview",
+        params=PREVIEW_PARAMS,
+        backend=_make_backend(files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert not result["done"], result["missing"]
+    assert any(
+        "research/final-note.md" in m and "缺少语言审查记录" in m for m in result["missing"]
+    )
+    assert not any("packet.md" in m for m in result["missing"])
 
 
 @pytest.mark.asyncio

@@ -361,6 +361,141 @@ async def _run_written_variant(
     return best
 
 
+async def _resolve_real_path(
+    backend: Any, raw_path: str
+) -> tuple[str | None, str | None]:
+    """``(resolved_file, resolved_root)`` — the RAW path as the caller spelled
+    it (NOT normpath'd first: ``research/hop/../report.md`` must resolve
+    through the symlink, which a pre-collapsed spelling would hide — audit r2
+    #4) and the workspace root's real path, both resolved IN the sandbox
+    (``realpath`` under the ``cd <workspace>`` prefix, so symlinks are
+    followed; no ``-e`` — the dev mac's BSD realpath lacks it, and existence
+    is the artifact check's own job anyway). ``(None, None)`` when the backend
+    cannot execute or the resolution fails — the caller then falls back to
+    string validation and says so."""
+    file_out = await _run_command(backend, f"realpath -- {shlex.quote(raw_path)}")
+    root_out = await _run_command(backend, "realpath -- .")
+
+    def _last_line(out: tuple[int, str]) -> str | None:
+        lines = [ln.strip() for ln in out[1].splitlines() if ln.strip()]
+        return lines[-1] if lines else None
+
+    if file_out is None or file_out[0] != 0:
+        return None, None
+    if root_out is None or root_out[0] != 0:
+        return None, None
+    return _last_line(file_out), _last_line(root_out)
+
+
+def _anchor_real_path(
+    resolved_file: str, resolved_root: str, workspace_dir: str | None
+) -> str:
+    """A spelling of the resolved REAL file that later checks (``wc``/``stat``/
+    reads) use, so validation and every subsequent check speak about the same
+    file. Anchored under the workspace_dir spelling when one is known (the
+    same file even when workspace_dir itself contains symlinked segments);
+    the resolved absolute path otherwise."""
+    if not workspace_dir:
+        return resolved_file
+    if resolved_file == resolved_root:
+        return workspace_dir
+    if resolved_file.startswith(resolved_root + "/"):
+        return posixpath.join(workspace_dir, resolved_file[len(resolved_root) + 1 :])
+    return resolved_file
+
+
+async def _validate_explicit_artifact_path(
+    explicit: str, template: str, backend: Any
+) -> tuple[str | None, str | None, str | None]:
+    """``(gap, note, checked_path)`` for an explicitly passed ``path_param``
+    value; gap and note both None means the path is fit to be judged, and
+    ``checked_path`` is the spelling every later check of this artifact uses.
+
+    An explicit path names the file the agent says it actually wrote, so it
+    must be the same kind of product the contract declares. The string checks
+    (inside the workspace, the template's top-level directory, the template's
+    suffix) run once on the ORIGINAL spelling; the real path is then resolved
+    IN the sandbox from that original spelling (symlinks and ``..`` followed)
+    and the same containment/shape checks run again on the resolved path
+    against the workspace's REAL root — anything else is a gap, never a
+    silent fallback to the dated template. When the sandbox cannot resolve,
+    the string checks stand, the note says so, and ``checked_path`` is the
+    original spelling (no root to anchor a real-path spelling against)."""
+    workspace_dir = getattr(backend, "workspace_dir", None)
+    if not isinstance(workspace_dir, str):
+        workspace_dir = None
+    rel = _workspace_relative(explicit, workspace_dir)
+    template_root = template.split("/", 1)[0] if "/" in template else ""
+    template_suffix = posixpath.splitext(template)[1]
+    if rel.startswith("/") or rel == ".." or rel.startswith("../"):
+        return (
+            f"显式交付路径越出工作区（{explicit}），无法核对；"
+            "下一步：传入当前工作区内的实际交付文件。",
+            None,
+            None,
+        )
+    explicit_root = rel.split("/", 1)[0] if "/" in rel else ""
+    if template_root and explicit_root != template_root:
+        return (
+            f"显式交付路径 {explicit} 不在契约声明的 {template_root}/ 下，无法核对；"
+            f"下一步：传入 {template_root}/ 下的实际交付文件。",
+            None,
+            None,
+        )
+    if template_suffix and posixpath.splitext(rel)[1] != template_suffix:
+        return (
+            f"显式交付路径 {explicit} 的扩展名须为 {template_suffix}"
+            "（与契约声明一致），无法核对。",
+            None,
+            None,
+        )
+
+    resolved_file, resolved_root = await _resolve_real_path(backend, explicit)
+    if resolved_file is None or resolved_root is None:
+        return (
+            None,
+            f"显式交付路径 {explicit} 未能解析真实路径（沙箱无法执行 realpath 或"
+            "文件不存在），仅做了字符串校验。",
+            explicit,
+        )
+    if resolved_file != resolved_root and not resolved_file.startswith(
+        resolved_root + "/"
+    ):
+        return (
+            f"显式交付路径 {explicit} 解析后的真实路径越出当前工作区"
+            f"（符号链接指向 {resolved_file}），无法核对；"
+            "下一步：传入工作区内的实际交付文件。",
+            None,
+            None,
+        )
+    resolved_rel = (
+        resolved_file[len(resolved_root) + 1 :] if resolved_file != resolved_root else ""
+    )
+    resolved_top = resolved_rel.split("/", 1)[0] if resolved_rel else ""
+    if template_root and resolved_top != template_root:
+        return (
+            f"显式交付路径 {explicit} 解析后的真实文件不在契约声明的 {template_root}/ 下"
+            f"（指向 {resolved_file}），无法核对。",
+            None,
+            None,
+        )
+    if template_suffix and posixpath.splitext(resolved_rel)[1] != template_suffix:
+        return (
+            f"显式交付路径 {explicit} 解析后的真实文件扩展名须为 {template_suffix}"
+            f"（指向 {resolved_file}），无法核对。",
+            None,
+            None,
+        )
+    # 无 workspace_dir 可锚定真实路径拼写时（真实后端总有），退回原始拼写——
+    # 校验解析的就是这个拼写，仍是同一个文件。
+    checked = (
+        _anchor_real_path(resolved_file, resolved_root, workspace_dir)
+        if workspace_dir
+        else explicit
+    )
+    return None, None, checked or explicit
+
+
 async def _check_artifact(
     backend: Any,
     artifact: dict[str, Any],
@@ -441,11 +576,25 @@ async def _check_artifact(
         template_path = render_template(artifact["path"], params)
         # An explicitly passed path (``path_param``) is what the agent says it
         # actually wrote; the dated template is only the conventional spelling.
+        # Its shape is validated against the template first — a blessing of an
+        # unrelated file must fail, not silently check the template instead.
         explicit_key = artifact.get("path_param")
         explicit = str(params.get(explicit_key) or "").strip() if explicit_key else ""
         if explicit:
             explicit_used = True
             concrete = [render_template(explicit, params)]
+            explicit_problem, explicit_note, checked_path = (
+                await _validate_explicit_artifact_path(concrete[0], template_path, backend)
+            )
+            if explicit_problem is not None:
+                _report(explicit_problem)
+                return missing, warnings, resolved
+            if explicit_note is not None:
+                warnings.append(explicit_note)
+            if checked_path:
+                # 校验解析的是这个文件，后续 wc/stat 等检查就说同一个文件
+                #（解析后的真实路径的锚定拼写）。
+                concrete = [checked_path]
         else:
             concrete = [template_path]
 
@@ -1787,11 +1936,18 @@ async def _contract_declared_paths(
             explicit = (
                 str(params.get(explicit_key) or "").strip() if explicit_key else ""
             )
-            concrete_path = (
-                render_template(explicit, params)
-                if explicit
-                else resolved_map.get(template, template)
-            )
+            if explicit:
+                explicit_path = render_template(explicit, params)
+                explicit_gap, _note, checked_path = await _validate_explicit_artifact_path(
+                    explicit_path, template, backend
+                )
+                if explicit_gap is not None:
+                    # Shape-invalid explicit path: the artifact check reports
+                    # it; it is nobody's language target.
+                    continue
+                concrete_path = checked_path or explicit_path
+            else:
+                concrete_path = resolved_map.get(template, template)
             if artifact.get("glob"):
                 matches = await _glob(backend, concrete_path)
                 paths.extend(
@@ -1831,9 +1987,10 @@ async def _check_language_review(
     when this run wrote them (a reused draft, e.g. dalton-publish's approved
     original, rides its existing same-hash records) — plus each reviewable
     file the run's dispatches reported, plus what the mtime window scan of the
-    workspace finds. Fail-closed throughout. ``published/`` archives are
-    nobody's language target (see is_reviewable_deliverable): their review is
-    the draft's."""
+    workspace finds (the dispatch list is not a complete write ledger — the
+    main agent's own writes never go through a dispatch). Fail-closed
+    throughout. ``published/`` archives are nobody's language target (see
+    is_reviewable_deliverable): their review is the draft's."""
     resolved_map = resolved or {}
     draft_template = render_template(rule["draft"], params)
     draft = resolved_map.get(draft_template, draft_template)
@@ -1902,10 +2059,15 @@ async def _check_language_review(
         _add(path)
 
     # 3. The deterministic mtime manifest: dispatch reports can miss files (a
-    # manual flow, a subagent that never echoed a path), so the workspace
-    # itself is scanned for reviewable files written inside the run's window —
-    # the run's start when there is one, else the manual window. A scan that
-    # cannot run is a gap, never a pass.
+    # manual flow, a subagent that never echoed a path — and the MAIN agent's
+    # own writes, which never go through a dispatch), so the workspace itself
+    # is scanned for reviewable files written inside the run's window — the
+    # run's start when there is one, else the manual window. A scan that
+    # cannot run is a gap, never a pass. (The dispatch ledger is NOT a write
+    # ledger: audit r1 #5 — a main-agent note outside the contract would
+    # otherwise skip review; reviewing a neighbour flow's in-window file is
+    # extra cost, not an error. Machine collection packets are kept out by
+    # is_reviewable_deliverable, not by this scan.)
     scanned = await _scan_reviewable_since(backend, since_epoch)
     if scanned is None:
         return ["无法扫描工作区的正式产物（find/stat），无法核对，请重试。"]

@@ -115,15 +115,22 @@ def _utc_now_iso() -> str:
 # reviewable; raw/machine files, scraped-data directories, knowledge-layer
 # renders (knowledge/paths.py serves them from the workspace ROOT, so the
 # drafts/research allowlist already excludes them), machine-rendered
-# conversation digests and verification sidecars are not. ``published/`` is
-# deliberately out: publish_report writes the archive AFTER the review with a
-# banner prepended (different hash) and never edits it again — its language
-# review is the draft's, which the two rounds already cover. This function is
-# the ONE owner of the rule — workflows, SKILLs and completion contracts all
-# defer to it, none keeps its own list.
+# conversation digests, machine-written collection packets and verification
+# sidecars are not. ``published/`` is deliberately out: publish_report writes
+# the archive AFTER the review with a banner prepended (different hash) and
+# never edits it again — its language review is the draft's, which the two
+# rounds already cover. This function is the ONE owner of the rule —
+# workflows, SKILLs and completion contracts all defer to it, none keeps its
+# own list.
 _REVIEWABLE_ROOTS = ("drafts", "research")
 _EXCLUDED_SEGMENTS = frozenset({"bg_data", "data", "lenses_work", "model_dump"})
 _MACHINE_RENDERED_PREFIXES = ("research/topics/conversations/",)
+# research/tracker/<run_id>/ holds dalton-thesis-delta collect.py's machine
+# output (packet.md/packet.json per run) — data for the analyst to read, never
+# a deliverable the flow owes language review for. Only the per-RUN
+# subdirectories are machine territory; a note an agent leaves directly under
+# research/tracker/ is its own writing and stays reviewable.
+_TRACKER_DIR = "research/tracker/"
 # Public: completion-contract glob counting excludes these too — a
 # ``cluster-*.md`` pattern would otherwise count ``cluster-a.md.language.md``.
 SIDECAR_SUFFIXES = (".audit.md", ".annotated.md", ".language.md", ".language.json")
@@ -151,7 +158,7 @@ def is_reviewable_deliverable(path: str, workspace_dir: str | None = None) -> bo
     """Whether ``path`` is a formal deliverable owed two language-review
     rounds: a human-readable ``.md`` under ``drafts/`` or ``research/`` that
     is not machine data, a knowledge render, a machine-rendered conversation
-    digest or a verification sidecar."""
+    digest, a machine-written collection packet or a verification sidecar."""
     rel = _normalize_relpath(path, workspace_dir)
     parts = [p for p in rel.split("/") if p]
     if not parts or parts[0] not in _REVIEWABLE_ROOTS:
@@ -160,6 +167,8 @@ def is_reviewable_deliverable(path: str, workspace_dir: str | None = None) -> bo
         return False
     if any(rel.startswith(prefix) for prefix in _MACHINE_RENDERED_PREFIXES):
         return False
+    if rel.startswith(_TRACKER_DIR) and "/" in rel[len(_TRACKER_DIR):]:
+        return False  # machine collection packet (research/tracker/<run_id>/…)
     return not any(seg in _EXCLUDED_SEGMENTS for seg in parts)
 
 

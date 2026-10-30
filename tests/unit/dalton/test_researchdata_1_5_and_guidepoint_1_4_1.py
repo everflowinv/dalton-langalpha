@@ -895,12 +895,12 @@ def test_collect_estimates_completeness_currency_and_zero_eps() -> None:
             "ticker": "BABA",
             "fetched_at": "2026-10-28T21:00:00-04:00",
             "earnings_estimate": {
-                "0y": {"avg": 0.0, "low": -1.0, "high": 1.0, "numberOfAnalysts": 15, "currency": "CNY"},
-                "+1y": {"avg": 65.0, "low": 60.0, "high": 70.0, "numberOfAnalysts": 20, "currency": "CNY"},
+                "0y": {"avg": 0.0, "low": -1.0, "high": 1.0, "numberOfAnalysts": 15, "currency": "CNY", "period_end": "2027-03-31"},
+                "+1y": {"avg": 65.0, "low": 60.0, "high": 70.0, "numberOfAnalysts": 20, "currency": "CNY", "period_end": "2028-03-31"},
             },
             "revenue_estimate": {
-                "0y": {"avg": 1000e9, "currency": "CNY"},
-                "+1y": {"avg": 1100e9, "currency": "CNY"},
+                "0y": {"avg": 1000e9, "currency": "CNY", "period_end": "2027-03-31"},
+                "+1y": {"avg": 1100e9, "currency": "CNY", "period_end": "2028-03-31"},
             },
             "eps_trend": {
                 "0y": {"current": 0.0, "7daysAgo": 0.5},
@@ -920,16 +920,17 @@ def test_collect_estimates_completeness_currency_and_zero_eps() -> None:
     assert cny_partial_cons["status"] == "partial"
     assert cny_partial_cons["currency"] == "CNY"
 
+    # 跨快照比较自 R3b 起先按真实期间（period_end）对齐再计算。
     prev_cny_cons = {
         "ticker": "BABA",
         "fetched_at": "2026-10-27T21:00:00-04:00",
         "currency": "CNY",
         "earnings_estimate": {
-            "0y": {"avg": 0.5, "currency": "CNY"},
-            "+1y": {"avg": 64.0, "currency": "CNY"},
+            "0y": {"avg": 0.5, "currency": "CNY", "period_end": "2027-03-31"},
+            "+1y": {"avg": 64.0, "currency": "CNY", "period_end": "2028-03-31"},
         },
         "revenue_estimate": {
-            "+1y": {"avg": 1095e9, "currency": "CNY"},
+            "+1y": {"avg": 1095e9, "currency": "CNY", "period_end": "2028-03-31"},
         },
         "price_targets": {"mean": 119.5},
     }
@@ -939,13 +940,13 @@ def test_collect_estimates_completeness_currency_and_zero_eps() -> None:
     assert deltas["eps_0y_vs_7d_pct"] == -100.0
     assert deltas["eps_+1y_vs_last_pct"] == 1.56
 
-    # Cross-snapshot currency mismatch (CNY vs USD) is guarded
+    # Cross-snapshot currency mismatch (CNY vs USD) on the SAME real period is guarded
     prev_usd_cons = {
         "ticker": "BABA",
         "fetched_at": "2026-10-27T21:00:00-04:00",
         "currency": "USD",
-        "earnings_estimate": {"+1y": {"avg": 9.0, "currency": "USD"}},
-        "revenue_estimate": {"+1y": {"avg": 150e9, "currency": "USD"}},
+        "earnings_estimate": {"+1y": {"avg": 9.0, "currency": "USD", "period_end": "2028-03-31"}},
+        "revenue_estimate": {"+1y": {"avg": 150e9, "currency": "USD", "period_end": "2028-03-31"}},
     }
     mismatch_deltas, _ = collect_mod.compute_consensus_deltas(cny_partial_cons, prev_usd_cons, thr)
     assert mismatch_deltas["currency_mismatch"] is True

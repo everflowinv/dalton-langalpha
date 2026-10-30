@@ -107,6 +107,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 - **推送稿两轮语言审查与原样回复**：按 `.agents/skills/dalton-conventions/SKILL.md` §8 将推送正文写入 `research/push/<D>-earnings-flash-<季度>.md` 并完成两轮 `check_language`，最后回复与该推送稿逐字相同。
 - 快讯落盘 `research/<D>-flash-<季度>.md`、写完 verdict 与推送稿两轮语言审查之后、推送 PM 之前，调用 `dalton_check_done(workflow="dalton-earnings-flash", params={"ticker": ..., "quarter": ..., "as_of": "<本稿 D>"})`（`<D>` 统一用财报发布的美东业务日，与快讯文件名一致；新近度按本轮运行开始时间核对，跨美东零点的自动唤醒不会因此误判）。
+- **用户指定文件名时传 `note_path`**：用户点名了交付文件名（如 `research/2026-10-30-update-FY26Q4.md` 一类的 update 稿）时，`params` 加 `"note_path": "<实际文件名>"`（必须是当前工作区 `research/` 下的 `.md`），完成契约改按该实际路径核对；不传则默认核对 `research/<D>-flash-<季度>.md`。既不要为过检查另写一份默认名文件，也不要改掉用户指定的文件名。
 - `done=false` 时按 `missing` 先补齐再查（快讯文件缺失或过小就补齐、verdict 未写或 `trigger.kind` 不是 `earnings` 就 `knowledge_append_verdict`、推送稿语言审查缺轮次或第 2 轮哈希对不上就补跑 `check_language`）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。
 
 ---

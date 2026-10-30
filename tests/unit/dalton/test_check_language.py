@@ -290,6 +290,10 @@ def test_is_reviewable_deliverable_covers_the_user_scope() -> None:
         "published/INDEX.md",
         "published/2026-10-23-call-META.md",  # archive: its review is the draft's
         "research/topics/conversations/abc12345.md",  # machine-rendered digest
+        # machine collection packets under a tracker run dir (collect.py's
+        # nightly output) are data, not deliverables owed language review
+        "research/tracker/20261029-2300/packet.md",
+        "research/tracker/20261029-2300/packet.md.language.md",
         "drafts/2026-10-23-initial-coverage.audit.md",
         "drafts/2026-10-23-initial-coverage.annotated.md",
         "drafts/2026-10-23-initial-coverage.md.language.md",
