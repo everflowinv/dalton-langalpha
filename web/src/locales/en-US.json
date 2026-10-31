@@ -7010,6 +7010,45 @@
       "enabledHint": "With it on, material this workspace receives is routed into sales notes or the company wiki by who is speaking, answered with a one-line receipt; suspected duplicates or an undecided classification still ask.",
       "disabledHint": "With it off, ingests keep the two-step flow: preview first, write after the user confirms.",
       "error": "Failed to toggle, try again"
+    },
+    "coverage": {
+      "title": "Coverage view",
+      "subtitle": "The coverage map of sectors, standalone companies, and unclassified workspaces; click a unit for detail, open the workspace of an active one directly",
+      "refresh": "Refresh",
+      "tabSectors": "Sectors",
+      "tabCompanies": "Standalone companies",
+      "tabUnclassified": "Unclassified workspaces",
+      "empty": "Nothing here yet",
+      "loadError": "Failed to load the coverage view",
+      "readable": "Readable",
+      "delegatable": "Delegatable",
+      "autoTracked": "In my schedule",
+      "openWorkspace": "Open workspace",
+      "detailLoading": "Loading detail...",
+      "detailError": "Failed to load detail",
+      "notCovered": "No company coverage yet",
+      "covered": "Company coverage",
+      "thesis": "Thesis",
+      "stance": "Stance",
+      "conviction": "Conviction",
+      "pillarCount": "{{count}} pillars",
+      "drivers": "Drivers",
+      "agendaTodos": "Agenda to-dos",
+      "agendaValidations": "Due validation",
+      "members": "Members",
+      "evidenceGaps": "Evidence gaps",
+      "ledgerGaps": "Cross-layer ledger gaps",
+      "relatedSectors": "Related sectors",
+      "reReview": "Assumptions to re-review",
+      "none": "None",
+      "noDoc": "No document yet",
+      "waitingPm": "Waiting for PM",
+      "pendingTruncated": "Showing first {{count}} of {{total}} pending items"
+    },
+    "systemJobs": {
+      "sectorTitle": "Sector auto-tracking",
+      "sectorSubtitle": "Agenda-due and internal-material delta jobs for each sector coverage unit (no securities probes)",
+      "sectorSummary": "Sector tracking"
     }
   }
 }

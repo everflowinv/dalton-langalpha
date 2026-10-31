@@ -513,7 +513,7 @@ export async function fetchDaltonBudgetToday(): Promise<DaltonBudgetToday> {
   return data;
 }
 
-export type DaltonSystemJobScope = 'company' | 'home' | 'host' | 'ops';
+export type DaltonSystemJobScope = 'company' | 'sector' | 'home' | 'host' | 'ops';
 export type DaltonSystemJobStatus = 'on' | 'off' | 'partial' | 'unknown';
 
 export interface DaltonSystemJobItem {
@@ -546,6 +546,14 @@ export interface DaltonSystemJobItem {
   log_tail?: string;
   running?: boolean;
   missing_tasks?: string[];
+  // sector scope（行业层 P3 起后端返回；其余 scope 无这些字段）
+  unit_id?: string | null;
+  sector_slug?: string;
+  subject_kind?: string;
+  tracking_status?: string;
+  paused_tasks?: string[];
+  active_tasks?: string[];
+  tasks?: unknown[];
 }
 
 export interface DaltonSystemJobsResponse {
@@ -554,6 +562,7 @@ export interface DaltonSystemJobsResponse {
   jobs: DaltonSystemJobItem[];
   groups?: {
     company: DaltonSystemJobItem[];
+    sector?: DaltonSystemJobItem[];
     home: DaltonSystemJobItem[];
     host: DaltonSystemJobItem[];
     ops: DaltonSystemJobItem[];

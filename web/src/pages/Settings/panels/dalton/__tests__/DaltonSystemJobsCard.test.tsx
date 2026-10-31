@@ -230,4 +230,60 @@ describe('DaltonSystemJobsCard', () => {
     const pre = screen.getByTestId('system-job-log-conversation-archive');
     expect(pre).toHaveTextContent('Error: something went wrong');
   });
+
+  it('renders and toggles sector-scope jobs with the same UI as company scope (P4)', async () => {
+    // 形状与后端 _build_sector_job_entry 的返回逐字段一致（system_jobs.py）
+    mockFetchJobs.mockResolvedValueOnce({
+      ok: true,
+      is_pm: true,
+      jobs: [
+        {
+          key: 'sector:ai-infrastructure',
+          kind: 'sector_tracking',
+          scope: 'sector',
+          title: 'AI Infrastructure 行业自动跟踪',
+          description: '',
+          schedule: '议程到期每 2 小时（研究时区）· 内部资料每周六 11:00 增量扫描 · 不跑证券探针',
+          workspace_id: '11111111-1111-1111-1111-111111111111',
+          unit_id: '22222222-2222-2222-2222-222222222222',
+          sector_slug: 'ai-infrastructure',
+          subject_kind: 'sector',
+          ticker: null,
+          status: 'on',
+          tracking_status: 'enabled',
+          enabled: true,
+          paused_by_user: false,
+          last_run_at: null,
+          last_result: null,
+          next_run_at: null,
+          can_toggle: true,
+          can_run_now: true,
+          missing_tasks: [],
+          paused_tasks: [],
+          active_tasks: [],
+          tasks: [],
+        },
+      ],
+    });
+
+    renderWithProviders(<DaltonSystemJobsCard scopes={['company', 'sector', 'home']} />);
+
+    expect(await screen.findByTestId('system-jobs-group-sector')).toBeInTheDocument();
+    expect(
+      screen.getByTestId('system-job-row-sector:ai-infrastructure'),
+    ).toBeInTheDocument();
+    expect(screen.getByText('AI Infrastructure 行业自动跟踪')).toBeInTheDocument();
+    // 与公司 scope 同一套暂停/开关控件
+    expect(screen.getByLabelText('切换 AI Infrastructure 行业自动跟踪')).toBeInTheDocument();
+    expect(screen.getByTestId('system-job-run-sector:ai-infrastructure')).toBeInTheDocument();
+    expect(screen.queryByTestId('system-jobs-group-host')).not.toBeInTheDocument();
+    // 摘要行包含行业跟踪（sector 摘要名走 i18n；jsdom 下组件测试以 en-US
+    // 渲染，原有四个 scope 的摘要名是组件内写死的中文，所以这里按 en-US
+    // 目录里的 sector 摘要名 'Sector tracking' 断言）
+    expect(
+      screen.getByText(
+        '统一查看、开关与立即触发系统内所有自动运行任务（公司跟踪、Sector tracking、Home 全局）',
+      ),
+    ).toBeInTheDocument();
+  });
 });

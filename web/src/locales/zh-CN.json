@@ -6892,6 +6892,45 @@
       "enabledHint": "开启后，工作区收到的资料按“谁在说”自动分流写入 sales notes 或 company-wiki，只回一条回执；疑似重复或分类拿不准时仍会询问。",
       "disabledHint": "关闭时保持两步确认：先预览，用户同意后写入。",
       "error": "切换失败，请重试"
+    },
+    "coverage": {
+      "title": "覆盖视图",
+      "subtitle": "行业、独立公司与未分类工作区的覆盖地图；点击单元查看详情，活跃单元可直接进入工作区",
+      "refresh": "刷新",
+      "tabSectors": "行业",
+      "tabCompanies": "独立公司",
+      "tabUnclassified": "未分类工作区",
+      "empty": "暂无内容",
+      "loadError": "加载覆盖视图失败",
+      "readable": "可读",
+      "delegatable": "可委派",
+      "autoTracked": "纳入本人调度",
+      "openWorkspace": "打开工作区",
+      "detailLoading": "正在加载详情...",
+      "detailError": "加载详情失败",
+      "notCovered": "未建立公司覆盖",
+      "covered": "已建公司覆盖",
+      "thesis": "论点",
+      "stance": "立场",
+      "conviction": "确信度",
+      "pillarCount": "{{count}} 根支柱",
+      "drivers": "指标",
+      "agendaTodos": "议程待办",
+      "agendaValidations": "到期验证",
+      "members": "成员",
+      "evidenceGaps": "证据缺口",
+      "ledgerGaps": "跨层台账 gap",
+      "relatedSectors": "关联行业",
+      "reReview": "待复核假设",
+      "none": "无",
+      "noDoc": "尚未建立文档",
+      "waitingPm": "等待 PM",
+      "pendingTruncated": "仅显示前 {{count}} 条（共 {{total}} 条待处理）"
+    },
+    "systemJobs": {
+      "sectorTitle": "行业自动跟踪",
+      "sectorSubtitle": "每个行业覆盖单元的议程到期与内部资料增量任务（不跑证券探针）",
+      "sectorSummary": "行业跟踪"
     }
   }
 }

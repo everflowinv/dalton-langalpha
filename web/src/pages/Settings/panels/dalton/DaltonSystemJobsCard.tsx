@@ -1,4 +1,5 @@
 import React, { useCallback, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import {
   AlertTriangle,
   CheckCircle2,
@@ -23,7 +24,13 @@ import {
   type DaltonSystemJobStatus,
 } from '../../utils/daltonApi';
 
-const SCOPE_LABELS: Record<DaltonSystemJobScope, { title: string; subtitle: string }> = {
+// 行业层 P4：sector scope 的文案走 i18n（新增文案的约定），四个原有 scope
+// 的文案保持原样不动。
+type NonSectorScope = Exclude<DaltonSystemJobScope, 'sector'>;
+
+type TranslationFn = ReturnType<typeof useTranslation>['t'];
+
+const SCOPE_LABELS: Record<NonSectorScope, { title: string; subtitle: string }> = {
   company: {
     title: '公司自动跟踪',
     subtitle: '每家覆盖公司的四项标准自主跟踪任务（盯盘 / 内部资料增量 / 涨跌 ±4% 触发）',
@@ -44,12 +51,29 @@ const SCOPE_LABELS: Record<DaltonSystemJobScope, { title: string; subtitle: stri
 
 const DEFAULT_SCOPES: DaltonSystemJobScope[] = ['company', 'home', 'host', 'ops'];
 
-const SCOPE_SUMMARY_NAMES: Record<DaltonSystemJobScope, string> = {
+const SCOPE_SUMMARY_NAMES: Record<NonSectorScope, string> = {
   company: '公司跟踪',
   home: 'Home 全局',
   host: '宿主机归档',
   ops: '运维监控',
 };
+
+function scopeGroupLabels(
+  scope: DaltonSystemJobScope,
+  t: TranslationFn,
+): { title: string; subtitle: string } {
+  if (scope === 'sector') {
+    return {
+      title: t('dalton.systemJobs.sectorTitle'),
+      subtitle: t('dalton.systemJobs.sectorSubtitle'),
+    };
+  }
+  return SCOPE_LABELS[scope];
+}
+
+function scopeSummaryName(scope: DaltonSystemJobScope, t: TranslationFn): string {
+  return scope === 'sector' ? t('dalton.systemJobs.sectorSummary') : SCOPE_SUMMARY_NAMES[scope];
+}
 
 function formatTimeZh(iso: string | null | undefined): string {
   if (!iso) return '暂无';
@@ -119,6 +143,7 @@ export function DaltonSystemJobsCard({
 }: {
   scopes?: DaltonSystemJobScope[];
 } = {}): React.ReactElement {
+  const { t } = useTranslation();
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [banner, setBanner] = useState<{ type: 'info' | 'error'; text: string } | null>(null);
   const [expandedLogKeys, setExpandedLogKeys] = useState<Record<string, boolean>>({});
@@ -227,7 +252,7 @@ export function DaltonSystemJobsCard({
           </h4>
           <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
             统一查看、开关与立即触发系统内所有自动运行任务（
-            {scopes.map((s) => SCOPE_SUMMARY_NAMES[s]).join('、')}）
+            {scopes.map((s) => scopeSummaryName(s, t)).join('、')}）
           </p>
         </div>
         <button
@@ -262,7 +287,7 @@ export function DaltonSystemJobsCard({
         <div className="flex flex-col gap-4">
           {scopes.map((scope) => {
             const groupJobs = jobs.filter((j) => j.scope === scope);
-            const meta = SCOPE_LABELS[scope];
+            const meta = scopeGroupLabels(scope, t);
             return (
               <div
                 key={scope}
