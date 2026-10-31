@@ -552,7 +552,7 @@ class _FakeJournalCursor:
                 j.row.update(state="done", completed_at=datetime.now(timezone.utc))
                 self._result = dict(j.row)
         elif text.startswith("UPDATE DALTON_LLM_JOURNAL") and "SET STATE = %S" in text:
-            # complete_journal_failed: (state, error_kind, error_text, cash, notional, inv)
+            # complete_journal_failed: (state, error_kind, error_text, cash, notional, inv, attempt)
             if j.row is not None:
                 j.row.update(state=params[0], error_kind=params[1], error_text=params[2])
                 self._result = dict(j.row)

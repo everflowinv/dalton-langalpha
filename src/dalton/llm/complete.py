@@ -985,6 +985,7 @@ async def dalton_complete(
         if not skip_journal:
             await complete_journal_done(
                 inv_id,
+                attempt=attempt,
                 response=journal_resp,
                 usage=usage_dict,
                 cash_usd=cash_dec,
@@ -1027,6 +1028,7 @@ async def dalton_complete(
             try:
                 await complete_journal_failed(
                     inv_id,
+                    attempt=attempt,
                     error_kind=error_kind,
                     error_text=safe_msg,
                     state=target_state,
