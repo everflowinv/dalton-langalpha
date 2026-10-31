@@ -52,6 +52,7 @@ from src.dalton.knowledge.validate import (
     validate_verdict,
 )
 from src.dalton.llm.assist import assist_json
+from src.dalton.settings import is_coverage_units_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -764,6 +765,11 @@ async def apply_update(
     dry_run: bool = False,
     skip_access_check: bool = False,
     profile: str | None = None,
+    # 防联动写递归的契约位（codex r2 决定保留）：cross_unit 的联动/补发写
+    # agenda 时固定传 True。自动补发钩子撤除后它在 apply_update 内暂无事
+    # 可做，但保留这个显式标记，任何将来重新引入 agenda 侧钩子的人必须先
+    # 处理它，而不是让联动写静默递归。
+    skip_linkage_retry: bool = False,
 ) -> dict[str, Any]:
     """Execute the full PK.4 knowledge update pipeline: validate -> DB version -> write files.
 
@@ -1109,6 +1115,35 @@ async def apply_update(
                 e,
             )
 
+    # 行业层 P2：thesis 落库后按跨知识引用联动（开关关闭时零开销、零查询）。
+    # Effects are best-effort and never fail the committed write; the result
+    # carries them only when something actually happened. A FAILED linkage is
+    # surfaced in the message the tool returns and persisted as a gap in the
+    # d026 ledger — 补发只由总监显式发起（codex r2 决定：在目标自己的回合内
+    # 用 backend=None 补写会和回合末对账互相覆盖，且跨所有者/直接编辑路径
+    # 触发不到，自动补发已整体撤除）。
+    cross_unit_effects: list[dict[str, Any]] = []
+    if doc_key == "thesis" and is_coverage_units_enabled():
+        from src.dalton.knowledge.cross_unit import (
+            persist_failed_linkage,
+            propagate_thesis_change,
+        )
+
+        cross_unit_effects = await propagate_thesis_change(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            old_doc=valid_base_doc,
+            new_doc=new_doc,
+            new_version_no=int(version_row["version_no"]),
+            profile=profile,
+        )
+        persist_outcomes: list[bool] = []
+        for effect in cross_unit_effects:
+            # 准备阶段失败（replayable=False，目标无法确定）不进台账，也
+            # 不参与"已记为 gap"的口径——见下方 message 分流（codex r3 #3）。
+            if effect.get("status") == "failed" and effect.get("replayable") is not False:
+                persist_outcomes.append(await persist_failed_linkage(user_id, effect))
+
     new_no = version_row["version_no"]
     was_str = f" (was v{latest_no})" if latest_no is not None else " (initial)"
     ops_str = "; ".join(op_summaries[:5])
@@ -1128,7 +1163,43 @@ async def apply_update(
         warn_str = f" {total_w} warning(s): " + "; ".join(all_w)
 
     msg = f"Saved {doc_key} v{new_no}{was_str}: {ops_str}.{render_str}{warn_str}"
-    return {
+    failed_effects = [e for e in cross_unit_effects if e.get("status") == "failed"]
+    if failed_effects:
+        # codex r1 #4 / r2 #2 / r3 #3：联动失败必须传到调用方（knowledge_update
+        # 只回传 message），且去向要如实——可重放的按记账结果说"已记为 gap，
+        # 可由总监 retry"或"未能记账"；目标无法确定的准备失败不可自动重试，
+        # 明说"重新保存该文档以再次触发"。
+        detail = "；".join(
+            f"{e.get('kind')}→{e.get('target_workspace_id') or '未知目标'}（{e.get('error')}）"
+            for e in failed_effects[:5]
+        )
+        replayable_failed = [
+            e for e in failed_effects if e.get("replayable") is not False
+        ]
+        prep_failed = [e for e in failed_effects if e.get("replayable") is False]
+        if replayable_failed:
+            persisted = sum(1 for ok in persist_outcomes if ok)
+            if persisted == len(replayable_failed):
+                follow_up = (
+                    "已记为 gap，可由总监在巡检时用 dalton_cross_unit_request "
+                    "action='retry' 补发"
+                )
+            elif persisted == 0:
+                follow_up = "且未能记账（gap 台账写入失败），请人工跟进"
+            else:
+                follow_up = (
+                    f"其中 {len(replayable_failed) - persisted} 条未能记账，请人工跟进"
+                )
+            msg += f" 联动失败 {len(replayable_failed)} 条（{follow_up}）：{detail}"
+        if prep_failed:
+            # codex r4 #3：不承诺"重新保存可再次触发"——增量检测
+            # （new_evidence_entries / changed_pillar_ids）对原样重存判无变化，
+            # 该提示兑现不了。
+            msg += (
+                f" 联动准备失败 {len(prep_failed)} 条（未能确定目标，无法自动重试，"
+                "请人工跟进：检查相关行业 / 公司 agenda 是否需要补记）"
+            )
+    result = {
         "ok": True,
         "doc": doc_key,
         "version_no": new_no,
@@ -1139,6 +1210,9 @@ async def apply_update(
         "warnings": val.warnings,
         "message": msg,
     }
+    if cross_unit_effects:
+        result["cross_unit_effects"] = cross_unit_effects
+    return result
 
 
 _REQUIRED_PROP_RE = re.compile(r"'([^']+)' is a required property")

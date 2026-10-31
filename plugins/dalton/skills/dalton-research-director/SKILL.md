@@ -26,6 +26,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 调用 `dalton_coverage_board()` 获取全覆盖公司实时状态与服务端已算好的优先级候选列表，返回结构包括：
 - `companies`：各公司的 `workspace_id`、`ticker`、`company_name`、`tier`（小写 `"core"` / `"watch"`）、`sector`、`aggregate_status`、`house_view`（`{stance, conviction}`）、`stance`、`conviction`、`one_liner`、`thesis_version`、`official_version`、`last_verdict`（`{id, verdict_id, word, verdict, at, event_date, summary, thread_id}`）、`open_questions`（每项 `{id, question, value, urgency, backoff_until, waiting_pm}`）、`open_signals`（每项 `{id, kind, summary}`）、`next_events`（每项 `{type, title, date, date_status}`）、`next_catalyst`、`waiting_pm`（每项 `{id, what, since}`）、`publish_awaiting_pm`（每项 `{request_id, title}`）、`last_publication`（`{publication_id, title, report_type, published_at}`）、`last_research_at`、`pending_signals`、`sec_probe_degraded`。
 - `candidates`：服务端已按紧迫度算好并排好序的候选任务列表，每项包含 `rank`、`workspace_id`、`ticker`、`task`、`kind`（仅取 `"open_question"`、`"validation_check"`、`"event_note"` 三种）、`score`、`est_usd`、`why`。
+- `units`（`coverage_units.enabled` 开启时才有此键）：已登记覆盖单元视图，行业与公司各一条，每项 `{unit_id, kind(company|sector), slug, display_name, owner_user_id, workspace_id, readable, delegatable, auto_tracked}`；行业单元另有 `members`：每项 `{member_id, name, ticker, company_unit_id, workspace_created, workspace_id, scope, reason, valid_until}`。三态含义：`readable`=可读（本人或共享可见）；`delegatable`=可委派（本人工作区，或共享 rw）；`auto_tracked`=纳入本人自动调度（本人有 `dalton-*` 自动化挂在该工作区）。**同事共享的行业/公司可以是资料来源（readable），但不会因为可见就成为本人调度对象**；`workspace_created=false` 的成员表示尚未建公司工作区，是否建由用户决定，不要擅自初始化。
 - `budget`：今日额度与剩余可分配预算（`cap_usd`、`spent_usd`、`open_reserved_usd`、`remaining_usd`、`reserve_for_events_usd`、`allocatable_usd`）。
 - `est_cost_by_kind`、`pending_approvals`（每项 `{request_id, publish_request_id, workspace_id, thread_id, kind, title, draft_path, review, created_at}`，通过 `workspace_id` 去 `companies` 里对应到公司）、`pm_handoffs`（每项 `{ticker, workspace_id, id, what, since}`）。
 
@@ -100,6 +101,18 @@ python3 .agents/skills/dalton-research-director/scripts/render_coverage.py \
 2. **跨公司专题研究（Topic Research）**：
    - 当识别到影响 $\ge 2$ 家覆盖公司的行业级变化（如供应链涨价、监管新规、技术路线切换），选定与该专题最核心相关的一家覆盖公司工作空间，调用 `delegate_to_analyst(question=..., workspace_id=..., report_back=True)` 把专题交给该公司工作区的分析师运行 `dalton-topic-research`（在 `question` 中写明专题名称、`slug`、关联公司 `related_tickers` 与核心可证伪问题）。
    - 专题完成后，将《对覆盖公司的含义》章节中涉及其他覆盖公司的验证点通过 `dalton_agenda_note` 或 `delegate_to_analyst` 分发至对应公司工作空间。
+
+## 3b. 行业层跨层研究协调（Cross-Layer Coordination，P2）
+
+本节依赖 `coverage_units.enabled`（未开启时没有 `units` 与 `dalton_cross_unit_request`，跳过本节）。行业工作区（绑定 sector 覆盖单元）已有自己的知识层与分析师；它**不能直接指挥公司分析师**——取证缺口统一由你在 Home 中转。当行业回报结构化取证请求（或你在 `units[].members` 里看到证据缺口）时，按固定五步走，全程用 `dalton_cross_unit_request` 持久化依赖：
+
+1. **受理请求**：`dalton_cross_unit_request(action="create", question=..., sector_workspace_id=..., sector_unit_id=..., evidence_needed=[...], completion_condition=...)` 落一条 `open` 请求（目标公司未定时 `target_workspace_id` 可先空着）。
+2. **委派**：选定目标公司工作区（`units` 里 `delegatable=true` 的公司单元；成员 `workspace_created=false` 的先请用户决定是否建工作区，不要擅自初始化），调用 `delegate_to_analyst(question=..., workspace_id=..., report_back=True)`，拿到派单线程后回写 `action="update", status="dispatched", dispatch_thread_id=..., target_workspace_id=...`。
+3. **收回报**：公司分析师经 report_back 回报完成状态、知识版本号与产物引用；回写 `action="update", status="fulfilled", result=[{completion, doc_versions, artifact_refs}]`。
+4. **交回行业**：把结果要点带回行业线程（`delegate_to_analyst` 指向行业工作区，让它继续综合），行业侧采纳公司假设时按 `dalton-knowledge` 的跨知识引用规则记 `knowledge_refs`。
+5. **保留缺口**：委派失败、被停止、或目标不可委派（`delegatable=false`、无权限）时，回写 `status="gap"` 并在 `result` 里写明原因——缺口明确保留、随时可查（`action="list"` 按 status 过滤），不允许静默丢弃；重新派单或取消时再更新状态。知识联动（待复核/更新候选）写不进目标 agenda 时也会自动记为 `gap`（`kind="linkage_retry"`）；**补发只在你巡检时显式发起**：`action="retry"`（可选 `target_workspace_id` 过滤、`limit` 分批，返回 `remaining` 提示是否还有剩余），从 Home 线程写入目标 agenda，目标工作区下一回合开始时自动落盘，不会与它自己的回合末对账冲突。多条 gap 按最老的先补；一批里被无权目标挡住时，把返回的 `next_cursor` 作为下次调用的 `cursor` 传入即可继续翻批（`remaining` 是从当前游标起算的存量）；若 message 提示"联动失败且未能记账"，说明台账写入也失败了，需人工跟进；若提示"联动准备失败（未能确定目标）"，该事件不可自动重试，请人工检查相关行业 / 公司 agenda 是否需要补记。
+
+另注意两条自动联动（服务端已做，无需你手工搬运）：行业支柱改版会在采用它的公司 agenda 生成"待复核"（origin=sector）；公司对行业条目提出 `contradicts` 证据会在行业 agenda 生成"更新候选"（origin=company）。你可以在看板 `open_questions` 里看到它们，按正常 open_question 排期跟进即可。
 
 ---
 

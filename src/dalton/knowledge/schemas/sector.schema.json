@@ -29,6 +29,9 @@
           "ticker": {"type": "string", "pattern": "^[A-Z0-9.]{1,12}$", "description": "可选；没有就省略，不得为行业编造伪 ticker"},
           "unit_id": {"type": "string", "description": "可选；成员已登记公司覆盖单元时填其 unit_id"},
           "workspace_created": {"type": "boolean", "description": "是否已为该公司建公司工作区（登记成员不自动建）"},
+          "scope": {"type": "string", "description": "关联范围：该公司在这个行业里被覆盖的业务范围，如 只计 AI 加速卡收入；一家公司可属多个行业，各关系可标不同范围"},
+          "reason": {"type": "string", "description": "为什么关联到本行业"},
+          "valid_until": {"$ref": "common#/$defs/isoDate", "description": "可选；关联有效期（如跟踪名单到期日），到期后关系视为待复核"},
           "note": {"type": "string"},
           "added_at": {"$ref": "common#/$defs/isoTime"}
         },
