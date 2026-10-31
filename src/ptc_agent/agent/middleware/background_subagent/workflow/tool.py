@@ -544,6 +544,27 @@ def create_run_workflow_tool(
             from src.dalton.workflows.as_of import resolve_launch_as_of
 
             params = await resolve_launch_as_of(backend, meta.name, params, journal_source)
+        # DALTON-HOOK(workflow-subject-kind): topic-research's subject_kind is
+        # the workspace's coverage identity (coverage-unit registry, sector
+        # layer P1), not the caller's claim — filled in when omitted and
+        # refused when it contradicts, so the workflow's branch and its
+        # completion contract can never disagree with what the workspace is.
+        # Before the args.json snapshot, like as_of, so a resume replays the
+        # same identity-derived value.
+        if isinstance(params, dict):
+            from src.dalton.workflows.subject_kind import (
+                SubjectKindRefused,
+                resolve_launch_subject_kind,
+            )
+
+            try:
+                params = await resolve_launch_subject_kind(
+                    meta.name,
+                    params,
+                    dict((get_config() or {}).get("configurable") or {}),
+                )
+            except SubjectKindRefused as error:
+                raise _Refused(str(error)) from error
         # DALTON-HOOK(workflow-resume): refresh progress_path after params normalization.
         if isinstance(params, dict) and isinstance(params.get("progress_path"), str):
             progress_path = params["progress_path"] or None

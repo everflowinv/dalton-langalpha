@@ -1,13 +1,13 @@
 ---
 name: dalton-knowledge
-description: "维护覆盖公司工作区的结构化知识层（核心论点、多空焦点、经营驱动、管理层、经验教训、研究议程、模型登记与判断日志）并保持读写一致。需要查阅公司既有认知或通过受控工具更新知识文档时使用；按需读写，轻量快速。"
+description: "维护覆盖公司或行业工作区的结构化知识层（公司/行业画像、核心论点、多空焦点、经营驱动、经验教训、研究议程、模型登记与判断日志）并保持读写一致。需要查阅既有认知或通过受控工具更新知识文档时使用；按需读写，轻量快速。"
 ---
 
-# Dalton 公司知识层维护（Company Knowledge Layer）
+# Dalton 知识层维护（Knowledge Layer）
 
 Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the first deliverable.
 
-每家覆盖公司对应一个工作区（文件夹名 = ticker，如 `META`）。人读的中文 Markdown 放在工作区根目录，机器读的真值 JSON 放在 `data/` 下并写入 Postgres `dalton_knowledge_versions` 版本表。
+每家覆盖公司对应一个工作区（文件夹名 = ticker，如 `META`）；每个覆盖行业/主题/产业链对应一个绑定 sector 覆盖单元的工作区（见 §1b）。人读的中文 Markdown 放在工作区根目录，机器读的真值 JSON 放在 `data/` 下并写入 Postgres `dalton_knowledge_versions` 版本表。
 
 ## 1. 工作区文件地图
 
@@ -23,6 +23,26 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 | `data/company.json` | 公司基本资料、覆盖层级（core/watch）、覆盖阶段、同业与基准 ETF | `knowledge_update(doc="company", ...)` |
 | `data/models.json` | `model/<TICKER>-model-v<NN>.xlsx` 版本登记与关键输出单元格 | `knowledge_update(doc="models", ...)` |
 | `verdicts.md` | 最近 60 条事件五词结论日志（全量在 `dalton_verdicts` 表） | `knowledge_append_verdict(...)` |
+
+## 1b. 行业工作区（sector profile，P1）
+
+工作区绑定了 **active 的 sector 覆盖单元**（`coverage_units.enabled` 开启且已登记）时，知识层切换为**行业 profile**；开关关闭或未登记一律按公司处理（§1 的公司文件地图）。判定特征：`knowledge_read(doc="sector")` 可读，写 `management`/`company` 会被工具拒绝并说明"行业覆盖单元（sector profile）"。
+
+| 路径 | 角色 | 与公司的差异 |
+|---|---|---|
+| `sector.md` / `data/sector.json` | 单元画像：定义、研究边界、地区/市场范围、产业链、wiki 标识、研究时区、覆盖阶段、**成员公司清单** | 替代 `company.json`；字段速查见 `.agents/skills/dalton-init-sector/references/sector-fields.md` |
+| `thesis.md` / `data/thesis.json` | 行业核心假设、周期位置、预期差、确认/证伪阈值、只追加证据台账 | 结构与不变量同公司；**不强制公司目标价等公司专属字段**（`house_view.target` 不写，首期不做行业 House View） |
+| `drivers.md` / `data/drivers.json` | 行业供需/量价/产能/资本开支驱动与指标读数 | 行业指标看板从 drivers 生成，不另建指标账本 |
+| `debate` / `lessons` / `agenda` / `models` / `verdicts.md` | 同公司 | 行业议程用宏观/政策/数据发布语义；结论沿用五词结论 |
+| ~~`management.md` / `data/management.json`~~ | 公司专属，**行业工作区不创建**（调用即被拒） | — |
+| ~~`data/company.json`~~ | 公司专属，**行业工作区不创建**（调用即被拒） | — |
+
+成员清单维护规则：
+
+- **唯一权威来源是 `data/sector.json` 的 `members`**（P2 的行业—公司关联表届时作为它的投影）；不要在别处另抄一份名单。
+- 成员只登记 `name`（必填）、可选 `ticker` / `unit_id` / `note` 与 `workspace_created`；**登记成员不自动创建公司工作区**——由 Home 决定是否建，建好后把该成员 `workspace_created` 改为 true。
+- **不得给行业编 ticker**：`ticker` 只用于确有证券代码的成员公司；行业单元本身永远没有 ticker，也不会被证券类跟踪/探针当成公司（身份由覆盖单元注册表决定，不是名字）。
+- 初始化一个行业工作区用 `.agents/skills/dalton-init-sector/`。
 
 ## 2. 按需读取顺序
 

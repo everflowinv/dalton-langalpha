@@ -24,11 +24,20 @@ from src.dalton.knowledge.ops import (
 )
 from src.dalton.knowledge.paths import (
     AGENT_MD,
-    DOC_KEYS,
+    ALL_DOC_KEYS,
     VERDICTS_MD,
     data_path,
     history_path,
     rendered_path,
+)
+from src.dalton.knowledge.profiles import (
+    PROFILE_COMPANY,
+    PROFILE_SECTOR,
+    PROFILE_SPECIFIC_DOCS,
+    doc_keys_for_profile,
+    doc_not_allowed_message,
+    is_doc_allowed,
+    resolve_workspace_profile,
 )
 from src.dalton.knowledge.render import (
     VERDICT_ZH,
@@ -615,14 +624,36 @@ async def _sync_workspace_description(
         logger.warning("Failed to sync workspace description for %s: %s", workspace_id, e)
 
 
+async def _sync_sector_workspace_description(
+    workspace_id: str, sector_doc: dict[str, Any]
+) -> None:
+    """Sync the workspace description when the sector profile doc is updated (P1)."""
+    try:
+        from src.server.database.workspace import update_workspace
+
+        name = sector_doc.get("name_zh") or sector_doc.get("name") or ""
+        one_liner = sector_doc.get("one_liner") or ""
+        desc = " · ".join(part for part in (name, "行业", one_liner) if part)
+        if desc:
+            await update_workspace(workspace_id, description=desc[:500])
+    except Exception as e:
+        logger.warning("Failed to sync workspace description for %s: %s", workspace_id, e)
+
+
 async def write_version_files_to_backend(
     workspace_id: str,
     version_row: dict[str, Any],
     backend: Any,
     *,
     alerts: list[str] | None = None,
+    profile: str = "company",
 ) -> list[str]:
-    """Write ``data/<doc>.json``, ``history/<doc>/...``, rendered ``<doc>.md``, and ``agent.md`` block."""
+    """Write ``data/<doc>.json``, ``history/<doc>/...``, rendered ``<doc>.md``, and ``agent.md`` block.
+
+    ``profile`` decides the rendering subject (codex r1 #3): sector content is
+    used ONLY for a sector-profile workspace — a residual sector row left in a
+    company workspace (sector archived, flag off) never relabels its rendering.
+    """
     notes: list[str] = []
     if backend is None:
         return notes
@@ -660,7 +691,15 @@ async def write_version_files_to_backend(
         latest_map[doc_key] = version_row
 
     company_doc = (latest_map.get("company") or {}).get("content") or {}
+    sector_doc = (
+        (latest_map.get("sector") or {}).get("content") or {}
+        if profile == PROFILE_SECTOR
+        else {}
+    )
     ticker = str(company_doc.get("ticker") or content.get("ticker") or "").upper()
+    # A sector workspace has no ticker; rendered headers name the sector instead.
+    if not ticker and sector_doc:
+        ticker = str(sector_doc.get("name") or "").strip()
 
     md_rel = rendered_path(doc_key)
     if md_rel and version_row.get("schema_valid", True):
@@ -685,6 +724,7 @@ async def write_version_files_to_backend(
     block = render_agent_block(
         ticker=ticker or "COMPANY",
         company_doc=company_doc,
+        sector_doc=sector_doc or None,
         thesis_doc=(thesis_row or {}).get("content"),
         thesis_version_no=(thesis_row or {}).get("version_no"),
         debate_doc=(debate_row or {}).get("content"),
@@ -723,15 +763,60 @@ async def apply_update(
     now: datetime | None = None,
     dry_run: bool = False,
     skip_access_check: bool = False,
+    profile: str | None = None,
 ) -> dict[str, Any]:
-    """Execute the full PK.4 knowledge update pipeline: validate -> DB version -> write files."""
+    """Execute the full PK.4 knowledge update pipeline: validate -> DB version -> write files.
+
+    ``profile`` (sector layer P1) gates WHICH docs the workspace accepts:
+    resolved from the coverage-unit registry when not passed — company profile
+    unless an active sector unit is bound (``knowledge/profiles.py``). Shared
+    docs validate against the same schemas and invariants in both profiles.
+    """
     if not skip_access_check:
         await verify_workspace_access(workspace_id, user_id, need="write", channel="cos")
-    if doc_key not in DOC_KEYS:
+    if profile is None:
+        try:
+            profile = await resolve_workspace_profile(workspace_id)
+        except Exception as e:
+            # codex r2 #1: an unreadable identity must not guess the doc set.
+            # Shared docs validate identically in both profiles and proceed;
+            # the three identity-bound docs are REFUSED until the registry
+            # answers (fail-closed), so nothing is written under a wrong profile.
+            logger.warning(
+                "[dalton.knowledge] coverage identity resolution failed for %s (%s); "
+                "refusing profile-specific doc %s",
+                workspace_id,
+                e,
+                doc_key,
+            )
+            if doc_key in PROFILE_SPECIFIC_DOCS:
+                return {
+                    "ok": False,
+                    "error": "coverage_identity_unavailable",
+                    "message": (
+                        f"工作区覆盖身份暂时无法解析（注册表查询失败），{doc_key} 属于"
+                        "身份专属文档（company/management/sector），已拒绝写入；"
+                        "请稍后重试。共享文档（thesis/debate/drivers/lessons/agenda/models）"
+                        "不受影响，可先写。"
+                    ),
+                }
+            profile = PROFILE_COMPANY
+    if not is_doc_allowed(doc_key, profile):
+        if doc_key in ALL_DOC_KEYS:
+            # A real doc of the OTHER profile (e.g. management in a sector
+            # workspace): refuse with the profile explanation, not "unknown doc".
+            return {
+                "ok": False,
+                "error": "doc_not_allowed_for_profile",
+                "message": doc_not_allowed_message(doc_key, profile),
+            }
         return {
             "ok": False,
             "error": "invalid_doc_key",
-            "message": f"Unknown doc {doc_key!r}; expected one of {DOC_KEYS}",
+            "message": (
+                f"Unknown doc {doc_key!r}; expected one of "
+                f"{doc_keys_for_profile(profile)}"
+            ),
         }
 
     # Step 1: Fetch latest version from DB. If none exists and data/<doc>.json is already in sandbox,
@@ -1008,11 +1093,13 @@ async def apply_update(
     extra_notes: list[str] = []
     if doc_key == "company":
         await _sync_workspace_description(workspace_id, new_doc)
+    elif doc_key == "sector":
+        await _sync_sector_workspace_description(workspace_id, new_doc)
 
     if backend is not None:
         try:
             extra_notes = await write_version_files_to_backend(
-                workspace_id, version_row, backend
+                workspace_id, version_row, backend, profile=profile
             )
         except Exception as e:
             logger.warning(
@@ -1286,6 +1373,21 @@ async def append_verdict(
             ticker = (
                 ((company_row or {}).get("content") or {}).get("ticker") or ""
             ).upper()
+            if not ticker:
+                # A sector workspace has no ticker; the log header names the
+                # sector. Only the sector profile looks: a company workspace
+                # keeps the old "COMPANY" header and makes no extra query.
+                try:
+                    verdict_profile = await resolve_workspace_profile(workspace_id)
+                except Exception:
+                    verdict_profile = PROFILE_COMPANY
+                if verdict_profile == PROFILE_SECTOR:
+                    sector_row = await db_knowledge.latest_valid_version(
+                        workspace_id, "sector"
+                    )
+                    ticker = str(
+                        ((sector_row or {}).get("content") or {}).get("name") or ""
+                    ).strip()
             v_md = render_verdicts_md(recent, ticker=ticker)
             await backend.awrite_text(VERDICTS_MD, v_md)
         except Exception as e:

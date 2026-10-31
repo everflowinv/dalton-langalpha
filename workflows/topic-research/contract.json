@@ -97,6 +97,7 @@
       "drivers",
       "debate"
     ],
+    "knowledge_docs_if_sector": ["thesis", "agenda", "drivers"],
     "knowledge_source": "tool",
     "verdict_kinds_any": [
       "NO_CHANGE",

@@ -208,6 +208,8 @@ def next_item_id(
         return f"{prefix}{max_n + 1:02d}"
     if collection_name == "debates":
         return f"D{_parse_int_suffix(existing_items, 'D') + 1}"
+    if collection_name == "members":
+        return f"M{_parse_int_suffix(existing_items, 'M') + 1}"
     if collection_name == "drivers":
         return f"K{_parse_int_suffix(existing_items, 'K') + 1}"
     if collection_name == "leading_indicators":
@@ -282,6 +284,7 @@ def _ensure_nested_ids_and_defaults(
     if "updated_at" in doc:
         if doc_key in (
             "company",
+            "sector",
             "thesis",
             "debate",
             "drivers",
@@ -359,6 +362,24 @@ def _ensure_nested_ids_and_defaults(
                     d["id"] = next_item_id("debates", debates[:idx], now=now)
                 d.setdefault("opened_at", now_str)
                 d.setdefault("history", [])
+
+    elif doc_key == "sector":
+        # The member roster is the one authoritative list (P2's relation table
+        # will be its projection); edits are normal set/append/remove ops — a
+        # member leaving coverage is a legitimate removal, not history.
+        members = doc.get("members")
+        if isinstance(members, list):
+            for idx, m in enumerate(members):
+                if not isinstance(m, dict):
+                    continue
+                if not m.get("id"):
+                    # Assign against the WHOLE roster, not the prefix: a doc
+                    # may arrive with later items already carrying ids
+                    # (codex r1 #4: [{"name":"A"},{"id":"M1","name":"B"}] must
+                    # not turn A into a second M1).
+                    m["id"] = next_item_id("members", members, now=now)
+                m.setdefault("workspace_created", False)
+                m.setdefault("added_at", now_str)
 
     elif doc_key == "drivers":
         drivers = doc.get("drivers")
@@ -1070,6 +1091,7 @@ def apply_ops(
                         "break",
                         "evidence",
                         "debates",
+                        "members",
                         "drivers",
                         "leading_indicators",
                         "guidance_history",

@@ -39,6 +39,13 @@ STAGE_ZH: dict[str, str] = {
 MAX_AGENT_BLOCK_CHARS = 2500
 
 
+def format_alert_lines(alerts: list[str] | None) -> str:
+    """The single ``提示`` line's alert text exactly as ``agent_block.md.j2``
+    renders it. Reconcile compares this against the managed block's current
+    line to decide whether a rewrite is needed to SHOW or CLEAR alerts."""
+    return "；".join(str(x) for x in alerts[:3] if x) if alerts else ""
+
+
 @lru_cache(maxsize=1)
 def _jinja_env() -> Environment:
     return Environment(
@@ -150,6 +157,7 @@ def render_agent_block(
     *,
     ticker: str,
     company_doc: dict[str, Any] | None = None,
+    sector_doc: dict[str, Any] | None = None,
     thesis_doc: dict[str, Any] | None = None,
     thesis_version_no: int | None = None,
     debate_doc: dict[str, Any] | None = None,
@@ -158,18 +166,42 @@ def render_agent_block(
     last_verdict: dict[str, Any] | None = None,
     alerts: list[str] | None = None,
 ) -> str:
-    """Render the managed block inside ``agent.md`` (guaranteed <= 2,500 chars, PK.6)."""
+    """Render the managed block inside ``agent.md`` (guaranteed <= 2,500 chars, PK.6).
+
+    ``sector_doc`` (sector profile, P1) switches the header and file index to
+    the sector subject: no ticker, no coverage tier, no management.md. Without
+    it the company rendering is byte-identical to the pre-sector block.
+    """
     c = company_doc or {}
     t = thesis_doc or {}
     d = debate_doc or {}
     a = agenda_doc or {}
     m = models_doc or {}
+    s = sector_doc or {}
 
-    eff_ticker = str(c.get("ticker") or ticker or "COMPANY").upper()
-    name = c.get("name") or eff_ticker
-    tier = str(c.get("coverage_tier") or "core").capitalize()
-    stage = STAGE_ZH.get(str(c.get("coverage_stage") or ""), c.get("coverage_stage") or "覆盖中")
-    header_title = f"{eff_ticker}（{name} · {tier}，{stage}）"
+    model_current = (
+        f"当前 {m['current']}" if isinstance(m, dict) and m.get("current") else "暂无正式模型"
+    )
+    model_seg = f"model/（{model_current}）"
+
+    if s:
+        name = s.get("name_zh") or s.get("name") or "行业工作区"
+        stage = STAGE_ZH.get(str(s.get("coverage_stage") or ""), s.get("coverage_stage") or "覆盖中")
+        header_title = f"{name}（行业 · {stage}）"
+        files_line = (
+            f"sector.md · thesis.md · debate.md · drivers.md · lessons.md · agenda.md · "
+            f"verdicts.md · {model_seg}· published/INDEX.md"
+        )
+    else:
+        eff_ticker = str(c.get("ticker") or ticker or "COMPANY").upper()
+        name = c.get("name") or eff_ticker
+        tier = str(c.get("coverage_tier") or "core").capitalize()
+        stage = STAGE_ZH.get(str(c.get("coverage_stage") or ""), c.get("coverage_stage") or "覆盖中")
+        header_title = f"{eff_ticker}（{name} · {tier}，{stage}）"
+        files_line = (
+            f"thesis.md · debate.md · drivers.md · management.md · lessons.md · agenda.md · "
+            f"verdicts.md · {model_seg}· published/INDEX.md"
+        )
 
     one_liner = _trunc(t.get("one_liner") or c.get("one_liner") or "待初始化", 110)
     hv = t.get("house_view") or {}
@@ -269,10 +301,7 @@ def render_agent_block(
     else:
         waiting_pm_line = ""
 
-    model_current = (
-        f"当前 {m['current']}" if isinstance(m, dict) and m.get("current") else "暂无正式模型"
-    )
-    alert_lines = "；".join(str(x) for x in alerts[:3] if x) if alerts else ""
+    alert_lines = format_alert_lines(alerts)
 
     tmpl = _jinja_env().get_template("agent_block.md.j2")
     rendered = tmpl.render(
@@ -287,6 +316,7 @@ def render_agent_block(
         last_verdict_line=last_verdict_line,
         waiting_pm_line=waiting_pm_line,
         model_current=model_current,
+        files_line=files_line,
         alert_lines=alert_lines,
     ).strip()
 

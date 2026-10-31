@@ -29,6 +29,10 @@ import structlog
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
 
+from src.dalton.knowledge.profiles import (
+    PROFILE_SECTOR,
+    resolve_workspace_profile,
+)
 from src.dalton.publish.language import (
     _REVIEWABLE_ROOTS,
     SIDECAR_SUFFIXES,
@@ -1358,6 +1362,42 @@ async def _check_closing(
     for doc, param in (closing.get("knowledge_docs_requires_param") or {}).items():
         if params.get(param):
             docs_all.append(doc)
+    # Sector-branch docs (codex r1 #1/#5): decided by the workspace's coverage
+    # identity, never by params.subject_kind — a caller could omit or lie about
+    # it and dodge the sector deliverables. A claimed value that CONTRADICTS
+    # the identity is an explicit failure, not a silent correction; an
+    # identity that cannot be resolved fails closed (无法核对, retry).
+    sector_docs = closing.get("knowledge_docs_if_sector") or []
+    if sector_docs:
+        if not workspace_id:
+            missing.append(
+                "无 workspace_id，无法按工作区覆盖身份核对行业分支知识层，请重试。"
+            )
+        else:
+            try:
+                profile = await resolve_workspace_profile(workspace_id)
+            except Exception as error:
+                logger.warning(
+                    "dalton_check_done coverage identity query failed",
+                    workspace_id=workspace_id,
+                    error=str(error),
+                )
+                profile = None
+                missing.append(
+                    "工作区覆盖身份无法核对（行业分支要求无法判定），请重试；"
+                    f"待核对：{'、'.join(sector_docs)}。"
+                )
+            if profile is not None:
+                claimed = str(params.get("subject_kind") or "").strip().lower()
+                if claimed in ("sector", "company"):
+                    actual = PROFILE_SECTOR if profile == PROFILE_SECTOR else "company"
+                    if claimed != actual:
+                        missing.append(
+                            f"params.subject_kind={claimed!r} 与本工作区覆盖身份"
+                            f"（{actual}）冲突；完成契约按身份核对，请更正参数后重查。"
+                        )
+                if profile == PROFILE_SECTOR:
+                    docs_all.extend(sector_docs)
     cond_all, cond_any, cond_problems = await _conditional_knowledge_docs(
         backend, contract, params
     )
