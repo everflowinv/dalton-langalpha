@@ -341,12 +341,19 @@ def format_wake_directive(
 
 def _extract_ticker(automation: dict[str, Any]) -> Optional[str]:
     meta = automation.get("metadata") or {}
-    if isinstance(meta, dict) and meta.get("ticker"):
-        return str(meta["ticker"]).upper()
+    if isinstance(meta, dict):
+        # 行业主体永远没有 ticker，也不允许从名称第二段猜出一个（P3：
+        # "dalton-sector-…" 的第二段是 "sector"，猜出来的 ticker 是伪身份）。
+        if str(meta.get("subject_kind") or "").strip().lower() == "sector":
+            return None
+        if meta.get("ticker"):
+            return str(meta["ticker"]).upper()
     name = str(automation.get("name") or "").strip().lower()
+    if name.startswith("dalton-sector-"):
+        return None
     if name.startswith("dalton-"):
         parts = name.split("-")
-        if len(parts) >= 3 and parts[1] not in ("earnings", "director", "data"):
+        if len(parts) >= 3 and parts[1] not in ("earnings", "director", "data", "sector"):
             return parts[1].upper()
     return None
 
@@ -356,6 +363,12 @@ def _determine_kind(automation: dict[str, Any]) -> str:
     if isinstance(meta, dict) and meta.get("dalton_kind"):
         return str(meta["dalton_kind"])
     name = str(automation.get("name") or "").strip().lower()
+    # 行业名先于通用后缀：`dalton-sector-<slug>-delta` 若落进通用 "-delta"
+    # 分支会被当公司 weekly_delta 处理（P3）。
+    if name.startswith("dalton-sector-") and name.endswith("-agenda"):
+        return "sector_watch"
+    if name.startswith("dalton-sector-") and name.endswith("-delta"):
+        return "sector_delta"
     if name == "dalton-earnings-calendar":
         return "calendar"
     if name == "dalton-director-daily":
@@ -493,6 +506,102 @@ async def _verify_automation_workspace_ownership(
 HOME_COVERAGE_SYNC_TIMEOUT_S = 5.0
 
 
+async def _sector_preflight_gate(
+    automation: dict[str, Any],
+    *,
+    automation_id: Optional[str],
+    execution_id: str,
+    workspace_id: str,
+    name: str,
+    persist: bool,
+) -> Optional[PreflightResult]:
+    """The sector branch's gate: a skip result, or None to go on.
+
+    Called before any early return that would otherwise wake the task
+    (``autonomy.enabled=false`` passes everything through), so a leftover
+    sector task never runs with the flag off or on a stale binding.
+    """
+    # 行业分支整体门控（r3 lead 决定）：开关关闭时，遗留的 sector_* 任务
+    # 直接跳过——不查注册表、不读不写任何 watch state，原因只记预检
+    # 日志。开关打开时复查单元绑定；失配（换绑/归档/非 sector/查不到/
+    # 查询失败）同样只跳过本次：不写 watch_state——对一个可能已改作
+    # 公司用途的旧工作区 upsert sector 主体行会破坏其身份（codex r3
+    # #1）——也不暂停任务：暂停是 tracking.disable 的职责，它按
+    # unit_id 覆盖跨工作区任务；这里基于一次性读到的绑定做处置会和
+    # 绑定/启用交错误停刚恢复的任务（codex r3 #2）。
+    from src.dalton.settings import is_coverage_units_enabled
+
+    if not is_coverage_units_enabled():
+        return await _skip_sector_run(
+            automation_id=automation_id,
+            execution_id=execution_id,
+            workspace_id=workspace_id,
+            name=name,
+            reason="coverage_units_disabled",
+            persist=persist,
+        )
+    from src.dalton.autonomy.sector import check_sector_automation_binding
+
+    binding_reason, _binding_unit = await check_sector_automation_binding(automation)
+    if binding_reason is not None:
+        logger.warning(
+            "[DALTON_PREFLIGHT] sector automation %s skipped: %s",
+            name,
+            binding_reason,
+        )
+        return await _skip_sector_run(
+            automation_id=automation_id,
+            execution_id=execution_id,
+            workspace_id=workspace_id,
+            name=name,
+            reason=binding_reason,
+            persist=persist,
+        )
+
+    return None
+
+
+async def _skip_sector_run(
+    *,
+    automation_id: Optional[str],
+    execution_id: str,
+    workspace_id: str,
+    name: str,
+    reason: str,
+    persist: bool,
+) -> PreflightResult:
+    """Skip a sector automation for ``reason`` — preflight log only, no side effects.
+
+    跳过原因只落 ``dalton_preflight_log``：不写 watch_state（不得覆盖旧
+    工作区的主体行）、不暂停任务（tracking.disable 的职责）。零 token、
+    零沙箱，下一次调度自然重试。
+    """
+    logger.info(
+        "[DALTON_PREFLIGHT] sector automation %s skipped: %s",
+        name,
+        reason,
+    )
+    if persist:
+        try:
+            await watch_db.insert_preflight_log(
+                automation_id=automation_id,
+                automation_execution_id=execution_id,
+                workspace_id=workspace_id,
+                decision="skip",
+                reason=reason,
+                signals=[],
+            )
+        except Exception as e:
+            logger.warning("[DALTON_PREFLIGHT] log insert failed: %s", e)
+    return PreflightResult(
+        should_wake=False,
+        decision="skip",
+        reason=reason,
+        signals=[],
+        wake_context=None,
+    )
+
+
 async def _sync_home_coverage_for_preflight(
     *,
     user_id: str,
@@ -502,7 +611,11 @@ async def _sync_home_coverage_for_preflight(
     sync_timeout_s: float = HOME_COVERAGE_SYNC_TIMEOUT_S,
 ) -> Optional[str]:
     """Render `coverage.yaml` into Home (and refresh due quarterly groups on `calendar`) with a dedicated short timeout before any step that could time out and wake."""
-    is_home_dalton = kind in ("calendar", "director_daily", "director_weekly") or not ticker
+    # 行业自动化（P3）没有 ticker，但它是工作区级任务而非 Home 任务，
+    # 不能落进 "not ticker ⇒ home" 的旧判据里去刷 Home 的 coverage.yaml。
+    is_home_dalton = (
+        kind in ("calendar", "director_daily", "director_weekly") or not ticker
+    ) and not str(kind).startswith("sector_")
     if not is_home_dalton or not persist:
         return None
 
@@ -571,6 +684,18 @@ async def _preflight_check_inner(
     name = str(automation.get("name") or "dalton-task")
     ticker = _extract_ticker(automation)
     kind = _determine_kind(automation)
+
+    if str(kind).startswith("sector_"):
+        gated = await _sector_preflight_gate(
+            automation,
+            automation_id=automation_id,
+            execution_id=execution_id,
+            workspace_id=workspace_id,
+            name=name,
+            persist=persist,
+        )
+        if gated is not None:
+            return gated
 
     if kind == "data_health":
         from src.dalton.data_map.health import run_all_health_checks
@@ -740,6 +865,70 @@ async def _preflight_check_inner(
                 payload={"kind": kind},
             )
         )
+    elif kind == "sector_delta":
+        # 行业资料增量是计划唤醒：采集在唤醒后的沙箱里按
+        # dalton-sector-delta 技能执行，预检不跑任何证券探针。
+        emitted.append(
+            ProbeSignal(
+                probe="schedule",
+                signal_key=f"sector_delta:{datetime.now(tz).date().isoformat()}",
+                priority="P1",
+                summary=f"{name} 行业资料增量计划唤醒",
+                payload={"kind": kind},
+            )
+        )
+    elif kind == "sector_watch":
+        # 行业议程到期：只跑议程探针，到期口径用行业的 research_tz（缺省
+        # 退回用户时区，并把生效时区写进跟踪状态，见 autonomy.sector）。
+        from src.dalton.autonomy.sector import resolve_sector_due_timezone
+
+        sector_meta = automation.get("metadata") if isinstance(automation.get("metadata"), dict) else {}
+        label = str(sector_meta.get("sector_name") or sector_meta.get("sector_slug") or name)
+        tz_name: Optional[str] = None
+        try:
+            # 时区解析只读不写，dry-run（persist=False）也按真实文档解析，
+            # 不让预演与实跑的到期口径分叉；解析失败降级用户时区并记日志。
+            tz_name, tz_source = await resolve_sector_due_timezone(
+                workspace_id=workspace_id,
+                user_id=user_id,
+            )
+            state["sector_due_tz"] = {"tz": tz_name, "source": tz_source}
+        except Exception as exc:
+            logger.warning(
+                "[DALTON_PREFLIGHT] sector due tz resolve failed for %s: %s", name, exc
+            )
+        sector_due_tz: Optional[ZoneInfo] = None
+        if tz_name:
+            try:
+                sector_due_tz = ZoneInfo(tz_name)
+            except Exception:
+                sector_due_tz = None
+        eff_ws_id = workspace_id if persist else None
+        in_bo, nb_iso = is_in_backoff(state, "agenda")
+        if in_bo:
+            logger.info(
+                "[DALTON_PREFLIGHT] probe=agenda sector=%s in time-backoff until %s",
+                name,
+                nb_iso,
+            )
+        else:
+            try:
+                sigs, state = await probe_agenda(
+                    workspace_id=eff_ws_id,
+                    ticker=label,
+                    watch_state=state,
+                    agenda_doc=agenda_doc_override,
+                    due_tz=sector_due_tz,
+                )
+                state = clear_probe_backoff(state, "agenda")
+                emitted.extend(sigs)
+            except Exception as err:
+                logger.warning(
+                    "[DALTON_PREFLIGHT] probe=agenda sector=%s transient error: %s",
+                    name,
+                    err,
+                )
+                state = record_probe_backoff(state, "agenda", str(err))
     else:
         # Standard company_watch: run the 4 company probes (agenda, sec, cnhk, earnings) with time-based backoff
         t_sym = ticker or "UNKNOWN"
@@ -825,6 +1014,27 @@ async def _preflight_check_inner(
             await watch_db.upsert_watch_state(workspace_id, ticker, state)
         except Exception as e:
             logger.warning("[DALTON_PREFLIGHT] upsert_watch_state failed: %s", e)
+    elif persist and workspace_id and kind.startswith("sector_"):
+        # 行业主体的跟踪状态（d027）：ticker 为 NULL，身份由 unit_id +
+        # subject_kind 承载；元数据缺 unit_id 时放弃写入而不是回退成公司行。
+        sector_meta = automation.get("metadata") if isinstance(automation.get("metadata"), dict) else {}
+        sector_unit_id = str(sector_meta.get("unit_id") or "").strip()
+        if sector_unit_id:
+            try:
+                await watch_db.upsert_watch_state(
+                    workspace_id,
+                    None,
+                    state,
+                    subject_kind="sector",
+                    unit_id=sector_unit_id,
+                )
+            except Exception as e:
+                logger.warning("[DALTON_PREFLIGHT] upsert_watch_state(sector) failed: %s", e)
+        else:
+            logger.warning(
+                "[DALTON_PREFLIGHT] sector automation %s carries no unit_id; watch state not persisted",
+                name,
+            )
 
     # Deduplicate against dalton_signals (idempotent by workspace_id, probe, signal_key; A10)
     candidate_signals: list[dict[str, Any]] = []
@@ -1097,6 +1307,34 @@ async def preflight_check(
         home_synced_in_outer = True
 
     if kind != "data_health" and not settings.autonomy.enabled:
+        # The passthrough below would wake a sector task without its gate;
+        # apply the gate first (company tasks pass through exactly as before).
+        if str(kind).startswith("sector_"):
+            sector_name = str(automation.get("name") or "dalton-task")
+            sector_automation_id = str(automation.get("automation_id") or "") or None
+            try:
+                gated = await asyncio.wait_for(
+                    _sector_preflight_gate(
+                        automation,
+                        automation_id=sector_automation_id,
+                        execution_id=execution_id,
+                        workspace_id=verified_ownership.workspace_id,
+                        name=sector_name,
+                        persist=persist,
+                    ),
+                    timeout=eff_timeout,
+                )
+            except asyncio.TimeoutError:
+                return await _skip_sector_run(
+                    automation_id=sector_automation_id,
+                    execution_id=execution_id,
+                    workspace_id=verified_ownership.workspace_id,
+                    name=sector_name,
+                    reason="preflight_timeout_sector",
+                    persist=persist,
+                )
+            if gated is not None:
+                return gated
         return PreflightResult(should_wake=True, decision="passthrough", reason="autonomy_disabled")
 
     try:
@@ -1140,6 +1378,25 @@ async def preflight_check(
                 reason=timeout_reason,
                 signals=[],
                 wake_context=None,
+            )
+        if str(kind).startswith("sector_"):
+            # 行业任务超时不保守唤醒（r3 lead 决定）：卡住的可能正是绑定
+            # 校验，唤醒一个绑定已失配的旧工作区任务会把行业回合写进错误
+            # 的工作区；超时按跳过处理，下一次调度自然重试。公司任务的
+            # 保守唤醒逐字不变。
+            timeout_reason = "preflight_timeout_sector"
+            logger.warning(
+                "[DALTON_PREFLIGHT] sector preflight timed out after %.1fs for %s; skipping without wake",
+                eff_timeout,
+                name,
+            )
+            return await _skip_sector_run(
+                automation_id=str(automation.get("automation_id") or "") or None,
+                execution_id=execution_id,
+                workspace_id=verified_ownership.workspace_id,
+                name=name,
+                reason=timeout_reason,
+                persist=persist,
             )
         ticker = _extract_ticker(automation)
         logger.warning(

@@ -1047,17 +1047,17 @@ def build_director_tools(
         source: str = "user",
         config: RunnableConfig = None,
     ) -> str:
-        """Inspect, enable, or disable the standard autonomous tracking suite (`watch`, `delta`, `move-up`, `move-down`) for a company workspace.
-        Analysts are restricted to their current workspace and refused on any other company; Chief of Staff can target any company workspace via `ticker` or `workspace_id`.
+        """Inspect, enable, or disable the standard autonomous tracking suite (`watch`, `delta`, `move-up`, `move-down`) for a company workspace — or the two sector tasks (`agenda`, `delta`) for a sector workspace.
+        Analysts are restricted to their current workspace (company or sector) and refused on any other subject; Chief of Staff can target any company workspace via `ticker` or `workspace_id`, and any sector workspace via `workspace_id` (a sector has no ticker).
 
         Args:
-            action: `"status"` to inspect tracking state and next run times, `"enable"` to create or resume the standard tracking suite, or `"disable"` to pause all `dalton-<ticker>-*` tasks (including `-earn-*`) without deleting them.
-            ticker: Company ticker symbol (e.g. `"NVDA"`). Used by Chief of Staff when `workspace_id` is omitted; rejected for analysts if it does not match their current workspace.
-            workspace_id: Target company workspace UUID. Defaults to the active workspace for analysts.
+            action: `"status"` to inspect tracking state and next run times, `"enable"` to create or resume the standard tracking suite, or `"disable"` to pause all of the subject's tasks (including `-earn-*` for companies, and tasks left on an older workspace for sectors) without deleting them.
+            ticker: Company ticker symbol (e.g. `"NVDA"`). Used by Chief of Staff when `workspace_id` is omitted; rejected for analysts if it does not match their current workspace, and refused on a sector workspace (sectors carry no ticker).
+            workspace_id: Target workspace UUID (company or sector). Defaults to the active workspace for analysts.
             source: `"user"` (default, explicit user/conversation enable with `force=True`) or `"coverage_finish"` (post-coverage auto-enable that respects `paused_by_user`).
 
         Returns:
-            JSON object with derived status (`enabled`, `disabled`, or `incomplete`), `paused_by_user` flag, and each task's schedule and `next_run_at`.
+            JSON object with derived status (`enabled`, `disabled`, or `incomplete`), `paused_by_user` flag, and each task's schedule and `next_run_at` (sector statuses additionally carry `subject_kind`, `unit_id`, and the resolved due timezone).
         """
         configurable = (config or {}).get("configurable") or {}
         user_id = str(configurable.get("user_id") or "").strip()
@@ -1109,47 +1109,73 @@ def build_director_tools(
                     },
                     ensure_ascii=False,
                 )
-            try:
-                cur_ticker = str(await _resolve_workspace_ticker(current_ws) or "").strip().upper()
-            except Exception as exc:
-                return json.dumps(
-                    {
-                        "ok": False,
-                        "error": "forbidden_workspace",
-                        "message": f"无法解析当前工作区（{current_ws}）对应的公司 ticker，拒绝操作：{exc}",
-                    },
-                    ensure_ascii=False,
-                )
-            if not cur_ticker:
-                return json.dumps(
-                    {
-                        "ok": False,
-                        "error": "forbidden_workspace",
-                        "message": f"无法解析当前工作区（{current_ws}）对应的公司 ticker，拒绝操作。",
-                    },
-                    ensure_ascii=False,
-                )
-            if passed_ticker:
-                if passed_ticker != cur_ticker:
+            # 行业工作区（codex r2 #5）：统一身份先于公司 ticker 解析——行业
+            # 分析师直接走行业实现（tracking 内部按 subject_kind 分派），
+            # 不再因解析不出公司 ticker 被一刀切拒绝。行业没有 ticker，
+            # 显式传 ticker 一律拒绝，不给"猜一个"留口。
+            # 开关门控（codex r3 #6）：开关关闭时连身份查询都不发，
+            # 公司路径与 P3 前逐字一致（零新增查询）。
+            sector_current = None
+            if is_coverage_units_enabled():
+                from src.dalton.autonomy.tracking import _resolve_workspace_sector
+
+                sector_current = await _resolve_workspace_sector(current_ws)
+            if sector_current is not None:
+                if passed_ticker:
                     return json.dumps(
                         {
                             "ok": False,
                             "error": "forbidden_workspace",
-                            "message": f"公司分析师只能操作当前工作区（{cur_ticker}），禁止操作 {passed_ticker}。",
+                            "message": (
+                                f"当前工作区（{current_ws}）是行业覆盖单元，没有公司 ticker；"
+                                "行业跟踪不接受 ticker 参数，省略后重试即可。"
+                            ),
                         },
                         ensure_ascii=False,
                     )
-                resolved_by_ticker = await resolve_workspace_id_by_ticker(passed_ticker, user_id)
-                if resolved_by_ticker is not None and str(resolved_by_ticker).strip() != current_ws:
+                target_ws_id = current_ws
+            else:
+                try:
+                    cur_ticker = str(await _resolve_workspace_ticker(current_ws) or "").strip().upper()
+                except Exception as exc:
                     return json.dumps(
                         {
                             "ok": False,
                             "error": "forbidden_workspace",
-                            "message": f"公司分析师只能操作当前工作区，禁止操作其他公司（{passed_ticker}）。",
+                            "message": f"无法解析当前工作区（{current_ws}）对应的公司 ticker，拒绝操作：{exc}",
                         },
                         ensure_ascii=False,
                     )
-            target_ws_id = current_ws
+                if not cur_ticker:
+                    return json.dumps(
+                        {
+                            "ok": False,
+                            "error": "forbidden_workspace",
+                            "message": f"无法解析当前工作区（{current_ws}）对应的公司 ticker，拒绝操作。",
+                        },
+                        ensure_ascii=False,
+                    )
+                if passed_ticker:
+                    if passed_ticker != cur_ticker:
+                        return json.dumps(
+                            {
+                                "ok": False,
+                                "error": "forbidden_workspace",
+                                "message": f"公司分析师只能操作当前工作区（{cur_ticker}），禁止操作 {passed_ticker}。",
+                            },
+                            ensure_ascii=False,
+                        )
+                    resolved_by_ticker = await resolve_workspace_id_by_ticker(passed_ticker, user_id)
+                    if resolved_by_ticker is not None and str(resolved_by_ticker).strip() != current_ws:
+                        return json.dumps(
+                            {
+                                "ok": False,
+                                "error": "forbidden_workspace",
+                                "message": f"公司分析师只能操作当前工作区，禁止操作其他公司（{passed_ticker}）。",
+                            },
+                            ensure_ascii=False,
+                        )
+                target_ws_id = current_ws
         else:
             if passed_ws:
                 await verify_workspace_access(passed_ws, user_id)
@@ -1254,8 +1280,73 @@ def build_director_tools(
                     },
                     ensure_ascii=False,
                 )
+            # 行业工作区（codex r2 #5）：analyst 可以管理自己所在行业工作区的
+            # sector 任务，权限规则与公司 scope 一致——只准当前工作区（key
+            # 只认本单元的 slug / unit_id，服务层的解析走同一注册表）。
+            # 开关门控（codex r3 #6）：关闭时零新增查询，公司路径原样。
+            sector_current = None
+            if is_coverage_units_enabled():
+                from src.dalton.autonomy.tracking import _resolve_workspace_sector
+
+                sector_current = await _resolve_workspace_sector(current_ws)
+            if sector_current is not None:
+                sector_slug = str(sector_current["unit"].get("slug") or "").strip()
+                sector_unit_id = str(sector_current["unit"].get("unit_id") or "").strip()
+                if raw_key:
+                    try:
+                        key_scope, key_target = classify_system_job_key(raw_key)
+                    except ValueError as exc:
+                        return json.dumps(
+                            {"ok": False, "error": "invalid_key", "message": str(exc)},
+                            ensure_ascii=False,
+                        )
+                    if key_scope != "sector":
+                        return json.dumps(
+                            {
+                                "ok": False,
+                                "error": "forbidden_scope",
+                                "message": f"行业分析师只能管理本行业任务（sector:{sector_slug}），禁止操作 {key_scope} 级任务（{raw_key}）。",
+                            },
+                            ensure_ascii=False,
+                        )
+                    if key_target.lower() not in {sector_slug.lower(), sector_unit_id.lower()}:
+                        return json.dumps(
+                            {
+                                "ok": False,
+                                "error": "forbidden_workspace",
+                                "message": f"行业分析师只能操作当前行业工作区（sector:{sector_slug}），禁止操作 {raw_key}。",
+                            },
+                            ensure_ascii=False,
+                        )
+                await verify_workspace_access(current_ws, user_id)
+                sector_key = f"sector:{sector_slug}"
+                if act in ("list", "status"):
+                    res = await get_system_job_status(user_id, sector_key)
+                    return json.dumps(res, ensure_ascii=False, default=str)
+                if act in ("enable", "disable"):
+                    return await dalton_coverage_tracking.ainvoke(
+                        {"action": act, "workspace_id": current_ws},
+                        config=config,
+                    )
+                try:
+                    res = await run_system_job_now(user_id, sector_key)
+                    return json.dumps(res, ensure_ascii=False, default=str)
+                except Exception as exc:
+                    return json.dumps(
+                        {"ok": False, "error": "system_job_error", "message": str(exc)},
+                        ensure_ascii=False,
+                    )
             if raw_key:
                 scope, target = classify_system_job_key(raw_key)
+                if scope == "sector":
+                    return json.dumps(
+                        {
+                            "ok": False,
+                            "error": "forbidden_workspace",
+                            "message": "行业任务只能在对应的行业工作区内管理；当前工作区不是行业工作区。",
+                        },
+                        ensure_ascii=False,
+                    )
                 if scope != "company":
                     return json.dumps(
                         {

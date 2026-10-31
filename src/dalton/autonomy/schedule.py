@@ -27,6 +27,12 @@ DELTA_TIMEZONE = "Asia/Shanghai"
 DELTA_CRON_CORE = "0 11 * * 2-6"
 DELTA_CRON_WATCH = "0 11 * * 6"
 
+# 行业单元（P3）：议程探针每 2 小时（工作日、研究时区）检查到期项；资料增量
+# 每周六北京时间 11:00 扫描——行业没有一致预期/SEC/股价，采集只走内部资料
+# 检索路（dalton-sector-delta），频率对齐公司 Watch 档的每周节奏。
+SECTOR_AGENDA_CRON = "0 8-18/2 * * 1-5"
+SECTOR_DELTA_CRON = "0 11 * * 6"
+
 
 def resolve_delta_schedule(tier: str) -> tuple[str, str]:
     """Return ``(cron_expression, timezone)`` for a company's ``dalton-<t>-delta`` task."""
@@ -244,6 +250,78 @@ def build_company_watch_specs(
                 "dalton_kind": "price_move",
                 "ticker": t_upper,
                 "direction": "down",
+            },
+        },
+    ]
+
+
+def build_sector_watch_specs(
+    *,
+    unit_id: str,
+    slug: str,
+    display_name: str,
+    workspace_id: str,
+    timezone_name: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return the two standard automations for a sector coverage unit (P3).
+
+    Agenda due + material delta only — a sector never runs the securities
+    probes (SEC / 港A 公告 / 财报 / 股价): those are subscribed company-side
+    once, and reach sectors as P2 cross-unit candidates. Names are
+    ``dalton-sector-<slug>-<kind>``: four segments, so neither
+    ``_TICKER_FROM_AUTO_NAME_RE`` nor ``preflight._extract_ticker`` can read a
+    ticker out of them, and metadata carries ``subject_kind``/``unit_id`` so
+    the sector path never falls back to name-guessing. ``timezone_name`` is
+    the resolved sector due timezone (doc ``research_tz`` → user tz; see
+    ``autonomy.sector``).
+    """
+    s_slug = re.sub(r"[^a-z0-9._-]+", "-", str(slug or "").strip().lower()).strip("-.") or "sector"
+    name = str(display_name or s_slug).strip() or s_slug
+    tz = timezone_name or get_dalton_settings().autonomy.timezone
+    return [
+        {
+            "name": f"dalton-sector-{s_slug}-agenda",
+            "description": f"{name} 行业议程到期检查（验证项/待查问题/催化剂）",
+            "trigger_type": "cron",
+            "cron_expression": SECTOR_AGENDA_CRON,
+            "timezone": tz,
+            "workspace_id": workspace_id,
+            "thread_strategy": "new",
+            "instruction": (
+                f"请阅读本轮 `<dalton_wake>` 中的触发信号，使用 `.agents/skills/dalton-agenda/SKILL.md` 处理行业 {name} 的到期议程"
+                "（到期验证项、待查问题、催化剂窗口），更新行业知识层（thesis/agenda/drivers）并追加 `knowledge_append_verdict`。"
+                "行业不跑证券探针：成员公司的公告/财报/股价事件由公司侧发现，经跨单元联动进入本工作区。"
+            ),
+            "metadata": {
+                "dalton_managed": True,
+                "dalton_kind": "sector_watch",
+                "subject_kind": "sector",
+                "unit_id": str(unit_id),
+                "sector_slug": s_slug,
+                "sector_name": name,
+                "research_tz": tz,
+            },
+        },
+        {
+            "name": f"dalton-sector-{s_slug}-delta",
+            "description": f"{name} 行业资料增量周扫（内部检索，无证券探针）",
+            "trigger_type": "cron",
+            "cron_expression": SECTOR_DELTA_CRON,
+            "timezone": DELTA_TIMEZONE,
+            "workspace_id": workspace_id,
+            "thread_strategy": "new",
+            "instruction": (
+                f"请按 `.agents/skills/dalton-sector-delta/SKILL.md` 对行业 {name} 做内部资料增量扫描"
+                "（行业关键词与成员公司名为检索条件，不含 SEC/公告/股价），有实质增量时更新 `thesis` / `debate` / `agenda` 并追加 `knowledge_append_verdict`。"
+            ),
+            "metadata": {
+                "dalton_managed": True,
+                "dalton_kind": "sector_delta",
+                "subject_kind": "sector",
+                "unit_id": str(unit_id),
+                "sector_slug": s_slug,
+                "sector_name": name,
+                "research_tz": tz,
             },
         },
     ]

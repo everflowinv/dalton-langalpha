@@ -1150,10 +1150,11 @@ async def update_workspace_tracking_endpoint(
 
 
 async def _authorize_system_job_mutation(key: str, user_id: str) -> str:
-    """Resolve effective owner ``user_id`` for company jobs; Home/host/ops permissions are enforced in ``system_jobs``."""
+    """Resolve effective owner ``user_id`` for company/sector jobs; Home/host/ops permissions are enforced in ``system_jobs``."""
     _require_dalton_enabled()
     from src.dalton.autonomy.system_jobs import (
         _resolve_company_workspace_id,
+        _resolve_sector_unit_for_key,
         classify_system_job_key,
     )
 
@@ -1164,6 +1165,27 @@ async def _authorize_system_job_mutation(key: str, user_id: str) -> str:
 
     if scope in ("ops", "home", "host"):
         return str(user_id).strip()
+
+    if scope == "sector":
+        # sector:<slug|unit_id> 的目标是覆盖单元，不是 ticker 也不是工作区
+        # ID（codex r2 #4）：按当前用户解析单元，再对单元当前绑定的工作区
+        # 做原有的跟踪权限校验。
+        try:
+            unit = await _resolve_sector_unit_for_key(str(user_id).strip(), target)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        sector_ws = str(unit.get("workspace_id") or "").strip()
+        if not sector_ws:
+            raise HTTPException(
+                status_code=404,
+                detail=f"行业单元 {target} 未绑定工作区，无可开关的跟踪任务。",
+            )
+        owner_id, _ = await _resolve_tracking_workspace_owner(
+            sector_ws,
+            user_id,
+            require_write=True,
+        )
+        return owner_id
 
     ws_id = await _resolve_company_workspace_id(user_id, target)
     owner_id, _ = await _resolve_tracking_workspace_owner(

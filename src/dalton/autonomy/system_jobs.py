@@ -27,6 +27,7 @@ from src.dalton.settings import (
     get_dalton_bridge_admin_token,
     get_dalton_bridge_base_url,
     get_dalton_config,
+    is_coverage_units_enabled,
 )
 from src.server.database import automation as auto_db
 from src.server.database import automation_executions as exec_db
@@ -484,6 +485,99 @@ async def _build_company_job_entry(
     }
 
 
+async def _discover_sector_units(user_id: str) -> list[dict[str, Any]]:
+    """The user's active sector units with a workspace binding (P3, flag on only)."""
+    if not is_coverage_units_enabled():
+        return []
+    try:
+        from src.dalton.database.coverage_units import list_coverage_units
+
+        units = await list_coverage_units(user_id, include_archived=False)
+    except Exception as exc:
+        logger.debug("[DALTON_SYSTEM_JOBS] sector unit lookup failed: %s", exc)
+        return []
+    return [
+        dict(u)
+        for u in units or []
+        if str(u.get("kind") or "") == "sector" and u.get("workspace_id")
+    ]
+
+
+def _build_sector_job_entry(
+    user_id: str,
+    unit: dict[str, Any],
+    automation_rows: list[dict[str, Any]],
+    tracking: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a ``sector`` scope system job entry from a sector unit's tracking status."""
+    slug = str(unit.get("slug") or "").strip()
+    display_name = str(unit.get("display_name") or slug).strip()
+    raw_status = str(tracking.get("status") or "disabled")
+    mapped_status = _TRACKING_STATUS_TO_JOB_STATUS.get(raw_status, "partial")
+
+    prefix = f"dalton-sector-{slug.lower()}-"
+    sector_rows = [
+        r
+        for r in automation_rows
+        if isinstance(r, dict)
+        and str(r.get("name") or "").strip().lower().startswith(prefix)
+        and (not r.get("workspace_id") or str(r.get("workspace_id")) == str(unit.get("workspace_id")))
+    ]
+    last_run_at, last_result, next_run_at = _summarize_company_runs(sector_rows)
+    if next_run_at is None:
+        task_nexts = [
+            str(t["next_run_at"])
+            for t in (tracking.get("tasks") or [])
+            if isinstance(t, dict) and t.get("status") == "active" and t.get("next_run_at")
+        ]
+        if task_nexts:
+            next_run_at = min(task_nexts)
+
+    return {
+        "key": f"sector:{slug}",
+        "kind": "sector_tracking",
+        "scope": "sector",
+        "title": f"{display_name} 行业自动跟踪",
+        "description": str(tracking.get("label") or ""),
+        "schedule": "议程到期每 2 小时（研究时区）· 内部资料每周六 11:00 增量扫描 · 不跑证券探针",
+        "workspace_id": str(unit.get("workspace_id")),
+        "unit_id": str(unit.get("unit_id") or "") or None,
+        "sector_slug": slug,
+        "subject_kind": "sector",
+        "ticker": None,
+        "timezone": tracking.get("timezone"),
+        "status": mapped_status,
+        "tracking_status": raw_status,
+        "enabled": mapped_status == "on",
+        "paused_by_user": bool(tracking.get("paused_by_user")),
+        "last_run_at": last_run_at,
+        "last_result": last_result,
+        "next_run_at": next_run_at,
+        "can_toggle": True,
+        "can_run_now": True,
+        "missing_tasks": tracking.get("missing_tasks") or [],
+        "paused_tasks": tracking.get("paused_tasks") or [],
+        "active_tasks": tracking.get("active_tasks") or [],
+        "tasks": tracking.get("tasks") or [],
+    }
+
+
+async def _resolve_sector_unit_for_key(
+    user_id: str,
+    target: str,
+    units: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Resolve a sector key's target (slug or unit_id) to one of the user's bound sector units."""
+    owned = units if units is not None else await _discover_sector_units(user_id)
+    cleaned = str(target or "").strip()
+    for u in owned:
+        if str(u.get("slug") or "").strip().lower() == cleaned.lower():
+            return u
+        if str(u.get("unit_id") or "").strip().lower() == cleaned.lower():
+            return u
+    raise ValueError(f"未找到行业自动跟踪任务: sector:{cleaned}")
+
+
 def classify_system_job_key(key: str) -> tuple[str, str]:
     """Classify a system job key into ``(scope, normalized_target)``.
 
@@ -492,6 +586,7 @@ def classify_system_job_key(key: str) -> tuple[str, str]:
         - ``("host", "conversation-archive")`` for conversation archive
         - ``("ops", "<ops_key>")`` for read-only ops jobs
         - ``("company", "<ticker_or_workspace_id>")`` for company tracking jobs
+        - ``("sector", "<slug_or_unit_id>")`` for sector tracking jobs (P3)
     """
     cleaned = str(key or "").strip()
     if not cleaned:
@@ -524,6 +619,14 @@ def classify_system_job_key(key: str) -> tuple[str, str]:
     if lower in ops_keys or lower.startswith(("ops-", "ops:")):
         norm_ops = lower.replace("ops:", "ops-")
         return "ops", norm_ops
+
+    # 行业单元的 key 必须带 sector: 前缀：裸 slug 会落进公司分支、被当成
+    # ticker 去解析（行业没有 ticker，P3 禁止从名称猜）。
+    if lower.startswith("sector:"):
+        target = cleaned.split(":", 1)[1].strip()
+        if not target:
+            raise ValueError("行业任务 key 缺少 slug 或 unit_id")
+        return "sector", target
 
     if lower.startswith("company:"):
         target = cleaned.split(":", 1)[1].strip()
@@ -578,23 +681,40 @@ async def list_system_jobs(user_id: str) -> dict[str, Any]:
         for spec in home_specs
     ]
 
+    # 行业单元（P3）：开关关闭时 _discover_sector_units 直接返回空列表，
+    # 不查注册表，输出与 P3 前一致（无 sector 组）。
+    sector_units = await _discover_sector_units(uid)
+    sector_jobs: list[dict[str, Any]] = []
+    for s_unit in sector_units:
+        s_ws = str(s_unit.get("workspace_id"))
+        try:
+            s_tracking = await get_tracking_status(uid, s_ws)
+        except ValueError:
+            continue
+        if str(s_tracking.get("subject_kind") or "") != "sector":
+            continue
+        sector_jobs.append(_build_sector_job_entry(uid, s_unit, rows, s_tracking))
+
     host_job, ops_jobs = await asyncio.gather(
         _fetch_host_conversation_archive_job(),
         _fetch_ops_jobs(),
     )
     host_jobs = [_apply_caller_visibility(host_job, is_pm=pm)]
 
-    all_jobs = [*company_jobs, *home_jobs, *host_jobs, *ops_jobs]
+    all_jobs = [*company_jobs, *sector_jobs, *home_jobs, *host_jobs, *ops_jobs]
+    groups: dict[str, list[dict[str, Any]]] = {
+        "company": company_jobs,
+        "home": home_jobs,
+        "host": host_jobs,
+        "ops": ops_jobs,
+    }
+    if sector_units:
+        groups["sector"] = sector_jobs
     return {
         "ok": True,
         "is_pm": pm,
         "jobs": all_jobs,
-        "groups": {
-            "company": company_jobs,
-            "home": home_jobs,
-            "host": host_jobs,
-            "ops": ops_jobs,
-        },
+        "groups": groups,
     }
 
 
@@ -641,6 +761,14 @@ async def get_system_job_status(user_id: str, key: str) -> dict[str, Any]:
             raise ValueError(f"未找到全局任务: {key}")
         job = _apply_caller_visibility(_build_home_job_entry(spec, by_name.get(target)), is_pm=pm)
         return {"ok": True, "job": job}
+
+    if scope == "sector":
+        s_unit = await _resolve_sector_unit_for_key(uid, target)
+        s_ws = str(s_unit.get("workspace_id"))
+        s_tracking = await get_tracking_status(uid, s_ws)
+        if str(s_tracking.get("subject_kind") or "") != "sector":
+            raise ValueError(f"未找到行业自动跟踪任务: {key}")
+        return {"ok": True, "job": _build_sector_job_entry(uid, s_unit, rows, s_tracking)}
 
     ws_id = await _resolve_company_workspace_id(uid, target)
     entry = await _build_company_job_entry(uid, ws_id, rows)
@@ -822,6 +950,19 @@ async def toggle_system_job(
             )
             return {"ok": True, "job": _build_home_job_entry(spec, updated_row)}
 
+    if scope == "sector":
+        s_unit = await _resolve_sector_unit_for_key(uid, target)
+        s_ws = str(s_unit.get("workspace_id"))
+        if enabled:
+            await enable_tracking(uid, s_ws, force=force, respect_user_pause=respect_user_pause)
+        else:
+            await disable_tracking(uid, s_ws)
+        rows_after = await list_all_user_automations(uid, name_prefix="dalton-")
+        s_tracking = await get_tracking_status(uid, s_ws)
+        if str(s_tracking.get("subject_kind") or "") != "sector":
+            raise ValueError(f"未找到行业自动跟踪任务: {key}")
+        return {"ok": True, "job": _build_sector_job_entry(uid, s_unit, rows_after, s_tracking)}
+
     ws_id = await _resolve_company_workspace_id(uid, target)
     if enabled:
         await enable_tracking(
@@ -954,6 +1095,40 @@ async def run_system_job_now(user_id: str, key: str) -> dict[str, Any]:
             "execution_id": trig["execution_id"],
             "where_to_check": where_hint,
             "message": f"已异步触发「{title}」（execution_id={trig['execution_id']}），请稍后在「{where_hint}」查看执行结果。",
+        }
+
+    # Sector scope: trigger the sector unit's agenda automation if it exists (P3)
+    if scope == "sector":
+        s_unit = await _resolve_sector_unit_for_key(uid, target)
+        s_slug = str(s_unit.get("slug") or "").strip()
+        s_ws = str(s_unit.get("workspace_id"))
+        agenda_name = f"dalton-sector-{s_slug.lower()}-agenda"
+        rows = await list_all_user_automations(uid, name_prefix=agenda_name)
+        row = next(
+            (
+                r
+                for r in rows
+                if isinstance(r, dict)
+                and str(r.get("name") or "").strip().lower() == agenda_name
+                and (not r.get("workspace_id") or str(r.get("workspace_id")) == str(s_ws))
+            ),
+            None,
+        )
+        if row is None or not row.get("automation_id"):
+            raise ValueError("该行业未开启自动跟踪，请先开启")
+        trig = await _trigger_automation_row_async(uid, row)
+        s_name = str(s_unit.get("display_name") or s_slug)
+        where_hint = f"{s_name} 行业工作区或「设置 → 自动任务」面板"
+        return {
+            "ok": True,
+            "key": f"sector:{s_slug}",
+            "scope": "sector",
+            "async": True,
+            "status": "triggered",
+            "automation_id": trig["automation_id"],
+            "execution_id": trig["execution_id"],
+            "where_to_check": where_hint,
+            "message": f"已异步触发 {s_name} 行业议程检查（execution_id={trig['execution_id']}），请稍后在{where_hint}查看运行结果。",
         }
 
     # Company scope: trigger the company's watch automation (`dalton-<t>-watch`) if it exists

@@ -48,13 +48,34 @@ async def probe_agenda(
     agenda_doc: Optional[dict[str, Any]] = None,
     today: Optional[date] = None,
     now: Optional[datetime] = None,
+    due_tz: Optional[ZoneInfo] = None,
 ) -> tuple[list[ProbeSignal], dict[str, Any]]:
-    """Inspect the company's ``agenda`` document for due watch.events, next_validations, open_questions, and wake_conditions."""
+    """Inspect the company's ``agenda`` document for due watch.events, next_validations, open_questions, and wake_conditions.
+
+    ``ticker`` is the subject label used in summaries; for a company it is the
+    ticker and also picks the due-moment fallback timezone via the exchange
+    rules. A sector caller (P3) passes the sector's display name as the label
+    together with ``due_tz`` — the sector's resolved research timezone — so
+    date-only and naive moments are read on the sector's own clock instead of
+    a guessed exchange; offset-carrying moments keep their offset either way
+    (``parse_due_moment``). ``due_tz`` also moves the "today" the event window
+    and question due-dates count from into the sector's calendar: a New-York
+    sector's 27th noon is already Shanghai's 28th, and its three-day catalyst
+    window must not ride the deployment date (codex r2 #7). Company callers
+    omit ``due_tz`` and behave exactly as before.
+    """
     tz = ZoneInfo(get_dalton_settings().autonomy.timezone)
+    if due_tz is not None:
+        tz = due_tz
     now_dt = now or datetime.now(tz)
     if now_dt.tzinfo is None:
         now_dt = now_dt.replace(tzinfo=tz)
-    now_date = today or now_dt.date()
+    if due_tz is not None:
+        # 行业分支："今天"取研究时区日历上的日期（传入的时刻可能是别的
+        # 时区的）。公司分支保持原式：传入时刻自身的日期。
+        now_date = today or now_dt.astimezone(due_tz).date()
+    else:
+        now_date = today or now_dt.date()
     doc = agenda_doc
     if doc is None and workspace_id:
         try:
@@ -114,7 +135,7 @@ async def probe_agenda(
             continue
         raw_due = val_item.get("due") or val_item.get("due_date") or val_item.get("target_date")
         due = _parse_date(raw_due)
-        if validation_is_due(raw_due, ticker, now_dt):
+        if validation_is_due(raw_due, ticker, now_dt, tz=due_tz):
             vid = str(val_item.get("id") or "V")
             if vid in seen_val_ids:
                 continue
