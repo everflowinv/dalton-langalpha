@@ -929,6 +929,7 @@ async def test_extraction_verbatim_quote_validation_and_speaker_rules(
     async def _fake_done(
         invocation_id: str,
         *,
+        attempt: int,
         response: dict[str, Any] | None,
         usage: dict[str, Any] | None = None,
         cash_usd: Any = 0,

@@ -391,6 +391,7 @@ async def claim_journal_invocation(
 async def complete_journal_done(
     invocation_id: str,
     *,
+    attempt: int,
     response: dict[str, Any] | None,
     usage: dict[str, Any] | None = None,
     cash_usd: Decimal = Decimal("0"),
@@ -399,7 +400,13 @@ async def complete_journal_done(
     billing_type: str | None = None,
     conn: Any = None,
 ) -> dict[str, Any] | None:
-    """Transition a journal row to `state='done'` with response (or NULL when `persist_raw=False`), usage, and costs."""
+    """Transition a journal row to `state='done'` with response (or NULL when `persist_raw=False`), usage, and costs.
+
+    R6: only the attempt that claimed the row may write it back, and only while
+    it is still `'pending'`; a stale worker returning after a newer attempt took
+    over finds no matching row, logs a warning, and returns None instead of
+    clobbering the newer attempt's state or response.
+    """
     resp_json = (
         json.dumps(response, ensure_ascii=False, default=str)
         if response is not None
@@ -428,7 +435,13 @@ async def complete_journal_done(
                     billing_type = COALESCE(%s, billing_type),
                     error_kind = NULL,
                     error_text = NULL
-                WHERE invocation_id = %s
+                -- Only the attempt that claimed the row writes it back. A stale
+                -- mark (pending -> indeterminate) keeps the attempt number, so
+                -- that attempt may still settle it -- a long call past the stale
+                -- window must not lose its result or its cost; a takeover bumps
+                -- the attempt and so shuts the older worker out.
+                WHERE invocation_id = %s AND attempt = %s
+                  AND state IN ('pending', 'indeterminate')
                 RETURNING *
                 """,
                 (
@@ -439,9 +452,17 @@ async def complete_journal_done(
                     provider,
                     billing_type,
                     invocation_id,
+                    int(attempt),
                 ),
             )
             row = await cur.fetchone()
+            if row is None:
+                logger.warning(
+                    "[DaltonLLMJournal] complete_journal_done refused for %s attempt=%s "
+                    "(row superseded by a newer attempt or already settled)",
+                    invocation_id,
+                    attempt,
+                )
             return dict(row) if row else None
 
     if conn is not None:
@@ -481,6 +502,7 @@ async def record_journal_replay(invocation_id: str, *, conn: Any = None) -> None
 async def complete_journal_failed(
     invocation_id: str,
     *,
+    attempt: int,
     error_kind: str,
     error_text: str | BaseException | None,
     state: str = "failed",
@@ -488,7 +510,14 @@ async def complete_journal_failed(
     notional_usd: Decimal | None = None,
     conn: Any = None,
 ) -> dict[str, Any] | None:
-    """Transition a journal row to `state='failed'` or `state='indeterminate'`."""
+    """Transition a journal row to `state='failed'` or `state='indeterminate'`.
+
+    R6: only the attempt that claimed the row may write it back, and only while
+    it is still `'pending'` (the pre-update state; writing `'indeterminate'` is
+    itself a pending→indeterminate transition); a stale worker returning after
+    a newer attempt took over finds no matching row, logs a warning, and
+    returns None instead of clobbering the newer attempt's state.
+    """
     if state not in ("failed", "indeterminate"):
         state = "indeterminate"
     safe_err = sanitize_error_text(error_text, max_len=300)
@@ -504,12 +533,25 @@ async def complete_journal_failed(
                     error_text = %s,
                     cash_usd = COALESCE(%s, cash_usd),
                     notional_usd = COALESCE(%s, notional_usd)
-                WHERE invocation_id = %s
+                -- Only the attempt that claimed the row writes it back. A stale
+                -- mark (pending -> indeterminate) keeps the attempt number, so
+                -- that attempt may still settle it -- a long call past the stale
+                -- window must not lose its result or its cost; a takeover bumps
+                -- the attempt and so shuts the older worker out.
+                WHERE invocation_id = %s AND attempt = %s
+                  AND state IN ('pending', 'indeterminate')
                 RETURNING *
                 """,
-                (state, error_kind, safe_err, cash_usd, notional_usd, invocation_id),
+                (state, error_kind, safe_err, cash_usd, notional_usd, invocation_id, int(attempt)),
             )
             row = await cur.fetchone()
+            if row is None:
+                logger.warning(
+                    "[DaltonLLMJournal] complete_journal_failed refused for %s attempt=%s "
+                    "(row superseded by a newer attempt or already settled)",
+                    invocation_id,
+                    attempt,
+                )
             return dict(row) if row else None
 
     if conn is not None:

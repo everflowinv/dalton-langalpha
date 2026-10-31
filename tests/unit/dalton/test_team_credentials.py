@@ -1069,6 +1069,7 @@ async def test_journal_records_caller_user_id_and_stamps_credential_user_id(
 
     await journal_db.complete_journal_done(
         "inv-off-1",
+        attempt=1,
         response={"text": "ok"},
         usage={"total_tokens": 15},
     )
