@@ -10,6 +10,10 @@ from zoneinfo import ZoneInfo
 from psycopg.rows import dict_row
 
 from src.dalton.autonomy.due import ticker_market_timezone, validation_is_due
+from src.dalton.autonomy.units_view import (
+    build_units_view,
+    load_dalton_automations_by_user,
+)
 from src.dalton.budget.service import get_budget_today
 from src.dalton.coverage import get_user_coverage
 from src.dalton.coverage.identity import resolve_workspace_coverage_identity
@@ -187,43 +191,18 @@ async def build_coverage_board(
                 # 行业层 P0 round 2（codex #4）：兼容回退还需要该用户已有的
                 # dalton-* 自动化行——没有文档、只有自动化的老公司工作区在开关
                 # 关闭时也要照常出现在看板上。与 tracking 的回退同一条规则：
-                # 不过滤状态（暂停也是已验证的跟踪信息）。
+                # 不过滤状态（暂停也是已验证的跟踪信息）。查询只在确有工作区
+                # 时发出（与抽出前的条件一致）。
                 autos_by_user: dict[str, list[dict[str, Any]]] = {}
                 try:
-                    # 与 tracking 的筛选和顺序一致（codex r2 #1/#2）：它按
-                    # strip().lower().startswith("dalton-") 过滤、按 file_name
-                    # 排序取第一条，这里用 lower(btrim(name)) LIKE 等价筛选，
-                    # 并保持 ORDER BY file_name 的确定顺序。
-                    if user_id is not None and ws_rows:
-                        await cur.execute(
-                            """
-                            SELECT user_id, workspace_id::text AS workspace_id, name, metadata
-                            FROM automations
-                            WHERE strpos(lower(name), 'dalton-') > 0 AND user_id = %s
-                            ORDER BY file_name
-                            """,
-                            (user_id,),
+                    if ws_rows:
+                        autos_by_user = await load_dalton_automations_by_user(
+                            cur, user_id
                         )
-                    elif ws_rows:
-                        await cur.execute(
-                            """
-                            SELECT user_id, workspace_id::text AS workspace_id, name, metadata
-                            FROM automations
-                            WHERE strpos(lower(name), 'dalton-') > 0
-                            ORDER BY file_name
-                            """
-                        )
-                    for ar in await cur.fetchall() or []:
-                        # The SQL only prefilters; tracking's own rule (Python strip(), which
-                        # also drops tabs and other whitespace btrim keeps) decides.
-                        if (
-                            isinstance(ar, dict)
-                            and ar.get("user_id")
-                            and str(ar.get("name") or "").strip().lower().startswith("dalton-")
-                        ):
-                            autos_by_user.setdefault(str(ar["user_id"]), []).append(dict(ar))
                 except Exception as exc:
-                    logger.warning("[DALTON_BOARD] dalton automation preload failed: %s", exc)
+                    logger.warning(
+                        "[DALTON_BOARD] dalton automation preload failed: %s", exc
+                    )
                     autos_by_user = {}
 
                 await cur.execute(
@@ -570,192 +549,11 @@ async def build_coverage_board(
 
         # 行业层 P2：units 覆盖单元视图。开关关闭时本块整体不执行——
         # 不查 dalton_coverage_units / dalton_sector_members，输出不带
-        # units 键。上方主查询的连接此时已归还池里，这里必须重新租借一
-        # 个连接上下文（codex r1 #2）；同事可见工作区复用 sharing 的现成
-        # 枚举（隐藏的不出现，出现即代表可读）。
+        # units 键。枚举、同事可见性与成员渲染都在 units_view（P4 抽出，
+        # 与覆盖视图的 HTTP API 共享同一实现），board 只捕获失败降级。
         if units is not None:
             try:
-                from src.dalton.database.sector_members import fetch_members_for_sectors
-
-                colleague_access: dict[str, tuple[bool, bool]] = {}
-                async with get_db_connection() as uconn:
-                    async with uconn.cursor(row_factory=dict_row) as ucur:
-                        # 参数出现在 IS NULL 这种无类型上下文里时必须显式
-                        # 转型（codex r1 #1）：默认适配器发 unknown 类型，
-                        # Postgres 推断不出 $1，整个 units 视图会被吞成空。
-                        await ucur.execute(
-                            """
-                            SELECT unit_id::text AS unit_id, kind, owner_user_id, slug,
-                                   display_name, workspace_id::text AS workspace_id, ticker
-                            FROM dalton_coverage_units
-                            WHERE status = 'active'
-                              AND (%s::text IS NULL OR owner_user_id = %s)
-                            ORDER BY kind, slug
-                            """,
-                            (user_id, user_id),
-                        )
-                        unit_rows = [dict(r) for r in await ucur.fetchall()]
-
-                        # 同事的单元只经由可见工作区进入（不泄漏隐藏工作区
-                        # 的存在），可见性判断全部复用 sharing 的既有结果。
-                        if user_id is not None:
-                            try:
-                                from src.dalton.sharing import list_team_workspaces
-
-                                for member in await list_team_workspaces(user_id):
-                                    for cws in member.get("workspaces") or []:
-                                        ws_id_c = str(cws.get("workspace_id") or "")
-                                        if ws_id_c:
-                                            colleague_access[ws_id_c] = (
-                                                str(cws.get("web_access") or "hidden") != "hidden",
-                                                str(cws.get("cos_access") or "hidden") == "rw",
-                                            )
-                            except Exception as exc:
-                                logger.warning(
-                                    "[DALTON_BOARD] team workspace lookup failed: %s", exc
-                                )
-                        if colleague_access:
-                            await ucur.execute(
-                                """
-                                SELECT unit_id::text AS unit_id, kind, owner_user_id, slug,
-                                       display_name, workspace_id::text AS workspace_id, ticker
-                                FROM dalton_coverage_units
-                                WHERE status = 'active'
-                                  AND workspace_id = ANY(%s::uuid[])
-                                  AND (%s::text IS NULL OR owner_user_id <> %s)
-                                ORDER BY kind, slug
-                                """,
-                                (list(colleague_access), user_id, user_id),
-                            )
-                            existing_ids = {u["unit_id"] for u in unit_rows}
-                            unit_rows.extend(
-                                dict(r)
-                                for r in await ucur.fetchall()
-                                if str(r.get("unit_id")) not in existing_ids
-                            )
-
-                        sector_ids = [
-                            str(u["unit_id"]) for u in unit_rows if u.get("kind") == "sector"
-                        ]
-                        member_rows = await fetch_members_for_sectors(ucur, sector_ids)
-                        members_by_sector: dict[str, list[dict[str, Any]]] = {}
-                        for mr in member_rows:
-                            members_by_sector.setdefault(
-                                str(mr.get("sector_unit_id")), []
-                            ).append(dict(mr))
-                        company_unit_ids = sorted(
-                            {
-                                str(m.get("company_unit_id"))
-                                for m in member_rows
-                                if m.get("company_unit_id")
-                            }
-                        )
-                        company_ws_by_unit: dict[str, dict[str, Any]] = {}
-                        if company_unit_ids:
-                            await ucur.execute(
-                                """
-                                SELECT unit_id::text AS unit_id, status, owner_user_id,
-                                       workspace_id::text AS workspace_id
-                                FROM dalton_coverage_units
-                                WHERE unit_id = ANY(%s::uuid[])
-                                """,
-                                (company_unit_ids,),
-                            )
-                            for cr in await ucur.fetchall():
-                                company_ws_by_unit[str(cr["unit_id"])] = dict(cr)
-                            # 只认 active 绑定：归档的公司单元不再指向工作区，
-                            # 避免"已建工作区"的假阳性。
-                            company_ws_by_unit = {
-                                uid: row
-                                for uid, row in company_ws_by_unit.items()
-                                if str(row.get("status") or "") == "active"
-                            }
-
-                def _member_workspace_visible(company_row: dict[str, Any] | None) -> bool:
-                    """成员的公司工作区 id 只有查看者有权读取时才输出（codex r1 #5）。
-
-                    同一所有者，或在 list_team_workspaces 的可见结果里；无权时
-                    只保留 workspace_created 与名称，不输出 id——成员解析不允
-                    许绕过同事工作区的可见性过滤。
-                    """
-                    if company_row is None:
-                        return False
-                    if user_id is None:
-                        return True
-                    if str(company_row.get("owner_user_id") or "") == str(user_id):
-                        return True
-                    return colleague_access.get(
-                        str(company_row.get("workspace_id") or ""), (False, False)
-                    )[0]
-
-                own_auto_ws = {
-                    str(a.get("workspace_id") or "")
-                    for a in autos_by_user.get(str(user_id or ""), [])
-                    if a.get("workspace_id")
-                }
-                for u in unit_rows:
-                    u_id = str(u.get("unit_id"))
-                    owner = str(u.get("owner_user_id") or "")
-                    ws_id = str(u.get("workspace_id") or "") or None
-                    is_own = user_id is not None and owner == str(user_id)
-                    if is_own:
-                        readable = True
-                        # 未绑定工作区的单元没有可委派的对象。
-                        delegatable = ws_id is not None
-                        auto_tracked = bool(ws_id and ws_id in own_auto_ws)
-                    elif user_id is None:
-                        readable = True
-                        delegatable = False
-                        auto_tracked = False
-                    else:
-                        access = colleague_access.get(ws_id or "")
-                        if access is None:
-                            continue
-                        readable = access[0]
-                        delegatable = access[1]
-                        auto_tracked = False
-                    entry: dict[str, Any] = {
-                        "unit_id": u_id,
-                        "kind": u.get("kind"),
-                        "slug": u.get("slug"),
-                        "display_name": u.get("display_name"),
-                        "owner_user_id": owner,
-                        "workspace_id": ws_id,
-                        "readable": readable,
-                        "delegatable": delegatable,
-                        "auto_tracked": auto_tracked,
-                    }
-                    if u.get("kind") == "company":
-                        entry["ticker"] = u.get("ticker")
-                    else:
-                        members_out: list[dict[str, Any]] = []
-                        for m in members_by_sector.get(u_id, []):
-                            company_row = company_ws_by_unit.get(
-                                str(m.get("company_unit_id") or "")
-                            )
-                            members_out.append(
-                                {
-                                    "member_id": m.get("member_id"),
-                                    "name": m.get("member_name"),
-                                    "ticker": m.get("ticker"),
-                                    "company_unit_id": m.get("company_unit_id"),
-                                    "workspace_created": bool(m.get("workspace_created")),
-                                    "workspace_id": (
-                                        company_row.get("workspace_id")
-                                        if _member_workspace_visible(company_row)
-                                        else None
-                                    ),
-                                    "scope": m.get("scope") or "",
-                                    "reason": m.get("reason") or "",
-                                    "valid_until": (
-                                        m["valid_until"].isoformat()
-                                        if m.get("valid_until")
-                                        else None
-                                    ),
-                                }
-                            )
-                        entry["members"] = members_out
-                    units.append(entry)
+                units.extend(await build_units_view(user_id, autos_by_user))
             except Exception as exc:
                 logger.warning("[DALTON_BOARD] units view build failed: %s", exc)
     except Exception as e:

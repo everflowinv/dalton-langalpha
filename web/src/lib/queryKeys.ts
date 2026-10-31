@@ -333,6 +333,9 @@ export const queryKeys = {
     budget:          () => [...queryKeys.dalton.all, 'budget'],
     budgetToday:     () => [...queryKeys.dalton.all, 'budget', 'today'],
     coverageBoard:   (tier = 'all', staleOnly = false) => [...queryKeys.dalton.all, 'coverage', 'board', tier, staleOnly],
+    // DALTON-HOOK(query-keys): sector layer P4 coverage-units view; the list query doubles as the feature-flag channel
+    coverageUnits:   () => [...queryKeys.dalton.all, 'coverage', 'units'],
+    coverageUnitDetail: (unitId: string) => [...queryKeys.dalton.all, 'coverage', 'units', 'detail', unitId],
     autonomyReport:  (week?: string) => [...queryKeys.dalton.all, 'autonomy', 'report', week ?? 'current'],
     // DALTON-HOOK(team-credentials): team-shared credentials status query key scoped by user
     credentialsStatus: (userId?: string | null) => [...queryKeys.dalton.all, 'credentials', 'status', userId ?? 'current'],

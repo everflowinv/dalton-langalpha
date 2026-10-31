@@ -1012,6 +1012,48 @@ async def get_coverage_board_endpoint(
     )
 
 
+# ---------------------------------------------------------------------------
+# 行业层 P4：覆盖单元视图（只读）。列表响应同时是开关状态的下发通道。
+# ---------------------------------------------------------------------------
+
+
+@router.get("/coverage/units")
+@handle_api_exceptions("list coverage units", logger)
+async def list_coverage_units_endpoint(
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    _require_dalton_enabled()
+    from src.dalton.autonomy.units_view import build_units_listing
+    from src.dalton.settings import is_coverage_units_enabled
+
+    # 开关关闭返回 200 + {"enabled": false} 而不是 404：列表接口兼任前端
+    # 获知开关状态的通道，404 会让"未启用"与"Dalton 未开启/路由不存在"
+    # 在查询层无法区分，正常状态被迫走错误处理路径。
+    if not is_coverage_units_enabled():
+        return {"enabled": False}
+    return await build_units_listing(str(user_id).strip())
+
+
+@router.get("/coverage/units/{unit_id}")
+@handle_api_exceptions("get coverage unit detail", logger)
+async def get_coverage_unit_detail_endpoint(
+    unit_id: str,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    _require_dalton_enabled()
+    from src.dalton.autonomy.units_view import UnitNotFound, build_unit_detail
+    from src.dalton.settings import is_coverage_units_enabled
+
+    # 详情在开关关闭时一律 404：未启用的功能里不存在"单元详情"这种资源，
+    # 与不可见单元同一语义（不泄漏存在性）。
+    if not is_coverage_units_enabled():
+        raise HTTPException(status_code=404, detail="coverage units disabled")
+    try:
+        return await build_unit_detail(str(user_id).strip(), unit_id)
+    except UnitNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
 @router.get("/autonomy/report")
 @handle_api_exceptions("get autonomy weekly report", logger)
 async def get_autonomy_report_endpoint(

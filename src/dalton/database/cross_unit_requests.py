@@ -175,6 +175,59 @@ async def list_requests(
 _UNSET = object()
 
 
+async def list_pending_for_sector(
+    owner_user_id: str,
+    sector_unit_id: str,
+    sector_workspace_id: str | None = None,
+    *,
+    limit: int = 50,
+    conn: Any = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """The owner's pending rows for ONE sector: filter first, LIMIT last (P4).
+
+    ``list_requests`` reads the owner's newest rows globally, so a burst of
+    records elsewhere would push this sector's old gap out of any window
+    before the caller ever got to filter (codex p4 r1 #2). The sector and
+    pending-status filters therefore live in the WHERE clause here; matching
+    by ``sector_workspace_id`` catches rows that only recorded the workspace.
+    Returns ``(rows, total)`` where ``total`` counts every matching pending
+    row, so the UI can say "仅显示前 N 条" when the LIMIT bit.
+    """
+    params: list[Any] = [
+        str(owner_user_id or "").strip(),
+        _uuid_or_none(sector_unit_id, "sector_unit_id"),
+        _uuid_or_none(sector_workspace_id, "sector_workspace_id"),
+    ]
+    where = """
+        owner_user_id = %s
+        AND status IN ('gap', 'open', 'dispatched')
+        AND (sector_unit_id = %s::uuid OR sector_workspace_id = %s::uuid)
+    """
+    async with get_db_connection(conn) as c:
+        async with c.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                SELECT COUNT(*) AS cnt
+                FROM dalton_cross_unit_requests
+                WHERE {where}
+                """,
+                tuple(params),
+            )
+            cnt_row = await cur.fetchone()
+            await cur.execute(
+                f"""
+                SELECT {_REQ_COLS}
+                FROM dalton_cross_unit_requests
+                WHERE {where}
+                ORDER BY created_at DESC, request_id DESC
+                LIMIT %s
+                """,
+                (*params, max(1, min(int(limit), 200))),
+            )
+            rows = [dict(r) for r in await cur.fetchall()]
+    return rows, int((cnt_row or {}).get("cnt") or 0)
+
+
 async def list_linkage_retry_batch(
     owner_user_id: str,
     *,

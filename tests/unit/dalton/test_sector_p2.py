@@ -2868,12 +2868,18 @@ class _Lease:
 
 
 def _install_board(monkeypatch: pytest.MonkeyPatch, cur: Any) -> None:
-    """每次 get_db_connection() 租出一条新连接（同一 cursor 数据面）。"""
+    """每次 get_db_connection() 租出一条新连接（同一 cursor 数据面）。
+
+    P4 起 units 视图的枚举在 units_view 模块里执行（board 委托），连接
+    替身需要同时挂在两个命名空间上，断言不变。
+    """
     import src.dalton.autonomy.board as board_mod
+    import src.dalton.autonomy.units_view as units_view_mod
 
     monkeypatch.setattr(board_mod, "get_budget_today", lambda **kw: {"cap_usd": 10.0, "spent_usd": 1.0})
     monkeypatch.setattr(board_mod, "get_user_coverage", lambda uid: {})
     monkeypatch.setattr(board_mod, "get_db_connection", lambda: _Lease(cur))
+    monkeypatch.setattr(units_view_mod, "get_db_connection", lambda: _Lease(cur))
 
 
 _U1 = USER
