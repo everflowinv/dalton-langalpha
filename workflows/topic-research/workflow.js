@@ -7,11 +7,18 @@ const { topic, slug, horizon, workspace_dir: W, as_of: D } = args
 const related = args.related_tickers || []
 const dateTag = D || 'latest'
 const topicSlug = slug || 'topic'
+// 行业分支（sector layer P1）：行业工作区由 Home 以 subject_kind=sector 启动；
+// 不传或传 company 时与既有公司工作区路径完全一致。
+const isSector = args.subject_kind === 'sector'
 const R = `${W}/research/${dateTag}-topic-${topicSlug}`
 const S = '.agents/skills/dalton-topic-research'
 const base = `先读 .agents/skills/dalton-conventions/SKILL.md 与 ${S}/SKILL.md、${S}/references/principles.md；专题：「${topic}」，时间范围：${
   horizon || '优先近 30 天（6 个月以上标日期，12 个月以上仅作背景）'
-}，相关公司：${related.join(', ') || '见规划'}。基金 wiki 只读，任何阶段不回写 wiki。`
+}，相关公司：${related.join(', ') || '见规划'}。基金 wiki 只读，任何阶段不回写 wiki。${
+  isSector
+    ? '本工作区是行业工作区（绑定 sector 覆盖单元）：行业认知从 data/sector.json 与 data/thesis.json、data/drivers.json、data/agenda.json 读（没有 management/company 文档，也不得创建）；成员清单以 data/sector.json 的 members 为准，不给行业编 ticker。'
+    : ''
+}`
 
 // Keep schema nesting depth <= 4 (well within schema_max_depth=5)
 const PLAN_SCHEMA = {
@@ -401,12 +408,18 @@ if (draftOk && reviewPassed && lang2Sha === null) {
 }
 
 // 知识提案只看最终审稿结论，与中间有没有修订完全无关；修订 prompt 不写这个文件。
+// 行业工作区（isSector）产出行业知识层草案：论点/指标/议程进本工作区，
+// 对成员公司的修改走提案交回 Home（行业观点只把公司标"待复核"，不直接改公司论点）。
 let kp = null
 if (reviewPassed) {
   kp = await agent(
-    `${base} 阶段 7 知识层草案：按 PK.2 的 JSON Schema 将对相关覆盖公司（${
-      related.join(', ') || '报告涉及的覆盖公司'
-    }）的知识层修改建议（drivers、debate、lessons、agenda）写到 ${R}/knowledge-revision.json（不回写基金 wiki，不直接改 data/）。`,
+    isSector
+      ? `${base} 阶段 7 知识层草案（行业工作区）：按 PK.2 的 JSON Schema 把本行业的知识层修改建议写到 ${R}/knowledge-revision.json（不回写基金 wiki，不直接改 data/）：行业论点进 thesis（支柱/阈值/证据，不写公司目标价）、行业指标进 drivers、行业问题与验证点进 agenda，可含 debate/lessons 与 sector 文档的成员、边界修订；涉及成员公司（${
+          related.join(', ') || '见 data/sector.json 的 members'
+        }）的修改列为跨公司提案，由 Home 转交对应公司分析师，不在本工作区写 company/management。`
+      : `${base} 阶段 7 知识层草案：按 PK.2 的 JSON Schema 将对相关覆盖公司（${
+          related.join(', ') || '报告涉及的覆盖公司'
+        }）的知识层修改建议（drivers、debate、lessons、agenda）写到 ${R}/knowledge-revision.json（不回写基金 wiki，不直接改 data/）。`,
     { agentType: 'general-purpose', label: '知识层草案', phase: '独立审稿与修订', schema: OUT }
   )
 }

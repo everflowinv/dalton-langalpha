@@ -13,7 +13,7 @@ from langchain_core.tools import BaseTool, tool
 from src.dalton.auth import verify_workspace_access
 from src.dalton.database import knowledge as db_knowledge
 from src.dalton.database import verdicts as db_verdicts
-from src.dalton.knowledge.paths import DOC_KEYS
+from src.dalton.knowledge.paths import ALL_DOC_KEYS
 from src.dalton.knowledge.reconcile import apply_pending
 from src.dalton.knowledge.service import append_verdict, apply_update
 from src.server.database.pool import get_db_connection
@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 DocLiteral = Literal[
     "company",
+    "sector",
     "thesis",
     "debate",
     "drivers",
@@ -199,8 +200,9 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         config: RunnableConfig,
         tool_call_id: Annotated[str, InjectedToolCallId] = "",
     ) -> str:
-        """Change one company-knowledge document through validated operations; prefer this over editing data/*.json by hand.
+        """Change one knowledge document through validated operations; prefer this over editing data/*.json by hand.
 
+        Which docs the workspace accepts follows its coverage profile: a company workspace takes company/thesis/debate/drivers/management/lessons/agenda/models; a sector workspace (bound to a sector coverage unit) takes sector/thesis/debate/drivers/lessons/agenda/models — management and company are company-only and are refused there, and sector is refused in a company workspace. Shared docs (thesis 等) validate identically in both; 行业 thesis 不强制公司目标价等公司专属字段。
         Writing requires the caller to own the workspace or hold rw on it; external members are fully isolated — colleagues' workspaces are not visible to them at all (a 404 is an identity limit — report it, don't retry or hand-edit around it).
         Read data/<doc>.json first and pass its version as base_version (null only to create the document).
         Ops address list items by id, e.g. {"op":"append","path":"/evidence","value":{...}},
@@ -378,11 +380,11 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         *,
         config: RunnableConfig,
     ) -> str:
-        """Read company-knowledge documents or recent event verdicts for a workspace (own or colleague's visible workspace).
+        """Read knowledge documents or recent event verdicts for a workspace (own or colleague's visible workspace).
 
         Args:
             workspace_id: Target workspace UUID (defaults to current workspace in RunnableConfig).
-            doc: Document key ("company", "thesis", "debate", "drivers", "management", "lessons", "agenda", "models"), "verdicts", or "all" (default).
+            doc: Document key ("company", "sector", "thesis", "debate", "drivers", "management", "lessons", "agenda", "models"), "verdicts", or "all" (default). A sector workspace holds sector instead of company/management; asking for a doc the workspace's profile refuses returns content null — switch doc or ask in the right workspace.
             limit: Maximum number of verdicts to return when doc is "verdicts" or "all" (default 20).
 
         Returns:
@@ -409,7 +411,7 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
                 default=str,
             )
 
-        if cleaned_doc in DOC_KEYS:
+        if cleaned_doc in ALL_DOC_KEYS:
             row = await db_knowledge.latest_valid_version(target_ws_id, cleaned_doc)
             # latest_version_no is the LATEST row's number, valid or not — the
             # exact value apply_update validates base_version against. It is

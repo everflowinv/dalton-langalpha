@@ -14,19 +14,33 @@ from src.dalton.database import publications as db_publications
 from src.dalton.database import verdicts as db_verdicts
 from src.dalton.knowledge.paths import (
     AGENT_MD,
-    DOC_KEYS,
+    AGENT_SUMMARY_END,
+    AGENT_SUMMARY_START_PREFIX,
     RENDERED,
     data_path,
     history_edited_md_path,
     history_path,
     rendered_path,
 )
+from src.dalton.knowledge.profiles import (
+    PROFILE_COMPANY,
+    PROFILE_SECTOR,
+    PROFILE_SPECIFIC_DOCS,
+    SHARED_DOC_KEYS,
+    doc_keys_for_profile,
+    doc_not_allowed_message,
+    resolve_workspace_profile,
+)
 from src.dalton.knowledge.render import (
+    format_alert_lines,
     render_agent_block,
     render_document_md,
     update_agent_md_block,
 )
-from src.dalton.knowledge.service import canonical_json, write_version_files_to_backend
+from src.dalton.knowledge.service import (
+    canonical_json,
+    write_version_files_to_backend,
+)
 from src.dalton.knowledge.validate import validate_update
 from src.server.database.workspace_file import (
     get_file as db_get_file,
@@ -87,6 +101,47 @@ async def _insert_reconcile_version(
         return None
 
 
+_ALERT_LINE_PREFIX = "**提示**："
+
+
+def _block_shows_different_alerts(
+    existing_agent_md: str | None, alerts: list[str]
+) -> bool:
+    """Whether the managed block's ``提示`` line differs from ``alerts`` as
+    rendered today (codex r3 #5). Alerts are read back from the block itself —
+    the one place that knows what the agent currently SEES — so a rewrite can
+    both surface new alerts and CLEAR stale ones (e.g. a violation file the
+    user deleted). No managed block or no change → False: a workspace with
+    nothing new is never rewritten."""
+    if not existing_agent_md:
+        return False
+    in_block = False
+    current: str | None = None
+    for line in existing_agent_md.splitlines():
+        if line.startswith(AGENT_SUMMARY_START_PREFIX):
+            in_block = True
+            continue
+        if AGENT_SUMMARY_END in line:
+            break
+        if in_block and line.startswith(_ALERT_LINE_PREFIX):
+            current = line[len(_ALERT_LINE_PREFIX) :].strip()
+            break
+    return (current or "") != format_alert_lines(alerts)
+
+
+def _subject_label(latest_valid_all: dict[str, Any], profile: str) -> str:
+    """The rendering label for this workspace's docs. The company ticker when
+    the workspace IS a company; the sector name only when the workspace's
+    profile is sector — a residual sector row must never relabel a company
+    workspace (codex r1 #3)."""
+    company_doc = ((latest_valid_all.get("company") or {}).get("content")) or {}
+    ticker = str(company_doc.get("ticker") or "").upper()
+    if ticker or profile != "sector":
+        return ticker
+    sector_doc = ((latest_valid_all.get("sector") or {}).get("content")) or {}
+    return str(sector_doc.get("name") or "").strip()
+
+
 async def detect_direct_edits(
     workspace_id: str,
     user_id: str,
@@ -102,10 +157,33 @@ async def detect_direct_edits(
     - Direct edits to rendered ``<doc>.md`` are recorded with ``rendered_md_edited`` warning so
       ``apply_pending`` backs up the edited markdown to ``history/`` on the next turn.
     - Tampering or deletion of ``published/**`` files is logged and surfaced as a warning.
+
+    The scanned doc set follows the workspace's knowledge profile (P1): the
+    historic eight for a company workspace, the sector set for a sector
+    workspace. With the flag off the profile is always company — today's scan.
+    In a sector workspace, a directly written ``data/company.json`` /
+    ``data/management.json`` (docs the profile refuses) is recorded as an
+    INVALID direct-edit version with a ``doc_not_allowed_for_profile`` warning,
+    so it surfaces through the existing alert mechanism without ever becoming a
+    valid version. If the coverage identity cannot be resolved, the six SHARED
+    docs (identical in both profiles) are still scanned; only the three
+    identity-bound docs (company/management/sector) are skipped for this pass
+    (codex r2 #1) — never a company fallback.
     """
     eff_storage_owner = storage_owner_id or user_id
     if not skip_access_check and storage_owner_id is None:
         await verify_workspace_access(workspace_id, user_id)
+    profile_known = True
+    try:
+        profile = await resolve_workspace_profile(workspace_id)
+    except Exception as e:
+        logger.warning(
+            "[dalton.reconcile] coverage identity resolution failed for %s (%s); "
+            "scanning shared docs only this pass (no company fallback)",
+            workspace_id,
+            e,
+        )
+        profile, profile_known = PROFILE_COMPANY, False
     meta = await get_file_metadata_for_sync(workspace_id)
     latest_all = await db_knowledge.list_all_latest_for_workspace(
         workspace_id, valid_only=False
@@ -117,10 +195,10 @@ async def detect_direct_edits(
     recorded_versions: list[dict[str, Any]] = []
     published_alerts: list[str] = []
 
-    company_doc = ((latest_valid_all.get("company") or {}).get("content")) or {}
-    ticker = str(company_doc.get("ticker") or "").upper()
+    ticker = _subject_label(latest_valid_all, profile)
+    scan_docs = doc_keys_for_profile(profile) if profile_known else SHARED_DOC_KEYS
 
-    for doc_key in DOC_KEYS:
+    for doc_key in scan_docs:
         latest = latest_all.get(doc_key)
         latest_valid = latest_valid_all.get(doc_key)
         j_path = data_path(doc_key)
@@ -277,6 +355,82 @@ async def detect_direct_edits(
                     if md_row is not None:
                         recorded_versions.append(md_row)
 
+    # 2b. Sector profile: company-only docs are not in the scan set above, so a
+    # directly written data/company.json / data/management.json would go
+    # unnoticed. Record it as an INVALID direct-edit version carrying a
+    # doc_not_allowed_for_profile warning — the existing alert mechanism then
+    # surfaces it in agent.md, and it never becomes a valid version (codex r1 #2).
+    if profile == PROFILE_SECTOR:
+        for doc_key in ("company", "management"):
+            j_path = data_path(doc_key)
+            j_meta = meta.get(j_path)
+            if not (j_meta and j_meta.get("kind") == "file"):
+                continue
+            latest = latest_all.get(doc_key)
+            # codex r2 #3: dedup must consider the VIOLATION state, not just the
+            # content. A same-content row that is already a violation record is
+            # done; a same-content VALID row (flag-off era, or the r1 fallback
+            # bug) still needs the violation recorded — otherwise the file
+            # stays present with no alert at all.
+            latest_is_violation = latest is not None and any(
+                isinstance(w, dict) and w.get("code") == "doc_not_allowed_for_profile"
+                for w in (latest.get("warnings") or [])
+            )
+            file_row = await db_get_file(workspace_id, j_path, include_content=True)
+            raw_text = (
+                await resolve_file_text_or_none(
+                    file_row,
+                    user_id=eff_storage_owner,
+                    context=f"reconcile:{j_path}",
+                )
+                if file_row
+                else None
+            )
+            if raw_text is None:
+                continue
+            raw_sha = hashlib.sha256(raw_text.encode("utf-8")).hexdigest()
+            try:
+                parsed = json.loads(raw_text)
+                if not isinstance(parsed, dict):
+                    raise ValueError("top-level JSON value must be an object")
+                # Content comparison is canonical (not the file's bytes), so a
+                # recorded row never re-fires per turn — but ONLY when that row
+                # is itself the violation record.
+                if latest_is_violation and same_content(parsed, latest.get("content")):
+                    continue
+                content_to_store = parsed
+                _, store_sha = canonical_json(parsed)
+            except Exception:
+                content_to_store = {"_raw": raw_text[:65536]}
+                store_sha = raw_sha
+                if (
+                    latest_is_violation
+                    and latest is not None
+                    and isinstance(latest.get("content"), dict)
+                    and "_raw" in latest["content"]
+                    and latest.get("content_sha256") == raw_sha
+                ):
+                    continue
+            warning = {
+                "code": "doc_not_allowed_for_profile",
+                "path": j_path,
+                "message": doc_not_allowed_message(doc_key, "sector"),
+            }
+            new_row = await _insert_reconcile_version(
+                user_id=user_id,
+                workspace_id=workspace_id,
+                doc_key=doc_key,
+                base_version_no=latest["version_no"] if latest else None,
+                content=content_to_store,
+                content_sha256=store_sha,
+                reason="行业工作区出现不适用文档（公司专属），未按有效版本入库",
+                warnings=[warning],
+                schema_valid=False,
+                edited_path=j_path,
+            )
+            if new_row is not None:
+                recorded_versions.append(new_row)
+
     # 3. Check published/** files against dalton_publication_files
     pub_files = await db_publications.list_publication_files(workspace_id)
     for pf in pub_files:
@@ -291,23 +445,66 @@ async def detect_direct_edits(
             logger.warning("[dalton.reconcile] %s in workspace %s", msg, workspace_id)
             published_alerts.append(msg)
 
-    return {
+    result: dict[str, Any] = {
         "recorded_versions": recorded_versions,
         "published_alerts": published_alerts,
     }
+    if not profile_known:
+        result["skipped"] = "coverage-identity-unavailable"
+        result["skipped_docs"] = list(PROFILE_SPECIFIC_DOCS)
+    return result
 
 
-async def collect_workspace_alerts(workspace_id: str) -> list[str]:
-    """Derive active direct-edit and publication tampering alerts from Postgres."""
+async def collect_workspace_alerts(
+    workspace_id: str,
+    *,
+    profile: str | None = None,
+) -> list[str]:
+    """Derive active direct-edit and publication tampering alerts from Postgres.
+
+    A ``doc_not_allowed_for_profile`` violation row stays in history forever,
+    but its ALERT is active only while the offending file still exists in the
+    mirror (codex r2 #4) — deleting the file IS the fix. And the fix hint for a
+    sector workspace says so: ``knowledge_update`` on a company-only doc is
+    always refused there, so pointing at it would send the agent into a wall.
+    """
     alerts: list[str] = []
     latest_all = await db_knowledge.list_all_latest_for_workspace(
         workspace_id, valid_only=False
+    )
+    if profile is None:
+        try:
+            profile = await resolve_workspace_profile(workspace_id)
+        except Exception:
+            # Display-layer fallback only: with the identity unknown, show the
+            # historic company wording rather than guessing sector semantics.
+            profile = PROFILE_COMPANY
+    # Only a sector workspace has profile violations whose alert depends on
+    # the file still existing; a company workspace makes no extra lookup.
+    meta = (
+        await get_file_metadata_for_sync(workspace_id)
+        if profile == PROFILE_SECTOR
+        else {}
     )
     for doc_key, row in sorted(latest_all.items()):
         if row.get("source") != "direct_edit":
             continue
         v_no = row["version_no"]
         edited_path = row.get("edited_path") or data_path(doc_key)
+        is_profile_violation = any(
+            isinstance(w, dict) and w.get("code") == "doc_not_allowed_for_profile"
+            for w in (row.get("warnings") or [])
+        )
+        if is_profile_violation:
+            if profile == PROFILE_SECTOR and (meta.get(edited_path) or {}).get(
+                "kind"
+            ) == "file":
+                alerts.append(
+                    f"⚠ {edited_path} 是行业工作区不使用的公司专属文档（违规已记录 v{v_no}）；"
+                    f"修复：删除 {edited_path}（行业工作区不使用公司专属文档），"
+                    "需要记录的内容放进 sector / thesis——不要用 knowledge_update 写它（会被拒绝）"
+                )
+            continue
         if not row.get("schema_valid", True):
             first_w = (row.get("warnings") or [{}])[0]
             detail = f"{first_w.get('path', '/')}: {first_w.get('message', 'invalid')}"
@@ -346,6 +543,23 @@ async def apply_pending(
     if backend is None:
         return {"written": 0, "alerts": []}
 
+    # Codex r1 #2/#3 + r2 #1: the profile decides rendering and gates the
+    # profile-specific docs. With the identity unknown, SHARED docs (identical
+    # in both profiles) still write — under the company label, a display-only
+    # transient — while company/management/sector pending rows wait for the
+    # registry to answer; never a company fallback for them.
+    profile_known = True
+    try:
+        profile = await resolve_workspace_profile(workspace_id)
+    except Exception as e:
+        logger.warning(
+            "[dalton.reconcile] coverage identity resolution failed for %s (%s); "
+            "writing shared-doc pending versions only (no company fallback for "
+            "profile-specific docs)",
+            workspace_id,
+            e,
+        )
+        profile, profile_known = PROFILE_COMPANY, False
     latest_all = await db_knowledge.list_all_latest_for_workspace(
         workspace_id, valid_only=False
     )
@@ -353,11 +567,23 @@ async def apply_pending(
         workspace_id, valid_only=True
     )
     company_doc = ((latest_valid_all.get("company") or {}).get("content")) or {}
-    ticker = str(company_doc.get("ticker") or "").upper()
+    # A residual sector row must not relabel a company workspace's rendering —
+    # the sector content is only used when the workspace IS a sector (codex r1 #3).
+    sector_doc = (
+        ((latest_valid_all.get("sector") or {}).get("content") or {})
+        if profile == PROFILE_SECTOR
+        else {}
+    )
+    ticker = _subject_label(latest_valid_all, profile)
 
     written_count = 0
     for doc_key, row in latest_all.items():
         if row.get("files_written_at") is not None:
+            continue
+        if not profile_known and doc_key in PROFILE_SPECIFIC_DOCS:
+            # Identity-bound doc with an unknown identity: leave pending, retry
+            # next pass. Writing it could render or admit it under the wrong
+            # profile; skipping it loses nothing (the version row exists).
             continue
 
         v_no = int(row["version_no"])
@@ -414,11 +640,25 @@ async def apply_pending(
 
         else:
             # Tool / import / publish version that had files_written_at == NULL
-            await write_version_files_to_backend(workspace_id, row, backend)
+            await write_version_files_to_backend(
+                workspace_id, row, backend, profile=profile
+            )
             written_count += 1
 
-    alerts = await collect_workspace_alerts(workspace_id)
-    if written_count > 0 or alerts:
+    alerts = await collect_workspace_alerts(workspace_id, profile=profile)
+    # A sector workspace's violation alert disappears from the ledger once its
+    # file is deleted, yet the managed block still shows it — so with nothing
+    # else to write, a sector workspace reads the block to see whether it must
+    # clear a stale alert (codex r3 #5). A company workspace keeps the old
+    # path exactly: no extra read when there is nothing to write.
+    existing_agent_md: str | None = None
+    stale_alert = False
+    if written_count == 0 and not alerts and profile == PROFILE_SECTOR:
+        existing_agent_md = await backend.aread_text(AGENT_MD)
+        stale_alert = _block_shows_different_alerts(existing_agent_md, alerts)
+    if written_count > 0 or alerts or stale_alert:
+        if existing_agent_md is None:
+            existing_agent_md = await backend.aread_text(AGENT_MD)
         thesis_row = latest_valid_all.get("thesis")
         debate_row = latest_valid_all.get("debate")
         agenda_row = latest_valid_all.get("agenda")
@@ -428,6 +668,7 @@ async def apply_pending(
         block = render_agent_block(
             ticker=ticker or "COMPANY",
             company_doc=company_doc,
+            sector_doc=sector_doc or None,
             thesis_doc=(thesis_row or {}).get("content"),
             thesis_version_no=(thesis_row or {}).get("version_no"),
             debate_doc=(debate_row or {}).get("content"),
@@ -436,11 +677,14 @@ async def apply_pending(
             last_verdict=last_verdict,
             alerts=alerts,
         )
-        existing_agent_md = await backend.aread_text(AGENT_MD)
         new_agent_md = update_agent_md_block(existing_agent_md, block)
         await backend.awrite_text(AGENT_MD, new_agent_md)
 
-    return {"written": written_count, "alerts": alerts}
+    result: dict[str, Any] = {"written": written_count, "alerts": alerts}
+    if not profile_known:
+        result["skipped"] = "coverage-identity-unavailable"
+        result["skipped_docs"] = list(PROFILE_SPECIFIC_DOCS)
+    return result
 
 
 from langchain.agents.middleware import AgentMiddleware  # noqa: E402

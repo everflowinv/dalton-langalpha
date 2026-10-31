@@ -15,6 +15,22 @@ DOC_KEYS: tuple[str, ...] = (
     "models",
 )
 
+# Sector layer P1: a workspace bound to a sector coverage unit runs the sector
+# profile instead (knowledge/profiles.py). DOC_KEYS stays the company set — the
+# company path must not change with the flag off.
+SECTOR_DOC_KEYS: tuple[str, ...] = (
+    "sector",
+    "thesis",
+    "debate",
+    "drivers",
+    "lessons",
+    "agenda",
+    "models",
+)
+
+# Path-validity union: every doc key any profile accepts (data/history paths).
+ALL_DOC_KEYS: tuple[str, ...] = (*DOC_KEYS, "sector")
+
 DATA_DIR = "data"
 HISTORY_DIR = "history"
 PUBLISHED_DIR = "published"
@@ -30,6 +46,7 @@ RENDERED: dict[str, str] = {
     "management": "management.md",
     "lessons": "lessons.md",
     "agenda": "agenda.md",
+    "sector": "sector.md",
 }
 
 VERDICTS_MD = "verdicts.md"
@@ -51,7 +68,7 @@ WATCHED_GLOBS: tuple[str, ...] = (
 
 def data_path(doc_key: str) -> str:
     """Return workspace-relative path for a knowledge JSON document."""
-    if doc_key not in DOC_KEYS:
+    if doc_key not in ALL_DOC_KEYS:
         raise ValueError(f"Unknown knowledge doc_key: {doc_key!r}")
     return f"{DATA_DIR}/{doc_key}.json"
 
@@ -71,7 +88,7 @@ def _format_utc_stamp(at: datetime) -> str:
 
 def history_path(doc_key: str, version_no: int, at: datetime) -> str:
     """Return workspace-relative history snapshot path for a knowledge document."""
-    if doc_key not in DOC_KEYS:
+    if doc_key not in ALL_DOC_KEYS:
         raise ValueError(f"Unknown knowledge doc_key: {doc_key!r}")
     stamp = _format_utc_stamp(at)
     return f"{HISTORY_DIR}/{doc_key}/{stamp}-v{version_no:04d}.json"

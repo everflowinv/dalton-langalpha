@@ -1,0 +1,29 @@
+{{ header_comment }}
+
+# {{ doc.name }}（{{ doc.name_zh or "行业覆盖单元" }}）
+
+- **覆盖形态**：`{{ doc.kind or "sector" }}` ｜ **覆盖阶段**：{{ doc.coverage_stage }}
+- **一句话判断**：{{ doc.one_liner }}
+{% if doc.unit_id %}- **覆盖单元**：`{{ doc.unit_id }}`
+{% endif %}{% if doc.covered_since %}- **开始覆盖**：{{ doc.covered_since }}
+{% endif %}
+## 定义与研究边界
+
+- **定义**：{{ doc.definition }}
+{% if doc.boundaries %}- **边界**：{{ doc.boundaries }}
+{% endif %}{% if doc.scope %}- **地区/市场范围**：{{ doc.scope.regions | join("、") if doc.scope.regions else "—" }} ｜ {{ doc.scope.markets | join("、") if doc.scope.markets else "—" }}
+{% endif %}{% if doc.research_tz %}- **研究时区**：{{ doc.research_tz }}
+{% endif %}{% if doc.wiki_slug %}- **Wiki 标识**：`wiki/sectors/{{ doc.wiki_slug }}`（只读映射）
+{% endif %}
+{% if doc.value_chain %}## 产业链
+
+{% for stage in doc.value_chain %}- {{ stage.stage }}{% if stage.note %}：{{ stage.note }}{% endif %}
+{% endfor %}{% endif %}
+## 成员公司清单（{{ doc.members | length if doc.members else 0 }}）
+
+> 本清单是唯一权威来源；登记成员不自动创建公司工作区。
+
+| ID | 公司 | Ticker | 公司单元 | 已建工作区 | 登记时间 |
+|---|---|---|---|---|---|
+{% for m in doc.members or [] %}| **{{ m.id }}** | {{ m.name }} | {{ m.ticker or "—" }} | {{ m.unit_id or "—" }} | {{ "是" if m.workspace_created else "否" }} | {{ m.added_at }} |
+{% endfor %}

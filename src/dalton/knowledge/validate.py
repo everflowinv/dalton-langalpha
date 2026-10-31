@@ -19,6 +19,7 @@ SCHEMAS_DIR = Path(__file__).resolve().parent / "schemas"
 SCHEMA_NAMES: tuple[str, ...] = (
     "common",
     "company",
+    "sector",
     "thesis",
     "debate",
     "drivers",
@@ -91,7 +92,13 @@ def _load_schemas_and_registry() -> tuple[dict[str, dict[str, Any]], Registry]:
 
 
 def check_all_schemas() -> dict[str, str]:
-    """Validate all 10 JSON Schemas against Draft 2020-12 and return name -> $id."""
+    """Validate every knowledge JSON Schema against Draft 2020-12 and return name -> $id.
+
+    Includes the sector profile's ``sector`` schema (sector layer P1); the
+    shared docs (thesis/debate/drivers/lessons/agenda/models/verdict) validate
+    identically in both profiles — which doc set a workspace accepts is decided
+    by ``knowledge/profiles.py``, never by relaxing these schemas.
+    """
     schemas, _ = _load_schemas_and_registry()
     return {name: s["$id"] for name, s in schemas.items()}
 
@@ -141,6 +148,30 @@ def validate_schema(schema_name: str, instance: Any) -> list[dict[str, Any]]:
                         ),
                     }
                 )
+    if schema_name == "sector" and isinstance(instance, dict):
+        # Codex r1 #4: duplicate member ids break the id-addressed op semantics
+        # (`/members/M1/...` would hit whichever item sorts first) — reject in
+        # every write path (tool update AND direct-edit reconcile).
+        members = instance.get("members")
+        if isinstance(members, list):
+            seen_member_ids: set[str] = set()
+            for idx, m in enumerate(members):
+                if not isinstance(m, dict) or not m.get("id"):
+                    continue
+                mid = str(m["id"])
+                if mid in seen_member_ids:
+                    errors.append(
+                        {
+                            "code": "duplicate_member_id",
+                            "path": f"/members/{idx}/id",
+                            "message": (
+                                f"成员 id {mid!r} 出现多于一次；成员按 id 寻址，"
+                                "id 必须全表唯一"
+                            ),
+                        }
+                    )
+                else:
+                    seen_member_ids.add(mid)
     if schema_name == "agenda" and isinstance(instance, dict):
         # `format: date-time` 没有注册 rfc3339-validator，FormatChecker 直接放
         # 行，schema 的 pattern 只挡形状——"2026-10-28T25:00:00-04:00" 这类

@@ -139,10 +139,12 @@ def _sample_thesis_doc() -> dict[str, Any]:
     }
 
 
-def test_all_10_schemas_valid_draft_2020_12() -> None:
+def test_all_11_schemas_valid_draft_2020_12() -> None:
+    # 11 = 原 10 份 + sector profile 的 sector.schema.json（sector layer P1）。
     schema_ids = check_all_schemas()
     assert set(schema_ids.keys()) == set(SCHEMA_NAMES)
-    assert len(schema_ids) == 10
+    assert len(schema_ids) == 11
+    assert "sector" in schema_ids
     for name, uri in schema_ids.items():
         assert uri == f"https://dalton.local/schemas/{name}"
 
@@ -492,7 +494,12 @@ def test_migrated_4_companies_pass_all_schemas_and_debate_coverage() -> None:
         d_ids = [d["id"] for d in debate_payload["debates"]]
         assert d_ids == [f"D{i}" for i in range(1, exp_d + 1)]
 
-        for doc_key, md_rel in RENDERED.items():
+        # 公司工作区只渲染公司 profile 的文档（RENDERED 另含行业 profile 的
+        # sector.md，公司工作区没有 sector 文档，自然不渲染它）。
+        for doc_key in DOC_KEYS:
+            md_rel = RENDERED.get(doc_key)
+            if md_rel is None:
+                continue
             assert (c_dir / md_rel).exists(), f"Missing rendered {ticker}/{md_rel}"
         assert (c_dir / "agent.md").exists()
         assert (c_dir / "verdicts.md").exists()

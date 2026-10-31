@@ -90,6 +90,7 @@ ALLOWED_HOOKS=(
   "workflow-resume"
   "workflow-journal"
   "workflow-as-of-default"
+  "workflow-subject-kind"
   "subagent-model-pin"
   "html-md-canonical"
   "hermetic-prebuilt-workflows"

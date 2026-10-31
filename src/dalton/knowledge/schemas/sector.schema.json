@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema", "$id": "https://dalton.local/schemas/sector",
+  "type": "object", "additionalProperties": false,
+  "description": "行业覆盖单元画像（sector layer P1）。单元可承载行业、主题或产业链；一个覆盖单元对应一个工作区，本文档是成员公司清单的唯一权威来源（P2 的关联表届时作为它的投影）。成员只登记身份，不自动创建公司工作区。",
+  "properties": {
+    "schema_version": {"const": 1},
+    "unit_id": {"type": "string", "description": "对应 dalton_coverage_units.unit_id；绑定关系以注册表为准，此处仅作引用"},
+    "kind": {"enum": ["sector", "theme", "value_chain"], "description": "覆盖形态：行业 / 主题 / 产业链（同一套知识模型）"},
+    "name": {"type": "string", "description": "英文名或通用名，如 AI Infrastructure"},
+    "name_zh": {"type": "string"},
+    "definition": {"type": "string", "description": "研究对象定义：这个单元覆盖什么"},
+    "boundaries": {"type": "string", "description": "研究边界：明确纳入与排除的范围，防止与相邻单元重叠漂移"},
+    "scope": {"type": "object", "additionalProperties": false,
+      "properties": {"regions": {"type": "array", "items": {"type": "string"}, "description": "如 全球 / 美国 / 中国"},
+                     "markets": {"type": "array", "items": {"type": "string"}, "description": "如 US equities / A股 / 港股"}},
+      "required": ["regions", "markets"]},
+    "value_chain": {"type": "array", "description": "产业链环节，按上下游顺序",
+      "items": {"type": "object", "additionalProperties": false,
+        "properties": {"stage": {"type": "string"}, "note": {"type": "string"}},
+        "required": ["stage"]}},
+    "wiki_slug": {"type": "string", "description": "共享 wiki 的行业目录标识（wiki/sectors/<slug>，只读映射，不得当作研究身份）"},
+    "research_tz": {"type": "string", "description": "IANA 时区（如 America/New_York）；P1 只保存，不参与到期计算——按它做议程调度属后续阶段"},
+    "coverage_stage": {"enum": ["onboarding", "initial", "full", "maintenance", "paused"]},
+    "members": {"type": "array", "description": "成员公司清单，唯一权威来源；登记不等于覆盖，是否已建公司工作区看 workspace_created",
+      "items": {"type": "object", "additionalProperties": false,
+        "properties": {
+          "id": {"type": "string", "pattern": "^M\\d+$"},
+          "name": {"type": "string"},
+          "ticker": {"type": "string", "pattern": "^[A-Z0-9.]{1,12}$", "description": "可选；没有就省略，不得为行业编造伪 ticker"},
+          "unit_id": {"type": "string", "description": "可选；成员已登记公司覆盖单元时填其 unit_id"},
+          "workspace_created": {"type": "boolean", "description": "是否已为该公司建公司工作区（登记成员不自动建）"},
+          "note": {"type": "string"},
+          "added_at": {"$ref": "common#/$defs/isoTime"}
+        },
+        "required": ["id", "name", "workspace_created", "added_at"]}},
+    "one_liner": {"type": "string", "maxLength": 200},
+    "covered_since": {"$ref": "common#/$defs/isoDate"}
+  },
+  "required": ["schema_version", "name", "definition", "coverage_stage", "one_liner"]
+}

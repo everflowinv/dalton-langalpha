@@ -10,7 +10,9 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ## 0. 启动工作流（第一步必读）
 
-> **运行工作区约束**：本工作流固定在具体的**公司工作区**内由该公司分析师（`analyst`）执行（完成契约要求更新公司知识层并由仅对 `analyst` 开放的 `dalton-reviewer` 审稿）。若当前在 **Home** 工作区（研究总监 `chief_of_staff`），选定与本专题最相关的核心覆盖公司工作区，调用 `delegate_to_analyst(question=..., workspace_id=..., report_back=True)` 交由该公司分析师在公司工作区执行本技能。
+> **运行工作区约束**：本工作流固定在具体的**公司工作区或行业工作区**内由该工作区的分析师（`analyst`）执行（完成契约要求更新所在工作区的知识层并由仅对 `analyst` 开放的 `dalton-reviewer` 审稿）。若当前在 **Home** 工作区（研究总监 `chief_of_staff`）：公司专题选定最相关的核心覆盖公司工作区，行业/主题/产业链专题选定绑定了 sector 覆盖单元的行业工作区（没有则先登记并初始化），调用 `delegate_to_analyst(question=..., workspace_id=..., report_back=True)` 交由该分析师在工作区执行本技能。
+>
+> **`subject_kind` 由工作区覆盖身份决定，不信任调用方**：启动时 RunWorkflow 按 P0 覆盖身份自动补齐（行业工作区=sector，公司工作区=company），与身份冲突的取值会被直接拒绝（不会静默纠正）。行业工作区**可以不传** `subject_kind`；完成检查 `dalton_check_done` 同样按工作区身份核对行业产物（行业分支加查 thesis/agenda/drivers），不读参数里的 `subject_kind`。
 
 ### 开始前：检查未完成的 run（中断续跑）
 
@@ -39,6 +41,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
            "workspace_dir": "<当前工作区路径>",
            "related_tickers": ["<TICKER1>", "<TICKER2>"],
            "core_questions": ["<Q1>", "<Q2>", "..."],
+           "subject_kind": "<可省略：RunWorkflow 按工作区覆盖身份自动补齐 sector/company；传了就必须与身份一致，冲突会被拒绝>",
            "progress_path": "research/<D>-topic-<slug>/.progress.json"
        }
    )
@@ -54,7 +57,8 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 ## 1. Phase 0 — 研究规划（Research Planning，产出 `research/<D>-topic-<slug>/plan.md`）
 
 1. **先读现有知识层与基金 Wiki（只读）**：
-   - 先读当前公司工作区的 `thesis.md`、`debate.md`、`drivers.md`、`management.md`、`lessons.md`；若涉及其他覆盖公司，跨目录读取 `../<TICKER>/thesis.md` 与 `drivers.md`。
+   - 公司工作区：先读当前工作区的 `thesis.md`、`debate.md`、`drivers.md`、`management.md`、`lessons.md`；若涉及其他覆盖公司，跨目录读取 `../<TICKER>/thesis.md` 与 `drivers.md`。
+   - 行业工作区（`subject_kind=sector`）：先读 `sector.md`（定义、边界与成员清单）、`thesis.md`、`debate.md`、`drivers.md`、`lessons.md`、`agenda.md`；涉及成员公司时按 `.agents/skills/dalton-knowledge/SKILL.md` 的读序跨目录读其公司知识（只读，修改走提案）。
    - 用 `researchdata.research(route="company-wiki", operation="search", query="<专题关键词>")` 或 `researchdata.research(route="company-wiki", operation="list", params={"company": "<TICKER>"})`（或只读文件检索）查阅共享基金百科 `wiki/` 中已有的行业/技术/供应链条目（**wiki 默认只读，不自动写回 `wiki/`；只有用户明确要求入库〔"入库/存一下/加到 wiki"〕时，按入库流程用 `ingest_company_wiki`**）。
 2. **拆解 3–6 个信息集群（Clusters）并写入 `research/<D>-topic-<slug>/plan.md`**：
    - 参考 [references/clusters-investment.md](references/clusters-investment.md)。
@@ -136,15 +140,16 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ## 7. Phase 7 — 知识层回写与收盘三步（Knowledge Layer Update & Handoff，workflow 结束后主智能体必做）
 
-1. **更新当前公司知识层**：
-   - 读取 `research/<D>-topic-<slug>/knowledge-revision.json`，将专题沉淀的结构性变化通过 `knowledge_update` 写入当前公司工作区的 `drivers` 或 `debate`。
+1. **更新当前工作区知识层**：
+   - 公司工作区：读取 `research/<D>-topic-<slug>/knowledge-revision.json`，将专题沉淀的结构性变化通过 `knowledge_update` 写入当前公司工作区的 `drivers` 或 `debate`。
+   - 行业工作区（`subject_kind=sector`）：将行业论点（支柱/阈值/证据，`thesis`，不写公司目标价）、行业指标（`drivers`）、行业问题与验证点（`agenda`）写入本工作区；可一并修订 `sector`（成员、边界）与 `debate`/`lessons`。完成契约会加查 `thesis` 与 `agenda` 的 source=tool 新版本，缺了会被 `dalton_check_done` 拦下。
    - 若专题揭示了可复用的研究规律或踩坑教训，写入 `lessons`（必须带 `applies_when` 与 `scope`：单公司或行业级）。
-   - 调用 `knowledge_append_verdict`（`trigger.kind="agenda"`）记录本次专题对 thesis 的结论，并通过 `agenda_ops` 关闭已完成的议程项、登记新发现的跟踪项。
-2. **跨公司更新走提案机制**：
-   - 若专题结论涉及其他覆盖公司，**不直接跨目录修改其他公司的 `data/*.json`**，在 `knowledge-revision.json` 中列出跨公司修改提案，并通过 `agenda_ops` 写入 `pm_handoffs`（或由 Home 研究总监通过 `delegate_to_analyst` / `dalton_agenda_note` 分发给对应公司分析师）。
+   - 调用 `knowledge_append_verdict`（`trigger.kind="agenda"`）记录本次专题对 thesis 的结论（行业工作区同样沿用五词结论），并通过 `agenda_ops` 关闭已完成的议程项、登记新发现的跟踪项。
+2. **跨工作区更新走提案机制**：
+   - 若专题结论涉及其他覆盖公司或行业工作区的成员公司，**不直接跨目录修改其他工作区的 `data/*.json`**，在 `knowledge-revision.json` 中列出跨公司修改提案，并通过 `agenda_ops` 写入 `pm_handoffs`（或由 Home 研究总监通过 `delegate_to_analyst` / `dalton_agenda_note` 分发给对应公司分析师）。行业观点只把成员公司标"待复核"，不自动改公司论点。
 3. **基金 Wiki 默认只读，按需两步入库**：`wiki/` 目录默认只读，不自动写回；只有用户明确要求入库（"入库/存一下/加到 wiki"）时，按两步入库流程调用 `ingest_company_wiki`（先 `confirm=False` 预览并由用户确认，再 `confirm=True` 正式写入；卖方材料不进 wiki）。
 4. **汇报完成前必须过完成契约（`dalton_check_done`）**：
-   - 调用 `dalton_check_done(workflow="topic-research", run_id=<`research/<D>-topic-<slug>/.progress.json` 里的 run_id>, params={"topic": "<专题名称>", "slug": "<kebab-case-slug>", "workspace_dir": "<当前工作区路径>", "as_of": "<D>"})`（与启动时的参数一致；未传 `as_of` 时用 `as_of="latest"`）；
+   - 调用 `dalton_check_done(workflow="topic-research", run_id=<`research/<D>-topic-<slug>/.progress.json` 里的 run_id>, params={"topic": "<专题名称>", "slug": "<kebab-case-slug>", "workspace_dir": "<当前工作区路径>", "as_of": "<D>"})`（与启动时的参数一致；行业产物按**工作区覆盖身份**核对——行业工作区加查 thesis/agenda/drivers 的本轮 source=tool 新版本，与 params 里是否带 subject_kind 无关，带了冲突值会被拒绝；未传 `as_of` 时用 `as_of="latest"`）；
    - 走手动降级路径（`workflow.enabled` 已关闭、没有 run）时不传 `run_id`，调用 `dalton_check_done(workflow="topic-research", params={"topic": "<专题名称>", "slug": "<kebab-case-slug>", "workspace_dir": "<当前工作区路径>", "as_of": "<D>", "manual": true})`，审稿结论按 `research/<D>-topic-<slug>/review.json` 核对；
    - `done=false` 时按 `missing` 先补齐再查（缺文件补文件、`validate_topic.py` 修到通过、知识层缺 source=tool 新版本就 `knowledge_update`），补不了的缺项只能汇报"未完成"并列出缺项与原因，不得汇报"完成"。
 5. **发布归档**（完成契约通过后）：当 `dalton-reviewer` 返回 `pass` 且 PM 要求正式发布时，先运行 `check_draft(draft_path="drafts/<D>-topic-<slug>.md")`，再调用 `publish_report(draft_path="drafts/<D>-topic-<slug>.md", title="<专题名称>", kind="topic", slug="<slug>", updates_thesis=False)`。
