@@ -30,7 +30,7 @@ from src.dalton.autonomy.tracking import (
 )
 from src.dalton.database import plans as plans_db
 from src.dalton.database import watch as watch_db
-from src.dalton.settings import get_dalton_settings
+from src.dalton.settings import get_dalton_settings, is_coverage_units_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +149,18 @@ def _render_daily_plan_markdown(
     return "\n".join(lines) + "\n"
 
 
+class _InputRefused(ValueError):
+    """A cross-unit request's association failed validation (codex r1 #11).
+
+    Distinct from a plain ValueError so the tool layer can return the specific
+    error code instead of a generic invalid_input.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 def build_director_tools(
     *,
     role: str = "chief_of_staff",
@@ -164,6 +176,9 @@ def build_director_tools(
 
         Returns:
             JSON string with `date`, `tz`, `budget`, `companies`, `candidates`, and `est_cost_by_kind`.
+            When `coverage_units.enabled` is on it ALSO carries `units`: every registered coverage
+            unit (sector and company) with `readable` / `delegatable` / `auto_tracked` flags, sector
+            members and each member's `workspace_created`; `companies` keeps its exact shape either way.
         """
         configurable = (config or {}).get("configurable") or {}
         user_id = str(configurable.get("user_id") or "").strip()
@@ -273,6 +288,286 @@ def build_director_tools(
             ensure_ascii=False,
             default=str,
         )
+
+    @tool("dalton_cross_unit_request")
+    async def dalton_cross_unit_request(
+        action: str,
+        request_id: str | None = None,
+        question: str | None = None,
+        sector_workspace_id: str | None = None,
+        sector_unit_id: str | None = None,
+        target_workspace_id: str | None = None,
+        evidence_needed: list[str] | None = None,
+        completion_condition: str | None = None,
+        status: str | None = None,
+        dispatch_thread_id: str | None = None,
+        result: list[dict[str, Any]] | None = None,
+        limit: int = 20,
+        cursor: list[str] | None = None,
+        config: RunnableConfig = None,
+    ) -> str:
+        """Track cross-layer research requests between a sector workspace and company workspaces (P2).
+
+        The sector analyst reports a structured evidence request (target unit, question, evidence
+        needed, completion condition); you persist it here (`action="create"`), dispatch it to the
+        company analyst with `delegate_to_analyst(report_back=True)` yourself, record the dispatch
+        (`action="update"`, `status="dispatched"`, `dispatch_thread_id=...`), and when the report
+        comes back record the outcome (`status="fulfilled"`, `result=[{...}]` with completion state,
+        knowledge doc versions, artifact refs) before handing the result to the sector thread.
+        A dispatch that fails, is stopped, or lacks permission becomes `status="gap"` and STAYS
+        visible as a deficiency until re-dispatched or cancelled — never silently dropped.
+        `action="retry"` re-fires YOUR pending linkage gaps (`kind="linkage_retry"`, auto-recorded
+        when a cross-unit linkage could not be written to the target agenda). Retries run from this
+        Home thread with backend=None; the target's next turn start applies the pending agenda file,
+        so there is no conflict with its own end-of-turn reconcile. On update the MERGED
+        target/thread/status is validated, not just the newly passed fields. Dispatching still goes
+        through `delegate_to_analyst`; this tool only persists the dependency. Association ownership
+        is validated: `sector_unit_id` must be your own or a readable sector unit; `target_workspace_id`
+        a workspace you may delegate to; and `dispatch_thread_id` a thread that actually belongs to
+        that target workspace.
+
+        Args:
+            action: `"create"` | `"list"` | `"update"` | `"retry"`.
+            limit: Batch size for `"retry"` (oldest gaps first; the response reports `remaining`).
+            cursor: Keyset cursor for `"retry"` paging — pass the previous call's `next_cursor`
+                (a `[created_at, request_id]` pair) so rows that stay `skipped_no_access` don't block
+                later recoverable ones; omit it to start from the oldest gap.
+            request_id: Request UUID (required for `"update"`).
+            question: The research question to answer (required for `"create"`).
+            sector_workspace_id: Reporting sector workspace UUID.
+            sector_unit_id: Reporting sector coverage unit UUID (must be yours or readable).
+            target_workspace_id: Company workspace the request is dispatched to (must be delegatable).
+            evidence_needed: Evidence items the company should collect (list of strings).
+            completion_condition: What counts as done.
+            status: `"open"` | `"dispatched"` | `"fulfilled"` | `"gap"` | `"cancelled"`.
+            dispatch_thread_id: The delegate_to_analyst thread id (required when marking dispatched, unless already set; must belong to the target workspace).
+            result: Report outcome entries: completion state, knowledge doc + version refs, artifact refs.
+
+        Returns:
+            JSON object with `ok` and the created/updated/listed request rows.
+        """
+        configurable = (config or {}).get("configurable") or {}
+        user_id = str(configurable.get("user_id") or "").strip()
+        if not user_id:
+            raise ValueError("user_id is required")
+
+        from src.dalton.database import coverage_units as cu_db
+        from src.dalton.database import cross_unit_requests as cur_db
+
+        async def _verify_sector_unit(raw_unit_id: str) -> None:
+            """codex r1 #11：sector_unit_id 必须是本人的，或其工作区可读的 sector 单元。"""
+            clean = str(raw_unit_id or "").strip()
+            if not clean:
+                return
+            unit = await cu_db.get_coverage_unit(clean)
+            if unit is None or str(unit.get("kind") or "") != "sector":
+                raise _InputRefused(
+                    "invalid_sector_unit",
+                    f"sector_unit_id={clean} 不是已登记的 sector 覆盖单元。",
+                )
+            if str(unit.get("owner_user_id") or "") != user_id:
+                bound_ws = str(unit.get("workspace_id") or "").strip()
+                if not bound_ws:
+                    raise _InputRefused(
+                        "invalid_sector_unit",
+                        f"sector 单元 {clean} 属于他人且未绑定工作区，无法核实访问权。",
+                    )
+                await verify_workspace_access(bound_ws, user_id, need="read")
+
+        async def _verify_dispatch_thread(raw_thread_id: str, effective_target: str) -> None:
+            """codex r1 #11：dispatch_thread_id 必须是确实属于目标工作区的线程。"""
+            from src.server.database.conversation.threads_read import get_thread_by_id
+
+            thread = await get_thread_by_id(str(raw_thread_id).strip())
+            if thread is None or str(thread.get("workspace_id") or "") != str(
+                effective_target
+            ):
+                raise _InputRefused(
+                    "invalid_dispatch_thread",
+                    f"dispatch_thread_id={raw_thread_id} 不存在，或不属于目标工作区 {effective_target}。",
+                )
+
+        act = str(action or "").strip().lower()
+        try:
+            if act == "create":
+                if not str(question or "").strip():
+                    return json.dumps(
+                        {"ok": False, "error": "invalid_input",
+                         "message": "action=create 需要非空 question（结构化取证问题）。"},
+                        ensure_ascii=False,
+                    )
+                if sector_workspace_id and str(sector_workspace_id).strip():
+                    await verify_workspace_access(
+                        str(sector_workspace_id).strip(), user_id, need="read"
+                    )
+                await _verify_sector_unit(sector_unit_id or "")
+                if target_workspace_id and str(target_workspace_id).strip():
+                    # 目标必须是调用者有权委派的工作区（codex r1 #11）
+                    await verify_workspace_access(
+                        str(target_workspace_id).strip(), user_id,
+                        need="write", channel="cos",
+                    )
+                row = await cur_db.insert_request(
+                    owner_user_id=user_id,
+                    question=str(question or ""),
+                    sector_unit_id=sector_unit_id,
+                    sector_workspace_id=sector_workspace_id,
+                    target_workspace_id=target_workspace_id,
+                    evidence_needed=[
+                        {"what": str(e)} for e in (evidence_needed or []) if str(e or "").strip()
+                    ],
+                    completion_condition=completion_condition or "",
+                )
+                return json.dumps({"ok": True, "request": row}, ensure_ascii=False, default=str)
+
+            if act == "list":
+                clean_status = str(status or "").strip() or None
+                rows = await cur_db.list_requests(user_id, status=clean_status)
+                counts: dict[str, int] = {}
+                for r in rows:
+                    counts[str(r.get("status"))] = counts.get(str(r.get("status")), 0) + 1
+                return json.dumps(
+                    {"ok": True, "requests": rows, "status_counts": counts},
+                    ensure_ascii=False,
+                    default=str,
+                )
+
+            if act == "update":
+                rid = str(request_id or "").strip()
+                if not rid:
+                    return json.dumps(
+                        {"ok": False, "error": "missing_request_id",
+                         "message": "action=update 需要 request_id。"},
+                        ensure_ascii=False,
+                    )
+                existing = await cur_db.get_request(rid, user_id)
+                if existing is None:
+                    return json.dumps(
+                        {"ok": False, "error": "request_not_found",
+                         "message": f"未找到属于当前用户的跨层请求 {rid}。"},
+                        ensure_ascii=False,
+                    )
+                clean_status = str(status or "").strip() or None
+                new_target = (
+                    str(target_workspace_id).strip()
+                    if target_workspace_id and str(target_workspace_id).strip()
+                    else ""
+                )
+                new_thread = (
+                    str(dispatch_thread_id).strip()
+                    if dispatch_thread_id and str(dispatch_thread_id).strip()
+                    else ""
+                )
+                # codex r2 #5：校验【合并后的有效值】，不是只看本次传入——
+                # 保留旧行的 target/thread 时同样要过归属检查。
+                eff_target = new_target or str(existing.get("target_workspace_id") or "")
+                eff_thread = new_thread or str(existing.get("dispatch_thread_id") or "")
+                eff_status = clean_status or str(existing.get("status") or "")
+                # 仅当本次更新涉及派单关联（换目标 / 绑线程 / 标 dispatched）时
+                # 做全量校验；fulfilled/cancelled/gap 的收尾记账不因历史权限
+                # 变化被卡死。
+                touches_dispatch = bool(new_target or new_thread or clean_status == "dispatched")
+                if touches_dispatch:
+                    if eff_target:
+                        await verify_workspace_access(
+                            eff_target, user_id, need="write", channel="cos"
+                        )
+                    if eff_thread:
+                        if not eff_target:
+                            return json.dumps(
+                                {"ok": False, "error": "missing_target",
+                                 "message": "绑定 dispatch_thread_id 前必须先指定目标工作区（本次传入或请求行已有）。"},
+                                ensure_ascii=False,
+                            )
+                        await _verify_dispatch_thread(eff_thread, eff_target)
+                    if eff_status == "dispatched" and not eff_thread:
+                        return json.dumps(
+                            {"ok": False, "error": "missing_dispatch_thread",
+                             "message": "标记 dispatched 时必须同时提供 dispatch_thread_id（delegate_to_analyst 返回的线程 id）。"},
+                            ensure_ascii=False,
+                        )
+                if clean_status == "fulfilled" and not (
+                    result or (existing.get("result") or [])
+                ):
+                    return json.dumps(
+                        {"ok": False, "error": "missing_result",
+                         "message": "标记 fulfilled 时必须提供 result（完成状态、知识版本与产物引用）。"},
+                        ensure_ascii=False,
+                    )
+                # Tool-level omitted args mean "leave unchanged" — only fields
+                # the caller actually passed reach the DB layer.
+                update_kwargs: dict[str, Any] = {"status": clean_status}
+                if new_target:
+                    update_kwargs["target_workspace_id"] = new_target
+                if new_thread:
+                    update_kwargs["dispatch_thread_id"] = new_thread
+                if result:
+                    update_kwargs["result"] = [
+                        r if isinstance(r, dict) else {"note": str(r)} for r in result
+                    ]
+                row = await cur_db.update_request(rid, user_id, **update_kwargs)
+                return json.dumps({"ok": True, "request": row}, ensure_ascii=False, default=str)
+
+            if act == "retry":
+                from src.dalton.knowledge.cross_unit import retry_linkage_rows
+
+                retry_target = (
+                    str(target_workspace_id).strip()
+                    if target_workspace_id and str(target_workspace_id).strip()
+                    else None
+                )
+                try:
+                    batch_limit = max(1, min(int(limit or 20), 100))
+                except (TypeError, ValueError):
+                    batch_limit = 20
+                parsed_cursor: tuple[str, str] | None = None
+                if cursor:
+                    if not isinstance(cursor, (list, tuple)) or len(cursor) != 2:
+                        return json.dumps(
+                            {"ok": False, "error": "invalid_cursor",
+                             "message": "cursor 必须是上一次返回的 next_cursor（[created_at, request_id] 两个元素）。"},
+                            ensure_ascii=False,
+                        )
+                    parsed_cursor = (str(cursor[0]), str(cursor[1]))
+                # 从 Home 线程发起：写入目标 agenda 用 backend=None，目标工作区
+                # 下一回合开始由 apply_pending 落盘（先于它自己回合末的
+                # detect_direct_edits，不会误判为直接编辑）。
+                outcome = await retry_linkage_rows(
+                    user_id,
+                    target_workspace_id=retry_target,
+                    limit=batch_limit,
+                    cursor=parsed_cursor,
+                )
+                next_cursor = outcome.get("next_cursor")
+                return json.dumps(
+                    {
+                        "ok": True,
+                        "results": outcome.get("results"),
+                        "remaining": outcome.get("remaining"),
+                        "next_cursor": list(next_cursor) if next_cursor else None,
+                    },
+                    ensure_ascii=False,
+                    default=str,
+                )
+
+            return json.dumps(
+                {"ok": False, "error": "invalid_action",
+                 "message": f"不支持的 action `{action}`，仅支持 create、list、update、retry。"},
+                ensure_ascii=False,
+            )
+        except HTTPException:
+            raise
+        except _InputRefused as refused:
+            return json.dumps(
+                {"ok": False, "error": refused.code, "message": str(refused)},
+                ensure_ascii=False,
+            )
+        except ValueError as e:
+            return json.dumps({"ok": False, "error": "invalid_input", "message": str(e)},
+                              ensure_ascii=False)
+        except Exception as e:
+            logger.warning("[DALTON_DIRECTOR] dalton_cross_unit_request fallback: %s", e)
+            return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
 
     @tool("dalton_agenda_note")
     async def dalton_agenda_note(
@@ -1084,7 +1379,9 @@ def build_director_tools(
             )
 
     if role == "chief_of_staff":
-        return [
+        # 跨层请求台账只在覆盖单元开关开启时挂载：开关关闭时 CoS 的工具面
+        # 与 upstream 完全一致，公司路径不多一个入口。
+        cos_tools = [
             dalton_coverage_board,
             dalton_record_plan,
             dalton_agenda_note,
@@ -1094,4 +1391,7 @@ def build_director_tools(
             dalton_coverage_tracking,
             dalton_system_jobs,
         ]
+        if is_coverage_units_enabled():
+            cos_tools.insert(2, dalton_cross_unit_request)
+        return cos_tools
     return [dalton_schedule_automation, dalton_coverage_tracking, dalton_system_jobs]

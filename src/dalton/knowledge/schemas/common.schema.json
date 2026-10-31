@@ -32,6 +32,19 @@
       },
       "required": ["kind"]
     },
+    "knowledgeRef": {
+      "type": "object", "additionalProperties": false,
+      "description": "跨知识引用（行业层 P2）：指向另一覆盖单元/工作区某个知识版本里的条目。定位优先按 unit_id；目标未登记覆盖单元（如兼容规则识别的老公司工作区）时省略 unit_id，按 workspace_id 解析。带版本的引用是稳定锚点：被引方后续改版不改动本条，传播机制按版本差异判定影响",
+      "properties": {
+        "unit_id": {"type": "string", "format": "uuid", "description": "目标覆盖单元；目标未登记时省略"},
+        "workspace_id": {"type": "string", "format": "uuid"},
+        "doc_key": {"enum": ["company","sector","thesis","debate","drivers","management","lessons","agenda","models"]},
+        "version_no": {"type": "integer", "minimum": 1},
+        "entry_id": {"type": "string", "minLength": 1, "maxLength": 64, "description": "被引条目 id：支柱 P\\d+、证据 E-…/EV-…、问题 Q-\\d{3} 等"},
+        "relation": {"enum": ["supports","contradicts","assumes","derived_from"], "description": "supports=支持本条；contradicts=与本条矛盾（会通知对方生成更新候选）；assumes=采用了对方的假设/支柱（对方改版时会生成本方待复核）；derived_from=由对方推导而来"}
+      },
+      "required": ["workspace_id","doc_key","version_no","entry_id","relation"]
+    },
     "figure": {
       "type": "object", "additionalProperties": false,
       "properties": {

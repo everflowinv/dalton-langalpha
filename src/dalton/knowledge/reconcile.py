@@ -31,6 +31,7 @@ from src.dalton.knowledge.profiles import (
     doc_not_allowed_message,
     resolve_workspace_profile,
 )
+from src.dalton.settings import is_coverage_units_enabled
 from src.dalton.knowledge.render import (
     format_alert_lines,
     render_agent_block,
@@ -204,8 +205,63 @@ async def detect_direct_edits(
         j_path = data_path(doc_key)
         j_meta = meta.get(j_path)
 
+        # 行业层 P2（codex r3 #1 + r4 #1）：最新版本还没落盘
+        # （files_written_at IS NULL，联动/总监 retry 以 backend=None 写入）
+        # 时，文件必然落后于数据库——直接把哈希差当编辑会以 vN+1 为基线
+        # 覆盖待落盘版本。但也不能整轮跳过：文件若另有真实修改，跳过会让
+        # 下一回合 apply_pending 用 vN+1 覆盖掉修改（codex r4 #1）。因此只
+        # 在"文件仍 == 最近已落盘基线"（same_content 规范化比较）时跳过，
+        # 留给下一回合落盘；文件有真实修改、或没有已落盘基线时，走改动前
+        # 的原检测逻辑——记出的 direct_edit 让 apply_pending 走"不覆盖
+        # JSON"分支保住修改。渲染 md 检测本就兼容未落盘版本（下方
+        # expected_rows 会并入最近已落盘基线），两种结局下都照常执行。
+        # 开关关闭时本闸不存在，行为逐字不变。已知残余：待落盘内容与真实
+        # 修改如何"合并"成一份，属于 backlog 里"工具写入覆盖未入账直接
+        # 编辑"的通用问题，本闸只保证不新增丢失。
+        skip_json_check = False
+        if (
+            is_coverage_units_enabled()
+            and latest is not None
+            and latest.get("files_written_at") is None
+            and j_meta is not None
+            and j_meta.get("kind") == "file"
+        ):
+            baseline_row = await db_knowledge.latest_written_version(
+                workspace_id, doc_key
+            )
+            file_matches_baseline = False
+            if baseline_row is not None:
+                file_row = await db_get_file(workspace_id, j_path, include_content=True)
+                raw_text = (
+                    await resolve_file_text_or_none(
+                        file_row,
+                        user_id=eff_storage_owner,
+                        context=f"reconcile:{j_path}",
+                    )
+                    if file_row
+                    else None
+                )
+                if raw_text is not None:
+                    try:
+                        file_matches_baseline = same_content(
+                            json.loads(raw_text), baseline_row.get("content")
+                        )
+                    except Exception:
+                        file_matches_baseline = False
+            if file_matches_baseline:
+                skip_json_check = True
+                logger.debug(
+                    "[dalton.reconcile] %s in workspace %s has an unwritten latest "
+                    "version (v%s) and the file still equals the last written "
+                    "baseline (v%s); skipping direct-edit detection this pass",
+                    doc_key,
+                    workspace_id,
+                    latest.get("version_no"),
+                    baseline_row.get("version_no"),
+                )
+
         # 1. Check data/<doc>.json
-        if j_meta and j_meta.get("kind") == "file":
+        if j_meta and j_meta.get("kind") == "file" and not skip_json_check:
             mirror_sha = j_meta.get("content_hash")
             if latest is None or mirror_sha != latest.get("content_sha256"):
                 file_row = await db_get_file(workspace_id, j_path, include_content=True)
@@ -293,6 +349,38 @@ async def detect_direct_edits(
                         latest = new_row
                         if schema_valid:
                             latest_valid = new_row
+                            # 行业层 P2（codex r1 #6）：直接编辑产生的有效
+                            # thesis 版本同样触发跨单元联动——否则手改支柱/
+                            # 反证只入账不传播，下一次工具更新已以它为旧
+                            # 文档，事件永远补发不了。开关关闭零调用。
+                            if doc_key == "thesis" and is_coverage_units_enabled():
+                                try:
+                                    from src.dalton.knowledge.cross_unit import (
+                                        propagate_thesis_change,
+                                    )
+
+                                    linkage_effects = await propagate_thesis_change(
+                                        user_id=user_id,
+                                        workspace_id=workspace_id,
+                                        old_doc=old_valid_content,
+                                        new_doc=new_row.get("content"),
+                                        new_version_no=int(new_row["version_no"]),
+                                        profile=profile,
+                                    )
+                                    for effect in linkage_effects:
+                                        if effect.get("status") == "failed":
+                                            from src.dalton.knowledge.cross_unit import (
+                                                persist_failed_linkage,
+                                            )
+
+                                            await persist_failed_linkage(user_id, effect)
+                                except Exception as exc:
+                                    logger.warning(
+                                        "[dalton.reconcile] thesis linkage after direct"
+                                        " edit failed for %s: %s",
+                                        workspace_id,
+                                        exc,
+                                    )
 
         # 2. Check rendered <doc>.md
         md_rel = rendered_path(doc_key)

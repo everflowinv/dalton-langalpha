@@ -12,6 +12,7 @@ from src.dalton.autonomy.tracking import (
     _extract_ticker_from_text,
     _resolve_workspace_ticker,
 )
+from src.dalton.settings import is_coverage_units_enabled
 from src.server.database.pool import get_db_connection
 from src.server.utils.pg_sanitize import SafeJson, strip_pg_nul_str
 
@@ -210,6 +211,16 @@ async def insert_version(
                 ),
             )
             row = await cur.fetchone()
+            # Sector layer P2: the members projection is rewritten in THIS
+            # transaction — the sector document stays the only authority and
+            # the table can never disagree with a committed version. Only
+            # schema-valid versions project; a rejected or alert-only document
+            # is not the authoritative member list. A projection failure fails
+            # the whole write (fail closed) rather than leaving drift behind.
+            if doc_key == "sector" and schema_valid and is_coverage_units_enabled():
+                from src.dalton.database.sector_members import sync_members_projection
+
+                await sync_members_projection(cur, workspace_id, content, next_no)
             return _serialize_row(row)  # type: ignore[return-value]
 
 
@@ -305,6 +316,31 @@ async def latest_by_user(user_id: str, doc_key: str) -> list[dict[str, Any]]:
             )
             rows = await cur.fetchall()
             return [_serialize_row(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+async def latest_written_version(
+    workspace_id: str, doc_key: str
+) -> dict[str, Any] | None:
+    """Return the newest version whose files were actually written, valid or not.
+
+    行业层 P2（codex r4 #1）：对账判断"文件是否仍等于最近已落盘基线"时用。
+    不筛 schema_valid——文件基线是最后写进工作区的那份内容，无效的
+    direct_edit 也可能曾是基线。
+    """
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                SELECT {_KV_COLS}
+                FROM dalton_knowledge_versions
+                WHERE workspace_id = %s AND doc_key = %s
+                  AND files_written_at IS NOT NULL
+                ORDER BY version_no DESC
+                LIMIT 1
+                """,
+                (workspace_id, doc_key),
+            )
+            return _serialize_row(await cur.fetchone())
 
 
 async def latest_written_valid_version(

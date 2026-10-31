@@ -39,10 +39,19 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 成员清单维护规则：
 
-- **唯一权威来源是 `data/sector.json` 的 `members`**（P2 的行业—公司关联表届时作为它的投影）；不要在别处另抄一份名单。
-- 成员只登记 `name`（必填）、可选 `ticker` / `unit_id` / `note` 与 `workspace_created`；**登记成员不自动创建公司工作区**——由 Home 决定是否建，建好后把该成员 `workspace_created` 改为 true。
+- **唯一权威来源是 `data/sector.json` 的 `members`**（P2 的行业—公司关联表 `dalton_sector_members` 是它在同一事务内的查询投影）；不要在别处另抄一份名单。
+- 成员只登记 `name`（必填）、可选 `ticker` / `unit_id` / `note` / `scope`（关联范围，如"只计 AI 加速卡收入"）/ `reason`（为什么关联）/ `valid_until`（有效期）与 `workspace_created`；**登记成员不自动创建公司工作区**——由 Home 决定是否建，建好后把该成员 `workspace_created` 改为 true。一家公司可以出现在多个行业的成员清单里（各关系可标不同 scope），但公司知识和自动化只有一套。
 - **不得给行业编 ticker**：`ticker` 只用于确有证券代码的成员公司；行业单元本身永远没有 ticker，也不会被证券类跟踪/探针当成公司（身份由覆盖单元注册表决定，不是名字）。
 - 初始化一个行业工作区用 `.agents/skills/dalton-init-sector/`。
+
+### 跨知识引用（行业层 P2，可选字段）
+
+`thesis` 的支柱和证据条目可带 `knowledge_refs` 数组，每项指向另一覆盖单元/工作区某个知识版本里的条目：`{unit_id?, workspace_id, doc_key, version_no, entry_id, relation}`，`relation` ∈ `supports` / `contradicts` / `assumes` / `derived_from`（目标未登记覆盖单元时省略 `unit_id`）。引用是带版本的稳定锚点：被引方后续改版不改动已写的引用。规则：
+
+- **公司采用行业假设**：在公司 thesis 对应支柱的 `knowledge_refs` 记 `relation=assumes`（指向行业 thesis 的支柱 `P<n>` 与当时版本）。行业支柱改版后，本公司 agenda 会自动收到一条"待复核"（origin=sector）——**采纳与否由公司分析师显式决定**，采纳时更新该 `knowledge_refs` 指向新版本，不采纳则记录理由；待复核项不会自动改公司论点。
+- **公司证据与行业观点矛盾**：在该证据的 `knowledge_refs` 记 `relation=contradicts`（指向行业条目）。行业 agenda 会收到一条"更新候选"（origin=company）；行业分析师核验代表性与适用范围后自行决定是否更新行业结论。
+- **行业引用公司证据**：行业 thesis 证据可记 `relation=supports` / `derived_from` 指向公司证据条目；多家公司引用同一份协会数据不算多份独立证据，口径与期间照实拆。
+- 同一事件只联动一次（按 源工作区+文档+版本+条目+关系 去重）；联动只在有权限的目标上发生（同一所有者或已有共享授权）。
 
 ## 2. 按需读取顺序
 

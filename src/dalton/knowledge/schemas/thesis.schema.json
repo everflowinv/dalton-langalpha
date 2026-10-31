@@ -68,6 +68,8 @@
           "required": ["what"]},
         "model_line": {"type": "string", "description": "对应模型里的行，如 Model!Row 18 Reality Labs opex"},
         "provenance": {"enum": ["inherited","draft","approved"]},
+        "knowledge_refs": {"type": "array", "description": "跨知识引用（行业层 P2）：本公司支柱采用了哪个行业支柱的哪个版本（relation=assumes）等；行业改版时据此生成待复核",
+                           "items": {"$ref": "common#/$defs/knowledgeRef"}},
         "created_at": {"$ref": "common#/$defs/isoTime"},
         "retired_at": {"$ref": "common#/$defs/isoTime"}
       },
@@ -97,6 +99,8 @@
         "quality": {"enum": ["high","medium","low"]},
         "impact": {"type": "string"},
         "follow_up": {"type": "string"},
+        "knowledge_refs": {"type": "array", "description": "跨知识引用（行业层 P2）：本条证据与哪些行业/其他公司的条目相关——引用行业支柱记 supports/contradicts，引用行业口径记 derived_from；contradicts 会在对方议程生成更新候选",
+                           "items": {"$ref": "common#/$defs/knowledgeRef"}},
         "supersedes": {"type": "string", "pattern": "^E-\\d{8}-\\d{2,3}$"}
       },
       "required": ["id","at","source","fact","pillar_ids","signal","quality"]},

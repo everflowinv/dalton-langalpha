@@ -95,11 +95,23 @@ def build_tool_signature_registry() -> dict[str, set[str]]:
     """Collect parameter names for Dalton direct tools, `dalton_sec.*` MCP tools, and peer tools."""
     registry: dict[str, set[str]] = {}
 
-    # 1. Dalton direct tools across roles (`build_dalton_tools`, from `@tool` `args_schema`)
-    for role in ("analyst", "chief_of_staff"):
-        for t in build_dalton_tools(role):
-            fields = set(t.args_schema.model_fields.keys()) if t.args_schema else set()
-            registry.setdefault(t.name, set()).update(fields)
+    # 1. Dalton direct tools across roles (`build_dalton_tools`, from `@tool` `args_schema`).
+    # 构建时打开覆盖单元开关：技能文档合法引用的按开关挂载的工具
+    # （如 dalton_cross_unit_request）也要进入注册表，校验的是完整工具面。
+    import os
+
+    prev_flag = os.environ.get("DALTON_COVERAGE_UNITS_ENABLED")
+    os.environ["DALTON_COVERAGE_UNITS_ENABLED"] = "1"
+    try:
+        for role in ("analyst", "chief_of_staff"):
+            for t in build_dalton_tools(role):
+                fields = set(t.args_schema.model_fields.keys()) if t.args_schema else set()
+                registry.setdefault(t.name, set()).update(fields)
+    finally:
+        if prev_flag is None:
+            os.environ.pop("DALTON_COVERAGE_UNITS_ENABLED", None)
+        else:
+            os.environ["DALTON_COVERAGE_UNITS_ENABLED"] = prev_flag
 
     # 2. `dalton_sec.*` MCP tools (`@mcp.tool()` functions in `dalton_sec_mcp_server.py`, prefixed only)
     for tool_name, params in SEC_REGISTERED_TOOLS.items():
