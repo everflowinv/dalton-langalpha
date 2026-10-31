@@ -57,8 +57,13 @@ TICKER_SOURCE_AUTOMATION = "automation"
 # Ticker shapes accepted everywhere (tracking's historical convention):
 # 1-10 alnum chars plus an optional 1-4 letter market suffix (.HK, .SS, ...).
 _CLEAN_TICKER_RE = re.compile(r"^[A-Za-z0-9]{1,10}(?:\.[A-Za-z]{1,4})?$")
+# Sector automations (`dalton-sector-…`, P3) must never yield a ticker here —
+# including a slug like `earn-ai` whose task name would otherwise satisfy the
+# `earn-*` suffix and read the literal "sector" out as one. The lookahead
+# can't touch company rows: a company task name is `dalton-<ticker>-…` and no
+# ticker is the literal `sector-…` prefix (codex r2 #8).
 _TICKER_FROM_AUTO_NAME_RE = re.compile(
-    r"^dalton-([a-z0-9.]+)-(?:watch|delta|move-up|move-down|earn-.*)$"
+    r"^dalton-(?!sector-)([a-z0-9.]+)-(?:watch|delta|move-up|move-down|earn-.*)$"
 )
 
 
@@ -88,7 +93,10 @@ def ticker_from_automation_rows(
     Tracking's historical compat fallback: a row belongs to the workspace when
     its `workspace_id` matches or is empty (legacy rows), and supplies the
     ticker through `metadata.ticker` or its `dalton-<t>-*` name. Paused rows
-    count too — pausing is a user state, not an identity change.
+    count too — pausing is a user state, not an identity change. A row that
+    declares itself a sector subject (`metadata.subject_kind == "sector"` or a
+    `dalton-sector-` name, P3) never supplies a ticker: sectors have none, and
+    the name's second segment is the literal "sector" (codex r2 #8).
     """
     ws_str = str(workspace_id or "").strip()
     for r in rows or []:
@@ -96,6 +104,10 @@ def ticker_from_automation_rows(
         if row_ws and row_ws != ws_str:
             continue
         r_meta = r.get("metadata") if isinstance(r.get("metadata"), Mapping) else {}
+        if str(r_meta.get("subject_kind") or "").strip().lower() == "sector":
+            continue
+        if str(r.get("name") or "").strip().lower().startswith("dalton-sector-"):
+            continue
         if r_meta.get("ticker"):
             return str(r_meta["ticker"]).strip().upper()
         m = _TICKER_FROM_AUTO_NAME_RE.match(str(r.get("name") or "").strip().lower())

@@ -194,7 +194,7 @@ async def insert_publication(
     publish_request_id: str,
     user_id: str,
     workspace_id: str,
-    ticker: str,
+    ticker: str | None,
     kind: str,
     title: str,
     published_date: date | str,
@@ -208,8 +208,16 @@ async def insert_publication(
     approved_at: datetime | str,
     thesis_version_no: int | None = None,
     supersedes_publication_id: str | None = None,
+    subject_kind: str = "company",
+    unit_id: str | None = None,
 ) -> dict[str, Any]:
-    """Insert ``dalton_publications``, ``dalton_publication_files``, and mark request ``published`` in one transaction."""
+    """Insert ``dalton_publications``, ``dalton_publication_files``, and mark request ``published`` in one transaction.
+
+    Subject identity (d027, sector layer P3): a company row keeps its ticker;
+    a sector row passes ``ticker=None`` with ``subject_kind="sector"`` and the
+    coverage unit's id — the table's CHECK enforces the combination, so no
+    subject is ever archived under a made-up ticker.
+    """
     if isinstance(published_date, str):
         pub_date = date.fromisoformat(published_date[:10])
     else:
@@ -219,6 +227,15 @@ async def insert_publication(
         app_dt = datetime.fromisoformat(approved_at.replace("Z", "+00:00"))
     else:
         app_dt = approved_at
+
+    norm_kind = str(subject_kind or "company").strip().lower() or "company"
+    if norm_kind == "sector":
+        if ticker:
+            raise ValueError("a sector publication never carries a ticker")
+        if not unit_id or not str(unit_id).strip():
+            raise ValueError("a sector publication requires the coverage unit_id")
+    elif not ticker:
+        raise ValueError("a company publication requires a ticker")
 
     async with get_db_connection() as conn, conn.transaction():
         async with conn.cursor(row_factory=dict_row) as cur:
@@ -253,40 +270,84 @@ async def insert_publication(
             if existing is not None:
                 return _serialize_row(existing)  # type: ignore[return-value]
 
-            await cur.execute(
-                f"""
-                INSERT INTO dalton_publications (
-                    publish_request_id, user_id, workspace_id, ticker,
-                    kind, title, published_date, files, bundle_sha256,
-                    sources, audit_summary, reviewer, approver_user_id,
-                    approved_at, thesis_version_no, supersedes_publication_id
-                ) VALUES (
-                    %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s,
-                    %s, %s, %s
+            if norm_kind == "sector":
+                await cur.execute(
+                    f"""
+                    INSERT INTO dalton_publications (
+                        publish_request_id, user_id, workspace_id, ticker,
+                        kind, title, published_date, files, bundle_sha256,
+                        sources, audit_summary, reviewer, approver_user_id,
+                        approved_at, thesis_version_no, supersedes_publication_id,
+                        subject_kind, unit_id
+                    ) VALUES (
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s,
+                        %s, %s::uuid
+                    )
+                    RETURNING {_PUB_COLS}
+                    """,
+                    (
+                        publish_request_id,
+                        strip_pg_nul_str(user_id),
+                        workspace_id,
+                        None,
+                        strip_pg_nul_str(kind),
+                        strip_pg_nul_str(title),
+                        pub_date,
+                        SafeJson(files),
+                        strip_pg_nul_str(bundle_sha256),
+                        SafeJson(sources),
+                        SafeJson(audit_summary),
+                        SafeJson(reviewer),
+                        strip_pg_nul_str(approver_user_id),
+                        app_dt,
+                        thesis_version_no,
+                        supersedes_publication_id,
+                        "sector",
+                        str(unit_id).strip(),
+                    ),
                 )
-                RETURNING {_PUB_COLS}
-                """,
-                (
-                    publish_request_id,
-                    strip_pg_nul_str(user_id),
-                    workspace_id,
-                    strip_pg_nul_str(ticker),
-                    strip_pg_nul_str(kind),
-                    strip_pg_nul_str(title),
-                    pub_date,
-                    SafeJson(files),
-                    strip_pg_nul_str(bundle_sha256),
-                    SafeJson(sources),
-                    SafeJson(audit_summary),
-                    SafeJson(reviewer),
-                    strip_pg_nul_str(approver_user_id),
-                    app_dt,
-                    thesis_version_no,
-                    supersedes_publication_id,
-                ),
-            )
+            else:
+                # 公司行的 INSERT 与 upstream-main 逐字一致（codex r2 #10）：
+                # 不写新列，靠 d027 的列默认值落 subject_kind='company'。
+                # 这同时是开关关闭 / 未升级 d027 时的兼容路径——旧库没有
+                # 新列，这条 SQL 依然可用。
+                await cur.execute(
+                    f"""
+                    INSERT INTO dalton_publications (
+                        publish_request_id, user_id, workspace_id, ticker,
+                        kind, title, published_date, files, bundle_sha256,
+                        sources, audit_summary, reviewer, approver_user_id,
+                        approved_at, thesis_version_no, supersedes_publication_id
+                    ) VALUES (
+                        %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s,
+                        %s, %s, %s
+                    )
+                    RETURNING {_PUB_COLS}
+                    """,
+                    (
+                        publish_request_id,
+                        strip_pg_nul_str(user_id),
+                        workspace_id,
+                        strip_pg_nul_str(ticker) if ticker else None,
+                        strip_pg_nul_str(kind),
+                        strip_pg_nul_str(title),
+                        pub_date,
+                        SafeJson(files),
+                        strip_pg_nul_str(bundle_sha256),
+                        SafeJson(sources),
+                        SafeJson(audit_summary),
+                        SafeJson(reviewer),
+                        strip_pg_nul_str(approver_user_id),
+                        app_dt,
+                        thesis_version_no,
+                        supersedes_publication_id,
+                    ),
+                )
             pub_row = await cur.fetchone()
             assert pub_row is not None
             pub_id = str(pub_row["publication_id"])

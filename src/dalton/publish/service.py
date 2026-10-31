@@ -893,7 +893,7 @@ async def run_publish(
     if not user_id or not str(user_id).strip():
         raise ValueError("user_id is required")
     user_id = str(user_id).strip()
-    await verify_workspace_access(workspace_id, user_id)
+    ws_row = await verify_workspace_access(workspace_id, user_id)
     if backend is None:
         return {"ok": False, "message": "ERROR: filesystem backend is unavailable."}
 
@@ -951,6 +951,40 @@ async def run_publish(
     thesis_version_no = (thesis_row or {}).get("version_no")
     models_doc = (latest_map.get("models") or {}).get("content")
     company_doc = (latest_map.get("company") or {}).get("content") or {}
+
+    # 行业主体（P3）：数据库层已可容纳无 ticker 主体（d027），但正式发布的
+    # House View / 审批语义首期不开放——在这里、在用 slug 前缀伪造伪 ticker
+    # 之前明确拒绝。开关关闭时不查注册表（解析用上面已加载的文档内容，是
+    # 纯函数），公司路径与 P3 前逐字一致。
+    from src.dalton.settings import is_coverage_units_enabled
+
+    if is_coverage_units_enabled():
+        from src.dalton.coverage.identity import resolve_workspace_coverage_identity
+
+        pub_identity = await resolve_workspace_coverage_identity(
+            ws_row,
+            company_content=company_doc if isinstance(company_doc, dict) and company_doc else None,
+            thesis_content=thesis_doc if isinstance(thesis_doc, dict) else None,
+        )
+        if pub_identity.is_sector:
+            unit = pub_identity.unit or {}
+            sector_label = (
+                str(unit.get("display_name") or unit.get("slug") or "").strip()
+                or workspace_id
+            )
+            return {
+                "ok": False,
+                "status": "sector_publish_not_supported",
+                "subject_kind": "sector",
+                "unit_id": str(unit.get("unit_id") or "") or None,
+                "message": (
+                    f"工作区 {workspace_id} 是行业覆盖单元（{sector_label}）。"
+                    "行业主体的正式发布（House View 审批流）首期未开放：发布审批语义保持不变，"
+                    "行业研究请以研究纪要 / 专题报告形式留在工作区（`check_draft` 数字核验仍可用）；"
+                    "无 ticker 的行业主体行（d027）已可入库，待行业发布流程上线后启用。"
+                ),
+            }
+
     ticker = str(company_doc.get("ticker") or slug.split("-")[0]).upper()
 
     if request_id:

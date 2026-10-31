@@ -19,7 +19,7 @@
         "properties": {"stage": {"type": "string"}, "note": {"type": "string"}},
         "required": ["stage"]}},
     "wiki_slug": {"type": "string", "description": "共享 wiki 的行业目录标识（wiki/sectors/<slug>，只读映射，不得当作研究身份）"},
-    "research_tz": {"type": "string", "description": "IANA 时区（如 America/New_York）；P1 只保存，不参与到期计算——按它做议程调度属后续阶段"},
+    "research_tz": {"type": "string", "description": "IANA 时区（如 America/New_York）；P3 起决定行业议程的到期计算与时区（缺省退回用户时区），公司路径不受影响"},
     "coverage_stage": {"enum": ["onboarding", "initial", "full", "maintenance", "paused"]},
     "members": {"type": "array", "description": "成员公司清单，唯一权威来源；登记不等于覆盖，是否已建公司工作区看 workspace_created",
       "items": {"type": "object", "additionalProperties": false,

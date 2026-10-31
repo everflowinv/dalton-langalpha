@@ -47,11 +47,46 @@ async def get_watch_state(workspace_id: Optional[str]) -> dict[str, Any]:
 
 async def upsert_watch_state(
     workspace_id: Optional[str],
-    ticker: str,
+    ticker: Optional[str],
     state: dict[str, Any],
+    *,
+    subject_kind: str = "company",
+    unit_id: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Create or update watch state for a workspace (or Home sentinel)."""
+    """Create or update watch state for a workspace (or Home sentinel).
+
+    A sector coverage unit (d027, sector layer P3) passes ``ticker=None`` with
+    ``subject_kind="sector"`` and its ``unit_id`` — the row's subject identity
+    is the unit, never a made-up ticker. The company INSERT is unchanged for
+    company callers: the sector columns only enter the statement on the sector
+    branch, so no company write touches the new columns.
+    """
     ws_uuid = _resolve_ws_uuid(workspace_id)
+    kind = str(subject_kind or "company").strip().lower() or "company"
+    if kind == "sector":
+        if not unit_id or not str(unit_id).strip():
+            raise ValueError("sector watch state requires unit_id")
+        if ticker:
+            raise ValueError("sector watch state must not carry a ticker")
+        async with get_db_connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_watch_state (workspace_id, ticker, state, updated_at, unit_id, subject_kind)
+                    VALUES (%s, NULL, %s, NOW(), %s::uuid, 'sector')
+                    ON CONFLICT (workspace_id) DO UPDATE
+                    SET ticker = EXCLUDED.ticker,
+                        state = EXCLUDED.state,
+                        updated_at = NOW(),
+                        unit_id = EXCLUDED.unit_id,
+                        subject_kind = 'sector'
+                    RETURNING workspace_id, ticker, state, updated_at, unit_id, subject_kind
+                    """,
+                    (ws_uuid, Jsonb(state), str(unit_id).strip()),
+                )
+                row = await cur.fetchone()
+                return dict(row) if row else {}
+
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(

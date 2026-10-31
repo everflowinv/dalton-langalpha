@@ -26,7 +26,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 字段见 [references/sector-fields.md](references/sector-fields.md)，要点：
 
 - `name` / `name_zh` / `kind`（`sector` | `theme` | `value_chain`）/ `definition` / `boundaries`（明确纳入与排除，防止与相邻单元重叠）/ `coverage_stage: "onboarding"` / `one_liner`（≤200 字一句话）必写；
-- `scope.regions` 与 `scope.markets`、`value_chain`（产业链环节，按上下游顺序）、`wiki_slug`（共享 wiki 的行业目录，只读映射）按实际填写；`research_tz`（IANA 时区）**P1 只保存，不参与任何到期计算**——议程到期调度按它执行属于后续阶段（P3），现有 agenda 探针仍按公司/交易所规则，别为了"让时区生效"而填它；
+- `scope.regions` 与 `scope.markets`、`value_chain`（产业链环节，按上下游顺序）、`wiki_slug`（共享 wiki 的行业目录，只读映射）按实际填写；`research_tz`（IANA 时区）**P3 起参与本行业的议程到期计算**（日期按它解释，带时区偏移的时刻原样生效；未填写时退回用户时区），仅影响行业议程，公司路径仍按公司/交易所规则；
 - `members`：成员公司清单——每项 `name` 必填，`ticker` / `unit_id` 可选（没有就省略，**不得为行业或未确认的成员编造 ticker**），`scope`（关联范围，如"只计 AI 加速卡收入"）/ `reason` / `valid_until` 可选（一家公司可属多个行业，各关系标各自范围），`workspace_created` 默认 false。**登记成员不自动创建公司工作区**：是否建工作区由 Home 决定，建好后把对应成员 `workspace_created` 改 true。
 - 示例 create 值：
 

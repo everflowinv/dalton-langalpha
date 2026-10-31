@@ -12,7 +12,7 @@
 | `scope.regions` / `scope.markets` | string[]（两者同出现） | 地区 / 市场范围 |
 | `value_chain[]` | `{stage, note?}` | 产业链环节，按上下游顺序 |
 | `wiki_slug` | string | 共享 wiki 行业目录标识（只读映射，不当研究身份） |
-| `research_tz` | string | IANA 时区；**P1 只保存，不参与到期计算**（按它调度属后续阶段） |
+| `research_tz` | string | IANA 时区；P3 起参与行业议程到期计算（缺省退回用户时区），公司路径不受影响 |
 | `coverage_stage` | `onboarding`/`initial`/`full`/`maintenance`/`paused`，必填 | 覆盖阶段 |
 | `members[]` | 见下 | 成员公司清单，**唯一权威来源**（P2 关联表届时作为它的投影） |
 | `one_liner` | string ≤200，必填 | 一句话判断 |
