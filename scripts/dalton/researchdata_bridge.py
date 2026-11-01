@@ -320,14 +320,24 @@ def _error_code_from_text(err_text: str) -> str:
     return match.group(1) if match is not None else ""
 
 
-def _extract_upstream_http_status(payload: dict[str, Any], err_text: str) -> int | None:
-    """Best-effort upstream HTTP status for a failed call: an explicit
-    ``status_code``/``http_status``/``upstream_status`` int in the payload
-    (top level, ``data``, ``data.structuredContent``, or the error object),
-    else the first explicit status marker in the error text — via the shared
-    `log_redaction.http_status_from_text`, which also reads a dict the
-    upstream stringified (``'status_code': 403`` / ``"status_code": 403``).
-    None when the upstream never said one."""
+# R7 §1: the exception-repr head an upstream error text may carry
+# ("asyncio.TimeoutError: …", "RuntimeError: subprocess died"). Requiring a
+# colon keeps ordinary prose ("no Timeout was configured") from matching, so
+# this only fires on an actual ``<exception type>:`` shape.
+_EXC_TYPE_IN_TEXT_RE = re.compile(
+    r"(?<![A-Za-z0-9_.])((?:[A-Za-z_][A-Za-z0-9_]{0,32}\.){0,2}"
+    r"[A-Za-z_][A-Za-z0-9_]{0,32}(?:Error|Exception|Timeout))[:\uff1a]"
+)
+
+
+def _exc_type_from_text(err_text: str) -> str:
+    match = _EXC_TYPE_IN_TEXT_RE.search(err_text)
+    return match.group(1) if match is not None else ""
+
+
+def _payload_containers(payload: dict[str, Any]) -> list[Any]:
+    """Every dict a payload-scoped value may live in: top level, ``data``,
+    ``data.structuredContent``, and a structured ``error`` object."""
     containers: list[Any] = [payload]
     data_obj = payload.get("data")
     if isinstance(data_obj, dict):
@@ -338,6 +348,18 @@ def _extract_upstream_http_status(payload: dict[str, Any], err_text: str) -> int
     err_obj = payload.get("error")
     if isinstance(err_obj, dict):
         containers.append(err_obj)
+    return containers
+
+
+def _extract_upstream_http_status(payload: dict[str, Any], err_text: str) -> int | None:
+    """Best-effort upstream HTTP status for a failed call: an explicit
+    ``status_code``/``http_status``/``upstream_status`` int in the payload
+    (top level, ``data``, ``data.structuredContent``, or the error object),
+    else the first explicit status marker in the error text — via the shared
+    `log_redaction.http_status_from_text`, which also reads a dict the
+    upstream stringified (``'status_code': 403`` / ``"status_code": 403``).
+    None when the upstream never said one."""
+    containers = _payload_containers(payload)
     for container in containers:
         if not isinstance(container, dict):
             continue
@@ -348,6 +370,105 @@ def _extract_upstream_http_status(payload: dict[str, Any], err_text: str) -> int
             if 100 <= raw <= 599:
                 return raw
     return _log_redaction.http_status_from_text(err_text)
+
+
+#: Cache-marker keys an upstream SEC payload may declare about itself. The
+#: bridge holds no SEC cache of its own — the failure line can only echo what
+#: the upstream answered about its own cache, "-" when it says nothing.
+_SEC_CACHE_KEYS: tuple[str, ...] = ("cached", "from_cache", "cache_hit")
+
+
+def _sec_failure_context(
+    arguments: Mapping[str, Any],
+    payload: dict[str, Any] | None,
+    error_text: str,
+    *,
+    exc_type: str = "",
+) -> dict[str, str]:
+    """R7 §1: the structured context a failed SEC call must leave behind —
+    the identifiers actually asked for and answered (ticker, form, accession,
+    CIK), the upstream cache verdict when the payload declares one, and the
+    exception type (explicit from the raise site when the bridge caught one,
+    else the exception-repr head in the error text). The 10-28 window left 87
+    ``status=error`` rows with no error body, unattributable to rate-limit /
+    timeout / 5xx after the fact; these fields are what makes the next one
+    attributable. Every value runs the unified redaction chain; unknown is
+    ``"-"``."""
+    params_obj = arguments.get("params")
+    if not isinstance(params_obj, dict):
+        params_obj = {}
+
+    def _from_request(name: str) -> str:
+        raw = arguments.get(name)
+        if raw is None or raw == "":
+            raw = params_obj.get(name)
+        if raw is not None and str(raw).strip():
+            return _log_redaction.clean_log_field(str(raw), max_len=_SEC_CODE_MAX)
+        return ""
+
+    def _from_payload(name: str) -> str:
+        if payload is not None:
+            for container in _payload_containers(payload):
+                if not isinstance(container, dict):
+                    continue
+                raw = container.get(name)
+                if raw is not None and str(raw).strip():
+                    return _log_redaction.clean_log_field(str(raw), max_len=_SEC_CODE_MAX)
+        return ""
+
+    def _first(*values: str) -> str:
+        for value in values:
+            if value:
+                return value
+        return "-"
+
+    # CIK has no request-side spelling in the route contract (callers ask by
+    # ticker), so it can only come from the payload's own echo.
+    ctx = {
+        "ticker": _first(_from_request("ticker"), _from_payload("ticker")),
+        "form": _first(_from_request("form"), _from_payload("form")),
+        "accession": _first(_from_request("accession"), _from_payload("accession")),
+        "cik": _first(_from_payload("cik")),
+    }
+    cache = "-"
+    if payload is not None:
+        for container in _payload_containers(payload):
+            if not isinstance(container, dict):
+                continue
+            for key in _SEC_CACHE_KEYS:
+                if key in container:
+                    cache = "hit" if bool(container[key]) else "miss"
+                    break
+            if cache != "-":
+                break
+    ctx["cache"] = cache
+    # R7 r2 (codex #4): the exception-repr head is extracted from the
+    # already-redacted text and cleaned again — an unsanitized extraction
+    # could re-emit a secret fragment the `error=` field itself redacted
+    # (e.g. ``token=sk-…Error: rejected`` must not come back as exc_type).
+    ctx["exc_type"] = _first(
+        _log_redaction.clean_log_field(exc_type, max_len=64),
+        _log_redaction.clean_log_field(
+            _exc_type_from_text(
+                _log_redaction.clean_log_field(error_text, max_len=_SEC_ERROR_EXCERPT_MAX)
+            ),
+            max_len=64,
+        ),
+    )
+    return ctx
+
+
+def _sec_ctx_log_suffix(sec_ctx: dict[str, str]) -> tuple[str, tuple[str, ...]]:
+    """The ``sec_*`` field suffix (template + args) for a tools/call log line,
+    built from a failure context `_log_sec_call_outcome` returned (R7 §1)."""
+    return (
+        " sec_ticker=%s sec_form=%s sec_accession=%s sec_cik=%s"
+        " sec_cache=%s sec_exc_type=%s sec_upstream_status=%s",
+        tuple(
+            sec_ctx[key]
+            for key in ("ticker", "form", "accession", "cik", "cache", "exc_type", "upstream_status")
+        ),
+    )
 
 
 def _log_sec_call_outcome(
@@ -362,16 +483,16 @@ def _log_sec_call_outcome(
     error_code: str = "",
     upstream_status_hint: int | None = None,
     timeout_s: float | None = None,
-) -> None:
+    exc_type: str = "",
+) -> dict[str, str]:
     """One structured line per SEC route call — failure at WARNING, success at
     DEBUG. The correlation id ties it to the same request's other lines; a
-    payload with no upstream status logs ``-`` rather than failing."""
-    ticker = _log_redaction.clean_log_field(arguments.get("ticker") or "", max_len=32) or "-"
-    form_raw = arguments.get("form")
-    params_obj = arguments.get("params")
-    if (form_raw is None or form_raw == "") and isinstance(params_obj, dict):
-        form_raw = params_obj.get("form")
-    form = _log_redaction.clean_log_field(form_raw or "", max_len=32) or "-"
+    payload with no upstream status logs ``-`` rather than failing.
+
+    R7 §1: the failure line additionally carries `_sec_failure_context`'s
+    fields (exception type, accession, CIK, cache verdict — ticker/form/op
+    were already there), and the sanitized context is returned so the
+    request's ``tools/call`` line can repeat it; empty dict on success."""
 
     err_code = error_code
     upstream_status: int | None = upstream_status_hint
@@ -391,13 +512,15 @@ def _log_sec_call_outcome(
     if timeout_s is not None and not error_text:
         error_text = f"researchdata_bridge timed out after {timeout_s}s"
 
+    ctx = _sec_failure_context(arguments, payload, error_text, exc_type=exc_type)
     op = _log_redaction.clean_log_field(operation or "", max_len=64) or "list-filings"
+    status_field = upstream_status if upstream_status is not None else "-"
     base_args = (
         corr_id,
         op,
-        ticker,
-        form,
-        upstream_status if upstream_status is not None else "-",
+        ctx["ticker"],
+        ctx["form"],
+        status_field,
         elapsed_ms,
         stdio_attempts,
         max(0, stdio_attempts - 1),
@@ -408,14 +531,28 @@ def _log_sec_call_outcome(
             "elapsed_ms=%d attempts=%d retries=%d",
             *base_args,
         )
-        return
+        return {}
     logger.warning(
         "sec_call_failed corr=%s op=%s ticker=%s form=%s upstream_status=%s "
-        "elapsed_ms=%d attempts=%d retries=%d error_code=%s error=%s",
+        "elapsed_ms=%d attempts=%d retries=%d exc_type=%s accession=%s cik=%s "
+        "cache=%s error_code=%s error=%s",
         *base_args,
+        ctx["exc_type"],
+        ctx["accession"],
+        ctx["cik"],
+        ctx["cache"],
         _log_redaction.clean_log_field(err_code, max_len=_SEC_CODE_MAX) or "-",
         _log_redaction.clean_log_field(error_text, max_len=_SEC_ERROR_EXCERPT_MAX) or "-",
     )
+    return {
+        "ticker": ctx["ticker"],
+        "form": ctx["form"],
+        "accession": ctx["accession"],
+        "cik": ctx["cik"],
+        "cache": ctx["cache"],
+        "exc_type": ctx["exc_type"],
+        "upstream_status": str(status_field),
+    }
 
 
 def _sanitize_metadata_tree(obj: Any, *, max_str_len: int = 300) -> Any:
@@ -9539,21 +9676,19 @@ class ResearchDataBridge:
                                 elapsed_ms=int((time.monotonic() - t0) * 1000),
                                 stdio_attempts=stdio_attempts,
                                 error_text=f"{type(call_exc).__name__}: {call_exc}",
+                                exc_type=type(call_exc).__name__,
                             )
                         raise
             except asyncio.TimeoutError:
                 elapsed_ms = int((time.monotonic() - t0) * 1000)
-                logger.warning(
-                    "tools/call timeout corr=%s tool=%s route=%s op=%s timeout_s=%d elapsed_ms=%d",
-                    corr_id,
-                    tool_name,
-                    route,
-                    operation,
-                    eff_timeout,
-                    elapsed_ms,
-                )
+                # R7 r3 (codex #3): the timeout exit keeps the same SEC
+                # failure context as the normal exit — this branch returns
+                # early, so its own tools/call timeout line must carry the
+                # sec_* fields itself.
+                timeout_sec_suffix = ""
+                timeout_sec_args: tuple[str, ...] = ()
                 if route == "sec":
-                    _log_sec_call_outcome(
+                    timeout_ctx = _log_sec_call_outcome(
                         corr_id=corr_id,
                         operation=operation,
                         arguments=arguments,
@@ -9561,7 +9696,21 @@ class ResearchDataBridge:
                         elapsed_ms=elapsed_ms,
                         stdio_attempts=stdio_attempts,
                         timeout_s=eff_timeout,
+                        exc_type="asyncio.TimeoutError",
                     )
+                    if timeout_ctx:
+                        timeout_sec_suffix, timeout_sec_args = _sec_ctx_log_suffix(timeout_ctx)
+                logger.warning(
+                    "tools/call timeout corr=%s tool=%s route=%s op=%s timeout_s=%d elapsed_ms=%d"
+                    + timeout_sec_suffix,
+                    corr_id,
+                    tool_name,
+                    route,
+                    operation,
+                    eff_timeout,
+                    elapsed_ms,
+                    *timeout_sec_args,
+                )
                 timeout_payload: dict[str, Any] = {
                     "_declared_sources": [],
                     "_sources": [],
@@ -9614,6 +9763,9 @@ class ResearchDataBridge:
         # P0 fix1 5: guards against a second sec_call_failed line for the same
         # request (payload path already logged, or top-level error below).
         sec_outcome_logged = False
+        # R7 §1: the sanitized failure context from the request's one
+        # sec_call_failed line, repeated on this request's tools/call line.
+        sec_ctx: dict[str, str] = {}
         mcp_is_error = isinstance(result_obj, dict) and bool(result_obj.get("isError"))
         raw_content_text = ""
 
@@ -9866,7 +10018,7 @@ class ResearchDataBridge:
                         # strips them before the 300-char slice.
                         error_excerpt_str = _sanitize_failure_log_excerpt(err_body)
                     if route == "sec":
-                        _log_sec_call_outcome(
+                        sec_ctx = _log_sec_call_outcome(
                             corr_id=corr_id,
                             operation=operation,
                             arguments=arguments,
@@ -9904,7 +10056,7 @@ class ResearchDataBridge:
             and not sec_outcome_logged
             and (top_error is not None or mcp_is_error)
         ):
-            _log_sec_call_outcome(
+            sec_ctx = _log_sec_call_outcome(
                 corr_id=corr_id,
                 operation=operation,
                 arguments=arguments,
@@ -9942,8 +10094,21 @@ class ResearchDataBridge:
         if error_excerpt_str:
             error_log_suffix = " error_category=%s error=%s"
             error_log_args = (error_category_str, error_excerpt_str)
+        # R7 §1 + r3 (codex #3): a failed SEC call's own identifiers and
+        # failure class ride the tools/call line too — the ops counts of
+        # body-less failure rows had no way back to ticker/form/accession,
+        # the exception type, or the cache verdict. The condition is the
+        # context itself, not a status whitelist: `_log_sec_call_outcome`
+        # returns a context only for failed calls, and the normalizer keeps
+        # statuses like `failed`/`timeout` besides `error`. Success (and
+        # empty) lines keep their original shape.
+        sec_ctx_suffix = ""
+        sec_ctx_args: tuple[str, ...] = ()
+        if sec_ctx and route == "sec":
+            sec_ctx_suffix, sec_ctx_args = _sec_ctx_log_suffix(sec_ctx)
         logger.info(
             "tools/call corr=%s tool=%s route=%s op=%s status=%s declared_sources=%d elapsed_ms=%d"
+            + sec_ctx_suffix
             + error_log_suffix,
             corr_id,
             tool_name,
@@ -9953,6 +10118,7 @@ class ResearchDataBridge:
             _log_redaction.clean_log_field(status_str, max_len=32),
             declared_count,
             elapsed_ms,
+            *sec_ctx_args,
             *error_log_args,
         )
         return resp
@@ -13641,7 +13807,12 @@ class ResearchDataBridge:
                 exc.error_code,
                 str(exc)[:200],
             )
-            return 502, {"ok": False, "error": exc.error_code, "detail": str(exc)[:200]}
+            payload = {"ok": False, "error": exc.error_code, "detail": str(exc)[:200]}
+            if exc.phases:
+                # R7 §3: a multi-stage failure answers with every stage's
+                # result, not just the last attempt's.
+                payload["phases"] = exc.phases
+            return 502, payload
         return 200, result
 
     async def handle_feishu_doc_read(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
@@ -13872,24 +14043,38 @@ class ResearchDataBridge:
                     )
             if grant_email:
                 try:
-                    spelling = client.grant_full_access(document_id, grant_email)
+                    spelling, _grant_phases = client.grant_full_access_with_phases(
+                        document_id, grant_email
+                    )
                 except FeishuApiError as exc:
-                    # C1: keep Feishu's own code and msg (sanitized) so the
-                    # caller can tell an unmatched email from a missing app
-                    # scope instead of guessing at a bare error code.
+                    # C1 + R7 r2 (codex #3): keep Feishu's own code and msg
+                    # (sanitized) so the caller can tell an unmatched email
+                    # from a missing app scope. The warning carries the full
+                    # per-stage summary — each stage's msg is individually
+                    # bounded in _grant_phase, so a long openid error no
+                    # longer truncates the email stage out of one 200-char
+                    # slice — and the structured phases ride the response,
+                    # matching the re-grant endpoint.
                     sanitized = _sanitize_feishu_response_preview(
-                        f"{exc.error_code}: {str(exc)}",
+                        f"{exc.error_code}: {exc}",
                         secrets=(client.app_secret, client._tenant_token),
                         dynamic_ids=(document_id, node_token, space_id, parent_node_token, folder_token),
-                        limit=200,
+                        limit=600,
                     )
                     warnings.append(
                         f"grant_failed: document created, but granting {grant_email} "
                         f"full access failed ({sanitized}); share it manually or "
                         f"re-grant with feishu_grant_access."
                     )
+                    if exc.phases:
+                        payload["grant_phases"] = exc.phases
                 else:
+                    # R7 r3 (codex #1): the phase list rides the success
+                    # response under the same key as on failure — an
+                    # "openid refused → email granted" outcome answers with
+                    # both stages, not just the winning spelling.
                     payload["grant_member"] = spelling
+                    payload["grant_phases"] = _grant_phases
             if warnings:
                 payload["warning"] = " ".join(warnings)
             # C2: no image bound out of the images the markdown carried — the
@@ -13963,26 +14148,49 @@ class ResearchDataBridge:
                     "document_id": document_id,
                     "message": "补授权邮箱与文档创建者不一致，只允许给创建者本人补授权。",
                 }
+            # R7 §3: the permission call only speaks ``type=docx`` — a wiki
+            # link must resolve to a docx node (obj_token with
+            # obj_type=="docx"); any other object (sheet/bitable/…) would
+            # send a non-docx obj_token into a docx permission call, the
+            # token-mixing failure the ops review flagged.
+            obj_type = str(node.get("obj_type") or "") if isinstance(node, dict) else ""
+            if (kind == "wiki" and obj_type != "docx") or obj_type not in ("", "docx"):
+                return {
+                    "ok": False,
+                    "error": "not_docx",
+                    "document_id": document_id,
+                    "obj_type": obj_type or "unknown",
+                    "message": (
+                        f"目标对象不是 docx 文档（obj_type={obj_type or 'unknown'}），"
+                        "编辑授权只支持 docx 文档；请在飞书客户端手动分享该对象。"
+                    ),
+                }
             node_token = (
                 str(node.get("node_token") or "")
                 if isinstance(node, dict) and node.get("node_token")
                 else (token if kind == "wiki" else "")
             )
-            spelling = client.grant_full_access(document_id, email)
+            spelling, grant_phases = client.grant_full_access_with_phases(document_id, email)
             return {
                 "ok": True,
                 "document_id": document_id,
                 "url": feishu_doc_url(document_id, node_token),
                 "granted": email,
                 "grant_member": spelling,
+                # R7 r3 (codex #1): same key as the 502 failure answer —
+                # success keeps the per-stage results too.
+                "phases": grant_phases,
             }
 
         code, result = await self._run_feishu(_grant)
         if isinstance(result, dict) and result.get("error") == "grant_scope_denied":
             return 403, result
+        if isinstance(result, dict) and result.get("error") == "not_docx":
+            return 400, result
         if code == 502 and isinstance(result, dict):
             # _run_feishu truncates the detail to 200 chars and sanitizes
             # nothing; redo both so Feishu's code/msg arrives clean.
+            phases = result.get("phases")
             detail = _sanitize_feishu_response_preview(
                 str(result.get("detail") or ""),
                 secrets=(),
@@ -13995,6 +14203,11 @@ class ResearchDataBridge:
                 "detail": detail,
                 "message": f"授权失败（{detail}）；若是邮箱对不上账号，请改用该用户的飞书登录邮箱重试。",
             }
+            # R7 §3: the per-stage grant results ride the failure answer, so
+            # the caller sees every stage's code/msg/log_id, not just the
+            # last attempt's.
+            if isinstance(phases, list):
+                result["phases"] = list(phases)
         return code, result
 
     async def handle_feishu_doc_append(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
@@ -14991,11 +15204,70 @@ def bind_docx_images(
 
 
 class FeishuApiError(RuntimeError):
-    """Feishu OpenAPI call failure. Never carries credentials or tokens."""
+    """Feishu OpenAPI call failure. Never carries credentials or tokens.
 
-    def __init__(self, error_code: str, message: str = "") -> None:
+    R7 §3: alongside the bridge-side ``error_code``, a refusal that reached a
+    Feishu payload also carries it structured — ``feishu_code``/``feishu_msg``
+    (the payload's own business code and msg, which `_request` used to embed
+    only in the message text) and ``log_id`` (the request id Feishu names
+    ``log_id``, older endpoints ``request_id``; "" when none came back). A
+    multi-stage flow may attach ``phases`` so a later stage's failure cannot
+    mask an earlier one's.
+    """
+
+    def __init__(
+        self,
+        error_code: str,
+        message: str = "",
+        *,
+        feishu_code: str = "",
+        feishu_msg: str = "",
+        log_id: str = "",
+        phases: list[dict[str, str]] | None = None,
+    ) -> None:
         super().__init__(message or error_code)
         self.error_code = error_code
+        self.feishu_code = feishu_code
+        self.feishu_msg = feishu_msg
+        self.log_id = log_id
+        self.phases = phases
+
+
+def _feishu_error_payload_ids(payload: dict[str, Any]) -> tuple[str, str, str]:
+    """``(feishu_code, feishu_msg, log_id)`` from an error payload — the ids
+    Feishu puts beside its own code/msg at the top level."""
+    feishu_code = _log_redaction.clean_log_field(payload.get("code"), max_len=32)
+    feishu_msg = str(payload.get("msg") or "")[:200]
+    log_id = _log_redaction.clean_log_field(
+        payload.get("log_id") or payload.get("request_id") or "", max_len=64
+    )
+    return feishu_code, feishu_msg, log_id
+
+
+#: Feishu open_id shape — a user identifier the unified log redaction does
+#: not know (`ou_…`). Scrubbed here, bridge-local; the shared
+#: `log_redaction.py` is deliberately untouched (R7 r2, codex #1).
+_FEISHU_OPEN_ID_RE = re.compile(r"\bou_[A-Za-z0-9_\-]+")
+
+
+def _feishu_scrub_member_text(
+    raw: str, member_ids: tuple[str, ...] = (), *, max_len: int = 120
+) -> str:
+    """Sanitize a Feishu msg destined for grant phases / logs / responses:
+    the unified redaction chain first, then this request's own member ids
+    (either spelling) and any other ``ou_…`` open_id replaced — Feishu's own
+    msg may echo the member_id it refused, and that identifier must not
+    survive anywhere. Truncation comes last so a redaction straddling the
+    boundary still applies."""
+    text = _log_redaction.clean_log_field(raw, max_len=max_len * 2)
+    for member_id in member_ids:
+        if member_id:
+            text = text.replace(member_id, "[REDACTED]")
+    text = _FEISHU_OPEN_ID_RE.sub("[REDACTED]", text)
+    # Feishu's own token shapes (tenant/user access tokens, app ids) are not in
+    # the unified chain; a msg that echoes one must not reach a phase (R7 r3).
+    text = _FEISHU_AUTH_TOKEN_RE.sub("[REDACTED]", text)
+    return text[:max_len]
 
 
 #: Codes where Feishu never returned a definite verdict: the connection died
@@ -15466,15 +15738,24 @@ class FeishuClient:
                 ),
             )
         if status < 200 or status >= 300:
+            feishu_code, feishu_msg, log_id = _feishu_error_payload_ids(payload)
             raise FeishuApiError(
                 f"feishu_http_{status}",
                 f"code={payload.get('code')} msg={str(payload.get('msg') or '')[:200]}",
+                feishu_code=feishu_code,
+                feishu_msg=feishu_msg,
+                log_id=log_id,
             )
         code = payload.get("code")
         if code not in (0, None):
             raise FeishuApiError(
                 "feishu_api_error",
                 f"code={code} msg={str(payload.get('msg') or '')[:200]}",
+                feishu_code=str(code)[:32],
+                feishu_msg=str(payload.get("msg") or "")[:200],
+                log_id=_log_redaction.clean_log_field(
+                    payload.get("log_id") or payload.get("request_id") or "", max_len=64
+                ),
             )
         if not unwrap_data:
             # Some endpoints (tenant_access_token) carry their fields at the
@@ -15748,6 +16029,134 @@ class FeishuClient:
 
     # -- drive permissions --
 
+    #: Feishu's own msg wording when a permission grant refuses the member's
+    #: *identity* — the one refusal class that says the other member spelling
+    #: could succeed. Matched on the payload msg, EN or CN.
+    _FEISHU_MEMBER_NOT_EXIST_RE = re.compile(
+        r"(?i)(?:user|member|account)\s+not\s+(?:exist|found)"
+        r"|用户不存在|成员不存在|账号不存在"
+    )
+
+    #: Business codes verified as permission-class refusals. Currently empty
+    #: on purpose: the only business code production ever showed on this call
+    #: (1063001, HTTP 400, "Invalid parameter", 2026-10-28) is a parameter
+    #: refusal, and no code has verified evidence of meaning permission — an
+    #: unverified mapping would misroute the fallback, so a code lands here
+    #: only with production proof.
+    _FEISHU_GRANT_PERMISSION_CODES: frozenset[str] = frozenset()
+
+    #: Refusal classes that may retry the grant with the email spelling.
+    _FEISHU_GRANT_FALLBACK_CLASSES: frozenset[str] = frozenset({"identity"})
+
+    @classmethod
+    def _grant_refusal_class(cls, exc: "FeishuApiError") -> str:
+        """Classify an openid-grant refusal for the email-fallback decision.
+
+        The bridge has no vendor error table, so this is a conservative
+        partition, not a Feishu code map, and every unclassifiable refusal
+        lands in a class that does NOT fall back — an unknown error surfaces
+        as itself instead of being masked by a second attempt.
+
+        Order matters, and identity comes before the HTTP-shape classes:
+        Feishu answers business refusals — member-not-exist included — as
+        HTTP 400 with a body code/msg, so a 400-first order would file every
+        identity refusal under parameter and the email fallback would be
+        dead code. Identity matches only Feishu's own ``feishu_msg``, never
+        the bridge-wrapped message text, so this classifier's own wording
+        can never re-classify itself.
+
+        * ``transport`` — `_feishu_outcome_unknown` (network, unparseable or
+          empty body, 5xx): no definite verdict, and a retry could
+          double-commit a write whose outcome is unknown.
+        * ``identity`` — Feishu's own msg names the member as not existing
+          (EN or CN): the one class that says the email spelling might
+          succeed.
+        * ``permission`` — HTTP 401/403, or a business code in the verified
+          permission set: operator / app permission; both spellings hit the
+          same wall.
+        * ``parameter`` — any other HTTP 400: the request shape was refused;
+          the email body has the same shape and fails the same way.
+        * ``unclassified`` — anything else (including every numeric business
+          code the bridge cannot positively name).
+        """
+        if _feishu_outcome_unknown(exc.error_code):
+            return "transport"
+        if cls._FEISHU_MEMBER_NOT_EXIST_RE.search(exc.feishu_msg):
+            return "identity"
+        if exc.error_code in ("feishu_http_401", "feishu_http_403"):
+            return "permission"
+        if exc.feishu_code in cls._FEISHU_GRANT_PERMISSION_CODES:
+            return "permission"
+        if exc.error_code == "feishu_http_400":
+            return "parameter"
+        return "unclassified"
+
+    def _grant_phase(
+        self,
+        stage: str,
+        *,
+        status: str,
+        exc: "FeishuApiError | None" = None,
+        note: str = "",
+        member_ids: tuple[str, ...] = (),
+    ) -> dict[str, str]:
+        """One grant stage's result, sanitized once for both the log line and
+        the wire payload: the bridge error_code, Feishu's own code/msg, and
+        the request log_id when the stage reached a payload. ``stage`` is
+        ``lookup`` / ``openid`` / ``email``; ``status`` is ``ok`` / ``failed``
+        / ``skipped``. Member identifiers (email, open_id) never enter a
+        phase by construction, and a msg that echoes the member_id is
+        scrubbed via ``member_ids`` (R7 r2, codex #1).
+
+        R7 r3 (codex #2): when the failure never reached a payload msg
+        (non-JSON response, network exception), ``feishu_msg`` is empty and
+        the bridge's own exception text — `_request`'s HTTP status /
+        content-type / path template / body preview, or the exception type —
+        is the only diagnosis there was. It is kept in ``detail`` under the
+        same scrubbing; empty whenever ``feishu_msg`` already says it."""
+        phase: dict[str, str] = {"stage": stage, "status": status, "note": note}
+        # The client's own credentials are scrubbed by value as well as by shape.
+        member_ids = (*member_ids, self.app_secret, self._tenant_token)
+        if exc is not None:
+            phase["error_code"] = exc.error_code
+            phase["feishu_code"] = _log_redaction.clean_log_field(exc.feishu_code, max_len=32)
+            phase["feishu_msg"] = _feishu_scrub_member_text(exc.feishu_msg, member_ids)
+            phase["detail"] = (
+                ""
+                if exc.feishu_msg
+                else _feishu_scrub_member_text(str(exc), member_ids, max_len=160)
+            )
+            phase["log_id"] = _log_redaction.clean_log_field(exc.log_id, max_len=64)
+        else:
+            phase["error_code"] = ""
+            phase["feishu_code"] = ""
+            phase["feishu_msg"] = ""
+            phase["detail"] = ""
+            phase["log_id"] = ""
+        return phase
+
+    @staticmethod
+    def _grant_phases_summary(phases: list[dict[str, str]]) -> str:
+        """The phase list as one sanitized line: ``lookup:ok (found) |
+        openid:failed feishu_http_403 feishu_code=1063001 msg=… log_id=…``."""
+        parts: list[str] = []
+        for phase in phases:
+            bits = [f"{phase['stage']}:{phase['status']}"]
+            if phase.get("error_code"):
+                bits.append(phase["error_code"])
+            if phase.get("feishu_code"):
+                bits.append(f"feishu_code={phase['feishu_code']}")
+            if phase.get("feishu_msg"):
+                bits.append(f"msg={phase['feishu_msg']}")
+            if phase.get("detail"):
+                bits.append(f"detail={phase['detail']}")
+            if phase.get("log_id"):
+                bits.append(f"log_id={phase['log_id']}")
+            if phase.get("note"):
+                bits.append(f"({phase['note']})")
+            parts.append(" ".join(bits))
+        return " | ".join(parts)
+
     def user_open_id_by_email(self, email: str) -> str:
         """The Feishu ``open_id`` for *email*, via the directory's own
         batch-get-id lookup; ``''`` when the app cannot look (no contact
@@ -15797,14 +16206,66 @@ class FeishuClient:
     def grant_full_access(self, token: str, email: str) -> str:
         """Grant *email* full access; returns the member spelling that worked.
 
-        Tries the account's ``open_id`` first (C1) and falls back to the raw
-        email; both failure paths raise, so the caller's warning carries the
-        code and msg of the spelling that was actually refused.
+        Thin wrapper over `grant_full_access_with_phases` for callers that
+        only need the spelling; see there for the three-stage contract.
         """
+        spelling, _phases = self.grant_full_access_with_phases(token, email)
+        return spelling
+
+    def grant_full_access_with_phases(
+        self, token: str, email: str
+    ) -> tuple[str, list[dict[str, str]]]:
+        """Grant *email* full access; returns ``(member spelling, phases)``.
+
+        R7 §3: the three stages — directory lookup, openid grant, email
+        grant — each keep their own result (bridge code, Feishu's own
+        code/msg, log_id) in the log line, in the returned phase list, and
+        in any raised error, so the last attempt can no longer mask an
+        earlier failure (the 10-30 incident surfaced only the email
+        attempt's 1063001). Successes record their stage too, so an
+        "openid refused for identity → email granted" outcome answers with
+        both. The email spelling runs only when the lookup found no account,
+        or the openid grant was refused for the member's *identity*
+        (`_grant_refusal_class`); parameter / permission / transport /
+        unclassified refusals raise with every stage so far instead of
+        retrying. Both grant requests ask Feishu not to notify the member.
+        """
+        phases: list[dict[str, str]] = []
+        member_ids: tuple[str, ...] = (email,)
+
+        def _masked_member() -> str:
+            # Unified log redaction: the address itself never enters a log
+            # line, only the fact that the member was addressed by email.
+            return _log_redaction.clean_log_field(email, max_len=64)
+
+        def _fail(cause: FeishuApiError) -> FeishuApiError:
+            summary = self._grant_phases_summary(phases)
+            logger.warning(
+                "feishu_grant outcome=failed member=%s stages=%s", _masked_member(), summary
+            )
+            return FeishuApiError("feishu_grant_failed", summary, phases=phases)
+
         try:
             open_id = self.user_open_id_by_email(email)
-        except FeishuApiError:
-            open_id = ""
+        except FeishuApiError as exc:
+            # A failed lookup is not "user not found" — the directory call
+            # itself broke (scope / permission / transport), and an email
+            # retry would mask which stage actually failed.
+            phases.append(
+                self._grant_phase("lookup", status="failed", exc=exc, member_ids=member_ids)
+            )
+            phases.append(
+                self._grant_phase(
+                    "email", status="skipped", note="no fallback: lookup itself failed"
+                )
+            )
+            raise _fail(exc) from exc
+        phases.append(
+            self._grant_phase("lookup", status="ok", note="not_found" if not open_id else "found")
+        )
+        if open_id:
+            member_ids = (email, open_id)
+
         if open_id:
             try:
                 self._request(
@@ -15817,21 +16278,66 @@ class FeishuClient:
                         "perm": "full_access",
                     },
                 )
-                return f"openid:{open_id}"
-            except FeishuApiError:
-                pass  # the email spelling gets its own chance, and its own error
-        self._request(
-            "POST",
-            f"/open-apis/drive/v1/permissions/{token}/members",
-            query={"type": "docx"},
-            json_body={
-                "member_type": "email",
-                "member_id": email,
-                "perm": "full_access",
-            },
-        )
-        return f"email:{email}"
+            except FeishuApiError as exc:
+                refusal_class = self._grant_refusal_class(exc)
+                phases.append(
+                    self._grant_phase(
+                        "openid",
+                        status="failed",
+                        exc=exc,
+                        note=f"class={refusal_class}",
+                        member_ids=member_ids,
+                    )
+                )
+                if refusal_class not in self._FEISHU_GRANT_FALLBACK_CLASSES:
+                    phases.append(
+                        self._grant_phase(
+                            "email",
+                            status="skipped",
+                            note=f"no fallback: openid refusal class={refusal_class}",
+                        )
+                    )
+                    raise _fail(exc) from exc
+                # An identity refusal is the one verdict the email spelling
+                # can change — it gets its own chance, and its own result.
+            else:
+                phases.append(self._grant_phase("openid", status="ok"))
+                logger.info(
+                    "feishu_grant outcome=ok member=%s stages=%s",
+                    _masked_member(),
+                    self._grant_phases_summary(phases),
+                )
+                return f"openid:{open_id}", phases
+        else:
+            phases.append(
+                self._grant_phase(
+                    "openid", status="skipped", note="no fallback needed: lookup not_found"
+                )
+            )
 
+        try:
+            self._request(
+                "POST",
+                f"/open-apis/drive/v1/permissions/{token}/members",
+                query={"type": "docx", "need_notification": "false"},
+                json_body={
+                    "member_type": "email",
+                    "member_id": email,
+                    "perm": "full_access",
+                },
+            )
+        except FeishuApiError as exc:
+            phases.append(
+                self._grant_phase("email", status="failed", exc=exc, member_ids=member_ids)
+            )
+            raise _fail(exc) from exc
+        phases.append(self._grant_phase("email", status="ok"))
+        logger.info(
+            "feishu_grant outcome=ok member=%s stages=%s",
+            _masked_member(),
+            self._grant_phases_summary(phases),
+        )
+        return f"email:{email}", phases
 
 async def _send_http(
     writer: asyncio.StreamWriter,
