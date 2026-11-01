@@ -6,6 +6,10 @@ services:
     image: dalton-postgres:18-pgvector
 
   backend:
+    # default for everything it already talks to; crawl for the crawler service.
+    networks:
+      - default
+      - crawl
     build:
       context: .
       dockerfile: scripts/dalton/Dockerfile.dalton
@@ -46,6 +50,58 @@ services:
       - ./workflows:/app/workflows:ro
       - ./config/dalton:/app/config/dalton:ro
       - ./var/dalton:/app/var/dalton
+
+  # P6b: scrapling's browser tiers (Chromium/Camoufox) fetch here instead of
+  # inside the 4 GB backend container, whose ceiling a runaway crawl could hit
+  # (2026-10-31: browser tree ~3.2 GiB, container 4095.96/4096 MiB) and take
+  # chat and streaming down with it. Same image as the backend (it carries
+  # scrapling and the browsers); only the command differs. Reachable only on
+  # the `crawl` network as http://crawler:8100 — no published ports; the
+  # backend opts in via crawler.browser_service_url in agent_config.dalton.yaml
+  # and fails the tier (never falls back in-process) when this service is down.
+  # 2g hard cap sized on the 6 GB VM: browsers at ~0.4-0.9 GiB per crawl plus
+  # worker overhead; a burst past it kills only crawls. pids_limit bounds a
+  # fork-happy page; /dev/shm at 1gb because Chromium crashes pages on Docker's
+  # default 64 MB. APP_ENV matches the backend's, so the same agent_config
+  # overlay (and thus crawler.browser_concurrency) applies on both sides.
+  crawler:
+    build:
+      context: .
+      dockerfile: scripts/dalton/Dockerfile.dalton
+      args:
+        BUILD_GIT_SHA: ${BUILD_GIT_SHA:-}
+        BUILD_GIT_DIRTY: ${BUILD_GIT_DIRTY:-}
+    # Not the backend entrypoint: no DB wait, no migrations — the service
+    # touches neither Postgres nor Redis. tini still reaps what a killed crawl
+    # worker leaves behind.
+    entrypoint: ["/usr/bin/tini", "-s", "--"]
+    command: ["uv", "run", "python", "-m", "src.dalton.crawl_service"]
+    mem_limit: 2g
+    memswap_limit: 2g
+    shm_size: "1gb"
+    pids_limit: 512
+    restart: unless-stopped
+    # Only what the service reads — never the backend's whole .env: this
+    # container renders untrusted pages in a browser, so it holds no API keys
+    # or DB credentials. Both values interpolate from the project .env. The
+    # token interpolates default-empty (a `:?` here would break every compose
+    # command, `build backend` included, wherever the variable is unset); the
+    # service logs an ERROR at startup and serves every /fetch 401 until it
+    # is set.
+    environment:
+      INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:-}
+      APP_ENV: ${APP_ENV:-}
+    # Code comes from the same bind mounts as the backend (whose image src is
+    # only a fallback), so a deploy's git ff reaches both; read-only here.
+    volumes:
+      - ./src:/app/src:ro
+      - ./mcp_servers:/app/mcp_servers:ro
+      - ./agent_config.yaml:/app/agent_config.yaml:ro
+      - ./agent_config.dalton.yaml:/app/agent_config.dalton.yaml:ro
+    # Own network shared only with the backend: a compromised page cannot
+    # reach Postgres, Redis or MinIO on the default network.
+    networks:
+      - crawl
 
   frontend:
     # Replace upstream 0.0.0.0:5173 port binding with loopback-only (requires Docker Compose v2.24.4+).
@@ -110,6 +166,9 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+
+networks:
+  crawl: {}
 
 volumes:
   dalton-minio-data:

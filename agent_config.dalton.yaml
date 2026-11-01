@@ -62,6 +62,12 @@ search_api: "openclaw"
 # (P6a sampling). 1 until crawls move to their own memory-capped container (P6b).
 crawler:
   browser_concurrency: 1
+  # P6b: browser/stealth tiers run in the dedicated `crawler` compose service
+  # (docker-compose.dalton.yml, 2 GB cap) instead of inside this 4 GB backend
+  # container. Unset = in-process (local dev, upstream parity). When the
+  # service is down the browser tiers fail; they never fall back in-process,
+  # which would move the browsers back into the backend container.
+  browser_service_url: http://crawler:8100
 
 # Fetch falls through the chain per URL: in-house first; Firecrawl only for the
 # URLs in-house could not fetch (403, anti-bot, JS-only pages). Firecrawl bills

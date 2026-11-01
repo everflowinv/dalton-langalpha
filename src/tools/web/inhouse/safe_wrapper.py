@@ -521,6 +521,22 @@ class SafeCrawlerWrapper:
         """Classify an exception, update appropriate breaker(s), return CrawlResult."""
         error_str = str(e)
 
+        # DALTON-HOOK(crawl-service): a dead or broken crawl service is OUR
+        # infrastructure, not the target host's — route it to the existing
+        # browser_closed infra category (tripping the global infra breaker)
+        # without charging the host breaker, so a service outage neither
+        # poisons innocent hosts' breakers nor keeps sending fresh hosts into
+        # a dead service. A target-page failure reported through a HEALTHY
+        # service (crawl_service_fault=False) carries the browser's own error
+        # text and falls through to the keyword classification below.
+        if getattr(e, "crawl_service_fault", False):
+            await self._infra_breaker.record_failure(self._trigger_browser_reset)
+            return CrawlResult(
+                success=False,
+                error=f"Crawl service unavailable: {error_str[:150]}",
+                error_type="browser_closed",
+            )
+
         if "has been closed" in error_str or "Target page" in error_str:
             error_type = "browser_closed"
         elif "ERR_NAME_NOT_RESOLVED" in error_str:
