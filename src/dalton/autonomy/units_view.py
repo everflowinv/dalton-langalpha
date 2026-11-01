@@ -317,7 +317,7 @@ async def list_unclassified_workspaces(user_id: str) -> list[dict[str, Any]]:
             await cur.execute(
                 """
                 SELECT workspace_id::text AS workspace_id, user_id, name,
-                       description, updated_at
+                       description, updated_at, status
                 FROM workspaces
                 WHERE status <> 'deleted' AND user_id = %s
                 ORDER BY name ASC

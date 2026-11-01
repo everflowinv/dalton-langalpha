@@ -201,6 +201,660 @@ async def test_bind_rejects_non_uuid_before_touching_the_db(monkeypatch: pytest.
 
 
 # ---------------------------------------------------------------------------
+# 绑定事务的语句顺序（codex r2 #2）：同一事务里先 FOR UPDATE 锁并确认
+# 单元归属，再谈工作区。替身按 SQL 语义求值（预检 / 工作区校验 / 占用
+# 检查 / UPDATE 都真实走到），对撤修后的旧顺序同样成立——旧顺序在相同
+# 输入上会先给出工作区侧错误，下面的断言即失败。
+# ---------------------------------------------------------------------------
+
+_BIND_USER = "user-1"
+_BIND_OTHER_USER = "user-2"
+_BIND_UNIT_OWN = "11111111-1111-1111-1111-111111111111"
+_BIND_UNIT_OCCUPIER = "33333333-3333-3333-3333-333333333333"
+_BIND_UNIT_FOREIGN = "44444444-4444-4444-4444-444444444444"
+_BIND_WS = "55555555-5555-5555-5555-555555555555"
+
+
+class _BindCursorProto:
+    async def __aenter__(self) -> Any: ...  # noqa: E704
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> Any: ...  # noqa: E704
+    async def execute(self, query: Any, params: Any = None) -> Any: ...  # noqa: E704
+    async def fetchone(self) -> Any: ...  # noqa: E704
+
+
+def _bind_unit_row(**overrides: Any) -> dict[str, Any]:
+    row = {
+        "unit_id": _BIND_UNIT_OWN,
+        "kind": "company",
+        "owner_user_id": _BIND_USER,
+        "slug": "mega-tech",
+        "display_name": "Mega Tech",
+        "workspace_id": None,
+        "ticker": "MSFT",
+        "status": "active",
+        "research_tz": None,
+        "created_at": None,
+        "updated_at": None,
+    }
+    row.update(overrides)
+    return row
+
+
+class _ExecLog(list):
+    """按序执行的语句（str 列表），附带语义替身的可变状态。
+
+    `params` 与语句一一对应；`locks` 是按序取过的 advisory 锁 key；
+    `members` 是 `dalton_sector_members` 的当前行（DELETE/INSERT 即时求值）。
+    """
+
+    def __init__(self, *args: Any) -> None:
+        super().__init__(*args)
+        self.params: list[tuple[Any, ...]] = []
+        self.locks: list[str] = []
+        self.members: list[dict[str, Any]] = []
+
+
+def _install_bind_db(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    unit_rows: list[dict[str, Any]],
+    ws_rows: dict[str, dict[str, Any]],
+    active_binding_by_ws: dict[str, str],
+    sector_doc_by_ws: dict[str, dict[str, Any]] | None = None,
+    initial_members: list[dict[str, Any]] | None = None,
+) -> _ExecLog:
+    """按 SQL 语义求值的绑定/解绑/归档事务替身。
+
+    语句按生产 SQL 的形状分派并即时落效（UPDATE 改 unit_rows、DELETE/
+    INSERT 改 members），对真实 `sync_projection_to_latest_doc` /
+    `sync_members_projection` 同样可求值——它们跑的是真代码，只有游标是替身。
+    """
+    from psycopg import AsyncConnection
+
+    sector_doc_by_ws = sector_doc_by_ws or {}
+    executed = _ExecLog()
+    executed.members.extend(initial_members or [])
+    state: dict[str, Any] = {"sql": "", "params": ()}
+
+    cur = create_autospec(_BindCursorProto, instance=True)
+    cur.__aenter__.return_value = cur
+    cur.__aexit__.return_value = None
+
+    async def _exec(sql: str, params: Any = None) -> None:
+        norm = " ".join(str(sql).split())
+        p = tuple(params or ())
+        executed.append(norm)
+        executed.params.append(p)
+        state["sql"], state["params"] = norm, p
+        if norm.startswith("SELECT pg_advisory_xact_lock"):
+            executed.locks.append(str(p[0]))
+        elif norm.startswith("DELETE FROM dalton_sector_members"):
+            target = str(p[0])
+            executed.members[:] = [
+                m for m in executed.members if str(m["sector_unit_id"]) != target
+            ]
+        elif norm.startswith("INSERT INTO dalton_sector_members"):
+            executed.members.append(
+                {
+                    "sector_unit_id": str(p[0]),
+                    "member_id": p[1],
+                    "member_name": p[2],
+                    "ticker": p[3],
+                    "company_unit_id": p[4],
+                    "workspace_created": p[5],
+                    "scope": p[6],
+                    "reason": p[7],
+                    "valid_until": p[8],
+                    "position": p[9],
+                    "synced_version_no": p[10],
+                }
+            )
+
+    async def _fetchone() -> Any:
+        sql, p = state["sql"], state["params"]
+        if sql.startswith("SELECT workspace_id::text AS workspace_id FROM dalton_coverage_units"):
+            # bind 归属预检（同时读出原绑定），参数 (unit_id, owner_user_id)
+            return next(
+                (
+                    {"workspace_id": str(u.get("workspace_id") or "") or None}
+                    for u in unit_rows
+                    if str(u["unit_id"]) == str(p[0])
+                    and str(u["owner_user_id"]) == str(p[1])
+                    and u["status"] == "active"
+                ),
+                None,
+            )
+        if sql.startswith("SELECT kind, workspace_id"):
+            # unbind/archive 预读，参数 (unit_id, owner_user_id)，任意 status
+            return next(
+                (
+                    {
+                        "kind": u["kind"],
+                        "workspace_id": str(u.get("workspace_id") or "") or None,
+                    }
+                    for u in unit_rows
+                    if str(u["unit_id"]) == str(p[0])
+                    and str(u["owner_user_id"]) == str(p[1])
+                ),
+                None,
+            )
+        if "FROM workspaces" in sql:
+            # uuid 比较与大小写无关（Postgres 语义）；返回行里的 id 是规范化小写
+            ws = ws_rows.get(str(p[0]).lower())
+            if ws is None or ws.get("status") == "deleted":
+                return None
+            return dict(ws)
+        if "FROM dalton_knowledge_versions" in sql:
+            # sync_projection_to_latest_doc 的最新有效行业文档，参数 (workspace_id,)
+            doc = sector_doc_by_ws.get(str(p[0]))
+            return dict(doc) if doc else None
+        if "kind = 'sector'" in sql and "FROM dalton_coverage_units" in sql:
+            # sync_members_projection 的 active 行业单元查找，参数 (workspace_id,)
+            return next(
+                (
+                    {
+                        "unit_id": str(u["unit_id"]),
+                        "owner_user_id": u["owner_user_id"],
+                        "slug": u["slug"],
+                    }
+                    for u in unit_rows
+                    if str(u.get("workspace_id") or "") == str(p[0])
+                    and u["status"] == "active"
+                    and u["kind"] == "sector"
+                ),
+                None,
+            )
+        if "SELECT slug FROM dalton_coverage_units" in sql:
+            # 占用检查，参数 (workspace_id, unit_id)
+            other = active_binding_by_ws.get(str(p[0]))
+            return {"slug": other} if other and str(other) != str(p[1]) else None
+        if sql.startswith("UPDATE dalton_coverage_units"):
+            if "SET status" in sql:
+                # set_coverage_unit_status，参数 (status, unit_id, owner_user_id)
+                for u in unit_rows:
+                    if (
+                        str(u["unit_id"]) == str(p[1])
+                        and str(u["owner_user_id"]) == str(p[2])
+                    ):
+                        u["status"] = str(p[0])
+                        return dict(u)
+                return None
+            if "SET workspace_id = NULL" in sql:
+                # unbind，参数 (unit_id, owner_user_id)
+                for u in unit_rows:
+                    if (
+                        str(u["unit_id"]) == str(p[0])
+                        and str(u["owner_user_id"]) == str(p[1])
+                    ):
+                        u["workspace_id"] = None
+                        return dict(u)
+                return None
+            # bind 的 UPDATE，参数 (workspace_id, unit_id, owner_user_id)
+            for u in unit_rows:
+                if (
+                    str(u["unit_id"]) == str(p[1])
+                    and str(u["owner_user_id"]) == str(p[2])
+                    and u["status"] == "active"
+                ):
+                    u["workspace_id"] = str(p[0]).lower()  # uuid 列存规范化形式
+                    return dict(u)
+            return None
+        raise AssertionError(f"unexpected SQL in bind double: {sql}")
+
+    cur.execute.side_effect = _exec
+    cur.fetchone.side_effect = _fetchone
+
+    conn = create_autospec(AsyncConnection, instance=True)
+    conn.cursor.return_value = cur
+    conn.transaction.side_effect = lambda *a: _ConnCtx(conn)
+    ctx = _ConnCtx(conn)
+    monkeypatch.setattr(
+        cu_db,
+        "get_db_connection",
+        create_autospec(
+            cu_db.get_db_connection, side_effect=lambda conn=None: ctx
+        ),
+    )
+    return executed
+
+
+@pytest.mark.asyncio
+async def test_bind_foreign_unit_with_occupied_workspace_reports_unit_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """codex r2 #2：他人的 unit_id + 本人已被占用的工作区 → unit not found，而非 workspace conflict。"""
+    from src.server.database.home_workspace import get_home_workspace_id
+
+    assert _BIND_WS != get_home_workspace_id(_BIND_USER)  # 场景是普通工作区
+    foreign = _bind_unit_row(
+        unit_id=_BIND_UNIT_FOREIGN, owner_user_id=_BIND_OTHER_USER, slug="foreign"
+    )
+    occupier = _bind_unit_row(
+        unit_id=_BIND_UNIT_OCCUPIER, slug="occupier", workspace_id=_BIND_WS
+    )
+    executed = _install_bind_db(
+        monkeypatch,
+        unit_rows=[foreign, occupier],
+        ws_rows={
+            _BIND_WS: {
+                "workspace_id": _BIND_WS,
+                "user_id": _BIND_USER,
+                "name": "Mine",
+                "status": "active",
+            }
+        },
+        active_binding_by_ws={_BIND_WS: _BIND_UNIT_OCCUPIER},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=f"active coverage unit {_BIND_UNIT_FOREIGN} not found for this owner",
+    ):
+        await cu_db.bind_coverage_unit_workspace(_BIND_UNIT_FOREIGN, _BIND_WS, _BIND_USER)
+    # 归属预检是第一条语句；工作区检查根本没被碰（撤修后第一条是
+    # FROM workspaces，且错误会先变成 workspace conflict）。
+    assert "FOR UPDATE" in executed[0]
+    assert not any("FROM workspaces" in s for s in executed)
+
+
+@pytest.mark.asyncio
+async def test_bind_foreign_unit_on_home_reports_unit_not_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """codex r2 #2：他人的 unit_id + Home → unit not found，而非 Home 拒绝。"""
+    from src.server.database.home_workspace import get_home_workspace_id
+
+    home_ws = get_home_workspace_id(_BIND_USER)
+    foreign = _bind_unit_row(
+        unit_id=_BIND_UNIT_FOREIGN, owner_user_id=_BIND_OTHER_USER, slug="foreign"
+    )
+    executed = _install_bind_db(
+        monkeypatch,
+        unit_rows=[foreign],
+        ws_rows={
+            home_ws: {
+                "workspace_id": home_ws,
+                "user_id": _BIND_USER,
+                "name": "Home",
+                "status": "active",
+            }
+        },
+        active_binding_by_ws={},
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=f"active coverage unit {_BIND_UNIT_FOREIGN} not found for this owner",
+    ):
+        await cu_db.bind_coverage_unit_workspace(_BIND_UNIT_FOREIGN, home_ws, _BIND_USER)
+    assert "FOR UPDATE" in executed[0]
+    assert not any("FROM workspaces" in s for s in executed)
+
+
+@pytest.mark.asyncio
+async def test_bind_happy_path_locks_unit_before_workspace_checks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """本人的 active 单元绑定空闲工作区：预检放行，UPDATE 条件保持 owner/status。"""
+    own = _bind_unit_row(unit_id=_BIND_UNIT_OWN, slug="mega-tech")
+    executed = _install_bind_db(
+        monkeypatch,
+        unit_rows=[own],
+        ws_rows={
+            _BIND_WS: {
+                "workspace_id": _BIND_WS,
+                "user_id": _BIND_USER,
+                "name": "Mine",
+                "status": "active",
+            }
+        },
+        active_binding_by_ws={},
+    )
+
+    row = await cu_db.bind_coverage_unit_workspace(_BIND_UNIT_OWN, _BIND_WS, _BIND_USER)
+    assert row["workspace_id"] == _BIND_WS
+    precheck = executed[0]
+    assert precheck.startswith("SELECT workspace_id::text AS workspace_id FROM dalton_coverage_units")
+    assert "FOR UPDATE" in precheck
+    # 显式转型：uuid 列带 ::uuid（owner_user_id 是 text，与文件既有写法一致）
+    assert "unit_id = %s::uuid AND owner_user_id = %s AND status = 'active'" in precheck
+    update_sql = next(s for s in executed if s.startswith("UPDATE dalton_coverage_units"))
+    assert "owner_user_id = %s AND status = 'active'" in update_sql
+
+
+# ---------------------------------------------------------------------------
+# 绑定关系变化时同步成员投影（codex r3）：投影的定义是"该行业单元当前
+# 绑定的工作区的最新 schema_valid 行业文档"。bind 在同一事务里（单元行锁
+# → 工作区 advisory 锁）重同步；unbind/archive 清空。真实
+# sync_projection_to_latest_doc / sync_members_projection 全程在测，只有
+# 游标是语义替身。
+# ---------------------------------------------------------------------------
+
+_BIND_UNIT_SECTOR_A = "66666666-6666-6666-6666-666666666666"
+_BIND_UNIT_SECTOR_B = "77777777-7777-7777-7777-777777777777"
+
+
+def _install_units_flag(monkeypatch: pytest.MonkeyPatch, enabled: bool) -> None:
+    import src.dalton.settings as settings_mod
+
+    monkeypatch.setattr(
+        settings_mod, "is_coverage_units_enabled", lambda e=enabled: e
+    )
+
+
+def _sector_doc_2_members(version_no: int = 3) -> dict[str, Any]:
+    return {
+        "version_no": version_no,
+        "content": {
+            "members": [
+                {"id": "M1", "name": "某综合科技公司", "ticker": "EXAMPLE"},
+                {"id": "M2", "name": "未覆盖的封装厂商"},
+            ]
+        },
+    }
+
+
+def _member_row(unit_id: str, member_id: str) -> dict[str, Any]:
+    return {
+        "sector_unit_id": unit_id,
+        "member_id": member_id,
+        "member_name": member_id,
+        "ticker": None,
+        "company_unit_id": None,
+        "workspace_created": False,
+        "scope": "",
+        "reason": "",
+        "valid_until": None,
+        "position": 0,
+        "synced_version_no": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_archive_then_rebind_moves_projection_to_new_unit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """归档 A（绑 W）→ B 绑 W（W 的行业文档 2 成员）：B 投影 2 行，A 清空。"""
+    _install_units_flag(monkeypatch, True)
+    unit_a = _bind_unit_row(
+        unit_id=_BIND_UNIT_SECTOR_A, kind="sector", slug="sector-a",
+        workspace_id=_BIND_WS, ticker=None,
+    )
+    unit_b = _bind_unit_row(
+        unit_id=_BIND_UNIT_SECTOR_B, kind="sector", slug="sector-b", ticker=None
+    )
+    executed = _install_bind_db(
+        monkeypatch,
+        unit_rows=[unit_a, unit_b],
+        ws_rows={
+            _BIND_WS: {
+                "workspace_id": _BIND_WS,
+                "user_id": _BIND_USER,
+                "name": "Mine",
+                "status": "active",
+            }
+        },
+        active_binding_by_ws={},
+        sector_doc_by_ws={_BIND_WS: _sector_doc_2_members()},
+        initial_members=[
+            _member_row(_BIND_UNIT_SECTOR_A, "M1"),
+            _member_row(_BIND_UNIT_SECTOR_A, "M2"),
+        ],
+    )
+
+    archived = await cu_db.set_coverage_unit_status(
+        _BIND_UNIT_SECTOR_A, _BIND_USER, "archived"
+    )
+    assert archived is not None and archived["status"] == "archived"
+    await cu_db.bind_coverage_unit_workspace(_BIND_UNIT_SECTOR_B, _BIND_WS, _BIND_USER)
+
+    # A 清空、B 接手：成员行全部挂在 B 名下
+    assert {m["sector_unit_id"] for m in executed.members} == {_BIND_UNIT_SECTOR_B}
+    assert sorted(m["member_id"] for m in executed.members) == ["M1", "M2"]
+    assert all(m["synced_version_no"] == 3 for m in executed.members)
+    # 两步各取一次锁，key 都是 insert_version 的那把
+    assert executed.locks == [f"dalton:kv:{_BIND_WS}:sector"] * 2
+    # bind 阶段：advisory 锁在投影同步（文档读取 / 写入）之前
+    insert_idx = next(
+        i for i, s in enumerate(executed) if s.startswith("INSERT INTO dalton_sector_members")
+    )
+    lock_idxs = [
+        i for i, s in enumerate(executed) if s.startswith("SELECT pg_advisory_xact_lock")
+    ]
+    bind_lock = max(i for i in lock_idxs if i < insert_idx)
+    assert "FROM dalton_knowledge_versions" in executed[bind_lock + 1]
+
+
+@pytest.mark.asyncio
+async def test_rebind_locks_previous_and_target_workspace_in_sorted_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 从 W1 改绑 W2：两个工作区的写文档锁都取，按排序固定顺序（codex r3 #1）。
+
+    只锁 W2 时，W1 上已读到 A 的写文档事务可在本事务之后提交，把 W1 的成员
+    写回 A 名下；锁住 W1 让它要么先提交（被这里覆盖），要么等本事务提交后再读。
+    """
+    _install_units_flag(monkeypatch, True)
+    ws_new = "00000000-0000-0000-0000-0000000000a2"  # 排序在 _BIND_WS 之前
+    unit_a = _bind_unit_row(
+        unit_id=_BIND_UNIT_SECTOR_A, kind="sector", slug="sector-a",
+        workspace_id=_BIND_WS, ticker=None,
+    )
+    ws = {"user_id": _BIND_USER, "name": "Mine", "status": "active"}
+    executed = _install_bind_db(
+        monkeypatch,
+        unit_rows=[unit_a],
+        ws_rows={
+            _BIND_WS: {"workspace_id": _BIND_WS, **ws},
+            ws_new: {"workspace_id": ws_new, **ws},
+        },
+        active_binding_by_ws={},
+        sector_doc_by_ws={ws_new: _sector_doc_2_members()},
+    )
+
+    await cu_db.bind_coverage_unit_workspace(_BIND_UNIT_SECTOR_A, ws_new, _BIND_USER)
+
+    assert executed.locks == [
+        f"dalton:kv:{ws_new}:sector",
+        f"dalton:kv:{_BIND_WS}:sector",
+    ]
+    assert {m["sector_unit_id"] for m in executed.members} == {_BIND_UNIT_SECTOR_A}
+
+
+@pytest.mark.asyncio
+async def test_bind_lock_key_uses_normalized_workspace_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """大写 UUID 绑定：锁 key 用库里返回的规范化 id，与写文档路径是同一把锁（codex r3 #2）。"""
+    _install_units_flag(monkeypatch, True)
+    unit_b = _bind_unit_row(
+        unit_id=_BIND_UNIT_SECTOR_B, kind="sector", slug="sector-b", ticker=None
+    )
+    ws_upper = "AAAAAAAA-0000-0000-0000-000000000001"
+    ws_norm = ws_upper.lower()
+    executed = _install_bind_db(
+        monkeypatch,
+        unit_rows=[unit_b],
+        ws_rows={
+            ws_norm: {
+                "workspace_id": ws_norm,
+                "user_id": _BIND_USER,
+                "name": "Mine",
+                "status": "active",
+            }
+        },
+        active_binding_by_ws={},
+        sector_doc_by_ws={ws_norm: _sector_doc_2_members()},
+    )
+
+    await cu_db.bind_coverage_unit_workspace(_BIND_UNIT_SECTOR_B, ws_upper, _BIND_USER)
+
+    assert executed.locks == [f"dalton:kv:{ws_norm}:sector"]
+    assert len(executed.members) == 2
+
+
+@pytest.mark.asyncio
+async def test_bind_sector_unit_to_workspace_without_doc_clears_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """行业单元绑到无有效文档的工作区：其旧投影被清空（投影=文档，文档无则无）。"""
+    _install_units_flag(monkeypatch, True)
+    unit_b = _bind_unit_row(
+        unit_id=_BIND_UNIT_SECTOR_B, kind="sector", slug="sector-b", ticker=None
+    )
+    executed = _install_bind_db(
+        monkeypatch,
+        unit_rows=[unit_b],
+        ws_rows={
+            _BIND_WS: {
+                "workspace_id": _BIND_WS,
+                "user_id": _BIND_USER,
+                "name": "Mine",
+                "status": "active",
+            }
+        },
+        active_binding_by_ws={},
+        sector_doc_by_ws={},  # W 没有行业文档
+        initial_members=[
+            _member_row(_BIND_UNIT_SECTOR_B, "M1"),
+            _member_row(_BIND_UNIT_SECTOR_B, "M2"),
+        ],
+    )
+
+    row = await cu_db.bind_coverage_unit_workspace(_BIND_UNIT_SECTOR_B, _BIND_WS, _BIND_USER)
+    assert row["workspace_id"] == _BIND_WS
+    assert executed.members == []
+    assert executed.locks == [f"dalton:kv:{_BIND_WS}:sector"]
+    assert any("FROM dalton_knowledge_versions" in s for s in executed)
+
+
+@pytest.mark.asyncio
+async def test_bind_company_unit_never_touches_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """公司单元绑定：不取 advisory 锁、不碰 dalton_sector_members（kind 门控）。"""
+    _install_units_flag(monkeypatch, True)
+    company = _bind_unit_row(unit_id=_BIND_UNIT_OWN, kind="company", slug="mega-tech")
+    executed = _install_bind_db(
+        monkeypatch,
+        unit_rows=[company],
+        ws_rows={
+            _BIND_WS: {
+                "workspace_id": _BIND_WS,
+                "user_id": _BIND_USER,
+                "name": "Mine",
+                "status": "active",
+            }
+        },
+        active_binding_by_ws={},
+        sector_doc_by_ws={_BIND_WS: _sector_doc_2_members()},
+        initial_members=[_member_row(_BIND_UNIT_SECTOR_A, "M1")],
+    )
+
+    await cu_db.bind_coverage_unit_workspace(_BIND_UNIT_OWN, _BIND_WS, _BIND_USER)
+    assert not any(s.startswith("SELECT pg_advisory_xact_lock") for s in executed)
+    assert not any("dalton_sector_members" in s for s in executed)
+    assert not any("dalton_knowledge_versions" in s for s in executed)
+    assert len(executed.members) == 1  # 预置行原样
+
+
+@pytest.mark.asyncio
+async def test_unbind_and_archive_clear_sector_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """解绑 / 归档行业单元：同一事务内对原工作区取锁后清空投影。"""
+    _install_units_flag(monkeypatch, True)
+    sector = _bind_unit_row(
+        unit_id=_BIND_UNIT_SECTOR_A, kind="sector", slug="sector-a",
+        workspace_id=_BIND_WS, ticker=None,
+    )
+    executed = _install_bind_db(
+        monkeypatch,
+        unit_rows=[sector],
+        ws_rows={},
+        active_binding_by_ws={},
+        initial_members=[
+            _member_row(_BIND_UNIT_SECTOR_A, "M1"),
+            _member_row(_BIND_UNIT_SECTOR_A, "M2"),
+        ],
+    )
+
+    unbound = await cu_db.unbind_coverage_unit_workspace(_BIND_UNIT_SECTOR_A, _BIND_USER)
+    assert unbound is not None and unbound["workspace_id"] is None
+    assert executed.members == []
+    assert executed.locks == [f"dalton:kv:{_BIND_WS}:sector"]
+
+    # 归档路径同样清空（重新放两行再归档）。此时单元已被解绑、原工作区为空，
+    # 按契约不取锁、直接删——locks 不再增长。
+    executed.members.extend(
+        [_member_row(_BIND_UNIT_SECTOR_A, "M1"), _member_row(_BIND_UNIT_SECTOR_A, "M2")]
+    )
+    archived = await cu_db.set_coverage_unit_status(
+        _BIND_UNIT_SECTOR_A, _BIND_USER, "archived"
+    )
+    assert archived is not None and archived["status"] == "archived"
+    assert executed.members == []
+    assert executed.locks == [f"dalton:kv:{_BIND_WS}:sector"]
+
+
+@pytest.mark.asyncio
+async def test_unbind_company_unit_does_not_touch_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """公司单元解绑：预读只判 kind，不取锁、不碰投影。"""
+    _install_units_flag(monkeypatch, True)
+    company = _bind_unit_row(
+        unit_id=_BIND_UNIT_OWN, kind="company", slug="mega-tech", workspace_id=_BIND_WS
+    )
+    executed = _install_bind_db(
+        monkeypatch,
+        unit_rows=[company],
+        ws_rows={},
+        active_binding_by_ws={},
+        initial_members=[_member_row(_BIND_UNIT_SECTOR_A, "M1")],
+    )
+
+    row = await cu_db.unbind_coverage_unit_workspace(_BIND_UNIT_OWN, _BIND_USER)
+    assert row is not None and row["workspace_id"] is None
+    assert not any(s.startswith("SELECT pg_advisory_xact_lock") for s in executed)
+    assert not any("dalton_sector_members" in s for s in executed)
+    assert len(executed.members) == 1
+
+
+@pytest.mark.asyncio
+async def test_flag_off_bind_does_not_sync_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """开关关闭：绑定不同步投影——不取锁、不读文档、不碰成员表（与 knowledge 同门控）。"""
+    _install_units_flag(monkeypatch, False)
+    sector = _bind_unit_row(
+        unit_id=_BIND_UNIT_SECTOR_A, kind="sector", slug="sector-a", ticker=None
+    )
+    executed = _install_bind_db(
+        monkeypatch,
+        unit_rows=[sector],
+        ws_rows={
+            _BIND_WS: {
+                "workspace_id": _BIND_WS,
+                "user_id": _BIND_USER,
+                "name": "Mine",
+                "status": "active",
+            }
+        },
+        active_binding_by_ws={},
+        sector_doc_by_ws={_BIND_WS: _sector_doc_2_members()},
+        initial_members=[_member_row(_BIND_UNIT_SECTOR_A, "M1")],
+    )
+
+    row = await cu_db.bind_coverage_unit_workspace(_BIND_UNIT_SECTOR_A, _BIND_WS, _BIND_USER)
+    assert row["workspace_id"] == _BIND_WS
+    assert not any(s.startswith("SELECT pg_advisory_xact_lock") for s in executed)
+    assert not any("dalton_sector_members" in s for s in executed)
+    assert not any("dalton_knowledge_versions" in s for s in executed)
+    assert len(executed.members) == 1
+
+
+# ---------------------------------------------------------------------------
 # 唯一约束冲突 → 可读错误（表上的索引才是真约束；这里只锁映射）
 # ---------------------------------------------------------------------------
 

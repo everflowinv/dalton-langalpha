@@ -176,6 +176,58 @@ async def fetch_members_for_sectors(
     return [dict(r) for r in await cur.fetchall()]
 
 
+async def sync_projection_to_latest_doc(
+    cur: Any,
+    workspace_id: str,
+    sector_unit_id: str,
+    *,
+    clear_when_no_doc: bool = False,
+) -> dict[str, Any] | None:
+    """Rewrite one sector unit's projection from its workspace's latest valid doc.
+
+    The projection's definition is "what the sector unit's currently bound
+    workspace's latest schema-valid ``sector`` document says", so the binding's
+    own write paths (bind; codex r3) sync inside the same transaction. Runs in
+    the CALLER's transaction, which must already hold the workspace's
+    ``dalton:kv:{workspace_id}:sector`` advisory lock (the ``insert_version``
+    lock) so an online document write is serialized either before us (we see
+    its version) or after us (its own sync supersedes ours).
+
+    With no valid document: ``clear_when_no_doc=True`` (the bind path — the
+    projection must equal nothing) deletes the unit's rows and reports zero
+    members; ``False`` keeps :func:`rebuild_sector_members_projection`'s
+    historical "skip, clear nothing" behavior.
+    """
+    await cur.execute(
+        """
+        SELECT version_no, content
+        FROM dalton_knowledge_versions
+        WHERE workspace_id = %s::uuid
+          AND doc_key = 'sector'
+          AND schema_valid = TRUE
+        ORDER BY version_no DESC
+        LIMIT 1
+        """,
+        (str(workspace_id).strip(),),
+    )
+    doc_row = await cur.fetchone()
+    if doc_row is None:
+        if not clear_when_no_doc:
+            return None
+        await cur.execute(
+            "DELETE FROM dalton_sector_members WHERE sector_unit_id = %s::uuid",
+            (str(sector_unit_id).strip(),),
+        )
+        return {
+            "sector_unit_id": str(sector_unit_id),
+            "members": 0,
+            "synced_version_no": None,
+        }
+    return await sync_members_projection(
+        cur, workspace_id, doc_row["content"], int(doc_row["version_no"])
+    )
+
+
 async def list_members_for_company(
     company_unit_id: str,
     *,
@@ -326,23 +378,10 @@ async def rebuild_sector_members_projection(
                     await cur.execute(
                         "SELECT pg_advisory_xact_lock(hashtext(%s))", (lock_key,)
                     )
-                    await cur.execute(
-                        """
-                        SELECT version_no, content
-                        FROM dalton_knowledge_versions
-                        WHERE workspace_id = %s::uuid
-                          AND doc_key = 'sector'
-                          AND schema_valid = TRUE
-                        ORDER BY version_no DESC
-                        LIMIT 1
-                        """,
-                        (ws_id,),
-                    )
-                    doc_row = await cur.fetchone()
-                    if doc_row is None:
-                        continue
-                    summary = await sync_members_projection(
-                        cur, ws_id, doc_row["content"], int(doc_row["version_no"])
+                    # 无文档时跳过、不清空（rebuild 的历史行为）；
+                    # 有文档则整表重写为该文档的成员清单。
+                    summary = await sync_projection_to_latest_doc(
+                        cur, ws_id, str(unit["unit_id"])
                     )
                     if summary is not None:
                         rebuilt.append(summary)

@@ -1,14 +1,24 @@
 import React, { useMemo, useState } from 'react';
 import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
-import { ChevronDown, ChevronRight, ExternalLink, Loader2, RefreshCw } from 'lucide-react';
+import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { ChevronDown, ChevronRight, ExternalLink, Loader2, Plus, RefreshCw } from 'lucide-react';
+import { useAuth } from '@/contexts/AuthContext';
 import {
+  archiveDaltonCoverageUnit,
+  bindDaltonCoverageUnit,
+  coverageUnitErrorCode,
   type CoverageUnitDetail,
   type CoverageUnitEntry,
+  type RegisterCoverageUnitPayload,
   type SectorMember,
+  type UnclassifiedWorkspace,
+  registerDaltonCoverageUnit,
+  unbindDaltonCoverageUnit,
   useDaltonCoverageUnitDetail,
   useDaltonCoverageUnits,
 } from '@/lib/dalton/coverage';
+import { queryKeys } from '@/lib/queryKeys';
 import { cn } from '@/lib/utils';
 
 type CoverageTab = 'sectors' | 'companies' | 'unclassified';
@@ -59,17 +69,288 @@ function OpenWorkspaceLink({ workspaceId }: { workspaceId: string }) {
   );
 }
 
+type TFunc = ReturnType<typeof useTranslation>['t'];
+
+/** 写路径错误文案：有稳定错误码走 i18n，否则退回原始 message。 */
+function coverageMutationError(err: unknown, t: TFunc): string {
+  const code = coverageUnitErrorCode(err);
+  if (code) {
+    const keyed = t(`dalton.coverage.errors.${code}`, { defaultValue: '' });
+    if (keyed) return keyed;
+  }
+  return err instanceof Error && err.message
+    ? err.message
+    : t('dalton.coverage.errors.fallback');
+}
+
+/** 新建行业单元（P5）：只登记 sector；绑定在单元行上单独做。 */
+function RegisterSectorForm() {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const [slug, setSlug] = useState('');
+  const [displayName, setDisplayName] = useState('');
+  const [researchTz, setResearchTz] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [createdSlug, setCreatedSlug] = useState<string | null>(null);
+
+  const registerMutation = useMutation({
+    mutationFn: (payload: RegisterCoverageUnitPayload) => registerDaltonCoverageUnit(payload),
+    onSuccess: (unit) => {
+      setError(null);
+      setCreatedSlug(unit.slug);
+      setSlug('');
+      setDisplayName('');
+      setResearchTz('');
+      void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.coverageUnits() });
+    },
+    onError: (err: unknown) => {
+      setCreatedSlug(null);
+      setError(coverageMutationError(err, t));
+    },
+  });
+
+  const submit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const cleanSlug = slug.trim();
+    if (!cleanSlug) {
+      setError(t('dalton.coverage.errors.invalid_slug'));
+      return;
+    }
+    registerMutation.mutate({
+      kind: 'sector',
+      slug: cleanSlug,
+      display_name: displayName.trim() || undefined,
+      research_tz: researchTz.trim() || undefined,
+    });
+  };
+
+  return (
+    <form
+      onSubmit={submit}
+      data-testid="coverage-register-form"
+      className="mb-3 rounded-md border border-border/50 bg-background/40 p-2"
+    >
+      <div className="flex flex-wrap items-center gap-2 pb-2">
+        <span className="inline-flex items-center gap-1 text-xs font-medium text-foreground">
+          <Plus className="h-3.5 w-3.5 text-muted-foreground" />
+          {t('dalton.coverage.registerTitle')}
+        </span>
+        <span className="text-[11px] text-muted-foreground">
+          {t('dalton.coverage.registerHint')}
+        </span>
+      </div>
+      <div className="flex flex-wrap items-center gap-2">
+        <input
+          value={slug}
+          onChange={(e) => setSlug(e.target.value)}
+          placeholder={t('dalton.coverage.fieldSlug')}
+          aria-label={t('dalton.coverage.fieldSlug')}
+          data-testid="coverage-register-slug"
+          className="w-56 rounded border border-border/60 bg-background px-2 py-1 text-xs"
+        />
+        <input
+          value={displayName}
+          onChange={(e) => setDisplayName(e.target.value)}
+          placeholder={t('dalton.coverage.fieldDisplayName')}
+          aria-label={t('dalton.coverage.fieldDisplayName')}
+          data-testid="coverage-register-display-name"
+          className="w-44 rounded border border-border/60 bg-background px-2 py-1 text-xs"
+        />
+        <input
+          value={researchTz}
+          onChange={(e) => setResearchTz(e.target.value)}
+          placeholder={t('dalton.coverage.fieldResearchTz')}
+          aria-label={t('dalton.coverage.fieldResearchTz')}
+          data-testid="coverage-register-tz"
+          className="w-56 rounded border border-border/60 bg-background px-2 py-1 text-xs"
+        />
+        <button
+          type="submit"
+          disabled={registerMutation.isPending}
+          data-testid="coverage-register-submit"
+          className="rounded-md border border-border/60 bg-background px-2.5 py-1 text-xs font-medium hover:bg-muted/60 disabled:opacity-50"
+        >
+          {registerMutation.isPending
+            ? t('dalton.coverage.registering')
+            : t('dalton.coverage.register')}
+        </button>
+      </div>
+      {createdSlug && (
+        <div
+          data-testid="coverage-register-done"
+          className="pt-1 text-[11px] text-emerald-600 dark:text-emerald-400"
+        >
+          {t('dalton.coverage.registeredSlug', { slug: createdSlug })}
+        </div>
+      )}
+      {error && (
+        <div
+          role="alert"
+          data-testid="coverage-register-error"
+          className="pt-1 text-[11px] text-destructive"
+        >
+          {error}
+        </div>
+      )}
+    </form>
+  );
+}
+
+/** UnitManageActions 只消费这两个字段；CoverageUnitEntry 与 CoverageUnitDetail 都结构满足。 */
+interface ManageableUnit {
+  unit_id: string;
+  workspace_id: string | null;
+}
+
+/** 本人单元行上的管理操作（P5）：绑定（选本人的未绑定工作区）/ 解绑 / 归档。 */
+function UnitManageActions({
+  unit,
+  unclassified,
+}: {
+  unit: ManageableUnit;
+  unclassified: UnclassifiedWorkspace[];
+}) {
+  const { t } = useTranslation();
+  const queryClient = useQueryClient();
+  const [wsChoice, setWsChoice] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [hint, setHint] = useState<string | null>(null);
+
+  const invalidate = () => {
+    void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.coverageUnits() });
+    void queryClient.invalidateQueries({
+      queryKey: queryKeys.dalton.coverageUnitDetail(unit.unit_id),
+    });
+  };
+
+  const bindMutation = useMutation({
+    mutationFn: (wsId: string) => bindDaltonCoverageUnit(unit.unit_id, wsId),
+    onSuccess: (row) => {
+      setError(null);
+      setWsChoice('');
+      setHint(row.kind === 'sector' ? t('dalton.coverage.boundHintSector') : null);
+      invalidate();
+    },
+    onError: (err: unknown) => setError(coverageMutationError(err, t)),
+  });
+  const unbindMutation = useMutation({
+    mutationFn: () => unbindDaltonCoverageUnit(unit.unit_id),
+    onSuccess: () => {
+      setError(null);
+      setHint(null);
+      invalidate();
+    },
+    onError: (err: unknown) => setError(coverageMutationError(err, t)),
+  });
+  const archiveMutation = useMutation({
+    mutationFn: () => archiveDaltonCoverageUnit(unit.unit_id),
+    onSuccess: () => {
+      setError(null);
+      setHint(null);
+      invalidate();
+    },
+    onError: (err: unknown) => setError(coverageMutationError(err, t)),
+  });
+
+  const busy =
+    bindMutation.isPending || unbindMutation.isPending || archiveMutation.isPending;
+  const actionBtn =
+    'rounded border border-border/60 bg-background px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-muted/60 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50';
+
+  return (
+    <div
+      className="flex w-full flex-col gap-1 pt-1"
+      data-testid={`coverage-manage-${unit.unit_id}`}
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        {!unit.workspace_id && (
+          <>
+            <select
+              value={wsChoice}
+              onChange={(e) => setWsChoice(e.target.value)}
+              data-testid={`coverage-bind-select-${unit.unit_id}`}
+              aria-label={t('dalton.coverage.bindTargetNone')}
+              disabled={busy || unclassified.length === 0}
+              className="max-w-56 rounded border border-border/60 bg-background px-1.5 py-0.5 text-[11px]"
+            >
+              <option value="">{t('dalton.coverage.bindTargetNone')}</option>
+              {unclassified.map((ws) => (
+                <option key={ws.workspace_id} value={ws.workspace_id}>
+                  {ws.name ?? ws.workspace_id}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              onClick={() => {
+                if (wsChoice) bindMutation.mutate(wsChoice);
+              }}
+              disabled={busy || !wsChoice}
+              data-testid={`coverage-bind-btn-${unit.unit_id}`}
+              className={actionBtn}
+            >
+              {bindMutation.isPending
+                ? t('dalton.coverage.binding')
+                : t('dalton.coverage.bind')}
+            </button>
+          </>
+        )}
+        {unit.workspace_id && (
+          <button
+            type="button"
+            onClick={() => unbindMutation.mutate()}
+            disabled={busy}
+            data-testid={`coverage-unbind-btn-${unit.unit_id}`}
+            className={actionBtn}
+          >
+            {t('dalton.coverage.unbind')}
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={() => archiveMutation.mutate()}
+          disabled={busy}
+          data-testid={`coverage-archive-btn-${unit.unit_id}`}
+          className={actionBtn}
+        >
+          {t('dalton.coverage.archiveUnit')}
+        </button>
+      </div>
+      {hint && (
+        <div
+          data-testid={`coverage-bind-hint-${unit.unit_id}`}
+          className="text-[11px] text-muted-foreground"
+        >
+          {hint}
+        </div>
+      )}
+      {error && (
+        <div
+          role="alert"
+          data-testid={`coverage-manage-error-${unit.unit_id}`}
+          className="text-[11px] text-destructive"
+        >
+          {error}
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** 行业成员行：登记了公司单元的成员可展开该公司详情（关联行业 + 待复核）。 */
 function MemberRow({
   member,
   expanded,
   onToggle,
+  unclassified,
 }: {
   member: SectorMember;
   expanded: boolean;
   onToggle: () => void;
+  unclassified: UnclassifiedWorkspace[];
 }) {
   const { t } = useTranslation();
+  const { userId } = useAuth();
   const detailQuery = useDaltonCoverageUnitDetail(
     expanded && member.company_unit_id ? member.company_unit_id : null,
   );
@@ -136,7 +417,15 @@ function MemberRow({
               {t('dalton.coverage.detailError')}
             </div>
           ) : detailQuery.data ? (
-            <CompanyDetail detail={detailQuery.data} />
+            <>
+              <CompanyDetail detail={detailQuery.data} />
+              {/* 成员公司同样有自己的管理入口（codex r2 #1）：归属判断用
+                  详情响应的 owner_user_id，与 UnitRow 同一规则；成员被
+                  "独立公司"入口排除，这里是本人公司单元唯一的行内入口。 */}
+              {detailQuery.data.owner_user_id === userId && (
+                <UnitManageActions unit={detailQuery.data} unclassified={unclassified} />
+              )}
+            </>
           ) : null}
         </div>
       )}
@@ -164,7 +453,13 @@ function DetailSection({
   );
 }
 
-function SectorDetail({ detail }: { detail: CoverageUnitDetail }) {
+function SectorDetail({
+  detail,
+  unclassified,
+}: {
+  detail: CoverageUnitDetail;
+  unclassified: UnclassifiedWorkspace[];
+}) {
   const { t } = useTranslation();
   const [expandedMember, setExpandedMember] = useState<string | null>(null);
   const sector = detail.sector;
@@ -279,6 +574,7 @@ function SectorDetail({ detail }: { detail: CoverageUnitDetail }) {
                   prev === (m.member_id ?? '') ? null : (m.member_id ?? ''),
                 )
               }
+              unclassified={unclassified}
             />
           ))}
         </div>
@@ -378,10 +674,18 @@ function CompanyDetail({ detail }: { detail: CoverageUnitDetail }) {
   );
 }
 
-function UnitRow({ unit, expanded, onToggle }: {
+function UnitRow({
+  unit,
+  expanded,
+  onToggle,
+  own,
+  unclassified,
+}: {
   unit: CoverageUnitEntry;
   expanded: boolean;
   onToggle: () => void;
+  own: boolean;
+  unclassified: UnclassifiedWorkspace[];
 }) {
   const { t } = useTranslation();
   const detailQuery = useDaltonCoverageUnitDetail(expanded ? unit.unit_id : null);
@@ -423,11 +727,13 @@ function UnitRow({ unit, expanded, onToggle }: {
             <div className="py-2 text-xs text-destructive">{t('dalton.coverage.detailError')}</div>
           ) : detailQuery.data ? (
             unit.kind === 'sector' ? (
-              <SectorDetail detail={detailQuery.data} />
+              <SectorDetail detail={detailQuery.data} unclassified={unclassified} />
             ) : (
               <CompanyDetail detail={detailQuery.data} />
             )
           ) : null}
+          {/* 登记 / 绑定 / 解绑 / 归档只出现在本人的单元行上（P5） */}
+          {own && <UnitManageActions unit={unit} unclassified={unclassified} />}
         </div>
       )}
     </div>
@@ -443,6 +749,7 @@ function UnitRow({ unit, expanded, onToggle }: {
  */
 export function DaltonCoverageCard(): React.ReactElement | null {
   const { t } = useTranslation();
+  const { userId } = useAuth();
   const [tab, setTab] = useState<CoverageTab>('sectors');
   const [expandedUnit, setExpandedUnit] = useState<string | null>(null);
   const { data, isLoading, isFetching, refetch, error } = useDaltonCoverageUnits();
@@ -517,6 +824,9 @@ export function DaltonCoverageCard(): React.ReactElement | null {
         </div>
       )}
 
+      {/* 新建行业单元：绑定目标 = 未分类工作区（本人的、未绑 active 单元、非 Home） */}
+      <RegisterSectorForm />
+
       <div className="mb-2 flex gap-1" data-testid="coverage-tabs">
         {tabs.map(({ key, label, count }) => (
           <button
@@ -555,6 +865,8 @@ export function DaltonCoverageCard(): React.ReactElement | null {
                   onToggle={() =>
                     setExpandedUnit((prev) => (prev === u.unit_id ? null : u.unit_id))
                   }
+                  own={u.owner_user_id === userId}
+                  unclassified={unclassified}
                 />
               ))}
             </div>
@@ -575,6 +887,8 @@ export function DaltonCoverageCard(): React.ReactElement | null {
                   onToggle={() =>
                     setExpandedUnit((prev) => (prev === u.unit_id ? null : u.unit_id))
                   }
+                  own={u.owner_user_id === userId}
+                  unclassified={unclassified}
                 />
               ))}
             </div>

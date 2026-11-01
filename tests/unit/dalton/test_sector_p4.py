@@ -291,7 +291,15 @@ def _make_cursor(
             sql = last["sql"]
             p = list(last["params"] or [])
             if "FROM workspaces" in sql:
-                return ws_rows
+                # 按 SELECT 列清单投影（codex r2 #3）：漏选的键不得出现在行里，
+                # 否则 is_home_row 对 status 的依赖测不出来（撤修即失败）。
+                cols = [
+                    c.strip().rsplit(" AS ", 1)[-1].strip()
+                    for c in sql.split("SELECT", 1)[1]
+                    .split("FROM workspaces", 1)[0]
+                    .split(",")
+                ]
+                return [{k: r.get(k) for k in cols} for r in ws_rows]
             if "FROM automations" in sql:
                 if p and "user_id = %s" in sql:
                     return [
@@ -571,6 +579,50 @@ def test_list_units_and_unclassified(client: TestClient, monkeypatch: pytest.Mon
         assert "%s IS NULL" not in s, f"untyped NULL param: {s}"
         assert " LIKE " not in s, f"LIKE literal pattern: {s}"
     assert any("%s::text IS NULL" in s for s in executed)
+
+
+def test_list_unclassified_excludes_legacy_unbound_home(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """codex r2 #3：账号合并遗留的旧 Home（id 与新所有者不匹配、status='unbound'）
+    不得进入未分类列表——查询必须投影 status，is_home_row 才认得出它。"""
+    _install_flag(monkeypatch, True)
+    unit_rows = [_sector_unit_row(), _company_unit_row()]
+    legacy_home_ws = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"  # 非 uuid5 派生的 Home id
+    ws_rows = [
+        {
+            "workspace_id": WS_EXTRA,
+            "user_id": USER,
+            "name": "随便的主题工作区",
+            "description": "",
+            "updated_at": None,
+            "status": "active",
+        },
+        {
+            "workspace_id": legacy_home_ws,
+            "user_id": USER,
+            "name": "旧 Home",
+            "description": "",
+            "updated_at": None,
+            "status": "unbound",
+        },
+    ]
+    cur, executed = _make_cursor(
+        unit_rows=unit_rows, ws_rows=ws_rows, auto_rows=[], kv_rows=[]
+    )
+    _install_db(
+        monkeypatch,
+        cur,
+        units_by_ws=_default_units_by_ws(),
+        unit_by_id={UNIT_SECTOR: _sector_unit_row(), UNIT_COMPANY: _company_unit_row()},
+        member_rows=_member_rows(),
+    )
+
+    body = client.get("/api/v1/dalton/coverage/units").json()
+    # 遗留 Home 被排除；普通未分类工作区照常出现
+    assert [w["workspace_id"] for w in body["unclassified"]] == [WS_EXTRA]
+    ws_sql = next(s for s in executed if "FROM workspaces" in s)
+    assert "status" in ws_sql.split("FROM workspaces", 1)[0]
 
 
 def test_list_colleague_units_only_via_visible_workspaces(

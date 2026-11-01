@@ -449,3 +449,20 @@ def test_dedupe_script_compares_invalid_json_by_full_sha() -> None:
     # Same truncated ``_raw``, different full-text sha: not provably a duplicate.
     deletable, notes = find_spurious([v1, v2, differs])
     assert deletable == [] and notes == []
+
+
+def test_dedupe_script_canonicalizes_workspace_arg(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An uppercase --workspace reaches run() (and its advisory lock key) in the
+    canonical lowercase form the online writers lock (codex sector-reg r5)."""
+    import scripts.dalton.dedupe_knowledge_direct_edits as dedupe
+
+    run_mock = create_autospec(dedupe.run, return_value=None)
+    monkeypatch.setattr(dedupe, "run", run_mock)
+    monkeypatch.setattr(
+        dedupe, "resolve_db_params", create_autospec(dedupe.resolve_db_params, return_value={})
+    )
+    monkeypatch.setattr(
+        dedupe, "build_conninfo", create_autospec(dedupe.build_conninfo, return_value="")
+    )
+    assert dedupe.main(["--workspace", "ABCDEF12-3456-7890-ABCD-EF1234567890"]) == 0
+    assert run_mock.call_args.args[0] == "abcdef12-3456-7890-abcd-ef1234567890"

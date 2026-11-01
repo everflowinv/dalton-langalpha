@@ -30,6 +30,7 @@ import argparse
 import hashlib
 import json
 import sys
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -258,7 +259,13 @@ def run(
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--workspace", required=True, help="Workspace UUID")
+    # Canonical UUID text: the advisory lock key below must match the one the
+    # online writers build (``knowledge._kv_lock_workspace``), or an
+    # uppercase spelling would never serialize against them.
+    ap.add_argument(
+        "--workspace", required=True, type=lambda v: str(uuid.UUID(v.strip())),
+        help="Workspace UUID",
+    )
     ap.add_argument("--apply", action="store_true", help="Delete the listed rows")
     ap.add_argument("--expect-count", type=int, default=None, help="Required with --apply")
     ap.add_argument(
