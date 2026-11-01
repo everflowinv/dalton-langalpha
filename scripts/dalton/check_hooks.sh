@@ -267,6 +267,13 @@ ALLOWED_HOOKS=(
   # ffprobe the ASR pipeline probes recording duration with
   # (Dockerfile.sandbox).
   "sandbox-ffprobe"
+  # P6b: scrapling's browser/stealth tiers delegate to the dedicated crawl
+  # service container (docker-compose.dalton.yml `crawler`,
+  # src/dalton/crawl_service/) when crawler.browser_service_url is set — the
+  # tier hook lives in scrapling_crawler.py (_fetch_via_crawl_service +
+  # _tier2/_tier3), the key's getter in tool_settings.py. A service failure
+  # fails the tier with no in-process fallback.
+  "crawl-service"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

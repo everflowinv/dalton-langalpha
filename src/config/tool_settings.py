@@ -140,6 +140,19 @@ def get_crawler_browser_concurrency(default: int = 2) -> int:
     return resolve_crawler_browser_concurrency(default)[0]
 
 
+# DALTON-HOOK(crawl-service): base URL of the dedicated crawl-browser service
+# (P6b, src/dalton/crawl_service/). Unset — the upstream default — keeps
+# Tier 2/3 fetching in-process; Dalton's deployment overlay sets it so
+# scrapling's Chromium/Camoufox run in their own memory-capped container
+# instead of beside the server process in the 4 GB backend.
+def get_crawler_browser_service_url(default: str = "") -> str:
+    """Base URL the crawler delegates browser/stealth tiers to; '' = in-process."""
+    value = _get_tool_config('crawler.browser_service_url')
+    if isinstance(value, str) and value.strip():
+        return value.strip().rstrip("/")
+    return default
+
+
 def get_crawler_page_timeout(default: int = 60000) -> int:
     """Get crawler page timeout in milliseconds."""
     return int(_get_tool_config('crawler.page_timeout', default))

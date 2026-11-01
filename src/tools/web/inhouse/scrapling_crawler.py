@@ -392,7 +392,32 @@ class ScraplingCrawler:
         async with self._http_sem:
             return await fetch_fast(url, timeout_s=_TIER1_TIMEOUT_MS / 1000)
 
+    # DALTON-HOOK(crawl-service): Tier 2/3 delegation to the dedicated crawl
+    # service (P6b, src/dalton/crawl_service/). Returns None when
+    # `crawler.browser_service_url` is unset, leaving the in-process path
+    # below untouched (local dev, upstream parity). When the service is
+    # configured, a failure raises CrawlServiceError into the tier's existing
+    # except path — deliberately NO fallback to an in-process browser, which
+    # would move Chromium back into the memory-capped backend container this
+    # split exists to protect. The local browser semaphore is bypassed on this
+    # path: queueing belongs at the service, whose own semaphore bounds the
+    # real browser count in the container that actually pays for them.
+    async def _fetch_via_crawl_service(self, url: str, tier: str, **fetch_kwargs):
+        from src.config.tool_settings import get_crawler_browser_service_url
+
+        if not get_crawler_browser_service_url():
+            return None
+
+        from src.dalton.crawl_service.client import fetch_via_service
+
+        return await fetch_via_service(
+            url, tier=tier, timeout_ms=self.timeout, **fetch_kwargs
+        )
+
     async def _tier2_fetch(self, url: str):
+        serviced = await self._fetch_via_crawl_service(url, "browser")  # DALTON-HOOK(crawl-service)
+        if serviced is not None:
+            return serviced
         async with self._browser_sem:
             session = make_session(
                 "browser",
@@ -405,6 +430,11 @@ class ScraplingCrawler:
     async def _tier3_fetch(self, url: str, *, solve_cloudflare: bool):
         """Stealth fetch with optional CF solver. Caller decides based on Tier 2's
         observation — invoking the solver against a non-CF page is wasted work."""
+        serviced = await self._fetch_via_crawl_service(  # DALTON-HOOK(crawl-service)
+            url, "stealth", solve_cloudflare=solve_cloudflare
+        )
+        if serviced is not None:
+            return serviced
         async with self._browser_sem:
             session = make_session(
                 "stealth", timeout_ms=self.timeout, network_idle=self.network_idle
