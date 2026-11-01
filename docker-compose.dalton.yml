@@ -65,12 +65,11 @@ services:
   # default 64 MB. APP_ENV matches the backend's, so the same agent_config
   # overlay (and thus crawler.browser_concurrency) applies on both sides.
   crawler:
-    build:
-      context: .
-      dockerfile: scripts/dalton/Dockerfile.dalton
-      args:
-        BUILD_GIT_SHA: ${BUILD_GIT_SHA:-}
-        BUILD_GIT_DIRTY: ${BUILD_GIT_DIRTY:-}
+    # The backend's image, never built on its own: it carries scrapling and the
+    # browsers, and the code comes from the bind mounts below. A separate build
+    # would need the backend's BUILD_GIT_SHA args and could drift from it
+    # (the 2026-11-01 P6b deploy failed exactly there).
+    image: dalton-langalpha-backend
     # Not the backend entrypoint: no DB wait, no migrations — the service
     # touches neither Postgres nor Redis. tini still reaps what a killed crawl
     # worker leaves behind.
