@@ -411,7 +411,10 @@ def _grant_bridge(tmp_path: Path) -> rb.ResearchDataBridge:
     bridge.cfg = create_autospec(rb.BridgeConfig, instance=True)
     bridge.cfg.wiki_ingest_audit_file = tmp_path / "wiki_ingest_audit.jsonl"
     bridge._feishu_client_instance = create_autospec(rb.FeishuClient, instance=True)
-    bridge._feishu_client_instance.grant_full_access.return_value = "openid:ou_1"
+    bridge._feishu_client_instance.grant_full_access_with_phases.return_value = (
+        "openid:ou_1",
+        [],
+    )
     return bridge
 
 
@@ -453,7 +456,7 @@ class TestGrantScopeBridge:
         assert payload["ok"] is True
         assert payload["granted"] == "u@corp.com"
         assert payload["url"]
-        bridge._feishu_client_instance.grant_full_access.assert_called_once_with(
+        bridge._feishu_client_instance.grant_full_access_with_phases.assert_called_once_with(
             "docx-g1", "u@corp.com"
         )
         # The registration itself persisted with the normalized email.
@@ -952,13 +955,21 @@ class TestOpenIdLookup:
         client = create_autospec(rb.FeishuClient, instance=True)
         client._request.return_value = {"user_list": [{"email": "b@corp.com", "user_id": ""}]}
         assert rb.FeishuClient.user_open_id_by_email(client, "a@corp.com") == ""
-        # grant_full_access keeps the email spelling as the fallback.
+        # The grant keeps the email spelling as the fallback spelling, and
+        # answers with the per-stage phase list (R7 r2).
         client.user_open_id_by_email.return_value = ""
         client._request.side_effect = [
             {"code": 0},  # email-form permission grant
         ]
-        spelling = rb.FeishuClient.grant_full_access(client, "docx-1", "a@corp.com")
+        spelling, phases = rb.FeishuClient.grant_full_access_with_phases(
+            client, "docx-1", "a@corp.com"
+        )
         assert spelling == "email:a@corp.com"
+        # lookup → skipped openid → email grant: the fallback path shape. The
+        # phase dicts themselves are Mocks here (autospec self); the per-stage
+        # field contract is locked by the fake-HTTP tests in
+        # test_feishu_grant_r7.py.
+        assert len(phases) == 3
 
 
 # ---------------------------------------------------------------------------

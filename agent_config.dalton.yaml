@@ -57,9 +57,11 @@ search_api: "openclaw"
 # holds. Each Tier-2/3 stealth browser costs ~400 MB, so upstream's default of
 # 6 (~2.4 GB of browsers) pushed the container to 3.99/4 GB — one browser short
 # of an OOM kill — when the pre-market insight tasks opened 3 at once
-# (2026-10). 2 keeps the browser tier at ~0.8 GB and leaves the turn headroom.
+# (2026-10). 2 kept the browser tier at ~0.8 GB on average, but on 10-31 one
+# crawl's process tree reached ~3.2 GB and the container hit 4095.96/4096 MiB
+# (P6a sampling). 1 until crawls move to their own memory-capped container (P6b).
 crawler:
-  browser_concurrency: 2
+  browser_concurrency: 1
 
 # Fetch falls through the chain per URL: in-house first; Firecrawl only for the
 # URLs in-house could not fetch (403, anti-bot, JS-only pages). Firecrawl bills

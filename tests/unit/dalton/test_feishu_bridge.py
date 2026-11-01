@@ -171,7 +171,7 @@ async def test_doc_create_grants_and_survives_grant_failure(
 
     _stub_feishu_client(
         bridge,
-        grant_full_access=_grant_fail,
+        grant_full_access_with_phases=_grant_fail,
     )
 
     code, payload = await bridge.handle_feishu_doc_create(
@@ -186,12 +186,141 @@ async def test_doc_create_grants_and_survives_grant_failure(
 
 
 @pytest.mark.asyncio
+async def test_doc_create_grant_failure_keeps_every_stage_in_warning_and_response(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R7 r2 (codex #3): the create path's grant failure carries the full
+    per-stage summary — a long openid msg is bounded per stage, so it can no
+    longer truncate the email stage out of one 200-char slice — plus the
+    structured grant_phases, matching the re-grant endpoint."""
+    bridge = _make_bridge(monkeypatch, tmp_path)
+
+    def _grant_fail(token, email):
+        raise rb.FeishuApiError(
+            "feishu_grant_failed",
+            "lookup:ok (found) | openid:failed feishu_http_400 "
+            f"feishu_code=1062005 msg={'x' * 300} log_id=lg-openid | "
+            "email:failed feishu_http_400 feishu_code=99991661 msg=invalid email "
+            "log_id=lg-email",
+            phases=[
+                {"stage": "lookup", "status": "ok", "note": "found", "error_code": "",
+                 "feishu_code": "", "feishu_msg": "", "log_id": ""},
+                {"stage": "openid", "status": "failed", "note": "class=parameter",
+                 "error_code": "feishu_http_400", "feishu_code": "1062005",
+                 "feishu_msg": "x" * 300, "log_id": "lg-openid"},
+                {"stage": "email", "status": "failed", "note": "",
+                 "error_code": "feishu_http_400", "feishu_code": "99991661",
+                 "feishu_msg": "invalid email", "log_id": "lg-email"},
+            ],
+        )
+
+    _stub_feishu_client(
+        bridge,
+        grant_full_access_with_phases=_grant_fail,
+    )
+
+    code, payload = await bridge.handle_feishu_doc_create(
+        {"title": "T", "markdown": "# hi", "grant_email": "user@corp.com"}
+    )
+    assert code == 200
+    assert payload["ok"] is True
+    warning = payload["warning"]
+    # Both stages survive the long openid msg in the warning text…
+    assert "openid:failed" in warning, warning
+    assert "email:failed" in warning, warning
+    assert "feishu_code=99991661" in warning, warning
+    # …and the structured phase list rides the response.
+    assert [(p["stage"], p["status"]) for p in payload["grant_phases"]] == [
+        ("lookup", "ok"),
+        ("openid", "failed"),
+        ("email", "failed"),
+    ]
+    assert payload["grant_phases"][2]["log_id"] == "lg-email"
+
+
+@pytest.mark.asyncio
+async def test_doc_create_grant_success_returns_phases(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """R7 r3 (codex #1): an "openid refused for identity → email granted"
+    create answers with both stages in ``grant_phases`` (the failure key),
+    with the refused openid stage keeping Feishu's code/msg/log_id. Doc
+    creation stays stubbed; the grant chain runs the real client against a
+    fake HTTP layer."""
+    import email.message
+    import io as _io
+
+    class _FakeResp(_io.BytesIO):
+        def __init__(self, body: bytes, status: int = 200) -> None:
+            super().__init__(body)
+            self.status = status
+            headers = email.message.Message()
+            headers["Content-Type"] = "application/json"
+            self.headers = headers
+
+    def handler(url, body):
+        if "tenant_access_token" in url:
+            return 200, {"code": 0, "tenant_access_token": "t-fake", "expire": 7200}
+        if "batch_get_id" in url:
+            return 200, {
+                "code": 0,
+                "data": {"user_list": [{"email": "user@corp.com", "user_id": "ou_1"}]},
+            }
+        if body.get("member_type") == "openid":
+            return 400, {"code": 1062005, "msg": "member not exist", "log_id": "lg-oid"}
+        return 200, {"code": 0, "data": {}}
+
+    calls: list[dict] = []
+    opener_cls = create_autospec(rb.urllib.request.build_opener)
+    opener = opener_cls.return_value
+
+    def _open(req, timeout=None):
+        url = req.full_url
+        req_body = json.loads(req.data.decode("utf-8")) if req.data else {}
+        calls.append({"url": url, "body": req_body})
+        status, payload = handler(url, req_body)
+        data = json.dumps(payload).encode("utf-8")
+        if status >= 400:
+            raise rb.urllib.error.HTTPError(
+                url, status, "error", email.message.Message(), _io.BytesIO(data)
+            )
+        return _FakeResp(data, status)
+
+    opener.open.side_effect = _open
+    monkeypatch.setattr(rb.urllib.request, "build_opener", opener_cls)
+
+    bridge = _make_bridge(monkeypatch, tmp_path)
+    _stub_feishu_client(bridge)
+
+    code, payload = await bridge.handle_feishu_doc_create(
+        {"title": "T", "markdown": "# hi", "grant_email": "user@corp.com"}
+    )
+    assert code == 200
+    assert payload["ok"] is True
+    assert payload["grant_member"] == "email:user@corp.com"
+    assert [(p["stage"], p["status"]) for p in payload["grant_phases"]] == [
+        ("lookup", "ok"),
+        ("openid", "failed"),
+        ("email", "ok"),
+    ]
+    openid_phase = payload["grant_phases"][1]
+    assert openid_phase["feishu_code"] == "1062005"
+    assert openid_phase["feishu_msg"] == "member not exist"
+    assert openid_phase["log_id"] == "lg-oid"
+    grant_calls = [c for c in calls if "/permissions/" in c["url"]]
+    assert [c["body"]["member_type"] for c in grant_calls] == ["openid", "email"], calls
+    assert all("need_notification=false" in c["url"] for c in grant_calls), calls
+
+
+@pytest.mark.asyncio
 async def test_doc_create_grant_success_has_no_warning(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     bridge = _make_bridge(monkeypatch, tmp_path)
     client = _stub_feishu_client(bridge)
-    client.grant_full_access = create_autospec(client.grant_full_access, return_value=None)
+    client.grant_full_access_with_phases = create_autospec(
+        client.grant_full_access_with_phases, return_value=("", [])
+    )
 
     code, payload = await bridge.handle_feishu_doc_create(
         {"title": "T", "markdown": "# hi", "grant_email": "user@corp.com", "space_id": "sp1"}
@@ -893,7 +1022,9 @@ async def test_doc_create_team_group_failure_is_a_warning(
     def _email_fail(token, email):
         raise rb.FeishuApiError("feishu_http_403", "code=1063002 no permission")
 
-    _stub_feishu_client(bridge, grant_chat_full_access=_fail, grant_full_access=_email_fail)
+    _stub_feishu_client(
+        bridge, grant_chat_full_access=_fail, grant_full_access_with_phases=_email_fail
+    )
 
     code, payload = await bridge.handle_feishu_doc_create(
         {"title": "T", "markdown": "# hi", "grant_email": "user@corp.com"}
