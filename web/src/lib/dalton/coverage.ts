@@ -5,6 +5,8 @@ import { queryKeys } from '@/lib/queryKeys';
 // 行业层 P4 覆盖视图的数据层。类型与后端 `/api/v1/dalton/coverage/units*`
 // 的真实响应逐字段一致（src/dalton/autonomy/units_view.py）——后端改了
 // 这里要同步，不在这层补后端不返回的字段。
+// P5 写路径（登记 / 绑定 / 解绑 / 归档）的响应是服务层的单元行
+// （src/dalton/database/coverage_units.py 的 _UNIT_COLS）。
 
 export type CoverageUnitKind = 'sector' | 'company';
 
@@ -228,4 +230,88 @@ export function useDaltonCoverageUnitDetail(unitId: string | null) {
     enabled: unitId !== null,
     staleTime: 30_000,
   });
+}
+
+// ---------------------------------------------------------------------------
+// P5 写路径：登记 / 绑定 / 解绑 / 归档。服务层校验失败时后端返回
+// 4xx，detail 为 `{error: <code>, message: string}`；code 是稳定错误码，
+// UI 按 dalton.coverage.errors.<code> 选 i18n 文案，message 仅兜底。
+// ---------------------------------------------------------------------------
+
+/** `dalton_coverage_units` 行（服务层 _UNIT_COLS 投影），与写端点响应一致。 */
+export interface CoverageUnitRecord {
+  unit_id: string;
+  kind: CoverageUnitKind;
+  owner_user_id: string;
+  slug: string;
+  display_name: string;
+  workspace_id: string | null;
+  ticker: string | null;
+  status: string;
+  research_tz: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RegisterCoverageUnitPayload {
+  kind: CoverageUnitKind;
+  slug: string;
+  display_name?: string;
+  ticker?: string | null;
+  research_tz?: string | null;
+}
+
+/** 从被拒请求里取稳定错误码；非本写路径的错误（无结构 detail）返回 null。 */
+export function coverageUnitErrorCode(err: unknown): string | null {
+  const detail = (
+    err as { response?: { data?: { detail?: unknown } } } | null
+  )?.response?.data?.detail;
+  if (
+    detail &&
+    typeof detail === 'object' &&
+    typeof (detail as { error?: unknown }).error === 'string' &&
+    (detail as { error?: unknown }).error
+  ) {
+    return (detail as { error: string }).error;
+  }
+  return null;
+}
+
+export async function registerDaltonCoverageUnit(
+  payload: RegisterCoverageUnitPayload,
+): Promise<CoverageUnitRecord> {
+  const { data } = await api.post<CoverageUnitRecord>(
+    '/api/v1/dalton/coverage/units',
+    payload,
+  );
+  return data;
+}
+
+export async function bindDaltonCoverageUnit(
+  unitId: string,
+  workspaceId: string,
+): Promise<CoverageUnitRecord> {
+  const { data } = await api.post<CoverageUnitRecord>(
+    `/api/v1/dalton/coverage/units/${encodeURIComponent(unitId)}/bind`,
+    { workspace_id: workspaceId },
+  );
+  return data;
+}
+
+export async function unbindDaltonCoverageUnit(
+  unitId: string,
+): Promise<CoverageUnitRecord> {
+  const { data } = await api.post<CoverageUnitRecord>(
+    `/api/v1/dalton/coverage/units/${encodeURIComponent(unitId)}/unbind`,
+  );
+  return data;
+}
+
+export async function archiveDaltonCoverageUnit(
+  unitId: string,
+): Promise<CoverageUnitRecord> {
+  const { data } = await api.post<CoverageUnitRecord>(
+    `/api/v1/dalton/coverage/units/${encodeURIComponent(unitId)}/archive`,
+  );
+  return data;
 }

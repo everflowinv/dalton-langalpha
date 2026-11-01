@@ -114,6 +114,18 @@ python3 .agents/skills/dalton-research-director/scripts/render_coverage.py \
 
 另注意两条自动联动（服务端已做，无需你手工搬运）：行业支柱改版会在采用它的公司 agenda 生成"待复核"（origin=sector）；公司对行业条目提出 `contradicts` 证据会在行业 agenda 生成"更新候选"（origin=company）。你可以在看板 `open_questions` 里看到它们，按正常 open_question 排期跟进即可。
 
+## 3c. 覆盖单元的登记与绑定（Coverage Unit Registry，P5）
+
+本节同样依赖 `coverage_units.enabled`。用户要新覆盖一个行业/公司、或整理覆盖关系时，用 `dalton_coverage_unit` 在 Home 完成登记与绑定（一切只针对**本人**的单元与工作区）：
+
+1. **先查再登**：拿不准时先 `dalton_coverage_unit(action="list")` 看本人已有单元（`include_archived=true` 含归档），slug 同类型下唯一且登记后不可改写，不要重复登记。
+2. **登记**：`action="register", kind="sector", slug=..., display_name=..., research_tz=...`。行业单元**不传 ticker**（传了会被拒）；公司单元（`kind="company"`）可传 `ticker`，服务端自动规范化。
+3. **绑定**：`action="bind", unit_id=..., workspace_id=...`，只能绑本人非 Home 工作区，一个工作区最多一个 active 单元。绑定 sector 单元成功后返回带 `hint`：向用户提示可委派该工作区运行 `dalton-init-sector` 初始化行业知识层（提示即可，用户不需要时跳过，不要擅自初始化）。
+4. **解绑 / 归档**：`action="unbind"` 只清绑定；`action="archive"` 归档单元——它停止身份解析并腾出工作区槽位，**不删除任何数据**。
+5. **失败即回报**：返回 `ok=false` 时带稳定 `error` 码（如 `slug_conflict`、`workspace_conflict`、`workspace_not_owned`、`home_workspace_refused`、`sector_ticker_refused`），把 message 原样带给用户，让用户决定换 slug、先解绑还是归档旧单元。
+
+
+
 ---
 
 ## 4. Home 空间 PM 问答路由规则（Home PM QA Routing，对齐 PS.16）

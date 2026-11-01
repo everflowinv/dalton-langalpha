@@ -4,17 +4,39 @@ import { fireEvent, screen, waitFor } from '@testing-library/react';
 import { renderWithProviders } from '@/test/utils';
 import { DaltonCoverageCard } from '../DaltonCoverageCard';
 import {
+  archiveDaltonCoverageUnit,
+  bindDaltonCoverageUnit,
+  registerDaltonCoverageUnit,
+  unbindDaltonCoverageUnit,
   useDaltonCoverageUnits,
   useDaltonCoverageUnitDetail,
+  type CoverageUnitRecord,
 } from '@/lib/dalton/coverage';
 
-vi.mock('@/lib/dalton/coverage', () => ({
-  useDaltonCoverageUnits: vi.fn(),
-  useDaltonCoverageUnitDetail: vi.fn(),
+// 查询与写路径都替身；coverageUnitErrorCode 用真实实现（错误码 → i18n 键）。
+vi.mock('@/lib/dalton/coverage', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/dalton/coverage')>();
+  return {
+    ...actual,
+    useDaltonCoverageUnits: vi.fn(),
+    useDaltonCoverageUnitDetail: vi.fn(),
+    registerDaltonCoverageUnit: vi.fn(),
+    bindDaltonCoverageUnit: vi.fn(),
+    unbindDaltonCoverageUnit: vi.fn(),
+    archiveDaltonCoverageUnit: vi.fn(),
+  };
+});
+
+vi.mock('@/contexts/AuthContext', () => ({
+  useAuth: vi.fn(() => ({ userId: 'local-dev-user' })),
 }));
 
 const mockUnitsQuery = useDaltonCoverageUnits as unknown as Mock;
 const mockDetailQuery = useDaltonCoverageUnitDetail as unknown as Mock;
+const mockRegister = registerDaltonCoverageUnit as unknown as Mock;
+const mockBind = bindDaltonCoverageUnit as unknown as Mock;
+const mockUnbind = unbindDaltonCoverageUnit as unknown as Mock;
+const mockArchive = archiveDaltonCoverageUnit as unknown as Mock;
 
 // 与后端 /api/v1/dalton/coverage/units 的真实响应逐字段一致
 // （src/dalton/autonomy/units_view.py）。
@@ -309,6 +331,30 @@ function companyDetailResponse() {
   };
 }
 
+function unitRecord(overrides: Partial<CoverageUnitRecord> = {}): CoverageUnitRecord {
+  return {
+    unit_id: SECTOR_UNIT_ID,
+    kind: 'sector',
+    owner_user_id: 'local-dev-user',
+    slug: 'ai-infrastructure',
+    display_name: 'AI Infrastructure',
+    workspace_id: SECTOR_WS,
+    ticker: null,
+    status: 'active',
+    research_tz: null,
+    created_at: '2026-11-01T00:00:00+00:00',
+    updated_at: '2026-11-01T00:00:00+00:00',
+    ...overrides,
+  };
+}
+
+/** 后端 4xx 的错误形状：detail 为 {error: <稳定码>, message}。 */
+function writeError(code: string, message: string) {
+  return {
+    response: { data: { detail: { error: code, message } } },
+  };
+}
+
 function installQueries(data: ReturnType<typeof unitsResponse> | { enabled: false }) {
   mockUnitsQuery.mockReturnValue({
     data,
@@ -335,12 +381,17 @@ describe('DaltonCoverageCard', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     installQueries(unitsResponse());
+    mockRegister.mockResolvedValue(unitRecord({ slug: 'power-grids' }));
+    mockBind.mockResolvedValue(unitRecord());
+    mockUnbind.mockResolvedValue(unitRecord({ workspace_id: null }));
+    mockArchive.mockResolvedValue(unitRecord({ status: 'archived' }));
   });
 
   it('renders nothing while the backend flag is off (no sector copy at all)', () => {
     installQueries({ enabled: false });
     const { container } = renderWithProviders(<DaltonCoverageCard />);
     expect(screen.queryByTestId('dalton-coverage-card')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('coverage-register-form')).not.toBeInTheDocument();
     expect(container.textContent).toBe('');
   });
 
@@ -527,5 +578,202 @@ describe('DaltonCoverageCard', () => {
     expect(
       screen.getByTestId(`coverage-pending-truncated-${SECTOR_UNIT_ID}`),
     ).toHaveTextContent('Showing first 2 of 7 pending items');
+  });
+
+  // -------------------------------------------------------------------------
+  // P5 写入口：新建行业单元 + 本人单元行上的绑定 / 解绑 / 归档
+  // -------------------------------------------------------------------------
+
+  it('renders the register form when the flag is on and submits a sector unit', async () => {
+    renderWithProviders(<DaltonCoverageCard />);
+
+    expect(await screen.findByTestId('coverage-register-form')).toBeInTheDocument();
+    fireEvent.change(screen.getByTestId('coverage-register-slug'), {
+      target: { value: ' power-grids ' },
+    });
+    fireEvent.change(screen.getByTestId('coverage-register-display-name'), {
+      target: { value: 'Power Grids' },
+    });
+    fireEvent.click(screen.getByTestId('coverage-register-submit'));
+
+    await waitFor(() => {
+      expect(mockRegister).toHaveBeenCalledTimes(1);
+    });
+    // 表单只登记 sector（产品默认）；slug 去空白；空字段不随请求发送
+    expect(mockRegister).toHaveBeenCalledWith({
+      kind: 'sector',
+      slug: 'power-grids',
+      display_name: 'Power Grids',
+      research_tz: undefined,
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId('coverage-register-done')).toBeInTheDocument();
+    });
+  });
+
+  it('maps a rejected registration to the i18n copy of its stable error code', async () => {
+    mockRegister.mockRejectedValueOnce(
+      writeError('slug_conflict', 'coverage unit slug already registered for this owner and kind'),
+    );
+    renderWithProviders(<DaltonCoverageCard />);
+
+    fireEvent.change(await screen.findByTestId('coverage-register-slug'), {
+      target: { value: 'ai-infrastructure' },
+    });
+    fireEvent.click(screen.getByTestId('coverage-register-submit'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('coverage-register-error')).toBeInTheDocument();
+    });
+    // jsdom 下 en-US 文案；错误码 → dalton.coverage.errors.slug_conflict
+    expect(screen.getByTestId('coverage-register-error')).toHaveTextContent(
+      'This slug is already registered for this kind; pick another.',
+    );
+  });
+
+  it('binds an own unbound unit to one of the caller’s own workspaces', async () => {
+    renderWithProviders(<DaltonCoverageCard />);
+
+    // mega-tech：本人、未绑定的独立公司 → 绑定入口出现
+    fireEvent.click(await screen.findByTestId('coverage-tab-companies'));
+    fireEvent.click(screen.getByTestId(`coverage-unit-toggle-${STANDALONE_UNIT_ID}`));
+    await waitFor(() => {
+      expect(screen.getByTestId(`coverage-manage-${STANDALONE_UNIT_ID}`)).toBeInTheDocument();
+    });
+    fireEvent.change(screen.getByTestId(`coverage-bind-select-${STANDALONE_UNIT_ID}`), {
+      target: { value: UNCLASSIFIED_WS },
+    });
+    fireEvent.click(screen.getByTestId(`coverage-bind-btn-${STANDALONE_UNIT_ID}`));
+
+    await waitFor(() => {
+      expect(mockBind).toHaveBeenCalledWith(STANDALONE_UNIT_ID, UNCLASSIFIED_WS);
+    });
+  });
+
+  it('shows the dalton-init-sector hint after binding a sector unit', async () => {
+    const data = unitsResponse();
+    // 本人、未绑定的行业单元
+    data.units[0].workspace_id = null;
+    installQueries(data);
+
+    renderWithProviders(<DaltonCoverageCard />);
+    fireEvent.click(await screen.findByTestId(`coverage-unit-toggle-${SECTOR_UNIT_ID}`));
+    fireEvent.change(screen.getByTestId(`coverage-bind-select-${SECTOR_UNIT_ID}`), {
+      target: { value: UNCLASSIFIED_WS },
+    });
+    fireEvent.click(screen.getByTestId(`coverage-bind-btn-${SECTOR_UNIT_ID}`));
+
+    await waitFor(() => {
+      expect(screen.getByTestId(`coverage-bind-hint-${SECTOR_UNIT_ID}`)).toBeInTheDocument();
+    });
+    expect(screen.getByTestId(`coverage-bind-hint-${SECTOR_UNIT_ID}`)).toHaveTextContent(
+      'dalton-init-sector',
+    );
+  });
+
+  it('unbinds and archives an own bound unit from its row', async () => {
+    renderWithProviders(<DaltonCoverageCard />);
+
+    // 已绑定的本人行业单元：解绑 + 归档都在
+    fireEvent.click(await screen.findByTestId(`coverage-unit-toggle-${SECTOR_UNIT_ID}`));
+    await waitFor(() => {
+      expect(screen.getByTestId(`coverage-manage-${SECTOR_UNIT_ID}`)).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByTestId(`coverage-unbind-btn-${SECTOR_UNIT_ID}`));
+    await waitFor(() => {
+      expect(mockUnbind).toHaveBeenCalledWith(SECTOR_UNIT_ID);
+    });
+
+    fireEvent.click(screen.getByTestId(`coverage-archive-btn-${SECTOR_UNIT_ID}`));
+    await waitFor(() => {
+      expect(mockArchive).toHaveBeenCalledWith(SECTOR_UNIT_ID);
+    });
+  });
+
+  it('never shows manage actions on a colleague-owned unit', async () => {
+    const data = unitsResponse();
+    data.units.push({
+      unit_id: 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee',
+      kind: 'sector',
+      slug: 'colleague-sector',
+      display_name: 'Colleague Sector',
+      owner_user_id: 'user-2',
+      workspace_id: 'ffffffff-ffff-ffff-ffff-ffffffffffff',
+      readable: true,
+      delegatable: false,
+      auto_tracked: false,
+      members: [],
+    });
+    installQueries(data);
+
+    renderWithProviders(<DaltonCoverageCard />);
+    fireEvent.click(
+      await screen.findByTestId('coverage-unit-toggle-eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'),
+    );
+    await waitFor(() => {
+      expect(
+        screen.getByTestId('coverage-unit-eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'),
+      ).toBeInTheDocument();
+    });
+    // 同事单元展开后没有任何管理操作
+    expect(
+      screen.queryByTestId('coverage-manage-eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'),
+    ).not.toBeInTheDocument();
+  });
+
+  // codex r2 #1：成员公司被"独立公司"入口排除，本人公司单元只能在成员详情里管理
+  it('shows manage actions on an own member company inside its member detail', async () => {
+    renderWithProviders(<DaltonCoverageCard />);
+
+    // 展开行业 → 展开成员 M1（company_unit_id 归本人所有）
+    fireEvent.click(await screen.findByTestId(`coverage-unit-toggle-${SECTOR_UNIT_ID}`));
+    await waitFor(() => {
+      expect(screen.getByTestId(`coverage-detail-${SECTOR_UNIT_ID}`)).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByTestId('coverage-member-toggle-M1'));
+    await waitFor(() => {
+      expect(
+        screen.getByTestId(`coverage-manage-${MEMBER_COMPANY_UNIT_ID}`),
+      ).toBeInTheDocument();
+    });
+    // 详情响应显示该公司单元已绑定工作区 → 解绑 + 归档可用
+    expect(
+      screen.getByTestId(`coverage-unbind-btn-${MEMBER_COMPANY_UNIT_ID}`),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByTestId(`coverage-archive-btn-${MEMBER_COMPANY_UNIT_ID}`),
+    ).toBeInTheDocument();
+  });
+
+  it('shows no manage actions on a colleague-owned member company', async () => {
+    const colleagueCompany = companyDetailResponse();
+    colleagueCompany.owner_user_id = 'user-2';
+    mockDetailQuery.mockImplementation((unitId: string | null) => ({
+      data:
+        unitId === null
+          ? undefined
+          : unitId === SECTOR_UNIT_ID
+            ? sectorDetailResponse()
+            : colleagueCompany,
+      isLoading: false,
+      isFetching: false,
+      error: null,
+    }));
+
+    renderWithProviders(<DaltonCoverageCard />);
+    fireEvent.click(await screen.findByTestId(`coverage-unit-toggle-${SECTOR_UNIT_ID}`));
+    await waitFor(() => {
+      expect(screen.getByTestId(`coverage-detail-${SECTOR_UNIT_ID}`)).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByTestId('coverage-member-toggle-M1'));
+    await waitFor(() => {
+      expect(
+        screen.getByTestId(`coverage-detail-${MEMBER_COMPANY_UNIT_ID}`),
+      ).toBeInTheDocument();
+    });
+    // 他人的成员公司：公司详情可见，但没有任何管理操作
+    expect(
+      screen.queryByTestId(`coverage-manage-${MEMBER_COMPANY_UNIT_ID}`),
+    ).not.toBeInTheDocument();
   });
 });

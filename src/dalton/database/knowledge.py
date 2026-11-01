@@ -113,6 +113,22 @@ async def latest_valid_version(
             return _serialize_row(row)
 
 
+def _kv_lock_workspace(workspace_id: str) -> str:
+    """Canonical workspace id for the ``dalton:kv:`` advisory lock key.
+
+    Postgres treats differently-cased spellings of one UUID as the same
+    workspace, but ``hashtext`` does not: the coverage-unit bind path locks the
+    canonical lowercase form, so the document write must too, or the two never
+    serialize (codex sector-reg r4). A non-UUID string is left as-is; the
+    ``::uuid`` queries reject it anyway.
+    """
+    raw = str(workspace_id or "").strip()
+    try:
+        return str(UUID(raw))
+    except ValueError:
+        return raw
+
+
 async def insert_version(
     *,
     user_id: str,
@@ -144,7 +160,7 @@ async def insert_version(
     resolved_ticker = await _resolve_version_ticker(
         workspace_id, content=content, ticker=ticker
     )
-    lock_key = f"dalton:kv:{workspace_id}:{doc_key}"
+    lock_key = f"dalton:kv:{_kv_lock_workspace(workspace_id)}:{doc_key}"
     async with get_db_connection() as conn, conn.transaction():
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(

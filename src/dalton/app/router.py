@@ -130,6 +130,22 @@ class EarningsCalendarMirrorRequest(BaseModel):
     reported: list[Any] | None = None
 
 
+class CoverageUnitRegisterRequest(BaseModel):
+    """`POST /coverage/units` body — normalization and refusal rules live in the service layer."""
+
+    kind: str
+    slug: str
+    display_name: str = ""
+    ticker: str | None = None
+    research_tz: str | None = None
+
+
+class CoverageUnitBindRequest(BaseModel):
+    """`POST /coverage/units/{id}/bind` body — the workspace must be the caller's own, non-Home."""
+
+    workspace_id: str
+
+
 def _require_dalton_enabled() -> None:
     if not get_dalton_settings().enabled:
         raise HTTPException(status_code=404, detail="Dalton mode disabled")
@@ -1052,6 +1068,100 @@ async def get_coverage_unit_detail_endpoint(
         return await build_unit_detail(str(user_id).strip(), unit_id)
     except UnitNotFound as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
+# 行业层 P5：覆盖单元的登记 / 绑定 / 解绑 / 归档（写路径）。只调用 P0 的
+# 服务函数（`src/dalton/coverage/units.py`），校验与事务都在服务层；这里
+# 只做开关门控与 ValueError → 4xx 的映射。开关关闭时与详情同一语义：
+# 一律 404（开关状态本身只由列表接口下发），且不触任何服务函数。
+# ---------------------------------------------------------------------------
+
+
+def _require_coverage_units_enabled() -> None:
+    _require_dalton_enabled()
+    from src.dalton.settings import is_coverage_units_enabled
+
+    if not is_coverage_units_enabled():
+        raise HTTPException(status_code=404, detail="coverage units disabled")
+
+
+def _coverage_unit_http_error(exc: ValueError) -> HTTPException:
+    from src.dalton.coverage.unit_errors import classify_coverage_unit_error
+
+    code, status = classify_coverage_unit_error(exc)
+    # detail 带稳定错误码，前端据此选 i18n 文案；message 保留服务层原文兜底。
+    return HTTPException(status_code=status, detail={"error": code, "message": str(exc)})
+
+
+@router.post("/coverage/units")
+@handle_api_exceptions("register coverage unit", logger)
+async def register_coverage_unit_endpoint(
+    body: CoverageUnitRegisterRequest,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    _require_coverage_units_enabled()
+    from src.dalton.coverage.units import register_coverage_unit
+
+    try:
+        return await register_coverage_unit(
+            str(user_id).strip(),
+            kind=body.kind,
+            slug=body.slug,
+            display_name=body.display_name,
+            ticker=body.ticker,
+            research_tz=body.research_tz,
+        )
+    except ValueError as exc:
+        raise _coverage_unit_http_error(exc) from exc
+
+
+@router.post("/coverage/units/{unit_id}/bind")
+@handle_api_exceptions("bind coverage unit workspace", logger)
+async def bind_coverage_unit_endpoint(
+    unit_id: str,
+    body: CoverageUnitBindRequest,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    _require_coverage_units_enabled()
+    from src.dalton.coverage.units import bind_coverage_unit_workspace
+
+    try:
+        return await bind_coverage_unit_workspace(
+            unit_id, body.workspace_id, str(user_id).strip()
+        )
+    except ValueError as exc:
+        raise _coverage_unit_http_error(exc) from exc
+
+
+@router.post("/coverage/units/{unit_id}/unbind")
+@handle_api_exceptions("unbind coverage unit workspace", logger)
+async def unbind_coverage_unit_endpoint(
+    unit_id: str,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    _require_coverage_units_enabled()
+    from src.dalton.coverage.units import unbind_coverage_unit_workspace
+
+    try:
+        return await unbind_coverage_unit_workspace(unit_id, str(user_id).strip())
+    except ValueError as exc:
+        raise _coverage_unit_http_error(exc) from exc
+
+
+@router.post("/coverage/units/{unit_id}/archive")
+@handle_api_exceptions("archive coverage unit", logger)
+async def archive_coverage_unit_endpoint(
+    unit_id: str,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    _require_coverage_units_enabled()
+    from src.dalton.coverage.units import archive_coverage_unit
+
+    try:
+        return await archive_coverage_unit(unit_id, str(user_id).strip())
+    except ValueError as exc:
+        raise _coverage_unit_http_error(exc) from exc
 
 
 @router.get("/autonomy/report")

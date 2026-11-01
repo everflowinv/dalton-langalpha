@@ -28,6 +28,14 @@ from src.dalton.autonomy.tracking import (
     get_tracking_status,
     resolve_workspace_id_by_ticker,
 )
+from src.dalton.coverage.unit_errors import classify_coverage_unit_error
+from src.dalton.coverage.units import (
+    archive_coverage_unit,
+    bind_coverage_unit_workspace,
+    get_registered_units,
+    register_coverage_unit,
+    unbind_coverage_unit_workspace,
+)
 from src.dalton.database import plans as plans_db
 from src.dalton.database import watch as watch_db
 from src.dalton.settings import get_dalton_settings, is_coverage_units_enabled
@@ -568,6 +576,134 @@ def build_director_tools(
         except Exception as e:
             logger.warning("[DALTON_DIRECTOR] dalton_cross_unit_request fallback: %s", e)
             return json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False)
+
+    @tool("dalton_coverage_unit")
+    async def dalton_coverage_unit(
+        action: str,
+        kind: str | None = None,
+        slug: str | None = None,
+        display_name: str | None = None,
+        ticker: str | None = None,
+        research_tz: str | None = None,
+        unit_id: str | None = None,
+        workspace_id: str | None = None,
+        include_archived: bool = False,
+        config: RunnableConfig = None,
+    ) -> str:
+        """Register, bind, unbind, archive, or list the caller's OWN coverage units (sector layer P5).
+
+        Reach for this when the user starts covering a new sector or company: register the
+        unit (`action="register"`), then bind one of the user's own non-Home workspaces to it
+        (`action="bind"`) — only then do tracking, dispatch and the coverage board resolve that
+        workspace as the unit. Owner-scoped throughout: another user's units and workspaces are
+        refused. A sector unit never takes a `ticker` (refused); a company unit's ticker is
+        normalized to the auto-tracking shape. One workspace holds at most one active unit, so
+        check `action="list"` before re-registering a name. `action="archive"` frees the
+        workspace slot and the unit stops resolving; it deletes nothing. `action="unbind"`
+        clears the binding without archiving.
+
+        Args:
+            action: `"register"` | `"bind"` | `"unbind"` | `"archive"` | `"list"`.
+            kind: `"sector"` or `"company"` (register only).
+            slug: Stable lowercase slug, 1-64 chars of `[a-z0-9._-]` (e.g. `ai-infrastructure`); unique per owner+kind, never rewritten (register only).
+            display_name: Human-readable name; defaults to the slug (register only).
+            ticker: Company ticker (e.g. `"NVDA"`); must be omitted for a sector.
+            research_tz: IANA zone for the unit's agenda due-times (register only).
+            unit_id: The unit UUID (bind/unbind/archive).
+            workspace_id: One of the user's own non-Home workspaces (bind only).
+            include_archived: Include archived rows in `"list"`.
+
+        Returns:
+            JSON with `ok`; success carries the unit row (`unit`, or `units` for `"list"`),
+            failure a stable `error` code with `message`. A successful sector bind also carries
+            a `hint` recommending `dalton-init-sector` in the bound workspace — a suggestion,
+            not a requirement.
+        """
+        configurable = (config or {}).get("configurable") or {}
+        user_id = str(configurable.get("user_id") or "").strip()
+        if not user_id:
+            raise ValueError("user_id is required")
+
+        act = str(action or "").strip().lower()
+        if act not in {"register", "bind", "unbind", "archive", "list"}:
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": "invalid_action",
+                    "message": f"不支持的 action `{action}`，仅支持 register、bind、unbind、archive、list。",
+                },
+                ensure_ascii=False,
+            )
+        # 挂载点已按开关门控；这里再挡一次，防的是开关翻转后残留的已建工具实例。
+        if not is_coverage_units_enabled():
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": "coverage_units_disabled",
+                    "message": "coverage_units.enabled 未开启，覆盖单元登记表不可写。",
+                },
+                ensure_ascii=False,
+            )
+
+        try:
+            if act == "register":
+                if not str(slug or "").strip():
+                    return json.dumps(
+                        {
+                            "ok": False,
+                            "error": "missing_slug",
+                            "message": "action=register 需要非空 slug（小写字母/数字与 . _ -，如 ai-infrastructure）。",
+                        },
+                        ensure_ascii=False,
+                    )
+                row = await register_coverage_unit(
+                    user_id,
+                    kind=str(kind or ""),
+                    slug=str(slug),
+                    display_name=str(display_name or ""),
+                    ticker=ticker,
+                    research_tz=research_tz,
+                )
+                return json.dumps({"ok": True, "unit": row}, ensure_ascii=False, default=str)
+
+            if act == "bind":
+                clean_unit = str(unit_id or "").strip()
+                clean_ws = str(workspace_id or "").strip()
+                if not clean_unit or not clean_ws:
+                    return json.dumps(
+                        {
+                            "ok": False,
+                            "error": "missing_target",
+                            "message": "action=bind 需要同时提供 unit_id 与 workspace_id。",
+                        },
+                        ensure_ascii=False,
+                    )
+                row = await bind_coverage_unit_workspace(clean_unit, clean_ws, user_id)
+                out: dict[str, Any] = {"ok": True, "unit": row}
+                if str(row.get("kind") or "") == "sector":
+                    out["hint"] = (
+                        f"行业单元 {row.get('slug')} 已绑定工作区 {clean_ws}。"
+                        "建议向该工作区委派 dalton-init-sector 技能初始化行业知识层（用户不需要时可跳过）。"
+                    )
+                return json.dumps(out, ensure_ascii=False, default=str)
+
+            if act == "unbind":
+                row = await unbind_coverage_unit_workspace(str(unit_id or ""), user_id)
+                return json.dumps({"ok": True, "unit": row}, ensure_ascii=False, default=str)
+
+            if act == "archive":
+                row = await archive_coverage_unit(str(unit_id or ""), user_id)
+                return json.dumps({"ok": True, "unit": row}, ensure_ascii=False, default=str)
+
+            rows = await get_registered_units(user_id, include_archived=include_archived)
+            return json.dumps(
+                {"ok": True, "units": rows}, ensure_ascii=False, default=str
+            )
+        except ValueError as e:
+            code, _status = classify_coverage_unit_error(e)
+            return json.dumps(
+                {"ok": False, "error": code, "message": str(e)}, ensure_ascii=False
+            )
 
     @tool("dalton_agenda_note")
     async def dalton_agenda_note(
@@ -1470,8 +1606,9 @@ def build_director_tools(
             )
 
     if role == "chief_of_staff":
-        # 跨层请求台账只在覆盖单元开关开启时挂载：开关关闭时 CoS 的工具面
-        # 与 upstream 完全一致，公司路径不多一个入口。
+        # 跨层请求台账与覆盖单元登记工具只在覆盖单元开关开启时挂载：
+        # 开关关闭时 CoS 的工具面与 upstream 完全一致，公司路径不多一个入口
+        # （request_lock 锁的是默认开关下的工具清单，这里的门控让锁不动）。
         cos_tools = [
             dalton_coverage_board,
             dalton_record_plan,
@@ -1484,5 +1621,6 @@ def build_director_tools(
         ]
         if is_coverage_units_enabled():
             cos_tools.insert(2, dalton_cross_unit_request)
+            cos_tools.insert(3, dalton_coverage_unit)
         return cos_tools
     return [dalton_schedule_automation, dalton_coverage_tracking, dalton_system_jobs]

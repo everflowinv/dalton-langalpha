@@ -394,6 +394,66 @@ async def test_insert_version_skips_projection_when_flag_off_or_not_sector(
         assert not called, (flag, doc_key, valid)
 
 
+@pytest.mark.asyncio
+async def test_insert_version_lock_key_uses_canonical_workspace_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """大写 UUID 写文档：advisory 锁 key 用规范化小写 id，与绑定路径同一把锁（codex sector-reg r4）。"""
+    import src.dalton.database.knowledge as kv_mod
+
+    monkeypatch.setattr(kv_mod, "is_coverage_units_enabled", lambda: False)
+    monkeypatch.setattr(
+        kv_mod,
+        "_resolve_workspace_ticker",
+        create_autospec(_REAL_KV.get("_resolve_workspace_ticker"), return_value=None),
+    )
+    cur = _spec_cursor()
+    locks: list[Any] = []
+
+    async def _exec(sql: str, params: Any = None) -> None:
+        if "pg_advisory_xact_lock" in sql:
+            locks.append(tuple(params))
+
+    cur.execute.side_effect = _exec
+    cur.fetchone.side_effect = [None, {"knowledge_version_id": "kv-1", "version_no": 1}]
+
+    class _Tx:
+        async def __aenter__(self) -> "_Tx":
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+    class _Conn:
+        def cursor(self, *args: Any, **kwargs: Any) -> Any:
+            return cur
+
+        def transaction(self, *args: Any) -> "_Tx":
+            return _Tx()
+
+        async def __aenter__(self) -> "_Conn":
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+    monkeypatch.setattr(
+        kv_mod,
+        "get_db_connection",
+        create_autospec(_REAL_KV.get("get_db_connection"), return_value=_Conn()),
+    )
+    await kv_mod.insert_version(
+        user_id=USER,
+        workspace_id="ABCDEF12-3456-7890-ABCD-EF1234567890",
+        doc_key="sector",
+        base_version_no=None,
+        content={"schema_version": 1},
+        content_sha256="abc",
+        reason="r",
+    )
+    assert locks == [("dalton:kv:abcdef12-3456-7890-abcd-ef1234567890:sector",)]
+
+
 async def _run_insert_version(
     kv_mod: Any,
     monkeypatch: pytest.MonkeyPatch,
