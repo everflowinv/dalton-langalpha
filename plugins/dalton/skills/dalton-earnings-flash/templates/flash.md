@@ -1,5 +1,6 @@
 **{公司} {财季}：{一句话总结，以卖方主流观点为锚；若无卖方初评，用可靠新闻标题并注明}**
 事件结论（初判）：{无变化/强化/削弱/证伪/新论点}——{受影响的 thesis 支柱或 debate}（JSON 里写 `NO_CHANGE` / `THESIS_STRENGTHENED` / `THESIS_WEAKENED` / `THESIS_BROKEN` / `NEW_THESIS`）
+线性还是切换：{沿旧叙事线性演进；或叙事 / 倍数 regime（市场给这类资产的定价规则）可能在切换——若是，点名触发器（本季哪个数字或指引变化）、方向（升级 / 降级）与待确认证据}
 
 **业绩 summary：**
 - **Key headline numbers：** {绝对值、本季同比（YoY）、上一季同比（prior-quarter YoY）、beat/miss（注明 GAAP / Non-GAAP / 固定汇率等口径与币种；亏损或零分母给绝对差额）}

@@ -1,6 +1,6 @@
 ---
 name: dalton-call
-description: "经六条证据门禁硬检后产出高确信度投资建议：含驱动级预期差三问、可证伪主张、三情景概率加权 IRR、仓位与对冲及退出条件（未达门禁则诚实输出暂无高 conviction）。用户需要将研究转化为建仓/加仓/做空建议时使用；几分钟内可完成。"
+description: "经六条证据门禁硬检后产出高确信度投资建议：含驱动级预期差三问、可证伪主张、三情景概率加权 IRR、仓位与对冲及退出条件（未达门禁则附已完成的赔率卡与三层保护如实汇报缺口）。用户需要将研究转化为建仓/加仓/做空建议时使用；几分钟内可完成。"
 ---
 
 # 高确信度投资建议（Conviction Call）
@@ -10,7 +10,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ## 0. 核心纪律：宁缺毋滥，不达门禁绝不硬凑
 
-Conviction Call 是 Dalton 研究体系的最高级别输出，直接服务于 PM 的建仓/加仓/做空决策。**任何时候只要 6 条证据门禁中有 1 条未满足，必须输出“暂无高 conviction”模板，明确说明缺哪块证据、正在等待什么验证信号，严禁为了交差而强行拼凑推荐。**
+Conviction Call（高确信度投资建议）是 Dalton 研究体系的最高级别输出，直接服务于 PM 的建仓/加仓/做空决策。**任何时候只要 6 条证据门禁中有 1 条未满足，必须停止高确信推荐，改用《门禁未通过声明模板》向 PM 如实汇报缺哪块证据、正在等待什么验证信号，并附上已完成的赔率卡与三层保护；没有高确信不等于不交付赔率分析，严禁为了交差而强行拼凑推荐。**
 
 ---
 
@@ -25,7 +25,7 @@ Conviction Call 是 Dalton 研究体系的最高级别输出，直接服务于 P
 ### Step 2：六条证据门禁硬检（6 Hard Evidence Gates）
 逐条对照 [references/evidence-gate.md](references/evidence-gate.md) 检查 Gate 1 至 Gate 6：
 - **若任意一条 Gate 为 `FAIL`**：
-  1. 停止生成正式推荐，改用 [templates/call.md](templates/call.md) 底部的 **《暂无高 conviction 声明模板》**，写明未通过的具体 Gate、缺失证据及预计补齐时间/事件。
+  1. 停止生成正式推荐，改用 [templates/call.md](templates/call.md) 底部的 **《门禁未通过声明模板》**，写明未通过的具体 Gate（门禁）、缺失证据及预计补齐时间/事件，并**附上已完成的赔率卡与三层保护**（三情景价格带、所需胜率与裁决、三层保护与失效条件、行动分类与限制变量、双向改判条件；结构化字段上线前写在正文）。
   2. 调用 `knowledge_append_verdict`（`verdict="NO_CHANGE"`），通过 `agenda_ops` 将缺失证据登记入 `agenda.md` 的验证计划（若需 PM 拍板研究优先级，填 `pm_handoffs`）。
   3. 到此结束，不写正式推荐草稿。
 - **仅当 Gate 1–6 全部 `PASS` 时**，进入 Step 3。

@@ -8,7 +8,7 @@ description: "并行执行公司背景、行业竞争、三把财务镜头与估
 Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the first deliverable.
 公司认知按 `.agents/skills/dalton-knowledge/SKILL.md` 的读序读（`agent.md` 托管块 → `thesis.md` → `debate.md` → 按需 `drivers.md`、`management.md`、`verdicts.md`、`agenda.md`）；收尾按 `.agents/skills/dalton-agenda/SKILL.md` 的三步。
 
-本 skill 是 Dalton 买方初次覆盖（P2 初筛阶段）的启动与收尾控制器。目标是围绕一家新覆盖公司，一次运行产出 **12 问初筛报告**（`drafts/<as_of>-initial-coverage.md`）+ **初始化的公司知识层**（`company`、`thesis`、`debate`、`drivers`、`management`、`agenda` 与首条 `NEW_THESIS` 结论），回答买方初筛最核心的问题：主营靠什么赚钱、行业特性与周期、长短期驱动、竞争位置与壁垒（正在形成还是被破坏）、历史股价是 EPS 驱动还是倍数驱动、当前 bull/bear debate、股价位置、叙事演绎与高 conviction 预期差（若无足够预期差则诚实写“暂无高 conviction”）。
+本 skill 是 Dalton 买方初次覆盖（P2 初筛阶段）的启动与收尾控制器。目标是围绕一家新覆盖公司，一次运行产出 **12 问初筛报告**（`drafts/<as_of>-initial-coverage.md`）+ **初始化的公司知识层**（`company`、`thesis`、`debate`、`drivers`、`management`、`agenda` 与首条 `NEW_THESIS` 结论），回答买方初筛最核心的问题：主营靠什么赚钱、行业特性与周期、长短期驱动、竞争位置与壁垒（正在形成还是被破坏）、历史股价是 EPS 驱动还是倍数驱动、当前 bull/bear debate、股价位置、叙事演绎与预期差（用 `stance`〔方向〕+ `conviction`〔确信度〕表达，附行动分类、限制变量与改判条件；无高确信时仍须交付赔率卡与三层保护）。
 
 ---
 
@@ -63,7 +63,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
      - **C 财务镜头**：按 `.agents/skills/dalton-financial-lenses/SKILL.md` 输出 `research/<D>-ic/lenses.json` 与 `drafts/<D>-lenses.md`；
      - **D 估值历史与可比（拆成取数 + 写稿两步派发）**：先按 `.agents/skills/comps-analysis/SKILL.md` 取数并生成可比表 `research/<D>-ic/comps.xlsx`，再按 `references/branch-valuation-history.md` 撰写估值历史与对数分解稿 `research/<D>-ic/valuation.md`；
      - **支线核验**：四条支线取证完成后，多一次支线核验派发，核对各支线产物是否存在并计算哈希。
-   - **阶段 2（bull/bear 快速版）**：综合 A–D 支线产物与内部库/AlphaEngine 检索，按 `.agents/skills/dalton-bullbear/SKILL.md` 快速版方法输出 `research/<D>-ic/bullbear-quick.md`。
+   - **阶段 2（bull/bear 快速版，含叙事收敛）**：综合 A–D 支线产物与内部库/AlphaEngine 检索，按 `.agents/skills/dalton-bullbear/SKILL.md` 快速版方法输出 `research/<D>-ic/bullbear-quick.md`；**首次覆盖时的叙事收敛按该 skill 快速版流程第 1 步执行**（先列全市场叙事、删减到 2–3 个决定价值的驱动变量〔driver〕、每个驱动变量再往下挖一层观察指标与数据来源），收敛结果写入主要分歧、第 3 阶段的 12 问成稿及知识层 `debate` / `drivers` 初稿。
    - **阶段 3（12 问初筛成稿）**：按 `references/screen-12q.md` 与 `templates/initial-coverage.md` 撰写 `drafts/<D>-initial-coverage.md`（先锁定证据台账编号再定稿，文末合并为单一 `## 引用` 节）。
    - **阶段 4（知识层初始化草案）**：从初筛成稿与支线一手材料抽取结构化知识层操作草案 `research/<D>-ic/knowledge-proposal.json`（只抽取不新增判断；每条 `thesis.evidence` 必填结构化 `figures` 数组，且 `source.ref` 指向一手文件或 `prov`）。
    - **阶段 5（独立审稿与修订）**：由 `dalton-reviewer` 审阅重点题（Q1–Q5、Q7、Q8、Q12）、壁垒判断、估值分解表及“`## 引用` 表存在且每个 `[引用N]` 都能在表里找到”，再由修订子智能体完成 P0 修改并同步更新 `knowledge-proposal.json`。

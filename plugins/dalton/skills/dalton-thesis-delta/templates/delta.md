@@ -17,6 +17,7 @@
 ## 三、对 Thesis 支柱与 Debate 的影响
 - **受影响的支柱 / Debate**：{如 P2 核心广告变现 / D2（2027 年 Capex 与折旧对 EPS 的拖累）}
 - **判断变化**：{旧倾向/状态} → {新倾向/状态}（理由：{具体机制与证据} [引用1]）
+- **线性还是切换**：{沿旧叙事线性演进；或叙事 / 倍数 regime（市场给这类资产的定价规则）可能在切换——若是，点名触发器、方向与确认证据}
 - **知识层更新记录**：已调用 `knowledge_update(doc="{thesis|debate|drivers|management}")` 与 `knowledge_append_verdict`
 
 ## 四、下一项验证与改判条件
