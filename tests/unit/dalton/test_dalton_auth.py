@@ -2125,6 +2125,14 @@ class TestDaltonAuthRound6WriteIsolation:
         fake_backend = create_autospec(_BackendProto, instance=True)
         fake_backend.aread_text.return_value = "# Draft\n\nBody text."
 
+        from src.server.database import user as user_db
+
+        monkeypatch.setattr(
+            user_db,
+            "get_user",
+            create_autospec(user_db.get_user, return_value=None),
+        )
+
         monkeypatch.setattr(
             db_publications,
             "resolve_thread_author_model",
@@ -2146,16 +2154,25 @@ class TestDaltonAuthRound6WriteIsolation:
         monkeypatch.setattr(db_publications, "get_request", mock_get_req)
         monkeypatch.setattr(db_publications, "get_publication", mock_get_pub)
 
-        # 4a. Foreign user's publish_request_id -> 403
+        # 4a. A caller who is neither workspace owner nor initiator -> 403.
+        # (Round-2 decision D narrowed re-entry to the workspace owner and the
+        # original initiator; user-carol is neither, so access refuses them
+        # before the request row is even consulted.)
+        from src.dalton.publish.files import compute_bundle_sha256
+
+        draft_bundle_sha = compute_bundle_sha256(
+            "# Draft\n\nBody text.".encode("utf-8"), []
+        )
         mock_get_req.return_value = {
             "publish_request_id": "req-bob",
             "workspace_id": ws_alice,
             "user_id": "user-bob",
             "status": "published",
+            "bundle_sha256": draft_bundle_sha,
         }
         with pytest.raises(HTTPException) as exc_pub_foreign:
             await publish_svc.run_publish(
-                user_id="user-alice",
+                user_id="user-carol",
                 workspace_id=ws_alice,
                 thread_id="t-1",
                 tool_call_id="tc-1",
@@ -2168,6 +2185,23 @@ class TestDaltonAuthRound6WriteIsolation:
             )
         assert exc_pub_foreign.value.status_code == 403
         mock_get_pub.assert_not_called()
+
+        # 4a2. The workspace owner takes over a colleague-filed request by
+        # request_id (round-2 decisions A/D) -> allowed.
+        pub_taken = await publish_svc.run_publish(
+            user_id="user-alice",
+            workspace_id=ws_alice,
+            thread_id="t-1",
+            tool_call_id="tc-1",
+            draft_path="drafts/d.md",
+            title="Meta Note",
+            kind="event_note",
+            slug="meta-q3",
+            request_id="req-bob",
+            backend=fake_backend,
+        )
+        assert pub_taken["ok"] is True
+        assert pub_taken["status"] == "published"
 
         # 4b. Ownerless publish_request_id -> 403
         mock_get_req.return_value = {
@@ -2197,6 +2231,7 @@ class TestDaltonAuthRound6WriteIsolation:
             "workspace_id": ws_alice,
             "user_id": "user-alice",
             "status": "published",
+            "bundle_sha256": draft_bundle_sha,
             "publication_id": "pub-1",
         }
         pub_ok = await publish_svc.run_publish(

@@ -36,6 +36,10 @@ _ALLOWED_TRANSITION_COLS = frozenset(
         "attachments",
         "updates_thesis",
         "thesis_version_no",
+        "title",
+        "kind",
+        "slug",
+        "draft_path",
         "audit",
         "review",
         "decided_by",
@@ -474,6 +478,29 @@ async def list_pending(
                 ORDER BY created_at DESC
                 """,
                 (user_id, status),
+            )
+            rows = await cur.fetchall()
+            return [_serialize_row(r) for r in rows if r is not None]  # type: ignore[misc]
+
+
+async def list_pending_for_workspace(
+    workspace_id: str, status: str = "awaiting_pm"
+) -> list[dict[str, Any]]:
+    """List ``status`` publish requests for ``workspace_id`` regardless of initiator.
+
+    A colleague-initiated publish is owned by the workspace owner, so a
+    user-scoped ``list_pending`` would hide it from the closing check.
+    """
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                SELECT {_REQ_COLS}
+                FROM dalton_publish_requests
+                WHERE workspace_id = %s AND status = %s
+                ORDER BY created_at DESC
+                """,
+                (workspace_id, status),
             )
             rows = await cur.fetchall()
             return [_serialize_row(r) for r in rows if r is not None]  # type: ignore[misc]

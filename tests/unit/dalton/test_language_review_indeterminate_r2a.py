@@ -383,7 +383,12 @@ def _backend(files: dict[str, str]) -> Any:
 
 @pytest.fixture
 def _lang_config(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def _verify(workspace_id: str, user_id: str) -> dict[str, Any]:
+    async def _verify(
+        workspace_id: str,
+        user_id: str,
+        need: str | None = None,
+        channel: str | None = None,
+    ) -> dict[str, Any]:
         return {}
 
     async def _model(user_id: str | None = None) -> str:

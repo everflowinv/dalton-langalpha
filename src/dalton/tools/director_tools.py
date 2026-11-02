@@ -27,6 +27,7 @@ from src.dalton.autonomy.tracking import (
     enable_tracking,
     get_tracking_status,
     resolve_workspace_id_by_ticker,
+    resolve_workspace_id_by_ticker_any_owner,
 )
 from src.dalton.coverage.unit_errors import classify_coverage_unit_error
 from src.dalton.coverage.units import (
@@ -167,6 +168,86 @@ class _InputRefused(ValueError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+TRACKING_OWNER_ONLY_DETAIL = (
+    "自动跟踪（及调度类自动化任务）只能由工作区所有者开启或停用；"
+    "当前用户不是该工作区的所有者。")
+
+
+async def _verify_tracking_workspace_owner(workspace_id: str, user_id: str) -> None:
+    """Tracking stays owner-only; a non-owner's generic 403 is re-raised with why."""
+    try:
+        await verify_workspace_access(workspace_id, user_id)
+    except HTTPException as exc:
+        if exc.status_code == 403:
+            raise HTTPException(
+                status_code=403, detail=TRACKING_OWNER_ONLY_DETAIL
+            ) from exc
+        raise
+
+
+async def _resolve_system_job_owner_ws(
+    scope: str, target: str, user_id: str
+) -> tuple[str, str] | None:
+    """``(workspace_id, owner_id)`` for a company/sector system-job key's
+    workspace when the caller can READ it (round-4 decision 3).
+
+    Every candidate passes a real ``verify_workspace_access(need='read',
+    channel='cos')`` — an unreadable workspace is skipped silently, never
+    raised, so to an unauthorized caller it is indistinguishable from a
+    nonexistent one. ``None`` means "no readable match" and the caller answers
+    the same "not found" it would for a missing key."""
+    from src.server.database import workspace as ws_db
+
+    async def _readable_owner_ws(ws_id: str) -> tuple[str, str] | None:
+        try:
+            ws = await ws_db.get_workspace(ws_id)
+            if not ws:
+                return None
+            resolved_id = str(ws.get("workspace_id") or "").strip()
+            owner = str(ws.get("user_id") or "").strip()
+            if not resolved_id or not owner:
+                return None
+            await verify_workspace_access(
+                resolved_id, user_id, need="read", channel="cos"
+            )
+            return resolved_id, owner
+        except HTTPException:
+            return None
+
+    if scope == "company":
+        if len(target) >= 32 and "-" in target:
+            return await _readable_owner_ws(target)
+        # The caller's own workspace first, then cross-owner readable ones.
+        owned_ws = await resolve_workspace_id_by_ticker(target, user_id)
+        if owned_ws:
+            return await _readable_owner_ws(str(owned_ws))
+        any_ws = await resolve_workspace_id_by_ticker_any_owner(target, user_id)
+        if any_ws:
+            return await _readable_owner_ws(any_ws)
+        return None
+    if scope == "sector":
+        from src.dalton.settings import is_coverage_units_enabled
+
+        if not is_coverage_units_enabled():
+            return None
+        lowered = str(target or "").strip().lower()
+        for unit in await get_registered_units():
+            if str(unit.get("kind") or "") != "sector":
+                continue
+            slug = str(unit.get("slug") or "").strip().lower()
+            unit_id = str(unit.get("unit_id") or "").strip().lower()
+            if lowered not in (slug, unit_id):
+                continue
+            bound_ws = str(unit.get("workspace_id") or "").strip()
+            # Round-5 item 3: keep looking past unreadable same-name
+            # candidates — only a READABLE match resolves.
+            resolved = await _readable_owner_ws(bound_ws) if bound_ws else None
+            if resolved is not None:
+                return resolved
+        return None
+    return None
 
 
 def build_director_tools(
@@ -1314,10 +1395,15 @@ def build_director_tools(
                 target_ws_id = current_ws
         else:
             if passed_ws:
-                await verify_workspace_access(passed_ws, user_id)
                 target_ws_id = passed_ws
             elif passed_ticker:
                 resolved_ws = await resolve_workspace_id_by_ticker(passed_ticker, user_id)
+                if not resolved_ws:
+                    # Round-2 F: 按 ticker 跨所有者再解析一次——工作区存在但不
+                    # 属于调用者时，给出 owner-only 的原因，而不是"未找到"。
+                    resolved_ws = await resolve_workspace_id_by_ticker_any_owner(
+                        passed_ticker, user_id
+                    )
                 if not resolved_ws:
                     return json.dumps(
                         {
@@ -1329,7 +1415,6 @@ def build_director_tools(
                     )
                 target_ws_id = resolved_ws
             elif current_ws and current_ws.lower() != "home":
-                await verify_workspace_access(current_ws, user_id)
                 target_ws_id = current_ws
             else:
                 return json.dumps(
@@ -1342,17 +1427,36 @@ def build_director_tools(
                 )
 
         if act == "status":
-            res = await get_tracking_status(user_id, target_ws_id)
-        elif act == "enable":
-            is_user_action = src == "user"
-            res = await enable_tracking(
-                user_id,
-                target_ws_id,
-                force=is_user_action,
-                respect_user_pause=not is_user_action,
+            # Round-2 F: 有读权限的同事可查状态；跟踪任务挂在所有者名下，
+            # 按所有者的自动化记录报告，避免把已开启的跟踪误报成 disabled。
+            status_ws_row = await verify_workspace_access(
+                target_ws_id, user_id, need="read", channel="cos"
             )
+            status_owner = str((status_ws_row or {}).get("user_id") or "").strip() or user_id
+            res = await get_tracking_status(status_owner, target_ws_id)
         else:
-            res = await disable_tracking(user_id, target_ws_id)
+            # 开启/停用只允许所有者（所有入口统一），并把调度层
+            # （schedule_dalton_automation_helper）的通用 403 换成说明原因的
+            # 文案，不改权限本身。
+            await _verify_tracking_workspace_owner(target_ws_id, user_id)
+            try:
+                if act == "enable":
+                    is_user_action = src == "user"
+                    res = await enable_tracking(
+                        user_id,
+                        target_ws_id,
+                        force=is_user_action,
+                        respect_user_pause=not is_user_action,
+                    )
+                else:
+                    res = await disable_tracking(user_id, target_ws_id)
+            except HTTPException as exc:
+                if exc.status_code == 403:
+                    raise HTTPException(
+                        status_code=403,
+                        detail=TRACKING_OWNER_ONLY_DETAIL,
+                    ) from exc
+                raise
         return json.dumps(res, ensure_ascii=False, default=str)
 
     @tool("dalton_system_jobs")
@@ -1454,11 +1558,20 @@ def build_director_tools(
                             },
                             ensure_ascii=False,
                         )
-                await verify_workspace_access(current_ws, user_id)
                 sector_key = f"sector:{sector_slug}"
                 if act in ("list", "status"):
-                    res = await get_system_job_status(user_id, sector_key)
+                    # Round-3 decision 3: readable colleagues may look; the
+                    # jobs live under the workspace owner's automations.
+                    status_ws_row = await verify_workspace_access(
+                        current_ws, user_id, need="read", channel="cos"
+                    )
+                    status_owner = (
+                        str((status_ws_row or {}).get("user_id") or "").strip()
+                        or user_id
+                    )
+                    res = await get_system_job_status(status_owner, sector_key)
                     return json.dumps(res, ensure_ascii=False, default=str)
+                await _verify_tracking_workspace_owner(current_ws, user_id)
                 if act in ("enable", "disable"):
                     return await dalton_coverage_tracking.ainvoke(
                         {"action": act, "workspace_id": current_ws},
@@ -1534,10 +1647,18 @@ def build_director_tools(
                             ensure_ascii=False,
                         )
 
-            await verify_workspace_access(current_ws, user_id)
             if act in ("list", "status"):
-                res = await get_system_job_status(user_id, current_ws)
+                # Round-3 decision 3: readable colleagues may look; report from
+                # the workspace owner's automation rows.
+                status_ws_row = await verify_workspace_access(
+                    current_ws, user_id, need="read", channel="cos"
+                )
+                status_owner = (
+                    str((status_ws_row or {}).get("user_id") or "").strip() or user_id
+                )
+                res = await get_system_job_status(status_owner, current_ws)
                 return json.dumps(res, ensure_ascii=False, default=str)
+            await _verify_tracking_workspace_owner(current_ws, user_id)
             if act in ("enable", "disable"):
                 return await dalton_coverage_tracking.ainvoke(
                     {"action": act, "workspace_id": current_ws},
@@ -1585,6 +1706,58 @@ def build_director_tools(
                 ensure_ascii=False,
             )
 
+        # Round-2 F: key=company:<TICKER> 的开关也只允许所有者。按 ticker 跨
+        # 所有者解析得到他人工作区时，直接给 owner-only 文案，而不是让
+        # toggle 走到"未找到公司自动跟踪任务"；uuid 形态的 target 由下面
+        # toggle 内部的所有者检查兜住。
+        if (
+            scope == "company"
+            and act in ("enable", "disable")
+            and not (len(target) >= 32 and "-" in target)
+        ):
+            owned_ws = await resolve_workspace_id_by_ticker(target, user_id)
+            if (
+                not owned_ws
+                and await resolve_workspace_id_by_ticker_any_owner(target, user_id)
+            ):
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "error": "tracking_owner_only",
+                        "message": TRACKING_OWNER_ONLY_DETAIL,
+                    },
+                    ensure_ascii=False,
+                )
+
+        # Round-3/4/5: company/sector status is reported from the workspace
+        # owner's automation rows, for any caller who can read the workspace.
+        # The resolver runs the real read gate; company keys are passed on as
+        # the VERIFIED workspace UUID so the status lookup never re-resolves
+        # the raw ticker under the caller. An unreadable (or missing) key gets
+        # EXACTLY the "not found" answer a nonexistent key produces — falling
+        # back to get_system_job_status(caller, raw_key) would let the layer
+        # below accept the raw UUID and resolve the ticker (a leak), so the
+        # not-found shape is built here and permission errors collapse into it.
+        if act == "status" and scope in ("company", "sector"):
+            try:
+                owner_ws = await _resolve_system_job_owner_ws(scope, target, user_id)
+            except HTTPException:
+                owner_ws = None
+            if owner_ws is None:
+                missing_word = "行业" if scope == "sector" else "公司"
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "error": "system_job_error",
+                        "message": f"未找到{missing_word}自动跟踪任务: {raw_key}",
+                    },
+                    ensure_ascii=False,
+                )
+            owner_ws_id, owner_id = owner_ws
+            job_key = f"company:{owner_ws_id}" if scope == "company" else raw_key
+            res = await get_system_job_status(owner_id, job_key)
+            return json.dumps(res, ensure_ascii=False, default=str)
+
         try:
             if act == "status":
                 res = await get_system_job_status(user_id, raw_key)
@@ -1593,6 +1766,19 @@ def build_director_tools(
             else:
                 res = await run_system_job_now(user_id, raw_key)
             return json.dumps(res, ensure_ascii=False, default=str)
+        except HTTPException as exc:
+            # Round-2 F: toggle/run_now 深处的调度层所有者 403 统一换成
+            # owner-only 文案。
+            if exc.status_code == 403:
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "error": "tracking_owner_only",
+                        "message": TRACKING_OWNER_ONLY_DETAIL,
+                    },
+                    ensure_ascii=False,
+                )
+            raise
         except PermissionError as exc:
             err_code = "ops_readonly" if scope == "ops" else "forbidden_pm"
             return json.dumps(

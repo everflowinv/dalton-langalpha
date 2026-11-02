@@ -7,6 +7,8 @@ import logging
 from collections.abc import Sequence
 from typing import Any
 
+from psycopg.rows import dict_row
+
 from src.dalton.autonomy.schedule import (
     build_company_watch_specs,
     build_sector_watch_specs,
@@ -115,6 +117,82 @@ async def resolve_workspace_id_by_ticker(ticker: str, user_id: str) -> str | Non
             t_upper,
             exc,
         )
+    return None
+
+
+async def resolve_workspace_id_by_ticker_any_owner(
+    ticker: str,
+    caller_user_id: str | None = None,
+) -> str | None:
+    """Resolve a workspace_id for ``ticker`` across owners the CALLER may read
+    (round-3 decision 2).
+
+    ``resolve_workspace_id_by_ticker`` filters by ``user_id``, so a colleague
+    asking for the PM's workspace gets None and the tool would answer
+    "not found". This twin lists every ticker match first and keeps the first
+    one the caller can READ per ``sharing.require_workspace_access`` — the
+    sharing rules cannot live in SQL. With no readable match it returns None:
+    an unreadable workspace stays "not found", never owner-only-wording.
+    """
+    t_upper = str(ticker or "").strip().upper()
+    if not t_upper:
+        return None
+    try:
+        async with get_db_connection() as conn, conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                    SELECT workspace_id::text
+                    FROM workspaces
+                    WHERE UPPER(BTRIM(name)) = %s
+                      AND status <> 'deleted'
+                    ORDER BY created_at DESC
+                    """,
+                (t_upper,),
+            )
+            rows = await cur.fetchall() or []
+            await cur.execute(
+                """
+                    SELECT w.workspace_id::text
+                    FROM workspaces w
+                    JOIN dalton_knowledge_versions kv
+                      ON kv.workspace_id = w.workspace_id
+                     AND kv.doc_key = 'company'
+                    WHERE w.status <> 'deleted'
+                      AND UPPER(BTRIM(kv.content->>'ticker')) = %s
+                    ORDER BY kv.version_no DESC, w.created_at DESC
+                    """,
+                (t_upper,),
+            )
+            rows.extend(await cur.fetchall() or [])
+    except Exception as exc:
+        logger.debug(
+            "[DALTON_TRACKING] Failed resolving any-owner workspace_id for ticker=%s: %s",
+            t_upper,
+            exc,
+        )
+        return None
+
+    caller = str(caller_user_id or "").strip()
+    if not caller:
+        return None
+    from src.dalton.sharing import require_workspace_access
+
+    seen_ids: set[str] = set()
+    for r in rows:
+        ws_id = str((r or {}).get("workspace_id") or "").strip()
+        if not ws_id or ws_id in seen_ids:
+            continue
+        seen_ids.add(ws_id)
+        try:
+            ws = await ws_db.get_workspace(ws_id)
+            if not ws:
+                continue
+            await require_workspace_access(
+                ws, caller, channel="cos", need="read", workspace=ws
+            )
+            return ws_id
+        except Exception:
+            continue
     return None
 
 

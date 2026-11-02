@@ -373,7 +373,7 @@ async def run_check_language(
             "ok": False,
             "message": "ERROR: round 只能是 1 或 2：第 1 轮在初稿写完、第一次独立审稿之前；第 2 轮在终稿语言修改完成后、最后一次独立审稿之前。",
         }
-    await verify_workspace_access(workspace_id, user_id)
+    await verify_workspace_access(workspace_id, user_id, need="write", channel="cos")
     if backend is None:
         return {"ok": False, "message": "ERROR: filesystem backend is unavailable."}
 
