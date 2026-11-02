@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '@/api/client';
 import { queryKeys } from '@/lib/queryKeys';
@@ -215,12 +216,130 @@ export async function fetchDaltonCoverageUnitDetail(
  * backend saying the sector layer is off, and every sector-related surface
  * (coverage card, sector scope in the system-jobs card) hides on it.
  */
-export function useDaltonCoverageUnits() {
+export function useDaltonCoverageUnits(enabled = true) {
   return useQuery({
     queryKey: queryKeys.dalton.coverageUnits(),
     queryFn: fetchDaltonCoverageUnits,
+    enabled,
     staleTime: 30_000,
   });
+}
+
+// ---------------------------------------------------------------------------
+// 从属关系推导（侧栏"覆盖结构"树、工作区行 chip、工作区页从属条共用）。
+// 全部只读列表响应的字段；成员的 workspace_id 后端已按查看者过滤，
+// 有值即代表本人可读，前端不重复判断。
+// ---------------------------------------------------------------------------
+
+/** 成员公司判定：被任何（可见）行业列为成员的公司单元 id 集合。
+ *  行业 / 独立公司两分与角色映射都从这一处推导。 */
+export function coverageMemberUnitIds(units: CoverageUnitEntry[]): Set<string> {
+  const memberUnitIds = new Set<string>();
+  for (const u of units) {
+    if (u.kind !== 'sector') continue;
+    for (const m of u.members ?? []) {
+      if (m.company_unit_id) memberUnitIds.add(m.company_unit_id);
+    }
+  }
+  return memberUnitIds;
+}
+
+/** 行业 / 独立公司两分（未分类工作区不入 units，走 unclassified）。
+ *  推导规则与设置页覆盖卡片的 tab 一致，是其唯一实现。 */
+export function splitCoverageUnits(units: CoverageUnitEntry[]): {
+  sectors: CoverageUnitEntry[];
+  standaloneCompanies: CoverageUnitEntry[];
+} {
+  const memberUnitIds = coverageMemberUnitIds(units);
+  return {
+    sectors: units.filter((u) => u.kind === 'sector'),
+    standaloneCompanies: units.filter(
+      (u) => u.kind === 'company' && !memberUnitIds.has(u.unit_id),
+    ),
+  };
+}
+
+/** A member company's parent sector, resolved for display and navigation. */
+export interface CoverageRoleSector {
+  unitId: string;
+  displayName: string;
+  workspaceId: string | null;
+  readable: boolean;
+}
+
+/**
+ * A bound workspace's place in the coverage structure:
+ * `sector` — the sector unit's own workspace; `member` — a member company's
+ * workspace (possibly under several sectors); `standalone` — a company unit
+ * bound to no visible sector.
+ */
+export type CoverageWorkspaceRole =
+  | { kind: 'sector'; sectorNames: never[]; sectors: never[]; unit: CoverageUnitEntry }
+  | { kind: 'member'; sectorNames: string[]; sectors: CoverageRoleSector[] }
+  | { kind: 'standalone'; sectorNames: never[]; sectors: never[] };
+
+/** 空结果共用一个模块级常量：调用方（React.memo 的行）按引用比较。 */
+const EMPTY_ROLES: ReadonlyMap<string, CoverageWorkspaceRole> = new Map();
+
+/**
+ * Why a member row / chip cannot be entered, in one shared rule:
+ * `noWorkspace` — nothing was ever created (`workspace_created` false);
+ * `noAccess` — a workspace exists but the backend filtered its id out for
+ * this viewer. The i18n keys are `dalton.coverage.noWorkspace` / `.noAccess`.
+ */
+export function coverageNoEntryReason(workspaceCreated: boolean): 'noWorkspace' | 'noAccess' {
+  return workspaceCreated ? 'noAccess' : 'noWorkspace';
+}
+
+export function deriveCoverageWorkspaceRoles(
+  units: CoverageUnitEntry[],
+): ReadonlyMap<string, CoverageWorkspaceRole> {
+  // 与 splitCoverageUnits 同一"成员公司"判定：被任何（可见）行业列为成员。
+  const memberUnitIds = coverageMemberUnitIds(units);
+  const roles = new Map<string, CoverageWorkspaceRole>();
+  for (const u of units) {
+    if (!u.workspace_id) continue;
+    if (u.kind === 'sector') {
+      roles.set(u.workspace_id, { kind: 'sector', sectorNames: [], sectors: [], unit: u });
+    } else if (!memberUnitIds.has(u.unit_id)) {
+      roles.set(u.workspace_id, { kind: 'standalone', sectorNames: [], sectors: [] });
+    } else {
+      const sectors: CoverageRoleSector[] = [];
+      for (const s of units) {
+        if (s.kind !== 'sector') continue;
+        if (!(s.members ?? []).some((m) => m.company_unit_id === u.unit_id)) continue;
+        sectors.push({
+          unitId: s.unit_id,
+          displayName: s.display_name ?? s.slug ?? s.unit_id,
+          workspaceId: s.workspace_id,
+          readable: s.readable,
+        });
+      }
+      roles.set(u.workspace_id, {
+        kind: 'member',
+        sectorNames: sectors.map((s) => s.displayName),
+        sectors,
+      });
+    }
+  }
+  return roles.size > 0 ? roles : EMPTY_ROLES;
+}
+
+/**
+ * workspace_id → coverage role, built once per listing for every consumer
+ * (sidebar tree chips, gallery affiliation bar). Sharing one query through
+ * React Query means one request; the map itself is a single useMemo, never
+ * per-row. Gated exactly like DaltonCoverageCard — no auth-mode gate, the
+ * listing's `enabled:false` (or its failure) is what hides every surface —
+ * so an empty map (no chips, no bar) is also what a non-Dalton deploy sees.
+ * A failed refresh keeps no stale roles: `isError` collapses to EMPTY_ROLES.
+ */
+export function useCoverageRoleByWorkspace(): ReadonlyMap<string, CoverageWorkspaceRole> {
+  const { data, isError } = useDaltonCoverageUnits();
+  return useMemo(
+    () => (isError ? EMPTY_ROLES : deriveCoverageWorkspaceRoles(data?.enabled ? data.units : [])),
+    [data, isError],
+  );
 }
 
 export function useDaltonCoverageUnitDetail(unitId: string | null) {

@@ -24,6 +24,8 @@ import { GettingStartedGate } from '@/pages/Onboarding';
 import { SIDEBAR_DEFAULT_WIDTH, clampSidebarWidth } from './sidebarWidth';
 // DALTON-HOOK(team-sharing): collapsible Team workspaces section
 import { TeamWorkspacesSection } from '@/pages/ChatAgent/components/dalton/TeamSharing';
+// DALTON-HOOK(coverage-tree): sidebar coverage-structure tree (sectors → members)
+import { CoverageTreeSection } from '@/pages/ChatAgent/components/dalton/CoverageTreeSection';
 import { isDaltonAuth } from '@/config/daltonAuth';
 import './Sidebar.css';
 
@@ -360,6 +362,8 @@ function AppSidebar({ collapsed, onToggleCollapse, width, onWidthChange }: AppSi
 
       <div className="sidebar-tree">
         <NavigationPanel {...navTreeProps} />
+        {/* DALTON-HOOK(coverage-tree): coverage structure tree below My Workspaces */}
+        <CoverageTreeSection currentWorkspaceId={currentWorkspaceId} />
         {/* DALTON-HOOK(team-sharing): Team workspaces section below My Workspaces */}
         {isDaltonAuth && <TeamWorkspacesSection currentWorkspaceId={currentWorkspaceId} />}
       </div>

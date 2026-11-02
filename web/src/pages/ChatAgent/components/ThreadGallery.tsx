@@ -57,6 +57,8 @@ import { WorkspaceTrackingToggle } from './dalton/WorkspaceTrackingToggle';
 import { WorkspaceSharingModal } from './dalton/WorkspaceSharingModal';
 // DALTON-HOOK(wiki-ingest): workspace auto-ingest switch
 import { AutoIngestToggle } from './dalton/AutoIngestToggle';
+// DALTON-HOOK(coverage-tree): sector/company affiliation bar under the header
+import { CoverageAffiliationBar } from './dalton/CoverageAffiliationBar';
 import { DURATION, EASE_OUT, TWEEN } from '@/lib/motion';
 
 /** Placeholder rows while the list is read: the first screen's worth. */
@@ -744,6 +746,9 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
                   <span>{totalThreads ?? threads.length} {(totalThreads ?? threads.length) === 1 ? t('thread.thread') : t('thread.threads')}</span>
                 )}
               </div>
+              {/* DALTON-HOOK(coverage-tree): sector / member-company / standalone affiliation bar.
+                  Renders nothing for Home and unclassified workspaces (no coverage role). */}
+              {workspaceId && <CoverageAffiliationBar workspaceId={workspaceId} />}
               {/* DALTON-HOOK(coverage-tracking): company workspace auto-tracking toggle */}
               {/* DALTON-HOOK(workspace-sharing-settings): company workspace sharing settings modal */}
               {/* DALTON-HOOK(wiki-ingest): workspace auto-ingest switch (workspaces.config) */}

@@ -11,6 +11,8 @@ import { useIsMobile } from '@/hooks/useIsMobile';
 import { isDaltonAuth } from '@/config/daltonAuth';
 import { useUser } from '@/hooks/useUser';
 import { useTeamWorkspaces } from './dalton/TeamSharing';
+// DALTON-HOOK(coverage-tree): workspace-row sector/member chips from the coverage listing
+import { useCoverageRoleByWorkspace } from '@/lib/dalton/coverage';
 import {
   expandedWorkspaces,
   expandedThreads,
@@ -118,6 +120,9 @@ function NavigationPanel({
   // DALTON-HOOK(colleague-dispatch): subscribe to current user and team workspaces so row permissions stay reactive
   const { user: currentUser } = useUser({ enabled: isDaltonAuth });
   const { data: teamData } = useTeamWorkspaces(isDaltonAuth);
+  // DALTON-HOOK(coverage-tree): one role map for every workspace row's chip,
+  // built once per listing (never per row); empty while the flag is off.
+  const coverageRoles = useCoverageRoleByWorkspace();
   const currentUserId = currentUser?.user_id ?? null;
   const callerTier = teamData?.caller_tier ?? null;
   const rootRef = useRef<HTMLDivElement>(null);
@@ -385,6 +390,15 @@ function NavigationPanel({
           >
           {workspaces.map((ws) => {
             const wsId = ws.workspace_id;
+            // DALTON-HOOK(coverage-tree): resolve this row's chip text here so
+            // WorkspaceTreeRow receives a primitive (memo-stable; undefined
+            // when the row has no coverage role) instead of the whole map.
+            const coverageRole = coverageRoles.get(wsId);
+            const coverageChip = coverageRole?.kind === 'sector'
+              ? t('dalton.coverage.sectorChip')
+              : coverageRole?.kind === 'member' && coverageRole.sectorNames.length > 0
+                ? coverageRole.sectorNames.join('、')
+                : undefined;
             // While a drag is live, rows across the pin boundary from the
             // lifted workspace (Home counts as pinned) stop being drop
             // targets, so the preview can never show an arrangement the drop
@@ -413,6 +427,8 @@ function NavigationPanel({
                 // DALTON-HOOK(colleague-dispatch): pass caller identity and tier into WorkspaceTreeRow
                 currentUserId={currentUserId}
                 callerTier={callerTier}
+                // DALTON-HOOK(coverage-tree): sector/member chip for bound workspaces
+                coverageChip={coverageChip}
                 wsActions={rowActions}
                 rename={renamingWsId === wsId ? activeRename : inactiveRename}
                 onToggleWorkspace={toggleWorkspace}

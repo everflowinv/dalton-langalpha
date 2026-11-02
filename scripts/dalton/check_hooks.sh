@@ -87,6 +87,10 @@ ALLOWED_HOOKS=(
   "dalton-patch-tool-calls"
   "fake-ip-allow"
   "coverage-tracking"
+  # LaneC: sector-layer visualization — the sidebar coverage tree, the
+  # workspace-row sector/member chips, and the gallery affiliation bar all
+  # read the coverage-units listing (lib/dalton/coverage.ts derivation).
+  "coverage-tree"
   "workflow-resume"
   "workflow-journal"
   "workflow-as-of-default"

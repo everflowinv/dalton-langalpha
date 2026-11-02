@@ -1,0 +1,9 @@
+/* A coverage-tree row that leads nowhere (no workspace, or not readable):
+   the workspace row's own metrics (.nav-panel-row), minus the pointer and the
+   hover tint that would promise a click. */
+.nav-panel-row.coverage-row-inert {
+  cursor: default;
+}
+.nav-panel-row.coverage-row-inert:hover {
+  background-color: transparent;
+}

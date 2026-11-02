@@ -40,6 +40,8 @@ import { isHomeWorkspace } from '@/lib/homeWorkspace';
 import { useThreadFlags } from '@/lib/threadLifecycle/store';
 import type { User } from '@/types/api';
 import type { TeamWorkspacesResponse } from './dalton/TeamSharing';
+// DALTON-HOOK(coverage-tree): the workspace row's sector/member chip text
+//(resolved per row in NavigationPanel; no coverage import needed here)
 import { sidebarAgentRowLabel, type SidebarAgentRow } from '../session/subagents/subagentStatus';
 import { SubagentStatusIcon } from './taskStatusUi';
 import type { NavWorkspace } from '../hooks/useNavigationData';
@@ -895,6 +897,10 @@ export interface WorkspaceTreeRowProps {
   // DALTON-HOOK(colleague-dispatch): pass caller identity and tier into WorkspaceTreeRow
   currentUserId?: string | null;
   callerTier?: string | null;
+  // DALTON-HOOK(coverage-tree): the row's sector ("行业") / parent-sector chip
+  // text, or undefined when the workspace holds no coverage role (flag off,
+  // data missing, or an unclassified/standalone workspace) — memo-stable.
+  coverageChip?: string;
   /** The shared duplicate / move / delete flows. */
   wsActions: Omit<WorkspaceActions, 'dialogs'>;
   rename: {
@@ -937,6 +943,8 @@ function WorkspaceTreeRowImpl({
   // DALTON-HOOK(colleague-dispatch): accept caller identity and tier on WorkspaceTreeRowImpl
   currentUserId,
   callerTier,
+  // DALTON-HOOK(coverage-tree): accept the row's chip text
+  coverageChip,
   wsActions,
   rename,
   onToggleWorkspace,
@@ -1035,6 +1043,19 @@ function WorkspaceTreeRowImpl({
                   >
                     {label(ws) || t('nav.workspaceFallback')}
                   </span>
+                  {/* DALTON-HOOK(coverage-tree): sector ("行业") / parent-sector
+                      chip after the name; a primitive prop that is undefined
+                      while the flag is off or the row has no coverage role. */}
+                  {coverageChip && (
+                    <span
+                      data-testid="coverage-role-chip"
+                      title={coverageChip}
+                      className="shrink-0 max-w-32 truncate rounded-full border px-1.5 py-0.5 text-[10px]"
+                      style={{ borderColor: 'var(--color-border-muted)', color: 'var(--color-text-tertiary)' }}
+                    >
+                      {coverageChip}
+                    </span>
+                  )}
                   {/* Chevron + row actions float over the name's tail on hover
                       (as thread rows do), so the name keeps the full row width
                       instead of truncating around controls that are not showing. */}
