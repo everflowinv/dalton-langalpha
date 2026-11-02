@@ -1039,12 +1039,15 @@ async def test_run_publish_flag_off_keeps_company_path_and_skips_registry(
         create_autospec(db_knowledge.list_all_latest_for_workspace, return_value={}),
     )
     # 已发布的请求 → 快速返回分支，消息里仍是 slug 前缀伪造的公司 ticker（P3 前行为）
+    from src.dalton.publish.files import compute_bundle_sha256
+
     published_row = {
         "publish_request_id": "req-1",
         "workspace_id": WS_ID,
         "user_id": USER_ID,
         "status": "published",
         "publication_id": "pub-1",
+        "bundle_sha256": compute_bundle_sha256("# draft\n内容。\n".encode("utf-8"), []),
         "audit": None,
     }
     monkeypatch.setattr(

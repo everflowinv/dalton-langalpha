@@ -90,6 +90,13 @@ async def test_run_publish_settles_audit_failed_on_build_timeout(
                 "workspace_id": "ws1",
                 "user_id": "u1",
                 "status": "auditing",
+                "title": "T",
+                "kind": "topic",
+                "slug": "s",
+                "draft_path": "drafts/d.md",
+                "bundle_sha256": service_mod.compute_bundle_sha256(
+                    "# 草稿\nRevenue $1,234 million。\n".encode("utf-8"), []
+                ),
             },
         ),
     )

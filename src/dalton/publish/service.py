@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import copy
 import hashlib
 import logging
@@ -683,7 +684,7 @@ async def run_check_draft(
     if not user_id or not str(user_id).strip():
         raise ValueError("user_id is required")
     user_id = str(user_id).strip()
-    await verify_workspace_access(workspace_id, user_id)
+    await verify_workspace_access(workspace_id, user_id, need="write", channel="cos")
     if backend is None:
         return {"ok": False, "message": "ERROR: filesystem backend is unavailable."}
 
@@ -871,7 +872,142 @@ async def _append_agenda_pm_handoff(
         logger.warning("Could not append pm_handoff to agenda in %s: %s", workspace_id, e)
 
 
-async def run_publish(
+# Round-3 decision 4: the initiating thread may be gone; the card/handoff then
+# say so instead of showing an empty initiator.
+PUBLISH_INITIATOR_UNKNOWN = "发起人未知（原线程已删除）"
+
+
+async def _resolve_publish_initiator(
+    row: dict[str, Any],
+    ws_owner_id: str,
+    *,
+    caller_thread_id: str,
+    caller_user_id: str,
+) -> str | None:
+    """The initiator of a publish request, for re-entry authorization and for
+    naming on the approval card / agenda handoff.
+
+    Round-4 decision 4: a first filing (or any call whose thread IS the row's
+    ``conversation_thread_id``) is judged by the current caller. Only a
+    CROSS-THREAD request_id re-entry looks the row's thread up: its owner is
+    the initiator, and a thread that can no longer be read surfaces as
+    ``PUBLISH_INITIATOR_UNKNOWN`` instead of widening re-entry."""
+    row_thread_id = str(row.get("conversation_thread_id") or "").strip()
+    caller_uid = str(caller_user_id or "").strip()
+
+    def _by_caller() -> str | None:
+        return caller_uid if caller_uid and caller_uid != ws_owner_id else None
+
+    if not row_thread_id or row_thread_id == str(caller_thread_id or "").strip():
+        return _by_caller()
+    try:
+        from src.server.database import conversation as conv_db
+
+        thread = await conv_db.get_thread_by_id(row_thread_id)
+        thread_owner = str((thread or {}).get("user_id") or "").strip()
+        if thread_owner:
+            return thread_owner if thread_owner != ws_owner_id else None
+        return PUBLISH_INITIATOR_UNKNOWN
+    except Exception as exc:
+        logger.debug(
+            "Could not resolve initiator thread %s for publish request: %s",
+            row_thread_id,
+            exc,
+        )
+        return PUBLISH_INITIATOR_UNKNOWN
+
+
+# Round-3 decision 1: when a caller re-enters by request_id, the request row's
+# saved params win and the caller's differing ones are only reported back.
+# The note travels to the wrapper through a ContextVar so every exit path of
+# the state machine can carry it without threading it through each return.
+_IGNORED_PARAMS_NOTE: contextvars.ContextVar[list[str] | None] = (
+    contextvars.ContextVar("_publish_ignored_params", default=None)
+)
+
+
+def _adopt_request_params(
+    row: dict[str, Any],
+    *,
+    title: str,
+    kind: str,
+    slug: str,
+    draft_path: str,
+    updates_thesis: bool,
+    attachments: list[dict[str, Any]] | None,
+) -> tuple[str, str, str, str, bool, list[dict[str, Any]] | None]:
+    """Round-3 decision 1: on request_id re-entry the row's saved
+    ``title/kind/slug/draft_path/updates_thesis/attachments`` are authoritative.
+    Returns the adopted values and records which caller-supplied params
+    differed, for the wrapper to name in the result message."""
+    ignored: list[str] = []
+    row_title = str(row.get("title") or "")
+    row_kind = str(row.get("kind") or "")
+    row_slug = str(row.get("slug") or "")
+    row_draft = str(row.get("draft_path") or "")
+    row_updates = bool(row.get("updates_thesis"))
+
+    if row_title and row_title != title:
+        ignored.append("title")
+    if row_kind and row_kind != kind:
+        ignored.append("kind")
+    if row_slug and row_slug != slug:
+        ignored.append("slug")
+    if row_draft and row_draft != draft_path:
+        ignored.append("draft_path")
+    if row_updates != bool(updates_thesis):
+        ignored.append("updates_thesis")
+    row_atts = row.get("attachments") if isinstance(row.get("attachments"), list) else None
+    if row_atts is not None:
+        caller_atts = [
+            {"path": str(a.get("path") or ""), "role": str(a.get("role") or "appendix")}
+            for a in (attachments or [])
+            if isinstance(a, dict)
+        ]
+        row_atts_meta = [
+            {"path": str(a.get("path") or ""), "role": str(a.get("role") or "appendix")}
+            for a in row_atts
+            if isinstance(a, dict)
+        ]
+        if row_atts_meta != caller_atts:
+            ignored.append("attachments")
+    if ignored:
+        _IGNORED_PARAMS_NOTE.set(ignored)
+
+    return (
+        row_title or title,
+        row_kind or kind,
+        row_slug or slug,
+        row_draft or draft_path,
+        row_updates,
+        row_atts if row_atts is not None else attachments,
+    )
+
+
+def _thesis_version_drift(
+    row: dict[str, Any],
+    thesis_row: dict[str, Any] | None,
+) -> str | None:
+    """Round-3/4 decision: a request that updates thesis is only executable
+    while the workspace's thesis is still what the request was filed against.
+
+    An empty pinned ``thesis_version_no`` means the workspace had NO thesis
+    when the request was filed (round-4 decision 2): a thesis existing by
+    execution time is a drift, not a skip."""
+    if not bool(row.get("updates_thesis")):
+        return None
+    approved_ver = row.get("thesis_version_no")
+    if not approved_ver:
+        if thesis_row is not None:
+            return "请求发起时工作区尚无 thesis，而现在已存在（thesis_version_no 缺失）"
+        return None
+    current_ver = (thesis_row or {}).get("version_no")
+    if current_ver is None or int(current_ver) != int(approved_ver):
+        return "thesis 版本与送审时不一致（thesis 在送审后已被修改）"
+    return None
+
+
+async def _run_publish_state_machine(
     *,
     user_id: str,
     workspace_id: str,
@@ -893,55 +1029,141 @@ async def run_publish(
     if not user_id or not str(user_id).strip():
         raise ValueError("user_id is required")
     user_id = str(user_id).strip()
-    ws_row = await verify_workspace_access(workspace_id, user_id)
+    ws_row = await verify_workspace_access(
+        workspace_id, user_id, need="write", channel="cos"
+    )
+    # A colleague with workspace write access may run the publish state machine,
+    # but every ownership field it writes (request row, publication row, agenda
+    # handoff, thesis.official) belongs to the workspace owner; `user_id` below
+    # stays the caller for model-config resolution and billing, which fall back
+    # user -> team credential holder -> yaml.
+    ws_owner_id = str((ws_row or {}).get("user_id") or "").strip() or user_id
     if backend is None:
         return {"ok": False, "message": "ERROR: filesystem backend is unavailable."}
+
+    # Round-3 decision 1: with request_id the row is authoritative — resolve it
+    # BEFORE reading anything so the row's draft_path/attachments/title/…
+    # drive the whole run; the caller's differing params are only reported.
+    row: dict[str, Any] | None = None
+    created = False
+    if request_id:
+        row = await db_publications.get_request(request_id)
+        if not row or str(row["workspace_id"]) != str(workspace_id):
+            return {
+                "ok": False,
+                "message": f"ERROR: publish_request {request_id} not found in this workspace.",
+            }
+        # Round-2 decision D: re-entry by request_id is the workspace owner's
+        # or the original initiator's (resolved from the request row's thread,
+        # decision C) — any other colleague gets 403 even with workspace write.
+        initiator_id = await _resolve_publish_initiator(
+            row,
+            ws_owner_id,
+            caller_thread_id=thread_id,
+            caller_user_id=user_id,
+        )
+        row_owner = str(row.get("user_id") or "").strip()
+        allowed_reentry = {ws_owner_id}
+        if initiator_id and initiator_id != PUBLISH_INITIATOR_UNKNOWN:
+            allowed_reentry.add(initiator_id)
+        if not row_owner or str(user_id) not in allowed_reentry:
+            raise HTTPException(
+                status_code=403,
+                detail="Publication request does not belong to current user",
+            )
+        created = False
+        req_id = str(row["publish_request_id"])
+        status = str(row["status"])
+        # Terminal states need no draft read — the draft may already be gone.
+        if status in ("rejected", "expired", "superseded"):
+            return {
+                "ok": False,
+                "status": status,
+                "audit": row.get("audit"),
+                "message": _prefix_with_audit_summary(
+                    row,
+                    f"Publish request {req_id} is {status}: "
+                    f"{row.get('decision_message') or row.get('error') or 'please fix and call publish_report again.'}",
+                ),
+            }
+        (
+            title,
+            kind,
+            slug,
+            draft_path,
+            updates_thesis,
+            attachments,
+        ) = _adopt_request_params(
+            row,
+            title=title,
+            kind=kind,
+            slug=slug,
+            draft_path=draft_path,
+            updates_thesis=updates_thesis,
+            attachments=attachments,
+        )
+        # The approval's pinned thesis version travels on the row (round-3
+        # decision 1): execution reads it from there, not from this call.
+        approved_thesis_version_no = row.get("thesis_version_no")
 
     # Resolve author_model from active thread usage / thread record when not explicitly provided (G3.2)
     if not author_model:
         author_model = await db_publications.resolve_thread_author_model(thread_id)
 
-    draft_text = await backend.aread_text(draft_path)
-    if draft_text is None:
+    async def _read_draft_and_bundle(
+        dp: str, atts: list[dict[str, Any]] | None
+    ) -> tuple[str, str | None, list[dict[str, Any]], list[tuple[str, str, bytes]], str] | None:
+        """Read the draft (+ attachments) at ``dp``/``atts`` and hash the bundle;
+        ``None`` when the draft file is missing. Round-4 decision 1: re-readable
+        so an adopted request row's params can drive a fresh read."""
+        text = await backend.aread_text(dp)
+        if text is None:
+            return None
+        atts_meta: list[dict[str, Any]] = []
+        blobs: list[tuple[str, str, bytes]] = []
+        facts: str | None = None
+        for att in atts or []:
+            if not isinstance(att, dict):
+                continue
+            apath = str(att.get("path") or "")
+            arole = str(att.get("role") or "appendix")
+            if not apath:
+                continue
+            raw: bytes | None = None
+            if hasattr(backend, "adownload_file_bytes"):
+                raw = await backend.adownload_file_bytes(apath)
+            if raw is None and hasattr(backend, "aread_text"):
+                t = await backend.aread_text(apath)
+                if t is not None:
+                    raw = t.encode("utf-8")
+                    if arole == "facts":
+                        facts = t
+            elif raw is not None and arole == "facts":
+                facts = raw.decode("utf-8", errors="replace")
+
+            if raw is not None:
+                asha = hashlib.sha256(raw).hexdigest()
+                atts_meta.append({"path": apath, "role": arole, "sha256": asha})
+                blobs.append((arole, apath, raw))
+        return (
+            text,
+            facts,
+            atts_meta,
+            blobs,
+            compute_bundle_sha256(text.encode("utf-8"), blobs),
+        )
+
+    read_result = await _read_draft_and_bundle(draft_path, attachments)
+    if read_result is None:
         return {
             "ok": False,
             "message": f"ERROR: Draft file not found at {draft_path}",
         }
-    draft_bytes = draft_text.encode("utf-8")
+    draft_text, facts_text, att_list, att_blobs, bundle_sha256 = read_result
     # A5: the publish state machine re-audits through the same wall-clock budget
     # as check_draft — its provenance precheck, reuse hash and audit phases all
     # hang off this one deadline.
     audit_deadline = time.monotonic() + get_dalton_config().publish.audit_total_timeout_s
-
-    # Read attachments & compute bundle_sha256
-    att_list: list[dict[str, Any]] = []
-    att_blobs: list[tuple[str, str, bytes]] = []
-    facts_text: str | None = None
-    for att in attachments or []:
-        if not isinstance(att, dict):
-            continue
-        apath = str(att.get("path") or "")
-        arole = str(att.get("role") or "appendix")
-        if not apath:
-            continue
-        raw: bytes | None = None
-        if hasattr(backend, "adownload_file_bytes"):
-            raw = await backend.adownload_file_bytes(apath)
-        if raw is None and hasattr(backend, "aread_text"):
-            t = await backend.aread_text(apath)
-            if t is not None:
-                raw = t.encode("utf-8")
-                if arole == "facts":
-                    facts_text = t
-        elif raw is not None and arole == "facts":
-            facts_text = raw.decode("utf-8", errors="replace")
-
-        if raw is not None:
-            asha = hashlib.sha256(raw).hexdigest()
-            att_list.append({"path": apath, "role": arole, "sha256": asha})
-            att_blobs.append((arole, apath, raw))
-
-    bundle_sha256 = compute_bundle_sha256(draft_bytes, att_blobs)
 
     latest_map = await db_knowledge.list_all_latest_for_workspace(
         workspace_id, valid_only=True
@@ -985,25 +1207,13 @@ async def run_publish(
                 ),
             }
 
-    ticker = str(company_doc.get("ticker") or slug.split("-")[0]).upper()
-
     if request_id:
-        row = await db_publications.get_request(request_id)
-        if not row or str(row["workspace_id"]) != str(workspace_id):
-            return {
-                "ok": False,
-                "message": f"ERROR: publish_request {request_id} not found in this workspace.",
-            }
-        row_owner = str(row.get("user_id") or "").strip()
-        if not row_owner or row_owner != user_id:
-            raise HTTPException(
-                status_code=403,
-                detail="Publication request does not belong to current user",
-            )
-        created = False
+        # The request_id branch already adopted the row's params above.
+        assert row is not None
+        reuse_existing_row = True
     else:
         row, created = await db_publications.get_or_create_request(
-            user_id=user_id,
+            user_id=ws_owner_id,
             workspace_id=workspace_id,
             thread_id=thread_id,
             tool_call_id=tool_call_id,
@@ -1017,9 +1227,98 @@ async def run_publish(
             thesis_version_no=thesis_version_no if updates_thesis else None,
             status="auditing",
         )
+        req_id = str(row["publish_request_id"])
+        status = str(row["status"])
+        # Round-4 decision 1: a same-(thread, tool_call) retry that fetched an
+        # EXISTING row adopts it too. The only exception is re-submitting one
+        # of the retryable statuses without request_id — that path may carry
+        # new params and writes them back (below).
+        reuse_existing_row = not created and status not in (
+            "audit_failed",
+            "review_revise",
+            "review_unavailable",
+        )
+        if reuse_existing_row:
+            (
+                title,
+                kind,
+                slug,
+                draft_path,
+                updates_thesis,
+                attachments,
+            ) = _adopt_request_params(
+                row,
+                title=title,
+                kind=kind,
+                slug=slug,
+                draft_path=draft_path,
+                updates_thesis=updates_thesis,
+                attachments=attachments,
+            )
+            # The row's draft_path/attachments are authoritative — re-read the
+            # content with them before any comparison or publication.
+            re_read = await _read_draft_and_bundle(draft_path, attachments)
+            if re_read is None:
+                return {
+                    "ok": False,
+                    "status": status,
+                    "audit": row.get("audit"),
+                    "message": _prefix_with_audit_summary(
+                        row,
+                        f"按原请求参数读取草稿失败（draft_path={draft_path}），"
+                        "正文已改动或文件缺失；请重新调用 publish_report"
+                        "（不带 request_id）发起新的审批。",
+                    ),
+                }
+            draft_text, facts_text, att_list, att_blobs, bundle_sha256 = re_read
+        approved_thesis_version_no = row.get("thesis_version_no")
 
-    req_id = str(row["publish_request_id"])
-    status = str(row["status"])
+    ticker = str(company_doc.get("ticker") or slug.split("-")[0]).upper()
+
+    if reuse_existing_row:
+        # Round-3/4 decision 1: unified content gate — the bundle recomputed
+        # from the row's draft_path/attachments as they sit on disk NOW must
+        # still equal the row's recorded bundle_sha256, on EVERY entry that
+        # fetched an existing row (request_id or same-tool-call retry alike).
+        assert row is not None
+        if str(row.get("bundle_sha256") or "") != bundle_sha256:
+            err = "正文（草稿或附件）与请求记录的 bundle 哈希不一致，正文已改动"
+            if status in ("approved", "publishing"):
+                await db_publications.transition(
+                    req_id, (status,), "superseded", error=err
+                )
+                return {
+                    "ok": False,
+                    "status": "superseded",
+                    "audit": row.get("audit"),
+                    "message": _prefix_with_audit_summary(
+                        row,
+                        f"{err}，已批准的结果作废（superseded），"
+                        "请重新调用 publish_report 走审批。",
+                    ),
+                }
+            if status == "published":
+                return {
+                    "ok": False,
+                    "status": "published",
+                    "audit": row.get("audit"),
+                    "message": _prefix_with_audit_summary(
+                        row,
+                        "该请求已发布，但草稿/附件在此之后已改动（bundle 哈希不一致）；"
+                        "如需发布新内容，请重新调用 publish_report（不带 request_id）"
+                        "发起新的审批。",
+                    ),
+                }
+            return {
+                "ok": False,
+                "status": status,
+                "audit": row.get("audit"),
+                "message": _prefix_with_audit_summary(
+                    row,
+                    f"{err}；本请求未作任何改动，请重新调用 publish_report"
+                    "（不带 request_id）发起新的审批。",
+                ),
+            }
 
     # Fast exits for terminal / already-completed states
     if status == "published":
@@ -1033,13 +1332,16 @@ async def run_publish(
             row.get("audit") if isinstance(row.get("audit"), dict) else None
         )
         msg_prefix = f"{audit_summary} · " if audit_summary else ""
+        # Round-3 decision 1: the saved publication's fields, not this call's.
+        pub_title = str((pub or {}).get("title") or title)
+        pub_ticker = str((pub or {}).get("ticker") or ticker)
         return {
             "ok": True,
             "status": "published",
             "publication_id": row.get("publication_id"),
             "paths": paths,
             "audit": row.get("audit"),
-            "message": f"{msg_prefix}Published {ticker} ({title}): {', '.join(paths)} · publication {row.get('publication_id')}",
+            "message": f"{msg_prefix}Published {pub_ticker} ({pub_title}): {', '.join(paths)} · publication {row.get('publication_id')}",
         }
 
     if status in ("rejected", "expired", "superseded"):
@@ -1065,6 +1367,23 @@ async def run_publish(
     model_cells: dict[str, dict[str, Any]] | None = None
     evidence_ref_bodies: dict[str, str] | None = None
     if status in ("audit_failed", "review_revise", "review_unavailable") and not created:
+        if request_id is not None:
+            # Round-5 item 2: an EXPLICIT request_id re-entry never rewrites
+            # the row's params or pinned thesis version — that licence is the
+            # same-tool-call retry's alone. A drifted thesis is refused here:
+            # re-file instead of re-auditing under a stale pin.
+            drift_err = _thesis_version_drift(row, thesis_row)
+            if drift_err:
+                return {
+                    "ok": False,
+                    "status": status,
+                    "audit": row.get("audit"),
+                    "message": _prefix_with_audit_summary(
+                        row,
+                        f"{drift_err}；请重新调用 publish_report（不带 request_id）"
+                        "发起新的审批。",
+                    ),
+                }
         prov_records = await _load_workspace_provenance(
             workspace_id,
             draft_path=draft_path,
@@ -1125,17 +1444,36 @@ async def run_publish(
                     f"{msg_prefix}Publish request {req_id} remains in {status}; update the draft before retrying."
                 ),
             }
-        # Bundle, inputs, or audit config changed -> re-enter auditing
-        updated = await db_publications.transition(
-            req_id,
-            (status,),
-            "auditing",
-            bundle_sha256=bundle_sha256,
-            attachments=att_list,
-        )
+        # Bundle, inputs, or audit config changed -> re-enter auditing.
+        # Round-3 decision 1: a same-tool-call retry (no request_id) may carry
+        # new params — write them all back so the row always reflects the
+        # latest submission that went through the audit. Round-5 item 2: an
+        # explicit request_id re-entry keeps the row's saved params/version
+        # (they were adopted above) and only moves the status.
+        if request_id is None:
+            updated = await db_publications.transition(
+                req_id,
+                (status,),
+                "auditing",
+                bundle_sha256=bundle_sha256,
+                attachments=att_list,
+                title=title,
+                kind=kind,
+                slug=slug,
+                draft_path=draft_path,
+                updates_thesis=updates_thesis,
+                thesis_version_no=thesis_version_no if updates_thesis else None,
+            )
+        else:
+            updated = await db_publications.transition(
+                req_id, (status,), "auditing"
+            )
         if updated:
             row = updated
             status = "auditing"
+            # Round-4 decision 2: the re-submission may have re-pinned the
+            # thesis version — every later phase reads it from the updated row.
+            approved_thesis_version_no = row.get("thesis_version_no")
 
     # Step 2: Figure Audit (when status == 'auditing')
     if status == "auditing":
@@ -1262,6 +1600,20 @@ async def run_publish(
 
     # Step 3: Independent Cross-Family Review (when status == 'reviewing')
     if status == "reviewing":
+        # Round-4 decision 2: thesis drift is caught BEFORE the review runs —
+        # a drifted thesis must be re-filed, not reviewed and voided later.
+        drift_err = _thesis_version_drift(row, thesis_row)
+        if drift_err:
+            return {
+                "ok": False,
+                "status": status,
+                "audit": row.get("audit"),
+                "message": _prefix_with_audit_summary(
+                    row,
+                    f"{drift_err}；请重新调用 publish_report（不带 request_id）"
+                    "发起新的审批。",
+                ),
+            }
         if unrecalc_warnings:
             err_msg = "；".join(unrecalc_warnings)
             await db_publications.transition(
@@ -1320,7 +1672,7 @@ async def run_publish(
                 error=rev_res.reason,
             )
             await _append_agenda_pm_handoff(
-                user_id=user_id,
+                user_id=ws_owner_id,
                 workspace_id=workspace_id,
                 what="配置审稿模型凭证",
                 kind="data_access",
@@ -1370,20 +1722,19 @@ async def run_publish(
 
     # Step 4 & 5: PM Approval (when status == 'awaiting_pm')
     if status == "awaiting_pm":
-        if request_id and row.get("bundle_sha256") != bundle_sha256:
-            await db_publications.transition(
-                req_id,
-                ("awaiting_pm",),
-                "superseded",
-                error="Draft bundle changed while awaiting PM approval",
-            )
+        # Round-4 decision 2: thesis drift is caught BEFORE the approval card
+        # (or the unattended handoff) — a drifted thesis must be re-filed, not
+        # approved and voided afterwards.
+        drift_err = _thesis_version_drift(row, thesis_row)
+        if drift_err:
             return {
                 "ok": False,
-                "status": "superseded",
+                "status": status,
                 "audit": row.get("audit"),
                 "message": _prefix_with_audit_summary(
                     row,
-                    "草稿在审批前已被修改（superseded），请重新调用 publish_report。",
+                    f"{drift_err}；请重新调用 publish_report（不带 request_id）"
+                    "发起新的审批。",
                 ),
             }
         if unrecalc_warnings:
@@ -1417,12 +1768,25 @@ async def run_publish(
                 "message": _prefix_with_audit_summary(row, model_sha_err),
             }
 
-        # 4a. Unattended run -> do NOT emit interrupt(); record pm_handoff and stop at awaiting_pm
-        if origin_type in ("automation", "agent"):
+        # 4a. Unattended run -> do NOT emit interrupt(); record pm_handoff and stop at awaiting_pm.
+        # Round-2 decision A: a colleague-initiated publish takes this path too —
+        # the workspace owner cannot answer an approval card inside a colleague's
+        # thread (read-only there), and the colleague cannot pass the PM check.
+        initiated_by = await _resolve_publish_initiator(
+            row,
+            ws_owner_id,
+            caller_thread_id=thread_id,
+            caller_user_id=user_id,
+        )
+        if origin_type in ("automation", "agent") or user_id != ws_owner_id:
             await _append_agenda_pm_handoff(
-                user_id=user_id,
+                user_id=ws_owner_id,
                 workspace_id=workspace_id,
-                what=f"批准正式发布《{title}》（request_id={req_id}）",
+                what=(
+                    f"批准正式发布《{title}》（request_id={req_id}"
+                    + (f"，由 {initiated_by} 发起" if initiated_by else "")
+                    + "）"
+                ),
                 kind="publish_approval",
                 backend=backend,
             )
@@ -1430,12 +1794,23 @@ async def run_publish(
                 row.get("audit") if isinstance(row.get("audit"), dict) else None
             )
             msg_prefix = f"{audit_summary}。" if audit_summary else ""
+            if user_id != ws_owner_id:
+                message = (
+                    f"{msg_prefix}已通过数字核验与独立审稿，已提交给工作区所有者审批"
+                    f"（request_id={req_id}）；所有者在自己的线程里用这个 request_id "
+                    "继续即可审批。"
+                )
+            else:
+                message = (
+                    f"{msg_prefix}已通过数字核验与独立审稿，等待 PM 审批，"
+                    f"request_id={req_id}"
+                )
             return {
                 "ok": False,
                 "status": "awaiting_pm",
                 "request_id": req_id,
                 "audit": row.get("audit"),
-                "message": f"{msg_prefix}已通过数字核验与独立审稿，等待 PM 审批，request_id={req_id}",
+                "message": message,
             }
 
         # 4b. Interactive thread -> emit ToolApprovalCard interrupt (aligned schema G3.2)
@@ -1508,8 +1883,8 @@ async def run_publish(
             f"通过 · {reviewer_payload['model']} （{reviewer_payload['family']}）"
         )
         thesis_ver_str = (
-            f"v{thesis_version_no}"
-            if updates_thesis and thesis_version_no
+            f"v{approved_thesis_version_no}"
+            if updates_thesis and approved_thesis_version_no
             else "不更新"
         )
 
@@ -1558,6 +1933,11 @@ async def run_publish(
                 }
             ],
         }
+        if initiated_by:
+            # A colleague-initiated publish: the request belongs to the
+            # workspace owner, so the approval card names who actually filed it.
+            payload["action_requests"][0]["args"]["initiated_by"] = initiated_by
+            payload["action_requests"][0]["args"]["发起人"] = initiated_by
         call_interrupt = interrupt_fn or interrupt
         answer = call_interrupt(payload)
         ans_dict = answer if isinstance(answer, dict) else {}
@@ -1575,16 +1955,19 @@ async def run_publish(
             else ""
         )
 
-        # Verify PM user authorization
+        # Verify PM user authorization. Round-2 decision B: approve/reject is
+        # the workspace owner's alone — another PM-listed colleague may not
+        # decide someone else's workspace.
         pm_users = set(get_dalton_config().pm_user_ids)
-        if user_id not in pm_users:
+        if user_id not in pm_users or user_id != ws_owner_id:
             return {
                 "ok": False,
                 "status": "awaiting_pm",
                 "audit": row.get("audit"),
                 "message": _prefix_with_audit_summary(
                     row,
-                    f"只有 PM（{sorted(pm_users)}）能批准正式发布。",
+                    "只有工作区所有者（且在 PM 名单内）能批准或拒绝正式发布，"
+                    "当前调用者不是该工作区的所有者。",
                 ),
             }
 
@@ -1657,6 +2040,27 @@ async def run_publish(
 
     # Step 6: Consume approval (approve-once, execute-once)
     if status == "approved":
+        # Round-3 decision 1: if the approval pinned a thesis version, the
+        # workspace's current thesis must still be that version — a drift means
+        # the approved thesis.official snapshot is stale; go back to approval.
+        thesis_drift = _thesis_version_drift(row, thesis_row)
+        if thesis_drift:
+            await db_publications.transition(
+                req_id,
+                ("approved",),
+                "superseded",
+                error=thesis_drift,
+            )
+            return {
+                "ok": False,
+                "status": "superseded",
+                "audit": row.get("audit"),
+                "message": _prefix_with_audit_summary(
+                    row,
+                    f"{thesis_drift}，已批准的结果作废（superseded），"
+                    "请重新调用 publish_report 走审批。",
+                ),
+            }
         app_unrecalc = await _check_unrecalculated_models(
             backend, draft_text, facts_text, attachments=attachments, att_blobs=None
         )
@@ -1712,6 +2116,27 @@ async def run_publish(
 
     # Step 7, 8, 9: Write immutable files, insert publication rows, update thesis.official
     if status == "publishing":
+        # Round-3 decision 1: the publishing resume path has no
+        # consume_approval of its own, so it re-checks the thesis drift here
+        # (the bundle gate already ran before the state dispatch).
+        thesis_drift = _thesis_version_drift(row, thesis_row)
+        if thesis_drift:
+            await db_publications.transition(
+                req_id,
+                ("publishing",),
+                "superseded",
+                error=thesis_drift,
+            )
+            return {
+                "ok": False,
+                "status": "superseded",
+                "audit": row.get("audit"),
+                "message": _prefix_with_audit_summary(
+                    row,
+                    f"{thesis_drift}，已批准的结果作废（superseded），"
+                    "请重新调用 publish_report 走审批。",
+                ),
+            }
         pub_unrecalc = await _check_unrecalculated_models(
             backend, draft_text, facts_text, attachments=attachments, att_blobs=None
         )
@@ -1752,7 +2177,7 @@ async def run_publish(
         )
         review_info = row.get("review") or {}
         audit_info = row.get("audit") or {}
-        approver = str(row.get("decided_by") or user_id)
+        approver = str(row.get("decided_by") or ws_owner_id)
 
         pub_markdown = prepend_publication_banner(
             draft_text,
@@ -1764,7 +2189,7 @@ async def run_publish(
             reviewer_model=str(review_info.get("model") or "reviewer"),
             reviewer_family=str(review_info.get("family") or "independent"),
             publication_id=req_id,
-            thesis_version_no=thesis_version_no if updates_thesis else None,
+            thesis_version_no=approved_thesis_version_no if updates_thesis else None,
         )
 
         files_meta, file_blobs, file_notes = await write_published_bundle(
@@ -1778,7 +2203,7 @@ async def run_publish(
         try:
             pub_row = await db_publications.insert_publication(
                 publish_request_id=req_id,
-                user_id=user_id,
+                user_id=ws_owner_id,
                 workspace_id=workspace_id,
                 ticker=ticker,
                 kind=kind,
@@ -1806,7 +2231,9 @@ async def run_publish(
                 },
                 approver_user_id=approver,
                 approved_at=now_dt,
-                thesis_version_no=thesis_version_no if updates_thesis else None,
+                thesis_version_no=approved_thesis_version_no
+                if updates_thesis
+                else None,
             )
         except db_publications.WorkspaceUnavailableForPublishError as exc:
             err_msg = str(exc)
@@ -1854,7 +2281,7 @@ async def run_publish(
                         }
                     )
             off_res = await apply_update(
-                user_id=user_id,
+                user_id=ws_owner_id,
                 workspace_id=workspace_id,
                 doc_key="thesis",
                 ops=ops_for_official,
@@ -1920,3 +2347,61 @@ async def run_publish(
         "message": f"Unexpected publish request status: {status}",
     }
 
+
+
+async def run_publish(
+    *,
+    user_id: str,
+    workspace_id: str,
+    thread_id: str,
+    tool_call_id: str,
+    draft_path: str,
+    title: str,
+    kind: str,
+    slug: str,
+    attachments: list[dict[str, Any]] | None = None,
+    updates_thesis: bool = False,
+    request_id: str | None = None,
+    backend: Any,
+    author_model: str | None = None,
+    origin_type: str | None = None,
+    interrupt_fn: Any = None,
+) -> dict[str, Any]:
+    """Execute the PK.11 publication state machine (see ``_run_publish_state_machine``).
+
+    Round-3 decision 1 wrapper: when a request_id re-entry ignored some of the
+    caller's params in favour of the row's saved ones, every result message is
+    prefixed with which params were ignored, so an owner taking a request over
+    sees that their (differing) title/slug/etc. did not take effect."""
+    # One shape for "no request_id" everywhere below: the tool may pass "",
+    # and the state machine mixes truthiness and `is None` checks.
+    request_id = (request_id or "").strip() or None
+    token = _IGNORED_PARAMS_NOTE.set(None)
+    try:
+        result = await _run_publish_state_machine(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            thread_id=thread_id,
+            tool_call_id=tool_call_id,
+            draft_path=draft_path,
+            title=title,
+            kind=kind,
+            slug=slug,
+            attachments=attachments,
+            updates_thesis=updates_thesis,
+            request_id=request_id,
+            backend=backend,
+            author_model=author_model,
+            origin_type=origin_type,
+            interrupt_fn=interrupt_fn,
+        )
+    finally:
+        ignored = _IGNORED_PARAMS_NOTE.get()
+        _IGNORED_PARAMS_NOTE.reset(token)
+    if ignored and isinstance(result, dict):
+        result["message"] = (
+            f"已按原请求的参数继续，忽略本次传入的 {'、'.join(ignored)}。"
+            f"{result.get('message') or ''}"
+        )
+        result["ignored_params"] = list(ignored)
+    return result

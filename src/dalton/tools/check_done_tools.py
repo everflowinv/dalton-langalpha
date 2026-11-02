@@ -2396,17 +2396,17 @@ async def _check_published_or_awaiting(
     info = await _file_info(backend, published)
     if info.exists and info.size > 0:
         return []
-    if not user_id or not workspace_id:
+    if not workspace_id:
         return [
             (
-                f"没有 published/ 副本 {published}，且缺少 user_id/workspace_id 无法查询本工作区的 "
+                f"没有 published/ 副本 {published}，且缺少 workspace_id 无法查询本工作区的 "
                 "awaiting_pm 发布请求；发布状态无法核对，请在公司工作区线程重试。"
             )
         ]
     try:
-        from src.dalton.database.publications import list_pending
+        from src.dalton.database.publications import list_pending_for_workspace
 
-        requests = await list_pending(user_id, "awaiting_pm")
+        requests = await list_pending_for_workspace(workspace_id, "awaiting_pm")
     except Exception as error:
         logger.warning("dalton_check_done awaiting_pm query failed", error=str(error))
         return ["发布状态无法核对（awaiting_pm 查询失败），请重试。"]
@@ -2415,13 +2415,43 @@ async def _check_published_or_awaiting(
     workspace_dir = getattr(backend, "workspace_dir", None)
     if not isinstance(workspace_dir, str):
         workspace_dir = None
+    draft_text = await _read_text(backend, draft)
+    current_draft_sha = (
+        hashlib.sha256(draft_text.encode("utf-8")).hexdigest()
+        if draft_text is not None
+        else None
+    )
+    stale_request = False
     for request in requests:
         if not isinstance(request, dict):
             continue
         if str(request.get("workspace_id") or "") != str(workspace_id):
             continue
-        if _same_workspace_path(request.get("draft_path"), draft, workspace_dir):
-            return []
+        if not _same_workspace_path(request.get("draft_path"), draft, workspace_dir):
+            continue
+        # Round-2 decision E: the request only counts while the draft on disk
+        # still hashes to what its audit covered — same gate as the check_draft
+        # sidecar and the language-review record.
+        audit_info = (
+            request.get("audit") if isinstance(request.get("audit"), dict) else {}
+        )
+        recorded_sha = str(audit_info.get("draft_sha256") or "").strip()
+        if (
+            not recorded_sha
+            or current_draft_sha is None
+            or recorded_sha != current_draft_sha
+        ):
+            stale_request = True
+            continue
+        return []
+    if stale_request:
+        return [
+            (
+                f"本工作区 draft_path={draft} 的 awaiting_pm 发布请求核验的是旧草稿"
+                "（请求记录的草稿哈希与当前草稿不一致）；下一步：对最终稿重新调用 "
+                "publish_report 提交发布，不得汇报发布完成。"
+            )
+        ]
     return [
         (
             f"既没有 published/ 副本 {published}，也没有本工作区 draft_path={draft} 的 "

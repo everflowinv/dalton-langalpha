@@ -27,7 +27,9 @@ import psycopg
 import pytest
 
 from ptc_agent.agent.backends.sandbox import SandboxBackend
-from src.dalton.database.publications import list_pending as _REAL_LIST_PENDING
+from src.dalton.database.publications import (
+    list_pending_for_workspace as _REAL_LIST_PENDING,
+)
 from src.dalton.database.verdicts import (
     get_verdict_for_execution as _REAL_GET_VERDICT_FOR_EXECUTION,
     list_verdicts as _REAL_LIST_VERDICTS,
@@ -2835,6 +2837,50 @@ async def test_publish_done_when_published_or_awaiting_pm(
 
 
 @pytest.mark.asyncio
+async def test_publish_awaiting_pm_found_for_colleague_initiator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A colleague-initiated publish is owned by the workspace owner; the
+    closing check still finds its awaiting_pm request when the colleague (not
+    the owner) runs dalton_check_done."""
+    _patch_pending(monkeypatch, [_pending_row(PUB_DRAFT, user_id="pm-owner-1")])
+    colleague_done = await run_check_done(
+        workflow="dalton-publish", params=PUB_PARAMS,
+        backend=_make_backend(_publish_files()), workspace_id=WS,
+        user_id="colleague-1",
+    )
+    assert colleague_done["done"] is True, colleague_done["missing"]
+
+
+@pytest.mark.asyncio
+async def test_publish_awaiting_pm_stale_draft_hash_is_not_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round-2 decision E: an awaiting_pm request only counts while the draft
+    on disk still hashes to what its audit covered — a stale request (or one
+    without a recorded hash) is a gap, not a pass."""
+    stale = _pending_row(PUB_DRAFT, audit={"draft_sha256": "0" * 64})
+    _patch_pending(monkeypatch, [stale])
+    stale_done = await run_check_done(
+        workflow="dalton-publish", params=PUB_PARAMS,
+        backend=_make_backend(_publish_files()), workspace_id=WS,
+        user_id="user-1",
+    )
+    assert stale_done["done"] is False
+    assert any("旧草稿" in m for m in stale_done["missing"])
+
+    hashless = _pending_row(PUB_DRAFT, audit={})
+    _patch_pending(monkeypatch, [hashless])
+    hashless_done = await run_check_done(
+        workflow="dalton-publish", params=PUB_PARAMS,
+        backend=_make_backend(_publish_files()), workspace_id=WS,
+        user_id="user-1",
+    )
+    assert hashless_done["done"] is False
+    assert any("旧草稿" in m for m in hashless_done["missing"])
+
+
+@pytest.mark.asyncio
 async def test_publish_gaps_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     # Another workspace's request for the same path does not count.
     _patch_pending(monkeypatch, [_pending_row(PUB_DRAFT, workspace_id="ws-other")])
@@ -2895,24 +2941,35 @@ def _patch_pending(
 
     listed = create_autospec(_REAL_LIST_PENDING)
 
-    async def _rows(user_id: str, status: str = "awaiting_pm") -> list[dict[str, Any]]:
+    async def _rows(workspace_id: str, status: str = "awaiting_pm") -> list[dict[str, Any]]:
         if error is not None:
             raise error
         assert status == "awaiting_pm"
         return rows or []
 
     listed.side_effect = _rows
-    monkeypatch.setattr(publications_db, "list_pending", listed)
+    monkeypatch.setattr(publications_db, "list_pending_for_workspace", listed)
 
 
-def _pending_row(draft_path: str, workspace_id: str = WS) -> dict[str, Any]:
+def _pending_row(
+    draft_path: str,
+    workspace_id: str = WS,
+    user_id: str = "user-1",
+    audit: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if audit is None:
+        # The awaiting_pm gate (round-2 decision E): a request counts only
+        # while its audit covered the CURRENT draft on disk.
+        draft = _publish_files()[PUB_DRAFT]
+        audit = {"draft_sha256": hashlib.sha256(draft.encode("utf-8")).hexdigest()}
     return {
         "publish_request_id": "pr-1",
-        "user_id": "user-1",
+        "user_id": user_id,
         "workspace_id": workspace_id,
         "slug": "call-META",
         "draft_path": draft_path,
         "status": "awaiting_pm",
+        "audit": audit,
     }
 
 

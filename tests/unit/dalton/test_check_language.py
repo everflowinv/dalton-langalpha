@@ -68,7 +68,12 @@ def _issue(quote: str, issue_type: str = "negation_defensive") -> dict[str, str]
 
 @pytest.fixture(autouse=True)
 def _config(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def _verify(workspace_id: str, user_id: str) -> dict[str, Any]:
+    async def _verify(
+        workspace_id: str,
+        user_id: str,
+        need: str | None = None,
+        channel: str | None = None,
+    ) -> dict[str, Any]:
         return {}
 
     monkeypatch.setattr(language_mod, "verify_workspace_access", _verify)
@@ -500,7 +505,12 @@ async def test_check_language_tool_resolves_home_workspace_id(
 
     seen_ws: list[str] = []
 
-    async def _verify(workspace_id: str, user_id: str) -> dict[str, Any]:
+    async def _verify(
+        workspace_id: str,
+        user_id: str,
+        need: str | None = None,
+        channel: str | None = None,
+    ) -> dict[str, Any]:
         seen_ws.append(workspace_id)
         return {}
 
