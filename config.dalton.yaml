@@ -66,3 +66,12 @@ features:
   claude_code_runtime:
     enabled: false
 
+
+# Workflow children (RunWorkflow) get 90 min instead of upstream's 30.
+# 2026-11-02: two dalton-evidence branches in DASH were cancelled at exactly
+# child_timeout=1800s mid-work. run_timeout stays at upstream's 16200s (three
+# 90-minute waves): the validator only needs it above one child_timeout, and
+# the egress relay credential is sized for turns up to workflow_timeout
+# (21600s), so a longer run would lose relay access mid-run.
+workflow:
+  child_timeout: 5400
