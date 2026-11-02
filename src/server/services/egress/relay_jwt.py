@@ -34,9 +34,13 @@ ALGORITHM = "HS256"  # fixed single-entry allowlist — never taken from the hea
 # with margin or a long turn loses egress mid-run. TTL minus threshold is only
 # the remint cadence. Long tokens are free here: revocation is a per-request
 # grant lookup, never expiry.
-DEFAULT_TTL_SECONDS = 8 * 60 * 60
+# DALTON-HOOK(tail-drain-outlives-workflows): a background subagent may keep
+# using this credential for the tail allowance after its turn ends (up to the
+# workflow child_timeout, 5400s under the Dalton overlay), so the threshold
+# covers turn cap + tail + margin and the TTL stays above it.
+DEFAULT_TTL_SECONDS = 10 * 60 * 60
 LEEWAY_SECONDS = 30
-REMINT_THRESHOLD_SECONDS = 21600 + 30 * 60  # turn cap + bringup/skew margin
+REMINT_THRESHOLD_SECONDS = 21600 + 5400 + 30 * 60  # turn cap + tail allowance + bringup/skew margin
 
 _REQUIRED_CLAIMS = ["iss", "aud", "sub", "workspace_id", "iat", "nbf", "exp", "jti"]
 

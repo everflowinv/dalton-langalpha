@@ -9,6 +9,13 @@ workflow run gets its own ``run_timeout`` window counted from its start
 (plus a settle margin), every other writer keeps the flat 1800s tail
 allowance, and a writer past its own deadline still discards (fail-closed),
 with the timeout naming the deadline it actually used.
+
+R3 (11-02, DASH Task-IbtxIg): an ORDINARY background Task outliving its
+turn hit the same flat 1800s — fenced out as worker_lost 30 minutes in
+while the Dalton overlay had raised workflow child_timeout to 5400s. The
+ordinary allowance is now ``max(SUBAGENT_TAIL_TIMEOUT, child_timeout)`` —
+the same ceiling a workflow child gets — in the guard drain, the stop
+bill's settle wait, and the kill-path archive wait.
 """
 
 from __future__ import annotations
@@ -21,6 +28,7 @@ from unittest.mock import create_autospec, patch
 
 import pytest
 
+from src.config.models import WorkflowOrchestrationConfig
 from src.ptc_agent.agent.middleware.background_subagent.registry import (
     BackgroundTaskRegistry,
 )
@@ -105,9 +113,21 @@ def _workflow_row(
 
 
 class _Settings:
-    """Enter a tuple of patch contexts (keeps the with-blocks readable)."""
+    """Enter a tuple of patch contexts (keeps the with-blocks readable).
 
-    def __init__(self, *, run_timeout: float, global_timeout: float):
+    The orchestration double is the REAL WorkflowOrchestrationConfig: the
+    ordinary-writer allowance reads ``child_timeout`` off it, and a loose
+    namespace would hide a missing or mis-typed field until production.
+    ``run_timeout`` must exceed ``child_timeout`` (model validator).
+    """
+
+    def __init__(
+        self,
+        *,
+        run_timeout: int,
+        global_timeout: float,
+        child_timeout: int = 1800,
+    ):
         import src.config.settings as settings_mod
 
         self._patches = [
@@ -116,7 +136,10 @@ class _Settings:
                 "get_workflow_orchestration_config",
                 create_autospec(
                     settings_mod.get_workflow_orchestration_config,
-                    return_value=SimpleNamespace(run_timeout=run_timeout),
+                    return_value=WorkflowOrchestrationConfig(
+                        run_timeout=run_timeout,
+                        child_timeout=child_timeout,
+                    ),
                 ),
             ),
             patch.object(
@@ -142,9 +165,10 @@ class _Settings:
 @pytest.mark.asyncio
 async def test_a_live_workflow_writer_gets_its_own_run_timeout_window(monkeypatch):
     """The drain's first wait carries the workflow's OWN window — its
-    run_timeout counted from its start plus the settle margin — not the flat
-    tail allowance and not the main turn's global workflow_timeout (both
-    patched tiny here; the round-1 global-max shape would wait only 0.05s)."""
+    run_timeout counted from its start plus the settle margin — not the
+    ordinary tail allowance (floored at child_timeout 1s here, the patched
+    0.05s constant below it) and not the main turn's global workflow_timeout
+    (0.05s; the round-1 global-max shape would wait only 0.05s)."""
     monkeypatch.setattr(subagent_collection, "SUBAGENT_TAIL_TIMEOUT", 0.05)
     monkeypatch.setattr(executor.LocalRunExecutor, "_WORKFLOW_SETTLE_MARGIN_S", 0.05)
     captured: dict = {}
@@ -170,20 +194,23 @@ async def test_a_live_workflow_writer_gets_its_own_run_timeout_window(monkeypatc
                 return_value=[_workflow_row("wf-1", started=datetime.now(tz=UTC))],
             ),
         ),
-        _Settings(run_timeout=0.6, global_timeout=0.05),
+        _Settings(run_timeout=2, global_timeout=0.05, child_timeout=1),
     ):
         with pytest.raises(_Probe):
             await ex._drain_run_subagent_writers("t-1", "run-1", guard)
 
-    assert captured["timeout"] > 0.4  # ≈ run_timeout 0.6 + margin 0.05
+    # ≈ run_timeout 2 + margin 0.05; the flat allowance would give 1.0
+    assert captured["timeout"] > 1.6
     store._registry.settle()
 
 
 @pytest.mark.asyncio
 async def test_nonworkflow_writers_keep_the_flat_tail_allowance(monkeypatch):
-    """No live root workflow: the drain waits the flat SUBAGENT_TAIL_TIMEOUT
-    and nothing more — the global workflow_timeout must not stretch a wait
-    for ordinary writers (round-1's global-max shape waited it out)."""
+    """No live root workflow: the drain waits the ordinary tail allowance —
+    max(SUBAGENT_TAIL_TIMEOUT, child_timeout), here 1.0s with the constant
+    patched to 0.05 below child_timeout — and nothing more: the global
+    workflow_timeout (5s) must not stretch a wait for ordinary writers
+    (round-1's global-max shape waited it out)."""
     monkeypatch.setattr(subagent_collection, "SUBAGENT_TAIL_TIMEOUT", 0.05)
     monkeypatch.setattr(executor.LocalRunExecutor, "_WORKFLOW_SETTLE_MARGIN_S", 0.05)
     captured: dict = {}
@@ -214,13 +241,185 @@ async def test_nonworkflow_writers_keep_the_flat_tail_allowance(monkeypatch):
                 ],
             ),
         ),
-        _Settings(run_timeout=5.0, global_timeout=5.0),
+        _Settings(run_timeout=2, global_timeout=5.0, child_timeout=1),
     ):
         with pytest.raises(_Probe):
             await ex._drain_run_subagent_writers("t-1", "run-1", guard)
 
-    assert captured["timeout"] <= 0.1  # the flat 0.05 allowance
+    # The child_timeout side of the max (1.0), not the global 5s
+    assert 0.9 < captured["timeout"] <= 1.05
     store._registry.settle()
+
+
+@pytest.mark.asyncio
+async def test_ordinary_tail_writer_waits_the_child_timeout_when_longer():
+    """Production 11-02 (DASH Task-IbtxIg): a plain background Task that
+    outlived its turn was drained on the flat 1800s and fenced out as
+    worker_lost 30 minutes in. Its allowance is now
+    max(SUBAGENT_TAIL_TIMEOUT, child_timeout) counted from the drain's
+    start — here child_timeout 5400s (the Dalton overlay) against the
+    untouched 1800s constant."""
+    captured: dict = {}
+
+    async def _capture_wait(futures, timeout=None):
+        captured["timeout"] = timeout
+        raise _Probe
+
+    store = _RegistryStore(_FakeRegistry("plain-1"))
+    guard = SimpleNamespace(
+        run_id="run-1",
+        owns_task_ns=lambda task_id: True,
+    )
+    ex = executor.LocalRunExecutor()
+    try:
+        with (
+            _drain_patches(store),
+            patch("asyncio.wait", _capture_wait),
+            patch.object(
+                sr_db,
+                "list_open_workflow_runs_for_thread",
+                create_autospec(
+                    sr_db.list_open_workflow_runs_for_thread,
+                    return_value=[],
+                ),
+            ),
+            _Settings(run_timeout=16200, global_timeout=1.0, child_timeout=5400),
+        ):
+            with pytest.raises(_Probe):
+                await ex._drain_run_subagent_writers("t-1", "run-1", guard)
+
+        assert 5000 < captured["timeout"] <= 5400  # child_timeout, not 1800
+    finally:
+        store._registry.settle()
+
+
+@pytest.mark.asyncio
+async def test_ordinary_tail_writer_at_the_upstream_default_keeps_1800s():
+    """Upstream default (child_timeout 1800s): the ordinary allowance stays
+    at the flat 1800s — the max can raise the ceiling but never lower it."""
+    captured: dict = {}
+
+    async def _capture_wait(futures, timeout=None):
+        captured["timeout"] = timeout
+        raise _Probe
+
+    store = _RegistryStore(_FakeRegistry("plain-1"))
+    guard = SimpleNamespace(
+        run_id="run-1",
+        owns_task_ns=lambda task_id: True,
+    )
+    ex = executor.LocalRunExecutor()
+    try:
+        with (
+            _drain_patches(store),
+            patch("asyncio.wait", _capture_wait),
+            patch.object(
+                sr_db,
+                "list_open_workflow_runs_for_thread",
+                create_autospec(
+                    sr_db.list_open_workflow_runs_for_thread,
+                    return_value=[],
+                ),
+            ),
+            _Settings(run_timeout=3600, global_timeout=1.0, child_timeout=1800),
+        ):
+            with pytest.raises(_Probe):
+                await ex._drain_run_subagent_writers("t-1", "run-1", guard)
+
+        assert 1700 < captured["timeout"] <= 1800  # the flat 1800s allowance
+    finally:
+        store._registry.settle()
+
+
+@pytest.mark.asyncio
+async def test_stop_bill_keeps_the_upstream_allowance_under_a_longer_child_timeout():
+    """The stop bill waits the whole batch, so it stays at the upstream 1800s
+    even when child_timeout is 5400: settle_abandoned stamps a task finalized
+    more than 30 minutes ago, and a longer batch wait would let a finished task
+    leave the in-flight count before its usage row exists. The retained-task set is spied (not consulted) because its
+    done-callback discards a finished collector before a name lookup could
+    find it, and the collector must finish under the patches."""
+    captured: dict = {}
+
+    async def _capture_wait(futures, timeout=None):
+        captured["timeout"] = timeout
+        return (set(), set(futures))  # all writers still "hung"
+
+    handle = asyncio.get_running_loop().create_task(asyncio.Event().wait())
+    task = BackgroundTask(
+        tool_call_id="call-bill-1",
+        task_id="bill-1",
+        description="bill-1",
+        prompt="",
+        subagent_type="general-purpose",
+        asyncio_task=handle,
+    )
+    retained: list[asyncio.Task] = []
+    retain = create_autospec(
+        subagent_collection._retain_collector, side_effect=retained.append
+    )
+    persist = create_autospec(subagent_collection.persist_subagent_usage)
+    try:
+        with (
+            patch.object(subagent_collection, "_retain_collector", retain),
+            patch("asyncio.wait", _capture_wait),
+            patch.object(subagent_collection, "persist_subagent_usage", persist),
+            _Settings(run_timeout=16200, global_timeout=1.0, child_timeout=5400),
+        ):
+            await subagent_collection._bill_after_unwind(
+                "run-bill", [task], "t-1", "ws-1", "u-1", False,
+            )
+            assert retained, "no bill collector was retained"
+            await asyncio.wait_for(retained[0], timeout=5.0)
+
+        assert captured["timeout"] == subagent_collection.SUBAGENT_TAIL_TIMEOUT == 1800.0
+        assert persist.await_count == 1
+    finally:
+        handle.cancel()
+
+
+@pytest.mark.asyncio
+async def test_archive_waits_the_child_timeout_sized_allowance():
+    """The kill path's archive wait matches too: a lane's events must not be
+    read and persisted while its writer may still append under the longer
+    allowance the guard drain would have held it to."""
+    captured: dict = {}
+
+    async def _capture_wait(futures, timeout=None):
+        captured["timeout"] = timeout
+        return (set(), set(futures))
+
+    handle = asyncio.get_running_loop().create_task(asyncio.Event().wait())
+    task = BackgroundTask(
+        tool_call_id="call-arch-1",
+        task_id="arch-1",
+        description="arch-1",
+        prompt="",
+        subagent_type="general-purpose",
+        asyncio_task=handle,
+    )
+    retained: list[asyncio.Task] = []
+    retain = create_autospec(
+        subagent_collection._retain_collector, side_effect=retained.append
+    )
+    killed = create_autospec(subagent_collection.killed_lane, return_value=[])
+    try:
+        with (
+            patch.object(subagent_collection, "_retain_collector", retain),
+            patch("asyncio.wait", _capture_wait),
+            patch.object(subagent_collection, "killed_lane", killed),
+            _Settings(run_timeout=16200, global_timeout=1.0, child_timeout=5400),
+        ):
+            subagent_collection._archive_after_unwind(
+                "t-1", "run-arch", [task], "ws-1", None,
+            )
+            assert retained, "no archive collector was retained"
+            await asyncio.wait_for(retained[0], timeout=5.0)
+
+        assert 5000 < captured["timeout"] <= 5400
+        assert killed.await_count == 1
+    finally:
+        handle.cancel()
 
 
 @pytest.mark.asyncio
@@ -250,7 +449,7 @@ async def test_a_writer_past_its_own_deadline_discards_naming_the_basis(monkeypa
                     ],
                 ),
             ),
-            _Settings(run_timeout=0.02, global_timeout=0.02),
+            _Settings(run_timeout=2, global_timeout=2, child_timeout=1),
         ):
             drained = asyncio.create_task(
                 ex._drain_run_subagent_writers("t-1", "run-1", guard)
@@ -294,13 +493,13 @@ async def test_a_persistently_unreadable_workflow_ledger_fails_closed_at_a_fixed
                     side_effect=_unreadable,
                 ),
             ),
-            _Settings(run_timeout=0.02, global_timeout=0.25),
+            _Settings(run_timeout=2, global_timeout=1.1, child_timeout=1),
         ):
             drained = asyncio.create_task(
                 ex._drain_run_subagent_writers("t-1", "run-1", guard)
             )
             try:
-                await asyncio.wait_for(drained, timeout=1.5)
+                await asyncio.wait_for(drained, timeout=2.5)
             except asyncio.TimeoutError as exc:
                 assert "from the drain's start" in str(exc)
     finally:
