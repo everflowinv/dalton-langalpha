@@ -7090,6 +7090,11 @@
       "sectorTitle": "Sector auto-tracking",
       "sectorSubtitle": "Agenda-due and internal-material delta jobs for each sector coverage unit (no securities probes)",
       "sectorSummary": "Sector tracking"
+    },
+    "notify": {
+      "targetsNone": "Not pushed",
+      "targetsInheritCategory": "Inherits category settings",
+      "targetsGroupLeft": "bot no longer in this group"
     }
   }
 }

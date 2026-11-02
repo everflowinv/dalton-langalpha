@@ -18,6 +18,8 @@ import { INSTANT, SELECTION_SPRING } from '../utils/motion';
 import { StatusGlyph } from './StatusMark';
 // DALTON-HOOK(dalton-notify): per-task Feishu/Discord notify toggle
 import { AutomationNotifyToggle } from '@/pages/Settings/panels/dalton/AutomationNotifyToggle';
+// DALTON-HOOK(notify-routes): per-task notify target routing selector
+import { AutomationNotifyTargets } from '@/pages/Settings/panels/dalton/AutomationNotifyTargets';
 import './AutomationList.css';
 
 /** A finished group longer than this starts folded when anything else is on
@@ -187,6 +189,8 @@ export function AutomationList({ groups, readings, selectedId, onSelect, keyboar
                     </button>
                     {/* DALTON-HOOK(dalton-notify): per-task Feishu/Discord notify switch */}
                     <AutomationNotifyToggle automation={a} />
+                    {/* DALTON-HOOK(notify-routes): per-task notify target routing selector */}
+                    <AutomationNotifyTargets automation={a} />
                   </div>
                 );
               })}

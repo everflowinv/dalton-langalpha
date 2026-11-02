@@ -71,6 +71,9 @@ def _make_bridge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> rb.Research
     monkeypatch.setenv("DALTON_BRIDGE_ENV_FILE", str(empty_env))
     monkeypatch.setenv("OPENCLAW_GATEWAY_URL", "http://127.0.0.1:18789")
     monkeypatch.setenv("OPENCLAW_GATEWAY_TOKEN", "secret-gateway-token-xyz987")
+    # Keep the host machine's real Feishu credentials (the openclaw.json
+    # fallback BridgeConfig reads) out of the test config.
+    monkeypatch.setattr(rb, "_read_openclaw_feishu_credentials", lambda: ("", ""))
     return rb.ResearchDataBridge(rb.BridgeConfig())
 
 
@@ -275,7 +278,9 @@ async def test_unconfigured_notify_targets_does_not_push(
         validate_dalton_model_preferences({"dalton_notify_targets": ["discord:user:not_a_number"]})
     assert is_valid_dalton_notify_target("feishu:user:ou_abc_1") is True
     assert is_valid_dalton_notify_target("discord:user:123456") is True
-    assert is_valid_dalton_notify_target("feishu:chat:oc_123") is False
+    assert is_valid_dalton_notify_target("feishu:chat:oc_abc_1") is True
+    # feishu:chat ids are oc_-shaped; a bare or differently-prefixed id stays invalid.
+    assert is_valid_dalton_notify_target("feishu:chat:ou_123") is False
 
 
 @pytest.mark.asyncio

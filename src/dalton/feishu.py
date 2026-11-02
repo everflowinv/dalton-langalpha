@@ -27,6 +27,10 @@ FEISHU_ROUTES = frozenset(
         "doc/append",
         # C1: re-grant only, scoped to docs the bridge itself created.
         "doc/grant",
+        # notify-routes: the chat-sending bot's display name and its own chats,
+        # for the settings page and route validation.
+        "bot-info",
+        "chats",
     }
 )
 

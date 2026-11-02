@@ -732,3 +732,49 @@ export async function fetchDaltonFeishuSpaces(): Promise<{ spaces: DaltonFeishuS
   );
   return data;
 }
+
+export interface DaltonNotifyTestResponse {
+  ok: boolean;
+  detail: string | null;
+  error_code: string | null;
+}
+
+/** Send one test push to a target the current user already has configured. */
+export async function sendDaltonNotifyTest(target: string): Promise<DaltonNotifyTestResponse> {
+  const { data } = await api.post<DaltonNotifyTestResponse>(
+    '/api/v1/dalton/notify/test',
+    { target },
+  );
+  return data;
+}
+
+export interface DaltonFeishuBotResponse {
+  ok: boolean;
+  app_name: string | null;
+}
+
+/** The chat-sending Feishu bot's display name (null when unavailable; falls back to generic copy). */
+export async function fetchDaltonFeishuBotName(): Promise<DaltonFeishuBotResponse> {
+  const { data } = await api.get<DaltonFeishuBotResponse>(
+    '/api/v1/dalton/notify/feishu-bot',
+  );
+  return data;
+}
+
+export interface DaltonFeishuGroup {
+  chat_id: string;
+  name: string;
+}
+
+export interface DaltonFeishuGroupsResponse {
+  ok: boolean;
+  groups: DaltonFeishuGroup[];
+}
+
+/** The chats the notify bot is in (admin only; server caches 5 minutes). */
+export async function fetchDaltonFeishuGroups(): Promise<DaltonFeishuGroupsResponse> {
+  const { data } = await api.get<DaltonFeishuGroupsResponse>(
+    '/api/v1/dalton/notify/feishu-groups',
+  );
+  return data;
+}

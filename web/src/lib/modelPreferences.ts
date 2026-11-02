@@ -73,6 +73,9 @@ export interface ModelPreferences extends ModelProfile {
   dalton_notify_enabled?: boolean | null;
   dalton_notify_targets?: string[] | null;
   dalton_notify_overrides?: Record<string, boolean> | null;
+  // DALTON-HOOK(notify-routes): per-target display labels and per-task routing
+  dalton_notify_target_labels?: Record<string, string> | null;
+  dalton_notify_routes?: Record<string, string[]> | null;
 }
 
 // DALTON-HOOK(settings-section): Zod boundary schema for Dalton model_preference keys
@@ -84,6 +87,15 @@ const daltonStrListOrNull = z.catch(
 const daltonBoolOrNull = z.catch(z.nullable(z.optional(z.boolean())), undefined);
 const daltonBoolMapOrNull = z.catch(
   z.nullable(z.optional(z.record(z.string(), z.boolean()))),
+  undefined,
+);
+// DALTON-HOOK(notify-routes): notify target labels and per-task target routes
+const daltonStrMapOrNull = z.catch(
+  z.nullable(z.optional(z.record(z.string(), z.string()))),
+  undefined,
+);
+const daltonStrListMapOrNull = z.catch(
+  z.nullable(z.optional(z.record(z.string(), z.array(z.string())))),
   undefined,
 );
 const daltonTimeoutOrNull = z.catch(
@@ -107,6 +119,9 @@ export const DaltonModelPrefsSchema = z.object({
   dalton_notify_enabled: daltonBoolOrNull,
   dalton_notify_targets: daltonStrListOrNull,
   dalton_notify_overrides: daltonBoolMapOrNull,
+  // DALTON-HOOK(notify-routes): notify target labels and per-task target routes
+  dalton_notify_target_labels: daltonStrMapOrNull,
+  dalton_notify_routes: daltonStrListMapOrNull,
 });
 
 /**
@@ -165,6 +180,9 @@ export const MODEL_PREF_KEYS: ReadonlySet<string> = new Set<string>([
   'dalton_notify_enabled',
   'dalton_notify_targets',
   'dalton_notify_overrides',
+  // DALTON-HOOK(notify-routes): route notify keys to model_preference
+  'dalton_notify_target_labels',
+  'dalton_notify_routes',
 ]);
 
 /**
@@ -220,8 +238,20 @@ export function modelProfile(prefs: unknown, model: string | null | undefined): 
   return typeof entry === 'object' && entry !== null ? (entry as ModelProfile) : {};
 }
 
-/** A flat patch of preference keys, whichever column they end up in. */
-export type PreferencePatch = ModelPreferences & Record<string, unknown>;
+/** A flat patch of preference keys, whichever column they end up in.
+ *
+ * The Dalton notify maps may carry `null` members in a write: the server's
+ * jsonb deep merge deletes a key at any depth on null, which is how one
+ * label or one task's route is cleared without rewriting the whole map.
+ * Reads keep the never-null shapes from `ModelPreferences`. */
+export type PreferencePatch = Omit<
+  ModelPreferences,
+  'dalton_notify_target_labels' | 'dalton_notify_routes'
+> & {
+  // DALTON-HOOK(notify-routes): null members delete map keys on write
+  dalton_notify_target_labels?: Record<string, string | null> | null;
+  dalton_notify_routes?: Record<string, string[] | null> | null;
+} & Record<string, unknown>;
 
 /**
  * Route a flat patch to the column each key belongs to.
