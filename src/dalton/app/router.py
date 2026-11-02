@@ -7,6 +7,7 @@ all SQL lives in `src/dalton/database/`.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -1795,6 +1796,184 @@ async def list_feishu_spaces_endpoint(
         detail = str(res.get("error") or "feishu_error")
         raise HTTPException(status_code=502, detail=detail)
     return {"spaces": res.get("spaces") or []}
+
+# ---------------------------------------------------------------------------
+# Personal notify test push (DALTON-HOOK(notify-routes)): one short card to a
+# target the requesting user already has configured, via the same bridge /notify
+# path a settled automation uses.
+# ---------------------------------------------------------------------------
+
+
+class DaltonNotifyTestRequest(BaseModel):
+    target: str = Field(min_length=1, max_length=200)
+
+
+# notify-routes: the bot name is deployment-wide (the bridge's own Feishu app),
+# so one process-local entry serves every user. A 10-minute TTL is acceptable
+# in-process state under multi-worker: the value is read-only, has no
+# consistency requirement, and a stale or divergent copy per worker only means
+# an old name on the settings page for a few minutes.
+_FEISHU_BOT_NAME_CACHE_TTL_S = 600.0
+_feishu_bot_name_cache: tuple[float, str] | None = None
+
+
+async def _resolve_feishu_bot_name() -> str | None:
+    global _feishu_bot_name_cache
+    cached = _feishu_bot_name_cache
+    if cached is not None and time.monotonic() - cached[0] < _FEISHU_BOT_NAME_CACHE_TTL_S:
+        return cached[1]
+
+    from src.dalton.feishu import FeishuBridgeError, post_bridge_feishu
+
+    try:
+        res = await post_bridge_feishu("bot-info", {})
+    except FeishuBridgeError as exc:
+        logger.warning("Feishu bot info lookup failed: %s", type(exc).__name__)
+        return None
+    app_name = str(res.get("app_name") or "").strip() if isinstance(res, dict) else ""
+    if not app_name:
+        return None
+    _feishu_bot_name_cache = (time.monotonic(), app_name)
+    return app_name
+
+
+@router.get("/notify/feishu-bot")
+@handle_api_exceptions("get dalton notify feishu bot", logger)
+async def dalton_notify_feishu_bot_endpoint(
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    # notify-routes: the name exists only for the admin group card; the group
+    # discovery it accompanies is PM-only, so this stays PM-only too.
+    _require_notify_admin(user_id)
+    app_name = await _resolve_feishu_bot_name()
+    return {"ok": app_name is not None, "app_name": app_name}
+
+
+def _require_notify_admin(user_id: str | None) -> str:
+    """Group push is admin-managed: the same PM set `is_invite_pm` decides (DALTON_PM_USER_IDS)."""
+    _require_dalton_enabled()
+    from src.dalton.invites import is_invite_pm
+
+    uid = str(user_id or "").strip()
+    if not uid:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    if not is_invite_pm(uid):
+        raise HTTPException(status_code=403, detail="仅管理员可管理飞书群推送")
+    return uid
+
+
+@router.get("/notify/feishu-groups")
+@handle_api_exceptions("get dalton notify feishu groups", logger)
+async def dalton_notify_feishu_groups_endpoint(
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    _require_notify_admin(user_id)
+    from src.dalton.notify.groups import FeishuGroupsUnavailable, discover_feishu_notify_groups
+
+    try:
+        groups = await discover_feishu_notify_groups()
+    except FeishuGroupsUnavailable as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"ok": True, "groups": groups}
+
+
+@router.post("/notify/test")
+@handle_api_exceptions("send dalton notify test", logger)
+async def dalton_notify_test_endpoint(
+    body: DaltonNotifyTestRequest,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    _require_dalton_enabled()
+    from src.dalton.llm.model_prefs import (
+        is_dalton_chat_target,
+        resolve_dalton_notify_target_labels,
+        resolve_dalton_notify_targets,
+    )
+    from src.dalton.notify.dispatch import post_bridge_notify
+    from src.dalton.notify.groups import FeishuGroupsUnavailable, discover_feishu_notify_groups
+
+    cleaned = body.target.strip()
+
+    if is_dalton_chat_target(cleaned):
+        # A group test is the admin's: the bot must already be in the group.
+        _require_notify_admin(user_id)
+        try:
+            groups = await discover_feishu_notify_groups()
+        except FeishuGroupsUnavailable:
+            raise HTTPException(
+                status_code=503, detail="飞书群列表暂时不可用，请稍后再试"
+            ) from None
+        by_id = {g["chat_id"]: g["name"] for g in groups}
+        chat_id = cleaned.split(":", 2)[-1]
+        if chat_id not in by_id:
+            raise HTTPException(
+                status_code=404,
+                detail="群不在机器人已加入的群列表中（请先把机器人拉进群，再刷新群列表）",
+            )
+        display = by_id[chat_id] or cleaned
+        labels: dict[str, str] = {}
+    else:
+        targets = await resolve_dalton_notify_targets(user_id)
+        if cleaned not in targets:
+            raise HTTPException(
+                status_code=404,
+                detail="目标不在当前推送目标列表中（只允许向本人已配置的目标发送测试）",
+            )
+        labels = await resolve_dalton_notify_target_labels(user_id)
+        display = labels.get(cleaned) or cleaned
+
+    card = {
+        "schema": "2.0",
+        "header": {
+            "title": {"tag": "plain_text", "content": "Dalton 推送测试"},
+            "template": "blue",
+        },
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": f"这是一条测试推送，用于确认该目标可用。目标：{display}",
+                }
+            ]
+        },
+    }
+    text_msg = f"Dalton 推送测试\n这是一条测试推送，用于确认该目标可用。目标：{display}"
+
+    res = await post_bridge_notify([cleaned], text_msg, card)
+    results = res.get("results") if isinstance(res, dict) else None
+    item = next(
+        (
+            r
+            for r in results
+            if isinstance(r, dict) and str(r.get("target") or "") == cleaned
+        ),
+        None,
+    ) if isinstance(results, list) else None
+    if item is not None and item.get("ok") is True:
+        return {"ok": True, "detail": None, "error_code": None}
+
+    error_code = "send_failed"
+    feishu_code = ""
+    feishu_msg = ""
+    log_id = ""
+    if isinstance(item, dict):
+        error_code = str(item.get("error") or error_code)
+        feishu_code = str(item.get("feishu_code") or "")
+        feishu_msg = str(item.get("feishu_msg") or "")
+        log_id = str(item.get("log_id") or "")
+    elif isinstance(res, dict):
+        # The bridge refused the whole request (non-2xx / bad shape): its own
+        # error_code is all this side knows.
+        error_code = str(res.get("error_code") or error_code)
+    detail = f"发送失败（{error_code}）"
+    if feishu_code:
+        detail = f"发送失败（飞书错误码 {feishu_code}）"
+    if feishu_msg:
+        detail = f"{detail}：{feishu_msg}"
+    if log_id:
+        detail = f"{detail}（log_id: {log_id}）"
+    return {"ok": False, "detail": detail, "error_code": error_code}
+
 
 @router.get("/search")
 @handle_api_exceptions("global search", logger)

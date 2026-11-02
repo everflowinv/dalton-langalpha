@@ -510,6 +510,22 @@ async def update_preferences(
 
     _refuse_renamed_model_keys(model_pref, other_pref)
 
+    # DALTON-HOOK(notify-routes): the three notify keys live in
+    # model_preference only — a write under other_preference would skip every
+    # validation below, so it is refused instead of silently ignored.
+    if other_pref and any(
+        key in other_pref
+        for key in (
+            "dalton_notify_targets",
+            "dalton_notify_routes",
+            "dalton_notify_target_labels",
+        )
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="dalton_notify_targets / dalton_notify_routes / dalton_notify_target_labels 只能写在 model_preference 中",
+        )
+
     # The model keys live in their own column now. A client still
     # sending them under other_preference is honored for one release so an old
     # tab does not silently drop the user's settings on the floor.
@@ -553,15 +569,38 @@ async def update_preferences(
 
         _validate_model_tuning(model_pref, effective)
         _validate_default_model_choices(model_pref)
-        # DALTON-HOOK(settings-section): validate Dalton model preference keys (catalog membership, dedup, timeout 60..1800)
-        from src.dalton.llm.model_prefs import validate_dalton_model_preferences
+        # DALTON-HOOK(settings-section): validate Dalton model preference keys (catalog membership, dedup, timeout 60..1800).
+        # notify-routes: the stored bag rides along so the route/label cleanup
+        # sees the sub-keys a partial patch does not name (the same hand-off
+        # _clear_unhonored_efforts uses for profiles).
+        from src.dalton.llm.model_prefs import (
+            validate_dalton_model_preferences,
+            validate_dalton_notify_routes_for_user,
+        )
+
+        # notify-routes: the route entries the caller actually submitted — the
+        # validator below normalizes and cleans `model_pref` in place, and only
+        # the submitted entries (not the cleanup's pass-through groups) are
+        # gated on admin rights and live group discovery.
+        submitted_routes = model_pref.get("dalton_notify_routes")
 
         try:
             validate_dalton_model_preferences(
-                model_pref, effective_model_preference=effective
+                model_pref,
+                effective_model_preference=effective,
+                stored_model_preference=stored_model_pref,
             )
         except TuningError as exc:
             raise _tuning_400(exc) from exc
+
+        # notify-routes: group targets in notify routes are PM-only and must
+        # be in the bot's discovered chat list; the sync validator above has
+        # no user context, this one does.
+        await validate_dalton_notify_routes_for_user(
+            user_id,
+            submitted_routes,
+            (stored_model_pref or {}).get("dalton_notify_routes"),
+        )
 
         # After validation, so a bad level in the patch still gets its 400 and
         # only levels already in the row are cleared.

@@ -3,6 +3,7 @@ import { useDaltonCoverageUnits } from '@/lib/dalton/coverage';
 import { DaltonBudgetCard } from './DaltonBudgetCard';
 import { DaltonCosSharingCard } from './DaltonCosSharingCard';
 import { DaltonCoverageCard } from './DaltonCoverageCard';
+import { DaltonFeishuGroupsCard } from './DaltonFeishuGroupsCard';
 import { DaltonInvitesCard } from './DaltonInvitesCard';
 import { DaltonNotifyTargetsCard } from './DaltonNotifyTargetsCard';
 import { DaltonSystemJobsCard } from './DaltonSystemJobsCard';
@@ -36,6 +37,8 @@ export function DaltonSection({ advanced = false }: { advanced?: boolean } = {})
       <div id="dalton-notify-targets">
         <DaltonNotifyTargetsCard />
       </div>
+      {/* notify-routes: admin-only group push (renders nothing for non-PM) */}
+      <DaltonFeishuGroupsCard />
       <div id="dalton-system-jobs">
         <DaltonSystemJobsCard scopes={baseScopes} />
       </div>

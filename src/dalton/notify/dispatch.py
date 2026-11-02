@@ -22,6 +22,7 @@ from src.dalton.database.verdicts import get_verdict_for_execution
 from src.dalton.llm.model_prefs import (
     resolve_dalton_notify_enabled,
     resolve_dalton_notify_overrides,
+    resolve_dalton_notify_routes,
     resolve_dalton_notify_targets,
 )
 from src.dalton.settings import (
@@ -777,6 +778,72 @@ def _split_target_channel(raw_target: str) -> tuple[str, str]:
     return ("unknown", cleaned)
 
 
+def _notify_route_keys(automation: Mapping[str, Any] | None) -> list[str]:
+    """Route lookup keys for ``automation``, same precedence as the override keys."""
+    classification = classify_automation_for_notify(automation)
+    if classification is None or not isinstance(automation, Mapping):
+        return []
+    name = str(automation.get("name") or "").strip()
+    return [
+        key
+        for key in (
+            name,
+            name.lower(),
+            f"category:{classification.category}",
+            classification.category,
+        )
+        if key
+    ]
+
+
+def resolve_notify_route_targets(
+    automation: Mapping[str, Any] | None,
+    routes: Mapping[str, Sequence[str]] | None,
+    configured_targets: Sequence[str],
+    *,
+    include_chat_targets: bool = False,
+) -> list[str] | None:
+    """Apply per-task routes: the routed delivery list, or ``None`` for "no route".
+
+    ``configured_targets`` holds personal targets only, so with no route (or
+    ``include_chat_targets`` false) a group is never delivered. A route's
+    personal side is its intersection with the configured list (a deleted
+    personal target drops out on its own, order preserved); its group entries
+    ride along only when the task's owner is an admin.
+    """
+    if not isinstance(routes, Mapping):
+        return None
+    for key in _notify_route_keys(automation):
+        routed = routes.get(key)
+        if isinstance(routed, Sequence) and not isinstance(routed, (str, bytes)):
+            configured = list(configured_targets)
+            routed_set = {str(t).strip() for t in routed if isinstance(t, str) and t.strip()}
+            personal = [t for t in configured if t in routed_set]
+            chat_targets = (
+                [
+                    str(t).strip()
+                    for t in routed
+                    if isinstance(t, str) and _is_chat_target(str(t).strip())
+                ]
+                if include_chat_targets
+                else []
+            )
+            return personal + chat_targets
+    return None
+
+
+def _is_chat_target(target: str) -> bool:
+    from src.dalton.llm.model_prefs import is_dalton_chat_target
+
+    return is_dalton_chat_target(target)
+
+
+async def _default_notify_admin(user_id: str | None) -> bool:
+    from src.dalton.invites import is_invite_pm
+
+    return is_invite_pm(user_id)
+
+
 async def evaluate_user_notify_eligibility(
     user_id: str | None,
     automation: Mapping[str, Any] | None,
@@ -785,12 +852,17 @@ async def evaluate_user_notify_eligibility(
     resolve_enabled_fn: Callable[[str | None], Awaitable[bool]] = resolve_dalton_notify_enabled,
     resolve_overrides_fn: Callable[[str | None], Awaitable[dict[str, bool]]] = resolve_dalton_notify_overrides,
     resolve_targets_fn: Callable[[str | None], Awaitable[list[str]]] = resolve_dalton_notify_targets,
+    resolve_routes_fn: Callable[[str | None], Awaitable[dict[str, list[str]]]] = resolve_dalton_notify_routes,
+    is_admin_fn: Callable[[str | None], Awaitable[bool]] | None = None,
 ) -> tuple[bool, str | None, list[str]]:
-    """Evaluate master switch, per-task override, and target configuration for ``user_id``.
+    """Evaluate master switch, per-task override, routes, and target configuration for ``user_id``.
 
     Shared by both initial settlement dispatch and retry so both paths enforce
-    identical rules. Returns ``(allowed, skip_reason, configured_targets)`` where
-    ``skip_reason`` is ``"toggle_off"`` or ``"target_removed"`` when ``allowed`` is ``False``.
+    identical rules. Returns ``(allowed, skip_reason, effective_targets)`` where
+    ``skip_reason`` is ``"toggle_off"`` or ``"target_removed"`` when ``allowed``
+    is ``False``. Without a route the task reaches the owner's personal targets
+    only; with one, the personal intersection plus (for an admin owner) the
+    route's group entries. An empty result skips as ``target_removed``.
     """
     cleaned_uid = str(user_id or "").strip()
     if not cleaned_uid:
@@ -808,21 +880,39 @@ async def evaluate_user_notify_eligibility(
         return (False, "toggle_off", [])
 
     targets = await resolve_targets_fn(cleaned_uid)
-    if not targets:
-        return (False, "target_removed", [])
-
     normalized_targets = [
         _split_target_channel(t)[1] for t in targets if str(t).strip()
     ]
-    if not normalized_targets:
-        return (False, "target_removed", [])
+
+    routes = await resolve_routes_fn(cleaned_uid)
+    admin_check = is_admin_fn if is_admin_fn is not None else _default_notify_admin
+    include_chats = await admin_check(cleaned_uid)
+    routed = resolve_notify_route_targets(
+        automation, routes, normalized_targets, include_chat_targets=include_chats
+    )
+    if routed is None:
+        # No route (or a non-array entry): personal targets only, and an empty
+        # personal list skips — a group is never a default.
+        if not normalized_targets:
+            return (False, "target_removed", [])
+        effective_targets = normalized_targets
+    else:
+        # A route (even an explicitly empty one) decides delivery: the personal
+        # intersection may be empty while the group side still delivers.
+        if not routed:
+            logger.info(
+                "[DALTON_NOTIFY] Skipping notify for a routed task whose route "
+                "resolves to no targets"
+            )
+            return (False, "target_removed", [])
+        effective_targets = routed
 
     if target is not None:
         cleaned_target = _split_target_channel(target)[1]
-        if cleaned_target not in normalized_targets:
-            return (False, "target_removed", normalized_targets)
+        if cleaned_target not in effective_targets:
+            return (False, "target_removed", effective_targets)
 
-    return (True, None, normalized_targets)
+    return (True, None, effective_targets)
 
 
 async def claim_target_delivery(
@@ -1188,6 +1278,8 @@ async def retry_failed_notify_deliveries(
     resolve_enabled_fn: Callable[[str | None], Awaitable[bool]] = resolve_dalton_notify_enabled,
     resolve_overrides_fn: Callable[[str | None], Awaitable[dict[str, bool]]] = resolve_dalton_notify_overrides,
     resolve_targets_fn: Callable[[str | None], Awaitable[list[str]]] = resolve_dalton_notify_targets,
+    resolve_routes_fn: Callable[[str | None], Awaitable[dict[str, list[str]]]] = resolve_dalton_notify_routes,
+    is_admin_fn: Callable[[str | None], Awaitable[bool]] | None = None,
     max_attempts: int = 3,
     lookback_hours: int = 24,
     stale_pending_minutes: int = 10,
@@ -1308,6 +1400,8 @@ async def retry_failed_notify_deliveries(
                     resolve_enabled_fn=resolve_enabled_fn,
                     resolve_overrides_fn=resolve_overrides_fn,
                     resolve_targets_fn=resolve_targets_fn,
+                    resolve_routes_fn=resolve_routes_fn,
+                    is_admin_fn=is_admin_fn,
                 )
                 if not allowed:
                     skipped_updated = await _invoke_mark_delivery(
@@ -1461,6 +1555,8 @@ async def on_automation_settled(
     resolve_enabled_fn: Callable[[str | None], Awaitable[bool]] = resolve_dalton_notify_enabled,
     resolve_overrides_fn: Callable[[str | None], Awaitable[dict[str, bool]]] = resolve_dalton_notify_overrides,
     resolve_targets_fn: Callable[[str | None], Awaitable[list[str]]] = resolve_dalton_notify_targets,
+    resolve_routes_fn: Callable[[str | None], Awaitable[dict[str, list[str]]]] = resolve_dalton_notify_routes,
+    is_admin_fn: Callable[[str | None], Awaitable[bool]] | None = None,
     get_verdict_fn: Callable[..., Awaitable[dict[str, Any] | None]] = get_verdict_for_execution,
     claim_target_fn: Callable[..., Awaitable[bool]] = claim_target_delivery,
     mark_target_fn: Callable[..., Awaitable[None]] = mark_target_delivery,
@@ -1490,6 +1586,8 @@ async def on_automation_settled(
             resolve_enabled_fn=resolve_enabled_fn,
             resolve_overrides_fn=resolve_overrides_fn,
             resolve_targets_fn=resolve_targets_fn,
+            resolve_routes_fn=resolve_routes_fn,
+            is_admin_fn=is_admin_fn,
         )
         if not allowed or not targets:
             return False

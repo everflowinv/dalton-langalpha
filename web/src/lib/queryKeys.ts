@@ -346,6 +346,10 @@ export const queryKeys = {
     sharing:         (workspaceId: string) => [...queryKeys.dalton.all, 'sharing', workspaceId],
     // DALTON-HOOK(colleague-dispatch): user-level Chief of Staff sharing settings query key
     userSharing:     () => [...queryKeys.dalton.all, 'sharing', 'user-settings'],
+    // DALTON-HOOK(notify-routes): the chat-sending Feishu bot's display name (server caches 10 min)
+    // and the bot's own chats for the admin group-push card (server caches 5 min).
+    feishuBotName:   () => [...queryKeys.dalton.all, 'notify', 'feishu-bot'],
+    feishuGroups:    () => [...queryKeys.dalton.all, 'notify', 'feishu-groups'],
     // DALTON-HOOK(user-coverage): Dashboard earnings calendar query key scoped by tab ('mine' | 'market') and user
     earningsCalendar: (
       scope: 'mine' | 'market',

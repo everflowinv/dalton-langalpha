@@ -6972,6 +6972,11 @@
       "sectorTitle": "行业自动跟踪",
       "sectorSubtitle": "每个行业覆盖单元的议程到期与内部资料增量任务（不跑证券探针）",
       "sectorSummary": "行业跟踪"
+    },
+    "notify": {
+      "targetsNone": "不推送",
+      "targetsInheritCategory": "继承类别设置",
+      "targetsGroupLeft": "机器人已不在此群"
     }
   }
 }

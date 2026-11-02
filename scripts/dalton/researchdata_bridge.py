@@ -11316,8 +11316,21 @@ class ResearchDataBridge:
                 )
                 continue
 
+            # No Feishu id (user or chat) reaches a log line raw; Discord's
+            # numeric ids stay as-is, as they always were.
+            display_target = target_str
+            if channel == "feishu":
+                kind = target_arg.split(":", 1)[0] if ":" in target_arg else "user"
+                display_target = f"feishu:{kind}:<id>"
+
             if channel == "feishu" and card_dict is not None:
-                open_id = (
+                # Both feishu target shapes ride the same OpenClaw send-card
+                # script (it is the bot's own delivery channel); only the id
+                # namespace differs.
+                receive_id_type = (
+                    "chat_id" if target_arg.startswith("chat:") else "open_id"
+                )
+                receive_id = (
                     target_arg.split(":", 1)[1]
                     if ":" in target_arg
                     else target_arg
@@ -11326,8 +11339,9 @@ class ResearchDataBridge:
                     card_res = await asyncio.to_thread(
                         _run_feishu_send_card,
                         script_path=self.cfg.feishu_send_card_script,
-                        open_id=open_id,
+                        receive_id=receive_id,
                         card=card_dict,
+                        receive_id_type=receive_id_type,
                         timeout_s=self.cfg.feishu_send_card_timeout_s,
                     )
                     ok = card_res.get("ok") is True
@@ -11335,7 +11349,7 @@ class ResearchDataBridge:
                     if ok:
                         logger.info(
                             "notify target=%s channel=feishu mode=card status=ok exit_code=%s",
-                            target_str,
+                            display_target,
                             exit_code,
                         )
                         results.append(
@@ -11347,7 +11361,7 @@ class ResearchDataBridge:
                         )
                         logger.warning(
                             "notify target=%s channel=feishu mode=card status=error exit_code=%s",
-                            target_str,
+                            display_target,
                             exit_code,
                         )
                         results.append(
@@ -11361,7 +11375,7 @@ class ResearchDataBridge:
                 except Exception as card_exc:
                     logger.warning(
                         "notify target=%s channel=feishu mode=card status=error error_type=%s",
-                        target_str,
+                        display_target,
                         type(card_exc).__name__,
                     )
                     results.append(
@@ -11377,7 +11391,7 @@ class ResearchDataBridge:
             if not token:
                 logger.warning(
                     "notify target=%s channel=%s status=error error_code=missing_openclaw_gateway_token",
-                    target_str,
+                    display_target,
                     channel,
                 )
                 results.append(
@@ -11420,7 +11434,7 @@ class ResearchDataBridge:
                     )
                     logger.warning(
                         "notify target=%s channel=%s status=error error_code=%s status_code=%s",
-                        target_str,
+                        display_target,
                         channel,
                         err_code,
                         status_code,
@@ -11436,7 +11450,7 @@ class ResearchDataBridge:
                 else:
                     logger.info(
                         "notify target=%s channel=%s status=ok",
-                        target_str,
+                        display_target,
                         channel,
                     )
                     results.append(
@@ -11455,7 +11469,7 @@ class ResearchDataBridge:
                 )
                 logger.warning(
                     "notify target=%s channel=%s status=error error_type=%s status_code=%s",
-                    target_str,
+                    display_target,
                     channel,
                     type(exc).__name__,
                     status_code,
@@ -13815,6 +13829,33 @@ class ResearchDataBridge:
             return 502, payload
         return 200, result
 
+    async def handle_feishu_bot_info(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Return only the chat-sending bot's display name, never its ids or credentials.
+
+        The settings page shows this name beside the ``feishu:chat:*`` format so
+        the user invites the right bot (the group sender is this app, not the
+        OpenClaw bot the personal pushes use)."""
+        _ = body
+        code, payload = await self._run_feishu(lambda client: client.bot_info())
+        if code != 200:
+            return code, payload
+        app_name = str(payload or "").strip() if isinstance(payload, str) else ""
+        if not app_name:
+            return 502, {"ok": False, "error": "feishu_bot_name_missing"}
+        return 200, {"ok": True, "app_name": app_name}
+
+    async def handle_feishu_chats(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """The chats the bot is in, each only as ``chat_id`` + ``name``.
+
+        Read-only discovery for the admin settings card and route validation;
+        nothing here joins, creates, or writes any chat."""
+        _ = body
+        code, payload = await self._run_feishu(lambda client: client.list_bot_chats())
+        if code != 200:
+            return code, payload
+        chats = [c for c in payload if isinstance(c, dict)] if isinstance(payload, list) else []
+        return 200, {"ok": True, "chats": chats}
+
     async def handle_feishu_doc_read(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         """Handle ``POST /feishu/doc/read``: resolve a docx/wiki link or token and return title + plain text.
 
@@ -14638,17 +14679,21 @@ def build_wiki_ingest_cmd(
         cmd.extend(["--source-url", source_url])
     return cmd
 _FEISHU_TARGET_RE = re.compile(r"^feishu:(user:ou_[A-Za-z0-9_-]+)$")
+_FEISHU_CHAT_TARGET_RE = re.compile(r"^feishu:(chat:oc_[A-Za-z0-9_-]+)$")
 _DISCORD_TARGET_RE = re.compile(r"^discord:(user:[0-9]+)$")
 
 
 def parse_notify_target(raw: str) -> tuple[str, str]:
-    """Split ``<channel>:user:<id>`` into ``(channel, 'user:<id>')``."""
+    """Split ``feishu:user:<id>`` / ``feishu:chat:<id>`` / ``discord:user:<id>`` into ``(channel, '<kind>:<id>')``."""
     if not isinstance(raw, str):
         raise ValueError("Target must be a string")
     cleaned = raw.strip()
     m_feishu = _FEISHU_TARGET_RE.match(cleaned)
     if m_feishu:
         return "feishu", m_feishu.group(1)
+    m_chat = _FEISHU_CHAT_TARGET_RE.match(cleaned)
+    if m_chat:
+        return "feishu", m_chat.group(1)
     m_discord = _DISCORD_TARGET_RE.match(cleaned)
     if m_discord:
         return "discord", m_discord.group(1)
@@ -14673,18 +14718,24 @@ def build_openclaw_message_invoke_body(
 def build_feishu_send_card_cmd(
     *,
     script_path: Path | str,
-    open_id: str,
+    receive_id: str,
     card_json_file: Path | str,
+    receive_id_type: str = "open_id",
     dry_run: bool = False,
 ) -> list[str]:
-    """Build subprocess argv for ``feishu_send_card.py``."""
+    """Build subprocess argv for ``feishu_send_card.py``.
+
+    ``receive_id_type`` selects the id namespace of ``receive_id``: ``open_id``
+    for a personal DM, ``chat_id`` for a group the OpenClaw bot is in (both are
+    the script's own ``--receive-id-type`` choices).
+    """
     cmd = [
         "python3",
         str(script_path),
         "--chat-id",
-        str(open_id),
+        str(receive_id),
         "--receive-id-type",
-        "open_id",
+        receive_id_type,
         "--card-json-file",
         str(card_json_file),
         "--json",
@@ -14697,8 +14748,9 @@ def build_feishu_send_card_cmd(
 def _run_feishu_send_card(
     *,
     script_path: Path,
-    open_id: str,
+    receive_id: str,
     card: dict[str, Any],
+    receive_id_type: str = "open_id",
     timeout_s: float = FEISHU_SEND_CARD_TIMEOUT_S,
     dry_run: bool = False,
 ) -> dict[str, Any]:
@@ -14721,8 +14773,9 @@ def _run_feishu_send_card(
 
         cmd = build_feishu_send_card_cmd(
             script_path=script_path,
-            open_id=open_id,
+            receive_id=receive_id,
             card_json_file=tmp_path,
+            receive_id_type=receive_id_type,
             dry_run=dry_run,
         )
         subproc_env = seed_asr_client.strip_asr_credentials_from_env(os.environ)
@@ -15762,6 +15815,53 @@ class FeishuClient:
             # top level instead of under `data`.
             return payload
         return payload.get("data") if isinstance(payload.get("data"), dict) else {}
+
+    # -- im --
+
+    def list_bot_chats(
+        self, *, page_size: int = 100, max_pages: int = 10
+    ) -> list[dict[str, Any]]:
+        """The chats the bot itself is in (``im/v1/chats``), paginated.
+
+        Only ``chat_id`` and ``name`` leave this method: the response's other
+        fields (owner ids, member counts, descriptions) are not this feature's
+        to expose.
+        """
+        chats: list[dict[str, Any]] = []
+        page_token: str | None = None
+        for _ in range(max_pages):
+            data = self._request(
+                "GET",
+                "/open-apis/im/v1/chats",
+                query={"page_size": page_size, "page_token": page_token},
+            )
+            items = data.get("items")
+            if isinstance(items, list):
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    chat_id = str(item.get("chat_id") or "").strip()
+                    if chat_id:
+                        chats.append(
+                            {"chat_id": chat_id, "name": str(item.get("name") or "")}
+                        )
+            if not data.get("has_more"):
+                break
+            page_token = data.get("page_token") or None
+            if not page_token:
+                break
+        return chats
+
+    def bot_info(self) -> str:
+        """The bot's own display name (``bot/v3/info``), nothing else.
+
+        That endpoint nests its payload under a top-level ``bot`` key instead
+        of the usual ``data`` (hence ``unwrap_data=False``), and carries ids
+        beside the name — only the name leaves this method.
+        """
+        payload = self._request("GET", "/open-apis/bot/v3/info", unwrap_data=False)
+        bot = payload.get("bot") if isinstance(payload.get("bot"), dict) else {}
+        return str(bot.get("app_name") or "").strip()
 
     # -- docx --
 
@@ -16828,6 +16928,11 @@ async def _handle_client(
                 "/feishu/doc/append": bridge.handle_feishu_doc_append,
                 # C1: re-grant only, for shares that failed at doc creation.
                 "/feishu/doc/grant": bridge.handle_feishu_doc_grant,
+                # DALTON-HOOK(notify-routes): the chat-sending bot's name, so the
+                # settings page can tell the user which bot to invite to a group,
+                # and the bot's own chats, for the admin group-push card.
+                "/feishu/bot-info": bridge.handle_feishu_bot_info,
+                "/feishu/chats": bridge.handle_feishu_chats,
             }
             handler = feishu_routes.get(path)
             if handler is None:

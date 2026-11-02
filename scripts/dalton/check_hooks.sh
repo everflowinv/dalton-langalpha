@@ -278,6 +278,12 @@ ALLOWED_HOOKS=(
   # _tier2/_tier3), the key's getter in tool_settings.py. A service failure
   # fails the tier with no in-process fallback.
   "crawl-service"
+  # Notify routing (2026-11): feishu:chat:* group targets, per-target labels,
+  # and per-task target routes — bridge chat send via FeishuClient, dispatch
+  # route intersection in evaluate_user_notify_eligibility, the /notify/test
+  # endpoint, and the automation-list target selector
+  # (modelPreferences.ts, AutomationList.tsx).
+  "notify-routes"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
