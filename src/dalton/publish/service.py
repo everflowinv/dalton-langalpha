@@ -1434,15 +1434,30 @@ async def _run_publish_state_machine(
             )
             unrecalc_lead = f"{'；'.join(unrecalc_warnings)}。" if unrecalc_warnings else ""
             msg_prefix = f"{unrecalc_lead}{audit_summary}。" if audit_summary else unrecalc_lead
+            # 提示词第 1 批第 2 轮 #5：同请求幂等重入时，早退分支也要沿用
+            # block 的阻断文案——"remains in review_revise" 说不出需要人工处理。
+            review_info = row.get("review") if isinstance(row.get("review"), dict) else {}
+            if status == "review_revise" and review_info.get("verdict") == "block":
+                block_fixes = "; ".join(
+                    review_info.get("must_fix") or [review_info.get("summary") or ""]
+                )
+                message = (
+                    f"{msg_prefix}发布请求 {req_id} 的独立审稿结论仍为 block：存在阻断性问题，"
+                    f"不能靠常规修订解决（{block_fixes}）。请停止发布，向 PM 说明这些问题；"
+                    "等人工处理完，再重新调用 publish_report（不带 request_id）发起新的审批。"
+                )
+            else:
+                message = (
+                    f"{msg_prefix}Publish request {req_id} remains in {status}; "
+                    "update the draft before retrying."
+                )
             return {
                 "ok": False,
                 "status": status,
                 "audit": prev_audit or None,
                 "audit_path": audit_path,
                 "annotated_path": annotated_path,
-                "message": (
-                    f"{msg_prefix}Publish request {req_id} remains in {status}; update the draft before retrying."
-                ),
+                "message": message,
             }
         # Bundle, inputs, or audit config changed -> re-enter auditing.
         # Round-3 decision 1: a same-tool-call retry (no request_id) may carry
@@ -1689,7 +1704,12 @@ async def _run_publish_state_machine(
                 ),
             }
 
-        if rev_dict.get("verdict") == "revise":
+        if rev_dict.get("verdict") in ("revise", "block"):
+            # block reuses the review_revise status (no new state-machine state,
+            # no migration): like revise it never reaches approval, but the
+            # verdict stays "block" in the review payload and the message says
+            # the problem is unfixable by routine revision and needs a human.
+            is_block = rev_dict.get("verdict") == "block"
             await db_publications.transition(
                 req_id,
                 ("reviewing",),
@@ -1697,16 +1717,24 @@ async def _run_publish_state_machine(
                 review=rev_dict,
             )
             fixes = "; ".join(rev_dict.get("must_fix") or [rev_dict.get("summary", "")])
+            if is_block:
+                message = (
+                    f"独立审稿（{rev_dict.get('model')} / {rev_dict.get('family')}）"
+                    f"结论为 block：存在阻断性问题，不能靠常规修订解决（{fixes}）。"
+                    "请停止发布，向 PM 说明这些问题（事实错误、数字对不上或结论没有证据支撑）；"
+                    "等人工处理完，再重新调用 publish_report（不带 request_id）发起新的审批。"
+                )
+            else:
+                message = (
+                    f"Independent review ({rev_dict.get('model')} / {rev_dict.get('family')}) "
+                    f"requested revisions: {fixes}"
+                )
             return {
                 "ok": False,
                 "status": "review_revise",
                 "audit": row.get("audit"),
                 "review": rev_dict,
-                "message": _prefix_with_audit_summary(
-                    row,
-                    f"Independent review ({rev_dict.get('model')} / {rev_dict.get('family')}) "
-                    f"requested revisions: {fixes}",
-                ),
+                "message": _prefix_with_audit_summary(row, message),
             }
 
         row = (

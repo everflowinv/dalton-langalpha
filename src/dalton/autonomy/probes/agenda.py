@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
@@ -67,7 +67,16 @@ async def probe_agenda(
     tz = ZoneInfo(get_dalton_settings().autonomy.timezone)
     if due_tz is not None:
         tz = due_tz
-    now_dt = now or datetime.now(tz)
+    # One clock for every judgment below: an explicit `now` wins; a `today` with
+    # no `now` builds the moment on `today` in the effective timezone, so the
+    # date-window checks and the due-moment checks never ride two clocks
+    # (prompt review batch 1 round 3 #12).
+    if now is not None:
+        now_dt = now
+    elif today is not None:
+        now_dt = datetime.combine(today, dtime(12, 0), tzinfo=tz)
+    else:
+        now_dt = datetime.now(tz)
     if now_dt.tzinfo is None:
         now_dt = now_dt.replace(tzinfo=tz)
     if due_tz is not None:
@@ -122,10 +131,17 @@ async def probe_agenda(
                 )
             )
 
+    # 过期很久的历史项（>30 天）不再逐条唤醒，只汇总成一条低优先级清理信号
+    # （提示词第 1 批第 3 轮 #11）；汇总范围＝本来会发信号的项（P0/P1 的待查
+    # 问题、启用中的日期唤醒、验证项），不会把本来静默的低优先级项放大。
+    stale_ids: list[str] = []
+    stale_cutoff = now_date - timedelta(days=30)
+
     # 2. Next validations past their due moment (schema field `next_validations`, plus legacy
     #    `validation_queue` fallback). Due-ness keeps the item's own moment and timezone — naive
     #    values read in the ticker's exchange timezone — instead of the local (Shanghai) date:
     #    a US item dated for an after-hours call must not fall due while its ET day is young.
+    #    Validations keep the 18:00-local rule for date-only dues (close of the local day).
     validations = list(doc.get("next_validations") or []) + list(doc.get("validation_queue") or [])
     seen_val_ids: set[str] = set()
     for val_item in validations:
@@ -140,6 +156,9 @@ async def probe_agenda(
             if vid in seen_val_ids:
                 continue
             seen_val_ids.add(vid)
+            if due and due < stale_cutoff:
+                stale_ids.append(vid)
+                continue
             what = val_item.get("what") or val_item.get("metric") or vid
             signals.append(
                 ProbeSignal(
@@ -151,7 +170,12 @@ async def probe_agenda(
                 )
             )
 
-    # 3. Open questions due <= today or origin=='pm' with no attempts (skipping questions in backoff per A11)
+    # 3. Open questions past their due moment (schema field `open_questions[].due_date`,
+    #    plus legacy review_by/due fallbacks) or origin=='pm' with no attempts (skipping
+    #    questions in backoff per A11). Due-ness shares the unified moment rule
+    #    (`validation_is_due`) with the AGENDA reading of a date-only value: due at the
+    #    START of the local date (date_hour=0, round 3 #8) — a full ISO moment keeps its
+    #    own clock and offset. Only P0/P1 questions ever signal, so only they can go stale.
     for q in doc.get("open_questions") or []:
         if not isinstance(q, dict):
             continue
@@ -172,24 +196,34 @@ async def probe_agenda(
                 )
             )
             continue
-        due = _parse_date(q.get("due_date") or q.get("review_by") or q.get("due"))
+        raw_due = q.get("due_date") or q.get("review_by") or q.get("due")
+        due = _parse_date(raw_due)
         prio = str(q.get("priority") or q.get("value") or "P1").upper()
         if prio == "HIGH":
             prio = "P0"
         elif prio == "MEDIUM":
             prio = "P1"
-        if due and due <= now_date and prio in ("P0", "P1"):
-            signals.append(
-                ProbeSignal(
-                    probe="agenda",
-                    signal_key=f"question:{qid}:{due.isoformat()}",
-                    priority=prio,
-                    summary=f"{ticker} 待查问题到期（{qid}）：{question}",
-                    payload={"kind": "open_question", "id": qid, "due_date": due.isoformat(), "question": question},
-                )
+        if prio not in ("P0", "P1"):
+            continue
+        if not validation_is_due(raw_due, ticker, now_dt, tz=due_tz, date_hour=0):
+            continue
+        if due and due < stale_cutoff:
+            stale_ids.append(str(qid))
+            continue
+        signals.append(
+            ProbeSignal(
+                probe="agenda",
+                signal_key=f"question:{qid}:{due.isoformat() if due else now_date.isoformat()}",
+                priority=prio,
+                summary=f"{ticker} 待查问题到期（{qid}）：{question}",
+                payload={"kind": "open_question", "id": qid, "due_date": due.isoformat() if due else None, "question": question},
             )
+        )
 
-    # 4. Wake conditions / next actions due <= today (schema field `wake_conditions`, plus legacy `next_actions` fallback)
+    # 4. Wake conditions / next actions past their due moment (schema field
+    #    `wake_conditions` with the date in `params`, plus legacy `next_actions`
+    #    top-level spellings), on the same agenda moment rule as questions
+    #    (date-only due at local midnight; full moments by their own clock).
     wake_items = list(doc.get("wake_conditions") or []) + list(doc.get("next_actions") or [])
     for act in wake_items:
         if not isinstance(act, dict):
@@ -198,19 +232,54 @@ async def probe_agenda(
             continue
         if act.get("status") not in (None, "pending", "in_progress", "open", "active"):
             continue
-        due = _parse_date(act.get("due_date") or act.get("due") or act.get("target_date"))
+        # Schema-legal wake_conditions carry the date inside `params` (params.date
+        # canonical; params.at / params.due tolerated). Top-level due_date/due/
+        # target_date are pre-schema spellings that can still sit in stored rows,
+        # so they stay as legacy fallbacks — reading params first is what makes a
+        # schema-valid `kind=date` condition fire at all.
+        params = act.get("params") if isinstance(act.get("params"), dict) else {}
+        raw_due = (
+            params.get("date")
+            or params.get("at")
+            or params.get("due")
+            or act.get("due_date")
+            or act.get("due")
+            or act.get("target_date")
+        )
+        due = _parse_date(raw_due)
         prio = str(act.get("priority") or "P1").upper()
-        if due and due <= now_date:
-            aid = act.get("id") or "W"
-            desc = act.get("action") or act.get("condition") or act.get("title") or aid
-            signals.append(
-                ProbeSignal(
-                    probe="agenda",
-                    signal_key=f"action:{aid}:{due.isoformat()}",
-                    priority=prio if prio in ("P0", "P1", "P2") else "P1",
-                    summary=f"{ticker} 唤醒条件/议程动作到期（{aid}）：{desc}",
-                    payload={"kind": "wake_condition", "id": aid, "due_date": due.isoformat(), "action": desc},
-                )
+        if not validation_is_due(raw_due, ticker, now_dt, tz=due_tz, date_hour=0):
+            continue
+        aid = act.get("id") or "W"
+        if due and due < stale_cutoff:
+            stale_ids.append(str(aid))
+            continue
+        desc = act.get("action") or act.get("condition") or act.get("title") or aid
+        signals.append(
+            ProbeSignal(
+                probe="agenda",
+                signal_key=f"action:{aid}:{due.isoformat() if due else now_date.isoformat()}",
+                priority=prio if prio in ("P0", "P1", "P2") else "P1",
+                summary=f"{ticker} 唤醒条件/议程动作到期（{aid}）：{desc}",
+                payload={"kind": "wake_condition", "id": aid, "due_date": due.isoformat() if due else None, "action": desc},
             )
+        )
+
+    if stale_ids:
+        # One low-priority sweep-up per workspace per ISO WEEK (round 3 #11): the
+        # key carries the ISO week so it does not repeat within the week. This
+        # signal never directly wakes the sandbox (is_direct_wake_signal refuses
+        # it); it rides along as a cleanup hint with whatever else woke.
+        iso_year, iso_week, _ = now_date.isocalendar()
+        owner = str(workspace_id) if workspace_id else ticker
+        signals.append(
+            ProbeSignal(
+                probe="agenda",
+                signal_key=f"stale_todos:{owner}:{iso_year}-W{iso_week:02d}",
+                priority="P2",
+                summary=f"{ticker} 的 agenda 里有 {len(stale_ids)} 个过期超过 30 天的待办（验证项/待查问题/日期唤醒），请用 knowledge_update 清理或改期：{'、'.join(stale_ids[:8])}{' 等' if len(stale_ids) > 8 else ''}",
+                payload={"kind": "stale_todos", "count": len(stale_ids), "ids": stale_ids},
+            )
+        )
 
     return signals, watch_state

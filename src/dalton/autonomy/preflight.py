@@ -94,6 +94,11 @@ def is_direct_wake_signal(sig: dict[str, Any] | ProbeSignal) -> bool:
         summary = str(sig.get("summary") or "")
 
     if probe in ("agenda", "earnings", "calendar", "director", "schedule", "price"):
+        # The stale-todo sweep-up (prompt review batch 1 round 3 #11) is a P2
+        # cleanup hint, not something to wake a sandbox over on its own: it
+        # rides along with whatever else woke this run.
+        if payload.get("kind") == "stale_todos":
+            return False
         return True
 
     if probe == "sec":
@@ -1073,11 +1078,31 @@ async def _preflight_check_inner(
             pair = (sig.probe, sig.signal_key)
             if pair not in seen_keys:
                 candidate_signals.append(sig.to_dict())
-                seen_keys.add(pair)
+                # The stale-todo sweep-up is only recorded once it actually
+                # rides along a wake (below); recording it here would let a
+                # lone, non-waking stale hint consume the week's dedup key.
+                if (sig.payload or {}).get("kind") != "stale_todos":
+                    seen_keys.add(pair)
         state["_woken_signal_keys"] = [list(x) for x in sorted(seen_keys)]
         if watch_state_override is not None:
             watch_state_override.clear()
             watch_state_override.update(state)
+
+    # The stale-todo sweep-up never stands in the wake decision (round 4 #3):
+    # it is kept out of the direct-wake split, the LLM triage and thereby the
+    # triage fallback, so a lone stale signal reads as "no new signals" and
+    # stays unhandled for the next run (its ISO-week signal_key still dedups
+    # the hint to once a week). It only rides along — and only then is marked
+    # notified — when another signal actually wakes this round.
+    stale_signals: list[dict[str, Any]] = []
+    effective_candidates: list[dict[str, Any]] = []
+    for cand in candidate_signals:
+        payload = cand.get("payload") if isinstance(cand.get("payload"), dict) else {}
+        if payload.get("kind") == "stale_todos":
+            stale_signals.append(cand)
+        else:
+            effective_candidates.append(cand)
+    candidate_signals = effective_candidates
 
     if not candidate_signals:
         if persist:
@@ -1219,6 +1244,36 @@ async def _preflight_check_inner(
                 signals=[],
                 wake_context=None,
             )
+
+    # A real wake happened: now the stale-todo sweep-up rides along, and only
+    # now is it marked notified (round 4 #3) — resolving it here means the
+    # weekly hint was delivered; without a wake it stays unhandled above.
+    if stale_signals:
+        stale_ids = [str(s["signal_id"]) for s in stale_signals if s.get("signal_id")]
+        if persist and stale_ids:
+            try:
+                await watch_db.resolve_signals(
+                    stale_ids,
+                    workspace_id=workspace_id,
+                    ticker=ticker,
+                    resolved_by="preflight.stale_todos:notified",
+                )
+            except Exception as e:
+                logger.warning("[DALTON_PREFLIGHT] resolve stale_todos signals failed: %s", e)
+        if not persist:
+            keys = {
+                tuple(x)
+                for x in (state.get("_woken_signal_keys") or [])
+                if isinstance(x, (list, tuple)) and len(x) == 2
+            }
+            keys.update(
+                (str(s.get("probe")), str(s.get("signal_key"))) for s in stale_signals
+            )
+            state["_woken_signal_keys"] = [list(x) for x in sorted(keys)]
+            if watch_state_override is not None:
+                watch_state_override.clear()
+                watch_state_override.update(state)
+        woke_signals = woke_signals + stale_signals
 
     if persist:
         try:

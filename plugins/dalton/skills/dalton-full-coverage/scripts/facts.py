@@ -29,6 +29,10 @@ CORE_SCALAR_KEYS = (
 QUARTER_PREFIXES = ("rev", "gp", "op", "eps")
 ANNUAL_PREFIXES = ("fcf", "sbc")
 
+# 旧版提示词曾把营业利润写成 opinc_q1..q8；完整性检查按季度折算后兼容读取，
+# 同一季度 op_q 与 opinc_q 并存时以 op_q 为准，不重复计数。
+QUARTER_ALIASES = {"op": "opinc"}
+
 
 def render_ledger_comment(rows: list) -> str:
     payload = {"ledger": rows}
@@ -107,18 +111,31 @@ def update_facts_file(path: pathlib.Path, new_rows: list, title: str = None) -> 
     return rows
 
 
+def _series_keys_with_value(by_key: dict, prefix: str) -> list:
+    return [
+        k for k, v in by_key.items()
+        if (k.startswith(f"{prefix}_q") or k.startswith(f"{prefix}_Q") or re.match(rf"^{prefix}_\d{{4}}Q[1-4]$", k, re.I))
+        and str(v.get("value", "")).strip()
+    ]
+
+
+def _quarter_tail(prefix: str, key: str) -> str:
+    return key[len(prefix) + 1:].lower()
+
+
 def check_completeness(rows: list) -> dict:
     by_key = {r.get("key"): r for r in rows if isinstance(r, dict) and r.get("key")}
     missing_scalars = [k for k in CORE_SCALAR_KEYS if k not in by_key or not str(by_key[k].get("value", "")).strip()]
 
     quarter_counts = {}
     for prefix in QUARTER_PREFIXES:
-        matched = [
-            k for k, v in by_key.items()
-            if (k.startswith(f"{prefix}_q") or k.startswith(f"{prefix}_Q") or re.match(rf"^{prefix}_\d{{4}}Q[1-4]$", k, re.I))
-            and str(v.get("value", "")).strip()
-        ]
-        quarter_counts[prefix] = len(matched)
+        matched = _series_keys_with_value(by_key, prefix)
+        covered = {_quarter_tail(prefix, k) for k in matched}
+        alias = QUARTER_ALIASES.get(prefix)
+        if alias:
+            for k in _series_keys_with_value(by_key, alias):
+                covered.add(_quarter_tail(alias, k))
+        quarter_counts[prefix] = len(covered)
 
     annual_counts = {}
     for prefix in ANNUAL_PREFIXES:

@@ -95,7 +95,23 @@ class ScriptedHost:
         # A real child takes time; an instantly-resolved host future can land
         # the engine's pending-promise check before the JS microtasks drain.
         await asyncio.sleep(0.02)
-        return self.outcome_for(label, prompt)
+        result = self.outcome_for(label, prompt)
+        # 审稿契约（提示词第 1 批 #2）：dalton-reviewer 的回复必须逐项覆盖
+        # 1–9 项检查，workflows 据此判结果有效。旧桩只写 verdict；按全部
+        # 通过补齐 items，使这些用例仍考察 verdict 分支本身。
+        if (
+            opts.get("agentType") == "dalton-reviewer"
+            and isinstance(result, dict)
+            and "items" not in result
+        ):
+            result = {
+                **result,
+                "items": [
+                    {"check": n, "result": "pass", "reason": "ok"}
+                    for n in range(1, 10)
+                ],
+            }
+        return result
 
     def phase(self, title: str) -> None:
         pass
@@ -194,6 +210,63 @@ async def test_block_verdict_stops_the_run_with_the_reason() -> None:
     labels = host.labels()
     assert "修订 1" not in labels
     assert "产物核验" not in labels
+
+
+@pytest.mark.asyncio
+async def test_review_missing_check_items_is_a_failed_review_not_a_pass() -> None:
+    """审稿契约（提示词第 1 批 #2）：items 未覆盖 1–9 项检查的审稿结果按
+    审稿失败处理，不得作为 verdict 进入修订循环或收尾。"""
+    host = ScriptedHost(
+        by_label={
+            # items 显式为空数组，绕过 harness 对旧桩的自动补齐。
+            "审稿": {"verdict": "pass", "summary": "只看了前几项", "must_fix": [], "items": []}
+        }
+    )
+    result = await _run("initial-coverage", IC_PARAMS, host)
+
+    assert result["ok"] is False
+    assert result["review_verdict"] is None
+    assert any("未覆盖 1–9 项检查" in item for item in result["incomplete"])
+    # 缺项的 pass 不得触发修订，也不得当作通过收尾。
+    labels = host.labels()
+    assert "修订 1" not in labels
+
+
+@pytest.mark.asyncio
+async def test_pass_with_must_fix_reads_as_revise_and_enters_the_revision_loop() -> None:
+    """verdictOf 的 must_fix 规则（提示词第 1 批第 2 轮 #2）：pass 但 must_fix
+    非空按 revise 处理——与服务端 publish/review.py 一致，修订必须发生。"""
+    host = ScriptedHost(
+        by_label={
+            "审稿": {
+                "verdict": "pass",
+                "summary": "总体通过但还有必改项",
+                "must_fix": ["补风险章节"],
+                "items": [
+                    {"check": n, "result": "revise", "reason": "must_fix 项"}
+                    for n in range(1, 10)
+                ],
+            },
+            "复审 1": {
+                "verdict": "pass",
+                "summary": "已解决",
+                "must_fix": [],
+                "items": [
+                    {"check": n, "result": "pass", "reason": "ok"}
+                    for n in range(1, 10)
+                ],
+            },
+        }
+    )
+    result = await _run("initial-coverage", IC_PARAMS, host)
+
+    labels = host.labels()
+    assert labels.index("修订 1") > labels.index("审稿"), (
+        "a pass carrying must_fix must trigger the revision loop"
+    )
+    assert result["ok"] is True, result["incomplete"]
+    assert result["review_verdict"] == "pass"
+    assert result["revise_rounds"] == 1
 
 
 @pytest.mark.asyncio

@@ -52,6 +52,7 @@ def _is_transcription_switch_on() -> bool:
 _DALTON_SKILL_SPECS: tuple[tuple[str, str | None, tuple[str, ...]], ...] = (
     ("dalton-conventions", None, ("research-conventions",)),
     ("dalton-init-company", "dalton-init-company", ("dalton-conventions", "research-conventions")),
+    ("dalton-init-sector", None, ("dalton-conventions", "research-conventions", "dalton-knowledge")),
     ("dalton-knowledge", None, ("dalton-conventions", "research-conventions")),
     ("dalton-publish", "dalton-publish", ("dalton-conventions", "research-conventions")),
     ("dalton-agenda", None, ("dalton-conventions", "research-conventions")),
@@ -67,12 +68,14 @@ _DALTON_SKILL_SPECS: tuple[tuple[str, str | None, tuple[str, ...]], ...] = (
     ("dalton-earnings-deep", "dalton-earnings-deep", ("dalton-conventions", "research-conventions", _RW)),
     ("dalton-stock-move", "dalton-stock-move", ("dalton-conventions", "research-conventions")),
     ("dalton-thesis-delta", "dalton-thesis-delta", ("dalton-conventions", "research-conventions")),
+    ("dalton-sector-delta", None, ("dalton-conventions", "research-conventions", "dalton-knowledge", "dalton-agenda")),
     ("dalton-filing-review", "dalton-filing-review", ("dalton-conventions", "research-conventions")),
     ("dalton-weekly-review", "weekly-review", ("dalton-conventions", "research-conventions", _RW)),
     ("dalton-topic-research", "topic-research", ("dalton-conventions", "research-conventions", _RW)),
     ("dalton-call", "dalton-call", ("dalton-conventions", "research-conventions")),
     ("dalton-pm-qa", "pm-qa", ("dalton-conventions", "research-conventions")),
     ("dalton-transcript-polish", "transcribe", ("dalton-conventions", "research-conventions")),
+    ("dalton-language", None, ()),
     ("dalton-onboarding", None, ()),
 )
 

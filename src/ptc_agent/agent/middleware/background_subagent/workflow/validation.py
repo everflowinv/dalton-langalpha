@@ -100,6 +100,20 @@ def validate_dispatch(
     if schema is not None:
         _validate_schema(schema, caps)
 
+    # DALTON-HOOK(reviewer-contract): a reviewer dispatch names the draft it
+    # reviews; the driver hashes that file itself and binds the digest to the
+    # journal record (prompt review batch 1 round 2 #1 — the model never
+    # echoes the hash, the caller computes it).
+    review_draft = opts.get("reviewDraft")
+    if review_draft is not None and (
+        not isinstance(review_draft, str)
+        or not review_draft.strip()
+        or len(review_draft) > 512
+    ):
+        raise DispatchValidationError(
+            "opts.reviewDraft must be a non-empty path string (≤512 chars)"
+        )
+
     # DALTON-HOOK(workflow-journal): a read-only probe dispatch (branch
     # verification, the deliverables hash check) reports files that may
     # legitimately not exist — it opts out of the declared-artifact check.
@@ -117,6 +131,9 @@ def validate_dispatch(
         "phase": normalized_phase,
         "schema": schema,
         "check_files": check_files,
+        "review_draft": (
+            review_draft.strip() if isinstance(review_draft, str) else None
+        ),
     }
 
 

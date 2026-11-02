@@ -73,9 +73,16 @@ def workspace_market_timezone(
     return ticker, ticker_market_timezone(ticker, company)
 
 
-def parse_due_moment(val: Any, default_tz: ZoneInfo) -> Optional[datetime]:
+def parse_due_moment(
+    val: Any,
+    default_tz: ZoneInfo,
+    *,
+    date_hour: int = 18,
+) -> Optional[datetime]:
     """到期验证项的原始时刻：带时区偏移的原样保留；只有日期或无时区的时刻按
-    交易所时区解释，日期按该时区当地时间 18:00 算（收盘之后才算到期）。"""
+    交易所时区解释，日期按该时区当地 ``date_hour`` 点算。验证项用默认的
+    18:00（收盘之后才算到期）；普通议程项（待查问题、日期唤醒）传 0——
+    当地日期一开始就算到期（提示词第 1 批第 3 轮 #8）。"""
     if not val:
         return None
     s = str(val).strip().replace("Z", "+00:00")
@@ -86,11 +93,11 @@ def parse_due_moment(val: Any, default_tz: ZoneInfo) -> Optional[datetime]:
         d = _parse_date(s)
         if d is None:
             return None
-        return datetime(d.year, d.month, d.day, 18, 0, 0, tzinfo=default_tz)
+        return datetime(d.year, d.month, d.day, date_hour, 0, 0, tzinfo=default_tz)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=default_tz)
     if date_only:
-        dt = dt.replace(hour=18, minute=0, second=0, microsecond=0)
+        dt = dt.replace(hour=date_hour, minute=0, second=0, microsecond=0)
     return dt
 
 
@@ -100,10 +107,12 @@ def validation_is_due(
     now_dt: datetime,
     *,
     tz: Optional[ZoneInfo] = None,
+    date_hour: int = 18,
 ) -> bool:
     """验证项是否已过它的到期时刻（无 due 或解析不了返回 False）。`tz` 显式
-    给出时优先（看板 / 总监已从 company.exchange 解析出的交易所时区）。"""
-    moment = parse_due_moment(raw_due, tz or market_timezone(ticker))
+    给出时优先（看板 / 总监已从 company.exchange 解析出的交易所时区）；
+    ``date_hour`` 见 ``parse_due_moment``（议程项传 0，验证项保持 18）。"""
+    moment = parse_due_moment(raw_due, tz or market_timezone(ticker), date_hour=date_hour)
     return moment is not None and now_dt >= moment
 
 

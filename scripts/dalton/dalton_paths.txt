@@ -52,6 +52,12 @@ tests/unit/ptc_agent/agent/middleware/test_removed_attachment_union.py
 # B5/D5: transport_lost abort records its spill reason and the failure the
 # parent sees carries the run's last written text + transcript directory.
 tests/unit/middleware/test_subagent_spill_recovery.py
+# 提示词第 1 批 #4：sector-delta / init-sector / language 三技能补登注册表、
+# 发现排除与 requires 依赖的测试。
+tests/unit/middleware/skills/test_dalton_registry_batch1.py
+# 提示词第 1 批第 2 轮 #1/#2：审稿派发的调用方哈希绑定（reviewDraft）、
+# 缺 1–9 检查项的审稿回复不可 replay 的 driver/journal 契约测试。
+tests/unit/middleware/workflow/test_reviewer_contract.py
 # A1: log-only registry of in-flight heavy compute, read by the loop watchdog.
 src/observability/heavy_tasks.py
 # P6a: 3-way container memory sampler (crawler browser, pdf_render browser, other).

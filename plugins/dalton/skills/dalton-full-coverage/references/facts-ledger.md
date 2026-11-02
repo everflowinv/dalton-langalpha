@@ -98,7 +98,7 @@ python .agents/skills/dalton-full-coverage/scripts/facts.py check \
 使用 `dalton_sec.get_company_facts`（按 R1–R10 规则，单季必须为 3m，Q4 由 FY − 9M 派生并标 `derived_filing_actual`）：
 - **营业收入（Revenue）**：`rev_q1` 至 `rev_q8`（`period` 写清具体财季，如 `1Q25`…`4Q26`）
 - **毛利或毛利率（Gross Profit）**：`gp_q1` 至 `gp_q8`
-- **营业利润（Operating Income）**：`opinc_q1` 至 `opinc_q8`
+- **营业利润（Operating Income）**：`op_q1` 至 `op_q8`
 - **稀释每股收益（Diluted EPS）**：`eps_q1` 至 `eps_q8`
 
 ### 5. 最近 3 个完整财年的自由现金流与股权激励（`fy1`、`fy2`、`fy3`，对应 FY-3、FY-2、FY-1）

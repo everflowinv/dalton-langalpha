@@ -49,6 +49,12 @@ def _draft_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
+def _nine_items(result: str = "pass") -> list[dict]:
+    """A reviewer reply's items: checks 1–9 each present (the shared contract
+    the driver, the workflows and check_done all enforce)."""
+    return [{"check": n, "result": result, "reason": "ok"} for n in range(1, 10)]
+
+
 def _with_full_language_sidecars(files: dict[str, str]) -> dict[str, str]:
     """Give every reviewable .md in a healthy-run fixture its two-round sidecar
     — the deterministic workspace scan checks them all, not just the draft."""
@@ -397,8 +403,9 @@ def _full_files(
     if with_review_pass:
         # Run-scoped review evidence: the run's status.json names the
         # workflow, and its journal's LAST review record is a pass whose
-        # draft_sha256 matches the draft above (hash computed by the tool,
-        # the record echoes the writer's).
+        # caller-bound draft_sha256 (the driver hashed the draft named by the
+        # dispatch's reviewDraft opt; the model never echoes a hash) matches
+        # the draft above — hash computed here, the record carries it.
         files[".agents/threads/short-1/workflows/task-run-1/status.json"] = json.dumps(
             {"run_id": "task-run-1", "name": "initial-coverage", "status": "completed", "updated_at": 1.0}
         )
@@ -411,10 +418,12 @@ def _full_files(
                         "status": "ok",
                         "seq": 7,
                         "recorded_at": 2.0,
+                        "draft_sha256": _draft_hash(draft),
                         "result": {
                             "verdict": "pass",
                             "summary": "通过",
-                            "draft_sha256": _draft_hash(draft),
+                            "items": _nine_items(),
+                            "must_fix": [],
                         },
                     }
                 ],
@@ -943,8 +952,9 @@ async def test_review_pass_from_another_run_does_not_count(
 async def test_review_pass_hash_must_match_current_draft(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A recorded pass whose draft_sha256 is the PRE-revision draft is a
-    missing item: the review covered a draft that is no longer there."""
+    """A recorded pass whose caller-bound draft_sha256 is the PRE-revision
+    draft is a missing item: the review covered a draft that is no longer
+    there."""
     files = _full_files(draft="# 初筛（修订后）\n" + "内容" * 400)
     # The journal still records the pre-revision draft's hash.
     files[JOURNAL_PASS] = json.dumps(
@@ -956,10 +966,12 @@ async def test_review_pass_hash_must_match_current_draft(
                     "status": "ok",
                     "seq": 7,
                     "recorded_at": 2.0,
+                    "draft_sha256": _draft_hash("# 初筛\n" + "内容" * 400),
                     "result": {
                         "verdict": "pass",
                         "summary": "通过",
-                        "draft_sha256": _draft_hash("# 初筛\n" + "内容" * 400),
+                        "items": _nine_items(),
+                        "must_fix": [],
                     },
                 }
             ],
@@ -1001,7 +1013,8 @@ async def test_run_id_scopes_the_review_lookup(monkeypatch: pytest.MonkeyPatch) 
                     "result": {
                         "verdict": "revise",
                         "summary": "P0",
-                        "draft_sha256": "f" * 64,
+                        "items": _nine_items("revise"),
+                        "must_fix": ["补 Q3"],
                     },
                 }
             ],
@@ -1113,7 +1126,13 @@ async def test_review_scan_stays_inside_the_calling_thread(
                     "status": "ok",
                     "seq": 1,
                     "recorded_at": 90.0,
-                    "result": {"verdict": "pass", "summary": "ok", "draft_sha256": "a" * 64},
+                    "draft_sha256": "a" * 64,
+                    "result": {
+                        "verdict": "pass",
+                        "summary": "ok",
+                        "items": _nine_items(),
+                        "must_fix": [],
+                    },
                 }
             ],
         },
@@ -1129,7 +1148,13 @@ async def test_review_scan_stays_inside_the_calling_thread(
                     "status": "ok",
                     "seq": 7,
                     "recorded_at": 2.0,
-                    "result": {"verdict": "pass", "summary": "ok", "draft_sha256": "f" * 64},
+                    "draft_sha256": "f" * 64,
+                    "result": {
+                        "verdict": "pass",
+                        "summary": "ok",
+                        "items": _nine_items(),
+                        "must_fix": [],
+                    },
                 }
             ],
         },
@@ -1337,7 +1362,10 @@ def _manual_files(draft_sha: str | None = None, verdict: str = "pass") -> dict[s
         {
             "verdict": verdict,
             "summary": "ok",
+            "items": _nine_items(),
             "must_fix": [],
+            # The saving analyst writes the hash it computed itself; the
+            # reviewer's reply never carried one.
             "draft_sha256": draft_sha or _draft_hash(files[DRAFT]),
         },
         ensure_ascii=False,
@@ -1384,6 +1412,29 @@ async def test_manual_sidecar_last_verdict_must_be_pass(monkeypatch: pytest.Monk
 
 
 @pytest.mark.asyncio
+async def test_manual_sidecar_missing_check_items_is_an_invalid_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """手动路径与 journal 同一套契约（提示词第 1 批第 2 轮 #2）：缺 1–9
+    检查项的 review.json 不能通过 check_done；pass 带 must_fix 也按 revise。"""
+    files = _manual_files()
+    doc = json.loads(files[MANUAL_SIDECAR])
+    doc["items"] = doc["items"][:7]
+    files[MANUAL_SIDECAR] = json.dumps(doc, ensure_ascii=False)
+    result = await _manual_check(monkeypatch, files, MANUAL_PARAMS)
+    assert not result["done"]
+    assert any("审稿输出无效" in item and "1–9" in item for item in result["missing"])
+
+    files = _manual_files()
+    doc = json.loads(files[MANUAL_SIDECAR])
+    doc["must_fix"] = ["补一句风险"]
+    files[MANUAL_SIDECAR] = json.dumps(doc, ensure_ascii=False)
+    result = await _manual_check(monkeypatch, files, MANUAL_PARAMS)
+    assert not result["done"]
+    assert any("不是 pass" in item for item in result["missing"])
+
+
+@pytest.mark.asyncio
 async def test_manual_without_sidecar_is_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     files = _manual_files()
     del files[MANUAL_SIDECAR]
@@ -1415,7 +1466,12 @@ async def test_manual_with_existing_run_dir_still_uses_the_journal(
                     "status": "ok",
                     "seq": 7,
                     "recorded_at": 2.0,
-                    "result": {"verdict": "revise", "summary": "P0", "draft_sha256": "f" * 64},
+                    "result": {
+                        "verdict": "revise",
+                        "summary": "P0",
+                        "items": _nine_items("revise"),
+                        "must_fix": ["P0"],
+                    },
                 }
             ],
         },
@@ -1498,7 +1554,7 @@ async def test_manual_sidecar_refused_while_an_unfinished_run_exists(
             "label": "审稿",
             "dispatches": [
                 {"label": "审稿", "status": "ok", "seq": 1, "recorded_at": 1.0,
-                 "result": {"verdict": "revise", "summary": "P0", "draft_sha256": "f" * 64}}
+                 "result": {"verdict": "revise", "summary": "P0", "items": _nine_items("revise"), "must_fix": ["P0"]}}
             ],
         },
         ensure_ascii=False,
@@ -1518,7 +1574,7 @@ async def test_unfinished_newer_run_blocks_falling_back_to_an_older_pass(
     files[".agents/threads/short-1/workflows/task-run-4/workflow.js"] = "return 1;"
     files[".agents/threads/short-1/workflows/task-run-4/journal/审稿.json"] = json.dumps(
         {"label": "审稿", "dispatches": [{"label": "审稿", "status": "ok", "seq": 1, "recorded_at": 9.0,
-          "result": {"verdict": "revise", "summary": "P0", "draft_sha256": "f" * 64}}]},
+          "result": {"verdict": "revise", "summary": "P0", "items": _nine_items("revise"), "must_fix": ["P0"]}}]},
         ensure_ascii=False,
     )
     _patch_knowledge(monkeypatch, IC_DOCS)
@@ -1584,7 +1640,7 @@ async def test_manual_sidecar_refused_when_only_a_journal_marks_the_run(
     files = _manual_files()
     files[".agents/threads/short-1/workflows/task-run-5/journal/审稿.json"] = json.dumps(
         {"label": "审稿", "dispatches": [{"label": "审稿", "status": "ok", "seq": 1, "recorded_at": 1.0,
-          "result": {"verdict": "revise", "summary": "P0", "draft_sha256": "f" * 64}}]},
+          "result": {"verdict": "revise", "summary": "P0", "items": _nine_items("revise"), "must_fix": ["P0"]}}]},
         ensure_ascii=False,
     )
     result = await _manual_check(monkeypatch, files, MANUAL_PARAMS)
@@ -2280,6 +2336,7 @@ async def test_preview_and_deep_require_push_draft_even_when_main_draft_reviewed
                 {
                     "verdict": "pass",
                     "summary": "ok",
+                    "items": _nine_items(),
                     "must_fix": [],
                     "draft_sha256": _draft_hash(deep_text),
                 }
@@ -2660,33 +2717,285 @@ async def test_call_gate_passed_branch_needs_current_check_draft(
     assert any("旧草稿" in m for m in stale["missing"])
 
 
+GATES_FILE = "research/2026-10-23-call.gates.json"
+
+
+def _patch_run_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give a named conversation run a readable start so the window anchors."""
+    monkeypatch.setattr(
+        check_done_tools,
+        "_run_start_epoch",
+        create_autospec(
+            check_done_tools._run_start_epoch,
+            return_value=int(time.time()) - 3600,
+        ),
+    )
+
+
+def _gates_entry(
+    *, passed: bool = False, failed: list[dict[str, Any]] | None = None
+) -> dict[str, str]:
+    if failed is None:
+        failed = [] if passed else [{"gate": 3, "reason": "Gate 3 驱动变量缺数字化预期差"}]
+    return {
+        GATES_FILE: json.dumps(
+            {"passed": passed, "failed_gates": failed, "as_of": "2026-10-23"},
+            ensure_ascii=False,
+        )
+    }
+
+
 @pytest.mark.asyncio
-async def test_call_gate_failed_branch_needs_no_change_verdict(
+async def test_call_gate_failed_round_completes_with_gates_file_and_verdict(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    _patch_run_start(monkeypatch)
+    """门禁失败分支的完整签名（提示词第 1 批第 2 轮 #3）：写下的门禁结果
+    文件（passed=false、failed_gates 各带原因）+ 本轮任意五词之一的
+    verdict；NO_CHANGE 只是论点确实无变化时的选择。"""
+    for word in ("NO_CHANGE", "THESIS_WEAKENED", "THESIS_BROKEN", "NEW_THESIS"):
+        _patch_verdicts(monkeypatch, [_verdict_row(word)])
+        if word == "NO_CHANGE":
+            _patch_knowledge(monkeypatch, [])
+        else:
+            # 非 NO_CHANGE 的结论要求 thesis 本轮有更新。
+            _patch_knowledge(monkeypatch, ["thesis"])
+        done = await run_check_done(
+            workflow="dalton-call", params=CALL_PARAMS,
+            backend=_make_backend(_gates_entry()), workspace_id=WS,
+        )
+        assert done["done"] is True, (word, done["missing"])
+
+    # 行没有 run_id 时（第 3 轮 #2 的严格归因）：不再退回时间窗口，本轮没有
+    # verdict 就是不算完成——run_id 为空的旧行不会冒充本轮。
     _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE")])
-    done = await run_check_done(
+    strict = await run_check_done(
+        workflow="dalton-call", params=CALL_PARAMS,
+        backend=_make_backend(_gates_entry()), workspace_id=WS,
+        conversation_run_id="run-now",
+    )
+    assert strict["done"] is False
+    assert any("本轮没有五词结论" in m for m in strict["missing"])
+    assert not any("时间窗口" in w for w in strict["warnings"])
+
+    # 只有在完全没取到本轮对话 run 标识时才退回时间窗口，并如实说明。
+    window = await run_check_done(
+        workflow="dalton-call", params=CALL_PARAMS,
+        backend=_make_backend(_gates_entry()), workspace_id=WS,
+    )
+    assert window["done"] is True, window["missing"]
+    assert any("时间窗口" in w for w in window["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_call_gate_failed_without_gates_file_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """没有门禁结果文件也没有草稿：两个签名都没有，无法判定（第 3 轮 #1
+    起先读本轮门禁文件，不存在就走草稿分支）。"""
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE")])
+    result = await run_check_done(
         workflow="dalton-call", params=CALL_PARAMS,
         backend=_make_backend({}), workspace_id=WS,
     )
-    assert done["done"] is True, done["missing"]
+    assert result["done"] is False
+    assert any("没有正式草稿" in m and "门禁结果文件" in m for m in result["missing"])
 
-    # Neither signature: no draft and no NO_CHANGE word this round.
-    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_WEAKENED")])
-    undecided = await run_check_done(
+
+@pytest.mark.asyncio
+async def test_call_gate_failed_with_empty_failed_gates_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """passed=false 但 failed_gates 为空（或条目没有原因）不合契约。"""
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE")])
+    result = await run_check_done(
         workflow="dalton-call", params=CALL_PARAMS,
-        backend=_make_backend({}), workspace_id=WS,
+        backend=_make_backend(_gates_entry(failed=[])), workspace_id=WS,
     )
-    assert undecided["done"] is False
-    assert any("无法判定门禁结果" in m for m in undecided["missing"])
+    assert result["done"] is False
+    assert any("failed_gates" in m for m in result["missing"])
 
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE")])
+    result = await run_check_done(
+        workflow="dalton-call", params=CALL_PARAMS,
+        backend=_make_backend(
+            _gates_entry(failed=[{"gate": 3, "reason": "  "}])
+        ),
+        workspace_id=WS,
+    )
+    assert result["done"] is False
+    assert any("reason" in m for m in result["missing"])
+
+
+@pytest.mark.asyncio
+async def test_call_gate_failed_ignores_last_rounds_verdict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_run_start(monkeypatch)
+    """数据库行带 run_id 时按本轮归因：上一轮的 verdict 不能完成本轮。"""
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", run_id="run-old")])
+    result = await run_check_done(
+        workflow="dalton-call", params=CALL_PARAMS,
+        backend=_make_backend(_gates_entry()), workspace_id=WS,
+        conversation_run_id="run-now",
+    )
+    assert result["done"] is False
+    assert any("本轮门禁结果为未通过" in m and "本轮没有五词结论" in m for m in result["missing"])
+
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", run_id="run-now")])
+    result = await run_check_done(
+        workflow="dalton-call", params=CALL_PARAMS,
+        backend=_make_backend(_gates_entry()), workspace_id=WS,
+        conversation_run_id="run-now",
+    )
+    assert result["done"] is True, result["missing"]
+    # 按本轮 run_id 归因时不出现时间窗口的说明。
+    assert not any("时间窗口" in w for w in result["warnings"])
+
+
+@pytest.mark.asyncio
+async def test_call_gate_failed_non_no_change_verdict_requires_thesis_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_run_start(monkeypatch)
+    """结论不是 NO_CHANGE 就是宣告论点变化：thesis 必须在本轮有更新。"""
+    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_WEAKENED", run_id="run-now")])
+    _patch_knowledge(monkeypatch, [])
+    result = await run_check_done(
+        workflow="dalton-call", params=CALL_PARAMS,
+        backend=_make_backend(_gates_entry()), workspace_id=WS,
+        conversation_run_id="run-now",
+    )
+    assert result["done"] is False
+    assert any("THESIS_WEAKENED" in m and "thesis" in m for m in result["missing"])
+
+    _patch_knowledge(monkeypatch, ["thesis"])
+    result = await run_check_done(
+        workflow="dalton-call", params=CALL_PARAMS,
+        backend=_make_backend(_gates_entry()), workspace_id=WS,
+        conversation_run_id="run-now",
+    )
+    assert result["done"] is True, result["missing"]
+
+
+@pytest.mark.asyncio
+async def test_call_gate_failed_verdict_db_error_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     _patch_verdicts(monkeypatch, error=RuntimeError("db down"))
     dead = await run_check_done(
         workflow="dalton-call", params=CALL_PARAMS,
-        backend=_make_backend({}), workspace_id=WS,
+        backend=_make_backend(_gates_entry()), workspace_id=WS,
     )
     assert dead["done"] is False
     assert any("数据库查询失败" in m for m in dead["missing"])
+
+
+@pytest.mark.asyncio
+async def test_call_this_round_failed_gates_win_over_a_leftover_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """第 3 轮 #1/#3：同一天先有一份旧草稿、本轮门禁 passed=false——失败
+    分支说了算（遗留草稿被无视），没写 verdict、没更新 thesis 就不能完成。"""
+    _patch_run_start(monkeypatch)
+    old_draft = "# Conviction Call\n" + "旧稿" * 300
+    files = {CALL_DRAFT: old_draft, **_gates_entry()}
+    # 草稿是旧一轮写的（mtime 在本轮窗口之外）。
+    _patch_verdicts(monkeypatch, [])
+    _patch_knowledge(monkeypatch, [])
+    result = await run_check_done(
+        workflow="dalton-call", params=CALL_PARAMS,
+        backend=_make_backend(files, mtimes={CALL_DRAFT: 1_700_000_000}),
+        workspace_id=WS,
+    )
+    assert result["done"] is False
+    # 判定的是失败分支的缺口（本轮没有 verdict），不是草稿分支的旧稿缺口。
+    assert any("本轮门禁结果为未通过" in m and "本轮没有五词结论" in m for m in result["missing"])
+    assert not any("不是本轮写下的" in m for m in result["missing"])
+
+
+@pytest.mark.asyncio
+async def test_call_stale_gates_file_does_not_count_as_this_round(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """第 3 轮 #1/#3：门禁结果文件是旧文件（mtime 在本轮窗口外）时不算本
+    轮结果——落回草稿分支，旧草稿同样不能完成。"""
+    _patch_run_start(monkeypatch)
+    old_draft = "# Conviction Call\n" + "旧稿" * 300
+    files = {CALL_DRAFT: old_draft, **_gates_entry()}
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE")])
+    result = await run_check_done(
+        workflow="dalton-call", params=CALL_PARAMS,
+        backend=_make_backend(
+            files, mtimes={GATES_FILE: 1_700_000_000, CALL_DRAFT: 1_700_000_000}
+        ),
+        workspace_id=WS,
+    )
+    assert result["done"] is False
+    # 旧门禁文件被无视：走草稿分支，报的是草稿缺本轮签名（或旧稿）。
+    assert any(
+        ("不是本轮写下的" in m or "没有正式草稿" in m) for m in result["missing"]
+    )
+    assert not any("本轮门禁结果为未通过" in m for m in result["missing"])
+
+
+@pytest.mark.asyncio
+async def test_call_gates_passed_this_round_demands_a_fresh_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """第 3 轮 #1：本轮门禁 passed=true 走草稿分支，且草稿必须是本轮写的
+    ——旧稿不能借着本轮的门禁结果完成。"""
+    _patch_run_start(monkeypatch)
+    old_draft = "# Conviction Call\n" + "旧稿" * 300
+    files = {CALL_DRAFT: old_draft, **_gates_entry(passed=True)}
+    _patch_verdicts(monkeypatch, [])
+    result = await run_check_done(
+        workflow="dalton-call", params=CALL_PARAMS,
+        backend=_make_backend(files, mtimes={CALL_DRAFT: 1_700_000_000}),
+        workspace_id=WS,
+    )
+    assert result["done"] is False
+    assert any("不是本轮写下的" in m for m in result["missing"])
+
+
+@pytest.mark.asyncio
+async def test_call_draft_with_unreadable_mtime_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """第 4 轮 #1：草稿的 mtime 读不到时不能失败放行——与门禁文件的新鲜度
+   检查同口径，返回 missing（无法确认草稿是本轮写的）。"""
+    _patch_run_start(monkeypatch)
+    draft = "# Conviction Call\n" + "内容" * 300
+    files = {CALL_DRAFT: draft, **_gates_entry(passed=True)}
+    _patch_verdicts(monkeypatch, [])
+
+    real_file_info = check_done_tools._file_info
+
+    async def _draft_mtime_unreadable(backend: Any, path: str) -> Any:
+        if path == CALL_DRAFT:
+            # 文件在、读得出内容，但 stat 给不出修改时间（_file_info 的
+            # mtime_epoch=None 契约）。
+            return check_done_tools._FileInfo(
+                exists=True, size=len(draft.encode("utf-8")), text=None, mtime_epoch=None
+            )
+        return await real_file_info(backend, path)
+
+    monkeypatch.setattr(
+        check_done_tools,
+        "_file_info",
+        create_autospec(
+            check_done_tools._file_info, side_effect=_draft_mtime_unreadable
+        ),
+    )
+    result = await run_check_done(
+        workflow="dalton-call", params=CALL_PARAMS,
+        backend=_make_backend(files),
+        workspace_id=WS,
+    )
+    assert result["done"] is False
+    assert any("无法确认草稿是本轮写的" in m for m in result["missing"])
+    # 不是"旧稿"分支（mtime 明确过期），而是读不到的 fail-closed 分支。
+    assert not any("不是本轮写下的" in m for m in result["missing"])
 
 
 @pytest.mark.asyncio
@@ -2703,7 +3012,7 @@ async def test_call_probe_failure_is_not_confirmed_absence(
         workspace_id=WS,
     )
     assert result["done"] is False
-    assert any("正式草稿读取出错" in m and "无法判定门禁结果" in m for m in result["missing"])
+    assert any("读取出错" in m and "无法判定门禁结果" in m for m in result["missing"])
 
 
 @pytest.mark.asyncio
@@ -2721,7 +3030,7 @@ async def test_call_empty_file_with_dead_probe_is_not_absence(
         workspace_id=WS,
     )
     assert result["done"] is False
-    assert any("正式草稿读取出错" in m and "无法判定门禁结果" in m for m in result["missing"])
+    assert any("读取出错" in m and "无法判定门禁结果" in m for m in result["missing"])
 
 
 @pytest.mark.asyncio
@@ -2742,7 +3051,7 @@ async def test_call_decode_failure_with_dead_probe_is_not_absence(
         workspace_id=WS,
     )
     assert result["done"] is False
-    assert any("正式草稿读取出错" in m and "无法判定门禁结果" in m for m in result["missing"])
+    assert any("读取出错" in m and "无法判定门禁结果" in m for m in result["missing"])
 
 
 # dalton-call's real publish naming: the DRAFT carries the date, the slug

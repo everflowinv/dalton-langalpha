@@ -1964,6 +1964,12 @@ async def test_real_script_block_fill_resume_chain() -> None:
                         "summary": "测试收尾 block",
                         "must_fix": [],
                         "draft_sha256": "a" * 64,
+                        # 审稿契约（提示词第 1 批 #2）：items 逐项覆盖 1–9，
+                        # 缺项的结果按审稿失败处理而不是 block。
+                        "items": [
+                            {"check": n, "result": "revise", "reason": "block 用例"}
+                            for n in range(1, 10)
+                        ],
                     }
                 )
             ),

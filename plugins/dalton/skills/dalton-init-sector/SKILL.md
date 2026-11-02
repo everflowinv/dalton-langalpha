@@ -1,6 +1,6 @@
 ---
 name: dalton-init-sector
-description: "为已绑定行业覆盖单元的工作区初始化行业知识层：创建 sector 文档（定义、边界、产业链、成员清单）与行业版 thesis / agenda / drivers，全部经 knowledge_update 落库。开始覆盖一个行业、主题或产业链时使用；要求工作区已绑定 sector 覆盖单元。"
+description: "为已绑定行业覆盖单元的工作区初始化行业知识层：创建 sector 文档与行业版 thesis / agenda / drivers，全部经 knowledge_update 落库。开始覆盖一个行业、主题或产业链时使用。"
 ---
 
 # Dalton 行业覆盖初始化（`dalton-init-sector`）

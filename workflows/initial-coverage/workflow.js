@@ -30,9 +30,11 @@ const VERDICT = {
     verdict: { type: 'string', enum: ['pass', 'revise', 'block'] },
     summary: { type: 'string', minLength: 1 },
     must_fix: { type: 'array', items: { type: 'string', minLength: 1 } },
-    draft_sha256: { type: 'string', minLength: 64 },
+    // items 元素的键（check/result/reason/lines）由 dalton-reviewer 的提示词契约约束，
+    // 结构深度保持在平台 schema_max_depth 限制内（元素键不展开为 schema 节点）。
+    items: { type: 'array', items: { type: 'object' } },
   },
-  required: ['verdict', 'summary', 'draft_sha256'],
+  required: ['verdict', 'summary', 'items'],
 }
 const HASH = {
   type: 'object',
@@ -41,7 +43,35 @@ const HASH = {
   },
   required: ['files'],
 }
-const verdictOf = (r) => (r && typeof r === 'object' ? r.verdict : null)
+const verdictOf = (r) => {
+  // pass 但 must_fix 非空按 revise 处理，与服务端 publish/review.py 的规则一致
+  //（提示词第 1 批第 2 轮 #2）。
+  if (r && typeof r === 'object' && r.verdict === 'pass' && Array.isArray(r.must_fix) && r.must_fix.length) {
+    return 'revise'
+  }
+  return r && typeof r === 'object' ? r.verdict : null
+}
+// 审稿结果与 dalton-reviewer 提示词、服务端发布审稿（publish/review.py）同一契约：
+// items 必须逐项覆盖 1–9 项检查；缺项的结果不可作为 verdict 使用（fail-closed）。
+const REVIEW_CHECKS = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+const completeReview = (r) => {
+  if (!r || typeof r !== 'object') return false
+  const items = Array.isArray(r.items) ? r.items : []
+  const done = new Set()
+  for (const it of items) {
+    if (
+      it &&
+      typeof it === 'object' &&
+      Number.isInteger(it.check) &&
+      it.check >= 1 &&
+      it.check <= 9 &&
+      (it.result === 'pass' || it.result === 'revise')
+    ) {
+      done.add(it.check)
+    }
+  }
+  return REVIEW_CHECKS.every((c) => done.has(c))
+}
 const DRAFT_OUT = { ...OUT, required: ['files', 'summary', 'sha256'] }
 const shaOf = (r) =>
   r && typeof r === 'object' && typeof r.sha256 === 'string' && /^[0-9a-f]{64}$/.test(r.sha256)
@@ -247,17 +277,22 @@ const kp =
       )
 
 phase('审稿')
-const review =
+let review =
   !draftOk
     ? null
     : await agent(
         `审阅 ${draftPath}（被审草稿 sha256：${
           reviewedSha || '未知'
-        }；支线材料在 ${R}/，只读不改文件）。这是买方初次覆盖，重点看：Q1/Q2/Q3/Q4/Q5/Q7/Q8/Q12 是否有判断；“预期差”是否只是复述共识；壁垒“形成还是被破坏”是否有证据及可证伪指标；估值分解是否算对（两项之和等于股价对数变化）。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；draft_sha256 填提示词里的被审草稿 sha256 原值）。`,
-        { agentType: 'dalton-reviewer', label: '审稿', phase: '审稿', schema: VERDICT }
+        }；支线材料在 ${R}/，只读不改文件）。这是买方初次覆盖，重点看：Q1/Q2/Q3/Q4/Q5/Q7/Q8/Q12 是否有判断；“预期差”是否只是复述共识；壁垒“形成还是被破坏”是否有证据及可证伪指标；估值分解是否算对（两项之和等于股价对数变化）。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；items 逐项覆盖 1–9 项检查）。`,
+        { agentType: 'dalton-reviewer', label: '审稿', phase: '审稿', schema: VERDICT, reviewDraft: draftPath }
       )
 
 const incomplete = []
+// 审稿结果未覆盖 1–9 项检查时按审稿失败处理（与发布审稿同一契约，fail-closed）。
+if (review !== null && !completeReview(review)) {
+  incomplete.push('审稿结果未覆盖 1–9 项检查，按审稿失败处理')
+  review = null
+}
 if (review && verdictOf(review) === 'block') {
   incomplete.push(`审稿 block：${review.summary || '存在不可修订级问题'}`)
   return {
@@ -294,13 +329,17 @@ while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 2) {
   }
   currentDraftSha = fixedSha
   const reReview = await agent(
-    `复审（第 ${rounds} 轮修订后）：审阅 ${W}/drafts/${D}-initial-coverage.md（被审草稿 sha256：${fixedSha}；支线材料在 ${R}/，只读不改文件）。重点核对上一轮 must_fix 是否全部解决。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；draft_sha256 填提示词里的被审草稿 sha256 原值）。上一轮审稿意见：\n${JSON.stringify(
+    `复审（第 ${rounds} 轮修订后）：审阅 ${W}/drafts/${D}-initial-coverage.md（被审草稿 sha256：${fixedSha}；支线材料在 ${R}/，只读不改文件）。重点核对上一轮 must_fix 是否全部解决。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；items 逐项覆盖 1–9 项检查）。上一轮审稿意见：\n${JSON.stringify(
       finalReview
     )}`,
-    { agentType: 'dalton-reviewer', label: `复审 ${rounds}`, phase: '审稿', schema: VERDICT }
+    { agentType: 'dalton-reviewer', label: `复审 ${rounds}`, phase: '审稿', schema: VERDICT, reviewDraft: draftPath }
   )
   if (reReview === null) {
     incomplete.push(`第 ${rounds} 轮复审失败`)
+    break
+  }
+  if (!completeReview(reReview)) {
+    incomplete.push(`第 ${rounds} 轮复审结果未覆盖 1–9 项检查，按复审失败处理`)
     break
   }
   if (verdictOf(reReview) === 'block') {
@@ -341,11 +380,14 @@ if (draftOk && reviewPassed && lang2Sha === null) {
 } else if (draftOk && reviewPassed && lang2Sha !== preLang2Sha) {
   currentDraftSha = lang2Sha
   const finalCheck = await agent(
-    `终稿审稿（语言修改后）：审阅 ${draftPath}（被审草稿 sha256：${lang2Sha}；支线材料在 ${R}/，只读不改文件）。重点：语言修改未动事实与数字，上一轮 must_fix 仍全部解决。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；draft_sha256 填提示词里的被审草稿 sha256 原值）。`,
-    { agentType: 'dalton-reviewer', label: '终稿审稿', phase: '审稿', schema: VERDICT }
+    `终稿审稿（语言修改后）：审阅 ${draftPath}（被审草稿 sha256：${lang2Sha}；支线材料在 ${R}/，只读不改文件）。重点：语言修改未动事实与数字，上一轮 must_fix 仍全部解决。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；items 逐项覆盖 1–9 项检查）。`,
+    { agentType: 'dalton-reviewer', label: '终稿审稿', phase: '审稿', schema: VERDICT, reviewDraft: draftPath }
   )
   if (finalCheck === null) {
     incomplete.push('终稿审稿失败')
+  } else if (!completeReview(finalCheck)) {
+    incomplete.push('终稿审稿结果未覆盖 1–9 项检查，按审稿失败处理')
+    finalReview = null
   } else {
     finalReview = finalCheck
   }

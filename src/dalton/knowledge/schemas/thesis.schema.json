@@ -24,7 +24,7 @@
     "houseView": {"type": "object", "additionalProperties": false,
       "properties": {
         "stance": {"enum": ["long","short","neutral","no_view"]},
-        "conviction": {"enum": ["high","medium","low","none"], "description": "没有足够预期差时写 none（§3.1-8）"},
+        "conviction": {"enum": ["high","medium","low","none"], "description": "判断的稳健程度：high=合理的盈利、倍数、时间扰动下判断仍成立；medium=方向成立但依赖一个可识别、可监控的关键条件；low=依赖窄假设或核心证据尚不能区分竞争解释。none 只用于 stance=no_view（机制或估值范围无法识别），不得用来表达“预期差不够”——预期差不足时 stance 用 neutral 并承担举证责任"},
         "horizon_months": {"type": "integer", "minimum": 1, "maximum": 60},
         "summary": {"type": "string"},
         "variant_perception": {"type": "string", "description": "我们和市场哪里不同、为什么市场错、什么会让市场改变看法"},

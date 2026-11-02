@@ -474,6 +474,24 @@ async def test_preflight_direct_wake_vs_llm_triage_and_fallback(monkeypatch):
     assert is_direct_wake_signal({"probe": "sec", "payload": {"form": "8-K", "items": ["5.02"]}}) is False
     assert is_direct_wake_signal({"probe": "sec", "payload": {"form": "4"}}) is False
     assert is_direct_wake_signal({"probe": "cnhk", "priority": "P2", "payload": {"priority": "P2"}}) is False
+    # 提示词第 1 批第 3 轮 #11：过期历史项的汇总信号不直接唤醒——它是随其他
+    # 唤醒附带的清理提示；普通的议程到期项仍直接唤醒。
+    assert (
+        is_direct_wake_signal(
+            {
+                "probe": "agenda",
+                "priority": "P2",
+                "payload": {"kind": "stale_todos", "count": 3, "ids": ["Q-001"]},
+            }
+        )
+        is False
+    )
+    assert (
+        is_direct_wake_signal(
+            {"probe": "agenda", "payload": {"kind": "open_question", "id": "Q-001"}}
+        )
+        is True
+    )
 
     auto = {
         "automation_id": "11111111-1111-1111-1111-111111111111",
@@ -755,7 +773,8 @@ async def test_a1_budget_keys_a3_timeout_a5_agenda_note_a7_director_a9_once_defe
     monkeypatch.setattr("src.dalton.autonomy.preflight.probe_sec", mock_probe_sec)
     monkeypatch.setattr("src.dalton.autonomy.preflight.probe_cnhk_filings", mock_probe_cnhk)
 
-    today_iso = datetime.now(timezone.utc).date().isoformat()
+    # 到期判断按交易所当地 18:00（validation_is_due）：用昨天，任何钟点都确定已到期。
+    today_iso = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
     res_concurrent = await preflight_check(
         {
             "automation_id": "11111111-1111-1111-1111-111111111111",
@@ -815,7 +834,8 @@ async def test_preflight_check_skips_when_no_signals_and_wakes_once(monkeypatch)
     assert res_skip.reason == "no_new_signals"
 
     # 2. Due open question -> wake with <dalton_wake> directive
-    today_iso = datetime.now(timezone.utc).date().isoformat()
+    # 到期判断按交易所当地 18:00（validation_is_due）：用昨天，任何钟点都确定已到期。
+    today_iso = (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
     agenda_with_due = {
         "open_questions": [
             {
@@ -851,6 +871,144 @@ async def test_preflight_check_skips_when_no_signals_and_wakes_once(monkeypatch)
     )
     assert res_dup.should_wake is False
     assert res_dup.reason == "no_new_signals"
+
+
+def _stale_harness(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Persist-mode preflight doubles keyed by signal_key, so a test can tell
+    the stale sweep-up and the real wake signal apart."""
+    from src.server.database import workspace as ws_db
+
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(
+            ws_db.get_workspace,
+            return_value={
+                "workspace_id": "22222222-2222-2222-2222-222222222222",
+                "user_id": "local-dev-user",
+            },
+        ),
+    )
+    calls: dict[str, list[Any]] = {"resolve": [], "claim": [], "log": []}
+    counter = {"n": 0}
+
+    async def _upsert(**kwargs: Any) -> tuple[dict[str, Any], bool]:
+        counter["n"] += 1
+        return (
+            {
+                "signal_id": f"sig-{counter['n']}",
+                "signal_key": kwargs.get("signal_key"),
+                "status": "pending",
+            },
+            True,
+        )
+
+    async def _claim(signal_ids: Any, execution_id: Any, **_kw: Any) -> list[Any]:
+        calls["claim"].append(list(signal_ids))
+        return list(signal_ids)
+
+    async def _resolve(signal_ids: Any, **_kw: Any) -> None:
+        calls["resolve"].append((list(signal_ids), _kw.get("resolved_by")))
+
+    async def _log(**kwargs: Any) -> None:
+        calls["log"].append(kwargs)
+
+    monkeypatch.setattr(watch_db, "upsert_signal", create_autospec(watch_db.upsert_signal, side_effect=_upsert))
+    monkeypatch.setattr(watch_db, "claim_signals_woken", create_autospec(watch_db.claim_signals_woken, side_effect=_claim))
+    monkeypatch.setattr(watch_db, "resolve_signals", create_autospec(watch_db.resolve_signals, side_effect=_resolve))
+    monkeypatch.setattr(watch_db, "insert_preflight_log", create_autospec(watch_db.insert_preflight_log, side_effect=_log))
+    monkeypatch.setattr(watch_db, "get_watch_state", create_autospec(watch_db.get_watch_state, return_value={}))
+    monkeypatch.setattr(watch_db, "upsert_watch_state", create_autospec(watch_db.upsert_watch_state, return_value={}))
+    monkeypatch.setattr(watch_db, "expire_old_signals", create_autospec(watch_db.expire_old_signals, return_value=[]))
+    monkeypatch.setattr("src.dalton.autonomy.preflight.probe_sec", create_autospec(probe_sec, return_value=([], {})))
+    monkeypatch.setattr("src.dalton.autonomy.preflight.probe_cnhk_filings", create_autospec(probe_cnhk_filings, return_value=([], {})))
+    return calls
+
+
+def _stale_question(qid: str, due: str) -> dict[str, Any]:
+    return {
+        "id": qid,
+        "question": f"{qid} 长期未验证",
+        "why": "P1",
+        "value": "high",
+        "urgency": "now",
+        "origin": "analyst",
+        "owner": "analyst",
+        "status": "open",
+        "attempts": [],
+        "created_at": "2026-01-01T00:00:00Z",
+        "due_date": due,
+    }
+
+
+@pytest.mark.asyncio
+async def test_stale_todos_alone_never_wakes_and_stays_unhandled(monkeypatch):
+    """第 4 轮 #3：唯一的信号是过期汇总时不唤醒、不进分诊（无 LLM 调用）、
+    不标记 resolved——保持未处理，留到下一次（ISO 周键仍只提示一次）。"""
+    calls = _stale_harness(monkeypatch)
+    stale_due = (datetime.now(timezone.utc).date() - timedelta(days=45)).isoformat()
+    auto = {
+        "automation_id": "11111111-1111-1111-1111-111111111111",
+        "name": "dalton-meta-watch",
+        "trigger_type": "cron",
+        "user_id": "local-dev-user",
+        "workspace_id": "22222222-2222-2222-2222-222222222222",
+    }
+    result = await preflight_check(
+        auto,
+        "exec-stale-1",
+        watch_state_override={},
+        agenda_doc_override={"open_questions": [_stale_question("Q-001", stale_due)]},
+        persist=True,
+    )
+    assert result.should_wake is False
+    assert result.decision == "skip"
+    assert result.reason == "no_new_signals"
+    # 不进 claim（没有唤醒可认领），也不标记 resolved（留到下一次）。
+    assert calls["claim"] == []
+    assert calls["resolve"] == []
+
+
+@pytest.mark.asyncio
+async def test_stale_todos_rides_along_a_real_wake_and_is_marked_notified(monkeypatch):
+    """第 4 轮 #3：同一轮里有其他信号触发唤醒时，汇总信号随唤醒内容附带，
+    并在那时标记已通知；claim 只认领真正唤醒的信号。"""
+    calls = _stale_harness(monkeypatch)
+    now_date = datetime.now(timezone.utc).date()
+    stale_due = (now_date - timedelta(days=45)).isoformat()
+    fresh_due = (now_date - timedelta(days=1)).isoformat()
+    auto = {
+        "automation_id": "11111111-1111-1111-1111-111111111111",
+        "name": "dalton-meta-watch",
+        "trigger_type": "cron",
+        "user_id": "local-dev-user",
+        "workspace_id": "22222222-2222-2222-2222-222222222222",
+    }
+    result = await preflight_check(
+        auto,
+        "exec-stale-2",
+        watch_state_override={},
+        agenda_doc_override={
+            "open_questions": [
+                _stale_question("Q-stale", stale_due),
+                {**_stale_question("Q-fresh", fresh_due), "question": "新到期问题"},
+            ]
+        },
+        persist=True,
+    )
+    assert result.should_wake is True, result
+    assert result.decision == "wake"
+    # 唤醒内容里既有真正的到期项，也有随行附带的过期汇总提示。
+    assert "Q-fresh" in result.wake_context
+    assert "过期超过 30 天" in result.wake_context
+    # claim 只认领唤醒信号（fresh 的 question 信号）……
+    assert len(calls["claim"]) == 1
+    assert len(calls["claim"][0]) == 1
+    # ……汇总信号走 resolved 标记（已通知），resolved_by 点名来源。
+    assert len(calls["resolve"]) == 1
+    resolved_ids, resolved_by = calls["resolve"][0]
+    assert len(resolved_ids) == 1
+    assert resolved_by == "preflight.stale_todos:notified"
 
 
 @pytest.mark.asyncio
@@ -1053,7 +1211,14 @@ async def test_p0i_i5_autonomy_low_risk_fixes(
         "33333333-3333-3333-3333-333333333333",
         agenda_doc_override={
             "next_validations": [
-                {"id": "V-1", "what": "Check Q3", "due": "2020-01-01", "status": "open"}
+                # 近期到期（第 4 轮 #3 起，>30 天的历史项只进汇总、不单独唤醒，
+                # 走不到 claim 路径）——用昨天，任何钟点都确定已到期。
+                {
+                    "id": "V-1",
+                    "what": "Check Q3",
+                    "due": (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat(),
+                    "status": "open",
+                }
             ]
         },
         persist=True,
@@ -2264,3 +2429,46 @@ def test_director_tools_role_gating_analyst_excludes_watch_event_and_resolve_sig
     assert "dalton_resolve_signals" in skill_md
     assert 'probe="calendar"' in skill_md
     assert "dalton_agenda_note" not in skill_md
+
+
+@pytest.mark.asyncio
+async def test_stale_todos_dry_run_keeps_its_key_until_it_rides_a_wake(monkeypatch):
+    """persist=False keeps dedup keys in the watch state: a lone stale hint must
+    not record its key, or the next run's real wake would drop the hint."""
+    _stale_harness(monkeypatch)
+    now_date = datetime.now(timezone.utc).date()
+    stale_due = (now_date - timedelta(days=45)).isoformat()
+    fresh_due = (now_date - timedelta(days=1)).isoformat()
+    auto = {
+        "automation_id": "11111111-1111-1111-1111-111111111111",
+        "name": "dalton-meta-watch",
+        "trigger_type": "cron",
+        "user_id": "local-dev-user",
+        "workspace_id": "22222222-2222-2222-2222-222222222222",
+    }
+    state: dict = {}
+    first = await preflight_check(
+        auto,
+        "exec-stale-dry-1",
+        watch_state_override=state,
+        agenda_doc_override={"open_questions": [_stale_question("Q-stale", stale_due)]},
+        persist=False,
+    )
+    assert first.should_wake is False
+    assert not any("stale_todos" in str(k) for k in state.get("_woken_signal_keys") or [])
+
+    second = await preflight_check(
+        auto,
+        "exec-stale-dry-2",
+        watch_state_override=state,
+        agenda_doc_override={
+            "open_questions": [
+                _stale_question("Q-stale", stale_due),
+                {**_stale_question("Q-fresh", fresh_due), "question": "新到期问题"},
+            ]
+        },
+        persist=False,
+    )
+    assert second.should_wake is True, second
+    assert "过期超过 30 天" in second.wake_context
+    assert any("stale_todos" in str(k) for k in state.get("_woken_signal_keys") or [])

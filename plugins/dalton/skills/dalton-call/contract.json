@@ -1,6 +1,6 @@
 {
   "name": "dalton-call",
-  "description": "Conviction call 的完成契约（门禁两分支）：正式草稿存在＝六条门禁全过，要求草稿足量且 check_draft 侧车哈希与当前稿一致；草稿不存在＝门禁未过，要求本轮有 word=NO_CHANGE 的 verdict；两个签名都读不到＝无法判定门禁结果，记 missing（对应 dalton-call SKILL Step 2 与 Step 9.1–9.2）。",
+  "description": "Conviction call 的完成契约（门禁两分支）：本轮门禁结果文件为 passed=false＝门禁未过，要求 failed_gates 至少一条且各带原因、本轮追加一条五词之一的 verdict，且结论不是 NO_CHANGE 时 thesis 须在本轮有更新；passed=true 或本轮没有门禁未过的记录＝六条门禁全过，要求本轮新写的足量正式草稿，且 check_draft 侧车哈希与当前稿一致；两支条件都不满足＝无法判定门禁结果，记 missing（对应 dalton-call SKILL Step 2 与 Step 9）。",
   "params_required": [
     "ticker",
     "as_of"
@@ -14,8 +14,16 @@
     "gated_draft": {
       "draft": "drafts/{as_of}-call-{ticker}.md",
       "min_bytes": 300,
+      "gates_file": "research/{as_of}-call.gates.json",
+      "knowledge_docs_any_unless_no_change": [
+        "thesis"
+      ],
       "absent_verdict_kinds_any": [
-        "NO_CHANGE"
+        "NO_CHANGE",
+        "THESIS_STRENGTHENED",
+        "THESIS_WEAKENED",
+        "THESIS_BROKEN",
+        "NEW_THESIS"
       ]
     },
     "language_review": {

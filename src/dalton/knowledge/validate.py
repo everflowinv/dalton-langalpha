@@ -176,7 +176,9 @@ def validate_schema(schema_name: str, instance: Any) -> list[dict[str, Any]]:
         # `format: date-time` 没有注册 rfc3339-validator，FormatChecker 直接放
         # 行，schema 的 pattern 只挡形状——"2026-10-28T25:00:00-04:00" 这类
         # 形状合法但解析失败的值要在这里真实解析挡下，否则进库后验证项永不
-        # 到期。
+        # 到期。到期探针读的三个日期字段（next_validations[].due、
+        # open_questions[].due_date、wake_conditions[].params 的日期键，提示词
+        # 第 1 批第 2 轮 #4）共用同一套 writable_due_error 口径。
         from src.dalton.autonomy.due import writable_due_error
 
         for idx, val_item in enumerate(instance.get("next_validations") or []):
@@ -191,6 +193,49 @@ def validate_schema(schema_name: str, instance: Any) -> list[dict[str, Any]]:
                         "message": due_err,
                     }
                 )
+        for idx, q_item in enumerate(instance.get("open_questions") or []):
+            if not isinstance(q_item, dict) or "due_date" not in q_item:
+                continue
+            due_err = writable_due_error(q_item.get("due_date"))
+            if due_err:
+                errors.append(
+                    {
+                        "code": "invalid_due",
+                        "path": f"/open_questions/{idx}/due_date",
+                        "message": due_err,
+                    }
+                )
+        for idx, cond in enumerate(instance.get("wake_conditions") or []):
+            if not isinstance(cond, dict) or cond.get("kind") != "date":
+                continue
+            params = cond.get("params") if isinstance(cond.get("params"), dict) else {}
+            date_keys = [key for key in ("date", "at", "due") if key in params]
+            # kind=date 的唤醒条件必须至少带一个非空日期键（第 3 轮 #10）：
+            # 没有日期的 date 条件到期探针永远读不到，写进来就是死条目。
+            if not date_keys or not any(
+                str(params.get(key) or "").strip() for key in date_keys
+            ):
+                errors.append(
+                    {
+                        "code": "missing_due",
+                        "path": f"/wake_conditions/{idx}/params",
+                        "message": (
+                            "kind=\"date\" 的唤醒条件必须在 params.date（兼容 params.at / params.due）"
+                            "写非空的到期时间，值为 YYYY-MM-DD 或带时区偏移的完整时刻"
+                        ),
+                    }
+                )
+                continue
+            for key in date_keys:
+                due_err = writable_due_error(params.get(key))
+                if due_err:
+                    errors.append(
+                        {
+                            "code": "invalid_due",
+                            "path": f"/wake_conditions/{idx}/params/{key}",
+                            "message": due_err,
+                        }
+                    )
     return errors
 
 
