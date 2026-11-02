@@ -8,7 +8,7 @@
 
 | 章节 | 规则摘要 | 上游真源路径 | JSON 路径 / 行号 |
 |---|---|---|---|
-| §1 角色与边界 | 基本面多头导向、不强迫看多、"暂无高 conviction"、PM 决定交易 | `/Users/everflow/Projects/dalton-research-agent-os/deploy/phase9/p9a-research-playbook-v1.json`<br>`docs/dalton/blueprint.md` | `$.investor_mandate` (L5–28)<br>§3.1 (L190–215) |
+| §1 角色与边界 | 基本面多头导向、不强迫看多、决策推导链与不参与的举证责任、PM 决定交易 | `/Users/everflow/Projects/dalton-research-agent-os/deploy/phase9/p9a-research-playbook-v1.json`<br>`docs/dalton/blueprint.md` | `$.investor_mandate` (L5–28)<br>§3.1 (L190–215) |
 | §2 与 `research-conventions` 的关系 | 6 项主题优先级对照表 | `docs/dalton/dev-guide/P0D-P1-data-and-onboarding.md` | §P1.1 (L911–921) |
 | §3 八条底线 | 数字带来源/期间/口径、模型只由证据改动、五词结论、完整空方、来源身份、先量化异动、只写重要变化、诚实边界 | `docs/dalton/blueprint.md`<br>`p9a-research-playbook-v1.json` | §3.1 (L190–215)<br>`$.non_negotiables` (L29–42) |
 | §4 按任务找参考 | 任务到 `references/*.md` 的路由表 | `docs/dalton/dev-guide/P0D-P1-data-and-onboarding.md` | §P1.1 (L899–905) |
@@ -68,7 +68,7 @@
 
 | 文件与章节 | 规则摘要 | 上游真源路径 | JSON 路径 / 行号 |
 |---|---|---|---|
-| `risk-reward.md` §1–§5 | 四类机会回报标准（Compounder 3–5yr 3–5x、周期反转、价值 6–12m +50%、做空 3–6m -30%）、三情景 IRR、仓位词汇、暂无高 conviction、PM 决定交易 | `p9a-research-playbook-v1.json`<br>`company-deepdive-mx-0911/SKILL.md`<br>`manual/research-process.md` | `$.risk_reward_standards` (L251–274)<br>L55–59<br>L25 |
+| `risk-reward.md` §1–§6 | 四类机会标签（3–5x / +50% / -30% 等仅为标签）与统一回报门槛、三情景 IRR 与所需胜率算法、仓位词汇、不参与的举证责任、conviction 上限与三层保护硬规则、PM 决定交易 | `p9a-research-playbook-v1.json`<br>`company-deepdive-mx-0911/SKILL.md`<br>`manual/research-process.md` | `$.risk_reward_standards` (L251–274)<br>L55–59<br>L25 |
 | `event-verdicts.md` §1–§5 | 五词结论正式词形与中文标签、事件 5 要素、Priced in 与催化剂耗尽、5 类错误归因、无变化不推送 | `p9a-research-playbook-v1.json`<br>`docs/dalton/dev-guide/P0D-P1-data-and-onboarding.md` | `$.stages[5]` (L178–195), `$.decision_vocabulary.event_verdicts` (L396–415)<br>§P1.1 (L940) |
 | `event-verdicts.md` §6 | 股价异动先量化同组与 ETF 剥离 Beta/Alpha，再按四级顺序查因 | `~/.openclaw/workspace/skills/stock-move-analyzer/SKILL.md` | L1–95 |
 | `writing.md` §1–§6 | 判断先行（≤3 句）、段落四步法、正向改写警告、引用格式与期间、中文交付与禁用词表、"相当于" vs "占"、区间"至"、金额 USD/美元、一句话收尾 | `bullbear-discussion/references/common_task.md`<br>`bullbear-discussion/SKILL.md`<br>`company-deepdive-mx-0911/references/writing_guide.md`<br>`company-deepdive-mx-0911/references/common_rules.md` | §0.1 (L15–24)<br>L13, L56<br>L5–13, L103<br>L56 |

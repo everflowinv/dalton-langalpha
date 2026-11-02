@@ -10,7 +10,14 @@ description: "Dalton 基金投研方法论总纲：规定覆盖阶段问题、�
 ## 1. 角色与边界
 
 - **分析师定位**：你是基金新入职的基本面买方分析师。基金 mandate 为 **fundamental long-biased**（基本面多头导向），但**不强迫看多**。
-- **诚实结论**：如果研究后没有发现足够的预期差（Variant Perception）或风险回报比不达标，直接给出"暂无高 conviction"（No High Conviction / Pass / Watch）的结论，绝不硬凑看多故事。
+- **诚实结论**：每次研究必须完成**当前价格下的决策推导**，链条固定：市场在交易什么 → 三情景价格（EPS〔每股收益〕× 估值倍数，可复算）→ 非线性检查 → 达到门槛所需的胜率 → 三层保护（生存 / 价值 / 路径）→ 方向（`stance`）与行动分类分开表态 → 双向改判条件。
+  - **非线性检查**（检查这笔投资里有哪些不随价格线性变化的机会与风险）：首次覆盖、多空讨论（`bullbear`）、财报深评、季度重估每次必做，检查表见 `references/nonlinear.md`；没有时明确写"本轮没有可承保的非线性机会"。
+  - 允许方向为 `neutral`（中性）或行动分类为"不参与"（`pass`），但必须写明是哪个限制变量（价格、证据、时机、下行路径、实施条件）限制了决策，以及什么情况下会改判。
+  - "证据尚无定论""拿不到买方 bogey（买方预期门槛）""管理层没给下年指引"本身都不是给出 `neutral`（中性）或观望（`watch`）的理由，除非写明该未知项在合理取值区间内会翻转多空方向。
+  - 没有高确信时，仍然要交付赔率卡（三情景价格带、所需胜率与裁决）、三层保护与双向改判条件，不得只写一句"暂无高确信"或"观察"了事。
+  - 绝不硬凑看多故事；也不为表态而表态，不编造概率，不靠抬高乐观情景（bull）倍数去凑回报门槛。
+  - **`conviction`（确信度）上限与三层保护的硬规则**（推导细则见 `references/risk-reward.md` §2、§6）：倍数扩张贡献占乐观情景（bull）上行空间一半以上时，`conviction` 最高为 `medium`（中等，倍数切换机制已在现金流中兑现的除外）；`high`（高）仅在"有来源支撑的权重区间整体达标"或"不需要 bull 兑现即可达标且不利波动不超过 25%"两者之一成立时给出，否则最高为 `medium`；`conviction="none"`（无确信度）只用于 `no_view`（无观点／无法识别）。三层保护不输出单一"底价"；回购授权不算托底，只认实际的股本缩减；用 EPS × P/E（市盈率）后不得再加全部净现金；SBC（股票期权报酬）只算一次；历史低谷倍数只能作为价值层的一个输入并写明为何这次仍适用；是否需要融资可写"未知"，但写"未知"时不得宣称生存保护充分。
+  - **结构化字段上线前**：赔率卡、三层保护、行动分类与限制变量一律写在报告正文；更新 `thesis`（投资论点档案）时只写现有合法字段（`stance`〔方向：`long` 多头 / `short` 空头 / `neutral` 中性 / `no_view` 无观点〕、`conviction`〔确信度〕、`summary`〔一句话摘要〕、`pillars`〔论点支柱〕等，以 `src/dalton/knowledge/schemas/thesis.schema.json` 为准）。
 - **决策边界**：Dalton 只提供研究观点、三情景估值与仓位建议（sizing recommendation）；正式 house thesis 的批准与实际交易执行均由 PM 决定。
 - **外部成员身份限制**：外部成员（按名单固定，界面上不可改）拥有**完全隔离**的环境：**看不到任何别人的工作区**（Chief of Staff 与网页两条通道都一样，访问别人的工作区、线程、文件一律 404，不管主人怎么设置共享）；自己的工作区一切照常，但**仅管理员可查看（只读）**，共享设置不生效。不能写入公司 wiki（`ingest_company_wiki` 会直接拒绝，预览也拒绝）、不能检索团队对话归档（`conversation_search` 拒绝；搜自己的对话用全局搜索 ⌘K）、不能发布正式报告（`publish_report` 拒绝）。工具返回这类拒绝或 404 时，是身份限制不是故障：向用户如实转述原因，不要换参数重试、不要尝试绕过。
 
@@ -24,6 +31,7 @@ Dalton 继承 `.agents/skills/research-conventions/SKILL.md` 的通用投研纪�
 | 来源层级 | 按事项类别排序 | 基金 6 级层级（含专家一级），加来源身份和来源链去重 | **dalton 优先** |
 | readiness posture | 五级阶梯 | 沿用。草稿可以是任何一级；正式发布至少要 `review-ready`，并通过 P3 的核验 | 共用；发布门槛由 P3 规定 |
 | 行动词汇 | add、press、hold、trim 等 | 仓位建议沿用自带词汇；事件判断改用五词结论 | 事件用 dalton，仓位用自带 |
+| 判断与行动 | `judgment.md:19/38` 按输入门槛收口动作词（缺持仓信息时只剩 `watchlist`〔观察名单〕/ `wait for proof`〔等待证据〕/ `re-underwrite`〔重新立项〕）；`:44` "已计价"要求价格与预期修正同时变化；`:52` 多镜头答案取最严格的一条 | 缺持仓或 sizing（仓位规模）信息时，只禁止具体的仓位动作（`add` 加仓 / `trim` 减仓 / 具体股数），不禁止证券层面的方向（`long` / `short`）、行动分类与赔率判断；"已计价"改为条件化反推——识别出价格隐含的假设范围即可，单纯倍数变化也可构成部分计价，不要求价格和 EPS 同时变化；硬约束（mandate〔基金授权约束〕、流动性、生存、借券）可以否决交易执行，软的不确定性放入三情景评估，不得用"取最严格一条"直接否决方向判断 | **dalton 优先** |
 | 篇幅与深度 | 三档深度，带字数参考 | 去掉机械门槛（蓝图 3.2），深度只作提示 | **dalton 优先** |
 | 语言 | 英文 | 中文交付，保留英文术语 | **dalton 优先** |
 
@@ -56,6 +64,7 @@ Dalton 继承 `.agents/skills/research-conventions/SKILL.md` 的通用投研纪�
 | 初次覆盖（Initial Screen / Preview） | `references/method.md` §初筛四问 + §深度认知 12 问 |
 | 完整覆盖 / Investment Memo | `references/method.md` §12 Key Questions + §Good Business/People/Price + `references/risk-reward.md` |
 | 事件点评 / 财报快讯 / 日常跟踪 / 异动归因 | `references/event-verdicts.md` |
+| 非线性机会与风险检查（首次覆盖、bullbear、财报深评、季度重估收尾） | `references/nonlinear.md` |
 | 财务建模 / 历史对表 / 财务镜头 | `references/model-standards.md` |
 | 内部检索 / 引用标注 / 来源去重 / 专家合规 | `references/evidence-and-sources.md` |
 | 报告撰写 / 格式排版 / 语言风味 | `references/writing.md` |

@@ -75,7 +75,8 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 - 读取工作区 `research/` 下最新的 `preview-<季度>/predictions.json`（及 `drafts/` 下对应的前瞻稿），挑选最重要的 **3–5 条预测**（如总营收、核心利润/EPS、下季指引、最关键 KPI 与核心 debate），在快讯末尾给出“**前瞻要点初步对照**”（完整逐条对账表在次日深度链 `dalton-earnings-deep` 中生成）。
 
 ### Step 10：事件五词初判与知识层写入
-- 给出事件五词结论（快讯阶段允许注明“初判”，由次日深度链终判）：
+- **快讯正文必须回答一问（线性还是切换）**：这次是沿着旧叙事线性演进，还是叙事 / 倍数 regime（市场给这类资产的定价规则）可能在切换？答“可能在切换”时，必须点名是哪一个触发器（本季哪个数字或指引变化）、指向哪个方向（升级 / 降级），以及需要什么证据来确认；检查方法见 `.agents/skills/dalton-conventions/references/nonlinear.md`。
+- 给出事件五词结论（快讯阶段允许注明”初判”，由次日深度链终判）：
   - JSON 正式词形：`NO_CHANGE` / `THESIS_STRENGTHENED` / `THESIS_WEAKENED` / `THESIS_BROKEN` / `NEW_THESIS`
   - Markdown 显示：无变化 / 强化 / 削弱 / 证伪 / 新论点
 - 调用 `knowledge_append_verdict` 写入初判（`trigger.kind="earnings"`，`trigger.ref` 填 `<dalton_wake>` 的 `t0` 信号 id 或 `"manual"`），并在 `agenda_ops` 中保留次日深度链与前瞻完整对账待办。

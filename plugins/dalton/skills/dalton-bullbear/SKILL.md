@@ -17,12 +17,13 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ## 一、对话快速版流程（默认，主智能体直接执行）
 
-> **速度原则**：快速版的价值在速度与判断锐度。不要在快速版里跑 `fincheck.py` 和股东回报支线。
+> **速度原则**：快速版的价值在速度与判断锐度，与 `bullbear-doc` 完整成稿明确拉开详略——正文控制在约 30 行内，每段只给判断与关键数字，论证细节留给完整成稿。不要在快速版里跑 `fincheck.py` 和股东回报支线。
 
 1. **读基金方法论与公司知识层**
    - 读 `.agents/skills/dalton-conventions/SKILL.md`。
    - 按 `.agents/skills/dalton-knowledge/SKILL.md` 读序读取当前工作区的 `agent.md`、`thesis.md`、`debate.md`、`drivers.md`。
    - 若已有历史 `debate.md`，本轮以**增量更新与对比**为主：重点核查哪些 debate 的倾向或置信度发生了变化、原因是什么（新证据 vs 已 price in），禁止忽略旧结论直接覆盖。
+   - **首次覆盖时执行叙事收敛（全列 → 删减 → 下挖底层驱动）**：初次覆盖一家公司、知识层尚无 `debate`（分歧档案）时，先把市场上流传的叙事**全部列出**（不加筛选，含互相矛盾的说法）；再**删减到 2–3 个可研究、真正决定价值的驱动变量（driver）**，逐条写明删除理由；每个驱动变量再**往下挖一层底层驱动**，写明观察指标与数据来源。收敛结果作为本轮"主要分歧"段的输入，并写入知识层 `debate` 与 `drivers`（驱动变量档案）初稿；后续季度重估只做增量更新，不再重跑全量收敛。
 
 2. **一致预期与隐含费用空间**
    - 在 PTC（`execute_code`）中先调一次 `researchdata.catalog()`，再调 `researchdata.finance(route="estimates", ticker=T)`，获取本财年（`0y`）与下一财年（`+1y`）EPS、收入一致预期、7/30/90 天 EPS 修正轨迹、近 30 天上调/下调次数，以及近 4 次财报次日涨跌。
@@ -48,19 +49,20 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 5. **一手指引与公告核对**
    - 美股用 `dalton_sec.list_filings` 与 `researchdata.finance(route="sec")` 核对最新 8-K / 10-Q / 10-K 的业绩指引原文与电话会纪要，记录 accession 与期间；港股与 A 股调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)`（查不到，或者需要仅英文版的公告时，再用 `web_search` 查 `site:hkexnews.hk`）核对最新定期报告与业绩公告原文（`operation="ask"` 平台财务表仅作二手初值，核心财务数字回公告核实，回报核对复权、分红、拆股与币种）。分析师提问中提及但管理层未确认的数字，标为“分析师提问口径，管理层未确认”。
 
-6. **按固定结构在对话中回复**（除非 PM 要求写文件，否则直接在对话输出）：
+6. **按固定七段结构在对话中回复**（除非 PM 要求写文件，否则直接在对话中输出；结构化字段上线前，情景与赔率内容只写在对话回复或报告正文中，更新 `thesis`〔投资论点档案〕时只写现有合法字段，见 `dalton-conventions/SKILL.md` §1）：
 
 ```markdown
-**结论**：修正方向（上修/下修/持平）、财报风险方向（偏上行/偏下行/中性）、置信度（高/中/低）——一句话给立场与核心依据
-**多空在争什么（估值之外）**：2–4 个 debate，每个一行：分歧变量｜Bull 怎么看（带来源）｜Bear 怎么看（带来源）｜我的倾向与置信度（若与上一版不同，写明变化原因）
-**盈利预测修正三层**：收入｜费用/capex 或利润率｜一次性项目（按对 EPS 影响排序）；附隐含费用空间与敏感度（`[假设] 卖方费用比一致预期隐含空间多 X，对应 EPS 少 Y`）
-**3–6 个月催化剂**（按时间排）：事件｜日期或窗口｜检验哪个 debate｜bull/bear 兑现阈值
-**改判条件**：什么可观测证据或数字出现我会换边
-**来源**：每类来源（内部库四路由 / AlphaEngine / SEC filing / 一致预期）命中与实际使用数；本轮未取得的写明原因（无相关结果 / 渠道失败 / 未覆盖）
+**结论**：`stance`（方向：`long` 多头 / `short` 空头 / `neutral` 中性 / `no_view` 无观点）｜`conviction`（确信度：高 / 中 / 低 / 无〔仅 `no_view`〕）｜行动分类（现在可以动手 / 等价格〔附买点价带〕/ 等证据〔附带期限的待验证事件〕/ 不参与）与限制变量（无〔仅"现在可以动手"〕/ 价格 / 证据 / 时机 / 下行路径 / 实施条件）——一句话给立场与核心依据
+**市场叙事与预期门槛**（3–5 行要点）：市场在交易什么；Street（卖方一致预期）/ 买方（bogey〔买方预期门槛〕/ whisper〔财报前的耳语预期〕）/ House（我们的判断）各自的门槛数字与口径（口径一致才比较；拿不到买方 bogey 写明原因，不因此压低 conviction〔确信度〕）；附 7/30/90 天修正轨迹与隐含费用空间（流程第 2 步产出）
+**主要分歧**（聚焦 2–3 个 debate，每个一行）：分歧变量｜传导路径（仅 EPS / 仅倍数 / 两者）｜Bull 怎么看（带来源）｜Bear 怎么看（带来源）｜我的倾向与置信度（若与上一版不同，写明变化原因）
+**赔率卡**：三情景（bear 悲观 / base 基准 / bull 乐观）EPS × 倍数 = 价格带（单个价带宽度 `(hi−lo)/mid`〔（上沿−下沿）÷中点〕≤ 25%，三档中点严格递增，主判定取价带中点）＋ 所需胜率与裁决——按 `.agents/skills/dalton-conventions/references/risk-reward.md` §2 第 4 条计算（base 测试权重固定 25% / 50% 两行，注明"测试权重，不是预测"；多头算所需 bull 概率 `u_req(b)`、空头算所需 bear 概率 `d_req(b)`），裁决四选一（明显高于 / 接近 / 低于 / 无法判断），并写明方向、所用权重行与依据的分歧；不编造概率点值
+**三层保护与失效条件**：生存（资金链 / 融资需求）｜价值（机制与区间）｜路径（跌到价值区之间会发生什么），各一句，并写明保护在什么条件下失效；遵守 `risk-reward.md` §6 的硬规则——不输出单一"底价"、回购授权不算托底（只认实际股本缩减）、EPS × 倍数后不得再加全部净现金、SBC（股票期权报酬）只算一次、历史低谷倍数只作价值层输入并写明为何仍适用、融资需求可写"未知"但写未知不得宣称生存保护充分
+**非线性四问**（检查表见 `.agents/skills/dalton-conventions/references/nonlinear.md`）：倍数 regime（市场给这类资产的定价规则）变了吗｜driver（驱动变量）有没有非线性或凸性（斜率随变量增大而加大，或阈值 / 期权性质）机会｜拥挤持仓 + 催化剂怎么组合｜有没有反身性（股价反过来改变公司行为）——无信号时一行写明"本轮没有可承保的非线性机会"
+**投委会四问（含双向改判条件）、默认前提自检与来源**：投委会四问（每问 1–2 句）——① 什么在改变客户行为和公司的经济性？② 为什么这个解释比竞争解释更可信？③ 市场在哪个环节判断错了？④ 看到什么我会认错（双向改判条件：看到什么可观测证据或数字会升级 / 加仓或回补，看到什么会降级 / 减仓或加空，各至少一条）；默认前提自检——结论是否仅靠"默认会复苏 / 默认管理层会兑现 / 默认政策会好转 / 默认利润率会回到历史水平 / 默认新业务会成功"支撑，若是则降为低确信或补齐证据；来源——每类来源（内部库四路由 / AlphaEngine / SEC 公告 / 一致预期）命中与实际使用数，本轮未取得的写明原因（无相关结果 / 渠道失败 / 未覆盖）
 ```
 
 7. **收尾：写知识层并询问是否转成稿**
-   - 按下方“三、知识层写入与发布规则”更新 `debate`、`drivers` 并追加 `verdict`。
+   - 按下方"三、知识层写入与发布规则"更新 `thesis`（快速版必做）、`debate`、`drivers` 并追加 `verdict`。
    - 询问 PM 是否需要跑 `bullbear-doc` 生成包含独立股东回报支线与 XBRL 财务体检的 v4.2 完整成稿。
 
 ---
@@ -110,9 +112,9 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 3. **主智能体核查与收尾**
    - 检查 `drafts/<as_of>-bullbear.md` 是否存在，运行 `python .agents/skills/dalton-bullbear/scripts/bb_check.py drafts/<as_of>-bullbear.md` 确认 0 WARN。确认文末 `## 引用` 表存在且每个 `[引用N]` / `[回报引用N]` 都能在表里找到（每行合并写出核验目标与括号内来源说明，形如 `[引用1]: evidence:E-20261023-01 （行情｜Yahoo Finance｜价格与一致预期快照｜{DATE}｜data/consensus/...）`）。
    - 可选调用 `check_draft(draft_path="drafts/<as_of>-bullbear.md")` 查看数字核验反馈（草稿期不阻断）。
-   - 执行下方知识层写入（第三节第 1–3 步）。
+   - 执行下方知识层写入（第三节第 1–4 步）。
    - **汇报完成前必须过完成契约**：调用 `dalton_check_done(workflow="bullbear-doc", run_id=<`research/<as_of>-bullbear/.progress.json` 里的 run_id>, params={"ticker": "<TICKER>", "workspace_dir": "<当前工作区路径>", "as_of": "<as_of>"})`（走手动降级路径、没有 run 时不传 `run_id`，调用 `dalton_check_done(workflow="bullbear-doc", params={"ticker": "<TICKER>", "workspace_dir": "<当前工作区路径>", "as_of": "<as_of>", "manual": true})`，审稿结论按 `research/<as_of>-bullbear/review.json` 核对）；`done=false` 时按 `missing` 先补齐再查（缺文件补文件、`bb_check` 修到 0 WARN、知识层缺 source=tool 新版本就 `knowledge_update`、check_draft 用了旧草稿就对最终稿重跑），补不了的缺项只能汇报"未完成"并列出缺项，不得汇报"完成"。
-   - 完成契约通过后，向 PM 汇报核心判断、各 Debate 倾向变化及审稿结论；如需正式发布，按第三节第 4 步执行。
+   - 完成契约通过后，向 PM 汇报核心判断、各 Debate 倾向变化及审稿结论；如需正式发布，按第三节第 5 步执行。
 
 ---
 
@@ -120,19 +122,24 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 无论快速版还是完整成稿，结束时均由主智能体按 `.agents/skills/dalton-knowledge/SKILL.md` 与 `.agents/skills/dalton-agenda/SKILL.md` 写入知识层（子智能体无 `knowledge_*` 工具）：
 
-1. **`knowledge_update(doc="debate")`**
+1. **`knowledge_update(doc="thesis")`**（快速版与完整成稿收尾均必做；只写 `src/dalton/knowledge/schemas/thesis.schema.json` 当前已上线的合法字段）
+   - 必填字段：`house_view.stance`（方向：`long` 多头 / `short` 空头 / `neutral` 中性 / `no_view` 无观点四选一；`pass` 不是 `stance` 的取值）、`house_view.conviction`（确信度：`high` 高 / `medium` 中 / `low` 低 / `none` 无，`none` 仅用于 `no_view`）、`house_view.summary`（一句话方向结论与核心理由）、`house_view.updated_at`（更新时间）；可选字段：`house_view.horizon_months`（期限月数，1–60）、`house_view.variant_perception`（预期差：我们和市场哪里不同）与 `house_view.position_suggestion`（建议仓位档位枚举）。
+   - 市场叙事可另写 `market_view.summary`（市场观点摘要）。
+   - **结构化字段上线前，赔率卡、三层保护、行动分类与限制变量一律不写入 `thesis`**，只留在对话回复或报告正文；`house_view.target`（目标价）只在指向模型单元格时使用。`conviction`（确信度）的上限遵守 `dalton-conventions/references/risk-reward.md` §6。
+
+2. **`knowledge_update(doc="debate")`**
    - 每个 Debate 写入一条结构化记录：分歧变量、多方论据（Bull）、空方论据（Bear）、双方最强反驳、我的判断（立场与置信度）、依赖假设、改判条件、来源引用。
    - 若某条 Debate 的倾向或置信度相比旧版发生变化，使用 `set` 操作更新并在 `reason` 中写明变化原因（服务端自动在 `debates[].history` 保留旧值与原因）。
 
-2. **`knowledge_update(doc="drivers")`**
+3. **`knowledge_update(doc="drivers")`**
    - 将 §4（Earnings revision map）识别出的核心驱动变量与 EPS/收入敏感度、§5（Catalyst & KPI）的 3–5 个跟踪 KPI 及 bull/bear 区间写入 `drivers`（新读数用 `append`）。
 
-3. **`knowledge_append_verdict`**
+4. **`knowledge_append_verdict`**
    - `trigger.kind`：PM 发起填 `"manual"`，议程触发填 `"agenda"`。
    - `verdict`：对照上一版 debate 与 thesis 给出正式五词结论之一（`NO_CHANGE` / `THESIS_STRENGTHENED` / `THESIS_WEAKENED` / `THESIS_BROKEN` / `NEW_THESIS`）。
    - `agenda_ops`：把 §5 的催化剂写入 `watch.events`，把改判条件写入 `next_validations`。
 
-4. **发布（`publish_report`）**
+5. **发布（`publish_report`）**
    - 对话快速版不发布。
    - 完整成稿默认保存在 `drafts/<as_of>-bullbear.md`；当 PM 要求正式发布时，调用 `publish_report(draft_path="drafts/<as_of>-bullbear.md", title="...", kind="bullbear", slug="...")`。
 

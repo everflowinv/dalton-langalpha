@@ -87,6 +87,7 @@ python3 .agents/skills/dalton-thesis-delta/scripts/collect.py collect \
 
 #### 分支 A：存在重要变化（`material=yes`）
 1. **撰写增量笔记**：按 `.agents/skills/dalton-thesis-delta/templates/delta.md` 写入 `research/<YYYY-MM-DD>-delta.md`（日期统一用**美东业务日**——本轮运行开始时的美东日历日，与 `dalton_check_done` 口径一致；自动唤醒常在美东前一天晚间启动，此时不要用 UTC/北京日期命名）（写清变化是什么、一手与卖方证据、影响哪个 thesis 支柱或 debate、事件五词结论、下一项验证）。
+   - **笔记正文必须回答一问（线性还是切换）**：这次是沿着旧叙事线性演进，还是叙事 / 倍数 regime（市场给这类资产的定价规则）可能在切换？答"可能在切换"时，必须点名是哪一个触发器、指向哪个方向（升级 / 降级），以及需要什么证据来确认（检查方法见 `.agents/skills/dalton-conventions/references/nonlinear.md`；结构化字段上线前写在正文）。
 2. **更新知识层**：调用 `knowledge_update` 更新受影响的文档（`thesis` / `debate` / `drivers` / `management`）。
 3. **追加事件结论**：调用 `knowledge_append_verdict` 写入五词结论（`THESIS_STRENGTHENED` / `THESIS_WEAKENED` / `THESIS_BROKEN` / `NEW_THESIS` 或有实质新证据但维持原判的 `NO_CHANGE` + `progress="some"`（彻底解答问题时填 `"resolved"`）；`trigger.kind` 按第 1 步对照表与变化主要来源填 `consensus_change`、`internal_material`、`filing`、`earnings`、`indicator`、`price_move`、`due_validation`、`pm_question`、`agenda` 或 `manual`，`trigger.ref` 填 `<dalton_wake>` 信号 id）。
 4. **回复摘要**：最后一条回复写不超过 10 行的精炼中文摘要（delta 任务不发私信推送，PM 在对话里看到它；判断先行：五词结论 + 变化核心事实与带期间数字 + 受影响的支柱/Debate + 下一项验证）。
