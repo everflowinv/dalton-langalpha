@@ -8,10 +8,14 @@ move_quant.py — 股价异动统一量化脚本（PS.10）
 3. 同组收益 = 同组（不含目标）窗口收益的中位数；
    超额 vs 同组 = 目标窗口收益 - 同组中位数；
    超额 vs 板块 ETF = 目标窗口收益 - ETF 窗口收益。
+   没有真实同业时 peers 为空（绝不把板块 ETF 冒充同组）：peer_median 与超额 vs 同组为
+   null，σ、z 值与分类改用同一个板块 ETF 基准（输出 benchmark=sector_etf；盘中连 ETF
+   数据都没有时退到指数期货，benchmark=futures）。
 4. 日超额 = 目标日收益 - 同组日收益中位数；
    σ = 窗口起点前 60 个交易日日超额的标准差（有效样本 > 20 才计算）；
    day_z = 最后一日超额 / σ；
    window_z = 窗口超额 / (σ * sqrt(窗口交易日数))。
+   （无真实同业时日超额、σ 与 z 值同样按上述 benchmark 口径，不与同业口径混用。）
 5. 量比 (volume_vs_adtv) = 当日成交量 / 前 20 日均量（不含当日）。
 6. 判定 (assessment)：
    - sector_beta：当且仅当 |窗口超额| < 3.0pp 且 |窗口 z| < 1.5
@@ -27,7 +31,7 @@ import json
 import math
 import re
 import sys
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -236,32 +240,53 @@ def resolve_peers_and_etf(
     explicit_peers: str | None = None,
     explicit_etf: str | None = None,
     coverage_path: str | None = None,
-) -> tuple[list[str], str]:
-    """按 PS.10 优先级确定同组代码列表与板块 ETF。"""
+) -> tuple[list[str], str, str]:
+    """按 PS.10 优先级确定同组代码列表与板块 ETF。
+
+    返回 (peers, etf, peer_source)。没有真实同业时 peers 为空列表——板块 ETF 只作
+    基准，绝不冒充同组——peer_source 为 "none"；否则 peer_source 记实际生效的一级：
+    explicit（--peers）> coverage（coverage.yaml）> default_map（内置表）。
+    """
     t = ticker.upper().strip()
     peers: list[str] = []
+    peer_source = "none"
     etf: str | None = explicit_etf.upper().strip() if explicit_etf else None
 
     if explicit_peers:
-        peers = [p.strip().upper() for p in explicit_peers.split(",") if p.strip() and p.strip().upper() != t]
+        explicit_list = [
+            p.strip().upper()
+            for p in explicit_peers.split(",")
+            if p.strip() and p.strip().upper() != t
+        ]
+        if explicit_list:
+            peers = explicit_list
+            peer_source = "explicit"
 
     companies = load_coverage_yaml(coverage_path)
     if companies and (not peers or not etf):
         entry = next((c for c in companies if str(c.get("ticker", "")).upper() == t), None)
         if entry:
             if not peers:
+                cov_peers: list[str] = []
                 raw_peers = entry.get("peers") or []
                 if isinstance(raw_peers, list) and raw_peers:
-                    peers = [str(p).upper() for p in raw_peers if str(p).upper() != t and str(p).upper() not in PRIVATE_TICKERS]
+                    cov_peers = [
+                        str(p).upper()
+                        for p in raw_peers
+                        if str(p).upper() != t and str(p).upper() not in PRIVATE_TICKERS
+                    ]
                 elif entry.get("peer_group"):
                     pg = entry["peer_group"]
-                    peers = [
+                    cov_peers = [
                         str(c["ticker"]).upper()
                         for c in companies
                         if c.get("peer_group") == pg
                         and str(c.get("ticker", "")).upper() != t
                         and str(c.get("ticker", "")).upper() not in PRIVATE_TICKERS
                     ]
+                if cov_peers:
+                    peers = cov_peers
+                    peer_source = "coverage"
             if not etf:
                 raw_etfs = entry.get("etfs") or []
                 if isinstance(raw_etfs, list) and raw_etfs:
@@ -271,28 +296,25 @@ def resolve_peers_and_etf(
                     etf = GROUP_ETF_MAP.get(pg)
 
     if not peers:
-        peers = [p for p in DEFAULT_PEER_MAP.get(t, []) if p != t and p not in PRIVATE_TICKERS]
+        default_peers = [p for p in DEFAULT_PEER_MAP.get(t, []) if p != t and p not in PRIVATE_TICKERS]
+        if default_peers:
+            peers = default_peers
+            peer_source = "default_map"
 
-    if not etf or not peers:
+    if not etf:
         try:
             import yfinance as yf  # type: ignore
             info = yf.Ticker(t).info or {}
             sector = info.get("sector", "")
             industry = info.get("industry", "")
-            if not etf:
-                if "Semiconductor" in industry:
-                    etf = "SMH"
-                else:
-                    etf = SECTOR_ETF_MAP.get(sector, "QQQ" if t in DEFAULT_PEER_MAP else "SPY")
-            if not peers:
-                peers = [etf]
+            if "Semiconductor" in industry:
+                etf = "SMH"
+            else:
+                etf = SECTOR_ETF_MAP.get(sector, "QQQ" if t in DEFAULT_PEER_MAP else "SPY")
         except Exception:
-            if not etf:
-                etf = "QQQ" if t in DEFAULT_PEER_MAP else "SPY"
-            if not peers:
-                peers = [etf]
+            etf = "QQQ" if t in DEFAULT_PEER_MAP else "SPY"
 
-    return peers, (etf or "SPY")
+    return peers, (etf or "SPY"), peer_source
 
 
 def classify_move(alpha_vs_peers_pp: float | None, window_z: float | None) -> str:
@@ -364,6 +386,7 @@ def compute_quant_from_frames(
     window_str: str = "1d",
     end_override: str | None = None,
     require_end_bar: bool = False,
+    peer_source: str | None = None,
 ) -> dict[str, Any]:
     """
     核心计算函数（可对真实 yfinance DataFrame 或测试 DataFrame 执行）。
@@ -515,11 +538,27 @@ def compute_quant_from_frames(
         peer_daily_med = rets_pct_df[valid_peer_syms].median(axis=1)
     elif sector_etf and sector_etf in rets_pct_df.columns:
         peer_daily_med = rets_pct_df[sector_etf]
-        warnings_list.append(f"无有效同组成份股，日超额回退使用板块 ETF ({sector_etf}) 计算")
     else:
         peer_daily_med = pd.Series(dtype=float)
 
     daily_excess = (t_daily_ret - peer_daily_med.reindex(t_daily_ret.index)).dropna()
+
+    # 基准口径：有真实同业参与计算时一律用同组；没有时统一退到板块 ETF，
+    # 绝不把 ETF 冒充同组——peer_median / alpha_vs_peers 保持 null，
+    # σ、z 值与分类全部按同一个基准计算，避免两种口径混用。
+    if valid_peer_syms:
+        benchmark = "peers"
+        benchmark_excess = alpha_vs_peers
+    elif etf_change is not None or (sector_etf is not None and sector_etf in rets_pct_df.columns):
+        benchmark = "sector_etf"
+        benchmark_excess = alpha_vs_sector
+        warnings_list.append(
+            f"无同组公司数据，本次只和板块 ETF（{sector_etf}）比较，不能作同组归因；"
+            f"需要同组对比时，用 --peers 指定同组代码后重跑"
+        )
+    else:
+        benchmark = None
+        benchmark_excess = None
 
     # 窗口起点前 60 个交易日日超额的标准差 σ（样本 > 20 才算）
     hist_excess = daily_excess[daily_excess.index <= base_idx].tail(HIST_LOOKBACK_DAYS)
@@ -547,7 +586,10 @@ def compute_quant_from_frames(
             "date": d_idx.strftime("%Y-%m-%d"),
             "close": round(d_close, 2) if d_close is not None else None,
             "change_pct": round(d_ret, 2) if d_ret is not None else None,
-            "peer_median_pct": round(d_peer, 2) if d_peer is not None else None,
+            # d_peer 在无真实同业时是 ETF 日收益：逐日 peer_median_pct 置 null（顶层
+            # 口径一致），基准日收益统一记在 benchmark_pct（有同业时两者同值）。
+            "peer_median_pct": round(d_peer, 2) if (d_peer is not None and valid_peer_syms) else None,
+            "benchmark_pct": round(d_peer, 2) if d_peer is not None else None,
             "excess_pct": round(d_exc, 2) if d_exc is not None else None,
             "day_z": round(d_z, 2) if d_z is not None else None,
             "volume": d_vol,
@@ -556,10 +598,10 @@ def compute_quant_from_frames(
 
     last_day_z = daily_breakdown[-1]["day_z"] if daily_breakdown else None
     window_z: float | None = None
-    if alpha_vs_peers is not None and sigma_60d and n_win_days >= 1:
-        window_z = alpha_vs_peers / (sigma_60d * math.sqrt(n_win_days))
+    if benchmark_excess is not None and sigma_60d and n_win_days >= 1:
+        window_z = benchmark_excess / (sigma_60d * math.sqrt(n_win_days))
 
-    assessment = classify_move(alpha_vs_peers, window_z)
+    assessment = classify_move(benchmark_excess, window_z)
 
     return {
         "ok": True,
@@ -577,7 +619,10 @@ def compute_quant_from_frames(
         "volume_vs_adtv": round(vol_vs_adtv, 2) if vol_vs_adtv is not None else None,
         "daily": daily_breakdown,
         "peers": peer_rows,
+        "peers_used": valid_peer_syms,
+        "peer_source": peer_source,
         "peer_median": round(peer_median, 2) if peer_median is not None else None,
+        "benchmark": benchmark,
         "sector_etf": sector_etf,
         "etf_change": round(etf_change, 2) if etf_change is not None else None,
         "alpha_vs_peers": round(alpha_vs_peers, 2) if alpha_vs_peers is not None else None,
@@ -588,6 +633,7 @@ def compute_quant_from_frames(
         "assessment": assessment,
         "data_ok": data_ok,
         "warnings": warnings_list,
+        "computed_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -698,6 +744,7 @@ def compute_session_quant_from_intraday(
     session: str = "pre",
     session_date: str | None = None,
     futures: list[str] | None = None,
+    peer_source: str | None = None,
 ) -> dict[str, Any]:
     """
     基于含盘前盘后（prepost=True）的日内分钟线计算盘前（pre）或盘后（post）异动，
@@ -928,9 +975,28 @@ def compute_session_quant_from_intraday(
     alpha_vs_sector = (target_change_pct - etf_change) if etf_change is not None else None
     alpha_vs_futures = (target_change_pct - futures_change) if futures_change is not None else None
 
-    ref_alpha = alpha_vs_peers if alpha_vs_peers is not None else (
-        alpha_vs_sector if alpha_vs_sector is not None else alpha_vs_futures
-    )
+    # 基准口径与日线一致：真实同业优先；没有同业时依次退到板块 ETF、指数期货，
+    # 并在 warnings 里写明不能作同业归因，分类只用最终选定的这一个基准。
+    if alpha_vs_peers is not None:
+        benchmark = "peers"
+        ref_alpha = alpha_vs_peers
+    elif alpha_vs_sector is not None:
+        benchmark = "sector_etf"
+        ref_alpha = alpha_vs_sector
+        warnings_list.append(
+            f"无同组公司数据，本次只和板块 ETF（{sector_etf}）比较，不能作同组归因；"
+            f"需要同组对比时，用 --peers 指定同组代码后重跑"
+        )
+    elif alpha_vs_futures is not None:
+        benchmark = "futures"
+        ref_alpha = alpha_vs_futures
+        warnings_list.append(
+            f"无同组公司数据且板块 ETF 数据缺失，本次只和指数期货（{primary_future}）比较，"
+            f"不能作同组归因；需要同组对比时，用 --peers 指定同组代码后重跑"
+        )
+    else:
+        benchmark = None
+        ref_alpha = None
     assessment = classify_move(ref_alpha, None)
 
     return {
@@ -947,7 +1013,10 @@ def compute_session_quant_from_intraday(
         "session_volume": t_info["session_volume"],
         "bar_count": t_info["bar_count"],
         "peers": peer_rows,
+        "peers_used": [r["ticker"] for r in peer_rows],
+        "peer_source": peer_source,
         "peer_median": round(peer_median, 2) if peer_median is not None else None,
+        "benchmark": benchmark,
         "sector_etf": sector_etf,
         "etf_change": round(etf_change, 2) if etf_change is not None else None,
         "futures": futures_rows,
@@ -958,6 +1027,7 @@ def compute_session_quant_from_intraday(
         "alpha_vs_futures": round(alpha_vs_futures, 2) if alpha_vs_futures is not None else None,
         "assessment": assessment,
         "warnings": warnings_list,
+        "computed_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -978,7 +1048,7 @@ def run_analyze(
 
     t = ticker.upper().strip()
     sess = (session or "regular").strip().lower()
-    peers, sector_etf = resolve_peers_and_etf(t, peers_arg, etf_arg, coverage_path)
+    peers, sector_etf, peer_source = resolve_peers_and_etf(t, peers_arg, etf_arg, coverage_path)
 
     if sess in ("pre", "post"):
         ok_sym, reason = supports_extended_session(t)
@@ -1081,6 +1151,7 @@ def run_analyze(
             session=sess,
             session_date=sess_date,
             futures=fut_syms,
+            peer_source=peer_source,
         )
 
     end_dt, start_dt, n_days, _ = parse_window_spec(window, end_override)
@@ -1138,6 +1209,7 @@ def run_analyze(
         window_str=window,
         end_override=end_override,
         require_end_bar=require_end,
+        peer_source=peer_source,
     )
 
 

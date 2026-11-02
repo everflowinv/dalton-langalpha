@@ -14497,8 +14497,11 @@ _WIKI_SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ),
     (
         "api_key_prefix",
+        # Left boundary: a real token never continues a word/slug, so a char
+        # before the prefix (letter/digit/-/_) means it is prose like
+        # "sandisk-celebrates-2026" (sk-) or "risk-management" (sk-), not a key.
         re.compile(
-            r"(?:sk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9_\-]{16,}|AIza[0-9A-Za-z\-_]{30,}|"
+            r"(?<![A-Za-z0-9_\-])(?:sk-(?:proj-|ant-|live-|test-)?[A-Za-z0-9_\-]{16,}|AIza[0-9A-Za-z\-_]{30,}|"
             r"AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|"
             r"github_pat_[A-Za-z0-9_]{20,}|xai-[A-Za-z0-9_\-]{16,}|tvly-[A-Za-z0-9_\-]{16,}|"
             r"fc-[A-Za-z0-9_\-]{16,}|xox[baprs]-[A-Za-z0-9\-]{16,})",
