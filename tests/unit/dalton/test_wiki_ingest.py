@@ -412,6 +412,42 @@ async def test_bridge_wiki_ingest_size_extension_and_full_byte_secret_validation
     assert res_preview_pdf["scan_note"] == "无法提取正文，仅做了字节扫描"
 
 
+def test_wiki_secret_api_key_prefix_needs_token_left_boundary() -> None:
+    """Prefixed-token detection needs a word boundary: public URLs like
+    `sandisk-celebrates-...` (matches `sk-`) and slugs like
+    `risk-management-framework-2026` must not be flagged, while real-shaped
+    keys — standalone, or after `key=`, a quote, or a space — still are.
+    """
+    real_shaped_keys = [
+        "sk-proj-1234567890abcdefghijklmno",
+        "sk-abcdefghij12345678",
+        "api key=sk-live-abcdefghijklmnop",
+        'config: "xai-abcdefghijklmnopqrs"',
+        "token ghp_abcdefghijklmnopqrst",
+        "github_pat_ABCDEFGHIJKLMNOPQRST_12x",
+        "AIzaSyD-1234567890abcdefghijklmnopqrstuv",
+        "AKIAIOSFODNN7EXAMPLE12",
+        "ASIAIOSFODNN7EXAMPLE12",
+        "tvly-1234567890abcdefgh",
+        "fc-1234567890abcdefgh",
+        "xoxb-1234567890abcdefgh",
+        "xoxp-1234567890abcdefgh",
+        "Source: https://vendor.example.com/docs?ref=sk-1234567890abcdefgh",
+    ]
+    for sample in real_shaped_keys:
+        assert rb._detect_wiki_ingest_secret(sample) == "api_key_prefix", sample
+
+    public_text_not_keys = [
+        "https://www.sandisk.com/company/newsroom/press-releases/2026/sandisk-celebrates-20-years-of-flash-innovation",
+        "risk-management-framework-2026",
+        "task-management-tools-comparison",
+        "See mishra-analytics-portfolio-2026-review for details",
+        "flash-memory-supply-chain-update",
+    ]
+    for sample in public_text_not_keys:
+        assert rb._detect_wiki_ingest_secret(sample) is None, sample
+
+
 # ---------------------------------------------------------------------------
 # 3. Bridge Security Fix 1: `--content @path` Host File Read Prevention
 # ---------------------------------------------------------------------------

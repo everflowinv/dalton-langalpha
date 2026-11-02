@@ -56,3 +56,5 @@
    - `Utilities` → `XLU`
    - `Basic Materials` → `XLB`
    - 其他或获取失败 → `SPY`
+
+两层兜底都找不到同组公司时，`peers` 保持为空（`peer_source="none"`），`peer_median` 与 `alpha_vs_peers` 为 `null`；`sigma_60d_pct`、`day_z`、`window_z` 与 `assessment` 改以板块 ETF 为统一基准计算（输出 `benchmark="sector_etf"`），并在 `warnings` 中提示用 `--peers` 指定同组后重跑。

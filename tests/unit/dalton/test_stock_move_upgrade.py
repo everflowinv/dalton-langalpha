@@ -1,6 +1,6 @@
 """Unit tests for stock-move attribution upgrade (DALTON-HOOK(stock-move-upgrade)).
 
-Locks three contracts:
+Locks four contracts:
 1. Extended-hours (`extended_hours=True` -> `prepost=True` / `extended=True`) pass-through
    across yfinance data source, MarketDataProvider, direct tools, and MCP servers, plus
    extended-hours chart freshness (04:00-20:00 ET).
@@ -11,6 +11,10 @@ Locks three contracts:
 3. `move_quant.py` `--session pre|post|regular` extended-hours minute-bar calculation
    (exact `< close` regular / `>= close` post boundaries, early-close calendar handling,
    date-bounded downloads, and retention-limit error) with peer/ETF/futures benchmarks.
+4. `move_quant.py` never fakes a peer group out of the sector ETF: with no real peers,
+   `peers`/`peers_used` are empty, `peer_median`/`alpha_vs_peers` are null, and sigma /
+   z-scores / assessment all ride one ETF (`benchmark="sector_etf"`) or futures
+   (`benchmark="futures"`) benchmark, with an explicit warning and `peer_source`.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ from pathlib import Path
 from unittest.mock import create_autospec, patch
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 import pytest
 import yfinance as yf
@@ -603,6 +608,269 @@ class TestMoveQuantExtendedSessions:
             assert dl_kwargs["start"] == prev_dt.isoformat()
             assert dl_kwargs["end"] == (target_dt + timedelta(days=1)).isoformat()
             assert dl_kwargs["prepost"] is True
+
+
+class TestMoveQuantPeerBenchmarkContract:
+    """No real peers -> the sector ETF is a benchmark, never a fake peer group.
+
+    Pins the production fix behind the HESAI/COHR incidents: XLY/XLK must not
+    appear as `peers` when no real peers resolve; sigma/z/assessment then all
+    ride the ETF benchmark and the output says so (`benchmark`, `peer_source`,
+    `peers_used`, `computed_at`, plus an explicit warning).
+    """
+
+    @staticmethod
+    def _make_daily_frames(last_day_rets: dict[str, float], seed: int = 11):
+        """Deterministic 75-day synthetic close/volume frames with per-symbol last-day returns."""
+        dates = pd.bdate_range("2026-06-01", periods=75)
+        cols = list(last_day_rets)
+        rets = pd.DataFrame(
+            np.random.default_rng(seed).normal(0.0004, 0.008, size=(75, len(cols))),
+            index=dates,
+            columns=cols,
+        )
+        for i, sym in enumerate(cols):
+            rets.iloc[-1, i] = last_day_rets[sym]
+        prices = 100.0 * (1.0 + rets).cumprod()
+        vols = pd.DataFrame(1_000_000, index=dates, columns=cols)
+        return prices, vols, dates
+
+    @staticmethod
+    def _e2e_download_frame(prices: pd.DataFrame, vols: pd.DataFrame) -> pd.DataFrame:
+        """Shape `yf.download(..., group_by="ticker")` returns: (ticker, field) MultiIndex."""
+        cols = pd.MultiIndex.from_product([list(prices.columns), ["Adj Close", "Close", "Volume"]])
+        raw = pd.DataFrame(index=prices.index, columns=cols, dtype=float)
+        for sym in prices.columns:
+            raw[(sym, "Adj Close")] = prices[sym].to_numpy()
+            raw[(sym, "Close")] = prices[sym].to_numpy()
+            raw[(sym, "Volume")] = vols[sym].to_numpy()
+        return raw
+
+    def test_no_real_peers_daily_rides_etf_benchmark_with_warning(self):
+        mq = _load_move_quant()
+        prices, vols, dates = self._make_daily_frames({"COHR": -0.065, "XLK": -0.005})
+
+        res = mq.compute_quant_from_frames(
+            target="COHR",
+            peers=[],
+            sector_etf="XLK",
+            adj_close_df=prices,
+            close_df=prices,
+            volume_df=vols,
+            window_str="1d",
+            end_override=dates[-1].strftime("%Y-%m-%d"),
+            require_end_bar=True,
+        )
+
+        assert res["ok"] is True
+        assert res["benchmark"] == "sector_etf"
+        assert res["peers"] == []
+        assert res["peers_used"] == []
+        assert res["peer_median"] is None
+        assert res["alpha_vs_peers"] is None
+        # One benchmark everywhere: -6.5% vs XLK -0.5% -> -6.0pp excess, sigma/z included.
+        assert abs(res["alpha_vs_sector"] - (-6.0)) < 0.05
+        assert res["assessment"] == "stock_specific"
+        assert res["sigma_60d_pct"] is not None and res["sigma_60d_pct"] > 0
+        assert res["day_z"] is not None
+        expected_window_z = res["alpha_vs_sector"] / (res["sigma_60d_pct"] * 1.0)
+        assert abs(res["window_z"] - expected_window_z) < 0.05
+        assert any(
+            "无同组公司数据" in w and "XLK" in w and "--peers" in w
+            for w in res["warnings"]
+        )
+        # 逐日明细与顶层口径一致：无同业时 peer_median_pct 为 null，
+        # 基准日收益（这里是 XLK 的日收益）记在 benchmark_pct。
+        assert all(row["peer_median_pct"] is None for row in res["daily"])
+        last_day = res["daily"][-1]
+        assert abs(last_day["benchmark_pct"] - (-0.5)) < 0.01
+        assert abs(last_day["excess_pct"] - (last_day["change_pct"] - last_day["benchmark_pct"])) < 0.02
+        datetime.fromisoformat(res["computed_at"])
+
+    def test_real_peers_keep_peer_benchmark_and_explicit_source(self):
+        mq = _load_move_quant()
+        prices, vols, dates = self._make_daily_frames(
+            {"COHR": -0.065, "LITE": -0.005, "FN": -0.005, "XLK": -0.005}
+        )
+
+        res = mq.compute_quant_from_frames(
+            target="COHR",
+            peers=["LITE", "FN"],
+            sector_etf="XLK",
+            adj_close_df=prices,
+            close_df=prices,
+            volume_df=vols,
+            window_str="1d",
+            end_override=dates[-1].strftime("%Y-%m-%d"),
+            require_end_bar=True,
+            peer_source="explicit",
+        )
+
+        assert res["ok"] is True
+        assert res["benchmark"] == "peers"
+        assert res["peer_source"] == "explicit"
+        assert set(res["peers_used"]) == {"LITE", "FN"}
+        assert abs(res["peer_median"] - (-0.5)) < 0.01
+        assert abs(res["alpha_vs_peers"] - (-6.0)) < 0.05
+        assert res["assessment"] == "stock_specific"
+        expected_window_z = res["alpha_vs_peers"] / (res["sigma_60d_pct"] * 1.0)
+        assert abs(res["window_z"] - expected_window_z) < 0.05
+        assert not any("无同组公司数据" in w for w in res["warnings"])
+        # 有同业时逐日基准就是同组中位数：peer_median_pct 与 benchmark_pct 同值。
+        last_day = res["daily"][-1]
+        assert last_day["peer_median_pct"] == last_day["benchmark_pct"]
+        assert abs(last_day["benchmark_pct"] - (-0.5)) < 0.01
+
+    def test_resolve_peers_and_etf_never_fakes_peers_from_etf(self, tmp_path):
+        mq = _load_move_quant()
+        missing_cov = str(tmp_path / "no-coverage.yaml")
+
+        peers, etf, src = mq.resolve_peers_and_etf(
+            "COHR", explicit_peers="LITE,FN", explicit_etf="SMH", coverage_path=missing_cov
+        )
+        assert (peers, etf, src) == (["LITE", "FN"], "SMH", "explicit")
+
+        # yfinance succeeds for the ETF lookup: peers stay empty, ETF never joins them.
+        with patch("yfinance.Ticker", autospec=True) as mock_ticker_cls:
+            mock_ticker_cls.return_value.info = {"sector": "Technology", "industry": "Semiconductors"}
+            peers, etf, src = mq.resolve_peers_and_etf("COHR", coverage_path=missing_cov)
+        assert peers == []
+        assert etf == "SMH"
+        assert etf not in peers
+        assert src == "none"
+
+        # yfinance raising: same contract, ETF falls back without entering peers.
+        with patch("yfinance.Ticker", autospec=True) as mock_ticker_cls:
+            mock_ticker_cls.side_effect = RuntimeError("yfinance unavailable")
+            peers, etf, src = mq.resolve_peers_and_etf("COHR", coverage_path=missing_cov)
+        assert peers == []
+        assert etf == "SPY"
+        assert etf not in peers
+        assert src == "none"
+
+        # Built-in default map still supplies real peers and its own source.
+        with patch("yfinance.Ticker", autospec=True) as mock_ticker_cls:
+            mock_ticker_cls.side_effect = RuntimeError("yfinance unavailable")
+            peers, etf, src = mq.resolve_peers_and_etf("NVDA", coverage_path=missing_cov)
+        assert peers == ["AMD", "AVGO", "MRVL", "INTC"]
+        assert etf == "QQQ"
+        assert src == "default_map"
+
+        # coverage.yaml entry wins over the default map.
+        cov = tmp_path / "coverage.yaml"
+        cov.write_text(
+            "companies:\n"
+            "  - ticker: COHR\n"
+            "    peers: [LITE, FN]\n"
+            "    etfs: [SMH]\n",
+            encoding="utf-8",
+        )
+        peers, etf, src = mq.resolve_peers_and_etf("COHR", coverage_path=str(cov))
+        assert (peers, etf, src) == (["LITE", "FN"], "SMH", "coverage")
+
+    def test_run_analyze_end_to_end_without_peers_reports_etf_benchmark(self, tmp_path):
+        mq = _load_move_quant()
+        prices, vols, dates = self._make_daily_frames({"COHR": -0.065, "SPY": -0.005})
+        raw = self._e2e_download_frame(prices, vols)
+
+        with patch("yfinance.download", autospec=True) as mock_dl, patch(
+            "yfinance.Ticker", autospec=True
+        ) as mock_ticker_cls:
+            mock_dl.return_value = raw
+            mock_ticker_cls.side_effect = RuntimeError("yfinance unavailable")
+            res = mq.run_analyze(
+                ticker="COHR",
+                window="1d",
+                coverage_path=str(tmp_path / "no-coverage.yaml"),
+                end_override=dates[-1].strftime("%Y-%m-%d"),
+            )
+
+        assert res["ok"] is True
+        assert res["data_ok"] is True
+        assert res["benchmark"] == "sector_etf"
+        assert res["peer_source"] == "none"
+        assert res["peers"] == []
+        assert res["peers_used"] == []
+        assert res["peer_median"] is None
+        assert res["alpha_vs_peers"] is None
+        assert res["assessment"] == "stock_specific"
+        assert any("无同组公司数据" in w and "SPY" in w for w in res["warnings"])
+        datetime.fromisoformat(res["computed_at"])
+
+    def test_run_analyze_end_to_end_explicit_peers_reports_peer_benchmark(self, tmp_path):
+        mq = _load_move_quant()
+        prices, vols, dates = self._make_daily_frames(
+            {"COHR": -0.065, "LITE": -0.005, "FN": -0.005, "SMH": -0.005}
+        )
+        raw = self._e2e_download_frame(prices, vols)
+
+        with patch("yfinance.download", autospec=True) as mock_dl:
+            mock_dl.return_value = raw
+            res = mq.run_analyze(
+                ticker="COHR",
+                window="1d",
+                peers_arg="LITE,FN",
+                etf_arg="SMH",
+                coverage_path=str(tmp_path / "no-coverage.yaml"),
+                end_override=dates[-1].strftime("%Y-%m-%d"),
+            )
+
+        assert res["ok"] is True
+        assert res["benchmark"] == "peers"
+        assert res["peer_source"] == "explicit"
+        assert set(res["peers_used"]) == {"LITE", "FN"}
+        assert abs(res["alpha_vs_peers"] - (-6.0)) < 0.05
+        assert not any("无同组公司数据" in w for w in res["warnings"])
+
+    def test_intraday_benchmark_cascades_to_etf_then_futures(self):
+        mq = _load_move_quant()
+        idx = pd.to_datetime([
+            "2026-10-20 15:55:00-04:00",
+            "2026-10-21 04:15:00-04:00",
+            "2026-10-21 08:30:00-04:00",
+        ])
+        close_df = pd.DataFrame(
+            {
+                "COHR": [100.0, 98.0, 93.5],
+                "QQQ": [100.0, 99.5, 99.0],
+                "NQ=F": [20000.0, 19900.0, 19800.0],
+                "ES=F": [5800.0, 5780.0, 5765.2],
+            },
+            index=idx,
+        )
+
+        res_etf = mq.compute_session_quant_from_intraday(
+            target="COHR",
+            peers=[],
+            sector_etf="QQQ",
+            close_df=close_df,
+            session="pre",
+            session_date="2026-10-21",
+            futures=["NQ=F", "ES=F"],
+        )
+        assert res_etf["ok"] is True
+        assert res_etf["benchmark"] == "sector_etf"
+        assert res_etf["peers_used"] == []
+        assert res_etf["peer_median"] is None
+        assert res_etf["alpha_vs_peers"] is None
+        assert abs(res_etf["alpha_vs_sector"] - (-5.5)) < 0.01
+        assert res_etf["assessment"] == "stock_specific"
+        assert any("无同组公司数据" in w and "QQQ" in w for w in res_etf["warnings"])
+        datetime.fromisoformat(res_etf["computed_at"])
+
+        res_fut = mq.compute_session_quant_from_intraday(
+            target="COHR",
+            peers=[],
+            sector_etf=None,
+            close_df=close_df.drop(columns=["QQQ"]),
+            session="pre",
+            session_date="2026-10-21",
+            futures=["NQ=F", "ES=F"],
+        )
+        assert res_fut["ok"] is True
+        assert res_fut["benchmark"] == "futures"
+        assert res_fut["alpha_vs_futures"] == -5.5
+        assert any("无同组公司数据" in w and "期货" in w for w in res_fut["warnings"])
 
 
 def test_trading_day_fallback_uses_stdlib_nyse_holidays_without_calendar_libs(monkeypatch):
