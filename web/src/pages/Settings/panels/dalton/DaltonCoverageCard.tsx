@@ -1,5 +1,5 @@
-import React, { useMemo, useState } from 'react';
-import { useNavigate } from 'react-router';
+import React, { useEffect, useState } from 'react';
+import { useLocation, useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { ChevronDown, ChevronRight, ExternalLink, Loader2, Plus, RefreshCw } from 'lucide-react';
@@ -14,6 +14,7 @@ import {
   type SectorMember,
   type UnclassifiedWorkspace,
   registerDaltonCoverageUnit,
+  splitCoverageUnits,
   unbindDaltonCoverageUnit,
   useDaltonCoverageUnitDetail,
   useDaltonCoverageUnits,
@@ -750,29 +751,30 @@ function UnitRow({
 export function DaltonCoverageCard(): React.ReactElement | null {
   const { t } = useTranslation();
   const { userId } = useAuth();
-  const [tab, setTab] = useState<CoverageTab>('sectors');
+  // 侧栏"未分类"入口带着 #dalton-coverage-unclassified 跳来：挂载时读到
+  // 该 hash 就直接落在"未分类工作区" tab（Settings 的 hash 机制会滚动到
+  // id 同名的 tab 按钮上）。
+  const [tab, setTab] = useState<CoverageTab>(() =>
+    typeof window !== 'undefined' && window.location.hash === '#dalton-coverage-unclassified'
+      ? 'unclassified'
+      : 'sectors',
+  );
   const [expandedUnit, setExpandedUnit] = useState<string | null>(null);
   const { data, isLoading, isFetching, refetch, error } = useDaltonCoverageUnits();
-
-  const units = data?.enabled ? data.units : [];
-  // 独立公司 = 没有被任何（可见）行业列为成员的公司单元
-  const memberUnitIds = useMemo(() => {
-    const ids = new Set<string>();
-    for (const u of units) {
-      for (const m of u.members ?? []) {
-        if (m.company_unit_id) ids.add(m.company_unit_id);
-      }
-    }
-    return ids;
-  }, [units]);
+  // Already on this page when the sidebar link is followed again: the card
+  // stays mounted, so the initializer above never re-reads the hash. Each
+  // navigation gets a new location.key, which re-runs this.
+  const location = useLocation();
+  useEffect(() => {
+    if (location.hash === '#dalton-coverage-unclassified') setTab('unclassified');
+  }, [location.hash, location.key]);
 
   // 开关关闭（或还在加载/失败）时不渲染任何行业相关入口与文案
   if (!data || data.enabled === false) return null;
 
-  const sectors = units.filter((u) => u.kind === 'sector');
-  const standaloneCompanies = units.filter(
-    (u) => u.kind === 'company' && !memberUnitIds.has(u.unit_id),
-  );
+  // 行业 / 独立公司两分（独立公司 = 没被任何可见行业列为成员的公司单元）
+  // 与侧栏覆盖结构树、工作区从属标记共用同一推导（lib/dalton/coverage）。
+  const { sectors, standaloneCompanies } = splitCoverageUnits(data.units);
   const unclassified = data.unclassified ?? [];
 
   const tabs: Array<{ key: CoverageTab; label: string; count: number }> = [
@@ -791,6 +793,7 @@ export function DaltonCoverageCard(): React.ReactElement | null {
 
   return (
     <div
+      id="dalton-coverage"
       className="rounded-lg p-4"
       style={{
         backgroundColor: 'var(--color-bg-card)',
@@ -833,6 +836,8 @@ export function DaltonCoverageCard(): React.ReactElement | null {
             key={key}
             type="button"
             data-testid={`coverage-tab-${key}`}
+            // Settings 的 hash 滚动机制以元素 id 为锚：#dalton-coverage-unclassified 落在未分类 tab 上
+            id={key === 'unclassified' ? 'dalton-coverage-unclassified' : undefined}
             onClick={() => {
               setTab(key);
               setExpandedUnit(null);

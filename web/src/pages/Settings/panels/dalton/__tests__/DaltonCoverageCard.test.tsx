@@ -1,3 +1,4 @@
+import { useNavigate } from 'react-router';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { Mock } from 'vitest';
 import { fireEvent, screen, waitFor } from '@testing-library/react';
@@ -428,6 +429,51 @@ describe('DaltonCoverageCard', () => {
       screen.getByTestId(`coverage-unclassified-${UNCLASSIFIED_WS}`),
     ).toBeInTheDocument();
     expect(screen.getByText('随便的主题工作区')).toBeInTheDocument();
+  });
+
+  it('opens the unclassified tab when deep-linked with #dalton-coverage-unclassified', async () => {
+    // 侧栏覆盖结构树的"未分类"入口带着这个 hash 跳来
+    window.location.hash = '#dalton-coverage-unclassified';
+    try {
+      renderWithProviders(<DaltonCoverageCard />);
+
+      expect(await screen.findByTestId('coverage-tab-unclassified')).toHaveClass('bg-muted');
+      // 未分类 tab 的锚点 id 就是 hash 名（Settings 的 hash 滚动机制用）
+      expect(screen.getByTestId('coverage-tab-unclassified')).toHaveAttribute(
+        'id',
+        'dalton-coverage-unclassified',
+      );
+      expect(
+        screen.getByTestId(`coverage-unclassified-${UNCLASSIFIED_WS}`),
+      ).toBeInTheDocument();
+      expect(screen.getByTestId('coverage-tab-sectors')).not.toHaveClass('bg-muted');
+    } finally {
+      window.location.hash = '';
+    }
+  });
+
+  it('switches to the unclassified tab when the sidebar link is followed while already mounted', async () => {
+    // The sidebar entry navigates within the app; the card does not remount.
+    function FollowSidebarLink() {
+      const navigate = useNavigate();
+      return (
+        <button type="button" onClick={() => navigate('/settings?tab=model#dalton-coverage-unclassified')}>
+          follow
+        </button>
+      );
+    }
+    renderWithProviders(
+      <>
+        <DaltonCoverageCard />
+        <FollowSidebarLink />
+      </>,
+      { route: '/settings?tab=model' },
+    );
+    expect(await screen.findByTestId('coverage-tab-sectors')).toHaveClass('bg-muted');
+    fireEvent.click(screen.getByText('follow'));
+    await waitFor(() => {
+      expect(screen.getByTestId('coverage-tab-unclassified')).toHaveClass('bg-muted');
+    });
   });
 
   it('marks members without company coverage and never forces creating one', async () => {
