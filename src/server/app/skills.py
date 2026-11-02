@@ -399,7 +399,7 @@ async def get_skills(
         None,
         description="Return the workspace-effective view (workspace rows "
         "shadow user rows, workspace disables apply). Requires auth and "
-        "workspace ownership.",
+        "workspace read access; skill writes stay owner-only.",
     ),
     all_scopes: bool = Query(
         False,
@@ -408,7 +408,8 @@ async def get_skills(
         "mutually exclusive with workspace_id.",
     ),
 ):
-    """List skills: platform tier always, plus the caller's own tiers."""
+    """List skills: platform tier always, plus the caller's own tiers (a
+    workspace view reads the tiers of the workspace's owner)."""
     if all_scopes:
         if user_id is None:
             raise HTTPException(status_code=401, detail="Authentication required")
@@ -418,15 +419,29 @@ async def get_skills(
                 detail="all_scopes and workspace_id are mutually exclusive",
             )
         return await _assemble_all_scopes(user_id, include_disabled)
+    read_user_id = user_id
     if workspace_id is not None:
         if user_id is None:
             raise HTTPException(status_code=401, detail="Authentication required")
-        await _require_owned_workspace(workspace_id, user_id)
+        # --- DALTON-HOOK(team-sharing): begin ---
+        # The listing follows the sharing gate: anyone with read access sees
+        # the workspace-effective view; the write routes below it stay
+        # owner-only through _require_owned_workspace. The view belongs to the
+        # workspace, so its rows and the user tiers they shadow are queried
+        # under the owner's id — a colleague sees the owner's skills, never
+        # their own, in this listing.
+        from src.dalton.sharing import require_workspace_access
+
+        shared = await require_workspace_access(
+            workspace_id, user_id, channel="web", need="read"
+        )
+        read_user_id = str(shared["user_id"])
+        # --- DALTON-HOOK(team-sharing): end ---
     if user_id is None:
         # No attribution here: the bundle a skill came from is only meaningful
         # next to the switch that turns it off, and this view has no account.
         return {"skills": [_platform_info(s) for s in list_skills()]}
-    return await _assemble_skills(user_id, include_disabled, workspace_id)
+    return await _assemble_skills(read_user_id, include_disabled, workspace_id)
 
 
 @router.get("/limits", response_model=SkillLimitsResponse)
@@ -789,16 +804,33 @@ async def _skill_folder(
     user → platform; reserved names keep the platform tier collision-free, so
     the tier walk is belt-and-braces)."""
     row = None
+    effective_user_id = user_id
     if workspace_id is not None:
-        await _require_owned_workspace(workspace_id, user_id)
-        row = await get_user_skill(user_id, name, workspace_id=workspace_id)
+        # --- DALTON-HOOK(team-sharing): begin ---
+        # A skill's page is a read surface like the listing above it: the
+        # sharing read gate decides who may look, while the skill write
+        # routes keep the owner check (_require_owned_workspace). The page
+        # shows the workspace's effective tiers, which are the owner's, so
+        # every row and archive below is read under the owner's id.
+        from src.dalton.sharing import require_workspace_access
+
+        shared = await require_workspace_access(
+            workspace_id, user_id, channel="web", need="read"
+        )
+        effective_user_id = str(shared["user_id"])
+        # --- DALTON-HOOK(team-sharing): end ---
+        row = await get_user_skill(effective_user_id, name, workspace_id=workspace_id)
     if row is None:
-        row = await get_user_skill(user_id, name)
+        row = await get_user_skill(effective_user_id, name)
     if row is not None:
-        folder = ZipFolder(await fetch_skill_archive(user_id, row), name)
+        folder = ZipFolder(
+            await fetch_skill_archive(effective_user_id, row), name
+        )
         if "SKILL.md" not in folder.files:
             logger.error(
-                "stored skill archive unreadable (user=%s name=%s)", user_id, name
+                "stored skill archive unreadable (user=%s name=%s)",
+                effective_user_id,
+                name,
             )
             raise HTTPException(
                 status_code=502, detail="Stored skill archive is unreadable"
@@ -811,7 +843,7 @@ async def _skill_folder(
     # source for management, and a workspace deny-list scopes where a skill
     # runs, not whether its owner may look at it.
     registry = build_effective_skill_registry(
-        disabled_skills=await get_disabled_builtin_skills(user_id)
+        disabled_skills=await get_disabled_builtin_skills(effective_user_id)
     )
     skill = registry.get(name)
     # The configured drop-in root, not the field default: an operator who
