@@ -910,6 +910,8 @@ async def _live_range_response(
     work_dir: str,
     byte_range: tuple[int, int],
     disposition: str,
+    *,
+    blocked_for_non_owner: bool = False,  # DALTON-HOOK(team-sharing): canonical-path block for non-owner Range reads
 ) -> Response | None:
     """A range of a live file, read in the exec that checks its containment.
 
@@ -940,7 +942,13 @@ async def _live_range_response(
     if sliced is None:
         raise HTTPException(status_code=404, detail="File not found")
     client_path = _to_client_path(sandbox, sliced.canonical, work_dir)
-    if _is_always_hidden_path(client_path):
+    # DALTON-HOOK(team-sharing): the canonical target is what a link in the
+    # served tree resolves to, so a colleague's gate rides it — same check the
+    # whole-file path runs — or a symlink into the owner's private dirs would
+    # answer ranges the plain download refuses.
+    if _is_always_hidden_path(client_path) or (
+        blocked_for_non_owner and _is_non_owner_blocked_path(client_path)
+    ):
         raise HTTPException(status_code=404, detail="File not found")
     filename = client_path.split("/")[-1] if client_path else "download"
     mime = resolve_content_type(filename)
@@ -969,6 +977,8 @@ async def _warm_range_response(
     work_dir: str,
     byte_range: tuple[int, int],
     disposition: str,
+    *,
+    blocked_for_non_owner: bool = False,  # DALTON-HOOK(team-sharing): forwarded to the Range helper
 ) -> tuple[bool, Response | None]:
     """:func:`_live_range_response` through the session this worker already
     holds, without a folder hold, as ``(settled, answer)``.
@@ -985,7 +995,12 @@ async def _warm_range_response(
         return False, None
     try:
         answer = await _live_range_response(
-            sandbox, candidate, work_dir, byte_range, disposition
+            sandbox,
+            candidate,
+            work_dir,
+            byte_range,
+            disposition,
+            blocked_for_non_owner=blocked_for_non_owner,  # DALTON-HOOK(team-sharing)
         )
     except RuntimeError as e:
         logger.info(
@@ -1062,7 +1077,12 @@ async def download_workspace_file(
 
     # --- DALTON-HOOK(workspace-sharing-settings): begin ---
     workspace = await owned_workspace_on_computer(workspace_id, x_user_id, need="read")
-    is_non_owner_reader = workspace.get("user_id") != x_user_id
+    is_non_owner = workspace.get("user_id") != x_user_id
+    # The read gate stamps the caller's effective web level on the row
+    # (require_workspace_access), the same level a need="write" gate checks:
+    # an rw colleague downloads like the owner, so only a colleague without
+    # write stays under the read-only rules below.
+    is_non_owner_reader = is_non_owner and workspace.get("_caller_web_access") != "rw"
     # --- DALTON-HOOK(workspace-sharing-settings): end ---
 
     work_dir = owner_work_dir(workspace)
@@ -1071,11 +1091,13 @@ async def download_workspace_file(
     # Virtual files come from the DB, as in /files/read: on the sandbox their
     # folder links out to the file mount, and the stored copy has no row for them.
     virtual_path = normalize_requested_path(path, work_dir, previous_dirs)
-    if is_non_owner_reader and virtual_path and _is_non_owner_blocked_path(virtual_path):
+    # DALTON-HOOK(team-sharing): blocked paths and virtual files are the
+    # owner's private data, withheld from rw colleagues too
+    if is_non_owner and virtual_path and _is_non_owner_blocked_path(virtual_path):
         raise HTTPException(status_code=404, detail="File not found")
     virtual = _virtual_file(virtual_path)
     if virtual:
-        if is_non_owner_reader:
+        if is_non_owner:
             raise HTTPException(status_code=404, detail="File not found")
         text = await _load_virtual_file(virtual, virtual_path, x_user_id)
         filename = virtual_path.rsplit("/", 1)[-1]
@@ -1088,7 +1110,9 @@ async def download_workspace_file(
         normalized_path = normalize_requested_path(path, work_dir, previous_dirs)
         if not normalized_path:
             raise HTTPException(status_code=400, detail="File path is required")
-        if is_non_owner_reader and _is_non_owner_blocked_path(normalized_path):
+        # DALTON-HOOK(team-sharing): owner-private paths stay blocked for rw
+        # colleagues too; the binary and redaction rules below are what rw lifts
+        if is_non_owner and _is_non_owner_blocked_path(normalized_path):
             raise HTTPException(status_code=404, detail="File not found")
 
         if byte_range is None:
@@ -1160,7 +1184,13 @@ async def download_workspace_file(
             resolve_content_type(candidate.rsplit("/", 1)[-1])
         ):
             settled, ranged = await _warm_range_response(
-                workspace, workspace_id, candidate, work_dir, byte_range, disposition
+                workspace,
+                workspace_id,
+                candidate,
+                work_dir,
+                byte_range,
+                disposition,
+                blocked_for_non_owner=is_non_owner,
             )
             if ranged is not None:
                 return ranged
@@ -1191,7 +1221,12 @@ async def download_workspace_file(
             )
         ):
             ranged = await _live_range_response(
-                sandbox, candidate, work_dir, byte_range, disposition
+                sandbox,
+                candidate,
+                work_dir,
+                byte_range,
+                disposition,
+                blocked_for_non_owner=is_non_owner,
             )
             if ranged is not None:
                 return ranged
@@ -1209,7 +1244,7 @@ async def download_workspace_file(
         # DALTON-HOOK(workspace-sharing-settings): reject hidden/system/virtual canonical targets and binary files for non-owner
         client_path = _to_client_path(sandbox, normalized, work_dir)
         if _is_always_hidden_path(client_path) or (
-            is_non_owner_reader and _is_non_owner_blocked_path(client_path)
+            is_non_owner and _is_non_owner_blocked_path(client_path)
         ):
             raise HTTPException(status_code=404, detail="File not found")
 
@@ -1228,6 +1263,22 @@ async def download_workspace_file(
             )
 
         if too_large is not None:
+            # DALTON-HOOK(team-sharing): a streamed body skips redaction, so a
+            # non-owner streams only a file whose name and first bytes rule out
+            # text; anything that might be text is refused rather than leaked
+            # unredacted. The owner's own download is unchanged.
+            if is_non_owner and await _large_file_may_be_text(
+                sandbox,
+                too_large,
+                work_dir=work_dir,
+                client_path=client_path,
+                mime=mime,
+            ):
+                raise HTTPException(
+                    status_code=413,
+                    detail="This file is too large to download with redaction; "
+                    "ask the workspace owner to share it directly",
+                )
             return await _stream_large_file(
                 workspace_id, sandbox, too_large, filename, mime, disposition, folder=folder
             )
@@ -1239,6 +1290,42 @@ async def download_workspace_file(
         record_fs_bytes("download", len(content))
 
         return _build_download_response(content, filename, mime, request, disposition)
+
+
+async def _large_file_may_be_text(
+    sandbox: Any,
+    too_large: FileTooLargeToServe,
+    *,
+    work_dir: str,
+    client_path: str,
+    mime: str,
+) -> bool:
+    """Whether a file past the exec read limit might be text.
+
+    DALTON-HOOK(team-sharing): the caller is a non-owner about to take an
+    unredactable streamed body, so uncertainty refuses — a text-typed name, a
+    head that cannot be read, or first bytes that may still decode as UTF-8
+    all count as text. Only a head UTF-8 has already ruled out streams: the
+    name is not trusted, since a large text file renamed to .xlsx would
+    otherwise stream unredacted.
+    """
+    if _is_text_content_type(mime):
+        return True
+    try:
+        sniffed = await read_contained_sandbox_range(
+            sandbox,
+            too_large.canonical,
+            work_dir=work_dir,
+            offset=0,
+            length=UTF8_SNIFF_BYTES,
+        )
+    except FileChangedWhileRead:
+        # The size and the head did not describe one file; refusing sends the
+        # caller to a fresh read instead of an unredactable body.
+        return True
+    if sniffed is None or sniffed.content is None:
+        return True
+    return _starts_as_text(sniffed.head, sniffed.size)
 
 
 async def _stream_large_file(

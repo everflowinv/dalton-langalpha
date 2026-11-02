@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import io
+import zipfile
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, ClassVar
 from unittest.mock import create_autospec
 
 import psycopg
 import pytest
-from fastapi import HTTPException, Request, UploadFile
+from fastapi import HTTPException, Request, Response, UploadFile
 from starlette.datastructures import Headers
 
 from src.config import settings as app_settings
@@ -23,6 +26,7 @@ from src.dalton.sharing import (
     require_thread_reader,
     require_workspace_reader,
 )
+from src.server.app import skills as skills_app
 from src.server.app import workspaces as workspaces_app
 from src.server.app.threads import crud as threads_crud
 from src.server.app.threads import messaging as threads_messaging
@@ -41,6 +45,10 @@ from src.server.models.workspace import WorkspaceUpdate
 from src.server.services import workspace_files as ws_files_service
 from src.server.services.persistence.file import FilePersistenceService
 from src.server.services.turn_runtime import requested_workspace
+from src.server.services.workspace_file_containment import (
+    ContainedSlice,
+    FileTooLargeToServe,
+)
 from src.ptc_agent.core.sandbox import PTCSandbox
 
 TEAM_EMAILS = (
@@ -115,6 +123,30 @@ def _disable_dalton_auth(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(app_settings, "HOST_MODE", "oss")
     monkeypatch.setenv("DALTON_AUTH_MODE", "oss")
     monkeypatch.setenv("DALTON_ALLOWED_EMAILS", TEAM_EMAILS)
+
+
+# Captured at import, before any fixture patches the module: the spec source
+# for re-patching get_workspace_sharing with a different level mid-test.
+_REAL_GET_WORKSPACE_SHARING = dalton_sharing.get_workspace_sharing
+
+
+def _set_web_sharing(monkeypatch: pytest.MonkeyPatch, *, web_access: str) -> None:
+    """Point the sharing lookup at one fixed web level (fixture default: ro)."""
+
+    async def _fake(workspace_id: str, *, conn: Any | None = None) -> dict[str, Any]:
+        return {
+            "workspace_id": workspace_id,
+            "cos_access": "ro",
+            "web_access": web_access,
+            "updated_by": None,
+            "updated_at": None,
+        }
+
+    monkeypatch.setattr(
+        dalton_sharing,
+        "get_workspace_sharing",
+        create_autospec(_REAL_GET_WORKSPACE_SHARING, side_effect=_fake),
+    )
 
 
 def _sample_workspace(
@@ -1656,3 +1688,1176 @@ class TestRangeDownloadPermissionMatrix:
         assert exc.value.status_code == 403
         warm_spy.assert_not_called()
         live_spy.assert_not_called()
+
+
+WS_ID = "11111111-1111-4111-8111-111111111111"
+XLSX_MIME = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
+
+
+class TestRwColleagueFileDownloads:
+    """rw colleagues (#152) download binaries like the owner on both serve
+    paths, Range answers included; the owner's private paths and virtual
+    files stay hidden, and ro colleagues keep every read-only limit."""
+
+    def _mirror_patches(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        row: dict[str, Any],
+        file_bytes: bytes = b"PK\x03\x04 sheet",
+    ) -> None:
+        ws = _sample_workspace(user_id="u-richard", status="stopped")
+        monkeypatch.setattr(
+            ws_files_crud,
+            "db_get_workspace",
+            create_autospec(ws_files_crud.db_get_workspace, return_value=ws),
+        )
+        monkeypatch.setattr(
+            ws_files_service,
+            "db_get_workspace",
+            create_autospec(ws_files_service.db_get_workspace, return_value=ws),
+        )
+        monkeypatch.setattr(
+            ws_files_crud,
+            "owner_work_dir",
+            create_autospec(
+                ws_files_crud.owner_work_dir,
+                return_value="/home/workspace/NVDA_Deep_Dive",
+            ),
+        )
+        monkeypatch.setattr(
+            FilePersistenceService,
+            "get_file_content",
+            create_autospec(FilePersistenceService.get_file_content, return_value=row),
+        )
+        monkeypatch.setattr(
+            ws_files_crud,
+            "get_vault_secrets_for_redaction",
+            create_autospec(
+                ws_files_crud.get_vault_secrets_for_redaction, return_value=[]
+            ),
+        )
+        monkeypatch.setattr(
+            ws_files_crud,
+            "http_file_bytes",
+            create_autospec(ws_files_crud.http_file_bytes, return_value=file_bytes),
+        )
+
+    @pytest.mark.asyncio
+    async def test_rw_colleague_downloads_mirror_binary(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The reported case: an rw colleague saving the owner's xlsx from a
+        stopped workspace's DB mirror."""
+        _enable_dalton_auth(monkeypatch)
+        _set_web_sharing(monkeypatch, web_access="rw")
+        # Not valid UTF-8, like a real xlsx's zip body, so the route serves it
+        # verbatim rather than through the text redaction path.
+        xlsx = b"PK\x03\x04\xff\xfe\x00\xb2sheet-bytes"
+        self._mirror_patches(
+            monkeypatch,
+            row={
+                "file_name": "Anthropic_sheet_updated_20261102.xlsx",
+                "mime_type": XLSX_MIME,
+                "is_binary": True,
+            },
+            file_bytes=xlsx,
+        )
+        response = await ws_files_crud.download_workspace_file(
+            WS_ID,
+            x_user_id="u-chao",
+            request=_make_request(),
+            path="ant_sheet_update/Anthropic_sheet_updated_20261102.xlsx",
+            attachment=True,
+        )
+        assert response.status_code == 200
+        assert response.body == xlsx
+        # The mirror's bytes are the owner's stored object, fetched with the
+        # owner's storage identity — the colleague never needs their own.
+        ws_files_crud.http_file_bytes.assert_awaited_once()
+        assert ws_files_crud.http_file_bytes.await_args.kwargs["user_id"] == "u-richard"
+
+    @pytest.mark.asyncio
+    async def test_rw_colleague_range_of_mirror_binary_is_206(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _enable_dalton_auth(monkeypatch)
+        _set_web_sharing(monkeypatch, web_access="rw")
+        pdf = b"%PDF-1.7" + bytes(range(256)) * 4
+        self._mirror_patches(
+            monkeypatch,
+            row={
+                "file_name": "report.pdf",
+                "mime_type": "application/pdf",
+                "is_binary": True,
+                "blob_sha256": "digest-of-report",
+                "file_size": len(pdf),
+            },
+            file_bytes=pdf,
+        )
+        monkeypatch.setattr(
+            ws_files_crud,
+            "http_file_byte_range",
+            create_autospec(
+                ws_files_crud.http_file_byte_range,
+                side_effect=lambda _row, start, n, **_: (
+                    pdf[start : start + n],
+                    len(pdf),
+                ),
+            ),
+        )
+        response = await ws_files_crud.download_workspace_file(
+            WS_ID,
+            x_user_id="u-chao",
+            request=_make_request({"range": "bytes=0-99"}),
+            path="report.pdf",
+            attachment=False,
+        )
+        assert response.status_code == 206
+        assert response.body == pdf[:100]
+
+    @pytest.mark.asyncio
+    async def test_rw_colleague_virtual_and_blocked_paths_remain_404(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Write access lifts the binary limits only: the owner's private
+        data (virtual DB files, system/hidden paths) stays invisible."""
+        _enable_dalton_auth(monkeypatch)
+        _set_web_sharing(monkeypatch, web_access="rw")
+        self._mirror_patches(
+            monkeypatch,
+            row={
+                "file_name": "portfolio.json",
+                "mime_type": "application/json",
+                "is_binary": False,
+            },
+        )
+        for blocked_path in (
+            ".agents/user/profile/portfolio.json",
+            "_internal/secret.txt",
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await ws_files_crud.download_workspace_file(
+                    WS_ID,
+                    x_user_id="u-chao",
+                    request=_make_request(),
+                    path=blocked_path,
+                    attachment=True,
+                )
+            assert exc.value.status_code == 404
+        FilePersistenceService.get_file_content.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ro_colleague_mirror_binary_still_403(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _enable_dalton_auth(monkeypatch)
+        _set_web_sharing(monkeypatch, web_access="ro")
+        self._mirror_patches(
+            monkeypatch,
+            row={
+                "file_name": "Anthropic_sheet_updated_20261102.xlsx",
+                "mime_type": XLSX_MIME,
+                "is_binary": True,
+            },
+        )
+        with pytest.raises(HTTPException) as exc:
+            await ws_files_crud.download_workspace_file(
+                WS_ID,
+                x_user_id="u-chao",
+                request=_make_request(),
+                path="ant_sheet_update/Anthropic_sheet_updated_20261102.xlsx",
+                attachment=True,
+            )
+        assert exc.value.status_code == 403
+        assert "read-only" in str(exc.value.detail)
+
+    @pytest.mark.asyncio
+    async def test_rw_colleague_download_url_still_falls_back_to_download(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The signed store link skips secret redaction, so it stays
+        owner-only; an rw colleague gets ``url: null`` and downloads through
+        /files/download, where the text bodies stay redacted."""
+        _enable_dalton_auth(monkeypatch)
+        _set_web_sharing(monkeypatch, web_access="rw")
+        ws = _sample_workspace(user_id="u-richard", status="running")
+        monkeypatch.setattr(
+            ws_files_crud,
+            "db_get_workspace",
+            create_autospec(ws_files_crud.db_get_workspace, return_value=ws),
+        )
+        monkeypatch.setattr(
+            ws_files_service,
+            "db_get_workspace",
+            create_autospec(ws_files_service.db_get_workspace, return_value=ws),
+        )
+        result = await ws_files_crud.workspace_file_download_url(
+            WS_ID,
+            x_user_id="u-chao",
+            path="ant_sheet_update/Anthropic_sheet_updated_20261102.xlsx",
+        )
+        assert result == {"url": None}
+
+    def _live_patches(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        status: str = "running",
+        returns: bytes,
+        name: str = "sheet.xlsx",
+    ) -> dict[str, Any]:
+        ws = _sample_workspace(user_id="u-richard", status=status)
+        monkeypatch.setattr(
+            ws_files_crud,
+            "db_get_workspace",
+            create_autospec(ws_files_crud.db_get_workspace, return_value=ws),
+        )
+        monkeypatch.setattr(
+            ws_files_service,
+            "db_get_workspace",
+            create_autospec(ws_files_service.db_get_workspace, return_value=ws),
+        )
+        monkeypatch.setattr(
+            ws_files_crud,
+            "owner_work_dir",
+            create_autospec(
+                ws_files_crud.owner_work_dir,
+                return_value="/home/workspace/NVDA_Deep_Dive",
+            ),
+        )
+        sandbox = create_autospec(PTCSandbox, instance=True)
+        sandbox.validate_path = lambda _p: True
+
+        @asynccontextmanager
+        async def _acquire(*_args):
+            yield sandbox, ws
+
+        monkeypatch.setattr(ws_files_crud, "acquire_sandbox_to_change", _acquire)
+        canonical = f"/home/workspace/NVDA_Deep_Dive/ant_sheet_update/{name}"
+        monkeypatch.setattr(
+            ws_files_crud,
+            "contained_absolute_path",
+            create_autospec(
+                ws_files_crud.contained_absolute_path, return_value=canonical
+            ),
+        )
+        monkeypatch.setattr(
+            ws_files_crud,
+            "read_contained_sandbox_file",
+            create_autospec(
+                ws_files_crud.read_contained_sandbox_file,
+                return_value=(canonical, returns),
+            ),
+        )
+        return ws
+
+    @pytest.mark.asyncio
+    async def test_rw_colleague_downloads_live_binary(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Running workspace: the same download straight off the sandbox."""
+        _enable_dalton_auth(monkeypatch)
+        _set_web_sharing(monkeypatch, web_access="rw")
+        # A real xlsx's zip body is not valid UTF-8; neither may this be, or
+        # the route would (correctly) treat it as redactable text.
+        xlsx = b"PK\x03\x04\xff\xfe\x00\xb2live-sheet"
+        self._live_patches(monkeypatch, returns=xlsx)
+        response = await ws_files_crud.download_workspace_file(
+            WS_ID,
+            x_user_id="u-chao",
+            request=_make_request(),
+            path="ant_sheet_update/sheet.xlsx",
+            attachment=True,
+        )
+        assert response.status_code == 200
+        assert response.body == xlsx
+
+    @pytest.mark.asyncio
+    async def test_rw_colleague_live_range_reaches_range_helpers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _enable_dalton_auth(monkeypatch)
+        _set_web_sharing(monkeypatch, web_access="rw")
+        self._live_patches(monkeypatch, returns=b"%PDF-1.7", name="report.pdf")
+        monkeypatch.setattr(
+            ws_files_crud,
+            "_warm_range_response",
+            create_autospec(
+                ws_files_crud._warm_range_response, return_value=(False, None)
+            ),
+        )
+        ranged = Response(
+            content=b"%PDF",
+            status_code=206,
+            headers={"Content-Range": "bytes 0-3/2048"},
+        )
+        live_spy = create_autospec(ws_files_crud._live_range_response, return_value=ranged)
+        monkeypatch.setattr(ws_files_crud, "_live_range_response", live_spy)
+        response = await ws_files_crud.download_workspace_file(
+            WS_ID,
+            x_user_id="u-chao",
+            request=_make_request({"range": "bytes=0-3"}),
+            path="ant_sheet_update/report.pdf",
+            attachment=False,
+        )
+        assert response.status_code == 206
+        assert response.body == b"%PDF"
+        live_spy.assert_awaited_once()
+
+
+class TestSkillsListingAccess:
+    """GET /api/v1/skills?workspace_id=… follows the sharing read gate; every
+    skill write keeps the strict owner check."""
+
+    def _listing_patches(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for name, returns in (
+            ("get_disabled_builtin_skills", set()),
+            ("get_skill_command_overrides", {}),
+            ("list_workspace_skill_disables", set()),
+            ("list_user_skills", []),
+            ("list_enabled_user_skills", []),
+            ("list_account_disables", SimpleNamespace(bundles=set())),
+        ):
+            monkeypatch.setattr(
+                skills_app,
+                name,
+                create_autospec(getattr(skills_app, name), return_value=returns),
+            )
+
+        def _component_owners():
+            return SimpleNamespace(skills={})
+
+        monkeypatch.setattr(
+            "src.server.services.plugins.bundled.component_owners",
+            _component_owners,
+        )
+
+    @pytest.mark.asyncio
+    async def test_workspace_view_allows_read_colleague(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _enable_dalton_auth(monkeypatch)
+        self._listing_patches(monkeypatch)
+        ws = _sample_workspace(user_id="u-richard")
+        monkeypatch.setattr(
+            ws_db,
+            "get_workspace",
+            create_autospec(ws_db.get_workspace, return_value=ws),
+        )
+        result = await skills_app.get_skills(
+            user_id="u-chao",
+            include_disabled=False,
+            workspace_id=ws["workspace_id"],
+            all_scopes=False,
+        )
+        assert isinstance(result["skills"], list)
+
+    @pytest.mark.asyncio
+    async def test_workspace_view_hides_hidden_and_external_callers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _enable_dalton_auth(monkeypatch)
+        self._listing_patches(monkeypatch)
+        ws = _sample_workspace(user_id="u-richard")
+        monkeypatch.setattr(
+            ws_db,
+            "get_workspace",
+            create_autospec(ws_db.get_workspace, return_value=ws),
+        )
+        _set_web_sharing(monkeypatch, web_access="hidden")
+        with pytest.raises(HTTPException) as exc_hidden:
+            await skills_app.get_skills(
+                user_id="u-chao",
+                include_disabled=False,
+                workspace_id=ws["workspace_id"],
+                all_scopes=False,
+            )
+        assert exc_hidden.value.status_code == 404
+
+        _set_web_sharing(monkeypatch, web_access="rw")
+        # An off-allowlist caller fails the team check itself (403), the same
+        # answer require_workspace_reader gives them on any read route.
+        with pytest.raises(HTTPException) as exc_outsider:
+            await skills_app.get_skills(
+                user_id="u-outsider",
+                include_disabled=False,
+                workspace_id=ws["workspace_id"],
+                all_scopes=False,
+            )
+        assert exc_outsider.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_workspace_view_strict_owner_when_dalton_off(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _disable_dalton_auth(monkeypatch)
+        self._listing_patches(monkeypatch)
+        ws = _sample_workspace(user_id="u-richard")
+        monkeypatch.setattr(
+            ws_db,
+            "get_workspace",
+            create_autospec(ws_db.get_workspace, return_value=ws),
+        )
+        with pytest.raises(HTTPException) as exc:
+            await skills_app.get_skills(
+                user_id="u-chao",
+                include_disabled=False,
+                workspace_id=ws["workspace_id"],
+                all_scopes=False,
+            )
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_skills_write_ops_stay_owner_only(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _enable_dalton_auth(monkeypatch)
+        _set_web_sharing(monkeypatch, web_access="rw")
+        ws = _sample_workspace(user_id="u-richard")
+        monkeypatch.setattr(
+            skills_app,
+            "db_get_workspace",
+            create_autospec(skills_app.db_get_workspace, return_value=ws),
+        )
+
+        with pytest.raises(HTTPException) as exc_del:
+            await skills_app.delete_workspace_skill(
+                ws["workspace_id"], "memo-skill", user_id="u-chao"
+            )
+        assert exc_del.value.status_code == 403
+
+        fake_upload = create_autospec(UploadFile, instance=True)
+        with pytest.raises(HTTPException) as exc_up:
+            await skills_app.upload_workspace_skill(
+                ws["workspace_id"], user_id="u-chao", file=fake_upload
+            )
+        assert exc_up.value.status_code == 403
+
+        monkeypatch.setattr(
+            skills_app,
+            "delete_user_skill",
+            create_autospec(
+                skills_app.delete_user_skill, return_value={"archive_key": None}
+            ),
+        )
+        monkeypatch.setattr(
+            skills_app,
+            "drop_archive_if_unused",
+            create_autospec(skills_app.drop_archive_if_unused),
+        )
+        monkeypatch.setattr(
+            skills_app.WorkspaceManager,
+            "schedule_skill_reconcile",
+            create_autospec(skills_app.WorkspaceManager.schedule_skill_reconcile),
+        )
+        deleted = await skills_app.delete_workspace_skill(
+            ws["workspace_id"], "memo-skill", user_id="u-richard"
+        )
+        assert deleted.status_code == 204
+
+
+class TestSkillContentAccess:
+    """GET /api/v1/skills/{name}/content?workspace_id=… reads through the
+    sharing gate like the listing; opening the page does not open the writes."""
+
+    def _content_patches(self, monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+        skill_dir = tmp_path / "note-demo"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text("# Note demo\n", encoding="utf-8")
+        monkeypatch.setattr(
+            skills_app,
+            "get_user_skill",
+            create_autospec(skills_app.get_user_skill, return_value=None),
+        )
+        monkeypatch.setattr(
+            skills_app,
+            "get_disabled_builtin_skills",
+            create_autospec(skills_app.get_disabled_builtin_skills, return_value=set()),
+        )
+        monkeypatch.setattr(
+            skills_app,
+            "build_effective_skill_registry",
+            create_autospec(
+                skills_app.build_effective_skill_registry,
+                return_value={"note-demo": SimpleNamespace(hidden=False)},
+            ),
+        )
+        monkeypatch.setattr(
+            skills_app,
+            "configured_skill_dirs",
+            create_autospec(skills_app.configured_skill_dirs, return_value=[tmp_path]),
+        )
+        monkeypatch.setattr(
+            skills_app,
+            "resolve_skill_dir",
+            create_autospec(skills_app.resolve_skill_dir, return_value=skill_dir),
+        )
+
+    def _sample_ws(self, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+        ws = _sample_workspace(user_id="u-richard")
+        monkeypatch.setattr(
+            ws_db,
+            "get_workspace",
+            create_autospec(ws_db.get_workspace, return_value=ws),
+        )
+        return ws
+
+    async def _read_content(self, ws: dict[str, Any], user_id: str):
+        return await skills_app.get_skill_content(
+            "note-demo",
+            user_id=user_id,
+            workspace_id=ws["workspace_id"],
+            path="SKILL.md",
+        )
+
+    @pytest.mark.asyncio
+    async def test_content_allows_read_colleague(self, monkeypatch, tmp_path) -> None:
+        # The fixture's default sharing row is web_access="ro": read is enough.
+        _enable_dalton_auth(monkeypatch)
+        self._content_patches(monkeypatch, tmp_path)
+        response = await self._read_content(self._sample_ws(monkeypatch), "u-chao")
+        assert response["name"] == "note-demo"
+        assert response["content"] == "# Note demo\n"
+
+    @pytest.mark.asyncio
+    async def test_content_hides_hidden_and_rejects_outsiders(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        _enable_dalton_auth(monkeypatch)
+        self._content_patches(monkeypatch, tmp_path)
+        ws = self._sample_ws(monkeypatch)
+        _set_web_sharing(monkeypatch, web_access="hidden")
+        with pytest.raises(HTTPException) as exc_hidden:
+            await self._read_content(ws, "u-chao")
+        assert exc_hidden.value.status_code == 404
+
+        _set_web_sharing(monkeypatch, web_access="rw")
+        # An off-roster caller fails the team check itself (403), the same
+        # answer the listing gives them.
+        with pytest.raises(HTTPException) as exc_outsider:
+            await self._read_content(ws, "u-outsider")
+        assert exc_outsider.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_content_strict_owner_when_dalton_off(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        _disable_dalton_auth(monkeypatch)
+        self._content_patches(monkeypatch, tmp_path)
+        with pytest.raises(HTTPException) as exc:
+            await self._read_content(self._sample_ws(monkeypatch), "u-chao")
+        assert exc.value.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_content_read_does_not_open_writes(
+        self, monkeypatch, tmp_path
+    ) -> None:
+        _enable_dalton_auth(monkeypatch)
+        self._content_patches(monkeypatch, tmp_path)
+        ws = self._sample_ws(monkeypatch)
+        response = await self._read_content(ws, "u-chao")
+        assert response["name"] == "note-demo"
+
+        monkeypatch.setattr(
+            skills_app,
+            "db_get_workspace",
+            create_autospec(skills_app.db_get_workspace, return_value=ws),
+        )
+        with pytest.raises(HTTPException) as exc_del:
+            await skills_app.delete_workspace_skill(
+                ws["workspace_id"], "note-demo", user_id="u-chao"
+            )
+        assert exc_del.value.status_code == 403
+
+        fake_upload = create_autospec(UploadFile, instance=True)
+        with pytest.raises(HTTPException) as exc_up:
+            await skills_app.upload_workspace_skill(
+                ws["workspace_id"], user_id="u-chao", file=fake_upload
+            )
+        assert exc_up.value.status_code == 403
+
+
+class TestRwColleagueLargeFileStreams:
+    """Round 3, fix 1: a streamed body skips redaction, so a non-owner streams
+    a file past the exec read limit only when its name and first bytes rule
+    out text. The owner's stream is unchanged."""
+
+    _WORK_DIR = "/home/workspace/NVDA_Deep_Dive"
+
+    def _too_large_patches(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        name: str,
+        head: bytes,
+        size: int = 9_000_000,
+    ) -> tuple[Any, Any]:
+        ws = _sample_workspace(user_id="u-richard", status="running")
+        monkeypatch.setattr(
+            ws_files_crud,
+            "db_get_workspace",
+            create_autospec(ws_files_crud.db_get_workspace, return_value=ws),
+        )
+        monkeypatch.setattr(
+            ws_files_service,
+            "db_get_workspace",
+            create_autospec(ws_files_service.db_get_workspace, return_value=ws),
+        )
+        monkeypatch.setattr(
+            ws_files_crud,
+            "owner_work_dir",
+            create_autospec(
+                ws_files_crud.owner_work_dir, return_value=self._WORK_DIR
+            ),
+        )
+        sandbox = create_autospec(PTCSandbox, instance=True)
+        sandbox.validate_path = lambda _p: True
+
+        @asynccontextmanager
+        async def _acquire(*_args):
+            yield sandbox, ws
+
+        monkeypatch.setattr(ws_files_crud, "acquire_sandbox_to_change", _acquire)
+        canonical = f"{self._WORK_DIR}/ant_sheet_update/{name}"
+        monkeypatch.setattr(
+            ws_files_crud,
+            "contained_absolute_path",
+            create_autospec(
+                ws_files_crud.contained_absolute_path, return_value=canonical
+            ),
+        )
+        monkeypatch.setattr(
+            ws_files_crud,
+            "read_contained_sandbox_file",
+            create_autospec(
+                ws_files_crud.read_contained_sandbox_file,
+                side_effect=FileTooLargeToServe(canonical, size),
+            ),
+        )
+        sniff_mock = create_autospec(
+            ws_files_crud.read_contained_sandbox_range,
+            return_value=ContainedSlice(
+                canonical=canonical,
+                size=size,
+                version="9000000 1 2 3",
+                head=head,
+                content=head,
+            ),
+        )
+        monkeypatch.setattr(ws_files_crud, "read_contained_sandbox_range", sniff_mock)
+        stream_spy = create_autospec(
+            ws_files_crud._stream_large_file,
+            return_value=Response(content=b"streamed-bytes", status_code=200),
+        )
+        monkeypatch.setattr(ws_files_crud, "_stream_large_file", stream_spy)
+        return sniff_mock, stream_spy
+
+    @pytest.mark.asyncio
+    async def test_rw_colleague_large_text_mimed_stream_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A text-typed name refuses before any sniff: the streamed body could
+        not be redacted."""
+        _enable_dalton_auth(monkeypatch)
+        _set_web_sharing(monkeypatch, web_access="rw")
+        sniff_mock, stream_spy = self._too_large_patches(
+            monkeypatch, name="transcript.md", head=b"# notes\n"
+        )
+        with pytest.raises(HTTPException) as exc:
+            await ws_files_crud.download_workspace_file(
+                WS_ID,
+                x_user_id="u-chao",
+                request=_make_request(),
+                path="ant_sheet_update/transcript.md",
+                attachment=True,
+            )
+        assert exc.value.status_code == 413
+        assert "redaction" in str(exc.value.detail)
+        sniff_mock.assert_not_called()
+        stream_spy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rw_colleague_large_text_sniffed_stream_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unknown extension refuses on the sniff: a UTF-8 head is text."""
+        _enable_dalton_auth(monkeypatch)
+        _set_web_sharing(monkeypatch, web_access="rw")
+        sniff_mock, stream_spy = self._too_large_patches(
+            monkeypatch, name="export.xyz", head="收益说明与持仓 notes".encode()
+        )
+        with pytest.raises(HTTPException) as exc:
+            await ws_files_crud.download_workspace_file(
+                WS_ID,
+                x_user_id="u-chao",
+                request=_make_request(),
+                path="ant_sheet_update/export.xyz",
+                attachment=True,
+            )
+        assert exc.value.status_code == 413
+        sniff_mock.assert_awaited_once()
+        stream_spy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rw_colleague_large_text_renamed_xlsx_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A large UTF-8 text renamed to .xlsx is sniffed and refused: the name
+        alone must not let an unredactable body stream."""
+        _enable_dalton_auth(monkeypatch)
+        _set_web_sharing(monkeypatch, web_access="rw")
+        sniff_mock, stream_spy = self._too_large_patches(
+            monkeypatch, name="export.xlsx", head=b"API_KEY=sk-live-secret\nrow,1,2\n"
+        )
+        with pytest.raises(HTTPException) as exc:
+            await ws_files_crud.download_workspace_file(
+                WS_ID,
+                x_user_id="u-chao",
+                request=_make_request(),
+                path="ant_sheet_update/export.xlsx",
+                attachment=True,
+            )
+        assert exc.value.status_code == 413
+        sniff_mock.assert_awaited_once()
+        stream_spy.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_rw_colleague_large_binary_mimed_streams(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A real binary under a binary name streams, after the head is sniffed:
+        the name alone is never trusted."""
+        _enable_dalton_auth(monkeypatch)
+        _set_web_sharing(monkeypatch, web_access="rw")
+        sniff_mock, stream_spy = self._too_large_patches(
+            monkeypatch, name="sheet.xlsx", head=b"PK\x03\x04\xff\xfe\x00\xb2"
+        )
+        response = await ws_files_crud.download_workspace_file(
+            WS_ID,
+            x_user_id="u-chao",
+            request=_make_request(),
+            path="ant_sheet_update/sheet.xlsx",
+            attachment=True,
+        )
+        assert response.status_code == 200
+        assert response.body == b"streamed-bytes"
+        sniff_mock.assert_awaited_once()
+        stream_spy.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_rw_colleague_large_binary_sniffed_streams(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unknown extension streams when the head rules out UTF-8."""
+        _enable_dalton_auth(monkeypatch)
+        _set_web_sharing(monkeypatch, web_access="rw")
+        sniff_mock, stream_spy = self._too_large_patches(
+            monkeypatch, name="export.xyz", head=b"\xff\xfe\x00\xfa\xfbbinary"
+        )
+        response = await ws_files_crud.download_workspace_file(
+            WS_ID,
+            x_user_id="u-chao",
+            request=_make_request(),
+            path="ant_sheet_update/export.xyz",
+            attachment=True,
+        )
+        assert response.status_code == 200
+        assert response.body == b"streamed-bytes"
+        sniff_mock.assert_awaited_once()
+        stream_spy.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_owner_large_text_still_streams(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _enable_dalton_auth(monkeypatch)
+        sniff_mock, stream_spy = self._too_large_patches(
+            monkeypatch, name="transcript.md", head=b"# notes\n"
+        )
+        response = await ws_files_crud.download_workspace_file(
+            WS_ID,
+            x_user_id="u-richard",
+            request=_make_request(),
+            path="ant_sheet_update/transcript.md",
+            attachment=True,
+        )
+        assert response.status_code == 200
+        assert response.body == b"streamed-bytes"
+        stream_spy.assert_awaited_once()
+        sniff_mock.assert_not_called()
+
+
+class TestRwColleagueRangeBlockedPaths:
+    """Round 3, fix 2: both live Range paths run the whole-file canonical
+    checks, so a symlink in the served tree that resolves into the owner's
+    private dirs answers 404 to a colleague. The real ``_live_range_response``
+    runs; only the sandbox read is replaced."""
+
+    _WORK_DIR = "/home/workspace/NVDA_Deep_Dive"
+    # Under .agents/ (a colleague-blocked system tree) but not itself an
+    # always-hidden name and not text-typed, so the colleague's 404 below can
+    # only come from the non-owner canonical check, and the owner's control
+    # answer survives the helper's text- and validator-based "goes whole" outs.
+    _BLOCKED_CANONICAL = "/home/workspace/NVDA_Deep_Dive/.agents/memory/notes.pdf"
+
+    def _blocked_slice(self) -> ContainedSlice:
+        return ContainedSlice(
+            canonical=self._BLOCKED_CANONICAL,
+            size=2048,
+            version="2048 1 2 3",
+            # Bytes UTF-8 has already ruled out (0xff), so the helper's own
+            # "might be text" out cannot swallow the owner's control answer.
+            head=b"%PDF-1.7\xff\xfe\x00binary-head",
+            content=b"%PDF-1.7 sliced-bytes",
+        )
+
+    @pytest.mark.asyncio
+    async def test_live_range_helper_404s_blocked_canonical_for_non_owner(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sandbox = create_autospec(PTCSandbox, instance=True)
+        monkeypatch.setattr(
+            ws_files_crud,
+            "read_contained_sandbox_range",
+            create_autospec(
+                ws_files_crud.read_contained_sandbox_range,
+                return_value=self._blocked_slice(),
+            ),
+        )
+        with pytest.raises(HTTPException) as exc:
+            await ws_files_crud._live_range_response(
+                sandbox,
+                f"{self._WORK_DIR}/link.pdf",
+                self._WORK_DIR,
+                (0, 1023),
+                "inline",
+                blocked_for_non_owner=True,
+            )
+        assert exc.value.status_code == 404
+
+        # The same resolved target answers the owner: a 206 with the slice.
+        owner_answer = await ws_files_crud._live_range_response(
+            sandbox,
+            f"{self._WORK_DIR}/link.pdf",
+            self._WORK_DIR,
+            (0, 1023),
+            "inline",
+            blocked_for_non_owner=False,
+        )
+        assert owner_answer is not None
+        assert owner_answer.status_code == 206
+        assert owner_answer.body == b"%PDF-1.7 sliced-bytes"
+
+    @pytest.mark.asyncio
+    async def test_warm_range_path_serves_nothing_from_blocked_canonical(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The warm path runs the same check through the real helper; its 404
+        is swallowed by design (the route then answers from the acquisition,
+        which raises it), so the warm answer here must be nothing at all."""
+        ws = _sample_workspace(user_id="u-richard", status="running")
+        sandbox = create_autospec(PTCSandbox, instance=True)
+        sandbox.validate_path = lambda _p: True
+        monkeypatch.setattr(
+            ws_files_crud,
+            "warm_sandbox",
+            create_autospec(ws_files_crud.warm_sandbox, return_value=sandbox),
+        )
+        monkeypatch.setattr(
+            ws_files_crud,
+            "read_contained_sandbox_range",
+            create_autospec(
+                ws_files_crud.read_contained_sandbox_range,
+                return_value=self._blocked_slice(),
+            ),
+        )
+        settled, answer = await ws_files_crud._warm_range_response(
+            ws,
+            WS_ID,
+            f"{self._WORK_DIR}/link.pdf",
+            self._WORK_DIR,
+            (0, 1023),
+            "inline",
+            blocked_for_non_owner=True,
+        )
+        assert settled is False
+        assert answer is None
+
+    @pytest.mark.asyncio
+    async def test_rw_colleague_range_of_symlink_into_blocked_dir_is_404(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Route level: an rw colleague's Range request for a symlink whose
+        canonical target sits under .agents/ dies with 404 on the acquisition
+        path, with the whole-file read never reached."""
+        _enable_dalton_auth(monkeypatch)
+        _set_web_sharing(monkeypatch, web_access="rw")
+        ws = _sample_workspace(user_id="u-richard", status="running")
+        monkeypatch.setattr(
+            ws_files_crud,
+            "db_get_workspace",
+            create_autospec(ws_files_crud.db_get_workspace, return_value=ws),
+        )
+        monkeypatch.setattr(
+            ws_files_service,
+            "db_get_workspace",
+            create_autospec(ws_files_service.db_get_workspace, return_value=ws),
+        )
+        monkeypatch.setattr(
+            ws_files_crud,
+            "owner_work_dir",
+            create_autospec(
+                ws_files_crud.owner_work_dir, return_value=self._WORK_DIR
+            ),
+        )
+        # No warm session: the request goes straight through the acquisition.
+        monkeypatch.setattr(
+            ws_files_crud,
+            "warm_sandbox",
+            create_autospec(ws_files_crud.warm_sandbox, return_value=None),
+        )
+        sandbox = create_autospec(PTCSandbox, instance=True)
+        sandbox.validate_path = lambda _p: True
+
+        @asynccontextmanager
+        async def _acquire(*_args):
+            yield sandbox, ws
+
+        monkeypatch.setattr(ws_files_crud, "acquire_sandbox_to_change", _acquire)
+        monkeypatch.setattr(
+            ws_files_crud,
+            "contained_absolute_path",
+            create_autospec(
+                ws_files_crud.contained_absolute_path,
+                return_value=f"{self._WORK_DIR}/link.pdf",
+            ),
+        )
+        range_mock = create_autospec(
+            ws_files_crud.read_contained_sandbox_range,
+            return_value=self._blocked_slice(),
+        )
+        monkeypatch.setattr(ws_files_crud, "read_contained_sandbox_range", range_mock)
+        whole_read_mock = create_autospec(ws_files_crud.read_contained_sandbox_file)
+        monkeypatch.setattr(
+            ws_files_crud, "read_contained_sandbox_file", whole_read_mock
+        )
+        with pytest.raises(HTTPException) as exc:
+            await ws_files_crud.download_workspace_file(
+                WS_ID,
+                x_user_id="u-chao",
+                request=_make_request({"range": "bytes=0-1023"}),
+                path="link.pdf",
+                attachment=False,
+            )
+        assert exc.value.status_code == 404
+        range_mock.assert_awaited_once()
+        whole_read_mock.assert_not_called()
+
+
+class TestSkillsOwnerIdentityReads:
+    """Round 3, fix 3: a workspace view queries the owner's tiers, with real
+    row shapes — a colleague sees the owner's workspace skills, never their own
+    same-name personal skill, and the detail page returns the owner's bytes."""
+
+    _OWNER_WS_ROW: ClassVar[dict[str, Any]] = {
+        "name": "note-demo",
+        "description": "Owner's workspace copy",
+        "command": None,
+        "user_id": "u-richard",
+        "workspace_id": WS_ID,
+        "enabled": True,
+        "confirmed": True,
+        "plugin_id": None,
+        "plugin_name": None,
+        "plugin_enabled": None,
+        "user_skill_id": 101,
+        "archive_key": "archives/owner-ws-note-demo.zip",
+        "content_hash": "hash-owner-ws",
+    }
+    _OWNER_PERSONAL_ROW: ClassVar[dict[str, Any]] = {
+        "name": "owner-personal",
+        "description": "Owner's user-tier skill",
+        "command": None,
+        "user_id": "u-richard",
+        "workspace_id": None,
+        "enabled": True,
+        "confirmed": True,
+        "plugin_id": None,
+        "plugin_name": None,
+        "plugin_enabled": None,
+        "user_skill_id": 102,
+        "archive_key": "archives/owner-personal.zip",
+        "content_hash": "hash-owner-personal",
+    }
+    _CHAO_ROWS: ClassVar[dict[str, dict[str, Any]]] = {
+        "note-demo": {
+            "name": "note-demo",
+            "description": "Chao's same-name personal skill",
+            "command": None,
+            "user_id": "u-chao",
+            "workspace_id": None,
+            "enabled": True,
+            "confirmed": True,
+            "plugin_id": None,
+            "plugin_name": None,
+            "plugin_enabled": None,
+            "user_skill_id": 201,
+            "archive_key": "archives/chao-note-demo.zip",
+            "content_hash": "hash-chao-note-demo",
+        },
+        "chao-private": {
+            "name": "chao-private",
+            "description": "Chao's own tier, invisible in A's workspace",
+            "command": None,
+            "user_id": "u-chao",
+            "workspace_id": None,
+            "enabled": True,
+            "confirmed": True,
+            "plugin_id": None,
+            "plugin_name": None,
+            "plugin_enabled": None,
+            "user_skill_id": 202,
+            "archive_key": "archives/chao-private.zip",
+            "content_hash": "hash-chao-private",
+        },
+    }
+
+    def _owner_rows(
+        self, user_id: str, workspace_id: str | None
+    ) -> list[dict[str, Any]]:
+        """Real-shaped branching: the owner's rows under the owner's id, the
+        colleague's own rows under theirs — so a leak shows up in the result
+        instead of an assertion inside the fake."""
+        if workspace_id == WS_ID:
+            return [dict(self._OWNER_WS_ROW)] if user_id == "u-richard" else []
+        if user_id == "u-richard":
+            return [dict(self._OWNER_PERSONAL_ROW)]
+        return [dict(row) for row in self._CHAO_ROWS.values()]
+
+    def _identity_listing_patches(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> dict[str, Any]:
+        mocks: dict[str, Any] = {}
+        for fn_name in ("list_user_skills", "list_enabled_user_skills"):
+
+            async def _list(
+                user_id: str, workspace_id: str | None = None
+            ) -> list[dict[str, Any]]:
+                return self._owner_rows(user_id, workspace_id)
+
+            mock = create_autospec(getattr(skills_app, fn_name), side_effect=_list)
+            mocks[fn_name] = mock
+            monkeypatch.setattr(skills_app, fn_name, mock)
+        for name, returns in (
+            ("get_disabled_builtin_skills", set()),
+            ("get_skill_command_overrides", {}),
+            ("list_workspace_skill_disables", set()),
+            ("list_account_disables", SimpleNamespace(bundles=set())),
+        ):
+            monkeypatch.setattr(
+                skills_app,
+                name,
+                create_autospec(getattr(skills_app, name), return_value=returns),
+            )
+
+        def _component_owners():
+            return SimpleNamespace(skills={})
+
+        monkeypatch.setattr(
+            "src.server.services.plugins.bundled.component_owners",
+            _component_owners,
+        )
+        return mocks
+
+    def _sample_ws(self, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+        ws = _sample_workspace(user_id="u-richard")
+        monkeypatch.setattr(
+            ws_db,
+            "get_workspace",
+            create_autospec(ws_db.get_workspace, return_value=ws),
+        )
+        return ws
+
+    @staticmethod
+    def _zip_of(name: str, text: str) -> bytes:
+        """A stored archive's shape: every file sits under one ``<name>/``
+        folder, which is what ZipFolder lists."""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as archive:
+            archive.writestr(f"{name}/SKILL.md", text)
+        return buf.getvalue()
+
+    @pytest.mark.asyncio
+    async def test_colleague_sees_owner_skills_not_own(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _enable_dalton_auth(monkeypatch)
+        mocks = self._identity_listing_patches(monkeypatch)
+        self._sample_ws(monkeypatch)
+        result = await skills_app.get_skills(
+            user_id="u-chao",
+            include_disabled=False,
+            workspace_id=WS_ID,
+            all_scopes=False,
+        )
+        by_name = {s.name: s for s in result["skills"]}
+        # The workspace row is the owner's, and it is what the view carries.
+        assert by_name["note-demo"].origin == "workspace"
+        assert by_name["note-demo"].description == "Owner's workspace copy"
+        # The owner's user tier shows; the colleague's own tier does not.
+        assert "owner-personal" in by_name
+        assert "chao-private" not in by_name
+        # Every tier query ran under the owner's id, never the caller's.
+        for mock in (mocks["list_user_skills"], mocks["list_enabled_user_skills"]):
+            assert mock.await_count > 0
+            for call in mock.await_args_list:
+                assert call.args[0] == "u-richard"
+
+    @pytest.mark.asyncio
+    async def test_colleague_reads_owner_workspace_skill_content(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _enable_dalton_auth(monkeypatch)
+        self._sample_ws(monkeypatch)
+        owner_archive = self._zip_of("note-demo", "# Owner's workspace skill\n")
+        chao_archive = self._zip_of("note-demo", "# Chao's personal copy\n")
+
+        async def _get_user_skill(
+            user_id: str, name: str, workspace_id: str | None = None
+        ) -> dict[str, Any] | None:
+            if user_id == "u-richard" and workspace_id == WS_ID:
+                return dict(self._OWNER_WS_ROW)
+            if user_id == "u-chao" and name in self._CHAO_ROWS:
+                return dict(self._CHAO_ROWS[name])
+            return None
+
+        get_mock = create_autospec(
+            skills_app.get_user_skill, side_effect=_get_user_skill
+        )
+        monkeypatch.setattr(skills_app, "get_user_skill", get_mock)
+
+        async def _fetch(user_id: str, row: dict[str, Any]) -> bytes:
+            return owner_archive if row["user_id"] == "u-richard" else chao_archive
+
+        fetch_mock = create_autospec(
+            skills_app.fetch_skill_archive, side_effect=_fetch
+        )
+        monkeypatch.setattr(skills_app, "fetch_skill_archive", fetch_mock)
+
+        response = await skills_app.get_skill_content(
+            "note-demo",
+            user_id="u-chao",
+            workspace_id=WS_ID,
+            path="SKILL.md",
+        )
+        # The page carries the owner's workspace row, served from the owner's
+        # archive — a leak would show Chao's personal copy instead.
+        assert response["content"] == "# Owner's workspace skill\n"
+        assert response["name"] == "note-demo"
+        for call in get_mock.await_args_list:
+            assert call.args[0] == "u-richard"
+        fetch_mock.assert_awaited_once()
+        assert fetch_mock.await_args.args[0] == "u-richard"
