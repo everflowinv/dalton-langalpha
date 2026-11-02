@@ -845,7 +845,11 @@ def _archive_after_unwind(
     async def archive() -> None:
         writers = [writer for task in tasks for writer in task.live_writers]
         if writers:
-            await asyncio.wait(writers, timeout=SUBAGENT_TAIL_TIMEOUT)
+            # DALTON-HOOK(tail-drain-outlives-workflows): the same
+            # child_timeout-sized allowance the guard drain waits, so a lane
+            # is not archived (its events read) while its writer may still
+            # append for as long as the drain would have held it.
+            await asyncio.wait(writers, timeout=subagent_tail_timeout())
         events: list[dict] = []
         for task in tasks:
             events.extend(await killed_lane(thread_id, task, owner=response_id))
@@ -865,6 +869,28 @@ def _archive_after_unwind(
 # research) run 15+ min, so a writer alive past this is hung: the guard drain
 # discards the run's session under it, and the stop bill stops waiting for it.
 SUBAGENT_TAIL_TIMEOUT = 1800.0
+
+
+# DALTON-HOOK(tail-drain-outlives-workflows): an ordinary (non-workflow)
+# background subagent keeps the workflow child's ceiling. Production raised
+# workflow child_timeout to 5400s via the Dalton overlay while this flat
+# 1800s discarded healthy model-building tail subagents 30 minutes in
+# (worker_lost from the recovery scanner once the fence fell); upstream's
+# child_timeout default of 1800s leaves the allowance at 1800s, so behavior
+# there is unchanged.
+def subagent_tail_timeout() -> float:
+    """Tail allowance for ordinary subagent writers, from the workflow
+    orchestration config: ``max(SUBAGENT_TAIL_TIMEOUT, child_timeout)``.
+
+    Read per call, never cached: config overlays can change between deploys,
+    and the guard drain re-derives it on every deadline pass.
+    """
+    from src.config.settings import get_workflow_orchestration_config
+
+    return max(
+        SUBAGENT_TAIL_TIMEOUT,
+        float(get_workflow_orchestration_config().child_timeout),
+    )
 
 
 async def _bill_after_unwind(
@@ -889,12 +915,18 @@ async def _bill_after_unwind(
         return
 
     async def bill_when_settled() -> None:
-        _, hung = await asyncio.wait(writers, timeout=SUBAGENT_TAIL_TIMEOUT)
+        # DALTON-HOOK(tail-drain-outlives-workflows): deliberately stays at the
+        # upstream SUBAGENT_TAIL_TIMEOUT, not subagent_tail_timeout(). This waits
+        # for the whole batch, and settle_abandoned stamps a task finalized more
+        # than 30 minutes ago; a longer wait would let a finished task drop out
+        # of the in-flight count before its usage row is written.
+        tail_timeout = SUBAGENT_TAIL_TIMEOUT
+        _, hung = await asyncio.wait(writers, timeout=tail_timeout)
         if hung:
             logger.warning(
                 f"[SubagentUsage] {len(hung)} writer(s) of response_id="
                 f"{response_id} thread_id={thread_id} still running after "
-                f"{SUBAGENT_TAIL_TIMEOUT:.0f}s; billing without their usage"
+                f"{tail_timeout:.0f}s; billing without their usage"
             )
         await persist_subagent_usage(
             response_id, tasks, thread_id, workspace_id, user_id, is_byok=is_byok

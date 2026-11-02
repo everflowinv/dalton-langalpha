@@ -1231,7 +1231,8 @@ class LocalRunExecutor:
 
     # DALTON-HOOK(tail-drain-outlives-workflows): sizes the drain deadline
     # per writer — a live root workflow's own run_timeout window, everyone
-    # else the flat tail allowance.
+    # else the tail allowance subagent_tail_timeout() sizes (the flat 1800s
+    # or the workflow child_timeout, whichever is longer).
     async def _tail_drain_deadline(
         self,
         thread_id: str,
@@ -1242,12 +1243,14 @@ class LocalRunExecutor:
         """When the drain may give up on these writers, and why (for the
         timeout's wording): each live ROOT workflow run gets its own
         ``run_timeout`` window counted from its start plus a settle margin;
-        every other writer gets the flat ``SUBAGENT_TAIL_TIMEOUT`` tail
-        allowance counted from the drain's start. The drain waits to the
-        latest of the applicable deadlines — discarding any writer before
-        its own clock permits is the production failure this exists to
-        prevent. A workflow-rows read that fails degrades to the global
-        workflow timeout (hours): hold, never kill blind."""
+        every other writer gets the ``subagent_tail_timeout()`` tail
+        allowance — the flat ``SUBAGENT_TAIL_TIMEOUT`` raised to the workflow
+        ``child_timeout`` when that is longer — counted from the drain's
+        start. The drain waits to the latest of the applicable deadlines —
+        discarding any writer before its own clock permits is the production
+        failure this exists to prevent. A workflow-rows read that fails
+        degrades to the global workflow timeout (hours): hold, never kill
+        blind."""
         from datetime import UTC
 
         from src.config.settings import (
@@ -1256,10 +1259,16 @@ class LocalRunExecutor:
         )
         from src.server.database.runs import subagent_runs as sr_db
 
-        flat_deadline = drain_started + subagent_collection.SUBAGENT_TAIL_TIMEOUT
+        # DALTON-HOOK(tail-drain-outlives-workflows): an ordinary tail
+        # subagent keeps the workflow child's ceiling too — production's
+        # Dalton overlay raised child_timeout to 5400s while the flat 1800s
+        # discarded healthy modelers 30 minutes in.
+        tail_allowance = subagent_collection.subagent_tail_timeout()
+        flat_deadline = drain_started + tail_allowance
         flat_basis = (
-            f"the flat {subagent_collection.SUBAGENT_TAIL_TIMEOUT:.0f}s tail "
-            f"allowance"
+            f"the {tail_allowance:.0f}s tail allowance for ordinary writers "
+            f"(max of the flat {subagent_collection.SUBAGENT_TAIL_TIMEOUT:.0f}s "
+            f"and the workflow child_timeout)"
         )
         try:
             open_workflows = await sr_db.list_open_workflow_runs_for_thread(
