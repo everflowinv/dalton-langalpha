@@ -133,7 +133,7 @@ def create_publish_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         """Publish a finished draft as the fund's official research (.md and optional .xlsx model): audits every figure, gets an independent review, then asks the PM to approve.
 
         Admins and internal members only: external members are refused outright (report the refusal honestly; drafting and check_draft stay available).
-        Call only when the draft is final; while drafting use check_draft. Unmatched figures or a "revise" review come back as a list to fix — fix and call again.
+        Call only when the draft is final; while drafting use check_draft. Unmatched figures or a "revise" review come back as a list to fix — fix and call again; a "block" review names an unfixable-by-revision problem (factual error, numbers that do not match, conclusion without evidence) that a human must handle before re-submitting.
         Returns: the published paths, or what blocks publishing and what to do next.
         """
         user_id, workspace_id, thread_id, _ = _extract_run_identity(config)

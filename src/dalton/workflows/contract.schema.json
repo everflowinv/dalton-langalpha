@@ -490,7 +490,8 @@
           "additionalProperties": false,
           "required": [
             "draft",
-            "absent_verdict_kinds_any"
+            "absent_verdict_kinds_any",
+            "gates_file"
           ],
           "properties": {
             "draft": {
@@ -509,9 +510,21 @@
                 "type": "string"
               },
               "description": "草稿不存在（门禁未过分支）时本轮须有的 verdict word（如 NO_CHANGE）。"
+            },
+            "gates_file": {
+              "type": "string",
+              "minLength": 1,
+              "description": "门禁未过分支必须写下的门禁结果文件路径模板：{\"passed\": false, \"failed_gates\": [{\"gate\": 1-6, \"reason\": \"…\"}], \"as_of\": \"…\"}，至少一条带原因的失败门禁；门禁通过时写 passed=true。"
+            },
+            "knowledge_docs_any_unless_no_change": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "门禁未过且本轮 verdict 不是 NO_CHANGE 时，这些知识文档（至少其一）须在本轮有 source=tool 新版本——论点变了就要落到知识层。"
             }
           },
-          "description": "门禁两分支（dalton-call）：草稿存在＝门禁通过，要求草稿足量且 check_draft 侧车哈希一致；草稿不存在＝门禁未过，要求本轮有 absent_verdict_kinds_any 的 verdict；两者都没有或读取出错＝无法判定，记 missing。"
+          "description": "门禁两分支（dalton-call）：本轮 gates_file 为 passed=false＝门禁未过，要求 failed_gates 各带原因、本轮有 absent_verdict_kinds_any 之一的 verdict（有本轮对话的 run 标识时按 run_id 严格匹配，取不到该标识时退回时间窗口并在 warnings 里说明），且 verdict 非 NO_CHANGE 时 knowledge_docs_any_unless_no_change 至少其一本轮有更新；passed=true 或本轮没有门禁未过的文件＝门禁通过，要求正式草稿为本轮新写、足量且 check_draft 侧车哈希一致；两支条件都不满足或读取出错＝无法判定，记 missing。"
         }
       },
       "dependentRequired": {

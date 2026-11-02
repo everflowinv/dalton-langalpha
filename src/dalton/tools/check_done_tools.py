@@ -38,6 +38,7 @@ from src.dalton.publish.language import (
     SIDECAR_SUFFIXES,
     is_reviewable_deliverable,
 )
+from src.dalton.publish.review import effective_review_verdict, reviewer_reply_error
 from src.dalton.tools.knowledge_tools import _extract_run_identity
 from src.dalton.workflows.contracts import (
     ContractError,
@@ -1030,7 +1031,13 @@ async def _find_run_review_pass(
     if last.get("status") != "ok":
         return False, f"最后一次审稿派发未成功（status={last.get('status')!r}），需重跑"
     result = last.get("result")
-    verdict = result.get("verdict") if isinstance(result, dict) else None
+    # The shared reviewer contract (publish/review.py): items must cover 1–9
+    # and a pass with must_fix reads as revise — the same rules the driver
+    # enforced when the child answered and the workflows judge in JS.
+    contract_error = reviewer_reply_error(result)
+    if contract_error:
+        return False, f"最后一次审稿输出无效：{contract_error}；需重审"
+    verdict = effective_review_verdict(result)
     if verdict != "pass":
         summary = result.get("summary") if isinstance(result, dict) else None
         return False, f"本次 run 最后一条审稿结论是 {verdict!r}，不是 pass{('：' + str(summary)) if summary else ''}"
@@ -1040,9 +1047,15 @@ async def _find_run_review_pass(
         if status != "ok" or text is None:
             raise _CannotVerify(f"被审草稿读取失败（{draft_path}），无法核对审稿哈希")
         current = hashlib.sha256(text.encode("utf-8")).hexdigest()
-        recorded = result.get("draft_sha256") if isinstance(result, dict) else None
+        # The binding is caller-side: the driver hashed the draft named by the
+        # dispatch's reviewDraft opt and stamped it on the journal record. A
+        # hash inside the result would be the model's word and is not read.
+        recorded = last.get("draft_sha256")
         if not isinstance(recorded, str) or not _SHA256_RE.match(recorded):
-            return False, "审稿记录里没有 64 位十六进制的被审草稿哈希（draft_sha256）"
+            return False, (
+                "这条审稿记录没有记下被审草稿的哈希（通常是旧版运行留下的记录），"
+                "无法确认它审的是当前草稿，需要对当前草稿重新审稿"
+            )
         if recorded != current:
             return False, (
                 f"审稿针对的是旧草稿：记录哈希 {recorded[:12]}…，当前 {draft_path} "
@@ -1063,7 +1076,8 @@ async def _find_manual_review_pass(
 ) -> tuple[bool, str]:
     """(passed, reason) for the manual path: the reviewer JSON the analyst
     saved at ``sidecar`` — one object or a list (the last entry is the final
-    word) — must be a pass whose ``draft_sha256`` equals the CURRENT draft's
+    word) — must be a valid reviewer reply whose ``draft_sha256`` (written by
+    the saving analyst, never the reviewer's echo) equals the CURRENT draft's
     hash, computed here, exactly as the journal check demands."""
     status, text = await _read_text_diagnosed(backend, sidecar)
     if status == "error":
@@ -1071,7 +1085,9 @@ async def _find_manual_review_pass(
     if status == "missing" or text is None:
         return False, (
             f"手动降级路径没有审稿记录 {sidecar}；下一步：派 dalton-reviewer 审最终稿，"
-            "把它返回的 JSON（含 verdict 与 draft_sha256）原样保存到该路径"
+            "把它返回的 JSON（verdict/summary/items 覆盖 1–9 项/must_fix/nice_to_have，"
+            "审稿人不回填哈希）保存到该路径，并把送审的这份最终稿的 sha256 写入 "
+            "draft_sha256 字段"
         )
     try:
         doc = json.loads(text)
@@ -1081,7 +1097,13 @@ async def _find_manual_review_pass(
         doc = doc[-1] if doc else None
     if not isinstance(doc, dict):
         return False, f"手动审稿记录结构异常（{sidecar}），需为审稿 JSON 对象"
-    verdict = doc.get("verdict")
+    # The same contract as the journal path: 1–9 covered, pass+must_fix is
+    # revise. The analyst-computed draft_sha256 field does not bother the
+    # contract check (ReviewVerdict tolerates it).
+    contract_error = reviewer_reply_error(doc)
+    if contract_error:
+        return False, f"手动审稿输出无效：{contract_error}；需重审并重新保存"
+    verdict = effective_review_verdict(doc)
     if verdict != "pass":
         summary = doc.get("summary")
         return False, f"手动审稿记录的最后结论是 {verdict!r}，不是 pass{('：' + str(summary)) if summary else ''}"
@@ -1093,7 +1115,11 @@ async def _find_manual_review_pass(
     current = hashlib.sha256(draft_text.encode("utf-8")).hexdigest()
     recorded = doc.get("draft_sha256")
     if not isinstance(recorded, str) or not _SHA256_RE.match(recorded):
-        return False, f"手动审稿记录 {sidecar} 里没有 64 位十六进制的被审草稿哈希（draft_sha256）"
+        return False, (
+            f"手动审稿记录 {sidecar} 里没有 64 位十六进制的被审草稿哈希（draft_sha256，"
+            "由保存审稿 JSON 的你计算并写入，审稿人不回填）；下一步：如果这次审稿审的就是当前最终稿，"
+            "把它的 sha256 补进该字段后重新保存；审稿之后改过草稿的，先对当前最终稿重新审稿再保存"
+        )
     if recorded != current:
         return False, (
             f"手动审稿针对的是旧草稿：记录哈希 {recorded[:12]}…，当前 {draft_path} "
@@ -1475,17 +1501,18 @@ async def _check_closing(
 
     gate = closing.get("gated_draft")
     if gate:
-        missing.extend(
-            await _check_gated_draft(
-                backend,
-                gate,
-                params,
-                workspace_id,
-                since,
-                thread_id=thread_id,
-                resolved=resolved_map,
-            )
+        gate_missing, gate_warnings = await _check_gated_draft(
+            backend,
+            gate,
+            params,
+            workspace_id,
+            since,
+            thread_id=thread_id,
+            conversation_run_id=conversation_run_id,
+            resolved=resolved_map,
         )
+        missing.extend(gate_missing)
+        warnings.extend(gate_warnings)
 
     publication = closing.get("published_or_awaiting_pm")
     if publication:
@@ -1820,9 +1847,17 @@ async def _last_review_pass_sha256(
         if entry.get("status") != "ok":
             continue
         result = entry.get("result")
-        sha = result.get("draft_sha256") if isinstance(result, dict) else None
-        if isinstance(result, dict) and result.get("verdict") == "pass":
-            return True, sha if isinstance(sha, str) and _SHA256_RE.match(sha) else None
+        # The shared reviewer contract (round 3 #6): an invalid reply (missing
+        # items, stringly check numbers) or a pass carrying must_fix (that is a
+        # revise) is not a passing review — keep looking for a real one.
+        if reviewer_reply_error(result) is not None:
+            continue
+        if effective_review_verdict(result) != "pass":
+            continue
+        # Caller-bound hash on the journal record (the driver hashed the draft
+        # named by the dispatch's reviewDraft opt) — never the result's echo.
+        sha = entry.get("draft_sha256")
+        return True, sha if isinstance(sha, str) and _SHA256_RE.match(sha) else None
     return True, None
 
 
@@ -2034,12 +2069,6 @@ async def _check_language_review(
     resolved_map = resolved or {}
     draft_template = render_template(rule["draft"], params)
     draft = resolved_map.get(draft_template, draft_template)
-    if (contract.get("closing") or {}).get("gated_draft"):
-        # A gated contract (dalton-call) legitimately has no draft when the
-        # gate failed; that branch is judged by gated_draft itself.
-        status, _ = await _read_text_diagnosed(backend, draft)
-        if status == "missing":
-            return []
     # An autospec'd backend answers `workspace_dir` with a Mock — only a real
     # string root can anchor an absolute spelling of a file.
     workspace_dir = getattr(backend, "workspace_dir", None)
@@ -2073,6 +2102,26 @@ async def _check_language_review(
         )
         if gap:
             return gap
+
+    gates = (contract.get("closing") or {}).get("gated_draft")
+    if gates:
+        # 分支选择跟随本轮的门禁结果（round 3 #1）：本轮 passed=false 的门禁
+        # 分支由 gated_draft 自己判定（语言审查随之不要求，遗留草稿也不审）；
+        # 门禁读取的 gap 同样交给 gated_draft 汇报，这里不重复报。
+        gates_outcome, gates_gaps = await _gates_outcome_this_run(
+            backend,
+            gates,
+            params,
+            resolved_map,
+            datetime.fromtimestamp(since_epoch, tz=timezone.utc),
+        )
+        if gates_gaps or gates_outcome == "failed":
+            return []
+        # A gated contract legitimately has no draft when the gate failed; a
+        # missing draft is the gate branch's own gap to report.
+        status, _ = await _read_text_diagnosed(backend, draft)
+        if status == "missing":
+            return []
 
     # 1. What the contract declares — only ``fresh_this_run`` files must be
     # this run's writing; a reused draft (dalton-publish's approved original,
@@ -2278,6 +2327,111 @@ async def _check_knowledge_unless_no_change(
     ]
 
 
+def _gates_file_error(doc: Any) -> str | None:
+    """The gate-result file's own contract: ``{"passed": false, "failed_gates":
+    [{"gate": 1-6, "reason": "…"}], "as_of": "…"}`` with at least one failed
+    gate that carries a reason (prompt review batch 1 round 2 #3)."""
+    if not isinstance(doc, dict):
+        return "门禁结果文件需为 JSON 对象"
+    if doc.get("passed") is not False:
+        return "passed 不是 false（门禁未过分支要求 passed=false 的门禁结果文件）"
+    failed = doc.get("failed_gates")
+    if not isinstance(failed, list) or not failed:
+        return "failed_gates 缺失或为空（至少一条未通过的门禁）"
+    for idx, item in enumerate(failed):
+        if not isinstance(item, dict):
+            return f"failed_gates[{idx}] 需为对象"
+        gate = item.get("gate")
+        if not isinstance(gate, int) or isinstance(gate, bool) or not 1 <= gate <= 6:
+            return f"failed_gates[{idx}].gate 需为 1–6 的门禁编号"
+        if not str(item.get("reason") or "").strip():
+            return f"failed_gates[{idx}].reason 缺失（每条失败门禁都要有原因）"
+    return None
+
+
+async def _check_verdicts_this_run(
+    workspace_id: str,
+    *,
+    kinds: list[str],
+    since: datetime,
+    thread_id: str | None,
+    conversation_run_id: str | None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """This run's verdicts and whether they were attributed by ``run_id``.
+
+    When the caller names this turn's conversation run, attribution is STRICT:
+    only rows whose ``run_id`` equals it count — rows without a ``run_id``
+    never stand in (prompt review batch 1 round 3 #2). Only when no
+    conversation run was named does the ``since`` window stand, and the caller
+    says so in a warning (without nudging the model toward any parameter: the
+    conversation run id is not something the model passes).
+    """
+    rows = await _check_verdicts(
+        workspace_id, kinds=kinds, since=since, thread_id=thread_id
+    )
+    if conversation_run_id:
+        return (
+            [
+                row
+                for row in rows
+                if str(row.get("run_id") or "") == str(conversation_run_id)
+            ],
+            True,
+        )
+    return rows, False
+
+
+async def _gates_outcome_this_run(
+    backend: Any,
+    gate: dict[str, Any],
+    params: dict[str, Any],
+    resolved: dict[str, str] | None,
+    since: datetime,
+) -> tuple[str, list[str]]:
+    """("failed" | "passed" | "absent", gaps): THIS round's gate-result file.
+
+    本轮的标准（round 3 #1）：文件 mtime 在本轮窗口内（MTIME_TOLERANCE_SECONDS）
+    且 ``as_of`` 与参数一致；不满足任一就不是本轮的门禁结果（"absent"），读取
+    或解析失败是 gap（fail-closed，绝不默默放过）。"""
+    template = gate.get("gates_file")
+    if not template:
+        return "absent", []
+    path = render_template(template, params)
+    path = (resolved or {}).get(path, path)
+    status, text = await _read_text_diagnosed(backend, path)
+    if status == "error":
+        return "absent", [f"门禁结果文件读取出错（{path}），无法判定门禁结果，请重试。"]
+    if status == "missing" or text is None:
+        return "absent", []
+    info = await _file_info(backend, path)
+    if info.mtime_epoch is None:
+        return "absent", [f"门禁结果文件 {path} 的修改时间无法读取，无法确认是本轮结果，请重试。"]
+    if info.mtime_epoch < int(since.timestamp()) - MTIME_TOLERANCE_SECONDS:
+        return "absent", []
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return "absent", [
+            f"门禁结果文件不可解析（{path}），需要重写为合法 JSON：门禁未过写 "
+            '{"passed": false, "failed_gates": [{"gate": 1, "reason": "…"}], "as_of": "YYYY-MM-DD"}'
+            '（gate 取整数 1–6），门禁全过写 {"passed": true, "failed_gates": [], "as_of": "YYYY-MM-DD"}'
+        ]
+    if not isinstance(doc, dict) or str(doc.get("as_of") or "") != str(
+        params.get("as_of") or ""
+    ):
+        recorded_as_of = doc.get("as_of") if isinstance(doc, dict) else None
+        return "absent", [
+            f"门禁结果文件 {path} 的 as_of（{recorded_as_of!r}）与参数 as_of 不一致，"
+            "不能当作本轮结果；下一步：按本轮参数重写该文件。"
+        ]
+    if doc.get("passed") is True:
+        return "passed", []
+    gates_error = _gates_file_error(doc)
+    if gates_error:
+        return "absent", [f"门禁结果文件不合契约（{path}）：{gates_error}。"]
+    return "failed", []
+
+
 async def _check_gated_draft(
     backend: Any,
     gate: dict[str, Any],
@@ -2286,60 +2440,125 @@ async def _check_gated_draft(
     since: datetime,
     *,
     thread_id: str | None = None,
+    conversation_run_id: str | None = None,
     resolved: dict[str, str] | None = None,
-) -> list[str]:
-    """The two gate branches, each with its own signature: a formal draft
-    (gate passed) owes size + a current check_draft sidecar; no draft (gate
-    failed) owes this round's verdict word. Neither signature readable is
-    无法判定, never a pass."""
+) -> tuple[list[str], list[str]]:
+    """The two gate branches, chosen by THIS round's gate-result file first
+    (round 3 #1): a fresh ``passed=false`` file means the failure branch no
+    matter what drafts are lying around; ``passed=true`` or no fresh file
+    means the draft branch, which demands a draft written THIS round (mtime in
+    the window). The failure branch owes this run's verdict — any of the five
+    words, chosen by the argument's actual change — and, when that word is
+    not NO_CHANGE, a thesis update behind it. Neither signature readable is
+    无法判定, never a pass. Returns (missing, warnings)."""
     draft_template = render_template(gate["draft"], params)
     draft = (resolved or {}).get(draft_template, draft_template)
+
+    outcome, gates_gaps = await _gates_outcome_this_run(
+        backend, gate, params, resolved, since
+    )
+    if gates_gaps:
+        return gates_gaps, []
+
+    if outcome == "failed":
+        # The failure branch: the file already named its reasoned failed
+        # gates; what it owes beyond them is this run's verdict (+ thesis).
+        kinds = list(gate["absent_verdict_kinds_any"])
+        if not workspace_id:
+            return [
+                (
+                    f"本轮门禁结果为未通过（{draft} 不再要求），但无 workspace_id 无法核对"
+                    "门禁未过分支的 verdict；请在公司工作区线程重试。"
+                )
+            ], []
+        warnings: list[str] = []
+        try:
+            rows, by_run_id = await _check_verdicts_this_run(
+                workspace_id,
+                kinds=kinds,
+                since=since,
+                thread_id=thread_id,
+                conversation_run_id=conversation_run_id,
+            )
+        except Exception as error:
+            logger.warning("dalton_check_done gate verdict query failed", error=str(error))
+            return [
+                (
+                    "本轮门禁结果为未通过，但门禁未过分支的 verdict 无法核对"
+                    "（数据库查询失败），无法判定门禁结果，请重试。"
+                )
+            ], warnings
+        if not by_run_id:
+            warnings.append(
+                "verdict 按时间窗口归因（未取到本轮对话的 run 标识，可能计入本窗口内"
+                "其他轮次的 verdict）。"
+            )
+        if not rows:
+            return [
+                (
+                    f"本轮门禁结果为未通过，但本轮没有五词结论（{'/'.join(kinds)}）的 verdict"
+                    "；下一步：按论点的实际变化调用 knowledge_append_verdict 写其中之一"
+                    "（论点确实没有变化才写 NO_CHANGE）；已完成的赔率判断写在给 PM 的说明里。"
+                )
+            ], warnings
+        missing: list[str] = []
+        cond_docs = list(gate.get("knowledge_docs_any_unless_no_change") or [])
+        if cond_docs and any(str(row.get("word")) != "NO_CHANGE" for row in rows):
+            missing.extend(
+                await _check_knowledge_unless_no_change(
+                    workspace_id, cond_docs, rows, since
+                )
+            )
+        return missing, warnings
+
+    # The draft branch: gates passed this round, or no fresh gate-result file.
     status, text = await _read_text_diagnosed(backend, draft)
     if status == "error" or (status == "ok" and text is None):
-        return [f"正式草稿读取出错（{draft}），无法判定门禁结果，请重试。"]
-    if status == "ok":
-        gaps: list[str] = []
-        need = gate.get("min_bytes")
-        size = len((text or "").encode("utf-8"))
-        if need and size < need:
-            gaps.append(
-                f"正式草稿过小（{draft}，{size} 字节 < {need}），疑似占位。下一步：写满该交付物。"
-            )
-        message = await _check_draft_sidecar(backend, draft)
-        if message:
-            gaps.append(message)
-        return gaps
-
-    kinds = list(gate["absent_verdict_kinds_any"])
-    if not workspace_id:
+        return [f"正式草稿读取出错（{draft}），无法判定门禁结果，请重试。"], []
+    if status == "missing":
+        detail = (
+            "本轮门禁结果为通过，但没有正式草稿"
+            if outcome == "passed"
+            else "既没有本轮的门禁结果文件，也没有正式草稿"
+        )
         return [
             (
-                f"没有正式草稿 {draft}，且无 workspace_id 无法核对门禁未过分支的 verdict；"
-                "无法判定门禁结果，请在公司工作区线程重试。"
+                f"无法判定门禁结果：{detail} {draft}；下一步：门禁全过就写草稿并 "
+                f"check_draft，门禁未过就写 {render_template(gate.get('gates_file') or 'research/{as_of}-call.gates.json', params)}"
+                "（passed=false、failed_gates 各带原因）并按论点实际变化写五词结论。"
             )
-        ]
-    try:
-        rows = await _check_verdicts(
-            workspace_id, kinds=kinds, since=since, thread_id=thread_id
-        )
-    except Exception as error:
-        logger.warning("dalton_check_done gate verdict query failed", error=str(error))
+        ], []
+    # A draft this run did not write cannot close this run's contract — the
+    # gates file said passed (or is absent), so the draft must be fresh. An
+    # unreadable mtime fails closed exactly like the gates file's freshness
+    # check: only an mtime affirmatively inside this run's window lets the
+    # draft through (round 4 #1).
+    info = await _file_info(backend, draft)
+    if info.mtime_epoch is None:
         return [
             (
-                f"没有正式草稿 {draft}，门禁未过分支的 verdict 无法核对（数据库查询失败），"
-                "无法判定门禁结果，请重试。"
+                f"正式草稿 {draft} 的修改时间无法读取，无法确认草稿是本轮写的，"
+                "请重试。"
             )
-        ]
-    if rows:
-        return []
-    return [
-        (
-            f"无法判定门禁结果：既没有正式草稿 {draft}（门禁通过分支），"
-            f"自 {since.date().isoformat()} 起也没有 word ∈ {'/'.join(kinds)} 的 verdict"
-            "（门禁未过分支）；下一步：门禁全过就写草稿并 check_draft，"
-            "门禁未过就用 knowledge_append_verdict 写 NO_CHANGE。"
+        ], []
+    if info.mtime_epoch < int(since.timestamp()) - MTIME_TOLERANCE_SECONDS:
+        return [
+            (
+                f"正式草稿 {draft} 不是本轮写下的（修改时间早于本轮窗口），旧稿不能"
+                "作为本轮门禁通过分支的交付物；下一步：本轮重新成稿并 check_draft。"
+            )
+        ], []
+    gaps: list[str] = []
+    need = gate.get("min_bytes")
+    size = len((text or "").encode("utf-8"))
+    if need and size < need:
+        gaps.append(
+            f"正式草稿过小（{draft}，{size} 字节 < {need}），疑似占位。下一步：写满该交付物。"
         )
-    ]
+    message = await _check_draft_sidecar(backend, draft)
+    if message:
+        gaps.append(message)
+    return gaps, []
 
 
 def _workspace_relative(path: str, workspace_dir: str | None) -> str:

@@ -464,11 +464,20 @@ async def test_pm_dalton_reviewer_models_used_by_publish_run_review(
     ) -> DaltonCompleteResult:
         eff = str(request_model or model or "")
         called_models.append(eff)
+        from src.dalton.publish.review import ReviewCheckItem
+
         return DaltonCompleteResult(
             ok=True,
             status="done",
             model=eff,
-            data=ReviewVerdict(verdict="pass", summary="Approved by PM reviewer list"),
+            data=ReviewVerdict(
+                verdict="pass",
+                summary="Approved by PM reviewer list",
+                items=[
+                    ReviewCheckItem(check=n, result="pass", reason="ok")
+                    for n in range(1, 10)
+                ],
+            ),
             usage={"input_tokens": 50, "output_tokens": 10},
             cash_usd=0.0,
             notional_usd=0.01,

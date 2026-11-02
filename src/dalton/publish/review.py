@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import logging
 from datetime import datetime, timezone
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt
 
 from src.dalton.settings import REPO_ROOT
 
@@ -15,11 +16,19 @@ logger = logging.getLogger(__name__)
 
 REVIEWER_AGENT_PATH = REPO_ROOT / "plugins" / "dalton" / "agents" / "dalton-reviewer.md"
 
+# The reviewer agent prompt numbers its checks 1..9; a reply must cover every
+# one or it is not a review of the whole contract (missing items are invalid,
+# not silently "pass").
+REVIEW_CHECK_NUMBERS: tuple[int, ...] = tuple(range(1, 10))
+
 
 class ReviewCheckItem(BaseModel):
-    """Single check item (1..7) from the independent reviewer."""
+    """Single check item (1..9) from the independent reviewer.
 
-    check: int = Field(ge=1, le=7)
+    ``check`` is a STRICT integer: a stringly-typed ``"1"`` is an invalid
+    reply, not something to coerce (prompt review batch 1 round 3 #4)."""
+
+    check: StrictInt = Field(ge=1, le=9)
     result: Literal["pass", "revise"]
     reason: str
     lines: list[int] = Field(default_factory=list)
@@ -28,11 +37,83 @@ class ReviewCheckItem(BaseModel):
 class ReviewVerdict(BaseModel):
     """Structured output schema for ``dalton-reviewer`` (PK.10)."""
 
-    verdict: Literal["pass", "revise"]
+    verdict: Literal["pass", "revise", "block"]
     summary: str
     items: list[ReviewCheckItem] = Field(default_factory=list)
     must_fix: list[str] = Field(default_factory=list)
     nice_to_have: list[str] = Field(default_factory=list)
+    # The prompt no longer asks the model to echo the draft hash — the caller
+    # injects it into the review input and stamps the result itself. The field
+    # stays so a reply that carries one anyway can be checked for consistency
+    # instead of being trusted or silently dropped.
+    draft_sha256: str | None = None
+
+
+def review_contract_error(
+    verdict: ReviewVerdict, *, draft_sha256: str | None = None
+) -> str | None:
+    """Contract check on a reviewer reply; ``None`` means the reply is valid.
+
+    Items must cover checks 1..9 (a missing check is an invalid review, not a
+    pass), and a ``draft_sha256`` echoed by the model must equal the hash the
+    caller injected into the review input.
+    """
+    covered = {item.check for item in verdict.items}
+    missing = [str(n) for n in REVIEW_CHECK_NUMBERS if n not in covered]
+    if missing:
+        return f"items 未覆盖检查项 {','.join(missing)}（要求逐项覆盖 1–9）"
+    if (
+        draft_sha256
+        and verdict.draft_sha256
+        and verdict.draft_sha256.strip().lower() != draft_sha256.strip().lower()
+    ):
+        return (
+            "回填的 draft_sha256 与被审草稿不一致"
+            f"（{verdict.draft_sha256[:16]}… ≠ 注入的 {draft_sha256[:16]}…）"
+        )
+    return None
+
+
+def reviewer_reply_error(reply: Any) -> str | None:
+    """Contract check on any ``dalton-reviewer`` reply — the workflow child,
+    the manual sidecar, and the server path all judge the same shape.
+
+    A reply that is not a valid ``ReviewVerdict`` (checks 1..9 covered, usable
+    item shapes) is an invalid review, never a pass; the caller records it as
+    such so resume never reuses it.
+    """
+    from pydantic import ValidationError
+
+    try:
+        verdict = ReviewVerdict.model_validate(reply)
+    except ValidationError as error:
+        first = error.errors()[0] if error.errors() else {}
+        loc = ".".join(str(part) for part in first.get("loc", ()))
+        return (
+            "审稿输出不符合结构"
+            f"（{loc or '根字段'}: {first.get('msg', 'invalid')}）——"
+            "要求 verdict/summary/items 覆盖 1–9 项/must_fix/nice_to_have"
+        )
+    return review_contract_error(verdict)
+
+
+def effective_review_verdict(reply: Any) -> str | None:
+    """The reply's verdict after the must_fix rule, or ``None`` when invalid.
+
+    ``pass`` with a non-empty ``must_fix`` reads as ``revise`` — the same rule
+    the server applies (``run_review``); ``block`` is never downgraded.
+    """
+    from pydantic import ValidationError
+
+    try:
+        verdict = ReviewVerdict.model_validate(reply)
+    except ValidationError:
+        return None
+    if review_contract_error(verdict) is not None:
+        return None
+    if verdict.verdict == "pass" and verdict.must_fix:
+        return "revise"
+    return verdict.verdict
 
 
 @dataclasses.dataclass
@@ -58,6 +139,9 @@ class ReviewResult:
     verdict: ReviewVerdict | None = None
     usage: dict[str, Any] | None = None
     reason: str | None = None
+    # The sha256 of the exact draft text that was sent for review — computed
+    # and stamped by this caller, never taken from the model's reply.
+    draft_sha256: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         if self.status != "done" or self.verdict is None:
@@ -68,8 +152,11 @@ class ReviewResult:
                 "verdict": "unavailable",
                 "reason": self.reason or "No cross-family reviewer model available",
             }
+        # must_fix forces revise at minimum, but never downgrades a block.
         effective_verdict = (
-            "revise" if self.verdict.must_fix else self.verdict.verdict
+            self.verdict.verdict
+            if self.verdict.verdict == "block"
+            else ("revise" if self.verdict.must_fix else self.verdict.verdict)
         )
         points = list(self.verdict.must_fix) + [
             f"[建议] {x}" for x in self.verdict.nice_to_have
@@ -81,6 +168,7 @@ class ReviewResult:
             "model": self.model,
             "family": self.family,
             "verdict": effective_verdict,
+            "draft_sha256": self.draft_sha256,
             "summary": self.verdict.summary,
             "items": [i.model_dump() for i in self.verdict.items],
             "must_fix": list(self.verdict.must_fix),
@@ -174,7 +262,10 @@ def load_agent_body(agent_name: str = "dalton-reviewer") -> str:
         REPO_ROOT / "plugins" / "dalton" / "agents" / f"{agent_name}.md"
     )
     if not path.exists():
-        return "你是基金的独立审稿人。只读审稿，输出严格 JSON（verdict: pass|revise, summary, items, must_fix, nice_to_have）。"
+        return (
+            "你是基金的独立审稿人。只读审稿，输出严格 JSON"
+            "（verdict: pass|revise|block, summary, items 覆盖 1–9 项检查, must_fix, nice_to_have）。"
+        )
     raw = path.read_text(encoding="utf-8")
     if raw.startswith("---"):
         parts = raw.split("---", 2)
@@ -183,8 +274,15 @@ def load_agent_body(agent_name: str = "dalton-reviewer") -> str:
     return raw.strip()
 
 
-def render_review_input(bundle: ReviewBundle, *, max_chars: int = 120_000) -> str:
-    """Assemble the numbered draft, audit summary, thesis, debate, and management context for review."""
+def render_review_input(
+    bundle: ReviewBundle, *, max_chars: int = 120_000, draft_sha256: str | None = None
+) -> str:
+    """Assemble the numbered draft, audit summary, thesis, debate, and management context for review.
+
+    ``draft_sha256`` is the caller-injected identity of the draft under review:
+    the reviewer sees it in the header, and the stored review result is stamped
+    with the same value — the model is never asked to echo it back.
+    """
     numbered_draft = "\n".join(
         f"{idx:4d}: {line}"
         for idx, line in enumerate(bundle.draft_markdown.splitlines(), start=1)
@@ -216,6 +314,9 @@ def render_review_input(bundle: ReviewBundle, *, max_chars: int = 120_000) -> st
         "## 报告正文（带行号）",
         numbered_draft,
     ]
+    if draft_sha256:
+        # 绑定被审草稿身份：由调用方注入；审稿输出不需要回填它。
+        sections.insert(1, f"被审草稿 sha256：{draft_sha256}")
     if thesis:
         sections.extend(["", "## 当前 Thesis（thesis.md）", thesis])
     if debate:
@@ -285,7 +386,11 @@ async def run_review(
         )
 
     system_prompt = load_agent_body("dalton-reviewer")
-    user_prompt = render_review_input(bundle)
+    # The hash is caller-side: computed from the exact draft text being sent,
+    # injected into the input, verified against any echoed value on receipt,
+    # and stamped onto the stored result.
+    draft_sha = hashlib.sha256(bundle.draft_markdown.encode("utf-8")).hexdigest()
+    user_prompt = render_review_input(bundle, draft_sha256=draft_sha)
 
     last_failure: ReviewResult | None = None
     while model and family_of(model) != author_family:
@@ -339,7 +444,14 @@ async def run_review(
                 if not isinstance(verdict_obj, ReviewVerdict):
                     raise ValueError(f"Unexpected review output type: {type(verdict_obj)}")
 
-                if verdict_obj.must_fix and verdict_obj.verdict != "revise":
+                contract_err = review_contract_error(
+                    verdict_obj, draft_sha256=draft_sha
+                )
+                if contract_err:
+                    raise ValueError(f"审稿结果无效：{contract_err}")
+
+                # must_fix forces revise at minimum, but never downgrades a block.
+                if verdict_obj.must_fix and verdict_obj.verdict == "pass":
                     verdict_obj.verdict = "revise"
 
                 return ReviewResult(
@@ -348,6 +460,7 @@ async def run_review(
                     family=cand_family,
                     verdict=verdict_obj,
                     usage=usage,
+                    draft_sha256=draft_sha,
                 )
         except Exception as e:
             logger.warning("Independent review call failed on model %s: %s", model, e)

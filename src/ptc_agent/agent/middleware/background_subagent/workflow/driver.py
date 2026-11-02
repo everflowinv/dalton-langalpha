@@ -53,6 +53,7 @@ from src.server.utils.error_sanitization import sanitize_error_text
 from src.dalton.workflows.journal import (
     WorkflowJournal,
     artifact_records,
+    digest_paths,
     engine_safe,
     missing_declared_artifacts,
     prompt_digest,
@@ -459,7 +460,9 @@ class WorkflowDriver:
         # DALTON-HOOK(workflow-resume): a dispatch this run is resuming from
         # the previous run's journal never reaches the dispatcher — the cap
         # below counts real children only, so a replayed run keeps its budget.
-        replay_entry = await self._journal.find_replayable(label, rec["prompt"])
+        replay_entry = await self._journal.find_replayable(
+            label, rec["prompt"], subagent_type=rec["subagent_type"]  # DALTON-HOOK(reviewer-contract)
+        )
         if replay_entry is not None:
             self._emitter.log(
                 f"[resume] 复用派发记录：{label}（产物哈希一致，未重新派发）"
@@ -552,6 +555,28 @@ class WorkflowDriver:
         sem = self._sem
         if sem is None:
             raise RuntimeError("workflow driver has not started")
+        # DALTON-HOOK(reviewer-contract): the caller-computed draft hash for a
+        # reviewer dispatch — hashed here from the file, never taken from any
+        # child's word, and stamped onto the journal record so dalton_check_done
+        # can bind the review to the exact draft (prompt review batch 1 round 2
+        # #1). Computed BEFORE the dispatch: the digest is of the draft as it
+        # stood when the reviewer was sent; a file that cannot be read records
+        # None and the closing check fails closed on the missing binding.
+        review_draft_sha: str | None = None
+        if rec.get("review_draft"):
+            draft_path = str(rec["review_draft"])
+            try:
+                digests = await digest_paths(self.spec.backend, [draft_path])
+                review_draft_sha = digests.get(draft_path)
+            except Exception as error:
+                logger.warning(
+                    "[workflow] review draft hash failed",
+                    extra={
+                        "path": draft_path,
+                        "label": label,
+                        "error": str(error),
+                    },
+                )
         run = _ChildRun(
             seq=seq,
             label=label,
@@ -620,6 +645,22 @@ class WorkflowDriver:
             if not run.schema_valid:
                 run.status = "invalid_schema"
                 run.error = schema_error
+            else:
+                # DALTON-HOOK(reviewer-contract): the reviewer contract that a
+                # JSON Schema cannot express (schema_max_depth bars item
+                # element constraints): items must cover checks 1..9 with a
+                # usable shape. A reply that fails it is an invalid output —
+                # schema_valid False, the invalid_schema status (so the same
+                # retry fires and the journal outcome carries no result, which
+                # is what keeps resume from ever reusing it).
+                if rec["subagent_type"] == "dalton-reviewer":
+                    from src.dalton.publish.review import reviewer_reply_error
+
+                    contract_error = reviewer_reply_error(run.parsed)
+                    if contract_error:
+                        run.schema_valid = False
+                        run.status = "invalid_schema"
+                        run.error = contract_error
 
         # DALTON-HOOK(workflow-journal): an ok answer whose own files are
         # missing or empty is a partial dispatch, not a success — the child
@@ -687,6 +728,9 @@ class WorkflowDriver:
                     "result": engine_safe(result_value),
                     "result_kind": "parsed" if schema is not None else "text",
                     "artifacts": [],
+                    # DALTON-HOOK(reviewer-contract): caller-computed binding.
+                    "draft_sha256": review_draft_sha,
+                    "review_draft": rec.get("review_draft"),
                     "missing_artifacts": list(run.partial_artifacts),
                     "error": run.error,
                     "replayable": False,
@@ -707,7 +751,15 @@ class WorkflowDriver:
                     "result": result_value,
                     "result_kind": "parsed" if schema is not None else "text",
                     "artifacts": records or [],
-                    "replayable": records is not None,
+                    # DALTON-HOOK(reviewer-contract): caller-computed binding
+                    # of a reviewer dispatch to the draft it reviewed. A
+                    # reviewDraft whose hash could not be computed is never
+                    # replayable — resume must re-dispatch the review against
+                    # the draft that is actually there (round 3 #5).
+                    "draft_sha256": review_draft_sha,
+                    "review_draft": rec.get("review_draft"),
+                    "replayable": records is not None
+                    and not (rec.get("review_draft") and review_draft_sha is None),
                     "recorded_at": time.time(),
                 }
             )

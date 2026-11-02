@@ -23,6 +23,10 @@ logger = logging.getLogger(__name__)
 # Journal filenames keep the label's letters, digits, CJK and a few
 # separators; anything else (slashes above all) collapses to one ``_``.
 JOURNAL_NAME_SAFE = re.compile(r"[^0-9A-Za-z_\u4e00-\u9fff.-]+")
+# Reviewer dispatch labels across the shipped workflows (审稿 / 独立审稿 /
+# `<TICKER> 审稿` / `复审 N`) — the pre-reviewDraft spelling of identifying a
+# reviewer-class journal entry by label alone.
+REVIEWER_LABEL_RE = re.compile(r"审稿|复审")
 JOURNAL_DIR = "journal"
 
 
@@ -386,7 +390,9 @@ class WorkflowJournal:
             )
         await self.write_progress("running")
 
-    async def find_replayable(self, label: str, prompt: str) -> dict[str, Any] | None:
+    async def find_replayable(
+        self, label: str, prompt: str, *, subagent_type: str | None = None
+    ) -> dict[str, Any] | None:
         """The journal entry a resume may replay, or None to dispatch.
 
         A replay demands more than label+prompt: the entry must have been
@@ -402,6 +408,26 @@ class WorkflowJournal:
                 or entry.get("replayable") is not True
             ):
                 continue
+            # Reviewer-class entries (a reviewDraft binding, or the label a
+            # pre-reviewDraft reviewer dispatch carried) are re-validated
+            # against the reviewer contract BEFORE reuse (round 4 #2): a
+            # reply recorded before the contract existed — missing items,
+            # stringly check numbers, a model-echoed hash standing in for the
+            # binding — is invalid and re-dispatches the review instead of
+            # replaying it.
+            result = entry.get("result")
+            # The current dispatch's own type is authoritative (a custom
+            # workflow may label its reviewer "review"); the label pattern only
+            # covers records written before the type was passed.
+            if (
+                subagent_type == "dalton-reviewer"
+                or entry.get("review_draft")
+                or REVIEWER_LABEL_RE.search(str(entry.get("label") or ""))
+            ):
+                from src.dalton.publish.review import reviewer_reply_error
+
+                if reviewer_reply_error(result) is not None:
+                    continue
             # The same empty-artifact guard as ``artifact_records``, applied
             # at read time: journals written before that guard carry
             # ``replayable: true`` with no artifacts for a child that
@@ -417,6 +443,19 @@ class WorkflowJournal:
                     self.backend, [a["path"] for a in artifacts]
                 )
                 if any(current.get(a["path"]) != a.get("sha256") for a in artifacts):
+                    continue
+            # A reviewer dispatch names the draft it reviewed (reviewDraft):
+            # replaying it against a CHANGED draft would resurrect a review of
+            # something that is no longer there — re-dispatch instead. A record
+            # whose binding hash failed to compute (draft_sha256 None) never
+            # replays either (prompt review batch 1 round 3 #5).
+            review_draft = entry.get("review_draft")
+            if review_draft:
+                recorded_sha = entry.get("draft_sha256")
+                current_sha = (
+                    await digest_paths(self.backend, [str(review_draft)])
+                ).get(str(review_draft))
+                if not isinstance(recorded_sha, str) or current_sha != recorded_sha:
                     continue
             return entry
         return None
@@ -435,6 +474,11 @@ class WorkflowJournal:
                 "result": entry.get("result"),
                 "result_kind": entry.get("result_kind", "parsed"),
                 "artifacts": entry.get("artifacts") or [],
+                # The caller-computed draft hash of a reviewer dispatch rides
+                # the replay too: a resumed run's journal keeps the binding
+                # dalton_check_done verifies (prompt review batch 1 round 2 #1).
+                "draft_sha256": entry.get("draft_sha256"),
+                "review_draft": entry.get("review_draft"),
                 # Replayed entries stay replayable with their artifact pins:
                 # a second interruption resumes off THIS run's journal, which
                 # now carries the full history forward.

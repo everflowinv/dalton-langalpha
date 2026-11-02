@@ -40,6 +40,9 @@ def test_defaults_and_unknown_options_are_ignored() -> None:
         "schema": None,
         # DALTON-HOOK(workflow-journal): checkFiles normalizes into the rec.
         "check_files": True,
+        # DALTON-HOOK(reviewer-contract): reviewDraft names the draft a reviewer
+        # dispatch reviews; None when the caller passed none.
+        "review_draft": None,
     }
 
 

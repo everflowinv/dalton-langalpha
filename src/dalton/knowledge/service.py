@@ -886,7 +886,8 @@ async def apply_update(
             "diff": diff_documents(base_v_content, latest_content),
             "message": (
                 f"version_conflict on {doc_key}: passed base_version={base_version}, "
-                f"but latest version in DB is v{latest_no}. Re-read data/{doc_key}.json and retry."
+                f"but latest version in DB is v{latest_no}. Call knowledge_read(doc=\"{doc_key}\") "
+                "and retry with its returned latest_version_no as base_version."
             ),
         }
     if source == "import" and latest is not None:
@@ -1091,7 +1092,8 @@ async def apply_update(
             "diff": diff_documents(base_doc, curr_doc),
             "message": (
                 f"version_conflict on {doc_key}: passed base_version={base_version}, "
-                f"but latest version in DB is v{curr_no}. Re-read data/{doc_key}.json and retry."
+                f"but latest version in DB is v{curr_no}. Call knowledge_read(doc=\"{doc_key}\") "
+                "and retry with its returned latest_version_no as base_version."
             ),
         }
 

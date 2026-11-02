@@ -820,7 +820,14 @@ async def test_g32_reviewer_falls_back_to_next_cross_family_candidate(
             ok=True,
             status="done",
             model=eff,
-            data=ReviewVerdict(verdict="pass", summary="All good"),
+            data=ReviewVerdict(
+                verdict="pass",
+                summary="All good",
+                items=[
+                    ReviewCheckItem(check=n, result="pass", reason="ok")
+                    for n in range(1, 10)
+                ],
+            ),
             usage={"input_tokens": 100, "output_tokens": 20},
             cash_usd=0.0,
             notional_usd=0.01,
@@ -3553,6 +3560,39 @@ async def test_publish_remaining_exit_points_include_unified_audit_summary(
     assert res_revise["status"] == "review_revise"
     assert "已核实 1 / 冲突 0 / 未核实 0 / 不需核实 0" in res_revise["message"]
 
+    # 2b. review block exit point: same review_revise status (reused, no new
+    # state-machine state), but the message names a blocking problem that a
+    # human must handle, and the review payload keeps verdict=block.
+    state_row["status"] = "reviewing"
+    mock_run_review.return_value = ReviewResult(
+        status="done",
+        model="gpt-6.1-sol-oauth",
+        family="openai-gpt",
+        verdict=ReviewVerdict(
+            verdict="block",
+            summary="结论无证据支撑",
+            items=[],
+            must_fix=["§2 增速判断与引用证据脱节"],
+            nice_to_have=[],
+        ),
+    )
+    res_block = await publish_svc.run_publish(
+        user_id="local-dev-user",
+        workspace_id="ws-1",
+        thread_id="t-1",
+        tool_call_id="tc-1",
+        draft_path="drafts/meta.md",
+        title="META",
+        kind="initial_coverage",
+        slug="meta",
+        backend=backend,
+    )
+    assert res_block["status"] == "review_revise"
+    assert res_block["review"]["verdict"] == "block"
+    assert "阻断性问题" in res_block["message"]
+    assert "人工处理" in res_block["message"]
+    assert "已核实 1 / 冲突 0 / 未核实 0 / 不需核实 0" in res_block["message"]
+
     # 3. PM rejected exit point
     state_row["status"] = "awaiting_pm"
     res_rejected = await publish_svc.run_publish(
@@ -3571,6 +3611,55 @@ async def test_publish_remaining_exit_points_include_unified_audit_summary(
     assert res_rejected["status"] == "rejected"
     assert "已核实 1 / 冲突 0 / 未核实 0 / 不需核实 0" in res_rejected["message"]
     assert "PM 拒绝发布：暂缓发布" in res_rejected["message"]
+
+    # 4. Idempotent early exit with a recorded block review (round 2 #5): the
+    # same draft re-submitted against a review_revise row whose review says
+    # block must keep the blocking wording, not "remains in review_revise".
+    from src.dalton.publish.audit import resolve_audit_config_fingerprint
+
+    block_audit = audit_ok.to_dict()
+    block_audit["inputs_sha256"] = "inputs-sha-fixed"
+    block_audit["config_sha256"] = "cfg-sha-fixed"
+    state_row["status"] = "review_revise"
+    state_row["audit"] = block_audit
+    state_row["review"] = {
+        "status": "done",
+        "verdict": "block",
+        "must_fix": ["§2 增速判断与引用证据脱节"],
+        "summary": "结论无证据支撑",
+    }
+    monkeypatch.setattr(
+        publish_svc,
+        "resolve_audit_config_fingerprint",
+        create_autospec(
+            resolve_audit_config_fingerprint,
+            return_value=("model-x", [], "pv1", "cfg-sha-fixed"),
+        ),
+    )
+
+    async def _fixed_inputs_sha(fn: Any, /, *args: Any, **kwargs: Any) -> str:
+        return "inputs-sha-fixed"
+
+    # The autouse inline_heavy_compute fixture already replaced this name with
+    # a mock, so the fixed answer replaces the double in turn.
+    monkeypatch.setattr(publish_svc, "run_in_heavy_subprocess", _fixed_inputs_sha)
+    res_idem_block = await publish_svc.run_publish(
+        user_id="local-dev-user",
+        workspace_id="ws-1",
+        thread_id="t-1",
+        tool_call_id="tc-1",
+        draft_path="drafts/meta.md",
+        title="META",
+        kind="initial_coverage",
+        slug="meta",
+        backend=backend,
+    )
+    assert res_idem_block["status"] == "review_revise"
+    assert res_idem_block["ok"] is False
+    assert "阻断性问题" in res_idem_block["message"]
+    assert "人工处理" in res_idem_block["message"]
+    assert "remains in" not in res_idem_block["message"]
+    assert "已核实 1 / 冲突 0 / 未核实 0 / 不需核实 0" in res_idem_block["message"]
 
 
 

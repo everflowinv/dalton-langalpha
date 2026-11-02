@@ -87,6 +87,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
    - `origin`（必填）：`"analyst"` | `"pm"` | `"director"` | `"event"`
    - `owner`（必填，默认 `"analyst"`）：`"analyst"` | `"pm"`
    - `status`（必填）：`"open"` | `"waiting_pm"` | `"resolved"` | `"dropped"`
+   - `due_date`（可选）：到期时间，填 `YYYY-MM-DD`（按标的交易所当地时间当天 00:00 起算到期）或带时区偏移的完整时刻（如 `2026-10-20T16:30:00-04:00`，按该时刻到期）；`value` 为 `high` 或 `medium` 的问题到期会触发唤醒，需要限期回答的问题务必填写
    - `linked`（可选）：`{"pillars": ["P1"], "debates": ["D1"], "drivers": ["K1"], "evidence_ids": ["E-20261023-01"]}`
 3. **关闭旧验证项与新增下一项验证（`/next_validations`）**：
    - 关闭已完成的验证项：`{"op": "set", "path": "/next_validations/V-001/status", "value": "done"}`

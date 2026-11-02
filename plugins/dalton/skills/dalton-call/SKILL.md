@@ -26,9 +26,11 @@ Conviction Call（高确信度投资建议）是 Dalton 研究体系的最高级
 逐条对照 [references/evidence-gate.md](references/evidence-gate.md) 检查 Gate 1 至 Gate 6：
 - **若任意一条 Gate 为 `FAIL`**：
   1. 停止生成正式推荐，改用 [templates/call.md](templates/call.md) 底部的 **《门禁未通过声明模板》**，写明未通过的具体 Gate（门禁）、缺失证据及预计补齐时间/事件，并**附上已完成的赔率卡与三层保护**（三情景价格带、所需胜率与裁决、三层保护与失效条件、行动分类与限制变量、双向改判条件；结构化字段上线前写在正文）。
-  2. 调用 `knowledge_append_verdict`（`verdict="NO_CHANGE"`），通过 `agenda_ops` 将缺失证据登记入 `agenda.md` 的验证计划（若需 PM 拍板研究优先级，填 `pm_handoffs`）。
-  3. 到此结束，不写正式推荐草稿。
-- **仅当 Gate 1–6 全部 `PASS` 时**，进入 Step 3。
+  2. 写**门禁结果文件** `research/<YYYY-MM-DD>-call.gates.json`：`{"passed": false, "failed_gates": [{"gate": <1–6>, "reason": "<缺哪块证据、为什么不过>"}], "as_of": "<YYYY-MM-DD>"}`——至少一条失败项、每条都有原因；这是完成契约核对门禁未过分支的依据，没有它或 `failed_gates` 为空都不算完成。
+  3. 调用 `knowledge_append_verdict` 记录五词结论：**verdict 按论点的实际变化填写**——支柱与预期差确实未动才是 `NO_CHANGE`；本轮证据削弱/强化了论点就如实写 `THESIS_WEAKENED` / `THESIS_STRENGTHENED`，触发证伪或立新论点则写 `THESIS_BROKEN` / `NEW_THESIS`——并在 `event` / `rationale` 里写明是哪条门禁未通过与缺失的证据。通过 `agenda_ops` 将缺失证据登记入 `agenda.md` 的验证计划（若需 PM 拍板研究优先级，填 `pm_handoffs`）。
+  4. **`verdict` 不是 `NO_CHANGE` 时，必须同步更新 `thesis`**：把受影响的证据追加进证据台账，命中确认 / 预警 / 证伪条件时如实调整支柱状态，需要时更新 `house_view`——论点变了却没写进知识层，完成契约不予通过。
+  5. 到此结束，不写正式推荐草稿。
+- **仅当 Gate 1–6 全部 `PASS` 时**，把 `research/<YYYY-MM-DD>-call.gates.json` 写成 `{"passed": true, "failed_gates": [], "as_of": "<YYYY-MM-DD>"}`，进入 Step 3。
 
 ### Step 3：预期差三问（Variant Perception — 3 Questions）
 必须用**经营驱动变量（Driver 单位，而非笼统的“市场低估了增长”）**回答三问：
@@ -84,5 +86,5 @@ Conviction Call（高确信度投资建议）是 Dalton 研究体系的最高级
 ### 收尾门禁：汇报完成前必须过完成契约（`dalton_check_done`）
 
 - 向 PM 汇报“完成”前（两个分支都要），必须调用 `dalton_check_done(workflow="dalton-call", params={"ticker": ..., "as_of": "<本稿日期 YYYY-MM-DD，与草稿文件名一致>"})`。
-- 契约按门禁两分支核对：存在 `drafts/<日期>-call-<TICKER>.md`＝门禁全过分支，要求草稿写满、`check_draft` 侧车哈希与当前稿一致、且 `<草稿>.language.json` 含两轮语言审查（第 2 轮哈希与终稿一致）；不存在＝门禁未过分支，要求本轮已写 `NO_CHANGE` verdict（Step 2 第 2 项），语言审查随之不要求。两者都没有＝无法判定门禁结果，记 missing。
-- `done=false` 时按 `missing` 先补齐再查（有草稿但 check_draft 用了旧草稿就对最终稿重跑 `check_draft`；语言审查缺轮次或第 2 轮哈希对不上就补跑对应轮次的 `check_language`；门禁未过却没写 verdict 就 `knowledge_append_verdict(verdict="NO_CHANGE")`）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。
+- 契约按本轮的门禁结果分两支核对：本轮的 `research/<日期>-call.gates.json` 为 `passed=false`＝门禁未过分支，要求 `failed_gates` 至少一条且各带原因、本轮调用 `knowledge_append_verdict` 追加了五词结论之一（`NO_CHANGE` / `THESIS_STRENGTHENED` / `THESIS_WEAKENED` / `THESIS_BROKEN` / `NEW_THESIS`，按论点实际变化选择，上一轮的记录不算数），且结论不是 `NO_CHANGE` 时本轮已用 `knowledge_update` 更新 `thesis`；这一支不要求草稿和语言审查。门禁结果为 `passed=true` 或本轮没有门禁未过的记录＝门禁全过分支，要求 `drafts/<日期>-call-<TICKER>.md` 是本轮新写的完整草稿、`check_draft` 侧车哈希与当前稿一致、且 `<草稿>.language.json` 含两轮语言审查（第 2 轮哈希与终稿一致）。两支的条件都不满足＝无法判定门禁结果，记为 `missing`。
+- `done=false` 时按 `missing` 先补齐再查（有草稿但 check_draft 用了旧草稿就对最终稿重跑 `check_draft`；语言审查缺轮次或第 2 轮哈希对不上就补跑对应轮次的 `check_language`；门禁未过就补写 `research/<日期>-call.gates.json` 与本轮的五词结论 verdict——论点确实无变化才写 `NO_CHANGE`，其他词同步用 `knowledge_update` 更新 thesis）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。

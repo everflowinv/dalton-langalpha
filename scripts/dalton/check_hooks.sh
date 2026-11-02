@@ -93,6 +93,9 @@ ALLOWED_HOOKS=(
   "coverage-tree"
   "workflow-resume"
   "workflow-journal"
+  # 提示词第 1 批第 2 轮：审稿派发带 reviewDraft（调用方计算草稿哈希绑定
+  # journal），审稿回复缺 1–9 检查项按 invalid_schema 处理（不可 replay）。
+  "reviewer-contract"
   "workflow-as-of-default"
   "workflow-subject-kind"
   "subagent-model-pin"
