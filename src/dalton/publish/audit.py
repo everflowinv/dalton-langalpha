@@ -67,6 +67,9 @@ class AuditBuildTimeout(RuntimeError):
 
 
 _DEADLINE_GRACE_S = 5.0
+# Deterministic extraction and explicit footnote matching get their own floor so an
+# overrun in provenance precheck or Step B LLM labeling never skips deterministic matching.
+_DETERMINISTIC_MATCH_FLOOR_S = 30.0
 # The post-judging phases (derived re-run, candidate merge, result assembly) get
 # their own budget: they must finish even when judging consumed the audit's.
 _FINALIZE_GRACE_S = 120.0
@@ -86,7 +89,24 @@ REASON_ZH: dict[str, str] = {
 
 CONTRADICTED_REASONS = frozenset({"source_conflict"})
 
+
+def _is_timeout_uncertain_item(item: Any) -> bool:
+    """Return True when an ``uncertain`` item was left unjudged due to deadline/timeout."""
+    if not isinstance(item, dict):
+        return False
+    hint = str(item.get("hint") or "")
+    low = hint.lower()
+    return (
+        "截止时间已到" in hint
+        or "核验步超时" in hint
+        or "超时" in hint
+        or "deadline" in low
+        or "timed out" in low
+        or "timeout" in low
+    )
+
 AUDIT_PROMPT_VERSION = "audit_v8"
+AUDIT_ALGO_VERSION = "audit_v9"
 _AUDIT_CACHE_TAG_RE = re.compile(r"<!--\s*dalton:audit-cache\b")
 _AUDIT_CACHE_RE = re.compile(
     r"<!--\s*dalton:audit-cache\s*\n(.*?)\n-->",
@@ -220,6 +240,12 @@ def format_audit_status(audit: "AuditResult") -> str:
         if audit.figures > 0
         else "?"
     )
+    if audit.timed_out_count > 0:
+        return (
+            f"⚠️ 无冲突，但 {len(audit.uncertain)} 个数字（{share}）未能判断"
+            f"（其中 {audit.timed_out_count} 个因超时未能判断；建议为无脚注的数字补上 [引用N] 脚注、拆分报告后重试），"
+            "待 PM 决定"
+        )
     return (
         f"⚠️ 无冲突，但 {len(audit.uncertain)} 个数字（{share}）未能核验，"
         "待 PM 决定"
@@ -274,10 +300,32 @@ def format_audit_summary_from_dict(
     else:
         unmatched_all = list(audit_info.get("unmatched") or [])
         unverified_cnt = max(0, len(unmatched_all) - contradicted_cnt)
-    if "uncertain" in audit_info and audit_info.get("uncertain") is not None:
+    uncertain_items_list = [
+        x for x in (audit_info.get("uncertain_items") or []) if isinstance(x, dict)
+    ]
+    if not uncertain_items_list and isinstance(audit_info.get("uncertain"), list):
+        uncertain_items_list = [
+            x for x in audit_info["uncertain"] if isinstance(x, dict)
+        ]
+    if "uncertain" in audit_info and isinstance(audit_info.get("uncertain"), int):
         uncertain_cnt = int(audit_info.get("uncertain") or 0)
+    elif uncertain_items_list:
+        uncertain_cnt = len(uncertain_items_list)
     else:
-        uncertain_cnt = len(audit_info.get("uncertain_items") or [])
+        uncertain_cnt = int(audit_info.get("uncertain") or 0)
+
+    if "timed_out" in audit_info and isinstance(audit_info.get("timed_out"), int):
+        timed_out_cnt = int(audit_info.get("timed_out") or 0)
+    elif isinstance(audit_info.get("timed_out_items"), list):
+        timed_out_cnt = len(audit_info["timed_out_items"])
+    elif (
+        isinstance(audit_info.get("labeling"), dict)
+        and isinstance(audit_info["labeling"].get("timed_out_unjudged"), int)
+    ):
+        timed_out_cnt = int(audit_info["labeling"].get("timed_out_unjudged") or 0)
+    else:
+        timed_out_cnt = sum(1 for u in uncertain_items_list if _is_timeout_uncertain_item(u))
+
     exempt_cnt = int(audit_info.get("exempt") or 0)
     if isinstance(audit_info.get("incidental"), list):
         incidental_cnt = len(audit_info["incidental"])
@@ -302,13 +350,27 @@ def format_audit_summary_from_dict(
         unverified_cnt,
         not_required_cnt,
     )
-    unc_part = (
-        f"（另有未能判断 {uncertain_cnt}，不计入以上四项）"
-        if uncertain_cnt
-        else ""
-    )
+    if timed_out_cnt > 0:
+        other_uncertain_cnt = max(0, uncertain_cnt - timed_out_cnt)
+        if other_uncertain_cnt > 0:
+            unc_part = (
+                f"（另有因超时未能判断 {timed_out_cnt}、其他未能判断 {other_uncertain_cnt}，不计入以上四项）"
+            )
+        else:
+            unc_part = f"（另有因超时未能判断 {timed_out_cnt}，不计入以上四项）"
+        timeout_note = (
+            "；超时未能判断的数字，建议为无脚注的数字补上 [引用N] 脚注、拆分报告后重试，"
+            "或调大 publish.audit_total_timeout_s"
+        )
+    else:
+        unc_part = (
+            f"（另有未能判断 {uncertain_cnt}，不计入以上四项）"
+            if uncertain_cnt
+            else ""
+        )
+        timeout_note = ""
     arrow = f" → {audit_path}" if audit_path else ""
-    return f"{lead}共 {total_cnt} 个数字：{counts}{unc_part}{arrow}"
+    return f"{lead}共 {total_cnt} 个数字：{counts}{unc_part}{timeout_note}{arrow}"
 
 
 def compute_audit_inputs_sha256(
@@ -367,6 +429,7 @@ def compute_audit_config_fingerprint(
     else:
         eff_prompt_version = AUDIT_PROMPT_VERSION
     cfg_payload = {
+        "algo_version": AUDIT_ALGO_VERSION,
         "audit_model": eff_model,
         "audit_fallback_models": eff_fallbacks,
         "audit_timeout_s": eff_timeout,
@@ -504,6 +567,14 @@ class AuditResult:
         return len(self.uncertain)
 
     @property
+    def timed_out_items(self) -> list[dict[str, Any]]:
+        return [u for u in self.uncertain if _is_timeout_uncertain_item(u)]
+
+    @property
+    def timed_out_count(self) -> int:
+        return len(self.timed_out_items)
+
+    @property
     def not_required_count(self) -> int:
         return self.exempt + len(self.incidental)
 
@@ -522,6 +593,7 @@ class AuditResult:
             for m in self.matches
             if m.get("verified_by") == "derived" or m.get("kind") == "derived"
         )
+        timed_out_list = self.timed_out_items
         return {
             "draft_sha256": self.draft_sha256,
             "figures": self.figures,
@@ -530,6 +602,7 @@ class AuditResult:
             "contradicted": len(self.contradicted),
             "unverified": len(self.unverified),
             "uncertain": len(self.uncertain),
+            "timed_out": len(timed_out_list),
             "exempt": self.exempt,
             "incidental": len(self.incidental),
             "not_required": self.not_required_count,
@@ -558,6 +631,7 @@ class AuditResult:
             "contradicted_items": self.contradicted,
             "unverified_items": self.unverified,
             "uncertain_items": self.uncertain,
+            "timed_out_items": timed_out_list,
             "incidental_items": self.incidental,
         }
 
@@ -1059,6 +1133,9 @@ def _build_audit_result(
     eff_labeling.setdefault("failed_batch_details", [])
     eff_labeling["incidental_excluded"] = len(incidental_list)
     eff_labeling.setdefault("llm_period_overrides", 0)
+    timed_out_unjudged = sum(1 for u in unc_list if _is_timeout_uncertain_item(u))
+    if timed_out_unjudged > 0:
+        eff_labeling["timed_out_unjudged"] = timed_out_unjudged
 
     unit_warns = _extract_model_unit_warnings(
         None, matched_list, unmatched_blocking
@@ -1155,6 +1232,157 @@ def _extract_task(
     return extracted, facts_ledger
 
 
+def _has_explicit_citation(fig: ExtractedFigure) -> bool:
+    return bool(
+        fig.footnote_target
+        or fig.footnote_targets
+        or fig.missing_citations
+        or fig.duplicate_citations
+    )
+
+
+_RELATIVE_PERIOD_RE = re.compile(
+    r"(?:上年|去年|前年|上期|上季|上季度|前季|prior\s+year|last\s+year|previous\s+year|year\s+ago|prior\s+quarter)",
+    re.IGNORECASE,
+)
+
+
+def _has_relative_period_shift(fig: ExtractedFigure) -> bool:
+    loc = fig.location or {}
+    sentence = str(loc.get("sentence") or "")
+    return bool(_RELATIVE_PERIOD_RE.search(sentence) or _RELATIVE_PERIOD_RE.search(fig.metric or ""))
+
+
+def _is_semantically_explicit_for_pre_verify(fig: ExtractedFigure) -> bool:
+    """Return True only when Step A already resolved metric, period, and unit without semantic disambiguation."""
+    if not (fig.metric or "").strip():
+        return False
+    if not (fig.period or "").strip():
+        return False
+    loc = fig.location or {}
+    if not bool(loc.get("period_explicit")):
+        return False
+    if _has_relative_period_shift(fig):
+        return False
+    unit_str = str(fig.unit or "").strip()
+    if not unit_str or unit_str in ("other", ""):
+        return False
+    if unit_str == "count" and (fig.scale or 1.0) <= 1.0 and not fig.currency:
+        return False
+    return True
+
+
+def _pre_label_match_task(
+    extracted: list[ExtractedFigure],
+    *,
+    thesis_doc: dict[str, Any] | None,
+    models_doc: dict[str, Any] | None,
+    model_cells: dict[str, dict[str, Any]] | None,
+    provenance_records: dict[str, dict[str, Any]] | None,
+    facts_ledger: dict[str, dict[str, Any]] | None,
+    metric_aliases: dict[str, list[str]] | None,
+    evidence_ref_bodies: dict[str, str] | None,
+    draft_path: str,
+) -> tuple[dict[str, MatchOutcome], dict[str, list[MatchCandidate]]]:
+    """Run deterministic footnote/citation matching (Orders 0–3) BEFORE Step B LLM labeling.
+
+    Only figures whose Step A extraction already unambiguously resolved ``metric``, ``period``
+    (explicit in the sentence/table, not inherited from a heading or prior sentence), and ``unit``
+    are settled as ``matched=True`` before Step B. Conflicts (``reason in CONTRADICTED_REASONS``,
+    unless the sentence has a relative period shift on an inherited period) and broken references
+    (``lock_unverified=True``) are also settled before Step B. All other figures retain their
+    pre-match result only as candidates and proceed through Step B labeling and Step C re-matching.
+    """
+    outcomes = match_figures(
+        extracted,
+        thesis_doc=thesis_doc,
+        models_doc=models_doc,
+        model_cells=model_cells,
+        provenance_records=provenance_records,
+        facts_ledger=facts_ledger,
+        metric_aliases=metric_aliases,
+        evidence_ref_bodies=evidence_ref_bodies,
+        draft_path=draft_path,
+        deadline=None,
+        footnote_only=True,
+    )
+    settled: dict[str, MatchOutcome] = {}
+    pre_candidates_by_id: dict[str, list[MatchCandidate]] = {}
+    for out in outcomes:
+        fig = out.figure
+        if fig.exempt or not _has_explicit_citation(fig):
+            continue
+        if out.lock_unverified:
+            settled[fig.id] = out
+            continue
+        if out.reason in CONTRADICTED_REASONS:
+            if not bool((fig.location or {}).get("period_explicit")) and _has_relative_period_shift(fig):
+                if out.candidates:
+                    pre_candidates_by_id[fig.id] = list(out.candidates)
+                continue
+            settled[fig.id] = out
+            continue
+        if out.matched:
+            if _is_semantically_explicit_for_pre_verify(fig):
+                fig.label_hint = (
+                    "consensus"
+                    if out.kind == "prov" and "consensus" in str(out.excerpt or "").lower()
+                    else ("estimate" if out.kind == "model" else "reported")
+                )
+                fig.incidental_category = ""
+                settled[fig.id] = out
+            else:
+                cands = list(out.candidates)
+                if out.ref:
+                    src_val = fig.value
+                    src_unit = str(fig.unit or "")
+                    src_period = str(fig.period or "")
+                    if out.kind == "facts" and facts_ledger:
+                        frow = facts_ledger.get(str(out.ref))
+                        if frow is not None and frow.get("value") is not None:
+                            src_val = float(frow["value"])
+                            src_unit = str(frow.get("unit") or "")
+                            src_period = str(frow.get("period") or src_period)
+                    elif out.kind == "model" and model_cells:
+                        c_info = model_cells.get(str(out.ref))
+                        if c_info is not None and c_info.get("value") is not None:
+                            src_val = float(c_info["value"])
+                            src_unit = str(c_info.get("unit") or "")
+                            src_period = str(c_info.get("period") or src_period)
+                    elif out.kind == "evidence" and thesis_doc:
+                        for ev in thesis_doc.get("evidence") or []:
+                            if isinstance(ev, dict) and str(ev.get("id") or "") == str(out.ref):
+                                for ef in ev.get("figures") or []:
+                                    if isinstance(ef, dict) and ef.get("value") is not None:
+                                        ok_v, _, _ = values_within_tolerance(
+                                            fig,
+                                            float(ef["value"]),
+                                            str(ef.get("unit") or "other"),
+                                        )
+                                        if ok_v:
+                                            src_val = float(ef["value"])
+                                            src_unit = str(ef.get("unit") or "")
+                                            src_period = str(ef.get("period") or src_period)
+                                            break
+                                break
+                    cands.insert(
+                        0,
+                        MatchCandidate(
+                            kind=str(out.kind or "facts"),
+                            id=str(out.ref),
+                            value=src_val,
+                            unit=src_unit,
+                            period=src_period,
+                            why=(f"脚注来源数值吻合：{out.excerpt}" if out.excerpt else "脚注来源数值吻合"),
+                        ),
+                    )
+                if cands:
+                    pre_candidates_by_id[fig.id] = cands
+        elif out.candidates:
+            pre_candidates_by_id[fig.id] = list(out.candidates)
+    return settled, pre_candidates_by_id
+
+
 def _match_and_collect_task(
     extracted: list[ExtractedFigure],
     *,
@@ -1168,6 +1396,9 @@ def _match_and_collect_task(
     draft_path: str,
     match_deadline: float | None,
     collect_candidates: bool,
+    pre_settled_by_id: dict[str, MatchOutcome] | None = None,
+    pre_candidates_by_id: dict[str, list[MatchCandidate]] | None = None,
+    deferred_unlabeled_ids: set[str] | None = None,
 ) -> tuple[
     list[MatchOutcome],
     dict[str, list[tuple[int, ExtractedFigure, list[dict[str, Any]]]]],
@@ -1196,7 +1427,16 @@ def _match_and_collect_task(
         evidence_ref_bodies=evidence_ref_bodies,
         draft_path=draft_path,
         deadline=match_deadline,
+        pre_settled_by_id=pre_settled_by_id,
+        deferred_unlabeled_ids=deferred_unlabeled_ids,
     )
+    if pre_candidates_by_id:
+        for out in outcomes:
+            if not out.matched and out.figure.id in pre_candidates_by_id:
+                existing_ids = {(c.kind, c.id) for c in out.candidates}
+                for pc in pre_candidates_by_id[out.figure.id]:
+                    if (pc.kind, pc.id) not in existing_ids:
+                        out.candidates.append(pc)
     if not collect_candidates:
         return outcomes, {}, {}
     pending_by_section, pending_cands_by_idx = _collect_judge_candidates(
@@ -1215,12 +1455,22 @@ def _match_and_collect_task(
     return outcomes, pending_by_section, pending_cands_by_idx
 
 
-def _deadline_marked_outcomes(extracted: list[ExtractedFigure]) -> list[MatchOutcome]:
-    """Every figure marked 核验未完成 — the shape the audit ends with when the
-    matching child was killed at its budget and no partial result came back."""
+def _deadline_marked_outcomes(
+    extracted: list[ExtractedFigure],
+    pre_settled_by_id: dict[str, MatchOutcome] | None = None,
+    pre_candidates_by_id: dict[str, list[MatchCandidate]] | None = None,
+) -> list[MatchOutcome]:
+    """Every unsettled figure marked 核验未完成 — the shape the audit ends with when the
+    matching child was killed at its budget and no partial result came back.
+    Deterministically pre-matched outcomes from before Step B are always preserved."""
+    settled_map = pre_settled_by_id or {}
+    cand_map = pre_candidates_by_id or {}
     outcomes: list[MatchOutcome] = []
     for fig in extracted:
-        if fig.exempt:
+        settled_out = settled_map.get(fig.id)
+        if settled_out is not None:
+            outcomes.append(dataclasses.replace(settled_out, figure=fig))
+        elif fig.exempt:
             outcomes.append(
                 MatchOutcome(figure=fig, matched=True, kind="exempt", ref=fig.exempt_reason)
             )
@@ -1235,9 +1485,12 @@ def _deadline_marked_outcomes(extracted: list[ExtractedFigure]) -> list[MatchOut
                     matched=False,
                     reason="uncertain",
                     hint=_MATCH_DEADLINE_HINT,
+                    candidates=list(cand_map.get(fig.id) or []),
                     lock_unverified=True,
                 )
             )
+    if settled_map:
+        outcomes = apply_derived_figure_matching(outcomes)
     return outcomes
 
 
@@ -1260,7 +1513,7 @@ async def aaudit_draft(
     prompt_version: str | None = None,
     deadline: float | None = None,
 ) -> AuditResult:
-    """Async 4-step figure audit (P0H §1.2 / P0I §1): Step A extract -> Step B LLM label -> Step C match -> Step D LLM judge + anchor.
+    """Async figure audit (P0H §1.2 / P0I §1): Step A extract -> Pre-B deterministic footnote match -> Step B LLM label -> Step C match & candidates -> Step D LLM judge + anchor.
 
     ``deadline`` (``time.monotonic()``) spans the WHOLE audit when the caller
     has one (``run_check_draft`` starts it before even loading provenance, so
@@ -1327,7 +1580,10 @@ async def aaudit_draft(
             _extract_task,
             draft_markdown,
             facts_markdown,
-            deadline=deadline,
+            timeout_s=max(
+                deadline - time.monotonic() if deadline is not None else 0.0,
+                _DETERMINISTIC_MATCH_FLOOR_S,
+            ),
             label="audit.extract",
         )
     except HeavyComputeTimeout as e:
@@ -1336,9 +1592,55 @@ async def aaudit_draft(
         ) from e
     labeling_incomplete = False
     labeling_stats: dict[str, Any] = {}
+    pre_settled_by_id: dict[str, MatchOutcome] = {}
+    pre_candidates_by_id: dict[str, list[MatchCandidate]] = {}
 
-    # Step B: Mandatory full-coverage LLM figure labeling & colloquial Chinese number extraction (P0I §1.4, L28, L35)
+    # Pre-Step B: Deterministic footnote / citation matching (Orders 0–3) on footnoted figures.
+    # Runs with its own guaranteed floor before Step B so semantically explicit footnoted figures are
+    # deterministically verified or flagged as conflict/unverified without waiting on LLM labeling, and
+    # are excluded from Step B LLM batches.
+    if use_llm_judge and any(_has_explicit_citation(f) for f in extracted if not f.exempt):
+        try:
+            pre_settled_by_id, pre_candidates_by_id = await run_in_heavy_subprocess(
+                _pre_label_match_task,
+                extracted,
+                thesis_doc=thesis_doc,
+                models_doc=models_doc,
+                model_cells=model_cells,
+                provenance_records=provenance_records,
+                facts_ledger=facts_ledger,
+                metric_aliases=metric_aliases,
+                evidence_ref_bodies=evidence_ref_bodies,
+                draft_path=draft_path,
+                timeout_s=max(
+                    deadline - time.monotonic() if deadline is not None else 0.0,
+                    _DETERMINISTIC_MATCH_FLOOR_S,
+                ),
+                label="audit.pre_match",
+            )
+            for f in extracted:
+                s_out = pre_settled_by_id.get(f.id)
+                if s_out is not None and s_out.matched:
+                    f.label_hint = s_out.figure.label_hint
+                    f.incidental_category = s_out.figure.incidental_category
+        except HeavyComputeTimeout:
+            logger.warning(
+                "Pre-label deterministic footnote matching hit its floor for %s; "
+                "proceeding to Step B/C",
+                draft_path or workspace_id,
+            )
+            pre_settled_by_id = {}
+            pre_candidates_by_id = {}
+
+    # Step B: LLM figure labeling & colloquial Chinese number extraction for remaining unsettled figures (P0I §1.4, L28, L35)
+    deferred_ids: set[str] = set()
+    deferred_unlabeled_ids: set[str] = set()
     if use_llm_judge:
+        deferred_ids = {
+            f.id
+            for f in extracted
+            if not f.exempt and _has_explicit_citation(f) and f.id not in pre_settled_by_id
+        }
         extracted, labeling_ok = await label_figures_with_status(
             draft_markdown,
             extracted,
@@ -1347,13 +1649,18 @@ async def aaudit_draft(
             thread_id=thread_id,
             stats_out=labeling_stats,
             deadline=deadline,
+            pre_settled_ids=set(pre_settled_by_id),
         )
         labeling_incomplete = not labeling_ok
+        deferred_unlabeled_ids = {
+            f.id
+            for f in extracted
+            if f.id in deferred_ids and not bool((f.location or {}).get("step_b_completed"))
+        }
 
-    # Step C: Deterministic footnote matching (Orders 0–3) & candidate collection,
-    # in one killable child (see _match_and_collect_task). The child checks the
-    # deadline per figure and returns partial results; the parent-side kill at
-    # deadline + grace is the safety net for a single regex that cannot check.
+    # Step C: Deterministic footnote matching (Orders 0–3, guaranteed by _DETERMINISTIC_MATCH_FLOOR_S
+    # and never skipped by deadline inside match_figures) & candidate collection for unfootnoted figures,
+    # in one killable child (see _match_and_collect_task).
     try:
         outcomes, pending_by_section, pending_cands_by_idx = (
             await run_in_heavy_subprocess(
@@ -1369,17 +1676,25 @@ async def aaudit_draft(
                 draft_path=draft_path,
                 match_deadline=deadline,
                 collect_candidates=use_llm_judge,
-                timeout_s=max(0.0, deadline - time.monotonic()) + _DEADLINE_GRACE_S,
+                pre_settled_by_id=pre_settled_by_id,
+                pre_candidates_by_id=pre_candidates_by_id,
+                deferred_unlabeled_ids=deferred_unlabeled_ids,
+                timeout_s=max(0.0, deadline - time.monotonic())
+                + max(_DEADLINE_GRACE_S, _DETERMINISTIC_MATCH_FLOOR_S),
                 label="audit.match",
             )
         )
     except HeavyComputeTimeout:
         logger.warning(
-            "Audit matching killed at its budget for %s; marking all figures "
-            "核验未完成",
+            "Audit matching killed at its budget for %s; marking unsettled figures "
+            "核验未完成 while preserving deterministic footnote matches",
             draft_path or workspace_id,
         )
-        outcomes = _deadline_marked_outcomes(extracted)
+        outcomes = _deadline_marked_outcomes(
+            extracted,
+            pre_settled_by_id=pre_settled_by_id,
+            pre_candidates_by_id=pre_candidates_by_id,
+        )
         pending_by_section, pending_cands_by_idx = {}, {}
 
     # Step D: Section-batched concurrent LLM judge (`Semaphore(4)`, <=10 figs/batch) + code anchoring (P0I §1.5–§1.6)
@@ -1785,6 +2100,13 @@ def render_audit_md(audit: AuditResult, *, draft_path: str = "") -> str:
                 "",
             ]
         )
+    if audit.timed_out_count > 0:
+        lines.extend(
+            [
+                f"> ⚠️ **有 {audit.timed_out_count} 个数字因超时未能判断：建议为无脚注的数字补上 `[引用N]` 脚注、拆分报告后重试，或调大 `publish.audit_total_timeout_s`**",
+                "",
+            ]
+        )
     conflict_lead = audit.conflict_lead_sentence()
     if conflict_lead:
         lines.extend([f"> ⚠️ **{conflict_lead}**", ""])
@@ -1955,6 +2277,13 @@ def try_load_reusable_audit_from_md(
         unverified_list = list(cached["unverified"])
         unmatched_list = list(cached["unmatched"])
         matches_list = list(cached["matches"])
+        uncertain_list = list(cached["uncertain"])
+        cached_labeling = dict(cached["labeling"])
+        # Never reuse a cached audit that contains timed-out unjudged items (Item 5)
+        if any(_is_timeout_uncertain_item(u) for u in uncertain_list) or int(
+            cached_labeling.get("timed_out_unjudged") or 0
+        ) > 0:
+            return None
         return AuditResult(
             draft_sha256=draft_sha,
             figures=int(cached["figures"]),
@@ -1964,11 +2293,11 @@ def try_load_reusable_audit_from_md(
             matches=matches_list,
             contradicted=contradicted_list,
             unverified=unverified_list,
-            uncertain=list(cached["uncertain"]),
+            uncertain=uncertain_list,
             incidental=list(cached["incidental"]),
             outcomes=[],
             labeling_incomplete=bool(cached["labeling_incomplete"]),
-            labeling=dict(cached["labeling"]),
+            labeling=cached_labeling,
             reused=True,
             inputs_sha256=inputs_sha,
             config_sha256=cfg_sha,

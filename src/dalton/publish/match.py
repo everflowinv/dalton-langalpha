@@ -1884,16 +1884,19 @@ def match_figures(
     evidence_ref_bodies: dict[str, str] | None = None,
     draft_path: str = "",
     deadline: float | None = None,
+    footnote_only: bool = False,
+    pre_settled_by_id: dict[str, MatchOutcome] | None = None,
+    deferred_unlabeled_ids: set[str] | None = None,
 ) -> list[MatchOutcome]:
     """Step C: Match footnoted figures (Orders 0–3) and collect candidates for unfootnoted figures (P0I §1.2, L34, L36).
 
     Unfootnoted figures NEVER become `matched=True` here; Order 0b and Order 4 only produce candidates for Step D.
 
-    ``deadline`` (``time.monotonic()``) is checked once per figure: at the
-    budget every figure not yet reached is returned marked 核验未完成 and
-    locked out of Step D, so a big draft returns its partial results instead
-    of running on for hours (A5 — one audit ran 103 minutes past its budget
-    because nothing in this loop looked at the clock).
+    Deterministic classifications (exempt, incidental, and explicit footnote/citation matching Orders 0–3 plus
+    Order 5 derived figures from them) run in Pass 1 and are never skipped by ``deadline``.
+    ``deadline`` (``time.monotonic()``) is enforced in Pass 2 on the expensive unfootnoted candidate scan
+    (Order 0b & Order 4): at the budget every unfootnoted figure not yet reached is returned marked 核验未完成
+    and locked out of Step D.
     """
     if source_cache is None:
         source_cache = SourceParseCache()
@@ -1910,21 +1913,128 @@ def match_figures(
     outcomes: list[MatchOutcome] = []
 
     def _try_match_target(
-        fig: ExtractedFigure, target_ref: str
+        fig: ExtractedFigure,
+        target_ref: str,
+        _visited_facts: set[str] | None = None,
+        _scoped_facts_path: str | None = None,
     ) -> MatchOutcome | None:
-        # Order 0: facts ledger reference `f:<id>`
-        if target_ref.startswith("f:"):
-            fid = target_ref[2:].strip()
-            frow = facts_map.get(fid)
-            if not frow or not frow.get("ref"):
+        # Order 0: facts ledger reference `f:<id>` (or `<path>#<id>`)
+        if target_ref.startswith("f:") or re.match(
+            r"^(?:[\w./-]+[./])?facts\.md#", target_ref, re.IGNORECASE
+        ):
+            raw_ref = (
+                target_ref[2:].strip()
+                if target_ref.startswith("f:")
+                else target_ref.strip()
+            )
+            explicit_path = _scoped_facts_path
+            if "#" in raw_ref:
+                raw_p, fid = raw_ref.split("#", 1)
+                fid = fid.strip()
+                if raw_p.strip().startswith("/"):
+                    # Footnote paths are workspace-relative; an absolute one is
+                    # refused rather than stripped, so it can never land on a
+                    # different, relative ledger that happens to share the tail.
+                    return MatchOutcome(
+                        figure=fig,
+                        matched=False,
+                        reason="unverified",
+                        hint=(
+                            f"脚注 {target_ref} 用了绝对路径；facts 台账引用请写工作区相对路径"
+                            "（例如 research/<日期>-fc/facts.md#键）"
+                        ),
+                        lock_unverified=True,
+                    )
+                norm_p = posixpath.normpath(raw_p.strip()).removeprefix("./")
+                explicit_path = norm_p if norm_p not in ("", ".") else "facts.md"
+            else:
+                fid = raw_ref
+            lookup_key = f"{explicit_path}#{fid}" if explicit_path else fid
+            visited = set(_visited_facts) if _visited_facts else set()
+            if lookup_key in visited:
                 return MatchOutcome(
                     figure=fig,
                     matched=False,
                     reason="unverified",
-                    hint=f"Facts ledger entry {fid} not found",
+                    hint=f"事实台账条目 {lookup_key} 存在循环引用（{target_ref}），请让它直接指向最终来源",
                     lock_unverified=True,
                 )
-            return _try_match_target(fig, str(frow["ref"]))
+            visited.add(lookup_key)
+            if explicit_path:
+                frow = facts_map.get(lookup_key)
+            else:
+                cand_row = facts_map.get(fid)
+                frow = cand_row if (cand_row and not cand_row.get("scoped_only")) else None
+            if not frow:
+                return MatchOutcome(
+                    figure=fig,
+                    matched=False,
+                    reason="unverified",
+                    hint=f"事实台账中没有条目 {lookup_key}，请检查引用的键名和对应的 facts.md 文件",
+                    lock_unverified=True,
+                )
+            ref_str = str(frow.get("ref") or "").strip()
+            if ref_str.startswith(("evidence:", "model:", "prov:", "f:")) or re.match(
+                r"^(?:[\w./-]+[./])?facts\.md#", ref_str, re.IGNORECASE
+            ):
+                return _try_match_target(fig, ref_str, visited, explicit_path)
+            if frow.get("value") is None:
+                return MatchOutcome(
+                    figure=fig,
+                    matched=False,
+                    reason="unverified",
+                    hint=f"事实台账条目 {lookup_key} 没有可用的数值，请检查这一行的数值列或引用列",
+                    lock_unverified=True,
+                )
+            f_metric = str(frow.get("metric") or "").strip()
+            if fig.metric and f_metric and not metrics_match(fig.metric, f_metric, metric_aliases):
+                return MatchOutcome(
+                    figure=fig,
+                    matched=False,
+                    reason="unverified",
+                    hint=f"事实台账 {lookup_key} 指标（{f_metric}）与正文（{fig.metric}）不一致",
+                )
+            f_period = normalize_period(frow.get("period"))
+            fig_p = normalize_period(fig.period)
+            if fig_p and f_period and fig_p != f_period:
+                return MatchOutcome(
+                    figure=fig,
+                    matched=False,
+                    reason="unverified",
+                    hint=f"事实台账 {lookup_key} 期间（{f_period}）与正文（{fig_p}）不一致",
+                )
+            f_val = float(frow["value"])
+            f_unit = str(frow.get("unit") or "other")
+            f_cur = frow.get("currency")
+            ok_v, unit_mis, _ = values_within_tolerance(
+                fig, f_val, f_unit, src_currency=f_cur
+            )
+            if ok_v:
+                return MatchOutcome(
+                    figure=fig,
+                    matched=True,
+                    kind="facts",
+                    ref=lookup_key,
+                    excerpt=f"{f_metric} ({f_period}): {f_val} {f_unit}".strip(),
+                )
+            fig_base, fig_dim = _to_base(fig.value, fig.unit, fig.scale, fig.currency)
+            f_base, f_dim = _to_base(f_val, f_unit, 1.0, f_cur)
+            dims_ok = _are_dimensions_compatible(
+                fig, fig_base, fig_dim, f_unit, 1.0, f_base, f_dim
+            )
+            if unit_mis or not dims_ok:
+                return MatchOutcome(
+                    figure=fig,
+                    matched=False,
+                    reason="unverified",
+                    hint=f"事实台账 {lookup_key} 量纲（{f_unit}）与正文（{fig.unit}）不一致",
+                )
+            return MatchOutcome(
+                figure=fig,
+                matched=False,
+                reason="source_conflict",
+                hint=f"与事实台账 {lookup_key} 数值冲突（正文 {fig.raw} vs 台账 {f_val} {f_unit}）",
+            )
 
         # Order 1: evidence:<E-id>
         if target_ref.startswith("evidence:"):
@@ -2397,7 +2507,12 @@ def match_figures(
             lock_unverified=locked,
         )
 
-    for fig in figures:
+    unfootnoted_indices: list[int] = []
+
+    # Pass 1: Deterministic classification (exempt, incidental) and explicit footnote/citation matching
+    # (Orders 0–3). Never gated by `deadline`, so footnoted figures are always deterministically verified
+    # or flagged as conflict/unverified even if an earlier phase or unfootnoted scan runs out of time.
+    for idx, fig in enumerate(figures):
         if fig.exempt:
             outcomes.append(
                 MatchOutcome(figure=fig, matched=True, kind="exempt", ref=fig.exempt_reason)
@@ -2410,19 +2525,8 @@ def match_figures(
             )
             continue
 
-        # A5: the per-figure deadline check — one figure × every source body is
-        # where the unbounded work lives, so the budget is enforced here. Cheap
-        # classifications (exempt/incidental) above still get their real outcome.
-        if deadline is not None and time.monotonic() >= deadline:
-            outcomes.append(
-                MatchOutcome(
-                    figure=fig,
-                    matched=False,
-                    reason="uncertain",
-                    hint="核验未完成（截止时间已到）— 交由 PM 决定",
-                    lock_unverified=True,
-                )
-            )
+        if pre_settled_by_id and fig.id in pre_settled_by_id:
+            outcomes.append(dataclasses.replace(pre_settled_by_id[fig.id], figure=fig))
             continue
 
         targets = (
@@ -2430,6 +2534,21 @@ def match_figures(
             if fig.footnote_targets
             else ([fig.footnote_target] if fig.footnote_target else [])
         )
+        has_citation_info = bool(
+            targets or fig.missing_citations or fig.duplicate_citations
+        )
+        if not has_citation_info:
+            unfootnoted_indices.append(idx)
+            outcomes.append(
+                MatchOutcome(
+                    figure=fig,
+                    matched=False,
+                    reason="unverified",
+                    hint="无引用，未在来源中找到",
+                )
+            )
+            continue
+
         target_evals: list[tuple[str, MatchOutcome | None]] = [
             (t, _try_match_target(fig, t)) for t in targets
         ]
@@ -2521,17 +2640,67 @@ def match_figures(
             )
             continue
 
-        # Order 0b & Order 4 (P0I §1.2 / L34): Unfootnoted figures NEVER become `matched=True` here;
-        # auto-search only collects candidate sources for Step D (`audit.judge` + code anchoring).
+    if deferred_unlabeled_ids:
+        for idx, out in enumerate(outcomes):
+            if out.figure.id not in deferred_unlabeled_ids:
+                continue
+            if out.lock_unverified:
+                continue
+            sent_txt = str((out.figure.location or {}).get("sentence") or "")
+            has_rel_shift = not bool((out.figure.location or {}).get("period_explicit")) and bool(
+                re.search(
+                    r"(?:去年同期|上年同期|前一年|上一财年|上财年|前一季度|上一季度|上季度|上期|上年|去年|同期|prior\s+year|last\s+year|year\s+ago|prior\s+quarter)",
+                    sent_txt,
+                    re.IGNORECASE,
+                )
+            )
+            if out.reason == "source_conflict" and not has_rel_shift:
+                continue
+            outcomes[idx] = MatchOutcome(
+                figure=out.figure,
+                matched=False,
+                reason="uncertain",
+                hint="核验未完成（指标与期间识别超时）— 交由 PM 决定",
+                candidates=list(out.candidates),
+                lock_unverified=True,
+            )
+
+    # Order 5: Derived figures from Order 0–3 verified figures (also deterministic and cheap)
+    outcomes = apply_derived_figure_matching(outcomes)
+    if footnote_only:
+        return outcomes
+
+    # Pass 2: Order 0b & Order 4 (P0I §1.2 / L34) for remaining unfootnoted figures.
+    # Unfootnoted figures NEVER become `matched=True` here; auto-search only collects candidate sources
+    # for Step D (`audit.judge` + code anchoring). Enforces `deadline` per figure and inside the provenance loop.
+    for idx in unfootnoted_indices:
+        if outcomes[idx].matched:
+            continue
+        fig = figures[idx]
+        if deadline is not None and time.monotonic() >= deadline:
+            outcomes[idx] = MatchOutcome(
+                figure=fig,
+                matched=False,
+                reason="uncertain",
+                hint="核验未完成（截止时间已到）— 交由 PM 决定",
+                lock_unverified=True,
+            )
+            continue
+
         auto_candidates: list[MatchCandidate] = []
 
         # Order 0b: facts ledger candidates
         for fid, frow in facts_map.items():
+            if frow.get("scoped_only") or "#" in fid:
+                continue
             if metrics_match(fig.metric, str(frow.get("metric") or ""), metric_aliases):
                 fp = normalize_period(frow.get("period"))
                 if not fig.period or not fp or normalize_period(fig.period) == fp:
                     ok_v, _, _ = values_within_tolerance(
-                        fig, float(frow["value"]), str(frow.get("unit") or "other")
+                        fig,
+                        float(frow["value"]),
+                        str(frow.get("unit") or "other"),
+                        src_currency=frow.get("currency"),
                     )
                     if ok_v:
                         auto_candidates.append(
@@ -2613,7 +2782,11 @@ def match_figures(
                         auto_candidates.extend(cand.candidates)
 
         # Order 4d: provenance records candidates
+        deadline_hit_mid_fig = False
         for pid, prec in prov_map.items():
+            if deadline is not None and time.monotonic() >= deadline:
+                deadline_hit_mid_fig = True
+                break
             if _is_draft_provenance_record(prec, draft_path):
                 continue
             body_text = str(
@@ -2644,18 +2817,26 @@ def match_figures(
             elif prov_cands:
                 auto_candidates.extend(prov_cands)
 
-        outcomes.append(
-            MatchOutcome(
+        if deadline_hit_mid_fig:
+            outcomes[idx] = MatchOutcome(
                 figure=fig,
                 matched=False,
-                reason="unverified",
-                hint="无引用，未在来源中找到",
+                reason="uncertain",
+                hint="核验未完成（截止时间已到）— 交由 PM 决定",
                 candidates=auto_candidates[:5],
+                lock_unverified=True,
             )
+            continue
+
+        outcomes[idx] = MatchOutcome(
+            figure=fig,
+            matched=False,
+            reason="unverified",
+            hint="无引用，未在来源中找到",
+            candidates=auto_candidates[:5],
         )
 
-    # Order 5: Derived figures from Order 0–3 verified figures
-    return apply_derived_figure_matching(outcomes)
+    return outcomes
 
 
 def retrieve_candidate_sources(
@@ -2896,7 +3077,7 @@ def retrieve_candidate_sources(
 
     # 4. facts_ledger
     for fid, frow in (facts_ledger or {}).items():
-        if not isinstance(frow, dict):
+        if not isinstance(frow, dict) or frow.get("scoped_only") or "#" in fid:
             continue
         fn_hit = int(fn_target == f"f:{fid}")
         fm = str(frow.get("metric") or "")
@@ -2905,7 +3086,12 @@ def retrieve_candidate_sources(
         val_hit = 0
         if frow.get("value") is not None:
             try:
-                ok_f, _, _ = values_within_tolerance(fig, float(frow["value"]), fu)
+                ok_f, _, _ = values_within_tolerance(
+                    fig,
+                    float(frow["value"]),
+                    fu,
+                    src_currency=frow.get("currency"),
+                )
                 if ok_f:
                     val_hit = 1
             except (TypeError, ValueError):

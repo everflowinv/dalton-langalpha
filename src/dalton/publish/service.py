@@ -7,6 +7,7 @@ import contextvars
 import copy
 import hashlib
 import logging
+import posixpath
 import re
 import time
 from datetime import datetime, timezone
@@ -28,6 +29,7 @@ from src.dalton.knowledge.render import render_published_index_md
 from src.dalton.knowledge.service import apply_update
 from src.dalton.publish.audit import (
     AuditBuildTimeout,
+    _is_timeout_uncertain_item,
     aaudit_draft,
     resolve_audit_config_fingerprint,
     compute_audit_inputs_sha256,
@@ -432,13 +434,227 @@ async def _load_evidence_ref_bodies(
     return out
 
 
+_PROV_PRECHECK_MAX_S = 15.0
+_CACHE_CHECK_MAX_S = 15.0
+_FACTS_REF_RE = re.compile(
+    r"\b(?:f:[A-Za-z0-9_./#-]+|(?:[\w./-]+[./])?facts\.md#[A-Za-z0-9_.-]+)\b",
+    re.IGNORECASE,
+)
+_BARE_FACTS_KEY_REF_RE = re.compile(
+    r"\bf:[A-Za-z0-9_.-]+(?![/#])",
+    re.IGNORECASE,
+)
+_EXPLICIT_FACTS_PATH_REF_RE = re.compile(
+    r"(?:f:)?(?<![A-Za-z0-9_./-])((?:[\w./-]+[./])?facts\.md)#([A-Za-z0-9_.-]+)",
+    re.IGNORECASE,
+)
+
+
+def _normalize_workspace_path(path: str | None, backend: Any = None) -> str:
+    """Convert an in-workspace absolute path to a workspace-relative path and collapse ``.``/``..``;
+    leave non-workspace absolute paths intact for ``backend``."""
+    raw = (path or "").strip()
+    if not raw:
+        return ""
+    norm = posixpath.normpath(raw)
+    if norm == ".":
+        return ""
+    if not norm.startswith("/"):
+        return norm
+    ws_roots: list[str] = []
+    if backend is not None:
+        # Only the workspace folder: the computer root (`root_dir`) or a generic
+        # sandbox prefix would turn a sibling workspace's absolute path into a
+        # relative one that the backend re-anchors inside this workspace.
+        for attr in ("workspace_dir",):
+            try:
+                val = getattr(backend, attr, None)
+            except Exception:
+                val = None
+            if isinstance(val, str) and val.strip().startswith("/"):
+                clean_r = posixpath.normpath(val.strip()).rstrip("/")
+                if clean_r and clean_r not in ws_roots:
+                    ws_roots.append(clean_r)
+    for root in ws_roots:
+        if norm == root:
+            return ""
+        if norm.startswith(f"{root}/"):
+            return norm[len(root) + 1 :]
+    return norm
+
+
+def _derive_convention_facts_paths(draft_path: str, backend: Any = None) -> list[str]:
+    """Derive deterministic convention facts.md paths from ``draft_path`` (Item 3.2).
+
+    - ``drafts/<D>-memo.md`` -> ``research/<D>-fc/facts.md``
+    - ``drafts/<slug>.md`` -> ``drafts/<slug>.facts.md``
+    """
+    norm_draft = _normalize_workspace_path(draft_path, backend)
+    if not norm_draft or norm_draft == "." or norm_draft.startswith("/"):
+        return []
+    draft_dir = posixpath.dirname(norm_draft)
+    draft_name = posixpath.basename(norm_draft)
+    if not draft_name.lower().endswith(".md"):
+        return []
+    stem = draft_name[:-3]
+    if not stem:
+        return []
+    paths: list[str] = []
+    if posixpath.basename(draft_dir) == "drafts":
+        parent_prefix = posixpath.dirname(draft_dir)
+        if stem.endswith("-memo") and len(stem) > len("-memo"):
+            d_part = stem[: -len("-memo")]
+            fc_path = (
+                f"{parent_prefix}/research/{d_part}-fc/facts.md"
+                if parent_prefix
+                else f"research/{d_part}-fc/facts.md"
+            )
+            paths.append(fc_path)
+        sidecar_path = f"{draft_dir}/{stem}.facts.md"
+        if sidecar_path not in paths:
+            paths.append(sidecar_path)
+    return paths
+
+
+async def _resolve_facts_markdown(
+    backend: Any,
+    *,
+    draft_text: str,
+    draft_path: str = "",
+    explicit_facts_path: str | None = None,
+    attachments: list[dict[str, Any]] | None = None,
+    preloaded_attachment_facts: dict[str, str] | None = None,
+) -> tuple[str | None, str | None, str | None]:
+    """Unified deterministic facts.md loader shared by ``run_check_draft`` and ``_run_publish_state_machine``.
+
+    1. Footnotes with an explicit file path (``<path>#<key>``, including ``facts.md#<key>``):
+       resolved relative to the workspace root and read once into a scoped
+       ``<!-- DALTON-FACTS-FILE path="..." -->`` block bound strictly to that path.
+    2. Bare key references (``f:<key>``): resolved against a single default ledger, picking the first
+       existing file in order:
+       (a) caller-supplied ``explicit_facts_path`` or ``role="facts"`` attachment;
+       (b) naming convention derived from ``draft_path`` (``drafts/<D>-memo.md`` -> ``research/<D>-fc/facts.md``,
+           ``drafts/<slug>.md`` -> ``drafts/<slug>.facts.md``);
+       (c) ``<draft_dir>/facts.md`` (in the draft's own subdirectory; workspace root ``facts.md`` is never auto-used).
+    """
+    if backend is None:
+        return None, None, None
+    norm_draft = _normalize_workspace_path(draft_path, backend)
+    draft_dir = (
+        posixpath.dirname(norm_draft)
+        if norm_draft and not norm_draft.startswith("/")
+        else ""
+    )
+    if draft_dir == ".":
+        draft_dir = ""
+
+    # 1. Single default ledger for bare `f:<key>` references
+    default_facts_text: str | None = None
+    default_facts_path: str | None = None
+
+    # 1.1 Explicit `facts_path` or `role="facts"` attachment (always wins over auto-discovery)
+    explicit_candidates: list[tuple[str, bool]] = []
+    if explicit_facts_path and explicit_facts_path.strip():
+        norm_ep = _normalize_workspace_path(explicit_facts_path, backend)
+        if norm_ep:
+            explicit_candidates.append((norm_ep, False))
+    for att in attachments or []:
+        if isinstance(att, dict) and str(att.get("role") or "") == "facts":
+            ap = str(att.get("path") or "").strip()
+            if ap:
+                norm_ap = _normalize_workspace_path(ap, backend)
+                if norm_ap and all(norm_ap != p for p, _ in explicit_candidates):
+                    explicit_candidates.append((norm_ap, True))
+
+    preloaded_map = (
+        preloaded_attachment_facts
+        if isinstance(preloaded_attachment_facts, dict)
+        else {}
+    )
+    for cand_p, is_att in explicit_candidates:
+        txt = preloaded_map.get(cand_p) if is_att else None
+        if not isinstance(txt, str) or not txt.strip():
+            txt = await _read_optional_text(backend, cand_p)
+        if isinstance(txt, str) and txt.strip():
+            default_facts_text = txt
+            default_facts_path = cand_p
+            break
+
+    # 1.2 Naming convention derived from `draft_path`
+    if default_facts_text is None:
+        for conv_p in _derive_convention_facts_paths(norm_draft, backend):
+            txt = await _read_optional_text(backend, conv_p)
+            if isinstance(txt, str) and txt.strip():
+                default_facts_text = txt
+                default_facts_path = conv_p
+                break
+
+    # 1.3 `<draft_dir>/facts.md` (only when draft is inside a subdirectory, never workspace root `facts.md`)
+    if default_facts_text is None and draft_dir:
+        dir_facts_p = f"{draft_dir}/facts.md"
+        txt = await _read_optional_text(backend, dir_facts_p)
+        if isinstance(txt, str) and txt.strip():
+            default_facts_text = txt
+            default_facts_path = dir_facts_p
+
+    # 2. Scoped explicit-path footnote references (`<path>#<key>`, including `facts.md#<key>`):
+    #    resolved relative to workspace root and read once (no draft_dir fallback).
+    scoped_blocks: list[str] = []
+    seen_explicit_paths: set[str] = set()
+    scan_queue: list[str] = []
+    if draft_text:
+        scan_queue.append(draft_text)
+    if default_facts_text:
+        scan_queue.append(default_facts_text)
+    while scan_queue:
+        cur_text = scan_queue.pop(0)
+        for m in _EXPLICIT_FACTS_PATH_REF_RE.finditer(cur_text):
+            if m.group(1).strip().startswith("/"):
+                continue  # absolute footnote paths are refused at match time
+            raw_p = _normalize_workspace_path(m.group(1), backend)
+            if (
+                not raw_p
+                or raw_p == "."
+                or raw_p.startswith("..")
+                or raw_p.startswith("/")
+                or raw_p in seen_explicit_paths
+            ):
+                continue
+            seen_explicit_paths.add(raw_p)
+            txt = await _read_optional_text(backend, raw_p)
+            if isinstance(txt, str) and txt.strip():
+                scoped_blocks.append(
+                    f'<!-- DALTON-FACTS-FILE path="{raw_p}" -->\n{txt.strip()}\n<!-- /DALTON-FACTS-FILE -->'
+                )
+                scan_queue.append(txt)
+
+    # 3. Notice message
+    facts_notice: str | None = None
+    if default_facts_path is not None:
+        facts_notice = f"默认事实台账：{default_facts_path}"
+    elif explicit_candidates:
+        tried = "、".join(p for p, _ in explicit_candidates)
+        facts_notice = f"没有找到指定的事实台账（{tried}），请检查文件路径"
+    elif draft_text and _BARE_FACTS_KEY_REF_RE.search(draft_text):
+        facts_notice = (
+            "正文有 f:<键> 引用，但没有找到默认事实台账；check_draft 请传 facts_path，"
+            "publish_report 请在 attachments 里附上 role=\"facts\" 的文件（或放在约定路径）"
+        )
+
+    parts: list[str] = list(scoped_blocks)
+    if default_facts_text:
+        parts.append(default_facts_text)
+    combined_markdown = "\n\n".join(parts) if parts else None
+    return combined_markdown, default_facts_path, facts_notice
+
+
 def _prov_hits_all_key_figures(
     draft_text: str,
     prov_map: dict[str, dict[str, Any]],
     *,
     draft_path: str = "",
 ) -> bool:
-    """Return True if every non-exempt figure in ``draft_text`` (not already pointing to ``evidence:``/``model:``) hits in ``prov_map`` with matching metric, period, value, and unit."""
+    """Return True if every non-exempt figure in ``draft_text`` (not already pointing to ``evidence:``/``model:``/``f:``) hits in ``prov_map`` with matching metric, period, value, and unit."""
     if not draft_text or not draft_text.strip():
         return True
     figs = [
@@ -446,7 +662,8 @@ def _prov_hits_all_key_figures(
         for f in extract_figures(draft_text)
         if not f.exempt
         and f.label_hint != "incidental"
-        and not (f.footnote_target or "").startswith(("evidence:", "model:"))
+        and not (f.footnote_target or "").startswith(("evidence:", "model:", "f:"))
+        and "facts.md#" not in (f.footnote_target or "").lower()
     ]
     if not figs:
         return True
@@ -615,22 +832,23 @@ async def _load_workspace_provenance(
                 if remaining_for_expand > 0 and max_limit > first_limit and bool(
                     draft_text and draft_text.strip()
                 ):
-                    # A1/A5: the precheck runs in a killable subprocess under the
-                    # audit-wide deadline. On a budget overrun, load the wider tier
-                    # anyway: the match phase re-checks against it under the same
-                    # deadline and marks what it cannot finish.
+                    # A1/A5: the precheck runs in a killable subprocess with its own
+                    # sub-budget cap so it never starves the downstream figure audit.
+                    precheck_deadline = min(
+                        deadline, time.monotonic() + _PROV_PRECHECK_MAX_S
+                    )
                     try:
                         hits = await run_in_heavy_subprocess(
                             _prov_hits_all_key_figures,
                             draft_text,
                             out,
                             draft_path=draft_path,
-                            deadline=deadline,
+                            deadline=precheck_deadline,
                             label="publish.prov_precheck",
                         )
                     except HeavyComputeTimeout:
                         logger.warning(
-                            "Provenance precheck for %s hit the audit deadline; "
+                            "Provenance precheck for %s hit the precheck budget; "
                             "loading the wider provenance tier regardless",
                             workspace_id,
                         )
@@ -684,11 +902,17 @@ async def run_check_draft(
     if not user_id or not str(user_id).strip():
         raise ValueError("user_id is required")
     user_id = str(user_id).strip()
-    await verify_workspace_access(workspace_id, user_id, need="write", channel="cos")
+    await verify_workspace_access(
+        workspace_id, user_id, need="write", channel="cos"
+    )
     if backend is None:
         return {"ok": False, "message": "ERROR: filesystem backend is unavailable."}
 
     draft_text = await backend.aread_text(draft_path)
+    if draft_text is None:
+        norm_dp = _normalize_workspace_path(draft_path, backend)
+        if norm_dp and norm_dp != draft_path:
+            draft_text = await backend.aread_text(norm_dp)
     if draft_text is None:
         return {
             "ok": False,
@@ -701,16 +925,21 @@ async def run_check_draft(
     # time) before the budgeted phases even began.
     audit_deadline = time.monotonic() + get_dalton_config().publish.audit_total_timeout_s
 
-    facts_text: str | None = None
-    if facts_path:
-        facts_text = await backend.aread_text(facts_path)
-
     if thesis_doc is None:
         t_row = await db_knowledge.latest_valid_version(workspace_id, "thesis")
         thesis_doc = t_row["content"] if t_row else None
     if models_doc is None:
         m_row = await db_knowledge.latest_valid_version(workspace_id, "models")
         models_doc = m_row["content"] if m_row else None
+
+    facts_text, resolved_facts_path, facts_notice = await _resolve_facts_markdown(
+        backend,
+        draft_text=draft_text,
+        draft_path=draft_path,
+        explicit_facts_path=facts_path,
+        attachments=None,
+        preloaded_attachment_facts=None,
+    )
     if provenance_records is None:
         provenance_records = await _load_workspace_provenance(
             workspace_id,
@@ -734,33 +963,37 @@ async def run_check_draft(
     audit_path, annotated_path = _derive_sidecar_paths(draft_path)
     existing_audit_md = await _read_optional_text(backend, audit_path)
     # A5: the reusable-audit hash re-serialises every input (all provenance
-    # bodies included), so it rides the same deadline and subprocess as the
-    # phases it stands before. A budget overrun just means no cached reuse:
-    # the audit below runs under the same deadline and degrades the same way.
-    try:
-        cached_audit = await run_in_heavy_subprocess(
-            try_load_reusable_audit_from_md,
-            existing_audit_md,
-            draft_markdown=draft_text,
-            thesis_doc=thesis_doc,
-            models_doc=models_doc,
-            model_cells=model_cells,
-            provenance_records=provenance_records,
-            facts_markdown=facts_text,
-            evidence_ref_bodies=evidence_ref_bodies,
-            use_llm_judge=use_llm_judge,
-            config_fingerprint=await resolve_audit_config_fingerprint(
-                user_id, use_llm_judge=use_llm_judge
-            ),
-            deadline=audit_deadline,
-            label="publish.audit_cache_check",
+    # bodies included), so it runs in a subprocess with its own capped sub-budget
+    # when an existing sidecar is present.
+    cached_audit = None
+    if existing_audit_md:
+        cache_check_deadline = min(
+            audit_deadline, time.monotonic() + _CACHE_CHECK_MAX_S
         )
-    except HeavyComputeTimeout:
-        logger.warning(
-            "Reusable-audit hash for %s hit the audit deadline; re-auditing",
-            draft_path,
-        )
-        cached_audit = None
+        try:
+            cached_audit = await run_in_heavy_subprocess(
+                try_load_reusable_audit_from_md,
+                existing_audit_md,
+                draft_markdown=draft_text,
+                thesis_doc=thesis_doc,
+                models_doc=models_doc,
+                model_cells=model_cells,
+                provenance_records=provenance_records,
+                facts_markdown=facts_text,
+                evidence_ref_bodies=evidence_ref_bodies,
+                use_llm_judge=use_llm_judge,
+                config_fingerprint=await resolve_audit_config_fingerprint(
+                    user_id, use_llm_judge=use_llm_judge
+                ),
+                deadline=cache_check_deadline,
+                label="publish.audit_cache_check",
+            )
+        except HeavyComputeTimeout:
+            logger.warning(
+                "Reusable-audit hash for %s hit the audit deadline; re-auditing",
+                draft_path,
+            )
+            cached_audit = None
     if cached_audit is not None:
         cached_audit.unrecalculated_model_warnings = unrecalc_warnings
         if unrecalc_warnings and any(
@@ -772,15 +1005,21 @@ async def run_check_draft(
                     render_audit_md, cached_audit, draft_path=draft_path
                 ),
             )
-        warn_lead = f"{'；'.join(unrecalc_warnings)}。" if unrecalc_warnings else ""
-        return {
+        unrecalc_lead = f"{'；'.join(unrecalc_warnings)}。" if unrecalc_warnings else ""
+        facts_suffix = f"（{facts_notice}）" if facts_notice else ""
+        res_cached: dict[str, Any] = {
             "ok": True,
             "reused": True,
             "audit": cached_audit.to_dict(),
             "audit_path": audit_path,
             "annotated_path": annotated_path,
-            "message": f"{warn_lead}{cached_audit.summary_line(audit_path)}",
+            "message": f"{unrecalc_lead}{cached_audit.summary_line(audit_path)}{facts_suffix}",
         }
+        if resolved_facts_path is not None:
+            res_cached["facts_path"] = resolved_facts_path
+        elif facts_notice:
+            res_cached["facts_warning"] = facts_notice
+        return res_cached
 
     try:
         audit = await aaudit_draft(
@@ -809,15 +1048,21 @@ async def run_check_draft(
     await backend.awrite_text(audit_path, audit_md)
     await backend.awrite_text(annotated_path, annotated_md)
 
-    warn_lead = f"{'；'.join(unrecalc_warnings)}。" if unrecalc_warnings else ""
-    return {
+    unrecalc_lead = f"{'；'.join(unrecalc_warnings)}。" if unrecalc_warnings else ""
+    facts_suffix = f"（{facts_notice}）" if facts_notice else ""
+    res_fresh: dict[str, Any] = {
         "ok": True,
         "reused": False,
         "audit": audit.to_dict(),
         "audit_path": audit_path,
         "annotated_path": annotated_path,
-        "message": f"{warn_lead}{audit.summary_line(audit_path)}",
+        "message": f"{unrecalc_lead}{audit.summary_line(audit_path)}{facts_suffix}",
     }
+    if resolved_facts_path is not None:
+        res_fresh["facts_path"] = resolved_facts_path
+    elif facts_notice:
+        res_fresh["facts_warning"] = facts_notice
+    return res_fresh
 
 
 def _prefix_with_audit_summary(row: dict[str, Any], message: str) -> str:
@@ -1112,16 +1357,20 @@ async def _run_publish_state_machine(
 
     async def _read_draft_and_bundle(
         dp: str, atts: list[dict[str, Any]] | None
-    ) -> tuple[str, str | None, list[dict[str, Any]], list[tuple[str, str, bytes]], str] | None:
+    ) -> tuple[str, dict[str, str], list[dict[str, Any]], list[tuple[str, str, bytes]], str] | None:
         """Read the draft (+ attachments) at ``dp``/``atts`` and hash the bundle;
         ``None`` when the draft file is missing. Round-4 decision 1: re-readable
         so an adopted request row's params can drive a fresh read."""
         text = await backend.aread_text(dp)
         if text is None:
+            norm_dp = _normalize_workspace_path(dp, backend)
+            if norm_dp and norm_dp != dp:
+                text = await backend.aread_text(norm_dp)
+        if text is None:
             return None
         atts_meta: list[dict[str, Any]] = []
         blobs: list[tuple[str, str, bytes]] = []
-        facts: str | None = None
+        facts_by_path: dict[str, str] = {}
         for att in atts or []:
             if not isinstance(att, dict):
                 continue
@@ -1129,17 +1378,31 @@ async def _run_publish_state_machine(
             arole = str(att.get("role") or "appendix")
             if not apath:
                 continue
+            norm_apath = _normalize_workspace_path(apath, backend)
             raw: bytes | None = None
             if hasattr(backend, "adownload_file_bytes"):
-                raw = await backend.adownload_file_bytes(apath)
+                dl_res = await backend.adownload_file_bytes(apath)
+                if isinstance(dl_res, (bytes, bytearray)):
+                    raw = bytes(dl_res)
+                elif norm_apath and norm_apath != apath:
+                    dl_res = await backend.adownload_file_bytes(norm_apath)
+                    if isinstance(dl_res, (bytes, bytearray)):
+                        raw = bytes(dl_res)
             if raw is None and hasattr(backend, "aread_text"):
                 t = await backend.aread_text(apath)
-                if t is not None:
+                if not isinstance(t, str) and norm_apath and norm_apath != apath:
+                    t = await backend.aread_text(norm_apath)
+                if isinstance(t, str):
                     raw = t.encode("utf-8")
                     if arole == "facts":
-                        facts = t
+                        facts_by_path[apath] = t
+                        if norm_apath:
+                            facts_by_path[norm_apath] = t
             elif raw is not None and arole == "facts":
-                facts = raw.decode("utf-8", errors="replace")
+                decoded_f = raw.decode("utf-8", errors="replace")
+                facts_by_path[apath] = decoded_f
+                if norm_apath:
+                    facts_by_path[norm_apath] = decoded_f
 
             if raw is not None:
                 asha = hashlib.sha256(raw).hexdigest()
@@ -1147,7 +1410,7 @@ async def _run_publish_state_machine(
                 blobs.append((arole, apath, raw))
         return (
             text,
-            facts,
+            facts_by_path,
             atts_meta,
             blobs,
             compute_bundle_sha256(text.encode("utf-8"), blobs),
@@ -1159,7 +1422,7 @@ async def _run_publish_state_machine(
             "ok": False,
             "message": f"ERROR: Draft file not found at {draft_path}",
         }
-    draft_text, facts_text, att_list, att_blobs, bundle_sha256 = read_result
+    draft_text, preloaded_facts_by_path, att_list, att_blobs, bundle_sha256 = read_result
     # A5: the publish state machine re-audits through the same wall-clock budget
     # as check_draft — its provenance precheck, reuse hash and audit phases all
     # hang off this one deadline.
@@ -1270,8 +1533,18 @@ async def _run_publish_state_machine(
                         "（不带 request_id）发起新的审批。",
                     ),
                 }
-            draft_text, facts_text, att_list, att_blobs, bundle_sha256 = re_read
+            draft_text, preloaded_facts_by_path, att_list, att_blobs, bundle_sha256 = re_read
         approved_thesis_version_no = row.get("thesis_version_no")
+
+    facts_text, resolved_facts_path, facts_notice = await _resolve_facts_markdown(
+        backend,
+        draft_text=draft_text,
+        draft_path=draft_path,
+        explicit_facts_path=None,
+        attachments=attachments,
+        preloaded_attachment_facts=preloaded_facts_by_path,
+    )
+    facts_suffix = f"（{facts_notice}）" if facts_notice else ""
 
     ticker = str(company_doc.get("ticker") or slug.split("-")[0]).upper()
 
@@ -1419,8 +1692,25 @@ async def _run_publish_state_machine(
         prev_inputs_sha = str(prev_audit.get("inputs_sha256") or "")
         prev_cfg_sha = str(prev_audit.get("config_sha256") or "")
         prev_unrecalc = list(prev_audit.get("unrecalculated_model_warnings") or [])
+        prev_uncertain_items = prev_audit.get("uncertain_items")
+        if not isinstance(prev_uncertain_items, list):
+            prev_uncertain_items = (
+                prev_audit.get("uncertain")
+                if isinstance(prev_audit.get("uncertain"), list)
+                else []
+            )
+        prev_timed_out = (
+            int(prev_audit.get("timed_out") or 0) > 0
+            or any(
+                _is_timeout_uncertain_item(u)
+                for u in prev_uncertain_items
+                if isinstance(u, dict)
+            )
+            or int((prev_audit.get("labeling") or {}).get("timed_out_unjudged") or 0) > 0
+        )
         if (
             row.get("bundle_sha256") == bundle_sha256
+            and not prev_timed_out
             and bool(prev_inputs_sha)
             and prev_inputs_sha == current_inputs_sha
             and bool(prev_cfg_sha)
@@ -1510,26 +1800,31 @@ async def _run_publish_state_machine(
             )
         audit_path, annotated_path = _derive_sidecar_paths(draft_path)
         existing_audit_md = await _read_optional_text(backend, audit_path)
-        try:
-            audit = await run_in_heavy_subprocess(
-                try_load_reusable_audit_from_md,
-                existing_audit_md,
-                draft_markdown=draft_text,
-                thesis_doc=thesis_doc,
-                models_doc=models_doc,
-                model_cells=model_cells,
-                provenance_records=prov_records,
-                facts_markdown=facts_text,
-                evidence_ref_bodies=evidence_ref_bodies,
-                use_llm_judge=True,
-                config_fingerprint=await resolve_audit_config_fingerprint(
-                    user_id, use_llm_judge=True
-                ),
-                deadline=audit_deadline,
-                label="publish.audit_cache_check",
+        audit = None
+        if existing_audit_md:
+            cache_check_deadline = min(
+                audit_deadline, time.monotonic() + _CACHE_CHECK_MAX_S
             )
-        except HeavyComputeTimeout:
-            audit = None
+            try:
+                audit = await run_in_heavy_subprocess(
+                    try_load_reusable_audit_from_md,
+                    existing_audit_md,
+                    draft_markdown=draft_text,
+                    thesis_doc=thesis_doc,
+                    models_doc=models_doc,
+                    model_cells=model_cells,
+                    provenance_records=prov_records,
+                    facts_markdown=facts_text,
+                    evidence_ref_bodies=evidence_ref_bodies,
+                    use_llm_judge=True,
+                    config_fingerprint=await resolve_audit_config_fingerprint(
+                        user_id, use_llm_judge=True
+                    ),
+                    deadline=cache_check_deadline,
+                    label="publish.audit_cache_check",
+                )
+            except HeavyComputeTimeout:
+                audit = None
         if audit is None:
             try:
                 audit = await aaudit_draft(
@@ -1589,7 +1884,7 @@ async def _run_publish_state_machine(
                 audit=audit.to_dict(),
                 error="；".join(unrecalc_warnings) if unrecalc_warnings else None,
             )
-            return {
+            res_failed: dict[str, Any] = {
                 "ok": False,
                 "status": "audit_failed",
                 "reused": audit.reused,
@@ -1598,9 +1893,14 @@ async def _run_publish_state_machine(
                 "annotated_path": annotated_path,
                 "message": (
                     f"{unrecalc_lead}{audit.summary_line(audit_path)}。"
-                    f"请根据 {audit_path} 修复冲突与未核实数字后重新调用 publish_report。"
+                    f"请根据 {audit_path} 修复冲突与未核实数字后重新调用 publish_report。{facts_suffix}"
                 ),
             }
+            if resolved_facts_path is not None:
+                res_failed["facts_path"] = resolved_facts_path
+            elif facts_notice:
+                res_failed["facts_warning"] = facts_notice
+            return res_failed
 
         row = (
             await db_publications.transition(
@@ -1826,12 +2126,12 @@ async def _run_publish_state_machine(
                 message = (
                     f"{msg_prefix}已通过数字核验与独立审稿，已提交给工作区所有者审批"
                     f"（request_id={req_id}）；所有者在自己的线程里用这个 request_id "
-                    "继续即可审批。"
+                    f"继续即可审批。{facts_suffix}"
                 )
             else:
                 message = (
                     f"{msg_prefix}已通过数字核验与独立审稿，等待 PM 审批，"
-                    f"request_id={req_id}"
+                    f"request_id={req_id}{facts_suffix}"
                 )
             return {
                 "ok": False,
@@ -2362,7 +2662,7 @@ async def _run_publish_state_machine(
             "audit": row.get("audit"),
             "message": (
                 f"{msg_prefix}Published {ticker} {title}: {paths_str}"
-                f"{official_ver_note} · publication {pub_id[:8]}{notes_str}"
+                f"{official_ver_note} · publication {pub_id[:8]}{notes_str}{facts_suffix}"
             ),
         }
         if thesis_update_error:

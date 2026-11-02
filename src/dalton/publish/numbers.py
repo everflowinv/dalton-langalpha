@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import time
 import dataclasses
+import json
+import posixpath
 import re
+import time
 from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, Field, model_validator
@@ -801,37 +803,376 @@ def parse_footnotes(markdown_text: str) -> dict[str, str]:
     return merged
 
 
-def parse_facts_ledger(facts_markdown: str) -> dict[str, dict[str, Any]]:
-    """Parse ``<!-- FACTS-LEDGER -->`` table rows from a ``role='facts'`` attachment (PK.9)."""
+_BAKED_SCALE_UNITS = frozenset(
+    {
+        "USD_mn",
+        "USD_100mn",
+        "USD_bn",
+        "HKD_mn",
+        "HKD_100mn",
+        "HKD_bn",
+        "CNY_mn",
+        "CNY_100mn",
+        "CNY_bn",
+        "count_mn",
+    }
+)
+_KNOWN_EXPLICIT_UNITS = _BAKED_SCALE_UNITS | frozenset(
+    {
+        "USD",
+        "HKD",
+        "CNY",
+        "pct",
+        "%",
+        "bps",
+        "bp",
+        "x",
+        "per_share",
+        "count",
+        "other",
+    }
+)
+
+
+def _is_period_cell(s: str) -> bool:
+    t = (s or "").strip()
+    if not t:
+        return False
+    return bool(
+        _PERIOD_TOKEN_RE.fullmatch(t)
+        or _CN_DATE_RE.fullmatch(t)
+        or match_ltm_periods(t, fullmatch=True)
+    )
+
+
+def _parse_facts_value_and_unit(
+    val_str: str,
+    explicit_unit: str = "",
+    metric_hint: str = "",
+    *,
+    allow_bare_year_int: bool = False,
+) -> tuple[float, str, str | None] | None:
+    """Parse numeric value, canonical unit, and currency from a facts ledger cell, folding non-baked scales into value."""
+    cleaned = (val_str or "").strip()
+    if not cleaned or _is_period_cell(cleaned):
+        return None
+    explicit_unit = (explicit_unit or "").strip()
+    if explicit_unit and explicit_unit in _KNOWN_EXPLICIT_UNITS:
+        try:
+            val = float(cleaned.replace(",", "").replace("%", "").strip())
+            norm_unit = "pct" if explicit_unit == "%" else ("bps" if explicit_unit == "bp" else explicit_unit)
+            cur_from_unit = (
+                norm_unit.split("_")[0]
+                if norm_unit.startswith(("USD", "HKD", "CNY"))
+                else None
+            )
+            return val, norm_unit, cur_from_unit
+        except ValueError:
+            pass
+    m = _NUMBER_RE.search(cleaned)
+    if not m:
+        return None
+    num_str = (m.group("num") or "").replace(",", "")
+    dec_str = m.group("dec") or ""
+    if (
+        not allow_bare_year_int
+        and not dec_str
+        and not m.group("currency")
+        and not m.group("scale")
+        and not m.group("unit")
+        and not explicit_unit
+        and _STANDALONE_YEAR_RE.match(num_str)
+    ):
+        return None
+    try:
+        val = float(num_str + dec_str)
+    except ValueError:
+        return None
+    sign = m.group("sign") or ""
+    if sign in ("-", "−") or (m.group("open_paren") and m.group("close_paren")):
+        val = -val
+    cur, canon_unit, scale = _determine_unit_and_scale(
+        m.group("currency"),
+        m.group("scale"),
+        m.group("unit") or explicit_unit,
+        context_text=f"{metric_hint} {cleaned}".strip(),
+        header_context=f"{explicit_unit} {cleaned}".strip(),
+    )
+    if explicit_unit in _KNOWN_EXPLICIT_UNITS and canon_unit in ("other", "count"):
+        canon_unit = "pct" if explicit_unit == "%" else ("bps" if explicit_unit == "bp" else explicit_unit)
+        if not cur and str(canon_unit).startswith(("USD", "HKD", "CNY")):
+            cur = str(canon_unit).split("_")[0]
+    if cur in ("USD", "HKD", "CNY") and canon_unit in ("USD", "HKD", "CNY", "count"):
+        if scale == 1e6:
+            canon_unit = f"{cur}_mn"
+        elif scale == 1e8:
+            canon_unit = f"{cur}_100mn"
+        elif scale == 1e9:
+            canon_unit = f"{cur}_bn"
+        elif canon_unit == "count":
+            canon_unit = cur
+    canon_unit_str = str(canon_unit or "other")
+    if scale and scale > 1.0 and canon_unit_str not in _BAKED_SCALE_UNITS:
+        val = val * float(scale)
+    return val, canon_unit_str, cur
+
+
+def _parse_facts_table_header(cells: list[str]) -> tuple[dict[str, int], str] | None:
+    """Map column role names ('id', 'metric', 'period', 'value', 'unit', 'ref') and optional header unit from a facts table header row."""
+    col_map: dict[str, int] = {}
+    header_unit = ""
+    for idx, raw_cell in enumerate(cells):
+        m_paren = re.search(r"[（\(]([^）\)]+)[）\)]", raw_cell)
+        paren_unit = ""
+        if m_paren:
+            paren_unit = re.sub(
+                r"^(?:单位\s*[：:]\s*|in\s+)",
+                "",
+                m_paren.group(1).strip(),
+                flags=re.IGNORECASE,
+            ).strip()
+        base_cell = re.sub(r"[（\(][^）\)]*[）\)]", "", raw_cell)
+        c = re.sub(r"[\s*`]+", "", base_cell).lower()
+        if c in ("id", "key", "编号", "键"):
+            col_map.setdefault("id", idx)
+        elif c in ("metric", "label", "指标", "项目", "名称"):
+            col_map.setdefault("metric", idx)
+        elif c in ("period", "期间", "时间", "年度", "季度"):
+            col_map.setdefault("period", idx)
+        elif c in ("value", "val", "数值", "值", "金额", "数据"):
+            if "value" not in col_map:
+                col_map["value"] = idx
+                if paren_unit:
+                    header_unit = paren_unit
+        elif c in ("unit", "单位"):
+            col_map.setdefault("unit", idx)
+        elif c in ("ref", "source", "来源", "引用", "出处"):
+            col_map.setdefault("ref", idx)
+    if {"id", "metric", "period", "value", "ref"} <= set(col_map.keys()):
+        return col_map, header_unit
+    return None
+
+
+_DALTON_FACTS_FILE_BLOCK_RE = re.compile(
+    r'<!--\s*DALTON-FACTS-FILE\s+path="([^"]+)"\s*-->\s*(.*?)\s*<!--\s*/DALTON-FACTS-FILE\s*-->',
+    re.DOTALL,
+)
+
+
+def _parse_single_facts_ledger(facts_markdown: str) -> dict[str, dict[str, Any]]:
+    """Parse ``<!-- FACTS-LEDGER -->`` rows (JSON block, header-mapped table, or positional fallback table) from one ledger document."""
     entries: dict[str, dict[str, Any]] = {}
-    in_ledger = False
+    if not facts_markdown:
+        return entries
+
+    # 1. Support JSON comment payload generated by full-coverage scripts/facts.py:
+    #    <!-- FACTS-LEDGER {"ledger": [{"key": ..., "label": ..., "value": ..., "period": ..., "source": ...}]} -->
+    for m_comment in re.finditer(r"<!--\s*FACTS-LEDGER\b(.*?)-->", facts_markdown, re.DOTALL):
+        body = m_comment.group(1).strip()
+        if not body.startswith("{"):
+            continue
+        try:
+            data = json.loads(body)
+        except Exception:
+            continue
+        ledger_rows = data.get("ledger") if isinstance(data, dict) else None
+        if not isinstance(ledger_rows, list):
+            continue
+        for item in ledger_rows:
+            if not isinstance(item, dict):
+                continue
+            row_id = str(item.get("id") or item.get("key") or "").strip()
+            if not row_id:
+                continue
+            metric = str(item.get("metric") or item.get("label") or "").strip()
+            period_raw = str(item.get("period") or "").strip()
+            ref = str(item.get("ref") or item.get("source") or "").strip()
+            explicit_unit = str(item.get("unit") or "").strip()
+            raw_val = item.get("value")
+            cur: str | None = None
+            if isinstance(raw_val, (int, float)) and not isinstance(raw_val, bool):
+                val = float(raw_val)
+                unit = explicit_unit or "other"
+                if unit.startswith(("USD", "HKD", "CNY")):
+                    cur = unit.split("_")[0]
+            else:
+                parsed_vu = _parse_facts_value_and_unit(
+                    str(raw_val or ""),
+                    explicit_unit=explicit_unit,
+                    metric_hint=metric,
+                    allow_bare_year_int=True,
+                )
+                if parsed_vu is None:
+                    continue
+                val, unit, cur = parsed_vu
+            entries[row_id] = {
+                "id": row_id,
+                "metric": metric,
+                "period": normalize_period(period_raw) or period_raw,
+                "value": val,
+                "unit": unit,
+                "currency": cur,
+                "ref": ref,
+            }
+
+    # 2. Markdown table immediately following <!-- FACTS-LEDGER ... -->
+    in_ledger_block = False
+    in_table = False
+    header_seen = False
+    col_map: dict[str, int] | None = None
+    header_unit = ""
     for line in facts_markdown.splitlines():
         stripped = line.strip()
         if "<!-- FACTS-LEDGER" in stripped:
-            in_ledger = True
+            in_ledger_block = True
+            in_table = False
+            header_seen = False
+            col_map = None
+            header_unit = ""
             continue
-        if in_ledger and stripped.startswith("<!--") and "END" in stripped.upper():
-            break
-        if not stripped.startswith("|") or not stripped.endswith("|"):
+        if not in_ledger_block:
             continue
+        if stripped.startswith("<!--") and "END" in stripped.upper():
+            in_ledger_block = False
+            in_table = False
+            header_seen = False
+            col_map = None
+            header_unit = ""
+            continue
+        if stripped.startswith("#"):
+            in_ledger_block = False
+            in_table = False
+            header_seen = False
+            col_map = None
+            header_unit = ""
+            continue
+        is_pipe_row = stripped.startswith("|") and stripped.endswith("|")
+        if not is_pipe_row:
+            if in_table:
+                in_ledger_block = False
+                in_table = False
+                header_seen = False
+                col_map = None
+                header_unit = ""
+            continue
+        in_table = True
         cells = [c.strip() for c in stripped.strip("|").split("|")]
-        if len(cells) < 6:
+        if len(cells) < 5:
             continue
-        if cells[0].lower() in ("id", "---") or set(cells[0]) <= {"-", ":"}:
+        if all(set(c) <= {"-", ":", " "} for c in cells if c):
             continue
-        row_id, metric, period, val_str, unit, ref = cells[:6]
-        try:
-            val = float(val_str.replace(",", "").replace("%", "").strip())
-        except ValueError:
+        if not header_seen:
+            header_seen = True
+            hdr_res = _parse_facts_table_header(cells)
+            if hdr_res is not None:
+                col_map, header_unit = hdr_res
+            else:
+                col_map = None
+                header_unit = ""
             continue
+        if col_map is not None:
+            max_idx = max(col_map.values())
+            if len(cells) <= max_idx:
+                continue
+            row_id = cells[col_map["id"]].strip()
+            if not row_id:
+                continue
+            metric = cells[col_map["metric"]].strip()
+            period = cells[col_map["period"]].strip()
+            val_str = cells[col_map["value"]].strip()
+            explicit_unit = (
+                cells[col_map["unit"]].strip() if "unit" in col_map else ""
+            ) or header_unit
+            ref = cells[col_map["ref"]].strip()
+            parsed_vu = _parse_facts_value_and_unit(
+                val_str,
+                explicit_unit=explicit_unit,
+                metric_hint=metric,
+                allow_bare_year_int=True,
+            )
+            if parsed_vu is None:
+                continue
+            val, unit, cur = parsed_vu
+        else:
+            # Positional fallback when headers are unrecognized
+            if len(cells) >= 6:
+                row_id, metric, period, val_str, explicit_unit, ref = cells[:6]
+                if not row_id:
+                    continue
+                parsed_vu = _parse_facts_value_and_unit(
+                    val_str,
+                    explicit_unit=explicit_unit,
+                    metric_hint=metric,
+                    allow_bare_year_int=True,
+                )
+                if parsed_vu is None:
+                    continue
+                val, unit, cur = parsed_vu
+            else:
+                row_id, metric, col2, col3, ref = cells[:5]
+                if not row_id:
+                    continue
+                if _is_period_cell(col3) and not _is_period_cell(col2):
+                    parsed_vu = _parse_facts_value_and_unit(
+                        col2, metric_hint=metric, allow_bare_year_int=True
+                    )
+                    period = col3
+                elif _is_period_cell(col2) and not _is_period_cell(col3):
+                    parsed_vu = _parse_facts_value_and_unit(
+                        col3, metric_hint=metric, allow_bare_year_int=True
+                    )
+                    period = col2
+                else:
+                    parsed_col2 = _parse_facts_value_and_unit(
+                        col2, metric_hint=metric, allow_bare_year_int=False
+                    )
+                    parsed_col3 = _parse_facts_value_and_unit(
+                        col3, metric_hint=metric, allow_bare_year_int=False
+                    )
+                    if parsed_col2 is not None and parsed_col3 is None:
+                        parsed_vu, period = parsed_col2, col3
+                    elif parsed_col3 is not None and parsed_col2 is None:
+                        parsed_vu, period = parsed_col3, col2
+                    elif parsed_col2 is not None:
+                        parsed_vu, period = parsed_col2, col3
+                    else:
+                        parsed_vu, period = None, ""
+                if parsed_vu is None:
+                    continue
+                val, unit, cur = parsed_vu
         entries[row_id] = {
             "id": row_id,
             "metric": metric,
             "period": normalize_period(period) or period,
             "value": val,
             "unit": unit,
+            "currency": cur,
             "ref": ref,
         }
+    return entries
+
+
+def parse_facts_ledger(facts_markdown: str) -> dict[str, dict[str, Any]]:
+    """Parse ``<!-- FACTS-LEDGER -->`` rows from default ledger markdown and optional scoped ``<!-- DALTON-FACTS-FILE path="..." -->`` blocks."""
+    entries: dict[str, dict[str, Any]] = {}
+    if not facts_markdown:
+        return entries
+    for m_block in _DALTON_FACTS_FILE_BLOCK_RE.finditer(facts_markdown):
+        norm_p = posixpath.normpath(m_block.group(1).strip()).lstrip("/")
+        if not norm_p or norm_p == ".":
+            continue
+        scoped_entries = _parse_single_facts_ledger(m_block.group(2))
+        for row_id, row_dict in scoped_entries.items():
+            scoped_key = f"{norm_p}#{row_id}"
+            entries[scoped_key] = {
+                **row_dict,
+                "scoped_only": True,
+                "facts_path": norm_p,
+            }
+    remaining = _DALTON_FACTS_FILE_BLOCK_RE.sub("", facts_markdown)
+    if remaining.strip():
+        default_entries = _parse_single_facts_ledger(remaining)
+        entries.update(default_entries)
     return entries
 
 
@@ -876,7 +1217,14 @@ def _resolve_footnote_target(
     if _is_citation_id(s):
         norm_s = re.sub(r"\s+", "", s)
         target = cits.get(norm_s) or cits.get(s)
-        if target and target != _DUPLICATE_CITATION_TARGET and target.startswith(_KNOWN_SOURCE_PREFIXES):
+        if (
+            target
+            and target != _DUPLICATE_CITATION_TARGET
+            and (
+                target.startswith(_KNOWN_SOURCE_PREFIXES)
+                or bool(re.match(r"^(?:[\w./-]+[./])?facts\.md#", target, re.IGNORECASE))
+            )
+        ):
             return target
         return None
     trad_key = s[1:] if s.startswith("^") else s
@@ -1097,6 +1445,58 @@ def _mask_excluded_spans(line: str) -> str:
     return "".join(chars)
 
 
+def _extract_line_periods(text: str) -> list[tuple[int, str]]:
+    """Extract sorted ``(start_pos, normalized_period)`` tokens from ``text`` after masking code/links/footnotes/forms."""
+    period_scan = text
+    for pat in (_INLINE_CODE_RE, _MARKDOWN_LINK_RE, _ANY_FOOTNOTE_REF_RE, _FILING_FORM_RE):
+        period_scan = pat.sub(lambda m: " " * len(m.group(0)), period_scan)
+    return sorted(
+        [
+            (pm.start(), normalize_period(pm.group(1)))
+            for pm in _PERIOD_TOKEN_RE.finditer(period_scan)
+        ]
+        + [(pos, "LTM") for pos in match_ltm_periods(period_scan)]
+    )
+
+
+def _resolve_period_for_number_span(
+    text: str,
+    line_periods: list[tuple[int, str]],
+    *,
+    num_start: int,
+    num_end: int,
+    sent_start: int,
+    sent_end: int,
+    fallback_period: str = "",
+    fallback_explicit: bool = False,
+) -> tuple[str, bool]:
+    """Resolve ``(period, period_explicit)`` for a number at ``[num_start, num_end)`` within ``text``.
+
+    Prefer the nearest preceding period in the same sentence; only look forward within the same clause
+    (no ``[。；;，,、]`` between number and period). A period from an earlier sentence on the same line
+    is inherited with ``period_explicit=False``.
+    """
+    if line_periods:
+        preceding_same_sent = [
+            p for pos, p in line_periods if sent_start <= pos <= num_start
+        ]
+        if preceding_same_sent:
+            return preceding_same_sent[-1], True
+        following_same_clause = [
+            p
+            for pos, p in line_periods
+            if num_start < pos < sent_end
+            and not re.search(r"[。；;，,、]", text[num_end:pos])
+        ]
+        if following_same_clause:
+            return following_same_clause[0], True
+        if not fallback_explicit:
+            preceding_any = [p for pos, p in line_periods if pos <= num_start]
+            if preceding_any:
+                return preceding_any[-1], False
+    return fallback_period, fallback_explicit
+
+
 def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
     """Extract all figures (including exempt ones marked ``exempt=True``) from Markdown text (PK.9)."""
     (
@@ -1199,6 +1599,7 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                 for hdr_cell in cells:
                     if not _SENTENCE_BOUNDARY_RE.search(hdr_cell) and not has_exempt_marker(hdr_cell):
                         continue
+                    hdr_periods = _extract_line_periods(hdr_cell)
                     masked_hdr = _mask_excluded_spans(hdr_cell)
                     for nm in _NUMBER_RE.finditer(masked_hdr):
                         num_str = nm.group("num").replace(",", "")
@@ -1239,11 +1640,15 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                             citation_table,
                             citation_table_missing=citation_table_missing,
                         )
-                        p_hdr = _PERIOD_TOKEN_RE.search(hdr_sentence)
-                        eff_period = (
-                            normalize_period(p_hdr.group(1))
-                            if p_hdr
-                            else current_section_period
+                        eff_period, hdr_period_explicit = _resolve_period_for_number_span(
+                            hdr_cell,
+                            hdr_periods,
+                            num_start=nm.start(),
+                            num_end=nm.end(),
+                            sent_start=sent_start,
+                            sent_end=sent_end,
+                            fallback_period=current_section_period,
+                            fallback_explicit=False,
                         )
                         eff_metric = (
                             _extract_metric_from_context(
@@ -1287,6 +1692,7 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                                     "col": _ANY_FOOTNOTE_REF_RE.sub("", hdr_cell).strip(" *"),
                                     "sentence": stripped,
                                     "section": current_section_title,
+                                    "period_explicit": hdr_period_explicit,
                                 },
                                 exempt=is_exempt,
                                 exempt_reason="illustrative" if is_exempt else None,
@@ -1352,6 +1758,7 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                     # Determine period and metric from row_header / col_header
                     p_col = _PERIOD_TOKEN_RE.search(col_clause)
                     p_row = _PERIOD_TOKEN_RE.search(row_clause)
+                    cell_period_explicit = bool(p_col or p_row)
                     if p_col:
                         period = normalize_period(p_col.group(1))
                         col_without_period = _PERIOD_TOKEN_RE.sub("", clean_col).strip(" ()（）-")
@@ -1385,6 +1792,7 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                         else ""
                     )
                     header_ctx = f"{row_clause} {col_clause} {table_header_0} {caption_unit_ctx}".strip()
+                    cell_periods = _extract_line_periods(cell_text)
                     masked_cell = _mask_excluded_spans(cell_text)
                     for nm in _NUMBER_RE.finditer(masked_cell):
                         num_str = nm.group("num").replace(",", "")
@@ -1425,10 +1833,19 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                         cell_sentence = cell_text[sent_start:sent_end]
                         is_first_cell_sentence = sent_start == 0
                         eff_period = period
+                        eff_period_explicit = cell_period_explicit
                         eff_metric = metric
-                        p_cell = _PERIOD_TOKEN_RE.search(cell_sentence)
-                        if p_cell and (not eff_period or not is_first_cell_sentence):
-                            eff_period = normalize_period(p_cell.group(1))
+                        if not cell_period_explicit or not is_first_cell_sentence:
+                            eff_period, eff_period_explicit = _resolve_period_for_number_span(
+                                cell_text,
+                                cell_periods,
+                                num_start=nm.start(),
+                                num_end=nm.end(),
+                                sent_start=sent_start,
+                                sent_end=sent_end,
+                                fallback_period=period,
+                                fallback_explicit=cell_period_explicit if is_first_cell_sentence else False,
+                            )
                         if not is_first_cell_sentence or col_idx == 0:
                             sent_metric = _extract_metric_from_context(
                                 cell_sentence,
@@ -1473,6 +1890,7 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                                     "col": col_header,
                                     "sentence": stripped,
                                     "section": current_section_title,
+                                    "period_explicit": eff_period_explicit,
                                 },
                                 exempt=is_exempt,
                                 exempt_reason="illustrative" if is_exempt else None,
@@ -1499,16 +1917,7 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
             )
 
         # Mask filing forms (e.g. "10-Q" in "Q2 10-Q") and inline refs before scanning for period tokens
-        period_scan_line = scan_line
-        for pat in (_INLINE_CODE_RE, _MARKDOWN_LINK_RE, _ANY_FOOTNOTE_REF_RE, _FILING_FORM_RE):
-            period_scan_line = pat.sub(lambda m: " " * len(m.group(0)), period_scan_line)
-        line_periods = sorted(
-            [
-                (pm.start(), normalize_period(pm.group(1)))
-                for pm in _PERIOD_TOKEN_RE.finditer(period_scan_line)
-            ]
-            + [(pos, "LTM") for pos in match_ltm_periods(period_scan_line)]
-        )
+        line_periods = _extract_line_periods(scan_line)
 
         line_num_matches = list(_NUMBER_RE.finditer(masked_line))
         for nm_idx, nm in enumerate(line_num_matches):
@@ -1546,25 +1955,23 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
             if is_neg:
                 val = -val
 
-            # Nearest period in same line: prefer preceding period on the line;
-            # only look forward within the same clause (no 。；; between number and period)
-            period = current_section_period
-            if line_periods:
-                preceding = [p for pos, p in line_periods if pos <= nm.start()]
-                if preceding:
-                    period = preceding[-1]
-                else:
-                    following_same_clause = [
-                        p
-                        for pos, p in line_periods
-                        if pos > nm.start()
-                        and not re.search(r"[。；;]", scan_line[nm.end() : pos])
-                    ]
-                    if following_same_clause:
-                        period = following_same_clause[0]
+            raw_tok_end = nm.start() + len(nm.group("full").rstrip())
+            sent_start, sent_end = _sentence_bounds_for_span(
+                scan_line, nm.start(), raw_tok_end
+            )
+
+            period, period_explicit = _resolve_period_for_number_span(
+                scan_line,
+                line_periods,
+                num_start=nm.start(),
+                num_end=nm.end(),
+                sent_start=sent_start,
+                sent_end=sent_end,
+                fallback_period=current_section_period,
+                fallback_explicit=False,
+            )
 
             # Nearest footnote/citation cluster for this number within the same sentence
-            raw_tok_end = nm.start() + len(nm.group("full").rstrip())
             sent_text = _sentence_for_span(raw_line, nm.start(), raw_tok_end)
             is_exempt = is_blockquote or has_exempt_marker(sent_text)
             exempt_reason = (
@@ -1590,9 +1997,6 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
             )
 
             metric = _extract_metric_from_context(scan_line, nm.start(), nm.end())
-            sent_start, sent_end = _sentence_bounds_for_span(
-                scan_line, nm.start(), raw_tok_end
-            )
             prev_nm_end = (
                 line_num_matches[nm_idx - 1].end() if nm_idx > 0 else 0
             )
@@ -1646,6 +2050,7 @@ def extract_figures(markdown_text: str) -> list[ExtractedFigure]:
                         "col": None,
                         "sentence": stripped,
                         "section": current_section_title,
+                        "period_explicit": period_explicit,
                     },
                     exempt=is_exempt,
                     exempt_reason=exempt_reason,
@@ -1833,33 +2238,39 @@ async def label_figures_with_status(
     thread_id: str | None = None,
     stats_out: dict[str, Any] | None = None,
     deadline: float | None = None,
+    pre_settled_ids: set[str] | None = None,
 ) -> tuple[list[ExtractedFigure], bool]:
     """Step B LLM figure labeling (`audit.label_figures`) across all figures and sections (P0I §1.4, L28, L35, L43)."""
     if not user_id or not str(user_id).strip():
         raise ValueError("user_id is required")
     user_id = str(user_id).strip()
+    settled_ids = set(pre_settled_ids or ())
+    pre_settled_count = sum(1 for f in figures if f.id in settled_ids)
     total_initial = len(figures)
     if assist_json is None:
         for f in figures:
-            f.label_hint = "reported"
-            f.incidental_category = ""
+            if f.id not in settled_ids:
+                f.label_hint = "reported"
+                f.incidental_category = ""
         if stats_out is not None:
+            unsettled_initial = max(0, total_initial - pre_settled_count)
             stats_out.update(
                 {
                     "total": total_initial,
-                    "labeled": 0,
-                    "batches": 1 if total_initial else 0,
-                    "failed_batches": 1 if total_initial else 0,
+                    "labeled": pre_settled_count,
+                    "pre_matched": pre_settled_count,
+                    "batches": 1 if unsettled_initial else 0,
+                    "failed_batches": 1 if unsettled_initial else 0,
                     "failed_batch_details": (
                         [{"batch_index": 1, "start_fig": 1, "end_fig": total_initial, "section": ""}]
-                        if total_initial
+                        if unsettled_initial
                         else []
                     ),
                     "incidental_excluded": 0,
                     "llm_period_overrides": 0,
                 }
             )
-        return figures, False
+        return figures, (total_initial == pre_settled_count)
 
     (
         traditional_footnotes,
@@ -1870,20 +2281,23 @@ async def label_figures_with_status(
     lines = markdown_text.splitlines()
     outline, chunks = _split_markdown_sections_and_chunks(markdown_text, max_chunk_chars=6000)
 
-    # Map each figure to its chunk; batch up to 40 figures per call; send every section to Step B
+    # Map each figure to its chunk; batch up to 40 figures per call.
+    # Figures already settled by deterministic footnote matching before Step B
+    # (pre_settled_ids) are excluded from LLM labeling batches.
     batches: list[tuple[str, int, str, list[ExtractedFigure], int, int]] = []
     assigned_ids: set[str] = set()
     fig_ordinal_map = {f.id: idx for idx, f in enumerate(figures, start=1)}
 
     for sec_title, c_start, c_end, chunk_text in chunks:
-        chunk_figs = [
+        chunk_figs_all = [
             f
             for f in figures
             if f.id not in assigned_ids
             and c_start <= int(f.location.get("line") or 1) <= c_end
         ]
-        for f in chunk_figs:
+        for f in chunk_figs_all:
             assigned_ids.add(f.id)
+        chunk_figs = [f for f in chunk_figs_all if f.id not in settled_ids]
 
         if chunk_figs:
             for offset in range(0, len(chunk_figs), 40):
@@ -1903,7 +2317,9 @@ async def label_figures_with_status(
             if non_def_lines:
                 batches.append((sec_title, c_start, chunk_text, [], 0, 0))
 
-    leftover = [f for f in figures if f.id not in assigned_ids]
+    leftover = [
+        f for f in figures if f.id not in assigned_ids and f.id not in settled_ids
+    ]
     if leftover:
         for offset in range(0, len(leftover), 40):
             sub = leftover[offset : offset + 40]
@@ -1930,7 +2346,7 @@ async def label_figures_with_status(
                     break
                 search_pos = found_pos + max(1, len(f.raw))
 
-    labeled_count = 0
+    labeled_count = pre_settled_count
     failed_batches = 0
     failed_batch_details: list[dict[str, Any]] = []
     llm_period_overrides = 0
@@ -2106,6 +2522,7 @@ async def label_figures_with_status(
                             target.unit = _PerShareUnit("per_share", currency=target.currency)
                         else:
                             target.unit = u_clean
+                target.location["step_b_completed"] = True
 
             for extra in parsed.extra_figures:
                 raw_sub = (extra.raw or "").strip()
@@ -2212,6 +2629,7 @@ async def label_figures_with_status(
                         "col": None,
                         "sentence": matched_line_text.strip(),
                         "section": sec_title,
+                        "step_b_completed": True,
                     },
                     exempt=is_exempt,
                     exempt_reason="illustrative" if is_exempt else None,
@@ -2227,6 +2645,7 @@ async def label_figures_with_status(
                 {
                     "total": len(figures),
                     "labeled": labeled_count,
+                    "pre_matched": pre_settled_count,
                     "batches": len(batches),
                     "failed_batches": failed_batches,
                     "failed_batch_details": failed_batch_details,
