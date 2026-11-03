@@ -5,6 +5,8 @@
 handlers share the writer spawn pipeline in ``_spawn_writer``.
 """
 
+# DALTON-HOOK(subagent-resume): asyncio.wait bounds an orphaned writer's stop.
+import asyncio
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -25,6 +27,7 @@ from ptc_agent.agent.middleware.background_subagent.registry import (
     TaskWriterLive,
 )
 from ptc_agent.agent.middleware.background_subagent.task import (
+    TerminalStatus,
     WORKFLOW_SUBAGENT_TYPE,
     bare_task_id,
 )
@@ -62,6 +65,109 @@ def _truncate_description(description: str, max_sentences: int = 2) -> str:
         if not remaining:
             break
     return " ".join(sentences)
+
+
+# DALTON-HOOK(subagent-resume): how long a resume waits out an orphaned
+# writer's unwind before refusing (a retry resumes once it ends).
+_ORPHAN_WRITER_STOP_TIMEOUT_S = 30.0
+
+
+# DALTON-HOOK(subagent-resume): truth for "is this task running" is the run
+# ledger, not the local asyncio handle (src/server/AGENTS.md § Multi-worker).
+# A writer whose guard connection died keeps running in this process after
+# the recovery scanner finalized its run (worker_lost) and took the fence —
+# answering "still running" off the local handle left TaskOutput calling the
+# same task failed and the parked steers re-waking the thread for a resume
+# that could only fail again.
+async def _read_latest_run(
+    mw: "BackgroundSubagentMiddleware", task: BackgroundTask
+) -> dict | None:
+    """The task's latest ledger run, or None when there is no ledger, no
+    read to call (the duck-typed contract names only start/finalize), or no
+    row. Raises when the read itself fails — callers that must not mistake a
+    failed read for an absent row decide their own refusal."""
+    ledger = getattr(mw.registry, "run_ledger", None)
+    if ledger is None:
+        return None
+    get_latest = getattr(ledger, "get_latest_run", None)
+    if get_latest is None:
+        return None
+    return await get_latest(task.task_id)
+
+
+async def _latest_ledger_run(
+    mw: "BackgroundSubagentMiddleware", task: BackgroundTask
+) -> dict | None:
+    """``_read_latest_run`` failing open: None, read as running, for the
+    early liveness question — only a terminal row proves a live local handle
+    is an orphan whose run is over, and one that cannot be proven must never
+    be stopped."""
+    try:
+        return await _read_latest_run(mw, task)
+    except Exception:
+        logger.warning(
+            "resume ledger read failed; treating the task as running",
+            task_id=task.task_id,
+            exc_info=True,
+        )
+        return None
+
+
+async def _stop_orphaned_writer(
+    task: BackgroundTask, tool_call_id: str, *, status: TerminalStatus = "error"
+) -> ToolMessage | None:
+    """Stop a writer whose run the ledger already ended, and wait out its
+    unwind so its terminal meta cannot land under the resumed round's
+    "running". None when it ended; a refusal when the cap ran out, which a
+    retry clears. The orphan's settle cannot overwrite the ledger's terminal
+    row: finalize is a CAS off in_progress, so it loses and mirrors the
+    survivor instead."""
+    # A finished handler means the subagent body is done and the wrapper is
+    # in its terminal settle — the ledger CAS, the meta, the closing frames,
+    # the fence release. A cancel landing there would strand the fence, so
+    # a settling writer is only waited out, never cancelled. An orphan this
+    # stop already cancelled (sealed) is only waited out on a retry too: a
+    # second cancel would cut the wrapper's own await on the unwinding
+    # handler and skip its usage merge and settle.
+    if (
+        task.handler_task is None or not task.handler_task.done()
+    ) and not task.stream_sealed:
+        # A stamp other than force_cancel's "cancelled": the local view
+        # mirrors the ledger's terminal row, and a cancelled stamp would arm
+        # the "cancelled and cannot be resumed" refusal against the very
+        # retry a timed-out stop tells the model to make.
+        task.force_cancel("its run already ended", status=status)
+        # DALTON-HOOK(subagent-resume): the "error" stamp is not a cancel, so
+        # ``_emit``'s kill seal (which keys off ``cancelled`` only — a
+        # completed task's trailing frames must still land) does not cover
+        # this stop. Seal the stream for new frames too: the unwinding
+        # writer still emits (a forwarder's finalize appends
+        # reasoning_signal), and its run's run_end is already on the stream.
+        # The seal is cleared when the resumed round resets the task.
+        task.stream_sealed = True
+        if task.delta_coalescer is not None:
+            task.delta_coalescer.discard()
+    writers = task.live_writers
+    if writers:
+        _done, pending = await asyncio.wait(
+            writers, timeout=_ORPHAN_WRITER_STOP_TIMEOUT_S
+        )
+        if pending:
+            logger.warning(
+                "orphaned writer did not stop in time; refusing resume",
+                task_id=task.task_id,
+                pending=len(pending),
+            )
+            return ToolMessage(
+                content=(
+                    f"Error: {task.display_id} could not be resumed yet — its "
+                    f"previous writer is still stopping. Try again."
+                ),
+                tool_call_id=tool_call_id,
+                name="Task",
+                status="error",
+            )
+    return None
 
 
 async def handle_task_action(
@@ -493,20 +599,13 @@ async def _handle_resume(
             status="error",
         )
 
-    locally_live = (
-        task.asyncio_task is not None and not task.asyncio_task.done()
-    )
-    if locally_live:
-        return ToolMessage(
-            content=f"Error: Task-{target_task_id} is still running. Use action='update' to send instructions to a running task.",
-            tool_call_id=tool_call_id,
-            name="Task",
-            status="error",
-        )
-    # Claim the resume before the first await: two parallel resume
-    # calls in one model step would otherwise both observe not-live
-    # and double-spawn writers for one namespace (the session fence
-    # is idempotent for this run and admits both).
+    # Claim the resume before the first await: two parallel resume calls in
+    # one model step would otherwise both observe not-live and double-spawn
+    # writers for one namespace (the session fence is idempotent for this run
+    # and admits both).
+    # DALTON-HOOK(subagent-resume): the claim spans the ledger read and the
+    # orphan stop too — a sibling returning a stale terminal row after this
+    # call started its writer must be refused before it can cancel it.
     if task.task_id in mw._resume_claims:
         return ToolMessage(
             content=f"Error: Task-{target_task_id} is already being resumed. Use action='update' to send instructions to it.",
@@ -516,6 +615,54 @@ async def _handle_resume(
         )
     mw._resume_claims.add(task.task_id)
     try:
+        locally_live = (
+            task.asyncio_task is not None and not task.asyncio_task.done()
+        )
+        if locally_live:
+            # DALTON-HOOK(subagent-resume): the ledger arbitrates before the
+            # local handle refuses. An in-progress latest run (or no ledger
+            # to ask) keeps the old answer; a terminal one means the local
+            # writer lost its fence (worker_lost) and is stopped here, after
+            # which the namespace lock below arbitrates the resume as for any
+            # other task.
+            run = await _latest_ledger_run(mw, task)
+            if run is None or str(run["status"]) == "in_progress":
+                return ToolMessage(
+                    content=f"Error: Task-{target_task_id} is still running. Use action='update' to send instructions to a running task.",
+                    tool_call_id=tool_call_id,
+                    name="Task",
+                    status="error",
+                )
+            # Only the run the ledger named may be stopped: a task rebound to
+            # another round since the read is not that run's orphan to kill.
+            if task.task_run_id != str(run["task_run_id"]):
+                return ToolMessage(
+                    content=f"Error: Task-{target_task_id} is still running. Use action='update' to send instructions to a running task.",
+                    tool_call_id=tool_call_id,
+                    name="Task",
+                    status="error",
+                )
+            # DALTON-HOOK(subagent-resume): a run the ledger ended as
+            # cancelled is refused as before (recovery stamped a cancel
+            # intent this worker never saw land); a credit stop is the one
+            # cancel meant to be re-entered.
+            if str(run["status"]) == "cancelled" and not is_credit_stop(
+                run.get("failure")
+            ):
+                refusal = await _stop_orphaned_writer(
+                    task, tool_call_id, status="cancelled"
+                )
+                if refusal is not None:
+                    return refusal
+                return ToolMessage(
+                    content=f"Error: Task-{target_task_id} was cancelled and cannot be resumed.",
+                    tool_call_id=tool_call_id,
+                    name="Task",
+                    status="error",
+                )
+            refusal = await _stop_orphaned_writer(task, tool_call_id)
+            if refusal is not None:
+                return refusal
         if mw.namespace_owner is not None:
             # Not live in THIS process: the namespace lock is the
             # cluster-wide arbiter. Contended = a writer on another
@@ -538,6 +685,46 @@ async def _handle_resume(
             # task here means a registered-but-unstarted local writer.
             return ToolMessage(
                 content=f"Error: Task-{target_task_id} is still running. Use action='update' to send instructions to a running task.",
+                tool_call_id=tool_call_id,
+                name="Task",
+                status="error",
+            )
+
+        # DALTON-HOOK(subagent-resume): the one resume-eligibility check
+        # every route passes — an orphan stopped, a settling writer waited
+        # out, a plain completed task — read again under the fence, right
+        # before admission: a run the ledger ended as cancelled (a stop
+        # intent this worker may never have seen land) must not resume
+        # whichever way it got here, and the local cancelled stamp makes the
+        # top-of-flow refusal catch retries too. A credit stop is the one
+        # cancel meant to be re-entered. A FAILED read is not a pass:
+        # admitting on an unreadable ledger could resume a cancelled run, so
+        # the fence goes back and the model retries.
+        try:
+            run = await _read_latest_run(mw, task)
+        except Exception:
+            logger.warning(
+                "resume ledger recheck failed; refusing",
+                task_id=task.task_id,
+                exc_info=True,
+            )
+            await mw._release_task_ns(task.task_id)
+            return ToolMessage(
+                content=f"Error: could not resume {task.display_id} — its run ledger could not be read. Try again.",
+                tool_call_id=tool_call_id,
+                name="Task",
+                status="error",
+            )
+        if (
+            run is not None
+            and str(run["status"]) == "cancelled"
+            and not is_credit_stop(run.get("failure"))
+        ):
+            await mw._release_task_ns(task.task_id)
+            if not task.cancelled:
+                task.mark_cancelled("its run already ended")
+            return ToolMessage(
+                content=f"Error: Task-{target_task_id} was cancelled and cannot be resumed.",
                 tool_call_id=tool_call_id,
                 name="Task",
                 status="error",

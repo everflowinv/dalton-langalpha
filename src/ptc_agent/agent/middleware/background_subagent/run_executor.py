@@ -451,6 +451,10 @@ async def _settle_terminal_run(
     successor (who can only acquire after the release) always writes
     "running" after this writer's terminal state — never under it.
     """
+    # DALTON-HOOK(subagent-resume): this settle's round identity, read once
+    # before the first await, so the finalize and run_end below always close
+    # this round's own row and stream.
+    task_run_id = task.task_run_id
     # DALTON-HOOK(subagent-caps): ensure slot/queue entry is released on every
     # terminal settle path (including cancelled-before-spawn).
     await release_subagent_slot(task)
@@ -476,10 +480,12 @@ async def _settle_terminal_run(
     # this writer still owns the stream, and recovery will append
     # run_end after whatever it writes.
     cas_applied = True
-    if run_ledger is not None and task.task_run_id:
+    # DALTON-HOOK(subagent-resume): the finalize and the run_end below key
+    # on the snapshot, not the (resettable) task field.
+    if run_ledger is not None and task_run_id:
         try:
             finalized = await run_ledger.finalize_task_run(
-                task.task_run_id,
+                task_run_id,
                 "cancelled" if task.cancelled else ledger_status,
                 task_id=task.task_id,
                 # A user cancel is not a failure — don't let the
@@ -500,10 +506,16 @@ async def _settle_terminal_run(
             logger.warning(
                 "task-run ledger finalize failed",
                 task_id=task.task_id,
-                task_run_id=task.task_run_id,
+                task_run_id=task_run_id,
                 exc_info=True,
             )
-    if registry is not None:
+    # DALTON-HOOK(subagent-resume): a lost CAS means another executor already
+    # ended this run (recovery on a fence-less orphan, a sibling worker) and a
+    # successor may have written "running" since — a late terminal meta here
+    # would land under it. Recovery stamped this run's retention before its
+    # finalize (it defers the finalize when that stamp fails), so skipping
+    # leaks nothing.
+    if registry is not None and not (run_finalized and not cas_applied):
         try:
             await registry.write_task_meta(task, terminal_status)
         except Exception:
@@ -528,7 +540,7 @@ async def _settle_terminal_run(
     if run_finalized and cas_applied and not task.redis_write_failed:
         try:
             await run_ledger.append_run_end(
-                task.task_run_id,
+                task_run_id,
                 task_id=task.task_id,
                 outcome=terminal_status,
                 finalized_at=run_row.get("finalized_at"),
@@ -537,7 +549,7 @@ async def _settle_terminal_run(
             logger.warning(
                 "subagent_run_end_append_failed",
                 task_id=task.task_id,
-                task_run_id=task.task_run_id,
+                task_run_id=task_run_id,
                 exc_info=True,
             )
     # Seal the per-task stream LAST. Content spills XADD with
@@ -549,14 +561,20 @@ async def _settle_terminal_run(
         # Identity-exact stream ops: this settle may outlive the task's
         # registry entry (cancel teardown eviction, tool_call_id reuse) —
         # id-resolving variants would no-op or hit the replacement task.
-        try:
-            await registry.append_sentinel_for_task(task)
-        except Exception:
-            logger.warning(
-                "subagent_sentinel_write_failed",
-                task_id=task.task_id,
-                exc_info=True,
-            )
+        # DALTON-HOOK(subagent-resume): the sentinel is skipped on a lost CAS
+        # for the same reason the terminal meta above is: an auto-id sentinel
+        # on the task_id-scoped stream would disorder a successor round's
+        # explicit seq ids. The retention stamp still runs — idempotent, and
+        # the one clock that must never be missed.
+        if not (run_finalized and not cas_applied):
+            try:
+                await registry.append_sentinel_for_task(task)
+            except Exception:
+                logger.warning(
+                    "subagent_sentinel_write_failed",
+                    task_id=task.task_id,
+                    exc_info=True,
+                )
         # Attach-grace TTL starts at terminal (active streams carry
         # none) — stamped even when redis_write_failed skipped the
         # sentinel, so a torn stream expires instead of leaking.

@@ -389,6 +389,10 @@ TASK_PIPELINE = ReportPipeline(
     terminal_cap=45 * 60.0,
     verdict=lambda job: task_report_verdict(job),
     subject=lambda job: _task_subject(job.get("payload") or {}),
+    # DALTON-HOOK(subagent-resume): a turn that ran while this one waited may
+    # have delivered the result (TaskOutput stamps result_delivered_at), and
+    # a seen result never opens a turn.
+    recheck=True,
     owner=_with_owner,
 )
 
