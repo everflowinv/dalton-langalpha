@@ -2,36 +2,72 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema", "$id": "https://dalton.local/schemas/thesis",
   "type": "object", "additionalProperties": false,
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {"enum": [1, 2]},
     "as_of": {"$ref": "common#/$defs/isoTime"},
     "one_liner": {"type": "string", "maxLength": 200},
     "aggregate_status": {"$ref": "common#/$defs/pillarStatus"},
     "aggregate_override": {"type": "string", "description": "一条核心支柱 impaired 而总体好于 watch 时，必须写一句带证据的理由（规则见 dalton-earnings-deep 的 calibration.md 第二节第 3 条）"},
     "house_view": {"$ref": "#/$defs/houseView"},
     "house_view_history": {"type": "array", "items": {"$ref": "#/$defs/houseViewChange"}, "description": "只追加"},
-    "market_view": {"type": "object", "additionalProperties": false,
-      "description": "市场基准与一致预期，和 house case 分开（§3.1-2）；一致预期不能自动覆盖研究判断",
-      "properties": {"summary": {"type": "string"}, "as_of": {"$ref": "common#/$defs/isoTime"},
-                     "updated_at": {"$ref": "common#/$defs/isoTime"},
-                     "figures": {"type": "array", "items": {"$ref": "common#/$defs/figure"}},
-                     "evidence_refs": {"type": "array", "items": {"$ref": "common#/$defs/evidenceRef"}}}},
+    "market_view": {"$ref": "#/$defs/marketView"},
+    "underwriting": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/underwriting"}], "description": "三情景估值与赔率测算（`house_view.stance` 不为 `no_view` 时必填）"},
     "pillars": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/pillar"}},
     "evidence": {"type": "array", "items": {"$ref": "#/$defs/evidence"}, "description": "证据台账，只追加；更正用 supersedes 新增一条"},
     "official": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/official"}], "description": "只能由 publish_report 写"}
   },
   "required": ["schema_version","as_of","one_liner","aggregate_status","house_view","house_view_history","pillars","evidence","official"],
   "$defs": {
+    "marketObservation": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "claim": {"type": "string", "minLength": 1},
+        "who": {"type": "string", "minLength": 1},
+        "as_of": {"type": "string", "minLength": 1},
+        "sources": {"$ref": "common#/$defs/sourceRefList"},
+        "confidence": {"enum": ["high", "medium", "low"]}
+      },
+      "required": ["claim", "who", "as_of", "sources", "confidence"]
+    },
+    "marketView": {
+      "type": "object", "additionalProperties": false,
+      "description": "市场基准与一致预期，与 `house_view` 分开记录；一致预期不能自动覆盖我方研究判断。当 `house_view.stance` 为 `long`、`short` 或 `neutral` 时必填，且必须包含非空的 `summary`（不超过 200 字）与非空的 `observations`（每个条目的 `sources` 至少有一条引用）；当 `positioning` 为 `crowded_long`、`balanced` 或 `crowded_short` 时，`positioning_sources` 必须非空，无来源时 `positioning` 填 `unknown`",
+      "properties": {
+        "summary": {"type": "string"},
+        "as_of": {"$ref": "common#/$defs/isoTime"},
+        "updated_at": {"$ref": "common#/$defs/isoTime"},
+        "figures": {"type": "array", "items": {"$ref": "common#/$defs/figure"}},
+        "evidence_refs": {"type": "array", "items": {"$ref": "common#/$defs/evidenceRef"}},
+        "observations": {"type": "array", "maxItems": 3, "items": {"$ref": "#/$defs/marketObservation"}},
+        "positioning": {"enum": ["crowded_long", "balanced", "crowded_short", "unknown"]},
+        "positioning_sources": {"$ref": "common#/$defs/sourceRefList"}
+      }
+    },
+    "flipConditions": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "upgrade_if": {"type": ["string", "null"]},
+        "downgrade_if": {"type": ["string", "null"]}
+      }
+    },
     "houseView": {"type": "object", "additionalProperties": false,
       "properties": {
         "stance": {"enum": ["long","short","neutral","no_view"]},
-        "conviction": {"enum": ["high","medium","low","none"], "description": "判断的稳健程度：high=合理的盈利、倍数、时间扰动下判断仍成立；medium=方向成立但依赖一个可识别、可监控的关键条件；low=依赖窄假设或核心证据尚不能区分竞争解释。none 只用于 stance=no_view（机制或估值范围无法识别），不得用来表达“预期差不够”——预期差不足时 stance 用 neutral 并承担举证责任"},
-        "horizon_months": {"type": "integer", "minimum": 1, "maximum": 60},
+        "conviction": {"enum": ["high","medium","low","none"], "description": "判断的稳健程度：`high`=合理的盈利、倍数、时间扰动下判断仍成立；`medium`=方向成立但依赖一个可识别、可监控的关键条件；`low`=依赖窄假设或核心证据尚不能区分竞争解释。`none` 只用于 `stance` 为 `no_view`（`stance` 为 `long`、`short` 或 `neutral` 时不得填 `none`），不得用来表达“预期差不够”——预期差不足时 `stance` 填 `neutral`。填 `high` 须满足：（1）无 `priority` 为 `core` 的支柱处于 `impaired` 或 `broken`。`stance` 为 `long` 或 `short` 时还须满足：（2）若估值倍数变动对该方向回报的贡献超过 50%，须设 `underwriting.rerating_observed` 为 `true` 并提供非空 `rerating_sources`；（3）该方向的 `breakeven_verdict.verdict` 为 `clearly_above`；（4）二选一：要么填写 `underwriting.weight_bounds`（`sources` 非空，`rationale` 不是风险中性假设），并且区间允许的所有权重组合下（含最不利的组合）都过门槛；要么在 Base 权重 25% 和 50% 两种假设下，三种情景都按目标价不利一端计算时，不需要有利情景也能达标，且不利变动不超过上限。`stance` 为 `neutral` 时，两个方向的 `breakeven_verdict.verdict` 都不能是 `clearly_above`，除非 `house_view.binding_constraint` 为 `implementation` 或 `timing` 并写明 `binding_constraint_text`"},
+        "horizon_months": {"type": ["integer", "null"], "minimum": 1, "maximum": 60, "description": "投资期限（月，1–60 的整数）。`stance` 为 `long`、`short` 或 `neutral` 时必填，且须与 `underwriting.hurdles.horizon_months` 一致；修改此值时须递增 `underwriting.scenario_version`"},
+        "actionability": {"enum": ["act_now", "wait_price", "wait_evidence", "pass"], "description": "当前行动建议：`stance` 为 `long`、`short` 或 `neutral` 时必填，`stance` 为 `no_view` 时必须为 `pass`。`act_now` 仅用于 `long` 或 `short`（要求当前方向 `breakeven_verdict.verdict` 为 `clearly_above`、已填 `underwriting.stress`、不利端点变动不超限、无 `broken` 支柱、多头 `needs_financing` 不为 `unknown`、空头 `borrow_cost_annual` 不为 `null`）；`wait_price` 必填 `entry_band`；`wait_evidence` 必填 `trigger_refs`"},
+        "entry_band": {"oneOf": [{"type": "null"}, {"$ref": "common#/$defs/range"}], "description": "目标建仓价格区间 `{lo, hi, unit}`。当 `actionability` 为 `wait_price` 时必填：做多须满足 `bear.price.lo <= lo <= hi < anchor.price`，做空须满足 `anchor.price < lo <= hi <= bull.price.hi`，中性须在 `[bear.price.lo, bull.price.hi]` 内，且区间中点与 `anchor.price` 偏离不超过 25%"},
+        "binding_constraint": {"enum": ["none", "price", "evidence", "timing", "downside_path", "implementation"], "description": "当前首要制约因素。`stance` 为 `long`、`short` 或 `neutral` 时必填；仅当 `stance` 为 `long` 或 `short` 且 `actionability` 为 `act_now` 时可填 `none`，其余情况不得填 `none` 且必须填写 `binding_constraint_text`"},
+        "binding_constraint_text": {"type": ["string", "null"], "description": "制约因素的具体原因与量化条件。当 `binding_constraint` 不为 `none` 时必填"},
+        "flip_conditions": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/flipConditions"}], "description": "改判条件。当 `stance` 为 `long`、`short` 或 `neutral` 时必填，且 `upgrade_if`（上调条件）与 `downgrade_if`（下调条件）均须为非空字符串"},
+        "trigger_refs": {"type": "array", "items": {"type": "string"}, "description": "待触发复核的条目 ID 列表。当 `actionability` 为 `wait_evidence` 时必填，每项须指向 `agenda` 中真实存在且带日期的条目（`V-xxx`、`W*`、`Q-xxx` 或 `kind` 为 `date` 的 `C*`）或通过 `next_proof_point.validation_id` 关联到上述条目的支柱 `P*`"},
+        "missing": {"type": "array", "items": {"type": "string"}, "description": "暂不立论时缺失的关键信息列表。当 `stance` 为 `no_view` 时必填且至少含一条非空说明"},
+        "review_by": {"type": ["string", "null"], "description": "最晚复核日期（`YYYY-MM-DD`）。当 `stance` 为 `no_view` 时必填，须在文档 `as_of` 起 30 天内，且 `agenda.next_validations` 中须至少有一条 `due` 在 30 天内的验证项"},
         "summary": {"type": "string"},
         "variant_perception": {"type": "string", "description": "我们和市场哪里不同、为什么市场错、什么会让市场改变看法"},
         "target": {"type": "object", "additionalProperties": false,
           "properties": {"value": {"type": "number"}, "currency": {"type": "string"}, "method": {"type": "string"},
                          "model_ref": {"$ref": "common#/$defs/evidenceRef"}},
-          "required": ["value","currency","method","model_ref"], "description": "目标价必须指向模型单元格"},
+          "required": ["value","currency","method"], "description": "`schema_version` 为 `1` 时的单点目标价（未填写 `underwriting` 时必须提供指向 `models` 已登记模型单元格的 `model_ref`）；`schema_version` 为 `2` 时改用 `underwriting` 三情景估值，不再填写此字段"},
         "position_suggestion": {"enum": ["none","starter","core","max","reduce","exit"]},
         "updated_at": {"$ref": "common#/$defs/isoTime"}
       },
@@ -41,6 +77,169 @@
                      "reason": {"type": "string"},
                      "evidence_ids": {"type": "array", "items": {"type": "string"}}, "verdict_id": {"type": "string"}},
       "required": ["at","to","reason"]},
+    "stateCalc": {
+      "type": "object", "additionalProperties": false,
+      "description": "单档情景估值计算：`method` 为 `eps_pe` 时必填正数区间 `eps` 与 `multiple`（`lo > 0`）、口径 `basis`、期间 `period` 及存在于 `evidence` 的 `sources`；`method` 为 `reference` 时必填 `price_range` 及指向 `models` 已登记模型单元格（`model/<file>.xlsx#Sheet!Cell`）或 `evidence` 中计算证据（`source.type` 为 `model` 或含完整算式的 `internal_note`）的 `ref`。`bear`/`base`/`bull` 单档价格区间相对宽度 `(hi - lo) / mid` 不得超过 25%",
+      "properties": {
+        "method": {"enum": ["eps_pe", "reference"]},
+        "eps": {"$ref": "common#/$defs/range"},
+        "multiple": {"$ref": "common#/$defs/range"},
+        "basis": {"type": "string", "minLength": 1},
+        "period": {"type": "string", "minLength": 1},
+        "fiscal_year_end": {"type": "string", "pattern": "^\\d{2}-\\d{2}$"},
+        "sources": {"$ref": "common#/$defs/sourceRefList"},
+        "ref": {
+          "anyOf": [
+            {"$ref": "common#/$defs/sourceRef"},
+            {"$ref": "common#/$defs/evidenceRef"}
+          ]
+        },
+        "price_range": {"$ref": "common#/$defs/range"},
+        "note": {"type": "string"}
+      },
+      "required": ["method"],
+      "allOf": [
+        {
+          "if": {"properties": {"method": {"const": "eps_pe"}}},
+          "then": {"required": ["eps", "multiple", "basis", "period", "sources"]}
+        },
+        {
+          "if": {"properties": {"method": {"const": "reference"}}},
+          "then": {"required": ["ref", "price_range"]}
+        }
+      ]
+    },
+    "underwritingState": {
+      "type": "object", "additionalProperties": false,
+      "description": "三情景中的单档情景：`states` 必须包含 `bear`、`base`、`bull` 各一档，价格 `lo`、`hi`、`mid` 随 `bear` → `base` → `bull` 递增（`mid` 严格递增）；必须填写非空的 `condition`（或 `summary`），并至少关联一项：`debate_ids`（`D*`，须在 `debate` 文档中存在）或 `driver_ids`（`K*`，须在 `drivers` 文档中存在）",
+      "properties": {
+        "name": {"enum": ["bear", "base", "bull"]},
+        "condition": {"type": "string", "minLength": 1},
+        "summary": {"type": "string", "maxLength": 200},
+        "debate_ids": {"type": "array", "items": {"type": "string"}},
+        "driver_ids": {"type": "array", "items": {"type": "string"}},
+        "calc": {"$ref": "#/$defs/stateCalc"},
+        "cash_return_per_share": {"type": "number"}
+      },
+      "required": ["name", "calc"]
+    },
+    "underwritingStress": {
+      "type": "object", "additionalProperties": false,
+      "description": "极端压力情景。当 `house_view.actionability` 为 `act_now` 时必填",
+      "properties": {
+        "calc": {"$ref": "#/$defs/stateCalc"},
+        "condition": {"type": "string", "minLength": 1},
+        "needs_financing": {"enum": ["yes", "no", "unknown", true, false]}
+      },
+      "required": ["calc", "condition", "needs_financing"]
+    },
+    "underwritingProtection": {
+      "type": "object", "additionalProperties": false,
+      "description": "下行保护：必须完整提供生存底线说明（`survival` 或 `survival.text`）、极端情况下是否依赖外部融资 `needs_financing`（`yes` / `no` / `unknown`；为 `unknown` 时不得声称无需融资或生存保护充分，且多头不得标 `act_now`）、底部估值说明（`value` 或 `value.text`/`value.mechanism`）、底部价格区间 `value_range`（`{lo, hi}`）、兑现路径 `path` 及失效条件 `failure`",
+      "properties": {
+        "survival": {
+          "oneOf": [
+            {"type": "string", "minLength": 1},
+            {
+              "type": "object", "additionalProperties": false,
+              "properties": {
+                "text": {"type": "string", "minLength": 1},
+                "needs_financing": {"enum": ["yes", "no", "unknown", true, false]}
+              },
+              "required": ["text", "needs_financing"]
+            }
+          ]
+        },
+        "needs_financing": {"enum": ["yes", "no", "unknown", true, false]},
+        "value": {
+          "oneOf": [
+            {"type": "string", "minLength": 1},
+            {
+              "type": "object", "additionalProperties": false,
+              "properties": {
+                "text": {"type": "string", "minLength": 1},
+                "mechanism": {"type": "string", "minLength": 1},
+                "value_range": {"$ref": "common#/$defs/range"}
+              },
+              "required": ["value_range"],
+              "anyOf": [
+                {"required": ["text"]},
+                {"required": ["mechanism"]}
+              ]
+            }
+          ]
+        },
+        "value_range": {"$ref": "common#/$defs/range"},
+        "path": {"type": "string", "minLength": 1},
+        "failure": {"type": "string", "minLength": 1}
+      },
+      "required": ["survival", "value", "path", "failure"]
+    },
+    "underwritingWeightBounds": {
+      "type": "object", "additionalProperties": false,
+      "description": "我方判断的三情景权重区间（可选）：`bear`、`base`、`bull` 的 `lo`、`hi` 须在 `[0, 1]` 内，且三个区间里能取出一组合计为 1 的权重",
+      "properties": {
+        "bear": {"$ref": "common#/$defs/range"},
+        "base": {"$ref": "common#/$defs/range"},
+        "bull": {"$ref": "common#/$defs/range"},
+        "rationale": {"type": "string", "minLength": 1},
+        "sources": {"$ref": "common#/$defs/sourceRefList"}
+      },
+      "required": ["bear", "base", "bull", "rationale", "sources"]
+    },
+    "breakevenVerdictItem": {
+      "type": "object", "additionalProperties": false,
+      "description": "赔率达标判定：`stance` 为 `long` 或 `short` 时必须包含对应 `side` 的条目（`verdict` 须为 `clearly_above` 或 `around`，`act_now` 时须为 `clearly_above`）；`stance` 为 `neutral` 时必须同时包含 `long` 与 `short` 两条（除非 `binding_constraint` 为 `implementation` 或 `timing`，否则两条 `verdict` 均不得为 `clearly_above`）。`b_row` 只能填 `0.25` 或 `0.5`；`debate_ids` 必须引用 `debate` 文档中已存在的 `D*`",
+      "properties": {
+        "side": {"enum": ["long", "short"]},
+        "verdict": {"enum": ["clearly_above", "around", "below", "cannot_judge"]},
+        "b_row": {"enum": [0.25, 0.5]},
+        "basis": {"type": "string", "minLength": 1},
+        "debate_ids": {"type": "array", "minItems": 1, "items": {"type": "string", "pattern": "^D\\d+$"}}
+      },
+      "required": ["side", "verdict", "b_row", "basis", "debate_ids"]
+    },
+    "underwritingHurdles": {
+      "type": "object", "additionalProperties": false,
+      "description": "门槛回报率与风险容忍参数快照（其中 `horizon_months` 若提供须与 `house_view.horizon_months` 一致）",
+      "properties": {
+        "long_hurdle_annual": {"type": "number"},
+        "short_hurdle_annual": {"type": "number"},
+        "min_total_return": {"type": "number"},
+        "max_adverse_move_act_now": {"type": "number"},
+        "max_bear_loss_act_now": {"type": "number"},
+        "horizon_months": {"type": "integer", "minimum": 1, "maximum": 60}
+      }
+    },
+    "underwriting": {
+      "type": "object", "additionalProperties": false,
+      "description": "三情景估值与赔率测算（`house_view.stance` 不为 `no_view` 时必填）。修改 `states`、`anchor`、`weight_bounds` 或 `house_view.horizon_months` 时，`scenario_version` 必须递增；做空（`stance` 为 `short`）且 `borrow_cost_annual` 为 `null` 时，`house_view.actionability` 只能为 `wait_evidence` 或 `pass`",
+      "properties": {
+        "anchor": {
+          "type": "object", "additionalProperties": false,
+          "properties": {
+            "price": {"type": "number", "exclusiveMinimum": 0},
+            "price_at": {"type": "string", "minLength": 1},
+            "currency": {"type": "string", "minLength": 1},
+            "source": {"type": "string", "minLength": 1}
+          },
+          "required": ["price", "price_at", "currency", "source"]
+        },
+        "scenario_version": {"type": "integer", "minimum": 1},
+        "fiscal_year_end": {"type": "string", "pattern": "^\\d{2}-\\d{2}$"},
+        "states": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"$ref": "#/$defs/underwritingState"}},
+        "stress": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/underwritingStress"}]},
+        "protection": {"$ref": "#/$defs/underwritingProtection"},
+        "weight_bounds": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/underwritingWeightBounds"}]},
+        "breakeven_verdict": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/breakevenVerdictItem"}},
+        "hurdles": {"$ref": "#/$defs/underwritingHurdles"},
+        "borrow_cost_annual": {"type": ["number", "null"], "minimum": 0},
+        "dividend_yield": {"type": ["number", "null"], "minimum": 0},
+        "rerating_observed": {"type": "boolean"},
+        "rerating_sources": {"$ref": "common#/$defs/sourceRefList"}
+      },
+      "required": ["anchor", "scenario_version", "states", "protection", "breakeven_verdict"]
+    },
     "pillar": {"type": "object", "additionalProperties": false,
       "properties": {
         "id": {"type": "string", "pattern": "^P\\d+$"},
@@ -81,8 +280,8 @@
         "period": {"$ref": "common#/$defs/period"},
         "source": {"type": "object", "additionalProperties": false,
           "properties": {"type": {"$ref": "common#/$defs/sourceType",
-                                  "enum": ["filing","company_release","transcript","broker_report","consensus","official_data","expert","news","model","internal_note","legacy_thesis"],
-                                  "description": "证据来源类型及默认可信度等级（tier）：filing=1（监管财报）、company_release=2（公司公告/新闻稿）、transcript=2（电话会/业绩会转写，包括 AlphaEngine ASR 稿；卖方回访记 3）、broker_report=3（署名研报）、consensus=3（一致预期）、official_data=4（官方/协会数据）、expert=5（专家访谈，标身份）、news=6（新闻，只作线索）、model=2-3（本方模型推导；新增的 model 证据必须引用模型单元格，并且不能标 tier 1）、internal_note=3-5（团队内部对话或纪要，默认 5）、legacy_thesis=3-5（历史迁移论点）"},
+                                  "enum": ["filing","company_release","transcript","broker_report","consensus","official_data","expert","news","model","internal_note","legacy_thesis","market_color"],
+                                  "description": "证据来源类型及默认可信度等级（`tier`）：`filing`=1（监管财报）、`company_release`=2（公司公告/新闻稿）、`transcript`=2（电话会/业绩会转写，包括 AlphaEngine ASR 稿；卖方回访记 3）、`broker_report`=3（署名研报）、`consensus`=3（一致预期）、`official_data`=4（官方/协会数据）、`expert`=5（专家访谈，标身份）、`news`=6（新闻，只作线索）、`model`=2-3（本方模型推导；新增的 `model` 证据必须引用模型单元格，并且不能标 `tier` 1）、`internal_note`=3-5（团队内部对话或纪要，默认 5）、`legacy_thesis`=3-5（历史迁移论点）、`market_color`=3-5（市场预期与仓位观察，只能支撑 `market_view` 与 `expectations`；不得绑定 `pillar_ids`、不得支撑 `label` 为 `reported` 或 `company_guidance` 的 `figures`，且不得被 `underwriting` 下的任何字段引用）"},
                          "identity": {"type": "string", "description": "研报署名机构/作者、专家身份、文件名"},
                          "tier": {"$ref": "common#/$defs/sourceTier"},
                          "ref": {"$ref": "common#/$defs/evidenceRef"},
@@ -108,6 +307,7 @@
       "properties": {"version_no": {"type": "integer"}, "publication_id": {"type": "string", "format": "uuid"},
                      "approved_by": {"type": "string"}, "approved_at": {"$ref": "common#/$defs/isoTime"},
                      "house_view": {"$ref": "#/$defs/houseView"}, "aggregate_status": {"$ref": "common#/$defs/pillarStatus"},
+                     "underwriting": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/underwriting"}]},
                      "pillars": {"type": "array", "items": {"type": "object"}, "description": "批准时 pillars 的冻结副本"}},
       "required": ["version_no","publication_id","approved_by","approved_at","house_view","aggregate_status"]}
   }

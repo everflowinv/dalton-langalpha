@@ -34,7 +34,7 @@
 {% if doc.watch and doc.watch.events %}
 | ID | 事件类型 | 日期 | 日期状态 | 来源 | 应对计划 |
 |---|---|---|---|---|---|
-{% for ev in doc.watch.events %}| **{{ ev.id }}** | `{{ ev.type }}` | {{ ev.date or "待定" }} | {{ "已确认" if ev.date_status == "confirmed" else ("待确认" if ev.date_status == "estimated" else "未知") }} (`{{ ev.date_status }}`) | {{ ev.source or "—" }} | {{ ev.plan or "—" }} |
+{% for ev in doc.watch.events %}| **{{ ev.id }}** | `{{ ev.type }}` | {{ ev.date or "待定" }} | {{ "已确认" if ev.date_status == "confirmed" else ("待确认" if ev.date_status == "estimated" else "未知") }} (`{{ ev.date_status }}`){% if ev.review_by %} · 复核期限 {{ ev.review_by }}{% endif %} | {{ ev.source or "—" }} | {{ ev.plan or "—" }} |
 {% endfor %}
 {% else %}
 暂无监控事件。

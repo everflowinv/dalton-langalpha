@@ -648,6 +648,7 @@ async def write_version_files_to_backend(
     *,
     alerts: list[str] | None = None,
     profile: str = "company",
+    current_price: float | None = None,
 ) -> list[str]:
     """Write ``data/<doc>.json``, ``history/<doc>/...``, rendered ``<doc>.md``, and ``agent.md`` block.
 
@@ -702,6 +703,8 @@ async def write_version_files_to_backend(
     if not ticker and sector_doc:
         ticker = str(sector_doc.get("name") or "").strip()
 
+    today_iso = datetime.now(timezone.utc).date().isoformat()
+
     md_rel = rendered_path(doc_key)
     if md_rel and version_row.get("schema_valid", True):
         md_text = render_document_md(
@@ -710,6 +713,8 @@ async def write_version_files_to_backend(
             version_no=version_no,
             at=created_dt,
             ticker=ticker,
+            current_price=current_price,
+            now_date=today_iso,
         )
         if md_text:
             await backend.awrite_text(md_rel, md_text)
@@ -733,6 +738,8 @@ async def write_version_files_to_backend(
         models_doc=(models_row or {}).get("content"),
         last_verdict=last_verdict,
         alerts=alerts,
+        current_price=current_price,
+        now_date=today_iso,
     )
     existing_agent_md = await backend.aread_text(AGENT_MD)
     new_agent_md = update_agent_md_block(existing_agent_md, block)
@@ -954,10 +961,22 @@ async def apply_update(
         await _populate_model_sha256(new_doc, backend)
 
     models_doc: dict[str, Any] | None = None
+    agenda_doc: dict[str, Any] | None = None
+    debate_doc: dict[str, Any] | None = None
     if doc_key == "thesis":
         models_row = await db_knowledge.latest_valid_version(workspace_id, "models")
-        if models_row and isinstance(models_row.get("content"), dict):
-            models_doc = models_row["content"]
+        models_doc = (
+            models_row["content"]
+            if models_row and isinstance(models_row.get("content"), dict)
+            else {}
+        )
+        if new_doc.get("schema_version") == 2:
+            agenda_row = await db_knowledge.latest_valid_version(workspace_id, "agenda")
+            if agenda_row and isinstance(agenda_row.get("content"), dict):
+                agenda_doc = agenda_row["content"]
+            debate_row = await db_knowledge.latest_valid_version(workspace_id, "debate")
+            if debate_row and isinstance(debate_row.get("content"), dict):
+                debate_doc = debate_row["content"]
 
     # Compare against latest valid version for hard invariants (I1/I2)
     valid_base_doc = base_doc
@@ -971,6 +990,8 @@ async def apply_update(
         new_doc,
         source=source,
         models_doc=models_doc,
+        agenda_doc=agenda_doc,
+        debate_doc=debate_doc,
         reason=reason,
     )
     has_hard_invariant_error = any(
@@ -1008,6 +1029,8 @@ async def apply_update(
                 new_doc,
                 source=source,
                 models_doc=models_doc,
+                agenda_doc=agenda_doc,
+                debate_doc=debate_doc,
                 reason=reason,
             )
 

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from src.config.env import HOST_IP, LOCAL_DEV_USER_ID
 from src.config.settings import HOST_MODE
@@ -60,6 +60,44 @@ class DaltonKnowledgeConfig(BaseModel):
 
     enabled: bool = True
     max_doc_bytes: int = Field(default=1_048_576, gt=0)
+
+
+class DaltonMandateSettings(BaseModel):
+    """Underwriting mandate hurdle and staleness parameters (§5, §12.1, §12.8, §12.9)."""
+
+    long_hurdle_annual: float = Field(default=0.15, ge=0.0)
+    short_hurdle_annual: float = Field(default=0.20, ge=0.0)
+    min_total_return: float = Field(default=0.10, ge=0.0)
+    max_adverse_move_act_now: float = Field(default=0.25, ge=0.0)
+    max_entry_distance: float = Field(default=0.25, ge=0.0)
+    call_hurdle_annual: float = Field(default=0.15, ge=0.0)
+    anchor_stale_days: int = Field(default=14, ge=1)
+    anchor_stale_move: float = Field(default=0.15, ge=0.0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_legacy_bear_loss(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "max_adverse_move_act_now" not in data:
+            legacy = data.get("max_bear_loss_act_now")
+            if legacy is not None:
+                data = dict(data)
+                data["max_adverse_move_act_now"] = abs(float(legacy))
+        return data
+
+    @property
+    def max_bear_loss_act_now(self) -> float:
+        """Signed compatibility alias for §5 (`-max_adverse_move_act_now`)."""
+        return -self.max_adverse_move_act_now
+
+    def snapshot_hurdles(self, horizon_months: int = 12) -> dict[str, float | int]:
+        """Return the hurdle snapshot stored on `underwriting.hurdles` at write time (§12.9)."""
+        return {
+            "long_hurdle_annual": self.long_hurdle_annual,
+            "short_hurdle_annual": self.short_hurdle_annual,
+            "min_total_return": self.min_total_return,
+            "max_adverse_move_act_now": self.max_adverse_move_act_now,
+            "horizon_months": int(horizon_months),
+        }
 
 
 class DaltonPublishConfig(BaseModel):
@@ -323,6 +361,7 @@ class DaltonConfig(BaseModel):
     models: DaltonModelsConfig = Field(default_factory=DaltonModelsConfig)
     budget: DaltonBudgetDefaults = Field(default_factory=DaltonBudgetDefaults)
     knowledge: DaltonKnowledgeConfig = Field(default_factory=DaltonKnowledgeConfig)
+    mandate: DaltonMandateSettings = Field(default_factory=DaltonMandateSettings)
     publish: DaltonPublishConfig = Field(default_factory=DaltonPublishConfig)
     autonomy: DaltonAutonomyConfig = Field(default_factory=DaltonAutonomyConfig)
     conversations: DaltonConversationsConfig = Field(
@@ -374,6 +413,11 @@ get_dalton_config.cache_clear = _load_base_dalton_config.cache_clear  # type: ig
 
 
 get_dalton_settings = get_dalton_config
+
+
+def get_dalton_mandate_settings() -> DaltonMandateSettings:
+    """Return configured `DaltonMandateSettings` (§5, §12.1, §12.8)."""
+    return get_dalton_config().mandate
 
 
 def is_dalton_enabled() -> bool:

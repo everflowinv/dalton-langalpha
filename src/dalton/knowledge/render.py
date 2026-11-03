@@ -46,6 +46,232 @@ STAGE_ZH: dict[str, str] = {
     "paused": "暂停覆盖",
 }
 
+ENUM_ZH: dict[str, dict[str, str]] = {
+    "stance": {
+        "long": "看多",
+        "short": "看空",
+        "neutral": "中性",
+        "no_view": "暂不表态",
+    },
+    "conviction": {
+        "high": "高",
+        "medium": "中",
+        "low": "低",
+        "none": "无",
+    },
+    "confidence": {
+        "high": "高",
+        "medium": "中",
+        "low": "低",
+        "none": "无",
+    },
+    "quality": {
+        "high": "高",
+        "medium": "中",
+        "low": "低",
+    },
+    "actionability": {
+        "act_now": "立即行动",
+        "wait_price": "等待买点",
+        "wait_evidence": "等待证据",
+        "pass": "暂不参与",
+    },
+    "binding_constraint": {
+        "none": "无",
+        "price": "价格",
+        "evidence": "关键证据待验证",
+        "timing": "催化剂时点",
+        "downside_path": "下行路径风险",
+        "implementation": "交易执行条件",
+    },
+    "position_suggestion": {
+        "none": "不持仓",
+        "starter": "观察仓",
+        "core": "核心仓",
+        "max": "重仓",
+        "reduce": "减仓",
+        "exit": "清仓",
+    },
+    "positioning": {
+        "crowded_long": "多头拥挤",
+        "balanced": "仓位均衡",
+        "crowded_short": "空头拥挤",
+        "unknown": "未知",
+    },
+    "breakeven_side": {
+        "long": "做多",
+        "short": "做空",
+    },
+    "breakeven_verdict": {
+        "clearly_above": "显著高于门槛",
+        "around": "在门槛附近",
+        "below": "低于门槛",
+        "cannot_judge": "无法判断",
+    },
+    "needs_financing": {
+        "yes": "是",
+        "no": "否",
+        "true": "是",
+        "false": "否",
+        "unknown": "未知",
+    },
+    "anchor_source": {
+        "closing_price": "收盘价",
+        "intraday": "盘中价",
+        "manual": "手动输入",
+    },
+    "state_name": {
+        "bear": "Bear",
+        "base": "Base",
+        "bull": "Bull",
+    },
+    "figure_label": {
+        "reported": "财报披露",
+        "company_guidance": "公司指引",
+        "consensus": "一致预期",
+        "street_estimate": "卖方预估",
+        "house_estimate": "我方预估",
+        "research_judgement": "研究判断",
+        "estimate": "估算",
+        "assumption": "假设",
+        "derived": "推算值",
+        "market_implied": "市场隐含",
+    },
+    "pillar_status": {
+        "untested": "待验证",
+        "intact": "成立",
+        "strengthening": "强化",
+        "watch": "观察",
+        "impaired": "受损",
+        "broken": "证伪",
+        "changed": "已变更",
+        "retired": "已退役",
+    },
+    "pillar_priority": {
+        "core": "核心",
+        "supporting": "辅助",
+    },
+    "pillar_provenance": {
+        "inherited": "迁移观点，待复核",
+        "draft": "研究草稿",
+        "approved": "已批准",
+    },
+    "source_type": {
+        "filing": "监管财报",
+        "company_release": "公司公告",
+        "transcript": "业绩会转写",
+        "broker_report": "卖方研报",
+        "consensus": "一致预期",
+        "official_data": "官方数据",
+        "expert": "专家访谈",
+        "news": "新闻线索",
+        "model": "本方模型",
+        "internal_note": "内部纪要",
+        "legacy_thesis": "历史迁移",
+        "market_color": "市场观察",
+    },
+    "signal": {
+        "strongly_confirming": "强力验证",
+        "confirming": "验证",
+        "mildly_confirming": "小幅验证",
+        "neutral": "中性",
+        "mildly_weakening": "小幅削弱",
+        "weakening": "削弱",
+        "strongly_weakening": "严重削弱",
+        "mixed": "多空交织",
+        "invalidating": "证伪",
+        "untested": "尚未检验",
+    },
+    "transmission": {
+        "eps_only": "仅影响 EPS",
+        "multiple_only": "仅影响估值倍数",
+        "both": "同时影响 EPS 与估值倍数",
+    },
+    "response_shape": {
+        "linear": "线性",
+        "threshold": "阈值跳变",
+        "lag": "时滞传导",
+        "convex": "凸性加速",
+        "concave": "凹性递减",
+        "unknown": "待定",
+    },
+}
+
+
+def zh_label(category: str, val: Any) -> str:
+    """Translate an enum value in ``category`` to human-readable Chinese, falling back to ``val`` as-is."""
+    if val is None:
+        return ""
+    if isinstance(val, bool):
+        key = "true" if val else "false"
+    else:
+        key = str(val)
+    mapping = ENUM_ZH.get(category)
+    if mapping and key in mapping:
+        return mapping[key]
+    return str(val)
+
+
+def format_breakeven_cell(row: dict[str, Any] | None, side: str = "long") -> str:
+    """Format a breakeven row into human-readable Chinese for rendering."""
+    if not isinstance(row, dict):
+        return "—"
+    disp = str(row.get("display") or "").strip()
+    side_action = "做空" if side == "short" else "做多"
+    state_label = "Bear" if side == "short" else "Bull"
+    if disp == "该组合不可达":
+        return f"这个 Base 权重下{side_action}无法达标"
+    if disp in ("无需 bull 即达标", "无需 bear 即达标"):
+        return f"无需 {state_label} 情景即达标"
+    if disp.endswith("–该组合不可达"):
+        prefix = disp[: -len("–该组合不可达")]
+        for token in ("Bull >= ", "Bear >= "):
+            if prefix.startswith(token):
+                prefix = prefix[len(token) :]
+                break
+        return f"有利情况下 {state_label} 权重至少 {prefix}；最不利情况下这个 Base 权重{side_action}无法达标"
+    if disp.startswith("Bull >= "):
+        return "Bull 权重至少 " + disp[len("Bull >= ") :]
+    if disp.startswith("Bear >= "):
+        return "Bear 权重至少 " + disp[len("Bear >= ") :]
+    return disp or "—"
+
+
+def format_breakeven_verdicts(verdicts: list[dict[str, Any]] | None) -> str:
+    """Format ``underwriting.breakeven_verdict`` items in Chinese without exposing raw enum tokens."""
+    if not isinstance(verdicts, list) or not verdicts:
+        return "—"
+    parts: list[str] = []
+    for bv in verdicts:
+        if not isinstance(bv, dict):
+            continue
+        side_zh = zh_label("breakeven_side", bv.get("side"))
+        verdict_zh = zh_label("breakeven_verdict", bv.get("verdict"))
+        b_row = bv.get("b_row")
+        b_prefix = (
+            f"按 Base 权重 {round(float(b_row) * 100)}% 检验，"
+            if isinstance(b_row, (int, float)) and not isinstance(b_row, bool)
+            else ""
+        )
+        basis = str(bv.get("basis") or "").strip()
+        parts.append(f"{side_zh}：{verdict_zh}（{b_prefix}{basis}）")
+    return " ｜ ".join(parts) if parts else "—"
+
+
+def format_thresholds(items: list[dict[str, Any]] | None, empty_text: str) -> str:
+    """Format a pillar threshold list on a single line so template block tags never strip trailing newlines."""
+    if not isinstance(items, list) or not items:
+        return empty_text
+    segs: list[str] = []
+    for t in items:
+        if not isinstance(t, dict):
+            continue
+        val_part = t.get("value") if "value" in t and t.get("value") is not None else (t.get("event_text") or "")
+        unit_part = t.get("unit") or ""
+        period_part = t.get("period") or ""
+        segs.append(f"`{t.get('id') or ''}` {t.get('metric') or ''} {t.get('operator') or ''} {val_part} {unit_part} ({period_part})")
+    return "；".join(segs) if segs else empty_text
+
 MAX_AGENT_BLOCK_CHARS = 2500
 
 
@@ -93,6 +319,143 @@ def _trunc(text: str | None, max_len: int = 80) -> str:
     return s[: max_len - 1] + "…"
 
 
+def _fmt_num(val: Any) -> str:
+    if val is None or isinstance(val, bool):
+        return "?"
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return str(val)
+    if abs(f - round(f)) <= 1e-6:
+        return str(int(round(f)))
+    return f"{f:.2f}".rstrip("0").rstrip(".")
+
+
+def _format_odds_card_line(
+    thesis_doc: dict[str, Any],
+    *,
+    current_price: float | None = None,
+    now_date: str | None = None,
+) -> str:
+    uw = thesis_doc.get("underwriting")
+    if not isinstance(uw, dict):
+        return ""
+    from src.dalton.knowledge.scenario_math import evaluate_underwriting
+
+    eval_res = evaluate_underwriting(
+        thesis_doc,
+        current_price=current_price,
+        now_date=now_date,
+    )
+    anchor = uw.get("anchor") if isinstance(uw.get("anchor"), dict) else {}
+    p0_str = _fmt_num(anchor.get("price"))
+    p_at = str(anchor.get("price_at") or "")[:10]
+    anchor_seg = f"基准股价 {p0_str}（{p_at}）" if p_at else f"基准股价 {p0_str}"
+
+    states = eval_res.get("states") or {}
+    state_parts: list[str] = []
+    for label, key in (("Bear", "bear"), ("Base", "base"), ("Bull", "bull")):
+        st = states.get(key)
+        if isinstance(st, dict) and isinstance(st.get("price"), dict):
+            pr = st["price"]
+            eps_b = st.get("eps")
+            mult_b = st.get("multiple")
+            if isinstance(eps_b, dict) and isinstance(mult_b, dict):
+                eps_str = (
+                    _fmt_num(eps_b.get("lo"))
+                    if abs(float(eps_b["lo"]) - float(eps_b["hi"])) <= 1e-6
+                    else f"{_fmt_num(eps_b.get('lo'))}–{_fmt_num(eps_b.get('hi'))}"
+                )
+                mult_str = (
+                    f"{_fmt_num(mult_b.get('lo'))}x"
+                    if abs(float(mult_b["lo"]) - float(mult_b["hi"])) <= 1e-6
+                    else f"{_fmt_num(mult_b.get('lo'))}–{_fmt_num(mult_b.get('hi'))}x"
+                )
+                state_parts.append(
+                    f"{label} {_fmt_num(pr.get('lo'))}–{_fmt_num(pr.get('hi'))}（EPS {eps_str}×{mult_str}）"
+                )
+            else:
+                state_parts.append(f"{label} {_fmt_num(pr.get('lo'))}–{_fmt_num(pr.get('hi'))}")
+    states_seg = " / ".join(state_parts) if state_parts else "三情景待定"
+
+    hv = thesis_doc.get("house_view") if isinstance(thesis_doc.get("house_view"), dict) else {}
+    stance = str(hv.get("stance") or "long")
+    wb = uw.get("weight_bounds") if isinstance(uw.get("weight_bounds"), dict) else None
+    bv_list = uw.get("breakeven_verdict") if isinstance(uw.get("breakeven_verdict"), list) else []
+
+    def _format_side_seg(side_k: str) -> str:
+        side_weight_label = "Bear 权重" if side_k == "short" else "Bull 权重"
+        wb_key = "bear" if side_k == "short" else "bull"
+        short_note = (
+            (eval_res.get("hurdles") or {}).get("short_cost_note")
+            if side_k == "short"
+            else None
+        )
+        note_suffix = f"；{short_note}" if short_note else ""
+        be_rows = (eval_res.get("breakeven") or {}).get(side_k) or []
+        row_25 = next((r for r in be_rows if abs(float(r.get("b", 0.0)) - 0.25) <= 1e-6), None)
+        row_50 = next((r for r in be_rows if abs(float(r.get("b", 0.0)) - 0.50) <= 1e-6), None)
+        if row_50 is not None and row_25 is not None:
+            req_part = (
+                f"达标所需{side_weight_label}（给定 Base 权重{note_suffix}）：Base 50% 时需 {format_breakeven_cell(row_50, side_k)}；"
+                f"Base 25% 时需 {format_breakeven_cell(row_25, side_k)}"
+            )
+        elif row_50 is not None:
+            req_part = f"达标所需{side_weight_label}（Base 50%{note_suffix}）：需 {format_breakeven_cell(row_50, side_k)}"
+        else:
+            req_part = f"达标所需{side_weight_label}待算"
+
+        bv_match = next(
+            (b for b in bv_list if isinstance(b, dict) and b.get("side") == side_k),
+            bv_list[0] if bv_list and isinstance(bv_list[0], dict) else {},
+        )
+        verdict_word = bv_match.get("verdict") or "unknown"
+        verdict_zh = zh_label("breakeven_verdict", verdict_word)
+        if isinstance(wb, dict) and isinstance(wb.get(wb_key), dict):
+            wb_side = wb[wb_key]
+            w_lo = round(float(wb_side.get("lo", 0.0)) * 100.0)
+            w_hi = round(float(wb_side.get("hi", 0.0)) * 100.0)
+            wb_part = f"我方给 {side_weight_label} {w_lo}%–{w_hi}% → {verdict_zh}"
+        else:
+            wb_part = f"赔率是否达标：{verdict_zh}"
+        return f"{req_part}｜{wb_part}"
+
+    if stance == "neutral":
+        be_seg = f"做多（{_format_side_seg('long')}）；做空（{_format_side_seg('short')}）"
+    elif stance == "short":
+        be_seg = _format_side_seg("short")
+    else:
+        be_seg = _format_side_seg("long")
+
+    prot = uw.get("protection") if isinstance(uw.get("protection"), dict) else {}
+    surv = prot.get("survival")
+    nf = (
+        surv.get("needs_financing")
+        if isinstance(surv, dict) and surv.get("needs_financing") is not None
+        else prot.get("needs_financing")
+    )
+    if nf is None:
+        nf = "unknown"
+    nf_zh = zh_label("needs_financing", nf)
+    val_obj = prot.get("value")
+    v_range = (
+        val_obj.get("value_range")
+        if isinstance(val_obj, dict) and isinstance(val_obj.get("value_range"), dict)
+        else (prot.get("value_range") if isinstance(prot.get("value_range"), dict) else {})
+    )
+    prot_seg = (
+        f"下行保护 {_fmt_num(v_range.get('lo'))}–{_fmt_num(v_range.get('hi'))}（依赖外部融资：{nf_zh}）"
+        if "lo" in v_range and "hi" in v_range
+        else f"下行保护（依赖外部融资：{nf_zh}）"
+    )
+
+    parts = [anchor_seg, states_seg, be_seg, prot_seg]
+    staleness = eval_res.get("staleness") or {}
+    if staleness.get("is_stale"):
+        parts.append("需要重估")
+    return "｜".join(parts)
+
+
 def render_document_md(
     doc_key: str,
     doc: dict[str, Any],
@@ -100,6 +463,8 @@ def render_document_md(
     version_no: int = 1,
     at: datetime | str | None = None,
     ticker: str = "",
+    current_price: float | None = None,
+    now_date: str | None = None,
 ) -> str | None:
     """Render ``data/<doc_key>.json`` into its human-readable ``<doc_key>.md``."""
     if doc_key not in RENDERED:
@@ -108,11 +473,25 @@ def render_document_md(
     header = render_header_comment(doc_key, version_no, at_iso)
     tmpl = _jinja_env().get_template(f"{doc_key}.md.j2")
     eff_ticker = ticker or str(doc.get("ticker") or "").strip() or doc_key.upper()
+    underwriting_eval: dict[str, Any] | None = None
+    if doc_key == "thesis" and isinstance(doc.get("underwriting"), dict):
+        from src.dalton.knowledge.scenario_math import evaluate_underwriting
+
+        underwriting_eval = evaluate_underwriting(
+            doc,
+            current_price=current_price,
+            now_date=now_date,
+        )
     rendered = tmpl.render(
         header_comment=header,
         ticker=eff_ticker,
         doc=doc,
         verdict_zh=VERDICT_ZH,
+        underwriting_eval=underwriting_eval,
+        zh=zh_label,
+        format_breakeven_cell=format_breakeven_cell,
+        format_breakeven_verdicts=format_breakeven_verdicts,
+        format_thresholds=format_thresholds,
     )
     if not rendered.endswith("\n"):
         rendered += "\n"
@@ -176,6 +555,8 @@ def render_agent_block(
     models_doc: dict[str, Any] | None = None,
     last_verdict: dict[str, Any] | None = None,
     alerts: list[str] | None = None,
+    current_price: float | None = None,
+    now_date: str | None = None,
 ) -> str:
     """Render the managed block inside ``agent.md`` (guaranteed <= 2,500 chars, PK.6).
 
@@ -218,10 +599,36 @@ def render_agent_block(
     hv = t.get("house_view") or {}
     hv_stance = hv.get("stance") or "no_view"
     hv_conv = hv.get("conviction") or "none"
+    hv_act = hv.get("actionability")
+    stance_zh = zh_label("stance", hv_stance)
+    conv_zh = zh_label("conviction", hv_conv)
     v_str = f"v{thesis_version_no}" if thesis_version_no else "v1"
     as_of_date = str(t.get("as_of") or "")[:10]
     ver_meta = f"{v_str}，{as_of_date}" if as_of_date else v_str
-    one_liner_line = f"{one_liner}；house view：{hv_stance} / {hv_conv}（{ver_meta}）。"
+    if hv_act:
+        act_zh = zh_label("actionability", hv_act)
+        hm = hv.get("horizon_months")
+        hm_seg = f"{hm} 个月，" if hm is not None else ""
+        bc = hv.get("binding_constraint") or "none"
+        bc_zh = zh_label("binding_constraint", bc)
+        bc_txt = _trunc(hv.get("binding_constraint_text"), 36)
+        bc_seg = (
+            "无制约"
+            if bc == "none" and not bc_txt
+            else (f"受限于{bc_zh}：{bc_txt}" if bc_txt else f"受限于{bc_zh}")
+        )
+        one_liner_line = (
+            f"{one_liner}；我方观点：{stance_zh} / 置信度{conv_zh} / {act_zh}"
+            f"（{hm_seg}{bc_seg}，{ver_meta}）。"
+        )
+    else:
+        one_liner_line = f"{one_liner}；我方观点：{stance_zh} / 置信度{conv_zh}（{ver_meta}）。"
+
+    odds_card_line = _format_odds_card_line(
+        t,
+        current_price=current_price,
+        now_date=now_date,
+    )
 
     official = t.get("official")
     if isinstance(official, dict) and official.get("version_no"):
@@ -231,6 +638,11 @@ def render_agent_block(
         date_prefix = f"{off_date} " if off_date else ""
         pub_suffix = f"（publication {pub_id}）" if pub_id else ""
         official_line = f"thesis v{official['version_no']}，{date_prefix}{approved_by} 批准{pub_suffix}"
+        if t.get("underwriting") is not None or hv_act is not None:
+            off_hv = official.get("house_view") if isinstance(official.get("house_view"), dict) else {}
+            off_uw = official.get("underwriting")
+            if off_hv.get("actionability") != hv_act or off_uw != t.get("underwriting"):
+                official_line += "｜草稿较正式版有改动（待重新审批发布）"
     else:
         official_line = "尚未发布正式版本（迁移观点或研究草稿，待复核）"
 
@@ -318,6 +730,7 @@ def render_agent_block(
     rendered = tmpl.render(
         header_title=header_title,
         one_liner_line=one_liner_line,
+        odds_card_line=odds_card_line,
         official_line=official_line,
         thesis_status_line=thesis_status_line,
         debates_line=debates_line,

@@ -4,51 +4,134 @@
 
 - **更新时间**：{{ doc.as_of }}
 - **一句话判断**：{{ doc.one_liner }}
-- **总体状态（Aggregate Status）**：`{{ doc.aggregate_status }}`{% if doc.aggregate_override %}（破例说明：{{ doc.aggregate_override }}）{% endif %}
+- **总体状态（Aggregate Status）**：{{ zh("pillar_status", doc.aggregate_status) }}{{ ("（破例说明：" ~ doc.aggregate_override ~ "）") if doc.aggregate_override else "" }}
 {% if doc.official %}
 - **正式版本（Official）**：v{{ doc.official.version_no }} · {{ doc.official.approved_at }} 由 {{ doc.official.approved_by }} 批准（Publication `{{ doc.official.publication_id }}`）
 {% else %}
 - **正式版本（Official）**：尚未发布正式版本（当前为研究草稿 / 迁移观点，待复核）
 {% endif %}
 
-## House View
+## 我方观点
 
 | 维度 | 内容 |
 |---|---|
-| 方向 / 置信度 | `{{ doc.house_view.stance }}` / `{{ doc.house_view.conviction }}`{% if doc.house_view.position_suggestion %}（仓位建议：`{{ doc.house_view.position_suggestion }}`）{% endif %} |
+| 方向 / 置信度{{ " / 当前动作" if doc.house_view.actionability else "" }} | {{ zh("stance", doc.house_view.stance) }} / {{ zh("conviction", doc.house_view.conviction) }}{{ (" / " ~ zh("actionability", doc.house_view.actionability)) if doc.house_view.actionability else "" }}{{ ("（仓位建议：" ~ zh("position_suggestion", doc.house_view.position_suggestion) ~ "）") if doc.house_view.position_suggestion else "" }} |
+{% if doc.house_view.horizon_months %}
+| 投资期限 | {{ doc.house_view.horizon_months }} 个月 |
+{% endif %}
+{% if doc.house_view.binding_constraint %}
+| 当前制约因素 | {{ zh("binding_constraint", doc.house_view.binding_constraint) }}{{ (" — " ~ doc.house_view.binding_constraint_text) if doc.house_view.binding_constraint_text else "" }} |
+{% endif %}
+{% if doc.house_view.entry_band %}
+| 目标建仓价区间 | {{ doc.house_view.entry_band.lo }}–{{ doc.house_view.entry_band.hi }}{{ (" " ~ doc.house_view.entry_band.unit) if doc.house_view.entry_band.unit else "" }} |
+{% endif %}
+{% if doc.house_view.flip_conditions %}
+| 改判条件 | {{ ("上调：" ~ doc.house_view.flip_conditions.upgrade_if) if doc.house_view.flip_conditions.upgrade_if else "" }}{{ " ｜ " if (doc.house_view.flip_conditions.upgrade_if and doc.house_view.flip_conditions.downgrade_if) else "" }}{{ ("下调：" ~ doc.house_view.flip_conditions.downgrade_if) if doc.house_view.flip_conditions.downgrade_if else "" }} |
+{% endif %}
+{% if doc.house_view.trigger_refs %}
+| 待验证触发项 | {{ doc.house_view.trigger_refs | join(", ") }} |
+{% endif %}
+{% if doc.house_view.missing %}
+| 待补关键信息 | {{ doc.house_view.missing | join("；") }}{{ ("（复核期限：" ~ doc.house_view.review_by ~ "）") if doc.house_view.review_by else "" }} |
+{% endif %}
 | 核心摘要 | {{ doc.house_view.summary }} |
-{% if doc.house_view.variant_perception %}| 预期差（Variant Perception） | {{ doc.house_view.variant_perception }} |
-{% endif %}{% if doc.house_view.target %}| 目标价 | {{ doc.house_view.target.currency }} {{ doc.house_view.target.value }}（方法：{{ doc.house_view.target.method }}，模型单元格：`{{ doc.house_view.target.model_ref.path }}#{{ doc.house_view.target.model_ref.cell }}`） |
-{% endif %}| 更新时间 | {{ doc.house_view.updated_at }} |
+{% if doc.house_view.variant_perception %}
+| 预期差（Variant Perception） | {{ doc.house_view.variant_perception }} |
+{% endif %}
+{% if doc.house_view.target %}
+| 目标价 | {{ doc.house_view.target.currency }} {{ doc.house_view.target.value }}（方法：{{ doc.house_view.target.method }}{{ ("，模型单元格：`" ~ doc.house_view.target.model_ref.path ~ "#" ~ doc.house_view.target.model_ref.cell ~ "`") if doc.house_view.target.model_ref else "" }}） |
+{% endif %}
+| 更新时间 | {{ doc.house_view.updated_at }} |
 
+{% if doc.underwriting %}
+## 三情景估值与赔率（v{{ doc.underwriting.scenario_version }}）
+
+- **基准股价**：{{ doc.underwriting.anchor.currency }} {{ doc.underwriting.anchor.price }}（{{ doc.underwriting.anchor.price_at }}，来源：{{ zh("anchor_source", doc.underwriting.anchor.source) }}）{{ " · **【需要重估】**" if (underwriting_eval and underwriting_eval.staleness and underwriting_eval.staleness.is_stale) else "" }}
+{% if underwriting_eval and underwriting_eval.hurdles %}
+- **最低要求回报对应终值**：做多需不低于 {{ "%.2f"|format(underwriting_eval.hurdles.H_L) }} ｜ 做空需不高于 {{ "%.2f"|format(underwriting_eval.hurdles.H_S) }}{{ ("（" ~ underwriting_eval.hurdles.short_cost_note ~ "）") if underwriting_eval.hurdles.short_cost_note else "" }}
+{% endif %}
+{% if underwriting_eval and underwriting_eval.multiple_decomposition and underwriting_eval.multiple_decomposition.tag %}
+- **回报来源拆解**：{{ underwriting_eval.multiple_decomposition.tag }}
+{% endif %}
+
+### 三情景估值
+
+| 情景 | 目标股价区间 | 股价中点 | 每股分红与回购 | 含现金回报终值中点 | 关联分歧 / 驱动 | 成立条件 |
+|---|---|---|---|---|---|---|
+{% for st in doc.underwriting.states %}
+{% set sb = underwriting_eval.states.get(st.name) if underwriting_eval and underwriting_eval.states else none %}
+| **{{ zh("state_name", st.name) }}** | {{ ("%.2f"|format(sb.price.lo) ~ "–" ~ "%.2f"|format(sb.price.hi)) if sb else "—" }} | {{ "%.2f"|format(sb.price.mid) if sb else "—" }} | {{ st.cash_return_per_share or 0 }} | {{ "%.2f"|format(sb.v_tr.mid) if sb else "—" }} | {{ ((st.debate_ids or []) + (st.driver_ids or [])) | join(", ") or "—" }} | {{ st.condition or st.summary or "—" }} |
+{% endfor %}
+
+{% if underwriting_eval and underwriting_eval.breakeven %}
+### 达标所需胜率反推（给定 Base 情景权重，非主观概率预测）
+
+区间的两端，分别是三种情景都按目标价下沿、都按上沿计算时的结果，向外取整到 5 个百分点。
+
+| 假定 Base 情景权重 | 做多达标所需 Bull 最低权重 | 做空达标所需 Bear 最低权重 |
+|---|---|---|
+{% for idx in range(underwriting_eval.breakeven.long | length) %}
+{% set r_l = underwriting_eval.breakeven.long[idx] %}
+{% set r_s = underwriting_eval.breakeven.short[idx] %}
+| {{ "%.0f"|format(r_l.b * 100) }}% | {{ format_breakeven_cell(r_l, "long") }} | {{ format_breakeven_cell(r_s, "short") }}{{ ("（" ~ underwriting_eval.hurdles.short_cost_note ~ "）") if (underwriting_eval.hurdles and underwriting_eval.hurdles.short_cost_note) else "" }} |
+{% endfor %}
+
+{% endif %}
+{% if doc.underwriting.weight_bounds %}
+- **我方判断的情景权重区间**：Bear {{ "%.0f"|format(doc.underwriting.weight_bounds.bear.lo * 100) }}%–{{ "%.0f"|format(doc.underwriting.weight_bounds.bear.hi * 100) }}% · Base {{ "%.0f"|format(doc.underwriting.weight_bounds.base.lo * 100) }}%–{{ "%.0f"|format(doc.underwriting.weight_bounds.base.hi * 100) }}% · Bull {{ "%.0f"|format(doc.underwriting.weight_bounds.bull.lo * 100) }}%–{{ "%.0f"|format(doc.underwriting.weight_bounds.bull.hi * 100) }}%（依据：{{ doc.underwriting.weight_bounds.rationale }}）
+{% endif %}
+- **赔率是否达标**：{{ format_breakeven_verdicts(doc.underwriting.breakeven_verdict) }}
+{% set prot = doc.underwriting.protection %}
+{% set surv_txt = prot.survival.text if prot.survival is mapping else prot.survival %}
+{% set nf_val = prot.survival.needs_financing if (prot.survival is mapping and prot.survival.needs_financing is not none) else prot.needs_financing %}
+{% set val_txt = (prot.value.text or prot.value.mechanism) if prot.value is mapping else prot.value %}
+{% set vr = prot.value.value_range if (prot.value is mapping and prot.value.value_range) else prot.value_range %}
+- **下行保护**：生存底线：{{ surv_txt }}（依赖外部融资：{{ zh("needs_financing", nf_val) }}）｜底部估值支撑：{{ val_txt }}{{ ("（" ~ vr.lo ~ "–" ~ vr.hi ~ "）") if vr else "" }}｜保护兑现路径：{{ prot.path }}｜保护失效条件：{{ prot.failure }}
+
+{% endif %}
 {% if doc.market_view %}
-## 市场基准与一致预期（Market View）
+## 市场基准与一致预期
 
 {{ doc.market_view.summary or "—" }}
+{% if doc.market_view.positioning %}
+
+- **市场仓位**：{{ zh("positioning", doc.market_view.positioning) }}
+{% endif %}
+{% if doc.market_view.observations %}
+
+| 市场主流观点 | 代表机构 / 来源 | 截至日期 | 置信度 |
+|---|---|---|---|
+{% for obs in doc.market_view.observations %}
+| {{ obs.claim }} | {{ obs.who }} | {{ obs.as_of }} | {{ zh("confidence", obs.confidence) }} |
+{% endfor %}
+{% endif %}
 {% if doc.market_view.figures %}
 
 | 指标 | 期间 | 数值 | 单位 | 标签 |
 |---|---|---|---|---|
-{% for f in doc.market_view.figures %}| {{ f.metric }} | {{ f.period }} | {{ f.value }} | {{ f.unit }} | `{{ f.label }}` |
-{% endfor %}{% endif %}
+{% for f in doc.market_view.figures %}
+| {{ f.metric }} | {{ f.period }} | {{ f.value }} | {{ f.unit }} | {{ zh("figure_label", f.label) }} |
+{% endfor %}
 {% endif %}
 
+{% endif %}
 ## 核心支柱（Pillars）
 
 | ID | 优先级 | 状态 | 来源状态 | 核心主张（Claim） | 基线（Baseline） | 预期路径 | 下一步验证 |
 |---|---|---|---|---|---|---|---|
-{% for p in doc.pillars %}| **{{ p.id }}** | `{{ p.priority }}` | `{{ p.status }}` | {{ "迁移观点，待复核" if p.provenance == "inherited" else p.provenance }} | {{ p.claim }} | {{ p.baseline.text }} ({{ p.baseline.as_of }}) | {{ p.expected_path }} | {{ p.next_proof_point.what if p.next_proof_point else "—" }} |
-{% endfor %}
-
 {% for p in doc.pillars %}
+| **{{ p.id }}** | {{ zh("pillar_priority", p.priority) }} | {{ zh("pillar_status", p.status) }} | {{ zh("pillar_provenance", p.provenance) }} | {{ p.claim }} | {{ p.baseline.text }} ({{ p.baseline.as_of }}) | {{ p.expected_path }} | {{ p.next_proof_point.what if p.next_proof_point else "—" }} |
+{% endfor %}
+{% for p in doc.pillars %}
+
 ### {{ p.id }}：{{ p.claim }}
-- **优先级**：`{{ p.priority }}` ｜ **当前状态**：`{{ p.status }}`{% if p.status_reason %}（{{ p.status_reason }}）{% endif %} ｜ **出处**：`{{ p.provenance }}`
+- **优先级**：{{ zh("pillar_priority", p.priority) }} ｜ **当前状态**：{{ zh("pillar_status", p.status) }}{{ ("（" ~ p.status_reason ~ "）") if p.status_reason else "" }} ｜ **出处**：{{ zh("pillar_provenance", p.provenance) }}
 - **基线**：{{ p.baseline.text }}（截至 {{ p.baseline.as_of }}）
 - **预期路径**：{{ p.expected_path }}
 - **阈值（Thresholds）**：
-  - **确认（Confirm）**：{% if p.thresholds.confirm %}{% for t in p.thresholds.confirm %}`{{ t.id }}` {{ t.metric }} {{ t.operator }} {{ t.value if t.value is defined else (t.event_text or "") }} {{ t.unit or "" }} ({{ t.period or "" }}){% if not loop.last %}；{% endif %}{% endfor %}{% else %}无{% endif %}
-  - **预警（Warn）**：{% if p.thresholds.warn %}{% for t in p.thresholds.warn %}`{{ t.id }}` {{ t.metric }} {{ t.operator }} {{ t.value if t.value is defined else (t.event_text or "") }} {{ t.unit or "" }} ({{ t.period or "" }}){% if not loop.last %}；{% endif %}{% endfor %}{% else %}无{% endif %}
-  - **证伪（Break）**：{% if p.thresholds.break %}{% for t in p.thresholds.break %}`{{ t.id }}` {{ t.metric }} {{ t.operator }} {{ t.value if t.value is defined else (t.event_text or "") }} {{ t.unit or "" }} ({{ t.period or "" }}){% if not loop.last %}；{% endif %}{% endfor %}{% else %}⚠ 未设置证伪阈值{% endif %}
+  - **确认（Confirm）**：{{ format_thresholds(p.thresholds.confirm, "无") }}
+  - **预警（Warn）**：{{ format_thresholds(p.thresholds.warn, "无") }}
+  - **证伪（Break）**：{{ format_thresholds(p.thresholds.break, "⚠ 未设置证伪阈值") }}
 {% endfor %}
 
 ## 证据台账（Evidence Ledger，只追加）
@@ -56,7 +139,8 @@
 {% if doc.evidence %}
 | ID | 时间 | 期间 | 来源（层级） | 事实与数据 | 关联支柱 | 信号 | 质量 |
 |---|---|---|---|---|---|---|---|
-{% for e in doc.evidence %}| **{{ e.id }}**{% if e.supersedes %} *(更正 {{ e.supersedes }})*{% endif %} | {{ e.at[:10] }} | {{ e.period or "—" }} | {{ e.source.identity }} (`{{ e.source.type }}` T{{ e.source.tier }}) | {{ e.fact }}{% if e.interpretation %} — *{{ e.interpretation }}*{% endif %} | {{ e.pillar_ids | join(", ") }} | `{{ e.signal }}` | `{{ e.quality }}` |
+{% for e in doc.evidence %}
+| **{{ e.id }}**{{ (" *(更正 " ~ e.supersedes ~ ")*") if e.supersedes else "" }} | {{ e.at[:10] }} | {{ e.period or "—" }} | {{ e.source.identity }}（{{ zh("source_type", e.source.type) }} T{{ e.source.tier }}） | {{ e.fact }}{{ (" — *" ~ e.interpretation ~ "*") if e.interpretation else "" }} | {{ e.pillar_ids | join(", ") }} | {{ zh("signal", e.signal) }} | {{ zh("quality", e.quality) }} |
 {% endfor %}
 {% else %}
 暂无证据记录。

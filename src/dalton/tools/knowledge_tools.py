@@ -264,8 +264,9 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         Which docs the workspace accepts follows its coverage profile: a company workspace takes company/thesis/debate/drivers/management/lessons/agenda/models; a sector workspace (bound to a sector coverage unit) takes sector/thesis/debate/drivers/lessons/agenda/models — management and company are company-only and are refused there, and sector is refused in a company workspace. Shared docs (thesis 等) validate identically in both; 行业 thesis 不强制公司目标价等公司专属字段。
         Writing requires the caller to own the workspace or hold rw on it; external members are fully isolated — colleagues' workspaces are not visible to them at all (a 404 is an identity limit — report it, don't retry or hand-edit around it).
         Call knowledge_read(doc=...) first and pass its returned latest_version_no as base_version (pass null when it returns null — data/<doc>.json carries no version number).
-        Ops address list items by id, e.g. {"op":"append","path":"/evidence","value":{...}},
+        Ops address list items by id (or name/side in underwriting), e.g. {"op":"append","path":"/evidence","value":{...}},
         {"op":"set","path":"/pillars/P2/status","value":"watch"}. reason says why, in one or two sentences.
+        When writing thesis v2 (underwriting or actionability), stance in long/short/neutral requires market_view, house_view.{horizon_months,actionability,binding_constraint,flip_conditions}, and underwriting.{anchor,states,protection,breakeven_verdict} (weight_bounds optional), and source.type="market_color" may only back market_view or expectations (never pillars, underwriting, or reported/guidance figures).
         Pass dry_run=True to validate a draft and preview the diff and expected schema structure without saving a DB version or rendering files; once dry_run passes, submit with dry_run=False.
         On validation failure, the returned message includes the expected schema structure (失败时返回的信息里带有期望结构，照着补齐再提交).
         Returns: the new version and the rendered file (or dry-run preview/diff), or the list of problems to fix.
