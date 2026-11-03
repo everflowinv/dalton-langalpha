@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, ClassVar
 from unittest.mock import create_autospec
+from uuid import uuid4
 
 import psycopg
 import pytest
@@ -34,6 +35,7 @@ from src.server.app.threads import provenance as threads_provenance
 from src.server.app.threads import tasks as threads_tasks
 from src.server.app.workspace_files import crud as ws_files_crud
 from src.server.app.workspace_files.file_refs import ResolveFileRefRequest
+from src.server.dependencies.principal import Principal
 from src.server.database import conversation as conv_db
 from src.server.database import user as user_db
 from src.server.database import workspace as ws_db
@@ -540,7 +542,7 @@ class TestReadEndpointsAllowColleagues:
         )
 
         list_resp = await threads_crud.list_threads(
-            x_user_id="u-chao",
+            principal=Principal(user_id="u-chao", auth="session"),
             workspace_id=ws["workspace_id"],
             limit=20,
             offset=0,
@@ -1144,8 +1146,11 @@ class TestWriteEndpointsRejectColleagues:
         )
         with pytest.raises(HTTPException) as exc_route_new:
             await threads_messaging.send_new_thread_message(
-                request=ChatRequest(workspace_id=ws["workspace_id"], messages=[]),
-                auth=auth_ctx,
+                turn=threads_messaging.AdmittedTurn(
+                    thread_id=str(uuid4()),
+                    body=ChatRequest(workspace_id=ws["workspace_id"], messages=[]),
+                    auth=auth_ctx,
+                ),
                 raw_request=_make_request(),
             )
         assert exc_route_new.value.status_code == 403
@@ -1161,9 +1166,11 @@ class TestWriteEndpointsRejectColleagues:
         }
         with pytest.raises(HTTPException) as exc_send:
             await threads_messaging.send_thread_message(
-                thread_id=thread_id,
-                request=ChatRequest(workspace_id=ws["workspace_id"], messages=[]),
-                auth=auth_ctx,
+                turn=threads_messaging.AdmittedTurn(
+                    thread_id=thread_id,
+                    body=ChatRequest(workspace_id=ws["workspace_id"], messages=[]),
+                    auth=auth_ctx,
+                ),
                 raw_request=_make_request(),
             )
         assert exc_send.value.status_code == 403

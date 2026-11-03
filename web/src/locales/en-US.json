@@ -2260,6 +2260,7 @@
     },
     "provenance": {
       "fromChiefOfStaff": "From Chief of Staff",
+      "fromAnotherThread": "From another thread",
       "automation": "Automation",
       "automationNamed": "Automation · {{name}}",
       "viaChannel": "Via {{platform}}",

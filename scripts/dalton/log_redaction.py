@@ -103,6 +103,12 @@ STDERR_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         r"\1[REDACTED]",
     ),
     (re.compile(r"(?<![0-9A-Za-z_\-])(sk-ant-[A-Za-z0-9_\-]{8,})(?![0-9A-Za-z_\-])"), "[REDACTED]"),
+    # sync3 B9 (#656): a computer's CLI token (lac1.), the file-mount token's
+    # family (lfs1.) and a personal access token (la_pat_) carry no key name
+    # when they land in a line bare, and their dot/underscore segments each
+    # stay under the generic 40+-char pattern's reach below.
+    (re.compile(r"(?<![0-9A-Za-z])(?:lac1|lfs1)\.[0-9A-Za-z][0-9A-Za-z._\-]{8,}"), "[REDACTED]"),
+    (re.compile(r"(?<![0-9A-Za-z_])la_pat_[0-9A-Za-z\-_]{8,}"), "[REDACTED]"),
     (re.compile(r"(?<![0-9A-Za-z_\-])(sk-[A-Za-z0-9_\-]{8,})(?![0-9A-Za-z_\-])"), "[REDACTED]"),
     (re.compile(r"(?<![0-9A-Za-z_\-])(gsk_[A-Za-z0-9_\-]{8,})(?![0-9A-Za-z_\-])"), "[REDACTED]"),
     (re.compile(r"(?<![0-9A-Za-z_\-])(AIza[0-9A-Za-z_\-]{35})(?![0-9A-Za-z_\-])"), "[REDACTED]"),

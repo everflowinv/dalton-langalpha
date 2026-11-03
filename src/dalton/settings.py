@@ -217,6 +217,20 @@ class DaltonColleagueDispatchConfig(BaseModel):
     enabled: bool = False
 
 
+class DaltonComputerCliTokensConfig(BaseModel):
+    """Master flag for #656's per-computer CLI tokens (`lac1.*`, what the ``la``
+    CLI presents from inside a sandbox).
+
+    Off (the default): no token file is written into a sandbox, no
+    ``computer_cli_tokens`` row is minted, the sweep never claims or prunes,
+    and a presented token authenticates nothing (401). Turning it from on to
+    off also calls for the one-shot full-table revocation
+    (``scripts/dalton/revoke_computer_cli_tokens.py``).
+    """
+
+    enabled: bool = False
+
+
 class DaltonCoverageUnitsConfig(BaseModel):
     """Coverage-unit identity registry switch (`dalton_coverage_units`, d023, sector layer P0).
 
@@ -355,6 +369,9 @@ class DaltonConfig(BaseModel):
     colleague_dispatch: DaltonColleagueDispatchConfig = Field(
         default_factory=DaltonColleagueDispatchConfig
     )
+    computer_cli_tokens: DaltonComputerCliTokensConfig = Field(
+        default_factory=DaltonComputerCliTokensConfig
+    )
     coverage_units: DaltonCoverageUnitsConfig = Field(
         default_factory=DaltonCoverageUnitsConfig
     )
@@ -434,6 +451,14 @@ def is_colleague_dispatch_enabled() -> bool:
     if env_flag is not None:
         return env_flag.strip().lower() in ("1", "true", "yes")
     return get_dalton_config().colleague_dispatch.enabled
+
+
+def is_computer_cli_tokens_enabled() -> bool:
+    """Whether #656's per-computer CLI tokens (`lac1.*`) are enabled (sync3 B9)."""
+    env_flag = os.getenv("DALTON_COMPUTER_CLI_TOKENS_ENABLED")
+    if env_flag is not None:
+        return env_flag.strip().lower() in ("1", "true", "yes")
+    return get_dalton_config().computer_cli_tokens.enabled
 
 
 def is_coverage_units_enabled() -> bool:

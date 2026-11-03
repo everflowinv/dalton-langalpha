@@ -2292,6 +2292,7 @@
     },
     "provenance": {
       "fromChiefOfStaff": "来自研究总监",
+      "fromAnotherThread": "来自另一个对话",
       "automation": "自动化",
       "automationNamed": "自动化 · {{name}}",
       "viaChannel": "来自 {{platform}}",

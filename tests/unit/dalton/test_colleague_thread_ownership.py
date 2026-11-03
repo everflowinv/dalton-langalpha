@@ -18,6 +18,7 @@ from src.dalton.sharing import (
     require_thread_access,
 )
 from src.server.app import workspaces as workspaces_app
+from src.server.dependencies.principal import Principal
 from src.server.database import conversation as conv_db
 from src.server.database import user as user_db
 from src.server.database import workspace as ws_db
@@ -603,6 +604,7 @@ async def test_soft_deleted_workspace_returns_thread_only_shell_and_lists_collea
     )
 
     res = await threads_crud.list_threads(
+        principal=Principal(user_id="u-alice", auth="session"),
         workspace_id=ws_id,
         limit=20,
         offset=0,
@@ -610,7 +612,6 @@ async def test_soft_deleted_workspace_returns_thread_only_shell_and_lists_collea
         sort_order="desc",
         platform_prefix=None,
         archived=False,
-        x_user_id="u-alice",
     )
     assert res.total == 1
     assert res.threads[0].thread_id == thread_id

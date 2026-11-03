@@ -918,12 +918,9 @@ async def test_send_thread_message_rejects_mismatched_workspace_id(
 
     http_req = create_autospec(Request, instance=True)
     http_req.headers = {}
-    auth = create_autospec(threads_messaging.ChatRateLimited, instance=True)
-    auth.user_id = "u-internal-a"
-    auth.is_byok = True
-    auth.has_oauth = False
-    auth.access_tier = 1
-    auth.burst_slot_id = None
+    from src.server.dependencies.usage_limits import ChatAuthResult
+
+    auth = ChatAuthResult(user_id="u-internal-a", is_byok=True)
     chat_req = ChatRequest(
         messages=[{"role": "user", "content": "hi"}],
         workspace_id=ws_b,

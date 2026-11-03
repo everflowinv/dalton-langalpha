@@ -313,10 +313,15 @@ ALLOWED_HOOKS=(
   "payoff-assessment"
   # sync3 B5/D16①（上游 #655）：上游 release.py::_sources() 决定静态 prompt 的
   # 发布指纹（部署变化 → 旧线程下一轮 due/rebuild）。Dalton 的 data_map 经
-  # loader.py 的 data-map hook 渲染进 system.md.j2 / tool_guide.md.j2，其渲染
+  # loader.py 的 data-map 钩子渲染进 system.md.j2 / tool_guide.md.j2，其渲染
   # 输入（data_map 的 __init__/builder/health/sources.yaml）由此 hook 登记进
   # _sources()；运行时重新生成的 src/dalton/llm/openclaw_overlay.json 明确排除。
   "prompt-release-sources"
+  # sync3 B9（上游 #656 电脑 CLI token）的部署级开关
+  # dalton.computer_cli_tokens.enabled（默认 false）的三道拦截：cli_tokens.keep()
+  # 开头返回 False、CliTokenSweeper.start() 不启动循环且 sweep_once() 在
+  # _prune_calls()/claim_due() 之前返回 0、get_principal 的 lac1 分支 401。
+  "computer-cli-tokens-off"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

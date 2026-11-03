@@ -7,12 +7,15 @@ the automation files all write through it.
 """
 
 import uuid
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, create_autospec, patch
 
 import pytest
+from fastapi import Request
+from starlette.datastructures import Headers
 
 from src.server.database.home_workspace import get_home_workspace_id
 from src.server.database.workspace import HomeWorkspaceTaken
+from src.server.dependencies.principal import Principal
 from src.server.services.automations import lifecycle
 from src.server.services.automations.lifecycle import (
     AutomationRefusal,
@@ -21,6 +24,16 @@ from src.server.services.automations.lifecycle import (
     update_automation,
 )
 from src.server.models.automation import AutomationCreate
+
+
+def _stub_request() -> Request:
+    # DALTON-HOOK(automation-model): #656 switched the routes to
+    # principal-shaped params; these imports and this request stub serve the
+    # adapted call sites below.
+    req = create_autospec(Request, instance=True)
+    req.__len__.return_value = 1
+    req.headers = Headers({})
+    return req
 
 OWNER = "user-owner"
 OTHER = "user-other"
@@ -534,10 +547,14 @@ class TestAutomationModelUpdate:
         )
 
         req = AutomationUpdate.model_validate({"llm_model": None})
+        # DALTON-HOOK(automation-model): #656 made the route take a principal
+        # (WorkspaceSendPrincipal) instead of a bare user_id; a session
+        # principal carries the same owner.
         resp = await automations_app.update_automation(
             automation_id=uuid.UUID(AUTOMATION_ID),
             request=req,
-            user_id=OWNER,
+            principal=Principal(user_id=OWNER, auth="session"),
+            http_request=_stub_request(),
         )
 
         update_mock.assert_awaited_once()
@@ -591,10 +608,12 @@ class TestAutomationModelUpdate:
         )
 
         req = AutomationUpdate.model_validate({"name": "renamed"})
+        # DALTON-HOOK(automation-model): same principal-shaped call as above.
         resp = await automations_app.update_automation(
             automation_id=uuid.UUID(AUTOMATION_ID),
             request=req,
-            user_id=OWNER,
+            principal=Principal(user_id=OWNER, auth="session"),
+            http_request=_stub_request(),
         )
 
         update_mock.assert_awaited_once()

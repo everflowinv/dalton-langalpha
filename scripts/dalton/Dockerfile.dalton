@@ -16,7 +16,9 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 WORKDIR /app
 
 COPY pyproject.toml uv.lock README.md ./
-COPY libs/ptc-cli/ libs/ptc-cli/
+# sync3 B9: no COPY of libs/ptc-cli — Dalton does not ship the `la` CLI (the
+# feature is off; cli/ is neither built nor packaged, and computer_cli_tokens
+# never mint). The backend imports nothing from it; pnpm builds it in cli/.
 COPY libs/market-protocol/ libs/market-protocol/
 
 ARG INSTALL_OBSERVABILITY=false
@@ -63,8 +65,8 @@ RUN if [ -z "$BUILD_GIT_SHA" ] || [ "$BUILD_GIT_SHA" = "unknown" ]; then \
     fi \
     && printf '%s\n' "$BUILD_GIT_SHA" | cut -c1-8 > /app/.build_git_sha \
     && printf '%s\n' "$BUILD_GIT_DIRTY" > /app/.build_git_dirty \
-    && find server.py config.yaml agent_config.yaml agent_config.dalton.yaml alembic.ini \
-            config/dalton libs/ptc-cli libs/market-protocol src scripts migrations mcp_servers plugins workflows \
+    && find server.py config.yaml config.dalton.yaml agent_config.yaml agent_config.dalton.yaml alembic.ini \
+            config/dalton libs/market-protocol src scripts migrations mcp_servers plugins workflows \
             -type f ! -path '*/__pycache__/*' ! -path '*/.pytest_cache/*' ! -path '*/.ruff_cache/*' ! -name '*.pyc' ! -name '*.pyo' ! -name '.DS_Store' -print0 \
        | sort -z \
        | xargs -0 sha256sum > /app/.build_files.sha256

@@ -8,6 +8,14 @@ credentials:
 colleague_dispatch:
   enabled: false
 
+# 电脑 CLI token（上游 #656：`la` 在电脑沙箱里调用 API 用的 lac1.* token）。
+# 默认关闭。关闭时三处拦截（hook：computer-cli-tokens-off）：cli_tokens.keep()
+# 不写 token 文件、不写 computer_cli_tokens 行；CliTokenSweeper 不启动、
+# sweep_once 在 _prune_calls/claim_due 之前就返回；get_principal 的 lac1 分支
+# 直接 401。从开改成关时按运维约定跑一次 scripts/dalton/revoke_computer_cli_tokens.py。
+computer_cli_tokens:
+  enabled: false
+
 # 覆盖单元登记表（d023，行业层 P0）。默认关闭：关闭时工作区覆盖身份只走兼容
 # 规则（公司知识文档 → 隐式公司；Home → 无单元；其余 → 未分类），不读
 # dalton_coverage_units 表；打开后，绑定到工作区的 active 单元优先于兼容规则。

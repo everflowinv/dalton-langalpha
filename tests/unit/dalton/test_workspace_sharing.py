@@ -28,6 +28,7 @@ from src.server.app.threads import crud as threads_crud
 from src.server.app.workspace_files import _shared as ws_files_shared
 from src.server.app.workspace_files import crud as ws_files_crud
 from src.server.app.workspace_files import uploads as ws_files_uploads
+from src.server.dependencies.principal import Principal
 from src.server.services import workspace_files as ws_files_service
 from src.server.services import workspace_upload_pull as ws_upload_pull
 from src.server.database import computer as computer_db
@@ -718,7 +719,7 @@ class TestWebChannelEndpoints:
 
         with pytest.raises(HTTPException) as exc_threads:
             await threads_crud.list_threads(
-                x_user_id="u-chao",
+                principal=Principal(user_id="u-chao", auth="session"),
                 workspace_id=ws["workspace_id"],
                 limit=20,
                 offset=0,
