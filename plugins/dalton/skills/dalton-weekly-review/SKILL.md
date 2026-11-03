@@ -69,7 +69,7 @@ Workflow 不可用时：
    - 按 `.agents/skills/dalton-weekly-review/references/watch-rules.md` 检索并写 `dalton/research/weekly-<end>/watch-<TICKER>.md`。
 4. **阶段 4：汇总与 Conviction Call（`汇总与 call`）**：
    - **周报开头先写“市场状态”小段**：调用 `macro(route="market-regime", operation="snapshot")` 以及 `macro(route="market-regime", operation="crowding", top=5, order="high")`、`macro(route="market-regime", operation="crowding", top=5, order="low")`，在周会稿开头增加“市场状态”一小段，概述美股顶部/底部阶段与提醒、动量、A 股/港股/亚洲读数以及指数拥挤度最高/最低的前 5 个板块（标明 `as_of` 数据日期；若 `stale=true` 则注明）；
-   - 对 Core 中标记 `call_candidate: true` 的公司（最多 3 家）按 `.agents/skills/dalton-call/SKILL.md` 做证据门槛与三情景 IRR 核对，输出 `call-<TICKER>.md`（不过门槛即输出《门禁未通过声明》：缺口 + 已完成的赔率卡与三层保护）；
+   - 对 Core 中标记 `call_candidate: true` 的公司（最多 3 家）按 `.agents/skills/dalton-call/SKILL.md` 做六条证据门禁与 `thesis.underwriting` 赔率核对，输出 `call-<TICKER>.md`（不过门槛即输出《门禁未通过声明》：缺口 + 已完成的赔率卡与三层保护）；
    - 按 `.agents/skills/dalton-weekly-review/templates/weekly.md` 汇总全部材料、各公司本周 `verdicts.md` 与 `proposals/`，生成周会稿 `dalton/drafts/<end>-weekly.md`；**若本月触发了月度复盘（判断标准见下方"每月第一期周报附月度复盘"），本阶段负责把复盘一节追加到周会稿末尾，并单独写入归档文件 `dalton/drafts/<YYYY-MM>-monthly-review.md`**。
 
 ### 第 3 步：提案交办（`delegate_to_analyst`）与议程批注（`dalton_agenda_note`）
@@ -93,7 +93,7 @@ Workflow 完成后，研究总监在 Home 执行收尾动作：
 
 ## 每月第一期周报附月度复盘
 
-月度复盘挂在**每月第一期周报**上：设本期周报截止日 `end` 所在自然月的**上一个月**为 `<YYYY-MM>`（例如 `end` 为 `2026-11-06`，则 `<YYYY-MM>` 为 `2026-10`）。阶段 4（汇总与 call）先检查归档文件 `dalton/drafts/<YYYY-MM>-monthly-review.md`（在 Home 工作区外路径为 `../Home/dalton/drafts/<YYYY-MM>-monthly-review.md`）是否已存在：若不存在，则复盘 `<YYYY-MM>` 月，将复盘写入该归档文件，并作为 `## 月度复盘（<YYYY-MM>）` 一节追加在周会稿末尾（结构化字段上线前写在正文，不写新字段）：
+月度复盘挂在**每月第一期周报**上：设本期周报截止日 `end` 所在自然月的**上一个月**为 `<YYYY-MM>`（例如 `end` 为 `2026-11-06`，则 `<YYYY-MM>` 为 `2026-10`）。阶段 4（汇总与 call）先检查归档文件 `dalton/drafts/<YYYY-MM>-monthly-review.md`（在 Home 工作区外路径为 `../Home/dalton/drafts/<YYYY-MM>-monthly-review.md`）是否已存在：若不存在，则复盘 `<YYYY-MM>` 月，将复盘写入该归档文件，并作为 `## 月度复盘（<YYYY-MM>）` 一节追加在周会稿末尾（结合各公司 `thesis.underwriting`、`thesis.house_view` 与 `verdicts.md` 复盘，若产生对某公司 `thesis` 或 `lessons` 的修改建议则一并写入 `proposals/<TICKER>.json` 交办给对应工作区分析师）：
 
 - **复盘范围**：上月所有的 `stance`（方向）与行动分类变化，**加上长期处于观察（`watch` / 等价格 / 等证据）或 `neutral`（中性）、从未行动的候选**——长期不行动本身就是复盘对象。
 - **逐只对照投委会四问**（什么在改变客户行为和公司的经济性？为什么这个解释比竞争解释更可信？市场在哪个环节判断错了？看到什么我会认错〔双向：看到什么减仓或回补、看到什么加仓或加空〕？），逐只标出**错在哪一问**；四问都站得住的写“无错项”。

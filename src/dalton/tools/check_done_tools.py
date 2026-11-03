@@ -2480,6 +2480,68 @@ async def _check_verdicts_this_run(
     return rows, False
 
 
+_DOWNGRADED_ACTIONABILITY_VALUES = frozenset({"wait_price", "wait_evidence", "pass"})
+
+
+async def _gates_outcome_and_doc_this_run(
+    backend: Any,
+    gate: dict[str, Any],
+    params: dict[str, Any],
+    resolved: dict[str, str] | None,
+    since: datetime,
+) -> tuple[str, list[str], dict[str, Any] | None]:
+    """("failed" | "passed" | "absent", gaps, parsed_doc): THIS round's gate-result file.
+
+    本轮的标准（round 3 #1）：文件 mtime 在本轮窗口内（MTIME_TOLERANCE_SECONDS）
+    且 ``as_of`` 与参数一致；不满足任一就不是本轮的门禁结果（"absent"），读取
+    或解析失败是 gap（fail-closed，绝不默默放过）。"""
+    template = gate.get("gates_file")
+    if not template:
+        return "absent", [], None
+    path = render_template(template, params)
+    path = (resolved or {}).get(path, path)
+    status, text = await _read_text_diagnosed(backend, path)
+    if status == "error":
+        return "absent", [f"门禁结果文件读取出错（{path}），无法判定门禁结果，请重试。"], None
+    if status == "missing" or text is None:
+        return "absent", [], None
+    info = await _file_info(backend, path)
+    if info.mtime_epoch is None:
+        return "absent", [f"门禁结果文件 {path} 的修改时间无法读取，无法确认是本轮结果，请重试。"], None
+    if info.mtime_epoch < int(since.timestamp()) - MTIME_TOLERANCE_SECONDS:
+        return "absent", [], None
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        return (
+            "absent",
+            [
+                f"门禁结果文件不可解析（{path}），需要重写为合法 JSON：门禁未过写 "
+                '{"passed": false, "failed_gates": [{"gate": 1, "reason": "…"}], "as_of": "YYYY-MM-DD"}'
+                '（gate 取整数 1–6），门禁全过写 {"passed": true, "failed_gates": [], "as_of": "YYYY-MM-DD"}'
+            ],
+            None,
+        )
+    if not isinstance(doc, dict) or str(doc.get("as_of") or "") != str(
+        params.get("as_of") or ""
+    ):
+        recorded_as_of = doc.get("as_of") if isinstance(doc, dict) else None
+        return (
+            "absent",
+            [
+                f"门禁结果文件 {path} 的 as_of（{recorded_as_of!r}）与参数 as_of 不一致，"
+                "不能当作本轮结果；下一步：按本轮参数重写该文件。"
+            ],
+            None,
+        )
+    if doc.get("passed") is True:
+        return "passed", [], doc
+    gates_error = _gates_file_error(doc)
+    if gates_error:
+        return "absent", [f"门禁结果文件不合契约（{path}）：{gates_error}。"], None
+    return "failed", [], doc
+
+
 async def _gates_outcome_this_run(
     backend: Any,
     gate: dict[str, Any],
@@ -2487,48 +2549,36 @@ async def _gates_outcome_this_run(
     resolved: dict[str, str] | None,
     since: datetime,
 ) -> tuple[str, list[str]]:
-    """("failed" | "passed" | "absent", gaps): THIS round's gate-result file.
+    """("failed" | "passed" | "absent", gaps): THIS round's gate-result file."""
+    outcome, gaps, _ = await _gates_outcome_and_doc_this_run(
+        backend, gate, params, resolved, since
+    )
+    return outcome, gaps
 
-    本轮的标准（round 3 #1）：文件 mtime 在本轮窗口内（MTIME_TOLERANCE_SECONDS）
-    且 ``as_of`` 与参数一致；不满足任一就不是本轮的门禁结果（"absent"），读取
-    或解析失败是 gap（fail-closed，绝不默默放过）。"""
-    template = gate.get("gates_file")
-    if not template:
-        return "absent", []
-    path = render_template(template, params)
-    path = (resolved or {}).get(path, path)
-    status, text = await _read_text_diagnosed(backend, path)
-    if status == "error":
-        return "absent", [f"门禁结果文件读取出错（{path}），无法判定门禁结果，请重试。"]
-    if status == "missing" or text is None:
-        return "absent", []
-    info = await _file_info(backend, path)
-    if info.mtime_epoch is None:
-        return "absent", [f"门禁结果文件 {path} 的修改时间无法读取，无法确认是本轮结果，请重试。"]
-    if info.mtime_epoch < int(since.timestamp()) - MTIME_TOLERANCE_SECONDS:
-        return "absent", []
+
+async def _is_v1_thesis_without_underwriting(workspace_id: str | None) -> bool:
+    """True only when ``dalton_knowledge_versions`` holds a valid pure v1
+    ``thesis`` (no file fallback; ``_resolve_schema_version`` must resolve to 1
+    with no v2 fields)."""
+    if not workspace_id:
+        return False
     try:
-        doc = json.loads(text)
-    except ValueError:
-        return "absent", [
-            f"门禁结果文件不可解析（{path}），需要重写为合法 JSON：门禁未过写 "
-            '{"passed": false, "failed_gates": [{"gate": 1, "reason": "…"}], "as_of": "YYYY-MM-DD"}'
-            '（gate 取整数 1–6），门禁全过写 {"passed": true, "failed_gates": [], "as_of": "YYYY-MM-DD"}'
-        ]
-    if not isinstance(doc, dict) or str(doc.get("as_of") or "") != str(
-        params.get("as_of") or ""
-    ):
-        recorded_as_of = doc.get("as_of") if isinstance(doc, dict) else None
-        return "absent", [
-            f"门禁结果文件 {path} 的 as_of（{recorded_as_of!r}）与参数 as_of 不一致，"
-            "不能当作本轮结果；下一步：按本轮参数重写该文件。"
-        ]
-    if doc.get("passed") is True:
-        return "passed", []
-    gates_error = _gates_file_error(doc)
-    if gates_error:
-        return "absent", [f"门禁结果文件不合契约（{path}）：{gates_error}。"]
-    return "failed", []
+        from src.dalton.database import knowledge as db_knowledge
+        from src.dalton.knowledge.ops import _resolve_schema_version
+
+        row = await db_knowledge.latest_valid_version(workspace_id, "thesis")
+    except Exception:
+        return False
+    if not isinstance(row, dict):
+        return False
+    doc = row.get("content")
+    if not isinstance(doc, dict) or not doc:
+        return False
+    if not isinstance(doc.get("house_view"), dict) or not doc.get("house_view"):
+        return False
+    if "underwriting" in doc and doc.get("underwriting") is not None:
+        return False
+    return _resolve_schema_version("thesis", doc) == 1
 
 
 async def _check_gated_draft(
@@ -2547,13 +2597,17 @@ async def _check_gated_draft(
     matter what drafts are lying around; ``passed=true`` or no fresh file
     means the draft branch, which demands a draft written THIS round (mtime in
     the window). The failure branch owes this run's verdict — any of the five
-    words, chosen by the argument's actual change — and, when that word is
-    not NO_CHANGE, a thesis update behind it. Neither signature readable is
-    无法判定, never a pass. Returns (missing, warnings)."""
+    words, chosen by the argument's actual change — and a thesis update behind
+    it (``knowledge_docs_any`` when thesis is v2, or
+    ``knowledge_docs_any_unless_no_change`` when the word is not NO_CHANGE; an
+    existing pure v1 thesis in DB without ``underwriting`` is not forced to
+    upgrade to v2 when a gate fails and the verdict is NO_CHANGE, provided the
+    gate-result file records ``actionability_after``). Neither signature readable
+    is 无法判定, never a pass. Returns (missing, warnings)."""
     draft_template = render_template(gate["draft"], params)
     draft = (resolved or {}).get(draft_template, draft_template)
 
-    outcome, gates_gaps = await _gates_outcome_this_run(
+    outcome, gates_gaps, gates_doc = await _gates_outcome_and_doc_this_run(
         backend, gate, params, resolved, since
     )
     if gates_gaps:
@@ -2595,12 +2649,67 @@ async def _check_gated_draft(
         if not rows:
             return [
                 (
-                    f"本轮门禁结果为未通过，但本轮没有五词结论（{'/'.join(kinds)}）的 verdict"
-                    "；下一步：按论点的实际变化调用 knowledge_append_verdict 写其中之一"
-                    "（论点确实没有变化才写 NO_CHANGE）；已完成的赔率判断写在给 PM 的说明里。"
+                    f"本轮门禁结果为未通过，但本轮没有五词结论（{'/'.join(f'`{k}`' for k in kinds)}）的 `verdict`"
+                    "；下一步：按论点的实际变化调用 `knowledge_append_verdict` 写其中之一"
+                    "（论点确实没有变化才写 `NO_CHANGE`）；已完成的赔率判断写在给 PM 的说明里。"
                 )
             ], warnings
         missing: list[str] = []
+        req_docs = list(gate.get("knowledge_docs_any") or [])
+        if req_docs:
+            try:
+                found = await _check_knowledge_versions(workspace_id, req_docs, since)
+            except Exception as error:
+                logger.warning(
+                    "dalton_check_done gate knowledge query failed", error=str(error)
+                )
+                missing.append(
+                    (
+                        "门禁未过分支的知识层更新无法核对（数据库查询失败），请重试；"
+                        f"待核对：{'、'.join(req_docs)}。"
+                    )
+                )
+                found = None
+            if found is not None and not any(found.get(doc) for doc in req_docs):
+                is_v1_no_change = (
+                    req_docs == ["thesis"]
+                    and all(str(row.get("word")) == "NO_CHANGE" for row in rows)
+                    and await _is_v1_thesis_without_underwriting(workspace_id)
+                )
+                if is_v1_no_change:
+                    act_after = (
+                        gates_doc.get("actionability_after")
+                        if isinstance(gates_doc, dict)
+                        else None
+                    )
+                    if (
+                        not isinstance(act_after, str)
+                        or act_after not in _DOWNGRADED_ACTIONABILITY_VALUES
+                    ):
+                        gates_template = gate.get("gates_file") or ""
+                        gates_path = render_template(gates_template, params)
+                        gates_path = (resolved or {}).get(gates_path, gates_path)
+                        missing.append(
+                            (
+                                f"本轮门禁结果为未通过且工作区 `thesis` 仍为第 1 版（`verdict=\"NO_CHANGE\"`），"
+                                f"门禁结果文件（{gates_path}）缺少合法的降级行动建议 "
+                                f"`actionability_after`（当前为 {act_after!r}，须取 `thesis` schema 的 "
+                                "`actionability` 降级枚举值 `wait_price`、`wait_evidence` 或 `pass`）；"
+                                "下一步：在门禁结果文件中补齐 `actionability_after`，"
+                                "并把降级结论与赔率卡写在报告正文里。"
+                            )
+                        )
+                else:
+                    missing.append(
+                        (
+                            f"本轮门禁结果为未通过，但知识层 {'、'.join(req_docs)} "
+                            f"自 {since.date().isoformat()} 起均无 source=tool 新版本（至少需要其一）；"
+                            "下一步：v2 工作区调用 `knowledge_update` 将降级后的 `house_view.actionability` "
+                            "与已完成的 `underwriting` 赔率卡写入 `thesis`；若工作区 `thesis` 仍为第 1 版且 `verdict` 非 `NO_CHANGE`，"
+                            "不要单独写 v2 字段，在门禁结果文件写明 `actionability_after`、把降级结论与赔率卡写在报告正文里，"
+                            "并调用 `knowledge_update` 更新 `thesis` 的第 1 版字段（如 `pillars`、`evidence`、`house_view.summary`）。"
+                        )
+                    )
         cond_docs = list(gate.get("knowledge_docs_any_unless_no_change") or [])
         if cond_docs and any(str(row.get("word")) != "NO_CHANGE" for row in rows):
             missing.extend(

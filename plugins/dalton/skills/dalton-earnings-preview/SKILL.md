@@ -12,12 +12,12 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ## 目标
 
-在公司财报发布前三个交易日（由 PS.7 的 `tm3` 自动任务触发，或由分析师手动触发），依次回答三个核心问题：
+在公司财报发布前三个交易日（由 `dalton-earnings-calendar` 建立的 `tm3` 自动任务触发，或由分析师手动触发），依次回答三个核心问题：
 1. **投资者真正的预期门槛（bar / bogey）是多少，高频数据指向什么方向？**
 2. **本次财报对当季业绩与下季/全年指引看什么，EPS 质量与管理层指引隐含门槛在哪？**
 3. **当前多空核心分歧（debate）共享哪些前提与因果机制，本次财报能验证什么？**
 
-并将本次要验证的判断用 `scripts/predictions.py` 写成结构化 `predictions.json`，供财报发布后快讯（PS.9 `dalton-earnings-flash`）与次日深度链（PS.9 `dalton-earnings-deep`）逐条对账。
+并将本次要验证的判断用 `scripts/predictions.py` 写成结构化 `predictions.json`，供财报发布后快讯（`dalton-earnings-flash`）与次日深度链（`dalton-earnings-deep`）逐条对账。
 
 ---
 
@@ -81,10 +81,10 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 3. **独立性与来源链去重**：
    - 称为“共享 narrative”至少需要 **≥2 个独立原始来源**支持；同一份卖方报告被邮件、TMTB、FUNDA AI、X 转述只算 **1 条来源链**；
    - 仅单一来源支持的标“**单源观点**”；点赞量、转发量不证明机构共识。
-4. **可观察验证点与电话会必听问题**：
+4. **可观察验证点、电话会必听问题与事前冻结（`frozen_pre_event=true`）**：
    - 每个核心 debate 必须绑定一个**本次财报可观察的验证点**（及管理层电话会最需关注的 3–4 个核心问题：为什么重要、什么回答证实、什么回答证伪、需要警惕的回避措辞）；
    - 只能长期验证、本季财报无法证伪的条件单独列出；
-   - 对照工作区 `debate.md`，写明本轮分歧与知识层现有 debate 的对应关系。
+   - 对照工作区 `debate.md`，写明本轮分歧与知识层现有 debate 的对应关系，并在收尾（Step 8 第 5 项）将本次财报前的预期门槛写入 `debate` 的 `debates[].expectations[]` 数组中 `frozen_pre_event=true` 的事前冻结条目（含 `metric`、`period`、`unit`、`street`/`buyside`/`house` 各带 `value`、`basis`、`as_of`、`sources`，以及 `event_id`、官方财报发布时刻 `t0`、严格早于 `t0` 的三个时间戳 `published_at`、`acquired_at`、`frozen_at` 与 `reconstructed: false`；完整样例见 `.agents/skills/dalton-knowledge/references/structured-write-example.md`），防止财报后用事后评论倒推事前 bogey。
 
 ### Step 6：情景与反应框架
 
@@ -133,8 +133,8 @@ python3 .agents/skills/dalton-earnings-preview/scripts/predictions.py validate \
 4. **第 2 轮语言审查（终稿）**：自检与内容修订全部完成后、调用 `check_draft` 之前，调用 `check_language(round=2)` 并按清单完成终稿语言修改；草稿有改动就再调用一次 `check_language(round=2)` 对终稿复核（记录追加在同一 `<草稿>.language.json`），使最后一条第 2 轮记录绑定终稿哈希。本次产出中其他给人读的 .md 笔记（research/ 检索与对账笔记等）同样各审两轮：第 1 轮审完按清单改，第 2 轮复核，改过就再跑一次 round=2 确认；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/、知识层渲染文件与 .audit/.annotated/.language 侧车不审。
 5. **知识层写入与 `dalton-agenda` 收尾三步**：
    - 调用 `knowledge_update(doc="drivers", ...)` 追加本轮取得的高频指标最新读数；
-   - 调用 `knowledge_update(doc="debate", ...)` 标注本次财报可检验的 debate；
-   - 调用 `knowledge_append_verdict` 记录事件五词结论（`trigger.kind="earnings"`，`trigger.ref` 填 `<dalton_wake>` 的 `tm3` 信号 id 或 `"manual"`；通常为 `NO_CHANGE`，若前瞻研究已改变判断则如实填写），并在同次调用的 `agenda_ops` 中加入“财报发布当天对照 `research/<D>-preview-<季度>/predictions.json` 逐条核对”的验证项；
+   - **在 T−3 将预期门槛写入 `debate` 的事前冻结条目**：调用 `knowledge_update(doc="debate", ...)` 标注本次财报可检验的 debate，并在对应分歧的 `debates[].expectations[]` 中将财报前锁定的预期门槛写为 `frozen_pre_event: true` 条目——带齐 `metric`、`period`、`unit`、`street`/`buyside`/`house`（非空一侧必填 `value`、`basis`、`as_of`、`sources`）、`event_id`（如 `"META_FY26Q3_EARNINGS"`）、官方财报发布时刻 `t0`（ISO 8601 时间戳）、**三个均严格早于 `t0`（`< t0`）的时间戳** `published_at`（预期来源发布时间）、`acquired_at`（我方检索获取时间）、`frozen_at`（本次前瞻冻结时间，即 `as-of`）以及 `reconstructed: false`（样例见 `.agents/skills/dalton-knowledge/references/structured-write-example.md`）。若工作区的 `thesis` 已是 v2（含 `underwriting`），可同步更新 `thesis.market_view.observations`（每项含 `claim`、`who`、`as_of`、`sources`、`confidence`）；**若工作区的 `thesis` 还是 v1（没有 `underwriting`），收尾不要往 `thesis` 里单独加 `market_view.observations`**（一旦写入任何 v2 字段，整份 `thesis` 就会按 v2 校验并要求同时补齐 `underwriting` 与 `house_view` 的全部 v2 字段）；
+   - 调用 `knowledge_append_verdict` 记录事件五词结论（`trigger.kind="earnings"`，`trigger.ref` 填 `<dalton_wake>` 的 `tm3` 信号 id 或 `"manual"`；通常为 `NO_CHANGE`，若前瞻研究已改变判断则如实填写），并在同次调用的 `agenda_ops` 中加入“财报发布当天对照 `debate` 中 `frozen_pre_event=true` 冻结门槛与 `research/<D>-preview-<季度>/predictions.json` 逐条核对”的验证项；
    - 调用 `check_draft(draft_path="drafts/<D>-preview-<季度>.md")` 生成数字核验反馈；PM 要求正式发布时调用 `publish_report(draft_path="drafts/<D>-preview-<季度>.md", title="<公司名>（<TICKER>）<季度> 财报前瞻", kind="earnings_preview", slug="<ticker-lower>-preview-<季度小写>-<D>")`；
    - **推送稿两轮语言审查与原样回复**：按 `.agents/skills/dalton-conventions/SKILL.md` §8 将推送正文写入 `research/push/<D>-earnings-preview-<季度>.md`，完成两轮 `check_language` 后以该文件全文逐字作为最后回复（外部通知由 Dalton 通知模块按用户的飞书开关统一处理）。
 
