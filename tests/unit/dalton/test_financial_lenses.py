@@ -549,27 +549,105 @@ class TestWorkflowsAndHelperScripts:
         assert meta.name == wf_name
         assert meta.description
 
-    def test_scenario_irr_ps15_sample(self) -> None:
+    def test_scenario_math_cli_underwriting_sample(self) -> None:
+        thesis_sample = {
+            "schema_version": 2,
+            "house_view": {"stance": "long", "horizon_months": 24},
+            "underwriting": {
+                "scenario_version": 1,
+                "anchor": {
+                    "price": 100.0,
+                    "currency": "USD",
+                    "price_at": "2026-10-18",
+                },
+                "states": [
+                    {
+                        "name": "bear",
+                        "calc": {
+                            "method": "reference",
+                            "ref": "E-20261018-01",
+                            "price_range": {"lo": 78.0, "hi": 82.0},
+                        },
+                        "cash_return_per_share": 0.0,
+                    },
+                    {
+                        "name": "base",
+                        "calc": {
+                            "method": "reference",
+                            "ref": "E-20261018-01",
+                            "price_range": {"lo": 125.0, "hi": 135.0},
+                        },
+                        "cash_return_per_share": 0.0,
+                    },
+                    {
+                        "name": "bull",
+                        "calc": {
+                            "method": "reference",
+                            "ref": "E-20261018-01",
+                            "price_range": {"lo": 165.0, "hi": 175.0},
+                        },
+                        "cash_return_per_share": 0.0,
+                    },
+                ],
+            },
+        }
         proc = subprocess.run(
             [
                 sys.executable,
-                str(DALTON_PLUGIN_DIR / "skills" / "dalton-call" / "scripts" / "scenario_irr.py"),
-                "--current",
-                "100",
-                "--years",
-                "2",
-                "--prices",
-                "80/130/170",
-                "--probs",
-                "0.25/0.5/0.25",
-                "--yield",
-                "0",
+                "-m",
+                "src.dalton.knowledge.scenario_math",
+                "--thesis",
+                json.dumps(thesis_sample),
             ],
+            cwd=str(REPO_ROOT),
             capture_output=True,
             text=True,
             check=True,
         )
-        assert "14.0%" in proc.stdout
+        out = json.loads(proc.stdout)
+        assert out["ok"] is True
+        assert out["hurdles"]["H_L"] == pytest.approx(132.25)
+
+    def test_bb_check_debate_count_2_to_3(self) -> None:
+        bb_check = _load_script_module(
+            DALTON_PLUGIN_DIR / "skills" / "dalton-bullbear" / "scripts" / "bb_check.py",
+            "bb_check",
+        )
+
+        def _make_doc(n_debates: int) -> str:
+            debates_md = "\n".join(
+                f"### Debate {i}：问题 {i}（短名{i}）\n"
+                "- **分歧**：可证伪问题\n"
+                "- **Bull 怎么看**：\n  - 论点 A [引用1]\n  - 比共识乐观在哪：B\n"
+                "- **Bear 怎么看**：\n  - 论点 C [引用1]\n  - 比共识悲观在哪：D\n"
+                "- **双方最强反驳**：\n  - Bull 对 Bear：E\n  - Bear 对 Bull：F\n"
+                "- **我的判断**：\n  - 立场与置信度：偏 Bull，中\n  - 依赖假设：[假设] X\n  - 改判条件：Y\n"
+                for i in range(1, n_debates + 1)
+            )
+            return (
+                "# 测试BullBear\n"
+                "## 一、股东回报\n- 回报要点 [回报引用1]\n"
+                "## 二、市场共识：现在 price in 的是什么\n"
+                "- **看多的人默认成立**：\n  - 条目一 [引用1]\n  - 条目二 [引用1]\n"
+                "- **看空的人默认成立**：\n  - 条目一 [引用1]\n  - 条目二 [引用1]\n"
+                "- **两边都不争的**：\n  - 条目一 [引用1]\n"
+                f"## 三、Top N debates：真正有分歧的地方\n{debates_md}"
+                "## 四、Earnings revision map\n- 变量 → Debate 1 短名1 → 敏感度\n"
+                "## 五、Catalyst & KPI\n- 催化剂\n"
+                "## 六、财务体检\n- **结论**：资产负债表没有触发提示项\n"
+                "## 七、Variant perception\n- 预期差\n"
+                "## 八、一句话\nThe stock works if A (debate 1 短名1).\n"
+                "## 九、股东回报附录\n- 附录 [回报引用1]\n"
+                "## 引用\n"
+                "[引用1]: evidence:E-20261023-01 （行情）\n"
+                "[回报引用1]: evidence:E-20261023-02 （回报）\n"
+            )
+
+        for valid_n in (2, 3):
+            assert bb_check.check("t", _make_doc(valid_n)) == []
+        for invalid_n in (1, 4, 5):
+            probs = bb_check.check("t", _make_doc(invalid_n))
+            assert any("应为 2 至 3 条（禁止硬凑）" in p for p in probs)
 
     def test_trading_days_nyse(self) -> None:
         proc = subprocess.run(

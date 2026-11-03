@@ -2834,13 +2834,23 @@ def _patch_run_start(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _gates_entry(
-    *, passed: bool = False, failed: list[dict[str, Any]] | None = None
+    *,
+    passed: bool = False,
+    failed: list[dict[str, Any]] | None = None,
+    actionability_after: str | None = None,
 ) -> dict[str, str]:
     if failed is None:
         failed = [] if passed else [{"gate": 3, "reason": "Gate 3 驱动变量缺数字化预期差"}]
+    payload: dict[str, Any] = {
+        "passed": passed,
+        "failed_gates": failed,
+        "as_of": "2026-10-23",
+    }
+    if actionability_after is not None:
+        payload["actionability_after"] = actionability_after
     return {
         GATES_FILE: json.dumps(
-            {"passed": passed, "failed_gates": failed, "as_of": "2026-10-23"},
+            payload,
             ensure_ascii=False,
         )
     }
@@ -2856,11 +2866,8 @@ async def test_call_gate_failed_round_completes_with_gates_file_and_verdict(
     verdict；NO_CHANGE 只是论点确实无变化时的选择。"""
     for word in ("NO_CHANGE", "THESIS_WEAKENED", "THESIS_BROKEN", "NEW_THESIS"):
         _patch_verdicts(monkeypatch, [_verdict_row(word)])
-        if word == "NO_CHANGE":
-            _patch_knowledge(monkeypatch, [])
-        else:
-            # 非 NO_CHANGE 的结论要求 thesis 本轮有更新。
-            _patch_knowledge(monkeypatch, ["thesis"])
+        # 门禁未过分支无论五词结论是否为 NO_CHANGE，都必须在本轮更新 thesis（降级 actionability + underwriting 赔率卡）。
+        _patch_knowledge(monkeypatch, ["thesis"])
         done = await run_check_done(
             workflow="dalton-call", params=CALL_PARAMS,
             backend=_make_backend(_gates_entry()), workspace_id=WS,
@@ -2956,6 +2963,7 @@ async def test_call_gate_failed_ignores_last_rounds_verdict(
     assert any("本轮门禁结果为未通过" in m and "本轮没有五词结论" in m for m in result["missing"])
 
     _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", run_id="run-now")])
+    _patch_knowledge(monkeypatch, ["thesis"])
     result = await run_check_done(
         workflow="dalton-call", params=CALL_PARAMS,
         backend=_make_backend(_gates_entry()), workspace_id=WS,
@@ -2971,24 +2979,157 @@ async def test_call_gate_failed_non_no_change_verdict_requires_thesis_update(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_run_start(monkeypatch)
-    """结论不是 NO_CHANGE 就是宣告论点变化：thesis 必须在本轮有更新。"""
+    """门禁未过分支（无论 NO_CHANGE 还是非 NO_CHANGE）：thesis 必须在本轮有更新（写入降级后的 actionability 与 underwriting 赔率卡）。"""
+    for word in ("NO_CHANGE", "THESIS_WEAKENED"):
+        _patch_verdicts(monkeypatch, [_verdict_row(word, run_id="run-now")])
+        _patch_knowledge(monkeypatch, [])
+        result = await run_check_done(
+            workflow="dalton-call", params=CALL_PARAMS,
+            backend=_make_backend(_gates_entry()), workspace_id=WS,
+            conversation_run_id="run-now",
+        )
+        assert result["done"] is False
+        assert any("thesis" in m for m in result["missing"])
+
+        _patch_knowledge(monkeypatch, ["thesis"])
+        result = await run_check_done(
+            workflow="dalton-call", params=CALL_PARAMS,
+            backend=_make_backend(_gates_entry()), workspace_id=WS,
+            conversation_run_id="run-now",
+        )
+        assert result["done"] is True, result["missing"]
+
+
+@pytest.mark.asyncio
+async def test_call_gate_failed_accepts_v1_thesis_without_v2_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """工作区数据库里存量 thesis 仍是纯第 1 版（_resolve_schema_version==1 且不含 v2 字段）时，
+    门禁未过、五词结论为 NO_CHANGE 且门禁结果文件写明合法的 actionability_after 时不强制升到 v2；
+    缺 actionability_after、取值非法、混入 v2 字段、空对象 {}、或数据库无有效 thesis 时均不豁免。"""
+    from src.dalton.database import knowledge as db_knowledge
+
+    _patch_run_start(monkeypatch)
+    real_latest_valid = db_knowledge.latest_valid_version
+    v1_thesis_row = {
+        "version_no": 1,
+        "schema_valid": True,
+        "content": {
+            "schema_version": 1,
+            "ticker": "META",
+            "as_of": "2026-10-01",
+            "house_view": {"stance": "long", "conviction": "medium", "summary": "v1 存量观点"},
+        },
+    }
+    monkeypatch.setattr(
+        db_knowledge,
+        "latest_valid_version",
+        create_autospec(real_latest_valid, return_value=v1_thesis_row),
+    )
+
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", run_id="run-now")])
+    _patch_knowledge(monkeypatch, [])
+    # 1) 纯 v1 + NO_CHANGE + 合法 actionability_after -> 豁免成立
+    no_change_res = await run_check_done(
+        workflow="dalton-call",
+        params=CALL_PARAMS,
+        backend=_make_backend(_gates_entry(actionability_after="wait_evidence")),
+        workspace_id=WS,
+        conversation_run_id="run-now",
+    )
+    assert no_change_res["done"] is True, no_change_res["missing"]
+
+    # 2) 纯 v1 + NO_CHANGE 但门禁结果文件缺 actionability_after 或取值非法 -> 拒绝
+    for bad_after in (None, "act_now", "hold"):
+        bad_after_res = await run_check_done(
+            workflow="dalton-call",
+            params=CALL_PARAMS,
+            backend=_make_backend(_gates_entry(actionability_after=bad_after)),
+            workspace_id=WS,
+            conversation_run_id="run-now",
+        )
+        assert bad_after_res["done"] is False
+        assert any("actionability_after" in m for m in bad_after_res["missing"])
+
+    # 3) 非 NO_CHANGE 时，即使存量是纯 v1 且写了 actionability_after，也必须更新 thesis
     _patch_verdicts(monkeypatch, [_verdict_row("THESIS_WEAKENED", run_id="run-now")])
     _patch_knowledge(monkeypatch, [])
-    result = await run_check_done(
-        workflow="dalton-call", params=CALL_PARAMS,
-        backend=_make_backend(_gates_entry()), workspace_id=WS,
+    weakened_res = await run_check_done(
+        workflow="dalton-call",
+        params=CALL_PARAMS,
+        backend=_make_backend(_gates_entry(actionability_after="wait_evidence")),
+        workspace_id=WS,
         conversation_run_id="run-now",
     )
-    assert result["done"] is False
-    assert any("THESIS_WEAKENED" in m and "thesis" in m for m in result["missing"])
+    assert weakened_res["done"] is False
+    assert any("thesis" in m for m in weakened_res["missing"])
 
-    _patch_knowledge(monkeypatch, ["thesis"])
-    result = await run_check_done(
-        workflow="dalton-call", params=CALL_PARAMS,
-        backend=_make_backend(_gates_entry()), workspace_id=WS,
+    # 4) 空对象 {}、混入 house_view.actionability 的文档、以及 v2 文档均不豁免
+    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", run_id="run-now")])
+    for non_v1_content in (
+        {},
+        {
+            "schema_version": 1,
+            "ticker": "META",
+            "as_of": "2026-10-01",
+            "house_view": {
+                "stance": "long",
+                "conviction": "medium",
+                "actionability": "wait_evidence",
+                "summary": "混入 v2 字段",
+            },
+        },
+        {
+            "schema_version": 2,
+            "ticker": "META",
+            "as_of": "2026-10-01",
+            "house_view": {"stance": "long", "conviction": "medium", "summary": "v2 观点"},
+            "underwriting": {"scenario_version": 1},
+        },
+    ):
+        monkeypatch.setattr(
+            db_knowledge,
+            "latest_valid_version",
+            create_autospec(
+                real_latest_valid,
+                return_value={"version_no": 1, "schema_valid": True, "content": non_v1_content},
+            ),
+        )
+        non_v1_res = await run_check_done(
+            workflow="dalton-call",
+            params=CALL_PARAMS,
+            backend=_make_backend(
+                {
+                    **_gates_entry(actionability_after="wait_evidence"),
+                    "data/thesis.json": json.dumps(non_v1_content, ensure_ascii=False),
+                }
+            ),
+            workspace_id=WS,
+            conversation_run_id="run-now",
+        )
+        assert non_v1_res["done"] is False
+        assert any("thesis" in m for m in non_v1_res["missing"])
+
+    # 5) 数据库里没有有效 thesis 时（即使磁盘上有 data/thesis.json），也不回退读文件豁免
+    monkeypatch.setattr(
+        db_knowledge,
+        "latest_valid_version",
+        create_autospec(real_latest_valid, return_value=None),
+    )
+    no_db_res = await run_check_done(
+        workflow="dalton-call",
+        params=CALL_PARAMS,
+        backend=_make_backend(
+            {
+                **_gates_entry(actionability_after="wait_evidence"),
+                "data/thesis.json": json.dumps(v1_thesis_row["content"], ensure_ascii=False),
+            }
+        ),
+        workspace_id=WS,
         conversation_run_id="run-now",
     )
-    assert result["done"] is True, result["missing"]
+    assert no_db_res["done"] is False
+    assert any("thesis" in m for m in no_db_res["missing"])
 
 
 @pytest.mark.asyncio
