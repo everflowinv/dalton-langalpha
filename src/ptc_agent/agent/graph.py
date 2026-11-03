@@ -241,6 +241,7 @@ async def build_ptc_graph_with_session(
     workspace_owner_id: str | None = None,
     tail_turn_no_new_work: bool = False,
     reached_computers: set[str] | None = None,
+    claude_code_launcher: Any | None = None,
 ) -> Any:
     """Build a BackgroundSubagentOrchestrator from a pre-acquired session (WorkspaceManager path).
 
@@ -262,7 +263,8 @@ async def build_ptc_graph_with_session(
     a build without one never trims. ``cancel_notices`` tells the agent of
     the user's cancels of its wakeups; a build without one tells it of none.
     ``reached_computers`` collects the user's other computers a Chief of Staff
-    turn ran calls on, for the turn's end to back up.
+    turn ran calls on, for the turn's end to back up. ``claude_code_launcher``
+    says where a Claude Code turn's CLI runs (``PTCAgent.create_agent``).
     """
     mcp_registry = (
         tool_view.mcp_registry if tool_view is not None else session.mcp_registry
@@ -378,6 +380,7 @@ async def build_ptc_graph_with_session(
             else {}
         ),
         computers=computers,
+        claude_code_launcher=claude_code_launcher,
     )
 
     logger.debug(

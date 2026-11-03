@@ -47,9 +47,11 @@ def test_dalton_overlay_keeps_the_claude_code_runtime_flag_dark(dalton_overlay):
 
 
 def test_the_runtime_is_unavailable_under_the_dalton_overlay(dalton_overlay):
-    # No patch on runtime_available: every input it reads is the real one, and
-    # the overlay's flag is the first to fail.
-    assert claude_code.runtime_available() is False
+    # No patch on rows_available: every input it reads is the real one, and
+    # the overlay's flag is the first to fail. (#652 split the old
+    # runtime_available into rows_available/backend_available; rows_available
+    # is the one every offering reads.)
+    assert claude_code.rows_available() is False
 
 
 def test_no_claude_code_rows_are_listed_for_dalton_users(dalton_overlay):
@@ -76,7 +78,7 @@ def test_without_the_overlay_the_runtime_still_needs_an_operator_opt_in(monkeypa
     monkeypatch.delenv("APP_ENV", raising=False)
     clear_config_cache()
     try:
-        assert claude_code.runtime_available() is False
+        assert claude_code.rows_available() is False
     finally:
         clear_config_cache()
 
