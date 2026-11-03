@@ -1569,6 +1569,18 @@ async def _check_closing(
                 resolved=resolved_map,
             )
         )
+
+    mirror_rule = closing.get("earnings_calendar_mirror")
+    if mirror_rule:
+        missing.extend(
+            await _check_earnings_calendar_mirror(
+                backend, mirror_rule, params, user_id, since, since_label
+            )
+        )
+
+    signal_rule = closing.get("calendar_wake_signal")
+    if signal_rule:
+        missing.extend(await _check_calendar_wake_signal(signal_rule, user_id))
     return missing, warnings, since_label
 
 
@@ -2676,6 +2688,169 @@ async def _check_published_or_awaiting(
             f"既没有 published/ 副本 {published}，也没有本工作区 draft_path={draft} 的 "
             "awaiting_pm 发布请求；下一步：调用 publish_report 提交发布，或按其返回处理"
             "（audit_failed / review_revise 修稿重提），不得汇报发布完成。"
+        )
+    ]
+
+
+def _as_utc(value: Any) -> datetime | None:
+    """A DB/API timestamp as tz-aware UTC, or None when it isn't one."""
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+async def _check_earnings_calendar_mirror(
+    backend: Any,
+    rule: dict[str, Any],
+    params: dict[str, Any],
+    user_id: str | None,
+    since: datetime,
+    since_label: str,
+) -> list[str]:
+    """The Home ledger must be mirrored THIS round and the mirror must still
+    match the file on disk.
+
+    The mirror row keeps the ledger as jsonb (key order not preserved) and
+    ``validate_earnings_calendar_ledger`` reorders keys, so both sides go
+    through validation and compare by the canonical sorted-keys hash — the
+    same hash ``dalton_publish_earnings_calendar`` returns."""
+    if not user_id:
+        return ["缺少 user_id，财报日历镜像无法核对，请重试。"]
+    ledger_template = str(rule.get("ledger") or "dalton/earnings-calendar.json")
+    ledger_path = render_template(ledger_template, params)
+    raw = await _read_text(backend, ledger_path)
+    if raw is None:
+        return [
+            f"台账镜像未发布或与当前台账不一致：台账 {ledger_path} 读不到（不存在或不可读），"
+            "无法核对镜像；先按 SKILL 写出本轮台账，再调用 dalton_publish_earnings_calendar。"
+        ]
+    try:
+        ledger = json.loads(raw)
+    except ValueError:
+        return [
+            f"台账镜像未发布或与当前台账不一致：台账 {ledger_path} 不是合法 JSON；"
+            "修复文件后调用 dalton_publish_earnings_calendar。"
+        ]
+    from src.dalton.coverage.models import (
+        canonical_ledger_sha256,
+        validate_earnings_calendar_ledger,
+    )
+
+    try:
+        validated = validate_earnings_calendar_ledger(
+            ledger, raw_bytes_len=len(raw.encode("utf-8"))
+        )
+    except ValueError as error:
+        return [
+            f"台账镜像未发布或与当前台账不一致：台账 {ledger_path} 校验不通过（{error}）；"
+            "修复后调用 dalton_publish_earnings_calendar。"
+        ]
+    from src.dalton.database import coverage as coverage_db
+
+    try:
+        mirror_row = await coverage_db.get_earnings_calendar_mirror(user_id)
+    except Exception as error:
+        logger.warning(
+            "dalton_check_done mirror query failed", error=str(error)
+        )
+        return ["财报日历镜像无法核对（数据库查询失败），请重试。"]
+    if not isinstance(mirror_row, dict) or not isinstance(
+        mirror_row.get("ledger"), dict
+    ):
+        return [
+            "台账镜像未发布或与当前台账不一致：服务端还没有当前用户的财报日历镜像；"
+            "调用 dalton_publish_earnings_calendar 发布。"
+        ]
+    published = _as_utc(mirror_row.get("published_at"))
+    if published is None or published < since:
+        return [
+            f"台账镜像未发布或与当前台账不一致：镜像的发布时间不在本轮窗口内"
+            f"（自 {since_label} 起）；本轮调用 dalton_publish_earnings_calendar 重新发布。"
+        ]
+    if canonical_ledger_sha256(mirror_row["ledger"]) != canonical_ledger_sha256(
+        validated
+    ):
+        return [
+            "台账镜像未发布或与当前台账不一致：镜像内容与当前台账文件不同"
+            "（台账在发布后被修改）；调用 dalton_publish_earnings_calendar 重新发布。"
+        ]
+    return []
+
+
+def _iso_week_key(moment: datetime, tz: Any) -> str:
+    """`YYYY-Www` for ``moment`` in the automation timezone — the calendar
+    probe's own signal_key shape (probe_calendar)."""
+    local = moment.astimezone(tz)
+    iso_year, iso_week, _ = local.date().isocalendar()
+    return f"{iso_year}-W{iso_week:02d}"
+
+
+async def _check_calendar_wake_signal(
+    rule: dict[str, Any],
+    user_id: str | None,
+) -> list[str]:
+    """This week's calendar wake signal must not be left open.
+
+    No wakeup context reaches the tool (the `<dalton_wake>` directive rides
+    the turn's messages, not the graph config), so the signal row itself
+    decides. The probe writes ``weekly:<ISO week>`` into the caller's Home
+    workspace the moment the weekly automation fires, and the SKILL closes it
+    on EVERY refresh (woken or manual), so: the CURRENT week's row (check
+    time, automation timezone — the same week the agent computes) in state
+    ``pending`` or ``woken`` means this round owes a close. ``resolved`` is
+    closed; ``expired`` is a past round's leftover, not this round's debt.
+    No row means nothing woke this week and nothing is owed."""
+    if not user_id:
+        return ["缺少 user_id，财报日历唤醒信号无法核对，请重试。"]
+    from src.dalton.auth import resolve_caller_home_workspace_id
+
+    try:
+        home_ws_id = await resolve_caller_home_workspace_id(user_id)
+    except Exception as error:
+        logger.warning(
+            "dalton_check_done home workspace resolve failed", error=str(error)
+        )
+        return ["Home 工作区无法解析，财报日历唤醒信号无法核对，请重试。"]
+    probe = str(rule.get("probe") or "calendar").strip() or "calendar"
+    from src.dalton.settings import get_dalton_settings
+
+    try:
+        tz = ZoneInfo(get_dalton_settings().autonomy.timezone)
+    except Exception:
+        tz = timezone.utc
+    week_key = _iso_week_key(datetime.now(timezone.utc), tz)
+    from src.dalton.database import watch as watch_db
+
+    try:
+        row = await watch_db.get_signal_by_key(
+            home_ws_id, probe, f"weekly:{week_key}"
+        )
+    except Exception as error:
+        logger.warning(
+            "dalton_check_done calendar signal query failed", error=str(error)
+        )
+        return ["财报日历唤醒信号无法核对（数据库查询失败），请重试。"]
+    if not isinstance(row, dict):
+        return []
+    status = str(row.get("status") or "").strip().lower()
+    if status in ("resolved", "expired"):
+        return []
+    return [
+        (
+            f"本周财报日历唤醒信号 weekly:{week_key}（probe={probe}）尚未关闭"
+            f"（当前状态 {status or '未知'}）；下一步：调用 dalton_resolve_signals("
+            f'signal_keys=["weekly:{week_key}"], probe="{probe}", ...) 关闭；'
+            "若返回 resolved_count=0（未匹配到未关闭信号），在总结里如实说明"
+            "信号可能早已关闭或仍开着，不要原样反复重试。"
         )
     ]
 

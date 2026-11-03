@@ -9,6 +9,8 @@ Subcommands:
   roll    : Roll confirmed entries whose release date (`date`) is strictly before `--today` into `reported`, and re-register as `pending` for the next quarter.
   diff    : Reconcile scan JSONL file(s) (`--scan <jsonl>`) against the ledger and optionally verify automation JSON files.
   publish : Validate and publish earnings-calendar.json to PUT /api/v1/dalton/earnings/calendar/mirror (max 1 MB).
+            Requires an explicit backend URL (--api-url or DALTON_API_URL/LANGALPHA_API_URL/API_BASE_URL);
+            without one it exits with no_api_url — inside a sandbox use the dalton_publish_earnings_calendar tool instead.
 """
 
 import argparse
@@ -37,15 +39,28 @@ def _default_state_path() -> Path:
     env_path = os.environ.get("DALTON_EARNINGS_CALENDAR_PATH")
     if env_path:
         return Path(env_path)
-    candidates = [
-        Path("Home/dalton/earnings-calendar.json"),
-        Path("dalton/earnings-calendar.json"),
-        Path("../Home/dalton/earnings-calendar.json"),
-    ]
+    local = Path("dalton/earnings-calendar.json")
+    via_home = Path("Home/dalton/earnings-calendar.json")
+    # The Research Director's working directory IS the Home workspace root;
+    # from there the old Home-first guess made `mark` create
+    # Home/Home/dalton/earnings-calendar.json on first write. `Home/dalton/...`
+    # stays a candidate only when a Home/ subdirectory actually exists.
+    if Path.cwd().name == "Home":
+        # The server tool and the completion contract read exactly this path,
+        # so from Home it is the only answer. A ledger an older run left at
+        # Home/dalton/... is moved here once rather than written to forever.
+        if not local.exists() and via_home.exists():
+            local.parent.mkdir(parents=True, exist_ok=True)
+            via_home.replace(local)
+        return local
+    if not Path("Home").is_dir():
+        candidates = [local, Path("../Home/dalton/earnings-calendar.json")]
+    else:
+        candidates = [via_home, local, Path("../Home/dalton/earnings-calendar.json")]
     for c in candidates:
         if c.exists():
             return c
-    return Path("Home/dalton/earnings-calendar.json")
+    return candidates[0]
 
 
 def _default_coverage_path() -> Path | None:
@@ -776,13 +791,34 @@ def cmd_publish(args: argparse.Namespace) -> int:
     ledger = load_ledger(state_path, create=False)
     body_bytes = validate_ledger_for_publish(ledger)
 
+    # No 127.0.0.1 fallback: inside a sandbox that address is the sandbox
+    # itself, never the backend (the 10-31 mirror publish failures). Without
+    # an explicitly configured backend URL the HTTP path cannot work, so fail
+    # fast and point at the server-side tool instead of dialing anything.
     api_base = (
         getattr(args, "api_url", None)
         or os.environ.get("DALTON_API_URL")
         or os.environ.get("LANGALPHA_API_URL")
         or os.environ.get("API_BASE_URL")
-        or "http://127.0.0.1:8000"
-    ).rstrip("/")
+    )
+    if not api_base or not api_base.strip():
+        print(
+            json.dumps(
+                {
+                    "ok": False,
+                    "error": "no_api_url",
+                    "message": (
+                        "未配置后端地址（--api-url 或环境变量 DALTON_API_URL/LANGALPHA_API_URL/API_BASE_URL），"
+                        "沙箱内该 HTTP 路径连不上后端，不再回退 127.0.0.1:8000。"
+                        "改用服务端工具 dalton_publish_earnings_calendar 发布财报日历镜像。"
+                    ),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 2
+    api_base = api_base.strip().rstrip("/")
     endpoint = f"{api_base}/api/v1/dalton/earnings/calendar/mirror"
     headers = _build_publish_headers(args)
 
@@ -894,8 +930,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp_diff.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     sp_diff.set_defaults(fn=cmd_diff)
 
-    sp_pub = sub.add_parser("publish", help="Publish earnings-calendar.json to server mirror")
-    sp_pub.add_argument("--api-url", default=None, help="Server base URL (default: http://127.0.0.1:8000)")
+    sp_pub = sub.add_parser("publish", help="Publish earnings-calendar.json to server mirror (needs --api-url; inside a sandbox prefer the dalton_publish_earnings_calendar tool)")
+    sp_pub.add_argument("--api-url", default=None, help="Server base URL (required unless DALTON_API_URL/LANGALPHA_API_URL/API_BASE_URL is set; no default)")
     sp_pub.add_argument("--token", default=None, help="Bearer token for Authorization header")
     sp_pub.add_argument("--service-token", default=None, help="Internal service token (X-Service-Token)")
     sp_pub.add_argument("--user-id", default=None, help="Target user_id header (X-User-Id)")

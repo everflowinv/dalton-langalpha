@@ -184,6 +184,32 @@ async def upsert_signal(
             return row_dict, should_wake
 
 
+async def get_signal_by_key(
+    workspace_id: Optional[str],
+    probe: str,
+    signal_key: str,
+) -> Optional[dict[str, Any]]:
+    """Fetch one signal row in ANY lifecycle state by (workspace, probe, signal_key), or None.
+
+    Unlike ``list_pending_signals`` this sees resolved/expired rows too — a
+    completion check must distinguish "already closed" from "never existed"."""
+    ws_uuid = _resolve_ws_uuid(workspace_id)
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT signal_id, workspace_id, ticker, probe, signal_key, priority,
+                       summary, payload, detected_at, woken_execution_id, woken_at,
+                       resolved_at, expired_at
+                FROM dalton_signals
+                WHERE workspace_id = %s AND probe = %s AND signal_key = %s
+                """,
+                (ws_uuid, str(probe or "").strip(), str(signal_key or "").strip()),
+            )
+            row = await cur.fetchone()
+            return _with_signal_status(dict(row)) if row else None
+
+
 async def list_pending_signals(
     workspace_id: Optional[str] = None,
     ticker: Optional[str] = None,

@@ -11,6 +11,12 @@
   "closing": {
     "push_draft": {
       "path": "research/push/{as_of}-earnings-calendar.md"
+    },
+    "earnings_calendar_mirror": {
+      "ledger": "dalton/earnings-calendar.json"
+    },
+    "calendar_wake_signal": {
+      "probe": "calendar"
     }
   }
 }

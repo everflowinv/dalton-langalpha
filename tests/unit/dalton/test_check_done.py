@@ -27,6 +27,16 @@ import psycopg
 import pytest
 
 from ptc_agent.agent.backends.sandbox import SandboxBackend
+# coverage.models must load before database.coverage: that order initializes
+# the src.dalton.coverage package first and sidesteps its import cycle
+# (service.py reads attributes off the partially-initialized db module).
+from src.dalton.coverage.models import validate_earnings_calendar_ledger as _REAL_VALIDATE_LEDGER
+from src.dalton.auth import (
+    resolve_caller_home_workspace_id as _REAL_RESOLVE_HOME,
+)
+from src.dalton.database.coverage import (
+    get_earnings_calendar_mirror as _REAL_GET_MIRROR,
+)
 from src.dalton.database.publications import (
     list_pending_for_workspace as _REAL_LIST_PENDING,
 )
@@ -34,6 +44,7 @@ from src.dalton.database.verdicts import (
     get_verdict_for_execution as _REAL_GET_VERDICT_FOR_EXECUTION,
     list_verdicts as _REAL_LIST_VERDICTS,
 )
+from src.dalton.database.watch import get_signal_by_key as _REAL_GET_SIGNAL
 from src.dalton.tools import check_done_tools
 from src.dalton.tools.check_done_tools import run_check_done
 
@@ -2444,19 +2455,25 @@ async def test_weekly_and_earnings_calendar_push_draft_and_unreadable_start_fail
     )
     assert weekly_ok_res["done"] is True, weekly_ok_res["missing"]
 
-    # 2. dalton-earnings-calendar
-    cal_path = "research/push/2026-10-23-earnings-calendar.md"
-    cal_params = {"as_of": "2026-10-23"}
+    # 2. dalton-earnings-calendar — the mirror + wake-signal seams answer "no
+    # row" here so the push-draft gaps stay the only calendar-side missing.
+    cal_path = CAL_PUSH
+    cal_params = CAL_PARAMS
+    _patch_calendar_mirror(monkeypatch, None)
+    _patch_calendar_signal(monkeypatch, status=None)
+    _patch_home_workspace(monkeypatch)
 
     cal_missing = await run_check_done(
         workflow="dalton-earnings-calendar",
         params=cal_params,
         backend=_make_backend({}),
         workspace_id=None,
+        user_id="user-1",
         thread_id="short-1",
     )
     assert cal_missing["done"] is False
     assert any("缺少推送稿" in m and cal_path in m for m in cal_missing["missing"])
+    assert any("台账镜像未发布或与当前台账不一致" in m for m in cal_missing["missing"])
 
     cal_r1 = await run_check_done(
         workflow="dalton-earnings-calendar",
@@ -2468,20 +2485,24 @@ async def test_weekly_and_earnings_calendar_push_draft_and_unreadable_start_fail
             }
         ),
         workspace_id=None,
+        user_id="user-1",
         thread_id="short-1",
     )
     assert cal_r1["done"] is False
     assert any("缺少第 2 轮" in m and cal_path in m for m in cal_r1["missing"])
 
     cal_ok_files = {
+        CAL_LEDGER_PATH: json.dumps(_cal_ledger(), ensure_ascii=False),
         cal_path: push_text,
         f"{cal_path}.language.json": _language_json(push_text),
     }
+    _patch_calendar_all_good(monkeypatch)
     cal_ok = await run_check_done(
         workflow="dalton-earnings-calendar",
         params=cal_params,
         backend=_make_backend(cal_ok_files),
         workspace_id=None,
+        user_id="user-1",
         thread_id="short-1",
     )
     assert cal_ok["done"] is True, cal_ok["missing"]
@@ -2500,6 +2521,7 @@ async def test_weekly_and_earnings_calendar_push_draft_and_unreadable_start_fail
         params=cal_params,
         backend=_make_backend(cal_ok_files, mtimes={cal_path: DEFAULT_START_EPOCH - 3}),
         workspace_id=None,
+        user_id="user-1",
         thread_id="short-1",
         conversation_run_id="conv-run-unknown",
     )
@@ -2510,6 +2532,7 @@ async def test_weekly_and_earnings_calendar_push_draft_and_unreadable_start_fail
         params=cal_params,
         backend=_make_backend(cal_ok_files, mtimes={cal_path: DEFAULT_START_EPOCH - 10}),
         workspace_id=None,
+        user_id="user-1",
         thread_id="short-1",
         conversation_run_id="conv-run-unknown",
     )
@@ -2530,6 +2553,7 @@ async def test_weekly_and_earnings_calendar_push_draft_and_unreadable_start_fail
         params=cal_params,
         backend=_make_backend(cal_ok_files),
         workspace_id=None,
+        user_id="user-1",
         thread_id="short-1",
         conversation_run_id="conv-run-unknown",
     )
@@ -3280,6 +3304,154 @@ def _pending_row(
         "status": "awaiting_pm",
         "audit": audit,
     }
+
+
+# --- dalton-earnings-calendar mirror & wake-signal seams (calendar-publish) ---
+
+CAL_LEDGER_PATH = "dalton/earnings-calendar.json"
+CAL_PARAMS = {"as_of": "2026-10-23"}
+CAL_PUSH = "research/push/2026-10-23-earnings-calendar.md"
+
+
+def _cal_ledger() -> dict[str, Any]:
+    """A minimal valid earnings-calendar ledger (real shape per SKILL.md)."""
+    return {
+        "updated": "2026-10-23",
+        "entries": {
+            "META": {
+                "name": "Meta Platforms",
+                "status": "confirmed",
+                "date": "2026-10-28",
+                "date_status": "confirmed",
+                "quarter": "FY26Q3",
+            },
+            "GOOGL": {
+                "name": "Alphabet",
+                "status": "pending",
+                "tentative_date": "2026-11-05",
+            },
+        },
+        "reported": [{"ticker": "MSFT", "quarter": "FY26Q2", "date": "2026-07-29"}],
+    }
+
+
+def _cal_files(**extra: str) -> dict[str, str]:
+    push_text = "## 财报日历周报\n本周确认 2 家。\n"
+    files = {
+        CAL_LEDGER_PATH: json.dumps(_cal_ledger(), ensure_ascii=False),
+        CAL_PUSH: push_text,
+        f"{CAL_PUSH}.language.json": _language_json(push_text),
+    }
+    files.update(extra)
+    return files
+
+
+def _patch_calendar_mirror(
+    monkeypatch: pytest.MonkeyPatch,
+    ledger: dict[str, Any] | None = None,
+    *,
+    published_at: datetime | None = None,
+    error: Exception | None = None,
+) -> None:
+    """Serve ``dalton_earnings_calendar_mirror`` rows; ``ledger=None`` means no row.
+
+    The stored ledger is the VALIDATED form (what the service upserts), with
+    key order shuffled — jsonb does not preserve it, so the check must compare
+    canonically, never by dict equality."""
+    from src.dalton.database import coverage as coverage_db
+
+    if ledger is not None:
+        validated = _REAL_VALIDATE_LEDGER(ledger)
+        stored = dict(reversed(list(validated.items())))
+        row: dict[str, Any] | None = {
+            "user_id": "user-1",
+            "ledger": stored,
+            "published_at": published_at or datetime.now(timezone.utc),
+        }
+    else:
+        row = None
+    fetched = create_autospec(_REAL_GET_MIRROR)
+
+    async def _get(user_id: str) -> dict[str, Any] | None:
+        if error is not None:
+            raise error
+        return row
+
+    fetched.side_effect = _get
+    monkeypatch.setattr(coverage_db, "get_earnings_calendar_mirror", fetched)
+
+
+def _patch_calendar_signal(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    status: str | None = None,
+    error: Exception | None = None,
+) -> Any:
+    """Answer ``weekly:<ISO week>`` calendar-signal lookups; returns the mock
+    so a test can inspect which week keys were actually queried.
+
+    ``status=None`` answers "no such signal row" (nothing woke this week);
+    any other value is the row's lifecycle status."""
+    from src.dalton.database import watch as watch_db
+
+    fetched = create_autospec(_REAL_GET_SIGNAL)
+
+    async def _get(workspace_id: str, probe: str, signal_key: str) -> dict[str, Any] | None:
+        if error is not None:
+            raise error
+        assert probe == "calendar"
+        if status is None:
+            return None
+        now = datetime.now(timezone.utc)
+        row = {
+            "signal_id": "sig-1",
+            "workspace_id": workspace_id,
+            "ticker": None,
+            "probe": probe,
+            "signal_key": signal_key,
+            "priority": "P1",
+            "summary": "覆盖池财报日历周度刷新",
+            "payload": {},
+            "detected_at": now,
+            "woken_execution_id": None,
+            "woken_at": None,
+            "resolved_at": None,
+            "expired_at": None,
+        }
+        if status == "resolved":
+            row["resolved_at"] = now
+        elif status == "woken":
+            row["woken_execution_id"] = "exec-1"
+            row["woken_at"] = now
+        elif status == "expired":
+            row["expired_at"] = now
+        return watch_db._with_signal_status(row)
+
+    fetched.side_effect = _get
+    monkeypatch.setattr(watch_db, "get_signal_by_key", fetched)
+    return fetched
+
+
+def _patch_home_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    home_ws_id: str = "11111111-1111-1111-1111-111111111111",
+) -> None:
+    from src.dalton import auth as dalton_auth
+
+    resolved = create_autospec(_REAL_RESOLVE_HOME)
+
+    async def _resolve(user_id: str) -> str:
+        return home_ws_id
+
+    resolved.side_effect = _resolve
+    monkeypatch.setattr(dalton_auth, "resolve_caller_home_workspace_id", resolved)
+
+
+def _patch_calendar_all_good(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mirror published this round with the current ledger; no wake signal."""
+    _patch_calendar_mirror(monkeypatch, _cal_ledger())
+    _patch_calendar_signal(monkeypatch, status=None)
+    _patch_home_workspace(monkeypatch)
 
 
 # ------------------------------------------------- language_review closing rule
@@ -4509,3 +4681,296 @@ async def test_stale_template_falls_through_to_a_qualifying_variant(
     assert result["done"], result["missing"]
     # Not a pass on the stale template: no freshness gap was reported at all.
     assert not any("不是本轮写的" in m for m in result["missing"])
+
+
+# --- dalton-earnings-calendar: mirror + wake-signal closing checks (calendar-publish) ---
+
+
+@pytest.mark.asyncio
+async def test_earnings_calendar_check_done_mirror_missing_is_not_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The 10-31 incident shape: the ledger exists, the run claims a refresh,
+    but no mirror row was ever published — done must be False."""
+    _patch_knowledge(monkeypatch, [])
+    _patch_calendar_signal(monkeypatch, status=None)
+    _patch_home_workspace(monkeypatch)
+    _patch_calendar_mirror(monkeypatch, None)
+    result = await run_check_done(
+        workflow="dalton-earnings-calendar",
+        params=CAL_PARAMS,
+        backend=_make_backend(_cal_files()),
+        workspace_id=None,
+        user_id="user-1",
+        thread_id="short-1",
+    )
+    assert result["done"] is False
+    assert any(
+        "台账镜像未发布或与当前台账不一致" in m and "dalton_publish_earnings_calendar" in m
+        for m in result["missing"]
+    ), result["missing"]
+
+
+@pytest.mark.asyncio
+async def test_earnings_calendar_check_done_mirror_stale_publish_is_not_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mirror published BEFORE this round's window is yesterday's mirror:
+    this round owes a fresh publish."""
+    _patch_knowledge(monkeypatch, [])
+    _patch_calendar_signal(monkeypatch, status=None)
+    _patch_home_workspace(monkeypatch)
+    _patch_calendar_mirror(
+        monkeypatch,
+        _cal_ledger(),
+        published_at=datetime(2026, 10, 20, 12, 0, tzinfo=timezone.utc),
+    )
+    result = await run_check_done(
+        workflow="dalton-earnings-calendar",
+        params=CAL_PARAMS,
+        backend=_make_backend(_cal_files()),
+        workspace_id=None,
+        user_id="user-1",
+        thread_id="short-1",
+    )
+    assert result["done"] is False
+    assert any(
+        "发布时间不在本轮窗口内" in m and "dalton_publish_earnings_calendar" in m
+        for m in result["missing"]
+    ), result["missing"]
+
+
+@pytest.mark.asyncio
+async def test_earnings_calendar_check_done_mirror_content_mismatch_is_not_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mirror carrying different content than the ledger on disk (the file
+    was edited after publishing) fails even though published_at is fresh —
+    and the canonical hash, not jsonb key order, decides the comparison."""
+    _patch_knowledge(monkeypatch, [])
+    _patch_calendar_signal(monkeypatch, status=None)
+    _patch_home_workspace(monkeypatch)
+    stale_ledger = _cal_ledger()
+    stale_ledger["entries"]["META"]["date"] = "2026-10-29"
+    _patch_calendar_mirror(monkeypatch, stale_ledger)
+    result = await run_check_done(
+        workflow="dalton-earnings-calendar",
+        params=CAL_PARAMS,
+        backend=_make_backend(_cal_files()),
+        workspace_id=None,
+        user_id="user-1",
+        thread_id="short-1",
+    )
+    assert result["done"] is False
+    assert any(
+        "镜像内容与当前台账文件不同" in m and "dalton_publish_earnings_calendar" in m
+        for m in result["missing"]
+    ), result["missing"]
+
+
+@pytest.mark.asyncio
+async def test_earnings_calendar_check_done_mirror_matches_is_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirror published this round with the current ledger's canonical hash —
+    and a reshuffled stored key order (jsonb round-trip) still matches."""
+    _patch_knowledge(monkeypatch, [])
+    _patch_calendar_all_good(monkeypatch)
+    result = await run_check_done(
+        workflow="dalton-earnings-calendar",
+        params=CAL_PARAMS,
+        backend=_make_backend(_cal_files()),
+        workspace_id=None,
+        user_id="user-1",
+        thread_id="short-1",
+    )
+    assert result["done"] is True, result["missing"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("ledger_text", "expected_gap"),
+    [
+        (None, "读不到"),
+        ("{not json", "不是合法 JSON"),
+        ('{"updated": "2026-10-23"}', "校验不通过"),
+    ],
+)
+async def test_earnings_calendar_check_done_unreadable_ledger_is_not_done(
+    monkeypatch: pytest.MonkeyPatch,
+    ledger_text: str | None,
+    expected_gap: str,
+) -> None:
+    """A ledger the check cannot read/parse/validate names the cause and the
+    fix (publish), never a pass."""
+    _patch_knowledge(monkeypatch, [])
+    _patch_calendar_signal(monkeypatch, status=None)
+    _patch_home_workspace(monkeypatch)
+    _patch_calendar_mirror(monkeypatch, _cal_ledger())
+    files = _cal_files()
+    if ledger_text is None:
+        del files[CAL_LEDGER_PATH]
+    else:
+        files[CAL_LEDGER_PATH] = ledger_text
+    result = await run_check_done(
+        workflow="dalton-earnings-calendar",
+        params=CAL_PARAMS,
+        backend=_make_backend(files),
+        workspace_id=None,
+        user_id="user-1",
+        thread_id="short-1",
+    )
+    assert result["done"] is False
+    assert any(
+        expected_gap in m and CAL_LEDGER_PATH in m and "dalton_publish_earnings_calendar" in m
+        for m in result["missing"]
+    ), result["missing"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["pending", "woken"])
+async def test_earnings_calendar_check_done_open_wake_signal_is_not_done(
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+) -> None:
+    """The second half of the 10-31 incident: the mirror is fine but this
+    week's calendar wake signal is still open (pending leftover or woken by
+    the automation) — not done until the agent closes it."""
+    _patch_knowledge(monkeypatch, [])
+    _patch_home_workspace(monkeypatch)
+    _patch_calendar_mirror(monkeypatch, _cal_ledger())
+    _patch_calendar_signal(monkeypatch, status=status)
+    result = await run_check_done(
+        workflow="dalton-earnings-calendar",
+        params=CAL_PARAMS,
+        backend=_make_backend(_cal_files()),
+        workspace_id=None,
+        user_id="user-1",
+        thread_id="short-1",
+    )
+    assert result["done"] is False
+    assert any(
+        "尚未关闭" in m and "weekly:" in m and "dalton_resolve_signals" in m
+        for m in result["missing"]
+    ), result["missing"]
+
+
+@pytest.mark.asyncio
+async def test_earnings_calendar_check_done_expired_signal_is_not_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An expired signal is a PAST round's leftover, not this round's debt —
+    and only the CURRENT week is queried, so a lingering expired row from an
+    earlier week cannot block a manual refresh that crossed the week boundary."""
+    from zoneinfo import ZoneInfo
+
+    from src.dalton.settings import get_dalton_settings
+
+    _patch_knowledge(monkeypatch, [])
+    _patch_home_workspace(monkeypatch)
+    _patch_calendar_mirror(monkeypatch, _cal_ledger())
+    fetched = _patch_calendar_signal(monkeypatch, status="expired")
+    result = await run_check_done(
+        workflow="dalton-earnings-calendar",
+        params=CAL_PARAMS,
+        backend=_make_backend(_cal_files()),
+        workspace_id=None,
+        user_id="user-1",
+        thread_id="short-1",
+    )
+    assert result["done"] is True, result["missing"]
+    # Exactly one week key — the check-time week in the automation timezone —
+    # is ever queried; historical weeks are not.
+    assert fetched.call_count == 1
+    queried_key = fetched.call_args[0][2]
+    tz = ZoneInfo(get_dalton_settings().autonomy.timezone)
+    local_now = datetime.now(timezone.utc).astimezone(tz).date()
+    iso_year, iso_week, _ = local_now.isocalendar()
+    assert queried_key == f"weekly:{iso_year}-W{iso_week:02d}"
+
+
+@pytest.mark.asyncio
+async def test_earnings_calendar_check_done_resolved_wake_signal_is_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A manual refresh that (per the SKILL) closes the week's leftover
+    pending signal passes: resolved reads as closed."""
+    _patch_knowledge(monkeypatch, [])
+    _patch_home_workspace(monkeypatch)
+    _patch_calendar_mirror(monkeypatch, _cal_ledger())
+    _patch_calendar_signal(monkeypatch, status="resolved")
+    result = await run_check_done(
+        workflow="dalton-earnings-calendar",
+        params=CAL_PARAMS,
+        backend=_make_backend(_cal_files()),
+        workspace_id=None,
+        user_id="user-1",
+        thread_id="short-1",
+    )
+    assert result["done"] is True, result["missing"]
+
+
+@pytest.mark.asyncio
+async def test_earnings_calendar_check_done_manual_run_without_signal_skips_signal_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No weekly:<ISO week> signal row exists (PM manual trigger before the
+    weekly cron): the signal check stays silent, only the mirror matters."""
+    _patch_knowledge(monkeypatch, [])
+    _patch_home_workspace(monkeypatch)
+    _patch_calendar_all_good(monkeypatch)
+    result = await run_check_done(
+        workflow="dalton-earnings-calendar",
+        params=CAL_PARAMS,
+        backend=_make_backend(_cal_files()),
+        workspace_id=None,
+        user_id="user-1",
+        thread_id="short-1",
+    )
+    assert result["done"] is True, result["missing"]
+    assert not any("唤醒信号" in m for m in result["missing"])
+
+
+@pytest.mark.asyncio
+async def test_earnings_calendar_check_done_signal_and_mirror_query_failures_are_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fail-closed: a dead mirror or signal query is 无法核对, never a pass."""
+    _patch_knowledge(monkeypatch, [])
+    _patch_home_workspace(monkeypatch)
+    _patch_calendar_mirror(
+        monkeypatch, None, error=RuntimeError("pool exhausted")
+    )
+    _patch_calendar_signal(monkeypatch, error=RuntimeError("pool exhausted"))
+    result = await run_check_done(
+        workflow="dalton-earnings-calendar",
+        params=CAL_PARAMS,
+        backend=_make_backend(_cal_files()),
+        workspace_id=None,
+        user_id="user-1",
+        thread_id="short-1",
+    )
+    assert result["done"] is False
+    assert any("财报日历镜像无法核对" in m for m in result["missing"])
+    assert any("财报日历唤醒信号无法核对" in m for m in result["missing"])
+
+
+@pytest.mark.asyncio
+async def test_earnings_calendar_check_done_without_user_id_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The mirror and the signal both live under the calling user; without
+    user_id neither can be verified, so both report their missing entry."""
+    _patch_knowledge(monkeypatch, [])
+    result = await run_check_done(
+        workflow="dalton-earnings-calendar",
+        params=CAL_PARAMS,
+        backend=_make_backend(_cal_files()),
+        workspace_id=None,
+        user_id=None,
+        thread_id="short-1",
+    )
+    assert result["done"] is False
+    assert any("缺少 user_id，财报日历镜像无法核对" in m for m in result["missing"])
+    assert any("缺少 user_id，财报日历唤醒信号无法核对" in m for m in result["missing"])
+
