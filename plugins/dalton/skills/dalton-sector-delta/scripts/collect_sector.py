@@ -534,6 +534,7 @@ def cmd_commit(args: argparse.Namespace) -> int:
             "subject_kind": "sector",
             "sector": pk.get("sector"),
             "unit_id": pk.get("unit_id"),
+            "since": str(pk.get("since") or ""),
             "until": next_until,
             "window_advanced": packet_complete,
             "committed_at": now_iso,

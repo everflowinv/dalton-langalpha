@@ -5,7 +5,17 @@
   ],
   "stages": [
     {
-      "name": "财报日历周报"
+      "name": "财报日历周报",
+      "artifacts": [
+        {
+          "path": "dalton/research/earnings-scan-{as_of}.jsonl",
+          "path_param": "scan_file",
+          "variant_glob": "dalton/research/earnings-scan-*.jsonl",
+          "min_bytes": 10,
+          "fresh_this_run": true,
+          "requires_scan_dates_status": true
+        }
+      ]
     }
   ],
   "closing": {

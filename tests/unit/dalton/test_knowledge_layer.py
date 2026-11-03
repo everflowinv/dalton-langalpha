@@ -3629,6 +3629,13 @@ def test_b4b_skill_prompts_field_paths_and_enums_match_schemas() -> None:
         "financial_currency": {"HKD", "USD", "CNY"},  # 跨币种换算示例中的财报币种参数
         "publisher": {"OpenClaw"},  # 派生来源示例中的发布方标识
         "round": {"2"},  # 多轮取证轮次示例参数
+        "scan_only_stale": {"true", "false", "True", "False"},  # dalton_coverage_board 返回的仅扫描未重估布尔字段
+        "delegatable": {"true", "false", "True", "False"},  # dalton_coverage_board units 可委派布尔字段
+        "include_archived": {"true", "false", "True", "False"},  # dalton_coverage_unit list 含归档布尔参数
+        "window_advanced": {"true", "false", "True", "False"},  # collect_sector.py 窗口推进布尔字段
+        "recorded": {"true", "false", "True", "False"},  # calendar_state.py check 返回的已记录布尔字段
+        "date_changed": {"true", "false", "True", "False"},  # calendar_state.py check 返回的改期布尔字段
+        "resolved_count": {"0"},  # dalton_resolve_signals 返回的关闭信号计数
     }
 
     # Non-schema identifiers that legitimately appear in backticks in the 12 schema-focused skill files,
@@ -3730,6 +3737,14 @@ def test_b4b_skill_prompts_field_paths_and_enums_match_schemas() -> None:
         "coverage.complete",
         "coverage.continuation_params",
         "hashlib.sha256",
+        "budget.allocatable_usd",
+        "units[].members",
+        "last_run.until",
+        "workspace.status",
+        "earnings.ir_url",
+        "json.dumps",
+        "json.loads",
+        "state.next_run_at",
     )
 
     banned_tokens = {
@@ -3981,6 +3996,9 @@ def test_b4b_skill_prompts_field_paths_and_enums_match_schemas() -> None:
         "plugins/dalton/skills/dalton-earnings-flash/templates/flash.md",
         "plugins/dalton/skills/dalton-thesis-delta/SKILL.md",
         "plugins/dalton/skills/dalton-weekly-review/SKILL.md",
+        "plugins/dalton/skills/dalton-research-director/SKILL.md",
+        "plugins/dalton/skills/dalton-sector-delta/SKILL.md",
+        "plugins/dalton/skills/dalton-earnings-calendar/SKILL.md",
     ]
 
     all_problems: list[str] = []

@@ -32,6 +32,7 @@ SKILL_CONTRACTS = [
     "dalton-stock-move",
     "dalton-filing-review",
     "dalton-thesis-delta",
+    "dalton-sector-delta",
     "dalton-call",
     "dalton-publish",
     "dalton-earnings-calendar",

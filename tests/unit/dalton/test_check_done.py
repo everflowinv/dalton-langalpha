@@ -2452,6 +2452,7 @@ async def test_weekly_and_earnings_calendar_push_draft_and_unreadable_start_fail
         ),
         "dalton/research/weekly-2026-10-23/attribution.json": json.dumps({"rows": ["x" * 60]}),
         "dalton/research/weekly-2026-10-23/core-META.md": "META " * 50,
+        "dalton/drafts/2026-10-16-weekly.md": "上周周会" * 100,
         "dalton/drafts/2026-10-23-weekly.md": "周会" * 300,
     }
     weekly_missing = await run_check_done(
@@ -2529,11 +2530,12 @@ async def test_weekly_and_earnings_calendar_push_draft_and_unreadable_start_fail
     assert cal_r1["done"] is False
     assert any("缺少第 2 轮" in m and cal_path in m for m in cal_r1["missing"])
 
-    cal_ok_files = {
-        CAL_LEDGER_PATH: json.dumps(_cal_ledger(), ensure_ascii=False),
-        cal_path: push_text,
-        f"{cal_path}.language.json": _language_json(push_text),
-    }
+    cal_ok_files = _cal_files(
+        **{
+            cal_path: push_text,
+            f"{cal_path}.language.json": _language_json(push_text),
+        }
+    )
     _patch_calendar_all_good(monkeypatch)
     cal_ok = await run_check_done(
         workflow="dalton-earnings-calendar",
@@ -3579,7 +3581,42 @@ def _cal_ledger() -> dict[str, Any]:
 
 def _cal_files(**extra: str) -> dict[str, str]:
     push_text = "## 财报日历周报\n本周确认 2 家。\n"
+    scan_lines = "\n".join(
+        [
+            json.dumps(
+                {
+                    "ticker": "META",
+                    "name": "Meta Platforms",
+                    "status": "confirmed",
+                    "earnings_date": "2026-10-28",
+                    "timing": "AMC",
+                    "quarter_label": "FY26Q3",
+                    "confidence": "high",
+                    "source_url": "https://investor.atmeta.com/",
+                    "evidence": "IR release",
+                    "notes": "官方确认",
+                },
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                {
+                    "ticker": "GOOGL",
+                    "name": "Alphabet",
+                    "status": "pending",
+                    "earnings_date": "2026-11-05",
+                    "timing": "AMC",
+                    "quarter_label": "FY26Q3",
+                    "confidence": "estimated",
+                    "source_url": "",
+                    "evidence": "FMP",
+                    "notes": "待确认（FMP 候选日期）",
+                },
+                ensure_ascii=False,
+            ),
+        ]
+    ) + "\n"
     files = {
+        "dalton/research/earnings-scan-2026-10-23.jsonl": scan_lines,
         CAL_LEDGER_PATH: json.dumps(_cal_ledger(), ensure_ascii=False),
         CAL_PUSH: push_text,
         f"{CAL_PUSH}.language.json": _language_json(push_text),
@@ -5512,3 +5549,886 @@ async def test_full_coverage_workflow_run_satisfies_check_done(
         thread_id="short-1",
     )
     assert result["done"], result["missing"]
+
+
+# --- Batch 5b: two freshness metrics on coverage board & 3 completion checks ---
+
+
+@pytest.mark.asyncio
+async def test_b5b_coverage_board_two_freshness_no_change_vs_scenario_version_increment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Batch 5b #1 (and Round 2 #2, #3, #6, #7, #8):
+    - A company with only NO_CHANGE verdicts recently has a fresh last_scan_at
+      and a stale last_revaluation_at (scan_only_stale=True);
+    - A company whose thesis.underwriting.scenario_version incremented recently
+      has both last_scan_at and last_revaluation_at fresh (scan_only_stale=False);
+    - The first historical thesis version does NOT count as a scenario_version
+      increment regardless of its scenario_version value (and any non-schema
+      underwriting.scenario_version_updated_at field is ignored);
+    - Same-day multiple verdicts (09:00 THESIS_STRENGTHENED, 16:00 NO_CHANGE)
+      sort by full timestamp: last_scan_at takes 16:00 (and last_verdict
+      summary/thread_id follow the 16:00 row), while last_revaluation_at takes
+      09:00;
+    - Scheduled candidates must state which decision changes when resolved
+      (decision_impact); items without one are not scheduled, and
+      dalton_record_plan rejects dispatches when decision_impact is '无' or when
+      both decision_impact and why are omitted.
+    """
+    from psycopg import AsyncConnection, AsyncCursor
+
+    from src.dalton.autonomy import board as board_mod
+    from src.dalton.database import plans as plans_db
+    from src.dalton.tools import director_tools as dt_mod
+
+    # Direct unit check for _extract_scenario_version_increment_at (Item 8):
+    # first historical version with scenario_version=3 does NOT count; only an
+    # increase over a previous version counts.
+    assert (
+        board_mod._extract_scenario_version_increment_at(
+            [
+                {
+                    "version_no": 1,
+                    "content": {
+                        "underwriting": {
+                            "scenario_version": 3,
+                            "scenario_version_updated_at": "2026-11-03T11:00:00+00:00",
+                        }
+                    },
+                    "created_at": "2026-11-03T11:00:00+00:00",
+                }
+            ]
+        )
+        is None
+    )
+    assert (
+        board_mod._extract_scenario_version_increment_at(
+            [
+                {
+                    "version_no": 1,
+                    "content": {"underwriting": {"scenario_version": 2}},
+                    "created_at": "2026-09-01T10:00:00+00:00",
+                },
+                {
+                    "version_no": 2,
+                    "content": {"underwriting": {"scenario_version": 2}},
+                    "created_at": "2026-10-01T10:00:00+00:00",
+                },
+                {
+                    "version_no": 3,
+                    "content": {"underwriting": {"scenario_version": 3}},
+                    "created_at": "2026-11-03T11:00:00+00:00",
+                },
+            ]
+        )
+        == "2026-11-03T11:00:00+00:00"
+    )
+
+    cur = create_autospec(AsyncCursor, instance=True)
+    cur.__aenter__.return_value = cur
+    cur.__aexit__.return_value = None
+
+    last_sql: dict[str, str] = {"sql": ""}
+    executed_queries: list[tuple[str, Any]] = []
+
+    async def _exec(sql: str, params: Any = None) -> None:
+        norm_sql = " ".join(str(sql).split())
+        last_sql["sql"] = norm_sql
+        executed_queries.append((norm_sql, params))
+
+    cur.execute.side_effect = _exec
+
+    from zoneinfo import ZoneInfo
+
+    today_str = (
+        datetime.now(ZoneInfo(board_mod.get_dalton_settings().autonomy.timezone))
+        .date()
+        .isoformat()
+    )
+    old_reval_str = "2026-09-01"
+
+    def _fetchall() -> list[dict[str, Any]]:
+        sql = last_sql["sql"]
+        if "FROM workspaces" in sql:
+            return [
+                {
+                    "workspace_id": "ws-no-change",
+                    "user_id": "u1",
+                    "name": "META",
+                    "description": "",
+                    "status": "active",
+                    "updated_at": None,
+                },
+                {
+                    "workspace_id": "ws-sv-inc",
+                    "user_id": "u1",
+                    "name": "NVDA",
+                    "description": "",
+                    "status": "active",
+                    "updated_at": None,
+                },
+                {
+                    "workspace_id": "ws-same-day",
+                    "user_id": "u1",
+                    "name": "GOOGL",
+                    "description": "",
+                    "status": "active",
+                    "updated_at": None,
+                },
+                {
+                    "workspace_id": "ws-first-only",
+                    "user_id": "u1",
+                    "name": "AMZN",
+                    "description": "",
+                    "status": "active",
+                    "updated_at": None,
+                },
+            ]
+        if "LAG(" in sql and "dalton_knowledge_versions" in sql:
+            # Lightweight window-function query: only ws-sv-inc had sv > prev_sv
+            return [
+                {
+                    "workspace_id": "ws-sv-inc",
+                    "version_no": 2,
+                    "scenario_version": 2,
+                    "prev_scenario_version": 1,
+                    "created_at": datetime.fromisoformat(f"{today_str}T11:00:00+00:00"),
+                }
+            ]
+        if "dalton_knowledge_versions" in sql:
+            # DISTINCT ON (workspace_id, doc_key) latest version per doc
+            return [
+                {
+                    "workspace_id": "ws-no-change",
+                    "doc_key": "company",
+                    "version_no": 1,
+                    "content": {"ticker": "META", "name": "Meta"},
+                    "created_at": f"{old_reval_str}T10:00:00+00:00",
+                },
+                {
+                    "workspace_id": "ws-no-change",
+                    "doc_key": "thesis",
+                    "version_no": 1,
+                    "content": {
+                        "house_view": {"stance": "bullish", "conviction": "high"},
+                        "underwriting": {"scenario_version": 1},
+                    },
+                    "created_at": f"{old_reval_str}T10:00:00+00:00",
+                },
+                {
+                    "workspace_id": "ws-no-change",
+                    "doc_key": "agenda",
+                    "version_no": 1,
+                    "content": {
+                        "open_questions": [
+                            {
+                                "id": "Q-001",
+                                "question": "Reels 广告负载率上限？",
+                                "why": "决定是否将可执行度从 wait_evidence 上调为 actionable 并加仓",
+                                "value": "high",
+                                "urgency": "this_week",
+                                "status": "open",
+                            },
+                            {
+                                "id": "Q-002",
+                                "question": "办公室装修细节？",
+                                "why": "",
+                                "value": "high",
+                                "urgency": "now",
+                                "status": "open",
+                            },
+                        ],
+                        "next_validations": [],
+                    },
+                    "created_at": f"{today_str}T10:00:00+00:00",
+                },
+                {
+                    "workspace_id": "ws-sv-inc",
+                    "doc_key": "company",
+                    "version_no": 1,
+                    "content": {"ticker": "NVDA", "name": "NVIDIA"},
+                    "created_at": f"{old_reval_str}T10:00:00+00:00",
+                },
+                {
+                    "workspace_id": "ws-sv-inc",
+                    "doc_key": "thesis",
+                    "version_no": 2,
+                    "content": {
+                        "house_view": {"stance": "bullish", "conviction": "high"},
+                        "underwriting": {"scenario_version": 2},
+                    },
+                    "created_at": f"{today_str}T11:00:00+00:00",
+                },
+                {
+                    "workspace_id": "ws-sv-inc",
+                    "doc_key": "agenda",
+                    "version_no": 1,
+                    "content": {
+                        "open_questions": [
+                            {
+                                "id": "Q-001",
+                                "question": "Blackwell 机架交付节奏？",
+                                "why": "决定是否维持 bullish 方向与当前核心仓位",
+                                "value": "high",
+                                "urgency": "this_week",
+                                "status": "open",
+                            }
+                        ],
+                        "next_validations": [],
+                    },
+                    "created_at": f"{today_str}T11:00:00+00:00",
+                },
+                {
+                    "workspace_id": "ws-same-day",
+                    "doc_key": "company",
+                    "version_no": 1,
+                    "content": {"ticker": "GOOGL", "name": "Alphabet"},
+                    "created_at": f"{old_reval_str}T10:00:00+00:00",
+                },
+                {
+                    "workspace_id": "ws-same-day",
+                    "doc_key": "thesis",
+                    "version_no": 1,
+                    "content": {
+                        "house_view": {"stance": "bullish", "conviction": "medium"},
+                        "underwriting": {"scenario_version": 1},
+                    },
+                    "created_at": f"{old_reval_str}T10:00:00+00:00",
+                },
+                {
+                    "workspace_id": "ws-first-only",
+                    "doc_key": "company",
+                    "version_no": 1,
+                    "content": {"ticker": "AMZN", "name": "Amazon"},
+                    "created_at": f"{old_reval_str}T10:00:00+00:00",
+                },
+                {
+                    "workspace_id": "ws-first-only",
+                    "doc_key": "thesis",
+                    "version_no": 1,
+                    "content": {
+                        "house_view": {"stance": "bullish", "conviction": "high"},
+                        "underwriting": {
+                            "scenario_version": 3,
+                            "scenario_version_updated_at": f"{today_str}T11:00:00+00:00",
+                        },
+                    },
+                    "created_at": f"{today_str}T11:00:00+00:00",
+                },
+            ]
+        if "FROM dalton_verdicts" in sql:
+            return [
+                {
+                    "workspace_id": "ws-no-change",
+                    "verdict_id": "VER-2",
+                    "verdict_at": datetime.fromisoformat(f"{today_str}T12:00:00+00:00"),
+                    "word": "NO_CHANGE",
+                    "trigger_kind": "agenda",
+                    "trigger_ref": "s1",
+                    "progress": "none",
+                    "next_due": None,
+                    "payload": {"summary": "例行扫描无变化"},
+                    "conversation_thread_id": "t1",
+                    "created_at": datetime.fromisoformat(f"{today_str}T12:00:00+00:00"),
+                },
+                {
+                    "workspace_id": "ws-no-change",
+                    "verdict_id": "VER-1",
+                    "verdict_at": datetime.fromisoformat(f"{old_reval_str}T12:00:00+00:00"),
+                    "word": "NEW_THESIS",
+                    "trigger_kind": "initial",
+                    "trigger_ref": "init",
+                    "progress": "resolved",
+                    "next_due": None,
+                    "payload": {"summary": "初始建档"},
+                    "conversation_thread_id": "t0",
+                    "created_at": datetime.fromisoformat(f"{old_reval_str}T12:00:00+00:00"),
+                },
+                {
+                    "workspace_id": "ws-sv-inc",
+                    "verdict_id": "VER-3",
+                    "verdict_at": datetime.fromisoformat(f"{today_str}T11:00:00+00:00"),
+                    "word": "NO_CHANGE",
+                    "trigger_kind": "agenda",
+                    "trigger_ref": "s2",
+                    "progress": "some",
+                    "next_due": None,
+                    "payload": {"summary": "更新情景赔率卡"},
+                    "conversation_thread_id": "t2",
+                    "created_at": datetime.fromisoformat(f"{today_str}T11:00:00+00:00"),
+                },
+                # Same-day multiple verdicts on GOOGL: returned in reverse order
+                # (09:00 first, 16:00 second) to verify full-timestamp sorting
+                {
+                    "workspace_id": "ws-same-day",
+                    "verdict_id": "VER-MORN",
+                    "verdict_at": datetime.fromisoformat(f"{today_str}T09:00:00+00:00"),
+                    "word": "THESIS_STRENGTHENED",
+                    "trigger_kind": "earnings",
+                    "trigger_ref": "q3",
+                    "progress": "resolved",
+                    "next_due": None,
+                    "payload": {"summary": "早盘季报上调论点"},
+                    "conversation_thread_id": "t-morning",
+                    "created_at": datetime.fromisoformat(f"{today_str}T09:00:00+00:00"),
+                },
+                {
+                    "workspace_id": "ws-same-day",
+                    "verdict_id": "VER-AFT",
+                    "verdict_at": datetime.fromisoformat(f"{today_str}T16:00:00+00:00"),
+                    "word": "NO_CHANGE",
+                    "trigger_kind": "price_move",
+                    "trigger_ref": "pm1",
+                    "progress": "none",
+                    "next_due": None,
+                    "payload": {"summary": "收盘扫描无变化"},
+                    "conversation_thread_id": "t-afternoon",
+                    "created_at": datetime.fromisoformat(f"{today_str}T16:00:00+00:00"),
+                },
+                {
+                    "workspace_id": "ws-first-only",
+                    "verdict_id": "VER-AMZN-1",
+                    "verdict_at": datetime.fromisoformat(f"{old_reval_str}T12:00:00+00:00"),
+                    "word": "NEW_THESIS",
+                    "trigger_kind": "initial",
+                    "trigger_ref": "init",
+                    "progress": "resolved",
+                    "next_due": None,
+                    "payload": {"summary": "初始建档"},
+                    "conversation_thread_id": "t-amzn-0",
+                    "created_at": datetime.fromisoformat(f"{old_reval_str}T12:00:00+00:00"),
+                },
+            ]
+        return []
+
+    cur.fetchall.side_effect = _fetchall
+    conn = create_autospec(AsyncConnection, instance=True)
+    conn.__aenter__.return_value = conn
+    conn.__aexit__.return_value = None
+    conn.cursor.return_value = cur
+
+    mock_budget = create_autospec(board_mod.get_budget_today)
+    mock_budget.return_value = {
+        "cap_usd": 50.0,
+        "spent_usd": 0.0,
+        "open_reserved_usd": 0.0,
+    }
+    monkeypatch.setattr(board_mod, "get_budget_today", mock_budget)
+    monkeypatch.setattr(board_mod, "get_db_connection", lambda: conn)
+    mock_coverage = create_autospec(board_mod.get_user_coverage)
+    mock_coverage.return_value = {}
+    monkeypatch.setattr(board_mod, "get_user_coverage", mock_coverage)
+
+    board = await board_mod.build_coverage_board(user_id="u1")
+    by_ticker = {c["ticker"]: c for c in board["companies"]}
+
+    # Round 3 #3: window query filters by workspace_id = ANY(%s) and casts to bigint
+    lag_queries = [(s, p) for s, p in executed_queries if "LAG(" in s]
+    assert len(lag_queries) == 1
+    assert "WHERE workspace_id = ANY(%s)" in lag_queries[0][0]
+    assert "::bigint" in lag_queries[0][0]
+    assert lag_queries[0][1] == (
+        ["ws-no-change", "ws-sv-inc", "ws-same-day", "ws-first-only"],
+    )
+
+    meta = by_ticker["META"]
+    assert "last_research_at" not in meta
+    assert meta["last_scan_at"] == f"{today_str}T12:00:00+00:00"
+    assert meta["last_revaluation_at"] == f"{old_reval_str}T12:00:00+00:00"
+    assert meta["scan_staleness"] == 1.0
+    assert meta["revaluation_staleness"] > meta["scan_staleness"]
+    assert meta["scan_only_stale"] is True
+
+    nvda = by_ticker["NVDA"]
+    assert "last_research_at" not in nvda
+    assert nvda["last_scan_at"] == f"{today_str}T11:00:00+00:00"
+    assert nvda["last_revaluation_at"] == f"{today_str}T11:00:00+00:00"
+    assert nvda["scan_staleness"] == 1.0
+    assert nvda["revaluation_staleness"] == 1.0
+    assert nvda["scan_only_stale"] is False
+
+    # Item 2: same-day 09:00 THESIS_STRENGTHENED and 16:00 NO_CHANGE on GOOGL
+    googl = by_ticker["GOOGL"]
+    assert googl["last_scan_at"] == f"{today_str}T16:00:00+00:00"
+    assert googl["last_revaluation_at"] == f"{today_str}T09:00:00+00:00"
+    assert googl["last_verdict"]["word"] == "NO_CHANGE"
+    assert googl["last_verdict"]["summary"] == "收盘扫描无变化"
+    assert googl["last_verdict"]["thread_id"] == "t-afternoon"
+
+    # Item 8: first historical version on AMZN (version_no=1, scenario_version=3)
+    # does NOT count as a scenario_version increment
+    amzn = by_ticker["AMZN"]
+    assert amzn["last_revaluation_at"] == f"{old_reval_str}T12:00:00+00:00"
+
+    # Q-002 on META had empty why/decision_impact so it must NOT be scheduled
+    cand_tasks = [c["task"] for c in board["candidates"]]
+    assert any("Q-001" in t and "Reels" in t for t in cand_tasks)
+    assert not any("Q-002" in t for t in cand_tasks)
+    for cand in board["candidates"]:
+        assert cand.get("decision_impact")
+        assert "解决后改变的决定=" in cand.get("why", "")
+
+    # dalton_record_plan refuses a dispatch whose decision_impact is '无' OR
+    # when both decision_impact and why are omitted (Item 6)
+    monkeypatch.setattr(
+        dt_mod,
+        "verify_workspace_access",
+        create_autospec(dt_mod.verify_workspace_access, return_value=None),
+    )
+    monkeypatch.setattr(
+        dt_mod,
+        "build_coverage_board",
+        create_autospec(dt_mod.build_coverage_board, return_value=board),
+    )
+    monkeypatch.setattr(
+        plans_db,
+        "upsert_daily_plan",
+        create_autospec(
+            plans_db.upsert_daily_plan, return_value={"created_at": today_str}
+        ),
+    )
+    tools = {t.name: t for t in dt_mod.build_director_tools(role="chief_of_staff")}
+    refused_raw = await tools["dalton_record_plan"].ainvoke(
+        {
+            "dispatches": [
+                {
+                    "ticker": "META",
+                    "workspace_id": "ws-no-change",
+                    "task": "无决定影响任务",
+                    "kind": "open_question",
+                    "est_usd": 1.0,
+                    "decision_impact": "无",
+                }
+            ]
+        },
+        config={"configurable": {"user_id": "u1"}},
+    )
+    refused = json.loads(refused_raw)
+    assert refused["ok"] is False
+    assert refused["error"] == "missing_decision_impact"
+
+    refused_omitted_raw = await tools["dalton_record_plan"].ainvoke(
+        {
+            "dispatches": [
+                {
+                    "ticker": "META",
+                    "workspace_id": "ws-no-change",
+                    "task": "完全省略决定影响字段的任务",
+                    "kind": "open_question",
+                    "est_usd": 1.0,
+                }
+            ]
+        },
+        config={"configurable": {"user_id": "u1"}},
+    )
+    refused_omitted = json.loads(refused_omitted_raw)
+    assert refused_omitted["ok"] is False
+    assert refused_omitted["error"] == "missing_decision_impact"
+
+    # Round 3 #4: empty/null decision_impact falls back to valid why; placeholder
+    # markers ("null", "na", "n/a", "无。", "暂无", "none") with trailing punctuation/spaces are rejected
+    for empty_di in (None, "", "   ", "null", "NULL。"):
+        fallback_ok_raw = await tools["dalton_record_plan"].ainvoke(
+            {
+                "dispatches": [
+                    {
+                        "ticker": "META",
+                        "workspace_id": "ws-no-change",
+                        "task": "回退到有效 why 的任务",
+                        "kind": "open_question",
+                        "est_usd": 1.0,
+                        "decision_impact": empty_di,
+                        "why": "决定是否将可执行度上调为 actionable",
+                    }
+                ]
+            },
+            config={"configurable": {"user_id": "u1"}},
+        )
+        fallback_ok = json.loads(fallback_ok_raw)
+        assert fallback_ok["ok"] is True, empty_di
+
+    for bad_marker in ("null", "na", "n/a", "无。", "暂无", "none", "  暂无！ "):
+        bad_raw = await tools["dalton_record_plan"].ainvoke(
+            {
+                "dispatches": [
+                    {
+                        "ticker": "META",
+                        "workspace_id": "ws-no-change",
+                        "task": "空话决定影响任务",
+                        "kind": "open_question",
+                        "est_usd": 1.0,
+                        "decision_impact": bad_marker,
+                    }
+                ]
+            },
+            config={"configurable": {"user_id": "u1"}},
+        )
+        bad_res = json.loads(bad_raw)
+        assert bad_res["ok"] is False, bad_marker
+        assert bad_res["error"] == "missing_decision_impact", bad_marker
+
+    # Round 3 #3: when user has no workspaces, the LAG window query is skipped
+    executed_queries.clear()
+    cur.fetchall.side_effect = lambda: []
+    await board_mod.build_coverage_board(user_id="u-empty")
+    assert not any("LAG(" in s for s, _ in executed_queries)
+
+
+@pytest.mark.asyncio
+async def test_b5b_weekly_review_first_of_month_archive_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Batch 5b #2a (and Round 2 #4, #5):
+    - Whether a weekly review is the first issue of the month is determined by
+      whether any completed weekly draft exists earlier in `end`'s month (so if
+      November's first weekly review runs on 2026-11-13, it still requires
+      dalton/drafts/2026-10-monthly-review.md; if 2026-11-06-weekly.md exists,
+      2026-11-13 is the second issue and does not require the archive).
+    - Only the previous month's archive file (<prev_month>-monthly-review.md)
+      satisfies the check; having only <end_month>-monthly-review.md is rejected.
+    """
+    _patch_knowledge(monkeypatch, [])
+    end_date = "2026-11-06"
+    push_path = f"research/push/{end_date}-director-weekly.md"
+    push_text = "## 周度复盘推送\n本周核心结论。\n"
+    base_files = {
+        f"dalton/research/weekly-{end_date}/screen.json": json.dumps(
+            {"core": [{"ticker": "META", "workspace": "Meta Platforms"}], "flagged": []}
+        ),
+        f"dalton/research/weekly-{end_date}/attribution.json": json.dumps(
+            {"META": {"eps_chg": 0.02, "mult_chg": -0.01}, "rows": ["x" * 60]}
+        ),
+        f"dalton/research/weekly-{end_date}/core-META.md": "# META 周度深挖\n" + "内容" * 80,
+        f"dalton/drafts/{end_date}-weekly.md": "# 周会稿\n" + "正文" * 300,
+        push_path: push_text,
+        f"{push_path}.language.json": _language_json(push_text),
+    }
+    params = {
+        "home_dir": "dalton",
+        "end": end_date,
+        "coverage_path": "dalton/coverage.yaml",
+    }
+
+    # 1. Omitted monthly review archive -> rejected
+    res_missing = await run_check_done(
+        workflow="weekly-coverage-review",
+        params=params,
+        backend=_make_backend(base_files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert res_missing["done"] is False
+    assert any(
+        "2026-10-monthly-review.md" in m for m in res_missing["missing"]
+    ), res_missing["missing"]
+
+    # 2. Empty monthly review archive -> rejected
+    res_empty = await run_check_done(
+        workflow="weekly-coverage-review",
+        params=params,
+        backend=_make_backend(
+            {**base_files, "dalton/drafts/2026-10-monthly-review.md": "   \n"}
+        ),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert res_empty["done"] is False
+    assert any(
+        "2026-10-monthly-review.md" in m for m in res_empty["missing"]
+    ), res_empty["missing"]
+
+    # 3. Item 5 & Round 3 #1, #2: Only current month's archive (2026-11-monthly-review.md)
+    # exists, missing previous month's archive (2026-10-monthly-review.md) -> rejected,
+    # even if caller passes prev_month="2026-11", monthly_review_draft="dalton/drafts/2026-11-monthly-review.md",
+    # or first_of_month=False.
+    wrong_month_files = {
+        **base_files,
+        "dalton/drafts/2026-11-monthly-review.md": "# 2026-11 月度复盘\n错写成当月文件名。\n",
+    }
+    for override_params in (
+        params,
+        {**params, "prev_month": "2026-11"},
+        {
+            **params,
+            "monthly_review_draft": "dalton/drafts/2026-11-monthly-review.md",
+        },
+        {**params, "first_of_month": False},
+    ):
+        res_wrong_month = await run_check_done(
+            workflow="weekly-coverage-review",
+            params=override_params,
+            backend=_make_backend(wrong_month_files),
+            workspace_id=WS,
+            thread_id="short-1",
+        )
+        assert res_wrong_month["done"] is False, override_params
+        assert any(
+            "2026-10-monthly-review.md" in m for m in res_wrong_month["missing"]
+        ), (override_params, res_wrong_month["missing"])
+
+    # 4. Non-empty previous-month monthly review archive present -> passes
+    res_ok = await run_check_done(
+        workflow="weekly-coverage-review",
+        params=params,
+        backend=_make_backend(
+            {
+                **base_files,
+                "dalton/drafts/2026-10-monthly-review.md": "# 2026-10 月度复盘\n情景覆盖率 92%，漏提醒 0 次。\n",
+            }
+        ),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert res_ok["done"] is True, res_ok["missing"]
+
+    # 5. Item 4: First weekly review of November running on Nov 13 (no earlier
+    # 2026-11-*-weekly.md) still requires 2026-10-monthly-review.md; when
+    # 2026-11-06-weekly.md exists (second issue of the month), it does not.
+    end_nov13 = "2026-11-13"
+    push_nov13 = f"research/push/{end_nov13}-director-weekly.md"
+    files_nov13 = {
+        f"dalton/research/weekly-{end_nov13}/screen.json": json.dumps(
+            {"core": [{"ticker": "META", "workspace": "Meta Platforms"}], "flagged": []}
+        ),
+        f"dalton/research/weekly-{end_nov13}/attribution.json": json.dumps(
+            {"META": {"eps_chg": 0.02, "mult_chg": -0.01}, "rows": ["x" * 60]}
+        ),
+        f"dalton/research/weekly-{end_nov13}/core-META.md": "# META 周度深挖\n" + "内容" * 80,
+        f"dalton/drafts/{end_nov13}-weekly.md": "# 周会稿\n" + "正文" * 300,
+        push_nov13: push_text,
+        f"{push_nov13}.language.json": _language_json(push_text),
+    }
+    params_nov13 = {
+        "home_dir": "dalton",
+        "end": end_nov13,
+        "coverage_path": "dalton/coverage.yaml",
+    }
+    res_nov13_first_missing = await run_check_done(
+        workflow="weekly-coverage-review",
+        params=params_nov13,
+        backend=_make_backend(files_nov13),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert res_nov13_first_missing["done"] is False
+    assert any(
+        "2026-10-monthly-review.md" in m for m in res_nov13_first_missing["missing"]
+    ), res_nov13_first_missing["missing"]
+
+    res_nov13_second_issue = await run_check_done(
+        workflow="weekly-coverage-review",
+        params=params_nov13,
+        backend=_make_backend(
+            {
+                **files_nov13,
+                "dalton/drafts/2026-11-06-weekly.md": "# 上周周会稿\n" + "正文" * 300,
+            }
+        ),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert res_nov13_second_issue["done"] is True, res_nov13_second_issue["missing"]
+
+
+@pytest.mark.asyncio
+async def test_b5b_sector_delta_increment_and_period_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Batch 5b #2b: dalton-sector-delta requires the increment file to exist,
+    be non-empty, and state the covered period (since -> until).
+    """
+    _patch_knowledge(monkeypatch, ["thesis"])
+    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", "internal_material")])
+
+    last_run_ok = json.dumps(
+        {
+            "subject_kind": "sector",
+            "sector": "AI 基础设施",
+            "unit_id": "u-1",
+            "since": "2026-10-16",
+            "until": "2026-10-23",
+            "window_advanced": True,
+            "committed_at": "2026-10-23T11:00:00+08:00",
+            "run_id": "20261023-1100",
+            "material": "yes",
+            "summary": "云厂商上修 CapEx 指引",
+        },
+        ensure_ascii=False,
+    )
+    base_files = {
+        "research/tracker/last_run.json": last_run_ok,
+        "research/tracker/updates.log": "2026-10-23T11:00:00 | 20261023-1100 | material=yes | 云厂商上修\n",
+    }
+
+    # 1. Missing increment note -> rejected
+    res_missing = await run_check_done(
+        workflow="dalton-sector-delta",
+        params={"as_of": "2026-10-23"},
+        backend=_make_backend(base_files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert res_missing["done"] is False
+    assert any("2026-10-23-delta.md" in m for m in res_missing["missing"]), res_missing["missing"]
+
+    # 2. Increment note exists and is non-empty, but omits covered period -> rejected
+    res_no_period = await run_check_done(
+        workflow="dalton-sector-delta",
+        params={"as_of": "2026-10-23"},
+        backend=_make_backend(
+            {
+                **base_files,
+                "research/2026-10-23-delta.md": "# 行业增量笔记\n" + "本轮发现云厂商上修资本开支指引。" * 15,
+            }
+        ),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert res_no_period["done"] is False
+    assert any("未写明本轮覆盖的期间" in m for m in res_no_period["missing"]), res_no_period["missing"]
+
+    # 3. Increment note exists, is non-empty, and states covered period -> passes
+    res_ok = await run_check_done(
+        workflow="dalton-sector-delta",
+        params={"as_of": "2026-10-23"},
+        backend=_make_backend(
+            {
+                **base_files,
+                "research/2026-10-23-delta.md": (
+                    "# 行业增量笔记（覆盖期间：2026-10-16 至 2026-10-23）\n"
+                    + "本轮发现云厂商上修资本开支指引，已更新行业支柱 P1。" * 10
+                ),
+            }
+        ),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert res_ok["done"] is True, res_ok["missing"]
+
+
+@pytest.mark.asyncio
+async def test_b5b_earnings_calendar_scan_persisted_and_dates_confirmed_or_pending_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Batch 5b #2c: dalton-earnings-calendar requires the scan JSONL file to be
+    persisted on disk and every date to be either confirmed or marked 待确认.
+    """
+    _patch_knowledge(monkeypatch, [])
+    _patch_calendar_signal(monkeypatch, status="resolved")
+    _patch_home_workspace(monkeypatch)
+    _patch_calendar_mirror(monkeypatch, _cal_ledger())
+
+    # 1. Scan file missing -> rejected
+    files_no_scan = _cal_files()
+    files_no_scan.pop("dalton/research/earnings-scan-2026-10-23.jsonl", None)
+    res_missing_scan = await run_check_done(
+        workflow="dalton-earnings-calendar",
+        params=CAL_PARAMS,
+        backend=_make_backend(files_no_scan),
+        workspace_id=None,
+        user_id="user-1",
+        thread_id="short-1",
+    )
+    assert res_missing_scan["done"] is False
+    assert any(
+        "earnings-scan-2026-10-23.jsonl" in m for m in res_missing_scan["missing"]
+    ), res_missing_scan["missing"]
+
+    # 2. Scan file has a date that is neither confirmed nor marked 待确认 -> rejected
+    bad_scan_line = (
+        json.dumps(
+            {
+                "ticker": "GOOGL",
+                "name": "Alphabet",
+                "status": "pending",
+                "earnings_date": "2026-11-05",
+                "confidence": "high",
+                "notes": "FMP 日期但未标待确认",
+            },
+            ensure_ascii=False,
+        )
+        + "\n"
+    )
+    res_unmarked = await run_check_done(
+        workflow="dalton-earnings-calendar",
+        params=CAL_PARAMS,
+        backend=_make_backend(
+            _cal_files(**{"dalton/research/earnings-scan-2026-10-23.jsonl": bad_scan_line})
+        ),
+        workspace_id=None,
+        user_id="user-1",
+        thread_id="short-1",
+    )
+    assert res_unmarked["done"] is False
+    assert any(
+        "未标明确认或待确认" in m for m in res_unmarked["missing"]
+    ), res_unmarked["missing"]
+
+    # 3. Scan file persisted and every date is confirmed or marked 待确认 -> passes
+    res_ok = await run_check_done(
+        workflow="dalton-earnings-calendar",
+        params=CAL_PARAMS,
+        backend=_make_backend(_cal_files()),
+        workspace_id=None,
+        user_id="user-1",
+        thread_id="short-1",
+    )
+    assert res_ok["done"] is True, res_ok["missing"]
+
+    # 4. Item 1: already_reported rows (this quarter already reported, next
+    # quarter unannounced — with or without date) in scan JSONL -> passes
+    already_reported_scan = (
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "ticker": "META",
+                        "name": "Meta Platforms",
+                        "status": "confirmed",
+                        "earnings_date": "2026-10-30",
+                        "fiscal_quarter": "Q3 2026",
+                        "time_of_day": "AMC",
+                        "confidence": "high",
+                        "official_source": "https://investor.atmeta.com/pr",
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "ticker": "TSMC",
+                        "name": "Taiwan Semiconductor",
+                        "status": "already_reported",
+                        "earnings_date": "2026-10-15",
+                        "fiscal_quarter": "Q3 2026",
+                        "notes": "本季已于 10-15 发布，下季日期尚未公布",
+                    },
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    {
+                        "ticker": "ASML",
+                        "name": "ASML Holding",
+                        "status": "already_reported",
+                        "earnings_date": "",
+                        "fiscal_quarter": "Q3 2026",
+                        "notes": "本季已发布，下季未公布",
+                    },
+                    ensure_ascii=False,
+                ),
+            ]
+        )
+        + "\n"
+    )
+    res_already_reported = await run_check_done(
+        workflow="dalton-earnings-calendar",
+        params=CAL_PARAMS,
+        backend=_make_backend(
+            _cal_files(
+                **{"dalton/research/earnings-scan-2026-10-23.jsonl": already_reported_scan}
+            )
+        ),
+        workspace_id=None,
+        user_id="user-1",
+        thread_id="short-1",
+    )
+    assert res_already_reported["done"] is True, res_already_reported["missing"]
