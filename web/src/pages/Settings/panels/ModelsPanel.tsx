@@ -30,6 +30,7 @@ import { SETTINGS, settingAt } from '../sections';
 import { BACKGROUND_AUTO, backgroundDefaultChoice, isModelWrite, modelPrefs, readDefaultModelScope, splitPreferenceWrite } from '@/lib/modelPreferences';
 import { useModelSlotCopy } from '@/components/model/useModelSlotCopy';
 import { paidByDeployment, paidByUser } from '@/lib/modelPayer';
+import { isClaudeCodeModel } from '@/lib/claudeCode';
 import type { ModelSlot, DefaultModelScope, PreferencePatch } from '@/lib/modelPreferences';
 
 type ModelsMode = 'simple' | 'advanced';
@@ -59,7 +60,7 @@ export function ModelsPanel() {
   const { preferences: prefsData } = usePreferences();
   const { mutate } = useUpdatePreferences();
   // DALTON-HOOK(settings-section): customModels is read to keep custom models out of the Dalton selectors
-  const { models: visibleModels, metadata: modelMetadata, payers, systemDefaults: hookSystemDefaults, customModels, validModelNames, catalogModelNames, isLoading: modelsLoading, compactionProfiles } = useAllModels();
+  const { models: visibleModels, slotModels, metadata: modelMetadata, payers, systemDefaults: hookSystemDefaults, customModels, validModelNames, catalogModelNames, isLoading: modelsLoading, compactionProfiles } = useAllModels();
   const { t } = useTranslation();
   const copy = useSettingCopy();
   const modelSlotCopy = useModelSlotCopy();
@@ -139,9 +140,10 @@ export function ModelsPanel() {
   );
   // Once saved, those models are the user's choice and catch every turn, the
   // ones their plan or key pays for included, which the list no longer shows.
+  // A Claude Code turn takes no fallback, so its models are not such a turn.
   const savedCrossesPayer = mPref.fallback_models != null
     && fallbackModels.some((m) => paidByDeployment(payers[m]))
-    && Object.values(payers).some(paidByUser);
+    && Object.entries(payers).some(([m, payer]) => paidByUser(payer) && !isClaudeCodeModel(modelMetadata[m]));
 
   // While the question is open each select shows the model the answer would
   // write, and a cancel puts both back on the saved ones.
@@ -292,6 +294,7 @@ export function ModelsPanel() {
         <SettingsCardBody id={SETTINGS.defaultModels.anchor}>
           <ModelTierConfig
             models={visibleModels}
+            backgroundModels={slotModels}
             metadata={modelMetadata}
             primaryModel={shownDefault('default')}
             onPrimaryModelChange={setDefault('default')}
@@ -464,7 +467,7 @@ export function ModelsPanel() {
                 description={t('settings.modelTuning.fetchModelDesc')}
                 value={mPref.fetch_model ?? ''}
                 onChange={(v) => write({ fetch_model: v || null })}
-                models={visibleModels}
+                models={slotModels}
                 placeholder={modelSlotCopy.defaultsToBackground}
                 payers={payers}
                 metadata={modelMetadata}
@@ -480,7 +483,7 @@ export function ModelsPanel() {
                   // user clears compaction_model.
                   summarization_model: null,
                 })}
-                models={visibleModels}
+                models={slotModels}
                 placeholder={modelSlotCopy.defaultsToConversation}
                 payers={payers}
                 metadata={modelMetadata}
@@ -503,7 +506,7 @@ export function ModelsPanel() {
               <FallbackModelsPicker
                 selected={fallbackModels}
                 onChange={(list) => write({ fallback_models: list })}
-                models={visibleModels}
+                models={slotModels}
                 metadata={modelMetadata}
                 payers={payers}
                 skipped={{

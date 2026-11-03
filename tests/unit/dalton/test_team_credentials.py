@@ -1998,7 +1998,7 @@ async def test_oauth_demotion_mid_flow_rejects_callback_and_poll_without_write(
         "generate_authorize_url",
         create_autospec(
             claude_oauth.generate_authorize_url,
-            return_value=("https://claude.ai/oauth/authorize?state=s-claude", "s-claude"),
+            return_value=("https://claude.ai/oauth/authorize?state=s-claude", "s-claude", "s-claude"),
         ),
     )
     monkeypatch.setattr(

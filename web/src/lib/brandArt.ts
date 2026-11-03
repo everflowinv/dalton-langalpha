@@ -17,6 +17,7 @@ import { baseURL } from '@/pages/ChatAgent/utils/api/transport';
 
 import iconOpenai from '@/assets/providers/openai.svg';
 import iconAnthropic from '@/assets/providers/anthropic.svg';
+import iconClaude from '@/assets/providers/claude.svg';
 import iconGemini from '@/assets/providers/gemini.svg';
 import iconOpenrouter from '@/assets/providers/openrouter.svg';
 import iconZai from '@/assets/providers/z-ai.svg';
@@ -78,6 +79,7 @@ const LLM_PROVIDER_ART: Record<string, BrandArt> = {
   // no icon asset and falls back to its initials; xai-oauth wears xAI's mark.
   'antigravity-oauth': mark(iconGemini, false, 'Gemini'),
   'xai-oauth': XAI,
+  'claude-code': mark(iconClaude, false, 'Claude'),
   gemini: mark(iconGemini, false, 'Gemini'),
   xai: XAI,
   'grok-oauth': XAI,

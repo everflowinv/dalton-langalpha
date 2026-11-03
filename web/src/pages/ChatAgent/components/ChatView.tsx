@@ -1966,6 +1966,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                         onPickReasoningEffort={threadTuning.setReasoningEffort}
                         onPickFastMode={threadTuning.setFastMode}
                         selectedWorkspaceId={workspaceId}
+                        inHome={isHome}
                         toolbarStatus={trayContents && (
                           <TrayDock ref={trayDockRef} phase={trayPhase} contents={trayContents} onOpen={peekTray} />
                         )}

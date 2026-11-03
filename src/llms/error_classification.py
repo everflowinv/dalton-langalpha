@@ -55,7 +55,7 @@ _OVERFLOW_PHRASES = (
 )
 
 
-def _iter_exception_chain(exc: BaseException):
+def iter_exception_chain(exc: BaseException):
     seen: set[int] = set()
     current: BaseException | None = exc
     while current is not None and id(current) not in seen:
@@ -71,7 +71,7 @@ def extract_status_code(exc: BaseException) -> int | None:
     exception in the chain, then falls back to parsing a 4xx/5xx code out of
     the exception messages.
     """
-    for current in _iter_exception_chain(exc):
+    for current in iter_exception_chain(exc):
         status = getattr(current, "status_code", None)
         if isinstance(status, int):
             return status
@@ -80,7 +80,7 @@ def extract_status_code(exc: BaseException) -> int | None:
         if isinstance(status, int):
             return status
 
-    for current in _iter_exception_chain(exc):
+    for current in iter_exception_chain(exc):
         # A timeout never carries a provider status, and its message can carry
         # numbers that look like one: ``chunks_received=413`` read as a 413
         # would make a stalled stream look like a payload the provider refused.
@@ -107,7 +107,7 @@ def is_stalled_stream(exc: BaseException) -> bool:
     return any(
         isinstance(current, TimeoutError)
         and isinstance(getattr(current, "chunks_received", None), int)
-        for current in _iter_exception_chain(exc)
+        for current in iter_exception_chain(exc)
     )
 
 
@@ -121,7 +121,7 @@ def is_mid_stream_error(exc: BaseException) -> bool:
     """
     return any(
         getattr(current, "mid_stream", False) is True
-        for current in _iter_exception_chain(exc)
+        for current in iter_exception_chain(exc)
     )
 
 
@@ -133,7 +133,7 @@ def is_programming_error(exc: BaseException) -> bool:
     """
     return any(
         isinstance(current, _PROGRAMMING_ERRORS)
-        for current in _iter_exception_chain(exc)
+        for current in iter_exception_chain(exc)
     )
 
 
@@ -152,7 +152,7 @@ def is_context_overflow(exc: BaseException) -> bool:
     """
     from langchain_core.exceptions import ContextOverflowError
 
-    for current in _iter_exception_chain(exc):
+    for current in iter_exception_chain(exc):
         if isinstance(current, ContextOverflowError):
             return True
         # The status as the SDK set it, on the error or its response, never
@@ -246,7 +246,7 @@ def quota_exhaustion_seconds(
     if status_code == 429:
         # A numeric Retry-After header is a horizon too; the HTTP-date form
         # is not parsed — providers that mean hours say so in the body.
-        for current in _iter_exception_chain(exc):
+        for current in iter_exception_chain(exc):
             response = getattr(current, "response", None)
             headers = getattr(response, "headers", None)
             raw = headers.get("Retry-After") if hasattr(headers, "get") else None
