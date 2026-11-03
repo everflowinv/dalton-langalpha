@@ -16,7 +16,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 - **只认公司官方来源**：仅公司 IR 新闻稿、IR Events 页面、美股 SEC 8-K/6-K 或港股/A 股交易所法定排期公告（通过 `researchdata.finance(route="cn-hk", operation="filings", ...)` 或披露易 HKEXnews 原文核实的董事会会议召期通告、定期报告预约披露时间表）明确披露未来发布日期时，才标为 `confirmed`（`date_status: confirmed`）并创建财报链自动任务。
 - **聚合日历一律标“待确认”**：FMP、yfinance、Nasdaq、Zacks、Earnings Whispers、WSJ、MarketWatch、`get_earnings_calendar` 等给出的日期只记为 `pending`（附 `tentative_date`、`tentative_sources`），`date_status: estimated`，界面与总结显示“待确认”，**在官方公布前绝不建 `tm3/t0/tp1` 自动任务**（若 `tentative_date` 在 10 天内，只建一条 T-5 的 `once` 日期复查任务，仅复查日期不做研究）。详见 [`references/classification.md`](references/classification.md)。
-- **跨工作区建任务统一调用 `dalton_schedule_automation`**：Home 的研究总监调用 `dalton_schedule_automation(action="upsert", name=..., trigger_type="once", next_run_at=..., instruction=..., description=..., timezone_name=..., workspace_id=..., ticker=...)` 创建或原地改期；分析师在本公司工作区补建时可直接写文件或调用该工具（常设授权）。标准四项自动跟踪（含 `move-up` / `move-down` 价格触发）在自动维护路径统一调用 `dalton_coverage_tracking(action="enable", source="coverage_finish", ticker=..., workspace_id=...)` 开启与补建（`source="coverage_finish"` 会尊重 `paused_by_user` 标记，不会重新打开用户主动暂停的跟踪和财报任务；仅当用户明确要求恢复跟踪时才传 `source="user"`）。
+- **跨工作区建任务统一调用 `dalton_schedule_automation`**：Home 的研究总监调用 `dalton_schedule_automation(action="upsert", name=..., trigger_type="once", next_run_at=..., instruction=..., description=..., timezone_name=..., workspace_id=..., ticker=...)` 创建或原地改期；分析师在本公司工作区补建时可直接写文件或调用该工具（常设授权）。标准四项自动跟踪（含 `move-up` / `move-down` 价格触发）在自动维护路径统一调用 `dalton_coverage_tracking(action="enable", source="coverage_finish", ticker=..., workspace_id=...)` 开启与补建（自动维护时 `source` 必须传 `"coverage_finish"`，以尊重 `paused_by_user` 标记、不重新打开用户主动暂停的跟踪和财报任务；仅当用户明确要求恢复跟踪时 `source` 才传 `"user"`）。
 - **无工作区不建链**：只为 `workspace.status=active` 的公司创建自动任务链；没有工作区的 Core 公司列入总结“缺工作区”，严禁在 Home 工作区跑出无知识层支撑的前瞻。
 
 ---
@@ -107,7 +107,7 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
 3. **逐家追加 JSONL**：每查完一家，立即用 `json.dumps` 追加一行到 `dalton/research/earnings-scan-<YYYY-MM-DD>.jsonl`（本 skill 在 Home 工作区运行，路径相对 Home 根；禁止手写字符串拼接）。字段固定为：
    `ticker, name, status, earnings_date, timing, quarter_label, confidence, source_url, evidence, notes`
    - 工具报错或超时写 `"status": "scan_failed"`，**严禁写成 `"not_announced"`**。
-   - 仅有聚合站/FMP/yfinance 日期时，写 `"status": "pending"`，在 `earnings_date` 记录候选日期，`confidence: "estimated"`，并在 `notes` 注明候选来源。
+   - 仅有聚合网站、FMP 或 yfinance 日期时，写 `"status": "pending"`，在 `earnings_date` 记录候选日期，`confidence` 写 `"estimated"`，并在 `notes` 注明候选来源（含“待确认”）。
 4. **大名单并行分片**：当待扫名单 > 30 家时，可用 workflow 内联脚本按 tier 分 4 组 `parallel` 扫描（每组派一个 `dalton-evidence` 子智能体，各写分片 jsonl），主智能体收齐后进入合并。
 
 ### Step 4：合并与容错解析（Merge）
@@ -163,9 +163,9 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
    ```
 6. **同步公司议程（`dalton_watch_event`）**：
    调用 `dalton_watch_event` 将事件 upsert 至该公司 `agenda.watch.events`（字段严格对齐 `agenda.schema.json`，不传 `timing`、`source_url`、`tentative_date` 等非 schema 字段）：
-   - **官方确认**：传 `workspace_id`、`type="earnings"`、`date="<YYYY-MM-DD>"`、`date_status="confirmed"`、`source="<官方来源 URL>"`、`plan="T-3 dalton-<t>-earn-<period>-tm3 / T0 dalton-<t>-earn-<period>-t0 / T+1 dalton-<t>-earn-<period>-tp1"`（Watch 公司仅写 `T0`），把财季、发布时点与电话会时间写进 `note`（例如 `"FY26Q3 财报 · 盘后 16:05 ET · 电话会 16:30"`）；
-   - **候选待确认**：传 `workspace_id`、`type="earnings"`、`date="<候选 YYYY-MM-DD>"`、`date_status="estimated"`（显示“待确认”）、`source="<候选来源说明>"`、`note="FY26Q3 财报 · 待确认"`，**不写 `plan`**；
-   - **改期**：传 `event_id`（或不传 `event_id`，由工具按同 `type="earnings"` 且 `note` 开头的财季标识如 `FY26Q3` 自动匹配已有事件更新），更新为新 `date`，并在 `note` 中保留旧日期与改期说明（例如 `"FY26Q3 财报 · 盘后 16:05 ET · 电话会 16:30（原 10/27，改期）"`）。
+   - **官方确认**：传 `workspace_id`、`type` 传 `"earnings"`、`date="<YYYY-MM-DD>"`、`date_status="confirmed"`、`source="<官方来源 URL>"`、`plan="T-3 dalton-<t>-earn-<period>-tm3 / T0 dalton-<t>-earn-<period>-t0 / T+1 dalton-<t>-earn-<period>-tp1"`（Watch 公司仅写 `T0`），把财季、发布时点与电话会时间写进 `note`（例如 `"FY26Q3 财报 · 盘后 16:05 ET · 电话会 16:30"`）；
+   - **候选待确认**：传 `workspace_id`、`type` 传 `"earnings"`、`date="<候选 YYYY-MM-DD>"`、`date_status="estimated"`（显示“待确认”）、`source="<候选来源说明>"`、`note="FY26Q3 财报 · 待确认"`，**不写 `plan`**；
+   - **改期**：传 `event_id`（或不传 `event_id`，由工具按相同 `type`〔`"earnings"`〕且 `note` 开头的财季标识如 `FY26Q3` 自动匹配已有事件更新），更新为新 `date`，并在 `note` 中保留旧日期与改期说明（例如 `"FY26Q3 财报 · 盘后 16:05 ET · 电话会 16:30（原 10/27，改期）"`）。
 
 ### Step 6：强制对账（Reconciliation，不过不算完成）
 
@@ -179,7 +179,7 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
    检查 `missing` 与 `date_mismatch`。
 2. **自动任务文件读回核验**：
    逐个读回三条自动任务文件的 `state.next_run_at`（或顶层 `next_run_at`），确认：
-   - `status == "active"`；
+   - 任务 `status` 为 `"active"`；
    - 带时区偏移的时间先转换到公司所在市场时区（如 `America/New_York`）再比对日期与时点，**严禁直接截取字符串前 10 位**；
    - 若读回不可用，只能报告“本地已记录”，严禁报告“对账通过”；
    - 对账未通过的公司及原因逐条进入总结第 2 项“**未落库**”。
@@ -203,19 +203,22 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
 3. **解析失败行**：Step 4 捕获的 JSONL 坏行清单（没有写“无”）
 4. **改期**：公司 / 旧日期 → 新日期 / 改期原因 / 自动任务原地更新状态
 5. **本周已发布、仍待官宣与缺工作区**：本轮 `roll` 移入 `reported` 的公司、仍处于 `pending` 的数量（附带 `date_status: estimated`“待确认”候选日期的公司列表）、缺工作区的 Core 公司、以及**台账镜像与当周信号**的关闭结果（发布是否成功、`resolved_count` 各是多少）
-6. **扫描失败的公司**：`status: "scan_failed"` 的公司及失败原因（没有写“无”）
+6. **扫描失败的公司**：`status` 为 `"scan_failed"` 的公司及失败原因（没有写“无”）
 
 ### 收尾门禁：汇报完成前必须过完成契约（`dalton_check_done`）
 
 - **推送稿两轮语言审查与原样回复**：按 `.agents/skills/dalton-conventions/SKILL.md` §8 将总结推送正文写入 Home 工作区下的 `research/push/<YYYY-MM-DD>-earnings-calendar.md` 并完成两轮 `check_language`，最后回复与该推送稿逐字相同。
-- 向 PM 汇报“完成”前，必须在 Home 调用 `dalton_check_done(workflow="dalton-earnings-calendar", params={"as_of": "<YYYY-MM-DD>"})`。
-- `done=false` 时按 `missing` 先补齐再查（推送稿缺失或语言审查缺轮次、第 2 轮哈希对不上就补跑 `check_language`）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。
+- 向 PM 汇报“完成”前，必须在 Home 调用 `dalton_check_done(workflow="dalton-earnings-calendar", params={"as_of": "<YYYY-MM-DD>"})`。完成前会检查：
+  1. 本轮扫描文件 `dalton/research/earnings-scan-<YYYY-MM-DD>.jsonl` 必须已写入且非空，且每条带日期的记录要么已官方确认（`status` 为 `"confirmed"`），要么标为“待确认”（`status` 为 `"pending"`，且 `confidence` 为 `"estimated"` 或 `notes` 含“待确认”），或属于本期已发布、下季未公布（`status` 为 `"already_reported"`）；
+  2. 台账 `dalton/earnings-calendar.json` 中每个带日期的条目要么已官方确认（`status` 为 `"confirmed"` 且 `date_status="confirmed"`），要么标为“待确认”（`status` 为 `"pending"` 且 `date_status="estimated"`），且本轮已调用 `dalton_publish_earnings_calendar` 发布服务端镜像、调用 `dalton_resolve_signals` 关闭本周日历唤醒信号；
+  3. 推送稿 `research/push/<YYYY-MM-DD>-earnings-calendar.md` 已完成两轮 `check_language`。
+- `done=false` 时按 `missing` 先补齐再查（扫描文件未写入或日期状态未标明、推送稿缺失或语言审查缺轮次、第 2 轮哈希对不上就补跑 `check_language`）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。
 
 ---
 
-## 自动任务 JSON 模板（遵守 PK.15）
+## 自动任务 JSON 模板
 
-> 推送由 Dalton 通知模块按用户的飞书开关统一处理，自动任务模板中不写 `"delivery"` 字段；公司价格触发任务在自动维护时统一由 `dalton_coverage_tracking(action="enable", source="coverage_finish", ticker=..., workspace_id=...)` 管理（仅在用户明确要求恢复跟踪时传 `source="user"`）。
+> 推送由 Dalton 通知模块按用户的飞书开关统一处理，自动任务模板中不写 `"delivery"` 字段；公司价格触发任务在自动维护时统一由 `dalton_coverage_tracking(action="enable", source="coverage_finish", ticker=..., workspace_id=...)` 管理（仅在用户明确要求恢复跟踪时 `source` 传 `"user"`）。
 
 ### 1. 每周日历维护（`dalton-earnings-calendar.json`，Home 工作区）
 

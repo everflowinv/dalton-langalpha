@@ -71,14 +71,23 @@ def render_coverage_html(board: dict[str, Any]) -> str:
 
         lp = c.get("last_publication") or {}
         pub_str = _esc(lp.get("title") or "-") if isinstance(lp, dict) else "-"
+        last_scan_at = _esc(str(c.get("last_scan_at") or "-")[:10])
+        last_revaluation_at = _esc(str(c.get("last_revaluation_at") or "-")[:10])
+        scan_only_stale = bool(c.get("scan_only_stale"))
+        stale_badge = (
+            ' <span class="badge" style="color:#d97706;border-color:#d97706">仅扫描·长期未投资重估</span>'
+            if scan_only_stale
+            else ""
+        )
         rel_link = f"../{ticker}/thesis.md"
 
         rows_html.append(
             f"""<tr>
-  <td><strong><a href="{rel_link}">{ticker}</a></strong> <span class="badge">{tier}</span></td>
+  <td><strong><a href="{rel_link}">{ticker}</a></strong> <span class="badge">{tier}</span>{stale_badge}</td>
   <td><span class="dot" style="background:{dot_color}"></span>{dot_label} · {stance}/{conviction}</td>
   <td>{one_liner}</td>
   <td><code>{_esc(v_word)}</code> <span class="muted">({v_date})</span></td>
+  <td>{last_scan_at} / {last_revaluation_at}</td>
   <td>{cat_str}</td>
   <td>{pub_str}</td>
 </tr>"""
@@ -215,12 +224,13 @@ def render_coverage_html(board: dict[str, Any]) -> str:
         <th>状态 / 观点</th>
         <th>一句话判断（House View）</th>
         <th>最近结论</th>
+        <th>最近扫描 / 最近投资重估</th>
         <th>下一个催化剂</th>
         <th>最近正式发布</th>
       </tr>
     </thead>
     <tbody>
-      {"".join(rows_html) if rows_html else '<tr><td colspan="6" class="muted">暂无覆盖公司数据</td></tr>'}
+      {"".join(rows_html) if rows_html else '<tr><td colspan="7" class="muted">暂无覆盖公司数据</td></tr>'}
     </tbody>
   </table>
 </body>

@@ -53,6 +53,11 @@
         {
           "path": "dalton/drafts/{end}-weekly.md",
           "min_bytes": 500
+        },
+        {
+          "path": "dalton/drafts/{prev_month}-monthly-review.md",
+          "min_bytes": 10,
+          "requires_first_of_month": "end"
         }
       ]
     }

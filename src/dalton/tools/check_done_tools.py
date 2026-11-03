@@ -501,6 +501,225 @@ async def _validate_explicit_artifact_path(
     return None, None, checked or explicit
 
 
+_ISO_DATE_TOKEN_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+
+
+def _derive_monthly_review_params(params: dict[str, Any]) -> dict[str, Any]:
+    """Always derive ``prev_month`` from ``params['end']`` when present."""
+    raw_end = str(params.get("end") or "").strip()[:10]
+    if not raw_end:
+        return params
+    try:
+        end_date = date.fromisoformat(raw_end)
+    except ValueError:
+        return params
+    if end_date.month == 1:
+        prev_year, prev_m = end_date.year - 1, 12
+    else:
+        prev_year, prev_m = end_date.year, end_date.month - 1
+    out = dict(params)
+    out["prev_month"] = f"{prev_year:04d}-{prev_m:02d}"
+    return out
+
+
+async def _is_first_weekly_of_month(
+    backend: Any, params: dict[str, Any], date_param: str
+) -> bool:
+    """Return True when no completed weekly review exists earlier in ``end``'s month."""
+    raw_date = str(params.get(date_param) or "").strip()[:10]
+    if not raw_date:
+        return False
+    try:
+        end_date = date.fromisoformat(raw_date)
+    except ValueError:
+        return False
+
+    home_dir = str(params.get("home_dir") or "dalton").strip().rstrip("/")
+    draft_dirs = [f"{home_dir}/drafts" if home_dir and home_dir != "." else "drafts"]
+    if "dalton/drafts" not in draft_dirs:
+        draft_dirs.append("dalton/drafts")
+
+    month_prefix = f"{end_date.year:04d}-{end_date.month:02d}-"
+    weekly_re = re.compile(r"(?:^|/)(\d{4}-\d{2}-\d{2})-weekly\.md$")
+    candidate_paths: list[str] = []
+    glob_supported = False
+    for d_dir in draft_dirs:
+        matched = await _glob(backend, f"{d_dir}/{month_prefix}*-weekly.md")
+        if matched is not None:
+            glob_supported = True
+            candidate_paths.extend(matched)
+
+    if not glob_supported:
+        for d_dir in draft_dirs:
+            for day_num in range(1, end_date.day):
+                candidate_paths.append(
+                    f"{d_dir}/{month_prefix}{day_num:02d}-weekly.md"
+                )
+
+    seen_paths: set[str] = set()
+    for p in candidate_paths:
+        if p in seen_paths or p.endswith(SIDECAR_SUFFIXES):
+            continue
+        seen_paths.add(p)
+        m = weekly_re.search(p)
+        if not m:
+            continue
+        try:
+            cand_date = date.fromisoformat(m.group(1))
+        except ValueError:
+            continue
+        if (
+            cand_date.year == end_date.year
+            and cand_date.month == end_date.month
+            and cand_date < end_date
+        ):
+            info = await _file_info(backend, p)
+            if info.exists and info.size > 0:
+                return False
+    return True
+
+
+async def _check_period_in_artifact(
+    backend: Any, path: str, text: str | None
+) -> str | None:
+    """Verify that a sector-delta artifact is non-empty and states the covered period."""
+    if path.endswith(".json"):
+        if text is None or not text.strip():
+            return (
+                f"增量状态文件为空或无法读取（{path}）；"
+                "下一步：运行 collect_sector.py commit 写入包含 `since` 与 `until` 的状态文件后重查。"
+            )
+        try:
+            doc = json.loads(text)
+        except ValueError:
+            return f"增量状态文件不可解析（{path}）；下一步：重写合法 JSON 并包含 `since` 与 `until`。"
+        if not isinstance(doc, dict):
+            return f"增量状态文件结构异常（{path}）；下一步：重写为 JSON 对象并包含 `since` 与 `until`。"
+        since_val = str(doc.get("since") or "").strip()[:10]
+        until_val = str(doc.get("until") or "").strip()[:10]
+        try:
+            if not since_val or not until_val:
+                raise ValueError("missing since/until")
+            date.fromisoformat(since_val)
+            date.fromisoformat(until_val)
+        except ValueError:
+            return (
+                f"增量状态文件 {path} 未写明本轮覆盖的期间（缺少合法的 `since` 与 `until` 起止日期）；"
+                "下一步：在状态文件中写明本轮覆盖的期间（`since` 与 `until`）后重查。"
+            )
+        return None
+
+    if text is None or not text.strip():
+        return (
+            f"增量笔记为空或无法读取（{path}）；"
+            "下一步：写入非空增量笔记并写明本轮覆盖的期间（`since` → `until`）。"
+        )
+
+    expected_since = ""
+    expected_until = ""
+    last_run_text = await _read_text(backend, "research/tracker/last_run.json")
+    if last_run_text:
+        try:
+            lr_doc = json.loads(last_run_text)
+            if isinstance(lr_doc, dict):
+                expected_since = str(lr_doc.get("since") or "").strip()[:10]
+                expected_until = str(lr_doc.get("until") or "").strip()[:10]
+        except ValueError:
+            pass
+    found_dates = _ISO_DATE_TOKEN_RE.findall(text)
+    if expected_since and expected_until:
+        if expected_since not in text or expected_until not in text:
+            return (
+                f"增量笔记 {path} 未写明本轮覆盖的期间（需写明起止日期 `{expected_since}` → `{expected_until}`）；"
+                "下一步：在增量笔记中写明本轮覆盖的期间后重查。"
+            )
+        return None
+    if len(set(found_dates)) < 2 and len(found_dates) < 2:
+        return (
+            f"增量笔记 {path} 未写明本轮覆盖的期间（需写明起止日期 `since` → `until`）；"
+            "下一步：在增量笔记中写明本轮覆盖的期间后重查。"
+        )
+    return None
+
+
+def _check_scan_dates_status_in_jsonl(path: str, text: str | None) -> list[str]:
+    """Verify that the earnings-calendar scan JSONL is non-empty and every date is confirmed or marked 待确认."""
+    if text is None or not text.strip():
+        return [
+            f"日历扫描文件为空（{path}）；下一步：逐家扫描并将结果写入 {path}。"
+        ]
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if not lines:
+        return [
+            f"日历扫描文件为空（{path}）；下一步：逐家扫描并将结果写入 {path}。"
+        ]
+    gaps: list[str] = []
+    for idx, raw_line in enumerate(lines, start=1):
+        try:
+            row = json.loads(raw_line)
+        except ValueError:
+            gaps.append(
+                f"日历扫描文件 {path} 第 {idx} 行不是合法 JSON；下一步：修复损坏行后重查。"
+            )
+            continue
+        if not isinstance(row, dict):
+            gaps.append(
+                f"日历扫描文件 {path} 第 {idx} 行不是 JSON 对象；下一步：修复后重查。"
+            )
+            continue
+        ticker_label = str(row.get("ticker") or f"第{idx}行")
+        status = str(row.get("status") or "").strip().lower()
+        date_val = str(
+            row.get("earnings_date") or row.get("date") or row.get("tentative_date") or ""
+        ).strip()
+        date_status = str(row.get("date_status") or "").strip().lower()
+        confidence = str(row.get("confidence") or "").strip().lower()
+        notes = str(row.get("notes") or row.get("note") or "").strip()
+        if status in ("already_reported", "reported", "scan_failed"):
+            continue
+        if date_val:
+            is_confirmed = (
+                status in ("confirmed", "announced+high", "announced")
+                or date_status == "confirmed"
+            ) and (
+                status == "confirmed"
+                or date_status == "confirmed"
+                or confidence == "high"
+            ) and date_status not in ("estimated", "unknown", "unannounced", "待确认") and confidence not in ("estimated", "low", "medium")
+            is_pending_marked = (
+                (
+                    status in ("pending", "estimated", "announced+medium", "tentative")
+                    or date_status in ("estimated", "待确认")
+                )
+                and confidence != "high"
+                and (
+                    status in ("estimated", "announced+medium", "tentative")
+                    or confidence in ("estimated", "low", "medium")
+                    or date_status in ("estimated", "待确认")
+                    or bool(row.get("tentative_sources"))
+                    or ("待确认" in notes and "未标待确认" not in notes)
+                )
+            )
+            if not (is_confirmed or is_pending_marked):
+                gaps.append(
+                    f"日历扫描文件 {path} 中 {ticker_label} 的日期（{date_val}）未标明确认或待确认"
+                    "（每条带日期的记录要么官方确认写 `status=\"confirmed\"`，要么标为待确认写 `status=\"pending\"` 且 `confidence=\"estimated\"` 或在 `notes` 注明“待确认”，或已发布写 `status=\"already_reported\"`）；"
+                    "下一步：核实并标明每个日期的确认或待确认状态后重查。"
+                )
+        else:
+            if status == "confirmed" or date_status == "confirmed":
+                gaps.append(
+                    f"日历扫描文件 {path} 中 {ticker_label} 标为 `status=\"confirmed\"` 但缺少 `earnings_date`；"
+                    "下一步：在 `earnings_date` 补齐官方日期，或将 `status` 改为 `\"pending\"`（待确认）/ `\"not_announced\"`（未公布）。"
+                )
+            elif status not in ("pending", "not_announced", "already_reported", "reported", "scan_failed"):
+                gaps.append(
+                    f"日历扫描文件 {path} 中 {ticker_label} 的 `status` 未按规范标明（当前为 `{status}`）；"
+                    "下一步：将 `status` 填写为 `\"confirmed\"`、`\"pending\"`（待确认）、`\"already_reported\"`、`\"not_announced\"` 或 `\"scan_failed\"`。"
+                )
+    return gaps
+
+
 async def _check_artifact(
     backend: Any,
     artifact: dict[str, Any],
@@ -516,12 +735,19 @@ async def _check_artifact(
     missing: list[str] = []
     warnings: list[str] = []
     resolved: dict[str, str] = {}
+    params = _derive_monthly_review_params(params)
     name = artifact["path"]
 
     def _report(message: str) -> None:
         (warnings if _optional(artifact) else missing).append(message)
 
     if artifact.get("requires_param") and not params.get(artifact["requires_param"]):
+        return missing, warnings, resolved
+
+    first_of_month_param = artifact.get("requires_first_of_month")
+    if first_of_month_param and not await _is_first_weekly_of_month(
+        backend, params, str(first_of_month_param)
+    ):
         return missing, warnings, resolved
 
     condition = artifact.get("requires_json")
@@ -718,6 +944,14 @@ async def _check_artifact(
                 f"产物文件过小（{path}，{info.size} 字节 < {artifact['min_bytes']}），"
                 "疑似占位。下一步：写满该交付物。"
             )
+        if first_of_month_param:
+            monthly_text = (
+                info.text if info.text is not None else await _read_text(backend, path)
+            )
+            if monthly_text is None or not monthly_text.strip():
+                _report(
+                    f"月度复盘归档文件为空（{path}）；下一步：写入非空的月度复盘归档后重查。"
+                )
         if floor_epoch is not None:
             if info.mtime_epoch is None:
                 _report(f"无法读取文件时间（{path}），本轮写入未核对，请重试。")
@@ -734,6 +968,19 @@ async def _check_artifact(
                 _report(
                     f"产物文件缺少完成标记 {marker}：{path}。下一步：补齐内容并写上标记。"
                 )
+        if artifact.get("requires_period"):
+            period_text = (
+                info.text if info.text is not None else await _read_text(backend, path)
+            )
+            period_err = await _check_period_in_artifact(backend, path, period_text)
+            if period_err:
+                _report(period_err)
+        if artifact.get("requires_scan_dates_status"):
+            scan_text = (
+                info.text if info.text is not None else await _read_text(backend, path)
+            )
+            for scan_err in _check_scan_dates_status_in_jsonl(path, scan_text):
+                _report(scan_err)
         # Sidecars live beside each target the way check_draft writes them
         # (draft stem + suffix), so a contract names only the draft path.
         for sidecar in artifact.get("sidecars") or []:
@@ -2950,6 +3197,36 @@ async def _check_earnings_calendar_mirror(
             f"台账镜像未发布或与当前台账不一致：台账 {ledger_path} 校验不通过（{error}）；"
             "修复后调用 dalton_publish_earnings_calendar。"
         ]
+    entries_map = ledger.get("entries") if isinstance(ledger, dict) else None
+    if isinstance(entries_map, dict):
+        for tk, ent in entries_map.items():
+            if not isinstance(ent, dict):
+                continue
+            e_status = str(ent.get("status") or "").strip().lower()
+            e_date = str(ent.get("date") or ent.get("tentative_date") or "").strip()
+            e_date_status = str(ent.get("date_status") or "").strip().lower()
+            if e_status in ("reported", "already_reported", "scan_failed"):
+                continue
+            if e_date:
+                is_conf = e_status == "confirmed" and e_date_status in ("", "confirmed")
+                is_pend = e_status == "pending" and (
+                    e_date_status in ("estimated", "待确认")
+                    or (
+                        bool(ent.get("tentative_date"))
+                        and e_date_status not in ("confirmed", "unannounced")
+                    )
+                )
+                if not (is_conf or is_pend):
+                    return [
+                        f"台账 {ledger_path} 中 {tk} 的日期（{e_date}）未标明确认或待确认"
+                        "（每个带日期的条目要么官方确认写 `status=\"confirmed\"` 且 `date_status=\"confirmed\"`，要么标为待确认写 `status=\"pending\"` 且 `date_status=\"estimated\"`）；"
+                        "修复后调用 `dalton_publish_earnings_calendar`。"
+                    ]
+            elif e_status == "confirmed" or e_date_status == "confirmed":
+                return [
+                    f"台账 {ledger_path} 中 {tk} 标为 `status=\"confirmed\"` 但缺少 `date`；"
+                    "修复后调用 `dalton_publish_earnings_calendar`。"
+                ]
     from src.dalton.database import coverage as coverage_db
 
     try:
@@ -3194,12 +3471,12 @@ def create_check_done_tools(
         config: RunnableConfig,
         tool_call_id: Annotated[str, InjectedToolCallId] = "",
     ) -> str:
-        """对照完成契约核对一次 workflow/多步 skill 是否真的做完，汇报完成前必须调用。
+        """对照完成契约核对一次 workflow 或多步 skill 是否全部完成，汇报完成前必须调用。
 
-        传 workflow 名（initial-coverage、full-coverage、bullbear-doc、earnings-deep-update、weekly-coverage-review、topic-research 之一）或多步 skill 名（dalton-earnings-preview、dalton-earnings-flash、dalton-stock-move、dalton-filing-review、dalton-thesis-delta、dalton-call、dalton-publish、dalton-earnings-calendar 之一，params 按该 SKILL 收尾段所列），params 用启动时的同一组参数；run_id 传本次运行的 task id（.progress.json 的 run_id），不传则取本线程最近一次同名 workflow 的 run。
-        workflow 关闭、按 SKILL 手动降级执行时，params 加 "manual": true，审稿改核对 SKILL 指定的 review.json。
-        只读不改：重查文件、哈希、校验脚本、知识层版本、verdict、本次 run 的审稿 pass 与语言审查两轮记录。不通过时先补齐 missing 再查；补不了的只能汇报"未完成"。
-        Returns: JSON {done, missing, warnings}，missing 为中文缺项与下一步。
+        `workflow` 传工作流名（`"initial-coverage"`、`"full-coverage"`、`"bullbear-doc"`、`"earnings-deep-update"`、`"weekly-coverage-review"`、`"topic-research"` 之一）或多步技能名（`"dalton-earnings-preview"`、`"dalton-earnings-flash"`、`"dalton-stock-move"`、`"dalton-filing-review"`、`"dalton-thesis-delta"`、`"dalton-sector-delta"`、`"dalton-call"`、`"dalton-publish"`、`"dalton-earnings-calendar"` 之一，`params` 按该技能收尾段所列），`params` 用启动时的同一组参数；`run_id` 传本次运行的任务 ID（`.progress.json` 的 `run_id`），不传则取本线程最近一次同名工作流的运行记录。
+        `workflow.enabled` 关闭、按技能说明手动执行时，`params` 加 `"manual": true`，审稿改为核对技能指定的 `review.json`。
+        只读不改：重查文件、哈希、校验脚本、知识层版本、`verdict`、本次运行的审稿 `pass` 与两轮语言审查记录。`done=false` 时先按 `missing` 补齐再查；补不了的只能汇报“未完成”。
+        Returns: JSON `{done, missing, warnings}`，`missing` 为中文缺项说明与下一步操作。
         """
         if allowed is not None and workflow not in allowed:
             return json.dumps(

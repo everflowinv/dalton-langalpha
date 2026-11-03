@@ -44,6 +44,171 @@ URGENCY_WEIGHT = {
     "someday": 0.5,
     "later": 0.5,
 }
+REVALUATION_VERDICT_WORDS = frozenset(
+    {"NEW_THESIS", "THESIS_STRENGTHENED", "THESIS_WEAKENED", "THESIS_BROKEN"}
+)
+_NO_DECISION_MARKERS = frozenset(
+    {
+        "none",
+        "n/a",
+        "na",
+        "null",
+        "无",
+        "无。",
+        "暂无",
+        "不改变",
+        "无影响",
+        "无决定",
+        "-",
+    }
+)
+_DECISION_TRAILING_PUNCT = " \t\r\n.。!！?？;；,，、:：~～…"
+
+
+def normalize_decision_impact(val: Any) -> str:
+    """Return stripped decision-impact string, or ``""`` if empty or a placeholder marker."""
+    if val is None:
+        return ""
+    raw = str(val).strip()
+    if not raw:
+        return ""
+    cleaned = raw.rstrip(_DECISION_TRAILING_PUNCT).strip().lower()
+    if not cleaned or cleaned in _NO_DECISION_MARKERS or raw.lower() in _NO_DECISION_MARKERS:
+        return ""
+    return raw
+
+
+def resolve_decision_impact(item: dict[str, Any]) -> str:
+    """Resolve ``decision_impact`` from a dict, falling back to ``why`` when ``decision_impact`` is empty or ``null``."""
+    raw_di = item.get("decision_impact")
+    if raw_di is not None:
+        s_di = str(raw_di).strip()
+        if s_di and s_di.rstrip(_DECISION_TRAILING_PUNCT).strip().lower() != "null":
+            return normalize_decision_impact(raw_di)
+    return normalize_decision_impact(item.get("why"))
+
+
+def _parse_utc_epoch(val: Any) -> float | None:
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        dt = val if val.tzinfo is not None else val.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    if isinstance(val, date):
+        return datetime(val.year, val.month, val.day, tzinfo=timezone.utc).timestamp()
+    raw = str(val).strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except ValueError:
+        try:
+            d = date.fromisoformat(raw[:10])
+            return datetime(d.year, d.month, d.day, tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            return None
+
+
+def _to_iso_timestamp(val: Any) -> str | None:
+    if val is None:
+        return None
+    if isinstance(val, datetime):
+        return val.isoformat()
+    if isinstance(val, date):
+        return val.isoformat()
+    raw = str(val).strip()
+    if not raw:
+        return None
+    if _parse_utc_epoch(raw) is not None:
+        return raw
+    return None
+
+
+def _latest_iso_timestamp(*timestamps: str | None) -> str | None:
+    best_str: str | None = None
+    best_key: tuple[float, str] | None = None
+    for ts in timestamps:
+        if not ts:
+            continue
+        epoch = _parse_utc_epoch(ts)
+        if epoch is None:
+            continue
+        key = (epoch, ts)
+        if best_key is None or key > best_key:
+            best_key = key
+            best_str = ts
+    return best_str
+
+
+def _verdict_sort_key(row: dict[str, Any]) -> tuple[float, int, str]:
+    raw_ts = (
+        row.get("verdict_at")
+        if row.get("verdict_at") is not None
+        else row.get("created_at")
+    )
+    epoch = _parse_utc_epoch(raw_ts)
+    vid = str(row.get("verdict_id") or "")
+    return (epoch if epoch is not None else -1.0, len(vid), vid)
+
+
+def _days_since(iso_date: str | None, today: date) -> int | None:
+    if not iso_date:
+        return None
+    try:
+        d = date.fromisoformat(str(iso_date)[:10])
+        return max(0, (today - d).days)
+    except ValueError:
+        return None
+
+
+def _extract_scenario_version_increment_at(
+    thesis_rows: list[dict[str, Any]],
+    latest_thesis_content: dict[str, Any] | None = None,
+) -> str | None:
+    """Return the latest timestamp when ``thesis.underwriting.scenario_version`` incremented.
+
+    Only an increase over the previous version's ``scenario_version`` counts;
+    the first historical record never counts regardless of its ``scenario_version`` value.
+    A ``thesis`` without ``underwriting`` returns ``None`` so ``last_revaluation_at``
+    relies solely on non-``NO_CHANGE`` five-word verdicts.
+    """
+    if not thesis_rows:
+        return None
+    ordered = sorted(thesis_rows, key=lambda r: int(r.get("version_no") or 0))
+    eff_latest = latest_thesis_content
+    if eff_latest is None:
+        last_c = ordered[-1].get("content")
+        if isinstance(last_c, dict):
+            eff_latest = last_c
+    if isinstance(eff_latest, dict):
+        latest_uw = eff_latest.get("underwriting")
+        if not isinstance(latest_uw, dict) or not latest_uw:
+            return None
+
+    prev_sv: int | None = None
+    last_inc_at: str | None = None
+    for row in ordered:
+        sv = row.get("scenario_version")
+        prev_from_sql = row.get("prev_scenario_version")
+        if not isinstance(sv, int) or isinstance(sv, bool):
+            content = row.get("content")
+            uw = content.get("underwriting") if isinstance(content, dict) else None
+            sv = uw.get("scenario_version") if isinstance(uw, dict) else None
+        if not isinstance(sv, int) or isinstance(sv, bool):
+            continue
+        row_ts = _to_iso_timestamp(row.get("created_at"))
+        if isinstance(prev_from_sql, int) and not isinstance(prev_from_sql, bool):
+            if sv > prev_from_sql and row_ts:
+                last_inc_at = row_ts
+            prev_sv = sv
+            continue
+        if prev_sv is not None and sv > prev_sv and row_ts:
+            last_inc_at = row_ts
+        prev_sv = sv
+    return last_inc_at
 
 
 async def _load_user_coverage_map(user_id: str | None) -> dict[str, dict[str, Any]]:
@@ -217,14 +382,42 @@ async def build_coverage_board(
                 )
                 kv_rows = await cur.fetchall()
 
+                sv_rows: list[dict[str, Any]] = []
+                if ws_rows:
+                    await cur.execute(
+                        """
+                        SELECT DISTINCT ON (workspace_id)
+                               workspace_id, version_no, scenario_version, prev_scenario_version, created_at
+                        FROM (
+                            SELECT workspace_id,
+                                   version_no,
+                                   (content->'underwriting'->>'scenario_version')::bigint AS scenario_version,
+                                   LAG((content->'underwriting'->>'scenario_version')::bigint) OVER (
+                                       PARTITION BY workspace_id ORDER BY version_no ASC
+                                   ) AS prev_scenario_version,
+                                   created_at
+                            FROM dalton_knowledge_versions
+                            WHERE workspace_id = ANY(%s)
+                              AND schema_valid = TRUE
+                              AND doc_key = 'thesis'
+                              AND (content->'underwriting'->>'scenario_version') ~ '^[0-9]+$'
+                        ) sv_history
+                        WHERE prev_scenario_version IS NOT NULL
+                          AND scenario_version > prev_scenario_version
+                        ORDER BY workspace_id, version_no DESC
+                        """,
+                        ([str(r["workspace_id"]) for r in ws_rows],),
+                    )
+                    sv_rows = await cur.fetchall()
+
                 await cur.execute(
                     """
-                    SELECT DISTINCT ON (workspace_id)
+                    SELECT DISTINCT ON (workspace_id, (word = 'NO_CHANGE'))
                            workspace_id, verdict_id, verdict_at, word,
                            trigger_kind, trigger_ref, progress, next_due, payload,
                            conversation_thread_id, created_at
                     FROM dalton_verdicts
-                    ORDER BY workspace_id, verdict_at DESC, length(verdict_id) DESC, verdict_id DESC
+                    ORDER BY workspace_id, (word = 'NO_CHANGE'), verdict_at DESC, length(verdict_id) DESC, verdict_id DESC
                     """
                 )
                 verdict_rows = await cur.fetchall()
@@ -297,9 +490,36 @@ async def build_coverage_board(
         kv_by_ws: dict[str, dict[str, dict[str, Any]]] = {}
         for r in kv_rows:
             ws_id = str(r["workspace_id"])
-            kv_by_ws.setdefault(ws_id, {})[str(r["doc_key"])] = dict(r)
+            doc_key = str(r["doc_key"])
+            row_dict = dict(r)
+            ws_docs = kv_by_ws.setdefault(ws_id, {})
+            if doc_key not in ws_docs or int(row_dict.get("version_no") or 0) > int(
+                ws_docs[doc_key].get("version_no") or 0
+            ):
+                ws_docs[doc_key] = row_dict
 
-        verdict_by_ws = {str(r["workspace_id"]): dict(r) for r in verdict_rows}
+        thesis_rows_by_ws: dict[str, list[dict[str, Any]]] = {}
+        for r in sv_rows or []:
+            if not isinstance(r, dict) or not r.get("workspace_id"):
+                continue
+            if r.get("doc_key") not in (None, "thesis"):
+                continue
+            thesis_rows_by_ws.setdefault(str(r["workspace_id"]), []).append(dict(r))
+
+        verdict_by_ws: dict[str, dict[str, Any]] = {}
+        reval_verdict_by_ws: dict[str, dict[str, Any]] = {}
+        for r in verdict_rows:
+            ws_id = str(r["workspace_id"])
+            row_dict = dict(r)
+            row_key = _verdict_sort_key(row_dict)
+            prev_any = verdict_by_ws.get(ws_id)
+            if prev_any is None or row_key > _verdict_sort_key(prev_any):
+                verdict_by_ws[ws_id] = row_dict
+            if str(row_dict.get("word") or "") in REVALUATION_VERDICT_WORDS:
+                prev_rev = reval_verdict_by_ws.get(ws_id)
+                if prev_rev is None or row_key > _verdict_sort_key(prev_rev):
+                    reval_verdict_by_ws[ws_id] = row_dict
+
         pub_by_ws = {str(r["workspace_id"]): dict(r) for r in pub_rows}
         sigs_by_ws: dict[str, list[dict[str, Any]]] = {}
         for s in sig_rows:
@@ -350,17 +570,45 @@ async def build_coverage_board(
             stance = house_view.get("stance") or thesis_content.get("stance") or "neutral"
 
             last_verdict = verdict_by_ws.get(ws_id)
+            reval_verdict = reval_verdict_by_ws.get(ws_id)
             last_pub = pub_by_ws.get(ws_id)
-            last_research_at = (
-                last_verdict["verdict_at"].isoformat()[:10]
-                if last_verdict and hasattr(last_verdict.get("verdict_at"), "isoformat")
-                else (
-                    str(last_pub.get("published_date") or "")[:10]
-                    if last_pub and last_pub.get("published_date")
-                    else None
+            any_verdict_at = (
+                _to_iso_timestamp(last_verdict.get("verdict_at"))
+                or _to_iso_timestamp(last_verdict.get("created_at"))
+            ) if last_verdict else None
+            reval_verdict_at = (
+                _to_iso_timestamp(reval_verdict.get("verdict_at"))
+                or _to_iso_timestamp(reval_verdict.get("created_at"))
+            ) if reval_verdict else None
+            last_sv_increment_at = _extract_scenario_version_increment_at(
+                thesis_rows_by_ws.get(ws_id) or [],
+                latest_thesis_content=thesis_content if isinstance(thesis_content, dict) else None,
+            )
+            last_revaluation_at = _latest_iso_timestamp(
+                last_sv_increment_at, reval_verdict_at
+            )
+            last_scan_at = _latest_iso_timestamp(
+                any_verdict_at, last_sv_increment_at
+            )
+            scan_staleness = round(_compute_staleness(last_scan_at, today), 2)
+            revaluation_staleness = round(
+                _compute_staleness(last_revaluation_at, today), 2
+            )
+            scan_days = _days_since(last_scan_at, today)
+            revaluation_days = _days_since(last_revaluation_at, today)
+            scan_only_stale = bool(
+                last_scan_at
+                and (
+                    last_revaluation_at is None
+                    or (
+                        revaluation_days is not None
+                        and revaluation_days >= 14
+                        and scan_days is not None
+                        and revaluation_days > scan_days
+                    )
                 )
             )
-            staleness = _compute_staleness(last_research_at, today)
+            freshness_weight = round(max(revaluation_staleness, scan_staleness), 2)
 
             open_questions_list: list[dict[str, Any]] = []
             for q in agenda_content.get("open_questions") or []:
@@ -372,6 +620,8 @@ async def build_coverage_board(
                 backoff_until = q.get("next_attempt_after") or q.get("backoff_until")
                 in_backoff = _is_backoff_active(backoff_until, now_dt, today)
                 waiting_pm = bool(q.get("waiting_pm")) or q.get("status") == "waiting_pm"
+                decision_impact = resolve_decision_impact(q)
+                has_decision_impact = bool(decision_impact)
                 open_questions_list.append(
                     {
                         "id": qid,
@@ -380,12 +630,13 @@ async def build_coverage_board(
                         "urgency": urg,
                         "backoff_until": backoff_until,
                         "waiting_pm": waiting_pm,
+                        "decision_impact": decision_impact if has_decision_impact else None,
                     }
                 )
-                if not waiting_pm and not in_backoff:
+                if not waiting_pm and not in_backoff and has_decision_impact:
                     v_w = VALUE_WEIGHT.get(val, 2.0)
                     u_w = URGENCY_WEIGHT.get(urg, 1.5)
-                    score = round(v_w * u_w * staleness, 2)
+                    score = round(v_w * u_w * freshness_weight, 2)
                     est_usd = DEFAULT_EST_COST_BY_KIND["open_question"]
                     raw_candidates.append(
                         {
@@ -395,7 +646,17 @@ async def build_coverage_board(
                             "kind": "open_question",
                             "score": score,
                             "est_usd": est_usd,
-                            "why": f"价值={val} · 紧迫度={urg} · 距上次研究权重={staleness:.2f}",
+                            "decision_impact": decision_impact,
+                            "last_scan_at": last_scan_at,
+                            "last_revaluation_at": last_revaluation_at,
+                            "scan_staleness": scan_staleness,
+                            "revaluation_staleness": revaluation_staleness,
+                            "scan_only_stale": scan_only_stale,
+                            "why": (
+                                f"价值={val} · 紧迫度={urg} · 最近扫描权重={scan_staleness:.2f} · "
+                                f"最近投资重估权重={revaluation_staleness:.2f} · "
+                                f"解决后改变的决定={decision_impact}"
+                            ),
                         }
                     )
 
@@ -409,10 +670,20 @@ async def build_coverage_board(
                 due_raw = v.get("due") or v.get("target_date") or v.get("due_date")
                 if not due_raw:
                     continue
+                if "decision_impact" in v and not normalize_decision_impact(
+                    v.get("decision_impact")
+                ):
+                    continue
+                v_decision = str(
+                    v.get("decision_impact")
+                    or v.get("expected")
+                    or v.get("note")
+                    or f"核验 {v_what} 是否达到阈值，决定是否调整方向（stance）、可执行度（actionability）或仓位"
+                ).strip()
                 # 与议程探针同一到期口径：保留原始时刻/时区，缺时区按标的交易所
                 # 时区，不按本地（上海）日历日提前判到期。
                 if validation_is_due(due_raw, ticker, now_dt, tz=market_tz):
-                    score = round(3.0 * 3.0 * staleness, 2)
+                    score = round(3.0 * 3.0 * freshness_weight, 2)
                     raw_candidates.append(
                         {
                             "workspace_id": ws_id,
@@ -421,7 +692,17 @@ async def build_coverage_board(
                             "kind": "validation_check",
                             "score": score,
                             "est_usd": DEFAULT_EST_COST_BY_KIND["validation_check"],
-                            "why": f"验证节点到期（{str(due_raw)[:10]}）· 距上次研究权重={staleness:.2f}",
+                            "decision_impact": v_decision,
+                            "last_scan_at": last_scan_at,
+                            "last_revaluation_at": last_revaluation_at,
+                            "scan_staleness": scan_staleness,
+                            "revaluation_staleness": revaluation_staleness,
+                            "scan_only_stale": scan_only_stale,
+                            "why": (
+                                f"验证节点到期（{str(due_raw)[:10]}）· 最近扫描权重={scan_staleness:.2f} · "
+                                f"最近投资重估权重={revaluation_staleness:.2f} · "
+                                f"解决后改变的决定={v_decision}"
+                            ),
                         }
                     )
 
@@ -454,9 +735,15 @@ async def build_coverage_board(
 
             ws_sigs = sigs_by_ws.get(ws_id) or []
             for s in ws_sigs[:3]:
+                if "decision_impact" in s and not normalize_decision_impact(s.get("decision_impact")):
+                    continue
                 prio = str(s.get("priority") or "P1")
                 v_w = VALUE_WEIGHT.get(prio, 2.0)
-                score = round(v_w * 2.5 * staleness, 2)
+                score = round(v_w * 2.5 * freshness_weight, 2)
+                s_decision = str(
+                    s.get("decision_impact")
+                    or f"评估信号 [{s.get('probe')}] 是否改变方向（stance）、可执行度（actionability）或仓位"
+                ).strip()
                 raw_candidates.append(
                     {
                         "workspace_id": ws_id,
@@ -465,7 +752,17 @@ async def build_coverage_board(
                         "kind": "event_note",
                         "score": score,
                         "est_usd": DEFAULT_EST_COST_BY_KIND["event_note"],
-                        "why": f"未消费信号（{prio}）",
+                        "decision_impact": s_decision,
+                        "last_scan_at": last_scan_at,
+                        "last_revaluation_at": last_revaluation_at,
+                        "scan_staleness": scan_staleness,
+                        "revaluation_staleness": revaluation_staleness,
+                        "scan_only_stale": scan_only_stale,
+                        "why": (
+                            f"未消费信号（{prio}）· 最近扫描权重={scan_staleness:.2f} · "
+                            f"最近投资重估权重={revaluation_staleness:.2f} · "
+                            f"解决后改变的决定={s_decision}"
+                        ),
                     }
                 )
 
@@ -539,7 +836,11 @@ async def build_coverage_board(
                         if last_pub
                         else None
                     ),
-                    "last_research_at": last_research_at,
+                    "last_scan_at": last_scan_at,
+                    "last_revaluation_at": last_revaluation_at,
+                    "scan_staleness": scan_staleness,
+                    "revaluation_staleness": revaluation_staleness,
+                    "scan_only_stale": scan_only_stale,
                     "pending_signals": len(ws_sigs),
                     "sec_probe_degraded": bool(
                         (watch_state_by_ws.get(ws_id) or {}).get("sec_probe_degraded")

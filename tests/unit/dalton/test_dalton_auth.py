@@ -2405,14 +2405,28 @@ class TestDaltonAuthRound6WriteIsolation:
             tools["dalton_record_plan"].ainvoke(
                 {
                     "plan_date": "2026-10-21",
-                    "dispatches": [{"ticker": "AAPL", "task": "Alice task", "est_usd": 2.0}],
+                    "dispatches": [
+                        {
+                            "ticker": "AAPL",
+                            "task": "Alice task",
+                            "est_usd": 2.0,
+                            "decision_impact": "决定是否调整核心仓位",
+                        }
+                    ],
                 },
                 config={"configurable": {"user_id": "user-alice"}},
             ),
             tools["dalton_record_plan"].ainvoke(
                 {
                     "plan_date": "2026-10-21",
-                    "dispatches": [{"ticker": "MSFT", "task": "Bob task", "est_usd": 3.0}],
+                    "dispatches": [
+                        {
+                            "ticker": "MSFT",
+                            "task": "Bob task",
+                            "est_usd": 3.0,
+                            "decision_impact": "决定是否上调可执行度",
+                        }
+                    ],
                 },
                 config={"configurable": {"user_id": "user-bob"}},
             ),
