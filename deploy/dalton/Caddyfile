@@ -33,6 +33,34 @@
 		-Server
 	}
 
+	# 0. History replay (/api/v1/threads/<id>/messages/replay) is a finite SSE
+	# response that can run to 10+ MB on a long thread (tool results and
+	# provenance), and the chat view reveals nothing until it has all arrived.
+	# The global encode skips it whenever the first flushed event (history_page,
+	# ~60 bytes) is under encode's 512-byte minimum_length, which flush_interval
+	# -1 makes the common case, so long replays went out uncompressed. Compress
+	# this route regardless of the first chunk: about 4x smaller (12.5 MB ->
+	# 2.9 MB gzip on a real thread). Same header stripping and proxying as the
+	# general backend route below.
+	@history_replay path_regexp history_replay ^/api/v1/threads/[^/]+/messages/replay$
+	handle @history_replay {
+		request_header -X-Service-Token
+		request_header -X-User-Id
+		encode {
+			zstd
+			gzip
+			minimum_length 1
+			match {
+				header Content-Type text/event-stream*
+			}
+		}
+		reverse_proxy backend:8000 {
+			header_up -X-Service-Token
+			header_up -X-User-Id
+			flush_interval -1
+		}
+	}
+
 	# 1. Reverse proxy only /api/* and /ws/* to backend:8000.
 	# Strip external X-Service-Token and X-User-Id headers so the internal service-token
 	# channel cannot be invoked from the public edge.
