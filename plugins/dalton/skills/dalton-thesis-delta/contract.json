@@ -1,6 +1,6 @@
 {
   "name": "dalton-thesis-delta",
-  "description": "每晚 thesis 增量跟踪的完成契约：本轮 collect.py commit 已落盘（last_run.json 今天写入、updates.log）+ 事件五词 verdict；last_run.json 的 material=yes 时还要求增量笔记与至少一份受影响知识文档的本轮更新，material=no 时无笔记是合法结果（对应 dalton-thesis-delta SKILL 第 3–4 步）。",
+  "description": "每晚 thesis 增量跟踪的完成契约：本轮 collect.py commit 已落盘（last_run.json 今天写入、updates.log）+ 事件五词 verdict（必带 payoff_assessment）；last_run.json 的 material=yes 时还要求增量笔记与至少一份受影响知识文档的本轮更新，material=no 时无笔记是合法结果（对应 dalton-thesis-delta SKILL 第 3–4 步）。",
   "params_required": [
     "ticker",
     "as_of"
@@ -53,6 +53,7 @@
       "THESIS_BROKEN",
       "NEW_THESIS"
     ],
+    "verdict_payoff_required": true,
     "knowledge_docs_if_json": [
       {
         "json": "research/tracker/last_run.json",

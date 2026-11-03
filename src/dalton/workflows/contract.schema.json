@@ -492,6 +492,11 @@
           },
           "description": "本轮命中 verdict_kinds_any/verdict_trigger 的 verdict 里有 word 不是 NO_CHANGE 时，至少其一须有 source=tool 新版本（stock-move / filing-review 的条件知识更新）。"
         },
+        "verdict_payoff_required": {
+          "type": "boolean",
+          "default": false,
+          "description": "为 true 时，本轮命中的每条 verdict 都必须带 payload.payoff_assessment（stock-move / thesis-delta 的赔率评估必填；缺字段的 verdict 记 missing）。"
+        },
         "published_or_awaiting_pm": {
           "type": "object",
           "additionalProperties": false,

@@ -49,7 +49,10 @@ python3 .agents/skills/dalton-thesis-delta/scripts/collect.py collect \
    - 检查 `collect.py` 返回的汇总 JSON 中的 `internal_status`、`failed_sources`、`all_sources_ok` 与 `short_circuit_eligible`：
    - **任何来源 `ok: false` 或标记为“未完成”（`incomplete: true` / `completed: false` / `has_more: true` / `status: "partial"`，含 `company-wiki` 列表被截断或 `estimates` 一致预期失败/`partial`）都不能当成“没有新文档”**：当某个来源取数失败、列表被截断（如 `company-wiki` 提示有更多文档）、一致预期不全（`estimates` `error`/`partial`）或因翻满 5 页上限 / 预算中断而未扫完（`all_sources_ok == false` 或 `failed_sources` 非空）时，**严禁走“所有来源 0 新增 → 短路结束”的分支**；在本轮结论（`verdict` 与 `commit --summary`）和汇报里必须如实写明“`<来源> 本轮取数失败或未完成（原因）`”，**绝不能写成“本轮无新文档”或“无新增”**。
    - **短路判断要求所有来源（含一致预期）都 `ok: true` 且完整扫完（无 `incomplete` / `partial`），而且都是 `0` 新增**：仅当 `all_sources_ok == true`（所有来源 `ok: true` 且 `incomplete != true`，`failed_sources` 为空）、`auto_flags` 为空，且新内部文档（`counts.internal` + `counts.alphaengine`）与新公告（`counts.sec`）均为 `0`（即 `short_circuit_eligible == true`）时：
-     1. 直接执行提交：
+     1. **短路前必须核对价格与价带（不得跳过）**：采集提示没响不等于赔率没变——价格提示阈值（1 日 ±4% / 5 日 ±8%）和三情景价带是两回事，价格可以从 100 慢跌到 99，穿过已登记的 99.5 买点边界而全程不触发提示。**价格不在汇总 JSON 里**：先读汇总 JSON 的 `packet_json` 字段（指向 `research/tracker/<run_id>/packet.json`），打开该文件后读 `consensus.price.close`（最新收盘价）与 `consensus.price.as_of`（收盘日期），对照**上一版三情景价带**（`thesis` 尚无结构化价带字段时，基准在最近一份写了赔率卡段的报告正文里：`drafts/` 下多空备忘 `*-bullbear.md`、覆盖 memo、财报深评，或 `research/*-stock-move.md` 的收尾三问，按修改时间取最近一份；Bear / Base / Bull 三档价格带端点与事先登记的买点价带即基准）：
+        - 最新收盘价**越过了任一价带端点**（跌破 Bear 下沿、涨穿 Base / Bull 上沿，或进入买点价带）时，**不得走短路分支**：改按分支 A 处理（`material=yes`），`payoff_assessment` 填 `{"changed": true, "reason": "price_crossed_band"}`，并照分支 A 写增量笔记；
+        - 该工作区还没有任何带赔率卡的报告（无价带基准）、`consensus.price` 取数失败（`consensus.price.error`）、或收盘价未越过任何端点时，才继续短路，`payoff_assessment` 填 `{"changed": false, "reason": "none"}`；无基准或取数失败时在 `commit --summary` 里如实写明（如"无价带基准，未比较"），不得写成"已比较、未变"。
+     2. 直接执行提交：
         ```bash
         python3 .agents/skills/dalton-thesis-delta/scripts/collect.py commit \
           --workspace-dir . \
@@ -57,8 +60,8 @@ python3 .agents/skills/dalton-thesis-delta/scripts/collect.py collect \
           --material no \
           --summary "无新增"
         ```
-     2. 调用 `knowledge_append_verdict` 写入一条 `NO_CHANGE`（`progress="none"`，`trigger.kind` 按上方对照表将 `<dalton_wake>` 探针名映射为合法枚举值，`trigger.ref` 填信号 id，`next_validation` 沿用当前最近待验证项）；
-     3. **立即结束本轮任务，不读取任何文档全文，也不推送 PM**。
+     3. 调用 `knowledge_append_verdict` 写入一条 `NO_CHANGE`（`progress="none"`，`payoff_assessment` 按上一步核对结论填 `{"changed": false, "reason": "none"}`——穿过价带的情况已在上一步改走分支 A；`trigger.kind` 按上方对照表将 `<dalton_wake>` 探针名映射为合法枚举值，`trigger.ref` 填信号 id，`next_validation` 沿用当前最近待验证项）；
+     4. **立即结束本轮任务，不读取任何文档全文，也不推送 PM**。
 
 ### 第 2 步：对照知识层与 `materiality.md` 判断是否重要
 
@@ -90,10 +93,11 @@ python3 .agents/skills/dalton-thesis-delta/scripts/collect.py collect \
    - **笔记正文必须回答一问（线性还是切换）**：这次是沿着旧叙事线性演进，还是叙事 / 倍数 regime（市场给这类资产的定价规则）可能在切换？答"可能在切换"时，必须点名是哪一个触发器、指向哪个方向（升级 / 降级），以及需要什么证据来确认（检查方法见 `.agents/skills/dalton-conventions/references/nonlinear.md`；结构化字段上线前写在正文）。
 2. **更新知识层**：调用 `knowledge_update` 更新受影响的文档（`thesis` / `debate` / `drivers` / `management`）。
 3. **追加事件结论**：调用 `knowledge_append_verdict` 写入五词结论（`THESIS_STRENGTHENED` / `THESIS_WEAKENED` / `THESIS_BROKEN` / `NEW_THESIS` 或有实质新证据但维持原判的 `NO_CHANGE` + `progress="some"`（彻底解答问题时填 `"resolved"`）；`trigger.kind` 按第 1 步对照表与变化主要来源填 `consensus_change`、`internal_material`、`filing`、`earnings`、`indicator`、`price_move`、`due_validation`、`pm_question`、`agenda` 或 `manual`，`trigger.ref` 填 `<dalton_wake>` 信号 id）。
+   - **`payoff_assessment` 必填**（本技能每条 `verdict` 都要带）：对照上一版三情景价带与所需胜率，回答"本轮增量之后，当前价格下的赔率变了吗"（尚无历史三情景基准时填 `{"changed": false, "reason": "none"}`）。赔率没变填 `{"changed": false, "reason": "none"}`；赔率变了填 `{"changed": true, "reason": "<枚举值>"}`，按主因五选一——`"price_crossed_band"`（我们的三情景假设未改，单纯股价越过上一版三情景或买点价带端点）、`"scenario_revised"`（我们依据本轮新证据重算并调整了三情景的 EPS 或估值倍数假设）、`"expectations_migrated"`（我们的三情景假设未改，但 Street consensus 或买方 bogey 明显上移或下移）、`"catalyst_expired"`（支撑该笔投资的催化剂已兑现、落空或过期，进入催化剂真空期）、`"protection_failed"`（生存、价值或路径任一下行保护条件失效）。论点没变但赔率变了时，`verdict` 仍填 `"NO_CHANGE"`、赔率变化只写进 `payoff_assessment`，不得把 `verdict` 改写成 `"THESIS_STRENGTHENED"` 等论点变化枚举。
 4. **回复摘要**：最后一条回复写不超过 10 行的精炼中文摘要（delta 任务不发私信推送，PM 在对话里看到它；判断先行：五词结论 + 变化核心事实与带期间数字 + 受影响的支柱/Debate + 下一项验证）。
 
 #### 分支 B：无重要变化（`material=no`）
-1. **只记结论**：调用 `knowledge_append_verdict` 写入一条 `NO_CHANGE`（`progress="none"`，`trigger.kind` 按第 1 步对照表映射，`trigger.ref` 填唤醒信号 id）。
+1. **只记结论**：调用 `knowledge_append_verdict` 写入一条 `NO_CHANGE`（`progress="none"`；`payoff_assessment`：若股价越过上一版三情景或买点价带填 `{"changed": true, "reason": "price_crossed_band"}`，若催化剂到期填 `{"changed": true, "reason": "catalyst_expired"}`，其余情况填 `{"changed": false, "reason": "none"}`；`trigger.kind` 按第 1 步对照表映射，`trigger.ref` 填唤醒信号 id）。
 2. **不写增量笔记，不推送 PM**。
 
 ### 第 4 步：提交状态（`commit`）与关闭到期验证项
@@ -115,5 +119,5 @@ python3 .agents/skills/dalton-thesis-delta/scripts/collect.py commit \
 ### 收尾门禁：汇报完成前必须过完成契约（`dalton_check_done`）
 
 - 第 4 步 `commit` 成功后（无论 `material=yes` 还是 `no`，含第 1 步的快速短路分支），结束本轮前调用 `dalton_check_done(workflow="dalton-thesis-delta", params={"ticker": ..., "as_of": "<本轮美东业务日 YYYY-MM-DD，与增量笔记文件名一致>"})`；若笔记文件名日期与 `as_of` 不同（如跨了美东零点），再加 `"delta_note": "<本轮实际写入的笔记路径>"` 显式指给契约。
-- 契约按 `research/tracker/last_run.json` 判定：它须为本轮 `commit` 写入；`material=yes` 时还要求 `research/<本轮日期>-delta.md` 增量笔记（按本轮运行开始时间核对新近度；也接受本轮实际写入的同目录 `*-delta.md` 或 params 里显式给的 `delta_note` 路径），以及 `thesis`/`debate`/`drivers`/`management` 至少一份本轮 `knowledge_update` 新版本；`material=no` 时没有增量笔记是合法结果。两种情况都要求本轮 verdict 已写。
-- `done=false` 时按 `missing` 先补齐再查（`commit` 未落盘就重跑 `commit`、增量笔记缺失就补写、verdict 未写就 `knowledge_append_verdict`、知识层缺本轮更新就 `knowledge_update`）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。
+- 契约按 `research/tracker/last_run.json` 判定：它须为本轮 `commit` 写入；`material=yes` 时还要求 `research/<本轮日期>-delta.md` 增量笔记（按本轮运行开始时间核对新近度；也接受本轮实际写入的同目录 `*-delta.md` 或 params 里显式给的 `delta_note` 路径），以及 `thesis`/`debate`/`drivers`/`management` 至少一份本轮 `knowledge_update` 新版本；`material=no` 时没有增量笔记是合法结果。两种情况都要求本轮 `verdict` 已写且带 `payoff_assessment`（契约只看本轮最新一条）。
+- `done=false` 时按 `missing` 先补齐再查（`commit` 未落盘就重跑 `commit`、增量笔记缺失就补写、`verdict` 未写或缺少 `payoff_assessment` 就按分支 A 第 3 点填法调用 `knowledge_append_verdict` **再追加一条**带 `payoff_assessment` 的 `verdict`、知识层缺本轮更新就 `knowledge_update`）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。

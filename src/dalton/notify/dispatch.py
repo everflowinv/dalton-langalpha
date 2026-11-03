@@ -19,6 +19,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 from src.dalton.database.verdicts import get_verdict_for_execution
+from src.dalton.knowledge.render import PAYOFF_REASON_ZH
 from src.dalton.llm.model_prefs import (
     resolve_dalton_notify_enabled,
     resolve_dalton_notify_overrides,
@@ -535,9 +536,15 @@ def format_notify_message(
     thread_id: str | None = None,
     frontend_base_url: str | None = None,
     max_summary_chars: int = MAX_CARD_SECTION_CHARS,
+    title_override: str | None = None,
 ) -> str:
     """Format the Chinese plain-text notification message (used for Discord DMs)."""
-    lines: list[str] = [f"{classification.scope} · {classification.label_zh}"]
+    headline = (
+        f"{classification.scope} · {title_override}"
+        if title_override
+        else f"{classification.scope} · {classification.label_zh}"
+    )
+    lines: list[str] = [headline]
 
     cleaned_word = (verdict_word or "").strip()
     if cleaned_word:
@@ -672,6 +679,7 @@ def build_feishu_notify_card(
     max_summary_chars: int = MAX_CARD_SECTION_CHARS,
     max_total_chars: int = MAX_CARD_TOTAL_BODY_CHARS,
     is_excerpt: bool = False,
+    title_override: str | None = None,
 ) -> dict[str, Any]:
     """Build Feishu Card Schema 2.0 dictionary for a Dalton automation notification."""
     cleaned_word = (verdict_word or "").strip()
@@ -683,11 +691,16 @@ def build_feishu_notify_card(
         f"{ts_label} · 结论：{cleaned_word}" if cleaned_word else ts_label
     )
     tag_text, tag_color = map_category_to_business_tag(classification.category)
+    headline = (
+        f"{classification.scope} · {title_override}"
+        if title_override
+        else f"{classification.scope} · {classification.label_zh}"
+    )
 
     header: dict[str, Any] = {
         "title": {
             "tag": "plain_text",
-            "content": f"{classification.scope} · {classification.label_zh}",
+            "content": headline,
         },
         "subtitle": {
             "tag": "plain_text",
@@ -776,6 +789,31 @@ def _split_target_channel(raw_target: str) -> tuple[str, str]:
         channel = cleaned.split(":", 1)[0].strip().lower()
         return (channel or "unknown", cleaned)
     return ("unknown", cleaned)
+
+
+def _verdict_payoff_assessment(
+    verdict_row: Mapping[str, Any] | None,
+) -> Mapping[str, Any] | None:
+    """The run's verdict payload ``payoff_assessment``, or None when absent.
+
+    Rows written before the field existed (and any malformed payload) read as
+    "not assessed" — the NO_CHANGE push filter keeps skipping them."""
+    if not isinstance(verdict_row, Mapping):
+        return None
+    payload = verdict_row.get("payload")
+    if not isinstance(payload, Mapping):
+        return None
+    payoff = payload.get("payoff_assessment")
+    return payoff if isinstance(payoff, Mapping) else None
+
+
+def _payoff_change_title(payoff: Mapping[str, Any] | None) -> str:
+    """The payoff-change headline: thesis intact, odds moved, reason in Chinese."""
+    reason = ""
+    if payoff is not None:
+        reason = str(payoff.get("reason") or "")
+    reason_zh = PAYOFF_REASON_ZH.get(reason)
+    return f"论点未变、赔率变了：{reason_zh}" if reason_zh else "论点未变、赔率变了"
 
 
 def _notify_route_keys(automation: Mapping[str, Any] | None) -> list[str]:
@@ -1572,7 +1610,7 @@ async def on_automation_settled(
     so no row remains stuck in ``pending``. Returns ``True`` iff at least one target was
     delivered successfully. Never raises.
     """
-    _ = workspace_id
+    ws_for_verdict = (workspace_id or "").strip() or None
     pending_targets: list[tuple[str, str]] = []
     try:
         classification = classify_automation_for_notify(automation)
@@ -1595,6 +1633,14 @@ async def on_automation_settled(
         verdict_row = await get_verdict_fn(
             automation_execution_id=execution_id,
             run_id=run_id,
+            workspace_id=ws_for_verdict,
+            # The price_move gate, the word and the payoff unlock all read the
+            # same price_move-scoped row: a run may append other-trigger
+            # verdicts after the price_move one, and those must not flip the
+            # gate (same scope as stock-move's completion contract).
+            trigger_kind="price_move"
+            if classification.requires_non_no_change_verdict
+            else None,
         )
         verdict_word = (
             str(verdict_row.get("word") or "").strip()
@@ -1602,14 +1648,29 @@ async def on_automation_settled(
             else ""
         )
 
+        # DALTON-HOOK(payoff-assessment): a NO_CHANGE verdict whose odds moved
+        # (payoff_assessment.changed=true) still reaches the PM — the thesis
+        # held but the price crossed the odds card's band. Only a verdict row
+        # of THIS execution/run, in THIS automation's workspace, can open that
+        # door; a missing row (or one written to another workspace during the
+        # run) stays muted.
+        payoff_title_override: str | None = None
         if classification.requires_non_no_change_verdict:
             if not verdict_word or verdict_word.upper() == "NO_CHANGE":
-                logger.info(
-                    "[DALTON_NOTIFY] Skipping price_move notify for execution_id=%s (verdict=%r)",
-                    execution_id,
-                    verdict_word or None,
-                )
-                return False
+                payoff = _verdict_payoff_assessment(verdict_row)
+                if (
+                    verdict_word
+                    and payoff is not None
+                    and payoff.get("changed") is True
+                ):
+                    payoff_title_override = _payoff_change_title(payoff)
+                else:
+                    logger.info(
+                        "[DALTON_NOTIFY] Skipping price_move notify for execution_id=%s (verdict=%r)",
+                        execution_id,
+                        verdict_word or None,
+                    )
+                    return False
 
         resolved_frontend_url = frontend_url_fn()
         message_text = format_notify_message(
@@ -1618,6 +1679,7 @@ async def on_automation_settled(
             final_text=final_text,
             thread_id=thread_id,
             frontend_base_url=resolved_frontend_url,
+            title_override=payoff_title_override,
         )
         card_dict = build_feishu_notify_card(
             classification,
@@ -1625,6 +1687,7 @@ async def on_automation_settled(
             final_text=final_text,
             thread_id=thread_id,
             frontend_base_url=resolved_frontend_url,
+            title_override=payoff_title_override,
         )
         payload_record = {
             "text": message_text,

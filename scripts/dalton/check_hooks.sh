@@ -307,6 +307,10 @@ ALLOWED_HOOKS=(
   # launch reply. Logic in src/dalton/workflows/company_routing.py; the seam
   # and the note ride _launch/_run_started_reply here.
   "company-routing"
+  # 提示词第 3 批 P-1a（2026-11-02）：verdict 新增 payoff_assessment（论点没变
+  # 但赔率变了）——validate 的 changed/reason 组合校验、price_move 推送按
+  # payoff_assessment.changed=true 放行并改标题、完成契约的必填与推送稿要求。
+  "payoff-assessment"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

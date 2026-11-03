@@ -320,8 +320,12 @@ def _verdict_row(
     *,
     run_id: str | None = None,
     conversation_thread_id: str | None = None,
+    payoff: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """One row exactly as ``verdicts._serialize_row`` emits it (real columns)."""
+    """One row exactly as ``verdicts._serialize_row`` emits it (real columns).
+
+    ``payoff`` lands inside ``payload.payoff_assessment``; omitted leaves the
+    legacy payload shape (rows written before the field existed)."""
     return {
         "verdict_id": "VD-20261023-01",
         "user_id": "user-1",
@@ -332,7 +336,7 @@ def _verdict_row(
         "trigger_ref": None,
         "progress": None,
         "next_due": None,
-        "payload": {},
+        "payload": {"payoff_assessment": payoff} if payoff is not None else {},
         "conversation_thread_id": conversation_thread_id,
         "run_id": run_id,
         "automation_execution_id": None,
@@ -368,14 +372,24 @@ def _patch_verdicts(
         automation_execution_id: str | None = None,
         thread_id: str | None = None,
         run_id: str | None = None,
+        workspace_id: str | None = None,
+        trigger_kind: str | None = None,
     ) -> dict[str, Any] | None:
         if error is not None:
             raise error
         if not run_id:
             return None
         for row in rows or []:
-            if row.get("run_id") == run_id:
-                return row
+            if row.get("run_id") != run_id:
+                continue
+            # The real query pins the row to the named workspace and trigger
+            # kind; a verdict the run wrote into a different workspace or
+            # under another trigger never answers it.
+            if workspace_id and row.get("workspace_id") not in (None, workspace_id):
+                continue
+            if trigger_kind and row.get("trigger_kind") != trigger_kind:
+                continue
+            return row
         return None
 
     by_execution.side_effect = _for_execution
@@ -2096,7 +2110,14 @@ async def test_stock_move_no_change_needs_no_knowledge_update(
     _patch_knowledge(monkeypatch, [])
     _patch_verdicts(
         monkeypatch,
-        [_verdict_row("NO_CHANGE", trigger_kind="price_move", run_id="run-nc")],
+        [
+            _verdict_row(
+                "NO_CHANGE",
+                trigger_kind="price_move",
+                run_id="run-nc",
+                payoff={"changed": False, "reason": "none"},
+            )
+        ],
     )
     result = await run_check_done(
         workflow="dalton-stock-move",
@@ -2142,8 +2163,18 @@ async def test_stock_move_no_change_needs_no_knowledge_update(
     _patch_verdicts(
         monkeypatch,
         [
-            _verdict_row("THESIS_STRENGTHENED", trigger_kind="price_move", run_id="run-morning"),
-            _verdict_row("NO_CHANGE", trigger_kind="price_move", run_id="run-afternoon"),
+            _verdict_row(
+                "THESIS_STRENGTHENED",
+                trigger_kind="price_move",
+                run_id="run-morning",
+                payoff={"changed": False, "reason": "none"},
+            ),
+            _verdict_row(
+                "NO_CHANGE",
+                trigger_kind="price_move",
+                run_id="run-afternoon",
+                payoff={"changed": False, "reason": "none"},
+            ),
         ],
     )
     afternoon_no_change = await run_check_done(
@@ -2178,7 +2209,14 @@ async def test_stock_move_changed_verdict_requires_a_knowledge_update(
     _patch_knowledge(monkeypatch, [])
     _patch_verdicts(
         monkeypatch,
-        [_verdict_row("THESIS_WEAKENED", trigger_kind="price_move", run_id="conv-run-14pm")],
+        [
+            _verdict_row(
+                "THESIS_WEAKENED",
+                trigger_kind="price_move",
+                run_id="conv-run-14pm",
+                payoff={"changed": True, "reason": "price_crossed_band"},
+            )
+        ],
     )
     result = await run_check_done(
         workflow="dalton-stock-move", params=MOVE_PARAMS,
@@ -2612,7 +2650,16 @@ async def test_thesis_delta_material_no_without_note_is_done(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_knowledge(monkeypatch, [])
-    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", trigger_kind="indicator")])
+    _patch_verdicts(
+        monkeypatch,
+        [
+            _verdict_row(
+                "NO_CHANGE",
+                trigger_kind="indicator",
+                payoff={"changed": False, "reason": "none"},
+            )
+        ],
+    )
     result = await run_check_done(
         workflow="dalton-thesis-delta", params=DELTA_PARAMS,
         backend=_make_backend(_delta_files("no", with_note=False)), workspace_id=WS,
@@ -2625,7 +2672,16 @@ async def test_thesis_delta_material_yes_needs_note_and_knowledge(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_knowledge(monkeypatch, [])
-    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", trigger_kind="filing")])
+    _patch_verdicts(
+        monkeypatch,
+        [
+            _verdict_row(
+                "THESIS_STRENGTHENED",
+                trigger_kind="filing",
+                payoff={"changed": False, "reason": "none"},
+            )
+        ],
+    )
     result = await run_check_done(
         workflow="dalton-thesis-delta", params=DELTA_PARAMS,
         backend=_make_backend(_delta_files("yes", with_note=False)), workspace_id=WS,
@@ -2649,7 +2705,10 @@ async def test_thesis_delta_stale_or_unreadable_last_run_is_missing(
 ) -> None:
     _freeze_execution_day(monkeypatch, "2026-10-23")
     _patch_knowledge(monkeypatch, [])
-    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE")])
+    _patch_verdicts(
+        monkeypatch,
+        [_verdict_row("NO_CHANGE", payoff={"changed": False, "reason": "none"})],
+    )
     from datetime import datetime as _dt
 
     yesterday = int(_dt.fromisoformat("2026-10-22T12:00:00+00:00").timestamp())
@@ -2680,7 +2739,16 @@ async def test_thesis_delta_missing_material_field_is_missing(
     核对: reading it as "condition not met" would skip the delta note and the
     knowledge check while everything else passes."""
     _patch_knowledge(monkeypatch, [])
-    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", trigger_kind="indicator")])
+    _patch_verdicts(
+        monkeypatch,
+        [
+            _verdict_row(
+                "NO_CHANGE",
+                trigger_kind="indicator",
+                payoff={"changed": False, "reason": "none"},
+            )
+        ],
+    )
     files = _delta_files("no", with_note=False)
     files[LAST_RUN] = json.dumps({"run_id": "20261023-2000"})
     result = await run_check_done(
@@ -2701,7 +2769,16 @@ async def test_thesis_delta_material_out_of_domain_is_missing(
     """material must be yes or no — any other value is unverifiable, not a
     no-requirements round; yes/no keep their two existing paths."""
     _patch_knowledge(monkeypatch, [])
-    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE", trigger_kind="indicator")])
+    _patch_verdicts(
+        monkeypatch,
+        [
+            _verdict_row(
+                "NO_CHANGE",
+                trigger_kind="indicator",
+                payoff={"changed": False, "reason": "none"},
+            )
+        ],
+    )
     files = _delta_files("maybe", with_note=False)
     result = await run_check_done(
         workflow="dalton-thesis-delta", params=DELTA_PARAMS,
@@ -2792,7 +2869,10 @@ async def test_call_gate_failed_round_completes_with_gates_file_and_verdict(
 
     # 行没有 run_id 时（第 3 轮 #2 的严格归因）：不再退回时间窗口，本轮没有
     # verdict 就是不算完成——run_id 为空的旧行不会冒充本轮。
-    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE")])
+    _patch_verdicts(
+        monkeypatch,
+        [_verdict_row("NO_CHANGE", payoff={"changed": False, "reason": "none"})],
+    )
     strict = await run_check_done(
         workflow="dalton-call", params=CALL_PARAMS,
         backend=_make_backend(_gates_entry()), workspace_id=WS,
@@ -2817,7 +2897,10 @@ async def test_call_gate_failed_without_gates_file_is_missing(
 ) -> None:
     """没有门禁结果文件也没有草稿：两个签名都没有，无法判定（第 3 轮 #1
     起先读本轮门禁文件，不存在就走草稿分支）。"""
-    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE")])
+    _patch_verdicts(
+        monkeypatch,
+        [_verdict_row("NO_CHANGE", payoff={"changed": False, "reason": "none"})],
+    )
     result = await run_check_done(
         workflow="dalton-call", params=CALL_PARAMS,
         backend=_make_backend({}), workspace_id=WS,
@@ -2831,7 +2914,10 @@ async def test_call_gate_failed_with_empty_failed_gates_is_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """passed=false 但 failed_gates 为空（或条目没有原因）不合契约。"""
-    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE")])
+    _patch_verdicts(
+        monkeypatch,
+        [_verdict_row("NO_CHANGE", payoff={"changed": False, "reason": "none"})],
+    )
     result = await run_check_done(
         workflow="dalton-call", params=CALL_PARAMS,
         backend=_make_backend(_gates_entry(failed=[])), workspace_id=WS,
@@ -2839,7 +2925,10 @@ async def test_call_gate_failed_with_empty_failed_gates_is_missing(
     assert result["done"] is False
     assert any("failed_gates" in m for m in result["missing"])
 
-    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE")])
+    _patch_verdicts(
+        monkeypatch,
+        [_verdict_row("NO_CHANGE", payoff={"changed": False, "reason": "none"})],
+    )
     result = await run_check_done(
         workflow="dalton-call", params=CALL_PARAMS,
         backend=_make_backend(
@@ -2947,7 +3036,10 @@ async def test_call_stale_gates_file_does_not_count_as_this_round(
     _patch_run_start(monkeypatch)
     old_draft = "# Conviction Call\n" + "旧稿" * 300
     files = {CALL_DRAFT: old_draft, **_gates_entry()}
-    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE")])
+    _patch_verdicts(
+        monkeypatch,
+        [_verdict_row("NO_CHANGE", payoff={"changed": False, "reason": "none"})],
+    )
     result = await run_check_done(
         workflow="dalton-call", params=CALL_PARAMS,
         backend=_make_backend(
@@ -3029,7 +3121,10 @@ async def test_call_probe_failure_is_not_confirmed_absence(
     """A dead sandbox (reads raise, commands fail with no probe marker) must
     not read as "no draft": the gate's absent branch would then clear on a
     same-day NO_CHANGE verdict and report done."""
-    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE")])
+    _patch_verdicts(
+        monkeypatch,
+        [_verdict_row("NO_CHANGE", payoff={"changed": False, "reason": "none"})],
+    )
     result = await run_check_done(
         workflow="dalton-call", params=CALL_PARAMS,
         backend=_make_backend({}, read_error=True, execute_error=True),
@@ -3047,7 +3142,10 @@ async def test_call_empty_file_with_dead_probe_is_not_absence(
     None for empty files, files.py): a None read is not proof of absence,
     so with the probe dead (exit 1, no marker) the gate cannot be decided
     and a same-day NO_CHANGE must not clear it."""
-    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE")])
+    _patch_verdicts(
+        monkeypatch,
+        [_verdict_row("NO_CHANGE", payoff={"changed": False, "reason": "none"})],
+    )
     result = await run_check_done(
         workflow="dalton-call", params=CALL_PARAMS,
         backend=_make_backend({CALL_DRAFT: ""}, execute_error=True),
@@ -3063,7 +3161,10 @@ async def test_call_decode_failure_with_dead_probe_is_not_absence(
 ) -> None:
     """A UTF-8 decode failure reads as None the same way — existence stays
     unknown, never the absent branch."""
-    _patch_verdicts(monkeypatch, [_verdict_row("NO_CHANGE")])
+    _patch_verdicts(
+        monkeypatch,
+        [_verdict_row("NO_CHANGE", payoff={"changed": False, "reason": "none"})],
+    )
     backend = _make_backend(
         {CALL_DRAFT: "# Conviction Call\n" + "论证" * 300},
         execute_error=True,
@@ -4073,7 +4174,11 @@ async def test_wake_before_eastern_midnight_binds_window_to_turn_start(
     the turn's start, so the verdict/note written during the turn count and
     the contract reports done."""
     captured = _patch_knowledge_capture(monkeypatch, ["thesis"])
-    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", "internal_material")])
+    _patch_verdicts(monkeypatch, [_verdict_row(
+            "THESIS_STRENGTHENED",
+            "internal_material",
+            payoff={"changed": False, "reason": "none"},
+        )])
     # This turn's start: the wake time, read from conversation_responses.
     monkeypatch.setattr(
         check_done_tools,
@@ -4113,7 +4218,11 @@ async def test_delta_note_variant_accepts_the_eastern_day_file(
     _patch_knowledge(
         monkeypatch, ["thesis"], start_epochs={"resp-wake": _WAKE_EPOCH}
     )
-    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", "internal_material")])
+    _patch_verdicts(monkeypatch, [_verdict_row(
+            "THESIS_STRENGTHENED",
+            "internal_material",
+            payoff={"changed": False, "reason": "none"},
+        )])
 
     result = await run_check_done(
         workflow="dalton-thesis-delta",
@@ -4168,7 +4277,11 @@ async def test_explicit_delta_note_param_wins_over_dated_template(
     _patch_knowledge(
         monkeypatch, ["thesis"], start_epochs={"resp-wake": _WAKE_EPOCH}
     )
-    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", "internal_material")])
+    _patch_verdicts(monkeypatch, [_verdict_row(
+            "THESIS_STRENGTHENED",
+            "internal_material",
+            payoff={"changed": False, "reason": "none"},
+        )])
 
     result = await run_check_done(
         workflow="dalton-thesis-delta",
@@ -4334,6 +4447,7 @@ async def test_verdict_from_sibling_thread_in_same_workspace_is_rejected(
                 "THESIS_STRENGTHENED",
                 "internal_material",
                 conversation_thread_id="short-1",
+                payoff={"changed": False, "reason": "none"},
             )
         ],
     )
@@ -4423,7 +4537,11 @@ async def test_same_as_of_rerun_passes_when_this_run_rewrites_the_note(
     sandbox clock skew): the contract completes."""
     _patch_second_run_start(monkeypatch)
     _patch_knowledge(monkeypatch, ["thesis"])
-    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", "internal_material")])
+    _patch_verdicts(monkeypatch, [_verdict_row(
+            "THESIS_STRENGTHENED",
+            "internal_material",
+            payoff={"changed": False, "reason": "none"},
+        )])
 
     result = await run_check_done(
         workflow="dalton-thesis-delta",
@@ -4621,7 +4739,11 @@ async def test_today_anchor_is_the_window_start_across_utc_midnight(
         create_autospec(check_done_tools._run_start_epoch, return_value=int(day_d.timestamp())),
     )
     _patch_knowledge(monkeypatch, ["thesis"])
-    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", "internal_material")])
+    _patch_verdicts(monkeypatch, [_verdict_row(
+            "THESIS_STRENGTHENED",
+            "internal_material",
+            payoff={"changed": False, "reason": "none"},
+        )])
 
     files = _second_run_files()
     # The note names the run's as_of day (10-27), written this run.
@@ -4654,7 +4776,11 @@ async def test_stale_template_falls_through_to_a_qualifying_variant(
     _patch_knowledge(
         monkeypatch, ["thesis"], start_epochs={"resp-wake": _WAKE_EPOCH}
     )
-    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED", "internal_material")])
+    _patch_verdicts(monkeypatch, [_verdict_row(
+            "THESIS_STRENGTHENED",
+            "internal_material",
+            payoff={"changed": False, "reason": "none"},
+        )])
 
     old_note = "# 旧\n" + "变化" * 200
     new_note = "# 新\n" + "变化" * 200
