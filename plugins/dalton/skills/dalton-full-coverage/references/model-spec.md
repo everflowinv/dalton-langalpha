@@ -24,8 +24,8 @@
 6. **`Balance Sheet`**：资产负债表（现金与短投、应收、存货、PP&E、商誉与无形资产、应付、递延收入/合同负债、有息债务、股东权益；资产总计必须动态等于负债及股东权益总计）。
 7. **`Scenarios`**：多/中/空三情景开关与驱动参数页（至少包含 **Bear / Base / Bull** 三套独立的核心驱动参数——收入增速、毛利率、费用率、Capex 强度、终值假设，严禁只改标签不改底层驱动参数；汇总三情景下的收入、EPS、FCF 与每股估值）。
 8. **`Guidance vs Actual`（Dalton 增补页 2：C4 12 季指引可信度表）**：完整落地 C 支线 C4 整理的**过去 12 个季度管理层指引 vs 实际结果逐季对比表**（列：季度｜指引指标｜指引区间下限｜指引区间上限｜指引中点｜实际结果｜Beat/Miss 金额与百分比｜结果判定｜管理层事后解释），并在底部用公式统计：过去 12 季 Beat 次数、Beat 率（%）、平均 Beat 幅度、指引风格结论。
-9. **`Street vs House`（Dalton 增补页 3：我们与卖方逐驱动对比表）**：作为备忘录第八章 `8.3 我们与卖方逐驱动对比` 的唯一数字出处。按未来两年（`0y`、`+1y`）及中期（`+2y`）逐行列出：**核心业务分部收入、集团总收入、毛利率、各项经营费用/Capex、营业利润（率）、有效税率、稀释股数、GAAP/Non-GAAP EPS、FCF**，每行包含以下列：
-   - `指标与期间 | 卖方一致预期（Street Consensus） | 我们的基准预测（House Base） | 我们的乐观/悲观预测（House Bull / Bear） | House Base vs Street 差异（% 或 bps） | 差异背后的核心 Debate 与证据依据（引用 [A/B/C/D-n]）`
+9. **`Street vs House`（Dalton 增补页 3：我们与卖方逐驱动对比表）**：作为备忘录「财务预测与估值」节 Street vs House 对比表的唯一数字出处。按未来两年（`0y`、`+1y`）及中期（`+2y`）逐行列出：**核心业务分部收入、集团总收入、毛利率、各项经营费用/Capex、营业利润（率）、有效税率、稀释股数、GAAP/Non-GAAP EPS、FCF**，每行包含以下列：
+   - `指标与期间 | Consensus | House Base | House Bull / Bear | House Base vs Consensus 差异（% 或 bps） | 差异背后的核心 Debate 与证据依据（[引用N]）`
    - 其中 `House Base / Bull / Bear` 列必须用公式直接引用 `Scenarios`、`Revenue Model` 与 `Income Statement` 页的对应单元格，严禁手填硬编码。
 10. **`DCF Inputs`**：WACC 测算（无风险利率、ERP、Beta、税后债务成本、目标资本结构）与终值参数（永续增长率 $g$ 与退出倍数 Exit Multiple）。
 11. **`DCF`**：自由现金流折现模型与股权价值桥接（Enterprise Value → Equity Value → Implied Share Price）。

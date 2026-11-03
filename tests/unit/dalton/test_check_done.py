@@ -4974,3 +4974,274 @@ async def test_earnings_calendar_check_done_without_user_id_fails_closed(
     assert any("缺少 user_id，财报日历镜像无法核对" in m for m in result["missing"])
     assert any("缺少 user_id，财报日历唤醒信号无法核对" in m for m in result["missing"])
 
+
+
+# ------------------------------------------------- full-coverage workflow→contract
+# Round 2 #1: the reworked full-coverage flow (single writer, two memo
+# language rounds, one revision) must still satisfy dalton_check_done. The
+# real workflow.js runs against a host that writes every artifact it would
+# leave on disk; run_check_done then audits exactly those files.
+
+FC_REPO_ROOT = Path(__file__).resolve().parents[3]
+FC_MEMO = """# 虚拟公司（TEST）投资备忘录
+
+## 摘要
+
+锚点：TEST｜2026-10-23｜股价 100 美元｜当前建议：观察。2Q26 收入同比增长 18%，OPM 13.2% [引用1]。
+
+## 公司与商业模式
+
+公司靠订阅赚钱，margin 来自切换成本。2Q26 续费率 95% [引用1]。
+
+## 行业与竞争
+
+行业分散，前三家合计份额 30% [引用2]。
+
+## 核心投资逻辑与争议
+
+市场认为增长见顶 [引用2]；我们不同，因为新客户结构变了 [引用1]。
+
+## 财务预测与估值
+
+Base 目标价 120 美元，上行/下行 2:1 [引用3]。
+
+## 风险
+
+大客户流失：单一客户占收入 20%，丢单直接砍利润 [引用1]。
+
+## 管理层
+
+CEO 创始人，指引历来保守 [引用1]。
+
+## 跟踪
+
+季度净增客户数跌破 X 即证伪 [假设]。
+
+## 附录
+
+计算明细。
+
+## 引用
+
+[引用1]: f:rev_q8 （数字底表｜最近一季收入｜2Q26｜research/2026-10-23-fc/facts.md）
+[引用2]: evidence:E-20261023-01 （法定财报｜虚拟公司｜FY2025 10-K｜2026-02-01｜accession 000000000-26-000001）
+[引用3]: model:model/META-model-v01.xlsx!Scenarios!C12 （本方模型｜Base 目标价｜2026-10-23｜model/META-model-v01.xlsx）
+"""
+
+_PASS_VERDICT = {
+    "verdict": "pass",
+    "summary": "通过",
+    "items": _nine_items(),
+    "must_fix": [],
+}
+
+
+class _FcRunHost:
+    """Answers the real full-coverage workflow's dispatches and records the
+    files each child would leave behind in ``files`` (side effects only the
+    real tools would perform: writing artifacts, check_language records)."""
+
+    def __init__(self) -> None:
+        self.files: dict[str, str] = {}
+        self.labels: list[str] = []
+        self.review_sha: str | None = None
+
+    # -- helpers ---------------------------------------------------------
+    def _sha(self, path: str) -> str:
+        return _draft_hash(self.files[path])
+
+    def _out(self, path: str, summary: str = "done") -> dict[str, Any]:
+        return {"files": [path], "summary": summary, "sha256": self._sha(path)}
+
+    def _append_round(self, path: str, round_no: int) -> None:
+        sidecar = f"{path}.language.json"
+        doc = json.loads(self.files[sidecar]) if sidecar in self.files else {"draft": path, "rounds": []}
+        doc["rounds"].append(
+            {
+                "round": round_no,
+                "draft_sha256": self._sha(path),
+                "model": "test-review-model",
+                "generated_at": "2026-10-23T00:00:00Z",
+                "issues": [],
+                "dropped_quotes": 0,
+            }
+        )
+        self.files[sidecar] = json.dumps(doc, ensure_ascii=False)
+
+    def _two_round_sidecar(self, path: str) -> None:
+        self._append_round(path, 1)
+        self._append_round(path, 2)
+
+    # -- host protocol ---------------------------------------------------
+    async def agent(self, prompt: str, opts: dict[str, Any]) -> Any:
+        label = str(opts.get("label") or "")
+        await asyncio.sleep(0)
+        self.labels.append(label)
+        R = "research/2026-10-23-fc"
+        if label == "数字底表":
+            self.files[f"{R}/facts.md"] = (
+                "<!-- FACTS-LEDGER\n{\"ledger\": [{\"key\": \"rev_q8\", \"value\": \"18%\"}]}\n-->\n\n"
+                + "底表内容：" * 60
+            )
+            return self._out(f"{R}/facts.md")
+        if label == "frame":
+            self.files[f"{R}/questions.md"] = "# 虚拟公司 12 问研究提纲\n\n" + "问题与取证安排：" * 30
+            return self._out(f"{R}/questions.md")
+        if label.startswith("支线 "):
+            k = label.split(" ")[1].lower()
+            self.files[f"{R}/e{k}.md"] = f"# 支线 {k.upper()}\n\n" + "取证内容：" * 40 + "\n<!-- 完成 -->"
+            return self._out(f"{R}/e{k}.md")
+        if label == "支线核验":
+            paths = [
+                line[2:].split("（")[0].strip()
+                for line in prompt.splitlines()
+                if line.startswith("- ") and "|" not in line
+            ]
+            return {"files": [f"{p}|ok" for p in paths]}
+        if label == "建模":
+            self.files["model/META-model-v01.xlsx"] = "x" * 1200
+            return {
+                "files": ["model/META-model-v01.xlsx"],
+                "summary": "recalc / audit --strict / Checks 全部通过",
+                "sha256": _draft_hash(self.files["model/META-model-v01.xlsx"]),
+                "checks_passed": True,
+            }
+        if label == "memo 探测":
+            m = re.search(r"f='([^']+)'", prompt)
+            return {"files": [f"{m.group(1)}|absent"]}
+        if label == "模型审计":
+            m = re.search(r"f='([^']+)'", prompt)
+            return {"files": [f"{m.group(1)}|audit_ok"]}
+        if label == "成稿":
+            self.files["drafts/2026-10-23-memo.md"] = FC_MEMO
+            return self._out("drafts/2026-10-23-memo.md", "成稿，validate 0 FAIL")
+        if label == "check-model":
+            self.files[f"{R}/model-check.md"] = "# 模型审计\n\n" + "审计结论：" * 40
+            return self._out(f"{R}/model-check.md")
+        if label == "语言审查 1":
+            memo = "drafts/2026-10-23-memo.md"
+            self._append_round(memo, 1)
+            self.files[memo] = self.files[memo] + "\n（按第 1 轮清单完成语言修改。）\n"
+            return self._out(memo, "按清单修改完成")
+        if label == "笔记语言审查":
+            for rel in (
+                f"{R}/facts.md",
+                f"{R}/questions.md",
+                f"{R}/ea.md",
+                f"{R}/eb.md",
+                f"{R}/ec.md",
+                f"{R}/ed.md",
+                f"{R}/model-check.md",
+            ):
+                self._two_round_sidecar(rel)
+            return {"files": [f"{R}/facts.md"], "summary": "笔记两轮完成"}
+        if label == "语言审查 2":
+            memo = "drafts/2026-10-23-memo.md"
+            self._append_round(memo, 2)
+            return self._out(memo, "终稿无需再改")
+        if opts.get("agentType") == "dalton-reviewer":
+            m = re.search(r"sha256：([0-9a-f]{64})", prompt)
+            if m:
+                self.review_sha = m.group(1)
+            return json.loads(json.dumps(_PASS_VERDICT))
+        if label.startswith("解析"):
+            return {"path": "model/META-model-v01.xlsx", "sha256": _draft_hash(self.files["model/META-model-v01.xlsx"])}
+        if label == "知识层修订草案":
+            self.files[f"{R}/knowledge-revision.json"] = json.dumps(
+                {"thesis": {"ops": [{"op": "set", "value": "x" * 40}]}}, ensure_ascii=False
+            )
+            return self._out(f"{R}/knowledge-revision.json")
+        if label == "产物核验":
+            paths = [
+                line[2:].strip()
+                for line in prompt.splitlines()
+                if line.startswith("- ") and "|" not in line
+            ]
+
+            def _norm(p: str) -> str:
+                return p[2:] if p.startswith("./") else p
+
+            return {
+                "files": [
+                    f"{p}|{self._sha(_norm(p))}" if _norm(p) in self.files else p for p in paths
+                ]
+            }
+        return {"files": ["x"], "summary": "s", "sha256": "a" * 64}
+
+    def phase(self, title: str) -> None:
+        pass
+
+    def log(self, message: str) -> None:
+        pass
+
+
+@pytest.mark.asyncio
+async def test_full_coverage_workflow_run_satisfies_check_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reworked full-coverage flow end to end: the real workflow.js runs
+    (single writer, two memo language rounds, no revision this run), the
+    driver-side records are written the way the real driver would, and
+    dalton_check_done reports done over exactly those artifacts."""
+    from ptc_agent.agent.middleware.background_subagent.workflow.engine import (
+        WorkflowHost,
+        WorkflowLimits,
+        run_workflow_script,
+    )
+
+    host = _FcRunHost()
+    spec_host = create_autospec(WorkflowHost, instance=True)
+    spec_host.agent.side_effect = host.agent
+    spec_host.phase.side_effect = host.phase
+    spec_host.log.side_effect = host.log
+    script = (FC_REPO_ROOT / "workflows" / "full-coverage" / "workflow.js").read_text(encoding="utf-8")
+    outcome = await run_workflow_script(
+        script, PARAMS, spec_host, WorkflowLimits(memory_limit_mb=64, cpu_budget_s=10.0)
+    )
+    assert outcome.status == "completed", outcome.error
+    run_result = outcome.result
+    assert run_result["ok"] is True, run_result["incomplete"]
+    assert run_result["language_done"] is True
+    assert "成稿" in host.labels and "语言审查 2" in host.labels
+    assert "修订 1" not in host.labels  # the review passed on the first try
+
+    # Driver-side records the real driver/journal would leave: the run's
+    # status + the last reviewer pass binding the final draft hash, and the
+    # main agent's check_draft audit sidecar for the closing contract.
+    files = dict(host.files)
+    memo_sha = _draft_hash(files["drafts/2026-10-23-memo.md"])
+    assert host.review_sha == memo_sha
+    files[".agents/threads/short-1/workflows/task-run-1/status.json"] = json.dumps(
+        {"run_id": "task-run-1", "name": "full-coverage", "status": "completed", "updated_at": 2.0}
+    )
+    files[".agents/threads/short-1/workflows/task-run-1/journal/独立审稿.json"] = json.dumps(
+        {
+            "label": "独立审稿",
+            "dispatches": [
+                {
+                    "label": "独立审稿",
+                    "status": "ok",
+                    "seq": 7,
+                    "recorded_at": 2.0,
+                    "draft_sha256": memo_sha,
+                    "result": _PASS_VERDICT,
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )
+    files["drafts/2026-10-23-memo.audit.md"] = (
+        "# 数字核验报告\n- **草稿哈希**：`" + memo_sha[:16] + "…`\n"
+    )
+
+    _patch_knowledge(monkeypatch, ["company", "thesis", "debate", "drivers", "management", "models"])
+    _patch_verdicts(monkeypatch, [_verdict_row("THESIS_STRENGTHENED")])
+
+    result = await run_check_done(
+        workflow="full-coverage",
+        params=PARAMS,
+        backend=_make_backend(files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert result["done"], result["missing"]
