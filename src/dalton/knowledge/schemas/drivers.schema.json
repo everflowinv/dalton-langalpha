@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema", "$id": "https://dalton.local/schemas/drivers",
   "type": "object", "additionalProperties": false,
   "properties": {
-    "schema_version": {"const": 1}, "as_of": {"$ref": "common#/$defs/isoTime"},
+    "schema_version": {"enum": [1, 2]}, "as_of": {"$ref": "common#/$defs/isoTime"},
     "historical_valuation_driver": {"type": "object", "additionalProperties": false,
       "description": "历史上股价由 EPS 驱动还是倍数驱动",
       "properties": {"summary": {"type": "string"}, "window": {"type": "string"},
@@ -31,6 +31,41 @@
           "properties": {"kind": {"enum": ["none","price","fmp_metric","internal_query"]}, "params": {"type": "object"}}}
       },
       "required": ["id","name","source","frequency","good_direction"]},
+    "driverResponsePoint": {
+      "type": "object", "additionalProperties": false,
+      "description": "非线性传导的定量计算点，须同时包含输入变动（`driver_move` 或 `x`）与产出影响（`eps_impact`、`multiple_impact`、`fcf_impact` 或 `y`）",
+      "properties": {
+        "driver_move": {"type": ["string", "number"], "minLength": 1},
+        "eps_impact": {"oneOf": [{"type": "null"}, {"type": "number"}, {"type": "string", "minLength": 1}, {"$ref": "common#/$defs/range"}]},
+        "multiple_impact": {"oneOf": [{"type": "null"}, {"type": "number"}, {"type": "string", "minLength": 1}, {"$ref": "common#/$defs/range"}]},
+        "fcf_impact": {"oneOf": [{"type": "null"}, {"type": "number"}, {"type": "string", "minLength": 1}, {"$ref": "common#/$defs/range"}]},
+        "x": {"type": ["number", "string"], "minLength": 1},
+        "y": {"type": ["number", "string"], "minLength": 1},
+        "note": {"type": ["string", "null"]}
+      },
+      "allOf": [
+        {"anyOf": [{"required": ["driver_move"]}, {"required": ["x"]}]},
+        {"anyOf": [{"required": ["eps_impact"]}, {"required": ["multiple_impact"]}, {"required": ["fcf_impact"]}, {"required": ["y"]}]}
+      ]
+    },
+    "driverResponse": {
+      "type": "object", "additionalProperties": false,
+      "description": "驱动因素对盈利或估值的传导特征。当 `shape` 为 `threshold`、`lag`、`convex` 或 `concave`（非 `linear` / `unknown`）时，必须填写非空的 `threshold_text`，或在 `points` 中提供至少 3 个同时含输入变动（`driver_move` 或 `x`）与产出影响（`eps_impact`、`multiple_impact`、`fcf_impact` 或 `y`）的计算点",
+      "properties": {
+        "mechanism": {"type": "string", "minLength": 1},
+        "shape": {"enum": ["linear", "threshold", "lag", "convex", "concave", "unknown"]},
+        "threshold_text": {"type": ["string", "null"]},
+        "calc_ref": {
+          "anyOf": [
+            {"type": "null"},
+            {"$ref": "common#/$defs/sourceRef"},
+            {"$ref": "common#/$defs/evidenceRef"}
+          ]
+        },
+        "points": {"type": "array", "items": {"$ref": "#/$defs/driverResponsePoint"}}
+      },
+      "required": ["mechanism", "shape"]
+    },
     "driver": {"type": "object", "additionalProperties": false,
       "properties": {
         "id": {"type": "string", "pattern": "^K\\d+$"},
@@ -41,6 +76,7 @@
         "linked_pillars": {"type": "array", "items": {"type": "string"}},
         "linked_debates": {"type": "array", "items": {"type": "string"}},
         "leading_indicators": {"type": "array", "items": {"$ref": "#/$defs/indicator"}},
+        "response": {"$ref": "#/$defs/driverResponse"},
         "sensitivity": {"type": "object", "additionalProperties": false,
           "properties": {"target_metric": {"type": "string", "description": "如 FY2026 EPS"},
                          "per_change": {"type": "string", "description": "如 每 +1pp 广告增速"},

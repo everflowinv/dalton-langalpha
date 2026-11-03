@@ -66,6 +66,15 @@ budget:
 knowledge:
   max_doc_bytes: 1048576
 
+mandate:
+  long_hurdle_annual: 0.15        # 多头年化要求回报
+  short_hurdle_annual: 0.20       # 空头年化要求跌幅
+  min_total_return: 0.10          # 多头短周期最低绝对回报（见 4.2）
+  max_adverse_move_act_now: 0.25  # act_now 时不利端点最大不利幅度（§12.1 / §12.4）
+  call_hurdle_annual: 0.15        # call 要求年化门槛
+  anchor_stale_days: 14           # 锚价天数过期阈值（§12.8）
+  anchor_stale_move: 0.15         # 锚价偏离过期阈值（§12.8）
+
 publish:
   reviewer_models:
     - "gpt-6.1-sol-oauth"
