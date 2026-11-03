@@ -160,7 +160,8 @@ Save to `{task}/`.
 
 **Portfolio-aware variant.** When the user supplies holdings: which candidates are additive, which duplicate exposure already held, which work as hedges or pairs against existing positions, what the list does to factor and sector exposure, and where position size runs into liquidity.
 
-**Routing.** Each `immediate research candidate` names its next skill and the fields that travel with it: `.agents/skills/earnings-preview/SKILL.md` when a print is the next event, `.agents/skills/earnings-analysis/SKILL.md` when the trigger was a print already out, `.agents/skills/initiating-coverage/SKILL.md` for a full underwrite, `.agents/skills/comps-analysis/SKILL.md` or `.agents/skills/dcf-model/SKILL.md` when the debate is valuation, `.agents/skills/thesis-tracker/SKILL.md` once a view exists, and `.agents/skills/catalyst-calendar/SKILL.md` for the dated trigger a watchlist name waits on.
+<!-- DALTON-HOOK(skills-registry): routes to the Dalton skills that supersede the switched-off upstream ones -->
+**Routing.** Each `immediate research candidate` names its next skill and the fields that travel with it: `.agents/skills/dalton-earnings-preview/SKILL.md` when a print is the next event, `.agents/skills/dalton-earnings-flash/SKILL.md` when the trigger was a print already out, `.agents/skills/dalton-initial-coverage/SKILL.md` for a full underwrite, `.agents/skills/comps-analysis/SKILL.md` or `.agents/skills/dcf-model/SKILL.md` when the debate is valuation, `.agents/skills/dalton-thesis-delta/SKILL.md` once a view exists, and `.agents/skills/dalton-agenda/SKILL.md` for the dated trigger a watchlist name waits on.
 
 **User files.** A watchlist or portfolio file the user supplied is extended, never overwritten: write to a new file or a new tab, and add a data-quality flag column rather than editing source values.
 

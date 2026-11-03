@@ -68,7 +68,7 @@
       "required": ["id","metric","operator","label"]
     },
     "signal": {"enum": ["strongly_confirming","confirming","mildly_confirming","neutral","mildly_weakening","weakening","strongly_weakening","mixed","invalidating","untested"],
-               "description": "沿用 thesis-tracker 的刻度；禁止相加成分数"},
+               "description": "每个信号单独判断，按 dalton-earnings-deep 的 calibration.md 第二节的刻度；不要把多个信号相加成一个分数"},
     "pillarStatus": {"enum": ["strengthening","intact","watch","impaired","broken","changed","untested","retired"]},
     "verdictWord": {"enum": ["NO_CHANGE","THESIS_STRENGTHENED","THESIS_WEAKENED","THESIS_BROKEN","NEW_THESIS"],
                     "description": "Playbook 正式词形；md 和界面显示 无变化/强化/削弱/证伪/新论点"}

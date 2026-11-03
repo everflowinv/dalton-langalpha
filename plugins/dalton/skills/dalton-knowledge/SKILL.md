@@ -14,7 +14,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 | 路径 | 角色 | 写入方式 |
 |---|---|---|
 | `agent.md` | 公司目标、一句话判断与文件索引；`<!-- dalton:summary:start ... -->` 至 `<!-- dalton:summary:end -->` 为服务端托管块 | 托管块由 `knowledge_update` 自动刷新；自由区可用 `Edit` 维护 |
-| `thesis.md` / `data/thesis.json` | 核心支柱（3–5 条）、confirm/warn/break 阈值、只追加证据台账、house view 与正式版本 | `knowledge_update(doc="thesis", ...)` |
+| `thesis.md` / `data/thesis.json` | 核心支柱（3–5 条）、confirm/warn/break 阈值、只追加证据台账、house view 与正式版本；为不熟悉的行业设支柱和跟踪指标时，先看 `references/sector-signals.md` 里各行业的领先指标和预警信号 | `knowledge_update(doc="thesis", ...)` |
 | `debate.md` / `data/debate.json` | 当前 Top Debates（分歧变量、多方、空方、最强反驳、我方判断、改判条件） | `knowledge_update(doc="debate", ...)` |
 | `drivers.md` / `data/drivers.json` | 关键业务驱动、领先指标最新读数、EPS/倍数敏感度 | `knowledge_update(doc="drivers", ...)` |
 | `management.md` / `data/management.json` | 管理层团队、指引风格（Beat 率/中位 Surprise 由服务端计算）、指引对实际历史 | `knowledge_update(doc="management", ...)` |

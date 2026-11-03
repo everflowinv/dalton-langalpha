@@ -6,7 +6,7 @@
     "as_of": {"$ref": "common#/$defs/isoTime"},
     "one_liner": {"type": "string", "maxLength": 200},
     "aggregate_status": {"$ref": "common#/$defs/pillarStatus"},
-    "aggregate_override": {"type": "string", "description": "一条核心支柱 impaired 而总体好于 watch 时，必须写一句带证据的理由（thesis-tracker 第 3 步规则）"},
+    "aggregate_override": {"type": "string", "description": "一条核心支柱 impaired 而总体好于 watch 时，必须写一句带证据的理由（规则见 dalton-earnings-deep 的 calibration.md 第二节第 3 条）"},
     "house_view": {"$ref": "#/$defs/houseView"},
     "house_view_history": {"type": "array", "items": {"$ref": "#/$defs/houseViewChange"}, "description": "只追加"},
     "market_view": {"type": "object", "additionalProperties": false,

@@ -5,7 +5,7 @@ description: "Translate a macro, policy, rate, commodity, geopolitical or indust
 
 # Impact Analysis
 
-One object carries this skill: the **transmission chain**, written as event, channel, driver, line item, action. A shock reaches a share price only by reaching a named landing, a financial line item or the valuation input a discount rate moves directly, so a claim that cannot name where it lands is a mood about a theme and does not ship. This is the work between `.agents/skills/morning-note/SKILL.md`, which says something happened, and the models, which say what a company is worth.
+One object carries this skill: the **transmission chain**, written as event, channel, driver, line item, action. A shock reaches a share price only by reaching a named landing, a financial line item or the valuation input a discount rate moves directly, so a claim that cannot name where it lands is a mood about a theme and does not ship. This is the work between the daily note, which says something happened, and the models, which say what a company is worth. <!-- DALTON-HOOK(skills-registry): morning-note is switched off in Dalton builds -->
 
 Evidence labels, source tiers, staleness, the readiness posture and the intake limits: `.agents/skills/research-conventions/SKILL.md`, read before the first deliverable.
 

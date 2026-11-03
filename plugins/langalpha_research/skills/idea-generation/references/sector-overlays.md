@@ -2,7 +2,7 @@
 
 Deferred reference for `idea-generation`. Read it whenever the candidate list crosses a sector boundary, before ranking names against each other, and when a screen metric looks unusually good.
 
-Two things per sector: the valuation base the sector is actually priced on, and the traps that make a generic screen metric lie there. Which KPIs to track once a name becomes a position, and the warning sign that shows up first: `.agents/skills/thesis-tracker/references/sector-signals.md`.
+Two things per sector: the valuation base the sector is actually priced on, and the traps that make a generic screen metric lie there. Which KPIs to track once a name becomes a position, and the warning sign that shows up first, go into that company's thesis (`.agents/skills/dalton-knowledge/SKILL.md`); the per-sector table is `.agents/skills/dalton-knowledge/references/sector-signals.md`. <!-- DALTON-HOOK(skills-registry): thesis-tracker is switched off in Dalton builds -->
 
 One rule sits above the table: a single multiple applied across sectors ranks the accounting, not the businesses. Rank inside a sector on its own base, and compare across sectors only on returns against the cost of capital or on free cash flow yield with the reinvestment need stated.
 

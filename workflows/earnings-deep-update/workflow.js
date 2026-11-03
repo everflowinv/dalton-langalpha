@@ -181,7 +181,7 @@ const calib =
             ? `用 python ${S}/scripts/reconcile.py 对 ${args.preview_predictions} 逐条对账，输出 ${R}/reconcile.md，并把对账计数写成 ${R}/reconcile.json（{"wrong": <错数>, "partial": <部分数>}）；`
             : `本次财报前无 predictions.json，跳过前瞻对账：仍要生成 ${R}/reconcile.md（写明跳过原因）与 ${R}/reconcile.json（{"wrong": 0, "partial": 0}）；`
         }
-2) 按 .agents/skills/thesis-tracker/SKILL.md 的 post-earnings 模式，对 ${W}/thesis.md 每个支柱给信号与状态，写 ${R}/thesis-calibration.md；
+2) 按第二节的财报后校准规则，对 ${W}/thesis.md 每个支柱给信号与状态，写 ${R}/thesis-calibration.md；
 3) 更新指引兑现记录：本季实际 vs 上季给的指引，判断管理层指引风格是否延续，写 ${R}/management-delta.md。
 材料：${W}/drafts/${D}-deep-${Q}.md${model ? `，${R}/model-delta.md` : ''}${
           modelFile ? `；最终模型 ${modelFile}（只读）` : ''

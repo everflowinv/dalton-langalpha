@@ -582,7 +582,25 @@ def list_skills() -> list[dict[str, Any]]:
 
 
 # DALTON-HOOK(skills-registry)
-from .dalton_registry import DALTON_SKILL_DEFINITIONS  # noqa: E402
+from .dalton_registry import DALTON_SKILL_DEFINITIONS, SUPERSEDED_UPSTREAM_SKILLS  # noqa: E402
 
 SKILL_REGISTRY.update(DALTON_SKILL_DEFINITIONS)
+# DALTON-HOOK(skills-registry): switch off the upstream task skills a Dalton
+# skill supersedes (see dalton_registry.SUPERSEDED_UPSTREAM_SKILLS) with the
+# deployment kill switch, so they drop out of every accessor: listings, slash
+# commands and saved aliases, explicit additional_context requests (the per-build
+# registry resolves through _is_enabled), and the sandbox sync. The names stay
+# in the catalog, so discovery never brings their directories back as user skills.
+import dataclasses as _dataclasses  # noqa: E402
+
+
+def _superseded_gate() -> bool:
+    return False
+
+
+for _superseded in SUPERSEDED_UPSTREAM_SKILLS:
+    if _superseded in SKILL_REGISTRY:
+        SKILL_REGISTRY[_superseded] = _dataclasses.replace(
+            SKILL_REGISTRY[_superseded], system_gate=_superseded_gate
+        )
 
