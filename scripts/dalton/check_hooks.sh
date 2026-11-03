@@ -311,6 +311,12 @@ ALLOWED_HOOKS=(
   # 但赔率变了）——validate 的 changed/reason 组合校验、price_move 推送按
   # payoff_assessment.changed=true 放行并改标题、完成契约的必填与推送稿要求。
   "payoff-assessment"
+  # sync3 B5/D16①（上游 #655）：上游 release.py::_sources() 决定静态 prompt 的
+  # 发布指纹（部署变化 → 旧线程下一轮 due/rebuild）。Dalton 的 data_map 经
+  # loader.py 的 data-map hook 渲染进 system.md.j2 / tool_guide.md.j2，其渲染
+  # 输入（data_map 的 __init__/builder/health/sources.yaml）由此 hook 登记进
+  # _sources()；运行时重新生成的 src/dalton/llm/openclaw_overlay.json 明确排除。
+  "prompt-release-sources"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

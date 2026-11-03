@@ -12,8 +12,10 @@ on the one before.
   Off unless the operator turns it on (see ``OffloadSettings.idle_seconds``).
 - Tier 2: when the context reaches its threshold, or the model refuses it
   as too long, the start of the view is summarized (see ``compact``), all of
-  it at a turn start while the thread's system prompt is stale, so the call
-  after it can take the new one (see ``rebuild_pending``), and
+  it at a turn start while the thread's system prompt is due for a rebuild,
+  so the call after it can take the new one (see ``frozen_prompt.due``),
+  and on the main agent at a turn start under the threshold too, after a
+  deploy, once the prompt cache has expired (see ``rebuild``), and
   the attachments in what it keeps are taken out until it fits; on Claude,
   whose kept turns are sent as they were, the summary takes them instead
   (see ``fitting.Fit``); and between turns when the user asks (see
@@ -54,6 +56,7 @@ from langchain.agents.middleware.types import (
     ModelResponse,
 )
 
+from src.llms.cache_markers import CacheScope, cache_scope
 from src.llms.error_classification import is_context_overflow
 from src.llms.provider_compaction import (
     compaction_settings,
@@ -64,9 +67,11 @@ from src.llms.provider_compaction import (
 )
 
 from ptc_agent.agent.state import ensure_message_ids
+from ptc_agent.agent.middleware._utils import run_ids
+from ptc_agent.agent.middleware.model_resilience import FALLBACK_KEY
 from ptc_agent.agent.middleware.compaction.between_turns import Ask, HandOff, asked
 from ptc_agent.agent.middleware.compaction.types import CompactionState, OffloadSettings
-from ptc_agent.agent.middleware.compaction.fitting import Fit, reported_usage
+from ptc_agent.agent.middleware.compaction.fitting import Fit, Fitted, reported_usage
 from ptc_agent.agent.middleware.compaction.compact import (
     NOTHING_TO_COMPACT,
     Compaction,
@@ -87,6 +92,7 @@ from ptc_agent.agent.middleware.compaction.summarize import (
     is_other_model,
     summary_text,
 )
+from ptc_agent.agent.middleware.compaction.rebuild import StalePinRebuilds, TurnStartRebuilds
 from ptc_agent.agent.middleware.compaction.summary_request import (
     finished_summary,
     keeps_turns,
@@ -100,10 +106,8 @@ from ptc_agent.agent.middleware.compaction.utils import (
     stamp_compaction_summary,
     stamp_context_threshold,
     target_cost,
-    turn_start_cut,
     with_summary_text,
 )
-from ptc_agent.agent.middleware.runtime_context.frozen_prompt import rebuild_pending
 from ptc_agent.agent.middleware.compaction.offloading import (
     is_idle,
     offload_view,
@@ -138,6 +142,33 @@ logger = logging.getLogger(__name__)
 # boundaries, which takes tens of milliseconds; past this the trim waits for
 # the next pass rather than hold the turn.
 _COVERAGE_TIMEOUT_S = 5.0
+
+
+def _log_rebuild(decision: str, reason: str) -> None:
+    """Whether a due thread's summary rebuilds the prompt, or why it keeps the
+    tail or waits, so the rebuilds a thread misses can be counted from the
+    logs."""
+    thread_id, agent = run_ids()
+    logger.info("[Compaction] rebuild=%s reason=%s thread_id=%s agent=%s", decision, reason, thread_id, agent)
+
+
+def _log_rebuild_after(fitted: Fitted, rebuild: str | None, waits: str) -> None:
+    """Log what a send on a stale pin did with it. SystemPin takes the new
+    prompt when Claude answers a request that holds no bound thinking: always
+    after a rebuild (``rebuild`` names why), and after a kept tail whose
+    thinking the summary or the fit left unsent. A fallback's answer leaves
+    the pin as it was, and otherwise the tail keeps it (``waits`` says why)."""
+    if any(
+        isinstance(message, AIMessage) and FALLBACK_KEY in (message.response_metadata or {})
+        for message in fitted.response.result or ()
+    ):
+        _log_rebuild("deferred", "fallback")
+    elif rebuild:
+        _log_rebuild("yes", rebuild)
+    elif not fitted.sent_bound_thinking:
+        _log_rebuild("yes", "no_bound_thinking")
+    else:
+        _log_rebuild("deferred", waits)
 
 
 @contextmanager
@@ -269,6 +300,8 @@ class CompactionMiddleware(AgentMiddleware):
         # The main agent's window; see with_window.
         self._coverage: WindowCoverage | None = None
         self._carries: tuple[WindowCarry, ...] = ()
+        # When a due prompt is rebuilt; see with_turn_start_rebuilds.
+        self._rebuilds: StalePinRebuilds = StalePinRebuilds()
 
     @classmethod
     def for_agent(
@@ -331,45 +364,66 @@ class CompactionMiddleware(AgentMiddleware):
         estimate = self._estimate(request.model)
         reading = await context_tokens(request.state, view, estimate, system)
         tokens = reading.tokens
+        # A stale system prompt stays while any thinking it bound is in view,
+        # so at a turn start the summary keeps none: its own request still
+        # carries the old prompt and tools, which the thinking it summarizes
+        # is checked against, and the call after it takes the new ones.
+        plan = self._rebuilds.plan(
+            request,
+            view,
+            tokens,
+            self._token_threshold,
+            time.time(),
+            first_call=bool(request.state.get("_run_first_call")),
+        )
         refusal: Exception | None = None
-        if tokens < self._token_threshold:
+        if not plan.forced and tokens < self._token_threshold:
             try:
                 response = await handler(request.override(messages=view))
-                return self._answered(response, reading=reading)
+                if plan.waits is not None:
+                    _log_rebuild("deferred", plan.waits)
+                return self._answered(request, response, reading=reading)
             except Exception as exc:
                 # Matched across providers, most of which LangChain does not
                 # classify as an overflow.
                 if not is_context_overflow(exc):
                     raise
-                logger.warning("[Compaction] Context overflow, summarizing: %s", exc)
+                thread_id, agent = run_ids()
+                logger.warning(
+                    "[Compaction] trigger=overflow thread_id=%s agent=%s: %s", thread_id, agent, exc
+                )
                 refusal = exc
-        else:
-            logger.info("[Compaction] Triggered: %d >= %d tokens", tokens, self._token_threshold)
+        elif not plan.forced:
+            thread_id, agent = run_ids()
+            logger.info(
+                "[Compaction] trigger=threshold tokens=%d threshold=%d thread_id=%s agent=%s",
+                tokens,
+                self._token_threshold,
+                thread_id,
+                agent,
+            )
 
-        # A stale system prompt stays while any thinking it bound is in view,
-        # so at a turn start the summary keeps none: its own request still
-        # carries the old prompt and tools, which the thinking it summarizes
-        # is checked against, and the call after it takes the new ones.
-        rebuild = turn_start_cut(view) if rebuild_pending(request.state) else 0
-        cutoff = rebuild or self._cutoff(view, request.model)
+        cutoff = plan.cut or self._cutoff(view, request.model)
         fit = Fit(
             self._token_threshold,
             system,
             estimate,
             lossless=self._native and native_kind(request.model) == "anthropic",
         )
-        if rebuild:
-            logger.info("[Compaction] Rebuild: the summary keeps no turns")
-        elif fit.lossless:
+        if not plan.cut and fit.lossless:
             cutoff = fit.cut(view, cutoff, tokens, refused=refusal is not None)
         if cutoff <= 0:
             # All of it is the kept tail: the attachments are all that can go.
             fitted = await fit.send(request, handler, view, refusal=refusal)
+            if plan.due:
+                _log_rebuild_after(fitted, None, "no_cut")
             return self._answered(
-                fitted.response, fitted.update(request.state), spared=fitted.spared
+                request, fitted.response, fitted.update(request.state), spared=fitted.spared
             )
 
-        compaction = await self._summarize(request, handler, view, cutoff, rebuild=bool(rebuild))
+        compaction = await self._summarize(
+            request, handler, view, cutoff, rebuild=bool(plan.cut), scope=plan.scope
+        )
         note = compaction.note_row()
         # A refusal of the view says nothing of what the summary made room
         # for, so its messages are fitted by estimate like any others. The
@@ -382,9 +436,11 @@ class CompactionMiddleware(AgentMiddleware):
                 response=dataclasses.replace(fitted.response, result=[note, *fitted.response.result])
             )
         self._stamp_summary(fitted.response, compaction)
+        if plan.due:
+            _log_rebuild_after(fitted, plan.reason if plan.cut else None, "no_turn_start_cut")
         update = compaction.update(request.state)
         return self._answered(
-            fitted.response, {**update, **fitted.update(update)}, spared=fitted.spared
+            request, fitted.response, {**update, **fitted.update(update)}, spared=fitted.spared
         )
 
     async def _summarize(
@@ -395,6 +451,7 @@ class CompactionMiddleware(AgentMiddleware):
         cutoff: int,
         *,
         rebuild: bool = False,
+        scope: CacheScope | None = None,
     ) -> Compaction:
         """Summarize ``view`` before ``cutoff``, first by the agent's own
         model: its provider compacting the conversation where it can, else the
@@ -403,7 +460,10 @@ class CompactionMiddleware(AgentMiddleware):
         the setting says. ``rebuild`` is True for a summary that keeps no
         turn, whose cut is the user's new message: Claude's cut stays there
         rather than move back onto the answer before it. Whether turns stay
-        after the summary is read from what it keeps (``keeps_turns``)."""
+        after the summary is read from what it keeps (``keeps_turns``).
+
+        ``scope`` places the cache markers of the provider's own summary
+        call (``RebuildPlan.scope``)."""
         own: Own | None = None
         kind = native_kind(request.model)
         # Claude reads its block only where the kept turns can follow it.
@@ -411,7 +471,7 @@ class CompactionMiddleware(AgentMiddleware):
         if kind is not None and self._native and cut > 0:
             cutoff = cut
             own = functools.partial(
-                self._provider_summary, request, handler, notes=self._notes_dir is not None
+                self._provider_summary, request, handler, notes=self._notes_dir is not None, scope=scope
             )
         elif kind is None and self._writes_own(request):
             own = functools.partial(
@@ -462,10 +522,22 @@ class CompactionMiddleware(AgentMiddleware):
         """What a call between turns asks for (see ``between_turns``)."""
         if isinstance(ask, HandOff):
             return await self._hand_off(request, handler, view, notes=self._notes_dir is not None)
+        # A due thread's summary keeps no turns here too, so the next turn
+        # takes the new prompt.
+        plan = self._rebuilds.between_turns(request, view, time.time())
+        if plan.cut:
+            compaction = await self._summarize(
+                request, handler, view, plan.cut, rebuild=True, scope=plan.scope
+            )
+            _log_rebuild("yes", plan.reason)
+            return compaction
         cutoff = self._cutoff(view, request.model)
         if cutoff <= 0:
             raise ValueError(NOTHING_TO_COMPACT)
-        return await self._summarize(request, handler, view, cutoff)
+        compaction = await self._summarize(request, handler, view, cutoff)
+        if plan.waits is not None:
+            _log_rebuild("deferred", plan.waits)
+        return compaction
 
     @staticmethod
     async def _hand_off(
@@ -551,6 +623,7 @@ class CompactionMiddleware(AgentMiddleware):
         kept: bool,
         *,
         notes: bool,
+        scope: CacheScope | None = None,
     ) -> NativeAnswer:
         """The agent's provider compacting ``to_summarize`` itself, with the
         summary prompt in place of its own where it takes one (Claude), the
@@ -563,13 +636,14 @@ class CompactionMiddleware(AgentMiddleware):
         own model writes, and the summarizer is the fallback here. It stays
         out of the turn's message stream, where its reply would read as the
         answer. OpenAI's goes after the user's own messages it summarized.
+        ``scope`` places its cache markers (``cache_markers.cache_scope``).
         """
         settings = compaction_settings(
             request.model,
             request.model_settings,
             summary_prompt("native", kept, notes),
         )
-        with as_sent(), _unstreamed():
+        with as_sent(), _unstreamed(), cache_scope(scope):
             response = await handler(
                 request.override(messages=to_summarize, model_settings=settings)
             )
@@ -633,6 +707,7 @@ class CompactionMiddleware(AgentMiddleware):
 
     def _answered(
         self,
+        request: ModelRequest,
         response: ModelResponse,
         update: dict[str, Any] | None = None,
         *,
@@ -645,13 +720,16 @@ class CompactionMiddleware(AgentMiddleware):
         answered, which the next turn's Tier 1 measures its pause from.
         ``reading`` is the trigger's reading of the view this call was sent
         as it was, which its growth is stamped from; a call that was sent a
-        summary or a fitted view has none."""
+        summary or a fitted view has none. The run's first call is past once
+        it answers (see ``abefore_agent``)."""
         input_tokens, output_tokens = self._extract_token_usage(response, reading)
+        opened = {"_run_first_call": False} if request.state.get("_run_first_call") else {}
         return ExtendedModelResponse(
             model_response=response,
             command=Command(
                 update={
                     **(update or {}),
+                    **opened,
                     "_cached_input_tokens": max(input_tokens - spared, 0),
                     "_cached_output_tokens": output_tokens,
                     "_last_model_response_at": time.time(),
@@ -695,7 +773,10 @@ class CompactionMiddleware(AgentMiddleware):
         the graph picks up where it stopped; an orchestrator re-entry does."""
         update = await self._offload_idle(state)
         trimmed = await self._trim({**state, **update})
-        return {**update, **(trimmed or {})} or None
+        # Only a fresh run passes through here, so its first model call is
+        # told apart from a resume's (see ``turn_start_cut``).
+        opened = {"_run_first_call": True} if self._rebuilds.reads_first_call else {}
+        return {**update, **(trimmed or {}), **opened} or None
 
     async def _offload_idle(self, state: Mapping[str, Any]) -> dict[str, Any]:
         """Tier 1, once per turn and only when the model last answered more
@@ -779,6 +860,15 @@ class CompactionMiddleware(AgentMiddleware):
         main = copy.copy(self)
         main._coverage = coverage
         main._carries = tuple(carries)
+        return main
+
+    def with_turn_start_rebuilds(self, rebuilds: TurnStartRebuilds) -> CompactionMiddleware:
+        """This middleware, rebuilding a due prompt as ``rebuilds`` says
+        rather than only at a turn start once the pin is stale. For the main
+        agent's stack only: a subagent's run is bounded.
+        """
+        main = copy.copy(self)
+        main._rebuilds = rebuilds
         return main
 
     def with_scratchpad_notes(self, notes_dir: str) -> CompactionMiddleware:
