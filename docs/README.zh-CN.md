@@ -166,7 +166,7 @@ Robinhood 需要通过桌面应用连接，因为 Robinhood 只接受回跳到�
 
 ## 快速开始
 
-**用你已经付费的模型**。可以用 Claude 或 ChatGPT 订阅登录，使用 Kimi、GLM 或 MiniMax 的 coding plan，接入任意 API key，自托管时还可以运行本地模型。
+**用你已经付费的模型**。可以用 Claude 或 ChatGPT 订阅登录，使用 Kimi、GLM、MiniMax 或 OpenCode Go 的 coding plan，接入任意 API key，自托管时还可以运行本地模型。
 
 **在你习惯的地方使用**。可以用浏览器、适用于 macOS、Windows 和 Linux 的[桌面应用](https://github.com/ginlix-ai/langalpha/releases)，在 [LangAlpha.ai](https://langalpha.ai) 上还能用 Slack、Discord、Telegram、飞书和 iMessage。
 
@@ -324,7 +324,7 @@ LangAlpha 并非只为前沿模型调优。所有模型都由同一套工具和�
 | 接入方式 | 服务商 |
 | --- | --- |
 | 订阅登录 | Claude（Claude Code）、ChatGPT（Codex） |
-| Coding plan | Kimi、GLM、MiniMax |
+| Coding plan | Kimi、GLM、MiniMax、OpenCode Go |
 | API key | OpenAI、Anthropic、Gemini、DeepSeek、Qwen（DashScope）、Kimi（月之暗面）、GLM（智谱）、MiniMax、OpenRouter、Groq、Cerebras |
 | 本地 | Ollama、LM Studio、vLLM |
 

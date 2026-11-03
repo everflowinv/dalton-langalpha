@@ -817,6 +817,8 @@ class TestCustomModelFallback:
         # Parent has no further parent — get_parent_provider returns self.
         mc.get_parent_provider.return_value = "moonshot"
         mc.get_child_variants.return_value = ["moonshot-coding"]
+        # Each its own connection, as two providers without routes are.
+        mc.connection_of.side_effect = lambda provider: provider
 
         def _provider_info(name):
             if name == "moonshot-coding":

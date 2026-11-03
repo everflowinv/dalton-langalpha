@@ -9,6 +9,7 @@ import { useEffectiveTuning, useModelProfileWriter } from '@/hooks/useModelProfi
 import { useFeatureEnabled } from '@/hooks/useFeatures';
 import { homeWorkspaceQuery } from '@/hooks/useHomeWorkspace';
 import { useAllModels } from '@/hooks/useAllModels';
+import { useProviderCatalog } from '@/hooks/useProviderCatalog';
 import { useLapsedSignIn } from '@/hooks/useLapsedSignIn';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useFavoriteModels } from '@/hooks/useFavoriteModels';
@@ -713,10 +714,19 @@ function ChatInput({
   const foldedItems = toolbarItems.filter((i) => fold.folded.includes(i.id));
 
   const favorites = useFavoriteModels();
+  const { entryFor } = useProviderCatalog();
   const modelGroupList = useMemo(() => modelGroups({
     models: visibleModels,
     payers,
-  }), [visibleModels, payers]);
+    brandOf: (group) => {
+      const entry = entryFor(group);
+      if (!entry?.group || entry.group === group) return undefined;
+      return {
+        id: entry.group,
+        label: visibleModels[entry.group]?.display_name ?? entry.group_display_name ?? entry.display_name,
+      };
+    },
+  }), [visibleModels, payers, entryFor]);
   const recentModels = deriveRecentModels({ selectedModel: pillModel, threadModels: threadModelsProp, validModelNames })
     .filter((m) => !favorites.models.includes(m));
   const showEffort = hasTuningMenu(reasoningEfforts, isCodexModel);

@@ -11,13 +11,15 @@ import { TEAM_SHARED_CREDENTIALS_HINT, useTeamCredentials } from '@/hooks/useTea
 import { useConfiguredProviders, type ConfiguredProvider } from '@/hooks/useConfiguredProviders';
 import { useProviderCatalog } from '@/hooks/useProviderCatalog';
 import type { ProviderCatalogEntry } from '@/components/model/types';
-import { isSubscriptionProvider, SUBSCRIPTIONS, subscriptionKey, type SubscriptionProvider } from '@/api/oauth';
+import { isSubscriptionProvider, subscriptionKey, type SubscriptionProvider } from '@/api/oauth';
 import { RemoveAccessDialog } from '@/components/modelAccess/RemoveAccessDialog';
 import { planLabel } from '@/components/modelAccess/planLabel';
+import { regionTag } from '@/components/modelAccess/optionLabels';
 import { StatusLabel, type AccessStatus } from '@/components/modelAccess/parts';
 import { ProviderChoices } from '@/components/modelAccess/ProviderChoices';
-import { KeyProviderList, KeyProviderOptions, KeyStepFrame, ProviderTitle } from '@/components/modelAccess/KeyProviderPicker';
-import { NO_FILTER, optionsOf, type KeyFilter, type KeyOption, type ProviderGroup } from '@/components/modelAccess/providerOptions';
+import { SubscriptionChoices } from '@/components/modelAccess/SubscriptionChoices';
+import { KeyProviderList, KeyStepFrame, ProviderTitle } from '@/components/modelAccess/KeyProviderPicker';
+import { NO_FILTER, optionsOf, startingOption, type KeyFilter, type KeyOption, type ProviderGroup } from '@/components/modelAccess/providerOptions';
 import { AccessRow, Group, KeyRow } from './modelAccess/AccessRows';
 import { KeySheet } from './modelAccess/KeySheet';
 import { ManageSheet, SubscriptionFlow } from './modelAccess/ManageSheet';
@@ -25,16 +27,18 @@ import { ManageSheet, SubscriptionFlow } from './modelAccess/ManageSheet';
 const subscriptionName = (t: (k: string) => string, p: SubscriptionProvider) =>
   t(`modelAccess.${subscriptionKey(p)}.name`);
 
+/** The list a key flow was opened from, which Back returns to: the API keys,
+ *  or the subscriptions for a coding plan. */
+type KeyOrigin = 'pick-key' | 'pick-subscription';
+
 /** What the sheet is showing. */
 type Sheet =
   | { kind: 'pick-subscription' }
   | { kind: 'connect-subscription'; provider: SubscriptionProvider }
   | { kind: 'pick-key' }
   | { kind: 'pick-local' }
-  | { kind: 'key-options'; group: ProviderGroup }
-  /** `fresh`: the provider had no connection when this flow opened. */
-  | { kind: 'key'; group: ProviderGroup; option: KeyOption; fresh: boolean }
-  | { kind: 'local-key'; entry: ProviderCatalogEntry; fresh: boolean }
+  | { kind: 'key'; group: ProviderGroup; option: KeyOption; origin: KeyOrigin }
+  | { kind: 'local-key'; entry: ProviderCatalogEntry }
   /** `from` the add-key flow keeps that flow's width for the key it just saved.
    *  `justConnected`: the flow before it made the connection, so its models
    *  start picked. */
@@ -44,7 +48,6 @@ type Sheet =
 function isWide(sheet: Sheet): boolean {
   switch (sheet.kind) {
     case 'pick-key':
-    case 'key-options':
     case 'key':
       return true;
     case 'manage':
@@ -58,8 +61,7 @@ function isWide(sheet: Sheet): boolean {
 function backFrom(sheet: Sheet): Sheet | null {
   switch (sheet.kind) {
     case 'connect-subscription': return { kind: 'pick-subscription' };
-    case 'key-options': return { kind: 'pick-key' };
-    case 'key': return sheet.group.options.length > 1 ? { kind: 'key-options', group: sheet.group } : { kind: 'pick-key' };
+    case 'key': return { kind: sheet.origin };
     case 'local-key': return { kind: 'pick-local' };
     default: return null;
   }
@@ -75,7 +77,7 @@ export function ModelAccessSection() {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const sheetTitleId = useId();
-  const { keyGroups, localEntries, placeOf, optionFor } = useProviderCatalog();
+  const { keyGroups, planGroups, localEntries, placeOf, optionFor } = useProviderCatalog();
   const { providers, withdrawn, configuredSet, statusLoading, statusError } = useConfiguredProviders();
   // DALTON-HOOK(team-credentials): team-shared credentials hint; only PM
   // users may write them (connect, keys, base URLs) — the server refuses
@@ -89,21 +91,24 @@ export function ModelAccessSection() {
   // Kept here, not in the list, so Back from a provider returns to the same narrowed list.
   const [keyFilter, setKeyFilter] = useState<KeyFilter>(NO_FILTER);
 
-  const subscriptionRows = providers.filter((p) => p.access_type === 'oauth');
-  const keyRows = providers.filter((p) => p.access_type === 'api_key' || p.access_type === 'coding_plan');
+  const subscriptionRows = providers.filter((p) => p.access_type === 'oauth' || p.access_type === 'coding_plan');
+  const keyRows = providers.filter((p) => p.access_type === 'api_key');
   const localRows = providers.filter((p) => p.access_type === 'local');
 
-  const openKeyOption = (group: ProviderGroup, option: KeyOption) =>
-    setSheet({ kind: 'key', group, option, fresh: !configuredSet.has(option.provider) });
-  const pickKeyGroup = (group: ProviderGroup) =>
-    group.options.length === 1 ? openKeyOption(group, group.options[0]) : setSheet({ kind: 'key-options', group });
+  // The key form opens on the region a key is saved for, and offers the rest.
+  const pickKeyGroup = (origin: KeyOrigin) => (group: ProviderGroup) =>
+    setSheet({ kind: 'key', group, option: startingOption(group, configuredSet), origin });
   const manage = (provider: string) => setSheet({ kind: 'manage', provider, from: 'list' });
   const back = (from: Sheet) => () => setSheet(backFrom(from));
 
   const managed = sheet?.kind === 'manage' ? providers.find((p) => p.provider === sheet.provider) ?? null : null;
-  /** How a row and its dialogs name a connection. */
-  const nameOf = (p: ConfiguredProvider) =>
-    isSubscriptionProvider(p.provider) ? subscriptionName(t, p.provider) : p.display_name;
+  /** How a row and its dialogs name a connection: a coding plan offered in
+   *  several regions says which one, since each is its own connection. */
+  const nameOf = (p: ConfiguredProvider) => {
+    if (isSubscriptionProvider(p.provider)) return subscriptionName(t, p.provider);
+    const region = p.access_type === 'coding_plan' ? regionTag(t, placeOf(p.provider)) : null;
+    return region ? `${p.display_name} · ${region}` : p.display_name;
+  };
 
   const sheetTitle = (() => {
     if (!sheet) return null;
@@ -115,7 +120,6 @@ export function ModelAccessSection() {
       case 'connect-subscription': return t('setup.connectTitle', { provider: subscriptionName(t, sheet.provider) });
       case 'pick-key': return t('modelAccess.addKey');
       case 'pick-local': return t('modelAccess.addLocal');
-      case 'key-options':
       case 'key': return providerTitle(sheet.group.name, sheet.group.markProvider);
       case 'local-key': return providerTitle(sheet.entry.display_name, sheet.entry.provider);
       case 'manage': return managed ? nameOf(managed) : null;
@@ -144,7 +148,9 @@ export function ModelAccessSection() {
       )}
 
       <Group title={t('modelAccess.subscriptions')} empty={statusLoading ? '' : statusError ? t('modelAccess.status.unknownLong') : t('modelAccess.noneSubscriptions')}>
-        {subscriptionRows.map((p) => (
+        {subscriptionRows.map((p) => p.access_type === 'coding_plan' ? (
+          <KeyRow key={p.provider} p={p} place={placeOf(p.provider)} onManage={() => manage(p.provider)} />
+        ) : (
           <AccessRow
             key={p.provider}
             provider={p.provider}
@@ -227,10 +233,11 @@ export function ModelAccessSection() {
           covered={!!removing}
         >
           {sheet.kind === 'pick-subscription' && (
-            <ProviderChoices
-              entries={SUBSCRIPTIONS.map((s) => ({ provider: s.provider, name: subscriptionName(t, s.provider), note: t(`modelAccess.${s.key}.pickNote`) }))}
+            <SubscriptionChoices
+              planGroups={planGroups}
               configured={configuredSet}
-              onPick={(p) => setSheet(configuredSet.has(p) ? { kind: 'manage', provider: p, from: 'list' } : { kind: 'connect-subscription', provider: p })}
+              onPickSignIn={(p) => setSheet(configuredSet.has(p) ? { kind: 'manage', provider: p, from: 'list' } : { kind: 'connect-subscription', provider: p })}
+              onPickPlan={pickKeyGroup('pick-subscription')}
             />
           )}
           {sheet.kind === 'connect-subscription' && (
@@ -247,7 +254,7 @@ export function ModelAccessSection() {
               configured={configuredSet}
               onPick={(provider) => {
                 const entry = localEntries.find((e) => e.provider === provider);
-                if (entry) setSheet({ kind: 'local-key', entry, fresh: !configuredSet.has(entry.provider) });
+                if (entry) setSheet({ kind: 'local-key', entry });
               }}
             />
           )}
@@ -269,26 +276,17 @@ export function ModelAccessSection() {
                 filter={keyFilter}
                 onFilterChange={setKeyFilter}
                 configured={configuredSet}
-                onPick={pickKeyGroup}
+                onPick={pickKeyGroup('pick-key')}
               />
             </KeyStepFrame>
           )}
-          {sheet.kind === 'key-options' && (
-            <KeyProviderOptions
-              key={sheet.group.group}
-              group={sheet.group}
-              configured={configuredSet}
-              onBack={back(sheet)}
-              onContinue={(option) => openKeyOption(sheet.group, option)}
-            />
-          )}
           {sheet.kind === 'key' && (
             <KeySheet
-              key={sheet.option.provider}
+              key={sheet.group.group}
               option={sheet.option}
               group={sheet.group}
               configured={providers}
-              onSaved={(provider) => setSheet({ kind: 'manage', provider, from: 'key-flow', justConnected: sheet.fresh })}
+              onSaved={(provider, fresh) => setSheet({ kind: 'manage', provider, from: 'key-flow', justConnected: fresh })}
               onBack={back(sheet)}
             />
           )}
@@ -297,7 +295,7 @@ export function ModelAccessSection() {
               key={sheet.entry.provider}
               option={optionsOf(sheet.entry)[0]}
               configured={providers}
-              onSaved={(provider) => setSheet({ kind: 'manage', provider, from: 'list', justConnected: sheet.fresh })}
+              onSaved={(provider, fresh) => setSheet({ kind: 'manage', provider, from: 'list', justConnected: fresh })}
               onBack={back(sheet)}
             />
           )}

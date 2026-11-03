@@ -218,7 +218,7 @@ fi
 # ---------------------------------------------------------------------------
 header "LLM Provider"
 printf "  How will you access LLM models?\n\n"
-printf "  ${BOLD}1${NC}) OAuth — connect your Claude or ChatGPT subscription in the UI\n"
+printf "  ${BOLD}1${NC}) Subscription or coding plan — connect it in the web UI after starting\n"
 printf "  ${BOLD}2${NC}) API key — choose from available providers\n"
 printf "  ${BOLD}3${NC}) Skip — configure models later in the web UI\n\n"
 info "You can change models later in agent_config.yaml (see models.json for all options)."
@@ -227,31 +227,10 @@ llm=$(prompt_choice "Choice" "1")
 
 case $llm in
     1)
-        ensure_llm_block
-        printf "\n"
-        printf "  Which subscription will you connect?\n"
-        printf "    ${BOLD}a${NC}) Claude (Anthropic)\n"
-        printf "    ${BOLD}b${NC}) ChatGPT (OpenAI Codex)\n"
-        printf "\n"
-        sub=$(prompt_choice "Sub-choice" "a")
-        case $sub in
-            b)
-                set_llm_field "name" "gpt-6.1-sol-oauth"
-                set_llm_field "background" "gpt-6.1-terra-oauth"
-                # compaction blank → the turn's model; fetch blank → the background model
-                set_llm_field "compaction" ""
-                set_llm_field "fetch" ""
-                success "ChatGPT OAuth — connect your subscription in the UI after starting"
-                ;;
-            *)
-                set_llm_field "name" "claude-opus-5-5-oauth"
-                set_llm_field "background" "claude-sonnet-5-5-oauth"
-                # compaction blank → the turn's model; fetch blank → the background model
-                set_llm_field "compaction" ""
-                set_llm_field "fetch" ""
-                success "Claude OAuth — connect your subscription in the UI after starting"
-                ;;
-        esac
+        # The web wizard signs in or takes the plan's key, then picks the models
+        # that connection serves.
+        set_llm_null
+        success "Connect your subscription or coding plan in the setup wizard on first launch."
         ;;
     2)
         ensure_llm_block

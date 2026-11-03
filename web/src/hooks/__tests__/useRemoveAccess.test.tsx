@@ -17,6 +17,7 @@ const h = vi.hoisted(() => ({
   manifest: {} as Record<string, { provider: string }>,
   keyCandidates: {} as Record<string, { slugs: string[]; shared: string[] }>,
   connected: [] as string[],
+  catalog: [] as unknown[],
 }));
 
 vi.mock('@/api/model', () => ({ deleteUserApiKey: h.deleteUserApiKey }));
@@ -25,7 +26,9 @@ vi.mock('@/api/oauth', async (importOriginal) => ({
   disconnectOAuth: h.disconnectOAuth,
 }));
 vi.mock('@/hooks/useModels', () => ({
-  useModels: () => ({ models: { model_metadata: h.manifest, key_candidates: h.keyCandidates } }),
+  useModels: () => ({
+    models: { model_metadata: h.manifest, key_candidates: h.keyCandidates, provider_catalog: h.catalog },
+  }),
 }));
 // What the server holds when the removal reads it, the cleanup's starting point.
 vi.mock('@/hooks/useStoredPreferences', () => ({ useReadStoredPreferences: () => async () => h.preferences }));
@@ -34,7 +37,7 @@ vi.mock('@/hooks/useConfiguredProviders', () => ({
   useConfiguredProviders: () => ({ configuredSet: new Set(h.connected) }),
 }));
 
-import { useRemoveAccess } from '../useModelAccessActions';
+import { usePruneReplacedRegions, useRemoveAccess } from '../useModelAccessActions';
 import type { ConfiguredProvider } from '../useConfiguredProviders';
 
 const written = () => h.mutateAsync.mock.calls.at(-1)![0] as {
@@ -52,6 +55,7 @@ afterEach(() => {
   h.preferences = null;
   h.connected = [];
   h.keyCandidates = {};
+  h.catalog = [];
 });
 
 describe('useRemoveAccess', () => {
@@ -144,5 +148,107 @@ describe('useRemoveAccess', () => {
     });
 
     expect(invalidate).toHaveBeenCalledWith({ queryKey: queryKeys.user.apiKeys() });
+  });
+});
+
+describe('usePruneReplacedRegions', () => {
+  const plan = (provider: string, modelsFrom: string, cnModelsFrom: string) => ({
+    provider,
+    display_name: 'Plan',
+    access_type: 'coding_plan',
+    brand_key: modelsFrom,
+    byok_eligible: true,
+    models_from: modelsFrom,
+    region_variants: [{ provider: `${provider}-cn`, display_name: 'Plan', region: 'cn', models_from: cnModelsFrom }],
+  });
+
+  const replace = async (replaced: string[], by: string, stranded: string[] = []) => {
+    // What a write leaves stored, so the prune after the move reads it.
+    h.mutateAsync.mockImplementation(async (payload) => {
+      const pref = (payload as { model_preference?: Record<string, unknown> }).model_preference ?? {};
+      const stored = (h.preferences?.model_preference ?? {}) as Record<string, unknown>;
+      h.preferences = { ...h.preferences, model_preference: { ...stored, ...pref } };
+      return {};
+    });
+    const { result } = renderHookWithProviders(() => usePruneReplacedRegions());
+    await act(async () => { await result.current(replaced, by, stranded); });
+  };
+
+  it("moves a region's picks to the region that replaced it when both offer the same models", async () => {
+    h.catalog = [plan('mm-coding', 'mm', 'mm')];
+    h.manifest = { 'mm-a': { provider: 'mm' }, 'mm-b': { provider: 'mm' } };
+    h.connected = ['mm-coding', 'mm-coding-cn'];
+    h.preferences = {
+      model_preference: {
+        preferred_model: 'mm-a',
+        profiles: { 'mm-a': { reasoning_effort: 'high' } },
+        custom_models: [
+          { name: 'mm-a', model_id: 'mm-a', provider: 'mm-coding' },
+          { name: 'mm-b', model_id: 'mm-b', provider: 'mm-coding' },
+        ],
+      },
+      other_preference: { starred_models: ['mm-a', 'mm-b'] },
+    };
+
+    await replace(['mm-coding'], 'mm-coding-cn');
+
+    expect(h.mutateAsync).toHaveBeenCalledTimes(1);
+    expect(written()).toEqual({
+      model_preference: {
+        custom_models: [
+          { name: 'mm-a', model_id: 'mm-a', provider: 'mm-coding-cn' },
+          { name: 'mm-b', model_id: 'mm-b', provider: 'mm-coding-cn' },
+        ],
+      },
+    });
+  });
+
+  it("takes a region's picks out when the new region offers models of its own", async () => {
+    h.catalog = [plan('glm-coding', 'glm', 'glm-cn')];
+    h.manifest = { 'glm-a': { provider: 'glm' } };
+    h.connected = ['glm-coding', 'glm-coding-cn'];
+    h.preferences = {
+      model_preference: {
+        preferred_model: 'glm-a',
+        custom_models: [{ name: 'glm-a', model_id: 'glm-a', provider: 'glm-coding' }],
+      },
+      other_preference: { starred_models: ['glm-a'] },
+    };
+
+    await replace(['glm-coding'], 'glm-coding-cn');
+
+    expect(written()).toEqual({
+      model_preference: { custom_models: null, preferred_model: null },
+      other_preference: { starred_models: null },
+    });
+  });
+
+  it('moves the picks a failed switch left under a region that now has no key', async () => {
+    h.catalog = [plan('mm-coding', 'mm', 'mm')];
+    h.manifest = { 'mm-a': { provider: 'mm' } };
+    h.connected = ['mm-coding-cn'];
+    h.preferences = {
+      model_preference: {
+        preferred_model: 'mm-a',
+        custom_models: [{ name: 'mm-a', model_id: 'mm-a', provider: 'mm-coding' }],
+      },
+    };
+
+    await replace([], 'mm-coding-cn', ['mm-coding']);
+
+    expect(written()).toEqual({
+      model_preference: { custom_models: [{ name: 'mm-a', model_id: 'mm-a', provider: 'mm-coding-cn' }] },
+    });
+  });
+
+  it('leaves the preferences alone when no keyless region holds a pick', async () => {
+    h.catalog = [plan('mm-coding', 'mm', 'mm')];
+    h.manifest = { 'mm-a': { provider: 'mm' } };
+    h.connected = ['mm-coding-cn'];
+    h.preferences = { other_preference: { starred_models: ['mm-a'] } };
+
+    await replace([], 'mm-coding-cn', ['mm-coding']);
+
+    expect(h.mutateAsync).not.toHaveBeenCalled();
   });
 });

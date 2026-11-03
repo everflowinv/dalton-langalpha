@@ -6,6 +6,10 @@
  * one list of both would repeat every name with a different tag. Split by
  * connection inside the brand, no list repeats a name, and each connection
  * has one payer, so its tag names the tab instead of tagging every row.
+ *
+ * The models map files a model the user picked under a coding plan (or a
+ * region of it) under that plan, so `brandOf` folds such a group into its
+ * brand's: one rail tab per brand, the plan a connection inside it.
  */
 import { isSubscription, type Payer } from '@/lib/modelPayer';
 
@@ -40,24 +44,33 @@ function rankOf(models: string[], payers: Record<string, Payer>): number {
   return Math.min(...models.map((m) => payerRank(payers[m])));
 }
 
-export function modelGroups({ models, payers }: {
+/** The brand a group of the models map belongs to, when it is not its own. */
+export type BrandOf = (group: string) => { id: string; label: string } | undefined;
+
+export function modelGroups({ models, payers, brandOf }: {
   models: Record<string, { models?: string[]; display_name?: string }>;
   payers: Record<string, Payer>;
+  brandOf?: BrandOf;
 }): ModelGroup[] {
-  const groups: ModelGroup[] = [];
+  const brands = new Map<string, { label: string; byConnection: Map<string, ModelConnection> }>();
   for (const [group, data] of Object.entries(models)) {
-    const byConnection = new Map<string, ModelConnection>();
+    const brand = brandOf?.(group) ?? { id: group, label: data.display_name ?? group };
+    const into = brands.get(brand.id) ?? { label: brand.label, byConnection: new Map() };
+    brands.set(brand.id, into);
     for (const m of data.models ?? []) {
       const id = payers[m] ?? 'none';
-      const connection = byConnection.get(id) ?? { id, models: [], payer: payers[m] };
-      byConnection.set(id, connection);
+      const connection = into.byConnection.get(id) ?? { id, models: [], payer: payers[m] };
+      into.byConnection.set(id, connection);
       if (!connection.models.includes(m)) connection.models.push(m);
     }
+  }
+  const groups: ModelGroup[] = [];
+  for (const [id, { label, byConnection }] of brands) {
     if (byConnection.size === 0) continue;
     const connections = [...byConnection.values()];
     // Array sort is stable, so the catalog order holds within a rank.
     connections.sort((a, b) => rankOf(a.models, payers) - rankOf(b.models, payers));
-    groups.push({ id: group, label: data.display_name ?? group, connections });
+    groups.push({ id, label, connections });
   }
   const rank = (g: ModelGroup) => rankOf(g.connections.flatMap((c) => c.models), payers);
   return groups.sort((a, b) => rank(a) - rank(b));

@@ -234,11 +234,11 @@ async def check_key(
 
     # SDKs with no test of their own (deepseek, qwq, codex, ...) speak OpenAI's.
     test_fn, model = _SDK_TEST_DISPATCH.get(info.get("sdk") or "openai", _SDK_TEST_DISPATCH["openai"])
-    # A model this provider serves: its own rows, else its brand's, which a
-    # variant with none of its own (a coding plan) serves (``_add_brand_rows``).
+    # A model this provider serves: its own rows, else those a variant with
+    # none of its own (a coding plan or its region) serves (``_add_brand_rows``).
     mc = LLM.get_model_config()
     manifest_models = mc.manifest.get("models", {})
-    listed = manifest_models.get(provider) or manifest_models.get(mc.get_parent_provider(provider)) or []
+    listed = manifest_models.get(provider) or manifest_models.get(mc.models_from(provider)) or []
     if listed:
         model = listed[0].get("id", model)
 

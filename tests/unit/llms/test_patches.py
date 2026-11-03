@@ -504,6 +504,46 @@ class TestOpenAICompactionTrigger:
         assert payload["extra_body"] == self._MARKER
 
 
+class TestOpenAIReasoningStatus:
+    """A streamed reasoning item is stored ``in_progress``; Kimi Code refuses
+    one sent back that way, so it goes out ``completed``."""
+
+    @pytest.fixture(autouse=True)
+    def _patched(self, monkeypatch):
+        for var in ("OPENAI_BASE_URL", "OPENAI_API_BASE"):
+            monkeypatch.delenv(var, raising=False)
+        from src.llms.patches import _patch_langchain_openai_reasoning_status
+
+        _patch_langchain_openai_reasoning_status()
+
+    def _sent(self, reasoning):
+        from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+        from langchain_openai import ChatOpenAI
+
+        model = ChatOpenAI(model="k3.1-pro", api_key="x", output_version="responses/v1")
+        call = {"type": "function_call", "call_id": "c1", "name": "f", "arguments": "{}"}
+        history = [
+            HumanMessage("q"),
+            AIMessage(
+                content=[reasoning, call],
+                tool_calls=[{"id": "c1", "name": "f", "args": {}}],
+            ),
+            ToolMessage("1", tool_call_id="c1"),
+        ]
+        items = model._get_request_payload(history)["input"]
+        return [item for item in items if item.get("type") == "reasoning"]
+
+    def test_a_streamed_item_goes_out_completed(self):
+        streamed = {"type": "reasoning", "id": "rs_1", "status": "in_progress", "summary": []}
+
+        assert [item["status"] for item in self._sent(streamed)] == ["completed"]
+
+    def test_an_item_without_a_status_gets_none(self):
+        unstreamed = {"type": "reasoning", "id": "rs_1", "summary": []}
+
+        assert ["status" in item for item in self._sent(unstreamed)] == [False]
+
+
 class TestInputTransformations:
     """The API's list of the earlier thinking it dropped reaches a streamed
     answer. A non-streamed one keeps it through ``llm_output``, which the

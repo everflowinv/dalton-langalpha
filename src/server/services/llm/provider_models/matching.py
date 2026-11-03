@@ -8,6 +8,7 @@ from typing import NotRequired, TypedDict
 from src.llms.gateway_names import gateway_slug, manifest_slug_index
 from src.llms.model_spec import borrows_reasoning, canonical_reasoning_efforts, reasoning_block, wire_api
 
+from .catalog import GatewayCatalog
 from .wire import OPENROUTER, is_chat_model
 
 # Fallback reasons the match itself gives.
@@ -51,22 +52,22 @@ def served_models(provider: str, mc, *, holder: str | None = None, base_url_save
 
 
 def _add_brand_rows(out: dict[str, list[str]], provider: str, mc) -> None:
-    """A variant with no models of its own (a coding plan) offers its brand's,
-    each picked as an entry naming the variant, which runs on the variant's key
-    even where that key may not reach the brand's own rows (``own_api_key``).
-    The same models the picker offers (``connectionBuiltIns`` in the web app)."""
-    brand = mc.get_parent_provider(provider)
-    rows = [(k, e) for k, e in mc.llm_config.items() if e and e.get("visible")]
-    if brand == provider or any(e.get("provider") == provider for _, e in rows):
+    """A variant with no models of its own (a coding plan, or a region of one)
+    offers those of the provider ``models_from`` names. A brand's rows are each
+    picked as an entry naming the variant, which runs on the variant's key and
+    endpoint even where that key may not reach the rows' own
+    (``own_api_key``); a plan's rows run under a region of it as they are,
+    sent to that region's host. The same models the picker offers
+    (``connectionBuiltIns`` in the web app)."""
+    source = mc.models_from(provider)
+    if source == provider:
         return
-    for key, entry in rows:
-        if entry.get("provider") != brand:
+    for key, entry in mc.llm_config.items():
+        if not entry or not entry.get("visible") or entry.get("provider") != source:
             continue
         keys = out.setdefault(entry.get("model_id") or key, [])
         if key not in keys:
             keys.append(key)
-
-
 
 
 class ModelsResult(TypedDict):
@@ -94,6 +95,7 @@ def build_result(
     base_url_saved: bool = False,
     reason: str | None = None,
     fetched_at: str | None = None,
+    catalog: GatewayCatalog | None = None,
 ) -> ModelsResult:
     """Intersect a normalized list with the manifest, or fall back to it.
 
@@ -101,10 +103,14 @@ def build_result(
     The fallback rule: no list, or a list naming none of the manifest models
     the credential serves (for OpenRouter, matched by name: an empty list),
     answers with every manifest model it serves, as before lists were read.
+    A gateway's ``catalog`` describes each listed model, on every read like
+    the OpenRouter annotation, and its own list stands in for a list that
+    could not be read.
     """
     served = served_models(provider, mc, holder=holder, base_url_saved=base_url_saved)
     manifest_keys = [k for keys in served.values() for k in keys]
-    listed = {m["id"]: m for m in models or []}
+    offered = catalog.describe(models, mc) if catalog is not None else models
+    listed = {m["id"]: m for m in offered or []}
 
     ready: list[str] = []
     context_windows: dict[str, int] = {}
@@ -129,7 +135,7 @@ def build_result(
         if models is not None and not models:
             reason = EMPTY_LIST
     else:
-        others = [m for m in models or [] if m["id"] not in served]
+        others = [m for m in offered or [] if m["id"] not in served]
         # Only a list that could have matched and did not is suspect; a provider
         # the manifest tunes nothing for has every model under ``others``.
         if models is not None and manifest_keys and not ready:

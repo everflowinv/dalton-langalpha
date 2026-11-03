@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from collections.abc import Mapping
 from typing import Any, Protocol
 
-from .gateway_names import gateway_slug, manifest_slug_index
+from .gateway_names import gateway_slug, manifest_slug_index, names_models_its_own_way
 from .reasoning import (
     OFF_LEVELS,
     REASONING_LEVELS,
@@ -235,12 +235,14 @@ def routed_provider_info(entry: dict, manifest: ManifestSource) -> dict:
 
 def shadowed_model(entry: dict, manifest: ManifestSource) -> dict | None:
     """The built-in a custom entry stands for: the one whose name it took, else,
-    for an entry routed through OpenRouter, which names models its own way, the
-    one its id matches. That match is what the model list called it known by,
-    so the entry is tuned as the model it was picked as."""
+    for an entry routed through a gateway that names models its own way
+    (OpenRouter, or one with a ``model_catalog``), the one its id matches. That
+    match is what the model list called it known by, so the entry is tuned as
+    the model it was picked as."""
     name = entry.get("name")
     found = manifest.get_model_config(name) if isinstance(name, str) and name else None
-    if found is not None or routed_provider_info(entry, manifest).get("sdk") != "openrouter":
+    route = routed_provider_info(entry, manifest)
+    if found is not None or not names_models_its_own_way(route):
         return found
     model_id = entry.get("model_id")
     key = manifest_slug_index(manifest).get(gateway_slug(model_id)) if isinstance(model_id, str) else None

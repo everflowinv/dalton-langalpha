@@ -4,7 +4,7 @@
  */
 import { api } from '@/api/client';
 import type { KeyCandidates, ProviderCatalogEntry, ReasoningDeclaration } from '@/components/model/types';
-import type { ModelMetadataEntry } from '@/hooks/useFilteredModels';
+import type { GatewayIndex, ModelMetadataEntry } from '@/hooks/useFilteredModels';
 import type { CompactionProfileCatalog, SearchProviderCatalog, SystemDefaults } from '@/hooks/useAllModels';
 
 /** `GET /api/v1/models`: the deployment's catalog, the same for every user. */
@@ -19,6 +19,8 @@ export interface ModelsResponse {
   provider_catalog: ProviderCatalogEntry[];
   /** Where a turn looks for each provider's stored key. */
   key_candidates: Record<string, KeyCandidates>;
+  /** How a pick from a gateway's list meets the built-in it is tuned as. */
+  gateway_index?: GatewayIndex;
 }
 
 export async function getAvailableModels(): Promise<ModelsResponse> {
@@ -82,6 +84,13 @@ export interface ListedModel {
   manifest_key?: string;
   /** OpenRouter: the levels the model takes there, saved with the pick. */
   reasoning?: ReasoningDeclaration;
+  /** A gateway's catalog: the provider the model is served on (one of the
+   *  connection's `routes`), and what that API needs sent, saved with the pick. */
+  route?: string;
+  /** The catalog describes the model, so the pick runs tuned by it. */
+  described?: boolean;
+  parameters?: Record<string, unknown>;
+  prompt_guidance?: string;
 }
 
 export type AvailableModelsReason =

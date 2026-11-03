@@ -515,7 +515,8 @@
         "description": "DeepSeek's V4.1 Flash model with extended thinking, image input and 1M context",
         "alias": [
           "deepseek-v4-flash",
-          "deepseek-v4-flash-vision-exp"
+          "deepseek-v4-flash-vision-exp",
+          "deepseek-v4.1-flash"
         ],
         "context_window": 1000000,
         "max_output": 384000,
@@ -906,17 +907,43 @@
     ],
     "moonshot-coding": [
       {
-        "id": "kimi-k3",
+        "id": "k3.1-pro",
+        "name": "Kimi K3.1 Pro",
+        "is_reasoning": true,
+        "context_window": 262144,
+        "pricing": {
+          "input": 2.0,
+          "cached_input": 0.2,
+          "output": 10.0,
+          "unit": "per_1m_tokens"
+        },
+        "description": "Kimi K3.1 Pro on a Kimi Code plan"
+      },
+      {
+        "id": "k3.1-pro-highspeed",
+        "name": "Kimi K3.1 Pro Highspeed",
+        "is_reasoning": true,
+        "context_window": 1048576,
+        "pricing": {
+          "input": 4.0,
+          "cached_input": 0.2,
+          "output": 20.0,
+          "unit": "per_1m_tokens"
+        },
+        "description": "Kimi K3.1 Pro Highspeed on a Kimi Code plan"
+      },
+      {
+        "id": "k3",
         "name": "Kimi K3",
         "is_reasoning": true,
-        "description": "Moonshot AI's flagship Kimi K3 multi-modal model with 1M-token context",
-        "context_window": 1000000,
+        "context_window": 262144,
         "pricing": {
           "input": 3.0,
           "cached_input": 0.3,
           "output": 15.0,
           "unit": "per_1m_tokens"
-        }
+        },
+        "description": "Kimi K3 on a Kimi Code plan"
       }
     ],
     "cerebras": [
@@ -1054,11 +1081,31 @@
       "operator_channel": "system",
       "variants": {
         "moonshot-coding": {
-          "base_url": "https://api.kimi.com/coding",
+          "base_url": "https://api.kimi.ai/coding/v1",
           "env_key": "MOONSHOT_CODING_API_KEY",
+          "sdk": "openai",
           "access_type": "coding_plan",
+          "operator_channel": null,
+          "use_response_api": true,
+          "default_headers": {
+            "User-Agent": "LangAlpha/1.0"
+          },
           "own_api_key": true,
-          "operator_channel": null
+          "display_name": "Kimi Code"
+        },
+        "moonshot-cn-coding": {
+          "base_url": "https://api.kimi.com/coding/v1",
+          "env_key": "MOONSHOT_CN_CODING_API_KEY",
+          "sdk": "openai",
+          "access_type": "coding_plan",
+          "operator_channel": null,
+          "use_response_api": true,
+          "default_headers": {
+            "User-Agent": "LangAlpha/1.0"
+          },
+          "region": "cn",
+          "parent_provider": "moonshot-coding",
+          "display_name": "Kimi Code"
         }
       }
     },
@@ -1081,7 +1128,9 @@
           "sdk": "anthropic",
           "base_url": "https://api.z.ai/api/anthropic",
           "env_key": "ZAI_CODING_API_KEY",
-          "access_type": "coding_plan"
+          "access_type": "coding_plan",
+          "own_api_key": true,
+          "display_name": "GLM Coding Plan"
         },
         "z-ai-cn-coding": {
           "sdk": "anthropic",
@@ -1089,7 +1138,9 @@
           "env_key": "ZAI_CN_CODING_API_KEY",
           "access_type": "coding_plan",
           "region": "cn",
-          "parent_provider": "z-ai-cn"
+          "parent_provider": "z-ai-cn",
+          "own_api_key": true,
+          "display_name": "GLM Coding Plan"
         }
       }
     },
@@ -1107,7 +1158,56 @@
           "base_url": "https://api.minimax.io/anthropic",
           "env_key": "MINIMAX_CODING_API_KEY",
           "access_type": "coding_plan",
-          "own_api_key": true
+          "own_api_key": true,
+          "display_name": "MiniMax Coding Plan"
+        },
+        "minimax-cn-coding": {
+          "base_url": "https://api.minimax.cn/anthropic",
+          "env_key": "MINIMAX_CN_CODING_API_KEY",
+          "access_type": "coding_plan",
+          "own_api_key": true,
+          "region": "cn",
+          "display_name": "MiniMax Coding Plan"
+        }
+      }
+    },
+    "opencode-go": {
+      "sdk": "anthropic",
+      "base_url": "https://opencode.ai/inference/go/anthropic",
+      "models_url": "https://opencode.ai/inference/go/v1/models",
+      "model_catalog": {
+        "url": "https://models.dev/api.json",
+        "provider": "opencode-go",
+        "routes": {
+          "@ai-sdk/anthropic": "opencode-go",
+          "@ai-sdk/openai": "opencode-go-responses",
+          "@ai-sdk/google": "opencode-go-google",
+          "@ai-sdk/openai-compatible": "opencode-go-chat"
+        },
+        "fallback_route": "opencode-go-chat"
+      },
+      "env_key": "OPENCODE_API_KEY",
+      "access_type": "coding_plan",
+      "display_name": "OpenCode Go",
+      "category": "inference",
+      "operator_channel": null,
+      "default_headers": {
+        "User-Agent": "LangAlpha/1.0"
+      },
+      "session_header": "x-opencode-session",
+      "variants": {
+        "opencode-go-chat": {
+          "sdk": "glm",
+          "base_url": "https://opencode.ai/inference/go/openai/v1"
+        },
+        "opencode-go-responses": {
+          "sdk": "openai",
+          "base_url": "https://opencode.ai/inference/go/openai/v1",
+          "use_response_api": true
+        },
+        "opencode-go-google": {
+          "sdk": "gemini",
+          "base_url": "https://opencode.ai/inference/go/google"
         }
       }
     },

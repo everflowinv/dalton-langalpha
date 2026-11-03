@@ -876,27 +876,88 @@
       "write": "parameters.output_config.effort"
     }
   },
-  "kimi-k3-coding": {
+  "kimi-k3.1-pro-coding": {
     "prompt_guidance": "lean",
-    "model_id": "kimi-k3",
+    "model_id": "k3.1-pro",
     "provider": "moonshot-coding",
-    "display_name": "Kimi K3 Coding",
+    "display_name": "Kimi K3.1 Pro",
     "visible": true,
-    "speed": 1,
-    "intelligence": 4,
-    "context": 1000000,
+    "speed": 2,
+    "intelligence": 5,
+    "context": 262144,
     "input_modalities": [
       "text",
       "image"
     ],
+    "parameters": {
+      "reasoning": {
+        "summary": "auto"
+      }
+    },
     "reasoning": {
       "efforts": [
         "low",
         "high",
         "max"
       ],
-      "default": "max",
-      "write": "extra_body.reasoning_effort"
+      "default": "high",
+      "write": "parameters.reasoning.effort"
+    }
+  },
+  "kimi-k3.1-pro-highspeed-coding": {
+    "prompt_guidance": "lean",
+    "model_id": "k3.1-pro-highspeed",
+    "provider": "moonshot-coding",
+    "display_name": "Kimi K3.1 Pro Highspeed",
+    "visible": true,
+    "speed": 4,
+    "intelligence": 5,
+    "context": 1048576,
+    "input_modalities": [
+      "text",
+      "image"
+    ],
+    "parameters": {
+      "reasoning": {
+        "summary": "auto"
+      }
+    },
+    "reasoning": {
+      "efforts": [
+        "low",
+        "high",
+        "max"
+      ],
+      "default": "high",
+      "write": "parameters.reasoning.effort"
+    }
+  },
+  "kimi-k3-coding": {
+    "prompt_guidance": "lean",
+    "model_id": "k3",
+    "provider": "moonshot-coding",
+    "display_name": "Kimi K3",
+    "visible": true,
+    "speed": 1,
+    "intelligence": 4,
+    "context": 262144,
+    "input_modalities": [
+      "text",
+      "image"
+    ],
+    "parameters": {
+      "reasoning": {
+        "summary": "auto"
+      }
+    },
+    "reasoning": {
+      "efforts": [
+        "low",
+        "high",
+        "max"
+      ],
+      "default": "high",
+      "write": "parameters.reasoning.effort"
     }
   },
   "gpt-5.3-codex-spark-oauth": {

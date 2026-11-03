@@ -1,11 +1,11 @@
-import { useId } from 'react';
+import { useId, type ReactNode } from 'react';
 import { useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
 import { Loader } from '@/components/ui/loader';
 import { WizardStepHeader } from '@/components/ui/wizard';
-import { ApiKeyFormFields, useApiKeyForm } from '@/components/modelAccess/ApiKeyForm';
+import type { ApiKeyFormState } from '@/components/modelAccess/ApiKeyForm';
 import { ProviderTitle } from '@/components/modelAccess/KeyProviderPicker';
-import { optionName } from '@/components/modelAccess/optionLabels';
+import { RegionKeyForm } from '@/components/modelAccess/RegionKeyForm';
 import { optionsOf, type KeyOption } from '@/components/modelAccess/providerOptions';
 import { useConfiguredProviders } from '@/hooks/useConfiguredProviders';
 import { useProviderCatalog, type KeyPlace } from '@/hooks/useProviderCatalog';
@@ -35,6 +35,7 @@ function ownProviderOption(provider: string, displayName: string): KeyOption {
 export function ApiKeyConnect({ state }: { state: LocationState }) {
   const { t } = useTranslation();
   const { optionFor, placeOf, isLoading } = useProviderCatalog();
+  const { providers } = useConfiguredProviders();
   const provider = state.provider ?? '';
 
   if (isLoading) {
@@ -45,14 +46,27 @@ export function ApiKeyConnect({ state }: { state: LocationState }) {
     );
   }
 
-  const option = optionFor(provider) ?? ownProviderOption(provider, state.displayName ?? provider);
-  return <KeyForm key={option.provider} state={state} option={option} place={placeOf(provider)} />;
+  const place = placeOf(provider);
+  return (
+    <RegionKeyForm
+      start={optionFor(provider) ?? ownProviderOption(provider, state.displayName ?? provider)}
+      group={place?.group}
+      configured={providers}
+    >
+      {({ form, fields, option }) => <KeyStep state={state} form={form} fields={fields} option={option} place={place} />}
+    </RegionKeyForm>
+  );
 }
 
-function KeyForm({ state, option, place }: { state: LocationState; option: KeyOption; place?: KeyPlace }) {
+function KeyStep({ state, form, fields, option, place }: {
+  state: LocationState;
+  form: ApiKeyFormState;
+  fields: ReactNode;
+  option: KeyOption;
+  place?: KeyPlace;
+}) {
   const navigate = useNavigate();
   const connected = useProviderConnected();
-  const { providers } = useConfiguredProviders();
   const { t } = useTranslation();
   // DALTON-HOOK(team-credentials): team-shared credentials status
   const { isShared: isTeamShared, canManage } = useTeamCredentials();
@@ -62,18 +76,15 @@ function KeyForm({ state, option, place }: { state: LocationState; option: KeyOp
   const headingId = useId();
 
   const method = state.method ?? 'api_key';
-  const form = useApiKeyForm(option, providers ?? []);
   const { entry } = option;
   const displayName = place?.group.name ?? entry.display_name;
-  const brandKey = entry.brand_key ?? entry.provider;
-  // The plan and region were picked on the provider step; this names them
-  // where the provider offers more than one.
-  const optionLabel = place && place.group.options.length > 1 ? optionName(t, option) : null;
+  const modelsFrom = option.models_from;
 
   const handleSave = async () => {
+    const { fresh } = form;
     const savedAs = await form.save();
     if (!savedAs) return;
-    const next = { method, provider: savedAs, displayName, brandKey, justConnected: true };
+    const next = { method, list: state.list, provider: savedAs, displayName, modelsFrom, justConnected: fresh };
     // A local server has no models until some are picked from its list, so it
     // goes on to the model step whatever page sent the user here; the return
     // then happens from the last step.
@@ -81,7 +92,7 @@ function KeyForm({ state, option, place }: { state: LocationState; option: KeyOp
     else connected(next);
   };
 
-  const handleBack = () => navigate('/setup/provider', { state: { method, group: place?.group.group } });
+  const handleBack = () => navigate('/setup/provider', { state: { list: state.list } });
 
   return (
     <div>
@@ -114,11 +125,8 @@ function KeyForm({ state, option, place }: { state: LocationState; option: KeyOp
           {t('modelAccess.teamManagedByAdmin')}
         </p>
       )}
-      {optionLabel && (
-        <p className="-mt-3 mb-4 text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{optionLabel}</p>
-      )}
       {/* DALTON-HOOK(team-credentials): hide API key inputs and save action for non-PM members under team sharing */}
-      {!teamManagedByAdmin && <ApiKeyFormFields form={form} />}
+      {!teamManagedByAdmin && <div className="flex flex-col gap-4">{fields}</div>}
       <SetupFooter
         back={{ label: t('setup.back'), onClick: handleBack }}
         primary={

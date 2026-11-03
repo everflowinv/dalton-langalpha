@@ -316,6 +316,7 @@ class TestPlatformVariantFiltering:
         mock_config = MagicMock()
         mock_config.flat_providers = flat
         mock_config.get_provider_info = lambda p: flat.get(p, {})
+        mock_config.connection_of = lambda p: p
         mock_config.get_byok_eligible_providers = lambda: [
             name for name, cfg in flat.items()
             if cfg.get("byok_eligible", False) and not cfg.get("platform", False)
@@ -365,6 +366,7 @@ class TestPlatformVariantFiltering:
         flat = self._build_flat_providers()
         mock_config = MagicMock()
         mock_config.flat_providers = flat
+        mock_config.connection_of = lambda p: p
 
         with patch("src.llms.llm.ModelConfig", return_value=mock_config):
             allowed = _get_allowed_providers([])

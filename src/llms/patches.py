@@ -227,6 +227,43 @@ def _patch_langchain_openai_compaction_trigger():
         logger.warning(f"Failed to patch langchain_openai compaction trigger: {e}")
 
 
+def _patch_langchain_openai_reasoning_status():
+    """Send back a streamed reasoning item as ``completed``.
+
+    langchain-openai 1.7 builds a streamed reasoning item from its
+    ``output_item.added`` event, which says ``in_progress``, and takes only the
+    encrypted content from the ``done`` event, so the stored item keeps the
+    stale status. OpenAI ignores it on input; Kimi Code refuses the request
+    with a 400. An item being sent back has finished, whatever it was saved as.
+    """
+    try:
+        from langchain_openai.chat_models.base import BaseChatOpenAI
+
+        original = BaseChatOpenAI._get_request_payload
+        if getattr(original, "_completes_reasoning", False):
+            return
+
+        @functools.wraps(original)
+        def _patched(self, input_, *, stop=None, **kwargs):
+            payload = original(self, input_, stop=stop, **kwargs)
+            items = payload.get("input")
+            if isinstance(items, list):
+                payload["input"] = [
+                    {**item, "status": "completed"}
+                    if isinstance(item, dict)
+                    and item.get("type") == "reasoning"
+                    and item.get("status") == "in_progress"
+                    else item
+                    for item in items
+                ]
+            return payload
+
+        _patched._completes_reasoning = True
+        BaseChatOpenAI._get_request_payload = _patched
+    except Exception as e:
+        logger.warning(f"Failed to patch langchain_openai reasoning status: {e}")
+
+
 def _patch_langchain_anthropic_header_betas():
     """Keep the client's own betas on a request that names betas.
 

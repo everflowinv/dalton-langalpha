@@ -5,6 +5,7 @@ Covers GET/PUT/DELETE of BYOK API keys, key masking, and
 the public /api/v1/models endpoint.
 """
 
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -24,6 +25,11 @@ PROVIDER_INFO_MAP = {
 }
 
 DB = "src.server.app.api_keys"
+
+
+@asynccontextmanager
+async def _no_transaction(_user_id):
+    yield None
 
 
 @pytest_asyncio.fixture
@@ -47,6 +53,10 @@ async def client():
                 f"{DB}._get_provider_info_map",
                 return_value=PROVIDER_INFO_MAP,
             ),
+            # The machine's own server keys are not the test's.
+            patch(f"{DB}.deployment_key", return_value=None),
+            # The writes are mocked one by one; their transaction needs no pool.
+            patch(f"{DB}.key_writes", _no_transaction),
         ):
             yield c
 
@@ -195,7 +205,25 @@ async def test_update_api_keys_delete_key(client):
         )
 
     assert resp.status_code == 200
-    mock_delete.assert_awaited_once_with("test-user-123", "openai")
+    mock_delete.assert_awaited_once_with("test-user-123", "openai", conn=None)
+
+
+@pytest.mark.asyncio
+async def test_a_plans_key_saved_in_one_region_removes_it_from_the_others(client):
+    # A plan runs in one region; a key the client never saw (saved from another
+    # tab) goes too, in the same transaction as the new one.
+    with (
+        patch(f"{DB}.upsert_api_key", new_callable=AsyncMock) as upsert,
+        patch(f"{DB}.delete_api_key", new_callable=AsyncMock) as delete,
+        patch(f"{DB}._get_custom_providers", new_callable=AsyncMock, return_value=[]),
+        patch(f"{DB}.get_user_api_keys", new_callable=AsyncMock, return_value={"byok_enabled": True, "keys": {}, "base_urls": {}}),
+        patch("src.server.services.onboarding.maybe_complete_personalization", new_callable=AsyncMock, return_value=False),
+    ):
+        resp = await client.put("/api/v1/users/me/api-keys", json={"api_keys": {"moonshot-cn-coding": "sk-placeholder"}})
+
+    assert resp.status_code == 200
+    upsert.assert_awaited_once()
+    delete.assert_awaited_once_with("test-user-123", "moonshot-coding", conn=None)
 
 
 @pytest.mark.asyncio
@@ -279,7 +307,7 @@ async def test_oss_saves_a_local_base_url(client):
 
     assert resp.status_code == 200
     upsert.assert_awaited_once_with(
-        "test-user-123", "openai", "sk-newkey1234567890", base_url="http://localhost:1234/v1"
+        "test-user-123", "openai", "sk-newkey1234567890", base_url="http://localhost:1234/v1", conn=None
     )
 
 

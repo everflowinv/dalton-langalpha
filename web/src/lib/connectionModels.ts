@@ -6,9 +6,26 @@
  * connection still serves must be left alone.
  */
 import type { CustomModelEntry, KeyCandidates } from '@/components/model/types';
+import type { ConnectionOf } from '@/lib/providerCatalog';
 
 /** The manifest's rows (`model_metadata`), before the user's entries are merged over them. */
-export type ManifestModels = Readonly<Record<string, { provider?: string } | undefined>>;
+export type ManifestModels = Readonly<Record<string, { provider?: string; access_type?: string } | undefined>>;
+
+type Candidates = Readonly<Record<string, KeyCandidates>> | undefined;
+
+/**
+ * Whether the manifest model `name` runs on `provider`'s key as it is, with no
+ * entry of the user's naming the provider: one of its own rows, or a coding
+ * plan's row the plan's key reaches under `provider` (a region of the plan,
+ * or another protocol of it), which the server's walk finds there. A plan keeps
+ * one region, so the walk never finds another region's key first.
+ */
+export function runsNatively(name: string, provider: string, manifest: ManifestModels, keyCandidates: Candidates): boolean {
+  const meta = manifest[name];
+  if (!meta?.provider) return false;
+  if (meta.provider === provider) return true;
+  return meta.access_type === 'coding_plan' && !!keyCandidates?.[meta.provider]?.shared.includes(provider);
+}
 
 export interface ConnectionContext {
   customModels: readonly CustomModelEntry[];
@@ -17,13 +34,20 @@ export interface ConnectionContext {
   connected: ReadonlySet<string>;
   /** Where a turn looks for each provider's key (`key_candidates`). */
   keyCandidates?: Readonly<Record<string, KeyCandidates>>;
+  /** A model saved under another API of a connection is the connection's. */
+  connectionOf: ConnectionOf;
 }
 
 const nameOf = (cm: CustomModelEntry) => cm.name || cm.model_id;
 
 /** A saved custom entry under another provider took this name, so the name routes there. */
-export function takenElsewhere(name: string, provider: string, customModels: readonly CustomModelEntry[]): boolean {
-  return customModels.some((cm) => cm.provider !== provider && nameOf(cm) === name);
+export function takenElsewhere(
+  name: string,
+  provider: string,
+  customModels: readonly CustomModelEntry[],
+  connectionOf: ConnectionOf,
+): boolean {
+  return customModels.some((cm) => connectionOf(cm.provider) !== provider && nameOf(cm) === name);
 }
 
 /**
@@ -35,7 +59,7 @@ export function takenElsewhere(name: string, provider: string, customModels: rea
  * (a region's key, the server's `shares_api_key`).
  */
 export function servedElsewhere(name: string, provider: string, ctx: ConnectionContext): boolean {
-  if (takenElsewhere(name, provider, ctx.customModels)) return true;
+  if (takenElsewhere(name, provider, ctx.customModels, ctx.connectionOf)) return true;
   const own = ctx.manifest[name]?.provider;
   if (!own) return false;
   const holders = ctx.keyCandidates?.[own]?.shared ?? [own];
@@ -45,15 +69,17 @@ export function servedElsewhere(name: string, provider: string, ctx: ConnectionC
 /** Every model name `provider` serves that leaves the user's lists with it. */
 export function modelsLeavingWith(provider: string, ctx: ConnectionContext): Set<string> {
   const names = [
-    ...ctx.customModels.filter((cm) => cm.provider === provider).map(nameOf),
-    ...Object.entries(ctx.manifest).filter(([, meta]) => meta?.provider === provider).map(([name]) => name),
+    ...ctx.customModels.filter((cm) => ctx.connectionOf(cm.provider) === provider).map(nameOf),
+    ...Object.keys(ctx.manifest).filter((name) => runsNatively(name, provider, ctx.manifest, ctx.keyCandidates)),
   ];
   return new Set(names.filter((m) => !servedElsewhere(m, provider, ctx)));
 }
 
 /**
- * The manifest's models a connection offers: its own, or for a variant without
- * entries of its own (a coding plan) its brand's. Read off each model's own
+ * The manifest's models a connection offers: those that run on it as they are
+ * (`runsNatively`), or for a variant with none (a coding plan of a brand, or a
+ * region of one) those of `modelsFrom`, the provider the catalog names for it,
+ * each picked as an entry naming the variant. Read off each model's own
  * provider rather than the catalog's grouping, which files a region's models
  * under the top-level brand (`z-ai-cn`'s under `z-ai`), so a variant of the
  * region would find none. A name a custom entry under another provider took
@@ -61,17 +87,17 @@ export function modelsLeavingWith(provider: string, ctx: ConnectionContext): Set
  */
 export function connectionBuiltIns(
   provider: string,
-  brand: string,
+  modelsFrom: string,
   manifest: ManifestModels,
   customModels: readonly CustomModelEntry[],
+  connectionOf: ConnectionOf,
+  keyCandidates?: Candidates,
 ): string[] {
-  const under = (p: string) =>
-    Object.entries(manifest)
-      .filter(([name, meta]) => meta?.provider === p && !takenElsewhere(name, provider, customModels))
-      .map(([name]) => name);
-  const exact = under(provider);
-  if (exact.length > 0 || provider === brand) return exact;
-  return under(brand);
+  const offered = (runs: (name: string) => boolean) =>
+    Object.keys(manifest).filter((name) => runs(name) && !takenElsewhere(name, provider, customModels, connectionOf));
+  const native = offered((name) => runsNatively(name, provider, manifest, keyCandidates));
+  if (native.length > 0 || provider === modelsFrom) return native;
+  return offered((name) => manifest[name]?.provider === modelsFrom);
 }
 
 /**
@@ -82,22 +108,21 @@ export function connectionBuiltIns(
  * with nothing picked.
  */
 export function seedPicks({
-  provider,
   candidates,
   savedNames,
   starred,
-  manifest,
+  native,
   justConnected,
 }: {
-  provider: string;
   candidates: readonly string[];
   /** The names saved as custom entries under this provider. */
   savedNames: readonly string[];
   starred: readonly string[];
-  manifest: ManifestModels;
+  /** Whether a manifest model runs on this connection as it is (`runsNatively`). */
+  native: (name: string) => boolean;
   justConnected: boolean;
 }): Set<string> {
-  const mine = (m: string) => savedNames.includes(m) || manifest[m]?.provider === provider;
+  const mine = (m: string) => savedNames.includes(m) || native(m);
   const kept = starred.filter((m) => candidates.includes(m) && mine(m));
   return new Set(kept.length === 0 && justConnected ? candidates : kept);
 }

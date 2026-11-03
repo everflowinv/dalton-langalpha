@@ -26,6 +26,8 @@ export interface RegionVariant {
   sdk?: SdkType | string;
   base_url?: string | null;
   use_response_api?: boolean;
+  /** Whose manifest models a key saved here offers: the region's plan. */
+  models_from?: string;
 }
 
 export interface ProviderCatalogEntry {
@@ -39,7 +41,14 @@ export interface ProviderCatalogEntry {
   base_url?: string | null;
   use_response_api?: boolean;
   dynamic_models?: boolean;
+  /** Whose manifest models a key saved here offers: the provider's own, else
+   *  a coding plan's brand. */
+  models_from?: string;
   region_variants?: RegionVariant[];
+  /** The connection's other APIs (OpenCode Go's Chat Completions beside its
+   *  Anthropic Messages): a model it serves on one is saved under that one,
+   *  and stays this connection's. */
+  routes?: string[];
   /** The provider this entry is a plan or region of (the providers.json group). */
   group?: string;
   group_display_name?: string;
@@ -77,6 +86,10 @@ export interface CustomModelEntry {
   /** Context window in tokens, as the provider lists it; picks the compaction band. */
   context?: number;
   reasoning?: ReasoningDeclaration;
+  /** The prompt scaffolding the model is tuned for, where it is known. */
+  prompt_guidance?: string;
+  /** The name a gateway's catalog gives the model, shown in place of `name`. */
+  display_name?: string;
 }
 
 export interface CustomModelFormState {

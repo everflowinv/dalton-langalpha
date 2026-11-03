@@ -72,7 +72,7 @@ export function ManageSheet({
   const allowDisconnect = !isDaltonAuth || canDisconnect;
   const allowManage = !isDaltonAuth || canManage;
   const subscription = isSubscriptionProvider(p.provider) ? p.provider : null;
-  const picker = useModelPicker({ provider: p.provider, brandKey: option?.entry.brand_key ?? p.brand_key, justConnected });
+  const picker = useModelPicker({ provider: p.provider, modelsFrom: option?.models_from ?? p.brand_key, justConnected });
   const [reconnecting, setReconnecting] = useState(false);
   const [editingKey, setEditingKey] = useState(false);
   const [saved, setSaved] = useState(false);

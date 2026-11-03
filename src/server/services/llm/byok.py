@@ -52,6 +52,26 @@ def key_fits(provider: str, holder: str, *, has_base_url: bool, mc) -> bool:
     return has_base_url or mc.shares_api_key(provider, holder)
 
 
+def call_endpoint(provider: str, holding: str, mc, *, custom: bool) -> str:
+    """The provider whose endpoint a turn calls, for a model on ``provider``
+    whose key the walk found under ``holding``.
+
+    A key's own connection decides first: a model saved under another API of
+    it (OpenCode Go's Chat Completions, the key under its Anthropic route or
+    any other) is served on that API, and a region of the model's plan (``moonshot-cn-coding``
+    for ``moonshot-coding``) is where the key was issued, so the call goes to
+    its host. Past those, a manifest model keeps its own endpoint (a z-ai-coding
+    model whose key sits under ``z-ai`` still calls the coding endpoint), while
+    a custom model goes where the key is: it was tagged with a brand but saved
+    for the variant the user configured.
+    """
+    if mc.connection_of(provider) == mc.connection_of(holding):
+        return provider
+    if mc.models_from(holding) == provider:
+        return holding
+    return holding if custom else provider
+
+
 async def walk_byok_candidates(
     user_id,
     provider,

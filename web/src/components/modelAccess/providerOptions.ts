@@ -21,6 +21,8 @@ export interface KeyOption {
   /** The wire format the key is spoken with there. */
   sdk: string | null;
   use_response_api: boolean;
+  /** Whose manifest models the connection offers (the catalog's `models_from`). */
+  models_from: string;
 }
 
 export interface ProviderGroup {
@@ -44,7 +46,6 @@ export const NO_FILTER: KeyFilter = { query: '', category: 'all' };
 /** The list's sections, in order; a provider with no category goes last. */
 export const CATEGORIES: readonly ProviderCategory[] = ['closed_source', 'open_source', 'inference'];
 
-const PLAN_ORDER: Record<Plan, number> = { api_key: 0, coding_plan: 1 };
 const REGION_ORDER: Record<string, number> = { intl: 0, sg: 1, cn: 2 };
 
 /** The places a catalog entry takes a key: its own, then each of its regions. */
@@ -58,6 +59,7 @@ export function optionsOf(entry: ProviderCatalogEntry): KeyOption[] {
     base_url: entry.base_url ?? null,
     sdk: entry.sdk ?? null,
     use_response_api: entry.use_response_api ?? false,
+    models_from: entry.models_from ?? entry.brand_key ?? entry.provider,
   };
   const regions = (entry.region_variants ?? []).map((v): KeyOption => ({
     entry,
@@ -67,6 +69,7 @@ export function optionsOf(entry: ProviderCatalogEntry): KeyOption[] {
     base_url: v.base_url ?? null,
     sdk: v.sdk ?? own.sdk,
     use_response_api: v.use_response_api ?? own.use_response_api,
+    models_from: v.models_from ?? own.models_from,
   }));
   return [own, ...regions];
 }
@@ -91,8 +94,7 @@ export function groupProviders(entries: readonly ProviderCatalogEntry[]): Provid
     g.options.push(...optionsOf(entry));
   }
   for (const g of groups.values()) {
-    g.options.sort((a, b) =>
-      PLAN_ORDER[a.plan] - PLAN_ORDER[b.plan] || (REGION_ORDER[a.region] ?? 9) - (REGION_ORDER[b.region] ?? 9));
+    g.options.sort((a, b) => (REGION_ORDER[a.region] ?? 9) - (REGION_ORDER[b.region] ?? 9));
   }
   return [...groups.values()];
 }
@@ -105,19 +107,7 @@ export function filterGroups(groups: readonly ProviderGroup[], f: KeyFilter): Pr
   });
 }
 
-export function plansOf(g: ProviderGroup): Plan[] {
-  return [...new Set(g.options.map((o) => o.plan))];
-}
-
-export function regionsOf(g: ProviderGroup, plan: Plan): string[] {
-  return [...new Set(g.options.filter((o) => o.plan === plan).map((o) => o.region))];
-}
-
-export function findOption(g: ProviderGroup, plan: Plan, region: string): KeyOption | null {
-  return g.options.find((o) => o.plan === plan && o.region === region) ?? null;
-}
-
-/** Where the options step starts: a key already saved for this provider, else its first option. */
+/** Where a provider's key form starts: the region a key is saved for, else its first. */
 export function startingOption(g: ProviderGroup, saved: ReadonlySet<string>): KeyOption {
   return g.options.find((o) => saved.has(o.provider)) ?? g.options[0];
 }

@@ -10,6 +10,12 @@ import { ChatInputModelMenu } from '../chat-input.modelMenu';
 import { modelGroups } from '@/lib/modelGroups';
 import type { Payer } from '@/lib/modelPayer';
 
+vi.mock('@/hooks/usePayerLabel', async () => {
+  const { payerLabel } = await import('@/lib/modelPayer');
+  const { useTranslation } = await import('react-i18next');
+  return { usePayerLabel: () => { const { t } = useTranslation(); return (payer: Payer) => payerLabel(t, payer); } };
+});
+
 vi.mock('@/hooks/useIsMobile', () => ({ useIsMobile: () => false }));
 
 const metadata = {

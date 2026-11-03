@@ -7,7 +7,7 @@ import type { ConfiguredProvider } from '@/hooks/useConfiguredProviders';
 import type { KeyPlace } from '@/hooks/useProviderCatalog';
 import { useAvailableModels } from '@/hooks/useProviderModels';
 import { isKnownEndpoint, useKnownHosts } from '@/components/modelAccess/endpointTrust';
-import { optionName } from '@/components/modelAccess/optionLabels';
+import { regionTag } from '@/components/modelAccess/optionLabels';
 import { QuietNote, StatusLabel, type AccessStatus } from '@/components/modelAccess/parts';
 import { keyDetail } from './keyDetail';
 
@@ -76,7 +76,7 @@ export function KeyRow({ p, place, onManage }: { p: ConfiguredProvider; place?: 
     <AccessRow
       provider={place?.group.markProvider ?? p.provider}
       name={place?.group.name ?? p.display_name}
-      tag={place && place.group.options.length > 1 ? optionName(t, place.option) : null}
+      tag={regionTag(t, place)}
       unverified={p.access_type !== 'local' && !!p.base_url && isKnownEndpoint(p.base_url, knownHosts) === false}
       detail={keyDetail(p, t)}
       status={status}

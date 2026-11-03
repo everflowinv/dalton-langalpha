@@ -2,8 +2,9 @@ import { useMemo } from 'react';
 import { useModels } from './useModels';
 import { usePreferences } from './usePreferences';
 import { getModelAccess, usePlatformModels } from './usePlatformModels';
-import { buildVisibleModels, augmentPlatformWithLocal, customPairKey } from './useFilteredModels';
-import type { BuildVisibleModelsResult, ModelMetadataEntry } from './useFilteredModels';
+import { buildVisibleModels, augmentPlatformWithLocal, customPairKey, planKeyHolders } from './useFilteredModels';
+import type { BuildVisibleModelsResult, ModelMetadataEntry, ProviderRow } from './useFilteredModels';
+import { indexCatalog, ownProviderNames } from '@/lib/providerCatalog';
 import { useConfiguredProviders } from './useConfiguredProviders';
 import { useMissingModels } from './useProviderModels';
 import { isPlatformMode } from '@/config/hostMode';
@@ -132,26 +133,42 @@ export function useAllModels(): UseAllModelsResult {
     return cm as CustomModelEntry[];
   }, [preferences]);
 
-  /** Provider catalog for resolving SDK of custom models */
-  const providerCatalog = useMemo<Record<string, { sdk?: string }>>(() => {
-    const map: Record<string, { sdk?: string }> = {};
-    for (const entry of modelsData?.provider_catalog ?? []) {
-      map[entry.provider] = entry;
+  /** What each provider a custom model can name says about it: its SDK, the
+   *  name its group is listed under, and its connection. A region and another
+   *  API of a connection are listed under the connection's entry's name. */
+  const providerCatalog = useMemo<Record<string, ProviderRow>>(() => {
+    const map: Record<string, ProviderRow> = {};
+    const customProviders = modelPrefs(preferences).custom_providers;
+    for (const [provider, row] of indexCatalog(modelsData?.provider_catalog ?? [], ownProviderNames(customProviders)).rows) {
+      map[provider] = { sdk: row.sdk, display_name: row.entry.display_name, connection: row.connection };
     }
-    // Also index custom providers from preferences
-    for (const cp of modelPrefs(preferences).custom_providers ?? []) {
+    // The user's own providers, which speak their parent's SDK.
+    for (const cp of customProviders ?? []) {
       if (!map[cp.name] && cp.parent_provider && map[cp.parent_provider]) {
-        map[cp.name] = { sdk: map[cp.parent_provider].sdk };
+        map[cp.name] = { sdk: map[cp.parent_provider].sdk, connection: cp.name };
       }
     }
     return map;
   }, [modelsData, preferences]);
 
+  // What the access filters count as connected: a coding plan's key also
+  // under the plan's other slugs, whose models it runs.
+  const planHolders = useMemo(
+    () => planKeyHolders(configuredProviders, modelsData?.key_candidates ?? {}),
+    [configuredProviders, modelsData],
+  );
+  const accessProviders = useMemo(
+    () => (planHolders.size === 0
+      ? configuredProviders
+      : [...configuredProviders, ...[...planHolders].map(([provider, holder]) => ({ ...holder, provider }))]),
+    [configuredProviders, planHolders],
+  );
+
   // Augment platform with locally-known BYOK/OAuth providers so the
   // tier filter recognises connections that the platform service may not know about.
   const platform = useMemo(
-    () => rawPlatform ? augmentPlatformWithLocal(rawPlatform, configuredProviders, byokEnabled) : null,
-    [rawPlatform, configuredProviders, byokEnabled],
+    () => rawPlatform ? augmentPlatformWithLocal(rawPlatform, accessProviders, byokEnabled) : null,
+    [rawPlatform, accessProviders, byokEnabled],
   );
 
   const systemDefaults = modelsData?.system_defaults ?? null;
@@ -165,7 +182,16 @@ export function useAllModels(): UseAllModelsResult {
     .filter((p) => !p.is_custom && p.access_type !== 'local')
     .filter((p) => (p.access_type === 'oauth' ? p.state === 'connected' : !isPlatformMode || byokEnabled))
     .map((p) => p.provider), [configuredProviders, byokEnabled]);
-  const { missingByProvider, isLoading: listsLoading } = useMissingModels(listedProviders);
+  const { missingByProvider: listedMissing, isLoading: listsLoading } = useMissingModels(listedProviders);
+  // A plan slug run on a key held under another answers to that key's list.
+  const missingByProvider = useMemo(() => {
+    const out = new Map(listedMissing);
+    for (const [provider, holder] of planHolders) {
+      const missing = listedMissing.get(holder.provider);
+      if (missing && !out.has(provider)) out.set(provider, missing);
+    }
+    return out;
+  }, [listedMissing, planHolders]);
 
   /** Run the full pipeline: normalize → merge custom → filter */
   const visible = useMemo<BuildVisibleModelsResult>(() => {
@@ -186,10 +212,11 @@ export function useAllModels(): UseAllModelsResult {
       customModels,
       providerCatalog,
       platform,
-      configuredProviders,
+      accessProviders,
       missingByProvider,
+      modelsData.gateway_index,
     );
-  }, [modelsData, customModels, providerCatalog, platform, configuredProviders, missingByProvider]);
+  }, [modelsData, customModels, providerCatalog, platform, accessProviders, missingByProvider]);
 
   const catalogModelNames = useMemo(() => {
     const names = new Set<string>();

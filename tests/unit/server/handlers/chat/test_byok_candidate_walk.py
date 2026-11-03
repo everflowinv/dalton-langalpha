@@ -424,7 +424,16 @@ async def test_prefetch_reads_what_the_walk_inspects():
 # cannot drift into or out of sharing without a deliberate edit here.
 @pytest.mark.parametrize(
     "provider",
-    ["moonshot", "moonshot-coding", "minimax", "minimax-coding", "dashscope", "dashscope-intl"],
+    [
+        "moonshot",
+        "minimax",
+        "minimax-coding",
+        "minimax-cn-coding",
+        "z-ai-coding",
+        "z-ai-cn-coding",
+        "dashscope",
+        "dashscope-intl",
+    ],
 )
 def test_shipped_manifest_walks_separate_credential_providers_alone(provider):
     from src.llms.llm import LLM
@@ -435,12 +444,20 @@ def test_shipped_manifest_walks_separate_credential_providers_alone(provider):
 @pytest.mark.parametrize(
     ("provider", "walk"),
     [
-        ("z-ai", ["z-ai", "z-ai-cn", "z-ai-coding"]),
+        ("z-ai", ["z-ai", "z-ai-cn"]),
+        # Kimi Code issues one key for both its hosts upstream-side, and
+        # OpenCode Go is one key with a route per wire format.
         # DALTON-HOOK(team-credentials): coding_plan variants only accept their
         # own slug key — a deliberate Dalton difference from upstream's family
-        # walk (upstream expects ["z-ai-coding", "z-ai", "z-ai-cn"]).
-        ("z-ai-coding", ["z-ai-coding"]),
-        ("z-ai-cn-coding", ["z-ai-cn-coding"]),
+        # walk (upstream expects ["moonshot-coding", "moonshot-cn-coding"] and
+        # the four-route opencode-go family), so one plan's quota never pays
+        # for a sibling's models.
+        ("moonshot-coding", ["moonshot-coding"]),
+        ("moonshot-cn-coding", ["moonshot-cn-coding"]),
+        ("opencode-go", ["opencode-go"]),
+        ("opencode-go-chat", ["opencode-go-chat"]),
+        ("opencode-go-responses", ["opencode-go-responses"]),
+        ("opencode-go-google", ["opencode-go-google"]),
         ("volcengine", ["volcengine", "doubao-coding"]),
         ("doubao-coding", ["doubao-coding"]),
         # OpenRouter runs on its own client upstream-side since #623.

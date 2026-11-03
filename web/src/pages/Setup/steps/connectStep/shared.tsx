@@ -5,22 +5,27 @@ import { CheckboxChoice } from '@/components/ui/choice';
 import type { AccessType } from '@/components/model/types';
 import { returnFromSetup } from '@/lib/setupReturn';
 
+/** The provider step's lists: the subscriptions, the API keys, the local servers. */
+export type ProviderList = Exclude<AccessType, 'coding_plan'>;
+
 /**
  * What the wizard's steps hand each other. A catalog provider is named by the
  * key it saves under and nothing else: its plan, region, endpoint and format
  * are looked up in the catalog where they are needed.
  */
 export interface LocationState {
+  /** Which connect form the connect step renders. */
   method?: AccessType;
+  /** The provider step's list the user came from, which Back returns to: a
+   *  coding plan is listed with the subscriptions, though its form is a key's. */
+  list?: ProviderList;
   provider?: string;
   /** For the model step's heading. */
   displayName?: string;
-  /** The brand whose models the model step offers (a coding plan shares its provider's). */
-  brandKey?: string;
+  /** Whose manifest models the model step offers (a coding plan shares its brand's). */
+  modelsFrom?: string;
   /** Defining a provider of the user's own. */
   isCustom?: boolean;
-  /** The provider whose plans to open again, for Back to the provider step. */
-  group?: string;
   /** Connected by this visit's connect step, so the model step starts on
    *  every model it offers rather than on what is saved. */
   justConnected?: boolean;

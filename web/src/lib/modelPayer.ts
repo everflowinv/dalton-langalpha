@@ -15,8 +15,8 @@ import type { KeyCandidates } from '@/components/model/types';
 import type { PlatformModelsResponse } from '@/types/platform';
 
 /**
- * A subscription carries the provider it signs in to, so its tag can name the
- * plan and two sign-ins stay apart; every key of the user's pays alike, and so
+ * A subscription carries the provider it signs in to, or whose coding-plan key
+ * pays, so its tag can name the plan and two plans stay apart; every key of the user's pays alike, and so
  * does the deployment. Kept a string so payers compare, group and key maps as
  * values.
  */
@@ -60,15 +60,19 @@ const PAYER_LABEL_KEYS = {
   server_key: 'payer.serverKey',
 } as const;
 
-/** A payer's badge text. A sign-in this list does not know keeps the generic
- *  word. */
+/** A payer's badge text. A coding plan is named by `planName`, the catalog's
+ *  name for it; one whose name already says plan ("GLM Coding Plan") is
+ *  tagged with the name alone. A plan nothing names keeps the generic word. */
 export function payerLabel(
   t: (key: string, opts?: Record<string, unknown>) => string,
   payer: Payer,
+  planName?: (provider: string) => string | undefined,
 ): string {
   if (!isSubscription(payer)) return t(PAYER_LABEL_KEYS[payer]);
-  const plan = SUBSCRIPTION_PLANS[payer.slice(SUBSCRIPTION.length)];
-  return plan ? t('payer.plan', { plan }) : t('payer.subscription');
+  const provider = payer.slice(SUBSCRIPTION.length);
+  const plan = SUBSCRIPTION_PLANS[provider] ?? planName?.(provider);
+  if (!plan) return t('payer.subscription');
+  return /\bplan$/i.test(plan) ? plan : t('payer.plan', { plan });
 }
 
 /** What a payer reads off a model's manifest entry. */
@@ -137,19 +141,22 @@ export function payerResolver(ctx: PayerContext) {
   const byAccess = (access: ConfiguredProvider['access_type']) =>
     new Set(ctx.configured.filter((p) => p.access_type === access).map((p) => p.provider));
   const signIns = byAccess('oauth');
+  const plans = byAccess('coding_plan');
   const locals = byAccess('local');
   return (meta: PayerModel | undefined, provider: string, custom?: string): Payer | undefined => {
     // A model the user added runs on its own route, whatever built-in it
     // shadows: their sign-in, their local server, or a key of theirs, saved
-    // under the model's own name or one its provider's key serves.
+    // under the model's own name or one its provider's key serves. A key of a
+    // coding plan pays as the plan, a subscription bought with a key.
     if (custom !== undefined) {
       if (signIns.has(provider)) return subscriptionPayer(provider);
       if (locals.has(provider)) return undefined;
-      return ownKey.holds(custom) || ownKey.serves(provider, true) ? 'own_key' : undefined;
+      if (!ownKey.holds(custom) && !ownKey.serves(provider, true)) return undefined;
+      return plans.has(provider) ? subscriptionPayer(provider) : 'own_key';
     }
     if (meta?.access_type === 'oauth') return subscriptionPayer(provider);
     if (meta?.access_type === 'local') return undefined;
-    if (ownKey.serves(provider)) return 'own_key';
+    if (ownKey.serves(provider)) return meta?.access_type === 'coding_plan' ? subscriptionPayer(provider) : 'own_key';
     if (isPlatformMode) {
       const { platform } = ctx;
       // No plan answer fails open, as the model filter does.
@@ -167,7 +174,7 @@ export function payerResolver(ctx: PayerContext) {
 export function payerOfBilling(billing: unknown, model?: PayerModel): Payer | undefined {
   if (model?.access_type === 'local') return undefined;
   if (billing === 'oauth') return subscriptionPayer(model?.provider);
-  if (billing === 'byok') return 'own_key';
+  if (billing === 'byok') return model?.access_type === 'coding_plan' ? subscriptionPayer(model.provider) : 'own_key';
   if (billing === 'platform') return deploymentPayer();
   return undefined;
 }

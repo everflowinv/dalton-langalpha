@@ -166,7 +166,7 @@ Robinhood はローカルアプリに戻るサインインしか受け付けな�
 
 ## 使い始める
 
-**すでに料金を払っているモデルを使えます。** Claude や ChatGPT のサブスクリプションでサインインする、Kimi、GLM、MiniMax の coding plan を使う、任意の API key を持ち込む、セルフホストならローカルモデルを動かす、のいずれも選べます。
+**すでに料金を払っているモデルを使えます。** Claude や ChatGPT のサブスクリプションでサインインする、Kimi、GLM、MiniMax、OpenCode Go の coding plan を使う、任意の API key を持ち込む、セルフホストならローカルモデルを動かす、のいずれも選べます。
 
 **いつもの場所で使えます。** ブラウザ、macOS、Windows、Linux 向けの[デスクトップアプリ](https://github.com/ginlix-ai/langalpha/releases)、そして [LangAlpha.ai](https://langalpha.ai) なら Slack、Discord、Telegram、Feishu、iMessage からも使えます。
 
@@ -324,7 +324,7 @@ LangAlpha はフロンティアモデルだけに合わせて調整されてい�
 | 接続方法 | Provider |
 | --- | --- |
 | サブスクリプションでのサインイン | Claude（Claude Code）、ChatGPT（Codex） |
-| Coding plan | Kimi、GLM、MiniMax |
+| Coding plan | Kimi、GLM、MiniMax、OpenCode Go |
 | API key | OpenAI、Anthropic、Gemini、DeepSeek、Qwen（DashScope）、Kimi（Moonshot）、GLM（Zhipu）、MiniMax、OpenRouter、Groq、Cerebras |
 | ローカル | Ollama、LM Studio、vLLM |
 

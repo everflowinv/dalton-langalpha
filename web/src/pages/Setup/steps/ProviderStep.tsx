@@ -7,51 +7,14 @@ import { SetupFooter } from '../SetupFooter';
 import { useProviderCatalog } from '@/hooks/useProviderCatalog';
 import { usePreferences } from '@/hooks/usePreferences';
 import { useConfiguredProviders } from '@/hooks/useConfiguredProviders';
-import type { AccessType } from '@/components/model/types';
 import { modelPrefs } from '@/lib/modelPreferences';
-import { SUBSCRIPTIONS, subscriptionKey } from '@/api/oauth';
-import { KeyOptionFields, KeyProviderList, ProviderTitle } from '@/components/modelAccess/KeyProviderPicker';
+import { subscriptionKey } from '@/api/oauth';
+import { KeyProviderList } from '@/components/modelAccess/KeyProviderPicker';
 import { ProviderChoices } from '@/components/modelAccess/ProviderChoices';
+import { SubscriptionChoices } from '@/components/modelAccess/SubscriptionChoices';
 import { QuietNote } from '@/components/modelAccess/parts';
-import { useKeyOption } from '@/components/modelAccess/useKeyOption';
-import { NO_FILTER, type KeyFilter, type KeyOption, type ProviderGroup } from '@/components/modelAccess/providerOptions';
-import { useProviderConnected, type LocationState } from './connectStep/shared';
-
-type Method = Exclude<AccessType, 'coding_plan'>;
-
-/**
- * A provider with more than one plan or region, before its key: the same
- * choice the Settings dialog offers, with the wizard's own buttons.
- */
-function KeyOptionsView({
-  group,
-  configured,
-  onBack,
-  onContinue,
-}: {
-  group: ProviderGroup;
-  configured: ReadonlySet<string>;
-  onBack: () => void;
-  onContinue: (option: KeyOption) => void;
-}) {
-  const { t } = useTranslation();
-  const headingId = useId();
-  const choice = useKeyOption(group, configured);
-  return (
-    <div>
-      <WizardStepHeader
-        titleId={headingId}
-        title={<ProviderTitle name={group.name} markProvider={group.markProvider} title={t('setup.connectTitle', { provider: group.name })} size="md" />}
-        helper={t('setup.providerOptionsHelper')}
-      />
-      <KeyOptionFields choice={choice} />
-      <SetupFooter
-        back={{ label: t('setup.back'), onClick: onBack }}
-        primary={{ label: t('setup.continue'), onClick: () => onContinue(choice.option) }}
-      />
-    </div>
-  );
-}
+import { NO_FILTER, startingOption, type KeyFilter, type ProviderGroup } from '@/components/modelAccess/providerOptions';
+import { useProviderConnected, type LocationState, type ProviderList } from './connectStep/shared';
 
 // ---------------------------------------------------------------------------
 // ProviderStep — Step 2: the provider, as Settings lists them
@@ -64,13 +27,9 @@ export default function ProviderStep() {
   const { t } = useTranslation();
   const headingId = useId();
 
-  // A coding plan is now a plan on the provider's own step; an older link
-  // that still names it lands on the key providers.
-  const routed = location.state as { method?: AccessType; group?: string } | null;
-  const asked = routed?.method ?? 'api_key';
-  const method: Method = asked === 'coding_plan' ? 'api_key' : asked;
+  const list: ProviderList = (location.state as LocationState | null)?.list ?? 'api_key';
 
-  const { keyGroups, localEntries, isLoading } = useProviderCatalog();
+  const { keyGroups, planGroups, localEntries, isLoading } = useProviderCatalog();
   const { preferences } = usePreferences();
   const { providers } = useConfiguredProviders();
   // What already works. A subscription that has to sign in again runs no turn,
@@ -80,9 +39,6 @@ export default function ProviderStep() {
     [providers],
   );
   const [filter, setFilter] = useState<KeyFilter>(NO_FILTER);
-  // Back from a key opens its provider's plans again, as in Settings.
-  const [pickedGroup, setPickedGroup] = useState<string | null>(routed?.group ?? null);
-  const picked = keyGroups.find((g) => g.group === pickedGroup && g.options.length > 1) ?? null;
 
   // The user's own providers, which the key method also offers.
   const userCustomProviders = useMemo(() => {
@@ -101,51 +57,33 @@ export default function ProviderStep() {
     else navigate('/setup/connect', { state });
   }, [configuredSet, connected, navigate]);
 
-  const openKeyOption = useCallback((group: ProviderGroup, option: KeyOption) => {
-    goOn({
-      method: 'api_key',
-      provider: option.provider,
-      displayName: group.name,
-      brandKey: option.entry.brand_key ?? option.entry.provider,
-    });
-  }, [goOn]);
-
-  const pickKeyGroup = useCallback((group: ProviderGroup) => {
-    if (group.options.length === 1) openKeyOption(group, group.options[0]);
-    else setPickedGroup(group.group);
-  }, [openKeyOption]);
+  // The key step opens on the region a key is saved for, and offers the
+  // rest. A coding plan's key form is reached from the subscriptions, which
+  // its Back returns to.
+  const pickKeyGroup = (from: ProviderList) => (group: ProviderGroup) => {
+    const option = startingOption(group, configuredSet);
+    goOn({ method: 'api_key', list: from, provider: option.provider, displayName: group.name, modelsFrom: option.models_from });
+  };
 
   // A definition saved before its key is not a connection: without a key it
   // goes on to model management without consuming the return, which then
   // happens from the Done step. Settings lists only connections, so its models
   // have never been picked.
   const pickCustom = useCallback((name: string) => {
-    const customState = { method, provider: name, displayName: name, brandKey: name };
+    const customState = { method: list, list, provider: name, displayName: name, modelsFrom: name };
     if (configuredSet.has(name)) connected(customState);
     else navigate('/setup/models', { state: { ...customState, justConnected: true } });
-  }, [method, configuredSet, connected, navigate]);
+  }, [list, configuredSet, connected, navigate]);
 
   const addCustom = useCallback(() => {
-    navigate('/setup/connect', { state: { method, isCustom: true } });
-  }, [navigate, method]);
+    navigate('/setup/connect', { state: { method: list, list, isCustom: true } });
+  }, [navigate, list]);
 
   if (isLoading) {
     return (
       <div className="flex items-center justify-center py-20">
         <Loader size={20} className="text-(--color-text-tertiary)" label={t('common.loading')} />
       </div>
-    );
-  }
-
-  if (picked) {
-    return (
-      <KeyOptionsView
-        key={picked.group}
-        group={picked}
-        configured={configuredSet}
-        onBack={() => setPickedGroup(null)}
-        onContinue={(option) => openKeyOption(picked, option)}
-      />
     );
   }
 
@@ -166,32 +104,29 @@ export default function ProviderStep() {
         titleId={headingId}
         title={t('setup.providerTitle')}
         helper={
-          method === 'oauth' ? t('setup.providerSubtitleOAuth')
-            : method === 'local' ? t('setup.providerSubtitleLocal')
+          list === 'oauth' ? t('setup.providerSubtitleOAuth')
+            : list === 'local' ? t('setup.providerSubtitleLocal')
             : t('setup.providerSubtitleApiKey')
         }
       />
       <div className="flex flex-col gap-4">
-        {method === 'oauth' && (
-          <ProviderChoices
-            entries={SUBSCRIPTIONS.map((s) => ({
-              provider: s.provider,
-              name: t(`modelAccess.${s.key}.name`),
-              note: t(`modelAccess.${s.key}.pickNote`),
-            }))}
+        {list === 'oauth' && (
+          <SubscriptionChoices
+            planGroups={planGroups}
             configured={configuredSet}
-            onPick={(p) => goOn({ method: 'oauth', provider: p, displayName: t(`modelAccess.${subscriptionKey(p)}.name`), brandKey: p })}
+            onPickSignIn={(p) => goOn({ method: 'oauth', list: 'oauth', provider: p, displayName: t(`modelAccess.${subscriptionKey(p)}.name`), modelsFrom: p })}
+            onPickPlan={pickKeyGroup('oauth')}
           />
         )}
 
-        {method === 'api_key' && (
+        {list === 'api_key' && (
           <>
             <KeyProviderList
               groups={keyGroups}
               filter={filter}
               onFilterChange={setFilter}
               configured={configuredSet}
-              onPick={pickKeyGroup}
+              onPick={pickKeyGroup('api_key')}
               compact
             />
             {userCustomProviders.length > 0 && (
@@ -210,7 +145,7 @@ export default function ProviderStep() {
           </>
         )}
 
-        {method === 'local' && (
+        {list === 'local' && (
           <>
             {localEntries.length === 0 ? (
               <QuietNote>{t('setup.noProviders')}</QuietNote>
@@ -220,7 +155,7 @@ export default function ProviderStep() {
                 configured={configuredSet}
                 onPick={(p) => {
                   const entry = localEntries.find((e) => e.provider === p);
-                  if (entry) goOn({ method: 'local', provider: p, displayName: entry.display_name, brandKey: entry.brand_key ?? p });
+                  if (entry) goOn({ method: 'local', list: 'local', provider: p, displayName: entry.display_name, modelsFrom: entry.brand_key ?? p });
                 }}
               />
             )}

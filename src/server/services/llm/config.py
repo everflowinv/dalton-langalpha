@@ -108,18 +108,25 @@ def system_default_models() -> dict[str, str]:
     }
 
 
-def deployment_key(provider_info: dict) -> str | None:
+def deployment_key(provider: str) -> str | None:
     """The deployment's own key for a provider, when a user's turn may run on it.
 
     Standalone, the server's keys are its user's, which is how the turns use
     them. In platform mode they are the platform's, which only a plan reaches.
+    Either way a turn takes one only for a manifest model naming the
+    provider itself, never for a model the user picked
+    (``resolve_model_client``) or one of another provider's rows, so a
+    provider with no rows of its own (a gateway, a plan offering its brand's)
+    gets none: listed as connected, its every pick would fail asking for a key.
     """
     import os
 
     from src.config.settings import HOST_MODE
+    from src.llms.llm import LLM as LLMFactory
 
-    env_key = provider_info.get("env_key")
-    if HOST_MODE != "oss" or not env_key:
+    mc = LLMFactory.get_model_config()
+    env_key = mc.get_provider_info(provider).get("env_key")
+    if HOST_MODE != "oss" or not env_key or not mc.runs_manifest_models(provider):
         return None
     return os.getenv(env_key) or None
 
@@ -163,7 +170,7 @@ def deployment_serves_default() -> bool:
         return False
     if info.get("access_type") == "local":
         return deployment_local_provider() is not None
-    return deployment_key(info) is not None
+    return deployment_key(provider) is not None
 
 
 # ---------------------------------------------------------------------------

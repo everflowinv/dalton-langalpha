@@ -14,7 +14,8 @@ import { cn } from '@/lib/utils';
 import { llmProviderArt } from '@/lib/brandArt';
 import { isImeComposing } from '@/lib/ime';
 import type { ModelConnection, ModelGroup } from '@/lib/modelGroups';
-import { isSubscription, payerLabel, type Payer } from '@/lib/modelPayer';
+import { isSubscription, type Payer } from '@/lib/modelPayer';
+import { usePayerLabel } from '@/hooks/usePayerLabel';
 import type { ModelMetadataEntry } from '@/hooks/useFilteredModels';
 import { ModelMark, MarkedModelName } from '@/components/model/ModelMark';
 import { PayerBadge } from '@/components/model/PayerBadge';
@@ -129,6 +130,7 @@ function ModelList({
   selectedModel, metadata, payers, groups, favorites, recent, onToggleFavorite, needsSignIn, onPick, onManage,
 }: ListProps & { onPick: (model: string) => void; onManage: () => void }) {
   const { t } = useTranslation();
+  const payerLabel = usePayerLabel();
   const [query, setQuery] = useState('');
   const [tab, setTab] = useState<string | null>(null);
   const [connectionTab, setConnectionTab] = useState<string | null>(null);
@@ -288,7 +290,7 @@ function ModelList({
                         'data-focus-visible:outline-current',
                       )}
                     >
-                      {c.payer ? payerLabel(t, c.payer) : t('chat.modelSelector.unbilled')}
+                      {c.payer ? payerLabel(c.payer) : t('chat.modelSelector.unbilled')}
                     </ToggleButton>
                   ))}
                 </ToggleButtonGroup>

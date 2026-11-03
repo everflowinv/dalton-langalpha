@@ -26,7 +26,7 @@ from .availability import (
     raise_oauth_reauth_required,
     raise_oauth_refresh_unavailable,
 )
-from .byok import byok_candidates, walk_byok_candidates
+from .byok import byok_candidates, call_endpoint, walk_byok_candidates
 from .user_models import ModelSource
 
 #: Providers that accept a request-time service tier. The rule had no owner:
@@ -149,16 +149,14 @@ async def _resolve_custom_model_byok(
         user_id, provider, mc, _byok_cache=_byok_cache, any_credential=True,
     )
     if byok_config:
-        base_url = byok_config.get("base_url") or mc.get_provider_info(holding).get("base_url")
-        # Rewrite ``provider`` to the candidate that actually held the key.
         # ``create_llm_from_custom`` reads SDK / default_headers /
-        # use_response_api from the provider field, so if a custom model
-        # tagged ``z-ai`` resolves via its ``z-ai-coding``
-        # sibling, we need the SDK to match the coding-plan endpoint —
-        # otherwise we'd build a GLM client pointed at an
-        # Anthropic-shaped URL and fail every request.
-        if holding != provider:
-            custom_config = {**custom_config, "provider": holding}
+        # use_response_api from the provider field, so it names the endpoint
+        # called: a GLM client pointed at an Anthropic-shaped URL fails every
+        # request.
+        endpoint = call_endpoint(provider, holding, mc, custom=True)
+        base_url = byok_config.get("base_url") or mc.get_provider_info(endpoint).get("base_url")
+        if endpoint != provider:
+            custom_config = {**custom_config, "provider": endpoint}
         return byok_config, base_url, custom_config
 
     return None, None, custom_config
@@ -311,11 +309,9 @@ async def resolve_byok_llm_client(
     if not byok_config:
         return None
     # base_url precedence: a user custom base_url on the holding slug wins;
-    # otherwise the MODEL'S OWN provider endpoint (NOT the parent's, NOT the
-    # candidate's). This is the coding-variant fix: a z-ai-coding model
-    # (anthropic SDK) whose key lives under parent `z-ai` (glm SDK)
-    # must still build against the anthropic coding endpoint.
-    base_url = byok_config.get("base_url") or mc.get_provider_info(provider).get("base_url")
+    # otherwise the endpoint ``call_endpoint`` picks.
+    endpoint = call_endpoint(provider, holding, mc, custom=False)
+    base_url = byok_config.get("base_url") or mc.get_provider_info(endpoint).get("base_url")
     logger.debug(
         f"[CHAT] Resolved BYOK client for system model={model_name} "
         f"provider={provider} key_held_by={holding} base_url={base_url or 'SDK default'}"

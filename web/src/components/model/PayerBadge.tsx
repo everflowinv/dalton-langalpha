@@ -1,7 +1,7 @@
 import type { ReactNode } from 'react';
-import { useTranslation } from 'react-i18next';
 import { cn } from '@/lib/utils';
-import { payerLabel, type Payer } from '@/lib/modelPayer';
+import type { Payer } from '@/lib/modelPayer';
+import { usePayerLabel } from '@/hooks/usePayerLabel';
 
 /** The small tag set beside a model or a setting's name. */
 export function NameTag({ children, className }: { children: ReactNode; className?: string }) {
@@ -21,7 +21,7 @@ export function PayerBadge({ payer, className }: {
   payer: Payer | undefined;
   className?: string;
 }) {
-  const { t } = useTranslation();
+  const label = usePayerLabel();
   if (!payer) return null;
-  return <NameTag className={className}>{payerLabel(t, payer)}</NameTag>;
+  return <NameTag className={className}>{label(payer)}</NameTag>;
 }

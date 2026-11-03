@@ -5,6 +5,7 @@ from src.llms.patches import (
     _patch_langchain_anthropic_input_transformations,
     _patch_langchain_anthropic_usage_metadata,
     _patch_langchain_openai_compaction_trigger,
+    _patch_langchain_openai_reasoning_status,
 )
 from src.llms.extension.dashscope import _install_responses_stream_bridge
 _patch_langchain_anthropic_usage_metadata()
@@ -13,6 +14,7 @@ _patch_langchain_anthropic_header_betas()
 _patch_langchain_anthropic_compaction_block()
 _patch_langchain_anthropic_input_transformations()
 _patch_langchain_openai_compaction_trigger()
+_patch_langchain_openai_reasoning_status()
 # Here rather than at first client construction: the bridge rewrites a module
 # global, so installing it lazily would let two workers disagree about whether
 # a Responses stream reports its reasoning, names its failures and keeps its

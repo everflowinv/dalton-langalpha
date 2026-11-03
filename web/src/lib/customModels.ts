@@ -4,9 +4,15 @@
  * untouched, so no writer can drop models it does not own.
  */
 import type { CustomModelEntry } from '@/components/model/types';
+import type { ConnectionOf } from '@/lib/providerCatalog';
 
-export function withoutProvider(all: readonly CustomModelEntry[], provider: string): CustomModelEntry[] {
-  return all.filter((m) => m.provider !== provider);
+/** Every entry but `provider`'s, those saved under another API of it included. */
+export function withoutProvider(
+  all: readonly CustomModelEntry[],
+  provider: string,
+  connectionOf: ConnectionOf,
+): CustomModelEntry[] {
+  return all.filter((m) => connectionOf(m.provider) !== provider);
 }
 
 /** `provider`'s entries become `next`; the rest keep their order. */
@@ -14,8 +20,9 @@ export function replaceProviderModels(
   all: readonly CustomModelEntry[],
   provider: string,
   next: readonly CustomModelEntry[],
+  connectionOf: ConnectionOf,
 ): CustomModelEntry[] {
-  return [...withoutProvider(all, provider), ...next];
+  return [...withoutProvider(all, provider, connectionOf), ...next];
 }
 
 /**
@@ -27,8 +34,9 @@ export function mergeProviderModels(
   all: readonly CustomModelEntry[],
   provider: string,
   batch: readonly CustomModelEntry[],
+  connectionOf: ConnectionOf,
 ): CustomModelEntry[] {
   const names = new Set(batch.map((m) => m.name));
-  const kept = all.filter((m) => m.provider === provider && !names.has(m.name));
-  return replaceProviderModels(all, provider, [...kept, ...batch]);
+  const kept = all.filter((m) => connectionOf(m.provider) === provider && !names.has(m.name));
+  return replaceProviderModels(all, provider, [...kept, ...batch], connectionOf);
 }
