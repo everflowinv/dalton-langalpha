@@ -4,7 +4,7 @@ One file of the ComputerManager split; see the package __init__."""
 
 import asyncio
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import datetime
@@ -35,6 +35,7 @@ from src.server.database.computer import (
     update_computer_activity,
     update_computer_status,
 )
+from src.server.database.computer_names import insert_under_free_name
 from src.server.database.home_workspace import get_home_workspace_id, is_home_row
 from src.server.database.workspace_folders import folder_allocation, takes_name_folders
 from src.server.database.workspace_names import HOME_FOLDER, candidate_dir_names
@@ -72,24 +73,6 @@ _HOME_BIND_ATTEMPTS = 3
 
 def default_computer_name(kind: str) -> str:
     return provider_class(kind).default_computer_name
-
-
-def next_default_computer_name(
-    kind: str, taken: Iterable[Optional[str]], *, base: Optional[str] = None
-) -> str:
-    """The kind's default name, or ``base``, numbered past the names in ``taken``.
-
-    Two kinds share "Cloud computer", so a user's second machine would
-    otherwise read the same as their first in every picker.
-    """
-    base = base or default_computer_name(kind)
-    used = {name.casefold() for name in taken if name}
-    if base.casefold() not in used:
-        return base
-    number = 2
-    while f"{base} {number}".casefold() in used:
-        number += 1
-    return f"{base} {number}"
 
 
 class MachineLifecycleMixin:
@@ -149,10 +132,13 @@ class MachineLifecycleMixin:
         is validated here so a bad one never reaches a row; ``config`` is the
         row's own facts, which no provider reads (an ssh Mac's model name);
         ``default_name`` is what an unnamed machine is called before numbering.
+        A ``name`` the user typed is theirs, so one their other computer has is
+        refused; a name nobody typed is numbered past the taken ones instead.
 
         Raises:
             ProviderNotOffered: ``kind`` is not one a new computer may run on.
             UnknownResourceTier: ``kind`` declares no ``resource_tier``.
+            ComputerNameTaken: another live computer of the user has ``name``.
         """
         kind = kind or self.config.sandbox.provider
         if kind not in self.config.sandbox.creatable_providers():
@@ -161,42 +147,48 @@ class MachineLifecycleMixin:
             settings = self._provider_settings(kind, provider_config)
             if resource_tier is not None and resource_tier not in settings.resource_tiers:
                 raise UnknownResourceTier("Unknown resource tier")
-        if not name:
-            name = next_default_computer_name(
-                kind,
-                (c.get("name") for c in await get_computers_for_user(user_id)),
-                base=default_name,
+
+        async def insert(chosen: str) -> Dict[str, Any]:
+            return await create_computer(
+                user_id,
+                kind=kind,
+                name=chosen,
+                is_primary=is_primary and may_be_primary(kind),
+                status=ComputerStatus.CREATING if prepare else ComputerStatus.STOPPED,
+                resource_tier=resource_tier or "standard",
+                root_dir=root_dir or self.config.filesystem.working_directory,
+                provider_config=provider_config,
+                config=config,
+                files_backup=files_backup,
             )
-        return await create_computer(
-            user_id,
-            kind=kind,
-            name=name,
-            is_primary=is_primary and may_be_primary(kind),
-            status=ComputerStatus.CREATING if prepare else ComputerStatus.STOPPED,
-            resource_tier=resource_tier or "standard",
-            root_dir=root_dir or self.config.filesystem.working_directory,
-            provider_config=provider_config,
-            config=config,
-            files_backup=files_backup,
-        )
+
+        if name:
+            return await insert(name)
+        base = (default_name or "").strip() or default_computer_name(kind)
+        return await insert_under_free_name(user_id, base, insert)
 
     async def ensure_primary_computer(
         self,
         user_id: str,
         *,
-        name: Optional[str] = None,
+        default_name: Optional[str] = None,
         resource_tier: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Reuse the primary computer to avoid paying for a sandbox per project.
 
         Creation is stopped until first start. A concurrent primary insert can
-        return a non-primary loser; tombstone that row rather than hand it out."""
+        return a non-primary loser; tombstone that row rather than hand it out.
+        ``default_name`` (the first project's) is numbered past the user's
+        other computers, since nobody typed it for a computer."""
         computer = await get_primary_computer(user_id)
         if computer is not None:
             return computer
 
         computer = await self.create_computer_for_user(
-            user_id, name=name, resource_tier=resource_tier, is_primary=True
+            user_id,
+            default_name=default_name,
+            resource_tier=resource_tier,
+            is_primary=True,
         )
         if computer.get("is_primary"):
             return computer
@@ -349,26 +341,33 @@ class MachineLifecycleMixin:
             # create_computer(). Give this attempt an identity of its own so
             # only the actual inserter may tombstone a later lost-bind row.
             candidate_id = str(uuid4()) if adopt_ref else None
-            computer = await create_computer(
-                user_id,
-                kind=kind,
-                name=workspace.get("name")
-                or default_computer_name(kind),
-                status=status
-                if status in ("running", "stopped") and adopt_ref
-                else "stopped",
-                provider_ref=adopt_ref,
-                resource_tier=workspace.get("resource_tier") or "standard",
-                # A kind that caps a sandbox's run cannot hold the flag.
-                is_always_on=bool(workspace.get("is_always_on"))
-                and provider_class(kind).holds_always_on,
-                platform_secret_version=int(
-                    workspace.get("platform_secret_version") or 0
-                ),
-                is_primary=may_be_primary(kind),
-                root_dir=root_dir,
-                computer_id=candidate_id,
-                origin_workspace_id=workspace_id if adopt_ref else None,
+
+            async def insert(name: str) -> Dict[str, Any]:
+                return await create_computer(
+                    user_id,
+                    kind=kind,
+                    name=name,
+                    status=status
+                    if status in ("running", "stopped") and adopt_ref
+                    else "stopped",
+                    provider_ref=adopt_ref,
+                    resource_tier=workspace.get("resource_tier") or "standard",
+                    # A kind that caps a sandbox's run cannot hold the flag.
+                    is_always_on=bool(workspace.get("is_always_on"))
+                    and provider_class(kind).holds_always_on,
+                    platform_secret_version=int(
+                        workspace.get("platform_secret_version") or 0
+                    ),
+                    is_primary=may_be_primary(kind),
+                    root_dir=root_dir,
+                    computer_id=candidate_id,
+                    origin_workspace_id=workspace_id if adopt_ref else None,
+                )
+
+            # Named after the project, which nobody typed for a computer, so
+            # one of the user's computers holding it numbers it instead.
+            computer = await insert_under_free_name(
+                user_id, workspace.get("name") or default_computer_name(kind), insert
             )
             if adopt_ref:
                 minted_here = str(computer.get("computer_id")) == candidate_id

@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Collection, Mapping, Sequence
 from datetime import date, datetime, time, timezone as dt_timezone
 from decimal import Decimal
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from ptc_agent.agent.middleware.runtime_context.epoch import MACHINE_PHRASES
 from src.server.database.automation_executions import list_settled_since
 from src.server.database.conversation.threads_read import get_recent_threads_for_user
 from src.server.database.portfolio import get_user_portfolio
@@ -23,7 +25,7 @@ from src.server.database.workspace import get_workspaces_for_user
 from src.server.services.thread_lifecycle import project_lifecycle
 from src.tools.secretary.utils import (
     ComputerPlacement,
-    read_computer_placement,
+    PlacedComputer,
     user_zone,
 )
 
@@ -36,6 +38,28 @@ HOLDINGS = 20
 
 _EXCERPT_CHARS = 160
 _TITLE_CHARS = 80
+# A path is copied into a call, so it is never cut short.
+_PATH_CHARS = 4096
+# Nor is a computer's name, which a call passes back as `computer`: the
+# column holds 255.
+_NAME_CHARS = 255
+
+_OWN_MACHINE = (
+    "On a machine of the user's own, everything outside its root and "
+    "`~/.langalpha` (the Python and tools commands run with) is the user's: "
+    "their files, apps, settings and sign-ins. Open or change anything there, "
+    "or act with their sign-ins, only when the user asks you to."
+)
+_STOPPED = (
+    "A call on a stopped computer starts it first, which delays that call, "
+    "and the computer then stays on until it is idle again. Tell the user when "
+    "a call of yours starts one."
+)
+_MAC_TOOLS = (
+    "A Mac's command line tools are not GNU's: `sed -i` needs `''`, and "
+    "`date -d`, `grep -P`, `stat -c`, `find -printf` and `timeout` don't "
+    "exist. Its bash may be version 3.2, without `declare -A` or `mapfile`."
+)
 
 # The read sits on the turn's critical path, beside the agent build.
 _READ_TIMEOUT_S = 2.0
@@ -62,18 +86,25 @@ _RUN_FAILURE = {
 
 
 async def read_activity(
-    user_id: str, *, home_id: str, thread_id: str | None, timezone: str
+    user_id: str,
+    *,
+    home_id: str,
+    thread_id: str | None,
+    timezone: str,
+    computers: Sequence[Mapping[str, Any]],
 ) -> str | None:
     """The ``<activity>`` text, or None when a read did not answer or render.
 
     None rather than a partial block: the baseline reads None as a source that
     has not answered and asks again next turn, where a partial block would
     freeze as the truth and file a row once the missing part came back.
+    ``computers`` is the roster the build read once for this block and for
+    its tools, so the block never names a computer the tools cannot take.
     """
     zone = user_zone(timezone)
     today = _now().astimezone(zone).date()
     try:
-        (workspaces, total), threads, runs, holdings, placement = await asyncio.wait_for(
+        (workspaces, total), threads, runs, holdings = await asyncio.wait_for(
             asyncio.gather(
                 get_workspaces_for_user(
                     user_id, limit=RECENT_WORKSPACES, sort_by="recent"
@@ -87,7 +118,6 @@ async def read_activity(
                     limit=AUTOMATION_RUNS,
                 ),
                 get_user_portfolio(user_id),
-                read_computer_placement(user_id),
             ),
             timeout=_READ_TIMEOUT_S,
         )
@@ -110,7 +140,7 @@ async def read_activity(
             runs=runs,
             holdings=holdings,
             home_id=home_id,
-            placement=placement,
+            placement=ComputerPlacement.from_rows(computers),
             zone=zone,
             today=today,
             colleague_workspaces=colleague_workspaces,
@@ -142,6 +172,8 @@ def render_activity(
     neither.
     """
     sections: list[str] = []
+    if placement.computers:
+        sections.append(_computers_section(placement.computers.values()))
     if workspaces:
         sections.append(
             "\n".join(
@@ -198,6 +230,44 @@ def render_activity(
     return "\n\n".join(sections)
 
 
+def _computers_section(computers: Collection[PlacedComputer]) -> str:
+    """The user's computers, for the ``computer`` the machine tools take, with
+    what working on one of the user's own machines asks of the agent: what an
+    analyst there is told about it (``ANALYST_MACHINE``, ``MAC_TOOLS``). Home's
+    own computer is left out of those lines: ``<workspace>`` already says them
+    of it (``HOME_MACHINE``, ``MAC_TOOLS``)."""
+    lines = [
+        "The user's computers. To work on another one, pass its name as "
+        "`computer` to Bash, ExecuteCode, Read, Write, Edit, Glob or Grep. "
+        "Paths there are that machine's own: write them whole. Without "
+        "`computer`, the tools run in Home:",
+        *(_computer_line(c) for c in computers),
+    ]
+    if any(c.state == "stopped" for c in computers):
+        lines.append(_STOPPED)
+    others = [c for c in computers if not c.is_home]
+    if any(c.machine for c in others):
+        lines.append(_OWN_MACHINE)
+    if any(c.machine.endswith("_mac") for c in others):
+        lines.append(_MAC_TOOLS)
+    return "\n".join(lines)
+
+
+def _computer_line(computer: PlacedComputer) -> str:
+    facts = []
+    if computer.is_home:
+        facts.append("where you run, in Home")
+    if phrase := MACHINE_PHRASES.get(computer.machine):
+        facts.append(phrase)
+    if computer.root:
+        facts.append(f"root `{_path_text(computer.root)}`")
+    if computer.state == "stopped":
+        facts.append("stopped")
+    elif computer.state == "failed":
+        facts.append("failed: the user repairs or rebuilds it in Computers")
+    return f'- "{_one_line(computer.name, _NAME_CHARS)}" ({", ".join(facts)})'
+
+
 def _workspace_line(
     ws: dict[str, Any], placement: ComputerPlacement, zone: ZoneInfo
 ) -> str:
@@ -208,11 +278,13 @@ def _workspace_line(
     if active:
         facts.append(f"last active {_date(active, zone)}")
     if computer := placement.computer(ws):
-        facts.append(f'computer "{_one_line(computer, _TITLE_CHARS)}"')
+        facts.append(f'computer "{_one_line(computer, _NAME_CHARS)}"')
     if machine := placement.machine(ws):
         facts.append(machine)
-    if folder := placement.folder(ws):
-        facts.append(f"folder `{_one_line(folder, _TITLE_CHARS)}`")
+    if path := placement.path(ws):
+        facts.append(f"folder `{_path_text(path)}`")
+    elif folder := ws.get("dir_name"):
+        facts.append(f"folder `{_path_text(folder)}`")
     facts.append(f"workspace_id `{ws['workspace_id']}`")
     return f"- {name}{f': {described}' if described else ''} ({', '.join(facts)})"
 
@@ -318,6 +390,18 @@ def _number(value: Any) -> str:
 
 def _date(value: datetime, zone: ZoneInfo) -> str:
     return value.astimezone(zone).date().isoformat()
+
+
+def _path_text(value: Any) -> str:
+    """A path the agent passes back whole, so it reads as the machine spells
+    it: its spaces stay, since two in a row name another folder, and so do its
+    angle brackets, which no tool decodes. Only ``</``, which could close the
+    block early, is escaped; a folder's name holds no slash, so only a root
+    that holds it, or ends in ``<`` before a folder, ever needs it, and such a
+    path is the one the agent cannot pass back as written. A line break, which
+    a line here cannot hold, reads as a space."""
+    text = " ".join(str(value or "").splitlines())[:_PATH_CHARS]
+    return text.replace("</", "&lt;/")
 
 
 def _one_line(value: Any, cap: int) -> str:

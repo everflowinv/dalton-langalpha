@@ -7,7 +7,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone as dt_timezone
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 from urllib.parse import quote, unquote
 from zoneinfo import ZoneInfo
 
@@ -465,6 +465,12 @@ def user_zone(name: str) -> ZoneInfo:
         return ZoneInfo("UTC")
 
 
+def spoken_computer_name(name: str | None) -> str:
+    """A computer's name as an agent reads it, and so as it passes the name
+    back as ``computer``: on one line, and never cut short."""
+    return " ".join((name or "").split()) or "Untitled"
+
+
 def computer_label(name: str | None, computers: int) -> str | None:
     """What an agent is told a computer is called, out of ``computers`` live ones.
 
@@ -473,7 +479,24 @@ def computer_label(name: str | None, computers: int) -> str | None:
     """
     if name is None or computers < 2:
         return None
-    return name.strip() or "Untitled"
+    return spoken_computer_name(name)
+
+
+def computer_state(
+    kind: str | None, status: str | None
+) -> Literal["", "stopped", "failed"]:
+    """What a call on a computer meets before it runs, as the agent is told.
+
+    "stopped" for a hosted computer that is down or going down, which the call
+    starts first. A machine of the user's own reads as nothing there: its
+    status is only whether our processes run on it, and reaching it connects.
+    "failed" for one in error, which no call starts.
+    """
+    if status == "error":
+        return "failed"
+    if kind != "ssh" and status in ("stopped", "stopping"):
+        return "stopped"
+    return ""
 
 
 def computer_machine(
@@ -494,42 +517,66 @@ def computer_machine(
 
 
 @dataclass(frozen=True, slots=True)
+class PlacedComputer:
+    """One of the user's computers, as the Chief of Staff is told of it."""
+
+    name: str
+    #: ``computer_machine``'s token: "" for a hosted computer.
+    machine: str
+    #: Where its workspace folders sit, and where a call on it starts.
+    root: str
+    is_home: bool
+    #: ``computer_state``'s word for it: "" when a call there just runs.
+    state: Literal["", "stopped", "failed"] = ""
+
+
+@dataclass(frozen=True, slots=True)
 class ComputerPlacement:
     """Which computer each of the user's workspaces is on, as the Chief of Staff is told.
 
-    A folder is named only on Home's computer, the one whose folders the Chief
-    of Staff reads: a workspace on another computer keeps its folder there, so
-    naming it would send a read or a link to a path Home lacks.
+    Every workspace names its folder, which sits at the root of its computer:
+    the Chief of Staff's tools reach any of the user's computers. With more
+    than one, each workspace names its computer too, and ``computers`` holds
+    them by id in the roster's order, primary first; with one it is empty.
     """
 
-    home_computer_id: str | None = None
-    names: Mapping[str, str] = field(default_factory=dict)
-    machines: Mapping[str, str] = field(default_factory=dict)
+    computers: Mapping[str, PlacedComputer] = field(default_factory=dict)
 
     @classmethod
     def from_rows(cls, rows: Sequence[Mapping[str, Any]]) -> "ComputerPlacement":
-        names = {
-            str(row["computer_id"]): label
-            for row in rows
-            if (label := computer_label(row["name"], len(rows))) is not None
-        }
-        machines = {
-            str(row["computer_id"]): computer_machine(
-                row.get("kind"), row.get("provider_config")
-            )
-            for row in rows
-        }
-        home = next((str(row["computer_id"]) for row in rows if row["is_home"]), None)
-        return cls(home_computer_id=home, names=names, machines=machines)
+        return cls(
+            {
+                str(row["computer_id"]): PlacedComputer(
+                    name=name,
+                    machine=computer_machine(row.get("kind"), row.get("provider_config")),
+                    root=row["root_dir"],
+                    is_home=bool(row["is_home"]),
+                    # Home's computer is being started for the turn that reads this.
+                    state=""
+                    if row["is_home"]
+                    else computer_state(row.get("kind"), row.get("status")),
+                )
+                for row in rows
+                if (name := computer_label(row["name"], len(rows))) is not None
+            }
+        )
 
-    def folder(self, workspace: Mapping[str, Any]) -> str | None:
-        # With Home on no computer nothing matches, since str() is never None.
-        if str(workspace.get("computer_id")) != self.home_computer_id:
+    def _placed(self, workspace: Mapping[str, Any]) -> PlacedComputer | None:
+        return self.computers.get(str(workspace.get("computer_id")))
+
+    def path(self, workspace: Mapping[str, Any]) -> str | None:
+        """The folder's whole path when the workspace is on another computer
+        than Home's: a call there takes that machine's own paths, and its
+        root is not one the agent can guess."""
+        placed = self._placed(workspace)
+        folder = workspace.get("dir_name")
+        if placed is None or placed.is_home or not folder:
             return None
-        return workspace.get("dir_name")
+        return f"{placed.root.rstrip('/')}/{folder}"
 
     def computer(self, workspace: Mapping[str, Any]) -> str | None:
-        return self.names.get(str(workspace.get("computer_id")))
+        placed = self._placed(workspace)
+        return placed.name if placed else None
 
     def machine(self, workspace: Mapping[str, Any]) -> str | None:
         """What sets the workspace's computer apart when it is the user's own.
@@ -537,19 +584,19 @@ class ComputerPlacement:
         Said only beside the computer's name: with one computer, Home's own
         block says whose it is.
         """
-        if self.computer(workspace) is None:
+        placed = self._placed(workspace)
+        if placed is None or not placed.machine:
             return None
-        machine = self.machines.get(str(workspace.get("computer_id")), "")
-        if machine.endswith("_mac"):
+        if placed.machine.endswith("_mac"):
             return "the user's own Mac"
-        return "the user's own machine" if machine else None
+        return "the user's own machine"
 
 
 async def read_computer_placement(user_id: str) -> ComputerPlacement:
     # Local import: this module loads at agent import time.
-    from src.server.database.computer import get_computer_names_and_home
+    from src.server.database.computer import get_computer_roster
 
-    return ComputerPlacement.from_rows(await get_computer_names_and_home(user_id))
+    return ComputerPlacement.from_rows(await get_computer_roster(user_id))
 
 
 def _run_block(run: dict[str, Any], text: str, zone: ZoneInfo) -> str:

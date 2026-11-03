@@ -8,6 +8,7 @@ This module creates a PTC agent that:
 """
 
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from functools import partial
 from typing import Any
@@ -32,6 +33,7 @@ from ptc_agent.agent.middleware import (
     MultimodalMiddleware,
     MultimodalStripMiddleware,
     CodeValidationMiddleware,
+    ComputerArgumentGuardMiddleware,
     CreditGateMiddleware,
     EmptyToolCallRetryMiddleware,
     LeakDetectionMiddleware,
@@ -131,6 +133,12 @@ from ptc_agent.agent.tools import (
     create_preview_url_tool,
     create_show_widget_tool,
     TodoWrite,
+)
+from ptc_agent.agent.tools.computer_reach import (
+    REACHABLE_TOOLS,
+    ComputerReach,
+    ComputerTarget,
+    ComputerTools,
 )
 from src.tools.web.search import get_web_search_tool
 from src.tools.web.fetch import web_fetch_tool
@@ -284,6 +292,7 @@ class PTCAgent:
         # DALTON-HOOK(colleague-dispatch): workspace owner identity and tail-turn tool trimming
         workspace_owner_id: str | None = None,
         tail_turn_no_new_work: bool = False,
+        computers: ComputerReach | None = None,
     ) -> Any:
         """Create a deepagent with PTC pattern capabilities.
 
@@ -332,6 +341,9 @@ class PTCAgent:
             cancel_notices: The user's cancels of wakeups on this thread,
                 read before every call. None for a build with no thread row
                 to read, which tells the agent of none.
+            computers: The user's other computers, which the Chief of Staff's
+                own Bash, ExecuteCode and file tools take a ``computer`` to run
+                on. None leaves every tool on this computer.
 
         Returns:
             Configured BackgroundSubagentOrchestrator wrapping the deepagent.
@@ -575,6 +587,7 @@ class PTCAgent:
                 # a repeat reaches none of them.
                 RepeatCallGuardMiddleware(),
                 ToolArgumentParsingMiddleware(),
+                ComputerArgumentGuardMiddleware(),
                 ProtectedPathMiddleware(
                     denied_directories=self.config.filesystem.denied_directories,
                 ),
@@ -782,6 +795,44 @@ class PTCAgent:
 
         tools: list[Any] = [execute_code_tool, bash_tool, *shared_tools]
 
+        def tools_on(target: ComputerTarget) -> dict[str, Any]:
+            """The machine tools over another computer's session. Each command
+            is still this thread's, so it hands off to it; the mount serves
+            it the computer's root, which is no workspace's folder."""
+            there = SandboxBackend(target.sandbox, operation_callback=operation_callback)
+            there_call = CallContext(
+                workspace_id=None, thread_id=thread_id, timezone=call_context.timezone
+            )
+            machine = {
+                "thread_id": short_thread_id,
+                "session": target.session,
+                "call_context": there_call,
+                "file_tools_only": file_tools_only,
+                "hand_off": (
+                    replace(hand_off, computer=target.name, computer_id=target.computer_id)
+                    if hand_off is not None
+                    else None
+                ),
+            }
+            built = [
+                create_execute_code_tool(there, mcp_registry, **machine),
+                create_execute_bash_tool(there, **machine),
+                *create_filesystem_tools(there, operation_callback=operation_callback),
+                create_glob_tool(there),
+                create_grep_tool(there),
+            ]
+            return {tool.name: tool for tool in built}
+
+        # Only the Chief of Staff's own: a subagent's tools stay on this
+        # computer, as an analyst's do.
+        reach = computers if role == "chief_of_staff" else None
+        if reach is not None:
+            computer_tools = ComputerTools(reach, tools_on, sandbox)
+            tools = [
+                computer_tools.wrap(tool) if tool.name in REACHABLE_TOOLS else tool
+                for tool in tools
+            ]
+
         if role == "chief_of_staff":
             from src.tools.secretary.approvals import StandingApprovalMiddleware
 
@@ -889,7 +940,7 @@ class PTCAgent:
 
         model_resilience = [build_model_resilience_middleware(self.config, turn)]
 
-        multimodal_read = MultimodalMiddleware(sandbox=sandbox)
+        multimodal_read = MultimodalMiddleware(sandbox=sandbox, computers=reach)
 
         # Placed before (outer to) model_resilience so sandbox images are
         # captured once, on the final response only — not per retry attempt.
@@ -1051,7 +1102,7 @@ class PTCAgent:
         # Messaging the user (send_message, list_message_targets), present only
         # when a channel gateway is configured. Main agent only, added after the
         # subagent snapshot: a subagent reports to its parent, never to a person.
-        tools.extend(build_messaging_tools(role))
+        tools.extend(build_messaging_tools(role, computers=reach))
 
         # The agent's own follow-ups on this thread, main agent only and
         # added after the subagent snapshot: a wakeup comes back to the

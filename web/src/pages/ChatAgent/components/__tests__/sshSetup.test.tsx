@@ -33,6 +33,7 @@ import {
   connectSshPairing,
   createSshPairing,
   getComputerProviders,
+  getComputers,
   getSshKey,
   getSshPairing,
   probeSsh,
@@ -45,10 +46,11 @@ const mockStatus = getSshPairing as Mock;
 const mockConnect = connectSshPairing as Mock;
 const mockProbe = probeSsh as Mock;
 const mockKey = getSshKey as Mock;
+const mockComputers = getComputers as Mock;
 
 const DAYTONA_AND_SSH: ComputerProviderOption[] = [
-  { kind: 'daytona', is_default: true, allowed: null },
-  { kind: 'ssh', is_default: false, allowed: null },
+  { kind: 'daytona', is_default: true, allowed: null, default_name: 'Cloud computer' },
+  { kind: 'ssh', is_default: false, allowed: null, default_name: 'SSH computer' },
 ];
 
 const pairing = (token: string) => ({
@@ -95,6 +97,7 @@ async function pickSsh(user: ReturnType<typeof userEvent.setup>) {
 beforeEach(() => {
   vi.clearAllMocks();
   mockProviders.mockResolvedValue({ providers: DAYTONA_AND_SSH });
+  mockComputers.mockResolvedValue({ computers: [] });
   mockMint.mockResolvedValue(pairing('tok1'));
   mockStatus.mockResolvedValue(status({}));
   mockKey.mockResolvedValue({
@@ -143,17 +146,18 @@ describe('pairing', () => {
     const summary = await screen.findByTestId('ssh-ready');
     expect(within(summary).getByText('me@198.51.100.7')).toBeInTheDocument();
     expect(within(summary).getByText('Ubuntu 24.04 · x86_64 · sudo available')).toBeInTheDocument();
-    // The summary has no name of its own: the top field shows the hostname as its default.
+    // The summary has no name of its own: the top field holds the hostname, the name it gets.
     expect(within(summary).queryByRole('textbox', { name: /^Name/ })).not.toBeInTheDocument();
-    const top = screen.getByRole('textbox', { name: /^Name/ });
-    expect(top).toHaveValue('');
-    expect(top).toHaveAttribute('placeholder', 'devbox');
+    const top = screen.getByRole('textbox', { name: 'Name' });
+    expect(top).toHaveValue('devbox');
     expect(within(summary).getByText('Workspaces go in /home/me/langalpha.')).toBeInTheDocument();
     expect(within(summary).getByText('Host key SHA256:abc123')).toBeInTheDocument();
 
+    // The name the field holds is the server's own, so it goes unsent: the
+    // server numbers past a computer that took it meanwhile, which a name sent
+    // would be refused for.
     await user.click(screen.getByRole('button', { name: 'Add computer' }));
     expect(onSubmit).toHaveBeenCalledWith({
-      name: 'devbox',
       resource_tier: 'standard',
       kind: 'ssh',
       ssh: {
@@ -387,13 +391,14 @@ describe('by hand', () => {
     expect(within(summary).getByText('me@203.0.113.10:2222')).toBeInTheDocument();
     expect(within(summary).getByText('Connecting as root.')).toBeInTheDocument();
     // No hostname: the name falls back to the host.
-    expect(screen.getByRole('textbox', { name: /^Name/ })).toHaveAttribute('placeholder', '203.0.113.10');
+    expect(screen.getByRole('textbox', { name: /^Name/ })).toHaveValue('203.0.113.10');
 
+    // The server falls back to the host the same way, so no name is sent.
     await user.click(screen.getByRole('button', { name: 'Add computer' }));
     expect(onSubmit).toHaveBeenCalledWith(expect.objectContaining({
-      name: '203.0.113.10',
       ssh: expect.objectContaining({ host: '203.0.113.10', port: 2222, username: 'me' }),
     }));
+    expect(onSubmit.mock.calls[0][0]).not.toHaveProperty('name');
   });
 
   it('goes back to the form with the address kept when the user picks a different machine', async () => {
@@ -448,5 +453,42 @@ describe('by hand', () => {
     expect(screen.getByText(pairing('tok1').command)).toBeInTheDocument();
     // The pairing minted on the way in is kept, not replaced.
     await waitFor(() => expect(mockMint).toHaveBeenCalledTimes(1));
+  });
+});
+
+
+describe('the name it gets', () => {
+  it('numbers the hostname past a computer that has it, and follows the source until the user types', async () => {
+    mockStatus.mockResolvedValue(READY);
+    mockComputers.mockResolvedValue({ computers: [{ computer_id: 'c1', name: 'DevBox' }, { computer_id: 'c2', name: 'Cloud computer' }] });
+    const user = userEvent.setup();
+    open();
+    const field = await screen.findByRole('textbox', { name: 'Name' });
+    await waitFor(() => expect(field).toHaveValue('Cloud computer 2'));
+
+    await pickSsh(user);
+    await screen.findByTestId('ssh-ready');
+    expect(screen.getByRole('textbox', { name: 'Name' })).toHaveValue('devbox 2');
+  });
+
+  it('sends a typed name, and none once the field is cleared', async () => {
+    mockStatus.mockResolvedValue(READY);
+    const user = userEvent.setup();
+    const onSubmit = open();
+    await pickSsh(user);
+    await screen.findByTestId('ssh-ready');
+    const field = screen.getByRole('textbox', { name: 'Name' });
+
+    // Focusing selects the suggestion, so typing replaces it.
+    await user.click(field);
+    await user.keyboard('Lab box');
+    expect(field).toHaveValue('Lab box');
+    await user.click(screen.getByRole('button', { name: 'Add computer' }));
+    expect(onSubmit.mock.calls[0][0]).toHaveProperty('name', 'Lab box');
+
+    await user.clear(field);
+    expect(field).toHaveAttribute('placeholder', 'devbox');
+    await user.click(screen.getByRole('button', { name: 'Add computer' }));
+    expect(onSubmit.mock.calls[1][0]).not.toHaveProperty('name');
   });
 });

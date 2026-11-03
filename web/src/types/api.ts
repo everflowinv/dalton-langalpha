@@ -427,6 +427,9 @@ export interface ComputerProviderOption {
   /** The sizes it offers, smallest first, from its server config. Empty for a
    *  machine the user sizes; absent from an older server, which is unknown. */
   tiers?: ComputerTierSpec[];
+  /** What a computer created here unnamed is called, before numbering; absent
+   *  from an older server. */
+  default_name?: string;
 }
 
 /** One size a provider offers, as its server config defines it. */

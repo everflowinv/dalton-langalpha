@@ -8,7 +8,7 @@ The absolute spelling still travels, as ``sandbox_path``.
 """
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -70,3 +70,30 @@ async def test_a_failed_operation_reports_the_same_pair():
     assert event["status"] == "failed"
     assert event["payload"]["file_path"] == "report.md"
     assert event["payload"]["sandbox_path"] == f"{WORK_DIR}/report.md"
+
+
+@pytest.mark.asyncio
+async def test_a_write_naming_another_computer_makes_no_card_and_skips_the_agent_md_hook():
+    """What it wrote is on that computer, so neither the card nor the hook
+    may take `agent.md` for the workspace's own."""
+    hook = Mock()
+    mw = FileOperationMiddleware(work_dir=WORK_DIR, on_agent_md_write=hook)
+    events = []
+    request = SimpleNamespace(
+        tool_call={
+            "name": "Write",
+            "id": "call-1",
+            "args": {"file_path": "agent.md", "content": "x\n", "computer": "Studio Mac"},
+        }
+    )
+    with patch(
+        "ptc_agent.agent.middleware.file_operations.sse_middleware.get_stream_writer",
+        return_value=events.append,
+    ):
+        async def handler(_request):
+            return "ok"
+
+        assert await mw.awrap_tool_call(request, handler) == "ok"
+
+    assert events == []
+    hook.assert_not_called()

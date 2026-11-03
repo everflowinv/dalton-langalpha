@@ -13,6 +13,7 @@ import structlog
 
 from ptc_agent.core.paths import (
     lexical_path,
+    machine_path,
     resolve_agent_path,
     virtual_agent_path,
 )
@@ -51,6 +52,8 @@ def normalize_path(
     itself is ``paths.resolve_agent_path``, shared with the pinned backend.
     """
     ctx = _ambient_project(project)
+    if ctx is not None and ctx.machine is not None:
+        return machine_path(path, base=_project_base(sandbox, project), home=ctx.machine.home)
     return resolve_agent_path(
         path,
         workspace=_project_base(sandbox, project),
@@ -65,6 +68,9 @@ def virtualize_path(
     sandbox: "PTCSandbox", path: str, project: ProjectContext | None = None
 ) -> str:
     """Convert real sandbox path to the virtual spelling the agent sees."""
+    ctx = _ambient_project(project)
+    if ctx is not None and ctx.machine is not None:
+        return lexical_path(path)
     return virtual_agent_path(
         path, workspace=_project_base(sandbox, project), root=sandbox._work_dir
     )
@@ -114,6 +120,14 @@ def validate_path(
         ):
             return False
 
+    # A computer reached from Home whose file calls run as its commands do:
+    # the whole machine, as a command there reaches it. An unexpanded
+    # ``~user`` is still refused.
+    ctx = _ambient_project(project)
+    machine = ctx.machine if ctx is not None else None
+    if machine is not None and machine.home and normalized_path.startswith("/"):
+        return True
+
     # Check against allowed directories
     for allowed_dir in sandbox.config.filesystem.allowed_directories:
         # Exact match or path within allowed directory
@@ -155,6 +169,9 @@ def _normalize_search_path(sandbox: "PTCSandbox", path: str) -> str:
     machine a host-side inspection means to search.
     """
     base = _project_base(sandbox, None)
+    ctx = current_project()
+    if ctx is not None and ctx.machine is not None:
+        return machine_path(path, base=base, home=ctx.machine.home)
     if path == ".":
         return base
     if not path.startswith("/"):

@@ -19,6 +19,7 @@ from ptc_agent.core.session import Session
 
 from src.observability import safe_add, workspace_created
 from src.server.database.computer import (
+    DEFAULT_ROOT_DIR,
     get_computer,
     get_computer_for_workspace,
     get_computers_by_status,
@@ -44,6 +45,7 @@ from src.server.database.workspace import (
     workspace_is_moving,
 )
 from src.server.database.workspace_folders import (
+    FOLDER_LAYOUT_VERSION,
     WorkspaceFolderMoving,
     is_top_level,
     workspace_folder_in_use,
@@ -137,7 +139,7 @@ class WorkspaceManager(ComputerManager):
             computer = await self._chosen_computer(user_id, computer_id)
         else:
             computer = await self.ensure_primary_computer(
-                user_id, name=name, resource_tier=resource_tier
+                user_id, default_name=name, resource_tier=resource_tier
             )
         # Never had a sandbox and one is being built. A workspace placed on it
         # now would make its first request wait out that build, so it waits here.
@@ -283,6 +285,50 @@ class WorkspaceManager(ComputerManager):
                 "This workspace's folder is being moved. Try again in a moment."
             ) from e
         return session
+
+    async def reach_computer(self, computer_id: str, *, user_id: str) -> Session:
+        """This worker's session on a computer Home's agent works on from its
+        root, started if it is down. The caller checks the user owns it.
+
+        A workspace's acquire also keeps the machine's data token and moves
+        the folders owed a rename; this does both, and restores the folders
+        still owed their files, since the agent reads every folder there
+        without opening each workspace.
+        """
+        session = await self.wake_computer(computer_id, user_id=user_id)
+        sandbox = session.sandbox
+        computer = await get_computer(computer_id)
+        if sandbox is None or sandbox.runtime is None or computer is None:
+            raise RuntimeError(f"Computer {computer_id} has no sandbox to run on")
+        runtime = sandbox.runtime
+        binding = self._binding_from_computer("", computer)
+        await self._keep_data_token(computer_id, user_id, sandbox)
+        await self._settle_folders(computer_id, runtime, root=binding.root_dir)
+        await self.restore_owed_folders(session, binding)
+        if (computer.get("layout_version") or 0) >= FOLDER_LAYOUT_VERSION:
+            # Below it the root is still one workspace's own folder.
+            await self._prune_root_thread_dirs(runtime, binding.root_dir, user_id)
+        return session
+
+    @staticmethod
+    async def _prune_root_thread_dirs(runtime: Any, root: str | None, user_id: str) -> None:
+        """Remove the dirs a deleted Home thread left at a computer's root.
+
+        Home's commands on a computer it reaches keep their logs and scripts
+        in thread dirs at the root, where no workspace's bring-up looks, so
+        they are judged here against Home's threads. Never fails the reach.
+        """
+        from ptc_agent.core.paths import SandboxLayout
+        from src.server.database.home_workspace import get_home_workspace_id
+        from src.server.services.computer_manager import _thread_dirs
+
+        try:
+            layout = SandboxLayout.for_root(root or DEFAULT_ROOT_DIR).for_workspace(None)
+            await _thread_dirs.prune_dead_thread_dirs(
+                runtime, layout, get_home_workspace_id(user_id)
+            )
+        except Exception as e:  # noqa: BLE001 - the next reach prunes again
+            logger.warning(f"Could not prune Home's thread dirs at {root}: {e}")
 
     async def get_session_if_running(
         self, workspace_id: str, user_id: str | None = None

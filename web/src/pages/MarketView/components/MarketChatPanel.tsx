@@ -24,7 +24,7 @@ import { ChartSurfaceContext, type ChartSurface } from '../../ChatAgent/contexts
 import { WorkspaceProvider } from '../../ChatAgent/contexts/WorkspaceContext';
 import { computerFolders } from '../../ChatAgent/utils/agentPaths';
 import { useChatMessages } from '../../ChatAgent/hooks/useChatMessages';
-import { useComputerRootDir } from '../../ChatAgent/hooks/useComputers';
+import { useComputerRoots } from '../../ChatAgent/hooks/useComputers';
 import { useThreadModel } from '../../ChatAgent/hooks/useThreadModel';
 import { useThreadSubagents } from '../../ChatAgent/hooks/useThreadSubagents';
 import { useThreadTuning } from '../../ChatAgent/hooks/useThreadTuning';
@@ -157,9 +157,10 @@ function MarketChatScope(props: MarketChatPanelProps): React.ReactElement {
   // does Home's cached row, which can predate the turn that gave Home its folder.
   const { data: activeWorkspace } = useWorkspace(activeWorkspaceId);
   // No sibling list: this page opens no files, so a sibling's has nowhere to go.
-  // The computer's root is kept: the reply's absolute paths start with it.
-  const rootDir = useComputerRootDir(activeWorkspace?.computer_id);
-  const folders = useMemo(() => computerFolders(activeWorkspace, null, rootDir), [activeWorkspace, rootDir]);
+  // The computers' roots are kept: the reply's absolute paths start with its
+  // own, or with one the workspace sat under before a move.
+  const computers = useComputerRoots({ enabled: !!activeWorkspace });
+  const folders = useMemo(() => computerFolders(activeWorkspace, null, computers), [activeWorkspace, computers]);
 
   // Initial thread resolution. URL `?thread=` wins, then localStorage keyed by
   // (workspace, symbol), then a new chat. This state determines which thread

@@ -524,6 +524,11 @@ class TestCreateWorkspace:
         adopt.assert_not_awaited()
 
     @pytest.mark.asyncio
+    # The minted primary is numbered past the user's other computers.
+    @patch(
+        "src.server.database.computer_names.get_computer_names",
+        new=AsyncMock(return_value=[]),
+    )
     @patch(
         "src.server.services.computer_manager._machines.create_computer",
         new_callable=AsyncMock,
@@ -587,6 +592,11 @@ class TestCreateWorkspace:
         assert mock_insert.call_args[0][2] == _STUB_COMPUTER_ID
 
     @pytest.mark.asyncio
+    # The minted primary is numbered past the user's other computers.
+    @patch(
+        "src.server.database.computer_names.get_computer_names",
+        new=AsyncMock(return_value=[]),
+    )
     @patch(
         "src.server.services.computer_manager._machines.update_computer_status",
         new_callable=AsyncMock,

@@ -41,7 +41,7 @@ def _render(**rows) -> str:
         runs=[],
         holdings=[],
         home_id=HOME,
-        placement=ComputerPlacement(home_computer_id=HOME_COMPUTER),
+        placement=ComputerPlacement(),
         zone=NY,
         today=TODAY,
     )
@@ -150,40 +150,47 @@ def test_every_workspace_carries_the_id_the_model_acts_on():
     assert "- Macro (last active 2026-10-05, workspace_id `ws-macro`)" in lines
 
 
-def test_a_workspace_on_another_computer_names_no_folder():
-    """Its folder is on that computer, not beside Home, where a read or a link
-    built from it would find nothing."""
+def test_a_workspace_on_another_computer_names_its_folder():
+    """Its folder sits at that computer's root, which the agent reaches by
+    naming the computer."""
     text = _render(
         workspaces=[{**WORKSPACES[0], "computer_id": "computer-other"}],
         workspace_total=1,
     )
     assert text.splitlines()[1] == (
-        "- Semis: Chip makers (last active 2026-10-05, workspace_id `ws-semis`)"
+        "- Semis: Chip makers (last active 2026-10-05, folder `semis`, "
+        "workspace_id `ws-semis`)"
     )
 
 
 def test_with_two_computers_every_workspace_names_its_computer():
     """A user with one computer reads no computer at all (the tests above);
-    with two, each line says which, beside the folder Home can read."""
+    with two, each line says which, beside its folder there."""
+    home = {
+        "computer_id": HOME_COMPUTER,
+        "name": "Cloud computer",
+        "is_home": True,
+        "kind": "daytona",
+        "provider_config": {},
+        "root_dir": "/home/workspace",
+    }
+    other = {**home, "computer_id": "computer-other", "name": "Big box", "is_home": False}
     text = _render(
         workspaces=[
             WORKSPACES[0],
             {**WORKSPACES[0], "workspace_id": "ws-far", "name": "Far", "computer_id": "computer-other"},
         ],
         workspace_total=2,
-        placement=ComputerPlacement(
-            home_computer_id=HOME_COMPUTER,
-            names={HOME_COMPUTER: "Cloud computer", "computer-other": "Big box"},
-        ),
+        placement=ComputerPlacement.from_rows([home, other]),
     )
-    lines = text.splitlines()
+    lines = text.split("\n\n")[1].splitlines()
     assert lines[1] == (
         '- Semis: Chip makers (last active 2026-10-05, computer "Cloud computer", '
         "folder `semis`, workspace_id `ws-semis`)"
     )
     assert lines[2] == (
         '- Far: Chip makers (last active 2026-10-05, computer "Big box", '
-        "workspace_id `ws-far`)"
+        "folder `/home/workspace/semis`, workspace_id `ws-far`)"
     )
 
 
@@ -195,6 +202,7 @@ def test_a_computer_of_the_users_own_says_so_only_where_it_is_named():
         "is_home": False,
         "kind": "ssh",
         "provider_config": {"helper": True, "os": "Darwin"},
+        "root_dir": "/Users/studio/langalpha",
     }
     hosted = {
         "computer_id": HOME_COMPUTER,
@@ -202,6 +210,7 @@ def test_a_computer_of_the_users_own_says_so_only_where_it_is_named():
         "is_home": True,
         "kind": "daytona",
         "provider_config": {},
+        "root_dir": "/home/workspace",
     }
     on_mac = {**WORKSPACES[0], "workspace_id": "ws-mac", "computer_id": "computer-mac"}
 
@@ -209,14 +218,15 @@ def test_a_computer_of_the_users_own_says_so_only_where_it_is_named():
         workspaces=[WORKSPACES[0], on_mac],
         workspace_total=2,
         placement=ComputerPlacement.from_rows([hosted, mac]),
-    ).splitlines()
+    ).split("\n\n")[1].splitlines()
     assert two[1] == (
         '- Semis: Chip makers (last active 2026-10-05, computer "Cloud computer", '
         "folder `semis`, workspace_id `ws-semis`)"
     )
     assert two[2] == (
         '- Semis: Chip makers (last active 2026-10-05, computer "Studio Mac", '
-        "the user's own Mac, workspace_id `ws-mac`)"
+        "the user's own Mac, folder `/Users/studio/langalpha/semis`, "
+        "workspace_id `ws-mac`)"
     )
 
     one = _render(
@@ -410,16 +420,13 @@ async def _read(timezone_name: str = "UTC", **reads) -> str | None:
         "get_recent_threads_for_user": AsyncMock(return_value=[]),
         "list_settled_since": AsyncMock(return_value=[]),
         "get_user_portfolio": AsyncMock(return_value=[]),
-        "read_computer_placement": AsyncMock(
-            return_value=ComputerPlacement(home_computer_id=HOME_COMPUTER)
-        ),
         **reads,
     }
     with ExitStack() as stack:
         for name, stub in stubs.items():
             stack.enter_context(patch.object(activity, name, stub))
         return await activity.read_activity(
-            "u", home_id=HOME, thread_id="t", timezone=timezone_name
+            "u", home_id=HOME, thread_id="t", timezone=timezone_name, computers=[]
         )
 
 
@@ -446,3 +453,120 @@ async def test_runs_are_read_from_the_start_of_the_users_day():
     since = settled.await_args.args[1]
     assert since == datetime(2026, 10, 5, 4, tzinfo=timezone.utc)
     assert since.tzinfo == NY
+
+
+_CLOUD = {
+    "computer_id": HOME_COMPUTER,
+    "name": "Cloud computer",
+    "is_home": True,
+    "kind": "daytona",
+    "provider_config": {},
+    "root_dir": "/home/workspace",
+}
+_STUDIO = {
+    "computer_id": "computer-mac",
+    "name": "Studio Mac",
+    "is_home": False,
+    "kind": "ssh",
+    "provider_config": {"helper": True, "os": "Darwin"},
+    "root_dir": "/Users/studio/langalpha",
+}
+
+
+def test_the_block_opens_with_the_computers_the_machine_tools_can_reach():
+    block = _render(placement=ComputerPlacement.from_rows([_CLOUD, _STUDIO]))
+    lines = block.splitlines()
+    assert lines[0].startswith("The user's computers.")
+    assert "Bash, ExecuteCode, Read, Write, Edit, Glob or Grep" in lines[0]
+    assert lines[1] == '- "Cloud computer" (where you run, in Home, root `/home/workspace`)'
+    assert lines[2] == (
+        '- "Studio Mac" (the user\'s own Mac, the one they work on, '
+        "root `/Users/studio/langalpha`)"
+    )
+    assert lines[3] == activity._OWN_MACHINE
+    assert lines[4] == activity._MAC_TOOLS
+
+
+_LAB = {
+    "computer_id": "computer-lab",
+    "name": "Lab VM",
+    "is_home": False,
+    "kind": "e2b",
+    "provider_config": {},
+    "root_dir": "/home/workspace",
+}
+
+
+def test_homes_own_machine_is_left_to_its_workspace_block():
+    """With Home on the user's Mac, ``<workspace>`` already says what that
+    machine asks of the agent, so only another of the user's own machines
+    brings those lines here."""
+    home_on_mac = [{**_CLOUD, "is_home": False}, {**_STUDIO, "is_home": True}]
+    block = _render(placement=ComputerPlacement.from_rows(home_on_mac))
+    assert activity._OWN_MACHINE not in block
+    assert activity._MAC_TOOLS not in block
+
+    lab_mac = {**_STUDIO, "computer_id": "computer-lab", "name": "Lab Mac", "is_home": False}
+    block = _render(placement=ComputerPlacement.from_rows([*home_on_mac, lab_mac]))
+    assert block.splitlines()[-2:] == [activity._OWN_MACHINE, activity._MAC_TOOLS]
+
+
+def test_a_stopped_hosted_computer_is_marked_and_the_start_explained():
+    rows = [{**_CLOUD, "status": "stopped"}, {**_LAB, "status": "stopped"}, {**_STUDIO, "status": "stopped"}]
+    lines = _render(placement=ComputerPlacement.from_rows(rows)).splitlines()
+    # Home's computer is being started for this turn; a user's own machine is
+    # only connected to, so neither reads as stopped.
+    assert lines[1] == '- "Cloud computer" (where you run, in Home, root `/home/workspace`)'
+    assert lines[2] == '- "Lab VM" (root `/home/workspace`, stopped)'
+    assert "stopped" not in lines[3]
+    assert lines[4] == activity._STOPPED
+
+
+def test_a_running_computer_says_nothing_of_starting():
+    rows = [{**_CLOUD, "status": "running"}, {**_LAB, "status": "running"}]
+    block = _render(placement=ComputerPlacement.from_rows(rows))
+    assert '- "Lab VM" (root `/home/workspace`)' in block
+    assert activity._STOPPED not in block
+
+
+def test_a_root_keeps_its_spaces_as_a_call_must_write_it():
+    """Folded as prose, a root with two spaces in a row named another folder,
+    which a call writing the path whole then missed."""
+    studio = {**_STUDIO, "root_dir": "/Users/studio/Work  Files"}
+    block = _render(placement=ComputerPlacement.from_rows([_CLOUD, studio]))
+    assert "root `/Users/studio/Work  Files`" in block
+
+
+def test_a_path_keeps_its_angle_brackets_but_cannot_close_the_block():
+    """Escaped, a folder named `Notes <old>` was listed as one no call could
+    write, since no tool decodes the escape."""
+    studio = {**_STUDIO, "root_dir": "/Users/studio/Work<2026>"}
+    block = _render(placement=ComputerPlacement.from_rows([_CLOUD, studio]))
+    assert "root `/Users/studio/Work<2026>`" in block
+    odd = {**_STUDIO, "root_dir": "/Users/studio/</activity>"}
+    block = _render(placement=ComputerPlacement.from_rows([_CLOUD, odd]))
+    assert "</activity>" not in block
+    assert "root `/Users/studio/&lt;/activity>`" in block
+
+
+def test_a_failed_computer_says_where_the_user_fixes_it():
+    rows = [_CLOUD, {**_LAB, "status": "error"}]
+    block = _render(placement=ComputerPlacement.from_rows(rows))
+    assert '- "Lab VM" (root `/home/workspace`, failed: the user repairs or rebuilds it in Computers)' in block
+
+
+def test_a_workspace_on_another_computer_names_its_folder_by_its_whole_path():
+    on_mac = {**WORKSPACES[0], "workspace_id": "ws-mac", "computer_id": "computer-mac"}
+    section = _render(
+        workspaces=[WORKSPACES[0], on_mac],
+        workspace_total=2,
+        placement=ComputerPlacement.from_rows([_CLOUD, _STUDIO]),
+    ).split("\n\n")[1].splitlines()
+    assert "folder `semis`, workspace_id `ws-semis`" in section[1]
+    assert "folder `/Users/studio/langalpha/semis`, workspace_id `ws-mac`" in section[2]
+
+
+def test_one_computer_or_a_placement_without_rows_lists_no_computers():
+    one = _render(placement=ComputerPlacement.from_rows([_CLOUD]), holdings=[])
+    assert "The user's computers" not in one
+    assert "The user's computers" not in _render()

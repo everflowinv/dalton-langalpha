@@ -31,6 +31,7 @@ from tests.computer_manager_patch import cm_patch
 
 _LIFECYCLE = "src.server.services.computer_manager._lifecycle"
 _MACHINES = "src.server.services.computer_manager._machines"
+_NAMES = "src.server.database.computer_names"
 _RETIREMENT = "src.server.services.computer_manager._retirement"
 _PROVISIONING = "src.server.services.computer_manager._provisioning"
 _FOLDERS = "src.server.services.computer_manager._folders"
@@ -304,10 +305,8 @@ class TestMintingAComputer(_Base):
 
     @pytest.fixture(autouse=True)
     def _users_computers(self):
-        """An unnamed machine reads the user's others to number its name."""
-        with patch(
-            f"{_MACHINES}.get_computers_for_user", AsyncMock(return_value=[])
-        ) as listed:
+        """An unnamed machine reads the user's other names to number its own."""
+        with patch(f"{_NAMES}.get_computer_names", AsyncMock(return_value=[])) as listed:
             self.users_computers = listed
             yield
 
@@ -395,11 +394,7 @@ class TestMintingAComputer(_Base):
         otherwise read the same as the first in every picker."""
         manager = _make_manager()
         mock_create.return_value = _make_computer(status="stopped")
-        self.users_computers.return_value = [
-            {"name": "cloud computer"},
-            {"name": "Cloud computer 2"},
-            {"name": "Research"},
-        ]
+        self.users_computers.return_value = ["cloud computer", "Cloud computer 2", "Research"]
 
         await manager.create_computer_for_user("user-1", kind="e2b")
 
@@ -408,10 +403,79 @@ class TestMintingAComputer(_Base):
 
     @pytest.mark.asyncio
     @patch("src.server.services.computer_manager._machines.create_computer")
+    async def test_an_unnamed_machine_that_loses_its_name_takes_the_next_free_one(
+        self, mock_create
+    ):
+        """Two creates read the same free name and the index admits one. The
+        loser is a name nobody typed, so it is numbered again rather than
+        refused, past both what it read again and the name it lost."""
+        from src.server.database.computer_names import ComputerNameTaken
+
+        manager = _make_manager()
+        created = _make_computer(status="stopped")
+        mock_create.side_effect = [ComputerNameTaken("Cloud computer"), created]
+        # Read again, the winner may fold differently there than in Python;
+        # the refused name is skipped all the same.
+        self.users_computers.side_effect = [[], ["Cloud computer 2"]]
+
+        assert await manager.create_computer_for_user("user-1") is created
+
+        names = [c.kwargs["name"] for c in mock_create.await_args_list]
+        assert names == ["Cloud computer", "Cloud computer 3"]
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.computer_manager._machines.create_computer")
+    async def test_a_typed_name_another_computer_has_is_refused_not_numbered(
+        self, mock_create
+    ):
+        from src.server.database.computer_names import ComputerNameTaken
+
+        manager = _make_manager()
+        mock_create.side_effect = ComputerNameTaken("Research", "comp-2")
+
+        with pytest.raises(ComputerNameTaken):
+            await manager.create_computer_for_user("user-1", name="research")
+
+        mock_create.assert_awaited_once()
+        self.users_computers.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.computer_manager._machines.create_computer")
+    @patch("src.server.services.computer_manager._machines.get_primary_computer")
+    async def test_a_first_projects_name_names_its_primary_only_while_free(
+        self, mock_primary, mock_create
+    ):
+        """The first project's name is the primary's default, which nobody
+        typed for a computer, so an owner's machine already called that keeps
+        it and the primary is numbered."""
+        manager = _make_manager()
+        mock_primary.return_value = None
+        mock_create.return_value = _make_computer(status="stopped")
+        self.users_computers.return_value = [" research "]
+
+        await manager.ensure_primary_computer("user-1", default_name="Research")
+
+        assert mock_create.await_args.kwargs["name"] == "Research 2"
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.computer_manager._machines.create_computer")
+    async def test_a_numbered_default_stays_inside_the_column(self, mock_create):
+        manager = _make_manager()
+        mock_create.return_value = _make_computer(status="stopped")
+        host = "h" * 255
+        self.users_computers.return_value = [host]
+
+        await manager.create_computer_for_user("user-1", kind="ssh", default_name=host)
+
+        name = mock_create.await_args.kwargs["name"]
+        assert name == "h" * 253 + " 2"
+
+    @pytest.mark.asyncio
+    @patch("src.server.services.computer_manager._machines.create_computer")
     async def test_a_named_machine_reads_no_other(self, mock_create):
         manager = _make_manager()
         mock_create.return_value = _make_computer(status="stopped")
-        self.users_computers.return_value = [{"name": "Research"}]
+        self.users_computers.return_value = ["Research"]
 
         await manager.create_computer_for_user("user-1", name="Research")
 
@@ -493,7 +557,7 @@ class TestMintingAComputer(_Base):
         mock_primary.return_value = None
         mock_create.return_value = _make_computer(status="stopped")
 
-        computer = await manager.ensure_primary_computer("user-1", name="Research")
+        computer = await manager.ensure_primary_computer("user-1", default_name="Research")
 
         assert computer["computer_id"] == "comp-1"
         assert mock_create.await_args.kwargs["is_primary"] is True
@@ -694,6 +758,14 @@ class TestMachineKeying(_Base):
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def no_other_names():
+    """An adopted machine reads the user's computer names to number its own."""
+    with patch(f"{_NAMES}.get_computer_names", AsyncMock(return_value=[])) as names:
+        yield names
+
+
+@pytest.mark.usefixtures("no_other_names")
 class TestResolveBinding(_Base):
     @pytest.mark.asyncio
     @patch(f"{_SESSIONS}.get_computer_for_workspace")
@@ -824,6 +896,42 @@ class TestResolveBinding(_Base):
         await manager._adopt_workspace_onto_computer("ws-a", workspace=row)
 
         assert mock_bind.await_args.kwargs["dir_name"] == folder
+
+    @pytest.mark.asyncio
+    @patch(f"{_MACHINES}.get_workspace_dir_names_for_computer", AsyncMock(return_value=()))
+    @patch(f"{_MACHINES}.publish_workspace_binding_change", AsyncMock())
+    @patch(f"{_NAMES}.get_computer_names")
+    @patch(f"{_MACHINES}.bind_workspace_to_computer")
+    @patch(f"{_MACHINES}.create_computer")
+    @patch(f"{_MACHINES}.get_computer_by_provider_ref")
+    async def test_an_adopted_machine_numbers_past_a_name_its_user_has(
+        self, mock_by_ref, mock_create, mock_bind, mock_listed
+    ):
+        """Named after its project, which nobody typed for a computer: a
+        computer of the user's already called that keeps the name."""
+        from src.server.database.computer_names import ComputerNameTaken
+
+        manager = _make_manager()
+        mock_by_ref.return_value = None
+        mock_create.side_effect = [ComputerNameTaken("Research"), _make_computer()]
+        mock_listed.side_effect = [[], ["Research"]]
+        mock_bind.return_value = _make_workspace(dir_name="Research")
+        row = {
+            "workspace_id": "ws-a",
+            "user_id": "user-1",
+            "computer_id": None,
+            "status": "stopped",
+            "name": "Research",
+            "sandbox_id": None,
+        }
+
+        await manager._adopt_workspace_onto_computer("ws-a", workspace=row)
+
+        names = [c.kwargs["name"] for c in mock_create.await_args_list]
+        assert names == ["Research", "Research 2"]
+        # Read before each attempt, so the second numbers past the winner.
+        assert mock_listed.await_count == 2
+        mock_listed.assert_awaited_with("user-1")
 
     @pytest.mark.asyncio
     @patch(f"{_MACHINES}.get_workspace_dir_names_for_computer", AsyncMock(return_value=()))
@@ -4928,6 +5036,7 @@ async def test_duplicate_stays_on_secondary_source_computer():
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("no_other_names")
 async def test_legacy_adoption_preserves_provider_and_root_stamp():
     manager = _make_manager()
     source = {
@@ -4947,6 +5056,7 @@ async def test_legacy_adoption_preserves_provider_and_root_stamp():
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("no_other_names")
 @pytest.mark.parametrize("kind, always_on", [("daytona", True), ("e2b", False)])
 async def test_legacy_adoption_carries_always_on_only_to_a_kind_that_holds_it(
     kind, always_on

@@ -1,8 +1,9 @@
 /**
  * What a machine's card on the rail and its details both show: the drawing
  * in its frame, the notes under its name, its spec rows, and Start or Stop.
+ * The refusal under a name field is here too, shared with the create form.
  */
-import type { ReactNode } from 'react';
+import { useId, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 import { AlertCircle, Laptop, Star } from 'lucide-react';
 
@@ -33,7 +34,8 @@ export interface MachineActions {
   /** A start or stop of this machine is in flight. */
   powerBusy: boolean;
   power: (action: PowerAction) => void;
-  rename: (name: string) => void;
+  /** Settles with the request; rejects with its refusal. */
+  rename: (name: string) => Promise<void>;
   changeSpec: () => void;
   alwaysOnBusy: boolean;
   turnOffAlwaysOn: () => void;
@@ -274,5 +276,37 @@ export function PowerButton({ computer, actions }: { computer: Computer; actions
     >
       {t('computer.start', 'Start')}
     </Button>
+  );
+}
+
+/** What ties a name field to the refusal under it, spread on the field. */
+interface RefusedField {
+  'aria-invalid'?: true;
+  'aria-describedby'?: string;
+}
+
+/**
+ * A name field and the server's refusal of what it holds, said under it: the
+ * field reads as invalid, is described by the line that says why, and takes
+ * the danger edge in place of its own. The create form and the rename in
+ * place share it, so a taken name reads the same in both.
+ */
+export function NameRefusal({ refusal, edge, children }: {
+  refusal: string | null;
+  /** The field's border while nothing is refused. */
+  edge: string;
+  /** The field, given what ties it to the refusal and the border to draw. */
+  children: (field: RefusedField, borderColor: string) => ReactNode;
+}) {
+  const id = useId();
+  return (
+    <>
+      {children(refusal ? { 'aria-invalid': true, 'aria-describedby': id } : {}, refusal ? 'var(--color-icon-danger)' : edge)}
+      {refusal && (
+        <p id={id} role="alert" className="text-xs" style={{ color: 'var(--color-icon-danger)' }}>
+          {refusal}
+        </p>
+      )}
+    </>
   );
 }

@@ -120,6 +120,21 @@ describe('WorkspaceImage reads a destination the way a link does', () => {
     await waitFor(() => expect(downloadWorkspaceFile).toHaveBeenCalledWith('ws-nvda', expected));
   });
 
+  it('names an image on another computer outside its workspaces instead of fetching it here', async () => {
+    const SSH = '/home/nosudo/langalpha-2';
+    const folders: ComputerFolders = {
+      dirName: 'Home',
+      siblings: [],
+      otherComputers: [{ root: SSH, workspaces: [{ workspaceId: 'ws-ssh', dirName: 'lithium' }] }],
+    };
+    renderInWorkspace(`${SSH}/scratch/elsewhere.png`, { workspaceId: 'ws-home', downloadFile: null, folders });
+    expect(screen.getByText('chart')).toBeInTheDocument();
+    expect(downloadWorkspaceFile).not.toHaveBeenCalled();
+
+    renderInWorkspace(`${SSH}/lithium/charts/there.png`, { workspaceId: 'ws-home', downloadFile: null, folders });
+    await waitFor(() => expect(downloadWorkspaceFile).toHaveBeenCalledWith('ws-ssh', 'charts/there.png'));
+  });
+
   // An image that did not load is a state, not a blank: the name plus why.
   it('names the file when it could not be loaded', async () => {
     const failing = vi.fn(() => Promise.reject(new Error('gone')));

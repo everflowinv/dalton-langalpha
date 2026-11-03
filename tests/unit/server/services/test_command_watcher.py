@@ -169,6 +169,7 @@ class _Harness:
         self.judged: dict = {}
         self.read = AsyncMock(side_effect=self._read)
         self.trace = AsyncMock(return_value=[{"tool": "t"}])
+        self.mirror = AsyncMock()
         # What a fresh read of the threads finds before the hour's stop.
         self.fresh_coverage: dict = {}
 
@@ -227,6 +228,7 @@ class _Harness:
                 new=AsyncMock(side_effect=lambda threads: self.fresh_coverage),
             ),
             patch.object(settle, "_nudge_hook_drainer", new=lambda: calls.nudge()),
+            patch.object(settle, "mirror_after_end", new=self.mirror),
         ]
         for p in self._patches:
             p.start()
@@ -284,6 +286,10 @@ async def test_one_read_settles_ended_jobs_with_their_tail_and_trace_then_drops_
     # The trace is read and left for the discard: a finalize that fails finds
     # it again on the next pass.
     assert all(c.kwargs == {"delete": False} for c in h.trace.await_args_list)
+    # Each end recorded is the mirror's to judge; the running one is not.
+    assert [c.args[0]["command_id"] for c in h.mirror.await_args_list] == [
+        "bg-00000000000a", "bg-00000000000b",
+    ]
 
 
 @pytest.mark.asyncio

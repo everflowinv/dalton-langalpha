@@ -277,9 +277,9 @@ describe('turning it on', () => {
     // Named as the machine unless the user types over it: the top field shows it as its default.
     expect(screen.getByRole('textbox', { name: /^Name/ })).toHaveAttribute('placeholder', 'alex-mac');
 
+    // The server gives it that name, numbered past the user's other computers.
     await user.click(screen.getByRole('button', { name: 'Add computer' }));
     expect(onSubmit).toHaveBeenCalledWith({
-      name: 'alex-mac',
       ssh: {
         host: 'alex-mac', port: 22, username: 'alex', tunnel_id: 'tun-1',
         host_key: 'ssh-ed25519 AAAAhelper', root_dir: '/Users/alex/langalpha',

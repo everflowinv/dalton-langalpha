@@ -360,7 +360,7 @@ def create_execute_bash_tool(
         # for plain shell commands). Stripped from the artifact by the
         # provenance middleware before it leaves the host.
         artifact = {"mcp_trace": list(outcome.trace)}
-        output = await command_handoff.settle(backend, outcome)
+        output = await command_handoff.settle(backend, outcome, hand_off)
         match outcome:
             case Failed():
                 logger.warning(

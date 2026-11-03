@@ -1074,3 +1074,27 @@ def test_a_fallback_notice_sits_after_the_message_its_call_followed():
         "backup-2",
         "message_chunk",
     ]
+
+
+def _file_op_events(tool_name, args):
+    call_args = {"file_path": "notes.md", **args}
+    msgs = [
+        AIMessage(
+            content="",
+            id="ai-1",
+            tool_calls=[{"name": tool_name, "args": call_args, "id": "tc-w"}],
+        ),
+        ToolMessage(content="ok", tool_call_id="tc-w", name=tool_name, id="tm-1"),
+    ]
+    return [i["event"] for i in _sse(msgs)]
+
+
+def test_a_write_or_edit_naming_another_computer_derives_no_artifact():
+    """The file is on that computer, so a card would open a path the turn's own
+    computer lacks."""
+    write = {"content": "x\n"}
+    edit = {"old_string": "a", "new_string": "b"}
+    assert "artifact" in _file_op_events("Write", write)
+    assert "artifact" in _file_op_events("Edit", edit)
+    assert "artifact" not in _file_op_events("Write", {**write, "computer": "Studio Mac"})
+    assert "artifact" not in _file_op_events("Edit", {**edit, "computer": "Studio Mac"})

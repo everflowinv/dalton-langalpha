@@ -14,9 +14,16 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Sequence
 
+from psycopg.errors import UniqueViolation
 from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
+from src.server.database.computer_names import (
+    COMPUTER_NAME_INDEX,
+    ComputerNameTaken,
+    name_taken,
+)
+from src.server.database.conversation.errors import _unique_violation_constraint
 from src.server.database.home_workspace import get_home_workspace_id
 from src.server.database.pool import get_db_connection
 from src.server.database.sql_fences import (
@@ -318,24 +325,30 @@ async def count_live_computers_of_kind(
         return int(row["computers"]) if row else 0
 
 
-async def get_computer_names_and_home(
+async def get_computer_roster(
     user_id: str,
     *,
     conn=None,
 ) -> List[Dict[str, Any]]:
-    """The user's live computers by id and name, each flagged when the user's
-    Home is on it: the names and the Home binding from one snapshot. The kind
-    and provider config say which is a machine of the user's own."""
+    """The user's live computers by id and name, with the kind and provider
+    config (whether it is a machine of the user's own), root (where its
+    workspace folders sit) and status, and ``is_home`` on the one the user's
+    Home is on, read in the same snapshot as the names.
+
+    Primary first, then oldest, so a listing of them reads the same on every
+    turn.
+    """
     async with _computer_cursor(conn) as cur:
         await cur.execute(
             f"""
-            SELECT c.computer_id, c.name, c.kind, c.provider_config,
+            SELECT c.computer_id, c.name, c.kind, c.provider_config, c.root_dir, c.status,
                    c.computer_id IS NOT DISTINCT FROM (
                        SELECT h.computer_id FROM workspaces h
                        WHERE h.workspace_id = %(home_id)s AND h.{FENCE_NOT_DELETED}
                    ) AS is_home
             FROM computers c
             WHERE c.user_id = %(user_id)s AND c.{FENCE_NOT_DELETED}
+            ORDER BY c.is_primary DESC, c.created_at, c.computer_id
             """,
             {"user_id": user_id, "home_id": get_home_workspace_id(user_id)},
         )
@@ -539,6 +552,11 @@ async def clear_computer_start_failure(computer_id: str, *, conn=None) -> bool:
         return cur.rowcount > 0
 
 
+async def _name_refusal(user_id: str, name: str) -> ComputerNameTaken:
+    # None when the holder was removed or renamed since the index refused.
+    return await name_taken(user_id, name) or ComputerNameTaken(name)
+
+
 async def create_computer(
     user_id: str,
     *,
@@ -562,10 +580,22 @@ async def create_computer(
 
     provider_ref and origin_workspace_id are for adopting a sandbox that
     predates the computers table; a machine minted for a new project is born
-    unprovisioned and gets its ref from try_bind_computer_provider_ref."""
-    from psycopg.errors import UniqueViolation
+    unprovisioned and gets its ref from try_bind_computer_provider_ref.
+
+    Raises:
+        ComputerNameTaken: another live computer of the user has ``name``.
+            A caller that chose the name itself numbers past it and asks again.
+    """
 
     async def _insert(want_primary: bool) -> Dict[str, Any]:
+        try:
+            return await _insert_row(want_primary)
+        except UniqueViolation as e:
+            if _unique_violation_constraint(e) == COMPUTER_NAME_INDEX:
+                raise await _name_refusal(user_id, name) from e
+            raise
+
+    async def _insert_row(want_primary: bool) -> Dict[str, Any]:
         async with _computer_cursor(conn) as cur:
             await cur.execute(
                 f"""
@@ -1093,21 +1123,34 @@ async def rename_computer(
     computer_id: str,
     name: str,
     *,
+    user_id: str,
     conn=None,
 ) -> Optional[Dict[str, Any]]:
-    """The name has no workspace shadow; nothing but the computer reads it."""
-    async with _computer_cursor(conn) as cur:
-        await cur.execute(
-            f"""
-            UPDATE computers
-            SET name = %s, updated_at = NOW()
-            WHERE computer_id = %s
-              AND {FENCE_NOT_DELETED}
-            RETURNING {_COMPUTER_COLS}
-            """,
-            (name, computer_id),
-        )
-        row = await cur.fetchone()
+    """The name has no workspace shadow; nothing but the computer reads it.
+
+    None unless ``user_id`` owns the computer. The computer's own name, in any
+    case, is never taken from it: the index compares a row only with others.
+
+    Raises:
+        ComputerNameTaken: another live computer of the same user has ``name``.
+    """
+    try:
+        async with _computer_cursor(conn) as cur:
+            await cur.execute(
+                f"""
+                UPDATE computers
+                SET name = %s, updated_at = NOW()
+                WHERE computer_id = %s AND user_id = %s
+                  AND {FENCE_NOT_DELETED}
+                RETURNING {_COMPUTER_COLS}
+                """,
+                (name, computer_id, user_id),
+            )
+            row = await cur.fetchone()
+    except UniqueViolation as e:
+        if _unique_violation_constraint(e) != COMPUTER_NAME_INDEX:
+            raise
+        raise await _name_refusal(user_id, name) from e
     return dict(row) if row else None
 
 

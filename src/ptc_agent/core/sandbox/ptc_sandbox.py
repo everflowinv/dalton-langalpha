@@ -199,6 +199,11 @@ class PTCSandbox:
         return type(self.provider).mounts_livefs
 
     @property
+    def files_as_command_user(self) -> bool:
+        """Whether a file call here runs as the user commands run as."""
+        return type(self.provider).files_as_command_user
+
+    @property
     def recreatable(self) -> bool:
         """Whether the server rebuilds this computer, and so lays its files
         unasked; on one its owner brought, a missing folder is theirs to restore."""

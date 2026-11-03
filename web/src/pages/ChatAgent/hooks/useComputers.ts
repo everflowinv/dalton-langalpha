@@ -30,6 +30,7 @@ import {
   patchComputerStatusInCaches,
   patchWorkspaceStatusInCaches,
 } from '../utils/warmWorkspace';
+import type { ComputerRootRow } from '../utils/agentPaths';
 import { isComputerStatusTerminal, isComputerStatusTransitional } from '../utils/computerStatus';
 import { activeSpecChange } from '../components/specChangeUi';
 import { recordPrepareFailure, recordPrepareStage } from './computerPreparation';
@@ -126,28 +127,18 @@ export const CREATE_COMPUTER_MUTATION_KEY = ['computers', 'create'] as const;
 export const RECONNECT_COMPUTER_MUTATION_KEY = ['computers', 'reconnect'] as const;
 
 /**
- * The root a computer keeps its workspace folders under, off the shared list.
- * Selected, so a refetch that only moved a status leaves its readers alone.
+ * Every computer's root, by computer, off the shared list: the root its
+ * workspace folders sit under. A workspace moves between computers with its
+ * folder, so an older turn's absolute path can start at a root it has since
+ * left, and the Chief of Staff links a file on another computer at its whole
+ * path there. Selected, so a refetch that only moved a status leaves its
+ * readers alone.
  */
-export function useComputerRootDir(computerId: string | null | undefined): string | undefined {
-  const { data } = useQuery({
-    ...computersList(),
-    enabled: !!computerId,
-    select: (list) => list.computers.find((c) => c.computer_id === computerId)?.root_dir,
-  });
-  return data;
-}
-
-/**
- * Every computer's root, off the shared list. A workspace moves between
- * computers with its folder, so an older turn's absolute path can start at a
- * root it has since left. Selected like the one above.
- */
-export function useComputerRootDirs(options: { enabled: boolean }): readonly string[] | undefined {
+export function useComputerRoots(options: { enabled: boolean }): readonly ComputerRootRow[] | undefined {
   const { data } = useQuery({
     ...computersList(),
     enabled: options.enabled,
-    select: (list) => list.computers.map((c) => c.root_dir),
+    select: (list) => list.computers.map((c) => ({ computer_id: c.computer_id, root_dir: c.root_dir })),
   });
   return data;
 }

@@ -95,7 +95,9 @@ class _Edges:
             yield MagicMock() if reach == "running" else None
 
         self.trace = AsyncMock(return_value=[{"tool": "t"}])
+        self.mirror = AsyncMock()
         self._p = [
+            patch.object(settle, "mirror_after_end", new=self.mirror),
             patch.object(control.cr_db, "get_thread_command", new=get_thread_command),
             patch.object(control.cr_db, "request_stop", new=request_stop),
             patch.object(control.cr_db, "finalize", new=finalize),
@@ -210,6 +212,19 @@ async def test_a_stop_that_lost_its_race_and_then_its_read_raises():
 async def _stop_marked(row, computer=RUNNING):
     async with control.computer_jobs_runtime(computer) as runtime:
         return await control.stop_marked([row], runtime, computer)
+
+
+@pytest.mark.asyncio
+async def test_a_stop_hands_the_command_it_ended_to_the_mirror():
+    """A stop is an end too: what the command wrote before it is mirrored as
+    a natural end's is, and a computer that is down has nothing to mirror."""
+    with _Edges(RUNNING) as e:
+        [ended] = await _stop_marked({**ROW, "stopped_by": HOUR})
+    e.mirror.assert_awaited_once_with(ended)
+
+    with _Edges({**RUNNING, "status": "stopped"}) as e:
+        await _stop_marked({**ROW, "stopped_by": HOUR}, {**RUNNING, "status": "stopped"})
+    e.mirror.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -10,11 +10,13 @@ import { useTranslation } from 'react-i18next';
 import { ChevronLeft, Pencil } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
+import { toast } from '@/components/ui/use-toast';
 import { SwapCell } from '@/components/ui/crossfade';
 import { Loader } from '@/components/ui/loader';
 import { ToggleSwitch } from '@/components/ui/switch';
 import { useLocale } from '@/hooks/useLocale';
 import { formatBytes } from '@/lib/format';
+import { useIsPresent } from '@/lib/framer';
 import { DURATION } from '@/lib/motion';
 import type { Computer } from '@/types/api';
 
@@ -23,7 +25,7 @@ import type { ThisMac } from '../hooks/useRemoteControl';
 import { isComputerPreparing, isComputerStatusTransitional, takesWorkspaces } from '../utils/computerStatus';
 import { DiskBar, DiskUsageText } from './computerDiskUi';
 import { activeSpecChange, effectiveTier } from './specChangeUi';
-import { COMPUTER_NAME_MAX } from './computerName';
+import { COMPUTER_NAME_MAX, computerNameTakenMessage } from '../utils/computerName';
 import { MakePrimaryButton } from './MakePrimaryDialog';
 import { providerCanBePrimary, providerManagesSpec } from './providerUi';
 import { ComputerFacts } from './computerFacts';
@@ -31,6 +33,7 @@ import {
   ComputerNotes,
   ComputerSpecRows,
   MachineFrame,
+  NameRefusal,
   PowerButton,
   SpecRow,
   StartFailureAction,
@@ -280,46 +283,98 @@ function removeBlockHint(t: Translate, block: RemoveBlock): string | null {
   }
 }
 
-/** The name, editable in place. Enter or blur saves; Escape backs out. */
-function EditableName({ name, onCommit }: { name: string; onCommit: (name: string) => void }) {
+/**
+ * The name, editable in place. Enter or blur saves; Escape backs out. A name
+ * another of the user's computers has comes back to the field, saying so, or
+ * to a toast once the details are leaving: Back and Close blur it, which saves.
+ */
+function EditableName({ name, onCommit }: { name: string; onCommit: (name: string) => Promise<void> }) {
   const { t } = useTranslation();
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(name);
+  // Why the server refused the draft as it stands; cleared by any edit.
+  const [refusal, setRefusal] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  // Bumped by every save and every keystroke, so a refusal that lands after
+  // the user typed another name does not put the refused one back over it.
+  const request = useRef(0);
+  // Whether the field can still say a refusal: the details fade out on Back
+  // or Close while the rename those sent is still out.
+  const present = useIsPresent();
+  const shown = useRef(false);
+  useEffect(() => {
+    shown.current = present;
+    return () => {
+      shown.current = false;
+    };
+  }, [present]);
 
   useEffect(() => {
-    if (editing) inputRef.current?.select();
+    if (!editing) return;
+    inputRef.current?.focus();
+    inputRef.current?.select();
   }, [editing]);
 
-  const commit = () => {
-    const next = draft.trim();
+  const backOut = () => {
+    setDraft(name);
+    setRefusal(null);
     setEditing(false);
-    if (next && next !== name) onCommit(next);
+  };
+
+  const save = () => {
+    setEditing(false);
+    const next = draft.trim();
+    if (!next || next === name) return;
+    const ticket = ++request.current;
+    // Any other refusal is told by the rename's own toast.
+    onCommit(next).catch((err: unknown) => {
+      const taken = computerNameTakenMessage(err, t);
+      if (!taken || ticket !== request.current) return;
+      if (!shown.current) {
+        toast({ variant: 'destructive', title: t('computer.renameFailed', 'Could not rename computer'), description: taken });
+        return;
+      }
+      setDraft(next);
+      setRefusal(taken);
+      setEditing(true);
+    });
   };
 
   if (editing) {
     return (
-      <input
-        ref={inputRef}
-        value={draft}
-        maxLength={COMPUTER_NAME_MAX}
-        aria-label={t('computer.renameLabel', 'Computer name')}
-        className="computer-card-name min-w-0 w-full rounded border bg-transparent px-1.5 py-0.5"
-        style={{ borderColor: 'var(--color-border-default)', color: 'var(--color-text-primary)', backgroundColor: 'var(--color-bg-input)' }}
-        onChange={(e) => setDraft(e.target.value)}
-        onBlur={commit}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter') {
-            e.preventDefault();
-            commit();
-          } else if (e.key === 'Escape') {
-            // Claimed here so the dialog around it stays open.
-            e.preventDefault();
-            setDraft(name);
-            setEditing(false);
-          }
-        }}
-      />
+      <div className="flex min-w-0 flex-col gap-1">
+        <NameRefusal refusal={refusal} edge="var(--color-border-default)">
+          {(field, borderColor) => (
+            <input
+              ref={inputRef}
+              value={draft}
+              maxLength={COMPUTER_NAME_MAX}
+              aria-label={t('computer.renameLabel', 'Computer name')}
+              {...field}
+              className="computer-card-name min-w-0 w-full rounded border bg-transparent px-1.5 py-0.5"
+              style={{ borderColor, color: 'var(--color-text-primary)', backgroundColor: 'var(--color-bg-input)' }}
+              onChange={(e) => {
+                request.current += 1;
+                setDraft(e.target.value);
+                setRefusal(null);
+              }}
+              // Left with the refused name still standing, the field backs out.
+              onBlur={refusal ? backOut : save}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  // Enter on a refused name keeps the field and its reason.
+                  if (!refusal) save();
+                } else if (e.key === 'Escape') {
+                  // Claimed here so the dialog around it stays open.
+                  e.preventDefault();
+                  backOut();
+                }
+              }}
+            />
+          )}
+        </NameRefusal>
+      </div>
     );
   }
   return (

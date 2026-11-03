@@ -57,9 +57,10 @@ _LISTED_WORKSPACE_FIELDS = (
 async def workspaces_list(user_id: str, tool_call_id: str) -> Command:
     """List workspaces for the user.
 
-    A row names its folder only when the workspace is on Home's computer, the
-    one whose folders the Chief of Staff reads, and its computer, with whether
-    that is the user's own, only when the user has more than one.
+    A row names its folder, which sits at the root of its computer, and its
+    computer, with whether that is the user's own, only when the user has
+    more than one; on another computer than Home's, the folder's whole path
+    too, since calls there take that machine's own paths.
     """
     try:
         from src.server.database.workspace import get_workspaces_for_user
@@ -76,8 +77,9 @@ async def workspaces_list(user_id: str, tool_call_id: str) -> Command:
         rows = []
         for ws in workspaces:
             row = {field: ws.get(field) for field in _LISTED_WORKSPACE_FIELDS}
-            row["dir_name"] = placement.folder(ws)
-            if placement.names:
+            if path := placement.path(ws):
+                row["path"] = path
+            if placement.computers:
                 row["computer"] = placement.computer(ws)
             if machine := placement.machine(ws):
                 row["machine"] = machine

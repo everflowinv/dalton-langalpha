@@ -330,6 +330,33 @@ describe('ComputersDialog', () => {
     expect(screen.getByLabelText(/^Name/)).toHaveValue('One too many');
   });
 
+  it('says a name another computer has under the name field, until the name is edited', async () => {
+    const user = userEvent.setup();
+    mockCreate.mockRejectedValue(
+      conflict('name_taken', 'You already have a computer named "Second machine".', {
+        name: 'Second machine',
+        computer_id: SECOND_ID,
+      }),
+    );
+    await openCreateForm(user);
+
+    const field = screen.getByLabelText(/^Name/);
+    await user.type(field, 'second MACHINE');
+    await user.click(screen.getByRole('button', { name: 'Create computer' }));
+
+    const said = await screen.findByRole('alert');
+    expect(said).toHaveTextContent('You already have a computer named "Second machine". Choose another name.');
+    expect(field).toHaveAccessibleDescription(said.textContent ?? '');
+    expect(field).toHaveAttribute('aria-invalid', 'true');
+    // Focused, so the user can fix it where it stands.
+    await waitFor(() => expect(field).toHaveFocus());
+    expect(screen.getByRole('dialog', { name: 'New computer' })).toBeInTheDocument();
+
+    await user.type(field, ' 2');
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(field).not.toHaveAttribute('aria-invalid');
+  });
+
   it.each([
     [1, 'You can have only 1 SSH computer. Remove it to add another.'],
     [3, 'You can have up to 3 SSH computers. Remove one to add another.'],

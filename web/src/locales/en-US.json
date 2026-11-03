@@ -1594,6 +1594,7 @@
     "empty": "No computers yet. Your first workspace creates one.",
     "nameLabel": "Name",
     "nameFromMachine": "Defaults to the machine's name",
+    "nameTaken": "You already have a computer named \"{{name}}\". Choose another name.",
     "namePlaceholderCloud": "Cloud computer",
     "namePlaceholderLocal": "Local computer",
     "tierLabel": "Computer spec",

@@ -128,6 +128,24 @@ describe('isFilePath', () => {
     expect(isFilePath('/srv/old/Workspace/reports/')).toBe(false);
   });
 
+  it('accepts a folder through a workspace\'s folder on another computer', () => {
+    const SSH = '/home/nosudo/langalpha-2';
+    const folders = {
+      otherRoots: [SSH],
+      dirName: 'Home',
+      siblings: [],
+      otherComputers: [{ root: SSH, workspaces: [{ workspaceId: 'ws-ssh', dirName: 'ssh-e2e' }] }],
+    };
+    expect(isFilePath(`${SSH}/ssh-e2e/reports/`, folders)).toBe(true);
+    expect(isFilePath(`${SSH}/ssh-e2e`, folders)).toBe(true);
+    // The rest of that machine is a file there too, with an extension or
+    // without, so its link is shown as its name and never as an app route.
+    expect(isFilePath(`${SSH}/reports/`, folders)).toBe(true);
+    expect(isFilePath(`${SSH}/LICENSE`, folders)).toBe(true);
+    expect(isFilePath(`${SSH}/ssh-e2e/reports/`, { ...folders, otherComputers: undefined })).toBe(false);
+    expect(isFilePath(`${SSH}/LICENSE`, { ...folders, otherComputers: undefined })).toBe(false);
+  });
+
   it('reads a line suffix as a file, not a URL scheme', () => {
     expect(isFilePath('model.py:42')).toBe(true);
     expect(isFilePath('work/code/model.py:40-55')).toBe(true);

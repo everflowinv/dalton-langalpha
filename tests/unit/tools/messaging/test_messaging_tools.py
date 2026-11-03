@@ -1285,3 +1285,116 @@ class TestThePreferredMark:
             "A direct message is listed as `<app>:@me`, or `slack:<team>` on Slack."
             in messaging.LIST_MESSAGE_TARGETS_DESCRIPTION
         )
+
+
+# -- files on the user's computers ----------------------------------------------
+
+
+class _Computers:
+    """Stands in for ``TurnComputers``: a path under ``/root/lithium`` is in
+    that workspace's folder; anything else is copied into Home."""
+
+    def __init__(self):
+        self.asked: list[list[tuple[str, str]]] = []
+
+    async def attach(self, files):
+        from ptc_agent.agent.tools.computer_reach import Attached, ComputerUnreachable
+
+        self.asked.append(list(files))
+        if any(computer == "Basement" for computer, _ in files):
+            raise ComputerUnreachable('The user has no computer named "Basement".')
+        return [
+            Attached(path.removeprefix("/root/lithium/"), NVDA)
+            if path.startswith("/root/lithium/")
+            else Attached(f"sent/{path.rsplit('/', 1)[-1]}", None, copied=1000)
+            for _, path in files
+        ]
+
+
+def _anywhere(computers):
+    tools = build_messaging_tools("chief_of_staff", computers=computers)
+    return {t.name: t for t in tools}["send_message"]
+
+
+class TestFilesOnComputers:
+    @pytest.mark.asyncio
+    async def test_a_named_file_goes_from_its_workspace_or_as_a_copy_in_home(self, gateway):
+        computers = _Computers()
+        gateway.reply = httpx.Response(
+            200,
+            json={
+                "status": "sent",
+                "address": "imessage:@me",
+                "files": [
+                    {"path": "reports/alb.md", "status": "sent"},
+                    {"path": "sent/budget.pdf", "status": "sent"},
+                    {"path": "digest.md", "status": "sent"},
+                ],
+            },
+        )
+        text = await _call(
+            _anywhere(computers),
+            {
+                "text": "here",
+                "target": "imessage:@me",
+                "files": [
+                    "Studio Mac:/root/lithium/reports/alb.md",
+                    "Studio Mac:~/Documents/budget.pdf",
+                    "digest.md",
+                ],
+            },
+        )
+
+        assert json.loads(gateway.requests[0].content)["files"] == [
+            {"path": "reports/alb.md", "workspace_id": NVDA},
+            {"path": "sent/budget.pdf", "workspace_id": None},
+            {"path": "digest.md", "workspace_id": None},
+        ]
+        # Asked once for every file named on a computer, so none is copied
+        # before all are found.
+        assert computers.asked == [
+            [
+                ("Studio Mac", "/root/lithium/reports/alb.md"),
+                ("Studio Mac", "~/Documents/budget.pdf"),
+            ]
+        ]
+        assert "- Studio Mac:/root/lithium/reports/alb.md: sent" in text
+        assert "- Studio Mac:~/Documents/budget.pdf (copied to Home as sent/budget.pdf): sent" in text
+        assert "- digest.md: sent" in text
+
+    @pytest.mark.asyncio
+    async def test_a_file_that_cannot_go_sends_nothing(self, gateway):
+        text = await _call(
+            _anywhere(_Computers()),
+            {"text": "x", "target": "imessage:@me", "files": ["Basement:/a.pdf"]},
+        )
+        assert gateway.requests == []
+        assert "code: invalid_request" in text
+        assert 'no computer named "Basement". Nothing was sent.' in text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("path", ["reports/q3:final.md", "/tmp/x:/y", "~/x:/y"])
+    async def test_a_path_with_a_colon_is_still_a_path(self, gateway, path):
+        computers = _Computers()
+        await _call(_anywhere(computers), {"text": "x", "files": [path]})
+        assert computers.asked == []
+        assert json.loads(gateway.requests[0].content)["files"] == [
+            {"path": path, "workspace_id": None}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_computer_whose_name_holds_a_slash_is_still_a_computer(self, gateway):
+        """Names may hold a slash, and the parse refused one in the name, so
+        the spec went to the messaging service as a path in Home."""
+        computers = _Computers()
+        await _call(_anywhere(computers), {"text": "x", "files": ["Work/Lab:~/a.pdf"]})
+        assert computers.asked == [[("Work/Lab", "~/a.pdf")]]
+
+    def test_only_a_chief_of_staff_with_several_computers_is_told_of_it(self, configured):
+        def files_doc(tool):
+            return tool.tool_call_schema.model_json_schema()["properties"]["files"]["description"]
+
+        assert "a colon" in files_doc(_anywhere(_Computers()))
+        assert "a colon" not in files_doc(_tool("send_message", "chief_of_staff"))
+        analyst = {t.name: t for t in build_messaging_tools("analyst", computers=_Computers())}
+        assert "a colon" not in files_doc(analyst["send_message"])

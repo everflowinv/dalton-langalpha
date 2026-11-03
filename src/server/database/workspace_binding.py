@@ -1,13 +1,15 @@
-"""Where one project sits on its computer, in a single narrow read.
+"""Where workspaces sit on their computers, in narrow reads.
 
 Separate from ``workspace.py`` because every caller on the hot paths (turn
-start, backup, restore, skill reconcile) wants exactly these three facts and
-none of the wide JSONB columns a full row carries.
+start, backup, restore, skill reconcile, a tool call on another computer)
+wants a few of these facts and none of the wide JSONB columns a full row
+carries.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from typing import Any, Dict, Optional
 
 from psycopg.rows import dict_row
@@ -72,3 +74,48 @@ async def get_project_binding(
         "previous_dir_names": tuple(row.get("previous_dir_names") or ()),
         "sibling_dir_names": tuple(row["sibling_dir_names"] or ()),
     }
+
+
+async def get_computer_folders(computer_id: str, *, conn=None) -> dict[str, str]:
+    """The live workspaces on a computer as {folder: workspace_id}, oldest
+    first, for a caller at its root, where each folder is a workspace's own
+    and none is the caller's."""
+    normalized = normalize_uuid(computer_id)
+    if normalized is None:
+        return {}
+    async with get_db_connection(conn) as owned:
+        async with owned.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT dir_name, workspace_id FROM workspaces
+                WHERE computer_id = %s
+                  AND status <> 'deleted'
+                  AND dir_name IS NOT NULL
+                  AND dir_name <> ''
+                ORDER BY created_at
+                """,
+                (normalized,),
+            )
+            return {row["dir_name"]: str(row["workspace_id"]) for row in await cur.fetchall()}
+
+
+async def get_computers_with_folders(
+    computer_ids: Sequence[str], *, conn=None
+) -> set[str]:
+    """Which of ``computer_ids`` hold a live workspace folder, in one read."""
+    normalized = [n for n in map(normalize_uuid, computer_ids) if n is not None]
+    if not normalized:
+        return set()
+    async with get_db_connection(conn) as owned:
+        async with owned.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT DISTINCT computer_id FROM workspaces
+                WHERE computer_id = ANY(%s::uuid[])
+                  AND status <> 'deleted'
+                  AND dir_name IS NOT NULL
+                  AND dir_name <> ''
+                """,
+                (normalized,),
+            )
+            return {str(row["computer_id"]) for row in await cur.fetchall()}

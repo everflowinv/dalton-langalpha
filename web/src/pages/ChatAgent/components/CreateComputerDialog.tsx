@@ -23,10 +23,11 @@ import { isDesktopShell } from '@/lib/desktop';
 import { DesktopDownloadLink } from '@/pages/Plugins/components/DesktopDownloadLink';
 import type { ComputerCreate, ComputerProviderOption, ResourceTier, WorkspaceQuota } from '@/types/api';
 
-import { useComputerProviders } from '../hooks/useComputers';
+import { useComputerProviders, useComputers } from '../hooks/useComputers';
 import { serverTakesRemoteControl, useThisMacAvailability } from '../hooks/useRemoteControl';
 import { useTierQuota } from '../hooks/useTierQuota';
-import { COMPUTER_NAME_MAX } from './computerName';
+import { COMPUTER_NAME_MAX, nextComputerName } from '../utils/computerName';
+import { NameRefusal } from './computerParts';
 import { SshSetup } from './sshSetup';
 import { useSshSetup } from './sshSetupState';
 import { RemoteControlActionButton, RemoteControlSetup } from './remoteControlSetup';
@@ -95,6 +96,10 @@ interface CreateComputerDialogProps {
   busy: boolean;
   /** The last refusal, already worded for the user. */
   error: string | null;
+  /** The last refusal of the name itself, said under the name field. */
+  nameError?: string | null;
+  /** The name was edited, which answers `nameError`. */
+  onNameEdit?: () => void;
   /** The computer whose mark refused the folder, one this account does not
    *  have: the user may take the folder from it. */
   takeOver?: string | null;
@@ -102,12 +107,24 @@ interface CreateComputerDialogProps {
   initialPick?: string | null;
 }
 
-function CreateComputerDialog({ onClose, onSubmit, busy, error, takeOver = null, initialPick = null }: CreateComputerDialogProps) {
+function CreateComputerDialog({
+  onClose,
+  onSubmit,
+  busy,
+  error,
+  nameError = null,
+  onNameEdit,
+  takeOver = null,
+  initialPick = null,
+}: CreateComputerDialogProps) {
   const { t } = useTranslation();
   const titleId = useId();
   const formId = useId();
   const nameId = useId();
-  const [name, setName] = useState('');
+  // What the user typed, null until they do: the field shows the name the
+  // computer would get until then.
+  const [typed, setTyped] = useState<string | null>(null);
+  const nameRef = useRef<HTMLInputElement>(null);
   const [picked, setPicked] = useState<string | null>(initialPick);
   const [pickedTier, setPickedTier] = useState<ResourceTier>('standard');
   const errorRef = useRef<HTMLDivElement>(null);
@@ -117,9 +134,14 @@ function CreateComputerDialog({ onClose, onSubmit, busy, error, takeOver = null,
   useEffect(() => {
     if (error && !busy) errorRef.current?.scrollIntoView?.({ block: 'nearest' });
   }, [error, busy]);
+  // The field sits above a body that may have scrolled it away.
+  useEffect(() => {
+    if (nameError) nameRef.current?.focus();
+  }, [nameError]);
 
   const { data: providerData } = useComputerProviders({ enabled: true });
   const { data: quota } = useTierQuota({ enabled: true });
+  const { data: computerList } = useComputers({ enabled: true });
   const providers = providerData?.providers ?? [];
   // One provider is no choice: the request then names none and the server
   // uses its default, as it does while the list is still loading.
@@ -156,6 +178,12 @@ function CreateComputerDialog({ onClose, onSubmit, busy, error, takeOver = null,
   // A machine the user brings is sized by them, so its tier is never a pick,
   // and left unnamed it goes by its hostname once it has answered.
   const own = source === 'thisMac' ? mac : source === 'ssh' ? ssh : null;
+  // The name a computer left unnamed gets: the source's default, numbered past
+  // the user's names as the server numbers it. The field holds it until the
+  // user types, and follows the source until then.
+  const base = own ? own.defaultName : providers.find((p) => p.kind === (hosted ?? providers[0]?.kind))?.default_name;
+  const suggested = base && computerList ? nextComputerName(base, computerList.computers.map((c) => c.name)) : null;
+  const name = typed ?? suggested ?? '';
 
   // A size the plan allows that this provider does not run but another open
   // one does (Extra Large, on E2B alone) is named with the way there, in
@@ -176,11 +204,13 @@ function CreateComputerDialog({ onClose, onSubmit, busy, error, takeOver = null,
           : null;
   // The body the form would send, or null while it cannot send one. A machine
   // the user brings, this Mac included, sends its setup's part and always names
-  // its kind, since the server takes a target only with it.
-  const trimmedName = name.trim();
-  const ownName = trimmedName || own?.defaultName;
+  // its kind, since the server takes a target only with it. Only a name the
+  // user typed is sent: the one the field suggests the server gives anyway,
+  // numbering past a computer that took it meanwhile, where a name sent is
+  // refused when one of them has it.
+  const trimmedName = (typed ?? '').trim();
   const fields: ComputerCreate | null = own
-    ? own.create && { ...own.create, ...(ownName ? { name: ownName } : {}), resource_tier: 'standard', kind: 'ssh' }
+    ? own.create && { ...own.create, ...(trimmedName ? { name: trimmedName } : {}), resource_tier: 'standard', kind: 'ssh' }
     : {
       ...(trimmedName ? { name: trimmedName } : {}),
       resource_tier: tier,
@@ -257,25 +287,45 @@ function CreateComputerDialog({ onClose, onSubmit, busy, error, takeOver = null,
         />
         <div className="flex flex-col gap-1.5">
           <label htmlFor={nameId} className="text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>
-            {t('computer.nameLabel', 'Name')}{' '}
-            <span className="font-normal" style={{ color: 'var(--color-text-tertiary)' }}>{t('common.optional')}</span>
+            {t('computer.nameLabel', 'Name')}
+            {/* A field holding a name is not one to leave blank. */}
+            {suggested === null && (
+              <>
+                {' '}
+                <span className="font-normal" style={{ color: 'var(--color-text-tertiary)' }}>{t('common.optional')}</span>
+              </>
+            )}
           </label>
-          <Input
-            id={nameId}
-            value={name}
-            maxLength={COMPUTER_NAME_MAX}
-            onChange={(e) => setName(e.target.value)}
-            disabled={busy}
-            autoComplete="off"
-            spellCheck={false}
-            // A machine the user brings is named after itself unless they say otherwise.
-            placeholder={own ? (own.defaultName ?? t('computer.nameFromMachine', "Defaults to the machine's name")) : undefined}
-            style={{
-              backgroundColor: 'var(--color-bg-input)',
-              borderColor: 'var(--color-border-muted)',
-              color: 'var(--color-text-primary)',
-            }}
-          />
+          <NameRefusal refusal={nameError} edge="var(--color-border-muted)">
+            {(field, borderColor) => (
+              <Input
+                ref={nameRef}
+                id={nameId}
+                value={name}
+                maxLength={COMPUTER_NAME_MAX}
+                onChange={(e) => {
+                  setTyped(e.target.value);
+                  onNameEdit?.();
+                }}
+                // The suggested name is replaced by typing, as a rename field's is;
+                // the click that focused it would otherwise drop a caret into it.
+                onFocus={(e) => {
+                  if (typed === null) e.currentTarget.select();
+                }}
+                onMouseUp={(e) => {
+                  if (typed === null) e.preventDefault();
+                }}
+                disabled={busy}
+                autoComplete="off"
+                spellCheck={false}
+                {...field}
+                // Cleared, it still says what the computer will be called; a machine
+                // the user brings says so before it has answered with its name.
+                placeholder={suggested ?? (own ? t('computer.nameFromMachine', "Defaults to the machine's name") : undefined)}
+                style={{ backgroundColor: 'var(--color-bg-input)', borderColor, color: 'var(--color-text-primary)' }}
+              />
+            )}
+          </NameRefusal>
         </div>
 
         {options.length > 1 && (

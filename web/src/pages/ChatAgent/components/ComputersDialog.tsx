@@ -57,6 +57,7 @@ import { apiErrorObject, apiErrorReason, apiErrorStatus } from '../utils/api';
 import { denialMessage } from '../utils/denialMessage';
 import { entitlementErrorMessage } from '../utils/entitlementErrors';
 import { folderMarkedOwner, sshLimitMessage } from '../utils/sshLimit';
+import { computerNameTakenMessage } from '../utils/computerName';
 
 type Translate = ReturnType<typeof useTranslation>['t'];
 
@@ -188,7 +189,9 @@ function ComputersPanel({
   const homeMoving = isMoveActive(homeMove) ? homeMove : null;
   // A refused start relays the quota service's own sentence (denialMessage).
   const error = power.error ? denialMessage(power.error, t) : null;
-  const createError = create.error
+  // A taken name is said under the name field; anything else under the form.
+  const createNameError = create.error ? computerNameTakenMessage(create.error, t) : null;
+  const createError = create.error && !createNameError
     ? (sshLimitMessage(create.error, t) ?? entitlementErrorMessage(create.error, t, create.variables?.resource_tier))
     : null;
   const removeError = remove.error ? removeErrorMessage(remove.error, t) : null;
@@ -420,6 +423,9 @@ function ComputersPanel({
               }
               busy={create.isPending}
               error={createError}
+              nameError={createNameError}
+              // A refused name stands until it is edited.
+              onNameEdit={createNameError ? () => create.reset() : undefined}
               takeOver={folderMarkedOwner(create.error)}
             />
           </Suspense>

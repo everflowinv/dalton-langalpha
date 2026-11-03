@@ -39,6 +39,7 @@ import {
 import { apiErrorObject, apiErrorReason } from '@/api/errors';
 import { entitlementErrorMessage } from '../utils/entitlementErrors';
 import { releaseRemoteControl } from './useRemoteControl';
+import { nameTakenBy } from '../utils/computerName';
 import { tierLabel } from '../components/tierUi';
 import { closeComputerSpec } from './computerPanelStore';
 import {
@@ -171,6 +172,8 @@ export function useComputerActions() {
     },
     onError: (err, _vars, ctx) => {
       for (const [key, data] of ctx?.snapshot ?? []) queryClient.setQueryData(key, data);
+      // A name another computer has is said beside the field it was typed in.
+      if (nameTakenBy(err) !== null) return;
       toast({
         variant: 'destructive',
         title: t('computer.renameFailed', 'Could not rename computer'),
@@ -367,8 +370,11 @@ export function useComputerActions() {
     onError: () => invalidateMachine(queryClient),
   });
 
+  // Settles with the request, so the field it came from can show a refusal.
   const renameComputerTo = useCallback(
-    (computerId: string, name: string) => rename.mutate({ computerId, name }),
+    async (computerId: string, name: string): Promise<void> => {
+      await rename.mutateAsync({ computerId, name });
+    },
     [rename],
   );
 

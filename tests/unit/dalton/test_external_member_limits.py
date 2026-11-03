@@ -2002,7 +2002,6 @@ class TestCosForeignWorkspaceThreadIsolation:
         from src.server.database.conversation import threads_read
         from src.tools.secretary import activity as activity_mod
         from src.tools.secretary import tools as sec_tools
-        from src.tools.secretary.utils import ComputerPlacement
 
         _enable_dalton_auth(monkeypatch)
         _admit_team_members(monkeypatch)
@@ -2213,14 +2212,9 @@ class TestCosForeignWorkspaceThreadIsolation:
             "get_user_portfolio",
             create_autospec(activity_mod.get_user_portfolio, return_value=[]),
         )
-        monkeypatch.setattr(
-            activity_mod,
-            "read_computer_placement",
-            create_autospec(
-                activity_mod.read_computer_placement,
-                return_value=ComputerPlacement(),
-            ),
-        )
+        # The roster the graph build reads reaches read_activity as its
+        # `computers` argument now, which renders an empty placement here:
+        # this test's assertions are about thread visibility, not placement.
 
         # With B's cos_rw_enabled=True: <activity> includes B's thread and A's own threads, never external threads
         executed_sql.clear()
@@ -2229,6 +2223,7 @@ class TestCosForeignWorkspaceThreadIsolation:
             home_id="99999999-9999-4999-8999-999999999999",
             thread_id=cos_own_tid,
             timezone="UTC",
+            computers=[],
         )
         assert act_on is not None
         assert "Colleague B Thread" in act_on
@@ -2251,6 +2246,7 @@ class TestCosForeignWorkspaceThreadIsolation:
             home_id="99999999-9999-4999-8999-999999999999",
             thread_id=cos_own_tid,
             timezone="UTC",
+            computers=[],
         )
         assert act_off is not None
         assert "Colleague B Thread" not in act_off

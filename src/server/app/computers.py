@@ -37,6 +37,7 @@ from src.server.database.computer import (
     set_computer_files_backup,
     update_computer_status,
 )
+from src.server.database.computer_names import ComputerNameTaken, name_taken
 from src.server.database.home_workspace import get_home_workspace_id
 from src.server.database.workspace import (
     count_live_workspaces_by_computer,
@@ -139,7 +140,7 @@ async def _computer_quota_decision(user_id: str, *, always: bool = False):
     """Serialize platform quota reads with the mutation that consumes the slot.
 
     ``always`` takes the lock without platform gating too, for a create whose
-    own check must hold until its insert.
+    own checks (a name, a folder) must hold until its insert.
     """
     if not (always or platform_gating_active()):
         yield
@@ -196,6 +197,17 @@ async def _computer_action_errors(action: str, computer_id: str, *, spec: bool =
         ) from None
     except ComputerBusyError as e:
         raise HTTPException(status_code=409, detail=spec_refusal("busy", str(e))) from None
+    except ComputerNameTaken as e:
+        # Names the holder, so a client words it in its own language.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "name_taken",
+                "message": str(e),
+                "name": e.name,
+                "computer_id": e.computer_id,
+            },
+        ) from None
     except ComputerRemovalRefused as e:
         logger.warning("Refused to %s computer %s: %s", action, computer_id, e.code)
         detail = {"code": e.code, "message": str(e)}
@@ -424,6 +436,8 @@ async def create_computer(
     Building a sandbox takes long enough that whoever first used the computer
     would wait through it, so it starts now and the client watches its events.
     Preparing holds a running slot from the insert, so the limit is asked here.
+    A ``name`` another of the user's live computers has, compared trimmed and
+    case-folded, is a 409 ``name_taken``; an unnamed one is numbered past them.
     """
     async with _computer_action_errors("create", "new"):
         sandbox = _sandbox_config()
@@ -441,6 +455,10 @@ async def create_computer(
         await assert_provider_allowed(x_user_id, kind, default_kind=sandbox.provider)
         plan: Optional[SSHCreatePlan] = None
         if request.ssh is not None:
+            if request.name and (taken := await name_taken(x_user_id, request.name)):
+                # Ahead of the probe, which dials the machine, and asked again
+                # under the lock below, ahead of a take-over.
+                raise taken
             with _ssh_create_refusals():
                 plan = await plan_create(
                     x_user_id, request.ssh, settings=sandbox.settings_for(SSH_KIND)
@@ -450,8 +468,12 @@ async def create_computer(
                 status_code=422,
                 detail=_FILES_BACKUP_REQUIRED,
             )
-        async with _computer_quota_decision(x_user_id, always=plan is not None):
+        # Every create and rename holds this lock, so a name still free under
+        # it is free at the insert, after a take-over that cannot be undone.
+        async with _computer_quota_decision(x_user_id, always=True):
             if plan is not None:
+                if request.name and (taken := await name_taken(x_user_id, request.name)):
+                    raise taken
                 with _ssh_create_refusals():
                     await plan.recheck(x_user_id)
             if provider_class(kind).metered:
@@ -558,6 +580,7 @@ async def list_computer_providers(x_user_id: CurrentUserId):
                 is_default=kind == sandbox.provider,
                 allowed=allowed[kind],
                 tiers=_tier_specs(sandbox, kind),
+                default_name=provider_class(kind).default_computer_name,
             )
             for kind in kinds
         ],
@@ -611,10 +634,17 @@ async def rename_computer(
     request: ComputerRenameRequest,
     x_user_id: CurrentUserId,
 ):
-    await _owned_computer(computer_id, x_user_id)
-    updated = await db_rename_computer(computer_id, request.name)
-    if updated is None:
-        raise HTTPException(status_code=404, detail="Computer not found")
+    """A name another of the user's live computers has is a 409 ``name_taken``;
+    the computer's own name in another case is a rename like any other."""
+    async with _computer_action_errors("rename", computer_id):
+        await _owned_computer(computer_id, x_user_id)
+        # Under the lock a create holds from its last name check to its insert.
+        async with computer_capacity_lock(x_user_id):
+            updated = await db_rename_computer(
+                computer_id, request.name, user_id=x_user_id
+            )
+        if updated is None:
+            raise HTTPException(status_code=404, detail="Computer not found")
     return await _counted_response(updated)
 
 

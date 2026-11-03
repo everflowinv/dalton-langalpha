@@ -55,7 +55,9 @@ _SKILL_PARAMS = "src.server.services.computer_manager._provisioning.sandbox_skil
 
 
 async def _computer(user_id, pool) -> str:
-    computer = await create_computer(user_id, kind="docker", name="Test computer")
+    computer = await create_computer(
+        user_id, kind="docker", name=f"Test computer {uuid.uuid4().hex[:8]}"
+    )
     computer_id = str(computer["computer_id"])
     async with pool.connection() as conn:
         await conn.execute(

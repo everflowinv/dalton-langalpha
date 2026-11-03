@@ -144,6 +144,55 @@ describe('Markdown folder links under a root of its own or one it moved off', ()
   });
 });
 
+/**
+ * The Chief of Staff links a file on another of the user's computers at its
+ * whole path there. Through a workspace's folder it opens in that workspace;
+ * the rest of that machine is on no computer this view reads, and a click
+ * would open a namesake here, so it is text.
+ */
+describe('Markdown links to another computer', () => {
+  const SSH = '/home/nosudo/langalpha-2';
+  const folders: ComputerFolders = {
+    dirName: 'Home',
+    siblings: [],
+    otherRoots: [SSH],
+    otherComputers: [{ root: SSH, workspaces: [{ workspaceId: 'ws-ssh', dirName: 'ssh-e2e' }] }],
+  };
+
+  function renderLink(content: string) {
+    const onOpenFile = vi.fn();
+    const view = render(
+      <WorkspaceProvider workspaceId="ws-home" downloadFile={null} folders={folders}>
+        <Markdown variant="chat" content={content} onOpenFile={onOpenFile} />
+      </WorkspaceProvider>,
+    );
+    return { link: view.container.querySelector('a'), onOpenFile };
+  }
+
+  it('opens a file through a workspace folder there in that workspace', () => {
+    const { link, onOpenFile } = renderLink(`[q3](${SSH}/ssh-e2e/reports/q3.md)`);
+    fireEvent.click(link!);
+    expect(onOpenFile.mock.calls[0].slice(0, 2)).toEqual(['reports/q3.md', 'ws-ssh']);
+  });
+
+  it.each([
+    ['a stray', `${SSH}/scratch/x.csv`],
+    ['license', `${SSH}/LICENSE`],
+    ['scratch', `${SSH}/scratch/`],
+    ['its root', SSH],
+  ])('leaves the rest of that machine as text, an extension or not: %s', (text, dest) => {
+    const { link } = renderLink(`[${text}](${dest})`);
+    expect(link).toBeNull();
+    expect(screen.getByText(text)).toBeInTheDocument();
+  });
+
+  it('still opens a rooted path under no other computer', () => {
+    const { link, onOpenFile } = renderLink('[out](/tmp/out.csv)');
+    fireEvent.click(link!);
+    expect(onOpenFile.mock.calls[0][0]).toBe('/tmp/out.csv');
+  });
+});
+
 // The agent writes the app's own pages as absolute links, so a reply read in a
 // channel still works. In the app a new tab is a second copy of it that has
 // lost this tab's state; a skipped setup sent that tab to the setup wizard.

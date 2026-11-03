@@ -272,6 +272,70 @@ class TestSandboxPathNormalization:
         assert sandbox.downloaded == "/home/workspace/work/t/charts/fig.png"
 
 
+class _Reach:
+    """The user's computers as a Chief of Staff turn reaches them: ``answer``
+    is the target a name resolves to, None for the turn's own, or the error."""
+
+    def __init__(self, answer):
+        self.answer = answer
+
+    async def reach(self, computer):
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        return self.answer
+
+
+class TestAReadOnAnotherComputer:
+    """The Chief of Staff's Read that names a computer attaches its bytes from
+    there, never a file under the same path on the turn's own."""
+
+    @staticmethod
+    def _read(computer):
+        args = {"file_path": "charts/c.png", "computer": computer}
+        return types.SimpleNamespace(tool_call={"name": "Read", "args": args, "id": "tc-1"})
+
+    @staticmethod
+    async def _handler(_request):
+        return ToolMessage(content="ok", tool_call_id="tc-1")
+
+    @pytest.mark.asyncio
+    async def test_its_bytes_come_from_that_computer(self):
+        home = _Sandbox(_png_bytes())
+        there = _Sandbox(_png_bytes(), work_dir="/Users/me/langalpha")
+        target = types.SimpleNamespace(sandbox=there, project=None)
+        mw = MultimodalMiddleware(sandbox=home, computers=_Reach(target))
+
+        result = await mw.awrap_tool_call(self._read("Studio Mac"), self._handler)
+
+        assert there.downloaded == "/Users/me/langalpha/charts/c.png"
+        assert home.downloaded is None
+        assert isinstance(result.content, list)
+
+    @pytest.mark.asyncio
+    async def test_the_turns_own_computer_is_read_here(self):
+        home = _Sandbox(_png_bytes())
+        mw = MultimodalMiddleware(sandbox=home, computers=_Reach(None))
+
+        await mw.awrap_tool_call(self._read("Cloud computer"), self._handler)
+
+        assert home.downloaded == "/home/workspace/charts/c.png"
+
+    @pytest.mark.asyncio
+    async def test_one_no_longer_reachable_answers_as_the_tools_own_call_would(self):
+        """It once fell back to the turn's own computer, which could attach
+        another file under the same path."""
+        from ptc_agent.agent.tools.computer_reach import ComputerUnreachable
+
+        home = _Sandbox(_png_bytes())
+        gone = ComputerUnreachable('Computer "Studio Mac" is not reachable right now.')
+        mw = MultimodalMiddleware(sandbox=home, computers=_Reach(gone))
+
+        result = await mw.awrap_tool_call(self._read("Studio Mac"), self._handler)
+
+        assert result.content == 'ERROR: Computer "Studio Mac" is not reachable right now.'
+        assert home.downloaded is None
+
+
 class TestContentIsTypedByItsBytes:
     """The extension is whatever wrote the file claimed, and a URL may carry none
     at all. Both injection paths checkpoint what they build, so a wrong call here

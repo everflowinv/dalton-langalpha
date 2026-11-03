@@ -1,12 +1,13 @@
 import type { LucideIcon } from 'lucide-react';
 import { FileText, FileSpreadsheet, Globe, Image, Presentation } from 'lucide-react';
 import {
+  folderWorkspacePath,
+  onOtherComputer,
   parseAgentHref,
   parseAgentPath,
-  siblingWorkspacePath,
   workspaceScopedPath,
   type ComputerFolders,
-  type SiblingPath,
+  type FolderPath,
 } from './agentPaths';
 import { hasLineSuffix, splitFileLocation } from './fileLocation';
 
@@ -89,16 +90,16 @@ export function parseWsPath(href: string | undefined): { workspaceId: string; pa
 }
 
 /**
- * The sibling workspace a destination reaches through its folder
- * (`agentPaths.siblingWorkspacePath`), with the path inside it read the way
- * `normalizeFilePath` reads a destination. A `__wsref__` destination names its
- * workspace outright and gets null here.
+ * The other workspace a destination reaches through its folder, on this
+ * computer or another (`agentPaths.folderWorkspacePath`), with the path inside
+ * it read the way `normalizeFilePath` reads a destination. A `__wsref__`
+ * destination names its workspace outright and gets null here.
  */
-export function parseSiblingHref(
+export function parseFolderHref(
   href: string | undefined,
   folders: ComputerFolders | null | undefined,
-): SiblingPath | null {
-  return href ? siblingWorkspacePath(parseAgentHref(href, folders?.rootDir), folders) : null;
+): FolderPath | null {
+  return href ? folderWorkspacePath(parseAgentHref(href, folders?.rootDir), folders) : null;
 }
 
 /**
@@ -118,7 +119,9 @@ export function parseSiblingHref(
  * otherwise read `name.py:` as a URL scheme. The computer's own root
  * (`ComputerFolders.rootDir`) says "start at the workspace" the same way, and
  * so does a path through the workspace's folder under a root it sat under
- * before a move (`ComputerFolders.otherRoots`).
+ * before a move (`ComputerFolders.otherRoots`), or through another
+ * workspace's folder on another computer (`ComputerFolders.otherComputers`),
+ * and so does anything else under that computer's root.
  */
 export function isFilePath(href: string | undefined, folders?: ComputerFolders | null): boolean {
   if (!href) return false;
@@ -138,6 +141,12 @@ export function isFilePath(href: string | undefined, folders?: ComputerFolders |
     // the click reads it: a path the folder folds off is the workspace's,
     // `/old/root/<folder>/data/` as much as `/home/workspace/data/`.
     if (folders?.otherRoots?.length && !normalizeFilePath(href, folders).startsWith('/')) return true;
+    // So is a workspace's folder on another of the user's computers, which
+    // `/that/root/<folder>/data/` names as surely, and the rest of that
+    // machine, which the link then shows as its name rather than as a route
+    // of this app (`onOtherComputer`), with an extension or without.
+    if (parseFolderHref(href, folders)) return true;
+    if (onOtherComputer(parseAgentHref(href, folders?.rootDir), folders)) return true;
     // The extension has to be in the name, not in what follows it. Reading the
     // whole destination let a query supply one, so `/search?q=notes.md` claimed
     // to be a file, the click was swallowed, and the panel was handed

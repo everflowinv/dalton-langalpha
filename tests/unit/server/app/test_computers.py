@@ -7,6 +7,7 @@ The alias arms are what guarantee the sandbox settings panel keeps working
 while both paths are live.
 """
 
+import contextlib
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
@@ -48,6 +49,30 @@ def sandbox_config():
     config = SandboxConfig()
     with patch("src.server.app.computers._sandbox_config", return_value=config):
         yield config
+
+
+@pytest.fixture(autouse=True)
+def capacity_lock():
+    """Every create and rename holds the user's capacity lock; a test that
+    asks about it patches its own over this one."""
+    held = []
+
+    @contextlib.asynccontextmanager
+    async def _lock(user_id):
+        held.append(user_id)
+        yield
+
+    with patch("src.server.app.computers.computer_capacity_lock", _lock):
+        yield held
+
+
+@pytest.fixture(autouse=True)
+def names_free():
+    """None of the caller's other computers holds the name an ssh create asks for."""
+    with patch(
+        "src.server.app.computers.name_taken", AsyncMock(return_value=None)
+    ) as taken:
+        yield taken
 
 
 @pytest_asyncio.fixture
@@ -210,6 +235,101 @@ async def test_create_computer_defaults_to_the_standard_tier(
     kwargs = manager.create_computer_for_user.call_args.kwargs
     assert kwargs["resource_tier"] == "standard"
     assert kwargs["name"] is None
+
+
+OTHER_COMPUTER_ID = "33333333-3333-4333-8333-333333333333"
+
+
+@pytest.mark.asyncio
+async def test_a_name_another_computer_has_is_refused_by_the_insert(
+    client, entitled, prepares, names_free
+):
+    """A name says which of the user's computers it means. Nothing is dialed
+    ahead of a hosted computer's insert, so the insert alone refuses it; the
+    holder is named for the client to word."""
+    from src.server.database.computer_names import ComputerNameTaken
+
+    manager = MagicMock()
+    manager.create_computer_for_user = AsyncMock(
+        side_effect=ComputerNameTaken("Research box", OTHER_COMPUTER_ID)
+    )
+    with patch("src.server.app.computers._computer_manager", return_value=manager):
+        resp = await client.post("/api/v1/computers", json={"name": "  research BOX "})
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {
+        "code": "name_taken",
+        "message": 'You already have a computer named "Research box".',
+        "name": "Research box",
+        "computer_id": OTHER_COMPUTER_ID,
+    }
+    assert manager.create_computer_for_user.call_args.kwargs["name"] == "research BOX"
+    names_free.assert_not_awaited()
+    prepares.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_blank_name_is_no_name(client, computer, entitled, prepares, names_free):
+    """Left to the default, which is numbered rather than refused."""
+    manager = MagicMock()
+    manager.create_computer_for_user = AsyncMock(return_value=computer)
+    with patch("src.server.app.computers._computer_manager", return_value=manager):
+        resp = await client.post("/api/v1/computers", json={"name": "   "})
+
+    assert resp.status_code == 201
+    assert manager.create_computer_for_user.call_args.kwargs["name"] is None
+    names_free.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_rename_onto_another_computers_name_is_409(client, computer):
+    from src.server.database.computer_names import ComputerNameTaken
+
+    with (
+        patch("src.server.app.computers.get_computer", AsyncMock(return_value=computer)),
+        patch(
+            "src.server.app.computers.db_rename_computer",
+            AsyncMock(side_effect=ComputerNameTaken("Lab", OTHER_COMPUTER_ID)),
+        ),
+    ):
+        resp = await client.patch(
+            f"/api/v1/computers/{COMPUTER_ID}", json={"name": " lab "}
+        )
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {
+        "code": "name_taken",
+        "message": 'You already have a computer named "Lab".',
+        "name": "Lab",
+        "computer_id": OTHER_COMPUTER_ID,
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_computer_renamed_to_its_own_name_in_another_case_is_renamed(
+    client, computer
+):
+    """Its own name is never taken from it, so nothing ahead of the update
+    asks whether the name is free; the index excludes the row itself."""
+    renamed = {**computer, "name": "MY COMPUTER"}
+    with (
+        patch("src.server.app.computers.get_computer", AsyncMock(return_value=computer)),
+        patch(
+            "src.server.app.computers.db_rename_computer",
+            AsyncMock(return_value=renamed),
+        ) as rename,
+        patch(
+            "src.server.app.computers.count_live_workspaces_by_computer",
+            AsyncMock(return_value={}),
+        ),
+    ):
+        resp = await client.patch(
+            f"/api/v1/computers/{COMPUTER_ID}", json={"name": "MY COMPUTER"}
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["name"] == "MY COMPUTER"
+    rename.assert_awaited_once_with(COMPUTER_ID, "MY COMPUTER", user_id=USER)
 
 
 @pytest.mark.asyncio
@@ -453,7 +573,13 @@ async def test_providers_lists_only_the_default_when_nothing_is_offered(client):
 
     assert resp.status_code == 200
     assert resp.json()["providers"] == [
-        {"kind": "daytona", "is_default": True, "allowed": True, "tiers": ANY}
+        {
+            "kind": "daytona",
+            "is_default": True,
+            "allowed": True,
+            "tiers": ANY,
+            "default_name": "Cloud computer",
+        }
     ]
     # Not read as a computer id by GET /{computer_id}.
     get_computer.assert_not_called()
@@ -475,9 +601,9 @@ async def test_providers_lists_the_default_first_with_what_the_caller_may_pick(
     assert [
         {k: v for k, v in p.items() if k != "tiers"} for p in resp.json()["providers"]
     ] == [
-        {"kind": "e2b", "is_default": True, "allowed": True},
-        {"kind": "daytona", "is_default": False, "allowed": False},
-        {"kind": "docker", "is_default": False, "allowed": None},
+        {"kind": "e2b", "is_default": True, "allowed": True, "default_name": "Cloud computer"},
+        {"kind": "daytona", "is_default": False, "allowed": False, "default_name": "Cloud computer"},
+        {"kind": "docker", "is_default": False, "allowed": None, "default_name": "Local computer"},
     ]
     allowances.assert_awaited_once_with(
         USER, ("e2b", "daytona", "docker"), default_kind="e2b"
@@ -496,6 +622,7 @@ async def test_providers_reads_an_ungated_offer_as_unknown_in_oss_mode(
         "is_default": False,
         "allowed": None,
         "tiers": ANY,
+        "default_name": "Cloud computer",
     }
 
 
@@ -641,6 +768,93 @@ async def test_an_ssh_create_where_ssh_is_not_offered_dials_nothing(
     assert resp.status_code == 400
     dial.assert_not_awaited()
     manager.create_computer_for_user.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_ssh_create_under_a_name_another_computer_has_dials_nothing(
+    client, entitled, sandbox_config, names_free
+):
+    """Refused ahead of the probe, so a typed name never costs a dial to a
+    machine, and in the shape the insert's own refusal answers."""
+    from src.server.database.computer_names import ComputerNameTaken
+
+    sandbox_config.offered_providers = ("ssh",)
+    names_free.return_value = ComputerNameTaken("Research box", OTHER_COMPUTER_ID)
+    manager = MagicMock()
+    manager.create_computer_for_user = AsyncMock()
+    dial = AsyncMock()
+    with (
+        patch("src.server.app.computers._computer_manager", return_value=manager),
+        patch(f"{_SSH}.probe", dial),
+        patch(f"{_SSH}.has_client_key", AsyncMock(return_value=True)),
+    ):
+        resp = await client.post(
+            "/api/v1/computers", json={**_SSH_CREATE, "name": "  research BOX "}
+        )
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == {
+        "code": "name_taken",
+        "message": 'You already have a computer named "Research box".',
+        "name": "Research box",
+        "computer_id": OTHER_COMPUTER_ID,
+    }
+    names_free.assert_awaited_once_with(USER, "research BOX")
+    dial.assert_not_awaited()
+    manager.create_computer_for_user.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_name_taken_while_the_probe_ran_is_refused_before_any_take_over(
+    client, computer, entitled, sandbox_config, names_free, capacity_lock
+):
+    """A take-over stops the folder's old computer for good, so the name is
+    asked again under the lock every rename holds, before the take-over runs."""
+    from src.server.database.computer_names import ComputerNameTaken
+
+    sandbox_config.offered_providers = ("ssh",)
+    names_free.side_effect = [None, ComputerNameTaken("Research box", OTHER_COMPUTER_ID)]
+    manager = _creating_manager({**computer, "kind": "ssh"})
+    recheck = AsyncMock()
+    with (
+        patch("src.server.app.computers._computer_manager", return_value=manager),
+        patch(f"{_SSH}.has_client_key", AsyncMock(return_value=True)),
+        patch(f"{_SSH}.client_key", AsyncMock(return_value="private key")),
+        patch(f"{_SSH}.probe", AsyncMock(return_value=_found())),
+        patch(f"{_SSH}.get_computers_for_user", AsyncMock(return_value=[])),
+        patch(f"{_SSH}.SSHCreatePlan.recheck", recheck),
+    ):
+        resp = await client.post(
+            "/api/v1/computers", json={**_SSH_CREATE, "name": "Research box"}
+        )
+
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["code"] == "name_taken"
+    assert names_free.await_count == 2
+    assert capacity_lock == [USER]
+    recheck.assert_not_awaited()
+    manager.create_computer_for_user.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_rename_holds_the_lock_a_create_holds_to_its_insert(
+    client, computer, capacity_lock
+):
+    with (
+        patch("src.server.app.computers.get_computer", AsyncMock(return_value=computer)),
+        patch(
+            "src.server.app.computers.db_rename_computer",
+            AsyncMock(return_value={**computer, "name": "Lab"}),
+        ),
+        patch(
+            "src.server.app.computers.count_live_workspaces_by_computer",
+            AsyncMock(return_value={}),
+        ),
+    ):
+        resp = await client.patch(f"/api/v1/computers/{COMPUTER_ID}", json={"name": "Lab"})
+
+    assert resp.status_code == 200, resp.text
+    assert capacity_lock == [USER]
 
 
 @pytest.mark.asyncio

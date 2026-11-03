@@ -28,6 +28,7 @@ from src.server.database.conversation.threads_read import (
 )
 from src.server.database.user import get_user_profile_for_prompt
 from src.server.database.workspace import update_workspace_activity
+from src.server.services.commands.mirror import mirror_computer
 from src.server.services.computer_disk import TURN_MEASURE_MIN_INTERVAL_SECONDS
 from src.server.services.history.window import runs_held
 from src.server.services.runs.sse_producer import RunSSEProducer
@@ -708,6 +709,9 @@ async def astream_ptc_workflow(
         # One relay session per directly bound server, held for the run.
         direct_mcp = inputs.direct_mcp
 
+        # The user's other computers this turn's calls run on, which its end
+        # backs up beside its own.
+        reached_computers: set[str] = set()
         # DALTON-HOOK(colleague-dispatch): strip Task/schedule_wakeup on post-revocation tail turn
         ptc_graph = await build_ptc_graph_with_session(
             session=session,
@@ -745,6 +749,7 @@ async def astream_ptc_workflow(
             subagent_switch=partial(read_thread_subagents_allowed, thread_id),
             window_coverage=partial(runs_held, thread_id),
             cancel_notices=ThreadCancelNotices(thread_id, turn_context.tool_timezone),
+            reached_computers=reached_computers,
         )
 
         _mark_phase("graph_build")
@@ -983,6 +988,11 @@ async def astream_ptc_workflow(
                 logger.warning(
                     f"[PTC_COMPLETE] file backup failed for {thread_id}: {e}"
                 )
+            # What the Chief of Staff wrote on another computer has no turn of
+            # that computer's own to sweep it, so the mirror is owed until one
+            # succeeds, as a command's end there owes it.
+            for computer_id in sorted(reached_computers):
+                await mirror_computer(computer_id)
             # A turn is what fills the shared disk, so its end is when the
             # reading the warning and the next turn's context rely on moves.
             if session and session.computer_id:

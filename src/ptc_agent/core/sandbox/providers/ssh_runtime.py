@@ -169,6 +169,12 @@ class SSHRuntime(ExecSessionRuntime):
         # Every command's script sets __la_dir to this computer's own folder.
         return "$__la_dir/sessions"
 
+    async def login_home(self) -> str:
+        """The login user's home, which ``~`` names on the machine."""
+        link = await self._link()
+        assert link.facts is not None
+        return link.facts.home
+
     # -- Connections --
 
     async def _connect(self) -> Link:

@@ -16,10 +16,10 @@ import { GuardedLink } from '@/components/GuardedLink';
 import { appRoutePath } from '@/lib/appRoutes';
 import { copyText } from '@/lib/clipboard';
 import WorkspaceImage from './WorkspaceImage';
-import { isFilePath, isImagePath, normalizeFilePath, parseSiblingHref, parseWsPath } from '../utils/filePaths';
+import { isFilePath, isImagePath, normalizeFilePath, parseFolderHref, parseWsPath } from '../utils/filePaths';
 import { useWorkspaceFolders } from '../contexts/WorkspaceContext';
 import { useShareLinkOpener } from '../contexts/ShareLinkOpenerContext';
-import { parseAgentPath } from '../utils/agentPaths';
+import { onOtherComputer, parseAgentHref, parseAgentPath } from '../utils/agentPaths';
 import { normalizeFileRefs } from '../utils/normalizeFileRefs';
 import { splitFileLocation, type OpenFileHandler } from '../utils/fileLocation';
 import { mapOutsideCode, mapOutsideMultilineCode } from '../utils/markdownSegments';
@@ -952,19 +952,23 @@ function Markdown({ content, variant = 'panel', className = '', style, onOpenFil
         if (onOpenFile) {
           const wsRef = parseWsPath(href);
           const { path, location } = splitFileLocation(href!);
-          // A sibling's folder names that workspace as a `__wsref__` does, so
-          // the link opens there with the path inside it.
-          const sibling = parseSiblingHref(path, folders);
+          // Another workspace's folder names that workspace as a `__wsref__`
+          // does, so the link opens there with the path inside it.
+          const other = parseFolderHref(path, folders);
           // A rooted path through this workspace's own folder is a path in it,
           // and stripping the root alone would leave the folder as a
           // subdirectory. A relative one keeps its climb, which the handler
           // reads against the file it was written in.
           const rooted = parseAgentPath(path, folders?.rootDir).absolute;
+          const opened = other?.path ?? normalizeFilePath(path, rooted ? folders : null);
+          // The rest of another computer is on no machine this view reads, so
+          // the link opens nothing rather than a namesake here.
+          if (!other && !wsRef && onOtherComputer(parseAgentHref(path, folders?.rootDir), folders)) return <span {...props}>{children}</span>;
           return (
             <a
               className="underline hover:opacity-80 transition-opacity cursor-pointer"
               style={{ color: 'var(--color-accent-primary)' }}
-              onClick={(e: React.MouseEvent) => { e.preventDefault(); onOpenFile(sibling?.path ?? normalizeFilePath(path, rooted ? folders : null), wsRef?.workspaceId ?? sibling?.workspaceId, location ?? undefined, { rooted: rooted || !!wsRef || !!sibling }); }}
+              onClick={(e: React.MouseEvent) => { e.preventDefault(); onOpenFile(opened, wsRef?.workspaceId ?? other?.workspaceId, location ?? undefined, { rooted: rooted || !!wsRef || !!other }); }}
               {...props}
             >{children}</a>
           );

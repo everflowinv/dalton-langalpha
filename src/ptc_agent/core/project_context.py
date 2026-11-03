@@ -23,7 +23,9 @@ from typing import Any
 
 __all__ = [
     "ROOT_CLAIM",
+    "MachinePaths",
     "ProjectContext",
+    "context_without_project",
     "current_project",
     "require_project",
     "run_with_project",
@@ -33,6 +35,17 @@ __all__ = [
 
 #: Ledger key for a computer whose workspace has no folder of its own yet.
 ROOT_CLAIM = "_root"
+
+
+@dataclass(frozen=True, slots=True)
+class MachinePaths:
+    """How a call made from another computer names this one: by the machine's
+    own paths, so ``/x`` is ``/x``, not the folder's."""
+
+    #: The home of the user commands run as, where file calls run as that
+    #: user too: ``~`` names it, and the file tools reach the whole machine,
+    #: as a command there does, rather than only the root and ``/tmp``.
+    home: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +60,9 @@ class ProjectContext:
     #: Folders a rename moved this workspace out of that no sibling holds now,
     #: so an old spelling of a path still names this folder.
     previous_dir_names: tuple[str, ...] = field(default=())
+    #: Set for a call made from another computer, which knows this one only
+    #: by the machine's own paths; None for a turn's own virtual spelling.
+    machine: MachinePaths | None = None
 
     @property
     def claim(self) -> str:
@@ -84,6 +100,15 @@ def require_project() -> ProjectContext:
     ctx = _current.get()
     if ctx is None:
         raise LookupError("no project bound to this context")
+    return ctx
+
+
+def context_without_project() -> contextvars.Context:
+    """A copy of the running context with no project bound, to start a task
+    in that does machine work for no folder: waking another computer from
+    inside a turn, whose setup would lay the turn's folder out on it."""
+    ctx = contextvars.copy_context()
+    ctx.run(_current.set, None)
     return ctx
 
 

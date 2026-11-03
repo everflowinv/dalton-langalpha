@@ -23,9 +23,7 @@ vi.mock('@/hooks/useAllWorkspaces', () => ({
 }));
 
 vi.mock('../useComputers', () => ({
-  useComputerRootDir: (computerId: string | null | undefined) =>
-    mocks.computers.find((c) => c.computer_id === computerId)?.root_dir,
-  useComputerRootDirs: () => mocks.computers.map((c) => c.root_dir),
+  useComputerRoots: () => mocks.computers.map((c) => ({ computer_id: c.computer_id, root_dir: c.root_dir })),
 }));
 
 const viewed = (extra: Record<string, unknown> = {}) => ({
@@ -80,6 +78,26 @@ describe('useComputerFolders', () => {
     mocks.computers = [{ computer_id: 'c-1', root_dir: ROOT }];
     rerender();
     expect([pending, result.current]).toEqual(['Read memory', 'Read memory']);
+    mocks.computers = [];
+  });
+
+  it("places the other computers' workspaces under their roots, by the list when a row has none", () => {
+    // The Chief of Staff links a file on another computer at its whole path there.
+    mocks.viewed = viewed({ workspace_id: 'ws-home', dir_name: 'Home', root_dir: '/home/workspace' });
+    mocks.rows = [
+      mocks.viewed,
+      sibling(),
+      { workspace_id: 'ws-ssh', computer_id: 'c-2', dir_name: 'ssh-e2e', previous_dir_names: [], status: 'running', root_dir: null },
+    ];
+    mocks.computers = [
+      { computer_id: 'c-1', root_dir: '/home/workspace' },
+      { computer_id: 'c-2', root_dir: '/home/nosudo/langalpha-2/' },
+    ];
+    const { result } = renderHook(() => useComputerFolders('ws-home'));
+    expect(result.current?.siblings.map((s) => s.dirName)).toEqual(['AMD']);
+    expect(result.current?.otherComputers).toEqual([
+      { root: '/home/nosudo/langalpha-2', workspaces: [{ workspaceId: 'ws-ssh', dirName: 'ssh-e2e', previousDirNames: [] }] },
+    ]);
     mocks.computers = [];
   });
 

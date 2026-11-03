@@ -552,6 +552,10 @@ class DockerProvider(SandboxProvider):
     label = "Docker"
     runs_remote = False
     default_computer_name = "Local computer"
+    # Commands run as the image's user, but a write goes through the daemon as
+    # root, and in bind-mount mode a path outside the root lands in the host
+    # folder rather than the container.
+    files_as_command_user = False
 
     @classmethod
     def reports_own_disk(cls, settings: Any) -> bool:

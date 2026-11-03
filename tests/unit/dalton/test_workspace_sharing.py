@@ -1433,14 +1433,26 @@ class TestChiefOfStaffChannel:
                 return_value=colleague_ws,
             ),
         )
-        # Upstream's listing reads computer placement (names + home) instead of
-        # the old get_workspace/get_home_workspace_id pair Dalton's version used.
+        # Upstream's listing reads computer placement through get_computer_roster
+        # instead of the old get_computer_names_and_home; the row carries the
+        # kind, provider config, root and status the placement now folds in.
+        roster = [
+            {
+                "computer_id": "c-1",
+                "name": "Cloud computer",
+                "kind": None,
+                "provider_config": None,
+                "root_dir": "langalpha",
+                "status": "running",
+                "is_home": True,
+            }
+        ]
         monkeypatch.setattr(
             computer_db,
-            "get_computer_names_and_home",
+            "get_computer_roster",
             create_autospec(
-                computer_db.get_computer_names_and_home,
-                return_value=[{"computer_id": "c-1", "name": "Cloud computer", "is_home": True}],
+                computer_db.get_computer_roster,
+                return_value=roster,
             ),
         )
 
@@ -1464,7 +1476,7 @@ class TestChiefOfStaffChannel:
             home_id="ws-home",
             zone=ZoneInfo("UTC"),
             today=now.date(),
-            placement=_ComputerPlacement(home_computer_id="c-1"),
+            placement=_ComputerPlacement.from_rows(roster),
             colleague_workspaces=colleague_ws,
         )
         assert "Colleague workspaces shared with your Chief of Staff" in rendered

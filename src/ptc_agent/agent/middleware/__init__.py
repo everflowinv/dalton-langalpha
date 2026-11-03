@@ -28,6 +28,7 @@ from .repeat_guard import RepeatCallGuardMiddleware
 # Tool middleware (argument parsing, error handling, result normalization, leak detection, code validation, empty call retry)
 from .tool import (
     CodeValidationMiddleware,
+    ComputerArgumentGuardMiddleware,
     EmptyToolCallRetryMiddleware,
     LeakDetectionMiddleware,
     ProtectedPathMiddleware,
@@ -138,6 +139,7 @@ __all__ = [
     "MultimodalStripMiddleware",
     # Tool middleware
     "CodeValidationMiddleware",
+    "ComputerArgumentGuardMiddleware",
     "EmptyToolCallRetryMiddleware",
     "LeakDetectionMiddleware",
     "ProtectedPathMiddleware",

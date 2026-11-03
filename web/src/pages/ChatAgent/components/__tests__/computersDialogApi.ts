@@ -14,6 +14,7 @@ export async function computersApi() {
     getWorkspaces: vi.fn(),
     getComputerStorage: vi.fn(),
     createComputer: vi.fn(),
+    renameComputer: vi.fn(),
     startComputer: vi.fn(),
     stopComputer: vi.fn(),
     deleteComputer: vi.fn(),

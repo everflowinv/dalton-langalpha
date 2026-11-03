@@ -58,9 +58,12 @@ def lexical_path(path: str) -> str:
     here to resolve against, and an uncollapsed ``..`` reads as an ordinary
     segment -- which lets a path spell its way into a folder the same test
     refuses by its real name. POSIX semantics because the sandbox is Linux
-    whatever the host is.
+    whatever the host is. POSIX leaves a leading ``//`` to the system and
+    ``normpath`` keeps it, but Linux reads it as ``/``: kept, it would walk
+    past every prefix test written for ``/``.
     """
-    return posixpath.normpath(path)
+    normal = posixpath.normpath(path)
+    return "/" + normal.lstrip("/") if normal.startswith("//") else normal
 
 
 # Name prefixes, not paths, so not on SandboxLayout, whose every constant is a
@@ -817,6 +820,25 @@ def resolve_agent_path(
     if path.startswith("/"):
         return lexical_path(f"{workspace}{path}")
     return lexical_path(f"{workspace}/{path}")
+
+
+def machine_path(path: str | None, *, base: str, home: str | None = None) -> str:
+    """A path as the machine spells it: absolute as written, relative from
+    ``base``. For a call with no virtual namespace, where folding ``/x`` under
+    a folder would quietly name another file than the one the agent meant.
+
+    ``~`` and ``~/x`` name ``home``, the login user's on that machine. Without
+    one, and for ``~user``, the path is left as written, which no allow list
+    holds.
+    """
+    candidate = (path or "").strip()
+    if candidate in ("", "."):
+        return base
+    if home and (candidate == "~" or candidate.startswith("~/")):
+        return lexical_path(f"{home.rstrip('/')}/{candidate[2:]}")
+    if candidate.startswith(("/", "~")):
+        return lexical_path(candidate)
+    return lexical_path(f"{base}/{candidate}")
 
 
 def virtual_agent_path(path: str, *, workspace: str, root: str) -> str:

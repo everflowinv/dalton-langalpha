@@ -1,5 +1,6 @@
 import type { ActivityItem, ToolActivityItem } from './activityTypes';
 import { categorizeTool } from '../toolDisplayConfig';
+import { calledOn } from '../../utils/agentPaths';
 
 /** The verbs whose consecutive calls read as one act on a set of files. */
 export const GROUPABLE_FILE_TOOLS = new Set(['Read', 'Edit', 'Write']);
@@ -30,6 +31,10 @@ export function groupFileToolRuns(items: ActivityItem[]): ActivityItem[][] {
       // landed. Grouping is for calls that read as one act; a failure is its
       // own act.
       && failed(last[0]) === failed(item)
+      // A run's pills name its files once each, and a pill opens its file on
+      // this computer or, for a call on another, the call: so a run keeps to
+      // one computer.
+      && calledOn(last[0].toolCall?.args) === calledOn(item.toolCall?.args)
     ) {
       last.push(item);
       continue;

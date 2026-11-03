@@ -31,6 +31,7 @@ from ptc_agent.agent.middleware.compaction.utils import (
     parse_summary_message,
 )
 from ptc_agent.agent.middleware.tool.argument_parsing import parse_tool_args
+from ptc_agent.agent.tools.computer_reach import ran_elsewhere
 from ptc_agent.agent.transcript.classify import STEERING_MARKERS, human_kind
 from src.llms.content_utils import extract_content_with_type
 from src.llms.token_counter import extract_token_usage
@@ -423,6 +424,8 @@ def _derive_artifact(
     tool_call_id = message.tool_call_id
 
     if tool_name in _FILE_OPERATION_TOOLS:
+        if ran_elsewhere(args):
+            return None
         payload: dict[str, Any] = {
             "operation": tool_name,
             "file_path": args.get("file_path", ""),

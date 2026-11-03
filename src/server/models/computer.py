@@ -310,7 +310,10 @@ class ComputerCreate(BaseModel):
         None,
         min_length=1,
         max_length=255,
-        description="User-facing computer name; a default is used when absent",
+        description=(
+            "User-facing computer name, unique among the user's computers; "
+            "a default is used when absent or blank"
+        ),
     )
     resource_tier: ResourceTierId = Field(
         "standard",
@@ -335,6 +338,14 @@ class ComputerCreate(BaseModel):
             "without them"
         ),
     )
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _trimmed_name(cls, value: Any) -> Any:
+        # Compared trimmed against the user's other names, so stored that way.
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
 
     @model_validator(mode="after")
     def _ssh_only_with_its_kind(self) -> "ComputerCreate":
@@ -604,6 +615,12 @@ class ComputerProviderOption(BaseModel):
             "machine is its owner's and they size it"
         ),
     )
+    default_name: str = Field(
+        description=(
+            "What a computer created here without a name is called, before it "
+            "is numbered past the user's other computers' names"
+        )
+    )
 
 
 class ComputerProvidersResponse(BaseModel):
@@ -652,7 +669,9 @@ class ComputerRenameRequest(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     name: str = Field(
-        min_length=1, max_length=255, description="New user-facing computer name"
+        min_length=1,
+        max_length=255,
+        description="New user-facing computer name, unique among the user's computers",
     )
 
 

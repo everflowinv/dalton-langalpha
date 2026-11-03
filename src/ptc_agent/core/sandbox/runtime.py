@@ -335,6 +335,13 @@ class SandboxRuntime(ABC):
         keeps this default."""
         return await self.exec(command, timeout, env=env)
 
+    async def login_home(self) -> str:
+        """The home ``~`` names for the user commands run as; empty when the
+        machine does not say."""
+        result = await self.exec('printf %s "$HOME"', timeout=15)
+        home = result.stdout.strip() if result.exit_code == 0 else ""
+        return home if home.startswith("/") else ""
+
     # -- File I/O --
 
     @abstractmethod
@@ -512,6 +519,10 @@ class SandboxProvider(ABC):
     # What a new computer is called until its owner names it. A user reads the
     # name before anything else about the machine, so it says where it runs.
     default_computer_name: ClassVar[str] = "Cloud computer"
+    # Whether a file read or write here runs as the user a command runs as, so
+    # a file call may reach the whole machine without reaching anything a
+    # command there cannot.
+    files_as_command_user: ClassVar[bool] = True
 
     @classmethod
     def platform_secret_name(cls, name: str) -> str:

@@ -776,3 +776,24 @@ class TestDescription:
             "running, end the command with & and send its output to a file, as in\n"
             "nohup python -m http.server 8050 > server.log 2>&1 &"
         )
+
+
+def test_a_hand_off_names_the_log_alone_on_the_turns_own_computer():
+    ref = SimpleNamespace(log_relpath=".agents/threads/6a7c8021/commands/c1.log")
+    assert _hand_off().log_path(ref) == ref.log_relpath
+
+
+def test_a_hand_off_on_another_computer_names_it_beside_the_log():
+    ref = SimpleNamespace(log_relpath="/home/user/langalpha/logs/c1.log")
+    on_mac = HandOff(
+        thread_id=THREAD,
+        user_id="user-1",
+        workspace_id=WORKSPACE,
+        wakeups=True,
+        computer="Studio Mac",
+        computer_id="22222222-2222-2222-2222-222222222222",
+    )
+    assert on_mac.log_path(ref) == (
+        '/home/user/langalpha/logs/c1.log on computer "Studio Mac" '
+        "(computer_id 22222222-2222-2222-2222-222222222222)"
+    )

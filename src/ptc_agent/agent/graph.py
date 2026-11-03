@@ -10,6 +10,7 @@ from ptc_agent.agent.middleware.runtime_context.epoch import Workspace
 from ptc_agent.agent.middleware.compaction.window import WindowCoverage
 from ptc_agent.agent.middleware.subagent_switch import SubagentSwitchReader
 from ptc_agent.agent.middleware.wakeups import CancelNotices
+from ptc_agent.agent.tools.computer_reach import ComputerReach
 from ptc_agent.config import AgentConfig
 from ptc_agent.core.project_context import ProjectContext
 from ptc_agent.core.session import Session
@@ -66,30 +67,45 @@ _HOME_DESCRIPTION = (
 
 async def _read_harness_blocks(
     user_id: str | None,
+    session: Session,
     home_id: str,
     thread_id: str | None,
     turn_context: TurnContext | None,
     role: AgentRole,
-) -> dict[str, str | None]:
-    """The baseline blocks the role adds, keyed by kind, read before the build.
+    touched: set[str] | None = None,
+) -> tuple[dict[str, str | None], ComputerReach | None]:
+    """The baseline blocks the role adds, keyed by kind, read before the build,
+    and the reach of its tools.
 
     A kind left out is a block this build does not have, so the analyst's
     build reads nothing. A None value is a read that did not answer, which the
     baseline marks as a hole and asks again next turn. A Chief of Staff with
     no user has no activity to read, so its build leaves the block out rather
-    than marking a hole that no later turn could fill.
+    than marking a hole that no later turn could fill. The user's computers
+    are read once for both: ``<activity>`` tells the agent which computers to
+    name, and the reach is None when there is no other, which leaves the
+    ``computer`` argument off its tools.
     """
     if role != "chief_of_staff" or not user_id:
-        return {}
+        return {}, None
+    from src.server.database.computer import get_computer_roster
+    from src.server.services.computer_reach import turn_computers
     from src.tools.secretary.activity import read_activity
 
+    try:
+        computers = await get_computer_roster(user_id)
+    except Exception:  # noqa: BLE001 - the turn runs on its own computer
+        logger.warning("Could not read the computers of %s", user_id, exc_info=True)
+        return {"activity": None}, None
     activity = await read_activity(
         user_id,
         home_id=home_id,
         thread_id=thread_id,
         timezone=turn_context.tool_timezone if turn_context else "UTC",
+        computers=computers,
     )
-    return {"activity": activity}
+    reach = turn_computers(user_id, session.computer_id, session, computers, touched)
+    return {"activity": activity}, reach
 
 
 async def _read_workspace_naming(
@@ -224,6 +240,7 @@ async def build_ptc_graph_with_session(
     # DALTON-HOOK(colleague-dispatch): workspace owner identity and tail-turn tool trimming
     workspace_owner_id: str | None = None,
     tail_turn_no_new_work: bool = False,
+    reached_computers: set[str] | None = None,
 ) -> Any:
     """Build a BackgroundSubagentOrchestrator from a pre-acquired session (WorkspaceManager path).
 
@@ -244,6 +261,8 @@ async def build_ptc_graph_with_session(
     main agent trim its checkpoint to its window (see ``compaction.window``);
     a build without one never trims. ``cancel_notices`` tells the agent of
     the user's cancels of its wakeups; a build without one tells it of none.
+    ``reached_computers`` collects the user's other computers a Chief of Staff
+    turn ran calls on, for the turn's end to back up.
     """
     mcp_registry = (
         tool_view.mcp_registry if tool_view is not None else session.mcp_registry
@@ -268,12 +287,15 @@ async def build_ptc_graph_with_session(
         user_data_counts,
         ptc_agent,
         workspace,
-        harness_blocks,
+        (harness_blocks, computers),
     ) = await asyncio.gather(
         fetch_user_data_counts(user_id),
         asyncio.to_thread(PTCAgent, config),
         _read_workspace_naming(workspace_id, role),
-        _read_harness_blocks(user_id, workspace_id, thread_id, turn_context, role),
+        _read_harness_blocks(
+            user_id, session, workspace_id, thread_id, turn_context, role,
+            reached_computers,
+        ),
     )
 
     # DALTON-HOOK(colleague-dispatch): merge workspace owner B's and caller A's vault secrets for leak detection
@@ -355,6 +377,7 @@ async def build_ptc_graph_with_session(
             if tail_turn_no_new_work
             else {}
         ),
+        computers=computers,
     )
 
     logger.debug(

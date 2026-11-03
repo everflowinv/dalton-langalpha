@@ -1592,6 +1592,7 @@
     "empty": "还没有计算机。创建第一个工作区时会自动建一台。",
     "nameLabel": "名称",
     "nameFromMachine": "默认使用机器的名称",
+    "nameTaken": "你已有一台名为“{{name}}”的计算机，请换一个名称。",
     "namePlaceholderCloud": "云端计算机",
     "namePlaceholderLocal": "本地计算机",
     "tierLabel": "计算机规格",
