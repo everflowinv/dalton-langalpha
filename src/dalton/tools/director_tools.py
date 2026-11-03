@@ -29,6 +29,11 @@ from src.dalton.autonomy.tracking import (
     resolve_workspace_id_by_ticker,
     resolve_workspace_id_by_ticker_any_owner,
 )
+from src.dalton.coverage.models import (
+    canonical_ledger_sha256,
+    validate_earnings_calendar_ledger,
+)
+from src.dalton.coverage.service import publish_user_earnings_calendar_mirror
 from src.dalton.coverage.unit_errors import classify_coverage_unit_error
 from src.dalton.coverage.units import (
     archive_coverage_unit,
@@ -1196,6 +1201,118 @@ def build_director_tools(
             ensure_ascii=False,
         )
 
+    @tool("dalton_publish_earnings_calendar")
+    async def dalton_publish_earnings_calendar(
+        config: RunnableConfig = None,
+    ) -> str:
+        """Publish the Home workspace's `dalton/earnings-calendar.json` to the server-side mirror.
+
+        Call it from the Home (Research Director) thread as the LAST step of a
+        `dalton-earnings-calendar` run, after Step 6 reconciliation: the sandbox cannot reach
+        the mirror endpoint itself (`calendar_state.py publish` dials the backend over HTTP and
+        fails there with Connection refused), so this server-side tool is the only publish path.
+        Reads the ledger, validates it (entries keyed by ticker, valid statuses, ≤1 MB), stores
+        it under the calling user, and returns the ledger's content hash. `dalton_check_done`
+        for `dalton-earnings-calendar` requires this round's mirror to carry the CURRENT
+        ledger's hash, so a ledger edited after publishing — or never published — reads as
+        未完成. On `ok=false` fix the named cause and call again: `ledger_not_found` means the
+        run has not written the ledger yet; `invalid_json` / `invalid_ledger` name the field to
+        fix. Never tell the PM the calendar was published while `ok=false`.
+
+        Returns:
+            JSON `{ok, entries_count, reported_count, published_at, ledger_sha256}` on success; `{ok: false, error, message}` naming the cause otherwise.
+        """
+        configurable = (config or {}).get("configurable") or {}
+        user_id = str(configurable.get("user_id") or "").strip()
+        if not user_id:
+            raise ValueError("user_id is required")
+
+        ledger_rel_path = "dalton/earnings-calendar.json"
+        if filesystem_backend is None:
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": "no_backend",
+                    "message": f"当前没有可用的文件后端，读不到 Home 工作区的 {ledger_rel_path}，无法发布镜像。",
+                },
+                ensure_ascii=False,
+            )
+        try:
+            raw = await filesystem_backend.aread_text(ledger_rel_path)
+        except Exception as e:
+            logger.warning("[DALTON_DIRECTOR] read ledger for publish failed: %s", e)
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": "read_failed",
+                    "message": f"读取 {ledger_rel_path} 失败（{e}）；确认台账已写出后重试。",
+                },
+                ensure_ascii=False,
+            )
+        if raw is None:
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": "ledger_not_found",
+                    "message": (
+                        f"Home 工作区没有可读的 {ledger_rel_path}：本轮还没有写出财报日历台账。"
+                        "先按 SKILL Step 5 用 calendar_state.py mark 更新台账，再回来发布。"
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        try:
+            ledger = json.loads(raw)
+        except ValueError as e:
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error": "invalid_json",
+                    "message": f"{ledger_rel_path} 不是合法 JSON（{e}）；修好文件再发布。",
+                },
+                ensure_ascii=False,
+            )
+        try:
+            validated = validate_earnings_calendar_ledger(
+                ledger, raw_bytes_len=len(raw.encode("utf-8"))
+            )
+        except ValueError as e:
+            return json.dumps(
+                {"ok": False, "error": "invalid_ledger", "message": str(e)},
+                ensure_ascii=False,
+            )
+        try:
+            result = await publish_user_earnings_calendar_mirror(
+                user_id,
+                validated,
+                raw_bytes_len=len(raw.encode("utf-8")),
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning("[DALTON_DIRECTOR] publish earnings calendar failed: %s", e)
+            return json.dumps(
+                {"ok": False, "error": "publish_failed", "message": str(e)},
+                ensure_ascii=False,
+            )
+        ledger_sha = canonical_ledger_sha256(validated)
+        return json.dumps(
+            {
+                "ok": True,
+                "entries_count": result.get("entries_count"),
+                "reported_count": result.get("reported_count"),
+                "published_at": result.get("published_at"),
+                "ledger_sha256": ledger_sha,
+                "message": (
+                    f"已发布财报日历镜像（{result.get('entries_count')} 家待披露、"
+                    f"{result.get('reported_count')} 家已披露），台账内容哈希 {ledger_sha}；"
+                    "此后再改台账须重新发布，否则 dalton_check_done 记为不一致。"
+                ),
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+
     @tool("dalton_schedule_automation")
     async def dalton_schedule_automation(
         action: str,
@@ -1801,6 +1918,7 @@ def build_director_tools(
             dalton_agenda_note,
             dalton_watch_event,
             dalton_resolve_signals,
+            dalton_publish_earnings_calendar,
             dalton_schedule_automation,
             dalton_coverage_tracking,
             dalton_system_jobs,

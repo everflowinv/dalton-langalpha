@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import date, datetime, timezone
 from typing import Any, Mapping
@@ -357,6 +358,22 @@ def dump_coverage_yaml(doc: dict[str, Any]) -> str:
     )
 
 
+def canonical_ledger_sha256(ledger: Mapping[str, Any]) -> str:
+    """Content hash of a ledger, stable across storage round-trips.
+
+    The mirror column is jsonb, which does not preserve key order, and
+    ``validate_earnings_calendar_ledger`` reorders top-level keys — so the only
+    hash that can compare a published mirror against the file on disk is one
+    taken over a canonical form (sorted keys, fixed separators). Both sides
+    must pass through ``validate_earnings_calendar_ledger`` before hashing so
+    the normalization itself cannot introduce a difference.
+    """
+    canonical = json.dumps(
+        dict(ledger), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def validate_earnings_calendar_ledger(
     ledger: Any,
     *,
@@ -417,9 +434,14 @@ def validate_earnings_calendar_ledger(
     updated = ledger.get("updated")
     if updated is not None and not isinstance(updated, str):
         raise ValueError("Ledger 'updated' field must be a string")
+    # No clock read here: defaulting a missing date to ``today()`` made the
+    # same file hash differently across midnight (publish vs later check), so
+    # a missing/empty ``updated`` is a validation error, never filled in.
+    if not (isinstance(updated, str) and updated.strip()):
+        raise ValueError("台账缺少 updated 日期（Ledger 'updated' field is required, YYYY-MM-DD）")
 
     out: dict[str, Any] = {
-        "updated": updated or date.today().isoformat(),
+        "updated": updated,
         "entries": normalized_entries,
         "reported": normalized_reported,
     }

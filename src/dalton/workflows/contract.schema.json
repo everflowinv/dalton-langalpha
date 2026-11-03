@@ -378,6 +378,34 @@
           },
           "description": "推送稿审查：要求推送稿文件存在、修改时间不早于本轮运行开始时间，且完成两轮语言审查（最后一条第 2 轮 draft_sha256 等于当前文件哈希）。"
         },
+        "earnings_calendar_mirror": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ledger"
+          ],
+          "properties": {
+            "ledger": {
+              "type": "string",
+              "minLength": 1,
+              "description": "财报日历台账路径模板（相对 Home 工作区根，如 dalton/earnings-calendar.json）。"
+            }
+          },
+          "description": "镜像发布检查：本轮时间窗口内 dalton_earnings_calendar_mirror 有一次发布，且镜像内容与当前台账文件一致（canonical JSON 哈希相同）。未发布、发布不在本轮窗口、内容不一致、台账读不到/损坏/校验不过均记 missing，下一步指向 dalton_publish_earnings_calendar。"
+        },
+        "calendar_wake_signal": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "probe": {
+              "type": "string",
+              "minLength": 1,
+              "default": "calendar",
+              "description": "唤醒信号的 probe 名（财报日历为 calendar）。"
+            }
+          },
+          "description": "唤醒信号关闭检查：只看核对时刻当周（ISO 周，自动任务时区）该 probe 的 weekly:<ISO 周> 信号；状态为 pending 或 woken 记 missing（下一步指向 dalton_resolve_signals），resolved（已关闭）与 expired（历史遗留）不记。信号行不存在（本周未排程）时不检查该项。"
+        },
         "knowledge_docs_requires_param": {
           "type": "object",
           "additionalProperties": {

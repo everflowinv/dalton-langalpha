@@ -104,7 +104,7 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
    - `"{公司}" "to report" "{季度}" results`（限 180 天内）
    - `"{公司}" earnings date announcement`（限 180 天内）
 2. **官方源确认**：美股阅读公司 IR 页面（`coverage.yaml` 中的 `earnings.ir_url`）或 SEC 8-K/6-K 原文确认；港股与 A 股调用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=SEARCH_START_DATE, end=TODAY, limit=20)`（港股传 5 位零填充纯数字如 `"00700"`，A 股传 6 位纯数字如 `"600519"`）检索巨潮资讯披露的董事会会议召期通告（Date of Board Meeting）或定期报告预约披露公告原文（港股若 `cn-hk filings` 未覆盖则用 `web_search` 查披露易 `site:hkexnews.hk` 原文链接确认）。判定标准严格执行 [`references/classification.md`](references/classification.md)。
-3. **逐家追加 JSONL**：每查完一家，立即用 `json.dumps` 追加一行到 `Home/dalton/research/earnings-scan-<YYYY-MM-DD>.jsonl`（禁止手写字符串拼接）。字段固定为：
+3. **逐家追加 JSONL**：每查完一家，立即用 `json.dumps` 追加一行到 `dalton/research/earnings-scan-<YYYY-MM-DD>.jsonl`（本 skill 在 Home 工作区运行，路径相对 Home 根；禁止手写字符串拼接）。字段固定为：
    `ticker, name, status, earnings_date, timing, quarter_label, confidence, source_url, evidence, notes`
    - 工具报错或超时写 `"status": "scan_failed"`，**严禁写成 `"not_announced"`**。
    - 仅有聚合站/FMP/yfinance 日期时，写 `"status": "pending"`，在 `earnings_date` 记录候选日期，`confidence: "estimated"`，并在 `notes` 注明候选来源。
@@ -174,7 +174,7 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
 1. **扫描文件 vs 台账对账**：
    ```bash
    python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json diff \
-     --scan Home/dalton/research/earnings-scan-$(date +%F).jsonl
+     --scan dalton/research/earnings-scan-$(date +%F).jsonl
    ```
    检查 `missing` 与 `date_mismatch`。
 2. **自动任务文件读回核验**：
@@ -184,25 +184,26 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
    - 若读回不可用，只能报告“本地已记录”，严禁报告“对账通过”；
    - 对账未通过的公司及原因逐条进入总结第 2 项“**未落库**”。
 
-### Step 7：发布台账镜像、按固定顺序输出总结并关闭唤醒信号
+### Step 7：发布镜像、关闭唤醒信号、写推送稿并输出总结
 
-在台账写完并通过对账后，运行 `publish` 子命令将 `Home/dalton/earnings-calendar.json` 发布到服务端镜像（`PUT /api/v1/dalton/earnings/calendar/mirror`，认证方式与 `PUT /api/v1/dalton/automations/{name}` 一致，最大 1 MB）：
+在台账写完并通过对账后，**先完成两个收尾动作**——它们都在写推送稿、跑语言审查之前，这样总结里写下的结果不会再变：
 
-```bash
-python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json publish
-```
+1. **发布台账镜像（`dalton_publish_earnings_calendar`）**：调用**服务端工具** `dalton_publish_earnings_calendar`（无参数），把 `Home/dalton/earnings-calendar.json` 发布到服务端镜像（最大 1 MB）。沙箱里连不上后端，不要再跑 `calendar_state.py publish`——该子命令只在宿主机明确配置了后端地址（`--api-url` 或 `DALTON_API_URL` 等）时可用。
+   - 确认返回 `ok=true`（含 `entries_count`、`published_at`、`ledger_sha256`）才算发布成功；
+   - `ok=false` 时按返回的 `error` 与 `message` 修复后重试一次：`ledger_not_found`＝台账尚未写出（回到 Step 5），`invalid_json` / `invalid_ledger`＝按 message 修文件再发；仍失败就在总结里如实写明“**台账镜像未发布**”及原因，**不得说已发布**；
+   - 发布之后再改台账（任何 `mark` / `roll`），必须重新调用本工具，否则完成契约会记为“镜像与当前台账不一致”。
+2. **关闭日历唤醒信号（`dalton_resolve_signals`）**：**不论本次刷新是否由 `<dalton_wake>` 信号唤醒，都调用一次**。先算当周 ISO 周（按 Asia/Shanghai——自动任务时区，与 `dalton_check_done` 的判定口径一致——形如 `2026-W44`），然后调用 `dalton_resolve_signals(signal_keys=["weekly:<当周 ISO 周>"], probe="calendar", note="完成本周财报日历核查与议程同步")`；若本轮 `<dalton_wake>` 里还带了其他 `probe="calendar"` 的信号（如 `group_refresh:<日期>`），把这些 signal_key 一并加进同一次调用。
+   - 这个调用可以重复：本周没有待关闭的信号时返回 `ok=false`、`resolved_count=0` 且没有 `error` 字段，这是正常结果，在总结里照实写“当周日历信号已关闭或本就不存在”即可，**不要当作失败，也不要原样反复重试**；
+   - 返回里带 `error` 时才是调用出了问题：`error` 是 `empty_signal_keys` / `missing_probe`，说明参数写错了，改正后重试一次；其他 `error` 在总结里如实写明“未能关闭信号”及原因，不得说已关闭。
 
-总结必须严格按以下 6 项顺序输出（第 2、3 项永远出现；仅当第 2、3 项均为“无”且其余无异常时可简短收尾）：
+两个收尾动作完成后，再写推送稿并按“收尾门禁”完成两轮语言审查，最后输出总结。总结必须严格按以下 6 项顺序（第 2、3 项永远出现；仅当第 2、3 项均为“无”且其余无异常时可简短收尾）：
 
 1. **新确认**：公司 / 财季 / 发布日期 / BMO·AMC（含发布与电话会时间）/ 官方来源链接
 2. **未落库**：对账未通过的公司 + 具体原因（没有写“无”）
 3. **解析失败行**：Step 4 捕获的 JSONL 坏行清单（没有写“无”）
 4. **改期**：公司 / 旧日期 → 新日期 / 改期原因 / 自动任务原地更新状态
-5. **本周已发布、仍待官宣与缺工作区**：本轮 `roll` 移入 `reported` 的公司、仍处于 `pending` 的数量（附带 `date_status: estimated`“待确认”候选日期的公司列表）、缺工作区的 Core 公司
+5. **本周已发布、仍待官宣与缺工作区**：本轮 `roll` 移入 `reported` 的公司、仍处于 `pending` 的数量（附带 `date_status: estimated`“待确认”候选日期的公司列表）、缺工作区的 Core 公司、以及**台账镜像与当周信号**的关闭结果（发布是否成功、`resolved_count` 各是多少）
 6. **扫描失败的公司**：`status: "scan_failed"` 的公司及失败原因（没有写“无”）
-
-**收尾关闭唤醒信号（`dalton_resolve_signals`）**：
-若本次刷新由 `<dalton_wake>` 信号唤醒（例如 `probe="calendar"`、`signal_key="weekly:<ISO 周>"` 如 `"weekly:2026-W43"`），在完成对账与总结后调用 `dalton_resolve_signals(signal_keys=["weekly:<ISO 周>"], probe="calendar", note="完成本周财报日历核查与议程同步")` 关闭自己 Home 工作区的日历唤醒信号，确认返回的 `resolved_count >= 1`。
 
 ### 收尾门禁：汇报完成前必须过完成契约（`dalton_check_done`）
 
@@ -225,7 +226,7 @@ python3 .agents/skills/dalton-earnings-calendar/scripts/calendar_state.py --json
   "trigger_type": "cron",
   "cron_expression": "0 9 * * 6",
   "timezone": "Asia/Shanghai",
-  "instruction": "/dalton-earnings-calendar 全名单 —— 按 skill 流程滚动、扫描（只认官方来源，候选日期标待确认）、用 dalton_schedule_automation(action=\"upsert\", ...) 建/改 tm3/t0/tp1 自动任务、用 dalton_watch_event 同步各公司 watch.events、对账，按固定顺序总结后调用 dalton_resolve_signals(probe=\"calendar\", ...) 关闭本周唤醒信号。",
+  "instruction": "/dalton-earnings-calendar 全名单 —— 按 skill 流程滚动、扫描（只认官方来源，候选日期标待确认）、用 dalton_schedule_automation(action=\"upsert\", ...) 建/改 tm3/t0/tp1 自动任务、用 dalton_watch_event 同步各公司 watch.events、对账；收尾先调用 dalton_publish_earnings_calendar 发布台账镜像，再调用 dalton_resolve_signals(probe=\"calendar\", ...) 关闭本周唤醒信号，然后写推送稿完成两轮 check_language，最后用 dalton_check_done(workflow=\"dalton-earnings-calendar\", ...) 核对通过后汇报完成。",
   "workspace_id": "home",
   "thread": "new"
 }

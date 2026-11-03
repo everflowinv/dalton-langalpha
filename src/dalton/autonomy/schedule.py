@@ -455,7 +455,10 @@ def build_global_director_specs(
             "thread_strategy": "new",
             "instruction": (
                 "请按 `.agents/skills/dalton-earnings-calendar/SKILL.md` 扫描覆盖池未来 21 天的财报披露日，"
-                "更新 `dalton/earnings_calendar.md` 并为即将披露的 Core 公司排期 T-3 / T+0 / T+1 任务。"
+                "维护 `dalton/earnings-calendar.json` 台账，并为即将披露的 Core 公司排期 T-3 / T0 / T+1 任务。"
+                "收尾先调用 `dalton_publish_earnings_calendar` 发布台账镜像、"
+                "用 `dalton_resolve_signals(probe=\"calendar\", ...)` 关闭本周日历唤醒信号，"
+                "再写推送稿完成两轮语言审查，最后用 `dalton_check_done(workflow=\"dalton-earnings-calendar\", ...)` 核对通过后汇报完成。"
             ),
             "metadata": {
                 "dalton_managed": True,
