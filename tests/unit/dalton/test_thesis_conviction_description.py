@@ -38,6 +38,6 @@ def test_description_states_robustness_semantics() -> None:
     ):
         assert level in desc and meaning in desc
     # none 只属于 no_view；"预期差不够"不再是写 none 的理由。
-    assert "只用于 stance=no_view" in desc
+    assert "只用于 `stance` 为 `no_view`" in desc
     assert "不得用来表达" in desc
     assert "没有足够预期差时写 none" not in desc

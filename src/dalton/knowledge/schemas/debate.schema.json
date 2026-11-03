@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema", "$id": "https://dalton.local/schemas/debate",
   "type": "object", "additionalProperties": false,
   "properties": {
-    "schema_version": {"const": 1}, "as_of": {"$ref": "common#/$defs/isoTime"},
+    "schema_version": {"enum": [1, 2]}, "as_of": {"$ref": "common#/$defs/isoTime"},
     "debates": {"type": "array", "items": {"$ref": "#/$defs/debate"}}
   },
   "required": ["schema_version","as_of","debates"],
@@ -12,13 +12,49 @@
                      "evidence_ids": {"type": "array", "items": {"type": "string"}},
                      "evidence_refs": {"type": "array", "items": {"$ref": "common#/$defs/evidenceRef"}}},
       "required": ["case"]},
+    "estimate": {
+      "type": "object", "additionalProperties": false,
+      "description": "单方预期值：`sources` 必须至少有一条来源引用；`basis` 填会计或统计口径（如 `GAAP`、`non_GAAP`）",
+      "properties": {
+        "value": {"oneOf": [{"type": "null"}, {"$ref": "common#/$defs/range"}, {"type": "number"}]},
+        "basis": {"type": "string", "minLength": 1},
+        "as_of": {"type": "string", "minLength": 1},
+        "sources": {"$ref": "common#/$defs/sourceRefList"},
+        "note": {"type": ["string", "null"]},
+        "confidence": {"enum": ["high", "medium", "low"]}
+      },
+      "required": ["value", "basis", "as_of", "sources"]
+    },
+    "expectation": {
+      "type": "object", "additionalProperties": false,
+      "description": "分歧指标预期对照：若 `street`、`buyside`、`house` 中非空条目的 `basis` 不一致或含 `unknown`，`gap` 必须填 `null`。当 `frozen_pre_event` 为 `true` 时，`reconstructed` 必须为 `false`，且必须填写非空 `event_id` 及严格早于事件发布时间 `t0` 的 `published_at`、`acquired_at`、`frozen_at`（新增或补标冻结时，文档的 `as_of` 也必须早于 `t0`；已经冻结的条目以后不受这条限制，文档更新时间可以晚于事件）；锁定后不可删除或修改任何字段",
+      "properties": {
+        "metric": {"type": "string", "minLength": 1},
+        "period": {"type": "string", "minLength": 1},
+        "unit": {"type": ["string", "null"]},
+        "street": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/estimate"}]},
+        "buyside": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/estimate"}]},
+        "house": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/estimate"}]},
+        "gap": {"oneOf": [{"type": "null"}, {"type": "number"}, {"type": "string"}, {"$ref": "common#/$defs/range"}]},
+        "frozen_pre_event": {"type": "boolean"},
+        "event_id": {"type": ["string", "null"]},
+        "t0": {"type": ["string", "null"]},
+        "published_at": {"type": ["string", "null"]},
+        "acquired_at": {"type": ["string", "null"]},
+        "frozen_at": {"type": ["string", "null"]},
+        "reconstructed": {"type": "boolean"}
+      },
+      "required": ["metric", "period"]
+    },
     "debate": {"type": "object", "additionalProperties": false,
       "properties": {
         "id": {"type": "string", "pattern": "^D\\d+$"},
         "variable": {"type": "string", "description": "分歧变量，如 FY26 Capex 指引上限"},
         "question": {"type": "string"},
-        "why_it_matters": {"type": "string", "description": "对 EPS / 倍数 / 股价的量级"},
-        "rank": {"type": "integer", "minimum": 1},
+        "why_it_matters": {"type": "string", "description": "对 EPS / 倍数 / 股价的影响量级。当 `status` 为 `open` 时必填"},
+        "rank": {"type": "integer", "minimum": 1, "description": "分歧重要性排序（从 1 开始的正整数）。当 `status` 为 `open` 时必填"},
+        "transmission": {"enum": ["eps_only", "multiple_only", "both"], "description": "对估值的影响路径（仅盈利 `eps_only`、仅估值倍数 `multiple_only` 或两者兼具 `both`）。当 `status` 为 `open` 时必填"},
+        "expectations": {"type": "array", "maxItems": 3, "items": {"$ref": "#/$defs/expectation"}, "description": "关键指标预期对照列表（最多 3 条）"},
         "bull": {"$ref": "#/$defs/side"}, "bear": {"$ref": "#/$defs/side"},
         "strongest_rebuttal": {"type": "object", "additionalProperties": false,
           "properties": {"against": {"enum": ["bull","bear","my_view"]}, "text": {"type": "string"}},
@@ -27,6 +63,7 @@
           "properties": {"side": {"enum": ["bull","bear","neutral","undecided"]}, "confidence": {"enum": ["high","medium","low"]}, "text": {"type": "string"}},
           "required": ["side","confidence","text"]},
         "market_lean": {"type": "object", "additionalProperties": false,
+          "description": "市场主流倾向。当 `status` 为 `open` 时必填且须包含 `side`",
           "properties": {"side": {"enum": ["bull","bear","split","unknown"]}, "evidence": {"type": "string"}}},
         "flip_condition": {"type": "object", "additionalProperties": false,
           "properties": {"text": {"type": "string"}, "driver_ids": {"type": "array", "items": {"type": "string"}},

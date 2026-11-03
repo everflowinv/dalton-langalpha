@@ -230,6 +230,8 @@ async def probe_agenda(
             continue
         if act.get("enabled") is False:
             continue
+        if act.get("kind") == "price_level":
+            continue
         if act.get("status") not in (None, "pending", "in_progress", "open", "active"):
             continue
         # Schema-legal wake_conditions carry the date inside `params` (params.date

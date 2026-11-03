@@ -197,7 +197,11 @@ async def detect_direct_edits(
     published_alerts: list[str] = []
 
     ticker = _subject_label(latest_valid_all, profile)
-    scan_docs = doc_keys_for_profile(profile) if profile_known else SHARED_DOC_KEYS
+    raw_scan_docs = doc_keys_for_profile(profile) if profile_known else SHARED_DOC_KEYS
+    scan_docs = tuple(
+        [k for k in raw_scan_docs if k != "thesis"]
+        + (["thesis"] if "thesis" in raw_scan_docs else [])
+    )
 
     for doc_key in scan_docs:
         latest = latest_all.get(doc_key)
@@ -310,11 +314,31 @@ async def detect_direct_edits(
                             old_valid_content = (
                                 latest_valid["content"] if latest_valid else None
                             )
+                            models_doc: dict[str, Any] | None = None
+                            agenda_doc: dict[str, Any] | None = None
+                            debate_doc: dict[str, Any] | None = None
+                            if doc_key == "thesis":
+                                models_row = latest_valid_all.get("models")
+                                models_doc = (
+                                    models_row["content"]
+                                    if models_row and isinstance(models_row.get("content"), dict)
+                                    else {}
+                                )
+                                if content_to_store.get("schema_version") == 2:
+                                    agenda_row = latest_valid_all.get("agenda")
+                                    if agenda_row and isinstance(agenda_row.get("content"), dict):
+                                        agenda_doc = agenda_row["content"]
+                                    debate_row = latest_valid_all.get("debate")
+                                    if debate_row and isinstance(debate_row.get("content"), dict):
+                                        debate_doc = debate_row["content"]
                             val = validate_update(
                                 doc_key,
                                 old_valid_content,
                                 content_to_store,
                                 source="direct_edit",
+                                models_doc=models_doc,
+                                agenda_doc=agenda_doc,
+                                debate_doc=debate_doc,
                                 reason="direct_edit",
                             )
                             schema_valid = val.ok
@@ -349,6 +373,7 @@ async def detect_direct_edits(
                         latest = new_row
                         if schema_valid:
                             latest_valid = new_row
+                            latest_valid_all[doc_key] = new_row
                             # 行业层 P2（codex r1 #6）：直接编辑产生的有效
                             # thesis 版本同样触发跨单元联动——否则手改支柱/
                             # 反证只入账不传播，下一次工具更新已以它为旧

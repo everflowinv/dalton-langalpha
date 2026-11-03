@@ -265,6 +265,144 @@ def _clamp_iso_date_as_of(val: Any, now_dt: datetime) -> Any:
     return val
 
 
+def _coerce_needs_financing(val: Any) -> Any:
+    if isinstance(val, bool):
+        return "yes" if val else "no"
+    return val
+
+
+def _has_non_empty_v2_value(val: Any) -> bool:
+    if val is None:
+        return False
+    if isinstance(val, str):
+        return bool(val.strip())
+    if isinstance(val, (list, dict)):
+        return bool(val)
+    return True
+
+
+def _resolve_schema_version(
+    doc_key: str,
+    doc: dict[str, Any],
+    old_doc: dict[str, Any] | None = None,
+) -> int:
+    """Determine whether `doc` is schema_version 2 or 1 (backward-compatible v1 default)."""
+    if doc.get("schema_version") == 2 or (isinstance(old_doc, dict) and old_doc.get("schema_version") == 2):
+        return 2
+    if doc_key == "thesis":
+        if _has_non_empty_v2_value(doc.get("underwriting")):
+            return 2
+        hv = doc.get("house_view")
+        if isinstance(hv, dict):
+            if any(
+                _has_non_empty_v2_value(hv.get(k))
+                for k in (
+                    "actionability",
+                    "binding_constraint",
+                    "binding_constraint_text",
+                    "flip_conditions",
+                    "entry_band",
+                    "trigger_refs",
+                    "missing",
+                    "review_by",
+                )
+            ):
+                return 2
+        mv = doc.get("market_view")
+        if isinstance(mv, dict) and any(
+            _has_non_empty_v2_value(mv.get(k))
+            for k in ("observations", "positioning", "positioning_sources")
+        ):
+            return 2
+    elif doc_key == "debate":
+        for d in doc.get("debates") or []:
+            if isinstance(d, dict) and any(
+                _has_non_empty_v2_value(d.get(k)) for k in ("transmission", "expectations")
+            ):
+                return 2
+    elif doc_key == "drivers":
+        for drv in doc.get("drivers") or []:
+            if isinstance(drv, dict) and _has_non_empty_v2_value(drv.get("response")):
+                return 2
+    elif doc_key == "agenda":
+        watch = doc.get("watch")
+        if isinstance(watch, dict):
+            for ev in watch.get("events") or []:
+                if isinstance(ev, dict) and _has_non_empty_v2_value(ev.get("review_by")):
+                    return 2
+        for wc in doc.get("wake_conditions") or []:
+            if isinstance(wc, dict) and (
+                wc.get("kind") == "price_level"
+                or any(
+                    _has_non_empty_v2_value(wc.get(k))
+                    for k in ("price_level", "direction", "transmission", "underwriting_version")
+                )
+            ):
+                return 2
+    return 1
+
+
+def _maintain_underwriting_defaults(
+    doc: dict[str, Any],
+    old_doc: dict[str, Any] | None = None,
+) -> None:
+    """Maintain `scenario_version`, `hurdles` snapshot (§12.9), and `needs_financing` coercion on `underwriting`."""
+    uw = doc.get("underwriting")
+    if not isinstance(uw, dict):
+        return
+    old_uw = (old_doc or {}).get("underwriting") if isinstance(old_doc, dict) else None
+    if not isinstance(old_uw, dict):
+        old_uw = None
+
+    hv = doc.get("house_view")
+    hm = int(hv.get("horizon_months") or 12) if isinstance(hv, dict) else 12
+    old_hv = (old_doc or {}).get("house_view") if isinstance(old_doc, dict) else None
+    old_hm = int(old_hv.get("horizon_months") or 12) if isinstance(old_hv, dict) else hm
+    hm_changed = old_uw is not None and old_hm != hm
+
+    if old_uw is not None and isinstance(old_uw.get("scenario_version"), int):
+        old_ver = int(old_uw["scenario_version"])
+        uw_core_changed = (
+            old_uw.get("states") != uw.get("states")
+            or old_uw.get("anchor") != uw.get("anchor")
+            or old_uw.get("weight_bounds") != uw.get("weight_bounds")
+            or hm_changed
+        )
+        if uw.get("scenario_version") is None:
+            uw["scenario_version"] = old_ver + 1 if uw_core_changed else old_ver
+        elif uw_core_changed and int(uw["scenario_version"]) == old_ver:
+            uw["scenario_version"] = old_ver + 1
+    elif uw.get("scenario_version") is None:
+        uw["scenario_version"] = 1
+
+    from src.dalton.settings import get_dalton_mandate_settings
+
+    mandate_snap = get_dalton_mandate_settings().snapshot_hurdles(horizon_months=hm)
+    existing_hurdles = uw.get("hurdles")
+    if not isinstance(existing_hurdles, dict):
+        uw["hurdles"] = dict(mandate_snap)
+    else:
+        merged_hurdles = dict(mandate_snap)
+        for k, v in existing_hurdles.items():
+            if v is not None and k != "max_entry_distance":
+                merged_hurdles[k] = v
+        if hm_changed and existing_hurdles.get("horizon_months") == old_hm:
+            merged_hurdles["horizon_months"] = hm
+        uw["hurdles"] = merged_hurdles
+
+    stress = uw.get("stress")
+    if isinstance(stress, dict) and "needs_financing" in stress:
+        stress["needs_financing"] = _coerce_needs_financing(stress.get("needs_financing"))
+
+    prot = uw.get("protection")
+    if isinstance(prot, dict):
+        if "needs_financing" in prot:
+            prot["needs_financing"] = _coerce_needs_financing(prot.get("needs_financing"))
+        surv = prot.get("survival")
+        if isinstance(surv, dict) and "needs_financing" in surv:
+            surv["needs_financing"] = _coerce_needs_financing(surv.get("needs_financing"))
+
+
 def _ensure_nested_ids_and_defaults(
     doc_key: str,
     doc: dict[str, Any],
@@ -280,7 +418,7 @@ def _ensure_nested_ids_and_defaults(
     else:
         now_dt = now_dt.astimezone(timezone.utc)
     now_str = _now_iso(now_dt)
-    doc["schema_version"] = 1
+    doc["schema_version"] = _resolve_schema_version(doc_key, doc, old_doc)
     if "updated_at" in doc:
         if doc_key in (
             "company",
@@ -316,6 +454,7 @@ def _ensure_nested_ids_and_defaults(
                 mv["updated_at"] = now_str
             if "as_of" in mv:
                 mv["as_of"] = _clamp_iso_as_of(mv.get("as_of"), now_dt, now_str)
+        _maintain_underwriting_defaults(doc, old_doc)
         pillars = doc.get("pillars")
         if isinstance(pillars, list):
             for idx, pillar in enumerate(pillars):
@@ -865,9 +1004,22 @@ def _resolve_parent(
     for idx, seg in enumerate(segments[:-1]):
         subpath = "/" + "/".join(segments[: idx + 1])
         if isinstance(curr, dict):
-            if seg not in curr:
+            if seg not in curr or curr[seg] is None:
                 # Auto-create intermediate dicts for known optional containers
-                if seg in ("thresholds", "watch", "identifiers", "autonomy", "linked"):
+                if seg in (
+                    "thresholds",
+                    "watch",
+                    "identifiers",
+                    "autonomy",
+                    "linked",
+                    "underwriting",
+                    "flip_conditions",
+                    "protection",
+                    "weight_bounds",
+                    "anchor",
+                    "stress",
+                    "response",
+                ):
                     curr[seg] = {}
                 else:
                     raise OpError(
@@ -880,11 +1032,13 @@ def _resolve_parent(
             matched = None
             available_ids: list[str] = []
             for item in curr:
-                if isinstance(item, dict) and "id" in item:
-                    available_ids.append(str(item["id"]))
-                    if str(item["id"]) == seg:
-                        matched = item
-                        break
+                if isinstance(item, dict):
+                    item_key = item.get("id") or item.get("name") or item.get("side")
+                    if item_key is not None:
+                        available_ids.append(str(item_key))
+                        if str(item_key) == seg:
+                            matched = item
+                            break
             if matched is None and seg.isdigit():
                 i = int(seg)
                 if 0 <= i < len(curr):
@@ -911,10 +1065,12 @@ def _find_in_list(
 ) -> tuple[int, dict[str, Any]]:
     available: list[str] = []
     for idx, item in enumerate(lst):
-        if isinstance(item, dict) and "id" in item:
-            available.append(str(item["id"]))
-            if str(item["id"]) == target_id:
-                return idx, item
+        if isinstance(item, dict):
+            item_key = item.get("id") or item.get("name") or item.get("side")
+            if item_key is not None:
+                available.append(str(item_key))
+                if str(item_key) == target_id:
+                    return idx, item
     if target_id.isdigit():
         i = int(target_id)
         if 0 <= i < len(lst) and isinstance(lst[i], dict):
