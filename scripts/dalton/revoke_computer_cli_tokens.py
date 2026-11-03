@@ -102,10 +102,10 @@ def main(argv: list[str] | None = None) -> int:
 
     # The sandbox token files stay behind by design: the third
     # computer-cli-tokens-off guard refuses what they hold. Name the mirror
-    # TTL so "it still worked for just under an hour" surprises nobody.
+    # TTL (5 minutes) so a token that still works briefly surprises nobody.
     print(
         "Sandbox LANGALPHA_TOKEN_FILE copies stay on disk but authenticate nothing "
-        "while the switch is off; the admission mirror lapses within the hour."
+        "while the switch is off; the admission mirror lapses within 5 minutes; keep the switch off until then."
     )
     return 0
 
