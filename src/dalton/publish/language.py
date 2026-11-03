@@ -167,6 +167,8 @@ def is_reviewable_deliverable(path: str, workspace_dir: str | None = None) -> bo
         return False
     if any(rel.startswith(prefix) for prefix in _MACHINE_RENDERED_PREFIXES):
         return False
+    if parts[-1] == "underwriting-summary.md":
+        return False  # machine-rendered knowledge_update(dry_run=True) payoff summary
     if rel.startswith(_TRACKER_DIR) and "/" in rel[len(_TRACKER_DIR):]:
         return False  # machine collection packet (research/tracker/<run_id>/…)
     return not any(seg in _EXCLUDED_SEGMENTS for seg in parts)

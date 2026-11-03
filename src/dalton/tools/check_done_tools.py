@@ -25,6 +25,7 @@ from datetime import date, datetime, timezone
 from typing import Annotated, Any
 from zoneinfo import ZoneInfo
 
+import orjson
 import structlog
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, tool
@@ -1428,6 +1429,306 @@ def _sidecar_path(draft: str) -> str:
     return _derived_sidecar(draft, ".audit.md")
 
 
+_LEGACY_IC_HEADING_RE = re.compile(r"^#{1,3}\s*一、\s*12\s*问初筛", re.MULTILINE)
+_IC_SAVED_VERSION_RE = re.compile(
+    r"^已保存\s*thesis\s*版本\s*(\d+)(?:$|[；;])", re.IGNORECASE
+)
+_IC_QUESTIONS_HEADING_RE = re.compile(
+    r"^#{1,6}\s*(?:(?:\d+[.、)]|[（(]\d+[)）]|\*+|_+)\s*)*Q(1[0-2]|[1-9])\b",
+    re.MULTILINE | re.IGNORECASE,
+)
+_IC_BODY_Q_ITEM_RE = re.compile(
+    r"^\s*(?:(?:#{1,6}|[-*+•]|\d+[.、)]|[（(]\d+[)）]|\*+|_+)\s*)*Q(1[0-2]|[1-9])(?:\b|[.、：:\s*_)）])",
+    re.MULTILINE | re.IGNORECASE,
+)
+_IC_H2_RE = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
+_IC_HEADING_NUM_PREFIX_RE = re.compile(r"^(?:[一二三四五六七八九十]+、|\d+[.、])\s*")
+
+_LEGACY_IC_REQUIRED_SECTIONS: tuple[str, ...] = (
+    "一、12 问初筛",
+    "二、",
+    "三、",
+    "四、",
+    "五、",
+    "六、",
+    "七、",
+    "八、",
+    "引用",
+)
+
+
+def _normalize_ic_heading(raw: str) -> str:
+    cleaned = raw.strip().strip("*_").strip()
+    cleaned = _IC_HEADING_NUM_PREFIX_RE.sub("", cleaned)
+    return cleaned.strip().strip("*_").strip()
+
+
+def is_legacy_initial_coverage_text(text: str | None) -> bool:
+    """Whether ``text`` carries the legacy ``一、12 问初筛`` heading at line start
+    (the same ``/^#{1,3}\\s*一、\\s*12\\s*问初筛/m`` rule ``workflow.js`` uses)."""
+    return bool(text is not None and _LEGACY_IC_HEADING_RE.search(text))
+
+
+def _extract_underwriting_summary_version(summary_text: str | None) -> int | None:
+    """Extract version number ``N`` from fixed first-line header ``已保存 thesis 版本 N``
+    of ``underwriting-summary.md``, or ``None`` if absent or uncommitted."""
+    if not summary_text:
+        return None
+    nonempty_lines = [ln.strip() for ln in summary_text.splitlines() if ln.strip()]
+    if not nonempty_lines:
+        return None
+    first_line = nonempty_lines[0]
+    if (
+        "没有保存成功" in first_line
+        or "不能写进正文" in first_line
+        or "尚未保存" in first_line
+    ):
+        return None
+    m = _IC_SAVED_VERSION_RE.match(first_line)
+    if not m:
+        return None
+    version = int(m.group(1))
+    return version if version >= 1 else None
+
+
+async def _is_legacy_initial_coverage_draft(
+    backend: Any,
+    params: dict[str, Any],
+    resolved: dict[str, str],
+    *,
+    run_id: str | None = None,
+    thread_id: str | None = None,
+) -> bool:
+    """True only when the current draft on disk carries the legacy ``一、12 问初筛``
+    heading AND this run started with that legacy draft already on disk
+    (recorded in the last ``status == "ok"`` entry of ``草稿探测.json``)."""
+    draft_template = render_template("drafts/{as_of}-initial-coverage.md", params)
+    target_draft = resolved.get(draft_template, draft_template)
+    draft_text = await _read_text(backend, target_draft)
+    if not is_legacy_initial_coverage_text(draft_text):
+        return False
+    try:
+        journals = await _locate_run_journals(
+            backend, "initial-coverage", run_id, thread_id
+        )
+    except _CannotVerify:
+        journals = None
+    if journals is not None:
+        probe_paths = [p for p in journals if p.endswith("/journal/草稿探测.json")]
+        if probe_paths:
+            probe_raw = await _read_text(backend, probe_paths[0])
+            if probe_raw is not None:
+                try:
+                    doc = json.loads(probe_raw)
+                except ValueError:
+                    return False
+                dispatches = doc.get("dispatches") if isinstance(doc, dict) else None
+                if isinstance(dispatches, list) and dispatches:
+                    ok_entries = [
+                        entry
+                        for entry in dispatches
+                        if isinstance(entry, dict)
+                        and entry.get("status") == "ok"
+                        and isinstance(entry.get("result"), dict)
+                    ]
+                    if not ok_entries:
+                        return False
+                    res = ok_entries[-1]["result"]
+                    recorded_draft = res.get("draft_content") or res.get(
+                        "draft_headings"
+                    )
+                    return is_legacy_initial_coverage_text(
+                        recorded_draft if isinstance(recorded_draft, str) else None
+                    )
+            return False
+    return False
+
+
+async def _check_initial_coverage_thesis_underwriting(
+    backend: Any,
+    params: dict[str, Any],
+    resolved: dict[str, str],
+    workspace_id: str | None,
+) -> list[str]:
+    """Verify against the server DB that ``thesis``'s latest valid version
+    equals version ``N`` on the first line of ``underwriting-summary.md``,
+    and carries ``underwriting`` (unless DB ``house_view.stance == 'no_view'``
+    with empty ``underwriting``). No timestamp or source comparison is used."""
+    if not workspace_id:
+        return []
+    underwriting_template = render_template(
+        "research/{as_of}-ic/underwriting-summary.md", params
+    )
+    underwriting_path = resolved.get(underwriting_template, underwriting_template)
+    underwriting_text = await _read_text(backend, underwriting_path)
+    summary_version = _extract_underwriting_summary_version(underwriting_text)
+
+    try:
+        from src.dalton.database import knowledge as db_knowledge
+
+        row = await db_knowledge.latest_valid_version(workspace_id, "thesis")
+    except Exception as error:
+        logger.warning(
+            "dalton_check_done initial-coverage thesis.underwriting query failed",
+            error=str(error),
+        )
+        return ["知识层 `thesis` 的赔率卡（`underwriting`）无法核对（数据库查询失败），请重试。"]
+    if not isinstance(row, dict):
+        return [
+            "知识层 `thesis` 没有 `schema_valid=true` 的有效版本；"
+            "下一步：调用 `knowledge_update(doc='thesis', ..., dry_run=False)` 写入含 `underwriting` 的有效版本。"
+        ]
+    db_version = row.get("version_no")
+    problems: list[str] = []
+    if summary_version is None:
+        problems.append(
+            f"赔率摘要 {underwriting_path} 第一行未记录正式保存的版本号（第一行必须固定写 `已保存 thesis 版本 N`）；"
+            f"下一步：按固定格式在 {underwriting_path} 第一行写入 `已保存 thesis 版本 {db_version}`（`house_view.stance=\"no_view\"` 时写 `已保存 thesis 版本 {db_version}；暂不表态，不计算赔率`）并贴上正式保存后的赔率摘要。"
+        )
+    elif db_version != summary_version:
+        problems.append(
+            f"赔率摘要 {underwriting_path} 第一行记录的版本号（版本 {summary_version}）与数据库里 `thesis` 最新有效版本（版本 {db_version}）不一致；"
+            f"下一步：以数据库最新有效版本（版本 {db_version}）的赔率摘要更新 {underwriting_path}，并确保正文赔率数字与之一致。"
+        )
+    content = row.get("content")
+    if not isinstance(content, dict):
+        problems.append(
+            "知识层 `thesis` 内容格式无效，无法核对 `underwriting` 赔率卡；"
+            f"下一步：调用 `knowledge_update(doc='thesis', ..., dry_run=False)` 重新写入，并同步更新 {underwriting_path} 首行版本号与赔率摘要。"
+        )
+        return problems
+    house_view = content.get("house_view")
+    stance = house_view.get("stance") if isinstance(house_view, dict) else None
+    underwriting = content.get("underwriting")
+    has_underwriting = isinstance(underwriting, dict) and bool(underwriting)
+    if stance == "no_view":
+        if underwriting is not None and has_underwriting:
+            problems.append(
+                f"知识层 `thesis` 最新有效版本（版本 {db_version}）的 `house_view.stance` 为 `\"no_view\"`，`underwriting` 必须为空；"
+                f"下一步：调用 `knowledge_update(doc='thesis', ..., dry_run=False)` 修正，并同步更新 {underwriting_path} 首行版本号。"
+            )
+    elif not has_underwriting:
+        problems.append(
+            "初次覆盖要求在知识层 `thesis` 中写入 `underwriting` 赔率卡"
+            f"（当前数据库版本 {db_version} 缺少非空的 `underwriting`，且 `house_view.stance` 不为 `\"no_view\"`）；"
+            f"下一步：调用 `knowledge_update(doc='thesis', ..., dry_run=False)` 写入 `underwriting` 赔率卡，并同步更新 {underwriting_path} 首行版本号与赔率摘要。"
+        )
+    return problems
+
+
+async def _check_initial_coverage_structure(
+    backend: Any,
+    params: dict[str, Any],
+    draft_path: str | None,
+    resolved: dict[str, str],
+    missing: list[str],
+    *,
+    run_id: str | None = None,
+    thread_id: str | None = None,
+) -> None:
+    """Validate initial-coverage's internal 12-question file, payoff summary,
+    and single-track report rules (summary first H2; no 6+ Q items in body),
+    while letting in-flight legacy drafts (already on disk when this run started)
+    complete under the old structure rules."""
+    questions_template = render_template("research/{as_of}-ic/questions.md", params)
+    questions_path = resolved.get(questions_template, questions_template)
+    underwriting_template = render_template(
+        "research/{as_of}-ic/underwriting-summary.md", params
+    )
+    underwriting_path = resolved.get(underwriting_template, underwriting_template)
+    target_draft = draft_path or render_template(
+        "drafts/{as_of}-initial-coverage.md", params
+    )
+    draft_text = await _read_text(backend, target_draft)
+
+    if draft_text is not None and await _is_legacy_initial_coverage_draft(
+        backend,
+        params,
+        resolved,
+        run_id=run_id,
+        thread_id=thread_id,
+    ):
+        missing[:] = [
+            item
+            for item in missing
+            if not (
+                (questions_path in item or underwriting_path in item)
+                and item.startswith(
+                    ("产物文件不存在：", "产物文件过小（", "交付物不存在：", "交付物过小（")
+                )
+            )
+        ]
+        found_qs = {
+            f"Q{int(m.group(1))}" for m in _IC_QUESTIONS_HEADING_RE.finditer(draft_text)
+        }
+        missing_qs = [f"Q{i}" for i in range(1, 13) if f"Q{i}" not in found_qs]
+        if missing_qs:
+            missing.append(
+                f"旧版初次覆盖草稿 {target_draft}「一、12 问初筛」缺少题目：{'、'.join(missing_qs)}。"
+            )
+        raw_h2 = [m.group(1).strip() for m in _IC_H2_RE.finditer(draft_text)]
+        missing_legacy = [
+            sec
+            for sec in _LEGACY_IC_REQUIRED_SECTIONS
+            if not any(title.startswith(sec) for title in raw_h2)
+        ]
+        if missing_legacy:
+            missing.append(
+                f"旧版初次覆盖草稿 {target_draft} 缺少章节：{'、'.join(missing_legacy)}。"
+            )
+        return
+
+    underwriting_text = await _read_text(backend, underwriting_path)
+    if (
+        underwriting_text is not None
+        and _extract_underwriting_summary_version(underwriting_text) is None
+    ):
+        missing.append(
+            f"赔率摘要 {underwriting_path} 未通过核验（第一行必须固定写 `已保存 thesis 版本 N`，"
+            "不得为「尚未保存」「没有保存成功」或「不能写进正文」）；"
+            f"下一步：若数据库已有正式保存的 `thesis` 有效版本，将其版本号 `N` 与赔率摘要按固定格式写入 {underwriting_path}；若尚未正式写入，先调用 `knowledge_update(doc='thesis', ..., dry_run=True)` 检查，通过后再以 `dry_run=False` 正式写入并更新 {underwriting_path}。"
+        )
+
+    questions_text = await _read_text(backend, questions_path)
+    if questions_text is not None:
+        found_qs = {
+            f"Q{int(m.group(1))}"
+            for m in _IC_QUESTIONS_HEADING_RE.finditer(questions_text)
+        }
+        missing_qs = [f"Q{i}" for i in range(1, 13) if f"Q{i}" not in found_qs]
+        if missing_qs:
+            missing.append(
+                f"内部 12 问底稿 {questions_path} 缺少题目：{'、'.join(missing_qs)}"
+                f"（须在内部底稿完整回答 Q1–Q12）；下一步：在 {questions_path} 中补齐缺失题目。"
+            )
+
+    if draft_text is None:
+        return
+
+    line_q_nums = {int(m.group(1)) for m in _IC_BODY_Q_ITEM_RE.finditer(draft_text)}
+    if len(line_q_nums) >= 6:
+        missing.append(
+            f"初次覆盖报告 {target_draft} 12 问逐条写进了正文"
+            f"（检测到 {len(line_q_nums)} 个不同的 Q 题号，正文不得逐条列 Q1–Q12）；"
+            f"下一步：将 Q1–Q12 移入内部 12 问底稿 {questions_path}，报告正文改按章节结构展开。"
+        )
+
+    normalized_h2 = [
+        _normalize_ic_heading(m.group(1)) for m in _IC_H2_RE.finditer(draft_text)
+    ]
+    first_h2 = normalized_h2[0] if normalized_h2 else ""
+    first_h2_lower = first_h2.lower()
+    is_summary_first = first_h2.startswith(
+        ("摘要", "一页摘要", "投资摘要")
+    ) or first_h2_lower.startswith(("summary", "executive summary"))
+    if not is_summary_first:
+        missing.append(
+            f"初次覆盖报告 {target_draft} 的第一个二级标题必须是摘要"
+            f"（接受「摘要」「一页摘要」「Summary」等开头；当前第一个二级标题为 {first_h2 or '无'!r}）；"
+            f"下一步：将 {target_draft} 的第一个二级标题改为 `## 摘要`。"
+        )
+
+
 async def _check_stages(
     contract: dict[str, Any],
     params: dict[str, Any],
@@ -1510,6 +1811,16 @@ async def _check_stages(
                 missing.append(
                     f"阶段「{stage_name}」要求本次 run 的最终审稿结论为 pass，未通过：{reason}。"
                 )
+    if contract.get("name") == "initial-coverage":
+        await _check_initial_coverage_structure(
+            backend,
+            params,
+            draft_path,
+            resolved,
+            missing,
+            run_id=run_id,
+            thread_id=thread_id,
+        )
     return missing, warnings, draft_path, resolved
 
 
@@ -1704,16 +2015,36 @@ async def _check_closing(
             )
             found = None
         if found is not None:
+            is_new_ic = contract.get(
+                "name"
+            ) == "initial-coverage" and not await _is_legacy_initial_coverage_draft(
+                backend,
+                params,
+                resolved_map,
+                run_id=run_id,
+                thread_id=thread_id,
+            )
             for doc in dict.fromkeys(docs_all):
+                if is_new_ic and doc == "thesis":
+                    continue
                 if not found[doc]:
                     missing.append(
-                        f"知识层 {doc} 自 {since_label} 起没有 source=tool 的新版本；"
-                        "下一步：用 knowledge_update 写入。"
+                        f"知识层 {doc} 自 {since_label} 起没有 `source=tool` 的新版本；"
+                        "下一步：用 `knowledge_update` 写入。"
                     )
             if docs_any and not any(found[doc] for doc in docs_any):
                 missing.append(
                     f"知识层 {'、'.join(docs_any)} 自 {since_label} 起"
-                    "均无 source=tool 新版本（至少需要其一）；下一步：用 knowledge_update 写入。"
+                    "均无 `source=tool` 新版本（至少需要其一）；下一步：用 `knowledge_update` 写入。"
+                )
+            if is_new_ic:
+                missing.extend(
+                    await _check_initial_coverage_thesis_underwriting(
+                        backend,
+                        params,
+                        resolved_map,
+                        workspace_id,
+                    )
                 )
 
     kinds = closing.get("verdict_kinds_any")
@@ -1942,6 +2273,48 @@ async def _collect_run_dispatch_files(
             for item in result.get("files") or []:
                 if isinstance(item, str) and item.strip():
                     files.add(item.split("|", 1)[0].strip())
+
+    # If this run was resumed from an earlier run (which may have paused for
+    # main-agent knowledge writes before resuming), walk ``{run}/resume.json``
+    # backward (up to 20 hops, with cycle detection) so ``started`` reflects
+    # the earliest dispatch across the resume chain.
+    cur_run_dir = posixpath.dirname(posixpath.dirname(journals[0]))
+    visited_dirs = {cur_run_dir}
+    for _ in range(20):
+        resume_raw = await _read_text(backend, f"{cur_run_dir}/resume.json")
+        if not resume_raw:
+            break
+        try:
+            resume_doc = json.loads(resume_raw)
+        except ValueError:
+            break
+        prior_dir = (
+            resume_doc.get("resumed_from") if isinstance(resume_doc, dict) else None
+        )
+        if not isinstance(prior_dir, str) or not prior_dir.strip():
+            break
+        prior_dir = prior_dir.strip().rstrip("/")
+        if prior_dir in visited_dirs:
+            break
+        visited_dirs.add(prior_dir)
+        prior_journals = await _glob(backend, f"{prior_dir}/journal/*.json")
+        for prior_path in prior_journals or []:
+            prior_text = await _read_text(backend, prior_path)
+            if not prior_text:
+                continue
+            try:
+                prior_doc = json.loads(prior_text)
+            except ValueError:
+                continue
+            if not isinstance(prior_doc, dict):
+                continue
+            for entry in prior_doc.get("dispatches") or []:
+                if not isinstance(entry, dict):
+                    continue
+                stamp = entry.get("recorded_at")
+                if isinstance(stamp, (int, float)) and not isinstance(stamp, bool):
+                    started = stamp if started is None else min(started, float(stamp))
+        cur_run_dir = prior_dir
     return sorted(files), started
 
 
@@ -3479,16 +3852,15 @@ def create_check_done_tools(
         Returns: JSON `{done, missing, warnings}`，`missing` 为中文缺项说明与下一步操作。
         """
         if allowed is not None and workflow not in allowed:
-            return json.dumps(
+            return orjson.dumps(
                 {
                     "done": False,
                     "missing": [f"该角色只能核对 {'、'.join(sorted(allowed))}"],
                     "warnings": [],
                     "checked": {"workflow": workflow},
                 },
-                ensure_ascii=False,
-                indent=2,
-            )
+                option=orjson.OPT_INDENT_2,
+            ).decode("utf-8")
         user_id, workspace_id, thread_id, conversation_run_id = _extract_run_identity(
             config
         )
@@ -3512,7 +3884,7 @@ def create_check_done_tools(
                 "warnings": [],
                 "checked": {"workflow": workflow},
             }
-        return json.dumps(result, ensure_ascii=False, indent=2)
+        return orjson.dumps(result, option=orjson.OPT_INDENT_2).decode("utf-8")
 
     return [_dalton_check_done]
 

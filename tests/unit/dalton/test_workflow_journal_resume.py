@@ -1696,6 +1696,7 @@ _GENERIC_OUT = {
     "files": ["research/generic.md"],
     "summary": "done",
     "sha256": "a" * 64,
+    "underwriting_version": 1,
 }
 
 # The default child must be as honest as a real one: it declares
@@ -1703,7 +1704,14 @@ _GENERIC_OUT = {
 # unwritten file a partial dispatch, not an ok answer). Built per dispatch —
 # ``Writes`` is defined further down this module.
 def _generic_writes(_prompt, _backend):
-    return Writes(_ok(_GENERIC_OUT), {"research/generic.md": "generic 产物"})
+    files = list(_GENERIC_OUT["files"])
+    uw_rel = "./research/2026-10-23-ic/underwriting-summary.md"
+    if uw_rel in getattr(_backend, "files", {}):
+        files.append(uw_rel)
+    return Writes(
+        _ok({**_GENERIC_OUT, "files": files}),
+        {"research/generic.md": "generic 产物"},
+    )
 
 
 @dataclass
@@ -1922,6 +1930,11 @@ async def test_real_script_block_fill_resume_chain() -> None:
     valuation_v2 = "估值成稿 v2（基于重派取数）：\n" + "ln(P1/P0) 分解与可比表行\n" * 40
     comps_v2 = "x" * 1200
     store2 = dict(backend1.writes)  # run 1's files + journals, incl. the fill
+    store2["./research/2026-10-23-ic/underwriting-summary.md"] = (
+        "已保存 thesis 版本 1\n赔率计算摘要（立场：中性）\n"
+    )
+    store2["./research/2026-10-23-ic/questions.md"] = "12 问初筛底稿\n"
+    store2["./drafts/2026-10-23-initial-coverage.md"] = "# 初筛\n\n## 摘要\n摘要。\n"
 
     async def _write_stage(prompt: str, backend: Any) -> Writes:
         """The write child: take the input path the workflow's PROMPT names
@@ -1957,9 +1970,31 @@ async def test_real_script_block_fill_resume_chain() -> None:
             ),
             "支线核验": _probe_answer,
             "估值历史与可比": _write_stage,
+            "草稿探测": Immediate(
+                _ok(
+                    {
+                        "files": ["./drafts/2026-10-23-initial-coverage.md"],
+                        "draft_content": "absent",
+                    }
+                )
+            ),
+            "赔率摘要核验": Immediate(
+                _ok(
+                    {
+                        "files": ["./research/2026-10-23-ic/underwriting-summary.md"],
+                        "exists": True,
+                        "first_line": "已保存 thesis 版本 1",
+                    }
+                )
+            ),
             "审稿": Immediate(
                 _ok(
                     {
+                        "files": [
+                            "./drafts/2026-10-23-initial-coverage.md",
+                            "./research/2026-10-23-ic/questions.md",
+                            "./research/2026-10-23-ic/underwriting-summary.md",
+                        ],
                         "verdict": "block",
                         "summary": "测试收尾 block",
                         "must_fix": [],
@@ -2007,3 +2042,533 @@ async def test_real_script_block_fill_resume_chain() -> None:
     # And the replayed healthy branches carry their origin, unchanged.
     replayed = _journal_entry_of(backend2, driver2, "公司背景")
     assert replayed["resumed_from"] == source1
+
+
+@pytest.mark.asyncio
+async def test_initial_coverage_underwriting_summary_pause_and_resume_through_real_journal() -> None:
+    """Round 4 #2: when underwriting-summary.md is absent on Run 1, 赔率摘要核验
+    still declares `files: [underwritingSummaryPath]`, so WorkflowJournal records
+    `replayable: False`. After the main agent writes underwriting-summary.md and
+    resumes with `journal_source=source1`, 赔率摘要核验 is NOT replayed from the
+    stale 'exists: False' entry — it re-dispatches, reads the newly written summary,
+    and the workflow proceeds to 初筛成稿 and 审稿 while replaying earlier branches."""
+    uw_path = "./research/2026-10-23-ic/underwriting-summary.md"
+    q_path = "./research/2026-10-23-ic/questions.md"
+    draft_path = "./drafts/2026-10-23-initial-coverage.md"
+    proposal_path = "./research/2026-10-23-ic/knowledge-proposal.json"
+
+    def _draft_probe(_prompt: str, backend: Any) -> Immediate:
+        content = backend.files.get(draft_path, "absent")
+        return Immediate(_ok({"files": [draft_path], "draft_content": content}))
+
+    def _uw_probe(_prompt: str, backend: Any) -> Immediate:
+        if uw_path in backend.files:
+            first_line = backend.files[uw_path].splitlines()[0]
+            return Immediate(
+                _ok({"files": [uw_path], "exists": True, "first_line": first_line})
+            )
+        return Immediate(
+            _ok({"files": [uw_path], "exists": False, "first_line": "none"})
+        )
+
+    store1: dict[str, str] = {}
+    by_label = {
+        "支线核验": _probe_answer,
+        "草稿探测": _draft_probe,
+        "知识层草案": Writes(
+            _ok({"files": [proposal_path], "summary": "知识层草案 v1"}),
+            {proposal_path: json.dumps({"thesis": [{"op": "create", "value": {}}]})},
+        ),
+        "赔率摘要核验": _uw_probe,
+        "初筛成稿": Writes(
+            _ok(
+                {
+                    "files": [draft_path, uw_path],
+                    "summary": "成稿完成",
+                    "sha256": "a" * 64,
+                    "underwriting_version": 1,
+                }
+            ),
+            {
+                draft_path: "# 初筛\n\n## 摘要\n摘要。\n",
+                q_path: "# 12 问初筛\n## Q1. 问题\n",
+            },
+        ),
+        "语言审查 1": Writes(
+            _ok({"files": [draft_path], "summary": "语言审查 1", "sha256": "a" * 64}),
+            {draft_path: "# 初筛\n\n## 摘要\n摘要。\n"},
+        ),
+        "审稿": Immediate(
+            _ok(
+                {
+                    "files": [draft_path, q_path, uw_path],
+                    "verdict": "block",
+                    "summary": "进到审稿即止",
+                    "must_fix": [],
+                    "draft_sha256": "a" * 64,
+                    "items": [
+                        {"check": n, "result": "revise", "reason": "ok"}
+                        for n in range(1, 10)
+                    ],
+                }
+            )
+        ),
+    }
+
+    # Run 1: underwriting-summary.md does not exist -> pauses before 初筛成稿
+    outcome1, driver1, dispatcher1, backend1 = await _drive_workflow(
+        store1,
+        by_label,
+        default=_generic_writes,
+    )
+    assert outcome1.status == "completed", outcome1.error
+    assert outcome1.result["ok"] is False
+    assert "已保存 thesis 版本 N" in outcome1.result["blocked"]
+    dispatched1 = [str(c["description"]) for c in dispatcher1.calls]
+    assert "赔率摘要核验" in dispatched1
+    assert "初筛成稿" not in dispatched1
+
+    uw_entry1 = _journal_entry_of(backend1, driver1, "赔率摘要核验")
+    assert uw_entry1["result"]["exists"] is False
+    assert uw_entry1["replayable"] is False, (
+        "a probe of a non-existent file must declare the path in `files` so the journal marks it non-replayable"
+    )
+
+    # Main agent formally saves thesis and writes underwriting-summary.md on disk
+    backend1.writes[uw_path] = (
+        "已保存 thesis 版本 1\n"
+        "赔率计算摘要（立场：中性，期限：18 个月）：\n"
+        "- 三情景价格区间：悲观 75–85 / 基准 95–105 / 乐观 120–130\n"
+    )
+    source1 = f".agents/threads/short-1/workflows/{driver1.wf_task_id}"
+    store2 = dict(backend1.writes)
+
+    # Run 2: resume with same params and journal_source=source1
+    outcome2, driver2, dispatcher2, backend2 = await _drive_workflow(
+        store2,
+        by_label,
+        default=_generic_writes,
+        journal_source=source1,
+    )
+    assert outcome2.status == "completed", outcome2.error
+    assert outcome2.result["blocked"] == "进到审稿即止"
+
+    dispatched2 = [str(c["description"]) for c in dispatcher2.calls]
+    for replayed_label in ("公司背景", "行业支线", "财务镜头", "估值取数", "估值历史与可比", "bull/bear 快速版", "知识层草案"):
+        assert replayed_label not in dispatched2, f"{replayed_label} must replay from Run 1's journal"
+    assert "赔率摘要核验" in dispatched2, "赔率摘要核验 must re-dispatch after underwriting-summary.md is created"
+    assert "初筛成稿" in dispatched2, "resumed run must proceed past the pause point to 初筛成稿"
+    assert "审稿" in dispatched2, "resumed run must reach 审稿"
+
+    uw_entry2 = _journal_entry_of(backend2, driver2, "赔率摘要核验")
+    assert uw_entry2["result"]["exists"] is True
+    assert uw_entry2["replayable"] is True
+    assert uw_entry2["artifacts"] == [
+        {
+            "path": uw_path,
+            "sha256": hashlib.sha256(store2[uw_path].encode("utf-8")).hexdigest(),
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_initial_coverage_e2e_pause_reunderwrite_resume_and_check_done(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 6 #1/#2/#3/#4: end-to-end test using the real WorkflowDriver, WorkflowJournal,
+    and run_check_done covering:
+    首次暂停(100) -> 暂停期间主 agent 正式写入依赖文档与 thesis v1(150) 并按固定格式写摘要 ->
+    resume -> 成稿(v1) -> 语言审查 1 改动草稿 -> 审稿 -> 修订 1(声明摘要文件, needs_reunderwrite=true, v1) 立刻停 ->
+    主 agent 写入 thesis v2 并更新摘要 -> resume(200) -> 成稿与修订重跑(v2) -> 复审 -> 赔率摘要复核(三者一致=2) ->
+    终稿审稿 -> 调用完成检查（沿 resume.json 回溯到 100，按 since 过滤依赖文档通过，三者版本号一致=2）."""
+    from tests.unit.dalton.test_check_done import (
+        DEFAULT_IC_DRAFT,
+        DEFAULT_IC_PROPOSAL,
+        DEFAULT_IC_QUESTIONS,
+        IC_DOCS,
+        PARAMS,
+        WS,
+        _make_backend,
+        _patch_knowledge,
+        _patch_verdicts,
+        _verdict_row,
+        _with_full_language_sidecars,
+    )
+    from src.dalton.tools.check_done_tools import run_check_done
+
+    bg_path = "./drafts/2026-10-23-background.md"
+    ind_path = "./research/2026-10-23-ic/industry.md"
+    lens_json = "./research/2026-10-23-ic/lenses.json"
+    lens_md = "./drafts/2026-10-23-lenses.md"
+    val_data = "./research/2026-10-23-ic/valuation-data.json"
+    val_md = "./research/2026-10-23-ic/valuation.md"
+    comps_xlsx = "./research/2026-10-23-ic/comps.xlsx"
+    bb_path = "./research/2026-10-23-ic/bullbear-quick.md"
+    q_path = "./research/2026-10-23-ic/questions.md"
+    proposal_path = "./research/2026-10-23-ic/knowledge-proposal.json"
+    uw_path = "./research/2026-10-23-ic/underwriting-summary.md"
+    draft_path = "./drafts/2026-10-23-initial-coverage.md"
+
+    draft_v1_raw = DEFAULT_IC_DRAFT + "\n乐观情景退出倍数 32x（初稿）。\n"
+    draft_v1_raw_sha = hashlib.sha256(draft_v1_raw.encode("utf-8")).hexdigest()
+    draft_v1 = DEFAULT_IC_DRAFT + "\n乐观情景退出倍数 32x。\n"
+    draft_v1_sha = hashlib.sha256(draft_v1.encode("utf-8")).hexdigest()
+    draft_v2_raw = DEFAULT_IC_DRAFT + "\n乐观情景退出倍数 28x（重跑初稿）。\n"
+    draft_v2_raw_sha = hashlib.sha256(draft_v2_raw.encode("utf-8")).hexdigest()
+    draft_v2 = DEFAULT_IC_DRAFT + "\n乐观情景退出倍数 28x。\n"
+    draft_v2_sha = hashlib.sha256(draft_v2.encode("utf-8")).hexdigest()
+
+    def _current_uw_version(backend: Any) -> int:
+        first_line = backend.files.get(uw_path, "").splitlines()[0]
+        return 2 if "版本 2" in first_line else 1
+
+    def _draft_probe(_prompt: str, backend: Any) -> Immediate:
+        content = backend.files.get(draft_path, "absent")
+        return Immediate(_ok({"files": [draft_path], "draft_content": content}))
+
+    def _uw_probe(_prompt: str, backend: Any) -> Immediate:
+        if uw_path in backend.files:
+            first_line = backend.files[uw_path].splitlines()[0]
+            return Immediate(
+                _ok({"files": [uw_path], "exists": True, "first_line": first_line})
+            )
+        return Immediate(
+            _ok({"files": [uw_path], "exists": False, "first_line": "none"})
+        )
+
+    def _uw_recheck(_prompt: str, backend: Any) -> Immediate:
+        first_line = backend.files[uw_path].splitlines()[0]
+        return Immediate(
+            _ok(
+                {
+                    "files": [uw_path, draft_path],
+                    "exists": True,
+                    "first_line": first_line,
+                }
+            )
+        )
+
+    def _draft_writer(_prompt: str, backend: Any) -> Writes:
+        ver = _current_uw_version(backend)
+        if ver == 1:
+            return Writes(
+                _ok(
+                    {
+                        "files": [draft_path, uw_path],
+                        "summary": "成稿 v1",
+                        "sha256": draft_v1_raw_sha,
+                        "underwriting_version": 1,
+                    }
+                ),
+                {draft_path: draft_v1_raw, q_path: DEFAULT_IC_QUESTIONS},
+            )
+        return Writes(
+            _ok(
+                {
+                    "files": [draft_path, uw_path],
+                    "summary": "成稿 v2（按新摘要重跑）",
+                    "sha256": draft_v2_raw_sha,
+                    "underwriting_version": 2,
+                }
+            ),
+            {draft_path: draft_v2_raw, q_path: DEFAULT_IC_QUESTIONS},
+        )
+
+    def _lang1_writer(_prompt: str, backend: Any) -> Writes:
+        # 语言审查 1 modifies draft_path on disk so that on resume after Pause 2,
+        # 初筛成稿's prior journal output no longer matches disk and 初筛成稿 re-runs.
+        ver = _current_uw_version(backend)
+        body = draft_v1 if ver == 1 else draft_v2
+        sha = draft_v1_sha if ver == 1 else draft_v2_sha
+        return Writes(
+            _ok({"files": [draft_path], "summary": "语言审查 1", "sha256": sha}),
+            {draft_path: body},
+        )
+
+    def _revision1_writer(_prompt: str, backend: Any) -> Writes:
+        ver = _current_uw_version(backend)
+        if ver == 1:
+            return Writes(
+                _ok(
+                    {
+                        "files": [draft_path, q_path, uw_path],
+                        "summary": "发现需要修改乐观情景倍数，等待主智能体重写赔率",
+                        "sha256": draft_v1_sha,
+                        "needs_reunderwrite": True,
+                        "underwriting_version": 1,
+                    }
+                ),
+                {draft_path: draft_v1, q_path: DEFAULT_IC_QUESTIONS},
+            )
+        return Writes(
+            _ok(
+                {
+                    "files": [draft_path, q_path, uw_path],
+                    "summary": "已按版本 2 赔率摘要将乐观情景倍数更新为 28x",
+                    "sha256": draft_v2_sha,
+                    "needs_reunderwrite": False,
+                    "underwriting_version": 2,
+                }
+            ),
+            {draft_path: draft_v2, q_path: DEFAULT_IC_QUESTIONS},
+        )
+
+    def _evidence_probe(prompt: str, backend: Any) -> Immediate:
+        paths = [
+            line[2:].strip()
+            for line in prompt.splitlines()
+            if line.startswith("- ") and "|" not in line
+        ]
+        entries = []
+        for p in paths:
+            content = backend.files.get(p, "")
+            sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            entries.append(f"{p}|{sha}")
+        return Immediate(_ok({"files": entries}))
+
+    by_label = {
+        "公司背景": Writes(
+            _ok({"files": [bg_path], "summary": "公司背景"}),
+            {bg_path: "背景" * 200},
+        ),
+        "行业支线": Writes(
+            _ok({"files": [ind_path], "summary": "行业支线"}),
+            {ind_path: "行业" * 200},
+        ),
+        "财务镜头": Writes(
+            _ok({"files": [lens_json, lens_md], "summary": "财务镜头"}),
+            {
+                lens_json: json.dumps({"lenses": ["l" * 20] * 3}),
+                lens_md: "镜头" * 200,
+            },
+        ),
+        "估值取数": Writes(
+            _ok({"files": [val_data], "summary": "估值取数"}),
+            {val_data: json.dumps({"pe": 15})},
+        ),
+        "支线核验": _probe_answer,
+        "估值历史与可比": Writes(
+            _ok({"files": [val_md, comps_xlsx], "summary": "估值历史与可比"}),
+            {val_md: "估值" * 200, comps_xlsx: "x" * 1200},
+        ),
+        "bull/bear 快速版": Writes(
+            _ok({"files": [bb_path], "summary": "bull/bear"}),
+            {bb_path: "多空" * 200},
+        ),
+        "草稿探测": _draft_probe,
+        "知识层草案": Writes(
+            _ok({"files": [proposal_path], "summary": "知识层草案"}),
+            {proposal_path: DEFAULT_IC_PROPOSAL},
+        ),
+        "赔率摘要核验": _uw_probe,
+        "初筛成稿": _draft_writer,
+        "语言审查 1": _lang1_writer,
+        "审稿": Immediate(
+            _ok(
+                {
+                    "files": [draft_path, q_path, uw_path],
+                    "verdict": "revise",
+                    "summary": "乐观情景倍数偏高，需下调至 28x",
+                    "must_fix": ["将乐观情景倍数从 32x 下调至 28x"],
+                    "items": [
+                        {"check": n, "result": "revise" if n == 5 else "pass", "reason": "ok"}
+                        for n in range(1, 10)
+                    ],
+                }
+            )
+        ),
+        "修订 1": _revision1_writer,
+        "赔率摘要复核": _uw_recheck,
+        "复审 1": Immediate(
+            _ok(
+                {
+                    "files": [draft_path, q_path, uw_path],
+                    "verdict": "pass",
+                    "summary": "已按版本 2 赔率摘要修正",
+                    "must_fix": [],
+                    "items": [
+                        {"check": n, "result": "pass", "reason": "ok"}
+                        for n in range(1, 10)
+                    ],
+                }
+            )
+        ),
+        "笔记语言审查": Writes(
+            _ok(
+                {
+                    "files": [bg_path, lens_md, ind_path, val_md, bb_path, q_path],
+                    "summary": "笔记语言审查通过",
+                }
+            ),
+            {},
+        ),
+        "语言审查 2": Writes(
+            _ok({"files": [draft_path], "summary": "语言审查 2", "sha256": draft_v2_sha}),
+            {draft_path: draft_v2},
+        ),
+        "终稿审稿": Immediate(
+            _ok(
+                {
+                    "files": [draft_path, q_path, uw_path],
+                    "verdict": "pass",
+                    "summary": "终稿审稿通过",
+                    "must_fix": [],
+                    "items": [
+                        {"check": n, "result": "pass", "reason": "ok"}
+                        for n in range(1, 10)
+                    ],
+                }
+            )
+        ),
+        "产物核验": _evidence_probe,
+    }
+
+    def _pin_dispatch_timestamps(store: dict[str, str], run_dir: str, ts: float) -> None:
+        prefix = f"{run_dir}/journal/"
+        for k, v in list(store.items()):
+            clean = k[2:] if k.startswith("./") else k
+            if clean.startswith(prefix) and clean.endswith(".json"):
+                doc = json.loads(v)
+                for entry in doc.get("dispatches") or []:
+                    if isinstance(entry, dict):
+                        entry["recorded_at"] = ts
+                store[k] = json.dumps(doc)
+
+    # 1) Run 1 (started at 100.0): pauses at 赔率摘要核验 before 初筛成稿
+    outcome1, driver1, dispatcher1, backend1 = await _drive_workflow(
+        {},
+        by_label,
+        default=_generic_writes,
+    )
+    assert outcome1.status == "completed", outcome1.error
+    assert outcome1.result["ok"] is False
+    assert "已保存 thesis 版本 N" in outcome1.result["blocked"]
+    assert "初筛成稿" not in [str(c["description"]) for c in dispatcher1.calls]
+
+    source1 = f".agents/threads/short-1/workflows/{driver1.wf_task_id}"
+    _pin_dispatch_timestamps(backend1.writes, source1, 100.0)
+    backend1.writes[f"{source1}/status.json"] = json.dumps(
+        {
+            "run_id": driver1.wf_task_id,
+            "name": "initial-coverage",
+            "status": "completed",
+            "updated_at": 110.0,
+        }
+    )
+
+    # 2) Pause 1 (at 150.0): main agent formally writes agenda/debate/company/drivers/management + thesis v1,
+    #    and writes underwriting-summary.md with fixed header "已保存 thesis 版本 1"
+    backend1.writes[uw_path] = (
+        "已保存 thesis 版本 1\n"
+        "赔率计算摘要（立场：中性，期限：18 个月）：\n"
+        "- 三情景价格区间：悲观 75–85 / 基准 95–105 / 乐观 125–135\n"
+    )
+    store2 = dict(backend1.writes)
+
+    # 3) Run 2 (resume=run1, started at 180.0): runs 初筛成稿 -> 语言审查 1 (modifies draft) ->
+    #    审稿 (revise) -> 修订 1 (needs_reunderwrite=true) -> pauses immediately before 复审 1
+    outcome2, driver2, dispatcher2, backend2 = await _drive_workflow(
+        store2,
+        by_label,
+        default=_generic_writes,
+        journal_source=source1,
+    )
+    assert outcome2.status == "completed", outcome2.error
+    assert outcome2.result["ok"] is False
+    assert "needs_reunderwrite=true" in outcome2.result["blocked"]
+    dispatched2 = [str(c["description"]) for c in dispatcher2.calls]
+    assert "初筛成稿" in dispatched2
+    assert "语言审查 1" in dispatched2
+    assert "审稿" in dispatched2
+    assert "修订 1" in dispatched2
+    assert "复审 1" not in dispatched2, "must pause before 复审 1 when needs_reunderwrite is true"
+
+    # Record resume.json in Run 2's directory (as create_run_workflow_tool does)
+    source2 = f".agents/threads/short-1/workflows/{driver2.wf_task_id}"
+    _pin_dispatch_timestamps(backend2.writes, source2, 180.0)
+    backend2.writes[f"{source2}/resume.json"] = json.dumps(
+        {"resumed_from": source1, "claimed_by": driver2.wf_task_id, "claimed_at": 180.0}
+    )
+    backend2.writes[f"{source2}/status.json"] = json.dumps(
+        {
+            "run_id": driver2.wf_task_id,
+            "name": "initial-coverage",
+            "status": "completed",
+            "updated_at": 190.0,
+        }
+    )
+
+    # 4) Pause 2: main agent formally writes thesis version 2 and updates underwriting-summary.md
+    backend2.writes[uw_path] = (
+        "已保存 thesis 版本 2\n"
+        "赔率计算摘要（立场：中性，期限：18 个月）：\n"
+        "- 三情景价格区间：悲观 75–85 / 基准 95–105 / 乐观 115–125\n"
+    )
+    store3 = dict(backend2.writes)
+
+    # 5) Run 3 (resume=run2, started at 200.0): because 语言审查 1 modified draft_path in Run 2
+    #    and uw_path changed in Pause 2, 初筛成稿 and 修订 1 re-run with version 2 ->
+    #    复审 1 -> 赔率摘要复核 (verifies version 2 === finalDraftVersion 2) -> 终稿审稿 -> completes
+    outcome3, driver3, dispatcher3, backend3 = await _drive_workflow(
+        store3,
+        by_label,
+        default=_generic_writes,
+        journal_source=source2,
+    )
+    assert outcome3.status == "completed", outcome3.error
+    assert outcome3.result["ok"] is True, outcome3.result["incomplete"]
+    dispatched3 = [str(c["description"]) for c in dispatcher3.calls]
+    assert "初筛成稿" in dispatched3
+    assert "修订 1" in dispatched3
+    assert "复审 1" in dispatched3
+    assert "赔率摘要复核" in dispatched3
+    assert "终稿审稿" in dispatched3
+
+    source3 = f".agents/threads/short-1/workflows/{driver3.wf_task_id}"
+    _pin_dispatch_timestamps(backend3.writes, source3, 200.0)
+    backend3.writes[f"{source3}/resume.json"] = json.dumps(
+        {"resumed_from": source2, "claimed_by": driver3.wf_task_id, "claimed_at": 200.0}
+    )
+    backend3.writes[f"{source3}/status.json"] = json.dumps(
+        {
+            "run_id": driver3.wf_task_id,
+            "name": "initial-coverage",
+            "status": "completed",
+            "updated_at": 210.0,
+        }
+    )
+
+    # 6) Call run_check_done against the final workspace state and DB version 2.
+    #    All dependency docs were written during Pause 1 at 150.0 (between Run 1 at 100.0 and Run 3 at 200.0).
+    check_files: dict[str, str] = {}
+    for k, v in backend3.writes.items():
+        clean_key = k[2:] if k.startswith("./") else k
+        check_files[clean_key] = v
+    check_files["drafts/2026-10-23-initial-coverage.audit.md"] = (
+        "# 数字核验报告\n- **草稿哈希**：`" + draft_v2_sha[:16] + "…`\n"
+    )
+    _with_full_language_sidecars(check_files)
+
+    _patch_knowledge(
+        monkeypatch,
+        IC_DOCS,
+        start_epochs={driver3.wf_task_id: 200},
+        thread_start_epoch=100,
+        thesis_version_no=2,
+        doc_timestamps={doc: 150.0 for doc in IC_DOCS},
+    )
+    _patch_verdicts(
+        monkeypatch,
+        [_verdict_row("NEW_THESIS", run_id=driver3.wf_task_id)],
+    )
+
+    done_res = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(check_files),
+        workspace_id=WS,
+        run_id=driver3.wf_task_id,
+        thread_id="short-1",
+    )
+    assert done_res["done"] is True, done_res["missing"]
+    assert done_res["missing"] == []

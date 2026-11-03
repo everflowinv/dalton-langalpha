@@ -3601,7 +3601,9 @@ def test_b4b_skill_prompts_field_paths_and_enums_match_schemas() -> None:
     # (none of these names exist in any knowledge schema):
     bare_tool_arg_allowed_values: dict[str, set[str]] = {
         "doc": {"thesis", "debate", "agenda", "drivers", "models", "management", "company", "lessons", "sector", "all"},  # knowledge_read / knowledge_update 的 doc 参数
+        "base_version": {"null", "None"},  # knowledge_update 新建文档时的 base_version 参数
         "dry_run": {"true", "false", "True", "False"},  # knowledge_update 的 dry_run 布尔参数
+        "paused_by_user": {"true", "false", "True", "False"},  # dalton_coverage_tracking 元数据布尔字段
         "done": {"true", "false", "True", "False"},  # dalton_check_done 返回的 done 布尔字段
         "passed": {"true", "false", "True", "False"},  # research/<as_of>-call.gates.json 的 passed 布尔字段
         "ok": {"true", "false", "True", "False"},  # 采集脚本与桥接响应的 ok 布尔状态字段
@@ -3636,6 +3638,7 @@ def test_b4b_skill_prompts_field_paths_and_enums_match_schemas() -> None:
         "recorded": {"true", "false", "True", "False"},  # calendar_state.py check 返回的已记录布尔字段
         "date_changed": {"true", "false", "True", "False"},  # calendar_state.py check 返回的改期布尔字段
         "resolved_count": {"0"},  # dalton_resolve_signals 返回的关闭信号计数
+        "needs_reunderwrite": {"true", "false", "True", "False"},  # initial-coverage 修订子任务返回布尔字段
     }
 
     # Non-schema identifiers that legitimately appear in backticks in the 12 schema-focused skill files,
@@ -3646,16 +3649,21 @@ def test_b4b_skill_prompts_field_paths_and_enums_match_schemas() -> None:
         "knowledge_update": "LangChain tool name",
         "knowledge_append_verdict": "LangChain tool name",
         "dalton_check_done": "LangChain tool name",
+        "dalton_coverage_tracking": "LangChain tool name",
         "check_draft": "LangChain tool name",
         "check_language": "LangChain tool name",
         "publish_report": "LangChain tool name",
         "execute_code": "LangChain tool name",
         "web_search": "LangChain tool name",
+        "workspace_dir": "RunWorkflow / dalton_check_done tool parameter",
+        "paused_by_user": "dalton_coverage_tracking metadata field",
         "base_version": "knowledge_update tool parameter",
         "dry_run": "knowledge_update tool parameter",
         "agenda_ops": "knowledge_append_verdict tool parameter",
         "latest_version_no": "knowledge_read response field",
         "underwriting_summary": "knowledge_update / knowledge_read response field",
+        "needs_reunderwrite": "initial-coverage workflow revision response boolean field",
+        "underwriting_version": "initial-coverage workflow draft/revision response integer field",
         # Error codes & database table names documented in dalton-knowledge/SKILL.md
         "append_only_violation": "validate.py error code",
         "official_is_publish_only": "validate.py error code",
@@ -3789,6 +3797,10 @@ def test_b4b_skill_prompts_field_paths_and_enums_match_schemas() -> None:
         "plugins/dalton/skills/dalton-earnings-preview/SKILL.md",
         "plugins/dalton/skills/dalton-earnings-flash/templates/flash.md",
         "plugins/dalton/skills/dalton-thesis-delta/SKILL.md",
+        "plugins/dalton/skills/dalton-initial-coverage/SKILL.md",
+        "plugins/dalton/skills/dalton-initial-coverage/references/screen-12q.md",
+        "plugins/dalton/skills/dalton-initial-coverage/templates/initial-coverage.md",
+        "plugins/dalton/skills/dalton-initial-coverage/templates/questions.md",
     }
 
     def _resolve_field_for_enum_check(
@@ -3999,6 +4011,10 @@ def test_b4b_skill_prompts_field_paths_and_enums_match_schemas() -> None:
         "plugins/dalton/skills/dalton-research-director/SKILL.md",
         "plugins/dalton/skills/dalton-sector-delta/SKILL.md",
         "plugins/dalton/skills/dalton-earnings-calendar/SKILL.md",
+        "plugins/dalton/skills/dalton-initial-coverage/SKILL.md",
+        "plugins/dalton/skills/dalton-initial-coverage/references/screen-12q.md",
+        "plugins/dalton/skills/dalton-initial-coverage/templates/initial-coverage.md",
+        "plugins/dalton/skills/dalton-initial-coverage/templates/questions.md",
     ]
 
     all_problems: list[str] = []
