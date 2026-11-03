@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Annotated, Any, Literal
 
 from fastapi import HTTPException
@@ -21,6 +22,15 @@ from src.tools.secretary._commands import InjectedToolCallId
 
 logger = logging.getLogger(__name__)
 
+# DALTON-HOOK(payoff-assessment): the two skills whose every verdict must
+# carry the odds assessment, matched by their standard automation names
+# (dalton-<ticker>-move-up/down = stock-move, dalton-<ticker>-delta =
+# thesis-delta). Runs the pattern cannot see (manual skill runs, custom task
+# names) fall through to the dalton_check_done contract, which knows the
+# workflow by name.
+_PAYOFF_SKILL_AUTO_RE = re.compile(
+    r"^dalton-[a-z0-9.]+-(?:move-(?:up|down)|delta)$", re.IGNORECASE
+)
 DocLiteral = Literal[
     "company",
     "sector",
@@ -90,6 +100,55 @@ async def _resolve_thread_origin(
     except Exception as e:
         logger.debug("Could not resolve thread origin for %s: %s", thread_id, e)
     return origin_type, automation_execution_id
+
+
+async def _automation_name_by_id(automation_id: str) -> str | None:
+    """The automation's name, or None when the id resolves to nothing."""
+    if not automation_id:
+        return None
+    try:
+        async with get_db_connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT name FROM automations WHERE automation_id = %s",
+                    (automation_id,),
+                )
+                row = await cur.fetchone()
+                return str(row[0]) if row and row[0] else None
+    except Exception as e:
+        logger.debug("Could not resolve automation %s: %s", automation_id, e)
+        return None
+
+
+async def _payoff_required_because(
+    verdict: dict[str, Any],
+    config: RunnableConfig | None,
+) -> str | None:
+    """Why THIS verdict must carry ``payoff_assessment`` (save-time gate), or None.
+
+    Two reliable signals: a ``price_move`` trigger (stock-move always writes
+    one; thesis-delta's price-wake runs do too) and a turn the server stamped
+    as sent by a stock-move / thesis-delta automation — per TURN, from
+    ``configurable.turn_origin_automation_id``: a pinned automation thread
+    also takes manual follow-ups, whose verdicts (other skills, no origin
+    stamp) must pass untouched. Nothing else is rejected here — the contract
+    layer (``dalton_check_done``) enforces the field for those runs by
+    workflow name."""
+    trigger = verdict.get("trigger")
+    kind = str(trigger.get("kind") or "") if isinstance(trigger, dict) else ""
+    if kind == "price_move":
+        return "`trigger.kind` 为 `price_move`（股价异动归因结论）"
+    cfg = (config or {}).get("configurable") or {}
+    automation_id = str(cfg.get("turn_origin_automation_id") or "").strip()
+    if not automation_id:
+        return None  # a manual turn (or an unstamped surface): check_done 兜底
+    origin_name = await _automation_name_by_id(automation_id)
+    if origin_name and _PAYOFF_SKILL_AUTO_RE.match(origin_name.strip()):
+        return (
+            f"本轮由自动任务 `{origin_name.strip()}` 触发"
+            "（`dalton-stock-move` / `dalton-thesis-delta` 的结论）"
+        )
+    return None
 
 
 def extract_verdict_signal_refs(verdict: dict[str, Any]) -> list[str]:
@@ -285,7 +344,8 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
         - 必填：verdict（上述五词之一）；event（一句话事件，含期间与数字）；rationale（定量依据）；progress（"none"|"some"|"resolved"）；
           trigger：{"kind": filing|earnings|price_move|consensus_change|indicator|due_validation|pm_question|internal_material|agenda|director|manual, "ref": 唤醒信号 id / accession / V- 编号, "automation_execution_id": 仅自动任务}；
           next_validation：{"what": 下一项看什么, "due": "YYYY-MM-DD"（不能是 null）, "validation_id": 可选 V-xxx}——不是 text/when。
-        - 可选：affected（{pillars:[], debates:[], drivers:[]}）；evidence_ids（["E-…"]——不是 evidence/evidence_refs/basis/summary）；question_ids（["Q-…"]）；house_view_changed。
+        - 可选：affected（{pillars:[], debates:[], drivers:[]}）；evidence_ids（["E-…"]——不是 evidence/evidence_refs/basis/summary）；question_ids（["Q-…"]）；house_view_changed；
+          `payoff_assessment`（`dalton-stock-move` 与 `dalton-thesis-delta` 每条 `verdict` **必填**，缺了在能识别调用来源时直接拒存；其他技能可选）：评估当前价格下的赔率是否发生实质变化。赔率没变填 `{"changed": false, "reason": "none"}`；赔率变了填 `{"changed": true, "reason": "<枚举值>"}`（`changed=false` 时 `reason` 只能填 `"none"`，`changed=true` 时不得填 `"none"`），`reason` 五选一：`"price_crossed_band"`（三情景假设未改，单纯股价越过三情景或买点价带）| `"scenario_revised"`（重算并调整了三情景 EPS 或估值倍数假设）| `"expectations_migrated"`（三情景假设未改，但 Street consensus 或买方 bogey 明显移动）| `"catalyst_expired"`（支撑催化剂已兑现、落空或过期）| `"protection_failed"`（生存、价值或路径任一下行保护条件失效）。
         最小示例：{"verdict":"NO_CHANGE","event":"…","rationale":"…","progress":"none","trigger":{"kind":"internal_material","ref":"<信号id>"},"next_validation":{"what":"…","due":"2026-11-05"}}；被拒时返回只列未知字段与缺少的字段，照改后原样重试。
 
         Writing requires the caller to own the workspace or hold rw on it; external members are fully isolated — colleagues' workspaces are not visible to them at all (a 404 is an identity limit — report it, don't retry).
@@ -319,6 +379,31 @@ def create_knowledge_tools(filesystem_backend: Any = None) -> list[BaseTool]:
             target_ws_id, user_id, eff_backend, skip_access_check=True
         )
         origin_type, auto_exec_id = await _resolve_thread_origin(thread_id)
+        # DALTON-HOOK(payoff-assessment): reject at save time where the caller
+        # is reliably identifiable (price_move trigger, or THIS TURN stamped as
+        # sent by a stock-move / thesis-delta automation) — a fieldless verdict
+        # that lands in the append-only table can only be healed by appending
+        # another row, and unattended automation runs may never call
+        # dalton_check_done to be told so. Manual turns in an automation's
+        # thread carry no stamp and pass untouched.
+        if not isinstance(verdict.get("payoff_assessment"), dict):
+            why = await _payoff_required_because(verdict, config)
+            if why:
+                return (
+                    "ERROR: `verdict` 缺少 `payoff_assessment`（"
+                    + why
+                    + "），本条未保存（NOT SAVED）。"
+                    "股价异动归因与每日增量跟踪的每条 `verdict` 都要评估当前价格下的赔率；"
+                    "补上该字段后原样重试：赔率没变传 "
+                    '`{"changed": false, "reason": "none"}`；'
+                    "赔率变了传 "
+                    '`{"changed": true, "reason": "<枚举值>"}`'
+                    "（`price_crossed_band` 单纯股价越过三情景或买点价带 | "
+                    "`scenario_revised` 重算了三情景 EPS 或估值倍数假设 | "
+                    "`expectations_migrated` Street consensus 或买方 bogey 明显移动 | "
+                    "`catalyst_expired` 催化剂已兑现或过期 | "
+                    "`protection_failed` 下行保护失效）。"
+                )
         res = await append_verdict(
             user_id=user_id,
             workspace_id=target_ws_id,

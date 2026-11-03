@@ -271,16 +271,26 @@ async def get_verdict_for_execution(
     automation_execution_id: str | None = None,
     thread_id: str | None = None,
     run_id: str | None = None,
+    workspace_id: str | None = None,
+    trigger_kind: str | None = None,
 ) -> dict[str, Any] | None:
     """Return the verdict row matching this run's ``automation_execution_id`` or ``run_id``.
 
     Never falls back to ``conversation_thread_id`` because recurring automations
     on a fixed thread (e.g. ``dalton-director-weekly``) would return a stale
-    verdict from an earlier run.
+    verdict from an earlier run. ``workspace_id``, when given, pins the row to
+    that workspace: the knowledge tool allows a run to write verdicts into
+    another workspace it holds write access on, and such a row must never
+    steer this workspace's push gate. ``trigger_kind``, when given, keeps the
+    row to one trigger class — a run may append several verdicts (a price_move
+    one plus an agenda one), and the price_move push gate must read the
+    price_move row, not whichever landed last.
     """
     _ = thread_id
     exec_id = (automation_execution_id or "").strip()
     rid = (run_id or "").strip()
+    ws_id = (workspace_id or "").strip()
+    trig = (trigger_kind or "").strip()
     if not (exec_id or rid):
         return None
 
@@ -292,15 +302,26 @@ async def get_verdict_for_execution(
             ):
                 if not val:
                     continue
+                # DALTON-HOOK(payoff-assessment): the workspace and trigger
+                # pins serve the price_move push gate — a run's cross-workspace
+                # or other-trigger verdict writes must not flip this gate.
+                clauses = [f"{col} = %s"]
+                params: list[str] = [val]
+                if ws_id:
+                    clauses.append("workspace_id = %s")
+                    params.append(ws_id)
+                if trig:
+                    clauses.append("trigger_kind = %s")
+                    params.append(trig)
                 await cur.execute(
                     f"""
                     SELECT {_VERDICT_COLS}
                     FROM dalton_verdicts
-                    WHERE {col} = %s
+                    WHERE {" AND ".join(clauses)}
                     ORDER BY verdict_at DESC, created_at DESC, length(verdict_id) DESC, verdict_id DESC
                     LIMIT 1
                     """,
-                    (val,),
+                    tuple(params),
                 )
                 row = await cur.fetchone()
                 if row is not None:

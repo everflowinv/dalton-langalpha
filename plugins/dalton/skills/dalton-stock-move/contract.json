@@ -1,6 +1,6 @@
 {
   "name": "dalton-stock-move",
-  "description": "股价异动归因的完成契约：归因笔记落盘 research/ + 事件五词 verdict（trigger_kind=price_move）；本轮 verdict 非 NO_CHANGE 时至少一份 thesis/debate/drivers/management 有本轮 source=tool 新版本（对应 dalton-stock-move SKILL 第 8–9 步）。",
+  "description": "股价异动归因的完成契约：归因笔记落盘 research/ + 事件五词 verdict（trigger_kind=price_move，必带 payoff_assessment）；本轮 verdict 非 NO_CHANGE 时至少一份 thesis/debate/drivers/management 有本轮 source=tool 新版本；verdict 非 NO_CHANGE、或 NO_CHANGE 但 payoff_assessment.changed=true 时，推送稿须本轮重写并过两轮语言审查（对应 dalton-stock-move SKILL 第 6–7 步）。",
   "params_required": [
     "ticker",
     "as_of"
@@ -27,6 +27,7 @@
       "NEW_THESIS"
     ],
     "verdict_trigger": "price_move",
+    "verdict_payoff_required": true,
     "knowledge_docs_any_unless_no_change": [
       "thesis",
       "debate",

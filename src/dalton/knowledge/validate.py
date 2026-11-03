@@ -771,4 +771,34 @@ def validate_verdict(
                     "message": "verdict is THESIS_BROKEN but no pillar in thesis.json has status broken or changed",
                 }
             )
-    return ValidationResult(errors=schema_errors, warnings=warnings)
+    # DALTON-HOOK(payoff-assessment): changed/reason 的组合在 schema 之外单独校验，
+    # 报错信息是模型可直接照改的一句话；jsonschema 的 if/then 报错做不到这一点。
+    payoff = verdict.get("payoff_assessment")
+    errors = list(schema_errors)
+    if isinstance(payoff, dict) and "changed" in payoff and "reason" in payoff:
+        changed = payoff.get("changed")
+        reason = payoff.get("reason")
+        if changed is False and reason != "none":
+            errors.append(
+                {
+                    "code": "payoff_reason_mismatch",
+                    "path": "/payoff_assessment/reason",
+                    "message": (
+                        f"payoff_assessment.changed=false 时 reason 必须是 none（当前 {reason!r}）；"
+                        "赔率没变就写 {\"changed\": false, \"reason\": \"none\"}"
+                    ),
+                }
+            )
+        elif changed is True and reason == "none":
+            errors.append(
+                {
+                    "code": "payoff_reason_mismatch",
+                    "path": "/payoff_assessment/reason",
+                    "message": (
+                        "payoff_assessment.changed=true 时 reason 不得是 none；"
+                        "从 price_crossed_band / scenario_revised / expectations_migrated / "
+                        "catalyst_expired / protection_failed 中选一个"
+                    ),
+                }
+            )
+    return ValidationResult(errors=errors, warnings=warnings)

@@ -920,7 +920,8 @@ def build_graph_config(
         langsmith_metadata["run_id"] = run_id
     if turn_index is not None:
         langsmith_metadata["turn_index"] = turn_index
-    langsmith_metadata.update(_origin_metadata(request, from_server=from_server))
+    turn_origin = _origin_metadata(request, from_server=from_server)
+    langsmith_metadata.update(turn_origin)
 
     configurable: dict = {
         "thread_id": thread_id,
@@ -933,6 +934,14 @@ def build_graph_config(
         # server-only, so no client can claim it.
         "wake_turn": request.query_type == WAKE_QUERY_TYPE,
     }
+    # DALTON-HOOK(payoff-assessment): this turn's automation identity, for
+    # tools that gate on WHO is running. The thread's stored origin must never
+    # answer for the running turn: a pinned automation thread also takes
+    # manual follow-ups, and those carry no origin, so only this per-request
+    # stamp (server-believed, same rule as _origin_metadata) says which
+    # automation — if any — sent THIS turn.
+    if turn_origin.get("origin") == "automation" and turn_origin.get("automation_id"):
+        configurable["turn_origin_automation_id"] = str(turn_origin["automation_id"])
     # A command's report-back turn names the command, so the call that reads
     # its notice brings the command's data sources with it. Its own field
     # (``report_source``) is server-only; the trace stays on the command's row.

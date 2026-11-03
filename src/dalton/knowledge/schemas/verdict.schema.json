@@ -20,7 +20,13 @@
       "properties": {"what": {"type": "string"}, "due": {"$ref": "common#/$defs/isoDate"}, "validation_id": {"type": "string"}},
       "required": ["what","due"]},
     "progress": {"enum": ["none","some","resolved"], "description": "对议程问题的进展，用于退避（PK.18）"},
-    "question_ids": {"type": "array", "items": {"type": "string"}}
+    "question_ids": {"type": "array", "items": {"type": "string"}},
+    "payoff_assessment": {"type": "object", "additionalProperties": false,
+      "properties": {"changed": {"type": "boolean"},
+                     "reason": {"enum": ["price_crossed_band","scenario_revised","expectations_migrated","catalyst_expired","protection_failed","none"],
+                                "description": "changed=false 时必须是 none；changed=true 时不得是 none（组合校验在 validate_verdict）"}},
+      "required": ["changed","reason"],
+      "description": "赔率评估：论点没变时，当前价格下的赔率是否变了。dalton-stock-move 与 dalton-thesis-delta 的 verdict 必填；其他技能可选（不填视为未评估）。旧记录无此字段，读取与渲染按未评估处理。"}
   },
   "required": ["at","trigger","event","verdict","rationale","next_validation","progress"]
 }

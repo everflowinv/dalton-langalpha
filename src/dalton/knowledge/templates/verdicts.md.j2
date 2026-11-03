@@ -3,9 +3,9 @@
 # {{ ticker }} 事件五词结论日志（Event Verdicts）
 
 {% if verdicts %}
-| 结论 ID | 时间 | 结论（五词） | 触发类型 | 事件概述 | 核心依据 | 下一步验证 |
-|---|---|---|---|---|---|---|
-{% for v in verdicts %}| **{{ v.id }}** | {{ v.at[:16] }} | **{{ verdict_zh.get(v.verdict, v.verdict) }}** (`{{ v.verdict }}`) | `{{ v.trigger.kind }}`{% if v.trigger.ref %} ({{ v.trigger.ref }}){% endif %} | {{ v.event }} | {{ v.rationale }} | {{ v.next_validation.what }} ({{ v.next_validation.due }}) |
+| 结论 ID | 时间 | 结论（五词） | 赔率 | 触发类型 | 事件概述 | 核心依据 | 下一步验证 |
+|---|---|---|---|---|---|---|---|
+{% for v in verdicts %}| **{{ v.id }}** | {{ v.at[:16] }} | **{{ verdict_zh.get(v.verdict, v.verdict) }}** (`{{ v.verdict }}`) | {% if v.payoff_assessment %}{% if v.payoff_assessment.changed %}{% set r_zh = payoff_reason_zh.get(v.payoff_assessment.reason) %}赔率变了{% if r_zh %}：{{ r_zh }}{% endif %}{% else %}赔率未变{% endif %}{% else %}—（未评估）{% endif %} | `{{ v.trigger.kind }}`{% if v.trigger.ref %} ({{ v.trigger.ref }}){% endif %} | {{ v.event }} | {{ v.rationale }} | {{ v.next_validation.what }} ({{ v.next_validation.due }}) |
 {% endfor %}
 {% else %}
 暂无事件结论记录。

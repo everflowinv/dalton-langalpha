@@ -790,6 +790,13 @@ def _verdict_row_matches(
     return True
 
 
+def _row_payoff_assessment(row: dict[str, Any]) -> dict[str, Any] | None:
+    """The row's ``payload.payoff_assessment``; legacy rows answer None."""
+    payload = row.get("payload")
+    payoff = payload.get("payoff_assessment") if isinstance(payload, dict) else None
+    return payoff if isinstance(payoff, dict) else None
+
+
 async def _check_verdicts(
     workspace_id: str,
     *,
@@ -1499,6 +1506,38 @@ async def _check_closing(
             )
         )
 
+    # DALTON-HOOK(payoff-assessment): stock-move / thesis-delta declare this
+    # key. The verdict table is append-only, so the check reads only the
+    # LATEST verdict this run wrote into this workspace through this skill's
+    # triggers (verdict_rows is already workspace- and kind/trigger-scoped;
+    # with a conversation run named, only rows carrying that run_id count —
+    # same strict attribution as the other run-scoped verdict checks). The
+    # remedy for a missing field is to APPEND one verdict that carries it;
+    # legacy rows without it can never block a later run.
+    if closing.get("verdict_payoff_required") and verdict_rows:
+        candidates = verdict_rows
+        if conversation_run_id:
+            candidates = [
+                row
+                for row in verdict_rows
+                if str(row.get("run_id") or "") == str(conversation_run_id)
+            ]
+        latest = candidates[0] if candidates else None  # list_verdicts: newest first
+        if latest is not None and _row_payoff_assessment(latest) is None:
+            missing.append(
+                f"本轮最新一条 `verdict`（{latest.get('verdict_id') or '?'}）缺少 `payoff_assessment`"
+                "（`dalton-stock-move` / `dalton-thesis-delta` 必填）；"
+                "下一步：调用 `knowledge_append_verdict` **再追加一条**带 `payoff_assessment` 的同内容 `verdict` 即可"
+                "（`verdict` 表只追加、不能改写，本契约只看最新一条，旧记录不用管）——"
+                '赔率没变填 `{"changed": false, "reason": "none"}`；'
+                '赔率变了填 `{"changed": true, "reason": "<枚举值>"}`，`reason` 从 '
+                '`"price_crossed_band"`（单纯股价越过三情景或买点价带）、'
+                '`"scenario_revised"`（重算了三情景 EPS 或估值倍数假设）、'
+                '`"expectations_migrated"`（Street consensus 或买方 bogey 明显移动）、'
+                '`"catalyst_expired"`（催化剂已兑现或过期）、'
+                '`"protection_failed"`（下行保护失效）中按主因选一个。'
+            )
+
     gate = closing.get("gated_draft")
     if gate:
         gate_missing, gate_warnings = await _check_gated_draft(
@@ -1566,6 +1605,8 @@ async def _check_closing(
                 run_id,
                 thread_id,
                 conversation_run_id=conversation_run_id,
+                workspace_id=workspace_id,
+                closing_trigger_kinds=triggers,
                 resolved=resolved_map,
             )
         )
@@ -2195,19 +2236,49 @@ async def _check_language_review(
 _PUSH_DRAFT_MTIME_TOLERANCE_SECONDS = MTIME_TOLERANCE_SECONDS
 
 
-async def _is_current_run_no_change(conversation_run_id: str | None) -> bool:
-    """True only when the current conversation run recorded a ``NO_CHANGE``
-    verdict via ``get_verdict_for_execution(run_id=conversation_run_id)``."""
+# DALTON-HOOK(payoff-assessment): the push-draft skip keys off this run's
+# verdict, which since the payoff field also carries whether the odds moved.
+async def _current_run_push_skip_state(
+    conversation_run_id: str | None,
+    workspace_id: str | None = None,
+    trigger_kinds: list[str] | None = None,
+) -> tuple[bool, str | None]:
+    """``(skip_push_draft, payoff_reason_zh)`` for the current conversation run.
+
+    Skip stays reserved for a ``NO_CHANGE`` verdict whose odds did NOT move
+    (``payoff_assessment`` absent-but-legacy, or ``changed`` false). A
+    ``NO_CHANGE`` with ``payoff_assessment.changed=true`` owes the PM a push,
+    so it returns ``(False, reason_zh)`` and the push-draft rule keeps holding;
+    rows without a ``run_id`` match never qualify (same attribution as
+    ``get_verdict_for_execution``). ``workspace_id`` pins the lookup to this
+    workspace and ``trigger_kinds`` to the contract's declared triggers (for
+    stock-move: ``price_move``) — the same scope the closing verdict checks
+    use, so a verdict this run wrote to another workspace or under another
+    trigger cannot flip this one's gates."""
     try:
         from src.dalton.database.verdicts import get_verdict_for_execution
+        from src.dalton.knowledge.render import PAYOFF_REASON_ZH
 
-        row = await get_verdict_for_execution(run_id=conversation_run_id)
+        row = await get_verdict_for_execution(
+            run_id=conversation_run_id,
+            workspace_id=(workspace_id or "").strip() or None,
+            trigger_kind=(trigger_kinds or [None])[0],
+        )
     except Exception as error:
         logger.warning(
             "dalton_check_done execution verdict query failed", error=str(error)
         )
-        return False
-    return isinstance(row, dict) and row.get("word") == "NO_CHANGE"
+        return (False, None)
+    if not isinstance(row, dict) or row.get("word") != "NO_CHANGE":
+        return (False, None)
+    payload = row.get("payload")
+    payoff = (
+        payload.get("payoff_assessment") if isinstance(payload, dict) else None
+    )
+    if isinstance(payoff, dict) and payoff.get("changed") is True:
+        reason = str(payoff.get("reason") or "")
+        return (False, PAYOFF_REASON_ZH.get(reason) or "赔率发生变化")
+    return (True, None)
 
 
 async def _check_push_draft(
@@ -2219,17 +2290,33 @@ async def _check_push_draft(
     thread_id: str | None,
     *,
     conversation_run_id: str | None = None,
+    workspace_id: str | None = None,
+    closing_trigger_kinds: list[str] | None = None,
     resolved: dict[str, str] | None = None,
 ) -> list[str]:
     """Check ``closing.push_draft``: file existence, written in the current
     round (mtime >= run/thread start epoch - 5s tolerance, fail-closed when
-    unreadable), and two-round language review matching current file sha256."""
+    unreadable), and two-round language review matching current file sha256.
+
+    ``closing_trigger_kinds`` is the contract's ``verdict_trigger`` list: the
+    skip lookup stays scoped to those triggers, same as the closing checks."""
     path_template = render_template(rule["path"], params)
     path = (resolved or {}).get(path_template, path_template)
-    skip_no_change = (
-        await _is_current_run_no_change(conversation_run_id)
-        if rule.get("skip_when_no_change")
-        else False
+    skip_no_change = False
+    payoff_reason: str | None = None
+    if rule.get("skip_when_no_change"):
+        skip_no_change, payoff_reason = await _current_run_push_skip_state(
+            conversation_run_id,
+            workspace_id,
+            trigger_kinds=_as_trigger_list(closing_trigger_kinds),
+        )
+    # A NO_CHANGE whose odds moved still owes a push draft; the gap message
+    # says why, or the model reads the requirement as a filter bug.
+    payoff_note = (
+        f"——本轮 `verdict` 为 `NO_CHANGE` 但 `payoff_assessment.changed=true`（{payoff_reason}），"
+        "论点没变仍须写推送稿（`## 结论` 首句写明“论点未变、赔率变了：<具体原因>”）并完成两轮语言审查"
+        if payoff_reason
+        else ""
     )
     status, _ = await _read_text_diagnosed(backend, path)
     if status == "error":
@@ -2238,9 +2325,9 @@ async def _check_push_draft(
         if skip_no_change:
             return []
         return [
-            f"缺少推送稿 {path}（文件不存在）；"
-            f"下一步：写入本轮推送稿 {path}，调用 check_language(round=1) 并按清单修改，"
-            "内容定稿后再调用 check_language(round=2)。"
+            f"缺少推送稿 {path}（文件不存在{payoff_note}）；"
+            f"下一步：写入本轮推送稿 {path}，调用 `check_language(round=1)` 并按清单修改，"
+            "内容定稿后再调用 `check_language(round=2)`。"
         ]
 
     since_epoch = await _push_draft_since_epoch(conversation_run_id, thread_id)
@@ -2258,7 +2345,7 @@ async def _check_push_draft(
             return []
         return [
             f"推送稿 {path} 修改时间（{info.mtime_epoch}）早于本轮运行开始时间（{since_epoch}），"
-            f"非本轮新写；下一步：用本轮内容重写 {path}，并重新完成 check_language(round=1) 与 check_language(round=2)。"
+            f"非本轮新写{payoff_note}；下一步：用本轮内容重写 {path}，并重新完成 `check_language(round=1)` 与 `check_language(round=2)`。"
         ]
 
     gap = await _check_language_record(

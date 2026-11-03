@@ -28,6 +28,16 @@ VERDICT_ZH: dict[str, str] = {
     "NEW_THESIS": "新论点",
 }
 
+# DALTON-HOOK(payoff-assessment): verdict.payoff_assessment.reason 的人读标签，
+# verdicts.md 渲染与 price_move 推送标题共用，枚举值不直接进面向用户的文字。
+PAYOFF_REASON_ZH: dict[str, str] = {
+    "price_crossed_band": "股价越过三情景或买点价带",
+    "scenario_revised": "三情景估值假设已重算",
+    "expectations_migrated": "Street 或买方预期明显移动",
+    "catalyst_expired": "催化剂已兑现或过期",
+    "protection_failed": "下行保护失效",
+}
+
 STAGE_ZH: dict[str, str] = {
     "onboarding": "入职迁移",
     "initial": "初步覆盖",
@@ -132,6 +142,7 @@ def render_verdicts_md(
         ticker=ticker or "COMPANY",
         verdicts=normalized,
         verdict_zh=VERDICT_ZH,
+        payoff_reason_zh=PAYOFF_REASON_ZH,
         rendered_at=_format_iso(rendered_at),
     )
     return out if out.endswith("\n") else out + "\n"

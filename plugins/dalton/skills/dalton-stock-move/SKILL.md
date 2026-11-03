@@ -16,7 +16,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 - **硬性门槛**：量化脚本 `move_quant.py` 必须成功且 `data_ok=true` 才能下结论；若最新日线/盘外分钟线未出或数据缺失，立即停止归因并写明原因，严禁凭训练记忆补全。
 - **全部定性线索带出处**：每条新闻、社媒讨论、filing、卖方观点、专家访谈必须带日期、链接或 `doc_id`，且核对发布时间在检索窗口内。
-- **价格触发自动任务的不打扰原则（Beta No-Push Rule）**：当由价格触发自动任务（`dalton-<t>-move-up.json` / `dalton-<t>-move-down.json`）唤醒，且量化判定为 `sector_beta`、同时新闻/X/公告/卖方确认无个股层面事件时，只用 `knowledge_append_verdict` 写一条 `NO_CHANGE`（`progress="none"`），**不向 PM 推送通知**。
+- **价格触发自动任务的不打扰原则（Beta No-Push Rule）**：当由价格触发自动任务（`dalton-<t>-move-up.json` / `dalton-<t>-move-down.json`）唤醒，且量化判定为 `sector_beta`、同时新闻/X/公告/卖方确认无个股层面事件时，只用 `knowledge_append_verdict` 写一条 `NO_CHANGE`（`progress="none"`，仍必填 `payoff_assessment`），**不向 PM 推送通知**——唯一例外是收尾三问判定赔率变了（`payoff_assessment.changed=true`，典型如板块普跌使股价越过三情景或买点价带）：此时按下方第 7 步写入推送稿、完成两轮 `check_language`，并以推送稿全文作为最后回复。
 
 ---
 
@@ -197,7 +197,14 @@ python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \
    - **主要驱动**：个股事件 / 板块共振 / 宏观与利率 / 资金面与仓位挤压 / 原因暂缺，并给出催化剂主次排序；
    - **竞争解释判定**：对第 0 步冻结的 2–3 个竞争解释逐条判定成立 / 排除 / 存疑（存疑的写明还差什么证据）；
    - **对 thesis 的含义**：这次异动背后的事实是否触及某个核心支柱（确认/警告/证伪阈值）或某条关键 debate？当前市场定价是对还是错（过度反应 / 反应不足 / 合理反映了基本面变化）？
-   - **收尾三问（报告正文必答；结构化字段上线前写在正文，不写新字段）**：经营变了吗？预期变了吗？赔率变了吗？——分别回答事件是否改变经营事实、是否改变市场预期（当前定价水平），以及是否改变当前价格下的赔率。赔率比较的**基准是上一份带日期、锚价和期限的报告里的赔率卡**；尚无历史赔率卡时明确写"本轮建立基准"，不得声称已经比较出了变化。赔率变好 / 变差 / 没变都要写明方向与依据。
+   - **收尾三问（报告正文必答，并把第三问的结论写进 `verdict` 的 `payoff_assessment` 字段）**：经营变了吗？预期变了吗？赔率变了吗？——分别回答事件是否改变经营事实、是否改变市场预期（当前定价水平），以及是否改变当前价格下的赔率。赔率比较的**基准是上一份带日期、锚价和期限的报告里的三情景价带与所需胜率**；尚无历史基准时明确写"本轮建立基准"（此时 `payoff_assessment` 填 `{"changed": false, "reason": "none"}`），不得声称已经比较出了变化。赔率变好 / 变差 / 没变都要写明方向与依据。
+     - `payoff_assessment` 的填法：赔率没变填 `{"changed": false, "reason": "none"}`；赔率变了填 `{"changed": true, "reason": "<枚举值>"}`，`reason` 按本次赔率变化的主因从以下五个枚举值中选一个：
+       - `"price_crossed_band"`：**我们的三情景（`Bear` / `Base` / `Bull`）估值假设未改**，单纯股价涨跌越过了上一版三情景价带端点（如跌破 `Bear` 下沿、涨穿 `Base` / `Bull` 上沿）或进入了事先设定的买点价带。
+       - `"scenario_revised"`：本次事件带来新基本面证据，**我们重算并调整了三情景的 EPS 或估值倍数假设**，使三情景目标价带本身上移或下移。
+       - `"expectations_migrated"`：**我们的三情景假设未改**，但 **Street consensus 或买方 bogey 明显上移或下移**，改变了当前价格隐含的预期差与所需胜率。
+       - `"catalyst_expired"`：此前支撑该笔投资的催化剂已兑现、落空或过期，未来 1–2 个季度进入催化剂真空期。
+       - `"protection_failed"`：三层下行保护（生存层融资/现金流、价值层实际股本缩减/资产托底、路径层借券/逼空）中的任一条件失效，扩大了下行风险敞口。
+     - **论点与赔率分开如实填写**：论点没变但赔率变了时，`verdict` 仍填 `"NO_CHANGE"`、`payoff_assessment.changed` 填 `true`——既不得为了触发推送而把 `verdict` 改写成 `"THESIS_STRENGTHENED"` / `"THESIS_WEAKENED"` 等，也不得为了与 `"NO_CHANGE"` 表面一致而把已变化的赔率写成 `"changed": false`。
    - **线性还是切换（报告正文必答）**：这次是沿着旧叙事线性演进，还是叙事 / 倍数 regime（市场给这类资产的定价规则）可能在切换？答"可能在切换"时，必须点名是**哪一个触发器**（哪份披露、哪个数字、哪类持仓变化）、**指向哪个方向**（升级 / 降级），以及**需要什么证据来确认**；检查方法见 `.agents/skills/dalton-conventions/references/nonlinear.md`。
    - **事件结论五词**：从 `NO_CHANGE`（无变化）、`THESIS_STRENGTHENED`（强化）、`THESIS_WEAKENED`（削弱）、`THESIS_BROKEN`（证伪）、`NEW_THESIS`（新论点）中选定一个，并用一句话写清理由。
    - **下一项验证**：接下来观察什么指标或事件、什么时间见分晓。
@@ -210,22 +217,24 @@ python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \
 0. **收尾前自检**：若拟定结论包含“证据不足 / 原因暂缺”，先列出所有未核查的相关来源并补齐取证；确认全部渠道均已核查后，在输出中附上已核查来源清单。
 1. **写入事件结论**：调用 `knowledge_append_verdict(verdict=VERDICT, agenda_ops=AGENDA_OPS)`：
    - `verdict.verdict`：五词正式枚举（如 `"NO_CHANGE"`、`"THESIS_STRENGTHENED"` 等）；
+   - `verdict.payoff_assessment`：**必填**。收尾三问第三问（赔率变了吗）的结论按第 6 步的填法写入：赔率没变填 `{"changed": false, "reason": "none"}`；变了填 `{"changed": true, "reason": "<五个原因之一>"}`；
    - `verdict.trigger.kind`：`"price_move"`（若由价格触发唤醒，`trigger.ref` 填入触发任务名或信号 id）；
    - `verdict.next_validation`：必填 `what` 与 `due`；
    - `verdict.progress`：有新实质证据或进展填 `"some"`（若彻底解答待验证问题填 `"resolved"`），纯板块 beta 无新事件填 `"none"`。
    - `agenda_ops`：把下一项验证写入议程（或更新已有验证项）。
 2. **更新知识层**：
    - 若某条 debate 的倾向或证据因本次事件发生证实/证伪，或某个驱动变量有新读数，调用 `knowledge_update(doc="debate", ops=OPS, reason=REASON)`（`doc` 可为 `"debate"` | `"drivers"` | `"thesis"`）更新。
-3. **价格触发推送纪律（只看最终 verdict，归因分类不影响）**：
-   - 先确定上面第 1 点写入的最终五词 `verdict`：
-   - **若最终 `verdict` 为 `NO_CHANGE`**：**不向 PM 推送消息**，也不写推送稿、不跑语言审查（无论归因分类是 `sector_beta`、`stock_specific` 还是 `mixed`）。
+3. **价格触发推送纪律（只看最终 `verdict` 与 `payoff_assessment`，归因分类不影响）**：
+   - 先确定上面第 1 点写入的最终五词 `verdict` 与 `payoff_assessment.changed`：
+   - **若最终 `verdict` 为 `NO_CHANGE` 且 `payoff_assessment.changed` 不是 `true`**：**不向 PM 推送消息**，也不写推送稿、不跑语言审查（无论归因分类是 `sector_beta`、`stock_specific` 还是 `mixed`）。
+   - **若最终 `verdict` 为 `NO_CHANGE` 但 `payoff_assessment.changed=true`**：论点没变、赔率变了，仍须向 PM 推送。按 `.agents/skills/dalton-conventions/SKILL.md` §8 把本轮推送正文写入 `research/push/<异动日 YYYY-MM-DD>-stock-move.md`（同日上涨、下跌各跑一次时，后一次重写该文件并重新审两轮）并完成两轮 `check_language`；推送稿 `## 结论` 首句写明"论点未变、赔率变了：<具体原因，如股价跌破三情景 Bear 价带下沿>"，最后回复与该推送稿逐字相同。
    - **若最终 `verdict` 不是 `NO_CHANGE`**：按 `.agents/skills/dalton-conventions/SKILL.md` §8 将本轮推送正文写入 `research/push/<异动日 YYYY-MM-DD>-stock-move.md`（同日上涨、下跌各跑一次时，后一次重写该文件并重新审两轮）并完成两轮 `check_language`，最后回复与该推送稿逐字相同。
 
 ### 收尾门禁：汇报完成前必须过完成契约（`dalton_check_done`）
 
 - 向 PM 汇报“完成”（或静默 beta 轮次记 `NO_CHANGE` 收尾）前，必须调用 `dalton_check_done(workflow="dalton-stock-move", params={"ticker": ..., "as_of": "<异动日 YYYY-MM-DD>"})`（`as_of` 传本次异动发生的那一天——美东交易日，与归因笔记 `research/<异动日 YYYY-MM-DD>-stock-move.md` 的日期一致；新近度按本轮运行开始时间核对）。
-- 契约要求：`research/<异动日>-stock-move.md` 归因笔记、本轮 `trigger.kind="price_move"` 的 verdict；verdict 不是 `NO_CHANGE` 时，`thesis`/`debate`/`drivers`/`management` 至少一份须有本轮 `knowledge_update` 写入的新版本，且本轮写入的 `research/push/<异动日>-stock-move.md` 须完成两轮 `check_language`。
-- `done=false` 时按 `missing` 先补齐再查（归因笔记缺失就补写、verdict 未写就 `knowledge_append_verdict`、非 `NO_CHANGE` 却没有知识更新就对受影响的文档 `knowledge_update`、非 `NO_CHANGE` 且推送稿未在本轮重写或缺语言审查轮次就补写并跑 `check_language`）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。
+- 契约要求：`research/<异动日>-stock-move.md` 归因笔记、本轮 `trigger.kind="price_move"` 且带 `payoff_assessment` 的 `verdict`（工具会在保存时拒绝缺 `payoff_assessment` 的 `price_move` 结论，漏存时按报错补上字段重试；契约只看本轮最新一条）；`verdict` 不是 `NO_CHANGE` 时，`thesis`/`debate`/`drivers`/`management` 至少一份须有本轮 `knowledge_update` 写入的新版本；`verdict` 不是 `NO_CHANGE`、或虽是 `NO_CHANGE` 但 `payoff_assessment.changed=true` 时，本轮写入的 `research/push/<异动日>-stock-move.md` 须完成两轮 `check_language`。
+- `done=false` 时按 `missing` 先补齐再查（归因笔记缺失就补写、`verdict` 未写或缺少 `payoff_assessment` 就按第 6 步填法调用 `knowledge_append_verdict` **再追加一条**带 `payoff_assessment` 的 `verdict`、非 `NO_CHANGE` 却没有知识更新就对受影响的文档 `knowledge_update`、需要推送稿（非 `NO_CHANGE`，或 `NO_CHANGE` 但 `payoff_assessment.changed=true`）而推送稿未在本轮重写或缺语言审查轮次就补写并跑 `check_language`）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。
 
 ---
 
