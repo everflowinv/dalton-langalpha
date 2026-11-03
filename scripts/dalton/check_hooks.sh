@@ -300,6 +300,13 @@ ALLOWED_HOOKS=(
   # subagent runs and compaction calls always are
   # (middleware/tool/empty_call_retry.py, transcript/classify.py; 65c4641e case).
   "empty-turn-guard"
+  # LaneA fix (2026-11-02, thread ada64139): company-level workflows launch
+  # only in the target company's own workspace — a company with a workspace of
+  # its own is refused with that workspace's name (switch or delegate from
+  # Home, never a relative-path write), one without runs with a note in the
+  # launch reply. Logic in src/dalton/workflows/company_routing.py; the seam
+  # and the note ride _launch/_run_started_reply here.
+  "company-routing"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

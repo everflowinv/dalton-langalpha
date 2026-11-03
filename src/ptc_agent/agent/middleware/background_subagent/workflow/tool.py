@@ -199,6 +199,7 @@ def _run_started_reply(
     base_rel: str,
     tool_call_id: str,
     resumed_from: str | None = None,
+    note: str | None = None,
 ) -> str | ToolMessage:
     """The launch reply, plus the artifact binding the card to the run."""
     # DALTON-HOOK(workflow-resume): the reply names the resumed run so the
@@ -209,13 +210,16 @@ def _run_started_reply(
         if resumed_from
         else ""
     )
+    # DALTON-HOOK(company-routing): an advisory note (target company has no
+    # workspace of its own yet) rides the launch reply.
+    routing_note = f"\n\n{note}" if note else ""
     result_text = (
         f"Workflow run started: **{run_task.display_id}**\n"
         f"- Workflow: {workflow_name}\n"
         "- Status: Running in background\n"
         f"- Run files: {base_rel}/{resume_note}\n\n"
         "You will be notified when it finishes. "
-        f"Per-child records are in {base_rel}/children/."
+        f"Per-child records are in {base_rel}/children/.{routing_note}"
     )
     return _reply_with_artifact(
         run_task,
@@ -565,6 +569,34 @@ def create_run_workflow_tool(
                 )
             except SubjectKindRefused as error:
                 raise _Refused(str(error)) from error
+        # DALTON-HOOK(company-routing): a company-level workflow (the four
+        # whose contracts require ``ticker``) launches only in its company's
+        # own workspace. A target company that owns another workspace is
+        # refused with that workspace's name (switch workspaces, or delegate
+        # from Home — never a relative-path write); one with no workspace of
+        # its own runs here with a note riding the launch reply. Logic and
+        # wording live in src/dalton/workflows/company_routing.py (production
+        # thread ada64139: cross-workspace writes left tracking forbidden and
+        # check_done unable to find the files).
+        company_routing_note: str | None = None
+        if isinstance(params, dict):
+            from src.dalton.workflows.company_routing import (
+                CompanyRoutingRefused,
+                resolve_launch_company_routing,
+            )
+
+            try:
+                company_routing_note = await resolve_launch_company_routing(
+                    meta.name,
+                    params,
+                    dict((get_config() or {}).get("configurable") or {}),
+                    # DALTON-HOOK(company-routing): the current workspace's
+                    # absolute sandbox root anchors the workspace_dir escape
+                    # check the same way check_done's path checks anchor it.
+                    workspace_root=getattr(backend, "workspace_dir", None),
+                )
+            except CompanyRoutingRefused as error:
+                raise _Refused(str(error)) from error
         # DALTON-HOOK(workflow-resume): refresh progress_path after params normalization.
         if isinstance(params, dict) and isinstance(params.get("progress_path"), str):
             progress_path = params["progress_path"] or None
@@ -721,6 +753,9 @@ def create_run_workflow_tool(
             tool_call_id=tool_call_id,
             # DALTON-HOOK(workflow-resume): name the resumed run in the reply.
             resumed_from=resume,
+            # DALTON-HOOK(company-routing): the advisory note from the routing
+            # check, when the target company has no workspace of its own.
+            note=company_routing_note,
         )
 
     # DALTON-HOOK(workflow-resume): the ``resume`` parameter continues an
