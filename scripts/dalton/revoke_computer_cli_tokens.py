@@ -5,8 +5,10 @@ Run when ``dalton.computer_cli_tokens.enabled`` flips from on to off: deletes
 every ``computer_cli_tokens`` row in one transaction, which is the same
 revocation a computer's stop or delete performs per computer (upstream
 ``cli_tokens.revoke`` → ``delete_token``). Both the current and the previous
-token of each computer die with the row; the Redis admission mirror lapses on
-its own within the hour. Every row goes, live or lapsed — a lapsed row's
+token of each computer die with the row. The Redis admission mirror is left
+to lapse on its own (``MIRROR_TTL``, 5 minutes), so run this after the switch
+is already off — ``get_principal`` then refuses every CLI token before the
+mirror is read — and keep it off for at least 5 minutes afterwards. Every row goes, live or lapsed — a lapsed row's
 computer would only ever get a fresh token with the switch back on, and an
 empty table is what "all tokens revoked" reads as afterwards.
 
