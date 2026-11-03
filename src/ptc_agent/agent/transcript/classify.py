@@ -55,8 +55,11 @@ LEGACY_SUMMARY_PREFIX = (
 # durable rows it renders.
 _RUNTIME_CONTEXT_SOURCES = frozenset({"runtime_context", "runtime_update"})
 
+# DALTON-HOOK(empty-turn-guard): the same stamp now also marks the hint sent
+# after a final reply with no visible text on a user's turn.
 #: Written by middleware/tool/empty_call_retry.py: the remediation hint a
-#: retry sends after an answer that meant to call a tool and carried none.
+#: retry sends after an answer that meant to call a tool and carried none, or
+#: a final reply that said nothing at all.
 EMPTY_CALL_RETRY_SOURCE = "empty_call_retry"
 
 # Written by middleware/background_subagent/orchestrator.py: the trigger that

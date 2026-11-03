@@ -293,6 +293,13 @@ ALLOWED_HOOKS=(
   # pipeline rechecks its verdict before each POST so an already-delivered
   # result opens no turn (task_actions.py, report_back/subagent.py).
   "subagent-resume"
+  # LaneC: a turn a user sent never ends silently — EmptyToolCallRetryMiddleware
+  # also retries a final reply with no visible text (thinking-only/blank) and,
+  # after retries stay empty, replaces it with an explicit failure notice;
+  # notification/wake turns are exempt unless a user steer reached them, and
+  # subagent runs and compaction calls always are
+  # (middleware/tool/empty_call_retry.py, transcript/classify.py; 65c4641e case).
+  "empty-turn-guard"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
