@@ -12,7 +12,7 @@ Depth is one word, chosen before the research starts, stated in the message that
 | `working analysis` | the standard research deliverable, complete on its own | the seven questions in `.agents/skills/research-conventions/references/judgment.md` answered somewhere, a sourced figure set, one comparison table (peers, segments or scenarios), a downside built through a named line item, and two to five falsifiable claims each with its monitoring item | 2,500 to 5,000 words, 8 to 12 pages, or 12 to 20 slides, plus a workbook when the numbers are meant to move |
 | `diligence package` | underwrite a position or a transaction | everything in `working analysis`, plus a segment-level build in a live-formula workbook, the primary documents read rather than summarised (the filings and the transcript), capital structure and governance, a conflict register for every contested figure, and an appendix carrying the pulls behind the tables | 25 to 50 pages plus the workbook |
 
-A skill that states its own band governs: `morning-note` is one page, `earnings-analysis` is 8 to 12 pages, `initiating-coverage` is 30 to 50. Take the band here when the calling skill is silent.
+A skill that states its own band governs (a daily note is one page, an earnings review 8 to 12 pages, an initiation 30 to 50). Take the band here when the calling skill is silent. <!-- DALTON-HOOK(skills-registry): the named upstream skills are switched off in Dalton builds -->
 
 ## Depth is not readiness
 

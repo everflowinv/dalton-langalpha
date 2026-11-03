@@ -48,6 +48,24 @@ def _is_transcription_switch_on() -> bool:
         in _TRANSCRIPTION_SWITCH_VALUES
     )
 
+# Upstream task skills a Dalton skill already does inside the Dalton loop
+# (knowledge layer, five-word verdict, language review, completion contract).
+# Left in the registry, the model can route a covered company's task to the
+# upstream one and the loop breaks: no verdict, no thesis update, output in
+# DOCX. Building blocks Dalton workflows call by path (research-conventions,
+# check-model, model-update, 3-statements, dcf-model, comps-analysis) stay.
+SUPERSEDED_UPSTREAM_SKILLS: frozenset[str] = frozenset({
+    "thesis-tracker",        # dalton-thesis-delta + dalton-knowledge + dalton-agenda
+    "earnings-analysis",     # dalton-earnings-flash + dalton-earnings-deep
+    "earnings-preview",      # dalton-earnings-preview
+    "morning-note",          # dalton-thesis-delta + dalton-stock-move + weekly push
+    "catalyst-calendar",     # dalton-earnings-calendar + agenda watch events
+    "initiating-coverage",   # dalton-initial-coverage + dalton-full-coverage
+    "company-profile",       # dalton-company-background
+    "trade-pitch",           # dalton-call + dalton-bullbear
+    "sector-overview",       # dalton-init-sector + dalton-topic-research
+})
+
 # (skill_name, command, requires)
 _DALTON_SKILL_SPECS: tuple[tuple[str, str | None, tuple[str, ...]], ...] = (
     ("dalton-conventions", None, ("research-conventions",)),
