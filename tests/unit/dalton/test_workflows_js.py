@@ -14,6 +14,7 @@ import inspect
 import json
 import re
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,59 @@ from ptc_agent.agent.middleware.background_subagent.workflow.engine import (
 pytestmark = pytest.mark.xdist_group("serial")
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
+
+# The full-coverage memo probe validates a draft's structure in process; the
+# validator lives with the skill's scripts.
+_FC_SCRIPTS = REPO_ROOT / "plugins" / "dalton" / "skills" / "dalton-full-coverage" / "scripts"
+if str(_FC_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_FC_SCRIPTS))
+
+# A structure-complete full-coverage memo (passes validate_memo with 0 FAIL):
+# the probe's "complete" fixture for the resume tests.
+FC_COMPLETE_MEMO = """# 虚拟公司（TEST）投资备忘录
+
+## 摘要
+
+锚点：TEST。2Q26 收入同比增长 18%，OPM 13.2% [引用1]。
+
+## 公司与商业模式
+
+公司靠订阅赚钱，margin 来自切换成本。2Q26 续费率 95% [引用1]。
+
+### 行业与竞争
+
+行业分散，前三家合计份额 30% [引用2]。
+
+## 核心投资逻辑与争议
+
+市场认为增长见顶 [引用2]；我们不同，因为新客户结构变了 [引用1]。
+
+## 财务预测与估值
+
+Base 目标价 120 美元 [引用3]。
+
+## 风险
+
+大客户流失：单一客户占收入 20%，丢单直接砍利润 [引用1]。
+
+## 管理层
+
+CEO 创始人，指引历来保守 [引用1]。
+
+## 跟踪
+
+季度净增客户数跌破 X 即证伪 [假设]。
+
+## 附录
+
+计算明细放这里，正文只写结论。
+
+## 引用
+
+[引用1]: f:rev_q8 （数字底表｜最近一季收入｜2Q26｜research/2026-10-23-fc/facts.md）
+[引用2]: evidence:E-20261023-01 （法定财报｜虚拟公司｜FY2025 10-K｜2026-02-01｜accession 000000000-26-000001）
+[引用3]: model:model/META-model-v01.xlsx!Scenarios!C12 （本方模型｜Base 目标价｜2026-10-23｜model/META-model-v01.xlsx）
+"""
 
 OUT = {"files": ["research/2026-10-23-ic/industry.md"], "summary": "done", "sha256": "a" * 64}
 
@@ -82,6 +136,23 @@ class ScriptedHost:
                 "questions": ["Q1"],
                 "summary": "plan",
             }
+        if label == "建模":
+            # The full-coverage model child must attest its own checks
+            # (recalc / audit --strict / Checks) and declare the xlsx.
+            return {
+                "files": ["model/META-model-v01.xlsx"],
+                "summary": "built, checks all green",
+                "sha256": "a" * 64,
+                "checks_passed": True,
+            }
+        if label.startswith("模型审计"):
+            m = re.search(r"f='([^']+)'", prompt)
+            assert m, "the model-audit probe prompt must quote the model path"
+            return {"files": [f"{m.group(1)}|audit_ok"]}
+        if label == "memo 探测":
+            m = re.search(r"f='([^']+)'", prompt)
+            assert m, "the memo probe prompt must quote the draft path"
+            return {"files": [f"{m.group(1)}|absent"]}
         if label == "产物核验":
             return self.evidence_default(prompt)
         if label == "支线核验":
@@ -451,6 +522,21 @@ class CapturingHost:
         label = str(opts.get("label") or "")
         if label.startswith("解析"):
             return {"path": "model/META-model-v01.xlsx", "sha256": "a" * 64}
+        if label == "建模":
+            return {
+                "files": ["model/META-model-v01.xlsx"],
+                "summary": "built, checks all green",
+                "sha256": "a" * 64,
+                "checks_passed": True,
+            }
+        if label.startswith("模型审计"):
+            m = re.search(r"f='([^']+)'", prompt)
+            assert m, "the model-audit probe prompt must quote the model path"
+            return {"files": [f"{m.group(1)}|audit_ok"]}
+        if label == "memo 探测":
+            m = re.search(r"f='([^']+)'", prompt)
+            assert m, "the memo probe prompt must quote the draft path"
+            return {"files": [f"{m.group(1)}|absent"]}
         if label == "规划":
             return {
                 "file": "research/2026-10-23-topic-ai-capex/plan.md",
@@ -753,6 +839,26 @@ class DiskHost(ScriptedHost):
             return None
         if label.startswith("解析"):
             return self.resolve(prompt)
+        if label == "memo 探测":
+            # Disk-backed, with the real probe's semantics (round 3 #2): a draft
+            # counts as complete only when it clears validate_memo's structure
+            # check; anything else on disk is a partial handed to the writer.
+            m = re.search(r"f='([^']+)'", prompt)
+            assert m, "the memo probe prompt must quote the draft path"
+            rel = m.group(1)[2:] if m.group(1).startswith("./") else m.group(1)
+            path = self.workspace / rel
+            if not path.exists():
+                return {"files": [f"{m.group(1)}|absent"]}
+            content = path.read_text(encoding="utf-8")
+            if len(content.encode("utf-8")) < 500:
+                return {"files": [f"{m.group(1)}|incomplete"]}
+            from validate_memo import validate_memo_text
+
+            fails, _, _ = validate_memo_text(content)
+            if fails:
+                return {"files": [f"{m.group(1)}|incomplete"]}
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            return {"files": [f"{m.group(1)}|ok|{digest}"]}
         mode = self.revise_modes.get(label)
         if mode is None:
             return super().outcome_for(label, prompt)
@@ -798,26 +904,49 @@ def _fc_host(tmp_path: Path, **kw: Any) -> DiskHost:
 
 
 @pytest.mark.asyncio
-async def test_full_two_model_revisions_end_on_v03(tmp_path: Path) -> None:
-    """Round 1 saves v02, round 2 saves v03 (never v02 twice); the return
-    value, the evidence list and the contract audit all pick v03."""
+async def test_full_model_revision_saves_v02_and_ends_there(tmp_path: Path) -> None:
+    """One revision round only (batch 2): round 1 saves v02, the re-review
+    passes, the final language round edits the draft and the final re-review
+    re-binds the hash — the run ends on v02 in the return value, the evidence
+    list and the contract audit; no v03 round is dispatched."""
     host = _fc_host(
         tmp_path,
-        by_label={"独立审稿": REVISE, "复审 1": REVISE, "复审 2": PASS, "终稿审稿": PASS},
-        revise_modes={"修订 1": "save", "修订 2": "save"},
+        by_label={
+            "独立审稿": REVISE,
+            "复审 1": PASS,
+            "语言审查 2": {**OUT, "sha256": "c" * 64},
+            "终稿审稿": PASS,
+        },
+        revise_modes={"修订 1": "save"},
     )
     result = await _run("full-coverage", FC_PARAMS, host)
 
     labels = host.labels()
-    assert "另存为 ./model/META-model-v02.xlsx" in host.prompts[labels.index("修订 1")]
-    assert "另存为 model/META-model-v03.xlsx" in host.prompts[labels.index("修订 2")]
-    assert "model/META-model-v03.xlsx" in host.prompts[labels.index("复审 2")]
-    final = "model/META-model-v03.xlsx"
+    assert "另存为 model/META-model-v02.xlsx" in host.prompts[labels.index("修订 1")]
+    assert "model/META-model-v02.xlsx" in host.prompts[labels.index("复审 1")]
+    assert "修订 2" not in labels and "复审 2" not in labels, "one revision round only"
+    assert labels.index("终稿审稿") > labels.index("语言审查 2"), "final review follows round 2"
+    final = "model/META-model-v02.xlsx"
     assert result["model"] == final
     assert _contract_audit_pick("full-coverage", tmp_path) == final
     assert _evidence_models(host) == [final]
     assert result["ok"] is True, result["incomplete"]
-    assert result["revise_rounds"] == 2
+    assert result["revise_rounds"] == 1
+    assert result["language_done"] is True
+
+
+@pytest.mark.asyncio
+async def test_full_rereview_still_revise_has_no_second_round(tmp_path: Path) -> None:
+    """The re-review after the single revision round still says revise: the
+    run ends incomplete with 审稿未最终通过 — no second revision dispatch."""
+    host = _fc_host(tmp_path, by_label={"独立审稿": REVISE, "复审 1": REVISE},
+                    revise_modes={"修订 1": "keep"})
+    result = await _run("full-coverage", FC_PARAMS, host)
+
+    assert result["ok"] is False
+    assert result["revise_rounds"] == 1
+    assert "修订 2" not in host.labels()
+    assert result["tracking"]["reason"] == "审稿未最终通过"
 
 
 @pytest.mark.asyncio
@@ -851,19 +980,26 @@ async def test_full_reported_v02_but_disk_v03_stops_before_rereview(tmp_path: Pa
 @pytest.mark.asyncio
 async def test_full_memo_only_revision_keeps_the_existing_model(tmp_path: Path) -> None:
     """A model exists and the revision only touched the memo: it reports the
-    unchanged v01, which is accepted and carried to the end."""
+    unchanged v01, which is accepted and carried to the end. Round 2 of the
+    language review finds nothing to change (same hash), so no final
+    re-review runs."""
+    round1_sha = hashlib.sha256("修订 1".encode()).hexdigest()
     host = _fc_host(
         tmp_path,
-        by_label={"独立审稿": REVISE, "复审 1": PASS, "终稿审稿": PASS},
+        by_label={"独立审稿": REVISE, "复审 1": PASS, "语言审查 2": {**OUT, "sha256": round1_sha}},
         revise_modes={"修订 1": "keep"},
     )
     result = await _run("full-coverage", FC_PARAMS, host)
 
+    labels = host.labels()
+    assert "语言审查 2" in labels, "the memo keeps its two language rounds"
+    assert "终稿审稿" not in labels, "an unchanged draft needs no final re-review"
     final = "model/META-model-v01.xlsx"
     assert result["ok"] is True, result["incomplete"]
     assert result["model"] == final == _contract_audit_pick("full-coverage", tmp_path)
     assert _evidence_models(host) == [final]
-    assert final in host.prompts[host.labels().index("复审 1")]
+    assert final in host.prompts[labels.index("复审 1")]
+    assert result["language_done"] is True
 
 
 @pytest.mark.asyncio
@@ -1066,8 +1202,8 @@ async def test_initial_missing_deliverable_skips_tracking_even_when_review_passe
 async def test_full_review_never_passes_skips_tracking(tmp_path: Path) -> None:
     host = _fc_host(
         tmp_path,
-        by_label={"独立审稿": REVISE, "复审 1": REVISE, "复审 2": REVISE},
-        revise_modes={"修订 1": "keep", "修订 2": "keep"},
+        by_label={"独立审稿": REVISE, "复审 1": REVISE},
+        revise_modes={"修订 1": "keep"},
     )
     result = await _run("full-coverage", FC_PARAMS, host)
 
@@ -1409,6 +1545,247 @@ async def test_full_frame_failure_blocks_before_evidence() -> None:
     assert "resume_hint" in result
     labels = host.labels()
     assert not any(label.startswith("支线 ") for label in labels), "no evidence branch may run"
+
+
+class _ModelProbeHost(ScriptedHost):
+    """Answers every branch probe ok except a model/… path, which is missing."""
+
+    def outcome_for(self, label: str, prompt: str) -> Any:
+        if label == "支线核验":
+            paths = [
+                line[2:].split("（")[0].strip()
+                for line in prompt.splitlines()
+                if line.startswith("- ") and "|" not in line
+            ]
+            return {
+                "files": [
+                    f"{p}|{'missing' if p.startswith('model/') else 'ok'}" for p in paths
+                ]
+            }
+        return super().outcome_for(label, prompt)
+
+
+@pytest.mark.asyncio
+async def test_full_model_failure_blocks_before_the_draft() -> None:
+    """建模串行在前、失败即停（第 2 批）：建模子任务 null、自检未回报通过、
+    只声明脚本没有 xlsx、或声明的模型在盘缺失，四种情形都停在成稿之前——
+    不派写作、审稿与产物核验。"""
+    params = _WORKFLOW_PARAMS["full-coverage"]
+
+    host = ScriptedHost(fail_labels={"建模"})
+    result = await _run("full-coverage", params, host)
+    assert result["ok"] is False
+    assert "建模失败" in result["blocked"] and "未产出" in result["blocked"]
+    assert "resume_hint" in result and "resume=" in result["resume_hint"]
+    labels = host.labels()
+    assert "成稿" not in labels, "a failed model build must not dispatch the writer"
+    assert "独立审稿" not in labels and "产物核验" not in labels
+
+    # xlsx 在盘、自检也通过，但 recalc / audit --strict 失败：checks_passed=false 拦下。
+    host = ScriptedHost(
+        by_label={
+            "建模": {
+                "files": ["model/META-model-v01.xlsx"],
+                "summary": "audit --strict failed: 3 broken links on DCF",
+                "sha256": "a" * 64,
+                "checks_passed": False,
+            },
+        },
+    )
+    result = await _run("full-coverage", params, host)
+    assert result["ok"] is False
+    assert "建模自检未通过" in result["blocked"] and "audit --strict failed" in result["blocked"]
+    assert "成稿" not in host.labels()
+
+    # 只回报了建模脚本、没有模型文件：不算建模产物。
+    host = ScriptedHost(
+        by_label={
+            "建模": {
+                "files": ["research/2026-10-23-fc/build_model.py"],
+                "summary": "script written",
+                "sha256": "a" * 64,
+                "checks_passed": True,
+            },
+        },
+    )
+    result = await _run("full-coverage", params, host)
+    assert result["ok"] is False
+    assert "建模失败" in result["blocked"] and "未声明本次的模型文件" in result["blocked"]
+    assert "成稿" not in host.labels()
+
+    # 回报了别的目录 / 别的公司的 xlsx（第 3 轮 #3）：规范化路径必须正好等于
+    # model/<本次 ticker>-model-vNN.xlsx，archive/AAPL-… 不算本次的建模产物。
+    for wrong in ("archive/AAPL-model-v01.xlsx", "research/2026-10-23-fc/META-model-v01.xlsx"):
+        host = ScriptedHost(
+            by_label={
+                "建模": {
+                    "files": [wrong],
+                    "summary": "built",
+                    "sha256": "a" * 64,
+                    "checks_passed": True,
+                },
+            },
+        )
+        result = await _run("full-coverage", params, host)
+        assert result["ok"] is False, wrong
+        assert "未声明本次的模型文件 model/META-model-vNN.xlsx" in result["blocked"], wrong
+        assert "成稿" not in host.labels()
+
+    # 只读探针对模型实跑 audit --strict 失败（第 3 轮 #4）：不能只信自报的 checks_passed。
+    host = ScriptedHost(
+        by_label={
+            "建模": {
+                "files": ["model/META-model-v01.xlsx"],
+                "summary": "built, checks all green",
+                "sha256": "a" * 64,
+                "checks_passed": True,
+            },
+            "模型审计": {"files": ["model/META-model-v01.xlsx|audit_failed"]},
+        },
+    )
+    result = await _run("full-coverage", params, host)
+    assert result["ok"] is False
+    assert "audit --strict" in result["blocked"] and "实跑" in result["blocked"]
+    assert "成稿" not in host.labels()
+
+    # 审计探针子任务本身失败：fail-closed，同样停在成稿之前。
+    host = ScriptedHost(
+        by_label={
+            "建模": {
+                "files": ["model/META-model-v01.xlsx"],
+                "summary": "built, checks all green",
+                "sha256": "a" * 64,
+                "checks_passed": True,
+            },
+        },
+        fail_labels={"模型审计"},
+    )
+    result = await _run("full-coverage", params, host)
+    assert result["ok"] is False
+    assert "模型审计探针失败" in result["blocked"]
+    assert "成稿" not in host.labels()
+
+    # 自检通过、也声明了 xlsx，但探针在盘上找不到（不足契约的 1000 字节下限）。
+    host = _ModelProbeHost(
+        by_label={
+            "建模": {
+                "files": ["model/META-model-v01.xlsx"],
+                "summary": "built",
+                "sha256": "a" * 64,
+                "checks_passed": True,
+            },
+        },
+    )
+    result = await _run("full-coverage", params, host)
+    assert result["ok"] is False
+    assert "建模失败" in result["blocked"] and "1000" in result["blocked"]
+    assert "成稿" not in host.labels()
+
+
+@pytest.mark.asyncio
+async def test_full_resume_with_existing_draft_never_rewrites_it(tmp_path: Path) -> None:
+    """Resume guard (round 2 #4): with a structure-complete drafts/<D>-memo.md
+    already on disk — edited by the language round, the revision or a human,
+    so the journal's draft hash no longer replays — the writer is never
+    re-dispatched; the run carries the on-disk draft into review."""
+    host = _fc_host(tmp_path, by_label={"独立审稿": PASS})
+    draft = tmp_path / "drafts" / "2026-10-23-memo.md"
+    draft.parent.mkdir(parents=True, exist_ok=True)
+    draft.write_text(FC_COMPLETE_MEMO, encoding="utf-8")
+    result = await _run("full-coverage", FC_PARAMS, host)
+
+    labels = host.labels()
+    assert "memo 探测" in labels
+    assert "成稿" not in labels, "an existing complete draft must never be rewritten"
+    assert "语言审查 1" in labels and "独立审稿" in labels
+    assert result["ok"] is True, result["incomplete"]
+
+
+@pytest.mark.asyncio
+async def test_full_partial_draft_is_completed_not_rewritten(tmp_path: Path) -> None:
+    """Round 3 #2: an empty or half-written memo on disk (a crashed writer's
+    leftover) is NOT treated as the finished draft — the writer is dispatched
+    to complete it on top of the existing content, never from scratch."""
+    for name, content in (
+        ("空文件", ""),
+        ("半成品", "# 虚拟公司（TEST）投资备忘录\n\n## 摘要\n\n写了一半。\n"),
+    ):
+        host = _fc_host(tmp_path, by_label={"独立审稿": PASS})
+        draft = tmp_path / "drafts" / "2026-10-23-memo.md"
+        draft.parent.mkdir(parents=True, exist_ok=True)
+        draft.write_text(content, encoding="utf-8")
+        result = await _run("full-coverage", FC_PARAMS, host)
+
+        labels = host.labels()
+        assert "成稿" in labels, f"{name}: the writer must be dispatched for a partial draft"
+        writer_prompt = host.prompts[labels.index("成稿")]
+        assert "保留其中可用的部分" in writer_prompt and "不要推倒重写" in writer_prompt, name
+        assert result["ok"] is True, (name, result["incomplete"])
+
+
+@pytest.mark.asyncio
+async def test_full_resume_reviews_and_revises_the_latest_model_version(tmp_path: Path) -> None:
+    """Round 3 #1: with v02 already on disk (a previous run's revision), the
+    first review sees v02 and a revision names v03 as the next version —
+    never reviewing v01 or colliding with the existing v02."""
+    round1_sha = hashlib.sha256("修订 1".encode()).hexdigest()
+    host = _fc_host(
+        tmp_path,
+        by_label={
+            "独立审稿": REVISE,
+            "复审 1": PASS,
+            "语言审查 2": {**OUT, "sha256": round1_sha},
+        },
+        revise_modes={"修订 1": "keep"},
+    )
+    host.touch("model/META-model-v02.xlsx")
+    result = await _run("full-coverage", FC_PARAMS, host)
+
+    labels = host.labels()
+    review_prompt = host.prompts[labels.index("独立审稿")]
+    assert "model/META-model-v02.xlsx" in review_prompt, "the first review must see the latest version"
+    assert "model/META-model-v01.xlsx" not in review_prompt
+    revise_prompt = host.prompts[labels.index("修订 1")]
+    assert "另存为 model/META-model-v03.xlsx" in revise_prompt, "the next version rides the latest"
+    assert "另存为 model/META-model-v02.xlsx" not in revise_prompt
+    assert "model/META-model-v02.xlsx" in host.prompts[labels.index("check-model")]
+    assert result["ok"] is True, result["incomplete"]
+    assert result["model"] == "model/META-model-v02.xlsx"
+
+
+@pytest.mark.asyncio
+async def test_full_latest_model_failing_audit_blocks_before_the_draft(tmp_path: Path) -> None:
+    """The model the gate audits must be the model the run then uses: with a
+    passing v01 built and a failing v02 already on disk, the run stops before
+    the draft instead of writing from an unaudited v02."""
+    host = _fc_host(
+        tmp_path,
+        by_label={
+            "模型审计（最新版本）": {"files": ["model/META-model-v02.xlsx|audit_failed"]},
+        },
+    )
+    host.touch("model/META-model-v02.xlsx")
+    result = await _run("full-coverage", FC_PARAMS, host)
+
+    assert result["ok"] is False
+    assert "model/META-model-v02.xlsx" in result["blocked"]
+    assert "成稿" not in host.labels()
+
+
+@pytest.mark.asyncio
+async def test_full_resume_with_saved_v02_accepts_latest_model(tmp_path: Path) -> None:
+    """Resume after an earlier run's revision saved v02 (round 2 #4): this
+    run does not revise (the review passes on the first try), and the final
+    resolver adopts the disk maximum version instead of aborting on a
+    mismatch with the built v01."""
+    host = _fc_host(tmp_path, by_label={"独立审稿": PASS})
+    host.touch("model/META-model-v02.xlsx")
+    result = await _run("full-coverage", FC_PARAMS, host)
+
+    assert result["ok"] is True, result["incomplete"]
+    assert result["model"] == "model/META-model-v02.xlsx"
+    assert not any("不一致" in item for item in result["incomplete"]), result["incomplete"]
+    assert result["model"] == _contract_audit_pick("full-coverage", tmp_path)
 
 
 TOPIC_PARAMS: dict[str, Any] = {

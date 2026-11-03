@@ -1,7 +1,7 @@
 export const meta = {
   name: 'full-coverage',
   description:
-    'Dalton 完整覆盖：一手材料与数字底表 → frame → A∥B∥C∥D 取证 → 建模∥memo → check-model∥独立审稿 → 修订 → 知识层修订草案',
+    'Dalton 完整覆盖：一手材料与数字底表 → frame → A∥B∥C∥D 取证 → 建模（串行，失败即停）→ 单一写手成稿 → 语言审查（两轮，第 2 轮在终稿上）→ check-model∥独立审稿 → 一轮修订 → 知识层修订草案',
 }
 
 const { ticker: T, company: C, workspace_dir: W, as_of: D } = args
@@ -16,7 +16,7 @@ if (Array.isArray(args.focus_questions) && args.focus_questions.length)
   pmAsks.push(`重点问题：${args.focus_questions.join('；')}`)
 if (args.revision_brief) pmAsks.push(`本轮必须修正的事项见 ${args.revision_brief}（先读该文件）`)
 const pmSection = pmAsks.length ? ` PM 的问题 / 本轮必须修正的事项：${pmAsks.join('；')}。` : ''
-const base = `先读 .agents/skills/dalton-conventions/SKILL.md 与 ${S}/SKILL.md；公司 ${C || T}（${T}），市场 ${args.market || 'US'}，截至 ${D}；数字底表 ${R}/facts.md（只引用底表，缺了写“底表缺 X”）。${pmSection}`
+const base = `先读 .agents/skills/dalton-conventions/SKILL.md；公司 ${C || T}（${T}），市场 ${args.market || 'US'}，截至 ${D}；数字底表 ${R}/facts.md（目标公司财务与市场数字只取自底表）。${pmSection}`
 const OUT = {
   type: 'object',
   properties: {
@@ -273,79 +273,22 @@ if (evMissing.length) {
   }
 }
 
-phase('建模与 memo 第一段')
-const [model, memo1] = await parallel([
-  () =>
-    agent(
-      `${base} 按 ${S}/references/model-spec.md 建模型 ${W}/model/${T}-model-v01.xlsx（三表 + DCF + comps + Facts/Guidance vs Actual/Street vs House 三页），支线材料 ${R}/e*.md。recalc 与 audit --strict 必须通过，Checks 全 OK。返回 Scenarios 三情景的每股价值与关键驱动。`,
-      { agentType: 'general-purpose', label: '建模', phase: '建模与 memo 第一段', schema: OUT }
-    ),
-  () =>
-    agent(
-      `${base} 按 ${S}/references/memo-writing.md 写 memo 第一段（基本信息、核心判断、零、一、二）到 ${W}/drafts/${D}-memo.md，材料 ${R}/。缺失支线：${
-        evMissing.join(',') || '无'
-      }。跑 python ${S}/scripts/validate_memo.py --part 1 ${W}/drafts/${D}-memo.md 到 0 FAIL。`,
-      { agentType: 'general-purpose', label: 'memo 第一段', phase: '建模与 memo 第一段', schema: OUT }
-    ),
-])
-
-const memo2 =
-  memo1 === null
-    ? null
-    : await agent(
-        `${base} 续写 ${W}/drafts/${D}-memo.md 第二段（三至六），第六章情景与敏感度引用模型 ${W}/model/${T}-model-v01.xlsx${
-          model === null ? '（模型失败：第六章写缺口）' : ''
-        }。跑 python ${S}/scripts/validate_memo.py --part 2 ${W}/drafts/${D}-memo.md 到 0 FAIL。`,
-        { agentType: 'general-purpose', label: 'memo 第二段', phase: '建模与 memo 第一段', schema: OUT }
-      )
-
-const memo3 =
-  memo2 === null
-    ? null
-    : await agent(
-        `${base} 续写 ${W}/drafts/${D}-memo.md 第三段（七至十、附录、引用清单），先通读前两段保持文风与引用编号连贯；第七章用 C4 指引可信度表，第九章估值与模型一致。跑 python ${S}/scripts/validate_memo.py --mode full ${W}/drafts/${D}-memo.md 到 0 FAIL，并返回 ${W}/drafts/${D}-memo.md 的 sha256。`,
-        { agentType: 'general-purpose', label: 'memo 第三段', phase: '建模与 memo 第一段', schema: DRAFT_OUT }
-      )
-
-const memoSha = memo3 === null ? null : shaOf(memo3)
-const memoOk = memo3 !== null && memoSha !== null
-
-// 第 1 轮语言审查：memo 三段写完之后、第一次独立审稿之前（改稿会换哈希，必须先改再送审）。
-const memoPath = `${W}/drafts/${D}-memo.md`
-phase('语言审查')
-const lang1 =
-  !memoOk
-    ? null
-    : await agent(
-        `对 ${memoPath} 做第 1 轮语言审查：调用工具 check_language(draft_path="${memoPath}", round=1)（只标问题），读 ${memoPath}.language.md 清单，按清单逐条修改 ${memoPath}（只改语言表达，不动事实、数字、术语、引用编号与判断强度；工具报错就不改稿并在 summary 里原样汇报错误）。改完跑 python ${S}/scripts/validate_memo.py --mode full ${memoPath} 确认 0 FAIL，并返回 ${memoPath} 的 sha256。`,
-        { agentType: 'general-purpose', label: '语言审查 1', phase: '语言审查', schema: DRAFT_OUT }
-      )
-const lang1Sha = lang1 === null ? null : shaOf(lang1)
-const lang1Failed = memoOk && lang1Sha === null
-const reviewedMemoSha = lang1Sha || memoSha
-
-phase('审模型与审稿')
-const [mcheck, reviewRaw] = await parallel([
-  () =>
-    model === null
-      ? Promise.resolve(null)
-      : agent(
-          `按 .agents/skills/check-model/SKILL.md 审 ${W}/model/${T}-model-v01.xlsx，只出报告不改模型，报告写 ${R}/model-check.md。`,
-          { agentType: 'general-purpose', label: 'check-model', phase: '审模型与审稿', schema: OUT }
-        ),
-  () =>
-    memo3 === null
-      ? Promise.resolve(null)
-      : agent(
-          `审阅 ${memoPath}（被审草稿 sha256：${
-            reviewedMemoSha || '未知'
-          }；支线 ${R}/e*.md，底表 ${R}/facts.md，模型 ${W}/model/${T}-model-v01.xlsx，全部只读，不修改任何文件）。先只凭核心判断和零章复述投资论点，再逐题检查，重点 Q1–Q5、Q7、Q8、Q12。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；items 逐项覆盖 1–9 项检查）。`,
-          { agentType: 'dalton-reviewer', label: '独立审稿', phase: '审模型与审稿', schema: VERDICT, reviewDraft: memoPath }
-        ),
-])
-
-// 修订循环与收尾只认 resolveFinalModel()（确定性子任务：ls … | sort -V | tail -1）
-// 解析出的磁盘路径；每轮修订后、复审前都解析一次，并与修订回报的路径比对。
+// 建模串行在最前、失败即停：估值、三情景与 Street vs House 的数字全部来自模型，
+// 模型不在，后面的写作与审稿都是白跑（3 天运行记录审查发现的问题）。门禁四问：
+// 子任务自检（recalc / audit --strict / Checks）是否回报通过、是否声明了本次的
+// model/<TICKER>-model-vNN.xlsx（规范化后完整路径相等；别的目录或别的公司不算）、
+// 声明的产物是否在盘上、只读探针对它实跑 audit --strict 是否通过（不只信自报）。
+const MODEL_OUT = {
+  type: 'object',
+  properties: {
+    files: { type: 'array', items: { type: 'string', minLength: 1 } },
+    summary: { type: 'string', minLength: 1 },
+    sha256: { type: 'string', minLength: 64 },
+    checks_passed: { type: 'boolean' },
+  },
+  required: ['files', 'summary', 'checks_passed'],
+}
+// 模型路径与版本：解析与“另存为下一版”都以磁盘最新版本为准（第 3 轮 #1）。
 const modelFileIn = (files) => {
   const found = (Array.isArray(files) ? files : [])
     .map((f) => {
@@ -357,15 +300,191 @@ const modelFileIn = (files) => {
 }
 const nextVersion = (p) =>
   p.replace(/-model-v(\d+)\.xlsx$/, (_, v) => `-model-v${String(Number(v) + 1).padStart(v.length, '0')}.xlsx`)
-const resolveFinalModel = async (label) => {
+const resolveFinalModel = async (label, phaseName = '解析最终模型') => {
   const r = await agent(
     `在 workspace 里执行：ls model/${T}-model-v*.xlsx 2>/dev/null | sort -V | tail -1，对输出文件计算 sha256sum。只返回 JSON：path（ls 的原样输出）与 sha256（64 位十六进制）。不写任何文件。`,
-    { agentType: 'dalton-evidence', label, phase: '解析最终模型', schema: FINAL_MODEL }
+    { agentType: 'dalton-evidence', label, phase: phaseName, schema: FINAL_MODEL }
   )
   return r && typeof r.path === 'string' && r.path && shaOf(r) ? { path: normPath(r.path), sha256: r.sha256 } : null
 }
+phase('建模')
+// 只读探针对模型实跑 audit --strict（收尾契约同一条命令），探针结果为门禁依据，
+// 不只信子任务自报的 checks_passed（第 3 轮 #4）。门禁和之后实际使用的模型必须是同一个文件，
+// 所以解析出磁盘最新版本后，若与建模回报的不同，对最新版本再审一次。
+const strictAudit = async (audited, label) => {
+  const modelAudit = await agent(
+    `只读核验（不写任何文件）。执行 bash：f='${audited}'；python .agents/skills/xlsx/scripts/audit.py "$f" --strict >/dev/null 2>&1 && echo "$f|audit_ok" || echo "$f|audit_failed"。返回 files 数组，只含这一行原样输出。`,
+    { agentType: 'dalton-evidence', label, phase: '建模', schema: PROBE_OUT, checkFiles: false }
+  )
+  const auditEntry = modelAudit && Array.isArray(modelAudit.files)
+    ? modelAudit.files.find((e) => typeof e === 'string' && e.startsWith(`${audited}|`))
+    : undefined
+  if (modelAudit === null || auditEntry === undefined) {
+    return gateBlock(
+      '模型审计探针失败，无法确认模型通过 audit --strict',
+      '模型审计探针未回报结果；请重试或修复模型后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑'
+    )
+  }
+  if (!auditEntry.endsWith('|audit_ok')) {
+    return gateBlock(
+      `建模自检未通过（只读探针对 ${audited} 实跑 audit --strict 失败），已停在成稿之前`,
+      '建模自检未通过，已停在成稿之前；修复模型至 audit --strict 通过后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用'
+    )
+  }
+  return null
+}
+let auditedModel = ''
+const model = await agent(
+  `${base} 按 ${S}/references/model-spec.md 建模型 ${W}/model/${T}-model-v01.xlsx（三表 + DCF + comps + Facts/Guidance vs Actual/Street vs House 三页），支线材料 ${R}/e*.md。recalc 与 audit --strict 必须通过，Checks 全 OK。返回 Scenarios 三情景的每股价值与关键驱动；checks_passed 只有在 recalc、audit --strict、Checks 全部通过时才是 true，任一失败或未跑都必须是 false 并在 summary 里写明失败项。若目标文件已存在，先读并核对，缺什么补什么，不必推倒重写。`,
+  { agentType: 'general-purpose', label: '建模', phase: '建模', schema: MODEL_OUT }
+)
+{
+  if (model === null) {
+    return gateBlock(
+      '建模失败（建模子任务未产出结果），已停在成稿之前',
+      '建模失败，已停在成稿之前；补齐模型后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用'
+    )
+  }
+  if (model.checks_passed !== true) {
+    const why = model.summary ? `：${model.summary}` : ''
+    return gateBlock(
+      `建模自检未通过（recalc / audit --strict / Checks 任一失败或未回报${why}），已停在成稿之前`,
+      '建模自检未通过，已停在成稿之前；修复模型（recalc、audit --strict、Checks 全部通过）后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用'
+    )
+  }
+  // 声明产物里必须有规范化后正好等于 model/<TICKER>-model-vNN.xlsx 的文件：
+  // 别的目录（archive/…）、别的公司（AAPL-…）或脚本、报告都不算本次的建模产物（第 3 轮 #3）。
+  const tickerLit = String(T).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const modelPathRe = new RegExp(`^model/${tickerLit}-model-v\\d+\\.xlsx$`)
+  const modelDeclared = branchArtifacts(model).filter((p) => modelPathRe.test(normPath(p)))
+  if (modelDeclared.length === 0) {
+    return gateBlock(
+      `建模失败（未声明本次的模型文件 model/${T}-model-vNN.xlsx；其他目录、其他公司的 xlsx 与脚本、报告都不算建模产物），已停在成稿之前`,
+      '建模失败，已停在成稿之前；在 model/ 目录产出本次公司的模型文件后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用'
+    )
+  }
+  const modelProbe = await probeBranchFiles(
+    modelDeclared.map((p) => [p, 1000]),
+    '建模'
+  )
+  if (modelProbe === null) {
+    return gateBlock(
+      '支线核验子任务失败，无法确认模型在盘',
+      '支线核验子任务失败（无法确认模型文件存在且足 1000 字节），已停在成稿之前；请重试或补数后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑'
+    )
+  }
+  if (!modelProbe.every((e) => e.endsWith('|ok'))) {
+    return gateBlock(
+      `建模失败（声明的模型产物不存在、为空或不足 1000 字节：${modelDeclared.join('、')}）`,
+      '建模失败，已停在成稿之前；补齐模型后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑，label、prompt 哈希与产物哈希一致的已完派发会直接复用'
+    )
+  }
+  auditedModel = modelDeclared[0]
+  const auditBlock = await strictAudit(auditedModel, '模型审计')
+  if (auditBlock !== null) return auditBlock
+}
 
-let modelPath = `${W}/model/${T}-model-v01.xlsx`
+// 写作、审模型、审稿与“另存为下一版”一律基于磁盘最新模型版本（第 3 轮 #1）：resume 时
+// 盘上可能已有上一 run 修订另存的 v02+，仍按 v01 审稿、并指示另存为已存在的 v02 都是错的。
+const initialModel = await resolveFinalModel('解析模型（建模后）', '建模')
+if (initialModel === null) {
+  return gateBlock(
+    '解析最新模型版本的子任务失败，已停在成稿之前',
+    '解析最新模型版本的子任务未回报结果；请重试后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑'
+  )
+}
+let modelPath = initialModel.path
+if (modelPath !== auditedModel) {
+  const latestBlock = await strictAudit(modelPath, '模型审计（最新版本）')
+  if (latestBlock !== null) return latestBlock
+}
+if (modelPath !== normPath(`${W}/model/${T}-model-v01.xlsx`)) {
+  log(`磁盘最新模型版本为 ${modelPath}（可能来自上一 run 的修订另存），写作、审稿与修订都按该版本进行`)
+}
+
+// 一位写手一次成稿：三位写手分段接力会让各段复述上下文，是 DASH memo 重复的成因之一。
+// resume 保护：语言审查、审稿修订或人工补稿都会原位改 drafts/<D>-memo.md，journal 的
+// 产物哈希随之失配、“成稿”会重新派发——所以派发前先探测并校验（第 3 轮 #2）：
+// 通过结构校验的完整稿才当成稿沿用（不重写）；半成品/空文件派写手在已有内容基础上
+// 续写补全（保留已有内容，不推倒重写）；没有文件才从头写成。
+const memoPath = `${W}/drafts/${D}-memo.md`
+phase('成稿')
+const memoProbe = await agent(
+  `只读核验（不写任何文件）。执行 bash：f='${memoPath}'；if ! test -e "$f"; then echo "$f|absent"; elif [ "$(wc -c < "$f")" -ge 500 ] && python ${S}/scripts/validate_memo.py --mode full "$f" >/dev/null 2>&1; then echo "$f|ok|$(sha256sum "$f" | cut -d' ' -f1)"; else echo "$f|incomplete"; fi。返回 files 数组，只含这一行原样输出。`,
+  { agentType: 'dalton-evidence', label: 'memo 探测', phase: '成稿', schema: HASH, checkFiles: false }
+)
+const memoFiles = memoProbe && Array.isArray(memoProbe.files) ? memoProbe.files : null
+if (memoFiles === null) {
+  return gateBlock(
+    'memo 探测子任务失败，无法判断盘上是否已有备忘录',
+    'memo 探测子任务未回报结果；请重试或补数后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑'
+  )
+}
+const memoEntry = memoFiles.find((e) => typeof e === 'string' && e.startsWith(`${memoPath}|`))
+if (memoEntry === undefined) {
+  return gateBlock(
+    `memo 探测结果缺 ${memoPath} 的条目`,
+    'memo 探测子任务的输出不含该路径的“<路径>|ok|<哈希> / incomplete / absent”条目；请重试后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑'
+  )
+}
+const memoTail = memoEntry.slice(memoPath.length + 1)
+const memoCompleteSha = memoTail.startsWith('ok|') && /^[0-9a-f]{64}$/.test(memoTail.slice(3)) ? memoTail.slice(3) : null
+const memoPartial = memoTail === 'incomplete'
+if (memoCompleteSha === null && !memoPartial && memoTail !== 'absent') {
+  return gateBlock(
+    `memo 探测结果无法解析（${memoEntry}）`,
+    'memo 探测条目既不是 ok|<64 位哈希>也不是 incomplete / absent；请重试后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑'
+  )
+}
+const memo = memoCompleteSha
+  ? {
+      files: [memoPath],
+      summary: `盘上已有 ${memoPath} 且结构校验通过（含语言审查或审稿修订），沿用最新稿，不重写`,
+      sha256: memoCompleteSha,
+    }
+  : await agent(
+      `${base} 通读 ${R}/questions.md（12 问研究提纲）、${R}/e*.md（含文末逐题证据小结）、${R}/facts.md 与模型 ${modelPath} 的 Scenarios / Street vs House 输出，按 ${S}/references/memo-writing.md 一次写成完整备忘录 ${memoPath}${
+        memoPartial
+          ? `。盘上已有 ${memoPath} 的半成品（结构校验未通过）：先读已有内容，保留其中可用的部分，补齐缺失的章节与引用，修到结构完整；不要推倒重写已有内容`
+          : ''
+      }。写给基金经理看：每件事只写一遍、12 问不进正文、计算过程放附录；信息缺口写它对判断的影响，不罗列“未披露”。跑 python ${S}/scripts/validate_memo.py --mode full ${memoPath} --research-dir ${R} 到 0 FAIL，并返回 ${memoPath} 的 sha256。`,
+      { agentType: 'general-purpose', label: '成稿', phase: '成稿', schema: DRAFT_OUT }
+    )
+const memoSha = shaOf(memo)
+const memoOk = memo !== null && memoSha !== null
+
+// 第 1 轮语言审查：成稿之后、第一次独立审稿之前（改稿会换哈希，必须先改再送审）；
+// 第 2 轮在修订循环结束后的终稿上（见下方“语言审查 2”），两轮与 check_done 契约一致。
+phase('语言审查')
+const lang1 =
+  !memoOk
+    ? null
+    : await agent(
+        `对 ${memoPath} 做语言审查：调用工具 check_language(draft_path="${memoPath}", round=1)（只标问题），读 ${memoPath}.language.md 清单，按清单逐条修改 ${memoPath}（只改语言表达，不动事实、数字、术语、引用编号与判断强度；工具报错就不改稿并在 summary 里原样汇报错误）。改完跑 python ${S}/scripts/validate_memo.py --mode full ${memoPath} --research-dir ${R} 确认 0 FAIL，并返回 ${memoPath} 的 sha256。`,
+        { agentType: 'general-purpose', label: '语言审查 1', phase: '语言审查', schema: DRAFT_OUT }
+      )
+const lang1Sha = lang1 === null ? null : shaOf(lang1)
+const lang1Failed = memoOk && lang1Sha === null
+const reviewedMemoSha = lang1Sha || memoSha
+
+phase('审模型与审稿')
+const [mcheck, reviewRaw] = await parallel([
+  () =>
+    agent(
+      `按 .agents/skills/check-model/SKILL.md 审 ${modelPath}，只出报告不改模型，报告写 ${R}/model-check.md。`,
+      { agentType: 'general-purpose', label: 'check-model', phase: '审模型与审稿', schema: OUT }
+    ),
+  () =>
+    !memoOk
+      ? Promise.resolve(null)
+      : agent(
+          `审阅 ${memoPath}（被审草稿 sha256：${
+            reviewedMemoSha || '未知'
+          }；支线 ${R}/e*.md，底表 ${R}/facts.md，模型 ${modelPath}，全部只读，不修改任何文件）。先只凭摘要复述投资论点（立场、赔率、改判条件），再逐节检查，重点：摘要（含投委会四问）、核心投资逻辑与争议、财务预测与估值（赔率卡与三层保护）、风险。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；items 逐项覆盖 1–9 项检查）。`,
+          { agentType: 'dalton-reviewer', label: '独立审稿', phase: '审模型与审稿', schema: VERDICT, reviewDraft: memoPath }
+        ),
+])
+
 const incomplete = []
 // 审稿结果未覆盖 1–9 项检查时按审稿失败处理（与发布审稿同一契约，fail-closed）。
 let review = reviewRaw
@@ -377,9 +496,8 @@ let fix = null
 let finalReview = review
 let rounds = 0
 let currentMemoSha = reviewedMemoSha
-// 提前结束时解析一次磁盘上的模型，作为返回值里的 model；建模失败则没有模型。
+// 提前结束时解析一次磁盘上的模型，作为返回值里的 model（建模门禁保证 model 已在盘）。
 const resolveOnExit = async () => {
-  if (model === null) return null
   const r = await resolveFinalModel('解析模型（终止）')
   if (r === null) incomplete.push('解析最终模型的子任务失败')
   return r
@@ -399,25 +517,25 @@ if (review && verdictOf(review) === 'block') {
   incomplete.push(`审稿 block：${review.summary || '存在不可修订级问题'}`)
   return finish(await resolveOnExit(), {
     blocked: review.summary || '审稿 block',
+    // 人工处理后两条路：resume 继续跑后续阶段（盘上 memo 与模型不会被重写——
+    // 成稿前有 memo 探测、模型按磁盘最新版本识别），或按 SKILL 手动路径收尾。
     resume_hint:
-      '修订 memo/模型后用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑：label、prompt 哈希与产物哈希一致的已完派发（支线、底表等）会直接复用，成稿及之后的阶段重新派发',
+      '审稿 block：先人工处理（按 must_fix 修订 memo 与模型、补证据），再选择：① 需要重走审稿/修订/收尾的，用启动时的同一组参数 + resume=<.progress.json 里的 run_id> 重跑（支线、底表、建模等未变产物直接复用；盘上已有的 memo 与模型不会被重写，流程沿用最新稿）；② 只需人工收尾的，按 dalton-full-coverage SKILL 手动降级路径执行，并以 manual=true 调用 dalton_check_done',
   })
 }
 
 phase('修订')
-// revise → 修订 → 解析模型 → 复审，最多 2 轮；每个失败出口都写进 incomplete 并停下
+// revise → 修订 → 解析模型 → 复审，仅 1 轮（写作流程第 2 批：一轮修订）；
+// 复审仍是 revise 时按“审稿未最终通过”收场，不进第二轮；每个失败出口都写进 incomplete 并停下
 let resolved = null
-while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 2) {
+while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 1) {
   rounds += 1
   const target = nextVersion(modelPath)
-  const modelClause =
-    model === null
-      ? '建模失败，本轮只改 memo'
-      : `模型若有改动走 .agents/skills/model-update/SKILL.md，另存为 ${target}，不覆盖旧版本；模型没改就原样沿用 ${modelPath}。不管改没改，都必须在 files 里回报当前模型的路径（另存则报 ${target}，未改则报 ${modelPath}）`
+  const modelClause = `模型若有改动走 .agents/skills/model-update/SKILL.md，另存为 ${target}，不覆盖旧版本；模型没改就原样沿用 ${modelPath}。不管改没改，都必须在 files 里回报当前模型的路径（另存则报 ${target}，未改则报 ${modelPath}）`
   fix = await agent(
     `${base} 先核对 ${memoPath} 的 sha256 是否与审稿前（${
       currentMemoSha || '当前记录值'
-    }）一致；按审稿意见与 ${R}/model-check.md 做第 ${rounds} 轮修订（memo 与模型；${modelClause}）。P0 全改，跑 python ${S}/scripts/validate_memo.py --mode full ${memoPath} 到 0 FAIL。审稿意见：\n${JSON.stringify(
+    }）一致；按审稿意见与 ${R}/model-check.md 做第 ${rounds} 轮修订（memo 与模型；${modelClause}）。P0 全改，跑 python ${S}/scripts/validate_memo.py --mode full ${memoPath} --research-dir ${R} 到 0 FAIL。审稿意见：\n${JSON.stringify(
       finalReview
     )}`,
     { agentType: 'general-purpose', label: `修订 ${rounds}`, phase: '修订', schema: DRAFT_OUT }
@@ -427,7 +545,7 @@ while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 2) {
     incomplete.push(`第 ${rounds} 轮修订失败（修订结果或其 sha256 缺失/非法），未复审，流程终止`)
     return finish(await resolveOnExit())
   }
-  if (model !== null) {
+  {
     const reportedPath = modelFileIn(fix.files)
     if (!reportedPath) {
       incomplete.push(`第 ${rounds} 轮修订未回报模型路径（模型未改也须回报 ${modelPath}），未复审，流程终止`)
@@ -451,7 +569,7 @@ while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 2) {
   const reReview = await agent(
     `复审（第 ${rounds} 轮修订后）：审阅 ${memoPath}（被审草稿 sha256：${
       currentMemoSha
-    }；模型 ${model === null ? '建模失败，无模型' : modelPath}；${W}/model/*.xlsx 只读不改）。重点核对上一轮 must_fix 是否全部解决。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；items 逐项覆盖 1–9 项检查）。上一轮审稿意见：\n${JSON.stringify(
+    }；模型 ${modelPath}；${W}/model/*.xlsx 只读不改）。重点核对上一轮 must_fix 是否全部解决。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；items 逐项覆盖 1–9 项检查）。上一轮审稿意见：\n${JSON.stringify(
       finalReview
     )}`,
     { agentType: 'dalton-reviewer', label: `复审 ${rounds}`, phase: '修订', schema: VERDICT, reviewDraft: memoPath }
@@ -482,22 +600,22 @@ const notesReview =
   !memoOk || !reviewPassed
     ? null
     : await agent(
-        `对本次运行产出、给人读的 .md 笔记逐一做两轮语言审查（规则见 .agents/skills/dalton-language/SKILL.md，只标问题）。每个文件依次：1) 调用工具 check_language(draft_path="<文件>", round=1)，读 <文件>.language.md 清单并按清单修改（只改语言表达，不动事实、数字、术语、引用编号与判断强度；工具报错就不改稿并在 summary 里原样汇报错误）；2) 调用 check_language(draft_path="<文件>", round=2) 复核；若第 1 轮后改过稿，改完再调用一次 round=2 确认（记录追加在同一 json）。\n文件清单：\n- ${R}/facts.md\n- ${R}/questions.md\n- ${R}/ea.md\n- ${R}/eb.md\n- ${R}/ec.md\n- ${R}/ed.md\n- ${R}/model-check.md\n清单之外本次运行写的其他给人读的 .md 一并同法处理；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/ 下的文件、知识层渲染文件与 .audit/.annotated/.language 侧车不审。返回处理过的文件列表与摘要。`,
+        `对本次运行产出、给人读的 .md 笔记逐一做两轮语言审查（规则见 .agents/skills/dalton-language/SKILL.md，只标问题）。每个文件依次：1) 调用工具 check_language(draft_path="<文件>", round=1)，读 <文件>.language.md 清单并按清单修改（只改语言表达，不动事实、数字、术语、引用编号与判断强度；工具报错就不改稿并在 summary 里原样汇报错误）；2) 调用 check_language(draft_path="<文件>", round=2) 复核；若第 1 轮后改过稿，改完再调用一次 round=2 确认（记录追加在同一 json）。\n文件清单：\n- ${R}/facts.md\n- ${R}/questions.md\n- ${R}/ea.md\n- ${R}/eb.md\n- ${R}/ec.md\n- ${R}/ed.md\n- ${R}/model-check.md\n本次运行清单之外新写的其他给人读的 .md 一并同法处理；只审查以上文件，不审 json/xlsx 等机器文件与 .audit/.annotated/.language 侧车。返回处理过的文件列表与摘要。`,
         { agentType: 'general-purpose', label: '笔记语言审查', phase: '修订', schema: OUT }
       )
 if (memoOk && reviewPassed && notesReview === null) {
   incomplete.push('笔记语言审查失败（支线/底稿笔记未完成两轮语言审查）')
 }
 
-// 第 2 轮语言审查：终稿内容定稿（审稿修订循环结束）之后、提交最后一次审稿之前。
-// 改了稿就再跑一次 round=2 复核，使最后一条第 2 轮记录绑定终稿哈希；哈希有变
-// 则终稿审稿重新绑定独立审稿哈希——语言修改不能让已有 pass 记录失效却无人重审。
+// 第 2 轮语言审查：终稿内容定稿（审稿修订结束）之后。改了稿就再跑一次 round=2 复核，
+// 使最后一条第 2 轮记录绑定终稿哈希；哈希有变则终稿审稿重新绑定——语言修改不能让已有
+// pass 记录失效却无人重审。两轮语言审查与 check_done 的契约（rounds 1+2、末轮哈希=终稿）一致。
 const preLang2Sha = currentMemoSha
 const lang2 =
   !memoOk || !reviewPassed
     ? null
     : await agent(
-        `对 ${memoPath} 做第 2 轮语言审查：调用工具 check_language(draft_path="${memoPath}", round=2)，读 ${memoPath}.language.md 清单，按清单逐条完成终稿语言修改（只改语言表达，不动事实、数字、术语、引用编号与判断强度；工具报错就不改稿并在 summary 里原样汇报错误）。若草稿有改动，再调用一次 check_language(draft_path="${memoPath}", round=2) 对终稿复核（记录追加在同一 json），并跑 python ${S}/scripts/validate_memo.py --mode full ${memoPath} 确认 0 FAIL。返回 ${memoPath} 最终 sha256。`,
+        `对 ${memoPath} 做第 2 轮语言审查：调用工具 check_language(draft_path="${memoPath}", round=2)，读 ${memoPath}.language.md 清单，按清单逐条完成终稿语言修改（只改语言表达，不动事实、数字、术语、引用编号与判断强度；工具报错就不改稿并在 summary 里原样汇报错误）。若草稿有改动，再调用一次 check_language(draft_path="${memoPath}", round=2) 对终稿复核（记录追加在同一 json），并跑 python ${S}/scripts/validate_memo.py --mode full ${memoPath} --research-dir ${R} 确认 0 FAIL。返回 ${memoPath} 最终 sha256。`,
         { agentType: 'general-purpose', label: '语言审查 2', phase: '修订', schema: DRAFT_OUT }
       )
 const lang2Sha = lang2 === null ? null : shaOf(lang2)
@@ -507,7 +625,7 @@ if (memoOk && reviewPassed && lang2Sha === null) {
 } else if (memoOk && reviewPassed && lang2Sha !== preLang2Sha) {
   currentMemoSha = lang2Sha
   const finalCheck = await agent(
-    `终稿审稿（语言修改后）：审阅 ${memoPath}（被审草稿 sha256：${lang2Sha}；模型 ${model === null ? '建模失败，无模型' : modelPath}；${W}/model/*.xlsx 只读不改）。重点：语言修改未动事实与数字，上一轮 must_fix 仍全部解决，validate_memo 仍 0 FAIL。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；items 逐项覆盖 1–9 项检查）。`,
+    `终稿审稿（语言修改后）：审阅 ${memoPath}（被审草稿 sha256：${lang2Sha}；模型 ${modelPath}；${W}/model/*.xlsx 只读不改）。重点：语言修改未动事实与数字，上一轮 must_fix 仍全部解决，validate_memo 仍 0 FAIL。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；items 逐项覆盖 1–9 项检查）。`,
     { agentType: 'dalton-reviewer', label: '终稿审稿', phase: '修订', schema: VERDICT, reviewDraft: memoPath }
   )
   if (finalCheck === null) {
@@ -522,39 +640,38 @@ if (memoOk && reviewPassed && lang2Sha === null) {
   }
 }
 
-// 循环结束后再确认一次：磁盘最大版本必须就是循环里最后确认的 modelPath。
-// 之后的知识草案、核验清单、返回值都只用 finalModel.path。
+// 循环结束后再确认一次磁盘上的最终模型：本 run 内做过修订的（rounds > 0），磁盘最大
+// 版本必须就是修订确认的 modelPath（回报与盘不符 = 版本不确定）；本 run 未修订的
+// （rounds === 0，含 resume：上一 run 修订另存的 v02+ 就在盘上），按磁盘最新版本沿用。
 phase('解析最终模型')
-let finalModel = null
-if (model !== null) {
-  finalModel = await resolveFinalModel('解析最终模型')
-  if (finalModel === null) {
-    incomplete.push('解析最终模型的子任务失败，流程终止')
-    return finish(null)
-  }
-  if (finalModel.path !== normPath(modelPath)) {
-    incomplete.push(
-      `最终模型与修订确认的版本（${modelPath}）不一致：磁盘最大版本 ${finalModel.path}，最终模型不确定，流程终止`
-    )
-    return finish(finalModel)
-  }
-  modelPath = finalModel.path
+const finalModel = await resolveFinalModel('解析最终模型')
+if (finalModel === null) {
+  incomplete.push('解析最终模型的子任务失败，流程终止')
+  return finish(null)
 }
+if (rounds > 0 && finalModel.path !== normPath(modelPath)) {
+  incomplete.push(
+    `最终模型与修订确认的版本（${modelPath}）不一致：磁盘最大版本 ${finalModel.path}，最终模型不确定，流程终止`
+  )
+  return finish(finalModel)
+}
+if (rounds === 0 && finalModel.path !== normPath(modelPath)) {
+  log(`本 run 未修订模型，磁盘最新版本为 ${finalModel.path}（可能来自上一 run 的修订另存），按最新版本沿用`)
+}
+modelPath = finalModel.path
 
 const kp =
-  memo3 === null
+  !memoOk
     ? null
     : await agent(
-        `${base} 先核对 ${memoPath} 的 sha256 是否为修订后哈希（${currentMemoSha || '修订后记录值'}）；最终模型为 ${finalModel ? finalModel.path : '无（建模失败）'}；再对比 ${W} 根目录现有知识层，按 PK.2 的 JSON Schema 写知识层修订草案 ${R}/knowledge-revision.json（结构为 {doc: {ops, reason, evidence_refs}}）：每处改动给旧值、新值、原因、证据（引用编号）。管理层指引风格与 C4 历史写入 management 部分；不直接修改 ${W}/data/。`,
+        `${base} 先核对 ${memoPath} 的 sha256 是否为修订后哈希（${currentMemoSha || '修订后记录值'}）；最终模型为 ${finalModel.path}；再对比 ${W} 根目录现有知识层，按 PK.2 的 JSON Schema 写知识层修订草案 ${R}/knowledge-revision.json（结构为 {doc: {ops, reason, evidence_refs}}）：每处改动给旧值、新值、原因、证据（引用编号）。管理层指引风格与 C4 历史写入 management 部分；不直接修改 ${W}/data/。`,
         { agentType: 'general-purpose', label: '知识层修订草案', phase: '修订', schema: OUT }
       )
 
-if (frame === null) incomplete.push('问题清单 frame 失败')
-if (evMissing.length) incomplete.push(`支线失败：${evMissing.join('、')}`)
-if (model === null) incomplete.push('建模失败')
-if (memo1 === null || memo2 === null || !memoOk) incomplete.push('memo 三段写作失败（末段草稿或其 sha256 缺失/非法）')
+// facts / frame / 支线 / 建模的缺失已在前置门禁返回，这里只收写作与审稿阶段的失败。
+if (!memoOk) incomplete.push('memo 成稿失败（草稿或其 sha256 缺失/非法）')
 if (lang1Failed) incomplete.push('语言审查第 1 轮失败（结果或其 sha256 缺失/非法），未按清单修改')
-if (mcheck === null && model !== null) incomplete.push('check-model 失败')
+if (mcheck === null) incomplete.push('check-model 失败')
 if (review === null && memoOk) incomplete.push('独立审稿失败')
 if (!reviewPassed && !incomplete.length) incomplete.push('审稿未最终通过（无 pass 记录）')
 if (kp === null && memoOk) incomplete.push('知识层修订草案失败')
@@ -573,9 +690,7 @@ const deliverables = [
   `${R}/ec.md.language.json`,
   `${R}/ed.md`,
   `${R}/ed.md.language.json`,
-  // No model when the build failed: never list an assumed v01 (the run is
-  // already incomplete for it).
-  ...(finalModel ? [finalModel.path] : []),
+  finalModel.path,
   memoPath,
   `${memoPath}.language.json`,
   `${R}/model-check.md`,
@@ -636,7 +751,7 @@ if (runOk) {
 return {
   ok: runOk,
   memo: `${W}/drafts/${D}-memo.md`,
-  model: finalModel ? finalModel.path : null,
+  model: finalModel.path,
   review_done: finalReview !== null,
   review_verdict: finalReview && verdictOf(finalReview),
   language_done: memoOk && lang1Sha !== null && lang2Sha !== null,

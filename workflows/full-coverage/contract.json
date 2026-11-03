@@ -1,6 +1,6 @@
 {
   "name": "full-coverage",
-  "description": "完整覆盖的完成契约：数字底表 + 问题清单 + 四支线 + 模型 + memo 三段 + 审稿修订 + 知识层修订草案（对应 dalton-full-coverage SKILL 的交付物）。",
+  "description": "完整覆盖的完成契约：数字底表 + 问题清单 + 四支线 + 建模（串行，失败即停）+ 单一写手 memo 成稿 + 语言审查与审稿修订 + 知识层修订草案（对应 dalton-full-coverage SKILL 的交付物）。",
   "draft": "drafts/{as_of}-memo.md",
   "params_required": [
     "ticker",
@@ -67,7 +67,7 @@
       ]
     },
     {
-      "name": "建模与 memo 第一段",
+      "name": "建模（串行，失败即停）",
       "artifacts": [
         {
           "path": "model/{ticker}-model-v*.xlsx",
@@ -85,7 +85,7 @@
       ]
     },
     {
-      "name": "memo 三段成稿",
+      "name": "memo 成稿",
       "artifacts": [
         {
           "path": "drafts/{as_of}-memo.md",

@@ -1,6 +1,6 @@
 ---
 name: dalton-full-coverage
-description: "完成一手数字底表、四支线并行取证、15 页动态公式 Excel 三表与 DCF 模型、三段式 12 问深度投资备忘录及双审稿发布。对重点标的开展立项级深度建仓研究、需要完整估值模型与正式备忘录时使用；属于最重度完整深度研究。"
+description: "完成一手数字底表、四支线并行取证、15 页动态公式 Excel 三表与 DCF 模型、深度投资备忘录（一位写手成稿）及双审稿发布。对重点标的开展立项级深度建仓研究、需要完整估值模型与正式备忘录时使用；属于最重度完整深度研究。"
 ---
 
 # Dalton 买方完整覆盖（`dalton-full-coverage`）
@@ -12,7 +12,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 1. **数字底表（`research/<D>-fc/facts.md`）**：含 `<!-- FACTS-LEDGER ... -->` 机器可读账本，作为全文唯一目标公司财务数字来源与发布核验基准；
 2. **公司专属 12 问研究提纲（`research/<D>-fc/questions.md`）** 与 **A/B/C/D 四条取证支线底稿（`ea.md`、`eb.md`、`ec.md`、`ed.md`）**；
 3. **带动态公式的 15 页 Excel 财务与估值模型（`model/<TICKER>-model-v01.xlsx`）**：含标准 12 页 + Dalton 专属 `Facts`、`Guidance vs Actual`（12 季表）、`Street vs House` 三页；
-4. **12 问前置总纲 + 十章论证深度投资备忘录（`drafts/<D>-memo.md`）**；
+4. **深度投资备忘录（`drafts/<D>-memo.md`）**：写给基金经理看（摘要 → 公司与商业模式 → 行业与竞争〔可并入上一节〕→ 核心投资逻辑与争议 → 财务预测与估值 → 风险 → 管理层 → 跟踪 → 附录），12 问研究提纲留在 `questions.md` 工作底稿、不进正文；
 5. **模型审计（`check-model`）与独立审稿（`dalton-reviewer`）**，修订后更新公司知识层并经 `publish_report(kind="full_coverage", updates_thesis=True)` 提交正式发布审批。
 
 ---
@@ -71,16 +71,13 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
      - `eb.md`：按 `references/branch-b-sellside-expert.md`（AlphaEngine 分类检索与全文精读、卖方预期地图、内部库与 company-wiki、Guidepoint 英文专家纪要、卖方盲点）；
      - `ec.md`：按 `references/branch-c-primary.md`（4 期报告 MD&A/Risk Factors diff、4 期电话会措辞漂移、招股书承诺对照、**C4 过去 12 个季度指引 vs 实际可信度表**、8-K 与内部人交易）；
      - `ed.md`：按 `references/branch-d-offstreet.md`（X、雪球、员工评价、社区情绪、招聘信号、13F、ToC 产品体验表或 ToB 从业者信号表）。
-   - **阶段 2 & 3（建模与 memo 三段式写作）**：
-     - **建模**：按 `references/model-spec.md` 构建 `model/<TICKER>-model-v01.xlsx`（`recalc.py` 与 `audit.py --strict` 通过，Checks 全 OK），与 memo 第一段并行；
-     - **memo 第一段**（基本信息、核心判断、零、一、二）→ 跑 `validate_memo.py --part 1` 到 0 FAIL；
-     - **memo 第二段**（三至六，引用模型三情景与敏感度）→ 跑 `validate_memo.py --part 2` 到 0 FAIL；
-     - **memo 第三段**（七至十、附录、`## 引用`，第七章含 C4 指引可信度表，第九章估值与模型一致）→ 跑 `validate_memo.py --mode full` 到 0 FAIL。
+   - **阶段 2（建模，串行在最前）**：按 `references/model-spec.md` 构建 `model/<TICKER>-model-v01.xlsx`（`recalc.py` 与 `audit.py --strict` 通过，Checks 全 OK）。建模失败立即中止，不进入写作——估值与三情景数字全部来自模型。
+   - **阶段 3（单一写手成稿与第 1 轮语言审查）**：一位写手通读 `questions.md`（12 问研究提纲）、四条支线底稿（含文末逐题证据小结）、`facts.md` 与模型输出，按 `references/memo-writing.md` 一次写成整篇备忘录 → 跑 `validate_memo.py --mode full` 到 0 FAIL → 第 1 轮语言审查（`check_language` round=1，按清单修改）→ 复跑校验。
    - **阶段 4（审模型与独立审稿并行）**：`check-model` 审模型输出 `research/<D>-fc/model-check.md`（只出报告不改模型）∥ `dalton-reviewer` 审 memo。
-   - **阶段 5（修订与知识层修订草案）**：按审稿意见与 `model-check.md` 修订 memo 和模型（若改模型，按 `.agents/skills/model-update/SKILL.md` 另存 `v02`，绝不覆盖 `v01`），并生成 `research/<D>-fc/knowledge-revision.json`。
+   - **阶段 5（一轮修订、终稿语言审查与知识层修订草案）**：审稿 `revise` 时按审稿意见与 `model-check.md` 做一轮修订（memo 与模型；若改模型，按 `.agents/skills/model-update/SKILL.md` 另存 `v02`，绝不覆盖 `v01`）后复审；随后对终稿做第 2 轮语言审查（`check_language` round=2，按清单修改并复核，绑定终稿哈希），并生成 `research/<D>-fc/knowledge-revision.json`。
 
 3. **Workflow 不可用时的手动降级路径**
-   - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按阶段 0 → 0.8 → 1 → 2/3 → 4 → 5 的顺序手动完成（依次调用子智能体或亲自执行）各阶段产物与脚本校验，并逐阶段核对产物。独立审稿阶段派 `dalton-reviewer` 审稿按三步执行：（1）主智能体先计算草稿的 sha256（`sha256sum drafts/<D>-memo.md` 或等价的 Python `hashlib.sha256`）；（2）把该哈希写进派给 `dalton-reviewer` 的提示词；（3）将返回的 JSON（`verdict` / `summary` / `items` 逐项覆盖 1–9 项检查 / `must_fix` / `nice_to_have`，审稿人不回填任何哈希）保存到 `research/<D>-fc/review.json`，保存时把第（1）步算出的被审草稿 sha256 写入该 JSON 的 `draft_sha256` 字段（多轮复审时保存最后一轮；改稿后必须重新计算哈希、重新审稿并覆盖）。收尾调用 `dalton_check_done(workflow="full-coverage", params={"ticker": "<TICKER>", "workspace_dir": "<当前工作区路径>", "as_of": "<D>", "manual": true})`（不传 `run_id`），审稿据此文件核对。语言审查两轮（顺序不可颠倒，与 workflow 相同）：成稿后先调用 `check_language(draft_path=<草稿>, round=1)` 并按 `<草稿>.language.md` 清单修改（只改语言，不动事实、数字、术语、引用编号与判断强度），再派 `dalton-reviewer` 首次审稿；修订循环结束、终稿内容定稿后调用 `check_language(round=2)` 按清单完成终稿语言修改，草稿有改动就再调用一次 `check_language(round=2)` 对终稿复核，然后做最后一次审稿（pass 的 JSON 存 review.json）与 `check_draft`；第一次审稿就 pass 时：第 2 轮照常执行；改了稿就补一次终稿审稿（pass 的 JSON 覆盖存 review.json），哈希未变则无需重审。本次产出中其他给人读的 .md 笔记（research/ 支线、背景、快讯、异动、公告点评、专题章节等）同样各审两轮：第 1 轮审完按清单改，第 2 轮复核，改过就再跑一次 round=2 确认；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/、知识层渲染文件与 .audit/.annotated/.language 侧车不审。
+   - **`workflow.enabled` 已关闭**（工具列表本来就不会有 `RunWorkflow`）：主智能体按阶段 0 → 0.8 → 1 → 2 → 3 → 4 → 5 的顺序手动完成各阶段产物与脚本校验（语言审查两轮、修订一轮，顺序同阶段 3–5）。派 `dalton-reviewer` 审稿（含修订后复审）时：（1）先算 `drafts/<D>-memo.md` 的 sha256；（2）把该哈希写入审稿提示词；（3）将返回的 JSON（`verdict` / `summary` / `items` 逐项覆盖 1–9 项检查 / `must_fix` / `nice_to_have`，审稿人不回填任何哈希）保存为 `research/<D>-fc/review.json`，并写入 `draft_sha256` 字段（复审时覆盖为最新一轮；改稿后必须重新计算哈希、重新审稿）。备忘录主稿语言审查两轮：成稿并跑 `validate_memo.py --mode full` 到 0 FAIL 后调用 `check_language(draft_path=<草稿>, round=1)` 按清单修改（只改语言，不动事实、数字、术语、引用编号与判断强度），复跑校验，再派 `dalton-reviewer` 首次审稿；一轮修订结束后对终稿调用 `check_language(round=2)` 完成终稿语言修改，草稿有改动就再跑一次 round=2 复核（记录追加在同一 json），然后做最后一次审稿（pass 的 JSON 存 review.json）。`research/<D>-fc/` 下给人读的底稿笔记（`facts.md`、`questions.md`、`ea.md`–`ed.md`、`model-check.md`）各做两轮 `check_language`（第 1 轮按清单改，第 2 轮复核，有改动则再跑一次 round=2 确认）；不审 json/xlsx 等机器文件与 `.audit/.annotated/.language` 侧车。收尾按第三节第 5 步以 `manual: true` 调用 `dalton_check_done`。**在途的旧结构运行**（备忘录还是「零、12 问 + 一至十章」的旧版双轨稿）：按旧规则完成并收尾——`validate_memo.py` 会自动识别旧结构并按旧规则校验（`--part` 仍可用），不要把旧稿改写成新结构。
    - **否则**（`workflow.enabled` 未关闭）：`RunWorkflow` 不在工具列表时，先用 **Read 工具**（不要用 Bash `cat`）读 `.agents/skills/run-workflow/SKILL.md` 后重试；仍没有就停下，告诉 PM「RunWorkflow 不可用」，不要自行手动派发 Task 子智能体代跑。
 
 ---
@@ -104,7 +101,7 @@ Workflow 返回后，主智能体按以下 6 步完成收尾（完成契约在�
   - **`company`**：将 `coverage_stage` 更新为 `"full"`。
 - 调用 **`knowledge_append_verdict`**：
   - 对照初次覆盖的 thesis 给出正式五词结论（通常为 `THESIS_STRENGTHENED` / `THESIS_WEAKENED` / `NEW_THESIS` / `THESIS_BROKEN` / `NO_CHANGE`）；
-  - 在 `agenda_ops` 中写入完整覆盖后的持续跟踪议程（第十章的监控清单、高频指标与催化剂日历）。
+  - 在 `agenda_ops` 中写入完整覆盖后的持续跟踪议程（跟踪节的验证点与失效条件、高频指标与催化剂日历）。
 
 ### 第 3 步：开启自动跟踪（`dalton_coverage_tracking`）
 - 调用 `dalton_coverage_tracking(action="enable", source="coverage_finish")` 开启（或补齐）该公司的标准自动跟踪任务（`watch`、`delta`、`move-up`、`move-down`）。若用户之前手动关闭过（带 `paused_by_user` 标记），`source="coverage_finish"` 会自动保持关闭状态，不重新打开。
@@ -146,17 +143,17 @@ Workflow 返回后，主智能体按以下 6 步完成收尾（完成契约在�
 ## 四、本 Skill 目录文件
 
 - `references/facts-ledger.md`：阶段 0 数字底表（`FACTS-LEDGER`）规则与必填键清单。
-- `references/frame.md`：阶段 0.8 公司专属 12 问问题清单（`questions.md`）规则。
+- `references/frame.md`：阶段 0.8 公司专属 12 问问题清单（`questions.md`，内部工作底稿）规则。
 - `references/branch-common.md`：A/B/C/D 四条取证支线通用规则。
 - `references/branch-a-industry.md`：支线 A（行业与竞争）取证规则。
 - `references/branch-b-sellside-expert.md`：支线 B（卖方、内部库与专家访谈）取证规则。
 - `references/branch-c-primary.md`：支线 C（一手文件精读与 C4 12 季指引可信度表）取证规则。
 - `references/branch-d-offstreet.md`：支线 D（场外信号、产品体验与从业者反馈）取证规则。
-- `references/memo-writing.md`：12 问前置总纲 + 十章论证写作指南、章节映射与三段式写作流程。
+- `references/memo-writing.md`：备忘录写作目标、章节结构与各节要求、引用与数字纪律、写作与校验流程。
 - `references/model-spec.md`：15 页 Excel 模型规格（标准 12 页 + Dalton 增补 3 页）。
-- `scripts/research_structure.py`：12 问映射表、问题清单校验（`validate-agenda`）与备忘录结构校验。
+- `scripts/research_structure.py`：12 问映射表、问题清单校验（`validate-agenda`）与备忘录结构校验（新稿按章节结构；旧版十二章在途稿按旧规则）。
 - `scripts/facts.py`：`facts.md` 中 `FACTS-LEDGER` 的命令行读写与必填键检查工具。
-- `scripts/validate_memo.py`：备忘录机械校验脚本（支持 `--part 1|2|3` 与 `--mode full`）。
-- `scripts/test_research_structure.py`：12 问结构与问题清单离线回归测试套件。
-- `templates/memo.md`：12 问深度投资备忘录中文模板。
-- `templates/questions.md`：公司专属 12 问研究提纲中文模板。
+- `scripts/validate_memo.py`：备忘录机械校验脚本（新稿查章节结构与引用闭环；旧版十二章在途稿按旧规则校验、`--part` 仍可用）。
+- `scripts/test_research_structure.py`：12 问结构与备忘录章节离线回归测试套件。
+- `templates/memo.md`：投资备忘录中文模板。
+- `templates/questions.md`：公司专属 12 问研究提纲中文模板（内部工作底稿）。
