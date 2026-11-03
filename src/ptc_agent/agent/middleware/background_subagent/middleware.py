@@ -351,6 +351,9 @@ class BackgroundSubagentMiddleware(AgentMiddleware):
         task.redis_write_failed = False
         task.sse_drain_complete = asyncio.Event()
         task.sse_consumer_count = 0
+        # DALTON-HOOK(subagent-resume): the stopped orphan's seal is
+        # round-scoped — this task's stream writes again from here on.
+        task.stream_sealed = False
         # Billed before the new round's writer exists: that round's ledger
         # settle also settles the run this usage spent, so its row lands first.
         if earlier_round is not None:

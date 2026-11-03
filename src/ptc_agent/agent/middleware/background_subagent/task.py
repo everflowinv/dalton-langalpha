@@ -250,6 +250,15 @@ class BackgroundTask:
     explicit ``<seq>-0`` ordering on the stream. Off the registry-wide lock
     so a slow Redis blip on one task can't stall appends to other tasks."""
 
+    # DALTON-HOOK(subagent-resume): sealed when a resume stops a fence-less
+    # orphan — see ``_emit``.
+    stream_sealed: bool = False
+    """Set when a resume stops a fence-less orphan: its run's ``run_end`` is
+    already on the stream, so ``_emit`` must reject the stopped writer's
+    later non-terminal frames (a forwarder's finalize still emits). Unlike a
+    kill's seal (``cancelled``), a normally completed task is NOT sealed —
+    its trailing frames must land. Cleared when a resumed round resets."""
+
     def adopt_writer_outcome(self, writer: asyncio.Task) -> Any:
         """Settle this task from its finished writer, and return the result.
 

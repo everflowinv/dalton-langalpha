@@ -121,3 +121,8 @@ tests/unit/ptc_agent/agent/tools/test_grep_content_cap.py
 tests/unit/server/services/test_subagent_usage_terminal_status.py
 # R3a-5: a dispatch whose declared files are missing/empty is partial.
 tests/unit/middleware/workflow/test_partial_artifacts.py
+# LaneA fix (2026-11-02, thread 2f1387ec): a worker_lost orphan's resume is
+# arbitrated by the run ledger and the report-back pipeline rechecks before
+# each POST; the sequence test pins one wake for one follow-up.
+tests/unit/middleware/test_subagent_orphan_resume.py
+tests/unit/server/services/test_task_report_back.py

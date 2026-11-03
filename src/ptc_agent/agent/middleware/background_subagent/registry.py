@@ -698,7 +698,12 @@ class BackgroundTaskRegistry:
             # those frames run inside the bounded unwind the drain awaits,
             # and dropping them would erase acknowledged user input. A held
             # delta is output, not bookkeeping, so the kill drops it too.
-            if task.cancelled:
+            # DALTON-HOOK(subagent-resume): a stopped orphan is sealed the
+            # same way — its run's run_end is already on the stream, and its
+            # writer's cancel-unwind still emits (a forwarder's finalize). A
+            # normally completed task is never sealed here: its trailing
+            # frames must land.
+            if task.cancelled or task.stream_sealed:
                 coalescer.discard()
                 if not terminal:
                     return

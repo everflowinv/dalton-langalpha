@@ -287,6 +287,12 @@ ALLOWED_HOOKS=(
   # endpoint, and the automation-list target selector
   # (modelPreferences.ts, AutomationList.tsx).
   "notify-routes"
+  # LaneA fix (2026-11-02, thread 2f1387ec): a resume consults the run ledger
+  # before trusting a live local writer — a worker_lost orphan is stopped and
+  # the resume proceeds through the namespace lock — and the task report-back
+  # pipeline rechecks its verdict before each POST so an already-delivered
+  # result opens no turn (task_actions.py, report_back/subagent.py).
+  "subagent-resume"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
