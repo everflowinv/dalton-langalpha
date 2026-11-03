@@ -12,7 +12,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ## 目标与定位
 
-在公司财报发布后数小时内（由 PS.7 的 `t0` 自动任务在 `release_time + N` 小时触发，或由分析师手动触发），向 PM 交付一份结构固定、零幻觉的**财报快讯**（落盘至 `research/<D>-flash-<季度>.md` 并直接推送）：
+在公司财报发布后数小时内（由 `dalton-earnings-calendar` 建立的 `t0` 自动任务在 `release_time + N` 小时触发，或由分析师手动触发），向 PM 交付一份结构固定、零幻觉的**财报快讯**（落盘至 `research/<D>-flash-<季度>.md` 并直接推送）：
 - 第一时间给出头条业绩、上一季同比对比、关键经营 KPI、指引变化、电话会 Q&A 核心要点、卖方初评与 sales 交易台反馈；
 - 对照前瞻预测文件 `predictions.json` 给出 3–5 条初步核对结论；
 - 给出事件五词结论**初判**（写入 `verdicts.md`），并确保次日 T+1 深度链自动任务（`tp1`）就绪。
@@ -23,8 +23,9 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ## 12 步必做流程
 
-### Step 1：确认报告期间与三期对比基线
+### Step 1：确认报告期间、读取事前冻结门槛与三期对比基线
 - 核实最新发布的财年与财季标签（沿用公司自身命名，如 `FY26Q3`，严格区分财季与自然季）。
+- **先读事前冻结条目（`frozen_pre_event=true`）**：读取工作区 `data/debate.json`（`debate.md`）各分歧 `debates[].expectations[]` 中本次财报事件（`event_id`）对应的 `frozen_pre_event == true` 冻结条目，以及 `research/` 下最新的 `preview-<季度>/predictions.json`，锁定财报前已冻结的买方 bogey / 我方预期门槛与卖方一致预期。**严禁拿财报发布后（`published_at >= t0` 或 `acquired_at >= t0`）的卖方点评或 sales 邮件去倒推或改写事前预期门槛**；若财报前未冻结某项买方 bogey，写明“无事前冻结买方门槛”，只比较实际 vs Street。
 - 准备三组对比期间：**当季（Current Quarter）、上一季（Prior Quarter）、去年同期（Year-Ago Quarter）**。
 - 若美股正式 `10-Q` / `10-K` 尚未提交，使用财报 `8-K EX-99.1`（外国私人发行人用 `6-K` 业绩附件）；港股与 A 股使用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)` 调取的巨潮资讯（cninfo）定期报告/业绩公告或港交所披露易（HKEXnews）官方业绩公告，并在 `Sources` 中明确注明。
 
@@ -40,10 +41,11 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 - **`Q&A takeaways` 只从电话会 Q&A 部分提取**（提炼 5–10 个最有决策价值的管理层回答，每个话题 1–2 句，不把开场白塞进 Q&A）。
 - **逐级降级规则**：若触发时刻电话会全文尚未入库，依次退到公司 IR Webcast 回放、8-K 预备发言稿（Prepared Remarks），并在正文开头与 `Sources` 中如实写明“截至触发时刻电话会纪要尚未入库”。
 
-### Step 4：卖方初评与独立研究点评
+### Step 4：卖方初评与独立研究点评（事后材料只进“反应分解”）
 - 调用 `researchdata.research(route="alphaengine", operation="search_library", ...)` 按公司名和 ticker 检索财报后报告（类别：`sell_side`、`sell_side_comment`、`sell_side_report`、`domestic_report`、`foreign_report`）。
 - **时间窗严格限定为 `[官方发布时刻 T0, 触发时刻]`**，**严格排除财报前瞻（preview）**；记录每份采用报告的机构名、标题、发布日期与 `doc_id`。
-- 同时间窗检索 `FUNDA AI`（`route="funda-ai"`）与 `TMTB`（`route="tmtb"`）：若有信息增量，在**卖方初评**下单独列为“**独立研究点评（仅有增量时）**”，标明来源身份，**绝不计入卖方一致预期或券商预测修正区间/中位数**。
+- **事后材料隔离铁律**：所有 `published_at >= t0` 或 `acquired_at >= t0` 的事后材料（卖方初评、sales 盘后反馈、独立研究点评）**只能进入“反应分解”（卖方初评与市场反应分解），严禁用来重构或冒充财报前的买方 bogey / 事前预期门槛**。
+- 同时间窗检索 `FUNDA AI`（`route="funda-ai"`）与 `TMTB`（`route="tmtb"`）：若有信息增量，在**卖方初评（反应分解）**下单独列为“**独立研究点评（仅有增量时）**”，标明来源身份，**绝不计入卖方一致预期或券商预测修正区间/中位数**。
 
 ### Step 5：Sales 与投资者反馈（严格时间窗与匿名纪律）
 - 调用 `researchdata.research(route="sales-notes", params={"layer": "raw", "media": "all"})` 检索时间窗 **`[T0, 触发时刻)`**（或发布后 24 小时内，`T0` 为官方财报发布时间戳）。
@@ -57,11 +59,13 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 - 按 [`references/kpi-packs.md`](references/kpi-packs.md) 及公司自身披露核心指标，选取 **3–6 个关键经营 KPI**，列出当季绝对值、同比（YoY）、环比（QoQ）及**上一季同比增速**，并指出 1–2 个决定本季盈利质量的驱动项。
 - 若公司变更 KPI 定义或分部披露结构，必须显式标注**可比性断点（comparability break）**。
 
-### Step 7：对账与 Beat/Miss 计算公式
-- **头条 Beat/Miss**：`beat/miss = 实际值 / 一致预期 - 1`，**仅在实际值与一致预期处于完全相同的会计口径（GAAP vs Non-GAAP/Adjusted）和同一币种时计算**。
+### Step 7：对账与双基准比较（“实际 vs Street”与“实际 vs 冻结门槛”）
+- **分别比较两把尺子**：
+  1. **实际 vs Street（卖方一致预期）**：`beat/miss = 实际值 / 一致预期 - 1`，**仅在实际值与一致预期处于完全相同的会计口径（GAAP vs Non-GAAP/Adjusted）和同一币种时计算**；
+  2. **实际 vs 冻结门槛（事前 `frozen_pre_event=true` 锁定门槛）**：将实际值与财报前在 `debate`（`frozen_pre_event=true`）及 `predictions.json` 中冻结的买方 bogey / 我方门槛单独对比（同口径下算差值或百分比；若事前未冻结买方数字门槛，显式写“无事前冻结买方门槛”，严禁拿事后报告里的说法补填）。
 - **亏损或零附近分母**：当指标为亏损、负 EPS 或分母接近 0 时，只报**绝对差额**（或利润率 bps 差额），禁止报告误导性百分比。
 - **指引对比**：
-  - **指引 Beat/Miss**：用本次指引**中点（midpoint）**对比同口径卖方一致预期，并同时保留完整指引区间；
+  - **指引 Beat/Miss**：用本次指引**中点（midpoint）**分别对比同口径卖方一致预期与事前冻结门槛，并同时保留完整指引区间；
   - **指引修正（Revision）**：用本次新指引区间/中点对比**上一季财报给出的官方指引**；未提供指引写“未提供（not guided）”。
 - **一次性项目与冲突处理**：解释重大一次性损益，若其改变 beat 解读则同时列出 GAAP 与 Adjusted EPS；不同来源数字冲突时，**实际值一律以监管 filing 为准**，单家券商预测以该机构最新日期研报为准，并如实说明冲突。
 
@@ -71,19 +75,22 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 - 多家可比卖方已出修正时，给出本财年与下一财年收入/EPS 修正前后数值、百分比幅度，以及对应远期 P/E 的**区间与中位数**；**严禁把 GAAP 与 Adjusted EPS 混算或求平均**；负 EPS 标为 `NM`。
 - **快讯时点兜底**：若快讯触发时卖方模型修正尚未发布，明确写“**卖方修正未出，次日深度点评补**”，禁止用财报前旧预测冒充财报后修正。
 
-### Step 9：前瞻要点初步对照
-- 读取工作区 `research/` 下最新的 `preview-<季度>/predictions.json`（及 `drafts/` 下对应的前瞻稿），挑选最重要的 **3–5 条预测**（如总营收、核心利润/EPS、下季指引、最关键 KPI 与核心 debate），在快讯末尾给出“**前瞻要点初步对照**”（完整逐条对账表在次日深度链 `dalton-earnings-deep` 中生成）。
+### Step 9：事前冻结门槛与前瞻要点对照
+- 读取工作区 `data/debate.json` 中 `frozen_pre_event=true` 的冻结条目与 `research/` 下最新的 `preview-<季度>/predictions.json`（及 `drafts/` 下对应的前瞻稿），挑选最重要的 **3–5 条预测**（如总营收、核心利润/EPS、下季指引、最关键 KPI 与核心 debate），在快讯末尾给出“**事前冻结门槛与前瞻要点对照**”：**每条分别写出“实际 vs Street”与“实际 vs 冻结门槛”**（完整逐条对账表在次日深度链 `dalton-earnings-deep` 中生成）。
 
-### Step 10：事件五词初判与知识层写入
+### Step 10：事件五词初判、当日 `underwriting` 更新与知识层写入
 - **快讯正文必须回答一问（线性还是切换）**：这次是沿着旧叙事线性演进，还是叙事 / 倍数 regime（市场给这类资产的定价规则）可能在切换？答“可能在切换”时，必须点名是哪一个触发器（本季哪个数字或指引变化）、指向哪个方向（升级 / 降级），以及需要什么证据来确认；检查方法见 `.agents/skills/dalton-conventions/references/nonlinear.md`。
-- 给出事件五词结论（快讯阶段允许注明”初判”，由次日深度链终判）：
+- **当天更新 `thesis.underwriting` 或写明不更新的理由**：
+  - 若当季结果或新指引已足以修正三情景 EPS/倍数区间、基准股价 `anchor` 或三层保护，当天调用 `knowledge_update(doc="thesis", ...)`（先 `dry_run=True` 看赔率摘要，再正式写入）更新 `thesis.underwriting` 与 `thesis.house_view`；
+  - 若因正式 `10-Q` 分部细表未出、或需待次日 T+1 深度链（`dalton-earnings-deep`）完成三表模型重算后再改三情景价带，**必须在快讯正文与 `verdict.rationale` 中明确写明当天不更新 `underwriting` 的具体理由及次日更新计划**，不得静默跳过。
+- 给出事件五词结论（快讯阶段允许注明“初判”，由次日深度链终判）：
   - JSON 正式词形：`NO_CHANGE` / `THESIS_STRENGTHENED` / `THESIS_WEAKENED` / `THESIS_BROKEN` / `NEW_THESIS`
   - Markdown 显示：无变化 / 强化 / 削弱 / 证伪 / 新论点
-- 调用 `knowledge_append_verdict` 写入初判（`trigger.kind="earnings"`，`trigger.ref` 填 `<dalton_wake>` 的 `t0` 信号 id 或 `"manual"`），并在 `agenda_ops` 中保留次日深度链与前瞻完整对账待办。
+- 调用 `knowledge_append_verdict` 写入初判（`trigger.kind="earnings"`，`trigger.ref` 填 `<dalton_wake>` 的 `t0` 信号 id 或 `"manual"`，附上 `payoff_assessment`），并在 `agenda_ops` 中保留次日深度链与前瞻完整对账待办。
 
 ### Step 11：确认或补建 T+1 深度链自动任务
-- 检查本工作区 `.agents/user/automations/dalton-<t>-earn-<period>-tp1.json`（T+1 交易日 20:00 当地市场时区）是否已由 PS.7 建立、`status == "active"` 且时间正确。
-- 若该文件不存在或时间有误（针对 Core 公司或 PM 要求深度跟踪的公司），立即按 PS.7 模板在本工作区直接写文件补建（分析师对本工作区 `dalton-*` 自动任务有常设授权，无需询问 PM）。
+- 检查本工作区 `.agents/user/automations/dalton-<t>-earn-<period>-tp1.json`（T+1 交易日 20:00 当地市场时区）是否已由 `dalton-earnings-calendar` 建立、处于激活状态（`"active"`）且时间正确。
+- 若该文件不存在或时间有误（针对 Core 公司或 PM 要求深度跟踪的公司），立即按 `.agents/skills/dalton-earnings-calendar/SKILL.md` 里的 `tp1` 模板在本工作区直接写文件补建（分析师对本工作区 `dalton-*` 自动任务有常设授权，无需询问 PM）。
 
 ### Step 12：交付前 14 项数据质量门自检（Data-Quality Gate）
 

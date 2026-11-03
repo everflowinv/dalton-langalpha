@@ -1,0 +1,77 @@
+{
+  "name": "dalton-sector-delta",
+  "description": "每周行业资料增量跟踪的完成契约：本轮 `collect_sector.py commit` 已写入文件（`last_run.json` 与 `updates.log` 存在、非空且写明本轮覆盖的期间 `since` → `until`）+ 行业五词 `verdict`；`last_run.json` 的 `material=\"yes\"` 时还要求本轮增量笔记 `research/{as_of}-delta.md` 存在、非空并写明本轮覆盖的期间（`since` → `until`），且至少一份受影响行业知识文档有本轮更新，`material=\"no\"` 时无增量笔记是合法结果。",
+  "params_required": [
+    "as_of"
+  ],
+  "stages": [
+    {
+      "name": "提交状态（commit）",
+      "artifacts": [
+        {
+          "path": "research/tracker/last_run.json",
+          "min_bytes": 10,
+          "modified_on": "today",
+          "fresh_this_run": true,
+          "requires_period": true
+        },
+        {
+          "path": "research/tracker/updates.log",
+          "min_bytes": 1,
+          "modified_on": "today",
+          "fresh_this_run": true
+        }
+      ]
+    },
+    {
+      "name": "行业增量笔记（仅 material=yes）",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-delta.md",
+          "path_param": "delta_note",
+          "variant_glob": "research/*-delta.md",
+          "min_bytes": 100,
+          "requires_period": true,
+          "requires_json": {
+            "json": "research/tracker/last_run.json",
+            "field": "material",
+            "equals": "yes",
+            "allowed_values": [
+              "yes",
+              "no"
+            ]
+          },
+          "fresh_this_run": true
+        }
+      ]
+    }
+  ],
+  "closing": {
+    "verdict_kinds_any": [
+      "NO_CHANGE",
+      "THESIS_STRENGTHENED",
+      "THESIS_WEAKENED",
+      "THESIS_BROKEN",
+      "NEW_THESIS"
+    ],
+    "knowledge_docs_if_json": [
+      {
+        "json": "research/tracker/last_run.json",
+        "when": {
+          "field": "material",
+          "equals": "yes",
+          "allowed_values": [
+            "yes",
+            "no"
+          ]
+        },
+        "docs_any": [
+          "thesis",
+          "debate",
+          "drivers",
+          "agenda"
+        ]
+      }
+    ]
+  }
+}

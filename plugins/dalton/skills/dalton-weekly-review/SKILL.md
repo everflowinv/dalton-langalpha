@@ -69,7 +69,7 @@ Workflow 不可用时：
    - 按 `.agents/skills/dalton-weekly-review/references/watch-rules.md` 检索并写 `dalton/research/weekly-<end>/watch-<TICKER>.md`。
 4. **阶段 4：汇总与 Conviction Call（`汇总与 call`）**：
    - **周报开头先写“市场状态”小段**：调用 `macro(route="market-regime", operation="snapshot")` 以及 `macro(route="market-regime", operation="crowding", top=5, order="high")`、`macro(route="market-regime", operation="crowding", top=5, order="low")`，在周会稿开头增加“市场状态”一小段，概述美股顶部/底部阶段与提醒、动量、A 股/港股/亚洲读数以及指数拥挤度最高/最低的前 5 个板块（标明 `as_of` 数据日期；若 `stale=true` 则注明）；
-   - 对 Core 中标记 `call_candidate: true` 的公司（最多 3 家）按 `.agents/skills/dalton-call/SKILL.md` 做证据门槛与三情景 IRR 核对，输出 `call-<TICKER>.md`（不过门槛即输出《门禁未通过声明》：缺口 + 已完成的赔率卡与三层保护）；
+   - 对 Core 中标记 `call_candidate: true` 的公司（最多 3 家）按 `.agents/skills/dalton-call/SKILL.md` 做六条证据门禁与 `thesis.underwriting` 赔率核对，输出 `call-<TICKER>.md`（不过门槛即输出《门禁未通过声明》：缺口 + 已完成的赔率卡与三层保护）；
    - 按 `.agents/skills/dalton-weekly-review/templates/weekly.md` 汇总全部材料、各公司本周 `verdicts.md` 与 `proposals/`，生成周会稿 `dalton/drafts/<end>-weekly.md`；**若本月触发了月度复盘（判断标准见下方"每月第一期周报附月度复盘"），本阶段负责把复盘一节追加到周会稿末尾，并单独写入归档文件 `dalton/drafts/<YYYY-MM>-monthly-review.md`**。
 
 ### 第 3 步：提案交办（`delegate_to_analyst`）与议程批注（`dalton_agenda_note`）
@@ -83,7 +83,7 @@ Workflow 完成后，研究总监在 Home 执行收尾动作：
 3. **汇报完成前必须过完成契约（`dalton_check_done`）**：
    - **推送稿两轮语言审查与原样回复**：按 `.agents/skills/dalton-conventions/SKILL.md` §8 在调 `dalton_check_done` 前将推送正文写入 Home 工作区下的 `research/push/<end>-director-weekly.md` 并完成两轮 `check_language`，最后回复与该推送稿逐字相同；
    - 在 Home 调用 `dalton_check_done(workflow="weekly-coverage-review", run_id=<`dalton/research/weekly-<end>/.progress.json` 里的 run_id>, params={"home_dir": "dalton", "end": "<YYYY-MM-DD>", "coverage_path": "dalton/coverage.yaml"})`（研究总监角色可核对 `weekly-coverage-review` 与 `dalton-earnings-calendar`；`workflow.enabled` 已关闭、手动执行时不传 `run_id`，在 `params` 中加 `"manual": true`）；
-   - `done=false` 时按 `missing` 先补齐再查（`screen.json`、`attribution.json`、`core-*.md`、周会稿与推送稿两轮语言审查均须通过）；补不了的只能汇报"未完成"并列出缺项，不得汇报"完成"。
+   - `done=false` 时按 `missing` 先补齐再查（`screen.json`、`attribution.json`、`core-*.md`、周会稿、当月第一期周报〔本期 `end` 所在自然月内尚无更早日期的已完成周会稿 `dalton/drafts/<YYYY-MM-DD>-weekly.md`〕时的上月月度复盘归档 `dalton/drafts/<YYYY-MM>-monthly-review.md`〔必须存在且非空〕，以及推送稿两轮语言审查均须通过）；补不了的只能汇报“未完成”并列出缺项，不得汇报“完成”。
 4. **统计与推送 PM**（完成契约通过后）：
    - 统计全覆盖公司本周事件五词（`NO_CHANGE` / `THESIS_STRENGTHENED` / `THESIS_WEAKENED` / `THESIS_BROKEN` / `NEW_THESIS`）分布；
    - 将周会稿中的**“本周判断（3–6 条）”**与**“Conviction call（或本周无高确信推荐，附赔率卡与三层保护）”**推送给 PM；
@@ -93,7 +93,7 @@ Workflow 完成后，研究总监在 Home 执行收尾动作：
 
 ## 每月第一期周报附月度复盘
 
-月度复盘挂在**每月第一期周报**上：设本期周报截止日 `end` 所在自然月的**上一个月**为 `<YYYY-MM>`（例如 `end` 为 `2026-11-06`，则 `<YYYY-MM>` 为 `2026-10`）。阶段 4（汇总与 call）先检查归档文件 `dalton/drafts/<YYYY-MM>-monthly-review.md`（在 Home 工作区外路径为 `../Home/dalton/drafts/<YYYY-MM>-monthly-review.md`）是否已存在：若不存在，则复盘 `<YYYY-MM>` 月，将复盘写入该归档文件，并作为 `## 月度复盘（<YYYY-MM>）` 一节追加在周会稿末尾（结构化字段上线前写在正文，不写新字段）：
+月度复盘挂在**每月第一期周报**上：设本期周报截止日 `end` 所在自然月的**上一个月**为 `<YYYY-MM>`（例如 `end` 为 `2026-11-06`，则 `<YYYY-MM>` 为 `2026-10`）。阶段 4（汇总与 call）先检查归档文件 `dalton/drafts/<YYYY-MM>-monthly-review.md`（在 Home 工作区外路径为 `../Home/dalton/drafts/<YYYY-MM>-monthly-review.md`）是否已存在：若不存在，则复盘 `<YYYY-MM>` 月，将复盘写入该归档文件，并作为 `## 月度复盘（<YYYY-MM>）` 一节追加在周会稿末尾（结合各公司 `thesis.underwriting`、`thesis.house_view` 与 `verdicts.md` 复盘，若产生对某公司 `thesis` 或 `lessons` 的修改建议则一并写入 `proposals/<TICKER>.json` 交办给对应工作区分析师）：
 
 - **复盘范围**：上月所有的 `stance`（方向）与行动分类变化，**加上长期处于观察（`watch` / 等价格 / 等证据）或 `neutral`（中性）、从未行动的候选**——长期不行动本身就是复盘对象。
 - **逐只对照投委会四问**（什么在改变客户行为和公司的经济性？为什么这个解释比竞争解释更可信？市场在哪个环节判断错了？看到什么我会认错〔双向：看到什么减仓或回补、看到什么加仓或加空〕？），逐只标出**错在哪一问**；四问都站得住的写“无错项”。
@@ -102,3 +102,4 @@ Workflow 完成后，研究总监在 Home 执行收尾动作：
   1. **情景覆盖率**：上月实际价格落在三档情景（bear / base / bull 价格带）之外的比例；
   2. **漏提醒次数**：改判条件已经满足、却没有发出提醒的次数。
 - **不考核**赚没赚钱，也不考核高 conviction（高确信）判断的占比。
+- **完成前检查（`dalton_check_done`）**：本期是当月第一期周报（本期 `end` 所在月份内在本期之前尚无已完成的周报 `dalton/drafts/<YYYY-MM-DD>-weekly.md`）时，完成契约会核对上月归档文件 `dalton/drafts/<YYYY-MM>-monthly-review.md` 必须存在且非空（只认上月 `<YYYY-MM>` 的归档文件）；未写或为空时会被拒绝收尾。

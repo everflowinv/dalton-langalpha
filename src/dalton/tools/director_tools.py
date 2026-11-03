@@ -17,7 +17,10 @@ from src.dalton.auth import (
     resolve_caller_home_workspace_id,
     verify_workspace_access,
 )
-from src.dalton.autonomy.board import build_coverage_board
+from src.dalton.autonomy.board import (
+    build_coverage_board,
+    resolve_decision_impact,
+)
 from src.dalton.autonomy.schedule import (
     schedule_dalton_automation_helper,
 )
@@ -132,8 +135,8 @@ def _render_daily_plan_markdown(
     else:
         lines.extend(
             [
-                "| # | 公司 | 任务类型 | 任务说明 | 预计花费 (USD) | 依据 |",
-                "|---:|---|---|---|---:|---|",
+                "| # | 公司 | 任务类型 | 任务说明 | 这个问题解决后会改变哪个决定 | 预计花费 (USD) | 依据 |",
+                "|---:|---|---|---|---|---:|---|",
             ]
         )
         for idx, d in enumerate(dispatches, start=1):
@@ -142,7 +145,10 @@ def _render_daily_plan_markdown(
             task_str = d.get("task") or d.get("instruction") or ""
             est = float(d.get("est_usd") or 0.0)
             why = d.get("why") or ""
-            lines.append(f"| {idx} | **{t}** | `{k}` | {task_str} | ${est:.2f} | {why} |")
+            decision_impact = resolve_decision_impact(d) or "-"
+            lines.append(
+                f"| {idx} | **{t}** | `{k}` | {task_str} | {decision_impact} | ${est:.2f} | {why} |"
+            )
 
     lines.extend(["", "## 3. 暂缓 / 未入选事项（Skipped）", ""])
     if not skipped:
@@ -292,10 +298,11 @@ def build_director_tools(
         """Record the Research Director's daily dispatch plan into Postgres and write `dalton/plans/<date>.md`.
 
         Refuses the plan if total `est_usd` across `dispatches` exceeds today's allocatable budget
-        (`remaining_usd - reserve_for_events_usd`).
+        (`remaining_usd - reserve_for_events_usd`), or if any dispatch omits `decision_impact`
+        (which decision changes when the task is resolved, e.g. `stance`, `actionability`, or position size).
 
         Args:
-            dispatches: List of selected tasks (`{ticker, workspace_id, task, kind, est_usd, why}`).
+            dispatches: List of selected tasks (`{ticker, workspace_id, task, kind, est_usd, decision_impact, why}`), where `decision_impact` states which decision changes when resolved.
             skipped: List of deferred tasks (`{ticker, task, reason}`).
             pm_attention: List of items awaiting PM review (`{ticker, what}`).
             plan_date: Optional ISO date string (`YYYY-MM-DD`); defaults to today.
@@ -307,6 +314,20 @@ def build_director_tools(
         for d in dispatches or []:
             if isinstance(d, dict) and ("workspace_id" in d or d.get("workspace_id")):
                 await verify_workspace_access(str(d.get("workspace_id") or ""), user_id)
+            if isinstance(d, dict):
+                if not resolve_decision_impact(d):
+                    return json.dumps(
+                        {
+                            "ok": False,
+                            "error": "missing_decision_impact",
+                            "message": (
+                                f"派单任务（{d.get('ticker') or '-'}：{d.get('task') or '-'}）未写明"
+                                "“这个问题解决后会改变哪个决定”（`decision_impact` / `why`），"
+                                "例如是否改变方向（`stance`）、可执行度（`actionability`）或仓位；没有就不排。"
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
         board = await build_coverage_board(user_id=user_id)
         budget = board.get("budget") or {}
         cap_usd = float(budget.get("cap_usd") or 0.0)
@@ -400,7 +421,7 @@ def build_director_tools(
         cursor: list[str] | None = None,
         config: RunnableConfig = None,
     ) -> str:
-        """Track cross-layer research requests between a sector workspace and company workspaces (P2).
+        """Track cross-layer research requests between a sector workspace and company workspaces.
 
         The sector analyst reports a structured evidence request (target unit, question, evidence
         needed, completion condition); you persist it here (`action="create"`), dispatch it to the
@@ -676,7 +697,7 @@ def build_director_tools(
         include_archived: bool = False,
         config: RunnableConfig = None,
     ) -> str:
-        """Register, bind, unbind, archive, or list the caller's OWN coverage units (sector layer P5).
+        """Register, bind, unbind, archive, or list the caller's OWN coverage units.
 
         Reach for this when the user starts covering a new sector or company: register the
         unit (`action="register"`), then bind one of the user's own non-Home workspaces to it
@@ -1327,7 +1348,7 @@ def build_director_tools(
         ticker: str | None = None,
         config: RunnableConfig = None,
     ) -> str:
-        """Create, update, pause, resume, or list Dalton (`dalton-*`) automations (PK.15).
+        """Create, update, pause, resume, or list Dalton (`dalton-*`) automations.
 
         Args:
             action: "upsert", "pause", "resume", or "list".

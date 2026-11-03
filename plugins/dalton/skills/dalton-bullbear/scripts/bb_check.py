@@ -165,11 +165,13 @@ def check(
             if not lo <= len(children) <= hi:
                 problems.append(f"{slug}: 第二节「{label}」有 {len(children)} 条子 bullet，应为 {lo} 至 {hi} 条")
 
-    # 5. 第三节：每条 debate 五块齐全且均为 bullet
+    # 5. 第三节：2–3 条 debate（禁止硬凑），每条五块齐全且均为 bullet
     sec3 = section(body, "## 三、", "## 四、")
     debates = re.split(r"(?m)^### Debate ", sec3)[1:] if sec3 else []
     if not debates:
         problems.append(f"{slug}: 第三节没有找到 `### Debate ` 小节")
+    elif not 2 <= len(debates) <= 3:
+        problems.append(f"{slug}: 第三节有 {len(debates)} 条 Debate，应为 2 至 3 条（禁止硬凑）")
     for k, deb in enumerate(debates, 1):
         for blk in DEBATE_BLOCKS:
             m = re.search(r"(?m)^(\s*[-*]\s*)?\*\*" + re.escape(blk), deb)

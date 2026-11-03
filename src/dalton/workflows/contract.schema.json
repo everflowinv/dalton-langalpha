@@ -183,6 +183,21 @@
           "type": "boolean",
           "default": false,
           "description": "该产物是本轮必须写出的交付物（唤醒技能的笔记/草稿/predictions.json/last_run.json 等）：无论经模板、显式路径还是 variant 找到，都要求 mtime 落在本轮窗口内。未标注的产物不做本轮窗口判定（合法复用上一轮的文件，如 dalton-publish 审批后的原草稿、workflow resume 复用的文件）。"
+        },
+        "requires_first_of_month": {
+          "type": "string",
+          "minLength": 1,
+          "description": "日期参数名（如 end）：仅当按实际周报历史判断，该期是当月第一期周报（本月在它之前没有已完成的周报）时才要求本产物。"
+        },
+        "requires_period": {
+          "type": "boolean",
+          "default": false,
+          "description": "要求增量文件非空并明确写出本轮覆盖的期间（起止日期 since → until）。"
+        },
+        "requires_scan_dates_status": {
+          "type": "boolean",
+          "default": false,
+          "description": "要求日历扫描 JSONL 文件落盘非空，且每条带日期的记录要么确认（confirmed）、要么标为待确认（pending + estimated/待确认）。"
         }
       }
     },
@@ -549,6 +564,13 @@
               "minLength": 1,
               "description": "门禁未过分支必须写下的门禁结果文件路径模板：{\"passed\": false, \"failed_gates\": [{\"gate\": 1-6, \"reason\": \"…\"}], \"as_of\": \"…\"}，至少一条带原因的失败门禁；门禁通过时写 passed=true。"
             },
+            "knowledge_docs_any": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "门禁未过分支本轮必须更新（至少其一，source=tool）的知识文档（无论 verdict 是否为 NO_CHANGE，均须将降级后的 actionability 与已完成的 underwriting 赔率卡写入 thesis）。"
+            },
             "knowledge_docs_any_unless_no_change": {
               "type": "array",
               "items": {
@@ -557,7 +579,7 @@
               "description": "门禁未过且本轮 verdict 不是 NO_CHANGE 时，这些知识文档（至少其一）须在本轮有 source=tool 新版本——论点变了就要落到知识层。"
             }
           },
-          "description": "门禁两分支（dalton-call）：本轮 gates_file 为 passed=false＝门禁未过，要求 failed_gates 各带原因、本轮有 absent_verdict_kinds_any 之一的 verdict（有本轮对话的 run 标识时按 run_id 严格匹配，取不到该标识时退回时间窗口并在 warnings 里说明），且 verdict 非 NO_CHANGE 时 knowledge_docs_any_unless_no_change 至少其一本轮有更新；passed=true 或本轮没有门禁未过的文件＝门禁通过，要求正式草稿为本轮新写、足量且 check_draft 侧车哈希一致；两支条件都不满足或读取出错＝无法判定，记 missing。"
+          "description": "门禁两分支（dalton-call）：本轮 gates_file 为 passed=false＝门禁未过，要求 failed_gates 各带原因、本轮有 absent_verdict_kinds_any 之一的 verdict（有本轮对话的 run 标识时按 run_id 严格匹配，取不到该标识时退回时间窗口并在 warnings 里说明），且 knowledge_docs_any（及 verdict 非 NO_CHANGE 时的 knowledge_docs_any_unless_no_change）至少其一本轮有更新；passed=true 或本轮没有门禁未过的文件＝门禁通过，要求正式草稿为本轮新写、足量且 check_draft 侧车哈希一致；两支条件都不满足或读取出错＝无法判定，记 missing。"
         }
       },
       "dependentRequired": {

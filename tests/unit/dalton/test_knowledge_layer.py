@@ -2744,3 +2744,1277 @@ def test_apply_update_enforces_server_timestamps_and_clamps_future_as_of() -> No
     assert ind["readings"][1]["as_of"] == write_iso
 
 
+def _sample_thesis_v2_with_underwriting() -> dict[str, Any]:
+    return {
+        "schema_version": 2,
+        "as_of": "2026-10-18T12:00:00Z",
+        "one_liner": "AI 推荐模型持续提升广告单价与转化率，当前估值具备显著安全边际",
+        "aggregate_status": "intact",
+        "house_view_history": [],
+        "pillars": [
+            {
+                "id": "P1",
+                "priority": "core",
+                "status": "intact",
+                "provenance": "approved",
+                "claim": "广告推荐模型驱动单价与转化率持续提升",
+                "baseline": {"text": "3Q26 广告平均单价同比 +11%", "as_of": "2026-10-18"},
+                "expected_path": "FY27 广告单价维持 8%–12% 同比正增长",
+                "thresholds": {
+                    "confirm": [
+                        {
+                            "id": "T1",
+                            "metric": "广告平均单价同比增速",
+                            "operator": ">=",
+                            "value": 8.0,
+                            "unit": "pct",
+                            "period": "4Q26",
+                            "label": "estimate",
+                        }
+                    ],
+                    "warn": [
+                        {
+                            "id": "T2",
+                            "metric": "广告平均单价同比增速",
+                            "operator": "<",
+                            "value": 3.0,
+                            "unit": "pct",
+                            "period": "4Q26",
+                            "label": "estimate",
+                        }
+                    ],
+                    "break": [
+                        {
+                            "id": "T3",
+                            "metric": "广告平均单价同比增速",
+                            "operator": "<",
+                            "value": 0.0,
+                            "unit": "pct",
+                            "period": "FY2027",
+                            "label": "estimate",
+                        }
+                    ],
+                },
+                "created_at": "2026-10-01T09:00:00Z",
+            }
+        ],
+        "evidence": [
+            {
+                "id": "E-20261018-01",
+                "at": "2026-10-18T10:00:00Z",
+                "period": "3Q26",
+                "source": {
+                    "type": "filing",
+                    "identity": "META 3Q26 10-Q",
+                    "tier": 1,
+                    "ref": {"kind": "filing", "form": "10-Q", "accession": "0001326801-26-000045"},
+                },
+                "fact": "3Q26 广告平均单价同比 +11%，展示量同比 +10%",
+                "figures": [
+                    {"metric": "广告平均单价同比", "value": 11.0, "unit": "pct", "period": "3Q26", "label": "reported"}
+                ],
+                "pillar_ids": ["P1"],
+                "signal": "confirming",
+                "quality": "high",
+            },
+            {
+                "id": "E-20261018-02",
+                "at": "2026-10-18T10:30:00Z",
+                "period": "FY2027",
+                "source": {
+                    "type": "consensus",
+                    "identity": "Yahoo Finance 一致预期快照",
+                    "tier": 3,
+                    "ref": {"kind": "url", "url": "https://finance.yahoo.com/quote/META/analysis"},
+                },
+                "fact": "卖方一致预期 FY2027 GAAP 稀释 EPS 为 28.0 美元",
+                "figures": [
+                    {"metric": "FY2027 GAAP 稀释 EPS", "value": 28.0, "unit": "per_share", "period": "FY2027", "label": "consensus"}
+                ],
+                "pillar_ids": ["P1"],
+                "signal": "neutral",
+                "quality": "medium",
+            },
+        ],
+        "market_view": {
+            "summary": "市场担忧 FY27 资本开支挤压自由现金流，给予 21x 远期市盈率",
+            "positioning": "balanced",
+            "positioning_sources": ["E-20261018-02"],
+            "observations": [
+                {
+                    "claim": "卖方一致预期 FY2027 GAAP 稀释 EPS 为 28.0 美元",
+                    "who": "Yahoo Finance 卖方一致预期",
+                    "as_of": "2026-10-18",
+                    "sources": ["E-20261018-02"],
+                    "confidence": "high",
+                }
+            ],
+            "figures": [
+                {
+                    "metric": "FY2027 GAAP 稀释 EPS",
+                    "period": "FY2027",
+                    "value": 28.0,
+                    "unit": "per_share",
+                    "label": "consensus",
+                }
+            ],
+        },
+        "house_view": {
+            "stance": "long",
+            "conviction": "medium",
+            "summary": "核心广告变现与 AI 推荐效率超预期，风险收益偏多",
+            "horizon_months": 12,
+            "actionability": "act_now",
+            "binding_constraint": "none",
+            "flip_conditions": {
+                "upgrade_if": "4Q26 广告收入同比增速 >= 18% 且 FY27 Capex 指引 <= 700 亿美元时加仓并上调至高确信",
+                "downgrade_if": "FY27 资本开支指引上限超过 750 亿美元且广告单价同比 < 3% 时减仓并降为观望",
+            },
+            "updated_at": "2026-10-18T12:00:00Z",
+        },
+        "underwriting": {
+            "scenario_version": 1,
+            "anchor": {
+                "price": 580.0,
+                "currency": "USD",
+                "price_at": "2026-10-18",
+                "source": "closing_price",
+            },
+            "hurdles": {
+                "long_hurdle_annual": 0.15,
+                "short_hurdle_annual": 0.20,
+                "min_total_return": 0.10,
+                "max_adverse_move_act_now": 0.25,
+                "horizon_months": 12,
+            },
+            "states": [
+                {
+                    "name": "bear",
+                    "condition": "广告增速放缓且折旧压制利润率；若广告单价转负则本情景失效",
+                    "debate_ids": ["D1"],
+                    "calc": {
+                        "method": "eps_pe",
+                        "period": "FY2027",
+                        "basis": "GAAP 稀释 EPS",
+                        "eps": {"lo": 24.0, "hi": 25.0},
+                        "multiple": {"lo": 19.0, "hi": 20.0},
+                        "sources": ["E-20261018-01"],
+                    },
+                    "cash_return_per_share": 2.0,
+                },
+                {
+                    "name": "base",
+                    "condition": "广告维持稳健增长，AI 提升转化率；若核心应用时长下滑则下调",
+                    "debate_ids": ["D1"],
+                    "calc": {
+                        "method": "eps_pe",
+                        "period": "FY2027",
+                        "basis": "GAAP 稀释 EPS",
+                        "eps": {"lo": 29.0, "hi": 31.0},
+                        "multiple": {"lo": 22.0, "hi": 23.0},
+                        "sources": ["E-20261018-01"],
+                    },
+                    "cash_return_per_share": 2.5,
+                },
+                {
+                    "name": "bull",
+                    "condition": "AI 商业化加速驱动收入与利润率双升；若监管限制个性化广告则失效",
+                    "debate_ids": ["D1"],
+                    "calc": {
+                        "method": "eps_pe",
+                        "period": "FY2027",
+                        "basis": "GAAP 稀释 EPS",
+                        "eps": {"lo": 33.0, "hi": 35.0},
+                        "multiple": {"lo": 24.0, "hi": 25.0},
+                        "sources": ["E-20261018-01"],
+                    },
+                    "cash_return_per_share": 3.0,
+                },
+            ],
+            "stress": {
+                "condition": "北美广告支出萎缩 10% 且反垄断罚款落地",
+                "calc": {
+                    "method": "eps_pe",
+                    "period": "FY2027",
+                    "basis": "GAAP 稀释 EPS",
+                    "eps": {"lo": 20.0, "hi": 21.0},
+                    "multiple": {"lo": 16.0, "hi": 17.0},
+                    "sources": ["E-20261018-01"],
+                },
+                "needs_financing": "no",
+            },
+            "weight_bounds": {
+                "bear": {"lo": 0.10, "hi": 0.25},
+                "base": {"lo": 0.45, "hi": 0.60},
+                "bull": {"lo": 0.25, "hi": 0.40},
+                "rationale": "过去 8 个季度广告单价与展示量超预期基率",
+                "sources": ["E-20261018-01"],
+            },
+            "protection": {
+                "survival": "净现金充裕，自由现金流为正，无再融资压力",
+                "needs_financing": "no",
+                "value": "核心广告业务 6% 自由现金流收益率与 19x–20x 底部市盈率支撑",
+                "value_range": {"lo": 456.0, "hi": 500.0},
+                "path": "季度财报与广告单价高频跟踪提供路径验证",
+                "failure": "自由现金流转负或核心应用日活连续两季下滑",
+            },
+            "breakeven_verdict": [
+                {
+                    "side": "long",
+                    "b_row": 0.25,
+                    "verdict": "clearly_above",
+                    "debate_ids": ["D1"],
+                    "basis": "base 权重 25% 时需约 40% bull 概率，证据支持明显高于门槛",
+                },
+                {
+                    "side": "long",
+                    "b_row": 0.5,
+                    "verdict": "clearly_above",
+                    "debate_ids": ["D1"],
+                    "basis": "base 权重 50% 时仅需约 32% bull 概率，明显高于门槛",
+                },
+            ],
+        },
+        "official": None,
+    }
+
+
+def _setup_in_memory_knowledge_db(monkeypatch: pytest.MonkeyPatch) -> tuple[dict[str, list[dict[str, Any]]], Any]:
+    from unittest.mock import create_autospec
+
+    from src.dalton.database import knowledge as db_knowledge
+    from src.dalton.database import verdicts as db_verdicts
+    from src.server.database import workspace as ws_db
+
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(
+            ws_db.get_workspace,
+            return_value={"workspace_id": "ws-meta", "user_id": "u-1"},
+        ),
+    )
+
+    store: dict[str, list[dict[str, Any]]] = {}
+    verdict_store: list[dict[str, Any]] = []
+
+    async def fake_latest_version(workspace_id: str, doc_key: str) -> dict[str, Any] | None:
+        rows = store.get(doc_key, [])
+        return rows[-1] if rows else None
+
+    async def fake_latest_valid_version(workspace_id: str, doc_key: str) -> dict[str, Any] | None:
+        rows = [r for r in store.get(doc_key, []) if r.get("schema_valid", True)]
+        return rows[-1] if rows else None
+
+    async def fake_list_all_latest(workspace_id: str, valid_only: bool = False) -> dict[str, dict[str, Any]]:
+        out: dict[str, dict[str, Any]] = {}
+        for k, rows in store.items():
+            filtered = [r for r in rows if r.get("schema_valid", True)] if valid_only else rows
+            if filtered:
+                out[k] = filtered[-1]
+        return out
+
+    mock_insert_version = create_autospec(db_knowledge.insert_version)
+
+    async def _insert_version_impl(
+        *,
+        user_id: str,
+        workspace_id: str,
+        doc_key: str,
+        base_version_no: int | None,
+        content: dict[str, Any],
+        content_sha256: str,
+        ops: list[dict[str, Any]] | None,
+        reason: str,
+        evidence_refs: list[dict[str, Any]] | None = None,
+        source: str = "tool",
+        warnings: list[dict[str, Any]] | None = None,
+        schema_valid: bool = True,
+        edited_path: str | None = None,
+        thread_id: str | None = None,
+        run_id: str | None = None,
+        tool_call_id: str | None = None,
+    ) -> dict[str, Any]:
+        rows = store.setdefault(doc_key, [])
+        v_no = len(rows) + 1
+        row = {
+            "knowledge_version_id": f"kv-{doc_key}-{v_no}",
+            "workspace_id": workspace_id,
+            "doc_key": doc_key,
+            "version_no": v_no,
+            "base_version_no": base_version_no,
+            "content": copy.deepcopy(content),
+            "content_sha256": content_sha256,
+            "ops": ops,
+            "reason": reason,
+            "source": source,
+            "warnings": warnings or [],
+            "schema_valid": schema_valid,
+            "edited_path": edited_path,
+            "files_written_at": None,
+            "created_at": datetime(2026, 10, 18, 12, 0, 0, tzinfo=UTC),
+        }
+        rows.append(row)
+        return row
+
+    mock_insert_version.side_effect = _insert_version_impl
+
+    async def fake_mark_files_written(kv_id: str) -> None:
+        for rows in store.values():
+            for r in rows:
+                if r["knowledge_version_id"] == kv_id:
+                    r["files_written_at"] = datetime.now(UTC)
+
+    async def fake_list_verdicts(workspace_id: str, limit: int = 60) -> list[dict[str, Any]]:
+        return list(reversed(verdict_store))[:limit]
+
+    monkeypatch.setattr(db_knowledge, "latest_version", create_autospec(db_knowledge.latest_version, side_effect=fake_latest_version))
+    monkeypatch.setattr(db_knowledge, "latest_valid_version", create_autospec(db_knowledge.latest_valid_version, side_effect=fake_latest_valid_version))
+    monkeypatch.setattr(db_knowledge, "list_all_latest_for_workspace", create_autospec(db_knowledge.list_all_latest_for_workspace, side_effect=fake_list_all_latest))
+    monkeypatch.setattr(db_knowledge, "insert_version", mock_insert_version)
+    monkeypatch.setattr(db_knowledge, "mark_files_written", create_autospec(db_knowledge.mark_files_written, side_effect=fake_mark_files_written))
+    monkeypatch.setattr(db_verdicts, "list_verdicts", create_autospec(db_verdicts.list_verdicts, side_effect=fake_list_verdicts))
+
+    class MemoryBackend:
+        def __init__(self) -> None:
+            self.files: dict[str, str] = {}
+
+        async def aread_text(self, path: str) -> str | None:
+            return self.files.get(path)
+
+        async def awrite_text(self, path: str, content: str) -> None:
+            self.files[path] = content
+
+    return store, MemoryBackend()
+
+
+@pytest.mark.asyncio
+async def test_knowledge_update_thesis_underwriting_returns_summary_in_dry_run_and_commit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """knowledge_update(doc='thesis') and knowledge_read(doc='thesis'|'all') return the underwriting summary in all states."""
+    from src.dalton.database import knowledge as db_knowledge
+    from src.dalton.knowledge.validate import validate_update
+    from src.dalton.tools.knowledge_tools import create_knowledge_tools
+
+    _store, backend = _setup_in_memory_knowledge_db(monkeypatch)
+    debate_doc = {
+        "schema_version": 2,
+        "as_of": "2026-10-18T12:00:00Z",
+        "debates": [
+            {
+                "id": "D1",
+                "variable": "广告单价同比增速",
+                "question": "AI 推荐模型能否持续推高广告单价",
+                "why_it_matters": "直接决定 FY27 EPS 能否站上 30 美元",
+                "rank": 1,
+                "transmission": "eps_only",
+                "bull": {
+                    "case": "转化率持续提升带动广告单价增长",
+                    "who": "多头买方",
+                    "evidence_ids": ["E-20261018-01"],
+                },
+                "bear": {
+                    "case": "高基数下广告单价增速放缓",
+                    "who": "谨慎派卖方",
+                    "evidence_ids": ["E-20261018-01"],
+                },
+                "strongest_rebuttal": {
+                    "against": "my_view",
+                    "text": "宏观广告预算收缩可能抵消 AI 转化率提升",
+                },
+                "my_view": {
+                    "side": "bull",
+                    "confidence": "medium",
+                    "text": "AI 推荐模型仍在提升广告转化率",
+                },
+                "market_lean": {
+                    "side": "bull",
+                    "evidence": "卖方普遍预期 6% 以上增长",
+                },
+                "flip_condition": {
+                    "text": "连续两个季度广告单价同比增速 < 4%",
+                    "driver_ids": ["K1"],
+                },
+                "linked_pillars": ["P1"],
+                "status": "open",
+                "opened_at": "2026-10-01T09:00:00Z",
+                "last_reviewed_at": "2026-10-18T12:00:00Z",
+                "history": [
+                    {
+                        "at": "2026-10-18T12:00:00Z",
+                        "change": "建立 D1 分歧",
+                        "reason": "初始化",
+                        "evidence_ids": ["E-20261018-01"],
+                    }
+                ],
+            }
+        ],
+    }
+    val_deb = validate_update("debate", None, debate_doc)
+    assert val_deb.ok is True, val_deb.errors
+
+    await db_knowledge.insert_version(
+        user_id="u-1",
+        workspace_id="ws-meta",
+        doc_key="debate",
+        base_version_no=None,
+        content=debate_doc,
+        content_sha256="d1",
+        ops=[],
+        reason="init debate",
+    )
+
+    tools = {t.name: t for t in create_knowledge_tools(filesystem_backend=backend)}
+    update_tool = tools["knowledge_update"]
+    read_tool = tools["knowledge_read"]
+    assert "请务必先传 `dry_run=True` 查看赔率计算摘要" in (update_tool.description or "")
+
+    thesis_doc = _sample_thesis_v2_with_underwriting()
+    val_direct = validate_update("thesis", None, thesis_doc, debate_doc=debate_doc)
+    assert val_direct.ok is True, val_direct.errors
+    assert val_direct.errors == []
+
+    cfg = {
+        "configurable": {
+            "user_id": "u-1",
+            "workspace_id": "ws-meta",
+            "turn_admitted_workspace_id": "ws-meta",
+            "thread_id": "t-1",
+            "run_id": "r-1",
+        }
+    }
+
+    dry_msg = await update_tool.ainvoke(
+        {
+            "name": "knowledge_update",
+            "args": {
+                "doc": "thesis",
+                "ops": [{"op": "create", "value": thesis_doc}],
+                "reason": "预览三情景赔率卡",
+                "base_version": None,
+                "dry_run": True,
+            },
+            "id": "tc-dry-1",
+            "type": "tool_call",
+        },
+        config=cfg,
+    )
+    dry_out = str(dry_msg.content if hasattr(dry_msg, "content") else dry_msg)
+    assert "赔率计算摘要（试写通过，尚未保存｜立场：看多，期限：12 个月，基准股价：580.00" in dry_out
+    assert "三情景价格区间：bear [456.00, 500.00]" in dry_out
+    assert "看多达标终值：667.00" in dry_out
+    assert "盈亏平衡所需概率（测试权重，不是主观预测）：看多：base 权重占 25% 时需 bull" in dry_out
+    assert "全部权重组合是否都过最低回报要求：看多通过：是 / 看空通过：否（共检查 6 组极端权重组合）" in dry_out
+    assert "最不利情景（bear 区间下沿，含现金回报）相对基准股价的跌幅：" in dry_out
+    assert "估值倍数变动占目标回报比例：" in dry_out
+
+    short_thesis_doc = copy.deepcopy(thesis_doc)
+    short_thesis_doc["house_view"]["stance"] = "short"
+    short_thesis_doc["house_view"]["actionability"] = "wait_price"
+    short_thesis_doc["house_view"]["binding_constraint"] = "price"
+    short_thesis_doc["house_view"]["binding_constraint_text"] = "等待反弹至做空建仓区间"
+    short_thesis_doc["house_view"]["entry_band"] = {"lo": 620.0, "hi": 650.0, "unit": "USD"}
+    short_dry_msg = await update_tool.ainvoke(
+        {
+            "name": "knowledge_update",
+            "args": {
+                "doc": "thesis",
+                "ops": [{"op": "create", "value": short_thesis_doc}],
+                "reason": "预览空头三情景赔率卡",
+                "base_version": None,
+                "dry_run": True,
+            },
+            "id": "tc-dry-short",
+            "type": "tool_call",
+        },
+        config=cfg,
+    )
+    short_dry_out = str(
+        short_dry_msg.content if hasattr(short_dry_msg, "content") else short_dry_msg
+    )
+    assert "最不利情景（bull 区间上沿）相对基准股价的涨幅：" in short_dry_out
+
+    neutral_thesis_doc = copy.deepcopy(thesis_doc)
+    neutral_thesis_doc["house_view"]["stance"] = "neutral"
+    neutral_thesis_doc["house_view"]["actionability"] = "wait_evidence"
+    neutral_thesis_doc["house_view"]["binding_constraint"] = "evidence"
+    neutral_thesis_doc["house_view"]["binding_constraint_text"] = "等待下一季验证"
+    neutral_thesis_doc["house_view"]["trigger_refs"] = ["V-001"]
+    neutral_dry_msg = await update_tool.ainvoke(
+        {
+            "name": "knowledge_update",
+            "args": {
+                "doc": "thesis",
+                "ops": [{"op": "create", "value": neutral_thesis_doc}],
+                "reason": "预览中性立场三情景赔率卡",
+                "base_version": None,
+                "dry_run": True,
+            },
+            "id": "tc-dry-neutral",
+            "type": "tool_call",
+        },
+        config=cfg,
+    )
+    neutral_dry_out = str(
+        neutral_dry_msg.content
+        if hasattr(neutral_dry_msg, "content")
+        else neutral_dry_msg
+    )
+    assert "最不利情景不利变动：中性或暂不表态时不计算" in neutral_dry_out
+
+    commit_msg = await update_tool.ainvoke(
+        {
+            "name": "knowledge_update",
+            "args": {
+                "doc": "thesis",
+                "ops": [{"op": "create", "value": thesis_doc}],
+                "reason": "正式写入三情景赔率卡",
+                "base_version": None,
+                "dry_run": False,
+            },
+            "id": "tc-commit-1",
+            "type": "tool_call",
+        },
+        config=cfg,
+    )
+    commit_out = str(commit_msg.content if hasattr(commit_msg, "content") else commit_msg)
+    assert "赔率计算摘要（已保存，版本 1｜立场：看多，期限：12 个月，基准股价：580.00" in commit_out
+    assert "三情景价格区间：bear [456.00, 500.00]" in commit_out
+    assert "全部权重组合是否都过最低回报要求：看多通过：是" in commit_out
+
+    # knowledge_read(doc="thesis") and knowledge_read(doc="all") attach underwriting_summary
+    read_single = await read_tool.ainvoke(
+        {
+            "name": "knowledge_read",
+            "args": {"doc": "thesis"},
+            "id": "tc-read-1",
+            "type": "tool_call",
+        },
+        config=cfg,
+    )
+    read_single_json = json.loads(str(read_single.content if hasattr(read_single, "content") else read_single))
+    assert "underwriting_summary" in read_single_json
+    assert "赔率计算摘要（已保存，版本 1｜立场：看多" in read_single_json["underwriting_summary"]
+    assert "三情景价格区间：bear [456.00, 500.00] (中点 478.00, 含现金终值 480.00)｜base [638.00, 713.00]" in read_single_json["underwriting_summary"]
+
+    read_all = await read_tool.ainvoke(
+        {
+            "name": "knowledge_read",
+            "args": {"doc": "all"},
+            "id": "tc-read-all",
+            "type": "tool_call",
+        },
+        config=cfg,
+    )
+    read_all_json = json.loads(str(read_all.content if hasattr(read_all, "content") else read_all))
+    assert "underwriting_summary" in read_all_json["documents"]["thesis"]
+    assert "三情景价格区间：bear [456.00, 500.00]" in read_all_json["documents"]["thesis"]["underwriting_summary"]
+
+    # When validation / scenario_math fails, first line clearly warns that it was not saved and lists errors first
+    bad_thesis = copy.deepcopy(thesis_doc)
+    bad_thesis["underwriting"]["states"][0]["calc"]["eps"] = {"lo": 36.0, "hi": 38.0}
+    fail_msg = await update_tool.ainvoke(
+        {
+            "name": "knowledge_update",
+            "args": {
+                "doc": "thesis",
+                "ops": [{"op": "create", "value": bad_thesis}],
+                "reason": "测试错误状态摘要",
+                "base_version": 1,
+                "dry_run": True,
+            },
+            "id": "tc-fail-1",
+            "type": "tool_call",
+        },
+        config=cfg,
+    )
+    fail_out = str(fail_msg.content if hasattr(fail_msg, "content") else fail_msg)
+    assert "赔率计算摘要（这一版没有保存成功（或计算有错误），下面的数字不能写进正文｜" in fail_out
+    assert "\n- 错误：" in fail_out
+
+
+@pytest.mark.asyncio
+async def test_apply_update_initial_direct_edit_thesis_validates_models_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """First-time import of preset data/thesis.json loads models context ({} when absent) so unregistered model refs are marked schema_valid=False."""
+    from src.dalton.database import knowledge as db_knowledge
+    from src.dalton.knowledge import service
+
+    _store, backend = _setup_in_memory_knowledge_db(monkeypatch)
+
+    preset_thesis = _sample_thesis_v2_with_underwriting()
+    preset_thesis["underwriting"]["states"][1]["calc"] = {
+        "method": "reference",
+        "price_range": {"lo": 638.0, "hi": 713.0},
+        "ref": "model/UNREGISTERED-v01.xlsx#DCF!G18",
+    }
+    backend.files["data/thesis.json"] = json.dumps(preset_thesis, ensure_ascii=False)
+
+    res = await service.apply_update(
+        user_id="u-1",
+        workspace_id="ws-meta",
+        doc_key="thesis",
+        ops=[{"op": "set", "path": "/house_view/summary", "value": "尝试在预置文件基础上修改"}],
+        reason="test initial direct_edit validation",
+        base_version=None,
+        source="tool",
+        backend=backend,
+        skip_access_check=True,
+    )
+    # Initial file was imported as v1 (direct_edit), so base_version=None triggers base_version_mismatch,
+    # and the imported v1 row must be marked schema_valid=False with unresolvable_reference_ref in warnings.
+    assert res["ok"] is False
+    v1_row = await db_knowledge.latest_version("ws-meta", "thesis")
+    assert v1_row is not None
+    assert v1_row["version_no"] == 1
+    assert v1_row["source"] == "direct_edit"
+    assert v1_row["schema_valid"] is False
+    assert any(w.get("code") == "unresolvable_reference_ref" for w in (v1_row.get("warnings") or []))
+
+
+def test_structured_write_example_md_validates_without_repair() -> None:
+    """Extract JSON blocks from structured-write-example.md and validate directly via validate_update (without server-side field rename repair)."""
+    import re
+    from pathlib import Path
+    from src.dalton.knowledge.validate import validate_update
+
+    repo_root = Path(__file__).resolve().parents[3]
+    example_md = (
+        repo_root
+        / "plugins/dalton/skills/dalton-knowledge/references/structured-write-example.md"
+    )
+    text = example_md.read_text(encoding="utf-8")
+    blocks = re.findall(r"```json\s*\n(.*?)\n```", text, flags=re.DOTALL)
+    assert len(blocks) == 4, f"Expected 4 JSON blocks in structured-write-example.md, got {len(blocks)}"
+
+    models_doc, agenda_doc, debate_doc, thesis_doc = [json.loads(b) for b in blocks]
+
+    val_models = validate_update("models", None, models_doc)
+    assert val_models.ok is True, val_models.errors
+    assert val_models.errors == []
+
+    val_agenda = validate_update("agenda", None, agenda_doc)
+    assert val_agenda.ok is True, val_agenda.errors
+    assert val_agenda.errors == []
+
+    val_debate = validate_update("debate", None, debate_doc)
+    assert val_debate.ok is True, val_debate.errors
+    assert val_debate.errors == []
+
+    val_thesis = validate_update(
+        "thesis",
+        None,
+        thesis_doc,
+        debate_doc=debate_doc,
+        agenda_doc=agenda_doc,
+        models_doc=models_doc,
+    )
+    assert val_thesis.ok is True, val_thesis.errors
+    assert val_thesis.errors == []
+
+    # Also verify _sample_thesis_v2_with_underwriting() passes validate_update directly with 0 errors
+    sample_thesis = _sample_thesis_v2_with_underwriting()
+    val_sample = validate_update(
+        "thesis",
+        None,
+        sample_thesis,
+        debate_doc=debate_doc,
+        agenda_doc=agenda_doc,
+        models_doc=models_doc,
+    )
+    assert val_sample.ok is True, val_sample.errors
+    assert val_sample.errors == []
+
+
+def test_b4b_skill_prompts_field_paths_and_enums_match_schemas() -> None:
+    """Hierarchically resolve dotted field paths and per-field enum values in all 16 batch-4b skill files against src/dalton/knowledge/schemas/*.schema.json.
+
+    Known scope: fenced code blocks (```...```) are excluded from this inline-backtick scanner;
+    complete JSON examples inside fenced blocks are validated directly by
+    ``test_structured_write_example_md_validates_without_repair`` via ``validate_update``.
+    """
+    import re
+    from pathlib import Path
+
+    repo_root = Path(__file__).resolve().parents[3]
+    schemas_dir = repo_root / "src/dalton/knowledge/schemas"
+    schemas: dict[str, dict[str, Any]] = {}
+    for p in sorted(schemas_dir.glob("*.schema.json")):
+        key = p.name.removesuffix(".schema.json")
+        schemas[key] = json.loads(p.read_text(encoding="utf-8"))
+
+    doc_roots = (
+        "thesis",
+        "debate",
+        "agenda",
+        "drivers",
+        "models",
+        "management",
+        "company",
+        "lessons",
+        "sector",
+        "verdict",
+    )
+
+    def _deref(doc_key: str, node: Any) -> list[tuple[str, dict[str, Any]]]:
+        """Dereference $ref, combinators, and array items while preserving each node's owning schema file key."""
+        if not isinstance(node, dict):
+            return []
+        out: list[tuple[str, dict[str, Any]]] = [(doc_key, node)]
+        ref = node.get("$ref")
+        if isinstance(ref, str):
+            if ref.startswith("#/$defs/"):
+                target_key = ref.removeprefix("#/$defs/")
+                target = (schemas[doc_key].get("$defs") or {}).get(target_key)
+                if target:
+                    out.extend(_deref(doc_key, target))
+            elif ref.startswith("common#/$defs/"):
+                target_key = ref.removeprefix("common#/$defs/")
+                target = (schemas["common"].get("$defs") or {}).get(target_key)
+                if target:
+                    out.extend(_deref("common", target))
+        for comb in ("oneOf", "anyOf", "allOf"):
+            for sub in node.get(comb) or []:
+                out.extend(_deref(doc_key, sub))
+        if "items" in node and isinstance(node["items"], dict):
+            out.extend(_deref(doc_key, node["items"]))
+        return out
+
+    def _step_prop(
+        doc_key: str, node: dict[str, Any], prop: str
+    ) -> list[tuple[str, dict[str, Any]]]:
+        res: list[tuple[str, dict[str, Any]]] = []
+        for cur_dk, n in _deref(doc_key, node):
+            props = n.get("properties")
+            if isinstance(props, dict) and prop in props:
+                res.append((cur_dk, props[prop]))
+            elif (
+                n.get("type") == "object"
+                and "properties" not in n
+                and n.get("additionalProperties") is not False
+                and prop in ("date", "at", "due")
+            ):
+                # agenda.wake_conditions[].params is an open object where kind="date" stores date/at/due
+                res.append((cur_dk, {"type": "string"}))
+        return res
+
+    all_named_nodes: list[tuple[str, str, dict[str, Any]]] = []
+    prop_names: set[str] = set()
+    enum_strings: set[str] = set()
+
+    def _collect_all_props(
+        doc_key: str, node: Any, seen: set[tuple[str, int]] | None = None
+    ) -> None:
+        if seen is None:
+            seen = set()
+        key_id = (doc_key, id(node))
+        if key_id in seen or not isinstance(node, dict):
+            return
+        seen.add(key_id)
+        props = node.get("properties")
+        if isinstance(props, dict):
+            for k, v in props.items():
+                prop_names.add(k)
+                if isinstance(v, dict):
+                    all_named_nodes.append((doc_key, k, v))
+                _collect_all_props(doc_key, v, seen)
+        enums = node.get("enum")
+        if isinstance(enums, list):
+            for item in enums:
+                if item is not None:
+                    enum_strings.add(str(item))
+        const_val = node.get("const")
+        if const_val is not None:
+            enum_strings.add(str(const_val))
+        for v in node.values():
+            if isinstance(v, dict):
+                _collect_all_props(doc_key, v, seen)
+            elif isinstance(v, list):
+                for item in v:
+                    if isinstance(item, dict):
+                        _collect_all_props(doc_key, item, seen)
+
+    for dk in doc_roots:
+        if dk in schemas:
+            _collect_all_props(dk, schemas[dk])
+    _collect_all_props("common", schemas["common"])
+
+    def _resolve_path(
+        path_str: str, *, allow_doc_root_singleton: bool = True
+    ) -> list[tuple[str, dict[str, Any]]]:
+        segs = [s.removesuffix("[]") for s in path_str.split(".")]
+        # Strip knowledge_read response wrapper key `content.` so `content.house_view.entry_band` still resolves hierarchically
+        if segs and segs[0] == "content" and len(segs) > 1:
+            segs = segs[1:]
+        if not segs:
+            return []
+        if segs[0] in doc_roots and (len(segs) > 1 or allow_doc_root_singleton):
+            dk = segs[0]
+            if len(segs) == 1:
+                return [(dk, schemas[dk])]
+            candidates: list[tuple[str, dict[str, Any]]] = [(dk, schemas[dk])]
+            rem = segs[1:]
+        else:
+            candidates = [(dk, v) for dk, k, v in all_named_nodes if k == segs[0]]
+            rem = segs[1:]
+        for seg in rem:
+            nxt: list[tuple[str, dict[str, Any]]] = []
+            for dk, node in candidates:
+                nxt.extend(_step_prop(dk, node, seg))
+            candidates = nxt
+            if not candidates:
+                break
+        return candidates
+
+    def _get_field_enums(candidates: list[tuple[str, dict[str, Any]]]) -> set[str]:
+        enums: set[str] = set()
+        for dk, node in candidates:
+            for _, n in _deref(dk, node):
+                if "enum" in n and isinstance(n["enum"], list):
+                    for e in n["enum"]:
+                        if e is not None:
+                            enums.add(str(e))
+                if "const" in n and n["const"] is not None:
+                    enums.add(str(n["const"]))
+                if n.get("type") == "boolean" or (
+                    isinstance(n.get("type"), list) and "boolean" in n["type"]
+                ):
+                    enums.update({"true", "false", "True", "False"})
+        return enums
+
+    # Explicit mapping for bare field names used in assignments (`field="val"` / `field: val`) or prose enum lists
+    # that appear in multiple schema locations (or shadow a doc root name like `verdict`):
+    default_bare_field_to_schema_path: dict[str, str] = {
+        "verdict": "verdict.verdict",  # knowledge_append_verdict 的五词结论枚举（verdict.schema.json）
+        "kind": "agenda.wake_conditions[].kind",  # agenda 唤醒条件 wake_conditions[].kind 枚举（agenda.schema.json）
+        "method": "thesis.underwriting.states[].calc.method",  # 三情景估值计算方法枚举（thesis.schema.json）
+        "side": "thesis.underwriting.breakeven_verdict[].side",  # 胜率裁决方向枚举（thesis.schema.json）
+        "schema_version": "thesis.schema_version",  # 知识文档 schema_version 枚举（1 | 2）
+        "progress": "verdict.progress",  # knowledge_append_verdict 的议程进展枚举（verdict.schema.json）
+        "unit": "thesis.evidence[].figures[].unit",  # 证据数值条目单位枚举（common.schema.json#/$defs/unit）
+        "label": "thesis.evidence[].figures[].label",  # 证据数值条目标签枚举（common.schema.json#/$defs/label）
+    }
+
+    # Explicit allowed value sets for bare tool/script parameters used in `param=val` / `param: val` expressions
+    # (none of these names exist in any knowledge schema):
+    bare_tool_arg_allowed_values: dict[str, set[str]] = {
+        "doc": {"thesis", "debate", "agenda", "drivers", "models", "management", "company", "lessons", "sector", "all"},  # knowledge_read / knowledge_update 的 doc 参数
+        "dry_run": {"true", "false", "True", "False"},  # knowledge_update 的 dry_run 布尔参数
+        "done": {"true", "false", "True", "False"},  # dalton_check_done 返回的 done 布尔字段
+        "passed": {"true", "false", "True", "False"},  # research/<as_of>-call.gates.json 的 passed 布尔字段
+        "ok": {"true", "false", "True", "False"},  # 采集脚本与桥接响应的 ok 布尔状态字段
+        "complete": {"true", "false", "True", "False"},  # AlphaEngine 分页响应的 complete 布尔字段
+        "completed": {"true", "false", "True", "False"},  # collect.py 来源状态的 completed 布尔字段
+        "incomplete": {"true", "false", "True", "False"},  # collect.py 来源状态的 incomplete 布尔字段
+        "has_more": {"true", "false", "True", "False"},  # 分页响应与 collect.py 的 has_more 布尔字段
+        "all_sources_ok": {"true", "false", "True", "False"},  # collect.py 汇总 JSON 的 all_sources_ok 布尔字段
+        "short_circuit_eligible": {"true", "false", "True", "False"},  # collect.py 汇总 JSON 的 short_circuit_eligible 布尔字段
+        "material": {"yes", "no"},  # collect.py commit --material 与增量重要度判定枚举
+        "stale": {"true", "false", "True", "False"},  # 周度复盘与研究库陈旧标记布尔字段
+        "call_candidate": {"true", "false", "True", "False"},  # 周度复盘候选标记布尔字段
+        "description_verified": {"true", "false", "True", "False"},  # dalton-earnings-preview 校验脚本布尔字段
+        "operation": {"ask", "filings", "get_document", "get_recording_status", "get_recording_task", "list_recording_tasks", "read", "search_library"},  # researchdata 桥接调用的 operation 参数
+        "route": {"cn-hk", "funda-ai", "tmtb", "alphaengine", "guidepoint", "sales-notes", "company-wiki"},  # researchdata 桥接调用的 route 参数
+        "sort": {"newest", "relevance"},  # researchdata 检索排序参数
+        "search_in": {"title", "content", "all"},  # researchdata 检索范围参数
+        "meeting_scope": {"personal", "institution", "all"},  # AlphaEngine 会议检索范围参数
+        "document_code": {"summary"},  # researchdata 摘要文档类型参数
+        "as_of_basis": {"unknown"},  # researchdata 日期基准回退标记
+        "layer": {"digest"},  # researchdata 内容层级标记
+        "independent": {"true", "false", "True", "False"},  # 证据独立性核验布尔字段
+        "body_locked": {"true", "false", "True", "False"},  # 研报正文权限锁定布尔字段
+        "listing_currency": {"HKD", "USD", "CNY"},  # 跨币种换算示例中的挂牌币种参数
+        "financial_currency": {"HKD", "USD", "CNY"},  # 跨币种换算示例中的财报币种参数
+        "publisher": {"OpenClaw"},  # 派生来源示例中的发布方标识
+        "round": {"2"},  # 多轮取证轮次示例参数
+        "scan_only_stale": {"true", "false", "True", "False"},  # dalton_coverage_board 返回的仅扫描未重估布尔字段
+        "delegatable": {"true", "false", "True", "False"},  # dalton_coverage_board units 可委派布尔字段
+        "include_archived": {"true", "false", "True", "False"},  # dalton_coverage_unit list 含归档布尔参数
+        "window_advanced": {"true", "false", "True", "False"},  # collect_sector.py 窗口推进布尔字段
+        "recorded": {"true", "false", "True", "False"},  # calendar_state.py check 返回的已记录布尔字段
+        "date_changed": {"true", "false", "True", "False"},  # calendar_state.py check 返回的改期布尔字段
+        "resolved_count": {"0"},  # dalton_resolve_signals 返回的关闭信号计数
+    }
+
+    # Non-schema identifiers that legitimately appear in backticks in the 12 schema-focused skill files,
+    # each with its explicit reason (no stale or unused keys):
+    non_schema_allowlist: dict[str, str] = {
+        # LangChain / Dalton tools & parameters
+        "knowledge_read": "LangChain tool name",
+        "knowledge_update": "LangChain tool name",
+        "knowledge_append_verdict": "LangChain tool name",
+        "dalton_check_done": "LangChain tool name",
+        "check_draft": "LangChain tool name",
+        "check_language": "LangChain tool name",
+        "publish_report": "LangChain tool name",
+        "execute_code": "LangChain tool name",
+        "web_search": "LangChain tool name",
+        "base_version": "knowledge_update tool parameter",
+        "dry_run": "knowledge_update tool parameter",
+        "agenda_ops": "knowledge_append_verdict tool parameter",
+        "latest_version_no": "knowledge_read response field",
+        "underwriting_summary": "knowledge_update / knowledge_read response field",
+        # Error codes & database table names documented in dalton-knowledge/SKILL.md
+        "append_only_violation": "validate.py error code",
+        "official_is_publish_only": "validate.py error code",
+        "target_needs_model_cell": "validate.py error code",
+        "model_needs_model_cell": "validate.py error code",
+        "model_tier_1_forbidden": "validate.py error code",
+        "dalton_knowledge_versions": "Postgres table name",
+        "dalton_sector_members": "Postgres table name",
+        "dalton_verdicts": "Postgres table name",
+        # Mandate setting in scenario_math.py
+        "max_entry_distance": "DaltonMandateSettings parameter in scenario_math.py",
+        # Call gate result file (.gates.json) & review.json / .progress.json fields
+        "failed_gates": "research/<as_of>-call.gates.json field",
+        "actionability_after": "research/<as_of>-call.gates.json v1 downgrade record field",
+        "run_id": ".progress.json / tracker run identifier",
+        "resume_hint": ".progress.json field",
+        "must_fix": "review.json field",
+        "nice_to_have": "review.json field",
+        "draft_sha256": "review.json field",
+        "bb_check": "dalton-bullbear mechanical check script name",
+        # External MCP / researchdata bridge & collect.py fields
+        "dalton_sec": "SEC filing MCP server prefix",
+        "get_earnings_history": "yfinance MCP tool operation",
+        "get_options_chain": "yfinance MCP tool operation",
+        "get_options_snapshot": "yfinance MCP tool operation",
+        "street_estimate": "consensus snapshot field",
+        "end_date": "MCP query date parameter",
+        "to_date": "MCP query date parameter",
+        "doc_id": "AlphaEngine document parameter",
+        "type_ids": "AlphaEngine filter parameter",
+        "foreign_report": "AlphaEngine document type",
+        "message_id": "tmtb document parameter",
+        "next_offset": "AlphaEngine pagination field",
+        "content_field": "AlphaEngine get_document parameter",
+        "content_sha256": "AlphaEngine get_document response field",
+        "available_content_fields": "AlphaEngine get_document response field",
+        "original_text": "AlphaEngine content_field value",
+        "digest_cn": "AlphaEngine content_field value",
+        "main_point": "AlphaEngine content_field value",
+        "question_answer": "AlphaEngine content_field value",
+        "get_document": "AlphaEngine researchdata operation",
+        "search_library": "Guidepoint researchdata operation",
+        "eps_per_1pct_revenue": "bullbear sensitivity table key",
+        "eps_per_10bn_expense": "bullbear sensitivity table key",
+        "implied_total_expenses_bn": "bullbear sensitivity table key",
+        "all_sources_ok": "collect.py summary JSON field",
+        "failed_sources": "collect.py summary JSON field",
+        "internal_status": "collect.py summary JSON field",
+        "short_circuit_eligible": "collect.py summary JSON field",
+        "auto_flags": "collect.py summary JSON field",
+        "packet_json": "collect.py summary JSON field",
+        "period_alignment": "collect.py consensus delta field",
+        "period_end": "collect.py consensus delta field",
+        "no_period_info": "collect.py period_alignment value",
+        "prev_key": "collect.py consensus delta field",
+        "delta_note": "dalton_check_done parameter for dalton-thesis-delta",
+        "researchdata_transport_unconfigured": "collect.py transport error status token",
+    }
+
+    # Dotted prefixes that belong to config.yaml, MCP tool calls, or external script JSON (not knowledge schemas)
+    non_schema_dotted_prefixes = (
+        "coverage_units.enabled",
+        "workflow.enabled",
+        "fundamentals.get_historical_valuation",
+        "dalton_sec.list_filings",
+        "x_api.search_posts",
+        "_sources.identity",
+        "plan.source",
+        "metadata.doc_id",
+        "params.query",
+        "params.industry_names",
+        "params.cursor",
+        "params.content_field",
+        "tools.researchdata",
+        "counts.internal",
+        "counts.alphaengine",
+        "counts.sec",
+        "consensus.price",
+        "coverage.complete",
+        "coverage.continuation_params",
+        "hashlib.sha256",
+        "budget.allocatable_usd",
+        "units[].members",
+        "last_run.until",
+        "workspace.status",
+        "earnings.ir_url",
+        "json.dumps",
+        "json.loads",
+        "state.next_run_at",
+    )
+
+    banned_tokens = {
+        "eps_band",
+        "multiple_band",
+        "price_band",
+        "derivation",
+        "cash_yield",
+        "mandate_snapshot",
+        "upgrade_or_add",
+        "downgrade_or_trim",
+        "multiple_regime_realized_in_cashflow",
+        "multiple_regime_evidence_ids",
+        "squeeze_scenario",
+        "indeterminate",
+        "scenario_irr",
+        "src.dalton.knowledge.scenario_math",
+    }
+
+    dotted_field_re = re.compile(
+        r"^[a-z_][a-z0-9_]*(\[\])?(\.[a-z_][a-z0-9_]*(\[\])?)+$"
+    )
+    # Require `==`, `=`, or `:` followed by whitespace or quotes so URI schemes like `evidence:E-...` or `site:hkexnews.hk` are not treated as assignments
+    assign_re = re.compile(
+        r"^([a-z_][a-z0-9_.\[\]]*)\s*(?:==|=|:\s+|:\s*(?=[\"']))\s*[\"']?([A-Za-z0-9_.-]+)[\"']?$"
+    )
+    prose_enum_re = re.compile(
+        r"`([a-z_][a-z0-9_.\[\]]*)`(?:\s*[（(〔][^`）)〕]{0,12}?|\s*(?:为|取|限|只能是|必须是|不是|设为|填)\s*)(`[^`\n]+`(?:\s*(?:/|、|或|\|)\s*`[^`\n]+`)+)"
+    )
+    snake_token_re = re.compile(r"^[a-z][a-z0-9_]*_[a-z0-9_]+$")
+
+    v2_schema_focused_files = {
+        "plugins/dalton/skills/dalton-knowledge/SKILL.md",
+        "plugins/dalton/skills/dalton-knowledge/references/structured-write-example.md",
+        "plugins/dalton/skills/dalton-conventions/references/risk-reward.md",
+        "plugins/dalton/skills/dalton-conventions/references/nonlinear.md",
+        "plugins/dalton/skills/dalton-bullbear/SKILL.md",
+        "plugins/dalton/skills/dalton-call/SKILL.md",
+        "plugins/dalton/skills/dalton-call/references/evidence-gate.md",
+        "plugins/dalton/skills/dalton-call/references/sizing.md",
+        "plugins/dalton/skills/dalton-call/templates/call.md",
+        "plugins/dalton/skills/dalton-earnings-preview/SKILL.md",
+        "plugins/dalton/skills/dalton-earnings-flash/templates/flash.md",
+        "plugins/dalton/skills/dalton-thesis-delta/SKILL.md",
+    }
+
+    def _resolve_field_for_enum_check(
+        lhs: str,
+        bare_map: dict[str, str],
+    ) -> tuple[list[tuple[str, dict[str, Any]]], set[str] | None, str | None]:
+        """Resolve `lhs` (dotted or bare) to `(schema_candidates, tool_arg_allowed, error_reason)`."""
+        clean_lhs = lhs.removesuffix("[]")
+        if dotted_field_re.match(lhs):
+            if any(
+                lhs == p or lhs.startswith(p + ".")
+                for p in non_schema_dotted_prefixes
+            ):
+                return [], set(), None
+            cands = _resolve_path(lhs, allow_doc_root_singleton=False)
+            if not cands:
+                return [], None, f"unresolved field path {lhs!r}"
+            return cands, None, None
+
+        # Bare field name: doc root names with assignments are treated as fields, never doc roots
+        if clean_lhs in bare_map:
+            mapped_path = bare_map[clean_lhs]
+            cands = _resolve_path(mapped_path, allow_doc_root_singleton=False)
+            if not cands:
+                return [], None, f"mapped path {mapped_path!r} for bare field {lhs!r} did not resolve"
+            return cands, None, None
+
+        if clean_lhs in bare_tool_arg_allowed_values:
+            return [], bare_tool_arg_allowed_values[clean_lhs], None
+
+        matches = [(dk, v) for dk, k, v in all_named_nodes if k == clean_lhs]
+        if len(matches) == 0:
+            return [], None, f"unknown bare field {lhs!r} (not in schemas or explicit bare-field table)"
+        if len(matches) > 1:
+            return (
+                [],
+                None,
+                f"ambiguous bare field {lhs!r} appears in {len(matches)} schema locations; use full path or add to bare_field_to_schema_path",
+            )
+        return matches, None, None
+
+    def _scan_text(
+        rel_path: str,
+        content: str,
+        *,
+        check_single_snake: bool = True,
+        bare_map: dict[str, str] | None = None,
+    ) -> list[str]:
+        eff_bare_map = bare_map if bare_map is not None else default_bare_field_to_schema_path
+        problems: list[str] = []
+        for banned in banned_tokens:
+            if banned in content:
+                problems.append(f"{rel_path}: banned token {banned!r}")
+
+        no_fences = re.sub(r"```.*?```", "", content, flags=re.DOTALL)
+
+        # 1) Check prose enum lists like `b_row`（`0.25` / `0.5` / `both`）
+        for pm in prose_enum_re.finditer(no_fences):
+            field, raw_list = pm.group(1), pm.group(2)
+            cands, tool_allowed, _err = _resolve_field_for_enum_check(field, eff_bare_map)
+            if tool_allowed is not None:
+                allowed = tool_allowed
+            elif cands:
+                allowed = _get_field_enums(cands)
+            else:
+                continue
+            if not allowed:
+                continue
+            for val in [v.strip("\"'") for v in re.findall(r"`([^`\n]+)`", raw_list)]:
+                if val not in allowed:
+                    problems.append(
+                        f"{rel_path}: field {field!r} enum value {val!r} not in {sorted(allowed)}"
+                    )
+
+        # 2) Check backticked paths, `field="val"` / `field: val` assignments, and single snake_case tokens
+        for raw_token in re.findall(r"`([^`\n]+)`", no_fences):
+            token = raw_token.strip()
+            if token.endswith((".md", ".json", ".log", ".py", ".xlsx", ".yaml", ".sh")):
+                continue
+
+            am = assign_re.match(token)
+            if am:
+                lhs, rhs = am.group(1), am.group(2)
+                cands, tool_allowed, err = _resolve_field_for_enum_check(lhs, eff_bare_map)
+                if err:
+                    problems.append(f"{rel_path}: {err} in {token!r}")
+                    continue
+                if tool_allowed is not None:
+                    if tool_allowed and rhs not in tool_allowed:
+                        problems.append(
+                            f"{rel_path}: invalid value in {token!r} (allowed for {lhs!r}: {sorted(tool_allowed)})"
+                        )
+                    continue
+                allowed = _get_field_enums(cands)
+                if allowed and rhs not in allowed:
+                    problems.append(
+                        f"{rel_path}: invalid enum assignment {token!r} (allowed for {lhs!r}: {sorted(allowed)})"
+                    )
+                continue
+
+            if dotted_field_re.match(token):
+                if any(
+                    token == p or token.startswith(p + ".")
+                    for p in non_schema_dotted_prefixes
+                ):
+                    continue
+                if not _resolve_path(token):
+                    problems.append(f"{rel_path}: unresolved dotted field path {token!r}")
+            elif check_single_snake and snake_token_re.match(token.removesuffix("[]")):
+                clean = token.removesuffix("[]")
+                if (
+                    clean not in prop_names
+                    and clean not in enum_strings
+                    and clean not in doc_roots
+                    and clean not in non_schema_allowlist
+                ):
+                    problems.append(f"{rel_path}: unknown snake_case identifier {token!r}")
+        return problems
+
+    # Negative self-checks (Items 1 & 2): all must be flagged as failures
+    neg_checks: list[tuple[str, list[str]]] = [
+        (
+            "underwriting.anchor.as_of",
+            _scan_text("negative-self-check", "锚点时间写在 `underwriting.anchor.as_of`"),
+        ),
+        (
+            'house_view.stance="clearly_above"',
+            _scan_text("negative-self-check", '方向填 `house_view.stance="clearly_above"`'),
+        ),
+        (
+            'house_view.stance: "clearly_above"',
+            _scan_text("negative-self-check", '方向填 `house_view.stance: "clearly_above"`'),
+        ),
+        (
+            'thesis.evidence[].figures[].label="market_color"',
+            _scan_text(
+                "negative-self-check",
+                '数值标签填 `thesis.evidence[].figures[].label="market_color"`',
+            ),
+        ),
+        (
+            'thesis.evidence[].figures[].unit="made_up"',
+            _scan_text(
+                "negative-self-check",
+                '单位填 `thesis.evidence[].figures[].unit="made_up"` 或 `unit="made_up"`',
+            ),
+        ),
+        (
+            'verdict="clearly_above"',
+            _scan_text("negative-self-check", '五词结论填 `verdict="clearly_above"`'),
+        ),
+        (
+            'verdict="THESIS_BROKEN" (against breakeven_verdict[].verdict)',
+            _scan_text(
+                "negative-self-check",
+                '胜率裁决填 `verdict="THESIS_BROKEN"`',
+                bare_map={
+                    **default_bare_field_to_schema_path,
+                    "verdict": "thesis.underwriting.breakeven_verdict[].verdict",
+                },
+            ),
+        ),
+        (
+            'kind="volume" (in agenda wake_conditions context)',
+            _scan_text("negative-self-check", '唤醒条件填 `kind="volume"`'),
+        ),
+        (
+            'status="open" (ambiguous bare field not in table)',
+            _scan_text("negative-self-check", '裸字段未列路径 `status="open"`'),
+        ),
+        (
+            'invented_field="clearly_above"',
+            _scan_text("negative-self-check", '自造字段 `invented_field="clearly_above"`'),
+        ),
+        (
+            "b_row prose enum both",
+            _scan_text("negative-self-check", "测试权重行 `b_row`（`0.25` / `0.5` / `both`）"),
+        ),
+    ]
+    for label, probs in neg_checks:
+        assert probs, f"Expected negative self-check {label!r} to fail, but got no problems"
+        print(f"NEGATIVE_SELF_CHECK [{label}]: {probs}")
+
+    # Positive self-checks: valid bare assignments in existing prompts must pass
+    pos_checks = _scan_text(
+        "positive-self-check",
+        '合法写法：`verdict="NEW_THESIS"`、`kind = "date"`、`debates[].status = "open"`、`source.ref.kind="model_cell"`',
+    )
+    assert pos_checks == [], f"Expected positive self-check to pass, got {pos_checks}"
+
+    b4b_skill_files = [
+        "plugins/dalton/skills/dalton-knowledge/SKILL.md",
+        "plugins/dalton/skills/dalton-knowledge/references/structured-write-example.md",
+        "plugins/dalton/skills/dalton-conventions/SKILL.md",
+        "plugins/dalton/skills/dalton-conventions/references/risk-reward.md",
+        "plugins/dalton/skills/dalton-conventions/references/evidence-and-sources.md",
+        "plugins/dalton/skills/dalton-conventions/references/nonlinear.md",
+        "plugins/dalton/skills/dalton-bullbear/SKILL.md",
+        "plugins/dalton/skills/dalton-call/SKILL.md",
+        "plugins/dalton/skills/dalton-call/references/evidence-gate.md",
+        "plugins/dalton/skills/dalton-call/references/sizing.md",
+        "plugins/dalton/skills/dalton-call/templates/call.md",
+        "plugins/dalton/skills/dalton-earnings-preview/SKILL.md",
+        "plugins/dalton/skills/dalton-earnings-flash/SKILL.md",
+        "plugins/dalton/skills/dalton-earnings-flash/templates/flash.md",
+        "plugins/dalton/skills/dalton-thesis-delta/SKILL.md",
+        "plugins/dalton/skills/dalton-weekly-review/SKILL.md",
+        "plugins/dalton/skills/dalton-research-director/SKILL.md",
+        "plugins/dalton/skills/dalton-sector-delta/SKILL.md",
+        "plugins/dalton/skills/dalton-earnings-calendar/SKILL.md",
+    ]
+
+    all_problems: list[str] = []
+    for rel_path in b4b_skill_files:
+        content = (repo_root / rel_path).read_text(encoding="utf-8")
+        all_problems.extend(
+            _scan_text(
+                rel_path,
+                content,
+                check_single_snake=(rel_path in v2_schema_focused_files),
+            )
+        )
+
+    assert all_problems == [], f"Schema field/enum mismatches in skill prompts: {all_problems}"
+
+
+
+
+

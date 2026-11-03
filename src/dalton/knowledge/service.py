@@ -840,8 +840,38 @@ async def apply_update(
         if existing_raw:
             try:
                 parsed = json.loads(existing_raw)
+                init_models_doc: dict[str, Any] | None = None
+                init_agenda_doc: dict[str, Any] | None = None
+                init_debate_doc: dict[str, Any] | None = None
+                if doc_key == "thesis":
+                    models_row = await db_knowledge.latest_valid_version(
+                        workspace_id, "models"
+                    )
+                    init_models_doc = (
+                        models_row["content"]
+                        if models_row and isinstance(models_row.get("content"), dict)
+                        else {}
+                    )
+                    if isinstance(parsed, dict) and parsed.get("schema_version") == 2:
+                        agenda_row = await db_knowledge.latest_valid_version(
+                            workspace_id, "agenda"
+                        )
+                        if agenda_row and isinstance(agenda_row.get("content"), dict):
+                            init_agenda_doc = agenda_row["content"]
+                        debate_row = await db_knowledge.latest_valid_version(
+                            workspace_id, "debate"
+                        )
+                        if debate_row and isinstance(debate_row.get("content"), dict):
+                            init_debate_doc = debate_row["content"]
                 val_existing = validate_update(
-                    doc_key, None, parsed, source="direct_edit", reason="initial file"
+                    doc_key,
+                    None,
+                    parsed,
+                    source="direct_edit",
+                    reason="initial file",
+                    models_doc=init_models_doc,
+                    agenda_doc=init_agenda_doc,
+                    debate_doc=init_debate_doc,
                 )
                 _, sha = canonical_json(parsed)
                 if dry_run:
@@ -1231,6 +1261,7 @@ async def apply_update(
         "previous_version_no": latest_no,
         "knowledge_version_id": version_row["knowledge_version_id"],
         "content_sha256": content_sha,
+        "content": new_doc,
         "rendered_file": md_file,
         "warnings": val.warnings,
         "message": msg,

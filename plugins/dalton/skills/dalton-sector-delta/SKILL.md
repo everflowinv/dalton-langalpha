@@ -12,9 +12,9 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 对行业覆盖单元（sector 单元）每周收一次"资料增量包"：以 `data/sector.json` 的行业名（`name` / `name_zh`）与成员公司名（`members[].name`）为检索词，扫内部研究来源 `sales-notes` / `tmtb` / `funda-ai` / `guidepoint`，判断相对现有行业知识层是否存在**重要变化（material change）**。
 
-**行业不跑证券探针**（与本技能无关的边界，见行业议程任务说明）：SEC filing、港 A 公告、财报窗口、一致预期与股价都不采集——成员公司的这类事件由**公司侧**的 `dalton-<t>-watch` / `dalton-<t>-delta` 发现一次，再经跨单元联动（P2）向本行业产生待复核/更新候选；本技能绝不为成员公司重复采集证券类材料。`alphaengine` 的"覆盖边界"窗口模型按单一公司查询词维护游标，行业多检索词无法复用该状态，首期不扫（packet 的 `skipped` 有说明）。
+**行业不采集单公司证券数据**（见行业议程任务说明）：SEC filing、港 A 公告、财报窗口、一致预期与股价都不采集——成员公司的这类事件由**公司侧**的 `dalton-<t>-watch` / `dalton-<t>-delta` 发现一次，再经跨单元联动向本行业产生待复核/更新候选；本技能绝不为成员公司重复采集证券类材料。`alphaengine` 的“覆盖边界”窗口模型按单一公司查询词维护游标，行业多检索词无法复用该状态，暂不扫描（`packet` 的 `skipped` 有说明）。
 
-- **零成本预检与 `<dalton_wake>`**：每周 cron（`dalton-sector-<slug>-delta.json`，北京时间 11:00）唤醒后线程首条上下文包含 `<dalton_wake>`（`probe=schedule`，`kind=sector_delta`），无信号的轮次在预检就被记 `skip`、花费为 0。
+- **零成本预检与 `<dalton_wake>`**：每周 cron（`dalton-sector-<slug>-delta.json`，北京时间 11:00）唤醒后线程首条上下文包含 `<dalton_wake>`（`probe` 为 `"schedule"`，`kind` 为 `"sector_delta"`），无信号的轮次在预检就被记 `skip`、花费为 0。
 - **无重要变化不打扰 PM**：所有来源取数成功且判定不属于重要变化时，只记一条 `NO_CHANGE` 结论并 `commit --material no`，**绝不向 PM 推送消息**。
 
 ## 三步执行流程
@@ -26,7 +26,7 @@ python3 .agents/skills/dalton-sector-delta/scripts/collect_sector.py collect \
   --workspace-dir .
 ```
 
-脚本读取 `data/sector.json` 生成检索词（行业名 + 成员公司名，默认上限 6 个，`--max-terms` 调整），逐词检索四个内部来源，写 `research/tracker/<run_id>/packet.json` 与 `packet.md`。与公司增量脚本共用同一条 researchdata 调用路（沙箱 PTC 包装模块优先，`DALTON_RESEARCHDATA_URL` 只作 HTTP 桥覆盖）；返回 `status=researchdata_transport_unconfigured` 时是配置错误，本轮未采集任何来源：不要重试采集，按"所有来源取数失败"如实汇报并停下，严禁写成"本轮无新文档"。
+脚本读取 `data/sector.json` 生成检索词（行业名 + 成员公司名，默认上限 6 个，`--max-terms` 调整），逐词检索四个内部来源，写 `research/tracker/<run_id>/packet.json` 与 `packet.md`。与公司增量脚本共用同一条 researchdata 调用路（沙箱 PTC 包装模块优先，`DALTON_RESEARCHDATA_URL` 只作 HTTP 桥覆盖）；返回 `status` 为 `"researchdata_transport_unconfigured"` 时是配置错误，本轮未采集任何来源：不要重试采集，按“所有来源取数失败”如实汇报并停下，严禁写成“本轮无新文档”。
 
 ### 第 2 步：短路判断（要求全部来源 ok 且 0 新增）
 
@@ -38,8 +38,17 @@ python3 .agents/skills/dalton-sector-delta/scripts/collect_sector.py collect \
 ### 第 3 步：有增量时（material=yes）
 
 1. 读 `packet.md`，按证据对行业论点的影响分流：只影响成员公司的证据经 `delegate` 交回 Home 转公司分析师（行业工作区不改公司知识）；影响行业层面的（政策、供需、产业链格局、跨成员共性变化）才进入本工作区的知识更新。
-2. 经 `knowledge_update` 更新 `thesis` / `debate` / `agenda`（必要时 `drivers` 指标读数），写增量笔记 `research/<YYYY-MM-DD>-delta.md`（引用 packet 的文档 id，成员公司相关证据注明"已转公司侧"）。
+2. 经 `knowledge_update` 更新 `thesis` / `debate` / `agenda`（必要时 `drivers` 指标读数），写增量笔记 `research/<YYYY-MM-DD>-delta.md`（必须非空、在开头写明本轮覆盖的期间 `since` → `until`〔如 `本轮覆盖的期间：2026-10-16 至 2026-10-23`〕，引用 `packet` 的文档 `id`，成员公司相关证据注明“已转公司侧”）。
 3. `commit --material yes --summary "<一句话结论>"`，并调用 `knowledge_append_verdict` 写五词结论（`trigger.kind="internal_material"`，`trigger.ref` 填信号 id 或 packet run_id）。
+
+### 收尾门禁：汇报完成前必须过完成契约（`dalton_check_done`）
+
+- 汇报“完成”前，必须在行业工作区调用 `dalton_check_done(workflow="dalton-sector-delta", params={"as_of": "<YYYY-MM-DD>"})`（若增量笔记路径非默认 `<as_of>-delta.md`，在 `params` 里加 `"delta_note": "research/<实际文件名>-delta.md"`）。
+- 完成前会检查：
+  1. 本轮 `collect_sector.py commit` 产出的 `research/tracker/last_run.json`（含本轮覆盖的期间 `since` → `until` 及 `material`）与 `research/tracker/updates.log` 存在且非空；
+  2. 当 `last_run.json` 中 `material="yes"` 时，本轮产出的增量笔记 `research/<YYYY-MM-DD>-delta.md` 必须存在、非空（≥ 100 字节），并在正文中写明本轮覆盖的期间（`since` → `until` 起止日期）；
+  3. 本轮已通过 `knowledge_append_verdict` 写入五词结论，且 `material="yes"` 时至少更新了一份受影响的行业知识文档（`thesis` / `debate` / `drivers` / `agenda`）。
+- `done=false` 时按 `missing` 先补齐再查；补不了的缺项只能如实汇报“未完成”并列出缺项，不得汇报“完成”。
 
 ## 检索词维护
 

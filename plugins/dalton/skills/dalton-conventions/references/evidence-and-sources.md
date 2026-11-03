@@ -10,7 +10,7 @@
 4. **Level 4 — 官方/协会统计与第三方独立产业数据（`official_data`，默认 tier 4）**：央行/FRED/财政部/行业协会官方统计、上下游上市公司披露、供应链独立调研、行业监测数据库。
 5. **Level 5 — 专家访谈与团队内部纪要（`expert` / `internal_note`，默认 tier 5）**：Guidepoint 专家纪要、基金 Wiki 与 AlphaEngine 中的专家访谈（必须标明专家身份、日期与验证状态，经营数字标"单一来源估计"），以及团队内部对话或纪要（`internal_note`，默认 tier 5，视引述内容可标 3–5）。
 6. **Level 6 — 财经新闻与社媒讨论（`news` / `derived`，默认 tier 6）**：新闻报道、TMTB、FUNDA AI 摘要等**仅作研究线索**，涉及财务或经营数字时必须回溯到 Level 1–5 原始出处。
-7. **本方模型推导（知识层 `model`，默认 tier 2–3）**：引用工作区财务模型（必须指向 `kind="model_cell"` 的具体 `Sheet!Cell`，且**不能标 tier 1**）。
+7. **本方模型推导（知识层 `model`，默认 tier 2–3）**：引用工作区财务模型（必须指向 `source.ref.kind="model_cell"` 的具体 `Sheet!Cell`，且**不能标 tier 1**）。
 
 **绝对禁用来源**：**百度百科**（任何情况下不得作为事实、历史沿革或行业数据的来源）。
 
@@ -62,7 +62,7 @@
 - **Track B（市场预期观察）**：TMTB（科技媒体通信行业简报）、sales color（卖方销售台的盘面点评）、买方 bogey（买方预期门槛）、买方持仓描述等材料，在用来说明**"市场在想什么、在交易什么"**时，只需标注**是谁的观点（身份 / 机构）、什么时点、来源链与置信度（高 / 中 / 低）**即可使用，**不适用双源规则**；同一来源链去重后，多次转述只算一条。
 - **不得跨轨**：同一条市场观察**不得**用来支撑公司的经营事实或支柱数字（份额、增速、利润率等）；经营事实回到 Track A 的层级与双源规则。
 - **买方 bogey 拿不到时**：写明原因即可（未检索到 / 渠道未覆盖），**不得因此压低 `conviction`（确信度）**；买方预期为空是合法状态（见 §5 第 4 类身份的定义）。
-- **结构化字段上线前的标注方式**：来源类型 `source.type="market_color"`（市场预期观察）上线前，暂沿用现有来源类型（`news`〔新闻〕/ `broker_report`〔券商研报〕等），并在报告正文里注明该条属于市场预期观察（Track B）。
+- **结构化标注方式**：在 `thesis.evidence` 中可将市场预期观察标为 `source.type="market_color"`（默认 tier 5，不可单独支撑核心支柱的经营事实），同时在 `thesis.market_view`（`summary`、`observations`、`positioning`、`figures`）中按结构化字段记录市场观点、预期观察（每条 `observations` 含主张 `claim`、来源身份 `who`、日期 `as_of`、来源引用 `sources` 与置信度 `confidence`；数字指标写入 `market_view.figures`，含 `metric`、`period`、`value`、`unit`、`label`）与持仓拥挤度判断（完整字段路径与样例见 `.agents/skills/dalton-knowledge/references/structured-write-example.md`）。
 
 ---
 
