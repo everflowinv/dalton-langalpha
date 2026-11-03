@@ -281,6 +281,7 @@ def writes(monkeypatch):
     monkeypatch.setattr(discovery, "get_db_connection", _connection)
     monkeypatch.setattr(discovery, "get_catalog_server", AsyncMock(return_value=_ROW))
     monkeypatch.setattr(discovery, "upsert_user_tool_schemas", _upsert)
+    monkeypatch.setattr(discovery, "enqueue_if_new", AsyncMock(return_value=False))
     return captured
 
 

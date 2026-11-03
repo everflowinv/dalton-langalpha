@@ -37,6 +37,7 @@ from src.server.database.mcp_tool_schemas import (
 )
 from src.server.database.pool import get_db_connection
 from src.server.models.mcp_server import OK_VERDICTS, ProbeResult
+from src.server.services.mcp_descriptions.jobs import enqueue_if_new
 from src.server.services.mcp_identity import bounded_identity
 from src.server.services.mcp_oauth.lifecycle import (
     TokenUnavailable,
@@ -194,6 +195,18 @@ class _SnapshotWriter:
                     last_probe=probe.model_dump(mode="json"),
                     **upsert_kwargs,
                 )
+                # In the same transaction, so a tool list that lands is queued
+                # for a description or not landed at all. Before the bump, so
+                # the scope lock is taken before any ``workspaces`` row, in
+                # the order landing a description takes them.
+                if write.row is not None and now_ok and upsert_kwargs.get("tools") is not None:
+                    await enqueue_if_new(
+                        user_id=self.user_id,
+                        server_name=self.server_name,
+                        tools=upsert_kwargs["tools"],
+                        from_vendor=True,
+                        conn=conn,
+                    )
                 # A moved tool surface means sessions must regenerate wrappers.
                 # The digest arm compares against what this write actually
                 # replaced, not a snapshot read before it: two workers probing

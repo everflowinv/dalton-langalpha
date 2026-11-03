@@ -577,7 +577,25 @@ async def set_plugin_enabled_endpoint(
             )
         else:
             await revoke_live_grants(user_id, [s["name"] for s in servers])
-    return PluginEnabledResponse(name=name, enabled=body.enabled)
+        return PluginEnabledResponse(name=name, enabled=False)
+
+    # As a server's own switch does: a component switched off with its plugin
+    # dropped its queued description, and switching it back on moves no tools.
+    from src.server.services.mcp_descriptions.worker import requeue_server
+
+    try:
+        servers = await list_plugin_server_names(user_id, row["user_plugin_id"])
+    except Exception:
+        logger.warning(
+            "plugin %s enabled, but its components could not be requeued for "
+            "descriptions",
+            name,
+            exc_info=True,
+        )
+        servers = []
+    for server in servers:
+        await requeue_server(user_id, server["name"])
+    return PluginEnabledResponse(name=name, enabled=True)
 
 
 @router.delete("/{name}", response_model=UninstallResponse)

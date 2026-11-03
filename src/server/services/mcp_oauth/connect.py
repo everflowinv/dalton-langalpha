@@ -51,6 +51,7 @@ from mcp.shared.auth import (
 from src.config.env import MCP_CLIENT_METADATA_URL
 from src.server.database.egress_grants import apply_consent_to_active_grants
 from src.server.database.mcp_config_version import bump_user_workspaces_mcp_version
+from src.server.database.mcp_descriptions import drop_descriptions
 from src.server.database.mcp_oauth import Secrets, get_connection, upsert_connection
 from src.server.database.mcp_servers import (
     get_catalog_server,
@@ -72,6 +73,7 @@ from src.server.services.brokerages import (  # DALTON-HOOK(hide-trading)
 )
 from src.server.services.mcp_apply import schedule_proactive_apply
 from src.server.services.mcp_config import same_consented_url
+from src.server.services.mcp_descriptions.jobs import own_description_scope
 from src.server.services.mcp_probe import _scrub_url
 from src.server.services.mcp_oauth.finish import (
     CallbackFailed,
@@ -1528,6 +1530,12 @@ async def complete_callback(
                 # The exchange may have signed in another brokerage login.
                 await refuse_attempts_on_connection_change(
                     record.user_id, server_name, conn=db
+                )
+                # So might the description: the one written for the account
+                # before is dropped, and the rediscovery below queues the next.
+                await drop_descriptions(
+                    await own_description_scope(record.user_id, server_name, conn=db),
+                    conn=db,
                 )
             logger.info(
                 "[mcp_oauth] connected user=%s server=%s connection=%s "

@@ -145,6 +145,9 @@ _REDIS_BACKGROUND_SINGLETONS: tuple[tuple[str, str], ...] = (
     # computers up while covered; claims on each command's row in Postgres
     # dedup it across workers.
     ("CommandWatcher", "src.server.services.commands.watcher"),
+    # Has a model describe MCP servers; a claim on each job's row under its
+    # scope's advisory lock dedups it across workers.
+    ("McpDescriptionWorker", "src.server.services.mcp_descriptions.worker"),
 )
 
 

@@ -161,6 +161,14 @@ async def apply_catalog_edit(
     )
     if row is None:
         return None
+    from src.server.services.mcp_descriptions.prompt_text import users_own_words
+
+    # Clearing the user's own description moves no tools, so nothing else
+    # would queue the generated one it now falls back to.
+    if prior is not None and users_own_words(prior) and not users_own_words(row):
+        from src.server.services.mcp_descriptions.worker import requeue_server
+
+        await requeue_server(user_id, name)
 
     # Force reconnect when the edit moves an OAuth-connected server off its
     # consented endpoint: the stored token was issued for the old host, so it
@@ -429,6 +437,11 @@ async def apply_catalog_enabled(
     if row is None:
         return None, None
     if enabled:
+        from src.server.services.mcp_descriptions.worker import requeue_server
+
+        # A row switched off drops its queued description, and switching it
+        # back on moves no tools, so nothing else would queue it again.
+        await requeue_server(user_id, name)
         return row, await _relay_execution_warning(user_id, name)
     await revoke_live_grants(user_id, [name])
     return row, None

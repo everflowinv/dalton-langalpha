@@ -125,6 +125,21 @@ async def test_enable_does_not_revoke(client):
 
 
 @pytest.mark.asyncio
+async def test_enable_requeues_every_owned_server(client):
+    requeue = AsyncMock()
+    with patch("src.server.services.mcp_descriptions.worker.requeue_server", new=requeue):
+        resp, _ = await _toggle(
+            client,
+            enabled=True,
+            servers=[{"name": "a", "plugin_server_key": "a"},
+                     {"name": "b", "plugin_server_key": "b"}],
+            connection=None,
+        )
+    assert resp.status_code == 200
+    assert [c.args for c in requeue.await_args_list] == [("test-user-123", "a"), ("test-user-123", "b")]
+
+
+@pytest.mark.asyncio
 async def test_disable_with_no_owned_servers_is_a_noop(client):
     resp, revoke = await _toggle(
         client, enabled=False, servers=[], connection=None

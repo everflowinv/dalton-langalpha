@@ -67,6 +67,18 @@ features:
     enabled: false
 
 
+# SYNC3 B3 (#647): upstream's model-written MCP server descriptions stay off.
+# Upstream defaults McpDescriptionsConfig to enabled (src/config/models.py),
+# which starts McpDescriptionWorker in every backend worker and has a model
+# describe MCP servers — shipped brokerages on the deployment's background
+# slot, users' own servers on each user's resolved credential. With enabled
+# false the worker never starts (worker.py start returns first), discovery
+# queues nothing (jobs.enqueue_if_new returns before any write), and agents
+# keep reading each row's own text (prompt_text.profiles_by_server returns
+# {}), so no description call can spend anyone's budget.
+mcp_descriptions:
+  enabled: false
+
 # Workflow children (RunWorkflow) get 90 min instead of upstream's 30.
 # 2026-11-02: two dalton-evidence branches in DASH were cancelled at exactly
 # child_timeout=1800s mid-work. run_timeout stays at upstream's 16200s (three

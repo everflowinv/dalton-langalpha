@@ -24,6 +24,7 @@ from ptc_agent.core.mcp_sanitize import (
 
 from src.server.database import mcp_servers as mcp_db
 from src.server.database.mcp_tool_schemas import upsert_tool_schemas
+from src.server.services.mcp_descriptions.jobs import enqueue_if_new
 from src.server.services.mcp_identity import bounded_identity
 
 logger = logging.getLogger(__name__)
@@ -291,6 +292,7 @@ async def discover_and_cache(
         results = {s.name: {"status": "error", "error": str(exc), "tools": []} for s in servers}
 
     stale = await _stale_server_names(workspace_id, servers)
+    owner = await _workspace_owner(workspace_id, servers)
     for server in servers:
         fingerprint = mcp_discovery_fingerprint(server)
         if server.name in stale:
@@ -332,4 +334,31 @@ async def discover_and_cache(
                 },
             )
         )
+        # A user's own server is described from the list its sandbox reported,
+        # which never writes a shared description; a built-in carries its
+        # author's text already.
+        if owner and _is_user_server(server):
+            await enqueue_if_new(
+                user_id=owner, server_name=server.name, tools=kept, from_vendor=False
+            )
     return rows
+
+
+def _is_user_server(server: MCPServerConfig) -> bool:
+    return getattr(server, "source", None) == "user"
+
+
+async def _workspace_owner(workspace_id: str, servers: list[MCPServerConfig]) -> str | None:
+    """Who owns the workspace, looked up only when a user's own server is
+    among those discovered."""
+    from src.server.database.workspace import get_workspace
+
+    if not any(_is_user_server(s) for s in servers):
+        return None
+    try:
+        workspace = await get_workspace(workspace_id)
+    except Exception:  # noqa: BLE001 - discovery must not fail on a description
+        logger.warning("[MCP_DISCOVERY] owner lookup failed for %s", workspace_id)
+        return None
+    user_id = (workspace or {}).get("user_id")
+    return str(user_id) if user_id else None

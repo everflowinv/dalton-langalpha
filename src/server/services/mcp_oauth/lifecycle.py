@@ -439,6 +439,7 @@ async def disconnect_server(user_id: str, server_name: str) -> bool:
         refuse_attempts_on_connection_change,
     )
     from src.server.database.pool import get_db_connection
+    from src.server.services.mcp_descriptions.jobs import own_description_scope
 
     row = await get_connection(user_id, server_name)
     if row is None:
@@ -462,8 +463,15 @@ async def disconnect_server(user_id: str, server_name: str) -> bool:
             # row keeps publishing the connected tool set while the resolved
             # config no longer carries a connection — the sandbox would dial
             # the vendor directly, with no relay in front of it.
+            # And the description written from them, which a job still
+            # running for the given-up account must not land again.
             await delete_user_and_workspace_tool_schemas_and_bump(
-                user_id, [server_name], conn=conn
+                user_id,
+                [server_name],
+                description_scopes=await own_description_scope(
+                    user_id, server_name, conn=conn
+                ),
+                conn=conn,
             )
     logger.info(
         "[mcp_oauth] disconnected user=%s server=%s connection=%s",
