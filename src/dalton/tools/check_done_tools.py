@@ -2913,6 +2913,21 @@ async def run_check_done(
                 "warnings": [],
                 "checked": checked,
             }
+        # 公司级路由指引放 missing 首位（ada64139 复盘）：ticker 属于另一个
+        # 工作区、或产物根目录越出当前工作区时，按本工作区找文件必然一堆
+        # "不存在"，先指路再列缺项。只对公司级流程生效（与启动检查同一份
+        # 名单），backend 的 workspace_dir 是越界判定的锚定根。
+        from src.dalton.workflows.company_routing import routing_hint_for_check
+
+        routing_hint = await routing_hint_for_check(
+            params,
+            user_id,
+            workspace_id,
+            workflow=workflow,
+            workspace_root=getattr(backend, "workspace_dir", None),
+        )
+        if routing_hint:
+            missing.append(routing_hint)
         # One window feeds both the stage artifact variants and the closing
         # checks, so a variant accepted by mtime is the same run the verdict
         # window counts.
