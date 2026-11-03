@@ -28,7 +28,7 @@ Conviction Call（高确信度投资建议）是 Dalton 研究体系的最高级
   - **路径 A（盈利预期差）**：在至少 1 个核心经营驱动变量（Driver）上，House Case 与 Street Consensus 存在明确的数字化差异，并能解释错误定价存续原因；
   - **路径 B（倍数 regime 切换，五条条件必须全部满足）**：① 点名是**增长持续期、资本强度 / 现金转化、资本配置、尾部折价**四类中的哪一类发生变化，并给出可观测的领先指标；② 给出**同一份盈利预测下**新旧估值倍数的价格桥，盈利变动贡献与估值倍数变动贡献分开列示；③ 给出**历史或同业估值倍数锚，并说明为什么适用于当前环境**；④ 存在 **1–4 个季度内**可观测的证伪或去折价催化剂节点与量化阈值；⑤ **同一原因不能在 EPS 和估值倍数里各算一次**（此外当估值倍数变动对目标回报贡献超过 50% 时，除非重估机制已在当期或近期现金流中实际兑现〔`underwriting.rerating_observed=true` 且附 `rerating_sources`〕，否则 `conviction` 最高只能标 `medium`）。**“估值终将回到历史均值”仍判 `FAIL`**。
 - **Gate 5 赔率与高确信路径检查（直接取 `knowledge_update(doc="thesis", dry_run=True)` 返回的赔率计算摘要，严禁心算）**：
-  - 所主张方向的 `underwriting.breakeven_verdict` 中每条 `verdict` 必须为 `"clearly_above"`（明显高于所需胜率），且不利方向价带端点相对基准股价的亏损幅度在上限之内（`act_now` 默认 ≤ 25%，空头须同时具备逼空压力情景 `underwriting.stress` 且借券成本 `underwriting.borrow_cost_annual` 已知）；
+  - 所主张方向的 `underwriting.breakeven_verdict` 中每条 `verdict` 必须为 `"clearly_above"`（显著高于门槛），且不利方向价带端点相对基准股价的亏损幅度在上限之内（`act_now` 默认 ≤ 25%，空头须同时具备逼空压力情景 `underwriting.stress` 且借券成本 `underwriting.borrow_cost_annual` 已知）；
   - 若拟给 `conviction="high"`（高确信），必须满足两条路径之一：① **有来源支撑的权重区间整体达标**（`weight_bounds` 有历史基率或二元事件来源支撑、`rationale` 不得为风险中性期权口径，且赔率计算摘要显示全部权重组合都过最低回报要求，包括对所主张方向最不利的那组权重）；或 ② **不需要乐观情景兑现即可达标**（在 `b=25%` 与 `b=50%` 两行测试权重下，赔率计算摘要显示价格区间下端〔多头〕或上端〔空头〕也无需 bull/bear 即可达标，且满足立即行动的不利波动上限）；并且若估值倍数变动占目标回报比例 > 50%，重估机制必须已在现金流中兑现（`underwriting.rerating_observed=true` 且附 `rerating_sources`）。
 - **Gate 6 支柱健康度检查**：
   - 近 30 天的 `verdicts.md` 中无未处理的 `THESIS_BROKEN`；

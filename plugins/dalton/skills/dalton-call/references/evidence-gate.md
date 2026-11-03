@@ -45,7 +45,7 @@
 
 ## Gate 5：赔率裁决达标且下行受控（Breakeven Verdict & High Conviction Paths）
 - **通过标准（直接取 `knowledge_update(doc="thesis", dry_run=True)` 返回的赔率计算摘要，严禁心算）**：
-  - 所主张方向的 `thesis.underwriting.breakeven_verdict` 中每条 `verdict` 为 **`"clearly_above"`（明显高于所需胜率）**；
+  - 所主张方向的 `thesis.underwriting.breakeven_verdict` 中每条 `verdict` 为 **`"clearly_above"`（显著高于门槛）**；
   - 不利方向价带端点相对基准股价的亏损幅度在上限之内（`act_now` 默认 ≤ 25%，即 `max_adverse_move_act_now`；多头看 `bear` 价带下沿，空头看 `bull` 价带上沿且须同时具备逼空压力情景 `underwriting.stress` 与已知借券成本 `underwriting.borrow_cost_annual`）；
   - 若给出 `conviction = "high"`（高确信），还必须满足以下两条路径之一（且估值倍数变动占目标回报比例 > 50% 时重估机制必须已在现金流中兑现，即 `underwriting.rerating_observed=true` 并附 `rerating_sources`）：
     1. **路径 ①（有来源支撑的权重区间整体达标）**：`underwriting.weight_bounds` 有历史基率或二元事件来源支撑（`rationale` 不得为风险中性期权隐含概率口径），且赔率计算摘要显示**全部权重组合（含对所主张方向最不利的那组权重）期望终值都越过回报门槛**；
@@ -54,7 +54,7 @@
 
 ---
 
-## Gate 6：主驱动支柱完好且受损支柱已全额扣减（Primary Pillar Intact & Impaired Pillars Deducted）
+## Gate 6：主驱动支柱成立且受损支柱已全额扣减（Primary Pillar Intact & Impaired Pillars Deducted）
 - **通过标准**：
   - 近 **30 天**的 `verdicts.md` 中**不存在未处理的 `THESIS_BROKEN` 结论**；
   - `data/thesis.json` 中支撑本次推荐的**主驱动支柱（primary driving pillar）不得处于 `impaired`（受损）或 `broken`（证伪）状态**；
@@ -65,11 +65,11 @@
 
 ## 门禁核验表格式（报告必附）
 
-| 门禁编号 | 门禁名称 | 本次核验事实与引用位置 | 状态（PASS/FAIL） |
+| 门禁编号 | 门禁名称 | 本次核验事实与引用位置 | 状态（通过 / 未通过） |
 |---|---|---|---|
-| **Gate 1** | 覆盖与模型时效（≤120天） | <最新模型与报告日期、文件名> | PASS / FAIL |
-| **Gate 2** | 核心支柱双源与证伪阈值 | <支柱 ID、独立来源数、证据等级> | PASS / FAIL |
-| **Gate 3** | 预期差双轨（Path A 驱动差值 / Path B 倍数切换五条件） | <Driver 差值及模型单元格，或 Path B 五条核验> | PASS / FAIL |
-| **Gate 4** | 可观测验证催化剂与时间窗 | <催化剂事件与具体季度/日期> | PASS / FAIL |
-| **Gate 5** | 赔率裁决 `clearly_above`、不利波动 ≤25% 及高确信路径 | <`knowledge_update` 赔率摘要：所需胜率、不利波动、高确信路径> | PASS / FAIL |
-| **Gate 6** | 主驱动支柱完好（其他 `impaired` 支柱已全额扣减且近 30 天已重估） | <核查近 30 天 verdicts.md 与 thesis.json 支柱状态> | PASS / FAIL |
+| **Gate 1** | 覆盖与模型时效（≤120天） | <最新模型与报告日期 [引用1]> | 通过 / 未通过 |
+| **Gate 2** | 核心支柱双源与证伪阈值 | <核心支柱内容、独立来源数、证据等级> | 通过 / 未通过 |
+| **Gate 3** | 预期差双轨（Path A 驱动差值 / Path B 倍数切换五条件） | <驱动变量差值与来源引用，或 Path B 五条核验> | 通过 / 未通过 |
+| **Gate 4** | 可观测验证催化剂与时间窗 | <催化剂事件与具体季度/日期> | 通过 / 未通过 |
+| **Gate 5** | 胜率裁决显著高于门槛、不利波动 ≤25% 及高确信路径 | <赔率计算摘要：所需胜率、不利波动、高确信路径> | 通过 / 未通过 |
+| **Gate 6** | 主驱动支柱成立（其他受损支柱已全额扣减且近 30 天已重估） | <核查近 30 天事件结论与支柱状态摘要> | 通过 / 未通过 |

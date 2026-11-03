@@ -63,7 +63,7 @@ python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \
 （`--session` 默认为 `regular`；盘前异动传 `--session pre`，盘后异动传 `--session post`。若用户指定了对比同组、ETF 或指数期货，可追加 `--peers A,B,C`、`--etf XLK`、`--futures NQ=F,ES=F`。）
 
    - 检查返回的 JSON：
-     - `ok` 必须为 `true`，且 `data_ok` 必须为 `true`。若最新一根日线尚未生成导致 `data_ok: false`，**立即停止归因**，向用户或日志说明“最新交易日行情尚未就绪（`data_ok=false`），暂不下归因结论”。
+     - `ok` 必须为 `true`，且 `data_ok` 必须为 `true`。若最新一根日线尚未生成导致 `data_ok: false`，**立即停止归因**，向用户说明“最新交易日行情尚未就绪，暂不下归因结论”（运行日志记录 `data_ok=false`，面向用户或 PM 的正文不写字段名）。
      - 记录核心量化指标：未复权收盘价 `close`、复权计算的区间涨跌幅 `change_pct`、逐日明细 `daily[]`（每行含逐日基准收益 `benchmark_pct`；无同组公司时 `peer_median_pct` 为 `null`）、当日成交量对前 20 日均量倍数 `volume_vs_adtv`、同组各成员涨跌 `peers[]` 与实际参与计算的成员 `peers_used[]`、同组来源 `peer_source`（`explicit` / `coverage` / `default_map` / `none`）、同组中位数 `peer_median`、板块 ETF 涨跌 `etf_change`、超额收益 `alpha_vs_peers` 与 `alpha_vs_sector`（盘前 / 盘后另有 `alpha_vs_futures`）、60 日日超额标准差 `sigma_60d_pct`、单日 `day_z`、窗口 `window_z`，以及分类判定 `assessment`（`sector_beta` / `stock_specific` / `mixed`）；输出末尾的 `computed_at` 是本次计算的 ISO 时间，引用指标时用它核对输出版本。
      - **按 `benchmark` 写准对比基准**：`benchmark == "peers"` 时才是同组口径；`benchmark == "sector_etf"`（无同组公司，`peers` 为空、`peer_median` 与 `alpha_vs_peers` 为 `null`）时只能写“**相对板块 ETF**”；`benchmark == "futures"`（盘前 / 盘后且板块 ETF 数据缺失）时只能写“**相对指数期货**”；都不能写成“相对同组”或“对同组超额”，也不要和手算的同组数字混用。两类时段输出的指标不同：**日线窗口（`--session regular`）**按所选基准统一计算 `sigma_60d_pct`、`day_z`、`window_z` 与 `assessment`；**盘前 / 盘后（`--session pre|post`）**不输出 `sigma_60d_pct`、`day_z`、`window_z`，只按所选基准的超额收益（`alpha_vs_peers` / `alpha_vs_sector` / `alpha_vs_futures`）判定 `assessment`。
      - **更换同组后必须重跑**：用 `--peers A,B,C` 指定新同组后重新运行脚本，超额收益、`sigma_60d_pct`、`day_z`、`window_z` 与 `assessment` 一律采用**新输出的全部数字**；不要把新同组的手算超额和旧输出的 σ、z 值拼在一起用，两者基准不同，不可比。
@@ -148,9 +148,9 @@ python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \
    3. **Guidepoint 专家访谈与一线反馈**：
       同一时间窗口检索 `research(route="guidepoint", operation="search_library", query=f"{COMPANY_NAME} {TICKER}", start=SEARCH_START, end=SEARCH_END, limit=10)`（或用 `research(route="all", operation="search", query=f"{COMPANY_NAME} {TICKER}", ticker=TICKER, start=SEARCH_START, end=SEARCH_END, limit=10)` 一次联搜本地库、AlphaEngine 与 Guidepoint），核查供应链、渠道、客户或竞品的一线变化；引用时写访谈日期与专家身份（不写姓名），原文引用不超过 20 词，专家给出的经营数字标为“单一来源估计”。
    4. **身份与状态纪律**：
-      - 列出机构、日期、作者、标题和 `doc_id`，提炼评级/目标价变化与核心论点。
-      - **卖方观点必须明确写成“卖方说法”（如“据 Morgan Stanley（2026-10-16 [doc_id]）观点……”），绝不当作已验证事实。**
-      - 严格区分并分别写明三种异常/空状态：`Desktop 未登录`、`工具调用失败`、`窗口内无新研报`，不得将未登录或报错混写为“无新研报”。
+      - 列出机构、日期、作者与标题，提炼评级/目标价变化与核心论点；`doc_id` 只放在文末 `## 引用` 或推送稿 `## 来源` 节对应行的末尾，正文段落里不写。
+      - **卖方观点必须明确写成“卖方说法”（如“据 Morgan Stanley 2026-10-16 的研报 [引用N]……”），绝不当作已验证事实。**
+      - 严格区分三种异常/空状态，正文用人话分别写明“本轮未能登录研报库”、“研报检索失败”、“窗口内无新研报”（不得将未登录或检索失败混写为“窗口内无新研报”），具体原因按规定放入归因报告文末 `## 附注` 或推送稿 `## 来源` 节（写成一句人话，不贴工具报错原文）。
 
 ### 第 3 步：社媒与社区讨论（最后辅助）
 
@@ -206,7 +206,7 @@ python3 .agents/skills/dalton-stock-move/scripts/move_quant.py analyze \
        - `"protection_failed"`：三层下行保护（生存层融资/现金流、价值层实际股本缩减/资产托底、路径层借券/逼空）中的任一条件失效，扩大了下行风险敞口。
      - **论点与赔率分开如实填写**：论点没变但赔率变了时，`verdict` 仍填 `"NO_CHANGE"`、`payoff_assessment.changed` 填 `true`——既不得为了触发推送而把 `verdict` 改写成 `"THESIS_STRENGTHENED"` / `"THESIS_WEAKENED"` 等，也不得为了与 `"NO_CHANGE"` 表面一致而把已变化的赔率写成 `"changed": false`。
    - **线性还是切换（报告正文必答）**：这次是沿着旧叙事线性演进，还是叙事 / 倍数 regime（市场给这类资产的定价规则）可能在切换？答"可能在切换"时，必须点名是**哪一个触发器**（哪份披露、哪个数字、哪类持仓变化）、**指向哪个方向**（升级 / 降级），以及**需要什么证据来确认**；检查方法见 `.agents/skills/dalton-conventions/references/nonlinear.md`。
-   - **事件结论五词**：从 `NO_CHANGE`（无变化）、`THESIS_STRENGTHENED`（强化）、`THESIS_WEAKENED`（削弱）、`THESIS_BROKEN`（证伪）、`NEW_THESIS`（新论点）中选定一个，并用一句话写清理由。
+   - **事件结论五词**：`verdict.verdict` JSON 字段从 `NO_CHANGE`（无变化）、`THESIS_STRENGTHENED`（强化）、`THESIS_WEAKENED`（削弱）、`THESIS_BROKEN`（证伪）、`NEW_THESIS`（新论点）中选定一个；归因笔记与推送正文用中文（“无变化 / 强化 / 削弱 / 证伪 / 新论点”）及一句话理由表述，涉及支柱或分歧时写出内容，不写英文枚举或 `P1`、`D1` 编号。
    - **下一项验证**：接下来观察什么指标或事件、什么时间见分晓。
 2. **说“证据不足 / 原因暂缺”之前的必查清单校验**：
    - 在给出“证据不足”或“原因暂缺”之前，**必须先显式列出还没查或未取到的相关来源**（逐项对照：①第 0 步量化分解与竞争解释是否每条都有判定；②一手公告与 Filing（第 1 步）；③事件窗口内的新闻、同业联动与市场状态快照（第 2 步）；④TMTB、Sales Notes 全文 `operation="read"` 与卖方/专家（第 2 步）；⑤社媒与社区讨论 X / 雪球（第 3 步）；⑥目标时段盘外分钟线、隔夜宏观 `BZ=F`/`CL=F`/`^TNX`/`DX-Y.NYB`/`^VIX` 30 分钟时间线及同组/ETF/期货 `NQ=F`、`ES=F` 对比（第 0、4 步））。只要有任一相关来源尚未核查，先补查该来源，禁止在未查完前直接下“证据不足”结论。
