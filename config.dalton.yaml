@@ -65,6 +65,17 @@ features:
   # the operator decision that opens those surfaces.
   claude_code_runtime:
     enabled: false
+  # SYNC3 B7 (#658): upstream turned the scratchpad on by default (catalog
+  # enabled=True with an OPT_OUT gate). The kill switch turns it off for
+  # every Dalton user: a disabled feature never reaches the per-user
+  # resolution (effective_flags returns False before reading the user's
+  # override), so a user turning the Settings toggle on still gets False.
+  # Off, the agent gets no scratchpad prompt section and NotesOffMiddleware
+  # keeps stale notes rows out of model calls; notes already on disk are
+  # only removed by archive/delete, never by the flag. Flip to true with the
+  # product decision that opens it.
+  scratchpad:
+    enabled: false
 
 
 # SYNC3 B3 (#647): upstream's model-written MCP server descriptions stay off.
