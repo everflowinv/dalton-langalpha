@@ -240,6 +240,10 @@ vi.mock('@/pages/ChatAgent/hooks/useChatMessages', () => ({
       };
     },
     returnedDraft: null,
+    // #662 (sync3 B12): the cold-summary hint and its per-thread setters,
+    // idle here — no thread in these cases is owed a summary.
+    nextSummary: null,
+    forThread: () => ({ setNextSummary: vi.fn(), insertNotification: vi.fn() }),
     clearReturnedDraft: () => {},
     awaitingReportBack: false,
     reportBackOwed: false,
