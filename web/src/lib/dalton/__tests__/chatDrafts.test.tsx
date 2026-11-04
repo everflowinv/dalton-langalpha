@@ -410,6 +410,8 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
     const makePending = () => ({
       acceptSend: () => {},
       finalizeSend: (ok: boolean) => outcomes.push(ok),
+      // B15: the handle's handoff to an automatic resend; unused by these outcomes.
+      handOffToResend: () => {},
     });
 
     settleSendResult(makePending(), () => true);
@@ -954,7 +956,7 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     reopened.unmount();
   });
 
-  it('a failed send of a draft with a quote and attachments restores the text in place, and the reload brings the chip and the notice back', () => {
+  it('a failed send of a draft with a quote and attachments restores text, chip and notice in place, and a resend carries the quote whole', () => {
     const onSend = vi.fn<ChatInputProps['onSend']>().mockReturnValue(false);
     const ref = createRef<ChatInputHandle>();
     const view = renderComposer({ draftKey: 'thread:t-fail', onSend }, { userId: 'u-1', ref });
@@ -970,16 +972,143 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     fireEvent.click(screen.getByLabelText('Send message'));
     expect(onSend).toHaveBeenCalledTimes(1);
 
-    // The refused send puts its text straight back, token and all.
+    // The refused send puts its whole self straight back: the text on its
+    // token, the chip on the token, and the notice that the attachment did
+    // not survive — no reload needed for any of it.
     expect(view.getTextarea().value).toBe(`${withToken}why?`);
-    view.unmount();
+    expect(document.querySelectorAll('.draft-token-quote')).toHaveLength(1);
+    expect(screen.getByTestId('attachments-lost-notice')).toBeTruthy();
 
-    // What a reload restores is the draft as it was sent: the quote chip on
-    // its token, and the notice that the attachment did not survive.
-    const reopened = renderComposer({ draftKey: 'thread:t-fail' }, { userId: 'u-1' });
+    // Sending it again, right here, carries the quote's body and source —
+    // not the token's clipped preview words.
+    fireEvent.click(screen.getByLabelText('Send message'));
+    expect(onSend).toHaveBeenCalledTimes(2);
+    expect(onSend.mock.calls[1][0].message).toContain(
+      '<quote source="Analyst">Margins slipped</quote>',
+    );
+    expect(onSend.mock.calls[1][0].message).toContain('why?');
+
+    // What a reload restores is the draft as it was sent, chip and notice too.
+    view.unmount();
+    const reopened = renderComposer({ draftKey: 'thread:t-fail', onSend }, { userId: 'u-1' });
     expect(reopened.getTextarea().value).toBe(`${withToken}why?`);
     expect(document.querySelectorAll('.draft-token-quote')).toHaveLength(1);
     expect(screen.getByTestId('attachments-lost-notice')).toBeTruthy();
     reopened.unmount();
+  });
+
+  it('a failed send whose quote meets a same-started quote added since seats each once, paired with its own words', async () => {
+    const resolvers: Array<(v: boolean) => void> = [];
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+      () => new Promise<boolean>((resolve) => { resolvers.push(resolve); }),
+    );
+    const ref = createRef<ChatInputHandle>();
+    const view = renderComposer({ draftKey: 'thread:t-collide', onSend }, { userId: 'u-1', ref });
+
+    act(() => {
+      ref.current!.addContext({ kind: 'quote', snippet: 'Revenue grew by a lot', from: ANALYST });
+    });
+    fireEvent.click(screen.getByLabelText('Send message'));
+    expect(view.getTextarea().value).toBe('');
+
+    // While the send is out, another quote starting with the same words —
+    // the composer, empty again, gives it the same token.
+    act(() => {
+      ref.current!.addContext({ kind: 'quote', snippet: 'Revenue grew by a little', from: ANALYST });
+    });
+    const typedSince = view.getTextarea().value;
+    expect(typedSince).toContain('\u2060');
+
+    await act(async () => {
+      resolvers[0](false);
+    });
+
+    // The returning quote is renumbered against the one that took its words:
+    // two chips, and a send spells each body exactly once.
+    expect(view.getTextarea().value).not.toBe(typedSince);
+    expect(document.querySelectorAll('.draft-token-quote')).toHaveLength(2);
+    fireEvent.click(screen.getByLabelText('Send message'));
+    const resent = onSend.mock.calls[1][0].message;
+    expect(resent.match(/<quote source="Analyst">Revenue grew by a lot<\/quote>/g)).toHaveLength(1);
+    expect(resent.match(/<quote source="Analyst">Revenue grew by a little<\/quote>/g)).toHaveLength(1);
+    view.unmount();
+  });
+
+  it('a host that takes refused sends back owns the restore: the settle keeps only the stored draft, and its giveBack seats it once', async () => {
+    const resolvers: Array<(v: boolean) => void> = [];
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+      () => new Promise<boolean>((resolve) => { resolvers.push(resolve); }),
+    );
+    const ref = createRef<ChatInputHandle>();
+    const view = renderComposer(
+      { draftKey: 'thread:t-docked', onSend, hostRestoresUnsent: () => true },
+      { userId: 'u-1', ref },
+    );
+
+    act(() => {
+      ref.current!.addContext({ kind: 'quote', snippet: 'Margins slipped', from: ANALYST });
+    });
+    fireEvent.click(screen.getByLabelText('Send message'));
+    const sentDraft = onSend.mock.calls[0][0];
+    expect(view.getTextarea().value).toBe('');
+
+    act(() => {
+      ref.current!.addContext({ kind: 'quote', snippet: 'Margins held', from: ANALYST });
+    });
+    const typedSince = view.getTextarea().value;
+
+    await act(async () => {
+      resolvers[0](false);
+    });
+
+    // The settle wrote nothing into the input: still only what was typed
+    // since, one chip of its own — the host's giveBack owns the send's return.
+    expect(view.getTextarea().value).toBe(typedSince);
+    expect(document.querySelectorAll('.draft-token-quote')).toHaveLength(1);
+    // The stored draft keeps both: the sent text and what was typed since.
+    expect(load('thread:t-docked', 'u-1')).toBe(`${sentDraft.text}\n\n${typedSince}`);
+
+    // The host seats the returned draft the way the chat does; no text or
+    // chip lands twice.
+    act(() => {
+      ref.current!.giveBack(sentDraft.text, [], { mentions: sentDraft.mentions, commands: sentDraft.commands });
+    });
+    expect(document.querySelectorAll('.draft-token-quote')).toHaveLength(2);
+    fireEvent.click(screen.getByLabelText('Send message'));
+    const resent = onSend.mock.calls[1][0].message;
+    expect(resent.match(/<quote source="Analyst">Margins slipped<\/quote>/g)).toHaveLength(1);
+    expect(resent.match(/<quote source="Analyst">Margins held<\/quote>/g)).toHaveLength(1);
+    view.unmount();
+  });
+
+  it('saves an attachment added after the text was stored, so a reopen says to add it again', () => {
+    vi.useFakeTimers();
+    const view = renderComposer({ draftKey: 'thread:t-att-late' }, { userId: 'u-1' });
+    fireEvent.change(view.getTextarea(), {
+      target: { value: 'text saved first', selectionStart: 16 },
+    });
+    act(() => {
+      vi.advanceTimersByTime(DRAFT_SAVE_DEBOUNCE_MS);
+    });
+    // Stored by the text alone: no attachments stood beside it yet.
+    const first = JSON.parse(
+      localStorage.getItem(buildDraftStorageKey('thread:t-att-late', 'u-1')) ?? '{}',
+    ) as { hadAttachments?: boolean };
+    expect(first.hadAttachments).toBeUndefined();
+
+    // The attachment lands with no keystroke after it; leaving now must still
+    // carry it into the stored draft.
+    attachFile(view, 'page.txt');
+    view.unmount();
+
+    const stored = JSON.parse(
+      localStorage.getItem(buildDraftStorageKey('thread:t-att-late', 'u-1')) ?? '{}',
+    ) as { hadAttachments?: boolean };
+    expect(stored.hadAttachments).toBe(true);
+
+    const reopened = renderComposer({ draftKey: 'thread:t-att-late' }, { userId: 'u-1' });
+    expect(screen.getByTestId('attachments-lost-notice')).toBeTruthy();
+    reopened.unmount();
+    vi.useRealTimers();
   });
 });

@@ -1957,6 +1957,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                         ref={chatInputRef}
                         // DALTON-HOOK(composer-drafts): persist draft per thread or per workspace new chat
                         draftKey={panelThreadId ? `thread:${panelThreadId}` : (workspaceId ? `ws:${workspaceId}:new` : undefined)}
+                        // DALTON-HOOK(composer-drafts): while the composer sits at a file's foot the chat's returnedDraft→giveBack
+                        // re-seats a refused send; the draft settle then leaves the input to it.
+                        hostRestoresUnsent={coverReads.docked}
                         onSend={handleSendWithAttachments}
                         {...composerDeck}
                         disabled={isLoadingHistory || !workspaceId || !!pendingInterrupt}

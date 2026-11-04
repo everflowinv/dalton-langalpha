@@ -346,6 +346,22 @@ export interface UseComposerDraftOptions {
    * tracks the draft at the moment it was kept, not when the save was queued.
    */
   getDraftParts?: () => DraftParts;
+  /**
+   * DALTON-HOOK(composer-drafts): the host takes a refused send back itself
+   * (the chat's returnedDraft, re-seated through its giveBack) while the
+   * composer sits where the transcript is out of view. Read when a send
+   * settles failed: then this settle keeps only the stored draft — the input
+   * is the host's to restore. Without it (the plain chat view) the composer
+   * restores what the send took, through `onSendReturned`.
+   */
+  hostRestoresUnsent?: () => boolean;
+  /**
+   * DALTON-HOOK(composer-drafts): re-seats a failed send's text and quote
+   * chips into the composer, collision-safe against quotes added since (one
+   * may have taken the same token). Called by the failure settle only when no
+   * host giveBack owns the restore.
+   */
+  onSendReturned?: (sentText: string, parts: DraftParts) => void;
 }
 
 export interface PendingSendHandle {
@@ -359,6 +375,16 @@ export interface PendingSendHandle {
    * same handle is a no-op.
    */
   acceptSend: () => void;
+  /**
+   * DALTON-HOOK(composer-drafts): a drop scheduled this send's own automatic
+   * resend — the resend is what can prove the server took the message, not
+   * the response headers it dropped after. From here only the resend's
+   * acceptance (`acceptSend`, through the acceptance callback the resent
+   * attempts carry) settles this handle; the promise's own value settles
+   * nothing, and the stored draft keeps its inFlight mark so a reload
+   * restores the text with the notice.
+   */
+  handOffToResend: () => void;
 }
 
 interface InFlightSendState {
@@ -366,6 +392,8 @@ interface InFlightSendState {
   userId: string;
   sentText: string;
   settled: boolean;
+  /** True once handOffToResend parked it: only acceptance settles it from there. */
+  handedOff?: boolean;
   /** The draft's rich parts at send: what its restore brings back. */
   parts: DraftParts;
 }
@@ -403,9 +431,15 @@ export interface UseComposerDraftResult {
   /** The restored draft had attachments, which are not kept; the composer says to add them again. */
   restoredHadAttachments: boolean;
   clearCurrentDraft: () => void;
+  /**
+   * DALTON-HOOK(composer-drafts): something beside the text changed (an
+   * attachment was added or removed) that the stored draft carries — saves the
+   * draft on the same debounce, unless a send still owns the box.
+   */
+  touchDraft: () => void;
   beginSend: () => PendingSendHandle;
   submitWithDraft: (
-    invoke: (onAccepted: () => void) => void | boolean | Promise<void | boolean>,
+    invoke: (onAccepted: () => void, onHandedOff: () => void) => void | boolean | Promise<void | boolean>,
   ) => void;
 }
 
@@ -421,6 +455,8 @@ export function useComposerDraft({
   prefillMessage,
   onDraftKeySwitch,
   getDraftParts,
+  hostRestoresUnsent,
+  onSendReturned,
 }: UseComposerDraftOptions): UseComposerDraftResult {
   const { user } = useUser({ enabled: Boolean(draftKey) });
   const userId = normalizeUserId(user?.user_id);
@@ -459,6 +495,10 @@ export function useComposerDraft({
   const hadPrefillRef = useRef<boolean>(Boolean(prefillMessage));
   const onDraftKeySwitchRef = useRef<(() => void) | undefined>(onDraftKeySwitch);
   const getDraftPartsRef = useRef<(() => DraftParts) | undefined>(getDraftParts);
+  const hostRestoresUnsentRef = useRef<(() => boolean) | undefined>(hostRestoresUnsent);
+  const onSendReturnedRef = useRef<((sentText: string, parts: DraftParts) => void) | undefined>(onSendReturned);
+  /** Mirrors `restoredHadAttachments`, for a save to keep the attachments-again notice standing. */
+  const restoredHadAttachmentsRef = useRef<boolean>(false);
   const prevTargetRef = useRef<{ draftKey?: string; userId: string }>({
     draftKey,
     userId,
@@ -474,10 +514,23 @@ export function useComposerDraft({
     (record: StoredChatDraft | null) => {
       updateRestoredFromInFlight(Boolean(record && record.inFlight));
       setRestoredQuotesState(record?.quotes ?? []);
-      setRestoredHadAttachmentsState(record?.hadAttachments === true);
+      restoredHadAttachmentsRef.current = record?.hadAttachments === true;
+      setRestoredHadAttachmentsState(restoredHadAttachmentsRef.current);
     },
     [updateRestoredFromInFlight],
   );
+
+  /**
+   * The parts a save of the live composer writes: what it holds now, and the
+   * attachments-again notice a failure restore left standing — a later edit
+   * must not drop it before the files are back beside the draft.
+   */
+  const partsForSave = useCallback((): DraftParts => {
+    const parts = getDraftPartsRef.current?.() ?? {};
+    return parts.hadAttachments || restoredHadAttachmentsRef.current
+      ? { ...parts, hadAttachments: true }
+      : parts;
+  }, []);
 
   useLayoutEffect(() => {
     activeDraftKeyRef.current = draftKey;
@@ -488,6 +541,8 @@ export function useComposerDraft({
     }
     onDraftKeySwitchRef.current = onDraftKeySwitch;
     getDraftPartsRef.current = getDraftParts;
+    hostRestoresUnsentRef.current = hostRestoresUnsent;
+    onSendReturnedRef.current = onSendReturned;
   });
 
   useLayoutEffect(() => {
@@ -540,11 +595,11 @@ export function useComposerDraft({
       ) {
         // Parts read at flush: what came back through giveBack after a failed
         // send (mentions, files) has landed by the time the debounce ends.
-        save(key, latestMessageRef.current, uid, undefined, { parts: getDraftPartsRef.current?.() });
+        save(key, latestMessageRef.current, uid, undefined, { parts: partsForSave() });
         dirtyRef.current = false;
       }
     }, DRAFT_SAVE_DEBOUNCE_MS);
-  }, []);
+  }, [partsForSave]);
 
   const setMessage: Dispatch<SetStateAction<string>> = useCallback(
     (action) => {
@@ -557,12 +612,27 @@ export function useComposerDraft({
       updateRestoredFromInFlight(false);
       setMessageState(next);
       if (wasInFlight && activeDraftKeyRef.current && next && next.trim()) {
-        save(activeDraftKeyRef.current, next, activeUserIdRef.current, undefined, { parts: getDraftPartsRef.current?.() });
+        save(activeDraftKeyRef.current, next, activeUserIdRef.current, undefined, { parts: partsForSave() });
       }
       scheduleSave(next);
     },
-    [scheduleSave, updateRestoredFromInFlight],
+    [scheduleSave, updateRestoredFromInFlight, partsForSave],
   );
+
+  /**
+   * DALTON-HOOK(composer-drafts): something beside the text changed (an
+   * attachment was added or removed) that the stored draft carries — saves on
+   * the same debounce, unless a send still owns the box: its own settle writes
+   * the draft, and a clear here would delete the inFlight copy a reload
+   * restores by.
+   */
+  const touchDraft = useCallback(() => {
+    const inFlight = inFlightSendRef.current;
+    if (inFlight && !inFlight.settled) return;
+    if (activeDraftKeyRef.current && latestMessageRef.current.trim()) {
+      scheduleSave(latestMessageRef.current);
+    }
+  }, [scheduleSave]);
 
   const clearCurrentDraft = useCallback(() => {
     if (timerRef.current !== null) {
@@ -587,7 +657,9 @@ export function useComposerDraft({
     const sentText = latestMessageRef.current;
     // The draft as it goes out — a restore after a failed send (this page or a
     // reload) brings back the quotes it carried, not whatever is typed since.
-    const parts = getDraftPartsRef.current?.() ?? {};
+    // The sticky notice counts: a resend of a draft whose files never came
+    // back still owes the attachments-again notice should it fail again.
+    const parts = partsForSave();
     const inFlight: InFlightSendState = {
       draftKey: activeDraftKeyRef.current,
       userId: activeUserIdRef.current,
@@ -625,8 +697,12 @@ export function useComposerDraft({
       }
     };
 
-    const settle = (succeeded: boolean) => {
+    const settle = (succeeded: boolean, fromAcceptance = false) => {
       if (inFlight.settled) return;
+      // A parked send answers only to its resend's acceptance; the promise's
+      // value (and any failure settle) settles nothing while the resend may
+      // still be the copy the server keeps.
+      if (inFlight.handedOff && !fromAcceptance) return;
       inFlight.settled = true;
       // A newer send on this key may have superseded this one while it was in
       // flight (a steer sent mid-stream, say): the key's stored draft and the
@@ -675,11 +751,33 @@ export function useComposerDraft({
           save(sendDraftKey, restoredText, sendUserId, undefined, { parts: inFlight.parts });
         }
         if (restoredText) {
-          latestMessageRef.current = restoredText;
-          dirtyRef.current = false;
-          writtenSinceMountOrSendRef.current = true;
-          updateRestoredFromInFlight(false);
-          setMessageState(restoredText);
+          // DALTON-HOOK(composer-drafts): who re-seats the input depends on
+          // where the composer sits. A host that takes refused sends back
+          // itself (the chat's returnedDraft → giveBack, while the transcript
+          // is out of view) owns the input — this settle only keeps the stored
+          // draft, so a reload before its restore lands still finds the text.
+          // Otherwise the composer restores its own send: the quotes go back
+          // collision-safe through onSendReturned (a quote added since may
+          // have taken the same token), and the attachments-again notice
+          // stands on the box until files are beside the draft again.
+          const restore = onSendReturnedRef.current;
+          if (hostRestoresUnsentRef.current?.()) {
+            latestMessageRef.current = restoredText;
+            dirtyRef.current = false;
+            writtenSinceMountOrSendRef.current = true;
+            updateRestoredFromInFlight(false);
+          } else if (restore) {
+            dirtyRef.current = false;
+            writtenSinceMountOrSendRef.current = true;
+            applyRestored({ text: restoredText, savedAt: 0, hadAttachments: inFlight.parts.hadAttachments });
+            restore(sentText, inFlight.parts);
+          } else {
+            latestMessageRef.current = restoredText;
+            dirtyRef.current = false;
+            writtenSinceMountOrSendRef.current = true;
+            updateRestoredFromInFlight(false);
+            setMessageState(restoredText);
+          }
         }
       } else if (sentText.trim()) {
         save(sendDraftKey, sentText, sendUserId, undefined, { parts: inFlight.parts });
@@ -691,20 +789,26 @@ export function useComposerDraft({
         settle(succeeded);
       },
       acceptSend() {
-        settle(true);
+        settle(true, true);
+      },
+      handOffToResend() {
+        if (inFlight.settled) return;
+        inFlight.handedOff = true;
       },
     };
-  }, [updateRestoredFromInFlight]);
+  }, [updateRestoredFromInFlight, partsForSave]);
 
   const submitWithDraft = useCallback(
-    (invoke: (onAccepted: () => void) => void | boolean | Promise<void | boolean>) => {
+    (invoke: (onAccepted: () => void, onHandedOff: () => void) => void | boolean | Promise<void | boolean>) => {
       const pending = beginSend();
       // The send path reports acceptance early (a run started, a steer was
-      // taken, the send was queued) by calling onAccepted; the promise's
-      // resolved value is the fallback for a send that never reported either.
+      // taken, the send was queued) by calling onAccepted, and a drop that
+      // scheduled the send's own resend by calling onHandedOff — from then the
+      // resend's acceptance is the only thing that settles it. The promise's
+      // resolved value is the fallback for a send that reports neither.
       let result: void | boolean | Promise<void | boolean>;
       try {
-        result = invoke(pending.acceptSend);
+        result = invoke(pending.acceptSend, pending.handOffToResend);
       } catch {
         pending.finalizeSend(false);
         return;
@@ -759,7 +863,7 @@ export function useComposerDraft({
           applyRestored(null);
           onDraftKeySwitchRef.current?.();
           if (followUpText && followUpText.trim()) {
-            save(draftKey, followUpText, userId, undefined, { parts: getDraftPartsRef.current?.() });
+            save(draftKey, followUpText, userId, undefined, { parts: partsForSave() });
             latestMessageRef.current = followUpText;
             dirtyRef.current = false;
             writtenSinceMountOrSendRef.current = true;
@@ -779,7 +883,7 @@ export function useComposerDraft({
               timerRef.current = null;
             }
             if (dirtyRef.current && draftKey) {
-              save(draftKey, latestMessageRef.current, userId, undefined, { parts: getDraftPartsRef.current?.() });
+              save(draftKey, latestMessageRef.current, userId, undefined, { parts: partsForSave() });
               dirtyRef.current = false;
             }
           };
@@ -796,7 +900,7 @@ export function useComposerDraft({
 
         if (continuationText && continuationText.trim()) {
           clearStorageEntry(prev.draftKey, prev.userId);
-          save(draftKey, continuationText, userId, undefined, { parts: getDraftPartsRef.current?.() });
+          save(draftKey, continuationText, userId, undefined, { parts: partsForSave() });
           latestMessageRef.current = continuationText;
           dirtyRef.current = false;
           writtenSinceMountOrSendRef.current = true;
@@ -807,7 +911,7 @@ export function useComposerDraft({
               timerRef.current = null;
             }
             if (dirtyRef.current && draftKey) {
-              save(draftKey, latestMessageRef.current, userId, undefined, { parts: getDraftPartsRef.current?.() });
+              save(draftKey, latestMessageRef.current, userId, undefined, { parts: partsForSave() });
               dirtyRef.current = false;
             }
           };
@@ -843,11 +947,11 @@ export function useComposerDraft({
         timerRef.current = null;
       }
       if (dirtyRef.current && draftKey) {
-        save(draftKey, latestMessageRef.current, userId, undefined, { parts: getDraftPartsRef.current?.() });
+        save(draftKey, latestMessageRef.current, userId, undefined, { parts: partsForSave() });
         dirtyRef.current = false;
       }
     };
-  }, [draftKey, userId, applyRestored]);
+  }, [draftKey, userId, applyRestored, partsForSave]);
 
   return {
     message,
@@ -856,6 +960,7 @@ export function useComposerDraft({
     restoredQuotes,
     restoredHadAttachments,
     clearCurrentDraft,
+    touchDraft,
     beginSend,
     submitWithDraft,
   };

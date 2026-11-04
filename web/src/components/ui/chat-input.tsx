@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback, useImperativeHandle, useMemo } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect, useCallback, useImperativeHandle, useMemo } from 'react'; // DALTON-HOOK(composer-drafts): useLayoutEffect keeps the failure-restore trampoline current
 import { Plus, ChartCandlestick } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router';
@@ -193,6 +193,15 @@ export interface ChatInputProps {
   // DALTON-HOOK(composer-drafts): storage key suffix for persisting unsent composer draft text
   draftKey?: string;
   /**
+   * DALTON-HOOK(composer-drafts): the host takes a refused send back itself —
+   * it watches the chat's returnedDraft and re-seats it through this input's
+   * `giveBack` — while the composer sits where the transcript is out of view.
+   * Then a failed send's settle keeps only the stored draft; the input is the
+   * host's to restore. A host that reports nothing leaves it unset, and the
+   * composer restores the send itself.
+   */
+  hostRestoresUnsent?: () => boolean;
+  /**
    * Context the host gathers above the text box, ruled off from it (the chat
    * view's queued file comments). The host owns what it holds and what a send
    * does with it; pair it with `hasExternalContext` when it makes an empty box
@@ -259,6 +268,7 @@ function ChatInput({
   toolbarStatus = null,
   // DALTON-HOOK(composer-drafts): storage key suffix for persisting unsent composer draft text
   draftKey,
+  hostRestoresUnsent,
   deck = null,
   ref,
 }: ChatInputProps & { ref?: React.Ref<ChatInputHandle> }) {
@@ -276,14 +286,19 @@ function ChatInput({
   // stored draft. Read through a ref so the hook — called before the mentions
   // and attachments exist — sees them as they are when a save flushes.
   const draftPartsRef = useRef<DraftParts>({});
+  // The failure restore needs the mentions machinery, which exists only below
+  // the draft hook; the trampoline lets the hook reach it when a settle runs.
+  const returnSendRef = useRef<((sentText: string, parts: DraftParts) => void) | null>(null);
   const handleDraftKeySwitch = useCallback(() => {
     resetRichDraftRef.current();
   }, []);
-  const { message, setMessage, restoredFromInFlight, restoredQuotes, restoredHadAttachments, clearCurrentDraft, submitWithDraft } = useComposerDraft({
+  const { message, setMessage, restoredFromInFlight, restoredQuotes, restoredHadAttachments, clearCurrentDraft, touchDraft, submitWithDraft } = useComposerDraft({
     draftKey,
     prefillMessage,
     onDraftKeySwitch: handleDraftKeySwitch,
     getDraftParts: () => draftPartsRef.current,
+    hostRestoresUnsent,
+    onSendReturned: (sentText, parts) => returnSendRef.current?.(sentText, parts),
   });
   const { attachedFiles, setAttachedFiles, isDragging, handleFiles, restoreFiles, removeFile, onDragEnter, onDragOver, onDragLeave, onDrop, handlePaste } = useFileAttachments({ disabled });
   const [watchMode, setWatchMode] = useState(false);
@@ -444,10 +459,22 @@ function ChatInput({
 
   // DALTON-HOOK(composer-drafts): what the stored draft keeps — the quotes its
   // text still holds, and whether attachments stood beside them (they are not
-  // persisted; a restore says to add them again).
+  // persisted; a restore says to add them again). A change beside the text —
+  // an attachment added or removed — saves on the same debounce, so the
+  // stored `hadAttachments` tracks the box without a keystroke.
   useEffect(() => {
     draftPartsRef.current = { quotes, hadAttachments: attachedFiles.length > 0 };
   }, [quotes, attachedFiles]);
+  // The mount run is no change: a restored draft is not "typed since", so the
+  // first fire is skipped and only later attachment changes save.
+  const attachmentsTouchedRef = useRef(false);
+  useEffect(() => {
+    if (!attachmentsTouchedRef.current) {
+      attachmentsTouchedRef.current = true;
+      return;
+    }
+    touchDraft();
+  }, [attachedFiles.length, touchDraft]);
 
   // Quotes restored from the stored draft go back into the mentions machine,
   // once per restore: the hook hands back a fresh array each time, and the
@@ -467,6 +494,30 @@ function ChatInput({
   const { isListening, toggleListening, stopListening, abandonListening } = useVoiceInput({ message, setMessage, isLoading });
 
   const givenBackBesideRef = useLatestRef(mentionedFiles);
+
+  // DALTON-HOOK(composer-drafts): what a refused send leaves in the composer
+  // when no host giveBack takes it (the plain chat view): its quotes re-seated
+  // against the tokens the input holds now — a quote added since may have
+  // taken the same words, so the returning one is renumbered rather than
+  // misattributed — and its text ahead of what was typed since, as the draft
+  // settlement and giveBack compose it. Files are not kept; the
+  // attachments-again notice says so.
+  const returnSendToComposer = useCallback((sentText: string, parts: DraftParts) => {
+    const quotes = parts.quotes ?? [];
+    // The beside-ref is written in a layout effect and may still hold the
+    // mentions the send cleared; the sent quotes are never "beside" their own
+    // restore.
+    const held = givenBackBesideRef.current.filter((m) => !quotes.some((q) => sameMention(q, m)));
+    const back = readGivenBack(sentText, quotes, held);
+    givenBackBesideRef.current = [...held, ...back.mentions];
+    // Sent text first, then whatever was typed since — and nothing after it
+    // when nothing was.
+    if (back.text) setMessage((prev) => (prev.trim() ? withGivenBack(back.text, prev) : back.text));
+    if (back.mentions.length > 0) setMentionedFiles((prev) => [...prev, ...back.mentions]);
+  }, [setMessage, setMentionedFiles]);
+  useLayoutEffect(() => {
+    returnSendRef.current = returnSendToComposer;
+  });
 
   // The handle is built before the send below, so it reaches it through here.
   const sendRef = useRef<() => boolean>(() => false);
@@ -772,8 +823,14 @@ function ChatInput({
     // DALTON-HOOK(composer-drafts): the input clears immediately; the stored
     // draft is removed only once the send is accepted (onAccepted fires from
     // the host) or resolves truthy — upstream hosts that report nothing fall
-    // back to the promise's value, and a void return settles as sent.
-    submitWithDraft((onAccepted) =>
+    // back to the promise's value, and a void return settles as sent. A send
+    // handed to its own automatic resend (onHandedOff) settles only when the
+    // resend itself is taken.
+    // DALTON-HOOK(composer-drafts): clear the chips before the send settles,
+    // not after — a send refused at once is put back (its quote chips
+    // included) inside submitWithDraft, and a later reset would drop them.
+    resetMentions();
+    submitWithDraft((onAccepted, onHandedOff) =>
       onSend({
         text: message,
         files: readyAttachments,
@@ -789,12 +846,12 @@ function ChatInput({
           ...ownOverrides,
           widgetSnapshots: widgetSnapshots.length ? widgetSnapshots : undefined,
           onAccepted,
+          onHandedOff,
         },
       }),
     );
     attachedFiles.forEach(f => { if (f.preview) URL.revokeObjectURL(f.preview); });
     setAttachedFiles([]);
-    resetMentions();
     resetSlash();
     // Clear widget deck on send. Other mounted chat inputs hear the same
     // clear via ContextBus so the deck empties everywhere — single source

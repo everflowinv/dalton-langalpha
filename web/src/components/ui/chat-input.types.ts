@@ -107,6 +107,13 @@ export interface ModelOptions {
    * uncalled and their return value settles the draft instead.
    */
   onAccepted?: () => void;
+  /**
+   * DALTON-HOOK(composer-drafts): the send path calls this when a drop
+   * scheduled the send's own automatic resend — from then only the resend's
+   * acceptance (reported through `onAccepted`) settles the draft, and the
+   * stored draft keeps its inFlight mark so a reload restores the text.
+   */
+  onHandedOff?: () => void;
 }
 
 export interface ReadyAttachment {

@@ -185,16 +185,27 @@ interface SendOptions extends ModelOptions {
   /**
    * DALTON-HOOK(composer-drafts): called once, as early as the server has
    * taken this send — the first metadata carrying a run_id, a steer accepted
-   * or merged into the running turn, an adopted duplicate, a reconnect to
-   * the already-started stream, or an auto-retry scheduled. The composer's
-   * draft settles as sent here, so a reload mid-stream never restores an
-   * already-sent message into the input. The send's returned boolean stays
-   * the fallback for a send that never reports either way. A send parked
-   * for compaction is not taken: it accepts — and its promise settles —
-   * only once the flushed send goes out, or settles false when a stop
-   * drops it.
+   * or merged into the running turn, an adopted duplicate, a reconnect to the
+   * already-started stream, or (for a send whose drop scheduled an automatic
+   * resend) that resend's own first frame. The composer's draft settles as
+   * sent here, so a reload mid-stream never restores an already-sent message
+   * into the input. The send's returned boolean stays the fallback for a send
+   * that never reports either way. A send parked for compaction is not taken:
+   * it accepts — and its promise settles — only once the flushed send goes
+   * out, or settles false when a stop drops it.
    */
   onAccepted?: () => void;
+  /**
+   * DALTON-HOOK(composer-drafts): called when a drop scheduled the send's own
+   * automatic resend — the resend, not the response headers, is what can prove
+   * the server took the message (#675 sends them before admission), so the
+   * composer parks its stored draft (kept inFlight, restorable on reload)
+   * until the resend's acceptance reports through `onAccepted`, which rides
+   * the resent attempts' model options. The send's returned boolean settles
+   * nothing then; a chain that gives up leaves the draft parked and the
+   * failed reply's Retry owns the message.
+   */
+  onHandedOff?: () => void;
   /**
    * What the composer held when it sent this. Should the server not keep the
    * send while the host has the transcript out of view (`returnsUnsent`), it

@@ -408,10 +408,11 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
   });
 
   // #675 sends the response headers while the stream is still setting up, so a
-  // drop after them is no longer proof the server took the send. The conclusion
-  // the draft takes is the one the stream itself reported — a first metadata
-  // frame, a recovery naming the run — or the one a scheduled resend or an
-  // adopted duplicate settles for it.
+  // drop after them is no longer proof the server took the send. The draft
+  // settles only on what proves the server holds the turn — a first metadata
+  // frame, a recovery naming the run, an adopted duplicate — and while a
+  // scheduled resend still owes that proof, the stored draft keeps its
+  // inFlight mark so a reload restores the text with the notice.
   describe('a send that only saw the response headers', () => {
     const DRAFT_KEY = 'thread:headers-only';
 
@@ -422,6 +423,24 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
       return { chat, composer };
     }
 
+    /** The stored record under the harness's key, or null. */
+    const storedDraft = (): { text?: string; inFlight?: boolean } | null => {
+      const raw = localStorage.getItem(`dalton.chatDraft.v2:anon:${DRAFT_KEY}`);
+      return raw ? (JSON.parse(raw) as { text?: string; inFlight?: boolean }) : null;
+    };
+
+    /** Lets timer-scheduled microtasks run between fake-clock steps. */
+    async function settle(ms: number) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(ms);
+      });
+      for (let i = 0; i < 5; i++) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(0);
+        });
+      }
+    }
+
     beforeEach(() => {
       localStorage.clear();
     });
@@ -430,41 +449,109 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
       localStorage.clear();
     });
 
-    it('settles accepted when the auto-resend takes the send over (the resend goes out under the first key)', async () => {
-      // No frame at all — only the headers — then the body drops.
-      mockSendStream.mockImplementation(async () => ({ disconnected: true }));
+    it('keeps the draft inFlight while the auto-resend waits, and settles only when the resend is taken', async () => {
+      // The server's own recoverable failure — the retry frame error_handling
+      // emits, auto_retry on and no run_id (the run never started) — then the
+      // drop. The resend that answers (call 2) starts its run and its first
+      // frame is what proves the message arrived.
+      const requestKeyOf = (args: unknown[]) => (args[3] as { requestKey?: string }).requestKey;
+      mockSendStream.mockImplementation(
+        async (_msg: string, _ws: string, _tid: string | null, opts: StreamOptions) => {
+          if (mockSendStream.mock.calls.length === 1) {
+            opts.onEvent?.({
+              event: 'retry',
+              message: 'Temporary error occurred, you can retry or resume the turn',
+              auto_retry: true,
+              error_type: 'timeout_error',
+              error_class: 'RuntimeError',
+              retry_count: 1,
+              max_retries: 3,
+              recovery: 'resend',
+            } as never);
+            return { disconnected: true };
+          }
+          opts.onEvent?.({ event: 'metadata', thread_id: 'thread-headers', run_id: 'run-headers-2' } as never);
+          return { disconnected: false };
+        },
+      );
 
       const accepted = vi.fn();
-      const { result, unmount } = renderHookWithProviders(() => useChatMessages('ws-test'));
+      const handedOff = vi.fn();
+      const { result, unmount } = renderHookWithProviders(() => useDraftChatHarness());
+      act(() => {
+        result.current.composer.setMessage('dropped in setup');
+      });
 
       vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      let sendPromise!: Promise<boolean>;
       try {
-        let outcome: boolean | undefined;
-        await act(async () => {
-          outcome = await result.current.handleSendMessage('dropped in setup', null, null, {
-            onAccepted: accepted,
+        act(() => {
+          result.current.composer.submitWithDraft((onAccepted, onHandedOff) => {
+            sendPromise = result.current.chat.handleSendMessage('dropped in setup', null, null, {
+              onAccepted: () => {
+                onAccepted();
+                accepted();
+              },
+              onHandedOff: () => {
+                onHandedOff();
+                handedOff();
+              },
+            });
+            return sendPromise;
           });
         });
+        await settle(0);
 
-        // The dropped-before-run resend owns the message from here — the draft
-        // settles sent against it, not against the headers.
+        // The backoff (1s) still owes the resend: nothing says the server took
+        // the message. The send parks the draft — the stored copy keeps its
+        // inFlight mark, which a reload restores with the notice — and the
+        // input stays clear for the resend that owns the message.
+        expect(mockSendStream).toHaveBeenCalledTimes(1);
+        expect(handedOff).toHaveBeenCalledTimes(1);
+        expect(accepted).not.toHaveBeenCalled();
+        expect(result.current.composer.message).toBe('');
+        expect(storedDraft()).toMatchObject({ text: 'dropped in setup', inFlight: true });
+
+        // The server said this attempt failed before any run, so upstream sends
+        // the resend as a new request (useChatMessages.autoRetry.test.ts,
+        // "resends the same message as a send when the server started no run");
+        // its first frame is what settles the draft.
+        await settle(1000);
+        expect(mockSendStream).toHaveBeenCalledTimes(2);
+        expect(requestKeyOf(mockSendStream.mock.calls[1])).not.toBe(requestKeyOf(mockSendStream.mock.calls[0]));
+
+        // The parked draft settles through the resend's acceptance alone; the
+        // promise's own true (it resolves once the turn is handed off) settled
+        // nothing.
         expect(accepted).toHaveBeenCalledTimes(1);
-        expect(outcome).toBe(true);
-        expect(result.current.isLoading).toBe(true);
+        expect(storedDraft()).toBeNull();
+        let resolved: boolean | undefined;
+        await act(async () => {
+          void sendPromise.then((v) => { resolved = v; });
+          await Promise.resolve();
+        });
+        expect(resolved).toBe(true);
       } finally {
-        // The pending backoff timer dies with the fake clock; nothing resends.
         vi.useRealTimers();
       }
       unmount();
     });
 
     it('does not settle accepted when no resend can take the send — the draft returns to the composer', async () => {
-      // A manual-recovery notice arrived before the drop, so the scheduled
-      // auto-resend does not apply and nothing the stream reported says the
-      // server kept the send.
+      // A manual-recovery failure arrived before the drop — the non-recoverable
+      // `error` frame shape the server emits with a recovery named and no
+      // auto_retry — so no scheduled resend applies and nothing the stream
+      // reported says the server kept the send.
       mockSendStream.mockImplementation(
         async (_msg: string, _ws: string, _tid: string | null, opts: StreamOptions) => {
-          opts.onEvent?.({ event: 'retry', message: 'Temporary error', recovery: 'resend' } as never);
+          opts.onEvent?.({
+            event: 'error',
+            error: 'Workspace ws-test not found',
+            type: 'workflow_error',
+            error_type: 'workspace_not_found',
+            error_class: 'ValueError',
+            recovery: 'resend',
+          } as never);
           return { disconnected: true };
         },
       );
@@ -494,6 +581,102 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
       // The draft came back: in the input and still stored.
       expect(result.current.composer.message).toBe('headers only, then dropped');
       expect(load(DRAFT_KEY)).toBe('headers only, then dropped');
+    });
+
+    it('returns the draft whole when the user stops before the run\'s first frame — the server holds nothing of it', async () => {
+      // The stream hangs in setup (headers at most, no frame); the stop aborts
+      // it. #675 sends the headers before admission, so nothing reached the
+      // server and the draft comes back instead of settling sent.
+      let hang!: (value: { disconnected: boolean; aborted: boolean }) => void;
+      mockSendStream.mockImplementation(
+        () => new Promise((resolve) => { hang = resolve; }),
+      );
+
+      const accepted = vi.fn();
+      const { result } = renderHookWithProviders(() => useDraftChatHarness());
+      act(() => {
+        result.current.composer.setMessage('stopped before the run began');
+      });
+      let sendPromise!: Promise<boolean>;
+      act(() => {
+        result.current.composer.submitWithDraft((onAccepted) => {
+          sendPromise = result.current.chat.handleSendMessage('stopped before the run began', null, null, {
+            onAccepted: () => {
+              onAccepted();
+              accepted();
+            },
+          });
+          return sendPromise;
+        });
+      });
+      // Let the stream open (headers at most) before the stop lands.
+      await act(async () => {
+        await Promise.resolve();
+      });
+
+      await act(async () => {
+        await result.current.chat.stopWorkflow();
+      });
+      await act(async () => {
+        hang({ disconnected: false, aborted: true });
+      });
+      let outcome: boolean | undefined;
+      await act(async () => {
+        outcome = await sendPromise;
+      });
+
+      expect(accepted).not.toHaveBeenCalled();
+      expect(outcome).toBe(false);
+      expect(result.current.composer.message).toBe('stopped before the run began');
+      expect(load(DRAFT_KEY)).toBe('stopped before the run began');
+    });
+
+    it('settles sent when the user stops after the run\'s first frame — the message is the server\'s', async () => {
+      let hang!: (value: { disconnected: boolean; aborted: boolean }) => void;
+      mockSendStream.mockImplementation(
+        (_msg: string, _ws: string, _tid: string | null, opts: StreamOptions) =>
+          new Promise((resolve) => {
+            opts.onEvent?.({ event: 'metadata', thread_id: 'thread-stop-after', run_id: 'run-stop-after' } as never);
+            hang = resolve;
+          }),
+      );
+
+      const accepted = vi.fn();
+      const { result } = renderHookWithProviders(() => useDraftChatHarness());
+      act(() => {
+        result.current.composer.setMessage('stopped after the run began');
+      });
+      let sendPromise!: Promise<boolean>;
+      act(() => {
+        result.current.composer.submitWithDraft((onAccepted) => {
+          sendPromise = result.current.chat.handleSendMessage('stopped after the run began', null, null, {
+            onAccepted: () => {
+              onAccepted();
+              accepted();
+            },
+          });
+          return sendPromise;
+        });
+      });
+      // The run's first frame arrives before the stop lands.
+      await act(async () => {
+        await Promise.resolve();
+      });
+
+      await act(async () => {
+        await result.current.chat.stopWorkflow();
+      });
+      await act(async () => {
+        hang({ disconnected: false, aborted: true });
+      });
+      let outcome: boolean | undefined;
+      await act(async () => {
+        outcome = await sendPromise;
+      });
+
+      expect(accepted).toHaveBeenCalledTimes(1);
+      expect(outcome).toBe(true);
+      expect(load(DRAFT_KEY)).toBe('');
     });
 
     it('settles accepted when a duplicate request is adopted — the server already took a copy', async () => {

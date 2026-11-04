@@ -73,6 +73,11 @@ import type {
 import { createAnswerBoard, type AnswerBoard } from '../session/interrupts/answerBoard';
 import { useInterruptAnswers } from '../session/interrupts/useInterruptAnswers';
 export type { ModelStatus, FallbackSuggestion } from '../session/types';
+// DALTON-HOOK(composer-drafts): a plain send's acceptance callback rides the
+// model options its scheduled resent attempts carry (settleRetry hands them to
+// streamFromCheckpoint verbatim), so the send whose drop scheduled the resend
+// settles its draft when the resend itself is taken, not before.
+type ResendModelOptions = ModelOptions & Pick<SendOptions, 'onAccepted'>;
 import type { ChatSessionRuntime } from '../session/runtime';
 import { noteLiveRun } from '../session/latestRun';
 import type { CardUpdater } from '../session/streamRefs';
@@ -2471,7 +2476,7 @@ export function useChatMessages(
   };
 
   // DALTON-HOOK(composer-drafts): return explicit boolean send outcome so ChatInput preserves drafts on failure
-  const handleSendMessage = async (message: string, additionalContext: Record<string, unknown>[] | null = null, attachmentMeta: Record<string, unknown>[] | null = null, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, hiddenOpener = false, threadTitle, artifactComments, draft, onAccepted, keepFullContext = false }: SendOptions = {}, resend: Resend = {}): Promise<boolean> => {
+  const handleSendMessage = async (message: string, additionalContext: Record<string, unknown>[] | null = null, attachmentMeta: Record<string, unknown>[] | null = null, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, hiddenOpener = false, threadTitle, artifactComments, draft, onAccepted, onHandedOff, keepFullContext = false }: SendOptions = {}, resend: Resend = {}): Promise<boolean> => {
     // What the request carries, and a resend of it again.
     const commentSend = commentSendOf(artifactComments);
     const hasContent = message.trim() || (additionalContext && additionalContext.length > 0) || !!commentSend;
@@ -2790,10 +2795,12 @@ export function useChatMessages(
       const resumed = result?.aborted && backgroundReconnectRef.current && !wasStoppedRef.current;
       if (resumed) backgroundReconnectRef.current = false;
       else if (result?.aborted || wasStoppedRef.current) {
-        // DALTON-HOOK(composer-drafts): the user's stop left their message in
-        // the transcript, so the draft settles sent rather than come back over
-        // the record.
-        return true;
+        // DALTON-HOOK(composer-drafts): #675 sends the headers before admission
+        // runs, so a stop that lands before the run's first frame leaves the
+        // server holding nothing of this send — the draft comes back whole
+        // (a false outcome restores it). Past the first frame the run is the
+        // server's and its message is in the transcript: sent.
+        return acceptedFired;
       }
 
       // A drop with no run on screen goes again rather than look for one to
@@ -2806,11 +2813,21 @@ export function useChatMessages(
       // Checked before the disconnect: the server drops the connection right
       // after a retry notice, and the run it names is already over, so there
       // is nothing to reconnect to. A scheduled resend owns finalization.
-      if (refs.retryNotice && settleRetry(refs.retryNotice, currentMessageRef.current || assistantMessageId, 0, { model, reasoningEffort, fastMode }, sendRequest(message, additionalContext, { subagentsAllowed, keepFullContext, artifactComments: commentSend }), requestKey, null, admission.unstarted())) {
+      // DALTON-HOOK(composer-drafts): the draft settles only when the resend
+      // itself is taken — its own first frame, or an adopted duplicate of it —
+      // which its acceptance callback (riding the model options every resent
+      // attempt carries) reports. Until then the composer keeps its stored
+      // draft marked inFlight (onHandedOff parks it), so a reload while the
+      // backoff waits restores the text with the "may already have gone
+      // through" notice instead of losing it; the resend goes out under the
+      // same request key, so a copy the first attempt left is adopted rather
+      // than doubled. A chain that gives up leaves it parked: the failed
+      // reply's Retry owns the message from there and the draft survives in
+      // storage.
+      if (refs.retryNotice && settleRetry(refs.retryNotice, currentMessageRef.current || assistantMessageId, 0, { model, reasoningEffort, fastMode, onAccepted: notifyAccepted }, sendRequest(message, additionalContext, { subagentsAllowed, keepFullContext, artifactComments: commentSend }), requestKey, null, admission.unstarted())) {
         wasDisconnected = true;
         ended = 'handedOff';
-        // DALTON-HOOK(composer-drafts): scheduled retry owns the send — the server took it, the draft settles sent
-        notifyAccepted();
+        onHandedOff?.();
         return true;
       }
 
@@ -2855,9 +2872,12 @@ export function useChatMessages(
           // An aborted stream (user hit stop) is intentional, not a failure.
           // streamFetch normally swallows AbortError and returns { aborted },
           // but guard here too so a stop never surfaces an error banner.
-          // DALTON-HOOK(composer-drafts): user stop / duplicate adoption counts as accepted send
+          // DALTON-HOOK(composer-drafts): a stop before the run's first frame
+          // leaves the server holding nothing (#675 sends headers ahead of
+          // admission) — the draft settles by what the stream reported, not by
+          // the stop itself.
           if ((err as Error)?.name === 'AbortError' || wasStoppedRef.current) {
-            return true;
+            return acceptedFired;
           }
           // A copy steered into another turn needs a turn running, which a
           // hidden opener's new chat has none of.
@@ -3311,7 +3331,9 @@ export function useChatMessages(
    * `cut` is what a fork's refusal gives back, and `shown` the bubbles the
    * caller already drew in its place.
    */
-  const streamFromCheckpoint = useStableHandler(async (request: TurnRequest, truncateIndex: number, snapshot: readonly ChatMessage[], modelOptions: ModelOptions = {}, { rerun, cut, shown }: { rerun?: { spent: number; send?: UnstartedSend | null }; cut?: ForkCut | null; shown?: ShownBubbles } = {}) => {
+  // DALTON-HOOK(composer-drafts): the resent attempt's model options may carry
+  // the original send's acceptance callback (see ResendModelOptions).
+  const streamFromCheckpoint = useStableHandler(async (request: TurnRequest, truncateIndex: number, snapshot: readonly ChatMessage[], modelOptions: ResendModelOptions = {}, { rerun, cut, shown }: { rerun?: { spent: number; send?: UnstartedSend | null }; cut?: ForkCut | null; shown?: ShownBubbles } = {}) => {
     const { message, checkpointId, forkFromTurn, retryOf } = request;
     const viaRetryEndpoint = retryOf !== null;
     // Callers check the slot is free: an edit or regenerate already holds it
@@ -3487,6 +3509,17 @@ export function useChatMessages(
         admission?.observe(event);
         if (event.event === 'metadata' && !isSubagentEvent(event)) runFrameSeen = true;
         if (event.event === 'metadata' || event.event === 'steering_accepted') requestKeys.settle(requestKey, 'accepted');
+        // DALTON-HOOK(composer-drafts): this request is a resent attempt of a
+        // send whose drop scheduled it — the send the server finally took is
+        // this one, so its acceptance (the run's first frame, or a recoverable
+        // failure naming the run) settles the original send's draft.
+        if (
+          !isSubagentEvent(event)
+          && (event.event === 'metadata'
+            || ((event.event === 'error' || event.event === 'retry') && event.recovery && typeof event.run_id === 'string'))
+        ) {
+          modelOptions.onAccepted?.();
+        }
         // As for a send: the hint goes once the run this request starts does.
         if (event.event === 'metadata' && !isSubagentEvent(event)) spendNextSummary();
         processStreamFrame(event);
@@ -3592,6 +3625,9 @@ export function useChatMessages(
       const askAgain = rerun && ((bubbleId: string) => (settleRetry(DROPPED_BEFORE_RUN, bubbleId, rerun.spent, modelOptions, request, requestKey, forkCut, plainSend ? admission?.unstarted() ?? null : null) ? 'resending' as const : 'failed' as const));
       if (retryFailedDuplicate(err, assistantMessageId, request, modelOptions, requestKey, rerun?.spent ?? 0) || adoptDuplicateRun(err, assistantMessageId, requestKey, askAgain || undefined)) {
         wasDisconnected = true;
+        // DALTON-HOOK(composer-drafts): the adopted duplicate is the server
+        // holding the resent copy — the original send's draft settles sent.
+        modelOptions.onAccepted?.();
         return;
       }
       if (recoverRefusedFork(err)) return;
@@ -3638,7 +3674,9 @@ export function useChatMessages(
    * `requestKey`, and `cut` the fork it stands for, and `send` the send the
    * server started no run of, which a resend of it carries.
    */
-  const settleRetry = (notice: RetryNotice, bubbleId: string, spent: number, modelOptions: ModelOptions, request: TurnRequest | null, requestKey: string, cut: ForkCut | null = null, send: UnstartedSend | null = null): boolean =>
+  // DALTON-HOOK(composer-drafts): the options ride to the resent attempt, its
+  // acceptance callback included.
+  const settleRetry = (notice: RetryNotice, bubbleId: string, spent: number, modelOptions: ResendModelOptions, request: TurnRequest | null, requestKey: string, cut: ForkCut | null = null, send: UnstartedSend | null = null): boolean =>
     settleRetryNotice(
       {
         setMessages,
