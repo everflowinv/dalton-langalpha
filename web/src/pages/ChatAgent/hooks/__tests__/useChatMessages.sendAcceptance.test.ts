@@ -41,7 +41,7 @@ vi.mock('@/hooks/useUser', () => ({
 import { sendChatMessageStream } from '../../utils/api';
 import { ensureThreadId } from '../../session/threadCreation';
 import { useChatMessages } from '../useChatMessages';
-import { useComposerDraft, load } from '@/lib/dalton/chatDrafts';
+import { useComposerDraft, load, loadInFlightCopy } from '@/lib/dalton/chatDrafts';
 
 const mockSendStream = sendChatMessageStream as Mock;
 const mockEnsureThreadId = ensureThreadId as Mock;
@@ -271,10 +271,10 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
       void sendPromise.then(() => { settled = true; });
       expect(settled).toBe(false);
       expect(result.current.chat.queuedSend).toBe('held while compacting');
-      // The composer input is clear for the next thought, but the draft text
-      // survives in storage — the queue cleared nothing.
+      // The composer input is clear for the next thought, but the send's copy
+      // survives in its own storage slot — the queue cleared nothing.
       expect(result.current.composer.message).toBe('');
-      expect(load(DRAFT_KEY)).toBe('held while compacting');
+      expect(loadInFlightCopy(DRAFT_KEY)?.text).toBe('held while compacting');
     });
 
     it('settles the parked send as failed when the user stops, so the draft returns to the composer', async () => {
@@ -407,11 +407,11 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
   });
 
   // #675 sends the response headers while the stream is still setting up, so a
-  // drop after them is no longer proof the server took the send. The draft
-  // settles only on what proves the server holds the turn — a first metadata
-  // frame, a recovery naming the run, an adopted duplicate — and while a
-  // scheduled resend still owes that proof, the stored draft keeps its
-  // inFlight mark so a reload restores the text with the notice.
+  // drop after them is no longer proof the server took the send. The send's
+  // copy settles only on what proves the server holds the turn — a first
+  // metadata frame, a recovery naming the run, an adopted duplicate — and
+  // while a scheduled resend still owes that proof, the copy stands under its
+  // own storage key so a reload offers it above the box with the notice.
   describe('a send that only saw the response headers', () => {
     const DRAFT_KEY = 'thread:headers-only';
 
@@ -422,10 +422,10 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
       return { chat, composer };
     }
 
-    /** The stored record under the harness's key, or null. */
-    const storedDraft = (): { text?: string; inFlight?: boolean } | null => {
-      const raw = localStorage.getItem(`dalton.chatDraft.v2:anon:${DRAFT_KEY}`);
-      return raw ? (JSON.parse(raw) as { text?: string; inFlight?: boolean }) : null;
+    /** The send's own copy (its separate storage slot), or null. */
+    const storedCopy = (): { text?: string } | null => {
+      const raw = localStorage.getItem(`dalton.chatInFlight.v1:anon:${DRAFT_KEY}`);
+      return raw ? (JSON.parse(raw) as { text?: string }) : null;
     };
 
     /** Lets timer-scheduled microtasks run between fake-clock steps. */
@@ -502,14 +502,14 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
         await settle(0);
 
         // The backoff (1s) still owes the resend: nothing says the server took
-        // the message. The send parks the draft — the stored copy keeps its
-        // inFlight mark, which a reload restores with the notice — and the
-        // input stays clear for the resend that owns the message.
+        // the message. The send parks — its copy stands under its own key,
+        // which a reload offers with the notice — and the input stays clear
+        // for the resend that owns the message.
         expect(mockSendStream).toHaveBeenCalledTimes(1);
         expect(handedOff).toHaveBeenCalledTimes(1);
         expect(accepted).not.toHaveBeenCalled();
         expect(result.current.composer.message).toBe('');
-        expect(storedDraft()).toMatchObject({ text: 'dropped in setup', inFlight: true });
+        expect(storedCopy()).toMatchObject({ text: 'dropped in setup' });
 
         // The server said this attempt failed before any run, so upstream sends
         // the resend as a new request (useChatMessages.autoRetry.test.ts,
@@ -523,7 +523,7 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
         // promise's own true (it resolves once the turn is handed off) settled
         // nothing.
         expect(accepted).toHaveBeenCalledTimes(1);
-        expect(storedDraft()).toBeNull();
+        expect(storedCopy()).toBeNull();
         let resolved: boolean | undefined;
         await act(async () => {
           void sendPromise.then((v) => { resolved = v; });
@@ -751,7 +751,7 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
         await settle(0);
         expect(mockSendStream).toHaveBeenCalledTimes(1);
         expect(accepted).not.toHaveBeenCalled();
-        expect(storedDraft()).toMatchObject({ text: 'stopped mid-backoff', inFlight: true });
+        expect(storedCopy()).toMatchObject({ text: 'stopped mid-backoff' });
 
         await act(async () => {
           await result.current.chat.stopWorkflow();
@@ -763,7 +763,7 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
         expect(accepted).not.toHaveBeenCalled();
         expect(result.current.composer.message).toBe('stopped mid-backoff');
         expect(load(DRAFT_KEY)).toBe('stopped mid-backoff');
-        expect(storedDraft()?.inFlight).not.toBe(true);
+        expect(storedCopy()).toBeNull();
       } finally {
         vi.useRealTimers();
       }
@@ -817,7 +817,7 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
         });
         await settle(0);
         // The chain's first leg parks the draft.
-        expect(storedDraft()).toMatchObject({ text: 'exhausted then retried', inFlight: true });
+        expect(storedCopy()).toMatchObject({ text: 'exhausted then retried' });
 
         // The last automatic attempt fails the same way: the chain gives up,
         // and the draft comes back whole.
@@ -828,15 +828,18 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
         expect(load(DRAFT_KEY)).toBe('exhausted then retried');
 
         // The failed reply's Retry, carrying the held acceptance, goes out and
-        // the server takes it: the restored draft settles sent — and an
-        // untouched box goes with the stored copy.
+        // the server takes it: the send settles sent. Its copy was already
+        // seated back and removed by the restore, so nothing is deleted — the
+        // box and its live draft are the user's now (lead's round-5 decision:
+        // an acceptance never clears what the box holds).
         await act(async () => {
           await result.current.chat.handleRetry();
         });
         expect(mockSendStream).toHaveBeenCalledTimes(3);
         expect(accepted).toHaveBeenCalledTimes(1);
-        expect(load(DRAFT_KEY)).toBe('');
-        expect(result.current.composer.message).toBe('');
+        expect(storedCopy()).toBeNull();
+        expect(result.current.composer.message).toBe('exhausted then retried');
+        expect(load(DRAFT_KEY)).toBe('exhausted then retried');
       } finally {
         vi.useRealTimers();
       }
@@ -964,7 +967,7 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
           });
         });
         await settle(0);
-        expect(storedDraft()).toMatchObject({ text: 'steered away', inFlight: true });
+        expect(storedCopy()).toMatchObject({ text: 'steered away' });
 
         await settle(1000);
         expect(mockSendStream).toHaveBeenCalledTimes(2);
@@ -1020,7 +1023,7 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
           });
         });
       });
-      // Parked, not taken: no stream, no acceptance, the draft inFlight.
+      // Parked, not taken: no stream, no acceptance, the copy standing.
       expect(mockSendStream).not.toHaveBeenCalled();
       expect(accepted).not.toHaveBeenCalled();
 
@@ -1035,17 +1038,336 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
         expect(mockSendStream).toHaveBeenCalledTimes(1);
         expect(accepted).not.toHaveBeenCalled();
         expect(result.current.composer.message).toBe('');
-        expect(storedDraft()).toMatchObject({ text: 'queued then resent', inFlight: true });
+        expect(storedCopy()).toMatchObject({ text: 'queued then resent' });
 
-        // The resend is taken: the parked draft settles sent.
+        // The resend is taken: the parked copy settles sent.
         await settle(1000);
         expect(mockSendStream).toHaveBeenCalledTimes(2);
         expect(accepted).toHaveBeenCalledTimes(1);
-        expect(storedDraft()).toBeNull();
+        expect(storedCopy()).toBeNull();
       } finally {
         vi.useRealTimers();
       }
       unmount();
+    });
+
+    it('an acceptance after the user typed leaves only what they typed, in the box and after a reload', async () => {
+      // Parked on the automatic resend, the user types a next thought. The
+      // resend is then taken: the send's copy goes, the typed draft is
+      // untouched — a reload finds only the typed text, with no offer.
+      mockSendStream.mockImplementation(
+        async (_msg: string, _ws: string, _tid: string | null, opts: StreamOptions) => {
+          if (mockSendStream.mock.calls.length === 1) {
+            opts.onEvent?.({
+              event: 'retry',
+              message: 'Temporary error occurred, you can retry or resume the turn',
+              auto_retry: true,
+              error_type: 'timeout_error',
+              error_class: 'RuntimeError',
+              retry_count: 1,
+              max_retries: 3,
+              recovery: 'resend',
+            } as never);
+            return { disconnected: true };
+          }
+          opts.onEvent?.({ event: 'metadata', thread_id: 'thread-typed', run_id: 'run-typed-2' } as never);
+          return { disconnected: false };
+        },
+      );
+
+      const accepted = vi.fn();
+      const { result, unmount } = renderHookWithProviders(() => useDraftChatHarness());
+      act(() => {
+        result.current.composer.setMessage('sent while parked');
+      });
+
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        act(() => {
+          result.current.composer.submitWithDraft((onAccepted, onHandedOff, onRestore) =>
+            result.current.chat.handleSendMessage('sent while parked', null, null, {
+              onAccepted: () => {
+                onAccepted();
+                accepted();
+              },
+              onHandedOff,
+              onNotTaken: onRestore,
+            }),
+          );
+        });
+        await settle(0);
+        expect(storedCopy()).toMatchObject({ text: 'sent while parked' });
+
+        act(() => {
+          result.current.composer.setMessage('typed while out');
+        });
+        await settle(300);
+        expect(load(DRAFT_KEY)).toBe('typed while out');
+
+        await settle(1000);
+        expect(accepted).toHaveBeenCalledTimes(1);
+        expect(storedCopy()).toBeNull();
+        expect(result.current.composer.message).toBe('typed while out');
+        expect(result.current.composer.inFlightCopy).toBeNull();
+      } finally {
+        vi.useRealTimers();
+      }
+      unmount();
+
+      // The reload finds only what the user typed, and no offered copy.
+      const reopened = renderHookWithProviders(() => useDraftChatHarness());
+      expect(reopened.result.current.composer.message).toBe('typed while out');
+      expect(reopened.result.current.composer.inFlightCopy).toBeNull();
+      reopened.unmount();
+    });
+
+    it('a manual Retry that succeeds never deletes what the user typed while the send was out', async () => {
+      // The chain exhausts and seats the sent words back; the user types a
+      // next thought over them; the failed reply's Retry goes out and is
+      // taken. The acceptance deletes the send's copy (already seated back
+      // and gone) — the box and its live draft keep everything.
+      const retryFrame = {
+        event: 'retry',
+        message: 'Temporary error occurred, you can retry or resume the turn',
+        auto_retry: true,
+        error_type: 'timeout_error',
+        error_class: 'RuntimeError',
+        retry_count: 1,
+        max_retries: 1,
+        recovery: 'resend',
+      } as never;
+      mockSendStream.mockImplementation(
+        async (_msg: string, _ws: string, _tid: string | null, opts: StreamOptions) => {
+          if (mockSendStream.mock.calls.length <= 2) {
+            opts.onEvent?.(retryFrame);
+            return { disconnected: true };
+          }
+          opts.onEvent?.({ event: 'metadata', thread_id: 'thread-typed-retry', run_id: 'run-typed-retry-3' } as never);
+          return { disconnected: false };
+        },
+      );
+
+      const accepted = vi.fn();
+      const { result, unmount } = renderHookWithProviders(() => useDraftChatHarness());
+      act(() => {
+        result.current.composer.setMessage('sent words');
+      });
+
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        act(() => {
+          result.current.composer.submitWithDraft((onAccepted, onHandedOff, onRestore) =>
+            result.current.chat.handleSendMessage('sent words', null, null, {
+              onAccepted: () => {
+                onAccepted();
+                accepted();
+              },
+              onHandedOff,
+              onNotTaken: onRestore,
+            }),
+          );
+        });
+        await settle(1000);
+        await settle(1000);
+        expect(result.current.composer.message).toBe('sent words');
+
+        act(() => {
+          result.current.composer.setMessage('sent words\nand typed since');
+        });
+        await settle(300);
+        expect(load(DRAFT_KEY)).toBe('sent words\nand typed since');
+
+        await act(async () => {
+          await result.current.chat.handleRetry();
+        });
+        expect(accepted).toHaveBeenCalledTimes(1);
+        expect(storedCopy()).toBeNull();
+        expect(result.current.composer.message).toBe('sent words\nand typed since');
+        expect(load(DRAFT_KEY)).toBe('sent words\nand typed since');
+      } finally {
+        vi.useRealTimers();
+      }
+      unmount();
+    });
+
+    it('a plain failure leaves a Retry whose success settles the original send — and only its copy', async () => {
+      // A network error with no recovery frame: the draft comes back, and the
+      // failure bubble's Retry carries the send's acceptance. The Retry
+      // succeeds: the acceptance fires and the copy (already seated back) is
+      // gone — the box and its live draft are the user's.
+      mockSendStream.mockImplementation(
+        async (_msg: string, _ws: string, _tid: string | null, opts: StreamOptions) => {
+          if (mockSendStream.mock.calls.length === 1) {
+            throw new TypeError('Failed to fetch');
+          }
+          opts.onEvent?.({ event: 'metadata', thread_id: 'thread-plain', run_id: 'run-plain-2' } as never);
+          return { disconnected: false };
+        },
+      );
+
+      const accepted = vi.fn();
+      const { result, unmount } = renderHookWithProviders(() => useDraftChatHarness());
+      act(() => {
+        result.current.composer.setMessage('plain failure then retry');
+      });
+
+      // The composer's real wiring: the send takes the box and parks its copy.
+      let outcome: boolean | undefined;
+      await act(async () => {
+        result.current.composer.submitWithDraft((onAccepted, onHandedOff, onRestore) => {
+          const sent = result.current.chat.handleSendMessage('plain failure then retry', null, null, {
+            onAccepted: () => {
+              onAccepted();
+              accepted();
+            },
+            onHandedOff,
+            onNotTaken: onRestore,
+          });
+          sent.then((v) => { outcome = v; });
+          return sent;
+        });
+      });
+      expect(outcome).toBe(false);
+      expect(accepted).not.toHaveBeenCalled();
+      // The failure seated the copy back — into the box and, synchronously,
+      // into the live draft (the debounce has not run).
+      expect(result.current.composer.message).toBe('plain failure then retry');
+      expect(load(DRAFT_KEY)).toBe('plain failure then retry');
+
+      await act(async () => {
+        await result.current.chat.handleRetry();
+      });
+      expect(mockSendStream).toHaveBeenCalledTimes(2);
+      expect(accepted).toHaveBeenCalledTimes(1);
+      expect(storedCopy()).toBeNull();
+      expect(result.current.composer.message).toBe('plain failure then retry');
+      expect(load(DRAFT_KEY)).toBe('plain failure then retry');
+    });
+
+    it('a steering_accepted frame for a plain POST counts as taken', async () => {
+      // Another session's running turn took the POST as steering and answered
+      // with steering_accepted alone: the server holds the message, so the
+      // send settles sent at that frame — its copy goes, nothing else.
+      mockSendStream.mockImplementation(
+        async (_msg: string, _ws: string, _tid: string | null, opts: StreamOptions) => {
+          opts.onEvent?.({ event: 'steering_accepted', position: 1 } as never);
+          return { disconnected: false };
+        },
+      );
+
+      const accepted = vi.fn();
+      const { result, unmount } = renderHookWithProviders(() => useDraftChatHarness());
+      act(() => {
+        result.current.composer.setMessage('taken as steering');
+      });
+
+      // The composer's real wiring: the frame settles the send at the box, so
+      // its copy is what must go.
+      let outcome: boolean | undefined;
+      await act(async () => {
+        result.current.composer.submitWithDraft((onAccepted, onHandedOff, onRestore) => {
+          const sent = result.current.chat.handleSendMessage('taken as steering', null, null, {
+            onAccepted: () => {
+              onAccepted();
+              accepted();
+            },
+            onHandedOff,
+            onNotTaken: onRestore,
+          });
+          sent.then((v) => { outcome = v; });
+          return sent;
+        });
+      });
+
+      expect(accepted).toHaveBeenCalledTimes(1);
+      expect(outcome).toBe(true);
+      expect(storedCopy()).toBeNull();
+      expect(result.current.composer.message).toBe('');
+      expect(load(DRAFT_KEY)).toBe('');
+    });
+
+    it('seats the copy back whole when a queued steer send is flushed and refused', async () => {
+      // A steer the server refuses as not_running waits behind the queue; the
+      // queueing promise stays open. The turn ends, the queued send goes out
+      // and is refused at admission: the copy comes back — text, and nothing
+      // deleted by the queueing itself.
+      let releaseFirst!: (v: { disconnected: boolean; aborted: boolean }) => void;
+      mockSendStream.mockImplementation(
+        async (_msg: string, _ws: string, _tid: string | null, opts: StreamOptions) => {
+          if (mockSendStream.mock.calls.length === 1) {
+            opts.onEvent?.({ event: 'thread_id', thread_id: 'thread-steerq' } as never);
+            return new Promise((resolve) => {
+              releaseFirst = resolve;
+            });
+          }
+          if (mockSendStream.mock.calls.length === 2) {
+            throw Object.assign(new Error('No running turn'), {
+              status: 409,
+              errorInfo: { code: 'not_running', message: 'No running turn to steer into.' },
+            });
+          }
+          opts.onEvent?.({ event: 'error', error: 'A reply is still running.', code: 'running', error_type: 'admission_conflict' } as never);
+          return { disconnected: false };
+        },
+      );
+
+      const accepted = vi.fn();
+      const { result, unmount } = renderHookWithProviders(() => useDraftChatHarness());
+      act(() => {
+        result.current.composer.setMessage('queued behind a refusal');
+      });
+
+      // The first send hangs, so the composer's send goes the steering route.
+      let first!: Promise<boolean>;
+      act(() => {
+        first = result.current.chat.handleSendMessage('first turn');
+      });
+      await act(async () => {
+        await Promise.resolve();
+      });
+      await waitFor(() => {
+        expect(result.current.chat.isLoading).toBe(true);
+      });
+
+      let sendPromise!: Promise<boolean>;
+      act(() => {
+        result.current.composer.submitWithDraft((onAccepted, onHandedOff, onRestore) => {
+          sendPromise = result.current.chat.handleSendMessage('queued behind a refusal', null, null, {
+            onAccepted: () => {
+              onAccepted();
+              accepted();
+            },
+            onHandedOff,
+            onNotTaken: onRestore,
+          });
+          return sendPromise;
+        });
+      });
+      await act(async () => {
+        await Promise.resolve();
+      });
+      // Queued, not taken: the promise is open and the copy stands.
+      expect(mockSendStream).toHaveBeenCalledTimes(2);
+      let settled = false;
+      void sendPromise.then(() => { settled = true; });
+      expect(settled).toBe(false);
+      expect(storedCopy()).toMatchObject({ text: 'queued behind a refusal' });
+
+      // The first turn ends; the queued send goes out and is refused — the
+      // copy comes back whole into the box.
+      await act(async () => {
+        releaseFirst({ disconnected: false, aborted: false });
+        await first.catch(() => undefined);
+      });
+      let outcome: boolean | undefined;
+      await act(async () => {
+        outcome = await sendPromise;
+      });
+      expect(mockSendStream).toHaveBeenCalledTimes(3);
+      expect(accepted).not.toHaveBeenCalled();
+      expect(outcome).toBe(false);
+      expect(result.current.composer.message).toBe('queued behind a refusal');
+      expect(storedCopy()).toBeNull();
     });
   });
 });

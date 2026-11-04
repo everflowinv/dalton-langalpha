@@ -17,6 +17,7 @@ import {
   buildDraftStorageKey,
   clear,
   load,
+  loadInFlightCopy,
   pruneExpired,
   save,
   settleSendResult,
@@ -460,24 +461,25 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
     fireEvent.change(view.getTextarea(), { target: { value: 'first message', selectionStart: 13 } });
     fireEvent.click(screen.getByLabelText('Send message'));
     expect(view.getTextarea().value).toBe('');
-    expect(load('thread:supersede', 'u-1')).toBe('first message');
+    expect(loadInFlightCopy('thread:supersede', 'u-1')?.text).toBe('first message');
 
     // Send B while A is still streaming
     fireEvent.change(view.getTextarea(), { target: { value: 'second steer', selectionStart: 11 } });
     fireEvent.click(screen.getByLabelText('Send message'));
-    expect(load('thread:supersede', 'u-1')).toBe('second steer');
+    expect(loadInFlightCopy('thread:supersede', 'u-1')?.text).toBe('second steer');
 
-    // A's turn completes — before the fix this deleted B's stored draft.
+    // A's turn completes — before the fix this deleted B's stored copy.
     await act(async () => {
       resolvers[0](true);
     });
-    expect(load('thread:supersede', 'u-1')).toBe('second steer');
+    expect(loadInFlightCopy('thread:supersede', 'u-1')?.text).toBe('second steer');
 
-    // B's turn completes — its own settle clears its own draft.
+    // B's turn completes — its own settle clears its own copy.
     await act(async () => {
       resolvers[1](true);
     });
     expect(load('thread:supersede', 'u-1')).toBe('');
+    expect(loadInFlightCopy('thread:supersede', 'u-1')).toBeNull();
     expect(view.getTextarea().value).toBe('');
     view.unmount();
 
@@ -496,7 +498,7 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
       resolvers2[0](false);
     });
     expect(view2.getTextarea().value).toBe('');
-    expect(load('thread:supersede2', 'u-1')).toBe('steer again');
+    expect(loadInFlightCopy('thread:supersede2', 'u-1')?.text).toBe('steer again');
     view2.unmount();
   });
 
@@ -511,11 +513,12 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
     fireEvent.change(view.getTextarea(), { target: { value: 'newer B', selectionStart: 7 } });
     fireEvent.click(screen.getByLabelText('Send message'));
 
-    // B fails first: its draft comes back.
+    // B fails first: its copy comes back into the box and the live draft.
     await act(async () => {
       resolvers[1](false);
     });
     expect(load('thread:gen', 'u-1')).toBe('newer B');
+    expect(loadInFlightCopy('thread:gen', 'u-1')).toBeNull();
 
     // A then succeeds: it was superseded by B, so B's restored draft stays.
     await act(async () => {
@@ -543,7 +546,9 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
     const view = renderComposer({ draftKey: 'market:panel:ws-1:NVDA', onSend }, { userId: 'u-1' });
     fireEvent.change(view.getTextarea(), { target: { value: 'first on old key', selectionStart: 16 } });
     fireEvent.click(screen.getByLabelText('Send message'));
-    expect(load('market:panel:ws-1:NVDA', 'u-1')).toBe('first on old key');
+    // The unresolved send's copy stands under its own key; the live draft is gone with the box.
+    expect(load('market:panel:ws-1:NVDA', 'u-1')).toBe('');
+    expect(loadInFlightCopy('market:panel:ws-1:NVDA', 'u-1')?.text).toBe('first on old key');
 
     view.rerenderComposer({ draftKey: 'market:panel:th-9', onSend });
     fireEvent.change(view.getTextarea(), { target: { value: 'second on new key', selectionStart: 17 } });
@@ -553,7 +558,8 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
       resolvers[0](true);
     });
     expect(load('market:panel:ws-1:NVDA', 'u-1')).toBe('');
-    expect(load('market:panel:th-9', 'u-1')).toBe('second on new key');
+    expect(loadInFlightCopy('market:panel:ws-1:NVDA', 'u-1')).toBeNull();
+    expect(loadInFlightCopy('market:panel:th-9', 'u-1')?.text).toBe('second on new key');
     view.unmount();
   });
 
@@ -751,11 +757,11 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
     removeItemSpy.mockRestore();
   });
 
-  it('shows notice when restoring an unconfirmed in-flight draft, hides it on ordinary drafts, and dismisses it on edit or send', async () => {
+  it('offers an unresolved send\'s copy above the box after a reload: put back, drop, or send beside it', async () => {
     const noticeText =
       'Your last send may already have gone through. Check the conversation before sending it again.';
 
-    // 1. Ordinary draft (typed, never sent) -> no notice on mount or after remount
+    // 1. Ordinary draft (typed, never sent) -> no offer on mount or after remount
     const ordinary = renderComposer({ draftKey: 'thread:ordinary' }, { userId: 'u-1' });
     fireEvent.change(ordinary.getTextarea(), {
       target: { value: 'ordinary unsent draft', selectionStart: 21 },
@@ -768,73 +774,100 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
     expect(screen.queryByTestId('in-flight-draft-notice')).toBeNull();
     ordinaryRemounted.unmount();
 
-    // 2. In-flight draft restored after reload/remount before onAccepted -> notice appears, disappears on edit
+    // 2. A send whose verdict never arrived: the reload keeps the box's live
+    // draft (here empty) and offers the copy above it — never merged in.
     const pendingSend = new Promise<boolean>(() => {});
     const onSendPending = vi.fn<ChatInputProps['onSend']>().mockReturnValue(pendingSend);
-    const inFlightView = renderComposer(
+    const sentView = renderComposer(
       { draftKey: 'thread:in-flight-edit', onSend: onSendPending },
       { userId: 'u-1' },
     );
-    fireEvent.change(inFlightView.getTextarea(), {
+    fireEvent.change(sentView.getTextarea(), {
       target: { value: 'message sent before reload', selectionStart: 26 },
     });
     fireEvent.click(screen.getByLabelText('Send message'));
-    expect(inFlightView.getTextarea().value).toBe('');
+    expect(sentView.getTextarea().value).toBe('');
     expect(screen.queryByTestId('in-flight-draft-notice')).toBeNull();
-    inFlightView.unmount();
+    sentView.unmount();
 
-    const restoredForEdit = renderComposer(
+    const offered = renderComposer(
       { draftKey: 'thread:in-flight-edit' },
       { userId: 'u-1' },
     );
-    expect(restoredForEdit.getTextarea().value).toBe('message sent before reload');
-    expect(screen.getByTestId('in-flight-draft-notice').textContent).toBe(noticeText);
+    // The box is empty (nothing was typed since); the offer stands above it.
+    expect(offered.getTextarea().value).toBe('');
+    expect(screen.getByTestId('in-flight-draft-notice').textContent).toContain(noticeText);
+    expect(screen.getByTestId('in-flight-draft-text').textContent).toBe('message sent before reload');
+    offered.unmount();
 
-    // Editing the restored draft dismisses the notice immediately and demotes it to an ordinary draft
-    fireEvent.change(restoredForEdit.getTextarea(), {
-      target: { value: 'message sent before reload (edited)', selectionStart: 35 },
-    });
-    expect(screen.queryByTestId('in-flight-draft-notice')).toBeNull();
-    restoredForEdit.unmount();
-
-    const afterEditRemount = renderComposer(
+    // 3. "Put back" seats the copy into the box — ahead of whatever is typed
+    // since — and removes the offer; the live draft that lands is what a
+    // reload keeps.
+    const offeredWithTyping = renderComposer(
       { draftKey: 'thread:in-flight-edit' },
       { userId: 'u-1' },
     );
-    expect(afterEditRemount.getTextarea().value).toBe('message sent before reload (edited)');
+    fireEvent.change(offeredWithTyping.getTextarea(), {
+      target: { value: 'typed meanwhile', selectionStart: 14 },
+    });
+    expect(screen.getByTestId('in-flight-draft-notice').textContent).toContain(noticeText);
+    fireEvent.click(screen.getByTestId('in-flight-draft-restore'));
     expect(screen.queryByTestId('in-flight-draft-notice')).toBeNull();
-    afterEditRemount.unmount();
+    expect(offeredWithTyping.getTextarea().value).toBe('message sent before reload\n\ntyped meanwhile');
+    offeredWithTyping.unmount();
 
-    // 3. In-flight draft restored -> disappears when sent
-    const inFlightForSend = renderComposer(
-      { draftKey: 'thread:in-flight-send', onSend: onSendPending },
+    const afterRestore = renderComposer({ draftKey: 'thread:in-flight-edit' }, { userId: 'u-1' });
+    expect(afterRestore.getTextarea().value).toBe('message sent before reload\n\ntyped meanwhile');
+    expect(screen.queryByTestId('in-flight-draft-notice')).toBeNull();
+    afterRestore.unmount();
+
+    // 4. "Discard" drops the copy: the offer and the stored copy both go,
+    // the live draft stays as typed.
+    const pending2 = new Promise<boolean>(() => {});
+    const sentAgain = renderComposer(
+      { draftKey: 'thread:in-flight-discard', onSend: vi.fn<ChatInputProps['onSend']>().mockReturnValue(pending2) },
       { userId: 'u-1' },
     );
-    fireEvent.change(inFlightForSend.getTextarea(), {
-      target: { value: 'message to resend after reload', selectionStart: 30 },
+    fireEvent.change(sentAgain.getTextarea(), {
+      target: { value: 'gone without an answer', selectionStart: 22 },
     });
     fireEvent.click(screen.getByLabelText('Send message'));
-    inFlightForSend.unmount();
+    sentAgain.unmount();
 
-    const onSendAccept = vi.fn<ChatInputProps['onSend']>().mockImplementation(
-      (send) => {
-        send.modelOptions.onAccepted?.();
-        return true;
-      },
-    );
-    const restoredForSend = renderComposer(
-      { draftKey: 'thread:in-flight-send', onSend: onSendAccept },
+    const toDiscard = renderComposer({ draftKey: 'thread:in-flight-discard' }, { userId: 'u-1' });
+    expect(screen.getByTestId('in-flight-draft-notice').textContent).toContain(noticeText);
+    fireEvent.click(screen.getByTestId('in-flight-draft-discard'));
+    expect(screen.queryByTestId('in-flight-draft-notice')).toBeNull();
+    expect(toDiscard.getTextarea().value).toBe('');
+    toDiscard.unmount();
+
+    const afterDiscard = renderComposer({ draftKey: 'thread:in-flight-discard' }, { userId: 'u-1' });
+    expect(afterDiscard.getTextarea().value).toBe('');
+    expect(screen.queryByTestId('in-flight-draft-notice')).toBeNull();
+    afterDiscard.unmount();
+
+    // 5. Sending beside the offer (the box's own draft) accepts the new send
+    // alone; the offer keeps standing until the user answers it.
+    const pending3 = new Promise<boolean>(() => {});
+    const besideView = renderComposer(
+      { draftKey: 'thread:in-flight-beside', onSend: vi.fn<ChatInputProps['onSend']>().mockReturnValue(pending3) },
       { userId: 'u-1' },
     );
-    expect(restoredForSend.getTextarea().value).toBe('message to resend after reload');
-    expect(screen.getByTestId('in-flight-draft-notice').textContent).toBe(noticeText);
-
+    fireEvent.change(besideView.getTextarea(), {
+      target: { value: 'first, unresolved', selectionStart: 18 },
+    });
     fireEvent.click(screen.getByLabelText('Send message'));
-    expect(onSendAccept).toHaveBeenCalledTimes(1);
-    expect(restoredForSend.getTextarea().value).toBe('');
-    expect(screen.queryByTestId('in-flight-draft-notice')).toBeNull();
-    expect(load('thread:in-flight-send', 'u-1')).toBe('');
-    restoredForSend.unmount();
+    besideView.unmount();
+
+    const beside = renderComposer(
+      { draftKey: 'thread:in-flight-beside', onSend: vi.fn<ChatInputProps['onSend']>().mockReturnValue(pending3) },
+      { userId: 'u-1' },
+    );
+    fireEvent.change(beside.getTextarea(), {
+      target: { value: 'second thought', selectionStart: 13 },
+    });
+    expect(screen.getByTestId('in-flight-draft-notice').textContent).toContain(noticeText);
+    beside.unmount();
   });
 });
 
@@ -1097,8 +1130,10 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     // since, one chip of its own — the host's giveBack owns the send's return.
     expect(view.getTextarea().value).toBe(typedSince);
     expect(document.querySelectorAll('.draft-token-quote')).toHaveLength(1);
-    // The stored draft keeps both: the sent text and what was typed since.
-    expect(load('thread:t-docked', 'u-1')).toBe(`${sentDraft.text}\n\n${typedSince}`);
+    // The send's copy is gone (the host took the return); the live draft holds
+    // what was typed since alone. The giveBack below seats the send's words.
+    expect(load('thread:t-docked', 'u-1')).toBe(typedSince);
+    expect(loadInFlightCopy('thread:t-docked', 'u-1')).toBeNull();
 
     // The host seats the returned draft the way the chat does; no text or
     // chip lands twice.
@@ -1212,14 +1247,15 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
       resolvers[0](false);
     });
 
-    // The settle wrote nothing into the input.
+    // The settle wrote nothing into the input; the host owns the return, so
+    // the copy is removed and the live draft holds what was typed since.
     expect(view.getTextarea().value).toBe(typedSince);
-    // Known limitation (accepted by lead): the sent text and what was typed
-    // since carry the SAME token here, so the restore's already-restored
-    // check sees one inside the other and the stored draft keeps a single
-    // copy of it — a reload restores one of the two quotes. The giveBack
-    // below re-seats both in the input regardless.
+    // Known limitation (accepted by lead): the two quotes mint the SAME
+    // token, so what was typed since reads exactly like the sent text — the
+    // stored draft keeps only that one copy, and a reload restores one of
+    // the two quotes. The giveBack below re-seats both in the input.
     expect(load('thread:t-38', 'u-1')).toContain(sentDraft.text.trim());
+    expect(loadInFlightCopy('thread:t-38', 'u-1')).toBeNull();
 
     // The host's giveBack seats the returned quote renumbered: two chips, and
     // a send spells each body exactly once with its own ending.
@@ -1263,6 +1299,102 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     view.unmount();
     const reopened = renderComposer({ draftKey: 'thread:t-att-keep' }, { userId: 'u-1' });
     expect(screen.getByTestId('attachments-lost-notice')).toBeTruthy();
+    reopened.unmount();
+    vi.useRealTimers();
+  });
+
+  it('a not-taken send seats its copy back ahead of what was typed since, and the copy is gone', async () => {
+    // The send's own storage entry keeps what went out; the live draft keeps
+    // what was typed since. A definite not-taken seats the copy back into the
+    // box FIRST, merged once, and removes the separate entry.
+    const resolvers: Array<(v: boolean) => void> = [];
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+      () => new Promise<boolean>((resolve) => { resolvers.push(resolve); }),
+    );
+    const view = renderComposer({ draftKey: 'thread:t-putback', onSend }, { userId: 'u-1' });
+    fireEvent.change(view.getTextarea(), { target: { value: 'sent words', selectionStart: 10 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+    expect(view.getTextarea().value).toBe('');
+    expect(loadInFlightCopy('thread:t-putback', 'u-1')?.text).toBe('sent words');
+    expect(load('thread:t-putback', 'u-1')).toBe('');
+
+    fireEvent.change(view.getTextarea(), { target: { value: 'typed meanwhile', selectionStart: 14 } });
+    expect(loadInFlightCopy('thread:t-putback', 'u-1')?.text).toBe('sent words');
+
+    await act(async () => {
+      resolvers[0](false);
+    });
+
+    // Both, in order: the sent words first, the typed-since after; the copy
+    // entry is gone and the live draft holds the merged text.
+    expect(view.getTextarea().value).toBe('sent words\n\ntyped meanwhile');
+    expect(loadInFlightCopy('thread:t-putback', 'u-1')).toBeNull();
+    view.unmount();
+    const reopened = renderComposer({ draftKey: 'thread:t-putback' }, { userId: 'u-1' });
+    expect(reopened.getTextarea().value).toBe('sent words\n\ntyped meanwhile');
+    expect(screen.queryByTestId('in-flight-draft-notice')).toBeNull();
+    reopened.unmount();
+  });
+
+  it('clearing what was typed since never deletes the unresolved send\'s copy — a reload offers it', () => {
+    vi.useFakeTimers();
+    const pending = new Promise<boolean>(() => {});
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockReturnValue(pending);
+    const view = renderComposer({ draftKey: 'thread:t-cleared', onSend }, { userId: 'u-1' });
+    fireEvent.change(view.getTextarea(), { target: { value: 'sent and unresolved', selectionStart: 19 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+    expect(view.getTextarea().value).toBe('');
+
+    // The user types a next thought and deletes it again: the live draft is
+    // gone, but the send's copy — under its own key — is untouched.
+    fireEvent.change(view.getTextarea(), { target: { value: 'fleeting thought', selectionStart: 16 } });
+    act(() => {
+      vi.advanceTimersByTime(DRAFT_SAVE_DEBOUNCE_MS);
+    });
+    fireEvent.change(view.getTextarea(), { target: { value: '', selectionStart: 0 } });
+    act(() => {
+      vi.advanceTimersByTime(DRAFT_SAVE_DEBOUNCE_MS);
+    });
+    expect(load('thread:t-cleared', 'u-1')).toBe('');
+    expect(loadInFlightCopy('thread:t-cleared', 'u-1')?.text).toBe('sent and unresolved');
+    view.unmount();
+
+    // The reload offers the copy above an empty box.
+    const reopened = renderComposer({ draftKey: 'thread:t-cleared' }, { userId: 'u-1' });
+    expect(reopened.getTextarea().value).toBe('');
+    expect(screen.getByTestId('in-flight-draft-notice').textContent).toContain('may already have gone through');
+    expect(screen.getByTestId('in-flight-draft-text').textContent).toBe('sent and unresolved');
+    reopened.unmount();
+    vi.useRealTimers();
+  });
+
+  it('moves the unresolved send\'s copy and the typed continuation together when ws:new resolves to a thread', () => {
+    vi.useFakeTimers();
+    const pending = new Promise<boolean>(() => {});
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockReturnValue(pending);
+    const view = renderComposer({ draftKey: 'ws:ws-7:new', onSend }, { userId: 'u-1' });
+    fireEvent.change(view.getTextarea(), { target: { value: 'the opening question', selectionStart: 20 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+    expect(view.getTextarea().value).toBe('');
+
+    // A follow-up typed while the thread id settles.
+    fireEvent.change(view.getTextarea(), { target: { value: 'typed before the id settled', selectionStart: 29 } });
+    act(() => {
+      vi.advanceTimersByTime(DRAFT_SAVE_DEBOUNCE_MS);
+    });
+
+    // The key resolves: both the copy and the live continuation move.
+    view.rerenderComposer({ draftKey: 'thread:t-resolved', onSend });
+    expect(loadInFlightCopy('ws:ws-7:new', 'u-1')).toBeNull();
+    expect(loadInFlightCopy('thread:t-resolved', 'u-1')?.text).toBe('the opening question');
+    expect(view.getTextarea().value).toBe('typed before the id settled');
+    expect(load('thread:t-resolved', 'u-1')).toBe('typed before the id settled');
+    view.unmount();
+
+    // A reload offers the send's copy beside the typed continuation.
+    const reopened = renderComposer({ draftKey: 'thread:t-resolved' }, { userId: 'u-1' });
+    expect(reopened.getTextarea().value).toBe('typed before the id settled');
+    expect(screen.getByTestId('in-flight-draft-text').textContent).toBe('the opening question');
     reopened.unmount();
     vi.useRealTimers();
   });

@@ -198,21 +198,23 @@ interface SendOptions extends ModelOptions {
   /**
    * DALTON-HOOK(composer-drafts): called when a drop scheduled the send's own
    * automatic resend — the resend, not the response headers, is what can prove
-   * the server took the message (#675 sends them before admission), so the
-   * composer parks its stored draft (kept inFlight, restorable on reload)
-   * until the resend's acceptance reports through `onAccepted`, which rides
-   * the resent attempts' model options. The send's returned boolean settles
-   * nothing then; a chain that gives up leaves the draft parked and the
-   * failed reply's Retry owns the message.
+   * the server took the message (#675 sends them before admission), so from
+   * here the composer parks the send's own copy (a separate storage entry,
+   * offered above the box on reload) until the resend's acceptance reports
+   * through `onAccepted`, which rides the resent attempts' model options. The
+   * send's returned boolean settles nothing then; a chain that gives up or a
+   * stop that cancels the backoff reports through `onNotTaken`, and the failed
+   * reply's Retry, its held acceptance included, can still settle it sent.
    */
   onHandedOff?: () => void;
   /**
    * DALTON-HOOK(composer-drafts): called when the send is definitely not
    * taken — a stop cancelled the resend backoff, the resend chain gave up
    * and left the failed reply's Retry, a resent attempt was refused — so the
-   * composer puts the draft back whole (text, quote chips, the
-   * attachments-again notice). Rides the resent attempts' model options like
-   * `onAccepted`, so the exit a chain reaches fires it.
+   * composer seats the send's copy back into the box whole (text, quote
+   * chips, the attachments-again notice) and removes it. Rides the resent
+   * attempts' model options like `onAccepted`, so the exit a chain reaches
+   * fires it.
    */
   onNotTaken?: () => void;
   /**

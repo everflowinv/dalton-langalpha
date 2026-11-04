@@ -2209,7 +2209,9 @@
       "dropFiles": "Drop files to upload",
       "uploading": "Uploading",
       "inFlightDraftRestored": "Your last send may already have gone through. Check the conversation before sending it again.",
-      "draftAttachmentsRestored": "Attachments are not kept in drafts — add them again before sending."
+      "draftAttachmentsRestored": "Attachments are not kept in drafts — add them again before sending.",
+      "inFlightDraftRestore": "Put back into the message box",
+      "inFlightDraftDiscard": "Discard"
     },
     "mention": {
       "noMatching": "No matching files",

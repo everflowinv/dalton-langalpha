@@ -110,15 +110,16 @@ export interface ModelOptions {
   /**
    * DALTON-HOOK(composer-drafts): the send path calls this when a drop
    * scheduled the send's own automatic resend — from then only the resend's
-   * acceptance (reported through `onAccepted`) settles the draft, and the
-   * stored draft keeps its inFlight mark so a reload restores the text.
+   * acceptance (reported through `onAccepted`) settles the send, whose copy
+   * is kept under its own storage entry until then.
    */
   onHandedOff?: () => void;
   /**
    * DALTON-HOOK(composer-drafts): the send path calls this when it is
    * definitely not taken — a stop cancelled the resend backoff, the resend
-   * chain gave up, a resent attempt was refused — and the composer puts the
-   * draft back whole: text, quote chips, the attachments-again notice.
+   * chain gave up, a resent attempt was refused — and the composer seats the
+   * send's copy back into the box: text, quote chips, the attachments-again
+   * notice.
    */
   onNotTaken?: () => void;
   /**

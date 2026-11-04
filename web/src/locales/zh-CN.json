@@ -2238,7 +2238,9 @@
       "dropFiles": "拖放文件以上传",
       "uploading": "上传中",
       "inFlightDraftRestored": "上次发送可能已被受理，发送前请先确认对话里是否已经有这条消息。",
-      "draftAttachmentsRestored": "草稿不保留附件，重新发送前请重新添加。"
+      "draftAttachmentsRestored": "草稿不保留附件，重新发送前请重新添加。",
+      "inFlightDraftRestore": "放回输入框",
+      "inFlightDraftDiscard": "丢弃"
     },
     "mention": {
       "noMatching": "无匹配文件",

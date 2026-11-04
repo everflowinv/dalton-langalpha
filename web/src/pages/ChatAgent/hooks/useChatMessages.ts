@@ -306,6 +306,12 @@ export function useChatMessages(
     steerId: string;
     /** When it was sent, from `steerSeqRef`. */
     seq: number;
+    /**
+     * DALTON-HOOK(composer-drafts): resolves the queueing call's deferred
+     * boolean — the flushed send's outcome, or false when a stop drops the
+     * queue — so a composer behind the send settles by what really went out.
+     */
+    settleQueued?: (sent: boolean) => void;
   }[]>([]);
   // Orders the queue above by when each message was sent: refusals come back
   // on separate POSTs, in whatever order those answer.
@@ -896,11 +902,13 @@ export function useChatMessages(
       requestKeys.spend(requestKey);
       requestKeys.settle(requestKey, 'dropped');
     }
-    // DALTON-HOOK(composer-drafts): the parked send dies here — settle its
-    // queueing call's deferred boolean as failed so the composer draft is not
-    // left holding an unsettled promise (chatDrafts ignores it if a newer
-    // send on the key already owns the draft).
+    // DALTON-HOOK(composer-drafts): the parked sends die here — settle their
+    // queueing calls' deferred booleans as failed so each composer seats its
+    // copy back whole (the plain-text giveBack below does not carry chips or
+    // the attachment notice; chatDrafts ignores a settle if a newer send on
+    // the key already owns the draft).
     queued?.settleQueued(false);
+    for (const entry of unsent) entry.settleQueued?.(false);
     // The optimistic shimmer bubble of the one parked during compaction.
     if (queued) setMessages((prev) => prev.filter((m) => m.id !== queued.messageId));
     return unsent;
@@ -2238,11 +2246,20 @@ export function useChatMessages(
       const code = (err as { errorInfo?: { code?: unknown } })?.errorInfo?.code;
       if ((err as { status?: number })?.status === 409 && code === 'not_running') {
         // Waiting to go out as a send of its own, it holds its comments until then.
-        if (settleNotRunningSteer(userMessage.id as string, gen, message, additionalContext, attachmentMeta, modelOptions, requestKey, seq)) ended = 'handedOff';
-        // DALTON-HOOK(composer-drafts): a queued position is not acceptance —
-        // the callbacks ride the queued modelOptions, and the flushed send's
-        // own acceptance settles the draft; this true alone deletes nothing.
-        return true;
+        // DALTON-HOOK(composer-drafts): a queued position is not acceptance.
+        // The composer caller (onAccepted in its model options) receives a
+        // promise that settles only on the flushed send's outcome or on a
+        // stop dropping the queue; the callbacks ride the queued options and
+        // do the settling — acceptance deletes the copy, a not-taken seats it
+        // back whole.
+        let resolveQueued: (sent: boolean) => void = () => {};
+        const outcome = modelOptions.onAccepted
+          ? new Promise<boolean>((resolve) => {
+              resolveQueued = resolve;
+            })
+          : null;
+        if (settleNotRunningSteer(userMessage.id as string, gen, message, additionalContext, attachmentMeta, modelOptions, requestKey, seq, resolveQueued)) ended = 'handedOff';
+        return outcome ?? true;
       }
       // A steer the user's stop overtook: the stop hands the turn's steers
       // back to the composer, and this one joins them.
@@ -2327,19 +2344,26 @@ export function useChatMessages(
     modelOptions: SendOptions,
     requestKey: string,
     seq: number,
+    // DALTON-HOOK(composer-drafts): resolves the queueing call's deferred boolean.
+    settleQueued?: (sent: boolean) => void,
   ): boolean => {
     // A thread switch while it was out took its bubble with the old thread.
     if (gen !== notRunningGenRef.current) {
       requestKeys.spend(requestKey);
+      settleQueued?.(false);
       return false;
     }
     if (wasStoppedRef.current) {
       requestKeys.spend(requestKey);
       setMessages((prev) => prev.filter((m) => m.id !== steerId));
       giveBackSteering(message);
+      // DALTON-HOOK(composer-drafts): stopped before it joined the queue —
+      // not taken; the composer seats its copy back whole (the plain-text
+      // giveBack above does not carry chips or the attachment notice).
+      settleQueued?.(false);
       return false;
     }
-    enqueueNotRunningSend({ gen, message, additionalContext, attachmentMeta, modelOptions, requestKey, steerId, seq });
+    enqueueNotRunningSend({ gen, message, additionalContext, attachmentMeta, modelOptions, requestKey, steerId, seq, settleQueued });
     return true;
   };
 
@@ -2363,6 +2387,8 @@ export function useChatMessages(
     attachmentMeta: Record<string, unknown>[] | null,
     modelOptions: SendOptions,
     shown?: ShownBubbles,
+    // DALTON-HOOK(composer-drafts): resolves the queueing call's deferred boolean.
+    settleQueued?: (sent: boolean) => void,
   ): void => {
     // Parked with the others, it holds its comments until it goes out.
     const requestKey = requestKeys.take(
@@ -2390,6 +2416,8 @@ export function useChatMessages(
       requestKey,
       steerId: waiting.id as string,
       seq: ++steerSeqRef.current,
+      // DALTON-HOOK(composer-drafts): settles the queueing call by the flushed send's outcome.
+      settleQueued,
     });
   };
 
@@ -2427,6 +2455,14 @@ export function useChatMessages(
     turnIndex: number;
     request: TurnRequest & { requestKey: string };
     watermarkBefore: number | null;
+    /**
+     * DALTON-HOOK(composer-drafts): the send's composer-draft acceptance.
+     * A failure with no recovery frame leaves a Retry on the bubble; the
+     * record `unadmit` writes for it keeps the acceptance, so a manual
+     * Retry that succeeds settles the original draft as sent — and so does
+     * each later record a retried-and-failed-again attempt leaves.
+     */
+    onAccepted?: () => void;
   }) => {
     const ids = new Set(send.userId === null ? [send.assistantId] : [send.userId, send.assistantId]);
     let started = false;
@@ -2464,16 +2500,16 @@ export function useChatMessages(
         // running turn's end took for kept may have turned into this send.
         setMessages((prev) => prev.map((m) => (ids.has(m.id as string) ? { ...m, unadmitted: true, isHistory: false } : m)));
         if (lastRenderedTurnIndexRef.current === send.turnIndex) lastRenderedTurnIndexRef.current = send.watermarkBefore;
-        // DALTON-HOOK(composer-drafts): a Retry the failure notice already held
-        // is the richer record — it carries the send's acceptance, which a
-        // manual Retry that succeeds settles the original draft by — so it is
-        // kept, not overwritten by this fallback entry.
+        // DALTON-HOOK(composer-drafts): the Retry record this failure leaves
+        // keeps the send's acceptance — the one this send arrived with, or the
+        // one a failure notice already held for it (a retried attempt) — so a
+        // manual Retry that succeeds settles the original draft as sent.
         const held = heldRetriesRef.current.get(send.assistantId);
         heldRetriesRef.current.set(send.assistantId, {
           bubbleId: send.assistantId,
           request: send.request,
           cut: null,
-          ...(held ? { onAccepted: held.onAccepted } : {}),
+          onAccepted: send.onAccepted ?? held?.onAccepted,
         });
       },
     };
@@ -2595,12 +2631,18 @@ export function useChatMessages(
 
     // The resend of a refused steer is the queue's own; anything else waits behind it.
     if (resend.requestKey === undefined && notRunningSendsRef.current.length > 0) {
-      queueBehindRefused(message, additionalContext, attachmentMeta, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, artifactComments, keepFullContext, onAccepted, onHandedOff, onNotTaken }, resend.shown);
-      // DALTON-HOOK(composer-drafts): a queued position is not acceptance —
-      // the flushed send's own acceptance settles the draft, and this true
-      // alone deletes nothing (the stored copy keeps its inFlight mark, which
-      // a reload restores with the notice).
-      return true;
+      // DALTON-HOOK(composer-drafts): a queued position is not acceptance.
+      // The composer caller (onAccepted in its options) receives a promise
+      // that settles only on the flushed send's outcome or on a stop dropping
+      // the queue; the callbacks ride the queued options and do the settling.
+      let resolveQueued: (sent: boolean) => void = () => {};
+      const outcome = onAccepted
+        ? new Promise<boolean>((resolve) => {
+            resolveQueued = resolve;
+          })
+        : null;
+      queueBehindRefused(message, additionalContext, attachmentMeta, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, artifactComments, keepFullContext, onAccepted, onHandedOff, onNotTaken }, resend.shown, resolveQueued);
+      return outcome ?? true;
     }
 
     // If agent is already streaming, send as steering message
@@ -2749,6 +2791,8 @@ export function useChatMessages(
       turnIndex,
       request: { ...sendRequest(message, additionalContext, { subagentsAllowed, keepFullContext, artifactComments: commentSend }), requestKey },
       watermarkBefore,
+      // DALTON-HOOK(composer-drafts): keeps the send's acceptance with the Retry a plain failure leaves.
+      onAccepted: notifyAccepted,
     });
     if (hiddenOpener) holdHiddenOpenerRetry(assistantMessageId, additionalContext);
     try {
@@ -2764,11 +2808,12 @@ export function useChatMessages(
         if (event.event === 'metadata' || event.event === 'steering_accepted') requestKeys.settle(requestKey, 'accepted');
         // DALTON-HOOK(composer-drafts): the send is accepted once the server has started its
         // run — the main agent's metadata frame (or a recoverable failure naming the run), the
-        // same signals `admission` counts as started. The Content-Location run_id is only a
+        // same signals `admission` counts as started, or a `steering_accepted` for the POST
+        // another session's running turn took as a steer. The Content-Location run_id is only a
         // pre-minted id sent before admission runs, so it must not settle the draft.
         if (
           !isSubagentEvent(event)
-          && (event.event === 'metadata'
+          && (event.event === 'metadata' || event.event === 'steering_accepted'
             || ((event.event === 'error' || event.event === 'retry') && event.recovery && typeof event.run_id === 'string'))
         ) {
           notifyAccepted();
@@ -3037,7 +3082,11 @@ export function useChatMessages(
     queue.shift();
     // The send's bubble takes the waiting one's place, in the same batch.
     setMessages((prev) => prev.filter((m) => m.id !== next.steerId));
-    void handleSendMessage(next.message, next.additionalContext, next.attachmentMeta, next.modelOptions, { requestKey: next.requestKey, shown: { userId: next.steerId } });
+    // DALTON-HOOK(composer-drafts): the flushed send's outcome settles the
+    // queueing call's deferred boolean; its own callbacks (acceptance,
+    // not-taken) riding the queued options do the real settling.
+    void handleSendMessage(next.message, next.additionalContext, next.attachmentMeta, next.modelOptions, { requestKey: next.requestKey, shown: { userId: next.steerId } })
+      .then((sent) => next.settleQueued?.(sent));
     // Fires when the view goes idle, a steer is answered or the workspace
     // arrives. The send handler is captured from that render, which is the
     // one that saw the view idle.
@@ -3522,6 +3571,8 @@ export function useChatMessages(
       turnIndex,
       request: { ...request, requestKey },
       watermarkBefore,
+      // DALTON-HOOK(composer-drafts): keeps the relayed acceptance with the Retry a plain failure leaves.
+      onAccepted: modelOptions.onAccepted,
     });
     let wasDisconnected = false;
     // How the request ended for its comments, unless the server answered first.
@@ -3549,11 +3600,12 @@ export function useChatMessages(
         if (event.event === 'metadata' || event.event === 'steering_accepted') requestKeys.settle(requestKey, 'accepted');
         // DALTON-HOOK(composer-drafts): this request is a resent attempt of a
         // send whose drop scheduled it — the send the server finally took is
-        // this one, so its acceptance (the run's first frame, or a recoverable
-        // failure naming the run) settles the original send's draft.
+        // this one, so its acceptance (the run's first frame, a recoverable
+        // failure naming the run, or a `steering_accepted` for the POST the
+        // running turn took as a steer) settles the original send's draft.
         if (
           !isSubagentEvent(event)
-          && (event.event === 'metadata'
+          && (event.event === 'metadata' || event.event === 'steering_accepted'
             || ((event.event === 'error' || event.event === 'retry') && event.recovery && typeof event.run_id === 'string'))
         ) {
           relayAccepted();
