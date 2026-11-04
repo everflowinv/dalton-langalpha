@@ -59,6 +59,16 @@ describe('ChatInput — giveBack', () => {
     expect(box.value).toBe('the edited question');
   });
 
+  // DALTON-HOOK(composer-drafts): the draft settlement of a refused send puts
+  // the sent text back ahead of what was typed since; giveBack must not add
+  // it a second time at the end.
+  it('does not add the text again when the draft settlement already put it first', () => {
+    const { ref, box } = renderInput();
+    fireEvent.change(box, { target: { value: 'the edited question\n\nwhat I typed meanwhile' } });
+    act(() => ref.current!.giveBack('the edited question'));
+    expect(box.value).toBe('the edited question\n\nwhat I typed meanwhile');
+  });
+
   it('puts back the files a send took, ready to send again', () => {
     // jsdom has no object URLs.
     vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:positions');

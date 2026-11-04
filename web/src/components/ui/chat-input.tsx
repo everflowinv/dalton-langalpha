@@ -59,7 +59,10 @@ const FOLLOWS_SETTINGS = { reasoningEffort: null, fastMode: null } as const;
 function withGivenBack(typed: string, text: string): string {
   const kept = typed.trimEnd();
   if (!kept) return text;
-  if (kept === text || kept.endsWith(`\n\n${text}`)) return typed;
+  // DALTON-HOOK(composer-drafts): a refused send's draft settlement may
+  // already have put the text back ahead of what was typed since
+  // (`chatDrafts.ts`), so it counts as given back at either end.
+  if (kept === text || kept.endsWith(`\n\n${text}`) || kept.startsWith(`${text}\n\n`)) return typed;
   return `${kept}\n\n${text}`;
 }
 
