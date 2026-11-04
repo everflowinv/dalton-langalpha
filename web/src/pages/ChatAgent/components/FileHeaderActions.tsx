@@ -1,5 +1,6 @@
 import React, { useRef, useState } from 'react';
-import { Code2, Download, Eye, ExternalLink, FileDown, Link2, Pencil, Pin, PinOff, Settings2, X, Undo2, Redo2, FileDiff, FileText, Check, Clipboard } from 'lucide-react';
+// DALTON-HOOK(external-share-guard): Link2Off for the external member's stop-only entry
+import { Code2, Download, Eye, ExternalLink, FileDown, Link2, Link2Off, Pencil, Pin, PinOff, Settings2, X, Undo2, Redo2, FileDiff, FileText, Check, Clipboard } from 'lucide-react';
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -71,6 +72,13 @@ interface FileHeaderActionsProps {
   /** Opens the panel's Publish dialog on a file; left out where the panel is not the owner's. */
   openPublish?: ((path: string) => void) | null;
   /**
+   * DALTON-HOOK(external-share-guard): an external member gets no publish
+   * entry, but a link they already made public can still be stopped — the
+   * old ShareLinkDialog allowed exactly that. Set only where the caller is
+   * an external member; the button appears just for a shared record.
+   */
+  openUnshareOnly?: ((path: string) => void) | null;
+  /**
    * The document an HTML file's frame shows, which a link inside it can make
    * another file: its menu says where that one's comments go, as the comment
    * box and toolbar do. Null while the file's viewer is not up.
@@ -108,6 +116,8 @@ function FileHeaderActions({
   readFileFullFn,
   access,
   openPublish = null,
+  // DALTON-HOOK(external-share-guard): stop-only entry for external members
+  openUnshareOnly = null,
   artifactDoc = null,
   htmlSource = false,
   onToggleHtmlSource = null,
@@ -137,6 +147,14 @@ function FileHeaderActions({
     workspaceId,
     selectedFile && isHtmlFile(selectedFile) ? selectedFile : null,
     access,
+  );
+  // DALTON-HOOK(external-share-guard): the record behind the selected file,
+  // read only where the unshare-only entry can show (external members).
+  const root = useWorkspaceFolders()?.rootDir;
+  const { data: unshareRecord } = useArtifactByPath(
+    openUnshareOnly ? workspaceId : null,
+    openUnshareOnly ? selectedFile : null,
+    { root },
   );
 
   const handleExportHtmlPdf = async () => {
@@ -366,6 +384,18 @@ function FileHeaderActions({
           aria-label={htmlSource ? t('filePanel.viewPreview') : t('filePanel.viewSource')}
         >
           {htmlSource ? <Eye className="h-4 w-4" /> : <Code2 className="h-4 w-4" />}
+        </button>
+      )}
+      {/* DALTON-HOOK(external-share-guard): an external member stops an
+          already-public link; nothing to publish, nothing to keep updated. */}
+      {openUnshareOnly && unshareRecord?.shared && (
+        <button
+          onClick={() => openUnshareOnly(selectedFile)}
+          className="file-panel-icon-btn"
+          title={t('artifact.unshareOnly')}
+          aria-label={t('artifact.unshareOnly')}
+        >
+          <Link2Off className="h-4 w-4" />
         </button>
       )}
       {/* An HTML file takes comments, so its menu also says where they go. */}

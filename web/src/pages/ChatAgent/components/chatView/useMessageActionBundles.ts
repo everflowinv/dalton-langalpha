@@ -13,6 +13,13 @@ export interface MessageActionSources {
   onOpenFile: Action<'onOpenFile'>;
   onDownloadFile: Action<'onDownloadFile'>;
   onPublishFile: Action<'onPublishFile'>;
+  /**
+   * DALTON-HOOK(external-share-guard)/(team-sharing): whether this chat's
+   * file cards may offer Publish at all — the workspace's own owner only. A
+   * colleague (rw or ro), an external member, or a read-only thread gets no
+   * entry; the server refuses them regardless.
+   */
+  publishAllowed?: boolean;
   downloadKeyFor: Action<'downloadKeyFor'>;
   onRevealFiles: Action<'onRevealFiles'>;
   onRevealMessage: Action<'onRevealMessage'>;
@@ -106,12 +113,12 @@ export function useMessageActionBundles(src: MessageActionSources): {
   // this object is built once and never re-renders the memoized message tree.
   // DALTON-HOOK(team-sharing): in read-only mode, expose only navigation actions
   const readOnly = Boolean(src.readOnly);
+  const publishAllowed = src.publishAllowed !== false && !readOnly;
   const messageActions = useMemo<MessageActions>(() => (
     readOnly
       ? {
           onOpenFile: stableOpenFile,
           onDownloadFile: stableDownloadFile,
-          onPublishFile: stablePublishFile,
           downloadKeyFor: stableDownloadKeyFor,
           onRevealFiles: stableRevealFiles,
           onRevealMessage: stableRevealMessage,
@@ -124,7 +131,7 @@ export function useMessageActionBundles(src: MessageActionSources): {
       : {
           onOpenFile: stableOpenFile,
           onDownloadFile: stableDownloadFile,
-          onPublishFile: stablePublishFile,
+          ...(publishAllowed ? { onPublishFile: stablePublishFile } : {}),
           downloadKeyFor: stableDownloadKeyFor,
           onRevealFiles: stableRevealFiles,
           onRevealMessage: stableRevealMessage,
@@ -163,7 +170,7 @@ export function useMessageActionBundles(src: MessageActionSources): {
     stableApprovePTCAgent, stableRejectPTCAgent, stableApproveSecretaryAction,
     stableRejectSecretaryAction, stableResumeCreditPause, stableApproveToolCall, stableRejectToolCall,
     stableEditMessage, stableRegenerate, stableRetry, editDrafts,
-    stableThumbUp, stableThumbDown, stableSendMessage,
+    stableThumbUp, stableThumbDown, stableSendMessage, publishAllowed, // DALTON-HOOK(external-share-guard)
   ]);
 
   // The subagent transcript is a DIFFERENT surface: its cards belong to a task,
@@ -174,11 +181,11 @@ export function useMessageActionBundles(src: MessageActionSources): {
   const subagentMessageActions = useMemo<MessageActions>(() => ({
     onOpenFile: stableOpenFile,
     onDownloadFile: stableDownloadFile,
-    onPublishFile: stablePublishFile,
+    ...(publishAllowed ? { onPublishFile: stablePublishFile } : {}), // DALTON-HOOK(external-share-guard)
     downloadKeyFor: stableDownloadKeyFor,
     onToolCallDetailClick: stableToolCallDetail,
     onOpenChart: stableOpenChart,
-  }), [stableOpenFile, stableDownloadFile, stablePublishFile, stableDownloadKeyFor, stableToolCallDetail, stableOpenChart]);
+  }), [stableOpenFile, stableDownloadFile, stablePublishFile, stableDownloadKeyFor, stableToolCallDetail, stableOpenChart, publishAllowed]);
 
   return { messageActions, subagentMessageActions };
 }

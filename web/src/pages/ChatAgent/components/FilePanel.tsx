@@ -30,6 +30,8 @@ import { useDownloadState, workspaceDownloadKey } from '../utils/downloadNotice'
 import './FilePanel.css';
 
 const ExportPreviewModal = React.lazy(() => import('./ExportPreviewModal'));
+// DALTON-HOOK(external-share-guard): the external member's stop-only dialog.
+const PublishDialog = React.lazy(() => import('./PublishDialog'));
 
 import type { ApiAdapter, ChartTabSpec, ContextPayload, PanelAccess, PanelTarget } from './filePanel/types';
 import { EDITABLE_EXTENSIONS, getFileExtension, viewerFor } from './filePanel/fileMeta';
@@ -275,12 +277,20 @@ function FilePanel({
   const servePrefix = apiAdapter?.servePrefix;
   // DALTON-HOOK(team-sharing): a teammate's workspace is read-only for
   // artifact purposes whatever their web level — rw lifts file writes only,
-  // never publish/comment (the server refuses those too); `mirror` keeps the
-  // HTML serving on the DB-mirror path instead of the owner's file grant.
+  // never publish/comment (the server refuses those too), and its HTML reads
+  // from the DB mirror: an rw colleague is no more the workspace's owner than
+  // a ro one, so the owner's file grant would only be refused. The owner
+  // alone (and never an external member) gets the owner access.
   // DALTON-HOOK(external-share-guard): an external member is no artifact
   // owner either — the publish entry and comment UI stay hidden.
   const access = useMemo<PanelAccess>(
-    () => (servePrefix ? { kind: 'share', servePrefix } : readOnly || !workspaceId ? { kind: 'readOnly', ...(teamReadOnly ? { mirror: true } : {}) } : callerTier === 'external' ? { kind: 'readOnly' } : { kind: 'owner' }),
+    () => (servePrefix
+      ? { kind: 'share', servePrefix }
+      : teamReadOnly || callerTier === 'external'
+        ? { kind: 'readOnly', ...(teamReadOnly ? { mirror: true } : {}) }
+        : readOnly || !workspaceId
+          ? { kind: 'readOnly' }
+          : { kind: 'owner' }),
     [servePrefix, readOnly, teamReadOnly, workspaceId, callerTier],
   );
   // DALTON-HOOK(team-sharing): no comment layer, docked comment box or publish
@@ -310,6 +320,9 @@ function FilePanel({
   const fileError = downloads.errorFor(selectedFile) ?? readError;
 
   const [exportModalOpen, setExportModalOpen] = useState(false);
+  // DALTON-HOOK(external-share-guard): an external member's stop-only dialog,
+  // for a link they already made public.
+  const [unshareTarget, setUnshareTarget] = useState<string | null>(null);
   const [pageCounts, setPageCounts] = useState<Record<string, number>>({});
 
   // DALTON-HOOK(multi-file-upload): uploadStatus carries the batch position
@@ -845,6 +858,9 @@ function FilePanel({
               readFileFullFn={readFileFullFn}
               access={access}
               openPublish={artifactTab.openPublish}
+              // DALTON-HOOK(external-share-guard): external members may stop a
+              // public link but never start one.
+              openUnshareOnly={callerTier === 'external' ? (path) => setUnshareTarget(path) : null}
               artifactDoc={artifactTab.doc}
               htmlSource={htmlView.source}
               // Only where the viewer is up to switch: not while loading, nor on an error card.
@@ -1085,6 +1101,17 @@ function FilePanel({
         </Suspense>
       )}
       {artifactTab.dialog}
+      {unshareTarget && (
+        <Suspense fallback={null}>
+          <PublishDialog
+            open
+            unshareOnly
+            workspaceId={workspaceId}
+            path={unshareTarget}
+            onClose={() => setUnshareTarget(null)}
+          />
+        </Suspense>
+      )}
       {selectedFile && memoEntry && memoStaleSandboxText !== null && (
         <MemoDiffModal
           open={memoDiffOpen}

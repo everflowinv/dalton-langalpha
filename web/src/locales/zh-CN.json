@@ -2159,7 +2159,8 @@
   },
   "chat": {
     "attachmentTooLarge": "{{name}} 超过 {{max}} MB，没有添加。更大的文件请从文件面板上传。",
-    "attachmentsTotalTooLarge": "{{name}} 没有添加：单条消息的附件总大小不能超过 {{max}} MB。更多文件请从文件面板上传。",    "artifactComments": {
+    "attachmentsTotalTooLarge": "{{name}} 没有添加：单条消息的附件总大小不能超过 {{max}} MB。更多文件请从文件面板上传。",
+    "artifactComments": {
       "sendFailed": "这些评论未能发送，仍在待发送中。",
       "message": {
         "head_other": "{{title}} 上的 {{count}} 条评论",
@@ -3236,7 +3237,8 @@
     "commentsGoHere": "评论发送至当前对话",
     "commentsGoNew": "评论发送至新对话",
     "unbind": "解除绑定",
-    "unbindFailed": "无法解除绑定。"
+    "unbindFailed": "无法解除绑定。",
+    "unshareOnly": "停止分享"
   },
   "memoryPanel": {
     "backToList": "返回记忆列表",

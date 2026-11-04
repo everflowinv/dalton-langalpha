@@ -581,6 +581,98 @@ describe('Dalton Team Sharing', () => {
     expect(iframe.getAttribute('srcdoc')).toContain('Mirror Report');
   });
 
+  it('an rw colleague opens HTML through the mirror with no publish entry (B11 r4)', async () => {
+    // An rw colleague may write files, but is not the workspace's owner:
+    // the panel reads readOnly+mirror, so the owner grant is never minted and
+    // no publish or comment surface appears.
+    const queryClient = createTestQueryClient();
+    const { unmount } = renderWithProviders(
+      <FilePanel
+        workspaceId="ws-richard-1"
+        onClose={vi.fn()}
+        files={['report.html']}
+        readOnly={false}
+        teamReadOnly={true}
+        apiAdapter={{
+          readFileFull: async () => ({
+            content: '<html><body><h1>RW Mirror</h1></body></html>',
+          }),
+        }}
+      />,
+      { queryClient },
+    );
+
+    const item = await screen.findByText('report.html');
+    await act(async () => {
+      fireEvent.click(item);
+    });
+
+    const iframe = await screen.findByTitle('report.html');
+    expect(iframe.getAttribute('srcdoc')).toContain('RW Mirror');
+    expect(iframe.getAttribute('sandbox')).not.toContain('allow-same-origin');
+    // No publish entry and no owner grant for a teammate's panel.
+    expect(screen.queryByTitle(/发布|publish/i)).toBeNull();
+    expect(mockGrant).toHaveBeenCalledWith(null);
+    unmount();
+  });
+
+  it('an external member sees only a stop entry for an already-public link (B11 r4)', async () => {
+    const queryClient = createTestQueryClient();
+
+    const renderHeader = () =>
+      renderWithProviders(
+        <FileHeaderActions
+          selectedFile="brief.html"
+          isEditing={false}
+          workspaceId="ws-ext-1"
+          fileContent="<html><body><h1>External Brief</h1></body></html>"
+          fileMime="text/html"
+          canEdit={false}
+          onStartEdit={vi.fn()}
+          onOpenExportModal={vi.fn()}
+          triggerDownloadFn={vi.fn(() => Promise.resolve())}
+          canDownload={false}
+          readFileFullFn={vi.fn(() => Promise.resolve({ content: '' }))}
+          access={{ kind: 'readOnly' }}
+          openUnshareOnly={(path) => void path}
+          editorRef={{ current: null }}
+          canUndo={false}
+          canRedo={false}
+          hasUnsavedChanges={false}
+          showDiff={false}
+          setShowDiff={vi.fn()}
+          isSaving={false}
+          saveError={null}
+          onSave={vi.fn()}
+          onCancelEdit={vi.fn()}
+        />,
+        { queryClient },
+      );
+
+    // The link is public: stop sharing shows, publish never does.
+    mockArtifactByPathResult.data = {
+      code: 'ext1',
+      url: '/a/ext1',
+      shared: true,
+    } as unknown as { code: string; url: string };
+    const first = renderHeader();
+    expect(await screen.findByTitle(/停止分享|Stop sharing/)).toBeInTheDocument();
+    expect(screen.queryByTitle(/发布|publish/i)).toBeNull();
+    first.unmount();
+
+    // A private file shows no entry at all.
+    mockArtifactByPathResult.data = {
+      code: 'ext2',
+      url: '/a/ext2',
+      shared: false,
+    } as unknown as { code: string; url: string };
+    const second = renderHeader();
+    // The header renders for the same selected file; the stop entry is the
+    // record's to show, and this one is not shared.
+    expect(screen.queryByTitle(/停止分享|Stop sharing/)).toBeNull();
+    second.unmount();
+  });
+
   it('preserves owner file-grant, HTML open-in-new-tab, and PDF export when owner views sibling workspace file read-only', async () => {
     const queryClient = createTestQueryClient();
     mockGrantResult.data = { prefix: '/api/v1/wsfiles/sig-owner/ws-sibling', expiresAt: Date.now() + 60_000 };

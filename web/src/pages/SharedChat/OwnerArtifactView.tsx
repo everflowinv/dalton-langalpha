@@ -11,6 +11,8 @@ import { ArtifactFrames } from '../ChatAgent/components/viewers/html/ArtifactFra
 import { ArtifactVersionPicker } from '../ChatAgent/components/viewers/html/ArtifactVersionPicker';
 import { CommentTools } from '../ChatAgent/components/viewers/html/comments/CommentTools';
 import { useCommentUi } from '../ChatAgent/components/viewers/html/comments/useCommentUi';
+// DALTON-HOOK(external-share-guard): the caller's tier hides publish
+import { useTeamReadOnly } from '../ChatAgent/components/dalton/TeamSharing';
 import { exportServedPdf } from '../ChatAgent/components/viewers/html/useHtmlActions';
 import { buildServeUrl } from '../ChatAgent/components/viewers/html/wsfilesUrl';
 import { shareLinkHref } from '../ChatAgent/utils/api/shareLinks';
@@ -69,6 +71,9 @@ export default function OwnerArtifactView({ code, metadata }: {
   const [publishOpen, setPublishOpen] = useState(false);
   const [pdfBusy, setPdfBusy] = useState(false);
   const ui = useCommentUi();
+  // DALTON-HOOK(external-share-guard): the caller's Dalton tier, for hiding
+  // the publish entry below.
+  const { callerTier } = useTeamReadOnly(workspaceId);
 
   const savePdf = async () => {
     if (pdfBusy) return;
@@ -100,7 +105,12 @@ export default function OwnerArtifactView({ code, metadata }: {
             <ArtifactVersionPicker view={versionView} variant="bar" />
             <ShareTopBarAction icon={RefreshCw} label={t('filePanel.reloadPage')} onClick={() => setReloads((n) => n + 1)} />
             <ShareTopBarAction icon={FileDown} label={t('filePanel.saveAsPdf')} onClick={() => void savePdf()} disabled={pdfBusy} />
-            <ShareTopBarAction icon={Link2} label={t('artifact.publish')} onClick={() => setPublishOpen(true)} />
+            {/* DALTON-HOOK(external-share-guard): an external member reads their
+                own /a/ page but may not publish from it — the server refuses;
+                the entry stays hidden rather than failing after the click. */}
+            {callerTier !== 'external' && (
+              <ShareTopBarAction icon={Link2} label={t('artifact.publish')} onClick={() => setPublishOpen(true)} />
+            )}
           </>
         )}
       />

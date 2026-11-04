@@ -333,6 +333,9 @@ ALLOWED_HOOKS=(
   # WorkspaceFileGCService.start() 不启动 sweep（回滚期间旧 GC 不得删掉
   # artifact_version_files 仍引用的对象）。
   "workspace-file-gc-kill"
+  # sync3 B11 r4（审查修正）：legacy 首读不再无条件把 keep_updated 写回
+  # TRUE——101 迁移已回填过，属主迁移后改成的 False 必须在首读后仍然成立。
+  "legacy-keeps-owner-setting"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

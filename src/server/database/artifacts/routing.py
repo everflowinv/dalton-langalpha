@@ -46,7 +46,12 @@ async def require_destination(
           JOIN workspaces tw ON tw.workspace_id = t.workspace_id
          WHERE t.conversation_thread_id = %(thread_id)s
            AND t.archived_at IS NULL
-           AND tw.user_id = %(user_id)s AND tw.status <> 'deleted'
+           -- DALTON-HOOK(colleague-dispatch): since d020 a thread in this
+           -- workspace can belong to a colleague; comments are sent into the
+           -- thread, so the sender must own the thread itself, not merely the
+           -- workspace it sits in (same rule as replay_rows' owner read).
+           AND COALESCE(t.user_id, tw.user_id) = %(user_id)s
+           AND tw.status <> 'deleted'
            AND t.workspace_id IN (%(workspace_id)s, %(home_id)s)
         """,
         {
@@ -186,7 +191,13 @@ async def destinations(
                       FROM conversation_threads t
                       JOIN workspaces tw
                         ON tw.workspace_id = t.workspace_id
-                       AND tw.user_id = %(user_id)s AND tw.status <> 'deleted'
+                       -- DALTON-HOOK(colleague-dispatch): a colleague's thread
+                       -- in this workspace is not a place the owner may send
+                       -- comments to; it drops out and the default falls
+                       -- through to the next rule (same rule as
+                       -- require_destination above).
+                       AND COALESCE(t.user_id, tw.user_id) = %(user_id)s
+                       AND tw.status <> 'deleted'
                      WHERE t.conversation_thread_id = ANY(%(ids)s::uuid[])
                     """,
                     {

@@ -2125,7 +2125,8 @@
   },
   "chat": {
     "attachmentTooLarge": "{{name}} is over {{max}} MB and was not attached. Upload larger files from the file panel.",
-    "attachmentsTotalTooLarge": "{{name}} was not attached: this message's attachments would exceed {{max}} MB in total. Upload more files from the file panel.",    "artifactComments": {
+    "attachmentsTotalTooLarge": "{{name}} was not attached: this message's attachments would exceed {{max}} MB in total. Upload more files from the file panel.",
+    "artifactComments": {
       "sendFailed": "These did not send, so they are still queued.",
       "message": {
         "head_one": "Comment on {{title}}",
@@ -3226,7 +3227,8 @@
     "commentsGoHere": "Comments go to this thread",
     "commentsGoNew": "Comments go to a new thread",
     "unbind": "Unbind",
-    "unbindFailed": "Couldn't unbind the file."
+    "unbindFailed": "Couldn't unbind the file.",
+    "unshareOnly": "Stop sharing"
   },
   "memoryPanel": {
     "backToList": "Back to memory list",

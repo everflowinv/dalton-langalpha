@@ -505,6 +505,12 @@ async def keep_updated_after_turn(*, workspace_id: str, user_id: str) -> None:
 
     if not is_artifact_publishing_enabled():
         return
+    # DALTON-HOOK(colleague-dispatch): the turn's sender is not always the
+    # workspace's owner — a colleague dispatch, the research director's
+    # dispatch, an rw colleague's own turn all end here with their own id.
+    # The record lock (``lock_owned``), the blob store and the redaction
+    # vault are all owner-scoped, so the cut runs as the owner, the way the
+    # legacy first read already does.
     try:
         kept = await artifacts_db.list_kept_updated(workspace_id)
         if not kept:
@@ -512,8 +518,16 @@ async def keep_updated_after_turn(*, workspace_id: str, user_id: str) -> None:
         workspace = await db_get_workspace(workspace_id)
         if not workspace or workspace.get("status") != "running":
             return
+        owner_id = str(workspace["user_id"])
         for artifact in kept:
-            await _keep_one(artifact, user_id)
+            # One link's failure is its own: a record deleted or refused
+            # mid-run must not stop the workspace's other links from updating.
+            try:
+                await _keep_one(artifact, owner_id)
+            except Exception:
+                logger.warning(
+                    "Keeping artifact %s updated failed", artifact.artifact_id, exc_info=True
+                )
     except Exception:
         logger.warning(
             "Keeping artifacts updated in workspace %s failed",

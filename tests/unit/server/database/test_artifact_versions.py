@@ -258,7 +258,14 @@ async def test_a_deleted_workspaces_comments_stop_waiting_for_a_send(mock_cursor
 async def test_a_links_first_cut_leaves_it_following_the_file(
     monkeypatch, mock_cursor
 ):
-    """It was live until now, whichever build shared it."""
+    """It was live until now, whichever build shared it.
+
+    DALTON-HOOK(legacy-keeps-owner-setting): migration 101 already backfilled
+    the pre-versions links to keep_updated=TRUE, so "leaves it following the
+    file" now means keeping the row's own setting rather than writing TRUE —
+    an owner who turned it off after the migration must not have the link's
+    first view switch it back on. The record here carries TRUE, as the
+    migration left it, and None lets the UPDATE's COALESCE keep it."""
     record = _record(latest_seq=0)
     monkeypatch.setattr(versions, "lock_owned", AsyncMock(return_value=record))
     mock_cursor.fetchone.return_value = None
@@ -272,7 +279,7 @@ async def test_a_links_first_cut_leaves_it_following_the_file(
         for c in mock_cursor.execute.call_args_list
         if "UPDATE share_links" in c.args[0]
     ]
-    assert params["keep_updated"] is True
+    assert params["keep_updated"] is None
 
 
 def _said(*rows):

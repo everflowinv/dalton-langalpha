@@ -1025,6 +1025,10 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
                 readOnly={panelAccess.readOnly}
                 // DALTON-HOOK(team-sharing): pass teamReadOnly separately from sibling readOnly
                 teamReadOnly={panelAccess.teamReadOnly}
+                // DALTON-HOOK(external-share-guard): the caller's tier decides
+                // the publish entry — an external member is no artifact owner
+                // even in their own workspace's gallery.
+                callerTier={teamReadOnly.callerTier}
                 singleFileMode={panelAccess.singleFileMode}
                 onReturnHome={panelAccess.onReturnHome}
                 returnLabel={panelAccess.returnLabel}

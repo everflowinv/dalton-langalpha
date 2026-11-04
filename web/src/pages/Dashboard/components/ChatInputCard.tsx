@@ -46,8 +46,14 @@ function ChatInputCard() {
     handleSend(message, files, commands, modelOptions);
 
   const handleMobileSend = (send: ComposerSend) => {
-    void sendComposer(send);
-    setChatExpanded(false);
+    // DALTON-HOOK(composer-drafts): forward the outcome so the mobile
+    // composer keeps its stored draft when the handoff is refused, exactly
+    // as the desktop one does — the panel stays open only on success.
+    const result = sendComposer(send);
+    void Promise.resolve(result).then((sent) => {
+      if (sent !== false) setChatExpanded(false);
+    });
+    return result;
   };
 
   // DALTON-HOOK(composer-drafts): persist dashboard composer draft per selected workspace or fallback key

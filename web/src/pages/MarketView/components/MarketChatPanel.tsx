@@ -716,6 +716,11 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
   });
 
   const { onPublishFile, dialog: publishDialog } = usePublishFile(activeWorkspaceId);
+  // DALTON-HOOK(external-share-guard)/(team-sharing): the market transcript's
+  // file cards offer Publish to the workspace's own owner only — a colleague
+  // (rw or ro) or an external member gets no entry; the server refuses them.
+  const publishAllowed =
+    !teamReadOnly.isColleague && teamReadOnly.callerTier !== 'external';
   const messageActions = useMemo<MessageActions>(() => ({
     onOpenSubagentTask: stableOpenSubagentTask,
     onToolCallDetailClick: stableToolCallDetail,
@@ -740,7 +745,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     onThumbDown: stableThumbDown,
     onWidgetSendPrompt: stableWidgetSendPrompt,
     onRevealMessage: follow.reveal,
-    onPublishFile,
+    ...(publishAllowed ? { onPublishFile } : {}), // DALTON-HOOK(external-share-guard)
   }), [
     stableOpenSubagentTask, stableToolCallDetail,
     stableAnswerQuestion, stableSkipQuestion, stableApproveCreateWorkspace,
@@ -748,7 +753,7 @@ function ChatBody(props: ChatBodyProps): React.ReactElement {
     stableApprovePTCAgent, stableRejectPTCAgent, stableApproveSecretaryAction,
     stableRejectSecretaryAction, stableResumeCreditPause, stableApproveToolCall, stableRejectToolCall,
     stableEditMessage, stableRegenerate, stableRetry, editDrafts,
-    stableThumbUp, stableThumbDown, stableWidgetSendPrompt, follow.reveal, onPublishFile,
+    stableThumbUp, stableThumbDown, stableWidgetSendPrompt, follow.reveal, onPublishFile, publishAllowed, // DALTON-HOOK(external-share-guard)
   ]);
 
   // In the Chief of Staff, carry the source thread/workspace into a PTC-agent

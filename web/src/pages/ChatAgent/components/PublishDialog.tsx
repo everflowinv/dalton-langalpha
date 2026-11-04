@@ -37,6 +37,13 @@ interface PublishDialogProps {
   /** Any spelling the panel holds; the record's `path` is canonical. */
   path: string;
   onClose: () => void;
+  /**
+   * DALTON-HOOK(external-share-guard): an external member may only stop a
+   * link they already made public — no publish, no keep-updated, no review
+   * list. Unshared files never open this mode (the entry is hidden), so the
+   * dialog shows the link, where it stands, and the one action.
+   */
+  unshareOnly?: boolean;
 }
 
 /** The last attempt's answer when it was not a new version, standing until the next attempt or close. */
@@ -209,7 +216,9 @@ function ReviewList({ heading, status, files, added, unavailable, failed, fetchi
  * Unshare stops the link and keeps every version. The chat and the owner's
  * comments are never part of it.
  */
-function PublishDialog({ open, workspaceId, path, onClose }: PublishDialogProps) {
+// DALTON-HOOK(external-share-guard): unshareOnly mode — stop a public link,
+// never start one
+function PublishDialog({ open, workspaceId, path, onClose, unshareOnly = false }: PublishDialogProps) {
   // Written by the review while a request is in flight, which holds the dialog open.
   const busy = useRef(false);
   return (
@@ -220,17 +229,25 @@ function PublishDialog({ open, workspaceId, path, onClose }: PublishDialogProps)
       >
         {/* Mounted only while the dialog shows, so every open starts a fresh
             review, and the exit animation plays over the last one. */}
-        <PublishReview workspaceId={workspaceId} path={path} busyRef={busy} onClose={onClose} />
+        <PublishReview
+          workspaceId={workspaceId}
+          path={path}
+          busyRef={busy}
+          onClose={onClose}
+          unshareOnly={unshareOnly}
+        />
       </DialogContent>
     </Dialog>
   );
 }
 
-function PublishReview({ workspaceId, path, busyRef, onClose }: {
+function PublishReview({ workspaceId, path, busyRef, onClose, unshareOnly = false }: {
   workspaceId: string;
   path: string;
   busyRef: RefObject<boolean>;
   onClose: () => void;
+  /** DALTON-HOOK(external-share-guard): stop-only mode, see the props above. */
+  unshareOnly?: boolean;
 }) {
   const { t } = useTranslation();
   const locale = useLocale();
@@ -271,7 +288,8 @@ function PublishReview({ workspaceId, path, busyRef, onClose }: {
   const upToDate = shared && status?.changed === false && !hasDrift;
   // Publishing sends the list on screen, so it waits for one that is current.
   const listReady = !!status && !statusQuery.isFetching && !statusQuery.isError;
-  const canPublish = !!artifact && listReady && files.length > 0 && !busy && !upToDate;
+  // DALTON-HOOK(external-share-guard): no publishing in the stop-only mode
+  const canPublish = !unshareOnly && !!artifact && listReady && files.length > 0 && !busy && !upToDate;
   const keepOn = shared ? !!artifact?.keep_updated : keepDraft ?? !!artifact?.keep_updated;
   const recordFailed = !!owned.error;
   const href = artifact ? shareLinkHref(artifact.code) : '';
@@ -422,6 +440,8 @@ function PublishReview({ workspaceId, path, busyRef, onClose }: {
               </Button>
             )}
           </div>
+          {/* DALTON-HOOK(external-share-guard): keep-updated is the owner's */}
+          {!unshareOnly && (
           <div
             className="flex items-center justify-between gap-3 px-3 py-2.5"
             style={{ borderColor: 'var(--color-border-muted)' }}
@@ -445,9 +465,13 @@ function PublishReview({ workspaceId, path, busyRef, onClose }: {
                 />
               )}
           </div>
+          )}
         </div>
+        {/* DALTON-HOOK(external-share-guard): the keep-updated row above is
+            the owner's; the stop-only view ends the card here */}
 
-        {latestSeq > 0 && <VersionList artifactId={artifact?.artifact_id} />}
+        {/* DALTON-HOOK(external-share-guard): versions are the owner's review */}
+        {!unshareOnly && latestSeq > 0 && <VersionList artifactId={artifact?.artifact_id} />}
 
         {/* Notices, about the list and the last attempt */}
         {outcome?.kind === 'conflict' && (
@@ -474,8 +498,10 @@ function PublishReview({ workspaceId, path, busyRef, onClose }: {
           </p>
         )}
 
-        {/* A refusal has no list to show, nor does a record that failed to load. */}
-        {!recordFailed && !blocking && (
+        {/* A refusal has no list to show, nor does a record that failed to load.
+            DALTON-HOOK(external-share-guard): nor does the unshare-only view,
+            which reviews nothing. */}
+        {!unshareOnly && !recordFailed && !blocking && (
           <ReviewList
             heading={status ? listHeading : null}
             status={status}
@@ -488,7 +514,9 @@ function PublishReview({ workspaceId, path, busyRef, onClose }: {
           />
         )}
 
-        {/* The version's note */}
+        {/* The version's note — DALTON-HOOK(external-share-guard): none to
+            write when only stopping a link */}
+        {!unshareOnly && (
         <label className="flex flex-col gap-1.5">
           <span className="text-xs font-medium" style={{ color: 'var(--color-text-secondary)' }}>
             {t('publish.label')}
@@ -508,6 +536,7 @@ function PublishReview({ workspaceId, path, busyRef, onClose }: {
             className="h-8 sm:text-xs bg-(--color-bg-input) border-(--color-border-muted) text-(--color-text-primary)"
           />
         </label>
+        )}
 
         {/* Footer */}
         <div className="flex items-center justify-between gap-3 pt-1">
@@ -527,10 +556,13 @@ function PublishReview({ workspaceId, path, busyRef, onClose }: {
             <Button variant="outline" size="sm" onClick={close} disabled={busy}>
               {t('common.close')}
             </Button>
+            {/* DALTON-HOOK(external-share-guard): no publish button here */}
+            {!unshareOnly && (
             <Button size="sm" className="gap-1.5" onClick={() => void send()} disabled={!canPublish}>
               {publish.pending && <Loader size={14} style={{ color: 'inherit' }} />}
               {shared ? t('publish.update') : t('publish.publish')}
             </Button>
+            )}
           </div>
         </div>
       </div>

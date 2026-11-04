@@ -855,6 +855,11 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
         ...modelOptions,
         ...(picked ? { chartSelections: picked.snapshots } : {}),
         ...(artifactComments ? { artifactComments } : {}),
+        // DALTON-HOOK(composer-drafts): the box as the person wrote it — a
+        // send the server refuses while the transcript is out of view goes
+        // back to the composer whole (attachments, mentions and commands too)
+        // instead of leaving a failed reply nobody reads.
+        draft: send,
       }),
     );
   }, [marketWatchEnabled, stableSendMessage, takeChartSelections, takeQueuedComments, composerSendOptions]);
@@ -1076,8 +1081,10 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   const composerDeck = {
     hasExternalContext: chartSelectionChips.length > 0 || commentDeck.ready.length > 0,
     placeholder: commentDeck.placeholder ?? chatPlaceholder,
-    // DALTON-HOOK(team-sharing): a read-only thread shows no docked comment box
-    deck: isThreadReadOnly ? null : <QueuedCommentDeck deck={commentDeck} running={isLoading} compact={isMobile && dockOpen} onOpen={handleOpenArtifactComment}
+    // DALTON-HOOK(team-sharing): a colleague's workspace or a read-only
+    // thread shows no docked comment box — comments are sent into the thread
+    // from the owner's own chat.
+    deck: teamReadOnly.isColleague || isThreadReadOnly ? null : <QueuedCommentDeck deck={commentDeck} running={isLoading} compact={isMobile && dockOpen} onOpen={handleOpenArtifactComment}
       onAddToTurn={addCommentsToTurn} focusComposer={focusComposer} />,
   };
 
@@ -1200,6 +1207,13 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     onOpenFile: handleOpenFileFromChat,
     onDownloadFile: handleDownloadFileFromChat,
     onPublishFile,
+    // DALTON-HOOK(external-share-guard)/(team-sharing): the transcript's file
+    // cards offer Publish to the workspace's own owner only — a colleague
+    // (rw or ro), an external member, or a read-only thread gets no entry.
+    publishAllowed:
+      !teamReadOnly.isColleague
+      && teamReadOnly.callerTier !== 'external'
+      && !isThreadReadOnly,
     downloadKeyFor,
     onRevealFiles: revealFiles,
     onRevealMessage: revealMessage,

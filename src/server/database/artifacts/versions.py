@@ -213,12 +213,12 @@ async def publish_version(
                 # list becomes this version's.
                 share = origin == "owner"
                 shared_now = share and not artifact.shared
-                # A link with no version was live until now, whichever build
-                # shared it, so its first cut leaves it following the file
-                # rather than frozen at the first view.
-                setting = (
-                    True if origin == "legacy" else keep_updated if share else None
-                )
+                # DALTON-HOOK(legacy-keeps-owner-setting): migration 101 already
+                # backfilled the pre-versions links to keep_updated=TRUE, so a
+                # legacy first read must keep the setting as the owner left it
+                # — turning it off after the migration survives the link's
+                # first view (None falls to the row's current value below).
+                setting = keep_updated if share else None
                 await cur.execute(
                     f"""
                     UPDATE share_links l
