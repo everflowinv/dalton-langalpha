@@ -531,9 +531,9 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
     let resolveStream!: (v: boolean) => void;
     const seenAccepted: Array<boolean | undefined> = [];
     const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
-      (_m, _a, _s, opts) => {
-        seenAccepted.push(typeof opts.onAccepted === 'function');
-        opts.onAccepted?.();
+      (send) => {
+        seenAccepted.push(typeof send.modelOptions.onAccepted === 'function');
+        send.modelOptions.onAccepted?.();
         return new Promise<boolean>((resolve) => { resolveStream = resolve; });
       },
     );
@@ -783,8 +783,8 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
     inFlightForSend.unmount();
 
     const onSendAccept = vi.fn<ChatInputProps['onSend']>().mockImplementation(
-      (_m, _a, _s, opts) => {
-        opts.onAccepted?.();
+      (send) => {
+        send.modelOptions.onAccepted?.();
         return true;
       },
     );

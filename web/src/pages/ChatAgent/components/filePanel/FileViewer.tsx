@@ -15,6 +15,7 @@ import { FileErrorDisplay, type FileError } from './fileErrors';
 import { DocumentErrorFallback, DocumentLoadingFallback } from './fallbacks';
 import type { useFileFocus } from './useFileFocus';
 import type { DownloadState } from '../../utils/downloadNotice';
+import type { HtmlArtifactView } from '../viewers/html/ArtifactFrames';
 
 const PdfViewer = React.lazy(() => import('../viewers/PdfViewer'));
 const CsvViewer = React.lazy(() => import('../viewers/CsvViewer'));
@@ -79,6 +80,8 @@ export interface FileViewerProps {
   servePrefix?: string;
   // DALTON-HOOK(team-sharing): render HTML from mirror without owner file-grant in colleague mirror mode
   teamReadOnly?: boolean;
+  /** The owner's comments and versions on an HTML file. Left out, the file shows alone. */
+  htmlArtifact?: HtmlArtifactView | null;
 }
 
 /** The open file, rendered by whichever viewer its bytes belong to. */
@@ -210,6 +213,7 @@ export function FileViewer(props: FileViewerProps): React.ReactElement {
             // DALTON-HOOK(team-sharing): forward teamReadOnly to HtmlViewer
             teamReadOnly={props.teamReadOnly}
             source={props.htmlSource}
+            artifact={props.htmlArtifact ?? null}
           />
         </DocumentErrorBoundary>
       </Suspense>

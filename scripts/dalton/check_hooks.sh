@@ -322,6 +322,17 @@ ALLOWED_HOOKS=(
   # 开头返回 False、CliTokenSweeper.start() 不启动循环且 sweep_once() 在
   # _prune_calls()/claim_due() 之前返回 0、get_principal 的 lac1 分支 401。
   "computer-cli-tokens-off"
+  # sync3 B11（上游 #666 artifact 发布/评论）的部署级开关
+  # dalton.artifact_publishing.enabled（代码默认 false，生产设 true）的七道
+  # 拦截：publish 与 set keep_updated=True 403、bind 403、评论写接口 403、
+  # 带 artifact_comment_ids 的发送 409（messaging 构造流式响应之前 + ptc_run
+  # 进 CommentSendScope 之前各一道）、keep_updated_after_turn 直接返回、
+  # agent 不注册 reply_to_comment。
+  "artifact-publishing-off"
+  # sync3 B11 带入的 0.6 回滚补丁：DALTON_WORKSPACE_FILE_GC_DISABLED=1 时
+  # WorkspaceFileGCService.start() 不启动 sweep（回滚期间旧 GC 不得删掉
+  # artifact_version_files 仍引用的对象）。
+  "workspace-file-gc-kill"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

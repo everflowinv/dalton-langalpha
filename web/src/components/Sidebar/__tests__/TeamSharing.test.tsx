@@ -7,6 +7,7 @@ import { queryKeys } from '@/lib/queryKeys';
 import { workspaceDetailQuery } from '@/pages/ChatAgent/utils/workspaceQueries';
 import { createEditDraftStore } from '@/pages/ChatAgent/hooks/utils/editDrafts';
 import type { useChatMessages as useChatMessagesType } from '@/pages/ChatAgent/hooks/useChatMessages';
+import type { CommentSendListener } from '@/pages/ChatAgent/hooks/utils/requestKey';
 import type { ChatMessage } from '@/types/chat';
 
 vi.mock('@/components/ui/dropdown-menu', () => ({
@@ -90,6 +91,30 @@ vi.mock('@/hooks/useShareLink', () => ({
   },
 }));
 
+// #666: the served-HTML path reads a file's artifact record instead of a
+// share link — useOwnedArtifact makes one (owner only), useArtifactByPath
+// looks an existing one up (a read-only sibling's page).
+const mockArtifactByPathResult = vi.hoisted(() => ({
+  data: undefined as { code: string; url: string } | undefined,
+}));
+const mockOwnedArtifact = vi.hoisted(() => vi.fn());
+const mockArtifactByPath = vi.hoisted(() => vi.fn());
+vi.mock('@/hooks/useArtifact', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/hooks/useArtifact')>();
+  return {
+    ...actual,
+    useOwnedArtifact: (...args: unknown[]) => {
+      mockOwnedArtifact(...args);
+      return { record: undefined, error: null, fetching: false };
+    },
+    useArtifactByPath: (wsId: string | null | undefined) => {
+      mockArtifactByPath(wsId);
+      return { data: wsId ? mockArtifactByPathResult.data : undefined };
+    },
+    useArtifactBinding: () => ({ bind: { mutate: vi.fn() }, unbind: { mutate: vi.fn() } }),
+  };
+});
+
 const STABLE_THEME = vi.hoisted(() => ({
   theme: 'dark' as const,
   setTheme: vi.fn(),
@@ -150,6 +175,11 @@ const STABLE_CHAT_HELPERS = vi.hoisted(() => ({
 }));
 const STABLE_EDIT_DRAFTS = createEditDraftStore(() => 'th-1');
 
+// #666: the chat tells its comment sends' outcomes to whoever subscribes.
+// The mock holds real listeners and honors the unsubscribe contract — with
+// no comment sends in these tests, none is ever told, like the quiet hook.
+const commentSendListeners = vi.hoisted(() => new Set<CommentSendListener>());
+
 vi.mock('@/pages/ChatAgent/hooks/useChatMessages', () => ({
   useChatMessages: (): ReturnType<typeof useChatMessagesType> => ({
     messages: mockMessages.current,
@@ -203,6 +233,14 @@ vi.mock('@/pages/ChatAgent/hooks/useChatMessages', () => ({
     compactionTokens: null,
     setIsCompacting: STABLE_CHAT_HELPERS.setIsCompacting,
     queuedSend: false,
+    watchCommentSends: (listener: CommentSendListener) => {
+      commentSendListeners.add(listener);
+      return () => {
+        commentSendListeners.delete(listener);
+      };
+    },
+    returnedDraft: null,
+    clearReturnedDraft: () => {},
     awaitingReportBack: false,
     reportBackOwed: false,
     reportBackOwedThreads: STABLE_CHAT_HELPERS.reportBackOwedThreads,
@@ -271,6 +309,7 @@ import { usePreviews } from '@/pages/ChatAgent/components/filePanel/usePreviews'
 import { StoreTab } from '@/pages/ChatAgent/components/filePanel/StoreTab';
 import FilePanel from '@/pages/ChatAgent/components/FilePanel';
 import FileHeaderActions from '@/pages/ChatAgent/components/FileHeaderActions';
+import type { PanelAccess } from '@/pages/ChatAgent/components/filePanel/types';
 import HtmlViewer from '@/pages/ChatAgent/components/viewers/HtmlViewer';
 import ChatView from '@/pages/ChatAgent/components/ChatView';
 import ThreadCard from '@/pages/ChatAgent/components/ThreadCard';
@@ -488,22 +527,52 @@ describe('Dalton Team Sharing', () => {
     expect(ownerResult.current.isReadOnly).toBe(false);
   });
 
-  it('renders HtmlViewer in colleague teamReadOnly mode via sandboxed srcDoc without requesting file-grant', () => {
+  it('renders HtmlViewer in colleague teamReadOnly mode via sandboxed srcDoc without requesting owner-only credentials', () => {
     const queryClient = createTestQueryClient();
+    // #666 moved the credential reads out of the viewer into the header's
+    // served-HTML hook, so the gate is pinned where it now lives: a mirror
+    // access mints no owner file grant and makes no artifact record.
     renderWithProviders(
-      <HtmlViewer
-        content="<html><body><h1>Mirror Report</h1></body></html>"
-        fileName="report.html"
-        workspaceId="ws-richard-1"
-        filePath="results/report.html"
-        teamReadOnly={true}
-      />,
+      <div>
+        <HtmlViewer
+          content="<html><body><h1>Mirror Report</h1></body></html>"
+          fileName="report.html"
+          workspaceId="ws-richard-1"
+          filePath="results/report.html"
+          teamReadOnly={true}
+        />
+        <FileHeaderActions
+          selectedFile="results/report.html"
+          isEditing={false}
+          workspaceId="ws-richard-1"
+          fileContent="<html><body><h1>Mirror Report</h1></body></html>"
+          fileMime="text/html"
+          canEdit={false}
+          onStartEdit={vi.fn()}
+          onOpenExportModal={vi.fn()}
+          triggerDownloadFn={vi.fn(() => Promise.resolve())}
+          canDownload={true}
+          readFileFullFn={vi.fn(() => Promise.resolve({ content: '' }))}
+          access={{ kind: 'readOnly', mirror: true }}
+          editorRef={{ current: null }}
+          canUndo={false}
+          canRedo={false}
+          hasUnsavedChanges={false}
+          showDiff={false}
+          setShowDiff={vi.fn()}
+          isSaving={false}
+          saveError={null}
+          onSave={vi.fn()}
+          onCancelEdit={vi.fn()}
+        />
+      </div>,
       { queryClient },
     );
 
-    // Owner-only file-grant and share-link hooks must receive null in colleague teamReadOnly mode
+    // No owner file grant for a teammate's mirror panel, and no artifact
+    // record made for it (the owner-only create path receives null).
     expect(mockGrant).toHaveBeenCalledWith(null);
-    expect(mockShareLink).toHaveBeenCalledWith(null, null);
+    expect(mockOwnedArtifact).toHaveBeenCalledWith(null, 'results/report.html', expect.anything());
 
     const iframe = screen.getByTitle('report.html') as HTMLIFrameElement;
     expect(iframe).toBeInTheDocument();
@@ -515,7 +584,7 @@ describe('Dalton Team Sharing', () => {
   it('preserves owner file-grant, HTML open-in-new-tab, and PDF export when owner views sibling workspace file read-only', async () => {
     const queryClient = createTestQueryClient();
     mockGrantResult.data = { prefix: '/api/v1/wsfiles/sig-owner/ws-sibling', expiresAt: Date.now() + 60_000 };
-    mockShareLinkResult.data = { code: 'share-sibling-html' };
+    mockArtifactByPathResult.data = { code: 'share-sibling-html', url: '/a/share-sibling-html' };
 
     const { result: panelResult } = renderHookWithProviders(
       () =>
@@ -533,6 +602,9 @@ describe('Dalton Team Sharing', () => {
     });
     expect(panelResult.current.panelAccess.readOnly).toBe(true);
     expect(panelResult.current.panelAccess.teamReadOnly).toBe(false);
+    // The sibling access the panel hands the header: read-only, not a
+    // teammate's mirror — served under its own grant like the owner's.
+    const siblingAccess: PanelAccess = { kind: 'readOnly' };
 
     const openSpy = vi.spyOn(window, 'open').mockImplementation(() => null);
     const fetchSpy = vi
@@ -567,8 +639,7 @@ describe('Dalton Team Sharing', () => {
             triggerDownloadFn={vi.fn(() => Promise.resolve())}
             canDownload={true}
             readFileFullFn={vi.fn(() => Promise.resolve({ content: '' }))}
-            canShare={false}
-            teamReadOnly={panelResult.current.panelAccess.teamReadOnly}
+            access={siblingAccess}
             editorRef={{ current: null }}
             canUndo={false}
             canRedo={false}
@@ -584,14 +655,13 @@ describe('Dalton Team Sharing', () => {
         { queryClient },
       );
 
-      // Owner viewing sibling workspace file still requests grant & share link
+      // Owner viewing sibling workspace file still requests the grant, and
+      // its published record is looked up (never made) for the /a/ page.
       expect(mockGrant).toHaveBeenCalledWith('ws-sibling');
-      expect(mockShareLink).toHaveBeenCalledWith('ws-sibling', {
-        kind: 'file',
-        path: 'results/report.html',
-      });
+      expect(mockArtifactByPath).toHaveBeenCalledWith('ws-sibling');
+      expect(mockOwnedArtifact).toHaveBeenCalledWith(null, 'results/report.html', expect.anything());
 
-      // HTML open-in-new-tab button is rendered and opens the share link
+      // HTML open-in-new-tab button is rendered and opens the record's page
       const openNewTabBtn = screen.getByTitle(/new tab|新标签/i);
       fireEvent.click(openNewTabBtn);
       expect(openSpy).toHaveBeenCalledWith(
@@ -637,6 +707,9 @@ describe('Dalton Team Sharing', () => {
     });
     expect(panelResult.current.panelAccess.readOnly).toBe(true);
     expect(panelResult.current.panelAccess.teamReadOnly).toBe(false);
+    // The sibling access the panel hands the header: read-only, not a
+    // teammate's mirror — served under its own grant like the owner's.
+    const siblingAccess: PanelAccess = { kind: 'readOnly' };
 
     const openPreviewTab = vi.fn();
     const openPreviewApi = vi.fn();

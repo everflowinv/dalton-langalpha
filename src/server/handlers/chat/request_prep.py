@@ -476,6 +476,7 @@ async def ensure_thread(
     workspace_id: str,
     user_id: str,
     initial_query: str = "",
+    row_ensured: bool = False,
     # DALTON-HOOK(colleague-dispatch): workspace owner and origin channel for colleague thread metadata.
     workspace_owner_id: str | None = None,
     origin_channel: str = "web",
@@ -486,11 +487,91 @@ async def ensure_thread(
     Returns the prior turn as it stood on entry, read here so the ordering
     against the ensure below (which stamps the thread row) stays off the
     callers.
+
+    ``row_ensured``: ``make_thread`` already found or made the row, which is
+    then the only call that applies creation-time fields, so this one has the
+    status to resume and nothing to create or title.
     """
     prior = await _read_prior_thread(
         thread_id, before_turn=_fork_predecessor_turn(request)
     )
+    if row_ensured:
+        await qr_db.update_thread_status(thread_id, "in_progress")
+        return prior
+    # DALTON-HOOK(colleague-dispatch): pass workspace_owner_id and origin_channel
+    # through to the shared row maker (comments.take may have made the row via
+    # make_thread already; only the creator applies creation-time metadata).
+    created = await _ensure_thread_row(
+        request,
+        thread_id,
+        workspace_id,
+        user_id,
+        initial_query=initial_query,
+        workspace_owner_id=workspace_owner_id,
+        origin_channel=origin_channel,
+        is_colleague_turn=is_colleague_turn,
+    )
 
+    # Threads born here (automations, channel gateways, legacy clients) never
+    # pass through POST /threads, so this is their only shot at an LLM title.
+    # Web create-first threads pre-exist → created=False → no double generation.
+    if created and initial_query:
+        from src.server.services.thread_title import schedule_title_generation
+
+        schedule_title_generation(
+            thread_id=thread_id,
+            user_id=user_id,
+            first_query=initial_query,
+            expected_title=initial_query[:255],
+            timezone=request.timezone,
+        )
+
+    return prior
+
+
+async def make_thread(
+    request: ChatRequest,
+    thread_id: str,
+    workspace_id: str,
+    user_id: str,
+    *,
+    # DALTON-HOOK(colleague-dispatch): workspace owner and origin channel for
+    # colleague thread metadata — the send hands the same identity here that
+    # ensure_thread would, so a row comments.take creates carries it too.
+    workspace_owner_id: str | None = None,
+    origin_channel: str = "web",
+    is_colleague_turn: bool = False,
+) -> bool:
+    """Make the thread a send needs before its admission, untitled. Whether
+    this call made it; a thread it finds keeps its status, since the send
+    may yet be refused. A thread this call made has no prior turn."""
+    return await _ensure_thread_row(
+        request,
+        thread_id,
+        workspace_id,
+        user_id,
+        initial_query="",
+        resume=False,
+        workspace_owner_id=workspace_owner_id,
+        origin_channel=origin_channel,
+        is_colleague_turn=is_colleague_turn,
+    )
+
+
+async def _ensure_thread_row(
+    request: ChatRequest,
+    thread_id: str,
+    workspace_id: str,
+    user_id: str,
+    *,
+    initial_query: str,
+    resume: bool = True,
+    # DALTON-HOOK(colleague-dispatch): dispatched_by metadata for a thread
+    # created in a colleague's workspace.
+    workspace_owner_id: str | None = None,
+    origin_channel: str = "web",
+    is_colleague_turn: bool = False,
+) -> bool:
     ensure_kwargs = dict(
         workspace_id=workspace_id,
         conversation_thread_id=thread_id,
@@ -498,6 +579,8 @@ async def ensure_thread(
         initial_query=initial_query,
         initial_status="in_progress",
     )
+    if not resume:
+        ensure_kwargs["resume"] = False
     if request.platform:
         ensure_kwargs["platform"] = request.platform
     if request.external_thread_id:
@@ -522,23 +605,7 @@ async def ensure_thread(
     # Applied only if this send creates the thread; PATCH owns it after.
     if request.subagents_allowed is not None:
         ensure_kwargs["subagents_allowed"] = request.subagents_allowed
-    created = await qr_db.ensure_thread_exists(**ensure_kwargs)
-
-    # Threads born here (automations, channel gateways, legacy clients) never
-    # pass through POST /threads, so this is their only shot at an LLM title.
-    # Web create-first threads pre-exist → created=False → no double generation.
-    if created and initial_query:
-        from src.server.services.thread_title import schedule_title_generation
-
-        schedule_title_generation(
-            thread_id=thread_id,
-            user_id=user_id,
-            first_query=initial_query,
-            expected_title=initial_query[:255],
-            timezone=request.timezone,
-        )
-
-    return prior
+    return await qr_db.ensure_thread_exists(**ensure_kwargs)
 
 
 async def keep_named_model(thread_id: str, named_model: NamedModel | None) -> None:

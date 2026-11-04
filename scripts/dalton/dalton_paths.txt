@@ -13,6 +13,8 @@ tests/fixtures/dalton/
 tests/unit/mcp_servers/fixtures/dalton_sec/
 tests/unit/mcp_servers/test_dalton_sec_periods.py
 tests/unit/server/services/test_bringup_owner_check.py
+# sync3 B11: rollback GC kill-switch tests (0.6 patch carried into sync3).
+tests/unit/server/services/test_workspace_file_gc_kill.py
 agent_config.dalton.yaml
 config.dalton.yaml
 docker-compose.dalton.yml

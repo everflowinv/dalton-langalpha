@@ -31,7 +31,7 @@ import './FilePanel.css';
 
 const ExportPreviewModal = React.lazy(() => import('./ExportPreviewModal'));
 
-import type { ApiAdapter, ChartTabSpec, ContextPayload, PanelTarget } from './filePanel/types';
+import type { ApiAdapter, ChartTabSpec, ContextPayload, PanelAccess, PanelTarget } from './filePanel/types';
 import { EDITABLE_EXTENSIONS, getFileExtension, viewerFor } from './filePanel/fileMeta';
 import { useFileUpload } from './filePanel/useFileUpload';
 import { useFileEdit } from './filePanel/useFileEdit';
@@ -59,8 +59,10 @@ import { FileCrumbs } from './filePanel/FileCrumbs';
 import { PreviewCrumbs } from './filePanel/PreviewCrumbs';
 import { SiblingCrumbs } from './filePanel/SiblingCrumbs';
 import { PreviewPanes } from './filePanel/PreviewPanes';
+import { useHtmlArtifactTab } from './filePanel/useHtmlArtifactTab';
 import { usePreviews } from './filePanel/usePreviews';
 import { usePanelTarget } from './filePanel/usePanelTarget';
+import { useCommentUi } from './viewers/html/comments/useCommentUi';
 import { ActiveTabBody } from './filePanel/ActiveTabBody';
 import type { NewTabMenu } from './filePanel/panelLaunchers';
 import { useWatchTab } from './filePanel/useWatchTab';
@@ -116,6 +118,13 @@ interface FilePanelProps {
   readOnly?: boolean;
   // DALTON-HOOK(team-sharing): distinguish colleague mirror read-only from owner sibling read-only
   teamReadOnly?: boolean;
+  // DALTON-HOOK(external-share-guard): the caller's Dalton tier — an external
+  // member gets no publish/comment entry even on their own workspace.
+  callerTier?: string | null;
+  // DALTON-HOOK(team-sharing): a read-only thread beside the panel (a
+  // colleague's dispatched thread) shows no comment layer or docked comment
+  // box either — comments are sent into that thread.
+  threadReadOnly?: boolean;
   /** Whether this viewer may save a file's bytes. A copy-link share grants
    *  `allow_files` without `allow_download`, and the download endpoint refuses
    *  what `allow_files` alone opened, so an offered save fails after the click. */
@@ -141,8 +150,6 @@ interface FilePanelProps {
    *  The host that sizes the panel reads this, since a chart has a floor of
    *  its own. */
   onActiveTabKindChange?: ((kind: FileTab['kind'] | null) => void) | null;
-  /** Offer the open file's share dialog in its header: the owner's own panel only. */
-  canShare?: boolean;
   /** Set while a Home or analyst panel shows a sibling's files in place of
    *  its own: the panel names that workspace and offers the way back, asking
    *  first about unsaved edits as its own close does. */
@@ -175,6 +182,8 @@ function FilePanel({
   readOnly = false,
   // DALTON-HOOK(team-sharing): distinguish colleague mirror read-only from owner sibling read-only
   teamReadOnly = false,
+  callerTier = null,
+  threadReadOnly = false,
   canDownload = true,
   singleFileMode = false,
   persistTabs = true,
@@ -185,7 +194,6 @@ function FilePanel({
   onToggleSystemFiles = null,
   onLeaveGuardChange = null,
   onActiveTabKindChange = null,
-  canShare = false,
   onReturnHome = null,
   returnLabel = null,
 }: FilePanelProps): React.ReactElement {
@@ -260,6 +268,25 @@ function FilePanel({
 
   // DALTON-HOOK(team-sharing): block preview sandbox requests in colleague mirror mode
   const previews = usePreviews(workspaceId, { teamReadOnly });
+  // Publishing, comments, versions and a file's record are the owner's: a
+  // read-only panel, or a share's, shows a file alone. Decided here once, and
+  // what acts on it reads this rather than deciding again.
+  const commentUi = useCommentUi();
+  const servePrefix = apiAdapter?.servePrefix;
+  // DALTON-HOOK(team-sharing): a teammate's workspace is read-only for
+  // artifact purposes whatever their web level — rw lifts file writes only,
+  // never publish/comment (the server refuses those too); `mirror` keeps the
+  // HTML serving on the DB-mirror path instead of the owner's file grant.
+  // DALTON-HOOK(external-share-guard): an external member is no artifact
+  // owner either — the publish entry and comment UI stay hidden.
+  const access = useMemo<PanelAccess>(
+    () => (servePrefix ? { kind: 'share', servePrefix } : readOnly || !workspaceId ? { kind: 'readOnly', ...(teamReadOnly ? { mirror: true } : {}) } : callerTier === 'external' ? { kind: 'readOnly' } : { kind: 'owner' }),
+    [servePrefix, readOnly, teamReadOnly, workspaceId, callerTier],
+  );
+  // DALTON-HOOK(team-sharing): no comment layer, docked comment box or publish
+  // entry beside a read-only thread (teamReadOnly covers a colleague's
+  // workspace; threadReadOnly a colleague's dispatched thread in it).
+  const comments = access.kind === 'owner' && !threadReadOnly ? commentUi : undefined;
 
   const { body, loading: fileLoading, error: readError, readAt, refetch } = useFileBody({
     cache, path: selectedFile, workspaceStatus: wsData?.status,
@@ -335,6 +362,26 @@ function FilePanel({
   // A replay restores the reader's place and leaves their choice of view be.
   const htmlView = useHtmlViewMode(focus.replayed ? null : focus.htmlAnchor, focus.seq);
   const { setSource: setHtmlSource } = htmlView;
+
+  // An HTML file the owner reads takes comments and has versions.
+  const artifactTab = useHtmlArtifactTab({
+    workspaceId,
+    tabId: activeTab.id,
+    file: selectedFile,
+    html: viewer === 'html',
+    source: htmlView.source,
+    active: isActive,
+    readAt: readAt ?? null,
+    ui: comments,
+  });
+  const htmlArtifactPath = artifactTab.path;
+  // The agent's edit to the HTML file in front is read at once, unlike other
+  // files: the frame swaps it in over the old one with the place kept, and a
+  // reader whose comments the agent is answering is waiting for exactly that.
+  const htmlChanged = !!htmlArtifactPath && !edit.isEditing && hasChanged(htmlArtifactPath);
+  useEffect(() => {
+    if (htmlChanged && htmlArtifactPath) cache.invalidate(htmlArtifactPath);
+  }, [htmlChanged, htmlArtifactPath, cache]);
 
   // Replay the tab's own location whenever it comes back to the front. A
   // location the tab has already been to is a replay; a new one is an ask.
@@ -445,6 +492,7 @@ function FilePanel({
     // DALTON-HOOK(team-sharing): suppress preview sandbox startup and personal memo in colleague mirror mode
     onTargetMemoHandled,
     teamReadOnly,
+    onCommentFocus: comments?.requestFocus,
   });
 
   // Opening a singleton tab drops a reference still resolving, like any other
@@ -773,11 +821,15 @@ function FilePanel({
         <FileCrumbs
           path={selectedFile}
           onOpenDir={revealInTree}
-          meta={meta}
+          // A page in front of the owner has its version and comments to say
+          // there; its line count is the markup's, read under Source.
+          meta={artifactTab.hideMeta ? null : meta}
           unsaved={edit.hasUnsavedChanges}
           chip={focus.chip && (
             <FocusChip state={focus.chip} onJump={focus.jump} onDismiss={() => { focus.dismiss(); tabs.clearLocation(activeTab.id); }} />
           )}
+          artifact={artifactTab.crumbs}
+          tools={artifactTab.tools}
           actions={(
             <FileHeaderActions
               selectedFile={selectedFile}
@@ -791,10 +843,9 @@ function FilePanel({
               triggerDownloadFn={triggerDownloadFn}
               canDownload={canDownload}
               readFileFullFn={readFileFullFn}
-              servePrefix={apiAdapter?.servePrefix}
-              canShare={canShare}
-              // DALTON-HOOK(team-sharing): avoid owner-only grant fetch in colleague mirror mode
-              teamReadOnly={teamReadOnly}
+              access={access}
+              openPublish={artifactTab.openPublish}
+              artifactDoc={artifactTab.doc}
               htmlSource={htmlView.source}
               // Only where the viewer is up to switch: not while loading, nor on an error card.
               onToggleHtmlSource={viewer === 'html' && !fileLoading && !fileError ? () => setHtmlSource((v) => !v) : null}
@@ -944,6 +995,7 @@ function FilePanel({
                   // DALTON-HOOK(team-sharing): forward teamReadOnly to FileViewer / HtmlViewer
                   teamReadOnly,
                   htmlSource: htmlView.source,
+                  htmlArtifact: artifactTab.view,
                 }}
                 onPageCount={onPageCount}
                 canUpload={!readOnly}
@@ -1032,6 +1084,7 @@ function FilePanel({
           />
         </Suspense>
       )}
+      {artifactTab.dialog}
       {selectedFile && memoEntry && memoStaleSandboxText !== null && (
         <MemoDiffModal
           open={memoDiffOpen}

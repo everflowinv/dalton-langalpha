@@ -231,6 +231,23 @@ class DaltonComputerCliTokensConfig(BaseModel):
     enabled: bool = False
 
 
+class DaltonArtifactPublishingConfig(BaseModel):
+    """Master flag for #666's artifact publishing, versions and file comments.
+
+    Off (the code default; production sets it true — user decision 11-03):
+    publishing and ``keep_updated`` answer 403, the comment write routes
+    answer 403, a send carrying ``artifact_comment_ids`` is refused 409 before
+    the stream starts, ``keep_updated_after_turn`` returns without cutting a
+    version, and the agent's ``reply_to_comment`` tool is not registered
+    (a deployment-level choice, so the tool list holds still within one
+    deployment; flipping it is a deployment change that re-records the
+    request lock). Old links keep working: reading, unsharing and the legacy
+    first-read conversion stay open.
+    """
+
+    enabled: bool = False
+
+
 class DaltonCoverageUnitsConfig(BaseModel):
     """Coverage-unit identity registry switch (`dalton_coverage_units`, d023, sector layer P0).
 
@@ -372,6 +389,9 @@ class DaltonConfig(BaseModel):
     computer_cli_tokens: DaltonComputerCliTokensConfig = Field(
         default_factory=DaltonComputerCliTokensConfig
     )
+    artifact_publishing: DaltonArtifactPublishingConfig = Field(
+        default_factory=DaltonArtifactPublishingConfig
+    )
     coverage_units: DaltonCoverageUnitsConfig = Field(
         default_factory=DaltonCoverageUnitsConfig
     )
@@ -459,6 +479,14 @@ def is_computer_cli_tokens_enabled() -> bool:
     if env_flag is not None:
         return env_flag.strip().lower() in ("1", "true", "yes")
     return get_dalton_config().computer_cli_tokens.enabled
+
+
+def is_artifact_publishing_enabled() -> bool:
+    """Whether #666's artifact publishing, versions and file comments are enabled (sync3 B11)."""
+    env_flag = os.getenv("DALTON_ARTIFACT_PUBLISHING_ENABLED")
+    if env_flag is not None:
+        return env_flag.strip().lower() in ("1", "true", "yes")
+    return get_dalton_config().artifact_publishing.enabled
 
 
 def is_coverage_units_enabled() -> bool:

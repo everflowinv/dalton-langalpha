@@ -12,12 +12,14 @@ type Action<K extends keyof MessageActions> = NonNullable<MessageActions[K]>;
 export interface MessageActionSources {
   onOpenFile: Action<'onOpenFile'>;
   onDownloadFile: Action<'onDownloadFile'>;
+  onPublishFile: Action<'onPublishFile'>;
   downloadKeyFor: Action<'downloadKeyFor'>;
   onRevealFiles: Action<'onRevealFiles'>;
   onRevealMessage: Action<'onRevealMessage'>;
   onOpenSources: Action<'onOpenSources'>;
   onToolCallDetailClick: Action<'onToolCallDetailClick'>;
   onOpenChart: Action<'onOpenChart'>;
+  onOpenArtifactComment: Action<'onOpenArtifactComment'>;
   onOpenSubagentTask: Action<'onOpenSubagentTask'>;
   onOpenDispatcher: Action<'onOpenDispatcher'>;
   onAnswerQuestion: Action<'onAnswerQuestion'>;
@@ -64,12 +66,14 @@ export function useMessageActionBundles(src: MessageActionSources): {
 } {
   const stableOpenFile = useStableHandler(src.onOpenFile);
   const stableDownloadFile = useStableHandler(src.onDownloadFile);
+  const stablePublishFile = useStableHandler(src.onPublishFile);
   const stableDownloadKeyFor = useStableHandler(src.downloadKeyFor);
   const stableRevealFiles = useStableHandler(src.onRevealFiles);
   const stableRevealMessage = useStableHandler(src.onRevealMessage);
   const stableOpenSources = useStableHandler(src.onOpenSources);
   const stableToolCallDetail = useStableHandler(src.onToolCallDetailClick);
   const stableOpenChart = useStableHandler(src.onOpenChart);
+  const stableOpenArtifactComment = useStableHandler(src.onOpenArtifactComment);
   const stableOpenSubagentTask = useStableHandler(src.onOpenSubagentTask);
   const stableOpenDispatcher = useStableHandler(src.onOpenDispatcher);
   const stableAnswerQuestion = useStableHandler(src.onAnswerQuestion);
@@ -107,6 +111,7 @@ export function useMessageActionBundles(src: MessageActionSources): {
       ? {
           onOpenFile: stableOpenFile,
           onDownloadFile: stableDownloadFile,
+          onPublishFile: stablePublishFile,
           downloadKeyFor: stableDownloadKeyFor,
           onRevealFiles: stableRevealFiles,
           onRevealMessage: stableRevealMessage,
@@ -119,12 +124,14 @@ export function useMessageActionBundles(src: MessageActionSources): {
       : {
           onOpenFile: stableOpenFile,
           onDownloadFile: stableDownloadFile,
+          onPublishFile: stablePublishFile,
           downloadKeyFor: stableDownloadKeyFor,
           onRevealFiles: stableRevealFiles,
           onRevealMessage: stableRevealMessage,
           onOpenSources: stableOpenSources,
           onToolCallDetailClick: stableToolCallDetail,
           onOpenChart: stableOpenChart,
+          onOpenArtifactComment: stableOpenArtifactComment,
           onOpenSubagentTask: stableOpenSubagentTask,
           onOpenDispatcher: stableOpenDispatcher,
           onAnswerQuestion: stableAnswerQuestion,
@@ -167,10 +174,11 @@ export function useMessageActionBundles(src: MessageActionSources): {
   const subagentMessageActions = useMemo<MessageActions>(() => ({
     onOpenFile: stableOpenFile,
     onDownloadFile: stableDownloadFile,
+    onPublishFile: stablePublishFile,
     downloadKeyFor: stableDownloadKeyFor,
     onToolCallDetailClick: stableToolCallDetail,
     onOpenChart: stableOpenChart,
-  }), [stableOpenFile, stableDownloadFile, stableDownloadKeyFor, stableToolCallDetail, stableOpenChart]);
+  }), [stableOpenFile, stableDownloadFile, stablePublishFile, stableDownloadKeyFor, stableToolCallDetail, stableOpenChart]);
 
   return { messageActions, subagentMessageActions };
 }

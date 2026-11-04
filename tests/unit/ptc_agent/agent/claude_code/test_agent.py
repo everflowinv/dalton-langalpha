@@ -182,6 +182,18 @@ def test_a_claude_code_turn_opens_with_the_skills_turn_and_baseline_hooks():
     assert not {"Task", "RunWorkflow"} & {t.name for t in graph.turn.spec.tools}
 
 
+def test_a_claude_code_turn_can_answer_comments_on_a_file():
+    """A comment send tells the agent to answer with this tool."""
+    # DALTON-HOOK(artifact-publishing-off): the tool rides Dalton's deployment
+    # switch (dalton.artifact_publishing.enabled, off by code default), so
+    # upstream's assertion runs with the switch on; the off case is pinned in
+    # tests/unit/dalton/test_artifact_publishing_switch.py.
+    import os
+
+    with patch.dict(os.environ, {"DALTON_ARTIFACT_PUBLISHING_ENABLED": "1"}):
+        assert "reply_to_comment" in {t.name for t in _built().turn.spec.tools}
+
+
 def test_a_claude_code_turn_is_offered_no_tool_that_places_an_order():
     """An order is put to the user before it runs, which a Claude Code turn cannot do yet."""
     from langchain_core.tools import StructuredTool

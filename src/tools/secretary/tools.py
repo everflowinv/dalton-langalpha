@@ -732,10 +732,7 @@ async def workspace_files_list_cos(
     ):
         return err
     try:
-        from src.server.app.workspace_files._shared import (
-            _is_non_owner_blocked_path,
-            owner_work_dir,
-        )
+        from src.server.app.workspace_files._shared import _is_non_owner_blocked_path
         from src.server.app.workspace_files.crud import _live_listing
         from src.server.database.workspace import get_workspace
         from src.server.models.workspace import served_from_mirror
@@ -745,6 +742,7 @@ async def workspace_files_list_cos(
         )
         from src.server.services.workspace_files import (
             acquire_sandbox_to_change,
+            owner_work_dir,
             previous_dir_names_of,
         )
 
@@ -820,9 +818,7 @@ async def workspace_file_read_cos(
             _decode_file_text,
             _is_binary,
             _is_non_owner_blocked_path,
-            _to_client_path,
             http_file_text,
-            owner_work_dir,
         )
         from src.server.app.workspace_files.crud import _read_contained_target
         from src.server.database.workspace import get_workspace
@@ -833,7 +829,9 @@ async def workspace_file_read_cos(
         )
         from src.server.services.workspace_files import (
             acquire_sandbox_to_change,
+            owner_work_dir,
             previous_dir_names_of,
+            to_client_path,
         )
         from src.server.utils.secret_redactor import (
             get_redactor,
@@ -875,7 +873,7 @@ async def workspace_file_read_cos(
                 except HTTPException:
                     return error_command("file not found", tool_call_id)
 
-            client_path = _to_client_path(sandbox, normalized, work_dir)
+            client_path = to_client_path(sandbox, normalized, work_dir)
             if _is_non_owner_blocked_path(client_path):
                 return error_command("file not found", tool_call_id)
             if _is_binary(normalized):
@@ -921,11 +919,7 @@ async def workspace_file_write_cos(
     ):
         return err
     try:
-        from src.server.app.workspace_files._shared import (
-            _is_non_owner_blocked_path,
-            _to_client_path,
-            owner_work_dir,
-        )
+        from src.server.app.workspace_files._shared import _is_non_owner_blocked_path
         from src.server.app.workspace_files.crud import MAX_WRITE_BYTES
         from src.server.database.workspace import get_workspace
         from src.server.models.workspace import served_from_mirror
@@ -935,7 +929,9 @@ async def workspace_file_write_cos(
         from src.server.services.workspace_files import (
             acquire_sandbox_to_change,
             contained_target,
+            owner_work_dir,
             previous_dir_names_of,
+            to_client_path,
         )
 
         ws = await get_workspace(workspace_id)
@@ -1007,7 +1003,7 @@ async def workspace_file_write_cos(
             normalized = await contained_target(
                 sandbox, rel_path, work_dir, previous_dirs
             )
-            client_path = _to_client_path(sandbox, normalized, work_dir)
+            client_path = to_client_path(sandbox, normalized, work_dir)
             if _is_non_owner_blocked_path(client_path):
                 return error_command(
                     "403 Forbidden: Cannot write system, hidden, or virtual files",

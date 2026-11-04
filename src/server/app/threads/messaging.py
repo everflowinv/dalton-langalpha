@@ -296,9 +296,10 @@ def _is_service_request(raw_request: Request | None) -> bool:
 
 # Fields only the server's own requests set. A user's copy would post a system
 # message, label their message as a report-back or a wakeup (whose turn may end
-# without a reply), forge a report-back watch's cleanup, or settle a parked
-# steer as its own turn; ``surface_rules`` is a channel gateway's, whose text
-# rides the operator role on providers with a native channel.
+# without a reply) or as file comments it does not carry, forge a report-back
+# watch's cleanup, or settle a parked steer as its own turn; ``surface_rules``
+# is a channel gateway's, whose text rides the operator role on providers with
+# a native channel.
 _SERVER_ONLY_FIELDS = (
     "query_type",
     *ANNOUNCED_KEYS,
@@ -310,6 +311,7 @@ _SERVER_ONLY_FIELDS = (
     "disable_subagents",
     "surface_rules",
     "steer_job_id",
+    "artifact_comments",
 )
 
 
@@ -737,6 +739,25 @@ async def _handle_send_message(
         # an own-key turn is the quota service's call, not ours, and so is what
         # the surface the turn came from means for it.
         await enforce_credit_limit(user_id, byok=is_byok, surface=request.platform)
+
+        # DALTON-HOOK(artifact-publishing-off): a send carrying file comments
+        # is refused while the deployment keeps artifact publishing off. This
+        # sits with the other pre-stream gates (credit above) so both the
+        # normal send and the dispatch path answer a real 409 — inside
+        # astream_ptc_workflow the headers are already out and the refusal
+        # would only be a stream-internal error frame. ptc_run keeps a second
+        # check ahead of CommentSendScope for callers that skip this route.
+        if request.artifact_comment_ids:
+            from src.dalton.settings import is_artifact_publishing_enabled
+
+            if not is_artifact_publishing_enabled():
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "artifact_publishing_disabled",
+                        "message": "File comments are disabled on this deployment.",
+                    },
+                )
 
         # I6: Redis down at START = 503 before any durable row. Ordered after
         # the auth/authz/credit gates (their statuses are more meaningful and

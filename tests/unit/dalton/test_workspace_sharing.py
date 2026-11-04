@@ -1498,11 +1498,16 @@ class TestChiefOfStaffChannel:
             "get_workspace",
             cos_get_ws_mock,
         )
+        # upstream #666 moved owner_work_dir out of _shared into
+        # services/workspace_files: patch it there (the CoS tools re-import
+        # it at call time) and on crud's own binding for the routes.
+        from src.server.services import workspace_files as ws_files_service
+
         monkeypatch.setattr(
-            ws_files_shared,
+            ws_files_service,
             "owner_work_dir",
             create_autospec(
-                ws_files_shared.owner_work_dir,
+                ws_files_service.owner_work_dir,
                 return_value="/home/workspace/NVDA_Deep_Dive",
             ),
         )

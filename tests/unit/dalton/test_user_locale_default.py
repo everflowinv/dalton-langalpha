@@ -44,5 +44,6 @@ def test_ptc_run_applies_default_to_prompt_profile():
     from src.server.handlers.chat import ptc_run
 
     src = inspect.getsource(ptc_run)
-    i = src.index("user_profile = await get_user_profile_for_prompt(user_id)")
+    # upstream #666 wrapped the read across lines; anchor on the call itself
+    i = src.index("await get_user_profile_for_prompt(user_id)")
     assert "user_profile = with_default_locale(user_profile)" in src[i : i + 400]
