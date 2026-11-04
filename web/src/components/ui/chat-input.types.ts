@@ -114,6 +114,20 @@ export interface ModelOptions {
    * stored draft keeps its inFlight mark so a reload restores the text.
    */
   onHandedOff?: () => void;
+  /**
+   * DALTON-HOOK(composer-drafts): the send path calls this when it is
+   * definitely not taken — a stop cancelled the resend backoff, the resend
+   * chain gave up, a resent attempt was refused — and the composer puts the
+   * draft back whole: text, quote chips, the attachments-again notice.
+   */
+  onNotTaken?: () => void;
+  /**
+   * DALTON-HOOK(composer-drafts): the send path calls this when the host
+   * actually took the refused send back itself (its returnedDraft → giveBack)
+   * — the composer's failure settle then keeps only the stored draft and
+   * leaves the input to that restore.
+   */
+  onReturnedUnsent?: () => void;
 }
 
 export interface ReadyAttachment {

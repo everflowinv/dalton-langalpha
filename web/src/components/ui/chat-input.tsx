@@ -193,15 +193,6 @@ export interface ChatInputProps {
   // DALTON-HOOK(composer-drafts): storage key suffix for persisting unsent composer draft text
   draftKey?: string;
   /**
-   * DALTON-HOOK(composer-drafts): the host takes a refused send back itself —
-   * it watches the chat's returnedDraft and re-seats it through this input's
-   * `giveBack` — while the composer sits where the transcript is out of view.
-   * Then a failed send's settle keeps only the stored draft; the input is the
-   * host's to restore. A host that reports nothing leaves it unset, and the
-   * composer restores the send itself.
-   */
-  hostRestoresUnsent?: () => boolean;
-  /**
    * Context the host gathers above the text box, ruled off from it (the chat
    * view's queued file comments). The host owns what it holds and what a send
    * does with it; pair it with `hasExternalContext` when it makes an empty box
@@ -268,7 +259,6 @@ function ChatInput({
   toolbarStatus = null,
   // DALTON-HOOK(composer-drafts): storage key suffix for persisting unsent composer draft text
   draftKey,
-  hostRestoresUnsent,
   deck = null,
   ref,
 }: ChatInputProps & { ref?: React.Ref<ChatInputHandle> }) {
@@ -297,7 +287,6 @@ function ChatInput({
     prefillMessage,
     onDraftKeySwitch: handleDraftKeySwitch,
     getDraftParts: () => draftPartsRef.current,
-    hostRestoresUnsent,
     onSendReturned: (sentText, parts) => returnSendRef.current?.(sentText, parts),
   });
   const { attachedFiles, setAttachedFiles, isDragging, handleFiles, restoreFiles, removeFile, onDragEnter, onDragOver, onDragLeave, onDrop, handlePaste } = useFileAttachments({ disabled });
@@ -830,7 +819,7 @@ function ChatInput({
     // not after — a send refused at once is put back (its quote chips
     // included) inside submitWithDraft, and a later reset would drop them.
     resetMentions();
-    submitWithDraft((onAccepted, onHandedOff) =>
+    submitWithDraft((onAccepted, onHandedOff, onRestore, onHostReturned) =>
       onSend({
         text: message,
         files: readyAttachments,
@@ -847,6 +836,8 @@ function ChatInput({
           widgetSnapshots: widgetSnapshots.length ? widgetSnapshots : undefined,
           onAccepted,
           onHandedOff,
+          onNotTaken: onRestore,
+          onReturnedUnsent: onHostReturned,
         },
       }),
     );

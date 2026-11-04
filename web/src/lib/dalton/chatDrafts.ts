@@ -347,44 +347,54 @@ export interface UseComposerDraftOptions {
    */
   getDraftParts?: () => DraftParts;
   /**
-   * DALTON-HOOK(composer-drafts): the host takes a refused send back itself
-   * (the chat's returnedDraft, re-seated through its giveBack) while the
-   * composer sits where the transcript is out of view. Read when a send
-   * settles failed: then this settle keeps only the stored draft — the input
-   * is the host's to restore. Without it (the plain chat view) the composer
-   * restores what the send took, through `onSendReturned`.
-   */
-  hostRestoresUnsent?: () => boolean;
-  /**
    * DALTON-HOOK(composer-drafts): re-seats a failed send's text and quote
    * chips into the composer, collision-safe against quotes added since (one
    * may have taken the same token). Called by the failure settle only when no
-   * host giveBack owns the restore.
+   * host giveBack took the send back (the send reports that through its own
+   * options; see PendingSendHandle.markHostReturned).
    */
   onSendReturned?: (sentText: string, parts: DraftParts) => void;
 }
 
 export interface PendingSendHandle {
+  /**
+   * The fallback settle: the send's promise resolved. `true` settles the send
+   * without touching the stored draft (only the server holding the turn —
+   * reported through `acceptSend` — may delete it; a `true` that reported
+   * nothing leaves the stored copy marked inFlight, which a reload restores
+   * with the "may already have gone through" notice); `false` puts the draft
+   * back whole. A parked send (see `handOffToResend`) ignores this.
+   */
   finalizeSend: (succeeded: boolean) => void;
   /**
-   * Settle this send as accepted before its promise resolves: the server has
-   * taken it (a run_id arrived, a steer was accepted, the send was queued, a
-   * duplicate was adopted, …), so its draft is safe to clear even though the
-   * stream may run on for a long time — a reload mid-stream must not restore
-   * an already-sent message into the composer. A later finalizeSend on the
-   * same handle is a no-op.
+   * The server took this send — its own first frame, a duplicate adopted, a
+   * steer it was merged into, or (for a parked send) the resend's acceptance.
+   * The only settle that deletes the stored draft. May still fire after a
+   * `restoreSend` (a manual Retry carrying the original acceptance): it then
+   * only deletes the stored copy, leaving whatever the box holds.
    */
   acceptSend: () => void;
   /**
-   * DALTON-HOOK(composer-drafts): a drop scheduled this send's own automatic
-   * resend — the resend is what can prove the server took the message, not
-   * the response headers it dropped after. From here only the resend's
-   * acceptance (`acceptSend`, through the acceptance callback the resent
-   * attempts carry) settles this handle; the promise's own value settles
-   * nothing, and the stored draft keeps its inFlight mark so a reload
-   * restores the text with the notice.
+   * A drop scheduled this send's own automatic resend: from here the promise's
+   * value settles nothing, and only `acceptSend` (the resend's acceptance,
+   * riding the resent attempts' options) or `restoreSend` (a definite
+   * not-taken: the chain gave up, or a stop cancelled the backoff) may settle.
    */
   handOffToResend: () => void;
+  /**
+   * The send was definitely not taken — settle it as failed and put the draft
+   * back whole (text, quote chips, the attachments-again notice), parked or
+   * not. Fires for a stop during the resend backoff, an exhausted chain, a
+   * dropped queue; a host that already took the send back through its
+   * `giveBack` (see `markHostReturned`) keeps the input to itself.
+   */
+  restoreSend: () => void;
+  /**
+   * The host returned this send itself (the chat's returnedDraft → its
+   * giveBack re-seats text, quotes and files) — the failure settle then keeps
+   * only the stored draft and leaves the input to that restore.
+   */
+  markHostReturned: () => void;
 }
 
 interface InFlightSendState {
@@ -392,8 +402,19 @@ interface InFlightSendState {
   userId: string;
   sentText: string;
   settled: boolean;
-  /** True once handOffToResend parked it: only acceptance settles it from there. */
+  /** True once handOffToResend parked it: acceptance or a forced restore settle it from there. */
   handedOff?: boolean;
+  /** True once the host reported taking the refused send back itself. */
+  hostReturned?: boolean;
+  /** True once the stored draft was deleted by an acceptance. */
+  cleared?: boolean;
+  /**
+   * What the failure restore left in the input, exactly — null when it never
+   * went into the input (the host's giveBack owned it). A late acceptance (a
+   * manual Retry carrying the send's) clears it with the stored copy when the
+   * box still holds it untouched; an edit is the user's and stays.
+   */
+  restoredInput?: string | null;
   /** The draft's rich parts at send: what its restore brings back. */
   parts: DraftParts;
 }
@@ -439,7 +460,12 @@ export interface UseComposerDraftResult {
   touchDraft: () => void;
   beginSend: () => PendingSendHandle;
   submitWithDraft: (
-    invoke: (onAccepted: () => void, onHandedOff: () => void) => void | boolean | Promise<void | boolean>,
+    invoke: (
+      onAccepted: () => void,
+      onHandedOff: () => void,
+      onRestore: () => void,
+      onHostReturned: () => void,
+    ) => void | boolean | Promise<void | boolean>,
   ) => void;
 }
 
@@ -455,7 +481,6 @@ export function useComposerDraft({
   prefillMessage,
   onDraftKeySwitch,
   getDraftParts,
-  hostRestoresUnsent,
   onSendReturned,
 }: UseComposerDraftOptions): UseComposerDraftResult {
   const { user } = useUser({ enabled: Boolean(draftKey) });
@@ -495,10 +520,9 @@ export function useComposerDraft({
   const hadPrefillRef = useRef<boolean>(Boolean(prefillMessage));
   const onDraftKeySwitchRef = useRef<(() => void) | undefined>(onDraftKeySwitch);
   const getDraftPartsRef = useRef<(() => DraftParts) | undefined>(getDraftParts);
-  const hostRestoresUnsentRef = useRef<(() => boolean) | undefined>(hostRestoresUnsent);
   const onSendReturnedRef = useRef<((sentText: string, parts: DraftParts) => void) | undefined>(onSendReturned);
-  /** Mirrors `restoredHadAttachments`, for a save to keep the attachments-again notice standing. */
-  const restoredHadAttachmentsRef = useRef<boolean>(false);
+  /** Mirrors `restoredHadAttachments` from its stored initial value, for a save to keep the attachments-again notice standing. */
+  const restoredHadAttachmentsRef = useRef<boolean>(restoredHadAttachments);
   const prevTargetRef = useRef<{ draftKey?: string; userId: string }>({
     draftKey,
     userId,
@@ -532,6 +556,40 @@ export function useComposerDraft({
       : parts;
   }, []);
 
+  /**
+   * DALTON-HOOK(composer-drafts): what a save of the live composer writes
+   * while one of its sends is still out (parked on a scheduled resend, or
+   * awaiting its verdict): the sent text and its quote chips stay in the
+   * stored copy — kept marked inFlight — merged with whatever was typed
+   * since, so the next save cannot overwrite the not-yet-taken send out of
+   * the draft. A key the send never had writes as an ordinary draft.
+   */
+  const draftForSave = useCallback((): { text: string; parts: DraftParts; inFlight: boolean } => {
+    const text = latestMessageRef.current;
+    const parts = partsForSave();
+    const out = inFlightSendRef.current;
+    if (
+      out && !out.settled
+      && out.draftKey === activeDraftKeyRef.current
+      && out.userId === activeUserIdRef.current
+      && out.sentText.trim()
+    ) {
+      const typed = text.trim();
+      const sent = out.sentText.trim();
+      const merged = !typed || typed === sent || typed.startsWith(`${sent}\n\n`) || typed.endsWith(`\n\n${sent}`)
+        ? (typed ? text : out.sentText)
+        : `${out.sentText}\n\n${text}`;
+      const held = parts.quotes ?? [];
+      const quotes = [...held, ...(out.parts.quotes ?? []).filter((q) => !held.some((p) => p.token === q.token))];
+      return {
+        text: merged,
+        parts: { quotes, hadAttachments: parts.hadAttachments || out.parts.hadAttachments === true },
+        inFlight: true,
+      };
+    }
+    return { text, parts, inFlight: false };
+  }, [partsForSave]);
+
   useLayoutEffect(() => {
     activeDraftKeyRef.current = draftKey;
     activeUserIdRef.current = userId;
@@ -541,7 +599,6 @@ export function useComposerDraft({
     }
     onDraftKeySwitchRef.current = onDraftKeySwitch;
     getDraftPartsRef.current = getDraftParts;
-    hostRestoresUnsentRef.current = hostRestoresUnsent;
     onSendReturnedRef.current = onSendReturned;
   });
 
@@ -594,12 +651,14 @@ export function useComposerDraft({
         activeUserIdRef.current === uid
       ) {
         // Parts read at flush: what came back through giveBack after a failed
-        // send (mentions, files) has landed by the time the debounce ends.
-        save(key, latestMessageRef.current, uid, undefined, { parts: partsForSave() });
+        // send (mentions, files) has landed by the time the debounce ends;
+        // a send still out keeps its copy merged in, marked inFlight.
+        const d = draftForSave();
+        save(key, d.text, uid, undefined, { parts: d.parts, ...(d.inFlight ? { inFlight: true } : {}) });
         dirtyRef.current = false;
       }
     }, DRAFT_SAVE_DEBOUNCE_MS);
-  }, [partsForSave]);
+  }, [draftForSave]);
 
   const setMessage: Dispatch<SetStateAction<string>> = useCallback(
     (action) => {
@@ -612,11 +671,12 @@ export function useComposerDraft({
       updateRestoredFromInFlight(false);
       setMessageState(next);
       if (wasInFlight && activeDraftKeyRef.current && next && next.trim()) {
-        save(activeDraftKeyRef.current, next, activeUserIdRef.current, undefined, { parts: partsForSave() });
+        const d = draftForSave();
+        save(activeDraftKeyRef.current, d.text, activeUserIdRef.current, undefined, { parts: d.parts, ...(d.inFlight ? { inFlight: true } : {}) });
       }
       scheduleSave(next);
     },
-    [scheduleSave, updateRestoredFromInFlight, partsForSave],
+    [scheduleSave, updateRestoredFromInFlight, draftForSave],
   );
 
   /**
@@ -692,18 +752,24 @@ export function useComposerDraft({
         isSameKey &&
         (writtenSinceMountOrSendRef.current ||
           Boolean(latestMessageRef.current.trim()));
+      inFlight.cleared = true;
       if (!hasFollowUp && sendDraftKey) {
         clearStorageEntry(sendDraftKey, sendUserId);
       }
     };
 
-    const settle = (succeeded: boolean, fromAcceptance = false) => {
-      if (inFlight.settled) return;
-      // A parked send answers only to its resend's acceptance; the promise's
-      // value (and any failure settle) settles nothing while the resend may
-      // still be the copy the server keeps.
-      if (inFlight.handedOff && !fromAcceptance) return;
-      inFlight.settled = true;
+    /**
+     * DALTON-HOOK(composer-drafts): the two settlement rules. The stored
+     * draft is deleted by an acceptance alone (`fromAcceptance` — the
+     * server holding the turn is the only proof worth deleting by); every
+     * other outcome leaves a copy behind, a plain one on failure (restored
+     * whole) and an inFlight one on a `true` that reported nothing (a
+     * reload then asks whether it went through). A failure puts the draft
+     * back exactly once — into the input unless the host reported taking
+     * that return itself — with its quote chips renumbered against what the
+     * box holds now and the attachments-again notice standing.
+     */
+    const settle = (succeeded: boolean, fromAcceptance = false, force = false) => {
       // A newer send on this key may have superseded this one while it was in
       // flight (a steer sent mid-stream, say): the key's stored draft and the
       // input are that send's now — this settle touches neither, or the first
@@ -714,11 +780,46 @@ export function useComposerDraft({
       const latestOnKey = inFlight.draftKey
         ? latestSendByKeyRef.current.get(`${inFlight.userId ?? ''}|${inFlight.draftKey}`)
         : undefined;
-      if (latestOnKey && latestOnKey !== inFlight) return;
+      const superseded = Boolean(latestOnKey && latestOnKey !== inFlight);
+      if (inFlight.settled) {
+        // Settled, but an acceptance may still arrive for it — a manual Retry
+        // of the failed reply carried the original acceptance — and settle the
+        // copy the failure put back: untouched, the box and its stored draft
+        // go with the send; edited, the draft is the user's and stays. Nothing
+        // else may touch it again.
+        if (fromAcceptance && !inFlight.cleared && !superseded) {
+          inFlight.cleared = true;
+          const restored = inFlight.restoredInput ?? null;
+          const untouched = restored !== null && latestMessageRef.current === restored;
+          const editedDraft = restored !== null && !untouched;
+          if (inFlight.draftKey && !editedDraft) {
+            clearStorageEntry(inFlight.draftKey, inFlight.userId);
+          }
+          if (untouched) {
+            latestMessageRef.current = '';
+            dirtyRef.current = false;
+            writtenSinceMountOrSendRef.current = false;
+            applyRestored(null);
+            setMessageState('');
+          }
+        }
+        return;
+      }
+      // A parked send answers only to its resend's acceptance, or to the
+      // definite not-taken (`force`): the chain gave up, or a stop cancelled
+      // the backoff. The promise's own value settles nothing while the resend
+      // may still be the copy the server keeps.
+      if (inFlight.handedOff && !fromAcceptance && !force) return;
+      inFlight.settled = true;
+      if (superseded) return;
       if (inFlightSendRef.current === inFlight) inFlightSendRef.current = null;
 
       if (succeeded) {
-        settleSuccess();
+        // `true` from the promise alone is not proof the server kept the
+        // send: only the acceptance clears (above); otherwise the stored
+        // copy keeps its inFlight mark, and a reload restores the text with
+        // the notice instead of losing it.
+        if (fromAcceptance) settleSuccess();
         return;
       }
       const sendDraftKey = inFlight.draftKey;
@@ -752,31 +853,33 @@ export function useComposerDraft({
         }
         if (restoredText) {
           // DALTON-HOOK(composer-drafts): who re-seats the input depends on
-          // where the composer sits. A host that takes refused sends back
-          // itself (the chat's returnedDraft → giveBack, while the transcript
-          // is out of view) owns the input — this settle only keeps the stored
-          // draft, so a reload before its restore lands still finds the text.
-          // Otherwise the composer restores its own send: the quotes go back
-          // collision-safe through onSendReturned (a quote added since may
-          // have taken the same token), and the attachments-again notice
-          // stands on the box until files are beside the draft again.
+          // what this send's failure did. A host that reported taking the
+          // refused send back itself (its returnedDraft → giveBack) owns the
+          // input — this settle keeps only the stored draft and touches
+          // neither the box nor its tracking ref, so the giveBack composes
+          // against what is typed since alone. Otherwise the composer
+          // restores its own send: the quotes go back collision-safe through
+          // onSendReturned (a quote added since may have taken the same
+          // token), and the attachments-again notice stands on the box until
+          // files are beside the draft again.
           const restore = onSendReturnedRef.current;
-          if (hostRestoresUnsentRef.current?.()) {
-            latestMessageRef.current = restoredText;
+          if (inFlight.hostReturned) {
             dirtyRef.current = false;
-            writtenSinceMountOrSendRef.current = true;
-            updateRestoredFromInFlight(false);
           } else if (restore) {
             dirtyRef.current = false;
             writtenSinceMountOrSendRef.current = true;
             applyRestored({ text: restoredText, savedAt: 0, hadAttachments: inFlight.parts.hadAttachments });
             restore(sentText, inFlight.parts);
+            // The restore wrote through setMessage, so this is exactly what
+            // the box now holds — a late acceptance compares against it.
+            inFlight.restoredInput = latestMessageRef.current;
           } else {
             latestMessageRef.current = restoredText;
             dirtyRef.current = false;
             writtenSinceMountOrSendRef.current = true;
             updateRestoredFromInFlight(false);
             setMessageState(restoredText);
+            inFlight.restoredInput = restoredText;
           }
         }
       } else if (sentText.trim()) {
@@ -795,20 +898,37 @@ export function useComposerDraft({
         if (inFlight.settled) return;
         inFlight.handedOff = true;
       },
+      restoreSend() {
+        settle(false, false, true);
+      },
+      markHostReturned() {
+        inFlight.hostReturned = true;
+      },
     };
-  }, [updateRestoredFromInFlight, partsForSave]);
+  }, [updateRestoredFromInFlight, applyRestored]);
 
   const submitWithDraft = useCallback(
-    (invoke: (onAccepted: () => void, onHandedOff: () => void) => void | boolean | Promise<void | boolean>) => {
+    (
+      invoke: (
+        onAccepted: () => void,
+        onHandedOff: () => void,
+        onRestore: () => void,
+        onHostReturned: () => void,
+      ) => void | boolean | Promise<void | boolean>,
+    ) => {
       const pending = beginSend();
-      // The send path reports acceptance early (a run started, a steer was
-      // taken, the send was queued) by calling onAccepted, and a drop that
-      // scheduled the send's own resend by calling onHandedOff — from then the
-      // resend's acceptance is the only thing that settles it. The promise's
-      // resolved value is the fallback for a send that reports neither.
+      // The send path reports through these: acceptance (a run started, a
+      // steer was taken, a duplicate adopted — the only thing that may delete
+      // the stored draft), a handoff to the send's own automatic resend (the
+      // resend's acceptance settles from there), a definite not-taken (a stop
+      // cancelled the backoff, the chain gave up, the queue was dropped — the
+      // draft comes back whole), and the host having taken a refused send back
+      // itself (the settle then leaves the input to its giveBack). The
+      // promise's resolved value is the fallback for a send that reports
+      // neither way, and it deletes nothing.
       let result: void | boolean | Promise<void | boolean>;
       try {
-        result = invoke(pending.acceptSend, pending.handOffToResend);
+        result = invoke(pending.acceptSend, pending.handOffToResend, pending.restoreSend, pending.markHostReturned);
       } catch {
         pending.finalizeSend(false);
         return;
@@ -883,7 +1003,8 @@ export function useComposerDraft({
               timerRef.current = null;
             }
             if (dirtyRef.current && draftKey) {
-              save(draftKey, latestMessageRef.current, userId, undefined, { parts: partsForSave() });
+              const d = draftForSave();
+              save(draftKey, d.text, userId, undefined, { parts: d.parts, ...(d.inFlight ? { inFlight: true } : {}) });
               dirtyRef.current = false;
             }
           };
@@ -911,7 +1032,8 @@ export function useComposerDraft({
               timerRef.current = null;
             }
             if (dirtyRef.current && draftKey) {
-              save(draftKey, latestMessageRef.current, userId, undefined, { parts: partsForSave() });
+              const d = draftForSave();
+              save(draftKey, d.text, userId, undefined, { parts: d.parts, ...(d.inFlight ? { inFlight: true } : {}) });
               dirtyRef.current = false;
             }
           };
@@ -947,11 +1069,12 @@ export function useComposerDraft({
         timerRef.current = null;
       }
       if (dirtyRef.current && draftKey) {
-        save(draftKey, latestMessageRef.current, userId, undefined, { parts: partsForSave() });
+        const d = draftForSave();
+        save(draftKey, d.text, userId, undefined, { parts: d.parts, ...(d.inFlight ? { inFlight: true } : {}) });
         dirtyRef.current = false;
       }
     };
-  }, [draftKey, userId, applyRestored, partsForSave]);
+  }, [draftKey, userId, applyRestored, partsForSave, draftForSave]);
 
   return {
     message,

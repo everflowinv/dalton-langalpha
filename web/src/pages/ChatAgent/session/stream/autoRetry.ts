@@ -119,6 +119,13 @@ export function recoveryRequest(
 export interface HeldRetry {
   bubbleId: string;
   request: TurnRequest;
+  /**
+   * DALTON-HOOK(composer-drafts): the composer-draft acceptance of the send
+   * this Retry stands for, kept so a Retry that succeeds settles the original
+   * draft as sent — the send's own promise long since resolved without proof
+   * the server kept it.
+   */
+  onAccepted?: () => void;
 }
 
 export function retryRequestFor(held: HeldRetry | null, bubbleId: string | undefined): TurnRequest {

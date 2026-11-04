@@ -204,7 +204,12 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
   });
 
   it('clears the stored draft on successful send, when emptied by user, and does not migrate sent text from ws:<id>:new to thread:<id>', () => {
-    const onSend = vi.fn<ChatInputProps['onSend']>().mockReturnValue(true);
+    // A send the server took reports acceptance (the real path fires it at the
+    // run's first frame); only that may delete the stored draft.
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation((send) => {
+      send.modelOptions.onAccepted?.();
+      return true;
+    });
     const view = renderComposer({ draftKey: 'ws:ws-1:new', onSend }, { userId: 'u-1' });
 
     fireEvent.change(view.getTextarea(), {
@@ -240,7 +245,10 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
   });
 
   it('migrates post-send continuation text from ws:<id>:new to thread:<id> and deletes the old key', () => {
-    const onSend = vi.fn<ChatInputProps['onSend']>().mockReturnValue(true);
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation((send) => {
+      send.modelOptions.onAccepted?.();
+      return true;
+    });
     const view = renderComposer({ draftKey: 'ws:ws-1:new', onSend }, { userId: 'u-1' });
 
     // Send initial message to start the new conversation
@@ -338,7 +346,7 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
   it('preserves thread composer draft on budget rejection (402/429) or network failure, and clears it only on successful send', async () => {
     // Simulate ChatView's handleSendWithAttachments -> stableSendMessage -> handleSendMessage chain
     let nextOutcome: 'budget_402' | 'rate_429' | 'network_err' | 'ok' = 'budget_402';
-    const simulatedThreadSend = vi.fn(async (): Promise<boolean> => {
+    const simulatedThreadSend = vi.fn(async (send?: Parameters<ChatInputProps['onSend']>[0]): Promise<boolean> => {
       try {
         if (nextOutcome === 'budget_402') {
           throw Object.assign(new Error('Monthly token budget exceeded'), {
@@ -355,6 +363,8 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
         if (nextOutcome === 'network_err') {
           throw new TypeError('Failed to fetch');
         }
+        // The server took the turn: acceptance rides before the boolean.
+        send?.modelOptions.onAccepted?.();
         return true;
       } catch {
         // Mirrors useChatMessages.ts catch branch returning false on 402/429/network failure
@@ -362,7 +372,7 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
       }
     });
 
-    const handleSendWithAttachments: ChatInputProps['onSend'] = () => simulatedThreadSend();
+    const handleSendWithAttachments: ChatInputProps['onSend'] = (send) => simulatedThreadSend(send);
     const view = renderComposer(
       { draftKey: 'thread:t-budget', onSend: handleSendWithAttachments },
       { userId: 'u-1' },
@@ -410,8 +420,10 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
     const makePending = () => ({
       acceptSend: () => {},
       finalizeSend: (ok: boolean) => outcomes.push(ok),
-      // B15: the handle's handoff to an automatic resend; unused by these outcomes.
+      // B15: the handle's handoff and forced restore; unused by these outcomes.
       handOffToResend: () => {},
+      restoreSend: () => {},
+      markHostReturned: () => {},
     });
 
     settleSendResult(makePending(), () => true);
@@ -431,10 +443,16 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
   it('a superseded send settles without touching the newer send\'s stored draft or input', async () => {
     // A streams forever (its promise never settles by itself); B is a steer
     // sent mid-stream on the same draft key. A completing afterwards — in
-    // success or failure — must not delete or restore over B.
+    // success or failure — must not delete or restore over B. A send the
+    // server takes reports acceptance before its boolean resolves.
     const resolvers: Array<(v: boolean) => void> = [];
     const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
-      () => new Promise<boolean>((resolve) => { resolvers.push(resolve); }),
+      (send) => new Promise<boolean>((resolve) => {
+        resolvers.push((v: boolean) => {
+          if (v) send.modelOptions.onAccepted?.();
+          resolve(v);
+        });
+      }),
     );
     const view = renderComposer({ draftKey: 'thread:supersede', onSend }, { userId: 'u-1' });
 
@@ -511,9 +529,16 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
   it('a send superseded only by a send on another key still clears its own key', async () => {
     // The market panel's key moves from its workspace form to the new thread's
     // once the thread exists; a send on the new key must not strand the first.
+    // The first send is accepted (the real path reports it), which clears its
+    // own key alone.
     const resolvers: Array<(v: boolean) => void> = [];
     const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
-      () => new Promise<boolean>((resolve) => { resolvers.push(resolve); }),
+      (send) => new Promise<boolean>((resolve) => {
+        resolvers.push((v: boolean) => {
+          if (v) send.modelOptions.onAccepted?.();
+          resolve(v);
+        });
+      }),
     );
     const view = renderComposer({ draftKey: 'market:panel:ws-1:NVDA', onSend }, { userId: 'u-1' });
     fireEvent.change(view.getTextarea(), { target: { value: 'first on old key', selectionStart: 16 } });
@@ -1035,13 +1060,20 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
   });
 
   it('a host that takes refused sends back owns the restore: the settle keeps only the stored draft, and its giveBack seats it once', async () => {
+    // The host's real shape: it reports taking the send back (onReturnedUnsent,
+    // what the chat fires with its returnedDraft) before the false resolves.
     const resolvers: Array<(v: boolean) => void> = [];
     const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
-      () => new Promise<boolean>((resolve) => { resolvers.push(resolve); }),
+      (send) => new Promise<boolean>((resolve) => {
+        resolvers.push((v: boolean) => {
+          if (v === false) send.modelOptions.onReturnedUnsent?.();
+          resolve(v);
+        });
+      }),
     );
     const ref = createRef<ChatInputHandle>();
     const view = renderComposer(
-      { draftKey: 'thread:t-docked', onSend, hostRestoresUnsent: () => true },
+      { draftKey: 'thread:t-docked', onSend },
       { userId: 'u-1', ref },
     );
 
@@ -1107,6 +1139,129 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     expect(stored.hadAttachments).toBe(true);
 
     const reopened = renderComposer({ draftKey: 'thread:t-att-late' }, { userId: 'u-1' });
+    expect(screen.getByTestId('attachments-lost-notice')).toBeTruthy();
+    reopened.unmount();
+    vi.useRealTimers();
+  });
+
+  it('a host that never takes the send back — a stop — leaves the restore to the composer, even docked', async () => {
+    // The docked host returns refused sends through its giveBack, but a stop
+    // produces no returnedDraft: the host reports nothing, so the composer
+    // restores its own send whole — text, chip and notice in place.
+    const resolvers: Array<(v: boolean) => void> = [];
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+      () => new Promise<boolean>((resolve) => { resolvers.push(resolve); }),
+    );
+    const ref = createRef<ChatInputHandle>();
+    const view = renderComposer({ draftKey: 'thread:t-dockstop', onSend }, { userId: 'u-1', ref });
+
+    act(() => {
+      ref.current!.addContext({ kind: 'quote', snippet: 'Margins slipped', from: ANALYST });
+    });
+    const withToken = view.getTextarea().value;
+    attachFile(view, 'exhibit.txt');
+    fireEvent.click(screen.getByLabelText('Send message'));
+    expect(view.getTextarea().value).toBe('');
+
+    await act(async () => {
+      resolvers[0](false);
+    });
+
+    // Restored in place, once: the token text, the chip on it, the notice.
+    expect(view.getTextarea().value).toBe(withToken);
+    expect(document.querySelectorAll('.draft-token-quote')).toHaveLength(1);
+    expect(screen.getByTestId('attachments-lost-notice')).toBeTruthy();
+    view.unmount();
+  });
+
+  it('a real same-token collision in the docked flow seats the returned quote once, paired with its own words', async () => {
+    // Two quotes whose first 38 width-characters match clip to the SAME token
+    // (quoteToken's cap), which is the real collision. The host takes the
+    // refused send back; its giveBack renumbers the returning quote against
+    // the one typed since, and each spells out exactly once, with its own body.
+    const sameStart = 'Margins slipped three percent in the fourth quarter of the trading year, and';
+    const snippetA = `${sameStart} the outlook dimmed`;
+    const snippetB = `${sameStart} the outlook brightened`;
+    const resolvers: Array<(v: boolean) => void> = [];
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+      (send) => new Promise<boolean>((resolve) => {
+        resolvers.push((v: boolean) => {
+          if (v === false) send.modelOptions.onReturnedUnsent?.();
+          resolve(v);
+        });
+      }),
+    );
+    const ref = createRef<ChatInputHandle>();
+    const view = renderComposer({ draftKey: 'thread:t-38', onSend }, { userId: 'u-1', ref });
+
+    act(() => {
+      ref.current!.addContext({ kind: 'quote', snippet: snippetA, from: ANALYST });
+    });
+    fireEvent.click(screen.getByLabelText('Send message'));
+    const sentDraft = onSend.mock.calls[0][0];
+    expect(view.getTextarea().value).toBe('');
+
+    act(() => {
+      ref.current!.addContext({ kind: 'quote', snippet: snippetB, from: ANALYST });
+    });
+    const typedSince = view.getTextarea().value;
+    // Same opening words, so the empty composer minted the same token.
+    expect(typedSince.trim()).toBe(sentDraft.text.trim());
+
+    await act(async () => {
+      resolvers[0](false);
+    });
+
+    // The settle wrote nothing into the input.
+    expect(view.getTextarea().value).toBe(typedSince);
+    // Known limitation (accepted by lead): the sent text and what was typed
+    // since carry the SAME token here, so the restore's already-restored
+    // check sees one inside the other and the stored draft keeps a single
+    // copy of it — a reload restores one of the two quotes. The giveBack
+    // below re-seats both in the input regardless.
+    expect(load('thread:t-38', 'u-1')).toContain(sentDraft.text.trim());
+
+    // The host's giveBack seats the returned quote renumbered: two chips, and
+    // a send spells each body exactly once with its own ending.
+    act(() => {
+      ref.current!.giveBack(sentDraft.text, [], { mentions: sentDraft.mentions, commands: sentDraft.commands });
+    });
+    expect(document.querySelectorAll('.draft-token-quote')).toHaveLength(2);
+    fireEvent.click(screen.getByLabelText('Send message'));
+    const resent = onSend.mock.calls[1][0].message;
+    expect(resent.match(/<quote source="Analyst">[^<]*the outlook dimmed<\/quote>/g)).toHaveLength(1);
+    expect(resent.match(/<quote source="Analyst">[^<]*the outlook brightened<\/quote>/g)).toHaveLength(1);
+    view.unmount();
+  });
+
+  it('keeps the attachments-again notice through the edits that follow a restore', () => {
+    vi.useFakeTimers();
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockReturnValue(false);
+    const view = renderComposer({ draftKey: 'thread:t-att-keep', onSend }, { userId: 'u-1' });
+
+    fireEvent.change(view.getTextarea(), {
+      target: { value: 'draft with a file', selectionStart: 16 },
+    });
+    attachFile(view, 'page.txt');
+    fireEvent.click(screen.getByLabelText('Send message'));
+    expect(screen.getByTestId('attachments-lost-notice')).toBeTruthy();
+
+    // Typing more after the restore saves the merged draft — the notice must
+    // survive that save, in storage and across a reopen.
+    fireEvent.change(view.getTextarea(), {
+      target: { value: 'draft with a file, edited', selectionStart: 24 },
+    });
+    act(() => {
+      vi.advanceTimersByTime(DRAFT_SAVE_DEBOUNCE_MS);
+    });
+    const stored = JSON.parse(
+      localStorage.getItem(buildDraftStorageKey('thread:t-att-keep', 'u-1')) ?? '{}',
+    ) as { text?: string; hadAttachments?: boolean };
+    expect(stored.text).toBe('draft with a file, edited');
+    expect(stored.hadAttachments).toBe(true);
+
+    view.unmount();
+    const reopened = renderComposer({ draftKey: 'thread:t-att-keep' }, { userId: 'u-1' });
     expect(screen.getByTestId('attachments-lost-notice')).toBeTruthy();
     reopened.unmount();
     vi.useRealTimers();

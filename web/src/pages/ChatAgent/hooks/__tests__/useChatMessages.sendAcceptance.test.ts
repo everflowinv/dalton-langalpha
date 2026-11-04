@@ -141,10 +141,11 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
     expect(accepted).not.toHaveBeenCalled();
   });
 
-  it('treats a send stopped while the thread is still being created as accepted — the message is already in the transcript', async () => {
+  it('returns the draft when the user stops while the thread is still being created — the POST never went out', async () => {
     // threadId stays '__default__' and the pre-create round-trip reports the
-    // user's stop: the user bubble is on screen, so the draft settles sent
-    // (no restore over the record) while the boolean stays false (no turn ran).
+    // user's stop. The stream request was never sent, so the server holds
+    // nothing: the draft comes back whole (no acceptance) and the optimistic
+    // bubble, local only, leaves with a reload.
     mockEnsureThreadId.mockResolvedValue({ threadId: '__default__', aborted: true });
     mockSendStream.mockResolvedValue({ disconnected: false });
 
@@ -160,12 +161,10 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
       });
     });
 
-    expect(accepted).toHaveBeenCalledTimes(1);
+    expect(accepted).not.toHaveBeenCalled();
     expect(outcome).toBe(false);
-    // The user's message stayed in the transcript — the reason the draft
-    // settles sent instead of coming back.
-    const bubble = result.current.messages.find((m) => m.role === 'user');
-    expect(bubble?.content).toBe('stopped mid-create');
+    // The draft is back in the input, not settled over the local bubble.
+    expect(result.current.messages.find((m) => m.role === 'user')?.content).toBe('stopped mid-create');
   });
 
   it('fires onAccepted when a steer sent mid-stream is accepted', async () => {
@@ -706,6 +705,347 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
       expect(accepted).toHaveBeenCalledTimes(1);
       expect(outcome).toBe(true);
       expect(result.current.messageError).toBe(null);
+    });
+
+    it('puts the parked draft back when the user stops during the resend backoff', async () => {
+      // The server's recoverable retry frame, then the drop: the send parks on
+      // its automatic resend. The user stops before the backoff fires — the
+      // stop cancels the resend, so the message is definitely not taken and
+      // the draft goes back whole.
+      mockSendStream.mockImplementation(
+        async (_msg: string, _ws: string, _tid: string | null, opts: StreamOptions) => {
+          opts.onEvent?.({
+            event: 'retry',
+            message: 'Temporary error occurred, you can retry or resume the turn',
+            auto_retry: true,
+            error_type: 'timeout_error',
+            error_class: 'RuntimeError',
+            retry_count: 1,
+            max_retries: 3,
+            recovery: 'resend',
+          } as never);
+          return { disconnected: true };
+        },
+      );
+
+      const accepted = vi.fn();
+      const { result, unmount } = renderHookWithProviders(() => useDraftChatHarness());
+      act(() => {
+        result.current.composer.setMessage('stopped mid-backoff');
+      });
+
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        act(() => {
+          result.current.composer.submitWithDraft((onAccepted, onHandedOff, onRestore) => {
+            return result.current.chat.handleSendMessage('stopped mid-backoff', null, null, {
+              onAccepted: () => {
+                onAccepted();
+                accepted();
+              },
+              onHandedOff,
+              onNotTaken: onRestore,
+            });
+          });
+        });
+        await settle(0);
+        expect(mockSendStream).toHaveBeenCalledTimes(1);
+        expect(accepted).not.toHaveBeenCalled();
+        expect(storedDraft()).toMatchObject({ text: 'stopped mid-backoff', inFlight: true });
+
+        await act(async () => {
+          await result.current.chat.stopWorkflow();
+        });
+        // The cancelled backoff settles the parked draft back: in the input,
+        // as an ordinary stored draft.
+        await settle(1000);
+        expect(mockSendStream).toHaveBeenCalledTimes(1);
+        expect(accepted).not.toHaveBeenCalled();
+        expect(result.current.composer.message).toBe('stopped mid-backoff');
+        expect(load(DRAFT_KEY)).toBe('stopped mid-backoff');
+        expect(storedDraft()?.inFlight).not.toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
+      unmount();
+    });
+
+    it('restores the draft when the resend chain gives up, and a manual Retry that succeeds settles it sent', async () => {
+      // max_retries 1: the first resend is the last automatic attempt. It
+      // fails the same way, the chain gives up, and the failed reply's Retry
+      // carries the original acceptance — the Retry's run settles the draft.
+      const retryFrame = {
+        event: 'retry',
+        message: 'Temporary error occurred, you can retry or resume the turn',
+        auto_retry: true,
+        error_type: 'timeout_error',
+        error_class: 'RuntimeError',
+        retry_count: 1,
+        max_retries: 1,
+        recovery: 'resend',
+      } as never;
+      mockSendStream.mockImplementation(
+        async (_msg: string, _ws: string, _tid: string | null, opts: StreamOptions) => {
+          if (mockSendStream.mock.calls.length <= 2) {
+            opts.onEvent?.(retryFrame);
+            return { disconnected: true };
+          }
+          opts.onEvent?.({ event: 'metadata', thread_id: 'thread-exhaust', run_id: 'run-exhaust-3' } as never);
+          return { disconnected: false };
+        },
+      );
+
+      const accepted = vi.fn();
+      const { result, unmount } = renderHookWithProviders(() => useDraftChatHarness());
+      act(() => {
+        result.current.composer.setMessage('exhausted then retried');
+      });
+
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        act(() => {
+          result.current.composer.submitWithDraft((onAccepted, onHandedOff, onRestore) => {
+            return result.current.chat.handleSendMessage('exhausted then retried', null, null, {
+              onAccepted: () => {
+                onAccepted();
+                accepted();
+              },
+              onHandedOff,
+              onNotTaken: onRestore,
+            });
+          });
+        });
+        await settle(0);
+        // The chain's first leg parks the draft.
+        expect(storedDraft()).toMatchObject({ text: 'exhausted then retried', inFlight: true });
+
+        // The last automatic attempt fails the same way: the chain gives up,
+        // and the draft comes back whole.
+        await settle(1000);
+        expect(mockSendStream).toHaveBeenCalledTimes(2);
+        expect(accepted).not.toHaveBeenCalled();
+        expect(result.current.composer.message).toBe('exhausted then retried');
+        expect(load(DRAFT_KEY)).toBe('exhausted then retried');
+
+        // The failed reply's Retry, carrying the held acceptance, goes out and
+        // the server takes it: the restored draft settles sent — and an
+        // untouched box goes with the stored copy.
+        await act(async () => {
+          await result.current.chat.handleRetry();
+        });
+        expect(mockSendStream).toHaveBeenCalledTimes(3);
+        expect(accepted).toHaveBeenCalledTimes(1);
+        expect(load(DRAFT_KEY)).toBe('');
+        expect(result.current.composer.message).toBe('');
+      } finally {
+        vi.useRealTimers();
+      }
+      unmount();
+    });
+
+    it('keeps the draft the user edited after the resend chain gave up, when a manual Retry succeeds', async () => {
+      // Same chain as above, but the user edits the restored text before
+      // pressing the failed reply's Retry: the edit is the user's and stays —
+      // in the input and in storage — even though the Retry's send was taken.
+      const retryFrame = {
+        event: 'retry',
+        message: 'Temporary error occurred, you can retry or resume the turn',
+        auto_retry: true,
+        error_type: 'timeout_error',
+        error_class: 'RuntimeError',
+        retry_count: 1,
+        max_retries: 1,
+        recovery: 'resend',
+      } as never;
+      mockSendStream.mockImplementation(
+        async (_msg: string, _ws: string, _tid: string | null, opts: StreamOptions) => {
+          if (mockSendStream.mock.calls.length <= 2) {
+            opts.onEvent?.(retryFrame);
+            return { disconnected: true };
+          }
+          opts.onEvent?.({ event: 'metadata', thread_id: 'thread-edited', run_id: 'run-edited-3' } as never);
+          return { disconnected: false };
+        },
+      );
+
+      const accepted = vi.fn();
+      const { result, unmount } = renderHookWithProviders(() => useDraftChatHarness());
+      act(() => {
+        result.current.composer.setMessage('restored words');
+      });
+
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        act(() => {
+          result.current.composer.submitWithDraft((onAccepted, onHandedOff, onRestore) => {
+            return result.current.chat.handleSendMessage('restored words', null, null, {
+              onAccepted: () => {
+                onAccepted();
+                accepted();
+              },
+              onHandedOff,
+              onNotTaken: onRestore,
+            });
+          });
+        });
+        await settle(1000);
+        await settle(1000);
+        expect(result.current.composer.message).toBe('restored words');
+
+        // The user edits what came back, and the edit lands in storage.
+        act(() => {
+          result.current.composer.setMessage('restored words, edited');
+        });
+        await settle(300);
+        expect(load(DRAFT_KEY)).toBe('restored words, edited');
+
+        await act(async () => {
+          await result.current.chat.handleRetry();
+        });
+        expect(accepted).toHaveBeenCalledTimes(1);
+        expect(load(DRAFT_KEY)).toBe('restored words, edited');
+        expect(result.current.composer.message).toBe('restored words, edited');
+      } finally {
+        vi.useRealTimers();
+      }
+      unmount();
+    });
+
+    it('settles the draft sent when the resend meets a duplicate the running turn took as steering', async () => {
+      // The first copy's answer was lost; the automatic resend gets the
+      // server's 409 for a copy the running turn already took as a steer —
+      // the message is the server's, so the parked draft settles sent.
+      mockSendStream.mockImplementation(
+        async (_msg: string, _ws: string, _tid: string | null, opts: StreamOptions) => {
+          if (mockSendStream.mock.calls.length === 1) {
+            opts.onEvent?.({
+              event: 'retry',
+              message: 'Temporary error occurred, you can retry or resume the turn',
+              auto_retry: true,
+              error_type: 'timeout_error',
+              error_class: 'RuntimeError',
+              retry_count: 1,
+              max_retries: 3,
+              recovery: 'resend',
+            } as never);
+            return { disconnected: true };
+          }
+          throw Object.assign(new Error('This request was already accepted'), {
+            status: 409,
+            errorInfo: {
+              code: 'duplicate_request',
+              message: 'This request was already accepted; the running turn took it as steering.',
+              thread_id: 'thread-steer',
+              run_id: 'run-steer',
+              steered: true,
+            },
+          });
+        },
+      );
+
+      const accepted = vi.fn();
+      const { result, unmount } = renderHookWithProviders(() => useDraftChatHarness());
+      act(() => {
+        result.current.composer.setMessage('steered away');
+      });
+
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        act(() => {
+          result.current.composer.submitWithDraft((onAccepted, onHandedOff, onRestore) => {
+            return result.current.chat.handleSendMessage('steered away', null, null, {
+              onAccepted: () => {
+                onAccepted();
+                accepted();
+              },
+              onHandedOff,
+              onNotTaken: onRestore,
+            });
+          });
+        });
+        await settle(0);
+        expect(storedDraft()).toMatchObject({ text: 'steered away', inFlight: true });
+
+        await settle(1000);
+        expect(mockSendStream).toHaveBeenCalledTimes(2);
+        expect(accepted).toHaveBeenCalledTimes(1);
+        expect(load(DRAFT_KEY)).toBe('');
+      } finally {
+        vi.useRealTimers();
+      }
+      unmount();
+    });
+
+    it('keeps a queued send\'s draft parked when the flushed send hands off to its own resend, and clears it when that resend is taken', async () => {
+      // Parked during compaction, flushed into a setup drop that schedules an
+      // automatic resend: the queue's deferred true settles nothing, and the
+      // resend's own first frame clears the draft.
+      mockSendStream.mockImplementation(
+        async (_msg: string, _ws: string, _tid: string | null, opts: StreamOptions) => {
+          if (mockSendStream.mock.calls.length === 1) {
+            opts.onEvent?.({
+              event: 'retry',
+              message: 'Temporary error occurred, you can retry or resume the turn',
+              auto_retry: true,
+              error_type: 'timeout_error',
+              error_class: 'RuntimeError',
+              retry_count: 1,
+              max_retries: 3,
+              recovery: 'resend',
+            } as never);
+            return { disconnected: true };
+          }
+          opts.onEvent?.({ event: 'metadata', thread_id: 'thread-queued', run_id: 'run-queued-2' } as never);
+          return { disconnected: false };
+        },
+      );
+
+      const accepted = vi.fn();
+      const { result, unmount } = renderHookWithProviders(() => useDraftChatHarness());
+      act(() => {
+        result.current.composer.setMessage('queued then resent');
+      });
+      act(() => {
+        result.current.chat.setIsCompacting('summarize');
+      });
+      act(() => {
+        result.current.composer.submitWithDraft((onAccepted, onHandedOff, onRestore) => {
+          return result.current.chat.handleSendMessage('queued then resent', null, null, {
+            onAccepted: () => {
+              onAccepted();
+              accepted();
+            },
+            onHandedOff,
+            onNotTaken: onRestore,
+          });
+        });
+      });
+      // Parked, not taken: no stream, no acceptance, the draft inFlight.
+      expect(mockSendStream).not.toHaveBeenCalled();
+      expect(accepted).not.toHaveBeenCalled();
+
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        act(() => {
+          result.current.chat.setIsCompacting(false);
+        });
+        await settle(0);
+        // The flushed send dropped in setup and handed off to its resend: the
+        // queue's deferred outcome resolved true, and the draft stayed parked.
+        expect(mockSendStream).toHaveBeenCalledTimes(1);
+        expect(accepted).not.toHaveBeenCalled();
+        expect(result.current.composer.message).toBe('');
+        expect(storedDraft()).toMatchObject({ text: 'queued then resent', inFlight: true });
+
+        // The resend is taken: the parked draft settles sent.
+        await settle(1000);
+        expect(mockSendStream).toHaveBeenCalledTimes(2);
+        expect(accepted).toHaveBeenCalledTimes(1);
+        expect(storedDraft()).toBeNull();
+      } finally {
+        vi.useRealTimers();
+      }
+      unmount();
     });
   });
 });

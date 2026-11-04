@@ -207,6 +207,24 @@ interface SendOptions extends ModelOptions {
    */
   onHandedOff?: () => void;
   /**
+   * DALTON-HOOK(composer-drafts): called when the send is definitely not
+   * taken — a stop cancelled the resend backoff, the resend chain gave up
+   * and left the failed reply's Retry, a resent attempt was refused — so the
+   * composer puts the draft back whole (text, quote chips, the
+   * attachments-again notice). Rides the resent attempts' model options like
+   * `onAccepted`, so the exit a chain reaches fires it.
+   */
+  onNotTaken?: () => void;
+  /**
+   * DALTON-HOOK(composer-drafts): called when the host actually took this
+   * refused send back itself (the chat's returnedDraft, re-seated through
+   * its giveBack) — the composer's failure settle then keeps only the stored
+   * draft and leaves the input to that restore. Whether it fired for this
+   * send decides who restores; a stop that never produced a returnedDraft
+   * leaves it uncalled, and the composer restores.
+   */
+  onReturnedUnsent?: () => void;
+  /**
    * What the composer held when it sent this. Should the server not keep the
    * send while the host has the transcript out of view (`returnsUnsent`), it
    * goes back to the composer as this, and the message leaves the transcript,
