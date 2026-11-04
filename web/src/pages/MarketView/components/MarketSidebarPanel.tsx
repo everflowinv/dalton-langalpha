@@ -12,7 +12,6 @@ import { getExtendedHoursInfo } from '@/lib/marketUtils';
 import { deriveQuoteDisplay, formatSignedPct2, roundQuote2 } from '@/lib/quotes'; // DALTON-HOOK(extended-hours-quotes)
 import { grouped2 } from '@/lib/format';
 import { useLocale } from '@/hooks/useLocale';
-import { EXT_COLOR_PRE, EXT_COLOR_POST } from '../utils/chartConstants';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import './MarketSidebarPanel.css';
 
@@ -157,7 +156,7 @@ function MarketSidebarPanel({ activeSymbol, onSymbolClick, marketStatus }: Marke
           <span className={`market-sidebar-row-change ${changeClass(displayIsPositive, displayChangePct)}`}>
             {formatChange(displayChangePct)}
             {extType && extDisplayPrice != null && extPct != null && (
-              <span className="market-sidebar-row-ext" style={{ display: 'inline-flex', alignItems: 'center', gap: 2, color: extType === 'pre' ? EXT_COLOR_PRE : EXT_COLOR_POST }}>
+              <span className="market-sidebar-row-ext" style={{ display: 'inline-flex', alignItems: 'center', gap: 2, color: extType === 'pre' ? 'var(--color-ext-pre)' : 'var(--color-ext-post)' }}>
                 {extType === 'pre' ? <Sunrise size={10} /> : <Sunset size={10} />}
                 {formatPrice(extDisplayPrice)} {formatSignedPct2(extPct, locale)}
               </span>

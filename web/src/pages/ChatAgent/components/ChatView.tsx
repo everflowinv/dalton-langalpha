@@ -117,7 +117,6 @@ import { useNextSummary } from '../hooks/useNextSummaryHint';
 import { ChatDiskWarning } from './chatView/ChatDiskWarning';
 import { ChatRestoreOffer } from './chatView/ChatRestoreOffer';
 import { useToolCallAnnouncer } from './chatView/useToolCallAnnouncer';
-import { useNavPanel } from './chatView/useNavPanel';
 import { MobileNavDrawer } from './chatView/MobileNavDrawer';
 import { useChatScroll } from './chatView/useChatScroll';
 import { useStreamFollow } from './chatView/transcriptFollow';
@@ -235,13 +234,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     isActiveRef.current = isActive;
   });
 
-  const {
-    navPanelVisible,
-    navSlideIn,
-    handleNavMinimize,
-    handleNavExpand,
-    inheritNavOnActivate,
-  } = useNavPanel();
+  // The mobile nav drawer. Desktop navigation is the app-shell AppSidebar.
+  const [navPanelVisible, setNavPanelVisible] = useState(false);
+  const handleNavMinimize = useCallback(() => setNavPanelVisible(false), []);
 
   // Floating cards management - extracted to custom hook for better encapsulation
   // Must be called before useChatMessages since updateTodoListCard and updateSubagentCard are passed to it
@@ -1356,13 +1351,17 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   }, [msgSelectionTooltip]);
 
 
+  const scrollThreadToTop = useCallback(() => {
+    if (activeAgentId === 'main') toTop();
+    else subagentToTop();
+  }, [activeAgentId, toTop, subagentToTop]);
+
   // Mobile: tap top bar to scroll chat to top
   const handleTopBarTap = useCallback((e: React.MouseEvent) => {
     if (!isMobile) return;
     if ((e.target as HTMLElement).closest('button, a')) return;
-    if (activeAgentId === 'main') toTop();
-    else subagentToTop();
-  }, [isMobile, activeAgentId, toTop, subagentToTop]);
+    scrollThreadToTop();
+  }, [isMobile, scrollThreadToTop]);
 
 
 
@@ -1516,13 +1515,14 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
 
 
   // When this view becomes active (thread switch or new thread):
-  // 1. Inherit nav panel state from the shared signal so it stays open across switches
+  // 1. Close the nav drawer: a cached view was left however it stood, and the
+  //    drawer covers the thread this view is here to show
   // 2. Scroll to bottom — while hidden (display:none) auto-scroll is a no-op
   // A run that started or ended while it was hidden is useForeignRunCatchUp's.
   const prevIsActiveRef = useRef(false);
   useEffect(() => {
     if (isActive && !prevIsActiveRef.current) {
-      inheritNavOnActivate();
+      handleNavMinimize();
 
       const tidNow = currentThreadId || threadId;
       requestAnimationFrame(() => {
@@ -1535,7 +1535,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       });
     }
     prevIsActiveRef.current = isActive;
-  }, [isActive, getScrollContainer, currentThreadId, threadId, pinToBottom, inheritNavOnActivate, isNearBottomRef, restoredForThreadRef]);
+  }, [isActive, getScrollContainer, currentThreadId, threadId, pinToBottom, handleNavMinimize, isNearBottomRef, restoredForThreadRef]);
 
   const feedThreadId = currentThreadId || threadId;
   useForeignRunCatchUp({
@@ -1648,7 +1648,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
             </button>
             {isMobile && (
               <button
-                onClick={handleNavExpand}
+                onClick={() => setNavPanelVisible(true)}
                 className="p-2 rounded-md transition-colors shrink-0"
                 style={{ color: 'var(--color-text-primary)' }}
                 title={t('sidebar.menu')}
@@ -1657,7 +1657,14 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
               </button>
             )}
             <h1 className="text-base font-semibold whitespace-nowrap title-font truncate" style={{ color: 'var(--color-text-primary)' }}>
-              {workspaceName || t('thread.workspace')}
+              {/* The bar's tap is a pointer's shortcut, and a bar holding buttons
+                  cannot be one. The title is the same action as a real control,
+                  named by the words on it, with what it does as its description. */}
+              {isMobile ? (
+                <button type="button" className="block max-w-full truncate text-left" title={t('chat.scrollToTop')} onClick={scrollThreadToTop}>
+                  {workspaceName || t('thread.workspace')}
+                </button>
+              ) : (workspaceName || t('thread.workspace'))}
             </h1>
             {/* DALTON-HOOK(workspace-sharing-settings): display colleague access banner in top bar */}
             {teamReadOnly.isColleague && (
@@ -1721,7 +1728,6 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
           {isMobile && (
             <MobileNavDrawer
               visible={navPanelVisible}
-              slideIn={navSlideIn}
               onMinimize={handleNavMinimize}
               isActive={isActive}
               workspaceId={workspaceId}

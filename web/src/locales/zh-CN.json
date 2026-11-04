@@ -760,6 +760,7 @@
   "dashboard": {
     "failedOnboarding": "设置失败，请重试。",
     "title": "{{brand}}",
+    "searchLabel": "按代码或公司名称搜索股票",
     "searchPlaceholder": "搜索股票代码或公司名称...",
     "searching": "搜索中...",
     "noResults": "未找到结果",
@@ -2201,6 +2202,7 @@
     },
     "backToWorkflow": "返回工作流",
     "backToMain": "返回主对话",
+    "scrollToTop": "滚动到对话顶部",
     "reconnecting": "重新连接中…",
     "offlineHistoryLoad": "网络已断开，无法刷新此对话。恢复连接后会自动同步。",
     "jumpToLatest": {
@@ -2232,6 +2234,7 @@
       "captureChart": "截取图表",
       "chartAlt": "图表",
       "send": "发送消息",
+      "messageLabel": "发给 Agent 的消息",
       "dropFiles": "拖放文件以上传",
       "uploading": "上传中",
       "inFlightDraftRestored": "上次发送可能已被受理，发送前请先确认对话里是否已经有这条消息。"
@@ -2303,6 +2306,10 @@
     "collapseResult": "收起",
     "resultMoreItems": "另有 {{n}} 项",
     "imageLoadFailed": "{{name}} 无法加载",
+    "taskDone": "已完成",
+    "taskOpen": "未完成",
+    "scrollableTable": "表格,可左右滑动",
+    "diagram": "图表",
     "actions": {
       "copyMessage": "复制消息",
       "copied": "已复制！",
@@ -4384,6 +4391,7 @@
     "usageCountsXai": "请求计入你的 SuperGrok 订阅额度，与在 Grok CLI 中使用时完全相同。"
   },
   "marketView": {
+    "pageHeading": "{{symbol}} 行情",
     "companyOverview": "公司概览",
     "quote": {
       "live": "实时",

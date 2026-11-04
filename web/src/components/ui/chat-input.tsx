@@ -13,6 +13,7 @@ import { useAllModels } from '@/hooks/useAllModels';
 import { useProviderCatalog } from '@/hooks/useProviderCatalog';
 import { useLapsedSignIn } from '@/hooks/useLapsedSignIn';
 import { useIsMobile } from '@/hooks/useIsMobile';
+import { onKeyboardFit, onScreenKeyboardUp, roomAboveKeyboard } from '@/lib/visualViewport';
 import { useFavoriteModels } from '@/hooks/useFavoriteModels';
 import { useSeededModel } from '@/hooks/useSeededModel';
 import { ChatInputRegistry, ContextBus } from '@/lib/contextBus';
@@ -50,6 +51,9 @@ import { useComposerDraft } from '@/lib/dalton/chatDrafts';
 
 /** Autosize cap for the composer textarea; past this the box scrolls. */
 const MAX_TEXTAREA_HEIGHT = 200;
+
+/** What the textarea keeps, two lines of the phone's text, however little room the keyboard leaves. */
+const MIN_TEXTAREA_HEIGHT_OVER_KEYBOARD = 52;
 
 /** A thread that follows Settings for both. */
 const FOLLOWS_SETTINGS = { reasoningEffort: null, fastMode: null } as const;
@@ -198,6 +202,13 @@ export interface ChatInputProps {
 }
 
 /* --- MAIN COMPONENT --- */
+
+function settleAfterSend(field: HTMLTextAreaElement | null): void {
+  if (!field) return;
+  field.style.height = 'auto';
+  // The answer lands where the on-screen keyboard is.
+  if (onScreenKeyboardUp()) field.blur();
+}
 
 function ChatInput({
   onSend,
@@ -553,6 +564,53 @@ function ChatInput({
     }
   }, [message]);
 
+  // A composer in a scrolling route grows downward, so with a keyboard up the
+  // text gives up what would push the send row under it. A limit apart from the
+  // height above, measured from the box as it stands: nothing collapses, so the
+  // text keeps its scroll, and a composer hidden with its cached thread keeps its size.
+  const fitToKeyboard = useCallback(() => {
+    const textarea = textareaRef.current;
+    const box = chatContainerRef.current;
+    if (!textarea || !box) return;
+    const active = document.activeElement;
+    // Its picker is anchored to the box as it stands.
+    if (active?.closest('[data-composer-panel]')) return;
+    const room = active === textarea ? roomAboveKeyboard(box) : null;
+    if (room === null) {
+      textarea.style.maxHeight = '';
+      return;
+    }
+    const shownBefore = textarea.clientHeight;
+    // Not `offsetHeight`: rounded, the limit never settles and the observer below
+    // refits it every frame.
+    textarea.style.maxHeight = Math.max(textarea.getBoundingClientRect().height + room, MIN_TEXTAREA_HEIGHT_OVER_KEYBOARD) + 'px';
+    // The box gives up its foot, and a caret at the end of the text is there.
+    if (textarea.clientHeight < shownBefore && textarea.selectionEnd === textarea.value.length) {
+      textarea.scrollTop = textarea.scrollHeight;
+    }
+    if ((roomAboveKeyboard(box) ?? 0) < 0) box.scrollIntoView({ block: 'nearest' });
+  }, []);
+
+  useEffect(fitToKeyboard, [message, fitToKeyboard]);
+  useEffect(() => {
+    if (!chatContainer) return;
+    // Whatever else sizes the box: a pill, an attachment leaving, a deck folding,
+    // with or without motion. A frame later, since changing the box inside its
+    // own callback is a ResizeObserver loop error.
+    let frame = 0;
+    const observer = new ResizeObserver(() => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(fitToKeyboard);
+    });
+    observer.observe(chatContainer);
+    const stopListening = onKeyboardFit(fitToKeyboard);
+    return () => {
+      observer.disconnect();
+      cancelAnimationFrame(frame);
+      stopListening();
+    };
+  }, [chatContainer, fitToKeyboard]);
+
   // Large text pastes condense into a pill (snippet-mention mechanics) instead
   // of flooding the draft. File pastes keep priority — handlePaste prevents
   // default when it takes the clipboard.
@@ -617,9 +675,7 @@ function ChatInput({
         ContextBus.clear();
       }
       setDeckFanned(false);
-      if (textareaRef.current) {
-        textareaRef.current.style.height = 'auto';
-      }
+      settleAfterSend(textareaRef.current);
       return;
     }
 
@@ -672,9 +728,7 @@ function ChatInput({
       ContextBus.clear();
     }
     setDeckFanned(false);
-    if (textareaRef.current) {
-      textareaRef.current.style.height = 'auto';
-    }
+    settleAfterSend(textareaRef.current);
     // DALTON-HOOK(composer-drafts): include draft helpers in handleSend deps
   }, [hasContent, disabled, message, effectiveMarketWatch, draftSubagents, attachedFiles, setAttachedFiles, onSend, onAction,
     mentionedFiles, resetMentions, slashCommands, resetSlash,
@@ -718,7 +772,7 @@ function ChatInput({
         }
         return;
       }
-      if (!e.shiftKey) {
+      if (!e.shiftKey && !onScreenKeyboardUp()) {
         e.preventDefault();
         handleSend();
       }
@@ -840,7 +894,7 @@ function ChatInput({
           overlays repeat it. */}
       <div
         ref={attachChatContainer}
-        className={cn('chat-input-container owns-its-edge flex flex-col items-stretch relative z-10 rounded-[22px] cursor-text border border-(--color-border-input) bg-(--color-bg-card)', isListening && 'recording')}
+        className={cn('chat-input-container owns-its-edge scroll-mb-2 flex flex-col items-stretch relative z-10 rounded-[22px] cursor-text border border-(--color-border-input) bg-(--color-bg-card)', isListening && 'recording')}
         onClick={(event) => {
           // A press on a control in the box is that control's, and the deck
           // above the text is its own surface: focusing the text there would
@@ -947,6 +1001,9 @@ function ChatInput({
                   stopListening();
                 }
               }}
+              // Named apart from the placeholder, which says what state the
+              // thread is in and is empty while listening.
+              aria-label={t("chat.composer.messageLabel")}
               placeholder={isListening ? "" : (placeholder ?? t("chat.placeholderDefault"))}
               className={`font-content w-full bg-transparent border-0 text-(--color-text-primary) ${isMobile ? 'text-base' : 'text-sm'} placeholder:text-(--color-text-tertiary) resize-none overflow-y-auto leading-relaxed block transition-opacity ${isListening ? 'opacity-20' : 'opacity-100'}`}
               rows={minRows}

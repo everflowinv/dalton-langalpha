@@ -12,6 +12,7 @@ import './index.css'
 // first click, not from whichever overlay happens to load first.
 import './lib/inputModality'
 import { applyCardStyle, getCardStyle } from './lib/cardStyle'
+import { trackVisualViewport } from './lib/visualViewport'
 import { Toaster } from './components/ui/toaster'
 import { StaleBuildBoundary } from './components/StaleBuildBoundary'
 
@@ -28,6 +29,7 @@ const queryClient = new QueryClient({
 
 document.title = BRAND_NAME // DALTON-HOOK(brand-name)
 applyCardStyle(getCardStyle())
+trackVisualViewport()
 
 // Nothing renders until the active locale's catalog is in, or the first paint
 // shows raw keys. A catalog that fails leaves #root to index.html's pre-boot

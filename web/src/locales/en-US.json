@@ -722,6 +722,7 @@
   "dashboard": {
     "failedOnboarding": "Failed to set up onboarding. Please try again.",
     "title": "{{brand}}",
+    "searchLabel": "Search stocks by symbol or company name",
     "searchPlaceholder": "Search by symbol or company name...",
     "searching": "Searching...",
     "noResults": "No results found",
@@ -2172,6 +2173,7 @@
     },
     "backToWorkflow": "Back to workflow",
     "backToMain": "Back to main",
+    "scrollToTop": "Scroll to the top of the conversation",
     "reconnecting": "Reconnecting…",
     "offlineHistoryLoad": "You are offline, so this conversation could not be refreshed. It will catch up when your connection returns.",
     "jumpToLatest": {
@@ -2203,6 +2205,7 @@
       "captureChart": "Capture chart",
       "chartAlt": "Chart",
       "send": "Send message",
+      "messageLabel": "Message to the agent",
       "dropFiles": "Drop files to upload",
       "uploading": "Uploading",
       "inFlightDraftRestored": "Your last send may already have gone through. Check the conversation before sending it again."
@@ -2275,6 +2278,10 @@
     "collapseResult": "Show less",
     "resultMoreItems": "+{{n}} more",
     "imageLoadFailed": "{{name}} could not be loaded",
+    "taskDone": "Done",
+    "taskOpen": "Not done",
+    "scrollableTable": "Table, scrolls sideways",
+    "diagram": "Diagram",
     "actions": {
       "copyMessage": "Copy message",
       "copied": "Copied!",
@@ -4403,6 +4410,7 @@
     "usageCountsXai": "Requests count against your SuperGrok subscription quota, exactly as they would in the Grok CLI."
   },
   "marketView": {
+    "pageHeading": "{{symbol}} market view",
     "companyOverview": "Company Overview",
     "quote": {
       "live": "Live",
