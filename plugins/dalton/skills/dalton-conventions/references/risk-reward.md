@@ -15,8 +15,8 @@ Dalton 是基本面长仓导向（fundamental long-biased）基金。下表的�
 
 - **多头**：回报门槛为年化 15%（期限较短时用总回报下限 10%）；将三情景含现金回报的终值与门槛终值对比，推导达到门槛所需的胜率。
 - **空头**：门槛按**期限内的总跌幅**计，不做年化复利——默认由 20% 年化折算到期限、上限 50%，并计入借券成本与股息补偿（成本未知就标注"未计成本"）。
-- **不利波动上限**：行动分类为 `act_now`（现在可以动手）时，不利方向价带端点相对基准股价的亏损幅度不得超过 25%（多头看悲观情景 bear 价带下沿，空头看乐观情景 bull 价带上沿）；空头给 `act_now` 还须填写逼空压力情景（`underwriting.stress`）且借券成本（`underwriting.borrow_cost_annual`）有已知上界，否则只能定为 `wait_evidence`（等证据）。
-- **买点距离**：行动分类为 `wait_price`（等价格）时，买点价带中点距现价不超过 25%（`max_entry_distance`〔买点最大偏离幅度〕）；边界规则见 §4。
+- **不利波动上限**：行动分类为 `act_now`（立即行动）时，不利方向价带端点相对基准股价的亏损幅度不得超过 25%（多头看悲观情景 bear 价带下沿，空头看乐观情景 bull 价带上沿）；空头给 `act_now` 还须填写逼空压力情景（`underwriting.stress`）且借券成本（`underwriting.borrow_cost_annual`）有已知上界，否则只能定为 `wait_evidence`（等待证据）。
+- **买点距离**：行动分类为 `wait_price`（等待买点）时，买点价带中点距现价不超过 25%（`max_entry_distance`〔买点最大偏离幅度〕）；边界规则见 §4。
 - 上述参数（`long_hurdle_annual`〔多头年化门槛〕、`short_hurdle_annual`〔空头年化门槛〕、`min_total_return`〔最低总回报〕、`max_adverse_move_act_now`〔立即可行动的最大不利波动〕）在写入 `thesis.underwriting` 时记入 `underwriting.hurdles`，由服务端统一计算并校验（可通过 `knowledge_update(doc="thesis", dry_run=True)` 返回的赔率计算摘要预览）；**任何门槛都不允许靠抬高乐观情景（bull）倍数去凑**。
 - **做空纪律**：空头须指明**盈利下修或倍数压缩的时间窗**（哪个指标、哪个季度下修，或倍数从什么环境压到什么环境），并单独评估**借券成本与逼空（short squeeze）的路径风险**；写不出明确时间窗的，不得给出做空（`short`）结论。
 
@@ -24,7 +24,7 @@ Dalton 是基本面长仓导向（fundamental long-biased）基金。下表的�
 
 ## 2. 三情景估值与隐含 IRR（Three-Scenario Valuation & IRR）
 
-所有覆盖阶段（初筛、财报前瞻 Preview、多空讨论快速版与完整稿、完整覆盖备忘录 Investment Memo）及目标价更新，都必须给出 **Base（基准）/ Bull（乐观）/ Bear（悲观）** 三个情景，不得只给单一目标价（当方向为 `no_view`〔无观点／无法识别〕时可免填三情景：商业模式或估值范围无法识别时，按 §4 写明无法识别什么与 30 天内的复核日期）。快速阶段允许**轻量计算**——在 `states[].calc` 中用 `method="eps_pe"`（填 `eps` 区间、`multiple` 区间、`basis`、`period` 与 `sources`）或 `method="reference"`（填 `price_range` 与指向模型单元格或计算类证据的 `ref`），只要求写明各自的来源和口径、可复算。**情景权重区间可选**（`weight_bounds`）：仅在有客观依据（历史基率、二元事件、在 `rationale` 中注明为“风险中性”口径的期权隐含概率）时填写，无依据则不写，严禁编造概率；在 `rationale` 中标注为“风险中性”口径的期权隐含概率仅作展示参考，**不能直接用来支撑 `high`（高确信）**（见 §6）。三情景与赔率卡同步写入 `thesis.underwriting`（先 `knowledge_update(doc="thesis", dry_run=True)` 查看赔率计算摘要，再正式写；完整结构化样例见 `.agents/skills/dalton-knowledge/references/structured-write-example.md`），报告正文保留给人读的赔率卡，数字与 `thesis.underwriting` 一致。
+所有覆盖阶段（初筛、财报前瞻 Preview、多空讨论快速版与完整稿、完整覆盖备忘录 Investment Memo）及目标价更新，都必须给出 **Base（基准）/ Bull（乐观）/ Bear（悲观）** 三个情景，不得只给单一目标价（当方向为 `no_view`〔暂不表态／无法识别〕时可免填三情景：商业模式或估值范围无法识别时，按 §4 写明无法识别什么与 30 天内的复核日期）。快速阶段允许**轻量计算**——在 `states[].calc` 中用 `method="eps_pe"`（填 `eps` 区间、`multiple` 区间、`basis`、`period` 与 `sources`）或 `method="reference"`（填 `price_range` 与指向模型单元格或计算类证据的 `ref`），只要求写明各自的来源和口径、可复算。**情景权重区间可选**（`weight_bounds`）：仅在有客观依据（历史基率、二元事件、在 `rationale` 中注明为“风险中性”口径的期权隐含概率）时填写，无依据则不写，严禁编造概率；在 `rationale` 中标注为“风险中性”口径的期权隐含概率仅作展示参考，**不能直接用来支撑 `high`（高确信）**（见 §6）。三情景与赔率卡同步写入 `thesis.underwriting`（先 `knowledge_update(doc="thesis", dry_run=True)` 查看赔率计算摘要，再正式写；完整结构化样例见 `.agents/skills/dalton-knowledge/references/structured-write-example.md`），报告正文保留给人读的赔率卡，数字与 `thesis.underwriting` 一致。
 
 1. **情景由业务驱动因子（Drivers）定义，而非单纯给估值倍数加减 20%**：
    - **Base Case（基准情景）**：基于当前最具把握的证据链推导的收入、利润率与自由现金流路径，搭配合理的稳态估值倍数。
@@ -43,7 +43,7 @@ Dalton 是基本面长仓导向（fundamental long-biased）基金。下表的�
    - **空头所需 bear 概率**：门槛按**期限内的总跌幅**计（不做年化复利）——`d_S = min(20% × T, 50%) + 借券成本 × T + 股息率 × T`（成本未知就标注"未计成本"），`H_S = 现价 × (1 − d_S)`；空头公式里的 `V_D / V_M / V_U` **只取纯价格终值（价带中点），不加现金回报**——股息补偿已经计入 `d_S`，不能再算第二次；`d_req(b) = (V_U − H_S − b × (V_U − V_M)) / (V_U − V_D)`。
    - **数字自检例子**：现价 100、期限一年、股息 5、借券成本 0、三档价格 60 / 80 / 100、base 权重 25%——`d_S = 20% + 0 + 5% = 25%`，`H_S = 100 × 0.75 = 75`；`d_req(25%) = (100 − 75 − 0.25 × (100 − 80)) / (100 − 60) = 20 / 40 = 50%`，即需要 50% 的 bear 概率。
    - **边界写法**：多头 `u_req < 0` 写"**无需 bull 即达标**"、`u_req > 1 − b` 写"**该组合不可达**"；空头 `d_req < 0` 写"**无需 bear 即达标**"、`d_req > 1 − b` 写"**该组合不可达**"——都**不得截成 100%**；`V_U = V_D` 时不做除法，直接比较终值与门槛。
-   - **裁决只能是四种之一**（`breakeven_verdict[].verdict` 枚举值）：`clearly_above`（明显高于） / `around`（在门槛附近） / `below`（低于） / `cannot_judge`（无法判断）；每条裁决必须写明**方向 `side`（`long` / `short`）、测试权重行 `b_row`（只能是 `0.25` 或 `0.5`，两行裁决分别各写一条）、文字依据 `basis` 与关联分歧 `debate_ids`**，不得只挑对自己有利的一行；agent 不报自己的概率点值。
+   - **裁决只能是四种之一（JSON 字段填法与正文写法分开）**：JSON 的 `breakeven_verdict[].verdict` 字段填枚举值 `clearly_above` / `around` / `below` / `cannot_judge`，并填齐方向 `side`（`long` / `short`）、测试权重行 `b_row`（只能是 `0.25` 或 `0.5`，两行分别各写一条）、文字依据 `basis` 与关联分歧 `debate_ids`；**报告正文和推送正文只写中文表述**——裁决写“显著高于门槛”“在门槛附近”“低于门槛”“无法判断”，方向写“做多 / 做空”，测试权重写“base 权重 25% / 50%”（注明“测试权重，不是预测”），关联分歧用一句话写出分歧的具体内容（不写 `D1` 等编号或 `side`、`b_row`、`debate_ids` 等字段名）。两行测试权重都必须写出，不得只挑对自己有利的一行；agent 不报自己的概率点值。
 
 ---
 
@@ -63,11 +63,11 @@ Dalton 是基本面长仓导向（fundamental long-biased）基金。下表的�
 
 ## 4. 不参与是合法结论，但必须承担举证责任
 
-- **neutral / 不参与也要完成决策推导**：下结论之前，三情景价格、达到门槛所需的胜率、三层保护必须已经算完；结论里写明是哪个变量限制了决策（价格、证据、时机、下行路径、实施条件），以及什么情况下会改判。商业模式属于难以预测的"太难桶（Too Hard Pile）"是 `no_view` 的合法理由，同样要写清无法识别什么与复核日期。
+- **neutral / 暂不参与也要完成决策推导**：下结论之前，三情景价格、达到门槛所需的胜率、三层保护必须已经算完；结论里写明是哪个变量限制了决策（价格、关键证据待验证、催化剂时点、下行路径风险、交易执行条件），以及什么情况下会改判。商业模式属于难以预测的"太难桶（Too Hard Pile）"是 `no_view` 的合法理由，同样要写清无法识别什么与复核日期。
 - **胜率比较，不是胜率否定**：把**证据支持的胜率**与**达到门槛所需的胜率**（§1 的统一门槛）放在一起比较，仍过不了线才构成不参与的依据；"胜率接近抛硬币""证据尚无定论""拿不到买方 bogey""管理层没给指引"本身都不是理由，除非写明这个未知项在合理取值区间内会翻转方向。
-- **仍要交付赔率卡与三层保护**：没有高确信时，仍要交付赔率卡（三情景价格带、所需胜率与裁决）、三层保护与双向改判条件，并按上面的分类写明 stance、行动分类与限制变量，不能只用一句"暂无高确信"或"观察"了事。在 Dalton，一份严谨的"为什么现在不参与 + 什么条件下参与"报告与多头推荐具有同等价值；但严禁为了得出买入结论而扭曲假设。
-- **stance（方向）只有四个值，可以写进 thesis**：`long`（当前价格和期限下风险收益明确偏多）、`short`（明确偏空）、`neutral`（已完成三情景定价，但合理假设区间内多空任一方向都过不了门槛，或方向在区间内翻转——两个方向都要在 `breakeven_verdict` 数组里分别给出 `side="long"` 与 `side="short"` 的裁决）、`no_view`（机制或估值范围无法识别〔含未研究〕，`conviction` 必须为 `"none"`，`actionability` 必须为 `"pass"`，且必须填 `house_view.missing` 数组写清**哪些东西无法识别**，并在 `house_view.review_by` 给出 **30 天内的复核日期**，不得反复以同一理由延期）。**不要把 pass 写成 stance 的取值。**
-- **行动分类与限制变量（写入 `thesis.house_view.actionability` 与 `binding_constraint`，并同步写在报告正文）**：现在可以动手（`act_now`，`binding_constraint="none"`）／等价格（`wait_price`，`binding_constraint="price"`，必填 `entry_band` 买点价带）／等证据（`wait_evidence`，`binding_constraint` 为 `evidence`、`timing`、`downside_path`、`implementation` 之一，必填 `trigger_refs` 指向 `agenda` 中带明确到期日的待验证事项或唤醒条件）／不参与（`pass`，`binding_constraint` 为 `price`、`evidence`、`timing`、`downside_path`、`implementation` 之一）；同时在 `flip_conditions` 写明双向改判条件（`upgrade_if` 与 `downgrade_if` 两个非空字符串，`stance` 为 `long`/`short`/`neutral` 时两边均须填写并包含具体指标、数字阈值、观察窗口与触发动作）。
+- **仍要交付赔率卡与三层保护**：没有高确信时，仍要交付赔率卡（三情景价格带、所需胜率与裁决）、三层保护与双向改判条件，并用中文写明方向、确信度、行动分类与限制变量（对应写入 `thesis.house_view` 相应字段，正文不写英文字段名或枚举值），不能只用一句"暂无高确信"或"观察"了事。在 Dalton，一份严谨的"为什么现在不参与 + 什么条件下参与"报告与多头推荐具有同等价值；但严禁为了得出买入结论而扭曲假设。
+- **方向与确信度（JSON 字段怎么填、正文怎么写）**：JSON 的 `thesis.house_view.stance` 字段只填四个枚举值之一——`long`（当前价格和期限下风险收益明确偏多）、`short`（明确偏空）、`neutral`（已完成三情景定价，但合理假设区间内多空任一方向都过不了门槛，或方向在区间内翻转——两个方向都要在 `breakeven_verdict` 数组里分别给出 `side="long"` 与 `side="short"` 的裁决）、`no_view`（机制或估值范围无法识别〔含未研究〕，`conviction` 必须为 `"none"`，`actionability` 必须为 `"pass"`，且必须填 `house_view.missing` 数组写清**哪些东西无法识别**，并在 `house_view.review_by` 给出 **30 天内的复核日期**，不得反复以同一理由延期）；**不要把 pass 写成 stance 的取值**。**报告正文和推送正文**直接写中文“看多 / 看空 / 中性 / 暂不表态”与“确信度：高 / 中 / 低 / 无”，不写 `stance`、`conviction` 等字段名或英文枚举值。
+- **行动分类、限制变量与改判条件（JSON 字段怎么填、正文怎么写）**：JSON 的 `thesis.house_view.actionability` 与 `binding_constraint` 字段填枚举值——`act_now`（`binding_constraint="none"`）／`wait_price`（`binding_constraint="price"`，必填 `entry_band` 买点价带）／`wait_evidence`（`binding_constraint` 为 `evidence`、`timing`、`downside_path`、`implementation` 之一，必填 `trigger_refs` 指向 `agenda` 中带明确到期日的待验证事项或唤醒条件）／`pass`（`binding_constraint` 为 `price`、`evidence`、`timing`、`downside_path`、`implementation` 之一），同时在 `flip_conditions` 字段填 `upgrade_if` 与 `downgrade_if` 两个非空字符串（`stance` 为 `long`/`short`/`neutral` 时两边均须填写具体指标、数字阈值、观察窗口与触发动作）。**报告正文和推送正文**用自然中文写明行动建议（“立即行动 / 等待买点 / 等待证据 / 暂不参与”）、买点价带或带到期日的待验证事项内容、限制决策的变量（无 / 价格 / 关键证据待验证 / 催化剂时点 / 下行路径风险 / 交易执行条件）以及上调/下调观点的具体触发条件，不在正文里写 `actionability`、`binding_constraint`、`flip_conditions`、`trigger_refs` 等字段名、枚举值或 `V-001` 等议程编号。
 - **wait_price 的买点边界**：多头要求买点价带上端低于现价、且下端不低于 bear 价带下沿；空头要求买点价带下端高于现价、且上端不超过 bull 价带上沿；价带中点离基准股价不超过 25%。
 - **不得换个说法绕开限制**："现价不值得、跌 25% 以上才值得买"的表态，stance 不能是 long（只能 neutral 或 short），买点要写成明确的价带与复核条件。
 

@@ -8,7 +8,7 @@
 
 ### 1. 逐条核对与三档判定
 读取财报前 T-3 生成的 `predictions.json`，使用 `scripts/reconcile.py` 将每条预测与当季一手披露实际值（或最新官方指引）逐一比对，输出固定列对账表至 `research/<D>-deep-<quarter>/reconcile.md`，同时将错判与部分命中的条数写入 `research/<D>-deep-<quarter>/reconcile.json`（格式为 `{"wrong": <错的条数>, "partial": <部分的条数>}`；若本次财报前无 `predictions.json`，`reconcile.json` 写 `{"wrong": 0, "partial": 0}`）：
-`指标（ID｜期间｜口径）｜我们的预期｜一致预期｜实际｜对/错/部分｜错因`
+`指标（期间｜口径）｜我们的预期｜一致预期｜实际｜对/错/部分｜错因`（合入深度报告正文时写出指标名称、期间与口径，不写 `P1` 等编号）
 
 每条预测必须明确给出以下三档判定之一，**严禁模棱两可或跳过错判条目**：
 - **`对`**：实际结果落在 `our_expectation` 预测区间内（或点预测误差在合理容差内且方向、机制完全吻合）；
@@ -49,19 +49,19 @@
 - **会计与披露红旗**：出现下列任何一项，就降低它所涉及支柱的证据质量，并在 agenda 里建一条带日期的跟进事项：KPI 定义或披露口径变化、non-GAAP 调整占盈利的比例扩大、收入确认方式变化、应收或存货增长快于收入、现金转化明显偏离报告盈利、资本化费用突增、分部重述、审计师或 CFO 离任、关联交易、反复出现的"一次性"费用。
 - **管理层可信度**：管理层的表述只有在量化、与上季说法一致、讲清机制、并坦白说明哪里没做好时才算有分量；含糊的乐观、改了口径的 KPI、选择性披露都不算。校准时写明本季属于哪一种。
 
-### 2. 支柱信号词与状态词（严格使用闭集枚举）
+### 2. 支柱信号词与状态词（JSON 填闭集枚举，正文写知识层渲染中文）
 
-- **信号词（`signal`，10 选 1）**：
-  `strongly confirming`、`confirming`、`mildly confirming`、`neutral`、`mildly weakening`、`weakening`、`strongly weakening`、`mixed`、`invalidating`、`untested`
-- **支柱状态词（`status`，8 选 1）**：
-  - `strengthening`：证据超越预期路径，且未来路径不变或更优；
-  - `intact`：证据与立项时的预期路径一致；
-  - `watch`：触及预警阈值或证据喜忧参半（`mixed`），取决于下一个验证点；
-  - `impaired`：该支柱已跌破证伪/破坏阈值，但其他核心支柱仍支撑整体逻辑；
-  - `broken`：核心主张已被证伪，持有理由消失；
-  - `changed`：公司实际业务演进已偏离原立项逻辑，需重新立项（`re-underwrite`）；
-  - `untested`：本季财报未提供检验该支柱的有效经营证据；
-  - `retired`：已完成历史使命并主动关闭（注明日期与原因）。
+- **信号词（`signal`，JSON 10 选 1；报告正文写对应中文）**：
+  `strongly_confirming`（强力验证）、`confirming`（验证）、`mildly_confirming`（小幅验证）、`neutral`（中性）、`mildly_weakening`（小幅削弱）、`weakening`（削弱）、`strongly_weakening`（严重削弱）、`mixed`（多空交织）、`invalidating`（证伪）、`untested`（尚未检验）
+- **支柱状态词（`status`，JSON 8 选 1；报告正文写对应中文，且支柱列写一句话主张内容、不写 `P1` 编号）**：
+  - `strengthening`（强化）：证据超越预期路径，且未来路径不变或更优；
+  - `intact`（成立）：证据与立项时的预期路径一致；
+  - `watch`（观察）：触及预警阈值或证据多空交织（`mixed`），取决于下一个验证点；
+  - `impaired`（受损）：该支柱已跌破证伪/破坏阈值，但其他核心支柱仍支撑整体逻辑；
+  - `broken`（证伪）：核心主张已被证伪，持有理由消失；
+  - `changed`（已变更）：公司实际业务演进已偏离原立项逻辑，需重新立项（`re-underwrite`）；
+  - `untested`（待验证）：本季财报未提供检验该支柱的有效经营证据；
+  - `retired`（已退役）：已完成历史使命并主动关闭（注明日期与原因）。
 
 ### 3. 整体 Thesis 状态对齐规则（反漂移合成）
 - **本条只约束 `aggregate_status`（支柱合成状态），不约束 `stance`（方向）和 `conviction`（确信度）**：支柱状态与 `house_view`（本方观点）的方向、确信度属于两个层面；支柱走弱时，`stance` 与 `conviction` 按 `dalton-conventions` §1 的决策推导独立评估（价格可能已跌到赔率转好的位置），不得机械联动下调。
@@ -70,7 +70,7 @@
   - 若有 **≥2 个核心支柱处于 `impaired`**，整体状态必须设为 `impaired`；
   - 若有**任一核心支柱处于 `broken` 或 `changed`**，整体状态必须同步设为 `broken` 或 `changed`。
 - **事件五词终判映射**：
-  - `NO_CHANGE`（无变化）、`THESIS_STRENGTHENED`（强化）、`THESIS_WEAKENED`（削弱）、`THESIS_BROKEN`（证伪）、`NEW_THESIS`（新论点）。
+  - JSON（`knowledge-revision.json` 与 `verdict`）填 `NO_CHANGE`、`THESIS_STRENGTHENED`、`THESIS_WEAKENED`、`THESIS_BROKEN`、`NEW_THESIS`；报告正文和推送正文只写中文（无变化、强化、削弱、证伪、新论点）。
   - 凡判 `THESIS_BROKEN` 或核心支柱进入 `impaired` / `broken`，必须触发 PM 升级通知与 `pm_handoffs`。
 
 ### 4. 股价反应必须先分解再作旁证
@@ -81,7 +81,7 @@
 每次财报后校准必须逐条给出 **`有` / `无`** 判断并附一句解释：
 1. **理由变了（The reason changed）**：当前继续看多/看空的理由是否已偏离最初立项时的核心支柱，却未做正式重估？
 2. **催化剂洗白（Catalyst laundering）**：原定在本季财报兑现的催化剂未达标，是否被悄悄替换成定性口号而非新的带日期验证点？
-3. **估值替代（Valuation substitution）**：当增长或利润率支柱走弱时，是否用“估值已经很便宜/P/E 低”来替原本的成长逻辑辩护？（免责条件：仅凭股价跌入事先登记的买点区间不能自动免责；必须在支柱失效后，于报告正文中重新完成三情景与三层保护分析，并将旧支柱状态改为 `changed`〔逻辑已变〕或 `retired`〔已关闭〕，才不算漂移。）
+3. **估值替代（Valuation substitution）**：当增长或利润率支柱走弱时，是否用“估值已经很便宜/P/E 低”来替原本的成长逻辑辩护？（免责条件：仅凭股价跌入事先登记的买点区间不能自动免责；必须在支柱失效后，于报告正文中重新完成三情景与三层保护分析，并将旧支柱状态改为 `changed`〔已变更〕或 `retired`〔已退役〕，才不算漂移。）
 4. **拿期限搪塞（Dismissal by horizon）**：面对连续出现的负面经营数据，是否一味以“短期季度噪音、我们看 3–5 年长期”为由拒绝下调支柱状态？
 5. **拿保护当理由（Protection as reason）**：对于原本为博取上行空间而建仓的标的，是否把“账上净现金多/有回购托底”当成了继续持有的主要理由？（回购授权不算托底，只认实际的股本缩减；免责条件同第 3 条。）
 

@@ -27,7 +27,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 - 核实最新发布的财年与财季标签（沿用公司自身命名，如 `FY26Q3`，严格区分财季与自然季）。
 - **先读事前冻结条目（`frozen_pre_event=true`）**：读取工作区 `data/debate.json`（`debate.md`）各分歧 `debates[].expectations[]` 中本次财报事件（`event_id`）对应的 `frozen_pre_event == true` 冻结条目，以及 `research/` 下最新的 `preview-<季度>/predictions.json`，锁定财报前已冻结的买方 bogey / 我方预期门槛与卖方一致预期。**严禁拿财报发布后（`published_at >= t0` 或 `acquired_at >= t0`）的卖方点评或 sales 邮件去倒推或改写事前预期门槛**；若财报前未冻结某项买方 bogey，写明“无事前冻结买方门槛”，只比较实际 vs Street。
 - 准备三组对比期间：**当季（Current Quarter）、上一季（Prior Quarter）、去年同期（Year-Ago Quarter）**。
-- 若美股正式 `10-Q` / `10-K` 尚未提交，使用财报 `8-K EX-99.1`（外国私人发行人用 `6-K` 业绩附件）；港股与 A 股使用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)` 调取的巨潮资讯（cninfo）定期报告/业绩公告或港交所披露易（HKEXnews）官方业绩公告，并在 `Sources` 中明确注明。
+- 若美股正式 `10-Q` / `10-K` 尚未提交，使用财报 `8-K EX-99.1`（外国私人发行人用 `6-K` 业绩附件）；港股与 A 股使用 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)` 调取的巨潮资讯（cninfo）定期报告/业绩公告或港交所披露易（HKEXnews）官方业绩公告，并在 `## 来源` 中明确注明。
 
 ### Step 2：一手披露先行（含上一季同比与上次指引）
 - **美股（含 ADR）**：通过 `dalton_sec.list_filings` / `researchdata.finance(route="sec")` 及公司 IR 页面获取当季财报新闻稿（Earnings Release）、财务补充表（Financial Supplement）和演示稿（Investor Presentation）。
@@ -39,7 +39,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 ### Step 3：电话会全文与 Q&A 提炼
 - 调用 `researchdata.research(route="transcript", ticker=T, limit=2)` 定位本次财报电话会（定位时必须核对每条候选的日期 `date`/`publish_time`、`kind`（区分官方业绩电话会 `company_call` 与券商回访 `broker_callback`）以及返回的 `coverage`：单次最多扫 10 页×50 条；若 `coverage.complete=false`，表示有界扫描未穷尽——零命中只能视为“本次有界检索未命中”而非无匹配，即使有候选也不能保证已拿到期间最新一场，需把 `coverage.continuation_params` 交给 `researchdata.research(route="alphaengine", operation="search_library", ...)` 续查或缩小 `start`/`end` 窗口，切勿把 `continuation_params` 传回 `transcript`），确认目标 `doc_id` 后用 `researchdata.research(route="alphaengine", operation="get_document", params={"doc_id": ..., "content_field": "auto", "offset": 0, "max_chars": 30000})` 按 `offset` / `next_offset` 分页读完全文（`doc_id` 必须保留完整字符串含 `_inst_` 后缀；`content_field` 仅接受 `"auto"|"original_text"|"content"|"digest"|"digest_cn"|"main_point"|"question_answer"` 各字段独立分页——若所选字段为空且返回 `warning` 与 `available_content_fields`，按映射改读有字符数的合法字段如 `original_text`、`digest` 或 `question_answer`，同一分页序列必须固定同一 `content_field` 按 `next_offset` 续读直到 `complete=true` 或 `next_offset` 为空，并核对 `content_sha256`）。
 - **`Q&A takeaways` 只从电话会 Q&A 部分提取**（提炼 5–10 个最有决策价值的管理层回答，每个话题 1–2 句，不把开场白塞进 Q&A）。
-- **逐级降级规则**：若触发时刻电话会全文尚未入库，依次退到公司 IR Webcast 回放、8-K 预备发言稿（Prepared Remarks），并在正文开头与 `Sources` 中如实写明“截至触发时刻电话会纪要尚未入库”。
+- **逐级降级规则**：若触发时刻电话会全文尚未入库，依次退到公司 IR Webcast 回放、8-K 预备发言稿（Prepared Remarks），并在正文开头与 `## 来源` 中如实写明“截至触发时刻电话会纪要尚未入库”。
 
 ### Step 4：卖方初评与独立研究点评（事后材料只进“反应分解”）
 - 调用 `researchdata.research(route="alphaengine", operation="search_library", ...)` 按公司名和 ticker 检索财报后报告（类别：`sell_side`、`sell_side_comment`、`sell_side_report`、`domestic_report`、`foreign_report`）。
@@ -50,10 +50,10 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 ### Step 5：Sales 与投资者反馈（严格时间窗与匿名纪律）
 - 调用 `researchdata.research(route="sales-notes", params={"layer": "raw", "media": "all"})` 检索时间窗 **`[T0, 触发时刻)`**（或发布后 24 小时内，`T0` 为官方财报发布时间戳）。
 - **合格标准**：只采纳包含机构销售台或买方客户真实反应、反复追问的问题、持仓/资金流观察、多空交锋、盈利质量看法的原始邮件；排除已在 AlphaEngine 覆盖的正式研报、纯新闻摘抄与会议通知。
-- **去重与匿名**：按邮件线程去重，**严禁点名终端买方客户身份**，统一标注 `anecdotal`，不得升级为卖方共识。
+- **去重与匿名**：按邮件线程去重，**严禁点名终端买方客户身份**，统一注明为“单方反馈（非市场共识）”，不得升级为卖方共识。
 - **空结果与失败区分**：
   - 若检索完成但无合格反馈：**直接省略 `Sales/Investor feedback` 整行（禁止写“未找到”或留空行）**；
-  - 若通路/工具报错无法访问：正文中不写“无反馈”，只在 `Sources` 中披露访问缺口。
+  - 若通路/工具报错无法访问：正文中不写“无反馈”，只在 `## 来源` 节中用一句人话披露访问缺口（如“本轮未取得销售台反馈：连接超时”，不写工具报错原文）。
 
 ### Step 6：按行业选择核心经营 KPI
 - 按 [`references/kpi-packs.md`](references/kpi-packs.md) 及公司自身披露核心指标，选取 **3–6 个关键经营 KPI**，列出当季绝对值、同比（YoY）、环比（QoQ）及**上一季同比增速**，并指出 1–2 个决定本季盈利质量的驱动项。
@@ -82,10 +82,10 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 - **快讯正文必须回答一问（线性还是切换）**：这次是沿着旧叙事线性演进，还是叙事 / 倍数 regime（市场给这类资产的定价规则）可能在切换？答“可能在切换”时，必须点名是哪一个触发器（本季哪个数字或指引变化）、指向哪个方向（升级 / 降级），以及需要什么证据来确认；检查方法见 `.agents/skills/dalton-conventions/references/nonlinear.md`。
 - **当天更新 `thesis.underwriting` 或写明不更新的理由**：
   - 若当季结果或新指引已足以修正三情景 EPS/倍数区间、基准股价 `anchor` 或三层保护，当天调用 `knowledge_update(doc="thesis", ...)`（先 `dry_run=True` 看赔率摘要，再正式写入）更新 `thesis.underwriting` 与 `thesis.house_view`；
-  - 若因正式 `10-Q` 分部细表未出、或需待次日 T+1 深度链（`dalton-earnings-deep`）完成三表模型重算后再改三情景价带，**必须在快讯正文与 `verdict.rationale` 中明确写明当天不更新 `underwriting` 的具体理由及次日更新计划**，不得静默跳过。
+  - 若因正式 `10-Q` 分部细表未出、或需待次日 T+1 深度链（`dalton-earnings-deep`）完成三表模型重算后再改三情景价带，**必须在快讯正文与 `verdict.rationale` 中明确写明当天不更新赔率卡的具体理由及次日更新计划**，不得静默跳过（正文写“赔率卡”，不写 `underwriting` 字段名）。
 - 给出事件五词结论（快讯阶段允许注明“初判”，由次日深度链终判）：
   - JSON 正式词形：`NO_CHANGE` / `THESIS_STRENGTHENED` / `THESIS_WEAKENED` / `THESIS_BROKEN` / `NEW_THESIS`
-  - Markdown 显示：无变化 / 强化 / 削弱 / 证伪 / 新论点
+  - 快讯正文与推送正文：只写中文（无变化 / 强化 / 削弱 / 证伪 / 新论点），且提到支柱或分歧时写出具体内容，不写 `P1`/`D1` 编号或英文枚举。
 - 调用 `knowledge_append_verdict` 写入初判（`trigger.kind="earnings"`，`trigger.ref` 填 `<dalton_wake>` 的 `t0` 信号 id 或 `"manual"`，附上 `payoff_assessment`），并在 `agenda_ops` 中保留次日深度链与前瞻完整对账待办。
 
 ### Step 11：确认或补建 T+1 深度链自动任务
@@ -104,12 +104,12 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 6. [ ] **Q&A 纯净度**：`Q&A takeaways` 全部来自电话会 Q&A 部分，未混入管理层开场白；
 7. [ ] **排除事前前瞻**：未将财报前发布的 preview 误标为财报后卖方初评；
 8. [ ] **Sales 时间窗精确**：`sales-notes` 检索严格遵循 `[T0, 触发时刻)` 原始时间戳；
-9. [ ] **Sales 反馈合规**：凡纳入的 sales/投资者反馈均可追溯至本轮读取的原邮件、标注了 `anecdotal`、隐去了终端客户身份、未升级为市场共识；
+9. [ ] **Sales 反馈合规**：凡纳入的 sales/投资者反馈均可追溯至本轮读取的原邮件、注明为“单方反馈（非市场共识）”、隐去了终端客户身份、未升级为市场共识；
 10. [ ] **无空反馈占位**：当 sales 检索无合格内容时，已完整省略该 bullet，未出现空的反馈行或“未找到”字样；
 11. [ ] **预测修正不混口径**：卖方盈利预测修正未混杂不同财年、不同币种或 GAAP 与 Adjusted 口径；
 12. [ ] **估值与价格核验**：最新股价（未复权常规收盘价）与远期 P/E 通过币种、ADR 换算比与股本类别核验；
 13. [ ] **缺失数据显式标注**：未披露或尚未入库的数据均已显式注明（如“未提供”、“卖方修正未出，次日深度点评补”），零脑补推断；
-14. [ ] **来源可一定位**：`Sources` 包含全部采用材料的直接 URL、SEC accession 或内部库 `doc_id` / `mail:ID`。
+14. [ ] **来源可追溯**：`## 来源` 节每行先写可读来源说明（来源类型、机构、标题、日期），直接 URL、SEC accession 或内部库 `doc_id` / `mail:ID` / `funda:ID` 放在该行末尾，正文段落里不写文档编号。
 
 ### 收尾门禁：汇报完成前必须过完成契约（`dalton_check_done`）
 

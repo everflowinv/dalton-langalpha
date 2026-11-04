@@ -89,9 +89,9 @@
 - **严禁把检索未命中直接写成"公司未披露"**：当工具未搜到某项数据时，只能表述为**"本轮未取得"**。
 - **`ok: false` 不等于"没有数据"**：
   - `researchdata` 返回 `ok: false` 时，`error` 会写明具体错误类别（`参数错误`、`上游不可用`、`权限或额度`、`没有匹配`），并附带 `hint` 指明下一步操作（换参数、换 `operation`、换数据源，或如实报告失败）。
-  - 智能体必须先按 `hint` 处理（例如不确定参数时查 `catalog(route=...)`，或根据 `normalized_params` 核对参数后重试，或切换备用数据源）；如果按 `hint` 处理后仍无法取数，**必须在报告里写明这个数据源取数失败**（及失败原因），**严禁把 `ok: false` 当成"没有数据"继续往下写，也严禁写成"没有相关信息"**。
+  - 智能体必须先按 `hint` 处理（例如不确定参数时查 `catalog(route=...)`，或根据 `normalized_params` 核对参数后重试，或切换备用数据源）；如果按 `hint` 处理后仍无法取数，**正文写"本轮未取得<具体数据名称>"，并在报告文末 `## 附注`（推送稿写在 `## 来源` 节，用一句人话说明）如实写明这个数据源取数失败及原因**（不在正文或来源节贴工具报错原文），**严禁把 `ok: false` 当成"没有数据"继续往下写，也严禁写成"没有相关信息"**。
   - **真正的"没有匹配"与出错分开**：查询执行成功但没有命中记录时，接口返回 `ok: true` 加空结果，并带上 `empty_reason`（如 `no_matching_records`、`no_matching_transcripts`）；此时可根据 `hint` 换公司名（`transcript` 仅来自 AlphaEngine，中英文公司名用 `|` 分隔）或扩大时间范围 `start`/`end` 重试。
-- 最终报告中的"未找到 / 本轮未取得"，必须如实限定在**本轮已实际检索的数据源与时间范围**内（例如："本轮检索 FY24–FY25 10-K 及近 90 天 AlphaEngine 研报未取得该分部退货率数据"）。
+- 最终报告中的"未找到 / 本轮未取得"，正文只写"本轮未取得<具体数据名称>"，检索的数据源与时间范围说明集中放在文末 `## 附注`（例如："本轮检索 FY24–FY25 10-K 及近 90 天卖方研报未取得该分部退货率数据"）。
 
 ---
 
@@ -158,7 +158,7 @@
 调用 `researchdata.macro(route="market-regime", operation="snapshot"|"us_topbottom"|"crowding"|"cn_leverage")` 引用市场状态、美股顶部/底部框架、指数拥挤度与 A 股杠杆监控时，必须严格遵守以下三条规则：
 
 1. **二手读数必须标注数据日期（`as_of` / `date` / `trade_date`）**：
-   - `market-regime` 是 OpenClaw 每日生成的监控二手读数（`document_id` 为 `regime:<op>:<date>`，`identity="derived"`，`publisher="OpenClaw"`），引用任何读数时必须显式标注对应的数据日期（如 `signals.json` 的 `date`、`as_of` 各分项日期、拥挤度的 `trade_date` 或去杠杆信号的 `date`）；当返回 `stale=true` 时，必须在正文中注明数据滞后及 `warnings`。
+   - `market-regime` 是 OpenClaw 每日生成的监控二手读数（`document_id` 为 `regime:<op>:<date>`，`identity="derived"`，`publisher="OpenClaw"`），引用任何读数时必须显式标注对应的数据日期（如 `signals.json` 的 `date`、`as_of` 各分项日期、拥挤度的 `trade_date` 或去杠杆信号的 `date`）；当返回 `stale=true` 时，正文注明数据日期与滞后情况，具体告警说明放进 `## 附注`（不在正文写 `stale=true` 或原样贴 `warnings`）。
 2. **顶部和底部的“阶段（`stage`）”是框架状态，不是预测**：
    - `us_topbottom`（`top_framework` / `bottom_framework`）中的 `stage`（如“无信号”、“预警”等）与 `summary` 仅代表监控框架当前所处的条件状态，绝不是对未来走势的概率预测，**严禁将其写成或解读为“上涨概率”或“下跌概率”**。
 3. **拥挤度 `probability_pct` 属于源站统计，必须原样标注来源**：

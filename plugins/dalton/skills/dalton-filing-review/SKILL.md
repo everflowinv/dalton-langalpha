@@ -66,7 +66,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 按 `.agents/skills/dalton-knowledge/SKILL.md` 读取本工作区 `thesis.md`（核心支柱与确认/警告/证伪阈值）和 `debate.md`：
 - 判断本次公告事实是否触及某条支柱或某条 debate；
-- 选定事件结论五词之一：`NO_CHANGE`（无变化）、`THESIS_STRENGTHENED`（强化）、`THESIS_WEAKENED`（削弱）、`THESIS_BROKEN`（证伪）、`NEW_THESIS`（新论点）。
+- 选定事件结论五词之一：`verdict.verdict` JSON 字段填 `NO_CHANGE`（无变化）、`THESIS_STRENGTHENED`（强化）、`THESIS_WEAKENED`（削弱）、`THESIS_BROKEN`（证伪）、`NEW_THESIS`（新论点）之一；审阅笔记与推送正文用中文五词及支柱/分歧内容表述，不写英文枚举或 `P1`/`D1` 编号。
 
 ### 第 4 步：输出公告审阅事件笔记
 

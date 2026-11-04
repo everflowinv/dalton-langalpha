@@ -86,9 +86,9 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
        --actuals research/<D>-deep-<quarter>/actuals.json \
        --output research/<D>-deep-<quarter>/reconcile.md
      ```
-   - 每条预测明确判定 **`对` / `错` / `部分`**，凡判为“错”或“部分”的写明具体错因（`数据错` / `模型错` / `判断错` / `意外事件`）并生成 `lessons` 候选；同时将错判与部分命中的计数写入 `research/<D>-deep-<quarter>/reconcile.json`（格式为 `{"wrong": <错的条数>, "partial": <部分的条数>}`）。若本次财报前无 `predictions.json`，在 `reconcile.md` 与报告中说明“本次财报前无 predictions.json，跳过前瞻对账”，并将 `research/<D>-deep-<quarter>/reconcile.json` 写为 `{"wrong": 0, "partial": 0}`。
+   - 每条预测明确判定 **`对` / `错` / `部分`**，凡判为“错”或“部分”的写明具体错因（`数据错` / `模型错` / `判断错` / `意外事件`）并生成 `lessons` 候选；同时将错判与部分命中的计数写入 `research/<D>-deep-<quarter>/reconcile.json`（格式为 `{"wrong": <错的条数>, "partial": <部分的条数>}`）。若本次财报前无 `predictions.json`，在 `reconcile.md` 与报告正文中说明“本次财报前未锁定前瞻预测，跳过前瞻对账”（正文不写 `predictions.json` 文件名），并将 `research/<D>-deep-<quarter>/reconcile.json` 写为 `{"wrong": 0, "partial": 0}`。
 2. **Thesis 财报后校准（`thesis-calibration.md`）**：
-   - 按 `references/calibration.md` 第二节（财报后校准规则），先拆解盈利质量（税率/回购带来的 EPS beat 不得将经营支柱判为 confirming），再对 `thesis.md` 每个支柱给出信号词（`strongly confirming` … `invalidating` / `untested`）与状态词（`strengthening` / `intact` / `watch` / `impaired` / `broken` / `changed` / `untested` / `retired`），并逐一排查五种漂移模式（有/无）。
+   - 按 `references/calibration.md` 第二节（财报后校准规则），先拆解盈利质量（税率/回购带来的 EPS 超预期〔beat〕不得将经营支柱判为 `confirming`〔验证〕），再对 `thesis.md` 每个支柱给出信号词（JSON 填 `references/calibration.md` 第二节第 2 条规定的 10 个枚举之一，报告正文写对应知识层渲染中文）与状态词（JSON 填该节规定的 8 个枚举之一，报告正文表格写一句话支柱主张与对应知识层渲染中文，不写 `P1` 编号或英文枚举），并逐一排查五种漂移模式（有/无）。
 3. **管理层指引兑现记录更新（`management-delta.md`）**：
    - 对比本季实际表现与上一季给出的官方指引中点/区间，记录偏差幅度与方向，判断管理层指引保守/激进风格是否延续。
 
