@@ -26,7 +26,7 @@ import { useThreadDeleteConfirm } from './threadDeleteAction';
 import { deleteThreadRow } from '../hooks/deleteThreadRow';
 import ChatInput from '../../../components/ui/chat-input';
 import type { ChatInputHandle } from '../../../components/ui/chat-input';
-import type { ComposerSend } from '../../../components/ui/chat-input.types';
+import type { ComposerSend, ContextPayload } from '../../../components/ui/chat-input.types';
 import { attachmentsToContexts } from '../utils/fileUpload';
 import FilePanel, { SYSTEM_DIR_PREFIXES } from './FilePanel';
 import { clampPanelWidth as clampPanelWidthUtil } from '@/lib/panelUtils';
@@ -228,8 +228,8 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
   const containerWidthRef = useRef<number>(0);
   const DIVIDER_WIDTH = 4; // px -- matches w-[4px] divider
   const chatInputRef = useRef<ChatInputHandle>(null);
-  const handleAddContext = useCallback((ctx: Record<string, unknown>) => {
-    chatInputRef.current?.addContext(ctx as any); // TODO: type properly
+  const handleAddContext = useCallback((ctx: ContextPayload) => {
+    chatInputRef.current?.addContext(ctx);
   }, []);
 
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -1019,6 +1019,7 @@ function ThreadGallery({ workspaceId, onBack, onThreadSelect }: ThreadGalleryPro
                 filesError={panelFilesError}
                 onRefreshFiles={refreshPanelFiles}
                 onAddContext={teamReadOnly.isColleague ? null : (handleAddContext as any)} // DALTON-HOOK(workspace-sharing-settings)
+                agentName={isHome ? t('agents.chiefOfStaff') : t('agents.analyst')}
                 showSystemFiles={showSystemFiles}
                 onToggleSystemFiles={() => {
                   setShowSystemFiles((v) => {

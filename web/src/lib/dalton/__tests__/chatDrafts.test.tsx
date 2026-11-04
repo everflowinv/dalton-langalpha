@@ -1,13 +1,17 @@
 import React from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { createRef } from 'react';
 import { MemoryRouter } from 'react-router';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import ChatInput, { type ChatInputProps } from '@/components/ui/chat-input';
+import ChatInput, { type ChatInputHandle, type ChatInputProps } from '@/components/ui/chat-input';
 import ChatInputCard from '@/pages/Dashboard/components/ChatInputCard';
 import { queryKeys } from '@/lib/queryKeys';
+import { quoteToken } from '@/components/ui/chat-input.quoteTokens';
+import type { QuoteMention } from '@/components/ui/chat-input.types';
 import {
   DRAFT_SAVE_DEBOUNCE_MS,
+  DRAFT_STORAGE_PREFIX_V1,
   DRAFT_TTL_MS,
   MAX_DRAFT_BYTES,
   buildDraftStorageKey,
@@ -51,15 +55,16 @@ function createQueryClient(userId?: string) {
 
 function renderComposer(
   props: Partial<ChatInputProps> = {},
-  options: { userId?: string; queryClient?: QueryClient } = {},
+  options: { userId?: string; queryClient?: QueryClient; ref?: React.Ref<ChatInputHandle> } = {},
 ) {
   const queryClient = options.queryClient ?? createQueryClient(options.userId);
   const onSend = props.onSend ?? vi.fn<ChatInputProps['onSend']>().mockReturnValue(true);
+  const ref = options.ref ?? createRef<ChatInputHandle>();
 
   const utils = render(
     <QueryClientProvider client={queryClient}>
       <MemoryRouter>
-        <ChatInput onSend={onSend} {...props} />
+        <ChatInput ref={ref} onSend={onSend} {...props} />
       </MemoryRouter>
     </QueryClientProvider>,
   );
@@ -70,7 +75,7 @@ function renderComposer(
     utils.rerender(
       <QueryClientProvider client={queryClient}>
         <MemoryRouter>
-          <ChatInput onSend={nextProps.onSend ?? onSend} {...props} {...nextProps} />
+          <ChatInput ref={ref} onSend={nextProps.onSend ?? onSend} {...props} {...nextProps} />
         </MemoryRouter>
       </QueryClientProvider>,
     );
@@ -80,6 +85,7 @@ function renderComposer(
     ...utils,
     onSend,
     queryClient,
+    ref,
     getTextarea,
     rerenderComposer,
   };
@@ -110,7 +116,8 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
     first.unmount();
 
     const storageKey = buildDraftStorageKey('thread:t-1', 'u-1');
-    expect(storageKey).toBe('dalton.chatDraft.v1:u-1:thread:t-1');
+    // v2 format: quote chips and the attachments-lost hint ride the stored draft.
+    expect(storageKey).toBe('dalton.chatDraft.v2:u-1:thread:t-1');
     expect(load('thread:t-1', 'u-1')).toBe('half-typed analysis for @report.md ');
 
     // 2. Remount with the same draftKey -> content is restored
@@ -801,5 +808,178 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
     expect(screen.queryByTestId('in-flight-draft-notice')).toBeNull();
     expect(load('thread:in-flight-send', 'u-1')).toBe('');
     restoredForSend.unmount();
+  });
+});
+
+// sync3 B15: the stored draft is v2 — beside its text it keeps the quote chips
+// the text still holds (token included) and whether attachments stood beside
+// them. A v1 entry is the draft's earlier, text-only self: it restores as
+// plain text until a v2 save replaces it. Attachments are never persisted; a
+// restore that had them says to add them again instead of leaving placeholder
+// words in the draft.
+describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
+  const ANALYST = { kind: 'message', speaker: 'Analyst' } as const;
+
+  /** A QuoteMention exactly as the composer mints it, on the token it would. */
+  const heldQuote = (snippet: string): QuoteMention => ({
+    kind: 'quote',
+    token: quoteToken(snippet, []),
+    snippet,
+    from: ANALYST,
+  });
+
+  /** Stages an attachment through the composer's hidden file input. */
+  const attachFile = (view: ReturnType<typeof renderComposer>, name = 'page.txt') => {
+    const input = view.container.querySelector<HTMLInputElement>('input[type="file"]')!;
+    fireEvent.change(input, {
+      target: { files: [new File(['x'], name, { type: 'text/plain' })] },
+    });
+  };
+
+  beforeEach(() => {
+    localStorage.clear();
+    Element.prototype.scrollIntoView = vi.fn();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    localStorage.clear();
+  });
+
+  it('restores a v1 entry as plain text after a reload, and the next save writes v2', () => {
+    vi.useFakeTimers();
+    localStorage.setItem(
+      buildDraftStorageKey('thread:t-v1', 'u-1', DRAFT_STORAGE_PREFIX_V1),
+      JSON.stringify({ text: '从 v1 恢复的文字', savedAt: Date.now() }),
+    );
+
+    const view = renderComposer({ draftKey: 'thread:t-v1' }, { userId: 'u-1' });
+    expect(view.getTextarea().value).toBe('从 v1 恢复的文字');
+    // Plain text only: no quote chips came back, and no notices stand on it.
+    expect(document.querySelectorAll('.draft-token-quote')).toHaveLength(0);
+    expect(screen.queryByTestId('in-flight-draft-notice')).toBeNull();
+    expect(screen.queryByTestId('attachments-lost-notice')).toBeNull();
+
+    // The restored draft is ordinary: editing it re-saves under the v2 key.
+    fireEvent.change(view.getTextarea(), {
+      target: { value: '从 v1 恢复的文字，改过', selectionStart: 12 },
+    });
+    act(() => {
+      vi.advanceTimersByTime(DRAFT_SAVE_DEBOUNCE_MS);
+    });
+    expect(
+      localStorage.getItem(buildDraftStorageKey('thread:t-v1', 'u-1')),
+    ).toContain('从 v1 恢复的文字，改过');
+    view.unmount();
+    vi.useRealTimers();
+  });
+
+  it('prefers the v2 entry over a stale v1 entry under the same draftKey', () => {
+    localStorage.setItem(
+      buildDraftStorageKey('thread:t-both', 'u-1', DRAFT_STORAGE_PREFIX_V1),
+      JSON.stringify({ text: 'v1 的旧文字', savedAt: Date.now() }),
+    );
+    const quote = heldQuote('Revenue grew');
+    save('thread:t-both', `${quote.token} why?`, 'u-1', Date.now(), { parts: { quotes: [quote] } });
+
+    const view = renderComposer({ draftKey: 'thread:t-both' }, { userId: 'u-1' });
+    expect(view.getTextarea().value).toBe(`${quote.token} why?`);
+    expect(document.querySelectorAll('.draft-token-quote')).toHaveLength(1);
+    view.unmount();
+  });
+
+  it('restores a v2 draft with its quote chips after a reload, and a send spells the quote back out', () => {
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockReturnValue(true);
+    const ref = createRef<ChatInputHandle>();
+    const view = renderComposer({ draftKey: 'thread:t-q2', onSend }, { userId: 'u-1', ref });
+
+    // Stage a quote the way a selection does, then words around its token.
+    act(() => {
+      ref.current!.addContext({ kind: 'quote', snippet: 'Revenue grew by a lot', from: ANALYST });
+    });
+    const withToken = view.getTextarea().value;
+    expect(withToken).toContain('\u2060');
+    fireEvent.change(view.getTextarea(), {
+      target: { value: `${withToken}说了什么`, selectionStart: (withToken + '说了什么').length },
+    });
+    view.unmount();
+
+    // The stored entry is v2 and carries the quote with its token.
+    const stored = JSON.parse(
+      localStorage.getItem(buildDraftStorageKey('thread:t-q2', 'u-1')) ?? '{}',
+    ) as { text?: string; quotes?: QuoteMention[] };
+    expect(stored.text).toBe(`${withToken}说了什么`);
+    expect(stored.quotes).toHaveLength(1);
+    expect(stored.quotes![0]).toMatchObject({ kind: 'quote', snippet: 'Revenue grew by a lot' });
+
+    // Reload (remount): the text is back with the chip on its token, and a
+    // send of it carries the quote block the chip stands for.
+    const reopened = renderComposer({ draftKey: 'thread:t-q2', onSend }, { userId: 'u-1' });
+    expect(reopened.getTextarea().value).toBe(`${withToken}说了什么`);
+    expect(document.querySelectorAll('.draft-token-quote')).toHaveLength(1);
+    fireEvent.click(screen.getByLabelText('Send message'));
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onSend.mock.calls[0][0].message).toContain(
+      '<quote source="Analyst">Revenue grew by a lot</quote>',
+    );
+    expect(onSend.mock.calls[0][0].message).toContain('说了什么');
+    reopened.unmount();
+  });
+
+  it('shows the attachments-again notice on a restored draft that had attachments, and hides it once files are beside it again', async () => {
+    const view = renderComposer({ draftKey: 'thread:t-att' }, { userId: 'u-1' });
+    attachFile(view, 'page.txt');
+    fireEvent.change(view.getTextarea(), {
+      target: { value: 'draft that went with a file', selectionStart: 26 },
+    });
+    view.unmount();
+
+    const reopened = renderComposer({ draftKey: 'thread:t-att' }, { userId: 'u-1' });
+    expect(reopened.getTextarea().value).toBe('draft that went with a file');
+    const notice = screen.getByTestId('attachments-lost-notice');
+    expect(notice.textContent).toBe(
+      'Attachments are not kept in drafts — add them again before sending.',
+    );
+    // No placeholder words stand in for the file: the draft is its text alone.
+    expect(reopened.getTextarea().value).not.toContain('page.txt');
+    expect(screen.queryByText('page.txt')).toBeNull();
+
+    // The notice leaves with the file that replaces it.
+    attachFile(reopened, 'page-again.txt');
+    await waitFor(() => {
+      expect(screen.queryByTestId('attachments-lost-notice')).toBeNull();
+    });
+    expect(screen.getByText('page-again.txt')).toBeTruthy();
+    reopened.unmount();
+  });
+
+  it('a failed send of a draft with a quote and attachments restores the text in place, and the reload brings the chip and the notice back', () => {
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockReturnValue(false);
+    const ref = createRef<ChatInputHandle>();
+    const view = renderComposer({ draftKey: 'thread:t-fail', onSend }, { userId: 'u-1', ref });
+
+    act(() => {
+      ref.current!.addContext({ kind: 'quote', snippet: 'Margins slipped', from: ANALYST });
+    });
+    const withToken = view.getTextarea().value;
+    fireEvent.change(view.getTextarea(), {
+      target: { value: `${withToken}why?`, selectionStart: (withToken + 'why?').length },
+    });
+    attachFile(view, 'exhibit.txt');
+    fireEvent.click(screen.getByLabelText('Send message'));
+    expect(onSend).toHaveBeenCalledTimes(1);
+
+    // The refused send puts its text straight back, token and all.
+    expect(view.getTextarea().value).toBe(`${withToken}why?`);
+    view.unmount();
+
+    // What a reload restores is the draft as it was sent: the quote chip on
+    // its token, and the notice that the attachment did not survive.
+    const reopened = renderComposer({ draftKey: 'thread:t-fail' }, { userId: 'u-1' });
+    expect(reopened.getTextarea().value).toBe(`${withToken}why?`);
+    expect(document.querySelectorAll('.draft-token-quote')).toHaveLength(1);
+    expect(screen.getByTestId('attachments-lost-notice')).toBeTruthy();
+    reopened.unmount();
   });
 });

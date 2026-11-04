@@ -25,6 +25,7 @@ vi.mock('../utils/threadStorage', () => ({
 vi.mock('../../utils/api', async () => (await import('./chatHookHarness')).apiMockModule());
 
 import { replayThreadHistory, sendChatMessageStream } from '../../utils/api';
+import { quoteToken } from '@/components/ui/chat-input.quoteTokens';
 import { useChatMessages } from '../useChatMessages';
 
 const mockReplay = replayThreadHistory as Mock;
@@ -78,7 +79,7 @@ describe('useChatMessages: a refused send goes back to the composer whole', () =
               preview: null,
             },
           ],
-          mentions: [{ path: 'reports/q3.html', snippet: 'the table' }],
+          mentions: [{ kind: 'file', path: 'reports/q3.html' }],
           commands: [{ type: 'skill', name: 'chart-annotation', skillName: 'chart-annotation' }],
         },
       });
@@ -88,7 +89,59 @@ describe('useChatMessages: a refused send goes back to the composer whole', () =
     expect(result.current.returnedDraft?.text).toBe('see the attached page');
     expect(result.current.returnedDraft?.files).toHaveLength(1);
     expect(result.current.returnedDraft?.files[0].file.name).toBe('page.png');
-    expect(result.current.returnedDraft?.mentions[0].path).toBe('reports/q3.html');
+    // #676 (sync3 B15) made a mention a file, a quote or a chip; this one is a file.
+    const mention = result.current.returnedDraft?.mentions[0];
+    expect(mention && 'path' in mention ? mention.path : undefined).toBe('reports/q3.html');
     expect(result.current.returnedDraft?.commands[0].skillName).toBe('chart-annotation');
+  });
+
+  // sync3 B15: a quote chip rides the draft as a mention with its token — a
+  // refused send gives it back with the attachment it went out with, so the
+  // composer's giveBack can seat both again.
+  it('returns a quote mention with its token beside the attachment when the docked send is refused', async () => {
+    mockSend.mockImplementation(refusedInStream);
+    const { result } = await mountDocked();
+
+    const token = quoteToken('Revenue grew', []);
+    await act(async () => {
+      await result.current.handleSendMessage('about this quote', null, null, {
+        model: null,
+        reasoningEffort: null,
+        fastMode: null,
+        draft: {
+          text: `${token} and the exhibit`,
+          files: [
+            {
+              file: new File(['x'], 'exhibit.txt', { type: 'text/plain' }),
+              dataUrl: 'data:text/plain;base64,eA==',
+              type: 'text/plain',
+              preview: null,
+            },
+          ],
+          mentions: [
+            {
+              kind: 'quote',
+              token,
+              snippet: 'Revenue grew',
+              from: { kind: 'message', speaker: 'Analyst' },
+            },
+          ],
+          commands: [],
+        },
+      });
+    });
+
+    const back = result.current.returnedDraft;
+    expect(back).not.toBeNull();
+    expect(back?.text).toBe(`${token} and the exhibit`);
+    expect(back?.files).toHaveLength(1);
+    expect(back?.files[0].file.name).toBe('exhibit.txt');
+    expect(back?.mentions).toHaveLength(1);
+    expect(back?.mentions[0]).toMatchObject({
+      kind: 'quote',
+      token,
+      snippet: 'Revenue grew',
+      from: { kind: 'message', speaker: 'Analyst' },
+    });
   });
 });

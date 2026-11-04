@@ -406,4 +406,123 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
       expect(load(DRAFT_KEY)).toBe('held while compacting');
     });
   });
+
+  // #675 sends the response headers while the stream is still setting up, so a
+  // drop after them is no longer proof the server took the send. The conclusion
+  // the draft takes is the one the stream itself reported — a first metadata
+  // frame, a recovery naming the run — or the one a scheduled resend or an
+  // adopted duplicate settles for it.
+  describe('a send that only saw the response headers', () => {
+    const DRAFT_KEY = 'thread:headers-only';
+
+    /** The chat hook bound to a real composer draft, the way ChatInput wires them. */
+    function useDraftChatHarness() {
+      const chat = useChatMessages('ws-test');
+      const composer = useComposerDraft({ draftKey: DRAFT_KEY });
+      return { chat, composer };
+    }
+
+    beforeEach(() => {
+      localStorage.clear();
+    });
+
+    afterEach(() => {
+      localStorage.clear();
+    });
+
+    it('settles accepted when the auto-resend takes the send over (the resend goes out under the first key)', async () => {
+      // No frame at all — only the headers — then the body drops.
+      mockSendStream.mockImplementation(async () => ({ disconnected: true }));
+
+      const accepted = vi.fn();
+      const { result, unmount } = renderHookWithProviders(() => useChatMessages('ws-test'));
+
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        let outcome: boolean | undefined;
+        await act(async () => {
+          outcome = await result.current.handleSendMessage('dropped in setup', null, null, {
+            onAccepted: accepted,
+          });
+        });
+
+        // The dropped-before-run resend owns the message from here — the draft
+        // settles sent against it, not against the headers.
+        expect(accepted).toHaveBeenCalledTimes(1);
+        expect(outcome).toBe(true);
+        expect(result.current.isLoading).toBe(true);
+      } finally {
+        // The pending backoff timer dies with the fake clock; nothing resends.
+        vi.useRealTimers();
+      }
+      unmount();
+    });
+
+    it('does not settle accepted when no resend can take the send — the draft returns to the composer', async () => {
+      // A manual-recovery notice arrived before the drop, so the scheduled
+      // auto-resend does not apply and nothing the stream reported says the
+      // server kept the send.
+      mockSendStream.mockImplementation(
+        async (_msg: string, _ws: string, _tid: string | null, opts: StreamOptions) => {
+          opts.onEvent?.({ event: 'retry', message: 'Temporary error', recovery: 'resend' } as never);
+          return { disconnected: true };
+        },
+      );
+
+      const accepted = vi.fn();
+      const { result } = renderHookWithProviders(() => useDraftChatHarness());
+      act(() => {
+        result.current.composer.setMessage('headers only, then dropped');
+      });
+      let sendPromise!: Promise<boolean>;
+      let outcome: boolean | undefined;
+      await act(async () => {
+        result.current.composer.submitWithDraft((onAccepted) => {
+          sendPromise = result.current.chat.handleSendMessage('headers only, then dropped', null, null, {
+            onAccepted: () => {
+              onAccepted();
+              accepted();
+            },
+          });
+          return sendPromise;
+        });
+        outcome = await sendPromise;
+      });
+
+      expect(accepted).not.toHaveBeenCalled();
+      expect(outcome).toBe(false);
+      // The draft came back: in the input and still stored.
+      expect(result.current.composer.message).toBe('headers only, then dropped');
+      expect(load(DRAFT_KEY)).toBe('headers only, then dropped');
+    });
+
+    it('settles accepted when a duplicate request is adopted — the server already took a copy', async () => {
+      mockSendStream.mockRejectedValue(
+        Object.assign(new Error('This request was already accepted'), {
+          status: 409,
+          errorInfo: {
+            code: 'duplicate_request',
+            message: 'This request was already accepted; reconnect to the existing run instead of resending.',
+            thread_id: 'th-dup',
+            run_id: 'run-dup',
+            run_status: 'in_progress',
+          },
+        }),
+      );
+
+      const accepted = vi.fn();
+      const { result } = renderHookWithProviders(() => useChatMessages('ws-test'));
+
+      let outcome: boolean | undefined;
+      await act(async () => {
+        outcome = await result.current.handleSendMessage('the copy that got through', null, null, {
+          onAccepted: accepted,
+        });
+      });
+
+      expect(accepted).toHaveBeenCalledTimes(1);
+      expect(outcome).toBe(true);
+      expect(result.current.messageError).toBe(null);
+    });
+  });
 });

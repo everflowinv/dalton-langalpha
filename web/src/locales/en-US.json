@@ -2208,7 +2208,8 @@
       "messageLabel": "Message to the agent",
       "dropFiles": "Drop files to upload",
       "uploading": "Uploading",
-      "inFlightDraftRestored": "Your last send may already have gone through. Check the conversation before sending it again."
+      "inFlightDraftRestored": "Your last send may already have gone through. Check the conversation before sending it again.",
+      "draftAttachmentsRestored": "Attachments are not kept in drafts — add them again before sending."
     },
     "mention": {
       "noMatching": "No matching files",
@@ -2847,12 +2848,29 @@
     }
   },
   "context": {
+    "quote": {
+      "toolbar": "Selected text",
+      "blockToolbar": "Text actions",
+      "quoteAction": "Quote",
+      "copy": "Copy",
+      "copied": "Copied",
+      "copyFailed": "Couldn't copy the text",
+      "more": "More",
+      "from": "Quote from {{name}}",
+      "you": "you",
+      "reply": "Reply to {{name}}",
+      "replyGeneric": "Reply",
+      "sourceAgent": "{{name}}'s response",
+      "sourceUser": "User's message",
+      "replyToImage": "Reply to this image",
+      "imageFailed": "Couldn't add the image",
+      "addToMessage": "Add to message"
+    },
     "addToContext": "Add to context",
     "addLinesToContext": "Add L{{start}}-{{end}} to context",
     "addLineToContext": "Add L{{line}} to context",
     "addNLinesToContext": "Add {{count}} lines to context",
     "openFile": "Open file",
-    "fromAgentResponse": "From agent response",
     "pastedText": "Pasted text",
     "chartInPanel": "Chart in panel",
     "pastedLines_one": "Pasted text · {{count}} line",

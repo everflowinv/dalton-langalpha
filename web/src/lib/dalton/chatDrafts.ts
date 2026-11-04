@@ -9,22 +9,62 @@ import {
 } from 'react';
 import * as z from 'zod/mini';
 import { useUser } from '@/hooks/useUser';
+import type { QuoteMention } from '@/components/ui/chat-input.types';
 
-export const DRAFT_STORAGE_PREFIX = 'dalton.chatDraft.v1:';
+export const DRAFT_STORAGE_PREFIX = 'dalton.chatDraft.v2:';
+/** Where the pre-quote format (text only) lives; read back as plain text until overwritten. */
+export const DRAFT_STORAGE_PREFIX_V1 = 'dalton.chatDraft.v1:';
 export const DRAFT_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 export const MAX_DRAFT_BYTES = 100 * 1024; // 100 KB
 export const DRAFT_SAVE_DEBOUNCE_MS = 300; // 300 ms
+
+const StoredQuoteOriginSchema = z.union([
+  z.object({
+    kind: z.literal('file'),
+    path: z.string(),
+    label: z.string(),
+    // Null is what QuoteOrigin allows (a file quoted without lines read back);
+    // rejecting it here would drop the whole stored draft on one such quote.
+    lineStart: z.optional(z.nullable(z.number())),
+    lineEnd: z.optional(z.nullable(z.number())),
+    lineCount: z.number(),
+  }),
+  z.object({
+    kind: z.literal('message'),
+    speaker: z.string(),
+    message: z.optional(z.string()),
+  }),
+]);
+
+const StoredDraftQuoteSchema = z.object({
+  kind: z.literal('quote'),
+  token: z.string(),
+  snippet: z.string(),
+  reply: z.optional(z.string()),
+  from: StoredQuoteOriginSchema,
+});
 
 export const StoredChatDraftSchema = z.object({
   text: z.string(),
   savedAt: z.number(),
   inFlight: z.optional(z.boolean()),
+  /** Quote mentions held in the draft, token included, so a restore brings the chips back. */
+  quotes: z.optional(z.array(StoredDraftQuoteSchema)),
+  /** The draft had attachments when it was saved; they are not kept, so a restore says to add them again. */
+  hadAttachments: z.optional(z.boolean()),
 });
 
 export type StoredChatDraft = z.output<typeof StoredChatDraftSchema>;
 
+/** The rich parts of a draft beyond its text, read at save time from the composer. */
+export interface DraftParts {
+  quotes?: QuoteMention[];
+  hadAttachments?: boolean;
+}
+
 export interface SaveDraftOptions {
   inFlight?: boolean;
+  parts?: DraftParts;
 }
 
 interface DraftController {
@@ -43,8 +83,9 @@ function normalizeUserId(userId?: string | null): string {
 export function buildDraftStorageKey(
   draftKey: string,
   userId?: string | null,
+  prefix: string = DRAFT_STORAGE_PREFIX,
 ): string {
-  return `${DRAFT_STORAGE_PREFIX}${normalizeUserId(userId)}:${draftKey}`;
+  return `${prefix}${normalizeUserId(userId)}:${draftKey}`;
 }
 
 function getLocalStorage(): Storage | null {
@@ -99,15 +140,19 @@ function clearStorageEntry(
   if (!storage) return;
   if (userId !== undefined) {
     safeRemoveItem(storage, buildDraftStorageKey(draftKey, userId));
+    // A v1 entry under the same id goes too, so a cleared draft cannot come back on the next read.
+    safeRemoveItem(storage, buildDraftStorageKey(draftKey, userId, DRAFT_STORAGE_PREFIX_V1));
     return;
   }
   safeRemoveItem(storage, buildDraftStorageKey(draftKey, 'anon'));
+  safeRemoveItem(storage, buildDraftStorageKey(draftKey, 'anon', DRAFT_STORAGE_PREFIX_V1));
   try {
     const suffix = `:${draftKey}`;
+    const prefixes = [DRAFT_STORAGE_PREFIX, DRAFT_STORAGE_PREFIX_V1];
     const matchingKeys: string[] = [];
     for (let i = 0; i < storage.length; i += 1) {
       const k = storage.key(i);
-      if (k && k.startsWith(DRAFT_STORAGE_PREFIX) && k.endsWith(suffix)) {
+      if (k && prefixes.some((p) => k.startsWith(p)) && k.endsWith(suffix)) {
         matchingKeys.push(k);
       }
     }
@@ -127,25 +172,29 @@ function loadStoredDraft(
   if (!draftKey) return null;
   const storage = getLocalStorage();
   if (!storage) return null;
-  const storageKey = buildDraftStorageKey(draftKey, userId);
-  try {
-    const raw = storage.getItem(storageKey);
-    if (!raw) return null;
-    const parsed = parseStoredDraft(raw);
-    if (
-      !parsed ||
-      !parsed.text ||
-      !parsed.text.trim() ||
-      now - parsed.savedAt > DRAFT_TTL_MS
-    ) {
+  // v2 first; a v1 entry (text only) is the draft's earlier self, restored as plain text.
+  const read = (prefix: string): StoredChatDraft | null => {
+    const storageKey = buildDraftStorageKey(draftKey!, userId, prefix);
+    try {
+      const raw = storage.getItem(storageKey);
+      if (!raw) return null;
+      const parsed = parseStoredDraft(raw);
+      if (
+        !parsed ||
+        !parsed.text ||
+        !parsed.text.trim() ||
+        now - parsed.savedAt > DRAFT_TTL_MS
+      ) {
+        safeRemoveItem(storage, storageKey);
+        return null;
+      }
+      return parsed;
+    } catch {
       safeRemoveItem(storage, storageKey);
       return null;
     }
-    return parsed;
-  } catch {
-    safeRemoveItem(storage, storageKey);
-    return null;
-  }
+  };
+  return read(DRAFT_STORAGE_PREFIX) ?? read(DRAFT_STORAGE_PREFIX_V1);
 }
 
 /**
@@ -186,9 +235,9 @@ export function clear(
 
 /**
  * Save a composer draft for `(userId, draftKey)`.
- * Clears the stored draft when `text` is empty or exceeds 100 KB (so an older
- * draft under the same key cannot resurrect), and silently degrades if
- * `localStorage` is unavailable or full.
+ * Clears the stored draft when `text` is empty or the stored payload exceeds
+ * 100 KB (so an older draft under the same key cannot resurrect), and silently
+ * degrades if `localStorage` is unavailable or full.
  */
 export function save(
   draftKey: string | null | undefined,
@@ -202,7 +251,22 @@ export function save(
     clearStorageEntry(draftKey, userId ?? 'anon');
     return false;
   }
-  if (getUtf8ByteLength(text) > MAX_DRAFT_BYTES) {
+  const parts = options?.parts;
+  const payload: StoredChatDraft = {
+    text,
+    savedAt: now,
+    ...(options?.inFlight ? { inFlight: true } : {}),
+    ...(parts?.quotes?.length ? { quotes: parts.quotes } : {}),
+    ...(parts?.hadAttachments ? { hadAttachments: true } : {}),
+  };
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(payload);
+  } catch {
+    clearStorageEntry(draftKey, userId ?? 'anon');
+    return false;
+  }
+  if (getUtf8ByteLength(serialized) > MAX_DRAFT_BYTES) {
     clearStorageEntry(draftKey, userId ?? 'anon');
     return false;
   }
@@ -210,10 +274,7 @@ export function save(
   if (!storage) return false;
   const storageKey = buildDraftStorageKey(draftKey, userId);
   try {
-    const payload: StoredChatDraft = options?.inFlight
-      ? { text, savedAt: now, inFlight: true }
-      : { text, savedAt: now };
-    storage.setItem(storageKey, JSON.stringify(payload));
+    storage.setItem(storageKey, serialized);
     return true;
   } catch {
     return false;
@@ -221,8 +282,8 @@ export function save(
 }
 
 /**
- * Scan `localStorage` for `dalton.chatDraft.v1:*` keys and remove any expired
- * (> 7 days) or malformed entries.
+ * Scan `localStorage` for `dalton.chatDraft.v1:*` and `dalton.chatDraft.v2:*`
+ * keys and remove any expired (> 7 days) or malformed entries.
  */
 export function pruneExpired(now: number = Date.now()): number {
   const storage = getLocalStorage();
@@ -230,9 +291,10 @@ export function pruneExpired(now: number = Date.now()): number {
   let removed = 0;
   try {
     const keys: string[] = [];
+    const prefixes = [DRAFT_STORAGE_PREFIX, DRAFT_STORAGE_PREFIX_V1];
     for (let i = 0; i < storage.length; i += 1) {
       const k = storage.key(i);
-      if (k && k.startsWith(DRAFT_STORAGE_PREFIX)) {
+      if (k && prefixes.some((p) => k.startsWith(p))) {
         keys.push(k);
       }
     }
@@ -278,6 +340,12 @@ export interface UseComposerDraftOptions {
   draftKey?: string;
   prefillMessage?: string;
   onDraftKeySwitch?: () => void;
+  /**
+   * The rich parts of the draft as it stands now, read when a save flushes —
+   * so what a restore brings back (quote chips, the attachments-lost hint)
+   * tracks the draft at the moment it was kept, not when the save was queued.
+   */
+  getDraftParts?: () => DraftParts;
 }
 
 export interface PendingSendHandle {
@@ -298,6 +366,8 @@ interface InFlightSendState {
   userId: string;
   sentText: string;
   settled: boolean;
+  /** The draft's rich parts at send: what its restore brings back. */
+  parts: DraftParts;
 }
 
 export function settleSendResult(
@@ -328,6 +398,10 @@ export interface UseComposerDraftResult {
   message: string;
   setMessage: Dispatch<SetStateAction<string>>;
   restoredFromInFlight: boolean;
+  /** Quotes the restored draft carried, a fresh array per restore; seed them into the composer's mentions once. */
+  restoredQuotes: QuoteMention[];
+  /** The restored draft had attachments, which are not kept; the composer says to add them again. */
+  restoredHadAttachments: boolean;
   clearCurrentDraft: () => void;
   beginSend: () => PendingSendHandle;
   submitWithDraft: (
@@ -346,6 +420,7 @@ export function useComposerDraft({
   draftKey,
   prefillMessage,
   onDraftKeySwitch,
+  getDraftParts,
 }: UseComposerDraftOptions): UseComposerDraftResult {
   const { user } = useUser({ enabled: Boolean(draftKey) });
   const userId = normalizeUserId(user?.user_id);
@@ -358,6 +433,14 @@ export function useComposerDraft({
   const [restoredFromInFlight, setRestoredFromInFlightState] = useState<boolean>(() => {
     if (prefillMessage || !draftKey) return false;
     return loadStoredDraft(draftKey, userId)?.inFlight === true;
+  });
+  const [restoredQuotes, setRestoredQuotesState] = useState<QuoteMention[]>(() => {
+    if (prefillMessage || !draftKey) return [];
+    return loadStoredDraft(draftKey, userId)?.quotes ?? [];
+  });
+  const [restoredHadAttachments, setRestoredHadAttachmentsState] = useState<boolean>(() => {
+    if (prefillMessage || !draftKey) return false;
+    return loadStoredDraft(draftKey, userId)?.hadAttachments === true;
   });
 
   const latestMessageRef = useRef<string>(message);
@@ -375,6 +458,7 @@ export function useComposerDraft({
   const prefillMessageRef = useRef<string | undefined>(prefillMessage);
   const hadPrefillRef = useRef<boolean>(Boolean(prefillMessage));
   const onDraftKeySwitchRef = useRef<(() => void) | undefined>(onDraftKeySwitch);
+  const getDraftPartsRef = useRef<(() => DraftParts) | undefined>(getDraftParts);
   const prevTargetRef = useRef<{ draftKey?: string; userId: string }>({
     draftKey,
     userId,
@@ -385,6 +469,16 @@ export function useComposerDraft({
     setRestoredFromInFlightState(next);
   }, []);
 
+  /** Applies what a restore brought back; `null` is every reset point (sent, cleared, switched). */
+  const applyRestored = useCallback(
+    (record: StoredChatDraft | null) => {
+      updateRestoredFromInFlight(Boolean(record && record.inFlight));
+      setRestoredQuotesState(record?.quotes ?? []);
+      setRestoredHadAttachmentsState(record?.hadAttachments === true);
+    },
+    [updateRestoredFromInFlight],
+  );
+
   useLayoutEffect(() => {
     activeDraftKeyRef.current = draftKey;
     activeUserIdRef.current = userId;
@@ -393,6 +487,7 @@ export function useComposerDraft({
       hadPrefillRef.current = true;
     }
     onDraftKeySwitchRef.current = onDraftKeySwitch;
+    getDraftPartsRef.current = getDraftParts;
   });
 
   useLayoutEffect(() => {
@@ -407,7 +502,7 @@ export function useComposerDraft({
         dirtyRef.current = false;
         writtenSinceMountOrSendRef.current = false;
         latestMessageRef.current = '';
-        updateRestoredFromInFlight(false);
+        applyRestored(null);
         setMessageState('');
       },
     };
@@ -415,7 +510,7 @@ export function useComposerDraft({
     return () => {
       activeControllers.delete(controller);
     };
-  }, [updateRestoredFromInFlight]);
+  }, [applyRestored]);
 
   const scheduleSave = useCallback((nextText: string) => {
     if (timerRef.current !== null) {
@@ -443,7 +538,9 @@ export function useComposerDraft({
         activeDraftKeyRef.current === key &&
         activeUserIdRef.current === uid
       ) {
-        save(key, latestMessageRef.current, uid);
+        // Parts read at flush: what came back through giveBack after a failed
+        // send (mentions, files) has landed by the time the debounce ends.
+        save(key, latestMessageRef.current, uid, undefined, { parts: getDraftPartsRef.current?.() });
         dirtyRef.current = false;
       }
     }, DRAFT_SAVE_DEBOUNCE_MS);
@@ -460,7 +557,7 @@ export function useComposerDraft({
       updateRestoredFromInFlight(false);
       setMessageState(next);
       if (wasInFlight && activeDraftKeyRef.current && next && next.trim()) {
-        save(activeDraftKeyRef.current, next, activeUserIdRef.current);
+        save(activeDraftKeyRef.current, next, activeUserIdRef.current, undefined, { parts: getDraftPartsRef.current?.() });
       }
       scheduleSave(next);
     },
@@ -475,12 +572,12 @@ export function useComposerDraft({
     dirtyRef.current = false;
     writtenSinceMountOrSendRef.current = false;
     latestMessageRef.current = '';
-    updateRestoredFromInFlight(false);
+    applyRestored(null);
     if (activeDraftKeyRef.current) {
       clearStorageEntry(activeDraftKeyRef.current, activeUserIdRef.current);
     }
     setMessageState('');
-  }, [updateRestoredFromInFlight]);
+  }, [applyRestored]);
 
   const beginSend = useCallback((): PendingSendHandle => {
     if (timerRef.current !== null) {
@@ -488,11 +585,15 @@ export function useComposerDraft({
       timerRef.current = null;
     }
     const sentText = latestMessageRef.current;
+    // The draft as it goes out — a restore after a failed send (this page or a
+    // reload) brings back the quotes it carried, not whatever is typed since.
+    const parts = getDraftPartsRef.current?.() ?? {};
     const inFlight: InFlightSendState = {
       draftKey: activeDraftKeyRef.current,
       userId: activeUserIdRef.current,
       sentText,
       settled: false,
+      parts,
     };
     inFlightSendRef.current = inFlight;
     if (inFlight.draftKey) {
@@ -502,13 +603,13 @@ export function useComposerDraft({
     // Ensure the draft is persisted in localStorage while awaiting send completion,
     // and clear the input box programmatically without deleting the stored draft.
     if (inFlight.draftKey && sentText.trim()) {
-      save(inFlight.draftKey, sentText, inFlight.userId, Date.now(), { inFlight: true });
+      save(inFlight.draftKey, sentText, inFlight.userId, Date.now(), { inFlight: true, parts });
     }
     dirtyRef.current = false;
     writtenSinceMountOrSendRef.current = false;
     hasSentOnKeyRef.current = true;
     latestMessageRef.current = '';
-    updateRestoredFromInFlight(false);
+    applyRestored(null);
     setMessageState('');
 
     const settleSuccess = () => {
@@ -571,7 +672,7 @@ export function useComposerDraft({
               : sentText
           : latestMessageRef.current;
         if (restoredText.trim()) {
-          save(sendDraftKey, restoredText, sendUserId);
+          save(sendDraftKey, restoredText, sendUserId, undefined, { parts: inFlight.parts });
         }
         if (restoredText) {
           latestMessageRef.current = restoredText;
@@ -581,7 +682,7 @@ export function useComposerDraft({
           setMessageState(restoredText);
         }
       } else if (sentText.trim()) {
-        save(sendDraftKey, sentText, sendUserId);
+        save(sendDraftKey, sentText, sendUserId, undefined, { parts: inFlight.parts });
       }
     };
 
@@ -655,17 +756,17 @@ export function useComposerDraft({
             : '';
           hasSentOnKeyRef.current = false;
           hadPrefillRef.current = Boolean(prefillMessageRef.current);
-          updateRestoredFromInFlight(false);
+          applyRestored(null);
           onDraftKeySwitchRef.current?.();
           if (followUpText && followUpText.trim()) {
-            save(draftKey, followUpText, userId);
+            save(draftKey, followUpText, userId, undefined, { parts: getDraftPartsRef.current?.() });
             latestMessageRef.current = followUpText;
             dirtyRef.current = false;
             writtenSinceMountOrSendRef.current = true;
             setMessageState(followUpText);
           } else {
             if (inFlight.sentText.trim()) {
-              save(draftKey, inFlight.sentText, userId, Date.now(), { inFlight: true });
+              save(draftKey, inFlight.sentText, userId, Date.now(), { inFlight: true, parts: inFlight.parts });
             }
             latestMessageRef.current = '';
             dirtyRef.current = false;
@@ -678,7 +779,7 @@ export function useComposerDraft({
               timerRef.current = null;
             }
             if (dirtyRef.current && draftKey) {
-              save(draftKey, latestMessageRef.current, userId);
+              save(draftKey, latestMessageRef.current, userId, undefined, { parts: getDraftPartsRef.current?.() });
               dirtyRef.current = false;
             }
           };
@@ -690,12 +791,12 @@ export function useComposerDraft({
         hasSentOnKeyRef.current = false;
         writtenSinceMountOrSendRef.current = false;
         hadPrefillRef.current = Boolean(prefillMessageRef.current);
-        updateRestoredFromInFlight(false);
+        applyRestored(null);
         onDraftKeySwitchRef.current?.();
 
         if (continuationText && continuationText.trim()) {
           clearStorageEntry(prev.draftKey, prev.userId);
-          save(draftKey, continuationText, userId);
+          save(draftKey, continuationText, userId, undefined, { parts: getDraftPartsRef.current?.() });
           latestMessageRef.current = continuationText;
           dirtyRef.current = false;
           writtenSinceMountOrSendRef.current = true;
@@ -706,7 +807,7 @@ export function useComposerDraft({
               timerRef.current = null;
             }
             if (dirtyRef.current && draftKey) {
-              save(draftKey, latestMessageRef.current, userId);
+              save(draftKey, latestMessageRef.current, userId, undefined, { parts: getDraftPartsRef.current?.() });
               dirtyRef.current = false;
             }
           };
@@ -717,7 +818,7 @@ export function useComposerDraft({
         hasSentOnKeyRef.current = false;
         writtenSinceMountOrSendRef.current = false;
         hadPrefillRef.current = Boolean(prefillMessageRef.current);
-        updateRestoredFromInFlight(false);
+        applyRestored(null);
         onDraftKeySwitchRef.current?.();
       }
       const hasExternalPrefill =
@@ -731,7 +832,7 @@ export function useComposerDraft({
         const restored = restoredRecord?.text ?? '';
         latestMessageRef.current = restored;
         dirtyRef.current = false;
-        updateRestoredFromInFlight(Boolean(restored && restoredRecord?.inFlight));
+        applyRestored(restored ? restoredRecord : null);
         setMessageState(restored);
       }
     }
@@ -742,16 +843,18 @@ export function useComposerDraft({
         timerRef.current = null;
       }
       if (dirtyRef.current && draftKey) {
-        save(draftKey, latestMessageRef.current, userId);
+        save(draftKey, latestMessageRef.current, userId, undefined, { parts: getDraftPartsRef.current?.() });
         dirtyRef.current = false;
       }
     };
-  }, [draftKey, userId, updateRestoredFromInFlight]);
+  }, [draftKey, userId, applyRestored]);
 
   return {
     message,
     setMessage,
     restoredFromInFlight,
+    restoredQuotes,
+    restoredHadAttachments,
     clearCurrentDraft,
     beginSend,
     submitWithDraft,
