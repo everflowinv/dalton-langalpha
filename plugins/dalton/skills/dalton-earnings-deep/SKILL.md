@@ -58,7 +58,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 ### 阶段 1：八节深度点评 ∥ 模型更新（并行）
 
 1. **支线 A —— 八节深度点评（必跑）**：
-   - 严格按 [`references/eight-sections.md`](references/eight-sections.md)（硬件股叠加 [`references/hardware-overlay.md`](references/hardware-overlay.md)）与 [`templates/deep.md`](templates/deep.md) 撰写中文深度报告至 `drafts/<D>-deep-<quarter>.md`。
+   - 严格按 [`references/eight-sections.md`](references/eight-sections.md)（硬件股叠加 [`references/hardware-overlay.md`](references/hardware-overlay.md)）与 [`templates/deep.md`](templates/deep.md) 撰写中文深度报告至 `drafts/<D>-deep-<quarter>.md`（首个二级标题为「`## 摘要`」，后接「`## 业绩与指引`」「`## 投资逻辑的验证`」「`## 赔率与行动`」「`## 跟踪`」、按需「`## 附注`」及文末单一「`## 引用`」）。
    - **价格反应与真实 52 周高低**：必须运行 `scripts/price_reaction.py` 获取盘后、次日、一周的绝对涨跌与相对 `QQQ`、`SPY`、板块 ETF（硬件股必加 `SOXX`/`SMH`）的超额表现，以及基于**真实 252 个交易日**的 52 周高低位置：
      ```bash
      python3 .agents/skills/dalton-earnings-deep/scripts/price_reaction.py \
@@ -66,7 +66,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
        --benchmarks QQQ,SPY --sector-etf XLC --markdown
      ```
    - **卖方与独立研究窗口**：检索发布时刻至发布后 3 个交易日内的 AlphaEngine 卖方报告、FUNDA AI 与 TMTB 点评，以及 `[T0, T0+24h)` 的 `sales-notes`。
-   - **证据层级与四类信息标注**：美股遵守 `10-Q/10-K > 8-K EX-99.1 > 新闻稿 > 演示稿 > 电话会` 优先级；港股与 A 股通过 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)` 调取法定定期报告与业绩公告（港股未覆盖时用 `web_search` 查披露易 `site:hkexnews.hk` 原文链接），`operation="ask"` 平台财务表仅作二手初值，核心数字一律回公告核实，并核对复权、分红、拆股与交易/报表币种；只在电话会口头提及的指引标 `call-only guidance`；所有内容严格区分 **事实 / 管理层指引 / 市场预期 / 研究判断**。
+   - **证据层级与四类信息标注**：美股遵守 `10-Q/10-K > 8-K EX-99.1 > 新闻稿 > 演示稿 > 电话会` 优先级；港股与 A 股通过 `researchdata.finance(route="cn-hk", operation="filings", ticker=CODE_5_OR_6, start=..., end=..., limit=20)` 调取法定定期报告与业绩公告（港股未覆盖时用 `web_search` 查披露易 `site:hkexnews.hk` 原文链接），`operation="ask"` 平台财务表仅作二手初值，核心数字一律回公告核实，并核对复权、分红、拆股与交易/报表币种；只在电话会口头提及、未写入公告的指引在正文用自然中文说明（如“管理层在电话会上口头表示，未写入公告”）；所有内容严格区分 **事实 / 管理层指引 / 市场预期 / 研究判断**。
 
 2. **支线 B —— Excel 模型更新（`model_path` 非空时运行）**：
    - 先读 `.agents/skills/model-update/SKILL.md`，触发类型设为 `Results`。
@@ -76,7 +76,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ### 阶段 2：前瞻对账与 Thesis 财报后校准
 
-严格按 [`references/calibration.md`](references/calibration.md) 产出校准文件，并将核心表格合入 `drafts/<D>-deep-<quarter>.md` 末尾的“前瞻对账”与“thesis 校准”章节：
+严格按 [`references/calibration.md`](references/calibration.md) 产出校准与对账内部文件（逐条表格留在内部文件），并将 `reconcile.md`、`thesis-calibration.md`、`management-delta.md` 的结论各用一两句话写进 `drafts/<D>-deep-<quarter>.md` 正文的「`## 投资逻辑的验证`」节：
 
 1. **前瞻逐条对账（`reconcile.md` 与 `reconcile.json`）**：
    - 运行 `scripts/reconcile.py` 对 `predictions.json` 的全部条目逐条比对实际结果：
@@ -88,13 +88,13 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
      ```
    - 每条预测明确判定 **`对` / `错` / `部分`**，凡判为“错”或“部分”的写明具体错因（`数据错` / `模型错` / `判断错` / `意外事件`）并生成 `lessons` 候选；同时将错判与部分命中的计数写入 `research/<D>-deep-<quarter>/reconcile.json`（格式为 `{"wrong": <错的条数>, "partial": <部分的条数>}`）。若本次财报前无 `predictions.json`，在 `reconcile.md` 与报告正文中说明“本次财报前未锁定前瞻预测，跳过前瞻对账”（正文不写 `predictions.json` 文件名），并将 `research/<D>-deep-<quarter>/reconcile.json` 写为 `{"wrong": 0, "partial": 0}`。
 2. **Thesis 财报后校准（`thesis-calibration.md`）**：
-   - 按 `references/calibration.md` 第二节（财报后校准规则），先拆解盈利质量（税率/回购带来的 EPS 超预期〔beat〕不得将经营支柱判为 `confirming`〔验证〕），再对 `thesis.md` 每个支柱给出信号词（JSON 填 `references/calibration.md` 第二节第 2 条规定的 10 个枚举之一，报告正文写对应知识层渲染中文）与状态词（JSON 填该节规定的 8 个枚举之一，报告正文表格写一句话支柱主张与对应知识层渲染中文，不写 `P1` 编号或英文枚举），并逐一排查五种漂移模式（有/无）。
+   - 按 `references/calibration.md` 第二节（财报后校准规则），先拆解盈利质量（税率/回购带来的每股收益〔EPS〕超预期〔beat〕不得将经营支柱判为 `confirming`〔验证〕），再对 `thesis.md` 每个支柱给出信号词与状态词（JSON 分别填该节第 2 条规定的 10 个、8 个枚举之一；逐条校准表留在 `thesis-calibration.md`，报告正文结论句用知识层渲染的中文写信号词与状态词，不写 `P1` 编号或英文枚举），并逐一排查五种漂移模式（有/无）。
 3. **管理层指引兑现记录更新（`management-delta.md`）**：
    - 对比本季实际表现与上一季给出的官方指引中点/区间，记录偏差幅度与方向，判断管理层指引保守/激进风格是否延续。
 
 ### 阶段 3：草稿期审稿与生成 `knowledge-revision.json`
 
-1. **草稿期审稿（`dalton-reviewer`）**：审阅 `drafts/<D>-deep-<quarter>.md` 及 `research/<D>-deep-<quarter>/` 下的对账与校准文件（核查 beat/miss 口径、“综合判断”是否有独立判断、thesis 信号是否被股价涨跌替代、对账是否诚实面对错判，以及“`## 引用` 表存在且每个 `[引用N]` 都能在表里找到”）。手动路径下先计算被审草稿的 `sha256` 写进审稿提示词（审稿人不回填任何哈希），将返回的 JSON（`verdict` / `summary` / `items` 逐项覆盖 1–9 项检查 / `must_fix` / `nice_to_have`）存为 `research/<D>-deep-<quarter>/review.json`，并把这个被审草稿的 `sha256` 写入其 `draft_sha256` 字段；改稿后必须重新计算哈希、重新审稿并覆盖该文件。
+1. **草稿期审稿（`dalton-reviewer`）**：审阅 `drafts/<D>-deep-<quarter>.md` 及 `research/<D>-deep-<quarter>/` 下的对账与校准文件（核查超预期/低于预期〔beat/miss〕口径、摘要与各节是否有独立判断、核心论点〔thesis〕信号是否被股价涨跌替代、对账是否诚实面对错判、正文「投资逻辑的验证」节是否已各用一两句话准确写入 reconcile.md、thesis-calibration.md、management-delta.md 的结论〔逐条表格留在内部文件〕，以及“`## 引用` 节存在且每个 `[引用N]` 都能在其中找到”）。手动路径下先计算被审草稿的 `sha256` 写进审稿提示词（审稿人不回填任何哈希），将返回的 JSON（`verdict` / `summary` / `items` 逐项覆盖 1–9 项检查 / `must_fix` / `nice_to_have`）存为 `research/<D>-deep-<quarter>/review.json`，并把这个被审草稿的 `sha256` 写入其 `draft_sha256` 字段；改稿后必须重新计算哈希、重新审稿并覆盖该文件。
 2. **生成知识层修订草案**：汇总全部产出与审稿意见，按 PK.2 Schema 生成 `research/<D>-deep-<quarter>/knowledge-revision.json`。
 
 ---
@@ -115,7 +115,7 @@ Workflow 结束后（或独立模式完成后），由当前主智能体读取 `
    - 在 `agenda_ops` 中写入下一季需要跟踪验证的事项；
    - **重大异常升级（PM Escalation）**：若终判为 `THESIS_BROKEN` 或任一核心支柱状态变为 `impaired` / `broken`，必须立即通过通知渠道推送 PM，并在 `agenda_ops` 中写入一条 `pm_handoffs`（PK.14）。
 3. **草稿核验（`check_draft`）与推送稿审查**：
-   - 末尾合并为单一 `## 引用` 节：确认报告末尾的 `## 引用` 表存在且每个 `[引用N]` 都能在表里找到（每行一条写出核验目标与括号内来源说明，形如 `[引用1]: evidence:E-20261023-01 （法定财报｜SEC 10-Q｜3Q26 季报｜2026-10-28｜accession ...）` 或 `[引用5]: model:model/META-model-v01.xlsx!DCF!C12 （本方模型｜DCF 估值页）`）；
+   - 末尾合并为单一 `## 引用` 节：确认报告末尾的 `## 引用` 表存在且每个 `[引用N]` 都能在表里找到（每行一条写出核验目标与括号内来源说明，形如 `[引用1]: evidence:E-20261023-01 （法定财报｜SEC 10-Q｜3Q26 季报｜2026-10-28｜accession ...）` 或 `[引用6]: model:model/META-model-v01.xlsx!Scenarios!C12 （本方模型｜Bull 情景远期 EPS）`）；
    - 调用 `check_draft` 生成数字核验报告 `drafts/<D>-deep-<quarter>.audit.md`；
    - **推送稿两轮语言审查与原样回复**：按 `.agents/skills/dalton-conventions/SKILL.md` §8 将推送正文写入 `research/push/<D>-earnings-deep-<quarter>.md` 并完成两轮 `check_language`，最后回复与该推送稿逐字相同。
 4. **汇报完成前必须过完成契约（`dalton_check_done`）**：

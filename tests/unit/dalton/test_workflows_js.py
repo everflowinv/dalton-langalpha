@@ -1234,6 +1234,44 @@ async def test_deep_without_model_path_never_resolves() -> None:
 
 
 @pytest.mark.asyncio
+async def test_deep_first_review_pass_writes_calibration_into_draft_and_binds_its_sha() -> None:
+    """When the first review passes directly (no revision loop), calibration
+    writes the reconcile/thesis-calibration/management-delta conclusions into
+    the draft's 投资逻辑的验证 section, returns the updated draft sha256, and
+    the subsequent review binds that sha256."""
+    draft_sha = "a" * 64
+    lang1_sha = "b" * 64
+    calib_sha = "d" * 64
+    params = {**DEEP_PARAMS, "model_path": None}
+    host = ScriptedHost(
+        by_label={
+            "八节点评": {**OUT, "sha256": draft_sha},
+            "语言审查 1": {**OUT, "sha256": lang1_sha},
+            "校准与对账": {**OUT, "sha256": calib_sha},
+            "审稿": {"verdict": "pass", "summary": "ok", "must_fix": []},
+            "语言审查 2": {**OUT, "sha256": calib_sha},
+        }
+    )
+    result = await _run("earnings-deep-update", params, host)
+
+    labels = host.labels()
+    assert "修订 1" not in labels
+    calib_prompt = host.prompts[labels.index("校准与对账")]
+    assert "reconcile.md" in calib_prompt
+    assert "thesis-calibration.md" in calib_prompt
+    assert "management-delta.md" in calib_prompt
+    assert "投资逻辑的验证" in calib_prompt
+    assert "./drafts/2026-10-28-deep-FY26Q3.md" in calib_prompt
+    review_prompt = host.prompts[labels.index("审稿")]
+    assert calib_sha in review_prompt, "review must bind the post-calibration draft sha"
+    assert lang1_sha not in review_prompt
+    kp_prompt = host.prompts[labels.index("知识层修订草案")]
+    assert calib_sha in kp_prompt
+    assert result["ok"] is True, result["incomplete"]
+    assert result["revise_rounds"] == 0
+
+
+@pytest.mark.asyncio
 async def test_full_absolute_workspace_dir_zero_revisions_is_not_a_mismatch(tmp_path: Path) -> None:
     """workspace_dir may be an absolute folder: the initial model path carries
     that prefix while the resolver reports model/…; with no revision at all the
