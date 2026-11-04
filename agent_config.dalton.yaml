@@ -73,3 +73,12 @@ crawler:
 # URLs in-house could not fetch (403, anti-bot, JS-only pages). Firecrawl bills
 # per call and shares the OpenClaw account, so it stays second.
 fetch_chain: ["inhouse", "firecrawl"]
+
+# sync3 B12 (#662): Dalton keeps the turn-start cold summary off. Its
+# composer hint reads the threshold stored with the last answer, so a thread
+# answered while it was off (or before the upgrade) would be summarized with
+# no hint and no "keep full context" choice once it is turned on. Ordinary
+# summaries at token_threshold and the rebuild floor are unaffected. Revisit
+# when upstream reads the hint from the live setting.
+compaction:
+  cold_compact_tokens: 0
