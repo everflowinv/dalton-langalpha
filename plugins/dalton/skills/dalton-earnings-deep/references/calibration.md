@@ -2,13 +2,15 @@
 
 本文件定义 `dalton-earnings-deep`（PS.9 阶段 2）的三项必做任务：**① 前瞻预测逐条对账（`reconcile.md` 与 `reconcile.json`）、② Thesis 支柱财报后校准与反漂移检查（`thesis-calibration.md`）、③ 管理层指引兑现记录更新（`management-delta.md`）**，以及最终汇总生成的 **`knowledge-revision.json`** 规范。
 
+> **正文呈现边界**：前瞻预测对账、论点支柱校准、管理层指引兑现的**逐条表格与明细一律留在内部文件**（`reconcile.md`、`thesis-calibration.md`、`management-delta.md`）中；深度报告正文（`## 投资逻辑的验证`）**对三项各用一两句话写核心结论**（正文用知识层渲染的中文写信号词、状态词与事件五词终判，并交代五种漂移排查结果、对账错因总结与管理层指引可信度，不写 `P1` 等内部编号、英文枚举或内部文件名）。
+
 ---
 
 ## 一、前瞻预测逐条对账规则（`reconcile.py` → `reconcile.md` + `reconcile.json`）
 
 ### 1. 逐条核对与三档判定
 读取财报前 T-3 生成的 `predictions.json`，使用 `scripts/reconcile.py` 将每条预测与当季一手披露实际值（或最新官方指引）逐一比对，输出固定列对账表至 `research/<D>-deep-<quarter>/reconcile.md`，同时将错判与部分命中的条数写入 `research/<D>-deep-<quarter>/reconcile.json`（格式为 `{"wrong": <错的条数>, "partial": <部分的条数>}`；若本次财报前无 `predictions.json`，`reconcile.json` 写 `{"wrong": 0, "partial": 0}`）：
-`指标（期间｜口径）｜我们的预期｜一致预期｜实际｜对/错/部分｜错因`（合入深度报告正文时写出指标名称、期间与口径，不写 `P1` 等编号）
+`指标（期间｜口径）｜我们的预期｜一致预期｜实际｜对/错/部分｜错因`
 
 每条预测必须明确给出以下三档判定之一，**严禁模棱两可或跳过错判条目**：
 - **`对`**：实际结果落在 `our_expectation` 预测区间内（或点预测误差在合理容差内且方向、机制完全吻合）；
