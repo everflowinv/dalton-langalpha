@@ -52,6 +52,25 @@ NON_US_EXTENDED_UNSUPPORTED_SUFFIXES = (
     ".DE", ".PA", ".AS", ".TO", ".AX", ".SI", ".NS", ".BO",
 )
 
+_cn_price_fallback_mod = None
+
+
+def _cn_price_fallback():
+    """同目录的 cn_price_fallback（港股/A 股日线坏数据识别与 cn-hk 备用源）。
+
+    importlib 按路径加载，脚本直跑与测试按路径加载本模块时同样成立。"""
+    global _cn_price_fallback_mod
+    if _cn_price_fallback_mod is None:
+        import importlib.util
+
+        path = Path(__file__).resolve().parent / "cn_price_fallback.py"
+        spec = importlib.util.spec_from_file_location("cn_price_fallback", path)
+        assert spec is not None and spec.loader is not None
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _cn_price_fallback_mod = mod
+    return _cn_price_fallback_mod
+
 
 def supports_extended_session(symbol: str) -> tuple[bool, str | None]:
     """检查标的是否支持美股盘前/盘后（pre/post）分钟线计算。"""
@@ -376,6 +395,76 @@ def parse_window_spec(window_str: str, end_override: str | None = None) -> tuple
     return end_dt, None, 5, w
 
 
+def _cn_daily_verdict_from_frames(
+    close_df, volume_df, symbol: str, end
+):
+    """从日线帧里取某个标的的（日期、收盘、量）序列，交给 cn_price_fallback
+    按请求截止日判定；美股不在调用方传入之列（只有 is_cn_symbol 的才进来）。"""
+    import pandas as pd
+
+    guard = _cn_price_fallback()
+    if close_df is None or symbol not in close_df.columns:
+        return None
+    s = close_df[symbol].dropna()
+    if s.empty:
+        return None
+    if volume_df is not None and symbol in volume_df.columns:
+        vols = volume_df[symbol].reindex(s.index).tolist()
+    else:
+        vols = []
+    volumes = [None if (v is None or pd.isna(v)) else v for v in vols]
+    return guard.evaluate_cn_daily(
+        symbol,
+        [idx.strftime("%Y-%m-%d") for idx in s.index],
+        s.tolist(),
+        volumes,
+        end=end,
+    )
+
+
+def _annotate_cn_daily_issues(
+    symbols: list[str],
+    adj_close_df,
+    close_df,
+    volume_df,
+    *,
+    end,
+) -> tuple[dict[str, str], list[str], dict[str, dict]]:
+    """港股/A 股日线坏数据（停滞/落后）的非破坏性处置（线程 63711ab2 /
+    fd9e3baa：yfinance 的 2525.HK 停在 HK$15.47、量为 0）。
+
+    永远不删、不合成历史日线：判定以请求截止日为准（查询历史窗口时不做
+    任何替换、不调备用源）；停滞尾部只标注，并把停滞段从计算中剔除（置
+    NaN——行还在，只是不用坏值算指标），基于历史的指标只用停滞段之前的
+    有效数据；"今日涨跌"由调用方作为单独字段输出，不写回日线帧。停牌
+    （备用报价亦无成交且价格不变）与连续假期（报价不比日线新）照实标注、
+    不切换。返回 (price_sources, 说明列表, 各标的判定)；美股不进此函数。
+    """
+    import pandas as pd
+
+    guard = _cn_price_fallback()
+    price_sources: dict[str, str] = {}
+    notes: list[str] = []
+    verdicts: dict[str, dict] = {}
+    for sym in symbols:
+        if not guard.is_cn_symbol(sym):
+            continue
+        verdict = _cn_daily_verdict_from_frames(close_df, volume_df, sym, end)
+        if verdict is None:
+            continue
+        verdicts[sym] = verdict
+        notes.append(verdict["note"])
+        if verdict.get("price_source"):
+            price_sources[sym] = verdict["price_source"]
+        stagnant_from = verdict.get("stagnant_from")
+        if stagnant_from:
+            cutoff = pd.Timestamp(stagnant_from)
+            for frame in (adj_close_df, close_df, volume_df):
+                if frame is not None and sym in frame.columns:
+                    frame.loc[frame.index >= cutoff, sym] = float("nan")
+    return price_sources, notes, verdicts
+
+
 def compute_quant_from_frames(
     target: str,
     peers: list[str],
@@ -387,6 +476,9 @@ def compute_quant_from_frames(
     end_override: str | None = None,
     require_end_bar: bool = False,
     peer_source: str | None = None,
+    price_sources: dict[str, str] | None = None,
+    source_notes: list[str] | None = None,
+    today_quote: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     核心计算函数（可对真实 yfinance DataFrame 或测试 DataFrame 执行）。
@@ -394,9 +486,51 @@ def compute_quant_from_frames(
     import numpy as np
     import pandas as pd
 
-    warnings_list: list[str] = []
+    notes_out: list[str] = source_notes if isinstance(source_notes, list) else (
+        list(source_notes) if source_notes else []
+    )
+    warnings_list: list[str] = list(notes_out)
     end_dt, start_dt, n_days, label = parse_window_spec(window_str, end_override)
     end_ts = pd.Timestamp(end_dt)
+
+    # 若调用方直接传入未经过 _annotate_cn_daily_issues 掩码的 DataFrame，
+    # 同样对港/A 股停滞尾做非破坏性掩码（在副本上置 NaN，不改调用方原帧）。
+    guard = _cn_price_fallback()
+    copied = False
+    for sym in [target, *(peers or [])]:
+        if not guard.is_cn_symbol(sym) or close_df is None or sym not in close_df.columns:
+            continue
+        s_c = close_df[sym].dropna()
+        s_c = s_c[s_c.index <= end_ts]
+        if s_c.empty:
+            continue
+        vols = (
+            volume_df[sym].reindex(s_c.index).tolist()
+            if (volume_df is not None and sym in volume_df.columns)
+            else []
+        )
+        stagnant = guard.find_stagnant_tail(
+            [idx.strftime("%Y-%m-%d") for idx in s_c.index],
+            s_c.tolist(),
+            [None if (v is None or pd.isna(v)) else v for v in vols],
+        )
+        if stagnant is not None:
+            if not copied:
+                adj_close_df = adj_close_df.copy() if adj_close_df is not None else None
+                close_df = close_df.copy() if close_df is not None else None
+                volume_df = volume_df.copy() if volume_df is not None else None
+                copied = True
+            cutoff = pd.Timestamp(stagnant["from_date"])
+            for frame in (adj_close_df, close_df, volume_df):
+                if frame is not None and sym in frame.columns:
+                    frame.loc[frame.index >= cutoff, sym] = float("nan")
+
+    def _extra_meta() -> dict[str, Any]:
+        return {
+            **({"price_sources": price_sources} if price_sources else {}),
+            **({"price_source_notes": notes_out, "source_notes": notes_out} if notes_out else {}),
+            **({"today_quote": today_quote} if today_quote else {}),
+        }
 
     if target not in adj_close_df.columns or adj_close_df[target].dropna().empty:
         return {
@@ -405,7 +539,8 @@ def compute_quant_from_frames(
             "ticker": target,
             "window": label,
             "error": f"No price series found for {target}",
-            "warnings": [f"Missing price series for {target}"],
+            "warnings": [*warnings_list, f"Missing price series for {target}"],
+            **_extra_meta(),
         }
 
     t_adj = adj_close_df[target].dropna()
@@ -419,7 +554,8 @@ def compute_quant_from_frames(
             "ticker": target,
             "window": label,
             "error": f"Insufficient price bars ({len(t_adj)}) for {target}",
-            "warnings": ["Insufficient price history"],
+            "warnings": [*warnings_list, "Insufficient price history"],
+            **_extra_meta(),
         }
 
     last_bar_date = t_adj.index[-1].date()
@@ -441,7 +577,8 @@ def compute_quant_from_frames(
                 "ticker": target,
                 "window": label,
                 "error": f"No trading days in [{start_dt}, {end_dt}]",
-                "warnings": ["No trading days in window"],
+                "warnings": [*warnings_list, "No trading days in window"],
+                **_extra_meta(),
             }
         first_pos = t_adj.index.get_loc(win_indices[0])
         if first_pos == 0:
@@ -451,7 +588,8 @@ def compute_quant_from_frames(
                 "ticker": target,
                 "window": label,
                 "error": "No prior close bar before window start",
-                "warnings": ["Missing prior close bar before window start"],
+                "warnings": [*warnings_list, "Missing prior close bar before window start"],
+                **_extra_meta(),
             }
         base_idx = t_adj.index[first_pos - 1]
     else:
@@ -474,8 +612,8 @@ def compute_quant_from_frames(
         s_end = s[s.index <= end_idx]
         if s_before.empty or s_end.empty:
             return None
-        if s_end.index[-1] <= s_before.index[-1]:
-            return 0.0
+        if s_end.index[-1] < end_idx or s_end.index[-1] <= s_before.index[-1]:
+            return None
         p0 = float(s_before.iloc[-1])
         p1 = float(s_end.iloc[-1])
         if not p0:
@@ -487,8 +625,10 @@ def compute_quant_from_frames(
             return None, None, None
         v = volume_df[sym].dropna()
         v_up_to = v[v.index <= bar_idx]
+        if v_up_to.empty or v_up_to.index[-1] < bar_idx:
+            return None, None, None
         if len(v_up_to) < 2:
-            return (int(v_up_to.iloc[-1]) if len(v_up_to) == 1 else None), None, None
+            return int(v_up_to.iloc[-1]), None, None
         cur_vol = int(v_up_to.iloc[-1])
         prior_20 = v_up_to.iloc[:-1].tail(ADTV_LOOKBACK_DAYS)
         if prior_20.empty:
@@ -501,7 +641,8 @@ def compute_quant_from_frames(
     last_close_unadj = float(t_close.loc[end_idx])
     last_vol, adtv_20d, vol_vs_adtv = calc_vol_vs_adtv(target, end_idx)
 
-    # 同组各成员表现
+    # 同组各成员表现：有效数据未覆盖目标窗口终点（valid_until 早于 end_idx 或窗口内
+    # 无有效 K 线）的同业一律从同组中位数和超额收益里剔除，并在 source_notes 注明。
     peer_rows: list[dict[str, Any]] = []
     valid_peer_syms: list[str] = []
     for p in peers:
@@ -509,7 +650,20 @@ def compute_quant_from_frames(
             continue
         p_chg = calc_window_ret_pct(p)
         if p_chg is None:
-            warnings_list.append(f"同组标的 {p} 缺少窗口行情数据，已跳过")
+            s_p = adj_close_df[p].dropna() if p in adj_close_df.columns else pd.Series(dtype=float)
+            s_p_end = s_p[s_p.index <= end_idx]
+            if not s_p_end.empty and s_p_end.index[-1] < end_idx:
+                valid_until_str = s_p_end.index[-1].strftime("%Y-%m-%d")
+                excl_note = (
+                    f"{p}: 有效数据截至 {valid_until_str}（早于目标窗口终点 "
+                    f"{end_idx.strftime('%Y-%m-%d')}），已从同组中位数和超额收益中剔除"
+                )
+                if not any(p in n and valid_until_str in n and "剔除" in n for n in notes_out):
+                    notes_out.append(excl_note)
+                if excl_note not in warnings_list:
+                    warnings_list.append(excl_note)
+            else:
+                warnings_list.append(f"同组标的 {p} 缺少窗口行情数据，已跳过")
             continue
         valid_peer_syms.append(p)
         p_close_s = close_df[p].dropna() if p in close_df.columns else pd.Series(dtype=float)
@@ -634,6 +788,7 @@ def compute_quant_from_frames(
         "data_ok": data_ok,
         "warnings": warnings_list,
         "computed_at": datetime.now(timezone.utc).isoformat(),
+        **_extra_meta(),
     }
 
 
@@ -1197,8 +1352,35 @@ def run_analyze(
     close_df = extract_field("Close")
     vol_df = extract_field("Volume")
 
+    # 若显式指定了 --end、单日 YYYY-MM-DD 或区间，以该日为截止日；否则按今天（香港时区）判定
+    w_clean = (window or "").strip()
+    has_explicit_end = bool(
+        end_override
+        or " to " in w_clean.lower()
+        or re.match(r"^\d{4}-\d{2}-\d{2}$", w_clean)
+    )
+    cn_end = end_dt if has_explicit_end else None
+
+    # 港股/A 股日线坏数据（停滞/落后）的非破坏性处置；美股不受影响
+    price_sources, source_notes, cn_verdicts = _annotate_cn_daily_issues(
+        symbols, adj_df, close_df, vol_df, end=cn_end
+    )
+    today_quotes = [
+        {"ticker": sym, **v["today"]}
+        for sym, v in cn_verdicts.items()
+        if v.get("today")
+    ]
+    if t in cn_verdicts and cn_verdicts[t].get("today") and len(today_quotes) == 1:
+        today_quote: Any = today_quotes[0]
+    elif len(today_quotes) == 1:
+        today_quote = today_quotes[0]
+    elif len(today_quotes) > 1:
+        today_quote = today_quotes
+    else:
+        today_quote = None
+
     # 若显式指定了 --end 或单日 YYYY-MM-DD，要求最新日线到达该日（除非是周末自动回退前一日）
-    require_end = bool(end_override or re.match(r"^\d{4}-\d{2}-\d{2}$", (window or "").strip()))
+    require_end = bool(end_override or re.match(r"^\d{4}-\d{2}-\d{2}$", w_clean))
     return compute_quant_from_frames(
         target=t,
         peers=peers,
@@ -1210,6 +1392,9 @@ def run_analyze(
         end_override=end_override,
         require_end_bar=require_end,
         peer_source=peer_source,
+        price_sources=price_sources or None,
+        source_notes=source_notes or None,
+        today_quote=today_quote,
     )
 
 
