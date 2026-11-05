@@ -38,13 +38,14 @@ vi.mock('@/hooks/useUser', () => ({
   useUser: () => ({ user: null, isLoading: false, isError: false }),
 }));
 
-import { sendChatMessageStream } from '../../utils/api';
+import { sendChatMessageStream, cancelWorkflow } from '../../utils/api';
 import { ensureThreadId } from '../../session/threadCreation';
 import { useChatMessages } from '../useChatMessages';
 import { useComposerDraft, load, loadInFlightCopies } from '@/lib/dalton/chatDrafts';
 
 const mockSendStream = sendChatMessageStream as Mock;
 const mockEnsureThreadId = ensureThreadId as Mock;
+const mockCancel = cancelWorkflow as Mock;
 
 type OnEvent = (e: Record<string, unknown>) => void;
 interface StreamOptions {
@@ -1631,6 +1632,185 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
       const box = result.current.composer.message;
       expect(box.match(/nr one/g)).toHaveLength(1);
       expect(box.match(/nr two/g)).toHaveLength(1);
+      expect(result.current.composer.inFlightCopies).toHaveLength(0);
+      expect(storedCopies()).toHaveLength(0);
+      expect(result.current.chat.returnedSteering).toBeNull();
+      unmount();
+    });
+
+    it('a 409 duplicate naming its run after the stop settles the draft taken', async () => {
+      // Round-10 item 2: the steer's answer was lost, the user stopped, and
+      // the POST then answers 409 duplicate_request with a run_id — proof the
+      // server took a copy. That proof outranks the stop: the draft settles
+      // sent, nothing comes back into the box.
+      let releaseFirst!: (v: { disconnected: boolean; aborted: boolean }) => void;
+      const steerKeys: string[] = [];
+      mockSendStream.mockImplementation(
+        async (_msg: string, _ws: string, _tid: string | null, opts: StreamOptions & { requestKey?: string }) => {
+          if (mockSendStream.mock.calls.length === 1) {
+            opts.onEvent?.({ event: 'thread_id', thread_id: 'thread-dupstop' } as never);
+            return new Promise((resolve) => {
+              releaseFirst = resolve;
+            });
+          }
+          steerKeys.push(String(opts.requestKey));
+          throw Object.assign(new Error('This request was already accepted'), {
+            status: 409,
+            errorInfo: {
+              code: 'duplicate_request',
+              message: 'This request was already accepted; the turn it named has it.',
+              thread_id: 'thread-dupstop',
+              run_id: 'run-dupstop',
+              run_status: 'completed',
+            },
+          });
+        },
+      );
+
+      const accepted = vi.fn();
+      const { result, unmount } = renderHookWithProviders(() => useDraftChatHarness());
+      act(() => {
+        result.current.composer.setMessage('the copied steer');
+      });
+      let first!: Promise<boolean>;
+      act(() => {
+        first = result.current.chat.handleSendMessage('first turn');
+      });
+      await act(async () => {
+        await Promise.resolve();
+      });
+      await waitFor(() => {
+        expect(result.current.chat.isLoading).toBe(true);
+      });
+
+      let outcome: boolean | undefined;
+      await act(async () => {
+        result.current.composer.submitWithDraft((onAccepted, onHandedOff, onRestore) => {
+          const sent = result.current.chat.handleSendMessage('the copied steer', null, null, {
+            onAccepted: () => {
+              onAccepted();
+              accepted();
+            },
+            onHandedOff,
+            onNotTaken: onRestore,
+          });
+          sent.then((v) => { outcome = v; });
+          return sent;
+        });
+      });
+      await act(async () => {
+        await result.current.chat.stopWorkflow();
+      });
+      await act(async () => {
+        releaseFirst({ disconnected: false, aborted: false });
+        await first.catch(() => undefined);
+      });
+
+      expect(accepted).toHaveBeenCalledTimes(1);
+      expect(outcome).toBe(true);
+      expect(result.current.composer.message).toBe('');
+      expect(storedCopies()).toHaveLength(0);
+      unmount();
+    });
+
+    it('server-returned steers with a draft behind them go back through it alone — each text once', async () => {
+      // Round-10 item 3: two steers are queued server-side when the user
+      // stops; the cancel answer hands them back, then both POSTs drop. The
+      // text channel skips the composer-backed ones — their own not-taken
+      // settle seats each copy back whole, exactly once.
+      const steerKeys: string[] = [];
+      let releaseFirst!: (v: { disconnected: boolean; aborted: boolean }) => void;
+      const releaseSteers: Array<(v: { disconnected: boolean; aborted: boolean }) => void> = [];
+      mockSendStream.mockImplementation(
+        async (_msg: string, _ws: string, _tid: string | null, opts: StreamOptions & { requestKey?: string }) => {
+          if (mockSendStream.mock.calls.length === 1) {
+            opts.onEvent?.({ event: 'thread_id', thread_id: 'thread-rsstop' } as never);
+            return new Promise((resolve) => {
+              releaseFirst = resolve;
+            });
+          }
+          steerKeys.push(String(opts.requestKey));
+          return new Promise((resolve) => {
+            releaseSteers.push(resolve);
+          });
+        },
+      );
+      mockCancel.mockResolvedValue({
+        cancelled: true,
+        thread_id: 'thread-rsstop',
+        returned_steers: [
+          { content: 'rs one', request_key: null },
+          { content: 'rs two', request_key: null },
+        ],
+      });
+
+      const accepted = vi.fn();
+      const { result, unmount } = renderHookWithProviders(() => useDraftChatHarness());
+      act(() => {
+        result.current.composer.setMessage('rs one');
+      });
+      let first!: Promise<boolean>;
+      act(() => {
+        first = result.current.chat.handleSendMessage('first turn');
+      });
+      await act(async () => {
+        await Promise.resolve();
+      });
+      await waitFor(() => {
+        expect(result.current.chat.isLoading).toBe(true);
+      });
+
+      const sendSteer = (text: string) => {
+        act(() => {
+          result.current.composer.setMessage(text);
+        });
+        act(() => {
+          result.current.composer.submitWithDraft((onAccepted, onHandedOff, onRestore) => {
+            return result.current.chat.handleSendMessage(text, null, null, {
+              onAccepted: () => {
+                onAccepted();
+                accepted();
+              },
+              onHandedOff,
+              onNotTaken: onRestore,
+            });
+          });
+        });
+      };
+      sendSteer('rs one');
+      await act(async () => {
+        await Promise.resolve();
+      });
+      sendSteer('rs two');
+      await act(async () => {
+        await Promise.resolve();
+      });
+      // Stamp the steers' real request keys onto the returned pair.
+      mockCancel.mockResolvedValue({
+        cancelled: true,
+        thread_id: 'thread-rsstop',
+        returned_steers: [
+          { content: 'rs one', request_key: steerKeys[0] },
+          { content: 'rs two', request_key: steerKeys[1] },
+        ],
+      });
+
+      await act(async () => {
+        await result.current.chat.stopWorkflow();
+      });
+      // The stop handed both back server-side; the text channel skipped them
+      // (their drafts own the return). Both POSTs then drop: not taken.
+      await act(async () => {
+        releaseSteers[0]({ disconnected: true, aborted: false });
+        releaseSteers[1]({ disconnected: true, aborted: false });
+        releaseFirst({ disconnected: false, aborted: false });
+        await first.catch(() => undefined);
+      });
+
+      expect(accepted).not.toHaveBeenCalled();
+      const box = result.current.composer.message;
+      expect(box.match(/rs one/g)).toHaveLength(1);
+      expect(box.match(/rs two/g)).toHaveLength(1);
       expect(result.current.composer.inFlightCopies).toHaveLength(0);
       expect(storedCopies()).toHaveLength(0);
       expect(result.current.chat.returnedSteering).toBeNull();

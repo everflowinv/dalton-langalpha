@@ -708,7 +708,9 @@ export function useComposerDraft({
   const applyRestored = useCallback(
     (record: { quotes?: QuoteMention[]; hadAttachments?: boolean } | null) => {
       setRestoredQuotesState(record?.quotes ?? []);
-      restoredHadAttachmentsRef.current = record?.hadAttachments === true;
+      // OR, not overwrite: a newer send's attachments-again notice must
+      // survive an older send's restore beside it in the same box.
+      restoredHadAttachmentsRef.current = restoredHadAttachmentsRef.current || record?.hadAttachments === true;
       setRestoredHadAttachmentsState(restoredHadAttachmentsRef.current);
     },
     [],
@@ -1012,13 +1014,17 @@ export function useComposerDraft({
       // in neither place, and a superseded send that was definitely refused
       // must not linger as a "may have gone through" offer.
       if (!superseded) hasSentOnKeyRef.current = false;
-      if (timerRef.current !== null) {
+      const boxOnSendKey = activeDraftKeyRef.current === sendDraftKey;
+      const seatsBox = boxOnSendKey && !inFlight.hostReturned;
+      // Only this key's own pending save may be cleared. The pending timer
+      // can belong to another draft now (the box switched keys under this
+      // send): killing it would drop that session's just-typed content, and
+      // this settle never writes that key back.
+      if (timerRef.current !== null && seatsBox) {
         clearTimeout(timerRef.current);
         timerRef.current = null;
       }
-      writtenSinceMountOrSendRef.current = true;
-      const boxOnSendKey = activeDraftKeyRef.current === sendDraftKey;
-      const seatsBox = boxOnSendKey && !inFlight.hostReturned;
+      if (seatsBox) writtenSinceMountOrSendRef.current = true;
       if (seatsBox) {
         // Seeding the sent quotes back is the box-seating paths' business
         // alone: a host that took the return seats them through its giveBack
@@ -1049,9 +1055,12 @@ export function useComposerDraft({
       // The parts saved with the words are the send's own beside what its key
       // holds: the box's current parts when it seats there (quotes added
       // while the send was out included), else the stored draft's quotes —
-      // never another session's.
+      // never another session's. The host-return case sits on the same key,
+      // so the box's own parts — the quotes added while the send was out —
+      // ride along too, or their bodies would be gone from storage before
+      // the host's giveBack save lands.
       if (merged.trim()) {
-        const parts = seatsBox
+        const parts = boxOnSendKey
           ? mergePartsForSave(inFlight.parts)
           : mergeParts(inFlight.parts, {
               quotes: savedRecord?.quotes ?? [],

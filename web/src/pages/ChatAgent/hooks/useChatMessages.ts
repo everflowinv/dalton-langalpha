@@ -453,6 +453,11 @@ export function useChatMessages(
   // stream: attaching to that run first would read it twice. The refused-steer flush waits for those sent
   // before its next, whose refusal may still land.
   const steersInFlightRef = useRef(new Map<number, number>());
+  // DALTON-HOOK(composer-drafts): request keys of steers still in flight that
+  // a composer draft waits behind (their model options carry its callbacks) —
+  // a stop's returned-steers text channel skips these; their own POST's
+  // not-taken settle restores the draft whole.
+  const composerSteerKeysRef = useRef(new Set<string>());
   // A refused steer's banner, for a load to show again once it has cleared
   // it: the first load to succeed after the refusal shows it, unless a turn
   // sent or a thread opened since has moved the session on.
@@ -1978,9 +1983,9 @@ export function useChatMessages(
       // false); only the rest — sends no draft lifecycle owns — go back as
       // plain text, so no words land in the box twice.
       const unsentTexts = unsent.filter((u) => !(u as { settleQueued?: unknown }).settleQueued);
-      giveBackStoppedSteers(outcome?.returned_steers ?? [], unsentTexts);
+      giveBackStoppedSteers(outcome?.returned_steers ?? [], unsentTexts, composerSteerKeysRef.current);
     } else {
-      giveBackStoppedSteers([], unsent.filter((u) => !(u as { settleQueued?: unknown }).settleQueued));
+      giveBackStoppedSteers([], unsent.filter((u) => !(u as { settleQueued?: unknown }).settleQueued), composerSteerKeysRef.current);
     }
   };
 
@@ -1994,6 +1999,11 @@ export function useChatMessages(
   const giveBackStoppedSteers = (
     returned: readonly HeldSteer[],
     unsent: readonly { message: string; steerId: string }[],
+    // DALTON-HOOK(composer-drafts): request keys of steers still in flight
+    // with a composer draft behind them — their POST's own not-taken settle
+    // seats the copy back whole, so the text channel must skip them or the
+    // words land twice.
+    composerKeys?: ReadonlySet<string>,
   ) => {
     const transcript = liveMessages.get();
     const keyOf = (m: ChatMessage) => (m as { requestKey?: string }).requestKey;
@@ -2006,6 +2016,10 @@ export function useChatMessages(
       // The stop gave its file comments back; the note goes to the composer.
       const comments = readArtifactCommentsShown(steer.artifact_comments);
       if (comments) requestKeys.returned(comments);
+      // A returned steer whose POST is still out with a draft behind it goes
+      // back through that draft's own settle (its drop reads not-taken) —
+      // bookkeeping below still applies, the text channel does not.
+      const ownedByDraft = !!key && !!composerKeys?.has(key);
       if (key) {
         seen.add(key);
         // The server keeps a returned steer's key spent, so the text sent
@@ -2020,7 +2034,8 @@ export function useChatMessages(
           && !m.steeringDelivered && !!m.steering && String(m.content ?? '').trim() === text);
         if (copy) drop.add(copy.id as string);
       }
-      if (steer.content) texts.push(steer.content);
+      // DALTON-HOOK(composer-drafts): text channel skips draft-owned returns.
+      if (steer.content && !ownedByDraft) texts.push(steer.content);
     }
     for (const u of unsent) texts.push(u.message);
     if (drop.size > 0) setMessages((prev) => prev.filter((m) => !drop.has(m.id as string)));
@@ -2190,6 +2205,10 @@ export function useChatMessages(
     recentlySentTrackerRef.current.track(openerMatchText(message, artifactComments), userMessage.timestamp, userMessage.id);
     setMessages((prev) => appendMessage(prev,userMessage));
     const seq = ++steerSeqRef.current;
+    // DALTON-HOOK(composer-drafts): register the composer draft behind this
+    // steer, if any, for the stop's text-channel skip.
+    const hasComposer = !!modelOptions.onAccepted;
+    if (hasComposer) composerSteerKeysRef.current.add(requestKey);
 
     // The refusal the stream answered with, once it started: the same answer
     // the route gives as a 409 before it does.
@@ -2278,6 +2297,15 @@ export function useChatMessages(
         if (settleNotRunningSteer(userMessage.id as string, gen, message, additionalContext, attachmentMeta, modelOptions, requestKey, seq, outcome ? resolveQueued : undefined)) ended = 'handedOff';
         return outcome ?? true;
       }
+      // DALTON-HOOK(composer-drafts): a 409 duplicate_request naming its run
+      // is proof the server TOOK a copy of this steer — even when the user
+      // has stopped since. It settles the draft as sent before anything the
+      // stop would do with it; without this, the stop branch would hand the
+      // words back, spend nothing, and a resend would duplicate the message.
+      if (settleDuplicateSteer(err, userMessage.id as string, message, requestKey)) {
+        notifyAccepted();
+        return true;
+      }
       // DALTON-HOOK(composer-drafts): a steer ending after the user's stop —
       // `stopping`, a network error, 429/500, `compacting`, `running`, or a
       // drop — was not taken (nothing accepted it). The composer's not-taken
@@ -2338,6 +2366,7 @@ export function useChatMessages(
       return false;
     } finally {
       requestKeys.settle(requestKey, ended);
+      if (hasComposer) composerSteerKeysRef.current.delete(requestKey);
       steersInFlightRef.current.delete(seq);
       if (notRunningSendsRef.current.length > 0) setNotRunningTick((n) => n + 1);
       // A load deferred to this answer runs now, unless a stream it started

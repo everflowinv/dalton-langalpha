@@ -1657,4 +1657,127 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     expect(load('thread:t-other', 'u-1')).toBe('other session words');
     vi.useRealTimers();
   });
+
+  it('an old request failing after the switch never cancels the new session\'s pending save', async () => {
+    // Round-10 item 1: the send went out on key A, the box moved to key B and
+    // typed content whose 300ms save is still pending when A fails. The
+    // settle must not kill B's timer: after the debounce, a reload finds B's
+    // content.
+    vi.useFakeTimers();
+    const resolvers: Array<(v: boolean) => void> = [];
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+      () => new Promise<boolean>((resolve) => { resolvers.push(resolve); }),
+    );
+    const view = renderComposer({ draftKey: 'thread:old-a', onSend }, { userId: 'u-1' });
+    fireEvent.change(view.getTextarea(), { target: { value: 'sent on A', selectionStart: 10 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+
+    // Switch to session B and type — the save is pending, not fired.
+    view.rerenderComposer({ draftKey: 'thread:new-b', onSend });
+    fireEvent.change(view.getTextarea(), { target: { value: 'typed on B', selectionStart: 10 } });
+    expect(load('thread:new-b', 'u-1')).toBe('');
+
+    // The old request fails while B's debounce is pending.
+    await act(async () => {
+      resolvers[0](false);
+    });
+    expect(load('thread:old-a', 'u-1')).toBe('sent on A');
+
+    // The debounce runs to term: B's content is saved; a reload finds it.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(DRAFT_SAVE_DEBOUNCE_MS);
+    });
+    expect(load('thread:new-b', 'u-1')).toBe('typed on B');
+    view.unmount();
+    const reopened = renderComposer({ draftKey: 'thread:new-b' }, { userId: 'u-1' });
+    expect(reopened.getTextarea().value).toBe('typed on B');
+    reopened.unmount();
+    vi.useRealTimers();
+  });
+
+  it('an older send\'s restore keeps the newer send\'s attachments-again notice standing', async () => {
+    // Round-10 item 4: send A without attachments, send B with one; B is not
+    // taken first (notice on), then A is not taken beside it. A's restore
+    // must not clear B's notice — on the box or in what a save keeps.
+    vi.useFakeTimers();
+    const resolvers: Array<(v: boolean) => void> = [];
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+      () => new Promise<boolean>((resolve) => { resolvers.push(resolve); }),
+    );
+    const view = renderComposer({ draftKey: 'thread:t-notice', onSend }, { userId: 'u-1' });
+
+    fireEvent.change(view.getTextarea(), { target: { value: 'send A plain', selectionStart: 13 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+    fireEvent.change(view.getTextarea(), { target: { value: 'send B with file', selectionStart: 17 } });
+    attachFile(view, 'exhibit.txt');
+    fireEvent.click(screen.getByLabelText('Send message'));
+
+    // B (newer) not taken: its words and its attachment notice come back.
+    await act(async () => {
+      resolvers[1](false);
+    });
+    expect(screen.getByTestId('attachments-lost-notice')).toBeTruthy();
+
+    // A (older, superseded) not taken: seated ahead, and the notice stays.
+    await act(async () => {
+      resolvers[0](false);
+    });
+    expect(view.getTextarea().value).toContain('send A plain');
+    expect(view.getTextarea().value).toContain('send B with file');
+    expect(screen.getByTestId('attachments-lost-notice')).toBeTruthy();
+
+    // What a save keeps carries the notice too.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(DRAFT_SAVE_DEBOUNCE_MS);
+    });
+    const stored = JSON.parse(
+      localStorage.getItem(buildDraftStorageKey('thread:t-notice', 'u-1')) ?? '{}',
+    ) as { hadAttachments?: boolean };
+    expect(stored.hadAttachments).toBe(true);
+    view.unmount();
+    const reopened = renderComposer({ draftKey: 'thread:t-notice' }, { userId: 'u-1' });
+    expect(screen.getByTestId('attachments-lost-notice')).toBeTruthy();
+    reopened.unmount();
+    vi.useRealTimers();
+  });
+
+  it('a host-owned return saves the quotes added while the send was out, before its giveBack lands', async () => {
+    // Round-10 item 5: docked send, a DIFFERENT-opening quote joins the box
+    // while it is out, the host reports taking the return. The synchronous
+    // save must carry the added quote's body beside the sent words — read at
+    // once, before the giveBack's debounce.
+    const resolvers: Array<(v: boolean) => void> = [];
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+      (send) => new Promise<boolean>((resolve) => {
+        resolvers.push((v: boolean) => {
+          if (v === false) send.modelOptions.onReturnedUnsent?.();
+          resolve(v);
+        });
+      }),
+    );
+    const ref = createRef<ChatInputHandle>();
+    const view = renderComposer({ draftKey: 'thread:t-hostq', onSend }, { userId: 'u-1', ref });
+    fireEvent.change(view.getTextarea(), { target: { value: 'the refused words', selectionStart: 16 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+
+    // While the send is out, a quote with a DIFFERENT opening joins the box.
+    act(() => {
+      ref.current!.addContext({ kind: 'quote', snippet: 'Margins slipped three percent', from: ANALYST });
+    });
+
+    await act(async () => {
+      resolvers[0](false);
+    });
+    // Immediately — no debounce, no giveBack yet: the stored draft's quotes
+    // carry the added quote's body (and the send's words are in the text).
+    const stored = JSON.parse(
+      localStorage.getItem(buildDraftStorageKey('thread:t-hostq', 'u-1')) ?? '{}',
+    ) as { text?: string; quotes?: Array<{ snippet?: string }> };
+    expect(stored.text).toContain('the refused words');
+    expect(stored.quotes?.map((q) => q.snippet)).toContain('Margins slipped three percent');
+    expect(loadInFlightCopies('thread:t-hostq', 'u-1')).toHaveLength(0);
+    // The host's giveBack owns the box: untouched by the settle.
+    expect(view.getTextarea().value).not.toContain('the refused words');
+    view.unmount();
+  });
 });
