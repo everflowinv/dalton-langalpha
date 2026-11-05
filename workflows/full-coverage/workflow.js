@@ -188,7 +188,7 @@ const facts = await agent(
 
 phase('问题清单')
 const frame = await agent(
-  `${base} 按 ${S}/references/frame.md 写 ${R}/questions.md。PM 要求：${args.pm_brief || '无'}；重点问题：${
+  `${base} 按 ${S}/references/frame.md 写 ${R}/questions.md（每问含 A / B / C / D 初始自评档位，只写在底稿、不进备忘录正文）。PM 要求：${args.pm_brief || '无'}；重点问题：${
     (args.focus_questions || []).join('；') || '默认'
   }。写完跑 python ${S}/scripts/research_structure.py validate-agenda ${R}/questions.md 到通过。初次覆盖稿与知识层在 ${W}/drafts/ 与 ${W} 根目录。若目标文件已存在，先读并核对，缺什么补什么，不必推倒重写。`,
   { agentType: 'general-purpose', label: 'frame', phase: '问题清单', schema: OUT }
@@ -443,7 +443,7 @@ const memo = memoCompleteSha
       sha256: memoCompleteSha,
     }
   : await agent(
-      `${base} 通读 ${R}/questions.md（12 问研究提纲）、${R}/e*.md（含文末逐题证据小结）、${R}/facts.md 与模型 ${modelPath} 的 Scenarios / Street vs House 输出，按 ${S}/references/memo-writing.md 一次写成完整备忘录 ${memoPath}${
+      `${base} 通读 ${R}/questions.md（12 问研究提纲）、${R}/e*.md（含文末逐题证据小结）、${R}/facts.md 与模型 ${modelPath} 的 Scenarios / Street vs House / Valuation Summary 输出，同步按支线证据更新 ${R}/questions.md 每问的 A / B / C / D 自评档位（只写在底稿、不进备忘录正文），并按 ${S}/references/memo-writing.md（章节顺序：摘要 → 公司与商业模式 → 行业与竞争〔可并入上一节〕→ 业务质量 → 核心投资逻辑与争议 → 财务预测与估值 → 风险 → 管理层 → 跟踪 → 附录 → 引用）一次写成完整备忘录 ${memoPath}${
         memoPartial
           ? `。盘上已有 ${memoPath} 的半成品（结构校验未通过）：先读已有内容，保留其中可用的部分，补齐缺失的章节与引用，修到结构完整；不要推倒重写已有内容`
           : ''
@@ -480,7 +480,7 @@ const [mcheck, reviewRaw] = await parallel([
       : agent(
           `审阅 ${memoPath}（被审草稿 sha256：${
             reviewedMemoSha || '未知'
-          }；支线 ${R}/e*.md，底表 ${R}/facts.md，模型 ${modelPath}，全部只读，不修改任何文件）。先只凭摘要复述投资论点（立场、赔率、改判条件），再逐节检查，重点：摘要（含投委会四问）、核心投资逻辑与争议、财务预测与估值（赔率卡与三层保护）、风险。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；items 逐项覆盖 1–9 项检查）。`,
+          }；问题提纲 ${R}/questions.md，支线 ${R}/e*.md，底表 ${R}/facts.md，模型 ${modelPath}，全部只读，不修改任何文件）。先只凭摘要复述投资论点（立场、赔率、改判条件），并对 ${R}/questions.md 中自评为 C、D 档的问题重点核对，再按章节顺序（摘要 → 公司与商业模式 → 行业与竞争〔可并入上一节〕→ 业务质量 → 核心投资逻辑与争议 → 财务预测与估值 → 风险 → 管理层 → 跟踪 → 附录 → 引用）逐节检查：摘要（含投委会四问）、公司与商业模式、行业与竞争、业务质量（Good Business〔生意质量〕/ Good People〔管理与组织质量〕/ Good Price〔价格与赔率〕三项判断是否各自独立且有证据支撑，综合判断评级表与方向和行动是否一致）、核心投资逻辑与争议、财务预测与估值（估值三角、赔率卡与三层保护）、风险（含一年后亏损 30% 的事前推演是否写出了空方最强版本）、管理层、跟踪、附录、引用。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；items 逐项覆盖 1–9 项检查）。`,
           { agentType: 'dalton-reviewer', label: '独立审稿', phase: '审模型与审稿', schema: VERDICT, reviewDraft: memoPath }
         ),
 ])
