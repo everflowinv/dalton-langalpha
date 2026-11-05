@@ -1926,10 +1926,10 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
     });
 
     it('a steer the server took, then handed back unconsumed by a stop, returns through the text channel', async () => {
-      // Round-10 item 3: two steers are queued server-side when the user
-      // stops; the cancel answer hands them back, then both POSTs drop. The
-      // text channel skips the composer-backed ones — their own not-taken
-      // settle seats each copy back whole, exactly once.
+      // Two composer steers are taken by the server (steering_accepted) and
+      // their POSTs end normally, so their drafts settle and the copies go.
+      // A later stop hands both back unconsumed: with no draft left behind
+      // them, the text channel must return their words.
       const steerKeys: string[] = [];
       let releaseFirst!: (v: { disconnected: boolean; aborted: boolean }) => void;
       const releaseSteers: Array<(v: { disconnected: boolean; aborted: boolean }) => void> = [];
@@ -2011,9 +2011,8 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
         ],
       });
 
-      // Both POSTs fail first (their acceptances never arrived): each draft
-      // settles not-taken and comes back. Seconds later the user stops, and
-      // the server hands the same two steers back — they must not land twice.
+      // Both POSTs end normally after the server took each steer. Seconds
+      // later the user stops, and the server hands the same two steers back.
       await act(async () => {
         releaseSteers[0]({ disconnected: false, aborted: false });
         releaseSteers[1]({ disconnected: false, aborted: false });
