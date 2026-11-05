@@ -91,6 +91,14 @@ class PromptLoader:
             **self._config.get("defaults", {}),
             **kwargs,  # User can override date if needed
         }
+        # DALTON-HOOK(team-memory-toggle): gate conversation_search prompt sentence and data map card row
+        has_explicit_team_memory = (
+            "conversation_search_enabled" in kwargs or "team_memory_enabled" in kwargs
+        )
+        context["conversation_search_enabled"] = bool(
+            context.get("conversation_search_enabled")
+            or context.get("team_memory_enabled")
+        )
         # DALTON-HOOK(data-map): inject system-generated data map (with static unprobed fallback)
         if "dalton_data_map" not in context and template_name in (
             "system.md.j2",
@@ -98,7 +106,13 @@ class PromptLoader:
         ):
             from src.dalton.data_map import resolve_prompt_data_map
 
-            context["dalton_data_map"] = resolve_prompt_data_map()
+            context["dalton_data_map"] = resolve_prompt_data_map(
+                team_memory_enabled=(
+                    context["conversation_search_enabled"]
+                    if has_explicit_team_memory
+                    else None
+                )
+            )
         return template.render(**context)
 
     def get_system_prompt(self, **kwargs: Any) -> str:

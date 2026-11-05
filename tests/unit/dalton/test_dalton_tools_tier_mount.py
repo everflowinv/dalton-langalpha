@@ -9,8 +9,25 @@ from src.dalton.tools import build_dalton_tools
 _ROLES = ("analyst", "chief_of_staff")
 
 
-def _tool_names(role: str, user_tier: str | None) -> set[str]:
-    return {t.name for t in build_dalton_tools(role, None, user_tier=user_tier)}
+def _tool_names(
+    role: str, user_tier: str | None, *, team_memory_enabled: bool = True
+) -> set[str]:
+    return {
+        t.name
+        for t in build_dalton_tools(
+            role,
+            None,
+            user_tier=user_tier,
+            team_memory_enabled=team_memory_enabled,
+        )
+    }
+
+
+@pytest.mark.parametrize("role", _ROLES)
+def test_default_off_omits_conversation_search(role: str):
+    assert "conversation_search" not in {
+        t.name for t in build_dalton_tools(role, None, user_tier="internal")
+    }
 
 
 @pytest.mark.parametrize("role", _ROLES)

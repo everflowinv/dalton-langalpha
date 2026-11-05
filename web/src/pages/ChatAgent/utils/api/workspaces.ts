@@ -339,6 +339,37 @@ export async function updateWorkspaceSharing(
   return data;
 }
 
+// DALTON-HOOK(team-memory-toggle): per-workspace Team Memory settings API contract
+export interface WorkspaceSettingsResponse {
+  workspace_id: string;
+  team_memory_enabled: boolean;
+  is_home?: boolean;
+  can_edit: boolean;
+  owner_external?: boolean;
+  updated_by?: string | null;
+  updated_at?: string | null;
+}
+
+export async function fetchWorkspaceSettings(
+  workspaceId: string,
+): Promise<WorkspaceSettingsResponse> {
+  const { data } = await api.get<WorkspaceSettingsResponse>(
+    `/api/v1/dalton/workspaces/${encodeURIComponent(workspaceId)}/settings`,
+  );
+  return data;
+}
+
+export async function updateWorkspaceSettings(
+  workspaceId: string,
+  payload: { team_memory_enabled: boolean },
+): Promise<WorkspaceSettingsResponse> {
+  const { data } = await api.put<WorkspaceSettingsResponse>(
+    `/api/v1/dalton/workspaces/${encodeURIComponent(workspaceId)}/settings`,
+    payload,
+  );
+  return data;
+}
+
 // --- Threads ---
 
 // DALTON-HOOK(wiki-ingest): workspace auto-ingest switch (D1)

@@ -62,15 +62,18 @@ export const GROUPS: readonly { labelKey: string; sections: readonly Section[] }
 ];
 
 // DALTON-HOOK(settings-section): shared visibility context and predicates from Dalton card modules
+// DALTON-HOOK(team-memory-toggle): Home Team Memory user-level switch setting entry
 import {
   canShowDaltonCosSharingCard,
   type DaltonSettingVisibilityContext,
 } from './panels/dalton/DaltonCosSharingCard';
+import { canShowDaltonHomeTeamMemoryCard } from './panels/dalton/DaltonHomeTeamMemoryCard';
 import { canShowDaltonInviteAdminCard } from './panels/dalton/DaltonInvitesCard';
 import { canShowDaltonFeishuScopesCard } from './panels/dalton/FeishuReadScopesCard';
 
 export {
   canShowDaltonCosSharingCard,
+  canShowDaltonHomeTeamMemoryCard,
   canShowDaltonInviteAdminCard,
   canShowDaltonFeishuScopesCard,
   type DaltonSettingVisibilityContext,
@@ -146,6 +149,8 @@ export const SETTINGS = {
   daltonReviewerModels: { section: 'model', anchor: 'dalton-reviewer-models', labelKey: 'settings.modelTuning.daltonReviewerModels', descKey: 'settings.modelTuning.daltonReviewerModelsDesc', advanced: true, keywords: '审稿 审稿模型候选 独立审稿模型 逻辑审稿 盲审 independent reviewer candidates' },
   daltonExtractModel: { section: 'model', anchor: 'dalton-extract-model', labelKey: 'settings.modelTuning.daltonExtractModel', descKey: 'settings.modelTuning.daltonExtractModelDesc', advanced: true, keywords: '对话归档抽卡模型 网页摘取模型 摘取 conversation archive extraction model' },
   daltonCosSharing: { section: 'model', anchor: 'dalton-cos-sharing', labelKey: 'settings.dalton.cosSharingLabel', descKey: 'settings.dalton.cosSharingDesc', keywords: '研究总监 研究总监共享开关 允许同事的研究总监向我的工作区派活 chief of staff sharing colleague dispatch', visibleWhen: canShowDaltonCosSharingCard },
+  // DALTON-HOOK(team-memory-toggle): Home Team Memory user-level setting entry
+  daltonHomeTeamMemory: { section: 'model', anchor: 'dalton-home-team-memory', labelKey: 'settings.dalton.homeTeamMemoryLabel', descKey: 'settings.dalton.homeTeamMemoryDesc', keywords: '团队记忆 Home 对话记录 对话卡片 team memory home conversation archive', visibleWhen: canShowDaltonHomeTeamMemoryCard },
   daltonInvites: { section: 'model', anchor: 'dalton-invites', labelKey: 'settings.dalton.invitesLabel', descKey: 'settings.dalton.invitesDesc', keywords: '团队邀请 成员权限 邀请链接 team invites allowlist', visibleWhen: canShowDaltonInviteAdminCard },
   daltonFeishuScopes: { section: 'model', anchor: 'dalton-feishu-scopes', labelKey: 'settings.dalton.feishuScopesLabel', descKey: 'settings.dalton.feishuScopesDesc', keywords: '飞书读取权限 飞书授权 文档 知识库 多维表格 feishu read scopes', visibleWhen: canShowDaltonFeishuScopesCard },
   daltonProviders: { section: 'model', anchor: 'dalton-providers', labelKey: 'settings.dalton.providersLabel', descKey: 'settings.dalton.providersDesc', keywords: '团队凭据 模型与数据源状态 团队共享凭据 team credentials provider status openclaw' },

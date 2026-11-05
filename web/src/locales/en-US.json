@@ -687,6 +687,8 @@
       "routingDesc": "Default models for figure audit, language review, independent review, auxiliary tasks, and conversation archive extraction.",
       "cosSharingLabel": "Chief of Staff workspace sharing",
       "cosSharingDesc": "Allow teammates’ Chief of Staff to dispatch research tasks to your workspaces.",
+      "homeTeamMemoryLabel": "Home Team Memory",
+      "homeTeamMemoryDesc": "Allow Chief of Staff (Home) to search past team conversation records (OpenClaw conversation cards).",
       "invitesLabel": "Team invitations & member access",
       "invitesDesc": "Manage single-use invite links, member tiers, and external workspace grants.",
       "feishuScopesLabel": "Feishu read scopes",
@@ -7003,6 +7005,15 @@
       "dispatchedByBadge": "Dispatched by {{name}}",
       "dispatchedThreadReadonlyHint": "Dispatched by {{name}} · Only the creator can send follow-up messages",
       "revokedThreadReadonlyHint": "The workspace owner has revoked write access · Historical conversation is read-only"
+    },
+    "teamMemory": {
+      "workspaceTitle": "Team Memory",
+      "workspaceDesc": "Allow the analyst to search past team conversation records (OpenClaw conversation cards)",
+      "homeTitle": "Home Team Memory",
+      "homeDesc": "Allow Chief of Staff (Home) to search past team conversation records (OpenClaw conversation cards)",
+      "loading": "Loading settings…",
+      "saveFailed": "Failed to save settings. Please try again.",
+      "toggleFailed": "Failed to update setting. Please try again."
     },
     "autoIngest": {
       "on": "Auto-ingest: on",

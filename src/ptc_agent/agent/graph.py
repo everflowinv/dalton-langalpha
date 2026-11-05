@@ -170,10 +170,28 @@ async def build_ptc_graph(
         fetch_user_data_counts(user_id),
         _read_workspace_naming(conversation_id),
     )
-    # DALTON-HOOK(data-map): warm per-turn data map from Postgres daily cache (falls back to static unprobed map)
+    # DALTON-HOOK(team-memory-toggle): resolve per-turn Team Memory switch from Postgres
     from src.dalton.data_map import warm_turn_data_map
+    from src.dalton.sharing import resolve_turn_team_memory_enabled
 
-    await warm_turn_data_map(search_api=getattr(config, "search_api", None))
+    caller_tier: str | None = None
+    if user_id:
+        from src.dalton.access_tiers import get_user_tier
+
+        caller_tier = await get_user_tier(user_id)
+
+    team_memory_enabled = await resolve_turn_team_memory_enabled(
+        role="analyst",
+        workspace_id=conversation_id,
+        user_id=user_id,
+        user_tier=caller_tier,
+    )
+
+    # DALTON-HOOK(data-map): warm per-turn data map from Postgres daily cache (falls back to static unprobed map)
+    await warm_turn_data_map(
+        search_api=getattr(config, "search_api", None),
+        team_memory_enabled=team_memory_enabled,
+    )
 
     inner_agent = ptc_agent.create_agent(
         sandbox=session.sandbox,
@@ -189,6 +207,12 @@ async def build_ptc_graph(
         user_id=user_id,
         user_data_counts=user_data_counts,
         tool_summary=getattr(session, "mcp_tool_summary", None),
+        user_tier=caller_tier,  # DALTON-HOOK(dalton-tools)
+        **(
+            {"team_memory_enabled": True}
+            if team_memory_enabled
+            else {}
+        ),  # DALTON-HOOK(team-memory-toggle)
     )
 
     logger.debug(
@@ -296,11 +320,6 @@ async def build_ptc_graph_with_session(
                     vault_secrets.setdefault(k, v)
     else:
         vault_secrets = dict(getattr(session.sandbox, "vault_secrets", None) or {})
-    # DALTON-HOOK(data-map): warm per-turn data map from Postgres daily cache (falls back to static unprobed map)
-    from src.dalton.data_map import warm_turn_data_map
-
-    await warm_turn_data_map(search_api=getattr(config, "search_api", None))
-
     # DALTON-HOOK(dalton-tools): the caller's tier gates internal-only Dalton
     # tools at mount time. Resolved fresh per build off the roster (never
     # cached — multi-worker truth lives in Postgres) and it fails closed: a
@@ -311,6 +330,23 @@ async def build_ptc_graph_with_session(
         from src.dalton.access_tiers import get_user_tier
 
         caller_tier = await get_user_tier(user_id)
+
+    # DALTON-HOOK(team-memory-toggle): resolve per-turn Team Memory switch from Postgres
+    from src.dalton.data_map import warm_turn_data_map
+    from src.dalton.sharing import resolve_turn_team_memory_enabled
+
+    team_memory_enabled = await resolve_turn_team_memory_enabled(
+        role=role,
+        workspace_id=workspace_id,
+        user_id=user_id,
+        user_tier=caller_tier,
+    )
+
+    # DALTON-HOOK(data-map): warm per-turn data map from Postgres daily cache (falls back to static unprobed map)
+    await warm_turn_data_map(
+        search_api=getattr(config, "search_api", None),
+        team_memory_enabled=team_memory_enabled,
+    )
 
     inner_agent = ptc_agent.create_agent(
         sandbox=session.sandbox,
@@ -355,6 +391,11 @@ async def build_ptc_graph_with_session(
             if tail_turn_no_new_work
             else {}
         ),
+        **(
+            {"team_memory_enabled": True}
+            if team_memory_enabled
+            else {}
+        ),  # DALTON-HOOK(team-memory-toggle)
     )
 
     logger.debug(

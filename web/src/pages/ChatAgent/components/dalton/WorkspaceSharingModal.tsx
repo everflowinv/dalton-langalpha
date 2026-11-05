@@ -7,16 +7,22 @@ import { AlertTriangle, Share2 } from 'lucide-react';
 import { ModalShell } from '@/components/ui/ModalShell';
 import { queryKeys } from '@/lib/queryKeys';
 import {
+  fetchWorkspaceSettings,
   fetchWorkspaceSharing,
+  updateWorkspaceSettings,
   updateWorkspaceSharing,
   type WorkspaceAccessLevel,
+  type WorkspaceSettingsResponse,
   type WorkspaceSharingResponse,
 } from '../../utils/api/workspaces';
 
 export {
+  fetchWorkspaceSettings,
   fetchWorkspaceSharing,
+  updateWorkspaceSettings,
   updateWorkspaceSharing,
   type WorkspaceAccessLevel,
+  type WorkspaceSettingsResponse,
   type WorkspaceSharingResponse,
 };
 
@@ -64,6 +70,34 @@ export function useUpdateWorkspaceSharing(workspaceId: string) {
   });
 }
 
+export function useWorkspaceSettings(
+  workspaceId: string | null | undefined,
+  enabled = true,
+) {
+  const id = workspaceId ?? '';
+  return useQuery<WorkspaceSettingsResponse>({
+    queryKey: queryKeys.dalton.workspaceSettings(id),
+    queryFn: () => fetchWorkspaceSettings(id),
+    enabled: Boolean(id) && enabled,
+    staleTime: 30_000,
+    retry: false,
+  });
+}
+
+export function useUpdateWorkspaceSettings(workspaceId: string) {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (payload: { team_memory_enabled: boolean }) =>
+      updateWorkspaceSettings(workspaceId, payload),
+    onSuccess: (updated) => {
+      queryClient.setQueryData(
+        queryKeys.dalton.workspaceSettings(workspaceId),
+        updated,
+      );
+    },
+  });
+}
+
 export function WorkspaceSharingModal({
   workspaceId,
   readOnly = false,
@@ -77,10 +111,18 @@ export function WorkspaceSharingModal({
   const titleId = useId();
   const [open, setOpen] = useState(false);
   const { data, isLoading, isError } = useWorkspaceSharing(workspaceId);
+  const { data: settingsData } = useWorkspaceSettings(workspaceId);
   const mutation = useUpdateWorkspaceSharing(workspaceId);
+  const settingsMutation = useUpdateWorkspaceSettings(workspaceId);
 
   const [draftCos, setDraftCos] = useState<WorkspaceAccessLevel>('ro');
   const [draftWeb, setDraftWeb] = useState<WorkspaceAccessLevel>('hidden');
+  const [draftTeamMemory, setDraftTeamMemory] = useState<boolean | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+
+  if (open && draftTeamMemory === null && settingsData !== undefined) {
+    setDraftTeamMemory(settingsData.team_memory_enabled === true);
+  }
 
   if (!workspaceId || isError || (isLoading && !data) || data?.is_home) {
     return null;
@@ -91,30 +133,82 @@ export function WorkspaceSharingModal({
   const dispatchEnabled = data?.colleague_dispatch_enabled === true;
   const ownerExternal = data?.owner_external === true;
   const canEdit = data?.can_edit ?? !readOnly;
+  const settingsLoaded = settingsData !== undefined;
+  const canEditTeamMemory =
+    settingsLoaded &&
+    settingsData.can_edit === true &&
+    !readOnly &&
+    !ownerExternal;
+  const showTeamMemorySection =
+    !readOnly &&
+    !ownerExternal &&
+    (settingsLoaded ? settingsData.can_edit === true : canEdit);
+  const isTeamMemoryDisabled = !canEditTeamMemory || mutation.isPending || settingsMutation.isPending;
+  const isPending = mutation.isPending || settingsMutation.isPending;
 
   const handleOpen = () => {
+    setSaveError(null);
     setDraftCos(cosAccess);
     setDraftWeb(webAccess);
+    setDraftTeamMemory(
+      settingsData !== undefined
+        ? settingsData.team_memory_enabled === true
+        : null,
+    );
     setOpen(true);
   };
 
   const handleClose = () => {
-    if (mutation.isPending) return;
+    if (isPending) return;
+    setSaveError(null);
     setOpen(false);
   };
 
-  const handleSave = () => {
-    if (!canEdit || mutation.isPending) return;
-    mutation.mutate(
+  const handleSave = async () => {
+    if (!canEdit || isPending) return;
+    setSaveError(null);
+
+    const sharingChanged =
       dispatchEnabled || ownerExternal
-        ? { web_access: draftWeb }
-        : { cos_access: draftCos, web_access: draftWeb },
-      {
-        onSuccess: () => {
-          setOpen(false);
-        },
-      },
-    );
+        ? draftWeb !== webAccess
+        : draftWeb !== webAccess || draftCos !== cosAccess;
+
+    const teamMemoryChanged =
+      canEditTeamMemory &&
+      draftTeamMemory !== null &&
+      draftTeamMemory !== (settingsData.team_memory_enabled === true);
+
+    if (!sharingChanged && !teamMemoryChanged) {
+      setOpen(false);
+      return;
+    }
+
+    const tasks: Promise<unknown>[] = [];
+    if (sharingChanged) {
+      tasks.push(
+        mutation.mutateAsync(
+          dispatchEnabled || ownerExternal
+            ? { web_access: draftWeb }
+            : { cos_access: draftCos, web_access: draftWeb },
+        ),
+      );
+    }
+    if (teamMemoryChanged) {
+      tasks.push(
+        settingsMutation.mutateAsync({
+          team_memory_enabled: draftTeamMemory,
+        }),
+      );
+    }
+
+    const results = await Promise.allSettled(tasks);
+    if (results.some((r) => r.status === 'rejected')) {
+      setSaveError(
+        t('dalton.teamMemory.saveFailed', '设置保存失败，请稍后重试'),
+      );
+      return;
+    }
+    setOpen(false);
   };
 
   return (
@@ -147,7 +241,7 @@ export function WorkspaceSharingModal({
             labelId={titleId}
             title={t('dalton.sharing.title', '共享设置')}
             onClose={handleClose}
-            closeDisabled={mutation.isPending}
+            closeDisabled={isPending}
             width="narrow"
             density="form"
             footer={
@@ -155,7 +249,7 @@ export function WorkspaceSharingModal({
                 <button
                   type="button"
                   onClick={handleClose}
-                  disabled={mutation.isPending}
+                  disabled={isPending}
                   data-testid="sharing-cancel-btn"
                   className="px-3 py-1.5 rounded-md text-xs border transition-colors hover:bg-foreground/5 disabled:opacity-50"
                   style={{
@@ -167,8 +261,8 @@ export function WorkspaceSharingModal({
                 </button>
                 <button
                   type="button"
-                  disabled={!canEdit || mutation.isPending}
-                  onClick={handleSave}
+                  disabled={!canEdit || isPending}
+                  onClick={() => void handleSave()}
                   data-testid="sharing-save-btn"
                   className="px-3 py-1.5 rounded-md text-xs font-medium transition-opacity hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed"
                   style={{
@@ -198,7 +292,7 @@ export function WorkspaceSharingModal({
                 ) : (
                   <fieldset
                     className="flex flex-col gap-2"
-                    disabled={!canEdit || mutation.isPending}
+                    disabled={!canEdit || isPending}
                     data-testid="sharing-cos-fieldset"
                   >
                     <legend
@@ -220,7 +314,7 @@ export function WorkspaceSharingModal({
                             name="cos_access"
                             value={opt.value}
                             checked={draftCos === opt.value}
-                            disabled={!canEdit || mutation.isPending}
+                            disabled={!canEdit || isPending}
                             onChange={() => setDraftCos(opt.value)}
                             data-testid={`sharing-cos-${opt.value}`}
                           />
@@ -233,7 +327,7 @@ export function WorkspaceSharingModal({
 
               <fieldset
                 className="flex flex-col gap-2"
-                disabled={!canEdit || mutation.isPending}
+                disabled={!canEdit || isPending}
                 data-testid="sharing-web-fieldset"
               >
                 <legend
@@ -255,7 +349,7 @@ export function WorkspaceSharingModal({
                         name="web_access"
                         value={opt.value}
                         checked={draftWeb === opt.value}
-                        disabled={!canEdit || mutation.isPending}
+                        disabled={!canEdit || isPending}
                         onChange={() => setDraftWeb(opt.value)}
                         data-testid={`sharing-web-${opt.value}`}
                       />
@@ -298,6 +392,85 @@ export function WorkspaceSharingModal({
               >
                 {t('dalton.sharing.homeNote', 'Home 工作区始终不对他人开放')}
               </p>
+
+              {showTeamMemorySection && (
+                <div
+                  data-testid="workspace-team-memory-section"
+                  className="flex items-center justify-between gap-3 pt-3 border-t"
+                  style={{ borderColor: 'var(--color-border-muted)' }}
+                >
+                  <div className="flex flex-col gap-0.5 min-w-0">
+                    <span
+                      className="text-xs font-medium"
+                      style={{ color: 'var(--color-text-secondary)' }}
+                    >
+                      {t('dalton.teamMemory.workspaceTitle', '团队记忆')}
+                    </span>
+                    <span
+                      className="text-xs"
+                      style={{ color: 'var(--color-text-tertiary)' }}
+                    >
+                      {!settingsLoaded
+                        ? t('dalton.teamMemory.loading', '正在加载设置…')
+                        : t(
+                            'dalton.teamMemory.workspaceDesc',
+                            '允许分析师查阅团队过去的对话记录（OpenClaw 对话卡片）',
+                          )}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={draftTeamMemory === true}
+                    aria-busy={!settingsLoaded || settingsMutation.isPending}
+                    aria-label={t('dalton.teamMemory.workspaceTitle', '团队记忆')}
+                    disabled={isTeamMemoryDisabled}
+                    onClick={() => {
+                      if (isTeamMemoryDisabled) return;
+                      setDraftTeamMemory(
+                        (prev) =>
+                          !(
+                            prev !== null
+                              ? prev
+                              : settingsData.team_memory_enabled === true
+                          ),
+                      );
+                    }}
+                    data-testid="workspace-team-memory-switch"
+                    className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
+                      isTeamMemoryDisabled ? 'cursor-not-allowed opacity-50' : 'cursor-pointer'
+                    }`}
+                    style={{
+                      backgroundColor:
+                        draftTeamMemory === true
+                          ? 'var(--color-accent-primary)'
+                          : 'var(--color-border-default)',
+                    }}
+                  >
+                    <span
+                      className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                        draftTeamMemory === true ? 'translate-x-4' : 'translate-x-1'
+                      }`}
+                    />
+                  </button>
+                </div>
+              )}
+
+              {saveError && (
+                <div
+                  role="alert"
+                  data-testid="workspace-sharing-save-error"
+                  className="flex items-center gap-2 rounded-md border px-3 py-2 text-xs"
+                  style={{
+                    borderColor: 'var(--color-danger, #ef4444)',
+                    backgroundColor: 'rgba(239, 68, 68, 0.08)',
+                    color: 'var(--color-danger, #ef4444)',
+                  }}
+                >
+                  <AlertTriangle className="h-4 w-4 shrink-0" />
+                  <span>{saveError}</span>
+                </div>
+              )}
 
             </div>
           </ModalShell>,

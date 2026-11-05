@@ -372,6 +372,9 @@ export const queryKeys = {
     feishuSpaces: () => [...queryKeys.dalton.all, 'feishu', 'spaces'],
     // DALTON-HOOK(query-keys): global keyword search query key
     search: (q: string, limit = 20) => [...queryKeys.dalton.all, 'search', q, limit],
+    // DALTON-HOOK(team-memory-toggle): workspace and user-level Team Memory settings query keys
+    workspaceSettings: (workspaceId: string) => [...queryKeys.dalton.all, 'workspace-settings', workspaceId],
+    userSettings: () => [...queryKeys.dalton.all, 'user-settings'],
   },
 };
 

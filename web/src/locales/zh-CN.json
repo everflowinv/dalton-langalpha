@@ -685,6 +685,8 @@
       "routingDesc": "数字核验、语言审查、独立审稿、辅助任务与对话归档抽卡的默认模型配置。",
       "cosSharingLabel": "研究总监工作区共享",
       "cosSharingDesc": "允许同事的研究总监向我的工作区派发研究任务或追问。",
+      "homeTeamMemoryLabel": "Home 团队记忆",
+      "homeTeamMemoryDesc": "允许研究总监（Home）查阅团队过去的对话记录（OpenClaw 对话卡片）。",
       "invitesLabel": "团队邀请与成员权限",
       "invitesDesc": "管理一次性注册邀请链接、成员角色与外部工作区授权。",
       "feishuScopesLabel": "飞书读取权限范围",
@@ -6885,6 +6887,15 @@
       "dispatchedByBadge": "由 {{name}} 派发",
       "dispatchedThreadReadonlyHint": "由 {{name}} 派发 · 仅创建者可继续提问",
       "revokedThreadReadonlyHint": "工作区所有者已收回写入权限 · 当前仅可只读查看历史对话"
+    },
+    "teamMemory": {
+      "workspaceTitle": "团队记忆",
+      "workspaceDesc": "允许分析师查阅团队过去的对话记录（OpenClaw 对话卡片）",
+      "homeTitle": "Home 团队记忆",
+      "homeDesc": "允许研究总监（Home）查阅团队过去的对话记录（OpenClaw 对话卡片）",
+      "loading": "正在加载设置…",
+      "saveFailed": "设置保存失败，请稍后重试",
+      "toggleFailed": "切换失败，请稍后重试"
     },
     "autoIngest": {
       "on": "自动入库：开启",

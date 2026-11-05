@@ -96,8 +96,16 @@ class WorkspaceSharingUpdateRequest(BaseModel):
     web_access: str | None = None
 
 
+class WorkspaceSettingsUpdateRequest(BaseModel):
+    team_memory_enabled: bool
+
+
 class UserSharingUpdateRequest(BaseModel):
     cos_rw_enabled: bool
+
+
+class UserSettingsUpdateRequest(BaseModel):
+    home_team_memory_enabled: bool
 
 
 class SystemJobToggleRequest(BaseModel):
@@ -660,6 +668,213 @@ async def update_workspace_sharing_endpoint(
     }
 
 
+@router.get("/workspaces/{workspace_id}/settings")
+@handle_api_exceptions("get workspace settings", logger)
+async def get_workspace_settings_endpoint(
+    workspace_id: str,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    from src.dalton.access_tiers import classify_owner_tier, get_user_tier
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    from src.dalton.sharing import (
+        can_edit_workspace_settings,
+        get_workspace_settings,
+        get_workspace_sharing,
+        require_team_reader,
+        require_workspace_access,
+    )
+    from src.server.database import workspace as ws_db
+    from src.server.database.home_workspace import is_home_row
+
+    uid = str(user_id or "").strip()
+    if not uid:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    is_pm = uid in get_dalton_settings().pm_user_ids
+    if is_dalton_supabase_auth_enabled() and not is_pm:
+        await require_team_reader(uid)
+
+    ws = await ws_db.get_workspace(workspace_id)
+    if ws is None or ws.get("status") == "deleted":
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+    is_home = is_home_row(ws) or bool(ws.get("is_home"))
+    owner_id = str(ws.get("user_id") or "").strip()
+
+    owner_tier: str | None = None
+    if is_dalton_supabase_auth_enabled() and owner_id and owner_id != uid:
+        caller_tier = await get_user_tier(uid)
+        if caller_tier == "external":
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        owner_tier = await classify_owner_tier(owner_id)
+        if owner_tier == "unknown":
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        if owner_tier == "external" and is_home:
+            raise HTTPException(status_code=404, detail="Workspace not found")
+
+    if is_home:
+        if owner_id != uid:
+            raise HTTPException(
+                status_code=403,
+                detail="Home workspace is not shared with team members",
+            )
+        return {
+            "workspace_id": str(ws["workspace_id"]),
+            "team_memory_enabled": False,
+            "is_home": True,
+            "can_edit": False,
+            "owner_external": False,
+            "updated_by": None,
+            "updated_at": None,
+        }
+
+    effective_owner_tier = owner_tier
+    if (
+        effective_owner_tier is None
+        and is_dalton_supabase_auth_enabled()
+        and owner_id
+    ):
+        effective_owner_tier = await classify_owner_tier(owner_id)
+    owner_external = effective_owner_tier == "external"
+
+    if owner_external:
+        if owner_id != uid:
+            if ws.get("status") in ("unbound", "deleted"):
+                raise HTTPException(status_code=404, detail="Workspace not found")
+            await require_team_reader(owner_id)
+            sharing = await get_workspace_sharing(str(ws["workspace_id"]))
+            if sharing.get("web_access") == "hidden":
+                raise HTTPException(status_code=404, detail="Workspace not found")
+        return {
+            "workspace_id": str(ws["workspace_id"]),
+            "team_memory_enabled": False,
+            "is_home": False,
+            "can_edit": False,
+            "owner_external": True,
+            "updated_by": None,
+            "updated_at": None,
+        }
+
+    can_edit = can_edit_workspace_settings(ws, uid, owner_external=owner_external)
+    if not can_edit:
+        if is_dalton_supabase_auth_enabled():
+            await require_workspace_access(
+                ws,
+                uid,
+                channel="web",
+                need="read",
+                workspace=ws,
+            )
+        else:
+            raise HTTPException(
+                status_code=403,
+                detail="Not authorized to access this workspace",
+            )
+
+    settings_row = await get_workspace_settings(str(ws["workspace_id"]))
+    return {
+        **settings_row,
+        "is_home": False,
+        "can_edit": can_edit,
+        "owner_external": False,
+    }
+
+
+@router.put("/workspaces/{workspace_id}/settings")
+@handle_api_exceptions("update workspace settings", logger)
+async def update_workspace_settings_endpoint(
+    workspace_id: str,
+    body: WorkspaceSettingsUpdateRequest,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    from src.dalton.access_tiers import classify_owner_tier, get_user_tier
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    from src.dalton.sharing import (
+        can_edit_workspace_settings,
+        get_workspace_sharing,
+        require_team_reader,
+        upsert_workspace_settings,
+    )
+    from src.server.database import workspace as ws_db
+    from src.server.database.home_workspace import is_home_row
+
+    uid = str(user_id or "").strip()
+    if not uid:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    is_pm = uid in get_dalton_settings().pm_user_ids
+    if is_dalton_supabase_auth_enabled() and not is_pm:
+        await require_team_reader(uid)
+
+    ws = await ws_db.get_workspace(workspace_id)
+    if ws is None or ws.get("status") == "deleted":
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+    is_home = is_home_row(ws) or bool(ws.get("is_home"))
+    owner_id = str(ws.get("user_id") or "").strip()
+
+    owner_tier: str | None = None
+    if is_dalton_supabase_auth_enabled() and owner_id and owner_id != uid:
+        caller_tier = await get_user_tier(uid)
+        if caller_tier == "external":
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        owner_tier = await classify_owner_tier(owner_id)
+        if owner_tier == "unknown":
+            raise HTTPException(status_code=404, detail="Workspace not found")
+        if owner_tier == "external" and is_home:
+            raise HTTPException(status_code=404, detail="Workspace not found")
+
+    if is_home:
+        if owner_id != uid:
+            raise HTTPException(
+                status_code=403,
+                detail="Home workspace is not shared with team members",
+            )
+        raise HTTPException(
+            status_code=400,
+            detail="Home workspace settings must be configured in user settings",
+        )
+
+    effective_owner_tier = owner_tier
+    if (
+        effective_owner_tier is None
+        and is_dalton_supabase_auth_enabled()
+        and owner_id
+    ):
+        effective_owner_tier = await classify_owner_tier(owner_id)
+    owner_external = effective_owner_tier == "external"
+    if owner_external:
+        if owner_id != uid:
+            if ws.get("status") in ("unbound", "deleted"):
+                raise HTTPException(status_code=404, detail="Workspace not found")
+            await require_team_reader(owner_id)
+            sharing = await get_workspace_sharing(str(ws["workspace_id"]))
+            if sharing.get("web_access") == "hidden":
+                raise HTTPException(status_code=404, detail="Workspace not found")
+        raise HTTPException(
+            status_code=403,
+            detail="Only internal workspace owner may modify workspace settings",
+        )
+
+    if not can_edit_workspace_settings(ws, uid, owner_external=owner_external):
+        raise HTTPException(
+            status_code=403,
+            detail="Only workspace owner may modify workspace settings",
+        )
+
+    saved = await upsert_workspace_settings(
+        str(ws["workspace_id"]),
+        team_memory_enabled=body.team_memory_enabled,
+        updated_by=uid,
+    )
+    return {
+        **saved,
+        "is_home": False,
+        "can_edit": True,
+        "owner_external": False,
+    }
+
+
 @router.get("/sharing/user-settings")
 @handle_api_exceptions("get user cos sharing settings", logger)
 async def get_user_sharing_settings_endpoint(
@@ -737,6 +952,82 @@ async def update_user_sharing_settings_endpoint(
         "can_edit": True,
         "caller_tier": caller_tier,
         "colleague_dispatch_enabled": is_colleague_dispatch_enabled(),
+    }
+
+
+@router.get("/user-settings")
+@handle_api_exceptions("get user team memory settings", logger)
+async def get_user_settings_endpoint(
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    from src.dalton.access_tiers import get_user_tier
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    from src.dalton.sharing import (
+        get_user_team_memory_settings,
+        require_team_reader,
+    )
+
+    uid = str(user_id or "").strip()
+    if not uid:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    if is_dalton_supabase_auth_enabled():
+        await require_team_reader(uid)
+        caller_tier = await get_user_tier(uid)
+        if caller_tier == "external":
+            return {
+                "user_id": uid,
+                "home_team_memory_enabled": False,
+                "can_edit": False,
+                "caller_tier": caller_tier,
+                "updated_at": None,
+            }
+    else:
+        caller_tier = "internal"
+
+    settings_row = await get_user_team_memory_settings(uid)
+    return {
+        **settings_row,
+        "can_edit": True,
+        "caller_tier": caller_tier,
+    }
+
+
+@router.put("/user-settings")
+@handle_api_exceptions("update user team memory settings", logger)
+async def update_user_settings_endpoint(
+    body: UserSettingsUpdateRequest,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    from src.dalton.access_tiers import get_user_tier
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    from src.dalton.sharing import (
+        require_team_reader,
+        upsert_user_team_memory_settings,
+    )
+
+    uid = str(user_id or "").strip()
+    if not uid:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    if is_dalton_supabase_auth_enabled():
+        await require_team_reader(uid)
+        caller_tier = await get_user_tier(uid)
+        if caller_tier == "external":
+            raise HTTPException(
+                status_code=403,
+                detail="外部成员不提供团队记忆设置",
+            )
+    else:
+        caller_tier = "internal"
+
+    saved = await upsert_user_team_memory_settings(
+        uid, home_team_memory_enabled=body.home_team_memory_enabled
+    )
+    return {
+        **saved,
+        "can_edit": True,
+        "caller_tier": caller_tier,
     }
 
 

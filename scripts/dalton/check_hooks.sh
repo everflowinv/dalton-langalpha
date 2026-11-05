@@ -311,6 +311,8 @@ ALLOWED_HOOKS=(
   # 但赔率变了）——validate 的 changed/reason 组合校验、price_move 推送按
   # payoff_assessment.changed=true 放行并改标题、完成契约的必填与推送稿要求。
   "payoff-assessment"
+  # Team Memory toggle: per-workspace and Home user-level switch for conversation_search
+  "team-memory-toggle"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
