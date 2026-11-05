@@ -459,9 +459,10 @@ export function useChatMessages(
   // not-taken settle restores the draft whole.
   const composerSteerKeysRef = useRef(new Set<string>());
   // DALTON-HOOK(composer-drafts): composer steers whose POST already ended
-  // (its draft settled: restored, or taken). A stop that returns one of them
-  // later must not put its words back a second time; cleared once a stop has
-  // read it.
+  // with the draft put back (not taken). A stop that returns one of them later
+  // must not put its words back a second time; cleared once a stop has read
+  // it. Taken steers are not listed: their draft is gone, so a stop that hands
+  // one back unconsumed returns it through the text channel.
   const settledComposerSteerKeysRef = useRef(new Set<string>());
   // A refused steer's banner, for a load to show again once it has cleared
   // it: the first load to succeed after the refusal shows it, unless a turn
@@ -2379,7 +2380,10 @@ export function useChatMessages(
       requestKeys.settle(requestKey, ended);
       if (hasComposer) {
         composerSteerKeysRef.current.delete(requestKey);
-        settledComposerSteerKeysRef.current.add(requestKey);
+        // Only a steer whose draft came back (not taken) is skipped by a later
+        // stop's text channel. One the server took has no draft left, so if
+        // the stop hands it back unconsumed, the text channel must return it.
+        if (!acceptedFired) settledComposerSteerKeysRef.current.add(requestKey);
       }
       steersInFlightRef.current.delete(seq);
       if (notRunningSendsRef.current.length > 0) setNotRunningTick((n) => n + 1);
