@@ -41,7 +41,7 @@ vi.mock('@/hooks/useUser', () => ({
 import { sendChatMessageStream } from '../../utils/api';
 import { ensureThreadId } from '../../session/threadCreation';
 import { useChatMessages } from '../useChatMessages';
-import { useComposerDraft, load, loadInFlightCopy } from '@/lib/dalton/chatDrafts';
+import { useComposerDraft, load, loadInFlightCopies } from '@/lib/dalton/chatDrafts';
 
 const mockSendStream = sendChatMessageStream as Mock;
 const mockEnsureThreadId = ensureThreadId as Mock;
@@ -274,7 +274,7 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
       // The composer input is clear for the next thought, but the send's copy
       // survives in its own storage slot — the queue cleared nothing.
       expect(result.current.composer.message).toBe('');
-      expect(loadInFlightCopy(DRAFT_KEY)?.text).toBe('held while compacting');
+      expect(loadInFlightCopies(DRAFT_KEY).map((c) => c.text)).toContain('held while compacting');
     });
 
     it('settles the parked send as failed when the user stops, so the draft returns to the composer', async () => {
@@ -422,11 +422,14 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
       return { chat, composer };
     }
 
-    /** The send's own copy (its separate storage slot), or null. */
-    const storedCopy = (): { text?: string } | null => {
+    /** The unresolved sends' copies (their separate storage slot). */
+    const storedCopies = (): Array<{ id?: string; text?: string }> => {
       const raw = localStorage.getItem(`dalton.chatInFlight.v1:anon:${DRAFT_KEY}`);
-      return raw ? (JSON.parse(raw) as { text?: string }) : null;
+      return raw ? (JSON.parse(raw) as Array<{ id?: string; text?: string }>) : [];
     };
+    /** The one copy a test cares about, by its text. */
+    const storedCopy = (text: string): { id?: string; text?: string } | undefined =>
+      storedCopies().find((c) => c.text === text);
 
     /** Lets timer-scheduled microtasks run between fake-clock steps. */
     async function settle(ms: number) {
@@ -509,7 +512,7 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
         expect(handedOff).toHaveBeenCalledTimes(1);
         expect(accepted).not.toHaveBeenCalled();
         expect(result.current.composer.message).toBe('');
-        expect(storedCopy()).toMatchObject({ text: 'dropped in setup' });
+        expect(storedCopy('dropped in setup')).toBeTruthy();
 
         // The server said this attempt failed before any run, so upstream sends
         // the resend as a new request (useChatMessages.autoRetry.test.ts,
@@ -523,7 +526,7 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
         // promise's own true (it resolves once the turn is handed off) settled
         // nothing.
         expect(accepted).toHaveBeenCalledTimes(1);
-        expect(storedCopy()).toBeNull();
+        expect(storedCopies()).toHaveLength(0);
         let resolved: boolean | undefined;
         await act(async () => {
           void sendPromise.then((v) => { resolved = v; });
@@ -751,7 +754,7 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
         await settle(0);
         expect(mockSendStream).toHaveBeenCalledTimes(1);
         expect(accepted).not.toHaveBeenCalled();
-        expect(storedCopy()).toMatchObject({ text: 'stopped mid-backoff' });
+        expect(storedCopy('stopped mid-backoff')).toBeTruthy();
 
         await act(async () => {
           await result.current.chat.stopWorkflow();
@@ -763,7 +766,7 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
         expect(accepted).not.toHaveBeenCalled();
         expect(result.current.composer.message).toBe('stopped mid-backoff');
         expect(load(DRAFT_KEY)).toBe('stopped mid-backoff');
-        expect(storedCopy()).toBeNull();
+        expect(storedCopies()).toHaveLength(0);
       } finally {
         vi.useRealTimers();
       }
@@ -817,7 +820,7 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
         });
         await settle(0);
         // The chain's first leg parks the draft.
-        expect(storedCopy()).toMatchObject({ text: 'exhausted then retried' });
+        expect(storedCopy('exhausted then retried')).toBeTruthy();
 
         // The last automatic attempt fails the same way: the chain gives up,
         // and the draft comes back whole.
@@ -837,7 +840,7 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
         });
         expect(mockSendStream).toHaveBeenCalledTimes(3);
         expect(accepted).toHaveBeenCalledTimes(1);
-        expect(storedCopy()).toBeNull();
+        expect(storedCopies()).toHaveLength(0);
         expect(result.current.composer.message).toBe('exhausted then retried');
         expect(load(DRAFT_KEY)).toBe('exhausted then retried');
       } finally {
@@ -967,7 +970,7 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
           });
         });
         await settle(0);
-        expect(storedCopy()).toMatchObject({ text: 'steered away' });
+        expect(storedCopy('steered away')).toBeTruthy();
 
         await settle(1000);
         expect(mockSendStream).toHaveBeenCalledTimes(2);
@@ -1038,13 +1041,13 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
         expect(mockSendStream).toHaveBeenCalledTimes(1);
         expect(accepted).not.toHaveBeenCalled();
         expect(result.current.composer.message).toBe('');
-        expect(storedCopy()).toMatchObject({ text: 'queued then resent' });
+        expect(storedCopy('queued then resent')).toBeTruthy();
 
         // The resend is taken: the parked copy settles sent.
         await settle(1000);
         expect(mockSendStream).toHaveBeenCalledTimes(2);
         expect(accepted).toHaveBeenCalledTimes(1);
-        expect(storedCopy()).toBeNull();
+        expect(storedCopies()).toHaveLength(0);
       } finally {
         vi.useRealTimers();
       }
@@ -1096,7 +1099,7 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
           );
         });
         await settle(0);
-        expect(storedCopy()).toMatchObject({ text: 'sent while parked' });
+        expect(storedCopy('sent while parked')).toBeTruthy();
 
         act(() => {
           result.current.composer.setMessage('typed while out');
@@ -1106,9 +1109,9 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
 
         await settle(1000);
         expect(accepted).toHaveBeenCalledTimes(1);
-        expect(storedCopy()).toBeNull();
+        expect(storedCopies()).toHaveLength(0);
         expect(result.current.composer.message).toBe('typed while out');
-        expect(result.current.composer.inFlightCopy).toBeNull();
+        expect(result.current.composer.inFlightCopies).toHaveLength(0);
       } finally {
         vi.useRealTimers();
       }
@@ -1117,7 +1120,7 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
       // The reload finds only what the user typed, and no offered copy.
       const reopened = renderHookWithProviders(() => useDraftChatHarness());
       expect(reopened.result.current.composer.message).toBe('typed while out');
-      expect(reopened.result.current.composer.inFlightCopy).toBeNull();
+      expect(reopened.result.current.composer.inFlightCopies).toHaveLength(0);
       reopened.unmount();
     });
 
@@ -1181,7 +1184,7 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
           await result.current.chat.handleRetry();
         });
         expect(accepted).toHaveBeenCalledTimes(1);
-        expect(storedCopy()).toBeNull();
+        expect(storedCopies()).toHaveLength(0);
         expect(result.current.composer.message).toBe('sent words\nand typed since');
         expect(load(DRAFT_KEY)).toBe('sent words\nand typed since');
       } finally {
@@ -1239,7 +1242,7 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
       });
       expect(mockSendStream).toHaveBeenCalledTimes(2);
       expect(accepted).toHaveBeenCalledTimes(1);
-      expect(storedCopy()).toBeNull();
+      expect(storedCopies()).toHaveLength(0);
       expect(result.current.composer.message).toBe('plain failure then retry');
       expect(load(DRAFT_KEY)).toBe('plain failure then retry');
     });
@@ -1281,7 +1284,7 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
 
       expect(accepted).toHaveBeenCalledTimes(1);
       expect(outcome).toBe(true);
-      expect(storedCopy()).toBeNull();
+      expect(storedCopies()).toHaveLength(0);
       expect(result.current.composer.message).toBe('');
       expect(load(DRAFT_KEY)).toBe('');
     });
@@ -1351,7 +1354,7 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
       let settled = false;
       void sendPromise.then(() => { settled = true; });
       expect(settled).toBe(false);
-      expect(storedCopy()).toMatchObject({ text: 'queued behind a refusal' });
+      expect(storedCopy('queued behind a refusal')).toBeTruthy();
 
       // The first turn ends; the queued send goes out and is refused — the
       // copy comes back whole into the box.
@@ -1367,7 +1370,98 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
       expect(accepted).not.toHaveBeenCalled();
       expect(outcome).toBe(false);
       expect(result.current.composer.message).toBe('queued behind a refusal');
-      expect(storedCopy()).toBeNull();
+      expect(storedCopies()).toHaveLength(0);
+    });
+
+    it('a stop during the steer queue seats each composer-linked send back exactly once', async () => {
+      // Two sends wait behind refused steers, both with a composer behind
+      // them. The stop drops the queue: each settles its own copy back into
+      // the box — once — and the plain-text give-back stays out of it, or
+      // each text would land twice.
+      let releaseFirst!: (v: { disconnected: boolean; aborted: boolean }) => void;
+      const notRunning = Object.assign(new Error('No running turn'), {
+        status: 409,
+        errorInfo: { code: 'not_running', message: 'No running turn to steer into.' },
+      });
+      mockSendStream.mockImplementation(
+        async (_msg: string, _ws: string, _tid: string | null, opts: StreamOptions) => {
+          if (mockSendStream.mock.calls.length === 1) {
+            opts.onEvent?.({ event: 'thread_id', thread_id: 'thread-2q' } as never);
+            return new Promise((resolve) => {
+              releaseFirst = resolve;
+            });
+          }
+          throw notRunning;
+        },
+      );
+
+      const accepted = vi.fn();
+      const { result, unmount } = renderHookWithProviders(() => useDraftChatHarness());
+      act(() => {
+        result.current.composer.setMessage('first steer');
+      });
+
+      // The first send hangs, so the composer's sends take the steering route.
+      let first!: Promise<boolean>;
+      act(() => {
+        first = result.current.chat.handleSendMessage('first turn');
+      });
+      await act(async () => {
+        await Promise.resolve();
+      });
+      await waitFor(() => {
+        expect(result.current.chat.isLoading).toBe(true);
+      });
+
+      const sendQueued = (text: string) => {
+        // The copy is what the composer holds at send time, so type it first.
+        act(() => {
+          result.current.composer.setMessage(text);
+        });
+        act(() => {
+          result.current.composer.submitWithDraft((onAccepted, onHandedOff, onRestore) => {
+            return result.current.chat.handleSendMessage(text, null, null, {
+              onAccepted: () => {
+                onAccepted();
+                accepted();
+              },
+              onHandedOff,
+              onNotTaken: onRestore,
+            });
+          });
+        });
+      };
+      sendQueued('queued words one');
+      await act(async () => {
+        await Promise.resolve();
+      });
+      // The second send waits BEHIND the refused steer: it joins the queue
+      // without POSTing (upstream's queueBehindRefused), its copy beside the
+      // first's.
+      sendQueued('queued words two');
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(mockSendStream).toHaveBeenCalledTimes(2);
+      expect(storedCopies().map((c) => c.text)).toEqual(['queued words one', 'queued words two']);
+
+      // The stop drops the queue: each copy seats back whole, once.
+      await act(async () => {
+        await result.current.chat.stopWorkflow();
+      });
+      expect(accepted).not.toHaveBeenCalled();
+      // The newer send (two) seats back into the box. The older one (one) was
+      // superseded on this key, so it never writes into the box the newer send
+      // owns: its copy stays as an offer the user can put back. Either way each
+      // text is somewhere exactly once — nothing lands twice, nothing is lost.
+      const box = result.current.composer.message;
+      expect(box.match(/queued words two/g)).toHaveLength(1);
+      expect(box.match(/queued words one/g)).toBeNull();
+      expect(storedCopies().map((c) => c.text)).toEqual(['queued words one']);
+      // The plain-text give-back stayed out: the queued sends have their own
+      // draft settles, so nothing was handed to returnedSteering on top.
+      expect(result.current.chat.returnedSteering).toBeNull();
+      unmount();
     });
   });
 });

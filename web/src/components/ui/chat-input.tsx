@@ -282,7 +282,7 @@ function ChatInput({
   const handleDraftKeySwitch = useCallback(() => {
     resetRichDraftRef.current();
   }, []);
-  const { message, setMessage, restoredQuotes, restoredHadAttachments, inFlightCopy, restoreInFlightCopy, discardInFlightCopy, clearCurrentDraft, touchDraft, submitWithDraft } = useComposerDraft({
+  const { message, setMessage, restoredQuotes, restoredHadAttachments, inFlightCopies, restoreInFlightCopy, discardInFlightCopy, clearCurrentDraft, touchDraft, submitWithDraft } = useComposerDraft({
     draftKey,
     prefillMessage,
     onDraftKeySwitch: handleDraftKeySwitch,
@@ -1092,42 +1092,47 @@ function ChatInput({
             )}
           </AnimatePresence>
 
-          {/* DALTON-HOOK(composer-drafts): a send whose verdict never arrived
-              — its copy as it went out, offered above the box beside whatever
-              draft is typed since, until the user seats it back or drops it. */}
-          {inFlightCopy && (
+          {/* DALTON-HOOK(composer-drafts): sends whose verdict never arrived
+              — each copy as it went out, offered above the box beside whatever
+              draft is typed since, until the user seats it back or drops it.
+              A new send appends its own copy without disturbing the offers. */}
+          {inFlightCopies.length > 0 && (
             <div
               role="status"
               data-testid="in-flight-draft-notice"
-              className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-xs text-(--color-text-secondary)"
+              className="flex flex-col gap-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-xs text-(--color-text-secondary)"
             >
-              <div>{t('chat.composer.inFlightDraftRestored')}</div>
-              {inFlightCopy.text.trim() && (
-                <div
-                  data-testid="in-flight-draft-text"
-                  className="mt-1 max-h-24 overflow-y-auto whitespace-pre-wrap break-words text-(--color-text-primary)"
-                >
-                  {inFlightCopy.text}
+              {inFlightCopies.map((copy) => (
+                <div key={copy.id} className="flex flex-col gap-1.5" data-testid="in-flight-draft-entry">
+                  <div>{t('chat.composer.inFlightDraftRestored')}</div>
+                  {copy.text.trim() && (
+                    <div
+                      data-testid="in-flight-draft-text"
+                      className="max-h-24 overflow-y-auto whitespace-pre-wrap break-words text-(--color-text-primary)"
+                    >
+                      {copy.text}
+                    </div>
+                  )}
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      data-testid="in-flight-draft-restore"
+                      className="press rounded-md border border-(--color-border-muted) px-2 py-0.5 text-xs hover:bg-(--color-border-muted)"
+                      onClick={() => restoreInFlightCopy(copy.id)}
+                    >
+                      {t('chat.composer.inFlightDraftRestore')}
+                    </button>
+                    <button
+                      type="button"
+                      data-testid="in-flight-draft-discard"
+                      className="press rounded-md px-2 py-0.5 text-xs hover:bg-(--color-border-muted)"
+                      onClick={() => discardInFlightCopy(copy.id)}
+                    >
+                      {t('chat.composer.inFlightDraftDiscard')}
+                    </button>
+                  </div>
                 </div>
-              )}
-              <div className="mt-1.5 flex items-center gap-2">
-                <button
-                  type="button"
-                  data-testid="in-flight-draft-restore"
-                  className="press rounded-md border border-(--color-border-muted) px-2 py-0.5 text-xs hover:bg-(--color-border-muted)"
-                  onClick={restoreInFlightCopy}
-                >
-                  {t('chat.composer.inFlightDraftRestore')}
-                </button>
-                <button
-                  type="button"
-                  data-testid="in-flight-draft-discard"
-                  className="press rounded-md px-2 py-0.5 text-xs hover:bg-(--color-border-muted)"
-                  onClick={discardInFlightCopy}
-                >
-                  {t('chat.composer.inFlightDraftDiscard')}
-                </button>
-              </div>
+              ))}
             </div>
           )}
 

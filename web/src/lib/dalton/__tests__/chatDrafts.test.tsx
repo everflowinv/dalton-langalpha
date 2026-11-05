@@ -17,7 +17,7 @@ import {
   buildDraftStorageKey,
   clear,
   load,
-  loadInFlightCopy,
+  loadInFlightCopies,
   pruneExpired,
   save,
   settleSendResult,
@@ -461,25 +461,27 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
     fireEvent.change(view.getTextarea(), { target: { value: 'first message', selectionStart: 13 } });
     fireEvent.click(screen.getByLabelText('Send message'));
     expect(view.getTextarea().value).toBe('');
-    expect(loadInFlightCopy('thread:supersede', 'u-1')?.text).toBe('first message');
+    expect(loadInFlightCopies('thread:supersede', 'u-1')[0]?.text).toBe('first message');
 
-    // Send B while A is still streaming
+    // Send B while A is still streaming: B appends its OWN copy — A's still
+    // stands beside it (its verdict is unknown), so B's is found by text.
     fireEvent.change(view.getTextarea(), { target: { value: 'second steer', selectionStart: 11 } });
     fireEvent.click(screen.getByLabelText('Send message'));
-    expect(loadInFlightCopy('thread:supersede', 'u-1')?.text).toBe('second steer');
+    expect(loadInFlightCopies('thread:supersede', 'u-1').map((c) => c.text)).toContain('second steer');
 
-    // A's turn completes — before the fix this deleted B's stored copy.
+    // A's turn completes — before the fix this deleted B's stored copy. A's
+    // acceptance now clears A's own copy alone, superseded or not.
     await act(async () => {
       resolvers[0](true);
     });
-    expect(loadInFlightCopy('thread:supersede', 'u-1')?.text).toBe('second steer');
+    expect(loadInFlightCopies('thread:supersede', 'u-1').map((c) => c.text)).toEqual(['second steer']);
 
     // B's turn completes — its own settle clears its own copy.
     await act(async () => {
       resolvers[1](true);
     });
     expect(load('thread:supersede', 'u-1')).toBe('');
-    expect(loadInFlightCopy('thread:supersede', 'u-1')).toBeNull();
+    expect(loadInFlightCopies('thread:supersede', 'u-1')).toHaveLength(0);
     expect(view.getTextarea().value).toBe('');
     view.unmount();
 
@@ -498,7 +500,9 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
       resolvers2[0](false);
     });
     expect(view2.getTextarea().value).toBe('');
-    expect(loadInFlightCopy('thread:supersede2', 'u-1')?.text).toBe('steer again');
+    // B' is still out, so its copy stands; A' failed while superseded, so it
+    // never touched B''s input — its own copy stays as an offer to restore.
+    expect(loadInFlightCopies('thread:supersede2', 'u-1').map((c) => c.text).sort()).toEqual(['first again', 'steer again']);
     view2.unmount();
   });
 
@@ -513,18 +517,21 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
     fireEvent.change(view.getTextarea(), { target: { value: 'newer B', selectionStart: 7 } });
     fireEvent.click(screen.getByLabelText('Send message'));
 
-    // B fails first: its copy comes back into the box and the live draft.
+    // B fails first: its copy comes back into the box and the live draft, and
+    // B's copy entry goes. A is still out — its copy stands until its verdict.
     await act(async () => {
       resolvers[1](false);
     });
     expect(load('thread:gen', 'u-1')).toBe('newer B');
-    expect(loadInFlightCopy('thread:gen', 'u-1')).toBeNull();
+    expect(loadInFlightCopies('thread:gen', 'u-1').map((c) => c.text)).toEqual(['older A']);
 
-    // A then succeeds: it was superseded by B, so B's restored draft stays.
+    // A then succeeds: superseded, so it touches neither B's box nor B's
+    // draft — but its acceptance clears its OWN copy, and nothing lingers.
     await act(async () => {
       resolvers[0](true);
     });
     expect(load('thread:gen', 'u-1')).toBe('newer B');
+    expect(loadInFlightCopies('thread:gen', 'u-1')).toHaveLength(0);
     expect(view.getTextarea().value).toBe('newer B');
     view.unmount();
   });
@@ -548,7 +555,7 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
     fireEvent.click(screen.getByLabelText('Send message'));
     // The unresolved send's copy stands under its own key; the live draft is gone with the box.
     expect(load('market:panel:ws-1:NVDA', 'u-1')).toBe('');
-    expect(loadInFlightCopy('market:panel:ws-1:NVDA', 'u-1')?.text).toBe('first on old key');
+    expect(loadInFlightCopies('market:panel:ws-1:NVDA', 'u-1')[0]?.text).toBe('first on old key');
 
     view.rerenderComposer({ draftKey: 'market:panel:th-9', onSend });
     fireEvent.change(view.getTextarea(), { target: { value: 'second on new key', selectionStart: 17 } });
@@ -558,8 +565,8 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
       resolvers[0](true);
     });
     expect(load('market:panel:ws-1:NVDA', 'u-1')).toBe('');
-    expect(loadInFlightCopy('market:panel:ws-1:NVDA', 'u-1')).toBeNull();
-    expect(loadInFlightCopy('market:panel:th-9', 'u-1')?.text).toBe('second on new key');
+    expect(loadInFlightCopies('market:panel:ws-1:NVDA', 'u-1')).toHaveLength(0);
+    expect(loadInFlightCopies('market:panel:th-9', 'u-1')[0]?.text).toBe('second on new key');
     view.unmount();
   });
 
@@ -1130,10 +1137,11 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     // since, one chip of its own — the host's giveBack owns the send's return.
     expect(view.getTextarea().value).toBe(typedSince);
     expect(document.querySelectorAll('.draft-token-quote')).toHaveLength(1);
-    // The send's copy is gone (the host took the return); the live draft holds
-    // what was typed since alone. The giveBack below seats the send's words.
-    expect(load('thread:t-docked', 'u-1')).toBe(typedSince);
-    expect(loadInFlightCopy('thread:t-docked', 'u-1')).toBeNull();
+    // The copy is gone, and (round-7 item 2) the stored draft already holds
+    // copy + typed-since merged — synchronously, with no gap before the
+    // giveBack; the giveBack's withGivenBack dedup keeps the box clean.
+    expect(load('thread:t-docked', 'u-1')).toBe(`${sentDraft.text}\n\n${typedSince}`);
+    expect(loadInFlightCopies('thread:t-docked', 'u-1')).toHaveLength(0);
 
     // The host seats the returned draft the way the chat does; no text or
     // chip lands twice.
@@ -1255,7 +1263,7 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     // stored draft keeps only that one copy, and a reload restores one of
     // the two quotes. The giveBack below re-seats both in the input.
     expect(load('thread:t-38', 'u-1')).toContain(sentDraft.text.trim());
-    expect(loadInFlightCopy('thread:t-38', 'u-1')).toBeNull();
+    expect(loadInFlightCopies('thread:t-38', 'u-1')).toHaveLength(0);
 
     // The host's giveBack seats the returned quote renumbered: two chips, and
     // a send spells each body exactly once with its own ending.
@@ -1315,11 +1323,11 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     fireEvent.change(view.getTextarea(), { target: { value: 'sent words', selectionStart: 10 } });
     fireEvent.click(screen.getByLabelText('Send message'));
     expect(view.getTextarea().value).toBe('');
-    expect(loadInFlightCopy('thread:t-putback', 'u-1')?.text).toBe('sent words');
+    expect(loadInFlightCopies('thread:t-putback', 'u-1')[0]?.text).toBe('sent words');
     expect(load('thread:t-putback', 'u-1')).toBe('');
 
     fireEvent.change(view.getTextarea(), { target: { value: 'typed meanwhile', selectionStart: 14 } });
-    expect(loadInFlightCopy('thread:t-putback', 'u-1')?.text).toBe('sent words');
+    expect(loadInFlightCopies('thread:t-putback', 'u-1')[0]?.text).toBe('sent words');
 
     await act(async () => {
       resolvers[0](false);
@@ -1328,7 +1336,7 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     // Both, in order: the sent words first, the typed-since after; the copy
     // entry is gone and the live draft holds the merged text.
     expect(view.getTextarea().value).toBe('sent words\n\ntyped meanwhile');
-    expect(loadInFlightCopy('thread:t-putback', 'u-1')).toBeNull();
+    expect(loadInFlightCopies('thread:t-putback', 'u-1')).toHaveLength(0);
     view.unmount();
     const reopened = renderComposer({ draftKey: 'thread:t-putback' }, { userId: 'u-1' });
     expect(reopened.getTextarea().value).toBe('sent words\n\ntyped meanwhile');
@@ -1356,7 +1364,7 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
       vi.advanceTimersByTime(DRAFT_SAVE_DEBOUNCE_MS);
     });
     expect(load('thread:t-cleared', 'u-1')).toBe('');
-    expect(loadInFlightCopy('thread:t-cleared', 'u-1')?.text).toBe('sent and unresolved');
+    expect(loadInFlightCopies('thread:t-cleared', 'u-1')[0]?.text).toBe('sent and unresolved');
     view.unmount();
 
     // The reload offers the copy above an empty box.
@@ -1385,8 +1393,8 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
 
     // The key resolves: both the copy and the live continuation move.
     view.rerenderComposer({ draftKey: 'thread:t-resolved', onSend });
-    expect(loadInFlightCopy('ws:ws-7:new', 'u-1')).toBeNull();
-    expect(loadInFlightCopy('thread:t-resolved', 'u-1')?.text).toBe('the opening question');
+    expect(loadInFlightCopies('ws:ws-7:new', 'u-1')).toHaveLength(0);
+    expect(loadInFlightCopies('thread:t-resolved', 'u-1')[0]?.text).toBe('the opening question');
     expect(view.getTextarea().value).toBe('typed before the id settled');
     expect(load('thread:t-resolved', 'u-1')).toBe('typed before the id settled');
     view.unmount();
@@ -1396,6 +1404,170 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     expect(reopened.getTextarea().value).toBe('typed before the id settled');
     expect(screen.getByTestId('in-flight-draft-text').textContent).toBe('the opening question');
     reopened.unmount();
+    vi.useRealTimers();
+  });
+
+  it('a new send appends its own copy: the offer standing in the banner survives it and settles independently', async () => {
+    // A reload offers copy A; the user types B and sends it without answering
+    // the offer. B gets its OWN copy — A keeps standing. B's acceptance
+    // removes B's copy alone.
+    const resolvers: Array<(v: boolean) => void> = [];
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+      (send) => new Promise<boolean>((resolve) => {
+        resolvers.push((v: boolean) => {
+          if (v) send.modelOptions.onAccepted?.();
+          resolve(v);
+        });
+      }),
+    );
+    // Send A on an earlier page; its verdict never arrives.
+    const first = renderComposer({ draftKey: 'thread:t-two', onSend }, { userId: 'u-1' });
+    fireEvent.change(first.getTextarea(), { target: { value: 'send A', selectionStart: 7 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+    first.unmount();
+    expect(loadInFlightCopies('thread:t-two', 'u-1')).toHaveLength(1);
+
+    // Reload: A is offered above the box. Type B and send it.
+    const view = renderComposer({ draftKey: 'thread:t-two', onSend }, { userId: 'u-1' });
+    expect(screen.getByTestId('in-flight-draft-text').textContent).toBe('send A');
+    fireEvent.change(view.getTextarea(), { target: { value: 'send B', selectionStart: 7 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+    // B appended its own copy; the offer for A still stands.
+    expect(loadInFlightCopies('thread:t-two', 'u-1').map((c) => c.text)).toEqual(['send A', 'send B']);
+    expect(screen.getByTestId('in-flight-draft-text').textContent).toBe('send A');
+
+    // B is taken: B's copy goes, A keeps standing — in storage and offered.
+    await act(async () => {
+      resolvers[1](true);
+    });
+    expect(loadInFlightCopies('thread:t-two', 'u-1').map((c) => c.text)).toEqual(['send A']);
+    expect(screen.getByTestId('in-flight-draft-text').textContent).toBe('send A');
+    view.unmount();
+  });
+
+  it('a docked not-taken seats the words into the SEND key at once — no gap, no waiting for the giveBack', async () => {
+    // The host reports taking the refused send back. Even before its giveBack
+    // lands, the stored draft for the send's key holds copy + typed-since,
+    // synchronously — a refresh at this instant finds the words.
+    const resolvers: Array<(v: boolean) => void> = [];
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+      (send) => new Promise<boolean>((resolve) => {
+        resolvers.push((v: boolean) => {
+          if (v === false) send.modelOptions.onReturnedUnsent?.();
+          resolve(v);
+        });
+      }),
+    );
+    const view = renderComposer({ draftKey: 'thread:t-gap', onSend }, { userId: 'u-1' });
+    fireEvent.change(view.getTextarea(), { target: { value: 'the refused words', selectionStart: 16 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+    fireEvent.change(view.getTextarea(), { target: { value: 'typed meanwhile', selectionStart: 14 } });
+
+    await act(async () => {
+      resolvers[0](false);
+    });
+    // Immediately — no debounce, no giveBack yet: the send's key holds both,
+    // and the box keeps only what was typed since for the host's giveBack.
+    expect(load('thread:t-gap', 'u-1')).toBe('the refused words\n\ntyped meanwhile');
+    expect(loadInFlightCopies('thread:t-gap', 'u-1')).toHaveLength(0);
+    expect(view.getTextarea().value).toBe('typed meanwhile');
+    view.unmount();
+  });
+
+  it('a docked not-taken after the box moved to another session writes the old key alone', async () => {
+    // The send went out on key one; the composer has since switched to key
+    // two and holds another draft. The not-taken writes the SEND's key with
+    // its own words and touches neither the new box nor the new key's draft.
+    const resolvers: Array<(v: boolean) => void> = [];
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+      (send) => new Promise<boolean>((resolve) => {
+        resolvers.push((v: boolean) => {
+          if (v === false) send.modelOptions.onReturnedUnsent?.();
+          resolve(v);
+        });
+      }),
+    );
+    const view = renderComposer({ draftKey: 'thread:t-old', onSend }, { userId: 'u-1' });
+    fireEvent.change(view.getTextarea(), { target: { value: 'sent on the old session', selectionStart: 24 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+
+    // The box moves to another session's key and something is typed there.
+    view.rerenderComposer({ draftKey: 'thread:t-new', onSend });
+    fireEvent.change(view.getTextarea(), { target: { value: 'typed on the new session', selectionStart: 25 } });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      resolvers[0](false);
+    });
+    // The send's words went to the send's key as its live draft; the copy is
+    // gone; the new session's box is untouched (its draft rides its own
+    // debounce, which the unmount flush below completes).
+    expect(load('thread:t-old', 'u-1')).toBe('sent on the old session');
+    expect(loadInFlightCopies('thread:t-old', 'u-1')).toHaveLength(0);
+    expect(view.getTextarea().value).toBe('typed on the new session');
+    view.unmount();
+    expect(load('thread:t-new', 'u-1')).toBe('typed on the new session');
+  });
+
+  it('a not-taken keep saves the quotes added while the send was out, beside the sent ones', async () => {
+    // Plain-text send A; quote B added while it is out; A is not taken. The
+    // synchronous save must carry BOTH — A's own quote (from its parts) and
+    // B (from the box as it stands) — or a reload would lose B's body.
+    const resolvers: Array<(v: boolean) => void> = [];
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+      () => new Promise<boolean>((resolve) => { resolvers.push(resolve); }),
+    );
+    const ref = createRef<ChatInputHandle>();
+    const view = renderComposer({ draftKey: 'thread:t-mixed', onSend }, { userId: 'u-1', ref });
+
+    act(() => {
+      ref.current!.addContext({ kind: 'quote', snippet: 'Revenue grew by a lot', from: ANALYST });
+    });
+    fireEvent.click(screen.getByLabelText('Send message'));
+
+    // While the send is out, another quote joins the (empty) box.
+    act(() => {
+      ref.current!.addContext({ kind: 'quote', snippet: 'Margins slipped', from: ANALYST });
+    });
+
+    await act(async () => {
+      resolvers[0](false);
+    });
+
+    // Immediately: the stored draft's quotes carry both bodies.
+    const stored = JSON.parse(
+      localStorage.getItem(buildDraftStorageKey('thread:t-mixed', 'u-1')) ?? '{}',
+    ) as { text?: string; quotes?: Array<{ snippet?: string }> };
+    expect(stored.quotes?.map((q) => q.snippet)).toEqual(
+      expect.arrayContaining(['Revenue grew by a lot', 'Margins slipped']),
+    );
+    view.unmount();
+  });
+
+  it('a migration leaves nothing behind on the resolved ws:new key', () => {
+    vi.useFakeTimers();
+    const pending = new Promise<boolean>(() => {});
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockReturnValue(pending);
+    const view = renderComposer({ draftKey: 'ws:ws-9:new', onSend }, { userId: 'u-1' });
+    fireEvent.change(view.getTextarea(), { target: { value: 'the opening question', selectionStart: 20 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+    // The follow-up lands in storage on the old key before the id settles.
+    fireEvent.change(view.getTextarea(), { target: { value: 'follow-up flushed early', selectionStart: 24 } });
+    act(() => {
+      vi.advanceTimersByTime(DRAFT_SAVE_DEBOUNCE_MS);
+    });
+    expect(load('ws:ws-9:new', 'u-1')).toBe('follow-up flushed early');
+
+    view.rerenderComposer({ draftKey: 'thread:t-clean', onSend });
+    // The follow-up moved to the thread's key; the resolved key keeps
+    // neither a live draft nor a copy.
+    expect(load('thread:t-clean', 'u-1')).toBe('follow-up flushed early');
+    expect(load('ws:ws-9:new', 'u-1')).toBe('');
+    expect(loadInFlightCopies('ws:ws-9:new', 'u-1')).toHaveLength(0);
+    expect(loadInFlightCopies('thread:t-clean', 'u-1').map((c) => c.text)).toEqual(['the opening question']);
+    view.unmount();
     vi.useRealTimers();
   });
 });

@@ -1969,9 +1969,14 @@ export function useChatMessages(
       if (!outcome || outcome.state === 'another_run_active') {
         toast({ description: t('chat.stopFailed'), variant: 'destructive' });
       }
-      giveBackStoppedSteers(outcome?.returned_steers ?? [], unsent);
+      // DALTON-HOOK(composer-drafts): queued sends with a composer behind
+      // them settle their own copy back whole (dropParked resolved them
+      // false); only the rest — sends no draft lifecycle owns — go back as
+      // plain text, so no words land in the box twice.
+      const unsentTexts = unsent.filter((u) => !(u as { settleQueued?: unknown }).settleQueued);
+      giveBackStoppedSteers(outcome?.returned_steers ?? [], unsentTexts);
     } else {
-      giveBackStoppedSteers([], unsent);
+      giveBackStoppedSteers([], unsent.filter((u) => !(u as { settleQueued?: unknown }).settleQueued));
     }
   };
 
@@ -2258,7 +2263,10 @@ export function useChatMessages(
               resolveQueued = resolve;
             })
           : null;
-        if (settleNotRunningSteer(userMessage.id as string, gen, message, additionalContext, attachmentMeta, modelOptions, requestKey, seq, resolveQueued)) ended = 'handedOff';
+        // DALTON-HOOK(composer-drafts): the resolver rides the entry only when
+        // a composer is behind it — a bare function would read as
+        // composer-linked and the stop's plain-text give-back would skip it.
+        if (settleNotRunningSteer(userMessage.id as string, gen, message, additionalContext, attachmentMeta, modelOptions, requestKey, seq, outcome ? resolveQueued : undefined)) ended = 'handedOff';
         return outcome ?? true;
       }
       // A steer the user's stop overtook: the stop hands the turn's steers
@@ -2641,7 +2649,9 @@ export function useChatMessages(
             resolveQueued = resolve;
           })
         : null;
-      queueBehindRefused(message, additionalContext, attachmentMeta, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, artifactComments, keepFullContext, onAccepted, onHandedOff, onNotTaken }, resend.shown, resolveQueued);
+      // DALTON-HOOK(composer-drafts): as above — the resolver rides the entry
+      // only when a composer is behind it.
+      queueBehindRefused(message, additionalContext, attachmentMeta, { model, reasoningEffort, fastMode, widgetSnapshots, chartSelections, subagentsAllowed, reasoningEffortOverride, fastModeOverride, artifactComments, keepFullContext, onAccepted, onHandedOff, onNotTaken }, resend.shown, outcome ? resolveQueued : undefined);
       return outcome ?? true;
     }
 
