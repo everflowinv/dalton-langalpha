@@ -78,6 +78,27 @@ def _apply_search_api_filter(markdown: str, search_api: str | None) -> str:
     )
 
 
+_TEAM_MEMORY_PRINCIPLE_CLAUSE = (
+    "；问到公司或主题时，先用 `conversation_search` 查团队以前的观点、假设和决定，"
+    "并在答案里说明与之前看法相比有什么变化"
+)
+
+
+def _apply_team_memory_filter(markdown: str, team_memory_enabled: bool) -> str:
+    """Filter `conversation_search` and its archive stats line when Team Memory is disabled for the turn."""
+    if team_memory_enabled:
+        return markdown
+    filtered_lines: list[str] = []
+    for line in markdown.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("- `conversation_search`") or stripped.startswith("- 归档统计："):
+            continue
+        if _TEAM_MEMORY_PRINCIPLE_CLAUSE in line:
+            line = line.replace(_TEAM_MEMORY_PRINCIPLE_CLAUSE, "")
+        filtered_lines.append(line)
+    return "\n".join(filtered_lines)
+
+
 def format_health_status(record: Mapping[str, Any] | None) -> str:
     """Format a source's health record into `可用` / `不可用（原因）` / `未体检`."""
     if not isinstance(record, Mapping):
@@ -438,9 +459,10 @@ def render_static_data_map_markdown(
     *,
     spec: Mapping[str, Any] | None = None,
     search_api: str | None = "openclaw",
+    team_memory_enabled: bool = False,
 ) -> str:
     """Render the static fallback data map with all sources marked `未体检` (never touches DB or network)."""
-    return render_data_map_markdown(
+    md = render_data_map_markdown(
         catalog_routes=None,
         handoff_routes=None,
         health_map={},
@@ -448,6 +470,7 @@ def render_static_data_map_markdown(
         spec=spec,
         search_api=search_api,
     )
+    return _apply_team_memory_filter(md, team_memory_enabled)
 
 
 async def refresh_daily_data_map(
@@ -508,6 +531,7 @@ async def get_or_build_data_map_markdown(
     conn: Any = None,
     search_api: str | None = "openclaw",
     timeout_s: float = CACHE_READ_TIMEOUT_S,
+    team_memory_enabled: bool = False,
 ) -> str:
     """Read today's cached data map from Postgres within `timeout_s` (2.0s).
 
@@ -522,8 +546,12 @@ async def get_or_build_data_map_markdown(
             timeout=timeout_s,
         )
         if cached and cached.get("rendered_markdown"):
-            return _apply_search_api_filter(str(cached["rendered_markdown"]), search_api)
-        return render_static_data_map_markdown(search_api=search_api)
+            md = _apply_search_api_filter(str(cached["rendered_markdown"]), search_api)
+            return _apply_team_memory_filter(md, team_memory_enabled)
+        return render_static_data_map_markdown(
+            search_api=search_api,
+            team_memory_enabled=team_memory_enabled,
+        )
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -531,7 +559,10 @@ async def get_or_build_data_map_markdown(
             "Data map Postgres cache read failed or timed out (%s); falling back to static unprobed data map",
             type(exc).__name__,
         )
-        return render_static_data_map_markdown(search_api=search_api)
+        return render_static_data_map_markdown(
+            search_api=search_api,
+            team_memory_enabled=team_memory_enabled,
+        )
 
 
 def set_turn_data_map(markdown: str | None) -> None:
@@ -544,20 +575,26 @@ async def warm_turn_data_map(
     search_api: str | None = "openclaw",
     cache_date: date | None = None,
     conn: Any = None,
+    team_memory_enabled: bool = False,
 ) -> str:
     """Read today's cached data map (or static fallback) and bind it to the current turn context."""
     md = await get_or_build_data_map_markdown(
         cache_date=cache_date,
         conn=conn,
         search_api=search_api,
+        team_memory_enabled=team_memory_enabled,
     )
     set_turn_data_map(md)
     return md
 
 
-def resolve_prompt_data_map() -> str:
+def resolve_prompt_data_map(*, team_memory_enabled: bool | None = None) -> str:
     """Return the current turn's pre-warmed data map, or the static `未体检` fallback if unset."""
     current = _TURN_DATA_MAP_VAR.get()
     if current and current.strip():
+        if team_memory_enabled is not None:
+            return _apply_team_memory_filter(current, team_memory_enabled)
         return current
-    return render_static_data_map_markdown()
+    return render_static_data_map_markdown(
+        team_memory_enabled=bool(team_memory_enabled),
+    )

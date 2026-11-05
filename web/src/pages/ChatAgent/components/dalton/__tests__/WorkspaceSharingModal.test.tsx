@@ -5,6 +5,7 @@ import { queryKeys } from '@/lib/queryKeys';
 import {
   formatAccessLevelZh,
   WorkspaceSharingModal,
+  type WorkspaceSettingsResponse,
   type WorkspaceSharingResponse,
 } from '../WorkspaceSharingModal';
 
@@ -20,6 +21,13 @@ const h = vi.hoisted(() => ({
       payload: { cos_access?: 'rw' | 'ro' | 'hidden'; web_access: 'rw' | 'ro' | 'hidden' },
     ) => Promise<WorkspaceSharingResponse>
   >(),
+  fetchWorkspaceSettings: vi.fn<(wsId: string) => Promise<WorkspaceSettingsResponse>>(),
+  updateWorkspaceSettings: vi.fn<
+    (
+      wsId: string,
+      payload: { team_memory_enabled: boolean },
+    ) => Promise<WorkspaceSettingsResponse>
+  >(),
 }));
 
 vi.mock('../../../utils/api/workspaces', async (importOriginal) => {
@@ -31,8 +39,23 @@ vi.mock('../../../utils/api/workspaces', async (importOriginal) => {
       wsId: string,
       payload: { cos_access?: 'rw' | 'ro' | 'hidden'; web_access: 'rw' | 'ro' | 'hidden' },
     ) => h.updateWorkspaceSharing(wsId, payload),
+    fetchWorkspaceSettings: (wsId: string) => h.fetchWorkspaceSettings(wsId),
+    updateWorkspaceSettings: (
+      wsId: string,
+      payload: { team_memory_enabled: boolean },
+    ) => h.updateWorkspaceSettings(wsId, payload),
   };
 });
+
+const STABLE_OWN_SETTINGS: WorkspaceSettingsResponse = {
+  workspace_id: WS_OWN,
+  team_memory_enabled: false,
+  is_home: false,
+  can_edit: true,
+  owner_external: false,
+  updated_by: null,
+  updated_at: null,
+};
 
 const STABLE_OWN_SHARING: WorkspaceSharingResponse = {
   workspace_id: WS_OWN,
@@ -70,6 +93,7 @@ describe('WorkspaceSharingModal', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     h.fetchWorkspaceSharing.mockResolvedValue(STABLE_OWN_SHARING);
+    h.fetchWorkspaceSettings.mockResolvedValue(STABLE_OWN_SETTINGS);
   });
 
   it('portals ModalShell directly under document.body, uses design tokens, and closes on Escape, backdrop click, close button, and cancel', async () => {
@@ -298,5 +322,267 @@ describe('WorkspaceSharingModal', () => {
     expect(formatAccessLevelZh('rw')).toBe('可读写');
     expect(formatAccessLevelZh('ro')).toBe('仅可读');
     expect(formatAccessLevelZh('hidden')).toBe('不可见');
+  });
+
+  it('shows Team Memory switch only to the workspace owner (default off) and saves when toggled', async () => {
+    const { default: i18n } = await import('@/i18n');
+    await i18n.changeLanguage('zh-CN');
+    onTestFinished(async () => {
+      await i18n.changeLanguage('en-US');
+    });
+
+    const updatedSettings: WorkspaceSettingsResponse = {
+      ...STABLE_OWN_SETTINGS,
+      team_memory_enabled: true,
+      updated_by: 'u-chao',
+      updated_at: '2026-11-05T12:00:00Z',
+    };
+    h.updateWorkspaceSettings.mockResolvedValueOnce(updatedSettings);
+
+    const queryClient = createTestQueryClient();
+    queryClient.setQueryData(queryKeys.dalton.sharing(WS_OWN), STABLE_OWN_SHARING);
+    queryClient.setQueryData(
+      queryKeys.dalton.workspaceSettings(WS_OWN),
+      STABLE_OWN_SETTINGS,
+    );
+
+    const { unmount } = renderWithProviders(
+      <WorkspaceSharingModal workspaceId={WS_OWN} />,
+      { queryClient },
+    );
+
+    fireEvent.click(screen.getByTestId('workspace-sharing-button'));
+
+    const section = screen.getByTestId('workspace-team-memory-section');
+    expect(section).toHaveTextContent('团队记忆');
+    expect(section).toHaveTextContent(
+      '允许分析师查阅团队过去的对话记录（OpenClaw 对话卡片）',
+    );
+    const toggle = screen.getByTestId('workspace-team-memory-switch');
+    expect(toggle).toHaveAttribute('aria-checked', 'false');
+
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute('aria-checked', 'true');
+
+    fireEvent.click(screen.getByTestId('sharing-save-btn'));
+
+    await waitFor(() => {
+      expect(h.updateWorkspaceSettings).toHaveBeenCalledWith(WS_OWN, {
+        team_memory_enabled: true,
+      });
+    });
+    expect(h.updateWorkspaceSharing).not.toHaveBeenCalled();
+    expect(
+      queryClient.getQueryData(queryKeys.dalton.workspaceSettings(WS_OWN)),
+    ).toEqual(updatedSettings);
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).toBeNull();
+    });
+    unmount();
+
+    // Non-owner (settings can_edit=false, even if sharing can_edit=true for a PM) does not see the switch
+    queryClient.setQueryData(queryKeys.dalton.sharing(WS_COLLEAGUE), {
+      ...STABLE_COLLEAGUE_SHARING,
+      can_edit: true,
+    });
+    queryClient.setQueryData(
+      queryKeys.dalton.workspaceSettings(WS_COLLEAGUE),
+      {
+        ...STABLE_OWN_SETTINGS,
+        workspace_id: WS_COLLEAGUE,
+        can_edit: false,
+      },
+    );
+
+    renderWithProviders(<WorkspaceSharingModal workspaceId={WS_COLLEAGUE} />, {
+      queryClient,
+    });
+    fireEvent.click(screen.getByTestId('workspace-sharing-button'));
+    expect(screen.queryByTestId('workspace-team-memory-section')).toBeNull();
+    expect(screen.queryByTestId('workspace-team-memory-switch')).toBeNull();
+  });
+
+  it('does not send Team Memory PUT when only sharing settings are modified', async () => {
+    const enabledSettings: WorkspaceSettingsResponse = {
+      ...STABLE_OWN_SETTINGS,
+      team_memory_enabled: true,
+    };
+    const updatedSharing: WorkspaceSharingResponse = {
+      ...STABLE_OWN_SHARING,
+      web_access: 'rw',
+    };
+    h.updateWorkspaceSharing.mockResolvedValueOnce(updatedSharing);
+
+    const queryClient = createTestQueryClient();
+    queryClient.setQueryData(queryKeys.dalton.sharing(WS_OWN), STABLE_OWN_SHARING);
+    queryClient.setQueryData(
+      queryKeys.dalton.workspaceSettings(WS_OWN),
+      enabledSettings,
+    );
+
+    renderWithProviders(<WorkspaceSharingModal workspaceId={WS_OWN} />, {
+      queryClient,
+    });
+
+    fireEvent.click(screen.getByTestId('workspace-sharing-button'));
+    expect(screen.getByTestId('workspace-team-memory-switch')).toHaveAttribute(
+      'aria-checked',
+      'true',
+    );
+
+    fireEvent.click(screen.getByTestId('sharing-web-rw'));
+    fireEvent.click(screen.getByTestId('sharing-save-btn'));
+
+    await waitFor(() => {
+      expect(h.updateWorkspaceSharing).toHaveBeenCalledWith(WS_OWN, {
+        web_access: 'rw',
+      });
+    });
+    expect(h.updateWorkspaceSettings).not.toHaveBeenCalled();
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).toBeNull();
+    });
+  });
+
+  it('keeps modal open, shows error message, preserves failed draft, and retries only the failed Team Memory request when Team Memory PUT fails', async () => {
+    const { default: i18n } = await import('@/i18n');
+    await i18n.changeLanguage('zh-CN');
+    onTestFinished(async () => {
+      await i18n.changeLanguage('en-US');
+    });
+
+    const updatedSharing: WorkspaceSharingResponse = {
+      ...STABLE_OWN_SHARING,
+      web_access: 'rw',
+    };
+    const updatedSettings: WorkspaceSettingsResponse = {
+      ...STABLE_OWN_SETTINGS,
+      team_memory_enabled: true,
+    };
+    h.updateWorkspaceSharing.mockResolvedValueOnce(updatedSharing);
+    h.updateWorkspaceSettings
+      .mockRejectedValueOnce(new Error('503 Service Unavailable'))
+      .mockResolvedValueOnce(updatedSettings);
+
+    const queryClient = createTestQueryClient();
+    queryClient.setQueryData(queryKeys.dalton.sharing(WS_OWN), STABLE_OWN_SHARING);
+    queryClient.setQueryData(
+      queryKeys.dalton.workspaceSettings(WS_OWN),
+      STABLE_OWN_SETTINGS,
+    );
+
+    renderWithProviders(<WorkspaceSharingModal workspaceId={WS_OWN} />, {
+      queryClient,
+    });
+
+    fireEvent.click(screen.getByTestId('workspace-sharing-button'));
+    fireEvent.click(screen.getByTestId('sharing-web-rw'));
+    fireEvent.click(screen.getByTestId('workspace-team-memory-switch'));
+    fireEvent.click(screen.getByTestId('sharing-save-btn'));
+
+    await waitFor(() => {
+      expect(screen.getByTestId('workspace-sharing-save-error')).toHaveTextContent(
+        '设置保存失败，请稍后重试',
+      );
+    });
+
+    // Modal stays open; sharing succeeded and updated cache; team memory draft stays true for retry
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+    expect(h.updateWorkspaceSharing).toHaveBeenCalledTimes(1);
+    expect(h.updateWorkspaceSettings).toHaveBeenCalledTimes(1);
+    expect(queryClient.getQueryData(queryKeys.dalton.sharing(WS_OWN))).toEqual(
+      updatedSharing,
+    );
+    expect(
+      queryClient.getQueryData(queryKeys.dalton.workspaceSettings(WS_OWN)),
+    ).toEqual(STABLE_OWN_SETTINGS);
+    expect(screen.getByTestId('workspace-team-memory-switch')).toHaveAttribute(
+      'aria-checked',
+      'true',
+    );
+
+    // Retry only sends the failed Team Memory PUT and closes on success
+    fireEvent.click(screen.getByTestId('sharing-save-btn'));
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).toBeNull();
+    });
+    expect(h.updateWorkspaceSharing).toHaveBeenCalledTimes(1);
+    expect(h.updateWorkspaceSettings).toHaveBeenCalledTimes(2);
+    expect(
+      queryClient.getQueryData(queryKeys.dalton.workspaceSettings(WS_OWN)),
+    ).toEqual(updatedSettings);
+  });
+
+  it('disables Team Memory switch while workspace settings are loading, omits Team Memory PUT if saved before loaded, and initializes draft when settings arrive', async () => {
+    const { default: i18n } = await import('@/i18n');
+    await i18n.changeLanguage('zh-CN');
+    onTestFinished(async () => {
+      await i18n.changeLanguage('en-US');
+    });
+
+    let resolveSettings: (val: WorkspaceSettingsResponse) => void = () => {};
+    h.fetchWorkspaceSettings.mockImplementationOnce(
+      () =>
+        new Promise<WorkspaceSettingsResponse>((resolve) => {
+          resolveSettings = resolve;
+        }),
+    );
+    const updatedSharing: WorkspaceSharingResponse = {
+      ...STABLE_OWN_SHARING,
+      web_access: 'ro',
+    };
+    h.updateWorkspaceSharing.mockResolvedValueOnce(updatedSharing);
+
+    const queryClient = createTestQueryClient();
+    queryClient.setQueryData(queryKeys.dalton.sharing(WS_OWN), STABLE_OWN_SHARING);
+
+    renderWithProviders(<WorkspaceSharingModal workspaceId={WS_OWN} />, {
+      queryClient,
+    });
+
+    fireEvent.click(screen.getByTestId('workspace-sharing-button'));
+
+    const section = screen.getByTestId('workspace-team-memory-section');
+    expect(section).toHaveTextContent('正在加载设置…');
+    const toggle = screen.getByTestId('workspace-team-memory-switch');
+    expect(toggle).toBeDisabled();
+    expect(toggle).toHaveAttribute('aria-busy', 'true');
+
+    // Clicking disabled switch does nothing
+    fireEvent.click(toggle);
+    expect(toggle).toHaveAttribute('aria-checked', 'false');
+
+    // Saving while settings are still unloaded only submits sharing changes
+    fireEvent.click(screen.getByTestId('sharing-web-ro'));
+    fireEvent.click(screen.getByTestId('sharing-save-btn'));
+
+    await waitFor(() => {
+      expect(h.updateWorkspaceSharing).toHaveBeenCalledWith(WS_OWN, {
+        web_access: 'ro',
+      });
+    });
+    expect(h.updateWorkspaceSettings).not.toHaveBeenCalled();
+    await waitFor(() => {
+      expect(screen.queryByRole('dialog')).toBeNull();
+    });
+
+    // Reopen while still loading, then resolve settings with team_memory_enabled=true -> draft initializes to true
+    fireEvent.click(screen.getByTestId('workspace-sharing-button'));
+    expect(screen.getByTestId('workspace-team-memory-switch')).toBeDisabled();
+
+    resolveSettings({
+      ...STABLE_OWN_SETTINGS,
+      team_memory_enabled: true,
+    });
+
+    await waitFor(() => {
+      expect(
+        screen.getByTestId('workspace-team-memory-switch'),
+      ).not.toBeDisabled();
+    });
+    expect(screen.getByTestId('workspace-team-memory-switch')).toHaveAttribute(
+      'aria-checked',
+      'true',
+    );
   });
 });

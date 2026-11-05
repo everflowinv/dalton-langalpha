@@ -20,6 +20,7 @@ def build_dalton_tools(
     *,
     enabled: bool | None = None,
     user_tier: str | None = None,
+    team_memory_enabled: bool = False,
 ) -> list[BaseTool]:
     """Return role-appropriate Dalton tools to bind onto the main agent (`DALTON-HOOK(dalton-tools)`).
 
@@ -87,7 +88,11 @@ def build_dalton_tools(
         if settings.autonomy.enabled:
             tools.extend(build_director_tools(role=role, filesystem_backend=filesystem_backend))
             tools.extend(build_coverage_tools(role=role))
-        if settings.conversations.enabled and tier_mounts_conversation_search:
+        if (
+            settings.conversations.enabled
+            and tier_mounts_conversation_search
+            and team_memory_enabled
+        ):
             try:
                 from src.dalton.tools.conversation_tools import create_conversation_tools
 
@@ -195,7 +200,11 @@ def build_dalton_tools(
     if settings.autonomy.enabled:
         tools.extend(build_director_tools(role=role, filesystem_backend=filesystem_backend))
 
-    if settings.conversations.enabled and tier_mounts_conversation_search:
+    if (
+        settings.conversations.enabled
+        and tier_mounts_conversation_search
+        and team_memory_enabled
+    ):
         try:
             from src.dalton.tools.conversation_tools import create_conversation_tools
 

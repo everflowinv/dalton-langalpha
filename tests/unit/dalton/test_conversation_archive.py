@@ -1381,8 +1381,8 @@ async def test_hybrid_search_rrf_fusion_and_conversation_search_tool(
         create_autospec(conv_tools_mod.get_user_tier, return_value="internal"),
     )
 
-    analyst_tools = {t.name: t for t in build_dalton_tools("analyst")}
-    cos_tools = {t.name: t for t in build_dalton_tools("chief_of_staff")}
+    analyst_tools = {t.name: t for t in build_dalton_tools("analyst", team_memory_enabled=True)}
+    cos_tools = {t.name: t for t in build_dalton_tools("chief_of_staff", team_memory_enabled=True)}
     assert "conversation_search" in analyst_tools
     assert "conversation_search" in cos_tools
     assert "wiki" not in (analyst_tools["conversation_search"].description or "").lower()

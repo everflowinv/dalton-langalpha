@@ -4,6 +4,7 @@ import { DaltonBudgetCard } from './DaltonBudgetCard';
 import { DaltonCosSharingCard } from './DaltonCosSharingCard';
 import { DaltonCoverageCard } from './DaltonCoverageCard';
 import { DaltonFeishuGroupsCard } from './DaltonFeishuGroupsCard';
+import { DaltonHomeTeamMemoryCard } from './DaltonHomeTeamMemoryCard';
 import { DaltonInvitesCard } from './DaltonInvitesCard';
 import { DaltonNotifyTargetsCard } from './DaltonNotifyTargetsCard';
 import { DaltonSystemJobsCard } from './DaltonSystemJobsCard';
@@ -28,6 +29,7 @@ export function DaltonSection({ advanced = false }: { advanced?: boolean } = {})
     <div className="flex flex-col gap-3">
       <DaltonCoverageCard />
       <DaltonCosSharingCard />
+      <DaltonHomeTeamMemoryCard />
       <DaltonInvitesCard />
       <FeishuReadScopesCard />
       <div id="dalton-providers">

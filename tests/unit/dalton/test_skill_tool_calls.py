@@ -104,7 +104,7 @@ def build_tool_signature_registry() -> dict[str, set[str]]:
     os.environ["DALTON_COVERAGE_UNITS_ENABLED"] = "1"
     try:
         for role in ("analyst", "chief_of_staff"):
-            for t in build_dalton_tools(role):
+            for t in build_dalton_tools(role, team_memory_enabled=True):
                 fields = set(t.args_schema.model_fields.keys()) if t.args_schema else set()
                 registry.setdefault(t.name, set()).update(fields)
     finally:
