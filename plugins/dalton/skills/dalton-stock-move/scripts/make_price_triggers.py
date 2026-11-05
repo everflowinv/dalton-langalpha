@@ -22,7 +22,7 @@ from typing import Any
 
 # 导入同目录的 coverage.yaml 解析辅助函数
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from move_quant import PRIVATE_TICKERS, load_coverage_yaml  # noqa: E402
+from move_quant import PRIVATE_TICKERS, _cn_price_fallback, load_coverage_yaml  # noqa: E402
 
 DEFAULT_THRESHOLD_PCT = 4.0  # 默认取自 stock_tracker 配置的 price_1d_pct: 4.0
 
@@ -126,23 +126,57 @@ def build_trigger_pair(
     }
 
 
-def compute_vol_threshold(ticker: str, default_pct: float = DEFAULT_THRESHOLD_PCT) -> float:
-    """高波动名字可按 2 倍 60 日日波动率单独设阈值（不低于默认 4.0%）。"""
+def compute_vol_threshold(
+    ticker: str, default_pct: float = DEFAULT_THRESHOLD_PCT
+) -> tuple[float, str | None]:
+    """高波动名字可按 2 倍 60 日日波动率单独设阈值（不低于默认 4.0%）。
+
+    港股/A 股日线坏数据（停滞/落后，见 cn_price_fallback）时波动率不可信，
+    退回默认阈值并返回原因；美股不受影响。返回 (threshold, note)。
+    """
     try:
         import yfinance as yf  # type: ignore
         df = yf.download(ticker, period="4mo", auto_adjust=False, progress=False)
         if df is None or len(df) < 25:
-            return default_pct
+            return default_pct, None
         col = df["Adj Close"] if "Adj Close" in df.columns else df["Close"]
         if hasattr(col, "columns"):
             col = col.iloc[:, 0]
+
+        note_out: str | None = None
+        guard = _cn_price_fallback()
+        if guard.is_cn_symbol(ticker):
+            vol_col = df["Volume"].iloc[:, 0] if hasattr(df["Volume"], "columns") else df["Volume"]
+            aligned = col.dropna()
+            verdict = guard.evaluate_cn_daily_bars(
+                ticker,
+                [str(ts.date()) for ts in aligned.index],
+                [float(v) for v in aligned.tolist()],
+                [float(v) if v == v else None for v in vol_col.reindex(aligned.index).tolist()],
+            )
+            if verdict is not None:
+                kind = verdict.get("kind")
+                if kind == "suspended":
+                    valid_until = verdict.get("valid_until")
+                    if valid_until:
+                        col = col[col.index <= valid_until]
+                    note_out = (
+                        f"疑似停牌（截至 {valid_until or '无有效数据'}（停牌前）），"
+                        "使用停牌前正常数据计算波动率阈值"
+                    )
+                elif kind in ("stagnant", "behind", "stagnant+behind"):
+                    return default_pct, (
+                        f"{verdict.get('note') or 'yfinance 日线异常'}，阈值退回默认 {default_pct:g}%"
+                    )
+
         rets = col.dropna().pct_change().dropna().tail(60) * 100.0
         if len(rets) > 20:
             two_sigma = round(float(rets.std(ddof=1)) * 2.0, 1)
-            return max(default_pct, two_sigma)
+            return max(default_pct, two_sigma), note_out
+        return default_pct, note_out
     except Exception:
         pass
-    return default_pct
+    return default_pct, None
 
 
 def main() -> int:
@@ -197,7 +231,9 @@ def main() -> int:
             skipped.append({"ticker": ticker, "reason": "invalid_symbol_format"})
             continue
 
-        thr = compute_vol_threshold(ticker, args.threshold) if args.compute_vol else args.threshold
+        thr, threshold_note = (
+            compute_vol_threshold(ticker, args.threshold) if args.compute_vol else (args.threshold, None)
+        )
         ws_id = None
         if isinstance(c.get("workspace"), dict) and c["workspace"].get("id"):
             ws_id = str(c["workspace"]["id"])
@@ -213,7 +249,10 @@ def main() -> int:
             fpath = out_dir / fname
             fpath.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             files_written.append(str(fpath))
-        generated.append({"ticker": ticker, "threshold_pct": thr, "files": files_written})
+        entry: dict[str, Any] = {"ticker": ticker, "threshold_pct": thr, "files": files_written}
+        if threshold_note:
+            entry["threshold_note"] = threshold_note
+        generated.append(entry)
 
     summary = {
         "ok": True,

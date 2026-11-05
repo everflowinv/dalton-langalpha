@@ -33,6 +33,7 @@ from src.tools.secretary.tools import (
     threads_list,
     threads_stop,
     # DALTON-HOOK(workspace-sharing-settings): CoS file access on colleague workspaces
+    workspace_file_copy_cos,
     workspace_file_read_cos,
     workspace_file_write_cos,
     workspace_files_list_cos,
@@ -59,26 +60,37 @@ async def chief_of_staff_workspaces(
     # DALTON-HOOK(workspace-sharing-settings): optional path/content for CoS file read/write
     path: str | None = None,
     content: str | None = None,
+    dest_path: str | None = None,
+    dest_workspace_id: str | None = None,
     tool_call_id: Annotated[str, InjectedToolCallId] = "",
 ) -> Command:
-    """List the user's and colleagues' shared workspaces, create or delete the user's own workspace, or list/read/write files in a workspace.
+    """List the user's and colleagues' shared workspaces, create or delete the user's own workspace, or list/read/copy/write files in a workspace.
 
     Use "list_files", "read_file", and "write_file" to inspect or update files in a colleague's
     shared workspace (which does not share this computer's filesystem); use "write_file" only
-    when the workspace's access is "rw". You cannot delegate into a colleague's shared
+    when the workspace's access is "rw". "read_file" returns text only — for a binary file
+    (Excel, PDF, images) use "copy_file" to copy it into Home, then send it from there or link
+    it by the returned folder_path.
+    Limits: "copy_file" copies binary Office (.xlsx, .xlsm, .docx, .pptx, .xls, .doc, .ppt),
+    PDF (.pdf), and image (.png, .jpg, .jpeg, .gif, .webp, .bmp, .tiff) files up to 50 MB
+    only; archives, pickle/database, audio/video, and text files are refused — read text with
+    "read_file".
+    You cannot delegate into a colleague's shared
     workspace — delegate_to_analyst refuses it; to act on that work, create a workspace of
     the user's own and hand off to its analyst.
 
     Args:
-        action: "list", "create", "delete", "list_files", "read_file", or "write_file".
+        action: "list", "create", "delete", "list_files", "read_file", "copy_file", or "write_file".
         name: Name for the new workspace; required for "create".
         description: What the new workspace is for; optional.
-        workspace_id: Target workspace ID; required for "delete", "list_files", "read_file", and "write_file". Home cannot be deleted.
-        path: Relative directory or file path INSIDE workspace_id's own folder (sources/x.md, not DASH/sources/x.md); optional prefix for "list_files", required for "read_file" and "write_file". Workspace folders sit beside Home (../<folder>), never inside it — a path starting with a workspace folder name is refused, because it would silently land in the wrong workspace.
+        workspace_id: Target workspace ID; required for "delete", "list_files", "read_file", "copy_file", and "write_file". Home cannot be deleted.
+        path: Relative directory or file path INSIDE workspace_id's own folder (sources/x.md, not DASH/sources/x.md); optional prefix for "list_files", required for "read_file", "copy_file" and "write_file". Workspace folders sit beside Home (../<folder>), never inside it — a path starting with a workspace folder name is refused, because it would silently land in the wrong workspace.
         content: Full UTF-8 text to write; required for "write_file" (requires "rw" access).
+        dest_path: Where "copy_file" lands the file, relative to the destination's folder; default shared/<filename>.
+        dest_workspace_id: Destination for "copy_file" other than Home; must be one of the user's own workspaces.
 
     Returns:
-        Workspace rows (with colleague owner and access level) for "list"; for "create" the new id with `folder_path` and `folder_ready` (before copying or cleaning into a new workspace, confirm `folder_path` exists and is non-empty — until `folder_ready` is true the folder is not on the machine yet); file paths/content for file actions.
+        Workspace rows (with colleague owner and access level) for "list"; for "create" the new id with `folder_path` and `folder_ready` (before copying or cleaning into a new workspace, confirm `folder_path` exists and is non-empty — until `folder_ready` is true the folder is not on the machine yet); file paths/content for file actions; for "copy_file" the destination path, its absolute `folder_path`, and the size.
         (DALTON-HOOK(workspace-folder-ready): the create result's folder fields.)
     """
     user_id = config.get("configurable", {}).get("user_id")
@@ -102,13 +114,19 @@ async def chief_of_staff_workspaces(
         return await workspace_file_read_cos(
             user_id, workspace_id, path, tool_call_id
         )
+    if action == "copy_file":
+        return await workspace_file_copy_cos(
+            user_id, workspace_id, path, dest_path, tool_call_id,
+            dest_workspace_id=dest_workspace_id,
+        )
     if action == "write_file":
         return await workspace_file_write_cos(
             user_id, workspace_id, path, content, tool_call_id
         )
     # --- DALTON-HOOK(workspace-sharing-settings): end ---
     return error_command(
-        f"Unknown action: {action}. Use list, create, delete, list_files, read_file, or write_file.",
+        f"Unknown action: {action}. Use list, create, delete, list_files, "
+        "read_file, copy_file, or write_file.",
         tool_call_id,
     )
 

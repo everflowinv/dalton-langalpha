@@ -13,6 +13,8 @@ tests/fixtures/dalton/
 tests/unit/mcp_servers/fixtures/dalton_sec/
 tests/unit/mcp_servers/test_dalton_sec_periods.py
 tests/unit/server/services/test_bringup_owner_check.py
+# Chief of Staff copies a binary file out of a shared workspace (workspace-sharing-settings).
+tests/unit/tools/secretary/test_workspace_file_copy_cos.py
 agent_config.dalton.yaml
 config.dalton.yaml
 docker-compose.dalton.yml

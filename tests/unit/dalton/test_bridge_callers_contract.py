@@ -40,6 +40,7 @@ def _load_collect_module():
 COVERED_BRIDGE_CALLER_FILES: set[str] = {
     "src/dalton/autonomy/probes/cnhk.py",
     "plugins/dalton/skills/dalton-thesis-delta/scripts/collect.py",
+    "plugins/dalton/skills/dalton-stock-move/scripts/cn_price_fallback.py",
     "src/dalton/data_map/health.py",
 }
 
@@ -165,6 +166,30 @@ def test_cnhk_probe_request_matches_bridge_route_contract() -> None:
         end="2026-10-24",
         limit=50,
     )
+    assert_valid_bridge_call(tool_name, arguments)
+
+
+def test_cn_price_fallback_quote_request_matches_bridge_route_contract() -> None:
+    """cn_price_fallback 的 cn-hk 备用报价请求符合路由契约（quote 只收 ticker）。"""
+    import importlib.util
+
+    guard_path = (
+        REPO_ROOT
+        / "plugins"
+        / "dalton"
+        / "skills"
+        / "dalton-stock-move"
+        / "scripts"
+        / "cn_price_fallback.py"
+    )
+    spec = importlib.util.spec_from_file_location("cn_price_fallback_contract", guard_path)
+    assert spec is not None and spec.loader is not None
+    guard_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(guard_mod)
+
+    tool_name, arguments = guard_mod.build_cn_hk_quote_request("02525")
+    assert tool_name == "finance"
+    assert arguments == {"route": "cn-hk", "operation": "quote", "ticker": "02525"}
     assert_valid_bridge_call(tool_name, arguments)
 
 
