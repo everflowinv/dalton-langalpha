@@ -127,7 +127,7 @@ python3 .agents/skills/dalton-earnings-preview/scripts/predictions.py validate \
    - [ ] 真实门槛五分清晰，buyside bogey 有明确来源或写明“本轮未找到有来源的买方数字门槛”；
    - [ ] 信息身份、期间、口径完整保留，同源转述已去重不重复计票；
    - [ ] 历史回测模式下确认零未来信息泄漏（所有来源日期 `<= as_of`）；
-   - [ ] “本轮未取得”与“通路/工具失败”分开写明；
+   - [ ] “本轮未取得”与“渠道/工具失败”分开写明；
    - [ ] `predictions.py validate --strict` 通过，正文第五节“核对清单”与 `predictions.json` 一一对应；
    - [ ] 末尾必须附引用表（在报告末尾 `## 引用` 一节按每行一条写出 `[引用1]: evidence:E-20261023-01` 或 `[引用3]: model:model/META-model-v01.xlsx!DCF!C12` 等核验来源对应关系）。
 4. **第 2 轮语言审查（终稿）**：自检与内容修订全部完成后、调用 `check_draft` 之前，调用 `check_language(round=2)` 并按清单完成终稿语言修改；草稿有改动就再调用一次 `check_language(round=2)` 对终稿复核（记录追加在同一 `<草稿>.language.json`），使最后一条第 2 轮记录绑定终稿哈希。本次产出中其他给人读的 .md 笔记（research/ 检索与对账笔记等）同样各审两轮：第 1 轮审完按清单改，第 2 轮复核，改过就再跑一次 round=2 确认；json/xlsx 等机器文件、bg_data/、data/、lenses_work/、model_dump/、知识层渲染文件与 .audit/.annotated/.language 侧车不审。

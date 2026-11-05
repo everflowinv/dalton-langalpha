@@ -39,7 +39,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 ### Step 3：电话会全文与 Q&A 提炼
 - 调用 `researchdata.research(route="transcript", ticker=T, limit=2)` 定位本次财报电话会（定位时必须核对每条候选的日期 `date`/`publish_time`、`kind`（区分官方业绩电话会 `company_call` 与券商回访 `broker_callback`）以及返回的 `coverage`：单次最多扫 10 页×50 条；若 `coverage.complete=false`，表示有界扫描未穷尽——零命中只能视为“本次有界检索未命中”而非无匹配，即使有候选也不能保证已拿到期间最新一场，需把 `coverage.continuation_params` 交给 `researchdata.research(route="alphaengine", operation="search_library", ...)` 续查或缩小 `start`/`end` 窗口，切勿把 `continuation_params` 传回 `transcript`），确认目标 `doc_id` 后用 `researchdata.research(route="alphaengine", operation="get_document", params={"doc_id": ..., "content_field": "auto", "offset": 0, "max_chars": 30000})` 按 `offset` / `next_offset` 分页读完全文（`doc_id` 必须保留完整字符串含 `_inst_` 后缀；`content_field` 仅接受 `"auto"|"original_text"|"content"|"digest"|"digest_cn"|"main_point"|"question_answer"` 各字段独立分页——若所选字段为空且返回 `warning` 与 `available_content_fields`，按映射改读有字符数的合法字段如 `original_text`、`digest` 或 `question_answer`，同一分页序列必须固定同一 `content_field` 按 `next_offset` 续读直到 `complete=true` 或 `next_offset` 为空，并核对 `content_sha256`）。
 - **`Q&A takeaways` 只从电话会 Q&A 部分提取**（提炼 5–10 个最有决策价值的管理层回答，每个话题 1–2 句，不把开场白塞进 Q&A）。
-- **逐级降级规则**：若触发时刻电话会全文尚未入库，依次退到公司 IR Webcast 回放、8-K 预备发言稿（Prepared Remarks），并在正文开头与 `## 来源` 中如实写明“截至触发时刻电话会纪要尚未入库”。
+- **逐级降级规则**：若触发时刻电话会全文尚未入库，依次退到公司 IR（投资者关系）Webcast（网络直播）回放、8-K 预备发言稿（Prepared Remarks），并按影响只在一个位置说明一次——若缺电话会纪要改变当轮结论或确信度，在开头判断处用一句话写清影响；否则只在 `## 来源` 节写明“截至触发时刻电话会纪要尚未入库”，不在正文与 `## 来源` 重复写两遍。
 
 ### Step 4：卖方初评与独立研究点评（事后材料只进“反应分解”）
 - 调用 `researchdata.research(route="alphaengine", operation="search_library", ...)` 按公司名和 ticker 检索财报后报告（类别：`sell_side`、`sell_side_comment`、`sell_side_report`、`domestic_report`、`foreign_report`）。
@@ -53,7 +53,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 - **去重与匿名**：按邮件线程去重，**严禁点名终端买方客户身份**，统一注明为“单方反馈（非市场共识）”，不得升级为卖方共识。
 - **空结果与失败区分**：
   - 若检索完成但无合格反馈：**直接省略 `Sales/Investor feedback` 整行（禁止写“未找到”或留空行）**；
-  - 若通路/工具报错无法访问：正文中不写“无反馈”，只在 `## 来源` 节中用一句人话披露访问缺口（如“本轮未取得销售台反馈：连接超时”，不写工具报错原文）。
+  - 若渠道/工具报错无法访问：正文中不写“无反馈”。缺口影响判断或确信度时，在相关判断处用一句话写清影响，`## 来源` 节不再重复；不影响判断时，只在 `## 来源` 节中用一句人话披露（如“本轮未取得销售台反馈：连接超时”，不写工具报错原文）。
 
 ### Step 6：按行业选择核心经营 KPI
 - 按 [`references/kpi-packs.md`](references/kpi-packs.md) 及公司自身披露核心指标，选取 **3–6 个关键经营 KPI**，列出当季绝对值、同比（YoY）、环比（QoQ）及**上一季同比增速**，并指出 1–2 个决定本季盈利质量的驱动项。
@@ -78,15 +78,15 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 ### Step 9：事前冻结门槛与前瞻要点对照
 - 读取工作区 `data/debate.json` 中 `frozen_pre_event=true` 的冻结条目与 `research/` 下最新的 `preview-<季度>/predictions.json`（及 `drafts/` 下对应的前瞻稿），挑选最重要的 **3–5 条预测**（如总营收、核心利润/EPS、下季指引、最关键 KPI 与核心 debate），在快讯末尾给出“**事前冻结门槛与前瞻要点对照**”：**每条分别写出“实际 vs Street”与“实际 vs 冻结门槛”**（完整逐条对账表在次日深度链 `dalton-earnings-deep` 中生成）。
 
-### Step 10：事件五词初判、当日 `underwriting` 更新与知识层写入
-- **快讯正文必须回答一问（线性还是切换）**：这次是沿着旧叙事线性演进，还是叙事 / 倍数 regime（市场给这类资产的定价规则）可能在切换？答“可能在切换”时，必须点名是哪一个触发器（本季哪个数字或指引变化）、指向哪个方向（升级 / 降级），以及需要什么证据来确认；检查方法见 `.agents/skills/dalton-conventions/references/nonlinear.md`。
-- **当天更新 `thesis.underwriting` 或写明不更新的理由**：
+### Step 10：事件五词结论、当日 `underwriting` 更新与知识层写入
+- **快讯正文必须交代叙事演进还是定价切换**：说明这次是沿着旧叙事线性演进，还是叙事 / 倍数 regime（市场给这类资产的定价规则）出现了切换迹象（若出现切换迹象，点名是本季哪个数字或指引变化触发、指向升级还是降级；不要固定堆叠“初判 + 可能在切换 + 待确认证据”套话；检查方法见 `.agents/skills/dalton-conventions/references/nonlinear.md`）。
+- **当天更新 `thesis.underwriting` 或在 `verdict.rationale` 记录暂不更新理由**：
   - 若当季结果或新指引已足以修正三情景 EPS/倍数区间、基准股价 `anchor` 或三层保护，当天调用 `knowledge_update(doc="thesis", ...)`（先 `dry_run=True` 看赔率摘要，再正式写入）更新 `thesis.underwriting` 与 `thesis.house_view`；
-  - 若因正式 `10-Q` 分部细表未出、或需待次日 T+1 深度链（`dalton-earnings-deep`）完成三表模型重算后再改三情景价带，**必须在快讯正文与 `verdict.rationale` 中明确写明当天不更新赔率卡的具体理由及次日更新计划**，不得静默跳过（正文写“赔率卡”，不写 `underwriting` 字段名）。
-- 给出事件五词结论（快讯阶段允许注明“初判”，由次日深度链终判）：
+  - 若因正式 `10-Q` 分部细表未出、或需待次日 T+1 深度链（`dalton-earnings-deep`）完成三表模型重算后再改三情景价带，**当日不更新赔率卡的具体理由及次日更新计划写进机器字段 `verdict.rationale`，快讯正文只写一句赔率结论（如“赔率卡维持前值”或更新后的结论），不在正文展开不更新的过程理由**（正文写“赔率卡”，不写 `underwriting` 字段名）。
+- 给出事件五词结论（由次日深度链终判，快讯正文直接给出当前判断，不固定加“初判”或逐行写“初步判定”）：
   - JSON 正式词形：`NO_CHANGE` / `THESIS_STRENGTHENED` / `THESIS_WEAKENED` / `THESIS_BROKEN` / `NEW_THESIS`
   - 快讯正文与推送正文：只写中文（无变化 / 强化 / 削弱 / 证伪 / 新论点），且提到支柱或分歧时写出具体内容，不写 `P1`/`D1` 编号或英文枚举。
-- 调用 `knowledge_append_verdict` 写入初判（`trigger.kind="earnings"`，`trigger.ref` 填 `<dalton_wake>` 的 `t0` 信号 id 或 `"manual"`，附上 `payoff_assessment`），并在 `agenda_ops` 中保留次日深度链与前瞻完整对账待办。
+- 调用 `knowledge_append_verdict` 写入本轮结论（`trigger.kind="earnings"`，`trigger.ref` 填 `<dalton_wake>` 的 `t0` 信号 id 或 `"manual"`，附上 `payoff_assessment`），并在 `agenda_ops` 中保留次日深度链与前瞻完整对账待办。
 
 ### Step 11：确认或补建 T+1 深度链自动任务
 - 检查本工作区 `.agents/user/automations/dalton-<t>-earn-<period>-tp1.json`（T+1 交易日 20:00 当地市场时区）是否已由 `dalton-earnings-calendar` 建立、处于激活状态（`"active"`）且时间正确。
@@ -113,7 +113,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 
 ### 收尾门禁：汇报完成前必须过完成契约（`dalton_check_done`）
 
-- **推送稿两轮语言审查与原样回复**：按 `.agents/skills/dalton-conventions/SKILL.md` §8 将推送正文写入 `research/push/<D>-earnings-flash-<季度>.md` 并完成两轮 `check_language`，最后回复与该推送稿逐字相同。
+- **推送稿两轮语言审查与原样回复**：按 `.agents/skills/dalton-conventions/SKILL.md` §8 将推送正文写入 `research/push/<D>-earnings-flash-<季度>.md` 并完成两轮 `check_language`，最后回复与该推送稿逐字相同（推送稿里同一数据缺口也只能出现一次：影响结论的在判断处用一句话写清影响，其余只写在 `## 来源` 节）。
 - 快讯落盘 `research/<D>-flash-<季度>.md`、写完 verdict 与推送稿两轮语言审查之后、推送 PM 之前，调用 `dalton_check_done(workflow="dalton-earnings-flash", params={"ticker": ..., "quarter": ..., "as_of": "<本稿 D>"})`（`<D>` 统一用财报发布的美东业务日，与快讯文件名一致；新近度按本轮运行开始时间核对，跨美东零点的自动唤醒不会因此误判）。
 - **用户指定文件名时传 `note_path`**：用户点名了交付文件名（如 `research/2026-10-30-update-FY26Q4.md` 一类的 update 稿）时，`params` 加 `"note_path": "<实际文件名>"`（必须是当前工作区 `research/` 下的 `.md`），完成契约改按该实际路径核对；不传则默认核对 `research/<D>-flash-<季度>.md`。既不要为过检查另写一份默认名文件，也不要改掉用户指定的文件名。
 - `done=false` 时按 `missing` 先补齐再查（快讯文件缺失或过小就补齐、verdict 未写或 `trigger.kind` 不是 `earnings` 就 `knowledge_append_verdict`、推送稿语言审查缺轮次或第 2 轮哈希对不上就补跑 `check_language`）；补不了的缺项只能汇报“未完成”并列出缺项与原因，不得汇报“完成”。

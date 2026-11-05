@@ -76,7 +76,7 @@ phase('深度点评与模型')
 const [report, model] = await parallel([
   () =>
     agent(
-      `${base} 按 ${S}/templates/deep.md（首个二级标题为「## 摘要」，后接「业绩与指引」「投资逻辑的验证」「赔率与行动」「跟踪」、按需「附注」及文末「引用」，对账与校准的逐条表格留内部文件、不在正文展开）与 ${S}/references/eight-sections.md${
+      `${base} 按 ${S}/templates/deep.md（首个二级标题为「## 摘要」，后接「业绩与指引」「投资逻辑的验证」「赔率与行动」「跟踪」、按需「附注」及文末「引用」，对账与校准的逐条表格留内部文件、不在正文展开；改判条件只在「跟踪」完整列一次，「赔率与行动」和「摘要」只写决定行动的那一个条件；成稿后通读全文，同一缺口、同一限定、同一改判条件只保留最合适的一处）与 ${S}/references/eight-sections.md${
         args.sector_overlay === 'hardware' ? ` 与 ${S}/references/hardware-overlay.md` : ''
       } 写深度点评到 ${W}/drafts/${D}-deep-${Q}.md；价格反应用 python ${S}/scripts/price_reaction.py；卖方窗口为发布到发布后 3 个交易日。返回成稿路径与 sha256。`,
       { agentType: 'general-purpose', label: '八节点评', phase: '深度点评与模型', schema: DRAFT_OUT }
@@ -253,7 +253,7 @@ while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 2) {
   const fixed = await agent(
     `先核对 ${reportPath} 的 sha256 是否与审稿前（${
       currentSha || '成稿记录值'
-    }）一致；按审稿意见做第 ${rounds} 轮修订（必改项 must_fix 全改，不新增未核实数字），并核对 ${R}/reconcile.md、${R}/thesis-calibration.md、${R}/management-delta.md 的结论是否已各用一两句话准确写进正文「投资逻辑的验证」节（如有缺漏或偏差一并修正，逐条表格留在内部文件），改完返回新 sha256。${modelClause}审稿意见：\n${JSON.stringify(
+    }）一致；按审稿意见做第 ${rounds} 轮修订（必改项 must_fix 全改，不新增未核实数字；修订后通读全文，同一缺口、同一限定、同一改判条件只保留最合适的一处），并核对 ${R}/reconcile.md、${R}/thesis-calibration.md、${R}/management-delta.md 的结论是否已各用一两句话准确写进正文「投资逻辑的验证」节（如有缺漏或偏差一并修正，逐条表格留在内部文件），改完返回新 sha256。${modelClause}审稿意见：\n${JSON.stringify(
       finalReview
     )}`,
     { agentType: 'general-purpose', label: `修订 ${rounds}`, phase: '审稿', schema: DRAFT_OUT }
