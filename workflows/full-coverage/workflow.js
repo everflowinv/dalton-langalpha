@@ -447,7 +447,7 @@ const memo = memoCompleteSha
         memoPartial
           ? `。盘上已有 ${memoPath} 的半成品（结构校验未通过）：先读已有内容，保留其中可用的部分，补齐缺失的章节与引用，修到结构完整；不要推倒重写已有内容`
           : ''
-      }。写给基金经理看：每件事只写一遍、12 问不进正文、计算过程放附录；信息缺口写它对判断的影响，不罗列“未披露”。跑 python ${S}/scripts/validate_memo.py --mode full ${memoPath} --research-dir ${R} 到 0 FAIL，并返回 ${memoPath} 的 sha256。`,
+      }。写给基金经理看：每件事只写一遍、12 问不进正文、计算过程放附录；信息缺口写它对判断的影响，不罗列“未披露”；成稿后通读全文，同一缺口、同一限定、同一改判条件只保留最合适的一处。跑 python ${S}/scripts/validate_memo.py --mode full ${memoPath} --research-dir ${R} 到 0 FAIL，并返回 ${memoPath} 的 sha256。`,
       { agentType: 'general-purpose', label: '成稿', phase: '成稿', schema: DRAFT_OUT }
     )
 const memoSha = shaOf(memo)
@@ -535,7 +535,7 @@ while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 1) {
   fix = await agent(
     `${base} 先核对 ${memoPath} 的 sha256 是否与审稿前（${
       currentMemoSha || '当前记录值'
-    }）一致；按审稿意见与 ${R}/model-check.md 做第 ${rounds} 轮修订（memo 与模型；${modelClause}）。P0 全改，跑 python ${S}/scripts/validate_memo.py --mode full ${memoPath} --research-dir ${R} 到 0 FAIL。审稿意见：\n${JSON.stringify(
+    }）一致；按审稿意见与 ${R}/model-check.md 做第 ${rounds} 轮修订（memo 与模型；${modelClause}）。P0 全改，修订后通读全文，同一缺口、同一限定、同一改判条件只保留最合适的一处；跑 python ${S}/scripts/validate_memo.py --mode full ${memoPath} --research-dir ${R} 到 0 FAIL。审稿意见：\n${JSON.stringify(
       finalReview
     )}`,
     { agentType: 'general-purpose', label: `修订 ${rounds}`, phase: '修订', schema: DRAFT_OUT }
