@@ -12,7 +12,7 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
 1. **数字底表（`research/<D>-fc/facts.md`）**：含 `<!-- FACTS-LEDGER ... -->` 机器可读账本，作为全文唯一目标公司财务数字来源与发布核验基准；
 2. **公司专属 12 问研究提纲（`research/<D>-fc/questions.md`）** 与 **A/B/C/D 四条取证支线底稿（`ea.md`、`eb.md`、`ec.md`、`ed.md`）**；
 3. **带动态公式的 15 页 Excel 财务与估值模型（`model/<TICKER>-model-v01.xlsx`）**：含标准 12 页 + Dalton 专属 `Facts`、`Guidance vs Actual`（12 季表）、`Street vs House` 三页；
-4. **深度投资备忘录（`drafts/<D>-memo.md`）**：写给基金经理看（摘要 → 公司与商业模式 → 行业与竞争〔可并入上一节〕→ 核心投资逻辑与争议 → 财务预测与估值 → 风险 → 管理层 → 跟踪 → 附录），12 问研究提纲留在 `questions.md` 工作底稿、不进正文；
+4. **深度投资备忘录（`drafts/<D>-memo.md`）**：写给基金经理看（摘要 → 公司与商业模式 → 行业与竞争〔可并入上一节〕→ 业务质量 → 核心投资逻辑与争议 → 财务预测与估值 → 风险 → 管理层 → 跟踪 → 附录 → 引用），12 问研究提纲（含每问 `A / B / C / D` 自评档位）留在 `questions.md` 工作底稿、不进正文；
 5. **模型审计（`check-model`）与独立审稿（`dalton-reviewer`）**，修订后更新公司知识层并经 `publish_report(kind="full_coverage", updates_thesis=True)` 提交正式发布审批。
 
 ---
@@ -65,14 +65,14 @@ Fund methodology: .agents/skills/dalton-conventions/SKILL.md — read before the
    ```
    `full-coverage` workflow 按以下阶段自动推进（约 15 次子智能体派发）：
    - **阶段 0（一手材料与数字底表）**：精读最近 4 份定期报告、4 次电话会、招股书（如有）、内部人交易；复用 `dalton-financial-lenses` 计算三把镜头；计算盈利质量（Sloan 比率、CFO/NI、CCC）；用 `scripts/facts.py set` 写入 `research/<D>-fc/facts.md` 的 `FACTS-LEDGER`。若阶段 0 失败则中止。
-   - **阶段 0.8（问题清单 frame）**：按 `references/frame.md` 撰写 `research/<D>-fc/questions.md`，并跑 `python .agents/skills/dalton-full-coverage/scripts/research_structure.py validate-agenda research/<D>-fc/questions.md` 直至通过。
+   - **阶段 0.8（问题清单 frame）**：按 `references/frame.md` 撰写 `research/<D>-fc/questions.md`（含每问 `A / B / C / D` 初始自评档位），并跑 `python .agents/skills/dalton-full-coverage/scripts/research_structure.py validate-agenda research/<D>-fc/questions.md` 直至通过。
    - **阶段 1（四条取证支线并行）**：
      - `ea.md`：按 `references/branch-a-industry.md`（行业定义与双法 TAM、5–8 家竞对现取财务与份额、周期高频指标、全球对标、政策、行业专用框架）；
      - `eb.md`：按 `references/branch-b-sellside-expert.md`（AlphaEngine 分类检索与全文精读、卖方预期地图、内部库与 company-wiki、Guidepoint 英文专家纪要、卖方盲点）；
      - `ec.md`：按 `references/branch-c-primary.md`（4 期报告 MD&A/Risk Factors diff、4 期电话会措辞漂移、招股书承诺对照、**C4 过去 12 个季度指引 vs 实际可信度表**、8-K 与内部人交易）；
      - `ed.md`：按 `references/branch-d-offstreet.md`（X、雪球、员工评价、社区情绪、招聘信号、13F、ToC 产品体验表或 ToB 从业者信号表）。
    - **阶段 2（建模，串行在最前）**：按 `references/model-spec.md` 构建 `model/<TICKER>-model-v01.xlsx`（`recalc.py` 与 `audit.py --strict` 通过，Checks 全 OK）。建模失败立即中止，不进入写作——估值与三情景数字全部来自模型。
-   - **阶段 3（单一写手成稿与第 1 轮语言审查）**：一位写手通读 `questions.md`（12 问研究提纲）、四条支线底稿（含文末逐题证据小结）、`facts.md` 与模型输出，按 `references/memo-writing.md` 一次写成整篇备忘录（成稿后通读全文，同一缺口、同一限定、同一改判条件只保留最合适的一处） → 跑 `validate_memo.py --mode full` 到 0 FAIL → 第 1 轮语言审查（`check_language` round=1，按清单修改）→ 复跑校验。
+   - **阶段 3（单一写手成稿与第 1 轮语言审查）**：一位写手通读 `questions.md`（12 问研究提纲）、四条支线底稿（含文末逐题证据小结）、`facts.md` 与模型输出，同步更新 `questions.md` 每问 `A / B / C / D` 自评档位（只写在底稿、不进备忘录正文），并按 `references/memo-writing.md` 一次写成整篇备忘录（成稿后通读全文，同一缺口、同一限定、同一改判条件只保留最合适的一处） → 跑 `validate_memo.py --mode full` 到 0 FAIL → 第 1 轮语言审查（`check_language` round=1，按清单修改）→ 复跑校验。
    - **阶段 4（审模型与独立审稿并行）**：`check-model` 审模型输出 `research/<D>-fc/model-check.md`（只出报告不改模型）∥ `dalton-reviewer` 审 memo。
    - **阶段 5（一轮修订、终稿语言审查与知识层修订草案）**：审稿 `revise` 时按审稿意见与 `model-check.md` 做一轮修订（memo 与模型；若改模型，按 `.agents/skills/model-update/SKILL.md` 另存 `v02`，绝不覆盖 `v01`；每次修订后通读全文，同一缺口、同一限定、同一改判条件只保留最合适的一处）后复审；随后对终稿做第 2 轮语言审查（`check_language` round=2，按清单修改并复核，绑定终稿哈希），并生成 `research/<D>-fc/knowledge-revision.json`。
 
