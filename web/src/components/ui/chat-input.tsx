@@ -384,6 +384,10 @@ function ChatInput({
   // mirrors the same global ContextBus state so two visible inputs always
   // show the same deck.
   const [widgetSnapshots, setWidgetSnapshots] = useState<WidgetContextSnapshot[]>([]);
+  // DALTON-HOOK(composer-drafts): the offered unresolved-send copies fold past
+  // three — everything stays stored and reachable; the banner just doesn't
+  // grow without bound on screen.
+  const [copiesExpanded, setCopiesExpanded] = useState(false);
   const [deckFanned, setDeckFanned] = useState(false);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -1102,7 +1106,7 @@ function ChatInput({
               data-testid="in-flight-draft-notice"
               className="flex flex-col gap-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-xs text-(--color-text-secondary)"
             >
-              {inFlightCopies.map((copy) => (
+              {(copiesExpanded ? inFlightCopies : inFlightCopies.slice(0, 3)).map((copy) => (
                 <div key={copy.id} className="flex flex-col gap-1.5" data-testid="in-flight-draft-entry">
                   <div>{t('chat.composer.inFlightDraftRestored')}</div>
                   {copy.text.trim() && (
@@ -1133,6 +1137,16 @@ function ChatInput({
                   </div>
                 </div>
               ))}
+              {inFlightCopies.length > 3 && !copiesExpanded && (
+                <button
+                  type="button"
+                  data-testid="in-flight-draft-expand"
+                  className="press self-start rounded-md px-2 py-0.5 text-xs hover:bg-(--color-border-muted)"
+                  onClick={() => setCopiesExpanded(true)}
+                >
+                  {t('chat.composer.inFlightDraftMore', { count: inFlightCopies.length - 3 })}
+                </button>
+              )}
             </div>
           )}
 

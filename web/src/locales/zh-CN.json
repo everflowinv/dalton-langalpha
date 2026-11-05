@@ -2240,7 +2240,8 @@
       "inFlightDraftRestored": "上次发送可能已被受理，发送前请先确认对话里是否已经有这条消息。",
       "draftAttachmentsRestored": "草稿不保留附件，重新发送前请重新添加。",
       "inFlightDraftRestore": "放回输入框",
-      "inFlightDraftDiscard": "丢弃"
+      "inFlightDraftDiscard": "丢弃",
+      "inFlightDraftMore": "还有 {{count}} 条未确认的发送"
     },
     "mention": {
       "noMatching": "无匹配文件",

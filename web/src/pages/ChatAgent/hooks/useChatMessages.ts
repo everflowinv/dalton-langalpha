@@ -908,7 +908,11 @@ export function useChatMessages(
     // the attachment notice; chatDrafts ignores a settle if a newer send on
     // the key already owns the draft).
     queued?.settleQueued(false);
-    for (const entry of unsent) entry.settleQueued?.(false);
+    // DALTON-HOOK(composer-drafts): settle newest first, so an older send the
+    // newer one superseded seats its words back AHEAD of the newer's already
+    // restored text (withGivenBack puts the returning words before what is
+    // typed), matching the order they were sent in.
+    for (const entry of [...unsent].reverse()) entry.settleQueued?.(false);
     // The optimistic shimmer bubble of the one parked during compaction.
     if (queued) setMessages((prev) => prev.filter((m) => m.id !== queued.messageId));
     return unsent;
@@ -2242,12 +2246,17 @@ export function useChatMessages(
           errorInfo: { code: frame.code, message: text },
         });
       }
-      // No answer, and no way to know: a delivery can still clear this.
-      if (result.disconnected && !accepted) throw new Error('Failed to send message');
+      // No answer, and no way to know: a delivery can still clear this. An
+      // aborted reader is the same no-answer (the steer's own POST carries no
+      // abort — a stop does not cancel it — so this is a drop, not a taking).
+      if ((result.disconnected || result.aborted) && !accepted) throw new Error('Failed to send message');
       // DALTON-HOOK(composer-drafts): report steering send outcome to composer draft lifecycle
       return true;
     } catch (err: unknown) {
-      if ((err as Error)?.name === 'AbortError') return true;
+      // DALTON-HOOK(composer-drafts): an aborted reader is a drop, not a
+      // taking — only an acceptance (steering_accepted above, or the duplicate
+      // adoption below) settles this steer as sent.
+      if ((err as Error)?.name === 'AbortError') return accepted;
       const code = (err as { errorInfo?: { code?: unknown } })?.errorInfo?.code;
       if ((err as { status?: number })?.status === 409 && code === 'not_running') {
         // Waiting to go out as a send of its own, it holds its comments until then.
@@ -2269,15 +2278,20 @@ export function useChatMessages(
         if (settleNotRunningSteer(userMessage.id as string, gen, message, additionalContext, attachmentMeta, modelOptions, requestKey, seq, outcome ? resolveQueued : undefined)) ended = 'handedOff';
         return outcome ?? true;
       }
-      // A steer the user's stop overtook: the stop hands the turn's steers
-      // back to the composer, and this one joins them.
-      if (wasStoppedRef.current && code === 'stopping') {
+      // DALTON-HOOK(composer-drafts): a steer ending after the user's stop —
+      // `stopping`, a network error, 429/500, `compacting`, `running`, or a
+      // drop — was not taken (nothing accepted it). The composer's not-taken
+      // settle seats the copy back whole (text, chips, the attachment
+      // notice); the plain-text give-back stays out of it, or the words would
+      // land twice. Sends without a draft lifecycle keep the upstream text
+      // give-back.
+      if (wasStoppedRef.current) {
         requestKeys.spend(requestKey);
         setMessages((prev) => prev.filter((m) => m.id !== userMessage.id));
-        giveBackSteering(message);
-        return true;
+        if (modelOptions.onAccepted) return false;
+        if (code === 'stopping') giveBackSteering(message);
+        return false;
       }
-      if (wasStoppedRef.current) return true;
       console.error('Error sending steering:', err);
       if (settleDuplicateSteer(err, userMessage.id as string, message, requestKey)) {
         // DALTON-HOOK(composer-drafts): the duplicate steer was already accepted server-side
@@ -2364,11 +2378,13 @@ export function useChatMessages(
     if (wasStoppedRef.current) {
       requestKeys.spend(requestKey);
       setMessages((prev) => prev.filter((m) => m.id !== steerId));
-      giveBackSteering(message);
       // DALTON-HOOK(composer-drafts): stopped before it joined the queue —
-      // not taken; the composer seats its copy back whole (the plain-text
-      // giveBack above does not carry chips or the attachment notice).
-      settleQueued?.(false);
+      // not taken. A composer-linked entry settles its copy back whole
+      // (text, chips, the attachment notice); only entries no draft
+      // lifecycle owns take the upstream plain-text give-back, so the words
+      // never land twice.
+      if (settleQueued) settleQueued(false);
+      else giveBackSteering(message);
       return false;
     }
     enqueueNotRunningSend({ gen, message, additionalContext, attachmentMeta, modelOptions, requestKey, steerId, seq, settleQueued });

@@ -322,9 +322,6 @@ const parseInFlightCopies = (raw: string): StoredInFlightCopy[] | null => {
   }
 };
 
-/** Enough unresolved sends on one draft that older ones only dilute the banner. */
-const MAX_INFLIGHT_COPIES = 5;
-
 let nextCopySeq = 1;
 export function newInFlightCopyId(): string {
   return `${Date.now().toString(36)}-${nextCopySeq++}`;
@@ -354,9 +351,8 @@ export function appendInFlightCopy(
   if (!storage) return null;
   const storageKey = buildInFlightStorageKey(draftKey, userId);
   const existing = loadInFlightCopies(draftKey, userId) ?? [];
-  const kept = [...existing, copy].slice(-MAX_INFLIGHT_COPIES);
   try {
-    storage.setItem(storageKey, JSON.stringify(kept));
+    storage.setItem(storageKey, JSON.stringify([...existing, copy]));
     return copy;
   } catch {
     return null;
@@ -433,7 +429,7 @@ export function migrateInFlightCopies(
   if (copies.length === 0) return;
   const storage = getLocalStorage();
   if (!storage) return;
-  const merged = [...(loadInFlightCopies(toKey, toUser) ?? []), ...copies].slice(-MAX_INFLIGHT_COPIES);
+  const merged = [...(loadInFlightCopies(toKey, toUser) ?? []), ...copies];
   try {
     storage.setItem(buildInFlightStorageKey(toKey, toUser), JSON.stringify(merged));
   } catch {
@@ -530,12 +526,12 @@ export interface UseComposerDraftOptions {
 
 export interface PendingSendHandle {
   /**
-   * The fallback settle: the send's promise resolved. `true` settles the send
-   * without touching anything stored — only the server holding the turn
-   * (reported through `acceptSend`) may delete the send's copy, and a `true`
-   * that reported nothing leaves it standing, so a reload offers it with the
-   * "may already have gone through" notice; `false` puts the copy back whole.
-   * A parked send (see `handOffToResend`) ignores this.
+   * The fallback settle: the send's promise resolved. A send that was not
+   * handed to an automatic resend and resolves `true` counts as taken (the
+   * host's promise is its acceptance — hosts only return true when the
+   * server took the turn) and its copy goes; `false` puts the copy back
+   * whole. A parked send (see `handOffToResend`) ignores this either way —
+   * its proof is the resend's own acceptance, or a definite not-taken.
    */
   finalizeSend: (succeeded: boolean) => void;
   /**
@@ -730,24 +726,28 @@ export function useComposerDraft({
       : parts;
   }, []);
 
+  /** The union of two parts bags, by token — the send's own quotes kept beside the other's. */
+  const mergeParts = useCallback((sendParts: DraftParts, other: DraftParts): DraftParts => {
+    const otherQuotes = other.quotes ?? [];
+    const quotes = [
+      ...otherQuotes,
+      ...(sendParts.quotes ?? []).filter((q) => !otherQuotes.some((p) => p.token === q.token)),
+    ];
+    return {
+      quotes,
+      hadAttachments: other.hadAttachments || sendParts.hadAttachments === true,
+    };
+  }, []);
+
   /**
    * DALTON-HOOK(composer-drafts): the parts a not-taken restore seats into the
    * live draft: the send's own quotes (with their renumbered tokens) beside
    * whatever the box holds now — quotes added while the send was out, the
    * attachment notice — so the synchronous save keeps both.
    */
-  const mergePartsForSave = useCallback((sendParts: DraftParts): DraftParts => {
-    const live = partsForSave();
-    const liveQuotes = live.quotes ?? [];
-    const quotes = [
-      ...liveQuotes,
-      ...(sendParts.quotes ?? []).filter((q) => !liveQuotes.some((p) => p.token === q.token)),
-    ];
-    return {
-      quotes,
-      hadAttachments: live.hadAttachments || sendParts.hadAttachments === true,
-    };
-  }, [partsForSave]);
+  const mergePartsForSave = useCallback((sendParts: DraftParts): DraftParts => (
+    mergeParts(sendParts, partsForSave())
+  ), [mergeParts, partsForSave]);
 
   useLayoutEffect(() => {
     activeDraftKeyRef.current = draftKey;
@@ -994,9 +994,7 @@ export function useComposerDraft({
       // signal (onAccepted) settle by their promise. Only a handed-off send's
       // `true` is not proof — it returned above unless the resend was taken.
       if (fromAcceptance || succeeded) acceptNow();
-      if (superseded) return;
       if (inFlightSendRef.current === inFlight) inFlightSendRef.current = null;
-
       if (succeeded) {
         // The server holds the turn: the copy went above, and nothing else —
         // whatever was typed since is the live draft's business.
@@ -1007,49 +1005,59 @@ export function useComposerDraft({
       if (!sendDraftKey) {
         return;
       }
-      // Definitely not taken, whatever owns the box: the words are seated into
-      // the SEND's key at once — copy merged with whatever the box holds —
-      // and only then does this send's copy go. A refresh in between never
-      // finds them in neither place.
-      hasSentOnKeyRef.current = false;
+      // Definitely not taken — superseded or not, whatever owns the box: the
+      // words are seated at once (into the box when it is this draft's, ahead
+      // of what is there now; into the send's own key otherwise), and only
+      // then does this send's copy go. A refresh in between never finds them
+      // in neither place, and a superseded send that was definitely refused
+      // must not linger as a "may have gone through" offer.
+      if (!superseded) hasSentOnKeyRef.current = false;
       if (timerRef.current !== null) {
         clearTimeout(timerRef.current);
         timerRef.current = null;
       }
       writtenSinceMountOrSendRef.current = true;
       const boxOnSendKey = activeDraftKeyRef.current === sendDraftKey;
-      if (boxOnSendKey && !inFlight.hostReturned) {
+      const seatsBox = boxOnSendKey && !inFlight.hostReturned;
+      if (seatsBox) {
         // Seeding the sent quotes back is the box-seating paths' business
         // alone: a host that took the return seats them through its giveBack
         // (seeding here would add the ORIGINAL token beside the renumbered
         // one), and a box that moved to another draft sees none of it.
         applyRestored({ quotes: inFlight.parts.quotes, hadAttachments: inFlight.parts.hadAttachments });
       }
-      const current = boxOnSendKey ? latestMessageRef.current : '';
+      // What the words join with is the send's own key's current draft — the
+      // box when it still belongs to this key, else what that key last saved
+      // (never the box another session now owns, and never its quotes).
+      const savedRecord = boxOnSendKey ? null : loadStoredDraft(sendDraftKey, sendUserId);
+      const beside = boxOnSendKey ? latestMessageRef.current : (savedRecord?.text ?? '');
       const merged = !sentText.trim()
-        ? current
-        : !current.trim() || current === sentText || current.startsWith(`${sentText}\n\n`) || current.endsWith(`\n\n${sentText}`)
-          ? (current.trim() ? current : sentText)
-          : `${sentText}\n\n${current}`;
-      const restore = boxOnSendKey && !inFlight.hostReturned ? onSendReturnedRef.current : undefined;
+        ? beside
+        : !beside.trim() || beside === sentText || beside.startsWith(`${sentText}\n\n`) || beside.endsWith(`\n\n${sentText}`)
+          ? (beside.trim() ? beside : sentText)
+          : `${sentText}\n\n${beside}`;
+      const restore = seatsBox ? onSendReturnedRef.current : undefined;
       if (restore) {
-        // The composer seats the copy into the box itself — chips renumbered
-        // against what it holds now; the merged text is what lands.
+        // The composer seats the copy into the box itself — ahead of what it
+        // holds now, chips renumbered against it; the merged text is what
+        // lands.
         restore(sentText, inFlight.parts);
-      } else if (boxOnSendKey && !inFlight.hostReturned) {
+      } else if (seatsBox) {
         latestMessageRef.current = merged;
         setMessageState(merged);
       }
-      // The host's giveBack case: the box is left alone (the giveBack seats
-      // it, and withGivenBack's dedup holds against the untouched box); the
-      // box-moved case: this box belongs to another draft and keeps its own
-      // content — only the send's key is written.
-      // The parts are the send's own beside what the box holds now — quotes
-      // added while the send was out included — so the synchronous save
-      // keeps both; the debounce that follows (left armed) rewrites with the
-      // fully re-seated chips.
+      // The parts saved with the words are the send's own beside what its key
+      // holds: the box's current parts when it seats there (quotes added
+      // while the send was out included), else the stored draft's quotes —
+      // never another session's.
       if (merged.trim()) {
-        save(sendDraftKey, merged, sendUserId, undefined, { parts: mergePartsForSave(inFlight.parts) });
+        const parts = seatsBox
+          ? mergePartsForSave(inFlight.parts)
+          : mergeParts(inFlight.parts, {
+              quotes: savedRecord?.quotes ?? [],
+              hadAttachments: savedRecord?.hadAttachments === true,
+            });
+        save(sendDraftKey, merged, sendUserId, undefined, { parts });
       }
       if (inFlight.copyId) removeInFlightCopy(sendDraftKey, inFlight.copyId, sendUserId);
       setInFlightCopiesState((prev) => prev.filter((c) => c.id !== inFlight.copyId));

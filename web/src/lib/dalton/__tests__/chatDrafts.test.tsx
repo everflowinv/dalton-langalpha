@@ -499,10 +499,11 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
     await act(async () => {
       resolvers2[0](false);
     });
-    expect(view2.getTextarea().value).toBe('');
-    // B' is still out, so its copy stands; A' failed while superseded, so it
-    // never touched B''s input — its own copy stays as an offer to restore.
-    expect(loadInFlightCopies('thread:supersede2', 'u-1').map((c) => c.text).sort()).toEqual(['first again', 'steer again']);
+    // Round 9 rule: A' was superseded and definitely not taken, so it comes
+    // back into the box (it is the user's words, not a "may have been sent"
+    // offer) and its copy goes; B' is still out, so B''s copy stands.
+    expect(view2.getTextarea().value).toBe('first again');
+    expect(loadInFlightCopies('thread:supersede2', 'u-1').map((c) => c.text)).toEqual(['steer again']);
     view2.unmount();
   });
 
@@ -1475,6 +1476,7 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
   });
 
   it('a docked not-taken after the box moved to another session writes the old key alone', async () => {
+    vi.useFakeTimers();
     // The send went out on key one; the composer has since switched to key
     // two and holds another draft. The not-taken writes the SEND's key with
     // its own words and touches neither the new box nor the new key's draft.
@@ -1491,24 +1493,30 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     fireEvent.change(view.getTextarea(), { target: { value: 'sent on the old session', selectionStart: 24 } });
     fireEvent.click(screen.getByLabelText('Send message'));
 
+    // Before the switch, a follow-up was typed AND SAVED on the old key
+    // (round-9 item 5: the merge base is the old key's saved draft).
+    fireEvent.change(view.getTextarea(), { target: { value: 'follow-up on the old session', selectionStart: 30 } });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(DRAFT_SAVE_DEBOUNCE_MS);
+    });
+    expect(load('thread:t-old', 'u-1')).toBe('follow-up on the old session');
+
     // The box moves to another session's key and something is typed there.
     view.rerenderComposer({ draftKey: 'thread:t-new', onSend });
     fireEvent.change(view.getTextarea(), { target: { value: 'typed on the new session', selectionStart: 25 } });
-    await act(async () => {
-      await Promise.resolve();
-    });
 
     await act(async () => {
       resolvers[0](false);
     });
-    // The send's words went to the send's key as its live draft; the copy is
-    // gone; the new session's box is untouched (its draft rides its own
-    // debounce, which the unmount flush below completes).
-    expect(load('thread:t-old', 'u-1')).toBe('sent on the old session');
+    // The send's words joined the old key's SAVED follow-up (not the new
+    // box's content); the copy is gone; the new session's box and draft keep
+    // to themselves (its draft rides its own debounce, completed below).
+    expect(load('thread:t-old', 'u-1')).toBe('sent on the old session\n\nfollow-up on the old session');
     expect(loadInFlightCopies('thread:t-old', 'u-1')).toHaveLength(0);
     expect(view.getTextarea().value).toBe('typed on the new session');
     view.unmount();
     expect(load('thread:t-new', 'u-1')).toBe('typed on the new session');
+    vi.useRealTimers();
   });
 
   it('a not-taken keep saves the quotes added while the send was out, beside the sent ones', async () => {
@@ -1568,6 +1576,85 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     expect(loadInFlightCopies('ws:ws-9:new', 'u-1')).toHaveLength(0);
     expect(loadInFlightCopies('thread:t-clean', 'u-1').map((c) => c.text)).toEqual(['the opening question']);
     view.unmount();
+    vi.useRealTimers();
+  });
+
+  it('keeps every unresolved send\'s copy — six sends, six copies, none dropped', async () => {
+    // No cap: a sixth unresolved send must not push the oldest copy out of
+    // storage (round-9 item 4). The banner folds past three, but everything
+    // stays stored and reachable.
+    const pending = new Promise<boolean>(() => {});
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockReturnValue(pending);
+    const view = renderComposer({ draftKey: 'thread:t-six', onSend }, { userId: 'u-1' });
+    for (let n = 1; n <= 6; n += 1) {
+      fireEvent.change(view.getTextarea(), { target: { value: `send number ${n}`, selectionStart: 13 } });
+      fireEvent.click(screen.getByLabelText('Send message'));
+    }
+    const copies = loadInFlightCopies('thread:t-six', 'u-1');
+    expect(copies.map((c) => c.text)).toEqual([
+      'send number 1', 'send number 2', 'send number 3',
+      'send number 4', 'send number 5', 'send number 6',
+    ]);
+    // A reload offers every one of them; the banner folds past three — three
+    // entries shown, an expander counting the rest — and the copy behind
+    // every offer is in storage.
+    view.unmount();
+    const reopened = renderComposer({ draftKey: 'thread:t-six' }, { userId: 'u-1' });
+    expect(screen.getAllByTestId('in-flight-draft-entry')).toHaveLength(3);
+    expect(screen.getByTestId('in-flight-draft-expand').textContent).toContain('3');
+    fireEvent.click(screen.getByTestId('in-flight-draft-expand'));
+    expect(screen.getAllByTestId('in-flight-draft-entry')).toHaveLength(6);
+    reopened.unmount();
+  });
+
+  it('a not-taken on the old key merges its SAVED draft — quote and follow-up — never the new box\'s', async () => {
+    // Round-9 item 5: the send went out with a quote, a follow-up was typed
+    // and saved on that key, then the box switched to another session. The
+    // not-taken writes the old key with quote + follow-up — the quote from
+    // the send's own parts, the follow-up from the old key's saved draft —
+    // and the new session's box and draft are untouched.
+    vi.useFakeTimers();
+    const resolvers: Array<(v: boolean) => void> = [];
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+      () => new Promise<boolean>((resolve) => { resolvers.push(resolve); }),
+    );
+    const ref = createRef<ChatInputHandle>();
+    const view = renderComposer({ draftKey: 'thread:t-merge', onSend }, { userId: 'u-1', ref });
+
+    act(() => {
+      ref.current!.addContext({ kind: 'quote', snippet: 'Revenue grew by a lot', from: ANALYST });
+    });
+    fireEvent.click(screen.getByLabelText('Send message'));
+    fireEvent.change(view.getTextarea(), { target: { value: 'follow-up kept on the old key', selectionStart: 29 } });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(DRAFT_SAVE_DEBOUNCE_MS);
+    });
+    expect(load('thread:t-merge', 'u-1')).toBe('follow-up kept on the old key');
+
+    view.rerenderComposer({ draftKey: 'thread:t-other', onSend });
+    fireEvent.change(view.getTextarea(), { target: { value: 'other session words', selectionStart: 19 } });
+
+    await act(async () => {
+      resolvers[0](false);
+    });
+
+    // Old key: the token text (the quote's) AHEAD of the saved follow-up,
+    // with the quote's parts — the other session's words and quotes nowhere
+    // in it.
+    const stored = JSON.parse(
+      localStorage.getItem(buildDraftStorageKey('thread:t-merge', 'u-1')) ?? '{}',
+    ) as { text?: string; quotes?: Array<{ snippet?: string }> };
+    // The quote token keeps its words together with non-breaking spaces.
+    const storedText = (stored.text ?? '').replace(/\s/g, ' ');
+    expect(storedText).toContain('Revenue grew by a lot');
+    expect(storedText).toContain('follow-up kept on the old key');
+    expect(storedText.indexOf('Revenue grew by a lot')).toBeLessThan(storedText.indexOf('follow-up kept on the old key'));
+    expect(stored.quotes?.map((q) => q.snippet)).toContain('Revenue grew by a lot');
+    expect(stored.text).not.toContain('other session words');
+    expect(loadInFlightCopies('thread:t-merge', 'u-1')).toHaveLength(0);
+    expect(view.getTextarea().value).toBe('other session words');
+    view.unmount();
+    expect(load('thread:t-other', 'u-1')).toBe('other session words');
     vi.useRealTimers();
   });
 });

@@ -1445,21 +1445,194 @@ describe('useChatMessages – send acceptance (DALTON composer drafts)', () => {
       expect(mockSendStream).toHaveBeenCalledTimes(2);
       expect(storedCopies().map((c) => c.text)).toEqual(['queued words one', 'queued words two']);
 
-      // The stop drops the queue: each copy seats back whole, once.
+      // The stop drops the queue: each copy seats back whole, once — the
+      // superseded older one AHEAD of the newer (round-9 item 3: definitely
+      // not taken does not linger as a "may have gone through" offer), and
+      // neither stays offered.
       await act(async () => {
         await result.current.chat.stopWorkflow();
       });
       expect(accepted).not.toHaveBeenCalled();
-      // The newer send (two) seats back into the box. The older one (one) was
-      // superseded on this key, so it never writes into the box the newer send
-      // owns: its copy stays as an offer the user can put back. Either way each
-      // text is somewhere exactly once — nothing lands twice, nothing is lost.
       const box = result.current.composer.message;
+      expect(box.match(/queued words one/g)).toHaveLength(1);
       expect(box.match(/queued words two/g)).toHaveLength(1);
-      expect(box.match(/queued words one/g)).toBeNull();
-      expect(storedCopies().map((c) => c.text)).toEqual(['queued words one']);
+      expect(box.indexOf('queued words one')).toBeLessThan(box.indexOf('queued words two'));
+      expect(result.current.composer.inFlightCopies).toHaveLength(0);
+      expect(storedCopies()).toHaveLength(0);
       // The plain-text give-back stayed out: the queued sends have their own
       // draft settles, so nothing was handed to returnedSteering on top.
+      expect(result.current.chat.returnedSteering).toBeNull();
+      unmount();
+    });
+
+    it('a steer ending after the user\'s stop is not taken — the draft seats back whole, whatever ended it', async () => {
+      // The steer POST is still out when the user stops; it then ends the
+      // named way with no acceptance. Each is a not-taken: false, the draft
+      // back in the box and in storage at once, and nothing handed to the
+      // plain-text channel.
+      const cases: Array<{ name: string; end: () => Promise<unknown> }> = [
+        {
+          name: 'stopping',
+          end: () => Promise.reject(Object.assign(new Error('The turn is stopping.'), {
+            status: 409,
+            errorInfo: { code: 'stopping', message: 'The turn is stopping.' },
+          })),
+        },
+        {
+          name: 'network error',
+          end: () => Promise.reject(new TypeError('Failed to fetch')),
+        },
+        {
+          name: 'aborted with no acceptance',
+          end: () => Promise.resolve({ aborted: true, disconnected: false }),
+        },
+      ];
+      for (const { name, end } of cases) {
+        let releaseFirst!: (v: { disconnected: boolean; aborted: boolean }) => void;
+        mockSendStream.mockImplementation(
+          async (_msg: string, _ws: string, _tid: string | null, opts: StreamOptions) => {
+            if (mockSendStream.mock.calls.length === 1) {
+              opts.onEvent?.({ event: 'thread_id', thread_id: 'thread-steerstop' } as never);
+              return new Promise((resolve) => {
+                releaseFirst = resolve;
+              });
+            }
+            return end();
+          },
+        );
+
+        const accepted = vi.fn();
+        const { result, unmount } = renderHookWithProviders(() => useDraftChatHarness());
+        act(() => {
+          result.current.composer.setMessage(`steer after stop (${name})`);
+        });
+        let first!: Promise<boolean>;
+        act(() => {
+          first = result.current.chat.handleSendMessage('first turn');
+        });
+        await act(async () => {
+          await Promise.resolve();
+        });
+        await waitFor(() => {
+          expect(result.current.chat.isLoading).toBe(true);
+        });
+
+        let outcome: boolean | undefined;
+        await act(async () => {
+          result.current.composer.submitWithDraft((onAccepted, onHandedOff, onRestore) => {
+            const sent = result.current.chat.handleSendMessage(`steer after stop (${name})`, null, null, {
+              onAccepted: () => {
+                onAccepted();
+                accepted();
+              },
+              onHandedOff,
+              onNotTaken: onRestore,
+            });
+            sent.then((v) => { outcome = v; });
+            return sent;
+          });
+        });
+        await act(async () => {
+          await result.current.chat.stopWorkflow();
+        });
+        await act(async () => {
+          releaseFirst({ disconnected: false, aborted: false });
+          await first.catch(() => undefined);
+        });
+
+        expect(accepted).not.toHaveBeenCalled();
+        expect(outcome).toBe(false);
+        // Back whole, at once, and only once: the box and the stored draft.
+        expect(result.current.composer.message).toBe(`steer after stop (${name})`);
+        expect(load(DRAFT_KEY)).toBe(`steer after stop (${name})`);
+        expect(storedCopies()).toHaveLength(0);
+        expect(result.current.chat.returnedSteering).toBeNull();
+        unmount();
+        localStorage.clear();
+        mockSendStream.mockReset();
+        mockSendStream.mockImplementation(async () => ({ disconnected: false }));
+        vi.clearAllMocks();
+      }
+    });
+
+    it('a not_running refusal landing after the stop seats each draft back once, not twice', async () => {
+      // Two steers are out when the user stops; both then come back
+      // not_running. The composer-linked ones settle their own copies whole —
+      // the plain-text give-back stays out — so each text appears exactly
+      // once, nothing lingers as an offer.
+      let releaseFirst!: (v: { disconnected: boolean; aborted: boolean }) => void;
+      const notRunning = Object.assign(new Error('No running turn'), {
+        status: 409,
+        errorInfo: { code: 'not_running', message: 'No running turn to steer into.' },
+      });
+      mockSendStream.mockImplementation(
+        async (_msg: string, _ws: string, _tid: string | null, opts: StreamOptions) => {
+          if (mockSendStream.mock.calls.length === 1) {
+            opts.onEvent?.({ event: 'thread_id', thread_id: 'thread-nrstop' } as never);
+            return new Promise((resolve) => {
+              releaseFirst = resolve;
+            });
+          }
+          throw notRunning;
+        },
+      );
+
+      const accepted = vi.fn();
+      const { result, unmount } = renderHookWithProviders(() => useDraftChatHarness());
+      act(() => {
+        result.current.composer.setMessage('nr one');
+      });
+      let first!: Promise<boolean>;
+      act(() => {
+        first = result.current.chat.handleSendMessage('first turn');
+      });
+      await act(async () => {
+        await Promise.resolve();
+      });
+      await waitFor(() => {
+        expect(result.current.chat.isLoading).toBe(true);
+      });
+
+      const sendSteer = (text: string) => {
+        act(() => {
+          result.current.composer.setMessage(text);
+        });
+        act(() => {
+          result.current.composer.submitWithDraft((onAccepted, onHandedOff, onRestore) => {
+            return result.current.chat.handleSendMessage(text, null, null, {
+              onAccepted: () => {
+                onAccepted();
+                accepted();
+              },
+              onHandedOff,
+              onNotTaken: onRestore,
+            });
+          });
+        });
+      };
+      sendSteer('nr one');
+      await act(async () => {
+        await Promise.resolve();
+      });
+      sendSteer('nr two');
+      await act(async () => {
+        await Promise.resolve();
+      });
+
+      await act(async () => {
+        await result.current.chat.stopWorkflow();
+      });
+      await act(async () => {
+        releaseFirst({ disconnected: false, aborted: false });
+        await first.catch(() => undefined);
+      });
+
+      expect(accepted).not.toHaveBeenCalled();
+      const box = result.current.composer.message;
+      expect(box.match(/nr one/g)).toHaveLength(1);
+      expect(box.match(/nr two/g)).toHaveLength(1);
+      expect(result.current.composer.inFlightCopies).toHaveLength(0);
+      expect(storedCopies()).toHaveLength(0);
       expect(result.current.chat.returnedSteering).toBeNull();
       unmount();
     });
