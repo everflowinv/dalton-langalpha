@@ -462,9 +462,9 @@ export function WorkspaceSharingModal({
                   data-testid="workspace-sharing-save-error"
                   className="flex items-center gap-2 rounded-md border px-3 py-2 text-xs"
                   style={{
-                    borderColor: 'var(--color-danger, #ef4444)',
-                    backgroundColor: 'rgba(239, 68, 68, 0.08)',
-                    color: 'var(--color-danger, #ef4444)',
+                    borderColor: 'var(--color-loss)',
+                    backgroundColor: 'var(--color-loss-soft)',
+                    color: 'var(--color-loss)',
                   }}
                 >
                   <AlertTriangle className="h-4 w-4 shrink-0" />

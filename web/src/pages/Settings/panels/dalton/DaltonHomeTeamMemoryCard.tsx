@@ -155,7 +155,7 @@ export function DaltonHomeTeamMemoryCard(): React.ReactElement | null {
           role="alert"
           data-testid="home-team-memory-error"
           className="text-xs"
-          style={{ color: 'var(--color-danger, #ef4444)' }}
+          style={{ color: 'var(--color-loss)' }}
         >
           {toggleError}
         </p>
