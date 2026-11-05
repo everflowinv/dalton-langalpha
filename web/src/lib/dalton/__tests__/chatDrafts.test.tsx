@@ -1022,6 +1022,37 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     reopened.unmount();
   });
 
+  it('a successful send clears the attachments-again notice, and the next draft does not inherit it', async () => {
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockReturnValue(true);
+    const view = renderComposer({ draftKey: 'thread:t-att-reset' }, { userId: 'u-1' });
+    attachFile(view, 'page.txt');
+    fireEvent.change(view.getTextarea(), {
+      target: { value: 'went with a file', selectionStart: 16 },
+    });
+    view.unmount();
+
+    const reopened = renderComposer({ draftKey: 'thread:t-att-reset', onSend }, { userId: 'u-1' });
+    expect(screen.getByTestId('attachments-lost-notice')).toBeTruthy();
+    attachFile(reopened, 'page-again.txt');
+    fireEvent.click(screen.getByLabelText('Send message'));
+    expect(onSend).toHaveBeenCalledTimes(1);
+
+    // Sent and taken: the notice is gone, and the next plain-text draft is
+    // saved without the attachments flag.
+    await waitFor(() => {
+      expect(screen.queryByTestId('attachments-lost-notice')).toBeNull();
+    });
+    fireEvent.change(reopened.getTextarea(), {
+      target: { value: 'plain follow-up', selectionStart: 15 },
+    });
+    reopened.unmount();
+    const stored = JSON.parse(
+      localStorage.getItem(buildDraftStorageKey('thread:t-att-reset', 'u-1')) ?? '{}',
+    ) as { text?: string; hadAttachments?: boolean };
+    expect(stored.text).toBe('plain follow-up');
+    expect(stored.hadAttachments).not.toBe(true);
+  });
+
   it('a failed send of a draft with a quote and attachments restores text, chip and notice in place, and a resend carries the quote whole', () => {
     const onSend = vi.fn<ChatInputProps['onSend']>().mockReturnValue(false);
     const ref = createRef<ChatInputHandle>();

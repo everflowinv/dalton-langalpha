@@ -458,6 +458,11 @@ export function useChatMessages(
   // a stop's returned-steers text channel skips these; their own POST's
   // not-taken settle restores the draft whole.
   const composerSteerKeysRef = useRef(new Set<string>());
+  // DALTON-HOOK(composer-drafts): composer steers whose POST already ended
+  // (its draft settled: restored, or taken). A stop that returns one of them
+  // later must not put its words back a second time; cleared once a stop has
+  // read it.
+  const settledComposerSteerKeysRef = useRef(new Set<string>());
   // A refused steer's banner, for a load to show again once it has cleared
   // it: the first load to succeed after the refusal shows it, unless a turn
   // sent or a thread opened since has moved the session on.
@@ -1983,9 +1988,15 @@ export function useChatMessages(
       // false); only the rest — sends no draft lifecycle owns — go back as
       // plain text, so no words land in the box twice.
       const unsentTexts = unsent.filter((u) => !(u as { settleQueued?: unknown }).settleQueued);
-      giveBackStoppedSteers(outcome?.returned_steers ?? [], unsentTexts, composerSteerKeysRef.current);
+      giveBackStoppedSteers(
+        outcome?.returned_steers ?? [],
+        unsentTexts,
+        new Set([...composerSteerKeysRef.current, ...settledComposerSteerKeysRef.current]),
+      );
+      settledComposerSteerKeysRef.current.clear();
     } else {
       giveBackStoppedSteers([], unsent.filter((u) => !(u as { settleQueued?: unknown }).settleQueued), composerSteerKeysRef.current);
+      settledComposerSteerKeysRef.current.clear();
     }
   };
 
@@ -2366,7 +2377,10 @@ export function useChatMessages(
       return false;
     } finally {
       requestKeys.settle(requestKey, ended);
-      if (hasComposer) composerSteerKeysRef.current.delete(requestKey);
+      if (hasComposer) {
+        composerSteerKeysRef.current.delete(requestKey);
+        settledComposerSteerKeysRef.current.add(requestKey);
+      }
       steersInFlightRef.current.delete(seq);
       if (notRunningSendsRef.current.length > 0) setNotRunningTick((n) => n + 1);
       // A load deferred to this answer runs now, unless a stream it started

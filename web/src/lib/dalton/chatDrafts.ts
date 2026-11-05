@@ -708,9 +708,11 @@ export function useComposerDraft({
   const applyRestored = useCallback(
     (record: { quotes?: QuoteMention[]; hadAttachments?: boolean } | null) => {
       setRestoredQuotesState(record?.quotes ?? []);
-      // OR, not overwrite: a newer send's attachments-again notice must
-      // survive an older send's restore beside it in the same box.
-      restoredHadAttachmentsRef.current = restoredHadAttachmentsRef.current || record?.hadAttachments === true;
+      // A reset (`null`: sent, cleared, switched) clears the notice. A restore
+      // ORs into it: a newer send's attachments-again notice must survive an
+      // older send's restore beside it in the same box.
+      restoredHadAttachmentsRef.current =
+        record === null ? false : restoredHadAttachmentsRef.current || record.hadAttachments === true;
       setRestoredHadAttachmentsState(restoredHadAttachmentsRef.current);
     },
     [],
