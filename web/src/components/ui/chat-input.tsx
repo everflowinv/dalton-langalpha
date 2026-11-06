@@ -221,7 +221,11 @@ function ChatInput({
   const handleDraftKeySwitch = useCallback(() => {
     resetRichDraftRef.current();
   }, []);
-  const { message, setMessage, restoredFromInFlight, clearCurrentDraft, submitWithDraft } = useComposerDraft({
+  // DALTON-HOOK(composer-drafts): give-back and IME composition hold come from useComposerDraft
+  const {
+    message, setMessage, restoredFromInFlight, clearCurrentDraft, submitWithDraft,
+    giveBack: giveBackDraft, onCompositionStart: holdDraftWrites, onCompositionEnd: releaseDraftWrites,
+  } = useComposerDraft({
     draftKey,
     prefillMessage,
     onDraftKeySwitch: handleDraftKeySwitch,
@@ -422,22 +426,16 @@ function ChatInput({
       setTimeout(() => textareaRef.current?.focus(), 0);
     },
     giveBack(text, files = []) {
-      if (text) {
-        setMessage((prev) => {
-          const typed = prev.trimEnd();
-          if (!typed) return text;
-          if (typed === text || typed.endsWith(`\n\n${text}`)) return prev;
-          return `${typed}\n\n${text}`;
-        });
-      }
+      // DALTON-HOOK(composer-drafts): handed-back text waits for an open IME composition
+      if (text) giveBackDraft(text);
       restoreFiles(files);
       setTimeout(() => textareaRef.current?.focus(), 0);
     },
     send() {
       return sendRef.current();
     },
-    // DALTON-HOOK(composer-drafts): include setMessage from useComposerDraft
-  }), [pillModel, sentEffort, resolvedFastMode, effectiveMarketWatch, draftSubagents, ownOverrides, setMentionedFiles, restoreFiles, setMessage]);
+    // DALTON-HOOK(composer-drafts): include setMessage and giveBackDraft from useComposerDraft
+  }), [pillModel, sentEffort, resolvedFastMode, effectiveMarketWatch, draftSubagents, ownOverrides, setMentionedFiles, restoreFiles, setMessage, giveBackDraft]);
 
   // Subscribe to ContextBus so this input mirrors the global widget-context
   // deck. Multiple chat inputs can be visible simultaneously (hero card +
@@ -529,6 +527,8 @@ function ChatInput({
   const handleChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const val = e.target.value;
     setMessage(val);
+    // DALTON-HOOK(composer-drafts): an input the browser marks as outside any composition ends one whose compositionend never came
+    if ((e.nativeEvent as InputEvent).isComposing === false) releaseDraftWrites();
     const cursorPos = e.target.selectionStart;
 
     // Pills whose /{command} or @mention text was deleted go with it
@@ -539,7 +539,7 @@ function ChatInput({
     if (detectSlash(val, cursorPos)) closeMentions();
     else detectMention(val, cursorPos);
     // DALTON-HOOK(composer-drafts): include setMessage from useComposerDraft
-  }, [pruneSlash, pruneMentions, detectSlash, detectMention, closeMentions, setMessage]);
+  }, [pruneSlash, pruneMentions, detectSlash, detectMention, closeMentions, setMessage, releaseDraftWrites]);
 
   // Close both autocompletes on blur
   const handleBlur = useCallback(() => {
@@ -823,12 +823,15 @@ function ChatInput({
               onPaste={handleTextareaPaste}
               onKeyDown={handleKeyDown}
               onBlur={handleBlur}
+              // DALTON-HOOK(composer-drafts): rewrites from outside the user's typing wait for the IME composition to end
               onCompositionStart={() => {
+                holdDraftWrites();
                 // Terminate voice input if IME starts
                 if (isListening) {
                   stopListening();
                 }
               }}
+              onCompositionEnd={releaseDraftWrites}
               placeholder={isListening ? "" : (placeholder ?? t("chat.placeholderDefault"))}
               className={`font-content w-full bg-transparent border-0 text-(--color-text-primary) ${isMobile ? 'text-base' : 'text-sm'} placeholder:text-(--color-text-tertiary) resize-none overflow-y-auto leading-relaxed block transition-opacity ${isListening ? 'opacity-20' : 'opacity-100'}`}
               rows={minRows}

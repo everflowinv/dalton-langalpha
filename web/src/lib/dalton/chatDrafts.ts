@@ -333,7 +333,17 @@ export interface UseComposerDraftResult {
   submitWithDraft: (
     invoke: (onAccepted: () => void) => void | boolean | Promise<void | boolean>,
   ) => void;
+  /** Hand text back to the composer beside what is typed (a stopped turn's
+   *  unread steers, an edit whose message is gone). */
+  giveBack: (text: string) => void;
+  onCompositionStart: () => void;
+  onCompositionEnd: () => void;
 }
+
+/** An input rewrite from outside the user's typing, held while an IME
+ *  composition is open. It runs against the draft key current when it runs:
+ *  the key effect's cleanup passes the key being left. */
+type ExternalWrite = (currentKey: string | undefined) => void;
 
 /**
  * Manages the composer text state backed by `localStorage` when `draftKey` is provided:
@@ -379,6 +389,41 @@ export function useComposerDraft({
     draftKey,
     userId,
   });
+  // An IME composition owns the textarea until it ends: a value written under
+  // it makes the IME insert its open segment again on every key, so the text
+  // repeats without end. Rewrites that do not come from the user's typing wait
+  // for compositionend (or for the key effect's cleanup, on a switch or unmount).
+  const composingRef = useRef(false);
+  const pendingWritesRef = useRef<ExternalWrite[]>([]);
+  const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const runExternal = useCallback((write: ExternalWrite) => {
+    // Behind writes still waiting, so they keep their order.
+    if (composingRef.current || pendingWritesRef.current.length > 0) {
+      pendingWritesRef.current.push(write);
+      return;
+    }
+    write(activeDraftKeyRef.current);
+  }, []);
+  // A write captured while the user was still loading belongs to the user who
+  // loaded since.
+  const ownerOf = useCallback((uid: string | undefined) => (!uid || uid === 'anon' ? activeUserIdRef.current : uid), []);
+  const flushPendingWrites = useCallback((currentKey: string | undefined) => {
+    if (flushTimerRef.current !== null) {
+      clearTimeout(flushTimerRef.current);
+      flushTimerRef.current = null;
+    }
+    const writes = pendingWritesRef.current.splice(0);
+    for (const write of writes) write(currentKey);
+  }, []);
+  // On the next task: after the input event that commits a composition,
+  // whichever order the browser fires the two in.
+  const scheduleFlush = useCallback(() => {
+    if (flushTimerRef.current !== null || pendingWritesRef.current.length === 0) return;
+    flushTimerRef.current = setTimeout(() => {
+      flushTimerRef.current = null;
+      if (!composingRef.current) flushPendingWrites(activeDraftKeyRef.current);
+    }, 0);
+  }, [flushPendingWrites]);
 
   const updateRestoredFromInFlight = useCallback((next: boolean) => {
     restoredFromInFlightRef.current = next;
@@ -400,22 +445,40 @@ export function useComposerDraft({
       getDraftKey: () => activeDraftKeyRef.current,
       getUserId: () => activeUserIdRef.current,
       cancelAndClearInput: () => {
+        const key = activeDraftKeyRef.current;
+        const uid = activeUserIdRef.current;
+        // The pending save goes now, so the cleared draft is not written back
+        // while the input waits for a composition.
         if (timerRef.current !== null) {
           clearTimeout(timerRef.current);
           timerRef.current = null;
         }
         dirtyRef.current = false;
-        writtenSinceMountOrSendRef.current = false;
-        latestMessageRef.current = '';
-        updateRestoredFromInFlight(false);
-        setMessageState('');
+        runExternal((currentKey) => {
+          if (currentKey !== key) return;
+          if (timerRef.current !== null) {
+            clearTimeout(timerRef.current);
+            timerRef.current = null;
+          }
+          dirtyRef.current = false;
+          writtenSinceMountOrSendRef.current = false;
+          latestMessageRef.current = '';
+          updateRestoredFromInFlight(false);
+          // Typing during the composition may have saved again, under the user
+          // it had then or, if that was the loading user, the one that loaded.
+          if (key) {
+            clearStorageEntry(key, uid);
+            if (uid === 'anon' && activeUserIdRef.current !== uid) clearStorageEntry(key, activeUserIdRef.current);
+          }
+          setMessageState('');
+        });
       },
     };
     activeControllers.add(controller);
     return () => {
       activeControllers.delete(controller);
     };
-  }, [updateRestoredFromInFlight]);
+  }, [updateRestoredFromInFlight, runExternal]);
 
   const scheduleSave = useCallback((nextText: string) => {
     if (timerRef.current !== null) {
@@ -550,39 +613,41 @@ export function useComposerDraft({
         return;
       }
       // Send failed: keep the draft in localStorage and put the original text back.
-      if (activeDraftKeyRef.current === sendDraftKey) {
-        hasSentOnKeyRef.current = false;
-        if (timerRef.current !== null) {
-          clearTimeout(timerRef.current);
-          timerRef.current = null;
+      runExternal((currentKey) => {
+        if (currentKey === sendDraftKey) {
+          hasSentOnKeyRef.current = false;
+          if (timerRef.current !== null) {
+            clearTimeout(timerRef.current);
+            timerRef.current = null;
+          }
+          const trimmedSent = sentText.trim();
+          const currentTyped = latestMessageRef.current.trim();
+          const alreadyRestored =
+            Boolean(trimmedSent) &&
+            (currentTyped === trimmedSent ||
+              currentTyped.startsWith(`${trimmedSent}\n\n`) ||
+              currentTyped.endsWith(`\n\n${trimmedSent}`));
+          const restoredText = sentText
+            ? alreadyRestored
+              ? latestMessageRef.current
+              : currentTyped
+                ? `${sentText}\n\n${latestMessageRef.current}`
+                : sentText
+            : latestMessageRef.current;
+          if (restoredText.trim()) {
+            save(sendDraftKey, restoredText, ownerOf(sendUserId));
+          }
+          if (restoredText) {
+            latestMessageRef.current = restoredText;
+            dirtyRef.current = false;
+            writtenSinceMountOrSendRef.current = true;
+            updateRestoredFromInFlight(false);
+            setMessageState(restoredText);
+          }
+        } else if (sentText.trim()) {
+          save(sendDraftKey, sentText, ownerOf(sendUserId));
         }
-        const trimmedSent = sentText.trim();
-        const currentTyped = latestMessageRef.current.trim();
-        const alreadyRestored =
-          Boolean(trimmedSent) &&
-          (currentTyped === trimmedSent ||
-            currentTyped.startsWith(`${trimmedSent}\n\n`) ||
-            currentTyped.endsWith(`\n\n${trimmedSent}`));
-        const restoredText = sentText
-          ? alreadyRestored
-            ? latestMessageRef.current
-            : currentTyped
-              ? `${sentText}\n\n${latestMessageRef.current}`
-              : sentText
-          : latestMessageRef.current;
-        if (restoredText.trim()) {
-          save(sendDraftKey, restoredText, sendUserId);
-        }
-        if (restoredText) {
-          latestMessageRef.current = restoredText;
-          dirtyRef.current = false;
-          writtenSinceMountOrSendRef.current = true;
-          updateRestoredFromInFlight(false);
-          setMessageState(restoredText);
-        }
-      } else if (sentText.trim()) {
-        save(sendDraftKey, sentText, sendUserId);
-      }
+      });
     };
 
     return {
@@ -593,7 +658,7 @@ export function useComposerDraft({
         settle(true);
       },
     };
-  }, [updateRestoredFromInFlight]);
+  }, [updateRestoredFromInFlight, runExternal, ownerOf]);
 
   const submitWithDraft = useCallback(
     (invoke: (onAccepted: () => void) => void | boolean | Promise<void | boolean>) => {
@@ -612,6 +677,52 @@ export function useComposerDraft({
     },
     [beginSend],
   );
+
+  const giveBack = useCallback((text: string) => {
+    if (!text) return;
+    const key = activeDraftKeyRef.current;
+    const uid = activeUserIdRef.current;
+    const merge = (prev: string) => {
+      const typed = prev.trimEnd();
+      if (!typed) return text;
+      if (typed === text || typed.endsWith(`\n\n${text}`)) return prev;
+      return `${typed}\n\n${text}`;
+    };
+    runExternal((currentKey) => {
+      if (currentKey !== key) {
+        // The composer moved to another draft while this waited: the text goes
+        // to the draft it was handed back to.
+        if (key) save(key, merge(load(key, ownerOf(uid))), ownerOf(uid));
+        return;
+      }
+      if (activeDraftKeyRef.current === key) {
+        setMessage(merge);
+        return;
+      }
+      // Flushed by the cleanup of the key being left: setMessage's debounced
+      // save would land on the next key, so this one saves directly.
+      const next = merge(latestMessageRef.current);
+      latestMessageRef.current = next;
+      dirtyRef.current = false;
+      if (key && next.trim()) save(key, next, ownerOf(uid));
+    });
+  }, [runExternal, setMessage, ownerOf]);
+
+  const onCompositionStart = useCallback(() => {
+    composingRef.current = true;
+  }, []);
+  const onCompositionEnd = useCallback(() => {
+    composingRef.current = false;
+    scheduleFlush();
+  }, [scheduleFlush]);
+
+  // Unmounted, no composition will end: a write arriving later (a send that
+  // fails after the composer is gone) runs at once against the last key.
+  // Declared before the key effect, so on unmount this runs before its save.
+  useEffect(() => () => {
+    composingRef.current = false;
+    flushPendingWrites(activeDraftKeyRef.current);
+  }, [flushPendingWrites]);
 
   // Sweep expired drafts once when mounted with a draftKey.
   const hasDraftKey = Boolean(draftKey);
@@ -673,6 +784,7 @@ export function useComposerDraft({
             setMessageState('');
           }
           return () => {
+            if (activeDraftKeyRef.current !== draftKey) flushPendingWrites(draftKey);
             if (timerRef.current !== null) {
               clearTimeout(timerRef.current);
               timerRef.current = null;
@@ -701,6 +813,7 @@ export function useComposerDraft({
           writtenSinceMountOrSendRef.current = true;
           setMessageState(continuationText);
           return () => {
+            if (activeDraftKeyRef.current !== draftKey) flushPendingWrites(draftKey);
             if (timerRef.current !== null) {
               clearTimeout(timerRef.current);
               timerRef.current = null;
@@ -723,10 +836,19 @@ export function useComposerDraft({
       const hasExternalPrefill =
         Boolean(prefillMessageRef.current) ||
         (!draftKeyChanged && hadPrefillRef.current);
-      if (
-        !hasExternalPrefill &&
-        !(userIdChanged && !draftKeyChanged && dirtyRef.current)
-      ) {
+      // The user loading under the same key leaves typed text alone: only an
+      // empty composer takes that user's stored draft. A switch between two
+      // signed-in users keeps the rule it had (skip only unsaved typing).
+      const userLoaded = userIdChanged && !draftKeyChanged && prev.userId === 'anon';
+      const keepTyped = userLoaded
+        ? Boolean(latestMessageRef.current.trim())
+        : userIdChanged && !draftKeyChanged && dirtyRef.current;
+      if (userLoaded && keepTyped && draftKey) {
+        save(draftKey, latestMessageRef.current, userId);
+      }
+      if (!hasExternalPrefill && !keepTyped) {
+        // Not held for a composition: the composer now shows another draft,
+        // and typing held over it would save the old text under the new key.
         const restoredRecord = draftKey ? loadStoredDraft(draftKey, userId) : null;
         const restored = restoredRecord?.text ?? '';
         latestMessageRef.current = restored;
@@ -737,6 +859,10 @@ export function useComposerDraft({
     }
 
     return () => {
+      // Writes held for an open composition land on the draft being left. A
+      // user change under the same key keeps them waiting for compositionend;
+      // unmount flushes them in its own effect, declared above.
+      if (activeDraftKeyRef.current !== draftKey) flushPendingWrites(draftKey);
       if (timerRef.current !== null) {
         clearTimeout(timerRef.current);
         timerRef.current = null;
@@ -746,7 +872,7 @@ export function useComposerDraft({
         dirtyRef.current = false;
       }
     };
-  }, [draftKey, userId, updateRestoredFromInFlight]);
+  }, [draftKey, userId, updateRestoredFromInFlight, flushPendingWrites]);
 
   return {
     message,
@@ -755,5 +881,8 @@ export function useComposerDraft({
     clearCurrentDraft,
     beginSend,
     submitWithDraft,
+    giveBack,
+    onCompositionStart,
+    onCompositionEnd,
   };
 }
