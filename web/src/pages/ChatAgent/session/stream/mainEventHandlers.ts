@@ -11,6 +11,8 @@ import type { MessageRecord, SetMessages, ToolCallRecord, ToolCallResultRecord, 
 import type { ProvenanceEvent } from '@/types/sse';
 import type { ContentSegment, PendingToolCallChunk, ProvenanceRecord, SubagentTaskRecord, TextSegment } from '@/types/chat';
 import { provenanceEventToRecord, provenanceRecordKey } from './provenance';
+// DALTON-HOOK(provenance-batch): single-copy provenance record merge helper
+import { mergeProvenanceRecords } from './provenanceBatch';
 import { appendTextChunk } from './textChunks';
 import { addToolCallChunk, hasPreparing, removeLandedToolCall, withoutPending } from './toolCallChunks';
 import type { StreamRefs, ToolCallChunkRecord } from '../streamRefs';
@@ -451,14 +453,15 @@ export function handleProvenance({ assistantMessageId, event, setMessages }: {
   const record = provenanceEventToRecord(event);
   const key = provenanceRecordKey(record);
 
+  // DALTON-HOOK(provenance-batch): merge via single-copy helper
   setMessages((prev: MessageRecord[]) =>
     prev.map((msg: MessageRecord) => {
       if (msg.id !== assistantMessageId) return msg;
 
-      const provenanceRecords = {
-        ...((msg.provenanceRecords as Record<string, ProvenanceRecord>) || {}),
-        [key]: record,
-      };
+      const provenanceRecords = mergeProvenanceRecords(
+        msg.provenanceRecords as Record<string, ProvenanceRecord> | undefined,
+        { [key]: record },
+      );
 
       return { ...msg, provenanceRecords };
     })
