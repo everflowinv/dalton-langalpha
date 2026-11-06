@@ -128,3 +128,7 @@ tests/unit/middleware/workflow/test_partial_artifacts.py
 # each POST; the sequence test pins one wake for one follow-up.
 tests/unit/middleware/test_subagent_orphan_resume.py
 tests/unit/server/services/test_task_report_back.py
+# Provenance batching module and unit tests (thread 7ef20255 OOM fix).
+web/src/pages/ChatAgent/session/stream/provenanceBatch.ts
+web/src/pages/ChatAgent/session/stream/__tests__/provenanceBatch.test.ts
+web/src/pages/ChatAgent/session/history/__tests__/replayHistory.provenanceBatch.test.ts

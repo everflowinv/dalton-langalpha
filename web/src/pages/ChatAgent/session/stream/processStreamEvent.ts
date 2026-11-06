@@ -33,8 +33,10 @@ import { BUSY_REPLY_KEYS, isBusyCode } from '../../hooks/utils/forkRefusal';
 import {
   handleReasoningSignal, handleReasoningContent, handleTextContent,
   handleToolCalls, handleToolCallResult, handleToolCallChunks,
-  handleTodoUpdate, handleHtmlWidget, handleProvenance,
+  handleTodoUpdate, handleHtmlWidget,
 } from './mainEventHandlers';
+// DALTON-HOOK(provenance-batch): frame-batched live provenance buffer
+import { createProvenanceFrameBuffer } from './provenanceBatch';
 import {
   isSubagentEvent, handleSubagentMessageChunk, handleSubagentToolCallChunks,
   handleSubagentToolCalls, handleSubagentToolCallResult, handleTaskSteeringAccepted,
@@ -122,6 +124,11 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
     refs.isReconnect ? setMessagesForHandlers(update) : queueMessages(update);
   const queueCardForHandlers: UpdateSubagentCard = (taskId, patch) =>
     rt.updateSubagentCard?.(taskId, patch, { nextFrame: !refs.isReconnect });
+  // DALTON-HOOK(provenance-batch): frame-batched live provenance buffer scoped to current thread
+  const provenanceBuffer = rt.provenanceBuffer ?? createProvenanceFrameBuffer({
+    setMessages: setMessagesForHandlers,
+    getThreadId: () => rt.threadIdRef?.current ?? rt.threadId ?? null,
+  });
   // Snapshot of the old assistant message's content order at the time the user
   // sent a steering message.  Used to roll back any content that leaked into the
   // old bubble due to stream-mode multiplexing (custom events can arrive after
@@ -204,7 +211,8 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
     // Only token chunks wait for the frame. Anything else first applies the
     // chunks queued ahead of it, in this task, so a state change it makes
     // (loading, an interrupt, an error) never renders before the text.
-    if (eventType !== 'message_chunk' && eventType !== 'tool_call_chunks') rt.flushMessages();
+    // DALTON-HOOK(provenance-batch): provenance events are frame-batched in provenanceBuffer
+    if (eventType !== 'message_chunk' && eventType !== 'tool_call_chunks' && eventType !== 'provenance') rt.flushMessages();
 
     // Check if this is a subagent event — filtered from the main chat view
     // and (critically) from the main reconnect cursor: task-lane frames
@@ -286,6 +294,8 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
     // stopped here, the way a reload shows it. This tab's Stop aborts the read
     // first and settles the bubble itself.
     if (eventType === 'run_end' && !isSubagent) {
+      // DALTON-HOOK(provenance-batch): flush buffered provenance immediately on run_end
+      provenanceBuffer.flush();
       const counted = event.token_totals;
       if (counted) rt.setTokenUsage((prev) => withServerTotals(prev, counted));
       if (event.outcome === 'cancelled') {
@@ -351,6 +361,8 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
     // Handle steering_delivered custom events (middleware picked up the steering message).
     // Subagent steering_delivered events are handled in the isSubagent block below.
     if (eventType === 'steering_delivered' && !isSubagent) {
+      // DALTON-HOOK(provenance-batch): flush buffered provenance onto the pre-steer bubble before finalizing it
+      provenanceBuffer.flush();
       const oldAssistantId = assistantMessageId;
       const entries = steeringDeliveredEntries(event);
       // A delivery of reports or price alerts alone leaves the user's own
@@ -608,11 +620,12 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
     // The event is flat — fields top-level on `event` — matching the live
     // tool_call_result reader.
     if (eventType === 'provenance') {
-      handleProvenance({
+      // DALTON-HOOK(provenance-batch): buffer live provenance records and flush once per frame
+      provenanceBuffer.queue(
         assistantMessageId,
-        event: event as unknown as import('@/types/sse').ProvenanceEvent,
-        setMessages: setMessagesForHandlers,
-      });
+        event as unknown as import('@/types/sse').ProvenanceEvent,
+        rt.threadIdRef?.current ?? rt.threadId ?? null,
+      );
       return;
     }
 
@@ -822,6 +835,8 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
       // Skip other content types
       return;
     } else if (eventType === 'error' || event.error) {
+      // DALTON-HOOK(provenance-batch): flush buffered provenance immediately on turn error
+      provenanceBuffer.flush();
       // The turn failed — clear any lingering retry/fallback pill, and any
       // switch suggestion (the fallback model didn't save the turn either).
       deps.clearModelStatus();
@@ -1154,6 +1169,8 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
         }
       }
     } else if (eventType === 'interrupt') {
+      // DALTON-HOOK(provenance-batch): flush buffered provenance before pausing turn on interrupt
+      provenanceBuffer.flush();
       projectLiveInterrupt(rt, event, assistantMessageId, refs);
 
       rt.setIsLoading(false);

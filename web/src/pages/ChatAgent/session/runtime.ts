@@ -41,6 +41,8 @@ import type { RequestKeyTracker } from '../hooks/utils/requestKey';
 import type { PreviewData } from '../hooks/utils/types';
 import type { StructuredError } from '@/utils/rateLimitError';
 import type { ChatMessage } from '@/types/chat';
+// DALTON-HOOK(provenance-batch): frame-batched live provenance buffer type on StreamRuntime
+import type { ProvenanceFrameBuffer } from './stream/provenanceBatch';
 
 /** Mutable ref container (matches both useRef cells and hand-built refs). */
 type Ref<T> = { current: T };
@@ -142,6 +144,8 @@ export interface StreamRuntime {
   queueMessages: (update: (prev: ChatMessage[]) => ChatMessage[]) => void;
   /** Apply the queued per-token writes now. */
   flushMessages: () => void;
+  // DALTON-HOOK(provenance-batch): frame-batched live provenance buffer
+  provenanceBuffer?: ProvenanceFrameBuffer;
   setIsLoading: React.Dispatch<React.SetStateAction<boolean>>;
   setPendingInterrupt: React.Dispatch<React.SetStateAction<PendingInterrupt | null>>;
   setTokenUsage: React.Dispatch<React.SetStateAction<TokenUsage | null>>;
