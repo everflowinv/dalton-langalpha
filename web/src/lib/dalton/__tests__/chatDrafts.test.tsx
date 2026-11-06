@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import ChatInput, { type ChatInputProps } from '@/components/ui/chat-input';
+import ChatInput, { type ChatInputHandle, type ChatInputProps } from '@/components/ui/chat-input';
 import ChatInputCard from '@/pages/Dashboard/components/ChatInputCard';
 import { queryKeys } from '@/lib/queryKeys';
 import {
@@ -801,5 +801,272 @@ describe('chatDrafts storage module & ChatInput composer drafts', () => {
     expect(screen.queryByTestId('in-flight-draft-notice')).toBeNull();
     expect(load('thread:in-flight-send', 'u-1')).toBe('');
     restoredForSend.unmount();
+  });
+
+  describe('IME composition holds rewrites from outside the user\'s typing', () => {
+    // A value written under an open composition makes the IME insert its open
+    // segment again on every key (the text repeats without end), so these wait.
+    const compose = (el: HTMLTextAreaElement, value: string) => {
+      fireEvent.compositionStart(el);
+      fireEvent.change(el, { target: { value, selectionStart: value.length } });
+    };
+    const endComposition = async (el: HTMLTextAreaElement, value: string) => {
+      fireEvent.change(el, { target: { value, selectionStart: value.length } });
+      fireEvent.compositionEnd(el);
+      await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
+    };
+
+    it('a send that fails mid-composition restores its text only after the composition ends', async () => {
+      let resolveSend!: (val: boolean) => void;
+      const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+        () => new Promise<boolean>((resolve) => { resolveSend = resolve; }),
+      );
+      const view = renderComposer({ draftKey: 'thread:ime-fail', onSend }, { userId: 'u-1' });
+      fireEvent.change(view.getTextarea(), { target: { value: '刚才任务中断了', selectionStart: 7 } });
+      fireEvent.click(screen.getByLabelText('Send message'));
+
+      compose(view.getTextarea(), '你ji');
+      await act(async () => { resolveSend(false); });
+      // Untouched while the IME owns the textarea.
+      expect(view.getTextarea().value).toBe('你ji');
+
+      await endComposition(view.getTextarea(), '你继续');
+      expect(view.getTextarea().value).toBe('刚才任务中断了\n\n你继续');
+      expect(load('thread:ime-fail', 'u-1')).toBe('刚才任务中断了\n\n你继续');
+      view.unmount();
+    });
+
+    it('a failed send held by a composition still lands in the draft when the composer unmounts first', async () => {
+      let resolveSend!: (val: boolean) => void;
+      const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+        () => new Promise<boolean>((resolve) => { resolveSend = resolve; }),
+      );
+      const view = renderComposer({ draftKey: 'thread:ime-unmount', onSend }, { userId: 'u-1' });
+      fireEvent.change(view.getTextarea(), { target: { value: 'sent text', selectionStart: 9 } });
+      fireEvent.click(screen.getByLabelText('Send message'));
+      compose(view.getTextarea(), 'typed');
+      await act(async () => { resolveSend(false); });
+
+      view.unmount();
+      expect(load('thread:ime-unmount', 'u-1')).toBe('sent text\n\ntyped');
+      const remounted = renderComposer({ draftKey: 'thread:ime-unmount' }, { userId: 'u-1' });
+      expect(remounted.getTextarea().value).toBe('sent text\n\ntyped');
+      remounted.unmount();
+    });
+
+    it('a send that fails after the composer unmounted mid-composition still restores its text into the draft', async () => {
+      let resolveSend!: (val: boolean) => void;
+      const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+        () => new Promise<boolean>((resolve) => { resolveSend = resolve; }),
+      );
+      const view = renderComposer({ draftKey: 'thread:ime-late-fail', onSend }, { userId: 'u-1' });
+      fireEvent.change(view.getTextarea(), { target: { value: 'sent A', selectionStart: 6 } });
+      fireEvent.click(screen.getByLabelText('Send message'));
+      compose(view.getTextarea(), 'typed B');
+      view.unmount();
+
+      await act(async () => { resolveSend(false); });
+      expect(load('thread:ime-late-fail', 'u-1')).toBe('sent A\n\ntyped B');
+    });
+
+    it('a draft cleared from outside during a composition stays cleared after it ends', async () => {
+      const view = renderComposer({ draftKey: 'thread:ime-clear-store' }, { userId: 'u-1' });
+      compose(view.getTextarea(), 'abc');
+      act(() => { clear('thread:ime-clear-store'); });
+      // The composition goes on past the save debounce.
+      fireEvent.change(view.getTextarea(), { target: { value: 'abcd', selectionStart: 4 } });
+      await act(async () => { await new Promise((r) => setTimeout(r, DRAFT_SAVE_DEBOUNCE_MS + 50)); });
+      await endComposition(view.getTextarea(), 'abcd');
+      expect(view.getTextarea().value).toBe('');
+      expect(load('thread:ime-clear-store', 'u-1')).toBe('');
+      view.unmount();
+    });
+
+    it('handed-back text waits for the composition and is not repeated', async () => {
+      const ref = React.createRef<ChatInputHandle>();
+      const view = renderComposer({ draftKey: 'thread:ime-giveback', ref } as Partial<ChatInputProps>, { userId: 'u-1' });
+      compose(view.getTextarea(), '刚才rw');
+      act(() => { ref.current!.giveBack('补充：多讲敏感性分析'); });
+      expect(view.getTextarea().value).toBe('刚才rw');
+
+      await endComposition(view.getTextarea(), '刚才任务');
+      expect(view.getTextarea().value).toBe('刚才任务\n\n补充：多讲敏感性分析');
+      // Later keys add only what is typed.
+      fireEvent.change(view.getTextarea(), { target: { value: '刚才任务\n\n补充：多讲敏感性分析。', selectionStart: 22 } });
+      expect(view.getTextarea().value).toBe('刚才任务\n\n补充：多讲敏感性分析。');
+      view.unmount();
+    });
+
+    it('text handed back during a composition goes to its own thread\'s draft when the composer moves to another thread', async () => {
+      save('thread:other', 'other thread draft', 'u-1');
+      const ref = React.createRef<ChatInputHandle>();
+      const view = renderComposer({ draftKey: 'thread:first', ref } as Partial<ChatInputProps>, { userId: 'u-1' });
+      fireEvent.change(view.getTextarea(), { target: { value: 'first typed', selectionStart: 11 } });
+      compose(view.getTextarea(), 'first typed x');
+      act(() => { ref.current!.giveBack('returned steer'); });
+
+      view.rerenderComposer({ draftKey: 'thread:other', ref } as Partial<ChatInputProps>);
+      expect(view.getTextarea().value).toBe('other thread draft');
+      expect(load('thread:other', 'u-1')).toBe('other thread draft');
+      expect(load('thread:first', 'u-1')).toBe('first typed x\n\nreturned steer');
+
+      fireEvent.compositionEnd(view.getTextarea());
+      await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
+      expect(view.getTextarea().value).toBe('other thread draft');
+      view.unmount();
+    });
+
+    it('the user loading mid-composition keeps held writes waiting for the composition', async () => {
+      const queryClient = createQueryClient();
+      queryClient.setQueryDefaults(queryKeys.user.me(), { queryFn: () => new Promise(() => {}) });
+      const ref = React.createRef<ChatInputHandle>();
+      const view = renderComposer({ draftKey: 'thread:ime-user', ref } as Partial<ChatInputProps>, { queryClient });
+      compose(view.getTextarea(), '刚才rw');
+      act(() => { ref.current!.giveBack('returned'); });
+      await act(async () => {
+        queryClient.setQueryData(queryKeys.user.me(), { user_id: 'u-1' });
+        await new Promise((r) => setTimeout(r, 20));
+      });
+      expect(view.getTextarea().value).toBe('刚才rw');
+      await endComposition(view.getTextarea(), '刚才任务');
+      expect(view.getTextarea().value).toBe('刚才任务\n\nreturned');
+      view.unmount();
+    });
+
+    it('text handed back while the user was loading goes to the loaded user when the composer moves on', async () => {
+      const queryClient = createQueryClient();
+      queryClient.setQueryDefaults(queryKeys.user.me(), { queryFn: () => new Promise(() => {}) });
+      const ref = React.createRef<ChatInputHandle>();
+      const view = renderComposer({ draftKey: 'thread:anon-first', ref } as Partial<ChatInputProps>, { queryClient });
+      compose(view.getTextarea(), '刚才rw');
+      act(() => { ref.current!.giveBack('returned'); });
+      await act(async () => {
+        queryClient.setQueryData(queryKeys.user.me(), { user_id: 'u-1' });
+        await new Promise((r) => setTimeout(r, 20));
+      });
+      view.rerenderComposer({ draftKey: 'thread:anon-second', ref } as Partial<ChatInputProps>);
+      expect(load('thread:anon-first', 'u-1')).toBe('刚才rw\n\nreturned');
+      view.unmount();
+    });
+
+    it('a write arriving right after the composition ends runs after the ones held during it', async () => {
+      const ref = React.createRef<ChatInputHandle>();
+      const view = renderComposer({ draftKey: 'thread:ime-order', ref } as Partial<ChatInputProps>, { userId: 'u-1' });
+      compose(view.getTextarea(), 'abc');
+      act(() => { clear('thread:ime-order'); });
+      fireEvent.change(view.getTextarea(), { target: { value: 'abc', selectionStart: 3 } });
+      fireEvent.compositionEnd(view.getTextarea());
+      act(() => { ref.current!.giveBack('later'); });
+      await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
+      expect(view.getTextarea().value).toBe('later');
+      view.unmount();
+    });
+
+    it('typing outside a composition runs writes a lost compositionend left waiting', async () => {
+      const ref = React.createRef<ChatInputHandle>();
+      const view = renderComposer({ draftKey: 'thread:ime-lost-end', ref } as Partial<ChatInputProps>, { userId: 'u-1' });
+      compose(view.getTextarea(), 'abc');
+      act(() => { ref.current!.giveBack('returned'); });
+      // No compositionend arrives; the next keystroke's input event says it is
+      // outside any composition.
+      const el = view.getTextarea();
+      act(() => {
+        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(el, 'abcd');
+        el.dispatchEvent(new InputEvent('input', { bubbles: true, isComposing: false }));
+      });
+      await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
+      expect(view.getTextarea().value).toBe('abcd\n\nreturned');
+      view.unmount();
+    });
+
+    it('a clear held while the user loads leaves no copy under the loaded user', async () => {
+      const queryClient = createQueryClient();
+      queryClient.setQueryDefaults(queryKeys.user.me(), { queryFn: () => new Promise(() => {}) });
+      const view = renderComposer({ draftKey: 'thread:ime-clear-user' }, { queryClient });
+      compose(view.getTextarea(), 'abc');
+      act(() => { clear('thread:ime-clear-user'); });
+      await act(async () => {
+        queryClient.setQueryData(queryKeys.user.me(), { user_id: 'u-1' });
+        await new Promise((r) => setTimeout(r, 20));
+      });
+      await endComposition(view.getTextarea(), 'abc');
+      expect(view.getTextarea().value).toBe('');
+      expect(load('thread:ime-clear-user', 'u-1')).toBe('');
+      expect(load('thread:ime-clear-user', 'anon')).toBe('');
+      view.unmount();
+    });
+
+    it('a clear held across a switch between signed-in users leaves the other user\'s draft alone', async () => {
+      const queryClient = createQueryClient('u-a');
+      save('thread:ime-clear-switch', 'u-b draft', 'u-b');
+      const view = renderComposer({ draftKey: 'thread:ime-clear-switch' }, { queryClient });
+      compose(view.getTextarea(), 'abc');
+      act(() => { clear('thread:ime-clear-switch', 'u-a'); });
+      await act(async () => {
+        queryClient.setQueryData(queryKeys.user.me(), { user_id: 'u-b' });
+        await new Promise((r) => setTimeout(r, 20));
+      });
+      await endComposition(view.getTextarea(), 'abc');
+      expect(load('thread:ime-clear-switch', 'u-b')).toBe('u-b draft');
+      view.unmount();
+    });
+
+    it('an outside clear of the draft waits for the composition to end', async () => {
+      const view = renderComposer({ draftKey: 'thread:ime-clear' }, { userId: 'u-1' });
+      compose(view.getTextarea(), 'abc');
+      act(() => { clear('thread:ime-clear'); });
+      expect(view.getTextarea().value).toBe('abc');
+      await endComposition(view.getTextarea(), 'abc');
+      expect(view.getTextarea().value).toBe('');
+      view.unmount();
+    });
+
+    it('the user loading under the same key leaves typed text alone', async () => {
+      const queryClient = createQueryClient();
+      // The user is still loading: its fetch has not answered.
+      queryClient.setQueryDefaults(queryKeys.user.me(), { queryFn: () => new Promise(() => {}) });
+      save('thread:user-load', 'older stored draft', 'u-1');
+      const view = renderComposer({ draftKey: 'thread:user-load' }, { queryClient });
+      fireEvent.change(view.getTextarea(), { target: { value: 'typed before the user loaded', selectionStart: 28 } });
+      // Past the save debounce, so the typed text is no longer marked unsaved.
+      await act(async () => { await new Promise((r) => setTimeout(r, DRAFT_SAVE_DEBOUNCE_MS + 50)); });
+
+      await act(async () => {
+        queryClient.setQueryData(queryKeys.user.me(), { user_id: 'u-1' });
+        // React Query notifies on a later tick.
+        await new Promise((r) => setTimeout(r, 20));
+      });
+      expect(view.getTextarea().value).toBe('typed before the user loaded');
+      // Kept under the user it now belongs to, so leaving and coming back finds it.
+      expect(load('thread:user-load', 'u-1')).toBe('typed before the user loaded');
+      view.unmount();
+    });
+
+    it('a switch between two signed-in users still shows the new user\'s draft once typing is saved', async () => {
+      const queryClient = createQueryClient('u-1');
+      save('thread:user-switch', 'u-2 draft', 'u-2');
+      const view = renderComposer({ draftKey: 'thread:user-switch' }, { queryClient });
+      fireEvent.change(view.getTextarea(), { target: { value: 'u-1 typing', selectionStart: 10 } });
+      await act(async () => { await new Promise((r) => setTimeout(r, DRAFT_SAVE_DEBOUNCE_MS + 50)); });
+
+      await act(async () => {
+        queryClient.setQueryData(queryKeys.user.me(), { user_id: 'u-2' });
+        await new Promise((r) => setTimeout(r, 20));
+      });
+      expect(view.getTextarea().value).toBe('u-2 draft');
+      expect(load('thread:user-switch', 'u-1')).toBe('u-1 typing');
+      view.unmount();
+    });
+
+    it('an empty composer still takes the stored draft when the user loads', async () => {
+      const queryClient = createQueryClient();
+      queryClient.setQueryDefaults(queryKeys.user.me(), { queryFn: () => new Promise(() => {}) });
+      save('thread:user-load-empty', 'stored draft', 'u-1');
+      const view = renderComposer({ draftKey: 'thread:user-load-empty' }, { queryClient });
+      expect(view.getTextarea().value).toBe('');
+      await act(async () => { queryClient.setQueryData(queryKeys.user.me(), { user_id: 'u-1' }); });
+      await waitFor(() => expect(view.getTextarea().value).toBe('stored draft'));
+      view.unmount();
+    });
   });
 });
