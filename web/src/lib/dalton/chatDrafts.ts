@@ -730,14 +730,17 @@ export function useComposerDraft({
   const getDraftPartsRef = useRef<(() => DraftParts) | undefined>(getDraftParts);
   const onSendReturnedRef = useRef<((sentText: string, parts: DraftParts) => void) | undefined>(onSendReturned);
   /**
-   * Current rich parts (quotes, hadAttachments) accumulated across restores and
-   * queued rewrites, so back-to-back saves in the same batch see each other's
-   * parts before a render updates the composer's live read.
+   * Current rich parts: the composer's live quotes plus the sticky
+   * attachments-again notice from a draft restore. Synced from the composer on
+   * every committed render (and before the first read after a render), and
+   * advanced in place only across queued rewrites that run back-to-back
+   * between two renders.
    */
   const currentPartsRef = useRef<DraftParts>({
     quotes: restoredQuotes,
     hadAttachments: restoredHadAttachments,
   });
+  const rewroteBetweenRendersRef = useRef(false);
   const prevTargetRef = useRef<{ draftKey?: string; userId: string }>({
     draftKey,
     userId,
@@ -791,10 +794,21 @@ export function useComposerDraft({
     };
   }, []);
 
+  const syncCurrentParts = useCallback((): DraftParts => {
+    if (!rewroteBetweenRendersRef.current && getDraftPartsRef.current) {
+      currentPartsRef.current = {
+        quotes: getDraftPartsRef.current().quotes ?? [],
+        hadAttachments: Boolean(currentPartsRef.current.hadAttachments),
+      };
+    }
+    return currentPartsRef.current;
+  }, []);
+
   /** Applies what a restore brought back; `null` is every reset point (sent, cleared, switched). */
   const applyRestored = useCallback(
     (record: { quotes?: QuoteMention[]; hadAttachments?: boolean } | null) => {
       if (record === null) {
+        rewroteBetweenRendersRef.current = true;
         currentPartsRef.current = {};
         setRestoredQuotesState([]);
         setRestoredHadAttachmentsState(false);
@@ -804,12 +818,13 @@ export function useComposerDraft({
       // quotes. A restore merges into the current parts ref: a newer send's
       // quotes and attachments-again notice survive an older send's restore
       // beside it in the same batch.
-      const next = mergeParts(record, currentPartsRef.current);
+      const next = mergeParts(record, syncCurrentParts());
+      rewroteBetweenRendersRef.current = true;
       currentPartsRef.current = next;
       setRestoredQuotesState(next.quotes ?? []);
       setRestoredHadAttachmentsState(Boolean(next.hadAttachments));
     },
-    [mergeParts],
+    [mergeParts, syncCurrentParts],
   );
 
   /**
@@ -818,8 +833,8 @@ export function useComposerDraft({
    * left standing in `currentPartsRef` before the next render.
    */
   const partsForSave = useCallback((): DraftParts => (
-    mergeParts(currentPartsRef.current, getDraftPartsRef.current?.() ?? {})
-  ), [mergeParts]);
+    mergeParts(syncCurrentParts(), getDraftPartsRef.current?.() ?? {})
+  ), [mergeParts, syncCurrentParts]);
 
   /**
    * DALTON-HOOK(composer-drafts): the parts a not-taken restore or give-back
@@ -830,7 +845,11 @@ export function useComposerDraft({
    */
   const mergePartsForSave = useCallback((sendParts: DraftParts): DraftParts => {
     const next = mergeParts(sendParts, partsForSave());
-    currentPartsRef.current = next;
+    rewroteBetweenRendersRef.current = true;
+    currentPartsRef.current = {
+      quotes: next.quotes,
+      hadAttachments: Boolean(currentPartsRef.current.hadAttachments || sendParts.hadAttachments),
+    };
     return next;
   }, [mergeParts, partsForSave]);
 
@@ -844,6 +863,13 @@ export function useComposerDraft({
     onDraftKeySwitchRef.current = onDraftKeySwitch;
     getDraftPartsRef.current = getDraftParts;
     onSendReturnedRef.current = onSendReturned;
+    rewroteBetweenRendersRef.current = false;
+    if (getDraftParts) {
+      currentPartsRef.current = {
+        quotes: getDraftParts().quotes ?? [],
+        hadAttachments: Boolean(currentPartsRef.current.hadAttachments),
+      };
+    }
   });
 
   useLayoutEffect(() => {

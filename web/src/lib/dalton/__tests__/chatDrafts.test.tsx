@@ -2187,4 +2187,138 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
       view.unmount();
     });
   });
+
+  it('replacing a returned quote with a same-token quote before a plain send returns keeps the new quote body on later failure and resend', async () => {
+    const snippetA = 'Revenue grew by a lot\nfirst quote body';
+    const snippetB = 'Revenue grew by a lot\nsecond quote body';
+    const resolvers: Array<(v: boolean) => void> = [];
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+      () => new Promise<boolean>((resolve) => { resolvers.push(resolve); }),
+    );
+    const ref = createRef<ChatInputHandle>();
+    const view = renderComposer({ draftKey: 'thread:t-replace-quote', onSend }, { userId: 'u-1', ref });
+
+    // Send 0: plain send that will return later.
+    fireEvent.change(view.getTextarea(), { target: { value: 'plain send', selectionStart: 10 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+
+    // Send 1: carries quote A and fails first.
+    act(() => {
+      ref.current!.addContext({ kind: 'quote', snippet: snippetA, from: ANALYST });
+    });
+    const tokenA = view.getTextarea().value;
+    fireEvent.click(screen.getByLabelText('Send message'));
+    await act(async () => {
+      resolvers[1](false);
+    });
+    expect(view.getTextarea().value).toBe(tokenA);
+
+    // User deletes quote A and adds quote B (same first line -> same token, different body).
+    fireEvent.change(view.getTextarea(), { target: { value: '', selectionStart: 0 } });
+    act(() => {
+      ref.current!.addContext({ kind: 'quote', snippet: snippetB, from: ANALYST });
+    });
+    const tokenB = view.getTextarea().value;
+    expect(tokenB).toBe(tokenA);
+
+    // Now the plain send (Send 0) returns; it must not re-inject deleted quote A into mentions.
+    await act(async () => {
+      resolvers[0](false);
+    });
+    expect(document.querySelectorAll('.draft-token-quote')).toHaveLength(1);
+
+    // Send 2 fails and restores; quote B must still have its own body, not quote A's.
+    fireEvent.click(screen.getByLabelText('Send message'));
+    expect(onSend.mock.calls[2][0].message).toContain(
+      '<quote source="Analyst">Revenue grew by a lot\nsecond quote body</quote>',
+    );
+    expect(onSend.mock.calls[2][0].message).not.toContain('first quote body');
+    await act(async () => {
+      resolvers[2](false);
+    });
+    expect(document.querySelectorAll('.draft-token-quote')).toHaveLength(1);
+
+    fireEvent.click(screen.getByLabelText('Send message'));
+    expect(onSend.mock.calls[3][0].message).toContain(
+      '<quote source="Analyst">Revenue grew by a lot\nsecond quote body</quote>',
+    );
+    expect(onSend.mock.calls[3][0].message).not.toContain('first quote body');
+    view.unmount();
+  });
+
+  it('a plain send returning while a live attachment is staged does not show the attachments-lost notice after the user removes that attachment', async () => {
+    vi.useFakeTimers();
+    const resolvers: Array<(v: boolean) => void> = [];
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+      () => new Promise<boolean>((resolve) => { resolvers.push(resolve); }),
+    );
+    const view = renderComposer({ draftKey: 'thread:t-live-att', onSend }, { userId: 'u-1' });
+
+    // Send without attachments.
+    fireEvent.change(view.getTextarea(), { target: { value: 'plain send without files', selectionStart: 24 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+
+    // While waiting, user stages a new attachment.
+    attachFile(view, 'staged-while-waiting.txt');
+    expect(screen.getByText('staged-while-waiting.txt')).toBeTruthy();
+
+    // The plain send fails and returns.
+    await act(async () => {
+      resolvers[0](false);
+    });
+    expect(view.getTextarea().value).toBe('plain send without files');
+    expect(screen.queryByTestId('attachments-lost-notice')).toBeNull();
+
+    // User removes the staged attachment: no attachments-lost notice should appear, now or after save/reload.
+    fireEvent.click(screen.getByLabelText('Remove'));
+    expect(screen.queryByTestId('attachments-lost-notice')).toBeNull();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(DRAFT_SAVE_DEBOUNCE_MS);
+    });
+    const stored = JSON.parse(
+      localStorage.getItem(buildDraftStorageKey('thread:t-live-att', 'u-1')) ?? '{}',
+    ) as { text?: string; hadAttachments?: boolean };
+    expect(stored.text).toBe('plain send without files');
+    expect(stored.hadAttachments).toBeUndefined();
+
+    view.unmount();
+    const reopened = renderComposer({ draftKey: 'thread:t-live-att' }, { userId: 'u-1' });
+    expect(screen.queryByTestId('attachments-lost-notice')).toBeNull();
+    reopened.unmount();
+    vi.useRealTimers();
+  });
+
+  it('deleting a restored quote token and saving does not write the deleted quote back to storage', () => {
+    vi.useFakeTimers();
+    const quote = heldQuote('Revenue grew by a lot');
+    save('thread:t-del-quote', `${quote.token} keep this text`, 'u-1', Date.now(), {
+      parts: { quotes: [quote] },
+    });
+
+    const view = renderComposer({ draftKey: 'thread:t-del-quote' }, { userId: 'u-1' });
+    expect(document.querySelectorAll('.draft-token-quote')).toHaveLength(1);
+
+    // User deletes the quote token and keeps only plain text.
+    fireEvent.change(view.getTextarea(), {
+      target: { value: 'keep this text', selectionStart: 14 },
+    });
+    expect(document.querySelectorAll('.draft-token-quote')).toHaveLength(0);
+
+    act(() => {
+      vi.advanceTimersByTime(DRAFT_SAVE_DEBOUNCE_MS);
+    });
+    const stored = JSON.parse(
+      localStorage.getItem(buildDraftStorageKey('thread:t-del-quote', 'u-1')) ?? '{}',
+    ) as { text?: string; quotes?: QuoteMention[] };
+    expect(stored.text).toBe('keep this text');
+    expect(stored.quotes).toBeUndefined();
+
+    view.unmount();
+    const reopened = renderComposer({ draftKey: 'thread:t-del-quote' }, { userId: 'u-1' });
+    expect(reopened.getTextarea().value).toBe('keep this text');
+    expect(document.querySelectorAll('.draft-token-quote')).toHaveLength(0);
+    reopened.unmount();
+    vi.useRealTimers();
+  });
 });
