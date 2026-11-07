@@ -16,8 +16,10 @@ from fastapi import HTTPException
 
 from src.server.services.claude_code import saved
 from src.server.services.claude_code.machine import ComputerToken
-from src.server.services.claude_code.saved import SavedToken, token_check_key, token_hash
+from ptc_agent.agent.claude_code.launcher import Credential
 from src.llms.claude_code import ClaudeTurnFailed
+from src.server.services.claude_code.launchers import HostedCredential
+from src.server.services.claude_code.saved import token_check_key, token_hash
 from src.server.services.llm.claude_code import (
     CLAUDE_CODE_OFF,
     claude_code_refusal,
@@ -64,11 +66,15 @@ async def _admission_reason(row, cache):
 
 async def _refused_turn(cache, row=None):
     """A backend turn that read the saved token and then met Claude's refusal."""
-    with serving(cache), _store(row or _row()), patch(f"{SAVED}.backend_available", lambda: True):
-        token = SavedToken("user-1")
-        assert await token.read() == TOKEN
+    with (
+        serving(cache),
+        patch("src.server.services.claude_code.launchers.stored_row", AsyncMock(return_value=row or _row())),
+        patch("src.server.services.claude_code.hosted.backend_available", lambda: True),
+    ):
+        token = HostedCredential("user-1", "saved_token")
+        assert await token.read() == Credential(TOKEN)
         with pytest.raises(ClaudeTurnFailed) as failed:
-            await token.refused(TOKEN)
+            await token.refused(Credential(TOKEN))
     return failed.value
 
 
@@ -216,7 +222,10 @@ async def test_a_flag_that_cannot_be_written_still_keeps_the_hour():
 @pytest.mark.asyncio
 async def test_a_relayed_token_claude_refused_is_flagged_ends_the_turn_saying_so_and_is_not_relayed_again():
     cache = Cache()
-    with serving(cache), _relay_store(_row()), _flag_writer() as flag:
+    with (
+        serving(cache), _relay_store(_row()), _flag_writer() as flag,
+        patch("src.server.services.claude_code.hosted.backend_available", lambda: True),
+    ):
         machine = ComputerToken("user-1", "c-1")
         assert await machine.relay() == TOKEN
         with pytest.raises(ClaudeTurnFailed) as failed:
@@ -226,7 +235,10 @@ async def test_a_relayed_token_claude_refused_is_flagged_ends_the_turn_saying_so
         "user-1", "claude-code", access_token_sha256=token_hash(TOKEN), saved_at=SAVED_AT, error_code="token_refused",
     )
     assert TOKEN not in repr(vars(machine))
-    with serving(Cache()), _relay_store(_row(flagged=True)):
+    with (
+        serving(Cache()), _relay_store(_row(flagged=True)),
+        patch("src.server.services.claude_code.hosted.backend_available", lambda: True),
+    ):
         assert await ComputerToken("user-1", "c-1").relay() is None
 
 
@@ -237,7 +249,7 @@ async def test_a_computer_that_signs_in_with_the_relayed_token_is_refused_once_c
     with (
         serving(Cache()), _store(_row(flagged=True)),
         patch("src.server.services.llm.claude_code.read_answer", AsyncMock(return_value=answer)),
-        patch("src.server.services.llm.claude_code.backend_available", lambda: True),
+        patch("src.server.services.claude_code.hosted.backend_available", lambda: True),
         pytest.raises(HTTPException) as refused,
     ):
         await require_computer_signed_in(CODE, "user-1", "c-1")

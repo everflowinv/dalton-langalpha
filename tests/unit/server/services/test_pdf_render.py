@@ -712,3 +712,52 @@ async def test_new_page_playwright_error_maps_to_taxonomy(_isolated_browser_glob
             workspace_serve_prefix=_PREFIX,
         )
     context.close.assert_awaited_once()
+
+
+# --- DALTON-HOOK(fake-ip-allow): behind the host's fake-IP proxy --------------
+
+
+def _fake_ip_answer(monkeypatch):
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *_a, **_k: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.0.7", 443))],
+    )
+
+
+def test_a_fake_ip_answer_whose_real_target_is_public_is_allowed(monkeypatch):
+    from src.dalton import network
+
+    _fake_ip_answer(monkeypatch)
+    with (
+        patch.object(network, "is_fake_ip_exempt", autospec=True, return_value=True),
+        patch.object(
+            network, "fake_ip_block_reason", autospec=True, return_value=(None, ["8.8.8.8"])
+        ) as recheck,
+    ):
+        assert _allowed("https://cdn.jsdelivr.net/npm/echarts.min.js", _PREFIX)
+    recheck.assert_awaited_once()
+
+
+def test_a_fake_ip_answer_whose_real_target_is_private_is_blocked(monkeypatch):
+    from src.dalton import network
+
+    _fake_ip_answer(monkeypatch)
+    with (
+        patch.object(network, "is_fake_ip_exempt", autospec=True, return_value=True),
+        patch.object(
+            network,
+            "fake_ip_block_reason",
+            autospec=True,
+            return_value=("Blocked 'evil.example': real address 10.0.0.5 is private", None),
+        ),
+    ):
+        assert not _allowed("https://evil.example/x.js", _PREFIX)
+
+
+def test_a_fake_ip_range_not_configured_stays_blocked(monkeypatch):
+    from src.dalton import network
+
+    _fake_ip_answer(monkeypatch)
+    with patch.object(network, "is_fake_ip_exempt", autospec=True, return_value=False):
+        assert not _allowed("https://cdn.jsdelivr.net/npm/echarts.min.js", _PREFIX)

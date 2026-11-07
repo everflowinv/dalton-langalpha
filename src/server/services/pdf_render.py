@@ -83,7 +83,13 @@ async def _is_request_allowed(url: str, workspace_serve_prefix: str) -> bool:
     try:
         await resolve_public_ips(parsed.hostname)
     except EgressBlockedError:
-        return False
+        # DALTON-HOOK(fake-ip-allow): behind the host's fake-IP proxy every
+        # public name resolves into 198.18.0.0/15, which the check above calls
+        # private; the in-house guard's real-target recheck decides instead,
+        # and the gated fetch that follows dials the rechecked address.
+        from src.tools.web.inhouse.guard import host_passes_guard
+
+        return await host_passes_guard(parsed.hostname)
     return True
 
 

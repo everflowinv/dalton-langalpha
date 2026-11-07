@@ -30,6 +30,7 @@ from src.server.database.workspace import update_workspace_activity
 from src.server.services.commands.mirror import mirror_computer
 from src.server.services.computer_disk import TURN_MEASURE_MIN_INTERVAL_SECONDS
 from src.server.services.history.window import runs_held
+from src.server.services.llm.claude_code import require_attended, run_stamp
 from src.server.services.runs.pending_input import needs_resend, pending_input_stamp
 from src.server.services.runs.sse_producer import RunSSEProducer
 from src.server.models.chat import (
@@ -462,6 +463,8 @@ async def astream_ptc_workflow(
             feedback_action = None
             query_content = user_input
             effective_model = config.llm.name if config and config.llm else None
+            if config is not None:
+                require_attended(config, request)
             # DALTON-HOOK(turn-row-model-line): the anchor row states the model
             # the server resolved for this turn (the automation's llm_model, a
             # client-named model, or the account default) as a settled fact.
@@ -564,6 +567,7 @@ async def astream_ptc_workflow(
                         inherits_rules=turn_context.inherits_rules,
                     ),
                     **automation_delivery.turn_metadata(extra_configurable),
+                    **run_stamp(config),
                     **(run_metadata or {}),
                 },
             )

@@ -42,7 +42,7 @@ async def _admit(computer, *, backend=False, cache=None, saved=None):
     with (
         serving(cache or _Cache()),
         patch(f"{SERVICE}.rows_available", return_value=True),
-        patch(f"{SERVICE}.backend_available", return_value=backend),
+        patch("src.server.services.claude_code.hosted.backend_available", return_value=backend),
         patch("src.server.database.computer.get_computer_for_workspace", new_callable=AsyncMock, return_value=computer),
         patch(f"{SAVED}.stored_row", new_callable=AsyncMock, return_value={"access_token": saved} if saved else None),
         patch(f"{MACHINES}.machine_of", new=dial),
@@ -198,7 +198,7 @@ async def test_resolve_names_the_turns_workspace_to_the_placement_check():
         pytest.raises(HTTPException),
     ):
         await resolve_llm_config(_base(), "user-1", None, False, workspace_id="ws-1")
-    assert seen.await_args.kwargs == {"user_id": "user-1", "workspace_id": "ws-1"}
+    assert seen.await_args.kwargs == {"user_id": "user-1", "workspace_id": "ws-1", "thread_id": None}
 
 
 # -- What a turn on an own computer records --
@@ -223,6 +223,7 @@ async def test_a_relayed_token_is_handed_over_once_asked_and_its_refusal_marks_i
             return_value={"access_token": "sk-ant-oat01-saved", "updated_at": None},
         ),
         patch(f"{SAVED}.mark_access_token_refused", new_callable=AsyncMock, return_value=True),
+        patch("src.server.services.claude_code.hosted.backend_available", lambda: True),
     ):
         machine = ComputerToken("user-1", "c-1")
         assert await machine.relay() == "sk-ant-oat01-saved"

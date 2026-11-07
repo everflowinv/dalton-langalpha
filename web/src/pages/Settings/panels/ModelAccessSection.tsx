@@ -10,15 +10,16 @@ import { isDaltonAuth } from '@/config/daltonAuth';
 import { TEAM_SHARED_CREDENTIALS_HINT, useTeamCredentials } from '@/hooks/useTeamCredentials';
 import { useConfiguredProviders, type ConfiguredProvider } from '@/hooks/useConfiguredProviders';
 import { useClaudeCodeStatus } from '@/hooks/useClaudeCode';
+import { useClaudeCodeCustody } from '@/hooks/useClaudeCodeCustody';
 import { useWorkspaceClaudeCode } from '@/hooks/useWorkspaceClaudeCode';
-import { CLAUDE_CODE, CLAUDE_CODE_CONNECTION, CLAUDE_CODE_TOKEN_PARAM, CLAUDE_CODE_WORKSPACE_PARAM } from '@/lib/claudeCode';
+import { ANTHROPIC, CLAUDE_CODE, CLAUDE_CODE_CHOICE, CLAUDE_CODE_CONNECTION, CLAUDE_CODE_MODE_LABELS, CLAUDE_CODE_TOKEN_PARAM, CLAUDE_CODE_WORKSPACE_PARAM } from '@/lib/claudeCode';
 import { useProviderCatalog } from '@/hooks/useProviderCatalog';
 import type { ProviderCatalogEntry } from '@/components/model/types';
 import { isSubscriptionProvider, subscriptionKey, type SubscriptionProvider } from '@/api/oauth';
 import { RemoveAccessDialog } from '@/components/modelAccess/RemoveAccessDialog';
 import { ClaudeCodeTokenSheet, RemoveClaudeCodeTokenDialog, TokenActions } from '@/components/modelAccess/ClaudeCodeToken';
 import { linkedSheetAction, useClaudeCodeTokenRows } from '@/components/modelAccess/tokenLine';
-import { tokenSheetTitle, type SheetAction, type TokenTarget } from '@/components/modelAccess/tokenTarget';
+import { SAVED_TOKEN, tokenSheetTitle, type SheetAction, type TokenTarget } from '@/components/modelAccess/tokenTarget';
 import { planLabel } from '@/components/modelAccess/planLabel';
 import { regionTag } from '@/components/modelAccess/optionLabels';
 import { StatusLabel, type AccessStatus } from '@/components/modelAccess/parts';
@@ -29,6 +30,7 @@ import { NO_FILTER, optionsOf, startingOption, type KeyFilter, type KeyOption, t
 import { AccessRow, Group, KeyRow } from './modelAccess/AccessRows';
 import { KeySheet } from './modelAccess/KeySheet';
 import { ManageSheet, SubscriptionFlow } from './modelAccess/ManageSheet';
+import { ClaudeCodeSheet } from './modelAccess/ClaudeCodeSheet';
 
 const subscriptionName = (t: (k: string) => string, p: SubscriptionProvider) =>
   t(`modelAccess.${subscriptionKey(p)}.name`);
@@ -43,9 +45,14 @@ type Sheet =
   | { kind: 'connect-subscription'; provider: SubscriptionProvider }
   | { kind: 'pick-key' }
   | { kind: 'pick-local' }
-  | { kind: 'key'; group: ProviderGroup; option: KeyOption; origin: KeyOrigin }
+  /** `origin` null: the Anthropic key's sheet on its own, which Cancel
+   *  closes. */
+  | { kind: 'key'; group: ProviderGroup; option: KeyOption; origin: KeyOrigin | null }
   | { kind: 'local-key'; entry: ProviderCatalogEntry }
   | { kind: 'claude-code-token'; target: TokenTarget; action: SheetAction }
+  /** Claude Code itself, where the server lets the user choose how it runs on
+   *  cloud computers: that choice, and the setup token it may store. */
+  | { kind: 'claude-code' }
   /** `from` the add-key flow keeps that flow's width for the key it just saved.
    *  `justConnected`: the flow before it made the connection, so its models
    *  start picked. */
@@ -68,7 +75,7 @@ function isWide(sheet: Sheet): boolean {
 function backFrom(sheet: Sheet): Sheet | null {
   switch (sheet.kind) {
     case 'connect-subscription': return { kind: 'pick-subscription' };
-    case 'key': return { kind: sheet.origin };
+    case 'key': return sheet.origin && { kind: sheet.origin };
     case 'local-key': return { kind: 'pick-local' };
     default: return null;
   }
@@ -94,9 +101,15 @@ export function ModelAccessSection() {
   const allowDisconnect = !isDaltonAuth || canDisconnect;
   const teamManagedByAdmin = isDaltonAuth && isTeamShared && !canManage;
   const tokenRows = useClaudeCodeTokenRows();
+  const { custody } = useClaudeCodeCustody();
+  // Where the server offers the choice, the saved token is one of its ways,
+  // so it lives in Claude Code's sheet beside it rather than on a row.
+  const savedRow = tokenRows.find(({ key }) => key === 'saved');
+  const listedTokenRows = custody ? tokenRows.filter((row) => row !== savedRow) : tokenRows;
   const [opened, setSheet] = useState<Sheet | null>(null);
   const [removing, setRemoving] = useState<ConfiguredProvider | null>(null);
   const [removingToken, setRemovingToken] = useState<TokenTarget | null>(null);
+  const [choiceCovered, setChoiceCovered] = useState(false);
   // A link elsewhere (the model picker, a refused turn) opens the sheet its
   // row's first button would, once Claude Code is on, for the token the
   // workspace it names runs its turns on: its computer's, where that is one
@@ -115,14 +128,26 @@ export function ModelAccessSection() {
     ? tokenRows.find(({ target }) => (target.kind === 'computer' ? target.computerId === linked.computerId : !linked.computerId))
     : undefined;
   const linkedAction = linkedRow && linkedSheetAction(linkedRow.line);
-  const sheet: Sheet | null = opened ?? (linkedRow && linkedAction ? { kind: 'claude-code-token', target: linkedRow.target, action: linkedAction } : null);
-  const closeSheet = () => {
-    setSheet(null);
+  // A link to the Anthropic key (the picker's, a refused turn's) opens its
+  // sheet, and drops once the key is saved or the sheet closed.
+  const anthropicGroup = keyGroups.find((g) => g.group === ANTHROPIC);
+  const anthropicKey = anthropicGroup ? { group: anthropicGroup, option: startingOption(anthropicGroup, configuredSet) } : null;
+  const anthropicKeySheet = (): Sheet | null => anthropicKey && { kind: 'key', ...anthropicKey, origin: null };
+  const linkedSheet: Sheet | null = linkedRow && linkedAction
+    ? { kind: 'claude-code-token', target: linkedRow.target, action: linkedAction }
+    : searchParams.get(CLAUDE_CODE_TOKEN_PARAM) === ANTHROPIC ? anthropicKeySheet()
+      : searchParams.get(CLAUDE_CODE_TOKEN_PARAM) === CLAUDE_CODE_CHOICE && custody ? { kind: 'claude-code' } : null;
+  const sheet: Sheet | null = opened ?? linkedSheet;
+  const dropLink = () => {
     if (searchParams.has(CLAUDE_CODE_TOKEN_PARAM)) setSearchParams((params) => {
       params.delete(CLAUDE_CODE_TOKEN_PARAM);
       params.delete(CLAUDE_CODE_WORKSPACE_PARAM);
       return params;
     }, { replace: true });
+  };
+  const closeSheet = () => {
+    setSheet(null);
+    dropLink();
   };
   // Kept here, not in the list, so Back from a provider returns to the same narrowed list.
   const [keyFilter, setKeyFilter] = useState<KeyFilter>(NO_FILTER);
@@ -160,6 +185,7 @@ export function ModelAccessSection() {
       case 'local-key': return providerTitle(sheet.entry.display_name, sheet.entry.provider);
       case 'manage': return managed ? nameOf(managed) : null;
       case 'claude-code-token': return tokenSheetTitle(t, sheet.target, sheet.action);
+      case 'claude-code': return CLAUDE_CODE_CONNECTION.display_name;
     }
   })();
 
@@ -202,9 +228,26 @@ export function ModelAccessSection() {
               }
             />
           )),
+          // Where the server offers a choice of how it runs on cloud
+          // computers, Claude Code's row says which is chosen and opens it.
+          ...(custody ? [(
+            <AccessRow
+              key={`${CLAUDE_CODE}:cloud`}
+              provider={CLAUDE_CODE}
+              name={CLAUDE_CODE_CONNECTION.display_name}
+              detail={custody.mode === 'stored' && savedRow ? savedRow.line.detail : t(CLAUDE_CODE_MODE_LABELS[custody.mode])}
+              wrapDetail
+              status={custody.mode === 'stored' && savedRow ? savedRow.line.status : custody.runs_on ? 'connected' : 'not_connected'}
+              action={(
+                <Button type="button" variant="ghost" size="sm" onClick={() => setSheet({ kind: 'claude-code' })}>
+                  {t('modelAccess.manage')}
+                </Button>
+              )}
+            />
+          )] : []),
           // Claude Code signs in with a setup token the user makes for it, so
           // the token is all there is to add, replace or remove.
-          ...tokenRows.map(({ key, target, tag, line }) => (
+          ...listedTokenRows.map(({ key, target, tag, line }) => (
             <AccessRow
               key={`${CLAUDE_CODE}:${key}`}
               provider={CLAUDE_CODE}
@@ -289,7 +332,7 @@ export function ModelAccessSection() {
           title={sheetTitle}
           onClose={closeSheet}
           width={isWide(sheet) ? 'wide' : 'standard'}
-          covered={!!removing}
+          covered={!!removing || (!!removingToken && sheet.kind === 'claude-code') || choiceCovered}
         >
           {sheet.kind === 'pick-subscription' && (
             <SubscriptionChoices
@@ -345,8 +388,12 @@ export function ModelAccessSection() {
               option={sheet.option}
               group={sheet.group}
               configured={providers}
-              onSaved={(provider, fresh) => setSheet({ kind: 'manage', provider, from: 'key-flow', justConnected: fresh })}
-              onBack={back(sheet)}
+              onSaved={(provider, fresh) => {
+                dropLink();
+                setSheet({ kind: 'manage', provider, from: 'key-flow', justConnected: fresh });
+              }}
+              onBack={sheet.origin ? back(sheet) : undefined}
+              onCancel={sheet.origin ? undefined : closeSheet}
             />
           )}
           {sheet.kind === 'local-key' && (
@@ -370,6 +417,15 @@ export function ModelAccessSection() {
             />
           )}
           {sheet.kind === 'manage' && !managed && <StatusLabel status="working" />}
+          {sheet.kind === 'claude-code' && (
+            <ClaudeCodeSheet
+              savedRow={savedRow}
+              anthropicKey={anthropicKey}
+              configured={providers}
+              onRemoveToken={() => setRemovingToken(SAVED_TOKEN)}
+              onCover={setChoiceCovered}
+            />
+          )}
           {sheet.kind === 'claude-code-token' && <ClaudeCodeTokenSheet target={sheet.target} onSaved={closeSheet} onCancel={closeSheet} />}
         </ModalShell>
       )}
@@ -384,7 +440,7 @@ export function ModelAccessSection() {
         />
       )}
 
-      {removingToken && <RemoveClaudeCodeTokenDialog target={removingToken} onClose={() => setRemovingToken(null)} />}
+      {removingToken && <RemoveClaudeCodeTokenDialog target={removingToken} stacked={!!sheet} onClose={() => setRemovingToken(null)} />}
     </div>
   );
 }

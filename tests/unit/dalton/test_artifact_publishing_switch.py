@@ -636,7 +636,7 @@ def test_off_main_agent_registers_no_reply_to_comment() -> None:
             user_id="u-1",
             mcp_registry=MagicMock(),
             sandbox=MagicMock(),
-            claude_code_launcher=lambda sandbox: MagicMock(),
+            claude_code_launcher=lambda sandbox, hosted, saved: MagicMock(),
         )
     assert "reply_to_comment" not in {
         t.name for t in graph.turn.spec.tools

@@ -307,7 +307,7 @@ class PTCAgent:
         workspace_owner_id: str | None = None,
         tail_turn_no_new_work: bool = False,
         computers: ComputerReach | None = None,
-        claude_code_launcher: "Callable[[PTCSandbox], Launcher] | None" = None,
+        claude_code_launcher: "Callable[[PTCSandbox, str | None, str | None], Launcher] | None" = None,
         # DALTON-HOOK(team-memory-toggle): per-workspace / Home user-level Team Memory switch
         team_memory_enabled: bool = False,
     ) -> Any:
@@ -362,7 +362,10 @@ class PTCAgent:
                 own Bash, ExecuteCode and file tools take a ``computer`` to run
                 on. None leaves every tool on this computer.
             claude_code_launcher: Where a Claude Code turn's CLI runs, given
-                the sandbox; the server picks it, and the token it signs in with.
+                the sandbox, the credential admission let a turn on a cloud
+                computer run on (``claude_code_hosted``) and the saved setup
+                token it let the turn sign in with (``claude_code_saved``); the
+                server picks it, and the token it signs in with.
 
         Returns:
             Configured BackgroundSubagentOrchestrator wrapping the deepagent.
@@ -1336,7 +1339,7 @@ class PTCAgent:
             return claude_code_graph(
                 agent, system_prompt=system_prompt, target=turn.client,
                 user_id=user_id, thread_id=thread_id, checkpointer=checkpointer,
-                launcher=claude_code_launcher(sandbox),
+                launcher=claude_code_launcher(sandbox, self.config.claude_code_hosted, self.config.claude_code_saved),
                 entry=(skill_loader_middleware, context.turn, context.baseline),
                 middleware=deepagent_middleware,
                 baseline=context.baseline.frozen_block,
