@@ -50,6 +50,7 @@ from data_client.normalize import (  # DALTON-HOOK(market-data-fallback)
     minor_unit_places,
     normalize_bars,
     populated,
+    restamp_daily_index,
     scale_price,
     series_labels,
     symbol_timezone,
@@ -518,6 +519,11 @@ def _yf_fetch_history(
     # A NaN-priced row (halted session, gap padding) must not propagate NaN
     # into the response — drop it here.
     df = df.copy().dropna(subset=["Open", "High", "Low", "Close"])
+    if canonical == "1day":
+        # DALTON-HOOK(market-data-fallback): reuse the main chain's daily
+        # restamp so FX daily bars (stamped by Yahoo at London midnight) are
+        # anchored at midnight in the instrument's protocol timezone (UTC).
+        df.index = restamp_daily_index(df.index, symbol_timezone(display))
     rows: list[dict] = []
     for idx, row in df.iterrows():
         try:

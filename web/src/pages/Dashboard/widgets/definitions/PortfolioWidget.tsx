@@ -7,17 +7,11 @@ import { Briefcase } from 'lucide-react';
 import { useDashboardContext } from '../framework/DashboardDataContext';
 import { registerWidget } from '../framework/WidgetRegistry';
 import { useWidgetContextExport } from '../framework/contextSnapshot';
-import {
-  serializeQuoteRowsToMarkdown,
-  serializeQuoteRowToMarkdown,
-  wrapWidgetContext,
-} from '../framework/snapshotSerializers';
+import { wrapWidgetContext } from '../framework/snapshotSerializers';
 import { PortfolioConfigSchema } from '../framework/configSchemas';
 import { RowAttachButton } from '../../components/RowAttachButton';
 import type { WidgetRenderProps } from '../types';
-import type { PortfolioRow } from '../../hooks/usePortfolioData';
-import { deriveQuoteDisplay, formatSignedPct2, roundQuote2, type MarketStatusInput } from '@/lib/quotes'; // DALTON-HOOK(extended-hours-quotes)
-import { normalizePortfolioCurrency } from '../../utils/portfolioSummary';
+import { formatSignedPct2 } from '@/lib/quotes'; // DALTON-HOOK(extended-hours-quotes)
 import { WidgetCardMeta } from '../framework/widgetCardSlots';
 import {
   HoldingsAddButton,
@@ -29,60 +23,13 @@ import {
 } from './_holdingsPrimitives';
 import {
   formatPortfolioNavMarkdownLine,
+  portfolioRowData,
   portfolioSummary,
+  serializePortfolioRowsToMarkdown,
+  serializePortfolioRowToMarkdown,
 } from './_holdingsHelpers';
 
 type PortfolioConfig = { valuesHidden?: boolean };
-
-// DALTON-HOOK(extended-hours-quotes): Derive price, change, session, and pre/post-market fields from shared deriveQuoteDisplay.
-export function rowToQuote(r: PortfolioRow, marketStatus?: MarketStatusInput) {
-  const hasQuote = r.quoteAvailable !== false;
-  if (!hasQuote) {
-    return {
-      symbol: r.symbol,
-      price: undefined,
-      shares: r.quantity ?? undefined,
-      marketValue: undefined,
-      changePercent: undefined,
-      currency: normalizePortfolioCurrency(r.currency),
-    };
-  }
-  const d = deriveQuoteDisplay(r, marketStatus);
-  const price = d.mainPrice != null ? roundQuote2(d.mainPrice) : undefined;
-  const change = d.mainChange != null ? roundQuote2(d.mainChange) : undefined;
-  const changePercent = d.mainChangePct != null ? roundQuote2(d.mainChangePct) : undefined;
-  const unrealizedPlPercent =
-    r.unrealizedPlPercent != null ? roundQuote2(r.unrealizedPlPercent) : undefined;
-  const extPrice = d.extPrice != null ? roundQuote2(d.extPrice) : undefined;
-  const extChange = d.extChange != null ? roundQuote2(d.extChange) : undefined;
-  const extPct = d.extChangePct != null ? roundQuote2(d.extChangePct) : undefined;
-  // DALTON-HOOK(extended-hours-quotes): Keep quote change/changePercent separate from holding unrealizedPlPercent.
-  return {
-    symbol: r.symbol,
-    ...(d.session !== 'regular' ? { session: d.session } : {}),
-    price,
-    ...(change !== undefined ? { change } : {}),
-    ...(changePercent !== undefined ? { changePercent } : {}),
-    shares: r.quantity ?? undefined,
-    marketValue: r.marketValue ?? undefined,
-    ...(unrealizedPlPercent !== undefined ? { unrealizedPlPercent } : {}),
-    ...(d.session === 'pre' && extPrice !== undefined
-      ? {
-          preMarket: extPrice,
-          ...(extChange !== undefined ? { preMarketChange: extChange } : {}),
-          ...(extPct !== undefined ? { preMarketChangePercent: extPct } : {}),
-        }
-      : {}),
-    ...(d.session === 'post' && extPrice !== undefined
-      ? {
-          postMarket: extPrice,
-          ...(extChange !== undefined ? { postMarketChange: extChange } : {}),
-          ...(extPct !== undefined ? { postMarketChangePercent: extPct } : {}),
-        }
-      : {}),
-    currency: normalizePortfolioCurrency(r.currency),
-  };
-}
 
 function PortfolioWidget({ instance, updateConfig }: WidgetRenderProps<PortfolioConfig>) {
   const { t } = useTranslation();
@@ -92,12 +39,12 @@ function PortfolioWidget({ instance, updateConfig }: WidgetRenderProps<Portfolio
   useWidgetContextExport(instance.id, {
     full: () => {
       // DALTON-HOOK(extended-hours-quotes): Pass dashboard.marketStatus so portfolio export includes session and extended-hours quotes.
-      const rows = portfolio.rows.map((r) => rowToQuote(r, dashboard.marketStatus));
+      const rows = portfolio.rows.map((r) => portfolioRowData(r, dashboard.marketStatus));
       const summary = portfolioSummary(portfolio.rows);
       const navLine = formatPortfolioNavMarkdownLine(summary, locale);
       const lines: string[] = [];
       if (navLine) lines.push(navLine, '');
-      lines.push(serializeQuoteRowsToMarkdown(rows));
+      lines.push(serializePortfolioRowsToMarkdown(rows));
       const text = wrapWidgetContext('portfolio.holdings', { count: rows.length }, lines.join('\n'));
       return {
         widget_type: 'portfolio.holdings',
@@ -112,9 +59,8 @@ function PortfolioWidget({ instance, updateConfig }: WidgetRenderProps<Portfolio
     rows: (rowId: string) => {
       const row = portfolio.rows.find((r) => (r.user_portfolio_id ?? r.symbol) === rowId);
       if (!row) return null;
-      // DALTON-HOOK(extended-hours-quotes): Pass dashboard.marketStatus to rowToQuote and format label via formatSignedPct2.
-      const quote = rowToQuote(row, dashboard.marketStatus);
-      const body = serializeQuoteRowToMarkdown(quote);
+      // DALTON-HOOK(extended-hours-quotes): Pass dashboard.marketStatus to portfolioRowData/serializePortfolioRowToMarkdown and format label via formatSignedPct2.
+      const body = serializePortfolioRowToMarkdown(row, dashboard.marketStatus);
       const text = wrapWidgetContext('portfolio.holdings/row', { symbol: row.symbol }, body);
       return {
         widget_type: 'portfolio.holdings/row',
@@ -127,7 +73,7 @@ function PortfolioWidget({ instance, updateConfig }: WidgetRenderProps<Portfolio
         description: t('dashboard.widgets.portfolio.title'),
         captured_at: new Date().toISOString(),
         text,
-        data: { row: quote },
+        data: { row: portfolioRowData(row, dashboard.marketStatus) },
       };
     },
   });

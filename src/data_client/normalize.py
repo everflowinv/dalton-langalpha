@@ -482,6 +482,17 @@ def symbol_timezone(symbol: str) -> ZoneInfo:
         return ZoneInfo("America/New_York")
 
 
+def restamp_daily_index(index: Any, day_tz: ZoneInfo | None) -> Any:  # DALTON-HOOK(market-data-fallback)
+    """Restamp each daily bar's index entry at midnight in *day_tz*.
+
+    Yahoo stamps a day at midnight in its own exchange zone (London for FX,
+    which in summer is the previous evening in the UTC an FX date is read in).
+    """
+    if day_tz is None:
+        return index
+    return [datetime.combine(i.date(), time(), day_tz) for i in index]
+
+
 def normalize_bars(
     bars: list[dict],
     symbol: str,

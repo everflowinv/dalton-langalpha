@@ -22,8 +22,9 @@ vi.mock('../../framework/DashboardDataContext', () => ({
 
 import { WatchlistRowItem, PortfolioRowItem } from '../_holdingsPrimitives';
 import WatchlistWidget from '../WatchlistWidget';
-import PortfolioWidget, { rowToQuote } from '../PortfolioWidget';
-import PortfolioWatchlistWidget, { portfolioRowToQuote } from '../PortfolioWatchlistWidget';
+import PortfolioWidget from '../PortfolioWidget';
+import PortfolioWatchlistWidget from '../PortfolioWatchlistWidget';
+import { portfolioRowData } from '../_holdingsHelpers';
 import { QueryClient } from '@tanstack/react-query'; // DALTON-HOOK(extended-hours-quotes)
 import { queryKeys } from '@/lib/queryKeys';
 import { snapshotToStockPrice } from '@/lib/quotes/quoteAdapters';
@@ -638,7 +639,7 @@ describe('WatchlistRowItem price', () => {
     expect(primPfEl).not.toHaveTextContent('+0.26%');
     unmountPrimPf();
 
-    // DALTON-HOOK(extended-hours-quotes): Verify portfolioRowToQuote and rowToQuote separate session move (-3.48 / -1.08%) from holding unrealizedPlPercent (+5.76%).
+    // DALTON-HOOK(extended-hours-quotes): Verify portfolioRowData and widget exports preserve cost/precision while separating session move (-3.48 / -1.08%) from holding unrealizedPlPercent (+5.76%).
     const holdingPostRow: PortfolioRow = {
       user_portfolio_id: 'p-goog-post',
       symbol: 'GOOG',
@@ -663,24 +664,42 @@ describe('WatchlistRowItem price', () => {
       quoteAvailable: true,
     };
 
+    const holdingLseRow: PortfolioRow = {
+      user_portfolio_id: 'p-vod-lse',
+      symbol: 'VOD.L',
+      price: 1.1725,
+      quantity: 100,
+      average_cost: 1.0525,
+      currency: 'GBP',
+      costCurrency: 'GBP',
+      places: 4,
+      marketValue: 117.25,
+      unrealizedPl: 12,
+      unrealizedPlPercent: 11.4,
+      isPositive: true,
+      quoteAvailable: true,
+    };
+
     const expectedHoldingQuote = {
       symbol: 'GOOG',
-      session: 'post',
-      price: 317.28,
-      change: -3.48,
-      changePercent: -1.08,
+      currency: 'USD',
       shares: 10,
+      averageCost: 300,
+      costCurrency: 'USD',
+      price: 317.28,
+      places: 2,
       marketValue: 3172.8,
       unrealizedPlPercent: 5.76,
+      session: 'post',
+      change: -3.48,
+      changePercent: -1.08,
       postMarket: 318.1,
       postMarketChange: 0.82,
       postMarketChangePercent: 0.26,
-      currency: 'USD',
     };
-    expect(portfolioRowToQuote(holdingPostRow, afterHoursStatus)).toEqual(expectedHoldingQuote);
-    expect(rowToQuote(holdingPostRow, afterHoursStatus)).toEqual(expectedHoldingQuote);
+    expect(portfolioRowData(holdingPostRow, afterHoursStatus)).toEqual(expectedHoldingQuote);
 
-    mockDashboardCtx.portfolio = { rows: [holdingPostRow], loading: false, hasRealHoldings: true };
+    mockDashboardCtx.portfolio = { rows: [holdingPostRow, holdingLseRow], loading: false, hasRealHoldings: true };
     mockDashboardCtx.dashboard = { marketStatus: afterHoursStatus };
 
     const { unmount: unmountPfWidget } = render(
@@ -698,11 +717,12 @@ describe('WatchlistRowItem price', () => {
 
     const expectedHoldingMarkdown = [
       '**GOOG**',
+      'shares 10',
+      'avg cost USD 300.00',
       'regular close USD 317.28 -3.48 (-1.08%) vs prev close',
       'post-market USD 318.10 +0.82 (+0.26% vs regular close)',
-      'shares 10',
-      'mkt val USD 3172.80',
-      '持仓浮盈 +5.76%',
+      'value USD 3172.80',
+      'unrealized P/L +5.76%',
     ].join('\n');
 
     const pfRowSnap = await getWidgetContextSnapshot('pf-test', 'p-goog-post');
@@ -714,6 +734,44 @@ describe('WatchlistRowItem price', () => {
     expect(pwRowSnap?.label).toBe('GOOG · +5.76%');
     expect(pwRowSnap?.data).toEqual({ row: expectedHoldingQuote, tab: 'portfolio' });
     expect(pwRowSnap?.text).toContain(expectedHoldingMarkdown);
+
+    const expectedLseRow = {
+      symbol: 'VOD.L',
+      currency: 'GBP',
+      shares: 100,
+      averageCost: 1.0525,
+      costCurrency: 'GBP',
+      price: 1.1725,
+      places: 4,
+      marketValue: 117.25,
+      unrealizedPlPercent: 11.4,
+    };
+    const expectedLseMarkdown = [
+      '**VOD.L**',
+      'shares 100',
+      'avg cost GBP 1.0525',
+      'price GBP 1.1725',
+      'value GBP 117.25',
+      'unrealized P/L +11.40%',
+    ].join('\n');
+
+    const pfLseSnap = await getWidgetContextSnapshot('pf-test', 'p-vod-lse');
+    expect(pfLseSnap?.data).toEqual({ row: expectedLseRow });
+    expect(pfLseSnap?.text).toContain(expectedLseMarkdown);
+
+    const pwLseSnap = await getWidgetContextSnapshot('pw-test', 'p-vod-lse');
+    expect(pwLseSnap?.data).toEqual({ row: expectedLseRow, tab: 'portfolio' });
+    expect(pwLseSnap?.text).toContain(expectedLseMarkdown);
+
+    const pfFullSnap = await getWidgetContextSnapshot('pf-test');
+    expect(pfFullSnap?.data).toMatchObject({ rows: [expectedHoldingQuote, expectedLseRow] });
+    expect(pfFullSnap?.text).toContain('1.1725');
+    expect(pfFullSnap?.text).toContain('1.0525');
+
+    const pwFullSnap = await getWidgetContextSnapshot('pw-test');
+    expect(pwFullSnap?.data).toMatchObject({ tab: 'portfolio', rows: [expectedHoldingQuote, expectedLseRow] });
+    expect(pwFullSnap?.text).toContain('1.1725');
+    expect(pwFullSnap?.text).toContain('1.0525');
     unmountPfWidget();
   });
 });

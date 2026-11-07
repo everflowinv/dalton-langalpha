@@ -12,13 +12,14 @@ import asyncio
 import logging
 import math
 import time
-from datetime import date, datetime, time as dt_time, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from src.data_client.normalize import (
     build_series,
     minor_unit_places,
+    restamp_daily_index,  # DALTON-HOOK(market-data-fallback)
     scale_snapshot_prices,
     symbol_timezone,
 )
@@ -162,7 +163,7 @@ def _fetch_history(
     # NaN into the cache and render as "nan" downstream — drop it here.
     df = df.copy().dropna(subset=["Open", "High", "Low", "Close"])
     if day_tz is not None:
-        df.index = [datetime.combine(i.date(), dt_time(), day_tz) for i in df.index]
+        df.index = restamp_daily_index(df.index, day_tz)  # DALTON-HOOK(market-data-fallback)
     return [_normalize_bar(idx, row, places) for idx, row in df.iterrows()]
 
 
