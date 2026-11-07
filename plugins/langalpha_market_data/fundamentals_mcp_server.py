@@ -44,12 +44,19 @@ import httpx
 from data_client.fmp import close_fmp_client, get_fmp_client
 from data_client.lifespan import closing_lifespan
 from data_client.market_data_provider import symbol_market
-from data_client.normalize import populated
+from data_client.normalize import (
+    declared_venue,
+    minor_unit_places,
+    populated,
+    scale_price,
+    series_labels,
+)
 from data_client.ginlix_data import close_ginlix_mcp_client, get_ginlix_mcp_client
 from data_client.ginlix_data.cn_financial import GinlixDataCnFinancialSource
 from mcp_servers._envelope import error_from_exception, make_error, make_response
 from mcp_servers._schemas import (
     ANY,
+    BAR_LABELS,
     INT,
     RECORDS,
     RECORDS_BY_KEY,
@@ -60,6 +67,7 @@ from mcp_servers._schemas import (
 )
 from market_protocol.enums import AssetClass
 from market_protocol.symbology import (
+    UNKNOWN_MIC,
     is_family_index,
     to_canonical,
     to_display,
@@ -867,8 +875,7 @@ async def get_financial_ratios(
     period: Literal["annual", "quarter"] = "annual",
     limit: int = 10,
 ) -> _OUT_GET_FINANCIAL_RATIOS:
-    """Fetch raw historical key metrics and financial ratios — track P/E, ROE,
-    and margins over time, or compare valuation across companies.
+    """Fetch raw historical key metrics and financial ratios.
 
     Args:
         symbol: Ticker, e.g. "AAPL", "0700.HK", "600519.SH".
@@ -877,12 +884,14 @@ async def get_financial_ratios(
 
     Returns:
         dict: {symbol, count, data, source, data_type, period}. data is
-        {key_metrics, ratios}, each a list of period records; count is the total.
-        key_metrics fields: date, marketCap, enterpriseValue, evToEBITDA,
-        freeCashFlowYield. ratios fields: date, netProfitMargin, returnOnEquity,
-        currentRatio, debtToEquityRatio, priceToEarningsRatio. Field names are
-        FMP-native camelCase; date is "YYYY-MM-DD"; records are newest-first as
-        returned by FMP. On error: {error: <code>, detail, symbol}.
+        {key_metrics, ratios}, each a list of period records, newest first; count
+        is the total. key_metrics fields: date, marketCap, enterpriseValue,
+        evToEBITDA, freeCashFlowYield. ratios fields: date, netProfitMargin,
+        returnOnEquity, currentRatio, debtToEquityRatio, priceToEarningsRatio.
+        Field names are FMP-native camelCase; date is "YYYY-MM-DD". A quarter
+        row's flow-based fields (P/S, EV/EBITDA, yields, returns) cover that
+        quarter alone, but its P/E fields annualize the quarter's EPS (x4). On
+        error: {error: <code>, detail, symbol}.
     """
     disp = _canonical(symbol)
     api = _fmp_symbol(symbol)
@@ -940,8 +949,7 @@ async def get_growth_metrics(
     period: Literal["annual", "quarter"] = "annual",
     limit: int = 10,
 ) -> _OUT_GET_GROWTH_METRICS:
-    """Fetch raw historical growth rates for trend analysis — chart revenue/EPS
-    trajectory or compare growth across competitors.
+    """Fetch raw historical growth rates.
 
     Args:
         symbol: Ticker, e.g. "AAPL", "0700.HK", "600519.SH".
@@ -950,13 +958,13 @@ async def get_growth_metrics(
 
     Returns:
         dict: {symbol, count, data, source, data_type, period}. data is
-        {financial_growth, income_statement_growth}, each a list; count is the
-        total. financial_growth fields: date, revenueGrowth, netIncomeGrowth,
-        epsgrowth; income_statement_growth fields: date, growthRevenue,
-        growthNetIncome, growthEPS. Growth values are decimal fractions
-        (0.1 = 10%). Field names are FMP-native camelCase; date is "YYYY-MM-DD";
-        records are newest-first as returned by FMP. On error:
-        {error: <code>, detail, symbol}.
+        {financial_growth, income_statement_growth}, each a list, newest first;
+        count is the total. financial_growth fields: date, revenueGrowth,
+        netIncomeGrowth, epsgrowth; income_statement_growth fields: date,
+        growthRevenue, growthNetIncome, growthEPS. Growth values are decimal
+        fractions (0.1 = 10%); a quarter row grows on the prior quarter, not the
+        year-ago one. Field names are FMP-native camelCase; date is
+        "YYYY-MM-DD". On error: {error: <code>, detail, symbol}.
     """
     disp = _canonical(symbol)
     api = _fmp_symbol(symbol)
@@ -998,7 +1006,15 @@ _OUT_GET_HISTORICAL_VALUATION = output_model(
     envelope_schema(
         RECORDS_BY_KEY,
         frame=("symbol",),
-        echo={"data_type": STR, "period": STR},
+        echo={
+            "currency": described(
+                STR,
+                "ISO 4217 currency of current_dcf's dcf and stockPrice;"
+                " omitted when the listing's venue is unknown.",
+            ),
+            "data_type": STR,
+            "period": STR,
+        },
     ),
 )
 
@@ -1009,8 +1025,7 @@ async def get_historical_valuation(
     period: Literal["annual", "quarter"] = "annual",
     limit: int = 10,
 ) -> _OUT_GET_HISTORICAL_VALUATION:
-    """Fetch DCF fair value and enterprise value history — track fair value vs
-    price or build valuation trend charts.
+    """Fetch DCF fair value and enterprise value history.
 
     Args:
         symbol: Ticker, e.g. "AAPL", "0700.HK", "600519.SH".
@@ -1018,14 +1033,16 @@ async def get_historical_valuation(
         limit: Number of periods (default 10).
 
     Returns:
-        dict: {symbol, count, data, source, data_type, period}. data is
-        {current_dcf, historical_dcf, enterprise_value}, each a list; count is
-        the total. current_dcf fields: symbol, date, dcf, stockPrice.
-        historical_dcf is always [] — the stable FMP API no longer exposes it.
-        enterprise_value fields: date, stockPrice, marketCapitalization,
-        enterpriseValue. Field names are FMP-native camelCase; date is
-        "YYYY-MM-DD"; enterprise_value is newest-first as returned by FMP. On
-        error: {error: <code>, detail, symbol}.
+        dict: {symbol, currency, count, data, source, data_type, period}. data
+        is {current_dcf, historical_dcf, enterprise_value}, each a list; count
+        is the total. current_dcf fields: symbol, date, dcf, stockPrice, per
+        share in `currency` (absent when the venue is unknown). historical_dcf
+        is always []. enterprise_value fields, newest first: date,
+        reportedCurrency, stockPrice, marketCapitalization, enterpriseValue,
+        priced in reportedCurrency (the filings' currency, which can differ
+        from `currency`; null when unknown). Field names are FMP-native
+        camelCase; date is "YYYY-MM-DD".
+        On error: {error: <code>, detail, symbol}.
     """
     disp = _canonical(symbol)
     api = _fmp_symbol(symbol)
@@ -1038,21 +1055,48 @@ async def get_historical_valuation(
         current_dcf = await client.get_dcf(api)
         historical_dcf = await client.get_historical_dcf(api, period=period, limit=limit)
         enterprise_value = await client.get_enterprise_value(api, period=period, limit=limit)
-
-        return make_response(
-            {
-                "current_dcf": current_dcf or [],
-                "historical_dcf": historical_dcf or [],
-                "enterprise_value": enterprise_value or [],
-            },
-            source=_SOURCE,
-            symbol=disp,
-            data_type="historical_valuation",
-            period=period,
-        )
-
     except Exception as e:  # noqa: BLE001
         return error_from_exception(e, _UPSTREAM_FAILED, symbol=disp)
+
+    try:
+        key_metrics = await client.get_key_metrics(api, period=period, limit=limit)
+    except Exception as exc:  # noqa: BLE001 - it only labels the rows, which still answer
+        logger.warning("FMP key metrics unavailable for %s: %s", disp, type(exc).__name__)
+        key_metrics = []
+
+    # FMP prices the DCF row in the listing's trading currency (in pence on a
+    # pence venue) and the enterprise-value rows in the filings' currency, which
+    # only the key-metrics row for the same period names.
+    try:
+        ref = to_canonical(symbol, asset_class=AssetClass.EQUITY)
+    except Exception:  # noqa: BLE001
+        ref = None
+    # A venue the protocol does not know resolves to a USD default, not its currency.
+    currency = ref.price_currency if ref and declared_venue(ref) != UNKNOWN_MIC else None
+    places = minor_unit_places(symbol)
+    reported = {row.get("date"): row.get("reportedCurrency") for row in key_metrics or []}
+    return make_response(
+        {
+            "current_dcf": [
+                {
+                    **{k: v for k, v in row.items() if k != "Stock Price"},
+                    "dcf": scale_price(row.get("dcf"), places),
+                    "stockPrice": scale_price(row.get("Stock Price", row.get("stockPrice")), places),
+                }
+                for row in current_dcf or []
+            ],
+            "historical_dcf": historical_dcf or [],
+            "enterprise_value": [
+                {**row, "reportedCurrency": reported.get(row.get("date"))}
+                for row in enterprise_value or []
+            ],
+        },
+        source=_SOURCE,
+        symbol=disp,
+        currency=currency,
+        data_type="historical_valuation",
+        period=period,
+    )
 
 
 _OUT_GET_INSIDER_TRADES = output_model(
@@ -1070,22 +1114,23 @@ async def get_insider_trades(
     symbol: str,
     limit: int = 50,
 ) -> _OUT_GET_INSIDER_TRADES:
-    """Fetch insider trading transactions and aggregate buy/sell statistics —
-    detect insider buying clusters, screen unusual activity, or gauge C-suite
-    confidence.
+    """Fetch insider transactions from SEC Form 4 filings, with quarterly totals.
+    HK and A-share listings return empty lists.
 
     Args:
-        symbol: Ticker — US "AAPL", HK "0700.HK", A-share "600519.SH".
-        limit: Number of recent transactions to fetch (default 50).
+        symbol: Ticker, e.g. "AAPL".
+        limit: Number of recent transactions (default 50).
 
     Returns:
         dict: {symbol, count, data, source, data_type}. data is {trades, stats},
-        each a list; count is the total across both. trades fields: symbol,
-        filingDate, transactionDate, reportingName, transactionType,
-        securitiesTransacted, price. stats fields: year, quarter, totalBought,
-        totalSold, buySellRatio. Field names are FMP-native camelCase; dates are
-        "YYYY-MM-DD"; trades are newest-first as returned by FMP. On error:
-        {error: <code>, detail, symbol}.
+        each a list; count is the total across both. trades fields, newest
+        first: filingDate, transactionDate, reportingName, transactionType,
+        securitiesTransacted, price. Only "P-Purchase" and "S-Sale" are
+        open-market trades; others are awards, exercises or tax withholding.
+        stats, one row per calendar quarter: year, quarter, totalPurchases,
+        totalSales (counts of P and S trades), totalAcquired, totalDisposed
+        (shares, all transaction types). Field names are FMP-native camelCase;
+        dates are "YYYY-MM-DD". On error: {error: <code>, detail, symbol}.
     """
     disp = _canonical(symbol)
     api = _fmp_symbol(symbol)
@@ -1123,20 +1168,19 @@ _OUT_GET_DIVIDENDS_AND_SPLITS = output_model(
 async def get_dividends_and_splits(
     symbol: str,
 ) -> _OUT_GET_DIVIDENDS_AND_SPLITS:
-    """Fetch historical dividend payments and stock splits — analyze dividend
-    growth, adjust prices for splits, or compare dividend history across peers.
+    """Fetch historical dividend payments and stock splits.
 
     Args:
         symbol: Ticker — US "AAPL", HK "0700.HK", A-share "600519.SH".
 
     Returns:
         dict: {symbol, count, data, source, data_type}. data is
-        {dividends, splits}, each a list; count is the total across both.
-        dividends fields: date, recordDate, paymentDate, declarationDate,
-        adjDividend, dividend, yield, frequency. splits fields: date, numerator,
-        denominator. Field names are FMP-native camelCase; date is "YYYY-MM-DD";
-        records are newest-first as returned by FMP. On error:
-        {error: <code>, detail, symbol}.
+        {dividends, splits}, each a list, newest first; count is the total
+        across both. dividends fields: date, recordDate, paymentDate,
+        declarationDate, adjDividend (split-adjusted), dividend (as paid), yield
+        (percent, 0.34 = 0.34%), frequency. splits fields: date, numerator,
+        denominator. Field names are FMP-native camelCase; date is "YYYY-MM-DD".
+        On error: {error: <code>, detail, symbol}.
     """
     disp = _canonical(symbol)
     api = _fmp_symbol(symbol)
@@ -1180,18 +1224,20 @@ _OUT_GET_SHARES_FLOAT = output_model(
 async def get_shares_float(
     symbol: str,
 ) -> _OUT_GET_SHARES_FLOAT:
-    """Fetch shares float, outstanding shares, and float percentage — flag
-    low-float names, gauge ownership concentration, or screen squeeze candidates.
+    """Fetch shares float, outstanding shares, and float percentage.
 
     Args:
         symbol: Ticker — US "AAPL", HK "0700.HK", A-share "600519.SH".
 
     Returns:
         dict: {symbol, count, data, source, data_type}. data is a list of
-        records; count is the record total. Fields: symbol, date, freeFloat,
-        floatShares, outstandingShares. Field names are FMP-native camelCase;
-        date is "YYYY-MM-DD"; latest snapshot first as returned by FMP. On error:
-        {error: <code>, detail, symbol}.
+        records; count is the record total. Fields: symbol, date, freeFloat
+        (percent, 99.8 = 99.8%), floatShares, outstandingShares; an ADR counts
+        ADS units, not ordinary shares. date is "YYYY-MM-DD": the day FMP
+        refreshed the record, not the as-of date of the counts, which can be
+        months older; an A-share row's date is the trading day of its counts.
+        Field names are FMP-native camelCase. On error: {error: <code>, detail,
+        symbol}.
     """
     disp = _canonical(symbol)
     api = _fmp_symbol(symbol)
@@ -1209,8 +1255,12 @@ async def get_shares_float(
     try:
         data = await client.get_shares_float(api)
 
+        # FMP stamps the row with its refresh time; the contract is a bare date.
         return make_response(
-            data or [],
+            [
+                {**row, "date": str(row["date"])[:10]} if row.get("date") else row
+                for row in data or []
+            ],
             source=_SOURCE,
             symbol=disp,
             data_type="shares_float",
@@ -1284,6 +1334,7 @@ _OUT_GET_TECHNICAL_INDICATOR = output_model(
             "indicator": STR,
             "period": described(INT, "Indicator lookback length."),
             "timeframe": described(STR, "FMP-native bar size."),
+            **BAR_LABELS,
         },
     ),
 )
@@ -1296,22 +1347,22 @@ async def get_technical_indicator(
     period: int = 14,
     timeframe: str = "1day",
 ) -> _OUT_GET_TECHNICAL_INDICATOR:
-    """Fetch a technical indicator time series over OHLCV bars — plot RSI,
-    overlay EMA/MACD, or screen by technical signals.
+    """Fetch a technical indicator time series over OHLCV bars.
 
     Args:
         symbol: Ticker, e.g. "AAPL", "0700.HK", "600519.SH".
         indicator: FMP name — "rsi", "ema", "sma", "wma", "adx", "williams".
-        period: Indicator lookback length (default 14).
+        period: Lookback length (default 14).
         timeframe: FMP-native bar — "1min"…"4hour", "1day" (default "1day").
 
     Returns:
         dict: {symbol, count, data, source, data_type, indicator, period,
-        timeframe}. data is a list of bars; count is the bar total. Fields: date,
-        open, high, low, close, volume, and the indicator value keyed by its
-        name. date is "YYYY-MM-DD" (1day) or "YYYY-MM-DD HH:MM:SS"
-        (intraday); field names are FMP-native camelCase; bars newest-first.
-        On error: {error: <code>, detail, symbol}.
+        timeframe, price_treatment, in_progress?}. data: list of {date, open,
+        high, low, close, volume, <indicator>} newest first, field names
+        FMP-native camelCase. date is "YYYY-MM-DD" (1day) or
+        "YYYY-MM-DD HH:MM:SS" (intraday). price_treatment:
+        raw|split_adjusted|dividend_adjusted. in_progress: date of the newest
+        bar while it forms. On error: {error: <code>, detail, symbol}.
     """
     disp = _canonical(symbol)
     if timeframe not in _BAR_SIZES:
@@ -1327,18 +1378,32 @@ async def get_technical_indicator(
         return make_error("client_unavailable", _CLIENT_UNAVAILABLE, symbol=disp)
 
     try:
+        ref = to_canonical(symbol, asset_class=AssetClass.EQUITY)
+    except Exception:  # noqa: BLE001
+        ref = None
+    try:
         data = await client.get_technical_indicator(
             api, indicator=indicator, period=period, timeframe=timeframe
         )
+        rows = data or []
+        if timeframe == "1day":
+            # FMP stamps a daily row with a midnight time; the contract is a bare date.
+            rows = [
+                {**row, "date": str(row["date"])[:10]}
+                if isinstance(row, dict) and row.get("date") else row
+                for row in rows
+            ]
+        newest = rows[0].get("date") if rows and isinstance(rows[0], dict) else None
 
         return make_response(
-            data or [],
+            rows,
             source=_SOURCE,
             symbol=disp,
             data_type="technical_indicator",
             indicator=indicator,
             period=period,
             timeframe=timeframe,
+            **series_labels(_SOURCE, ref, timeframe, newest),
         )
 
     except Exception as e:  # noqa: BLE001

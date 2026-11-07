@@ -33,7 +33,7 @@ import pytest
 import yfinance as yf
 
 from market_protocol import AssetClass, market_of, to_canonical
-from market_protocol.symbology import WEEKDAYS_24_5
+from market_protocol.symbology import FUTURES_MIC
 from src.data_client.base import MarketDataSource
 from src.data_client.fmp.data_source import FMPDataSource
 from src.data_client.fmp.fmp_client import FMPClient
@@ -259,8 +259,8 @@ class TestFuturesCommoditiesRatesSymbologyAndRouting:
     def test_futures_use_weekdays_24_5_calendar_and_other_market(self, sym: str):
         ref = to_canonical(sym)
         assert ref.symbol == sym
-        assert ref.calendar_id == WEEKDAYS_24_5
-        assert market_of(ref) == "other"
+        assert ref.calendar_id == FUTURES_MIC
+        assert market_of(ref) == "futures"
         assert symbol_market(sym) == "other"
         assert is_us_symbol(sym) is False
         assert yahoo_symbol(sym, is_index=True) == sym

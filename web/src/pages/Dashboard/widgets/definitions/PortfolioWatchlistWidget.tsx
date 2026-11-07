@@ -17,6 +17,7 @@ import { RowAttachButton } from '../../components/RowAttachButton';
 import type { WidgetRenderProps } from '../types';
 import type { PortfolioRow } from '../../hooks/usePortfolioData';
 import { deriveQuoteDisplay, formatSignedPct2, roundQuote2, type MarketStatusInput } from '@/lib/quotes'; // DALTON-HOOK(extended-hours-quotes)
+import { normalizePortfolioCurrency } from '../../utils/portfolioSummary';
 import { watchlistQuoteRow } from '../../hooks/useWatchlistData';
 import { WidgetCardMeta } from '../framework/widgetCardSlots';
 import {
@@ -29,8 +30,10 @@ import {
   WatchlistRowItem,
   WatchlistTable,
 } from './_holdingsPrimitives';
-import { formatPortfolioNavMarkdownLine, portfolioSummary } from './_holdingsHelpers';
-import { normalizePortfolioCurrency } from '../../utils/portfolioSummary';
+import {
+  formatPortfolioNavMarkdownLine,
+  portfolioSummary,
+} from './_holdingsHelpers';
 
 type PWTabKey = 'watchlist' | 'portfolio';
 
@@ -88,7 +91,6 @@ export function portfolioRowToQuote(r: PortfolioRow, marketStatus?: MarketStatus
     currency: normalizePortfolioCurrency(r.currency),
   };
 }
-
 function PortfolioWatchlistWidget({
   instance,
   updateConfig,

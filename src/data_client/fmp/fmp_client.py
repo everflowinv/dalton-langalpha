@@ -7,28 +7,32 @@ see :func:`_format_sector_change_pct`.
 import asyncio
 import json
 import logging
+import math
 import os
 import time  # DALTON-HOOK(market-data-fallback): epoch for the quota-reset header
 from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional, Union
 from zoneinfo import ZoneInfo
 
 import httpx
 from market_protocol import display_spelling, vendor_spelling
 
-_CACHE_MAX_SIZE = 512
+from . import walk
+from .walk import Walk
 
 logger = logging.getLogger(__name__)
 
-# Stable's ``economic-indicators`` answers at most this many days ending at
-# ``to``, so an indicator is read back in windows of that span from today in
-# UTC. Another implementation of this tool surface should walk the same windows
-# with the same caps and batches, so both serve the same rows.
-_INDICATOR_WINDOW_DAYS = 91
-_INDICATOR_MAX_WINDOWS = 64
-_INDICATOR_MAX_EMPTY_RUN = 16
-_INDICATOR_MAX_BATCH = 8
+_CACHE_MAX_SIZE = 512
+# A dropped connection or a 5xx is retried on a fresh attempt, a refusal never:
+# a walk makes up to 64 calls, and one transient failure fails the read. A
+# timeout is not retried, so a hung FMP still fails a call in one timeout.
+# ginlix-data's FMP client retries a dropped connection and a 5xx the same
+# number of times, and a timeout too.
+_RETRIES = 2
+_BACKOFF_S = 0.25
+_TRANSIENT = frozenset({500, 502, 503, 504})
 
 
 def _vendor_symbol_params(params: Dict[str, Any]) -> Dict[str, Any]:
@@ -83,10 +87,29 @@ class FMPRequestError(Exception):
         *,
         status_code: Optional[int] = None,
         reset_epoch: Optional[float] = None,
+        retry_after: Optional[float] = None,
     ):
         super().__init__(message)
         self.status_code = status_code
         self.reset_epoch = reset_epoch
+        self.retry_after = retry_after
+
+
+def _retry_after(value: Optional[str]) -> Optional[float]:
+    """Seconds a ``Retry-After`` header asks for, in either of its forms."""
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            when = parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        seconds = (when - datetime.now(timezone.utc)).total_seconds()
+    return max(seconds, 0.0) if math.isfinite(seconds) else None
 
 
 def _today_utc() -> date:
@@ -157,7 +180,12 @@ class FmpQuotaExhausted(FMPRequestError):
     report rate limiting with the reset time instead of a generic failure.
     """
 
-    def __init__(self, reset_at: Optional[datetime] = None) -> None:
+    def __init__(
+        self,
+        reset_at: Optional[datetime] = None,
+        *,
+        retry_after: Optional[float] = None,
+    ) -> None:
         when = (
             reset_at.astimezone(_ET).strftime("%Y-%m-%d %H:%M US/Eastern")
             if reset_at
@@ -171,6 +199,7 @@ class FmpQuotaExhausted(FMPRequestError):
             f"FMP daily quota is exhausted (quota resets at {when}); "
             f"alternative providers such as yfinance will be used where available",
             status_code=429,
+            retry_after=retry_after,
         )
         self.reset_at = reset_at
 
@@ -334,9 +363,20 @@ class FMPClient:
         client = await self._get_client()
 
         try:
-            response = await client.get(
-                url, params=params, headers={"apikey": self.api_key}
-            )
+            for attempt in range(_RETRIES + 1):
+                try:
+                    response = await client.get(
+                        url, params=params, headers={"apikey": self.api_key}
+                    )
+                except httpx.TimeoutException:
+                    raise
+                except httpx.TransportError:
+                    if attempt == _RETRIES:
+                        raise
+                else:
+                    if response.status_code not in _TRANSIENT or attempt == _RETRIES:
+                        break
+                await asyncio.sleep(_BACKOFF_S * 2**attempt)
             # DALTON-HOOK(market-data-fallback): the quota-exhausted notice can
             # arrive inside any status's body, so look before
             # raise_for_status(); 402 is exempt (that one is about the plan,
@@ -356,7 +396,10 @@ class FMPClient:
                 # FmpQuotaExhausted a marker hit or a 429 would — the
                 # quota-aware callers upstream only recognize that class.
                 reset_at = await trip_quota_marker(429, _quota_reset_epoch(response))
-                raise FmpQuotaExhausted(reset_at) from None
+                raise FmpQuotaExhausted(
+                    reset_at,
+                    retry_after=_retry_after(response.headers.get("Retry-After")),
+                ) from None
             response.raise_for_status()
             if data is None:
                 data = _own_symbol_rows(response.json())
@@ -378,13 +421,15 @@ class FMPClient:
             # raises FmpQuotaExhausted so quota-aware callers recognize it;
             # a 402 may only mean this endpoint sits outside the plan, so it
             # fails this call alone as a plain FMPRequestError.
+            retry_after = _retry_after(e.response.headers.get("Retry-After"))
             if e.response.status_code == 429:
                 reset_at = await trip_quota_marker(429, _quota_reset_epoch(e.response))
-                raise FmpQuotaExhausted(reset_at) from e
+                raise FmpQuotaExhausted(reset_at, retry_after=retry_after) from e
             raise FMPRequestError(
                 f"FMP API request failed ({e.response.status_code})",
                 status_code=e.response.status_code,
                 reset_epoch=_quota_reset_epoch(e.response),
+                retry_after=retry_after,
             )
         except httpx.TimeoutException:
             raise FMPRequestError("FMP API request timed out")
@@ -999,10 +1044,11 @@ class FMPClient:
         elif isinstance(to_date, date):
             to_date = to_date.isoformat()
 
-        return await self._make_request(
+        rows = await self._make_request(
             "historical-price-eod/full",
             params={"symbol": symbol, "from": from_date, "to": to_date},
         )
+        return walk.eod_answer(rows, from_date)
 
     async def get_intraday_chart(
         self,
@@ -1020,9 +1066,8 @@ class FMPClient:
         if extended:  # DALTON-HOOK(stock-move-upgrade)
             params["extended"] = "true"
 
-        return await self._make_request(
-            f"historical-chart/{interval}", params=params
-        )
+        rows = await self._make_request(f"historical-chart/{interval}", params=params)
+        return walk.intraday_answer(rows, interval, from_date, to_date, _today_utc())
 
     async def get_commodity_price(
         self,
@@ -1132,62 +1177,32 @@ class FMPClient:
     # =====================================================================
 
     async def get_economic_indicators(self, name: str, limit: int = 50) -> List[Dict]:
-        """The newest ``limit`` observations of an indicator, newest first.
+        """The newest ``limit`` observations of an indicator, newest first, read
+        back from today in UTC (:func:`walk.read_indicator`)."""
+        return await walk.read_indicator(self._make_request, name, limit, _today_utc())
 
-        Stable ignores ``limit`` and answers at most the 91 days ending at
-        ``to``, clamping a longer range without a word, so a quarterly series
-        such as GDP has nothing in its default window. The series is read back
-        a window at a time instead, the first alone and then a widening batch,
-        until ``limit`` rows are in hand. An answer that is not a list is FMP's
-        refusal and is returned as it came, as the single read returned it.
-        """
-        found: Dict[str, Dict] = {}
-        end = _today_utc()
-        batch, walked, empty_run = 1, 0, 0
-        while walked < _INDICATOR_MAX_WINDOWS:
-            spans = []
-            for _ in range(min(batch, _INDICATOR_MAX_WINDOWS - walked)):
-                start = end - timedelta(days=_INDICATOR_WINDOW_DAYS - 1)
-                spans.append((start.isoformat(), end.isoformat()))
-                end = start - timedelta(days=1)
-            walked += len(spans)
-            answers = await asyncio.gather(
-                *(
-                    self._make_request(
-                        "economic-indicators",
-                        params={"name": name, "from": lo, "to": hi},
-                    )
-                    for lo, hi in spans
-                ),
-                return_exceptions=True,
-            )
-            # Newest first, in window order rather than completion order: a
-            # window older than the rows already in hand, or past the empty run
-            # that ends the series, is not needed, and neither is its failure.
-            for (lo, hi), answer in zip(spans, answers):
-                if len(found) >= limit or empty_run >= _INDICATOR_MAX_EMPTY_RUN:
-                    break
-                if isinstance(answer, BaseException):
-                    raise answer
-                if not isinstance(answer, list):
-                    return answer
-                inside = [
-                    row
-                    for row in answer
-                    if isinstance(row, dict) and lo <= str(row.get("date"))[:10] <= hi
-                ]
-                for row in inside:
-                    found.setdefault(row["date"], row)
-                empty_run = 0 if inside else empty_run + 1
-            if len(found) >= limit or empty_run >= _INDICATOR_MAX_EMPTY_RUN:
-                break
-            batch = min(batch * 2, _INDICATOR_MAX_BATCH)
-        rows = sorted(found.values(), key=lambda row: row["date"], reverse=True)
-        return rows[: max(limit, 0)]
+    async def _range(
+        self, endpoint: str, from_date: str, to_date: str, **walk_kwargs: Any
+    ) -> Union[Walk, Dict]:
+        """A range read back by :func:`walk.read_range`."""
+
+        async def request(params: Dict[str, Any]) -> Any:
+            return await self._make_request(endpoint, params=params)
+
+        return await walk.read_range(request, from_date, to_date, **walk_kwargs)
 
     async def get_economic_calendar(
         self, from_date: Optional[str] = None, to_date: Optional[str] = None
     ) -> List[Dict]:
+        """Events in the range; with both bounds a :class:`Walk` (see :meth:`_range`).
+
+        A lone bound is one read: the calendar holds upcoming dates, so where
+        its range ends is FMP's to say.
+        """
+        if from_date and to_date:
+            return await self._range(
+                "economic-calendar", from_date, to_date, from_start=True
+            )
         params: Dict[str, Any] = {}
         if from_date:
             params["from"] = from_date
@@ -1198,9 +1213,15 @@ class FMPClient:
     async def get_treasury_rates(
         self, from_date: Optional[str] = None, to_date: Optional[str] = None
     ) -> List[Dict]:
-        params: Dict[str, Any] = {}
+        """Daily rates; with a start, a :class:`Walk` to ``to_date`` or today in UTC.
+
+        No rate lies ahead, so a lone start leaves no doubt where the range
+        ends. Without a start it is one read, FMP's own recent window.
+        """
         if from_date:
-            params["from"] = from_date
+            to_date = to_date or _today_utc().isoformat()
+            return await self._range("treasury-rates", from_date, to_date)
+        params: Dict[str, Any] = {}
         if to_date:
             params["to"] = to_date
         return await self._make_request("treasury-rates", params=params)
@@ -1211,9 +1232,25 @@ class FMPClient:
     async def get_earnings_calendar_by_date(
         self, from_date: Optional[str] = None, to_date: Optional[str] = None
     ) -> List[Dict]:
+        """Reporters in the range; with both bounds a :class:`Walk` (see
+        :meth:`_range`), paged past FMP's 4,000-row answer. A lone bound is one
+        read, as the economic calendar's is, sorted oldest first as the range
+        read is."""
+        if from_date and to_date:
+            return await self._range(
+                "earnings-calendar",
+                from_date,
+                to_date,
+                page_rows=walk.EARNINGS_PAGE_ROWS,
+                window_days=walk.EARNINGS_WINDOW_DAYS,
+                from_start=True,
+            )
         params: Dict[str, Any] = {}
         if from_date:
             params["from"] = from_date
         if to_date:
             params["to"] = to_date
-        return await self._make_request("earnings-calendar", params=params)
+        rows = await self._make_request("earnings-calendar", params=params)
+        if not isinstance(rows, list):
+            return rows
+        return Walk(sorted(rows, key=lambda row: str(row.get("date"))))

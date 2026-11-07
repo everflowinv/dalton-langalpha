@@ -8,15 +8,20 @@ import {
   updatePortfolioHolding,
 } from '../utils/api';
 import { useQuotes, snapshotToStockPrice } from '@/lib/quotes';
+import { quotePlaces } from '@/lib/bars/currencyDisplay';
 import type { PortfolioHoldingPayload, PortfolioHoldingUpdatePayload } from '../utils/portfolio';
-import type { StockPrice } from '@/types/market';
+import { costBasis } from '../utils/portfolioSummary';
+import type { ExtendedSessionFields, StockPrice } from '@/types/market';
 
 export interface PortfolioRow {
   user_portfolio_id?: string | number;
   symbol: string;
   quantity?: number | null;
   average_cost?: number | null;
+  /** The currency its price and value are in: the quote's, else the holding's. */
   currency: string;
+  /** The currency its average cost was entered in. */
+  costCurrency?: string;
   notes?: string;
   price: number;
   change?: number | null;
@@ -25,6 +30,9 @@ export interface PortfolioRow {
   unrealizedPlPercent?: number | null;
   isPositive?: boolean;
   quoteAvailable?: boolean;
+  /** Places its prices print up to (lib/bars `quotePlaces`), from the quote's own currency and asset class, not the holding's. */
+  places?: number;
+  session?: ExtendedSessionFields;
   previousClose?: number | null;
   // DALTON-HOOK(extended-hours-quotes): Extended-hours and regular-session fields for accurate card display.
   regularClose?: number | null;
@@ -134,13 +142,17 @@ export function usePortfolioData() {
       const quoteAvailable = p.quoteAvailable !== false && p.price != null;
       const price = quoteAvailable ? p.price ?? 0 : 0;
       const marketValue = quoteAvailable ? q * price : null;
-      const plPct = quoteAvailable && ac != null && ac > 0 ? ((price - ac) / ac) * 100 : null;
+      const costCurrency = h.currency ?? 'USD';
+      const currency = p.currency ?? costCurrency;
+      const basis = costBasis({ symbol: sym, average_cost: ac, quantity: q, currency, costCurrency });
+      const plPct = marketValue != null && basis != null && basis > 0 ? ((marketValue - basis) / basis) * 100 : null;
       return {
         user_portfolio_id: h.user_portfolio_id,
         symbol: sym,
         quantity: q,
         average_cost: ac,
-        currency: h.currency ?? 'USD',
+        currency,
+        costCurrency,
         notes: h.notes ?? '',
         price,
         change: quoteAvailable ? p.change ?? null : null,
@@ -149,6 +161,8 @@ export function usePortfolioData() {
         quoteAvailable,
         unrealizedPlPercent: plPct,
         isPositive: quoteAvailable && plPct != null ? plPct >= 0 : true,
+        session: p.session,
+        places: p.places ?? quotePlaces(sym, {}),
         previousClose: p.previousClose ?? null,
         // DALTON-HOOK(extended-hours-quotes): Forward extended-hours and regular-close fields from StockPrice.
         regularClose: p.regularClose ?? null,

@@ -14,7 +14,7 @@ from typing import Any, NamedTuple, Optional
 from src.data_client.freshness import Freshness, FreshnessLabel, is_live, measure_quote
 from market_protocol import AssetClass, InstrumentRef, MarketPhase, display_spelling
 
-from .currency import fmt_price
+from .currency import fmt_money, fmt_price
 from .display import (
     _is_us_clock,
     _symbol_currency,
@@ -302,6 +302,9 @@ def _line(row: _Row, prev_price: Optional[float], at: Optional[datetime]) -> str
     snap = row.snap
     parts = [_symbol_label(snap)]
     price = current_price(snap)
+    # A coin's vendors close its day at 00:00 UTC and report its volume as
+    # money in the quote currency, not as a count of coins.
+    coin = row.ref is not None and row.ref.asset_class is AssetClass.CRYPTO
     # DALTON-HOOK(extended-hours-quotes): Split regular close + regular move from pre-market/after-hours price + move.
     phase = venue_phase(row.ref, at) if row.ref is not None else None
     main_price, change_parts = format_quote_change_parts(
@@ -311,10 +314,12 @@ def _line(row: _Row, prev_price: Optional[float], at: Optional[datetime]) -> str
         parts.append(
             main_price if isinstance(main_price, str) else _fmt_price(main_price, row.ref)
         )
+    if coin:
+        change_parts = [p.replace(" today", " since 00:00 UTC") for p in change_parts]
     parts.extend(change_parts)
     vol = finite_or_none(snap.get("volume"))
     if vol:
-        parts.append(f"vol {_fmt_volume(int(vol))}")
+        parts.append(f"vol {fmt_money(vol, row.ref.price_currency) if coin else _fmt_volume(int(vol))}")
     if prev_price and price is not None and prev_price > 0:
         delta_pct = (price - prev_price) / prev_price * 100
         parts.append(f"({'+' if delta_pct >= 0 else ''}{delta_pct:.2f}% since last check)")

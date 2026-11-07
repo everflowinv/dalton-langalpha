@@ -51,6 +51,7 @@ from data_client.normalize import (  # DALTON-HOOK(market-data-fallback)
     normalize_bars,
     populated,
     scale_price,
+    series_labels,
     symbol_timezone,
 )
 from data_client.ginlix_data.cn_source import GinlixDataCnSource
@@ -65,6 +66,7 @@ from market_protocol import (  # DALTON-HOOK(stock-move-upgrade)
     to_legacy_api,
 )
 from market_protocol.enums import AssetClass
+from market_protocol.symbology import FUTURES_MIC
 
 try:
     from _envelope import (
@@ -92,10 +94,13 @@ from mcp_servers._dates import (
     intraday_window,
 )
 from mcp_servers._schemas import (
+    BAR_LABELS,
+    INCOMPLETE,
     OBJECT,
     RECORDS,
     RECORDS_BY_KEY,
     STR,
+    TRUNCATED,
     described,
     envelope_schema,
     output_model,
@@ -196,6 +201,12 @@ def _display_rows(
             for field in ("open", "high", "low", "close"):
                 row[field] = scale_price(row[field], places)
     return normalized
+
+
+def _series_labels(env: dict, ref: Optional[InstrumentRef], interval: str) -> dict:
+    """:func:`series_labels` for an ascending envelope."""
+    newest = env["data"][-1]["date"] if env["data"] else None
+    return series_labels(env["source"], ref, interval, newest)
 
 
 _names = NameDirectory(_ginlix.get_instruments_v2, deadline=2.0)
@@ -570,8 +581,10 @@ async def _fetch_stock_series(
             resolved, interval, start_date, end_date, extended_hours=extended_hours
         ),
     )
-    if ok is not None and name:
-        ok["name"] = name
+    if ok is not None:
+        ok.update(_series_labels(ok, resolved[4], ok["interval"]))
+        if name:
+            ok["name"] = name
     return ok, err
 
 
@@ -609,8 +622,12 @@ async def _fetch_stock_bars(
             except ValueError:
                 end = datetime.now(_tz.utc)
             cn_start = (end - timedelta(days=_CN_DEFAULT_DAILY_DAYS)).strftime("%Y-%m-%d")
+        incomplete = False
         try:
-            bars = (await _cn.get_daily(legacy, cn_start, end_date)).bars
+            fetched = await _cn.get_daily(legacy, cn_start, end_date)
+            # The series' coverage flag marks sessions missing inside the window
+            # (a refetch that failed), not a cap cutting either end.
+            bars, incomplete = fetched.bars, fetched.truncated
         except httpx.HTTPError as exc:
             # An upstream miss (a 503, a 429, a dropped connection) is expected and
             # the chain answers instead, so one line is enough.
@@ -627,6 +644,7 @@ async def _fetch_stock_bars(
                 "interval": canonical,
                 "currency": currency,
                 "timezone": timezone,
+                "incomplete": incomplete,
             }, None
 
     # The legacy spelling of a family index is bare (GSPC), which every vendor
@@ -665,14 +683,15 @@ async def _fetch_stock_bars(
     elif ginlix_result is not None:
         # Already-normalized display rows, descending → flip to ascending.
         tier = {
-            "data": list(reversed(ginlix_result)),
+            "data": list(reversed(ginlix_result.bars)),
             "source": "ginlix-data",
             "symbol": display,
             "interval": canonical,
             "currency": currency,
             "timezone": timezone,
+            "truncated": ginlix_result.truncated,
         }
-        if populated(ginlix_result):
+        if populated(ginlix_result.bars):
             return tier, None
         # No bars is a miss too: Massive answers a range older than its history
         # with none (AAPL in 1995), which FMP still holds. The empty answer
@@ -785,6 +804,7 @@ async def _fetch_stock_bars(
         return miss or (None, make_error(
             "upstream_error", "FMP fetch failed.", symbol=display, interval=canonical
         ))
+    truncated = getattr(rows, "truncated", False)
     if window is not None:
         rows = window.rows(rows or [])
 
@@ -802,6 +822,7 @@ async def _fetch_stock_bars(
         "interval": canonical,
         "currency": currency,
         "timezone": timezone,
+        "truncated": truncated,
     }, None
 
 
@@ -819,7 +840,7 @@ _OUT_GET_STOCK_DATA = output_model(
     envelope_schema(
         RECORDS,
         frame=("symbol", "interval", "currency", "timezone"),
-        echo={"name": _NAME_ECHO},
+        echo={**BAR_LABELS, "name": _NAME_ECHO, "truncated": TRUNCATED, "incomplete": INCOMPLETE},
     ),
 )
 
@@ -832,24 +853,25 @@ async def get_stock_data(
     end_date: Optional[str] = None,
     extended_hours: bool = False,  # DALTON-HOOK(stock-move-upgrade)
 ) -> _OUT_GET_STOCK_DATA:
-    """Fetch OHLCV price bars for a stock; use for historical charts/analysis.
+    """Fetch OHLCV price bars for a stock.
 
-    Intervals: 1min|5min|15min|30min|1hour|4hour|1day ("1d"/"daily" accepted);
-    start_date and end_date required for intraday.
+    Intervals: 1min|5min|15min|30min|1hour|4hour|1day; intraday needs dates.
 
     Args:
-        symbol: US "AAPL", HK "0700.HK", CN "600519.SH", UK "VOD.L", futures "NQ=F", index "^TNX".
-        interval: Bar size; one of the intervals above.
-        start_date: "YYYY-MM-DD[ HH:MM]" start filter.
-        end_date: "YYYY-MM-DD[ HH:MM]" end filter.
-        extended_hours: Include pre/post-market intraday bars (default False).
+        symbol: US "AAPL", HK "0700.HK", CN "600519.SH", UK "VOD.L", "NQ=F", "^TNX".
+        interval: See above.
+        start_date: "YYYY-MM-DD[ HH:MM]".
+        end_date: Same format.
+        extended_hours: Pre/post-market intraday bars (default False).
 
     Returns:
         dict: {symbol, interval, currency, timezone, count, data, source,
-        name?}. data: list of {date, open, high, low, close, volume} ascending
-        (oldest first); date exchange-local "YYYY-MM-DD[ HH:MM:SS]"; prices in
-        `currency` major units. name: local-language name (CN/HK only). On
-        error: {error: <code>, detail}.
+        price_treatment, name?, in_progress?, truncated?, incomplete?}. data:
+        list of {date, open, high, low, close, volume} ascending; date
+        exchange-local "YYYY-MM-DD[ HH:MM:SS]"; prices in `currency` major
+        units. price_treatment: raw|split_adjusted|dividend_adjusted.
+        in_progress: forming last bar date. truncated: oldest bars cut by cap.
+        incomplete: bars in window missing. On error: {error: <code>, detail}.
     """
     env, err = await _fetch_stock_series(
         symbol, interval, start_date, end_date, extended_hours=extended_hours
@@ -864,7 +886,10 @@ _OUT_GET_ASSET_DATA = output_model(
     envelope_schema(
         RECORDS,
         frame=("symbol", "interval", "currency", "timezone"),
-        echo={"asset_type": STR, "name": _NAME_ECHO},
+        echo={
+            "asset_type": STR, **BAR_LABELS, "name": _NAME_ECHO,
+            "truncated": TRUNCATED, "incomplete": INCOMPLETE,
+        },
     ),
 )
 
@@ -880,23 +905,23 @@ async def get_asset_data(
 ) -> _OUT_GET_ASSET_DATA:
     """Fetch OHLCV bars for a stock, commodity, crypto, or forex pair.
 
-    Intervals: 1min|5min|1hour|1day (stock adds 15min|30min|4hour); dates
-    required for intraday.
+    Intervals: 1min|5min|1hour|1day; intraday needs dates.
 
     Args:
-        symbol: Stock "AAPL", commodity "GCUSD"/"CL=F", crypto "BTCUSD", fx "EURUSD".
-        asset_type: One of stock|commodity|crypto|forex.
-        interval: Bar size; see intervals above.
-        from_date: "YYYY-MM-DD[ HH:MM]" start filter.
-        to_date: "YYYY-MM-DD[ HH:MM]" end filter.
-        extended_hours: Include pre/post-market intraday bars (default False).
+        symbol: "AAPL", "GCUSD", "CL=F", "BTCUSD", "EURUSD".
+        asset_type: stock|commodity|crypto|forex.
+        interval: See above.
+        from_date: "YYYY-MM-DD[ HH:MM]".
+        to_date: Same format.
+        extended_hours: Pre/post-market intraday bars.
 
     Returns:
         dict: {symbol, asset_type, interval, currency, timezone, count, data,
-        source, name?}. data: list of {date, open, high, low, close, volume}
-        ascending (oldest first); exchange-local "YYYY-MM-DD[ HH:MM:SS]"; prices
-        in `currency` major units. name: local-language name (CN/HK stock only).
-        On error: {error: <code>, detail}.
+        source, price_treatment, name?, in_progress?, truncated?, incomplete?}.
+        data: [{date, open, high, low, close, volume}] ascending; exchange-local
+        "YYYY-MM-DD[ HH:MM:SS]"; major units. price_treatment:
+        raw|split_adjusted|dividend_adjusted. in_progress: forming bar date.
+        truncated: cut by cap. incomplete: missing bars. On error: {error, detail}.
     """
     at = asset_type.lower().strip()
     if at not in {"stock", "commodity", "crypto", "forex"}:
@@ -918,7 +943,16 @@ async def get_asset_data(
     # commodity / crypto / forex — FMP direct (the provider chain and ginlix
     # cover equities/indexes only). Currency + timezone from canonical identity.
     hint = {"crypto": AssetClass.CRYPTO, "forex": AssetClass.FX}.get(at)
-    display, _legacy, currency, timezone, _ref = _resolve(symbol, asset_class=hint)
+    display, _legacy, currency, timezone, ref = _resolve(symbol, asset_class=hint)
+    # FMP spells a pair as one run (BTCUSD, EURUSD), however the caller did,
+    # so the BTC-USD this tool answers with can be sent back.
+    pair = ref is not None and ref.asset_class in (AssetClass.CRYPTO, AssetClass.FX)
+    fmp_symbol = ref.symbol.replace("-", "") if pair else symbol
+    if at == "commodity" and ref is not None:
+        # A commodity keeps CME Globex hours, settling at its 16:00 Chicago halt,
+        # and adjusts for nothing. FMP labels it in New York time, the zone the
+        # ref keeps.
+        ref = ref.model_copy(update={"mic": FUTURES_MIC, "calendar_id": FUTURES_MIC})
     canonical, err = _resolve_interval(interval, _ASSET_INTERVALS, symbol=display)
     if err is not None:
         return err
@@ -953,9 +987,9 @@ async def get_asset_data(
             else:
                 lo, hi = daily_days(from_date, to_date)
                 if at == "crypto":
-                    rows = await client.get_crypto_price(symbol, from_date=lo, to_date=hi)
+                    rows = await client.get_crypto_price(fmp_symbol, from_date=lo, to_date=hi)
                 else:
-                    rows = await client.get_forex_price(symbol, from_date=lo, to_date=hi)
+                    rows = await client.get_forex_price(fmp_symbol, from_date=lo, to_date=hi)
         elif at == "commodity":
             # FMP labels a commodity in New York time, the zone its envelope
             # states, so its labels stand.
@@ -970,31 +1004,33 @@ async def get_asset_data(
             window = intraday_window(from_date, to_date, timezone, labels=NEW_YORK)
             if at == "crypto":
                 rows = await client.get_crypto_intraday_chart(
-                    symbol, canonical, from_date=window.from_day, to_date=window.to_day,
+                    fmp_symbol, canonical, from_date=window.from_day, to_date=window.to_day,
                     **ext_kw,  # DALTON-HOOK(stock-move-upgrade)
                 )
             else:
                 rows = await client.get_forex_intraday_chart(
-                    symbol, canonical, from_date=window.from_day, to_date=window.to_day,
+                    fmp_symbol, canonical, from_date=window.from_day, to_date=window.to_day,
                     **ext_kw,  # DALTON-HOOK(stock-move-upgrade)
                 )
     except Exception as e:  # noqa: BLE001
         return error_from_exception(
             e, "FMP fetch failed.", symbol=display, interval=canonical
         )
+    truncated = getattr(rows, "truncated", False)
     if window is not None and isinstance(rows, list):
         rows = window.rows(rows)
 
-    data = _display_rows(rows or [], symbol, intraday=intraday)
-    return make_response(
-        data,
-        source="fmp",
-        symbol=display,
-        interval=canonical,
-        currency=currency,
-        timezone=timezone,
-        asset_type=at,
-    )
+    env = {
+        "data": _display_rows(rows or [], symbol, intraday=intraday),
+        "source": "fmp",
+        "symbol": display,
+        "interval": canonical,
+        "currency": currency,
+        "timezone": timezone,
+        "truncated": truncated,
+        "asset_type": at,
+    }
+    return make_response(**env, **_series_labels(env, ref, canonical))
 
 
 _OUT_GET_SHORT_DATA = output_model(
@@ -1020,10 +1056,10 @@ async def get_short_data(
     to_date: Optional[str] = None,
     limit: int = 20,
 ) -> _OUT_GET_SHORT_DATA:
-    """Fetch short interest and/or short volume for a US stock (short-squeeze work).
+    """Fetch short interest and/or short volume for a US stock.
 
     Short interest is FINRA bi-monthly (settlement_date); short volume is daily
-    off-exchange (date). ginlix-data only.
+    off-exchange (date).
 
     Args:
         symbol: Stock ticker, e.g. "AAPL".
@@ -1035,9 +1071,9 @@ async def get_short_data(
     Returns:
         dict: {symbol, timezone, count, data, source, data_type}. data is a dict
         of {short_interest, short_volume} lists (requested sections only), newest
-        first. Record fields are vendor-native (e.g. settlement_date,
-        short_volume_ratio). Partial failures appear in an `errors` map. On
-        error: {error: <code>, detail}.
+        first. Record fields are vendor-native (e.g. settlement_date);
+        short_volume_ratio is a percent (43.3 = 43.3%). Partial failures appear
+        in an `errors` map. On error: {error: <code>, detail}.
     """
     display, legacy, _currency, timezone, _ref = _resolve(symbol)
 

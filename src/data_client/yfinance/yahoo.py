@@ -11,7 +11,7 @@ from __future__ import annotations
 import math  # DALTON-HOOK(yfinance-prev-close)
 
 import yfinance as yf
-from market_protocol import vendor_spelling
+from market_protocol import AssetClass, to_canonical, vendor_spelling
 
 _FX_CURRENCIES = frozenset({  # DALTON-HOOK(market-data-fallback)
     "AED", "ARS", "AUD", "BRL", "CAD", "CHF", "CLP", "CNH", "CNY", "COP",
@@ -93,14 +93,23 @@ def yahoo_symbol(symbol: str, *, is_index: bool = False) -> str:
     """Yahoo's spelling of *symbol*; a bare index gets its caret (``^GSPC``).
 
     A venue-suffixed index (``000300.SS``) is already a Yahoo symbol and never
-    takes a caret.
+    takes a caret. A rate is ``EURUSD=X`` and a coin ``BTC-USD``, however it
+    arrives: on Yahoo the pair spelling ``EUR-USD`` is a defunct coin.
     """
     s = vendor_spelling(symbol)
-    if not is_index and (fx := _yahoo_fx_symbol(s)) is not None:  # DALTON-HOOK(market-data-fallback)
+    if is_index:
+        return s if s.startswith("^") or "." in s or "=" in s else f"^{s}"  # DALTON-HOOK(stock-move-upgrade)
+    if (fx := _yahoo_fx_symbol(s)) is not None:  # DALTON-HOOK(market-data-fallback)
         return fx
-    if not is_index or s.startswith("^") or "." in s or "=" in s:  # DALTON-HOOK(stock-move-upgrade)
-        return s
-    return f"^{s}"
+    try:
+        ref = to_canonical(s)
+    except ValueError:
+        return s  # a spelling the protocol refuses still gets to ask Yahoo
+    if ref.asset_class is AssetClass.FX:
+        return f"{ref.symbol.replace('-', '')}=X"
+    if ref.asset_class is AssetClass.CRYPTO:
+        return ref.symbol
+    return s
 
 
 def yahoo_ticker(symbol: str) -> yf.Ticker:
