@@ -25,14 +25,15 @@ def build_dalton_tools(
     """Return role-appropriate Dalton tools to bind onto the main agent (`DALTON-HOOK(dalton-tools)`).
 
     - `chief_of_staff` (Home / Research Director):
-      `dalton_coverage_board`, `dalton_record_plan`, `dalton_cross_unit_request` (coverage_units.enabled only), `dalton_coverage_unit` (coverage_units.enabled only), `dalton_agenda_note`, `dalton_watch_event`, `dalton_resolve_signals`, `dalton_schedule_automation`, `dalton_coverage_tracking`, `dalton_system_jobs`, `dalton_coverage`, `conversation_search` (internal/admin only), `check_language`, `ingest_company_wiki`, `dalton_check_done` (weekly-coverage-review, dalton-earnings-calendar only), `feishu_read`, `feishu_list_wiki`, `feishu_create_doc`, `feishu_append`, `feishu_grant_access`
+      `dalton_coverage_board`, `dalton_record_plan`, `dalton_cross_unit_request` (coverage_units.enabled only), `dalton_coverage_unit` (coverage_units.enabled only), `dalton_agenda_note`, `dalton_watch_event`, `dalton_resolve_signals`, `dalton_schedule_automation`, `dalton_coverage_tracking`, `dalton_system_jobs`, `dalton_coverage`, `dalton_notify_settings` (internal/admin only), `conversation_search` (internal/admin only), `check_language`, `ingest_company_wiki`, `dalton_check_done` (weekly-coverage-review, dalton-earnings-calendar only), `feishu_read`, `feishu_list_wiki`, `feishu_create_doc`, `feishu_append`, `feishu_grant_access`
     - `analyst` (Company workspace):
-      `knowledge_update`, `knowledge_append_verdict`, `dalton_check_done`, `check_draft`, `check_language`, `publish_report`, `ingest_company_wiki`, `dalton_schedule_automation`, `dalton_coverage_tracking`, `dalton_system_jobs`, `conversation_search` (internal/admin only), `feishu_read`, `feishu_list_wiki`, `feishu_create_doc`, `feishu_append`, `feishu_grant_access`
+      `knowledge_update`, `knowledge_append_verdict`, `dalton_check_done`, `check_draft`, `check_language`, `publish_report`, `ingest_company_wiki`, `dalton_schedule_automation`, `dalton_coverage_tracking`, `dalton_system_jobs`, `dalton_notify_settings` (internal/admin only), `conversation_search` (internal/admin only), `feishu_read`, `feishu_list_wiki`, `feishu_create_doc`, `feishu_append`, `feishu_grant_access`
 
     ``user_tier`` ("admin" | "internal" | "external") withholds
-    ``conversation_search`` from external members, who would only reach its
-    per-call refusal. None leaves the tool mounted (the refusal stays the
-    second line of defense for builds without a resolved tier).
+    ``conversation_search`` and ``dalton_notify_settings`` from external
+    members, who would only reach their per-call refusal. None leaves the
+    tools mounted (the refusal stays the second line of defense for builds
+    without a resolved tier).
 
     ``prepare_transcription`` mounts only when ``is_transcription_enabled()``
     is true (``DALTON_TRANSCRIPTION_ENABLED`` on and storage configured); with
@@ -53,11 +54,20 @@ def build_dalton_tools(
 
     tools: list[BaseTool] = []
 
-    # The team conversation archive is internal-only; an external member's
-    # every call would be refused at run time, so the tool is not mounted for
-    # them in the first place ("external" is also what a failed tier lookup
-    # resolves to — fail closed on mounting).
+    # The team conversation archive and Feishu group push settings are
+    # internal/admin-only; an external member's every call would be refused at
+    # run time, so the tools are not mounted for them in the first place
+    # ("external" is also what a failed tier lookup resolves to — fail closed
+    # on mounting).
     tier_mounts_conversation_search = user_tier is None or user_tier != "external"
+
+    if tier_mounts_conversation_search:
+        try:
+            from src.dalton.tools.notify_tools import create_notify_tools
+
+            tools.extend(create_notify_tools())
+        except Exception as e:
+            logger.debug("[DALTON_TOOLS] notify_tools not loaded: %s", e)
 
     if settings.enabled:
         try:

@@ -2133,23 +2133,23 @@ async def _resolve_feishu_bot_name() -> str | None:
 async def dalton_notify_feishu_bot_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
-    # notify-routes: the name exists only for the admin group card; the group
-    # discovery it accompanies is PM-only, so this stays PM-only too.
-    _require_notify_admin(user_id)
+    # notify-routes: the name exists for the Feishu group card; group discovery
+    # is restricted to internal/admin members, so this matches it.
+    await _require_notify_admin(user_id)
     app_name = await _resolve_feishu_bot_name()
     return {"ok": app_name is not None, "app_name": app_name}
 
 
-def _require_notify_admin(user_id: str | None) -> str:
-    """Group push is admin-managed: the same PM set `is_invite_pm` decides (DALTON_PM_USER_IDS)."""
+async def _require_notify_admin(user_id: str | None) -> str:
+    """Group push is available to internal and admin members (`get_user_tier`)."""
     _require_dalton_enabled()
-    from src.dalton.invites import is_invite_pm
+    from src.dalton.access_tiers import is_internal_or_admin
 
     uid = str(user_id or "").strip()
     if not uid:
         raise HTTPException(status_code=401, detail="Authentication required")
-    if not is_invite_pm(uid):
-        raise HTTPException(status_code=403, detail="仅管理员可管理飞书群推送")
+    if not await is_internal_or_admin(uid):
+        raise HTTPException(status_code=403, detail="外部成员不能使用飞书群推送")
     return uid
 
 
@@ -2158,7 +2158,7 @@ def _require_notify_admin(user_id: str | None) -> str:
 async def dalton_notify_feishu_groups_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
-    _require_notify_admin(user_id)
+    await _require_notify_admin(user_id)
     from src.dalton.notify.groups import FeishuGroupsUnavailable, discover_feishu_notify_groups
 
     try:
@@ -2175,95 +2175,9 @@ async def dalton_notify_test_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
     _require_dalton_enabled()
-    from src.dalton.llm.model_prefs import (
-        is_dalton_chat_target,
-        resolve_dalton_notify_target_labels,
-        resolve_dalton_notify_targets,
-    )
-    from src.dalton.notify.dispatch import post_bridge_notify
-    from src.dalton.notify.groups import FeishuGroupsUnavailable, discover_feishu_notify_groups
+    from src.dalton.notify.dispatch import send_dalton_notify_test
 
-    cleaned = body.target.strip()
-
-    if is_dalton_chat_target(cleaned):
-        # A group test is the admin's: the bot must already be in the group.
-        _require_notify_admin(user_id)
-        try:
-            groups = await discover_feishu_notify_groups()
-        except FeishuGroupsUnavailable:
-            raise HTTPException(
-                status_code=503, detail="飞书群列表暂时不可用，请稍后再试"
-            ) from None
-        by_id = {g["chat_id"]: g["name"] for g in groups}
-        chat_id = cleaned.split(":", 2)[-1]
-        if chat_id not in by_id:
-            raise HTTPException(
-                status_code=404,
-                detail="群不在机器人已加入的群列表中（请先把机器人拉进群，再刷新群列表）",
-            )
-        display = by_id[chat_id] or cleaned
-        labels: dict[str, str] = {}
-    else:
-        targets = await resolve_dalton_notify_targets(user_id)
-        if cleaned not in targets:
-            raise HTTPException(
-                status_code=404,
-                detail="目标不在当前推送目标列表中（只允许向本人已配置的目标发送测试）",
-            )
-        labels = await resolve_dalton_notify_target_labels(user_id)
-        display = labels.get(cleaned) or cleaned
-
-    card = {
-        "schema": "2.0",
-        "header": {
-            "title": {"tag": "plain_text", "content": "Dalton 推送测试"},
-            "template": "blue",
-        },
-        "body": {
-            "elements": [
-                {
-                    "tag": "markdown",
-                    "content": f"这是一条测试推送，用于确认该目标可用。目标：{display}",
-                }
-            ]
-        },
-    }
-    text_msg = f"Dalton 推送测试\n这是一条测试推送，用于确认该目标可用。目标：{display}"
-
-    res = await post_bridge_notify([cleaned], text_msg, card)
-    results = res.get("results") if isinstance(res, dict) else None
-    item = next(
-        (
-            r
-            for r in results
-            if isinstance(r, dict) and str(r.get("target") or "") == cleaned
-        ),
-        None,
-    ) if isinstance(results, list) else None
-    if item is not None and item.get("ok") is True:
-        return {"ok": True, "detail": None, "error_code": None}
-
-    error_code = "send_failed"
-    feishu_code = ""
-    feishu_msg = ""
-    log_id = ""
-    if isinstance(item, dict):
-        error_code = str(item.get("error") or error_code)
-        feishu_code = str(item.get("feishu_code") or "")
-        feishu_msg = str(item.get("feishu_msg") or "")
-        log_id = str(item.get("log_id") or "")
-    elif isinstance(res, dict):
-        # The bridge refused the whole request (non-2xx / bad shape): its own
-        # error_code is all this side knows.
-        error_code = str(res.get("error_code") or error_code)
-    detail = f"发送失败（{error_code}）"
-    if feishu_code:
-        detail = f"发送失败（飞书错误码 {feishu_code}）"
-    if feishu_msg:
-        detail = f"{detail}：{feishu_msg}"
-    if log_id:
-        detail = f"{detail}（log_id: {log_id}）"
-    return {"ok": False, "detail": detail, "error_code": error_code}
+    return await send_dalton_notify_test(user_id, body.target)
 
 
 @router.get("/search")

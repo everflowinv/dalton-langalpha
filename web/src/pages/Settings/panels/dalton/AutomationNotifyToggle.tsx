@@ -1,7 +1,9 @@
 import React from 'react';
+import { useQueryClient } from '@tanstack/react-query';
 import { ToggleSwitch } from '@/components/ui/switch';
 import { usePreferences } from '@/hooks/usePreferences';
 import { useUpdatePreferences } from '@/hooks/useUpdatePreferences';
+import { queryKeys } from '@/lib/queryKeys';
 import {
   modelPrefs,
   resolveDaltonAutomationNotifyState,
@@ -13,7 +15,9 @@ interface AutomationNotifyToggleProps {
   automation: Pick<
     Automation,
     'name' | 'dalton_notify_category' | 'dalton_notify_effective' | 'dalton_notify_source'
-  >;
+  > & {
+    automation_id?: string;
+  };
 }
 
 export function AutomationNotifyToggle({
@@ -21,6 +25,7 @@ export function AutomationNotifyToggle({
 }: AutomationNotifyToggleProps): React.ReactElement | null {
   const { preferences, isLoading, isLoaded } = usePreferences();
   const updatePreferences = useUpdatePreferences();
+  const queryClient = useQueryClient();
 
   if (!automation.dalton_notify_category) {
     return null;
@@ -32,17 +37,26 @@ export function AutomationNotifyToggle({
   const overrides = prefs.dalton_notify_overrides;
   const { enabled: taskEnabled } = resolveDaltonAutomationNotifyState(automation, overrides);
   const canInteract = prefsReady && masterEnabled;
+  const overrideKey =
+    automation.dalton_notify_category === 'custom' && automation.automation_id
+      ? `automation:${automation.automation_id}`
+      : automation.name;
 
   const handleToggle = () => {
     if (!canInteract) return;
     // Submit only the single changed key; backend deep-merges model_preference.dalton_notify_overrides.
-    void updatePreferences.mutateAsync(
-      splitPreferenceWrite({
-        dalton_notify_overrides: {
-          [automation.name]: !taskEnabled,
-        },
-      }),
-    );
+    void updatePreferences
+      .mutateAsync(
+        splitPreferenceWrite({
+          dalton_notify_overrides: {
+            [overrideKey]: !taskEnabled,
+          },
+        }),
+      )
+      .then(() => {
+        void queryClient.invalidateQueries({ queryKey: queryKeys.user.preferences() });
+        void queryClient.invalidateQueries({ queryKey: queryKeys.automations.all });
+      });
   };
 
   return (

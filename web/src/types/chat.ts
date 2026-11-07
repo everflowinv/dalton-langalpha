@@ -367,6 +367,8 @@ export interface ToolApprovalState {
   order?: OrderProposal | null;
   /** The reason typed on Reject, if any. */
   reason?: string | null;
+  // DALTON-HOOK(notify-routes): confirmation token bound to a Dalton notify action request.
+  confirmToken?: string;
 }
 
 export interface UserQuestionState {

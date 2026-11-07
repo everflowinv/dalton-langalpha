@@ -466,6 +466,8 @@ export interface ActionRequest {
   duplicate_workspace_id?: string;
   duplicate_workspace_name?: string;
   duplicate_check_unavailable?: boolean;
+  // DALTON-HOOK(notify-routes): confirmation token bound to a Dalton notify action request.
+  confirm_token?: string;
 }
 
 export interface InterruptEvent extends BaseSSEEvent {

@@ -16,9 +16,9 @@ interface GroupTestState {
   detail: string | null;
 }
 
-/** Admin-only group push. No auth context is read: the group list endpoint is
- *  itself the PM gate — 403 means "not an admin" and the card stays away; any
- *  other failure still shows the card (with its refresh) to an admin. */
+/** Internal/admin group push. No auth context is read: the group list endpoint is
+ *  itself the tier gate — 403 means "external member" and the card stays away; any
+ *  other failure still shows the card (with its refresh) to internal/admin members. */
 export function DaltonFeishuGroupsCard(): React.ReactElement | null {
   const [testStates, setTestStates] = useState<Record<string, GroupTestState>>({});
 

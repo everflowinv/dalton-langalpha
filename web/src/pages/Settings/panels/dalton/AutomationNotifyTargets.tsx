@@ -1,5 +1,5 @@
-import React, { useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import React, { useEffect, useRef, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { Check, ChevronDown } from 'lucide-react';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
@@ -11,7 +11,12 @@ import { fetchDaltonFeishuGroups, type DaltonFeishuGroup } from '@/pages/Setting
 import type { Automation } from '@/types/automation';
 
 interface AutomationNotifyTargetsProps {
-  automation: Pick<Automation, 'name' | 'dalton_notify_category'>;
+  automation: Pick<
+    Automation,
+    'name' | 'dalton_notify_category' | 'dalton_notify_route_targets'
+  > & {
+    automation_id?: string;
+  };
 }
 
 type NotifyRoutes = Record<string, string[] | null>;
@@ -20,16 +25,28 @@ function isChatTarget(target: string): boolean {
   return target.startsWith('feishu:chat:');
 }
 
-/** The route entry a task resolves to, with the backend's own key precedence:
- *  exact name, lowercased name, `category:<cat>`, bare category. `null` means
- *  no route (personal targets only). An entry that exists but is not a list is
- *  skipped, exactly as `resolve_notify_route_targets` skips it. */
+/** The route entry a task resolves to:
+ *  For custom tasks, uses `dalton_notify_route_targets` returned directly by
+ *  the automations list endpoint (never the stale preference cache). For
+ *  inherent categories, resolves via exact name, lowercased name,
+ *  `category:<cat>`, bare category. `null` means no route (personal targets only). */
 export function resolveNotifyRouteEntry(
-  automation: Pick<Automation, 'name' | 'dalton_notify_category'>,
+  automation: Pick<
+    Automation,
+    'name' | 'dalton_notify_category' | 'dalton_notify_route_targets'
+  > & {
+    automation_id?: string;
+  },
   routes: NotifyRoutes,
 ): { list: string[]; source: 'task' | 'category' } | null {
   const category = automation.dalton_notify_category;
   if (!category) return null;
+  if (category === 'custom') {
+    if (Array.isArray(automation.dalton_notify_route_targets)) {
+      return { list: automation.dalton_notify_route_targets, source: 'task' };
+    }
+    return { list: [], source: 'task' };
+  }
   const name = automation.name.trim();
   const candidates: Array<[string, 'task' | 'category']> = [
     [name, 'task'],
@@ -74,8 +91,27 @@ export function AutomationNotifyTargets({
 }: AutomationNotifyTargetsProps): React.ReactElement | null {
   const { preferences, isLoading, isLoaded } = usePreferences();
   const updatePreferences = useUpdatePreferences();
+  const queryClient = useQueryClient();
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
+  const [localCustomTargets, setLocalCustomTargets] = useState<string[] | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  // One save at a time: a second tick while the first is out would capture an
+  // unconfirmed list, and a failure would roll back to it.
+  const [saving, setSaving] = useState(false);
+  // The last route the server confirmed for this task: a successful save's list
+  // until the task list response catches up, else null (the response's own).
+  const confirmedRef = useRef<string[] | null>(null);
+
+  // A fresh route from the server replaces the local edit; the error of a
+  // failed save stays until the panel shows another task.
+  useEffect(() => {
+    setLocalCustomTargets(null);
+    confirmedRef.current = null;
+  }, [automation.automation_id, automation.dalton_notify_route_targets]);
+  useEffect(() => {
+    setSaveError(null);
+  }, [automation.automation_id]);
 
   const prefsReady = Boolean(isLoaded) && !isLoading;
   const prefs = modelPrefs(preferences);
@@ -85,34 +121,56 @@ export function AutomationNotifyTargets({
     : [];
   const labels = prefs.dalton_notify_target_labels ?? {};
   const routes = (prefs.dalton_notify_routes ?? {}) as NotifyRoutes;
+  const isCustom = automation.dalton_notify_category === 'custom';
 
-  // The route this task resolves to (task key first, then category), the same
-  // precedence the server applies at delivery time.
-  const routeEntry = resolveNotifyRouteEntry(automation, routes);
+  // The route this task resolves to: for custom tasks, uses the API-returned
+  // dalton_notify_route_targets (or local edit state while refetch is in flight)
+  // rather than the preference cache.
+  const effectiveAutomation =
+    isCustom && localCustomTargets !== null
+      ? { ...automation, dalton_notify_route_targets: localCustomTargets }
+      : automation;
+  const routeEntry = resolveNotifyRouteEntry(effectiveAutomation, routes);
   const routeList = routeEntry ? routeEntry.list : [];
   const inheritsCategory = routeEntry?.source === 'category';
-  // Stale caches may name deleted personal targets; they drop out here as on
-  // the server. An explicit empty route ([] = deliver nowhere) stays a list —
-  // only a missing entry means "no route".
+  const serverRoutePersonal =
+    isCustom && Array.isArray(automation.dalton_notify_route_targets)
+      ? automation.dalton_notify_route_targets.filter((t) => !isChatTarget(t))
+      : [];
+  // For custom tasks, checked personal targets come directly from the server
+  // route (never filtered against a potentially stale preference cache). For
+  // inherent categories, stale caches may name deleted personal targets; they
+  // drop out here as on the server. An explicit empty route ([] = deliver
+  // nowhere) stays a list — only a missing entry means "no route".
   const selectedPersonal: string[] | null = routeEntry
-    ? routeList.filter((t) => targets.includes(t))
+    ? routeList.filter((t) => (isCustom ? !isChatTarget(t) : targets.includes(t)))
     : null;
   const selectedChats: string[] = routeEntry ? routeList.filter((t) => isChatTarget(t)) : [];
+  const personalOptions = isCustom
+    ? Array.from(
+        new Set([
+          ...targets,
+          ...serverRoutePersonal,
+          ...(selectedPersonal ?? []),
+        ]),
+      )
+    : targets;
 
-  // The group list is itself the PM gate: the endpoint answers 403 for a
-  // non-admin, and no auth context is read here — a render without
+  // The group list is itself the tier gate: the endpoint answers 403 for an
+  // external member, and no auth context is read here — a render without
   // AuthProvider (upstream page tests) degrades to personal-targets-only
   // instead of throwing. It is fetched when the selector opens, when a saved
   // route names groups (the collapsed label needs their names), or when there
   // is no personal target at all (groups are then the only thing to select).
   // The request needs a pushable task and the switches on, but not the
-  // groups themselves: an admin with no personal targets is only known to be
-  // selectable once the fetch answers, so `groups` stays out of this gate.
+  // groups themselves: an internal/admin member with no personal targets is
+  // only known to be selectable once the fetch answers, so `groups` stays out
+  // of this gate.
   const mayQuery =
     Boolean(automation.dalton_notify_category) &&
     prefsReady &&
     masterEnabled &&
-    (open || selectedChats.length > 0 || targets.length === 0);
+    (open || selectedChats.length > 0 || personalOptions.length === 0);
   const groupsQuery = useQuery({
     queryKey: queryKeys.dalton.feishuGroups(),
     queryFn: fetchDaltonFeishuGroups,
@@ -138,17 +196,25 @@ export function AutomationNotifyTargets({
   const canInteract =
     prefsReady &&
     masterEnabled &&
-    (targets.length > 0 || groups.length > 0 || routeEntry !== null);
+    (personalOptions.length > 0 || groups.length > 0 || routeEntry !== null);
 
   if (!canInteract) {
     return null;
   }
 
+  const routeKey =
+    isCustom && automation.automation_id
+      ? `automation:${automation.automation_id}`
+      : automation.name;
+
   const toggleTarget = (target: string) => {
+    if (saving) return;
     const isChat = isChatTarget(target);
-    // With no route of its own (or a category one), the task currently
-    // reaches every personal target — that is the baseline being edited.
-    const basePersonal = selectedPersonal ?? targets;
+    // With no route of its own (or a category one), an inherent-category task
+    // currently reaches every personal target — that is the baseline being edited.
+    // A custom task without an explicit route reaches nothing; with a server route,
+    // its baseline preserves all existing route entries (personal + chat).
+    const basePersonal = selectedPersonal ?? (isCustom ? [] : targets);
     const baseChats = selectedChats;
     const nextPersonal = isChat
       ? basePersonal
@@ -163,13 +229,35 @@ export function AutomationNotifyTargets({
     // Every edit saves an explicit task-level list, never null: null would
     // fall back to the category route (or all personal targets) and undo the
     // edit. An emptied list stays [] — "deliver nowhere".
-    void updatePreferences.mutateAsync(
-      splitPreferenceWrite({
-        dalton_notify_routes: {
-          [automation.name]: [...nextPersonal, ...nextChats],
-        },
-      }),
-    );
+    const nextRoute = [...nextPersonal, ...nextChats];
+    setSaveError(null);
+    setSaving(true);
+    if (isCustom) {
+      setLocalCustomTargets(nextRoute);
+    }
+    void updatePreferences
+      .mutateAsync(
+        splitPreferenceWrite({
+          dalton_notify_routes: {
+            [routeKey]: nextRoute,
+          },
+        }),
+      )
+      .then(() => {
+        if (isCustom) confirmedRef.current = nextRoute;
+        void queryClient.invalidateQueries({ queryKey: queryKeys.user.preferences() });
+        void queryClient.invalidateQueries({ queryKey: queryKeys.automations.all });
+      })
+      .catch((err: unknown) => {
+        // Back to the route the server last confirmed: an earlier save that
+        // succeeded before the list caught up, else the list response's.
+        if (isCustom) {
+          setLocalCustomTargets(confirmedRef.current);
+        }
+        const detail = err instanceof Error && err.message ? err.message : '';
+        setSaveError(detail ? `保存推送目标失败：${detail}` : '保存推送目标失败');
+      })
+      .finally(() => setSaving(false));
   };
 
   const row = (
@@ -187,7 +275,9 @@ export function AutomationNotifyTargets({
       aria-checked={checked}
       aria-label={testName}
       onClick={onToggle}
-      className="flex items-start gap-2 rounded px-2 py-1.5 text-left text-xs hover:bg-popover"
+      disabled={saving}
+      aria-busy={saving}
+      className="flex items-start gap-2 rounded px-2 py-1.5 text-left text-xs hover:bg-popover disabled:opacity-60"
     >
       <span
         aria-hidden="true"
@@ -249,10 +339,10 @@ export function AutomationNotifyTargets({
             个人目标
           </p>
           <div className="flex flex-col">
-            {targets.map((target) =>
+            {personalOptions.map((target) =>
               row(
                 target,
-                labels[target] || '未命名目标',
+                labels[target] || (targets.includes(target) ? '未命名目标' : target),
                 target,
                 // No route of its own means every personal target is reached;
                 // the checks say what delivery actually does.
@@ -297,8 +387,28 @@ export function AutomationNotifyTargets({
               </div>
             </>
           )}
+          {saveError && (
+            <p
+              role="alert"
+              className="px-2 pt-1.5 pb-0.5 text-[11px]"
+              style={{ color: 'var(--color-loss)' }}
+              data-testid="dalton-notify-save-error"
+            >
+              {saveError}
+            </p>
+          )}
         </PopoverContent>
       </Popover>
+      {!open && saveError && (
+        <span
+          role="alert"
+          className="ml-1.5 text-[11px]"
+          style={{ color: 'var(--color-loss)' }}
+          data-testid="dalton-notify-save-error"
+        >
+          {saveError}
+        </span>
+      )}
     </div>
   );
 }

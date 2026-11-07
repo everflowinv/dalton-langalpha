@@ -16,12 +16,14 @@ import type {
 } from '@/types/chat';
 import type { SetMessages } from '../types';
 import { setCardFields, setCardStatus } from './buckets';
-import type { DecisionTarget } from './toolApprovalCard';
+import { getDaltonConfirmToken, type DecisionTarget } from './toolApprovalCard';
 
 /** One answered call: which stopped call it answers, and the verdict. */
 export interface ToolApprovalSlot {
   target: DecisionTarget;
   decision: HitlDecisionBody;
+  // DALTON-HOOK(notify-routes): optional confirm_token for Dalton notify cards.
+  confirmToken?: string;
 }
 
 /** One click on an approval card, before the board derives anything from it. */
@@ -29,6 +31,8 @@ export interface ApprovalClick {
   approved: boolean;
   /** The reject reason the user typed, if any. */
   message?: string;
+  // DALTON-HOOK(notify-routes): optional confirm_token for Dalton notify cards.
+  confirmToken?: string;
 }
 
 /**
@@ -43,10 +47,19 @@ export interface ApprovalClick {
 export function buildToolApprovalResumeEntry(
   slots: Array<ToolApprovalSlot | undefined>,
 ): HitlResumeEntry {
-  const decisions = slots.map((slot) => slot?.decision ?? { type: 'reject' });
+  // DALTON-HOOK(notify-routes): echo confirm_token on approved Dalton notify slots only.
+  const withToken = (slot: ToolApprovalSlot | undefined): HitlDecisionBody => {
+    if (!slot) return { type: 'reject' };
+    const token = slot.decision.confirm_token ?? slot.confirmToken ?? slot.target.confirmToken;
+    if (slot.decision.type === 'approve' && token) {
+      return { ...slot.decision, confirm_token: token };
+    }
+    return slot.decision;
+  };
+  const decisions = slots.map(withToken);
   const keyed: Record<string, HitlDecisionBody> = {};
   for (const slot of slots) {
-    if (slot?.target.kind === 'attempt') keyed[slot.target.attemptId] = slot.decision;
+    if (slot?.target.kind === 'attempt') keyed[slot.target.attemptId] = withToken(slot);
   }
   return Object.keys(keyed).length > 0 ? { decisions, order_decisions: keyed } : { decisions };
 }
@@ -185,12 +198,30 @@ export function createAnswerBoard(deps: AnswerBoardDeps): AnswerBoard {
       const width = Math.max(1, position.count);
       const index = Math.min(Math.max(0, position.index), width - 1);
       const { status, reason, body } = decisionOf(click);
-      deps.setMessages((prev) => setCardFields(prev, 'toolApprovals', approvalId, { status, reason }));
+      // DALTON-HOOK(notify-routes): attach confirm_token from card state when approving a Dalton notify request.
+      let confirmToken = click.confirmToken ?? getDaltonConfirmToken(approvalId, interruptId, index);
+      deps.setMessages((prev) => {
+        if (!confirmToken) {
+          for (const m of prev) {
+            if (m.role === 'assistant') {
+              const card = (m as AssistantMessage).toolApprovals?.[approvalId];
+              if (card?.confirmToken) {
+                confirmToken = card.confirmToken;
+                break;
+              }
+            }
+          }
+        }
+        return setCardFields(prev, 'toolApprovals', approvalId, { status, reason });
+      });
 
       const slots = partials[interruptId] || new Array(width).fill(undefined);
       slots[index] = {
-        target: attemptId ? { kind: 'attempt', attemptId, index } : { kind: 'position', index },
+        target: attemptId
+          ? { kind: 'attempt', attemptId, index, ...(confirmToken ? { confirmToken } : {}) }
+          : { kind: 'position', index, ...(confirmToken ? { confirmToken } : {}) },
         decision: body,
+        ...(confirmToken ? { confirmToken } : {}),
       };
       partials[interruptId] = slots;
       // The resume answers every call the interrupt raised, in the order it

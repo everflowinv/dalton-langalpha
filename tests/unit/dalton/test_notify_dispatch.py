@@ -2178,3 +2178,147 @@ async def test_per_task_overrides_and_shared_notify_state() -> None:
     assert resp_non_pushable.dalton_notify_effective is None
     assert resp_non_pushable.dalton_notify_source is None
     assert callable(claim_execution_notify)
+
+
+@pytest.mark.asyncio
+async def test_resolve_and_populate_automation_notify_state_custom_routed_and_business_tag() -> None:
+    """Round 3 #3 & #4: custom automations with an explicit non-empty
+    automation:<id> route return category='custom' and respect
+    overrides['automation:<id>']; custom category maps to ('定时任务', 'indigo')."""
+    from src.dalton.notify.dispatch import (
+        NotifyClassification,
+        build_feishu_notify_card,
+        evaluate_user_notify_eligibility,
+        map_category_to_business_tag,
+        resolve_dalton_notify_routes,
+    )
+
+    assert map_category_to_business_tag("custom") == ("定时任务", "indigo")
+    custom_card = build_feishu_notify_card(
+        NotifyClassification(
+            category="custom",
+            label_zh="定时任务",
+            scope="Morning Macro Digest",
+        ),
+        verdict_word=None,
+        final_text="## 结论\n早报结论。",
+        thread_id="th-custom",
+        frontend_base_url="https://dalton.example.com",
+    )
+    assert (
+        custom_card["header"]["text_tag_list"][0]["text"]["content"] == "定时任务"
+    )
+
+    custom_id = str(uuid4())
+    custom_auto = {"automation_id": custom_id, "name": "Morning Macro Digest"}
+
+    # Unrouted -> (None, False, None); explicit empty route [] -> still ("custom", True, "default")
+    assert resolve_automation_notify_state(custom_auto, {}, {}) == (
+        None,
+        False,
+        None,
+    )
+    assert resolve_automation_notify_state(
+        custom_auto, {}, {f"automation:{custom_id}": []}
+    ) == ("custom", True, "default")
+    assert resolve_automation_notify_state(
+        custom_auto,
+        {f"automation:{custom_id}": False},
+        {f"automation:{custom_id}": []},
+    ) == ("custom", False, "task")
+
+    # Explicit non-empty route under automation:<id> -> ("custom", True, "default")
+    routes = {f"automation:{custom_id}": ["feishu:chat:oc_macro"]}
+    assert resolve_automation_notify_state(
+        custom_auto,
+        {"Morning Macro Digest": False},
+        routes,
+    ) == ("custom", True, "default")
+
+    # Override under automation:<id> controls the switch
+    assert resolve_automation_notify_state(
+        custom_auto,
+        {f"automation:{custom_id}": False},
+        routes,
+    ) == ("custom", False, "task")
+
+    now = datetime.now(UTC)
+    resp_custom = AutomationResponse.model_validate(
+        {
+            "automation_id": custom_id,
+            "user_id": "u-1",
+            "name": "Morning Macro Digest",
+            "trigger_type": "cron",
+            "cron_expression": "0 8 * * 1-5",
+            "timezone": "Asia/Shanghai",
+            "instruction": "Run morning macro digest.",
+            "thread_strategy": "new",
+            "status": "active",
+            "max_failures": 3,
+            "failure_count": 0,
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    overrides_fn = create_autospec(
+        resolve_dalton_notify_overrides,
+        return_value={f"automation:{custom_id}": False},
+    )
+    routes_fn = create_autospec(
+        resolve_dalton_notify_routes,
+        return_value=routes,
+    )
+    await populate_automation_notify_state(
+        "u-1",
+        [resp_custom],
+        resolve_overrides_fn=overrides_fn,
+        resolve_routes_fn=routes_fn,
+    )
+    assert resp_custom.dalton_notify_category == "custom"
+    assert resp_custom.dalton_notify_effective is False
+    assert resp_custom.dalton_notify_source == "task"
+    assert resp_custom.dalton_notify_route_targets == ["feishu:chat:oc_macro"]
+
+    # Empty route [] on custom task still populates category='custom' and route_targets=[], while delivery remains suppressed
+    empty_routes_fn = create_autospec(
+        resolve_dalton_notify_routes,
+        return_value={f"automation:{custom_id}": []},
+    )
+    await populate_automation_notify_state(
+        "u-1",
+        [resp_custom],
+        resolve_overrides_fn=create_autospec(
+            resolve_dalton_notify_overrides, return_value={}
+        ),
+        resolve_routes_fn=empty_routes_fn,
+    )
+    assert resp_custom.dalton_notify_category == "custom"
+    assert resp_custom.dalton_notify_effective is True
+    assert resp_custom.dalton_notify_source == "default"
+    assert resp_custom.dalton_notify_route_targets == []
+    allowed_empty, reason_empty, targets_empty = (
+        await evaluate_user_notify_eligibility(
+            "u-1",
+            custom_auto,
+            resolve_enabled_fn=create_autospec(
+                resolve_dalton_notify_enabled, return_value=True
+            ),
+            resolve_overrides_fn=create_autospec(
+                resolve_dalton_notify_overrides, return_value={}
+            ),
+            resolve_targets_fn=create_autospec(
+                resolve_dalton_notify_targets,
+                return_value=["feishu:user:ou_me_1"],
+            ),
+            resolve_routes_fn=empty_routes_fn,
+            is_admin_fn=create_autospec(
+                resolve_dalton_notify_enabled, return_value=True
+            ),
+        )
+    )
+    assert (allowed_empty, reason_empty, targets_empty) == (
+        False,
+        "target_removed",
+        [],
+    )
+
