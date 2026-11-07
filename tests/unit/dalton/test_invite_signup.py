@@ -2060,10 +2060,14 @@ async def test_p2_external_member_public_sharing_blocked_while_close_and_public_
     )
 
     # #666 moved the file-share enable side onto the artifact routes; the
-    # external-member gate travels with it (publish / keep_updated=True).
+    # external-member gate travels with it (publish / keep_updated=True / left-out).
     from src.dalton import access_tiers as dalton_access_tiers
     from src.server.app.artifacts import records as artifact_records_app
-    from src.server.app.artifacts.models import KeepUpdatedRequest, PublishRequest
+    from src.server.app.artifacts.models import (
+        KeepUpdatedRequest,
+        LeftOutRequest,
+        PublishRequest,
+    )
     from src.server.database import artifacts as artifacts_db
 
     monkeypatch.setenv("DALTON_ARTIFACT_PUBLISHING_ENABLED", "1")
@@ -2210,6 +2214,35 @@ async def test_p2_external_member_public_sharing_blocked_while_close_and_public_
         x_user_id=internal_a,
     )
     assert int_keep_resp.artifact_id == artifact_int.artifact_id
+
+    # 3b. External member is refused on set_file_left_out (403); internal member allowed.
+    set_left_out = create_autospec(
+        artifacts_db.set_left_out,
+        side_effect=lambda *, user_id, artifact_id, path, left_out, cap: (
+            dataclasses.replace(
+                artifacts_by_id[artifact_id],
+                left_out_files=(path,) if left_out else (),
+            )
+        ),
+    )
+    monkeypatch.setattr(artifacts_db, "set_left_out", set_left_out)
+    with pytest.raises(HTTPException) as exc_ext_left_out:
+        await artifact_records_app.set_file_left_out(
+            artifact_ext.artifact_id,
+            LeftOutRequest(path="extra.md", left_out=True),
+            x_user_id=external_u,
+        )
+    assert exc_ext_left_out.value.status_code == 403
+    assert exc_ext_left_out.value.detail == "外部成员不能创建公开分享链接"
+    set_left_out.assert_not_called()
+
+    int_left_out_resp = await artifact_records_app.set_file_left_out(
+        artifact_int.artifact_id,
+        LeftOutRequest(path="extra.md", left_out=True),
+        x_user_id=internal_a,
+    )
+    assert int_left_out_resp.artifact_id == artifact_int.artifact_id
+    set_left_out.assert_awaited_once()
 
     # 4. update_share_link: sharing a file now names the artifact to publish
     #    (409 publish_required, internal and external alike); closing an

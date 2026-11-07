@@ -15,7 +15,7 @@ from __future__ import annotations
 import hashlib
 import re
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, create_autospec
 
 import pytest
 
@@ -53,6 +53,8 @@ def _row(**overrides) -> dict:
         "revision": 0,
         "created_at": _NOW,
         "legacy_refused": None,
+        "loaded_files": [],
+        "left_out_files": [],
         "comment_destination": None,
     }
     return {**row, **overrides}
@@ -131,13 +133,18 @@ async def test_a_legacy_first_cut_keeps_the_owners_keep_updated_off(
     monkeypatch.setattr(
         versions,
         "lock_owned",
-        AsyncMock(
+        create_autospec(
+            versions.lock_owned,
             return_value=artifacts.artifact_from_row(
                 _row(keep_updated=False, shared_at=_NOW)
-            )
+            ),
         ),
     )
-    monkeypatch.setattr(versions, "_prune_kept_updated", AsyncMock())
+    monkeypatch.setattr(
+        versions,
+        "_prune_kept_updated",
+        create_autospec(versions._prune_kept_updated),
+    )
     mock_cursor.fetchone = fetchone
 
     result = await artifacts.publish_version(
