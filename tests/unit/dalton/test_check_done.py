@@ -37,6 +37,9 @@ from src.dalton.auth import (
 from src.dalton.database.coverage import (
     get_earnings_calendar_mirror as _REAL_GET_MIRROR,
 )
+from src.dalton.database.knowledge import (
+    latest_valid_version as _REAL_LATEST_VALID_VERSION,
+)
 from src.dalton.database.publications import (
     list_pending_for_workspace as _REAL_LIST_PENDING,
 )
@@ -224,19 +227,33 @@ def _patch_knowledge(
     *,
     start_epochs: dict[str, int | None] | None = None,
     thread_start_epoch: int | None = DEFAULT_START_EPOCH,
+    thesis_doc: dict[str, Any] | None = None,
+    thesis_version_no: int = 1,
+    thesis_missing: bool = False,
+    thesis_source: str = "tool",
+    thesis_created_at: datetime | None = None,
+    doc_timestamps: dict[str, datetime | int | float] | None = None,
 ) -> None:
     """Patch the version query: ``docs`` are the ones with a tool version.
 
     The connection and cursor are spec'd against psycopg's real async types;
     the rows are (doc_key,) tuples, the shape the query fetches. Single-row
     start-epoch lookups answer strictly by the bound ``run_id`` / ``thread_id``
-    parameter value (never by SQL text)."""
+    parameter value (never by SQL text). When ``doc_timestamps`` is supplied,
+    ``_fetchall`` filters ``docs`` by ``created_at >= since`` against the bound
+    ``since`` parameter passed to ``cursor.execute``."""
     epochs_by_id: dict[str, int | None] = {"short-1": thread_start_epoch}
     if start_epochs is not None:
         epochs_by_id.update(start_epochs)
 
     cursor = create_autospec(psycopg.AsyncCursor, instance=True)
     last_id: dict[str, str | None] = {"value": None}
+    last_since: dict[str, datetime | None] = {"value": None}
+
+    def _to_utc_dt(val: datetime | int | float) -> datetime:
+        if isinstance(val, datetime):
+            return val if val.tzinfo is not None else val.replace(tzinfo=timezone.utc)
+        return datetime.fromtimestamp(float(val), tz=timezone.utc)
 
     async def _execute(_query: Any = "", params: Any = None, **_kwargs: Any) -> None:
         if (
@@ -245,10 +262,26 @@ def _patch_knowledge(
             and isinstance(params[0], str)
         ):
             last_id["value"] = params[0]
+            last_since["value"] = None
+        elif (
+            isinstance(params, (tuple, list))
+            and len(params) == 3
+            and isinstance(params[2], datetime)
+        ):
+            last_id["value"] = None
+            last_since["value"] = params[2]
         else:
             last_id["value"] = None
+            last_since["value"] = None
 
     async def _fetchall() -> list[tuple[str]]:
+        since_dt = last_since["value"]
+        if doc_timestamps is not None and since_dt is not None:
+            return [
+                (doc,)
+                for doc in docs
+                if doc in doc_timestamps and _to_utc_dt(doc_timestamps[doc]) >= since_dt
+            ]
         return [(doc,) for doc in docs]
 
     async def _fetchone() -> tuple[int] | None:
@@ -274,6 +307,39 @@ def _patch_knowledge(
         yield conn
 
     monkeypatch.setattr(check_done_tools, "get_db_connection", _get_db_connection)
+    if "thesis" in docs or thesis_doc is not None:
+        from src.dalton.database import knowledge as db_knowledge
+
+        default_thesis = (
+            thesis_doc
+            if thesis_doc is not None
+            else {
+                "schema_version": 2,
+                "house_view": {"stance": "neutral", "conviction": "low"},
+                "underwriting": {
+                    "scenario_version": 1,
+                    "anchor": {"price": 100.0, "price_at": "2026-10-23", "currency": "USD"},
+                },
+            }
+        )
+        monkeypatch.setattr(
+            db_knowledge,
+            "latest_valid_version",
+            create_autospec(
+                _REAL_LATEST_VALID_VERSION,
+                return_value=(
+                    None
+                    if thesis_missing
+                    else {
+                        "version_no": thesis_version_no,
+                        "source": thesis_source,
+                        "schema_valid": True,
+                        "created_at": thesis_created_at or datetime.now(timezone.utc),
+                        "content": default_thesis,
+                    }
+                ),
+            ),
+        )
 
 
 def _patch_knowledge_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -399,9 +465,50 @@ def _patch_verdicts(
 IC_DOCS = ["company", "thesis", "debate", "drivers", "management", "agenda"]
 
 
+DEFAULT_IC_QUESTIONS = (
+    "# 初次覆盖 12 问工作底稿\n\n"
+    + "\n".join(f"## Q{i}. 问题 {i}\n- 当前判断：有判断。\n" for i in range(1, 13))
+    + "底稿内容" * 80
+)
+DEFAULT_IC_DRAFT = (
+    "# 初筛\n\n"
+    "## 摘要\n摘要判断。\n\n"
+    "## 公司与商业模式\n商业模式。\n\n"
+    "## 核心投资逻辑与主要分歧\n分歧分析。\n\n"
+    "## 估值与赔率\n估值赔率。\n\n"
+    "## 风险\n风险机制。\n\n"
+    "## 管理层与资本配置\n管理层。\n\n"
+    "## 研究议程与跟踪\n跟踪议程。\n\n"
+    "## 引用\n[引用1]: evidence:E-20261023-01 （法定财报｜Meta｜10-K｜2026-02-01｜id）\n"
+    + "内容" * 300
+)
+
+
+DEFAULT_IC_PROPOSAL = json.dumps(
+    {
+        "company": [{"op": "append", "value": "x" * 40}],
+        "thesis": [
+            {
+                "op": "create",
+                "value": {
+                    "house_view": {"stance": "neutral", "conviction": "low"},
+                    "underwriting": {"scenario_version": 1},
+                },
+            }
+        ],
+    },
+    ensure_ascii=False,
+)
+DEFAULT_IC_UNDERWRITING_SUMMARY = (
+    "已保存 thesis 版本 1\n"
+    "赔率计算摘要（立场：中性，期限：18 个月）：\n"
+    "- 三情景价格区间（当前 100.00 USD）：悲观 75–85 / 基准 95–105 / 乐观 120–130\n"
+)
+
+
 def _full_files(
     *,
-    draft: str = "# 初筛\n" + "内容" * 400,
+    draft: str = DEFAULT_IC_DRAFT,
     audit_hash: str | None = None,
     with_review_pass: bool = True,
 ) -> dict[str, str]:
@@ -414,9 +521,9 @@ def _full_files(
         "research/2026-10-23-ic/valuation.md": "估值" * 200,
         "research/2026-10-23-ic/comps.xlsx": "x" * 1200,
         "research/2026-10-23-ic/bullbear-quick.md": "多空" * 200,
-        "research/2026-10-23-ic/knowledge-proposal.json": json.dumps(
-            {"company": [{"op": "append", "value": "x" * 40}]}
-        ),
+        "research/2026-10-23-ic/questions.md": DEFAULT_IC_QUESTIONS,
+        "research/2026-10-23-ic/knowledge-proposal.json": DEFAULT_IC_PROPOSAL,
+        "research/2026-10-23-ic/underwriting-summary.md": DEFAULT_IC_UNDERWRITING_SUMMARY,
         DRAFT: draft,
     }
     digest = audit_hash or _draft_hash(draft)
@@ -472,6 +579,653 @@ async def test_all_satisfied_reports_done(monkeypatch: pytest.MonkeyPatch) -> No
     )
     assert result["done"], result
     assert result["missing"] == []
+
+
+@pytest.mark.asyncio
+async def test_initial_coverage_missing_single_track_sections_and_inline_q_headings_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bad_draft = (
+        "# 初筛\n\n"
+        "## 公司与商业模式\n商业模式放在了第一个二级标题。\n\n"
+        + "\n".join(f"### Q{i}. 第 {i} 题标题？\n不该出现在正文。\n" for i in range(1, 7))
+        + "\n## 摘要\n摘要判断放在后面。\n\n"
+        "## 引用\n[引用1]: evidence:E-20261023-01 （法定财报｜Meta｜10-K｜2026-02-01｜id）\n"
+        + "内容" * 300
+    )
+    files = _full_files(draft=bad_draft)
+    _patch_knowledge(monkeypatch, IC_DOCS)
+    _patch_verdicts(monkeypatch, [_verdict_row("NEW_THESIS")])
+
+    result = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert not result["done"]
+    assert any(
+        "12 问逐条写进了正文" in item and "不得逐条列 Q1–Q12" in item
+        for item in result["missing"]
+    )
+    assert any(
+        "第一个二级标题必须是摘要" in item
+        for item in result["missing"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_initial_coverage_questions_md_missing_q_numbers_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    files = _full_files()
+    incomplete_q = (
+        "# 初次覆盖 12 问工作底稿\n\n"
+        + "\n".join(f"## Q{i}. 问题 {i}\n- 当前判断：有判断。\n" for i in range(1, 11))
+        + "底稿内容" * 80
+    )
+    files["research/2026-10-23-ic/questions.md"] = incomplete_q
+    files["research/2026-10-23-ic/questions.md.language.json"] = _language_json(
+        incomplete_q
+    )
+    _patch_knowledge(monkeypatch, IC_DOCS)
+    _patch_verdicts(monkeypatch, [_verdict_row("NEW_THESIS")])
+
+    result = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert not result["done"]
+    assert any(
+        "questions.md" in item and "Q11" in item and "Q12" in item
+        for item in result["missing"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_initial_coverage_legacy_in_flight_draft_passes_under_old_rules(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    legacy_draft = (
+        "# 初筛\n\n"
+        "## 核心判断（≤3 句）\n旧版核心判断。\n\n"
+        "## 一、12 问初筛\n"
+        + "\n".join(f"### Q{i}. 问题 {i}\n- 当前判断：有判断。\n" for i in range(1, 13))
+        + "\n## 二、业务与行业\n业务。\n"
+        "## 三、股价与估值\n估值。\n"
+        "## 四、当前 debate\n分歧。\n"
+        "## 五、叙事演绎与预期差\n预期差。\n"
+        "## 六、财务镜头\n财务镜头。\n"
+        "## 七、初始 thesis 草案\n支柱。\n"
+        "## 八、研究议程\n议程。\n"
+        "## 引用\n[引用1]: evidence:E-20261023-01 （法定财报｜Meta｜10-K｜2026-02-01｜id）\n"
+        + "内容" * 300
+    )
+    files = _full_files(draft=legacy_draft)
+    # In-flight legacy run did not have a separate questions.md or underwriting-summary.md file,
+    # and the legacy draft already existed when this run started (recorded in 草稿探测.json).
+    del files["research/2026-10-23-ic/questions.md"]
+    del files["research/2026-10-23-ic/questions.md.language.json"]
+    del files["research/2026-10-23-ic/underwriting-summary.md"]
+    files[".agents/threads/short-1/workflows/task-run-1/journal/草稿探测.json"] = json.dumps(
+        {
+            "label": "草稿探测",
+            "dispatches": [
+                {
+                    "label": "草稿探测",
+                    "status": "pending",
+                    "seq": 1,
+                    "recorded_at": 1.0,
+                },
+                {
+                    "label": "草稿探测",
+                    "status": "ok",
+                    "seq": 1,
+                    "recorded_at": 1.5,
+                    "result": {
+                        "files": [f"./{DRAFT}"],
+                        "draft_content": legacy_draft,
+                    },
+                },
+            ],
+        },
+        ensure_ascii=False,
+    )
+    _patch_knowledge(monkeypatch, IC_DOCS)
+    _patch_verdicts(monkeypatch, [_verdict_row("NEW_THESIS")])
+
+    result = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert result["done"], result
+    assert result["missing"] == []
+
+    # By contrast, a NEW run (where 草稿探测 recorded "absent" in its last
+    # status=="ok" entry after the initial "pending" entry) whose writer outputs
+    # a draft with "## 一、12 问初筛" is NOT exempted and is checked under the new rules.
+    new_run_files = dict(files)
+    new_run_files[".agents/threads/short-1/workflows/task-run-1/journal/草稿探测.json"] = json.dumps(
+        {
+            "label": "草稿探测",
+            "dispatches": [
+                {
+                    "label": "草稿探测",
+                    "status": "pending",
+                    "seq": 1,
+                    "recorded_at": 1.0,
+                },
+                {
+                    "label": "草稿探测",
+                    "status": "ok",
+                    "seq": 1,
+                    "recorded_at": 1.5,
+                    "result": {
+                        "files": [f"./{DRAFT}"],
+                        "draft_content": "absent",
+                    },
+                },
+            ],
+        },
+        ensure_ascii=False,
+    )
+    new_run_res = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(new_run_files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert not new_run_res["done"]
+    assert any("第一个二级标题必须是摘要" in item for item in new_run_res["missing"])
+    assert any("12 问逐条写进了正文" in item for item in new_run_res["missing"])
+    assert any("questions.md" in item for item in new_run_res["missing"])
+    assert any("underwriting-summary.md" in item for item in new_run_res["missing"])
+
+
+@pytest.mark.asyncio
+async def test_initial_coverage_merged_chapters_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    merged_draft = (
+        "# 初次覆盖报告\n\n"
+        "## 一页摘要\n核心判断与三情景赔率小表。\n\n"
+        "## 公司与商业模式\n业务与行业。\n\n"
+        "## 核心投资逻辑与主要分歧\n分歧。\n\n"
+        "## 估值与赔率\n估值。\n\n"
+        "## 风险、管理层与资本配置\n风险与治理合并在一章。\n\n"
+        "### 研究议程与跟踪\n跟踪议程放在三级标题下。\n\n"
+        "## 引用\n[引用1]: evidence:E-20261023-01 （法定财报｜Meta｜10-K｜2026-02-01｜id）\n"
+        + "内容" * 300
+    )
+    files = _full_files(draft=merged_draft)
+    _patch_knowledge(monkeypatch, IC_DOCS)
+    _patch_verdicts(monkeypatch, [_verdict_row("NEW_THESIS")])
+
+    result = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert result["done"], result["missing"]
+    assert result["missing"] == []
+
+
+@pytest.mark.asyncio
+async def test_initial_coverage_summary_at_end_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary_last_draft = (
+        "# 初次覆盖报告\n\n"
+        "## 公司与商业模式\n业务与行业。\n\n"
+        "## 核心投资逻辑与主要分歧\n分歧。\n\n"
+        "## 估值与赔率\n估值。\n\n"
+        "## 风险\n风险。\n\n"
+        "## 管理层与资本配置\n治理。\n\n"
+        "## 研究议程与跟踪\n议程。\n\n"
+        "## 摘要\n摘要被放在了最后。\n\n"
+        "## 引用\n[引用1]: evidence:E-20261023-01 （法定财报｜Meta｜10-K｜2026-02-01｜id）\n"
+        + "内容" * 300
+    )
+    files = _full_files(draft=summary_last_draft)
+    _patch_knowledge(monkeypatch, IC_DOCS)
+    _patch_verdicts(monkeypatch, [_verdict_row("NEW_THESIS")])
+
+    result = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert not result["done"]
+    assert any("第一个二级标题必须是摘要" in item for item in result["missing"])
+
+    # English "Summary" at the first H2 is also accepted.
+    en_summary_draft = summary_last_draft.replace(
+        "## 公司与商业模式\n", "## Summary\n一页摘要。\n\n## 公司与商业模式\n", 1
+    )
+    en_files = _full_files(draft=en_summary_draft)
+    en_res = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(en_files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert en_res["done"], en_res["missing"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "q_lines",
+    [
+        "\n".join(f"**Q{i}.** 第 {i} 题的回答。" for i in range(1, 9)),
+        "\n".join(f"- q{i}：第 {i} 题的回答。" for i in range(1, 8)),
+        "\n".join(f"{i}. **q{i}.** 第 {i} 题的回答。" for i in range(1, 7)),
+    ],
+)
+async def test_initial_coverage_rejects_bold_and_list_q1_to_q12_in_body(
+    monkeypatch: pytest.MonkeyPatch,
+    q_lines: str,
+) -> None:
+    body_with_q_list = (
+        "# 初次覆盖报告\n\n"
+        "## 摘要\n摘要。\n\n"
+        + q_lines
+        + "\n\n## 公司与商业模式\n业务。\n\n"
+        "## 核心投资逻辑与主要分歧\n分歧。\n\n"
+        "## 估值与赔率\n估值。\n\n"
+        "## 风险\n风险。\n\n"
+        "## 管理层与资本配置\n管理层。\n\n"
+        "## 研究议程与跟踪\n议程。\n\n"
+        "## 引用\n[引用1]: evidence:E-20261023-01 （法定财报｜Meta｜10-K｜2026-02-01｜id）\n"
+        + "内容" * 300
+    )
+    files = _full_files(draft=body_with_q_list)
+    _patch_knowledge(monkeypatch, IC_DOCS)
+    _patch_verdicts(monkeypatch, [_verdict_row("NEW_THESIS")])
+
+    result = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert not result["done"]
+    assert any(
+        "12 问逐条写进了正文" in item and "不得逐条列 Q1–Q12" in item
+        for item in result["missing"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_initial_coverage_questions_md_accepts_bold_q_headings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    files = _full_files()
+    bold_q_doc = (
+        "# 初次覆盖 12 问工作底稿\n\n"
+        + "\n".join(
+            f"## {i}. **{'q' if i % 2 == 0 else 'Q'}{i}. 问题 {i}**\n- 当前判断：有判断。\n"
+            for i in range(1, 13)
+        )
+        + "底稿内容" * 80
+    )
+    files["research/2026-10-23-ic/questions.md"] = bold_q_doc
+    files["research/2026-10-23-ic/questions.md.language.json"] = _language_json(
+        bold_q_doc
+    )
+    _patch_knowledge(monkeypatch, IC_DOCS)
+    _patch_verdicts(monkeypatch, [_verdict_row("NEW_THESIS")])
+
+    result = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert result["done"], result["missing"]
+
+
+@pytest.mark.asyncio
+async def test_initial_coverage_underwriting_summary_verifies_saved_version_against_db_and_no_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_knowledge(monkeypatch, IC_DOCS, thesis_version_no=1)
+    _patch_verdicts(monkeypatch, [_verdict_row("NEW_THESIS")])
+
+    # 1) Uncommitted dry_run ("尚未保存" / "没有保存成功", missing "已保存 thesis 版本 N") -> rejected
+    uncommitted_files = _full_files()
+    uncommitted_files["research/2026-10-23-ic/underwriting-summary.md"] = (
+        "赔率计算摘要（试写通过，尚未保存｜立场：中性）\n"
+    )
+    uncommitted_res = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(uncommitted_files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert not uncommitted_res["done"]
+    assert any("未记录正式保存的版本号" in item for item in uncommitted_res["missing"])
+
+    # 2) DB has no valid thesis version -> rejected
+    _patch_knowledge(monkeypatch, IC_DOCS, thesis_missing=True)
+    no_db_res = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(_full_files()),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert not no_db_res["done"]
+    assert any("没有 `schema_valid=true` 的有效版本" in item for item in no_db_res["missing"])
+
+    # 3) Version mismatch between underwriting-summary.md (version 1) and DB (version 2) -> rejected
+    _patch_knowledge(monkeypatch, IC_DOCS, thesis_version_no=2)
+    mismatch_res = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(_full_files()),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert not mismatch_res["done"]
+    assert any(
+        "（版本 1）" in item and "（版本 2）不一致" in item
+        for item in mismatch_res["missing"]
+    )
+
+    # 4) Summary self-reports no_view ("暂不表态，不计算赔率") while DB stance is "neutral" and underwriting is None -> rejected
+    self_report_files = _full_files()
+    self_report_files["research/2026-10-23-ic/underwriting-summary.md"] = (
+        "已保存 thesis 版本 1；暂不表态，不计算赔率\n"
+    )
+    _patch_knowledge(
+        monkeypatch,
+        IC_DOCS,
+        thesis_version_no=1,
+        thesis_doc={
+            "schema_version": 2,
+            "house_view": {"stance": "neutral", "conviction": "low"},
+            "underwriting": None,
+        },
+    )
+    self_report_res = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(self_report_files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert not self_report_res["done"]
+    assert any("缺少非空的 `underwriting`" in item for item in self_report_res["missing"])
+
+    # 5) DB version 1 has house_view.stance == "no_view" and underwriting is None -> accepted
+    _patch_knowledge(
+        monkeypatch,
+        IC_DOCS,
+        thesis_version_no=1,
+        thesis_doc={
+            "schema_version": 2,
+            "house_view": {"stance": "no_view", "conviction": "low"},
+            "underwriting": None,
+        },
+    )
+    no_view_res = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(self_report_files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert no_view_res["done"], no_view_res["missing"]
+
+    # 6) Version check compares ONLY version N on the first line against DB latest_valid_version
+    #    (no timestamp or source check on thesis, and body lines after line 1 do not invalidate line 1)
+    first_line_only_files = _full_files()
+    first_line_only_files["research/2026-10-23-ic/underwriting-summary.md"] = (
+        "已保存 thesis 版本 1\n"
+        "赔率计算摘要：正文备忘提及（此前试写时尚未保存、不能写进正文，现已正式落库）。\n"
+    )
+    _patch_knowledge(
+        monkeypatch,
+        [d for d in IC_DOCS if d != "thesis"],
+        thesis_version_no=1,
+        thesis_source="init",
+        thesis_created_at=datetime(2020, 1, 1, tzinfo=timezone.utc),
+        thesis_doc={
+            "schema_version": 2,
+            "house_view": {"stance": "neutral", "conviction": "low"},
+            "underwriting": {
+                "scenario_version": 1,
+                "anchor": {"price": 100.0, "price_at": "2026-10-23", "currency": "USD"},
+            },
+        },
+    )
+    version_only_res = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(first_line_only_files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert version_only_res["done"], version_only_res["missing"]
+
+    # 7) Resume chain walks {run}/resume.json (real driver directory paths) back to the
+    #    initial run start (100), so dependency docs written during the pause (150) pass
+    #    a since-filtering knowledge query when the resumed run starts at 200.
+    resume_chain_files = _full_files()
+    run1_dir = ".agents/threads/short-1/workflows/task-run-1"
+    run2_dir = ".agents/threads/short-1/workflows/task-run-2"
+    resume_chain_files[f"{run1_dir}/status.json"] = json.dumps(
+        {"run_id": "task-run-1", "name": "initial-coverage", "status": "completed", "updated_at": 120.0}
+    )
+    resume_chain_files[f"{run1_dir}/journal/公司背景.json"] = json.dumps(
+        {
+            "label": "公司背景",
+            "dispatches": [
+                {
+                    "label": "公司背景",
+                    "status": "ok",
+                    "seq": 1,
+                    "recorded_at": 100.0,
+                    "result": {"files": ["drafts/2026-10-23-background.md"]},
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )
+    resume_chain_files[f"{run2_dir}/status.json"] = json.dumps(
+        {"run_id": "task-run-2", "name": "initial-coverage", "status": "completed", "updated_at": 260.0}
+    )
+    resume_chain_files[f"{run2_dir}/resume.json"] = json.dumps(
+        {
+            "resumed_from": run1_dir,
+            "claimed_at": 200.0,
+            "tool_call_id": "call-resume-2",
+            "task_id": "task-run-2",
+        }
+    )
+    resume_chain_files[f"{run2_dir}/journal/审稿.json"] = json.dumps(
+        {
+            "label": "审稿",
+            "dispatches": [
+                {
+                    "label": "审稿",
+                    "status": "ok",
+                    "seq": 7,
+                    "recorded_at": 200.0,
+                    "draft_sha256": _draft_hash(resume_chain_files[DRAFT]),
+                    "result": {
+                        "verdict": "pass",
+                        "summary": "通过",
+                        "items": _nine_items(),
+                        "must_fix": [],
+                    },
+                }
+            ],
+        },
+        ensure_ascii=False,
+    )
+    _patch_knowledge(
+        monkeypatch,
+        IC_DOCS,
+        thesis_version_no=1,
+        doc_timestamps={doc: 150.0 for doc in IC_DOCS},
+    )
+    _patch_verdicts(
+        monkeypatch,
+        [
+            {
+                **_verdict_row("NEW_THESIS"),
+                "verdict_at": datetime.fromtimestamp(250.0, tz=timezone.utc),
+            }
+        ],
+    )
+    resumed_ok = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(resume_chain_files),
+        workspace_id=WS,
+        run_id="task-run-2",
+        thread_id="short-1",
+    )
+    assert resumed_ok["done"] is True, resumed_ok["missing"]
+
+    # Without resume.json, since=200 filters out the docs written at 150 -> fails
+    no_resume_files = dict(resume_chain_files)
+    del no_resume_files[f"{run2_dir}/resume.json"]
+    no_resume_res = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(no_resume_files),
+        workspace_id=WS,
+        run_id="task-run-2",
+        thread_id="short-1",
+    )
+    assert no_resume_res["done"] is False
+    assert any("agenda" in m and "source=tool" in m for m in no_resume_res["missing"])
+
+
+@pytest.mark.asyncio
+async def test_initial_coverage_requires_thesis_underwriting_and_exempts_no_view_and_legacy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    files = _full_files()
+    _patch_verdicts(monkeypatch, [_verdict_row("NEW_THESIS")])
+
+    # 1) New structure without underwriting (stance != no_view) -> rejected
+    _patch_knowledge(
+        monkeypatch,
+        IC_DOCS,
+        thesis_doc={
+            "schema_version": 2,
+            "house_view": {"stance": "neutral", "conviction": "low"},
+            "underwriting": None,
+        },
+    )
+    missing_uw_res = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert not missing_uw_res["done"]
+    assert any("underwriting" in item for item in missing_uw_res["missing"])
+
+    # 2) New structure with stance == "no_view" and underwriting == None -> allowed by schema
+    _patch_knowledge(
+        monkeypatch,
+        IC_DOCS,
+        thesis_doc={
+            "schema_version": 2,
+            "house_view": {"stance": "no_view", "conviction": "low"},
+            "underwriting": None,
+        },
+    )
+    no_view_res = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert no_view_res["done"], no_view_res["missing"]
+
+    # 3) Legacy in-flight draft (already on disk at run start) without underwriting -> exempted
+    legacy_draft = (
+        "# 初筛\n\n"
+        "## 一、12 问初筛\n"
+        + "\n".join(f"### Q{i}. 问题 {i}\n- 当前判断：有判断。\n" for i in range(1, 13))
+        + "\n## 二、业务与行业\n业务。\n"
+        "## 三、股价与估值\n估值。\n"
+        "## 四、当前 debate\n分歧。\n"
+        "## 五、叙事演绎与预期差\n预期差。\n"
+        "## 六、财务镜头\n财务镜头。\n"
+        "## 七、初始 thesis 草案\n支柱。\n"
+        "## 八、研究议程\n议程。\n"
+        "## 引用\n[引用1]: evidence:E-20261023-01 （法定财报｜Meta｜10-K｜2026-02-01｜id）\n"
+        + "内容" * 300
+    )
+    legacy_files = _full_files(draft=legacy_draft)
+    del legacy_files["research/2026-10-23-ic/questions.md"]
+    del legacy_files["research/2026-10-23-ic/questions.md.language.json"]
+    del legacy_files["research/2026-10-23-ic/underwriting-summary.md"]
+    legacy_files[".agents/threads/short-1/workflows/task-run-1/journal/草稿探测.json"] = json.dumps(
+        {
+            "label": "草稿探测",
+            "dispatches": [
+                {
+                    "label": "草稿探测",
+                    "status": "pending",
+                    "seq": 1,
+                    "recorded_at": 1.0,
+                },
+                {
+                    "label": "草稿探测",
+                    "status": "ok",
+                    "seq": 1,
+                    "recorded_at": 1.5,
+                    "result": {
+                        "files": [f"./{DRAFT}"],
+                        "draft_content": legacy_draft,
+                    },
+                },
+            ],
+        },
+        ensure_ascii=False,
+    )
+    _patch_knowledge(
+        monkeypatch,
+        IC_DOCS,
+        thesis_doc={
+            "schema_version": 2,
+            "house_view": {"stance": "neutral", "conviction": "low"},
+            "underwriting": None,
+        },
+    )
+    legacy_res = await run_check_done(
+        workflow="initial-coverage",
+        params=PARAMS,
+        backend=_make_backend(legacy_files),
+        workspace_id=WS,
+        thread_id="short-1",
+    )
+    assert legacy_res["done"], legacy_res["missing"]
 
 
 @pytest.mark.asyncio
@@ -5300,6 +6054,30 @@ FC_MEMO = """# 虚拟公司（TEST）投资备忘录
 ## 行业与竞争
 
 行业分散，前三家合计份额 30% [引用2]。
+
+## 业务质量
+
+### Good Business：高切换成本支撑订阅续费与高回报
+
+2Q26 续费率 95%，详见「公司与商业模式」[引用1]。
+
+### Good People：创始人执掌且指引一贯稳健
+
+详见「管理层」[引用1]。
+
+### Good Price：现价隐含合理增长预期
+
+详见「财务预测与估值」[引用3]。
+
+### 综合判断
+
+| 维度 | 评级 | 一句理由 |
+|---|---|---|
+| Good Business | 强 | 订阅续费率 95% [引用1] |
+| Good People | 强 | 创始人执掌且指引稳健 [引用1] |
+| Good Price | 合理 | 现价隐含合理增长 [引用3] |
+
+好生意、好团队且价格合理，对应观察。
 
 ## 核心投资逻辑与争议
 

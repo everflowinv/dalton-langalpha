@@ -76,9 +76,9 @@ phase('深度点评与模型')
 const [report, model] = await parallel([
   () =>
     agent(
-      `${base} 按 ${S}/references/eight-sections.md${
+      `${base} 按 ${S}/templates/deep.md（首个二级标题为「## 摘要」，后接「业绩与指引」「投资逻辑的验证」「赔率与行动」「跟踪」、按需「附注」及文末「引用」，对账与校准的逐条表格留内部文件、不在正文展开；改判条件只在「跟踪」完整列一次，「赔率与行动」和「摘要」只写决定行动的那一个条件；成稿后通读全文，同一缺口、同一限定、同一改判条件只保留最合适的一处）与 ${S}/references/eight-sections.md${
         args.sector_overlay === 'hardware' ? ` 与 ${S}/references/hardware-overlay.md` : ''
-      } 写八节深度点评到 ${W}/drafts/${D}-deep-${Q}.md；价格反应用 python ${S}/scripts/price_reaction.py；卖方窗口为发布到发布后 3 个交易日。返回成稿路径与 sha256。`,
+      } 写深度点评到 ${W}/drafts/${D}-deep-${Q}.md；价格反应用 python ${S}/scripts/price_reaction.py；卖方窗口为发布到发布后 3 个交易日。返回成稿路径与 sha256。`,
       { agentType: 'general-purpose', label: '八节点评', phase: '深度点评与模型', schema: DRAFT_OUT }
     ),
   () =>
@@ -169,6 +169,7 @@ const lang1Sha = lang1 === null ? null : shaOf(lang1)
 const lang1Failed = reportSha0 !== null && lang1Sha === null
 const reportSha = lang1Sha || reportSha0
 const reportOk = report !== null && reportSha !== null
+let currentSha = reportSha
 
 phase('校准与对账')
 const calib =
@@ -182,21 +183,24 @@ const calib =
             : `本次财报前无 predictions.json，跳过前瞻对账：仍要生成 ${R}/reconcile.md（写明跳过原因）与 ${R}/reconcile.json（{"wrong": 0, "partial": 0}）；`
         }
 2) 按第二节的财报后校准规则，对 ${W}/thesis.md 每个支柱给信号与状态，写 ${R}/thesis-calibration.md；
-3) 更新指引兑现记录：本季实际 vs 上季给的指引，判断管理层指引风格是否延续，写 ${R}/management-delta.md。
+3) 更新指引兑现记录：本季实际 vs 上季给的指引，判断管理层指引风格是否延续，写 ${R}/management-delta.md；
+4) 把 ${R}/reconcile.md、${R}/thesis-calibration.md、${R}/management-delta.md 的结论各用一两句话写进 ${reportPath} 正文「投资逻辑的验证」节（逐条表格留在内部文件），改完返回 ${reportPath} 新的 sha256。
 材料：${W}/drafts/${D}-deep-${Q}.md${model ? `，${R}/model-delta.md` : ''}${
           modelFile ? `；最终模型 ${modelFile}（只读）` : ''
         }。`,
-        { agentType: 'general-purpose', label: '校准与对账', phase: '校准与对账', schema: OUT }
+        { agentType: 'general-purpose', label: '校准与对账', phase: '校准与对账', schema: DRAFT_OUT }
       )
+const calibSha = shaOf(calib)
+if (calibSha !== null) currentSha = calibSha
 
 phase('审稿')
 let review =
-  calib === null
+  calibSha === null
     ? null
     : await agent(
         `审阅 ${reportPath}（被审草稿 sha256：${
-          reportSha || '未知'
-        }）及 ${R}/ 下的对账与校准文件${modelFile ? `、最终模型 ${modelFile}` : ''}（只读不改任何文件）。重点：beat/miss 口径；“综合判断”是否有判断；thesis 信号是否被价格走势替代；对账是否回避了错判。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；items 逐项覆盖 1–9 项检查）。`,
+          currentSha || '未知'
+        }）及 ${R}/ 下的对账与校准文件${modelFile ? `、最终模型 ${modelFile}` : ''}（只读不改任何文件）。重点：超预期/低于预期（beat/miss）口径；摘要与各节是否有独立判断；核心论点（thesis）信号是否被价格走势替代；对账是否回避了错判；核对正文「投资逻辑的验证」节是否已各用一两句话准确写入 reconcile.md、thesis-calibration.md、management-delta.md 的结论（逐条表格留在内部文件）。按 dalton-reviewer 规范输出 JSON（verdict ∈ pass/revise/block；items 逐项覆盖 1–9 项检查）。`,
         { agentType: 'dalton-reviewer', label: '审稿', phase: '审稿', schema: VERDICT, reviewDraft: reportPath }
       )
 
@@ -208,7 +212,6 @@ if (review !== null && !completeReview(review)) {
 }
 let finalReview = review
 let rounds = 0
-let currentSha = reportSha
 let modelPath = modelFile
 // 提前结束时解析一次磁盘上的模型，作为返回值里的 model_file；没有模型则为 null。
 const resolveOnExit = async () => {
@@ -250,7 +253,7 @@ while (finalReview && verdictOf(finalReview) === 'revise' && rounds < 2) {
   const fixed = await agent(
     `先核对 ${reportPath} 的 sha256 是否与审稿前（${
       currentSha || '成稿记录值'
-    }）一致；按审稿意见做第 ${rounds} 轮修订（P0 全改，不新增未核实数字），改完返回新 sha256。${modelClause}审稿意见：\n${JSON.stringify(
+    }）一致；按审稿意见做第 ${rounds} 轮修订（必改项 must_fix 全改，不新增未核实数字；修订后通读全文，同一缺口、同一限定、同一改判条件只保留最合适的一处），并核对 ${R}/reconcile.md、${R}/thesis-calibration.md、${R}/management-delta.md 的结论是否已各用一两句话准确写进正文「投资逻辑的验证」节（如有缺漏或偏差一并修正，逐条表格留在内部文件），改完返回新 sha256。${modelClause}审稿意见：\n${JSON.stringify(
       finalReview
     )}`,
     { agentType: 'general-purpose', label: `修订 ${rounds}`, phase: '审稿', schema: DRAFT_OUT }
@@ -390,8 +393,8 @@ const kp = await agent(
 if (!reportOk) incomplete.push('八节点评失败（草稿或其 sha256 缺失/非法）')
 if (lang1Failed) incomplete.push('语言审查第 1 轮失败（结果或其 sha256 缺失/非法），未按清单修改')
 if (args.model_path && model === null) incomplete.push('模型更新失败（须人工跟进）')
-if (calib === null && reportOk) incomplete.push('校准与对账失败')
-if (review === null && calib !== null) incomplete.push('审稿失败')
+if (calibSha === null && reportOk) incomplete.push('校准与对账失败（结果或其 sha256 缺失/非法）')
+if (review === null && calibSha !== null) incomplete.push('审稿失败')
 if (!reviewPassed && !incomplete.length) incomplete.push('审稿未最终通过（无 pass 记录）')
 if (kp === null) incomplete.push('知识层修订草案失败')
 

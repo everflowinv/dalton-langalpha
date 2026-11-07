@@ -32,7 +32,7 @@
     - **Dalton 净现金桥接硬规则**：DCF 的净现金/（净债务）调整项**默认引用 `Facts` 页的「严格净现金（`net_cash_strict`）」**；同时在旁边单列一行以「基础净现金（`net_cash_basic`）」计算的每股价值作为敏感度对照；若有重大折后隐含资产（`hidden_asset_net`），显式说明是否纳入股权桥。
 12. **`Sensitivity Analysis`**：二维敏感度矩阵（WACC × 永续增长率 $g$、WACC × 退出倍数、核心业务增速 × 稳态营业利润率对每股价值与隐含 IRR 的敏感度）。
 13. **`Comparable Companies`**：同业可比估值表（至少 5–8 家可比公司，含市值、EV、未来两年收入与盈利增速、利润率、P/E、EV/EBITDA、EV/Sales、FCF Yield，底部用公式计算 `Max / 75th Percentile / Median / Mean / 25th Percentile / Min`）。
-14. **`Valuation Summary`**：估值汇总与足球场区间图数据（汇总 DCF 严格净现金口径、DCF 基础净现金口径、Comps 估值区间、历史估值倍数区间、三情景目标价与隐含上行/下行空间）。
+14. **`Valuation Summary`**：估值汇总与足球场区间图数据，承载估值三角（DCF 等内在价值〔严格净现金口径与基础净现金口径〕、Comps〔可比公司倍数〕区间、历史估值区间至少三种互相验证；公司有可分拆的业务、大额净现金或投资时，加做 SOTP〔分部加总估值〕；汇总各方法结论的差异说明，以及三情景目标价与隐含上行/下行空间）。
 15. **`Checks`**：模型勾稽与完整性检查页（资产负债表平衡检查 `Assets - Liabilities - Equity = 0`、现金流期末现金与资产负债表一致、分部收入加总等于总收入、`Street vs House` 引用一致性、无错误值，所有检查项状态必须为 `OK`）。
 
 ---

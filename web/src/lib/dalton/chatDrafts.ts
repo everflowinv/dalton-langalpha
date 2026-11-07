@@ -607,6 +607,28 @@ export function settleSendResult(
   pending.finalizeSend(result === true);
 }
 
+/** The box with `text` put back: into it when empty, else after what is
+ *  typed, a blank line between, and never twice. */
+export function withGivenBack(typed: string, text: string): string {
+  const kept = typed.trimEnd();
+  if (!kept) return text;
+  // DALTON-HOOK(composer-drafts): a refused send's draft settlement may
+  // already have put the text back ahead of what was typed since
+  // (`chatDrafts.ts`), so it counts as given back at either end.
+  if (kept === text || kept.endsWith(`\n\n${text}`) || kept.startsWith(`${text}\n\n`)) return typed;
+  return `${kept}\n\n${text}`;
+}
+
+export interface GiveBackOptions {
+  parts?: DraftParts;
+  /**
+   * Runs when the hand-back lands on the live box (still on the draftKey it
+   * was handed to): re-seats mentions, files, slash commands and returns the
+   * text (after any quote-token renumbering) to merge into the box.
+   */
+  onSeat?: () => string;
+}
+
 export interface UseComposerDraftResult {
   message: string;
   setMessage: Dispatch<SetStateAction<string>>;
@@ -642,7 +664,17 @@ export interface UseComposerDraftResult {
       onHostReturned: () => void,
     ) => void | boolean | Promise<void | boolean>,
   ) => void;
+  /** Hand text back to the composer beside what is typed (a stopped turn's
+   *  unread steers, an edit whose message is gone, or a host's returnedDraft). */
+  giveBack: (text: string, options?: GiveBackOptions) => void;
+  onCompositionStart: () => void;
+  onCompositionEnd: () => void;
 }
+
+/** An input rewrite from outside the user's typing, held while an IME
+ *  composition is open. It runs against the draft key current when it runs:
+ *  the key effect's cleanup passes the key being left. */
+type ExternalWrite = (currentKey: string | undefined) => void;
 
 /**
  * Manages the composer text state backed by `localStorage` when `draftKey` is provided:
@@ -703,6 +735,41 @@ export function useComposerDraft({
     draftKey,
     userId,
   });
+  // An IME composition owns the textarea until it ends: a value written under
+  // it makes the IME insert its open segment again on every key, so the text
+  // repeats without end. Rewrites that do not come from the user's typing wait
+  // for compositionend (or for the key effect's cleanup, on a switch or unmount).
+  const composingRef = useRef(false);
+  const pendingWritesRef = useRef<ExternalWrite[]>([]);
+  const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const runExternal = useCallback((write: ExternalWrite) => {
+    // Behind writes still waiting, so they keep their order.
+    if (composingRef.current || pendingWritesRef.current.length > 0) {
+      pendingWritesRef.current.push(write);
+      return;
+    }
+    write(activeDraftKeyRef.current);
+  }, []);
+  // A write captured while the user was still loading belongs to the user who
+  // loaded since.
+  const ownerOf = useCallback((uid: string | undefined) => (!uid || uid === 'anon' ? activeUserIdRef.current : uid), []);
+  const flushPendingWrites = useCallback((currentKey: string | undefined) => {
+    if (flushTimerRef.current !== null) {
+      clearTimeout(flushTimerRef.current);
+      flushTimerRef.current = null;
+    }
+    const writes = pendingWritesRef.current.splice(0);
+    for (const write of writes) write(currentKey);
+  }, []);
+  // On the next task: after the input event that commits a composition,
+  // whichever order the browser fires the two in.
+  const scheduleFlush = useCallback(() => {
+    if (flushTimerRef.current !== null || pendingWritesRef.current.length === 0) return;
+    flushTimerRef.current = setTimeout(() => {
+      flushTimerRef.current = null;
+      if (!composingRef.current) flushPendingWrites(activeDraftKeyRef.current);
+    }, 0);
+  }, [flushPendingWrites]);
 
   /** Applies what a restore brought back; `null` is every reset point (sent, cleared, switched). */
   const applyRestored = useCallback(
@@ -770,22 +837,40 @@ export function useComposerDraft({
       getDraftKey: () => activeDraftKeyRef.current,
       getUserId: () => activeUserIdRef.current,
       cancelAndClearInput: () => {
+        const key = activeDraftKeyRef.current;
+        const uid = activeUserIdRef.current;
+        // The pending save goes now, so the cleared draft is not written back
+        // while the input waits for a composition.
         if (timerRef.current !== null) {
           clearTimeout(timerRef.current);
           timerRef.current = null;
         }
         dirtyRef.current = false;
-        writtenSinceMountOrSendRef.current = false;
-        latestMessageRef.current = '';
-        applyRestored(null);
-        setMessageState('');
+        runExternal((currentKey) => {
+          if (currentKey !== key) return;
+          if (timerRef.current !== null) {
+            clearTimeout(timerRef.current);
+            timerRef.current = null;
+          }
+          dirtyRef.current = false;
+          writtenSinceMountOrSendRef.current = false;
+          latestMessageRef.current = '';
+          applyRestored(null);
+          // Typing during the composition may have saved again, under the user
+          // it had then or, if that was the loading user, the one that loaded.
+          if (key) {
+            clearStorageEntry(key, uid);
+            if (uid === 'anon' && activeUserIdRef.current !== uid) clearStorageEntry(key, activeUserIdRef.current);
+          }
+          setMessageState('');
+        });
       },
     };
     activeControllers.add(controller);
     return () => {
       activeControllers.delete(controller);
     };
-  }, [applyRestored]);
+  }, [applyRestored, runExternal]);
 
   const scheduleSave = useCallback((nextText: string) => {
     if (timerRef.current !== null) {
@@ -871,37 +956,46 @@ export function useComposerDraft({
   const restoreInFlightCopy = useCallback((id: string) => {
     const key = activeDraftKeyRef.current;
     const uid = activeUserIdRef.current;
-    const copy = key ? (loadInFlightCopies(key, uid) ?? []).find((c) => c.id === id) : undefined;
-    if (!key || !copy) {
-      if (key) removeInFlightCopy(key, id, uid);
+    runExternal((currentKey) => {
+      if (currentKey !== key) return;
+      const owner = ownerOf(uid);
+      const copy = key ? (loadInFlightCopies(key, owner) ?? []).find((c) => c.id === id) : undefined;
+      if (!key || !copy) {
+        if (key) removeInFlightCopy(key, id, owner);
+        setInFlightCopiesState((prev) => prev.filter((c) => c.id !== id));
+        return;
+      }
+      applyRestored(copy);
+      let merged: string;
+      const restore = onSendReturnedRef.current;
+      if (restore) {
+        restore(copy.text, { quotes: copy.quotes, hadAttachments: copy.hadAttachments });
+        merged = latestMessageRef.current;
+        if (timerRef.current !== null) {
+          clearTimeout(timerRef.current);
+          timerRef.current = null;
+        }
+        dirtyRef.current = false;
+      } else {
+        const current = latestMessageRef.current;
+        const sent = copy.text;
+        merged = !current.trim() || current === sent || current.startsWith(`${sent}\n\n`) || current.endsWith(`\n\n${sent}`)
+          ? (current.trim() ? current : sent)
+          : `${sent}\n\n${current}`;
+        latestMessageRef.current = merged;
+        setMessageState(merged);
+      }
+      // Seat the live draft at once — the copy's own parts beside whatever the
+      // box has picked up — then remove this copy alone: a refresh between the
+      // two never finds the words in neither place, and the other offered
+      // copies stand.
+      if (merged.trim()) {
+        save(key, merged, owner, undefined, { parts: mergePartsForSave({ quotes: copy.quotes, hadAttachments: copy.hadAttachments }) });
+      }
+      removeInFlightCopy(key, id, owner);
       setInFlightCopiesState((prev) => prev.filter((c) => c.id !== id));
-      return;
-    }
-    applyRestored(copy);
-    let merged: string;
-    const restore = onSendReturnedRef.current;
-    if (restore) {
-      restore(copy.text, { quotes: copy.quotes, hadAttachments: copy.hadAttachments });
-      merged = latestMessageRef.current;
-    } else {
-      const current = latestMessageRef.current;
-      const sent = copy.text;
-      merged = !current.trim() || current === sent || current.startsWith(`${sent}\n\n`) || current.endsWith(`\n\n${sent}`)
-        ? (current.trim() ? current : sent)
-        : `${sent}\n\n${current}`;
-      latestMessageRef.current = merged;
-      setMessageState(merged);
-    }
-    // Seat the live draft at once — the copy's own parts beside whatever the
-    // box has picked up — then remove this copy alone: a refresh between the
-    // two never finds the words in neither place, and the other offered
-    // copies stand.
-    if (merged.trim()) {
-      save(key, merged, uid, undefined, { parts: mergePartsForSave({ quotes: copy.quotes, hadAttachments: copy.hadAttachments }) });
-    }
-    removeInFlightCopy(key, id, uid);
-    setInFlightCopiesState((prev) => prev.filter((c) => c.id !== id));
-  }, [applyRestored]);
+    });
+  }, [applyRestored, mergePartsForSave, ownerOf, runExternal]);
 
   /** Drops one offered copy: the user says it is gone, sent or unwanted. */
   const discardInFlightCopy = useCallback((id: string) => {
@@ -975,7 +1069,11 @@ export function useComposerDraft({
         // and a superseded send that was taken must not linger as an offer.
         if (inFlight.cleared) return;
         inFlight.cleared = true;
-        if (inFlight.copyId) removeInFlightCopy(inFlight.draftKey, inFlight.copyId, inFlight.userId);
+        if (inFlight.copyId) {
+          removeInFlightCopy(inFlight.draftKey, inFlight.copyId, inFlight.userId);
+          const owner = ownerOf(inFlight.userId);
+          if (owner !== inFlight.userId) removeInFlightCopy(inFlight.draftKey, inFlight.copyId, owner);
+        }
         setInFlightCopiesState((prev) => prev.filter((c) => c.id !== inFlight.copyId));
       };
       if (inFlight.settled) {
@@ -1004,74 +1102,93 @@ export function useComposerDraft({
         // whatever was typed since is the live draft's business.
         return;
       }
-      const sendDraftKey = inFlight.draftKey;
-      const sendUserId = inFlight.userId;
-      if (!sendDraftKey) {
+      if (!inFlight.draftKey) {
         return;
       }
       // Definitely not taken — superseded or not, whatever owns the box: the
-      // words are seated at once (into the box when it is this draft's, ahead
-      // of what is there now; into the send's own key otherwise), and only
-      // then does this send's copy go. A refresh in between never finds them
-      // in neither place, and a superseded send that was definitely refused
-      // must not linger as a "may have gone through" offer.
-      if (!superseded) hasSentOnKeyRef.current = false;
-      const boxOnSendKey = activeDraftKeyRef.current === sendDraftKey;
-      const seatsBox = boxOnSendKey && !inFlight.hostReturned;
-      // Only this key's own pending save may be cleared. The pending timer
-      // can belong to another draft now (the box switched keys under this
-      // send): killing it would drop that session's just-typed content, and
-      // this settle never writes that key back.
-      if (timerRef.current !== null && seatsBox) {
-        clearTimeout(timerRef.current);
-        timerRef.current = null;
-      }
-      if (seatsBox) writtenSinceMountOrSendRef.current = true;
-      if (seatsBox) {
-        // Seeding the sent quotes back is the box-seating paths' business
-        // alone: a host that took the return seats them through its giveBack
-        // (seeding here would add the ORIGINAL token beside the renumbered
-        // one), and a box that moved to another draft sees none of it.
-        applyRestored({ quotes: inFlight.parts.quotes, hadAttachments: inFlight.parts.hadAttachments });
-      }
-      // What the words join with is the send's own key's current draft — the
-      // box when it still belongs to this key, else what that key last saved
-      // (never the box another session now owns, and never its quotes).
-      const savedRecord = boxOnSendKey ? null : loadStoredDraft(sendDraftKey, sendUserId);
-      const beside = boxOnSendKey ? latestMessageRef.current : (savedRecord?.text ?? '');
-      const merged = !sentText.trim()
-        ? beside
-        : !beside.trim() || beside === sentText || beside.startsWith(`${sentText}\n\n`) || beside.endsWith(`\n\n${sentText}`)
-          ? (beside.trim() ? beside : sentText)
-          : `${sentText}\n\n${beside}`;
-      const restore = seatsBox ? onSendReturnedRef.current : undefined;
-      if (restore) {
-        // The composer seats the copy into the box itself — ahead of what it
-        // holds now, chips renumbered against it; the merged text is what
-        // lands.
-        restore(sentText, inFlight.parts);
-      } else if (seatsBox) {
-        latestMessageRef.current = merged;
-        setMessageState(merged);
-      }
-      // The parts saved with the words are the send's own beside what its key
-      // holds: the box's current parts when it seats there (quotes added
-      // while the send was out included), else the stored draft's quotes —
-      // never another session's. The host-return case sits on the same key,
-      // so the box's own parts — the quotes added while the send was out —
-      // ride along too, or their bodies would be gone from storage before
-      // the host's giveBack save lands.
-      if (merged.trim()) {
-        const parts = boxOnSendKey
-          ? mergePartsForSave(inFlight.parts)
-          : mergeParts(inFlight.parts, {
-              quotes: savedRecord?.quotes ?? [],
-              hadAttachments: savedRecord?.hadAttachments === true,
-            });
-        save(sendDraftKey, merged, sendUserId, undefined, { parts });
-      }
-      if (inFlight.copyId) removeInFlightCopy(sendDraftKey, inFlight.copyId, sendUserId);
-      setInFlightCopiesState((prev) => prev.filter((c) => c.id !== inFlight.copyId));
+      // words are seated (into the box when it is this draft's, ahead of what
+      // is there now; into the send's own key otherwise), waiting for an open
+      // IME composition to end first so the textarea is not rewritten under
+      // the IME, and only then does this send's copy go.
+      runExternal((currentKey) => {
+        const sendDraftKey = inFlight.draftKey;
+        const sendUserId = inFlight.userId;
+        if (!sendDraftKey) return;
+        const owner = ownerOf(sendUserId);
+        if (!superseded) hasSentOnKeyRef.current = false;
+        const onSendKey = currentKey === sendDraftKey;
+        const boxOnSendKey = onSendKey && activeDraftKeyRef.current === sendDraftKey;
+        const seatsBox = boxOnSendKey && !inFlight.hostReturned;
+        // Only this key's own pending save may be cleared. The pending timer
+        // can belong to another draft now (the box switched keys under this
+        // send): killing it would drop that session's just-typed content, and
+        // this settle never writes that key back.
+        if (timerRef.current !== null && seatsBox) {
+          clearTimeout(timerRef.current);
+          timerRef.current = null;
+        }
+        if (seatsBox) writtenSinceMountOrSendRef.current = true;
+        if (seatsBox) {
+          // Seeding the sent quotes back is the box-seating paths' business
+          // alone: a host that took the return seats them through its giveBack
+          // (seeding here would add the ORIGINAL token beside the renumbered
+          // one), and a box that moved to another draft sees none of it.
+          applyRestored({ quotes: inFlight.parts.quotes, hadAttachments: inFlight.parts.hadAttachments });
+        }
+        // What the words join with is the send's own key's current draft — the
+        // box when this write still runs against the send's key, else what that
+        // key last saved (never the box another session now owns, and never its quotes).
+        const savedRecord = onSendKey ? null : loadStoredDraft(sendDraftKey, owner);
+        const beside = onSendKey ? latestMessageRef.current : (savedRecord?.text ?? '');
+        let merged = !sentText.trim()
+          ? beside
+          : !beside.trim() || beside === sentText || beside.startsWith(`${sentText}\n\n`) || beside.endsWith(`\n\n${sentText}`)
+            ? (beside.trim() ? beside : sentText)
+            : `${sentText}\n\n${beside}`;
+        const restore = seatsBox ? onSendReturnedRef.current : undefined;
+        if (restore) {
+          // The composer seats the copy into the box itself — ahead of what it
+          // holds now, chips renumbered against it; the merged text is what
+          // lands.
+          restore(sentText, inFlight.parts);
+          merged = latestMessageRef.current;
+          if (timerRef.current !== null) {
+            clearTimeout(timerRef.current);
+            timerRef.current = null;
+          }
+          dirtyRef.current = false;
+        } else if (seatsBox) {
+          latestMessageRef.current = merged;
+          dirtyRef.current = false;
+          setMessageState(merged);
+        } else if (onSendKey && !inFlight.hostReturned) {
+          // Flushed by the cleanup of the key being left: keep refs clean so
+          // the cleanup's trailing dirty check does not overwrite with pre-merge text.
+          latestMessageRef.current = merged;
+          dirtyRef.current = false;
+        }
+        // The parts saved with the words are the send's own beside what its key
+        // holds: the box's current parts when it runs on the send's key (quotes
+        // added while the send was out included), else the stored draft's quotes —
+        // never another session's. The host-return case sits on the same key,
+        // so the box's own parts — the quotes added while the send was out —
+        // ride along too, or their bodies would be gone from storage before
+        // the host's giveBack save lands.
+        if (merged.trim()) {
+          const parts = onSendKey
+            ? mergePartsForSave(inFlight.parts)
+            : mergeParts(inFlight.parts, {
+                quotes: savedRecord?.quotes ?? [],
+                hadAttachments: savedRecord?.hadAttachments === true,
+              });
+          save(sendDraftKey, merged, owner, undefined, { parts });
+        }
+        if (inFlight.copyId) {
+          removeInFlightCopy(sendDraftKey, inFlight.copyId, sendUserId);
+          if (owner !== sendUserId) removeInFlightCopy(sendDraftKey, inFlight.copyId, owner);
+        }
+        setInFlightCopiesState((prev) => prev.filter((c) => c.id !== inFlight.copyId));
+      });
     };
 
     return {
@@ -1092,7 +1209,7 @@ export function useComposerDraft({
         inFlight.hostReturned = true;
       },
     };
-  }, [applyRestored, mergePartsForSave]);
+  }, [applyRestored, mergeParts, mergePartsForSave, partsForSave, runExternal, ownerOf]);
 
   const submitWithDraft = useCallback(
     (
@@ -1125,6 +1242,65 @@ export function useComposerDraft({
     [beginSend],
   );
 
+  const giveBack = useCallback((text: string, options?: GiveBackOptions) => {
+    if (!text && !options?.onSeat) return;
+    const key = activeDraftKeyRef.current;
+    const uid = activeUserIdRef.current;
+    const merge = (prev: string, handedBack: string) => (
+      handedBack ? withGivenBack(prev, handedBack) : prev
+    );
+    runExternal((currentKey) => {
+      const owner = ownerOf(uid);
+      const handBackParts = options?.parts ?? {};
+      if (currentKey !== key) {
+        // The composer moved to another draft while this waited: the text goes
+        // to the draft it was handed back to.
+        if (!key) return;
+        const savedRecord = loadStoredDraft(key, owner);
+        const next = merge(savedRecord?.text ?? '', text);
+        if (next.trim()) {
+          const parts = mergeParts(handBackParts, {
+            quotes: savedRecord?.quotes ?? [],
+            hadAttachments: savedRecord?.hadAttachments === true,
+          });
+          save(key, next, owner, undefined, { parts });
+        }
+        return;
+      }
+      if (activeDraftKeyRef.current === key) {
+        const seatedText = options?.onSeat ? options.onSeat() : text;
+        if (seatedText) {
+          setMessage((prev) => merge(prev, seatedText));
+        }
+        return;
+      }
+      // Flushed by the cleanup of the key being left: setMessage's debounced
+      // save would land on the next key, so this one saves directly.
+      const next = merge(latestMessageRef.current, text);
+      latestMessageRef.current = next;
+      dirtyRef.current = false;
+      if (key && next.trim()) {
+        save(key, next, owner, undefined, { parts: mergePartsForSave(handBackParts) });
+      }
+    });
+  }, [runExternal, setMessage, ownerOf, mergeParts, mergePartsForSave]);
+
+  const onCompositionStart = useCallback(() => {
+    composingRef.current = true;
+  }, []);
+  const onCompositionEnd = useCallback(() => {
+    composingRef.current = false;
+    scheduleFlush();
+  }, [scheduleFlush]);
+
+  // Unmounted, no composition will end: a write arriving later (a send that
+  // fails after the composer is gone) runs at once against the last key.
+  // Declared before the key effect, so on unmount this runs before its save.
+  useEffect(() => () => {
+    composingRef.current = false;
+    flushPendingWrites(activeDraftKeyRef.current);
+  }, [flushPendingWrites]);
+
   // Sweep expired drafts once when mounted with a draftKey.
   const hasDraftKey = Boolean(draftKey);
   useEffect(() => {
@@ -1146,10 +1322,16 @@ export function useComposerDraft({
       // DALTON-HOOK(composer-drafts): the offered unresolved-send copies follow
       // the key — what the new key's slot holds shows above the box. A send
       // still out keeps its own copy out of the offers (migrated below).
+      const activeCopyId =
+        inFlightSendRef.current &&
+        !inFlightSendRef.current.settled &&
+        inFlightSendRef.current.draftKey === draftKey
+          ? inFlightSendRef.current.copyId
+          : undefined;
       setInFlightCopiesState(
         prefillMessageRef.current || hadPrefillRef.current
           ? []
-          : (draftKey ? loadInFlightCopies(draftKey, userId) : []),
+          : (draftKey ? loadInFlightCopies(draftKey, userId).filter((c) => c.id !== activeCopyId) : []),
       );
 
       // Migrate post-send continuation draft when `ws:<id>:new` resolves to `thread:<id>`
@@ -1199,6 +1381,7 @@ export function useComposerDraft({
           // The migrated copy belongs to the active send: no banner for it.
           setInFlightCopiesState((prevOffers) => prevOffers.filter((c) => c.id !== inFlight.copyId));
           return () => {
+            if (activeDraftKeyRef.current !== draftKey) flushPendingWrites(draftKey);
             if (timerRef.current !== null) {
               clearTimeout(timerRef.current);
               timerRef.current = null;
@@ -1227,6 +1410,7 @@ export function useComposerDraft({
           writtenSinceMountOrSendRef.current = true;
           setMessageState(continuationText);
           return () => {
+            if (activeDraftKeyRef.current !== draftKey) flushPendingWrites(draftKey);
             if (timerRef.current !== null) {
               clearTimeout(timerRef.current);
               timerRef.current = null;
@@ -1249,10 +1433,19 @@ export function useComposerDraft({
       const hasExternalPrefill =
         Boolean(prefillMessageRef.current) ||
         (!draftKeyChanged && hadPrefillRef.current);
-      if (
-        !hasExternalPrefill &&
-        !(userIdChanged && !draftKeyChanged && dirtyRef.current)
-      ) {
+      // The user loading under the same key leaves typed text alone: only an
+      // empty composer takes that user's stored draft. A switch between two
+      // signed-in users keeps the rule it had (skip only unsaved typing).
+      const userLoaded = userIdChanged && !draftKeyChanged && prev.userId === 'anon';
+      const keepTyped = userLoaded
+        ? Boolean(latestMessageRef.current.trim())
+        : userIdChanged && !draftKeyChanged && dirtyRef.current;
+      if (userLoaded && keepTyped && draftKey) {
+        save(draftKey, latestMessageRef.current, userId, undefined, { parts: partsForSave() });
+      }
+      if (!hasExternalPrefill && !keepTyped) {
+        // Not held for a composition: the composer now shows another draft,
+        // and typing held over it would save the old text under the new key.
         const restoredRecord = draftKey ? loadStoredDraft(draftKey, userId) : null;
         const restored = restoredRecord?.text ?? '';
         latestMessageRef.current = restored;
@@ -1263,6 +1456,10 @@ export function useComposerDraft({
     }
 
     return () => {
+      // Writes held for an open composition land on the draft being left. A
+      // user change under the same key keeps them waiting for compositionend;
+      // unmount flushes them in its own effect, declared above.
+      if (activeDraftKeyRef.current !== draftKey) flushPendingWrites(draftKey);
       if (timerRef.current !== null) {
         clearTimeout(timerRef.current);
         timerRef.current = null;
@@ -1272,7 +1469,7 @@ export function useComposerDraft({
         dirtyRef.current = false;
       }
     };
-  }, [draftKey, userId, applyRestored, partsForSave]);
+  }, [draftKey, userId, applyRestored, partsForSave, flushPendingWrites]);
 
   return {
     message,
@@ -1286,5 +1483,8 @@ export function useComposerDraft({
     touchDraft,
     beginSend,
     submitWithDraft,
+    giveBack,
+    onCompositionStart,
+    onCompositionEnd,
   };
 }

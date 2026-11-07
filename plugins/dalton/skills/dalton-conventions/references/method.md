@@ -61,25 +61,15 @@ Dalton 的个股研究按深度分为三个阶段，但**不设固定流程关�
 - **Q10–Q12（反方、催化剂与组合角色）**：⑩ 完整空方逻辑（Anti-thesis）与 Pre-mortem；⑪ 催化剂路径与可量化证伪阈值（Kill Criteria）；⑫ 仓位建议、对冲方案与零基审视。
 
 ### Investment Memo 12 段结构
-1. **投资结论与核心摘要（Executive Summary）**（≤3 句核心判断 + 目标价/IRR + 仓位建议）
-2. **业务本质与单位经济（Business Model & Unit Economics）**
-3. **行业空间与竞争格局（Industry Structure & Competitive Moat）**
-4. **管理层评估与资本配置（Management & Capital Allocation）**
-5. **核心论点支柱（Thesis Pillars 1–3）**（每条含驱动因子、量化预测与证据）
-6. **预期差分析（Variant Perception vs Street）**
-7. **财务模型与盈利质量（Financial Model & Quality Lenses）**
-8. **估值与三情景风险回报（Valuation & Bull/Base/Bear Scenarios）**
-9. **完整反方逻辑与事前验尸（Anti-Thesis & Pre-Mortem）**
-10. **催化剂日历与跟踪指标（Catalyst Path & KPIs to Watch）**
-11. **证伪条件与退出纪律（Falsifiers / Kill Criteria）**
-12. **组合角色与风险对冲（Sizing, Hedging & Portfolio Fit）**
+完整覆盖备忘录的章节结构以 `dalton-full-coverage/references/memo-writing.md` 为准。
 
 ---
 
 ## 5. Good Business / Good People / Good Price 分离原则
 
 - **严禁把"好公司"直接等同于"好股票"**：商业质量（Good Business）、管理层与资本配置（Good People）、估值与预期差（Good Price）必须独立打分、分开判断。
-- 一家基本面极佳但估值已充分计入乐观预期的公司，结论应为"好生意但当前无高赔率"（Good Business, Fair/Bad Price〔好生意，但价格合理或偏贵〕：方向可定为 `neutral`〔中性〕，行动分类定为"等价格"〔附买点价带〕或"不参与"，并写明限制变量与改判条件），等待买点而非强行上调目标倍数。
+- 一家基本面极佳但估值已充分计入乐观预期的公司，结论应为"好生意但当前无高赔率"（Good Business, Fair/Bad Price〔好生意，但价格合理或偏贵〕：方向可定为 `neutral`〔中性〕，行动分类定为"等待买点"〔附买点价带〕或"暂不参与"，并写明限制变量与改判条件），等待买点而非强行上调目标倍数。
+- **三项定义与评级档位**：Good Business（评级：`强`、`中`、`弱`）看赚钱容易吗（资产轻重、毛利率、资本密度、营运资本）、赚钱多吗（ROIC〔投入资本回报率〕对 WACC〔加权平均资本成本〕、FCF〔自由现金流〕利润率、份额）、赚钱久吗（护城河、行业结构、替代威胁）及定价和变现余量（为什么克制、什么条件下释放、客户要付出什么代价）；Good People（评级：`强`、`中`、`弱`）看长期导向、管理团队、组织与激励、过去三年指引兑现、资本配置、持股与增减持、员工信号；Good Price（评级：`便宜`、`合理`、`偏贵`）看现价要求公司做到什么（市场隐含预期），DCF〔现金流折现〕等内在价值、可比公司倍数、历史估值区间三种方法交叉验证的结论（完整覆盖称为“估值三角”，有可分拆业务、大额净现金或投资时加做分部加总），以及回报是否值得承担风险。
 
 ---
 

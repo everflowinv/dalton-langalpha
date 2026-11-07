@@ -28,6 +28,8 @@ web/src/pages/ChatAgent/hooks/__tests__/useChatMessages.draftGiveBack.test.ts
 web/src/pages/ChatAgent/components/chatView/__tests__/useMessageActionBundles.publish.test.tsx
 # sync3 B11 r4（审查修正）：手机端仪表盘 composer 按 outcome 收起/保留。
 web/src/pages/Dashboard/__tests__/ChatInputCard.mobileDraft.test.tsx
+# Chief of Staff copies a binary file out of a shared workspace (workspace-sharing-settings).
+tests/unit/tools/secretary/test_workspace_file_copy_cos.py
 agent_config.dalton.yaml
 config.dalton.yaml
 docker-compose.dalton.yml
@@ -141,3 +143,7 @@ tests/unit/middleware/workflow/test_partial_artifacts.py
 # each POST; the sequence test pins one wake for one follow-up.
 tests/unit/middleware/test_subagent_orphan_resume.py
 tests/unit/server/services/test_task_report_back.py
+# Provenance batching module and unit tests (thread 7ef20255 OOM fix).
+web/src/pages/ChatAgent/session/stream/provenanceBatch.ts
+web/src/pages/ChatAgent/session/stream/__tests__/provenanceBatch.test.ts
+web/src/pages/ChatAgent/session/history/__tests__/replayHistory.provenanceBatch.test.ts

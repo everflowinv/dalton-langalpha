@@ -12,11 +12,11 @@
 | **`THESIS_BROKEN`** | **证伪** | 触发预设的硬性证伪条件（Falsifier / Kill Criteria），核心投资逻辑不复存在。立即启动零基审视并写入复盘教训（`lessons.md`）；动作按下方 stance × verdict 查表。 |
 | **`NEW_THESIS`** | **新论点** | 公司发生重大业务转型、并购重组、新产品周期或管理层更迭，原有框架不再适用，需要新建 Thesis 支柱或 Debate。 |
 
-- **词形硬性规定**：在 JSON（如 `knowledge_append_verdict` 参数）与数据库 `dalton_verdicts`（渲染为 `verdicts.md`）中**一律使用Playbook正式词形**（`NO_CHANGE`、`THESIS_STRENGTHENED`、`THESIS_WEAKENED`、`THESIS_BROKEN`、`NEW_THESIS`），**严禁使用 `STRENGTHENED`、`WEAKENED`、`BROKEN` 等旧简写**；在渲染出的 Markdown 与用户界面中统一显示对应的**中文短标签**（无变化、强化、削弱、证伪、新论点）。
+- **词形硬性规定**：在 JSON（如 `knowledge_append_verdict` 参数）与数据库 `dalton_verdicts`（渲染为 `verdicts.md`）中**一律使用Playbook正式词形**（`NO_CHANGE`、`THESIS_STRENGTHENED`、`THESIS_WEAKENED`、`THESIS_BROKEN`、`NEW_THESIS`），**严禁使用 `STRENGTHENED`、`WEAKENED`、`BROKEN` 等旧简写**；在给 PM 读的报告正文、笔记与推送正文中一律只写对应的**中文短标签**（无变化、强化、削弱、证伪、新论点），不把英文枚举写进正文。
 
 ### 动作映射：按 stance × verdict 查表
 
-verdict（上文五词结论）描述的是论点本身的变化，动作要看 stance（持仓方向：long 多头 / short 空头 / neutral 中性 / no_view 无观点）。同一个 verdict 在多头和空头立场下指向相反的动作：
+verdict（上文五词结论）描述的是论点本身的变化，动作要看 stance（持仓方向：long 看多 / short 看空 / neutral 中性 / no_view 暂不表态）。同一个 verdict 在看多和看空立场下指向相反的动作：
 
 | verdict | long 立场下的倾向 | short 立场下的倾向 |
 |---|---|---|
@@ -34,8 +34,8 @@ verdict（上文五词结论）描述的是论点本身的变化，动作要看 
 
 每次调用 `knowledge_append_verdict` 或撰写事件点评时，必须完整包含以下五项：
 1. **事件描述与发生日期（Event & Date）**：具体发生了什么客观事件或披露。
-2. **映射的目标节点（Target Pillar / Debate / Driver）**：明确指向知识层中的哪个 Thesis 支柱（如 `P1`）、哪条核心争议（如 `D2`）或哪个业务驱动因子（如 `K1`）。
-3. **五词结论（Verdict）**：从上述 5 个正式枚举值中选择一个。
+2. **映射的目标节点（Target Pillar / Debate / Driver）**：明确指向知识层中的哪个 Thesis 支柱、哪条核心争议或哪个业务驱动因子（JSON 参数 `affected` 填编号如 `P1`、`D2`、`K1`；报告正文和推送正文用一句话直接写出该支柱、分歧或驱动变量的具体内容，不写编号）。
+3. **五词结论（Verdict）**：JSON 填上述 5 个正式枚举值之一，报告正文和推送正文写中文短标签（无变化 / 强化 / 削弱 / 证伪 / 新论点）。
 4. **量化证据与来源（Evidence & Source Attribution）**：实际数字 vs 预期数字（写明公司指引、卖方一致预期或买方 bogey 的各自口径与出处）。
 5. **下一项待验证事项与日期（Next Verification & Date）**：为了确认该趋势延续或反转，下一步要看什么具体指标、在什么时间点验证（同步更新至 `agenda.md`）。
 

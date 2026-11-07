@@ -215,6 +215,8 @@ class PTCAgent:
         role: AgentRole = "analyst",
         channels_enabled: bool = False,
         claude_code: bool = False,
+        # DALTON-HOOK(team-memory-toggle): gate conversation_search prompt sentence on whether tool is mounted
+        conversation_search_enabled: bool = False,
     ) -> str:
         """Build the static system prompt (excludes time/profile for cacheability).
 
@@ -257,6 +259,8 @@ class PTCAgent:
             role=role,
             channels_enabled=channels_enabled,
             claude_code=claude_code,
+            # DALTON-HOOK(team-memory-toggle): gate conversation_search prompt sentence on whether tool is mounted
+            conversation_search_enabled=conversation_search_enabled,
         )
 
     def _get_tool_summary(self, mcp_registry: MCPRegistry) -> str:
@@ -304,6 +308,8 @@ class PTCAgent:
         tail_turn_no_new_work: bool = False,
         computers: ComputerReach | None = None,
         claude_code_launcher: "Callable[[PTCSandbox], Launcher] | None" = None,
+        # DALTON-HOOK(team-memory-toggle): per-workspace / Home user-level Team Memory switch
+        team_memory_enabled: bool = False,
     ) -> Any:
         """Create a deepagent with PTC pattern capabilities.
 
@@ -881,6 +887,20 @@ class PTCAgent:
             else WorkspaceLayout.LARGE_TOOL_RESULTS_DIR
         )
 
+        # DALTON-HOOK(dalton-tools): build role-scoped Dalton tools before rendering prompt
+        # DALTON-HOOK(team-memory-toggle): mount conversation_search and render its prompt line only when enabled
+        from src.dalton.tools import build_dalton_tools
+
+        dalton_tools = build_dalton_tools(
+            role,
+            filesystem_backend,
+            user_tier=user_tier,
+            team_memory_enabled=team_memory_enabled,
+        )
+        conversation_search_enabled = any(
+            getattr(t, "name", None) == "conversation_search" for t in dalton_tools
+        )
+
         render_prompt = partial(
             self._build_system_prompt,
             subagent_summary,
@@ -898,6 +918,7 @@ class PTCAgent:
             role=role,
             channels_enabled=gates.channels,
             claude_code=claude_code,
+            conversation_search_enabled=conversation_search_enabled,  # DALTON-HOOK(team-memory-toggle)
         )
         # Read once: the baseline freezes this value per epoch, and the
         # prompt is sent with the frozen one (FrozenPromptMiddleware).
@@ -1282,9 +1303,8 @@ class PTCAgent:
         # DALTON-HOOK(dalton-tools): bind role-scoped Dalton knowledge/publish/director tools onto the main agent (PK.4, PK.11, PK.19).
         # ``user_tier`` (resolved by the async builder) withholds internal-only
         # tools from external members here, at mount time.
-        from src.dalton.tools import build_dalton_tools
-
-        tools = [*tools, *build_dalton_tools(role, filesystem_backend, user_tier=user_tier)]
+        # DALTON-HOOK(team-memory-toggle): reuse dalton_tools built above for prompt/tool parity
+        tools = [*tools, *dalton_tools]
         if direct_tools:
             tools = [*tools, *direct_tools]
 

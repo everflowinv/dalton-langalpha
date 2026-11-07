@@ -24,7 +24,7 @@ import { focusWithoutRing } from '@/lib/inputModality';
 import { cn } from '@/lib/utils';
 import type { WidgetContextSnapshot } from '@/pages/Dashboard/widgets/framework/contextSnapshot';
 import './chat-input.css';
-import type { ComposerDraft, ComposerScope, ComposerSend, ContextPayload, ModelOptions, ReadyAttachment, SlashCommand, ThreadTuning, Workspace } from './chat-input.types';
+import type { ComposerDraft, ComposerScope, ComposerSend, ContextPayload, ModelOptions, QuoteMention, ReadyAttachment, SlashCommand, ThreadTuning, Workspace } from './chat-input.types';
 import { isLargePaste, getModelDisplayName, sameMention } from './chat-input.helpers';
 import { effortLabelFor, resolveEffort } from '@/lib/modelTuning';
 import { ChatInputWidgetDeck, MentionAutocompleteList, SlashCommandList } from './chat-input.parts';
@@ -282,7 +282,11 @@ function ChatInput({
   const handleDraftKeySwitch = useCallback(() => {
     resetRichDraftRef.current();
   }, []);
-  const { message, setMessage, restoredQuotes, restoredHadAttachments, inFlightCopies, restoreInFlightCopy, discardInFlightCopy, clearCurrentDraft, touchDraft, submitWithDraft } = useComposerDraft({
+  // DALTON-HOOK(composer-drafts): give-back and IME composition hold come from useComposerDraft
+  const {
+    message, setMessage, restoredQuotes, restoredHadAttachments, inFlightCopies, restoreInFlightCopy, discardInFlightCopy, clearCurrentDraft, touchDraft, submitWithDraft,
+    giveBack: giveBackDraft, onCompositionStart: holdDraftWrites, onCompositionEnd: releaseDraftWrites,
+  } = useComposerDraft({
     draftKey,
     prefillMessage,
     onDraftKeySwitch: handleDraftKeySwitch,
@@ -506,7 +510,18 @@ function ChatInput({
     // Sent text first, then whatever was typed since — and nothing after it
     // when nothing was.
     if (back.text) setMessage((prev) => (prev.trim() ? withGivenBack(back.text, prev) : back.text));
-    if (back.mentions.length > 0) setMentionedFiles((prev) => [...prev, ...back.mentions]);
+    if (back.mentions.length > 0) {
+      const backQuotes = back.mentions.filter((m): m is QuoteMention => m.kind === 'quote');
+      const heldQuotes = held.filter((m): m is QuoteMention => m.kind === 'quote');
+      draftPartsRef.current = {
+        ...draftPartsRef.current,
+        quotes: [
+          ...heldQuotes,
+          ...backQuotes.filter((q) => !heldQuotes.some((p) => p.token === q.token)),
+        ],
+      };
+      setMentionedFiles((prev) => [...prev, ...back.mentions]);
+    }
   }, [setMessage, setMentionedFiles]);
   useLayoutEffect(() => {
     returnSendRef.current = returnSendToComposer;
@@ -567,23 +582,45 @@ function ChatInput({
       setTimeout(() => textareaRef.current?.focus(), 0);
     },
     giveBack(text, files = [], { mentions = [], commands = [], focus = true } = {}) {
-      // Through a ref, for what else comes back in the same commit to number against.
-      const back = readGivenBack(text, mentions, givenBackBesideRef.current);
-      givenBackBesideRef.current = [...givenBackBesideRef.current, ...back.mentions];
-      if (back.text) setMessage((prev) => withGivenBack(prev, back.text));
-      restoreFiles(files);
-      if (back.mentions.length > 0) setMentionedFiles((prev) => [...prev, ...back.mentions]);
-      restoreSlash(commands);
-      if (focus) setTimeout(() => textareaRef.current?.focus(), 0);
+      // DALTON-HOOK(composer-drafts): handed-back draft waits for an open IME composition
+      const preview = readGivenBack(text, mentions, givenBackBesideRef.current);
+      const previewQuotes = preview.mentions.filter((m): m is QuoteMention => m.kind === 'quote');
+      giveBackDraft(preview.text, {
+        parts: {
+          quotes: previewQuotes,
+          hadAttachments: files.length > 0,
+        },
+        onSeat: () => {
+          // Through a ref, for what else comes back in the same commit to number against.
+          const back = readGivenBack(text, mentions, givenBackBesideRef.current);
+          givenBackBesideRef.current = [...givenBackBesideRef.current, ...back.mentions];
+          const backQuotes = back.mentions.filter((m): m is QuoteMention => m.kind === 'quote');
+          if (backQuotes.length > 0 || files.length > 0) {
+            const existingQuotes = draftPartsRef.current.quotes ?? [];
+            draftPartsRef.current = {
+              quotes: [
+                ...existingQuotes,
+                ...backQuotes.filter((q) => !existingQuotes.some((p) => p.token === q.token)),
+              ],
+              hadAttachments: Boolean(draftPartsRef.current.hadAttachments || files.length > 0),
+            };
+          }
+          restoreFiles(files);
+          if (back.mentions.length > 0) setMentionedFiles((prev) => [...prev, ...back.mentions]);
+          restoreSlash(commands);
+          if (focus) setTimeout(() => textareaRef.current?.focus(), 0);
+          return back.text;
+        },
+      });
     },
     send() {
       return sendRef.current();
     },
-    // DALTON-HOOK(composer-drafts): include setMessage from useComposerDraft
+    // DALTON-HOOK(composer-drafts): include setMessage and giveBackDraft from useComposerDraft
     focus() {
       textareaRef.current?.focus();
     },
-  }), [pillModel, sentEffort, resolvedFastMode, effectiveMarketWatch, draftSubagents, ownOverrides, mentionedFiles, setMentionedFiles, addMention, addQuote, restoreFiles, restoreSlash, handleFiles, abandonListening, setMessage]);
+  }), [pillModel, sentEffort, resolvedFastMode, effectiveMarketWatch, draftSubagents, ownOverrides, mentionedFiles, setMentionedFiles, addMention, addQuote, restoreFiles, restoreSlash, handleFiles, abandonListening, setMessage, giveBackDraft]);
 
   // Subscribe to ContextBus so this input mirrors the global widget-context
   // deck. Multiple chat inputs can be visible simultaneously (hero card +
@@ -753,6 +790,8 @@ function ChatInput({
   const handleChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const val = keepWhole(e.target.value, e.target.selectionStart);
     setMessage(val);
+    // DALTON-HOOK(composer-drafts): an input the browser marks as outside any composition ends one whose compositionend never came
+    if ((e.nativeEvent as InputEvent).isComposing === false) releaseDraftWrites();
     const cursorPos = e.target.selectionStart;
 
     pruneDraft(val);
@@ -760,8 +799,8 @@ function ChatInput({
     // A live /slash trigger wins: the two menus never show at once.
     if (detectSlash(val, cursorPos)) closeMentions();
     else detectMention(val, cursorPos);
-  // DALTON-HOOK(composer-drafts): include setMessage from useComposerDraft
-  }, [keepWhole, pruneDraft, detectSlash, detectMention, closeMentions, setMessage]);
+    // DALTON-HOOK(composer-drafts): include setMessage and releaseDraftWrites from useComposerDraft
+  }, [keepWhole, pruneDraft, detectSlash, detectMention, closeMentions, setMessage, releaseDraftWrites]);
 
   // Close both autocompletes on blur
   const handleBlur = useCallback(() => {
@@ -1189,12 +1228,15 @@ function ChatInput({
               onSelect={handleSelect}
               onBlur={handleBlur}
               onScroll={(e) => { if (tokenLayerRef.current) tokenLayerRef.current.scrollTop = e.currentTarget.scrollTop; }}
+              // DALTON-HOOK(composer-drafts): rewrites from outside the user's typing wait for the IME composition to end
               onCompositionStart={() => {
+                holdDraftWrites();
                 // Terminate voice input if IME starts
                 if (isListening) {
                   stopListening();
                 }
               }}
+              onCompositionEnd={releaseDraftWrites}
               // Named apart from the placeholder, which says what state the
               // thread is in and is empty while listening.
               aria-label={t("chat.composer.messageLabel")}

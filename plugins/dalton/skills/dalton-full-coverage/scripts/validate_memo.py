@@ -125,7 +125,7 @@ def validate_memo_text(
             if not questions_path.exists():
                 fails.append(f"缺公司问题清单：{questions_path}")
             else:
-                fails.extend(validate_agenda(questions_path.read_text(encoding="utf-8")))
+                fails.extend(validate_agenda(questions_path.read_text(encoding="utf-8"), warnings=warns))
         if effective_part >= 2:
             fails.extend(check_thesis_and_risk_citations(text))
         used_cites = set(CITE.findall(text))
@@ -178,7 +178,7 @@ def validate_memo_text(
         if not questions_path.exists():
             fails.append(f"缺公司问题清单：{questions_path}")
         else:
-            fails.extend(validate_agenda(questions_path.read_text(encoding="utf-8")))
+            fails.extend(validate_agenda(questions_path.read_text(encoding="utf-8"), warnings=warns))
 
     used_cites, c_fails, c_warns = check_citation_closure(text)
     fails.extend(c_fails)

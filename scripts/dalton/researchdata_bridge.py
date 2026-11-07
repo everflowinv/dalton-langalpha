@@ -1505,6 +1505,7 @@ def build_researchdata_plugin_instruction() -> str:
         f"{RESEARCH_EVIDENCE_AND_ROUTE_GUIDE.replace(chr(10), ' ')} "
         'Finance: `finance(route="sec"|"estimates"|"cn-hk")`. '
         'Macro: `macro(route="fred"|"treasury"|"market-regime")`. '
+        'SEC 调用约定（网关在缺省 form 时默认 10-Q）：form 与附件文件名都是顶层参数——要 8-K、424B5、Form 4（写 "4"）等非 10-Q 文件必须显式传顶层 form（如 finance(route="sec", operation="list-filings", ticker="DASH", form="4")）；attachments 取正文用顶层 document（写在 params.document/doc_id 里会被桥自动提到顶层，但请直接写顶层）。 '
         "Read only ids that search returned (`wiki:`, `mail:`, `tmtb:`, `funda:`, `alphaengine` opaque string doc_id including `_inst_` suffix). "
         "Page long text with params.offset/max_chars (offset >= 0, max_chars 1-30000; SEC attachments/read-item allow up to 500000; get_document supports params.content_field with independent pagination per field). "
         "Leave `timeout` unset: the bridge sets per-route limits and long reads may take minutes. "
@@ -2168,9 +2169,9 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
             "ticker": "美股代码（如 'META'、'NVDA'）",
             "query": "检索关键词（smart-facts / search-concepts / search-text 必填）",
             "as_of": "YYYY-MM-DD",
-            "form": "10-K | 10-Q | 8-K | 20-F | 4",
+            "form": "表单代码，顶层参数，原样传给网关（10-K | 10-Q | 8-K | 20-F | 4 | 424B5 | S-1 …）；网关在缺省 form 时默认 10-Q，要 8-K、424B5、Form 4（写 '4'）等必须显式传顶层 form（params.form/form_type 桥会自动提到顶层）",
             "item": "SEC 章节号（如 '1A'、'7'、'2.02'，仅 read-item）",
-            "document": "附件文件名（仅 attachments，与 params.document_type 互斥）",
+            "document": "附件文件名（仅 attachments），必须放顶层；写进 params.document/doc_id 的会被桥自动提到顶层",
             "params.accession": "SEC 完整 accession 编号（10-2-6 数字，如 '0001326801-26-000010'，仅 attachments）",
             "params.document_type": "附件类型（非空字符串，如 'EX-99.1'，仅 attachments，与顶层 document 互斥）",
             "params.max_chars": "正文读取最大字符数（正整数 1–500000，仅 attachments / read-item）",
@@ -2181,9 +2182,11 @@ ROUTE_CONTRACT_SPECS: dict[str, dict[str, Any]] = {
         "return_shape": "{\"ok\": true, \"status\": \"ok\", \"ticker\": \"META\", \"rows\"|\"data\": ..., \"_sources\": [...], \"normalized_params\": {...}}",
         "examples": [
             "finance(route=\"sec\", operation=\"financials\", ticker=\"META\", form=\"10-K\", limit=5, params={\"statement\": \"income\"})",
+            "finance(route=\"sec\", operation=\"list-filings\", ticker=\"DASH\", form=\"4\", limit=5)",
             "finance(route=\"sec\", operation=\"smart-facts\", ticker=\"META\", query=\"revenue advertising\", limit=10)",
             "finance(route=\"sec\", operation=\"read-item\", ticker=\"META\", form=\"10-K\", item=\"7\", params={\"max_chars\": 100000})",
             "finance(route=\"sec\", operation=\"attachments\", ticker=\"META\", form=\"8-K\", params={\"accession\": \"0001326801-26-000010\", \"document_type\": \"EX-99.1\", \"max_chars\": 100000})",
+            "finance(route=\"sec\", operation=\"attachments\", ticker=\"NVDA\", document=\"q1fy27pr.htm\", params={\"accession\": \"0001045810-26-000024\", \"max_chars\": 100000})",
         ],
     },
     "estimates": {
@@ -3446,6 +3449,79 @@ def _normalize_guidepoint_params(
     return None
 
 
+def _normalize_sec_form_types(
+    normalized: dict[str, Any], nested_pairs: list[tuple[str, Any]]
+) -> dict[str, Any] | None:
+    """SEC 表单类型的统一规范化：先把嵌套 params.* 的拼写并入，再统一做
+    单元素列表展开与多元素列表报错（第 2 轮审查：先展开再提升会把
+    ``["8-K"]`` 字符串化成 ``"['8-K']"`` 转发，网关认不出就落回默认 10-Q）。
+
+    嵌套值已由调用方从 ``params`` 里 pop 出来（``nested_pairs`` 携带
+    ``params.form=...`` 式的出处）。顶层标量始终原样透传；顶层 ``"8-K"`` 与
+    嵌套 ``["8-K"]`` 视为一致、不报冲突。参数冲突时返回不含
+    ``normalized_params`` 的错误字典（调用方补视图），成功返回 None。
+    """
+
+    def _conflict(error: str, hint: str) -> dict[str, Any]:
+        return {
+            "_declared_sources": [],
+            "_sources": [],
+            "ok": False,
+            "status": "invalid_arguments",
+            "error_code": "parameter_conflict",
+            "error_category": "参数错误",
+            "error": error,
+            "hint": hint,
+        }
+
+    top_raw = normalized.get("form")
+    top_scalar = top_raw if isinstance(top_raw, str) else ""
+    top_scalar = top_scalar.strip() if top_scalar else ""
+    entries: list[tuple[str, Any]] = (
+        [("form", top_raw)] if isinstance(top_raw, list) else []
+    ) + list(nested_pairs)
+
+    candidates: list[tuple[str, str]] = []
+    if top_scalar:
+        candidates.append(("form", top_scalar))
+    for where, value in entries:
+        if value is None:
+            continue
+        if isinstance(value, list):
+            kept = [str(v).strip() for v in value if v is not None and str(v).strip()]
+            if not kept:
+                continue
+            if len(kept) > 1:
+                return _conflict(
+                    f"[参数错误] SEC form 一次只能取一种表单类型（当前传入 "
+                    f"{where}={value!r}）；要多种类型请分别调用。",
+                    "请把 form 传为单个表单代码（如 '8-K'、'424B5'、'4'）。",
+                )
+            candidates.append((where, kept[0]))
+        else:
+            text = str(value).strip()
+            if text:
+                candidates.append((where, text))
+
+    distinct = {v for _, v in candidates}
+    if len(distinct) > 1:
+        desc = ", ".join(f"{w}={v!r}" for w, v in candidates)
+        return _conflict(
+            f"[参数错误] SEC 表单类型同时传入了不一致的值 ({desc})。",
+            "SEC 的 form 是顶层参数（网关不传 form 时默认 10-Q）；"
+            "请只保留一个顶层 form（如 '8-K'、'424B5'、'4'）后重试。",
+        )
+
+    if distinct:
+        value = next(iter(distinct))
+        # 顶层为空或是列表（单元素展开）时写入统一值；顶层标量原样保留。
+        if not top_scalar:
+            normalized["form"] = value
+    elif isinstance(top_raw, list):
+        normalized["form"] = None
+    return None
+
+
 def _normalize_and_validate_call_args(
     tool_name: str,
     raw_args: dict[str, Any],
@@ -3572,6 +3648,11 @@ def _normalize_and_validate_call_args(
 
     if isinstance(normalized.get("ticker"), str):
         normalized["ticker"] = _normalize_ticker_for_route(route, normalized["ticker"])
+
+    # SEC 表单类型的统一规范化（嵌套先提升、再展开/报错）推迟到 params 提升
+    # 之后做：单元素列表展开与多元素报错必须看到提升合并后的值，否则
+    # params.form=["8-K"] 会被 str() 成 "['8-K']" 转发给网关。
+    sec_nested_form_pairs: list[tuple[str, Any]] = []
 
     # The gateway accepts query/start/end only on these routes (the library
     # ones add `document`) and refuses a separate `--ticker`, so fold it into
@@ -3723,10 +3804,43 @@ def _normalize_and_validate_call_args(
             if p_dict.get("doc_id") is not None and str(p_dict.get("doc_id")) != "":
                 p_dict["doc_id"] = _normalize_alphaengine_doc_id(p_dict["doc_id"])
             normalized["params"] = p_dict
+        elif route == "sec":
+            # The gateway takes the attachment filename and the form type as
+            # top-level flags (--document / --form); nested spellings die as
+            # unknown params, and a form lost that way answers the gateway's
+            # default 10-Q instead of the caller's 8-K/424B5/Form 4 (threads
+            # 1f9c1246, d9750d0e). Hoist both like the internal-library read
+            # path does; conflicts were already refused above, and an equal
+            # top-level spelling simply drops the nested copy.
+            hoisted_doc = ""
+            for sec_doc_k in ("document", "doc_id", "id", "document_id", "doc", "file_id"):
+                if sec_doc_k not in p_dict:
+                    continue
+                sec_doc_v = p_dict.pop(sec_doc_k)
+                if sec_doc_v is None:
+                    continue
+                sec_doc_str = str(sec_doc_v).strip()
+                if sec_doc_str and not hoisted_doc:
+                    hoisted_doc = sec_doc_str
+            if hoisted_doc and not str(normalized.get("document") or "").strip():
+                normalized["document"] = hoisted_doc
+            sec_nested_form_pairs = [
+                (f"params.{sec_form_k}", p_dict.pop(sec_form_k))
+                for sec_form_k in ("form", "form_type", "filing_type", "report_type")
+                if sec_form_k in p_dict
+            ]
+            normalized["params"] = p_dict
     elif route == "alphaengine" and normalized.get("document") is not None:
         top_doc_str = _normalize_alphaengine_doc_id(normalized.pop("document"))
         if top_doc_str != "":
             normalized["params"] = {"doc_id": top_doc_str}
+
+    if route == "sec":
+        sec_form_err = _normalize_sec_form_types(normalized, sec_nested_form_pairs)
+        if sec_form_err is not None:
+            norm_view = _build_normalized_params_view(normalized, is_community=is_comm)
+            sec_form_err["normalized_params"] = norm_view
+            return normalized, norm_view, sec_form_err
 
     norm_view = _build_normalized_params_view(normalized, is_community=is_comm)
 

@@ -336,6 +336,12 @@ ALLOWED_HOOKS=(
   # sync3 B11 r4（审查修正）：legacy 首读不再无条件把 keep_updated 写回
   # TRUE——101 迁移已回填过，属主迁移后改成的 False 必须在首读后仍然成立。
   "legacy-keeps-owner-setting"
+  # Team Memory toggle: per-workspace and Home user-level switch for conversation_search
+  "team-memory-toggle"
+  # Provenance batching: replay per-message accumulation and live per-frame flush
+  # with single-copy merge (provenanceBatch.ts, replayHistory.ts,
+  # processStreamEvent.ts, mainEventHandlers.ts, useChatMessages.ts, runtime.ts).
+  "provenance-batch"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

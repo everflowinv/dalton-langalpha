@@ -47,20 +47,28 @@
       ]
     },
     {
-      "name": "12 问初筛成稿",
-      "artifacts": [
-        {
-          "path": "drafts/{as_of}-initial-coverage.md",
-          "min_bytes": 500
-        }
-      ]
-    },
-    {
       "name": "知识层初始化草案",
       "artifacts": [
         {
           "path": "research/{as_of}-ic/knowledge-proposal.json",
           "min_bytes": 50
+        },
+        {
+          "path": "research/{as_of}-ic/underwriting-summary.md",
+          "min_bytes": 20
+        }
+      ]
+    },
+    {
+      "name": "12 问初筛成稿",
+      "artifacts": [
+        {
+          "path": "research/{as_of}-ic/questions.md",
+          "min_bytes": 200
+        },
+        {
+          "path": "drafts/{as_of}-initial-coverage.md",
+          "min_bytes": 500
         }
       ]
     },

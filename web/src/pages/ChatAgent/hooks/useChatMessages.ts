@@ -91,6 +91,8 @@ import { createHistoryWindow, HISTORY_PAGE_TURNS } from '../session/history/hist
 import { createStreamEventProcessor, type StreamRouterDeps } from '../session/stream/processStreamEvent';
 import { DROPPED_BEFORE_RUN, forkRequest, retryRequest, retryRequestFor, sendRequest, settleRetryNotice, type HeldRetry, type RetryNotice, type TurnRequest } from '../session/stream/autoRetry';
 import { createLiveTranscript, type LiveMessages } from '../session/stream/liveMessages';
+// DALTON-HOOK(provenance-batch): frame-batched live provenance buffer
+import { createProvenanceFrameBuffer } from '../session/stream/provenanceBatch';
 import { useSubagentHistory } from '../session/subagents/useSubagentHistory';
 import {
   acquireStreamOwnership as acquireOwnership,
@@ -185,6 +187,16 @@ export function useChatMessages(
   const [liveMessages] = useState(() => createLiveTranscript<ChatMessage[]>([], setMessagesState));
   const setMessages = liveMessages.write;
   useEffect(() => liveMessages.dispose, [liveMessages]);
+  // DALTON-HOOK(provenance-batch): frame-batched live provenance buffer scoped to active thread
+  const [provenanceBuffer] = useState(() =>
+    createProvenanceFrameBuffer({
+      setMessages: liveMessages.write as unknown as (
+        updater: (prev: Record<string, unknown>[]) => Record<string, unknown>[]
+      ) => void,
+      getThreadId: () => threadIdRef.current,
+    }),
+  );
+  useEffect(() => () => provenanceBuffer.clear(), [provenanceBuffer]);
   // What the views get: read-only, since a write from there would skip `messages`.
   const liveView: LiveMessages<ChatMessage[]> = liveMessages;
   const [threadId, setThreadId] = useState<string>(() => {
@@ -574,6 +586,8 @@ export function useChatMessages(
   const replayedRunIdsRef = useRef<string[]>([]);
   // Ref-based thread ID for use inside closures (avoids stale React state in callbacks)
   const threadIdRef = useRef(threadId);
+  // DALTON-HOOK(provenance-batch): generation of the newest history replay
+  const replayGenRef = useRef(0);
   // The edit boxes open on this view's threads, kept across reloads.
   const [editDrafts] = useState(() => createEditDraftStore(() => threadIdRef.current));
 
@@ -599,6 +613,8 @@ export function useChatMessages(
   // success finalize, so their (unpersisted) bubbles deliberately stay
   // unmarked and survive reloads.
   const markTranscriptPersisted = useCallback(({ keepQueued = false }: { keepQueued?: boolean } = {}) => {
+    // DALTON-HOOK(provenance-batch): flush buffered live provenance before marking turn persisted
+    provenanceBuffer.flush();
     // A steer the server refused inside the turn was never stored either, nor
     // yet one still queued in a run that may go on, nor a send it never kept.
     const persisted = (m: ChatMessage) => !m.isHistory && !(m as { queueError?: unknown }).queueError
@@ -615,7 +631,7 @@ export function useChatMessages(
     // tracker armed would make the reload's replay SKIP the user message
     // whose optimistic bubble it just cleared (vanished user bubble).
     recentlySentTrackerRef.current.clear();
-  }, [setMessages]);
+  }, [setMessages, provenanceBuffer]);
   const reportBackWatch = useReportBackWatch({
     threadId,
     workspaceId,
@@ -788,6 +804,8 @@ export function useChatMessages(
     setMessages,
     queueMessages: liveMessages.queue,
     flushMessages: liveMessages.flush,
+    // DALTON-HOOK(provenance-batch): shared live provenance buffer on StreamRuntime
+    provenanceBuffer,
     setIsLoading,
     setIsLoadingHistory,
     setHistoryLoadFailed,
@@ -957,12 +975,17 @@ export function useChatMessages(
         // direction, and no retry can be running under a '__default__' id
         // anyway (the loop breaks on one immediately).
         sessionEpochRef.current += 1;
+        // DALTON-HOOK(provenance-batch): discard old thread's buffered provenance when leaving a real thread
+        if (currentThreadId && currentThreadId !== '__default__') {
+          provenanceBuffer.clear();
+        }
         setThreadId(newThreadId);
       }
 
       // Clear messages only when switching to a different existing thread
       // Preserve messages when transitioning from '__default__' to actual thread ID
       if (isThreadSwitch) {
+        provenanceBuffer.clear();
         setMessages([]);
         setThreadModels([]);
         setTokenUsage(null);
@@ -1119,7 +1142,11 @@ export function useChatMessages(
     const limit = historyWindow.reloadLimit(tid, newest);
     // A replay already running refuses this one, and owns the window.
     const token = historyLoadingRef.current ? null : historyWindow.beginReload();
+    // DALTON-HOOK(provenance-batch): each replay's generation, so an overtaken one keeps its sources off the transcript.
+    // A refused replay (one already running) leaves the running one current.
+    const replayGen = historyLoadingRef.current ? replayGenRef.current : ++replayGenRef.current;
     return replayConversationHistory(runtime, {
+      isCurrent: () => replayGenRef.current === replayGen && threadIdRef.current === tid,
       applyFallbackSuggestion,
       loadFeedback,
       projectSubagentHistory: (byTaskId) => projectSubagentHistory(runtime, byTaskId),
@@ -1794,8 +1821,11 @@ export function useChatMessages(
     hydrateTaskTranscript,
   });
 
-  const cleanupAfterStreamEnd = (assistantMessageId: string) =>
+  const cleanupAfterStreamEnd = (assistantMessageId: string) => {
+    // DALTON-HOOK(provenance-batch): flush buffered provenance on stream end
+    provenanceBuffer.flush();
     cleanupAfterStreamEndImpl(runtime, recoveryDeps, assistantMessageId);
+  };
 
   /**
    * Synthesizes terminal events for a stopped turn and dispatches them through
@@ -1814,6 +1844,8 @@ export function useChatMessages(
   const finalizeStreamingMessage = (assistantMessageId: string) => {
     if (wasStoppedRef.current) return;
     wasStoppedRef.current = true;
+    // DALTON-HOOK(provenance-batch): flush buffered provenance before settling stopped bubble
+    provenanceBuffer.flush();
 
     const refs = {
       contentOrderCounterRef,

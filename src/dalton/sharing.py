@@ -424,6 +424,316 @@ async def upsert_user_cos_sharing(
     }
 
 
+def can_edit_workspace_settings(
+    workspace: Mapping[str, Any] | None,
+    user_id: str | None,
+    *,
+    owner_external: bool = False,
+) -> bool:
+    """Return True only when ``user_id`` is the internal workspace owner (and workspace is not Home)."""
+    if not workspace or owner_external:
+        return False
+    uid = (user_id or "").strip()
+    if not uid:
+        return False
+    if (
+        is_home_row(workspace)
+        or bool(workspace.get("is_home"))
+        or workspace.get("status") in ("unbound", "deleted")
+    ):
+        return False
+    owner_id = str(workspace.get("user_id") or "").strip()
+    return bool(owner_id and uid == owner_id)
+
+
+async def get_workspace_settings(
+    workspace_id: str,
+    *,
+    conn: Any = None,
+) -> dict[str, Any]:
+    """Fetch ``(team_memory_enabled, updated_by, updated_at)`` from ``dalton_workspace_settings``.
+
+    Missing row returns the default policy: ``team_memory_enabled=False``.
+    """
+    cleaned_ws = str(workspace_id or "").strip()
+    default_row: dict[str, Any] = {
+        "workspace_id": cleaned_ws,
+        "team_memory_enabled": False,
+        "updated_by": None,
+        "updated_at": None,
+    }
+    if not cleaned_ws:
+        return default_row
+
+    try:
+        async with get_db_connection(conn) as owned_conn:
+            async with owned_conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT workspace_id, team_memory_enabled, updated_by, updated_at
+                    FROM dalton_workspace_settings
+                    WHERE workspace_id = %s
+                    """,
+                    (cleaned_ws,),
+                )
+                row = await cur.fetchone()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(
+            "Failed to read dalton_workspace_settings for workspace_id=%s: %s",
+            cleaned_ws,
+            exc,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Workspace settings unavailable",
+        ) from exc
+
+    if not row:
+        return default_row
+
+    updated_at = row.get("updated_at")
+    return {
+        "workspace_id": str(row.get("workspace_id") or cleaned_ws),
+        "team_memory_enabled": bool(row.get("team_memory_enabled", False)),
+        "updated_by": row.get("updated_by"),
+        "updated_at": (
+            updated_at.isoformat()
+            if hasattr(updated_at, "isoformat")
+            else updated_at
+        ),
+    }
+
+
+async def upsert_workspace_settings(
+    workspace_id: str,
+    *,
+    team_memory_enabled: bool,
+    updated_by: str,
+    conn: Any = None,
+) -> dict[str, Any]:
+    """Insert or update ``dalton_workspace_settings`` for ``workspace_id``."""
+    cleaned_ws = str(workspace_id or "").strip()
+    if not cleaned_ws:
+        raise HTTPException(status_code=400, detail="workspace_id is required")
+
+    enabled = bool(team_memory_enabled)
+    cleaned_updated_by = (updated_by or "").strip() or None
+
+    async with get_db_connection(conn) as owned_conn:
+        async with owned_conn.transaction():
+            async with owned_conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    WITH ins AS (
+                        INSERT INTO dalton_workspace_settings (
+                            workspace_id, team_memory_enabled, updated_by, updated_at
+                        )
+                        VALUES (%s, %s, %s, NOW())
+                        ON CONFLICT (workspace_id) DO UPDATE SET
+                            team_memory_enabled = EXCLUDED.team_memory_enabled,
+                            updated_by = EXCLUDED.updated_by,
+                            updated_at = NOW()
+                        RETURNING workspace_id, team_memory_enabled, updated_by, updated_at
+                    ),
+                    locked_ws AS (
+                        SELECT w.workspace_id
+                        FROM workspaces w
+                        JOIN ins ON w.workspace_id = ins.workspace_id
+                        FOR UPDATE
+                    )
+                    SELECT ins.workspace_id, ins.team_memory_enabled, ins.updated_by, ins.updated_at
+                    FROM ins
+                    LEFT JOIN locked_ws ON TRUE
+                    """,
+                    (
+                        cleaned_ws,
+                        enabled,
+                        cleaned_updated_by,
+                    ),
+                )
+                row = await cur.fetchone()
+
+    if not row:
+        return {
+            "workspace_id": cleaned_ws,
+            "team_memory_enabled": enabled,
+            "updated_by": cleaned_updated_by,
+            "updated_at": None,
+        }
+
+    updated_at = row.get("updated_at")
+    return {
+        "workspace_id": str(row.get("workspace_id") or cleaned_ws),
+        "team_memory_enabled": bool(row.get("team_memory_enabled", enabled)),
+        "updated_by": row.get("updated_by"),
+        "updated_at": (
+            updated_at.isoformat()
+            if hasattr(updated_at, "isoformat")
+            else updated_at
+        ),
+    }
+
+
+async def get_user_team_memory_settings(
+    user_id: str,
+    *,
+    conn: Any = None,
+) -> dict[str, Any]:
+    """Fetch user-level Home Team Memory setting from ``dalton_user_settings``.
+
+    Defaults to ``home_team_memory_enabled=False`` when no row exists.
+    """
+    cleaned_uid = str(user_id or "").strip()
+    default_row: dict[str, Any] = {
+        "user_id": cleaned_uid,
+        "home_team_memory_enabled": False,
+        "updated_at": None,
+    }
+    if not cleaned_uid:
+        return default_row
+
+    try:
+        async with get_db_connection(conn) as owned_conn:
+            async with owned_conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT user_id, home_team_memory_enabled, updated_at
+                    FROM dalton_user_settings
+                    WHERE user_id = %s
+                    """,
+                    (cleaned_uid,),
+                )
+                row = await cur.fetchone()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(
+            "Failed to read dalton_user_settings for user_id=%s: %s",
+            cleaned_uid,
+            exc,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="User settings unavailable",
+        ) from exc
+
+    if not row:
+        return default_row
+
+    enabled = bool(row.get("home_team_memory_enabled", False))
+    updated_at = row.get("updated_at")
+    return {
+        "user_id": str(row.get("user_id") or cleaned_uid),
+        "home_team_memory_enabled": enabled,
+        "updated_at": (
+            updated_at.isoformat()
+            if hasattr(updated_at, "isoformat")
+            else updated_at
+        ),
+    }
+
+
+async def upsert_user_team_memory_settings(
+    user_id: str,
+    *,
+    home_team_memory_enabled: bool,
+    conn: Any = None,
+) -> dict[str, Any]:
+    """Upsert ``dalton_user_settings`` for ``user_id``."""
+    cleaned_uid = str(user_id or "").strip()
+    if not cleaned_uid:
+        raise HTTPException(status_code=400, detail="user_id is required")
+
+    enabled = bool(home_team_memory_enabled)
+    async with get_db_connection(conn) as owned_conn:
+        async with owned_conn.transaction():
+            async with owned_conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_user_settings (
+                        user_id, home_team_memory_enabled, updated_at
+                    )
+                    VALUES (%s, %s, NOW())
+                    ON CONFLICT (user_id) DO UPDATE SET
+                        home_team_memory_enabled = EXCLUDED.home_team_memory_enabled,
+                        updated_at = NOW()
+                    RETURNING user_id, home_team_memory_enabled, updated_at
+                    """,
+                    (cleaned_uid, enabled),
+                )
+                row = await cur.fetchone()
+
+    if not row:
+        return {
+            "user_id": cleaned_uid,
+            "home_team_memory_enabled": enabled,
+            "updated_at": None,
+        }
+
+    saved = bool(row.get("home_team_memory_enabled", enabled))
+    updated_at = row.get("updated_at")
+    return {
+        "user_id": str(row.get("user_id") or cleaned_uid),
+        "home_team_memory_enabled": saved,
+        "updated_at": (
+            updated_at.isoformat()
+            if hasattr(updated_at, "isoformat")
+            else updated_at
+        ),
+    }
+
+
+async def resolve_turn_team_memory_enabled(
+    *,
+    role: str,
+    workspace_id: str | None = None,
+    user_id: str | None = None,
+    user_tier: str | None = None,
+    conn: Any = None,
+) -> bool:
+    """Resolve whether Team Memory (``conversation_search``) is enabled for this turn.
+
+    Reads directly from PostgreSQL once at turn start with no process-local cache:
+    - Master switch ``settings.conversations.enabled`` must be True.
+    - External members (``user_tier == 'external'``) always get False.
+    - ``chief_of_staff`` (Home) turns read ``dalton_user_settings.home_team_memory_enabled`` for ``user_id``.
+    - Workspace turns (including colleague-dispatch turns) read
+      ``dalton_workspace_settings.team_memory_enabled`` for ``workspace_id``.
+    - Missing row or DB unavailability fails closed to False.
+    """
+    settings = get_dalton_settings()
+    if not settings.conversations.enabled:
+        return False
+    if (user_tier or "").strip().lower() == "external":
+        return False
+
+    normalized_role = (role or "").strip().lower()
+    try:
+        if normalized_role == "chief_of_staff":
+            cleaned_uid = str(user_id or "").strip()
+            if not cleaned_uid:
+                return False
+            row = await get_user_team_memory_settings(cleaned_uid, conn=conn)
+            return bool(row.get("home_team_memory_enabled", False))
+
+        cleaned_ws = str(workspace_id or "").strip()
+        if not cleaned_ws:
+            return False
+        row = await get_workspace_settings(cleaned_ws, conn=conn)
+        return bool(row.get("team_memory_enabled", False))
+    except Exception as exc:
+        logger.debug(
+            "Failed to resolve turn team_memory_enabled (role=%s, workspace_id=%s, user_id=%s): %s",
+            normalized_role,
+            workspace_id,
+            user_id,
+            exc,
+        )
+        return False
+
+
 async def require_team_reader(user_id: str | None) -> str:
     """Verify caller is authenticated and in DALTON_ALLOWED_EMAILS when Dalton auth is on.
 

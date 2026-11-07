@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Offline behavioral regressions for the agenda and the single-track memo."""
 import pathlib
+import re
 import sys
 import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from research_structure import (
     SECTIONS,
+    _is_valid_self_rating,
     QUESTIONS,
     is_legacy_report,
     make_agenda,
@@ -31,6 +33,22 @@ def specimen(merged=False):
         elif s == "公司与商业模式" and merged:
             parts.append("### 行业与竞争")
             parts.append("行业结构在此并入。 [引用2]")
+        elif s == "业务质量":
+            parts += [
+                "### Good Business：高转换成本与负营运资本驱动稳态高回报",
+                "ROIC 显著高于 WACC，详见「公司与商业模式」。 [引用1]",
+                "### Good People：创始人长期导向但指引兑现尚待观察",
+                "详见「管理层」。 [引用1]",
+                "### Good Price：现价已计入乐观增速预期",
+                "详见「财务预测与估值」。 [引用2]",
+                "### 综合判断",
+                "| 维度 | 评级 | 一句理由 |\n"
+                "|---|---|---|\n"
+                "| Good Business | 强 | 负营运资本与高转换成本 [引用1] |\n"
+                "| Good People | 中 | 创始人长期导向但指引兑现待观察 [引用1] |\n"
+                "| Good Price | 偏贵 | 现价已计入乐观增速 [引用2] |",
+                "好生意但价格偏贵，对应方向中性、等待买点。",
+            ]
         else:
             parts.append("本章提供论证。")
     parts += ["## 附录", "计算明细。", "## 引用", "[引用1]: f:F1 （底表｜锚点）", "[引用2]: f:F2 （底表｜锚点）"]
@@ -111,6 +129,187 @@ class ReportCases(unittest.TestCase):
         )
         self.assertTrue(any("摘要" in x and "唯一" in x for x in validate_report_structure(changed)))
 
+    def test_business_quality_missing_subheadings_fails(self):
+        missing_people = self.text.replace(
+            "### Good People：创始人长期导向但指引兑现尚待观察\n\n详见「管理层」。 [引用1]\n\n",
+            "",
+        )
+        self.assertTrue(
+            any("Good People" in x and "三级标题" in x for x in validate_report_structure(missing_people))
+        )
+        for bad_heading in (
+            "### Good Business：{一句判断}",
+            "### Good Business：强 / 中 / 弱",
+            "### Good Business：**强 / 中 / 弱**",
+            "### Good Business：强、中、弱选一",
+            "### Good Business：强",
+        ):
+            bad_doc = self.text.replace(
+                "### Good Business：高转换成本与负营运资本驱动稳态高回报",
+                bad_heading,
+            )
+            self.assertTrue(
+                any("Good Business" in x and "具体判断" in x for x in validate_report_structure(bad_doc)),
+                msg=f"should reject heading: {bad_heading}",
+            )
+        bad_price_heading = self.text.replace(
+            "### Good Price：现价已计入乐观增速预期",
+            "### Good Price：便宜、合理、偏贵选一",
+        )
+        self.assertTrue(
+            any("Good Price" in x and "具体判断" in x for x in validate_report_structure(bad_price_heading))
+        )
+        missing_synth = self.text.replace("### 综合判断", "### 小结")
+        self.assertTrue(
+            any("综合判断" in x and "三级标题" in x for x in validate_report_structure(missing_synth))
+        )
+
+    def test_business_quality_duplicate_subheadings_rejected(self):
+        dup_gb = self.text.replace(
+            "### Good Business：高转换成本与负营运资本驱动稳态高回报",
+            "### Good Business：高转换成本与负营运资本驱动稳态高回报\n\n一段。\n\n### Good Business：低壁垒导致回报偏低",
+        )
+        self.assertTrue(
+            any("Good Business" in x and "重复" in x for x in validate_report_structure(dup_gb))
+        )
+        dup_synth = self.text.replace(
+            "### 综合判断",
+            "### 综合判断\n\n一段。\n\n### 综合判断",
+        )
+        self.assertTrue(
+            any("综合判断" in x and "重复" in x for x in validate_report_structure(dup_synth))
+        )
+
+    def test_business_quality_duplicate_rating_table_or_row_rejected(self):
+        second_table = (
+            "| 维度 | 评级 | 一句理由 |\n"
+            "|---|---|---|\n"
+            "| Good Business | 弱 | 第二套冲突评级 |\n"
+            "| Good People | 中 | 理由 |\n"
+            "| Good Price | 便宜 | 第二套冲突评级 |"
+        )
+        two_tables = self.text.replace(
+            "好生意但价格偏贵，对应方向中性、等待买点。",
+            "好生意但价格偏贵，对应方向中性、等待买点。\n\n" + second_table,
+        )
+        errors_two_tables = validate_report_structure(two_tables)
+        self.assertTrue(any("评级表重复" in x for x in errors_two_tables))
+        self.assertTrue(any("Good Business" in x and "重复" in x for x in errors_two_tables))
+
+        dup_row = self.text.replace(
+            "| Good Business | 强 | 负营运资本与高转换成本 [引用1] |",
+            "| Good Business | 强 | 负营运资本与高转换成本 [引用1] |\n"
+            "| Good Business | 弱 | 重复的维度行 |",
+        )
+        self.assertTrue(
+            any("Good Business" in x and "重复" in x for x in validate_report_structure(dup_row))
+        )
+
+    def test_business_quality_table_without_outer_pipes_accepted(self):
+        no_outer_pipes = self.text.replace(
+            "| 维度 | 评级 | 一句理由 |\n"
+            "|---|---|---|\n"
+            "| Good Business | 强 | 负营运资本与高转换成本 [引用1] |\n"
+            "| Good People | 中 | 创始人长期导向但指引兑现待观察 [引用1] |\n"
+            "| Good Price | 偏贵 | 现价已计入乐观增速 [引用2] |",
+            "维度 | 评级 | 一句理由\n"
+            "---|---|---\n"
+            "Good Business | 强 | 负营运资本与高转换成本 [引用1]\n"
+            "Good People | 中 | 创始人长期导向但指引兑现待观察 [引用1]\n"
+            "Good Price | 偏贵 | 现价已计入乐观增速 [引用2]",
+        )
+        self.assertEqual(validate_report_structure(no_outer_pipes), [])
+        bad_no_outer = no_outer_pipes.replace("Good Price | 偏贵 |", "Good Price | 不便宜 |")
+        self.assertTrue(
+            any("Good Price" in x for x in validate_report_structure(bad_no_outer))
+        )
+
+    def test_business_quality_prose_words_not_accepted_as_ratings(self):
+        prose_only = self.text.replace(
+            "| 维度 | 评级 | 一句理由 |\n"
+            "|---|---|---|\n"
+            "| Good Business | 强 | 负营运资本与高转换成本 [引用1] |\n"
+            "| Good People | 中 | 创始人长期导向但指引兑现待观察 [引用1] |\n"
+            "| Good Price | 偏贵 | 现价已计入乐观增速 [引用2] |",
+            "Good Business：护城河很强；Good People：行业集中；Good Price：不便宜。",
+        )
+        errors_prose = validate_report_structure(prose_only)
+        self.assertTrue(any("评级表" in x for x in errors_prose))
+
+        sentence_in_cells = (
+            self.text.replace("| Good Business | 强 |", "| Good Business | 护城河很强 |")
+            .replace("| Good People | 中 |", "| Good People | 行业集中 |")
+            .replace("| Good Price | 偏贵 |", "| Good Price | 不便宜 |")
+        )
+        errors_cells = validate_report_structure(sentence_in_cells)
+        self.assertTrue(any("Good Business" in x for x in errors_cells))
+        self.assertTrue(any("Good People" in x for x in errors_cells))
+        self.assertTrue(any("Good Price" in x for x in errors_cells))
+
+    def test_business_quality_missing_ratings_in_synthesis_fails(self):
+        two_words = self.text.replace("| Good Business | 强 |", "| Good Business | 强或弱 |")
+        self.assertTrue(
+            any("Good Business" in x for x in validate_report_structure(two_words))
+        )
+        menu_cell = self.text.replace("| Good People | 中 |", "| Good People | 强 / 中 / 弱 |")
+        self.assertTrue(
+            any("Good People" in x for x in validate_report_structure(menu_cell))
+        )
+        placeholder_cell = self.text.replace(
+            "| Good Price | 偏贵 |", "| Good Price | {便宜、合理、偏贵选一} |"
+        )
+        self.assertTrue(
+            any("Good Price" in x for x in validate_report_structure(placeholder_cell))
+        )
+        missing_row = self.text.replace(
+            "| Good Price | 偏贵 | 现价已计入乐观增速 [引用2] |\n", ""
+        )
+        self.assertTrue(
+            any("Good Price" in x and "缺" in x for x in validate_report_structure(missing_row))
+        )
+
+
+class SynthesisTableCases(unittest.TestCase):
+    """「综合判断」只放一张评级表：其他表格不参与计数，也不会让校验崩溃。"""
+
+    def test_extra_table_with_missing_rating_row_reports_errors(self):
+        doc = re.sub(r"^\| Good Business \|.*\n", "", specimen(), count=1, flags=re.M)
+        doc = doc.replace(
+            "### 综合判断\n",
+            "### 综合判断\n\n| 项目 | 说明 |\n|---|---|\n| Good Business | 业务质量说明 |\n\n",
+            1,
+        )
+        errors = validate_report_structure(doc)
+        self.assertTrue(any("只放一张评级表" in e for e in errors))
+        self.assertTrue(any("缺“Good Business”行" in e for e in errors))
+
+    def test_extra_table_listing_a_dimension_in_another_column_is_rejected(self):
+        doc = specimen().replace(
+            "### 综合判断\n",
+            "### 综合判断\n\n序号 | 维度 | 结论\n---|---|---\n1 | Good Business | 弱\n\n",
+            1,
+        )
+        self.assertTrue(any("只放一张评级表" in e for e in validate_report_structure(doc)))
+
+
+    def test_single_column_extra_table_is_rejected(self):
+        doc = specimen().replace(
+            "### 综合判断\n",
+            "### 综合判断\n\n| 备注 |\n| --- |\n| Good Business：弱 |\n\n",
+            1,
+        )
+        self.assertTrue(any("只放一张评级表" in e for e in validate_report_structure(doc)))
+
+
+class SelfRatingParseCases(unittest.TestCase):
+    def test_grade_followed_by_reason_is_accepted(self):
+        for value in ("A B 支线未回", "A，B 支线未回", "A（B 支线未回）", "B（DCF 与可比估值二选一，缺少交叉验证）", "D"):
+            self.assertTrue(_is_valid_self_rating(value), value)
+
+    def test_multiple_grades_or_menus_are_rejected(self):
+        for value in ("A B", "AB", "B-C", "A B C D", "A / B / C / D", "待填写（A / B / C / D）", "A、B、C、D 选一", "A、B、C、D（选一）", "A、B、C、D 四选一"):
+            self.assertFalse(_is_valid_self_rating(value), value)
+
 
 class LegacyReportCases(unittest.TestCase):
     """在途旧结构运行按旧规则校验（第 2 轮 #3）：不报新结构错误。"""
@@ -160,6 +359,15 @@ class LegacyReportCases(unittest.TestCase):
         )
         self.assertTrue(is_legacy_report(partial))
 
+    def test_unnumbered_business_quality_heading_not_counted_as_legacy(self):
+        """新版不带中文序号的「## 业务质量」「## 行业与竞争」不计入旧版标记。"""
+        unnumbered_shared = (
+            "# 混合稿\n\n## 一、公司与业务\n\n内容。\n\n"
+            "## 业务质量\n\n内容。\n\n## 行业与竞争\n\n内容。\n\n"
+            "## 四、核心投资逻辑\n\n内容。\n"
+        )
+        self.assertFalse(is_legacy_report(unnumbered_shared))
+
 
 class DashSampleRegression(unittest.TestCase):
     def test_dash_sample_validates_under_legacy_rules(self):
@@ -172,12 +380,24 @@ class DashSampleRegression(unittest.TestCase):
         self.assertEqual(errors, [])
 
 
+def _filled_agenda(name="虚拟公司", ticker="TEST", fill="已读测试证据"):
+    return (
+        make_agenda(name, ticker)
+        .replace("自评：待填写（A / B / C / D）", "自评：B（已有初步证据支撑）")
+        .replace("待填写", fill)
+    )
+
+
 class AgendaCases(unittest.TestCase):
     def test_generated_scaffold_requires_research(self):
-        self.assertTrue(validate_agenda(make_agenda("虚拟公司", "TEST")))
+        scaffold = make_agenda("虚拟公司", "TEST")
+        self.assertIn("自评：待填写（A / B / C / D）", scaffold)
+        self.assertTrue(validate_agenda(scaffold))
+        blind_replace = scaffold.replace("待填写", "测试材料中的续费与投入证据")
+        self.assertTrue(any("Q1" in x and "自评" in x for x in validate_agenda(blind_replace)))
 
     def test_completed_agenda_has_all_questions(self):
-        agenda = make_agenda("虚拟公司", "TEST").replace("待填写", "测试材料中的续费与投入证据")
+        agenda = _filled_agenda(fill="测试材料中的续费与投入证据")
         self.assertEqual(validate_agenda(agenda), [])
 
     def test_scaffold_sections_are_real_memo_sections(self):
@@ -187,19 +407,57 @@ class AgendaCases(unittest.TestCase):
 
     def test_legacy_chapter_number_targets_still_accepted(self):
         """在途旧运行的 questions.md 写的是「第N章」：继续有效（旧规则收尾）。"""
-        agenda = make_agenda("虚拟公司", "TEST").replace("待填写", "已读测试证据")
+        agenda = _filled_agenda()
         agenda = agenda.replace("论证章节：公司与商业模式", "论证章节：第1章、第2章", 1)
         self.assertEqual(validate_agenda(agenda), [])
 
     def test_unknown_section_target_rejected(self):
-        agenda = make_agenda("虚拟公司", "TEST").replace("待填写", "已读测试证据")
+        agenda = _filled_agenda()
         agenda = agenda.replace("论证章节：公司与商业模式", "论证章节：结论、附录、感想", 1)
         self.assertTrue(any("Q1" in x and "节名" in x for x in validate_agenda(agenda)))
 
     def test_missing_company_specific_question(self):
-        agenda = make_agenda("虚拟公司", "TEST").replace("待填写", "已读测试证据")
+        agenda = _filled_agenda()
         agenda = agenda.replace("公司问题：已读测试证据", "公司问题：", 1)
         self.assertTrue(validate_agenda(agenda))
+
+    def test_self_rating_grades_accepted(self):
+        agenda = _filled_agenda()
+        agenda = agenda.replace("自评：B（", "自评：A（证据充分：", 1)
+        agenda = agenda.replace("自评：B（", "自评：C（主要靠推演：", 1)
+        agenda = agenda.replace("自评：B（", "自评：D（关键证据缺失：", 1)
+        self.assertEqual(validate_agenda(agenda), [])
+        for valid_val in (
+            "B，DCF 对利率敏感，估值仍有次要缺口",
+            "A，B 支线未回",
+            "A（B 支线未回）",
+        ):
+            doc = re.sub(r"^自评：.*$", f"自评：{valid_val}", _filled_agenda(), count=1, flags=re.M)
+            self.assertEqual(validate_agenda(doc), [], msg=f"should accept self rating: {valid_val}")
+
+    def test_missing_self_rating_line_warns_without_error(self):
+        agenda = re.sub(r"^自评：.*\n", "", _filled_agenda(), flags=re.M)
+        warns = []
+        self.assertEqual(validate_agenda(agenda, warnings=warns), [])
+        self.assertEqual(len(warns), 12)
+        self.assertTrue(any("Q1" in w and "自评" in w for w in warns))
+
+    def test_missing_or_invalid_self_rating_rejected(self):
+        agenda = _filled_agenda()
+        for bad_val in (
+            "",
+            "待填写",
+            "待填写（A / B / C / D）",
+            "B-C",
+            "BC",
+            "A / B / C / D",
+            "A B C D",
+        ):
+            doc = re.sub(r"^自评：.*$", f"自评：{bad_val}", agenda, count=1, flags=re.M)
+            self.assertTrue(
+                any("Q1" in x and "A / B / C / D" in x for x in validate_agenda(doc)),
+                msg=f"should reject self rating: {bad_val!r}",
+            )
 
 
 if __name__ == "__main__":

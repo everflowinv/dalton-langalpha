@@ -11,7 +11,7 @@
 
 import i18n from '@/i18n';
 import { isOnline } from '@/lib/network';
-import type { AssistantMessage } from '@/types/chat';
+import type { AssistantMessage, ProvenanceRecord } from '@/types/chat';
 import { replayThreadHistory } from '../../utils/api';
 import { setStoredThreadId } from '../../hooks/utils/threadStorage';
 import { updateMessage } from '../../hooks/utils/messageHelpers';
@@ -20,7 +20,8 @@ import {
   buildModelFallbackSegment, appendNotificationSegmentOnce, mapToolCallIdToAgentId,
 } from '../../hooks/utils/messageFinalizers';
 import { applyCallUsage, handleContextWindowEvent } from '../../hooks/utils/contextWindowEvent';
-import { handleProvenance } from '../stream/mainEventHandlers';
+// DALTON-HOOK(provenance-batch): batch replay provenance per assistant message and flush once at replay end
+import { accumulateReplayProvenance, flushReplayProvenance } from '../stream/provenanceBatch';
 import {
   handleHistoryUserMessage,
   handleHistoryReasoningSignal,
@@ -74,6 +75,12 @@ export interface ReplayHistoryDeps {
   /** Where the loaded transcript starts, reported in the commit that reveals
    *  it, on success only; null when it holds no turn. */
   onPage?: (page: LoadedHistoryPage | null) => void;
+  // DALTON-HOOK(provenance-batch): a replay overtaken by a thread switch or a newer replay keeps its batched sources off the transcript
+  /** Whether this replay still owns the transcript it writes to. Its batched
+   *  source records are written only while it does: bubble ids repeat across
+   *  threads and replays (`history-assistant-<turn>`), and the main replay is
+   *  not aborted when the view moves on. Omitted, the replay always owns it. */
+  isCurrent?: () => boolean;
 }
 
 export async function loadConversationHistory(
@@ -98,7 +105,12 @@ export async function loadConversationHistory(
   // replay's in-progress todos over the loading transcript, then shrank when
   // a run that was over got its leftovers marked stale.
   let lastTodoCard: Record<string, unknown> | null = null;
+  // DALTON-HOOK(provenance-batch): collect provenance records per assistant bubble and write once on reveal
+  const provenanceByMessage = new Map<string, Record<string, ProvenanceRecord>>();
   const reveal = (ok: boolean) => {
+    // A failed load keeps the bubbles it already wrote, so their sources go with them.
+    if (deps.isCurrent?.() ?? true) flushReplayProvenance(provenanceByMessage, setMessagesForHandlers);
+    else provenanceByMessage.clear();
     if (lastTodoCard) rt.updateTodoListCard?.(lastTodoCard);
     deps.beforeReveal?.(ok);
     rt.setIsLoadingHistory(false);
@@ -206,6 +218,8 @@ export async function loadConversationHistory(
     const carryEvents: SSEEvent[] = [];
     try {
       const onEvent = (_rawEvent: Record<string, unknown>): void => {
+      // DALTON-HOOK(provenance-batch): an overtaken replay writes nothing more; its late events would strip and rebuild the newer transcript's bubbles, which share its ids
+      if (deps.isCurrent && !deps.isCurrent()) return;
       stripHistory();
       // Cast to SSEEvent for type-safe field access within this callback
       const event = _rawEvent as SSEEvent;
@@ -372,11 +386,12 @@ export async function loadConversationHistory(
           return;
         }
 
-        handleProvenance({
-          assistantMessageId: currentAssistantMessageId,
-          event: event as unknown as import('@/types/sse').ProvenanceEvent,
-          setMessages: setMessagesForHandlers,
-        });
+        // DALTON-HOOK(provenance-batch): accumulate into per-message map instead of calling setMessages per event
+        accumulateReplayProvenance(
+          provenanceByMessage,
+          currentAssistantMessageId,
+          event as unknown as import('@/types/sse').ProvenanceEvent,
+        );
         return;
       }
 
@@ -818,6 +833,8 @@ export async function loadConversationHistory(
       const result = await replayThreadHistory(threadIdToUse, onEvent, {
         limit: deps.limit, beforeTurn: deps.beforeTurn, signal: deps.signal,
       });
+      // DALTON-HOOK(provenance-batch): an overtaken replay ends here, before it strips, stamps or reveals the newer transcript; the replay that overtook it owns the loading state
+      if (deps.isCurrent && !deps.isCurrent()) return false;
       stripHistory();
       // An older page that did not arrive whole is no page.
       if (olderPage && result?.aborted) return false;
@@ -837,6 +854,8 @@ export async function loadConversationHistory(
       // subagent events (no floating cards during history load).
       deps.projectSubagentHistory(subagentHistoryByTaskId);
     } catch (replayError: unknown) {
+      // DALTON-HOOK(provenance-batch): an overtaken replay's late 404 or failure leaves the newer transcript alone
+      if (deps.isCurrent && !deps.isCurrent()) return false;
       // Handle 404 gracefully - it's expected for brand new threads that haven't been fully initialized yet
       if ((replayError as Error).message && (replayError as Error).message.includes('404')) {
         // Thread not found (404) is expected for brand-new threads — skip silently.
@@ -913,6 +932,8 @@ export async function loadConversationHistory(
     return true;
   } catch (error: unknown) {
     if (olderPage) throw error;
+    // DALTON-HOOK(provenance-batch): an overtaken replay's failure is not the newer transcript's
+    if (deps.isCurrent && !deps.isCurrent()) return false;
     console.error('[History] Error loading conversation history:', error);
     // Only show error if it's not a 404 (404 is expected for new threads).
     // 404 still counts as a successful "no prior history" load — caller can

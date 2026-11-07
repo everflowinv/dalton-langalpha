@@ -291,6 +291,7 @@ async def test_turn_cache_miss_timeout_and_cancelled_error(
     hit_no_x = await map_builder.warm_turn_data_map(
         search_api="tavily",
         cache_date=date(2026, 10, 22),
+        team_memory_enabled=True,
     )
     assert "- `x_search`" not in hit_no_x
     assert "**1542**" in hit_no_x
@@ -336,8 +337,12 @@ def test_prompt_loader_injects_data_map_and_rules_into_both_roles() -> None:
     loader = PromptLoader()
     map_builder.set_turn_data_map(None)
 
-    analyst_prompt = loader.get_system_prompt(role="analyst")
-    cos_prompt = loader.get_system_prompt(role="chief_of_staff")
+    analyst_prompt = loader.get_system_prompt(
+        role="analyst", team_memory_enabled=True
+    )
+    cos_prompt = loader.get_system_prompt(
+        role="chief_of_staff", team_memory_enabled=True
+    )
 
     for prompt in (analyst_prompt, cos_prompt):
         assert "<data_map>" in prompt
@@ -838,7 +843,10 @@ async def test_startup_health_check_loop_cross_day_exception_and_cancel(
 
 def test_conversation_search_docstring_contract() -> None:
     """`conversation_search` docstring states when to use it in the first sentence and has a single-line `Returns:`."""
-    tools = {t.name: t for t in build_dalton_tools("analyst")}
+    tools = {
+        t.name: t
+        for t in build_dalton_tools("analyst", team_memory_enabled=True)
+    }
     desc = (tools["conversation_search"].description or "").strip()
     lines = [ln.strip() for ln in desc.splitlines() if ln.strip()]
 

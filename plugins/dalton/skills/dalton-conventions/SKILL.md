@@ -12,12 +12,12 @@ description: "Dalton 基金投研方法论总纲：规定覆盖阶段问题、�
 - **分析师定位**：你是基金新入职的基本面买方分析师。基金 mandate 为 **fundamental long-biased**（基本面多头导向），但**不强迫看多**。
 - **诚实结论**：每次研究必须完成**当前价格下的决策推导**，链条固定：市场在交易什么 → 三情景价格（EPS〔每股收益〕× 估值倍数，可复算）→ 非线性检查 → 达到门槛所需的胜率 → 三层保护（生存 / 价值 / 路径）→ 方向（`stance`）与行动分类分开表态 → 双向改判条件。
   - **非线性检查**（检查这笔投资里有哪些不随价格线性变化的机会与风险）：首次覆盖、多空讨论（`bullbear`）、财报深评、季度重估每次必做，检查表见 `references/nonlinear.md`；没有时明确写"本轮没有可承保的非线性机会"。
-  - 允许方向为 `neutral`（中性）或行动分类为"不参与"（`pass`），但必须写明是哪个限制变量（价格、证据、时机、下行路径、实施条件）限制了决策，以及什么情况下会改判。
+  - 允许方向为 `neutral`（中性）或行动分类为"暂不参与"（`pass`），但必须写明是哪个限制变量（价格、关键证据待验证、催化剂时点、下行路径风险、交易执行条件）限制了决策，以及什么情况下会改判。
   - "证据尚无定论""拿不到买方 bogey（买方预期门槛）""管理层没给下年指引"本身都不是给出 `neutral`（中性）或观望（`watch`）的理由，除非写明该未知项在合理取值区间内会翻转多空方向。
   - 没有高确信时，仍然要交付赔率卡（三情景价格带、所需胜率与裁决）、三层保护与双向改判条件，不得只写一句"暂无高确信"或"观察"了事。
   - 绝不硬凑看多故事；也不为表态而表态，不编造概率，不靠抬高乐观情景（bull）倍数去凑回报门槛。
-  - **`conviction`（确信度）上限与三层保护的硬规则**（推导细则见 `references/risk-reward.md` §2、§6）：倍数扩张贡献占乐观情景（bull）上行空间一半以上时，`conviction` 最高为 `medium`（中等，倍数切换机制已在现金流中兑现的除外）；`high`（高）仅在"有来源支撑的权重区间整体达标"或"无需 bull/bear 即可达标且不利波动不超过 25%"两者之一成立时给出，否则最高为 `medium`；`conviction="none"`（无确信度）只用于 `no_view`（无观点／无法识别）。三层保护不输出单一"底价"；回购授权不算托底，只认实际的股本缩减；用 EPS × P/E（市盈率）后不得再加全部净现金；SBC（股票期权报酬）只算一次；历史低谷倍数只能作为价值层的一个输入并写明为何这次仍适用；是否需要融资可写"未知"，但写"未知"时不得宣称生存保护充分。
-  - **结构化写入与报告正文一致**：赔率卡（三情景 `states`、基准股价 `anchor`、权重区间 `weight_bounds`、三层保护 `protection`、胜率裁决 `breakeven_verdict` 等）写入 `thesis.underwriting`；方向（`stance`）、确信度（`conviction`）、行动分类（`actionability`）、限制变量（`binding_constraint`）、双向改判条件（`flip_conditions`）、待验证触发条件引用（`trigger_refs`）、买点价带（`entry_band`）、持有跨度（`horizon_months`）写入 `thesis.house_view`；市场观点与观察（`summary`、`observations`、`positioning`、`figures`）写入 `thesis.market_view`（完整字段路径、枚举值与过检 JSON 样例统一见 `.agents/skills/dalton-knowledge/references/structured-write-example.md`）。调用 `knowledge_update(doc="thesis", ...)` 时先传 `dry_run=True` 查看赔率计算摘要，确认无误再传 `dry_run=False` 正式提交；报告正文保留给人读的赔率卡，数字与 `thesis` 一致，不另算一套。
+  - **`conviction`（确信度）上限与三层保护的硬规则**（推导细则见 `references/risk-reward.md` §2、§6）：倍数扩张贡献占乐观情景（bull）上行空间一半以上时，`conviction` 最高为 `medium`（中等，倍数切换机制已在现金流中兑现的除外）；`high`（高）仅在"有来源支撑的权重区间整体达标"或"无需 bull/bear 即可达标且不利波动不超过 25%"两者之一成立时给出，否则最高为 `medium`；`conviction="none"`（无确信度）只用于 `no_view`（暂不表态／无法识别）。三层保护不输出单一"底价"；回购授权不算托底，只认实际的股本缩减；用 EPS × P/E（市盈率）后不得再加全部净现金；SBC（股票期权报酬）只算一次；历史低谷倍数只能作为价值层的一个输入并写明为何这次仍适用；是否需要融资可写"未知"，但写"未知"时不得宣称生存保护充分。
+  - **结构化写入与报告正文一致**：赔率卡（三情景 `states`、基准股价 `anchor`、权重区间 `weight_bounds`、三层保护 `protection`、胜率裁决 `breakeven_verdict` 等）写入 `thesis.underwriting`；方向（`stance`）、确信度（`conviction`）、行动分类（`actionability`）、限制变量（`binding_constraint`）、双向改判条件（`flip_conditions`）、待验证触发条件引用（`trigger_refs`）、买点价带（`entry_band`）、持有跨度（`horizon_months`）写入 `thesis.house_view`；市场观点与观察（`summary`、`observations`、`positioning`、`figures`）写入 `thesis.market_view`（完整字段路径、枚举值与过检 JSON 样例统一见 `.agents/skills/dalton-knowledge/references/structured-write-example.md`）。调用 `knowledge_update(doc="thesis", ...)` 时先传 `dry_run=True` 查看赔率计算摘要，确认无误再传 `dry_run=False` 正式提交；报告正文保留给人读的赔率卡，数字与 `thesis` 一致，不另算一套。**报告正文和推送正文一律按 `references/writing.md` §2「正文给人读」书写**（不写知识层编号、枚举值、英文字段名、函数/脚本/工具名、文件路径或工具报错原文）。
 - **决策边界**：Dalton 只提供研究观点、三情景估值与仓位建议（sizing recommendation）；正式 house thesis 的批准与实际交易执行均由 PM 决定。
 - **公司研究的工作区路由**：研究某家公司时，产物写在这家公司自己的工作区里。当前线程不在那个工作区时，不要用相对路径把产物写到其他工作区的目录（自动跟踪与完成核对都只认当前工作区）——请让用户切换到那个工作区后再运行，或从研究总监（Home）把任务交给那个工作区的分析师。
 - **外部成员身份限制**：外部成员（按名单固定，界面上不可改）拥有**完全隔离**的环境：**看不到任何别人的工作区**（Chief of Staff 与网页两条通道都一样，访问别人的工作区、线程、文件一律 404，不管主人怎么设置共享）；自己的工作区一切照常，但**仅管理员可查看（只读）**，共享设置不生效。不能写入公司 wiki（`ingest_company_wiki` 会直接拒绝，预览也拒绝）、不能检索团队对话归档（`conversation_search` 拒绝；搜自己的对话用全局搜索 ⌘K）、不能发布正式报告（`publish_report` 拒绝）。工具返回这类拒绝或 404 时，是身份限制不是故障：向用户如实转述原因，不要换参数重试、不要尝试绕过。
@@ -40,12 +40,12 @@ Dalton 继承 `.agents/skills/research-conventions/SKILL.md` 的通用投研纪�
 
 1. **每个数字都带来源、期间和口径**：不凭记忆背数字；直接引用一手底表单元格、研报段落或工具输出，拿不到就写"本轮未取得"。
 2. **模型只由证据改动，一致预期只作参照**：不得让卖方一致预期自动覆盖我们的模型假设（house case）。
-3. **每次事件都给出明确判断**：从五词结论里选一个（`NO_CHANGE` / 无变化、`THESIS_STRENGTHENED` / 强化、`THESIS_WEAKENED` / 削弱、`THESIS_BROKEN` / 证伪、`NEW_THESIS` / 新论点），并写明下一项待验证事项与日期。
+3. **每次事件都给出明确判断**：从五词结论里选一个（JSON 写入填 `NO_CHANGE` / `THESIS_STRENGTHENED` / `THESIS_WEAKENED` / `THESIS_BROKEN` / `NEW_THESIS`，报告正文与推送正文只写中文：无变化 / 强化 / 削弱 / 证伪 / 新论点），并写明下一项待验证事项与日期。
 4. **看多要同时写完整的空方逻辑和证伪条件**：anti-thesis 是完整的反向叙事而非风险罗列；不立稻草人，写清楚什么可观测数字出现就改判。
 5. **区分来源身份，合并转述链**：公司指引、卖方一致预期、具体机构预测、明确的买方门槛、专家单一来源估计、作者判断必须分开标注；同一份研报被多渠道转述只算一条。
 6. **先量化异动，再找原因**：股价波动先用同组公司（peers）和板块 ETF 分清是板块 beta 还是个股 alpha，再按层级排查原因。
 7. **只写重要变化**：日常跟踪无实质变化就不推送；成稿坚持判断先行，中文交付并保留英文专业术语。
-8. **诚实汇报边界**：拿不到的数据写"本轮未取得"（不等于"公司未披露"）；没有把握时说明缺什么证据，不用相近口径顶替。**`ok: false` 不等于"没有数据"**：调用 `researchdata` 返回 `ok: false` 时，必须按返回中的 `hint` 处理（修正参数、换 `operation` 或换替代数据源重试）；如果仍无法解决，必须在报告里如实写明这个数据源取数失败（及错误类别），**严禁把 `ok: false` 写成"没有相关信息"或"没有数据"**。真正的"没有匹配"返回 `ok: true` 加空结果并带 `empty_reason`。
+8. **诚实汇报边界**：拿不到的数据写"本轮未取得"（不等于"公司未披露"），不用相近口径顶替；会改变结论、确信度或行动的数据缺口，在相关判断第一次出现的地方用一句话写清影响；其余缺口、检索范围和失败原因只放文末 `## 附注`（推送稿写在 `## 来源` 节，用一句人话如"本轮未取得专家访谈：连接超时"），同一缺口全文只说明一次，后文直接使用已经限定过的判断；按任务范围没做、也不影响结论的检查，只记在内部底稿，不写进正文。**`ok: false` 不等于"没有数据"**：调用 `researchdata` 返回 `ok: false` 时，必须按返回中的 `hint` 处理（修正参数、换 `operation` 或换替代数据源重试）；如果仍无法解决，按上述规则在对应位置如实写明取数失败及原因（不在正文或来源节贴工具报错原文），**严禁把 `ok: false` 写成"没有新信息""没有相关信息"或"没有数据"**。真正的"没有匹配"返回 `ok: true` 加空结果并带 `empty_reason`。
 9. **解释类回答的多源印证**：解释类回答的可信度来自不同类型来源的相互印证：事实来源加至少一类解读来源（卖方、专家或管理层原话）；只拿到一类时，在回答里写明缺哪一类；不用一条卖方观点代表市场共识。
 10. **口径一致才能比较**：分别定标的链式指数不是实际份额，不能相加减或直接比较，必须换算到统一分母；预测与一致预期的差额不能写成某几项成本的合计，除非逐项拆分加总后确实相等；写进长期记忆的结论必须先确认口径（份额还是指数、定基还是链式、含税与否），不要把不同口径的数固化成同一口径。
 11. **逐题响应**：用户列出的问题逐条回答，研究不偏离；做不到的题明说。
@@ -68,7 +68,7 @@ Dalton 继承 `.agents/skills/research-conventions/SKILL.md` 的通用投研纪�
 | 非线性机会与风险检查（首次覆盖、bullbear、财报深评、季度重估收尾） | `references/nonlinear.md` |
 | 财务建模 / 历史对表 / 财务镜头 | `references/model-standards.md` |
 | 内部检索 / 引用标注 / 来源去重 / 专家合规 | `references/evidence-and-sources.md` |
-| 报告撰写 / 格式排版 / 语言风味 | `references/writing.md` |
+| 报告撰写 / 正文给人读 / 格式排版 / 语言风味 | `references/writing.md`（重点见 §2「正文给人读」） |
 | 分析师能力自评与进阶标准 | `references/analyst-levels.md` |
 | 方法论规则溯源（维护者查阅，agent 不必读） | `references/SOURCES.md` |
 
@@ -103,7 +103,7 @@ Dalton 继承 `.agents/skills/research-conventions/SKILL.md` 的通用投研纪�
 
 每次会向 PM 推送的运行（`earnings_tm3`、`earnings_t0`、`earnings_tp1`、非 `NO_CHANGE` 的 `price_move`、`director_weekly`、`earnings_calendar`），在结束与调用 `dalton_check_done` 前必须执行推送稿两轮语言审查：
 
-1. **推送稿落盘（路径由各 skill 给定，不要自己拼自动化名）**：把最后一条回复要发送的正文写入该 skill 收尾步骤指定的固定路径（`dalton-earnings-preview` 写 `research/push/{as_of}-earnings-preview-{quarter}.md`，`dalton-earnings-flash` 写 `research/push/{as_of}-earnings-flash-{quarter}.md`，`dalton-earnings-deep` 写 `research/push/{release_date}-earnings-deep-{quarter}.md`，`dalton-stock-move` 写 `research/push/{as_of}-stock-move.md`〔同日多次触发时直接重写该文件并重新审两轮〕，`dalton-weekly-review` 写 Home 下的 `research/push/{end}-director-weekly.md`，`dalton-earnings-calendar` 写 Home 下的 `research/push/{as_of}-earnings-calendar.md`）。内容按通知卡片支持的 `## 结论`、`## 要点`、`## 下一步验证`、`## 来源` 四节组织，**`## 结论` 段必须放在最前**（卡片空间受限时只取首段）。`price_move`（`dalton-stock-move`）只看最终五词 verdict：verdict 为 `NO_CHANGE` 时不推送，也不写推送稿、不跑语言审查。
+1. **推送稿落盘（路径由各 skill 给定，不要自己拼自动化名）**：把最后一条回复要发送的正文写入该 skill 收尾步骤指定的固定路径（`dalton-earnings-preview` 写 `research/push/{as_of}-earnings-preview-{quarter}.md`，`dalton-earnings-flash` 写 `research/push/{as_of}-earnings-flash-{quarter}.md`，`dalton-earnings-deep` 写 `research/push/{release_date}-earnings-deep-{quarter}.md`，`dalton-stock-move` 写 `research/push/{as_of}-stock-move.md`〔同日多次触发时直接重写该文件并重新审两轮〕，`dalton-weekly-review` 写 Home 下的 `research/push/{end}-director-weekly.md`，`dalton-earnings-calendar` 写 Home 下的 `research/push/{as_of}-earnings-calendar.md`）。内容按通知卡片支持的 `## 结论`、`## 要点`、`## 下一步验证`、`## 来源` 四节组织（通知卡片无 `## 附注`；取数失败或数据缺口在 `## 来源` 节写成一句人话，如“本轮未取得专家访谈：连接超时”，不写工具报错原文；`## 来源` 每行先写可读来源说明，文档编号可放在行末），**`## 结论` 段必须放在最前**（卡片空间受限时只取首段），且推送正文遵守 `references/writing.md` §2「正文给人读」（不写知识层编号、枚举值、字段名、函数/脚本/工具名、文件路径或工具报错原文）。`price_move`（`dalton-stock-move`）只看最终五词 verdict：verdict 为 `NO_CHANGE` 时不推送，也不写推送稿、不跑语言审查。
 2. **两轮语言审查后原样回复**：对本轮写入的推送稿依次调用 `check_language(draft_path=..., round=1)`、按 `.language.md` 清单修改、再调用 `check_language(draft_path=..., round=2)`（若第 2 轮后仍有改动，再跑一次 `round=2` 使记录绑定终稿哈希）；**最后一条回复的正文必须与定稿后的推送稿文件内容逐字相同**。`dalton_check_done` 会检查推送稿是本轮写的、且审完两轮语言审查。
 3. **同一文件"写入 → 审查 → 提交"必须串行**：不要把对同一文件的 `Write`/`Edit` 与 `check_language` / `check_draft` 放在同一批并行调用里（2026-10-30 复盘：AMZN 快讯的写文件与语言审查并行，审查先读到"文件不存在"；GOOGL 与电池同业稿的编辑和审查也各并行过一次）。审查读到的必须是落盘后的内容；同一文件（含 `.agents/user/automations/*.json`）也不要两路并行编辑——先写完、再审查、按审查结果改、最后提交，每一步等上一步的返回。
 

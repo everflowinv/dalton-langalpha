@@ -27,6 +27,10 @@ _SANDBOX_TOKEN_RE = re.compile(r"gxs[ar]_[A-Za-z0-9_.\-]+")
 # Matches Claude Code setup tokens (sk-ant-oat01-...), as LeakDetectionMiddleware does.
 _SETUP_TOKEN_RE = re.compile(r"sk-ant-oat\d+-[A-Za-z0-9_-]+")
 
+# Minimum character length for a vault/config value to be treated as a secret
+# in text redaction and binary copy scanning.
+MIN_REDACT_SECRET_LEN = 8  # DALTON-HOOK(workspace-sharing-settings): shared minimum secret length threshold
+
 
 class SecretRedactor:
     """Resolves secret values from MCP config and provides redaction methods."""
@@ -79,7 +83,7 @@ class SecretRedactor:
             for name, value in sorted(
                 vault_secrets.items(), key=lambda kv: len(kv[1]), reverse=True,
             ):
-                if value and len(value) >= 8 and value in text:
+                if value and len(value) >= MIN_REDACT_SECRET_LEN and value in text:  # DALTON-HOOK(workspace-sharing-settings)
                     text = text.replace(value, f"[REDACTED:{name}]")
         text = _SANDBOX_TOKEN_RE.sub("[REDACTED:SANDBOX_TOKEN]", text)
         text = _SETUP_TOKEN_RE.sub("[REDACTED:CLAUDE_SETUP_TOKEN]", text)

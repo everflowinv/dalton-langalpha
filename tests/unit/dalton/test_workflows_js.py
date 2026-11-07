@@ -53,6 +53,30 @@ FC_COMPLETE_MEMO = """# 虚拟公司（TEST）投资备忘录
 
 行业分散，前三家合计份额 30% [引用2]。
 
+## 业务质量
+
+### Good Business：高切换成本支撑订阅续费与高回报
+
+2Q26 续费率 95%，详见「公司与商业模式」[引用1]。
+
+### Good People：创始人执掌且指引一贯稳健
+
+详见「管理层」[引用1]。
+
+### Good Price：现价隐含合理增长预期
+
+详见「财务预测与估值」[引用3]。
+
+### 综合判断
+
+| 维度 | 评级 | 一句理由 |
+|---|---|---|
+| Good Business | 强 | 订阅续费率 95% [引用1] |
+| Good People | 强 | 创始人执掌且指引稳健 [引用1] |
+| Good Price | 合理 | 现价隐含合理增长 [引用3] |
+
+好生意、好团队且价格合理，对应看多。
+
 ## 核心投资逻辑与争议
 
 市场认为增长见顶 [引用2]；我们不同，因为新客户结构变了 [引用1]。
@@ -157,6 +181,37 @@ class ScriptedHost:
             return self.evidence_default(prompt)
         if label == "支线核验":
             return self.branch_probe_default(prompt)
+        if label == "草稿探测":
+            return {
+                "files": ["./drafts/2026-10-23-initial-coverage.md"],
+                "draft_content": "absent",
+            }
+        if label == "赔率摘要核验":
+            return {
+                "files": ["./research/2026-10-23-ic/underwriting-summary.md"],
+                "exists": True,
+                "first_line": "已保存 thesis 版本 1",
+            }
+        if label == "赔率摘要复核":
+            return {
+                "files": [
+                    "./research/2026-10-23-ic/underwriting-summary.md",
+                    "./drafts/2026-10-23-initial-coverage.md",
+                ],
+                "exists": True,
+                "first_line": "已保存 thesis 版本 1",
+            }
+        if label == "终稿审稿":
+            return {"verdict": "pass", "summary": "ok", "must_fix": []}
+        if label.startswith("修订 "):
+            return {
+                **OUT,
+                "files": [
+                    "./drafts/2026-10-23-initial-coverage.md",
+                    "./research/2026-10-23-ic/questions.md",
+                    "./research/2026-10-23-ic/underwriting-summary.md",
+                ],
+            }
         return dict(OUT)
 
     async def agent(self, prompt: str, opts: dict[str, Any]) -> Any:
@@ -167,21 +222,48 @@ class ScriptedHost:
         # the engine's pending-promise check before the JS microtasks drain.
         await asyncio.sleep(0.02)
         result = self.outcome_for(label, prompt)
+        if (
+            label == "初筛成稿"
+            and isinstance(result, dict)
+            and "underwriting_version" not in result
+        ):
+            result = {**result, "underwriting_version": 1}
+        if label == "初筛成稿" and isinstance(result, dict) and result.pop("_strict_files", False):
+            pass  # the test pins the writer's files as given
+        elif label == "初筛成稿" and isinstance(result, dict):
+            # The writer declares the payoff summary it read (the journal only
+            # re-runs a dispatch whose declared files changed).
+            m = re.search(r"(\S*underwriting-summary\.md)", prompt)
+            files = list(result.get("files") or [])
+            if m and m.group(1) not in files:
+                result = {**result, "files": [*files, m.group(1)]}
+        if label.startswith("修订 ") and isinstance(result, dict):
+            if "needs_reunderwrite" not in result:
+                result = {**result, "needs_reunderwrite": False}
+            if "underwriting_version" not in result:
+                result = {**result, "underwriting_version": 1}
         # 审稿契约（提示词第 1 批 #2）：dalton-reviewer 的回复必须逐项覆盖
         # 1–9 项检查，workflows 据此判结果有效。旧桩只写 verdict；按全部
         # 通过补齐 items，使这些用例仍考察 verdict 分支本身。
-        if (
-            opts.get("agentType") == "dalton-reviewer"
-            and isinstance(result, dict)
-            and "items" not in result
-        ):
-            result = {
-                **result,
-                "items": [
-                    {"check": n, "result": "pass", "reason": "ok"}
-                    for n in range(1, 10)
-                ],
-            }
+        if opts.get("agentType") == "dalton-reviewer" and isinstance(result, dict):
+            if "items" not in result:
+                result = {
+                    **result,
+                    "items": [
+                        {"check": n, "result": "pass", "reason": "ok"}
+                        for n in range(1, 10)
+                    ],
+                }
+            if "files" not in result:
+                review_files = [
+                    "./drafts/2026-10-23-initial-coverage.md",
+                    "./research/2026-10-23-ic/questions.md",
+                    "./research/2026-10-23-ic/underwriting-summary.md",
+                ]
+                review_draft = opts.get("reviewDraft")
+                if isinstance(review_draft, str) and review_draft not in review_files:
+                    review_files.append(review_draft)
+                result = {**result, "files": review_files}
         return result
 
     def phase(self, title: str) -> None:
@@ -256,15 +338,15 @@ async def test_revise_verdict_triggers_revision_and_re_review() -> None:
 async def test_two_revise_rounds_then_still_revise_reports_incomplete() -> None:
     revise = {"verdict": "revise", "summary": "仍有 P0", "must_fix": ["x"]}
     host = ScriptedHost(
-        by_label={"审稿": revise, "复审 1": revise, "复审 2": revise}
+        by_label={"审稿": revise, "复审 1": revise}
     )
     result = await _run("initial-coverage", IC_PARAMS, host)
 
     assert result["ok"] is False
-    assert result["revise_rounds"] == 2
+    assert result["revise_rounds"] == 1
     assert any("审稿未最终通过" in item for item in result["incomplete"])
     assert host.labels().count("修订 1") == 1
-    assert host.labels().count("修订 2") == 1
+    assert host.labels().count("修订 2") == 0
 
 
 @pytest.mark.asyncio
@@ -557,6 +639,26 @@ class CapturingHost:
                 if line.startswith("- ") and "|" not in line
             ]
             return {"files": [f"{p}|ok" for p in paths]}
+        if label == "草稿探测":
+            return {
+                "files": ["./drafts/2026-10-23-initial-coverage.md"],
+                "draft_content": "absent",
+            }
+        if label == "赔率摘要核验":
+            return {
+                "files": ["./research/2026-10-23-ic/underwriting-summary.md"],
+                "exists": True,
+                "first_line": "已保存 thesis 版本 1",
+            }
+        if label == "赔率摘要复核":
+            return {
+                "files": [
+                    "./research/2026-10-23-ic/underwriting-summary.md",
+                    "./drafts/2026-10-23-initial-coverage.md",
+                ],
+                "exists": True,
+                "first_line": "已保存 thesis 版本 2",
+            }
         # A generic non-null answer keeps every script running to its last
         # dispatch, so the whole schema surface is captured.
         return {"files": ["x"], "summary": "s", "sha256": "a" * 64}
@@ -742,37 +844,55 @@ async def test_revision_without_valid_hash_stops_without_falling_back() -> None:
 
 @pytest.mark.asyncio
 async def test_second_revision_round_uses_the_first_rounds_hash() -> None:
-    """Two revise rounds: round 2's revision prompt and re-review carry the
-    hash round 1 produced — never the pre-review draft's."""
+    """Single revision round + round-2 language review: revision 1 verifies
+    lang1's hash, re-review 1 verifies revision 1's hash, and final review
+    verifies lang2's hash (with no second revision round)."""
+    lang1_hash = "d" * 64
     round1_hash = "b" * 64
     round2_hash = "c" * 64
-    revise = {"verdict": "revise", "summary": "P0", "must_fix": ["x"], "draft_sha256": "a" * 64}
+    revise = {"verdict": "revise", "summary": "P0", "must_fix": ["x"], "draft_sha256": lang1_hash}
     host = ScriptedHost(
         by_label={
-            "审稿": revise,
-            "复审 1": revise,
-            "复审 2": {"verdict": "pass", "summary": "ok", "must_fix": [], "draft_sha256": round2_hash},
-            # Each revision returns its own new hash.
-            "修订 1": {
+            "语言审查 1": {
                 "files": ["drafts/2026-10-23-initial-coverage.md"],
+                "summary": "l1",
+                "sha256": lang1_hash,
+            },
+            "审稿": revise,
+            "修订 1": {
+                "files": [
+                    "drafts/2026-10-23-initial-coverage.md",
+                    "research/2026-10-23-ic/underwriting-summary.md",
+                ],
                 "summary": "r1",
                 "sha256": round1_hash,
             },
-            "修订 2": {
+            "复审 1": {"verdict": "pass", "summary": "ok", "must_fix": [], "draft_sha256": round1_hash},
+            "语言审查 2": {
                 "files": ["drafts/2026-10-23-initial-coverage.md"],
-                "summary": "r2",
+                "summary": "l2",
                 "sha256": round2_hash,
             },
+            "终稿审稿": {"verdict": "pass", "summary": "ok", "must_fix": [], "draft_sha256": round2_hash},
         }
     )
     result = await _run("initial-coverage", IC_PARAMS, host)
 
-    round2_prompt = host.prompts[host.labels().index("修订 2")]
-    assert round1_hash in round2_prompt, "round 2 must verify round 1's hash"
-    assert round2_hash not in round2_prompt
-    rereview2_prompt = host.prompts[host.labels().index("复审 2")]
-    assert round2_hash in rereview2_prompt, "the re-review judges the current draft"
-    assert result["revise_rounds"] == 2
+    round1_prompt = host.prompts[host.labels().index("修订 1")]
+    assert lang1_hash in round1_prompt, "round 1 must verify lang1's hash"
+    assert round1_hash not in round1_prompt
+    rereview1_prompt = host.prompts[host.labels().index("复审 1")]
+    assert round1_hash in rereview1_prompt, "the re-review judges the current draft"
+    final_review_prompt = host.prompts[host.labels().index("终稿审稿")]
+    assert round2_hash in final_review_prompt, "final review judges the lang2 draft"
+    assert "修订 2" not in host.labels()
+    assert result["revise_rounds"] == 1
+    draft_prompt = host.prompts[host.labels().index("初筛成稿")]
+    notes_prompt = host.prompts[host.labels().index("笔记语言审查")]
+    verify_prompt = host.prompts[host.labels().index("产物核验")]
+    assert "research/2026-10-23-ic/questions.md" in draft_prompt
+    assert "research/2026-10-23-ic/questions.md" in notes_prompt
+    assert "research/2026-10-23-ic/questions.md" in verify_prompt
 
 
 # ------------------------------------------------- round-8: the final model
@@ -1135,6 +1255,44 @@ async def test_deep_without_model_path_never_resolves() -> None:
     assert result["model_file"] is None
     assert "原样沿用" not in host.prompts[host.labels().index("修订 1")]
     assert result["ok"] is True, result["incomplete"]
+
+
+@pytest.mark.asyncio
+async def test_deep_first_review_pass_writes_calibration_into_draft_and_binds_its_sha() -> None:
+    """When the first review passes directly (no revision loop), calibration
+    writes the reconcile/thesis-calibration/management-delta conclusions into
+    the draft's 投资逻辑的验证 section, returns the updated draft sha256, and
+    the subsequent review binds that sha256."""
+    draft_sha = "a" * 64
+    lang1_sha = "b" * 64
+    calib_sha = "d" * 64
+    params = {**DEEP_PARAMS, "model_path": None}
+    host = ScriptedHost(
+        by_label={
+            "八节点评": {**OUT, "sha256": draft_sha},
+            "语言审查 1": {**OUT, "sha256": lang1_sha},
+            "校准与对账": {**OUT, "sha256": calib_sha},
+            "审稿": {"verdict": "pass", "summary": "ok", "must_fix": []},
+            "语言审查 2": {**OUT, "sha256": calib_sha},
+        }
+    )
+    result = await _run("earnings-deep-update", params, host)
+
+    labels = host.labels()
+    assert "修订 1" not in labels
+    calib_prompt = host.prompts[labels.index("校准与对账")]
+    assert "reconcile.md" in calib_prompt
+    assert "thesis-calibration.md" in calib_prompt
+    assert "management-delta.md" in calib_prompt
+    assert "投资逻辑的验证" in calib_prompt
+    assert "./drafts/2026-10-28-deep-FY26Q3.md" in calib_prompt
+    review_prompt = host.prompts[labels.index("审稿")]
+    assert calib_sha in review_prompt, "review must bind the post-calibration draft sha"
+    assert lang1_sha not in review_prompt
+    kp_prompt = host.prompts[labels.index("知识层修订草案")]
+    assert calib_sha in kp_prompt
+    assert result["ok"] is True, result["incomplete"]
+    assert result["revise_rounds"] == 0
 
 
 @pytest.mark.asyncio
@@ -2046,3 +2204,288 @@ async def test_topic_probe_failure_exit_carries_missing_clusters() -> None:
     )
     assert not any("已传给写作" in item for item in result["incomplete"])
     assert "交叉验证与盲区" not in host.labels()
+
+
+@pytest.mark.asyncio
+async def test_initial_coverage_pauses_for_underwriting_summary_before_draft_and_resumes() -> None:
+    """Round 5 #2, #5: before drafting, the workflow verifies underwriting-summary.md
+    starts with the fixed header '已保存 thesis 版本 N' and declares its file path in
+    `files`; missing file, uncommitted dry_run ('尚未保存' / '没有保存成功'), or missing
+    file declaration all pause before 初筛成稿 and instruct the main agent to formally
+    write agenda/debate and then thesis (dry_run=True then dry_run=False). New-draft
+    prompts never mention '一、12 问初筛'."""
+    uw_path = "./research/2026-10-23-ic/underwriting-summary.md"
+    # 1) Missing underwriting-summary.md -> pauses before 初筛成稿
+    missing_host = ScriptedHost(
+        by_label={
+            "赔率摘要核验": {
+                "files": [uw_path],
+                "exists": False,
+                "first_line": "none",
+            }
+        }
+    )
+    paused = await _run("initial-coverage", IC_PARAMS, missing_host)
+    assert paused["ok"] is False
+    assert paused["knowledge_proposal"] == "./research/2026-10-23-ic/knowledge-proposal.json"
+    assert paused["underwriting_summary"] == uw_path
+    assert "agenda" in paused["blocked"] and "debate" in paused["blocked"]
+    assert "dry_run=False" in paused["blocked"] and "已保存 thesis 版本 N" in paused["blocked"]
+    assert "resume=" in paused["resume_hint"]
+    assert "知识层草案" in missing_host.labels()
+    assert "初筛成稿" not in missing_host.labels()
+
+    # 2) Uncommitted dry_run ("尚未保存" / "没有保存成功") -> refused, pauses before 初筛成稿
+    uncommitted_host = ScriptedHost(
+        by_label={
+            "赔率摘要核验": {
+                "files": [uw_path],
+                "exists": True,
+                "first_line": "赔率计算摘要（试写通过，尚未保存｜立场：中性）",
+            }
+        }
+    )
+    refused = await _run("initial-coverage", IC_PARAMS, uncommitted_host)
+    assert refused["ok"] is False
+    assert "尚未正式保存" in refused["blocked"]
+    assert "初筛成稿" not in uncommitted_host.labels()
+
+    # 3) Missing file declaration in 赔率摘要核验 -> refused, pauses before 初筛成稿
+    undeclared_host = ScriptedHost(
+        by_label={
+            "赔率摘要核验": {
+                "files": [],
+                "exists": True,
+                "first_line": "已保存 thesis 版本 1",
+            }
+        }
+    )
+    undeclared = await _run("initial-coverage", IC_PARAMS, undeclared_host)
+    assert undeclared["ok"] is False
+    assert "赔率摘要核验子任务失败" in undeclared["blocked"]
+    assert "初筛成稿" not in undeclared_host.labels()
+
+    # 4) Formal save ("已保存 thesis 版本 1；暂不表态，不计算赔率") -> proceeds to 初筛成稿
+    saved_host = ScriptedHost(
+        by_label={
+            "赔率摘要核验": {
+                "files": [uw_path],
+                "exists": True,
+                "first_line": "已保存 thesis 版本 1；暂不表态，不计算赔率",
+            },
+            "审稿": {"verdict": "pass", "summary": "ok", "must_fix": []},
+        }
+    )
+    resumed = await _run("initial-coverage", IC_PARAMS, saved_host)
+    assert resumed["ok"] is True, resumed["incomplete"]
+    labels = saved_host.labels()
+    assert "初筛成稿" in labels
+    draft_prompt = saved_host.prompts[labels.index("初筛成稿")]
+    review_prompt = saved_host.prompts[labels.index("审稿")]
+    assert "一、12 问初筛" not in draft_prompt
+    assert "一、12 问初筛" not in review_prompt
+    evidence_prompt = saved_host.prompts[labels.index("产物核验")]
+    assert uw_path in evidence_prompt
+
+
+@pytest.mark.asyncio
+async def test_initial_coverage_pauses_before_final_review_when_revision_requests_payoff_rewrite() -> None:
+    """Round 6 #2, #3, #4:
+    - 修订 1 must declare `underwriting-summary.md` in `files` and return required
+      `underwriting_version` and `needs_reunderwrite`.
+    - When `needs_reunderwrite: True`, workflow pauses immediately after 修订 1 and
+      before 复审 1.
+    - Before 终稿审稿, 赔率摘要复核 verifies `uwFinal.version === finalDraftVersion`
+      (and declares `draftPath` in `files`); mismatch pauses before 终稿审稿, while
+      matching versions proceed to 终稿审稿 and complete."""
+    uw_path = "./research/2026-10-23-ic/underwriting-summary.md"
+    draft_path = "./drafts/2026-10-23-initial-coverage.md"
+
+    # 1) 修订 1 omitting underwriting-summary.md from `files` fails revision (Item 4)
+    missing_summary_decl_host = ScriptedHost(
+        by_label={
+            "审稿": {"verdict": "revise", "summary": "下调倍数假设", "must_fix": ["下调 Bull 倍数"]},
+            "修订 1": {
+                "files": [draft_path],
+                "summary": "未声明 underwriting-summary.md",
+                "sha256": "a" * 64,
+                "needs_reunderwrite": False,
+                "underwriting_version": 1,
+            },
+        }
+    )
+    missing_decl_res = await _run("initial-coverage", IC_PARAMS, missing_summary_decl_host)
+    assert missing_decl_res["ok"] is False
+    assert any("underwriting-summary.md 文件声明" in item for item in missing_decl_res["incomplete"])
+    assert "复审 1" not in missing_summary_decl_host.labels()
+
+    # 2) 修订 1 setting needs_reunderwrite: True pauses immediately before 复审 1 (Item 2 & #3)
+    needs_rewrite_host = ScriptedHost(
+        by_label={
+            "审稿": {"verdict": "revise", "summary": "下调倍数假设", "must_fix": ["下调 Bull 倍数"]},
+            "修订 1": {
+                "files": [draft_path, uw_path],
+                "summary": "已按审稿意见更新草案，等待重写赔率",
+                "sha256": "a" * 64,
+                "needs_reunderwrite": True,
+                "underwriting_version": 1,
+            },
+        }
+    )
+    paused = await _run("initial-coverage", IC_PARAMS, needs_rewrite_host)
+    assert paused["ok"] is False
+    assert "needs_reunderwrite=true" in paused["blocked"]
+    assert "不要贴试写的返回" in paused["blocked"]
+    assert "已保存 thesis 版本 N" in paused["blocked"]
+    assert "复审 1" not in needs_rewrite_host.labels(), "must pause immediately after 修订 1 and before 复审 1"
+    assert "终稿审稿" not in needs_rewrite_host.labels()
+
+    # 3) Before 终稿审稿, 赔率摘要复核 omitting draftPath from `files` is rejected
+    incomplete_files_host = ScriptedHost(
+        by_label={
+            "审稿": {"verdict": "revise", "summary": "下调倍数假设", "must_fix": ["下调 Bull 倍数"]},
+            "修订 1": {
+                "files": [draft_path, uw_path],
+                "summary": "已按新摘要改好数字",
+                "sha256": "b" * 64,
+                "needs_reunderwrite": False,
+                "underwriting_version": 2,
+            },
+            "复审 1": {"verdict": "pass", "summary": "已修改", "must_fix": []},
+            "赔率摘要复核": {
+                "files": [uw_path],
+                "exists": True,
+                "first_line": "已保存 thesis 版本 2",
+            },
+        }
+    )
+    probe_failed = await _run("initial-coverage", IC_PARAMS, incomplete_files_host)
+    assert probe_failed["ok"] is False
+    assert any("赔率摘要复核子任务失败" in item for item in probe_failed["incomplete"])
+    assert "终稿审稿" not in incomplete_files_host.labels()
+
+    # 4) Before 终稿审稿, if finalDraftVersion (1) != summary first-line version (2), pause before 终稿审稿
+    version_mismatch_host = ScriptedHost(
+        by_label={
+            "审稿": {"verdict": "revise", "summary": "下调倍数假设", "must_fix": ["下调 Bull 倍数"]},
+            "修订 1": {
+                "files": [draft_path, uw_path],
+                "summary": "仍基于版本 1",
+                "sha256": "b" * 64,
+                "needs_reunderwrite": False,
+                "underwriting_version": 1,
+            },
+            "复审 1": {"verdict": "pass", "summary": "已修改", "must_fix": []},
+            "赔率摘要复核": {
+                "files": [uw_path, draft_path],
+                "exists": True,
+                "first_line": "已保存 thesis 版本 2",
+            },
+        }
+    )
+    mismatch_paused = await _run("initial-coverage", IC_PARAMS, version_mismatch_host)
+    assert mismatch_paused["ok"] is False
+    assert "版本 1" in mismatch_paused["blocked"] and "版本 2" in mismatch_paused["blocked"]
+    assert "终稿审稿" not in version_mismatch_host.labels()
+
+    # 5) When finalDraftVersion (2) == summary first-line version (2), runs 终稿审稿 and completes
+    rewritten_host = ScriptedHost(
+        by_label={
+            "审稿": {"verdict": "revise", "summary": "下调倍数假设", "must_fix": ["下调 Bull 倍数"]},
+            "修订 1": {
+                "files": [draft_path, uw_path],
+                "summary": "已按版本 2 赔率摘要更新正文与三情景表",
+                "sha256": "b" * 64,
+                "needs_reunderwrite": False,
+                "underwriting_version": 2,
+            },
+            "复审 1": {"verdict": "pass", "summary": "已修改", "must_fix": []},
+            "赔率摘要复核": {
+                "files": [uw_path, draft_path],
+                "exists": True,
+                "first_line": "已保存 thesis 版本 2",
+            },
+            "终稿审稿": {"verdict": "pass", "summary": "数字一致", "must_fix": []},
+        }
+    )
+    completed = await _run("initial-coverage", IC_PARAMS, rewritten_host)
+    assert completed["ok"] is True, completed["incomplete"]
+    labels = rewritten_host.labels()
+    assert labels.index("修订 1") < labels.index("复审 1") < labels.index("赔率摘要复核") < labels.index("终稿审稿")
+
+
+@pytest.mark.asyncio
+async def test_initial_coverage_legacy_in_flight_run_skips_pre_draft_pause_and_rejects_self_reported_legacy_tag() -> None:
+    """Round 4 #3: legacy draft detection is done by workflow.js matching
+    LEGACY_HEADING_RE against the raw draft_content returned by 草稿探测 (which
+    declares `files: [draftPath]`). In-flight legacy runs skip the pre-draft
+    知识层草案 and pause point, and omit questions.md & underwriting-summary.md
+    from deliverables."""
+    legacy_host = ScriptedHost(
+        by_label={
+            "草稿探测": {
+                "files": ["./drafts/2026-10-23-initial-coverage.md"],
+                "draft_content": "# 初筛\n\n## 核心判断\n判断。\n\n## 一、12 问初筛\n### Q1. 业务",
+            },
+            "审稿": {"verdict": "pass", "summary": "ok", "must_fix": []},
+        }
+    )
+    legacy_res = await _run("initial-coverage", IC_PARAMS, legacy_host)
+    assert legacy_res["ok"] is True, legacy_res["incomplete"]
+    labels = legacy_host.labels()
+    assert "赔率摘要核验" not in labels
+    assert "赔率摘要复核" not in labels
+    assert labels.index("初筛成稿") < labels.index("知识层草案")
+    evidence_prompt = legacy_host.prompts[labels.index("产物核验")]
+    assert "questions.md" not in evidence_prompt
+    assert "underwriting-summary.md" not in evidence_prompt
+
+    # On a non-legacy run, a child self-reporting `<path>|legacy` is rejected as invalid
+    class _BogusLegacyChildHost(ScriptedHost):
+        def evidence_default(self, prompt: str) -> Any:
+            paths = [
+                line[2:].strip()
+                for line in prompt.splitlines()
+                if line.startswith("- ") and "|" not in line
+            ]
+            return {
+                "files": [
+                    f"{p}|legacy" if "questions.md" in p else f"{p}|{'e' * 64}"
+                    for p in paths
+                ]
+            }
+
+    bogus_host = _BogusLegacyChildHost(
+        by_label={"审稿": {"verdict": "pass", "summary": "ok", "must_fix": []}}
+    )
+    bogus_res = await _run("initial-coverage", IC_PARAMS, bogus_host)
+    assert bogus_res["ok"] is False
+    assert any("产物核验返回无效条目" in item for item in bogus_res["incomplete"])
+
+@pytest.mark.asyncio
+async def test_initial_coverage_writer_must_declare_the_payoff_summary() -> None:
+    """The writer reads underwriting-summary.md, so its `files` must name it: the
+    journal only re-runs a dispatch when a declared file changes. A writer that
+    leaves it out is not accepted, and nothing after drafting runs."""
+    uw_path = "./research/2026-10-23-ic/underwriting-summary.md"
+    host = ScriptedHost(
+        by_label={
+            "赔率摘要核验": {
+                "files": [uw_path],
+                "exists": True,
+                "first_line": "已保存 thesis 版本 1",
+            },
+            "初筛成稿": {
+                "_strict_files": True,
+                "files": ["./drafts/2026-10-23-initial-coverage.md"],
+                "summary": "成稿",
+                "sha256": "a" * 64,
+                "underwriting_version": 1,
+            },
+        }
+    )
+    out = await _run("initial-coverage", IC_PARAMS, host)
+    assert out["ok"] is False
+    assert "初筛成稿" in host.labels()
+    assert "审稿" not in host.labels()
+
