@@ -1517,6 +1517,7 @@ def _scan_copy_bytes_in_child(
         return _COS_SCAN_FAILED_ERROR
 
 
+
 async def workspace_file_copy_cos(
     user_id: str,
     workspace_id: str | None,
@@ -1548,9 +1549,7 @@ async def workspace_file_copy_cos(
         from fastapi import HTTPException
         from src.server.app.workspace_files._shared import (
             _is_non_owner_blocked_path,
-            _to_client_path,
             http_file_bytes,
-            owner_work_dir,
         )
         from src.server.app.workspace_files.crud import _read_contained_target
         from src.server.database.home_workspace import get_home_workspace_id
@@ -1563,7 +1562,9 @@ async def workspace_file_copy_cos(
         from src.server.services.workspace_files import (
             acquire_sandbox_to_change,
             contained_target,
+            owner_work_dir,
             previous_dir_names_of,
+            to_client_path as _to_client_path,
         )
         from src.server.utils.secret_redactor import (
             get_vault_secrets_for_redaction,
