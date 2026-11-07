@@ -1054,6 +1054,53 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     expect(stored.hadAttachments).not.toBe(true);
   });
 
+  it('a send the host takes back with its files leaves no attachments-again notice once the user removes them', async () => {
+    // The host takes the refused send back (onReturnedUnsent) and its giveBack
+    // returns the real files beside the words, so nothing is lost: removing
+    // them is the user's choice, and the reopened draft must not ask to re-add.
+    const resolvers: Array<(v: boolean) => void> = [];
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+      (send) => new Promise<boolean>((resolve) => {
+        resolvers.push((v: boolean) => {
+          if (v === false) send.modelOptions.onReturnedUnsent?.();
+          resolve(v);
+        });
+      }),
+    );
+    const ref = createRef<ChatInputHandle>();
+    const view = renderComposer({ draftKey: 'thread:t-host-files', onSend }, { userId: 'u-1', ref });
+    attachFile(view, 'page.txt');
+    // The file is read asynchronously (FileReader); a send before its data is
+    // ready carries none.
+    await act(async () => { await new Promise((r) => setTimeout(r, 50)); });
+    fireEvent.change(view.getTextarea(), { target: { value: 'went with a file', selectionStart: 16 } });
+    fireEvent.click(screen.getByLabelText('Send message'));
+    const sent = onSend.mock.calls[0][0];
+    expect(sent.files).toHaveLength(1);
+
+    await act(async () => {
+      resolvers[0](false);
+    });
+    act(() => {
+      ref.current!.giveBack(sent.text, sent.files);
+    });
+    await waitFor(() => expect(screen.getByText('page.txt')).toBeTruthy());
+
+    fireEvent.click(screen.getAllByLabelText('Remove')[0]);
+    await waitFor(() => expect(screen.queryByText('page.txt')).toBeNull());
+    fireEvent.change(view.getTextarea(), { target: { value: 'went without it', selectionStart: 15 } });
+    view.unmount();
+
+    const stored = JSON.parse(
+      localStorage.getItem(buildDraftStorageKey('thread:t-host-files', 'u-1')) ?? '{}',
+    ) as { text?: string; hadAttachments?: boolean };
+    expect(stored.text).toBe('went without it');
+    expect(stored.hadAttachments).not.toBe(true);
+    const reopened = renderComposer({ draftKey: 'thread:t-host-files' }, { userId: 'u-1' });
+    expect(screen.queryByTestId('attachments-lost-notice')).toBeNull();
+    reopened.unmount();
+  });
+
   it('a failed send of a draft with a quote and attachments restores text, chip and notice in place, and a resend carries the quote whole', () => {
     const onSend = vi.fn<ChatInputProps['onSend']>().mockReturnValue(false);
     const ref = createRef<ChatInputHandle>();

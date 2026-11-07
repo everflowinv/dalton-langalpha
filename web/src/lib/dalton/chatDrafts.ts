@@ -843,12 +843,20 @@ export function useComposerDraft({
    * `currentPartsRef` synchronously so the next queued rewrite in the batch
    * sees the accumulated parts.
    */
-  const mergePartsForSave = useCallback((sendParts: DraftParts): DraftParts => {
+  const mergePartsForSave = useCallback((
+    sendParts: DraftParts,
+    { filesHandedBack = false }: { filesHandedBack?: boolean } = {},
+  ): DraftParts => {
     const next = mergeParts(sendParts, partsForSave());
     rewroteBetweenRendersRef.current = true;
+    // A send the host took back hands its files back too, so its attachments
+    // are not lost: a user who then removes them has nothing left to re-add.
+    // Otherwise the notice rides on to the next queued rewrite in the batch.
     currentPartsRef.current = {
       quotes: next.quotes,
-      hadAttachments: Boolean(currentPartsRef.current.hadAttachments || sendParts.hadAttachments),
+      hadAttachments: Boolean(
+        currentPartsRef.current.hadAttachments || (!filesHandedBack && sendParts.hadAttachments),
+      ),
     };
     return next;
   }, [mergeParts, partsForSave]);
@@ -1220,7 +1228,7 @@ export function useComposerDraft({
         // the host's giveBack save lands.
         if (merged.trim()) {
           const parts = onSendKey
-            ? mergePartsForSave(inFlight.parts)
+            ? mergePartsForSave(inFlight.parts, { filesHandedBack: Boolean(inFlight.hostReturned) })
             : mergeParts(inFlight.parts, {
                 quotes: savedRecord?.quotes ?? [],
                 hadAttachments: savedRecord?.hadAttachments === true,
