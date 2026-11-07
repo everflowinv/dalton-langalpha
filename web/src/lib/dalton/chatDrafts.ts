@@ -584,6 +584,9 @@ interface InFlightSendState {
   /** The attachments-again notice the draft carried before this send (files
    *  lost earlier), apart from any files the send itself carried. */
   priorLostNotice?: boolean;
+  /** Files still being read when the send went out: not sent, and gone from
+   *  the box, so no host can hand them back. */
+  filesWithheld?: boolean;
 }
 
 export function settleSendResult(
@@ -658,7 +661,7 @@ export interface UseComposerDraftResult {
    * live draft on the same debounce.
    */
   touchDraft: () => void;
-  beginSend: () => PendingSendHandle;
+  beginSend: (options?: { filesWithheld?: boolean }) => PendingSendHandle;
   submitWithDraft: (
     invoke: (
       onAccepted: () => void,
@@ -666,6 +669,7 @@ export interface UseComposerDraftResult {
       onRestore: () => void,
       onHostReturned: () => void,
     ) => void | boolean | Promise<void | boolean>,
+    options?: { filesWithheld?: boolean },
   ) => void;
   /** Hand text back to the composer beside what is typed (a stopped turn's
    *  unread steers, an edit whose message is gone, or a host's returnedDraft). */
@@ -1058,7 +1062,7 @@ export function useComposerDraft({
     setInFlightCopiesState((prev) => prev.filter((c) => c.id !== id));
   }, []);
 
-  const beginSend = useCallback((): PendingSendHandle => {
+  const beginSend = useCallback(({ filesWithheld = false }: { filesWithheld?: boolean } = {}): PendingSendHandle => {
     if (timerRef.current !== null) {
       clearTimeout(timerRef.current);
       timerRef.current = null;
@@ -1076,6 +1080,7 @@ export function useComposerDraft({
       settled: false,
       parts,
       priorLostNotice: Boolean(currentPartsRef.current.hadAttachments),
+      filesWithheld,
     };
     inFlightSendRef.current = inFlight;
     if (inFlight.draftKey) {
@@ -1234,7 +1239,7 @@ export function useComposerDraft({
           const parts = onSendKey
             ? mergePartsForSave(inFlight.parts, {
                 filesHandedBack: Boolean(inFlight.hostReturned),
-                priorLostNotice: Boolean(inFlight.priorLostNotice),
+                priorLostNotice: Boolean(inFlight.priorLostNotice || inFlight.filesWithheld),
               })
             : mergeParts(inFlight.parts, {
                 quotes: savedRecord?.quotes ?? [],
@@ -1278,8 +1283,9 @@ export function useComposerDraft({
         onRestore: () => void,
         onHostReturned: () => void,
       ) => void | boolean | Promise<void | boolean>,
+      options: { filesWithheld?: boolean } = {},
     ) => {
-      const pending = beginSend();
+      const pending = beginSend(options);
       // The send path reports through these: acceptance (a run started, a
       // steer was taken, a duplicate adopted — the only thing that may delete
       // the stored draft), a handoff to the send's own automatic resend (the

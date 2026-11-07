@@ -883,6 +883,8 @@ function ChatInput({
           onReturnedUnsent: onHostReturned,
         },
       }),
+      // DALTON-HOOK(composer-drafts): files still being read go unsent and leave the box
+      { filesWithheld: readyAttachments.length < attachedFiles.length },
     );
     attachedFiles.forEach(f => { if (f.preview) URL.revokeObjectURL(f.preview); });
     setAttachedFiles([]);

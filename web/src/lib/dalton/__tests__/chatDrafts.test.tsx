@@ -1093,6 +1093,41 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     expect(screen.getByTestId('attachments-lost-notice')).toBeTruthy();
   });
 
+  it('files still being read when the send went out are owed again when the host takes the send back', async () => {
+    const resolvers: Array<(v: boolean) => void> = [];
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+      (send) => new Promise<boolean>((resolve) => {
+        resolvers.push((v: boolean) => {
+          if (v === false) send.modelOptions.onReturnedUnsent?.();
+          resolve(v);
+        });
+      }),
+    );
+    const ref = createRef<ChatInputHandle>();
+    const view = renderComposer({ draftKey: 'thread:t-host-unread', onSend }, { userId: 'u-1', ref });
+    attachFile(view, 'page.txt');
+    fireEvent.change(view.getTextarea(), { target: { value: 'sent before the file was read', selectionStart: 29 } });
+    // At once: the FileReader has not finished, so the file goes unsent.
+    fireEvent.click(screen.getByLabelText('Send message'));
+    const sent = onSend.mock.calls[0][0];
+    expect(sent.files).toHaveLength(0);
+    await act(async () => {
+      resolvers[0](false);
+    });
+    act(() => {
+      ref.current!.giveBack(sent.text, sent.files);
+    });
+    fireEvent.change(view.getTextarea(), { target: { value: 'sent before the file was read!', selectionStart: 30 } });
+    view.unmount();
+
+    const stored = JSON.parse(
+      localStorage.getItem(buildDraftStorageKey('thread:t-host-unread', 'u-1')) ?? '{}',
+    ) as { hadAttachments?: boolean };
+    expect(stored.hadAttachments).toBe(true);
+    renderComposer({ draftKey: 'thread:t-host-unread' }, { userId: 'u-1' });
+    expect(screen.getByTestId('attachments-lost-notice')).toBeTruthy();
+  });
+
   it('a send the host takes back with its files leaves no attachments-again notice once the user removes them', async () => {
     // The host takes the refused send back (onReturnedUnsent) and its giveBack
     // returns the real files beside the words, so nothing is lost: removing
