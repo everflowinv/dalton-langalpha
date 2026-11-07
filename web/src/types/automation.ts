@@ -148,10 +148,11 @@ export interface Automation {
   updated_at: string;
 
   last_execution: AutomationExecution | null;
-  // DALTON-HOOK(dalton-notify): pushable category, effective value, and source returned by backend
+  // DALTON-HOOK(dalton-notify): pushable category, effective value, source, and custom route targets returned by backend
   dalton_notify_category?: string | null;
   dalton_notify_effective?: boolean | null;
   dalton_notify_source?: string | null;
+  dalton_notify_route_targets?: string[] | null;
 }
 
 /** The settings the form writes: every field on a create, and the whole set

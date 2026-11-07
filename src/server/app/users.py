@@ -613,10 +613,10 @@ async def update_preferences(
             validate_dalton_notify_routes_for_user,
         )
 
-        # notify-routes: the route entries the caller actually submitted — the
-        # validator below normalizes and cleans `model_pref` in place, and only
+        # DALTON-HOOK(notify-routes): the route entries the caller actually submitted —
+        # the validator below normalizes and cleans `model_pref` in place, and only
         # the submitted entries (not the cleanup's pass-through groups) are
-        # gated on admin rights and live group discovery.
+        # gated on internal/admin rights and live group discovery.
         submitted_routes = model_pref.get("dalton_notify_routes")
 
         try:
@@ -628,9 +628,9 @@ async def update_preferences(
         except TuningError as exc:
             raise _tuning_400(exc) from exc
 
-        # notify-routes: group targets in notify routes are PM-only and must
-        # be in the bot's discovered chat list; the sync validator above has
-        # no user context, this one does.
+        # DALTON-HOOK(notify-routes): group targets in notify routes are restricted
+        # to internal/admin members and must be in the bot's discovered chat list;
+        # the sync validator above has no user context, this one does.
         await validate_dalton_notify_routes_for_user(
             user_id,
             submitted_routes,

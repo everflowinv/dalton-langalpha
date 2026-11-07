@@ -115,6 +115,10 @@ class HITLDecision(BaseModel):
         default=None,
         description="Changes the user made to the proposal before approving it",
     )
+    confirm_token: Optional[str] = Field(  # DALTON-HOOK(notify-routes)
+        default=None,
+        description="Confirmation token echoed back for Dalton notify approvals",
+    )
 
 
 class HITLResponse(BaseModel):

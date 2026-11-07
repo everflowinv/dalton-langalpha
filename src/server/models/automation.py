@@ -686,10 +686,11 @@ class AutomationResponse(BaseModel):
     updated_at: datetime
 
     last_execution: Optional[AutomationExecutionResponse] = None
-    # DALTON-HOOK(dalton-notify): expose pushable category, effective toggle state, and source
+    # DALTON-HOOK(dalton-notify): expose pushable category, effective toggle state, source, and custom route targets
     dalton_notify_category: Optional[str] = None
     dalton_notify_effective: Optional[bool] = None
     dalton_notify_source: Optional[str] = None
+    dalton_notify_route_targets: Optional[List[str]] = None
 
     @model_validator(mode="after")
     def _populate_dalton_notify_category(self) -> "AutomationResponse":

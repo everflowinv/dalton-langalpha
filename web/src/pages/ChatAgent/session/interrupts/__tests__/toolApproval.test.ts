@@ -11,6 +11,9 @@ import type { AssistantMessage, ChatMessage } from '@/types/chat';
 import { projectLiveInterrupt } from '../fromLiveEvent';
 import { projectHistoryInterrupt, type HistoryInterruptContext } from '../fromHistoryEvent';
 import { createApprovalEvidence } from '../claims';
+// DALTON-HOOK(notify-routes): test Dalton conversational notify approval cards and decisions.
+import { createAnswerBoard } from '../answerBoard';
+import { buildToolApprovalState, isToolApprovalRequest, toolApprovalCards } from '../toolApprovalCard';
 import type { StreamRuntime, HistoryRuntime } from '../../runtime';
 import type { SSEEvent, StreamProcessorRefs, PairState } from '../../types';
 
@@ -182,6 +185,86 @@ describe('live projection', () => {
     // Tracked again, so the retried decision is not dropped.
     expect(second.rt.pendingInterruptIdsRef.current.has(INTERRUPT_ID)).toBe(true);
   });
+
+  // DALTON-HOOK(notify-routes): live projection renders and answers all three Dalton notify action types.
+  it('renders and answers Dalton notify confirmation cards across all three action types', () => {
+    const cases = [
+      {
+        type: 'dalton_notify_set_route',
+        name: '设置定时任务推送',
+        args: { 任务: 'NVDA Earnings Monitor', 推送到: ['Market Alert（群）', '张三（个人）'] },
+        confirm_token: 'tok-set-route-123',
+        click: { approved: true as const },
+        expectedDecision: { type: 'approve', confirm_token: 'tok-set-route-123' },
+      },
+      {
+        type: 'dalton_notify_add_personal_target',
+        name: '添加个人推送目标',
+        args: { 目标: 'ou_personal_1', 名称: '张三' },
+        confirm_token: 'tok-add-personal-456',
+        click: { approved: false as const, message: '换一个账号' },
+        expectedDecision: { type: 'reject', message: '换一个账号' },
+      },
+      {
+        type: 'dalton_notify_test',
+        name: '发送推送测试',
+        args: { 任务: 'NVDA Earnings Monitor', 推送到: ['Market Alert（群）'] },
+        confirm_token: 'tok-test-789',
+        click: { approved: true as const },
+        expectedDecision: { type: 'approve', confirm_token: 'tok-test-789' },
+      },
+    ];
+
+    for (const item of cases) {
+      const intId = `int-${item.type}`;
+      const { rt, refs, read } = build([bubble('a-1')]);
+      const board = createAnswerBoard({
+        pendingIds: rt.pendingInterruptIdsRef,
+        sessionEpoch: ref(0),
+        setMessages: rt.setMessages,
+      });
+      projectLiveInterrupt(
+        rt,
+        {
+          type: 'interrupt',
+          thread_id: 't-1',
+          interrupt_id: intId,
+          action_requests: [
+            {
+              type: item.type,
+              name: item.name,
+              args: item.args,
+              confirm_token: item.confirm_token,
+            },
+          ],
+          role: 'assistant',
+          finish_reason: 'interrupt',
+        } as unknown as SSEEvent,
+        'a-1',
+        refs,
+      );
+
+      const msg = read()[0] as AssistantMessage;
+      expect(msg.contentSegments).toEqual([{ type: 'tool_approval', proposalId: intId, order: 1 }]);
+      expect(msg.toolApprovals?.[intId]).toMatchObject({
+        status: 'pending',
+        toolName: item.name,
+        server: '',
+        tool: item.name,
+        args: item.args,
+        confirmToken: item.confirm_token,
+      });
+      expect(rt.pendingInterruptIdsRef.current.has(intId)).toBe(true);
+
+      const entry = board.decideToolCall(intId, intId, { index: 0, count: 1 }, item.click);
+      expect(entry).toEqual({ decisions: [item.expectedDecision] });
+      const payload = board.answer(intId, entry!);
+      expect(payload).toEqual({ [intId]: { decisions: [item.expectedDecision] } });
+      expect((read()[0] as AssistantMessage).toolApprovals?.[intId]?.status).toBe(
+        item.click.approved ? 'approved' : 'rejected',
+      );
+    }
+  });
 });
 
 describe('history projection', () => {
@@ -255,5 +338,194 @@ describe('history projection', () => {
     const msg = read()[0] as AssistantMessage;
     expect(msg.contentSegments).toEqual([]);
     expect(ctx.pendingHistoryInterrupts).toEqual([]);
+  });
+
+  // DALTON-HOOK(notify-routes): history replay restores and re-arms all three Dalton notify action types.
+  it('replays Dalton notify confirmation cards, restores pending on re-raise, and answers via answerBoard', () => {
+    const cases = [
+      {
+        type: 'dalton_notify_set_route',
+        name: '设置定时任务推送',
+        args: { 任务: 'NVDA Earnings Monitor', 推送到: ['Market Alert（群）'] },
+      },
+      {
+        type: 'dalton_notify_add_personal_target',
+        name: '添加个人推送目标',
+        args: { 目标: 'ou_personal_1', 名称: '张三' },
+      },
+      {
+        type: 'dalton_notify_test',
+        name: '发送推送测试',
+        args: { 任务: 'NVDA Earnings Monitor', 推送到: ['Market Alert（群）'] },
+      },
+    ];
+
+    for (const item of cases) {
+      const intId = `hist-${item.type}`;
+      const { rt, ctx, read } = build([bubble('a-1')]);
+      const ev = {
+        type: 'interrupt',
+        turn_index: 0,
+        interrupt_id: intId,
+        action_requests: [{ type: item.type, name: item.name, args: item.args }],
+      } as unknown as SSEEvent;
+
+      projectHistoryInterrupt(rt, ev, ctx);
+
+      const msg = read()[0] as AssistantMessage;
+      expect(msg.toolApprovals?.[intId]).toMatchObject({
+        status: 'pending',
+        tool: item.name,
+        args: item.args,
+      });
+      expect(ctx.pendingHistoryInterrupts).toEqual([
+        {
+          type: 'tool_approval',
+          assistantMessageId: 'a-1',
+          proposalId: intId,
+          interruptId: intId,
+          target: { kind: 'attempt', attemptId: item.type, index: 0 },
+        },
+      ]);
+
+      // Simulate a settled card followed by a re-raise in history replay: must restore to pending.
+      rt.setMessages((prev) =>
+        prev.map((m) => ({
+          ...(m as AssistantMessage),
+          toolApprovals: {
+            ...(m as AssistantMessage).toolApprovals,
+            [intId]: { ...(m as AssistantMessage).toolApprovals![intId], status: 'approved' as const },
+          },
+        })) as unknown as ChatMessage[],
+      );
+      ctx.pendingHistoryInterrupts.length = 0;
+      projectHistoryInterrupt(rt, ev, ctx);
+      expect((read()[0] as AssistantMessage).toolApprovals?.[intId]?.status).toBe('pending');
+      expect(ctx.pendingHistoryInterrupts).toHaveLength(1);
+
+      const pendingIds = ref(new Set<string>());
+      const board = createAnswerBoard({
+        pendingIds,
+        sessionEpoch: ref(0),
+        setMessages: rt.setMessages,
+      });
+      board.arm(ctx.pendingHistoryInterrupts.map((info) => info.interruptId));
+      const entry = board.decideToolCall(intId, intId, { index: 0, count: 1 }, { approved: true });
+      expect(board.answer(intId, entry!)).toEqual({
+        [intId]: { decisions: [{ type: 'approve' }] },
+      });
+    }
+  });
+});
+
+// DALTON-HOOK(notify-routes): unit test for toolApprovalCard helpers across the three Dalton notify types.
+describe('toolApprovalCard Dalton notify whitelist', () => {
+  it('recognizes all three Dalton notify action types and builds title and args state', () => {
+    const requests = [
+      {
+        type: 'dalton_notify_set_route',
+        name: '设置定时任务推送',
+        args: { 任务: 'NVDA Earnings Monitor', 推送到: ['Market Alert（群）'] },
+      },
+      {
+        type: 'dalton_notify_add_personal_target',
+        name: '添加个人推送目标',
+        args: { 目标: 'ou_personal_1', 名称: '张三' },
+      },
+      {
+        type: 'dalton_notify_test',
+        name: '发送推送测试',
+        args: { 任务: 'NVDA Earnings Monitor', 推送到: ['Market Alert（群）'] },
+      },
+    ];
+
+    for (const req of requests) {
+      expect(isToolApprovalRequest(req)).toBe(true);
+      const state = buildToolApprovalState(req, 'int-notify', 0, 1);
+      expect(state).toMatchObject({
+        toolName: req.name,
+        server: '',
+        tool: req.name,
+        args: req.args,
+        interruptId: 'int-notify',
+        status: 'pending',
+      });
+      const cards = toolApprovalCards([req], 'int-notify', 'fallback-notify');
+      expect(cards).toHaveLength(1);
+      expect(cards[0].target).toEqual({ kind: 'attempt', attemptId: req.type, index: 0 });
+      expect(cards[0].state.tool).toBe(req.name);
+      expect(cards[0].state.args).toEqual(req.args);
+    }
+  });
+
+  it('attaches confirm_token on approve for the three Dalton notify cards and keeps other approval cards unchanged', () => {
+    const daltonRequests = [
+      {
+        type: 'dalton_notify_set_route',
+        name: '设置定时任务推送',
+        args: { 任务: 'Morning Macro Digest' },
+        confirm_token: 'sha256-set-route',
+      },
+      {
+        type: 'dalton_notify_add_personal_target',
+        name: '添加个人推送目标',
+        args: { 目标: 'feishu:user:ou_zhang' },
+        confirm_token: 'sha256-add-personal',
+      },
+      {
+        type: 'dalton_notify_test',
+        name: '发送推送测试',
+        args: { 任务: 'Morning Macro Digest' },
+        confirm_token: 'sha256-test',
+      },
+    ];
+
+    for (const req of daltonRequests) {
+      const intId = `int-token-${req.type}`;
+      const cards = toolApprovalCards([req], intId, intId);
+      expect(cards[0].state.confirmToken).toBe(req.confirm_token);
+
+      const board = createAnswerBoard({
+        pendingIds: ref(new Set([intId])),
+        sessionEpoch: ref(0),
+        setMessages: () => {},
+      });
+      const entry = board.decideToolCall(intId, intId, { index: 0, count: 1 }, { approved: true });
+      expect(entry).toEqual({
+        decisions: [{ type: 'approve', confirm_token: req.confirm_token }],
+      });
+    }
+
+    // Non-Dalton tool approval card: decision shape is strictly { type: 'approve' } without confirm_token.
+    const otherIntId = 'int-other-mcp';
+    const otherCards = toolApprovalCards(
+      [
+        {
+          type: 'tool_call',
+          name: 'mcp__moomoo__trading_order_place',
+          args: { symbol: 'NVDA', qty: 10 },
+          confirm_token: 'should-not-be-kept',
+        },
+      ],
+      otherIntId,
+      otherIntId,
+    );
+    expect(otherCards[0].state.confirmToken).toBeUndefined();
+
+    const otherBoard = createAnswerBoard({
+      pendingIds: ref(new Set([otherIntId])),
+      sessionEpoch: ref(0),
+      setMessages: () => {},
+    });
+    const otherEntry = otherBoard.decideToolCall(
+      otherIntId,
+      otherIntId,
+      { index: 0, count: 1 },
+      { approved: true },
+    );
+    expect(otherEntry).toEqual({
+      decisions: [{ type: 'approve' }],
+    });
+    expect('confirm_token' in otherEntry!.decisions[0]).toBe(false);
   });
 });

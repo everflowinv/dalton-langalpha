@@ -39,7 +39,7 @@ export function DaltonSection({ advanced = false }: { advanced?: boolean } = {})
       <div id="dalton-notify-targets">
         <DaltonNotifyTargetsCard />
       </div>
-      {/* notify-routes: admin-only group push (renders nothing for non-PM) */}
+      {/* notify-routes: internal/admin group push (renders nothing on 403 for external members) */}
       <DaltonFeishuGroupsCard />
       <div id="dalton-system-jobs">
         <DaltonSystemJobsCard scopes={baseScopes} />

@@ -1025,6 +1025,8 @@ export interface ChatMessageBody extends ArtifactCommentSendFields {
 export interface HitlDecisionBody {
   type: string;
   message?: string;
+  // DALTON-HOOK(notify-routes): echoed confirmation token for Dalton notify approvals.
+  confirm_token?: string;
 }
 
 /**
