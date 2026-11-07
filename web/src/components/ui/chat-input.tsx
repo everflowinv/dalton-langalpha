@@ -24,6 +24,7 @@ import { focusWithoutRing } from '@/lib/inputModality';
 import { cn } from '@/lib/utils';
 import type { WidgetContextSnapshot } from '@/pages/Dashboard/widgets/framework/contextSnapshot';
 import './chat-input.css';
+// DALTON-HOOK(composer-drafts): QuoteMention and sameMention restore a draft's quotes beside the given-back text
 import type { ComposerDraft, ComposerScope, ComposerSend, ContextPayload, ModelOptions, QuoteMention, ReadyAttachment, SlashCommand, ThreadTuning, Workspace } from './chat-input.types';
 import { isLargePaste, getModelDisplayName, sameMention } from './chat-input.helpers';
 import { effortLabelFor, resolveEffort } from '@/lib/modelTuning';
