@@ -14,6 +14,7 @@ import {
   DRAFT_STORAGE_PREFIX_V1,
   DRAFT_TTL_MS,
   MAX_DRAFT_BYTES,
+  appendInFlightCopy,
   buildDraftStorageKey,
   clear,
   load,
@@ -2075,6 +2076,114 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
       expect(view.getTextarea().value).toBe('');
       await act(async () => { queryClient.setQueryData(queryKeys.user.me(), { user_id: 'u-1' }); });
       await waitFor(() => expect(view.getTextarea().value).toBe('stored draft'));
+      view.unmount();
+    });
+
+    it('two sends returned during a composition (plain A and quoted B) keep both texts, the quote chip, and the attachment notice when switching draftKey before compositionend', async () => {
+      const resolvers: Array<(v: boolean) => void> = [];
+      const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+        () => new Promise<boolean>((resolve) => { resolvers.push(resolve); }),
+      );
+      const ref = createRef<ChatInputHandle>();
+      const view = renderComposer({ draftKey: 'thread:ime-batch-settle', onSend }, { userId: 'u-1', ref });
+
+      fireEvent.change(view.getTextarea(), { target: { value: 'plain send A', selectionStart: 12 } });
+      fireEvent.click(screen.getByLabelText('Send message'));
+
+      act(() => {
+        ref.current!.addContext({ kind: 'quote', snippet: 'Revenue grew by a lot', from: ANALYST });
+      });
+      const tokenB = view.getTextarea().value;
+      fireEvent.change(view.getTextarea(), {
+        target: { value: `${tokenB}quoted send B`, selectionStart: (tokenB + 'quoted send B').length },
+      });
+      attachFile(view, 'exhibit.txt');
+      fireEvent.click(screen.getByLabelText('Send message'));
+
+      // Settled newest-first while composing, matching settleQueued(false)
+      compose(view.getTextarea(), '正在输入');
+      await act(async () => {
+        resolvers[1](false);
+        resolvers[0](false);
+      });
+      expect(view.getTextarea().value).toBe('正在输入');
+
+      view.rerenderComposer({ draftKey: 'thread:other', onSend });
+      fireEvent.compositionEnd(view.getTextarea());
+      await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
+      expect(loadInFlightCopies('thread:ime-batch-settle', 'u-1')).toHaveLength(0);
+
+      view.rerenderComposer({ draftKey: 'thread:ime-batch-settle', onSend });
+      expect(view.getTextarea().value).toBe(`plain send A\n\n${tokenB}quoted send B\n\n正在输入`);
+      expect(document.querySelectorAll('.draft-token-quote')).toHaveLength(1);
+      expect(screen.getByTestId('attachments-lost-notice')).toBeTruthy();
+
+      fireEvent.click(screen.getByLabelText('Send message'));
+      const resent = onSend.mock.calls[2][0].message;
+      expect(resent).toContain('plain send A');
+      expect(resent).toContain('quoted send B');
+      expect(resent).toContain('<quote source="Analyst">Revenue grew by a lot</quote>');
+      view.unmount();
+    });
+
+    it('two quoted giveBack calls queued during a composition keep both texts and both quote chips when switching draftKey before compositionend', async () => {
+      const onSend = vi.fn<ChatInputProps['onSend']>().mockReturnValue(true);
+      const ref = createRef<ChatInputHandle>();
+      const view = renderComposer({ draftKey: 'thread:ime-batch-giveback', onSend }, { userId: 'u-1', ref });
+
+      const quoteA = heldQuote('Revenue grew by a lot');
+      const quoteB = heldQuote('Margins slipped three percent');
+      compose(view.getTextarea(), '正在输入');
+      act(() => {
+        ref.current!.giveBack(`${quoteA.token}first handed back`, [], { mentions: [quoteA] });
+        ref.current!.giveBack(`${quoteB.token}second handed back`, [], { mentions: [quoteB] });
+      });
+      expect(view.getTextarea().value).toBe('正在输入');
+
+      view.rerenderComposer({ draftKey: 'thread:other', onSend });
+      fireEvent.compositionEnd(view.getTextarea());
+      await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
+
+      view.rerenderComposer({ draftKey: 'thread:ime-batch-giveback', onSend });
+      expect(view.getTextarea().value).toBe(
+        `正在输入\n\n${quoteA.token}first handed back\n\n${quoteB.token}second handed back`,
+      );
+      expect(document.querySelectorAll('.draft-token-quote')).toHaveLength(2);
+
+      fireEvent.click(screen.getByLabelText('Send message'));
+      const sent = onSend.mock.calls[0][0].message;
+      expect(sent).toContain('first handed back');
+      expect(sent).toContain('second handed back');
+      expect(sent).toContain('<quote source="Analyst">Revenue grew by a lot</quote>');
+      expect(sent).toContain('<quote source="Analyst">Margins slipped three percent</quote>');
+      view.unmount();
+    });
+
+    it('restoring an anon in-flight copy during a composition writes the draft under the user that loads before compositionend and removes the anon copy', async () => {
+      const quote = heldQuote('Revenue grew by a lot');
+      appendInFlightCopy('thread:ime-restore-anon', `${quote.token}anon send copy`, 'anon', {
+        quotes: [quote],
+      });
+      const queryClient = createQueryClient();
+      queryClient.setQueryDefaults(queryKeys.user.me(), { queryFn: () => new Promise(() => {}) });
+      const view = renderComposer({ draftKey: 'thread:ime-restore-anon' }, { queryClient });
+
+      expect(screen.getByTestId('in-flight-draft-text').textContent).toBe(`${quote.token}anon send copy`);
+      compose(view.getTextarea(), '正在输入');
+      fireEvent.click(screen.getByTestId('in-flight-draft-restore'));
+      expect(view.getTextarea().value).toBe('正在输入');
+
+      await act(async () => {
+        queryClient.setQueryData(queryKeys.user.me(), { user_id: 'u-1' });
+        await new Promise((r) => setTimeout(r, 20));
+      });
+
+      await endComposition(view.getTextarea(), '输入完成');
+      expect(view.getTextarea().value).toBe(`${quote.token}anon send copy\n\n输入完成`);
+      expect(load('thread:ime-restore-anon', 'u-1')).toBe(`${quote.token}anon send copy\n\n输入完成`);
+      expect(loadInFlightCopies('thread:ime-restore-anon', 'anon')).toHaveLength(0);
+      expect(loadInFlightCopies('thread:ime-restore-anon', 'u-1')).toHaveLength(0);
+      expect(document.querySelectorAll('.draft-token-quote')).toHaveLength(1);
       view.unmount();
     });
   });

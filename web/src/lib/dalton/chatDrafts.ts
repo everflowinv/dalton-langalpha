@@ -729,8 +729,15 @@ export function useComposerDraft({
   const onDraftKeySwitchRef = useRef<(() => void) | undefined>(onDraftKeySwitch);
   const getDraftPartsRef = useRef<(() => DraftParts) | undefined>(getDraftParts);
   const onSendReturnedRef = useRef<((sentText: string, parts: DraftParts) => void) | undefined>(onSendReturned);
-  /** Mirrors `restoredHadAttachments` from its stored initial value, for a save to keep the attachments-again notice standing. */
-  const restoredHadAttachmentsRef = useRef<boolean>(restoredHadAttachments);
+  /**
+   * Current rich parts (quotes, hadAttachments) accumulated across restores and
+   * queued rewrites, so back-to-back saves in the same batch see each other's
+   * parts before a render updates the composer's live read.
+   */
+  const currentPartsRef = useRef<DraftParts>({
+    quotes: restoredQuotes,
+    hadAttachments: restoredHadAttachments,
+  });
   const prevTargetRef = useRef<{ draftKey?: string; userId: string }>({
     draftKey,
     userId,
@@ -771,32 +778,6 @@ export function useComposerDraft({
     }, 0);
   }, [flushPendingWrites]);
 
-  /** Applies what a restore brought back; `null` is every reset point (sent, cleared, switched). */
-  const applyRestored = useCallback(
-    (record: { quotes?: QuoteMention[]; hadAttachments?: boolean } | null) => {
-      setRestoredQuotesState(record?.quotes ?? []);
-      // A reset (`null`: sent, cleared, switched) clears the notice. A restore
-      // ORs into it: a newer send's attachments-again notice must survive an
-      // older send's restore beside it in the same box.
-      restoredHadAttachmentsRef.current =
-        record === null ? false : restoredHadAttachmentsRef.current || record.hadAttachments === true;
-      setRestoredHadAttachmentsState(restoredHadAttachmentsRef.current);
-    },
-    [],
-  );
-
-  /**
-   * The parts a save of the live composer writes: what it holds now, and the
-   * attachments-again notice a failure restore left standing — a later edit
-   * must not drop it before the files are back beside the draft.
-   */
-  const partsForSave = useCallback((): DraftParts => {
-    const parts = getDraftPartsRef.current?.() ?? {};
-    return parts.hadAttachments || restoredHadAttachmentsRef.current
-      ? { ...parts, hadAttachments: true }
-      : parts;
-  }, []);
-
   /** The union of two parts bags, by token — the send's own quotes kept beside the other's. */
   const mergeParts = useCallback((sendParts: DraftParts, other: DraftParts): DraftParts => {
     const otherQuotes = other.quotes ?? [];
@@ -810,15 +791,48 @@ export function useComposerDraft({
     };
   }, []);
 
+  /** Applies what a restore brought back; `null` is every reset point (sent, cleared, switched). */
+  const applyRestored = useCallback(
+    (record: { quotes?: QuoteMention[]; hadAttachments?: boolean } | null) => {
+      if (record === null) {
+        currentPartsRef.current = {};
+        setRestoredQuotesState([]);
+        setRestoredHadAttachmentsState(false);
+        return;
+      }
+      // A reset (`null`: sent, cleared, switched) clears the notice and held
+      // quotes. A restore merges into the current parts ref: a newer send's
+      // quotes and attachments-again notice survive an older send's restore
+      // beside it in the same batch.
+      const next = mergeParts(record, currentPartsRef.current);
+      currentPartsRef.current = next;
+      setRestoredQuotesState(next.quotes ?? []);
+      setRestoredHadAttachmentsState(Boolean(next.hadAttachments));
+    },
+    [mergeParts],
+  );
+
   /**
-   * DALTON-HOOK(composer-drafts): the parts a not-taken restore seats into the
-   * live draft: the send's own quotes (with their renumbered tokens) beside
-   * whatever the box holds now — quotes added while the send was out, the
-   * attachment notice — so the synchronous save keeps both.
+   * The parts a save of the live composer writes: what it holds now, merged
+   * with the quotes and attachments-again notice a restore or queued rewrite
+   * left standing in `currentPartsRef` before the next render.
    */
-  const mergePartsForSave = useCallback((sendParts: DraftParts): DraftParts => (
-    mergeParts(sendParts, partsForSave())
-  ), [mergeParts, partsForSave]);
+  const partsForSave = useCallback((): DraftParts => (
+    mergeParts(currentPartsRef.current, getDraftPartsRef.current?.() ?? {})
+  ), [mergeParts]);
+
+  /**
+   * DALTON-HOOK(composer-drafts): the parts a not-taken restore or give-back
+   * seats into the live draft: the incoming quotes (with their renumbered
+   * tokens) beside whatever the box and `currentPartsRef` hold now, updating
+   * `currentPartsRef` synchronously so the next queued rewrite in the batch
+   * sees the accumulated parts.
+   */
+  const mergePartsForSave = useCallback((sendParts: DraftParts): DraftParts => {
+    const next = mergeParts(sendParts, partsForSave());
+    currentPartsRef.current = next;
+    return next;
+  }, [mergeParts, partsForSave]);
 
   useLayoutEffect(() => {
     activeDraftKeyRef.current = draftKey;
@@ -959,9 +973,12 @@ export function useComposerDraft({
     runExternal((currentKey) => {
       if (currentKey !== key) return;
       const owner = ownerOf(uid);
-      const copy = key ? (loadInFlightCopies(key, owner) ?? []).find((c) => c.id === id) : undefined;
+      // Read the copy from the slot where it was offered (the user captured
+      // when restore was clicked, which may still be `anon`); write the
+      // restored draft under the resolved owner and remove the original copy.
+      const copy = key ? (loadInFlightCopies(key, uid) ?? []).find((c) => c.id === id) : undefined;
       if (!key || !copy) {
-        if (key) removeInFlightCopy(key, id, owner);
+        if (key) removeInFlightCopy(key, id, uid);
         setInFlightCopiesState((prev) => prev.filter((c) => c.id !== id));
         return;
       }
@@ -992,7 +1009,8 @@ export function useComposerDraft({
       if (merged.trim()) {
         save(key, merged, owner, undefined, { parts: mergePartsForSave({ quotes: copy.quotes, hadAttachments: copy.hadAttachments }) });
       }
-      removeInFlightCopy(key, id, owner);
+      removeInFlightCopy(key, id, uid);
+      if (owner !== uid) removeInFlightCopy(key, id, owner);
       setInFlightCopiesState((prev) => prev.filter((c) => c.id !== id));
     });
   }, [applyRestored, mergePartsForSave, ownerOf, runExternal]);
