@@ -201,12 +201,7 @@ def _bar_date_str(idx: Any) -> str | None:
     return None
 
 
-def _recent_daily_rows(ticker: Any) -> list[tuple[str, float, float]] | None:  # DALTON-HOOK(yfinance-prev-close)
-    """A month of daily bars as ``(date, close, volume)``, ascending."""
-    try:
-        df = ticker.history(period="1mo", auto_adjust=False)
-    except Exception:
-        return None
+def _daily_rows_from_frame(df: Any) -> list[tuple[str, float, float]] | None:  # DALTON-HOOK(yfinance-prev-close)
     if df is None or getattr(df, "empty", True):
         return None
     rows: list[tuple[str, float, float]] = []
@@ -223,6 +218,15 @@ def _recent_daily_rows(ticker: Any) -> list[tuple[str, float, float]] | None:  #
             volume = 0.0
         rows.append((date_str, close, volume))
     return rows or None
+
+
+def _recent_daily_rows(ticker: Any) -> list[tuple[str, float, float]] | None:  # DALTON-HOOK(yfinance-prev-close)
+    """A month of daily bars as ``(date, close, volume)``, ascending."""
+    try:
+        df = ticker.history(period="1mo", auto_adjust=False)
+    except Exception:
+        return None
+    return _daily_rows_from_frame(df)
 
 
 _DAILY_ROWS_CACHE_TTL_S = 600.0

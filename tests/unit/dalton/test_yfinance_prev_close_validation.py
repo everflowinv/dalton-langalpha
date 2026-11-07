@@ -140,36 +140,17 @@ def _stub_ticker(rows_1mo: list[tuple[str, float, float]] | None,
         merged_info["marketCap"] = fast_info["marketCap"]
     ticker.info = merged_info
     last_price = fast_info.get("lastPrice")
-    quote_date = (
-        datetime.fromtimestamp(regular_market_time, tz=ZoneInfo("Asia/Hong_Kong")).strftime("%Y-%m-%d")
-        if regular_market_time is not None
-        else (rows_1mo[-1][0] if rows_1mo else "2026-10-27")
-    )
-    confirmed_prev = validated_previous_close(
-        regular_previous_close(fast_info), rows_1mo, quote_date
-    )
+    raw_prev = regular_previous_close(fast_info)
     meta: dict[str, object] = {"exchangeTimezoneName": "Asia/Hong_Kong"}
     if regular_market_time is not None:
         meta["regularMarketTime"] = regular_market_time
     if last_price is not None:
         meta["regularMarketPrice"] = last_price
-    if confirmed_prev is not None:
-        meta["chartPreviousClose"] = confirmed_prev
+    if raw_prev is not None:
+        meta["chartPreviousClose"] = raw_prev
     ticker.history_metadata = meta
-
-    daily_bars: list[tuple[str, float, float]] = []
-    if confirmed_prev is not None:
-        daily_bars.append(("2026-10-26", float(confirmed_prev), 10_000_000.0))
-    if isinstance(last_price, (int, float)):
-        vol = float(fast_info.get("lastVolume", 1_000_000) or 0.0)
-        daily_bars.append((quote_date, float(last_price), vol))
-    frame_5d = _history_frame(daily_bars) if daily_bars else pd.DataFrame()
-    frame_1mo = _history_frame(rows_1mo) if rows_1mo is not None else pd.DataFrame()
-    ticker.history.side_effect = (
-        lambda *a, **kw: frame_1mo
-        if kw.get("period") == "1mo"
-        else frame_5d
-    )
+    frame = _history_frame(rows_1mo) if rows_1mo is not None else pd.DataFrame()
+    ticker.history.return_value = frame
     return ticker
 
 
@@ -177,7 +158,7 @@ def test_fetch_single_snapshot_reports_unknown_on_frozen_conflict():
     # 2026-10-27 16:08 HKT print (1780099700 ≈ 08:08 UTC) at 12.90 while the
     # stale previous close still says 15.47 → the −16.61% must not be shown.
     ticker = _stub_ticker(
-        _frozen_hk_rows(),
+        _frozen_hk_rows()[:-1],
         fast_info={
             "lastPrice": 12.90,
             "regularMarketPreviousClose": 15.47,
@@ -337,6 +318,8 @@ def test_snapshot_from_history_skips_frozen_previous_row():
 
     ticker = create_autospec(yf.Ticker, instance=True)
     rows = [
+        ("2026-10-20", 15.47, 0.0),
+        ("2026-10-23", 15.47, 0.0),
         ("2026-10-26", 13.57, 48_924_388),
     ]
     ticker.history.return_value = _history_frame(rows)
@@ -388,7 +371,7 @@ def test_realtime_quote_reports_unknown_on_2525_hk_frozen_conflict():
     from src.data_client.yfinance import data_source as yf_ds, financial_source as yf_fin
 
     ticker = _stub_ticker(
-        _frozen_hk_rows(),
+        _frozen_hk_rows()[:-1],
         fast_info={
             "lastPrice": 12.90,
             "regularMarketPreviousClose": 15.47,
@@ -586,7 +569,7 @@ async def test_company_overview_formats_unknown_prev_close_without_zero_or_error
     from src.tools.market_data import company as company_mod
 
     ticker = _stub_ticker(
-        _frozen_hk_rows(),
+        _frozen_hk_rows()[:-1],
         fast_info={
             "lastPrice": 12.90,
             "regularMarketPreviousClose": 15.47,
@@ -657,7 +640,7 @@ def test_sector_etf_frozen_conflict_and_resumption_day_return_unknown():
 
     # 10/27 frozen-tail conflict (15.47 vs 13.57)
     conflict_ticker = _stub_ticker(
-        _frozen_hk_rows(),
+        _frozen_hk_rows()[:-1],
         fast_info={"lastPrice": 12.90, "regularMarketPreviousClose": 15.47},
     )
     with (
@@ -722,6 +705,7 @@ def test_sector_etf_stale_history_returns_unknown():
         _stale_hk_rows(),
         fast_info={"lastPrice": 12.90, "regularMarketPreviousClose": 13.57},
     )
+    stale_ticker.history_metadata["exchangeTimezoneName"] = "America/New_York"
     with (
         patch(
             "src.data_client.yfinance.financial_source.yahoo_ticker",
@@ -792,7 +776,7 @@ async def test_sector_performance_omits_unverified_etf_and_keeps_valid_sectors()
         fast_info={"lastPrice": 203.0, "regularMarketPreviousClose": 200.0},
     )
     frozen_ticker = _stub_ticker(
-        _frozen_hk_rows(),
+        _frozen_hk_rows()[:-1],
         fast_info={"lastPrice": 12.90, "regularMarketPreviousClose": 15.47},
     )
 
@@ -826,4 +810,132 @@ async def test_sector_performance_omits_unverified_etf_and_keeps_valid_sectors()
         "type": "sector_performance",
         "sectors": [{"sector": "Healthcare", "changePercentage": 1.5}],
     }
+
+
+def test_sector_etf_extended_hours_uses_regular_session_change():
+    # Previous close 100, regular close 105 (+5.00%), after-hours 106.
+    # Sector performance must report the regular session's +5.00%, not the
+    # extended-hours change_percent.
+    from src.dalton import extended_hours
+    from src.data_client.yfinance import data_source as yf_ds
+
+    et = ZoneInfo("America/New_York")
+    reg_close_dt = datetime(2026, 10, 27, 16, 0, tzinfo=et)
+    post_dt = datetime(2026, 10, 27, 17, 0, tzinfo=et)
+    now_dt = datetime(2026, 10, 27, 17, 5, tzinfo=et)
+
+    ticker = create_autospec(yf.Ticker, instance=True)
+    ticker.history.return_value = _history_frame(
+        [("2026-10-26", 100.0, 10_000_000), ("2026-10-27", 105.0, 12_000_000)]
+    )
+    ticker.history_metadata = {
+        "exchangeTimezoneName": "America/New_York",
+        "regularMarketPrice": 105.0,
+        "regularMarketTime": int(reg_close_dt.timestamp()),
+    }
+    ticker.info = {
+        "marketState": "POST",
+        "postMarketPrice": 106.0,
+        "postMarketTime": int(post_dt.timestamp()),
+    }
+
+    with (
+        patch(
+            "src.data_client.yfinance.data_source.yahoo_ticker",
+            new=create_autospec(yf_ds.yahoo_ticker, return_value=ticker),
+        ),
+        patch(
+            "src.dalton.extended_hours._now_utc",
+            new=create_autospec(
+                extended_hours._now_utc,
+                return_value=now_dt.astimezone(timezone.utc),
+            ),
+        ),
+    ):
+        snap = _fetch_single_snapshot("XLK")
+        row = _get_single_sector_perf("Technology", "XLK")
+
+    assert snap is not None
+    assert snap["late_trading_change_percent"] == pytest.approx((106.0 - 105.0) / 105.0 * 100.0, abs=1e-4)
+    assert snap["regular_trading_change_percent"] == pytest.approx(5.0, abs=1e-4)
+    assert snap["change_percent"] != pytest.approx(5.0, abs=1e-4)
+    assert row == {"sector": "Technology", "changePctStr": "+5.00%"}
+
+
+@pytest.mark.asyncio
+async def test_realtime_quote_restores_52_week_range_and_avg_volume():
+    from src.data_client.financial_data_provider import FinancialDataProvider
+    from src.data_client.market_data_provider import MarketDataProvider
+    from src.data_client.yfinance import data_source as yf_ds, financial_source as yf_fin
+    from src.tools.market_data import company as company_mod
+
+    ticker = _stub_ticker(
+        [("2026-10-26", 100.0, 10_000_000), ("2026-10-27", 105.0, 12_000_000)],
+        fast_info={
+            "lastPrice": 105.0,
+            "regularMarketPreviousClose": 100.0,
+            "currency": "USD",
+            "exchange": "NMS",
+            "marketCap": 3_500_000_000_000,
+        },
+        regular_market_time=int(
+            datetime(2026, 10, 27, 16, 0, tzinfo=ZoneInfo("America/New_York")).timestamp()
+        ),
+        info={
+            "longName": "Apple Inc.",
+            "sector": "Technology",
+            "industry": "Consumer Electronics",
+            "fiftyTwoWeekHigh": 260.5,
+            "fiftyTwoWeekLow": 165.25,
+            "averageVolume": 60_000_000,
+            "marketCap": 3_500_000_000_000,
+        },
+    )
+    ticker.history_metadata["exchangeTimezoneName"] = "America/New_York"
+    fin_provider = FinancialDataProvider(financial=YFinanceFinancialSource())
+    mkt_provider = create_autospec(MarketDataProvider, instance=True)
+    mkt_provider.get_snapshots.return_value = []
+
+    with (
+        patch(
+            "src.data_client.yfinance.financial_source.yahoo_ticker",
+            new=create_autospec(yf_fin.yahoo_ticker, return_value=ticker),
+        ),
+        patch(
+            "src.data_client.yfinance.data_source.yahoo_ticker",
+            new=create_autospec(yf_ds.yahoo_ticker, return_value=ticker),
+        ),
+        patch(
+            "src.tools.market_data.company.get_financial_data_provider",
+            new=create_autospec(
+                company_mod.get_financial_data_provider, return_value=fin_provider
+            ),
+        ),
+        patch(
+            "src.tools.market_data.company.get_market_data_provider",
+            new=create_autospec(
+                company_mod.get_market_data_provider, return_value=mkt_provider
+            ),
+        ),
+        patch(
+            "src.tools.market_data.company.display_names",
+            new=create_autospec(company_mod.display_names, return_value=(None, None)),
+        ),
+        patch(
+            "src.tools.market_data.company._fmp_request",
+            new=create_autospec(company_mod._fmp_request, return_value=[]),
+        ),
+    ):
+        q = _get_realtime_quote("AAPL")[0]
+        content, artifact = await company_mod.fetch_company_overview("AAPL")
+
+    assert q["yearHigh"] == 260.5
+    assert q["yearLow"] == 165.25
+    assert q["avgVolume"] == 60_000_000
+    assert "| 52-Week Range | $165.25 - $260.50 |" in content
+    assert "(Avg: 60.00M)" in content
+    assert artifact["quote"]["yearHigh"] == 260.5
+    assert artifact["quote"]["yearLow"] == 165.25
+    assert artifact["quote"]["avgVolume"] == 60_000_000
+
 

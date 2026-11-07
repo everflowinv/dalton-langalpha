@@ -32,6 +32,8 @@ from market_protocol.symbology import ALWAYS_24_7, FUTURES_MIC, WEEKDAYS_24_5
 from src.utils.market_hours import interval_seconds
 
 from .yahoo import (
+    _daily_rows_from_frame,  # DALTON-HOOK(yfinance-prev-close)
+    validated_previous_close,  # DALTON-HOOK(yfinance-prev-close)
     yahoo_symbol,
     yahoo_ticker,
 )
@@ -302,6 +304,14 @@ def _fetch_single_snapshot(sym: str) -> dict[str, Any] | None:
             if prev is None:
                 ticker.history(period="1d", interval="1d", auto_adjust=False)
                 prev = _finite(ticker.history_metadata.get("chartPreviousClose"))
+            if prev is not None and (
+                prior in by_date or days.empty or session is None or any(d < session for d in by_date)
+            ):
+                prev = validated_previous_close(  # DALTON-HOOK(yfinance-prev-close)
+                    prev,
+                    _daily_rows_from_frame(days),
+                    session.isoformat() if session is not None else None,
+                )
         volume = _finite(bar["Volume"]) if bar is not None and not a_share_index else None
         change, change_pct = change_from(price, prev)
         snap = {

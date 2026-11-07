@@ -199,6 +199,9 @@ def _get_realtime_quote(symbol: str) -> list[dict[str, Any]]:
         "open": snap["open"],
         "dayHigh": snap["high"],
         "dayLow": snap["low"],
+        "yearHigh": info.get("fiftyTwoWeekHigh"),  # DALTON-HOOK(yfinance-prev-close)
+        "yearLow": info.get("fiftyTwoWeekLow"),  # DALTON-HOOK(yfinance-prev-close)
+        "avgVolume": info.get("averageVolume"),  # DALTON-HOOK(yfinance-prev-close)
         "volume": snap["volume"],
         "marketCap": info.get("marketCap"),
         "pe": info.get("trailingPE"),
@@ -455,7 +458,7 @@ def _get_single_sector_perf(sector_name: str, etf_symbol: str) -> dict[str, Any]
     """Fetch daily change for one sector via its representative ETF."""
     try:
         snap = _fetch_single_snapshot(etf_symbol)
-        pct = snap["change_percent"] if snap else None
+        pct = snap["regular_trading_change_percent"] if snap else None  # DALTON-HOOK(extended-hours-quotes)
         if pct is None:
             return None
         sign = "+" if pct >= 0 else ""
