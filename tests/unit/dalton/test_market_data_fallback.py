@@ -460,6 +460,7 @@ async def test_fetch_quote_fx_served_by_yfinance_when_fmp_quota_exhausted(
     expected_yf_symbol: str,
     expected_price: float,
 ):
+    import pandas as pd
     import yfinance as yf_mod
 
     import src.data_client.yfinance.yahoo as yf_yahoo
@@ -475,18 +476,32 @@ async def test_fetch_quote_fx_served_by_yfinance_when_fmp_quota_exhausted(
         seen_yf_symbols.append(sym)
         ticker = create_autospec(real_ticker_cls, instance=True)
         if sym == expected_yf_symbol:
+            prev_close = round(expected_price - 0.01, 4)
+            open_p = round(expected_price - 0.005, 4)
+            high_p = round(expected_price + 0.01, 4)
+            low_p = round(expected_price - 0.02, 4)
             ticker.fast_info = {
                 "lastPrice": expected_price,
-                "regularMarketPreviousClose": round(expected_price - 0.01, 4),
-                "open": round(expected_price - 0.005, 4),
-                "dayHigh": round(expected_price + 0.01, 4),
-                "dayLow": round(expected_price - 0.02, 4),
+                "regularMarketPreviousClose": prev_close,
+                "open": open_p,
+                "dayHigh": high_p,
+                "dayLow": low_p,
                 "lastVolume": 0,
             }
-            ticker.history_metadata = {"regularMarketTime": 1761523200}
+            ticker.history_metadata = {
+                "regularMarketPrice": expected_price,
+                "chartPreviousClose": prev_close,
+                "regularMarketTime": 1761523200,
+                "exchangeTimezoneName": "Europe/London",
+            }
+            ticker.history.return_value = pd.DataFrame(
+                [{"Open": open_p, "High": high_p, "Low": low_p, "Close": expected_price, "Volume": 0}],
+                index=[pd.Timestamp("2025-10-27", tz="UTC")],
+            )
         else:
             ticker.fast_info = {"lastPrice": None}
             ticker.history_metadata = {}
+            ticker.history.return_value = pd.DataFrame()
         return ticker
 
     ticker_factory = create_autospec(real_ticker_cls, side_effect=_build_ticker)

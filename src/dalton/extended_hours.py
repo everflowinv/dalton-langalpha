@@ -20,7 +20,6 @@ from market_protocol import AssetClass, InstrumentRef, MarketPhase, to_canonical
 from market_protocol.calendars import get_calendar
 from market_protocol.symbology import UNKNOWN_MIC
 from src.data_client.instrument_clock import clock_for, clock_for_ref
-from src.data_client.normalize import is_us_class_share
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +75,7 @@ def _us_extended_window(
     ref = to_canonical(sym, asset_class=AssetClass.EQUITY)
     if ref.calendar_id != "XNYS" or ref.asset_class is AssetClass.INDEX:
         return None
-    if ref.mic == UNKNOWN_MIC and not is_us_class_share(ref):
+    if ref.mic == UNKNOWN_MIC:
         return None
     cal = get_calendar("XNYS")
     phase = cal.phase_at(moment)
@@ -134,10 +133,14 @@ def enrich_yfinance_snapshot_extended_hours(
         reg_change = _finite(base_snap.get("regular_trading_change"))
         if reg_change is None:
             reg_change = _finite(base_snap.get("change"))
+        if reg_change is not None:
+            reg_change = round(reg_change, 4)
         reg_change_pct = _finite(base_snap.get("regular_trading_change_percent"))
         if reg_change_pct is None:
             reg_change_pct = _finite(base_snap.get("change_percent"))
-        if reg_change_pct is None:
+        if reg_change_pct is not None:
+            reg_change_pct = round(reg_change_pct, 4)
+        else:
             prev_c = _finite(base_snap.get("previous_close"))
             if reg_change is not None and prev_c is not None and prev_c > 0:
                 reg_change_pct = round((reg_change / prev_c) * 100.0, 4)
@@ -470,6 +473,7 @@ def format_quote_change_parts(
             and status not in ("open", "late_trading", "closed")
         )
     )
+    reg_date = _regular_session_date(snap, ref)
     is_post = (
         us_equity
         and not is_pre
@@ -489,7 +493,16 @@ def format_quote_change_parts(
     basis = _regular_move_basis(
         snap, ref, at, phase, has_ext=has_ext, is_pre=is_pre
     )
-    reg_date = _regular_session_date(snap, ref)
+    if (
+        us_equity
+        and not is_pre
+        and not is_post
+        and phase is None
+        and status != "open"
+        and reg_date is not None
+        and basis == "last close"
+    ):
+        is_post = True
     close_word = "close" if (not is_pre and basis == "today") else "last close"
     close_label = (
         f"{close_word} {reg_date.strftime('%m-%d')}" if reg_date is not None else close_word

@@ -31,7 +31,7 @@ module stays user-agnostic so the agent library can consult defaults.
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Mapping, NamedTuple
+from typing import Literal, Mapping, NamedTuple
 
 from src.config import settings
 from src.config.settings import get_infrastructure_config
@@ -59,6 +59,9 @@ class FeatureSpec:
     gate: FeatureGate = FeatureGate.NONE
     min_tier: int | None = None  # plan gate only
     tradeoffs: str | None = None  # honest cost of opting in, shown in Settings
+    #: Where the user turns it on, when that is somewhere other than
+    #: Experiments: Claude Code's opt-in is made by connecting it under Model access.
+    home: Literal["model_access"] | None = None
 
 
 FEATURES: dict[str, FeatureSpec] = {
@@ -185,6 +188,25 @@ FEATURES: dict[str, FeatureSpec] = {
         ),
         enabled=False,
         gate=FeatureGate.OPT_IN,
+        home="model_access",
+    ),
+    # Off in every deployment until an operator turns it on in config.yaml's
+    # ``features:``; no user toggle, since "Summarize long threads after a
+    # break" (``Tuning.cold_compaction``) already decides it per user. On, a
+    # completed turn arms its thread's summary while the thread is idle on a
+    # warm cache (``services.idle_compaction``), on routes whose cache entries
+    # live an hour only.
+    "idle_compaction": FeatureSpec(
+        key="idle_compaction",
+        label="Idle compaction",
+        description=(
+            "Summarizes a long Claude thread while it sits idle, before its "
+            "hour-long prompt cache expires, so the next message neither waits "
+            "for a summary nor sends the whole conversation again. Applies only "
+            "where the cache lasts an hour, such as a Claude subscription."
+        ),
+        enabled=False,
+        gate=FeatureGate.NONE,
     ),
     "a_share_pack": FeatureSpec(
         key="a_share_pack",

@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import datetime, timedelta, timezone  # DALTON-HOOK(yfinance-prev-close)
+from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -21,14 +21,8 @@ from market_protocol import display_spelling, to_major_units
 
 from src.data_client.normalize import scale_quote_prices
 
-# DALTON-HOOK(yfinance-prev-close)
-from .data_source import _bar_date_str, _print_time_ms, _recent_daily_rows_cached
-from .yahoo import (
-    regular_previous_close,
-    validated_previous_close,
-    yahoo_symbol,
-    yahoo_ticker,
-)
+from .data_source import _fetch_single_snapshot
+from .yahoo import yahoo_ticker
 
 logger = logging.getLogger(__name__)
 
@@ -189,62 +183,34 @@ def _get_profile(symbol: str) -> list[dict[str, Any]]:
     return scale_quote_prices([{k: _clean_value(v) for k, v in profile.items()}], symbol)
 
 
-def _validated_ticker_prev_close(  # DALTON-HOOK(yfinance-prev-close)
-    symbol: str, ticker: Any, fi: Any
-) -> float | None:
-    """Validate *fi*'s previous close against recent daily bars via ``validated_previous_close``."""
-    api_sym = yahoo_symbol(symbol)
-    raw_prev = regular_previous_close(fi)
-    as_of_ms = _print_time_ms(ticker)
-    quote_date = None
-    if as_of_ms is not None:
-        try:
-            from src.data_client.normalize import symbol_timezone
-
-            quote_tz = symbol_timezone(api_sym)
-        except Exception:
-            quote_tz = timezone.utc
-        quote_date = _bar_date_str(
-            datetime.fromtimestamp(as_of_ms / 1000.0).astimezone(quote_tz)
-        )
-    daily_rows = _recent_daily_rows_cached(api_sym, quote_date, ticker)
-    if daily_rows is not None and quote_date is None:
-        quote_date = daily_rows[-1][0]
-    return validated_previous_close(raw_prev, daily_rows, quote_date)
-
-
 def _get_realtime_quote(symbol: str) -> list[dict[str, Any]]:
+    snap = _fetch_single_snapshot(symbol)
+    if snap is None:
+        return []
     ticker = yahoo_ticker(symbol)
-    fi = ticker.fast_info
     info = ticker.info or {}
-    price = float(fi.get("lastPrice", 0) or 0)
-    prev = _validated_ticker_prev_close(symbol, ticker, fi)  # DALTON-HOOK(yfinance-prev-close)
-    change = price - prev if prev is not None else None
-    change_pct = (change / prev * 100) if prev is not None else None
-    # DALTON-HOOK(yfinance-prev-close): the overview's 52-week range and average
-    # volume were read only from FMP's quote keys; Yahoo carries them too.
-    year_high = info.get("fiftyTwoWeekHigh") or fi.get("yearHigh")
-    year_low = info.get("fiftyTwoWeekLow") or fi.get("yearLow")
-    avg_volume = info.get("averageVolume") or fi.get("threeMonthAverageVolume")
     row = {
         "symbol": symbol,
         "name": info.get("longName") or info.get("shortName"),
-        "price": round(price, 4),
-        "change": round(change, 4) if change is not None else None,
-        "changePercentage": round(change_pct, 4) if change_pct is not None else None,
-        "previousClose": round(prev, 4) if prev is not None else None,
-        "open": round(float(fi.get("open", 0) or 0), 4),
-        "dayHigh": round(float(fi.get("dayHigh", 0) or 0), 4),
-        "dayLow": round(float(fi.get("dayLow", 0) or 0), 4),
-        "yearHigh": round(float(year_high), 4) if year_high else None,
-        "yearLow": round(float(year_low), 4) if year_low else None,
-        "avgVolume": int(avg_volume) if avg_volume else None,
-        "volume": int(fi.get("lastVolume", 0) or 0),
-        "marketCap": fi.get("marketCap"),
+        "price": snap["price"],
+        "change": snap["change"],
+        "changePercentage": snap["change_percent"],
+        "previousClose": snap["previous_close"],
+        "open": snap["open"],
+        "dayHigh": snap["high"],
+        "dayLow": snap["low"],
+        "volume": snap["volume"],
+        "marketCap": info.get("marketCap"),
         "pe": info.get("trailingPE"),
         "eps": info.get("trailingEps"),
     }
-    return scale_quote_prices([row], symbol)
+    row = scale_quote_prices([row], symbol)[0]
+    if row["marketCap"] is None:
+        # Yahoo's info omits it for some listings (A-shares); price it here on
+        # the scaled price, since fast_info's own multiplies a pence quote.
+        shares = _clean_value(ticker.fast_info.get("shares"))
+        row["marketCap"] = shares * row["price"] if shares else None
+    return [row]
 
 
 def _get_income_statements(
@@ -488,13 +454,10 @@ def _get_earnings_history(symbol: str, limit: int) -> list[dict[str, Any]]:
 def _get_single_sector_perf(sector_name: str, etf_symbol: str) -> dict[str, Any] | None:
     """Fetch daily change for one sector via its representative ETF."""
     try:
-        ticker = yahoo_ticker(etf_symbol)
-        fi = ticker.fast_info
-        price = float(fi.get("lastPrice", 0) or 0)
-        prev = _validated_ticker_prev_close(etf_symbol, ticker, fi)  # DALTON-HOOK(yfinance-prev-close)
-        if not prev:
+        snap = _fetch_single_snapshot(etf_symbol)
+        pct = snap["change_percent"] if snap else None
+        if pct is None:
             return None
-        pct = (price - prev) / prev * 100
         sign = "+" if pct >= 0 else ""
         return {
             "sector": sector_name,

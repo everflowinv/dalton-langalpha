@@ -994,6 +994,7 @@ class PTCAgent:
                     self.config.compaction.rebuild_floor_tokens,
                     settled_at=turn_context.previous_run_settled_at if turn_context else None,
                     cold_tokens=self.config.compaction.cold_compact_tokens,
+                    idle_tokens=self.config.compaction.idle_tokens,
                     keep_full_context=bool(turn_context and turn_context.keep_full_context),
                     sent_at=turn_context.sent_at if turn_context else None,
                 )
@@ -1103,6 +1104,8 @@ class PTCAgent:
             user_data_counts=user_data_counts,
             role=role,
         )
+        if main_compaction is not None:
+            main_compaction = main_compaction.with_baseline(context.baseline.sent_block)
 
         # Compiled subagent graphs live on this middleware; the RunWorkflow
         # dispatcher below shares the same instances so direct dispatches get

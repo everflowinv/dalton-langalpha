@@ -46,7 +46,7 @@ def _run_config(**overrides: Any) -> dict[str, Any]:
 
 @pytest.fixture(autouse=True)
 def _isolated_prev_close_daily_cache():
-    from src.data_client.yfinance import data_source as _ds
+    from src.data_client.yfinance import yahoo as _ds
 
     _ds._clear_prev_close_daily_cache()
     yield
@@ -77,7 +77,7 @@ def _frame(closes: list[float]) -> pd.DataFrame:
 
 class TestDailyRowsMemo:
     def test_second_snapshot_within_ttl_skips_the_history_request(self) -> None:
-        from src.data_client.yfinance.data_source import _recent_daily_rows_cached
+        from src.data_client.yfinance.yahoo import _recent_daily_rows_cached
 
         frame = _frame([10.0, 10.5, 11.0])
         ticker = _daily_ticker(frame)
@@ -93,7 +93,7 @@ class TestDailyRowsMemo:
         assert ticker.history.call_count == 1
 
     def test_a_new_trading_date_refetches(self) -> None:
-        from src.data_client.yfinance.data_source import _recent_daily_rows_cached
+        from src.data_client.yfinance.yahoo import _recent_daily_rows_cached
 
         ticker = _daily_ticker(_frame([10.0, 10.5]))
         _recent_daily_rows_cached("AAA", "2026-10-21", ticker)
@@ -103,7 +103,7 @@ class TestDailyRowsMemo:
     def test_expired_entry_refetches(self) -> None:
         import time
 
-        from src.data_client.yfinance import data_source as yf_ds
+        from src.data_client.yfinance import yahoo as yf_ds
 
         stale_rows = [("2026-10-20", 10.0, 1_000_000)]
         yf_ds._daily_rows_cache[("AAA", "2026-10-21")] = (
@@ -119,7 +119,7 @@ class TestDailyRowsMemo:
         ]
 
     def test_a_failed_fetch_is_never_memoized(self) -> None:
-        from src.data_client.yfinance.data_source import _recent_daily_rows_cached
+        from src.data_client.yfinance.yahoo import _recent_daily_rows_cached
 
         ticker = _daily_ticker(None)  # unreadable frame — None rows
         assert _recent_daily_rows_cached("AAA", "2026-10-21", ticker) is None
