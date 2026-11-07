@@ -865,6 +865,9 @@ export function useComposerDraft({
       quotes: next.quotes,
       hadAttachments: Boolean(currentPartsRef.current.hadAttachments || sendNotice),
     };
+    // The host's giveBack seats only the words and the files it has, so the
+    // notice owed for files it cannot return is shown here, not only on reload.
+    if (filesHandedBack && priorLostNotice) setRestoredHadAttachmentsState(true);
     return next;
   }, [mergeParts, partsForSave]);
 

@@ -1082,6 +1082,8 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     act(() => {
       ref.current!.giveBack(sent.text, sent.files);
     });
+    // Shown at once on this page, not only after a reload.
+    expect(screen.getByTestId('attachments-lost-notice')).toBeTruthy();
     fireEvent.change(reopened.getTextarea(), { target: { value: 'went with a file, still', selectionStart: 23 } });
     reopened.unmount();
 
@@ -1117,6 +1119,8 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     act(() => {
       ref.current!.giveBack(sent.text, sent.files);
     });
+    // Shown at once on this page, not only after a reload.
+    expect(screen.getByTestId('attachments-lost-notice')).toBeTruthy();
     fireEvent.change(view.getTextarea(), { target: { value: 'sent before the file was read!', selectionStart: 30 } });
     view.unmount();
 
