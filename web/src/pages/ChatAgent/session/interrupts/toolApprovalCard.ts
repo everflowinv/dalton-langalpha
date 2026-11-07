@@ -8,6 +8,31 @@ import type { ToolApprovalState } from '@/types/chat';
 import type { ActionRequest } from '@/types/sse';
 import { isDirectToolName, parseDirectToolName } from '../../utils/directTools';
 
+// DALTON-HOOK(notify-routes): conversational Feishu notify actions reuse the tool approval card.
+export const DALTON_NOTIFY_APPROVAL_TYPES = new Set([
+  'dalton_notify_set_route',
+  'dalton_notify_add_personal_target',
+  'dalton_notify_test',
+]);
+
+const daltonConfirmTokens = new Map<string, string>();
+
+export function isDaltonNotifyApprovalRequest(request: ActionRequest | undefined): boolean {
+  return !!request?.type && DALTON_NOTIFY_APPROVAL_TYPES.has(request.type);
+}
+
+export function getDaltonConfirmToken(
+  approvalId: string,
+  interruptId: string,
+  index: number,
+): string | undefined {
+  return (
+    daltonConfirmTokens.get(approvalId)
+    ?? daltonConfirmTokens.get(`${interruptId}#${index}`)
+    ?? (index === 0 ? daltonConfirmTokens.get(interruptId) : undefined)
+  );
+}
+
 /**
  * Whether an interrupt's first action request is a stopped tool call.
  *
@@ -18,7 +43,12 @@ import { isDirectToolName, parseDirectToolName } from '../../utils/directTools';
  */
 export function isToolApprovalRequest(request: ActionRequest | undefined): boolean {
   if (!request) return false;
-  return isDirectToolName(request.name) || !!request.attempt_id || !!request.order;
+  return (
+    isDirectToolName(request.name)
+    || isDaltonNotifyApprovalRequest(request)
+    || !!request.attempt_id
+    || !!request.order
+  );
 }
 
 /** The same question asked of a whole interrupt. The gate says what it raised,
@@ -37,8 +67,27 @@ export function buildToolApprovalState(
   actionIndex: number,
   actionCount: number,
 ): ToolApprovalState {
-  const name = request.name || '';
+  // DALTON-HOOK(notify-routes): use request.name for title, fallback to request.type, and keep confirm_token for Dalton notify cards.
+  const name = request.name || request.type || '';
   const parsed = parseDirectToolName(name) || { server: '', tool: name };
+  const confirmToken =
+    isDaltonNotifyApprovalRequest(request) && typeof request.confirm_token === 'string' && request.confirm_token
+      ? request.confirm_token
+      : undefined;
+  if (interruptId) {
+    const slotKey = `${interruptId}#${actionIndex}`;
+    if (confirmToken) {
+      daltonConfirmTokens.set(slotKey, confirmToken);
+      if (actionCount <= 1 && actionIndex === 0) {
+        daltonConfirmTokens.set(interruptId, confirmToken);
+      }
+    } else {
+      daltonConfirmTokens.delete(slotKey);
+      if (actionCount <= 1 && actionIndex === 0) {
+        daltonConfirmTokens.delete(interruptId);
+      }
+    }
+  }
   return {
     toolName: name,
     server: parsed.server,
@@ -52,6 +101,7 @@ export function buildToolApprovalState(
     order: request.order ?? null,
     status: 'pending',
     reason: null,
+    ...(confirmToken ? { confirmToken } : {}), // DALTON-HOOK(notify-routes)
   };
 }
 
@@ -64,9 +114,10 @@ export function buildToolApprovalState(
  * request that carried no attempt, and for a keyed one whose resume predates
  * the map.
  */
+// DALTON-HOOK(notify-routes): carry confirmToken on DecisionTarget for Dalton notify cards.
 export type DecisionTarget =
-  | { kind: 'attempt'; attemptId: string; index: number }
-  | { kind: 'position'; index: number };
+  | { kind: 'attempt'; attemptId: string; index: number; confirmToken?: string }
+  | { kind: 'position'; index: number; confirmToken?: string };
 
 /**
  * One card per stopped call, keyed so the two projections agree.
@@ -82,13 +133,35 @@ export function toolApprovalCards(
   fallbackId: string,
 ): Array<{ proposalId: string; target: DecisionTarget; state: ToolApprovalState }> {
   const base = interruptId || fallbackId;
-  return actionRequests.map((request, index) => ({
-    proposalId: actionRequests.length > 1 ? `${base}#${index}` : base,
-    target: request.attempt_id
-      ? { kind: 'attempt', attemptId: request.attempt_id, index }
-      : { kind: 'position', index },
-    state: buildToolApprovalState(request, interruptId, index, actionRequests.length),
-  }));
+  // DALTON-HOOK(notify-routes): key Dalton notify requests so paused history replay arms the answer board.
+  return actionRequests.map((request, index) => {
+    const attemptId = request.attempt_id || (isDaltonNotifyApprovalRequest(request) ? request.type : undefined);
+    const proposalId = actionRequests.length > 1 ? `${base}#${index}` : base;
+    const state = buildToolApprovalState(request, interruptId, index, actionRequests.length);
+    if (state.confirmToken) {
+      daltonConfirmTokens.set(proposalId, state.confirmToken);
+      daltonConfirmTokens.set(`${base}#${index}`, state.confirmToken);
+    } else {
+      daltonConfirmTokens.delete(proposalId);
+      daltonConfirmTokens.delete(`${base}#${index}`);
+    }
+    return {
+      proposalId,
+      target: attemptId
+        ? {
+            kind: 'attempt',
+            attemptId,
+            index,
+            ...(state.confirmToken ? { confirmToken: state.confirmToken } : {}),
+          }
+        : {
+            kind: 'position',
+            index,
+            ...(state.confirmToken ? { confirmToken: state.confirmToken } : {}),
+          },
+      state,
+    };
+  });
 }
 
 /**

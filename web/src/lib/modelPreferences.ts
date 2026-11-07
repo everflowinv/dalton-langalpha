@@ -398,6 +398,7 @@ export function readDefaultModelScope(prefs: unknown): DefaultModelScope {
 // DALTON-HOOK(settings-section): resolve per-task notify state from backend effective value or unified override precedence
 export function resolveDaltonAutomationNotifyState(
   automation: {
+    automation_id?: string | null;
     name: string;
     dalton_notify_category?: string | null;
     dalton_notify_effective?: boolean | null;
@@ -408,16 +409,24 @@ export function resolveDaltonAutomationNotifyState(
   const category = automation.dalton_notify_category;
   if (!category) return { enabled: false, source: null };
   if (overrides) {
-    const trimmedName = automation.name.trim();
-    const candidates: Array<[string, string]> = [
-      [trimmedName, 'task'],
-      [trimmedName.toLowerCase(), 'task'],
-      [`category:${category}`, 'category'],
-      [category, 'category'],
-    ];
-    for (const [key, src] of candidates) {
-      if (key && typeof overrides[key] === 'boolean') {
-        return { enabled: overrides[key], source: src };
+    if (category === 'custom') {
+      const autoId = automation.automation_id?.trim();
+      const customKey = autoId ? `automation:${autoId}` : '';
+      if (customKey && typeof overrides[customKey] === 'boolean') {
+        return { enabled: overrides[customKey], source: 'task' };
+      }
+    } else {
+      const trimmedName = automation.name.trim();
+      const candidates: Array<[string, string]> = [
+        [trimmedName, 'task'],
+        [trimmedName.toLowerCase(), 'task'],
+        [`category:${category}`, 'category'],
+        [category, 'category'],
+      ];
+      for (const [key, src] of candidates) {
+        if (key && typeof overrides[key] === 'boolean') {
+          return { enabled: overrides[key], source: src };
+        }
       }
     }
   }
@@ -432,6 +441,7 @@ export function resolveDaltonAutomationNotifyState(
 
 export function isDaltonAutomationNotifyEnabled(
   automation: {
+    automation_id?: string | null;
     name: string;
     dalton_notify_category?: string | null;
     dalton_notify_effective?: boolean | null;

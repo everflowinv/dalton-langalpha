@@ -4,6 +4,7 @@ import { act, fireEvent, screen, waitFor } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { renderWithProviders } from '@/test/utils';
 import { ApiError } from '@/api/client';
+import { AutomationNotifyToggle } from '../AutomationNotifyToggle';
 import { AutomationNotifyTargets, resolveNotifyRouteEntry } from '../AutomationNotifyTargets';
 import type { DaltonFeishuGroupsResponse } from '@/pages/Settings/utils/daltonApi';
 
@@ -477,5 +478,313 @@ describe('AutomationNotifyTargets', () => {
     await act(async () => {});
     expect(container).toBeEmptyDOMElement();
     expect(h.fetchCount).toBe(0);
+  });
+
+  it('renders toggle and selector for custom category and writes automation:<id> keys on toggle off and target edit', async () => {
+    const customAutomation = {
+      automation_id: 'auto-custom-1',
+      name: 'Morning Macro Digest',
+      dalton_notify_category: 'custom',
+      dalton_notify_effective: true,
+      dalton_notify_source: 'default',
+      dalton_notify_route_targets: ['feishu:chat:oc_research_group'],
+    };
+    h.groups = GROUPS;
+    h.preferences = prefsWith({
+      dalton_notify_routes: {
+        'automation:auto-custom-1': ['feishu:chat:oc_research_group'],
+        'Morning Macro Digest': ['feishu:user:ou_backup_2'],
+      },
+      dalton_notify_overrides: {
+        'Morning Macro Digest': false,
+      },
+    });
+
+    renderWithProviders(
+      <div>
+        <AutomationNotifyToggle automation={customAutomation} />
+        <AutomationNotifyTargets automation={customAutomation} />
+      </div>,
+    );
+
+    const toggleSwitch = screen.getByRole('switch', { name: '推送 Morning Macro Digest' });
+    expect(toggleSwitch).toHaveAttribute('aria-checked', 'true');
+
+    await act(async () => {
+      fireEvent.click(toggleSwitch);
+    });
+    await waitFor(() => {
+      expect(h.mutateAsync).toHaveBeenCalledWith({
+        model_preference: {
+          dalton_notify_overrides: {
+            'automation:auto-custom-1': false,
+          },
+        },
+      });
+    });
+    expect(toggleSwitch).toHaveAttribute('aria-checked', 'false');
+
+    const targetButton = screen.getByRole('button', { name: '推送目标 Morning Macro Digest' });
+    await waitFor(() => {
+      expect(targetButton).toHaveTextContent('核心投研群');
+    });
+
+    await act(async () => {
+      fireEvent.click(targetButton);
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole('checkbox', { name: '个人目标 feishu:user:ou_me_1' }));
+    });
+    await waitFor(() => {
+      expect(h.mutateAsync).toHaveBeenCalledWith({
+        model_preference: {
+          dalton_notify_routes: {
+            'automation:auto-custom-1': ['feishu:user:ou_me_1', 'feishu:chat:oc_research_group'],
+          },
+        },
+      });
+    });
+  });
+
+  it('uses API-returned dalton_notify_route_targets as baseline for custom tasks when preference cache lacks the key and invalidates both queries on save', async () => {
+    const customAutomation = {
+      automation_id: 'auto-custom-stale-1',
+      name: 'Morning Macro Digest',
+      dalton_notify_category: 'custom',
+      dalton_notify_effective: true,
+      dalton_notify_source: 'default',
+      dalton_notify_route_targets: ['feishu:chat:oc_research_group'],
+    };
+    h.groups = GROUPS;
+    // Preference cache is stale and does NOT contain 'automation:auto-custom-stale-1'
+    h.preferences = prefsWith({
+      dalton_notify_routes: {},
+    });
+
+    const { queryClient } = renderWithProviders(
+      <AutomationNotifyTargets automation={customAutomation} />,
+    );
+    const invalidateSpy = vi.spyOn(queryClient, 'invalidateQueries');
+
+    const targetButton = screen.getByRole('button', { name: '推送目标 Morning Macro Digest' });
+    await waitFor(() => {
+      expect(targetButton).toHaveTextContent('核心投研群');
+    });
+
+    await act(async () => {
+      fireEvent.click(targetButton);
+    });
+    const groupCheckbox = screen.getByRole('checkbox', { name: '飞书群 核心投研群' });
+    const personalCheckbox = screen.getByRole('checkbox', { name: '个人目标 feishu:user:ou_me_1' });
+    expect(groupCheckbox).toHaveAttribute('aria-checked', 'true');
+    expect(personalCheckbox).toHaveAttribute('aria-checked', 'false');
+
+    await act(async () => {
+      fireEvent.click(personalCheckbox);
+    });
+    await waitFor(() => {
+      expect(h.mutateAsync).toHaveBeenCalledWith({
+        model_preference: {
+          dalton_notify_routes: {
+            'automation:auto-custom-stale-1': [
+              'feishu:user:ou_me_1',
+              'feishu:chat:oc_research_group',
+            ],
+          },
+        },
+      });
+    });
+    await waitFor(() => {
+      expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['user', 'preferences'] });
+      expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ['automations'] });
+    });
+  });
+
+  it('preserves server route personal target missing from preference cache when checking a new group', async () => {
+    const newPersonalTarget = 'feishu:user:ou_chat_added';
+    const customAutomation = {
+      automation_id: 'auto-custom-p-1',
+      name: 'Morning Macro Digest',
+      dalton_notify_category: 'custom',
+      dalton_notify_effective: true,
+      dalton_notify_source: 'default',
+      dalton_notify_route_targets: [newPersonalTarget, 'feishu:chat:oc_research_group'],
+    };
+    h.groups = GROUPS;
+    // Preference cache does not contain newPersonalTarget (P) or its label
+    h.preferences = prefsWith({
+      dalton_notify_targets: ['feishu:user:ou_me_1'],
+      dalton_notify_target_labels: { 'feishu:user:ou_me_1': '我本人' },
+      dalton_notify_routes: {},
+    });
+
+    renderWithProviders(<AutomationNotifyTargets automation={customAutomation} />);
+
+    const targetButton = screen.getByRole('button', { name: '推送目标 Morning Macro Digest' });
+    await waitFor(() => {
+      expect(targetButton).toHaveTextContent(`${newPersonalTarget}、核心投研群`);
+    });
+
+    await act(async () => {
+      fireEvent.click(targetButton);
+    });
+
+    // P is present in the selectable personal list, shows canonical target when missing label, and is checked
+    const newPersonalCheckbox = screen.getByRole('checkbox', {
+      name: `个人目标 ${newPersonalTarget}`,
+    });
+    const cachedPersonalCheckbox = screen.getByRole('checkbox', {
+      name: '个人目标 feishu:user:ou_me_1',
+    });
+    const groupACheckbox = screen.getByRole('checkbox', { name: '飞书群 核心投研群' });
+    const groupBCheckbox = screen.getByRole('checkbox', { name: '飞书群 运营群' });
+
+    expect(newPersonalCheckbox).toHaveAttribute('aria-checked', 'true');
+    expect(cachedPersonalCheckbox).toHaveAttribute('aria-checked', 'false');
+    expect(groupACheckbox).toHaveAttribute('aria-checked', 'true');
+    expect(groupBCheckbox).toHaveAttribute('aria-checked', 'false');
+
+    // Check group B -> submits [P, group A, group B] without dropping P
+    await act(async () => {
+      fireEvent.click(groupBCheckbox);
+    });
+    await waitFor(() => {
+      expect(h.mutateAsync).toHaveBeenCalledWith({
+        model_preference: {
+          dalton_notify_routes: {
+            'automation:auto-custom-p-1': [
+              newPersonalTarget,
+              'feishu:chat:oc_research_group',
+              'feishu:chat:oc_ops_group',
+            ],
+          },
+        },
+      });
+    });
+  });
+
+  it('rolls back checked state and shows error alert when saving custom task targets fails', async () => {
+    const customAutomation = {
+      automation_id: 'auto-custom-fail-1',
+      name: 'Morning Macro Digest',
+      dalton_notify_category: 'custom',
+      dalton_notify_effective: true,
+      dalton_notify_source: 'default',
+      dalton_notify_route_targets: ['feishu:chat:oc_research_group'],
+    };
+    h.groups = GROUPS;
+    h.preferences = prefsWith({
+      dalton_notify_routes: {},
+    });
+    h.mutateAsync.mockRejectedValueOnce(new Error('Network Error'));
+
+    renderWithProviders(<AutomationNotifyTargets automation={customAutomation} />);
+
+    const targetButton = screen.getByRole('button', { name: '推送目标 Morning Macro Digest' });
+    await waitFor(() => {
+      expect(targetButton).toHaveTextContent('核心投研群');
+    });
+
+    await act(async () => {
+      fireEvent.click(targetButton);
+    });
+
+    const groupACheckbox = screen.getByRole('checkbox', { name: '飞书群 核心投研群' });
+    const groupBCheckbox = screen.getByRole('checkbox', { name: '飞书群 运营群' });
+    expect(groupACheckbox).toHaveAttribute('aria-checked', 'true');
+    expect(groupBCheckbox).toHaveAttribute('aria-checked', 'false');
+
+    await act(async () => {
+      fireEvent.click(groupBCheckbox);
+    });
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent('保存推送目标失败');
+    });
+    expect(groupACheckbox).toHaveAttribute('aria-checked', 'true');
+    expect(groupBCheckbox).toHaveAttribute('aria-checked', 'false');
+    expect(targetButton).toHaveTextContent('核心投研群');
+  });
+
+  it('takes no second tick while a save is out, and a failed save goes back to the server route', async () => {
+    const customAutomation = {
+      automation_id: 'auto-custom-serial-1',
+      name: 'Morning Macro Digest',
+      dalton_notify_category: 'custom',
+      dalton_notify_effective: true,
+      dalton_notify_source: 'default',
+      dalton_notify_route_targets: ['feishu:chat:oc_research_group'],
+    };
+    h.groups = GROUPS;
+    h.preferences = prefsWith({ dalton_notify_routes: {} });
+    let rejectFirst!: (err: Error) => void;
+    h.mutateAsync.mockImplementationOnce(
+      () => new Promise((_resolve, reject) => { rejectFirst = reject; }),
+    );
+
+    renderWithProviders(<AutomationNotifyTargets automation={customAutomation} />);
+    const targetButton = screen.getByRole('button', { name: '推送目标 Morning Macro Digest' });
+    await waitFor(() => expect(targetButton).toHaveTextContent('核心投研群'));
+    await act(async () => {
+      fireEvent.click(targetButton);
+    });
+
+    const groupB = screen.getByRole('checkbox', { name: '飞书群 运营群' });
+    await act(async () => {
+      fireEvent.click(groupB);
+    });
+    expect(h.mutateAsync).toHaveBeenCalledTimes(1);
+    // While the first save is out, the rows take no tick.
+    expect(groupB).toBeDisabled();
+    await act(async () => {
+      fireEvent.click(screen.getByRole('checkbox', { name: '飞书群 核心投研群' }));
+    });
+    expect(h.mutateAsync).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      rejectFirst(new Error('Network Error'));
+    });
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('保存推送目标失败'));
+    // Back to what the server confirmed, and the rows take ticks again.
+    expect(screen.getByRole('checkbox', { name: '飞书群 核心投研群' })).toHaveAttribute('aria-checked', 'true');
+    expect(groupB).toHaveAttribute('aria-checked', 'false');
+    expect(groupB).not.toBeDisabled();
+  });
+
+  it('a failed save after a successful one goes back to the successful one, not to the stale list', async () => {
+    const customAutomation = {
+      automation_id: 'auto-custom-serial-2',
+      name: 'Morning Macro Digest',
+      dalton_notify_category: 'custom',
+      dalton_notify_effective: true,
+      dalton_notify_source: 'default',
+      dalton_notify_route_targets: ['feishu:chat:oc_research_group'],
+    };
+    h.groups = GROUPS;
+    h.preferences = prefsWith({ dalton_notify_routes: {} });
+    h.mutateAsync.mockResolvedValueOnce({ model_preference: {}, other_preference: {} }).mockRejectedValueOnce(new Error('Network Error'));
+
+    // The task list response never catches up in this test: the prop stays [A].
+    renderWithProviders(<AutomationNotifyTargets automation={customAutomation} />);
+    const targetButton = screen.getByRole('button', { name: '推送目标 Morning Macro Digest' });
+    await waitFor(() => expect(targetButton).toHaveTextContent('核心投研群'));
+    await act(async () => {
+      fireEvent.click(targetButton);
+    });
+
+    const groupB = screen.getByRole('checkbox', { name: '飞书群 运营群' });
+    await act(async () => {
+      fireEvent.click(groupB);
+    });
+    await waitFor(() => expect(groupB).not.toBeDisabled());
+    expect(groupB).toHaveAttribute('aria-checked', 'true');
+
+    // The second save fails: B, saved a moment ago, stays.
+    await act(async () => {
+      fireEvent.click(screen.getByRole('checkbox', { name: '飞书群 核心投研群' }));
+    });
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('保存推送目标失败'));
+    expect(groupB).toHaveAttribute('aria-checked', 'true');
+    expect(screen.getByRole('checkbox', { name: '飞书群 核心投研群' })).toHaveAttribute('aria-checked', 'true');
   });
 });

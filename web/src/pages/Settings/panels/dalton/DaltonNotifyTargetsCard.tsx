@@ -95,7 +95,7 @@ export function DaltonNotifyTargetsCard(): React.ReactElement {
       return;
     }
     if (!isValidDaltonNotifyTarget(cleaned)) {
-      setError('格式无效，请使用 feishu:user:<open_id> 或 discord:user:<数字id>（飞书群推送由管理员在任务里设置）');
+      setError('格式无效，请使用 feishu:user:<open_id> 或 discord:user:<数字id>（飞书群推送可在任务路由或对话里设置，内部成员可用）');
       return;
     }
     if (targets.includes(cleaned)) {
@@ -201,7 +201,7 @@ export function DaltonNotifyTargetsCard(): React.ReactElement {
           推送到
         </label>
         <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-          自动任务完成后推送到您本人的飞书或 Discord 私信（格式：feishu:user:ou_xxx 或 discord:user:123）；群推送由管理员在自动化列表里为任务设置
+          自动任务完成后推送到您本人的飞书或 Discord 私信（格式：feishu:user:ou_xxx 或 discord:user:123）；群推送可在下方「飞书群推送」、自动化列表或对话里按任务设置（内部成员可用）
         </p>
       </div>
 

@@ -672,7 +672,7 @@ def validate_dalton_model_preferences(
                 if not isinstance(item, str) or not is_valid_dalton_personal_target(item):
                     raise TuningError(
                         DALTON_NOTIFY_TARGETS_KEY,
-                        f"{DALTON_NOTIFY_TARGETS_KEY}: 个人目标格式无效 {item!r}，仅支持 feishu:user:<open_id> 或 discord:user:<数字id>（飞书群由管理员在任务路由中选择）",
+                        f"{DALTON_NOTIFY_TARGETS_KEY}: 个人目标格式无效 {item!r}，仅支持 feishu:user:<open_id> 或 discord:user:<数字id>（飞书群由内部成员在任务路由中选择）",
                     )
                 cleaned_target = item.strip()
                 if cleaned_target not in seen_targets:
@@ -933,12 +933,13 @@ async def validate_dalton_notify_routes_for_user(
     produces: entries the server-side cleanup keeps (a group left behind when
     its task's personal target was deleted) are pass-through, not a new
     submission, so a user must stay able to delete their own personal targets
-    while discovery is down, the bot left the group, or they lost admin.
-    Group targets are admin-only and must be in the bot's discovered chat list
-    at write time. Raises ``HTTPException``: 403 for a non-admin writing a
-    group target, 503 when the discovery list is unavailable (the write should
-    retry later), 400 for a group the bot is not in. A submission that names
-    no group target passes without any discovery call.
+    while discovery is down, the bot left the group, or they lost internal/admin
+    tier. Group targets are restricted to internal/admin members and must be in
+    the bot's discovered chat list at write time. Raises ``HTTPException``: 403
+    for an external member writing a group target, 503 when the discovery list is
+    unavailable (the write should retry later), 400 for a group the bot is not
+    in. A submission that names no group target passes without any discovery
+    call.
 
     Only groups *added* to a route are gated: one already in ``stored_routes``
     under the same key stays as it was, so a route still holding groups the bot
@@ -968,12 +969,12 @@ async def validate_dalton_notify_routes_for_user(
     if not chat_targets:
         return
 
-    from src.dalton.invites import is_invite_pm
+    from src.dalton.access_tiers import is_internal_or_admin
 
-    if not is_invite_pm(user_id):
+    if not await is_internal_or_admin(user_id):
         raise HTTPException(
             status_code=403,
-            detail="仅管理员可在推送路由中使用飞书群目标",
+            detail="外部成员不能使用飞书群推送",
         )
 
     from src.dalton.notify.groups import FeishuGroupsUnavailable, discover_feishu_notify_groups
@@ -992,4 +993,123 @@ async def validate_dalton_notify_routes_for_user(
             status_code=400,
             detail=f"群 {unknown[0]} 不在机器人已加入的群列表中（请先把机器人拉进群，再刷新群列表）",
         )
+
+
+async def apply_dalton_notify_preference_patch(
+    user_id: str,
+    model_pref_patch: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate and persist a ``model_preference`` patch using the exact same
+    validation pipeline as ``PUT /api/v1/users/me/preferences``."""
+    from src.server.database.user import (
+        get_user_preferences as db_get_user_preferences,
+        invalidate_user_prefs_cache,
+        invalidate_user_profile_cache,
+        upsert_user_preferences,
+    )
+
+    stored = await db_get_user_preferences(user_id)
+    stored_model_pref = dict((stored or {}).get("model_preference") or {})
+    model_pref = dict(model_pref_patch)
+    effective = {
+        **stored_model_pref,
+        **{k: v for k, v in model_pref.items() if v is not None},
+    }
+    submitted_routes = model_pref.get(DALTON_NOTIFY_ROUTES_KEY)
+
+    validate_dalton_model_preferences(
+        model_pref,
+        effective_model_preference=effective,
+        stored_model_preference=stored_model_pref,
+    )
+    await validate_dalton_notify_routes_for_user(
+        user_id,
+        submitted_routes,
+        stored_model_pref.get(DALTON_NOTIFY_ROUTES_KEY),
+    )
+
+    updated = await upsert_user_preferences(
+        user_id=user_id,
+        model_preference=model_pref,
+    )
+    await invalidate_user_prefs_cache(user_id)
+    await invalidate_user_profile_cache(user_id)
+    return updated
+
+
+async def add_dalton_personal_notify_target(
+    user_id: str,
+    target: str,
+    label: str | None = None,
+) -> dict[str, Any]:
+    """Re-read, append-dedup, validate, and write a personal notify target under
+    ``lock_user_preferences`` in a single transaction."""
+    from src.server.database.pool import get_db_connection
+    from src.server.database.user import (
+        invalidate_user_prefs_cache,
+        invalidate_user_profile_cache,
+        lock_user_preferences,
+        upsert_user_preferences,
+    )
+
+    cleaned_target = str(target or "").strip()
+    cleaned_label = (
+        normalize_dalton_notify_label(label)
+        if isinstance(label, str) and label.strip()
+        else ""
+    )
+
+    async with get_db_connection() as conn, conn.transaction():
+        locked = await lock_user_preferences(user_id, conn=conn)
+        stored_model_pref = dict((locked or {}).get("model_preference") or {})
+        stored_other_pref = dict((locked or {}).get("other_preference") or {})
+
+        raw_existing = (
+            stored_model_pref.get(DALTON_NOTIFY_TARGETS_KEY)
+            if DALTON_NOTIFY_TARGETS_KEY in stored_model_pref
+            else stored_other_pref.get(DALTON_NOTIFY_TARGETS_KEY)
+        )
+        existing_targets = _normalize_stored_value(
+            DALTON_NOTIFY_TARGETS_KEY, raw_existing
+        )
+        next_targets = (
+            list(existing_targets) if isinstance(existing_targets, list) else []
+        )
+        if cleaned_target not in next_targets:
+            next_targets.append(cleaned_target)
+
+        model_pref: dict[str, Any] = {
+            DALTON_NOTIFY_TARGETS_KEY: next_targets,
+        }
+        if cleaned_label:
+            model_pref[DALTON_NOTIFY_TARGET_LABELS_KEY] = {
+                cleaned_target: cleaned_label,
+            }
+
+        effective = {
+            **stored_model_pref,
+            **{k: v for k, v in model_pref.items() if v is not None},
+        }
+        submitted_routes = model_pref.get(DALTON_NOTIFY_ROUTES_KEY)
+
+        validate_dalton_model_preferences(
+            model_pref,
+            effective_model_preference=effective,
+            stored_model_preference=stored_model_pref,
+        )
+        await validate_dalton_notify_routes_for_user(
+            user_id,
+            submitted_routes,
+            stored_model_pref.get(DALTON_NOTIFY_ROUTES_KEY),
+        )
+
+        updated = await upsert_user_preferences(
+            user_id=user_id,
+            model_preference=model_pref,
+            conn=conn,
+        )
+
+    await invalidate_user_prefs_cache(user_id)
+    await invalidate_user_profile_cache(user_id)
+    return updated
 

@@ -82,6 +82,7 @@ CATEGORY_BUSINESS_TAG_MAP: dict[str, tuple[str, str]] = {
     "earnings_tm3": ("前瞻", "purple"),
     "director_weekly": ("周报", "indigo"),
     "earnings_calendar": ("周报", "indigo"),
+    "custom": ("定时任务", "indigo"),
 }
 
 
@@ -104,6 +105,19 @@ def _resolve_ticker_label(automation: Mapping[str, Any], fallback_slug: str) -> 
     return fallback_slug.strip().upper()
 
 
+def is_excluded_automation_for_notify(
+    automation: Mapping[str, Any] | str | None,
+) -> bool:
+    """Return True if ``automation`` matches the internal excluded automation pattern."""
+    if isinstance(automation, str):
+        name = automation.strip()
+    elif isinstance(automation, Mapping):
+        name = str(automation.get("name") or "").strip()
+    else:
+        return False
+    return bool(name and _EXCLUDED_AUTO_RE.match(name.lower()))
+
+
 def classify_automation_for_notify(
     automation: Mapping[str, Any] | None,
 ) -> NotifyClassification | None:
@@ -114,7 +128,7 @@ def classify_automation_for_notify(
     name = str(automation.get("name") or "").strip()
     lowered_name = name.lower()
 
-    if lowered_name and _EXCLUDED_AUTO_RE.match(lowered_name):
+    if is_excluded_automation_for_notify(lowered_name):
         return None
 
     m_earn = _EARN_AUTO_RE.match(lowered_name)
@@ -189,23 +203,55 @@ def classify_automation_for_notify(
     return None
 
 
+def _custom_automation_key(automation: Mapping[str, Any] | None) -> str | None:
+    """Return ``f"automation:{automation_id}"`` when ``automation`` carries a non-empty ID."""
+    if not isinstance(automation, Mapping):
+        return None
+    auto_id = str(automation.get("automation_id") or "").strip()
+    return f"automation:{auto_id}" if auto_id else None
+
+
 def resolve_automation_notify_state(
     automation: Mapping[str, Any] | None,
     overrides: Mapping[str, bool] | None = None,
+    routes: Mapping[str, Sequence[str]] | None = None,
 ) -> tuple[str | None, bool, str | None]:
     """Return ``(category, effective_enabled, source)`` using unified key precedence.
 
-    Precedence:
+    Inherent categories resolve via:
     1. Exact task name ``name`` -> ``source="task"``
     2. Lowercase task name ``name.lower()`` -> ``source="task"``
     3. Category key ``f"category:{category}"`` -> ``source="category"``
     4. Bare category key ``category`` -> ``source="category"``
-    5. Default ``True`` for the 4 pushable categories -> ``source="default"``
+    5. Default ``True`` -> ``source="default"``
+
+    Custom automations (no inherent category, not excluded) return ``category="custom"``
+    whenever ``routes`` has an explicit list entry (including ``[]``) under
+    ``automation:<automation_id>``, with switch state governed by
+    ``overrides["automation:<automation_id>"]``.
     """
+    if not isinstance(automation, Mapping) or is_excluded_automation_for_notify(
+        automation
+    ):
+        return (None, False, None)
     classification = classify_automation_for_notify(automation)
     if classification is None:
-        return (None, False, None)
-    if isinstance(overrides, Mapping) and isinstance(automation, Mapping):
+        custom_key = _custom_automation_key(automation)
+        if (
+            not custom_key
+            or not isinstance(routes, Mapping)
+            or custom_key not in routes
+        ):
+            return (None, False, None)
+        routed = routes.get(custom_key)
+        if not isinstance(routed, Sequence) or isinstance(routed, (str, bytes)):
+            return (None, False, None)
+        if isinstance(overrides, Mapping) and custom_key in overrides:
+            val = overrides[custom_key]
+            if isinstance(val, bool):
+                return ("custom", val, "task")
+        return ("custom", True, "default")
+    if isinstance(overrides, Mapping):
         name = str(automation.get("name") or "").strip()
         for candidate_key, source in (
             (name, "task"),
@@ -223,9 +269,10 @@ def resolve_automation_notify_state(
 def is_automation_notify_enabled(
     automation: Mapping[str, Any] | None,
     overrides: Mapping[str, bool] | None = None,
+    routes: Mapping[str, Sequence[str]] | None = None,
 ) -> bool:
     """Resolve whether per-automation notification is enabled."""
-    return resolve_automation_notify_state(automation, overrides)[1]
+    return resolve_automation_notify_state(automation, overrides, routes)[1]
 
 
 async def populate_automation_notify_state(
@@ -233,6 +280,7 @@ async def populate_automation_notify_state(
     responses: Sequence[Any],
     *,
     resolve_overrides_fn: Callable[[str | None], Awaitable[dict[str, bool]]] = resolve_dalton_notify_overrides,
+    resolve_routes_fn: Callable[[str | None], Awaitable[dict[str, list[str]]]] = resolve_dalton_notify_routes,
 ) -> None:
     """Populate ``dalton_notify_category``, ``dalton_notify_effective``, and ``dalton_notify_source`` on response models."""
     if not responses:
@@ -241,16 +289,66 @@ async def populate_automation_notify_state(
         overrides = await resolve_overrides_fn(user_id) if user_id else {}
     except Exception:
         overrides = {}
+    needs_routes = resolve_routes_fn is not resolve_dalton_notify_routes or any(
+        classify_automation_for_notify(
+            {
+                "name": getattr(r, "name", None),
+                "metadata": getattr(r, "metadata", None),
+            }
+        )
+        is None
+        and not is_excluded_automation_for_notify(
+            {
+                "name": getattr(r, "name", None),
+                "metadata": getattr(r, "metadata", None),
+            }
+        )
+        for r in responses
+    )
+    if needs_routes and user_id:
+        try:
+            routes = await resolve_routes_fn(user_id)
+        except Exception:
+            routes = {}
+    else:
+        routes = {}
     for resp in responses:
         name = getattr(resp, "name", None)
         metadata = getattr(resp, "metadata", None)
+        automation_id = getattr(resp, "automation_id", None)
+        auto_dict = {
+            "name": name,
+            "metadata": metadata,
+            "automation_id": automation_id,
+        }
         cat, eff, src = resolve_automation_notify_state(
-            {"name": name, "metadata": metadata},
+            auto_dict,
             overrides,
+            routes,
         )
         setattr(resp, "dalton_notify_category", cat)
         setattr(resp, "dalton_notify_effective", eff if cat is not None else None)
         setattr(resp, "dalton_notify_source", src)
+        if cat == "custom":
+            custom_key = _custom_automation_key(auto_dict)
+            raw_routed = (
+                routes.get(custom_key)
+                if custom_key and isinstance(routes, Mapping)
+                else None
+            )
+            if isinstance(raw_routed, Sequence) and not isinstance(
+                raw_routed, (str, bytes)
+            ):
+                route_targets = [
+                    str(t).strip()
+                    for t in raw_routed
+                    if isinstance(t, str) and str(t).strip()
+                ]
+            else:
+                route_targets = []
+            setattr(resp, "dalton_notify_route_targets", route_targets)
+        else:
+            setattr(resp, "dalton_notify_route_targets", None)
 
 
 def _strip_non_http_markdown_links(text: str) -> str:
@@ -818,9 +916,14 @@ def _payoff_change_title(payoff: Mapping[str, Any] | None) -> str:
 
 def _notify_route_keys(automation: Mapping[str, Any] | None) -> list[str]:
     """Route lookup keys for ``automation``, same precedence as the override keys."""
-    classification = classify_automation_for_notify(automation)
-    if classification is None or not isinstance(automation, Mapping):
+    if not isinstance(automation, Mapping) or is_excluded_automation_for_notify(
+        automation
+    ):
         return []
+    classification = classify_automation_for_notify(automation)
+    if classification is None:
+        custom_key = _custom_automation_key(automation)
+        return [custom_key] if custom_key else []
     name = str(automation.get("name") or "").strip()
     return [
         key
@@ -847,7 +950,7 @@ def resolve_notify_route_targets(
     ``include_chat_targets`` false) a group is never delivered. A route's
     personal side is its intersection with the configured list (a deleted
     personal target drops out on its own, order preserved); its group entries
-    ride along only when the task's owner is an admin.
+    ride along only when the task's owner is an internal/admin member.
     """
     if not isinstance(routes, Mapping):
         return None
@@ -877,9 +980,9 @@ def _is_chat_target(target: str) -> bool:
 
 
 async def _default_notify_admin(user_id: str | None) -> bool:
-    from src.dalton.invites import is_invite_pm
+    from src.dalton.access_tiers import is_internal_or_admin
 
-    return is_invite_pm(user_id)
+    return await is_internal_or_admin(user_id)
 
 
 async def evaluate_user_notify_eligibility(
@@ -899,23 +1002,36 @@ async def evaluate_user_notify_eligibility(
     identical rules. Returns ``(allowed, skip_reason, effective_targets)`` where
     ``skip_reason`` is ``"toggle_off"`` or ``"target_removed"`` when ``allowed``
     is ``False``. Without a route the task reaches the owner's personal targets
-    only; with one, the personal intersection plus (for an admin owner) the
-    route's group entries. An empty result skips as ``target_removed``.
+    only; with one, the personal intersection plus (for an internal/admin owner)
+    the route's group entries. An empty result skips as ``target_removed``.
     """
     cleaned_uid = str(user_id or "").strip()
     if not cleaned_uid:
         return (False, "toggle_off", [])
 
+    if is_excluded_automation_for_notify(automation):
+        return (False, "toggle_off", [])
+
     if not await resolve_enabled_fn(cleaned_uid):
         return (False, "toggle_off", [])
 
+    classification = (
+        classify_automation_for_notify(automation)
+        if isinstance(automation, Mapping)
+        else None
+    )
     overrides = await resolve_overrides_fn(cleaned_uid)
-    if (
-        isinstance(automation, Mapping)
-        and classify_automation_for_notify(automation) is not None
-        and not is_automation_notify_enabled(automation, overrides)
-    ):
-        return (False, "toggle_off", [])
+    if isinstance(automation, Mapping):
+        if classification is not None and not is_automation_notify_enabled(
+            automation, overrides
+        ):
+            return (False, "toggle_off", [])
+        if classification is None:
+            custom_key = _custom_automation_key(automation)
+            if not custom_key:
+                return (False, "toggle_off", [])
+            if isinstance(overrides, Mapping) and overrides.get(custom_key) is False:
+                return (False, "toggle_off", [])
 
     targets = await resolve_targets_fn(cleaned_uid)
     normalized_targets = [
@@ -929,6 +1045,9 @@ async def evaluate_user_notify_eligibility(
         automation, routes, normalized_targets, include_chat_targets=include_chats
     )
     if routed is None:
+        # Unclassified custom tasks do not push unless an explicit route is configured.
+        if isinstance(automation, Mapping) and classification is None:
+            return (False, "toggle_off", [])
         # No route (or a non-array entry): personal targets only, and an empty
         # personal list skips — a group is never a default.
         if not normalized_targets:
@@ -1240,6 +1359,108 @@ async def post_bridge_notify(
         return data
 
 
+async def send_dalton_notify_test(
+    user_id: str | None,
+    target: str,
+) -> dict[str, Any]:
+    """Validate ``target`` for ``user_id`` and send one test notification card via bridge ``/notify``.
+
+    Shared by ``POST /api/v1/dalton/notify/test`` and ``dalton_notify_settings(action="test")``.
+    Raises ``HTTPException`` when ``target`` is unauthorized, missing from the user's
+    personal list or the bot's discovered group list, or when group discovery is down.
+    """
+    from fastapi import HTTPException
+    from src.dalton.access_tiers import is_internal_or_admin
+    from src.dalton.llm import model_prefs as _model_prefs
+    from src.dalton.notify import groups as _groups
+
+    cleaned = (target or "").strip()
+
+    if _model_prefs.is_dalton_chat_target(cleaned):
+        uid = str(user_id or "").strip()
+        if not uid:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        if not await is_internal_or_admin(uid):
+            raise HTTPException(status_code=403, detail="外部成员不能使用飞书群推送")
+        try:
+            groups = await _groups.discover_feishu_notify_groups()
+        except _groups.FeishuGroupsUnavailable:
+            raise HTTPException(
+                status_code=503, detail="飞书群列表暂时不可用，请稍后再试"
+            ) from None
+        by_id = {g["chat_id"]: g["name"] for g in groups}
+        chat_id = cleaned.split(":", 2)[-1]
+        if chat_id not in by_id:
+            raise HTTPException(
+                status_code=404,
+                detail="群不在机器人已加入的群列表中（请先把机器人拉进群，再刷新群列表）",
+            )
+        display = by_id[chat_id] or cleaned
+    else:
+        targets = await _model_prefs.resolve_dalton_notify_targets(user_id)
+        if cleaned not in targets:
+            raise HTTPException(
+                status_code=404,
+                detail="目标不在当前推送目标列表中（只允许向本人已配置的目标发送测试）",
+            )
+        labels = await _model_prefs.resolve_dalton_notify_target_labels(user_id)
+        display = labels.get(cleaned) or cleaned
+
+    card = {
+        "schema": "2.0",
+        "header": {
+            "title": {"tag": "plain_text", "content": "Dalton 推送测试"},
+            "template": "blue",
+        },
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": f"这是一条测试推送，用于确认该目标可用。目标：{display}",
+                }
+            ]
+        },
+    }
+    text_msg = f"Dalton 推送测试\n这是一条测试推送，用于确认该目标可用。目标：{display}"
+
+    res = await post_bridge_notify([cleaned], text_msg, card)
+    results = res.get("results") if isinstance(res, dict) else None
+    item = (
+        next(
+            (
+                r
+                for r in results
+                if isinstance(r, dict) and str(r.get("target") or "") == cleaned
+            ),
+            None,
+        )
+        if isinstance(results, list)
+        else None
+    )
+    if item is not None and item.get("ok") is True:
+        return {"ok": True, "detail": None, "error_code": None}
+
+    error_code = "send_failed"
+    feishu_code = ""
+    feishu_msg = ""
+    log_id = ""
+    if isinstance(item, dict):
+        error_code = str(item.get("error") or error_code)
+        feishu_code = str(item.get("feishu_code") or "")
+        feishu_msg = str(item.get("feishu_msg") or "")
+        log_id = str(item.get("log_id") or "")
+    elif isinstance(res, dict):
+        error_code = str(res.get("error_code") or error_code)
+    detail = f"发送失败（{error_code}）"
+    if feishu_code:
+        detail = f"发送失败（飞书错误码 {feishu_code}）"
+    if feishu_msg:
+        detail = f"{detail}：{feishu_msg}"
+    if log_id:
+        detail = f"{detail}（log_id: {log_id}）"
+    return {"ok": False, "detail": detail, "error_code": error_code}
+
+
 async def _invoke_post_notify(
     post_notify_fn: Callable[..., Awaitable[dict[str, Any]]],
     targets: list[str],
@@ -1296,16 +1517,23 @@ def _reconstruct_automation_from_delivery_row(
     row: Mapping[str, Any],
     payload: Mapping[str, Any],
 ) -> dict[str, Any] | None:
+    auto_id = (
+        str(row.get("automation_id") or "").strip()
+        or str(payload.get("automation_id") or "").strip()
+    )
     auto_name = (
         str(row.get("automation_name") or "").strip()
         or str(payload.get("automation_name") or "").strip()
     )
     raw_meta = row.get("automation_metadata")
     meta: dict[str, Any] = dict(raw_meta) if isinstance(raw_meta, Mapping) else {}
-    if not meta and payload.get("category"):
+    if not meta and payload.get("category") and payload.get("category") != "custom":
         meta = {"dalton_kind": str(payload.get("category"))}
-    if auto_name or meta:
-        return {"name": auto_name, "metadata": meta}
+    if auto_id or auto_name or meta:
+        reconstructed: dict[str, Any] = {"name": auto_name, "metadata": meta}
+        if auto_id:
+            reconstructed["automation_id"] = auto_id
+        return reconstructed
     return None
 
 
@@ -1613,9 +1841,12 @@ async def on_automation_settled(
     ws_for_verdict = (workspace_id or "").strip() or None
     pending_targets: list[tuple[str, str]] = []
     try:
-        classification = classify_automation_for_notify(automation)
-        if classification is None:
+        if not isinstance(automation, Mapping) or is_excluded_automation_for_notify(
+            automation
+        ):
             return False
+
+        classification = classify_automation_for_notify(automation)
 
         user_id = str(automation.get("user_id") or "").strip()
         allowed, _, targets = await evaluate_user_notify_eligibility(
@@ -1629,6 +1860,14 @@ async def on_automation_settled(
         )
         if not allowed or not targets:
             return False
+
+        if classification is None:
+            auto_name = str(automation.get("name") or "").strip() or "定时任务"
+            classification = NotifyClassification(
+                category="custom",
+                label_zh="定时任务",
+                scope=auto_name,
+            )
 
         verdict_row = await get_verdict_fn(
             automation_execution_id=execution_id,

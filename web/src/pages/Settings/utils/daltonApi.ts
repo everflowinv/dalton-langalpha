@@ -771,7 +771,7 @@ export interface DaltonFeishuGroupsResponse {
   groups: DaltonFeishuGroup[];
 }
 
-/** The chats the notify bot is in (admin only; server caches 5 minutes). */
+/** The chats the notify bot is in (internal/admin only; server caches 5 minutes). */
 export async function fetchDaltonFeishuGroups(): Promise<DaltonFeishuGroupsResponse> {
   const { data } = await api.get<DaltonFeishuGroupsResponse>(
     '/api/v1/dalton/notify/feishu-groups',

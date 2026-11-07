@@ -24,6 +24,7 @@ import email.message
 import io
 import json
 import logging
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
 import subprocess
@@ -40,7 +41,8 @@ if str(SCRIPTS_DALTON) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DALTON))
 
 import researchdata_bridge as rb  # noqa: E402
-import src.dalton.invites as invites_mod  # noqa: E402
+import src.dalton.access_tiers as access_tiers_mod  # noqa: E402
+from src.dalton.access_tiers import get_user_tier  # noqa: E402
 import src.dalton.llm.model_prefs as model_prefs_mod  # noqa: E402
 from src.dalton.llm.model_prefs import (  # noqa: E402
     DALTON_NOTIFY_ROUTES_KEY,
@@ -71,6 +73,7 @@ from src.dalton.notify.dispatch import (  # noqa: E402
 )
 from src.dalton.settings import get_dalton_frontend_url  # noqa: E402
 from src.llms.preferences import TuningError  # noqa: E402
+import src.server.database.pool as pool_mod  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -234,9 +237,13 @@ async def test_route_and_label_preferences_read_back_through_resolvers(
 async def test_route_write_without_chat_targets_needs_no_discovery(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(invites_mod, "is_invite_pm", lambda uid: False)
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(get_user_tier, return_value="external"),
+    )
     # No discovery call: a personal-only route (or no route key at all) passes
-    # even for a non-admin and with the bridge unreachable.
+    # even for an external member and with the bridge unreachable.
     async def _boom() -> list[dict[str, str]]:
         raise AssertionError("discovery must not be called")
 
@@ -259,12 +266,20 @@ async def test_route_write_chat_targets_admin_only_and_discovery_checked(
     monkeypatch.setattr(groups_mod, "discover_feishu_notify_groups", _discovered)
     submitted = {"task": ["feishu:chat:oc_group_1"]}
 
-    monkeypatch.setattr(invites_mod, "is_invite_pm", lambda uid: False)
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(get_user_tier, return_value="external"),
+    )
     with pytest.raises(HTTPException) as non_pm:
         await validate_dalton_notify_routes_for_user("u-member", submitted)
     assert non_pm.value.status_code == 403
 
-    monkeypatch.setattr(invites_mod, "is_invite_pm", lambda uid: True)
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(get_user_tier, return_value="internal"),
+    )
     with pytest.raises(HTTPException) as unknown:
         await validate_dalton_notify_routes_for_user(
             "u-pm", {"task": ["feishu:chat:oc_not_joined"]}
@@ -295,7 +310,11 @@ async def test_route_write_gates_only_groups_added_to_the_route(
         return [{"chat_id": "oc_live", "name": "在群"}]
 
     monkeypatch.setattr(groups_mod, "discover_feishu_notify_groups", _discovered)
-    monkeypatch.setattr(invites_mod, "is_invite_pm", lambda uid: True)
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(get_user_tier, return_value="admin"),
+    )
     stored = {"task": ["feishu:chat:oc_left_1", "feishu:chat:oc_left_2"]}
 
     await validate_dalton_notify_routes_for_user(
@@ -315,8 +334,12 @@ async def test_route_write_gates_only_groups_added_to_the_route(
         )
     assert moved.value.status_code == 400
 
-    # A non-admin can never add a group, stored elsewhere or not.
-    monkeypatch.setattr(invites_mod, "is_invite_pm", lambda uid: False)
+    # An external member can never add a group, stored elsewhere or not.
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(get_user_tier, return_value="external"),
+    )
     with pytest.raises(HTTPException) as non_pm:
         await validate_dalton_notify_routes_for_user(
             "u-member", {"other": ["feishu:chat:oc_live"]}, stored
@@ -979,12 +1002,20 @@ async def test_feishu_groups_endpoint_pm_only(
 
     from src.dalton.app.router import dalton_notify_feishu_groups_endpoint
 
-    monkeypatch.setattr(invites_mod, "is_invite_pm", lambda uid: False)
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(get_user_tier, return_value="external"),
+    )
     with pytest.raises(HTTPException) as non_pm:
         await dalton_notify_feishu_groups_endpoint(user_id="u-member")
     assert non_pm.value.status_code == 403
 
-    monkeypatch.setattr(invites_mod, "is_invite_pm", lambda uid: True)
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(get_user_tier, return_value="internal"),
+    )
     monkeypatch.setattr(groups_mod, "_groups_cache", None)
 
     async def _fake_bridge(route: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -1035,8 +1066,12 @@ async def test_notify_test_endpoint_group_permissions(
 
     monkeypatch.setattr(groups_mod, "discover_feishu_notify_groups", _discovered)
 
-    # Non-admin testing a group -> 403 (no discovery needed past the gate).
-    monkeypatch.setattr(invites_mod, "is_invite_pm", lambda uid: False)
+    # External member testing a group -> 403 (no discovery needed past the gate).
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(get_user_tier, return_value="external"),
+    )
     with pytest.raises(HTTPException) as non_pm:
         await dalton_notify_test_endpoint(
             DaltonNotifyTestRequest(target="feishu:chat:oc_group_1"),
@@ -1044,8 +1079,12 @@ async def test_notify_test_endpoint_group_permissions(
         )
     assert non_pm.value.status_code == 403
 
-    # Admin testing a group the bot is not in -> 404.
-    monkeypatch.setattr(invites_mod, "is_invite_pm", lambda uid: True)
+    # Internal/admin testing a group the bot is not in -> 404.
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(get_user_tier, return_value="internal"),
+    )
     with pytest.raises(HTTPException) as unknown:
         await dalton_notify_test_endpoint(
             DaltonNotifyTestRequest(target="feishu:chat:oc_not_joined"),
@@ -1284,12 +1323,16 @@ def test_partial_route_patch_cleans_stored_entries_too() -> None:
 async def test_feishu_bot_endpoint_refuses_non_admin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """r6 #9: the bot name endpoint serves the admin group card only."""
+    """r6 #9: the bot name endpoint refuses external members."""
     from fastapi import HTTPException
 
     from src.dalton.app.router import dalton_notify_feishu_bot_endpoint
 
-    monkeypatch.setattr(invites_mod, "is_invite_pm", lambda uid: False)
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(get_user_tier, return_value="external"),
+    )
     with pytest.raises(HTTPException) as excinfo:
         await dalton_notify_feishu_bot_endpoint(user_id="u-member")
     assert excinfo.value.status_code == 403
@@ -1301,7 +1344,7 @@ async def test_deleting_a_personal_target_survives_group_discovery_failures(
 ) -> None:
     """r7 #1: the task route is [A, G]; the user deletes A. The cleanup keeps
     [G] in the patch, but the group gate sees only what the caller submitted —
-    so a down discovery API, a group the bot left, or lost admin rights must
+    so a down discovery API, a group the bot left, or external tier must
     not block deleting one's own personal target."""
     # The full users.py sequence: the user submits only the target-list change
     # (deleting A, their sole personal target); the cleanup writes the kept
@@ -1332,7 +1375,11 @@ async def test_deleting_a_personal_target_survives_group_discovery_failures(
 
     # …and the group gate on the *submitted* entries passes even when
     # discovery is down (or would not know the kept group), for anyone.
-    monkeypatch.setattr(invites_mod, "is_invite_pm", lambda uid: False)
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(get_user_tier, return_value="external"),
+    )
 
     async def _unavailable() -> list[dict[str, str]]:
         raise groups_mod.FeishuGroupsUnavailable("bridge down")
@@ -1344,7 +1391,11 @@ async def test_deleting_a_personal_target_survives_group_discovery_failures(
     # discovery outage is a 503 for a new group submission.
     from fastapi import HTTPException
 
-    monkeypatch.setattr(invites_mod, "is_invite_pm", lambda uid: True)
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(get_user_tier, return_value="admin"),
+    )
     with pytest.raises(HTTPException) as submitted_gate:
         await validate_dalton_notify_routes_for_user(
             "u-pm", {"task-new": ["feishu:chat:oc_gone_group"]}
@@ -1387,3 +1438,2269 @@ def test_cleanup_merges_on_normalized_route_keys() -> None:
     # not duplicated under both spellings.
     labels = patch[DALTON_NOTIFY_TARGET_LABELS_KEY]
     assert labels == {"feishu:user:ou_a": None}
+
+
+# ---------------------------------------------------------------------------
+# internal/admin tier permissions + conversational tool dalton_notify_settings
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_group_notify_permissions_by_user_tier_and_error_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """internal and admin can configure group routes, list groups/bot, and send
+    group test cards; external is refused with 403; get_user_tier raising falls
+    back to external."""
+    from fastapi import HTTPException
+
+    import src.dalton.access_tiers as access_tiers_mod
+    from src.dalton.app import router as router_mod
+    from src.dalton.app.router import (
+        DaltonNotifyTestRequest,
+        dalton_notify_feishu_bot_endpoint,
+        dalton_notify_feishu_groups_endpoint,
+        dalton_notify_test_endpoint,
+    )
+
+    async def _discovered() -> list[dict[str, str]]:
+        return [{"chat_id": "oc_group_1", "name": "投研群"}]
+
+    async def _bot_name() -> str | None:
+        return "Everflow 投研"
+
+    async def _ok_post(
+        send_targets: list[str], text: str, card: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        _ = (text, card)
+        return {"ok": True, "results": [{"target": send_targets[0], "ok": True}]}
+
+    monkeypatch.setattr(groups_mod, "discover_feishu_notify_groups", _discovered)
+    monkeypatch.setattr(router_mod, "_resolve_feishu_bot_name", _bot_name)
+    monkeypatch.setattr(dispatch_mod, "post_bridge_notify", _ok_post)
+
+    tier_map: dict[str, str] = {
+        "u-admin": "admin",
+        "u-internal": "internal",
+        "u-external": "external",
+    }
+
+    async def _fake_get_user_tier(user_id: str | None) -> str:
+        uid = str(user_id or "")
+        if uid == "u-boom":
+            raise RuntimeError("tier lookup failed")
+        return tier_map.get(uid, "external")
+
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(get_user_tier, side_effect=_fake_get_user_tier),
+    )
+
+    for allowed_uid in ("u-admin", "u-internal"):
+        assert await access_tiers_mod.is_internal_or_admin(allowed_uid) is True
+        await validate_dalton_notify_routes_for_user(
+            allowed_uid, {"task": ["feishu:chat:oc_group_1"]}
+        )
+        bot_res = await dalton_notify_feishu_bot_endpoint(user_id=allowed_uid)
+        assert bot_res == {"ok": True, "app_name": "Everflow 投研"}
+        groups_res = await dalton_notify_feishu_groups_endpoint(user_id=allowed_uid)
+        assert groups_res == {
+            "ok": True,
+            "groups": [{"chat_id": "oc_group_1", "name": "投研群"}],
+        }
+        test_res = await dalton_notify_test_endpoint(
+            DaltonNotifyTestRequest(target="feishu:chat:oc_group_1"),
+            user_id=allowed_uid,
+        )
+        assert test_res == {"ok": True, "detail": None, "error_code": None}
+
+    for denied_uid in ("u-external", "u-boom"):
+        assert await access_tiers_mod.is_internal_or_admin(denied_uid) is False
+        with pytest.raises(HTTPException) as route_exc:
+            await validate_dalton_notify_routes_for_user(
+                denied_uid, {"task": ["feishu:chat:oc_group_1"]}
+            )
+        assert route_exc.value.status_code == 403
+        assert "外部成员不能使用飞书群推送" in str(route_exc.value.detail)
+
+        with pytest.raises(HTTPException) as bot_exc:
+            await dalton_notify_feishu_bot_endpoint(user_id=denied_uid)
+        assert bot_exc.value.status_code == 403
+
+        with pytest.raises(HTTPException) as groups_exc:
+            await dalton_notify_feishu_groups_endpoint(user_id=denied_uid)
+        assert groups_exc.value.status_code == 403
+
+        with pytest.raises(HTTPException) as test_exc:
+            await dalton_notify_test_endpoint(
+                DaltonNotifyTestRequest(target="feishu:chat:oc_group_1"),
+                user_id=denied_uid,
+            )
+        assert test_exc.value.status_code == 403
+        assert "外部成员不能使用飞书群推送" in str(test_exc.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_group_targets_follow_owner_tier_internal_vs_external(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default dispatch admin check (`_default_notify_admin`) lets group targets
+    ride along for internal and admin task owners, and drops them for external
+    (including when get_user_tier raises)."""
+    import src.dalton.access_tiers as access_tiers_mod
+
+    automation = {"name": "dalton-googl-earn-2026q1-t0", "user_id": "u-internal"}
+    personal = ["feishu:user:ou_a"]
+    routes = {
+        "dalton-googl-earn-2026q1-t0": ["feishu:chat:oc_g", "feishu:user:ou_a"]
+    }
+    fns = _route_test_fns(targets=personal, routes=routes)
+
+    async def _tier_by_uid(user_id: str | None) -> str:
+        uid = str(user_id or "")
+        if uid == "u-boom":
+            raise RuntimeError("roster error")
+        if uid == "u-internal":
+            return "internal"
+        if uid == "u-admin":
+            return "admin"
+        return "external"
+
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(get_user_tier, side_effect=_tier_by_uid),
+    )
+
+    for uid in ("u-internal", "u-admin"):
+        allowed, reason, effective = await evaluate_user_notify_eligibility(
+            uid,
+            automation,
+            resolve_enabled_fn=fns[0],
+            resolve_overrides_fn=fns[1],
+            resolve_targets_fn=fns[2],
+            resolve_routes_fn=fns[3],
+        )
+        assert (allowed, reason, effective) == (
+            True,
+            None,
+            ["feishu:user:ou_a", "feishu:chat:oc_g"],
+        )
+
+    for uid in ("u-external", "u-boom"):
+        allowed, reason, effective = await evaluate_user_notify_eligibility(
+            uid,
+            automation,
+            resolve_enabled_fn=fns[0],
+            resolve_overrides_fn=fns[1],
+            resolve_targets_fn=fns[2],
+            resolve_routes_fn=fns[3],
+        )
+        assert (allowed, reason, effective) == (
+            True,
+            None,
+            ["feishu:user:ou_a"],
+        )
+
+
+def _notify_tool_call(args: dict[str, Any], call_id: str = "call_notify_1") -> dict[str, Any]:
+    return {
+        "name": "dalton_notify_settings",
+        "args": args,
+        "id": call_id,
+        "type": "tool_call",
+    }
+
+
+def _approve_hitl_confirm(
+    action_type: str, payload: dict[str, Any]
+) -> tuple[bool, dict[str, Any]]:
+    _ = action_type
+    return (
+        True,
+        {
+            "decisions": [
+                {
+                    "type": "approve",
+                    "confirm_token": payload.get("confirm_token"),
+                }
+            ]
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_dalton_notify_settings_list_returns_targets_groups_routes_and_switches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.dalton.access_tiers as access_tiers_mod
+    import src.dalton.tools.notify_tools as notify_tools_mod
+    from src.dalton.tools.notify_tools import create_notify_tools
+    from src.server.database import automation as auto_db
+
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(get_user_tier, return_value="internal"),
+    )
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "resolve_dalton_notify_enabled",
+        create_autospec(resolve_dalton_notify_enabled, return_value=True),
+    )
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "resolve_dalton_notify_targets",
+        create_autospec(
+            resolve_dalton_notify_targets, return_value=["feishu:user:ou_me_1"]
+        ),
+    )
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "resolve_dalton_notify_target_labels",
+        create_autospec(
+            resolve_dalton_notify_target_labels,
+            return_value={"feishu:user:ou_me_1": "我本人"},
+        ),
+    )
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "resolve_dalton_notify_overrides",
+        create_autospec(resolve_dalton_notify_overrides, return_value={}),
+    )
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "resolve_dalton_notify_routes",
+        create_autospec(
+            resolve_dalton_notify_routes,
+            return_value={"dalton-nvda-earn-2026q1-t0": ["feishu:chat:oc_g1"]},
+        ),
+    )
+    monkeypatch.setattr(
+        auto_db,
+        "list_all_automations",
+        create_autospec(
+            auto_db.list_all_automations,
+            return_value=[
+                {
+                    "automation_id": "auto-nvda-1",
+                    "name": "dalton-nvda-earn-2026q1-t0",
+                    "status": "active",
+                    "metadata": {"ticker": "NVDA"},
+                }
+            ],
+        ),
+    )
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "discover_feishu_notify_groups",
+        create_autospec(
+            groups_mod.discover_feishu_notify_groups,
+            return_value=[{"chat_id": "oc_g1", "name": "半导体投研群"}],
+        ),
+    )
+
+    tool = create_notify_tools()[0]
+    cmd = await tool.ainvoke(
+        _notify_tool_call({"action": "list"}),
+        config={"configurable": {"user_id": "u-internal"}},
+    )
+    payload = json.loads(cmd.update["messages"][0].content)
+    assert payload["success"] is True
+    assert payload["notify_enabled"] is True
+    assert payload["personal_targets"] == [
+        {"target": "feishu:user:ou_me_1", "label": "我本人"}
+    ]
+    assert payload["groups_available"] is True
+    assert payload["groups"] == [
+        {
+            "chat_id": "oc_g1",
+            "target": "feishu:chat:oc_g1",
+            "name": "半导体投研群",
+        }
+    ]
+    assert len(payload["automations"]) == 1
+    auto_item = payload["automations"][0]
+    assert auto_item["automation_id"] == "auto-nvda-1"
+    assert auto_item["name"] == "dalton-nvda-earn-2026q1-t0"
+    assert auto_item["notify_enabled"] is True
+    assert auto_item["route_targets"] == ["feishu:chat:oc_g1"]
+    assert auto_item["effective_targets"] == [
+        {"target": "feishu:chat:oc_g1", "display": "半导体投研群 (feishu:chat:oc_g1)"}
+    ]
+
+    # When group discovery is unavailable, list still succeeds and reports groups_available=False.
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "discover_feishu_notify_groups",
+        create_autospec(
+            groups_mod.discover_feishu_notify_groups,
+            side_effect=groups_mod.FeishuGroupsUnavailable("bridge offline"),
+        ),
+    )
+    cmd_down = await tool.ainvoke(
+        _notify_tool_call({"action": "list"}),
+        config={"configurable": {"user_id": "u-internal"}},
+    )
+    payload_down = json.loads(cmd_down.update["messages"][0].content)
+    assert payload_down["success"] is True
+    assert payload_down["groups_available"] is False
+    assert "不可用" in payload_down["groups_note"]
+
+
+@pytest.mark.asyncio
+async def test_dalton_notify_settings_set_route_rejects_foreign_task_unconfigured_personal_and_unknown_group(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.dalton.access_tiers as access_tiers_mod
+    import src.dalton.tools.notify_tools as notify_tools_mod
+    from src.dalton.tools.notify_tools import create_notify_tools
+    from src.server.database import automation as auto_db
+
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(get_user_tier, return_value="internal"),
+    )
+    monkeypatch.setattr(
+        auto_db,
+        "list_all_automations",
+        create_autospec(
+            auto_db.list_all_automations,
+            return_value=[{"automation_id": "a-1", "name": "dalton-nvda-earn-2026q1-t0"}],
+        ),
+    )
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "resolve_dalton_notify_targets",
+        create_autospec(
+            resolve_dalton_notify_targets, return_value=["feishu:user:ou_me_1"]
+        ),
+    )
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "resolve_dalton_notify_target_labels",
+        create_autospec(
+            resolve_dalton_notify_target_labels,
+            return_value={"feishu:user:ou_me_1": "我本人"},
+        ),
+    )
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "discover_feishu_notify_groups",
+        create_autospec(
+            groups_mod.discover_feishu_notify_groups,
+            return_value=[{"chat_id": "oc_g1", "name": "半导体投研群"}],
+        ),
+    )
+    confirm_spy = create_autospec(
+        notify_tools_mod.hitl_confirm,
+        side_effect=AssertionError("hitl_confirm must not be called on invalid input"),
+    )
+    monkeypatch.setattr(notify_tools_mod, "hitl_confirm", confirm_spy)
+
+    tool = create_notify_tools()[0]
+    cfg = {"configurable": {"user_id": "u-internal"}}
+
+    # 1. Foreign / non-existent automation
+    cmd_foreign = await tool.ainvoke(
+        _notify_tool_call(
+            {
+                "action": "set_route",
+                "automation": "someone-elses-task",
+                "targets": ["feishu:chat:oc_g1"],
+            }
+        ),
+        config=cfg,
+    )
+    res_foreign = json.loads(cmd_foreign.update["messages"][0].content)
+    assert res_foreign["success"] is False
+    assert "不存在或不属于当前用户" in res_foreign["error"]
+
+    # 2. Personal target not in current user's target list
+    cmd_personal = await tool.ainvoke(
+        _notify_tool_call(
+            {
+                "action": "set_route",
+                "automation": "dalton-nvda-earn-2026q1-t0",
+                "targets": ["feishu:user:ou_other_person"],
+            }
+        ),
+        config=cfg,
+    )
+    res_personal = json.loads(cmd_personal.update["messages"][0].content)
+    assert res_personal["success"] is False
+    assert "尚未添加，请先添加个人推送目标" in res_personal["error"]
+
+    # 3. Group not in bot's discovered groups
+    cmd_group = await tool.ainvoke(
+        _notify_tool_call(
+            {
+                "action": "set_route",
+                "automation": "dalton-nvda-earn-2026q1-t0",
+                "targets": ["feishu:chat:oc_not_joined"],
+            }
+        ),
+        config=cfg,
+    )
+    res_group = json.loads(cmd_group.update["messages"][0].content)
+    assert res_group["success"] is False
+    assert "不在机器人已加入的群列表中" in res_group["error"]
+    confirm_spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_dalton_notify_settings_set_route_confirm_writes_via_shared_validator_and_decline_skips_write(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.dalton.access_tiers as access_tiers_mod
+    import src.dalton.tools.notify_tools as notify_tools_mod
+    from src.dalton.tools.notify_tools import create_notify_tools
+    from src.server.database import automation as auto_db
+    from src.server.database import user as user_db
+    from src.tools.secretary._commands import hitl_confirm as real_hitl_confirm
+
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(get_user_tier, return_value="internal"),
+    )
+    monkeypatch.setattr(
+        auto_db,
+        "list_all_automations",
+        create_autospec(
+            auto_db.list_all_automations,
+            return_value=[{"automation_id": "a-1", "name": "dalton-nvda-earn-2026q1-t0"}],
+        ),
+    )
+    stored_prefs: dict[str, Any] = {
+        "model_preference": {
+            "dalton_notify_enabled": False,
+            "dalton_notify_targets": ["feishu:user:ou_me_1"],
+            "dalton_notify_target_labels": {"feishu:user:ou_me_1": "我本人"},
+            "dalton_notify_overrides": {"dalton-nvda-earn-2026q1-t0": False},
+            "dalton_notify_routes": {},
+        },
+        "other_preference": {},
+    }
+    monkeypatch.setattr(
+        model_prefs_mod,
+        "get_user_preferences",
+        create_autospec(model_prefs_mod.get_user_preferences, return_value=stored_prefs),
+    )
+    monkeypatch.setattr(
+        user_db,
+        "get_user_preferences",
+        create_autospec(user_db.get_user_preferences, return_value=stored_prefs),
+    )
+    monkeypatch.setattr(
+        user_db,
+        "invalidate_user_prefs_cache",
+        create_autospec(user_db.invalidate_user_prefs_cache, return_value=None),
+    )
+    monkeypatch.setattr(
+        user_db,
+        "invalidate_user_profile_cache",
+        create_autospec(user_db.invalidate_user_profile_cache, return_value=None),
+    )
+
+    upserted_patches: list[dict[str, Any]] = []
+
+    async def _fake_upsert(
+        user_id: str,
+        risk_preference: dict[str, Any] | None = None,
+        investment_preference: dict[str, Any] | None = None,
+        agent_preference: dict[str, Any] | None = None,
+        other_preference: dict[str, Any] | None = None,
+        model_preference: dict[str, Any] | None = None,
+        replace: bool = False,
+        conn: Any = None,
+    ) -> dict[str, Any]:
+        _ = (
+            user_id,
+            risk_preference,
+            investment_preference,
+            agent_preference,
+            other_preference,
+            replace,
+            conn,
+        )
+        upserted_patches.append(dict(model_preference or {}))
+        return {"model_preference": model_preference}
+
+    monkeypatch.setattr(
+        user_db,
+        "upsert_user_preferences",
+        create_autospec(user_db.upsert_user_preferences, side_effect=_fake_upsert),
+    )
+
+    discovered_groups = [{"chat_id": "oc_g1", "name": "半导体投研群"}]
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "discover_feishu_notify_groups",
+        create_autospec(
+            groups_mod.discover_feishu_notify_groups,
+            return_value=discovered_groups,
+        ),
+    )
+    monkeypatch.setattr(
+        groups_mod,
+        "discover_feishu_notify_groups",
+        create_autospec(
+            groups_mod.discover_feishu_notify_groups,
+            return_value=discovered_groups,
+        ),
+    )
+
+    # Wrap the real validators to prove set_route runs through the exact same validators as PUT.
+    validate_sync_spy = create_autospec(
+        model_prefs_mod.validate_dalton_model_preferences,
+        side_effect=model_prefs_mod.validate_dalton_model_preferences,
+    )
+    validate_user_spy = create_autospec(
+        model_prefs_mod.validate_dalton_notify_routes_for_user,
+        side_effect=model_prefs_mod.validate_dalton_notify_routes_for_user,
+    )
+    monkeypatch.setattr(
+        model_prefs_mod, "validate_dalton_model_preferences", validate_sync_spy
+    )
+    monkeypatch.setattr(
+        model_prefs_mod, "validate_dalton_notify_routes_for_user", validate_user_spy
+    )
+
+    tool = create_notify_tools()[0]
+    cfg = {"configurable": {"user_id": "u-internal"}}
+
+    # 1. Decline -> does not write
+    decline_confirm = create_autospec(real_hitl_confirm, return_value=(False, None))
+    monkeypatch.setattr(notify_tools_mod, "hitl_confirm", decline_confirm)
+    cmd_declined = await tool.ainvoke(
+        _notify_tool_call(
+            {
+                "action": "set_route",
+                "automation": "dalton-nvda-earn-2026q1-t0",
+                "targets": ["我本人", "半导体投研群"],
+            }
+        ),
+        config=cfg,
+    )
+    declined_text = cmd_declined.update["messages"][0].content
+    assert "取消" in declined_text
+    assert upserted_patches == []
+    decline_confirm.assert_called_once()
+    confirm_payload = decline_confirm.call_args.args[1]
+    assert confirm_payload["name"] == "设置定时任务推送"
+    assert confirm_payload["args"] == {
+        "任务": "dalton-nvda-earn-2026q1-t0",
+        "推送到": ["我本人（个人，feishu:user:ou_me_1）", "半导体投研群（群，oc_g1）"],
+        "提示": "你的推送总开关目前是关的，在设置里打开后才会推送",
+    }
+    assert "dalton-nvda-earn-2026q1-t0 →" in confirm_payload["summary"]
+    assert "我本人" in confirm_payload["summary"]
+    assert "半导体投研群" in confirm_payload["summary"]
+
+    # 2. Confirm -> validates via shared validators, writes single-task route/override, does NOT touch master switch
+    approve_confirm = create_autospec(
+        real_hitl_confirm, side_effect=_approve_hitl_confirm
+    )
+    monkeypatch.setattr(notify_tools_mod, "hitl_confirm", approve_confirm)
+    cmd_approved = await tool.ainvoke(
+        _notify_tool_call(
+            {
+                "action": "set_route",
+                "automation": "dalton-nvda-earn-2026q1-t0",
+                "targets": ["我本人", "半导体投研群"],
+            }
+        ),
+        config=cfg,
+    )
+    res_approved = json.loads(cmd_approved.update["messages"][0].content)
+    assert res_approved["success"] is True
+    assert res_approved["targets"] == ["feishu:user:ou_me_1", "feishu:chat:oc_g1"]
+    assert res_approved["notify_enabled"] is False
+    assert "你的推送总开关目前是关的，在设置里打开后才会推送" in res_approved["note"]
+    assert "你的推送总开关目前是关的，在设置里打开后才会推送" in res_approved["summary"]
+    assert validate_sync_spy.call_count == 1
+    assert validate_user_spy.await_count == 1
+    assert len(upserted_patches) == 1
+    written = upserted_patches[0]
+    assert written["dalton_notify_routes"] == {
+        "dalton-nvda-earn-2026q1-t0": ["feishu:user:ou_me_1", "feishu:chat:oc_g1"]
+    }
+    assert "dalton_notify_enabled" not in written
+    assert written["dalton_notify_overrides"] == {
+        "dalton-nvda-earn-2026q1-t0": True
+    }
+
+    # 3. Empty targets=[] -> writes explicit [] ("不推送")
+    cmd_empty = await tool.ainvoke(
+        _notify_tool_call(
+            {
+                "action": "set_route",
+                "automation": "dalton-nvda-earn-2026q1-t0",
+                "targets": [],
+            }
+        ),
+        config=cfg,
+    )
+    res_empty = json.loads(cmd_empty.update["messages"][0].content)
+    assert res_empty["success"] is True
+    assert res_empty["targets"] == []
+    assert upserted_patches[-1]["dalton_notify_routes"] == {
+        "dalton-nvda-earn-2026q1-t0": []
+    }
+
+
+def _mock_locked_prefs_db(
+    monkeypatch: pytest.MonkeyPatch,
+    stored_prefs: dict[str, Any],
+    upserted: list[dict[str, Any]],
+) -> Any:
+    from src.server.database import user as user_db
+
+    fake_tx = create_autospec(psycopg.AsyncTransaction, instance=True)
+    fake_tx.__aenter__.return_value = fake_tx
+    fake_tx.__aexit__.return_value = False
+
+    fake_conn = create_autospec(psycopg.AsyncConnection, instance=True)
+    fake_conn.transaction.return_value = fake_tx
+
+    @asynccontextmanager
+    async def _fake_get_db_conn():
+        yield fake_conn
+
+    monkeypatch.setattr(
+        pool_mod,
+        "get_db_connection",
+        create_autospec(pool_mod.get_db_connection, side_effect=_fake_get_db_conn),
+    )
+
+    async def _fake_lock_prefs(user_id: str, *, conn: Any) -> dict[str, Any]:
+        _ = user_id
+        assert conn is fake_conn
+        return {
+            "model_preference": dict(stored_prefs.get("model_preference") or {}),
+            "other_preference": dict(stored_prefs.get("other_preference") or {}),
+        }
+
+    lock_spy = create_autospec(user_db.lock_user_preferences, side_effect=_fake_lock_prefs)
+    monkeypatch.setattr(user_db, "lock_user_preferences", lock_spy)
+    monkeypatch.setattr(
+        model_prefs_mod,
+        "get_user_preferences",
+        create_autospec(model_prefs_mod.get_user_preferences, side_effect=lambda _u: stored_prefs),
+    )
+    monkeypatch.setattr(
+        user_db,
+        "get_user_preferences",
+        create_autospec(user_db.get_user_preferences, side_effect=lambda _u: stored_prefs),
+    )
+    monkeypatch.setattr(
+        user_db,
+        "invalidate_user_prefs_cache",
+        create_autospec(user_db.invalidate_user_prefs_cache, return_value=None),
+    )
+    monkeypatch.setattr(
+        user_db,
+        "invalidate_user_profile_cache",
+        create_autospec(user_db.invalidate_user_profile_cache, return_value=None),
+    )
+
+    async def _fake_upsert(
+        user_id: str,
+        risk_preference: dict[str, Any] | None = None,
+        investment_preference: dict[str, Any] | None = None,
+        agent_preference: dict[str, Any] | None = None,
+        other_preference: dict[str, Any] | None = None,
+        model_preference: dict[str, Any] | None = None,
+        replace: bool = False,
+        conn: Any = None,
+    ) -> dict[str, Any]:
+        _ = (
+            user_id,
+            risk_preference,
+            investment_preference,
+            agent_preference,
+            other_preference,
+            replace,
+            conn,
+        )
+        patch_copy = dict(model_preference or {})
+        upserted.append(patch_copy)
+        merged_mp = dict(stored_prefs.get("model_preference") or {})
+        for k, v in patch_copy.items():
+            if isinstance(v, Mapping) and isinstance(merged_mp.get(k), Mapping):
+                sub = dict(merged_mp[k])
+                for sk, sv in v.items():
+                    if sv is None:
+                        sub.pop(sk, None)
+                    else:
+                        sub[sk] = sv
+                merged_mp[k] = sub
+            elif v is None:
+                merged_mp.pop(k, None)
+            else:
+                merged_mp[k] = v
+        stored_prefs["model_preference"] = merged_mp
+        return {"model_preference": dict(merged_mp)}
+
+    monkeypatch.setattr(
+        user_db,
+        "upsert_user_preferences",
+        create_autospec(user_db.upsert_user_preferences, side_effect=_fake_upsert),
+    )
+    return lock_spy
+
+
+@pytest.mark.asyncio
+async def test_dalton_notify_settings_add_personal_target_confirm_and_decline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.dalton.access_tiers as access_tiers_mod
+    import src.dalton.tools.notify_tools as notify_tools_mod
+    from src.dalton.tools.notify_tools import create_notify_tools
+
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(get_user_tier, return_value="internal"),
+    )
+    stored_prefs: dict[str, Any] = {
+        "model_preference": {
+            "dalton_notify_targets": ["feishu:user:ou_existing"],
+            "dalton_notify_target_labels": {"feishu:user:ou_existing": "已有目标"},
+        },
+        "other_preference": {},
+    }
+    upserted: list[dict[str, Any]] = []
+    lock_spy = _mock_locked_prefs_db(monkeypatch, stored_prefs, upserted)
+
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "hitl_confirm",
+        create_autospec(
+            notify_tools_mod.hitl_confirm, side_effect=_approve_hitl_confirm
+        ),
+    )
+
+    tool = create_notify_tools()[0]
+    cfg = {"configurable": {"user_id": "u-internal"}}
+
+    cmd = await tool.ainvoke(
+        _notify_tool_call(
+            {
+                "action": "add_personal_target",
+                "target": "feishu:user:ou_new_user",
+                "label": "张分析师",
+            }
+        ),
+        config=cfg,
+    )
+    res = json.loads(cmd.update["messages"][0].content)
+    assert res["success"] is True
+    assert res["personal_targets"] == [
+        "feishu:user:ou_existing",
+        "feishu:user:ou_new_user",
+    ]
+    assert res["target_labels"]["feishu:user:ou_new_user"] == "张分析师"
+    assert res["target_labels"]["feishu:user:ou_existing"] == "已有目标"
+    assert len(upserted) == 1
+    assert upserted[0]["dalton_notify_target_labels"] == {
+        "feishu:user:ou_new_user": "张分析师"
+    }
+    assert lock_spy.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_dalton_notify_settings_test_sends_only_to_routed_targets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.dalton.access_tiers as access_tiers_mod
+    import src.dalton.tools.notify_tools as notify_tools_mod
+    from src.dalton.tools.notify_tools import create_notify_tools
+    from src.server.database import automation as auto_db
+
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(get_user_tier, return_value="internal"),
+    )
+    monkeypatch.setattr(
+        auto_db,
+        "list_all_automations",
+        create_autospec(
+            auto_db.list_all_automations,
+            return_value=[{"automation_id": "a-1", "name": "dalton-nvda-earn-2026q1-t0"}],
+        ),
+    )
+    # User has 2 personal targets and 2 discovered groups, but the automation route
+    # only includes ou_a and oc_g1.
+    personal_list = ["feishu:user:ou_a", "feishu:user:ou_b"]
+    labels_map = {"feishu:user:ou_a": "分析师A", "feishu:user:ou_b": "分析师B"}
+    routes_map = {
+        "dalton-nvda-earn-2026q1-t0": ["feishu:user:ou_a", "feishu:chat:oc_g1"]
+    }
+    groups_list = [
+        {"chat_id": "oc_g1", "name": "核心群1"},
+        {"chat_id": "oc_g2", "name": "其他群2"},
+    ]
+
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "resolve_dalton_notify_targets",
+        create_autospec(resolve_dalton_notify_targets, return_value=personal_list),
+    )
+    monkeypatch.setattr(
+        model_prefs_mod,
+        "resolve_dalton_notify_targets",
+        create_autospec(resolve_dalton_notify_targets, return_value=personal_list),
+    )
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "resolve_dalton_notify_target_labels",
+        create_autospec(resolve_dalton_notify_target_labels, return_value=labels_map),
+    )
+    monkeypatch.setattr(
+        model_prefs_mod,
+        "resolve_dalton_notify_target_labels",
+        create_autospec(resolve_dalton_notify_target_labels, return_value=labels_map),
+    )
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "resolve_dalton_notify_routes",
+        create_autospec(resolve_dalton_notify_routes, return_value=routes_map),
+    )
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "discover_feishu_notify_groups",
+        create_autospec(
+            groups_mod.discover_feishu_notify_groups, return_value=groups_list
+        ),
+    )
+    monkeypatch.setattr(
+        groups_mod,
+        "discover_feishu_notify_groups",
+        create_autospec(
+            groups_mod.discover_feishu_notify_groups, return_value=groups_list
+        ),
+    )
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "hitl_confirm",
+        create_autospec(
+            notify_tools_mod.hitl_confirm, side_effect=_approve_hitl_confirm
+        ),
+    )
+
+    sent_targets: list[str] = []
+
+    async def _fake_bridge_post(
+        targets: list[str], text: str, card: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        _ = (text, card)
+        sent_targets.extend(targets)
+        return {"ok": True, "results": [{"target": t, "ok": True} for t in targets]}
+
+    monkeypatch.setattr(
+        dispatch_mod,
+        "post_bridge_notify",
+        create_autospec(post_bridge_notify, side_effect=_fake_bridge_post),
+    )
+
+    tool = create_notify_tools()[0]
+    cmd = await tool.ainvoke(
+        _notify_tool_call(
+            {"action": "test", "automation": "dalton-nvda-earn-2026q1-t0"}
+        ),
+        config={"configurable": {"user_id": "u-internal"}},
+    )
+    payload = json.loads(cmd.update["messages"][0].content)
+    assert payload["success"] is True
+    assert sent_targets == ["feishu:user:ou_a", "feishu:chat:oc_g1"]
+    assert [r["target"] for r in payload["results"]] == [
+        "feishu:user:ou_a",
+        "feishu:chat:oc_g1",
+    ]
+    assert all(r["ok"] is True for r in payload["results"])
+
+
+@pytest.mark.asyncio
+async def test_hitl_confirm_payload_shape_and_decision_approve_reject_for_all_three_actions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 2 #1: real hitl_confirm emits Chinese name/args for the generic tool
+    approval card and handles both approve and reject decisions."""
+    import src.dalton.access_tiers as access_tiers_mod
+    from src.dalton.tools.notify_tools import create_notify_tools
+    from src.server.database import automation as auto_db
+    import src.tools.secretary._commands as commands_mod
+
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(get_user_tier, return_value="internal"),
+    )
+    monkeypatch.setattr(
+        auto_db,
+        "list_all_automations",
+        create_autospec(
+            auto_db.list_all_automations,
+            return_value=[{"automation_id": "a-1", "name": "Morning Macro Digest"}],
+        ),
+    )
+    stored_prefs: dict[str, Any] = {
+        "model_preference": {
+            "dalton_notify_enabled": True,
+            "dalton_notify_targets": ["feishu:user:ou_zhang"],
+            "dalton_notify_target_labels": {"feishu:user:ou_zhang": "张三"},
+            "dalton_notify_overrides": {},
+            "dalton_notify_routes": {
+                "automation:a-1": ["feishu:chat:oc_market", "feishu:user:ou_zhang"]
+            },
+        },
+        "other_preference": {},
+    }
+    upserted: list[dict[str, Any]] = []
+    _mock_locked_prefs_db(monkeypatch, stored_prefs, upserted)
+
+    discovered_groups = [{"chat_id": "oc_market", "name": "Market Alert"}]
+    import src.dalton.tools.notify_tools as notify_tools_mod
+
+    discover_mock = create_autospec(
+        groups_mod.discover_feishu_notify_groups,
+        return_value=discovered_groups,
+    )
+    monkeypatch.setattr(groups_mod, "discover_feishu_notify_groups", discover_mock)
+    monkeypatch.setattr(notify_tools_mod, "discover_feishu_notify_groups", discover_mock)
+    monkeypatch.setattr(
+        dispatch_mod,
+        "post_bridge_notify",
+        create_autospec(
+            post_bridge_notify,
+            return_value={
+                "ok": True,
+                "results": [
+                    {"target": "feishu:chat:oc_market", "ok": True},
+                    {"target": "feishu:user:ou_zhang", "ok": True},
+                ],
+            },
+        ),
+    )
+
+    tool = create_notify_tools()[0]
+    cfg = {"configurable": {"user_id": "u-internal"}}
+
+    captured_payloads: list[dict[str, Any]] = []
+    real_interrupt = commands_mod.interrupt
+
+    def _interrupt_reject(payload: dict[str, Any]) -> dict[str, Any]:
+        captured_payloads.append(payload)
+        return {"decisions": [{"type": "reject", "message": "暂不执行"}]}
+
+    monkeypatch.setattr(
+        commands_mod,
+        "interrupt",
+        create_autospec(real_interrupt, side_effect=_interrupt_reject),
+    )
+
+    # Reject all 3 actions via the real hitl_confirm
+    for call_args in (
+        {
+            "action": "set_route",
+            "automation": "Morning Macro Digest",
+            "targets": ["Market Alert", "张三"],
+        },
+        {
+            "action": "add_personal_target",
+            "target": "feishu:user:ou_lisi",
+            "label": "李四",
+        },
+        {
+            "action": "test",
+            "automation": "Morning Macro Digest",
+        },
+    ):
+        cmd_rej = await tool.ainvoke(_notify_tool_call(call_args), config=cfg)
+        assert "取消" in cmd_rej.update["messages"][0].content
+
+    assert len(captured_payloads) == 3
+    req_set = captured_payloads[0]["action_requests"][0]
+    assert req_set["type"] == "dalton_notify_set_route"
+    assert req_set["name"] == "设置定时任务推送"
+    assert isinstance(req_set.get("confirm_token"), str) and len(req_set["confirm_token"]) == 64
+    assert req_set["args"] == {
+        "任务": "Morning Macro Digest",
+        "推送到": [
+            "Market Alert（群，oc_market）",
+            "张三（个人，feishu:user:ou_zhang）",
+        ],
+    }
+
+    req_add = captured_payloads[1]["action_requests"][0]
+    assert req_add["type"] == "dalton_notify_add_personal_target"
+    assert req_add["name"] == "添加个人推送目标"
+    assert isinstance(req_add.get("confirm_token"), str) and len(req_add["confirm_token"]) == 64
+    assert req_add["args"] == {"目标": "feishu:user:ou_lisi", "名称": "李四"}
+
+    req_test = captured_payloads[2]["action_requests"][0]
+    assert req_test["type"] == "dalton_notify_test"
+    assert req_test["name"] == "发送测试推送"
+    assert isinstance(req_test.get("confirm_token"), str) and len(req_test["confirm_token"]) == 64
+    assert req_test["args"] == {
+        "任务": "Morning Macro Digest",
+        "推送到": [
+            "张三（个人，feishu:user:ou_zhang）",
+            "Market Alert（群，oc_market）",
+        ],
+    }
+    assert upserted == []
+
+    # Approve all 3 actions via the real hitl_confirm (echoing back confirm_token)
+    def _interrupt_approve(payload: dict[str, Any]) -> dict[str, Any]:
+        captured_payloads.append(payload)
+        token = payload["action_requests"][0].get("confirm_token")
+        return {"decisions": [{"type": "approve", "confirm_token": token}]}
+
+    monkeypatch.setattr(
+        commands_mod,
+        "interrupt",
+        create_autospec(real_interrupt, side_effect=_interrupt_approve),
+    )
+    for call_args in (
+        {
+            "action": "set_route",
+            "automation": "Morning Macro Digest",
+            "targets": ["Market Alert", "张三"],
+        },
+        {
+            "action": "add_personal_target",
+            "target": "feishu:user:ou_lisi",
+            "label": "李四",
+        },
+        {
+            "action": "test",
+            "automation": "Morning Macro Digest",
+        },
+    ):
+        cmd_ok = await tool.ainvoke(_notify_tool_call(call_args), config=cfg)
+        res_ok = json.loads(cmd_ok.update["messages"][0].content)
+        assert res_ok["success"] is True
+
+
+@pytest.mark.asyncio
+async def test_custom_automation_with_group_route_pushes_on_settled_and_unrouted_does_not_push() -> None:
+    """Round 2 #2: a custom automation configured with an explicit route pushes on
+    settlement (category='custom', label_zh='定时任务', scope=<name>); an unrouted
+    custom automation does not push."""
+    custom_auto = {
+        "automation_id": "a-custom-1",
+        "name": "Morning Macro Digest",
+        "user_id": "u-pm",
+    }
+    personal = ["feishu:user:ou_pm"]
+    verdict_fn = create_autospec(get_verdict_for_execution, return_value=None)
+    url_fn = create_autospec(
+        get_dalton_frontend_url, return_value="https://dalton.example.com"
+    )
+    claim_fn = create_autospec(claim_target_delivery, return_value=True)
+    mark_fn = create_autospec(mark_target_delivery, return_value=None)
+    admin_fn = create_autospec(resolve_dalton_notify_enabled, return_value=True)
+
+    posted_batches: list[tuple[list[str], str, dict[str, Any] | None]] = []
+
+    async def _fake_post(
+        send_targets: list[str], text: str, card: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        posted_batches.append((list(send_targets), text, card))
+        return {"ok": True, "results": [{"target": t, "ok": True} for t in send_targets]}
+
+    post_fn = create_autospec(post_bridge_notify, side_effect=_fake_post)
+
+    # 1. Unrouted custom automation -> does not push even when user has personal targets
+    fns_unrouted = _route_test_fns(targets=personal, routes={})
+    pushed_unrouted = await on_automation_settled(
+        automation=custom_auto,
+        execution_id="exec-custom-unrouted",
+        thread_id="th-custom-1",
+        final_text="今日宏观早报：美债收益率回落，科技股情绪回暖。",
+        resolve_enabled_fn=fns_unrouted[0],
+        resolve_overrides_fn=fns_unrouted[1],
+        resolve_targets_fn=fns_unrouted[2],
+        resolve_routes_fn=fns_unrouted[3],
+        is_admin_fn=admin_fn,
+        get_verdict_fn=verdict_fn,
+        claim_target_fn=claim_fn,
+        mark_target_fn=mark_fn,
+        post_notify_fn=post_fn,
+        frontend_url_fn=url_fn,
+    )
+    assert pushed_unrouted is False
+    assert posted_batches == []
+
+    # 2. Custom automation routed to a Feishu group -> pushes on completion
+    fns_routed = _route_test_fns(
+        targets=personal,
+        routes={"automation:a-custom-1": ["feishu:chat:oc_macro_group"]},
+    )
+    pushed_routed = await on_automation_settled(
+        automation=custom_auto,
+        execution_id="exec-custom-routed",
+        thread_id="th-custom-2",
+        final_text="今日宏观早报：美债收益率回落，科技股情绪回暖。",
+        resolve_enabled_fn=fns_routed[0],
+        resolve_overrides_fn=fns_routed[1],
+        resolve_targets_fn=fns_routed[2],
+        resolve_routes_fn=fns_routed[3],
+        is_admin_fn=admin_fn,
+        get_verdict_fn=verdict_fn,
+        claim_target_fn=claim_fn,
+        mark_target_fn=mark_fn,
+        post_notify_fn=post_fn,
+        frontend_url_fn=url_fn,
+    )
+    assert pushed_routed is True
+    assert len(posted_batches) == 1
+    sent_targets, sent_text, sent_card = posted_batches[0]
+    assert sent_targets == ["feishu:chat:oc_macro_group"]
+    assert "Morning Macro Digest · 定时任务" in sent_text
+    assert sent_card is not None
+    assert "Morning Macro Digest · 定时任务" in sent_card["header"]["title"]["content"]
+    assert (
+        sent_card["header"]["text_tag_list"][0]["text"]["content"] == "定时任务"
+    )
+
+
+@pytest.mark.asyncio
+async def test_set_route_rejects_excluded_automations_and_test_requires_explicit_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 2 #2: excluded tasks (watch/delta/director-daily/data-health) are
+    rejected by set_route with a reason; test without an explicit route refuses
+    to send and asks the user to configure via set_route first."""
+    import src.dalton.access_tiers as access_tiers_mod
+    import src.dalton.tools.notify_tools as notify_tools_mod
+    from src.dalton.tools.notify_tools import create_notify_tools
+    from src.server.database import automation as auto_db
+
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(get_user_tier, return_value="internal"),
+    )
+    monkeypatch.setattr(
+        auto_db,
+        "list_all_automations",
+        create_autospec(
+            auto_db.list_all_automations,
+            return_value=[
+                {"automation_id": "a-w", "name": "dalton-nvda-watch"},
+                {"automation_id": "a-d", "name": "dalton-nvda-delta"},
+                {"automation_id": "a-dd", "name": "dalton-director-daily"},
+                {"automation_id": "a-dh", "name": "dalton-data-health"},
+                {"automation_id": "a-c", "name": "Morning Macro Digest"},
+            ],
+        ),
+    )
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "resolve_dalton_notify_targets",
+        create_autospec(
+            resolve_dalton_notify_targets, return_value=["feishu:user:ou_me"]
+        ),
+    )
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "resolve_dalton_notify_target_labels",
+        create_autospec(
+            resolve_dalton_notify_target_labels,
+            return_value={"feishu:user:ou_me": "我本人"},
+        ),
+    )
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "resolve_dalton_notify_routes",
+        create_autospec(resolve_dalton_notify_routes, return_value={}),
+    )
+    confirm_spy = create_autospec(
+        notify_tools_mod.hitl_confirm,
+        side_effect=AssertionError("hitl_confirm must not be called"),
+    )
+    monkeypatch.setattr(notify_tools_mod, "hitl_confirm", confirm_spy)
+    post_spy = create_autospec(
+        post_bridge_notify,
+        side_effect=AssertionError("post_bridge_notify must not be called"),
+    )
+    monkeypatch.setattr(dispatch_mod, "post_bridge_notify", post_spy)
+
+    tool = create_notify_tools()[0]
+    cfg = {"configurable": {"user_id": "u-internal"}}
+
+    for excluded_name in (
+        "dalton-nvda-watch",
+        "dalton-nvda-delta",
+        "dalton-director-daily",
+        "dalton-data-health",
+    ):
+        cmd_ex = await tool.ainvoke(
+            _notify_tool_call(
+                {
+                    "action": "set_route",
+                    "automation": excluded_name,
+                    "targets": ["我本人"],
+                }
+            ),
+            config=cfg,
+        )
+        res_ex = json.loads(cmd_ex.update["messages"][0].content)
+        assert res_ex["success"] is False
+        assert "是系统后台内部任务，不支持设置推送目标" in res_ex["error"]
+
+    # test action on a task without an explicit route refuses without sending
+    cmd_test_unrouted = await tool.ainvoke(
+        _notify_tool_call({"action": "test", "automation": "Morning Macro Digest"}),
+        config=cfg,
+    )
+    res_test_unrouted = json.loads(cmd_test_unrouted.update["messages"][0].content)
+    assert res_test_unrouted["success"] is False
+    assert (
+        res_test_unrouted["error"]
+        == "该任务尚未单独设置推送目标（或当前已设为不推送），请先设置定时任务推送（action='set_route'）后再发送测试推送"
+    )
+    confirm_spy.assert_not_called()
+    post_spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_set_route_concurrent_modification_preserves_other_task_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 2 #3: if another task's route is modified while set_route is waiting
+    for confirmation, set_route only submits the single modified task key so the
+    other task's new route is preserved."""
+    import src.dalton.access_tiers as access_tiers_mod
+    import src.dalton.tools.notify_tools as notify_tools_mod
+    from src.dalton.tools.notify_tools import create_notify_tools
+    from src.server.database import automation as auto_db
+
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(get_user_tier, return_value="internal"),
+    )
+    monkeypatch.setattr(
+        auto_db,
+        "list_all_automations",
+        create_autospec(
+            auto_db.list_all_automations,
+            return_value=[
+                {"automation_id": "a-1", "name": "dalton-nvda-earn-2026q1-t0"},
+                {"automation_id": "a-2", "name": "Morning Macro Digest"},
+            ],
+        ),
+    )
+    stored_prefs: dict[str, Any] = {
+        "model_preference": {
+            "dalton_notify_enabled": True,
+            "dalton_notify_targets": ["feishu:user:ou_me_1"],
+            "dalton_notify_target_labels": {"feishu:user:ou_me_1": "我本人"},
+            "dalton_notify_overrides": {"Morning Macro Digest": False},
+            "dalton_notify_routes": {"Morning Macro Digest": []},
+        },
+        "other_preference": {},
+    }
+    upserted_patches: list[dict[str, Any]] = []
+    _mock_locked_prefs_db(monkeypatch, stored_prefs, upserted_patches)
+
+    discovered_groups = [{"chat_id": "oc_g1", "name": "半导体投研群"}]
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "discover_feishu_notify_groups",
+        create_autospec(
+            groups_mod.discover_feishu_notify_groups,
+            return_value=discovered_groups,
+        ),
+    )
+    monkeypatch.setattr(
+        groups_mod,
+        "discover_feishu_notify_groups",
+        create_autospec(
+            groups_mod.discover_feishu_notify_groups,
+            return_value=discovered_groups,
+        ),
+    )
+
+    def _confirm_with_concurrent_route_edit(
+        action_type: str, payload: dict[str, Any]
+    ) -> tuple[bool, dict[str, Any]]:
+        _ = action_type
+        # Another writer updates Morning Macro Digest while this tool call is paused on HITL.
+        stored_prefs["model_preference"]["dalton_notify_routes"][
+            "Morning Macro Digest"
+        ] = ["feishu:chat:oc_g1"]
+        stored_prefs["model_preference"]["dalton_notify_overrides"][
+            "Morning Macro Digest"
+        ] = True
+        return (
+            True,
+            {
+                "decisions": [
+                    {
+                        "type": "approve",
+                        "confirm_token": payload.get("confirm_token"),
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "hitl_confirm",
+        create_autospec(
+            notify_tools_mod.hitl_confirm,
+            side_effect=_confirm_with_concurrent_route_edit,
+        ),
+    )
+
+    tool = create_notify_tools()[0]
+    cmd = await tool.ainvoke(
+        _notify_tool_call(
+            {
+                "action": "set_route",
+                "automation": "dalton-nvda-earn-2026q1-t0",
+                "targets": ["我本人"],
+            }
+        ),
+        config={"configurable": {"user_id": "u-internal"}},
+    )
+    res = json.loads(cmd.update["messages"][0].content)
+    assert res["success"] is True
+
+    # Only the single modified task key was submitted in the patch:
+    assert len(upserted_patches) == 1
+    assert upserted_patches[0] == {
+        "dalton_notify_routes": {
+            "dalton-nvda-earn-2026q1-t0": ["feishu:user:ou_me_1"]
+        },
+        "dalton_notify_overrides": {
+            "dalton-nvda-earn-2026q1-t0": True
+        },
+    }
+    # Deep merge preserved the concurrent change to Morning Macro Digest:
+    assert stored_prefs["model_preference"]["dalton_notify_routes"] == {
+        "Morning Macro Digest": ["feishu:chat:oc_g1"],
+        "dalton-nvda-earn-2026q1-t0": ["feishu:user:ou_me_1"],
+    }
+    assert stored_prefs["model_preference"]["dalton_notify_overrides"] == {
+        "Morning Macro Digest": True,
+        "dalton-nvda-earn-2026q1-t0": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_add_personal_target_consecutive_adds_under_lock_keep_both_targets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 2 #3: two consecutive/concurrent add_personal_target calls re-read
+    under lock_user_preferences in the same transaction so both targets survive."""
+    import src.dalton.access_tiers as access_tiers_mod
+    import src.dalton.tools.notify_tools as notify_tools_mod
+    from src.dalton.tools.notify_tools import create_notify_tools
+
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(get_user_tier, return_value="internal"),
+    )
+    stored_prefs: dict[str, Any] = {
+        "model_preference": {
+            "dalton_notify_targets": ["feishu:user:ou_base"],
+            "dalton_notify_target_labels": {"feishu:user:ou_base": "基准用户"},
+        },
+        "other_preference": {},
+    }
+    upserted: list[dict[str, Any]] = []
+    lock_spy = _mock_locked_prefs_db(monkeypatch, stored_prefs, upserted)
+
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "hitl_confirm",
+        create_autospec(
+            notify_tools_mod.hitl_confirm, side_effect=_approve_hitl_confirm
+        ),
+    )
+
+    tool = create_notify_tools()[0]
+    cfg = {"configurable": {"user_id": "u-internal"}}
+
+    cmd1 = await tool.ainvoke(
+        _notify_tool_call(
+            {
+                "action": "add_personal_target",
+                "target": "feishu:user:ou_first",
+                "label": "第一位",
+            }
+        ),
+        config=cfg,
+    )
+    res1 = json.loads(cmd1.update["messages"][0].content)
+    assert res1["success"] is True
+
+    cmd2 = await tool.ainvoke(
+        _notify_tool_call(
+            {
+                "action": "add_personal_target",
+                "target": "feishu:user:ou_second",
+                "label": "第二位",
+            }
+        ),
+        config=cfg,
+    )
+    res2 = json.loads(cmd2.update["messages"][0].content)
+    assert res2["success"] is True
+    assert lock_spy.await_count == 2
+    assert res2["personal_targets"] == [
+        "feishu:user:ou_base",
+        "feishu:user:ou_first",
+        "feishu:user:ou_second",
+    ]
+    assert stored_prefs["model_preference"]["dalton_notify_targets"] == [
+        "feishu:user:ou_base",
+        "feishu:user:ou_first",
+        "feishu:user:ou_second",
+    ]
+    assert stored_prefs["model_preference"]["dalton_notify_target_labels"] == {
+        "feishu:user:ou_base": "基准用户",
+        "feishu:user:ou_first": "第一位",
+        "feishu:user:ou_second": "第二位",
+    }
+
+
+@pytest.mark.asyncio
+async def test_custom_automation_routes_and_switches_keyed_by_id_same_name_and_case_isolated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 3 #1: custom automations store route and override keys under
+    automation:<automation_id>; ambiguous name on set_route refuses and lists
+    candidates (name, automation_id, created_at); two same-named custom tasks
+    and two tasks differing only by case do not affect each other."""
+    import src.dalton.access_tiers as access_tiers_mod
+    import src.dalton.tools.notify_tools as notify_tools_mod
+    from src.dalton.tools.notify_tools import create_notify_tools
+    from src.server.database import automation as auto_db
+
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(get_user_tier, return_value="internal"),
+    )
+    user_automations = [
+        {
+            "automation_id": "auto-dup-1",
+            "name": "Morning Macro Digest",
+            "created_at": "2026-11-01T08:00:00Z",
+            "user_id": "u-internal",
+        },
+        {
+            "automation_id": "auto-dup-2",
+            "name": "Morning Macro Digest",
+            "created_at": "2026-11-02T09:30:00Z",
+            "user_id": "u-internal",
+        },
+        {
+            "automation_id": "auto-case-upper",
+            "name": "Macro Digest",
+            "created_at": "2026-11-03T10:00:00Z",
+            "user_id": "u-internal",
+        },
+        {
+            "automation_id": "auto-case-lower",
+            "name": "macro digest",
+            "created_at": "2026-11-04T11:00:00Z",
+            "user_id": "u-internal",
+        },
+    ]
+    monkeypatch.setattr(
+        auto_db,
+        "list_all_automations",
+        create_autospec(auto_db.list_all_automations, return_value=user_automations),
+    )
+
+    stored_prefs: dict[str, Any] = {
+        "model_preference": {
+            "dalton_notify_enabled": True,
+            "dalton_notify_targets": ["feishu:user:ou_me_1"],
+            "dalton_notify_target_labels": {"feishu:user:ou_me_1": "我本人"},
+            # Legacy lowercase "False" override and name-keyed route must NOT suppress or cross-pollinate custom tasks.
+            "dalton_notify_overrides": {
+                "macro digest": False,
+                "Morning Macro Digest": False,
+            },
+            "dalton_notify_routes": {},
+        },
+        "other_preference": {},
+    }
+    upserted: list[dict[str, Any]] = []
+    _mock_locked_prefs_db(monkeypatch, stored_prefs, upserted)
+
+    discovered_groups = [
+        {"chat_id": "oc_g1", "name": "宏观投研群"},
+        {"chat_id": "oc_g2", "name": "策略复盘群"},
+    ]
+    discover_mock = create_autospec(
+        groups_mod.discover_feishu_notify_groups,
+        return_value=discovered_groups,
+    )
+    monkeypatch.setattr(groups_mod, "discover_feishu_notify_groups", discover_mock)
+    monkeypatch.setattr(notify_tools_mod, "discover_feishu_notify_groups", discover_mock)
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "hitl_confirm",
+        create_autospec(
+            notify_tools_mod.hitl_confirm, side_effect=_approve_hitl_confirm
+        ),
+    )
+
+    tool = create_notify_tools()[0]
+    cfg = {"configurable": {"user_id": "u-internal"}}
+
+    # 1. Ambiguous name on set_route -> refuses without writing and lists candidate name, automation_id, created_at
+    cmd_ambig = await tool.ainvoke(
+        _notify_tool_call(
+            {
+                "action": "set_route",
+                "automation": "Morning Macro Digest",
+                "targets": ["宏观投研群"],
+            },
+            call_id="call_ambig_1",
+        ),
+        config=cfg,
+    )
+    res_ambig = json.loads(cmd_ambig.update["messages"][0].content)
+    assert res_ambig["success"] is False
+    assert "匹配到多个同名任务，请指定任务 ID（automation_id）" in res_ambig["error"]
+    assert res_ambig["candidates"] == [
+        {
+            "name": "Morning Macro Digest",
+            "automation_id": "auto-dup-1",
+            "created_at": "2026-11-01T08:00:00Z",
+        },
+        {
+            "name": "Morning Macro Digest",
+            "automation_id": "auto-dup-2",
+            "created_at": "2026-11-02T09:30:00Z",
+        },
+    ]
+    assert upserted == []
+
+    # 2. Configure only auto-dup-1 by automation_id -> stores under automation:auto-dup-1
+    cmd_dup1 = await tool.ainvoke(
+        _notify_tool_call(
+            {
+                "action": "set_route",
+                "automation": "auto-dup-1",
+                "targets": ["宏观投研群"],
+            },
+            call_id="call_dup1_set",
+        ),
+        config=cfg,
+    )
+    res_dup1 = json.loads(cmd_dup1.update["messages"][0].content)
+    assert res_dup1["success"] is True
+    assert res_dup1["automation_id"] == "auto-dup-1"
+    assert res_dup1["route_key"] == "automation:auto-dup-1"
+    assert stored_prefs["model_preference"]["dalton_notify_routes"] == {
+        "automation:auto-dup-1": ["feishu:chat:oc_g1"],
+    }
+    assert (
+        stored_prefs["model_preference"]["dalton_notify_overrides"][
+            "automation:auto-dup-1"
+        ]
+        is True
+    )
+
+    # 3. Settlement of auto-dup-1 pushes; settlement of same-named auto-dup-2 does NOT push
+    verdict_fn = create_autospec(get_verdict_for_execution, return_value=None)
+    url_fn = create_autospec(
+        get_dalton_frontend_url, return_value="https://dalton.example.com"
+    )
+    claim_fn = create_autospec(claim_target_delivery, return_value=True)
+    mark_fn = create_autospec(mark_target_delivery, return_value=None)
+    admin_fn = create_autospec(resolve_dalton_notify_enabled, return_value=True)
+    posted_targets: list[list[str]] = []
+
+    async def _fake_post(
+        send_targets: list[str], text: str, card: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        _ = (text, card)
+        posted_targets.append(list(send_targets))
+        return {"ok": True, "results": [{"target": t, "ok": True} for t in send_targets]}
+
+    post_fn = create_autospec(post_bridge_notify, side_effect=_fake_post)
+
+    routes_now = dict(stored_prefs["model_preference"]["dalton_notify_routes"])
+    overrides_now = dict(stored_prefs["model_preference"]["dalton_notify_overrides"])
+    enabled_fn = create_autospec(resolve_dalton_notify_enabled, return_value=True)
+    overrides_fn = create_autospec(
+        resolve_dalton_notify_overrides, return_value=overrides_now
+    )
+    targets_fn = create_autospec(
+        resolve_dalton_notify_targets, return_value=["feishu:user:ou_me_1"]
+    )
+    routes_fn = create_autospec(resolve_dalton_notify_routes, return_value=routes_now)
+
+    pushed_1 = await on_automation_settled(
+        automation=user_automations[0],
+        execution_id="exec-dup-1",
+        thread_id="th-dup-1",
+        final_text="早报任务 1 完成。",
+        resolve_enabled_fn=enabled_fn,
+        resolve_overrides_fn=overrides_fn,
+        resolve_targets_fn=targets_fn,
+        resolve_routes_fn=routes_fn,
+        is_admin_fn=admin_fn,
+        get_verdict_fn=verdict_fn,
+        claim_target_fn=claim_fn,
+        mark_target_fn=mark_fn,
+        post_notify_fn=post_fn,
+        frontend_url_fn=url_fn,
+    )
+    assert pushed_1 is True
+    assert posted_targets == [["feishu:chat:oc_g1"]]
+
+    pushed_2 = await on_automation_settled(
+        automation=user_automations[1],
+        execution_id="exec-dup-2",
+        thread_id="th-dup-2",
+        final_text="同名早报任务 2 完成。",
+        resolve_enabled_fn=enabled_fn,
+        resolve_overrides_fn=overrides_fn,
+        resolve_targets_fn=targets_fn,
+        resolve_routes_fn=routes_fn,
+        is_admin_fn=admin_fn,
+        get_verdict_fn=verdict_fn,
+        claim_target_fn=claim_fn,
+        mark_target_fn=mark_fn,
+        post_notify_fn=post_fn,
+        frontend_url_fn=url_fn,
+    )
+    assert pushed_2 is False
+    assert posted_targets == [["feishu:chat:oc_g1"]]
+
+    # 4. Two tasks differing only by case ("Macro Digest" vs "macro digest"):
+    #    Configure "Macro Digest" by exact name -> matches only auto-case-upper,
+    #    writes automation:auto-case-upper, and is NOT suppressed by legacy "macro digest": False.
+    cmd_upper = await tool.ainvoke(
+        _notify_tool_call(
+            {
+                "action": "set_route",
+                "automation": "Macro Digest",
+                "targets": ["策略复盘群"],
+            },
+            call_id="call_upper_set",
+        ),
+        config=cfg,
+    )
+    res_upper = json.loads(cmd_upper.update["messages"][0].content)
+    assert res_upper["success"] is True
+    assert res_upper["automation_id"] == "auto-case-upper"
+    assert res_upper["route_key"] == "automation:auto-case-upper"
+
+    routes_case = dict(stored_prefs["model_preference"]["dalton_notify_routes"])
+    overrides_case = dict(stored_prefs["model_preference"]["dalton_notify_overrides"])
+    routes_case_fn = create_autospec(
+        resolve_dalton_notify_routes, return_value=routes_case
+    )
+    overrides_case_fn = create_autospec(
+        resolve_dalton_notify_overrides, return_value=overrides_case
+    )
+
+    posted_targets.clear()
+    pushed_upper = await on_automation_settled(
+        automation=user_automations[2],
+        execution_id="exec-case-upper",
+        thread_id="th-case-upper",
+        final_text="Macro Digest 大写任务完成。",
+        resolve_enabled_fn=enabled_fn,
+        resolve_overrides_fn=overrides_case_fn,
+        resolve_targets_fn=targets_fn,
+        resolve_routes_fn=routes_case_fn,
+        is_admin_fn=admin_fn,
+        get_verdict_fn=verdict_fn,
+        claim_target_fn=claim_fn,
+        mark_target_fn=mark_fn,
+        post_notify_fn=post_fn,
+        frontend_url_fn=url_fn,
+    )
+    assert pushed_upper is True
+    assert posted_targets == [["feishu:chat:oc_g2"]]
+
+    pushed_lower = await on_automation_settled(
+        automation=user_automations[3],
+        execution_id="exec-case-lower",
+        thread_id="th-case-lower",
+        final_text="macro digest 小写任务完成。",
+        resolve_enabled_fn=enabled_fn,
+        resolve_overrides_fn=overrides_case_fn,
+        resolve_targets_fn=targets_fn,
+        resolve_routes_fn=routes_case_fn,
+        is_admin_fn=admin_fn,
+        get_verdict_fn=verdict_fn,
+        claim_target_fn=claim_fn,
+        mark_target_fn=mark_fn,
+        post_notify_fn=post_fn,
+        frontend_url_fn=url_fn,
+    )
+    assert pushed_lower is False
+    assert posted_targets == [["feishu:chat:oc_g2"]]
+
+
+@pytest.mark.asyncio
+async def test_hitl_confirm_token_rejects_label_change_route_change_task_recreate_and_missing_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 4 #1: confirmation uses a deterministic SHA-256 confirm_token echoed back
+    by the frontend decision (no Redis snapshot). Re-computing on resume rejects
+    execution if a label target changed, a route changed, the task was renamed and a
+    new task with the same name was created, or confirm_token is missing; unchanged
+    content executes normally and reject does not execute."""
+    import src.dalton.access_tiers as access_tiers_mod
+    import src.dalton.tools.notify_tools as notify_tools_mod
+    from src.dalton.tools.notify_tools import (
+        _compute_confirm_token,
+        create_notify_tools,
+    )
+    from src.server.database import automation as auto_db
+    from src.tools.secretary._commands import hitl_confirm as real_hitl_confirm
+
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(get_user_tier, return_value="internal"),
+    )
+    automations_state: list[dict[str, Any]] = [
+        {"automation_id": "a-snap-1", "name": "Morning Macro Digest"}
+    ]
+    monkeypatch.setattr(
+        auto_db,
+        "list_all_automations",
+        create_autospec(
+            auto_db.list_all_automations,
+            side_effect=lambda _uid: list(automations_state),
+        ),
+    )
+
+    stored_prefs: dict[str, Any] = {
+        "model_preference": {
+            "dalton_notify_enabled": True,
+            "dalton_notify_targets": [
+                "feishu:user:ou_zhang",
+                "feishu:user:ou_imposter",
+            ],
+            "dalton_notify_target_labels": {
+                "feishu:user:ou_zhang": "张三",
+                "feishu:user:ou_imposter": "李四",
+            },
+            "dalton_notify_overrides": {},
+            "dalton_notify_routes": {
+                "automation:a-snap-1": ["feishu:chat:oc_g1"],
+            },
+        },
+        "other_preference": {},
+    }
+    upserted: list[dict[str, Any]] = []
+    _mock_locked_prefs_db(monkeypatch, stored_prefs, upserted)
+
+    discovered_groups = [
+        {"chat_id": "oc_g1", "name": "核心群1"},
+        {"chat_id": "oc_g2", "name": "其他群2"},
+    ]
+    discover_mock = create_autospec(
+        groups_mod.discover_feishu_notify_groups,
+        return_value=discovered_groups,
+    )
+    monkeypatch.setattr(groups_mod, "discover_feishu_notify_groups", discover_mock)
+    monkeypatch.setattr(notify_tools_mod, "discover_feishu_notify_groups", discover_mock)
+
+    sent_targets: list[str] = []
+
+    async def _fake_bridge_post(
+        targets: list[str], text: str, card: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        _ = (text, card)
+        sent_targets.extend(targets)
+        return {"ok": True, "results": [{"target": t, "ok": True} for t in targets]}
+
+    monkeypatch.setattr(
+        dispatch_mod,
+        "post_bridge_notify",
+        create_autospec(post_bridge_notify, side_effect=_fake_bridge_post),
+    )
+
+    tool = create_notify_tools()[0]
+    cfg = {"configurable": {"user_id": "u-internal"}}
+
+    # 1. Waiting for set_route confirmation, label "张三" is reassigned to ou_imposter -> approve refuses write
+    def _confirm_with_label_swap(
+        action_type: str, payload: dict[str, Any]
+    ) -> tuple[bool, dict[str, Any]]:
+        _ = action_type
+        assert payload["args"]["推送到"] == ["张三（个人，feishu:user:ou_zhang）"]
+        expected_tok = _compute_confirm_token(
+            action="set_route",
+            user_id="u-internal",
+            automation_id="a-snap-1",
+            route_key="automation:a-snap-1",
+            targets=["feishu:user:ou_zhang"],
+        )
+        assert payload["confirm_token"] == expected_tok
+        # Reassign "张三" to ou_imposter while waiting for approval
+        stored_prefs["model_preference"]["dalton_notify_target_labels"] = {
+            "feishu:user:ou_zhang": "旧张三",
+            "feishu:user:ou_imposter": "张三",
+        }
+        return (
+            True,
+            {"decisions": [{"type": "approve", "confirm_token": payload["confirm_token"]}]},
+        )
+
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "hitl_confirm",
+        create_autospec(real_hitl_confirm, side_effect=_confirm_with_label_swap),
+    )
+    cmd_label_changed = await tool.ainvoke(
+        _notify_tool_call(
+            {
+                "action": "set_route",
+                "automation": "Morning Macro Digest",
+                "targets": ["张三"],
+            },
+            call_id="call_tok_label",
+        ),
+        config=cfg,
+    )
+    res_label_changed = json.loads(cmd_label_changed.update["messages"][0].content)
+    assert res_label_changed["success"] is False
+    assert (
+        res_label_changed["error"]
+        == "确认期间任务或推送目标发生变化（或确认校验未通过），已取消本次操作。当前状态：任务 Morning Macro Digest（任务 ID：a-snap-1）→ 目标：feishu:user:ou_imposter。如需继续请重新发起。"
+    )
+    assert "原目标" not in res_label_changed["error"]
+    assert "原任务" not in res_label_changed["error"]
+    assert res_label_changed["current_targets"] == ["feishu:user:ou_imposter"]
+    assert "old_targets" not in res_label_changed
+    assert upserted == []
+
+    # 2. Waiting for test confirmation, route is changed from oc_g1 to oc_g2 -> approve refuses send
+    def _confirm_with_route_swap(
+        action_type: str, payload: dict[str, Any]
+    ) -> tuple[bool, dict[str, Any]]:
+        _ = action_type
+        assert payload["args"]["推送到"] == ["核心群1（群，oc_g1）"]
+        stored_prefs["model_preference"]["dalton_notify_routes"][
+            "automation:a-snap-1"
+        ] = ["feishu:chat:oc_g2"]
+        return (
+            True,
+            {"decisions": [{"type": "approve", "confirm_token": payload["confirm_token"]}]},
+        )
+
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "hitl_confirm",
+        create_autospec(real_hitl_confirm, side_effect=_confirm_with_route_swap),
+    )
+    cmd_test_changed = await tool.ainvoke(
+        _notify_tool_call(
+            {
+                "action": "test",
+                "automation": "Morning Macro Digest",
+            },
+            call_id="call_tok_test",
+        ),
+        config=cfg,
+    )
+    res_test_changed = json.loads(cmd_test_changed.update["messages"][0].content)
+    assert res_test_changed["success"] is False
+    assert (
+        res_test_changed["error"]
+        == "确认期间任务或推送目标发生变化（或确认校验未通过），已取消本次操作。当前状态：任务 Morning Macro Digest（任务 ID：a-snap-1）→ 目标：feishu:chat:oc_g2。如需继续请重新发起。"
+    )
+    assert "原目标" not in res_test_changed["error"]
+    assert "原任务" not in res_test_changed["error"]
+    assert res_test_changed["current_targets"] == ["feishu:chat:oc_g2"]
+    assert "old_targets" not in res_test_changed
+    assert sent_targets == []
+
+    # 3. Waiting for set_route confirmation, task is renamed and a new task with the same name is created -> approve refuses write
+    def _confirm_with_task_rename_and_recreate(
+        action_type: str, payload: dict[str, Any]
+    ) -> tuple[bool, dict[str, Any]]:
+        _ = action_type
+        assert payload["automation_id"] == "a-snap-1"
+        automations_state[:] = [
+            {"automation_id": "a-snap-1", "name": "Archived Macro Digest"},
+            {"automation_id": "a-snap-2", "name": "Morning Macro Digest"},
+        ]
+        return (
+            True,
+            {"decisions": [{"type": "approve", "confirm_token": payload["confirm_token"]}]},
+        )
+
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "hitl_confirm",
+        create_autospec(
+            real_hitl_confirm, side_effect=_confirm_with_task_rename_and_recreate
+        ),
+    )
+    cmd_task_recreated = await tool.ainvoke(
+        _notify_tool_call(
+            {
+                "action": "set_route",
+                "automation": "Morning Macro Digest",
+                "targets": ["核心群1"],
+            },
+            call_id="call_tok_task_recreate",
+        ),
+        config=cfg,
+    )
+    res_task_recreated = json.loads(cmd_task_recreated.update["messages"][0].content)
+    assert res_task_recreated["success"] is False
+    assert (
+        res_task_recreated["error"]
+        == "确认期间任务或推送目标发生变化（或确认校验未通过），已取消本次操作。当前状态：任务 Morning Macro Digest（任务 ID：a-snap-2）→ 目标：feishu:chat:oc_g1。如需继续请重新发起。"
+    )
+    assert "原任务" not in res_task_recreated["error"]
+    assert "原目标" not in res_task_recreated["error"]
+    assert res_task_recreated["current_automation"]["automation_id"] == "a-snap-2"
+    assert "old_automation" not in res_task_recreated
+    assert upserted == []
+
+    # Reset automations_state back to a-snap-1
+    automations_state[:] = [
+        {"automation_id": "a-snap-1", "name": "Morning Macro Digest"}
+    ]
+
+    # 4. Missing confirm_token in approve decision -> refuses execution for set_route, add_personal_target, and test
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "hitl_confirm",
+        create_autospec(
+            real_hitl_confirm,
+            return_value=(True, {"decisions": [{"type": "approve"}]}),
+        ),
+    )
+    for missing_tok_args in (
+        {
+            "action": "set_route",
+            "automation": "Morning Macro Digest",
+            "targets": ["核心群1"],
+        },
+        {
+            "action": "add_personal_target",
+            "target": "feishu:user:ou_new_person",
+            "label": "王五",
+        },
+        {
+            "action": "test",
+            "automation": "Morning Macro Digest",
+        },
+    ):
+        cmd_missing_tok = await tool.ainvoke(
+            _notify_tool_call(missing_tok_args),
+            config=cfg,
+        )
+        res_missing_tok = json.loads(cmd_missing_tok.update["messages"][0].content)
+        assert res_missing_tok["success"] is False
+        if missing_tok_args["action"] == "add_personal_target":
+            assert (
+                res_missing_tok["error"]
+                == "确认校验未通过，已取消添加个人推送目标，请重新发起。"
+            )
+        else:
+            assert (
+                "确认期间任务或推送目标发生变化（或确认校验未通过），已取消本次操作。"
+                in res_missing_tok["error"]
+            )
+    assert upserted == []
+    assert sent_targets == []
+
+    # 5. Unchanged content with matching confirm_token -> normal execution succeeds
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "hitl_confirm",
+        create_autospec(real_hitl_confirm, side_effect=_approve_hitl_confirm),
+    )
+    cmd_unchanged = await tool.ainvoke(
+        _notify_tool_call(
+            {
+                "action": "set_route",
+                "automation": "Morning Macro Digest",
+                "targets": ["张三", "核心群1"],
+            },
+            call_id="call_tok_ok",
+        ),
+        config=cfg,
+    )
+    res_unchanged = json.loads(cmd_unchanged.update["messages"][0].content)
+    assert res_unchanged["success"] is True
+    assert res_unchanged["targets"] == [
+        "feishu:user:ou_imposter",
+        "feishu:chat:oc_g1",
+    ]
+    assert len(upserted) == 1
+
+    # 6. Reject -> does not execute
+    upserted.clear()
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "hitl_confirm",
+        create_autospec(
+            real_hitl_confirm,
+            return_value=(False, {"decisions": [{"type": "reject"}]}),
+        ),
+    )
+    cmd_rejected = await tool.ainvoke(
+        _notify_tool_call(
+            {
+                "action": "set_route",
+                "automation": "Morning Macro Digest",
+                "targets": ["核心群1"],
+            },
+            call_id="call_tok_reject",
+        ),
+        config=cfg,
+    )
+    assert "取消" in cmd_rejected.update["messages"][0].content
+    assert upserted == []
+
+
+@pytest.mark.asyncio
+async def test_hitl_confirm_rerun_from_top_with_stale_token_reports_only_current_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 5 #3: test the real LangGraph resume behavior where the 1st invocation
+    raises an interrupt at hitl_confirm, state changes while waiting, and the 2nd
+    invocation re-runs the tool from the top carrying the 1st invocation's
+    confirm_token. Asserts no write/send occurs and the error message contains only
+    current content without fabricating 'original' task or targets."""
+    import src.dalton.access_tiers as access_tiers_mod
+    import src.dalton.tools.notify_tools as notify_tools_mod
+    from src.dalton.tools.notify_tools import create_notify_tools
+    from src.server.database import automation as auto_db
+    from src.tools.secretary._commands import hitl_confirm as real_hitl_confirm
+
+    class _PausedForConfirm(Exception):
+        def __init__(self, payload: dict[str, Any]) -> None:
+            super().__init__("paused for HITL confirm")
+            self.payload = payload
+
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(get_user_tier, return_value="internal"),
+    )
+    automations_state: list[dict[str, Any]] = [
+        {"automation_id": "a-rerun-1", "name": "Morning Macro Digest"}
+    ]
+    monkeypatch.setattr(
+        auto_db,
+        "list_all_automations",
+        create_autospec(
+            auto_db.list_all_automations,
+            side_effect=lambda _uid: list(automations_state),
+        ),
+    )
+
+    stored_prefs: dict[str, Any] = {
+        "model_preference": {
+            "dalton_notify_enabled": True,
+            "dalton_notify_targets": [
+                "feishu:user:ou_zhang",
+                "feishu:user:ou_imposter",
+            ],
+            "dalton_notify_target_labels": {
+                "feishu:user:ou_zhang": "张三",
+                "feishu:user:ou_imposter": "李四",
+            },
+            "dalton_notify_overrides": {},
+            "dalton_notify_routes": {
+                "automation:a-rerun-1": ["feishu:chat:oc_g1"],
+            },
+        },
+        "other_preference": {},
+    }
+    upserted: list[dict[str, Any]] = []
+    _mock_locked_prefs_db(monkeypatch, stored_prefs, upserted)
+
+    discovered_groups = [
+        {"chat_id": "oc_g1", "name": "群A"},
+        {"chat_id": "oc_g2", "name": "群B"},
+    ]
+    discover_mock = create_autospec(
+        groups_mod.discover_feishu_notify_groups,
+        return_value=discovered_groups,
+    )
+    monkeypatch.setattr(groups_mod, "discover_feishu_notify_groups", discover_mock)
+    monkeypatch.setattr(notify_tools_mod, "discover_feishu_notify_groups", discover_mock)
+
+    sent_targets: list[str] = []
+
+    async def _fake_bridge_post(
+        targets: list[str], text: str, card: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        _ = (text, card)
+        sent_targets.extend(targets)
+        return {"ok": True, "results": [{"target": t, "ok": True} for t in targets]}
+
+    monkeypatch.setattr(
+        dispatch_mod,
+        "post_bridge_notify",
+        create_autospec(post_bridge_notify, side_effect=_fake_bridge_post),
+    )
+
+    tool = create_notify_tools()[0]
+    cfg = {"configurable": {"user_id": "u-internal"}}
+
+    def _raise_pause(action_type: str, payload: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+        _ = action_type
+        raise _PausedForConfirm(payload)
+
+    # Case A: test action — 1st call pauses on route [oc_g1]; route changes to [oc_g2];
+    # 2nd call re-runs from top carrying 1st call's confirm_token
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "hitl_confirm",
+        create_autospec(real_hitl_confirm, side_effect=_raise_pause),
+    )
+    with pytest.raises(_PausedForConfirm) as paused_test:
+        await tool.ainvoke(
+            _notify_tool_call(
+                {"action": "test", "automation": "Morning Macro Digest"},
+                call_id="call_rerun_test",
+            ),
+            config=cfg,
+        )
+    old_test_token = paused_test.value.payload["confirm_token"]
+    assert paused_test.value.payload["targets"] == ["feishu:chat:oc_g1"]
+
+    # State changes while waiting for confirmation
+    stored_prefs["model_preference"]["dalton_notify_routes"][
+        "automation:a-rerun-1"
+    ] = ["feishu:chat:oc_g2"]
+
+    # 2nd call (resume): re-runs from top and brings back old_test_token
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "hitl_confirm",
+        create_autospec(
+            real_hitl_confirm,
+            return_value=(
+                True,
+                {"decisions": [{"type": "approve", "confirm_token": old_test_token}]},
+            ),
+        ),
+    )
+    cmd_resume_test = await tool.ainvoke(
+        _notify_tool_call(
+            {"action": "test", "automation": "Morning Macro Digest"},
+            call_id="call_rerun_test",
+        ),
+        config=cfg,
+    )
+    res_resume_test = json.loads(cmd_resume_test.update["messages"][0].content)
+    assert res_resume_test["success"] is False
+    assert sent_targets == []
+    assert (
+        res_resume_test["error"]
+        == "确认期间任务或推送目标发生变化（或确认校验未通过），已取消本次操作。当前状态：任务 Morning Macro Digest（任务 ID：a-rerun-1）→ 目标：feishu:chat:oc_g2。如需继续请重新发起。"
+    )
+    assert "原目标" not in res_resume_test["error"]
+    assert "原任务" not in res_resume_test["error"]
+    assert "oc_g1" not in res_resume_test["error"]
+    assert "old_targets" not in res_resume_test
+    assert "old_automation" not in res_resume_test
+    assert res_resume_test["current_targets"] == ["feishu:chat:oc_g2"]
+
+    # Case B: set_route action — 1st call pauses on task a-rerun-1 and label "张三" -> ou_zhang;
+    # while waiting, task is recreated as a-rerun-2 and label "张三" is reassigned to ou_imposter;
+    # 2nd call re-runs from top carrying 1st call's confirm_token
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "hitl_confirm",
+        create_autospec(real_hitl_confirm, side_effect=_raise_pause),
+    )
+    with pytest.raises(_PausedForConfirm) as paused_set:
+        await tool.ainvoke(
+            _notify_tool_call(
+                {
+                    "action": "set_route",
+                    "automation": "Morning Macro Digest",
+                    "targets": ["张三"],
+                },
+                call_id="call_rerun_set",
+            ),
+            config=cfg,
+        )
+    old_set_token = paused_set.value.payload["confirm_token"]
+    assert paused_set.value.payload["automation_id"] == "a-rerun-1"
+    assert paused_set.value.payload["targets"] == ["feishu:user:ou_zhang"]
+
+    # Mutate task and label while waiting
+    automations_state[:] = [
+        {"automation_id": "a-rerun-1", "name": "Archived Macro Digest"},
+        {"automation_id": "a-rerun-2", "name": "Morning Macro Digest"},
+    ]
+    stored_prefs["model_preference"]["dalton_notify_target_labels"] = {
+        "feishu:user:ou_zhang": "旧张三",
+        "feishu:user:ou_imposter": "张三",
+    }
+
+    # 2nd call (resume): re-runs from top and brings back old_set_token
+    monkeypatch.setattr(
+        notify_tools_mod,
+        "hitl_confirm",
+        create_autospec(
+            real_hitl_confirm,
+            return_value=(
+                True,
+                {"decisions": [{"type": "approve", "confirm_token": old_set_token}]},
+            ),
+        ),
+    )
+    cmd_resume_set = await tool.ainvoke(
+        _notify_tool_call(
+            {
+                "action": "set_route",
+                "automation": "Morning Macro Digest",
+                "targets": ["张三"],
+            },
+            call_id="call_rerun_set",
+        ),
+        config=cfg,
+    )
+    res_resume_set = json.loads(cmd_resume_set.update["messages"][0].content)
+    assert res_resume_set["success"] is False
+    assert upserted == []
+    assert (
+        res_resume_set["error"]
+        == "确认期间任务或推送目标发生变化（或确认校验未通过），已取消本次操作。当前状态：任务 Morning Macro Digest（任务 ID：a-rerun-2）→ 目标：feishu:user:ou_imposter。如需继续请重新发起。"
+    )
+    assert "原目标" not in res_resume_set["error"]
+    assert "原任务" not in res_resume_set["error"]
+    assert "a-rerun-1" not in res_resume_set["error"]
+    assert "ou_zhang" not in res_resume_set["error"]
+    assert "old_targets" not in res_resume_set
+    assert "old_automation" not in res_resume_set
+    assert res_resume_set["current_automation"] == {
+        "name": "Morning Macro Digest",
+        "automation_id": "a-rerun-2",
+        "route_key": "automation:a-rerun-2",
+    }
+    assert res_resume_set["current_targets"] == ["feishu:user:ou_imposter"]
+
+
+
+

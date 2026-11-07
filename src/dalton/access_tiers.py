@@ -61,6 +61,27 @@ async def get_user_tier(user_id: str | None) -> UserTier:
     return "external"
 
 
+async def is_internal_or_admin(user_id: str | None) -> bool:
+    """Return True when ``user_id`` resolves to ``admin`` or ``internal`` tier.
+
+    Fails closed to ``external`` (``False``) on missing user_id or any error
+    from ``get_user_tier``.
+    """
+    uid = str(user_id or "").strip()
+    if not uid:
+        return False
+    try:
+        tier = await get_user_tier(uid)
+    except Exception as exc:
+        logger.warning(
+            "is_internal_or_admin tier check failed for user_id=%s (treated as external): %s",
+            uid,
+            type(exc).__name__,
+        )
+        return False
+    return tier in ("admin", "internal")
+
+
 async def classify_owner_tier(owner_id: str | None) -> OwnerTier:
     """Strictly classify a *resource owner* for isolation decisions.
 
