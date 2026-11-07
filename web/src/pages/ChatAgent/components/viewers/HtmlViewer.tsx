@@ -1,14 +1,17 @@
-import { useEffect, useRef } from 'react';
-import { useTranslation } from 'react-i18next';
-import { AlertCircle } from 'lucide-react';
+import React, { useMemo, useRef, useState } from 'react';
 import { useTheme } from '@/contexts/ThemeContext';
-import { Button } from '@/components/ui/button';
-import { Loader } from '@/components/ui/loader';
 import SyntaxHighlighter, { oneDark, oneLight } from '../SyntaxHighlighter';
+import { ComposerDockSlot } from '../chatView/composerDock';
+import { ArtifactFrames, ServeFailed, type HtmlArtifactView } from './html/ArtifactFrames';
+import { BridgedFrame } from './html/BridgedFrame';
+import { useFragmentScroll, useLiveFrame } from './html/liveFrame';
+// DALTON-HOOK(team-sharing): the colleague mirror frame keeps the srcDoc sandbox path
 import { useHtmlSandbox } from './html/useHtmlSandbox';
-import { useServedHtml } from './html/useServedHtml';
 import { SERVED_HTML_SANDBOX } from './html/sandbox';
+import type { PageBridge } from './html/usePageBridge';
 import './HtmlViewer.css';
+
+export type { HtmlArtifactView } from './html/ArtifactFrames';
 
 interface HtmlViewerProps {
   /** Full source (read unlimited so Source isn't truncated). */
@@ -30,6 +33,23 @@ interface HtmlViewerProps {
   anchorSeq?: number | null;
   // DALTON-HOOK(team-sharing): render mirror HTML in sandboxed srcDoc iframe when teamReadOnly
   teamReadOnly?: boolean;
+  /** The owner's comments and versions. */
+  artifact?: HtmlArtifactView | null;
+}
+
+/**
+ * A short fingerprint of the file's bytes as the panel last read them. The
+ * live frame is keyed on it, so the agent's edit, once read, loads the file
+ * again (over the old one, scroll carried) while a remount of the same bytes
+ * keeps the browser's copy.
+ */
+function contentHash(text: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i += 1) {
+    h ^= text.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(36);
 }
 
 export default function HtmlViewer({
@@ -41,81 +61,19 @@ export default function HtmlViewer({
   servePrefix,
   anchor = null,
   anchorSeq = null,
+  // DALTON-HOOK(team-sharing): teamReadOnly keeps the colleague mirror frame
   teamReadOnly = false,
+  artifact = null,
 }: HtmlViewerProps) {
-  const { t } = useTranslation();
   const { theme } = useTheme();
-  const request = anchor ? `${anchorSeq ?? ''}\u0000${anchor}` : null;
-  const iframeRef = useRef<HTMLIFrameElement>(null);
-
-  const { pushTheme, scrollToAnchor } = useHtmlSandbox({ iframeRef, autoHeight: false });
-
-  // The fragment in `src` lands the first open, and any open naming a different
-  // section. It cannot land the same section twice, because that URL is the one
-  // already loaded, so ask the document itself on every request.
-  useEffect(() => {
-    if (anchor) scrollToAnchor(anchor);
-  }, [request, anchor, scrollToAnchor]);
-
-  // DALTON-HOOK(team-sharing): skip owner-only grant in colleague mirror mode; the mirror srcDoc below serves the page
-  const isReadOnlyMirror = teamReadOnly && !servePrefix;
-  const served = useServedHtml(workspaceId, filePath, servePrefix, { teamReadOnly });
-  const servedUrl = served.themedUrl;
-
   const isLight = theme === 'light';
-
-  const renderPreview = () => {
-    if (servedUrl) {
-      // src= loads: the served response's CSP `sandbox` header intersects
-      // with this attribute, and serve.py owns the effective policy and the
-      // link-click rationale (both must carry the popup tokens).
-      return (
-        <iframe
-          ref={iframeRef}
-          src={anchor ? `${servedUrl}#${encodeURIComponent(anchor)}` : servedUrl}
-          sandbox={SERVED_HTML_SANDBOX}
-          className="html-viewer-frame"
-          title={fileName || 'HTML Preview'}
-          onLoad={pushTheme}
-        />
-      );
-    }
-    // DALTON-HOOK(team-sharing): a teammate's HTML previews from the mirror in a sandboxed iframe
-    if (isReadOnlyMirror) {
-      return (
-        <iframe
-          ref={iframeRef}
-          srcDoc={content}
-          sandbox={SERVED_HTML_SANDBOX}
-          className="html-viewer-frame"
-          title={fileName || 'HTML Preview'}
-          onLoad={pushTheme}
-        />
-      );
-    }
-    if (served.error) {
-      return (
-        <div className="flex flex-col items-center justify-center gap-3 py-12 text-sm" role="alert">
-          <span className="flex items-center gap-2" style={{ color: 'var(--color-text-secondary)' }}>
-            <AlertCircle className="h-4 w-4 shrink-0" style={{ color: 'var(--color-icon-danger)' }} />
-            {t('filePanel.htmlPreviewFailed')}
-          </span>
-          <Button variant="outline" size="sm" onClick={served.retry}>
-            {t('common.retry')}
-          </Button>
-        </div>
-      );
-    }
-    return (
-      <div className="flex items-center justify-center py-12">
-        <Loader size={20} className="text-(--color-text-tertiary)" />
-      </div>
-    );
-  };
+  // Handed only to the owner's panel, which decides that once (`PanelAccess`).
+  const owner = !!artifact;
+  const revision = useMemo(() => contentHash(content), [content]);
 
   return (
     <div className="html-viewer">
-      {source ? (
+      {source && (
         <div className="html-viewer-source">
           <SyntaxHighlighter
             language="markup"
@@ -127,7 +85,68 @@ export default function HtmlViewer({
             {content}
           </SyntaxHighlighter>
         </div>
-      ) : renderPreview()}
+      )}
+      {/* The owner's frames stay up under Source, so a draft and the place
+          read are where they were on the way back. */}
+      {owner ? (
+        <div className="html-viewer-stage" data-shown={!source}>
+          <ArtifactFrames
+            revision={revision}
+            fileName={fileName}
+            workspaceId={workspaceId}
+            filePath={filePath}
+            view={artifact}
+            shown={!source}
+            anchor={anchor}
+            anchorSeq={anchorSeq}
+          />
+        </div>
+      ) : !source && (
+        <div className="html-viewer-stage">
+          {teamReadOnly && !servePrefix ? (
+            // DALTON-HOOK(team-sharing): a teammate's HTML previews from the
+            // DB mirror in a sandboxed iframe — no owner file grant exists
+            // for their session, so the served-URL path cannot serve them.
+            <MirrorFrame content={content} fileName={fileName} />
+          ) : (
+            <ViewFrame fileName={fileName} workspaceId={workspaceId} filePath={filePath} servePrefix={servePrefix} anchor={anchor} anchorSeq={anchorSeq} />
+          )}
+        </div>
+      )}
+      {owner && <ComposerDockSlot workspaceId={workspaceId} path={filePath} tabId={artifact.tabId} ui={artifact.ui} active={artifact.active} />}
     </div>
+  );
+}
+
+/** The file as served, read only: a share's view, and a panel that takes no comments. */
+function ViewFrame({ fileName, workspaceId, filePath, servePrefix, anchor, anchorSeq }: {
+  fileName: string;
+  workspaceId: string;
+  filePath: string;
+  servePrefix?: string;
+  anchor: string | null;
+  anchorSeq: number | null;
+}): React.ReactElement {
+  const live = useLiveFrame({ workspaceId, filePath, prefix: servePrefix, inject: 'view', anchor });
+  const [bridge, setBridge] = useState<PageBridge | null>(null);
+  useFragmentScroll(bridge, anchor, anchorSeq);
+  if (live.failed) return <ServeFailed onRetry={live.retry} />;
+  return <BridgedFrame source={live.source} title={fileName || 'HTML Preview'} groundKey={filePath} onBridge={setBridge} />;
+}
+
+// DALTON-HOOK(team-sharing): the mirror frame a colleague's panel shows — the
+// panel's own copy of the file's bytes, sandboxed with no bridge.
+function MirrorFrame({ content, fileName }: { content: string; fileName: string }): React.ReactElement {
+  const iframeRef = useRef<HTMLIFrameElement>(null);
+  const { pushTheme } = useHtmlSandbox({ iframeRef, autoHeight: false });
+  return (
+    <iframe
+      ref={iframeRef}
+      srcDoc={content}
+      sandbox={SERVED_HTML_SANDBOX}
+      className="html-viewer-frame"
+      title={fileName || 'HTML Preview'}
+      onLoad={pushTheme}
+    />
   );
 }

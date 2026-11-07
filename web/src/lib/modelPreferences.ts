@@ -10,7 +10,7 @@
 // DALTON-HOOK(settings-section): zod for the Dalton model_preference keys below
 import * as z from 'zod/mini';
 import type { CustomModelEntry } from '@/components/model/types';
-import type { ModelProfile } from './modelTuning';
+import type { AccountTuning, ModelProfile } from './modelTuning';
 import { HIDDEN_KEY, STARRED_KEY, STARRED_ONLY_KEY, modelList } from './favoriteModels';
 
 export interface PreferencesLike {
@@ -42,10 +42,10 @@ export interface CustomProviderEntry {
  * The stored model bag: catalog, routing, and the account-wide tuning a model
  * inherits when its own profile is silent.
  *
- * Extends `ModelProfile` because the tuning fields are the same settings
+ * Extends `AccountTuning` because the tuning fields are the same settings
  * at the account layer that a profile overrides per model.
  */
-export interface ModelPreferences extends ModelProfile {
+export interface ModelPreferences extends AccountTuning {
   preferred_model?: string | null;
   preferred_background_model?: string | null;
   compaction_model?: string | null;

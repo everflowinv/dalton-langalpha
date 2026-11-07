@@ -103,6 +103,12 @@ STDERR_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         r"\1[REDACTED]",
     ),
     (re.compile(r"(?<![0-9A-Za-z_\-])(sk-ant-[A-Za-z0-9_\-]{8,})(?![0-9A-Za-z_\-])"), "[REDACTED]"),
+    # sync3 B9 (#656): a computer's CLI token (lac1.), the file-mount token's
+    # family (lfs1.) and a personal access token (la_pat_) carry no key name
+    # when they land in a line bare, and their dot/underscore segments each
+    # stay under the generic 40+-char pattern's reach below.
+    (re.compile(r"(?<![0-9A-Za-z])(?:lac1|lfs1)\.[0-9A-Za-z][0-9A-Za-z._\-]{8,}"), "[REDACTED]"),
+    (re.compile(r"(?<![0-9A-Za-z_])la_pat_[0-9A-Za-z\-_]{8,}"), "[REDACTED]"),
     (re.compile(r"(?<![0-9A-Za-z_\-])(sk-[A-Za-z0-9_\-]{8,})(?![0-9A-Za-z_\-])"), "[REDACTED]"),
     (re.compile(r"(?<![0-9A-Za-z_\-])(gsk_[A-Za-z0-9_\-]{8,})(?![0-9A-Za-z_\-])"), "[REDACTED]"),
     (re.compile(r"(?<![0-9A-Za-z_\-])(AIza[0-9A-Za-z_\-]{35})(?![0-9A-Za-z_\-])"), "[REDACTED]"),
@@ -130,6 +136,11 @@ STDERR_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 # prefix visible (it names the route) and lose the token.
 MCP_PATH_RE = re.compile(r"/mcp/[^/\s\"'?&#]+")
 
+# /wsfiles/g/<grant>/... — a file grant (``v1.<workspace>.<exp>.<sig>``) is a
+# bearer credential in the path; its dots keep it out of the generic
+# long-string pattern, so it gets its own rule (sync3 B9 review).
+WSFILES_GRANT_PATH_RE = re.compile(r"/wsfiles/g/[^/\s\"'?&#]+")
+
 # AWS access-key ids and Slack bot/user tokens (fixed-shape, no key name
 # beside them, so the key-value patterns never see them).
 AWS_KEY_ID_RE = re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")
@@ -137,6 +148,7 @@ SLACK_TOKEN_RE = re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{8,}\b")
 
 _EXPORT_EXTRA_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (MCP_PATH_RE, "/mcp/<redacted>"),
+    (WSFILES_GRANT_PATH_RE, "/wsfiles/g/<redacted>"),
     (AWS_KEY_ID_RE, "[REDACTED]"),
     (SLACK_TOKEN_RE, "[REDACTED]"),
 )

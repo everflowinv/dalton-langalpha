@@ -1,4 +1,4 @@
-import type { ProviderModelsData } from '@/components/model/types';
+import type { CustomModelEntry, KeyCandidates, ProviderModelsData, ReasoningDeclaration } from '@/components/model/types';
 import type { ConfiguredProvider } from './useConfiguredProviders';
 import type { PlatformModelsResponse } from '@/types/platform';
 import type { NativeCompactionKind } from './useAllModels';
@@ -154,6 +154,29 @@ export function buildConfiguredSet(
 }
 
 /**
+ * Each coding plan slug the user holds no key under itself whose key one of
+ * their connections holds under another of the plan's slugs (a region of it,
+ * or another protocol), mapped to that connection, as the server's walk finds
+ * it there. A plan's models run on its key whichever of its slugs the key was
+ * saved under, and as far as that key's own list goes; a brand's do not, which
+ * is why only a coding plan's key is read this way.
+ */
+export function planKeyHolders(
+  providers: ConfiguredProvider[],
+  keyCandidates: Readonly<Record<string, KeyCandidates>>,
+): Map<string, ConfiguredProvider> {
+  const held = new Map(providers.filter((p) => p.access_type === 'coding_plan').map((p) => [p.provider, p]));
+  const have = new Set(providers.map((p) => p.provider));
+  const holders = new Map<string, ConfiguredProvider>();
+  for (const [provider, { shared }] of Object.entries(keyCandidates)) {
+    if (have.has(provider)) continue;
+    const holder = shared.map((s) => held.get(s)).find(Boolean);
+    if (holder) holders.set(provider, holder);
+  }
+  return holders;
+}
+
+/**
  * Augment platform response with locally-known providers.
  *
  * The local app is the authority on BYOK keys and OAuth tokens, but
@@ -282,16 +305,14 @@ export function dropMissingModels(
 // buildVisibleModels — single pipeline: normalize → merge custom → filter
 // ---------------------------------------------------------------------------
 
-interface CustomModelEntry {
-  name: string;
-  model_id: string;
-  provider: string;
-  reasoning?: { efforts?: string[]; default?: string };
+/** A custom entry as stored, which may still carry the flat keys entries
+ *  were saved with before the `reasoning` block existed. */
+type StoredCustomEntry = Omit<CustomModelEntry, 'reasoning'> & {
+  reasoning?: Partial<ReasoningDeclaration>;
   reasoning_efforts?: string[];
   reasoning_effort_default?: string;
-  prompt_guidance?: string;
   compaction_profile?: string;
-}
+};
 
 // The ladder an entry declares, from either shape it may be stored in. Mirrors
 // `reasoning_block` on the server, precedence included: a `reasoning` object
@@ -299,7 +320,7 @@ interface CustomModelEntry {
 // its flat keys read as a fallback for the block's missing ones. An empty
 // object is not such an answer, and `{}` being truthy here is what would have
 // made this side read one anyway.
-function declaredLadder(cm: CustomModelEntry): {
+function declaredLadder(cm: StoredCustomEntry): {
   efforts?: string[];
   effortDefault?: string;
 } {
@@ -319,9 +340,107 @@ function declaredLadder(cm: CustomModelEntry): {
   };
 }
 
-interface ProviderCatalogEntry {
+/** `GET /api/v1/models`' `gateway_index`: the routes whose model ids meet the
+ *  manifest's by slug, the manifest model each slug names, and per route the
+ *  manifest models whose effort ladder a pick on it borrows. */
+export interface GatewayIndex {
+  routes: string[];
+  models: Record<string, string>;
+  borrows: Record<string, string[]>;
+}
+
+/** `vendor/name.with.dots:suffix` -> `name-with-dots`, lowercased: the
+ *  server's `gateway_slug`, which the index is keyed by. */
+export function gatewaySlug(modelId: string): string {
+  const id = modelId.split(':', 1)[0];
+  return id.slice(id.lastIndexOf('/') + 1).toLowerCase().replaceAll('.', '-');
+}
+
+/** The tuning defaults a gateway's pick takes from the built-in its id matches
+ *  (`inherited_declarations` on the server), where the entry declares none:
+ *  its guidance and compaction, and its effort ladder where the route's API
+ *  carries that model's effort control. */
+function gatewayTuning(
+  cm: StoredCustomEntry,
+  rawMetadata: Record<string, ModelMetadataEntry>,
+  gateway: GatewayIndex | undefined,
+): Partial<ModelMetadataEntry> {
+  if (!gateway?.routes.includes(cm.provider) || !cm.model_id) return {};
+  const key = gateway.models[gatewaySlug(cm.model_id)];
+  const builtIn = key ? rawMetadata[key] : undefined;
+  const borrows = !!key && (gateway.borrows?.[cm.provider] ?? []).includes(key);
+  return {
+    ...(builtIn?.prompt_guidance ? { prompt_guidance: builtIn.prompt_guidance } : {}),
+    ...(builtIn?.compaction_profile ? { compaction_profile: builtIn.compaction_profile } : {}),
+    ...(borrows && builtIn?.reasoning_efforts ? { reasoning_efforts: builtIn.reasoning_efforts } : {}),
+    ...(borrows && builtIn?.reasoning_effort_default
+      ? { reasoning_effort_default: builtIn.reasoning_effort_default }
+      : {}),
+  };
+}
+
+/** What a custom model's provider says about it (`useAllModels`' map). */
+export interface ProviderRow {
   sdk?: string;
-  parent_provider?: string;
+  /** Names the group of the user's models under this provider. */
+  display_name?: string;
+  /** The connection the provider's models are listed under: its own name,
+   *  or for another API of a connection, that connection's. */
+  connection: string;
+}
+
+/**
+ * The manifest's metadata with the user's own models laid over it. What a
+ * model declares about itself is the entry's answer where it gives one, and
+ * the shadowed built-in's where it does not: a shadow reaches the same model
+ * through the user's own key, so the ladder carries over. The server resolves
+ * it identically (`with_inherited_declarations`), and on a route that speaks
+ * another API, which borrows nothing, it sends the entry with an empty ladder
+ * spelled out. Presence, not truthiness -- an entry declaring an empty ladder
+ * is saying the model honors no levels, which the built-in's must not
+ * overwrite.
+ *
+ * A pick from a gateway's list (OpenRouter, OpenCode Go) is named its own way,
+ * so it stands for the built-in its id matches through the server's index, as
+ * a turn on it does (`shadowed_model`), and takes only that one's tuning
+ * defaults: its provider and access stay the entry's.
+ *
+ * The label is the exception. The entry's name is the label its author typed,
+ * or the name a gateway's catalog gives the model, while the built-in's
+ * display_name names the manifest's model, which this entry may not route to.
+ * Provider compaction does not carry over either: it rides on the manifest's
+ * own request settings, which a custom entry never inherits.
+ */
+export function withCustomModels(
+  rawMetadata: Record<string, ModelMetadataEntry>,
+  customModels: readonly StoredCustomEntry[],
+  sdkOf: (provider: string) => string | undefined,
+  gateway?: GatewayIndex,
+): Record<string, ModelMetadataEntry> {
+  const metadata: Record<string, ModelMetadataEntry> = { ...rawMetadata };
+  for (const cm of customModels) {
+    const sdk = sdkOf(cm.provider);
+    const {
+      display_name: _shadowedLabel,
+      native_compaction: _shadowedNative,
+      ...declared
+    } = metadata[cm.name] ?? {
+      provider: cm.provider,
+      is_custom_model: true,
+      ...(sdk ? { sdk } : {}),
+      ...gatewayTuning(cm, rawMetadata, gateway),
+    };
+    const ladder = declaredLadder(cm);
+    metadata[cm.name] = {
+      ...declared,
+      ...('efforts' in ladder ? { reasoning_efforts: ladder.efforts } : {}),
+      ...('effortDefault' in ladder ? { reasoning_effort_default: ladder.effortDefault } : {}),
+      ...('prompt_guidance' in cm ? { prompt_guidance: cm.prompt_guidance } : {}),
+      ...('compaction_profile' in cm ? { compaction_profile: cm.compaction_profile } : {}),
+      ...(cm.display_name ? { display_name: cm.display_name } : {}),
+    };
+  }
+  return metadata;
 }
 
 export interface BuildVisibleModelsResult {
@@ -348,11 +467,12 @@ export interface BuildVisibleModelsResult {
 export function buildVisibleModels(
   rawApiModels: Record<string, Record<string, unknown>>,
   rawMetadata: Record<string, ModelMetadataEntry>,
-  customModels: CustomModelEntry[],
-  providerCatalog: Record<string, ProviderCatalogEntry>,
+  customModels: StoredCustomEntry[],
+  providerCatalog: Record<string, ProviderRow>,
   platform: PlatformModelsResponse | null,
   configuredProviders: ConfiguredProvider[],
   missingByProvider: ReadonlyMap<string, ReadonlySet<string>> = new Map(),
+  gateway?: GatewayIndex,
 ): BuildVisibleModelsResult {
   // 1. Normalize raw API shape → Record<string, ProviderModelsData>
   const normalized: Record<string, ProviderModelsData> = {};
@@ -364,8 +484,8 @@ export function buildVisibleModels(
     };
   }
 
-  // 2. Merge custom models
-  const metadata: Record<string, ModelMetadataEntry> = { ...rawMetadata };
+  // 2. Merge custom models, each listed under its connection.
+  const connectionOf = (provider: string) => providerCatalog[provider]?.connection ?? provider;
   // (group, name) pairs the user explicitly added. Bypasses filters for that
   // specific pair without polluting the global metadata — a parent-catalog
   // model starred under a variant must appear under the variant, not under
@@ -376,55 +496,20 @@ export function buildVisibleModels(
   // provider's own list still decides it.
   const routedPairs = new Set<string>();
   for (const cm of customModels) {
-    const key = cm.provider;
+    const key = connectionOf(cm.provider);
     const manifestEntry = rawMetadata[cm.name];
     if (manifestEntry && (cm.model_id || cm.name) === (manifestEntry.model_id ?? cm.name)) {
       routedPairs.add(customPairKey(key, cm.name));
     }
     if (!normalized[key]) {
-      normalized[key] = { models: [], display_name: key };
+      normalized[key] = { models: [], display_name: providerCatalog[key]?.display_name ?? key };
     }
     if (!normalized[key].models!.includes(cm.name)) {
       normalized[key].models!.push(cm.name);
     }
     customPairs.add(customPairKey(key, cm.name));
-    if (!metadata[cm.name]) {
-      const sdk = providerCatalog[cm.provider]?.sdk;
-      metadata[cm.name] = {
-        provider: cm.provider,
-        is_custom_model: true,
-        ...(sdk ? { sdk } : {}),
-      };
-    }
-    // What a model declares about itself is the entry's answer where it gives
-    // one, and the shadowed built-in's where it does not: a shadow reaches the
-    // same model through the user's own key, so the ladder carries over. The
-    // server resolves it identically (`with_inherited_declarations`), and on a
-    // route that speaks another API, which borrows nothing, it sends the entry
-    // with an empty ladder spelled out. Presence, not truthiness -- an entry
-    // declaring an empty ladder is saying the model honors no levels, which
-    // the built-in's must not overwrite.
-    // The label is the exception. The entry's name is the label its author
-    // typed, while the built-in's display_name names the manifest's model,
-    // which this entry may not route to.
-    const ladder = declaredLadder(cm);
-    // Provider compaction does not carry over either: it rides on the
-    // manifest's own request settings, which a custom entry never inherits.
-    const {
-      display_name: _shadowedLabel,
-      native_compaction: _shadowedNative,
-      ...declared
-    } = metadata[cm.name];
-    metadata[cm.name] = {
-      ...declared,
-      ...('efforts' in ladder ? { reasoning_efforts: ladder.efforts } : {}),
-      ...('effortDefault' in ladder
-        ? { reasoning_effort_default: ladder.effortDefault }
-        : {}),
-      ...('prompt_guidance' in cm ? { prompt_guidance: cm.prompt_guidance } : {}),
-      ...('compaction_profile' in cm ? { compaction_profile: cm.compaction_profile } : {}),
-    };
   }
+  const metadata = withCustomModels(rawMetadata, customModels, (p) => providerCatalog[p]?.sdk, gateway);
 
   // Snapshot before filtering — preserves the FULL pre-filter picture for
   // consumers like ModelPickStep that need to show built-ins under their
@@ -442,7 +527,7 @@ export function buildVisibleModels(
   // doesn't show two identically-routed rows.
   const shadowOwner: Record<string, string> = {};
   for (const cm of customModels) {
-    if (!Object.hasOwn(shadowOwner, cm.name)) shadowOwner[cm.name] = cm.provider;
+    if (!Object.hasOwn(shadowOwner, cm.name)) shadowOwner[cm.name] = connectionOf(cm.provider);
   }
   for (const [groupKey, data] of Object.entries(normalized)) {
     if (!data.models) continue;

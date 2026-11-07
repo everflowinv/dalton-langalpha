@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Response
 from fastapi.responses import StreamingResponse
@@ -37,6 +37,7 @@ from src.server.database.computer import (
     set_computer_files_backup,
     update_computer_status,
 )
+from src.server.database.computer_names import ComputerNameTaken, name_taken
 from src.server.database.home_workspace import get_home_workspace_id
 from src.server.database.workspace import (
     count_live_workspaces_by_computer,
@@ -120,6 +121,14 @@ from src.server.services.workspace_status_pubsub import (
     publish_computer_status_change,
     subscribe_to_computer_status,
 )
+from src.server.dependencies.principal import (
+    ComputerAddUserId,
+    ComputerEndUserId,
+    ComputerWriteUserId,
+    Principal,
+    ReadPrincipal,
+    ReadUserId,
+)
 from src.server.utils.api import CurrentUserId
 from src.server.utils.error_sanitization import sandbox_failure_http
 
@@ -139,7 +148,7 @@ async def _computer_quota_decision(user_id: str, *, always: bool = False):
     """Serialize platform quota reads with the mutation that consumes the slot.
 
     ``always`` takes the lock without platform gating too, for a create whose
-    own check must hold until its insert.
+    own checks (a name, a folder) must hold until its insert.
     """
     if not (always or platform_gating_active()):
         yield
@@ -196,6 +205,17 @@ async def _computer_action_errors(action: str, computer_id: str, *, spec: bool =
         ) from None
     except ComputerBusyError as e:
         raise HTTPException(status_code=409, detail=spec_refusal("busy", str(e))) from None
+    except ComputerNameTaken as e:
+        # Names the holder, so a client words it in its own language.
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "name_taken",
+                "message": str(e),
+                "name": e.name,
+                "computer_id": e.computer_id,
+            },
+        ) from None
     except ComputerRemovalRefused as e:
         logger.warning("Refused to %s computer %s: %s", action, computer_id, e.code)
         detail = {"code": e.code, "message": str(e)}
@@ -417,13 +437,15 @@ async def _schedule_claimed_start(computer_id: str) -> str:
 @router.post("", response_model=ComputerResponse, status_code=201)
 async def create_computer(
     request: ComputerCreate,
-    x_user_id: CurrentUserId,
+    x_user_id: ComputerAddUserId,
 ):
     """Create a computer and prepare its sandbox in the background.
 
     Building a sandbox takes long enough that whoever first used the computer
     would wait through it, so it starts now and the client watches its events.
     Preparing holds a running slot from the insert, so the limit is asked here.
+    A ``name`` another of the user's live computers has, compared trimmed and
+    case-folded, is a 409 ``name_taken``; an unnamed one is numbered past them.
     """
     async with _computer_action_errors("create", "new"):
         sandbox = _sandbox_config()
@@ -441,6 +463,10 @@ async def create_computer(
         await assert_provider_allowed(x_user_id, kind, default_kind=sandbox.provider)
         plan: Optional[SSHCreatePlan] = None
         if request.ssh is not None:
+            if request.name and (taken := await name_taken(x_user_id, request.name)):
+                # Ahead of the probe, which dials the machine, and asked again
+                # under the lock below, ahead of a take-over.
+                raise taken
             with _ssh_create_refusals():
                 plan = await plan_create(
                     x_user_id, request.ssh, settings=sandbox.settings_for(SSH_KIND)
@@ -450,8 +476,12 @@ async def create_computer(
                 status_code=422,
                 detail=_FILES_BACKUP_REQUIRED,
             )
-        async with _computer_quota_decision(x_user_id, always=plan is not None):
+        # Every create and rename holds this lock, so a name still free under
+        # it is free at the insert, after a take-over that cannot be undone.
+        async with _computer_quota_decision(x_user_id, always=True):
             if plan is not None:
+                if request.name and (taken := await name_taken(x_user_id, request.name)):
+                    raise taken
                 with _ssh_create_refusals():
                     await plan.recheck(x_user_id)
             if provider_class(kind).metered:
@@ -514,9 +544,18 @@ def _ssh_create_refusals():
         raise HTTPException(status_code=503, detail=str(e)) from None
 
 
+async def _listed_computers(principal: Principal) -> List[Dict[str, Any]]:
+    """The computers a list shows the caller: a computer's token, only its own."""
+    if principal.computer_id is None:
+        return await get_computers_for_user(principal.user_id)
+    row = await get_computer(principal.computer_id)
+    return [row] if row is not None and row.get("user_id") == principal.user_id else []
+
+
 @router.get("", response_model=ComputerListResponse)
-async def list_computers(x_user_id: CurrentUserId):
-    rows = await get_computers_for_user(x_user_id)
+async def list_computers(principal: ReadPrincipal):
+    x_user_id = principal.user_id
+    rows = await _listed_computers(principal)
     # One query for the whole list: stopping a machine takes every project on it
     # down, so the count is what the card needs to say so before asking.
     counts = await count_live_workspaces_by_computer(
@@ -538,7 +577,7 @@ async def list_computers(x_user_id: CurrentUserId):
 
 # Registered ahead of /{computer_id}, which would otherwise read "providers" as an id.
 @router.get("/providers", response_model=ComputerProvidersResponse)
-async def list_computer_providers(x_user_id: CurrentUserId):
+async def list_computer_providers(x_user_id: ReadUserId):
     """The providers a new computer may be created on, and which the caller may pick."""
     try:
         sandbox = _sandbox_config()
@@ -558,6 +597,7 @@ async def list_computer_providers(x_user_id: CurrentUserId):
                 is_default=kind == sandbox.provider,
                 allowed=allowed[kind],
                 tiers=_tier_specs(sandbox, kind),
+                default_name=provider_class(kind).default_computer_name,
             )
             for kind in kinds
         ],
@@ -601,7 +641,7 @@ async def _counted_response(computer: Dict[str, Any]) -> ComputerResponse:
 
 
 @router.get("/{computer_id}", response_model=ComputerResponse)
-async def get_computer_details(computer_id: str, x_user_id: CurrentUserId):
+async def get_computer_details(computer_id: str, x_user_id: ReadUserId):
     return await _counted_response(await _owned_computer(computer_id, x_user_id))
 
 
@@ -609,19 +649,26 @@ async def get_computer_details(computer_id: str, x_user_id: CurrentUserId):
 async def rename_computer(
     computer_id: str,
     request: ComputerRenameRequest,
-    x_user_id: CurrentUserId,
+    x_user_id: ComputerWriteUserId,
 ):
-    await _owned_computer(computer_id, x_user_id)
-    updated = await db_rename_computer(computer_id, request.name)
-    if updated is None:
-        raise HTTPException(status_code=404, detail="Computer not found")
+    """A name another of the user's live computers has is a 409 ``name_taken``;
+    the computer's own name in another case is a rename like any other."""
+    async with _computer_action_errors("rename", computer_id):
+        await _owned_computer(computer_id, x_user_id)
+        # Under the lock a create holds from its last name check to its insert.
+        async with computer_capacity_lock(x_user_id):
+            updated = await db_rename_computer(
+                computer_id, request.name, user_id=x_user_id
+            )
+        if updated is None:
+            raise HTTPException(status_code=404, detail="Computer not found")
     return await _counted_response(updated)
 
 
 @router.delete("/{computer_id}", response_model=ComputerRemoveResponse)
 async def remove_computer(
     computer_id: str,
-    x_user_id: CurrentUserId,
+    x_user_id: ComputerEndUserId,
     remove_key: bool = Query(
         True,
         description=(
@@ -658,7 +705,8 @@ async def remove_computer(
     on an ssh computer anything else LangAlpha put on the machine, stay unless
     ``delete_files`` says to delete them too. A refusal the
     user can act on is a 409 whose ``code`` the client words. On an ssh computer,
-    ``key`` says what became of the key's line on its machine. The tunnel of
+    ``key`` says what became of the key's line on its machine, and ``token``
+    names a Claude Code token left there by a machine not reached. The tunnel of
     a machine left with no computer goes on the connection the delete ran
     on, or without one in the background, where a machine that does not
     answer holds up nobody.
@@ -686,12 +734,12 @@ async def remove_computer(
                 lambda: release_tunnel(x_user_id, computer, settings=settings),
             )
     return ComputerRemoveResponse(
-        key=left.key, files=left.files, workspaces_deleted=deleted
+        key=left.key, files=left.files, token=left.token, workspaces_deleted=deleted
     )
 
 
 @router.get("/{computer_id}/storage", response_model=ComputerStorageResponse)
-async def get_computer_storage(computer_id: str, x_user_id: CurrentUserId):
+async def get_computer_storage(computer_id: str, x_user_id: ReadUserId):
     """Measure now when the machine runs; otherwise answer the last reading.
 
     A stopped machine is never started for this: the stored reading is what
@@ -725,7 +773,7 @@ async def get_computer_storage(computer_id: str, x_user_id: CurrentUserId):
 
 
 @router.get("/{computer_id}/session", response_model=ComputerSessionResponse)
-async def get_computer_session(computer_id: str, x_user_id: CurrentUserId):
+async def get_computer_session(computer_id: str, x_user_id: ReadUserId):
     """Resolve sessions only when Postgres says running so this read cannot provision."""
     computer = await _owned_computer(computer_id, x_user_id)
     response = ComputerSessionResponse(
@@ -754,7 +802,7 @@ async def get_computer_session(computer_id: str, x_user_id: CurrentUserId):
 
 
 @router.get("/{computer_id}/events")
-async def computer_status_events(computer_id: str, x_user_id: CurrentUserId):
+async def computer_status_events(computer_id: str, x_user_id: ReadUserId):
     computer = await _owned_computer(computer_id, x_user_id)
 
     def _frame(
@@ -792,7 +840,7 @@ async def computer_status_events(computer_id: str, x_user_id: CurrentUserId):
 @router.post("/{computer_id}/start", response_model=ComputerActionResponse)
 async def start_computer(
     computer_id: str,
-    x_user_id: CurrentUserId,
+    x_user_id: ComputerWriteUserId,
     lazy: bool = Query(
         False,
         description=(
@@ -855,7 +903,7 @@ async def start_computer(
 
 
 @router.post("/{computer_id}/stop", response_model=ComputerActionResponse)
-async def stop_computer(computer_id: str, x_user_id: CurrentUserId):
+async def stop_computer(computer_id: str, x_user_id: ComputerEndUserId):
     async with _computer_action_errors("stop", computer_id):
         await _owned_computer(computer_id, x_user_id)
         updated = await _computer_manager().stop_computer(computer_id)
@@ -868,7 +916,7 @@ async def stop_computer(computer_id: str, x_user_id: CurrentUserId):
 
 
 @router.post("/{computer_id}/archive", response_model=ComputerActionResponse)
-async def archive_computer(computer_id: str, x_user_id: CurrentUserId):
+async def archive_computer(computer_id: str, x_user_id: ComputerEndUserId):
     async with _computer_action_errors("archive", computer_id):
         await _owned_computer(computer_id, x_user_id)
         updated = await _computer_manager().archive_computer(computer_id)

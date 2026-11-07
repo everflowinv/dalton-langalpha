@@ -4,6 +4,7 @@ stores and Redis."""
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -15,11 +16,13 @@ from typing import Any, Iterable
 from src.llms.model_spec import wire_api
 from src.server.services.oauth_providers import SUBSCRIPTIONS
 
+from .catalog import GatewayCatalog, fetch_section
 from .matching import ModelsResult, build_result, filter_others, match_endpoint_models
 from .wire import (
     CODEX,
     ENDPOINT_REFUSED,
     OPENAI,
+    UNAUTHORIZED,
     ListFetchError,
     build_list_request,
     fetch_list,
@@ -118,7 +121,7 @@ async def _resolve_credential(user_id: str, provider: str, mc) -> Credential:
         return Credential(
             api_key=byok_config["api_key"], holder=holder, base_url=byok_config.get("base_url") or None,
         )
-    server_key = deployment_key(mc.get_provider_info(provider))
+    server_key = deployment_key(provider)
     if server_key:
         return Credential(api_key=server_key, holder=provider)
     raise NotConnected(provider)
@@ -186,6 +189,37 @@ async def _refresh_allowed(user_id: str, provider: str) -> bool:
     return await throttle(f"provider_models:refresh:{user_id}:{provider}", 1, _REFRESH_COOLDOWN_S)
 
 
+#: How long a catalog that could not be read is taken as unreadable.
+_CATALOG_RETRY_S = 300
+
+
+async def _gateway_catalog(info: dict) -> GatewayCatalog | None:
+    """A gateway's catalog (``model_catalog``), its section shared by every
+    user for as long as a list is kept; None for any other provider."""
+    config = info.get("model_catalog")
+    if not config:
+        return None
+    url_key = hashlib.sha256(config["url"].encode()).hexdigest()[:16]
+    key = f"model_catalog:{url_key}:{config['provider']}"
+    client = _redis()
+    if client is not None:
+        try:
+            raw = await client.get(key)
+            if raw is not None:
+                return GatewayCatalog(config, json.loads(raw))
+        except Exception:
+            logger.debug("[provider_models] catalog cache read failed", exc_info=True)
+    section = await fetch_section(config)
+    if client is not None:
+        # A catalog that could not be read is kept briefly too, so an outage
+        # costs one wait per few minutes rather than one per list.
+        try:
+            await client.set(key, json.dumps(section), ex=CACHE_TTL_S if section is not None else _CATALOG_RETRY_S)
+        except Exception:
+            logger.debug("[provider_models] catalog cache write failed", exc_info=True)
+    return GatewayCatalog(config, section)
+
+
 async def invalidate_available_models(user_id: str) -> None:
     """Drop every cached list of the user's. Called when a key or account is
     saved or removed: a key under one slug can serve its siblings' lists."""
@@ -237,12 +271,15 @@ async def available_models(user_id: str, provider: str, *, refresh: bool = False
         entry = await _cache_read(user_id, provider, fingerprint)
         if entry is not None:
             result = build_result(
-                provider, entry["shape"], entry["models"], mc, fetched_at=entry["fetched_at"], **match_kwargs,
+                provider, entry["shape"], entry["models"], mc, fetched_at=entry["fetched_at"],
+                catalog=await _gateway_catalog(info), **match_kwargs,
             )
             return filter_others({**result, "cached": True}, q)
 
     req = build_list_request(info, api_key=cred.api_key, base_url=cred.base_url, token_headers=cred.token_headers)
     started = time.monotonic()
+    # A gateway's catalog is read beside its list: neither waits on the other.
+    catalog_read = asyncio.create_task(_gateway_catalog(info))
     try:
         # A list on a base URL the user saved goes out as a key test does.
         try:
@@ -251,6 +288,7 @@ async def available_models(user_id: str, provider: str, *, refresh: bool = False
             raise ListFetchError(ENDPOINT_REFUSED) from e
         models = normalize(req.shape, await fetch_list(req, transport=transport))
     except ListFetchError as e:
+        catalog = await catalog_read
         logger.warning(
             "[provider_models] list fetch failed provider=%s user_id=%s reason=%s status=%s",
             provider, user_id, e.reason, e.status,
@@ -266,15 +304,24 @@ async def available_models(user_id: str, provider: str, *, refresh: bool = False
             # Revoked before its stated expiry: spent now, so the next list or
             # turn refreshes it instead of offering it again until then.
             await _expire_refused_token(user_id, provider)
-        result = build_result(provider, req.shape, None, mc, reason=reason, **match_kwargs)
+        # A refused key runs none of a gateway's models, so its catalog does
+        # not stand in for the list then.
+        result = build_result(
+            provider, req.shape, None, mc, reason=reason,
+            catalog=catalog if reason != UNAUTHORIZED else None, **match_kwargs,
+        )
         return filter_others({**result, "cached": False}, q)
+    except BaseException:
+        catalog_read.cancel()
+        raise
+    catalog = await catalog_read
 
     fetched_at = datetime.now(timezone.utc).isoformat()
     await _cache_write(
         user_id, provider,
         {"fingerprint": fingerprint, "shape": req.shape, "models": models, "fetched_at": fetched_at},
     )
-    result = build_result(provider, req.shape, models, mc, fetched_at=fetched_at, **match_kwargs)
+    result = build_result(provider, req.shape, models, mc, fetched_at=fetched_at, catalog=catalog, **match_kwargs)
     if result["status"] == "fallback":
         logger.warning(
             "[provider_models] falling back to the manifest provider=%s user_id=%s reason=%s listed=%d",

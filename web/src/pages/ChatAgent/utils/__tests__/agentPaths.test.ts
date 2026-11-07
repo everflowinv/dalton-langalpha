@@ -11,23 +11,30 @@ import {
   isUserDataReadmePath,
   normalizeAgentHref,
   normalizeAgentPath,
+  onOtherComputer,
   parseAgentHref,
   parseAgentPath,
-  siblingWorkspacePath,
+  folderWorkspacePath,
   topicFromMemoryKey,
   workspaceRelativePath,
   workspaceScopedPath,
   type ComputerFolders,
-  type SiblingWorkspace,
+  type ComputerRootRow,
+  type FolderWorkspace,
 } from '../agentPaths';
 
 /** The viewed workspace's folders, and the other workspaces on its computer. */
 function own(
   dirName: string | null,
   previousDirNames?: string[] | null,
-  siblings: readonly SiblingWorkspace[] = [],
+  siblings: readonly FolderWorkspace[] = [],
 ): ComputerFolders {
   return { dirName, previousDirNames, siblings };
+}
+
+/** The user's computers, one per root, as the computer list gives them. */
+function machines(...roots: (string | null)[]): ComputerRootRow[] {
+  return roots.map((root_dir, i) => ({ computer_id: `c-${i}`, root_dir }));
 }
 
 /**
@@ -629,8 +636,8 @@ describe('computeAgentArtifactRouting: a renamed workspace', () => {
  * sibling's files through its folder. Those paths open in the sibling, as a
  * `__wsref__` link to it does; everything else reads as it did before.
  */
-describe('siblingWorkspacePath', () => {
-  const siblings: SiblingWorkspace[] = [
+describe('folderWorkspacePath', () => {
+  const siblings: FolderWorkspace[] = [
     { workspaceId: 'ws-nvda', dirName: 'NVDA', previousDirNames: ['nvidia-ab12'] },
     { workspaceId: 'ws-home', dirName: 'Home' },
     // TSLA left `Macro` and Macro now holds it: the current name wins.
@@ -638,7 +645,7 @@ describe('siblingWorkspacePath', () => {
     { workspaceId: 'ws-macro', dirName: 'Macro' },
   ];
   const sib = (raw: string, { dir, previous }: { dir?: string; previous?: string[] } = {}) =>
-    siblingWorkspacePath(parseAgentPath(raw), own(dir ?? 'AAPL', previous ?? ['apple-old'], siblings));
+    folderWorkspacePath(parseAgentPath(raw), own(dir ?? 'AAPL', previous ?? ['apple-old'], siblings));
 
   it('reads one climb out of the workspace as the folder beside it', () => {
     expect(sib('../NVDA/results/report.md')).toEqual({ workspaceId: 'ws-nvda', path: 'results/report.md' });
@@ -653,7 +660,7 @@ describe('siblingWorkspacePath', () => {
 
   it('unwraps file:// on either form', () => {
     expect(sib('file:///home/workspace/NVDA/report.md')).toEqual({ workspaceId: 'ws-nvda', path: 'report.md' });
-    expect(siblingWorkspacePath(parseAgentHref('file:///home/workspace/NVDA/a%20b.md'), own('AAPL', null, siblings)))
+    expect(folderWorkspacePath(parseAgentHref('file:///home/workspace/NVDA/a%20b.md'), own('AAPL', null, siblings)))
       .toEqual({ workspaceId: 'ws-nvda', path: 'a b.md' });
   });
 
@@ -709,7 +716,7 @@ describe('siblingWorkspacePath', () => {
       { workspaceId: 'ws-a', dirName: 'A', previousDirNames: ['Old'] },
       { workspaceId: 'ws-b', dirName: 'B', previousDirNames: ['old'] },
     ];
-    expect(siblingWorkspacePath(parseAgentPath('../Old/x.md'), own('C', null, shared))).toBeNull();
+    expect(folderWorkspacePath(parseAgentPath('../Old/x.md'), own('C', null, shared))).toBeNull();
   });
 
   it('defers to this workspace\'s own former folder over a sibling\'s', () => {
@@ -717,8 +724,8 @@ describe('siblingWorkspacePath', () => {
   });
 
   it('finds nothing without siblings', () => {
-    expect(siblingWorkspacePath(parseAgentPath('../NVDA/x.md'), own('AAPL'))).toBeNull();
-    expect(siblingWorkspacePath(parseAgentPath('../NVDA/x.md'), null)).toBeNull();
+    expect(folderWorkspacePath(parseAgentPath('../NVDA/x.md'), own('AAPL'))).toBeNull();
+    expect(folderWorkspacePath(parseAgentPath('../NVDA/x.md'), null)).toBeNull();
   });
 });
 
@@ -746,7 +753,7 @@ describe('computerFolders', () => {
   it('ignores a workspace on another computer', () => {
     const folders = computerFolders(rows[0], rows);
     expect(folders?.siblings.map((s) => s.workspaceId)).not.toContain('ws-msft');
-    expect(siblingWorkspacePath(parseAgentPath('../MSFT/x.md'), folders)).toBeNull();
+    expect(folderWorkspacePath(parseAgentPath('../MSFT/x.md'), folders)).toBeNull();
   });
 
   it('gives a workspace on no computer its own folders and no siblings', () => {
@@ -760,7 +767,8 @@ describe('computerFolders', () => {
   });
 
   it('carries the computer root when it is known', () => {
-    expect(computerFolders(rows[0], rows, '/home/someone/langalpha')?.rootDir).toBe('/home/someone/langalpha');
+    expect(computerFolders(rows[0], rows, [{ computer_id: 'c1', root_dir: '/home/someone/langalpha' }])?.rootDir)
+      .toBe('/home/someone/langalpha');
     expect(computerFolders(rows[0], rows)).not.toHaveProperty('rootDir');
   });
 });
@@ -772,7 +780,7 @@ describe('computerFolders', () => {
  */
 describe('a computer root of its own', () => {
   const ROOT = '/home/someone/langalpha';
-  const siblings: SiblingWorkspace[] = [{ workspaceId: 'ws-nvda', dirName: 'NVDA' }];
+  const siblings: FolderWorkspace[] = [{ workspaceId: 'ws-nvda', dirName: 'NVDA' }];
   const folders: ComputerFolders = { rootDir: ROOT, dirName: 'AAPL', previousDirNames: ['apple-old'], siblings };
 
   it('strips it like the stock root, and only when given', () => {
@@ -806,7 +814,7 @@ describe('a computer root of its own', () => {
   });
 
   it('opens a sibling\'s folder in that workspace', () => {
-    expect(siblingWorkspacePath(parseAgentHref(`${ROOT}/NVDA/a%20b.md`, ROOT), folders))
+    expect(folderWorkspacePath(parseAgentHref(`${ROOT}/NVDA/a%20b.md`, ROOT), folders))
       .toEqual({ workspaceId: 'ws-nvda', path: 'a b.md' });
     expect(computeAgentArtifactRouting(`${ROOT}/NVDA/report.md`, undefined, folders))
       .toMatchObject({ targetFile: 'report.md', setWorkspaceId: 'ws-nvda' });
@@ -834,16 +842,17 @@ describe('a root the workspace has moved off', () => {
   };
 
   it('lists the other computers\' own roots, sorted, without this one\'s or a stock one', () => {
+    // The viewed workspace is on the fourth, `c-3`.
     const roots = ['/srv/b/', OLD, '/home/workspace', '/srv/here', OLD];
-    expect(computerFolders({ workspace_id: 'ws-1', dir_name: 'AAPL' }, [], '/srv/here', roots)?.otherRoots)
+    expect(computerFolders({ workspace_id: 'ws-1', computer_id: 'c-3', dir_name: 'AAPL' }, [], machines(...roots))?.otherRoots)
       .toEqual([OLD, '/srv/b']);
-    expect(computerFolders({ workspace_id: 'ws-1', dir_name: 'AAPL' }, [], null, ['/home/workspace']))
+    expect(computerFolders({ workspace_id: 'ws-1', computer_id: 'c-0', dir_name: 'AAPL' }, [], machines('/home/workspace')))
       .not.toHaveProperty('otherRoots');
   });
 
   it('keeps a root the row recorded leaving after its computer is gone from the list', () => {
-    const viewed = { workspace_id: 'ws-1', dir_name: 'AAPL', previous_root_dirs: [OLD, '/home/workspace'] };
-    const read = computerFolders(viewed, [], '/srv/here', ['/srv/here']);
+    const viewed = { workspace_id: 'ws-1', computer_id: 'c-0', dir_name: 'AAPL', previous_root_dirs: [OLD, '/home/workspace'] };
+    const read = computerFolders(viewed, [], machines('/srv/here'));
     expect(read?.otherRoots).toEqual([OLD]);
     expect(computeAgentArtifactRouting(`${OLD}/AAPL/results/q3.csv`, undefined, read))
       .toMatchObject({ targetFile: 'results/q3.csv', setWorkspaceId: null });
@@ -854,18 +863,18 @@ describe('a root the workspace has moved off', () => {
     // workspace's, so its record must not fold a path there into this one.
     const viewed = { workspace_id: 'ws-1', computer_id: 'c1', dir_name: 'AAPL' };
     const sibling = { workspace_id: 'ws-2', computer_id: 'c1', dir_name: 'AAPL-2', previous_root_dirs: [OLD] };
-    const read = computerFolders(viewed, [viewed, sibling], '/srv/here', ['/srv/here']);
+    const read = computerFolders(viewed, [viewed, sibling], [{ computer_id: 'c1', root_dir: '/srv/here' }]);
     expect(read).not.toHaveProperty('otherRoots');
     expect(computeAgentArtifactRouting(`${OLD}/AAPL/x.md`, undefined, read)).toMatchObject({ targetFile: `${OLD}/AAPL/x.md` });
   });
 
   it('reads its own root off the row before the computer list answers', () => {
-    const viewed = { workspace_id: 'ws-1', dir_name: 'AAPL', root_dir: '/srv/here' };
-    expect(computerFolders(viewed, [], undefined, undefined)?.rootDir).toBe('/srv/here');
+    const viewed = { workspace_id: 'ws-1', computer_id: 'c-0', dir_name: 'AAPL', root_dir: '/srv/here' };
+    expect(computerFolders(viewed, [])?.rootDir).toBe('/srv/here');
     // A row read without one, the answer to a change, takes the list's.
-    expect(computerFolders({ ...viewed, root_dir: null }, [], '/srv/here', ['/srv/here'])?.rootDir).toBe('/srv/here');
+    expect(computerFolders({ ...viewed, root_dir: null }, [], machines('/srv/here'))?.rootDir).toBe('/srv/here');
     // And the own root is never listed as another one.
-    expect(computerFolders(viewed, [], undefined, ['/srv/here', OLD])?.otherRoots).toEqual([OLD]);
+    expect(computerFolders(viewed, [], machines('/srv/here', OLD))?.otherRoots).toEqual([OLD]);
   });
 
   it('routes a path through its current or former folder into this workspace', () => {
@@ -903,7 +912,7 @@ describe('a root the workspace has moved off', () => {
   it('reads a root it left inside the one it is on now', () => {
     // Moved from `~/langalpha` to `~`: this computer's root takes the path first.
     const viewed = { workspace_id: 'ws-1', dir_name: 'AAPL', root_dir: '/home/dev', previous_root_dirs: [OLD] };
-    const read = computerFolders(viewed, [], undefined, undefined);
+    const read = computerFolders(viewed, []);
     expect(computeAgentArtifactRouting(`${OLD}/AAPL/results/q3.csv`, undefined, read))
       .toMatchObject({ targetFile: 'results/q3.csv' });
     expect(computeAgentArtifactRouting('/home/dev/AAPL/x.md', undefined, read)).toMatchObject({ targetFile: 'x.md' });
@@ -915,8 +924,229 @@ describe('a root the workspace has moved off', () => {
   });
 });
 
+/**
+ * The Chief of Staff reads the user's other computers and links a file there
+ * at its whole path on that machine. Through a workspace's folder, that path
+ * opens in that workspace, as a sibling's does; the rest of the machine does
+ * not, and this computer's own folders read exactly as before.
+ */
+describe('a workspace on another computer', () => {
+  const SSH = '/home/nosudo/langalpha-2';
+  const rows = [
+    { workspace_id: 'ws-home', computer_id: 'c-home', dir_name: 'Home', root_dir: '/home/workspace', status: 'running' },
+    { workspace_id: 'ws-nvda', computer_id: 'c-home', dir_name: 'NVDA', root_dir: '/home/workspace' },
+    { workspace_id: 'ws-ssh', computer_id: 'c-ssh', dir_name: 'ssh-e2e-d01c7a', previous_dir_names: ['ssh-old'], root_dir: SSH },
+    { workspace_id: 'ws-gone', computer_id: 'c-ssh', dir_name: 'Gone', root_dir: SSH, status: 'deleted' },
+    // A row read without its root takes the computer list's.
+    { workspace_id: 'ws-semis', computer_id: 'c-ws2', dir_name: 'Semis', root_dir: null },
+    { workspace_id: 'ws-cloud', computer_id: 'c-cloud', dir_name: 'Cloud', previous_dir_names: ['cloud-old'], root_dir: '/home/daytona/' },
+    // On a computer the list does not have yet, so its root is unknown.
+    { workspace_id: 'ws-new', computer_id: 'c-new', dir_name: 'Fresh', root_dir: null },
+  ];
+  const computers = [
+    { computer_id: 'c-home', root_dir: '/home/workspace' },
+    { computer_id: 'c-ssh', root_dir: SSH },
+    { computer_id: 'c-ws2', root_dir: '/home/workspace-2/' },
+    { computer_id: 'c-cloud', root_dir: '/home/daytona' },
+  ];
+  const home = computerFolders(rows[0], rows, computers);
+  const route = (raw: string, folders = home) => computeAgentArtifactRouting(raw, undefined, folders);
+  const withoutOthers = { ...home!, otherComputers: undefined };
+
+  it('groups the live ones by root, a stock root as one, and skips a computer with no known root', () => {
+    expect(home?.siblings).toEqual([{ workspaceId: 'ws-nvda', dirName: 'NVDA', previousDirNames: undefined }]);
+    expect(home?.otherComputers).toEqual([
+      { root: '', workspaces: [{ workspaceId: 'ws-cloud', dirName: 'Cloud', previousDirNames: ['cloud-old'] }] },
+      { root: SSH, workspaces: [{ workspaceId: 'ws-ssh', dirName: 'ssh-e2e-d01c7a', previousDirNames: ['ssh-old'] }] },
+      { root: '/home/workspace-2', workspaces: [{ workspaceId: 'ws-semis', dirName: 'Semis', previousDirNames: undefined }] },
+    ]);
+    expect(home?.otherRoots).toEqual([SSH, '/home/workspace-2']);
+    // A workspace on no computer has nothing to read a path against.
+    expect(computerFolders({ ...rows[0], computer_id: null }, rows, computers)).not.toHaveProperty('otherComputers');
+  });
+
+  it('opens a file through its folder there in that workspace, as a __wsref__ link would', () => {
+    const wsref = computeAgentArtifactRouting('agent.md', 'ws-ssh');
+    for (const raw of [`${SSH}/ssh-e2e-d01c7a/agent.md`, `file://${SSH}/ssh-e2e-d01c7a/agent.md`, `${SSH}//ssh-e2e-d01c7a/./agent.md`]) {
+      expect(route(raw)).toEqual(wsref);
+    }
+    expect(route(`${SSH}/ssh-e2e-d01c7a/agent.md`)).toMatchObject({ targetFile: 'agent.md', setWorkspaceId: 'ws-ssh' });
+    expect(folderWorkspacePath(parseAgentHref(`${SSH}/ssh-e2e-d01c7a/a%20b.md`), home))
+      .toEqual({ workspaceId: 'ws-ssh', path: 'a b.md' });
+    expect(route(`${SSH}/ssh-e2e-d01c7a/data/`)).toMatchObject({ targetDirectory: 'data', setWorkspaceId: 'ws-ssh' });
+    expect(route(`${SSH}/ssh-e2e-d01c7a`)).toMatchObject({ targetDirectory: '', setWorkspaceId: 'ws-ssh' });
+    expect(route('/home/workspace-2/Semis/q3.csv')).toMatchObject({ targetFile: 'q3.csv', setWorkspaceId: 'ws-semis' });
+  });
+
+  it('reaches a former folder there by its name key, and a current one exactly', () => {
+    expect(route(`${SSH}/SSH-OLD/x.md`)).toMatchObject({ targetFile: 'x.md', setWorkspaceId: 'ws-ssh' });
+    expect(route(`${SSH}/SSH-E2E-D01C7A/x.md`)).toMatchObject({ targetFile: `${SSH}/SSH-E2E-D01C7A/x.md`, setWorkspaceId: null });
+  });
+
+  it('reads a stock root on another computer after every folder on this one', () => {
+    expect(route('/home/workspace/Cloud/x.md')).toMatchObject({ targetFile: 'x.md', setWorkspaceId: 'ws-cloud' });
+    expect(route('/home/daytona/cloud-old/x.md')).toMatchObject({ targetFile: 'x.md', setWorkspaceId: 'ws-cloud' });
+    // This computer's sibling and this workspace's own folder win the stock root.
+    const shadowed = computerFolders(rows[0], [...rows, { workspace_id: 'ws-dup', computer_id: 'c-cloud', dir_name: 'X', previous_dir_names: ['NVDA', 'Home'] }], computers);
+    expect(route('/home/workspace/NVDA/x.md', shadowed)).toMatchObject({ targetFile: 'x.md', setWorkspaceId: 'ws-nvda' });
+    expect(route('/home/workspace/Home/x.md', shadowed)).toMatchObject({ targetFile: 'x.md', setWorkspaceId: null });
+  });
+
+  it('leaves a path through no workspace\'s folder where it was', () => {
+    for (const raw of [
+      `${SSH}/x.md`,
+      `${SSH}/Other/x.md`,
+      `${SSH}/Gone/x.md`,
+      '/Users/me/Documents/x.pdf',
+      '/home/workspace/Elsewhere/x.md',
+      '/home/new-root/Fresh/x.md',
+    ]) {
+      expect(route(raw)).toEqual(route(raw, withoutOthers));
+    }
+    expect(route('/Users/me/Documents/x.pdf')).toMatchObject({ targetFile: '/Users/me/Documents/x.pdf', setWorkspaceId: null });
+  });
+
+  it('marks the rest of that machine as one this view does not read', () => {
+    const elsewhere = (raw: string, folders = home) => onOtherComputer(parseAgentPath(raw, folders?.rootDir), folders);
+    expect(elsewhere(`${SSH}/x.md`)).toBe(true);
+    expect(elsewhere(`${SSH}/Other/x.md`)).toBe(true);
+    expect(elsewhere(SSH)).toBe(true);
+    expect(elsewhere(`${SSH}2/x.md`)).toBe(false);
+    expect(elsewhere('/Users/me/Documents/x.pdf')).toBe(false);
+    expect(elsewhere('x.md')).toBe(false);
+    expect(elsewhere(`${SSH}/x.md`, withoutOthers)).toBe(false);
+  });
+
+  it('marks the rest of a computer whose root sits inside this one\'s, and nothing of one sharing it', () => {
+    const MAC = '/Users/me';
+    const mac = computerFolders({ workspace_id: 'ws-mac', computer_id: 'c-mac', dir_name: 'Mac', root_dir: MAC }, [
+      { workspace_id: 'ws-mac', computer_id: 'c-mac', dir_name: 'Mac', root_dir: MAC },
+      { workspace_id: 'ws-twin', computer_id: 'c-twin', dir_name: 'Twin', root_dir: MAC },
+      { workspace_id: 'ws-deep', computer_id: 'c-deep', dir_name: 'Deep', root_dir: `${MAC}/langalpha` },
+    ], []);
+    const elsewhere = (raw: string) => onOtherComputer(parseAgentPath(raw, mac?.rootDir), mac);
+    expect(elsewhere(`${MAC}/langalpha/scratch/x.csv`)).toBe(true);
+    expect(elsewhere(`${MAC}/langalpha`)).toBe(true);
+    expect(elsewhere(MAC)).toBe(false);
+    expect(elsewhere(`${MAC}/scratch/x.csv`)).toBe(false);
+    expect(elsewhere(`${MAC}/Mac/x.csv`)).toBe(false);
+  });
+
+  it('marks the rest of a computer with no workspace on it yet', () => {
+    const bare = computerFolders(rows[0], rows, [...computers, { computer_id: 'c-bare', root_dir: '/Users/new/langalpha' }]);
+    expect(onOtherComputer(parseAgentPath('/Users/new/langalpha/notes.md', bare?.rootDir), bare)).toBe(true);
+    expect(onOtherComputer(parseAgentPath('/Users/new/langalpha/notes.md', home?.rootDir), home)).toBe(false);
+  });
+
+  it('compares roots by whole segments', () => {
+    // `/home/workspace-2` is not the stock root, and `${SSH}2` is not under SSH.
+    expect(route('/home/workspace-2/Semis/x.md')).toMatchObject({ setWorkspaceId: 'ws-semis' });
+    expect(route('/home/workspace/Semis/x.md')).toEqual(route('/home/workspace/Semis/x.md', withoutOthers));
+    expect(route(`${SSH}2/ssh-e2e-d01c7a/x.md`)).toMatchObject({ targetFile: `${SSH}2/ssh-e2e-d01c7a/x.md`, setWorkspaceId: null });
+  });
+
+  it('reads this computer\'s folders exactly as before', () => {
+    for (const raw of [
+      '../NVDA/x.md',
+      '/home/workspace/NVDA/x.md',
+      '../Home/x.md',
+      '/home/workspace/Home/x.md',
+      'NVDA/x.md',
+      'results/x.md',
+      // A climb out of the working directory stays on this computer.
+      '../Cloud/x.md',
+      '../ssh-e2e-d01c7a/x.md',
+      '__wsref__/ws-other/x.md',
+    ]) {
+      expect(route(raw)).toEqual(route(raw, withoutOthers));
+    }
+  });
+
+  it('keeps a folder this workspace sat under there before a move', () => {
+    const moved = computerFolders({ ...rows[0], previous_root_dirs: [SSH] }, [
+      ...rows,
+      { workspace_id: 'ws-took', computer_id: 'c-ssh', dir_name: 'Took', previous_dir_names: ['Home'] },
+    ], computers);
+    expect(route(`${SSH}/Home/x.md`, moved)).toMatchObject({ targetFile: 'x.md', setWorkspaceId: null });
+  });
+
+  it('opens a namesake there under a root this workspace never recorded leaving', () => {
+    const namesake = [...rows, { workspace_id: 'ws-ssh-nvda', computer_id: 'c-ssh', dir_name: 'NVDA', root_dir: SSH }];
+    const nvda = computerFolders(rows[1], namesake, computers);
+    expect(route(`${SSH}/NVDA/x.md`, nvda)).toMatchObject({ targetFile: 'x.md', setWorkspaceId: 'ws-ssh-nvda' });
+    const moved = computerFolders({ ...rows[1], previous_root_dirs: [SSH] }, namesake, computers);
+    expect(moved?.leftRoots).toEqual([SSH]);
+    expect(route(`${SSH}/NVDA/x.md`, moved)).toMatchObject({ targetFile: 'x.md', setWorkspaceId: null });
+  });
+
+  it('gives up on a folder two computers on one root both hold', () => {
+    const MAC = '/Users/me/langalpha';
+    const twoMacs = computerFolders(rows[0], [
+      rows[0],
+      { workspace_id: 'ws-a', computer_id: 'c-mac1', dir_name: 'Notes', root_dir: MAC },
+      { workspace_id: 'ws-b', computer_id: 'c-mac2', dir_name: 'Notes', root_dir: MAC },
+      { workspace_id: 'ws-c', computer_id: 'c-mac2', dir_name: 'Only', root_dir: `${MAC}/` },
+    ], []);
+    expect(twoMacs?.otherComputers?.map((g) => [g.root, g.workspaces.length])).toEqual([[MAC, 3]]);
+    expect(route(`${MAC}/Notes/x.md`, twoMacs)).toMatchObject({ targetFile: `${MAC}/Notes/x.md`, setWorkspaceId: null });
+    expect(route(`${MAC}/Only/x.md`, twoMacs)).toMatchObject({ targetFile: 'x.md', setWorkspaceId: 'ws-c' });
+  });
+
+  it('reads a path under two nested roots by the longer first', () => {
+    const nested = computerFolders(rows[0], [
+      rows[0],
+      { workspace_id: 'ws-old', computer_id: 'c-srv', dir_name: 'old', root_dir: '/srv' },
+      { workspace_id: 'ws-a', computer_id: 'c-inner', dir_name: 'A', root_dir: '/srv/old' },
+    ], []);
+    expect(route('/srv/old/A/x.md', nested)).toMatchObject({ targetFile: 'x.md', setWorkspaceId: 'ws-a' });
+    expect(route('/srv/old/notes.md', nested)).toMatchObject({ targetFile: 'notes.md', setWorkspaceId: 'ws-old' });
+  });
+
+  it('reads from a computer with a root of its own', () => {
+    // An analyst on the user's Mac, where Home is on a stock cloud computer, a
+    // second Mac shares this one's root, and a third keeps one inside it.
+    const MAC = '/Users/me/langalpha';
+    const mac = computerFolders({ workspace_id: 'ws-mac', computer_id: 'c-mac', dir_name: 'Mac', root_dir: MAC }, [
+      ...rows,
+      { workspace_id: 'ws-mac2', computer_id: 'c-mac2', dir_name: 'Mac2', root_dir: MAC },
+      { workspace_id: 'ws-deep', computer_id: 'c-deep', dir_name: 'Deep', root_dir: `${MAC}/inner` },
+    ], computers);
+    expect(route('/home/workspace/Home/x.md', mac)).toMatchObject({ targetFile: 'x.md', setWorkspaceId: 'ws-home' });
+    expect(route(`${MAC}/Mac2/x.md`, mac)).toMatchObject({ targetFile: 'x.md', setWorkspaceId: 'ws-mac2' });
+    expect(route(`${MAC}/inner/Deep/x.md`, mac)).toMatchObject({ targetFile: 'x.md', setWorkspaceId: 'ws-deep' });
+    expect(route(`${MAC}/Mac/x.md`, mac)).toMatchObject({ targetFile: 'x.md', setWorkspaceId: null });
+    // A stock path here is not under this computer's root, nor is its own under the stock one.
+    expect(route(`${MAC}/Cloud/x.md`, mac)).toMatchObject({ setWorkspaceId: null });
+  });
+
+  it('reads a stock root from a computer with a root of its own as the stock computer\'s first', () => {
+    const MAC = '/Users/me/langalpha';
+    const viewed = { workspace_id: 'ws-mac', computer_id: 'c-mac', dir_name: 'Mac', root_dir: MAC };
+    const mac = computerFolders(viewed, [
+      ...rows,
+      viewed,
+      { workspace_id: 'ws-local', computer_id: 'c-mac', dir_name: 'NVDA', root_dir: MAC },
+      { workspace_id: 'ws-only-here', computer_id: 'c-mac', dir_name: 'Local', root_dir: MAC },
+    ], computers);
+    expect(route('/home/workspace/NVDA/x.md', mac)).toMatchObject({ targetFile: 'x.md', setWorkspaceId: 'ws-nvda' });
+    expect(route(`${MAC}/NVDA/x.md`, mac)).toMatchObject({ targetFile: 'x.md', setWorkspaceId: 'ws-local' });
+    // No stock computer holds it, so the old spelling still reads here.
+    expect(route('/home/workspace/Local/x.md', mac)).toMatchObject({ targetFile: 'x.md', setWorkspaceId: 'ws-only-here' });
+    expect(route('/home/workspace/Mac/x.md', mac)).toMatchObject({ targetFile: 'x.md', setWorkspaceId: null });
+
+    // Through no folder, the stock computer's file opens nothing here, while
+    // on a stock computer, or with none elsewhere, it is this one's.
+    const elsewhere = (raw: string, folders: ComputerFolders | null) => onOtherComputer(parseAgentPath(raw, folders?.rootDir), folders);
+    const noStock = { ...mac!, otherComputers: mac!.otherComputers?.filter(({ root }) => root) };
+    expect(elsewhere('/home/workspace/outside.md', mac)).toBe(true);
+    expect(elsewhere('/home/workspace/Mac/outside.md', mac)).toBe(false);
+    expect(elsewhere('/home/workspace/outside.md', noStock)).toBe(false);
+    expect(elsewhere('/home/workspace/outside.md', home)).toBe(false);
+  });
+});
+
 describe('computeAgentArtifactRouting: a sibling\'s folder', () => {
-  const siblings: SiblingWorkspace[] = [
+  const siblings: FolderWorkspace[] = [
     { workspaceId: 'ws-nvda', dirName: 'NVDA', previousDirNames: ['nvidia-ab12'] },
     { workspaceId: 'ws-home', dirName: 'Home' },
     { workspaceId: 'ws-tsla', dirName: 'TSLA', previousDirNames: ['Macro'] },

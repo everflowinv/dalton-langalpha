@@ -48,6 +48,7 @@ from src.server.services.commands.control import (
     still_up,
     stop_marked,
 )
+from src.server.services.commands.mirror import take_owed
 from src.server.services.commands.settle import (
     AFTER_TURN_LIMIT,
     GONE,
@@ -218,6 +219,8 @@ class CommandWatcher:
 
         if WorkspaceManager.current() is None:
             return 0
+        # Mirrors owed by ends another worker recorded, of computers this one holds.
+        await take_owed()
         ended = 0
         for _ in range(_MAX_PAGES):
             if self._stopping.is_set():

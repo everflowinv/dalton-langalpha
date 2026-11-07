@@ -271,6 +271,10 @@ async def _resolve_with_connection(status: str) -> ResolvedMCP:
             new=AsyncMock(return_value=[]),
         ),
         patch(
+            f"{db}.mcp_descriptions.current_descriptions",
+            new=AsyncMock(return_value={}),
+        ),
+        patch(
             "src.server.services.mcp_config.account_disabled_builtins",
             new=AsyncMock(return_value=frozenset()),
         ),

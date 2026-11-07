@@ -6,6 +6,7 @@ import { useReadStoredPreferences } from '@/hooks/useStoredPreferences';
 import { useUpdatePreferences } from '@/hooks/useUpdatePreferences';
 import { useEndpointModels } from '@/hooks/useProviderModels';
 import { useRefreshAfterAccessChange } from '@/hooks/useModelAccessActions';
+import { useProviderCatalog } from '@/hooks/useProviderCatalog';
 import { modelPrefs, splitPreferenceWrite, type CustomProviderEntry } from '@/lib/modelPreferences';
 import { mergeProviderModels, replaceProviderModels } from '@/lib/customModels';
 import { apiErrorDetail, apiErrorStatus, apiValidationErrors } from '@/api/errors';
@@ -35,6 +36,7 @@ export function useCustomProviderForm() {
   const { preferences } = usePreferences();
   const readStored = useReadStoredPreferences();
   const updatePreferences = useUpdatePreferences();
+  const { connectionOf } = useProviderCatalog();
   const updateApiKeys = useUpdateApiKeys();
   const refresh = useRefreshAfterAccessChange();
 
@@ -127,7 +129,7 @@ export function useCustomProviderForm() {
       await updatePreferences.mutateAsync(splitPreferenceWrite({
         custom_providers: [...(bag.custom_providers ?? []).filter((p) => p.name !== slug), provider],
         // Models added since under a name re-used here survive this pass.
-        custom_models: mergeProviderModels(bag.custom_models ?? [], slug, batch),
+        custom_models: mergeProviderModels(bag.custom_models ?? [], slug, batch, connectionOf),
       }));
       unsaved = true;
       // After the preferences: the server takes a key only for a provider it knows.
@@ -150,7 +152,7 @@ export function useCustomProviderForm() {
             ...(bag.custom_providers ?? []).filter((p) => p.name === slug),
           ];
           const models = replaceProviderModels(
-            now.custom_models ?? [], slug, (bag.custom_models ?? []).filter((m) => m.provider === slug),
+            now.custom_models ?? [], slug, (bag.custom_models ?? []).filter((m) => m.provider === slug), connectionOf,
           );
           return updatePreferences.mutateAsync(splitPreferenceWrite({
             custom_providers: providers.length > 0 ? providers : null,

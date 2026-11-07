@@ -27,6 +27,12 @@ def provider_catalog() -> list[dict]:
     config = LLM.get_model_config()
     flat = config.flat_providers
 
+    # Another API of a connection, saved under by a model served on it.
+    routes_by_parent: dict[str, list[str]] = {}
+    for key, info in flat.items():
+        if not info.get("platform") and config.connection_of(key) != key:
+            routes_by_parent.setdefault(config.connection_of(key), []).append(key)
+
     region_variants_by_parent: dict[str, list[dict]] = {}
     for key, info in flat.items():
         if info.get("platform"):
@@ -46,6 +52,7 @@ def provider_catalog() -> list[dict]:
                 "sdk": info.get("sdk"),
                 "base_url": _base_url(info),
                 "use_response_api": info.get("use_response_api", False),
+                "models_from": config.models_from(key),
             })
 
     def _entry(k: str, inf: dict, brand: str) -> dict:
@@ -65,6 +72,9 @@ def provider_catalog() -> list[dict]:
             "base_url": _base_url(inf),
             "use_response_api": inf.get("use_response_api", False),
             "dynamic_models": inf.get("dynamic_models", False),
+            # Whose manifest models a key saved here offers (``models_from``):
+            # the provider's own, else a plan's brand, or a plan region's plan.
+            "models_from": config.models_from(k),
             "group": group,
             "group_display_name": config.get_display_name(group),
             # What kind of provider the group is (closed_source, open_source,
@@ -74,6 +84,8 @@ def provider_catalog() -> list[dict]:
         rv = region_variants_by_parent.get(k)
         if rv:
             entry["region_variants"] = rv
+        if routes_by_parent.get(k):
+            entry["routes"] = routes_by_parent[k]
         return entry
 
     catalog = []
@@ -83,11 +95,11 @@ def provider_catalog() -> list[dict]:
         # Local providers (Ollama, LM Studio, vLLM) are OSS-only
         if info.get("access_type") == "local" and HOST_MODE == "platform":
             continue
+        if not config.provider_listed(info):
+            continue
         parent_key = info.get("parent_provider")
-        if not parent_key:
-            catalog.append(_entry(key, info, key))
-        elif info.get("access_type", "api_key") != flat.get(parent_key, {}).get("access_type", "api_key"):
-            catalog.append(_entry(key, info, parent_key))
+        if not parent_key or info.get("access_type", "api_key") != flat.get(parent_key, {}).get("access_type", "api_key"):
+            catalog.append(_entry(key, info, config.brand_of(key)))
     return catalog
 
 

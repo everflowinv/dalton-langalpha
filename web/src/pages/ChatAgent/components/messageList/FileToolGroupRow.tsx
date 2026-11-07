@@ -4,7 +4,7 @@ import { motion } from '@/lib/framer';
 import { ChevronDown } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { categorizeTool, getToolIcon, getCompletedRowTitle, getCompletedSummary } from '../toolDisplayConfig';
-import { classifyAgentPath } from '../../utils/agentPaths';
+import { classifyAgentPath, ranElsewhere } from '../../utils/agentPaths';
 import { RunningLine } from './ToolCallRow';
 import { RowIcon, FailedIconBadge } from './ActivityRowParts';
 import { FoldPanel } from './FoldPanel';
@@ -64,8 +64,11 @@ export const FileToolGroupRow = memo(function FileToolGroupRow({ items, onOpenFi
   const singlePath = filePathOf(item);
   const singleLabel = getCompletedSummary(toolName, item.toolCall, t, root)
     || (singlePath && classifyAgentPath(singlePath, root).kind === 'file' ? singlePath.split('/').pop() : null);
+  // A run keeps to one computer. On another one the path is that machine's,
+  // and the file panel would read it here, so the pill opens the call.
+  const elsewhere = ranElsewhere(item.toolCall?.args);
   const openPath = (path: string) => {
-    if (onOpenFile) onOpenFile(path);
+    if (onOpenFile && !elsewhere) onOpenFile(path);
     else {
       const call = items.find((entry) => filePathOf(entry) === path);
       if (call) onToolCallClick?.(call);

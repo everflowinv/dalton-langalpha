@@ -41,6 +41,7 @@ from ptc_agent.agent.middleware.provenance.command_trace import (
     shown_commands,
 )
 from ptc_agent.agent.middleware.direct_mcp import direct_tool_meta
+from ptc_agent.agent.tools.computer_reach import ran_elsewhere
 from ptc_agent.core.project_context import current_project
 from ptc_agent.agent.provenance import (
     ProvenanceSource,
@@ -811,6 +812,10 @@ class ProvenanceMiddleware(AgentMiddleware):
         args = request.tool_call.get("args") or {}
         path = args.get("file_path") or args.get("path")
         if not path:
+            return
+        # Read on another of the user's computers, where the Sources panel,
+        # which opens the path on the turn's own, would find another file.
+        if ran_elsewhere(args):
             return
         if _is_agent_infra_path(path, self._sandbox_root):
             return

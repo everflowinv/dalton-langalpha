@@ -26,6 +26,9 @@ OAUTH_RESOURCE_AUDIENCES: tuple[str, ...] = tuple(
     for aud in os.getenv("OAUTH_RESOURCE_AUDIENCE", "").split(",")
     if aud.strip()
 )
+# The issuer's public client the `la` CLI signs in with (PKCE, loopback
+# redirect). Unset, `la login` takes a personal access token instead.
+OAUTH_CLI_CLIENT_ID: str = os.getenv("OAUTH_CLI_CLIENT_ID", "").strip()
 
 # TLS mode for the app-data and checkpointer pools. "prefer" negotiates TLS when the
 # server offers it and falls back to plaintext when it doesn't — the only value that
@@ -64,12 +67,14 @@ SERVER_BASE_URL: str = os.getenv("SERVER_BASE_URL", "http://localhost:8000")
 PUBLIC_APP_URL: str = (os.getenv("PUBLIC_APP_URL", "") or SERVER_BASE_URL).rstrip("/")
 
 # Where this server serves previews that a browser cannot open directly (a
-# private E2B computer's ports): a scheme and host, each preview a subdomain
-# of it. Unset turns the preview proxy off.
+# private E2B computer's ports) and the pages the agent publishes: a scheme and
+# host, each preview and page a subdomain of it. Unset turns the preview proxy
+# off, and pages are served sandboxed from the API origin instead.
 PREVIEW_PROXY_BASE_URL: str = os.getenv("PREVIEW_PROXY_BASE_URL", "").strip()
 
-# Origins allowed to frame a proxied preview, as a CSP frame-ancestors source
-# list. Unset sends none, which leaves framing to the preview itself.
+# Origins allowed to frame a proxied preview or a published page, as a CSP
+# frame-ancestors source list. Unset sends none, which leaves framing to the
+# preview itself.
 PREVIEW_PROXY_FRAME_ANCESTORS: str = os.getenv("PREVIEW_PROXY_FRAME_ANCESTORS", "").strip()
 
 # Where this deployment serves its OAuth client metadata document (CIMD). An

@@ -31,6 +31,7 @@ from ptc_agent.agent.middleware.compaction.utils import (
     parse_summary_message,
 )
 from ptc_agent.agent.middleware.tool.argument_parsing import parse_tool_args
+from ptc_agent.agent.tools.computer_reach import ran_elsewhere
 from ptc_agent.agent.transcript.classify import STEERING_MARKERS, human_kind
 from src.llms.content_utils import extract_content_with_type
 from src.llms.token_counter import extract_token_usage
@@ -91,9 +92,11 @@ def messages_to_history_events(
     for message in messages:
         if isinstance(message, HumanMessage):
             events.extend(_project_human_message(message, agent))
+            events.extend(_stamped_summary(message, agent))
             continue
         if isinstance(message, ToolMessage):
             events.extend(_project_tool_message(message, tool_call_index, agent))
+            events.extend(_stamped_summary(message, agent))
             continue
         if isinstance(message, AIMessage):
             events.extend(_project_ai_message(message, tool_call_index, agent))
@@ -289,16 +292,7 @@ def _project_ai_message(
     message_id = message.id or "unknown"
     # A compaction before this call: live, its signal fires before the call
     # streams, so the notice sits between the calls it fell between.
-    summary = compaction_summary(message)
-    if summary is not None:
-        events.append(
-            HistoryEvent(
-                "context-window",
-                agent,
-                summary["summary_message_id"],
-                _stamped_summarize_payload(summary),
-            )
-        )
+    events.extend(_stamped_summary(message, agent))
     text, reasoning, phase = split_content_blocks(message.content)
     tool_calls = _filter_tool_calls(message.tool_calls or [])
 
@@ -348,6 +342,22 @@ def _project_ai_message(
             usage_data["threshold"] = threshold
         events.append(HistoryEvent("context-window", agent, message_id, usage_data))
     return events
+
+
+def _stamped_summary(message: AnyMessage, agent: str) -> list[HistoryEvent]:
+    """The compaction stamped on ``message``: on a response, one before its
+    call; on a prompt or a tool result, one made between it and the reply."""
+    summary = compaction_summary(message)
+    if summary is None:
+        return []
+    return [
+        HistoryEvent(
+            "context-window",
+            agent,
+            summary["summary_message_id"],
+            _stamped_summarize_payload(summary),
+        )
+    ]
 
 
 def _project_tool_message(
@@ -423,6 +433,8 @@ def _derive_artifact(
     tool_call_id = message.tool_call_id
 
     if tool_name in _FILE_OPERATION_TOOLS:
+        if ran_elsewhere(args):
+            return None
         payload: dict[str, Any] = {
             "operation": tool_name,
             "file_path": args.get("file_path", ""),
@@ -601,11 +613,11 @@ def _stamped_summarize_payload(stamp: dict[str, Any]) -> dict[str, Any]:
 
 def inline_summary_ids(messages: Iterable[AnyMessage]) -> set[str]:
     """The summaries ``messages`` replay where they fired, off the
-    responses that answered from them."""
+    messages stamped with them."""
     return {
         stamp["summary_message_id"]
         for message in messages
-        if isinstance(message, AIMessage) and (stamp := compaction_summary(message))
+        if (stamp := compaction_summary(message))
     }
 
 

@@ -227,7 +227,17 @@ async def _purge_and_bump(
     # the running ones, because a cached snapshot outlives the sandbox that
     # wrote it.
     if purge:
-        await delete_user_and_workspace_tool_schemas_and_bump(user_id, purge)
+        # Their descriptions go with the snapshots: these servers' tools may
+        # have moved with the secret.
+        from src.server.services.mcp_descriptions.jobs import own_description_scopes
+
+        await delete_user_and_workspace_tool_schemas_and_bump(
+            user_id,
+            purge,
+            description_scopes=own_description_scopes(
+                user_id, [s for s in referencing if s.name in purge]
+            ),
+        )
     else:
         await bump_user_workspaces_mcp_version(user_id)
 

@@ -36,6 +36,7 @@ import type {
 import type { CardUpdater } from './streamRefs';
 import type { SubagentHistoryStore } from './subagents/historyStore';
 import type { SubagentTokenUsage } from '../utils/tokenUsage';
+import type { NextSummary } from '../utils/api/messages';
 import type { RecentlySentTracker } from '../hooks/utils/recentlySentTracker';
 import type { RequestKeyTracker } from '../hooks/utils/requestKey';
 import type { PreviewData } from '../hooks/utils/types';
@@ -149,6 +150,7 @@ export interface StreamRuntime {
   setIsLoading: React.Dispatch<React.SetStateAction<boolean>>;
   setPendingInterrupt: React.Dispatch<React.SetStateAction<PendingInterrupt | null>>;
   setTokenUsage: React.Dispatch<React.SetStateAction<TokenUsage | null>>;
+  setNextSummary: React.Dispatch<React.SetStateAction<NextSummary | null>>;
   setMessageError: React.Dispatch<React.SetStateAction<string | StructuredError | null>>;
   setIsCompacting: (value: string | false) => void;
   setCompactionTokens: (tokens: number | null) => void;
@@ -178,6 +180,9 @@ export interface StreamRuntime {
   /** A delivery of a steer this view sent settles its key. */
   requestKeyRef: Ref<RequestKeyTracker>;
   offloadBatchRef: Ref<OffloadBatch>;
+  /** The stream left the next send's summary unsaid: a run started (which
+   *  clears it) and no closing frame has told it since. */
+  nextSummaryOwedRef: Ref<boolean>;
 }
 
 /**
@@ -201,6 +206,7 @@ export interface RecoveryRuntime {
   setIsCompacting: (value: string | false) => void;
   setHasActiveSubagents: React.Dispatch<React.SetStateAction<boolean>>;
   setReloadTrigger: React.Dispatch<React.SetStateAction<number>>;
+  setNextSummary: React.Dispatch<React.SetStateAction<NextSummary | null>>;
   // stable containers, ref-current reads — owned by this lane
   isStreamingRef: Ref<boolean>;
   streamingThreadIdRef: Ref<string | null>;
@@ -225,6 +231,7 @@ export interface RecoveryRuntime {
   renderedInterruptIdsRef: Ref<Set<string>>;
   subagentHistory: SubagentHistoryStore;
   subagentTokenUsageRef: Ref<Record<string, SubagentTokenUsage>>;
+  nextSummaryOwedRef: Ref<boolean>;
 }
 
 /**

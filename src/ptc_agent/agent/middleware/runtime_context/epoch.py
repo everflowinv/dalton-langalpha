@@ -107,8 +107,8 @@ class Workspace:
 # sentence rather than restating it.
 OTHER_COMPUTERS = (
     "A workspace the user names that has no sibling folder is on another "
-    "computer, out of reach of your files. Say so, and that they can use it "
-    "from that workspace or ask their Chief of Staff."
+    "computer, out of reach of your files. Say so, and that their Chief of "
+    "Staff can reach it, or they can work on it from that workspace."
 )
 
 # A computer that is the user's own machine, by its ``computer_machine`` token.

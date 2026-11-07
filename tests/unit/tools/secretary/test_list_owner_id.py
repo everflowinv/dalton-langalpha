@@ -42,7 +42,7 @@ async def test_workspace_list_rows_carry_only_what_a_hand_off_reads():
         "src.server.database.workspace.get_workspaces_for_user",
         AsyncMock(return_value=([row], 1)),
     ), patch(
-        "src.server.database.computer.get_computer_names_and_home",
+        "src.server.database.computer.get_computer_roster",
         AsyncMock(
             return_value=[{"computer_id": "cmp-1", "name": "Cloud computer", "is_home": True}]
         ),
@@ -64,11 +64,10 @@ async def test_workspace_list_rows_carry_only_what_a_hand_off_reads():
     ]
 
 
-async def test_the_chief_of_staff_sees_a_folder_only_on_homes_computer():
-    """Home reads its siblings' folders on its own computer. A workspace on
-    another computer has no folder there, so its row names none, and with
-    more than one computer each row names the computer it is on, and whether
-    that is the user's own."""
+async def test_each_row_names_its_folder_and_with_two_computers_its_computer():
+    """The Chief of Staff reaches every computer's folders, so each row names
+    its folder; with more than one computer each also names the computer it
+    is on, the one to pass as ``computer``, and whether that is the user's own."""
     from src.tools.secretary.chief_of_staff import chief_of_staff_workspaces
 
     rows = [
@@ -77,20 +76,26 @@ async def test_the_chief_of_staff_sees_a_folder_only_on_homes_computer():
     ]
     read_computers = AsyncMock(
         return_value=[
-            {"computer_id": "cmp-home", "name": "Cloud computer", "is_home": True},
+            {
+                "computer_id": "cmp-home",
+                "name": "Cloud computer",
+                "is_home": True,
+                "root_dir": "/home/workspace",
+            },
             {
                 "computer_id": "cmp-other",
                 "name": "Big box",
                 "is_home": False,
                 "kind": "ssh",
                 "provider_config": {"os": "Linux"},
+                "root_dir": "/home/me/langalpha",
             },
         ]
     )
     with patch(
         "src.server.database.workspace.get_workspaces_for_user",
         AsyncMock(return_value=(rows, 2)),
-    ), patch("src.server.database.computer.get_computer_names_and_home", read_computers):
+    ), patch("src.server.database.computer.get_computer_roster", read_computers):
         command = await chief_of_staff_workspaces.ainvoke(
             {
                 "name": "manage_workspaces",
@@ -106,7 +111,10 @@ async def test_the_chief_of_staff_sees_a_folder_only_on_homes_computer():
         for ws in listed
     } == {
         "ws-here": ("semis", "Cloud computer", None),
-        "ws-there": (None, "Big box", "the user's own machine"),
+        "ws-there": ("macro", "Big box", "the user's own machine"),
     }
     assert "machine" not in listed[0]
+    # Calls on another computer take its own paths, so its folder comes whole.
+    assert "path" not in listed[0]
+    assert listed[1]["path"] == "/home/me/langalpha/macro"
     read_computers.assert_awaited_once_with(OWNER)

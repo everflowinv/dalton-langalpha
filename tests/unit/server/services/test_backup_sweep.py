@@ -21,6 +21,7 @@ from src.server.services.computer_manager import _machine_backup
 from src.server.services.computer_manager._machine_backup import MachineBackupMixin
 from src.server.services.computer_manager._sessions import SessionCacheMixin
 from src.server.services.persistence import backup
+from src.server.services.persistence.sync_result import BackupIncomplete
 from src.server.services.persistence.transfer import (
     ScanMark,
     ScanResult,
@@ -253,6 +254,112 @@ async def test_a_machine_whose_owner_turned_backups_off_is_neither_swept_nor_mir
     assert _synced(mgr) == []
     marks.assert_not_awaited()
     sweeper.assert_not_awaited()
+
+
+# --- a computer the Chief of Staff reached from Home ------------------------
+
+
+async def _run_computer(
+    rows,
+    *,
+    live,
+    sweep=None,
+    files_backup=True,
+    live_ids=(),
+    cached=None,
+    status="running",
+    unmirrored=(),
+):
+    mgr = _Manager("", cached=cached)
+    mgr.backup_project_files = AsyncMock(side_effect=lambda ws, **_: ws not in unmirrored)
+    binding = mgr.resolve_binding.return_value
+    binding.workspace_id = ""
+    binding.files_backup = files_backup
+    row = {"computer_id": COMPUTER, "provider_ref": DURABLE_REF, "status": status}
+    mgr._binding_from_computer = MagicMock(return_value=binding)
+    mgr.cached_session_for_computer = MagicMock(return_value=live)
+    mgr._start_machine = AsyncMock()
+    sweeper = (
+        AsyncMock(side_effect=sweep)
+        if isinstance(sweep, Exception)
+        else AsyncMock(return_value=sweep or _verdict())
+    )
+    with (
+        patch("src.server.database.computer.get_computer", new=AsyncMock(return_value=row)),
+        patch.object(_machine_backup, "get_scan_marks_for_computer", new=AsyncMock(return_value=rows)),
+        patch.object(
+            _machine_backup, "get_live_workspace_ids_for_computer", new=AsyncMock(return_value=list(live_ids))
+        ),
+        patch.object(_machine_backup, "sweep_projects", new=sweeper),
+        patch.object(_machine_backup, "scan_cap_bytes", return_value=None),
+    ):
+        done = await mgr.backup_computer_changes(COMPUTER)
+    # The machine's start path may rebuild or replace it: a backup never takes it.
+    mgr._start_machine.assert_not_awaited()
+    return mgr, sweeper, done
+
+
+@pytest.mark.asyncio
+async def test_a_reached_computer_mirrors_what_changed_on_this_workers_live_session():
+    mgr, sweeper, done = await _run_computer(
+        [_row("w1"), _row("w2")], live=_session(), sweep=_verdict(changed=["w2"], unchanged=["w1"])
+    )
+    assert done
+    assert [t.key for t in _swept(sweeper)] == ["w1", "w2"]
+    assert _synced(mgr) == ["w2"]
+
+
+@pytest.mark.asyncio
+async def test_a_reached_computer_with_a_project_left_unmirrored_stays_owed():
+    """No turn there sweeps it again, so the mirror is tried again rather than
+    counted done."""
+    with pytest.raises(BackupIncomplete):
+        await _run_computer(
+            [_row("w1"), _row("w2")],
+            live=_session(),
+            sweep=_verdict(changed=["w1", "w2"]),
+            unmirrored={"w1"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_worker_without_a_live_session_there_owes_the_mirror():
+    """Not even through a session it cached once: a stopped computer's handle
+    can reconnect, and the start path can rebuild it from the backup this
+    would have brought up to date. The worker that holds it mirrors."""
+    mgr, sweeper, done = await _run_computer([_row("w1")], live=None, cached=_session())
+    assert not done
+    assert _synced(mgr) == []
+    sweeper.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_computer_owes_nothing_though_a_handle_still_looks_live():
+    """Its stop mirrored it, and a handle another worker's stop left behind
+    would reconnect to it."""
+    mgr, sweeper, done = await _run_computer([_row("w1")], live=_session(), status="stopped")
+    assert done
+    mgr.cached_session_for_computer.assert_not_called()
+    sweeper.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_reached_computer_whose_owner_turned_backups_off_is_left_as_it_is():
+    mgr, sweeper, done = await _run_computer([_row("w1")], live=_session(), files_backup=False)
+    assert done
+    assert _synced(mgr) == []
+    sweeper.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_sweep_of_a_reached_computer_mirrors_every_project_there():
+    """It holds no project of the turn's to fall back on, so a fallback to that
+    left every change there unmirrored."""
+    mgr, _, _ = await _run_computer(
+        [_row("w1"), _row("w2")], live=_session(), sweep=RuntimeError("exec timed out"),
+        live_ids=["w1", "w2"],
+    )
+    assert _synced(mgr) == ["w1", "w2"]
 
 
 # --- both paths derive the rules the same way -----------------------------

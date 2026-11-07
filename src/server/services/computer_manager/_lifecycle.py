@@ -1030,7 +1030,7 @@ class SessionLifecycleMixin:
             return
         if reverted is not None:
             # The sync wrote a token beside it into a sandbox left running.
-            await self._revoke_data_token(binding.computer_id)
+            await self._revoke_computer_tokens(binding.computer_id)
 
     async def _release_lost_lazy_start(
         self,
@@ -1064,7 +1064,7 @@ class SessionLifecycleMixin:
             )
             return
         if released is not None:
-            await self._revoke_data_token(computer_id)
+            await self._revoke_computer_tokens(computer_id)
 
     async def _publish_workspace_running_with_current_always_on(
         self,

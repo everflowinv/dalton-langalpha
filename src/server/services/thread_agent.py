@@ -17,9 +17,11 @@ from typing import TYPE_CHECKING, Any
 from fastapi import HTTPException
 
 if TYPE_CHECKING:
+    from ptc_agent.agent.claude_code.launcher import Launcher
     from ptc_agent.agent.roles import AgentRole
     from ptc_agent.config.agent import AgentConfig
     from ptc_agent.core.project_context import ProjectContext
+    from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
     from src.server.services.computer_manager._types import WorkspaceToolView
     from src.server.services.egress.direct_tools import DirectMCPBinding
     from src.server.services.turn_runtime import TurnRoute
@@ -102,6 +104,8 @@ class AgentInputs:
     user_profile: dict[str, Any] | None
     #: The directly bound tools, unopened: a run opens them (``drive``).
     direct_mcp: DirectMCPBinding
+    #: The computer the session runs on, where a Claude Code turn's CLI may.
+    computer_id: str | None
     # DALTON-HOOK(colleague-dispatch): workspace owner identity (B) distinct from turn caller (A)
     workspace_owner_id: str | None = None
 
@@ -149,6 +153,7 @@ class AgentInputs:
             user_profile=with_trading_rule(user_profile, tool_view.trading_rule),
             # DALTON-HOOK(colleague-dispatch): bind direct_mcp resolved above
             direct_mcp=direct_mcp,
+            computer_id=session.computer_id,
         )
 
     def build_kwargs(self) -> dict[str, Any]:
@@ -167,8 +172,16 @@ class AgentInputs:
             "project": self.project,
             "tool_view": self.tool_view,
             "role": self.role,
+            "claude_code_launcher": self.claude_code_launcher,
         }
         # DALTON-HOOK(colleague-dispatch): pass workspace_owner_id to graph build
         if self.workspace_owner_id and self.workspace_owner_id != self.user_id:
             kwargs["workspace_owner_id"] = self.workspace_owner_id
         return kwargs
+
+    def claude_code_launcher(self, sandbox: PTCSandbox) -> Launcher:
+        """Where a Claude Code turn's CLI runs, on the token it signs in with.
+        Imported here, never at the top: the SDK loads only for such a turn."""
+        from src.server.services.claude_code.launchers import turn_launcher
+
+        return turn_launcher(sandbox, computer_id=self.computer_id, user_id=self.user_id)

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os  # DALTON-HOOK(workspace-file-gc-kill): rollback env switch read in start()
 
 from src.server.database.workspace_file_blobs import sweep_blob_garbage
 from src.utils.storage import is_storage_enabled
@@ -39,6 +40,11 @@ class WorkspaceFileGCService:
     async def start(self) -> None:
         """Launch the sweep loop; inert when no object store is configured."""
         if self._task and not self._task.done():
+            return
+        # DALTON-HOOK(workspace-file-gc-kill): a rollback to pre-upgrade code
+        # must not sweep blobs the newer schema still references.
+        if os.environ.get("DALTON_WORKSPACE_FILE_GC_DISABLED") == "1":
+            logger.warning("[WorkspaceFileGC] disabled by DALTON_WORKSPACE_FILE_GC_DISABLED=1; not started")
             return
         if not is_storage_enabled():
             logger.info("[WorkspaceFileGC] no object store configured; not started")

@@ -1,7 +1,8 @@
 import React, { Suspense, useEffect, useEffectEvent, useLayoutEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { useLocation, useNavigate } from 'react-router';
 import { useTranslation } from 'react-i18next';
-import { ArrowLeft, PanelRight, TextSelect, Menu } from 'lucide-react';
+import { MessageSelectionQuote } from './selectionQuote/MessageSelectionQuote';
+import { ArrowLeft, PanelRight, Menu } from 'lucide-react';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { useStableHandler } from '@/hooks/useStableHandler';
 import { useLatestRef } from '@/hooks/useLatestRef';
@@ -23,7 +24,7 @@ import { cn } from '@/lib/utils';
 import { invalidateSubagents } from '@/hooks/useSubagents';
 import { markHandoffReady } from '@/pages/Onboarding/welcome/handoff';
 import { cardDownloadKey, trackPending } from '../utils/downloadNotice';
-import { summarizeThread, offloadThread, cancelSubagentTask, triggerFileDownload, resolveWorkspaceFile } from '../utils/api';
+import { summarizeThread, offloadThread, cancelSubagentTask, triggerFileDownload, resolveWorkspaceFile, type NextSummary } from '../utils/api';
 import { downloadTarget } from '../utils/fileRefResolver';
 import { toast } from '@/components/ui/use-toast';
 import { mergeWarmingDisplay } from '../utils/warmWorkspace';
@@ -50,7 +51,8 @@ import {
 } from '../utils/compactionControl';
 import './FilePanel.css';
 import ChatInput, { type ChatInputHandle } from '../../../components/ui/chat-input';
-import { attachmentsToContexts, widgetSnapshotsToContexts, type Attachment } from '../utils/fileUpload';
+import type { ComposerSend, ContextPayload } from '../../../components/ui/chat-input.types';
+import { attachmentsToContexts, widgetSnapshotsToContexts } from '../utils/fileUpload';
 import MessageList, { LiveMessageList, normalizeSubagentText } from './MessageList';
 import { MessageActionsProvider } from './messageList/MessageActionsContext';
 import { UserBubble } from './messageList/UserBubble';
@@ -74,31 +76,48 @@ import { ComposerTray, ReconnectingChip, TrayDock } from './chatView/ComposerTra
 import { useTrayContents } from './chatView/useTrayContents';
 import { useThreadCommands } from '../hooks/useCommands';
 import { ThreadCommandsContext } from './commands/threadCommandsContext';
+import { ChatCommentSendsProvider, useChatCommentSends } from './artifactComments/useChatCommentSends';
+import { DockableComposer } from './chatView/composerDock';
+import { ComposerDockContext } from './chatView/useComposerDock';
+import { useChatCover, useChatCoverReads } from './chatView/useChatCover';
+import { useComposerGiveBack } from './chatView/useComposerGiveBack';
+import { usePublishFile } from './chatView/usePublishFile';
+import { DockTurnStatus } from './chatView/DockTurnStatus';
+import { QueuedCommentDeck } from './artifactComments/QueuedCommentDeck';
 import { useTrayFold } from './chatView/useTrayFold';
 import { ErrorBanner } from '@/components/ui/error-banner';
 import { motion, AnimatePresence, type PanInfo } from '@/lib/framer';
-import { TWEEN } from '@/lib/motion';
+import { DURATION, EASE_COLLAPSE, SPRING_FOLD, TWEEN } from '@/lib/motion';
 import { MobileBottomSheet } from '@/components/ui/mobile-bottom-sheet';
+import { preloadableLazy } from '@/lib/lazyWithMotion';
 
 
 
-const loadFilePanel = () => import('./FilePanel');
-const FilePanel = React.lazy(loadFilePanel);
+// Preloadable: a lazy panel suspends on its first render even with its code
+// in, and its boundary's 300ms reveal throttle left a preloaded panel blank.
+const FilePanel = preloadableLazy(() => import('./FilePanel'));
+const loadFilePanel = FilePanel.preload;
+// The panel opens on the fold spring, which leaves the chat's edge almost
+// where it was for the first frames, and shuts on the collapse curve, as a
+// fold does, the fade outrunning it.
+const PANEL_OPEN = { width: SPRING_FOLD, opacity: TWEEN.quick };
+const PANEL_EXIT = { width: 0, opacity: 0, transition: { width: { duration: DURATION.fold, ease: EASE_COLLAPSE }, opacity: TWEEN.exit } };
 const DetailPanel = React.lazy(() => import('./DetailPanel'));
 const PreviewViewer = React.lazy(() => import('./viewers/PreviewViewer'));
 
+import type { SendOptions } from '../session/types';
 import type {
   MessageRecord, LocationState,
-  SlashCommand, ModelOptions, ActionCommand,
-  MsgSelectionTooltipData, ChatViewProps,
+  ActionCommand,
+  ChatViewProps,
 } from './chatView/types';
 import { TranscriptStatus } from './chatView/TranscriptStatus';
 import { FallbackSuggestionPill } from './chatView/FallbackSuggestionPill';
 import { ThreadOffers } from './chatView/ThreadNotices';
+import { useNextSummary } from '../hooks/useNextSummaryHint';
 import { ChatDiskWarning } from './chatView/ChatDiskWarning';
 import { ChatRestoreOffer } from './chatView/ChatRestoreOffer';
 import { useToolCallAnnouncer } from './chatView/useToolCallAnnouncer';
-import { useNavPanel } from './chatView/useNavPanel';
 import { MobileNavDrawer } from './chatView/MobileNavDrawer';
 import { useChatScroll } from './chatView/useChatScroll';
 import { useStreamFollow } from './chatView/transcriptFollow';
@@ -216,13 +235,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     isActiveRef.current = isActive;
   });
 
-  const {
-    navPanelVisible,
-    navSlideIn,
-    handleNavMinimize,
-    handleNavExpand,
-    inheritNavOnActivate,
-  } = useNavPanel();
+  // The mobile nav drawer. Desktop navigation is the app-shell AppSidebar.
+  const [navPanelVisible, setNavPanelVisible] = useState(false);
+  const handleNavMinimize = useCallback(() => setNavPanelVisible(false), []);
 
   // Floating cards management - extracted to custom hook for better encapsulation
   // Must be called before useChatMessages since updateTodoListCard and updateSubagentCard are passed to it
@@ -325,7 +340,14 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // Chat messages management - receives updateTodoListCard and updateSubagentCard from floating cards hook.
   // Send, edit, regenerate and retry come from useTranscriptFollow below.
   const readComposerOptions = useCallback(() => chatInputRef.current?.getModelOptions?.(), []);
-  const chat = useChatMessages(workspaceId, threadId, updateTodoListCard as (todoData: Record<string, unknown>) => void, updateSubagentCard, finalizePendingTodos, handleFileArtifact, handleOpenPreviewFromStream, clearSubagentCards, handleWorkspaceCreated, 'web', readComposerOptions);
+  // Filled by useChatCover below. A send that fails at a file's foot comes
+  // back to the box; in the chat it stays on screen with its Retry.
+  const coverReads = useChatCoverReads();
+  const chat = useChatMessages(workspaceId, threadId, {
+    updateTodoListCard: updateTodoListCard as (todoData: Record<string, unknown>) => void, updateSubagentCard, finalizePendingTodos,
+    onFileArtifact: handleFileArtifact, onPreviewUrl: handleOpenPreviewFromStream, clearSubagentCards,
+    onWorkspaceCreated: handleWorkspaceCreated, platform: 'web', readComposerOptions, returnsUnsent: coverReads.docked,
+  });
   const {
     messages,
     liveMessages,
@@ -350,10 +372,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     fallbackSuggestion,
     clearFallbackSuggestion,
     messageError,
-    returnedSteering,
-    clearReturnedSteering,
-    returnedEdit,
-    clearReturnedEdit,
+    watchCommentSends,
     editDrafts,
     stopWorkflow,
     stopCompaction,
@@ -372,11 +391,11 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     handleApproveToolCall,
     handleRejectToolCall,
     tokenUsage,
+    forThread,
     threadId: currentThreadId,
     threadModels,
     marketWatch,
     isShared: threadIsShared,
-    insertNotification,
     handleThumbUp,
     handleThumbDown,
     feedbackByTurn,
@@ -483,6 +502,11 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   });
   const { toSend: tuningToSend } = threadTuning;
 
+  // The route's `__default__` stands for a chat with no thread yet; handing it
+  // to the panel would give every unsent chat in a workspace one shared strip.
+  const liveThreadId = currentThreadId || threadId;
+  const panelThreadId = liveThreadId && liveThreadId !== '__default__' ? liveThreadId : undefined;
+
   // Fallback-suggestion pill action: adopt the model that actually answered,
   // for this thread only. Making it the default is the banner's offer, which
   // the pick raises like any other.
@@ -514,23 +538,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // Status tab (useRightPanel). The tray reads the same snapshot for its chip.
   const showWatchChip = (marketWatch?.symbols?.length ?? 0) > 0;
 
-  // Steering the agent finished without reading comes back to the composer,
-  // beside whatever was typed there since.
-  useEffect(() => {
-    if (returnedSteering) {
-      chatInputRef.current?.giveBack(returnedSteering);
-      clearReturnedSteering();
-    }
-  }, [returnedSteering, clearReturnedSteering]);
-
-  // Edit text whose message is gone comes back to the composer, beside
-  // whatever is typed there.
-  useEffect(() => {
-    if (returnedEdit) {
-      chatInputRef.current?.giveBack(returnedEdit);
-      clearReturnedEdit();
-    }
-  }, [returnedEdit, clearReturnedEdit]);
+  useComposerGiveBack(chatInputRef, chat);
 
   // Read by the unmount cleanup, whose own closure holds a stale thread id
   const readCurrentThreadId = useEffectEvent(() => currentThreadId);
@@ -572,8 +580,10 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     entryRestored,
     pinTargetRef,
   } = scroll;
+  // What the next send summarizes first, which every turn the reader starts carries.
+  const { summary: summaryHint, starters: summarized } = useNextSummary(chat);
   const { handleSendMessage, handleEditMessage, handleRegenerate, handleRetry } = useTranscriptFollow(
-    chat,
+    { ...chat, ...summarized },
     scroll.follow,
     () => getScrollContainer(scrollAreaRef),
     readTurnEndScroll(preferences),
@@ -718,6 +728,15 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
   // wrappers re-point post-commit; the callbacks only fire from user events,
   // which always run after commit, so they never see a stale function.
   const stableSendMessage = useStableHandler(handleSendMessage);
+  // What every send from this chat carries beside its own.
+  const composerSendOptions = useStableHandler((options: SendOptions): SendOptions => ({ ...options, subagentsAllowed: subagentsToSend, ...tuningToSend }));
+  // The file comments queued for this thread's next send, shown above the
+  // text box and carried by its send, and the sender the file panel uses.
+  const commentSends = useChatCommentSends({
+    threadId: panelThreadId, running: isLoading, watch: watchCommentSends, chatCovered: coverReads.covered,
+    sendToChat: (artifactComments) => stableSendMessage('', null, null, composerSendOptions({ ...readComposerOptions(), artifactComments })),
+  });
+  const { deck: commentDeck, take: takeQueuedComments } = commentSends;
   // A rerun carries what the composer shows, as a send does, so a pick whose
   // save has not landed is not lost to the row the server would read.
   const stableEditMessage = useStableHandler((id: string, content: string) =>
@@ -765,9 +784,10 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
 
   const { chips: chartSelectionChips, takeForSend: takeChartSelections } = usePanelChartSelections(isActive);
 
-  // Wrapper: converts ChatInput's (message, attachments, slashCommands) into
-  // handleSendMessage(message, additionalContext, attachmentMeta)
-  const handleSendWithAttachments = useCallback((message: string, attachments: Attachment[] = [], slashCommands: SlashCommand[] = [], modelOptions: ModelOptions = {}) => {
+  // Wrapper: converts ChatInput's send into handleSendMessage(message,
+  // additionalContext, attachmentMeta), the send itself the draft it gives back.
+  const handleSendWithAttachments = useCallback((send: ComposerSend) => {
+    const { message, files: attachments, commands: slashCommands, modelOptions } = send;
     const contexts: Record<string, unknown>[] = [];
     let attachmentMeta: Record<string, unknown>[] | null = null;
 
@@ -822,24 +842,32 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     }
 
     const additionalContext = contexts.length > 0 ? contexts : null;
+    const outgoing = picked?.outgoingMessage ?? message;
+    // The queued file comments go with every send, the text as their note.
+    const artifactComments = takeQueuedComments(outgoing);
     // DALTON-HOOK(composer-drafts): forward send result so ChatInput preserves the draft when sending fails
     return stableSendMessage(
-      picked?.outgoingMessage ?? message,
+      outgoing,
       additionalContext,
       attachmentMeta,
-      {
+      composerSendOptions({
         ...modelOptions,
         ...(picked ? { chartSelections: picked.snapshots } : {}),
-        subagentsAllowed: subagentsToSend,
-        ...tuningToSend,
-      },
+        ...(artifactComments ? { artifactComments } : {}),
+        // DALTON-HOOK(composer-drafts): the box as the person wrote it — a
+        // send the server refuses while the transcript is out of view goes
+        // back to the composer whole (attachments, mentions and commands too)
+        // instead of leaving a failed reply nobody reads.
+        draft: send,
+      }),
     );
-  }, [marketWatchEnabled, stableSendMessage, takeChartSelections, subagentsToSend, tuningToSend]);
+  }, [marketWatchEnabled, stableSendMessage, takeChartSelections, takeQueuedComments, composerSendOptions]);
 
   // Handle action-type slash commands (e.g. /compact, /compaction, /offload)
   const handleAction = useCallback((cmd: ActionCommand) => {
     const tid = currentThreadId || threadId;
     if (!tid || tid === '__default__') return;
+    const thread = forThread(tid);
 
     // Surface backend errors from /compact + /offload. Backend may return
     // detail as a structured object ({code, verb, message}) — the 409
@@ -853,21 +881,21 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       if (detail && typeof detail === 'object' && !Array.isArray(detail)) {
         const obj = detail as { code?: string; message?: string };
         if (obj.code === 'workflow_active') {
-          insertNotification(t('chat.compactBusy'), 'warning');
+          thread.insertNotification(t('chat.compactBusy'), 'warning');
           return;
         }
         if (typeof obj.message === 'string' && obj.message.length > 0) {
-          insertNotification(obj.message, 'warning');
+          thread.insertNotification(obj.message, 'warning');
           return;
         }
-        insertNotification(t(fallbackKey), 'warning');
+        thread.insertNotification(t(fallbackKey), 'warning');
         return;
       }
       if (typeof detail === 'string' && detail.length > 0) {
-        insertNotification(detail, 'warning');
+        thread.insertNotification(detail, 'warning');
         return;
       }
-      insertNotification(t(fallbackKey), 'warning');
+      thread.insertNotification(t(fallbackKey), 'warning');
     };
 
     // A user Stop while this compaction runs cancels the backend call, which
@@ -881,7 +909,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       const code = compactionErrorCode(err);
       if (isUserStoppedCompaction({ userStopped: userStoppedCompactionRef.current, errorCode: code })) {
         userStoppedCompactionRef.current = false;
-        insertNotification(t('chat.compactionStopped'), 'info');
+        thread.insertNotification(t('chat.compactionStopped'), 'info');
         return;
       }
       surfaceActionError(err, 'chat.compactionError');
@@ -906,7 +934,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       (cmd.name === 'compact' || cmd.name === 'offload') &&
       isManualCompactionInFlight({ isCompacting, isLoading })
     ) {
-      insertNotification(t('chat.compactBusy'), 'warning');
+      thread.insertNotification(t('chat.compactBusy'), 'warning');
       return;
     }
 
@@ -918,8 +946,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       summarizeThread(tid)
         .then((data: Record<string, unknown>) => {
           clearIfCurrent(myGeneration);
+          thread.setNextSummary(null);
           const detail = (data.summary_text as string | undefined) || undefined;
-          insertNotification(
+          thread.insertNotification(
             t('chat.compactedNotification', { from: data.original_message_count }),
             'info',
             detail,
@@ -937,7 +966,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       offloadThread(tid)
         .then((data: Record<string, unknown>) => {
           clearIfCurrent(myGeneration);
-          insertNotification(
+          thread.setNextSummary((data.next_summary as NextSummary | null | undefined) ?? null);
+          thread.insertNotification(
             t('chat.offloadedNotification', {
               args: (data.offloaded_args as number) || 0,
               reads: (data.offloaded_reads as number) || 0,
@@ -950,7 +980,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
           clearIfCurrent(myGeneration);
         });
     }
-  }, [currentThreadId, threadId, insertNotification, setIsCompacting, isCompacting, isLoading, t]);
+  }, [currentThreadId, threadId, setIsCompacting, forThread, isCompacting, isLoading, t]);
 
   // Show sidebar at the start of each backend response (streaming)
   // Auto-refresh workspace files when agent finishes (isLoading transitions true→false)
@@ -986,11 +1016,6 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
 
 
 
-  // The route's `__default__` stands for a chat with no thread yet; handing it
-  // to the panel would give every unsent chat in a workspace one shared strip.
-  const liveThreadId = currentThreadId || threadId;
-  const panelThreadId = liveThreadId && liveThreadId !== '__default__' ? liveThreadId : undefined;
-
   // Right-panel controller (chatView/useRightPanel).
   const {
     panelTarget,
@@ -1021,6 +1046,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     activeTabKind,
     leaveFiles,
     handleOpenPreview,
+    handleOpenArtifactComment,
     handleOpenShareLink,
     handleOpenChart,
     handleOpenInMarketView,
@@ -1044,15 +1070,35 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     isColleague: teamReadOnly.isColleague,
   });
 
+  // Whether the file panel covers the chat, and the composer that moves to the
+  // file's foot while it does (chatView/useChatCover).
+  const { dockOpen, dock: composerDock, panelInnerRef, onSheetLanded } = useChatCover({
+    isMobile, filePanel: rightPanelType === 'file', panelExpanded, panelWidth: rightPanelWidth, threadId: panelThreadId,
+    mainAgent: activeAgentId === 'main', queuedComments: commentDeck.comments, reads: coverReads,
+  });
+  const addCommentsToTurn = useStableHandler(() => { chatInputRef.current?.send(); });
+  const focusComposer = useStableHandler(() => { chatInputRef.current?.focus(); });
+  // The queued comments ride above the text box and count as something to
+  // send. Folded as the sheet starts over the chat, so it docks folded.
+  const composerDeck = {
+    hasExternalContext: chartSelectionChips.length > 0 || commentDeck.ready.length > 0,
+    placeholder: commentDeck.placeholder ?? chatPlaceholder,
+    // DALTON-HOOK(team-sharing): a colleague's workspace or a read-only
+    // thread shows no docked comment box — comments are sent into the thread
+    // from the owner's own chat.
+    deck: teamReadOnly.isColleague || isThreadReadOnly ? null : <QueuedCommentDeck deck={commentDeck} running={isLoading} compact={isMobile && dockOpen} onOpen={handleOpenArtifactComment}
+      onAddToTurn={addCommentsToTurn} focusComposer={focusComposer} />,
+  };
+
   // On desktop the header's files toggle gives way to the panel's own the
   // moment it is pressed, so a panel still fetching its code would leave
-  // neither on screen. Fetched once the view settles, or as the pointer
-  // nears the toggle, it is there before the click.
+  // neither on screen; on a phone a panel opening on its code's fetch slides
+  // in blank. Fetched once the view settles, or as the pointer nears the
+  // toggle, it is there before the click.
   useEffect(() => {
-    if (isMobile) return;
     const timer = setTimeout(() => { void loadFilePanel(); }, 1500);
     return () => clearTimeout(timer);
-  }, [isMobile]);
+  }, []);
   // The file panel's props are one compiled scope, so this handler's per-chunk
   // identity would re-create every inline prop beside it and re-render the panel.
   const openSubagentTaskFromPanel = useStableHandler(handleOpenSubagentTask);
@@ -1092,6 +1138,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     jumping: scroll.jumping,
     contents: trayContents,
     getScroller: getMainScrollRoot,
+    docked: composerDock.docked,
   });
 
   // Keep the ref in sync so SSE events (via handleOpenPreviewFromStream) use the latest closure
@@ -1153,17 +1200,29 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     });
   }, [navigate, fromThreadId, fromWorkspaceId]);
 
+  // The file cards' Publish, one dialog for the chat.
+  const { onPublishFile, dialog: publishDialog } = usePublishFile(workspaceId || null);
+
   // Identity-stable action bundles for the memoized message tree
   // (chatView/useMessageActionBundles).
   const { messageActions, subagentMessageActions } = useMessageActionBundles({
     onOpenFile: handleOpenFileFromChat,
     onDownloadFile: handleDownloadFileFromChat,
+    onPublishFile,
+    // DALTON-HOOK(external-share-guard)/(team-sharing): the transcript's file
+    // cards offer Publish to the workspace's own owner only — a colleague
+    // (rw or ro), an external member, or a read-only thread gets no entry.
+    publishAllowed:
+      !teamReadOnly.isColleague
+      && teamReadOnly.callerTier !== 'external'
+      && !isThreadReadOnly,
     downloadKeyFor,
     onRevealFiles: revealFiles,
     onRevealMessage: revealMessage,
     onOpenSources: handleOpenSourcesFromChat,
     onToolCallDetailClick: handleToolCallDetailClick,
     onOpenChart: handleOpenChart,
+    onOpenArtifactComment: handleOpenArtifactComment,
     onOpenSubagentTask: handleOpenSubagentTask,
     onOpenDispatcher: openDispatcher,
     onAnswerQuestion: handleAnswerQuestion,
@@ -1226,80 +1285,26 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
 
 
   // Add context from FilePanel or message selection to ChatInput
-  const handleAddContext = useCallback((ctx: any) => { // TODO: type properly
+  const handleAddContext = useCallback((ctx: ContextPayload) => {
     chatInputRef.current?.addContext(ctx);
   }, []);
 
-  // Message text selection → "Add to context" tooltip
-  const [msgSelectionTooltip, setMsgSelectionTooltip] = useState<MsgSelectionTooltipData | null>(null);
   const msgAreaRef = useRef<HTMLDivElement>(null);
   // Collapse avatars when the messages column is too narrow to comfortably
   // accommodate them (mobile, side panels, etc.). 640px matches the visual
   // breakpoint where avatar gutters start crowding the message bubble.
 
-  const handleMessageMouseUp = useCallback(() => {
-    // Small delay to let the browser finalize the selection
-    setTimeout(() => {
-      const sel = window.getSelection();
-      if (!sel || !sel.toString().trim()) {
-        setMsgSelectionTooltip(null);
-        return;
-      }
-      const text = sel.toString();
-      const range = sel.getRangeAt(0);
-      const rect = range.getBoundingClientRect();
-      const area = msgAreaRef.current;
-      const areaRect = area?.getBoundingClientRect();
-      if (!areaRect) return;
-
-      setMsgSelectionTooltip({
-        x: rect.left - areaRect.left + rect.width / 2,
-        y: rect.top - areaRect.top - 8,
-        text,
-      });
-    }, 10);
-  }, []);
-
-  const handleAddMessageContext = useCallback(() => {
-    if (!msgSelectionTooltip) return;
-    const text = msgSelectionTooltip.text;
-    const lineCount = (text.match(/\n/g) || []).length + 1;
-    // Label: show line count for multi-line, or truncated text for single-line
-    const label = lineCount > 1
-      ? `chat: ${lineCount} lines`
-      : (text.length > 30 ? text.slice(0, 27).trim() + '...' : text);
-    chatInputRef.current?.addContext({
-      snippet: text,
-      label,
-      lineCount,
-      source: 'chat',
-    });
-    setMsgSelectionTooltip(null);
-    window.getSelection()?.removeAllRanges();
-  }, [msgSelectionTooltip]);
-
-  // Clear tooltip on mousedown (unless clicking the tooltip itself)
-  useEffect(() => {
-    if (!msgSelectionTooltip) return;
-    const handler = (e: MouseEvent) => {
-      if ((e.target as HTMLElement)?.closest?.('.chat-selection-tooltip')) return;
-      setTimeout(() => {
-        const sel = window.getSelection();
-        if (!sel || !sel.toString().trim()) setMsgSelectionTooltip(null);
-      }, 10);
-    };
-    document.addEventListener('mousedown', handler);
-    return () => document.removeEventListener('mousedown', handler);
-  }, [msgSelectionTooltip]);
-
+  const scrollThreadToTop = useCallback(() => {
+    if (activeAgentId === 'main') toTop();
+    else subagentToTop();
+  }, [activeAgentId, toTop, subagentToTop]);
 
   // Mobile: tap top bar to scroll chat to top
   const handleTopBarTap = useCallback((e: React.MouseEvent) => {
     if (!isMobile) return;
     if ((e.target as HTMLElement).closest('button, a')) return;
-    if (activeAgentId === 'main') toTop();
-    else subagentToTop();
-  }, [isMobile, activeAgentId, toTop, subagentToTop]);
+    scrollThreadToTop();
+  }, [isMobile, scrollThreadToTop]);
 
 
 
@@ -1453,13 +1458,14 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
 
 
   // When this view becomes active (thread switch or new thread):
-  // 1. Inherit nav panel state from the shared signal so it stays open across switches
+  // 1. Close the nav drawer: a cached view was left however it stood, and the
+  //    drawer covers the thread this view is here to show
   // 2. Scroll to bottom — while hidden (display:none) auto-scroll is a no-op
   // A run that started or ended while it was hidden is useForeignRunCatchUp's.
   const prevIsActiveRef = useRef(false);
   useEffect(() => {
     if (isActive && !prevIsActiveRef.current) {
-      inheritNavOnActivate();
+      handleNavMinimize();
 
       const tidNow = currentThreadId || threadId;
       requestAnimationFrame(() => {
@@ -1472,7 +1478,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
       });
     }
     prevIsActiveRef.current = isActive;
-  }, [isActive, getScrollContainer, currentThreadId, threadId, pinToBottom, inheritNavOnActivate, isNearBottomRef, restoredForThreadRef]);
+  }, [isActive, getScrollContainer, currentThreadId, threadId, pinToBottom, handleNavMinimize, isNearBottomRef, restoredForThreadRef]);
 
   const feedThreadId = currentThreadId || threadId;
   useForeignRunCatchUp({
@@ -1519,6 +1525,8 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     <RouteLeaveGuardContext value={leaveFiles}>
     <ShareLinkOpenerContext value={handleOpenShareLink}>
     <ThreadCommandsContext value={panelThreadId ?? null}>
+    <ChatCommentSendsProvider value={commentSends}>
+    <ComposerDockContext value={composerDock.context}>
     {/* `h-full`, never `h-screen`: this fills the shell's content column, which
         is the viewport only when nothing else is in it. Pinning it to 100vh
         pushes it out of its own box the moment anything is (the offline
@@ -1583,7 +1591,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
             </button>
             {isMobile && (
               <button
-                onClick={handleNavExpand}
+                onClick={() => setNavPanelVisible(true)}
                 className="p-2 rounded-md transition-colors shrink-0"
                 style={{ color: 'var(--color-text-primary)' }}
                 title={t('sidebar.menu')}
@@ -1592,7 +1600,14 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
               </button>
             )}
             <h1 className="text-base font-semibold whitespace-nowrap title-font truncate" style={{ color: 'var(--color-text-primary)' }}>
-              {workspaceName || t('thread.workspace')}
+              {/* The bar's tap is a pointer's shortcut, and a bar holding buttons
+                  cannot be one. The title is the same action as a real control,
+                  named by the words on it, with what it does as its description. */}
+              {isMobile ? (
+                <button type="button" className="block max-w-full truncate text-left" title={t('chat.scrollToTop')} onClick={scrollThreadToTop}>
+                  {workspaceName || t('thread.workspace')}
+                </button>
+              ) : (workspaceName || t('thread.workspace'))}
             </h1>
             {/* DALTON-HOOK(workspace-sharing-settings): display colleague access banner in top bar */}
             {teamReadOnly.isColleague && (
@@ -1656,7 +1671,6 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
           {isMobile && (
             <MobileNavDrawer
               visible={navPanelVisible}
-              slideIn={navSlideIn}
               onMinimize={handleNavMinimize}
               isActive={isActive}
               workspaceId={workspaceId}
@@ -1685,27 +1699,17 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                 height: 0, // Force flex-1 to work properly
                 position: 'relative',
               }}
-              onMouseUp={handleMessageMouseUp}
             >
-              {/* Message selection tooltip */}
-              {/* DALTON-HOOK(workspace-sharing-settings): hide add-to-context tooltip for colleagues */}
-              {/* DALTON-HOOK(colleague-dispatch): hide add-to-context tooltip on read-only foreign threads */}
-              {msgSelectionTooltip && !isThreadReadOnly && (() => {
-                const lines = (msgSelectionTooltip.text.match(/\n/g) || []).length + 1;
-                return (
-                  <div
-                    className="chat-selection-tooltip file-panel-selection-tooltip"
-                    style={{
-                      left: Math.max(8, msgSelectionTooltip.x - 60),
-                      top: Math.max(4, msgSelectionTooltip.y - 32),
-                    }}
-                    onMouseDown={(e) => { e.preventDefault(); e.stopPropagation(); handleAddMessageContext(); }}
-                  >
-                    <TextSelect className="h-3.5 w-3.5" style={{ color: 'var(--color-accent-primary)' }} />
-                    {lines > 1 ? t('context.addNLinesToContext', { count: lines }) : t('context.addToContext')}
-                  </div>
-                );
-              })()}
+              {/* Message selection quote (#676) replaces Dalton's selection tooltip. */}
+              {/* DALTON-HOOK(workspace-sharing-settings): no selecting text to quote for colleagues on a read-only thread */}
+              {/* DALTON-HOOK(colleague-dispatch): no selecting text to quote on read-only foreign threads */}
+              <MessageSelectionQuote
+                key={`${threadId}:${activeAgentId}:${isActive}`}
+                surfaceRef={msgAreaRef}
+                active={!!isActive && activeAgentId === 'main' && !isThreadReadOnly}
+                agentName={isHome ? t('agents.chiefOfStaff') : t('agents.analyst')}
+                onAddContext={handleAddContext}
+              />
               {activeAgentId === 'main' ? (
                 <ScrollArea ref={scrollAreaRef} className={`h-full w-full${!isMobile && !rightPanelType ? ' chat-scroll-hide-scrollbar' : ''}`}>
                   {/* The floor a pinned send holds open under its reply
@@ -1880,6 +1884,9 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
               {/* Re-declares --composer-h for the same reason the transcript
                   content does (TRANSCRIPT_BOTTOM_PAD): nothing in the stack
                   reads it. */}
+              {/* The stack moves to the foot of a file tab while the chat is
+                  out of view (chatView/useComposerDock), as the same elements. */}
+              <DockableComposer home={composerDock.home} host={composerDock.host}>
               <div className="w-full max-w-3xl sibling-space-y-3 relative pointer-events-auto [--composer-h:initial]">
                 {/* DALTON-HOOK(workspace-sharing-settings): replace writable composer with disabled colleague composer */}
                 {/* DALTON-HOOK(colleague-dispatch): also show disabled composer on foreign-owned threads or revoked workspaces */}
@@ -1933,8 +1940,11 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                       onSwitchModel={handleSwitchModel}
                       onDismiss={clearFallbackSuggestion}
                     />
-                    <ThreadOffers model={threadModel} subagents={threadSubagents} />
+                    <ThreadOffers model={threadModel} subagents={threadSubagents} summary={summaryHint} />
                     <SelectionChips chips={chartSelectionChips} />
+                    {/* At a file's foot the transcript is out of view, so the
+                        turn's progress comes along with the composer. */}
+                    {composerDock.docked && <DockTurnStatus running={isLoading} messages={messages} />}
                     {/* One row: the drawer is a tab tucked under the composer's top
                         edge, so no status row may come between them, and the
                         parent's sibling gap must not either. */}
@@ -1948,12 +1958,11 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                         // DALTON-HOOK(composer-drafts): persist draft per thread or per workspace new chat
                         draftKey={panelThreadId ? `thread:${panelThreadId}` : (workspaceId ? `ws:${workspaceId}:new` : undefined)}
                         onSend={handleSendWithAttachments}
-                        hasExternalContext={chartSelectionChips.length > 0}
+                        {...composerDeck}
                         disabled={isLoadingHistory || !workspaceId || !!pendingInterrupt}
                         onStop={handleStopButton}
                         isLoading={isLoading}
                         isCompacting={!!isCompacting}
-                        placeholder={chatPlaceholder}
                         files={mentionFiles}
                         tokenUsage={tokenUsage}
                         onAction={handleAction}
@@ -1966,6 +1975,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                         onPickReasoningEffort={threadTuning.setReasoningEffort}
                         onPickFastMode={threadTuning.setFastMode}
                         selectedWorkspaceId={workspaceId}
+                        inHome={isHome}
                         toolbarStatus={trayContents && (
                           <TrayDock ref={trayDockRef} phase={trayPhase} contents={trayContents} onOpen={peekTray} />
                         )}
@@ -1982,6 +1992,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                   <SubagentStatusBar agent={activeAgent} onSendInstruction={handleSubagentInstruction} />
                 ) : null}
               </div>
+              </DockableComposer>
             </div>
           </div>
         </div>
@@ -2044,6 +2055,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
             initial={{ x: '100%' }}
             animate={{ x: 0 }}
             transition={TWEEN.enter}
+            onAnimationComplete={onSheetLanded}
             // A chart pans with the same rightward swipe, so a chart tab closes by its button.
             drag={activeTabKind === 'chart' ? false : 'x'}
             dragConstraints={{ left: 0, right: 0 }}
@@ -2083,7 +2095,10 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                   filesLoading={filesLoading}
                   filesError={filesError}
                   onRefreshFiles={refreshFiles}
-                  onAddContext={isThreadReadOnly ? null : handleAddContext} // DALTON-HOOK(workspace-sharing-settings)
+                  onAddContext={!isThreadReadOnly && activeAgentId === 'main' ? handleAddContext : null} // DALTON-HOOK(workspace-sharing-settings)
+                  // DALTON-HOOK(team-sharing): no comment layer/docked comment box on a read-only thread
+                  threadReadOnly={isThreadReadOnly}
+                  agentName={isHome ? t('agents.chiefOfStaff') : t('agents.analyst')}
                   showSystemFiles={showSystemFiles}
                   onToggleSystemFiles={() => {
                     setShowSystemFiles((v) => {
@@ -2113,10 +2128,10 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
               ref={panelWrapperRef}
               initial={{ width: 0, opacity: 0 }}
               animate={{ width: rightPanelWidth, opacity: 1 }}
-              exit={{ width: 0, opacity: 0, transition: TWEEN.exit }}
+              exit={PANEL_EXIT}
               transition={(isDragging || dragJustEnded)
                 ? { duration: 0 }
-                : TWEEN.fold
+                : PANEL_OPEN
               }
               className="flex shrink-0 overflow-hidden"
             >
@@ -2125,6 +2140,7 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                   keeps its layout and scroll, and the panel stays the same
                   element, so a running app's iframe does not reload. */}
               <div
+                ref={panelInnerRef}
                 data-panel-inner
                 className={panelExpanded ? 'absolute inset-0 z-10' : 'shrink-0 h-full'}
                 style={panelExpanded ? undefined : { width: rightPanelWidth }}
@@ -2156,7 +2172,10 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
                       filesLoading={filesLoading}
                       filesError={filesError}
                       onRefreshFiles={refreshFiles}
-                      onAddContext={isThreadReadOnly ? null : handleAddContext} // DALTON-HOOK(workspace-sharing-settings)
+                      onAddContext={!isThreadReadOnly && activeAgentId === 'main' ? handleAddContext : null} // DALTON-HOOK(workspace-sharing-settings)
+                      // DALTON-HOOK(team-sharing): no comment layer/docked comment box on a read-only thread
+                      threadReadOnly={isThreadReadOnly}
+                      agentName={isHome ? t('agents.chiefOfStaff') : t('agents.analyst')}
                       showSystemFiles={showSystemFiles}
                       onToggleSystemFiles={() => {
                         setShowSystemFiles((v) => {
@@ -2176,7 +2195,10 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
         </>
       )}
 
+      {publishDialog}
     </div>
+    </ComposerDockContext>
+    </ChatCommentSendsProvider>
     </ThreadCommandsContext>
     </ShareLinkOpenerContext>
     </RouteLeaveGuardContext>

@@ -117,6 +117,10 @@ async def _resolve(
             new=AsyncMock(return_value=list(schemas or [])),
         ),
         patch(
+            "src.server.database.mcp_descriptions.current_descriptions",
+            new=AsyncMock(return_value={}),
+        ),
+        patch(
             "src.server.services.plugins.bundled.component_owners",
             return_value=owners,
         ),
@@ -465,6 +469,10 @@ class TestResolveInheritedLayer:
             patch(
                 "src.server.database.mcp_tool_schemas.get_user_tool_schemas",
                 new=AsyncMock(return_value=[]),
+            ),
+            patch(
+                "src.server.database.mcp_descriptions.current_descriptions",
+                new=AsyncMock(return_value={}),
             ),
         ):
             resolved = await resolve_mcp_config(base, "user-1", "ws-1")

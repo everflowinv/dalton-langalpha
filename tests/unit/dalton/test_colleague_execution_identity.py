@@ -458,6 +458,10 @@ async def test_agent_inputs_and_budget_attribution_keep_caller_for_billing_and_o
     from src.server.services.workspace_manager import WorkspaceManager
 
     session = create_autospec(Session, instance=True)
+    # computer_id is an instance attribute set in Session.__init__ (upstream
+    # #652's AgentInputs.read reads it); autospec only sees class attributes,
+    # so it is set by hand like session.sandbox below.
+    session.computer_id = "c-colleague-1"
     wm = create_autospec(WorkspaceManager, instance=True)
     view = create_autospec(WorkspaceToolView, instance=True)
     view.trading_rule = None
@@ -516,6 +520,7 @@ async def test_agent_inputs_and_budget_attribution_keep_caller_for_billing_and_o
     )
     assert inputs.user_id == "u-caller-a"
     assert inputs.workspace_owner_id == "u-owner-b"
+    assert inputs.computer_id == "c-colleague-1"
     assert direct_calls == [
         {
             "user_id": "u-owner-b",
@@ -571,6 +576,7 @@ async def test_thread_maintenance_summarize_uses_workspace_owner_for_session_and
     )
 
     session = create_autospec(Session, instance=True)
+    session.computer_id = "c-colleague-1"  # Session.__init__ 实例属性，autospec 看不见
     session.sandbox = None
     wm = create_autospec(WorkspaceManager, instance=True)
     session_calls: list[tuple[str, str | None]] = []

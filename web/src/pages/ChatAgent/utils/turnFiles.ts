@@ -12,10 +12,11 @@ import type { MessageRecord } from '../components/messageList/types';
 import { fileKind, isFilePath, isImagePath, parseWsPath } from './filePaths';
 import {
   classifyAgentPath,
+  folderWorkspacePath,
   isAgentNotesPath,
+  onOtherComputer,
   parseAgentHref,
   parseAgentPath,
-  siblingWorkspacePath,
   workspaceScopedPath,
   type AgentPathParts,
   type ComputerFolders,
@@ -28,7 +29,7 @@ import { mapOutsideCode } from './markdownSegments';
 export interface TurnFile {
   /** Workspace-relative path, with no location suffix. */
   path: string;
-  /** Set when the reference names another workspace (a Chief of Staff relay, or a sibling's folder). */
+  /** Set when the reference names another workspace (a Chief of Staff relay, or another workspace's folder). */
   workspaceId?: string;
   /** The spot inside the file the reply pointed at, if it named one. */
   location?: FileLocation;
@@ -123,23 +124,25 @@ function openablePath(path: string): boolean {
 }
 
 /**
- * Where a reference lands, and whether it is a notes file the deck keeps out.
- * A sibling's folder names that workspace as a `__wsref__` does, so the card
- * opens there; read from this workspace's folder, it would name a file the
- * workspace does not hold.
+ * Where a reference lands, or null for one the deck keeps out: a notes file,
+ * or a file on another computer outside its workspaces' folders, which the
+ * panel would read on this computer and, missing, swap for a file here that
+ * only shares its name. Another workspace's folder names that workspace as a
+ * `__wsref__` does, so the card opens there; read from this workspace's
+ * folder, it would name a file the workspace does not hold.
  */
 function placeRef(
   parts: AgentPathParts,
   folders: ComputerFolders | null | undefined,
-): { path: string; workspaceId?: string; notes: boolean } {
-  const sibling = siblingWorkspacePath(parts, folders);
-  if (sibling) {
-    return { path: sibling.path, workspaceId: sibling.workspaceId, notes: isAgentNotesPath(parseAgentPath(sibling.path)) };
+): { path: string; workspaceId?: string } | null {
+  const other = folderWorkspacePath(parts, folders);
+  if (other) {
+    return isAgentNotesPath(parseAgentPath(other.path)) ? null : other;
   }
-  return {
-    path: workspaceScopedPath(parts, folders?.dirName, folders?.previousDirNames, folders?.otherRoots),
-    notes: isAgentNotesPath(parts, folders?.dirName, folders?.previousDirNames, folders?.otherRoots),
-  };
+  const { dirName, previousDirNames, otherRoots } = folders ?? {};
+  if (onOtherComputer(parts, folders)) return null;
+  const path = workspaceScopedPath(parts, dirName, previousDirNames, otherRoots);
+  return isAgentNotesPath(parts, dirName, previousDirNames, otherRoots) ? null : { path };
 }
 
 interface MessageFiles {
@@ -172,9 +175,10 @@ function filesInMessage(message: TurnMessage, folders?: ComputerFolders | null):
         // rules run: those drop a fragment, and would take the location with it.
         const { path: href, location } = splitFileLocation(dest);
         const wsRef = parseWsPath(href);
-        const { path, workspaceId, notes } = placeRef(parseAgentHref(href, folders?.rootDir), folders);
-        if (!openablePath(path) || notes) return;
-        const file: TurnFile = { path, workspaceId: wsRef?.workspaceId ?? workspaceId, location: location ?? undefined };
+        const placed = placeRef(parseAgentHref(href, folders?.rootDir), folders);
+        if (!placed || !openablePath(placed.path)) return;
+        const { path } = placed;
+        const file: TurnFile = { path, workspaceId: wsRef?.workspaceId ?? placed.workspaceId, location: location ?? undefined };
         if (embeds || isImagePath(path)) {
           embedded.push(refKey(file));
           return;
@@ -192,8 +196,9 @@ function filesInMessage(message: TurnMessage, folders?: ComputerFolders | null):
   }
 
   for (const { parts, call } of writeCalls(message, folders?.rootDir)) {
-    const { path, workspaceId, notes } = placeRef(parts, folders);
-    if (!openablePath(path) || notes) continue;
+    const placed = placeRef(parts, folders);
+    if (!placed || !openablePath(placed.path)) continue;
+    const { path, workspaceId } = placed;
     // Only an Edit says what changed. A Write carries the new file alone, and
     // whether it replaced one, or how much of it, is not in the call. Neither
     // does a `replace_all` Edit, which carries one pair of strings for every
@@ -249,40 +254,35 @@ export function collectTurnFiles(
 
 // Keyed on the message that ends a turn, and checked against the whole member
 // list, so the entry survives exactly as long as the turn's messages do. The
-// folder names are part of the check: the workspace record often lands after
-// the transcript, and the entry built without them hides the wrong `agent.md`.
-// They are compared by value, so the same names from another copy of the
-// record still hit. The siblings' folders join them, for the same reason: the
-// list of every workspace lands after the transcript too, and so do the
-// computers' roots, which the absolute paths are read against.
+// folders are part of the check: the workspace record often lands after the
+// transcript, and the entry built without them hides the wrong `agent.md`; so
+// do the list of every workspace and the computers' roots, which the paths are
+// read against. They are compared by value (`foldersKey`), so the same folders
+// from another copy of the record still hit.
 const turnCache = new WeakMap<object, {
   members: readonly TurnMessage[];
   folders: string;
   files: TurnFile[];
 }>();
 
-function cachedTurnFiles(members: readonly TurnMessage[], folders: ComputerFolders | null): TurnFile[] {
+function cachedTurnFiles(
+  members: readonly TurnMessage[],
+  folders: ComputerFolders | null,
+  foldersKey: string,
+): TurnFile[] {
   const key = members[members.length - 1] as object | undefined;
   if (!key) return [];
-  // A folder name holds no `/`, so joined on it the names read back
-  // unambiguously; a root holds no control character.
-  const names = [
-    folders?.rootDir ?? '',
-    (folders?.otherRoots ?? []).join('\u0001'),
-    [folders?.dirName ?? '', ...(folders?.previousDirNames ?? [])].join('/'),
-    ...(folders?.siblings ?? []).map((s) => [s.workspaceId, s.dirName, ...(s.previousDirNames ?? [])].join('/')),
-  ].join('\u0000');
   const hit = turnCache.get(key);
   if (
     hit
-    && hit.folders === names
+    && hit.folders === foldersKey
     && hit.members.length === members.length
     && hit.members.every((m, i) => m === members[i])
   ) {
     return hit.files;
   }
   const files = collectTurnFiles(members, folders);
-  turnCache.set(key, { members: [...members], folders: names, files });
+  turnCache.set(key, { members: [...members], folders: foldersKey, files });
   return files;
 }
 
@@ -314,10 +314,14 @@ export function turnFilesByTurn(
     else byTurn.set(turnIndex, [member]);
   }
 
+  // Once per call, not per turn: this runs on every streamed token, and the
+  // folders hold every workspace on every computer. Every value comes from
+  // `computerFolders`, which builds its keys in one order.
+  const foldersKey = JSON.stringify(folders ?? null);
   const files = new Map<number, TurnFile[]>();
   for (const [turnIndex, members] of byTurn) {
     if (streaming.has(turnIndex)) continue;
-    const collected = cachedTurnFiles(members, folders ?? null);
+    const collected = cachedTurnFiles(members, folders ?? null, foldersKey);
     if (collected.length > 0) files.set(turnIndex, collected);
   }
   return files;

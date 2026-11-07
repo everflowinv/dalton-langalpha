@@ -330,6 +330,33 @@ describe('ComputersDialog', () => {
     expect(screen.getByLabelText(/^Name/)).toHaveValue('One too many');
   });
 
+  it('says a name another computer has under the name field, until the name is edited', async () => {
+    const user = userEvent.setup();
+    mockCreate.mockRejectedValue(
+      conflict('name_taken', 'You already have a computer named "Second machine".', {
+        name: 'Second machine',
+        computer_id: SECOND_ID,
+      }),
+    );
+    await openCreateForm(user);
+
+    const field = screen.getByLabelText(/^Name/);
+    await user.type(field, 'second MACHINE');
+    await user.click(screen.getByRole('button', { name: 'Create computer' }));
+
+    const said = await screen.findByRole('alert');
+    expect(said).toHaveTextContent('You already have a computer named "Second machine". Choose another name.');
+    expect(field).toHaveAccessibleDescription(said.textContent ?? '');
+    expect(field).toHaveAttribute('aria-invalid', 'true');
+    // Focused, so the user can fix it where it stands.
+    await waitFor(() => expect(field).toHaveFocus());
+    expect(screen.getByRole('dialog', { name: 'New computer' })).toBeInTheDocument();
+
+    await user.type(field, ' 2');
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(field).not.toHaveAttribute('aria-invalid');
+  });
+
   it.each([
     [1, 'You can have only 1 SSH computer. Remove it to add another.'],
     [3, 'You can have up to 3 SSH computers. Remove one to add another.'],
@@ -761,6 +788,7 @@ describe('ComputersDialog: removing a computer', () => {
     });
 
     const KEY = { used_by: null, fingerprint: 'SHA256:abc/def+', comment: 'langalpha' };
+    const TOKEN_PATH = `~/.config/langalpha/claude-code/${SECOND_ID}`;
     const BY_HAND =
       ' To remove it yourself, delete the line ending in langalpha from ~/.ssh/authorized_keys. Its fingerprint is SHA256:abc/def+.';
     it.each([
@@ -790,6 +818,19 @@ describe('ComputersDialog: removing a computer', () => {
         'We could not reach the machine, so our key is still there.',
         true,
       ],
+      [
+        'a Claude Code token left there',
+        { key: null, token: { outcome: 'unreached', path: TOKEN_PATH } },
+        `We could not reach the machine, so its Claude Code token is still there. To remove it yourself, delete ${TOKEN_PATH} on it.`,
+        true,
+      ],
+      [
+        'a Claude Code token the machine could not delete',
+        { key: null, token: { outcome: 'failed', path: '/srv/cfg/langalpha/claude-code/token' } },
+        'We could not remove its Claude Code token from the machine. To remove it yourself, delete /srv/cfg/langalpha/claude-code/token on it.',
+        true,
+      ],
+      ['no token left', { key: null, token: null }, undefined, false],
     ])('tells the outcome: %s', async (_case, res, description, stays) => {
       mockDelete.mockResolvedValue(res);
       await confirmSsh(userEvent.setup());

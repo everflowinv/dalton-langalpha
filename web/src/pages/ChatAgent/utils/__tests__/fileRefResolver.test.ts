@@ -67,6 +67,20 @@ describe('folderLinkTarget', () => {
     expect(folderLinkTarget('../../NVDA/x.md', 'reports/summary.md', home)).toEqual({ workspaceId: 'ws-nvda', path: 'x.md' });
   });
 
+  it('opens a folder on another computer in that workspace, at its whole path there', () => {
+    const SSH = '/home/nosudo/langalpha-2';
+    const folders: ComputerFolders = {
+      ...home,
+      otherRoots: [SSH],
+      otherComputers: [{ root: SSH, workspaces: [{ workspaceId: 'ws-ssh', dirName: 'ssh-e2e' }] }],
+    };
+    expect(folderLinkTarget(`${SSH}/ssh-e2e/x.md`, 'reports/summary.md', folders)).toEqual({ workspaceId: 'ws-ssh', path: 'x.md' });
+    expect(folderLinkTarget(`${SSH}/Home/x.md`, null, folders)).toEqual({ path: 'x.md' });
+    expect(folderLinkTarget(`${SSH}/notes/x.md`, null, folders)).toBeNull();
+    // A climb out of the working directory stays on this computer.
+    expect(folderLinkTarget('../ssh-e2e/x.md', null, folders)).toBeNull();
+  });
+
   it('leaves a link that climbs into no workspace folder to the usual reading', () => {
     expect(folderLinkTarget('../data/x.csv', 'results/report.md', home)).toBeNull();
     expect(folderLinkTarget('notes.md', 'reports/summary.md', home)).toBeNull();

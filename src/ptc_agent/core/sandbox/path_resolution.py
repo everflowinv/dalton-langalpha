@@ -13,6 +13,7 @@ import structlog
 
 from ptc_agent.core.paths import (
     lexical_path,
+    machine_path,
     resolve_agent_path,
     virtual_agent_path,
 )
@@ -51,6 +52,8 @@ def normalize_path(
     itself is ``paths.resolve_agent_path``, shared with the pinned backend.
     """
     ctx = _ambient_project(project)
+    if ctx is not None and ctx.machine is not None:
+        return machine_path(path, base=_project_base(sandbox, project), home=ctx.machine.home)
     return resolve_agent_path(
         path,
         workspace=_project_base(sandbox, project),
@@ -65,6 +68,9 @@ def virtualize_path(
     sandbox: "PTCSandbox", path: str, project: ProjectContext | None = None
 ) -> str:
     """Convert real sandbox path to the virtual spelling the agent sees."""
+    ctx = _ambient_project(project)
+    if ctx is not None and ctx.machine is not None:
+        return lexical_path(path)
     return virtual_agent_path(
         path, workspace=_project_base(sandbox, project), root=sandbox._work_dir
     )
@@ -91,6 +97,34 @@ def _denied_directories(
     return configured
 
 
+_GLOB_META = str.maketrans({c: f"\\{c}" for c in "\\*?[]{}"})
+
+
+def held_back() -> tuple[str, ...]:
+    """The folders a machine reached from Home holds back from the file
+    tools though its home opens the rest (``MachinePaths.denied``), which a
+    search of a folder above one must step over too."""
+    ctx = current_project()
+    return ctx.machine.denied if ctx is not None and ctx.machine is not None else ()
+
+
+def rg_excluded(held: tuple[str, ...], cwd: str) -> list[str]:
+    """rg arguments leaving each of ``held`` out of a search run from ``cwd``.
+
+    rg matches a filter against a path relative to the directory it runs
+    in when the path is below it, else against the whole path, so a held
+    folder below ``cwd`` is named from it and any other by its whole path.
+    Case-insensitive, as a Mac's disk matches names.
+    """
+    base = cwd.rstrip("/")
+    args: list[str] = []
+    for path in held:
+        below = path.casefold().startswith(f"{base}/".casefold())
+        spelled = path[len(base) :] if below else path
+        args.extend(["--iglob", ("!" if below else "!**") + spelled.translate(_GLOB_META)])
+    return args
+
+
 def validate_path(
     sandbox: "PTCSandbox", filepath: str, project: ProjectContext | None = None
 ) -> bool:
@@ -113,6 +147,21 @@ def validate_path(
             denied_dir + "/"
         ):
             return False
+
+    # A computer reached from Home whose file calls run as its commands do:
+    # the whole machine, as a command there reaches it. An unexpanded
+    # ``~user`` is still refused.
+    ctx = _ambient_project(project)
+    machine = ctx.machine if ctx is not None else None
+    if machine is not None and machine.home and normalized_path.startswith("/"):
+        # Except what the machine lists as denied, matched as a Mac's disk
+        # matches names. Best effort: a command runs as the same login and
+        # can read it, so this only keeps the file tools' reach off it.
+        path = normalized_path.casefold()
+        return not any(
+            path == held or path.startswith(held + "/")
+            for held in (d.casefold() for d in machine.denied)
+        )
 
     # Check against allowed directories
     for allowed_dir in sandbox.config.filesystem.allowed_directories:
@@ -155,6 +204,9 @@ def _normalize_search_path(sandbox: "PTCSandbox", path: str) -> str:
     machine a host-side inspection means to search.
     """
     base = _project_base(sandbox, None)
+    ctx = current_project()
+    if ctx is not None and ctx.machine is not None:
+        return machine_path(path, base=base, home=ctx.machine.home)
     if path == ".":
         return base
     if not path.startswith("/"):

@@ -274,4 +274,4 @@ Dalton 和普通的 AI 问答有三点不同：
 
 - 系统架构、部署和开发规范：[docs/dalton/ARCHITECTURE.md](docs/dalton/ARCHITECTURE.md)
 - 开发历史与各阶段的设计：[docs/dalton/dev-guide/README.md](docs/dalton/dev-guide/README.md)
-- Dalton 构建在开源项目 LangAlpha 之上，上游的说明见 [docs/README.zh-CN.md](docs/README.zh-CN.md) 或 [ginlix-ai/langalpha](https://github.com/ginlix-ai/langalpha)。
+- Dalton 构建在开源项目 LangAlpha 之上，上游的说明见 [README.zh-CN.md](README.zh-CN.md) 或 [ginlix-ai/langalpha](https://github.com/ginlix-ai/langalpha)。

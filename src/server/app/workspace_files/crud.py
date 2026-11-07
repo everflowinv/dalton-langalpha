@@ -69,6 +69,12 @@ from src.server.services.workspace_file_containment import (
     read_contained_sandbox_file,
     read_contained_sandbox_range,
 )
+from src.server.services.served_paths import (
+    is_always_hidden_path,
+    is_hidden_path,
+    is_text_content_type,
+    is_utf8,
+)
 from src.server.services.workspace_files import (
     HOME_NOT_ON_COMPUTER_REASON,
     acquire_sandbox_to_change,
@@ -76,8 +82,10 @@ from src.server.services.workspace_files import (
     not_running_for_upload,
     owned_workspace_on_computer,
     owner_layout,
+    owner_work_dir,
     previous_dir_names_of,
     record_fs_bytes,
+    to_client_path,
 )
 
 from ._shared import (
@@ -85,22 +93,16 @@ from ._shared import (
     streamed_download_budget,
     DEFAULT_READ_LIMIT_LINES,
     TOO_LARGE_DETAIL,
-    _is_text_content_type,
-    _is_utf8,
     MAX_UPLOAD_BYTES,
     _CACHEABLE_IMAGE_TYPES,
     _decode_file_text,
-    owner_work_dir,
     previous_roots_of,
-    _is_always_hidden_path,
     _is_binary,
-    _is_hidden_path,
     # DALTON-HOOK(workspace-sharing-settings): colleague path filter helper
     _is_non_owner_blocked_path,
     _is_system_path,
     _requested_hidden_ok,
     _requested_system_ok,
-    _to_client_path,
     _present_virtual_file,
     _virtual_file,
     _virtual_files_in_scope,
@@ -111,7 +113,7 @@ from ._shared import (
     may_be_utf8,
     requested_byte_range,
 )
-from .serve import warm_sandbox
+from src.server.services.warm_files import warm_sandbox
 
 logger = logging.getLogger(__name__)
 
@@ -223,9 +225,10 @@ async def list_workspace_files(
         files = [
             f["path"]
             for f in file_tree
-            if not _is_always_hidden_path(f["path"])
+            if not is_always_hidden_path(f["path"])
+            # DALTON-HOOK(workspace-sharing-settings): non-owners never take system paths
             and (allow_system or not _is_system_path(f["path"]))
-            and (allow_hidden or not _is_hidden_path(f["path"]))
+            and (allow_hidden or not is_hidden_path(f["path"]))
             # A row at a virtual path predates the backup skipping its folder;
             # a read answers from the DB, so only the splice may list one.
             and not _virtual_file(f["path"])
@@ -297,7 +300,7 @@ async def _live_listing(
         raise HTTPException(status_code=404, detail="Not found")
     # DALTON-HOOK(workspace-sharing-settings): re-check canonicalized glob_root for non-owners
     if is_non_owner and glob_root != work_dir:
-        glob_root_client = _to_client_path(sandbox, glob_root, work_dir)
+        glob_root_client = to_client_path(sandbox, glob_root, work_dir)
         if _is_non_owner_blocked_path(glob_root_client):
             return []
     absolute_paths: list[str] = await sandbox.aglob_files(
@@ -312,10 +315,10 @@ async def _live_listing(
     for absolute_path in absolute_paths:
         if not is_within(work_dir, absolute_path):
             continue
-        client_path = _to_client_path(sandbox, absolute_path, work_dir)
+        client_path = to_client_path(sandbox, absolute_path, work_dir)
 
         # Always hide internal cache/bytecode/bootstrap artifacts.
-        if _is_always_hidden_path(client_path):
+        if is_always_hidden_path(client_path):
             continue
 
         # DALTON-HOOK(workspace-sharing-settings): hide blocked paths for non-owners
@@ -323,7 +326,7 @@ async def _live_listing(
             continue
 
         # Hide internal SDK/package directories unless explicitly requested.
-        if not allow_hidden and _is_hidden_path(client_path):
+        if not allow_hidden and is_hidden_path(client_path):
             continue
 
         # Hide system directories unless explicitly requested or include_system=True.
@@ -468,7 +471,7 @@ async def resolve_workspace_file(
             cp
             for p in absolute_paths
             if is_within(work_dir, p)
-            for cp in [_to_client_path(sandbox, p, work_dir)]
+            for cp in [to_client_path(sandbox, p, work_dir)]
             if not (is_non_owner_reader and _is_non_owner_blocked_path(cp))
         ]
         source = "sandbox"
@@ -594,8 +597,8 @@ async def read_workspace_file(
         )
 
     # DALTON-HOOK(workspace-sharing-settings): reject hidden/system/virtual canonical targets for non-owner
-    client_path = _to_client_path(sandbox, normalized, work_dir)
-    if _is_always_hidden_path(client_path) or (
+    client_path = to_client_path(sandbox, normalized, work_dir)
+    if is_always_hidden_path(client_path) or (
         is_non_owner_reader and _is_non_owner_blocked_path(client_path)
     ):
         raise HTTPException(status_code=404, detail="File not found")
@@ -695,7 +698,7 @@ async def write_workspace_file(
 
         normalized = await contained_target(sandbox, path, work_dir, previous_dirs)
         # DALTON-HOOK(workspace-sharing-settings): re-check resolved canonical target after symlink resolution
-        resolved_client_path = _to_client_path(sandbox, normalized, work_dir)
+        resolved_client_path = to_client_path(sandbox, normalized, work_dir)
         if is_non_owner and _is_non_owner_blocked_path(resolved_client_path):
             raise HTTPException(
                 status_code=403, detail="Cannot write system or hidden files"
@@ -710,7 +713,7 @@ async def write_workspace_file(
         raise HTTPException(status_code=500, detail="Write failed")
 
     # Invalidate agent.md cache when user edits agent.md via UI
-    client_path = _to_client_path(sandbox, normalized, work_dir)
+    client_path = to_client_path(sandbox, normalized, work_dir)
     if client_path == "agent.md":
         try:
             manager = WorkspaceManager.get_instance()
@@ -941,18 +944,18 @@ async def _live_range_response(
         ) from None
     if sliced is None:
         raise HTTPException(status_code=404, detail="File not found")
-    client_path = _to_client_path(sandbox, sliced.canonical, work_dir)
+    client_path = to_client_path(sandbox, sliced.canonical, work_dir)
     # DALTON-HOOK(team-sharing): the canonical target is what a link in the
     # served tree resolves to, so a colleague's gate rides it — same check the
     # whole-file path runs — or a symlink into the owner's private dirs would
     # answer ranges the plain download refuses.
-    if _is_always_hidden_path(client_path) or (
+    if is_always_hidden_path(client_path) or (
         blocked_for_non_owner and _is_non_owner_blocked_path(client_path)
     ):
         raise HTTPException(status_code=404, detail="File not found")
     filename = client_path.split("/")[-1] if client_path else "download"
     mime = resolve_content_type(filename)
-    if _is_text_content_type(mime):
+    if is_text_content_type(mime):
         return None
     if sliced.content is None:
         raise _unsatisfiable(sliced.size)
@@ -1146,7 +1149,8 @@ async def download_workspace_file(
         # DALTON-HOOK(team-sharing): ro colleagues never take a stored Range
         # answer; the whole-file rules below keep text redacted and reject binaries
         if byte_range is not None:
-            if not is_non_owner_reader and not _is_text_content_type(mime):
+            # DALTON-HOOK(team-sharing): ro colleagues never take a stored Range answer
+            if not is_non_owner_reader and not is_text_content_type(mime):
                 ranged = await _stored_range_response(
                     file_record,
                     byte_range,
@@ -1161,15 +1165,16 @@ async def download_workspace_file(
 
         content = await http_file_bytes(file_record, user_id=workspace["user_id"])
 
+        # DALTON-HOOK(team-sharing): binary download is refused for read-only colleagues
         if is_non_owner_reader and not (
-            _is_text_content_type(mime) or _is_utf8(content)
+            is_text_content_type(mime) or is_utf8(content)
         ):
             raise HTTPException(
                 status_code=403,
                 detail="Binary file download is not available in read-only mode",
             )
 
-        if _is_text_content_type(mime) or _is_utf8(content):
+        if is_text_content_type(mime) or is_utf8(content):
             content = get_redactor().redact_bytes(content, vault_secrets=vault_secrets)
 
         return _build_download_response(content, filename, mime, request, disposition)
@@ -1180,7 +1185,7 @@ async def download_workspace_file(
     # the checks inside the acquisition reject binary files with 403
     if byte_range is not None and not is_non_owner_reader:
         candidate = contained_absolute_path(path, work_dir, previous_dirs)
-        if candidate is not None and not _is_text_content_type(
+        if candidate is not None and not is_text_content_type(
             resolve_content_type(candidate.rsplit("/", 1)[-1])
         ):
             settled, ranged = await _warm_range_response(
@@ -1216,7 +1221,7 @@ async def download_workspace_file(
         if (
             byte_range is not None
             and not is_non_owner_reader
-            and not _is_text_content_type(
+            and not is_text_content_type(
                 resolve_content_type(candidate.rsplit("/", 1)[-1])
             )
         ):
@@ -1242,8 +1247,8 @@ async def download_workspace_file(
         normalized, content = resolved
 
         # DALTON-HOOK(workspace-sharing-settings): reject hidden/system/virtual canonical targets and binary files for non-owner
-        client_path = _to_client_path(sandbox, normalized, work_dir)
-        if _is_always_hidden_path(client_path) or (
+        client_path = to_client_path(sandbox, normalized, work_dir)
+        if is_always_hidden_path(client_path) or (
             is_non_owner and _is_non_owner_blocked_path(client_path)
         ):
             raise HTTPException(status_code=404, detail="File not found")
@@ -1255,7 +1260,7 @@ async def download_workspace_file(
         if is_non_owner_reader and (
             _is_binary(client_path)
             or too_large is not None
-            or not (_is_text_content_type(mime) or _is_utf8(content))
+            or not (is_text_content_type(mime) or is_utf8(content))
         ):
             raise HTTPException(
                 status_code=403,
@@ -1283,7 +1288,7 @@ async def download_workspace_file(
                 workspace_id, sandbox, too_large, filename, mime, disposition, folder=folder
             )
 
-        if _is_text_content_type(mime) or _is_utf8(content):
+        if is_text_content_type(mime) or is_utf8(content):
             vault_secrets = await get_vault_secrets_for_redaction(workspace["user_id"])
             content = get_redactor().redact_bytes(content, vault_secrets=vault_secrets)
 
@@ -1309,7 +1314,7 @@ async def _large_file_may_be_text(
     name is not trusted, since a large text file renamed to .xlsx would
     otherwise stream unredacted.
     """
-    if _is_text_content_type(mime):
+    if is_text_content_type(mime):
         return True
     try:
         sniffed = await read_contained_sandbox_range(
@@ -1421,7 +1426,7 @@ async def workspace_file_download_url(
         normalized_path = normalize_requested_path(path, work_dir, previous_dirs)
         if not normalized_path:
             raise HTTPException(status_code=400, detail="File path is required")
-        if _is_always_hidden_path(normalized_path):
+        if is_always_hidden_path(normalized_path):
             raise HTTPException(status_code=404, detail="File not found")
         return {"url": await mirror_download_link(workspace, normalized_path)}
 
@@ -1437,8 +1442,8 @@ async def workspace_file_download_url(
             # outside it. /files/download applies the read policy and refuses the
             # rest itself, so it decides, and no answer here says which it was.
             return {"url": None}
-        client_path = _to_client_path(sandbox, canonical, work_dir)
-        if _is_always_hidden_path(client_path):
+        client_path = to_client_path(sandbox, canonical, work_dir)
+        if is_always_hidden_path(client_path):
             raise HTTPException(status_code=404, detail="File not found")
         rel_path = canonical[len(work_dir.rstrip("/")) + 1 :]
         try:
@@ -1487,7 +1492,7 @@ async def upload_workspace_file(
 
         normalized = await contained_target(sandbox, dest, work_dir, previous_dirs)
         # DALTON-HOOK(workspace-sharing-settings): re-check resolved canonical target after symlink resolution
-        resolved_client_path = _to_client_path(sandbox, normalized, work_dir)
+        resolved_client_path = to_client_path(sandbox, normalized, work_dir)
         if is_non_owner and _is_non_owner_blocked_path(resolved_client_path):
             raise HTTPException(
                 status_code=403, detail="Cannot upload to system or hidden paths"
@@ -1516,7 +1521,7 @@ async def upload_workspace_file(
     if not ok:
         raise HTTPException(status_code=500, detail="Upload failed")
 
-    client_path = _to_client_path(sandbox, normalized, work_dir)
+    client_path = to_client_path(sandbox, normalized, work_dir)
     record_fs_bytes("upload", len(content))
     return {
         "workspace_id": workspace_id,
@@ -1754,7 +1759,7 @@ async def delete_workspace_files(
             # A server-held file is refused for what it is, before the probe:
             # with the file mount down its link resolves to nothing, and the
             # file the panel lists would read as not found.
-            virtual = _virtual_file(_to_client_path(sandbox, candidate, work_dir))
+            virtual = _virtual_file(to_client_path(sandbox, candidate, work_dir))
             if virtual:
                 undeletable[index] = virtual.undeletable
                 continue
@@ -1773,8 +1778,8 @@ async def delete_workspace_files(
                 continue
 
             addressed = candidates[slot]
-            client_path = _to_client_path(sandbox, addressed, work_dir)
-            resolved_client_path = _to_client_path(sandbox, normalized, work_dir)
+            client_path = to_client_path(sandbox, addressed, work_dir)
+            resolved_client_path = to_client_path(sandbox, normalized, work_dir)
             # DALTON-HOOK(workspace-sharing-settings): re-check resolved canonical target for symlinks into hidden/system/virtual paths
             if is_non_owner and (
                 _is_non_owner_blocked_path(client_path)

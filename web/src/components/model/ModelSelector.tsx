@@ -4,7 +4,8 @@ import { Select } from "@/components/ui/select"
 import type { ProviderModelsData } from "./types"
 import type { ModelMetadataEntry } from "@/hooks/useFilteredModels"
 import { modelLabel } from "@/lib/modelLabel"
-import { payerLabel, type Payer } from "@/lib/modelPayer"
+import type { Payer } from "@/lib/modelPayer"
+import { usePayerLabel } from "@/hooks/usePayerLabel"
 
 export interface ModelSelectorProps {
   /** Label shown above the select. Absent, `ariaLabel` names it and the
@@ -61,6 +62,7 @@ export function ModelSelector({
   allowEmpty = false,
 }: ModelSelectorProps) {
   const { t } = useTranslation()
+  const payerLabel = usePayerLabel()
   const id = useId()
   const name = nameOf ?? ((m: string) => modelLabel(m, metadata))
 
@@ -158,7 +160,7 @@ export function ModelSelector({
               <optgroup key={provider} label={display}>
                 {modelList.map((m) => {
                   const payer = payers?.[m]
-                  const suffix = payer ? ` · ${payerLabel(t, payer)}` : ""
+                  const suffix = payer ? ` · ${payerLabel(payer)}` : ""
                   return (
                     <option key={m} value={m}>
                       {name(m)}{suffix}

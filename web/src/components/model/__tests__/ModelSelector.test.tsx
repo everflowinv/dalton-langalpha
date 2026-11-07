@@ -3,6 +3,12 @@ import { describe, it, expect, vi } from 'vitest';
 import { ModelSelector } from '../ModelSelector';
 import type { ProviderModelsData } from '../types';
 
+vi.mock('@/hooks/usePayerLabel', async () => {
+  const { payerLabel } = await import('@/lib/modelPayer');
+  const { useTranslation } = await import('react-i18next');
+  return { usePayerLabel: () => { const { t } = useTranslation(); return (payer: import('@/lib/modelPayer').Payer) => payerLabel(t, payer); } };
+});
+
 const sampleModels: Record<string, ProviderModelsData> = {
   openai: {
     display_name: 'OpenAI',

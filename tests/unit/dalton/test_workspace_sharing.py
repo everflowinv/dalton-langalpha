@@ -28,6 +28,7 @@ from src.server.app.threads import crud as threads_crud
 from src.server.app.workspace_files import _shared as ws_files_shared
 from src.server.app.workspace_files import crud as ws_files_crud
 from src.server.app.workspace_files import uploads as ws_files_uploads
+from src.server.dependencies.principal import Principal
 from src.server.services import workspace_files as ws_files_service
 from src.server.services import workspace_upload_pull as ws_upload_pull
 from src.server.database import computer as computer_db
@@ -718,7 +719,7 @@ class TestWebChannelEndpoints:
 
         with pytest.raises(HTTPException) as exc_threads:
             await threads_crud.list_threads(
-                x_user_id="u-chao",
+                principal=Principal(user_id="u-chao", auth="session"),
                 workspace_id=ws["workspace_id"],
                 limit=20,
                 offset=0,
@@ -1433,14 +1434,26 @@ class TestChiefOfStaffChannel:
                 return_value=colleague_ws,
             ),
         )
-        # Upstream's listing reads computer placement (names + home) instead of
-        # the old get_workspace/get_home_workspace_id pair Dalton's version used.
+        # Upstream's listing reads computer placement through get_computer_roster
+        # instead of the old get_computer_names_and_home; the row carries the
+        # kind, provider config, root and status the placement now folds in.
+        roster = [
+            {
+                "computer_id": "c-1",
+                "name": "Cloud computer",
+                "kind": None,
+                "provider_config": None,
+                "root_dir": "langalpha",
+                "status": "running",
+                "is_home": True,
+            }
+        ]
         monkeypatch.setattr(
             computer_db,
-            "get_computer_names_and_home",
+            "get_computer_roster",
             create_autospec(
-                computer_db.get_computer_names_and_home,
-                return_value=[{"computer_id": "c-1", "name": "Cloud computer", "is_home": True}],
+                computer_db.get_computer_roster,
+                return_value=roster,
             ),
         )
 
@@ -1464,7 +1477,7 @@ class TestChiefOfStaffChannel:
             home_id="ws-home",
             zone=ZoneInfo("UTC"),
             today=now.date(),
-            placement=_ComputerPlacement(home_computer_id="c-1"),
+            placement=_ComputerPlacement.from_rows(roster),
             colleague_workspaces=colleague_ws,
         )
         assert "Colleague workspaces shared with your Chief of Staff" in rendered
@@ -1485,11 +1498,16 @@ class TestChiefOfStaffChannel:
             "get_workspace",
             cos_get_ws_mock,
         )
+        # upstream #666 moved owner_work_dir out of _shared into
+        # services/workspace_files: patch it there (the CoS tools re-import
+        # it at call time) and on crud's own binding for the routes.
+        from src.server.services import workspace_files as ws_files_service
+
         monkeypatch.setattr(
-            ws_files_shared,
+            ws_files_service,
             "owner_work_dir",
             create_autospec(
-                ws_files_shared.owner_work_dir,
+                ws_files_service.owner_work_dir,
                 return_value="/home/workspace/NVDA_Deep_Dive",
             ),
         )

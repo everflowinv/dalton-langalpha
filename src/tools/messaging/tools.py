@@ -14,8 +14,10 @@ model has to know whether anything went out before it tells the user so.
 import http.cookiejar
 import logging
 import os
+import re
 import time
 import uuid
+from collections.abc import Sequence
 from typing import Annotated, Any, NamedTuple
 
 import httpx
@@ -23,6 +25,11 @@ from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import BaseTool, StructuredTool
 
 from ptc_agent.agent.roles import AgentRole
+from ptc_agent.agent.tools.computer_reach import (
+    Attached,
+    ComputerReach,
+    ComputerUnreachable,
+)
 from src.config import env
 
 try:
@@ -412,6 +419,57 @@ def _detail(answer: GatewayAnswer) -> str:
 # -- the tools ----------------------------------------------------------------
 
 
+#: A file the Chief of Staff names on one of the user's computers: the
+#: computer, a colon, and the file's whole path there. The path is what has
+#: to start with ``/`` or ``~``; a name may hold a slash.
+_ON_COMPUTER = re.compile(r"^(?P<computer>[^/~].*?):(?P<path>[/~].*)$")
+
+#: The messaging service's limits on one attached file and on a send's files
+#: in all, which a copy made for a send must not outgrow.
+ATTACH_MAX_BYTES = 20 * 1024 * 1024
+SEND_MAX_BYTES = 50 * 1024 * 1024
+
+
+async def _attach_all(
+    paths: Sequence[str], workspace_id: str | None, computers: ComputerReach | None
+) -> tuple[list[dict[str, Any]], dict[int, str]]:
+    """The files as the messaging service fetches them, and what the model
+    called each one it named on a computer, by position. Raises
+    ``ComputerUnreachable`` when one of those cannot go."""
+    on: dict[int, re.Match[str]] = {}
+    found: Sequence[Attached] = ()
+    if computers is not None:
+        on = {i: match for i, spec in enumerate(paths) if (match := _ON_COMPUTER.match(spec))}
+    if computers is not None and on:
+        found = await computers.attach([(m["computer"].strip(), m["path"]) for m in on.values()])
+    attached = dict(zip(on, found, strict=True))
+    refs: list[dict[str, Any]] = []
+    named: dict[int, str] = {}
+    for index, spec in enumerate(paths):
+        got = attached.get(index)
+        if got is None:
+            refs.append({"path": spec, "workspace_id": workspace_id})
+            continue
+        refs.append({"path": got.path, "workspace_id": got.workspace_id})
+        named[index] = f"{spec} (copied to Home as {got.path})" if got.copied else spec
+    return refs, named
+
+
+def _as_named(data: dict[str, Any], named: dict[int, str]) -> dict[str, Any]:
+    """The answer with each file the model named on a computer called as it
+    called it, so the result reads in its own terms."""
+    files = data.get("files")
+    if not named or not isinstance(files, list):
+        return data
+    return {
+        **data,
+        "files": [
+            {**entry, "path": named[i]} if i in named and isinstance(entry, dict) else entry
+            for i, entry in enumerate(files)
+        ],
+    }
+
+
 async def _send(
     *,
     text: str,
@@ -422,6 +480,7 @@ async def _send(
     files_workspace_id: str | None,
     config: RunnableConfig | None,
     tool_call_id: str,
+    computers: ComputerReach | None = None,
 ) -> tuple[str, dict[str, Any]]:
     turn = _turn(config)
     if not turn["user_id"]:
@@ -470,6 +529,11 @@ async def _send(
                 "Nothing was sent.",
             )
 
+    try:
+        refs, named = await _attach_all(paths, files_workspace_id, computers)
+    except ComputerUnreachable as e:
+        return _refusal("failed", "invalid_request", f"{e} Nothing was sent.")
+
     if not tool_call_id:
         # The messaging service answers a repeat of a call it delivered by the
         # call's id, so a send without one that is replayed goes out again.
@@ -486,7 +550,7 @@ async def _send(
         "workspace_id": turn["workspace_id"],
         "target": (target or "").strip() or None,
         "text": text,
-        "files": [{"path": p, "workspace_id": files_workspace_id} for p in paths],
+        "files": refs,
         "reply": bool(reply),
         "new_thread": bool(new_thread),
     }
@@ -512,7 +576,7 @@ async def _send(
                 shown=f"{e.message} {UNKNOWN_SHOWN}",
             )
         return _refusal("failed", "unavailable", f"{e.message} Nothing was sent.")
-    return send_result(data)
+    return format_send_result(_as_named(data, named)), send_artifact(data)
 
 
 _TEXT_ARG = Annotated[
@@ -567,34 +631,59 @@ async def _send_from_workspace(
     )
 
 
-async def _send_from_home(
-    text: _TEXT_ARG,
-    config: RunnableConfig,
-    files: Annotated[
-        list[str] | None,
-        f"Up to {MAX_FILES} file paths to attach: in Home, such as nvda_amd/digest.md, "
-        "or inside the folder of the workspace named in workspace_id, such as "
-        "dcf/report.md. Each file can be up to 20 MB, and a send's files hold 50 MB in all.",
-    ] = None,
-    workspace_id: Annotated[
-        str | None,
-        "The id of the workspace the files are in, from manage_workspaces, when they "
-        "are not in Home. Omit it for Home's files.",
-    ] = None,
-    target: _TARGET_ARG = None,
-    reply: _REPLY_ARG = False,
-    new_thread: _NEW_THREAD_ARG = False,
-    tool_call_id: Annotated[str, InjectedToolCallId] = "",
-) -> tuple[str, dict[str, Any]]:
-    return await _send(
-        text=text,
-        files=files,
-        target=target,
-        reply=reply,
-        new_thread=new_thread,
-        files_workspace_id=workspace_id,
-        config=config,
-        tool_call_id=tool_call_id,
+_FILES_FROM_HOME = (
+    f"Up to {MAX_FILES} file paths to attach: in Home, such as nvda_amd/digest.md, "
+    "or inside the folder of the workspace named in workspace_id, such as "
+    "dcf/report.md. Each file can be up to 20 MB, and a send's files hold 50 MB in all."
+)
+_FILES_ANYWHERE = (
+    f"Up to {MAX_FILES} file paths to attach: in Home, such as nvda_amd/digest.md, or "
+    "inside the folder of the workspace named in workspace_id, such as dcf/report.md. "
+    "A file on one of the user's computers goes as that computer's name, a colon and "
+    "its whole path there, such as `MacBook Pro:/Users/me/Documents/budget.pdf`; one "
+    "outside every workspace folder is copied into Home's `sent` folder to send. Each "
+    "file can be up to 20 MB, and a send's files hold 50 MB in all."
+)
+
+
+def _send_from_home(computers: ComputerReach | None) -> BaseTool:
+    """The Chief of Staff's ``send_message``, which attaches from Home or the
+    workspace it names, since it reads every workspace; and, given the user's
+    other ``computers``, from any of them."""
+
+    async def send_message(
+        text: _TEXT_ARG,
+        config: RunnableConfig,
+        files: Annotated[
+            list[str] | None, _FILES_ANYWHERE if computers is not None else _FILES_FROM_HOME
+        ] = None,
+        workspace_id: Annotated[
+            str | None,
+            "The id of the workspace the files are in, from manage_workspaces, when they "
+            "are not in Home. Omit it for Home's files.",
+        ] = None,
+        target: _TARGET_ARG = None,
+        reply: _REPLY_ARG = False,
+        new_thread: _NEW_THREAD_ARG = False,
+        tool_call_id: Annotated[str, InjectedToolCallId] = "",
+    ) -> tuple[str, dict[str, Any]]:
+        return await _send(
+            text=text,
+            files=files,
+            target=target,
+            reply=reply,
+            new_thread=new_thread,
+            files_workspace_id=workspace_id,
+            config=config,
+            tool_call_id=tool_call_id,
+            computers=computers,
+        )
+
+    return StructuredTool.from_function(
+        coroutine=send_message,
+        name="send_message",
+        description=SEND_MESSAGE_DESCRIPTION,
+        response_format="content_and_artifact",
     )
 
 
@@ -644,13 +733,6 @@ _SEND_MESSAGE = StructuredTool.from_function(
     description=SEND_MESSAGE_DESCRIPTION,
     response_format="content_and_artifact",
 )
-# The Chief of Staff's shape of the same tool; a build binds one of the two.
-_SEND_FROM_HOME = StructuredTool.from_function(
-    coroutine=_send_from_home,
-    name="send_message",
-    description=SEND_MESSAGE_DESCRIPTION,
-    response_format="content_and_artifact",
-)
 _LIST_MESSAGE_TARGETS = StructuredTool.from_function(
     coroutine=_list_message_targets,
     name="list_message_targets",
@@ -658,14 +740,18 @@ _LIST_MESSAGE_TARGETS = StructuredTool.from_function(
 )
 
 
-def build_messaging_tools(role: AgentRole) -> list[BaseTool]:
+def build_messaging_tools(
+    role: AgentRole, *, computers: ComputerReach | None = None
+) -> list[BaseTool]:
     """The messaging tools for one agent build, or none when unconfigured.
 
     ``role`` picks the ``send_message`` shape: an analyst attaches files from
     its workspace, and the Chief of Staff from Home or from the workspace it
-    names, since it reads every workspace.
+    names, since it reads every workspace. ``computers`` is given when the
+    user has several: the Chief of Staff's files may then be on any.
     """
     if not messaging_enabled():
         return []
-    send = _SEND_FROM_HOME if role == "chief_of_staff" else _SEND_MESSAGE
-    return [send, _LIST_MESSAGE_TARGETS]
+    if role == "chief_of_staff":
+        return [_send_from_home(computers), _LIST_MESSAGE_TARGETS]
+    return [_SEND_MESSAGE, _LIST_MESSAGE_TARGETS]

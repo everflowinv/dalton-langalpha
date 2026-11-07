@@ -45,6 +45,10 @@ from src.server.services.brokerage_capabilities import (
     group_keys_for,
     vendor_for_url,
 )
+from src.server.services.mcp_descriptions.prompt_text import (
+    effective_description,
+    profiles_by_server,
+)
 
 _DEFAULT_PORTS = {"http": 80, "https": 443}
 
@@ -444,6 +448,7 @@ async def resolve_mcp_config(
     inherited_servers: list[MCPServerConfig] = []
     tombstoned_inherited: list[MCPServerConfig] = []
     user_row_by_name = {row["name"]: row for row in user_rows}
+    profiles = await profiles_by_server(user_id, user_rows, connection_by_server)
     for row in user_rows:
         name = row["name"]
         if name in builtin_name_set:
@@ -481,6 +486,11 @@ async def resolve_mcp_config(
                 oauth_connection_id=(
                     connection["connection_id"] if connection else None
                 ),
+            )
+            # A prompt-only field, outside the discovery fingerprint, so this
+            # changes what the agent reads and nothing about the server.
+            cfg = cfg.model_copy(
+                update={"description": effective_description(row, profiles.get(name))}
             )
         except Exception:
             logger.error(

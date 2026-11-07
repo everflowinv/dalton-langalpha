@@ -8,7 +8,7 @@ import StockHeader from './components/StockHeader';
 import MarketChart from './components/MarketChart';
 import type { MarketChartHandle } from './components/MarketChart';
 import ChatInput from '../../components/ui/chat-input';
-import type { ComposerScope } from '../../components/ui/chat-input.types';
+import type { ComposerScope, ComposerSend } from '../../components/ui/chat-input.types';
 import MarketChatPanel from './components/MarketChatPanel';
 import MarketSidebarPanel from './components/MarketSidebarPanel';
 import { INTERVALS } from './utils/chartConstants';
@@ -434,7 +434,7 @@ function MarketViewInner() {
     setChartImageDesc(parts.join('\n'));
   }, [selectedStock, selectedInterval, stockInfo, selectedStockDisplay, overviewData, displayPrice, quote.currency]);
 
-  const handleSendMessage = useCallback(async (message: string, attachments: AttachmentItem[] = [], _slashCommands: string[] = [], { model, reasoningEffort, fastMode }: { model?: string; reasoningEffort?: string | null; fastMode?: boolean | null } = {}) => {
+  const handleSendMessage = useCallback(async (message: string, attachments: AttachmentItem[] = [], _slashCommands: string[] = [], { model, reasoningEffort, fastMode }: { model?: string | null; reasoningEffort?: string | null; fastMode?: boolean | null } = {}) => {
     // Build additional_context from chart image + file attachments.
     // The drawing tools are always bound; the chart-annotation skill rides
     // every send for its drawing guide and to tell the agent which ticker +
@@ -598,6 +598,7 @@ function MarketViewInner() {
           Page-wide, so the chat and watchlist columns stay draggable too; it
           overlaps the header rather than pushing it down (App.css). */}
       <div className="chrome-drag-strip" aria-hidden="true" />
+      <h1 className="sr-only">{t('marketView.pageHeading', { symbol: selectedStock })}</h1>
       {isMobile ? (
         <div className="market-mobile-layout">
           <StockHeader
@@ -656,10 +657,17 @@ function MarketViewInner() {
               </div>
             )}
             <ChatInput
-              // DALTON-HOOK(composer-drafts): persist draft for main market view mobile composer and forward send result
+              // DALTON-HOOK(composer-drafts): persist draft for main market view mobile
+              // composer and keep it open while the send's outcome is unknown —
+              // upstream closes unconditionally, a refused send restores the text.
               draftKey="market:main"
-              onSend={async (...args: any[]) => {
-                const sent = await (handleSendMessage as any)(...args);
+              onSend={async (send: ComposerSend) => {
+                const sent = await handleSendMessage(
+                  send.message,
+                  send.files as unknown as AttachmentItem[],
+                  [],
+                  send.modelOptions,
+                );
                 if (sent !== false) setChatExpanded(false);
                 return sent;
               }}

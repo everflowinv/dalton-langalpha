@@ -1,57 +1,82 @@
-import React, { useState, useRef, useEffect, useCallback, useImperativeHandle, useMemo } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect, useCallback, useImperativeHandle, useMemo } from 'react'; // DALTON-HOOK(composer-drafts): useLayoutEffect keeps the failure-restore trampoline current
 import { Plus, ChartCandlestick } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { useNavigate } from 'react-router';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { TokenUsageRing, type TokenUsageData } from './token-usage-ring';
 import { usePreferences } from '@/hooks/usePreferences';
-import { useDefaultModel } from '@/hooks/useSlotDefaultModels';
+import { useTurnModels } from '@/hooks/useTurnModels';
 import { useEffectiveTuning, useModelProfileWriter } from '@/hooks/useModelProfile';
 import { useFeatureEnabled } from '@/hooks/useFeatures';
 import { homeWorkspaceQuery } from '@/hooks/useHomeWorkspace';
 import { useAllModels } from '@/hooks/useAllModels';
+import { useProviderCatalog } from '@/hooks/useProviderCatalog';
 import { useLapsedSignIn } from '@/hooks/useLapsedSignIn';
 import { useIsMobile } from '@/hooks/useIsMobile';
+import { useLatestRef } from '@/hooks/useLatestRef';
+import { onKeyboardFit, onScreenKeyboardUp, roomAboveKeyboard } from '@/lib/visualViewport';
 import { useFavoriteModels } from '@/hooks/useFavoriteModels';
 import { useSeededModel } from '@/hooks/useSeededModel';
 import { ChatInputRegistry, ContextBus } from '@/lib/contextBus';
 import { AnimatePresence } from '@/lib/framer';
 import { isImeComposing } from '@/lib/ime';
+import { focusWithoutRing } from '@/lib/inputModality';
 import { cn } from '@/lib/utils';
 import type { WidgetContextSnapshot } from '@/pages/Dashboard/widgets/framework/contextSnapshot';
 import './chat-input.css';
-import type { ComposerScope, ModelOptions, ReadyAttachment, SlashCommand, ThreadTuning, Workspace } from './chat-input.types';
-import { isLargePaste, getModelDisplayName } from './chat-input.helpers';
-import { effortLabelFor, hasTuningMenu, resolveEffort } from '@/lib/modelTuning';
+import type { ComposerDraft, ComposerScope, ComposerSend, ContextPayload, ModelOptions, QuoteMention, ReadyAttachment, SlashCommand, ThreadTuning, Workspace } from './chat-input.types';
+import { isLargePaste, getModelDisplayName, sameMention } from './chat-input.helpers';
+import { effortLabelFor, resolveEffort } from '@/lib/modelTuning';
 import { ChatInputWidgetDeck, MentionAutocompleteList, SlashCommandList } from './chat-input.parts';
 import {
-  ComposerAttachments, ComposerPills, DropOverlay, SendStopButton, ToolbarOverflowMenu, VoiceButton, VoiceOverlay,
+  ComposerAttachments, ComposerChips, DraftTokenLayer, DropOverlay, SendStopButton, ToolbarOverflowMenu, VoiceButton, VoiceOverlay,
 } from './chat-input.composerParts';
-import { ChatInputEffortMenu, ChatInputModelMenu, ModelTriggerMeasure } from './chat-input.modelMenu';
+import { ChatInputModelMenu, ModelTriggerMeasure, type EffortMenuProps } from './chat-input.modelMenu';
+import type { ModelRowStatus } from './chat-input.modelPicker';
+import { claudeCodeTokenUrl, isClaudeCodeModel } from '@/lib/claudeCode';
+import { useWorkspaceClaudeCode } from '@/hooks/useWorkspaceClaudeCode';
 import { deriveRecentModels } from './chat-input.models';
 import { modelGroups } from '@/lib/modelGroups';
-import { useToolbarItems } from './chat-input.toolbar';
+import { useEffortToolbarItem, useToolbarItems } from './chat-input.toolbar';
 import {
   useToolbarFold, CONTAINER_BORDER, CONTAINER_PX, GROUP_GAP, ICON_BUTTON_W, TOOLBAR_GAP,
 } from './chat-input.useToolbarFold';
 import { useMentions } from './chat-input.useMentions';
+import { useQuoteTokens } from './chat-input.useQuoteTokens';
 import { useSlashCommands } from './chat-input.useSlashCommands';
 import { speechSupported, useVoiceInput } from './chat-input.useVoiceInput';
 import { useFileAttachments } from './chat-input.useFileAttachments';
 import { useDeviceTuningLift } from './chat-input.useDeviceTuningLift';
 import { readSubagentsDefault } from '@/lib/subagentsDefault';
-import { formatContextBlock } from './chat-input.contextBlocks';
+import { readGivenBack, spellOutQuotes } from './chat-input.quoteTokens';
+import { formatContextBlock } from './chat-input.wire';
 // DALTON-HOOK(composer-drafts): persist unsent composer draft text across view/thread switches
-import { useComposerDraft } from '@/lib/dalton/chatDrafts';
+import { useComposerDraft, type DraftParts } from '@/lib/dalton/chatDrafts';
 
 /** Autosize cap for the composer textarea; past this the box scrolls. */
 const MAX_TEXTAREA_HEIGHT = 200;
 
+/** What the textarea keeps, two lines of the phone's text, however little room the keyboard leaves. */
+const MIN_TEXTAREA_HEIGHT_OVER_KEYBOARD = 52;
+
 /** A thread that follows Settings for both. */
 const FOLLOWS_SETTINGS = { reasoningEffort: null, fastMode: null } as const;
 
+/** The box with `text` put back: into it when empty, else after what is
+ *  typed, a blank line between, and never twice. */
+function withGivenBack(typed: string, text: string): string {
+  const kept = typed.trimEnd();
+  if (!kept) return text;
+  // DALTON-HOOK(composer-drafts): a refused send's draft settlement may
+  // already have put the text back ahead of what was typed since
+  // (`chatDrafts.ts`), so it counts as given back at either end.
+  if (kept === text || kept.endsWith(`\n\n${text}`) || kept.startsWith(`${text}\n\n`)) return typed;
+  return `${kept}\n\n${text}`;
+}
+
 export interface ChatInputHandle {
   getModelOptions: () => ModelOptions;
-  addContext: (ctx: { path?: string; snippet?: string; label?: string; locator?: string; lineStart?: number; lineEnd?: number; lineCount?: number; source?: string }) => void;
+  addContext: (ctx: ContextPayload) => void;
   /**
    * Imperatively add a widget context snapshot to the deck. Local-only —
    * this does NOT publish to ContextBus. Use this when re-seeding the deck
@@ -61,24 +86,31 @@ export interface ChatInputHandle {
    */
   addWidgetSnapshot: (snapshot: WidgetContextSnapshot) => void;
   setValue: (text: string) => void;
-  /** Puts back text the user wrote elsewhere without losing what is typed
-   *  here: into an empty box, else after it, a blank line between. Files a
-   *  send took come back beside what is attached now. */
-  giveBack: (text: string, files?: ReadyAttachment[]) => void;
+  /**
+   * Puts back what was written elsewhere, or sent and handed back, without
+   * losing what is typed here: the text into an empty box, else after it, a
+   * blank line between, and the files and pills beside what is there now.
+   * `focus: false` leaves focus where it is, for a draft that comes back
+   * while the person may have moved on to something else.
+   */
+  giveBack: (
+    text: string,
+    files?: ReadyAttachment[],
+    rest?: Partial<Pick<ComposerDraft, 'mentions' | 'commands'>> & { focus?: boolean },
+  ) => void;
   /** Sends what is written, as Enter does. Returns whether there was
    *  anything to send. */
   send: () => boolean;
+  focus: () => void;
 }
 
 
 export interface ChatInputProps {
-  // DALTON-HOOK(composer-drafts): allow onSend to return false or a rejected promise to preserve draft on failure
-  onSend: (
-    message: string,
-    attachments: ReadyAttachment[],
-    slashCommands: SlashCommand[],
-    modelOptions: ModelOptions,
-  ) => void | boolean | Promise<void | boolean>;
+  /** The send is also the box as the person wrote it, for `giveBack` should it fail. */
+  // DALTON-HOOK(composer-drafts): the return stays open beside upstream's
+  // void — a host whose send can fail reports false (or a promise of it) so
+  // the composer keeps its stored draft; upstream hosts return nothing.
+  onSend: (send: ComposerSend) => void | boolean | Promise<void | boolean>;
   disabled?: boolean;
   isLoading?: boolean;
   /**
@@ -97,6 +129,10 @@ export interface ChatInputProps {
   onScopeChange?: ((scope: ComposerScope) => void) | null;
   /** Shown in the scope picker while there is no workspace to pick. */
   emptyWorkspacesHint?: string | null;
+  /** The send goes to Home with no scope picker to say so: a Home thread's,
+   *  or the welcome's, whose first message opens one there. Its turns are the
+   *  Chief of Staff's, as a send scoped to all workspaces is. */
+  inHome?: boolean;
   /**
    * The Subagents switch, owned by a thread host (`useThreadSubagents`),
    * which also receives each flip through `onToggleSubagents`. Null while the
@@ -151,13 +187,28 @@ export interface ChatInputProps {
    * docks its folded tray here). Outside the fold budget on purpose: a host's
    * status comes and goes on its own clock, and the toggles must not hop into
    * the overflow menu with it, so the model label gives up the room instead.
+   * Only once the label is down to its floor does the status cost a slot.
    */
   toolbarStatus?: React.ReactNode;
   // DALTON-HOOK(composer-drafts): storage key suffix for persisting unsent composer draft text
   draftKey?: string;
+  /**
+   * Context the host gathers above the text box, ruled off from it (the chat
+   * view's queued file comments). The host owns what it holds and what a send
+   * does with it; pair it with `hasExternalContext` when it makes an empty box
+   * sendable. A press on it is its own and does not focus the text box.
+   */
+  deck?: React.ReactNode;
 }
 
 /* --- MAIN COMPONENT --- */
+
+function settleAfterSend(field: HTMLTextAreaElement | null): void {
+  if (!field) return;
+  field.style.height = 'auto';
+  // The answer lands where the on-screen keyboard is.
+  if (onScreenKeyboardUp()) field.blur();
+}
 
 function ChatInput({
   onSend,
@@ -171,6 +222,7 @@ function ChatInput({
   scope,
   onScopeChange = null,
   emptyWorkspacesHint = null,
+  inHome = false,
   // Subagents switch
   subagentsAllowed: hostSubagents,
   onToggleSubagents = null,
@@ -207,9 +259,11 @@ function ChatInput({
   toolbarStatus = null,
   // DALTON-HOOK(composer-drafts): storage key suffix for persisting unsent composer draft text
   draftKey,
+  deck = null,
   ref,
 }: ChatInputProps & { ref?: React.Ref<ChatInputHandle> }) {
   const { t } = useTranslation();
+  const navigate = useNavigate();
   const isMobile = useIsMobile();
   const { preferences, isLoaded: preferencesRead } = usePreferences();
   const marketWatchEnabled = useFeatureEnabled('market_watch');
@@ -218,17 +272,26 @@ function ChatInput({
   const otherPref = (preferences as Record<string, Record<string, unknown>> | null)?.other_preference;
   // DALTON-HOOK(composer-drafts): persist unsent composer text in localStorage when draftKey is set
   const resetRichDraftRef = useRef<() => void>(() => {});
+  // The rich parts of the draft (held quotes, attachment presence) ride the
+  // stored draft. Read through a ref so the hook — called before the mentions
+  // and attachments exist — sees them as they are when a save flushes.
+  const draftPartsRef = useRef<DraftParts>({});
+  // The failure restore needs the mentions machinery, which exists only below
+  // the draft hook; the trampoline lets the hook reach it when a settle runs.
+  const returnSendRef = useRef<((sentText: string, parts: DraftParts) => void) | null>(null);
   const handleDraftKeySwitch = useCallback(() => {
     resetRichDraftRef.current();
   }, []);
   // DALTON-HOOK(composer-drafts): give-back and IME composition hold come from useComposerDraft
   const {
-    message, setMessage, restoredFromInFlight, clearCurrentDraft, submitWithDraft,
+    message, setMessage, restoredQuotes, restoredHadAttachments, inFlightCopies, restoreInFlightCopy, discardInFlightCopy, clearCurrentDraft, touchDraft, submitWithDraft,
     giveBack: giveBackDraft, onCompositionStart: holdDraftWrites, onCompositionEnd: releaseDraftWrites,
   } = useComposerDraft({
     draftKey,
     prefillMessage,
     onDraftKeySwitch: handleDraftKeySwitch,
+    getDraftParts: () => draftPartsRef.current,
+    onSendReturned: (sentText, parts) => returnSendRef.current?.(sentText, parts),
   });
   const { attachedFiles, setAttachedFiles, isDragging, handleFiles, restoreFiles, removeFile, onDragEnter, onDragOver, onDragLeave, onDrop, handlePaste } = useFileAttachments({ disabled });
   const [watchMode, setWatchMode] = useState(false);
@@ -239,10 +302,11 @@ function ChatInput({
   // The model a send names. A thread host owns it. Without one the composer
   // holds it, starting on the account default, which with nothing saved is
   // the deployment's (see useSlotDefaultModels for why it waits on the
-  // preference), and following the default when it changes.
-  const defaultModel = useDefaultModel();
-  const [ownModel, setOwnModel] = useSeededModel(defaultModel);
-  const pillModel = hostModel === undefined ? ownModel : hostModel;
+  // preference), and following the default when it changes. A turn in Home
+  // swaps a model it never runs for the default (see useTurnModels).
+  const turn = useTurnModels(inHome || scope === 'all');
+  const [ownModel, setOwnModel] = useSeededModel(turn.defaultModel);
+  const pillModel = turn.resolve(hostModel === undefined ? ownModel : hostModel);
 
   // Per-model tuning is an account preference, not a device one: the server
   // resolves ``profiles[<model>]`` for turns this input never starts (schedules,
@@ -324,6 +388,10 @@ function ChatInput({
   // mirrors the same global ContextBus state so two visible inputs always
   // show the same deck.
   const [widgetSnapshots, setWidgetSnapshots] = useState<WidgetContextSnapshot[]>([]);
+  // DALTON-HOOK(composer-drafts): the offered unresolved-send copies fold past
+  // three — everything stays stored and reachable; the banner just doesn't
+  // grow without bound on screen.
+  const [copiesExpanded, setCopiesExpanded] = useState(false);
   const [deckFanned, setDeckFanned] = useState(false);
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -358,11 +426,11 @@ function ChatInput({
   const slash = useSlashCommands({ textareaRef, message, setMessage, workspaceId: slashWorkspaceId });
   const {
     mentionedFiles, setMentionedFiles, pruneRemoved: pruneMentions, detectTrigger: detectMention,
-    close: closeMentions, reset: resetMentions, handleKeyDown: mentionKeyDown, open: mentionsOpen,
+    close: closeMentions, reset: resetMentions, handleKeyDown: mentionKeyDown, open: mentionsOpen, addMention, removeMention,
   } = mentions;
   const {
     slashCommands, pruneRemoved: pruneSlash, detectTrigger: detectSlash,
-    close: closeSlash, reset: resetSlash, handleKeyDown: slashKeyDown,
+    close: closeSlash, reset: resetSlash, restore: restoreSlash, handleKeyDown: slashKeyDown,
   } = slash;
 
   // DALTON-HOOK(composer-drafts): clear transient mention/slash pills when switching draftKey on a mounted input
@@ -372,9 +440,92 @@ function ChatInput({
       resetSlash();
     };
   }, [resetMentions, resetSlash]);
+  // Pills whose /{command} or @mention text was deleted go with it
+  const pruneDraft = useCallback((draft: string) => {
+    pruneSlash(draft);
+    pruneMentions(draft);
+  }, [pruneSlash, pruneMentions]);
+  // The words of the draft that stand for a skill or a file.
+  const draftTokens = useMemo(() => [
+    ...slashCommands.map((c) => `/${c.name}`),
+    ...mentionedFiles.filter((f) => f.kind === 'file').map((f) => `@${f.path}`),
+  ], [slashCommands, mentionedFiles]);
+  const {
+    heldMentions, quotes, chips, addQuote, handleSelect, handleQuotePress, handleKeyDown: tokenKeyDown, keepWhole,
+  } = useQuoteTokens({ textareaRef, message, setMessage, mentions, draftTokens, pruneDraft });
+
+  // DALTON-HOOK(composer-drafts): what the stored draft keeps — the quotes its
+  // text still holds, and whether attachments stood beside them (they are not
+  // persisted; a restore says to add them again). A change beside the text —
+  // an attachment added or removed — saves on the same debounce, so the
+  // stored `hadAttachments` tracks the box without a keystroke.
+  useEffect(() => {
+    draftPartsRef.current = { quotes, hadAttachments: attachedFiles.length > 0 };
+  }, [quotes, attachedFiles]);
+  // The mount run is no change: a restored draft is not "typed since", so the
+  // first fire is skipped and only later attachment changes save.
+  const attachmentsTouchedRef = useRef(false);
+  useEffect(() => {
+    if (!attachmentsTouchedRef.current) {
+      attachmentsTouchedRef.current = true;
+      return;
+    }
+    touchDraft();
+  }, [attachedFiles.length, touchDraft]);
+
+  // Quotes restored from the stored draft go back into the mentions machine,
+  // once per restore: the hook hands back a fresh array each time, and the
+  // draftKey-switch reset above has already emptied what the old draft held.
+  const seededRestoreRef = useRef<readonly unknown[] | null>(null);
+  useEffect(() => {
+    if (seededRestoreRef.current === restoredQuotes) return;
+    seededRestoreRef.current = restoredQuotes;
+    if (restoredQuotes.length === 0) return;
+    setMentionedFiles((prev) => [
+      ...prev,
+      ...restoredQuotes.filter((q) => !prev.some((m) => sameMention(m, q))),
+    ]);
+  }, [restoredQuotes, setMentionedFiles]);
 
   // Voice input (speech recognition) — see chat-input.useVoiceInput.
-  const { isListening, toggleListening, stopListening } = useVoiceInput({ message, setMessage, isLoading });
+  const { isListening, toggleListening, stopListening, abandonListening } = useVoiceInput({ message, setMessage, isLoading });
+
+  const givenBackBesideRef = useLatestRef(mentionedFiles);
+
+  // DALTON-HOOK(composer-drafts): what a refused send leaves in the composer
+  // when no host giveBack takes it (the plain chat view): its quotes re-seated
+  // against the tokens the input holds now — a quote added since may have
+  // taken the same words, so the returning one is renumbered rather than
+  // misattributed — and its text ahead of what was typed since, as the draft
+  // settlement and giveBack compose it. Files are not kept; the
+  // attachments-again notice says so.
+  const returnSendToComposer = useCallback((sentText: string, parts: DraftParts) => {
+    const quotes = parts.quotes ?? [];
+    // The beside-ref is written in a layout effect and may still hold the
+    // mentions the send cleared; the sent quotes are never "beside" their own
+    // restore.
+    const held = givenBackBesideRef.current.filter((m) => !quotes.some((q) => sameMention(q, m)));
+    const back = readGivenBack(sentText, quotes, held);
+    givenBackBesideRef.current = [...held, ...back.mentions];
+    // Sent text first, then whatever was typed since — and nothing after it
+    // when nothing was.
+    if (back.text) setMessage((prev) => (prev.trim() ? withGivenBack(back.text, prev) : back.text));
+    if (back.mentions.length > 0) {
+      const backQuotes = back.mentions.filter((m): m is QuoteMention => m.kind === 'quote');
+      const heldQuotes = held.filter((m): m is QuoteMention => m.kind === 'quote');
+      draftPartsRef.current = {
+        ...draftPartsRef.current,
+        quotes: [
+          ...heldQuotes,
+          ...backQuotes.filter((q) => !heldQuotes.some((p) => p.token === q.token)),
+        ],
+      };
+      setMentionedFiles((prev) => [...prev, ...back.mentions]);
+    }
+  }, [setMessage, setMentionedFiles]);
+  useLayoutEffect(() => {
+    returnSendRef.current = returnSendToComposer;
+  });
 
   // The handle is built before the send below, so it reaches it through here.
   const sendRef = useRef<() => boolean>(() => false);
@@ -391,29 +542,34 @@ function ChatInput({
         ...ownOverrides,
       };
     },
-    addContext({ path, snippet, label, locator, lineStart, lineEnd, lineCount, source }) {
-      if (snippet) {
-        // Snippet context — add pill with snippet data, don't modify textarea
-        setMentionedFiles((prev) => {
-          // Deduplicate by exact snippet content (handles multiple selections)
-          if (prev.some((f) => f.snippet === snippet && f.path === (path || '') && f.locator === locator && f.source === (source || undefined))) return prev;
-          return [...prev, { path: path || '', snippet, label, locator, lineStart, lineEnd, lineCount, source }];
-        });
-      } else if (path) {
-        // Whole file context — same behavior as selectFile via @mention
-        setMentionedFiles((prev) => {
-          if (prev.some((f) => f.path === path && !f.snippet)) return prev;
-          return [...prev, { path }];
-        });
-        // Insert @path into message text
-        setMessage((prev) => {
-          if (prev.includes('@' + path)) return prev;
-          const prefix = prev && !prev.endsWith(' ') ? prev + ' ' : prev;
-          return prefix + '@' + path + ' ';
-        });
+    addContext(ctx) {
+      // Dictation rewrites the draft from what it held when it started.
+      if (ctx.kind !== 'chip') abandonListening();
+      switch (ctx.kind) {
+        case 'file':
+          // Same behavior as selectFile via @mention
+          addMention(ctx);
+          setMessage((prev) => {
+            if (prev.includes('@' + ctx.path)) return prev;
+            const prefix = prev && !prev.endsWith(' ') ? prev + ' ' : prev;
+            return prefix + '@' + ctx.path + ' ';
+          });
+          break;
+        case 'quote':
+          addQuote(ctx);
+          break;
+        case 'chip':
+          addMention(ctx);
+          break;
+        case 'attachment': {
+          const { files, text } = ctx;
+          if (files.length) handleFiles(files);
+          if (text) setMessage((prev) => (prev.trim() ? `${prev.trimEnd()}\n${text}` : text));
+          break;
+        }
       }
       // Focus the textarea
-      setTimeout(() => textareaRef.current?.focus(), 0);
+      setTimeout(() => focusWithoutRing(textareaRef.current), 0);
     },
     addWidgetSnapshot(snapshot) {
       setWidgetSnapshots((prev) => {
@@ -425,17 +581,46 @@ function ChatInput({
       setMessage(text);
       setTimeout(() => textareaRef.current?.focus(), 0);
     },
-    giveBack(text, files = []) {
-      // DALTON-HOOK(composer-drafts): handed-back text waits for an open IME composition
-      if (text) giveBackDraft(text);
-      restoreFiles(files);
-      setTimeout(() => textareaRef.current?.focus(), 0);
+    giveBack(text, files = [], { mentions = [], commands = [], focus = true } = {}) {
+      // DALTON-HOOK(composer-drafts): handed-back draft waits for an open IME composition
+      const preview = readGivenBack(text, mentions, givenBackBesideRef.current);
+      const previewQuotes = preview.mentions.filter((m): m is QuoteMention => m.kind === 'quote');
+      giveBackDraft(preview.text, {
+        parts: {
+          quotes: previewQuotes,
+          hadAttachments: files.length > 0,
+        },
+        onSeat: () => {
+          // Through a ref, for what else comes back in the same commit to number against.
+          const back = readGivenBack(text, mentions, givenBackBesideRef.current);
+          givenBackBesideRef.current = [...givenBackBesideRef.current, ...back.mentions];
+          const backQuotes = back.mentions.filter((m): m is QuoteMention => m.kind === 'quote');
+          if (backQuotes.length > 0 || files.length > 0) {
+            const existingQuotes = draftPartsRef.current.quotes ?? [];
+            draftPartsRef.current = {
+              quotes: [
+                ...existingQuotes,
+                ...backQuotes.filter((q) => !existingQuotes.some((p) => p.token === q.token)),
+              ],
+              hadAttachments: Boolean(draftPartsRef.current.hadAttachments || files.length > 0),
+            };
+          }
+          restoreFiles(files);
+          if (back.mentions.length > 0) setMentionedFiles((prev) => [...prev, ...back.mentions]);
+          restoreSlash(commands);
+          if (focus) setTimeout(() => textareaRef.current?.focus(), 0);
+          return back.text;
+        },
+      });
     },
     send() {
       return sendRef.current();
     },
     // DALTON-HOOK(composer-drafts): include setMessage and giveBackDraft from useComposerDraft
-  }), [pillModel, sentEffort, resolvedFastMode, effectiveMarketWatch, draftSubagents, ownOverrides, setMentionedFiles, restoreFiles, setMessage, giveBackDraft]);
+    focus() {
+      textareaRef.current?.focus();
+    },
+  }), [pillModel, sentEffort, resolvedFastMode, effectiveMarketWatch, draftSubagents, ownOverrides, mentionedFiles, setMentionedFiles, addMention, addQuote, restoreFiles, restoreSlash, handleFiles, abandonListening, setMessage, giveBackDraft]);
 
   // Subscribe to ContextBus so this input mirrors the global widget-context
   // deck. Multiple chat inputs can be visible simultaneously (hero card +
@@ -499,13 +684,95 @@ function ChatInput({
     else onPickFastMode?.(next);
   }, [settingsFast, tuning.fastMode, hostTuning, onPickFastMode]);
 
-  // Auto-resize textarea; past the cap the box scrolls (overflow-y-auto).
-  useEffect(() => {
+  const tokenLayerRef = useRef<HTMLDivElement>(null);
+  const sizeTokenLayer = useCallback(() => {
+    if (!textareaRef.current || !tokenLayerRef.current) return;
+    tokenLayerRef.current.style.width = `${textareaRef.current.clientWidth}px`;
+    tokenLayerRef.current.style.height = `${textareaRef.current.clientHeight}px`;
+    tokenLayerRef.current.scrollTop = textareaRef.current.scrollTop;
+  }, []);
+
+  // Auto-resize textarea; past the cap the box scrolls (overflow-y-auto). A
+  // chip beside it changes its width, and so where the text wraps, and the
+  // layer has to wrap with it, a scrollbar taken out of the width included.
+  const fitTextarea = useCallback(() => {
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto';
-      textareaRef.current.style.height = Math.min(textareaRef.current.scrollHeight, MAX_TEXTAREA_HEIGHT) + 'px';
+      // Rounded up: `scrollHeight` rounds a fractional line height down as often as
+      // not, and what fits exactly then comes up short and shows a scrollbar.
+      textareaRef.current.style.height = Math.min(textareaRef.current.scrollHeight + 1, MAX_TEXTAREA_HEIGHT) + 'px';
+      sizeTokenLayer();
     }
-  }, [message]);
+  }, [sizeTokenLayer]);
+  useEffect(fitTextarea, [fitTextarea, message, chips.length, draftTokens.length]);
+  // A narrower window wraps the text too. Fitted a frame on, since the fit itself
+  // resizes what is being observed.
+  useEffect(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    let width = textarea.clientWidth;
+    let frame = 0;
+    const observer = new ResizeObserver(() => {
+      if (textarea.clientWidth === width) return;
+      width = textarea.clientWidth;
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(fitTextarea);
+    });
+    observer.observe(textarea);
+    return () => {
+      observer.disconnect();
+      cancelAnimationFrame(frame);
+    };
+  }, [fitTextarea]);
+
+  // A composer in a scrolling route grows downward, so with a keyboard up the
+  // text gives up what would push the send row under it. A limit apart from the
+  // height above, measured from the box as it stands: nothing collapses, so the
+  // text keeps its scroll, and a composer hidden with its cached thread keeps its size.
+  const fitToKeyboard = useCallback(() => {
+    const textarea = textareaRef.current;
+    const box = chatContainerRef.current;
+    if (!textarea || !box) return;
+    const active = document.activeElement;
+    // Its picker is anchored to the box as it stands.
+    if (active?.closest('[data-composer-panel]')) return;
+    const room = active === textarea ? roomAboveKeyboard(box) : null;
+    if (room === null) {
+      textarea.style.maxHeight = '';
+      sizeTokenLayer();
+      return;
+    }
+    const shownBefore = textarea.clientHeight;
+    // Not `offsetHeight`: rounded, the limit never settles and the observer below
+    // refits it every frame.
+    textarea.style.maxHeight = Math.max(textarea.getBoundingClientRect().height + room, MIN_TEXTAREA_HEIGHT_OVER_KEYBOARD) + 'px';
+    // The box gives up its foot, and a caret at the end of the text is there.
+    if (textarea.clientHeight < shownBefore && textarea.selectionEnd === textarea.value.length) {
+      textarea.scrollTop = textarea.scrollHeight;
+    }
+    sizeTokenLayer();
+    if ((roomAboveKeyboard(box) ?? 0) < 0) box.scrollIntoView({ block: 'nearest' });
+  }, [sizeTokenLayer]);
+
+  useEffect(fitToKeyboard, [message, fitToKeyboard]);
+  useEffect(() => {
+    if (!chatContainer) return;
+    // Whatever else sizes the box: a pill, an attachment leaving, a deck folding,
+    // with or without motion. A frame later, since changing the box inside its
+    // own callback is a ResizeObserver loop error.
+    let frame = 0;
+    const observer = new ResizeObserver(() => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(fitToKeyboard);
+    });
+    observer.observe(chatContainer);
+    const stopListening = onKeyboardFit(fitToKeyboard);
+    return () => {
+      observer.disconnect();
+      cancelAnimationFrame(frame);
+      stopListening();
+    };
+  }, [chatContainer, fitToKeyboard]);
 
   // Large text pastes condense into a pill (snippet-mention mechanics) instead
   // of flooding the draft. File pastes keep priority — handlePaste prevents
@@ -516,30 +783,24 @@ function ChatInput({
     const text = e.clipboardData.getData('text/plain');
     if (!isLargePaste(text)) return;
     e.preventDefault();
-    const lineCount = text.split('\n').length;
-    setMentionedFiles((prev) => {
-      if (prev.some((f) => f.source === 'paste' && f.snippet === text)) return prev;
-      return [...prev, { path: '', snippet: text, label: t('context.pastedLines', { count: lineCount }), lineCount, source: 'paste' }];
-    });
-  }, [handlePaste, setMentionedFiles, t]);
+    addMention({ kind: 'chip', source: 'paste', snippet: text, label: t('context.pastedLines', { count: text.split('\n').length }) });
+  }, [handlePaste, addMention, t]);
 
   // Detect @ and / triggers on input change
   const handleChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    const val = e.target.value;
+    const val = keepWhole(e.target.value, e.target.selectionStart);
     setMessage(val);
     // DALTON-HOOK(composer-drafts): an input the browser marks as outside any composition ends one whose compositionend never came
     if ((e.nativeEvent as InputEvent).isComposing === false) releaseDraftWrites();
     const cursorPos = e.target.selectionStart;
 
-    // Pills whose /{command} or @mention text was deleted go with it
-    pruneSlash(val);
-    pruneMentions(val);
+    pruneDraft(val);
 
     // A live /slash trigger wins: the two menus never show at once.
     if (detectSlash(val, cursorPos)) closeMentions();
     else detectMention(val, cursorPos);
-    // DALTON-HOOK(composer-drafts): include setMessage from useComposerDraft
-  }, [pruneSlash, pruneMentions, detectSlash, detectMention, closeMentions, setMessage, releaseDraftWrites]);
+    // DALTON-HOOK(composer-drafts): include setMessage and releaseDraftWrites from useComposerDraft
+  }, [keepWhole, pruneDraft, detectSlash, detectMention, closeMentions, setMessage, releaseDraftWrites]);
 
   // Close both autocompletes on blur
   const handleBlur = useCallback(() => {
@@ -550,7 +811,7 @@ function ChatInput({
   }, [closeMentions, closeSlash]);
 
   // --- Send ---
-  const hasContent = message.trim() || attachedFiles.length > 0 || !!chartImage || mentionedFiles.some((f) => f.snippet) || widgetSnapshots.length > 0 || hasExternalContext;
+  const hasContent = message.trim() || attachedFiles.length > 0 || !!chartImage || chips.length > 0 || widgetSnapshots.length > 0 || hasExternalContext;
 
   const handleSend = useCallback(() => {
     if (!hasContent || disabled) return;
@@ -573,9 +834,7 @@ function ChatInput({
         ContextBus.clear();
       }
       setDeckFanned(false);
-      if (textareaRef.current) {
-        textareaRef.current.style.height = 'auto';
-      }
+      settleAfterSend(textareaRef.current);
       return;
     }
 
@@ -587,29 +846,48 @@ function ChatInput({
         type: f.type,
         preview: f.preview,
       }));
-    // Append snippet blocks to message for mentions that have snippets
-    let finalMessage = message;
-    const snippetMentions = mentionedFiles.filter((f) => f.snippet);
-    if (snippetMentions.length > 0) {
-      const blocks = snippetMentions.map((f) => formatContextBlock(f, t));
+    // Quotes go where they sit among the typed words. Chips' blocks trail.
+    let finalMessage = spellOutQuotes(message, quotes);
+    if (chips.length > 0) {
+      const blocks = chips.map((f) => formatContextBlock(f, t));
       finalMessage = finalMessage.trimEnd() + '\n' + blocks.join('\n');
     }
-    // DALTON-HOOK(composer-drafts): clear input immediately, then remove stored draft only when onSend succeeds
-    submitWithDraft((onAccepted) =>
-      onSend(finalMessage, readyAttachments, slashCommands, {
-        model: pillModel,
-        reasoningEffort: sentEffort,
-        fastMode: resolvedFastMode,
-        marketWatch: effectiveMarketWatch,
-        subagentsAllowed: draftSubagents,
-        ...ownOverrides,
-        widgetSnapshots: widgetSnapshots.length ? widgetSnapshots : undefined,
-        onAccepted,
+    // DALTON-HOOK(composer-drafts): the input clears immediately; the stored
+    // draft is removed only once the send is accepted (onAccepted fires from
+    // the host) or resolves truthy — upstream hosts that report nothing fall
+    // back to the promise's value, and a void return settles as sent. A send
+    // handed to its own automatic resend (onHandedOff) settles only when the
+    // resend itself is taken.
+    // DALTON-HOOK(composer-drafts): clear the chips before the send settles,
+    // not after — a send refused at once is put back (its quote chips
+    // included) inside submitWithDraft, and a later reset would drop them.
+    resetMentions();
+    submitWithDraft((onAccepted, onHandedOff, onRestore, onHostReturned) =>
+      onSend({
+        text: message,
+        files: readyAttachments,
+        mentions: heldMentions,
+        commands: slashCommands,
+        message: finalMessage,
+        modelOptions: {
+          model: pillModel,
+          reasoningEffort: sentEffort,
+          fastMode: resolvedFastMode,
+          marketWatch: effectiveMarketWatch,
+          subagentsAllowed: draftSubagents,
+          ...ownOverrides,
+          widgetSnapshots: widgetSnapshots.length ? widgetSnapshots : undefined,
+          onAccepted,
+          onHandedOff,
+          onNotTaken: onRestore,
+          onReturnedUnsent: onHostReturned,
+        },
       }),
+      // DALTON-HOOK(composer-drafts): files still being read go unsent and leave the box
+      { filesWithheld: readyAttachments.length < attachedFiles.length },
     );
     attachedFiles.forEach(f => { if (f.preview) URL.revokeObjectURL(f.preview); });
     setAttachedFiles([]);
-    resetMentions();
     resetSlash();
     // Clear widget deck on send. Other mounted chat inputs hear the same
     // clear via ContextBus so the deck empties everywhere — single source
@@ -618,12 +896,10 @@ function ChatInput({
       ContextBus.clear();
     }
     setDeckFanned(false);
-    if (textareaRef.current) {
-      textareaRef.current.style.height = 'auto';
-    }
+    settleAfterSend(textareaRef.current);
     // DALTON-HOOK(composer-drafts): include draft helpers in handleSend deps
   }, [hasContent, disabled, message, effectiveMarketWatch, draftSubagents, attachedFiles, setAttachedFiles, onSend, onAction,
-    mentionedFiles, resetMentions, slashCommands, resetSlash,
+    heldMentions, quotes, chips, resetMentions, slashCommands, resetSlash,
     pillModel, sentEffort, resolvedFastMode, ownOverrides, widgetSnapshots, t, clearCurrentDraft, submitWithDraft]);
   useEffect(() => {
     sendRef.current = () => {
@@ -647,6 +923,7 @@ function ChatInput({
     // suppresses the mention menu while active).
     if (slashKeyDown(e)) return;
     if (mentionKeyDown(e)) return;
+    if (tokenKeyDown(e)) return;
 
     if (e.key === 'Enter' && !mentionsOpen) {
       // Cmd/Ctrl+Enter inserts a newline at the cursor (browsers suppress this by default)
@@ -664,13 +941,13 @@ function ChatInput({
         }
         return;
       }
-      if (!e.shiftKey) {
+      if (!e.shiftKey && !onScreenKeyboardUp()) {
         e.preventDefault();
         handleSend();
       }
     }
-    // DALTON-HOOK(composer-drafts): include setMessage from useComposerDraft
-  }, [slashKeyDown, mentionKeyDown, mentionsOpen, handleSend, isListening, stopListening, message, setMessage]);
+  // DALTON-HOOK(composer-drafts): include setMessage from useComposerDraft
+  }, [slashKeyDown, mentionKeyDown, tokenKeyDown, mentionsOpen, handleSend, isListening, stopListening, message, setMessage]);
 
   /* --- Progressive toolbar folding ---
    *
@@ -688,12 +965,39 @@ function ChatInput({
     menuContainer: chatContainer,
     draftRef: textareaRef,
   });
+  // The effort pill sits beside the model pill and folds last (`slot: 'right'`).
+  const effortLabel = effortLabelFor(t, resolvedEffort);
+  const taskCost = pillModel ? modelMetadata[pillModel]?.task_cost : undefined;
+  const effortProps = useMemo<EffortMenuProps>(() => ({
+    effortLabel,
+    reasoningEffort: resolvedEffort,
+    defaultEffort: settingsEffort,
+    reasoningEfforts,
+    onReasoningEffortChange: handleReasoningEffortChange,
+    fastMode: resolvedFastMode,
+    onFastModeChange: handleFastModeChange,
+    isCodexModel,
+    dropdownDirection,
+    container: chatContainer,
+    taskCost,
+    disabled: modelsLoading,
+  }), [
+    effortLabel, resolvedEffort, settingsEffort, reasoningEfforts, handleReasoningEffortChange, resolvedFastMode,
+    handleFastModeChange, isCodexModel, dropdownDirection, chatContainer, taskCost, modelsLoading,
+  ]);
+  const effortItem = useEffortToolbarItem(effortProps, isMobile);
+  const foldItems = useMemo(() => [...toolbarItems, effortItem], [toolbarItems, effortItem]);
 
   const ringVisible = !!(tokenUsage && tokenUsage.threshold > 0 && tokenUsage.total > 0);
   const micReserved = speechSupported && !!otherPref?.voice_input_enabled;
-  const { measureRowRef, fold } = useToolbarFold({
+  // Right group: the model pill (measured), the mic, and send/stop. A turn
+  // hides the mic but keeps its room, so the fold set holds through it.
+  const rightGroup = (model: number) => GROUP_GAP + model
+    + (micReserved ? TOOLBAR_GAP + ICON_BUTTON_W : 0)
+    + TOOLBAR_GAP + ICON_BUTTON_W;
+  const { measureRowRef, statusRef, fold } = useToolbarFold({
     containerRef: chatContainerRef,
-    items: toolbarItems,
+    items: foldItems,
     // The model pill is measured too, but it isn't foldable. Its label joins
     // the key because an authored display_name comes with the models request,
     // which can land after the pill was first measured under the key's label.
@@ -703,23 +1007,48 @@ function ChatInput({
     fixedLeft: CONTAINER_BORDER + CONTAINER_PX + ICON_BUTTON_W
       + (ringVisible ? TOOLBAR_GAP + ICON_BUTTON_W : 0)
       + (onCaptureChart ? TOOLBAR_GAP + ICON_BUTTON_W : 0),
-    // Right group: the model pill (measured), the mic, and send/stop. A turn
-    // hides the mic but keeps its room, so the fold set holds through it.
-    rightReserve: (widths) => GROUP_GAP + (widths.model ?? 0)
-      + (micReserved ? TOOLBAR_GAP + ICON_BUTTON_W : 0)
-      + TOOLBAR_GAP + ICON_BUTTON_W,
+    rightReserve: (widths) => rightGroup(widths.model ?? 0),
+    rightFloor: (widths) => rightGroup(widths.modelFloor ?? 0),
   });
   const inlineItems = toolbarItems.filter((i) => fold.inline.has(i.id));
-  const foldedItems = toolbarItems.filter((i) => fold.folded.includes(i.id));
+  const foldedItems = foldItems.filter((i) => fold.folded.includes(i.id));
 
   const favorites = useFavoriteModels();
+  const { entryFor } = useProviderCatalog();
   const modelGroupList = useMemo(() => modelGroups({
-    models: visibleModels,
+    models: turn.models,
     payers,
-  }), [visibleModels, payers]);
+    brandOf: (group) => {
+      const entry = entryFor(group);
+      if (!entry?.group || entry.group === group) return undefined;
+      return {
+        id: entry.group,
+        label: visibleModels[entry.group]?.display_name ?? entry.group_display_name ?? entry.display_name,
+      };
+    },
+  }), [turn.models, visibleModels, payers, entryFor]);
   const recentModels = deriveRecentModels({ selectedModel: pillModel, threadModels: threadModelsProp, validModelNames })
-    .filter((m) => !favorites.models.includes(m));
-  const showEffort = hasTuningMenu(reasoningEfforts, isCodexModel);
+    .filter((m) => !favorites.models.includes(m) && turn.offers(m));
+  // A Claude Code model runs a turn while the token where the workspace's
+  // computer runs it works or could not be checked, as admission lets it;
+  // otherwise its row says why, and where the user can fix it: that
+  // computer's token, or the saved one.
+  const claudeCode = useWorkspaceClaudeCode(selectedWorkspaceId);
+  const tokenUrl = claudeCodeTokenUrl(selectedWorkspaceId);
+  const modelRowStatus = (m: string): ModelRowStatus => {
+    if (isClaudeCodeModel(modelMetadata[m])) {
+      switch (claudeCode.state) {
+        case 'checking': return { unavailable: t('modelAccess.status.working') };
+        case 'no_token': return { unavailable: t('chat.modelSelector.claudeCodeSignedOut'), fix: () => navigate(tokenUrl) };
+        case 'rejected': return { unavailable: t('chat.modelSelector.claudeCodeRejected'), fix: () => navigate(tokenUrl) };
+        case 'needs_own_computer': return { unavailable: t('chat.modelSelector.claudeCodeNeedsOwnComputer') };
+        case 'policy_blocked': return { unavailable: t('chat.modelSelector.claudeCodePolicyBlocked') };
+        case 'needs_perl': return { unavailable: t('modelAccess.claudeCode.fail.needs_perl') };
+        case 'computer_unsupported': return { unavailable: t('modelAccess.claudeCode.fail.computer_unsupported') };
+      }
+    }
+    return { tag: lapsedSignIn(m) ? t('modelAccess.status.needsReauth') : undefined };
+  };
 
   return (
     <div
@@ -734,11 +1063,23 @@ function ChatInput({
           overlays repeat it. */}
       <div
         ref={attachChatContainer}
-        className={cn('chat-input-container owns-its-edge flex flex-col items-stretch relative z-10 rounded-[22px] cursor-text border border-(--color-border-input) bg-(--color-bg-card)', isListening && 'recording')}
-        onClick={() => textareaRef.current?.focus()}
+        className={cn('chat-input-container owns-its-edge scroll-mb-2 flex flex-col items-stretch relative z-10 rounded-[22px] cursor-text border border-(--color-border-input) bg-(--color-bg-card)', isListening && 'recording')}
+        onClick={(event) => {
+          // A press on a control in the box is that control's, and the deck
+          // above the text is its own surface: focusing the text there would
+          // raise a phone's keyboard over the page the press was about.
+          if (event.target instanceof Element && event.target.closest('button, a, input, select, [role="button"], [data-composer-deck]')) return;
+          textareaRef.current?.focus();
+        }}
       >
         {isListening && <VoiceOverlay />}
         <div className="flex flex-col px-3 pt-3 pb-2 gap-2">
+
+          {/* The deck folds, and the column's gap below it cannot: a gap lands
+              whole the frame the deck mounts and vanishes the frame it hides.
+              The deck carries the gap as its own bottom margin, inside the
+              fold, and this cancels the column's. */}
+          {deck && <div data-composer-deck className="-mb-2">{deck}</div>}
 
           {/* Widget context deck — top card visible, others peek behind */}
           {widgetSnapshots.length > 0 && (
@@ -760,13 +1101,6 @@ function ChatInput({
               }}
             />
           )}
-
-          <ComposerPills
-            slashCommands={slashCommands}
-            onRemoveCommand={slash.removeCommand}
-            mentionedFiles={mentionedFiles}
-            onRemoveMention={mentions.removeMention}
-          />
 
           <ComposerAttachments
             chartImage={chartImage}
@@ -803,26 +1137,99 @@ function ChatInput({
             )}
           </AnimatePresence>
 
-          {/* DALTON-HOOK(composer-drafts): warn when a restored draft came from an unconfirmed in-flight send */}
-          {restoredFromInFlight && (
+          {/* DALTON-HOOK(composer-drafts): sends whose verdict never arrived
+              — each copy as it went out, offered above the box beside whatever
+              draft is typed since, until the user seats it back or drops it.
+              A new send appends its own copy without disturbing the offers. */}
+          {inFlightCopies.length > 0 && (
             <div
               role="status"
               data-testid="in-flight-draft-notice"
-              className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-xs text-(--color-text-secondary)"
+              className="flex flex-col gap-1.5 rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-xs text-(--color-text-secondary)"
             >
-              {t('chat.composer.inFlightDraftRestored')}
+              {(copiesExpanded ? inFlightCopies : inFlightCopies.slice(0, 3)).map((copy) => (
+                <div key={copy.id} className="flex flex-col gap-1.5" data-testid="in-flight-draft-entry">
+                  <div>{t('chat.composer.inFlightDraftRestored')}</div>
+                  {copy.text.trim() && (
+                    <div
+                      data-testid="in-flight-draft-text"
+                      className="max-h-24 overflow-y-auto whitespace-pre-wrap break-words text-(--color-text-primary)"
+                    >
+                      {copy.text}
+                    </div>
+                  )}
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      data-testid="in-flight-draft-restore"
+                      className="press rounded-md border border-(--color-border-muted) px-2 py-0.5 text-xs hover:bg-(--color-border-muted)"
+                      onClick={() => restoreInFlightCopy(copy.id)}
+                    >
+                      {t('chat.composer.inFlightDraftRestore')}
+                    </button>
+                    <button
+                      type="button"
+                      data-testid="in-flight-draft-discard"
+                      className="press rounded-md px-2 py-0.5 text-xs hover:bg-(--color-border-muted)"
+                      onClick={() => discardInFlightCopy(copy.id)}
+                    >
+                      {t('chat.composer.inFlightDraftDiscard')}
+                    </button>
+                  </div>
+                </div>
+              ))}
+              {inFlightCopies.length > 3 && !copiesExpanded && (
+                <button
+                  type="button"
+                  data-testid="in-flight-draft-expand"
+                  className="press self-start rounded-md px-2 py-0.5 text-xs hover:bg-(--color-border-muted)"
+                  onClick={() => setCopiesExpanded(true)}
+                >
+                  {t('chat.composer.inFlightDraftMore', { count: inFlightCopies.length - 3 })}
+                </button>
+              )}
             </div>
           )}
 
-          {/* Textarea */}
-          <div className="relative">
+          {/* DALTON-HOOK(composer-drafts): attachments are not kept in a stored
+              draft — say so on restore until they are beside it again */}
+          {restoredHadAttachments && attachedFiles.length === 0 && (
+            <div
+              role="status"
+              data-testid="attachments-lost-notice"
+              className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-2.5 py-1.5 text-xs text-(--color-text-secondary)"
+            >
+              {t('chat.composer.draftAttachmentsRestored')}
+            </div>
+          )}
+
+          {/* Textarea, starting on the line the chips end on while it fits
+              there: its basis grows with the draft until it takes a line of
+              its own, where the text has the whole width to wrap in. */}
+          <div className="relative flex flex-wrap items-start gap-x-2">
+            <ComposerChips chips={chips} onRemove={removeMention} />
+            <div
+              className="relative min-w-0 flex-[1_1_5rem]"
+              style={chips.length > 0 ? { flexBasis: message.includes('\n') ? '100%' : `max(5rem, ${message.length + 1}ch)` } : undefined}
+            >
+            <DraftTokenLayer
+              text={message}
+              tokens={draftTokens}
+              quotes={quotes}
+              layerRef={tokenLayerRef}
+              onQuotePress={handleQuotePress}
+              onWheel={(e) => { if (textareaRef.current) textareaRef.current.scrollTop += e.deltaY; }}
+              className={`font-content ${isMobile ? 'text-base' : 'text-sm'} leading-relaxed transition-opacity ${isListening ? 'opacity-20' : 'opacity-100'}`}
+            />
             <textarea
               ref={textareaRef}
               value={message}
               onChange={handleChange}
               onPaste={handleTextareaPaste}
               onKeyDown={handleKeyDown}
+              onSelect={handleSelect}
               onBlur={handleBlur}
+              onScroll={(e) => { if (tokenLayerRef.current) tokenLayerRef.current.scrollTop = e.currentTarget.scrollTop; }}
               // DALTON-HOOK(composer-drafts): rewrites from outside the user's typing wait for the IME composition to end
               onCompositionStart={() => {
                 holdDraftWrites();
@@ -832,12 +1239,16 @@ function ChatInput({
                 }
               }}
               onCompositionEnd={releaseDraftWrites}
-              placeholder={isListening ? "" : (placeholder ?? t("chat.placeholderDefault"))}
-              className={`font-content w-full bg-transparent border-0 text-(--color-text-primary) ${isMobile ? 'text-base' : 'text-sm'} placeholder:text-(--color-text-tertiary) resize-none overflow-y-auto leading-relaxed block transition-opacity ${isListening ? 'opacity-20' : 'opacity-100'}`}
+              // Named apart from the placeholder, which says what state the
+              // thread is in and is empty while listening.
+              aria-label={t("chat.composer.messageLabel")}
+              placeholder={isListening || chips.length > 0 ? "" : (placeholder ?? t("chat.placeholderDefault"))}
+              className={`relative font-content w-full bg-transparent border-0 text-(--color-text-primary) ${isMobile ? 'text-base' : 'text-sm'} placeholder:text-(--color-text-tertiary) resize-none overflow-y-auto leading-relaxed block transition-opacity ${isListening ? 'opacity-20' : 'opacity-100'}`}
               rows={minRows}
               disabled={disabled}
               style={{ minHeight: `${minRows * 1.5}em` }}
             />
+            </div>
           </div>
 
           {/* Action Bar */}
@@ -888,7 +1299,11 @@ function ChatInput({
                 />
               )}
 
-              {toolbarStatus}
+              {/* Measured where it paints, for the fold's last resort. The
+                  gap before it moves inside (its own cancelled, its child's
+                  margin in its place), so an absent or hidden status takes
+                  no room and the measured width is the whole cost. */}
+              <span ref={statusRef} className="-ml-1 flex flex-none items-center *:ml-1">{toolbarStatus}</span>
 
               {/* Hidden measure row — the SAME components rendered geometry-only
                   (no handlers, menus, or aria state), so the fold budget can
@@ -898,11 +1313,14 @@ function ChatInput({
                 aria-hidden
                 className="invisible pointer-events-none absolute top-0 left-[-9999px] flex items-center gap-1 whitespace-nowrap"
               >
-                {toolbarItems.filter((i) => i.visible).map((item) => (
+                {foldItems.filter((i) => i.visible).map((item) => (
                   <span key={item.id} data-measure={item.id}>{item.inline({ measureOnly: true })}</span>
                 ))}
                 <span data-measure="model">
-                  <ModelTriggerMeasure selectedModel={pillModel} metadata={modelMetadata} effortLabel={effortLabelFor(t, resolvedEffort)} fast={resolvedFastMode === true && isCodexModel} showEffort={showEffort} />
+                  <ModelTriggerMeasure pill="model" selectedModel={pillModel} metadata={modelMetadata} />
+                </span>
+                <span data-measure="modelFloor">
+                  <ModelTriggerMeasure pill="model" selectedModel={pillModel} metadata={modelMetadata} floor />
                 </span>
               </div>
             </div>
@@ -914,30 +1332,18 @@ function ChatInput({
                 metadata={modelMetadata}
                 payers={payers}
                 groups={modelGroupList}
-                favorites={favorites.models}
+                favorites={favorites.models.filter(turn.offers)}
                 recent={recentModels}
                 onToggleFavorite={(m, on) => (on ? favorites.add(m) : favorites.remove(m))}
                 onSelectModel={handlePickModel}
-                needsSignIn={(m) => lapsedSignIn(m) !== null}
+                rowStatus={modelRowStatus}
                 dropdownDirection={dropdownDirection}
                 container={chatContainer}
                 draftRef={textareaRef}
                 disabled={modelsLoading}
+                nameHidden={fold.nameHidden}
               />
-              <ChatInputEffortMenu
-                effortLabel={effortLabelFor(t, resolvedEffort)}
-                reasoningEffort={resolvedEffort}
-                defaultEffort={settingsEffort}
-                reasoningEfforts={reasoningEfforts}
-                onReasoningEffortChange={handleReasoningEffortChange}
-                fastMode={resolvedFastMode}
-                onFastModeChange={handleFastModeChange}
-                isCodexModel={isCodexModel}
-                dropdownDirection={dropdownDirection}
-                container={chatContainer}
-                taskCost={pillModel ? modelMetadata[pillModel]?.task_cost : undefined}
-                disabled={modelsLoading}
-              />
+              {fold.inline.has(effortItem.id) && effortItem.inline({})}
               {/* Voice input, when enabled in settings. */}
               {micReserved && (
                 <VoiceButton

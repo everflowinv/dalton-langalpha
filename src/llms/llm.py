@@ -15,6 +15,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_deepseek import ChatDeepSeek
 from langchain_qwq import ChatQwen
 
+from . import claude_code
 from .endpoints import anthropic_sdk_base_url, is_official_openai_endpoint
 from .model_spec import (
     ModelSpec,
@@ -79,6 +80,22 @@ class ModelConfig:
             if cfg.get("platform", False):
                 continue
             self._child_variants.setdefault(parent, []).append(name)
+
+        self._providers_with_models = frozenset(
+            info["provider"]
+            for info in self.llm_config.values()
+            if info and info.get("visible") and info.get("provider")
+        )
+
+        # A gateway's catalog routes each model to one of its APIs, each a
+        # variant of the gateway: the same connection, called another way.
+        self._connections: dict[str, str] = {}
+        for name, info in self._flat_providers.items():
+            catalog = info.get("model_catalog")
+            if catalog and not info.get("parent_provider"):
+                for route in [*catalog["routes"].values(), catalog["fallback_route"]]:
+                    if route != name:
+                        self._connections[route] = name
 
     @staticmethod
     def _flatten_providers(grouped: dict) -> dict:
@@ -182,6 +199,67 @@ class ModelConfig:
         info = self.get_provider_info(provider)
         return info.get("parent_provider", provider)
 
+    def brand_of(self, provider: str) -> str:
+        """The provider whose models and entry ``provider`` is listed under.
+
+        Its parent's, unless it is a top-level entry of the manifest, which is
+        listed as itself: Claude Code names Anthropic as its parent, whose
+        pricing, image rules and task cost its models follow, but is a
+        provider of its own.
+        """
+        info = self.get_provider_info(provider)
+        if info.get("group") == provider:
+            return provider
+        return info.get("parent_provider", provider)
+
+    def models_from(self, provider: str) -> str:
+        """The provider whose manifest models ``provider`` offers.
+
+        Its own when it has any, else its nearest ancestor's: a coding plan with
+        none offers its brand's, and a region of a plan offers the plan's, whose
+        model ids its brand's rows may not share (Kimi Code's ``k3.1-pro``).
+        """
+        seen: set[str] = set()
+        current = provider
+        while current not in seen and current not in self._providers_with_models:
+            seen.add(current)
+            parent = self.get_parent_provider(current)
+            if parent == current:
+                return provider
+            current = parent
+        return current if current in self._providers_with_models else provider
+
+    def runs_manifest_models(self, provider: str) -> bool:
+        """Whether manifest models name ``provider`` itself, and so run on its
+        deployment key. A gateway's models are all the user's picks, and a
+        plan that offers its brand's runs them as picks too, while the brand's
+        own rows read the brand's key."""
+        return provider in self._providers_with_models
+
+    def plan_regions(self, provider: str) -> list[str]:
+        """The other regions of the coding plan ``provider`` is a region of.
+        A plan runs in one region at a time, so a key saved in one replaces
+        theirs; a provider that is no plan's region has none."""
+        info = self._flat_providers.get(provider, {})
+        if info.get("access_type") != "coding_plan":
+            return []
+        return [
+            name for name, other in self._flat_providers.items()
+            if name != provider
+            and other.get("group") == info.get("group")
+            and other.get("access_type") == "coding_plan"
+            and other.get("byok_eligible", True)
+            and not other.get("platform")
+            and self.connection_of(name) == name
+        ]
+
+    def connection_of(self, provider: str) -> str:
+        """The provider whose connection ``provider`` is one API of: a route
+        its gateway's ``model_catalog`` names, which takes the gateway's key
+        and whose models are the gateway's picks. Any other provider,
+        a region included, is its own connection."""
+        return self._connections.get(provider, provider)
+
     def get_child_variants(self, provider: str) -> list[str]:
         """Return provider names whose parent_provider is ``provider``.
 
@@ -245,12 +323,32 @@ class ModelConfig:
                 return key
         return model_name
 
+    def listed_models(self) -> list[tuple[str, dict[str, Any]]]:
+        """The rows the catalog lists: the visible ones, a Claude Code row only
+        on a deployment that runs Claude Code turns.
+
+        Listing is not resolution: an unlisted row still resolves, so a saved
+        pick or a thread on it is refused with a reason rather than read as
+        removed and cleared.
+        """
+        return [
+            (name, info)
+            for name, info in self.llm_config.items()
+            if info
+            and info.get("visible", False)
+            and self.provider_listed(self.get_provider_info(info.get("provider", "")))
+        ]
+
+    @staticmethod
+    def provider_listed(info: dict[str, Any]) -> bool:
+        """Whether the catalog lists the provider ``info`` describes: a Claude
+        Code one only on a deployment that runs Claude Code turns."""
+        return info.get("sdk") != claude_code.SDK or claude_code.rows_available()
+
     def get_model_metadata(self) -> dict[str, dict[str, Any]]:
-        """Return {model_key: {sdk, provider, access_type, ...}} for all visible models."""
+        """Return {model_key: {sdk, provider, access_type, ...}} for all listed models."""
         result = {}
-        for model_name, model_info in self.llm_config.items():
-            if not model_info or not model_info.get("visible", False):
-                continue
+        for model_name, model_info in self.listed_models():
             provider = model_info.get("provider", "unknown")
             provider_info = self.get_provider_info(provider)
             sdk = provider_info.get("sdk", "unknown")
@@ -412,8 +510,9 @@ _CODEX_SESSION_HEADERS = ("session-id", "thread-id", "session_id")
 
 
 def _derive_codex_affinity(cache_key: str) -> str:
-    """UUID-normalize a cache key for codex session headers — pass-through for
-    UUID keys, uuid5 otherwise so raw key material never egresses in a header."""
+    """UUID-normalize a cache key for a session header (codex's, or one a
+    provider names with ``session_header``): pass-through for UUID keys, uuid5
+    otherwise so raw key material never egresses in a header."""
     try:
         return str(uuid.UUID(str(cache_key)))
     except ValueError:
@@ -729,7 +828,12 @@ class LLM:
         - "byok"     — user-provided API key
         - "oauth"    — user-provided OAuth token
         - "platform" — system key (platform pays, credits deducted)
+
+        A Claude Code row is "oauth" with no key: the runtime signs in with
+        the setup token kept for langalpha, on the user's own plan.
         """
+        if self.sdk == claude_code.SDK:
+            return "oauth"
         if self.api_key_override is not None:
             if self.provider_info.get("access_type") == "oauth":
                 return "oauth"
@@ -748,6 +852,16 @@ class LLM:
         # DALTON-HOOK(provider-kill-switch): refuse providers disabled in Dalton config (L17)
         from src.dalton.llm.providers import ensure_provider_enabled
         ensure_provider_enabled(self.provider)
+        # A provider that routes and caches by conversation names the header it
+        # reads the thread from (OpenCode Go's ``x-opencode-session``). It
+        # refuses a request without one, so a call outside any thread (a title,
+        # an insight) is a session of its own.
+        session_header = self.provider_info.get("session_header")
+        if session_header:
+            self.default_headers = {
+                **(self.default_headers or {}),
+                session_header: _derive_codex_affinity(cache_key) if cache_key else str(uuid.uuid4()),
+            }
 
         effective_cache_key: str | None = None
         if cache_key and (
@@ -774,6 +888,8 @@ class LLM:
             client = self._get_anthropic_llm()
         elif self.sdk == "gemini":
             client = self._get_gemini_llm()
+        elif self.sdk == claude_code.SDK:
+            client = claude_code.ClaudeCodeTarget(model=self.model, effort=self.resolved_reasoning_effort)
         else:
             # DALTON-HOOK(llm-sdk-dispatch): Dalton-owned native SDKs (antigravity, muse)
             from src.dalton.llm.providers import build_dalton_client
@@ -1138,6 +1254,12 @@ class LLM:
         # Add all parameters from llm_config
         params.update(self.parameters)
 
+        # A gateway's Chat Completions route runs here too, for the reasoning
+        # it sends back (OpenCode Go), and reads the provider's headers.
+        merged_headers = _merged_default_headers(params, self.default_headers)
+        if merged_headers:
+            params["default_headers"] = merged_headers
+
         if self.extra_body:
             params["extra_body"] = self.extra_body
 
@@ -1233,6 +1355,16 @@ class LLM:
 
         # Add all parameters from llm_config
         params.update(self.parameters)
+
+        # A gateway serving Gemini's API reads the provider's headers too
+        # (OpenCode Go refuses a request without its session header). The
+        # client names them ``additional_headers``.
+        merged_headers = _merged_default_headers(
+            params, self.default_headers, params.pop("additional_headers", None)
+        )
+        params.pop("default_headers", None)
+        if merged_headers:
+            params["additional_headers"] = merged_headers
 
         # Pass extra_body via model_kwargs to avoid Pydantic unknown-field warning.
         if self.extra_body:
@@ -1388,23 +1520,22 @@ def get_llm_by_type(llm_type: str) -> BaseChatModel:
 
 def get_configured_llm_models() -> dict[str, list[str]]:
     """
-    Get visible LLM models grouped by parent provider.
+    Get listed LLM models grouped by the provider each is listed under.
 
-    Only returns models with "visible": true in models.json.
-    Models are grouped by their parent provider (e.g., platform variants → parent).
+    Only returns ``ModelConfig.listed_models()``: the visible rows, less any
+    the deployment cannot run (Claude Code's without its runtime).
+    Models are grouped by ``ModelConfig.brand_of`` (e.g., platform variants → parent).
 
     Returns:
-        Dictionary mapping parent provider to list of visible model names.
+        Dictionary mapping that provider to list of listed model names.
     """
     try:
         config = LLM.get_model_config()  # singleton — no disk I/O
         models: dict[str, list[str]] = {}
 
-        for model_name, model_info in config.llm_config.items():
-            if model_info and model_info.get("visible", False):
-                provider = model_info.get("provider", "unknown")
-                parent = config.get_parent_provider(provider)
-                models.setdefault(parent, []).append(model_name)
+        for model_name, model_info in config.listed_models():
+            provider = model_info.get("provider", "unknown")
+            models.setdefault(config.brand_of(provider), []).append(model_name)
 
         return models
 

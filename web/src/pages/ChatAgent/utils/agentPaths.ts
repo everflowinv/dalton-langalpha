@@ -115,7 +115,7 @@ export function isAgentNotesPath(
  * disk, and a former one by its name key, since the rename moved it away and
  * a path an older turn wrote can only mean this workspace, unless a sibling
  * has taken it since; a caller that knows the siblings asks
- * `siblingWorkspacePath` first.
+ * `folderWorkspacePath` first.
  */
 export function workspaceScopedPath(
   parts: AgentPathParts,
@@ -126,28 +126,16 @@ export function workspaceScopedPath(
   const { path } = parts;
   const inside = (rest: string): string | null => {
     const first = rest.split('/', 1)[0];
-    const inFolder = (!!dirName && first === dirName)
-      || (!!first && (previousDirNames ?? []).some((name) => !!name && foldFolderName(name) === foldFolderName(first)));
+    const inFolder = !!first && (first === dirName || heldBefore(previousDirNames, foldFolderName(first)));
     return inFolder ? rest.slice(first.length + 1) : null;
   };
-  // A root the sandbox did not claim survives parsing (`/tmp/x`): no folder
-  // there, unless it is a root the folder sat under before a move. Every root
-  // it starts under is tried, since one can sit inside another, the longest
-  // first, as the relay reads them: under `/srv` and `/srv/old`,
-  // `/srv/old/<folder>/x` is `x` before it is `<folder>/x` in a folder `old`.
-  const underOtherRoot = (rooted: string): string | null => {
-    const under = (otherRoots ?? []).filter((root) => rooted.startsWith(`${root}/`));
-    for (const root of under.sort((a, b) => b.length - a.length)) {
-      const scoped = inside(rooted.slice(root.length + 1));
-      if (scoped !== null) return scoped;
-    }
-    return null;
-  };
   if (parts.absolute) {
-    if (path.startsWith('/')) return underOtherRoot(path) ?? path;
-    // The root it was read under can hold one the folder sat under before:
-    // moved from `~/langalpha` to `~`, the old path reads `langalpha/<folder>/x`.
-    return inside(path) ?? (parts.root ? underOtherRoot(`${parts.root}/${path}`) : null) ?? path;
+    // A root the sandbox did not claim survives parsing (`/tmp/x`): no folder
+    // there, unless it is a root the folder sat under before a move. The root
+    // it was read under can hold one of those too: moved from `~/langalpha`
+    // to `~`, the old path reads `langalpha/<folder>/x`.
+    const here = path.startsWith('/') ? null : inside(path);
+    return here ?? underRoot(wholePath(parts), otherRoots ?? [], inside) ?? path;
   }
   // A `__wsref__` path climbs out of that workspace's folder, not this one's.
   if (parts.workspaceId || !path.startsWith('../')) return path;
@@ -162,14 +150,29 @@ function foldFolderName(name: string): string {
   return Array.from(name, (c) => CASEFOLD_EXCEPTIONS[c] ?? c.toLowerCase()).join('');
 }
 
-/** Another workspace on the viewed workspace's computer, by the folders that address it. */
-export interface SiblingWorkspace {
+/** Another workspace, by the folders that address it on its computer. */
+export interface FolderWorkspace {
   workspaceId: string;
   dirName: string;
   previousDirNames?: readonly string[] | null;
 }
 
-/** The viewed workspace's own folders and the other workspaces on its computer. */
+/**
+ * The live workspaces on the user's other computers whose folders sit under
+ * one root. Two computers with the same root share an entry, since a path
+ * cannot say which of them it is on.
+ */
+export interface RootFolders {
+  /** Slash-led with no trailing slash, or '' for the stock roots, which read as one. */
+  root: string;
+  workspaces: readonly FolderWorkspace[];
+}
+
+/**
+ * The viewed workspace's own folders, and the folders of every other live
+ * workspace a path can name: its siblings on its computer, and the ones on
+ * the user's other computers.
+ */
 export interface ComputerFolders {
   /**
    * The computer's root, where its workspace folders sit. A computer whose
@@ -186,9 +189,27 @@ export interface ComputerFolders {
    * to may be gone from the list.
    */
   otherRoots?: readonly string[];
+  /**
+   * The roots among `otherRoots` the workspace recorded leaving. Under one of
+   * them a path through its folder is its own before a namesake's there; under
+   * the rest, where it may never have been, a live namesake's goes first.
+   */
+  leftRoots?: readonly string[];
   dirName?: string | null;
   previousDirNames?: readonly string[] | null;
-  siblings: readonly SiblingWorkspace[];
+  siblings: readonly FolderWorkspace[];
+  /**
+   * The workspaces on the user's other computers, by root, sorted. The Chief
+   * of Staff reads them at their whole path on that machine and links them
+   * so, and the path names the workspace the same way a sibling's does.
+   */
+  otherComputers?: readonly RootFolders[];
+}
+
+/** The fields of a computer that place its workspaces' folders. */
+export interface ComputerRootRow {
+  computer_id: string;
+  root_dir?: string | null;
 }
 
 /** The fields of a workspace row that place it on a computer. */
@@ -205,60 +226,97 @@ export interface WorkspaceFolderRow {
 
 /**
  * The viewed workspace's folders and the other live workspaces on its
- * computer, or null until its row is known. A workspace on no computer has
- * no siblings, a deleted workspace's folder went with it, and a row with no
- * folder yet is not one a path can name. `computerRoots` are the roots of
- * every computer the user has, its own included.
+ * computer and on the user's others, or null until its row is known. A
+ * workspace on no computer has no siblings, a deleted workspace's folder went
+ * with it, and a row with no folder yet is not one a path can name.
+ * `computers` are every computer the user has, its own included.
  *
- * The root the row was read with goes first, `rootDir` (the computer list's)
- * after: the row gates the folders, so its root is there the moment they are,
- * while the list loads later and a tool title read against no root flashes
- * from one wording to another. Only the viewed row's former roots are read: a
- * root another workspace left names that workspace's folder, not this one's.
+ * Every row is placed by the root it was read with, then by its computer's on
+ * the list: the row gates the folders, so its root is there the moment they
+ * are, while the list loads later and a tool title read against no root
+ * flashes from one wording to another. A workspace elsewhere is left out
+ * while neither is known. Only the viewed row's former roots are read: a root
+ * another workspace left names that workspace's folder, not this one's.
  */
 export function computerFolders(
   viewed: WorkspaceFolderRow | null | undefined,
   rows: readonly WorkspaceFolderRow[] | null | undefined,
-  rootDir?: string | null,
-  computerRoots?: readonly (string | null | undefined)[] | null,
+  computers?: readonly ComputerRootRow[] | null,
 ): ComputerFolders | null {
   if (!viewed) return null;
   const computerId = viewed.computer_id;
-  const siblings: SiblingWorkspace[] = [];
+  const rootOf = new Map((computers ?? []).map((c) => [c.computer_id, c.root_dir]));
+  const siblings: FolderWorkspace[] = [];
+  const elsewhere = new Map<string, FolderWorkspace[]>();
+  const rowRoots: (string | null | undefined)[] = [];
+  // A computer with no workspace on it still holds its root.
+  for (const computer of computerId ? computers ?? [] : []) {
+    const key = rootKey(computer.root_dir);
+    if (computer.computer_id !== computerId && key !== null && !elsewhere.has(key)) elsewhere.set(key, []);
+  }
   for (const row of computerId ? rows ?? [] : []) {
-    if (row.workspace_id === viewed.workspace_id || row.computer_id !== computerId) continue;
+    if (row.workspace_id === viewed.workspace_id || !row.computer_id) continue;
     if (row.status === 'deleted' || !row.dir_name) continue;
-    siblings.push({ workspaceId: row.workspace_id, dirName: row.dir_name, previousDirNames: row.previous_dir_names });
+    const folders = { workspaceId: row.workspace_id, dirName: row.dir_name, previousDirNames: row.previous_dir_names };
+    if (row.computer_id === computerId) {
+      siblings.push(folders);
+      continue;
+    }
+    const key = rootKey(row.root_dir || rootOf.get(row.computer_id));
+    if (key === null) continue;
+    rowRoots.push(row.root_dir);
+    const group = elsewhere.get(key);
+    if (group) group.push(folders);
+    else elsewhere.set(key, [folders]);
   }
   // A stock root reads the same as none, so it is left out rather than giving
   // every cache keyed on the root a second entry for the same paths. The
-  // others are sorted so the list reordering by activity is no change.
-  const root = viewed.root_dir || rootDir;
+  // others are sorted so the list reordering by activity is no change. The
+  // rows' roots join the list's, which can land after them.
+  const root = viewed.root_dir || (computerId ? rootOf.get(computerId) : undefined);
   const own = ownRoot(root);
-  const otherRoots = [...new Set([...(computerRoots ?? []), ...(viewed.previous_root_dirs ?? [])].map(ownRoot))]
+  const others = (roots: readonly (string | null | undefined)[]) => [...new Set(roots.map(ownRoot))]
     .filter((other) => other && other !== own)
     .sort()
     .map((other) => `/${other}`);
+  const otherRoots = others([...(computers ?? []).map((c) => c.root_dir), ...rowRoots, ...(viewed.previous_root_dirs ?? [])]);
+  const leftRoots = others(viewed.previous_root_dirs ?? []);
+  const otherComputers = [...elsewhere]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([key, workspaces]) => ({ root: key, workspaces }));
   return {
     ...(own ? { rootDir: root } : {}),
     ...(otherRoots.length ? { otherRoots } : {}),
+    ...(leftRoots.length ? { leftRoots } : {}),
     dirName: viewed.dir_name,
     previousDirNames: viewed.previous_dir_names,
     siblings,
+    ...(otherComputers.length ? { otherComputers } : {}),
   };
 }
 
-/** A reference that names a sibling's folder: that workspace, and the path inside it. */
-export interface SiblingPath {
+/**
+ * A root as `RootFolders.root` spells it: '' for a stock one, since the
+ * sandbox reads every stock spelling as the same root, and null for none.
+ */
+function rootKey(root: string | null | undefined): string | null {
+  if (!root?.replace(/^\/+|\/+$/g, '')) return null;
+  const own = ownRoot(root);
+  return own ? `/${own}` : '';
+}
+
+/** A reference that names another workspace's folder: that workspace, and the path inside it. */
+export interface FolderPath {
   workspaceId: string;
   path: string;
 }
 
 /**
- * The sibling workspace a reference reaches through its folder, the way the
- * agent reaches it from Bash: `../<folder>/x` from its working directory, or
- * `<folder>/x` under a sandbox root. A bare `<folder>/x` is a path inside this
- * workspace, and a folder no sibling holds is left to the caller's usual reading.
+ * The other workspace a reference reaches through its folder. A sibling's is
+ * reached the way the agent reaches it from Bash: `../<folder>/x` from its
+ * working directory, or `<folder>/x` under a sandbox root. A bare `<folder>/x`
+ * is a path inside this workspace, and a folder no other workspace holds is
+ * left to the caller's usual reading.
  *
  * Folders match as `workspaceScopedPath` matches them, the current name exactly
  * and a former one by its name key, in this order: this workspace's current
@@ -267,40 +325,154 @@ export interface SiblingPath {
  * sibling took over after a rename is the sibling's on disk. This workspace's
  * own folders get null here and fold in `workspaceScopedPath`, so asking here
  * first and reading the rest through it keeps that order. The folder itself is
- * the sibling's root, which reads as `./`.
+ * the other workspace's root, which reads as `./`.
+ *
+ * An absolute path that names no folder on this computer may name one on
+ * another of the user's (`ComputerFolders.otherComputers`), at its whole path
+ * there: `<that root>/<folder>/x`. A folder this workspace recorded sitting
+ * under there before a move is still its own (`ComputerFolders.leftRoots`),
+ * so that reading comes after this computer's and after
+ * `workspaceScopedPath`'s, and a path neither places stays as it was. A stock
+ * root on a computer with a root of its own is the exception: it is only an
+ * old spelling here and a real one on a stock computer, so a folder there
+ * goes before a sibling's here.
  */
-export function siblingWorkspacePath(
+export function folderWorkspacePath(
   parts: AgentPathParts,
   folders: ComputerFolders | null | undefined,
-): SiblingPath | null {
-  if (!folders?.siblings.length || parts.workspaceId) return null;
-  const { dirName, previousDirNames, siblings } = folders;
-  let rest: string;
-  if (parts.absolute) {
-    // A root the sandbox did not claim (`/tmp/x`) holds no workspace folder.
-    if (parts.path.startsWith('/')) return null;
-    rest = parts.path;
-  } else {
-    // One level up is the computer root; a second climb leaves it.
-    if (!parts.path.startsWith('../')) return null;
-    rest = parts.path.slice(3);
+): FolderPath | null {
+  if (!folders || parts.workspaceId) return null;
+  // One level up is the computer root; a second climb leaves it.
+  if (!parts.absolute && !parts.path.startsWith('../')) return null;
+  // A root the sandbox did not claim (`/tmp/x`, another computer's) holds no
+  // folder on this computer, so only the others are asked.
+  if (!parts.path.startsWith('/')) {
+    // The view's own folder is one more candidate, and a path through it reads
+    // from this workspace, so a hit on it gets null. So does a former name it
+    // shares with a sibling, which `workspaceScopedPath` then folds as its
+    // own. The folders carry no id for it, and no workspace's id is empty.
+    const own = { workspaceId: '', dirName: folders.dirName ?? '', previousDirNames: folders.previousDirNames };
+    const match = folderPath(parts.absolute ? parts.path : parts.path.slice(3), [own, ...folders.siblings]);
+    if (match?.workspaceId === own.workspaceId) return null;
+    // On a computer with a root of its own, a stock root is a stock computer's,
+    // so a folder there names its workspace before a namesake here does.
+    if (parts.absolute && folders.rootDir && !ownRoot(parts.root)) {
+      const there = otherComputerPath(parts, folders.otherComputers ?? []);
+      if (there) return there;
+    }
+    // A climb out of the working directory stays on this computer.
+    if (match || !parts.absolute) return match;
   }
+  if (!folders.otherComputers?.length) return null;
+  // This workspace's folder under a root it moved off is still its own.
+  if (workspaceScopedPath(parts, folders.dirName, folders.previousDirNames, folders.leftRoots) !== parts.path) return null;
+  return otherComputerPath(parts, folders.otherComputers);
+}
+
+function heldBefore(names: readonly string[] | null | undefined, key: string): boolean {
+  return (names ?? []).some((name) => !!name && foldFolderName(name) === key);
+}
+
+/**
+ * The workspace among `workspaces` whose folder `rest` starts with, and the
+ * path inside it: a current folder exactly, else a former one by its name key
+ * that a single one of them left. Two that both left one folder, or two
+ * computers on one root that each hold it, give no way to tell whose it is.
+ */
+function folderPath(rest: string, workspaces: readonly FolderWorkspace[]): FolderPath | null {
   const slash = rest.indexOf('/');
   const folder = slash < 0 ? rest : rest.slice(0, slash);
-  if (!folder || folder === '..' || folder === dirName) return null;
-
+  if (!folder || folder === '..') return null;
   const key = foldFolderName(folder);
-  const heldBefore = (names: readonly string[] | null | undefined) =>
-    (names ?? []).some((name) => !!name && foldFolderName(name) === key);
-  let match = siblings.find((s) => s.dirName === folder);
-  if (!match && !heldBefore(previousDirNames)) {
-    const former = siblings.filter((s) => heldBefore(s.previousDirNames));
-    // Two siblings that both left one folder give no way to tell whose path it was.
-    if (former.length === 1) match = former[0];
-  }
-  if (!match) return null;
+  const current = workspaces.filter((w) => w.dirName === folder);
+  const held = current.length ? current : workspaces.filter((w) => heldBefore(w.previousDirNames, key));
+  if (held.length !== 1) return null;
   const inside = slash < 0 ? '' : rest.slice(slash + 1);
-  return { workspaceId: match.workspaceId, path: inside || './' };
+  return { workspaceId: held[0].workspaceId, path: inside || './' };
+}
+
+/**
+ * The first reading `read` gives of `whole` past a root it starts under.
+ * Roots compare whole segments, so `/srv/a-2` is not under `/srv/a`, and one
+ * can sit inside another, so each is tried, the longest first, as the relay
+ * reads them: under `/srv` and `/srv/old`, `/srv/old/<folder>/x` is read as
+ * `<folder>/x` under `/srv/old` before it is read as `old/<folder>/x` under `/srv`.
+ */
+function underRoot<T>(
+  whole: string,
+  roots: readonly string[],
+  read: (rest: string, root: string) => T | null,
+): T | null {
+  const under = roots.filter((root) => whole.startsWith(`${root}/`));
+  for (const root of under.sort((a, b) => b.length - a.length)) {
+    const hit = read(whole.slice(root.length + 1), root);
+    if (hit !== null) return hit;
+  }
+  return null;
+}
+
+/**
+ * An absolute path as it reads on its machine, with any sandbox root the
+ * parser took off put back: another computer's root can sit inside this
+ * one's (`~` here, `~/langalpha` there).
+ */
+function wholePath(parts: AgentPathParts): string {
+  return parts.path.startsWith('/') ? parts.path : `${parts.root ?? ''}/${parts.path}`;
+}
+
+/**
+ * The workspace on another computer an absolute path names through its
+ * folder, under each root it starts under (`underRoot`). The stock roots read
+ * as one, whatever the spelling, so their group takes a path read under one,
+ * after every root of its own.
+ */
+function otherComputerPath(parts: AgentPathParts, groups: readonly RootFolders[]): FolderPath | null {
+  const at = new Map(groups.map(({ root, workspaces }) => [root, workspaces]));
+  const read = (rest: string, root: string) => folderPath(rest, at.get(root) ?? []);
+  const stock = !parts.path.startsWith('/') && !ownRoot(parts.root);
+  return underRoot(wholePath(parts), [...at.keys()].filter(Boolean), read) ?? (stock ? read(parts.path, '') : null);
+}
+
+/**
+ * Whether a path the folders left as written is on another of the user's
+ * computers: its root, or rooted under it through no workspace's folder there
+ * (`folderWorkspacePath` names one through a folder). Nothing this view reads
+ * holds it, so it opens nothing. The roots are read as `underRoot` reads them,
+ * the longer first, so a computer whose root sits inside this one's (`~` here,
+ * `~/langalpha` there) holds the paths under it, and one sharing this root
+ * holds none. From a computer with a root of its own, a stock computer holds
+ * the stock root.
+ */
+export function onOtherComputer(parts: AgentPathParts, folders: ComputerFolders | null | undefined): boolean {
+  if (!folders?.otherComputers?.length || !parts.absolute || parts.workspaceId) return false;
+  // This workspace's folder under a root it moved off is still its own.
+  if (workspaceScopedPath(parts, folders.dirName, folders.previousDirNames, folders.otherRoots) !== parts.path) return false;
+  const whole = wholePath(parts);
+  const here = parts.path.startsWith('/') ? 0 : (parts.root ?? '').length;
+  // On a computer with a root of its own, a stock root is a stock computer's
+  // (`folderWorkspacePath`), whose group has no root of its own to compare.
+  const stock = !!folders.rootDir && !parts.path.startsWith('/') && !!parts.root && !ownRoot(parts.root);
+  return folders.otherComputers.some(({ root }) => (root ? root.length > here && (whole === root || whole.startsWith(`${root}/`)) : stock));
+}
+
+/**
+ * Whether a tool call's arguments name a computer: the Chief of Staff's file
+ * tools take one to run on another of the user's computers. The path such a
+ * call read or wrote is on that computer, whatever its spelling, so nothing
+ * here opens it as a file this view reads (the server's `ran_elsewhere`).
+ */
+export function ranElsewhere(args: Record<string, unknown> | null | undefined): boolean {
+  return calledOn(args) !== '';
+}
+
+/**
+ * The computer a tool call's arguments name, folded as the server reads a
+ * name (case and runs of spaces), or '' for none: two calls on one path are
+ * one file only on one computer.
+ */
+export function calledOn(args: Record<string, unknown> | null | undefined): string {
+  const computer = args?.computer;
+  return typeof computer === 'string' ? computer.trim().split(/\s+/).join(' ').toLowerCase() : '';
 }
 
 // The sandbox roots the agent sometimes emits, bare or `file:///`-wrapped (see
@@ -682,9 +854,9 @@ export interface AgentArtifactRouting {
  * the new query (a regression guard for chats whose links name other
  * workspaces).
  *
- * A path through a sibling's folder (`siblingWorkspacePath`) routes as the
- * `__wsref__` link to that workspace would. It is read as a path, which is
- * what an `OpenFileHandler` is handed, so a `#` inside a name stays.
+ * A path through another workspace's folder (`folderWorkspacePath`) routes
+ * as the `__wsref__` link to that workspace would. It is read as a path, which
+ * is what an `OpenFileHandler` is handed, so a `#` inside a name stays.
  */
 export function computeAgentArtifactRouting(
   rawPath: string,
@@ -692,8 +864,8 @@ export function computeAgentArtifactRouting(
   folders?: ComputerFolders | null,
 ): AgentArtifactRouting {
   const root = folders?.rootDir;
-  const sibling = targetWorkspaceId ? null : siblingWorkspacePath(takeApart(rawPath, false, root), folders);
-  if (sibling) return computeAgentArtifactRouting(sibling.path, sibling.workspaceId);
+  const other = targetWorkspaceId ? null : folderWorkspacePath(takeApart(rawPath, false, root), folders);
+  if (other) return computeAgentArtifactRouting(other.path, other.workspaceId);
   const routedPath = selectedWorkspacePath(rawPath, folders);
   const info = classifyAgentPath(routedPath, root);
   // Caller-supplied wsid wins; otherwise fall back to the wsid extracted from

@@ -30,6 +30,8 @@ from src.server.database.api_keys import (
     upsert_api_key,
     delete_api_key,
     invalidate_byok_cache,
+    key_writes,
+    update_base_url,
 )
 from src.server.services.llm.provider_models import invalidate_available_models
 
@@ -42,13 +44,19 @@ _BYOK_PROVIDERS_CACHE: list[str] | None = None
 
 
 def _get_supported_providers() -> list[str]:
-    """Get BYOK-eligible providers from LLM manifest (cached at module level)."""
+    """BYOK-eligible connections from the LLM manifest (cached at module level).
+
+    A gateway's route is one API of its connection and takes the gateway's
+    key, so it is no connection of its own: listed, a deployment key would
+    show as one plan row per API, and a key saved under one would be a second
+    key for the same connection.
+    """
     global _BYOK_PROVIDERS_CACHE
     if _BYOK_PROVIDERS_CACHE is None:
         from src.llms.llm import ModelConfig
 
         config = ModelConfig()
-        _BYOK_PROVIDERS_CACHE = config.get_byok_eligible_providers()
+        _BYOK_PROVIDERS_CACHE = [p for p in config.get_byok_eligible_providers() if config.connection_of(p) == p]
     return _BYOK_PROVIDERS_CACHE
 
 
@@ -105,7 +113,7 @@ def _format_response(
         # Local providers (Ollama, LM Studio, vLLM) are "configured" when a
         # base_url is stored, even without an API key.
         has_base_url = bool(base_urls.get(p))
-        has_env = deployment_key(pinfo) is not None or (p == served_locally and not has_base_url)
+        has_env = deployment_key(p) is not None or (p == served_locally and not has_base_url)
         providers.append({
             "provider": p,
             "display_name": pinfo.get("display_name", p.title()),
@@ -252,13 +260,14 @@ def _get_allowed_providers(custom_providers: list) -> set[str]:
 
     Excludes OAuth-only providers (codex-oauth, claude-oauth) since those
     are authenticated via OAuth flow, not user-supplied API keys.
-    Excludes platform variants (system-only proxy routes).
+    Excludes platform variants (system-only proxy routes), and a gateway's
+    routes, whose key is the gateway's (``_get_supported_providers``).
     """
     from src.llms.llm import ModelConfig
     config = ModelConfig()
     allowed = {
         name for name, info in config.flat_providers.items()
-        if info.get("access_type") != "oauth" and not info.get("platform")
+        if info.get("access_type") != "oauth" and not info.get("platform") and config.connection_of(name) == name
     }
     for cp in custom_providers:
         allowed.add(cp["name"])
@@ -301,29 +310,37 @@ async def update_api_keys(body: UpdateApiKeysRequest, user_id: CurrentUserId):
     if body.base_urls:
         await _refuse_base_urls(body.base_urls)
 
-    # Toggle BYOK if requested
-    if body.byok_enabled is not None:
-        await set_byok_enabled(user_id, body.byok_enabled)
+    # All or nothing, so a failed write leaves the keys as they were.
+    async with key_writes(user_id) as conn:
+        # Toggle BYOK if requested
+        if body.byok_enabled is not None:
+            await set_byok_enabled(user_id, body.byok_enabled, conn=conn)
 
-    # Upsert / delete individual provider keys
-    if body.api_keys:
-        for provider, key_value in body.api_keys.items():
-            base_url = body.base_urls.get(provider) if body.base_urls else None
-            if key_value is None and not base_url:
-                await delete_api_key(user_id, provider)
-            else:
-                # Upsert with key (or empty string for local providers with only base_url)
-                await upsert_api_key(user_id, provider, key_value or "", base_url=base_url)
+        # Upsert / delete individual provider keys
+        if body.api_keys:
+            from src.llms.llm import LLM as LLMFactory
 
-    # Update base_urls independently (when key already exists)
-    if body.base_urls:
-        for provider, url in body.base_urls.items():
-            # Skip if already handled in api_keys upsert above
-            if body.api_keys and provider in body.api_keys:
-                continue
-            # Update base_url on existing key row
-            from src.server.database.api_keys import update_base_url
-            await update_base_url(user_id, provider, url)
+            mc = LLMFactory.get_model_config()
+            for provider, key_value in body.api_keys.items():
+                base_url = body.base_urls.get(provider) if body.base_urls else None
+                if key_value is None and not base_url:
+                    await delete_api_key(user_id, provider, conn=conn)
+                else:
+                    # Upsert with key (or empty string for local providers with only base_url)
+                    await upsert_api_key(user_id, provider, key_value or "", base_url=base_url, conn=conn)
+                # One region per plan, whatever the client last saw stored.
+                if key_value:
+                    for region in mc.plan_regions(provider):
+                        await delete_api_key(user_id, region, conn=conn)
+
+        # Update base_urls independently (when key already exists)
+        if body.base_urls:
+            for provider, url in body.base_urls.items():
+                # Skip if already handled in api_keys upsert above
+                if body.api_keys and provider in body.api_keys:
+                    continue
+                # Update base_url on existing key row
+                await update_base_url(user_id, provider, url, conn=conn)
 
     # Invalidate cached BYOK status so the next chat picks up key changes
     await invalidate_byok_cache(user_id)
@@ -612,6 +629,7 @@ async def list_models():
     Includes provider_catalog for wizard provider selection.
     """
     from src.config.settings import get_prompt_guidance_default
+    from src.llms.gateway_names import gateway_index
     from src.llms.llm import get_configured_llm_models, LLM
     from src.llms.task_costs import task_cost_baseline
     from src.server.app import setup
@@ -687,4 +705,6 @@ async def list_models():
         "search_providers": search_providers,
         "provider_catalog": provider_catalog(),
         "key_candidates": key_candidates(),
+        # A pick from a gateway's list is tuned as the built-in it matched.
+        "gateway_index": gateway_index(config),
     }

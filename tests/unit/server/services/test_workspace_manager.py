@@ -524,6 +524,11 @@ class TestCreateWorkspace:
         adopt.assert_not_awaited()
 
     @pytest.mark.asyncio
+    # The minted primary is numbered past the user's other computers.
+    @patch(
+        "src.server.database.computer_names.get_computer_names",
+        new=AsyncMock(return_value=[]),
+    )
     @patch(
         "src.server.services.computer_manager._machines.create_computer",
         new_callable=AsyncMock,
@@ -587,6 +592,11 @@ class TestCreateWorkspace:
         assert mock_insert.call_args[0][2] == _STUB_COMPUTER_ID
 
     @pytest.mark.asyncio
+    # The minted primary is numbered past the user's other computers.
+    @patch(
+        "src.server.database.computer_names.get_computer_names",
+        new=AsyncMock(return_value=[]),
+    )
     @patch(
         "src.server.services.computer_manager._machines.update_computer_status",
         new_callable=AsyncMock,
@@ -5180,7 +5190,7 @@ class TestStatusRoutesToDbFallback:
     def test_the_warm_handle_is_fenced_on_the_rows_computer_root(self):
         """The file and share routes fence on the computer columns the
         workspace row already joins, with no read of their own."""
-        from src.server.app.workspace_files.serve import warm_sandbox
+        from src.server.services.warm_files import warm_sandbox
 
         wm = WorkspaceManager.get_instance(config=_make_config())
         session = self._ssh_session()
@@ -5208,7 +5218,7 @@ class TestStatusRoutesToDbFallback:
         "File not found", and a row whose sandbox auto-stopped serves nothing
         while reading 'running'.
         """
-        from src.server.app.workspace_files.serve import warm_sandbox
+        from src.server.services.warm_files import warm_sandbox
 
         wm = WorkspaceManager.get_instance(config=_make_config())
         session = _make_mock_session()  # on 'sandbox-abc'

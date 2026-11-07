@@ -32,6 +32,7 @@ from src.server.services.workspace_files import (
     contained_target,
     not_running_for_upload,
     owned_workspace_on_computer,
+    owner_work_dir,
     previous_dir_names_of,
 )
 from src.server.services.workspace_upload_pull import (
@@ -60,7 +61,6 @@ from ._shared import (
     # DALTON-HOOK(workspace-sharing-settings): colleague path filter helper
     _is_non_owner_blocked_path,
     _virtual_file,
-    owner_work_dir,
 )
 
 logger = logging.getLogger(__name__)

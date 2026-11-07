@@ -83,14 +83,18 @@ function ListedRow({ picker, model }: { picker: ModelPickerState; model: ListedM
   if (model.pricing?.input != null && model.pricing?.output != null) {
     parts.push(t('modelAccess.models.price', { input: usd(model.pricing.input, locale), output: usd(model.pricing.output, locale) }));
   }
+  const name = picker.nameOf(model);
   return (
     <PickRow
-      checked={picker.listedChecked(model)}
-      onToggle={() => picker.toggleListed(model)}
+      checked={picker.selected.has(name)}
+      onToggle={() => picker.toggle(name)}
       label={model.display_name || model.id}
       meta={(
         <>
-          <Tag>{t(model.known ? 'modelAccess.models.known' : 'modelAccess.models.notTuned')}</Tag>
+          {/* A model the gateway's catalog describes runs tuned by it, known or not. */}
+          {(model.known || !model.described) && (
+            <Tag>{t(model.known ? 'modelAccess.models.known' : 'modelAccess.models.notTuned')}</Tag>
+          )}
           {parts.length > 0 && (
             <span className="text-xs" style={{ color: 'var(--color-text-tertiary)', fontVariantNumeric: 'tabular-nums' }}>
               {parts.join(' · ')}
@@ -146,7 +150,9 @@ export function ModelPickerList({ picker, labelledBy }: { picker: ModelPickerSta
   const filteredOthers = filterWords.length === 0
     ? picker.others
     : picker.others.filter((m) => filterWords.every((w) => `${m.id} ${m.display_name ?? ''}`.toLowerCase().includes(w)));
-  const visibleOthers = filteredOthers.filter((m) => !picker.savedIds.has(m.id) && !picker.pendingIds.has(m.id));
+  // A model already listed above, as ready or as the user's own, shows there only.
+  const shown = new Set([...picker.ready.map((r) => r.name), ...picker.yours]);
+  const visibleOthers = filteredOthers.filter((m) => !shown.has(picker.nameOf(m)));
   const knownSuggestions = picker.others.filter((m) => m.known).slice(0, 8);
   // Search shows the known suggestions until there is a search, and again
   // under a search that found nothing.
@@ -177,10 +183,25 @@ export function ModelPickerList({ picker, labelledBy }: { picker: ModelPickerSta
 
       {picker.ready.length > 0 && (
         <section className="flex flex-col gap-1">
-          <h4 className="text-xs font-medium" style={{ color: 'var(--color-text-tertiary)' }}>{t('modelAccess.models.ready')}</h4>
-          {picker.ready.map((m) => (
-            <PickRow key={m} checked={picker.selected.has(m)} onToggle={() => picker.toggle(m)} label={label(m)} />
-          ))}
+          <div className="flex items-center justify-between gap-2">
+            <h4 className="text-xs font-medium" style={{ color: 'var(--color-text-tertiary)' }}>{t('modelAccess.models.ready')}</h4>
+            {/* Once the list has settled, so it picks what the provider confirmed. */}
+            {picker.ready.length > 1 && !picker.listing && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={picker.selectAllReady}
+                disabled={picker.ready.every((r) => picker.selected.has(r.name))}
+                className="h-7 px-2 text-xs"
+              >
+                {t('modelAccess.models.selectAll')}
+              </Button>
+            )}
+          </div>
+          {picker.ready.map((r) => r.listed
+            ? <ListedRow key={r.name} picker={picker} model={r.listed} />
+            : <PickRow key={r.name} checked={picker.selected.has(r.name)} onToggle={() => picker.toggle(r.name)} label={label(r.name)} />)}
         </section>
       )}
 

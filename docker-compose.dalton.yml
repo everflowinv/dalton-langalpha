@@ -16,6 +16,11 @@ services:
       args:
         BUILD_GIT_SHA: ${BUILD_GIT_SHA:-}
         BUILD_GIT_DIRTY: ${BUILD_GIT_DIRTY:-}
+    # sync3 B9 (#656): upstream's backend waits on the `cli` build service
+    # (`service_completed_successfully`); Dalton does not build or ship the
+    # `la` CLI, and the service below is parked on a profile nothing enables,
+    # so the inherited dependency is reset to nothing.
+    depends_on: !reset []
     entrypoint: ["/usr/bin/tini", "-s", "--", "/app/scripts/dalton/docker_entrypoint_dalton.sh"]
     # No --reload: src is bind-mounted, so with it a git pull on the deploy checkout restarts
     # the backend and cancels every running turn. Code changes are applied by an explicit
@@ -50,6 +55,22 @@ services:
       - ./workflows:/app/workflows:ro
       - ./config/dalton:/app/config/dalton:ro
       - ./var/dalton:/app/var/dalton
+      # sync3 B9 (#656): a tmpfs over /app/cli replaces the inherited
+      # `./cli:/app/cli:ro` bind (Compose merges service volumes by target, so
+      # one long-syntax entry with the same target wins). Without it a
+      # cli/dist/la.mjs built on the host would ride the bind into the
+      # container and _shared.py would ship it into every sandbox. Must be the
+      # long syntax here in `backend.volumes` — a service-level `tmpfs:` entry
+      # fails with "target /app/cli already mounted".
+      - type: tmpfs
+        target: /app/cli
+
+  # sync3 B9 (#656): upstream's one-shot `cli` build service, parked on a
+  # profile nothing enables (`docker compose --profile cli-disabled` opts in
+  # explicitly). Kept reachable rather than deleted so the inherited service
+  # stays valid for anyone who wants the upstream behaviour.
+  cli:
+    profiles: ["cli-disabled"]
 
   # P6b: scrapling's browser tiers (Chromium/Camoufox) fetch here instead of
   # inside the 4 GB backend container, whose ceiling a runaway crawl could hit

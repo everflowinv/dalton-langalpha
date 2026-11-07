@@ -30,6 +30,7 @@ import {
   patchComputerStatusInCaches,
   patchWorkspaceStatusInCaches,
 } from '../utils/warmWorkspace';
+import type { ComputerRootRow } from '../utils/agentPaths';
 import { isComputerStatusTerminal, isComputerStatusTransitional } from '../utils/computerStatus';
 import { activeSpecChange } from '../components/specChangeUi';
 import { recordPrepareFailure, recordPrepareStage } from './computerPreparation';
@@ -126,28 +127,18 @@ export const CREATE_COMPUTER_MUTATION_KEY = ['computers', 'create'] as const;
 export const RECONNECT_COMPUTER_MUTATION_KEY = ['computers', 'reconnect'] as const;
 
 /**
- * The root a computer keeps its workspace folders under, off the shared list.
- * Selected, so a refetch that only moved a status leaves its readers alone.
+ * Every computer's root, by computer, off the shared list: the root its
+ * workspace folders sit under. A workspace moves between computers with its
+ * folder, so an older turn's absolute path can start at a root it has since
+ * left, and the Chief of Staff links a file on another computer at its whole
+ * path there. Selected, so a refetch that only moved a status leaves its
+ * readers alone.
  */
-export function useComputerRootDir(computerId: string | null | undefined): string | undefined {
-  const { data } = useQuery({
-    ...computersList(),
-    enabled: !!computerId,
-    select: (list) => list.computers.find((c) => c.computer_id === computerId)?.root_dir,
-  });
-  return data;
-}
-
-/**
- * Every computer's root, off the shared list. A workspace moves between
- * computers with its folder, so an older turn's absolute path can start at a
- * root it has since left. Selected like the one above.
- */
-export function useComputerRootDirs(options: { enabled: boolean }): readonly string[] | undefined {
+export function useComputerRoots(options: { enabled: boolean }): readonly ComputerRootRow[] | undefined {
   const { data } = useQuery({
     ...computersList(),
     enabled: options.enabled,
-    select: (list) => list.computers.map((c) => c.root_dir),
+    select: (list) => list.computers.map((c) => ({ computer_id: c.computer_id, root_dir: c.root_dir })),
   });
   return data;
 }
@@ -229,12 +220,15 @@ export function patchComputerRow(
  * the storage breakdown sits under that prefix too, and refetching it runs
  * `du` over the whole machine, which a rename or an always-on toggle has no
  * reason to pay for. A change that does move bytes calls
- * {@link invalidateMachineStorage} alongside.
+ * {@link invalidateMachineStorage} alongside. Claude Code's list of the
+ * user's own computers names each one and is not polled when empty, so a
+ * machine added, renamed or removed is read there again too.
  */
 export function invalidateMachine(queryClient: QueryClient) {
   void queryClient.invalidateQueries({ queryKey: queryKeys.computers.lists() });
   void queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.all });
   void queryClient.invalidateQueries({ queryKey: queryKeys.workspaces.quota() });
+  void queryClient.invalidateQueries({ queryKey: queryKeys.features.claudeCodeComputers() });
 }
 
 /** Re-read the per-folder breakdown, if anyone is looking at it. */
@@ -430,8 +424,13 @@ export function useComputerStatusFanout(): void {
               // even if the re-read below is slow or fails.
               if (frame.start_failure) patchComputerRow(queryClient, computerId, { start_failure: frame.start_failure });
               patchComputerStatusInCaches(queryClient, computerId, status);
-              // A breakdown read while the machine was down only says to start it.
-              if (status === 'running') invalidateMachineStorage(queryClient, computerId);
+              // A breakdown read while the machine was down only says to start
+              // it, and Claude Code's list, which reads a computer's token only
+              // while it runs, still says it is offline.
+              if (status === 'running') {
+                invalidateMachineStorage(queryClient, computerId);
+                void queryClient.invalidateQueries({ queryKey: queryKeys.features.claudeCodeComputers() });
+              }
               // A failed start still needs the row: the server keeps why on
               // it (`start_failure`) before it sends 'error', or 'stopped' for
               // a start that reverted. Asked here, not after the close: either

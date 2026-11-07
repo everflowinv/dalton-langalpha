@@ -14,6 +14,7 @@ against the server's CURRENT fingerprint to decide hit vs. stale.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -21,6 +22,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Json
 
 from src.server.database.mcp_config_version import bump_user_versions
+from src.server.database.mcp_descriptions import drop_descriptions
 from src.server.database.mcp_oauth import SERVABLE_PARAM, ConnectionStatus
 from src.server.database.pool import get_db_connection
 
@@ -379,7 +381,11 @@ async def delete_user_tool_schemas(
 
 
 async def delete_user_and_workspace_tool_schemas_and_bump(
-    user_id: str, server_names: list[str], *, conn=None
+    user_id: str,
+    server_names: list[str],
+    *,
+    description_scopes: Sequence[str] = (),
+    conn=None,
 ) -> int:
     """Purge an inherited server's snapshots in BOTH tiers, then fan the version
     bump out to every workspace of the user, in one transaction.
@@ -392,6 +398,11 @@ async def delete_user_and_workspace_tool_schemas_and_bump(
     ``conn`` lets a caller that is already mid-transaction (disconnect) fold the
     purge into it, so the credential revoke and the snapshot purge cannot commit
     apart.
+
+    ``description_scopes`` are generated descriptions written from these
+    snapshots, dropped in the same transaction so neither outlives the other.
+    After the snapshot rows, the order discovery takes them in, and before the
+    ``workspaces`` rows, the order a landing description takes them in.
     """
     async with get_db_connection(conn) as db:
         async with db.transaction():
@@ -413,5 +424,6 @@ async def delete_user_and_workspace_tool_schemas_and_bump(
                     (server_names, user_id),
                 )
                 deleted += cur.rowcount
+                await drop_descriptions(description_scopes, conn=db)
                 await bump_user_versions(cur, user_id)
                 return deleted

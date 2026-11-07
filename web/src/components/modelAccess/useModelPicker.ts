@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useAllModels } from '@/hooks/useAllModels';
 import { useModels } from '@/hooks/useModels';
@@ -9,76 +9,23 @@ import { useProviderCatalog } from '@/hooks/useProviderCatalog';
 import { useUpdatePreferences } from '@/hooks/useUpdatePreferences';
 import { useAvailableModels, useLocalProviderModels, useRefreshAvailableModels } from '@/hooks/useProviderModels';
 import { useDebouncedValue } from '@/lib/useDebouncedValue';
-import { modelPrefs, pruneModelReferences, splitPreferenceWrite, starredModels } from '@/lib/modelPreferences';
-import { replaceProviderModels } from '@/lib/customModels';
-import { connectionBuiltIns, seedPicks, servedElsewhere, takenElsewhere } from '@/lib/connectionModels';
+import { modelPrefs, splitPreferenceWrite, starredModels } from '@/lib/modelPreferences';
+import { connectionBuiltIns, runsNatively, seedPicks, takenElsewhere } from '@/lib/connectionModels';
 import { apiErrorDetail } from '@/api/errors';
 import type { CustomModelEntry } from '@/components/model/types';
 import type { ListedModel } from '@/api/model';
 import { planIncludes, type ModelMetadataEntry } from '@/hooks/useFilteredModels';
-import { slugifyModelName } from './slugifyModelName';
-
-/** The name a custom model may take (`CUSTOM_MODEL_NAME_RE` on the server). */
-const NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,62}$/;
-const MODALITIES = new Set(['text', 'image', 'pdf']);
-
-/** What a listed model takes beyond text, as an entry saves it; null for text
- *  alone, which an entry says by naming none. */
-function listedModalities(listed: ListedModel): string[] | null {
-  // OpenRouter's `file` is a PDF, as the server reads it.
-  const modalities = [...new Set((listed.input_modalities ?? []).map((m) => (m === 'file' ? 'pdf' : m)))]
-    .filter((m) => MODALITIES.has(m));
-  return modalities.some((m) => m !== 'text') ? ['text', ...modalities.filter((m) => m !== 'text')] : null;
-}
-
-/** The custom-models entry an untuned listed model is saved as. */
-export function entryForListed(
-  listed: ListedModel,
-  provider: string,
-  taken: ReadonlySet<string>,
-): CustomModelEntry {
-  // The provider's own id where the server accepts it as a name and it names
-  // no other model; prefixed with the provider otherwise, so it never shadows
-  // a built-in of the same name, numbered on where that is taken too.
-  let name = NAME_RE.test(listed.id) && !taken.has(listed.id) ? listed.id : slugifyModelName(`${provider}/${listed.id}`);
-  if (!name) name = slugifyModelName(listed.id) || 'model';
-  for (let n = 2, stem = name; taken.has(name); n++) name = `${stem.slice(0, 62 - String(n).length)}-${n}`;
-  const entry: CustomModelEntry = { name, model_id: listed.id, provider };
-  const modalities = listedModalities(listed);
-  if (modalities) entry.input_modalities = modalities;
-  if (typeof listed.context_window === 'number' && listed.context_window > 0) entry.context = listed.context_window;
-  if (listed.reasoning) entry.reasoning = listed.reasoning;
-  return entry;
-}
-
-/**
- * Saved entries with the levels, window and inputs the provider's list now
- * gives each, so a pick follows the provider: one saved before lists carried
- * levels gets them on the next save, and a window lowered or an input dropped
- * stops being sent as the model's. A field the list leaves out, and an entry
- * it does not name, stay as saved.
- */
-export function withListedSpecs(entries: CustomModelEntry[], listed: readonly ListedModel[]): CustomModelEntry[] {
-  const byId = new Map(listed.map((m) => [m.id, m]));
-  return entries.map((cm) => {
-    const now = byId.get(cm.model_id);
-    if (!now) return cm;
-    const context = typeof now.context_window === 'number' && now.context_window > 0 ? now.context_window : null;
-    const next: CustomModelEntry = {
-      ...cm,
-      ...(context ? { context } : {}),
-      ...(now.reasoning ? { reasoning: now.reasoning } : {}),
-    };
-    if (Array.isArray(now.input_modalities)) {
-      const modalities = listedModalities(now);
-      if (modalities) next.input_modalities = modalities;
-      else delete next.input_modalities;
-    }
-    return next;
-  });
-}
+import { entryForListed } from './listedEntries';
+import { pickerWrite } from './pickerWrite';
 
 const NO_MODELS: Record<string, ModelMetadataEntry> = {};
+
+/** A row of Ready to use: a manifest model, or one a gateway's catalog
+ *  describes (`listed`), shown with what the catalog says of it. */
+export interface ReadyRow {
+  name: string;
+  listed?: ListedModel;
+}
 
 /**
  * Which models a provider's connection offers, and which of them the user has
@@ -95,19 +42,19 @@ const NO_MODELS: Record<string, ModelMetadataEntry> = {};
  */
 export function useModelPicker({
   provider,
-  brandKey,
+  modelsFrom,
   justConnected = false,
 }: {
   provider: string;
-  brandKey?: string;
+  modelsFrom?: string;
   justConnected?: boolean;
 }) {
   const { t } = useTranslation();
-  const brand = brandKey ?? provider;
+  const source = modelsFrom ?? provider;
   const { metadata, isLoading: modelsLoading } = useAllModels();
   const { models: modelsData } = useModels();
   const { providers: configured, configuredSet } = useConfiguredProviders();
-  const { entryFor } = useProviderCatalog();
+  const { entryFor, connectionOf } = useProviderCatalog();
   const { preferences, isLoaded: prefsLoaded } = usePreferences();
   const readStored = useReadStoredPreferences();
   const updatePreferences = useUpdatePreferences();
@@ -131,16 +78,25 @@ export function useModelPicker({
   // a saved entry named after one of these reaches that model through this
   // provider and keeps its tuning, so it is ready to use, not the user's own.
   const manifestMeta = modelsData?.model_metadata ?? NO_MODELS;
+  const keyCandidates = modelsData?.key_candidates;
+  /** A manifest model this connection runs as it is, needing no entry of its own. */
+  const native = useCallback(
+    (m: string) => runsNatively(m, provider, manifestMeta, keyCandidates),
+    [provider, manifestMeta, keyCandidates],
+  );
   // The manifest's models for this provider: a variant without entries of
-  // its own (a coding plan) shares its brand's.
+  // its own (a coding plan, or a region of one) shares `modelsFrom`'s.
   const builtIn = useMemo<string[]>(
-    () => connectionBuiltIns(provider, brand, manifestMeta, allCustom),
-    [provider, brand, manifestMeta, allCustom],
+    () => connectionBuiltIns(provider, source, manifestMeta, allCustom, connectionOf, keyCandidates),
+    [provider, source, manifestMeta, allCustom, connectionOf, keyCandidates],
   );
 
   // The user's own models under this exact provider, by name (what every
   // preference stores).
-  const savedCustom = useMemo(() => allCustom.filter((cm) => cm.provider === provider), [allCustom, provider]);
+  const savedCustom = useMemo(
+    () => allCustom.filter((cm) => connectionOf(cm.provider) === provider),
+    [allCustom, provider, connectionOf],
+  );
   const savedCustomNames = useMemo(() => savedCustom.map((cm) => cm.name || cm.model_id), [savedCustom]);
   const savedTuned = useMemo(
     () => savedCustomNames.filter((m) => !!manifestMeta[m] && !builtIn.includes(m)),
@@ -160,42 +116,82 @@ export function useModelPicker({
   const ready = useMemo(() => {
     // A name a custom entry under another provider took routes there, so the
     // list's word for it is not this connection's to act on.
-    const confirmed = (listOk ? list!.ready.filter((m) => metadata[m] && !takenElsewhere(m, provider, allCustom)) : builtIn)
+    const confirmed = (listOk ? list!.ready.filter((m) => metadata[m] && !takenElsewhere(m, provider, allCustom, connectionOf)) : builtIn)
       .filter((m) => planIncludes(metadata[m], plan));
     return [...confirmed, ...savedTuned.filter((m) => !confirmed.includes(m))];
-  }, [listOk, list, builtIn, metadata, provider, allCustom, savedTuned, plan]);
+  }, [listOk, list, builtIn, metadata, provider, allCustom, savedTuned, plan, connectionOf]);
   const missing = listOk ? list!.missing : [];
 
-  // Picked models not saved yet (from the list, or added by hand), by the
-  // name they will be saved under.
-  const [pending, setPending] = useState<ReadonlyMap<string, CustomModelEntry>>(new Map());
-
-  const savedIds = useMemo(() => new Set(savedCustom.map((cm) => cm.model_id)), [savedCustom]);
-  const pendingIds = useMemo(() => new Set([...pending.values()].map((e) => e.model_id)), [pending]);
-  /** The entry, saved or not, a listed model is already picked as. */
-  const findByModelId = (id: string) =>
-    savedCustom.find((cm) => cm.model_id === id) ?? [...pending.values()].find((e) => e.model_id === id);
-
-  const others = useMemo<ListedModel[]>(() => {
+  const listed = useMemo<ListedModel[]>(() => {
     if (isLocal) return (local.data ?? []).map((m) => ({ id: m.id, display_name: m.name }));
     return list?.others ?? [];
   }, [isLocal, local.data, list]);
+  // A gateway's catalog tunes the models it describes (OpenCode Go), so they
+  // are listed as ready to use; the untuned rest stay behind Show all.
+  const described = useMemo(() => listed.filter((m) => m.described), [listed]);
+  const others = useMemo(() => listed.filter((m) => !m.described), [listed]);
   const results = searchFirst && debounced && searched.data?.provider === provider ? searched.data.others : others;
 
-  const yours = useMemo(
-    () => [...new Set([...savedCustomNames, ...pending.keys()])].filter((m) => !ready.includes(m)),
-    [savedCustomNames, pending, ready],
+  // Models put on the user's own list this visit and not saved yet: added by
+  // hand, or ticked from the untuned rest or a search. They stay under the
+  // user's own until removed there, ticked or not.
+  const [added, setAdded] = useState<ReadonlyMap<string, CustomModelEntry>>(new Map());
+
+  // Every listed model as the entry a pick saves it as, so each row is one
+  // name: a saved or added entry for the model where there is one, else a
+  // name no other model, built-in or the user's, has taken.
+  const listedEntries = useMemo(() => {
+    const byId = new Map<string, CustomModelEntry>();
+    for (const cm of [...savedCustom, ...added.values()]) if (!byId.has(cm.model_id)) byId.set(cm.model_id, cm);
+    const taken = new Set([...Object.keys(metadata), ...allCustom.map((cm) => cm.name || cm.model_id), ...added.keys()]);
+    for (const m of [...listed, ...results]) {
+      if (byId.has(m.id)) continue;
+      const e = entryForListed(m, provider, taken);
+      taken.add(e.name);
+      byId.set(m.id, e);
+    }
+    return byId;
+  }, [savedCustom, added, metadata, allCustom, listed, results, provider]);
+  /** The name a listed model is picked under. */
+  const nameOf = (m: ListedModel) => listedEntries.get(m.id)?.name ?? m.id;
+  /** Entries not saved yet, each saved if its name is picked. */
+  const unsaved = useMemo(() => {
+    const out = new Map(added);
+    for (const e of listedEntries.values()) if (!savedCustom.includes(e) && !out.has(e.name)) out.set(e.name, e);
+    return [...out.values()];
+  }, [added, listedEntries, savedCustom]);
+
+  // Ready to use, one list: the manifest's models, then those the gateway's
+  // catalog describes.
+  const readyRows = useMemo<ReadyRow[]>(
+    () => [
+      ...ready.map((name) => ({ name })),
+      ...described.map((m) => ({ name: listedEntries.get(m.id)?.name ?? m.id, listed: m })),
+    ],
+    [ready, described, listedEntries],
   );
+
+  // A connection just made whose models all come from its gateway's catalog
+  // (OpenCode Go) has no ready list to start on, so it starts on the models
+  // tuned elsewhere in the manifest; the rest are a Select all away.
+  const seededListed = useMemo(
+    () => (!justConnected || savedCustom.length > 0 || builtIn.length > 0
+      ? []
+      : readyRows.filter((r) => r.listed?.known).map((r) => r.name)),
+    [justConnected, savedCustom, builtIn, readyRows],
+  );
+
+  // A described model shows checked in its own list, not again as the user's.
+  const yours = useMemo(() => {
+    const listedReady = new Set(readyRows.map((r) => r.name));
+    return [...new Set([...savedCustomNames, ...added.keys()])].filter((m) => !listedReady.has(m));
+  }, [savedCustomNames, added, readyRows]);
   /** Every name this view decides about: what is saved under this provider,
    *  and its own manifest models. Picks outside it belong to other providers,
    *  a coding plan's brand models among them until picked here. */
   const owned = useMemo(
-    () => [...new Set([
-      ...[...builtIn, ...ready].filter((m) => manifestMeta[m]?.provider === provider),
-      ...savedCustomNames,
-      ...yours,
-    ])],
-    [builtIn, ready, manifestMeta, provider, savedCustomNames, yours],
+    () => [...new Set([...[...builtIn, ...ready].filter(native), ...savedCustomNames, ...yours])],
+    [builtIn, ready, native, savedCustomNames, yours],
   );
 
   const existingStarred = useMemo(() => starredModels(preferences), [preferences]);
@@ -207,18 +203,23 @@ export function useModelPicker({
   // Loaded, not present: a new user has no preferences row yet (a 404 read as null).
   const inputsReady = !modelsLoading && prefsLoaded && listSettled && (!isLocal || !local.isLoading);
   const seed = useMemo(() => seedPicks({
-    provider,
-    candidates: [...ready, ...savedCustomNames],
+    candidates: [...ready, ...savedCustomNames, ...seededListed],
     savedNames: savedCustomNames,
     starred: existingStarred,
-    manifest: manifestMeta,
+    native,
     justConnected,
-  }), [provider, ready, savedCustomNames, existingStarred, manifestMeta, justConnected]);
+  }), [ready, savedCustomNames, seededListed, existingStarred, native, justConnected]);
   const selected = picked ?? seed;
   const initialized = picked !== null || inputsReady;
   const setSelected = (update: (prev: Set<string>) => Set<string>) => setPicked((prev) => update(prev ?? seed));
 
+  /** Picks or unpicks a model by name. An untuned listed model picked joins
+   *  the user's own. */
   const toggle = (name: string) => {
+    const e = unsaved.find((u) => u.name === name);
+    if (e && !selected.has(name) && !added.has(name) && !readyRows.some((r) => r.name === name)) {
+      setAdded((prev) => new Map(prev).set(name, e));
+    }
     setSelected((prev) => {
       const next = new Set(prev);
       if (next.has(name)) next.delete(name);
@@ -227,25 +228,17 @@ export function useModelPicker({
     });
   };
 
-  const addPending = (e: CustomModelEntry) => {
-    setPending((prev) => new Map(prev).set(e.name, e));
-    setSelected((prev) => new Set(prev).add(e.name));
-  };
+  /** Pick every model in Ready to use. */
+  const selectAllReady = () => setSelected((prev) => new Set([...prev, ...readyRows.map((r) => r.name)]));
 
-  /** Picks or unpicks an untuned listed model. */
-  const toggleListed = (listed: ListedModel) => {
-    const existing = findByModelId(listed.id);
-    if (existing) toggle(existing.name);
-    else addPending(entryForListed(listed, provider, new Set([...Object.keys(metadata), ...pending.keys()])));
-  };
-  const listedChecked = (listed: ListedModel) => {
-    const existing = findByModelId(listed.id);
-    return !!existing && selected.has(existing.name);
+  const addManual = (e: CustomModelEntry) => {
+    setAdded((prev) => new Map(prev).set(e.name, e));
+    setSelected((prev) => new Set(prev).add(e.name));
   };
 
   /** Drops an unsaved model, or unpicks a saved one (saving then removes it). */
   const removeYours = (name: string) => {
-    setPending((prev) => {
+    setAdded((prev) => {
       if (!prev.has(name)) return prev;
       const next = new Map(prev);
       next.delete(name);
@@ -276,52 +269,19 @@ export function useModelPicker({
   const save = async (): Promise<boolean> => {
     setSaving(true);
     setError(null);
-    const failed = (e: unknown) => {
+    try {
+      const stored = await readStored();
+      await updatePreferences.mutateAsync(splitPreferenceWrite(pickerWrite(stored, {
+        provider, selected, owned, saved: savedCustom, unsaved, listed, builtIn,
+        manifest: manifestMeta, native, connected: configuredSet, keyCandidates, connectionOf,
+      })));
+    } catch (e) {
       const detail = apiErrorDetail(e);
       setError(typeof detail === 'string' ? detail : t('modelAccess.models.saveFailed'));
       setSaving(false);
       return false;
-    };
-    // This provider's picks go onto what is stored now, so another
-    // provider's models and stars saved from another tab are kept.
-    let stored: Awaited<ReturnType<typeof readStored>>;
-    try {
-      stored = await readStored();
-    } catch (e) {
-      return failed(e);
     }
-    const storedCustom = modelPrefs(stored).custom_models ?? [];
-    // Unpicked here, and run by no other connection: a name another one still
-    // serves keeps its place on the list and its settings.
-    const ctx = {
-      customModels: storedCustom, manifest: manifestMeta, connected: configuredSet, keyCandidates: modelsData?.key_candidates,
-    };
-    const unpicked = (m: string) => owned.includes(m) && !selected.has(m) && !servedElsewhere(m, provider, ctx);
-    const fromOthers = starredModels(stored).filter((m) => !selected.has(m) && !unpicked(m));
-    // A saved model stays while picked; unpicking one of the user's own removes it.
-    const keptSaved = withListedSpecs(savedCustom.filter((cm) => selected.has(cm.name || cm.model_id)), others);
-    const keptNames = new Set(keptSaved.map((cm) => cm.name || cm.model_id));
-    const added = [...pending.values()].filter((e) => selected.has(e.name) && !keptNames.has(e.name));
-    // A parent-catalog model picked under a variant (a coding plan) needs an
-    // entry naming the variant, or its key would not be the one used.
-    const variantPicks = [...selected]
-      .filter((m) => builtIn.includes(m) && !keptNames.has(m))
-      .filter((m) => {
-        const own = metadata[m]?.provider;
-        return !!own && own !== provider;
-      })
-      .map((m): CustomModelEntry => ({ name: m, model_id: manifestMeta[m]?.model_id ?? m, provider }));
-    const custom = replaceProviderModels(storedCustom, provider, [...keptSaved, ...added, ...variantPicks]);
-    try {
-      await updatePreferences.mutateAsync(splitPreferenceWrite({
-        ...pruneModelReferences(stored, unpicked),
-        starred_models: [...fromOthers, ...selected],
-        custom_models: custom.length > 0 ? custom : null,
-      }));
-    } catch (e) {
-      return failed(e);
-    }
-    setPending(new Map());
+    setAdded(new Map());
     setSaving(false);
     return true;
   };
@@ -344,18 +304,16 @@ export function useModelPicker({
     setQuery,
     searching: searchFirst && !!debounced && searched.isFetching,
     searchedFor: debounced,
-    ready,
+    ready: readyRows,
     missing,
     others,
     results,
     yours,
-    savedIds,
-    pendingIds,
+    nameOf,
     selected,
     toggle,
-    toggleListed,
-    listedChecked,
-    addManual: addPending,
+    selectAllReady,
+    addManual,
     removeYours,
     refresh,
     refreshing,

@@ -5,10 +5,12 @@ All test doubles use `unittest.mock.create_autospec` and make no real network ca
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import create_autospec
 
@@ -2038,100 +2040,224 @@ async def test_p2_external_member_public_sharing_blocked_while_close_and_public_
         create_autospec(user_db.get_user, side_effect=lambda uid: users_by_id.get(uid)),
     )
 
-    async def _fake_owned_ws(
-        workspace_id: str, user_id: str
-    ) -> tuple[dict[str, Any], str]:
-        return (
-            {
-                "workspace_id": workspace_id,
-                "user_id": user_id,
-                "name": "WS",
-                "status": "running",
-            },
-            "/home/daytona/work",
-        )
+    async def _fake_owned_ws_on_computer(
+        workspace_id: str, user_id: str, *, need: str | None = None
+    ) -> dict[str, Any]:
+        return {
+            "workspace_id": workspace_id,
+            "user_id": user_id,
+            "name": "WS",
+            "status": "running",
+        }
 
     monkeypatch.setattr(
         share_links_app,
-        "_owned_workspace",
-        create_autospec(share_links_app._owned_workspace, side_effect=_fake_owned_ws),
+        "owned_workspace_on_computer",
+        create_autospec(
+            share_links_app.owned_workspace_on_computer,
+            side_effect=_fake_owned_ws_on_computer,
+        ),
     )
 
-    existing_shared_link = ShareLink(
-        code="codeext12345",
-        workspace_id=ws_ext_id,
-        kind=KIND_FILE,
-        path="report.md",
-        port=None,
-        title="Report",
-        files=("report.md",),
-        created_at=now,
-        shared_at=now,
+    # #666 moved the file-share enable side onto the artifact routes; the
+    # external-member gate travels with it (publish / keep_updated=True).
+    from src.dalton import access_tiers as dalton_access_tiers
+    from src.server.app.artifacts import records as artifact_records_app
+    from src.server.app.artifacts.models import KeepUpdatedRequest, PublishRequest
+    from src.server.database import artifacts as artifacts_db
+
+    monkeypatch.setenv("DALTON_ARTIFACT_PUBLISHING_ENABLED", "1")
+
+    async def _tier_of(uid: str) -> str:
+        return "external" if uid == external_u else "standard"
+
+    monkeypatch.setattr(
+        dalton_access_tiers,
+        "get_user_tier",
+        create_autospec(
+            dalton_access_tiers.get_user_tier, side_effect=_tier_of
+        ),
     )
-    closed_link = ShareLink(
-        code="codeext12345",
+
+    artifact_ext = artifacts_db.Artifact(
+        artifact_id="40000000-0000-4000-8000-000000000001",
+        code="artext12345",
         workspace_id=ws_ext_id,
-        kind=KIND_FILE,
         path="report.md",
-        port=None,
-        title="Report",
-        files=None,
-        created_at=now,
+        created_thread_id=None,
+        bound_thread_id=None,
+        keep_updated=False,
+        latest_seq=0,
         shared_at=None,
+        files=None,
+        revision=0,
+        created_at=now,
     )
-    created_int_link = ShareLink(
-        code="codeint12345",
+    artifact_int = artifacts_db.Artifact(
+        artifact_id="40000000-0000-4000-8000-000000000002",
+        code="artint12345",
         workspace_id=ws_int_id,
-        kind=KIND_FILE,
         path="report.md",
-        port=None,
-        title="Report",
-        files=None,
-        created_at=now,
+        created_thread_id=None,
+        bound_thread_id=None,
+        keep_updated=False,
+        latest_seq=0,
         shared_at=None,
+        files=None,
+        revision=0,
+        created_at=now,
     )
+    artifacts_by_id = {
+        artifact_ext.artifact_id: artifact_ext,
+        artifact_int.artifact_id: artifact_int,
+    }
 
     monkeypatch.setattr(
-        share_links_app,
-        "_owned_link",
+        artifacts_db,
+        "get_artifact",
         create_autospec(
-            share_links_app._owned_link, return_value=existing_shared_link
-        ),
-    )
-    monkeypatch.setattr(
-        share_links_app,
-        "set_private",
-        create_autospec(share_links_app.set_private, return_value=closed_link),
-    )
-    monkeypatch.setattr(
-        share_links_app,
-        "ensure_file_link",
-        create_autospec(
-            share_links_app.ensure_file_link, return_value=created_int_link
+            artifacts_db.get_artifact,
+            side_effect=lambda aid, *, user_id: artifacts_by_id.get(aid),
         ),
     )
 
-    # 1. External member may get-or-create the item's link: it starts private
-    #    (HTML open-in-tab and app previews read it); only sharing it is refused.
-    ext_link_resp = await share_links_app.get_or_create_share_link(
-        ws_ext_id,
-        share_links_app.ShareLinkCreate(kind="file", path="report.md"),
+    snapshot_publish = create_autospec(
+        artifact_records_app.snapshot.publish,
+        return_value=SimpleNamespace(artifact=artifact_int, seq=1, cut=True),
+    )
+    monkeypatch.setattr(
+        artifact_records_app.snapshot, "publish", snapshot_publish
+    )
+    monkeypatch.setattr(
+        artifacts_db,
+        "get_version",
+        create_autospec(
+            artifacts_db.get_version,
+            return_value=artifacts_db.Version(
+                seq=1,
+                entry_path="report.md",
+                origin="owner",
+                title="Report",
+                label=None,
+                byte_len=128,
+                published_at=now,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        artifacts_db,
+        "comment_counts",
+        create_autospec(
+            artifacts_db.comment_counts,
+            return_value=SimpleNamespace(open=0, unread=0),
+        ),
+    )
+    monkeypatch.setattr(
+        artifact_records_app,
+        "publish_artifact_change",
+        create_autospec(artifact_records_app.publish_artifact_change),
+    )
+
+    # 1. External member is refused on publish (403) before any snapshot read.
+    with pytest.raises(HTTPException) as exc_ext_publish:
+        await artifact_records_app.publish_artifact(
+            artifact_ext.artifact_id,
+            PublishRequest(files=["report.md"]),
+            x_user_id=external_u,
+        )
+    assert exc_ext_publish.value.status_code == 403
+    assert exc_ext_publish.value.detail == "外部成员不能创建公开分享链接"
+    snapshot_publish.assert_not_called()
+
+    # 2. External member is refused on keep_updated=True (403); False stays
+    #    open as cleanup.
+    with pytest.raises(HTTPException) as exc_ext_keep:
+        await artifact_records_app.update_artifact(
+            artifact_ext.artifact_id,
+            KeepUpdatedRequest(keep_updated=True),
+            x_user_id=external_u,
+        )
+    assert exc_ext_keep.value.status_code == 403
+    assert exc_ext_keep.value.detail == "外部成员不能创建公开分享链接"
+
+    set_keep_updated = create_autospec(
+        artifacts_db.set_keep_updated,
+        side_effect=lambda *, user_id, artifact_id, keep_updated: (
+            dataclasses.replace(artifacts_by_id[artifact_id], keep_updated=keep_updated)
+        ),
+    )
+    monkeypatch.setattr(artifacts_db, "set_keep_updated", set_keep_updated)
+    keep_off_resp = await artifact_records_app.update_artifact(
+        artifact_ext.artifact_id,
+        KeepUpdatedRequest(keep_updated=False),
         x_user_id=external_u,
     )
-    assert ext_link_resp.shared is False
+    assert keep_off_resp.keep_updated is False
+    set_keep_updated.assert_awaited_once()
 
-    # 2. External member blocked from PATCH /{workspace_id}/share-links/{code} with shared=True (403)
+    # 3. Internal member may publish and set keep_updated=True.
+    int_publish_resp = await artifact_records_app.publish_artifact(
+        artifact_int.artifact_id,
+        PublishRequest(files=["report.md"], keep_updated=True),
+        x_user_id=internal_a,
+    )
+    assert int_publish_resp.cut is True
+    snapshot_publish.assert_awaited_once()
+
+    int_keep_resp = await artifact_records_app.update_artifact(
+        artifact_int.artifact_id,
+        KeepUpdatedRequest(keep_updated=True),
+        x_user_id=internal_a,
+    )
+    assert int_keep_resp.artifact_id == artifact_int.artifact_id
+
+    # 4. update_share_link: sharing a file now names the artifact to publish
+    #    (409 publish_required, internal and external alike); closing an
+    #    existing share stays open to everyone.
+    shared_ext_link = ShareLink(
+        code="codeext12345",
+        workspace_id=ws_ext_id,
+        kind=KIND_FILE,
+        path="report.md",
+        port=None,
+        title="Report",
+        created_at=now,
+        shared_at=now,
+        files=("report.md",),
+        artifact=artifact_ext,
+    )
+    async def _get_link(code: str) -> ShareLink | None:
+        return shared_ext_link if code == shared_ext_link.code else None
+
+    monkeypatch.setattr(
+        share_links_app,
+        "get_link",
+        create_autospec(share_links_app.get_link, side_effect=_get_link),
+    )
+    monkeypatch.setattr(
+        artifacts_db,
+        "unshare",
+        create_autospec(artifacts_db.unshare, return_value=artifact_ext),
+    )
+    monkeypatch.setattr(
+        share_links_app,
+        "publish_artifact_change",
+        create_autospec(share_links_app.publish_artifact_change),
+    )
+
     with pytest.raises(HTTPException) as exc_enable_link:
         await share_links_app.update_share_link(
             ws_ext_id,
             "codeext12345",
-            share_links_app.ShareLinkUpdate(shared=True, files=["report.md"]),
+            share_links_app.ShareLinkUpdate(shared=True),
             x_user_id=external_u,
         )
-    assert exc_enable_link.value.status_code == 403
-    assert exc_enable_link.value.detail == "外部成员不能创建公开分享链接"
+    assert exc_enable_link.value.status_code == 409
+    assert exc_enable_link.value.detail == {
+        "code": "publish_required",
+        "artifact_id": artifact_ext.artifact_id,
+    }
 
-    # 3. External member ALLOWED to close an existing share link (shared=False)
     closed_resp = await share_links_app.update_share_link(
         ws_ext_id,
         "codeext12345",
@@ -2139,14 +2265,6 @@ async def test_p2_external_member_public_sharing_blocked_while_close_and_public_
         x_user_id=external_u,
     )
     assert closed_resp.shared is False
-
-    # 4. Internal member allowed to create share link
-    int_link_resp = await share_links_app.get_or_create_share_link(
-        ws_int_id,
-        share_links_app.ShareLinkCreate(kind="file", path="report.md"),
-        x_user_id=internal_a,
-    )
-    assert int_link_resp.code == "codeint12345"
 
     # 5. Thread sharing: external member blocked from enabling is_shared=True (403),
     #    allowed to close is_shared=False and read get_thread_share; internal member allowed to enable
@@ -2232,6 +2350,14 @@ async def test_p2_external_member_public_sharing_blocked_while_close_and_public_
     assert int_enabled.is_shared is True
 
     # 6. Existing public share links and public shared threads remain accessible via public route
+    # A published record (v1 exists) is what a public visitor reads.
+    published_ext_artifact = dataclasses.replace(
+        artifact_ext, shared_at=now, latest_seq=1, revision=1
+    )
+    published_ext_link = dataclasses.replace(
+        shared_ext_link, artifact=published_ext_artifact
+    )
+
     monkeypatch.setattr(
         pub_app,
         "resolve_link",
@@ -2239,14 +2365,29 @@ async def test_p2_external_member_public_sharing_blocked_while_close_and_public_
             pub_app.resolve_link,
             side_effect=lambda tok, *, user_id=None: (
                 LinkAccess(
-                    link=existing_shared_link,
+                    link=published_ext_link,
                     workspace={"workspace_id": ws_ext_id},
-                    work_dir="/home/daytona/work",
                     owner=False,
                 )
                 if tok == "codeext12345"
                 else None
             ),
+        ),
+    )
+    from src.server.services.artifacts import grants as artifact_grants_mod
+
+    monkeypatch.setattr(
+        pub_app,
+        "artifact_grants",
+        SimpleNamespace(
+            mint_artifact_share_grant=create_autospec(
+                artifact_grants_mod.mint_artifact_share_grant,
+                return_value=SimpleNamespace(
+                    token="visitor-token",
+                    expires_at=int(now.timestamp()) + 12 * 3600,
+                ),
+            ),
+            grant_prefix=lambda grant: f"/g/{grant.token}",
         ),
     )
     monkeypatch.setattr(

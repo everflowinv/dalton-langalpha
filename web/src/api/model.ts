@@ -4,8 +4,9 @@
  */
 import { api } from '@/api/client';
 import type { KeyCandidates, ProviderCatalogEntry, ReasoningDeclaration } from '@/components/model/types';
-import type { ModelMetadataEntry } from '@/hooks/useFilteredModels';
+import type { GatewayIndex, ModelMetadataEntry } from '@/hooks/useFilteredModels';
 import type { CompactionProfileCatalog, SearchProviderCatalog, SystemDefaults } from '@/hooks/useAllModels';
+import { apiErrorStatus } from '@/api/errors';
 
 /** `GET /api/v1/models`: the deployment's catalog, the same for every user. */
 export interface ModelsResponse {
@@ -19,11 +20,131 @@ export interface ModelsResponse {
   provider_catalog: ProviderCatalogEntry[];
   /** Where a turn looks for each provider's stored key. */
   key_candidates: Record<string, KeyCandidates>;
+  /** How a pick from a gateway's list meets the built-in it is tuned as. */
+  gateway_index?: GatewayIndex;
 }
 
 export async function getAvailableModels(): Promise<ModelsResponse> {
   const { data } = await api.get('/api/v1/models');
   return data as ModelsResponse;
+}
+
+/** Where this user's saved setup token stands. `off`: this server does not
+ *  run turns on a saved token (their flag is off, or the deployment runs
+ *  Claude Code only on the user's own computers). `checking`: a saved token Anthropic has not answered for
+ *  yet. `unverified`: the check could not reach Anthropic, which a later read
+ *  tries again; a turn runs meanwhile. `rejected`: Anthropic refused it.
+ *  `policy_blocked`: an organization's Claude Code policy is installed where
+ *  it would run, so Claude Code does not run there, whatever the token. */
+export type ClaudeCodeState = 'off' | 'no_token' | 'checking' | 'unverified' | 'signed_in' | 'rejected' | 'policy_blocked';
+
+/** `GET /api/v1/claude-code/status`, and the answer to a token saved. A
+ *  server that predates it answers 404, which reads as `off`. */
+export interface ClaudeCodeStatus {
+  /** Claude Code models are on for the user, wherever they run. Absent from
+   *  a server that predates it, where on means `state` is not `off`. */
+  enabled?: boolean;
+  state: ClaudeCodeState;
+  /** The Claude account, known only for a token made through Sign in. */
+  email: string | null;
+  /** When the token stops working; for a pasted one, the latest it can last. */
+  expires_at: string | null;
+  /** A token is saved, whatever `state` says: one is still there to remove
+   *  once Claude Code is off. Absent from a server that predates it. */
+  saved?: boolean;
+}
+
+/** Where Claude Code stands on one of the user's own computers. `off`: their
+ *  flag or the deployment does not run it. `offline`: the computer is not
+ *  running or cannot be reached, so its token cannot be read. `needs_perl`:
+ *  the computer has no perl, so no token can be used there.
+ *  `computer_unsupported`: it runs musl, which no build of Claude Code runs
+ *  on. The rest read as the account's (`ClaudeCodeState`), for the token
+ *  that computer uses, `policy_blocked` for a policy installed on it. */
+export type ClaudeCodeComputerState = 'off' | 'offline' | 'needs_perl' | 'computer_unsupported' | ClaudeCodeState;
+
+/** One of the user's own computers (SSH, or a Mac through Remote control) as
+ *  Claude Code sees it. */
+export interface ClaudeCodeComputer {
+  computer_id: string;
+  name: string;
+  kind: 'ssh' | 'helper';
+  state: ClaudeCodeComputerState;
+  /** The token its turns use: its own (`machine`), or the one saved in
+   *  Settings (`saved`), which a self-hosted server uses on a computer with
+   *  none of its own. Null with neither. */
+  source: 'machine' | 'saved' | null;
+  /** Whether its own token file is on the computer, one it refuses
+   *  included, which can be removed while it runs on the saved token. */
+  own_file?: boolean;
+  email: string | null;
+  expires_at: string | null;
+}
+
+/** A server from before per-computer tokens has no such route, and runs
+ *  Claude Code on none of the user's computers. */
+export async function getClaudeCodeComputers(): Promise<{ computers: ClaudeCodeComputer[] }> {
+  try {
+    const { data } = await api.get('/api/v1/claude-code/computers');
+    return data as { computers: ClaudeCodeComputer[] };
+  } catch (err) {
+    if (apiErrorStatus(err) === 404) return { computers: [] };
+    throw err;
+  }
+}
+
+const computerPath = (computerId: string) => `/api/v1/claude-code/computers/${encodeURIComponent(computerId)}`;
+
+/** Puts a setup token on the computer once Anthropic takes it; the refusals
+ *  are `saveClaudeCodeToken`'s. */
+export async function saveClaudeCodeComputerToken(computerId: string, token: string): Promise<ClaudeCodeComputer> {
+  const { data } = await api.put(`${computerPath(computerId)}/token`, { token });
+  return data as ClaudeCodeComputer;
+}
+
+export async function startClaudeCodeComputerSignIn(computerId: string): Promise<{ authorize_url: string; expires_at: string }> {
+  const { data } = await api.post(`${computerPath(computerId)}/sign-in`);
+  return data as { authorize_url: string; expires_at: string };
+}
+
+export async function submitClaudeCodeComputerSignInCode(computerId: string, code: string): Promise<ClaudeCodeComputer> {
+  const { data } = await api.post(`${computerPath(computerId)}/sign-in/code`, { code });
+  return data as ClaudeCodeComputer;
+}
+
+export async function removeClaudeCodeComputerToken(computerId: string): Promise<void> {
+  await api.delete(`${computerPath(computerId)}/token`);
+}
+
+export async function getClaudeCodeStatus(): Promise<ClaudeCodeStatus> {
+  const { data } = await api.get('/api/v1/claude-code/status');
+  return data as ClaudeCodeStatus;
+}
+
+/** Saves the user's setup token once Anthropic takes it, which one real
+ *  request checks, so it answers in seconds. A refusal carries the OAuth
+ *  routes' `error` body (`readOAuthError`) and saves nothing. */
+export async function saveClaudeCodeToken(token: string): Promise<ClaudeCodeStatus> {
+  const { data } = await api.put('/api/v1/claude-code/token', { token });
+  return data as ClaudeCodeStatus;
+}
+
+/** Starts a Claude sign-in that ends in a setup token the server makes for
+ *  the user: the page to approve it on, and when the sign-in lapses. */
+export async function startClaudeCodeSignIn(): Promise<{ authorize_url: string; expires_at: string }> {
+  const { data } = await api.post('/api/v1/claude-code/sign-in');
+  return data as { authorize_url: string; expires_at: string };
+}
+
+/** Finishes that sign-in with the code Claude's page showed, which the server
+ *  exchanges for a token and checks before saving, so it answers in seconds. */
+export async function submitClaudeCodeSignInCode(code: string): Promise<ClaudeCodeStatus> {
+  const { data } = await api.post('/api/v1/claude-code/sign-in/code', { code });
+  return data as ClaudeCodeStatus;
+}
+
+export async function removeClaudeCodeToken(): Promise<void> {
+  await api.delete('/api/v1/claude-code/token');
 }
 
 export async function getUserApiKeys(): Promise<Record<string, unknown>> {
@@ -82,6 +203,13 @@ export interface ListedModel {
   manifest_key?: string;
   /** OpenRouter: the levels the model takes there, saved with the pick. */
   reasoning?: ReasoningDeclaration;
+  /** A gateway's catalog: the provider the model is served on (one of the
+   *  connection's `routes`), and what that API needs sent, saved with the pick. */
+  route?: string;
+  /** The catalog describes the model, so the pick runs tuned by it. */
+  described?: boolean;
+  parameters?: Record<string, unknown>;
+  prompt_guidance?: string;
 }
 
 export type AvailableModelsReason =

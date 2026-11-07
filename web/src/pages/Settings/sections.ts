@@ -6,6 +6,7 @@ import {
   Cpu,
   CreditCard,
   FlaskConical,
+  Globe,
   MessageSquare,
   Palette,
   PieChart,
@@ -36,6 +37,8 @@ export const SECTIONS = {
   general: { labelKey: 'settings.section.general', descKey: 'settings.definition.general', icon: SlidersHorizontal },
   appearance: { labelKey: 'settings.section.appearance', descKey: 'settings.definition.appearance', icon: Palette },
   chat: { labelKey: 'settings.section.chat', descKey: 'settings.definition.chat', icon: MessageSquare },
+  // An HTML file's glyph everywhere else in the app (`fileKindIcon('page')`).
+  artifacts: { labelKey: 'settings.section.artifacts', descKey: 'settings.definition.artifacts', icon: Globe },
   agent: { labelKey: 'settings.section.agent', descKey: 'settings.definition.agent', icon: Bot },
   model: { labelKey: 'settings.section.model', descKey: 'settings.definition.model', icon: Cpu },
   integrations: { labelKey: 'settings.section.integrations', descKey: 'settings.definition.integrations', icon: Plug, platformOnly: true },
@@ -56,7 +59,7 @@ export function sectionShown(section: Section): boolean {
 
 export const GROUPS: readonly { labelKey: string; sections: readonly Section[] }[] = [
   { labelKey: 'settings.group.account', sections: ['account', 'preferences', 'plan'] },
-  { labelKey: 'settings.group.app', sections: ['general', 'appearance', 'chat'] },
+  { labelKey: 'settings.group.app', sections: ['general', 'appearance', 'chat', 'artifacts'] },
   { labelKey: 'settings.group.agent', sections: ['agent', 'model', 'integrations', 'trading'] },
   { labelKey: 'settings.group.labs', sections: ['experiments'] },
 ];
@@ -123,7 +126,11 @@ export const SETTINGS = {
   toolCallLayout: { section: 'chat', anchor: 'tool-calls', labelKey: 'settings.toolCallLayout', descKey: 'settings.toolCallLayoutDesc' },
   turnEndScroll: { section: 'chat', anchor: 'turn-end', labelKey: 'settings.turnEndScroll', descKey: 'settings.turnEndScrollDesc' },
   voiceInput: { section: 'chat', anchor: 'voice-input', labelKey: 'settings.voiceInput', descKey: 'settings.voiceInputDesc' },
+  commentDestination: { section: 'artifacts', anchor: 'comment-destination', labelKey: 'settings.artifacts.destination', descKey: 'settings.artifacts.destinationDesc', keywords: '评论去向 comment destination' },
+  commentEnter: { section: 'artifacts', anchor: 'comment-enter', labelKey: 'settings.artifacts.enter', descKey: 'settings.artifacts.enterDesc', keywords: '评论 回车 comment enter' },
+  artifactAnswers: { section: 'artifacts', anchor: 'artifact-answers', labelKey: 'settings.artifacts.answers', descKey: 'settings.artifacts.answersDesc', keywords: '评论 回答 artifact answers' },
   outputFormat: { section: 'agent', anchor: 'output-format', labelKey: 'settings.outputFormat', descKey: 'settings.outputFormatDesc', keywords: '输出格式 output format' },
+
   researchDepth: { section: 'agent', anchor: 'research-depth', labelKey: 'settings.researchDepth', descKey: 'settings.researchDepthDesc' },
   reachingOut: { section: 'agent', anchor: 'reaching-out', labelKey: 'settings.reachingOut', descKey: 'settings.reachingOutDesc' },
   subagents: { section: 'agent', anchor: 'subagents', labelKey: 'settings.subagentsDefault', descKey: 'settings.subagentsDefaultDesc' },

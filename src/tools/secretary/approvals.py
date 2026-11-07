@@ -13,8 +13,9 @@ from typing import Annotated, Any
 
 from langchain.agents.middleware import AgentMiddleware, AgentState
 from langchain.agents.middleware.types import PrivateStateAttr
-from langchain_core.messages import AIMessage
 from typing_extensions import NotRequired
+
+from ptc_agent.agent.pending_calls import pending_calls
 
 logger = logging.getLogger(__name__)
 
@@ -142,19 +143,19 @@ class StandingApprovalMiddleware(AgentMiddleware):
         self._user_id = user_id
 
     async def aafter_model(self, state: Any, runtime: Any) -> dict[str, Any] | None:
-        messages = state.get("messages") or []
-        last = messages[-1] if messages else None
-        if not isinstance(last, AIMessage) or not self._user_id:
+        if not self._user_id:
             return None
+        _, calls = pending_calls(state.get("messages") or [])
         wanted = {
             call["id"]: needed
-            for call in last.tool_calls
+            for call in calls
             if (needed := _settings_for(call))
         }
         if not wanted:
             return None
         granted = await _granted(self._user_id)
-        by_id = {call["id"]: call for call in last.tool_calls}
+        # DALTON-HOOK(workspace-duplicate-guard): the duplicate check reads the proposed call
+        by_id = {call["id"]: call for call in calls}
         preapproved_calls = []
         for call_id, needed in wanted.items():
             if needed not in granted:

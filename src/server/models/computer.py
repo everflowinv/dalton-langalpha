@@ -310,7 +310,10 @@ class ComputerCreate(BaseModel):
         None,
         min_length=1,
         max_length=255,
-        description="User-facing computer name; a default is used when absent",
+        description=(
+            "User-facing computer name, unique among the user's computers; "
+            "a default is used when absent or blank"
+        ),
     )
     resource_tier: ResourceTierId = Field(
         "standard",
@@ -335,6 +338,14 @@ class ComputerCreate(BaseModel):
             "without them"
         ),
     )
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _trimmed_name(cls, value: Any) -> Any:
+        # Compared trimmed against the user's other names, so stored that way.
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
 
     @model_validator(mode="after")
     def _ssh_only_with_its_kind(self) -> "ComputerCreate":
@@ -391,6 +402,10 @@ class ComputerSSHProbeResponse(BaseModel):
     helper: bool = Field(
         False,
         description="LangAlpha's helper answers for the machine rather than an sshd",
+    )
+    claude_code_blocked: bool = Field(
+        False,
+        description="Whether an organization's managed Claude Code settings on the machine keep Claude Code from running there",
     )
     suggested_root_dir: str = Field(
         description=(
@@ -604,6 +619,12 @@ class ComputerProviderOption(BaseModel):
             "machine is its owner's and they size it"
         ),
     )
+    default_name: str = Field(
+        description=(
+            "What a computer created here without a name is called, before it "
+            "is numbered past the user's other computers' names"
+        )
+    )
 
 
 class ComputerProvidersResponse(BaseModel):
@@ -652,7 +673,9 @@ class ComputerRenameRequest(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True)
 
     name: str = Field(
-        min_length=1, max_length=255, description="New user-facing computer name"
+        min_length=1,
+        max_length=255,
+        description="New user-facing computer name, unique among the user's computers",
     )
 
 
@@ -987,6 +1010,25 @@ class ComputerFilesRemoval(BaseModel):
     )
 
 
+class ComputerTokenRemoval(BaseModel):
+    """A Claude Code setup token left on a removed ssh computer's machine,
+    which signs in as its owner until it is deleted there."""
+
+    outcome: Literal["unreached", "failed"] = Field(
+        description=(
+            "unreached: the machine did not answer; failed: it answered but could "
+            "not delete it. Either way it last held a token file of the computer's"
+        )
+    )
+    path: str = Field(
+        description=(
+            "The token file on the machine, with ~ for the login's home, in the folder "
+            "it was last found in; in the default config home's (~/.config) when that "
+            "was never said"
+        )
+    )
+
+
 class ComputerRemoveRequest(BaseModel):
     """Request body for removing a computer.
 
@@ -1012,6 +1054,10 @@ class ComputerRemoveResponse(BaseModel):
     )
     files: Optional[ComputerFilesRemoval] = Field(
         None, description="Null unless the removal was asked to delete the machine's files"
+    )
+    token: Optional[ComputerTokenRemoval] = Field(
+        None,
+        description="Set only when a Claude Code token of the computer's is left on its machine",
     )
     workspaces_deleted: List[str] = Field(
         default_factory=list,

@@ -11,9 +11,10 @@
 
 import { SYSTEM_DIR_PREFIXES } from '../components/filePanel/fileMeta';
 import {
+  folderWorkspacePath,
   normalizeAgentPath,
   parseAgentPath,
-  siblingWorkspacePath,
+  ranElsewhere,
   workspaceScopedPath,
   type AgentPathParts,
   type ComputerFolders,
@@ -54,7 +55,8 @@ export function linkCandidates(href: string, fromFile: string | null, root?: str
  * Where a link inside an open file lands when it climbs into a workspace's
  * folder, by either reading `linkCandidates` offers. Read from the working
  * directory, `../NVDA/x.md` climbs into NVDA's folder; read from `reports/`,
- * it takes `../../NVDA/x.md`. A sibling's folder names that workspace, and
+ * it takes `../../NVDA/x.md`. Another workspace's folder names that workspace
+ * (a sibling's, or one on another computer at its whole path there), and
  * this workspace's own reads from its root, with no `workspaceId`. At most one
  * reading climbs exactly out of the workspace, since the joined one starts as
  * many levels deeper as the file sits.
@@ -70,8 +72,8 @@ export function folderLinkTarget(
   // A candidate is a canonical string, which has lost the sandbox root.
   const readings = parts.absolute ? [parts] : linkCandidates(href, fromFile, root).map((c) => parseAgentPath(c, root));
   for (const reading of readings) {
-    const sibling = siblingWorkspacePath(reading, folders);
-    if (sibling) return sibling;
+    const other = folderWorkspacePath(reading, folders);
+    if (other) return other;
     const own = workspaceScopedPath(reading, folders.dirName, folders.previousDirNames, folders.otherRoots);
     if (own !== reading.path) return { path: own || './' };
   }
@@ -175,6 +177,7 @@ export function writeCalls(message: TurnMessage, root?: string | null): WriteCal
     .sort(([, a], [, b]) => (a.order ?? 0) - (b.order ?? 0));
   for (const [id, call] of calls) {
     const args = call.toolCall?.args;
+    if (ranElsewhere(args)) continue;
     const named = args?.file_path ?? args?.filePath ?? args?.path ?? args?.filename;
     if (typeof named !== 'string' || !named) continue;
     const parts = parseAgentPath(named, root);

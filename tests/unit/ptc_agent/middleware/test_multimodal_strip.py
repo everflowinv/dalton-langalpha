@@ -1167,7 +1167,7 @@ class TestByteTotalRecordsTheRemoval:
             _ModelCallRequest("claude-sonnet-5-5", history, state={"_removed_attachment_ids": {"held"}}),
             handler,
         )
-        fitted = Fitted(response=strip_resp.model_response, removed={"fit-pdf"}, unsent=set(), spared=0)
+        fitted = Fitted(response=strip_resp.model_response, removed={"fit-pdf"}, unsent=set(), spared=0, sent_bound_thinking=False)
         fit_cmd = Command(update=fitted.update({"_removed_attachment_ids": {"held"}}))
 
         graph = StateGraph(CompactionState)
@@ -1236,7 +1236,13 @@ class TestByteTotalRecordsTheRemoval:
             handler,
         )
         fitted = Fitted(
-            response=strip_resp.model_response, removed={"fit-new"}, unsent=set(), spared=0
+            response=strip_resp.model_response,
+            removed={"fit-new"},
+            unsent=set(),
+            spared=0,
+            # Upstream #653/#655 added the field; the union-reducer contract
+            # under test does not depend on it.
+            sent_bound_thinking=False,
         )
         compact_cmd = Command(update={**compact_only, **fitted.update(compact_only)})
         cmds = [strip_resp.command, compact_cmd] if strip_first else [compact_cmd, strip_resp.command]

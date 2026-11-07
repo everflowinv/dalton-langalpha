@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ListedModel } from '@/api/model';
-import { entryForListed, withListedSpecs } from '../useModelPicker';
+import { entryForListed, withListedSpecs } from '../listedEntries';
 
 const ladder = { efforts: ['none', 'low', 'high', 'max'], default: 'high', write: 'parameters.reasoning.effort' };
 
@@ -45,5 +45,28 @@ describe('effort levels from a provider list', () => {
     // OpenRouter's word for a PDF is `file`.
     expect(withListedSpecs([saved], [{ id: 'acme/vision', input_modalities: ['text', 'file'] }]))
       .toEqual([{ ...saved, input_modalities: ['text', 'pdf'] }]);
+  });
+
+  it("a gateway's pick is always named under the gateway, so a built-in of its id is never shadowed", () => {
+    expect(entryForListed({ id: 'qwen9', route: 'gw-chat' }, 'gw', new Set()).name).toBe('gw/qwen9');
+    expect(entryForListed({ id: 'qwen9' }, 'gw', new Set()).name).toBe('qwen9');
+  });
+
+  it("a saved gateway pick moves whole when the gateway's catalog serves it on another API", () => {
+    const saved = {
+      name: 'gw/m', model_id: 'm', provider: 'gw-chat',
+      parameters: { max_tokens: 1 }, reasoning: { efforts: ['low'], write: 'parameters.reasoning_effort' },
+    };
+    const ladder = { efforts: ['low', 'high'], write: 'parameters.output_config.effort' };
+    const [moved] = withListedSpecs([saved], [
+      { id: 'm', described: true, route: 'gw-anthropic', parameters: { thinking: { type: 'adaptive' } }, reasoning: ladder },
+    ]);
+    expect(moved).toMatchObject({ provider: 'gw-anthropic', parameters: { thinking: { type: 'adaptive' } }, reasoning: ladder });
+    // Undescribed (the catalog unreadable), the list's word on the route is a fallback's: it stays.
+    expect(withListedSpecs([saved], [{ id: 'm', route: 'gw-chat2' }])).toEqual([saved]);
+    // Described without settings: none of the old API's are sent on the new one.
+    const [bare] = withListedSpecs([saved], [{ id: 'm', described: true, route: 'gw-anthropic' }]);
+    expect(bare).not.toHaveProperty('parameters');
+    expect(bare).not.toHaveProperty('reasoning');
   });
 });

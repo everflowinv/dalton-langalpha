@@ -35,6 +35,9 @@ const h = vi.hoisted(() => ({
     dalton_audit_timeout_s: 300,
     dalton_extract_model: 'deepseek-flash',
   } as Record<string, unknown>,
+  /** What the slots list; null lists the whole catalog. */
+  slotModels: null as Record<string, { models?: string[] }> | null,
+  metadata: {} as Record<string, { provider?: string; sdk?: string }>,
   validModelNames: new Set(['gpt-sol', 'gpt-terra', 'gpt-luna', 'claude-big', 'claude-small', 'deepseek-flash']),
   rawModels: {} as Record<string, { models?: string[] }>,
   rawApiResponse: null as Record<string, unknown> | null,
@@ -83,9 +86,10 @@ vi.mock('@/contexts/ThemeContext', () => ({
 vi.mock('@/hooks/useAllModels', () => ({
   useAllModels: () => ({
     models: h.catalog,
+    slotModels: h.slotModels ?? h.catalog,
     // Per-model tuning metadata — the Advanced section reads it for the
     // reasoning-effort ladder. Always an object from the real hook.
-    metadata: {},
+    metadata: h.metadata,
     payers: h.payers,
     systemDefaults: h.systemDefaults,
     // DALTON-HOOK(settings-section): ModelTab reads customModels for Dalton selectors
@@ -226,6 +230,8 @@ beforeEach(() => {
     dalton_audit_timeout_s: 300,
     dalton_extract_model: 'deepseek-flash',
   };
+  h.slotModels = null;
+  h.metadata = {};
   h.mutate.mockClear();
   h.mutateAsync.mockClear();
   h.mutateAsync.mockResolvedValue({});
@@ -455,6 +461,37 @@ describe('Settings: Dalton routing controls', () => {
   });
 });
 
+// A model that runs a conversation only (Claude Code) is the Default model's
+// to offer, and no Background, fetch or compaction slot's.
+describe('Settings: slots a conversation-only model cannot fill', () => {
+  it('lists only the slot models outside the Default model', async () => {
+    h.slotModels = { openai: { models: ['gpt-sol'] } };
+    localStorage.setItem('settings:modelMode', 'advanced');
+    renderModelTab();
+    const options = (name: string) =>
+      [...(screen.getByRole('combobox', { name }) as HTMLSelectElement).options].map((o) => o.value).filter(Boolean);
+    await screen.findByRole('combobox', { name: 'Default model' });
+    expect(options('Default model')).toContain('claude-big');
+    expect(options('Background model')).toEqual(['gpt-sol']);
+    expect(options('Web fetch model')).toEqual(['gpt-sol']);
+    expect(options('Compaction model')).toEqual(['gpt-sol']);
+  });
+});
+
+// The server runs the deployment's Background model beside a conversation-only
+// Default model (Claude Code), so an unset Background slot names that one.
+describe('Settings: Background beside a conversation-only Default model', () => {
+  it("names the deployment's Background model, not the Default model, once", async () => {
+    h.metadata = { 'claude-code-row': { provider: 'claude-code', sdk: 'claude-code' } };
+    h.preferences = { model_preference: { preferred_model: 'claude-code-row' }, other_preference: {} };
+    renderModelTab();
+    await screen.findByRole('combobox', { name: 'Background model' });
+    expect(background().value).toBe('');
+    expect(background().selectedOptions[0].textContent).toBe('Auto (deepseek-flash)');
+    expect([...background().options].filter((o) => o.textContent === 'Auto (deepseek-flash)')).toHaveLength(1);
+  });
+});
+
 describe('saved fallbacks that cross payers', () => {
   const NOTE = 'Saved fallbacks run on every turn, including ones you pay for yourself.';
   const renderAdvanced = () => {
@@ -473,6 +510,16 @@ describe('saved fallbacks that cross payers', () => {
 
   it('says nothing to a user who pays for no turn themselves', () => {
     h.payers = { 'deepseek-flash': 'server_key' };
+    h.preferences = { model_preference: { fallback_models: ['deepseek-flash'] }, other_preference: {} };
+    renderAdvanced();
+    expect(screen.queryByText(NOTE)).not.toBeInTheDocument();
+  });
+
+  // A Claude Code turn takes no fallback, so its models alone are no turn a
+  // saved list runs on.
+  it('says nothing to a user whose only turns of their own run on Claude Code', () => {
+    h.metadata = { 'claude-code-row': { provider: 'claude-code', sdk: 'claude-code' } };
+    h.payers = { 'deepseek-flash': 'server_key', 'claude-code-row': 'subscription:claude-code' };
     h.preferences = { model_preference: { fallback_models: ['deepseek-flash'] }, other_preference: {} };
     renderAdvanced();
     expect(screen.queryByText(NOTE)).not.toBeInTheDocument();

@@ -52,11 +52,11 @@ BUILD_FILES_SHA256_FILE = Path("/app/.build_files.sha256")
 DOCKER_MANIFEST_WATCHED_PATHS: tuple[str, ...] = (
     "server.py",
     "config.yaml",
+    "config.dalton.yaml",
     "agent_config.yaml",
     "agent_config.dalton.yaml",
     "alembic.ini",
     "config/dalton",
-    "libs/ptc-cli",
     "libs/market-protocol",
     "src",
     "scripts",

@@ -225,9 +225,10 @@ async def _computer_at(conn_factory, user_id, *, index, kind, version) -> None:
     async with conn_factory() as conn:
         await conn.execute(
             """INSERT INTO computers (computer_id, user_id, kind, provider_ref,
-                       status, platform_secret_version)
-               VALUES (%s, %s, %s, %s, 'running', %s)""",
-            (uuid.UUID(int=index), user_id, kind, f"{kind}-{index}", version),
+                       name, status, platform_secret_version)
+               VALUES (%s, %s, %s, %s, %s, 'running', %s)""",
+            (uuid.UUID(int=index), user_id, kind, f"{kind}-{index}", f"{kind}-{index}",
+             version),
         )
 
 
@@ -602,9 +603,11 @@ async def test_sweep_filters_unsupported_providers_before_batch_limit(
     async with patched_get_db_connection() as conn:
         for index in range(1, 27):
             await conn.execute(
-                """INSERT INTO computers (computer_id, user_id, kind, provider_ref, status)
-                   VALUES (%s, %s, 'docker', %s, 'running')""",
-                (uuid.UUID(int=index), seed_user["user_id"], f"docker-{index}"),
+                """INSERT INTO computers (computer_id, user_id, kind, provider_ref,
+                           name, status)
+                   VALUES (%s, %s, 'docker', %s, %s, 'running')""",
+                (uuid.UUID(int=index), seed_user["user_id"], f"docker-{index}",
+                 f"docker-{index}"),
             )
         await conn.execute(
             """INSERT INTO computers (computer_id, user_id, kind, provider_ref,
@@ -664,9 +667,9 @@ async def test_sweep_pages_past_machines_that_never_converge(
         for index in range(1, 4):
             await conn.execute(
                 """INSERT INTO computers (computer_id, user_id, kind, provider_ref,
-                           status, platform_secret_version)
-                   VALUES (%s, %s, 'daytona', %s, 'running', %s)""",
-                (uuid.UUID(int=index), seed_user["user_id"], f"d-{index}",
+                           name, status, platform_secret_version)
+                   VALUES (%s, %s, 'daytona', %s, %s, 'running', %s)""",
+                (uuid.UUID(int=index), seed_user["user_id"], f"d-{index}", f"d-{index}",
                  certified.generation),
             )
     first = await list_workspaces_behind_platform_secret({"daytona": rollout}, limit=2)

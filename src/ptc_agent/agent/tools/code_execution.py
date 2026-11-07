@@ -209,7 +209,7 @@ def create_execute_code_tool(
     async def _result(outcome: Ended | Failed) -> tuple[str, dict[str, Any]]:
         """An ended run's output, as the call returns it."""
         artifact = {"mcp_trace": list(outcome.trace)}
-        output = await command_handoff.settle(backend, outcome)
+        output = await command_handoff.settle(backend, outcome, hand_off)
         if isinstance(outcome, Ended) and outcome.exit_code == 0:
             logger.info("Code executed successfully", output_length=len(output))
             return ("SUCCESS\n" + output) if output else "SUCCESS", artifact

@@ -533,6 +533,36 @@ async def test_grep_uses_path_arg(middleware):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "args"),
+    [
+        ("Read", {"file_path": "/Users/me/report.md", "computer": "Studio Mac"}),
+        ("Grep", {"pattern": "revenue", "path": "/Users/me", "computer": "Studio Mac"}),
+    ],
+)
+async def test_a_read_on_another_computer_is_no_file_source(middleware, name, args):
+    """The Sources panel opens a file source on the turn's own computer, where
+    that path names another file or none."""
+    emitted = []
+    await _run(middleware, _make_request(name, args), _result(content="revenue"), emitted)
+
+    assert emitted == []
+
+
+@pytest.mark.asyncio
+async def test_a_blank_computer_is_still_a_read_here(middleware):
+    emitted = []
+    await _run(
+        middleware,
+        _make_request("Read", {"file_path": "work/report.md", "computer": " "}),
+        _result(content="revenue"),
+        emitted,
+    )
+
+    assert [e["identifier"] for e in emitted] == ["work/report.md"]
+
+
+@pytest.mark.asyncio
 async def test_execute_code_one_mcp_tool_event_per_trace_entry(middleware):
     artifact = {
         "mcp_trace": [

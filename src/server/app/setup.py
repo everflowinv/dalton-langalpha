@@ -27,6 +27,7 @@ if sys.platform == "win32":
 import importlib
 import logging
 import os
+import re
 import certifi
 
 os.environ["SSL_CERT_FILE"] = certifi.where()
@@ -53,6 +54,7 @@ from src.config.settings import (
 from src.observability import init_otel, init_otel_runtime, shutdown_otel_runtime
 from src.observability.private_query import drop_span_query
 from src.server.services.runs.executor import LocalRunExecutor
+from src.server.services.cli_calls import CliCallRecorder
 from src.server.services.background_registry_store import BackgroundRegistryStore
 from src.server.utils.api import find_malformed_route_ids  # TEMP (malformed-id-diag)
 from src.server.services.preview_base import (
@@ -135,6 +137,9 @@ _REDIS_BACKGROUND_SINGLETONS: tuple[tuple[str, str], ...] = (
     # Keeps running sandboxes' market-data tokens fresh between turns; a
     # claim on each computer's row in Postgres dedups it across workers.
     ("DataTokenSweeper", "src.server.services.data_token_sweep"),
+    # The same for the token the `la` CLI calls the API with, on every
+    # deployment.
+    ("CliTokenSweeper", "src.server.services.cli_token_sweep"),
     # Takes tunnels no computer uses off their machines; a claim on each
     # tunnel's row in Postgres dedups it across workers.
     ("TunnelSweeper", "src.server.services.ssh_tunnel_sweep"),
@@ -145,6 +150,9 @@ _REDIS_BACKGROUND_SINGLETONS: tuple[tuple[str, str], ...] = (
     # computers up while covered; claims on each command's row in Postgres
     # dedup it across workers.
     ("CommandWatcher", "src.server.services.commands.watcher"),
+    # Has a model describe MCP servers; a claim on each job's row under its
+    # scope's advisory lock dedups it across workers.
+    ("McpDescriptionWorker", "src.server.services.mcp_descriptions.worker"),
 )
 
 
@@ -1129,7 +1137,7 @@ async def lifespan(app: FastAPI):
 
     # 9. Close usage-limits HTTP client
     try:
-        from src.server.dependencies.usage_limits import close_http_client
+        from src.server.utils.http_client import close_http_client
 
         await close_http_client()
         logger.info("Usage limits HTTP client closed")
@@ -1301,6 +1309,10 @@ app.add_middleware(_SelectiveGZip, minimum_size=1000)
 # `malformed-id-diag` — `grep -rn malformed-id-diag src tests` lists them all.
 app.add_middleware(MalformedIdDiagnosticMiddleware)
 
+# Records every request a computer's `la` makes, with the thread whose command
+# made it (src/server/services/cli_calls.py).
+app.add_middleware(CliCallRecorder)
+
 # Register request ID middleware (will be executed after CORS)
 # Note: In FastAPI, middleware is executed in reverse order (last added = first executed)
 # So we add RequestIDMiddleware first, then CORS, so CORS executes first
@@ -1313,8 +1325,31 @@ allowed_origins = get_allowed_origins()
 
 logger.info(f"Allowed origins: {allowed_origins}")
 
+# Routes whose URL is the whole credential (a grant or share code in the path).
+# Their documents run on an opaque origin, so their own reads arrive as
+# Origin: null; any origin may read them, and never with credentials, which
+# the app's CORS below would add by echoing that origin back.
+_URL_CREDENTIAL_ROUTES = re.compile(
+    r"/api/v1/(?:wsfiles/g/|artifacts/g/|public/shared/[^/]+/files/serve/)"
+)
+
+
+class _CORSMiddleware(CORSMiddleware):
+    def __init__(self, app, **options):
+        super().__init__(app, **options)
+        self._url_credential = CORSMiddleware(
+            app, allow_origins=["*"], allow_methods=["GET", "HEAD"]
+        )
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and _URL_CREDENTIAL_ROUTES.match(scope["path"]):
+            await self._url_credential(scope, receive, send)
+            return
+        await super().__call__(scope, receive, send)
+
+
 app.add_middleware(
-    CORSMiddleware,
+    _CORSMiddleware,
     allow_origins=allowed_origins,  # Restrict to specific origins
     allow_credentials=True,
     allow_methods=[
@@ -1382,6 +1417,9 @@ from src.server.app.workspace_files import router as workspace_files_router
 from src.server.app.workspace_files import wsfiles_router
 from src.server.app.workspace_sandbox import router as workspace_sandbox_router
 from src.server.app.chart_annotations import router as chart_annotations_router
+from src.server.app.artifact_frames import frame_router as artifact_frame_router
+from src.server.app.artifacts import router as artifacts_router
+from src.server.app.artifacts import workspace_router as artifact_records_router
 from src.server.app.workspace_sandbox import preview_redirect_router
 from src.server.app.market_data import router as market_data_router
 from src.server.app.bars import router as bars_router
@@ -1389,6 +1427,8 @@ from src.server.app.user_events import router as user_events_router
 from src.server.app.users import router as users_router
 from src.server.app.trading_permission import router as trading_permission_router
 from src.server.app.features import router as features_router
+from src.server.app.claude_code import router as claude_code_router
+from src.server.app.claude_code_computers import router as claude_code_computers_router
 from src.server.app.watchlist import router as watchlist_router
 from src.server.app.portfolio import router as portfolio_router
 from src.server.app.news import router as news_router
@@ -1461,6 +1501,12 @@ app.include_router(
 app.include_router(
     chart_annotations_router
 )  # /api/v1/workspaces/{id}/chart-annotations - Agent-drawn chart annotations
+app.include_router(
+    artifact_records_router
+)  # /api/v1/workspaces/{id}/artifacts - A workspace file's artifact record (owner)
+app.include_router(
+    artifacts_router
+)  # /api/v1/artifacts/{id}/* - Versions, publishing and comments (owner)
 app.include_router(market_data_router)  # /api/v1/market-data/* - Market data proxy
 app.include_router(
     bars_router
@@ -1473,6 +1519,8 @@ app.include_router(
     user_events_router
 )  # /api/v1/users/me/thread-events - Thread lifecycle SSE feed
 app.include_router(features_router)  # /api/v1/features/* - Feature flags (per-user resolved)
+app.include_router(claude_code_router)  # /api/v1/claude-code/* - Claude Code setup token and readiness
+app.include_router(claude_code_computers_router)  # /api/v1/claude-code/computers/* - Claude Code on own computers
 app.include_router(
     watchlist_router
 )  # /api/v1/users/me/watchlist/* - Watchlist management
@@ -1576,6 +1624,9 @@ app.include_router(
 app.include_router(
     wsfiles_router
 )  # /api/v1/wsfiles/g/{grant}/{path} - Grant-gated path-style file serving
+app.include_router(
+    artifact_frame_router
+)  # /api/v1/artifacts/g/{grant}/v/{seq}/{path} - A version's files, without a preview base
 
 app.include_router(
     market_data_ws_router

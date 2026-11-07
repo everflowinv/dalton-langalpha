@@ -21,15 +21,16 @@ from fastapi import HTTPException
 from langgraph.types import Command
 
 from ptc_agent.core.project_context import ProjectContext, run_with_project
-from src.config.settings import get_sse_keepalive_interval
 from src.server.app import setup
 from src.server.database.conversation.threads_read import (
     read_thread_subagents_allowed,
 )
 from src.server.database.user import get_user_profile_for_prompt
 from src.server.database.workspace import update_workspace_activity
+from src.server.services.commands.mirror import mirror_computer
 from src.server.services.computer_disk import TURN_MEASURE_MIN_INTERVAL_SECONDS
 from src.server.services.history.window import runs_held
+from src.server.services.runs.pending_input import needs_resend, pending_input_stamp
 from src.server.services.runs.sse_producer import RunSSEProducer
 from src.server.models.chat import (
     ChatRequest,
@@ -72,8 +73,10 @@ from .request_prep import (
     build_turn_context,
     turn_start_checkpoint_id,
     read_disk_notice,
+    PriorThread,
     ensure_thread,
     keep_named_model,
+    make_thread,
     init_tracking,
     inject_inline_reminders,
     logger,
@@ -99,12 +102,14 @@ from src.server.services.runs.admission import (
     begin_run,
     dedup_retransmit_or_raise,
 )
+from src.server.services.artifacts.comments import CommentSendScope
 from src.server.services.turn_runtime import TurnRoute
 
 from .admission_gate import agent_steer_of, steer_allowed, wait_or_steer
 from .attachments import attach_request_files
 from .error_handling import handle_workflow_error
 from .agent_change import cancel_tool_calls_it_lacks
+from src.llms.claude_code import is_claude_code_model
 from src.server.services.llm.clients import is_own_key_turn
 from src.server.services.llm.config import apply_fetch_override, resolve_llm_config
 from src.server.services.llm.thread_model import NamedModel
@@ -185,6 +190,7 @@ async def astream_ptc_workflow(
     run_metadata: dict | None = None,
     extra_configurable: dict | None = None,
     named_model: NamedModel | None = None,
+    setup_over: asyncio.Event | None = None,
 ):
     """Async generator that streams PTC agent workflow events.
 
@@ -208,6 +214,9 @@ async def astream_ptc_workflow(
     from ``turn_route`` and has no default, so routing decides the workspace
     and the role in one place and no caller runs Home as an analyst by
     leaving one out.
+
+    ``setup_over`` is set once the run's stream is yielding, which keeps the
+    connection alive from there (``SetupKeepaliveResponse``).
     """
     workspace_id = route.workspace_id
     # DALTON-HOOK(colleague-dispatch): resolve workspace owner B and tail-turn / origin-channel metadata
@@ -240,6 +249,7 @@ async def astream_ptc_workflow(
     # Owns the burst lease, admission lock, and open START row until the
     # executor's done-callback is armed (transfer_to_executor below).
     scope = RunScope(user_id=user_id, burst_slot_id=request.burst_slot_id)
+    comments: CommentSendScope | None = None
     try:
         if not setup.agent_config:
             raise HTTPException(
@@ -269,246 +279,300 @@ async def astream_ptc_workflow(
             thread_id, request.request_key, except_job_id=request.steer_job_id
         )
 
-        # =====================================================================
-        # Early steering routing
-        # =====================================================================
-        # If a workflow is already running for this thread, route this POST
-        # into it as a steer *before* any turn row is written. Detecting steering
-        # here keeps ``conversation_queries`` clean — a steering message is
-        # neither a run nor a turn (v4 identity model); its content is archived
-        # on the owning response's metadata at finalize.
-        workspace_manager = WorkspaceManager.get_instance()
-        needs_startup = not workspace_manager.has_ready_session(workspace_id)
-        # When the workspace was evicted/restarted, any in-BTM LocalRunExecution for
-        # this thread holds a stale sandbox reference — cancel it first so
-        # admission/steering routes against live state only (this run isn't
-        # registered anywhere yet; its row commits at START, below).
-        if needs_startup:
-            await manager.cancel_stale_workflow(thread_id)
-        from src.server.services.thread_mutation import ThreadMutationRunner
+        # DALTON-HOOK(artifact-publishing-off): defense in depth for the send
+        # route's own pre-stream check (messaging.py): a request carrying file
+        # comments while artifact publishing is deployment-disabled is refused
+        # here too, before CommentSendScope can take (and later un-take) them.
+        if request.artifact_comment_ids:
+            from src.dalton.settings import is_artifact_publishing_enabled
 
-        # A send held behind a thread mutation (a /compact, the hand-off at a
-        # model switch) is told why it waits, as a cold start is. Not a
-        # dispatch's primer or a steer probe, which read the first frame as
-        # their answer.
-        held_by = (
-            None
-            if dispatched or request.steer_only
-            else await ThreadMutationRunner.get_instance().holding_verb(thread_id)
-        )
-        # Admit a fresh turn, steer the running one, or 409 — see
-        # ``wait_or_steer``; who may steer at all is ``steer_allowed``.
-        admit = partial(
-            wait_or_steer,
-            manager,
-            thread_id,
-            user_input,
-            user_id,
-            steer_only=request.steer_only,
-            platform=request.platform,
-            request_key=request.request_key,
-            workspace_id=workspace_id,
-            steer_job_id=request.steer_job_id,
-            # A hand-off into a running turn answers the dispatch primer
-            # with ``HandOffSteered``: that run's id and the steer's.
-            agent=agent_steer_of(request, dispatched=dispatched, run_id=run_id),
-            can_steer=steer_allowed(
-                request, dispatched=dispatched, steerable=steerable
-            ),
-        )
-        if held_by is None:
-            ready, steering_event = await admit()
-        else:
-            yield _turn_held({"status": "held", "reason": held_by})
-            waiting = asyncio.ensure_future(admit())
-            try:
-                # The wait can outlast an edge proxy's idle cutoff, so the
-                # stream shows it is alive until the turn is admitted.
-                beat = get_sse_keepalive_interval()
-                while not (await asyncio.wait({waiting}, timeout=beat))[0]:
-                    yield ":keepalive\n\n"
-                ready, steering_event = waiting.result()
-            finally:
-                waiting.cancel()
-            yield _turn_held({"status": "released"})
-        if not ready:
-            await scope.release_slot()
-            # Release admission immediately — no workflow will register
-            # under this lock, so holding it would needlessly block any
-            # follow-up POST.
-            scope.release_admission()
-            if steering_event:
-                yield steering_event
-            return
-
-        # =====================================================================
-        # Database Persistence Setup
-        # =====================================================================
-
-        # DALTON-HOOK(colleague-dispatch): pass workspace_owner_id and origin_channel to ensure_thread for colleague thread metadata
-        prior_thread = await ensure_thread(
-            request,
-            thread_id,
-            workspace_id,
-            user_id,
-            initial_query=user_input,
-            **(
-                {
-                    "workspace_owner_id": workspace_owner_id,
-                    "origin_channel": origin_channel,
-                }
-                if workspace_owner_id != str(user_id)
-                else {}
-            ),
-        )
-        # /retry builds its attempt with no surface: it runs where the
-        # attempt it retries did, under the same rules.
-        request, inherits_rules = await retried_on_its_surface(request)
-        disk_free_mb, disk_known = await read_disk_notice(workspace_id)
-        user_profile = await get_user_profile_for_prompt(user_id) if user_id else None
-        # DALTON-HOOK(i18n): a user with no saved users.locale gets the Dalton default (zh-CN), matching the web UI
-        from src.dalton.user_locale import with_default_locale
-
-        user_profile = with_default_locale(user_profile)
-        turn_context = build_turn_context(
-            request,
-            prior_thread,
-            user_profile=user_profile,
-            disk_free_mb=disk_free_mb,
-            disk_known=disk_known,
-            inherits_rules=inherits_rules,
-        )
-
-        query_type, fork = _resolve_fork(request=request, thread_id=thread_id)
-        is_checkpoint_replay = bool(request.checkpoint_id and not request.messages)
-
-        # Resolve LLM config (pre-resolved by the route handler, fallback for
-        # standalone use). Ahead of the metadata below on purpose: that block
-        # records the model and the detected slash command, and both are read
-        # off this config. Resolved late, the standalone path would stamp a
-        # skill the turn then refuses, because activation gates on the
-        # resolved registry while the metadata had nothing to gate on. The
-        # route already resolves before this generator runs, so this only
-        # moves the standalone path onto the ordering production has.
-        if config is None:
-            config = await resolve_llm_config(
-                setup.agent_config,
-                user_id,
-                request.llm_model,
-                is_byok,
-                reasoning_effort=getattr(request, "reasoning_effort", None),
-                fast_mode=getattr(request, "fast_mode", None),
-                thread_id=thread_id,
-                enabled_subagents=request.subagents_enabled,
-                workspace_id=workspace_id,
-                role=route.role,
-            )
-
-        # Persist query start
-        feedback_action = None
-        query_content = user_input
-        effective_model = config.llm.name if config and config.llm else None
-        # DALTON-HOOK(turn-row-model-line): the anchor row states the model
-        # the server resolved for this turn (the automation's llm_model, a
-        # client-named model, or the account default) as a settled fact.
-        turn_context = with_resolved_model(turn_context, effective_model)
-        # Off the resolved credential, not off ``is_byok``: that flag answers
-        # which ladder to try, and an automation with only an OAuth token
-        # passes it false while still paying its own vendor bill.
-        own_key = is_own_key_turn(config)
-        query_metadata = {
-            # The resolved one: a request may name a former Home row.
-            "workspace_id": workspace_id,
-        }
-        if effective_model:
-            query_metadata["llm_model"] = effective_model
-        query_metadata.update(provenance_metadata(request))
-
-        # Extract attachment and context metadata for display in history
-        # (skipped for HITL resumes)
-        widget_ctxs = parse_widget_contexts(request.additional_context)
-        chart_selections = parse_chart_selection_contexts(request.additional_context)
-        if request.additional_context and not request.hitl_response:
-            multimodal_ctxs = parse_multimodal_contexts(request.additional_context)
-            # A retry writes no query row, so a second upload would be
-            # stored for nothing.
-            if multimodal_ctxs and not request.retry_of_run_id:
-                query_metadata["attachments"] = await build_attachment_metadata(
-                    multimodal_ctxs, thread_id
-                )
-            if widget_ctxs:
-                query_metadata["widget_contexts"] = (
-                    serialize_widget_contexts_for_metadata(widget_ctxs)
-                )
-            if chart_selections:
-                query_metadata["chart_selections"] = (
-                    serialize_chart_selections_for_metadata(chart_selections)
+            if not is_artifact_publishing_enabled():
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "artifact_publishing_disabled",
+                        "message": "File comments are disabled on this deployment.",
+                    },
                 )
 
-        # Persist lightweight additional_context + slash command fallback
-        # (serialize_context_metadata's slash-command branch already guards
-        # on `not request.hitl_response`, so this is safe to call always.)
-        if not request.hitl_response:
-            serialize_context_metadata(
-                request,
-                query_metadata,
-                user_input,
-                extra_commands=user_skill_commands(config),
-                allowed_skills=turn_skill_names(config),
-            )
-
-        if request.hitl_response:
-            prepared = process_hitl_response(request)
-            feedback_action = prepared.feedback_action
-            query_content = prepared.query_content
-            query_metadata.update(prepared.metadata)
-
-        # =====================================================================
-        # START txn (v4): query row + in_progress run row + thread projection
-        # in one transaction (begin_run owns the attempt-chain derivation).
-        # =====================================================================
-        # Resolved ONCE and reused by the tracker re-mark below: the raw
-        # request field is empty on public follow-ups (HITL resume, user
-        # continuation), and stamping the durable row with the inherited gen
-        # while re-marking the tracker with None would make a live admitted
-        # run read as unadmitted to the fenced-teardown probe.
-        origin_meta = await _resolve_origin_meta(request, thread_id)
-        carried = await carry.carried_pair(request, thread_id)
-        # A resume or a retry names no automation run of its own: it sends for
-        # the one the turn it continues sent for.
-        if automation_delivery.delivery_of_turn(extra_configurable or {}) is None:
-            sends_for = await carry.carried_delivery(request, thread_id)
-            if sends_for:
-                extra_configurable = {**(extra_configurable or {}), **sends_for}
-        run_handle = await begin_run(
-            request,
-            scope=scope,
+        # File comments go out as this send's message, taken under its key
+        # here because admission needs the message; the scope gives them back
+        # if the send fails before a run or a steer takes it.
+        async with CommentSendScope(
             thread_id=thread_id,
-            run_id=run_id,
-            workspace_id=workspace_id,
             user_id=user_id,
-            is_byok=is_byok,
-            query_content=query_content,
-            query_type=query_type,
-            feedback_action=feedback_action,
-            query_metadata=query_metadata,
-            fork=fork,
-            is_checkpoint_replay=is_checkpoint_replay,
-            extra_run_metadata={
-                **origin_meta,
-                **carried,
-                **surface_stamp(
-                    request, prior_thread, inherits_rules=turn_context.inherits_rules
+            chief_of_staff=route.role == "chief_of_staff",
+            timezone=request.timezone,
+        ) as comments:
+            request, user_input = await comments.take(
+                request,
+                user_input,
+                make_thread=partial(
+                    make_thread,
+                    request,
+                    thread_id,
+                    workspace_id,
+                    user_id,
+                    # DALTON-HOOK(colleague-dispatch): a thread comments.take
+                    # creates in a colleague's workspace carries the same
+                    # dispatched_by metadata ensure_thread would stamp.
+                    workspace_owner_id=workspace_owner_id,
+                    origin_channel=origin_channel,
+                    is_colleague_turn=workspace_owner_id != str(user_id),
                 ),
-                **automation_delivery.turn_metadata(extra_configurable),
-                **(run_metadata or {}),
-            },
-        )
-        # DALTON-HOOK(colleague-dispatch): promote to tail_turn_no_new_work when START lock re-check admitted a tail turn after revocation
-        if getattr(run_handle, "tail_turn_no_new_work", False):
-            tail_turn_no_new_work = True
-            if isinstance(run_metadata, dict):
-                run_metadata["tail_turn_no_new_work"] = True
+            )
+
+            # =====================================================================
+            # Early steering routing
+            # =====================================================================
+            # If a workflow is already running for this thread, route this POST
+            # into it as a steer *before* any turn row is written. Detecting steering
+            # here keeps ``conversation_queries`` clean — a steering message is
+            # neither a run nor a turn (v4 identity model); its content is archived
+            # on the owning response's metadata at finalize.
+            workspace_manager = WorkspaceManager.get_instance()
+            needs_startup = not workspace_manager.has_ready_session(workspace_id)
+            # When the workspace was evicted/restarted, any in-BTM LocalRunExecution for
+            # this thread holds a stale sandbox reference — cancel it first so
+            # admission/steering routes against live state only (this run isn't
+            # registered anywhere yet; its row commits at START, below).
+            if needs_startup:
+                await manager.cancel_stale_workflow(thread_id)
+            from src.server.services.thread_mutation import ThreadMutationRunner
+
+            # A send held behind a thread mutation (a /compact, the hand-off at a
+            # model switch) is told why it waits, as a cold start is. Not a
+            # dispatch's primer or a steer probe, which read the first frame as
+            # their answer.
+            held_by = (
+                None
+                if dispatched or request.steer_only
+                else await ThreadMutationRunner.get_instance().holding_verb(thread_id)
+            )
+            # Admit a fresh turn, steer the running one, or 409 — see
+            # ``wait_or_steer``; who may steer at all is ``steer_allowed``.
+            admit = partial(
+                wait_or_steer,
+                manager,
+                thread_id,
+                user_input,
+                user_id,
+                steer_only=request.steer_only,
+                platform=request.platform,
+                request_key=request.request_key,
+                workspace_id=workspace_id,
+                steer_job_id=request.steer_job_id,
+                # A hand-off into a running turn answers the dispatch primer
+                # with ``HandOffSteered``: that run's id and the steer's.
+                agent=agent_steer_of(request, dispatched=dispatched, run_id=run_id),
+                can_steer=steer_allowed(
+                    request, dispatched=dispatched, steerable=steerable
+                ),
+                artifact_comments=request.artifact_comments,
+            )
+            if held_by is None:
+                ready, steering_event = await admit()
+            else:
+                yield _turn_held({"status": "held", "reason": held_by})
+                ready, steering_event = await admit()
+                yield _turn_held({"status": "released"})
+            if not ready:
+                # Steered: the running turn, or the turn it becomes, has it.
+                await comments.admitted()
+                await scope.release_slot()
+                # Release admission immediately — no workflow will register
+                # under this lock, so holding it would needlessly block any
+                # follow-up POST.
+                scope.release_admission()
+                if steering_event:
+                    yield steering_event
+                return
+
+            # =====================================================================
+            # Database Persistence Setup
+            # =====================================================================
+
+            if comments.made_thread:
+                prior_thread = PriorThread()
+            else:
+                # DALTON-HOOK(colleague-dispatch): pass workspace_owner_id and origin_channel to ensure_thread for colleague thread metadata
+                prior_thread = await ensure_thread(
+                    request,
+                    thread_id,
+                    workspace_id,
+                    user_id,
+                    initial_query=user_input,
+                    row_ensured=comments.row_ensured,
+                    **(
+                        {
+                            "workspace_owner_id": workspace_owner_id,
+                            "origin_channel": origin_channel,
+                        }
+                        if workspace_owner_id != str(user_id)
+                        else {}
+                    ),
+                )
+            # /retry builds its attempt with no surface: it runs where the
+            # attempt it retries did, under the same rules.
+            request, inherits_rules = await retried_on_its_surface(request)
+            disk_free_mb, disk_known = await read_disk_notice(workspace_id)
+            user_profile = (
+                await get_user_profile_for_prompt(user_id) if user_id else None
+            )
+            # DALTON-HOOK(i18n): a user with no saved users.locale gets the Dalton default (zh-CN), matching the web UI
+            from src.dalton.user_locale import with_default_locale
+
+            user_profile = with_default_locale(user_profile)
+            turn_context = build_turn_context(
+                request,
+                prior_thread,
+                user_profile=user_profile,
+                disk_free_mb=disk_free_mb,
+                disk_known=disk_known,
+                inherits_rules=inherits_rules,
+                sent_at=start_time,
+            )
+
+            query_type, fork = _resolve_fork(request=request, thread_id=thread_id)
+            is_checkpoint_replay = bool(request.checkpoint_id and not request.messages)
+
+            # Resolve LLM config (pre-resolved by the route handler, fallback for
+            # standalone use). Ahead of the metadata below on purpose: that block
+            # records the model and the detected slash command, and both are read
+            # off this config. Resolved late, the standalone path would stamp a
+            # skill the turn then refuses, because activation gates on the
+            # resolved registry while the metadata had nothing to gate on. The
+            # route already resolves before this generator runs, so this only
+            # moves the standalone path onto the ordering production has.
+            if config is None:
+                config = await resolve_llm_config(
+                    setup.agent_config,
+                    user_id,
+                    request.llm_model,
+                    is_byok,
+                    reasoning_effort=getattr(request, "reasoning_effort", None),
+                    fast_mode=getattr(request, "fast_mode", None),
+                    thread_id=thread_id,
+                    enabled_subagents=request.subagents_enabled,
+                    workspace_id=workspace_id,
+                    role=route.role,
+                )
+
+            # Persist query start
+            feedback_action = None
+            query_content = user_input
+            effective_model = config.llm.name if config and config.llm else None
+            # DALTON-HOOK(turn-row-model-line): the anchor row states the model
+            # the server resolved for this turn (the automation's llm_model, a
+            # client-named model, or the account default) as a settled fact.
+            turn_context = with_resolved_model(turn_context, effective_model)
+            # Off the resolved credential, not off ``is_byok``: that flag answers
+            # which ladder to try, and an automation with only an OAuth token
+            # passes it false while still paying its own vendor bill.
+            own_key = is_own_key_turn(config)
+            query_metadata = {
+                # The resolved one: a request may name a former Home row.
+                "workspace_id": workspace_id,
+            }
+            if effective_model:
+                query_metadata["llm_model"] = effective_model
+            query_metadata.update(provenance_metadata(request))
+
+            # Extract attachment and context metadata for display in history
+            # (skipped for HITL resumes)
+            widget_ctxs = parse_widget_contexts(request.additional_context)
+            chart_selections = parse_chart_selection_contexts(
+                request.additional_context
+            )
+            if request.additional_context and not request.hitl_response:
+                multimodal_ctxs = parse_multimodal_contexts(request.additional_context)
+                # A retry writes no query row, so a second upload would be
+                # stored for nothing.
+                if multimodal_ctxs and not request.retry_of_run_id:
+                    query_metadata["attachments"] = await build_attachment_metadata(
+                        multimodal_ctxs, thread_id
+                    )
+                if widget_ctxs:
+                    query_metadata["widget_contexts"] = (
+                        serialize_widget_contexts_for_metadata(widget_ctxs)
+                    )
+                if chart_selections:
+                    query_metadata["chart_selections"] = (
+                        serialize_chart_selections_for_metadata(chart_selections)
+                    )
+
+            # Persist lightweight additional_context + slash command fallback
+            # (serialize_context_metadata's slash-command branch already guards
+            # on `not request.hitl_response`, so this is safe to call always.)
+            if not request.hitl_response:
+                serialize_context_metadata(
+                    request,
+                    query_metadata,
+                    user_input,
+                    extra_commands=user_skill_commands(config),
+                    allowed_skills=turn_skill_names(config),
+                )
+
+            if request.artifact_comments:
+                query_metadata["artifact_comments"] = (
+                    request.artifact_comments.model_dump(mode="json")
+                )
+
+            if request.hitl_response:
+                prepared = process_hitl_response(request)
+                feedback_action = prepared.feedback_action
+                query_content = prepared.query_content
+                query_metadata.update(prepared.metadata)
+
+            # =====================================================================
+            # START txn (v4): query row + in_progress run row + thread projection
+            # in one transaction (begin_run owns the attempt-chain derivation).
+            # =====================================================================
+            # Resolved ONCE and reused by the tracker re-mark below: the raw
+            # request field is empty on public follow-ups (HITL resume, user
+            # continuation), and stamping the durable row with the inherited gen
+            # while re-marking the tracker with None would make a live admitted
+            # run read as unadmitted to the fenced-teardown probe.
+            origin_meta = await _resolve_origin_meta(request, thread_id)
+            carried = await carry.carried_pair(request, thread_id)
+            # A resume or a retry names no automation run of its own: it sends for
+            # the one the turn it continues sent for.
+            if automation_delivery.delivery_of_turn(extra_configurable or {}) is None:
+                sends_for = await carry.carried_delivery(request, thread_id)
+                if sends_for:
+                    extra_configurable = {**(extra_configurable or {}), **sends_for}
+            run_handle = await begin_run(
+                request,
+                scope=scope,
+                thread_id=thread_id,
+                run_id=run_id,
+                workspace_id=workspace_id,
+                user_id=user_id,
+                is_byok=is_byok,
+                query_content=query_content,
+                query_type=query_type,
+                feedback_action=feedback_action,
+                query_metadata=query_metadata,
+                fork=fork,
+                is_checkpoint_replay=is_checkpoint_replay,
+                extra_run_metadata={
+                    **origin_meta,
+                    **carried,
+                    **surface_stamp(
+                        request,
+                        prior_thread,
+                        inherits_rules=turn_context.inherits_rules,
+                    ),
+                    **automation_delivery.turn_metadata(extra_configurable),
+                    **(run_metadata or {}),
+                },
+            )
+            # DALTON-HOOK(colleague-dispatch): promote to tail_turn_no_new_work when START lock re-check admitted a tail turn after revocation
+            if getattr(run_handle, "tail_turn_no_new_work", False):
+                tail_turn_no_new_work = True
+                if isinstance(run_metadata, dict):
+                    run_metadata["tail_turn_no_new_work"] = True
+            await comments.admitted()
         if not is_checkpoint_replay:
             logger.debug(
                 f"[PTC_CHAT] Run started: workspace_id={workspace_id} "
@@ -708,6 +772,9 @@ async def astream_ptc_workflow(
         # One relay session per directly bound server, held for the run.
         direct_mcp = inputs.direct_mcp
 
+        # The user's other computers this turn's calls run on, which its end
+        # backs up beside its own.
+        reached_computers: set[str] = set()
         # DALTON-HOOK(colleague-dispatch): strip Task/schedule_wakeup on post-revocation tail turn
         ptc_graph = await build_ptc_graph_with_session(
             session=session,
@@ -745,6 +812,7 @@ async def astream_ptc_workflow(
             subagent_switch=partial(read_thread_subagents_allowed, thread_id),
             window_coverage=partial(runs_held, thread_id),
             cancel_notices=ThreadCancelNotices(thread_id, turn_context.tool_timezone),
+            reached_computers=reached_computers,
         )
 
         _mark_phase("graph_build")
@@ -754,15 +822,21 @@ async def astream_ptc_workflow(
         )
         cancelled_calls = []
         if (
-            route.role == "chief_of_staff"
+            (route.role == "chief_of_staff" or not is_claude_code_model(effective_model))
             and request.hitl_response
             and not request.checkpoint_id
         ):
             # A Home thread the retired Flash agent ran may be waiting on a
-            # step only Flash had. A resume has no base: the route refused one
+            # step only Flash had, and a thread Claude Code paused on one only
+            # its graph runs. A resume has no base: the route refused one
             # whose pause is off the branch, so the newest checkpoint is the
             # pause it answers.
-            cancelled_calls = await cancel_tool_calls_it_lacks(ptc_graph, thread_id)
+            cancelled_calls = await cancel_tool_calls_it_lacks(
+                ptc_graph,
+                thread_id,
+                user_id=user_id,
+                by_name=route.role == "chief_of_staff",
+            )
 
         if session.sandbox:
             sandbox_id = getattr(session.sandbox, "sandbox_id", None)
@@ -983,6 +1057,11 @@ async def astream_ptc_workflow(
                 logger.warning(
                     f"[PTC_COMPLETE] file backup failed for {thread_id}: {e}"
                 )
+            # What the Chief of Staff wrote on another computer has no turn of
+            # that computer's own to sweep it, so the mirror is owed until one
+            # succeeds, as a command's end there owes it.
+            for computer_id in sorted(reached_computers):
+                await mirror_computer(computer_id)
             # A turn is what fills the shared disk, so its end is when the
             # reading the warning and the next turn's context rely on moves.
             if session and session.computer_id:
@@ -1072,6 +1151,8 @@ async def astream_ptc_workflow(
         # via XREAD BLOCK. The workflow runs as a fully detached background
         # task — disconnect cannot reach it.
         async for event in stream_from_log(thread_id, run_id, last_event_id=None):
+            if setup_over is not None:
+                setup_over.set()
             yield event
 
     except (asyncio.CancelledError, GeneratorExit):
@@ -1081,6 +1162,8 @@ async def astream_ptc_workflow(
                 f"thread_id={thread_id} workspace_id={workspace_id}"
             )
             await scope.fail_open("client disconnected during setup")
+            if comments is not None:
+                await comments.run_never_began()
         else:
             logger.warning(
                 f"[PTC_CHAT] Generator cancelled (client disconnect?): "
@@ -1095,6 +1178,14 @@ async def astream_ptc_workflow(
         # run was never dispatched (nothing durable exists yet).
         if dispatched and run_handle is None:
             raise
+        # A resend carries these comments again under a key of its own, so they
+        # wait again before the frame asking for it goes out.
+        if (
+            comments is not None
+            and scope.owned_run_handle is not None
+            and needs_resend(pending_input_stamp(request))
+        ):
+            await comments.run_never_began()
         # =====================================================================
         # Error Recovery with Retry Logic
         # =====================================================================

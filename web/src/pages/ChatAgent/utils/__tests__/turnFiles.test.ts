@@ -257,6 +257,45 @@ describe('collectTurnFiles', () => {
     ]);
   });
 
+  it('opens a file on another computer in the workspace whose folder holds it, and nothing else there', () => {
+    // The Chief of Staff links a file there at its whole path on that machine.
+    // The rest of that machine is not one this view reads: a card would read
+    // the path on this computer and, missing, offer a file that shares its name.
+    const ssh = '/home/nosudo/langalpha-2';
+    const folders: ComputerFolders = {
+      ...own('Home', [], [{ workspaceId: 'ws-nvda', dirName: 'NVDA' }]),
+      otherRoots: [ssh],
+      otherComputers: [{ root: ssh, workspaces: [{ workspaceId: 'ws-ssh', dirName: 'ssh-e2e' }] }],
+    };
+    const files = collectTurnFiles(
+      [assistant(
+        `See [q3](${ssh}/ssh-e2e/reports/q3.md), [the deck](file://${ssh}/ssh-e2e/deck.pptx), `
+        + `[its notes](${ssh}/ssh-e2e/agent.md), [a stray](${ssh}/scratch/x.csv) and [a local one](/tmp/out.csv).`,
+        { a: write(0, `${ssh}/scratch/y.csv`), b: write(1, `${ssh}/ssh-e2e/data/z.csv`) },
+      )],
+      folders,
+    );
+    expect(files).toEqual([
+      { path: 'reports/q3.md', workspaceId: 'ws-ssh' },
+      { path: 'deck.pptx', workspaceId: 'ws-ssh' },
+      { path: '/tmp/out.csv' },
+      { path: 'data/z.csv', workspaceId: 'ws-ssh' },
+    ]);
+  });
+
+  it('gives no card to a write that names a computer, which wrote on that one', () => {
+    // A relative path there is under that computer's root, and a card would
+    // read it on this one, where a file of that name may well exist.
+    const onIt = (order: number, path: string) => {
+      const call = write(order, path);
+      return { ...call, toolCall: { args: { ...call.toolCall.args, computer: 'final-qa' } } };
+    };
+    const files = collectTurnFiles([
+      assistant('', { a: onIt(0, 'report.md'), b: onIt(1, '/home/nosudo/langalpha-2/ssh-e2e/z.csv'), c: write(2, 'notes.md') }),
+    ]);
+    expect(files).toEqual([{ path: 'notes.md' }]);
+  });
+
   it('leaves out system paths, section links and folders', () => {
     const files = collectTurnFiles([
       assistant('[skills](.agents/skills/report/SKILL.md), [a section](#findings), [a folder](results/), [a route](/settings)'),

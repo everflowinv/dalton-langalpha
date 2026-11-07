@@ -28,6 +28,7 @@ from ptc_agent.core.session import Session
 
 from src.server.database.workspace import get_live_workspace_ids_for_computer
 from src.server.database.workspace_file import get_scan_marks_for_computer
+from src.server.models.computer import ComputerStatus
 from src.server.services.persistence.sync_result import BackupIncomplete, UnsavedFile
 from src.server.services.persistence.transfer import (
     ScanMark,
@@ -156,21 +157,61 @@ class MachineBackupMixin:
         entry. Without a sandbox to sweep, or if the sweep fails, only the
         turn's project is mirrored, which is what a turn did before.
         """
+        await self._backup_changes(await self.resolve_binding(workspace_id), session)
+
+    async def backup_computer_changes(self, computer_id: str) -> bool:
+        """After calls from another computer's turn ran on ``computer_id``, or
+        the commands they left there ended, mirror every project there that
+        changed. No turn of that computer's own sweeps what they wrote, and its
+        stop backup may be far off. Only through a live session this worker
+        holds: attaching runs the machine's start path, which may rebuild it at
+        another tier, or build a fresh one, from the backup this would have
+        brought up to date. False when this worker holds none, so the mirror
+        is owed to the worker that does (``commands.mirror``). Raises
+        ``BackupIncomplete`` when a project there was left unmirrored, since
+        no turn there will sweep it again."""
+        from src.server.database.computer import get_computer
+
+        computer = await get_computer(computer_id)
+        if computer is None or computer.get("status") != ComputerStatus.RUNNING:
+            # Gone, or stopped and so mirrored at its stop.
+            return True
+        binding = self._binding_from_computer("", computer)
+        if not binding.files_backup:
+            return True
+        session = self.cached_session_for_computer(computer)
+        if session is None:
+            return False
+        if not await self._backup_changes(binding, session):
+            raise BackupIncomplete(
+                f"computer {computer_id}: a changed project was left unmirrored"
+            )
+        return True
+
+    async def _backup_changes(
+        self, binding: ComputerBinding, session: Optional[Session]
+    ) -> bool:
+        """Whether every project it set out to mirror was mirrored."""
         started = time.monotonic()
-        binding = await self.resolve_binding(workspace_id)
         if not binding.files_backup:
             # Its owner chose so; the last backup stays as it was.
-            return
+            return True
         session = session or self._cached_session(binding.computer_id)
-        ordered, layouts, sweep = [workspace_id], {}, None
+        ordered = [binding.workspace_id] if binding.workspace_id else []
+        layouts, sweep = {}, None
         if getattr(session, "sandbox", None):
             try:
                 ordered, layouts, sweep = await self._changed_projects(binding, session)
             except Exception as e:
                 logger.warning(
                     f"[backup-sweep] computer {binding.computer_id}: sweep failed "
-                    f"({type(e).__name__}: {e}); mirroring the turn's project only"
+                    f"({type(e).__name__}: {e}); mirroring "
+                    + ("the turn's project only" if ordered else "every project")
                 )
+                if not ordered:
+                    # A computer another's turn reached holds no project of
+                    # that turn's: every project there, as its stop mirrors.
+                    ordered = await get_live_workspace_ids_for_computer(binding.computer_id)
         swept_at = time.monotonic()
         mirrored = await self._mirror_projects(
             binding.computer_id,
@@ -191,6 +232,7 @@ class MachineBackupMixin:
                 f"mirrored {mirrored}/{len(ordered)} in "
                 f"{int((time.monotonic() - swept_at) * 1000)} ms"
             )
+        return mirrored == len(ordered)
 
     async def _changed_projects(
         self, binding: ComputerBinding, session: Session

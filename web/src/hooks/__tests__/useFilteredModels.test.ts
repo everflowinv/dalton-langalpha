@@ -7,8 +7,12 @@ import {
   buildConfiguredSet,
   buildVisibleModels,
   dropMissingModels,
+  gatewaySlug,
+  planKeyHolders,
+  withCustomModels,
 } from '../useFilteredModels';
 import type { ModelMetadataEntry } from '../useFilteredModels';
+import { CLAUDE_CODE_CONNECTION } from '@/lib/claudeCode';
 import type { ConfiguredProvider } from '../useConfiguredProviders';
 import type { ProviderModelsData } from '@/components/model/types';
 import type { PlatformModelsResponse } from '@/types/platform';
@@ -582,6 +586,39 @@ describe('buildVisibleModels', () => {
   });
 });
 
+describe('withCustomModels on a gateway pick', () => {
+  const raw: Record<string, ModelMetadataEntry> = {
+    'glm-5.3': { provider: 'z-ai', prompt_guidance: 'lean', compaction_profile: 'expansive', display_name: 'GLM 5.3' },
+  };
+  const gateway = { routes: ['gw', 'gw-chat'], models: { 'glm-5-3': 'glm-5.3' }, borrows: { gw: ['glm-5.3'] } };
+  const pick = { name: 'gw/glm-5.3', model_id: 'z-ai/glm-5.3:free', provider: 'gw-chat' };
+
+  it('reads an id as the server does', () => {
+    expect(gatewaySlug('anthropic/claude-sonnet-5.5:beta')).toBe('claude-sonnet-5-5');
+    expect(gatewaySlug('GLM-5.3')).toBe('glm-5-3');
+  });
+
+  it("takes the matched built-in's tuning defaults, on its own provider", () => {
+    const entry = withCustomModels(raw, [pick], () => 'glm', gateway)[pick.name];
+    expect(entry).toMatchObject({ provider: 'gw-chat', is_custom_model: true, prompt_guidance: 'lean', compaction_profile: 'expansive' });
+    expect(entry.display_name).toBeUndefined();
+  });
+
+  it("takes the built-in's effort ladder only on a route the server says carries it", () => {
+    const meta = { 'glm-5.3': { ...raw['glm-5.3'], reasoning_efforts: ['low', 'high'], reasoning_effort_default: 'high' } };
+    const on = (provider: string) => withCustomModels(meta, [{ ...pick, provider }], () => 'glm', gateway)[pick.name];
+    expect(on('gw')).toMatchObject({ reasoning_efforts: ['low', 'high'], reasoning_effort_default: 'high' });
+    expect(on('gw-chat').reasoning_efforts).toBeUndefined();
+  });
+
+  it('leaves an entry on any other provider, and one declaring its own, as they are', () => {
+    const own = withCustomModels(raw, [{ ...pick, provider: 'other' }], () => 'openai', gateway)[pick.name];
+    expect(own.prompt_guidance).toBeUndefined();
+    const declared = withCustomModels(raw, [{ ...pick, prompt_guidance: 'detailed' }], () => 'glm', gateway)[pick.name];
+    expect(declared.prompt_guidance).toBe('detailed');
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Variant isolation — configuring a coding-plan variant does NOT unlock the
 // parent brand's catalog. Variant keys and endpoints are distinct from the
@@ -714,6 +751,46 @@ describe('oauth_plans gate', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Claude Code — listed only while the server runs it for the user
+// ---------------------------------------------------------------------------
+
+describe('Claude Code models', () => {
+  const rawApiModels = {
+    anthropic: { models: ['claude-x'], display_name: 'Anthropic' },
+    'claude-code': { models: ['claude-x-code'], display_name: 'Claude Code' },
+  };
+  const rawMetadata: Record<string, ModelMetadataEntry> = {
+    'claude-x': { provider: 'anthropic', access_type: 'api_key', tier: 0 },
+    'claude-x-code': { provider: 'claude-code', sdk: 'claude-code', access_type: 'oauth' },
+  };
+  const anthropicKey: ConfiguredProvider = { provider: 'anthropic', display_name: 'Anthropic', access_type: 'api_key' };
+  const platform = { tier: 0, model_tier: 0, byok_providers: [], oauth_providers: [] } as unknown as PlatformModelsResponse;
+
+  // Listed or not, each stays in the catalog: a thread may hold one, and only
+  // the server says whether it can run now.
+  it('lists none while the server does not run Claude Code for the user, but keeps them in the catalog', () => {
+    for (const plan of [null, platform]) {
+      const result = buildVisibleModels(rawApiModels, rawMetadata, [], {}, plan, [anthropicKey]);
+      expect(result.models.anthropic?.models).toEqual(['claude-x']);
+      expect(result.models['claude-code']?.models ?? []).toEqual([]);
+      expect(result.validModelNames.has('claude-x-code')).toBe(false);
+      expect(result.rawModels['claude-code']?.models).toEqual(['claude-x-code']);
+    }
+  });
+
+  // Listed, it counts as a connection of its own: no key or sign-in of the
+  // user's is asked for.
+  it('lists them as a provider of their own while it does, through either access filter', () => {
+    for (const plan of [null, platform]) {
+      const access = [anthropicKey, CLAUDE_CODE_CONNECTION];
+      const result = buildVisibleModels(rawApiModels, rawMetadata, [], {}, plan && augmentPlatformWithLocal(plan, access, false), access);
+      expect(result.models.anthropic?.models).toEqual(['claude-x']);
+      expect(result.models['claude-code']?.models).toEqual(['claude-x-code']);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // dropMissingModels — a connection's own list hides what it cannot run
 // ---------------------------------------------------------------------------
 
@@ -770,5 +847,24 @@ describe('dropMissingModels', () => {
     );
     expect(build('glm-x').models['z-ai-coding']?.models ?? []).toEqual([]);
     expect(build('glm-x-house').models['z-ai-coding']?.models).toEqual(['glm-x']);
+  });
+});
+
+describe('planKeyHolders', () => {
+  const cn = { provider: 'plan-cn', display_name: 'Plan', access_type: 'coding_plan' as const };
+  const brandKey = { provider: 'brand', display_name: 'Brand', access_type: 'api_key' as const };
+  const candidates = {
+    plan: { slugs: ['plan', 'plan-cn'], shared: ['plan-cn'] },
+    'brand-x': { slugs: ['brand-x', 'brand'], shared: ['brand'] },
+    'plan-cn': { slugs: ['plan-cn', 'plan'], shared: ['plan'] },
+  };
+
+  it("maps a plan slug to the connection holding the plan's key under another slug", () => {
+    expect([...planKeyHolders([cn, brandKey], candidates)]).toEqual([['plan', cn]]);
+  });
+
+  it('maps nothing the user holds a key under itself', () => {
+    const intl = { ...cn, provider: 'plan' };
+    expect(planKeyHolders([cn, intl], candidates).size).toBe(0);
   });
 });

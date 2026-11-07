@@ -335,6 +335,23 @@ class SandboxRuntime(ABC):
         keeps this default."""
         return await self.exec(command, timeout, env=env)
 
+    async def login_home(self) -> str:
+        """The home ``~`` names for the user commands run as; empty when the
+        machine does not say."""
+        result = await self.exec('printf %s "$HOME"', timeout=15)
+        home = result.stdout.strip() if result.exit_code == 0 else ""
+        return home if home.startswith("/") else ""
+
+    # Whether ``login_config_home`` asks the machine. One that does not
+    # answers without reaching it, so its answer is no call the machine served.
+    says_config_home: ClassVar[bool] = False
+
+    async def login_config_home(self) -> str:
+        """That user's ``$XDG_CONFIG_HOME``, which places LangAlpha's config
+        folder (its Claude Code tokens) on a machine of the user's own; empty
+        when unset or not said. Only an SSH machine says: no other keeps one."""
+        return ""
+
     # -- File I/O --
 
     @abstractmethod
@@ -512,6 +529,10 @@ class SandboxProvider(ABC):
     # What a new computer is called until its owner names it. A user reads the
     # name before anything else about the machine, so it says where it runs.
     default_computer_name: ClassVar[str] = "Cloud computer"
+    # Whether a file read or write here runs as the user a command runs as, so
+    # a file call may reach the whole machine without reaching anything a
+    # command there cannot.
+    files_as_command_user: ClassVar[bool] = True
 
     @classmethod
     def platform_secret_name(cls, name: str) -> str:

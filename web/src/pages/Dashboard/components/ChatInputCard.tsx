@@ -1,6 +1,7 @@
 import React, { useState, useRef, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import ChatInput, { type ChatInputHandle } from '../../../components/ui/chat-input';
+import type { ComposerSend } from '../../../components/ui/chat-input.types';
 import { useChatInput } from '../hooks/useChatInput';
 import { useIsMobile } from '@/hooks/useIsMobile';
 import { MobileFabChat } from '@/components/ui/mobile-fab-chat';
@@ -39,10 +40,19 @@ function ChatInputCard() {
     [t],
   );
 
-  // DALTON-HOOK(composer-drafts): return handleSend result so ChatInput preserves draft on failure
-  const handleMobileSend = (...args: Parameters<typeof handleSend>) => {
-    const result = handleSend(...args);
-    setChatExpanded(false);
+  const sendComposer = ({ message, files, commands, modelOptions }: ComposerSend) =>
+    // DALTON-HOOK(composer-drafts): forward handleSend's boolean outcome so
+    // ChatInput keeps the stored draft when the handoff is refused
+    handleSend(message, files, commands, modelOptions);
+
+  const handleMobileSend = (send: ComposerSend) => {
+    // DALTON-HOOK(composer-drafts): forward the outcome so the mobile
+    // composer keeps its stored draft when the handoff is refused, exactly
+    // as the desktop one does — the panel stays open only on success.
+    const result = sendComposer(send);
+    void Promise.resolve(result).then((sent) => {
+      if (sent !== false) setChatExpanded(false);
+    });
     return result;
   };
 
@@ -117,7 +127,7 @@ function ChatInputCard() {
             ref={chatInputRef}
             // DALTON-HOOK(composer-drafts): persist dashboard desktop composer draft
             draftKey={draftKey}
-            onSend={handleSend}
+            onSend={sendComposer}
             disabled={isLoading}
             scope={scope}
             onScopeChange={setScope}

@@ -6,6 +6,7 @@ and edits those folders, so a Home turn brings each flagged one back first.
 """
 
 from contextlib import asynccontextmanager
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -54,6 +55,7 @@ async def test_home_restores_each_flagged_sibling_on_the_sandbox_it_holds():
         _maybe_restore_files=AsyncMock(side_effect=_restore),
         get_session_for_workspace=AsyncMock(),
     )
+    manager.restore_owed_folders = partial(ProvisioningMixin.restore_owed_folders, manager)
     # The owed list is the database's: a clean sibling is never in it.
     owed_read = AsyncMock(
         return_value={

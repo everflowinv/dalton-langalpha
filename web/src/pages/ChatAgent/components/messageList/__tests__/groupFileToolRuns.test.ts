@@ -36,6 +36,26 @@ describe('file tool grouping', () => {
     expect(groupFileToolRuns(items)).toEqual(items.map((item) => [item]));
   });
 
+  it('keeps reads on another computer out of a run of reads here', () => {
+    // A pill opens its file on this computer, and a call naming a computer
+    // read that one's: a shared run would give both kinds one behavior.
+    const there = (id: string, path: string): ToolActivityItem => ({
+      ...read(id, path), toolCall: { args: { file_path: path, computer: 'Studio Mac' } },
+    });
+    const items = [read('a', 'data/a.csv'), there('b', 'data/b.csv'), there('c', 'data/c.csv')];
+    expect(groupFileToolRuns(items)).toEqual([[items[0]], [items[1], items[2]]]);
+  });
+
+  it('keeps reads on two other computers in two runs', () => {
+    // One path on two machines is two files, which one run would show as one
+    // pill opening the first call.
+    const on = (id: string, computer: string): ToolActivityItem => ({
+      ...read(id, 'data/q3.csv'), toolCall: { args: { file_path: 'data/q3.csv', computer } },
+    });
+    const items = [on('a', 'Studio Mac'), on('b', 'studio  mac'), on('c', 'Lab box')];
+    expect(groupFileToolRuns(items)).toEqual([[items[0], items[1]], [items[2]]]);
+  });
+
   it('groups consecutive failures with each other, not with the successes', () => {
     const ok = read('a', 'data/a.csv');
     const bad1 = failedRead('b', 'data/x.csv');

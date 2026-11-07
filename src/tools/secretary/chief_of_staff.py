@@ -90,7 +90,15 @@ async def chief_of_staff_workspaces(
         dest_workspace_id: Destination for "copy_file" other than Home; must be one of the user's own workspaces.
 
     Returns:
-        Workspace rows (with colleague owner and access level) for "list"; for "create" the new id with `folder_path` and `folder_ready` (before copying or cleaning into a new workspace, confirm `folder_path` exists and is non-empty — until `folder_ready` is true the folder is not on the machine yet); file paths/content for file actions; for "copy_file" the destination path, its absolute `folder_path`, and the size.
+        One short row per workspace, with its id and its folder (dir_name); with more
+        than one computer, also the computer it is on, and for one on another computer
+        than yours, the folder's whole path there (path); plus the colleague-shared
+        workspaces, each with its owner and access level. For "create" the new id with
+        `folder_path` and `folder_ready` (before copying or cleaning into a new
+        workspace, confirm `folder_path` exists and is non-empty — until `folder_ready`
+        is true the folder is not on the machine yet); file paths/content for file
+        actions; for "copy_file" the destination path, its absolute `folder_path`, and
+        the size.
         (DALTON-HOOK(workspace-folder-ready): the create result's folder fields.)
     """
     user_id = config.get("configurable", {}).get("user_id")

@@ -5,6 +5,7 @@ import { MemoryRouter } from 'react-router';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { FilePreviewCard } from '../chat-input.parts';
 import ChatInput from '../chat-input';
+import type { ChatInputProps } from '../chat-input';
 import ImageLightbox from '@/pages/ChatAgent/components/ImageLightbox';
 import type { FileAttachment } from '../chat-input.types';
 
@@ -170,13 +171,13 @@ describe('image preview against the composer container', () => {
   // The composer's own container: its click handler focuses the textarea
   // (chat-input.tsx), which is exactly what an open preview must not let
   // through. An image is staged the way a user would, by pasting it.
-  function renderComposerWithImage() {
+  function renderComposerWithImage(over: Partial<ChatInputProps> = {}) {
     const onSend = vi.fn();
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     render(
       <QueryClientProvider client={queryClient}>
         <MemoryRouter>
-          <ChatInput onSend={onSend} />
+          <ChatInput onSend={onSend} {...over} />
         </MemoryRouter>
       </QueryClientProvider>,
     );
@@ -208,5 +209,18 @@ describe('image preview against the composer container', () => {
     expect(screen.queryByRole('button', { name: 'Close' })).toBeNull();
     expect(document.activeElement).toBe(thumb);
     expect(document.activeElement).not.toBe(textarea);
+  });
+
+  // The host toolbar slot (#657 wrapped it in the fold's measuring span,
+  // where Dalton docks its tray) must not crowd out a staged attachment's
+  // preview.
+  it('opens the preview with a host status docked in the toolbar', async () => {
+    renderComposerWithImage({ toolbarStatus: <span data-testid="tray-dock">queued: 1</span> });
+    await userEvent.click(openButton());
+    const [thumbnail, fullSize] = images();
+    expect(fullSize).not.toBe(thumbnail);
+    expect(screen.getByTestId('tray-dock')).toBeInTheDocument();
+    await userEvent.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog')).toBeNull();
   });
 });

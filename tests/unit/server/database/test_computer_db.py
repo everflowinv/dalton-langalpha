@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from src.server.database import computer as C
+from src.server.database import computer_names as N
 
 COMPUTER_ID = "11111111-1111-4111-8111-111111111111"
 WORKSPACE_ID = "22222222-2222-4222-8222-222222222222"
@@ -71,7 +72,8 @@ def cursor():
 
 @pytest.fixture
 def db(cursor):
-    """Patch the pool at computer.py's import site and mute the pub/sub fan-out."""
+    """Patch the pool at computer.py's import site, and computer_names.py's for
+    the holder a name refusal reads, and mute the pub/sub fan-out."""
     conn = AsyncMock()
 
     @asynccontextmanager
@@ -87,6 +89,7 @@ def db(cursor):
 
     with (
         patch("src.server.database.computer.get_db_connection", new=_fake),
+        patch("src.server.database.computer_names.get_db_connection", new=_fake),
         patch(
             "src.server.services.workspace_status_pubsub.publish_status_change",
             new=AsyncMock(),
@@ -435,6 +438,89 @@ class TestCreate:
         cursor.execute.side_effect = UniqueViolation()
         with pytest.raises(UniqueViolation):
             await C.create_computer(USER_ID, name="Cloud computer")
+
+
+def _name_violation():
+    """The refusal the name index raises, as psycopg reports it."""
+    from types import SimpleNamespace
+
+    from psycopg.errors import UniqueViolation
+
+    class NameViolation(UniqueViolation):
+        diag = SimpleNamespace(constraint_name=N.COMPUTER_NAME_INDEX)
+
+    return NameViolation()
+
+
+class TestNameTaken:
+    """A name says which of the user's computers it means, so the index refuses
+    a second live one; the refusal names the holder for the client to word."""
+
+    @pytest.mark.asyncio
+    async def test_an_insert_the_name_index_refuses_names_the_holder(self, db, cursor):
+        """Not retried as non-primary, which the primary race does: the name
+        stays taken however the row is flagged."""
+        cursor.execute.side_effect = [_name_violation(), None]
+        cursor.fetchone.return_value = {"computer_id": "comp-2", "name": "Research"}
+
+        with pytest.raises(N.ComputerNameTaken) as refused:
+            await C.create_computer(USER_ID, name="research ", is_primary=True)
+
+        assert (refused.value.name, refused.value.computer_id) == ("Research", "comp-2")
+        assert cursor.execute.await_count == 2
+        sql = _sql(cursor)
+        assert "SELECT computer_id, name FROM computers" in sql
+        assert (
+            r"lower(btrim(regexp_replace(name, '\s+', ' ', 'g')))"
+            r" = lower(btrim(regexp_replace(%(name)s, '\s+', ' ', 'g')))"
+        ) in sql
+        assert "status <> 'deleted'" in sql
+        assert _params(cursor) == {"user_id": USER_ID, "name": "research "}
+
+    @pytest.mark.asyncio
+    async def test_a_rename_is_of_the_users_own_computer_only(self, db, cursor):
+        """Ownership is in the update itself, so a row of another user's is
+        never renamed between a check and the write."""
+        await C.rename_computer(COMPUTER_ID, "Lab", user_id=USER_ID)
+
+        assert "WHERE computer_id = %s AND user_id = %s" in _sql(cursor)
+        assert _params(cursor) == ("Lab", COMPUTER_ID, USER_ID)
+
+    @pytest.mark.asyncio
+    async def test_a_rename_the_name_index_refuses_names_another_holder(
+        self, db, cursor
+    ):
+        """The index never compares a row with its own old version, so the
+        holder is another computer and is read without excluding this one."""
+        cursor.execute.side_effect = [_name_violation(), None]
+        cursor.fetchone.return_value = {"computer_id": "comp-2", "name": "Lab"}
+
+        with pytest.raises(N.ComputerNameTaken) as refused:
+            await C.rename_computer(COMPUTER_ID, "lab", user_id=USER_ID)
+
+        assert (refused.value.name, refused.value.computer_id) == ("Lab", "comp-2")
+        assert cursor.execute.await_count == 2
+        assert _params(cursor) == {"user_id": USER_ID, "name": "lab"}
+
+    @pytest.mark.asyncio
+    async def test_a_holder_gone_by_the_lookup_still_refuses_the_name(
+        self, db, cursor
+    ):
+        cursor.execute.side_effect = [_name_violation(), None]
+        cursor.fetchone.return_value = None
+
+        with pytest.raises(N.ComputerNameTaken) as refused:
+            await C.create_computer(USER_ID, name="Research")
+
+        assert (refused.value.name, refused.value.computer_id) == ("Research", None)
+
+    @pytest.mark.asyncio
+    async def test_any_other_violation_on_a_rename_is_not_a_name(self, db, cursor):
+        from psycopg.errors import UniqueViolation
+
+        cursor.execute.side_effect = UniqueViolation()
+        with pytest.raises(UniqueViolation):
+            await C.rename_computer(COMPUTER_ID, "Lab", user_id=USER_ID)
 
 
 class TestPublishFanOut:

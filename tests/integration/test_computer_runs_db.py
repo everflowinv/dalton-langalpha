@@ -10,6 +10,7 @@ nothing, and that two folds of one run count nothing twice.
 from __future__ import annotations
 
 import asyncio
+import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -35,7 +36,8 @@ pytestmark = [pytest.mark.integration, pytest.mark.asyncio(loop_scope="session")
 
 async def _computer(seed_user, *, kind="daytona", status="stopped", ref="sb-1"):
     computer = await create_computer(
-        seed_user["user_id"], kind=kind, name=f"{kind} box", status=status,
+        seed_user["user_id"], kind=kind, name=f"{kind} box {uuid.uuid4().hex[:8]}",
+        status=status,
         provider_ref=ref,
     )
     return str(computer["computer_id"])

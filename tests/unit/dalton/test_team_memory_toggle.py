@@ -527,7 +527,7 @@ async def test_colleague_turn_in_enabled_workspace_uses_workspace_setting(
     monkeypatch.setattr(
         graph_mod,
         "_read_harness_blocks",
-        create_autospec(graph_mod._read_harness_blocks, return_value={}),
+        create_autospec(graph_mod._read_harness_blocks, return_value=({}, None)),
     )
     monkeypatch.setattr(
         vault_db,

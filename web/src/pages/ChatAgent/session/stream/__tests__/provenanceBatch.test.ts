@@ -223,6 +223,9 @@ describe('createProvenanceFrameBuffer', () => {
       setTokenUsage: vi.fn(),
       setFallbackSuggestion: vi.fn(),
       setMessageError: vi.fn(),
+      // The runtime's run_end reads these since upstream's cold summary (sync3 B12).
+      setNextSummary: vi.fn(),
+      nextSummaryOwedRef: { current: false },
       t: (k: string) => k,
     };
     const deps = {

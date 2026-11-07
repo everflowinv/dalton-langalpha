@@ -30,7 +30,14 @@ from ptc_agent.agent.middleware.file_operations.image_fit import (
     UnsupportedImageFormat,
     identify_image,
 )
+from ptc_agent.agent.tools.computer_reach import (
+    COMPUTER_ARG,
+    ComputerReach,
+    ComputerUnreachable,
+    ran_elsewhere,
+)
 from ptc_agent.agent.tools.file_ops import is_memo_text_path
+from ptc_agent.core.project_context import project_bound
 from ptc_agent.core.sandbox.files import FileOverCap
 from src.tools.web.inhouse.guard import (
     BlockedAddressError,
@@ -332,14 +339,17 @@ class MultimodalMiddleware(AgentMiddleware):
     # hold and parse.
     MAX_PDF_SOURCE_BYTES = 64 * 1024 * 1024
 
-    def __init__(self, *, sandbox: Any) -> None:
+    def __init__(self, *, sandbox: Any, computers: ComputerReach | None = None) -> None:
         """
         Args:
             sandbox: PTCSandbox the Read tool is backed by, used to fetch the
                 raw bytes of a path the tool only acknowledged.
+            computers: The user's other computers, for a Read that names one
+                (the Chief of Staff's); its bytes are fetched from there.
         """
         super().__init__()
         self.sandbox = sandbox
+        self._computers = computers
 
     async def awrap_tool_call(
         self,
@@ -375,7 +385,13 @@ class MultimodalMiddleware(AgentMiddleware):
         async with _load_slot():
             if file_path.startswith(("http://", "https://")):
                 return await self._handle_url_content(file_path, result, tool_call_id, window)
-            return await self._handle_sandbox_content(file_path, result, tool_call_id, window)
+            return await self._handle_sandbox_content(
+                file_path,
+                result,
+                tool_call_id,
+                window,
+                computer=args[COMPUTER_ARG].strip() if ran_elsewhere(args) else None,
+            )
 
     def _too_large(self, source: str, tool_call_id: str, limit: int) -> ToolMessage:
         """Refuse an oversized block with a bare error result.
@@ -508,17 +524,29 @@ class MultimodalMiddleware(AgentMiddleware):
         tool_result: ToolMessage,
         tool_call_id: str,
         window: tuple[int, int] = (0, PDF_PAGE_WINDOW),
+        *,
+        computer: str | None = None,
     ) -> ToolMessage:
         """Fetch a sandbox file's bytes and attach them, or answer with why not."""
+        sandbox, project = self.sandbox, None
+        if computer and self._computers is not None:
+            # Reached already by the tool's own call, so this reads the same
+            # session back; one gone since answers as that call would have.
+            try:
+                target = await self._computers.reach(computer)
+            except ComputerUnreachable as e:
+                return _error(tool_call_id, str(e))
+            if target is not None:
+                sandbox, project = target.sandbox, target.project
         try:
             # The Read tool reaches the sandbox through SandboxBackend, which
             # normalizes first; this middleware holds the sandbox itself, whose
             # download does not. Without this, a virtual path the tool resolved
             # fine ("/work/task/charts/c.png") misses here and replaces the
             # tool's success with a not-found error.
-            file_bytes = await self.sandbox.adownload_file_bytes_capped(
-                self.sandbox.normalize_path(file_path), self._cap_for
-            )
+            with project_bound(project):
+                path = sandbox.normalize_path(file_path)
+            file_bytes = await sandbox.adownload_file_bytes_capped(path, self._cap_for)
             if not file_bytes:
                 logger.warning(f"[MULTIMODAL] Failed to download file: {file_path}")
                 return _error(tool_call_id, f"Could not read file: {file_path}")

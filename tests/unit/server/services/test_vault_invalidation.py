@@ -16,7 +16,7 @@ and every write fans out across the user's workspaces.
 from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 
 import pytest
 
@@ -166,7 +166,8 @@ async def test_secret_change_purges_and_fans_out(monkeypatch, probes, running, p
 
     await vi.after_secret_change("user-1", "API_KEY")
 
-    purge_bump.assert_awaited_once_with("user-1", ["authy"])
+    purge_bump.assert_awaited_once_with("user-1", ["authy"], description_scopes=ANY)
+    assert len(purge_bump.await_args.kwargs["description_scopes"]) == 1
     bump.assert_not_awaited()
     running.assert_awaited_with("user-1")
     assert [c.args for c in sched.call_args_list] == [
@@ -245,7 +246,7 @@ async def test_disabled_catalog_connector_is_still_scanned(monkeypatch, probes):
 
     await vi.after_secret_change("user-1", "API_KEY")
 
-    purge_bump.assert_awaited_once_with("user-1", ["dormant"])
+    purge_bump.assert_awaited_once_with("user-1", ["dormant"], description_scopes=ANY)
 
 
 @pytest.mark.asyncio
@@ -385,7 +386,7 @@ async def test_purge_failure_falls_back_to_a_bare_bump(monkeypatch, probes):
 
     await vi.after_secret_change("user-1", "API_KEY")
 
-    purge_bump.assert_awaited_once_with("user-1", ["authy"])
+    purge_bump.assert_awaited_once_with("user-1", ["authy"], description_scopes=ANY)
     bump.assert_awaited_once_with("user-1")
 
 

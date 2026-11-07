@@ -2,8 +2,9 @@ import { useMemo } from 'react';
 import { useModels } from './useModels';
 import { usePreferences } from './usePreferences';
 import { getModelAccess, usePlatformModels } from './usePlatformModels';
-import { buildVisibleModels, augmentPlatformWithLocal, customPairKey } from './useFilteredModels';
-import type { BuildVisibleModelsResult, ModelMetadataEntry } from './useFilteredModels';
+import { buildVisibleModels, augmentPlatformWithLocal, customPairKey, planKeyHolders } from './useFilteredModels';
+import type { BuildVisibleModelsResult, ModelMetadataEntry, ProviderRow } from './useFilteredModels';
+import { indexCatalog, ownProviderNames } from '@/lib/providerCatalog';
 import { useConfiguredProviders } from './useConfiguredProviders';
 import { useMissingModels } from './useProviderModels';
 import { isPlatformMode } from '@/config/hostMode';
@@ -12,6 +13,8 @@ import type { ModelsResponse } from '@/api/model';
 import type { PlatformModelsResponse } from '@/types/platform';
 import { modelPrefs } from '@/lib/modelPreferences';
 import { ownKeyRule, payerResolver, type Payer } from '@/lib/modelPayer';
+import { CLAUDE_CODE_CONNECTION, isClaudeCodeModel } from '@/lib/claudeCode';
+import { useClaudeCodeStatus } from './useClaudeCode';
 
 export interface SystemDefaults {
   default_model?: string;
@@ -71,6 +74,10 @@ export type SearchProviderCatalog = Record<string, SearchProviderInfo>;
 export interface UseAllModelsResult {
   /** Filtered models the user can access (grouped by provider). */
   models: Record<string, ProviderModelsData>;
+  /** The listed models a Background, fetch, compaction, fallback or subagent
+   *  slot, or a Chief of Staff turn, may name: all but Claude Code's, which
+   *  run an analyst's conversation only. */
+  slotModels: Record<string, ProviderModelsData>;
   /** Full metadata (including custom model entries). */
   metadata: Record<string, ModelMetadataEntry>;
   /** Pre-filter models (all models before access/tier gating). */
@@ -124,6 +131,10 @@ export function useAllModels(): UseAllModelsResult {
   const { preferences, isLoading: prefsLoading, isLoaded: prefsLoaded } = usePreferences();
   const { platform: rawPlatform, isLoading: platformLoading } = usePlatformModels();
   const { providers: configuredProviders, byokEnabled, isLoading: configuredLoading } = useConfiguredProviders();
+  // Claude Code runs on a setup token kept for it, on the user's computer or
+  // on the server, not on a connection of the user's: its models are listed
+  // while it is on for them, and offered for a turn where that token works.
+  const claudeCode = useClaudeCodeStatus();
 
   const customModels = useMemo<CustomModelEntry[]>(() => {
     if (!preferences) return [];
@@ -132,26 +143,42 @@ export function useAllModels(): UseAllModelsResult {
     return cm as CustomModelEntry[];
   }, [preferences]);
 
-  /** Provider catalog for resolving SDK of custom models */
-  const providerCatalog = useMemo<Record<string, { sdk?: string }>>(() => {
-    const map: Record<string, { sdk?: string }> = {};
-    for (const entry of modelsData?.provider_catalog ?? []) {
-      map[entry.provider] = entry;
+  /** What each provider a custom model can name says about it: its SDK, the
+   *  name its group is listed under, and its connection. A region and another
+   *  API of a connection are listed under the connection's entry's name. */
+  const providerCatalog = useMemo<Record<string, ProviderRow>>(() => {
+    const map: Record<string, ProviderRow> = {};
+    const customProviders = modelPrefs(preferences).custom_providers;
+    for (const [provider, row] of indexCatalog(modelsData?.provider_catalog ?? [], ownProviderNames(customProviders)).rows) {
+      map[provider] = { sdk: row.sdk, display_name: row.entry.display_name, connection: row.connection };
     }
-    // Also index custom providers from preferences
-    for (const cp of modelPrefs(preferences).custom_providers ?? []) {
+    // The user's own providers, which speak their parent's SDK.
+    for (const cp of customProviders ?? []) {
       if (!map[cp.name] && cp.parent_provider && map[cp.parent_provider]) {
-        map[cp.name] = { sdk: map[cp.parent_provider].sdk };
+        map[cp.name] = { sdk: map[cp.parent_provider].sdk, connection: cp.name };
       }
     }
     return map;
   }, [modelsData, preferences]);
 
+  // What the access filters count as connected: a coding plan's key also
+  // under the plan's other slugs, whose models it runs, and Claude Code while
+  // it is on for the user.
+  const planHolders = useMemo(
+    () => planKeyHolders(configuredProviders, modelsData?.key_candidates ?? {}),
+    [configuredProviders, modelsData],
+  );
+  const accessProviders = useMemo(() => [
+    ...configuredProviders,
+    ...[...planHolders].map(([provider, holder]) => ({ ...holder, provider })),
+    ...(claudeCode.enabled ? [CLAUDE_CODE_CONNECTION] : []),
+  ], [configuredProviders, planHolders, claudeCode.enabled]);
+
   // Augment platform with locally-known BYOK/OAuth providers so the
   // tier filter recognises connections that the platform service may not know about.
   const platform = useMemo(
-    () => rawPlatform ? augmentPlatformWithLocal(rawPlatform, configuredProviders, byokEnabled) : null,
-    [rawPlatform, configuredProviders, byokEnabled],
+    () => rawPlatform ? augmentPlatformWithLocal(rawPlatform, accessProviders, byokEnabled) : null,
+    [rawPlatform, accessProviders, byokEnabled],
   );
 
   const systemDefaults = modelsData?.system_defaults ?? null;
@@ -165,7 +192,16 @@ export function useAllModels(): UseAllModelsResult {
     .filter((p) => !p.is_custom && p.access_type !== 'local')
     .filter((p) => (p.access_type === 'oauth' ? p.state === 'connected' : !isPlatformMode || byokEnabled))
     .map((p) => p.provider), [configuredProviders, byokEnabled]);
-  const { missingByProvider, isLoading: listsLoading } = useMissingModels(listedProviders);
+  const { missingByProvider: listedMissing, isLoading: listsLoading } = useMissingModels(listedProviders);
+  // A plan slug run on a key held under another answers to that key's list.
+  const missingByProvider = useMemo(() => {
+    const out = new Map(listedMissing);
+    for (const [provider, holder] of planHolders) {
+      const missing = listedMissing.get(holder.provider);
+      if (missing && !out.has(provider)) out.set(provider, missing);
+    }
+    return out;
+  }, [listedMissing, planHolders]);
 
   /** Run the full pipeline: normalize → merge custom → filter */
   const visible = useMemo<BuildVisibleModelsResult>(() => {
@@ -186,10 +222,11 @@ export function useAllModels(): UseAllModelsResult {
       customModels,
       providerCatalog,
       platform,
-      configuredProviders,
+      accessProviders,
       missingByProvider,
+      modelsData.gateway_index,
     );
-  }, [modelsData, customModels, providerCatalog, platform, configuredProviders, missingByProvider]);
+  }, [modelsData, customModels, providerCatalog, platform, accessProviders, missingByProvider]);
 
   const catalogModelNames = useMemo(() => {
     const names = new Set<string>();
@@ -205,6 +242,15 @@ export function useAllModels(): UseAllModelsResult {
     }
     return names;
   }, [visible.rawModels, prefsLoaded, preferences]);
+
+  const slotModels = useMemo(() => {
+    const out: Record<string, ProviderModelsData> = {};
+    for (const [group, data] of Object.entries(visible.models)) {
+      const models = (data.models ?? []).filter((m) => !isClaudeCodeModel(visible.metadata[m]));
+      if (models.length > 0) out[group] = { ...data, models };
+    }
+    return out;
+  }, [visible]);
 
   const { payers, keylessModels } = useMemo(() => {
     const payerOf = payerResolver({
@@ -287,6 +333,7 @@ export function useAllModels(): UseAllModelsResult {
 
   return {
     models: visible.models,
+    slotModels,
     metadata: visible.metadata,
     rawModels: visible.rawModels,
     payers,
@@ -301,6 +348,6 @@ export function useAllModels(): UseAllModelsResult {
     compactionProfiles,
     searchProviders,
     rawApiResponse: modelsData,
-    isLoading: modelsLoading || prefsLoading || configuredLoading || platformLoading || listsLoading,
+    isLoading: modelsLoading || prefsLoading || configuredLoading || platformLoading || listsLoading || claudeCode.isLoading,
   };
 }

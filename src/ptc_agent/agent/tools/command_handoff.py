@@ -23,7 +23,7 @@ from typing import Any
 import structlog
 
 from ptc_agent.agent.tools.utils import mark_sandbox_failed, note_sandbox_exit
-from ptc_agent.core.sandbox.jobs import Ended, Failed, JobOutcome, Running
+from ptc_agent.core.sandbox.jobs import Ended, Failed, JobOutcome, JobRef, Running
 from src.utils.durations import format_duration
 
 logger = structlog.get_logger(__name__)
@@ -65,6 +65,24 @@ class HandOff:
     #: Whether the user has wakeups, which decides what the agent is told
     #: about outliving its turn.
     wakeups: bool
+    #: The computer the command runs on, when it is not the turn's own. The
+    #: log is there, so the row names it beside the log for every later
+    #: mention (the notice, ThreadStatus) to read, by its id too, which a
+    #: rename meanwhile leaves reaching it.
+    computer: str | None = None
+    computer_id: str | None = None
+
+    def log_path(self, ref: JobRef) -> str:
+        if self.computer is None:
+            return ref.log_relpath
+        held = f" (computer_id {self.computer_id})" if self.computer_id else ""
+        return f'{ref.log_relpath} on computer "{self.computer}"{held}'
+
+
+def log_of(ref: JobRef, hand_off: HandOff | None) -> str:
+    """Where a call says its job's log is: on another computer, named, since
+    the path alone reads from the turn's own."""
+    return hand_off.log_path(ref) if hand_off is not None else ref.log_relpath
 
 
 @dataclass(frozen=True)
@@ -190,10 +208,13 @@ async def run_command(
             return await render(outcome)
         if hand_off is not None:
             if await held.hand_over(call, hand_off):
+                log = hand_off.log_path(outcome.ref)
                 text = (
-                    background_result(outcome, wakeups=hand_off.wakeups)
+                    background_result(outcome, wakeups=hand_off.wakeups, log=log)
                     if background
-                    else handoff_result(outcome, waited_s=wait_s, wakeups=hand_off.wakeups)
+                    else handoff_result(
+                        outcome, waited_s=wait_s, wakeups=hand_off.wakeups, log=log
+                    )
                 )
                 return text, {"mcp_trace": [], "command_id": outcome.ref.command_id}
             if background:
@@ -209,7 +230,7 @@ async def run_command(
             outcome = held.hold(await backend.continue_job(outcome, left))
             if not isinstance(outcome, Running):
                 return await render(outcome)
-        return await stop_at_deadline(backend, outcome, render)
+        return await stop_at_deadline(backend, outcome, render, log_of(outcome.ref, hand_off))
     except asyncio.CancelledError:
         await held.release()
         raise
@@ -322,7 +343,7 @@ async def _write_row(
             tool=call.tool,
             description=call.description or "",
             command_preview=call.command,
-            log_path=ref.log_relpath,
+            log_path=hand_off.log_path(ref),
             job_ref=ref.to_dict(),
             started_at=running.handle.started_at,
             # A job still running has harvested nothing: this is what an
@@ -360,7 +381,7 @@ async def _row_exists(thread_id: str, command_id: str) -> bool:
 
 
 async def stop_at_deadline(
-    backend: Any, outcome: Running, render: Render
+    backend: Any, outcome: Running, render: Render, log: str
 ) -> tuple[str, dict[str, Any]]:
     """Stop a job the call's clock ran out on, and what the call returns.
 
@@ -383,10 +404,10 @@ async def stop_at_deadline(
         else:
             if not isinstance(done, Running):
                 return await render(done)
-    return deadline_result(outcome), {"mcp_trace": list(stopped.mcp_trace)}
+    return deadline_result(outcome, log), {"mcp_trace": list(stopped.mcp_trace)}
 
 
-async def settle(backend: Any, outcome: Ended | Failed) -> str:
+async def settle(backend: Any, outcome: Ended | Failed, hand_off: HandOff | None) -> str:
     """The output a call shows for its job, after the run's accounting.
 
     A call the sandbox failed marks the run failed. A nonzero exit is
@@ -403,7 +424,7 @@ async def settle(backend: Any, outcome: Ended | Failed) -> str:
             if code != 0 and not killed:
                 await note_sandbox_exit(backend, code, None)
             if outcome.truncated:
-                return truncated_note(outcome) + outcome.output
+                return truncated_note(log_of(outcome.ref, hand_off)) + outcome.output
             return outcome.output
 
 
@@ -411,7 +432,7 @@ def _ran_for(seconds: float) -> str:
     return format_duration(round(seconds))
 
 
-def handoff_result(outcome: Running, *, waited_s: float, wakeups: bool) -> str:
+def handoff_result(outcome: Running, *, waited_s: float, wakeups: bool, log: str) -> str:
     """What a call that waited and handed its job off returns.
 
     ``waited_s`` is the wait the call asked for, not the job's age: the
@@ -422,29 +443,29 @@ def handoff_result(outcome: Running, *, waited_s: float, wakeups: bool) -> str:
     return (
         f"Still running after {format_duration(waited_s)}, so it moved to the "
         f"background as command_id {outcome.ref.command_id}. Its output goes to "
-        f"{outcome.ref.log_relpath} as it runs, and you will be notified when it "
+        f"{log} as it runs, and you will be notified when it "
         "finishes. To stop it early, use ThreadStatus with stop.\n\n"
         f"{middle}\n\n"
         "Meanwhile do other work, or tell the user it is running and end your turn."
     )
 
 
-def background_result(outcome: Running, *, wakeups: bool) -> str:
+def background_result(outcome: Running, *, wakeups: bool, log: str) -> str:
     """What ``run_in_background`` returns at launch."""
     middle = _WAKEUP_CHECK if wakeups else _STOPPED_AFTER_THE_HOUR
     return (
         f"Started in the background as command_id {outcome.ref.command_id}. Its "
-        f"output goes to {outcome.ref.log_relpath} as it runs, and you will be "
+        f"output goes to {log} as it runs, and you will be "
         "notified when it finishes. To stop it early, use ThreadStatus with stop.\n\n"
         f"{middle}"
     )
 
 
-def deadline_result(outcome: Running) -> str:
+def deadline_result(outcome: Running, log: str) -> str:
     """What a call returns when its own clock ran out first."""
     return (
         f"ERROR: Stopped after {_ran_for(outcome.handle.ran_for())}: your time limit ran "
-        f"out before it ended. What it wrote is in {outcome.ref.log_relpath}."
+        f"out before it ended. What it wrote is in {log}."
     )
 
 
@@ -457,6 +478,6 @@ def not_handed_off_result() -> str:
     )
 
 
-def truncated_note(outcome: Ended) -> str:
+def truncated_note(log: str) -> str:
     """The line ahead of output cut to its end, naming the whole log."""
-    return f"(The start of the output was cut; the whole log is {outcome.ref.log_relpath}.)\n"
+    return f"(The start of the output was cut; the whole log is {log}.)\n"

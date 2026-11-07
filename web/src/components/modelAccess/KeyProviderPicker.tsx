@@ -1,4 +1,4 @@
-import { useId, type ReactNode } from 'react';
+import type { ReactNode } from 'react';
 import { ChevronLeft, Search } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
@@ -9,39 +9,43 @@ import { cn } from '@/lib/utils';
 import {
   CATEGORIES,
   filterGroups,
-  plansOf,
   type CategoryFilter,
   type KeyFilter,
   type KeyOption,
-  type Plan,
   type ProviderGroup,
 } from './providerOptions';
-import { useKeyOption, type KeyOptionChoice } from './useKeyOption';
 import type { TileSize } from '@/pages/ChatAgent/components/mcp/IdentityTile';
 import { QuietNote, Segmented } from './parts';
 import { ProviderChoice } from './ProviderChoices';
-import { planName, regionName } from './optionLabels';
+import { regionName } from './optionLabels';
 
 type T = (key: string) => string;
 
-/** What a provider offers, for its row: plans and regions, only where there is a choice to make. */
-function offerSummary(t: T, g: ProviderGroup): string | undefined {
-  const plans = plansOf(g);
+/** The regions a provider offers, for its row; nothing for the international one alone. */
+function regionSummary(t: T, g: ProviderGroup): string | undefined {
   const regions = [...new Set(g.options.map((o) => o.region))];
-  const parts: string[] = [];
-  if (plans.length > 1 || plans[0] === 'coding_plan') parts.push(plans.map((p) => planName(t, p)).join(' / '));
-  if (regions.length > 1 || regions[0] !== 'intl') parts.push(regions.map((r) => regionName(t, r)).join(' / '));
-  return parts.join(' · ') || undefined;
+  return regions.length > 1 || regions[0] !== 'intl' ? regions.map((r) => regionName(t, r)).join(' / ') : undefined;
 }
 
-function ProviderRow({ g, configured, onPick }: { g: ProviderGroup; configured: ReadonlySet<string>; onPick: (group: ProviderGroup) => void }) {
+/** A provider's group as one choice: its key providers' cell, or a coding plan's row. */
+export function ProviderRow({
+  g,
+  configured,
+  onPick,
+  layout = 'grid',
+}: {
+  g: ProviderGroup;
+  configured: ReadonlySet<string>;
+  onPick: (group: ProviderGroup) => void;
+  layout?: 'list' | 'grid';
+}) {
   const { t } = useTranslation();
   return (
     <ProviderChoice
-      layout="grid"
+      layout={layout}
       markProvider={g.markProvider}
       name={g.name}
-      note={offerSummary(t, g)}
+      note={regionSummary(t, g)}
       connected={g.options.some((o) => configured.has(o.provider))}
       onPick={() => onPick(g)}
     />
@@ -61,7 +65,7 @@ function ProviderTile({ g, configured, onPick }: { g: ProviderGroup; configured:
       <button
         type="button"
         onClick={() => onPick(g)}
-        title={offerSummary(t, g)}
+        title={regionSummary(t, g)}
         className="flex w-full min-w-0 items-center gap-2 rounded-md px-2 py-2 text-left transition-colors hover:bg-(--color-bg-hover)"
       >
         <span className="relative inline-flex shrink-0">
@@ -199,88 +203,34 @@ export function KeyProviderList({
 }
 
 /**
- * Step two, for a provider with more than one way in: its plan, then its
- * region, offering only the choices that exist. China and international keys
- * are separate keyspaces, so the region is a choice about the key, not taste.
+ * Which of a provider's regions the key is for, at the top of its key form.
+ * China and international keys are separate keyspaces, so the region is a
+ * choice about the key, not taste. Nothing for a provider with one region.
  */
-export function KeyProviderOptions({
+export function RegionChoice({
   group,
-  configured,
-  onBack,
-  onContinue,
+  option,
+  onChange,
 }: {
   group: ProviderGroup;
-  configured: ReadonlySet<string>;
-  onBack: () => void;
-  onContinue: (option: KeyOption) => void;
+  option: KeyOption;
+  onChange: (option: KeyOption) => void;
 }) {
   const { t } = useTranslation();
-  const choice = useKeyOption(group, configured);
+  if (group.options.length < 2) return null;
   return (
-    <KeyStepFrame
-      footer={(
-        <>
-          <BackButton onClick={onBack} />
-          <Button type="button" onClick={() => onContinue(choice.option)}>
-            {t('modelAccess.keyPicker.continue')}
-          </Button>
-        </>
-      )}
-    >
-      <div className="-mx-1 flex min-h-0 flex-1 flex-col overflow-y-auto px-1">
-        <KeyOptionFields choice={choice} />
-      </div>
-    </KeyStepFrame>
-  );
-}
-
-/** The plan, region and endpoint controls, for a caller that draws its own buttons. */
-export function KeyOptionFields({ choice }: { choice: KeyOptionChoice }) {
-  const { t } = useTranslation();
-  const endpointId = useId();
-  const { option, plans, regions } = choice;
-  return (
-    <div className="flex flex-col gap-5">
-      {plans.length > 1 && (
-        <div className="flex flex-col items-start gap-1.5">
-          <span className="text-xs font-medium" style={{ color: 'var(--color-text-tertiary)' }}>{t('modelAccess.keyPicker.plan')}</span>
-          <Segmented<Plan>
-            label={t('modelAccess.keyPicker.plan')}
-            value={option.plan}
-            onChange={choice.choosePlan}
-            options={plans.map((p) => ({ value: p, label: planName(t, p) }))}
-          />
-          <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>
-            {t(option.plan === 'coding_plan' ? 'modelAccess.keyPicker.codingPlanHint' : 'modelAccess.keyPicker.apiHint')}
-          </p>
-        </div>
-      )}
-
-      {regions.length > 1 && (
-        <div className="flex flex-col items-start gap-1.5">
-          <span className="text-xs font-medium" style={{ color: 'var(--color-text-tertiary)' }}>{t('setup.regionLabel')}</span>
-          <Segmented<string>
-            label={t('setup.regionLabel')}
-            value={option.region}
-            onChange={choice.chooseRegion}
-            options={regions.map((r) => ({ value: r, label: regionName(t, r) }))}
-          />
-          <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{t('modelAccess.keyPicker.regionHint')}</p>
-        </div>
-      )}
-
-      {option.base_url && (
-        <div className="flex flex-col gap-1">
-          <span id={endpointId} className="text-xs font-medium" style={{ color: 'var(--color-text-tertiary)' }}>{t('modelAccess.keyPicker.endpoint')}</span>
-          <code
-            aria-labelledby={endpointId}
-            className="truncate rounded-md px-3 py-2 font-mono text-xs"
-            style={{ background: 'var(--color-bg-input)', border: '1px solid var(--color-border-muted)', color: 'var(--color-text-secondary)' }}
-          >
-            {option.base_url}
-          </code>
-        </div>
-      )}
+    <div className="flex flex-col items-start gap-1.5">
+      <span className="text-xs font-medium" style={{ color: 'var(--color-text-tertiary)' }}>{t('setup.regionLabel')}</span>
+      <Segmented<string>
+        label={t('setup.regionLabel')}
+        value={option.provider}
+        onChange={(provider) => {
+          const next = group.options.find((o) => o.provider === provider);
+          if (next) onChange(next);
+        }}
+        options={group.options.map((o) => ({ value: o.provider, label: regionName(t, o.region) }))}
+      />
+      <p className="text-xs" style={{ color: 'var(--color-text-tertiary)' }}>{t('modelAccess.keyPicker.regionHint')}</p>
     </div>
   );
 }

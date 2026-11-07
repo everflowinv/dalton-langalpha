@@ -12,7 +12,7 @@ import type { SubagentTokenUsage } from '../utils/tokenUsage';
 import type { DecisionTarget } from './interrupts/toolApprovalCard';
 import type { StreamRefs, UpdateSubagentCard } from './streamRefs';
 import type { RetryNotice } from './stream/autoRetry';
-import type { ThreadTokenTotals } from '../utils/api/messages';
+import type { NextSummary, ThreadTokenTotals } from '../utils/api/messages';
 
 // --- Internal types for useChatMessages ---
 
@@ -105,6 +105,8 @@ interface SSEEvent {
   elapsed_ms?: number;
   /** What the thread has used, on a `run_end` frame. */
   token_totals?: ThreadTokenTotals | null;
+  /** What the thread's next send summarizes first, on a `run_end` frame. */
+  next_summary?: NextSummary | null;
   [key: string]: unknown;
 }
 
@@ -161,6 +163,12 @@ interface ModelOptions {
    */
   reasoningEffortOverride?: string;
   fastModeOverride?: boolean;
+  /**
+   * The file comments this send carries, as its bubble shows them. Their ids
+   * go out as `artifact_comment_ids` with its `reading`, and the message is
+   * the note typed with them, which may be empty.
+   */
+  artifactComments?: import('@/types/api').ArtifactCommentsShown;
 }
 
 /** What a fresh send takes beyond the model options an edit or regenerate does. */
@@ -177,16 +185,57 @@ interface SendOptions extends ModelOptions {
   /**
    * DALTON-HOOK(composer-drafts): called once, as early as the server has
    * taken this send — the first metadata carrying a run_id, a steer accepted
-   * or merged into the running turn, an adopted duplicate, a reconnect to
-   * the already-started stream, or an auto-retry scheduled. The composer's
-   * draft settles as sent here, so a reload mid-stream never restores an
-   * already-sent message into the input. The send's returned boolean stays
-   * the fallback for a send that never reports either way. A send parked
-   * for compaction is not taken: it accepts — and its promise settles —
-   * only once the flushed send goes out, or settles false when a stop
-   * drops it.
+   * or merged into the running turn, an adopted duplicate, a reconnect to the
+   * already-started stream, or (for a send whose drop scheduled an automatic
+   * resend) that resend's own first frame. The composer's draft settles as
+   * sent here, so a reload mid-stream never restores an already-sent message
+   * into the input. The send's returned boolean stays the fallback for a send
+   * that never reports either way. A send parked for compaction is not taken:
+   * it accepts — and its promise settles — only once the flushed send goes
+   * out, or settles false when a stop drops it.
    */
   onAccepted?: () => void;
+  /**
+   * DALTON-HOOK(composer-drafts): called when a drop scheduled the send's own
+   * automatic resend — the resend, not the response headers, is what can prove
+   * the server took the message (#675 sends them before admission), so from
+   * here the composer parks the send's own copy (a separate storage entry,
+   * offered above the box on reload) until the resend's acceptance reports
+   * through `onAccepted`, which rides the resent attempts' model options. The
+   * send's returned boolean settles nothing then; a chain that gives up or a
+   * stop that cancels the backoff reports through `onNotTaken`, and the failed
+   * reply's Retry, its held acceptance included, can still settle it sent.
+   */
+  onHandedOff?: () => void;
+  /**
+   * DALTON-HOOK(composer-drafts): called when the send is definitely not
+   * taken — a stop cancelled the resend backoff, the resend chain gave up
+   * and left the failed reply's Retry, a resent attempt was refused — so the
+   * composer seats the send's copy back into the box whole (text, quote
+   * chips, the attachments-again notice) and removes it. Rides the resent
+   * attempts' model options like `onAccepted`, so the exit a chain reaches
+   * fires it.
+   */
+  onNotTaken?: () => void;
+  /**
+   * DALTON-HOOK(composer-drafts): called when the host actually took this
+   * refused send back itself (the chat's returnedDraft, re-seated through
+   * its giveBack) — the composer's failure settle then keeps only the stored
+   * draft and leaves the input to that restore. Whether it fired for this
+   * send decides who restores; a stop that never produced a returnedDraft
+   * leaves it uncalled, and the composer restores.
+   */
+  onReturnedUnsent?: () => void;
+  /**
+   * What the composer held when it sent this. Should the server not keep the
+   * send while the host has the transcript out of view (`returnsUnsent`), it
+   * goes back to the composer as this, and the message leaves the transcript,
+   * where a failed reply's Retry would wait unseen.
+   */
+  draft?: import('@/components/ui/chat-input.types').ComposerDraft;
+  /** This turn starts without the summary a cold thread would get first. An
+   *  edit, regenerate or Retry takes it as an argument of its own. */
+  keepFullContext?: boolean;
 }
 
 /** Offload batch ref state. */

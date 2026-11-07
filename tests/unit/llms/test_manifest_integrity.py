@@ -34,7 +34,8 @@ def _shipped_default_models() -> list[tuple[str, str]]:
             found.append((f"agent_config.yaml llm.{field}", llm[field]))
     found.extend(("agent_config.yaml llm.fallback", m) for m in llm.get("fallback") or [])
 
-    # Literal presets only; the provider path reads its choices off the manifest.
+    # Literal presets, should the wizard set one again; its provider path
+    # reads its choices off the manifest.
     configure = (_REPO / "scripts" / "configure.sh").read_text()
     found.extend(
         (f"configure.sh {field}", key)
@@ -146,7 +147,7 @@ class TestManifestIntegrity:
         """A retirement has to repoint every default it strands. A stranded one
         is no 400 at load: it surfaces as a failed first turn on a fresh install."""
         defaults = _shipped_default_models()
-        assert any(where.startswith("configure.sh") for where, _ in defaults)
+        assert defaults
         missing = [
             f"{where}: {key}" for where, key in defaults
             if model_config.get_model_config(key) is None

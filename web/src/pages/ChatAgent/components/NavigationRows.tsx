@@ -728,12 +728,10 @@ function ThreadTreeRowImpl({
     // DALTON-HOOK(colleague-dispatch): block row activation for isolated external callers
     // A touch long-press opens the menu; the tap that ends it is not a navigation.
     if (renaming || menuOpen || threadPerms.isIsolatedExternal) return;
-    if (isCurrentThread) {
-      // Toggle agents expand for current thread
-      if (hasSubagents) onToggleThread(tid);
-    } else {
-      onNavigateThread(wsId, tid);
-    }
+    // Toggle agents expand for current thread. Without agents to show it is still
+    // a pick, which the mobile drawer closes on.
+    if (hasSubagents) onToggleThread(tid);
+    else onNavigateThread(wsId, tid);
   };
 
   const copyLink = () => {

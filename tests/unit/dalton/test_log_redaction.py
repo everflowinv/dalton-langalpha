@@ -41,6 +41,16 @@ def test_mcp_token_paths_are_redacted() -> None:
     )
 
 
+def test_file_grant_paths_are_redacted() -> None:
+    line = (
+        'GET /api/v1/wsfiles/g/v1.3f6c9a12-0000-0000-0000-000000000001.1793664000.'
+        'Zm9vYmFyYmF6cXV4/work/report.html HTTP/1.1" 200'
+    )
+    out = redact_text(line)
+    assert out == 'GET /api/v1/wsfiles/g/<redacted>/work/report.html HTTP/1.1" 200'
+    assert "Zm9vYmFyYmF6cXV4" not in out
+
+
 def test_bearer_and_basic_auth_headers_are_redacted() -> None:
     out_bearer = redact_text("Authorization: Bearer abc.def.ghi")
     assert "abc.def.ghi" not in out_bearer

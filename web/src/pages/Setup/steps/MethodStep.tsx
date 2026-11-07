@@ -34,8 +34,8 @@ const markOf = (p: { provider: string; brand_key?: string | null }) =>
   llmProviderArt(p.provider) ?? (p.brand_key ? llmProviderArt(p.brand_key) : undefined);
 
 /**
- * A coding plan is a plan of a provider, picked on that provider's step, so
- * it is not a way of its own here.
+ * A coding plan is a subscription bought with a key, listed with the
+ * subscriptions, so it is not a way of its own here.
  */
 const METHODS: Array<{ id: Method; titleKey: string; descKey: string }> = [
   { id: 'oauth', titleKey: 'setup.methodOAuth', descKey: 'setup.methodOAuthDesc' },
@@ -188,7 +188,7 @@ export default function MethodStep() {
   const [redeemingInvitation, setRedeemingInvitation] = useState(false);
 
   const choose = useCallback((method: Method) => {
-    navigate('/setup/provider', { state: { method } });
+    navigate('/setup/provider', { state: { list: method } });
   }, [navigate]);
 
   const handleSkipToDefaults = useCallback(() => {

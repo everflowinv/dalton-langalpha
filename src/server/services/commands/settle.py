@@ -4,8 +4,8 @@ the watcher's pass, every stop, and a computer that went away.
 ``decide`` judges one row against one read of its job: still running, to be
 stopped for the after-turn hour, or ended, and how. ``settle`` records an end:
 the job's MCP trace when the end will be reported, the guarded finalize, the
-job's state discarded after it, and a nudge to the drainer when the notice is
-due now. A stop is mark, kill, re-read, decide, settle, so a stopped row is
+job's state discarded after it, a nudge to the drainer when the notice is due
+now, and a mirror of the computer when it is not the thread's (``mirror``). A stop is mark, kill, re-read, decide, settle, so a stopped row is
 judged on the job as its kill left it.
 
 A command is covered while its thread has a live turn or task, and for an
@@ -32,6 +32,7 @@ from ptc_agent.core.sandbox.runtime import SandboxRuntime
 
 from src.server.database.runs import command_runs as cr_db
 from src.server.database.runs.command_runs import Outcome
+from src.server.services.commands.mirror import mirror_after_end
 
 logger = logging.getLogger(__name__)
 
@@ -215,6 +216,8 @@ async def settle(
             logger.debug(f"[COMMANDS] discard after {row['command_id']} ended failed: {e}")
     if outcome.report == "now":
         _nudge_hook_drainer()
+    if runtime is not None:
+        await mirror_after_end(ended)
     return ended
 
 

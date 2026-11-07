@@ -17,6 +17,7 @@ import { baseURL } from '@/pages/ChatAgent/utils/api/transport';
 
 import iconOpenai from '@/assets/providers/openai.svg';
 import iconAnthropic from '@/assets/providers/anthropic.svg';
+import iconClaude from '@/assets/providers/claude.svg';
 import iconGemini from '@/assets/providers/gemini.svg';
 import iconOpenrouter from '@/assets/providers/openrouter.svg';
 import iconZai from '@/assets/providers/z-ai.svg';
@@ -30,6 +31,7 @@ import iconOllama from '@/assets/providers/ollama.svg';
 import iconLmStudio from '@/assets/providers/lmstudio.svg';
 import iconVllm from '@/assets/providers/vllm.svg';
 import iconXai from '@/assets/providers/xai.svg';
+import iconOpencode from '@/assets/providers/opencode.svg';
 
 export type BrandArt = {
   src: string;
@@ -65,6 +67,7 @@ const MINIMAX = mark(iconMinimax, false, 'MiniMax');
 const QWEN = mark(iconQwen, false, 'Qwen');
 const KIMI = mark(iconKimi, true, 'Kimi');
 const XAI = mark(iconXai, true, 'Grok');
+const OPENCODE = mark(iconOpencode, true);
 
 /** Every manifest provider and its variants, which wear their parent's mark. */
 const LLM_PROVIDER_ART: Record<string, BrandArt> = {
@@ -76,6 +79,7 @@ const LLM_PROVIDER_ART: Record<string, BrandArt> = {
   // no icon asset and falls back to its initials; xai-oauth wears xAI's mark.
   'antigravity-oauth': mark(iconGemini, false, 'Gemini'),
   'xai-oauth': XAI,
+  'claude-code': mark(iconClaude, false, 'Claude'),
   gemini: mark(iconGemini, false, 'Gemini'),
   xai: XAI,
   'grok-oauth': XAI,
@@ -86,10 +90,16 @@ const LLM_PROVIDER_ART: Record<string, BrandArt> = {
   'z-ai-cn-coding': ZAI,
   minimax: MINIMAX,
   'minimax-coding': MINIMAX,
+  'minimax-cn-coding': MINIMAX,
   dashscope: QWEN,
   'dashscope-intl': QWEN,
   moonshot: KIMI,
   'moonshot-coding': KIMI,
+  'moonshot-cn-coding': KIMI,
+  'opencode-go': OPENCODE,
+  'opencode-go-chat': OPENCODE,
+  'opencode-go-responses': OPENCODE,
+  'opencode-go-google': OPENCODE,
   deepseek: mark(iconDeepseek, false, 'DeepSeek'),
   groq: mark(iconGroq),
   cerebras: mark(iconCerebras, true),

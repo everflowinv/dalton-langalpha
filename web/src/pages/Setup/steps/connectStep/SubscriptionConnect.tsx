@@ -26,8 +26,8 @@ export function SubscriptionConnect({ state }: { state: LocationState }) {
   const key = subscriptionKey(provider);
   const displayName = state.displayName ?? provider;
   const done = useCallback(() => {
-    connected({ method: 'oauth', provider, displayName, brandKey: state.brandKey ?? provider, justConnected: true });
-  }, [connected, provider, displayName, state.brandKey]);
+    connected({ method: 'oauth', list: 'oauth', provider, displayName, modelsFrom: state.modelsFrom ?? provider, justConnected: true });
+  }, [connected, provider, displayName, state.modelsFrom]);
 
   return (
     <div>
@@ -53,7 +53,7 @@ export function SubscriptionConnect({ state }: { state: LocationState }) {
         </>
       )}
       <SetupFooter
-        back={{ label: t('setup.back'), onClick: () => navigate('/setup/provider', { state: { method: 'oauth' } }) }}
+        back={{ label: t('setup.back'), onClick: () => navigate('/setup/provider', { state: { list: 'oauth' } }) }}
         primary={null}
       />
     </div>

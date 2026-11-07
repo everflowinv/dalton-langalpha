@@ -32,19 +32,18 @@ export default function ModelPickStep() {
     if (!state.provider) navigate('/setup/method', { replace: true });
   }, [state.provider, navigate]);
 
-  const method = state.method;
   const provider = state.provider ?? '';
   const displayName = state.displayName ?? provider;
-  const brandKey = state.brandKey ?? provider;
+  const modelsFrom = state.modelsFrom ?? provider;
   const isSubscription = isSubscriptionProvider(provider);
 
   const { configuredSet } = useConfiguredProviders();
   const isConfigured = provider ? configuredSet.has(provider) : false;
-  const picker = useModelPicker({ provider, brandKey, justConnected: state.justConnected === true });
+  const picker = useModelPicker({ provider, modelsFrom, justConnected: state.justConnected === true });
 
   const handleBack = useCallback(() => {
-    navigate('/setup/provider', { state: { method } });
-  }, [navigate, method]);
+    navigate('/setup/provider', { state: { list: state.list } });
+  }, [navigate, state.list]);
 
   const handleNext = async () => {
     if (await picker.save()) navigate('/setup/defaults');

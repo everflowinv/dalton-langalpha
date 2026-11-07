@@ -401,6 +401,8 @@ def phase2(monkeypatch) -> SimpleNamespace:
     monkeypatch.setattr(
         connect, "refuse_attempts_on_connection_change", _refuse_open_orders
     )
+    monkeypatch.setattr(connect, "own_description_scope", AsyncMock(return_value=[]))
+    monkeypatch.setattr(connect, "drop_descriptions", AsyncMock())
     monkeypatch.setattr(
         "src.server.services.mcp_oauth.discovery.refresh_user_tool_schemas",
         _refresh_user_tool_schemas,
@@ -1106,6 +1108,20 @@ class TestRoundTrip:
         # Sessions must re-resolve, and tools should appear immediately.
         assert phase2.bumps == [USER_ID]
         assert phase2.discoveries == [(USER_ID, SERVER_NAME)]
+
+    @pytest.mark.asyncio
+    async def test_the_last_accounts_description_goes_with_the_connection_write(
+        self, redis, phase1, phase2, monkeypatch
+    ):
+        monkeypatch.setattr(connect, "own_description_scope", AsyncMock(return_value=["user:k"]))
+        drop = AsyncMock()
+        monkeypatch.setattr(connect, "drop_descriptions", drop)
+        started = await start_connect(USER_ID, SERVER_NAME)
+
+        await _callback(started, code="auth-code-1")
+
+        [write_conn, *_] = phase2.write_conns
+        drop.assert_awaited_once_with(["user:k"], conn=write_conn)
 
     @pytest.mark.asyncio
     async def test_confidential_secret_is_encrypted_not_left_in_the_blob(

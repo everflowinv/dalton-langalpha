@@ -29,6 +29,7 @@ from src.config.settings import (
     get_locale_config,
 )
 from src.observability.langsmith_tracer import with_run_tracer
+from src.server.contracts.run_times import run_settled_at
 from src.server.contracts.turn_kinds import (
     ANNOUNCED_KEYS,
     NOTIFICATION_QUERY_TYPES,
@@ -37,6 +38,7 @@ from src.server.contracts.turn_kinds import (
 from src.server.database import conversation as qr_db
 from src.server.database.conversation.threads_write import remember_thread_llm_model
 from src.server.services.llm.thread_model import NamedModel
+from src.server.services.runs.pending_input import cache_clock_attempt
 from src.server.database.runs import lifecycle as tl_db
 from src.server.models.chat import CommandReport, summarize_hitl_response_map
 from src.server.utils.skill_context import (
@@ -401,6 +403,12 @@ class PriorThread(NamedTuple):
     # The surface the latest attempt recorded it ran on (``surface_stamp``).
     # Stands in for a resume's, which continues that attempt.
     attempt_platform: Optional[str] = None
+    # When the thread's newest attempt settled, by the run ledger, passing over
+    # one whose input never reached the graph (``cache_clock_attempt``). A
+    # cancelled or failed call still refreshed the provider's prompt cache but
+    # stamped nothing in the checkpoint, so compaction's cold-cache estimate
+    # reads this as well.
+    last_run_settled_at: Optional[datetime] = None
 
 
 def _fork_predecessor_turn(request: ChatRequest) -> Optional[int]:
@@ -427,11 +435,17 @@ async def _read_prior_thread(
     model reads ends there, so its prior turn is the attempt before the fork
     rather than the newest attempt on the thread.
     """
+    reads = [
+        qr_db.get_thread_by_id(thread_id),
+        tl_db.get_latest_attempt(thread_id, before_turn=before_turn),
+    ]
+    # A fork's prior turn is an earlier attempt, but the newest one is what
+    # last refreshed the provider's cache over the history they share.
+    if before_turn is not None:
+        reads.append(tl_db.get_latest_attempt(thread_id))
     try:
-        row, attempt = await asyncio.gather(
-            qr_db.get_thread_by_id(thread_id),
-            tl_db.get_latest_attempt(thread_id, before_turn=before_turn),
-        )
+        row, attempt, *newest = await asyncio.gather(*reads)
+        clock = await cache_clock_attempt(thread_id, newest[0] if newest else attempt)
     except Exception:
         logger.debug("thread runtime-context read failed", exc_info=True)
         return PriorThread()
@@ -455,6 +469,7 @@ async def _read_prior_thread(
             if isinstance(attempt_platform, str) and attempt_platform
             else None
         ),
+        last_run_settled_at=run_settled_at(clock),
     )
 
 
@@ -464,6 +479,7 @@ async def ensure_thread(
     workspace_id: str,
     user_id: str,
     initial_query: str = "",
+    row_ensured: bool = False,
     # DALTON-HOOK(colleague-dispatch): workspace owner and origin channel for colleague thread metadata.
     workspace_owner_id: str | None = None,
     origin_channel: str = "web",
@@ -474,11 +490,92 @@ async def ensure_thread(
     Returns the prior turn as it stood on entry, read here so the ordering
     against the ensure below (which stamps the thread row) stays off the
     callers.
+
+    ``row_ensured``: ``make_thread`` already found or made the row, which is
+    then the only call that applies creation-time fields, so this one has the
+    status to resume and nothing to create or title.
     """
     prior = await _read_prior_thread(
         thread_id, before_turn=_fork_predecessor_turn(request)
     )
+    if row_ensured:
+        await qr_db.update_thread_status(thread_id, "in_progress")
+        return prior
+    # DALTON-HOOK(colleague-dispatch): pass workspace_owner_id and origin_channel
+    # through to the shared row maker (comments.take may have made the row via
+    # make_thread already; only the creator applies creation-time metadata).
+    created = await _ensure_thread_row(
+        request,
+        thread_id,
+        workspace_id,
+        user_id,
+        initial_query=initial_query,
+        workspace_owner_id=workspace_owner_id,
+        origin_channel=origin_channel,
+        is_colleague_turn=is_colleague_turn,
+    )
 
+    # Threads born here (automations, channel gateways, legacy clients) never
+    # pass through POST /threads, so this is their only shot at an LLM title.
+    # Web create-first threads pre-exist → created=False → no double generation.
+    if created and initial_query:
+        from src.server.services.thread_title import schedule_title_generation
+        from src.server.utils.thread_stamp import stamped_title
+
+        schedule_title_generation(
+            thread_id=thread_id,
+            user_id=user_id,
+            first_query=initial_query,
+            expected_title=stamped_title(initial_query),
+            timezone=request.timezone,
+        )
+
+    return prior
+
+
+async def make_thread(
+    request: ChatRequest,
+    thread_id: str,
+    workspace_id: str,
+    user_id: str,
+    *,
+    # DALTON-HOOK(colleague-dispatch): workspace owner and origin channel for
+    # colleague thread metadata — the send hands the same identity here that
+    # ensure_thread would, so a row comments.take creates carries it too.
+    workspace_owner_id: str | None = None,
+    origin_channel: str = "web",
+    is_colleague_turn: bool = False,
+) -> bool:
+    """Make the thread a send needs before its admission, untitled. Whether
+    this call made it; a thread it finds keeps its status, since the send
+    may yet be refused. A thread this call made has no prior turn."""
+    return await _ensure_thread_row(
+        request,
+        thread_id,
+        workspace_id,
+        user_id,
+        initial_query="",
+        resume=False,
+        workspace_owner_id=workspace_owner_id,
+        origin_channel=origin_channel,
+        is_colleague_turn=is_colleague_turn,
+    )
+
+
+async def _ensure_thread_row(
+    request: ChatRequest,
+    thread_id: str,
+    workspace_id: str,
+    user_id: str,
+    *,
+    initial_query: str,
+    resume: bool = True,
+    # DALTON-HOOK(colleague-dispatch): dispatched_by metadata for a thread
+    # created in a colleague's workspace.
+    workspace_owner_id: str | None = None,
+    origin_channel: str = "web",
+    is_colleague_turn: bool = False,
+) -> bool:
     ensure_kwargs = dict(
         workspace_id=workspace_id,
         conversation_thread_id=thread_id,
@@ -486,6 +583,8 @@ async def ensure_thread(
         initial_query=initial_query,
         initial_status="in_progress",
     )
+    if not resume:
+        ensure_kwargs["resume"] = False
     if request.platform:
         ensure_kwargs["platform"] = request.platform
     if request.external_thread_id:
@@ -510,23 +609,7 @@ async def ensure_thread(
     # Applied only if this send creates the thread; PATCH owns it after.
     if request.subagents_allowed is not None:
         ensure_kwargs["subagents_allowed"] = request.subagents_allowed
-    created = await qr_db.ensure_thread_exists(**ensure_kwargs)
-
-    # Threads born here (automations, channel gateways, legacy clients) never
-    # pass through POST /threads, so this is their only shot at an LLM title.
-    # Web create-first threads pre-exist → created=False → no double generation.
-    if created and initial_query:
-        from src.server.services.thread_title import schedule_title_generation
-
-        schedule_title_generation(
-            thread_id=thread_id,
-            user_id=user_id,
-            first_query=initial_query,
-            expected_title=initial_query[:255],
-            timezone=request.timezone,
-        )
-
-    return prior
+    return await qr_db.ensure_thread_exists(**ensure_kwargs)
 
 
 async def keep_named_model(thread_id: str, named_model: NamedModel | None) -> None:
@@ -551,6 +634,7 @@ def build_turn_context(
     disk_free_mb: int | None = None,
     disk_known: bool = False,
     inherits_rules: bool = False,
+    sent_at: float | None = None,
 ) -> TurnContext:
     """What this turn knows about itself: the request's surface plus the prior row.
 
@@ -561,7 +645,8 @@ def build_turn_context(
     automation stamps the origin on every request it sends, so nothing is lost.
     ``disk_free_mb`` and ``disk_known`` come from :func:`read_disk_notice`.
     ``inherits_rules`` is set for a retry whose attempt ran under the last
-    rules stated (:func:`retried_on_its_surface`).
+    rules stated (:func:`retried_on_its_surface`). ``sent_at`` is when the
+    server received the request, ahead of admission and the workspace's start.
 
     The zone is the profile's before the request's: a channel or an
     automation's own request names none, and the request alone would put
@@ -572,6 +657,9 @@ def build_turn_context(
     zone = _first_zone((user_profile or {}).get("timezone"), request.timezone)
     return TurnContext(
         last_turn_at=prior.last_turn_at,
+        previous_run_settled_at=prior.last_run_settled_at,
+        keep_full_context=request.keep_full_context,
+        sent_at=sent_at,
         platform=request.platform,
         origin=request.origin.type if request.origin else None,
         origin_agent=request.origin.agent if request.origin else None,

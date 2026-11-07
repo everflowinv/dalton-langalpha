@@ -29,6 +29,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx2
 import pytest
@@ -2307,6 +2308,10 @@ def disconnect_db(monkeypatch) -> FakeDisconnectDb:
         "src.server.database.mcp_tool_schemas."
         "delete_user_and_workspace_tool_schemas_and_bump",
         fake.write("purge_both_tiers"),
+    )
+    monkeypatch.setattr(
+        "src.server.services.mcp_descriptions.jobs.own_description_scope",
+        AsyncMock(return_value=[]),
     )
     # Patched only so a regression to either narrower write shows up in the
     # trace rather than as a stray database call.

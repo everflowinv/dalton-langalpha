@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useEffectEvent, useId, useMemo, useRef, useState, Suspense } from 'react';
-import { CandlestickChart, FolderTree, LayoutDashboard, TextSelect, Upload } from 'lucide-react';
+import { CandlestickChart, FolderTree, LayoutDashboard, Upload } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import {
   memoMimeForName,
@@ -30,13 +30,18 @@ import { useDownloadState, workspaceDownloadKey } from '../utils/downloadNotice'
 import './FilePanel.css';
 
 const ExportPreviewModal = React.lazy(() => import('./ExportPreviewModal'));
+// DALTON-HOOK(external-share-guard): the external member's stop-only dialog.
+const PublishDialog = React.lazy(() => import('./PublishDialog'));
 
-import type { ApiAdapter, ChartTabSpec, ContextPayload, PanelTarget } from './filePanel/types';
+import type { ContextPayload } from '@/components/ui/chat-input.types';
+import type { ApiAdapter, ChartTabSpec, PanelAccess, PanelTarget } from './filePanel/types';
 import { EDITABLE_EXTENSIONS, getFileExtension, viewerFor } from './filePanel/fileMeta';
 import { useFileUpload } from './filePanel/useFileUpload';
 import { useFileEdit } from './filePanel/useFileEdit';
 import { usePanelConfirm } from './filePanel/usePanelConfirm';
-import { useSelectionContext } from './filePanel/useSelectionContext';
+import { selectionSourceName, useSelectionContext } from './filePanel/useSelectionContext';
+import { ImageReply } from './selectionQuote/ImageReply';
+import { SelectionQuote } from './selectionQuote/SelectionQuote';
 import { useFileSelection } from './filePanel/useFileSelection';
 import { useFileBackup } from './filePanel/useFileBackup';
 import { useFileFocus } from './filePanel/useFileFocus';
@@ -59,8 +64,10 @@ import { FileCrumbs } from './filePanel/FileCrumbs';
 import { PreviewCrumbs } from './filePanel/PreviewCrumbs';
 import { SiblingCrumbs } from './filePanel/SiblingCrumbs';
 import { PreviewPanes } from './filePanel/PreviewPanes';
+import { useHtmlArtifactTab } from './filePanel/useHtmlArtifactTab';
 import { usePreviews } from './filePanel/usePreviews';
 import { usePanelTarget } from './filePanel/usePanelTarget';
+import { useCommentUi } from './viewers/html/comments/useCommentUi';
 import { ActiveTabBody } from './filePanel/ActiveTabBody';
 import type { NewTabMenu } from './filePanel/panelLaunchers';
 import { useWatchTab } from './filePanel/useWatchTab';
@@ -116,6 +123,13 @@ interface FilePanelProps {
   readOnly?: boolean;
   // DALTON-HOOK(team-sharing): distinguish colleague mirror read-only from owner sibling read-only
   teamReadOnly?: boolean;
+  // DALTON-HOOK(external-share-guard): the caller's Dalton tier — an external
+  // member gets no publish/comment entry even on their own workspace.
+  callerTier?: string | null;
+  // DALTON-HOOK(team-sharing): a read-only thread beside the panel (a
+  // colleague's dispatched thread) shows no comment layer or docked comment
+  // box either — comments are sent into that thread.
+  threadReadOnly?: boolean;
   /** Whether this viewer may save a file's bytes. A copy-link share grants
    *  `allow_files` without `allow_download`, and the download endpoint refuses
    *  what `allow_files` alone opened, so an offered save fails after the click. */
@@ -131,6 +145,8 @@ interface FilePanelProps {
   isActive?: boolean;
   apiAdapter?: ApiAdapter | null;
   onAddContext?: ((ctx: ContextPayload) => void) | null;
+  /** Who a quote from this panel goes to: the placeholder names them. */
+  agentName?: string;
   showSystemFiles?: boolean;
   onToggleSystemFiles?: (() => void) | null;
   /** The guard the panel's own close runs, for whoever else can unmount the
@@ -141,8 +157,6 @@ interface FilePanelProps {
    *  The host that sizes the panel reads this, since a chart has a floor of
    *  its own. */
   onActiveTabKindChange?: ((kind: FileTab['kind'] | null) => void) | null;
-  /** Offer the open file's share dialog in its header: the owner's own panel only. */
-  canShare?: boolean;
   /** Set while a Home or analyst panel shows a sibling's files in place of
    *  its own: the panel names that workspace and offers the way back, asking
    *  first about unsaved edits as its own close does. */
@@ -175,17 +189,19 @@ function FilePanel({
   readOnly = false,
   // DALTON-HOOK(team-sharing): distinguish colleague mirror read-only from owner sibling read-only
   teamReadOnly = false,
+  callerTier = null,
+  threadReadOnly = false,
   canDownload = true,
   singleFileMode = false,
   persistTabs = true,
   isActive = true,
   apiAdapter = null,
   onAddContext = null,
+  agentName,
   showSystemFiles = false,
   onToggleSystemFiles = null,
   onLeaveGuardChange = null,
   onActiveTabKindChange = null,
-  canShare = false,
   onReturnHome = null,
   returnLabel = null,
 }: FilePanelProps): React.ReactElement {
@@ -260,6 +276,33 @@ function FilePanel({
 
   // DALTON-HOOK(team-sharing): block preview sandbox requests in colleague mirror mode
   const previews = usePreviews(workspaceId, { teamReadOnly });
+  // Publishing, comments, versions and a file's record are the owner's: a
+  // read-only panel, or a share's, shows a file alone. Decided here once, and
+  // what acts on it reads this rather than deciding again.
+  const commentUi = useCommentUi();
+  const servePrefix = apiAdapter?.servePrefix;
+  // DALTON-HOOK(team-sharing): a teammate's workspace is read-only for
+  // artifact purposes whatever their web level — rw lifts file writes only,
+  // never publish/comment (the server refuses those too), and its HTML reads
+  // from the DB mirror: an rw colleague is no more the workspace's owner than
+  // a ro one, so the owner's file grant would only be refused. The owner
+  // alone (and never an external member) gets the owner access.
+  // DALTON-HOOK(external-share-guard): an external member is no artifact
+  // owner either — the publish entry and comment UI stay hidden.
+  const access = useMemo<PanelAccess>(
+    () => (servePrefix
+      ? { kind: 'share', servePrefix }
+      : teamReadOnly || callerTier === 'external'
+        ? { kind: 'readOnly', ...(teamReadOnly ? { mirror: true } : {}) }
+        : readOnly || !workspaceId
+          ? { kind: 'readOnly' }
+          : { kind: 'owner' }),
+    [servePrefix, readOnly, teamReadOnly, workspaceId, callerTier],
+  );
+  // DALTON-HOOK(team-sharing): no comment layer, docked comment box or publish
+  // entry beside a read-only thread (teamReadOnly covers a colleague's
+  // workspace; threadReadOnly a colleague's dispatched thread in it).
+  const comments = access.kind === 'owner' && !threadReadOnly ? commentUi : undefined;
 
   const { body, loading: fileLoading, error: readError, readAt, refetch } = useFileBody({
     cache, path: selectedFile, workspaceStatus: wsData?.status,
@@ -283,6 +326,9 @@ function FilePanel({
   const fileError = downloads.errorFor(selectedFile) ?? readError;
 
   const [exportModalOpen, setExportModalOpen] = useState(false);
+  // DALTON-HOOK(external-share-guard): an external member's stop-only dialog,
+  // for a link they already made public.
+  const [unshareTarget, setUnshareTarget] = useState<string | null>(null);
   const [pageCounts, setPageCounts] = useState<Record<string, number>>({});
 
   // DALTON-HOOK(multi-file-upload): uploadStatus carries the batch position
@@ -317,7 +363,7 @@ function FilePanel({
   useEffect(() => { reportActiveKind(activeTab.kind); }, [activeTab.kind]);
   useEffect(() => () => reportActiveKind(null), []);
 
-  const { selectionTooltip, contentWrapperRef, contextMenu, setContextMenu, handleContentMouseUp, handleEditorTextSelect, handleAddSelectionContext } =
+  const { selectionTooltip, selectionComposing, beginReply, dismissSelection, contentWrapperRef, contextMenu, setContextMenu, handleEditorTextSelect, handleAddSelectionContext } =
     useSelectionContext({ selectedFile, fileContent, onAddContext });
 
   const viewer = selectedFile ? viewerFor(selectedFile, fileMime, edit.isEditing) : 'other';
@@ -335,6 +381,26 @@ function FilePanel({
   // A replay restores the reader's place and leaves their choice of view be.
   const htmlView = useHtmlViewMode(focus.replayed ? null : focus.htmlAnchor, focus.seq);
   const { setSource: setHtmlSource } = htmlView;
+
+  // An HTML file the owner reads takes comments and has versions.
+  const artifactTab = useHtmlArtifactTab({
+    workspaceId,
+    tabId: activeTab.id,
+    file: selectedFile,
+    html: viewer === 'html',
+    source: htmlView.source,
+    active: isActive,
+    readAt: readAt ?? null,
+    ui: comments,
+  });
+  const htmlArtifactPath = artifactTab.path;
+  // The agent's edit to the HTML file in front is read at once, unlike other
+  // files: the frame swaps it in over the old one with the place kept, and a
+  // reader whose comments the agent is answering is waiting for exactly that.
+  const htmlChanged = !!htmlArtifactPath && !edit.isEditing && hasChanged(htmlArtifactPath);
+  useEffect(() => {
+    if (htmlChanged && htmlArtifactPath) cache.invalidate(htmlArtifactPath);
+  }, [htmlChanged, htmlArtifactPath, cache]);
 
   // Replay the tab's own location whenever it comes back to the front. A
   // location the tab has already been to is a replay; a new one is an ask.
@@ -445,6 +511,7 @@ function FilePanel({
     // DALTON-HOOK(team-sharing): suppress preview sandbox startup and personal memo in colleague mirror mode
     onTargetMemoHandled,
     teamReadOnly,
+    onCommentFocus: comments?.requestFocus,
   });
 
   // Opening a singleton tab drops a reference still resolving, like any other
@@ -498,7 +565,7 @@ function FilePanel({
     setContextMenu(null);
     if (action === 'add-context' && onAddContext) {
       tabs.openFile(filePath, { pin: true });
-      onAddContext({ path: filePath });
+      onAddContext({ kind: 'file', path: filePath });
     } else if (action === 'add-to-memo') {
       // DALTON-HOOK(team-sharing): block Add to Memo in colleague mirror mode
       if (!teamReadOnly) void handleAddToMemo(filePath);
@@ -773,11 +840,15 @@ function FilePanel({
         <FileCrumbs
           path={selectedFile}
           onOpenDir={revealInTree}
-          meta={meta}
+          // A page in front of the owner has its version and comments to say
+          // there; its line count is the markup's, read under Source.
+          meta={artifactTab.hideMeta ? null : meta}
           unsaved={edit.hasUnsavedChanges}
           chip={focus.chip && (
             <FocusChip state={focus.chip} onJump={focus.jump} onDismiss={() => { focus.dismiss(); tabs.clearLocation(activeTab.id); }} />
           )}
+          artifact={artifactTab.crumbs}
+          tools={artifactTab.tools}
           actions={(
             <FileHeaderActions
               selectedFile={selectedFile}
@@ -791,10 +862,12 @@ function FilePanel({
               triggerDownloadFn={triggerDownloadFn}
               canDownload={canDownload}
               readFileFullFn={readFileFullFn}
-              servePrefix={apiAdapter?.servePrefix}
-              canShare={canShare}
-              // DALTON-HOOK(team-sharing): avoid owner-only grant fetch in colleague mirror mode
-              teamReadOnly={teamReadOnly}
+              access={access}
+              openPublish={artifactTab.openPublish}
+              // DALTON-HOOK(external-share-guard): external members may stop a
+              // public link but never start one.
+              openUnshareOnly={callerTier === 'external' ? (path) => setUnshareTarget(path) : null}
+              artifactDoc={artifactTab.doc}
               htmlSource={htmlView.source}
               // Only where the viewer is up to switch: not while loading, nor on an error card.
               onToggleHtmlSource={viewer === 'html' && !fileLoading && !fileError ? () => setHtmlSource((v) => !v) : null}
@@ -872,32 +945,28 @@ function FilePanel({
           <div className="file-panel-viewer">
             {/* font-content only while reading a file: the tree stays on the UI font. */}
             <div className={`file-panel-content${selectedFile ? ' font-content' : ''}`} ref={contentWrapperRef}>
-              {selectionTooltip && onAddContext && (
-                <button
-                  type="button"
-                  className="file-panel-selection-tooltip"
-                  style={{ left: Math.max(8, selectionTooltip.x - 60), top: Math.max(4, selectionTooltip.y - 32) }}
-                  // Acts on mousedown: a click would land after the browser has
-                  // already collapsed the selection it is meant to capture.
-                  onMouseDown={(e: React.MouseEvent) => {
-                    e.preventDefault(); e.stopPropagation();
-                    tabs.pinTab(activeTab.id);
-                    handleAddSelectionContext();
-                  }}
-                  onKeyDown={(e: React.KeyboardEvent) => {
-                    if (e.key !== 'Enter' && e.key !== ' ') return;
-                    e.preventDefault();
-                    tabs.pinTab(activeTab.id);
-                    handleAddSelectionContext();
-                  }}
-                >
-                  <TextSelect className="h-3.5 w-3.5" style={{ color: 'var(--color-accent-primary)' }} />
-                  {selectionTooltip.lineStart != null
+              <ImageReply surfaceRef={contentWrapperRef} enabled={!!onAddContext && isActive !== false} paused={!!selectionTooltip} agentName={agentName} onAddContext={onAddContext} />
+              {selectionTooltip && selectedFile && (
+                <SelectionQuote
+                  key={selectionTooltip.id}
+                  anchor={selectionTooltip}
+                  composing={selectionComposing}
+                  hidden={!onAddContext || isActive === false}
+                  boundsRef={contentWrapperRef}
+                  label={t('context.quote.from', { name: selectionSourceName(selectedFile, selectionTooltip) })}
+                  placeholder={agentName ? t('context.quote.reply', { name: agentName }) : t('context.quote.replyGeneric')}
+                  addLabel={selectionTooltip.lineStart != null
                     ? (selectionTooltip.lineEnd !== selectionTooltip.lineStart
                         ? t('context.addLinesToContext', { start: selectionTooltip.lineStart, end: selectionTooltip.lineEnd })
                         : t('context.addLineToContext', { line: selectionTooltip.lineStart }))
                     : t('context.addToContext')}
-                </button>
+                  onAdd={(reply) => {
+                    tabs.pinTab(activeTab.id);
+                    handleAddSelectionContext(reply);
+                  }}
+                  onReply={() => beginReply(selectionTooltip)}
+                  onDismiss={dismissSelection}
+                />
               )}
               {/* DALTON-HOOK(team-sharing): pass teamReadOnly so colleague mirror does not start preview sandbox */}
               <PreviewPanes tabs={tabs.tabs} activeId={activeTab.id} previews={previews} teamReadOnly={teamReadOnly} />
@@ -938,12 +1007,12 @@ function FilePanel({
                   onUndoRedoChange: edit.handleUndoRedoChange,
                   onEditorTextSelect: handleEditorTextSelect,
                   onAddContext: onAddContext ? addViewerContext : null,
-                  onContentMouseUp: handleContentMouseUp,
                   onViewerLink: handleViewerLink,
                   onAnchorLink: handleAnchorLink,
                   // DALTON-HOOK(team-sharing): forward teamReadOnly to FileViewer / HtmlViewer
                   teamReadOnly,
                   htmlSource: htmlView.source,
+                  htmlArtifact: artifactTab.view,
                 }}
                 onPageCount={onPageCount}
                 canUpload={!readOnly}
@@ -1032,6 +1101,18 @@ function FilePanel({
           />
         </Suspense>
       )}
+      {artifactTab.dialog}
+      {unshareTarget && (
+        <Suspense fallback={null}>
+          <PublishDialog
+            open
+            unshareOnly
+            workspaceId={workspaceId}
+            path={unshareTarget}
+            onClose={() => setUnshareTarget(null)}
+          />
+        </Suspense>
+      )}
       {selectedFile && memoEntry && memoStaleSandboxText !== null && (
         <MemoDiffModal
           open={memoDiffOpen}
@@ -1050,7 +1131,7 @@ function FilePanel({
 }
 
 export default FilePanel;
-export type { ContextPayload, PanelTarget } from './filePanel/types';
+export type { PanelTarget } from './filePanel/types';
 export { SYSTEM_DIR_PREFIXES } from './filePanel/fileMeta';
 // eslint-disable-next-line react-refresh/only-export-components
 export { categorizeFileError } from './filePanel/fileErrors';

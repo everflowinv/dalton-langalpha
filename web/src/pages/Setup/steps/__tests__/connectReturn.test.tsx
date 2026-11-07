@@ -30,7 +30,10 @@ const h = vi.hoisted(() => ({
 }));
 
 vi.mock('@/config/supportLinks', () => ({ PLATFORM_URL: '/account' }));
-vi.mock('@/hooks/useApiKeys', () => ({ useUpdateApiKeys: () => ({ mutateAsync: h.mutateAsync }) }));
+vi.mock('@/hooks/useApiKeys', () => ({
+  useApiKeys: () => ({ apiKeys: null, isLoading: false }),
+  useUpdateApiKeys: () => ({ mutateAsync: h.mutateAsync }),
+}));
 vi.mock('@/hooks/usePreferences', () => ({ usePreferences: () => ({ preferences: h.preferences }) }));
 vi.mock('@/hooks/useStoredPreferences', () => ({ useReadStoredPreferences: () => async () => h.preferences }));
 vi.mock('@/hooks/useUpdatePreferences', () => ({
@@ -81,6 +84,7 @@ import { ApiKeyConnect } from '../connectStep/ApiKeyConnect';
 import { CustomProviderConnect } from '../connectStep/CustomProviderConnect';
 import { SubscriptionConnect } from '../connectStep/SubscriptionConnect';
 import ProviderStep from '../ProviderStep';
+import ConnectStep from '../ConnectStep';
 import type { LocationState } from '../connectStep/shared';
 
 /**
@@ -425,20 +429,29 @@ describe('ProviderStep with a return', () => {
     expect(h.assign).not.toHaveBeenCalled();
   });
 
-  it('goes back naming the plan and region already saved for a provider with several', async () => {
+  it('goes back naming the plan region already saved, from the subscriptions', async () => {
     keepReturn();
+    // A coding plan is a subscription: listed under the plan's own name, its
+    // regions the only choice left.
     h.catalog = [
       { provider: 'z-ai', display_name: 'Zhipu AI', group: 'z-ai', group_display_name: 'Zhipu AI', access_type: 'api_key', region: 'intl', base_url: 'https://intl.example' },
-      { provider: 'z-ai-cn-coding', display_name: 'Zhipu AI', group: 'z-ai', group_display_name: 'Zhipu AI', access_type: 'coding_plan', region: 'cn', base_url: 'https://cn.example' },
+      { provider: 'z-ai-coding', display_name: 'GLM Coding Plan', group: 'z-ai', group_display_name: 'Zhipu AI', access_type: 'coding_plan', region: 'intl', base_url: 'https://plan.example' },
+      { provider: 'z-ai-cn-coding', display_name: 'GLM Coding Plan', group: 'z-ai', group_display_name: 'Zhipu AI', access_type: 'coding_plan', region: 'cn', base_url: 'https://cn.example' },
     ];
     h.configured = ['z-ai-cn-coding'];
     const user = userEvent.setup();
-    renderStep(<ProviderStep />, '/setup/provider');
+    render(
+      <QueryClientProvider client={createTestQueryClient()}>
+        <MemoryRouter initialEntries={[{ pathname: '/setup/provider', state: { list: 'oauth' } }]}>
+          <Routes>
+            <Route path="/setup/provider" element={<ProviderStep />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
 
-    await user.click(screen.getByRole('button', { name: /Zhipu AI/ }));
-    // Opens on the saved plan and region.
-    expect(screen.getByRole('button', { name: 'Coding plan' })).toHaveAttribute('aria-pressed', 'true');
-    await user.click(screen.getByRole('button', { name: 'Continue' }));
+    // The plan starts on the region its key is saved for, already connected.
+    await user.click(screen.getByRole('button', { name: /GLM Coding Plan/ }));
 
     expect(h.assign).toHaveBeenCalledWith(`${returnUrl()}&connected=z-ai-cn-coding`);
   });
@@ -466,7 +479,7 @@ describe('ProviderStep with a return', () => {
     const user = userEvent.setup();
     render(
       <QueryClientProvider client={createTestQueryClient()}>
-        <MemoryRouter initialEntries={[{ pathname: '/setup/provider', state: { method: 'oauth' } }]}>
+        <MemoryRouter initialEntries={[{ pathname: '/setup/provider', state: { list: 'oauth' } }]}>
           <Routes>
             <Route path="/setup/provider" element={<ProviderStep />} />
             <Route path="/setup/connect" element={<p>connect step</p>} />
@@ -480,5 +493,31 @@ describe('ProviderStep with a return', () => {
 
     expect(await screen.findByText('connect step')).toBeInTheDocument();
     expect(screen.queryByText('models step')).toBeNull();
+  });
+
+  it("returns from a coding plan's key form to the subscriptions it was picked from", async () => {
+    h.catalog = [
+      { provider: 'z-ai', display_name: 'Zhipu AI', group: 'z-ai', group_display_name: 'Zhipu AI', access_type: 'api_key', region: 'intl', base_url: 'https://intl.example' },
+      { provider: 'z-ai-coding', display_name: 'GLM Coding Plan', group: 'z-ai', group_display_name: 'Zhipu AI', access_type: 'coding_plan', region: 'intl', base_url: 'https://plan.example' },
+    ];
+    const user = userEvent.setup();
+    render(
+      <QueryClientProvider client={createTestQueryClient()}>
+        <MemoryRouter initialEntries={[{ pathname: '/setup/provider', state: { list: 'oauth' } }]}>
+          <Routes>
+            <Route path="/setup/provider" element={<ProviderStep />} />
+            <Route path="/setup/connect" element={<ConnectStep />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    await user.click(screen.getByRole('button', { name: /GLM Coding Plan/ }));
+    // The plan's form is a key's.
+    expect(await screen.findByPlaceholderText(/key/i)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Back' }));
+
+    expect(await screen.findByRole('button', { name: /ChatGPT/ })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /GLM Coding Plan/ })).toBeInTheDocument();
   });
 });

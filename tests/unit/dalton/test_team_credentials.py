@@ -34,6 +34,7 @@ import src.server.services.claude_oauth as claude_oauth_mod
 import src.server.services.codex_oauth as codex_oauth_mod
 import src.server.services.onboarding as onboarding_svc
 from src.server.app.api_keys import UpdateApiKeysRequest
+from src.server.database.sql_fences import advisory_key
 from src.utils.cache.redis_cache import RedisCacheClient
 
 HOLDER_ID = "991a99ad-8ff2-4bd8-bf08-e5963a248798"
@@ -42,6 +43,14 @@ MEMBER_ID = "33333333-3333-4333-8333-333333333333"
 
 _ORIG_LOAD_BASE_CONFIG = settings_mod._load_base_dalton_config
 _ORIG_GET_DB_CONNECTION = oauth_tokens_db.get_db_connection
+
+
+@asynccontextmanager
+async def _no_key_transaction(_user_id: str):
+    """Upstream #646 wraps `update_api_keys` writes in `key_writes`, whose
+    transaction needs a live pool; the write functions themselves are mocked
+    one by one in these tests (same shape as upstream's `test_api_keys.py`)."""
+    yield None
 
 
 @pytest.fixture(autouse=True)
@@ -739,7 +748,9 @@ async def test_non_pm_delete_and_disconnect_forbidden_while_pm_allowed(
     fake_set_byok_enabled = create_autospec(api_keys_app.set_byok_enabled, return_value=True)
     fake_upsert_api_key = create_autospec(api_keys_app.upsert_api_key, return_value=None)
     fake_delete_api_key = create_autospec(api_keys_app.delete_api_key, return_value=None)
-    fake_update_base_url = create_autospec(api_keys_db.update_base_url, return_value=None)
+    # Upstream #646 hoisted this import to `api_keys_app`, so the route's
+    # binding lives there now, not in the db module the function defines.
+    fake_update_base_url = create_autospec(api_keys_app.update_base_url, return_value=None)
     fake_invalidate_byok_cache = create_autospec(api_keys_app.invalidate_byok_cache, return_value=None)
     fake_invalidate_models = create_autospec(api_keys_app.invalidate_available_models, return_value=None)
     fake_get_user_api_keys = create_autospec(
@@ -753,13 +764,14 @@ async def test_non_pm_delete_and_disconnect_forbidden_while_pm_allowed(
     monkeypatch.setattr(api_keys_app, "set_byok_enabled", fake_set_byok_enabled)
     monkeypatch.setattr(api_keys_app, "upsert_api_key", fake_upsert_api_key)
     monkeypatch.setattr(api_keys_app, "delete_api_key", fake_delete_api_key)
-    monkeypatch.setattr(api_keys_db, "update_base_url", fake_update_base_url)
+    monkeypatch.setattr(api_keys_app, "update_base_url", fake_update_base_url)
     monkeypatch.setattr(api_keys_app, "invalidate_byok_cache", fake_invalidate_byok_cache)
     monkeypatch.setattr(api_keys_app, "invalidate_available_models", fake_invalidate_models)
     monkeypatch.setattr(api_keys_app, "get_user_api_keys", fake_get_user_api_keys)
     monkeypatch.setattr(onboarding_svc, "maybe_complete_personalization", fake_maybe_complete)
     get_db_conn_keys = create_autospec(api_keys_db.get_db_connection)
     monkeypatch.setattr(api_keys_db, "get_db_connection", get_db_conn_keys)
+    monkeypatch.setattr(api_keys_app, "key_writes", _no_key_transaction)
     cache_spy = create_autospec(RedisCacheClient(), instance=True)
     cache_spy.enabled = False
     cache_spy.client = None
@@ -907,9 +919,10 @@ async def test_non_pm_delete_and_disconnect_forbidden_while_pm_allowed(
         user_id=SECOND_PM_ID,
     )
     assert res_add["byok_enabled"] is True
-    fake_set_byok_enabled.assert_awaited_once_with(SECOND_PM_ID, True)
+    fake_set_byok_enabled.assert_awaited_once_with(SECOND_PM_ID, True, conn=None)
     fake_upsert_api_key.assert_awaited_once_with(
-        SECOND_PM_ID, "openai", "sk-member-new", base_url="https://member-proxy.example/v1"
+        SECOND_PM_ID, "openai", "sk-member-new",
+        base_url="https://member-proxy.example/v1", conn=None,
     )
     fake_update_base_url.assert_not_awaited()
     fake_invalidate_byok_cache.assert_awaited_once_with(SECOND_PM_ID)
@@ -920,7 +933,7 @@ async def test_non_pm_delete_and_disconnect_forbidden_while_pm_allowed(
     )
     assert res_pm_base_url is not None
     fake_update_base_url.assert_awaited_once_with(
-        SECOND_PM_ID, "openai", "https://pm-gateway.example/v1"
+        SECOND_PM_ID, "openai", "https://pm-gateway.example/v1", conn=None
     )
 
     res_pm_disable = await api_keys_app.update_api_keys(
@@ -928,7 +941,7 @@ async def test_non_pm_delete_and_disconnect_forbidden_while_pm_allowed(
         user_id=SECOND_PM_ID,
     )
     assert res_pm_disable is not None
-    fake_delete_api_key.assert_awaited_once_with(SECOND_PM_ID, "openai")
+    fake_delete_api_key.assert_awaited_once_with(SECOND_PM_ID, "openai", conn=None)
 
     monkeypatch.setattr(
         oauth_app,
@@ -952,6 +965,58 @@ async def test_non_pm_delete_and_disconnect_forbidden_while_pm_allowed(
     )
     pm_disconnect = await oauth_app.oauth_disconnect(key="codex", user_id=SECOND_PM_ID)
     assert pm_disconnect == {"success": True}
+
+
+@pytest.mark.asyncio
+async def test_key_writes_takes_advisory_lock_on_team_credential_holder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`key_writes` locks on the team credential holder, not the acting user:
+    the rows its transaction serializes are the holder's, so two team admins
+    saving the shared credentials at once take turns; with sharing off every
+    user is their own holder and locks under their own id."""
+    _enable_team_sharing(monkeypatch)
+
+    # A faithful AsyncConnection double: `key_writes` locks through
+    # `conn.execute` directly (no cursor), so that call is what records.
+    conn = create_autospec(AsyncConnection, instance=True)
+    lock_calls: list[tuple[str, tuple[Any, ...]]] = []
+
+    async def _record_lock_execute(query: Any, params: Any = None, **_kwargs: Any) -> None:
+        lock_calls.append((str(query), tuple(params)))
+
+    conn.execute.side_effect = _record_lock_execute
+
+    @asynccontextmanager
+    async def _tx_cm(*args: Any, **kwargs: Any):
+        yield None
+
+    conn.transaction.side_effect = _tx_cm
+
+    @asynccontextmanager
+    async def _get_db_conn(conn_arg: Any = None):
+        yield conn
+
+    monkeypatch.setattr(api_keys_db, "get_db_connection", _get_db_conn)
+
+    # Two different actors — a plain member and the second PM — both take the
+    # holder's lock, never their own.
+    assert advisory_key("API_KEYS", HOLDER_ID) != advisory_key("API_KEYS", MEMBER_ID)
+    for actor in (MEMBER_ID, SECOND_PM_ID):
+        lock_calls.clear()
+        async with api_keys_db.key_writes(actor) as locked_conn:
+            assert locked_conn is conn
+        assert len(lock_calls) == 1
+        assert "pg_advisory_xact_lock" in lock_calls[0][0]
+        assert lock_calls[0][1] == (advisory_key("API_KEYS", HOLDER_ID),)
+
+    # Sharing off: the actor is their own credential holder.
+    _enable_team_sharing(monkeypatch, sharing="off")
+    lock_calls.clear()
+    async with api_keys_db.key_writes(MEMBER_ID):
+        pass
+    assert len(lock_calls) == 1
+    assert lock_calls[0][1] == (advisory_key("API_KEYS", MEMBER_ID),)
 
 
 # ---------------------------------------------------------------------------
@@ -1933,7 +1998,7 @@ async def test_oauth_demotion_mid_flow_rejects_callback_and_poll_without_write(
         "generate_authorize_url",
         create_autospec(
             claude_oauth.generate_authorize_url,
-            return_value=("https://claude.ai/oauth/authorize?state=s-claude", "s-claude"),
+            return_value=("https://claude.ai/oauth/authorize?state=s-claude", "s-claude", "s-claude"),
         ),
     )
     monkeypatch.setattr(
@@ -2116,13 +2181,16 @@ async def test_non_team_mode_and_personal_model_preferences_unaffected(
     monkeypatch.setattr(api_keys_app, "invalidate_available_models", fake_inv_models)
     monkeypatch.setattr(api_keys_app, "get_user_api_keys", fake_get_keys)
     monkeypatch.setattr(onboarding_svc, "maybe_complete_personalization", fake_complete)
+    monkeypatch.setattr(api_keys_app, "key_writes", _no_key_transaction)
 
     res = await api_keys_app.update_api_keys(
         body=UpdateApiKeysRequest(api_keys={"openai": "sk-personal-1234"}),
         user_id=MEMBER_ID,
     )
     assert res["byok_enabled"] is True
-    fake_upsert_key.assert_awaited_once_with(MEMBER_ID, "openai", "sk-personal-1234", base_url=None)
+    fake_upsert_key.assert_awaited_once_with(
+        MEMBER_ID, "openai", "sk-personal-1234", base_url=None, conn=None
+    )
 
     # 2. In team mode, personal default model preferences still succeed for non-admin MEMBER_ID
     _enable_team_sharing(monkeypatch, sharing="team")

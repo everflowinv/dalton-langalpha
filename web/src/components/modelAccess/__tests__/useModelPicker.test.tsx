@@ -19,6 +19,8 @@ const h = vi.hoisted(() => ({
   rawModels: {} as Record<string, { models: string[] }>,
   connected: [] as string[],
   plans: {} as Record<string, string>,
+  // The provider's own list, when a test reads one.
+  available: undefined as Record<string, unknown> | undefined,
 }));
 
 vi.mock('@/hooks/useAllModels', () => ({
@@ -37,10 +39,10 @@ vi.mock('@/hooks/useConfiguredProviders', () => ({
   }),
 }));
 vi.mock('@/hooks/useProviderCatalog', () => ({
-  useProviderCatalog: () => ({ entryFor: (provider: string) => ({ provider }) }),
+  useProviderCatalog: () => ({ entryFor: (provider: string) => ({ provider }), connectionOf: (provider: string) => provider }),
 }));
 vi.mock('@/hooks/useProviderModels', () => ({
-  useAvailableModels: () => ({ data: undefined, isLoading: false, isFetching: false }),
+  useAvailableModels: () => ({ data: h.available, isLoading: false, isFetching: false }),
   useLocalProviderModels: () => ({ data: undefined, isLoading: false, isError: false }),
   useRefreshAvailableModels: () => vi.fn(),
 }));
@@ -69,6 +71,7 @@ afterEach(() => {
   h.stored = undefined;
   h.connected = [];
   h.plans = {};
+  h.available = undefined;
 });
 
 describe('useModelPicker on a coding plan', () => {
@@ -76,7 +79,7 @@ describe('useModelPicker on a coding plan', () => {
     zhipu();
     h.connected = ['z-ai-cn-coding'];
     const { result } = renderHookWithProviders(() =>
-      useModelPicker({ provider: 'z-ai-cn-coding', brandKey: 'z-ai-cn', justConnected: true }));
+      useModelPicker({ provider: 'z-ai-cn-coding', modelsFrom: 'z-ai-cn', justConnected: true }));
 
     await waitFor(() => expect(result.current.loading).toBe(false));
     expect([...result.current.selected]).toEqual(['glm-a-cn']);
@@ -94,7 +97,7 @@ describe('useModelPicker on a coding plan', () => {
       model_preference: { preferred_model: 'glm-a' },
       other_preference: { starred_models: ['glm-a'] },
     };
-    const { result } = renderHookWithProviders(() => useModelPicker({ provider: 'z-ai-coding', brandKey: 'z-ai' }));
+    const { result } = renderHookWithProviders(() => useModelPicker({ provider: 'z-ai-coding', modelsFrom: 'z-ai' }));
 
     await waitFor(() => expect(result.current.loading).toBe(false));
     expect(result.current.selected.size).toBe(0);
@@ -115,7 +118,7 @@ describe('useModelPicker on a coding plan', () => {
       },
       other_preference: { starred_models: ['glm-a'] },
     };
-    const { result } = renderHookWithProviders(() => useModelPicker({ provider: 'z-ai-coding', brandKey: 'z-ai' }));
+    const { result } = renderHookWithProviders(() => useModelPicker({ provider: 'z-ai-coding', modelsFrom: 'z-ai' }));
 
     await waitFor(() => expect(result.current.selected.has('glm-a')).toBe(true));
     act(() => result.current.toggle('glm-a'));
@@ -137,7 +140,7 @@ describe('useModelPicker saving beside another tab', () => {
       other_preference: { starred_models: ['tab-model'] },
     };
     const { result } = renderHookWithProviders(() =>
-      useModelPicker({ provider: 'z-ai-cn-coding', brandKey: 'z-ai-cn', justConnected: true }));
+      useModelPicker({ provider: 'z-ai-cn-coding', modelsFrom: 'z-ai-cn', justConnected: true }));
 
     await waitFor(() => expect(result.current.loading).toBe(false));
     await act(async () => { await result.current.save(); });
@@ -165,7 +168,7 @@ describe('useModelPicker beside a custom entry that took a built-in name', () =>
     const { result } = renderHookWithProviders(() => useModelPicker({ provider: 'openai' }));
 
     await waitFor(() => expect(result.current.loading).toBe(false));
-    expect(result.current.ready).toEqual(['gpt-sol']);
+    expect(result.current.ready.map((r) => r.name)).toEqual(['gpt-sol']);
     act(() => result.current.toggle('gpt-sol'));
     await act(async () => { await result.current.save(); });
 
@@ -210,6 +213,62 @@ describe('useModelPicker seed', () => {
 
     await waitFor(() => expect(result.current.loading).toBe(false));
     expect([...result.current.selected]).toEqual(['gpt-terra-oauth']);
-    expect(result.current.ready).not.toContain('gpt-spark-oauth');
+    expect(result.current.ready.map((r) => r.name)).not.toContain('gpt-spark-oauth');
+  });
+});
+
+describe("useModelPicker on a gateway's catalog", () => {
+  // OpenCode Go: no manifest models of its own; the catalog describes two,
+  // one the manifest knows, and lists one it does not describe.
+  const gateway = () => {
+    h.manifest = {};
+    h.rawModels = {};
+    h.connected = ['go'];
+    h.available = {
+      provider: 'go',
+      status: 'ok',
+      ready: [],
+      missing: [],
+      others: [
+        { id: 'kimi-k9', display_name: 'Kimi K9', described: true, known: true, route: 'go-anthropic', parameters: { a: 1 } },
+        { id: 'qwen-z', display_name: 'Qwen Z', described: true, route: 'go-chat' },
+        { id: 'raw-model', route: 'go-chat' },
+      ],
+    };
+  };
+
+  it('lists the described models as ready, starts on the known ones, and saves them under their route', async () => {
+    gateway();
+    const { result } = renderHookWithProviders(() => useModelPicker({ provider: 'go', justConnected: true }));
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.ready.map((r) => r.name)).toEqual(['go/kimi-k9', 'go/qwen-z']);
+    expect([...result.current.selected]).toEqual(['go/kimi-k9']);
+    expect(result.current.others.map((m) => m.id)).toEqual(['raw-model']);
+
+    act(() => result.current.selectAllReady());
+    await act(async () => { await result.current.save(); });
+
+    expect(lastWrite().model_preference?.custom_models).toEqual([
+      { name: 'go/kimi-k9', model_id: 'kimi-k9', provider: 'go-anthropic', parameters: { a: 1 }, display_name: 'Kimi K9' },
+      { name: 'go/qwen-z', model_id: 'qwen-z', provider: 'go-chat', display_name: 'Qwen Z' },
+    ]);
+    expect(lastWrite().other_preference?.starred_models).toEqual(['go/kimi-k9', 'go/qwen-z']);
+  });
+
+  it("puts an untuned model it ticks on the user's own, where it stays unticked until removed", async () => {
+    gateway();
+    const { result } = renderHookWithProviders(() => useModelPicker({ provider: 'go' }));
+
+    await waitFor(() => expect(result.current.loading).toBe(false));
+    expect(result.current.yours).toEqual([]);
+    const name = result.current.nameOf({ id: 'raw-model' });
+    act(() => result.current.toggle(name));
+    expect(result.current.yours).toEqual([name]);
+    act(() => result.current.toggle(name));
+    expect(result.current.yours).toEqual([name]);
+    expect(result.current.selected.has(name)).toBe(false);
+    act(() => result.current.removeYours(name));
+    expect(result.current.yours).toEqual([]);
   });
 });

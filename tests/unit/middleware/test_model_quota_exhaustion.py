@@ -496,3 +496,117 @@ async def test_one_fallback_notice_for_a_whole_main_agent_run(events, monkeypatc
     assert switches[0]["to_model"] == "gemini-4-argon-high-oauth"
     assert switches[0]["attempts_on_from"] == 1
     assert switches[0]["status_code"] == 402
+
+
+@pytest.mark.asyncio
+async def test_a_benched_primary_is_not_readmitted_when_the_fallbacks_stream_cuts(
+    no_sleep, events
+):
+    """Upstream #651's truncation refusal under the Dalton bench: the primary
+    sits the run out on its 402 bench while the fallback's every stream gets
+    cut. The cut reply is refused and retried once (a cut that repeats is the
+    server's limit), the run raises the primary's remembered 402, and the
+    next call of the run still never re-asks the benched primary."""
+    from langchain.agents.middleware.types import ModelResponse
+    from langchain_core.messages import AIMessage
+
+    def _cut_reply():
+        # The shape a Responses stream leaves when the server closes it
+        # before the response's terminal event: an id, no terminal fields.
+        return ModelResponse(
+            result=[
+                AIMessage(
+                    content=[{"type": "reasoning", "id": "rs_cut", "summary": []}],
+                    response_metadata={"id": "resp_1"},
+                )
+            ]
+        )
+
+    primary, fallback = _FakeModel("grok-4.7"), _FakeModel("spare")
+    mw = _make_middleware(primary, [(fallback.model, fallback)])
+    calls = []
+
+    async def handler(req):
+        calls.append(req.model.model)
+        if req.model is primary:
+            raise _grok_402()
+        return _cut_reply()
+
+    with pytest.raises(Exception, match="usage balance exhausted"):
+        await mw.awrap_model_call(_FakeRequest(primary), handler)
+    # One 402, then the cut twice: the repeating cut gets its one retry.
+    assert calls == ["grok-4.7", "spare", "spare"]
+
+    calls.clear()
+    with pytest.raises(Exception, match="usage balance exhausted") as caught:
+        await mw.awrap_model_call(_FakeRequest(primary), handler)
+    assert calls == ["spare", "spare"], "the benched primary is not re-asked"
+    trace = getattr(caught.value, "__model_resilience__", None)
+    assert trace, "the attempt trace rides the raised refusal"
+    assert trace["model"] == "grok-4.7"
+    assert trace["attempted_models"][0]["attempts"] == 0  # benched, never dialed
+
+
+@pytest.mark.asyncio
+async def test_the_missing_item_repair_answers_on_the_fallback_while_the_primary_sits_benched(
+    no_sleep, events
+):
+    """Upstream #651's 404 repair under the Dalton bench: the fallback's
+    "Item with id 'rs_cut' not found" strips the bare reasoning item and
+    answers on the resend, while the benched primary is neither re-asked nor
+    named as a switch target."""
+    from langchain.agents.middleware.types import ModelResponse
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    sealed = {
+        "type": "reasoning",
+        "id": "rs_done",
+        "summary": [],
+        "encrypted_content": "opaque",
+    }
+    bare = {"type": "reasoning", "id": "rs_cut", "summary": []}
+    history = [
+        HumanMessage("q", id="h-1"),
+        AIMessage(content=[sealed, {"type": "text", "text": "a"}], id="a-1"),
+        AIMessage(content=[bare], id="a-2"),
+        HumanMessage("what happened?", id="h-2"),
+    ]
+
+    def _not_found():
+        exc = Exception("Item with id 'rs_cut' not found.")
+        exc.status_code = 404
+        exc.param = "input"
+        return exc
+
+    primary, fallback = _FakeModel("grok-4.7"), _FakeModel("spare")
+    mw = _make_middleware(primary, [(fallback.model, fallback)])
+    calls = []
+    seen = []
+    not_found_raised = False
+
+    async def handler(req):
+        calls.append(req.model.model)
+        seen.append([m.id for m in req.messages])
+        if req.model is primary:
+            raise _grok_402()
+        nonlocal not_found_raised
+        if not not_found_raised:
+            not_found_raised = True
+            raise _not_found()
+        return ModelResponse(result=[AIMessage("ok")])
+
+    result = await mw.awrap_model_call(_FakeRequest(primary, history), handler)
+
+    assert calls == ["grok-4.7", "spare", "spare"]
+    # The resend dropped the bare item the server never stored; the sealed
+    # one carries itself and stays.
+    assert seen[1:] == [["h-1", "a-1", "a-2", "h-2"], ["h-1", "a-1", "h-2"]]
+    assert result.result[0].content == "ok"
+
+    switches = [e["props"] for e in events if e.get("name") == "model_fallback"]
+    assert switches and switches[0]["from_model"] == "grok-4.7"
+    assert all(p["to_model"] == "spare" for p in switches)
+
+    calls.clear()
+    assert await mw.awrap_model_call(_FakeRequest(primary, history), handler)
+    assert calls == ["spare"], "the benched primary is not re-asked"

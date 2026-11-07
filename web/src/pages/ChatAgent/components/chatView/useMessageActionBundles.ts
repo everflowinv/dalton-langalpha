@@ -12,12 +12,21 @@ type Action<K extends keyof MessageActions> = NonNullable<MessageActions[K]>;
 export interface MessageActionSources {
   onOpenFile: Action<'onOpenFile'>;
   onDownloadFile: Action<'onDownloadFile'>;
+  onPublishFile: Action<'onPublishFile'>;
+  /**
+   * DALTON-HOOK(external-share-guard)/(team-sharing): whether this chat's
+   * file cards may offer Publish at all — the workspace's own owner only. A
+   * colleague (rw or ro), an external member, or a read-only thread gets no
+   * entry; the server refuses them regardless.
+   */
+  publishAllowed?: boolean;
   downloadKeyFor: Action<'downloadKeyFor'>;
   onRevealFiles: Action<'onRevealFiles'>;
   onRevealMessage: Action<'onRevealMessage'>;
   onOpenSources: Action<'onOpenSources'>;
   onToolCallDetailClick: Action<'onToolCallDetailClick'>;
   onOpenChart: Action<'onOpenChart'>;
+  onOpenArtifactComment: Action<'onOpenArtifactComment'>;
   onOpenSubagentTask: Action<'onOpenSubagentTask'>;
   onOpenDispatcher: Action<'onOpenDispatcher'>;
   onAnswerQuestion: Action<'onAnswerQuestion'>;
@@ -64,12 +73,14 @@ export function useMessageActionBundles(src: MessageActionSources): {
 } {
   const stableOpenFile = useStableHandler(src.onOpenFile);
   const stableDownloadFile = useStableHandler(src.onDownloadFile);
+  const stablePublishFile = useStableHandler(src.onPublishFile);
   const stableDownloadKeyFor = useStableHandler(src.downloadKeyFor);
   const stableRevealFiles = useStableHandler(src.onRevealFiles);
   const stableRevealMessage = useStableHandler(src.onRevealMessage);
   const stableOpenSources = useStableHandler(src.onOpenSources);
   const stableToolCallDetail = useStableHandler(src.onToolCallDetailClick);
   const stableOpenChart = useStableHandler(src.onOpenChart);
+  const stableOpenArtifactComment = useStableHandler(src.onOpenArtifactComment);
   const stableOpenSubagentTask = useStableHandler(src.onOpenSubagentTask);
   const stableOpenDispatcher = useStableHandler(src.onOpenDispatcher);
   const stableAnswerQuestion = useStableHandler(src.onAnswerQuestion);
@@ -102,6 +113,7 @@ export function useMessageActionBundles(src: MessageActionSources): {
   // this object is built once and never re-renders the memoized message tree.
   // DALTON-HOOK(team-sharing): in read-only mode, expose only navigation actions
   const readOnly = Boolean(src.readOnly);
+  const publishAllowed = src.publishAllowed !== false && !readOnly;
   const messageActions = useMemo<MessageActions>(() => (
     readOnly
       ? {
@@ -119,12 +131,14 @@ export function useMessageActionBundles(src: MessageActionSources): {
       : {
           onOpenFile: stableOpenFile,
           onDownloadFile: stableDownloadFile,
+          ...(publishAllowed ? { onPublishFile: stablePublishFile } : {}),
           downloadKeyFor: stableDownloadKeyFor,
           onRevealFiles: stableRevealFiles,
           onRevealMessage: stableRevealMessage,
           onOpenSources: stableOpenSources,
           onToolCallDetailClick: stableToolCallDetail,
           onOpenChart: stableOpenChart,
+          onOpenArtifactComment: stableOpenArtifactComment,
           onOpenSubagentTask: stableOpenSubagentTask,
           onOpenDispatcher: stableOpenDispatcher,
           onAnswerQuestion: stableAnswerQuestion,
@@ -156,7 +170,7 @@ export function useMessageActionBundles(src: MessageActionSources): {
     stableApprovePTCAgent, stableRejectPTCAgent, stableApproveSecretaryAction,
     stableRejectSecretaryAction, stableResumeCreditPause, stableApproveToolCall, stableRejectToolCall,
     stableEditMessage, stableRegenerate, stableRetry, editDrafts,
-    stableThumbUp, stableThumbDown, stableSendMessage,
+    stableThumbUp, stableThumbDown, stableSendMessage, publishAllowed, // DALTON-HOOK(external-share-guard)
   ]);
 
   // The subagent transcript is a DIFFERENT surface: its cards belong to a task,
@@ -167,10 +181,11 @@ export function useMessageActionBundles(src: MessageActionSources): {
   const subagentMessageActions = useMemo<MessageActions>(() => ({
     onOpenFile: stableOpenFile,
     onDownloadFile: stableDownloadFile,
+    ...(publishAllowed ? { onPublishFile: stablePublishFile } : {}), // DALTON-HOOK(external-share-guard)
     downloadKeyFor: stableDownloadKeyFor,
     onToolCallDetailClick: stableToolCallDetail,
     onOpenChart: stableOpenChart,
-  }), [stableOpenFile, stableDownloadFile, stableDownloadKeyFor, stableToolCallDetail, stableOpenChart]);
+  }), [stableOpenFile, stableDownloadFile, stablePublishFile, stableDownloadKeyFor, stableToolCallDetail, stableOpenChart, publishAllowed]);
 
   return { messageActions, subagentMessageActions };
 }

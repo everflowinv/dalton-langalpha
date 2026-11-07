@@ -7,16 +7,17 @@ This module creates a PTC agent that:
 - Supports sub-agent delegation for specialized tasks
 """
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from functools import partial
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 from langchain.agents import create_agent
 
 from ptc_agent.agent.backends import SandboxBackend
-from ptc_agent.core.paths import SandboxLayout, WorkspaceLayout
+from ptc_agent.core.paths import LANGALPHA_CONFIG_SPELLINGS, SandboxLayout, WorkspaceLayout
 from ptc_agent.core.project_context import ProjectContext
 from ptc_agent.agent.limits import UNBOUNDED_RECURSION_LIMIT
 from ptc_agent.agent.main_state import MainAgentState
@@ -32,6 +33,7 @@ from ptc_agent.agent.middleware import (
     MultimodalMiddleware,
     MultimodalStripMiddleware,
     CodeValidationMiddleware,
+    ComputerArgumentGuardMiddleware,
     CreditGateMiddleware,
     EmptyToolCallRetryMiddleware,
     LeakDetectionMiddleware,
@@ -63,6 +65,7 @@ from ptc_agent.agent.middleware.compaction.notes import (
     ThreadScratchpad,
     notes_window_carry,
 )
+from ptc_agent.agent.middleware.compaction.rebuild import TurnStartRebuilds
 from ptc_agent.agent.middleware.compaction.window import WindowCoverage
 from ptc_agent.agent.middleware.direct_mcp import (
     DirectToolSet,
@@ -132,6 +135,14 @@ from ptc_agent.agent.tools import (
     create_show_widget_tool,
     TodoWrite,
 )
+from ptc_agent.agent.tools.computer_reach import (
+    REACHABLE_TOOLS,
+    ComputerReach,
+    ComputerTarget,
+    ComputerTools,
+)
+from ptc_agent.agent.tools.artifact_comments import create_reply_to_comment_tool
+from src.llms.claude_code import ClaudeCodeTarget
 from src.tools.web.search import get_web_search_tool
 from src.tools.web.fetch import web_fetch_tool
 from src.tools.web.crawl import create_crawl_tools
@@ -156,6 +167,9 @@ from ptc_agent.core.sandbox.livefs_mount import CallContext
 from ptc_agent.agent.tools.command_handoff import HandOff
 
 from ptc_agent.agent.turn import build_model_resilience_middleware, turn_model
+
+if TYPE_CHECKING:
+    from ptc_agent.agent.claude_code.launcher import Launcher
 
 try:
     from langgraph.types import Checkpointer
@@ -200,6 +214,7 @@ class PTCAgent:
         chart_annotation_enabled: bool = True,
         role: AgentRole = "analyst",
         channels_enabled: bool = False,
+        claude_code: bool = False,
         # DALTON-HOOK(team-memory-toggle): gate conversation_search prompt sentence on whether tool is mounted
         conversation_search_enabled: bool = False,
     ) -> str:
@@ -213,7 +228,9 @@ class PTCAgent:
         deployment's messaging service and the turn having a user, neither of
         which moves between a thread's turns. ``history_files`` says the file
         tools read past threads with no mount, which follows the computer's
-        kind, so it does not move between them either.
+        kind, so it does not move between them either. ``claude_code`` asks
+        for one question per call, since a Claude Code turn holds one call for
+        the user at a time.
         """
         loader = get_loader()
         return loader.get_system_prompt(
@@ -241,6 +258,7 @@ class PTCAgent:
             chart_annotation_enabled=chart_annotation_enabled,
             role=role,
             channels_enabled=channels_enabled,
+            claude_code=claude_code,
             # DALTON-HOOK(team-memory-toggle): gate conversation_search prompt sentence on whether tool is mounted
             conversation_search_enabled=conversation_search_enabled,
         )
@@ -288,6 +306,8 @@ class PTCAgent:
         # DALTON-HOOK(colleague-dispatch): workspace owner identity and tail-turn tool trimming
         workspace_owner_id: str | None = None,
         tail_turn_no_new_work: bool = False,
+        computers: ComputerReach | None = None,
+        claude_code_launcher: "Callable[[PTCSandbox], Launcher] | None" = None,
         # DALTON-HOOK(team-memory-toggle): per-workspace / Home user-level Team Memory switch
         team_memory_enabled: bool = False,
     ) -> Any:
@@ -338,11 +358,19 @@ class PTCAgent:
             cancel_notices: The user's cancels of wakeups on this thread,
                 read before every call. None for a build with no thread row
                 to read, which tells the agent of none.
+            computers: The user's other computers, which the Chief of Staff's
+                own Bash, ExecuteCode and file tools take a ``computer`` to run
+                on. None leaves every tool on this computer.
+            claude_code_launcher: Where a Claude Code turn's CLI runs, given
+                the sandbox; the server picks it, and the token it signs in with.
 
         Returns:
             Configured BackgroundSubagentOrchestrator wrapping the deepagent.
         """
         turn = turn_model(self.config, llm, self.llm, background=False)
+        claude_code = isinstance(turn.client, ClaudeCodeTarget)
+        # A subagent does not run on the Claude Code runtime yet.
+        disable_subagents = disable_subagents or claude_code
 
         # Freeze current time for this request (refreshes on each new query)
         request_time = datetime.now(tz=UTC)
@@ -501,6 +529,7 @@ class PTCAgent:
         read_file, write_file, edit_file = create_filesystem_tools(
             filesystem_backend,
             operation_callback=operation_callback,
+            record_creators=True,
         )
         search_tools = [
             create_glob_tool(filesystem_backend),  # overrides middleware glob
@@ -520,7 +549,11 @@ class PTCAgent:
             filesystem_tools
             if subagent_files is filesystem_backend
             else [
-                *create_filesystem_tools(subagent_files, operation_callback=operation_callback),
+                *create_filesystem_tools(
+                    subagent_files,
+                    operation_callback=operation_callback,
+                    record_creators=True,
+                ),
                 *search_tools,
             ]
         )
@@ -581,8 +614,10 @@ class PTCAgent:
                 # a repeat reaches none of them.
                 RepeatCallGuardMiddleware(),
                 ToolArgumentParsingMiddleware(),
+                ComputerArgumentGuardMiddleware(),
                 ProtectedPathMiddleware(
                     denied_directories=self.config.filesystem.denied_directories,
+                    denied_patterns=(LANGALPHA_CONFIG_SPELLINGS,),
                 ),
                 CodeValidationMiddleware(),
                 ToolErrorHandlingMiddleware(),
@@ -679,15 +714,18 @@ class PTCAgent:
         # middleware, and its tool hook must wrap the Task interceptor so a
         # resume it calls settles on that call's result. Without subagents
         # there is no TaskOutput to read a task report's result with, nor a
-        # task to resume, so only steers are taken in.
-        main_only_middleware.append(
-            SteeringMiddleware(
-                report_inbox=_bg_registry.report_inbox,
-                kinds=(
-                    ("steer",) if disable_subagents else ("report", "steer", "resume")
-                ),
-            )
+        # task to resume, so only steers are taken in. A Claude Code turn runs
+        # no subagents but takes the other reports in (a command's end, a
+        # wakeup, an alert), which its tool hook hands Claude mid-turn.
+        steering = SteeringMiddleware(
+            report_inbox=_bg_registry.report_inbox,
+            kinds=(
+                ("report", "steer")
+                if claude_code
+                else ("steer",) if disable_subagents else ("report", "steer", "resume")
+            ),
         )
+        main_only_middleware.append(steering)
 
         # The user's cancels of wakeups the agent set, after the steers that
         # reached this call. Whether or not wakeups are on, so the row saying
@@ -788,6 +826,44 @@ class PTCAgent:
 
         tools: list[Any] = [execute_code_tool, bash_tool, *shared_tools]
 
+        def tools_on(target: ComputerTarget) -> dict[str, Any]:
+            """The machine tools over another computer's session. Each command
+            is still this thread's, so it hands off to it; the mount serves
+            it the computer's root, which is no workspace's folder."""
+            there = SandboxBackend(target.sandbox, operation_callback=operation_callback)
+            there_call = CallContext(
+                workspace_id=None, thread_id=thread_id, timezone=call_context.timezone
+            )
+            machine = {
+                "thread_id": short_thread_id,
+                "session": target.session,
+                "call_context": there_call,
+                "file_tools_only": file_tools_only,
+                "hand_off": (
+                    replace(hand_off, computer=target.name, computer_id=target.computer_id)
+                    if hand_off is not None
+                    else None
+                ),
+            }
+            built = [
+                create_execute_code_tool(there, mcp_registry, **machine),
+                create_execute_bash_tool(there, **machine),
+                *create_filesystem_tools(there, operation_callback=operation_callback),
+                create_glob_tool(there),
+                create_grep_tool(there),
+            ]
+            return {tool.name: tool for tool in built}
+
+        # Only the Chief of Staff's own: a subagent's tools stay on this
+        # computer, as an analyst's do.
+        reach = computers if role == "chief_of_staff" else None
+        if reach is not None:
+            computer_tools = ComputerTools(reach, tools_on, sandbox)
+            tools = [
+                computer_tools.wrap(tool) if tool.name in REACHABLE_TOOLS else tool
+                for tool in tools
+            ]
+
         if role == "chief_of_staff":
             from src.tools.secretary.approvals import StandingApprovalMiddleware
 
@@ -841,6 +917,7 @@ class PTCAgent:
             chart_annotation_enabled=chart_annotation,
             role=role,
             channels_enabled=gates.channels,
+            claude_code=claude_code,
             conversation_search_enabled=conversation_search_enabled,  # DALTON-HOOK(team-memory-toggle)
         )
         # Read once: the baseline freezes this value per epoch, and the
@@ -885,6 +962,7 @@ class PTCAgent:
             workspace_id=workspace_id_for_memory,
             receives=multimodal_strip.receives,
             page_tokens=multimodal_strip.pdf_page_tokens,
+            large_results_dir=eviction_dir,
         )
         # The main agent is asked to update its scratchpad notes before each
         # summary, and its summaries name them; a subagent's do not. Without
@@ -907,10 +985,20 @@ class PTCAgent:
                     wakeup_cancels_window_carry,
                 ],
             )
+        if main_compaction is not None:
+            main_compaction = main_compaction.with_turn_start_rebuilds(
+                TurnStartRebuilds(
+                    self.config.compaction.rebuild_floor_tokens,
+                    settled_at=turn_context.previous_run_settled_at if turn_context else None,
+                    cold_tokens=self.config.compaction.cold_compact_tokens,
+                    keep_full_context=bool(turn_context and turn_context.keep_full_context),
+                    sent_at=turn_context.sent_at if turn_context else None,
+                )
+            )
 
         model_resilience = [build_model_resilience_middleware(self.config, turn)]
 
-        multimodal_read = MultimodalMiddleware(sandbox=sandbox)
+        multimodal_read = MultimodalMiddleware(sandbox=sandbox, computers=reach)
 
         # Placed before (outer to) model_resilience so sandbox images are
         # captured once, on the final response only — not per retry attempt.
@@ -1072,13 +1160,29 @@ class PTCAgent:
         # Messaging the user (send_message, list_message_targets), present only
         # when a channel gateway is configured. Main agent only, added after the
         # subagent snapshot: a subagent reports to its parent, never to a person.
-        tools.extend(build_messaging_tools(role))
+        tools.extend(build_messaging_tools(role, computers=reach))
 
         # The agent's own follow-ups on this thread, main agent only and
         # added after the subagent snapshot: a wakeup comes back to the
         # thread, and a subagent has no thread of its own to come back to.
         if wakeups_on:
             tools.append(build_schedule_wakeup_tool())
+
+        # Answering the user's comments on files, main agent only and added
+        # after the subagent snapshot: comments are sent to a thread, and a
+        # subagent has no thread of its own. On every turn, not only those
+        # carrying comments, so the tool list holds still for the prompt cache.
+        # DALTON-HOOK(artifact-publishing-off): the tool list is decided by
+        # the deployment switch (dalton.artifact_publishing.enabled) rather
+        # than per turn, so within one deployment it still holds still for the
+        # prompt cache; flipping the switch is a deployment change that calls
+        # for re-recording the request lock. The tool writes to the comments
+        # tables in its own body, so the HTTP-layer refusals cannot reach it —
+        # not registering it is the whole guard.
+        from src.dalton.settings import is_artifact_publishing_enabled
+
+        if thread_id and is_artifact_publishing_enabled():
+            tools.append(create_reply_to_comment_tool())
 
         # What will report back to the thread, main agent only for the same
         # reason: a subagent's own commands wait, and its result covers them.
@@ -1214,16 +1318,37 @@ class PTCAgent:
             state_schema=MainAgentState,
         ).with_config({"recursion_limit": UNBOUNDED_RECURSION_LIMIT})
 
+        alert_senders = frozenset(
+            sender
+            for sender, on in (
+                (MARKET_ALERT_SENDER, self.config.feature_enabled("market_watch")),
+                (WAKEUP_SENDER, wakeups_on),
+            )
+            if on
+        )
+        if claude_code:
+            from ptc_agent.agent.claude_code.agent import claude_code_graph
+            from ptc_agent.agent.claude_code.compaction import CompactionRules
+
+            if claude_code_launcher is None:
+                raise RuntimeError("a Claude Code turn needs a claude_code_launcher")
+
+            return claude_code_graph(
+                agent, system_prompt=system_prompt, target=turn.client,
+                user_id=user_id, thread_id=thread_id, checkpointer=checkpointer,
+                launcher=claude_code_launcher(sandbox),
+                entry=(skill_loader_middleware, context.turn, context.baseline),
+                middleware=deepagent_middleware,
+                baseline=context.baseline.frozen_block,
+                steering=steering,
+                alert_senders=alert_senders,
+                compaction=CompactionRules.of(self.config.compaction, turn_context, backend=backend,
+                                              workspace_id=workspace_id_for_memory),
+            )
+
         return BackgroundSubagentOrchestrator(
             agent=agent,
             middleware=background_middleware,
             auto_wait=self.config.background_auto_wait,
-            alert_senders=frozenset(
-                sender
-                for sender, on in (
-                    (MARKET_ALERT_SENDER, self.config.feature_enabled("market_watch")),
-                    (WAKEUP_SENDER, wakeups_on),
-                )
-                if on
-            ),
+            alert_senders=alert_senders,
         )

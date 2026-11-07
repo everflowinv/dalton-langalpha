@@ -311,6 +311,31 @@ ALLOWED_HOOKS=(
   # 但赔率变了）——validate 的 changed/reason 组合校验、price_move 推送按
   # payoff_assessment.changed=true 放行并改标题、完成契约的必填与推送稿要求。
   "payoff-assessment"
+  # sync3 B5/D16①（上游 #655）：上游 release.py::_sources() 决定静态 prompt 的
+  # 发布指纹（部署变化 → 旧线程下一轮 due/rebuild）。Dalton 的 data_map 经
+  # loader.py 的 data-map 钩子渲染进 system.md.j2 / tool_guide.md.j2，其渲染
+  # 输入（data_map 的 __init__/builder/health/sources.yaml）由此 hook 登记进
+  # _sources()；运行时重新生成的 src/dalton/llm/openclaw_overlay.json 明确排除。
+  "prompt-release-sources"
+  # sync3 B9（上游 #656 电脑 CLI token）的部署级开关
+  # dalton.computer_cli_tokens.enabled（默认 false）的三道拦截：cli_tokens.keep()
+  # 开头返回 False、CliTokenSweeper.start() 不启动循环且 sweep_once() 在
+  # _prune_calls()/claim_due() 之前返回 0、get_principal 的 lac1 分支 401。
+  "computer-cli-tokens-off"
+  # sync3 B11（上游 #666 artifact 发布/评论）的部署级开关
+  # dalton.artifact_publishing.enabled（代码默认 false，生产设 true）的七道
+  # 拦截：publish 与 set keep_updated=True 403、bind 403、评论写接口 403、
+  # 带 artifact_comment_ids 的发送 409（messaging 构造流式响应之前 + ptc_run
+  # 进 CommentSendScope 之前各一道）、keep_updated_after_turn 直接返回、
+  # agent 不注册 reply_to_comment。
+  "artifact-publishing-off"
+  # sync3 B11 带入的 0.6 回滚补丁：DALTON_WORKSPACE_FILE_GC_DISABLED=1 时
+  # WorkspaceFileGCService.start() 不启动 sweep（回滚期间旧 GC 不得删掉
+  # artifact_version_files 仍引用的对象）。
+  "workspace-file-gc-kill"
+  # sync3 B11 r4（审查修正）：legacy 首读不再无条件把 keep_updated 写回
+  # TRUE——101 迁移已回填过，属主迁移后改成的 False 必须在首读后仍然成立。
+  "legacy-keeps-owner-setting"
   # Team Memory toggle: per-workspace and Home user-level switch for conversation_search
   "team-memory-toggle"
   # Provenance batching: replay per-message accumulation and live per-frame flush

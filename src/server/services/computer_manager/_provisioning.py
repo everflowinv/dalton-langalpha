@@ -91,7 +91,7 @@ class ProvisioningMixin:
         # may name someone else's sandbox. NULL means nothing to destroy.
         computer_id = binding.computer_id
         durable_sandbox_id = binding.provider_ref
-        await self._revoke_data_token(computer_id)
+        await self._revoke_computer_tokens(computer_id)
         await self._revoke_livefs(computer_id)
         # Its previews end with it rather than at expiry, on every path that
         # retires a machine, the sweep's included.
@@ -299,7 +299,7 @@ class ProvisioningMixin:
         # built it has bound it.
         token = (
             asyncio.ensure_future(
-                self._keep_data_token(binding.computer_id, user_id, sandbox)
+                self._keep_computer_tokens(binding.computer_id, user_id, sandbox)
             )
             if reusing_sandbox
             else None
@@ -695,7 +695,7 @@ class ProvisioningMixin:
         # A rebuild no turn follows (a spec change, a platform-secret
         # rotation) would otherwise leave the new sandbox without a token
         # until the sweep reached it.
-        await self._keep_data_token(binding.computer_id, user_id, session.sandbox)
+        await self._keep_computer_tokens(binding.computer_id, user_id, session.sandbox)
         return session
 
     async def _stamp_sandbox_config(self, binding: ComputerBinding) -> None:
@@ -1049,14 +1049,31 @@ class ProvisioningMixin:
         still flagged is touched, only on the sandbox the caller holds, and a
         failure is that sibling's alone: it restores on its own next open.
         """
+        if getattr(session, "sandbox", None) is None:
+            return
+        try:
+            binding = await self.resolve_binding(workspace_id)
+        except Exception as e:
+            logger.warning(f"Could not list sibling restores for {workspace_id}: {e}")
+            return
+        await self.restore_owed_folders(session, binding, skip=workspace_id)
+
+    async def restore_owed_folders(
+        self, session: Any, binding: ComputerBinding, *, skip: str | None = None
+    ) -> None:
+        """Restore every workspace on ``binding``'s computer still owed its
+        files, but ``skip``, onto the sandbox ``session`` holds. For a caller
+        that reads the computer's folders without opening each workspace:
+        Home's agent, on its own computer or another it reaches."""
         sandbox = getattr(session, "sandbox", None)
         if sandbox is None:
             return
         try:
-            binding = await self.resolve_binding(workspace_id)
             owed = await get_restore_owed_workspaces_for_computer(binding.computer_id)
         except Exception as e:
-            logger.warning(f"Could not list sibling restores for {workspace_id}: {e}")
+            logger.warning(
+                f"Could not list owed restores on computer {binding.computer_id}: {e}"
+            )
             return
         sandbox_id = self._session_sandbox_id(session)
         gate = asyncio.Semaphore(_SIBLING_RESTORES_AT_ONCE)
@@ -1078,7 +1095,7 @@ class ProvisioningMixin:
                         )
                 except Exception as e:
                     logger.warning(
-                        f"Could not restore sibling {sibling_id} for {workspace_id}; "
+                        f"Could not restore {sibling_id} on computer {binding.computer_id}; "
                         f"it restores on its own next open: {e}"
                     )
 
@@ -1089,7 +1106,7 @@ class ProvisioningMixin:
             *(
                 restore(sibling_id)
                 for sibling_id, epoch in owed.items()
-                if sibling_id != workspace_id
+                if sibling_id != skip
                 and self._projects_attached.get((sibling_id, sandbox_id), _UNSEEN) != epoch
             )
         )

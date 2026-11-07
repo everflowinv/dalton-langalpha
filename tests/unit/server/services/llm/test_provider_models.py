@@ -288,8 +288,8 @@ class TestListUrl:
 
     def test_the_coding_variant_lists_at_its_own_endpoint(self, mc):
         info = mc.get_provider_info("moonshot-coding")
-        assert pm.list_url(info, pm.ANTHROPIC, None) == (
-            "https://api.kimi.com/coding/v1/models?limit=1000", pm.ANTHROPIC,
+        assert pm.list_url(info, pm.OPENAI, None) == (
+            "https://api.kimi.ai/coding/v1/models", pm.OPENAI,
         )
 
     def test_codex_sends_the_configured_client_version(self, mc):

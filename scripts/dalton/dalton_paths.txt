@@ -13,6 +13,21 @@ tests/fixtures/dalton/
 tests/unit/mcp_servers/fixtures/dalton_sec/
 tests/unit/mcp_servers/test_dalton_sec_periods.py
 tests/unit/server/services/test_bringup_owner_check.py
+# sync3 B11: rollback GC kill-switch tests (0.6 patch carried into sync3).
+tests/unit/server/services/test_workspace_file_gc_kill.py
+# sync3 B15: read-only threads offer no quoting (Dalton's half of the ChatView gate).
+web/src/pages/ChatAgent/components/selectionQuote/__tests__/MessageSelectionQuote.active.test.tsx
+# sync3 B11 r4（审查修正）：回合结束自动更新用属主身份 + 单链接失败隔离。
+tests/unit/server/services/test_artifact_keep_updated_owner.py
+# sync3 B11 r4（审查修正）：评论去向核对线程属主；legacy 首读保持属主的
+# keep_updated 设置。
+tests/unit/server/database/test_artifact_review_fixes.py
+# sync3 B11 r4（审查修正）：被拒发送带附件整体退回 composer（draft: send）。
+web/src/pages/ChatAgent/hooks/__tests__/useChatMessages.draftGiveBack.test.ts
+# sync3 B11 r4（审查修正）：回合文件卡片的发布入口按身份（publishAllowed）。
+web/src/pages/ChatAgent/components/chatView/__tests__/useMessageActionBundles.publish.test.tsx
+# sync3 B11 r4（审查修正）：手机端仪表盘 composer 按 outcome 收起/保留。
+web/src/pages/Dashboard/__tests__/ChatInputCard.mobileDraft.test.tsx
 # Chief of Staff copies a binary file out of a shared workspace (workspace-sharing-settings).
 tests/unit/tools/secretary/test_workspace_file_copy_cos.py
 agent_config.dalton.yaml

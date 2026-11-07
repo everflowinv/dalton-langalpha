@@ -1,4 +1,5 @@
 import { isUpstreamHint, RECONNECT_ACCOUNT_LINK, type StructuredError } from '@/utils/rateLimitError';
+import { claudeCodeRefusal } from '@/lib/claudeCode';
 import type { SSEEvent } from '../types';
 
 /**
@@ -8,7 +9,11 @@ import type { SSEEvent } from '../types';
  * Undefined for a frame the server did not classify. The live stream and a
  * reload both read it, so a failed turn shows the same card either way.
  */
-export function readStreamFailure(event: SSEEvent, message: string): StructuredError | undefined {
+export function readStreamFailure(event: SSEEvent, message: string, workspaceId: string): StructuredError | undefined {
+  if (event.type === 'claude_code_off') {
+    const { link } = claudeCodeRefusal(event.reason, workspaceId);
+    if (link) return { message, links: [link] };
+  }
   const kind = event.error_kind;
   if (kind !== 'upstream' && kind !== 'internal') return undefined;
   // Models the resilience middleware tried this turn (primary + fallbacks).
