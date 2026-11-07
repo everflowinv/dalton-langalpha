@@ -1054,6 +1054,45 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     expect(stored.hadAttachments).not.toBe(true);
   });
 
+  it('a draft that already owed its attachments keeps the notice when the host takes its send back with no files', async () => {
+    const view = renderComposer({ draftKey: 'thread:t-host-owed' }, { userId: 'u-1' });
+    attachFile(view, 'page.txt');
+    fireEvent.change(view.getTextarea(), { target: { value: 'went with a file', selectionStart: 16 } });
+    view.unmount();
+
+    const resolvers: Array<(v: boolean) => void> = [];
+    const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
+      (send) => new Promise<boolean>((resolve) => {
+        resolvers.push((v: boolean) => {
+          if (v === false) send.modelOptions.onReturnedUnsent?.();
+          resolve(v);
+        });
+      }),
+    );
+    const ref = createRef<ChatInputHandle>();
+    const reopened = renderComposer({ draftKey: 'thread:t-host-owed', onSend }, { userId: 'u-1', ref });
+    expect(screen.getByTestId('attachments-lost-notice')).toBeTruthy();
+    // Sent without adding the files again; the host takes it back with none.
+    fireEvent.click(screen.getByLabelText('Send message'));
+    const sent = onSend.mock.calls[0][0];
+    expect(sent.files).toHaveLength(0);
+    await act(async () => {
+      resolvers[0](false);
+    });
+    act(() => {
+      ref.current!.giveBack(sent.text, sent.files);
+    });
+    fireEvent.change(reopened.getTextarea(), { target: { value: 'went with a file, still', selectionStart: 23 } });
+    reopened.unmount();
+
+    const stored = JSON.parse(
+      localStorage.getItem(buildDraftStorageKey('thread:t-host-owed', 'u-1')) ?? '{}',
+    ) as { hadAttachments?: boolean };
+    expect(stored.hadAttachments).toBe(true);
+    renderComposer({ draftKey: 'thread:t-host-owed' }, { userId: 'u-1' });
+    expect(screen.getByTestId('attachments-lost-notice')).toBeTruthy();
+  });
+
   it('a send the host takes back with its files leaves no attachments-again notice once the user removes them', async () => {
     // The host takes the refused send back (onReturnedUnsent) and its giveBack
     // returns the real files beside the words, so nothing is lost: removing

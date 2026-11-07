@@ -581,6 +581,9 @@ interface InFlightSendState {
   cleared?: boolean;
   /** The draft's rich parts at send: what a restore brings back. */
   parts: DraftParts;
+  /** The attachments-again notice the draft carried before this send (files
+   *  lost earlier), apart from any files the send itself carried. */
+  priorLostNotice?: boolean;
 }
 
 export function settleSendResult(
@@ -845,18 +848,18 @@ export function useComposerDraft({
    */
   const mergePartsForSave = useCallback((
     sendParts: DraftParts,
-    { filesHandedBack = false }: { filesHandedBack?: boolean } = {},
+    { filesHandedBack = false, priorLostNotice = false }: { filesHandedBack?: boolean; priorLostNotice?: boolean } = {},
   ): DraftParts => {
     const next = mergeParts(sendParts, partsForSave());
     rewroteBetweenRendersRef.current = true;
-    // A send the host took back hands its files back too, so its attachments
-    // are not lost: a user who then removes them has nothing left to re-add.
-    // Otherwise the notice rides on to the next queued rewrite in the batch.
+    // A send the host took back hands its own files back too, so those are not
+    // lost (a user who then removes them has nothing left to re-add); a notice
+    // the draft already carried before the send still stands. Otherwise the
+    // send's notice rides on to the next queued rewrite in the batch.
+    const sendNotice = filesHandedBack ? priorLostNotice : Boolean(sendParts.hadAttachments);
     currentPartsRef.current = {
       quotes: next.quotes,
-      hadAttachments: Boolean(
-        currentPartsRef.current.hadAttachments || (!filesHandedBack && sendParts.hadAttachments),
-      ),
+      hadAttachments: Boolean(currentPartsRef.current.hadAttachments || sendNotice),
     };
     return next;
   }, [mergeParts, partsForSave]);
@@ -1072,6 +1075,7 @@ export function useComposerDraft({
       sentText,
       settled: false,
       parts,
+      priorLostNotice: Boolean(currentPartsRef.current.hadAttachments),
     };
     inFlightSendRef.current = inFlight;
     if (inFlight.draftKey) {
@@ -1228,7 +1232,10 @@ export function useComposerDraft({
         // the host's giveBack save lands.
         if (merged.trim()) {
           const parts = onSendKey
-            ? mergePartsForSave(inFlight.parts, { filesHandedBack: Boolean(inFlight.hostReturned) })
+            ? mergePartsForSave(inFlight.parts, {
+                filesHandedBack: Boolean(inFlight.hostReturned),
+                priorLostNotice: Boolean(inFlight.priorLostNotice),
+              })
             : mergeParts(inFlight.parts, {
                 quotes: savedRecord?.quotes ?? [],
                 hadAttachments: savedRecord?.hadAttachments === true,
