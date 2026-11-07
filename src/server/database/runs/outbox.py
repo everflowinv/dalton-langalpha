@@ -30,6 +30,7 @@ from src.server.database.runs.hook_jobs import (  # noqa: F401
     BurstReleasePayload,
     HookJob,
     NeedsInputWakePayload,
+    PushPayload,
     ReportBackPayload,
     UserFeedPayload,
     WatchClearPayload,
@@ -63,7 +64,8 @@ async def enqueue_hooks(
     ON CONFLICT DO NOTHING on idempotency_key: re-finalizing after a lost
     race never double-registers an effect. Each row is dated by the clock,
     not by the transaction, so jobs one transaction writes on a key run in
-    the order written.
+    the order written. A job with ``delay_seconds`` is first due that long
+    after the write, through the same ``next_retry_at`` a nack's backoff sets.
     """
     async with conn.cursor() as cur:
         for job in jobs:
@@ -71,9 +73,12 @@ async def enqueue_hooks(
                 """
                 INSERT INTO hook_outbox (
                     run_id, conversation_thread_id, hook_type,
-                    payload, ordering_key, idempotency_key, created_at
+                    payload, ordering_key, idempotency_key, created_at,
+                    next_retry_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, clock_timestamp())
+                VALUES (%s, %s, %s, %s, %s, %s, clock_timestamp(),
+                        -- NULL with no delay: make_interval is strict.
+                        clock_timestamp() + make_interval(secs => %s::float8))
                 ON CONFLICT (idempotency_key) DO NOTHING
                 """,
                 (
@@ -83,6 +88,7 @@ async def enqueue_hooks(
                     SafeJson(job.payload),
                     job.ordering_key,
                     job.idempotency_key,
+                    job.delay_seconds,
                 ),
             )
 
@@ -228,26 +234,44 @@ _REVIVED_OWED_SQL = _owed_sql(_REVIVED_OWED)
 # ordering chain while it waits. ``attempts`` stays monotonically increasing
 # (it is the ownership fence / claim generation and is never rewound — a
 # reused token would let a paused owner's late ack close the new owner's
-# claim); the failure budget counts reschedules out of it instead, so every
-# ceiling below reads the EFFECTIVE attempt count.
-_EFFECTIVE_ATTEMPTS_O_SQL = (
-    "(o.attempts - COALESCE((o.payload->>'reschedules')::bigint, 0))"
-)
-_EFFECTIVE_ATTEMPTS_BARE_SQL = (
-    "(attempts - COALESCE((payload->>'reschedules')::bigint, 0))"
-)
+# claim); the failure budget counts reschedules and user-card waits out of it
+# instead, so every ceiling below reads the EFFECTIVE attempt count.
+def _spent_sql(a: str = "") -> str:
+    """The attempts a job has spent toward the ceiling: its claims, less the
+    reschedules a wait made (``reschedules``, see ``reschedule_claimed_job``)
+    and the parks that found its thread waiting on the user (``waited``, see
+    ``defer_claimed_job``). ``attempts`` itself only grows, the fence token.
+    ``a`` is the hook_outbox alias, if any."""
+    c = f"{a}." if a else ""
+    return (
+        f"({c}attempts"
+        f" - COALESCE(({c}payload->>'reschedules')::bigint, 0)"
+        f" - COALESCE(({c}payload->>'waited')::bigint, 0))"
+    )
+
+
+_EFFECTIVE_ATTEMPTS_O_SQL = _spent_sql("o")
+_EFFECTIVE_ATTEMPTS_BARE_SQL = _spent_sql()
 
 
 def effective_attempts(attempts: int, payload: dict | None) -> int:
     """The delivery-failure budget every ceiling reads: the raw claim count
-    minus the reschedules a wait made — the Python twin of
-    ``_EFFECTIVE_ATTEMPTS_BARE_SQL`` above, for callers holding the claimed
-    row's (attempts, payload) instead of running SQL. An unreadable counter
-    reads as zero reschedules (fail-closed toward the raw count)."""
+    minus the reschedules a wait made and the parks that waited on the user —
+    the Python twin of ``_EFFECTIVE_ATTEMPTS_BARE_SQL`` above, for callers
+    holding the claimed row's (attempts, payload) instead of running SQL. An
+    unreadable counter reads as zero (fail-closed toward the raw count)."""
+    data = payload or {}
+    reschedules = 0
+    waited = 0
     try:
-        return int(attempts) - int((payload or {}).get("reschedules") or 0)
+        reschedules = int(data.get("reschedules") or 0)
     except (TypeError, ValueError):
-        return int(attempts)
+        reschedules = 0
+    try:
+        waited = int(data.get("waited") or 0)
+    except (TypeError, ValueError):
+        waited = 0
+    return int(attempts) - reschedules - waited
 
 
 async def claim_outbox_jobs(
@@ -322,7 +346,7 @@ async def claim_outbox_jobs(
                         OR (o.status = 'claimed'
                             AND o.lease_expires_at <= NOW()
                             -- DALTON-HOOK(handoff-report-quiescence): budget counts reschedules out
-                            AND {_EFFECTIVE_ATTEMPTS_O_SQL} < %s)
+                            AND {_spent_sql("o")} < %s)
                       )
                       AND NOT EXISTS (
                         SELECT 1 FROM hook_outbox p
@@ -375,7 +399,7 @@ async def claim_outbox_jobs(
                             OR (o.status = 'claimed'
                                 AND o.lease_expires_at <= NOW()
                                 -- DALTON-HOOK(handoff-report-quiescence): budget counts reschedules out
-                                AND {_EFFECTIVE_ATTEMPTS_O_SQL} < %s)
+                                AND {_spent_sql("o")} < %s)
                         )
                         AND (
                             o.ordering_key IS NULL
@@ -494,7 +518,7 @@ async def park_exhausted_jobs(*, max_attempts: int = 5) -> List[Dict[str, Any]]:
     expired_at_ceiling = (
         # DALTON-HOOK(handoff-report-quiescence): budget counts reschedules out
         "o.status = 'claimed' AND o.lease_expires_at <= NOW()"
-        f" AND {_EFFECTIVE_ATTEMPTS_O_SQL} >= %(max)s"
+        f" AND {_spent_sql('o')} >= %(max)s"
     )
     async with pool.get_db_connection() as conn:
         async with conn.transaction():
@@ -515,7 +539,7 @@ async def park_exhausted_jobs(*, max_attempts: int = 5) -> List[Dict[str, Any]]:
                           AND hook_type NOT IN {_sql_list(("steer", *ALERT_HOOK_TYPES))}
                           AND lease_expires_at <= NOW()
                           -- DALTON-HOOK(handoff-report-quiescence): effective, not raw
-                          AND {_EFFECTIVE_ATTEMPTS_BARE_SQL} >= %s
+                          AND {_spent_sql()} >= %s
                         RETURNING *
                     ),
                     comp AS ({_DEAD_REPORT_BACK_COMPENSATION_SQL})
@@ -836,7 +860,7 @@ _NACK_BACKOFF_SQL = (
 # DALTON-HOOK(handoff-report-quiescence): every ceiling counts reschedules out
 _AT_CEILING_SQL = (
     "o.hook_outbox_id = %(job_id)s::uuid AND o.status = 'claimed'"
-    f" AND o.attempts = %(attempts)s AND {_EFFECTIVE_ATTEMPTS_O_SQL} >= %(max)s"
+    f" AND o.attempts = %(attempts)s AND {_spent_sql('o')} >= %(max)s"
 )
 
 
@@ -870,26 +894,28 @@ async def nack_outbox_job(
                         UPDATE hook_outbox
                         -- DALTON-HOOK(handoff-report-quiescence): effective attempts
                         SET status = CASE
-                                WHEN {_EFFECTIVE_ATTEMPTS_BARE_SQL} >= %s THEN 'dead' ELSE 'pending'
+                                WHEN {_spent_sql()} >= %s THEN 'dead'
+                                ELSE 'pending'
                             END,
                             -- A steer backs off in its payload (see
                             -- _STEER_DUE_SQL), so a build that cannot run it
                             -- never claims it.
                             next_retry_at = CASE
-                                WHEN hook_type = 'steer' AND {_EFFECTIVE_ATTEMPTS_BARE_SQL} < %s
+                                WHEN hook_type = 'steer' AND {_spent_sql()} < %s
                                     THEN 'infinity'::timestamptz
                                 ELSE NOW() + make_interval(
                                     secs => LEAST(POWER(2, attempts), 60)::float
                                 )
                             END,
                             payload = CASE
-                                WHEN hook_type = 'steer' AND {_EFFECTIVE_ATTEMPTS_BARE_SQL} < %s
+                                WHEN hook_type = 'steer' AND {_spent_sql()} < %s
                                     THEN {_steer_due_at_sql("payload", _NACK_BACKOFF_SQL)}
                                 ELSE payload
                             END,
                             lease_expires_at = NULL,
                             completed_at = CASE
-                                WHEN {_EFFECTIVE_ATTEMPTS_BARE_SQL} >= %s THEN NOW() ELSE completed_at
+                                WHEN {_spent_sql()} >= %s THEN NOW()
+                                ELSE completed_at
                             END
                         WHERE hook_outbox_id = %s AND status = 'claimed'
                           AND attempts = %s
@@ -1141,7 +1167,7 @@ async def release_deferred_notifications(conn, thread_id: str) -> int:
 
 
 async def defer_claimed_job(
-    job_id: str, *, attempts: int, max_attempts: int = 5
+    job_id: str, *, attempts: int, max_attempts: int = 5, waits_on_user: bool = False
 ) -> Optional[str]:
     """Park a CLAIMED job back to deferred (``next_retry_at='infinity'``).
 
@@ -1160,7 +1186,14 @@ async def defer_claimed_job(
     the caller stops either way and its fenced ack no-ops. A turn's hold on
     the job is dropped: a job its executor holds was never confirmed, so the
     next live turn may take it in again.
+
+    ``waits_on_user`` is for a thread's report held by a card that only the
+    user's answer clears: each stop short of it releases the job again, so
+    the claim that found the card still waiting is not spent (``waited``).
+    Steers and alerts keep their own ceilings.
     """
+    waits = f"(%(waits)s AND hook_type IN {_THREAD_REPORT_TYPES_SQL})"
+    spent = f"({_spent_sql()} - {waits}::int)"
     async with pool.get_db_connection() as conn:
         async with conn.transaction():
             async with conn.cursor(row_factory=dict_row) as cur:
@@ -1175,19 +1208,23 @@ async def defer_claimed_job(
                         UPDATE hook_outbox
                         -- DALTON-HOOK(handoff-report-quiescence): effective attempts
                         SET status = CASE
-                                WHEN {_EFFECTIVE_ATTEMPTS_BARE_SQL} >= %s THEN 'dead' ELSE 'pending'
+                                WHEN {spent} >= %(max)s THEN 'dead' ELSE 'pending'
                             END,
                             next_retry_at = CASE
-                                WHEN {_EFFECTIVE_ATTEMPTS_BARE_SQL} >= %s THEN NOW()
+                                WHEN {spent} >= %(max)s THEN NOW()
                                 ELSE 'infinity'::timestamptz
                             END,
                             lease_expires_at = NULL,
                             completed_at = CASE
-                                WHEN {_EFFECTIVE_ATTEMPTS_BARE_SQL} >= %s THEN NOW() ELSE completed_at
+                                WHEN {spent} >= %(max)s THEN NOW() ELSE completed_at
                             END,
-                            payload = payload - 'steered_run_id' - 'due_at'
-                        WHERE hook_outbox_id = %s AND status = 'claimed'
-                          AND attempts = %s
+                            payload = (payload - 'steered_run_id' - 'due_at')
+                                || CASE WHEN {waits} THEN jsonb_build_object(
+                                    'waited',
+                                    COALESCE((payload->>'waited')::int, 0) + 1
+                                ) ELSE '{{}}'::jsonb END
+                        WHERE hook_outbox_id = %(job_id)s AND status = 'claimed'
+                          AND attempts = %(attempts)s
                         RETURNING *
                     ),
                     dead_rows AS (
@@ -1196,7 +1233,7 @@ async def defer_claimed_job(
                     comp AS ({_DEAD_REPORT_BACK_COMPENSATION_SQL})
                     SELECT status FROM parked
                     """,
-                    (max_attempts, max_attempts, max_attempts, job_id, attempts),
+                    {**fence, "waits": waits_on_user},
                 )
                 row = await cur.fetchone()
                 return row["status"] if row else None
@@ -1604,13 +1641,14 @@ async def requeue_job_with_key(
                     UPDATE hook_outbox
                     -- DALTON-HOOK(handoff-report-quiescence): effective attempts
                     SET status = CASE
-                            WHEN {_EFFECTIVE_ATTEMPTS_BARE_SQL} >= %s THEN 'dead' ELSE 'pending'
+                            WHEN {_spent_sql()} >= %s THEN 'dead' ELSE 'pending'
                         END,
                         ordering_key = %s,
                         created_at = clock_timestamp(),
                         lease_expires_at = NULL, next_retry_at = NOW(),
                         completed_at = CASE
-                            WHEN {_EFFECTIVE_ATTEMPTS_BARE_SQL} >= %s THEN NOW() ELSE completed_at
+                            WHEN {_spent_sql()} >= %s THEN NOW()
+                            ELSE completed_at
                         END
                     WHERE hook_outbox_id = %s AND status = 'claimed'
                       AND attempts = %s
@@ -1652,6 +1690,30 @@ async def merge_job_payload(
                 (SafeJson(patch), list(remove or []), job_id),
             )
             return cur.rowcount > 0
+
+
+async def add_to_job_payload_list(job_id: str, key: str, values: List[str]) -> None:
+    """Union ``values`` into the string list at ``payload[key]``, against the
+    row as it stands, so two owners of a job (one whose lease lapsed) each add
+    what they did rather than overwrite the other's."""
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE hook_outbox
+                SET payload = jsonb_set(
+                    COALESCE(payload, '{}'::jsonb),
+                    ARRAY[%(key)s],
+                    (SELECT COALESCE(jsonb_agg(v ORDER BY v), '[]'::jsonb)
+                     FROM (SELECT jsonb_array_elements_text(
+                                      COALESCE(payload->%(key)s, '[]'::jsonb)) AS v
+                           UNION
+                           SELECT unnest(%(values)s::text[])) AS s)
+                )
+                WHERE hook_outbox_id = %(job_id)s
+                """,
+                {"key": key, "values": list(values), "job_id": job_id},
+            )
 
 
 # ---------------------------------------------------------------------------

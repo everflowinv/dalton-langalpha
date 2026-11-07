@@ -24,7 +24,7 @@ _RUN = "00000000-0000-0000-0000-00000000000a"
 _JOB = "00000000-0000-0000-0000-00000000000b"
 
 _EFFECTIVE_BARE = (
-    "(attempts - COALESCE((payload->>'reschedules')::bigint, 0))"
+    "(attempts - COALESCE((payload->>'reschedules')::bigint, 0) - COALESCE((payload->>'waited')::bigint, 0))"
 )
 
 
@@ -125,8 +125,10 @@ async def test_nack_defer_and_requeue_ceilings_count_reschedules_out(
 
     await outbox.defer_claimed_job(_JOB, attempts=2, max_attempts=5)
     sql = _sql(mock_cursor)
-    assert f"{_EFFECTIVE_BARE} >= %s" in sql
+    assert f"({_EFFECTIVE_BARE} - " in sql
+    assert "::int) >= %(max)s" in sql
     assert " AND attempts >= %s" not in sql
+    assert " AND attempts >= %(max)s" not in sql
 
     await outbox.requeue_job_with_key(
         _JOB, attempts=2, ordering_key="k", max_attempts=5

@@ -1044,6 +1044,18 @@ def _awaitable_fn(fn):
 
 # DALTON-HOOK(handoff-keep-on-resumable): test suite for resumable handoff retention
 class TestHandoffKeepOnResumable:
+    @pytest.fixture(autouse=True)
+    def _no_card_waiting(self):
+        """Upstream #687 reads the checkpoint for a card left waiting under a
+        stopped or failed attempt; none of these cases has one, so the check
+        is stubbed the way upstream's own report-back tests stub it."""
+        with patch(
+            "src.server.services.report_back.notify_turn._card_waits",
+            autospec=True,
+            return_value=False,
+        ):
+            yield
+
     @staticmethod
     def _seeded_cache(
         *,
