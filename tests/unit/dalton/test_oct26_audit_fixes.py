@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import create_autospec
+from unittest.mock import call, create_autospec
 
 import langgraph.graph.ui as lg_ui
 import pandas as pd
@@ -301,7 +301,10 @@ async def test_yfinance_keyerror_current_trading_period_falls_back_to_history_cl
     assert snap["market_status"] is None
     assert snap["regular_trading_date"] == "2026-10-23"
     assert snap["as_of"] <= int(now_sat.timestamp() * 1000)
-    ticker.history.assert_called_once_with(period="5d", interval="1d", auto_adjust=False)
+    assert ticker.history.call_args_list == [
+        call(period="5d", interval="1d", auto_adjust=False),
+        call(period="1mo", auto_adjust=False),
+    ]
 
     main_seg, _parts = format_quote_change_parts(
         snap,
@@ -372,7 +375,10 @@ async def test_yfinance_keyerror_during_intraday_drops_unfinished_today_bar(
     assert snap["change"] == 5.0
     assert snap["as_of"] is not None and snap["as_of"] <= now_ms
     assert snap["regular_as_of"] is not None and snap["regular_as_of"] <= now_ms
-    ticker.history.assert_called_once_with(period="5d", interval="1d", auto_adjust=False)
+    assert ticker.history.call_args_list == [
+        call(period="5d", interval="1d", auto_adjust=False),
+        call(period="1mo", auto_adjust=False),
+    ]
 
 
 @pytest.mark.asyncio

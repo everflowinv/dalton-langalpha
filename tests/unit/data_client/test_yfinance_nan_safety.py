@@ -12,11 +12,26 @@ import json
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
+import pytest
 
 from src.data_client.yfinance.data_source import (
     _fetch_history,
     _fetch_single_snapshot,
 )
+
+
+# DALTON-HOOK(yfinance-prev-close): the snapshot path memoizes daily bars per
+# (symbol, trading date); tests here stub different frames for the same symbol
+# and must not share them.
+@pytest.fixture(autouse=True)
+def _isolated_prev_close_daily_cache():
+    """The snapshot path memoizes daily bars per (symbol, trading date); tests
+    here stub different frames for the same symbol and must not share them."""
+    from src.data_client.yfinance import yahoo as _yh
+
+    _yh._clear_prev_close_daily_cache()
+    yield
+    _yh._clear_prev_close_daily_cache()
 
 
 def _history_df(rows: list[dict], dates: list[str]) -> pd.DataFrame:
@@ -101,13 +116,21 @@ class TestFetchHistoryNanSafety:
 
 
 class TestFetchSnapshotNanSafety:
-    def _mock_ticker(self, meta: dict, day: dict | None = None) -> MagicMock:
+    # DALTON-HOOK(yfinance-prev-close): the stub can carry the prior session's bar,
+    # since Dalton validates the previous close against the daily rows.
+    def _mock_ticker(
+        self, meta: dict, day: dict | None = None, prior_day: dict | None = None
+    ) -> MagicMock:
         ticker = MagicMock()
-        day_df = (
-            pd.DataFrame([day], index=[pd.Timestamp("2026-07-01", tz="America/New_York")])
-            if day
-            else pd.DataFrame()
-        )
+        rows: list[dict] = []
+        dates: list[pd.Timestamp] = []
+        if prior_day is not None:
+            rows.append(prior_day)
+            dates.append(pd.Timestamp("2026-06-30", tz="America/New_York"))
+        if day is not None:
+            rows.append(day)
+            dates.append(pd.Timestamp("2026-07-01", tz="America/New_York"))
+        day_df = pd.DataFrame(rows, index=dates) if rows else pd.DataFrame()
         ticker.history.return_value = day_df
         ticker.history_metadata = {
             "exchangeTimezoneName": "America/New_York",
@@ -149,11 +172,16 @@ class TestFetchSnapshotNanSafety:
         json.dumps(snap, allow_nan=False)
 
     def test_clean_quote_unchanged(self):
+        # DALTON-HOOK(yfinance-prev-close): the daily frame confirms the
+        # previous close (previous valid session closed at 100.0), so this test
+        # keeps mapping a *verified* quote like it did before the previous-close
+        # validation existed.
         meta = {"regularMarketPrice": 105.5, "chartPreviousClose": 100.0}
+        prior_day = {"Open": 100.0, "High": 101.0, "Low": 99.0, "Close": 100.0, "Volume": 5000}
         day = {"Open": 101.0, "High": 106.0, "Low": 100.5, "Close": 105.5, "Volume": 12345}
         with patch(
             "src.data_client.yfinance.yahoo.yf.Ticker",
-            return_value=self._mock_ticker(meta, day),
+            return_value=self._mock_ticker(meta, day, prior_day=prior_day),
         ):
             snap = _fetch_single_snapshot("TEST")
 

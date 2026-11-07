@@ -149,8 +149,18 @@ def _stub_ticker(rows_1mo: list[tuple[str, float, float]] | None,
     if raw_prev is not None:
         meta["chartPreviousClose"] = raw_prev
     ticker.history_metadata = meta
-    frame = _history_frame(rows_1mo) if rows_1mo is not None else pd.DataFrame()
-    ticker.history.return_value = frame
+
+    def _history_for_period(*_args: object, **kwargs: object) -> pd.DataFrame:
+        if not rows_1mo:
+            return pd.DataFrame()
+        period = kwargs.get("period")
+        if period == "1d":
+            return _history_frame(rows_1mo[-1:])
+        if period == "5d":
+            return _history_frame(rows_1mo[-5:])
+        return _history_frame(rows_1mo)
+
+    ticker.history.side_effect = _history_for_period
     return ticker
 
 
@@ -348,6 +358,92 @@ def test_snapshot_from_history_skips_frozen_previous_row():
     assert snap["change"] is None
     assert snap["change_percent"] is None
     assert datetime.fromtimestamp(snap["as_of"] / 1000, tz=timezone.utc) is not None
+
+
+def test_fetch_single_snapshot_resumption_day_only_today_bar_validates_fallback():
+    # Resumption day 2525.HK (2026-10-26): 5d history returns only 2026-10-26
+    # (Close=13.57, Volume=48_924_388), while 1d fallback chartPreviousClose is
+    # 15.47. The fallback previous close must still pass through
+    # validated_previous_close and return unknown (None), never 15.47 (-12.28%).
+    from src.dalton import extended_hours
+    from src.data_client.yfinance import data_source as yf_ds
+
+    ticker = create_autospec(yf.Ticker, instance=True)
+    only_today = [("2026-10-26", 13.57, 48_924_388)]
+    ticker.history.return_value = _history_frame(only_today)
+    ticker.history_metadata = {
+        "regularMarketPrice": 13.57,
+        "regularMarketTime": 1793002099,
+        "exchangeTimezoneName": "Asia/Hong_Kong",
+        "chartPreviousClose": 15.47,
+    }
+    with (
+        patch(
+            "src.data_client.yfinance.data_source.yahoo_ticker",
+            new=create_autospec(yf_ds.yahoo_ticker, return_value=ticker),
+        ),
+        patch(
+            "src.dalton.extended_hours.enrich_yfinance_snapshot_extended_hours",
+            new=create_autospec(
+                extended_hours.enrich_yfinance_snapshot_extended_hours,
+                side_effect=lambda snap, sym, tk: snap,
+            ),
+        ),
+    ):
+        snap = _fetch_single_snapshot("2525.HK")
+    assert snap is not None
+    assert snap["price"] == 13.57
+    assert snap["previous_close"] is None
+    assert snap["change"] is None
+    assert snap["change_percent"] is None
+
+
+def test_fetch_single_snapshot_5d_zero_volume_window_uses_1mo_for_validation():
+    # Quote on 2026-10-27 at 12.90: 5d returns only 10/20–10/23 (Close=15.47,
+    # Volume=0) and 1d fallback chartPreviousClose is 15.47. A 5d validation
+    # window would see any_volume=False and let 15.47 (-16.61%) through; the 1mo
+    # validation window sees earlier traded sessions (10/08–10/12) and rejects it.
+    from src.dalton import extended_hours
+    from src.data_client.yfinance import data_source as yf_ds
+
+    ticker = create_autospec(yf.Ticker, instance=True)
+    rows_5d = [
+        ("2026-10-20", 15.47, 0.0),
+        ("2026-10-21", 15.47, 0.0),
+        ("2026-10-22", 15.47, 0.0),
+        ("2026-10-23", 15.47, 0.0),
+    ]
+    rows_1mo = _frozen_hk_rows()[:-1]
+    ticker.history.side_effect = (
+        lambda *a, **kw: _history_frame(rows_1mo)
+        if kw.get("period") == "1mo"
+        else _history_frame(rows_5d)
+    )
+    ticker.history_metadata = {
+        "regularMarketPrice": 12.90,
+        "regularMarketTime": 1793088499,
+        "exchangeTimezoneName": "Asia/Hong_Kong",
+        "chartPreviousClose": 15.47,
+    }
+    with (
+        patch(
+            "src.data_client.yfinance.data_source.yahoo_ticker",
+            new=create_autospec(yf_ds.yahoo_ticker, return_value=ticker),
+        ),
+        patch(
+            "src.dalton.extended_hours.enrich_yfinance_snapshot_extended_hours",
+            new=create_autospec(
+                extended_hours.enrich_yfinance_snapshot_extended_hours,
+                side_effect=lambda snap, sym, tk: snap,
+            ),
+        ),
+    ):
+        snap = _fetch_single_snapshot("2525.HK")
+    assert snap is not None
+    assert snap["price"] == 12.90
+    assert snap["previous_close"] is None
+    assert snap["change"] is None
+    assert snap["change_percent"] is None
 
 
 # ---------------------------------------------------------------------------

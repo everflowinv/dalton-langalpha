@@ -169,6 +169,11 @@ def validated_previous_close(  # DALTON-HOOK(yfinance-prev-close)
 
     rows_before = [r for r in daily_rows if not quote_date or r[0] < quote_date]
     any_volume = any(v > 0 for _, _, v in daily_rows)
+    if not rows_before and not any_volume:
+        # Volume-less instrument (e.g. an index) whose daily series holds
+        # only the current session's bar: there are no fill rows before the
+        # quote date to reject, so the chart's previous close stands.
+        return fast_info_prev
     candidates = [r for r in rows_before if r[2] > 0] if any_volume else rows_before
     if not candidates:
         # Rows exist but every one before the quote is a frozen fill: there is

@@ -289,12 +289,20 @@ def test_yfinance_profile_lse_price_scaled_to_major_units():
 
 
 def _lse_quote_ticker(info: dict):
+    # DALTON-HOOK(yfinance-prev-close): the snapshot validates previous close
+    # against recent daily bars, so the stub ticker carries two sessions of history.
     import pandas as pd
 
     ticker = MagicMock()
     ticker.history.return_value = pd.DataFrame(
-        [{"Open": 116.9, "High": 118.0, "Low": 116.0, "Close": 117.2, "Volume": 1000}],
-        index=[pd.Timestamp("2026-07-01", tz="Europe/London")],
+        [
+            {"Open": 116.0, "High": 117.0, "Low": 115.0, "Close": 116.85, "Volume": 1000},
+            {"Open": 116.9, "High": 118.0, "Low": 116.0, "Close": 117.2, "Volume": 1000},
+        ],
+        index=[
+            pd.Timestamp("2026-06-30", tz="Europe/London"),
+            pd.Timestamp("2026-07-01", tz="Europe/London"),
+        ],
     )
     ticker.history_metadata = {
         "regularMarketPrice": 117.2, "chartPreviousClose": 116.85,
