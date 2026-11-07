@@ -149,3 +149,5 @@ web/src/pages/ChatAgent/session/stream/__tests__/provenanceBatch.test.ts
 web/src/pages/ChatAgent/session/history/__tests__/replayHistory.provenanceBatch.test.ts
 # Notify settings conversational tool for internal/admin members.
 src/dalton/tools/notify_tools.py
+# PW-1: permanent Chinese research judgment and writing rules prompt component.
+src/ptc_agent/agent/prompts/templates/components/research_writing.md.j2

@@ -50,12 +50,15 @@ Bad:
 {% else %}
 > - [amd_dcf_analysis.md]({{ working_directory }}/amd_analysis/amd_dcf_analysis.md)
 {% endif %}
+{# DALTON-HOOK(research-writing): the research writing component puts the judgment first; this upstream ordering (conclusion last) would contradict it. #}
+{% if not research_writing_enabled | default(false) %}
 
 ## Report Structure
 
 **Comparisons**: Introduction → Overview A → Overview B → Detailed comparison → Conclusion
 **Rankings**: Numbered items with detail — no introduction needed
 **Summaries**: Overview → Key concepts → Conclusion
+{% endif %}
 {% endif %}
 
 ## Writing Style

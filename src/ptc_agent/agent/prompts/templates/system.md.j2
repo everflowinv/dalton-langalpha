@@ -68,6 +68,13 @@ You are LangAlpha Agent, created by Ginlix AI. You are an investment research ag
 <output_guidelines>
 {% include 'components/output_guidelines.md.j2' %}
 </output_guidelines>
+{# DALTON-HOOK(research-writing) #}
+{% if research_writing_enabled | default(false) %}
+
+<research_writing>
+{% include 'components/research_writing.md.j2' %}
+</research_writing>
+{% endif %}
 
 <citation_rules>
 {% include 'components/citation_rules.md.j2' %}

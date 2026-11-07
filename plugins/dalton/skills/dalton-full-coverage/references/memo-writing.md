@@ -115,7 +115,7 @@ EV（企业价值）/ 当前核心估值倍数（如 NTM P/E）/ 30 日均成交
   越线动作直接写仓位动作（加仓 / 减仓 / 清仓并重审逻辑）
 - **催化剂日历**：未来 3 / 6 / 12 个月的事件与观察指标
 - **下一次要看什么**：下一份财报 / 数据发布时盯什么
-- 节末用标准一句话收尾（见 `.agents/skills/dalton-conventions/references/writing.md` §7）：
+- 节末用标准一句话收尾（见 `.agents/skills/dalton-conventions/references/writing.md` §6）：
   "The stock works if [X]; it breaks if [Y]; the key debate is [Z]."
 
 ## 附录
@@ -126,7 +126,7 @@ EV（企业价值）/ 当前核心估值倍数（如 NTM P/E）/ 30 日均成交
 - IR 访谈待问清单、信源覆盖说明
 
 ## 引用
-格式见 `.agents/skills/dalton-conventions/references/writing.md` §7：文末单一 `## 引用` 节，
+格式见 `.agents/skills/dalton-conventions/references/writing.md` §6：文末单一 `## 引用` 节，
 每行一条，`[引用N]: 前缀:目标 （来源类型｜机构/作者｜标题或内容｜日期｜文档 id / 链接）`；
 底表引用用真实键名（如 `f:rev_q8`）。
 ```

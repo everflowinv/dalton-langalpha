@@ -61,6 +61,7 @@ BUILTIN_SUBAGENTS: dict[str, SubagentDefinition] = {
             "tool_guide": True,
             "data_processing": True,
             "visualizations": False,
+            "research_writing": False,  # DALTON-HOOK(research-writing)
         },
     ),
     "equity-analyst": SubagentDefinition(
