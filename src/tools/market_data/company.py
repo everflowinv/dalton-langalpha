@@ -15,6 +15,7 @@ import asyncio
 
 from langchain_core.runnables import RunnableConfig
 
+# DALTON-HOOK(extended-hours-quotes): the extended-hours lines take the overview's currency spec
 from .currency import CurrencyArg, DisplaySpec, _spec, fmt_count, fmt_money, fmt_price
 from .earnings import (
     EarningsReport,

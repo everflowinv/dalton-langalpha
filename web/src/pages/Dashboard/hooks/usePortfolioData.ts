@@ -21,7 +21,7 @@ export interface PortfolioRow {
   /** The currency its price and value are in: the quote's, else the holding's. */
   currency: string;
   /** The currency its average cost was entered in. */
-  costCurrency?: string;
+  costCurrency: string;
   notes?: string;
   price: number;
   change?: number | null;
@@ -31,7 +31,7 @@ export interface PortfolioRow {
   isPositive?: boolean;
   quoteAvailable?: boolean;
   /** Places its prices print up to (lib/bars `quotePlaces`), from the quote's own currency and asset class, not the holding's. */
-  places?: number;
+  places: number;
   session?: ExtendedSessionFields;
   previousClose?: number | null;
   // DALTON-HOOK(extended-hours-quotes): Extended-hours and regular-session fields for accurate card display.

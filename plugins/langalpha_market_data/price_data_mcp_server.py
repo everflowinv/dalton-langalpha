@@ -855,23 +855,25 @@ async def get_stock_data(
 ) -> _OUT_GET_STOCK_DATA:
     """Fetch OHLCV price bars for a stock.
 
-    Intervals: 1min|5min|15min|30min|1hour|4hour|1day; intraday needs dates.
+    Intervals: 1min|5min|15min|30min|1hour|4hour|1day. Intraday needs start_date
+    and end_date.
 
     Args:
-        symbol: US "AAPL", HK "0700.HK", CN "600519.SH", UK "VOD.L", "NQ=F", "^TNX".
+        symbol: Ticker — US "AAPL", HK "0700.HK", A-share "600519.SH", LSE "VOD.L", futures "NQ=F", index "^TNX".
         interval: See above.
         start_date: "YYYY-MM-DD[ HH:MM]".
         end_date: Same format.
-        extended_hours: Pre/post-market intraday bars (default False).
+        extended_hours: Include pre/post-market intraday bars (default False).
 
     Returns:
         dict: {symbol, interval, currency, timezone, count, data, source,
         price_treatment, name?, in_progress?, truncated?, incomplete?}. data:
-        list of {date, open, high, low, close, volume} ascending; date
-        exchange-local "YYYY-MM-DD[ HH:MM:SS]"; prices in `currency` major
+        list of {date, open, high, low, close, volume} ascending (oldest first);
+        date exchange-local "YYYY-MM-DD[ HH:MM:SS]"; prices in `currency` major
         units. price_treatment: raw|split_adjusted|dividend_adjusted.
-        in_progress: forming last bar date. truncated: oldest bars cut by cap.
-        incomplete: bars in window missing. On error: {error: <code>, detail}.
+        in_progress: date of a forming last bar; some daily feeds omit it.
+        truncated: true if a size cap cut the oldest bars. incomplete: true if
+        bars in the window are missing. On error: {error: <code>, detail}.
     """
     env, err = await _fetch_stock_series(
         symbol, interval, start_date, end_date, extended_hours=extended_hours
@@ -908,20 +910,22 @@ async def get_asset_data(
     Intervals: 1min|5min|1hour|1day; intraday needs dates.
 
     Args:
-        symbol: "AAPL", "GCUSD", "CL=F", "BTCUSD", "EURUSD".
+        symbol: Commodity "GCUSD"/"CL=F", crypto "BTCUSD", forex "EURUSD".
         asset_type: stock|commodity|crypto|forex.
         interval: See above.
         from_date: "YYYY-MM-DD[ HH:MM]".
         to_date: Same format.
-        extended_hours: Pre/post-market intraday bars.
+        extended_hours: Include pre/post-market intraday bars (default False).
 
     Returns:
         dict: {symbol, asset_type, interval, currency, timezone, count, data,
         source, price_treatment, name?, in_progress?, truncated?, incomplete?}.
-        data: [{date, open, high, low, close, volume}] ascending; exchange-local
-        "YYYY-MM-DD[ HH:MM:SS]"; major units. price_treatment:
-        raw|split_adjusted|dividend_adjusted. in_progress: forming bar date.
-        truncated: cut by cap. incomplete: missing bars. On error: {error, detail}.
+        data: list of {date, open, high, low, close, volume} ascending; date
+        exchange-local "YYYY-MM-DD[ HH:MM:SS]"; prices in `currency` major
+        units. price_treatment: raw|split_adjusted|dividend_adjusted.
+        in_progress: date of a forming last bar. truncated: true if a size cap
+        cut the oldest bars. incomplete: true if bars in the window are missing.
+        On error: {error: <code>, detail}.
     """
     at = asset_type.lower().strip()
     if at not in {"stock", "commodity", "crypto", "forex"}:

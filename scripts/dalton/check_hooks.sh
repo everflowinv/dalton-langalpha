@@ -575,13 +575,15 @@ cur_json = json.loads(open("tests/unit/mcp_servers/agent_docstring_lock.json", e
 pinned_modified_sha256 = {
     "direct:get_daily_prices": "8ac5caef9f4daf0aaeba4243dd3523871fe4d1b5887004580b510a7d5c026098",
     "direct:get_quote": "3048022c2ebe1b63286a638dcfb09da38f4510fb24b3006b840c8a1a54ca93cd",
-    "mcp:price_data:get_asset_data": "ddaeb61647241627897cbf68ae19a28bd8ed3b015e0060e7649421b6fbb75372",
-    "mcp:price_data:get_stock_data": "1207da227ebdfcfd4d706e737fec94345e54cb7cdd32f21c3087e0dfa53336e8",
+    # sync4 S4: upstream #694/#698 docstrings plus Dalton extended_hours
+    "mcp:price_data:get_asset_data": "3298104ce597a535188c0e6b997e7bb433ac6caf44ce0840ddf026b16e0ff5f6",
+    "mcp:price_data:get_stock_data": "7725a587e0702118bbcd29f9e5f4084347153d3b8812c21a6bff8bc724119692",
     # Prod-fix batch 2 (FMP 402): routes US statements to researchdata SEC
     # first and names the yfinance fallback source.
     "mcp:fundamentals:get_financial_statements": "e1aac0cb68f187c3e64395b670cb78915faeacdd98dfa771bbc2742363af0362",
-    "mcp:yf_price:get_multiple_stocks_history": "599dfce8a175bffc69f28b28565c405fe26376cedfc70ec332d5bdc9ce38140f",
-    "mcp:yf_price:get_stock_history": "a863f62db0e6469a860973a71183cd36df5c7ac9512e9745dc37022922436b68",
+    # sync4 S4: upstream #694/#698 docstrings plus Dalton extended_hours
+    "mcp:yf_price:get_multiple_stocks_history": "819253765db263f4e6cd7f78aa65a0d37f9d1cb6637f80baa00eed7dd9803288",
+    "mcp:yf_price:get_stock_history": "969375a1cada68c0c684590a88b330e70b0b4cf55228be7d6ef8d3f6d0b40625",
 }
 errors = []
 for k, expected_sha in pinned_modified_sha256.items():

@@ -62,9 +62,9 @@ export function portfolioRowData(row: PortfolioRow) {
     currency: normalizePortfolioCurrency(row.currency),
     shares: row.quantity ?? null,
     averageCost: row.average_cost ?? null,
-    costCurrency: normalizePortfolioCurrency(row.costCurrency ?? row.currency),
+    costCurrency: normalizePortfolioCurrency(row.costCurrency),
     price: hasQuote ? row.price : null,
-    places: row.places ?? 2,
+    places: row.places,
     marketValue: hasQuote ? row.marketValue ?? null : null,
     unrealizedPlPercent: hasQuote ? row.unrealizedPlPercent ?? null : null,
   };

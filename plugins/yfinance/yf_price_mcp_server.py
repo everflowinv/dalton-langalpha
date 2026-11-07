@@ -259,22 +259,25 @@ def get_stock_history(
     adjusted: bool = True,
 ) -> _OUT_GET_STOCK_HISTORY:
     """Historical OHLCV price bars for one stock.
+    Adjusted prices cannot be divided by historical EPS for historical P/E;
+    use adjusted=False for historical P/E.
 
     Args:
-        ticker: US "AAPL", HK "0700.HK", CN "600519.SH", "NQ=F", "^TNX".
+        ticker: Symbol — US "AAPL", HK "0700.HK", A-share "600519.SH", futures "NQ=F", index "^TNX".
         period: 1d,5d,1mo,3mo,6mo,1y,2y,5y,10y,ytd,max.
-        interval: 1min|5min|15min|30min|1hour|1day|1week|1month (2m|90m|5d|3mo
-            accepted; 4hour unsupported).
-        extended_hours: Pre/post-market intraday bars (default False).
-        adjusted: Split/dividend-adjusted (default True); False for raw/P/E.
+        interval: 1min|5min|15min|30min|1hour|1day|1week|1month (native
+            2m|90m|5d|3mo accepted; 4hour unsupported).
+        extended_hours: Include pre/post-market intraday bars (default False).
+        adjusted: Split/dividend-adjusted (default True); False for raw.
 
     Returns:
         dict: {symbol, interval, period, currency, timezone, count, data,
         source, price_treatment, in_progress?}. data: list of {date, open, high,
-        low, close, volume, dividends?, splits?} ascending; date exchange-local
-        "YYYY-MM-DD[ HH:MM:SS]"; prices in `currency` major units.
-        price_treatment: raw|dividend_adjusted. in_progress: forming last bar
-        date. On error: {error, detail} — not_found|unsupported_interval|upstream_error.
+        low, close, volume, dividends?, splits?} ascending (oldest first); date
+        exchange-local "YYYY-MM-DD[ HH:MM:SS]"; prices in `currency` major
+        units. price_treatment: raw|dividend_adjusted. in_progress: date of the
+        last bar while it forms.
+        On error: {error, detail} — not_found|unsupported_interval|upstream_error.
     """
     symbol, yf_symbol, currency = boundary(ticker)
     yf_interval, echo_interval, err = _resolve_interval(interval)
@@ -335,23 +338,27 @@ def get_multiple_stocks_history(
     adjusted: bool = True,
 ) -> _OUT_GET_MULTIPLE_STOCKS_HISTORY:
     """Historical OHLCV bars for several stocks.
+    Adjusted prices cannot be divided by historical EPS for historical P/E;
+    use adjusted=False for historical P/E.
 
     Args:
         tickers: Symbols, e.g. ["AAPL", "MSFT", "0700.HK", "NQ=F", "^TNX"].
         period: 1d,5d,1mo,3mo,6mo,1y,2y,5y,10y,ytd,max.
-        interval: 1min|5min|15min|30min|1hour|1day|1week|1month (2m|90m|5d|3mo
-            accepted; 4hour unsupported).
-        extended_hours: Pre/post-market intraday bars.
-        adjusted: Split/dividend-adjusted (default True); False for raw/P/E.
+        interval: 1min|5min|15min|30min|1hour|1day|1week|1month (native
+            2m|90m|5d|3mo accepted; 4hour unsupported).
+        extended_hours: Include pre/post-market intraday bars (default False).
+        adjusted: Split/dividend-adjusted (default True); False for raw.
 
     Returns:
-        dict: {interval, count, data, source, period, price_treatment, errors?}.
-        data: canonical symbol → {count, currency?, timezone?, price_treatment,
-        in_progress?, data} of [{date, open, high, low, close, volume,
-        dividends?, splits?}] ascending, exchange-local "YYYY-MM-DD[ HH:MM:SS]",
-        major units. price_treatment: raw|dividend_adjusted. in_progress:
-        forming last bar date. Errors: {error, detail, symbol} or
-        unsupported_interval.
+        dict: {interval, count, data, source, period, errors?}. data maps
+        canonical symbol → {count, currency?, timezone?, price_treatment,
+        in_progress?, data}; inner data: list of {date, open, high, low, close,
+        volume, dividends?, splits?} ascending (oldest first), exchange-local
+        "YYYY-MM-DD[ HH:MM:SS]"; count is total bars. Prices in major units.
+        price_treatment: raw|dividend_adjusted. in_progress: date of the last
+        bar while it forms. Failed symbols are listed in errors as {error,
+        detail, symbol}; a bad interval returns {error: unsupported_interval,
+        detail, supported}.
     """
     yf_interval, echo_interval, err = _resolve_interval(interval)
     if err is not None:

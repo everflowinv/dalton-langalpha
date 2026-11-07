@@ -289,6 +289,8 @@ def test_yfinance_profile_lse_price_scaled_to_major_units():
 
 
 def test_yfinance_realtime_quote_lse_scaled_to_major_units():
+    # DALTON-HOOK(yfinance-prev-close): the snapshot reads the previous close from
+    # the daily bars, so the stub ticker carries two sessions of history.
     import pandas as pd
 
     idx = pd.DatetimeIndex([
