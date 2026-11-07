@@ -342,6 +342,9 @@ ALLOWED_HOOKS=(
   # with single-copy merge (provenanceBatch.ts, replayHistory.ts,
   # processStreamEvent.ts, mainEventHandlers.ts, useChatMessages.ts, runtime.ts).
   "provenance-batch"
+  # PW-1: permanent Chinese research judgment and writing rules component gated
+  # by research_writing_enabled (default false, enabled in Dalton runtime).
+  "research-writing"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

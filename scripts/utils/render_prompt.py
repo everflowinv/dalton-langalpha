@@ -145,6 +145,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Render as if a messaging service is connected (the Over Chat section).",
     )
+    # DALTON-HOOK(research-writing): preview permanent research judgment and writing rules
+    p.add_argument(
+        "--research-writing",
+        action="store_true",
+        help="Enable the Dalton research judgment and writing rules section.",
+    )
     p.add_argument(
         "--no-user-profile", action="store_true", help="Omit user profile section."
     )
@@ -307,6 +313,7 @@ def render(args: argparse.Namespace) -> str:
             user_profile=user_profile,
             config=_PreviewConfig(guidance_vars["guidance"]),
             context=_preview_subagent_context(args),
+            research_writing_enabled=args.research_writing,  # DALTON-HOOK(research-writing)
         )
         result = compiler.compile(defn)
         return result["system_prompt"]
@@ -333,6 +340,7 @@ def render(args: argparse.Namespace) -> str:
         ask_user_enabled=not args.no_ask_user,
         channels_enabled=args.channels,
         claude_code=args.claude_code,
+        research_writing_enabled=args.research_writing,  # DALTON-HOOK(research-writing)
         current_time=current_time,
         thread_id=args.thread_id,
         max_concurrent_task_units=args.max_concurrent_tasks,

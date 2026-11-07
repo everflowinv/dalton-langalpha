@@ -63,6 +63,13 @@
 {% include 'components/output_guidelines.md.j2' %}
 </output_guidelines>
 {% endif %}
+{# DALTON-HOOK(research-writing) #}
+{% if section_research_writing | default(false) and research_writing_enabled | default(false) %}
+
+<research_writing>
+{% include 'components/research_writing.md.j2' %}
+</research_writing>
+{% endif %}
 
 <citation_rules>
 {% include 'components/citation_rules.md.j2' %}

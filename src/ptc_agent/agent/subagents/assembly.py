@@ -52,6 +52,7 @@ def compile_subagents(
     skills: BlockReader,
     skill_registry: dict[str, SkillDefinition],
     scratchpad: str | None,
+    research_writing_enabled: bool = False,  # DALTON-HOOK(research-writing)
 ) -> list[dict[str, Any]]:
     """The turn's roster for ``role``, as the specs ``SubAgentMiddleware`` takes.
 
@@ -91,6 +92,7 @@ def compile_subagents(
             skills=skills,
             scratchpad=scratchpad,
         ),
+        research_writing_enabled=research_writing_enabled,  # DALTON-HOOK(research-writing)
     )
     return create_subagents(turn_roster(config.subagents), compiler, role)
 

@@ -48,6 +48,7 @@ _SECTION_DEFAULTS: dict[str, bool] = {
     "data_processing": True,
     "visualizations": True,
     "output_guidelines": False,
+    "research_writing": True,  # DALTON-HOOK(research-writing)
     "workspace_context": False,
     "ask_user_guidelines": False,
 }
@@ -79,6 +80,7 @@ def subagent_template_vars(
     files_mounted: bool = True,
     market_watch: bool = True,
     todo: bool = True,
+    research_writing: bool = False,  # DALTON-HOOK(research-writing)
 ) -> dict[str, Any]:
     """What a subagent's templates read beside the loader's path table.
 
@@ -95,6 +97,7 @@ def subagent_template_vars(
         **_tool_gates(defn, market_watch=market_watch, todo=todo),
         **guidance_template_vars(guidance),
         "files_mounted": files_mounted,
+        "research_writing_enabled": research_writing,  # DALTON-HOOK(research-writing)
     }
 
 
@@ -142,12 +145,15 @@ class SubagentCompiler:
         search_tool: Callable[..., Any] | None = None,
         sandbox_tools: Callable[[frozenset[str]], list[Any]] | None = None,
         context: SubagentContext | None = None,
+        research_writing_enabled: bool = False,  # DALTON-HOOK(research-writing)
     ) -> None:
         self._sandbox = sandbox
         # What each subagent's runtime-context baseline is built from. Without
         # it (bare and test construction) a subagent gets no baseline, and its
         # prompt says nothing that would point at one.
         self._context = context
+        # DALTON-HOOK(research-writing): gate permanent research judgment and writing rules
+        self._research_writing_enabled = research_writing_enabled
         # A subagent runs in the parent turn's workspace folder, so its copy of
         # the path table has to name the same one.
         self._project = project
@@ -280,6 +286,7 @@ class SubagentCompiler:
                     self._config is not None and self._config.feature_enabled("market_watch")
                 ),
                 todo=bool(self._tool_sets.get("todo")),
+                research_writing=self._research_writing_enabled,  # DALTON-HOOK(research-writing)
             )
             # Resolve the turn's own folder so workspace_paths renders it
             if self._sandbox is not None and hasattr(self._sandbox, "config"):
