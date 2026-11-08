@@ -72,6 +72,58 @@ async def test_web_fetch_returns_page_when_extraction_times_out_silently(
 
 
 @pytest.mark.asyncio
+async def test_web_fetch_returns_page_when_overall_deadline_expires_during_extraction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """DALTON-HOOK(oauth-refresh-direct): when WEB_FETCH_DEADLINE expires while
+    _extract_with_llm is still running (arriving as a cancellation converted by
+    asyncio.timeout), the already-fetched raw markdown body is still returned."""
+    page_markdown = "# 禾赛科技财报\n\n2024 财年 Revenue 为 $1,234 million。" + "正文 " * 60
+    result = SimpleNamespace(
+        url="https://example.com/report",
+        title="Report",
+        source="live",
+        error=None,
+        excerpts=None,
+        summary=None,
+        markdown=page_markdown,
+        parse_timeout=False,
+    )
+    response = SimpleNamespace(
+        provider="inhouse",
+        provider_names=["inhouse"],
+        attempts=[SimpleNamespace(str=lambda: "inhouse")],
+        results=[result],
+    )
+
+    async def _fetch(request: Any) -> Any:
+        return response
+
+    service = SimpleNamespace(
+        provider_names=["inhouse"],
+        fetch=create_autospec(_fetch, return_value=response),
+    )
+    monkeypatch.setattr(fetch_mod, "get_fetch_service", lambda: service)
+    monkeypatch.setattr(fetch_mod, "WEB_FETCH_DEADLINE", 0.05)
+
+    async def _hang(*args: Any, **kwargs: Any) -> Any:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        fetch_mod,
+        "_extract_with_llm",
+        create_autospec(fetch_mod._extract_with_llm, side_effect=_hang),
+    )
+
+    content, artifact = await web_fetch(
+        url="https://example.com/report", prompt="提取营收", use_cache=False, include_sitemap=False
+    )
+    assert content.startswith("未能抽取（TimeoutError）")
+    assert page_markdown in content
+    assert artifact["error"] == "extraction_failed"
+
+
+@pytest.mark.asyncio
 async def test_pdf_parse_timeout_wording_survives_the_empty_page_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

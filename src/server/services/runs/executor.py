@@ -17,7 +17,6 @@ admission policy lives in our layer.
 
 import asyncio
 import logging
-import time  # DALTON-HOOK(tail-drain-outlives-workflows): wall clock for per-writer deadlines
 from datetime import datetime, timedelta
 from typing import Dict, Any, Literal, Optional, Callable, Coroutine
 from enum import Enum
@@ -25,6 +24,7 @@ from dataclasses import dataclass, field
 from contextlib import suppress
 
 from src.config.settings import (
+    get_checkpoint_flush_timeout,
     get_max_concurrent_workflows,
     get_workflow_result_ttl,
     get_abandoned_workflow_timeout,
@@ -37,7 +37,7 @@ from src.config.settings import (
     get_shutdown_timeout,
     get_wait_for_persistence_timeout,
 )
-from src.server.contracts.status import COLLECTED_ENDINGS
+from src.server.contracts.status import COLLECTED_ENDINGS, is_user_stop
 from src.server.services.runs import (
     admission,
     finalization,
@@ -102,6 +102,14 @@ class LocalRunExecution:
 
     persistence_complete: asyncio.Event = field(default_factory=asyncio.Event)
 
+    # Set when this run's finalize raised, leaving the row in_progress as far
+    # as this process knows; it runs the owner's terminal effects the raise
+    # skipped, and the coordinator tail when ``tail`` is set. Cleanup calls it
+    # on the first sweep after the row is settled (settling it itself when no
+    # recovery scanner runs) and drops the entry, instead of holding it
+    # RUNNING (workspace busy, slot taken) until the abandoned timeout.
+    finish_failed_finalize: Optional[Callable[..., Coroutine[Any, Any, None]]] = None
+
     graph: Optional[Any] = None
 
     # The run's event stream budget, made at its first append. Only the run's
@@ -120,11 +128,6 @@ class LocalRunExecutor:
     fresh ``run_id`` so concurrent turns on the same thread are isolated
     by construction.
     """
-
-    # DALTON-HOOK(tail-drain-outlives-workflows): slack past a workflow's
-    # own run_timeout before the tail drain may treat it as hung — its
-    # cancel/unwind path needs a bounded window of its own.
-    _WORKFLOW_SETTLE_MARGIN_S = 300.0
 
     _instance: Optional['LocalRunExecutor'] = None
 
@@ -194,6 +197,14 @@ class LocalRunExecutor:
             if best is None or info.created_at > best.created_at:
                 best = info
         return best
+
+    async def uncancelled_runs(self) -> list[TaskKey]:
+        """The runs this worker is running that no cancel has reached yet."""
+        async with self.task_lock:
+            return [
+                key for key, info in self.executions.items()
+                if info.status is LocalRunStatus.RUNNING and not info.explicit_cancel
+            ]
 
     async def has_active_tasks_for_workspace(self, workspace_id: str) -> bool:
         """Check if any active tasks exist for a workspace.
@@ -387,6 +398,7 @@ class LocalRunExecutor:
         to_remove: list[TaskKey] = []
         dead_handles: list = []
         cold_running: list[TaskKey] = []
+        unfinalized: list[tuple[TaskKey, Callable]] = []
 
         async with self.task_lock:
             for key, info in self.executions.items():
@@ -399,6 +411,9 @@ class LocalRunExecutor:
                         )
 
                 elif info.status == LocalRunStatus.RUNNING:
+                    finish = info.finish_failed_finalize
+                    if finish is not None and (info.task is None or info.task.done()):
+                        unfinalized.append((key, finish))
                     if info.active_connections == 0 and info.last_access_at < abandoned_threshold:
                         # Locally cold — candidate only. The cross-worker
                         # consumer signal is consulted outside the lock
@@ -416,6 +431,70 @@ class LocalRunExecutor:
             # different lock objects, defeating admission. The dict is
             # tiny (one entry per thread that has ever seen traffic);
             # leave it.
+
+        # With the writer fence on, the recovery scanner settles a run whose
+        # finalize failed, with its salvage and terminal frame, so the entry
+        # only waits for the row to leave in_progress. Without it recovery
+        # runs only at startup, and this process settles the run itself. An
+        # unreadable row keeps the entry for the next sweep.
+        settled: list[TaskKey] = []
+        if unfinalized:
+            from src.server.database.runs import lifecycle as tl_db
+            from src.server.services import writer_guard as wg
+            from src.server.services.runs.coordinator import RunCoordinator
+
+            async def read_row(run_id: str) -> Optional[Dict[str, Any]]:
+                async with asyncio.timeout(10):
+                    return await tl_db.get_run(run_id)
+
+            for key, finish in unfinalized:
+                thread_id, run_id = key
+                try:
+                    row = await read_row(run_id)
+                    if (
+                        row is not None
+                        and row["status"] == "in_progress"
+                        and not wg.guard_enabled()
+                        and await RunCoordinator.get_instance().reconcile_orphaned_dispatch(
+                            thread_id,
+                            run_id,
+                            error_text="the turn could not be saved",
+                            label="LocalRunExecutor",
+                        )
+                    ):
+                        row = await read_row(run_id)
+                except Exception:
+                    logger.warning(
+                        f"[LocalRunExecutor] Cleanup: row read failed for {key}",
+                        exc_info=True,
+                    )
+                    continue
+                if row is not None and row["status"] == "in_progress":
+                    continue
+                if row is not None:
+                    # The owner's effects run whoever settled the row. Every
+                    # settle by another owner stamps ``recovery`` and runs the
+                    # coordinator tail itself; a row without the stamp is this
+                    # finalize's own commit, whose acknowledgement was lost.
+                    try:
+                        await finish(
+                            row, tail=not (row.get("metadata") or {}).get("recovery")
+                        )
+                    except Exception:
+                        logger.warning(
+                            f"[LocalRunExecutor] Cleanup: terminal effects "
+                            f"failed for {key}",
+                            exc_info=True,
+                        )
+                settled.append(key)
+            async with self.task_lock:
+                for key in settled:
+                    if self.executions.pop(key, None) is not None:
+                        to_remove.append(key)
+                        logger.info(
+                            f"[LocalRunExecutor] Cleanup: removing task {key} "
+                            f"whose failed finalize is settled"
+                        )
 
         # Redis probe outside the lock: a locally-cold run may be watched
         # entirely through a sibling worker. None (Redis unreachable) means
@@ -795,15 +874,33 @@ class LocalRunExecutor:
             )
 
     async def _flush_checkpoint(self, thread_id: str, run_id: str) -> None:
-        """Resolve the run's graph and flush its checkpoint on user stop."""
+        """Resolve the run's graph and flush its checkpoint on user stop.
+
+        Only a run that wrote a step has one in flight to discard. One stopped
+        before that leaves the thread as the run before it did, and on a card
+        that run paused for, a write on top would plan the waiting call again
+        under a new interrupt id, so the user's answer would miss it and the
+        card be asked again. The ownership read and the flush share the one
+        deadline the next send's admission allows the stop.
+        """
+        from src.server.utils.checkpoint_helpers import newest_checkpoint
+
         async with self.task_lock:
             task_info = self.executions.get((thread_id, run_id))
             graph = task_info.graph if task_info else None
 
         if not graph:
             return
-
-        await teardown.flush_checkpoint(graph, thread_id)
+        try:
+            async with asyncio.timeout(get_checkpoint_flush_timeout()):
+                newest = await newest_checkpoint(graph.checkpointer, thread_id)
+                if newest is None or newest.run_id != run_id:
+                    return
+                await teardown.flush_checkpoint(graph, thread_id)
+        except TimeoutError:
+            logger.warning(
+                f"[LocalRunExecutor] Checkpoint flush timed out for {thread_id}"
+            )
 
     def _track_orphan_collector(
         self, thread_id: str, run_id: str, task: asyncio.Task
@@ -1122,9 +1219,10 @@ class LocalRunExecutor:
 
         # ---- local terminal mark (after the CAS: a losing finalize adopts
         # the survivor's status instead of relabeling the winner's). A THROWN
-        # finalize (applied=False, no survivor) marks nothing: the row is
-        # still in_progress, so the entry must stay RUNNING, with its
-        # run_handle, for cleanup's dead-handle fail_open path. ----
+        # finalize (applied=False, no survivor) marks no status: the row is
+        # still in_progress, so the entry stays RUNNING, with its run_handle,
+        # until cleanup sees the row settled or the abandoned timeout fails it
+        # open. ----
         if verdict.concluded:
             local_status = verdict.survivor_status or verdict.status
             async with self.task_lock:
@@ -1136,6 +1234,35 @@ class LocalRunExecutor:
                 task_info.completed_at = datetime.now()
                 if error:
                     task_info.error = error
+        else:
+            async def finish(row: Dict[str, Any], *, tail: bool) -> None:
+                if tail:
+                    from src.server.services.runs.coordinator import RunCoordinator
+
+                    RunCoordinator.get_instance().post_finalize_tail(thread_id, row)
+                await self._apply_post_terminal_effects(
+                    thread_id,
+                    run_id,
+                    FinalizeVerdict(
+                        applied=True,
+                        status=row["status"],
+                        stopped_by_user=is_user_stop(row),
+                    ),
+                    kind=kind,
+                    stop=stop,
+                    carried_events=carried_events,
+                    task_info=task_info,
+                    completion_callback=completion_callback,
+                    execution_time=outcome.execution_time,
+                    interrupt_reason=interrupt_reason,
+                    error=error,
+                    metadata=metadata,
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                )
+                task_info.persistence_complete.set()
+
+            task_info.finish_failed_finalize = finish
 
         if verdict.applied:
             await self._apply_post_terminal_effects(
@@ -1180,160 +1307,22 @@ class LocalRunExecutor:
         run's tail) never do. Collectors are not writers (they read Redis
         and persist via the app pool).
 
-        Fail-closed: raises on registry failure or deadline, so the guard
-        teardown discards the session instead of clean-releasing it under
-        writers it could not account for. Re-snapshots after each wait to
-        catch writers registered while earlier ones were draining."""
+        Fail-closed: raises on registry failure or on a writer that will not
+        stop (``drain_tail_writers``), so the guard teardown discards the
+        session instead of clean-releasing it under writers it could not
+        account for."""
         from src.server.services.background_registry_store import (
             BackgroundRegistryStore,
         )
-
-        # DALTON-HOOK(tail-drain-outlives-workflows): the drain waits each
-        # writer out to ITS OWN clock, never a flat presumption. A deep
-        # workflow tail writer is governed by workflow.run_timeout (hours,
-        # from its own start) — the flat 1800s tail presumption discarded
-        # live sessions under healthy workflows in production ("the
-        # connection is closed" on the parent, GuardSessionLost on its
-        # children, 30 minutes in). Writers past their own deadline are hung
-        # and still fail toward discard, fencing intact.
-        drain_started = time.time()
-        while True:
-            bg_registry = await BackgroundRegistryStore.get_instance().get_registry(
-                thread_id
-            )
-            if not bg_registry:
-                return
-            # DALTON-HOOK(tail-drain-outlives-workflows): the handles that
-            # come back are bare asyncio Tasks with no task_id, so the owning
-            # task ids are collected here, where the predicate sees the
-            # BackgroundTask, for the per-workflow deadline to match on.
-            live_task_ids: set[str] = set()
-
-            def _owned(task) -> bool:
-                if not guard.owns_task_ns(task.task_id):
-                    return False
-                if task.live_writers:
-                    live_task_ids.add(task.task_id)
-                return True
-
-            writers = await bg_registry.live_writers_where(_owned)
-            if not writers:
-                return
-            deadline, basis = await self._tail_drain_deadline(
-                thread_id, run_id, drain_started, live_task_ids
-            )
-            remaining = deadline - time.time()
-            if remaining <= 0:
-                # DALTON-HOOK(tail-drain-outlives-workflows): the wording
-                # names the deadline basis the drain actually used.
-                raise TimeoutError(
-                    f"tail drain deadline: {len(writers)} subagent writer(s) "
-                    f"still running for run={run_id}; waited past {basis}"
-                )
-            logger.info(
-                f"[LocalRunExecutor] guard tail-drain awaiting "
-                f"{len(writers)} subagent writer(s) for run={run_id} "
-                f"({basis}, {remaining:.0f}s left)"
-            )
-            await asyncio.wait(writers, timeout=remaining)
-
-    # DALTON-HOOK(tail-drain-outlives-workflows): sizes the drain deadline
-    # per writer — a live root workflow's own run_timeout window, everyone
-    # else the tail allowance subagent_tail_timeout() sizes (the flat 1800s
-    # or the workflow child_timeout, whichever is longer).
-    async def _tail_drain_deadline(
-        self,
-        thread_id: str,
-        run_id: str,
-        drain_started: float,
-        live_task_ids: set[str],
-    ) -> tuple[float, str]:
-        """When the drain may give up on these writers, and why (for the
-        timeout's wording): each live ROOT workflow run gets its own
-        ``run_timeout`` window counted from its start plus a settle margin;
-        every other writer gets the ``subagent_tail_timeout()`` tail
-        allowance — the flat ``SUBAGENT_TAIL_TIMEOUT`` raised to the workflow
-        ``child_timeout`` when that is longer — counted from the drain's
-        start. The drain waits to the latest of the applicable deadlines —
-        discarding any writer before its own clock permits is the production
-        failure this exists to prevent. A workflow-rows read that fails
-        degrades to the global workflow timeout (hours): hold, never kill
-        blind."""
-        from datetime import UTC
-
-        from src.config.settings import (
-            get_workflow_orchestration_config,
-            get_workflow_timeout,
+        from ptc_agent.agent.middleware.background_subagent.tail_drain import (
+            drain_tail_writers,
         )
-        from src.server.database.runs import subagent_runs as sr_db
 
-        # DALTON-HOOK(tail-drain-outlives-workflows): an ordinary tail
-        # subagent keeps the workflow child's ceiling too — production's
-        # Dalton overlay raised child_timeout to 5400s while the flat 1800s
-        # discarded healthy modelers 30 minutes in.
-        tail_allowance = subagent_collection.subagent_tail_timeout()
-        flat_deadline = drain_started + tail_allowance
-        flat_basis = (
-            f"the {tail_allowance:.0f}s tail allowance for ordinary writers "
-            f"(max of the flat {subagent_collection.SUBAGENT_TAIL_TIMEOUT:.0f}s "
-            f"and the workflow child_timeout)"
+        await drain_tail_writers(
+            lambda: BackgroundRegistryStore.get_instance().get_registry(thread_id),
+            lambda task: guard.owns_task_ns(task.task_id),
+            run_id=run_id,
         )
-        try:
-            open_workflows = await sr_db.list_open_workflow_runs_for_thread(
-                thread_id
-            )
-        except Exception:
-            # Anchored at the DRAIN'S start, never recomputed: re-anchoring
-            # on each loop's failed read would postpone the deadline forever
-            # under a persistent failure, and the session would never
-            # fail-closed.
-            fallback = drain_started + float(get_workflow_timeout())
-            logger.warning(
-                f"[LocalRunExecutor] open-workflow read failed sizing the "
-                f"tail drain for run={run_id}; holding to the global "
-                f"workflow timeout from the drain's start",
-                exc_info=True,
-            )
-            return (
-                max(flat_deadline, fallback),
-                "the global workflow-timeout fallback from the drain's start "
-                "(open-workflow read failed)",
-            )
-        run_timeout = float(get_workflow_orchestration_config().run_timeout)
-        deadline = flat_deadline
-        basis_parts = [flat_basis]
-        for row in open_workflows:
-            # Roots only: a run the turn launched. A workflow's own children
-            # carry no parent run and answer to child_timeout like any other
-            # non-workflow writer, not to run_timeout.
-            if row.get("parent_run_id") is None:
-                continue
-            if row.get("task_id") not in live_task_ids:
-                continue
-            started = row.get("started_at")
-            if started is None:
-                continue
-            if started.tzinfo is None:
-                started = started.replace(tzinfo=UTC)
-            own = (
-                started.timestamp()
-                + run_timeout
-                + self._WORKFLOW_SETTLE_MARGIN_S
-            )
-            if own > deadline:
-                deadline = own
-            age = max(time.time() - started.timestamp(), 0.0)
-            state = (
-                "overdue"
-                if own <= time.time()
-                else f"{own - time.time():.0f}s left"
-            )
-            basis_parts.append(
-                f"workflow {row.get('task_id')} at its own run_timeout "
-                f"+{self._WORKFLOW_SETTLE_MARGIN_S:.0f}s settle "
-                f"(started {age:.0f}s ago, budget {run_timeout:.0f}s, {state})"
-            )
-        return deadline, "; ".join(basis_parts)
 
     async def _apply_post_terminal_effects(
         self,

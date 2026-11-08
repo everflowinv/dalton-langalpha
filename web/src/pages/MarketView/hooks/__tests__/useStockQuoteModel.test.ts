@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { getExtendedHoursInfo } from '@/lib/marketUtils';
-import { quoteCurrency } from '@/lib/bars';
+import { quoteCurrency, quotePlaces } from '@/lib/bars';
 import { resolveDualName } from '@/lib/displayName';
 import { isLiveRow, resolveFreshnessBadge } from '@/lib/freshness';
 import { isUSEquity } from '../../utils/chartConstants';
@@ -41,6 +41,7 @@ function legacyDeriveStockQuote({
   const ext = extType && settledClose != null && extDisplayPrice != null && extDisplayPct != null
     ? {
         type: extType,
+        label: extType === 'pre' ? 'Pre-Market' : 'After-Hours',
         price: extDisplayPrice,
         change: extDisplayChange ?? null,
         pct: extDisplayPct,
@@ -56,7 +57,7 @@ function legacyDeriveStockQuote({
     : { price, change, pct: changePercent, tone };
 
   const isLive = wsStatus === 'connected' && isUSEquity(symbol) && wsHasData;
-  const status: QuoteStatus = isLive ? 'live' : marketPhase === 'closed' ? 'closed' : 'delayed';
+  const status: QuoteStatus = marketPhase === 'closed' ? 'closed' : isLive ? 'live' : 'delayed';
   const providers = (marketStatus?.providers ?? []) as string[];
   const activeSource = isLive ? 'ginlix-data' : (snapshot?.source ?? null);
   const dataSources = activeSource ? [activeSource] : providers;
@@ -75,7 +76,9 @@ function legacyDeriveStockQuote({
     changePercent,
     tone,
     headline,
+    places: quotePlaces(symbol, { currency: snapshot?.currency, assetClass: snapshot?.asset_class, price: previousClose ?? price }),
     status,
+    phase: marketPhase,
     tickAt,
     previousClose,
     open: realTimePrice?.open ?? stockInfo?.Open ?? null,
@@ -198,8 +201,9 @@ describe('deriveStockQuote', () => {
     expect(postQ.ext?.pct).toBeCloseTo(0.2584, 4);
   });
 
-  it('status: a live feed wins, a closed phase reads closed, anything else delayed', () => {
-    expect(deriveStockQuote({ ...base, wsStatus: 'connected', wsHasData: true, marketPhase: 'closed' }).status).toBe('live');
+  it('status: a closed phase wins over a live feed, a live feed reads live, anything else delayed', () => {
+    expect(deriveStockQuote({ ...base, wsStatus: 'connected', wsHasData: true, marketPhase: 'closed' }).status).toBe('closed');
+    expect(deriveStockQuote({ ...base, wsStatus: 'connected', wsHasData: true, marketPhase: 'post' }).status).toBe('live');
     expect(deriveStockQuote({ ...base, marketPhase: 'closed' }).status).toBe('closed');
     expect(deriveStockQuote({ ...base, marketPhase: 'post' }).status).toBe('delayed');
     expect(deriveStockQuote({ ...base }).status).toBe('delayed');

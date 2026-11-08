@@ -60,6 +60,17 @@ _STUB_PRICING = {
 }
 
 
+# DALTON-HOOK(llm-overlay): Reset the process-level missing-pricing warning set
+# before each test so earlier tests do not suppress warnings in later tests.
+@pytest.fixture(autouse=True)
+def _reset_warned_tracking_missing_pricing():
+    from src.utils.tracking.core import _WARNED_TRACKING_MISSING_PRICING
+
+    _WARNED_TRACKING_MISSING_PRICING.clear()
+    yield
+    _WARNED_TRACKING_MISSING_PRICING.clear()
+
+
 # ===================================================================
 # Test 1: PerCallTokenTracker billing_type tests
 # ===================================================================

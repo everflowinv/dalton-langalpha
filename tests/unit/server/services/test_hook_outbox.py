@@ -6,6 +6,7 @@ applicability (ordinary runs no-op) and RAISE on transport failure so the
 drainer's nack/backoff — not a swallowed log line — is the retry path.
 """
 
+import dataclasses
 # DALTON-HOOK(handoff-report-quiescence): create_autospec for the probe stub
 from unittest.mock import AsyncMock, MagicMock, create_autospec, patch
 
@@ -72,6 +73,18 @@ def _jobs(final_status, **kw):
 
 def _types(jobs):
     return sorted(j.hook_type for j in jobs)
+
+
+@pytest.mark.parametrize("on", [False, True])
+def test_a_completed_turn_owes_the_idle_compaction_job_only_with_the_feature_on(monkeypatch, on):
+    """Off, a turn writes nothing for it; on, only a completed one does."""
+    from src.config import features
+
+    spec = features.FEATURES["idle_compaction"]
+    monkeypatch.setitem(features.FEATURES, "idle_compaction", dataclasses.replace(spec, enabled=on))
+
+    assert ("idle_compact" in _types(_jobs("completed"))) is on
+    assert all("idle_compact" not in _types(_jobs(status)) for status in ("error", "cancelled", "interrupted"))
 
 
 _RELEASES_ITS_PAIR = {
@@ -1044,6 +1057,18 @@ def _awaitable_fn(fn):
 
 # DALTON-HOOK(handoff-keep-on-resumable): test suite for resumable handoff retention
 class TestHandoffKeepOnResumable:
+    @pytest.fixture(autouse=True)
+    def _no_card_waiting(self):
+        """Upstream #687 reads the checkpoint for a card left waiting under a
+        stopped or failed attempt; none of these cases has one, so the check
+        is stubbed the way upstream's own report-back tests stub it."""
+        with patch(
+            "src.server.services.report_back.notify_turn._card_waits",
+            autospec=True,
+            return_value=False,
+        ):
+            yield
+
     @staticmethod
     def _seeded_cache(
         *,

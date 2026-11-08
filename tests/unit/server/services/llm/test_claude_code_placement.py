@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi import HTTPException
 
+from ptc_agent.agent.claude_code.launcher import Credential
 from ptc_agent.core import claude_code_managed
 from ptc_agent.core.sandbox.providers.ssh import MUSL_UNSUPPORTED
 from src.server.services.claude_code import checks
@@ -42,9 +43,10 @@ async def _admit(computer, *, backend=False, cache=None, saved=None):
     with (
         serving(cache or _Cache()),
         patch(f"{SERVICE}.rows_available", return_value=True),
-        patch(f"{SERVICE}.backend_available", return_value=backend),
+        patch(f"{SERVICE}.live_cloud_turns", new_callable=AsyncMock, return_value=0),
+        patch("src.server.services.claude_code.hosted.backend_available", return_value=backend),
         patch("src.server.database.computer.get_computer_for_workspace", new_callable=AsyncMock, return_value=computer),
-        patch(f"{SAVED}.stored_token", new_callable=AsyncMock, return_value=saved),
+        patch(f"{SAVED}.stored_row", new_callable=AsyncMock, return_value={"access_token": saved} if saved else None),
         patch(f"{MACHINES}.machine_of", new=dial),
     ):
         await require_runnable(config, CODE, "analyst", user_id="user-1", workspace_id="ws-1")
@@ -69,11 +71,11 @@ async def test_an_own_computer_runs_on_a_hosted_server_with_nothing_known_of_it(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("file", ["refused", "none", "invalid"])
-async def test_an_own_computer_known_to_have_no_usable_token_is_refused(file):
+@pytest.mark.parametrize(("file", "reason"), [("refused", "token_refused"), ("none", "signed_out"), ("invalid", "token_refused")])
+async def test_an_own_computer_known_to_have_no_usable_token_is_refused_as_settings_shows_it(file, reason):
     with pytest.raises(HTTPException) as refused:
         await _admit(OWN, cache=_Cache({answer_key("c-1"): _answer(file)}))
-    assert _reason(refused) == "signed_out"
+    assert _reason(refused) == reason
 
 
 @pytest.mark.asyncio
@@ -104,7 +106,7 @@ async def test_an_answer_kept_with_a_field_no_longer_known_still_reads():
     kept = {answer_key("c-1"): _answer("refused", managed=["settings"])}
     with pytest.raises(HTTPException) as refused:
         await _admit(OWN, cache=_Cache(kept))
-    assert _reason(refused) == "signed_out"
+    assert _reason(refused) == "token_refused"
 
 
 @pytest.mark.asyncio
@@ -198,7 +200,7 @@ async def test_resolve_names_the_turns_workspace_to_the_placement_check():
         pytest.raises(HTTPException),
     ):
         await resolve_llm_config(_base(), "user-1", None, False, workspace_id="ws-1")
-    assert seen.await_args.kwargs == {"user_id": "user-1", "workspace_id": "ws-1"}
+    assert seen.await_args.kwargs == {"user_id": "user-1", "workspace_id": "ws-1", "thread_id": None}
 
 
 # -- What a turn on an own computer records --
@@ -208,7 +210,7 @@ async def test_resolve_names_the_turns_workspace_to_the_placement_check():
 async def test_a_turn_refused_on_the_machines_token_records_it_for_that_computer():
     cache = _Cache({answer_key("c-1"): _answer("works", email="user@example.com")})
     with serving(cache):
-        await ComputerToken("user-1", "c-1").refused("file")
+        await ComputerToken("user-1", "c-1").file_refused()
     kept = MachineAnswer(**cache.values[answer_key("c-1")])
     assert (kept.file, kept.email, kept.fresh) == ("refused", "user@example.com", True)
 
@@ -216,10 +218,19 @@ async def test_a_turn_refused_on_the_machines_token_records_it_for_that_computer
 @pytest.mark.asyncio
 async def test_a_relayed_token_is_handed_over_once_asked_and_its_refusal_marks_it_by_hash_only():
     cache = _Cache()
-    with serving(cache), patch(f"{SAVED}.stored_token", new_callable=AsyncMock, return_value="sk-ant-oat01-saved"):
+    with (
+        serving(cache),
+        patch(
+            "src.server.services.claude_code.machine.stored_row", new_callable=AsyncMock,
+            return_value={"access_token": "sk-ant-oat01-saved", "updated_at": None},
+        ),
+        patch(f"{SAVED}.mark_access_token_refused", new_callable=AsyncMock, return_value=True),
+        patch("src.server.services.claude_code.hosted.backend_available", lambda: True),
+    ):
         machine = ComputerToken("user-1", "c-1")
-        assert await machine.relay() == "sk-ant-oat01-saved"
-        await machine.refused("relay")
+        assert await machine.read() == Credential("sk-ant-oat01-saved")
+        with pytest.raises(ClaudeTurnFailed):
+            await machine.refused()
         assert cache.values == {token_check_key("sk-ant-oat01-saved"): False}
         assert "sk-ant-oat01-saved" not in repr(vars(machine))
-        assert await ComputerToken("user-1", "c-1").relay() is None, "a token Claude refused is not relayed again"
+        assert await ComputerToken("user-1", "c-1").read() is None, "a token Claude refused is not relayed again"

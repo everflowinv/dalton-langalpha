@@ -35,15 +35,9 @@ async def _install_dependencies(sandbox: "PTCSandbox") -> None:
     """Install required Python packages in sandbox (no-snapshot fallback)."""
     logger.info("Installing dependencies (no snapshot)")
 
-    # yfinance pins curl_cffi<0.14 but scrapling[all] requires >=0.14.
-    # Override resolves the conflict (tested, yfinance works with 0.14+).
     # DALTON-HOOK(sandbox-pip-system): pass --system to match Dockerfile.sandbox
     # when UV_SYSTEM_PYTHON / VIRTUAL_ENV is not set in the container.
-    install_cmd = (
-        "echo 'curl_cffi>=0.14' > /tmp/_overrides.txt && "
-            f"uv pip install --system -q --override /tmp/_overrides.txt {' '.join(DEFAULT_DEPENDENCIES)} && "
-            "rm -f /tmp/_overrides.txt"
-    )
+    install_cmd = f"uv pip install --system -q {' '.join(DEFAULT_DEPENDENCIES)}"
 
     try:
         assert sandbox.runtime is not None

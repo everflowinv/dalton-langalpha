@@ -3,9 +3,10 @@ machine, and what the backend knows of it.
 
 An own computer (the SSH provider's, a Mac reached through Remote control
 included) runs the CLI itself, signed in with the token LangAlpha keeps on
-that machine. With none there, a self-hosted server relays the token the
-user saved in Settings (``backend_available``), handed to the CLI by fd and
-never written to the machine; a hosted server has nothing to relay.
+that machine. With none there, the token the user saved in Settings is
+relayed where it signs in their turns (``hosted.saved_token_runs``): on a
+self-hosted server, and on the platform while the user stores it there. It
+is handed to the CLI by fd and never written to the machine.
 
 A token passes through the backend once, from a sign-in or a paste: it is
 staged on the machine over its SSH connection's stdin, beside the computer's
@@ -34,7 +35,7 @@ from ptc_agent.core.sandbox.providers._ssh_transport import TRANSPORT_ERRORS, Li
 from ptc_agent.core.sandbox.providers.ssh import MUSL_UNSUPPORTED
 from ptc_agent.core.sandbox.providers.ssh_errors import connect_failure
 from ptc_agent.core.sandbox.runtime import SandboxTransientError
-from src.llms.claude_code import ClaudeTurnFailed, backend_available
+from src.llms.claude_code import ClaudeTurnFailed
 from src.server.services.oauth_signin import OAuthRefusal, PendingSignIn
 from src.server.database.computer import get_computer, get_computer_roster
 from src.server.models.claude_code import ClaudeCodeComputer, ClaudeCodeComputers, ComputerState, Source, State
@@ -42,11 +43,13 @@ from src.server.models.computer import ComputerStatus as Lifecycle
 from src.server.services.ssh_computers import is_own_computer, ssh_info, tunnel_of, tunnels_for
 from src.utils.cache.redis_cache import get_cache_client
 
-from .checks import CHECK_CLEANUP_S, CHECK_S, CHECKED, SHORT_TTL_S, Held, in_background, keep_check, run_check, ttl
+from .checks import CHECK_CLEANUP_S, CHECK_S, CHECKED, SHORT_TTL_S, Held, in_background, run_check, ttl
 from .flow import MACHINE_IO_S, POLICY_BLOCKED, busy, changing, rows_on
-from .saved import stored_token, token_check_key, token_state, usable_token
+from .hosted import saved_token_runs
+from .saved import refusal_stamp, refuse, stored_row, token_state, usable
 
 if TYPE_CHECKING:
+    from ptc_agent.agent.claude_code.launcher import Credential
     from ptc_agent.agent.claude_code.ssh_launcher import SSHLauncher
 
 logger = logging.getLogger(__name__)
@@ -86,8 +89,6 @@ _NOT_RUNNABLE: dict[str, tuple[str, bool]] = {
     "policy_blocked": (POLICY_BLOCKED, False), "needs_perl": (NEEDS_PERL, True),
     "computer_unsupported": (MUSL_UNSUPPORTED, False),
 }
-#: Which token Claude refused on a run there, as the launcher reports it.
-Refused = Literal["file", "relay"]
 
 
 def answer_key(computer_id: str) -> str:
@@ -230,10 +231,11 @@ async def keep_unless_newer(computer_id: str, answer: MachineAnswer | None, sinc
 class ComputerToken:
     """What a turn on an own computer signs in with, as the backend sees it.
 
-    ``relay`` hands the CLI the user's saved token when the machine asks for
-    it, unless Claude is known to refuse it, remembering only its hash;
+    As the run's ``TokenStore``, ``read`` hands the CLI the user's saved
+    token when the machine asks for it, unless Claude is known to refuse it,
+    remembering only its hash, and ``refused`` hears that Claude refused it;
     ``announced`` hears whether the machine had a token file of the
-    computer's, and ``refused`` that Claude refused the token the run used,
+    computer's, and ``file_refused`` that Claude refused that file,
     so Settings and admission say so from then on, as ``blocked`` hears that
     an organization's policy is installed there, ``no_perl`` that the
     machine has no perl and ``unsupported`` that it runs musl. None of
@@ -245,7 +247,7 @@ class ComputerToken:
         self.user_id = user_id
         self.computer_id = computer_id
         self.built_at = time.time()
-        self._relayed: str | None = None
+        self._relayed: tuple[str, datetime] | None = None
 
     async def _last(self) -> tuple[bool, MachineAnswer | None]:
         """Whether this turn may still change the kept answer, and that answer:
@@ -253,10 +255,15 @@ class ComputerToken:
         last = await read_answer(self.computer_id)
         return last is None or last.checked_at <= self.built_at, last
 
-    async def relay(self) -> str | None:
-        token = await usable_token(self.user_id)
-        self._relayed = token_check_key(token) if token else None
-        return token
+    async def read(self) -> Credential | None:
+        from ptc_agent.agent.claude_code.launcher import Credential
+
+        row = await stored_row(self.user_id) if await saved_token_runs(self.user_id) else None
+        if row is None or not await usable(row):
+            self._relayed = None
+            return None
+        self._relayed = refusal_stamp(row)
+        return Credential(row["access_token"])
 
     async def announced(self, source: Literal["file", "relay", "none"]) -> None:
         """Keep that the machine had no token file a turn could use when it
@@ -270,11 +277,12 @@ class ComputerToken:
             folder = last.folder if last else None
             await keep_unless_newer(self.computer_id, MachineAnswer("none", folder=folder), self.built_at)
 
-    async def refused(self, source: Refused) -> None:
-        if source == "relay":
-            if self._relayed is not None:
-                await keep_check(self._relayed, "refused")
-            return
+    async def refused(self) -> None:
+        if self._relayed is not None:
+            await refuse(self.user_id, *self._relayed)
+        raise ClaudeTurnFailed("token_refused", "Claude refused the saved setup token relayed to the computer")
+
+    async def file_refused(self) -> None:
         current, last = await self._last()
         if current:
             await keep_unless_newer(self.computer_id, carried(last, "refused"), self.built_at)
@@ -298,14 +306,14 @@ class ComputerToken:
             await keep_unless_newer(self.computer_id, carried(last, file, present=present), self.built_at)
 
 
-async def machine_of(computer: Mapping[str, Any]) -> Machine:
+async def machine_of(computer: Mapping[str, Any]) -> Machine[Link]:
     """The computer's machine, dialed without starting the computer. Raises when it cannot be reached."""
     from src.server.services.workspace_manager import WorkspaceManager
 
     return await WorkspaceManager.get_instance().machine_link(dict(computer))
 
 
-def check_launcher(machine: Machine, user_id: str, token_file: str) -> SSHLauncher:
+def check_launcher(machine: Machine[Link], user_id: str, token_file: str) -> SSHLauncher:
     """A launcher signed in with the token file ``token_file`` names only, the
     computer's or a staged one, as a check of that token needs, and one that
     never installs the CLI nor waits long for a CLI slot: a check must end
@@ -316,7 +324,7 @@ def check_launcher(machine: Machine, user_id: str, token_file: str) -> SSHLaunch
 
 
 async def check_machine(
-    machine: Machine, user_id: str, computer_id: str, last: MachineAnswer | None, *, look_only: bool = False,
+    machine: Machine[Link], user_id: str, computer_id: str, last: MachineAnswer | None, *, look_only: bool = False,
 ) -> MachineAnswer:
     """The machine's token as it stands: whether a usable one is there, and if
     so whether Claude serves it, by one minimal turn on the machine, which
@@ -400,18 +408,20 @@ def _entry(
     )
 
 
-async def _relayed(user_id: str) -> str | None:
-    """The saved token a machine with none of its own would sign in with, where it is relayed."""
-    return await stored_token(user_id) if backend_available() else None
+async def _relayed(user_id: str) -> dict | None:
+    """The saved token's row, for a machine with none of its own that would sign in with it, where it is relayed."""
+    return await stored_row(user_id) if await saved_token_runs(user_id) else None
 
 
-async def _from_answer(computer: Mapping[str, Any], answer: MachineAnswer, saved: str | None) -> ClaudeCodeComputer:
+async def _from_answer(
+    user_id: str, computer: Mapping[str, Any], answer: MachineAnswer, saved: dict | None,
+) -> ClaudeCodeComputer:
     """The entry an answer reads as (``computer_state``). A machine with no
     usable token of its own signs in with the saved token where that is
     relayed, and reads as it does, still naming a file there it refuses, so
     that can be removed. One where Claude Code cannot run names a token
     there only so it can be removed."""
-    relayed = await token_state(saved) if saved and answer.relays else None
+    relayed = await token_state(user_id, saved) if saved and answer.relays else None
     state = computer_state(answer, relayed)
     if relayed is not None:
         return _entry(computer, state, "saved", own_file=answer.names_file)
@@ -422,48 +432,60 @@ async def _from_answer(computer: Mapping[str, Any], answer: MachineAnswer, saved
 
 
 async def _status(
-    user_id: str, computer: Mapping[str, Any], tunnels: dict[str, dict[str, Any]] | None, saved: str | None,
+    user_id: str, computer: Mapping[str, Any], tunnels: dict[str, dict[str, Any]] | None, saved: dict | None,
+    *, mark_offline: bool = False,
 ) -> ClaudeCodeComputer:
     """The computer's kept answer. On a miss with the computer awake, one
     worker checks it in the background and reads answer checking until it
-    lands; one asleep or out of reach reads as it last answered."""
+    lands; one asleep or out of reach reads as it last answered, or with
+    ``mark_offline`` as ``offline``, since no turn runs there until it is back."""
     computer_id = str(computer["computer_id"])
+    if mark_offline and not (_awake(computer, tunnels) and not await get_cache_client().get(unreached_key(computer_id))):
+        return _entry(computer, "offline")
     answer = await read_answer(computer_id)
     if answer is not None and answer.fresh:
-        return await _from_answer(computer, answer, saved)
+        return await _from_answer(user_id, computer, answer, saved)
     if _awake(computer, tunnels) and not await get_cache_client().get(unreached_key(computer_id)):
         started = await in_background(
             change_lock(computer_id), STATUS_CHECK_S, partial(_check_then_keep, user_id, computer_id, answer),
         )
         return _entry(computer, "unverified" if started is None else "checking")
     if answer is not None:
-        return await _from_answer(computer, answer, saved)
+        return await _from_answer(user_id, computer, answer, saved)
     return _entry(computer, "offline")
 
 
-async def _off(user_id: str, computer: Mapping[str, Any], tunnels: dict[str, dict[str, Any]] | None) -> ClaudeCodeComputer:
+async def _off(
+    user_id: str, computer: Mapping[str, Any], tunnels: dict[str, dict[str, Any]] | None, *, mark_offline: bool = False,
+) -> ClaudeCodeComputer:
     """A computer while Claude Code is off for the user, naming the token it
     last held, which Settings still offers to remove. With no answer kept
     (it lapsed, or Redis lost it) and the computer awake, one worker looks
     in the background for a token file there, never running a check, so a
-    token left on the machine is named from the next read on."""
+    token left on the machine is named from the next read on. With
+    ``mark_offline``, one asleep or that a recent dial could not reach reads
+    ``offline``."""
     computer_id = str(computer["computer_id"])
     answer = await read_answer(computer_id)
-    if answer is None and _awake(computer, tunnels) and not await get_cache_client().get(unreached_key(computer_id)):
+    reachable = _awake(computer, tunnels) and not await get_cache_client().get(unreached_key(computer_id))
+    if answer is None and reachable:
         await in_background(
             change_lock(computer_id), LOOK_S, partial(_check_then_keep, user_id, computer_id, None, look_only=True),
         )
-    return _entry(computer, "off", "machine" if answer is not None and answer.names_file else None)
+    source = "machine" if answer is not None and answer.names_file else None
+    return _entry(computer, "off" if reachable or not mark_offline else "offline", source)
 
 
-async def list_computers(user_id: str) -> ClaudeCodeComputers:
-    """Every own computer of the user's and where Claude Code stands on it."""
+async def list_computers(user_id: str, *, mark_offline: bool = False) -> ClaudeCodeComputers:
+    """Every own computer of the user's and where Claude Code stands on it;
+    ``mark_offline`` tells one out of reach (``_off``, ``_status``)."""
     computers = [c for c in await get_computer_roster(user_id) if is_own_computer(c)]
     if not await rows_on(user_id):
         tunnels = await tunnels_for(user_id, computers)
-        return ClaudeCodeComputers(computers=list(await asyncio.gather(*(_off(user_id, c, tunnels) for c in computers))))
+        entries = await asyncio.gather(*(_off(user_id, c, tunnels, mark_offline=mark_offline) for c in computers))
+        return ClaudeCodeComputers(computers=list(entries))
     tunnels, saved = await asyncio.gather(tunnels_for(user_id, computers), _relayed(user_id))
-    entries = await asyncio.gather(*(_status(user_id, c, tunnels, saved) for c in computers))
+    entries = await asyncio.gather(*(_status(user_id, c, tunnels, saved, mark_offline=mark_offline) for c in computers))
     return ClaudeCodeComputers(computers=list(entries))
 
 
@@ -503,7 +525,7 @@ class MachineHome:
         self.lock = change_lock(self.computer_id)
         self.sign_in = PendingSignIn(f"claude_code:sign_in:{user_id}:{self.computer_id}")
         self.who = f"user_id={user_id} computer_id={self.computer_id}"
-        self._machine: Machine | None = None
+        self._machine: Machine[Link] | None = None
         #: The tokens' folder the token was put in, as the machine named it, which ``keep`` records.
         self._folder: str | None = None
 
@@ -515,7 +537,7 @@ class MachineHome:
         return cls(user_id, computer)
 
     @property
-    def machine(self) -> Machine:
+    def machine(self) -> Machine[Link]:
         if self._machine is None:
             raise RuntimeError("ready the home before changing its token")
         return self._machine
@@ -630,7 +652,7 @@ class MachineHome:
         answer = await read_answer(self.computer_id)
         if answer is None:
             return _entry(self.computer, "checking")
-        return await _from_answer(self.computer, answer, await _relayed(self.user_id))
+        return await _from_answer(self.user_id, self.computer, answer, await _relayed(self.user_id))
 
     async def remove(self, *, held: Held) -> None:
         """Remove the token, then keep what the machine says now: its

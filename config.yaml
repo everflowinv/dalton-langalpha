@@ -40,6 +40,14 @@ redis_warm_on_startup: true
 # turns it on in its APP_ENV overlay.
 brokerage_marks_warm_on_startup: false
 langsmith_tracing: false
+# Off: a middleware hook's LangSmith run keeps its name, timing, outputs and
+# errors but not its inputs, and a graph node's run records how many messages
+# its state held rather than the messages, which the model call's own run
+# already holds. Each copy is the whole stored conversation, about 70 per model
+# call, and they were 96% of what a turn uploaded. On restores both, for
+# debugging a middleware, except where a middleware sets its own trace policy
+# (deepagents' PatchToolCallsMiddleware always omits its inputs).
+langsmith_full_payloads: false
 
 # User-facing product features. Each entry overrides the code catalog
 # (src/config/features.py) for this deployment; unset fields inherit the
@@ -283,6 +291,21 @@ market_watch:
   max_symbols: 10
   max_targets: 10              # Armed price targets per thread
   target_warning_minutes: 60   # Tell the thread this long before a target lapses
+
+
+# =============================================================================
+# CLAUDE CODE ON CLOUD COMPUTERS
+# =============================================================================
+# The runtime's own switch is features.claude_code_runtime above. With
+# sandbox_placement on, a turn on a cloud computer runs its Claude Code CLI
+# inside that computer's own sandbox, on Medium computers or larger; with it
+# off, a self-hosted server runs it in the worker that owns the turn, and the
+# platform runs none there.
+claude_code:
+  hosted_api_key: false        # Run them on the user's own Anthropic API key
+  stored_custody: false        # Run them on a setup token the user lets the server store
+  sandbox_placement: false     # Run the CLI inside the cloud computer's own sandbox
+  hosted_turns_per_user: 3     # Turns one user runs at once on cloud computers
 
 
 # =============================================================================

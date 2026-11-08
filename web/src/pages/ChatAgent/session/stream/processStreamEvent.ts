@@ -884,7 +884,7 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
       const kind = event.error_kind as 'upstream' | 'internal' | undefined;
       const structured: StructuredError | undefined = busyCode !== null
         ? { message: errorMessage as string, kind: 'notice' }
-        : readStreamFailure(event, errorMessage as string, rt.workspaceId);
+        : readStreamFailure(event, errorMessage as string, rt.workspaceId, rt.t);
 
       // DALTON-HOOK(colleague-dispatch): terminal non-retryable error when workspace owner revokes colleague access
       if (event.code === 'colleague_access_revoked') {

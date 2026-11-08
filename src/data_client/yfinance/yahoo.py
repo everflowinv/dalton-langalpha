@@ -9,9 +9,11 @@ goes back through ``display_spelling`` before it leaves the package.
 from __future__ import annotations
 
 import math  # DALTON-HOOK(yfinance-prev-close)
+import time  # DALTON-HOOK(yfinance-prev-close)
+from typing import Any  # DALTON-HOOK(yfinance-prev-close)
 
 import yfinance as yf
-from market_protocol import vendor_spelling
+from market_protocol import AssetClass, to_canonical, vendor_spelling
 
 _FX_CURRENCIES = frozenset({  # DALTON-HOOK(market-data-fallback)
     "AED", "ARS", "AUD", "BRL", "CAD", "CHF", "CLP", "CNH", "CNY", "COP",
@@ -93,14 +95,23 @@ def yahoo_symbol(symbol: str, *, is_index: bool = False) -> str:
     """Yahoo's spelling of *symbol*; a bare index gets its caret (``^GSPC``).
 
     A venue-suffixed index (``000300.SS``) is already a Yahoo symbol and never
-    takes a caret.
+    takes a caret. A rate is ``EURUSD=X`` and a coin ``BTC-USD``, however it
+    arrives: on Yahoo the pair spelling ``EUR-USD`` is a defunct coin.
     """
     s = vendor_spelling(symbol)
-    if not is_index and (fx := _yahoo_fx_symbol(s)) is not None:  # DALTON-HOOK(market-data-fallback)
+    if is_index:
+        return s if s.startswith("^") or "." in s or "=" in s else f"^{s}"  # DALTON-HOOK(stock-move-upgrade)
+    if (fx := _yahoo_fx_symbol(s)) is not None:  # DALTON-HOOK(market-data-fallback)
         return fx
-    if not is_index or s.startswith("^") or "." in s or "=" in s:  # DALTON-HOOK(stock-move-upgrade)
-        return s
-    return f"^{s}"
+    try:
+        ref = to_canonical(s)
+    except ValueError:
+        return s  # a spelling the protocol refuses still gets to ask Yahoo
+    if ref.asset_class is AssetClass.FX:
+        return f"{ref.symbol.replace('-', '')}=X"
+    if ref.asset_class is AssetClass.CRYPTO:
+        return ref.symbol
+    return s
 
 
 def yahoo_ticker(symbol: str) -> yf.Ticker:
@@ -158,6 +169,11 @@ def validated_previous_close(  # DALTON-HOOK(yfinance-prev-close)
 
     rows_before = [r for r in daily_rows if not quote_date or r[0] < quote_date]
     any_volume = any(v > 0 for _, _, v in daily_rows)
+    if not rows_before and not any_volume:
+        # Volume-less instrument (e.g. an index) whose daily series holds
+        # only the current session's bar: there are no fill rows before the
+        # quote date to reject, so the chart's previous close stands.
+        return fast_info_prev
     candidates = [r for r in rows_before if r[2] > 0] if any_volume else rows_before
     if not candidates:
         # Rows exist but every one before the quote is a frozen fill: there is
@@ -178,6 +194,73 @@ def validated_previous_close(  # DALTON-HOOK(yfinance-prev-close)
     if math.isclose(daily_prev, fast_info_prev, rel_tol=1e-3, abs_tol=1e-4):
         return fast_info_prev
     return None
+
+
+# DALTON-HOOK(yfinance-prev-close): daily-rows helper & (symbol, trading date) memo
+def _bar_date_str(idx: Any) -> str | None:
+    if hasattr(idx, "strftime"):
+        try:
+            return idx.strftime("%Y-%m-%d")
+        except Exception:
+            return None
+    return None
+
+
+def _daily_rows_from_frame(df: Any) -> list[tuple[str, float, float]] | None:  # DALTON-HOOK(yfinance-prev-close)
+    if df is None or getattr(df, "empty", True):
+        return None
+    rows: list[tuple[str, float, float]] = []
+    for idx, row in df.iterrows():
+        date_str = _bar_date_str(idx)
+        try:
+            close = float(row["Close"])
+            volume = float(row["Volume"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if date_str is None or not math.isfinite(close) or close <= 0:
+            continue
+        if volume != volume:  # NaN != NaN
+            volume = 0.0
+        rows.append((date_str, close, volume))
+    return rows or None
+
+
+def _recent_daily_rows(ticker: Any) -> list[tuple[str, float, float]] | None:  # DALTON-HOOK(yfinance-prev-close)
+    """A month of daily bars as ``(date, close, volume)``, ascending."""
+    try:
+        df = ticker.history(period="1mo", auto_adjust=False)
+    except Exception:
+        return None
+    return _daily_rows_from_frame(df)
+
+
+_DAILY_ROWS_CACHE_TTL_S = 600.0
+_DAILY_ROWS_CACHE_MAX = 256
+_daily_rows_cache: dict[tuple[str, str], tuple[float, list[tuple[str, float, float]]]] = {}
+
+
+def _clear_prev_close_daily_cache() -> None:  # DALTON-HOOK(yfinance-prev-close)
+    """Empty the previous-close daily-rows memo (tests isolate through this)."""
+    _daily_rows_cache.clear()
+
+
+def _recent_daily_rows_cached(  # DALTON-HOOK(yfinance-prev-close)
+    sym: str, quote_date: str | None, ticker: Any
+) -> list[tuple[str, float, float]] | None:
+    """`_recent_daily_rows` behind the (symbol, trading date) memo."""
+    now = time.monotonic()
+    key = (sym, quote_date or "")
+    hit = _daily_rows_cache.get(key)
+    if hit is not None and now - hit[0] < _DAILY_ROWS_CACHE_TTL_S:
+        return hit[1]
+    rows = _recent_daily_rows(ticker)
+    if rows is not None:
+        _daily_rows_cache[key] = (now, rows)
+        if len(_daily_rows_cache) > _DAILY_ROWS_CACHE_MAX:
+            stale = sorted(_daily_rows_cache.items(), key=lambda kv: kv[1][0])
+            for stale_key, _entry in stale[: _DAILY_ROWS_CACHE_MAX // 2]:
+                _daily_rows_cache.pop(stale_key, None)
+    return rows
 
 
 def yahoo_symbol_search(symbol: str, **kwargs) -> yf.Search:

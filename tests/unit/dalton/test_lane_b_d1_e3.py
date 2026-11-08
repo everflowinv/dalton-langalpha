@@ -24,68 +24,118 @@ _MKT_MOD = "src.tools.market_data.market_overview"
 
 # ---------------------------------------------------------------------- B2
 
+def _spdr_bars(closes_by_day: list[tuple[str, float]]) -> list[dict[str, float | int]]:
+    return [
+        {
+            "time": int(datetime.fromisoformat(f"{day}T16:00:00-04:00").timestamp() * 1000),
+            "open": close,
+            "high": close,
+            "low": close,
+            "close": close,
+            "volume": 1_000,
+        }
+        for day, close in closes_by_day
+    ]
+
+
 class TestSectorPerformanceQuota:
     @pytest.mark.asyncio
     async def test_dated_call_reports_quota_exhausted_explicitly(self):
-        """A dated request must name the exhausted quota, not return an empty table."""
-        from src.data_client import FinancialDataProvider
-        from src.data_client.base import FinancialDataSource
+        """A dated request answers from daily bars when yfinance has them, and
+        surfaces FmpQuotaExhausted when no fallback source can answer."""
+        from src.data_client.base import MarketDataSource
         from src.data_client.fmp.fmp_client import FmpQuotaExhausted
+        from src.data_client.market_data_provider import MarketDataProvider, ProviderEntry
         from src.tools.market_data import market_overview
         from src.tools.market_data.market_overview import fetch_sector_performance
 
-        financial = create_autospec(FinancialDataSource, instance=True)
-        financial.get_sector_performance.side_effect = FmpQuotaExhausted(
-            datetime(2026, 10, 28, 3, 0)
+        fmp_src = create_autospec(MarketDataSource, instance=True)
+        fmp_src.get_daily.side_effect = FmpQuotaExhausted(datetime(2026, 10, 28, 3, 0))
+        yf_src = create_autospec(MarketDataSource, instance=True)
+
+        async def _yf_dated(symbol: str, **kwargs):
+            if symbol == "XLK":
+                return _spdr_bars([("2026-10-26", 100.0), ("2026-10-27", 101.5)])
+            return []
+
+        yf_src.get_daily.side_effect = _yf_dated
+        provider = MarketDataProvider(
+            [
+                ProviderEntry("fmp", fmp_src, {"all"}),
+                ProviderEntry("yfinance", yf_src, {"all"}),
+            ]
         )
-        provider = create_autospec(FinancialDataProvider, instance=True)
-        provider.financial = financial
         with patch(
-            f"{_MKT_MOD}.get_financial_data_provider",
+            f"{_MKT_MOD}.get_market_data_provider",
             new=create_autospec(
-                market_overview.get_financial_data_provider, return_value=provider
+                market_overview.get_market_data_provider, return_value=provider
             ),
         ):
             content, artifact = await fetch_sector_performance(date="2026-10-27")
 
-        assert "额度已用完" in content
-        assert artifact.get("error") == "fmp_quota_exhausted"
-        assert artifact["sectors"] == []
+        assert artifact["date"] == "2026-10-27"
+        assert artifact["sectors"] == [
+            {"sector": "Information Technology", "changePercentage": 1.5}
+        ]
+        assert "| Information Technology | XLK | +1.50% |" in content
+        assert {
+            call.kwargs["to_date"] for call in yf_src.get_daily.await_args_list
+        } == {"2026-10-27"}
+
+        yf_src.get_daily.side_effect = None
+        yf_src.get_daily.return_value = []
+        with patch(
+            f"{_MKT_MOD}.get_market_data_provider",
+            new=create_autospec(
+                market_overview.get_market_data_provider, return_value=provider
+            ),
+        ):
+            empty_content, empty_artifact = await fetch_sector_performance(
+                date="2026-10-27"
+            )
+
+        assert "quota is exhausted" in empty_content.lower()
+        assert "quota is exhausted" in empty_artifact.get("error", "").lower()
+        assert empty_artifact["sectors"] == []
 
     @pytest.mark.asyncio
     async def test_dateless_call_still_falls_back_to_yfinance_snapshot(self):
-        from src.data_client import FinancialDataProvider
-        from src.data_client.base import FinancialDataSource
+        from src.data_client.base import MarketDataSource
         from src.data_client.fmp.fmp_client import FmpQuotaExhausted
+        from src.data_client.market_data_provider import MarketDataProvider, ProviderEntry
         from src.tools.market_data import market_overview
         from src.tools.market_data.market_overview import fetch_sector_performance
 
-        financial = create_autospec(FinancialDataSource, instance=True)
-        financial.get_sector_performance.side_effect = FmpQuotaExhausted(
-            datetime(2026, 10, 28, 3, 0)
-        )
-        provider = create_autospec(FinancialDataProvider, instance=True)
-        provider.financial = financial
-        snapshot_rows = [{"sector": "Technology", "changePctStr": "+1.50%"}]
-        with (
-            patch(
-                f"{_MKT_MOD}.get_financial_data_provider",
-                new=create_autospec(
-                    market_overview.get_financial_data_provider, return_value=provider
-                ),
-            ),
-            patch(
-                f"{_MKT_MOD}._yfinance_sector_snapshot",
-                new=create_autospec(
-                    market_overview._yfinance_sector_snapshot,
-                    return_value=snapshot_rows,
-                ),
-            ),
-        ):
-            content, artifact = await fetch_sector_performance()
+        fmp_src = create_autospec(MarketDataSource, instance=True)
+        fmp_src.get_daily.side_effect = FmpQuotaExhausted(datetime(2026, 10, 28, 3, 0))
+        yf_src = create_autospec(MarketDataSource, instance=True)
 
-        assert "Technology" in content
-        assert artifact["sectors"][0]["sector"] == "Technology"
+        async def _yf_daily(symbol: str, **kwargs):
+            if symbol == "XLK":
+                return _spdr_bars([("2026-10-26", 100.0), ("2026-10-27", 101.5)])
+            return []
+
+        yf_src.get_daily.side_effect = _yf_daily
+        for entries in (
+            [
+                ProviderEntry("fmp", fmp_src, {"all"}),
+                ProviderEntry("yfinance", yf_src, {"all"}),
+            ],
+            [ProviderEntry("yfinance", yf_src, {"all"})],
+        ):
+            provider = MarketDataProvider(entries)
+            with patch(
+                f"{_MKT_MOD}.get_market_data_provider",
+                new=create_autospec(
+                    market_overview.get_market_data_provider, return_value=provider
+                ),
+            ):
+                content, artifact = await fetch_sector_performance()
+
+            assert "Information Technology" in content
+            assert artifact["sectors"] == [
+                {"sector": "Information Technology", "changePercentage": 1.5}
+            ]
 
 
 # ---------------------------------------------------------------------- D1

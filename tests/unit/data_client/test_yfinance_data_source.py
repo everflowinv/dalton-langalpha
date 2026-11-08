@@ -18,18 +18,7 @@ from src.data_client.yfinance.data_source import (
     _fetch_single_snapshot,  # DALTON-HOOK(extended-hours-quotes)
     _place_in_sessions,
 )
-from src.data_client.yfinance.yahoo import yahoo_ticker
-
-
-@pytest.fixture(autouse=True)
-def _isolated_prev_close_daily_cache():
-    """These stubs carry per-test daily frames; the snapshot path's (symbol,
-    trading date) memo must not leak one test's bars into another."""
-    from src.data_client.yfinance import data_source as _ds
-
-    _ds._clear_prev_close_daily_cache()
-    yield
-    _ds._clear_prev_close_daily_cache()
+from src.data_client.yfinance.yahoo import yahoo_symbol, yahoo_ticker
 
 
 def _history_kwargs(**call_kwargs) -> dict:
@@ -164,18 +153,17 @@ def _make_stub_ticker(
 ) -> tuple[yf.Ticker, PropertyMock]:
     ticker = create_autospec(yf.Ticker, instance=True)
     ticker.fast_info = fast_info
-    ticker.history_metadata = (
-        {"regularMarketTime": regular_market_time} if regular_market_time is not None else {}
-    )
-    # DALTON-HOOK(yfinance-prev-close): a 1mo daily frame whose last valid bar
-    # before the quote's own session closes at the fast_info previous close,
-    # so these mapping tests exercise the extended-hours layer over a
-    # confirmed previous close, not the "cannot verify" fallback.
+    meta: dict[str, object] = {"exchangeTimezoneName": "America/New_York"}
+    if regular_market_time is not None:
+        meta["regularMarketTime"] = regular_market_time
+    if (last := fast_info.get("lastPrice")) is not None:
+        meta["regularMarketPrice"] = last
+    prev = fast_info.get("regularMarketPreviousClose", fast_info.get("previousClose"))
+    if prev is not None:
+        meta["chartPreviousClose"] = prev
+    ticker.history_metadata = meta
     frame = _confirming_daily_frame(fast_info, regular_market_time)
-    if frame is not None:
-        ticker.history.side_effect = (
-            lambda *a, **kw: frame if kw.get("period") == "1mo" else pd.DataFrame()
-        )
+    ticker.history.return_value = frame if frame is not None else pd.DataFrame()
     info_prop = (
         PropertyMock(side_effect=info)
         if isinstance(info, Exception)
@@ -198,15 +186,21 @@ def _confirming_daily_frame(
         regular_market_time, tz=ZoneInfo("America/New_York")
     ).date()
     days = [quote_day - timedelta(days=offset) for offset in (3, 2, 1)]
+    opens = [float(prev)] * len(days)
+    highs = [float(prev)] * len(days)
+    lows = [float(prev)] * len(days)
     closes = [float(prev)] * len(days)
     volumes = [1_000_000] * len(days)
     last = fast_info.get("lastPrice")
     if isinstance(last, (int, float)) and math.isfinite(last):
         days.append(quote_day)
+        opens.append(float(fast_info.get("open", last) or last))
+        highs.append(float(fast_info.get("dayHigh", last) or last))
+        lows.append(float(fast_info.get("dayLow", last) or last))
         closes.append(float(last))
-        volumes.append(1_000_000)
+        volumes.append(int(fast_info.get("lastVolume", 1_000_000) or 0))
     return pd.DataFrame(
-        {"Open": closes, "High": closes, "Low": closes, "Close": closes, "Volume": volumes},
+        {"Open": opens, "High": highs, "Low": lows, "Close": closes, "Volume": volumes},
         index=pd.DatetimeIndex([pd.Timestamp(d) for d in days]),
     )
 
@@ -435,3 +429,34 @@ def test_fetch_single_snapshot_keeps_regular_only_when_no_extended_data_or_info_
     assert fallback_snap["early_trading_change_percent"] is None
     assert fallback_snap["late_trading_change_percent"] is None
     assert fallback_snap["regular_only"] is True
+
+
+@pytest.mark.parametrize(
+    ("symbol", "yahoo"),
+    [
+        # On Yahoo, EUR-USD is a defunct coin and USD-JPY is no symbol at all.
+        ("EUR-USD", "EURUSD=X"), ("USD-JPY", "USDJPY=X"), ("JPY=X", "USDJPY=X"),
+        ("BTCUSD", "BTC-USD"), ("BTC-USD", "BTC-USD"),
+        ("600519.SH", "600519.SS"), ("GC=F", "GC=F"), ("AAPL", "AAPL"),
+    ],
+)
+def test_yahoo_spells_pairs_its_own_way(symbol, yahoo):
+    assert yahoo_symbol(symbol) == yahoo
+
+
+def test_a_daily_bar_keeps_yahoos_date_in_the_instruments_zone():
+    """Yahoo stamps an FX day at London midnight, the previous evening in UTC in summer."""
+    import pandas as pd
+    from zoneinfo import ZoneInfo
+
+    london = ZoneInfo("Europe/London")
+    days = pd.DatetimeIndex([pd.Timestamp("2026-07-01", tz=london), pd.Timestamp("2026-07-02", tz=london)])
+    frame = pd.DataFrame(
+        {"Open": [1.14, 1.13], "High": [1.15, 1.14], "Low": [1.13, 1.12], "Close": [1.14, 1.13], "Volume": [0, 0]},
+        index=days,
+    )
+    ticker = MagicMock()
+    ticker.history.return_value = frame
+    with patch("src.data_client.yfinance.yahoo.yf.Ticker", return_value=ticker):
+        bars = _fetch_history("EURUSD=X", "1d", "2026-07-01", "2026-07-02", day_tz=ZoneInfo("UTC"))
+    assert [b["time"] for b in bars] == [1782864000000, 1782950400000]  # 00:00 UTC on each date

@@ -1,7 +1,8 @@
 /**
  * Whose Claude Code token a workspace's turn runs on: the computer's own
  * entry on one of the user's own computers; elsewhere the saved token where
- * this server runs turns on one, and nowhere otherwise.
+ * this server runs turns on one, else as the user chose for cloud computers
+ * where the server offers that choice, and nowhere otherwise.
  */
 import { describe, it, expect, vi } from 'vitest';
 import type { Mock } from 'vitest';
@@ -9,16 +10,16 @@ import { act, waitFor } from '@testing-library/react';
 import { QueryClient } from '@tanstack/react-query';
 import { renderHookWithProviders } from '@/test/utils';
 import { queryKeys } from '@/lib/queryKeys';
-import type { ClaudeCodeComputer, ClaudeCodeStatus } from '@/api/model';
+import type { ClaudeCodeComputer, ClaudeCodeCustody, ClaudeCodeStatus } from '@/api/model';
 
-vi.mock('@/api/model', () => ({ getClaudeCodeStatus: vi.fn(), getClaudeCodeComputers: vi.fn() }));
+vi.mock('@/api/model', () => ({ getClaudeCodeStatus: vi.fn(), getClaudeCodeComputers: vi.fn(), getClaudeCodeCustody: vi.fn() }));
 vi.mock('@/pages/ChatAgent/utils/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@/pages/ChatAgent/utils/api')>()),
   getWorkspace: vi.fn(),
 }));
-import { getClaudeCodeComputers, getClaudeCodeStatus } from '@/api/model';
+import { getClaudeCodeComputers, getClaudeCodeCustody, getClaudeCodeStatus } from '@/api/model';
 import { getWorkspace } from '@/pages/ChatAgent/utils/api';
-import { useWorkspaceClaudeCode } from '../useWorkspaceClaudeCode';
+import { useWorkspaceClaudeCode, type WorkspaceClaudeCode } from '../useWorkspaceClaudeCode';
 
 const MAC: ClaudeCodeComputer = {
   computer_id: 'cmp-mac', name: 'Studio Mac', kind: 'helper', state: 'no_token', source: null, email: null, expires_at: null,
@@ -29,8 +30,14 @@ const RUNS_HERE: ClaudeCodeStatus = { enabled: true, state: 'rejected', email: n
 const OWN_ONLY: ClaudeCodeStatus = { enabled: true, state: 'off', email: null, expires_at: null, saved: false };
 
 /** `computerId` null: the workspace is not read yet, and its read is `getWorkspace`'s. */
-function run(computerId: string | null, status: ClaudeCodeStatus, list: () => Promise<unknown> = () => Promise.resolve({ computers: [MAC] })) {
+function run(
+  computerId: string | null,
+  status: ClaudeCodeStatus,
+  list: () => Promise<unknown> = () => Promise.resolve({ computers: [MAC] }),
+  custody: () => Promise<ClaudeCodeCustody | null> = () => Promise.resolve(null),
+) {
   (getClaudeCodeStatus as Mock).mockResolvedValue(status);
+  (getClaudeCodeCustody as Mock).mockReset().mockImplementation(custody);
   (getClaudeCodeComputers as Mock).mockReset().mockImplementation(list);
   const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false, retryDelay: 0 } } });
   queryClient.setQueryData(queryKeys.features.list(), [{ key: 'claude_code_runtime', enabled: true }]);
@@ -111,6 +118,130 @@ describe('useWorkspaceClaudeCode', () => {
     expect(result.current).toEqual({ state: 'checking', computerId: null, known: false });
     await act(async () => { answer({ ...desk('cmp-mac'), is_home: true }); });
     await waitFor(() => expect(result.current).toEqual({ state: 'no_token', computerId: 'cmp-mac', known: true }));
+  });
+
+  it.each<[WorkspaceClaudeCode['state'], Partial<ClaudeCodeCustody>]>([
+    ['hosted_off', { mode: 'local', api_key_saved: true, refusal: 'hosted_off' }],
+    ['needs_api_key', { mode: 'api_key', api_key_saved: false, refusal: 'needs_api_key' }],
+    ['api_key_endpoint', { mode: 'api_key', api_key_saved: true, refusal: 'api_key_endpoint' }],
+    ['api_key', { mode: 'api_key', api_key_saved: true, runs_on: 'api_key' }],
+    ['hosted_paused', { mode: 'api_key', api_key_saved: true, offered: ['stored'], refusal: 'hosted_paused' }],
+    ['hosted_paused', { mode: 'stored', offered: ['api_key'], refusal: 'hosted_paused' }],
+    ['needs_own_computer', { blocked: true, offered: [], refusal: 'stored_blocked' }],
+    ['needs_own_computer', { mode: 'api_key', api_key_saved: true, refusal: 'needs_own_computer' }],
+    ['hosted_off', { blocked: true, offered: ['api_key'], refusal: 'hosted_off' }],
+    ['checking', { mode: 'stored', offered: ['stored'], runs_on: 'stored_token' }],
+  ])('on a hosted computer reads %s off the verdict for the choice for cloud computers', async (state, choice) => {
+    const custody: ClaudeCodeCustody = {
+      mode: 'local', api_key_saved: false, offered: ['api_key', 'stored'], blocked: false, runs_on: null, refusal: null, disclosure: null, ...choice,
+    };
+    const { result } = run('cmp-daytona', OWN_ONLY, undefined, () => Promise.resolve(custody));
+    await waitFor(() => expect(result.current).toEqual({ state, computerId: null, known: true }));
+  });
+
+  const SMALL = () => Promise.resolve({ computers: [MAC], cloud_refusals: { 'cmp-daytona': 'needs_bigger_computer' } });
+
+  it.each<[WorkspaceClaudeCode['state'], Partial<ClaudeCodeCustody>]>([
+    ['needs_bigger_computer', { mode: 'api_key', api_key_saved: true, runs_on: 'api_key' }],
+    ['needs_api_key', { mode: 'api_key', api_key_saved: false, refusal: 'needs_api_key' }],
+    ['hosted_off', { mode: 'local', refusal: 'hosted_off' }],
+  ])('on a cloud computer the server names too small reads %s, the credential first', async (state, choice) => {
+    const custody: ClaudeCodeCustody = {
+      mode: 'local', api_key_saved: false, offered: ['api_key'], blocked: false, runs_on: null, refusal: null, disclosure: null, ...choice,
+    };
+    const { result } = run('cmp-daytona', OWN_ONLY, SMALL, () => Promise.resolve(custody));
+    await waitFor(() => expect(result.current).toEqual({ state, computerId: null, known: true }));
+  });
+
+  // A self-hosted server offers no choice, and names the computer on the same list.
+  it.each<[ClaudeCodeStatus['state'], WorkspaceClaudeCode['state']]>([
+    ['signed_in', 'needs_bigger_computer'], ['unverified', 'needs_bigger_computer'], ['rejected', 'rejected'], ['no_token', 'no_token'],
+  ])('with the saved token %s on a cloud computer the server names too small, reads %s', async (state, expected) => {
+    const { result } = run('cmp-daytona', { ...RUNS_HERE, state }, SMALL);
+    await waitFor(() => expect(result.current).toEqual({ state: expected, computerId: null, known: true }));
+  });
+
+  it('runs on a cloud computer the server does not name', async () => {
+    const { result } = run('cmp-other', { ...RUNS_HERE, state: 'signed_in' }, SMALL);
+    await waitFor(() => expect(result.current).toEqual({ state: 'signed_in', computerId: null, known: true }));
+  });
+
+  // The status says what the stored token is doing once it reads the choice.
+  it('waits as on a check while the token is stored but the status does not run it yet', async () => {
+    const { result } = run('cmp-daytona', OWN_ONLY, undefined, () => Promise.resolve({ mode: 'stored', api_key_saved: false, offered: ['stored'], blocked: false, runs_on: 'stored_token', refusal: null, disclosure: null }));
+    await waitFor(() => expect(getClaudeCodeCustody).toHaveBeenCalled());
+    await new Promise((r) => setTimeout(r, 50));
+    expect(result.current).toEqual({ state: 'checking', computerId: null, known: true });
+  });
+
+  it('waits as on a check until the choice for cloud computers is read, and when it cannot be', async () => {
+    const pending = run('cmp-daytona', OWN_ONLY, undefined, () => new Promise(() => {}));
+    await waitFor(() => expect(getClaudeCodeCustody).toHaveBeenCalled());
+    expect(pending.result.current).toEqual({ state: 'checking', computerId: null, known: true });
+    pending.unmount();
+    const { result } = run('cmp-daytona', OWN_ONLY, undefined, () => Promise.reject(Object.assign(new Error('unavailable'), { response: { status: 503 } })));
+    await waitFor(() => expect(getClaudeCodeCustody).toHaveBeenCalledTimes(2), { timeout: 3000 });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(result.current).toEqual({ state: 'checking', computerId: null, known: true });
+  });
+
+  // A stored token is one this server runs turns on, as a self-hosted one's is.
+  it('follows the saved token where this server runs turns on it, whatever the choice reads', async () => {
+    const { result } = run('cmp-daytona', RUNS_HERE, undefined, () => Promise.resolve({ mode: 'stored', api_key_saved: false, offered: ['stored'], blocked: false, runs_on: 'stored_token', refusal: null, disclosure: null }));
+    await waitFor(() => expect(getClaudeCodeCustody).toHaveBeenCalled());
+    await waitFor(() => expect(result.current).toEqual({ state: 'rejected', computerId: null, known: true }));
+  });
+
+  it('needs one of the user\'s own computers where no cloud computer runs it, whatever the stored token reads', async () => {
+    const { result } = run('cmp-daytona', { ...RUNS_HERE, state: 'signed_in' }, undefined, () => Promise.resolve({ mode: 'stored', api_key_saved: false, offered: ['stored'], blocked: false, runs_on: null, refusal: 'needs_own_computer', disclosure: null }));
+    await waitFor(() => expect(getClaudeCodeCustody).toHaveBeenCalled());
+    await waitFor(() => expect(result.current).toEqual({ state: 'needs_own_computer', computerId: null, known: true }));
+  });
+
+  it("follows an own computer's entry whatever the choice for cloud computers", async () => {
+    const { result } = run('cmp-mac', OWN_ONLY, undefined, () => Promise.resolve({ mode: 'local', api_key_saved: false, offered: ['api_key'], blocked: false, runs_on: null, refusal: 'hosted_off', disclosure: null }));
+    await waitFor(() => expect(getClaudeCodeCustody).toHaveBeenCalled());
+    await waitFor(() => expect(result.current).toEqual({ state: 'no_token', computerId: 'cmp-mac', known: true }));
+  });
+
+  // As the saved token expires the server reads it as refused, and the picker
+  // offers its models no longer, on a hosted computer and on one relaying it.
+  describe('as the saved token expires', () => {
+    const NOW = new Date('2026-11-03T12:00:00Z');
+    const SIGNED_IN: ClaudeCodeStatus = { enabled: true, state: 'signed_in', email: null, expires_at: '2026-11-03T12:00:30Z', saved: true };
+    const RELAYING: ClaudeCodeComputer = { ...MAC, state: 'signed_in', source: 'saved' };
+
+    it.each([
+      ['a hosted computer', 'cmp-daytona', null],
+      ['a computer relaying it', 'cmp-mac', 'cmp-mac'],
+    ])('reads %s as refused', async (_, computerId, expected) => {
+      vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+      vi.setSystemTime(NOW);
+      try {
+        const { result } = run(computerId, SIGNED_IN, () => Promise.resolve({ computers: [RELAYING] }));
+        await act(() => vi.waitFor(() => expect(result.current).toEqual({ state: 'signed_in', computerId: expected, known: true })));
+        (getClaudeCodeStatus as Mock).mockResolvedValue({ ...SIGNED_IN, state: 'rejected' });
+        (getClaudeCodeComputers as Mock).mockImplementation(() => Promise.resolve({ computers: [{ ...RELAYING, state: 'rejected' }] }));
+        await act(() => vi.advanceTimersByTimeAsync(31_000));
+        await act(() => vi.waitFor(() => expect(result.current).toEqual({ state: 'rejected', computerId: expected, known: true })));
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('reads a computer relaying it as refused where the status is read again first', async () => {
+      (getClaudeCodeStatus as Mock).mockResolvedValue(SIGNED_IN);
+      (getClaudeCodeComputers as Mock).mockReset().mockResolvedValue({ computers: [RELAYING] });
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false, retryDelay: 0 } } });
+      queryClient.setQueryData(queryKeys.features.list(), [{ key: 'claude_code_runtime', enabled: true }]);
+      queryClient.setQueryData(queryKeys.workspaces.detail('ws-1'), desk('cmp-mac'));
+      const { result } = renderHookWithProviders(() => useWorkspaceClaudeCode('ws-1'), { queryClient });
+      await waitFor(() => expect(result.current).toEqual({ state: 'signed_in', computerId: 'cmp-mac', known: true }));
+      (getClaudeCodeStatus as Mock).mockResolvedValue({ ...SIGNED_IN, state: 'rejected' });
+      (getClaudeCodeComputers as Mock).mockResolvedValue({ computers: [{ ...RELAYING, state: 'rejected' }] });
+      await act(() => queryClient.invalidateQueries({ queryKey: queryKeys.features.claudeCodeStatus() }));
+      await waitFor(() => expect(result.current).toEqual({ state: 'rejected', computerId: 'cmp-mac', known: true }));
+    });
   });
 
   it('is off while Claude Code is', async () => {

@@ -24,6 +24,21 @@ def test_tushare_adjusts_equities_only_regardless_of_venue():
     assert publisher_lineage("tushare", AssetClass.FUND, "XSHG")[0] is PriceTreatment.RAW
 
 
+@pytest.mark.parametrize("publisher", ["fmp", "ginlix-data", "yfinance", "tushare", None])
+@pytest.mark.parametrize("asset_class", [AssetClass.INDEX, AssetClass.CRYPTO, AssetClass.FX])
+def test_an_index_or_a_pair_is_raw_from_every_publisher(publisher, asset_class):
+    assert publisher_lineage(publisher, asset_class, "XNYS")[0] is PriceTreatment.RAW
+
+
+@pytest.mark.parametrize("publisher", ["fmp", "ginlix-data", "yfinance", "tushare", None])
+def test_a_futures_contract_is_raw_from_every_publisher(publisher):
+    from market_protocol import to_canonical
+
+    from src.data_client.normalize import series_lineage
+
+    assert series_lineage(publisher, to_canonical("GC=F"))[0] is PriceTreatment.RAW
+
+
 def test_series_lineage_reads_the_ref_and_bars_and_quotes_agree_on_fmp():
     from market_protocol import to_canonical
 
@@ -62,3 +77,10 @@ async def test_fmp_is_delayed_on_a_venue_the_protocol_does_not_know():
 def test_ginlix_data_indexes_are_delayed_and_its_equities_realtime():
     assert publisher_lineage("ginlix-data", AssetClass.INDEX, "XNYS")[1] is Tier.DELAYED_15M
     assert publisher_lineage("ginlix-data", AssetClass.EQUITY, "XNYS")[1] is Tier.REALTIME
+
+
+def test_a_ginlix_data_index_quote_reads_delayed_like_its_bars():
+    from src.data_client.normalize import snapshot_tier
+
+    assert snapshot_tier("ginlix-data", "XNYS", AssetClass.INDEX) is Tier.DELAYED_15M
+    assert snapshot_tier("ginlix-data", "XNYS", AssetClass.EQUITY) is Tier.REALTIME

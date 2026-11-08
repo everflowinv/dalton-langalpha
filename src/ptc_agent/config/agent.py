@@ -55,6 +55,22 @@ class CredentialSource(StrEnum):
     NONE = "none"
 
 
+class IdleCompactConfig(BaseModel):
+    """Compaction of a thread idle after a turn, while its prompt cache is
+    warm, on routes whose cache entries live an hour (see
+    ``compaction.rebuild.TurnStartRebuilds.idle``). On only with the
+    ``idle_compaction`` feature (``src.config.features``)."""
+
+    #: The least context an idle thread is summarized at keeping its tail
+    #: (I2); None takes ``cold_compact_tokens``. Never where the user turned
+    #: the summary after a break off (see ``CompactionConfig.idle_tokens``).
+    threshold_tokens: int | None = Field(default=None, ge=0)
+    #: How long before the cache entry the summary reads expires it fires:
+    #: a minute past the five a firing is given up at, so a sweep or two can
+    #: claim it, and under the hour.
+    lead_seconds: int = Field(default=900, ge=360, lt=3600)
+
+
 class CompactionConfig(BaseModel):
     """Context compaction settings.
 
@@ -90,6 +106,18 @@ class CompactionConfig(BaseModel):
     #: tail where its prompt is not due (see ``compaction.rebuild``); 0
     #: never does.
     cold_compact_tokens: int = 300_000
+    idle_compact: IdleCompactConfig = IdleCompactConfig()
+
+    @property
+    def idle_tokens(self) -> int:
+        """The least context an idle thread keeps its tail from, as the turn
+        resolved it: 0 where ``cold_compact_tokens`` is, which the user's
+        "Summarize long threads after a break" off sets, else
+        ``idle_compact.threshold_tokens`` or ``cold_compact_tokens``."""
+        if not self.cold_compact_tokens:
+            return 0
+        threshold = self.idle_compact.threshold_tokens
+        return self.cold_compact_tokens if threshold is None else threshold
 
     #: Which named preset the numbers above came from, stamped by
     #: ``resolve_llm_config``. None means they are the deployment's own YAML
@@ -399,6 +427,13 @@ class AgentConfig(BaseModel):
     subagent_models: dict[str, SubagentModel] = Field(
         default_factory=dict, exclude=True
     )
+    # What a Claude Code turn on a cloud computer was admitted to sign in
+    # with, None on any other turn; the run's row is stamped from it, so the
+    # turn is counted as what admission let it run on.
+    claude_code_hosted: str | None = Field(default=None, exclude=True)
+    # Which setup token the user saved it may sign in with, there or relayed
+    # to an own computer (``saved_token`` or ``stored_token``), None for none.
+    claude_code_saved: str | None = Field(default=None, exclude=True)
     # None permits standalone name resolution; [] means resolution rejected all candidates.
     fallback_llm_clients: list[Any] | None = Field(default=None, exclude=True)
     # Display names aligned index-for-index with ``fallback_llm_clients``

@@ -256,6 +256,10 @@ async def lifespan(app: FastAPI):
     # threads are owned by the worker process, not a dead pre-fork parent.
     init_otel_runtime()
 
+    from src.observability.langsmith_tracer import configure_trace_payloads
+
+    configure_trace_payloads()
+
     # Container hardening diagnostics: confirm tini is PID 1 and log cgroup PID limit.
     # If PID 1 is python (not tini), `init: true` in compose silently failed and
     # orphaned browser subprocesses will accumulate until cgroup exhausts.
@@ -572,6 +576,14 @@ async def lifespan(app: FastAPI):
         logger.warning(f"Failed to initialize PTC Agent: {e}")
         logger.warning("PTC Agent endpoints may not work correctly")
 
+    # A gate of the same kind, outside the catch-all: with the CLI inside
+    # cloud computers' sandboxes, a kind with no Medium tier would refuse every
+    # one of its computers as too small.
+    if agent_config is not None:
+        from src.server.services.claude_code.hosted import check_sandbox_tiers
+
+        check_sandbox_tiers(agent_config.sandbox)
+
     # Multi-worker hard gate (top level — must not be swallowed by the PTC
     # init catch-all): without the fence, two workers could both write one
     # thread's checkpoints. Refuse to boot rather than corrupt.
@@ -599,10 +611,11 @@ async def lifespan(app: FastAPI):
     from src.server.services.report_back import command as command_report
     from src.server.services.report_back import steer_executor, subagent
     from src.server.services.report_back.handoff import core as handoff_core
-    from src.server.services import automation_settlement, thread_lifecycle_feed
+    from src.server.services import automation_settlement, idle_compaction, thread_lifecycle_feed
     from src.server.services.features import register_feature_off_hook
     from src.server.services.hook_outbox import HookOutboxDrainer
     from src.server.services.market_targets import delivery as market_target_delivery
+    from src.server.services.push import notify as push_notify
     from src.server.services.wakeups import cancel as wakeups_cancel
     from src.server.services.wakeups import delivery as wakeup_delivery
 
@@ -613,9 +626,16 @@ async def lifespan(app: FastAPI):
     thread_lifecycle_feed.register_outbox_executors()
     automation_settlement.register_outbox_executors()
     market_target_delivery.register_outbox_executors()
+    # Registered with push off too: its rows then ack as no-ops.
+    push_notify.register_outbox_executors()
+    idle_compaction.register_outbox_executors()
     wakeup_delivery.register_wakeup_executors()
     # Turning wakeups off ends what the agent set, on every thread.
     register_feature_off_hook("wakeups", wakeups_cancel.setting_off)
+    # Turning Claude Code off deletes a setup token stored for the user.
+    from src.server.services.claude_code.hosted import register_opt_out
+
+    register_opt_out()
     try:
         HookOutboxDrainer.get_instance().start()
         logger.info("HookOutboxDrainer started")
@@ -700,6 +720,19 @@ async def lifespan(app: FastAPI):
         logger.info("WakeupSweeper started")
     except Exception as e:
         logger.warning(f"Failed to start WakeupSweeper: {e}")
+
+    # Start IdleCompactionSweeper (summarizes idle threads while their prompt
+    # cache is warm). Every worker runs one: a claim deletes its row.
+    try:
+        from src.server.handlers.idle_compaction import fire as fire_idle_compaction
+        from src.server.services.idle_compaction import start_sweeper
+
+        if await start_sweeper(fire_idle_compaction):
+            logger.info("IdleCompactionSweeper started")
+        else:
+            logger.info("IdleCompactionSweeper not started: the idle_compaction feature is off")
+    except Exception as e:
+        logger.warning(f"Failed to start IdleCompactionSweeper: {e}")
 
     # Start MarketInsightService (schedule-based market news gathering)
     try:
@@ -984,6 +1017,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Error shutting down WakeupSweeper: {e}")
 
+    try:
+        from src.server.services.idle_compaction import IdleCompactionSweeper
+
+        await IdleCompactionSweeper.get_instance().stop()
+    except Exception as e:
+        logger.warning(f"Error shutting down IdleCompactionSweeper: {e}")
+
     # 1. Shutdown AutomationScheduler
     try:
         from src.server.services.automation_scheduler import AutomationScheduler
@@ -1163,6 +1203,13 @@ async def lifespan(app: FastAPI):
         logger.info("Usage limits HTTP client closed")
     except Exception as e:
         logger.warning(f"Error closing usage limits HTTP client: {e}")
+
+    try:
+        from src.server.services.push.apns import close_apns_client
+
+        await close_apns_client()
+    except Exception as e:
+        logger.warning(f"Error closing APNs client: {e}")
 
     # 9.1. Close the messaging gateway HTTP client
     try:
@@ -1446,6 +1493,7 @@ from src.server.app.bars import router as bars_router
 from src.server.app.user_events import router as user_events_router
 from src.server.app.users import router as users_router
 from src.server.app.trading_permission import router as trading_permission_router
+from src.server.app.push_devices import router as push_devices_router
 from src.server.app.features import router as features_router
 from src.server.app.claude_code import router as claude_code_router
 from src.server.app.claude_code_computers import router as claude_code_computers_router
@@ -1538,6 +1586,9 @@ app.include_router(
 app.include_router(
     user_events_router
 )  # /api/v1/users/me/thread-events - Thread lifecycle SSE feed
+app.include_router(
+    push_devices_router
+)  # /api/v1/users/me/push-devices - Phones for push notifications
 app.include_router(features_router)  # /api/v1/features/* - Feature flags (per-user resolved)
 app.include_router(claude_code_router)  # /api/v1/claude-code/* - Claude Code setup token and readiness
 app.include_router(claude_code_computers_router)  # /api/v1/claude-code/computers/* - Claude Code on own computers

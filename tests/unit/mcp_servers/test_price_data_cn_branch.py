@@ -2,7 +2,9 @@
 
 Locks the branch contract: CN daily requests are served from ginlix-data's
 protocol route with source="tushare" (the upstream vendor); CN intraday skips
-it; an empty/erroring result falls through the existing chain unchanged.
+it; an empty result falls through the existing chain unchanged, and an erroring
+one falls through but is named: the chain's rows carry `fallback_from`, and
+with none the read is an error.
 """
 
 from __future__ import annotations
@@ -15,7 +17,7 @@ import pytest
 
 from src.data_client.base import FetchResult
 
-from .conftest import assert_ok_envelope
+from .conftest import assert_error, assert_ok_envelope
 
 _MOD = "plugins.langalpha_market_data.price_data_mcp_server"
 
@@ -70,6 +72,17 @@ class TestCnDailyBranch:
         daily.assert_awaited_once()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("gap", [True, False])
+    async def test_sessions_missing_inside_the_window_say_incomplete_not_truncated(self, gap):
+        import plugins.langalpha_market_data.price_data_mcp_server as mod
+
+        fetched = FetchResult(bars=_CN_BARS, truncated=gap)
+        with patch.object(mod._cn, "get_daily", return_value=fetched):
+            result = await mod.get_stock_data("600519.SS", interval="1day")
+
+        assert result.get("incomplete", False) is gap and "truncated" not in result
+
+    @pytest.mark.asyncio
     async def test_undated_cn_daily_gets_a_bounded_default_window(self):
         # Undated, the route answers with the instrument's whole listed history
         # (thousands of bars), where every other source is bounded.
@@ -115,7 +128,7 @@ class TestCnDailyBranch:
         ginlix_rows = [
             {"date": "2025-01-02", "open": 100, "high": 105, "low": 99, "close": 103, "volume": 1000},
         ]
-        with patch.object(mod._ginlix, "fetch_stock_data", new=AsyncMock(return_value=ginlix_rows)):
+        with patch.object(mod._ginlix, "fetch_stock_data", new=AsyncMock(return_value=FetchResult(ginlix_rows))):
             result = await mod.get_stock_data("AAPL", interval="1day")
 
         assert "name" not in result
@@ -149,6 +162,7 @@ class TestCnDailyBranch:
             result = await mod.get_stock_data("600519.SS", interval="1day")
 
         assert_ok_envelope(result, source="fmp")
+        assert "fallback_from" not in result
         client.get_stock_price.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -164,8 +178,37 @@ class TestCnDailyBranch:
             result = await mod.get_stock_data("600519.SS", interval="1day")
 
         assert_ok_envelope(result, source="fmp")
-        # A soft miss still leaves a trace, as the fundamentals CN branch does.
+        assert result["fallback_from"] == "tushare"
+        # A failed read leaves a trace, as the fundamentals CN branch does.
         assert "ginlix-data CN daily failed for 600519.SH" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_cn_daily_error_then_no_chain_rows_is_an_error(self):
+        # A Beijing listing FMP does not carry: an outage must not read as a
+        # listing with no bars.
+        import plugins.langalpha_market_data.price_data_mcp_server as mod
+
+        client = AsyncMock()
+        client.get_stock_price = AsyncMock(return_value=[])
+        with patch.object(mod._cn, "get_daily", side_effect=RuntimeError("boom")), \
+                _force_fmp_path(mod), \
+                patch(f"{_MOD}.get_fmp_client", return_value=client):
+            result = await mod.get_stock_data("920799.BJ", interval="1day")
+
+        assert_error(result, "upstream_error", detail_excludes=("boom",))
+        assert result["detail"] == "tushare failed (RuntimeError) and FMP has no rows for this listing"
+
+    @pytest.mark.asyncio
+    async def test_cn_daily_error_then_chain_error_keeps_its_code(self):
+        import plugins.langalpha_market_data.price_data_mcp_server as mod
+
+        with patch.object(mod._cn, "get_daily", side_effect=RuntimeError("boom")), \
+                _force_fmp_path(mod), \
+                patch(f"{_MOD}.get_fmp_client", side_effect=RuntimeError("no key")):
+            result = await mod.get_stock_data("920799.BJ", interval="1day")
+
+        assert_error(result, "client_unavailable", detail_excludes=("boom", "no key"))
+        assert result["detail"].startswith("tushare failed (RuntimeError) and FMP client unavailable")
 
     @pytest.mark.asyncio
     async def test_cn_daily_upstream_miss_logs_one_line(self, caplog):
@@ -195,6 +238,25 @@ class TestCnDailyBranch:
         assert record.exc_info is None
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "start, end, detail",
+        [
+            ("2025-01-31", "2025-01-01", "start is after end"),
+            ("01/01/2025", None, "start_date must be YYYY-MM-DD, not '01/01/2025'"),
+        ],
+    )
+    async def test_bad_bounds_are_refused_before_tushare_is_asked(self, start, end, detail):
+        import plugins.langalpha_market_data.price_data_mcp_server as mod
+
+        daily = AsyncMock(side_effect=AssertionError("tushare was asked"))
+        with patch.object(mod._cn, "get_daily", new=daily):
+            result = await mod.get_stock_data("600519.SH", start_date=start, end_date=end)
+
+        assert_error(result, "invalid_argument", symbol="600519.SH")
+        assert result["detail"] == detail
+        daily.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_us_symbol_skips_the_cn_daily_route(self):
         import plugins.langalpha_market_data.price_data_mcp_server as mod
 
@@ -203,7 +265,7 @@ class TestCnDailyBranch:
             {"date": "2025-01-02", "open": 100, "high": 105, "low": 99, "close": 103, "volume": 1000},
         ]
         with patch.object(mod._cn, "get_daily", return_value=FetchResult(bars=_CN_BARS)) as daily, \
-                patch.object(mod._ginlix, "fetch_stock_data", new=AsyncMock(return_value=ginlix_rows)):
+                patch.object(mod._ginlix, "fetch_stock_data", new=AsyncMock(return_value=FetchResult(ginlix_rows))):
             result = await mod.get_stock_data("AAPL", interval="1day")
 
         assert_ok_envelope(result, symbol="AAPL", source="ginlix-data", count=2)

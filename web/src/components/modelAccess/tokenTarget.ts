@@ -3,7 +3,7 @@ import type { TFunction } from 'i18next';
 import {
   removeClaudeCodeComputerToken, removeClaudeCodeToken, saveClaudeCodeComputerToken, saveClaudeCodeToken,
   startClaudeCodeComputerSignIn, startClaudeCodeSignIn, submitClaudeCodeComputerSignInCode, submitClaudeCodeSignInCode,
-  type ClaudeCodeComputer, type ClaudeCodeStatus,
+  type ClaudeCodeComputer, type ClaudeCodeComputers, type ClaudeCodeStatus,
 } from '@/api/model';
 import { readOAuthError } from '@/api/oauth';
 import { CLAUDE_CODE_UNRUNNABLE } from '@/lib/claudeCode';
@@ -68,14 +68,18 @@ export function useTokenRoutes(target: TokenTarget) {
     const store = (status: ClaudeCodeStatus) => {
       queryClient.setQueryData(queryKeys.features.claudeCodeStatus(), status);
       void reread(queryKeys.features.claudeCodeComputers());
+      void reread(queryKeys.features.claudeCodeSetup());
     };
     return {
       save: async (token: string) => store(await saveClaudeCodeToken(token)),
       start: () => startClaudeCodeSignIn(),
       submit: async (code: string) => store(await submitClaudeCodeSignInCode(code)),
       remove: async () => {
-        await removeClaudeCodeToken();
-        await reread(queryKeys.features.claudeCode());
+        try {
+          await removeClaudeCodeToken();
+        } finally {
+          await reread(queryKeys.features.claudeCode());
+        }
       },
     };
   }
@@ -84,15 +88,20 @@ export function useTokenRoutes(target: TokenTarget) {
     try {
       return await call;
     } catch (err) {
-      if (CLAUDE_CODE_UNRUNNABLE.has(readOAuthError(err)?.code ?? '')) void reread(queryKeys.features.claudeCodeComputers());
+      if (CLAUDE_CODE_UNRUNNABLE.has(readOAuthError(err)?.code ?? '')) {
+        void reread(queryKeys.features.claudeCodeComputers());
+        void reread(queryKeys.features.claudeCodeSetup());
+      }
       throw err;
     }
   };
   const store = (entry: ClaudeCodeComputer) => {
-    queryClient.setQueryData<{ computers: ClaudeCodeComputer[] }>(queryKeys.features.claudeCodeComputers(), (list) => list && ({
+    queryClient.setQueryData<ClaudeCodeComputers>(queryKeys.features.claudeCodeComputers(), (list) => list && ({
+      ...list,
       computers: list.computers.map((c) => (c.computer_id === entry.computer_id ? entry : c)),
     }));
     void reread(queryKeys.features.claudeCodeStatus());
+    void reread(queryKeys.features.claudeCodeSetup());
   };
   return {
     save: async (token: string) => store(await rereadIfBlocked(saveClaudeCodeComputerToken(computerId, token))),

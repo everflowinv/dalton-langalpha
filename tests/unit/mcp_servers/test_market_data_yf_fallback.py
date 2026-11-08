@@ -228,6 +228,52 @@ class TestGetStockDataOrder:
         client.get_intraday_chart.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_fx_daily_bst_midnight_restamped_to_utc_dates(self):
+        # Yahoo stamps FX daily bars at Europe/London midnight (00:00+01:00 in
+        # BST, i.e. 23:00 UTC the previous evening), while the FX protocol reads
+        # daily dates in UTC. Without restamping, 2026-07-01 00:00+01:00 falls
+        # before the 2026-07-01 00:00 UTC start bound and 2026-07-02's price is
+        # mislabeled as 2026-07-01.
+        import pandas as pd
+        import plugins.langalpha_market_data.price_data_mcp_server as mod
+
+        idx = pd.DatetimeIndex(
+            [
+                "2026-07-01 00:00:00+01:00",
+                "2026-07-02 00:00:00+01:00",
+            ]
+        )
+        df = pd.DataFrame(
+            {
+                "Open": [1.0800, 1.0900],
+                "High": [1.0850, 1.0950],
+                "Low": [1.0750, 1.0850],
+                "Close": [1.0825, 1.0925],
+                "Volume": [0, 0],
+            },
+            index=idx,
+        )
+        ticker_inst = create_autospec(mod._yf.Ticker, instance=True)
+        ticker_inst.history.return_value = df
+        ticker_cls = create_autospec(mod._yf.Ticker, return_value=ticker_inst)
+        client = _fmp_client()
+
+        with _ginlix_miss(mod), \
+             patch.object(mod, "_yf_fetch_history", new=_REAL_YF_FETCH), \
+             patch.object(mod._yf, "Ticker", new=ticker_cls), \
+             patch(f"{_PRICE_MOD}.get_fmp_client", return_value=client):
+            result = await mod.get_stock_data(
+                "EURUSD", "1day", "2026-07-01", "2026-07-02"
+            )
+
+        assert result["source"] == "yfinance"
+        assert [(r["date"], r["close"]) for r in result["data"]] == [
+            ("2026-07-01", 1.0825),
+            ("2026-07-02", 1.0925),
+        ]
+        client.get_stock_price.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_partial_yfinance_coverage_falls_through_to_fmp_when_fmp_succeeds(self):
         import plugins.langalpha_market_data.price_data_mcp_server as mod
 

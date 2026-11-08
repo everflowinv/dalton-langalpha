@@ -95,6 +95,12 @@ async def _anything(request: web.Request) -> web.Response:
     return web.json_response({})
 
 
+async def _policy_limits(request: web.Request) -> web.Response:
+    # A first-party CLI asks this before its first request and retries an
+    # answer it can't read for about 5s, which every launch would wait out.
+    return web.json_response({"restrictions": {}})
+
+
 def _api_host_cert(folder: Path) -> tuple[str, str, str]:
     """A CA and an api.anthropic.com certificate it signed, for one run: (ca, cert chain, key)."""
     from cryptography import x509
@@ -148,6 +154,8 @@ class FakeMessagesAPI:
         self.requests: list[dict[str, Any]] = []
         #: The credential each request carried: its bearer token, else its API key.
         self.credentials: list[str | None] = []
+        #: The API key header each request carried, if any.
+        self.api_keys: list[str | None] = []
         self._runner: web.AppRunner | None = None
         self._tunnel: asyncio.Server | None = None
         self._dir = tempfile.TemporaryDirectory(prefix="fake-api-")
@@ -157,6 +165,7 @@ class FakeMessagesAPI:
     async def __aenter__(self) -> FakeMessagesAPI:
         app = web.Application(client_max_size=64 * 1024 * 1024)
         app.router.add_post("/v1/messages", self._messages)
+        app.router.add_get("/api/claude_code/policy_limits", _policy_limits)
         app.router.add_route("*", "/{tail:.*}", _anything)
         self._runner = web.AppRunner(app)
         await self._runner.setup()
@@ -209,6 +218,7 @@ class FakeMessagesAPI:
         auth = request.headers.get("authorization", "")
         credential = auth.removeprefix("Bearer ") if auth else request.headers.get("x-api-key")
         self.credentials.append(credential)
+        self.api_keys.append(request.headers.get("x-api-key"))
         if credential in self.refused:
             return web.json_response({"type": "error", "error": {"type": "authentication_error", "message": "invalid token"}}, status=401)
         prompt = " ".join(t for blocks in _user_blocks(body)[-1:] for t in _texts(blocks))

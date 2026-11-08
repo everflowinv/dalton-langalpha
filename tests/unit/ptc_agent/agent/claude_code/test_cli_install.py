@@ -98,11 +98,13 @@ def env(tmp_path):
     handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(served))
     handler.log_message = lambda *a: None
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    # shutdown() waits out the loop's poll, half a second by default, per test.
+    threading.Thread(target=server.serve_forever, args=(0.05,), daemon=True).start()
     try:
         yield Env(tmp_path, f"http://127.0.0.1:{server.server_address[1]}", served)
     finally:
         server.shutdown()
+        server.server_close()
 
 
 V1 = b"#!/bin/sh\necho claude one\n" + b"x" * 4096
@@ -124,6 +126,13 @@ async def test_installs_once_then_reuses_without_downloading(env):
     assert await env.ensure(pin) == path
     assert (env.downloads(), env.hashed()) == (1, 1), "a marked copy of the right size is neither fetched nor hashed again"
     assert sorted(os.listdir(Path(path).parent)) == ["claude", "claude.verified"]
+
+
+async def test_an_install_leaves_the_connections_short_scripts_their_slot(env):
+    """A download can take minutes, so it never holds the slot a state read or a token check waits on."""
+    link = env.link()
+    async with link.control_slot:
+        await asyncio.wait_for(env.ensure(env.publish("1.0.0", V1), link), timeout=30)
 
 
 async def test_only_looking_never_installs_and_finds_a_ready_copy(env):

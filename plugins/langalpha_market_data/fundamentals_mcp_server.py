@@ -3,12 +3,12 @@
 
 Fundamental data for programmatic analysis via MCP. A CN listing is served
 first from ginlix-data (vendor Tushare), whose rows come in FMP's camelCase
-shape; every other listing, and any CN miss, comes from FMP. Ratios are the
-exception: FMP answers first there, since only it prices the valuation fields,
-and ginlix-data answers a CN listing FMP cannot. Historical valuation, insider
-trades and technical indicators come from FMP alone. `source` names the vendor
-that answered, and the envelope around `data` is the standard market-data
-contract (AGENT_CONTRACT.md).
+shape; every other listing, and any CN miss, comes from FMP. A CN read that
+failed, rather than came back empty, still falls back to FMP, but the answer
+then says so (`fallback_from`), and an FMP miss after it is an error.
+Historical valuation, insider trades and technical indicators come from FMP
+alone. `source` names the vendor that answered, and the envelope around
+`data` is the standard market-data contract (AGENT_CONTRACT.md).
 
 Tools:
 - get_financial_statements: Raw income/balance/cash flow (multi-year)
@@ -44,12 +44,20 @@ import httpx
 from data_client.fmp import close_fmp_client, get_fmp_client
 from data_client.lifespan import closing_lifespan
 from data_client.market_data_provider import symbol_market
-from data_client.normalize import populated
+from data_client.normalize import (
+    declared_venue,
+    minor_unit_places,
+    populated,
+    scale_price,
+    series_labels,
+)
 from data_client.ginlix_data import close_ginlix_mcp_client, get_ginlix_mcp_client
 from data_client.ginlix_data.cn_financial import GinlixDataCnFinancialSource
 from mcp_servers._envelope import error_from_exception, make_error, make_response
 from mcp_servers._schemas import (
     ANY,
+    BAR_LABELS,
+    FALLBACK_FROM,
     INT,
     RECORDS,
     RECORDS_BY_KEY,
@@ -60,6 +68,7 @@ from mcp_servers._schemas import (
 )
 from market_protocol.enums import AssetClass
 from market_protocol.symbology import (
+    UNKNOWN_MIC,
     is_family_index,
     to_canonical,
     to_display,
@@ -92,6 +101,7 @@ _SOURCE = "fmp"
 _SOURCE_TUSHARE = "tushare"
 _CLIENT_UNAVAILABLE = "FMP client is unavailable"
 _UPSTREAM_FAILED = "FMP request failed"
+_CN_FAILED = "tushare failed"
 
 # The bar sizes the hosted technicals read accepts, in the order its refusal
 # lists them. FMP answers any other as a bare 400, so the refusal is made here,
@@ -99,6 +109,9 @@ _UPSTREAM_FAILED = "FMP request failed"
 _BAR_SIZES = ("1min", "5min", "15min", "30min", "1hour", "4hour", "1day")
 
 _tushare_financial = None
+
+#: Echo key of the CN tools: set only when a failed tushare read left the answer to FMP.
+_FALLBACK = {"fallback_from": FALLBACK_FROM}
 
 
 def _canonical(symbol: str) -> str:
@@ -128,8 +141,7 @@ def _fmp_symbol(symbol: str) -> str:
 def _tushare_for(symbol: str) -> GinlixDataCnFinancialSource | None:
     """CN fundamentals (vendor: Tushare) served by ginlix-data, for CN symbols.
 
-    Returns ``None`` otherwise; callers fall through to the FMP path, and an
-    unreachable ginlix-data or an empty result does the same (soft miss).
+    Returns ``None`` otherwise, and :func:`_cn_first` goes straight to FMP.
     """
     if symbol_market(symbol) != "cn":
         return None
@@ -699,35 +711,87 @@ def _yf_periods_unknown(data: Any) -> bool:
     return False
 
 
-async def _from_tushare(disp: str, fetch, *, data_type: str, **extra):
-    """Serve a CN tool from tushare, or ``None`` to fall through to FMP.
+async def _from_fmp(
+    disp: str, read, *, data_type: str, yf_fallback=None, **extra
+) -> dict:
+    """Answer a tool from FMP: *read* takes the client and returns the payload.
 
-    The single definition of the cn-branch contract: gate on ``_tushare_for``,
-    treat any tushare error or empty payload as a soft miss (``None`` → the
-    caller's FMP path answers), and envelope hits with ``source="tushare"``.
-    *disp* is the display spelling, so a canonical ``600519.XSHG`` still gates
-    in as a CN listing.
+    The one place an FMP read gets its client, its envelope and its error, so a
+    tool passes only what it reads.
     """
-    ts = _tushare_for(disp)
-    if ts is None:
-        return None
     try:
-        data = await fetch(ts)
+        client = await get_fmp_client()
+    except Exception:  # noqa: BLE001
+        return make_error("client_unavailable", _CLIENT_UNAVAILABLE, symbol=disp)
+    try:
+        payload = await read(client)
+    except Exception as e:  # noqa: BLE001
+        err = error_from_exception(e, _UPSTREAM_FAILED, symbol=disp)
+        # DALTON-HOOK(market-data-fallback): a 402 is about the FMP plan, not
+        # the request — no argument change fixes it, so yfinance answers
+        # instead of returning an error the agent would retry blind.
+        if yf_fallback is not None and (
+            err.get("error") == "plan_not_covered" or getattr(e, "status_code", None) == 402
+        ):
+            yf_resp = await yf_fallback()
+            if yf_resp is not None:
+                return yf_resp
+        return err
+    return make_response(
+        payload or [], source=_SOURCE, symbol=disp, data_type=data_type, **extra
+    )
+
+
+async def _cn_first(
+    disp: str, cn_read, fmp_read, *, data_type: str, yf_fallback=None, **extra
+) -> dict:
+    """Serve a tool from tushare for a CN listing, from FMP otherwise.
+
+    The single definition of the cn-branch contract: gate on ``_tushare_for``
+    and a configured ginlix-data, envelope a tushare hit with
+    ``source="tushare"``, and let an empty payload fall through to FMP, read by
+    *fmp_read*. A tushare error falls through too, but it is not a miss: FMP's
+    rows then carry ``fallback_from``, an FMP error keeps its code with the
+    tushare failure named, and an empty FMP answer becomes ``upstream_error``,
+    since neither source answered. *disp* is the display spelling, so a
+    canonical ``600519.XSHG`` still gates in as a CN listing.
+    """
+    # DALTON-HOOK(market-data-fallback): Forward yf_fallback into _from_fmp so
+    # non-CN (or tushare-miss) reads still fall back to yfinance on FMP 402.
+    def fmp():
+        return _from_fmp(
+            disp, fmp_read, data_type=data_type, yf_fallback=yf_fallback, **extra
+        )
+
+    ts = _tushare_for(disp)
+    if ts is None or not await get_ginlix_mcp_client().ensure():
+        return await fmp()
+    try:
+        data = await cn_read(ts)
     except httpx.HTTPError as exc:
         # An upstream miss (a 503, a 429, a dropped connection) is expected; the
         # FMP path answers instead, so one line is enough.
-        logger.warning(
-            "ginlix-data %s unavailable for %s: %s", data_type, disp, _http_miss(exc)
-        )
-        return None
-    except Exception:  # noqa: BLE001 — soft miss, fall through to FMP
+        failed = _http_miss(exc)
+        logger.warning("ginlix-data %s unavailable for %s: %s", data_type, disp, failed)
+    except Exception as exc:  # noqa: BLE001 — FMP answers instead
+        failed = type(exc).__name__
         logger.warning("ginlix-data %s failed for %s", data_type, disp, exc_info=True)
-        return None
-    if not populated(data):
-        return None
-    return make_response(
-        data, source=_SOURCE_TUSHARE, symbol=disp, data_type=data_type, **extra
-    )
+    else:
+        if populated(data):
+            return make_response(
+                data, source=_SOURCE_TUSHARE, symbol=disp, data_type=data_type, **extra
+            )
+        return await fmp()
+    answer = await fmp()
+    if "error" in answer:
+        return {**answer, "detail": f"{_CN_FAILED} ({failed}) and FMP did too: {answer['detail']}"}
+    if not populated(answer["data"]):
+        return make_error(
+            "upstream_error",
+            f"{_CN_FAILED} ({failed}) and FMP has no rows for this listing",
+            symbol=disp,
+        )
+    return {**answer, "fallback_from": _SOURCE_TUSHARE}
 
 
 _OUT_GET_FINANCIAL_STATEMENTS = output_model(
@@ -735,7 +799,7 @@ _OUT_GET_FINANCIAL_STATEMENTS = output_model(
     envelope_schema(
         ANY,
         frame=("symbol",),
-        echo={"data_type": STR, "statement_type": STR, "period": STR},
+        echo={"data_type": STR, "statement_type": STR, "period": STR, **_FALLBACK},
     ),
 )
 
@@ -762,12 +826,13 @@ async def get_financial_statements(
         limit: Number of periods (default 10).
 
     Returns:
-        dict: {symbol, count, data, source, data_type, statement_type, period}.
-        One statement_type → a list of period records; "all" → {income_statement,
-        balance_sheet, cash_flow} lists with count the total. Common camelCase
-        fields: date, revenue, netIncome, eps, totalAssets, operatingCashFlow.
-        date is "YYYY-MM-DD"; records are newest-first as returned by FMP. On
-        error: {error: <code>, detail, symbol}.
+        dict: {symbol, count, data, source, data_type, statement_type, period,
+        fallback_from?}. One statement_type → a list of period records; "all" →
+        {income_statement, balance_sheet, cash_flow} lists with count the total.
+        Common camelCase fields: date, revenue, netIncome, eps, totalAssets,
+        operatingCashFlow. date is "YYYY-MM-DD"; records are newest-first.
+        fallback_from: source that failed before FMP answered. On error:
+        {error: <code>, detail, symbol}.
     """
     disp = _canonical(symbol)
     api = _fmp_symbol(symbol)
@@ -786,69 +851,52 @@ async def get_financial_statements(
         )
         return {"income_statement": income, "balance_sheet": balance, "cash_flow": cash}
 
-    cn = await _from_tushare(
-        disp, _cn_statements,
-        data_type="financial_statements", statement_type=statement_type, period=period,
-    )
-    if cn is not None:
-        return cn
-
-    try:
-        client = await get_fmp_client()
-    except Exception:  # noqa: BLE001
-        return make_error("client_unavailable", _CLIENT_UNAVAILABLE, symbol=disp)
-
-    try:
+    async def _fmp_statements(client):
         if statement_type == "income":
-            data = await client.get_income_statement(api, period=period, limit=limit)
-        elif statement_type == "balance":
-            data = await client.get_balance_sheet(api, period=period, limit=limit)
-        elif statement_type == "cash":
-            data = await client.get_cash_flow(api, period=period, limit=limit)
-        else:  # "all"
-            income = await client.get_income_statement(api, period=period, limit=limit)
-            balance = await client.get_balance_sheet(api, period=period, limit=limit)
-            cash_flow = await client.get_cash_flow(api, period=period, limit=limit)
-            data = {
-                "income_statement": income or [],
-                "balance_sheet": balance or [],
-                "cash_flow": cash_flow or [],
-            }
+            return await client.get_income_statement(api, period=period, limit=limit)
+        if statement_type == "balance":
+            return await client.get_balance_sheet(api, period=period, limit=limit)
+        if statement_type == "cash":
+            return await client.get_cash_flow(api, period=period, limit=limit)
+        income = await client.get_income_statement(api, period=period, limit=limit)  # "all"
+        balance = await client.get_balance_sheet(api, period=period, limit=limit)
+        cash_flow = await client.get_cash_flow(api, period=period, limit=limit)
+        return {
+            "income_statement": income or [],
+            "balance_sheet": balance or [],
+            "cash_flow": cash_flow or [],
+        }
 
+    async def _yf_statements_mcp():
+        yf_data, week_based = await asyncio.to_thread(
+            _yf_statements, disp, statement_type, period, limit
+        )
+        if yf_data is None:
+            return None
+        note = _YF_STATEMENTS_NOTE
+        # DALTON-HOOK(market-data-fallback): say so in the note rather
+        # than guessing calendar-shaped period labels.
+        if _yf_periods_unknown(yf_data):
+            note += _YF_WEEK_BASED_NOTE if week_based else _YF_PERIODS_UNKNOWN_NOTE
         return make_response(
-            data if statement_type == "all" else (data or []),
-            source=_SOURCE,
+            yf_data,
+            source="yfinance",
             symbol=disp,
             data_type="financial_statements",
             statement_type=statement_type,
             period=period,
+            note=note,
         )
 
-    except Exception as e:  # noqa: BLE001
-        err = error_from_exception(e, _UPSTREAM_FAILED, symbol=disp)
-        # DALTON-HOOK(market-data-fallback): a 402 is about the FMP plan, not
-        # the request — no argument change fixes it, so yfinance answers
-        # instead of returning an error the agent would retry blind.
-        if err.get("error") == "plan_not_covered" or getattr(e, "status_code", None) == 402:
-            yf_data, week_based = await asyncio.to_thread(
-                _yf_statements, disp, statement_type, period, limit
-            )
-            if yf_data is not None:
-                note = _YF_STATEMENTS_NOTE
-                # DALTON-HOOK(market-data-fallback): say so in the note rather
-                # than guessing calendar-shaped period labels.
-                if _yf_periods_unknown(yf_data):
-                    note += _YF_WEEK_BASED_NOTE if week_based else _YF_PERIODS_UNKNOWN_NOTE
-                return make_response(
-                    yf_data,
-                    source="yfinance",
-                    symbol=disp,
-                    data_type="financial_statements",
-                    statement_type=statement_type,
-                    period=period,
-                    note=note,
-                )
-        return err
+    return await _cn_first(
+        disp,
+        _cn_statements,
+        _fmp_statements,
+        data_type="financial_statements",
+        yf_fallback=_yf_statements_mcp,
+        statement_type=statement_type,
+        period=period,
+    )
 
 
 _OUT_GET_FINANCIAL_RATIOS = output_model(
@@ -856,7 +904,7 @@ _OUT_GET_FINANCIAL_RATIOS = output_model(
     envelope_schema(
         RECORDS_BY_KEY,
         frame=("symbol",),
-        echo={"data_type": STR, "period": STR},
+        echo={"data_type": STR, "period": STR, **_FALLBACK},
     ),
 )
 
@@ -867,8 +915,7 @@ async def get_financial_ratios(
     period: Literal["annual", "quarter"] = "annual",
     limit: int = 10,
 ) -> _OUT_GET_FINANCIAL_RATIOS:
-    """Fetch raw historical key metrics and financial ratios — track P/E, ROE,
-    and margins over time, or compare valuation across companies.
+    """Fetch raw historical key metrics and financial ratios.
 
     Args:
         symbol: Ticker, e.g. "AAPL", "0700.HK", "600519.SH".
@@ -876,13 +923,16 @@ async def get_financial_ratios(
         limit: Number of periods (default 10).
 
     Returns:
-        dict: {symbol, count, data, source, data_type, period}. data is
-        {key_metrics, ratios}, each a list of period records; count is the total.
-        key_metrics fields: date, marketCap, enterpriseValue, evToEBITDA,
-        freeCashFlowYield. ratios fields: date, netProfitMargin, returnOnEquity,
-        currentRatio, debtToEquityRatio, priceToEarningsRatio. Field names are
-        FMP-native camelCase; date is "YYYY-MM-DD"; records are newest-first as
-        returned by FMP. On error: {error: <code>, detail, symbol}.
+        dict: {symbol, count, data, source, data_type, period, fallback_from?}.
+        data is {key_metrics, ratios}: period records, newest first.
+        key_metrics fields: marketCap, enterpriseValue, evToEBITDA,
+        freeCashFlowYield. ratios fields: netProfitMargin, returnOnEquity,
+        currentRatio, debtToEquityRatio, priceToEarningsRatio. source "tushare"
+        rows lack both lists' price-based fields; market cap and EV are in
+        get_historical_valuation. date is "YYYY-MM-DD". A quarter row's
+        flow-based fields cover that quarter alone; its P/E fields annualize
+        the quarter's EPS (x4). fallback_from: source that failed before FMP
+        answered. On error: {error: <code>, detail, symbol}.
     """
     disp = _canonical(symbol)
     api = _fmp_symbol(symbol)
@@ -894,34 +944,17 @@ async def get_financial_ratios(
         )
         return {"key_metrics": key_metrics, "ratios": ratios}
 
-    # FMP first, the reverse of the other CN branches: the valuation fields
-    # promised above (marketCap, enterpriseValue, priceToEarningsRatio) are
-    # priced per period, and ginlix-data's CN rows carry only the accounting
-    # half. Those rows still answer a CN listing that FMP cannot.
-    async def _or_cn(fmp_answer: dict) -> dict:
-        cn = await _from_tushare(
-            disp, _cn_ratios, data_type="financial_ratios", period=period
-        )
-        return fmp_answer if cn is None else cn
-
-    try:
-        client = await get_fmp_client()
-    except Exception:  # noqa: BLE001
-        return await _or_cn(
-            make_error("client_unavailable", _CLIENT_UNAVAILABLE, symbol=disp)
-        )
-
-    try:
+    async def _fmp_ratios(client):
         key_metrics = await client.get_key_metrics(api, period=period, limit=limit)
         ratios = await client.get_financial_ratios(api, period=period, limit=limit)
-    except Exception as e:  # noqa: BLE001
-        return await _or_cn(error_from_exception(e, _UPSTREAM_FAILED, symbol=disp))
+        return {"key_metrics": key_metrics or [], "ratios": ratios or []}
 
-    data = {"key_metrics": key_metrics or [], "ratios": ratios or []}
-    answer = make_response(
-        data, source=_SOURCE, symbol=disp, data_type="financial_ratios", period=period
+    # CN rows carry the accounting half only: ginlix-data prices no period, so
+    # they have no marketCap, enterpriseValue or priceToEarningsRatio, and FMP's
+    # are not mixed in to stand for them.
+    return await _cn_first(
+        disp, _cn_ratios, _fmp_ratios, data_type="financial_ratios", period=period
     )
-    return answer if populated(data) else await _or_cn(answer)
 
 
 _OUT_GET_GROWTH_METRICS = output_model(
@@ -929,7 +962,7 @@ _OUT_GET_GROWTH_METRICS = output_model(
     envelope_schema(
         RECORDS_BY_KEY,
         frame=("symbol",),
-        echo={"data_type": STR, "period": STR},
+        echo={"data_type": STR, "period": STR, **_FALLBACK},
     ),
 )
 
@@ -940,8 +973,7 @@ async def get_growth_metrics(
     period: Literal["annual", "quarter"] = "annual",
     limit: int = 10,
 ) -> _OUT_GET_GROWTH_METRICS:
-    """Fetch raw historical growth rates for trend analysis — chart revenue/EPS
-    trajectory or compare growth across competitors.
+    """Fetch raw historical growth rates.
 
     Args:
         symbol: Ticker, e.g. "AAPL", "0700.HK", "600519.SH".
@@ -949,48 +981,34 @@ async def get_growth_metrics(
         limit: Number of periods (default 10).
 
     Returns:
-        dict: {symbol, count, data, source, data_type, period}. data is
-        {financial_growth, income_statement_growth}, each a list; count is the
-        total. financial_growth fields: date, revenueGrowth, netIncomeGrowth,
-        epsgrowth; income_statement_growth fields: date, growthRevenue,
-        growthNetIncome, growthEPS. Growth values are decimal fractions
-        (0.1 = 10%). Field names are FMP-native camelCase; date is "YYYY-MM-DD";
-        records are newest-first as returned by FMP. On error:
-        {error: <code>, detail, symbol}.
+        dict: {symbol, count, data, source, data_type, period, fallback_from?}.
+        data is {financial_growth, income_statement_growth}, each a list, newest
+        first; count is the total. financial_growth fields: date, revenueGrowth,
+        netIncomeGrowth, epsgrowth; income_statement_growth fields: date,
+        growthRevenue, growthNetIncome, growthEPS. Growth values are decimal
+        fractions (0.1 = 10%); a quarter row grows on the prior quarter, not the
+        year-ago one. Field names are FMP-native camelCase; date is
+        "YYYY-MM-DD". fallback_from: source that failed before FMP answered.
+        On error: {error: <code>, detail, symbol}.
     """
     disp = _canonical(symbol)
     api = _fmp_symbol(symbol)
 
-    cn = await _from_tushare(
-        disp,
-        lambda ts: ts.get_growth_periods(disp, period=period, limit=limit),
-        data_type="growth_metrics", period=period,
-    )
-    if cn is not None:
-        return cn
-
-    try:
-        client = await get_fmp_client()
-    except Exception:  # noqa: BLE001
-        return make_error("client_unavailable", _CLIENT_UNAVAILABLE, symbol=disp)
-
-    try:
+    async def _fmp_growth(client):
         financial_growth = await client.get_financial_growth(api, period=period, limit=limit)
         income_growth = await client.get_income_statement_growth(api, period=period, limit=limit)
+        return {
+            "financial_growth": financial_growth or [],
+            "income_statement_growth": income_growth or [],
+        }
 
-        return make_response(
-            {
-                "financial_growth": financial_growth or [],
-                "income_statement_growth": income_growth or [],
-            },
-            source=_SOURCE,
-            symbol=disp,
-            data_type="growth_metrics",
-            period=period,
-        )
-
-    except Exception as e:  # noqa: BLE001
-        return error_from_exception(e, _UPSTREAM_FAILED, symbol=disp)
+    return await _cn_first(
+        disp,
+        lambda ts: ts.get_growth_periods(disp, period=period, limit=limit),
+        _fmp_growth,
+        data_type="growth_metrics",
+        period=period,
+    )
 
 
 _OUT_GET_HISTORICAL_VALUATION = output_model(
@@ -998,7 +1016,15 @@ _OUT_GET_HISTORICAL_VALUATION = output_model(
     envelope_schema(
         RECORDS_BY_KEY,
         frame=("symbol",),
-        echo={"data_type": STR, "period": STR},
+        echo={
+            "currency": described(
+                STR,
+                "ISO 4217 currency of current_dcf's dcf and stockPrice;"
+                " omitted when the listing's venue is unknown.",
+            ),
+            "data_type": STR,
+            "period": STR,
+        },
     ),
 )
 
@@ -1009,8 +1035,7 @@ async def get_historical_valuation(
     period: Literal["annual", "quarter"] = "annual",
     limit: int = 10,
 ) -> _OUT_GET_HISTORICAL_VALUATION:
-    """Fetch DCF fair value and enterprise value history — track fair value vs
-    price or build valuation trend charts.
+    """Fetch DCF fair value and enterprise value history.
 
     Args:
         symbol: Ticker, e.g. "AAPL", "0700.HK", "600519.SH".
@@ -1018,14 +1043,16 @@ async def get_historical_valuation(
         limit: Number of periods (default 10).
 
     Returns:
-        dict: {symbol, count, data, source, data_type, period}. data is
-        {current_dcf, historical_dcf, enterprise_value}, each a list; count is
-        the total. current_dcf fields: symbol, date, dcf, stockPrice.
-        historical_dcf is always [] — the stable FMP API no longer exposes it.
-        enterprise_value fields: date, stockPrice, marketCapitalization,
-        enterpriseValue. Field names are FMP-native camelCase; date is
-        "YYYY-MM-DD"; enterprise_value is newest-first as returned by FMP. On
-        error: {error: <code>, detail, symbol}.
+        dict: {symbol, currency, count, data, source, data_type, period}. data
+        is {current_dcf, historical_dcf, enterprise_value}, each a list; count
+        is the total. current_dcf fields: symbol, date, dcf, stockPrice, per
+        share in `currency` (absent when the venue is unknown). historical_dcf
+        is always []. enterprise_value fields, newest first: date,
+        reportedCurrency, stockPrice, marketCapitalization, enterpriseValue,
+        priced in reportedCurrency (the filings' currency, which can differ
+        from `currency`; null when unknown). Field names are FMP-native
+        camelCase; date is "YYYY-MM-DD".
+        On error: {error: <code>, detail, symbol}.
     """
     disp = _canonical(symbol)
     api = _fmp_symbol(symbol)
@@ -1038,21 +1065,48 @@ async def get_historical_valuation(
         current_dcf = await client.get_dcf(api)
         historical_dcf = await client.get_historical_dcf(api, period=period, limit=limit)
         enterprise_value = await client.get_enterprise_value(api, period=period, limit=limit)
-
-        return make_response(
-            {
-                "current_dcf": current_dcf or [],
-                "historical_dcf": historical_dcf or [],
-                "enterprise_value": enterprise_value or [],
-            },
-            source=_SOURCE,
-            symbol=disp,
-            data_type="historical_valuation",
-            period=period,
-        )
-
     except Exception as e:  # noqa: BLE001
         return error_from_exception(e, _UPSTREAM_FAILED, symbol=disp)
+
+    try:
+        key_metrics = await client.get_key_metrics(api, period=period, limit=limit)
+    except Exception as exc:  # noqa: BLE001 - it only labels the rows, which still answer
+        logger.warning("FMP key metrics unavailable for %s: %s", disp, type(exc).__name__)
+        key_metrics = []
+
+    # FMP prices the DCF row in the listing's trading currency (in pence on a
+    # pence venue) and the enterprise-value rows in the filings' currency, which
+    # only the key-metrics row for the same period names.
+    try:
+        ref = to_canonical(symbol, asset_class=AssetClass.EQUITY)
+    except Exception:  # noqa: BLE001
+        ref = None
+    # A venue the protocol does not know resolves to a USD default, not its currency.
+    currency = ref.price_currency if ref and declared_venue(ref) != UNKNOWN_MIC else None
+    places = minor_unit_places(symbol)
+    reported = {row.get("date"): row.get("reportedCurrency") for row in key_metrics or []}
+    return make_response(
+        {
+            "current_dcf": [
+                {
+                    **{k: v for k, v in row.items() if k != "Stock Price"},
+                    "dcf": scale_price(row.get("dcf"), places),
+                    "stockPrice": scale_price(row.get("Stock Price", row.get("stockPrice")), places),
+                }
+                for row in current_dcf or []
+            ],
+            "historical_dcf": historical_dcf or [],
+            "enterprise_value": [
+                {**row, "reportedCurrency": reported.get(row.get("date"))}
+                for row in enterprise_value or []
+            ],
+        },
+        source=_SOURCE,
+        symbol=disp,
+        currency=currency,
+        data_type="historical_valuation",
+        period=period,
+    )
 
 
 _OUT_GET_INSIDER_TRADES = output_model(
@@ -1070,22 +1124,23 @@ async def get_insider_trades(
     symbol: str,
     limit: int = 50,
 ) -> _OUT_GET_INSIDER_TRADES:
-    """Fetch insider trading transactions and aggregate buy/sell statistics —
-    detect insider buying clusters, screen unusual activity, or gauge C-suite
-    confidence.
+    """Fetch insider transactions from SEC Form 4 filings, with quarterly totals.
+    HK and A-share listings return empty lists.
 
     Args:
-        symbol: Ticker — US "AAPL", HK "0700.HK", A-share "600519.SH".
-        limit: Number of recent transactions to fetch (default 50).
+        symbol: Ticker, e.g. "AAPL".
+        limit: Number of recent transactions (default 50).
 
     Returns:
         dict: {symbol, count, data, source, data_type}. data is {trades, stats},
-        each a list; count is the total across both. trades fields: symbol,
-        filingDate, transactionDate, reportingName, transactionType,
-        securitiesTransacted, price. stats fields: year, quarter, totalBought,
-        totalSold, buySellRatio. Field names are FMP-native camelCase; dates are
-        "YYYY-MM-DD"; trades are newest-first as returned by FMP. On error:
-        {error: <code>, detail, symbol}.
+        each a list; count is the total across both. trades fields, newest
+        first: filingDate, transactionDate, reportingName, transactionType,
+        securitiesTransacted, price. Only "P-Purchase" and "S-Sale" are
+        open-market trades; others are awards, exercises or tax withholding.
+        stats, one row per calendar quarter: year, quarter, totalPurchases,
+        totalSales (counts of P and S trades), totalAcquired, totalDisposed
+        (shares, all transaction types). Field names are FMP-native camelCase;
+        dates are "YYYY-MM-DD". On error: {error: <code>, detail, symbol}.
     """
     disp = _canonical(symbol)
     api = _fmp_symbol(symbol)
@@ -1114,7 +1169,7 @@ _OUT_GET_DIVIDENDS_AND_SPLITS = output_model(
     envelope_schema(
         RECORDS_BY_KEY,
         frame=("symbol",),
-        echo={"data_type": STR},
+        echo={"data_type": STR, **_FALLBACK},
     ),
 )
 
@@ -1123,47 +1178,35 @@ _OUT_GET_DIVIDENDS_AND_SPLITS = output_model(
 async def get_dividends_and_splits(
     symbol: str,
 ) -> _OUT_GET_DIVIDENDS_AND_SPLITS:
-    """Fetch historical dividend payments and stock splits — analyze dividend
-    growth, adjust prices for splits, or compare dividend history across peers.
+    """Fetch historical dividend payments and stock splits.
 
     Args:
         symbol: Ticker — US "AAPL", HK "0700.HK", A-share "600519.SH".
 
     Returns:
-        dict: {symbol, count, data, source, data_type}. data is
-        {dividends, splits}, each a list; count is the total across both.
-        dividends fields: date, recordDate, paymentDate, declarationDate,
-        adjDividend, dividend, yield, frequency. splits fields: date, numerator,
-        denominator. Field names are FMP-native camelCase; date is "YYYY-MM-DD";
-        records are newest-first as returned by FMP. On error:
+        dict: {symbol, count, data, source, data_type, fallback_from?}. data is
+        {dividends, splits}, each a list, newest first; count is the total
+        across both. dividends fields: date, recordDate, paymentDate,
+        declarationDate, adjDividend (split-adjusted), dividend (as paid), yield
+        (percent, 0.34 = 0.34%), frequency. splits fields: date, numerator,
+        denominator. Field names are FMP-native camelCase; date is "YYYY-MM-DD".
+        fallback_from: source that failed before FMP answered. On error:
         {error: <code>, detail, symbol}.
     """
     disp = _canonical(symbol)
     api = _fmp_symbol(symbol)
-    cn = await _from_tushare(
-        disp, lambda ts: ts.get_dividends(disp), data_type="dividends_and_splits"
-    )
-    if cn is not None:
-        return cn
 
-    try:
-        client = await get_fmp_client()
-    except Exception:  # noqa: BLE001
-        return make_error("client_unavailable", _CLIENT_UNAVAILABLE, symbol=disp)
-
-    try:
+    async def _fmp_dividends(client):
         dividends = await client.get_dividends(api)
         splits = await client.get_splits(api)
+        return {"dividends": dividends or [], "splits": splits or []}
 
-        return make_response(
-            {"dividends": dividends or [], "splits": splits or []},
-            source=_SOURCE,
-            symbol=disp,
-            data_type="dividends_and_splits",
-        )
-
-    except Exception as e:  # noqa: BLE001
-        return error_from_exception(e, _UPSTREAM_FAILED, symbol=disp)
+    return await _cn_first(
+        disp,
+        lambda ts: ts.get_dividends(disp),
+        _fmp_dividends,
+        data_type="dividends_and_splits",
+    )
 
 
 _OUT_GET_SHARES_FLOAT = output_model(
@@ -1171,7 +1214,7 @@ _OUT_GET_SHARES_FLOAT = output_model(
     envelope_schema(
         RECORDS,
         frame=("symbol",),
-        echo={"data_type": STR},
+        echo={"data_type": STR, **_FALLBACK},
     ),
 )
 
@@ -1180,44 +1223,37 @@ _OUT_GET_SHARES_FLOAT = output_model(
 async def get_shares_float(
     symbol: str,
 ) -> _OUT_GET_SHARES_FLOAT:
-    """Fetch shares float, outstanding shares, and float percentage — flag
-    low-float names, gauge ownership concentration, or screen squeeze candidates.
+    """Fetch shares float, outstanding shares, and float percentage.
 
     Args:
         symbol: Ticker — US "AAPL", HK "0700.HK", A-share "600519.SH".
 
     Returns:
-        dict: {symbol, count, data, source, data_type}. data is a list of
-        records; count is the record total. Fields: symbol, date, freeFloat,
-        floatShares, outstandingShares. Field names are FMP-native camelCase;
-        date is "YYYY-MM-DD"; latest snapshot first as returned by FMP. On error:
-        {error: <code>, detail, symbol}.
+        dict: {symbol, count, data, source, data_type, fallback_from?}. data is
+        a list of records; count is the record total. Fields: symbol, date, freeFloat
+        (percent, 99.8 = 99.8%), floatShares, outstandingShares; an ADR counts
+        ADS units, not ordinary shares. date is "YYYY-MM-DD": the day FMP
+        refreshed the record, not the as-of date of the counts, which can be
+        months older; an A-share row's date is the trading day of its counts.
+        Field names are FMP-native camelCase. fallback_from: source that failed
+        before FMP answered. On error: {error: <code>, detail, symbol}.
     """
     disp = _canonical(symbol)
     api = _fmp_symbol(symbol)
-    cn = await _from_tushare(
-        disp, lambda ts: ts.get_shares_float(disp), data_type="shares_float"
+
+    async def _fmp_float(client):
+        # FMP stamps the row with its refresh time; the contract is a bare date.
+        return [
+            {**row, "date": str(row["date"])[:10]} if row.get("date") else row
+            for row in await client.get_shares_float(api) or []
+        ]
+
+    return await _cn_first(
+        disp,
+        lambda ts: ts.get_shares_float(disp),
+        _fmp_float,
+        data_type="shares_float",
     )
-    if cn is not None:
-        return cn
-
-    try:
-        client = await get_fmp_client()
-    except Exception:  # noqa: BLE001
-        return make_error("client_unavailable", _CLIENT_UNAVAILABLE, symbol=disp)
-
-    try:
-        data = await client.get_shares_float(api)
-
-        return make_response(
-            data or [],
-            source=_SOURCE,
-            symbol=disp,
-            data_type="shares_float",
-        )
-
-    except Exception as e:  # noqa: BLE001
-        return error_from_exception(e, _UPSTREAM_FAILED, symbol=disp)
 
 
 _OUT_GET_KEY_EXECUTIVES = output_model(
@@ -1225,7 +1261,7 @@ _OUT_GET_KEY_EXECUTIVES = output_model(
     envelope_schema(
         RECORDS,
         frame=("symbol",),
-        echo={"data_type": STR},
+        echo={"data_type": STR, **_FALLBACK},
     ),
 )
 
@@ -1241,37 +1277,22 @@ async def get_key_executives(
         symbol: Ticker — US "AAPL", HK "0700.HK", A-share "600519.SH".
 
     Returns:
-        dict: {symbol, count, data, source, data_type}. data is a list of
-        executive records; count is the record total. Fields: name, title, pay,
-        currencyPay, gender, yearBorn, titleSince. Field names are FMP-native
-        camelCase; pay is an integer in currencyPay units; order is as returned
-        by FMP (not time-ordered). On error: {error: <code>, detail, symbol}.
+        dict: {symbol, count, data, source, data_type, fallback_from?}. data is
+        a list of executive records; count is the record total. Fields: name,
+        title, pay, currencyPay, gender, yearBorn, titleSince. Field names are
+        FMP-native camelCase; pay is an integer in currencyPay units; not
+        time-ordered. fallback_from: source that failed before FMP answered.
+        On error: {error: <code>, detail, symbol}.
     """
     disp = _canonical(symbol)
     api = _fmp_symbol(symbol)
-    cn = await _from_tushare(
-        disp, lambda ts: ts.get_key_executives(disp), data_type="key_executives"
+
+    return await _cn_first(
+        disp,
+        lambda ts: ts.get_key_executives(disp),
+        lambda client: client.get_key_executives(api),
+        data_type="key_executives",
     )
-    if cn is not None:
-        return cn
-
-    try:
-        client = await get_fmp_client()
-    except Exception:  # noqa: BLE001
-        return make_error("client_unavailable", _CLIENT_UNAVAILABLE, symbol=disp)
-
-    try:
-        data = await client.get_key_executives(api)
-
-        return make_response(
-            data or [],
-            source=_SOURCE,
-            symbol=disp,
-            data_type="key_executives",
-        )
-
-    except Exception as e:  # noqa: BLE001
-        return error_from_exception(e, _UPSTREAM_FAILED, symbol=disp)
 
 
 _OUT_GET_TECHNICAL_INDICATOR = output_model(
@@ -1284,6 +1305,7 @@ _OUT_GET_TECHNICAL_INDICATOR = output_model(
             "indicator": STR,
             "period": described(INT, "Indicator lookback length."),
             "timeframe": described(STR, "FMP-native bar size."),
+            **BAR_LABELS,
         },
     ),
 )
@@ -1296,22 +1318,22 @@ async def get_technical_indicator(
     period: int = 14,
     timeframe: str = "1day",
 ) -> _OUT_GET_TECHNICAL_INDICATOR:
-    """Fetch a technical indicator time series over OHLCV bars — plot RSI,
-    overlay EMA/MACD, or screen by technical signals.
+    """Fetch a technical indicator time series over OHLCV bars.
 
     Args:
         symbol: Ticker, e.g. "AAPL", "0700.HK", "600519.SH".
         indicator: FMP name — "rsi", "ema", "sma", "wma", "adx", "williams".
-        period: Indicator lookback length (default 14).
+        period: Lookback length (default 14).
         timeframe: FMP-native bar — "1min"…"4hour", "1day" (default "1day").
 
     Returns:
         dict: {symbol, count, data, source, data_type, indicator, period,
-        timeframe}. data is a list of bars; count is the bar total. Fields: date,
-        open, high, low, close, volume, and the indicator value keyed by its
-        name. date is "YYYY-MM-DD" (1day) or "YYYY-MM-DD HH:MM:SS"
-        (intraday); field names are FMP-native camelCase; bars newest-first.
-        On error: {error: <code>, detail, symbol}.
+        timeframe, price_treatment, in_progress?}. data: list of {date, open,
+        high, low, close, volume, <indicator>} newest first, field names
+        FMP-native camelCase. date is "YYYY-MM-DD" (1day) or
+        "YYYY-MM-DD HH:MM:SS" (intraday). price_treatment:
+        raw|split_adjusted|dividend_adjusted. in_progress: date of the newest
+        bar while it forms. On error: {error: <code>, detail, symbol}.
     """
     disp = _canonical(symbol)
     if timeframe not in _BAR_SIZES:
@@ -1327,18 +1349,32 @@ async def get_technical_indicator(
         return make_error("client_unavailable", _CLIENT_UNAVAILABLE, symbol=disp)
 
     try:
+        ref = to_canonical(symbol, asset_class=AssetClass.EQUITY)
+    except Exception:  # noqa: BLE001
+        ref = None
+    try:
         data = await client.get_technical_indicator(
             api, indicator=indicator, period=period, timeframe=timeframe
         )
+        rows = data or []
+        if timeframe == "1day":
+            # FMP stamps a daily row with a midnight time; the contract is a bare date.
+            rows = [
+                {**row, "date": str(row["date"])[:10]}
+                if isinstance(row, dict) and row.get("date") else row
+                for row in rows
+            ]
+        newest = rows[0].get("date") if rows and isinstance(rows[0], dict) else None
 
         return make_response(
-            data or [],
+            rows,
             source=_SOURCE,
             symbol=disp,
             data_type="technical_indicator",
             indicator=indicator,
             period=period,
             timeframe=timeframe,
+            **series_labels(_SOURCE, ref, timeframe, newest),
         )
 
     except Exception as e:  # noqa: BLE001

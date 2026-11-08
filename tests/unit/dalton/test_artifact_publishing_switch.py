@@ -153,6 +153,77 @@ async def test_off_keep_updated_true_refused_false_allowed(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("left_out", [True, False])
+async def test_off_left_out_refused_before_any_write(
+    owner_routes, monkeypatch: pytest.MonkeyPatch, left_out: bool
+) -> None:
+    from src.server.app.artifacts.models import LeftOutRequest
+
+    set_left_out = create_autospec(
+        owner_routes.db.set_left_out,
+        return_value=owner_routes.artifact,
+    )
+    monkeypatch.setattr(owner_routes.db, "set_left_out", set_left_out)
+
+    with pytest.raises(HTTPException) as raised:
+        await owner_routes.records.set_file_left_out(
+            ARTIFACT_ID,
+            LeftOutRequest(path="extra.html", left_out=left_out),
+            x_user_id="u-owner-1",
+        )
+    assert raised.value.status_code == 403
+    assert raised.value.detail == {"code": "artifact_publishing_disabled"}
+    set_left_out.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("left_out", [True, False])
+async def test_on_external_member_left_out_refused_and_internal_allowed(
+    owner_routes, monkeypatch: pytest.MonkeyPatch, left_out: bool
+) -> None:
+    from src.dalton import access_tiers as dalton_access_tiers
+    from src.server.app.artifacts.models import LeftOutRequest
+
+    monkeypatch.setenv(SWITCH_ENV, "1")
+    monkeypatch.setattr(
+        dalton_access_tiers,
+        "get_user_tier",
+        create_autospec(
+            dalton_access_tiers.get_user_tier,
+            side_effect=lambda uid: "external" if uid == "u-ext-1" else "standard",
+        ),
+    )
+    set_left_out = create_autospec(
+        owner_routes.db.set_left_out,
+        side_effect=lambda *, user_id, artifact_id, path, left_out, cap: (
+            dataclasses.replace(
+                owner_routes.artifact,
+                left_out_files=(path,) if left_out else (),
+            )
+        ),
+    )
+    monkeypatch.setattr(owner_routes.db, "set_left_out", set_left_out)
+
+    with pytest.raises(HTTPException) as raised:
+        await owner_routes.records.set_file_left_out(
+            ARTIFACT_ID,
+            LeftOutRequest(path="extra.html", left_out=left_out),
+            x_user_id="u-ext-1",
+        )
+    assert raised.value.status_code == 403
+    assert raised.value.detail == "外部成员不能创建公开分享链接"
+    set_left_out.assert_not_called()
+
+    response = await owner_routes.records.set_file_left_out(
+        ARTIFACT_ID,
+        LeftOutRequest(path="extra.html", left_out=left_out),
+        x_user_id="u-owner-1",
+    )
+    assert response.artifact_id == ARTIFACT_ID
+    set_left_out.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_off_binding_refused_delete_open(owner_routes) -> None:
     from src.server.app.artifacts.models import BindRequest
 
@@ -565,7 +636,7 @@ def test_off_main_agent_registers_no_reply_to_comment() -> None:
             user_id="u-1",
             mcp_registry=MagicMock(),
             sandbox=MagicMock(),
-            claude_code_launcher=lambda sandbox: MagicMock(),
+            claude_code_launcher=lambda sandbox, hosted, saved: MagicMock(),
         )
     assert "reply_to_comment" not in {
         t.name for t in graph.turn.spec.tools

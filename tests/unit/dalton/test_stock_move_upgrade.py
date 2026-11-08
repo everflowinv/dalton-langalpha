@@ -33,7 +33,7 @@ import pytest
 import yfinance as yf
 
 from market_protocol import AssetClass, market_of, to_canonical
-from market_protocol.symbology import WEEKDAYS_24_5
+from market_protocol.symbology import FUTURES_MIC
 from src.data_client.base import MarketDataSource
 from src.data_client.fmp.data_source import FMPDataSource
 from src.data_client.fmp.fmp_client import FMPClient
@@ -259,8 +259,8 @@ class TestFuturesCommoditiesRatesSymbologyAndRouting:
     def test_futures_use_weekdays_24_5_calendar_and_other_market(self, sym: str):
         ref = to_canonical(sym)
         assert ref.symbol == sym
-        assert ref.calendar_id == WEEKDAYS_24_5
-        assert market_of(ref) == "other"
+        assert ref.calendar_id == FUTURES_MIC
+        assert market_of(ref) == "futures"
         assert symbol_market(sym) == "other"
         assert is_us_symbol(sym) is False
         assert yahoo_symbol(sym, is_index=True) == sym
@@ -294,7 +294,7 @@ class TestFuturesCommoditiesRatesSymbologyAndRouting:
 
         mock_provider.get_snapshots.side_effect = _fake_get_snapshots
 
-        with patch("src.tools.market_data.quotes.get_market_data_provider", autospec=True) as mock_get_prov, patch("src.tools.market_data.quotes.fill_quote_names", autospec=True), patch("src.server.services.cache.quote_daily_fallback.fill_from_daily", autospec=True, side_effect=lambda served, asked, uid: served):
+        with patch("src.server.services.cache.quote_cache_service.get_market_data_provider", autospec=True) as mock_get_prov, patch("src.server.services.cache.quote_cache_service.fill_quote_names", autospec=True), patch("src.server.services.cache.quote_cache_service.fill_from_daily", autospec=True, side_effect=lambda served, asked, uid: served):
             mock_get_prov.return_value = mock_provider
             content, artifact = await fetch_quote(
                 ["GOOGL", "NQ=F", "CL=F", "^TNX", "^VIX", "DX-Y.NYB"],

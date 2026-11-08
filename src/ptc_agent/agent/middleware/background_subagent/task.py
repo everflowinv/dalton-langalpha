@@ -102,6 +102,15 @@ class BackgroundTask:
     handler_task: asyncio.Task | None = None
     """The underlying tool handler task executing the subagent."""
 
+    stragglers: set[asyncio.Task] = field(default_factory=set)
+    """Work the writer left running past a bounded close: a graph step or a
+    stream close that would not stop in time. It can still checkpoint, so it
+    counts among the live writers."""
+
+    stop_at: float | None = None
+    """Wall-clock time the current round's own clock stops it, stop grace
+    included, when it runs on one."""
+
     created_at: float = field(default_factory=time.time)
     """Timestamp when the task was created."""
 
@@ -273,7 +282,11 @@ class BackgroundTask:
         """
         try:
             result = writer.result()
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
+            if exc.args == ("subagent ran past its time limit",):
+                reason = "Timed out: still running past its time limit"
+                self.force_cancel(reason, status="timeout", cancel_handler=False)
+                return self.result
             self.mark_cancelled()
             return self.result
         except Exception as exc:
@@ -358,6 +371,13 @@ class BackgroundTask:
         """
         return self.terminal_status in ("cancelled", "timeout")
 
+    # DALTON-HOOK(subagent-caps): distinguishes a time-limit stop from a user
+    # cancel while keeping ``cancelled`` as the kill-seal predicate.
+    @property
+    def timed_out(self) -> bool:
+        """True when the task ended because its time limit expired."""
+        return self.terminal_status == "timeout"
+
     @property
     def display_id(self) -> str:
         """Return Task-<id> format for display."""
@@ -379,13 +399,17 @@ class BackgroundTask:
         Both count: a cancelled wrapper can return while its shielded handler
         keeps checkpointing, and a kill stamps ``terminal_status`` before
         either has unwound, so neither the status nor one handle says the task
-        has stopped writing.
+        has stopped writing. So do its stragglers.
         """
         return [
             writer
-            for writer in (self.asyncio_task, self.handler_task)
+            for writer in (self.asyncio_task, self.handler_task, *self.stragglers)
             if writer is not None and not writer.done()
         ]
+
+    def keep_straggler(self, work: asyncio.Task) -> None:
+        self.stragglers.add(work)
+        work.add_done_callback(self.stragglers.discard)
 
     @property
     def is_turn_visible(self) -> bool:

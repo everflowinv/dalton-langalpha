@@ -43,6 +43,7 @@ _DEFAULT_CHAIN = ["inhouse"]
 
 # Extraction model configuration
 EXTRACTION_TIMEOUT = 60.0  # seconds per model attempt
+WEB_FETCH_DEADLINE = 300.0  # seconds for the whole call: fetch, sitemap and extraction
 
 # Per-request overrides for extraction model (set by chat handler from user preferences)
 fetch_model_override: ContextVar[str | None] = ContextVar("fetch_model_override", default=None)
@@ -315,6 +316,26 @@ async def _extract_with_llm(
     return formatted["text"]
 
 
+def _fetch_failed(
+    artifact: dict,
+    error: WebError,
+    provider: str | None = None,
+    *,
+    provider_side: bool = False,
+) -> str:
+    artifact["error"] = error.type.value
+    mark_web_outcome(error, provider, provider_side=provider_side)
+    return f"[{error.type.value}] Failed to fetch {artifact['url']}: {error.message}"
+
+
+def _timeout_result(
+    artifact: dict, message: str, *, provider_side: bool = False
+) -> tuple[str, dict]:
+    logger.warning(f"WebFetch timed out on {artifact['url']}: {message}")
+    error = WebError(type=WebErrorType.TIMEOUT, message=message)
+    return _fetch_failed(artifact, error, provider_side=provider_side), artifact
+
+
 async def web_fetch(
     url: str,
     prompt: str,
@@ -345,6 +366,45 @@ async def web_fetch(
         model = _get_extraction_model()
 
     artifact: dict = {"type": "web_fetch", "url": url}
+    fetched_markdown: list[str] = []
+    try:
+        async with asyncio.timeout(WEB_FETCH_DEADLINE):
+            return await _fetch_and_extract(
+                url,
+                prompt,
+                model,
+                use_cache,
+                include_sitemap,
+                artifact,
+                fetched_markdown,
+            )
+    except TimeoutError as e:
+        # DALTON-HOOK(oauth-refresh-direct): if the 300s deadline expires once
+        # the page body is already in hand (during sitemap or LLM extraction),
+        # return the raw markdown with the marker instead of discarding it.
+        if fetched_markdown:
+            logger.warning(
+                f"LLM extraction failed for {artifact['url']}: {repr(e)}; returning raw page"
+            )
+            artifact["error"] = "extraction_failed"
+            return (
+                f"未能抽取（{_short_exc(e)}）。以下是未抽取的网页正文：\n\n{fetched_markdown[0]}",
+                artifact,
+            )
+        return _timeout_result(artifact, f"No answer within {WEB_FETCH_DEADLINE:.0f}s")
+
+
+async def _fetch_and_extract(
+    url: str,
+    prompt: str,
+    model: str,
+    use_cache: bool,
+    include_sitemap: bool,
+    artifact: dict,
+    fetched_markdown: Optional[ list[str] ] = None,
+) -> tuple[str, dict]:
+    """web_fetch's work, under its deadline. Every exception ends in a result
+    here, so a TimeoutError that reaches web_fetch is the deadline's own."""
     try:
         service = get_fetch_service()
         request = FetchRequest(
@@ -387,18 +447,14 @@ async def web_fetch(
             artifact["source"] = result.source
 
             if result.error is not None:
-                kind = result.error.type.value
-                artifact["error"] = kind
                 # A failed URL's error came from the last provider to try it;
                 # the response names a provider only when one succeeded.
-                mark_web_outcome(
+                failed = _fetch_failed(
+                    artifact,
                     result.error,
                     response.attempts[-1].provider if response.attempts else None,
                 )
-                return _with_sitemap_suggestions(
-                    f"[{kind}] Failed to fetch {url}: {result.error.message}",
-                    await _sitemap(),
-                ), artifact
+                return _with_sitemap_suggestions(failed, await _sitemap()), artifact
 
             artifact["title"] = result.title
 
@@ -430,9 +486,14 @@ async def web_fetch(
                     artifact,
                 )
 
-            # Extract with LLM (with sitemap context). DALTON-HOOK(oauth-refresh-direct):
-            # the page is already fetched — an extraction failure (auth, timeout)
-            # must not throw it away; return it with a clear marker instead.
+            # Extract with LLM (with sitemap context). Under the deadline its
+            # expiry arrives as a cancel (caught in web_fetch via fetched_markdown),
+            # while a TimeoutError or other Exception here is the extraction's own.
+            # DALTON-HOOK(oauth-refresh-direct): the page is already fetched —
+            # an extraction failure (auth, timeout) must not throw it away;
+            # return it with a clear marker instead.
+            if fetched_markdown is not None:
+                fetched_markdown.append(markdown)
             try:
                 extracted = await _extract_with_llm(markdown, prompt, model, await _sitemap())
             except Exception as e:

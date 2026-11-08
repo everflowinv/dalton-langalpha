@@ -24,6 +24,7 @@ import { focusWithoutRing } from '@/lib/inputModality';
 import { cn } from '@/lib/utils';
 import type { WidgetContextSnapshot } from '@/pages/Dashboard/widgets/framework/contextSnapshot';
 import './chat-input.css';
+// DALTON-HOOK(composer-drafts): QuoteMention and sameMention restore a draft's quotes beside the given-back text
 import type { ComposerDraft, ComposerScope, ComposerSend, ContextPayload, ModelOptions, QuoteMention, ReadyAttachment, SlashCommand, ThreadTuning, Workspace } from './chat-input.types';
 import { isLargePaste, getModelDisplayName, sameMention } from './chat-input.helpers';
 import { effortLabelFor, resolveEffort } from '@/lib/modelTuning';
@@ -33,7 +34,8 @@ import {
 } from './chat-input.composerParts';
 import { ChatInputModelMenu, ModelTriggerMeasure, type EffortMenuProps } from './chat-input.modelMenu';
 import type { ModelRowStatus } from './chat-input.modelPicker';
-import { claudeCodeTokenUrl, isClaudeCodeModel } from '@/lib/claudeCode';
+import { ANTHROPIC_KEY_URL, CLAUDE_CODE_CHOICE_URL, biggerComputer, claudeCodeTokenUrl, isClaudeCodeModel } from '@/lib/claudeCode';
+import type { Payer } from '@/lib/modelPayer';
 import { useWorkspaceClaudeCode } from '@/hooks/useWorkspaceClaudeCode';
 import { deriveRecentModels } from './chat-input.models';
 import { modelGroups } from '@/lib/modelGroups';
@@ -1015,9 +1017,18 @@ function ChatInput({
 
   const favorites = useFavoriteModels();
   const { entryFor } = useProviderCatalog();
+  // A Claude Code model runs a turn while the token where the workspace's
+  // computer runs it works or could not be checked, as admission lets it;
+  // otherwise its row says why, and where the user can fix it: that
+  // computer's token, or the saved one. On a cloud computer it may run on
+  // the user's Anthropic API key, which then pays for it.
+  const claudeCode = useWorkspaceClaudeCode(selectedWorkspaceId);
+  const pickerPayers = useMemo((): Record<string, Payer> => (claudeCode.state === 'api_key'
+    ? Object.fromEntries(Object.entries(payers).map(([m, payer]) => [m, isClaudeCodeModel(modelMetadata[m]) ? 'own_key' : payer]))
+    : payers), [claudeCode.state, payers, modelMetadata]);
   const modelGroupList = useMemo(() => modelGroups({
     models: turn.models,
-    payers,
+    payers: pickerPayers,
     brandOf: (group) => {
       const entry = entryFor(group);
       if (!entry?.group || entry.group === group) return undefined;
@@ -1026,14 +1037,9 @@ function ChatInput({
         label: visibleModels[entry.group]?.display_name ?? entry.group_display_name ?? entry.display_name,
       };
     },
-  }), [turn.models, visibleModels, payers, entryFor]);
+  }), [turn.models, visibleModels, pickerPayers, entryFor]);
   const recentModels = deriveRecentModels({ selectedModel: pillModel, threadModels: threadModelsProp, validModelNames })
     .filter((m) => !favorites.models.includes(m) && turn.offers(m));
-  // A Claude Code model runs a turn while the token where the workspace's
-  // computer runs it works or could not be checked, as admission lets it;
-  // otherwise its row says why, and where the user can fix it: that
-  // computer's token, or the saved one.
-  const claudeCode = useWorkspaceClaudeCode(selectedWorkspaceId);
   const tokenUrl = claudeCodeTokenUrl(selectedWorkspaceId);
   const modelRowStatus = (m: string): ModelRowStatus => {
     if (isClaudeCodeModel(modelMetadata[m])) {
@@ -1042,6 +1048,14 @@ function ChatInput({
         case 'no_token': return { unavailable: t('chat.modelSelector.claudeCodeSignedOut'), fix: () => navigate(tokenUrl) };
         case 'rejected': return { unavailable: t('chat.modelSelector.claudeCodeRejected'), fix: () => navigate(tokenUrl) };
         case 'needs_own_computer': return { unavailable: t('chat.modelSelector.claudeCodeNeedsOwnComputer') };
+        case 'hosted_paused': return { unavailable: t('chat.modelSelector.claudeCodePaused') };
+        case 'hosted_off': return { unavailable: t('chat.modelSelector.claudeCodeHostedOff'), fix: () => navigate(CLAUDE_CODE_CHOICE_URL) };
+        case 'needs_api_key': return { unavailable: t('chat.modelSelector.claudeCodeNeedsApiKey'), fix: () => navigate(ANTHROPIC_KEY_URL) };
+        case 'api_key_endpoint': return { unavailable: t('chat.modelSelector.claudeCodeApiKeyEndpoint'), fix: () => navigate(ANTHROPIC_KEY_URL) };
+        case 'needs_bigger_computer': {
+          const { rowKey, link } = biggerComputer();
+          return { unavailable: t(rowKey), fix: link ? () => window.open(link.url, '_blank', 'noopener,noreferrer') : undefined };
+        }
         case 'policy_blocked': return { unavailable: t('chat.modelSelector.claudeCodePolicyBlocked') };
         case 'needs_perl': return { unavailable: t('modelAccess.claudeCode.fail.needs_perl') };
         case 'computer_unsupported': return { unavailable: t('modelAccess.claudeCode.fail.computer_unsupported') };
@@ -1330,7 +1344,7 @@ function ChatInput({
               <ChatInputModelMenu
                 selectedModel={pillModel}
                 metadata={modelMetadata}
-                payers={payers}
+                payers={pickerPayers}
                 groups={modelGroupList}
                 favorites={favorites.models.filter(turn.offers)}
                 recent={recentModels}

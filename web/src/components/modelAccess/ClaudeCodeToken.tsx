@@ -1,16 +1,18 @@
 import { Fragment, useEffect, useId, useRef, useState } from 'react';
-import { ExternalLink, Shield } from 'lucide-react';
+import { ExternalLink, MoreHorizontal, Shield } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
 import { Input } from '@/components/ui/input';
 import { Loader } from '@/components/ui/loader';
 import { ModalShell } from '@/components/ui/ModalShell';
 import { useNow } from '@/hooks/useNow';
+import { apiErrorStatus } from '@/api/errors';
 import { readOAuthError } from '@/api/oauth';
 import { useClaudeCodeComputers, useClaudeCodeStatus } from '@/hooks/useClaudeCode';
 import { CLAUDE_CODE_UNRUNNABLE } from '@/lib/claudeCode';
 import { countdown } from './countdown';
-import { CopyButton, OpenProviderLink } from './parts';
+import { CopyButton, OpenProviderLink, ROW_BUTTON } from './parts';
 import { TOKEN_ACTIONS, type TokenAction } from './tokenLine';
 import { SAVED_TOKEN, tokenCopy, tokenSheetTitle, useTokenRoutes, type SheetAction, type TokenRoutes, type TokenTarget } from './tokenTarget';
 
@@ -35,9 +37,13 @@ const WORDED = {
 
 type Refusal = { code: string; message: string; retryable: boolean };
 
+/** A token checked as the user stopped letting the server store theirs is
+ *  refused `unavailable` with a 409, whose own sentence says so; the
+ *  `unavailable` worded here is Claude Code being off for them. */
 const refusalOf = (err: unknown): Refusal => {
   const detail = readOAuthError(err);
-  return { code: detail?.code ?? 'unknown', message: detail?.message ?? '', retryable: detail?.retryable ?? false };
+  const storeEnded = detail?.code === 'unavailable' && apiErrorStatus(err) === 409;
+  return { code: storeEnded ? 'store_ended' : detail?.code ?? 'unknown', message: detail?.message ?? '', retryable: detail?.retryable ?? false };
 };
 
 function say(t: (key: string) => string, scope: keyof typeof WORDED, r: Refusal): string {
@@ -50,9 +56,11 @@ function say(t: (key: string) => string, scope: keyof typeof WORDED, r: Refusal)
 
 /** A removal's refusal: in the server's sentence for a computer it can't
  *  reach, which says what that computer's owner can do, and in our words
- *  for anything else. */
-const sayRemoveFailed = (t: (key: string) => string, r: Refusal) =>
-  (r.code === 'computer_unreachable' && r.message ? r.message : t('modelAccess.claudeCode.removeFailed'));
+ *  for anything else, a token deleted whose turn did not stop included. */
+const sayRemoveFailed = (t: (key: string) => string, r: Refusal) => {
+  if (r.code === 'computer_unreachable' && r.message) return r.message;
+  return t(r.code === 'turns_running' ? 'modelAccess.claudeCode.turnsRunning' : 'modelAccess.claudeCode.removeFailed');
+};
 
 /** The server keeps a sign-in this long when its answer has no usable time. */
 const FALLBACK_LIFETIME_MS = 10 * 60_000;
@@ -102,7 +110,9 @@ export function ClaudeCodeTokenModal({ target, action, onClose }: { target: Toke
   );
 }
 
-/** A token line's buttons, each as `TOKEN_ACTIONS` says. */
+/** A token line's buttons, each as `TOKEN_ACTIONS` says: the first as a
+ *  button, any after it (Remove beside a Replace or an Add) in a menu of
+ *  their own, so a line's controls keep one width on one line. */
 export function TokenActions({ actions, onOpen, onRemove }: {
   actions: TokenAction[];
   onOpen: (action: SheetAction) => void;
@@ -110,16 +120,33 @@ export function TokenActions({ actions, onOpen, onRemove }: {
 }) {
   const { t } = useTranslation();
   if (actions.length === 0) return null;
+  const run = (action: TokenAction) => {
+    const { sheet } = TOKEN_ACTIONS[action];
+    if (sheet) onOpen(sheet);
+    else onRemove();
+  };
+  const [first, ...more] = actions;
   return (
-    <div className="flex gap-1">
-      {actions.map((action) => {
-        const { label, sheet, prominent } = TOKEN_ACTIONS[action];
-        return (
-          <Button key={action} type="button" variant={prominent ? 'outline' : 'ghost'} size="sm" onClick={sheet ? () => onOpen(sheet) : onRemove}>
-            {t(label)}
-          </Button>
-        );
-      })}
+    <div className="flex items-center gap-1">
+      <Button type="button" variant="outline" size="sm" className={ROW_BUTTON} onClick={() => run(first)}>
+        {t(TOKEN_ACTIONS[first].label)}
+      </Button>
+      {more.length > 0 && (
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <Button type="button" variant="ghost" size="icon" className="tap-target h-9 w-9" aria-label={t('modelAccess.claudeCode.moreActions')}>
+              <MoreHorizontal aria-hidden="true" className="h-4 w-4" />
+            </Button>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            {more.map((action) => (
+              <DropdownMenuItem key={action} variant={action === 'remove' ? 'destructive' : 'default'} onSelect={() => run(action)}>
+                {t(TOKEN_ACTIONS[action].label)}
+              </DropdownMenuItem>
+            ))}
+          </DropdownMenuContent>
+        </DropdownMenu>
+      )}
     </div>
   );
 }

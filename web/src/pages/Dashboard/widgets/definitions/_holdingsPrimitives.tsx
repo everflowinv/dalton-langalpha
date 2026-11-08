@@ -7,7 +7,7 @@ import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router';
 import { Pencil, Trash2, Eye, EyeOff } from 'lucide-react';
 import { deriveQuoteDisplay, roundQuote2, type MarketStatusInput } from '@/lib/quotes'; // DALTON-HOOK(extended-hours-quotes)
-import { integer } from '@/lib/format';
+import { DASH, formatList, integer } from '@/lib/format';
 import { useLocale } from '@/hooks/useLocale';
 import { formatMoney, quoteCurrency } from '@/lib/bars';
 import {
@@ -26,7 +26,6 @@ import {
 } from '../../utils/portfolioSummary';
 
 type MarketStatusData = MarketStatusInput;
-
 /** The pre- or after-hours move under a row's change: `AH 199.10 ▲ 0.34%`. */
 function ExtendedHours({
   label,
@@ -83,7 +82,7 @@ export function PortfolioTable({ children }: { children: ReactNode }) {
 
 interface WatchlistRowItemProps {
   item: WatchlistRow;
-  marketStatus: MarketStatusData;
+  marketStatus: MarketStatusData | null;
   onDelete?: (id: string) => void;
   /** The row's paperclip, set at the end of the symbol's cell. */
   attach?: ReactNode;
@@ -99,7 +98,6 @@ export function WatchlistRowItem({ item, marketStatus, onDelete, attach }: Watch
   // with the row's own listing suffix as the fallback for older payloads. An
   // index level prints bare.
   const code = quoteCurrency(item.currency, item.symbol, item.assetClass);
-
   // DALTON-HOOK(extended-hours-quotes): Derive main quote and extended-hours figures from shared deriveQuoteDisplay.
   const quoteDisplay = deriveQuoteDisplay(item, marketStatus);
   const extType = quoteDisplay.session === 'regular' ? null : quoteDisplay.session;
@@ -126,17 +124,23 @@ export function WatchlistRowItem({ item, marketStatus, onDelete, attach }: Watch
       <td className="term-num">
         {/* DALTON-HOOK(extended-hours-quotes): Regular close as main price; extPrice on extended line. */}
         {hasQuote && mainPrice != null
-          ? formatMoney(roundQuote2(Number(mainPrice)), code, locale)
+          ? formatMoney(item.places && item.places > 2 ? Number(mainPrice) : roundQuote2(Number(mainPrice)), code, locale, { upTo: item.places })
           : 'N/A'}
       </td>
       <td
         className="term-num"
-        title={hasQuote && mainChange != null ? formatMoney(roundQuote2(Number(mainChange)), code, locale, { signed: true }) : undefined}
+        title={hasQuote && mainChange != null ? formatMoney(item.places && item.places > 2 ? Number(mainChange) : roundQuote2(Number(mainChange)), code, locale, { signed: true, upTo: item.places }) : undefined}
       >
-        {hasQuote && mainChangePct != null ? <TermChange value={roundQuote2(Number(mainChangePct))} /> : <span className="term-t3">N/A</span>}
+        {!hasQuote ? (
+          <span className="term-t3">N/A</span>
+        ) : mainChangePct != null ? (
+          <TermChange value={roundQuote2(Number(mainChangePct))} />
+        ) : (
+          <span className="term-t3">{DASH}</span>
+        )}
         {hasQuote && extType && extLabel && extDisplayPrice != null && extPct != null && (
           <span className="block">
-            <ExtendedHours label={extLabel} price={formatMoney(roundQuote2(Number(extDisplayPrice)), code, locale)} pct={roundQuote2(Number(extPct))} />
+            <ExtendedHours label={extLabel} price={formatMoney(item.places && item.places > 2 ? Number(extDisplayPrice) : roundQuote2(Number(extDisplayPrice)), code, locale, { upTo: item.places })} pct={roundQuote2(Number(extPct))} />
           </span>
         )}
       </td>
@@ -161,7 +165,7 @@ export function WatchlistRowItem({ item, marketStatus, onDelete, attach }: Watch
 
 interface PortfolioRowItemProps {
   item: PortfolioRow;
-  marketStatus: MarketStatusData;
+  marketStatus: MarketStatusData | null;
   valuesHidden: boolean;
   onEdit?: (row: PortfolioRow) => void;
   onDelete?: (id: string) => void;
@@ -199,10 +203,11 @@ export function PortfolioRowItem({
   // close while an extended session runs, as the change beside it measures.
   const displayPrice =
     hasQuote && mainPrice != null
-      ? formatPortfolioMoney(
-          roundQuote2(Number(mainPrice)),
+      ? formatMoney(
+          item.places && item.places > 2 ? Number(mainPrice) : roundQuote2(Number(mainPrice)),
           currency,
           locale,
+          { upTo: item.places },
         )
       : undefined;
 
@@ -238,7 +243,7 @@ export function PortfolioRowItem({
         )}
         {hasQuote && extType && extLabel && extDisplayPrice != null && extPct != null && (
           <span className="block">
-            <ExtendedHours label={extLabel} price={formatPortfolioMoney(roundQuote2(Number(extDisplayPrice)), currency, locale)} pct={roundQuote2(Number(extPct))} />
+            <ExtendedHours label={extLabel} price={formatMoney(item.places && item.places > 2 ? Number(extDisplayPrice) : roundQuote2(Number(extDisplayPrice)), currency, locale, { upTo: item.places })} pct={roundQuote2(Number(extPct))} />
           </span>
         )}
       </td>
@@ -277,6 +282,11 @@ export function HoldingsAddButton({ label, onClick }: HoldingsAddButtonProps) {
       + {label}
     </button>
   );
+}
+
+/** The symbols a P/L leaves out, three at most before a count of the rest. */
+function listSymbols(symbols: string[], locale: string, more: (n: number) => string): string {
+  return formatList(symbols.length > 3 ? [...symbols.slice(0, 3), more(symbols.length - 3)] : symbols, locale);
 }
 
 interface PortfolioNavSummaryProps {
@@ -334,6 +344,14 @@ export function PortfolioNavSummary({ rows, valuesHidden, onToggleHidden }: Port
                     ],
                   ]}
                 />
+              </div>
+            )}
+            {summary.totalCost > 0 && summary.uncosted.length > 0 && (
+              <div className="term-line term-word term-t3 mt-1">
+                {t('dashboard.widgets.holdings.plExcludes', {
+                  symbols: listSymbols([...new Set(summary.uncosted.map((h) => h.symbol))], locale, (n) => t('dashboard.widgets.holdings.andMore', { n })),
+                  currency: summary.currency,
+                })}
               </div>
             )}
           </div>

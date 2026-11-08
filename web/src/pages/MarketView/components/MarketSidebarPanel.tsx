@@ -10,9 +10,11 @@ import AddPortfolioHoldingDialog from '../../Dashboard/components/AddPortfolioHo
 import ConfirmDialog from '../../Dashboard/components/ConfirmDialog';
 import { getExtendedHoursInfo } from '@/lib/marketUtils';
 import { deriveQuoteDisplay, formatSignedPct2, roundQuote2 } from '@/lib/quotes'; // DALTON-HOOK(extended-hours-quotes)
-import { grouped2 } from '@/lib/format';
+import { formatMoney } from '@/lib/bars';
+import { DASH, grouped2 } from '@/lib/format';
 import { useLocale } from '@/hooks/useLocale';
 import { useIsMobile } from '@/hooks/useIsMobile';
+import type { ExtendedSessionFields } from '@/types/market';
 import './MarketSidebarPanel.css';
 
 interface SidebarRow {
@@ -28,17 +30,18 @@ interface SidebarRow {
   lastMinuteClose?: number | null;
   lastTradePrice?: number | null;
   liveTickAt?: number | null;
-  isPositive: boolean;
+  isPositive?: boolean;
   changePercent?: number;
-  unrealizedPlPercent?: number;
+  unrealizedPlPercent?: number | null;
   watchlist_item_id?: string;
-  user_portfolio_id?: string;
-  earlyTradingChangePercent?: number | null;
-  lateTradingChangePercent?: number | null;
-  early_trading_change_percent?: number | null;
-  late_trading_change_percent?: number | null;
-  [key: string]: unknown;
+  user_portfolio_id?: string | number;
+  places?: number;
+  session?: ExtendedSessionFields;
+  /** The symbol's latest socket print, which stands in for its extended-hours price. */
+  livePrice?: number | null;
 }
+
+type SidebarKind = 'watchlist' | 'portfolio';
 
 interface DeleteConfirmState {
   open: boolean;
@@ -103,24 +106,28 @@ function MarketSidebarPanel({ activeSymbol, onSymbolClick, marketStatus }: Marke
   }, [deleteConfirm.onConfirm]);
 
   // DALTON-HOOK(extended-hours-quotes): Round sidebar prices and percentages with shared roundQuote2 / formatSignedPct2.
-  const formatPrice = (price: number | null | undefined): string => {
-    if (price == null || price === 0) return '--';
+  const formatPrice = (price: number | null | undefined, places?: number): string => {
+    if (price == null || price === 0) return DASH;
+    if (places && places > 2) {
+      return formatMoney(Number(price), null, locale, { upTo: places });
+    }
     return grouped2(roundQuote2(Number(price)), locale);
   };
 
   const formatChange = (val: number | null | undefined): string => {
-    if (val == null) return '--';
+    if (val == null) return DASH;
     return formatSignedPct2(val, locale);
   };
 
-  const changeClass = (isPositive: boolean, val: number | null | undefined): string => {
+  const changeClass = (val: number | null | undefined): string => {
     if (val == null || val === 0) return 'market-sidebar-row-change--neutral';
-    return isPositive ? 'market-sidebar-row-change--positive' : 'market-sidebar-row-change--negative';
+    return val > 0 ? 'market-sidebar-row-change--positive' : 'market-sidebar-row-change--negative';
   };
 
-  const renderRows = (items: SidebarRow[], keyField: string, changeField: string, onDelete: (id: string) => void) => {
+  const renderRows = (items: SidebarRow[], kind: SidebarKind, onDelete: (id: string) => void) => {
     return items.map((row) => {
       const isActive = activeSymbol && row.symbol === activeSymbol.toUpperCase();
+      const id = String(kind === 'watchlist' ? row.watchlist_item_id : row.user_portfolio_id);
       // DALTON-HOOK(extended-hours-quotes): Derive main quote and extended-hours figures from shared deriveQuoteDisplay.
       const wsTick = wsPrices.get(row.symbol) ?? null;
       const quoteDisplay = deriveQuoteDisplay(
@@ -129,43 +136,39 @@ function MarketSidebarPanel({ activeSymbol, onSymbolClick, marketStatus }: Marke
         wsTick,
       );
       const extType = quoteDisplay.session === 'regular' ? null : quoteDisplay.session;
-      const mainPrice = quoteDisplay.mainPrice;
-      const isWatchlistRow = changeField === 'changePercent';
+      const isWatchlistRow = kind === 'watchlist';
+      const mainPrice = isWatchlistRow || extType ? quoteDisplay.mainPrice : row.price;
       const displayChangePct = isWatchlistRow
         ? quoteDisplay.mainChangePct
-        : (row[changeField] as number | null | undefined);
-      const displayIsPositive =
-        isWatchlistRow && extType
-          ? (quoteDisplay.mainChange != null
-              ? quoteDisplay.mainChange >= 0
-              : displayChangePct != null
-                ? displayChangePct >= 0
-                : row.isPositive)
-          : row.isPositive;
+        : row.unrealizedPlPercent;
+      const changeColorVal =
+        isWatchlistRow && extType && quoteDisplay.mainChange != null
+          ? quoteDisplay.mainChange
+          : displayChangePct;
       const extDisplayPrice = quoteDisplay.extPrice;
       const extPct = quoteDisplay.extChangePct;
       return (
         <div
-          key={row[keyField] as string}
+          key={id}
           className={`market-sidebar-row${isActive ? ' market-sidebar-row--active' : ''}`}
           onClick={() => onSymbolClick?.(row.symbol)}
         >
           <span className="market-sidebar-row-symbol">{row.symbol}</span>
           {/* DALTON-HOOK(extended-hours-quotes): Render mainPrice, regular changePercent, and extDisplayPrice. */}
-          <span className="market-sidebar-row-price">{formatPrice(mainPrice)}</span>
-          <span className={`market-sidebar-row-change ${changeClass(displayIsPositive, displayChangePct)}`}>
+          <span className="market-sidebar-row-price">{formatPrice(mainPrice, row.places)}</span>
+          <span className={`market-sidebar-row-change ${changeClass(changeColorVal)}`}>
             {formatChange(displayChangePct)}
             {extType && extDisplayPrice != null && extPct != null && (
               <span className="market-sidebar-row-ext" style={{ display: 'inline-flex', alignItems: 'center', gap: 2, color: extType === 'pre' ? 'var(--color-ext-pre)' : 'var(--color-ext-post)' }}>
                 {extType === 'pre' ? <Sunrise size={10} /> : <Sunset size={10} />}
-                {formatPrice(extDisplayPrice)} {formatSignedPct2(extPct, locale)}
+                {formatPrice(extDisplayPrice, row.places)} {formatSignedPct2(extPct, locale)}
               </span>
             )}
           </span>
           <span className="market-sidebar-row-actions">
             <button
               className="market-sidebar-row-delete"
-              onClick={(e: React.MouseEvent) => { e.stopPropagation(); onDelete(row[keyField] as string); }}
+              onClick={(e: React.MouseEvent) => { e.stopPropagation(); onDelete(id); }}
               title={t('marketView.sidebar.remove')}
             >
               <X size={12} />
@@ -199,17 +202,18 @@ function MarketSidebarPanel({ activeSymbol, onSymbolClick, marketStatus }: Marke
         return {
           ...row,
           price: ws.price,
+          livePrice: ws.price,
           change: ws.change,
           changePercent: ws.changePercent ?? row.changePercent,
-          isPositive: ws.change >= 0,
+          isPositive: (ws.change ?? 0) >= 0,
           liveTickAt: ws.timestamp ?? row.liveTickAt ?? null,
         };
       }
-      // Portfolio: only overlay price and direction — preserve unrealizedPlPercent
+      // Portfolio: only overlay the price; the row's color stays its unrealized P/L.
       return {
         ...row,
         price: ws.price,
-        isPositive: ws.change >= 0,
+        livePrice: ws.price,
         liveTickAt: ws.timestamp ?? row.liveTickAt ?? null,
       };
     });
@@ -314,8 +318,8 @@ function MarketSidebarPanel({ activeSymbol, onSymbolClick, marketStatus }: Marke
               </div>
             )
             : isWatchlist
-              ? renderRows(currentRows as SidebarRow[], 'watchlist_item_id', 'changePercent', watchlist.handleDelete)
-              : renderRows(currentRows as SidebarRow[], 'user_portfolio_id', 'unrealizedPlPercent', handlePortfolioDelete)}
+              ? renderRows(currentRows as SidebarRow[], 'watchlist', watchlist.handleDelete)
+              : renderRows(currentRows as SidebarRow[], 'portfolio', handlePortfolioDelete)}
       </div>
 
       {/* Footer */}

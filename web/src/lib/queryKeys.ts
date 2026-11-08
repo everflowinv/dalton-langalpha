@@ -16,6 +16,9 @@ export const queryKeys = {
     me:          () => [...queryKeys.user.all, 'me'],
     preferences: () => [...queryKeys.user.all, 'preferences'],
     apiKeys:     () => [...queryKeys.user.all, 'api-keys'],
+    // Under the keys: it says whether an Anthropic key is saved, so a key
+    // saved or removed reads it again.
+    claudeCodeCustody: () => [...queryKeys.user.apiKeys(), 'claude-code-custody'],
     // Its own entry, not part of preferences: the server keeps it apart so the
     // agent, which can write preferences, cannot raise it.
     tradingPermission: () => [...queryKeys.user.all, 'trading-permission'],
@@ -32,6 +35,7 @@ export const queryKeys = {
     claudeCode: () => queryKeys.features.of('claude_code_runtime'),
     claudeCodeStatus: () => [...queryKeys.features.claudeCode(), 'status'],
     claudeCodeComputers: () => [...queryKeys.features.claudeCode(), 'computers'],
+    claudeCodeSetup: () => [...queryKeys.features.claudeCode(), 'setup'],
   },
   platform: {
     all:    ['platform'],
@@ -86,6 +90,8 @@ export const queryKeys = {
   fileGrants: {
     all:       ['fileGrants'],
     workspace: (wsId: string) => [...queryKeys.fileGrants.all, wsId],
+    // Apart from `workspace`, so renewing the shared grant mints none of these.
+    own:       (wsId: string, mount: number) => [...queryKeys.fileGrants.all, 'own', wsId, mount],
   },
   // A workspace file's record, its versions and comments. The `artifact_comment`
   // user event and a turn's end read the comments, the record (its `unread` and
@@ -110,6 +116,11 @@ export const queryKeys = {
     // Reads the computer, so it is fetched on demand (crumb, Publish dialog)
     // rather than on every record change.
     status:      (artifactId: string) => [...queryKeys.artifacts.all, 'status', artifactId],
+    leftOut:     (artifactId: string) => [...queryKeys.artifacts.all, 'left-out', artifactId],
+    // The answer under one report of what the page loaded, beneath `status`, so
+    // anything that reads a file's status again reads this too.
+    statusWith:  (artifactId: string, loaded: readonly string[], earlier: readonly string[]) =>
+      [...queryKeys.artifacts.status(artifactId), loaded, earlier],
     // The owner's comment destination setting changes every file's answer.
     allDestinations: ['artifacts', 'destinations'],
     // A bind or unbind changes the answer for every thread beside.

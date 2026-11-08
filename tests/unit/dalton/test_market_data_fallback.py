@@ -228,26 +228,90 @@ async def test_revenue_segments_go_straight_to_fmp():
 
 
 @pytest.mark.asyncio
-async def test_sector_performance_with_target_date_stays_fmp():
-    fmp, yf, source = _sources()
-    fmp.get_sector_performance.return_value = FMP_ROW
+async def test_routed_cn_profile_served_by_fmp_when_tushare_and_yfinance_miss():
+    from src.data_client.fallbacks import Fallback, recording
+    from src.data_client.financial_data_provider import (
+        MarketRoute,
+        RoutedFinancialSource,
+    )
 
-    assert await source.get_sector_performance(target_date="2025-01-15") == FMP_ROW
-    fmp.get_sector_performance.assert_awaited_once_with(target_date="2025-01-15")
-    yf.get_sector_performance.assert_not_awaited()
+    fmp, yf, fallback_source = _sources()
+    tushare = create_autospec(FinancialDataSource, instance=True)
+    tushare.get_company_profile.side_effect = ConnectionError("tushare down")
+    fmp_cn_row = [{"symbol": "600519.SS", "companyName": "Kweichow Moutai"}]
+    fmp.get_company_profile.return_value = fmp_cn_row
 
-    with pytest.raises(ValueError, match="2025-01-15"):
-        await YFinanceFinancialSource().get_sector_performance(target_date="2025-01-15")
+    routed = RoutedFinancialSource(
+        default=fallback_source,
+        by_market={"cn": MarketRoute(tushare, name="tushare")},
+        default_name=fallback_source.default_name,
+    )
+
+    # 1) yfinance raises -> FMP answers -> served_by is "fmp"
+    yf.get_company_profile.side_effect = ValueError("yahoo down")
+    with recording() as taken_err:
+        assert await routed.get_company_profile("600519.SH") == fmp_cn_row
+    assert taken_err == [
+        Fallback(
+            symbol="600519.SH",
+            what="company profile",
+            source="tushare",
+            error="ConnectionError",
+            served_by="fmp",
+        )
+    ]
+    assert fallback_source.default_name == "fmp"
+
+    # 2) yfinance returns [] -> FMP answers -> served_by is "fmp"
+    yf.get_company_profile.side_effect = None
+    yf.get_company_profile.return_value = []
+    with recording() as taken_empty:
+        assert await routed.get_company_profile("600519.SH") == fmp_cn_row
+    assert taken_empty == [
+        Fallback(
+            symbol="600519.SH",
+            what="company profile",
+            source="tushare",
+            error="ConnectionError",
+            served_by="fmp",
+        )
+    ]
+    assert fallback_source.default_name == "fmp"
 
 
 @pytest.mark.asyncio
-async def test_sector_performance_without_target_date_is_yfinance_first():
-    fmp, yf, source = _sources()
-    yf.get_sector_performance.return_value = YF_ROW
+async def test_routed_cn_profile_served_by_yfinance_when_fmp_quota_exhausted():
+    from src.data_client.fallbacks import Fallback, recording
+    from src.data_client.financial_data_provider import (
+        MarketRoute,
+        RoutedFinancialSource,
+    )
 
-    assert await source.get_sector_performance() == YF_ROW
-    fmp.get_sector_performance.assert_not_awaited()
-    yf.get_sector_performance.assert_awaited_once_with(target_date=None)
+    fmp, yf, fallback_source = _sources()
+    tushare = create_autospec(FinancialDataSource, instance=True)
+    tushare.get_company_profile.side_effect = ConnectionError("tushare down")
+    fmp.get_company_profile.side_effect = FmpQuotaExhausted(RESET)
+    yf_cn_row = [{"symbol": "600519.SS", "companyName": "Kweichow Moutai"}]
+    yf.get_company_profile.return_value = yf_cn_row
+
+    routed = RoutedFinancialSource(
+        default=fallback_source,
+        by_market={"cn": MarketRoute(tushare, name="tushare")},
+        default_name="fmp",
+    )
+
+    with recording() as taken:
+        assert await routed.get_company_profile("600519.SH") == yf_cn_row
+    assert taken == [
+        Fallback(
+            symbol="600519.SH",
+            what="company profile",
+            source="tushare",
+            error="ConnectionError",
+            served_by="yfinance",
+        )
+    ]
+    assert fallback_source.default_name == "yfinance"
 
 
 def test_only_fmp_errors_count_as_unavailable():
@@ -460,6 +524,7 @@ async def test_fetch_quote_fx_served_by_yfinance_when_fmp_quota_exhausted(
     expected_yf_symbol: str,
     expected_price: float,
 ):
+    import pandas as pd
     import yfinance as yf_mod
 
     import src.data_client.yfinance.yahoo as yf_yahoo
@@ -475,18 +540,32 @@ async def test_fetch_quote_fx_served_by_yfinance_when_fmp_quota_exhausted(
         seen_yf_symbols.append(sym)
         ticker = create_autospec(real_ticker_cls, instance=True)
         if sym == expected_yf_symbol:
+            prev_close = round(expected_price - 0.01, 4)
+            open_p = round(expected_price - 0.005, 4)
+            high_p = round(expected_price + 0.01, 4)
+            low_p = round(expected_price - 0.02, 4)
             ticker.fast_info = {
                 "lastPrice": expected_price,
-                "regularMarketPreviousClose": round(expected_price - 0.01, 4),
-                "open": round(expected_price - 0.005, 4),
-                "dayHigh": round(expected_price + 0.01, 4),
-                "dayLow": round(expected_price - 0.02, 4),
+                "regularMarketPreviousClose": prev_close,
+                "open": open_p,
+                "dayHigh": high_p,
+                "dayLow": low_p,
                 "lastVolume": 0,
             }
-            ticker.history_metadata = {"regularMarketTime": 1761523200}
+            ticker.history_metadata = {
+                "regularMarketPrice": expected_price,
+                "chartPreviousClose": prev_close,
+                "regularMarketTime": 1761523200,
+                "exchangeTimezoneName": "Europe/London",
+            }
+            ticker.history.return_value = pd.DataFrame(
+                [{"Open": open_p, "High": high_p, "Low": low_p, "Close": expected_price, "Volume": 0}],
+                index=[pd.Timestamp("2025-10-27", tz="UTC")],
+            )
         else:
             ticker.fast_info = {"lastPrice": None}
             ticker.history_metadata = {}
+            ticker.history.return_value = pd.DataFrame()
         return ticker
 
     ticker_factory = create_autospec(real_ticker_cls, side_effect=_build_ticker)
@@ -495,6 +574,8 @@ async def test_fetch_quote_fx_served_by_yfinance_when_fmp_quota_exhausted(
     fmp_source = create_autospec(FMPDataSource, instance=True)
     fmp_source.get_snapshots.side_effect = FmpQuotaExhausted(RESET)
 
+    import src.server.services.cache.quote_cache_service as quote_cache_mod
+
     provider = MarketDataProvider(
         entries=[
             ProviderEntry(name="yfinance", source=YFinanceDataSource(), markets={"all"}),
@@ -502,14 +583,14 @@ async def test_fetch_quote_fx_served_by_yfinance_when_fmp_quota_exhausted(
         ]
     )
     monkeypatch.setattr(
-        quotes_mod,
+        quote_cache_mod,
         "get_market_data_provider",
-        create_autospec(quotes_mod.get_market_data_provider, return_value=provider),
+        create_autospec(quote_cache_mod.get_market_data_provider, return_value=provider),
     )
     monkeypatch.setattr(
-        quotes_mod,
+        quote_cache_mod,
         "fill_quote_names",
-        create_autospec(quotes_mod.fill_quote_names, return_value=None),
+        create_autospec(quote_cache_mod.fill_quote_names, return_value=None),
     )
 
     content, artifact = await quotes_mod.fetch_quote([input_symbol])

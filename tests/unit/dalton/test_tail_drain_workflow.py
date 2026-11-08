@@ -21,6 +21,7 @@ bill's settle wait, and the kill-path archive wait.
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -28,30 +29,32 @@ from unittest.mock import create_autospec, patch
 
 import pytest
 
+from ptc_agent.agent.middleware.background_subagent import (
+    run_executor,
+    subagent as subagent_mod,
+    tail_drain,
+)
 from src.config.models import WorkflowOrchestrationConfig
+from src.dalton.subagent_slots import SubagentSlotLease
 from src.ptc_agent.agent.middleware.background_subagent.registry import (
     BackgroundTaskRegistry,
 )
 from src.ptc_agent.agent.middleware.background_subagent.task import BackgroundTask
-from src.server.database.runs import subagent_runs as sr_db
 from src.server.services import background_registry_store
 from src.server.services.runs import coordinator, executor, subagent_collection
 from src.server.services.writer_guard import GuardSessionLost, WriterGuard
+from src.utils.tracking.per_call_token_tracker import PerCallTokenTracker
 
 
 class _FakeRegistry:
     """The REAL BackgroundTaskRegistry holding real BackgroundTasks with hung
-    writers, under fixed task ids so the ledger rows can name them.
-
-    Production 10-30: the first version of this double tagged ``task_id``
-    onto the asyncio handles it returned, so the deadline's lookup passed
-    here while the real registry's bare handles carry no task_id and every
-    workflow fell back to the flat 1800s. Real objects keep that honest.
+    writers, under fixed task ids so the drain can inspect their clocks.
     """
 
-    def __init__(self, *task_ids: str):
+    def __init__(self, *task_ids: str, stop_at: float | None = None):
         self._registry = BackgroundTaskRegistry("t-1")
         self._handles = []
+        self.tasks: dict[str, BackgroundTask] = {}
         for task_id in task_ids:
             handle = asyncio.get_running_loop().create_task(asyncio.Event().wait())
             self._handles.append(handle)
@@ -62,12 +65,17 @@ class _FakeRegistry:
                 prompt="",
                 subagent_type="workflow",
                 asyncio_task=handle,
+                stop_at=stop_at,
             )
+            self.tasks[task_id] = task
             self._registry._tasks[task.tool_call_id] = task
             self._registry._task_id_to_tool_call_id[task_id] = task.tool_call_id
 
-    async def live_writers_where(self, pred):
-        return await self._registry.live_writers_where(pred)
+    async def live_writers_by_task(self, pred):
+        return await self._registry.live_writers_by_task(pred)
+
+    async def time_out_writers_where(self, pred):
+        return await self._registry.time_out_writers_where(pred)
 
     def settle(self):
         for handle in self._handles:
@@ -165,19 +173,19 @@ class _Settings:
 @pytest.mark.asyncio
 async def test_a_live_workflow_writer_gets_its_own_run_timeout_window(monkeypatch):
     """The drain's first wait carries the workflow's OWN window — its
-    run_timeout counted from its start plus the settle margin — not the
+    run_timeout (via task.stop_at) plus TAIL_DRAIN_SLACK_S — not the
     ordinary tail allowance (floored at child_timeout 1s here, the patched
     0.05s constant below it) and not the main turn's global workflow_timeout
-    (0.05s; the round-1 global-max shape would wait only 0.05s)."""
+    (0.05s)."""
     monkeypatch.setattr(subagent_collection, "SUBAGENT_TAIL_TIMEOUT", 0.05)
-    monkeypatch.setattr(executor.LocalRunExecutor, "_WORKFLOW_SETTLE_MARGIN_S", 0.05)
+    monkeypatch.setattr(tail_drain, "TAIL_DRAIN_SLACK_S", 0.05)
     captured: dict = {}
 
     async def _capture_wait(futures, timeout=None):
         captured["timeout"] = timeout
         raise _Probe
 
-    store = _RegistryStore(_FakeRegistry("wf-1"))
+    store = _RegistryStore(_FakeRegistry("wf-1", stop_at=time.time() + 2.0))
     guard = SimpleNamespace(
         run_id="run-1",
         owns_task_ns=lambda task_id: True,
@@ -186,86 +194,64 @@ async def test_a_live_workflow_writer_gets_its_own_run_timeout_window(monkeypatc
     with (
         _drain_patches(store),
         patch("asyncio.wait", _capture_wait),
-        patch.object(
-            sr_db,
-            "list_open_workflow_runs_for_thread",
-            create_autospec(
-                sr_db.list_open_workflow_runs_for_thread,
-                return_value=[_workflow_row("wf-1", started=datetime.now(tz=UTC))],
-            ),
-        ),
         _Settings(run_timeout=2, global_timeout=0.05, child_timeout=1),
     ):
         with pytest.raises(_Probe):
             await ex._drain_run_subagent_writers("t-1", "run-1", guard)
 
-    # ≈ run_timeout 2 + margin 0.05; the flat allowance would give 1.0
+    # ≈ run_timeout 2 + slack 0.05; the flat allowance would give 1.0
     assert captured["timeout"] > 1.6
     store._registry.settle()
 
 
 @pytest.mark.asyncio
 async def test_nonworkflow_writers_keep_the_flat_tail_allowance(monkeypatch):
-    """No live root workflow: the drain waits the ordinary tail allowance —
-    max(SUBAGENT_TAIL_TIMEOUT, child_timeout), here 1.0s with the constant
-    patched to 0.05 below child_timeout — and nothing more: the global
-    workflow_timeout (5s) must not stretch a wait for ordinary writers
-    (round-1's global-max shape waited it out)."""
+    """A writer with its own 1.0s stop_at clock waits its own window plus
+    slack — not the global workflow_timeout (5s)."""
     monkeypatch.setattr(subagent_collection, "SUBAGENT_TAIL_TIMEOUT", 0.05)
-    monkeypatch.setattr(executor.LocalRunExecutor, "_WORKFLOW_SETTLE_MARGIN_S", 0.05)
+    monkeypatch.setattr(tail_drain, "TAIL_DRAIN_SLACK_S", 0.05)
     captured: dict = {}
 
     async def _capture_wait(futures, timeout=None):
         captured["timeout"] = timeout
         raise _Probe
 
-    store = _RegistryStore(_FakeRegistry("plain-1"))
+    store = _RegistryStore(_FakeRegistry("plain-1", stop_at=time.time() + 1.0))
     guard = SimpleNamespace(
         run_id="run-1",
         owns_task_ns=lambda task_id: True,
     )
     ex = executor.LocalRunExecutor()
-    # A workflow CHILD row (no parent run) is an ordinary writer here: it
-    # answers to child_timeout, not run_timeout.
     with (
         _drain_patches(store),
         patch("asyncio.wait", _capture_wait),
-        patch.object(
-            sr_db,
-            "list_open_workflow_runs_for_thread",
-            create_autospec(
-                sr_db.list_open_workflow_runs_for_thread,
-                return_value=[
-                    _workflow_row("plain-1", started=datetime.now(tz=UTC),
-                                  parent_run_id=None)
-                ],
-            ),
-        ),
         _Settings(run_timeout=2, global_timeout=5.0, child_timeout=1),
     ):
         with pytest.raises(_Probe):
             await ex._drain_run_subagent_writers("t-1", "run-1", guard)
 
-    # The child_timeout side of the max (1.0), not the global 5s
-    assert 0.9 < captured["timeout"] <= 1.05
+    # The writer's own 1.0s clock (+ 0.05 slack), not the global 5s
+    assert 0.9 < captured["timeout"] <= 1.06
     store._registry.settle()
 
 
 @pytest.mark.asyncio
-async def test_ordinary_tail_writer_waits_the_child_timeout_when_longer():
+async def test_ordinary_tail_writer_waits_the_child_timeout_when_longer(monkeypatch):
     """Production 11-02 (DASH Task-IbtxIg): a plain background Task that
     outlived its turn was drained on the flat 1800s and fenced out as
-    worker_lost 30 minutes in. Its allowance is now
-    max(SUBAGENT_TAIL_TIMEOUT, child_timeout) counted from the drain's
-    start — here child_timeout 5400s (the Dalton overlay) against the
-    untouched 1800s constant."""
+    worker_lost 30 minutes in. Under drain_tail_writers, a writer with a
+    5400s clock gets the full 5400s window before overdue, and
+    subagent_collection.subagent_tail_timeout() is
+    max(SUBAGENT_TAIL_TIMEOUT, child_timeout) = 5400s."""
+    monkeypatch.setattr(tail_drain, "TAIL_DRAIN_SLACK_S", 0.0)
+    monkeypatch.setattr(tail_drain, "SETTLED_UNWIND_S", 10000.0)
     captured: dict = {}
 
     async def _capture_wait(futures, timeout=None):
         captured["timeout"] = timeout
         raise _Probe
 
-    store = _RegistryStore(_FakeRegistry("plain-1"))
+    store = _RegistryStore(_FakeRegistry("plain-1", stop_at=time.time() + 5400.0))
     guard = SimpleNamespace(
         run_id="run-1",
         owns_task_ns=lambda task_id: True,
@@ -275,16 +261,9 @@ async def test_ordinary_tail_writer_waits_the_child_timeout_when_longer():
         with (
             _drain_patches(store),
             patch("asyncio.wait", _capture_wait),
-            patch.object(
-                sr_db,
-                "list_open_workflow_runs_for_thread",
-                create_autospec(
-                    sr_db.list_open_workflow_runs_for_thread,
-                    return_value=[],
-                ),
-            ),
-            _Settings(run_timeout=16200, global_timeout=1.0, child_timeout=5400),
+            _Settings(run_timeout=16200, global_timeout=5400.0, child_timeout=5400),
         ):
+            assert subagent_collection.subagent_tail_timeout() == 5400.0
             with pytest.raises(_Probe):
                 await ex._drain_run_subagent_writers("t-1", "run-1", guard)
 
@@ -294,16 +273,17 @@ async def test_ordinary_tail_writer_waits_the_child_timeout_when_longer():
 
 
 @pytest.mark.asyncio
-async def test_ordinary_tail_writer_at_the_upstream_default_keeps_1800s():
+async def test_ordinary_tail_writer_at_the_upstream_default_keeps_1800s(monkeypatch):
     """Upstream default (child_timeout 1800s): the ordinary allowance stays
     at the flat 1800s — the max can raise the ceiling but never lower it."""
+    monkeypatch.setattr(tail_drain, "TAIL_DRAIN_SLACK_S", 0.0)
     captured: dict = {}
 
     async def _capture_wait(futures, timeout=None):
         captured["timeout"] = timeout
         raise _Probe
 
-    store = _RegistryStore(_FakeRegistry("plain-1"))
+    store = _RegistryStore(_FakeRegistry("plain-1", stop_at=time.time() + 1800.0))
     guard = SimpleNamespace(
         run_id="run-1",
         owns_task_ns=lambda task_id: True,
@@ -313,16 +293,9 @@ async def test_ordinary_tail_writer_at_the_upstream_default_keeps_1800s():
         with (
             _drain_patches(store),
             patch("asyncio.wait", _capture_wait),
-            patch.object(
-                sr_db,
-                "list_open_workflow_runs_for_thread",
-                create_autospec(
-                    sr_db.list_open_workflow_runs_for_thread,
-                    return_value=[],
-                ),
-            ),
-            _Settings(run_timeout=3600, global_timeout=1.0, child_timeout=1800),
+            _Settings(run_timeout=3600, global_timeout=1800.0, child_timeout=1800),
         ):
+            assert subagent_collection.subagent_tail_timeout() == 1800.0
             with pytest.raises(_Probe):
                 await ex._drain_run_subagent_writers("t-1", "run-1", guard)
 
@@ -424,86 +397,326 @@ async def test_archive_waits_the_child_timeout_sized_allowance():
 
 @pytest.mark.asyncio
 async def test_a_writer_past_its_own_deadline_discards_naming_the_basis(monkeypatch):
-    """Fail-closed kept: a workflow writer past its own run_timeout window
-    still raises, and the error names the deadline it actually used — the
-    workflow's own run_timeout — not a fixed 1800s."""
-    monkeypatch.setattr(subagent_collection, "SUBAGENT_TAIL_TIMEOUT", 0.02)
-    monkeypatch.setattr(executor.LocalRunExecutor, "_WORKFLOW_SETTLE_MARGIN_S", 0.01)
-    store = _RegistryStore(_FakeRegistry("wf-hung"))
+    """Fail-closed kept: a workflow writer past its own stop_at deadline that
+    refuses to unwind when stopped raises TimeoutError naming run_id."""
+    monkeypatch.setattr(tail_drain, "TAIL_DRAIN_SLACK_S", 0.01)
+    monkeypatch.setattr(tail_drain, "CANCEL_UNWIND_TIMEOUT", 0.02)
+    monkeypatch.setattr(tail_drain, "SUBAGENT_CLOSE_TIMEOUT_S", 0.0)
+
+    async def _stubborn() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(5)
+
+    fake_reg = _FakeRegistry("wf-hung", stop_at=time.time() - 10.0)
+    fake_reg.settle()
+    stubborn_handle = asyncio.create_task(_stubborn())
+    fake_reg._handles = [stubborn_handle]
+    fake_reg.tasks["wf-hung"].asyncio_task = stubborn_handle
+    await asyncio.sleep(0)
+
+    store = _RegistryStore(fake_reg)
     guard = SimpleNamespace(
         run_id="run-1",
         owns_task_ns=lambda task_id: True,
     )
     ex = executor.LocalRunExecutor()
-    started_long_ago = datetime.now(tz=UTC) - timedelta(seconds=10)
     try:
         with (
             _drain_patches(store),
-            patch.object(
-                sr_db,
-                "list_open_workflow_runs_for_thread",
-                create_autospec(
-                    sr_db.list_open_workflow_runs_for_thread,
-                    return_value=[
-                        _workflow_row("wf-hung", started=started_long_ago)
-                    ],
-                ),
-            ),
             _Settings(run_timeout=2, global_timeout=2, child_timeout=1),
         ):
-            drained = asyncio.create_task(
-                ex._drain_run_subagent_writers("t-1", "run-1", guard)
-            )
-            try:
-                await asyncio.wait_for(drained, timeout=5.0)
-            except asyncio.TimeoutError as exc:
-                assert "run_timeout" in str(exc)
-                assert "1800" not in str(exc)
+            with pytest.raises(TimeoutError) as exc_info:
+                await asyncio.wait_for(
+                    ex._drain_run_subagent_writers("t-1", "run-1", guard),
+                    timeout=5.0,
+                )
+            assert "run=run-1" in str(exc_info.value)
+            assert "after a stop" in str(exc_info.value)
     finally:
         store._registry.settle()
 
 
 @pytest.mark.asyncio
 async def test_a_persistently_unreadable_workflow_ledger_fails_closed_at_a_fixed_deadline(monkeypatch):
-    """fix2: when the open-workflow read keeps failing, the fallback
-    deadline is anchored at the DRAIN'S start and never recomputed — each
-    loop re-anchoring on ``now`` would postpone it forever and the session
-    would never fail-closed. Here the read fails every snapshot and the
-    writer is hung: the drain still raises, at the fixed anchor."""
-    monkeypatch.setattr(subagent_collection, "SUBAGENT_TAIL_TIMEOUT", 0.02)
-    monkeypatch.setattr(executor.LocalRunExecutor, "_WORKFLOW_SETTLE_MARGIN_S", 0.01)
-    store = _RegistryStore(_FakeRegistry("hung-1"))
+    """When a writer has no stop_at of its own, drain_tail_writers anchors its
+    fallback deadline at the drain's start (_longest_writer_clock) and never
+    recomputes it on later loop iterations — so a stubborn writer still fails
+    closed at the fixed anchor."""
+    monkeypatch.setattr(tail_drain, "TAIL_DRAIN_SLACK_S", 0.01)
+    monkeypatch.setattr(tail_drain, "CANCEL_UNWIND_TIMEOUT", 0.02)
+    monkeypatch.setattr(tail_drain, "SUBAGENT_CLOSE_TIMEOUT_S", 0.0)
+    monkeypatch.setattr(tail_drain, "_longest_writer_clock", lambda: 0.05)
+
+    async def _stubborn() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(5)
+
+    fake_reg = _FakeRegistry("hung-1", stop_at=None)
+    fake_reg.settle()
+    stubborn_handle = asyncio.create_task(_stubborn())
+    fake_reg._handles = [stubborn_handle]
+    fake_reg.tasks["hung-1"].asyncio_task = stubborn_handle
+    await asyncio.sleep(0)
+
+    store = _RegistryStore(fake_reg)
     guard = SimpleNamespace(
         run_id="run-1",
         owns_task_ns=lambda task_id: True,
     )
     ex = executor.LocalRunExecutor()
-
-    async def _unreadable(thread_id):
-        raise ConnectionError("workflow ledger down")
-
     try:
-        with (
-            _drain_patches(store),
-            patch.object(
-                sr_db,
-                "list_open_workflow_runs_for_thread",
-                create_autospec(
-                    sr_db.list_open_workflow_runs_for_thread,
-                    side_effect=_unreadable,
-                ),
-            ),
-            _Settings(run_timeout=2, global_timeout=1.1, child_timeout=1),
-        ):
-            drained = asyncio.create_task(
-                ex._drain_run_subagent_writers("t-1", "run-1", guard)
-            )
-            try:
-                await asyncio.wait_for(drained, timeout=2.5)
-            except asyncio.TimeoutError as exc:
-                assert "from the drain's start" in str(exc)
+        with _drain_patches(store):
+            with pytest.raises(TimeoutError) as exc_info:
+                await asyncio.wait_for(
+                    ex._drain_run_subagent_writers("t-1", "run-1", guard),
+                    timeout=3.0,
+                )
+            assert "run=run-1" in str(exc_info.value)
     finally:
         store._registry.settle()
+
+
+@pytest.mark.asyncio
+async def test_subagent_stop_at_starts_only_after_slot_acquired(monkeypatch):
+    """DALTON-HOOK(subagent-caps): task.stop_at is None while queued waiting
+    for a concurrency slot and only starts counting from slot acquisition."""
+    registry = BackgroundTaskRegistry("t-slot-stop-at")
+    task = await registry.register(
+        tool_call_id="tc-slot-clock",
+        description="queued child",
+        prompt="work",
+        subagent_type="research",
+    )
+    lease = SubagentSlotLease(
+        thread_id="t-slot-stop-at",
+        task_id=task.task_id,
+        slot_member=f"t-slot-stop-at:{task.task_id}",
+        max_per_thread=1,
+        max_global=1,
+        poll_min_s=0.01,
+        poll_max_s=0.01,
+    )
+    lease.status = "queued"
+    lease.was_queued = True
+    task.slot_lease = lease
+
+    slot_open = False
+    observed_while_queued: list[float | None] = []
+
+    async def _try_acquire(mode: str = "acquire") -> bool:
+        observed_while_queued.append(task.stop_at)
+        if slot_open:
+            lease._mark_acquired(fail_open=False)
+            return True
+        return False
+
+    monkeypatch.setattr(
+        lease,
+        "try_acquire_once",
+        create_autospec(lease.try_acquire_once, side_effect=_try_acquire),
+    )
+
+    class _FakeSubagent:
+        async def astream(self, state, config, **kwargs):
+            yield ("values", {"messages": []})
+
+    run_task = asyncio.create_task(
+        subagent_mod.arun_subagent_streaming(
+            _FakeSubagent(),
+            {"messages": []},
+            {"configurable": {"thread_id": "t-slot-stop-at"}},
+            registry=registry,
+            tool_call_id="tc-slot-clock",
+            time_limit=10.0,
+        )
+    )
+    await asyncio.sleep(0.05)
+    assert observed_while_queued
+    assert all(val is None for val in observed_while_queued)
+    assert task.stop_at is None
+
+    slot_acquired_at = time.time()
+    slot_open = True
+    await asyncio.wait_for(run_task, timeout=2.0)
+
+    assert task.stop_at is not None
+    assert task.stop_at >= slot_acquired_at + 10.0
+    await lease.release()
+
+
+@pytest.mark.asyncio
+async def test_subagent_timed_out_after_slot_queue_marks_timed_out_not_cancelled(
+    monkeypatch,
+):
+    """DALTON-HOOK(subagent-caps): when a subagent is queued for a slot and
+    times out (either via TIME_LIMIT_CANCEL from drain_tail_writers while queued
+    or on its own stop_at clock after acquiring the slot), it settles with
+    timed_out=True (terminal_status='timeout', ledger 'error') rather than
+    cancelled=True (terminal_status='cancelled')."""
+    monkeypatch.setattr("src.config.settings.get_workflow_timeout", lambda: 0.05)
+    monkeypatch.setattr(
+        "src.config.settings.get_workflow_orchestration_config",
+        lambda: SimpleNamespace(run_timeout=0.05),
+    )
+    monkeypatch.setattr(tail_drain, "TAIL_DRAIN_SLACK_S", 0.0)
+    monkeypatch.setattr(tail_drain, "CANCEL_UNWIND_TIMEOUT", 0.2)
+    monkeypatch.setattr(tail_drain, "SUBAGENT_CLOSE_TIMEOUT_S", 0.0)
+
+    class _Ledger:
+        def __init__(self) -> None:
+            self.statuses: list[str] = []
+            self.failures: list[dict | None] = []
+
+        async def finalize_task_run(self, task_run_id, status, **kwargs):
+            self.statuses.append(status)
+            self.failures.append(kwargs.get("failure"))
+            return {"applied": True, "run": {"status": status}}
+
+        async def append_run_end(self, task_run_id, **kwargs):
+            pass
+
+    # Case 1: subagent is still queued in wait_for_slot when drain_tail_writers
+    # fires time_out_writers_where (TIME_LIMIT_CANCEL must not be swallowed by
+    # abort_queued_subagent_on_cancel).
+    registry = BackgroundTaskRegistry("t-queued-timeout")
+    ledger = registry.run_ledger = _Ledger()
+    task = await registry.register(
+        tool_call_id="tc-queued-timeout",
+        description="queued subagent",
+        prompt="work",
+        subagent_type="research",
+    )
+    task.task_run_id = "tr-queued-timeout"
+    lease = SubagentSlotLease(
+        thread_id="t-queued-timeout",
+        task_id=task.task_id,
+        slot_member=f"t-queued-timeout:{task.task_id}",
+        max_per_thread=1,
+        max_global=1,
+        poll_min_s=0.02,
+        poll_max_s=0.02,
+    )
+    lease.status = "queued"
+    lease.was_queued = True
+    task.slot_lease = lease
+
+    async def _never_acquire(mode: str = "acquire") -> bool:
+        return False
+
+    monkeypatch.setattr(
+        lease,
+        "try_acquire_once",
+        create_autospec(lease.try_acquire_once, side_effect=_never_acquire),
+    )
+
+    async def _queued_runner(_request):
+        await lease.wait_for_slot(task, registry=registry)
+        return "unreachable"
+
+    writer = asyncio.create_task(
+        run_executor._run_background_task(
+            task,
+            _queued_runner,
+            None,
+            PerCallTokenTracker(),
+            "Subagent",
+            registry=registry,
+        )
+    )
+    task.asyncio_task = writer
+    await asyncio.sleep(0.01)
+
+    store = _RegistryStore(registry)
+    guard = SimpleNamespace(
+        run_id="run-1",
+        owns_task_ns=lambda task_id: task_id == task.task_id,
+    )
+    ex = executor.LocalRunExecutor()
+    with _drain_patches(store):
+        await ex._drain_run_subagent_writers("t-queued-timeout", "run-1", guard)
+    outcome = task.adopt_writer_outcome(writer)
+
+    assert task.timed_out is True
+    assert task.terminal_status == "timeout"
+    assert task.terminal_status != "cancelled"
+    assert outcome["status"] == "timeout"
+    assert ledger.statuses == ["error"]
+    assert ledger.failures[0]["error_type"] == "SubagentTimeLimitError"
+
+    # Case 2: subagent queues for a slot, acquires it, and then times out on its
+    # own clock after slot acquisition.
+    registry2 = BackgroundTaskRegistry("t-post-queue-timeout")
+    ledger2 = registry2.run_ledger = _Ledger()
+    task2 = await registry2.register(
+        tool_call_id="tc-post-queue-timeout",
+        description="post-queue timeout subagent",
+        prompt="work",
+        subagent_type="research",
+    )
+    task2.task_run_id = "tr-post-queue-timeout"
+    lease2 = SubagentSlotLease(
+        thread_id="t-post-queue-timeout",
+        task_id=task2.task_id,
+        slot_member=f"t-post-queue-timeout:{task2.task_id}",
+        max_per_thread=1,
+        max_global=1,
+        poll_min_s=0.01,
+        poll_max_s=0.01,
+    )
+    lease2.status = "queued"
+    lease2.was_queued = True
+    task2.slot_lease = lease2
+
+    async def _acquire_on_first_poll(mode: str = "acquire") -> bool:
+        lease2._mark_acquired(fail_open=False)
+        return True
+
+    monkeypatch.setattr(
+        lease2,
+        "try_acquire_once",
+        create_autospec(lease2.try_acquire_once, side_effect=_acquire_on_first_poll),
+    )
+    monkeypatch.setattr(subagent_mod, "SUBAGENT_STOP_GRACE_S", 0.0)
+
+    class _HangingSubagent:
+        async def astream(self, state, config, **kwargs):
+            await asyncio.Event().wait()
+            yield ("values", {"messages": []})
+
+    async def _post_queue_runner(_request):
+        return await subagent_mod.arun_subagent_streaming(
+            _HangingSubagent(),
+            {"messages": []},
+            {"configurable": {"thread_id": "t-post-queue-timeout"}},
+            registry=registry2,
+            tool_call_id="tc-post-queue-timeout",
+            time_limit=0.03,
+        )
+
+    writer2 = asyncio.create_task(
+        run_executor._run_background_task(
+            task2,
+            _post_queue_runner,
+            None,
+            PerCallTokenTracker(),
+            "Subagent",
+            registry=registry2,
+        )
+    )
+    task2.asyncio_task = writer2
+    await asyncio.wait_for(writer2, timeout=2.0)
+    outcome2 = task2.adopt_writer_outcome(writer2)
+
+    assert task2.timed_out is True
+    assert task2.terminal_status == "timeout"
+    assert task2.terminal_status != "cancelled"
+    assert outcome2["status"] == "timeout"
+    assert ledger2.statuses == ["error"]
+    assert ledger2.failures[0]["error_type"] == "SubagentTimeLimitError"
 
 
 # ---------------------------------------------------------------------------

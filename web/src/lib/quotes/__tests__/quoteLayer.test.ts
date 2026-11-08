@@ -17,7 +17,7 @@ import { getSnapshotStocks, getSnapshotIndexes } from '@/lib/quotes/snapshotApi'
 import { getQuoteBatcher, QuoteBatcher } from '../quoteBatcher';
 import { snapshotToStockPrice } from '../quoteAdapters';
 import { writeQuoteFromWs } from '../quoteWriteThrough';
-import { deriveQuoteDisplay } from '@/lib/dalton/quotes/deriveQuoteDisplay'; // DALTON-HOOK(extended-hours-quotes)
+import { deriveQuoteDisplay, roundQuote2 } from '@/lib/dalton/quotes/deriveQuoteDisplay'; // DALTON-HOOK(extended-hours-quotes)
 
 const mockGetSnapshotStocks = getSnapshotStocks as Mock;
 const mockGetSnapshotIndexes = getSnapshotIndexes as Mock;
@@ -153,25 +153,29 @@ describe('writeQuoteFromWs', () => {
 });
 
 describe('snapshotToStockPrice', () => {
-  it('rounds and maps an available quote', () => {
-    expect(
-      snapshotToStockPrice('AAPL', {
-        symbol: 'AAPL', price: 100.456, change: -1.234, change_percent: -1.216,
-        previous_close: 101.69,
-      }),
-    ).toMatchObject({
+  it('maps an available quote at the precision it was quoted', () => {
+    const adapted = snapshotToStockPrice('AAPL', {
+      symbol: 'AAPL', price: 100.456, change: -1.234, change_percent: -1.216,
+      previous_close: 101.69,
+    });
+    expect(adapted).toMatchObject({
       symbol: 'AAPL',
-      price: 100.46,
+      price: 100.456,
       // DALTON-HOOK(extended-hours-quotes): Adapter preserves raw change and changePercent precision for display-time rounding.
       change: -1.234,
       changePercent: -1.216,
       isPositive: false,
       quoteAvailable: true,
       previousClose: 101.69,
+      session: { previousClose: 101.69 },
     });
+    expect(roundQuote2(adapted.price)).toBe(100.46);
   });
 
-  it('keeps a CN fund price at its 3-decimal tick and a stock at cents', () => {
+  it('keeps a sub-cent tick and a CN fund price unrounded', () => {
+    expect(
+      snapshotToStockPrice('XXII', { symbol: 'XXII', price: 0.0483, change: -0.0258 }),
+    ).toMatchObject({ price: 0.0483, change: -0.0258 });
     expect(
       snapshotToStockPrice('510300.SH', {
         symbol: '510300.SH', price: 3.912, change: 0.0123, asset_class: 'fund', currency: 'CNY',
@@ -187,7 +191,7 @@ describe('snapshotToStockPrice', () => {
   it('marks a missing quote unavailable with zeroed display fields', () => {
     expect(snapshotToStockPrice('MSFT', null)).toEqual({
       symbol: 'MSFT', price: 0, change: 0, changePercent: 0,
-      isPositive: true, quoteAvailable: false,
+      isPositive: true, quoteAvailable: false, places: 2,
     });
   });
 

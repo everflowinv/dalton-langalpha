@@ -348,6 +348,29 @@ class MarketWatchConfig(BaseModel):
     )
 
 
+class ClaudeCodeConfig(BaseModel):
+    """Claude Code on cloud computers (the runtime's own switch is the
+    ``claude_code_runtime`` feature). With ``sandbox_placement`` the CLI of a
+    turn on a cloud computer runs inside that computer's own sandbox, and only
+    on Medium computers or larger (``hosted.SANDBOX_MIN_TIER``)."""
+
+    hosted_api_key: bool = Field(
+        default=False,
+        description="Run Claude Code turns on cloud computers on the user's own Anthropic API key",
+    )
+    stored_custody: bool = Field(
+        default=False,
+        description="Run Claude Code turns on cloud computers on a setup token the user lets the server store",
+    )
+    sandbox_placement: bool = Field(
+        default=False,
+        description="Run a cloud computer's Claude Code CLI inside the computer's own sandbox, not in the worker",
+    )
+    hosted_turns_per_user: int = Field(
+        default=3, ge=1, description="Claude Code turns one user runs at once on cloud computers"
+    )
+
+
 class WorkflowOrchestrationConfig(BaseModel):
     """Caps and timeouts for RunWorkflow programmatic subagent runs."""
 
@@ -511,7 +534,12 @@ class InfrastructureConfig(BaseModel):
         default=False, description="Fetch the built-in brokerages' logos on startup"
     )
     langsmith_tracing: bool = Field(default=False, description="Enable LangSmith tracing")
+    langsmith_full_payloads: bool = Field(
+        default=False,
+        description="Trace middleware inputs and graph nodes' messages to LangSmith",
+    )
     market_watch: MarketWatchConfig = Field(default_factory=MarketWatchConfig)
+    claude_code: ClaudeCodeConfig = Field(default_factory=ClaudeCodeConfig)
 
     # User-facing product features (deployment overrides of the code catalog
     # in src/config/features.py). Distinct from the infra toggles above, which

@@ -81,12 +81,23 @@ export interface ClaudeCodeComputer {
   expires_at: string | null;
 }
 
+/** The user's own computers, and each cloud computer of theirs that refuses
+ *  a Claude Code turn whatever the credential, by computer id, with the
+ *  reason (`needs_bigger_computer`: below the size Claude Code runs at). */
+export type ClaudeCodeComputerRefusal = 'needs_bigger_computer';
+
+export interface ClaudeCodeComputers {
+  computers: ClaudeCodeComputer[];
+  /** Absent from a server that predates it. */
+  cloud_refusals?: Record<string, ClaudeCodeComputerRefusal>;
+}
+
 /** A server from before per-computer tokens has no such route, and runs
  *  Claude Code on none of the user's computers. */
-export async function getClaudeCodeComputers(): Promise<{ computers: ClaudeCodeComputer[] }> {
+export async function getClaudeCodeComputers(): Promise<ClaudeCodeComputers> {
   try {
     const { data } = await api.get('/api/v1/claude-code/computers');
-    return data as { computers: ClaudeCodeComputer[] };
+    return data as ClaudeCodeComputers;
   } catch (err) {
     if (apiErrorStatus(err) === 404) return { computers: [] };
     throw err;
@@ -116,9 +127,95 @@ export async function removeClaudeCodeComputerToken(computerId: string): Promise
   await api.delete(`${computerPath(computerId)}/token`);
 }
 
+/** Where the user's Claude Code stands as a whole, the first that holds: a
+ *  token works somewhere, one is being checked, one was refused or expired,
+ *  somewhere runs it once a token is added, an own computer is out of reach,
+ *  every own computer has something that stops it, or nothing the user has
+ *  runs it. */
+export type ClaudeCodeSetupState = 'connected' | 'checking' | 'refused' | 'not_connected' | 'offline' | 'unsupported' | 'no_computer';
+
+/** `GET /api/v1/claude-code/setup`, read whether the user turned Claude Code
+ *  on (`on`) or not. Until they do, an own computer reads `off` where it is
+ *  reachable and `offline` where it is not. */
+export interface ClaudeCodeSetup {
+  state: ClaudeCodeSetupState;
+  on: boolean;
+  computers: ClaudeCodeComputer[];
+  /** This server runs turns on a setup token added in Settings, so one can
+   *  be added there whatever the user's computers. */
+  saved_token_runs: boolean;
+  /** This server runs Claude Code for workspaces on cloud computers too. */
+  cloud: boolean;
+  /** A turn on a cloud computer runs Claude Code inside that computer, not
+   *  on this server. Absent from a server that predates it. */
+  cli_in_sandbox?: boolean;
+  /** The user's cloud computers too small for Claude Code, in their order.
+   *  Absent from a server that predates it. */
+  too_small?: { computer_id: string; name: string }[];
+}
+
+/** Null where this server offers no Claude Code (404), or one from before
+ *  this route, which shows none. */
+export async function getClaudeCodeSetup(): Promise<ClaudeCodeSetup | null> {
+  try {
+    const { data } = await api.get('/api/v1/claude-code/setup');
+    return data as ClaudeCodeSetup;
+  } catch (err) {
+    if (apiErrorStatus(err) === 404) return null;
+    throw err;
+  }
+}
+
 export async function getClaudeCodeStatus(): Promise<ClaudeCodeStatus> {
   const { data } = await api.get('/api/v1/claude-code/status');
   return data as ClaudeCodeStatus;
+}
+
+/** Whether Claude Code runs for the user on cloud computers: it runs only on
+ *  their own computers (`local`), or on cloud computers too, with their
+ *  Anthropic API key (`api_key`) or on the setup token they let the server
+ *  store (`stored`). */
+export type ClaudeCodeCustodyMode = 'local' | 'api_key' | 'stored';
+
+/** `GET /api/v1/claude-code/custody`, and the answer to a choice made. */
+export interface ClaudeCodeCustody {
+  mode: ClaudeCodeCustodyMode;
+  /** An Anthropic API key is saved under Model access, the one `api_key` runs on. */
+  api_key_saved: boolean;
+  /** What the server lets the user choose now. A mode chosen before its
+   *  switch went off is kept, and paused. */
+  offered: Exclude<ClaudeCodeCustodyMode, 'local'>[];
+  /** An operator turned storing a token off for this user: `stored` is never
+   *  offered, and the mode is `local`. */
+  blocked: boolean;
+  /** The server's verdict for a turn on a cloud computer: what it runs on,
+   *  else the reason it is refused for (a `claude_code_off` refusal reason). */
+  runs_on: 'api_key' | 'stored_token' | null;
+  refusal: string | null;
+  /** The version of the consent text storing a token needs accepted now. */
+  disclosure: string | null;
+}
+
+/** Null where this server offers no choice for cloud computers (404): a
+ *  self-hosted one, or one whose operator runs Claude Code only on the user's
+ *  own computers. */
+export async function getClaudeCodeCustody(): Promise<ClaudeCodeCustody | null> {
+  try {
+    const { data } = await api.get('/api/v1/claude-code/custody');
+    return data as ClaudeCodeCustody;
+  } catch (err) {
+    if (apiErrorStatus(err) === 404) return null;
+    throw err;
+  }
+}
+
+/** A refusal carries the OAuth routes' `error` body (`readOAuthError`): a
+ *  mode not offered now (`unavailable`), storing blocked for the user
+ *  (`stored_blocked`), or `stored` without the current `disclosure`.
+ *  Leaving `stored` deletes the stored token before it answers. */
+export async function setClaudeCodeCustody(mode: ClaudeCodeCustodyMode, disclosure?: string): Promise<ClaudeCodeCustody> {
+  const { data } = await api.put('/api/v1/claude-code/custody', disclosure ? { mode, disclosure } : { mode });
+  return data as ClaudeCodeCustody;
 }
 
 /** Saves the user's setup token once Anthropic takes it, which one real

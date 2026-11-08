@@ -3,10 +3,12 @@
 import re
 from datetime import datetime, timezone
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 import pytz
 
 from market_protocol import AssetClass, MarketPhase
+from src.tools.market_data.display import zone_label
 from src.tools.market_data.quote_format import (
     block_clock,
     build_live_stamp,
@@ -70,6 +72,15 @@ class TestFormatQuoteLine:
     def test_change_since_prev(self):
         line = format_quote_line(_snap(), prev_price=232.50)
         assert "+0.41% since last check" in line
+
+    def test_a_coin_reads_its_utc_day_and_money_volume(self):
+        # Yahoo and FMP close a coin's day at 00:00 UTC and report its volume
+        # in dollars, not coins; the NYSE session never applies.
+        snap = _snap(symbol="BTC-USD", last_trade_price=76810.3281, change_percent=-0.68,
+                     volume=23_755_311_104)
+        line = format_quote_line(snap, at=_FIXED_ET)
+        assert "BTC-USD  $76,810.3281  -0.68% since 00:00 UTC  vol $23.76B" in line
+        assert "today" not in line and "(post" not in line and "closed" not in line
 
     def test_missing_fields_graceful(self):
         line = format_quote_line({"symbol": "XYZ"})
@@ -145,6 +156,55 @@ class TestCurrencyAndVenueAwareness:
         assert "ET" not in line
         assert "(" not in line
 
+    def test_a_closed_us_row_names_its_session_and_print_time(self):
+        # 01:00 ET Thursday: the row is Wednesday's last after-hours print.
+        at = _ET.localize(datetime(2026, 7, 2, 1, 0))
+        printed = _ET.localize(datetime(2026, 7, 1, 19, 59, 50))
+        line = format_quote_line(_snap(as_of=int(printed.timestamp() * 1000)), at=at)
+        assert "+2.31% on 2026-07-01" in line
+        assert line.endswith("(closed, 2026-07-01 19:59:50 ET)")
+
+    def test_a_thin_name_is_stamped_at_its_last_trade_not_its_last_quote(self):
+        traded = _ET.localize(datetime(2026, 11, 5, 19, 41, 54))
+        quoted = _ET.localize(datetime(2026, 11, 5, 19, 57, 56))
+        snap = _snap(
+            symbol="INMX", market_status="closed", last_trade_price=12.96,
+            last_trade_at=int(traded.timestamp() * 1000), as_of=int(quoted.timestamp() * 1000),
+        )
+        line = format_quote_line(snap, at=_ET.localize(datetime(2026, 11, 5, 21, 0)))
+        assert "19:41:54 ET" in line
+        assert "19:57" not in line
+
+    def test_a_live_row_whose_last_trade_is_old_names_its_trade_time(self):
+        # The quote moves on a live feed, but the price is a trade from hours ago.
+        at = _ET.localize(datetime(2026, 11, 6, 9, 15, 46))
+        traded = _ET.localize(datetime(2026, 11, 6, 4, 4, 20))
+        snap = _snap(
+            symbol="MKL", last_trade_price=1939.86, tier="realtime",
+            last_trade_at=int(traded.timestamp() * 1000), as_of=int(at.timestamp() * 1000),
+        )
+        assert format_quote_line(snap, at=at).endswith("(pre, 2026-11-06 04:04:20 ET)")
+
+    def test_a_live_row_that_just_traded_carries_no_clock(self):
+        at = _ET.localize(datetime(2026, 11, 6, 9, 15, 46))
+        traded = _ET.localize(datetime(2026, 11, 6, 9, 15, 41))
+        snap = _snap(
+            symbol="MKL", last_trade_price=1939.86, tier="realtime",
+            last_trade_at=int(traded.timestamp() * 1000), as_of=int(at.timestamp() * 1000),
+        )
+        assert format_quote_line(snap, at=at).endswith("(pre)")
+
+    def test_a_sub_dollar_price_keeps_four_places(self):
+        assert "$0.3734" in format_quote_line(_snap(last_trade_price=0.3734))
+
+    def test_a_sub_unit_price_in_another_currency_keeps_its_own_places(self):
+        # An A-share ticks in fen: four places would invent precision.
+        line = format_quote_line(_snap(symbol="600000.SH", last_trade_price=0.85))
+        assert "CN¥0.85 " in line
+
+    def test_a_hong_kong_penny_stock_keeps_its_tick(self):
+        assert "HK$0.0370" in format_quote_line(_snap(symbol="1234.HK", last_trade_price=0.037))
+
     def test_unresolvable_symbol_falls_back_to_dollar(self):
         # A symbol the protocol can't resolve degrades to '$' with no suffix and
         # never raises (the formatter sits in tool-output + middleware paths).
@@ -206,7 +266,7 @@ class TestLiveStampIsVenueGated:
             stamp = build_live_stamp([self._cn_snap()], at=self._SHANGHAI_1030)
         assert stamp is not None
         assert "600519.SH" in stamp and "(+1.25%)" in stamp
-        assert "2026-07-01 10:30:00 CST" in stamp
+        assert "2026-07-01 10:30:00 UTC+8" in stamp
         assert "ET" not in stamp
 
     def test_us_only_stamp_is_unchanged(self):
@@ -279,7 +339,7 @@ class TestFreshnessSplitsTheStamp:
             stamp = build_live_stamp(
                 [self._cn_realtime(self._CN_1030)], at=self._CN_1030
             )
-        assert "2026-09-09 10:29:50 CST" in stamp
+        assert "2026-09-09 10:29:50 UTC+8" in stamp
 
     def test_mixed_batch_splits_into_two_groups(self):
         # Both venues are open at 10:30 CST/HKT on their own calendars, so the
@@ -306,7 +366,7 @@ class TestFreshnessSplitsTheStamp:
         three_hours_ago = int(_FIXED_ET.timestamp() * 1000) - 3 * 3600 * 1000
         with patch(f"{_MOD}.get_market_session", return_value=("REGULAR_HOURS", _FIXED_ET)):
             stamp = build_live_stamp([_snap(as_of=three_hours_ago)], at=_FIXED_ET)
-        assert stamp == "[Stale: NVDA $233.45 (+2.31%)]"
+        assert stamp == "[Stale: NVDA $233.45 (+2.31%) @ 2026-07-01 11:32:05 ET]"
 
     def test_each_freshness_gets_its_own_group(self):
         ten_minutes_ago = int(_FIXED_ET.timestamp() * 1000) - 10 * 60 * 1000
@@ -316,7 +376,7 @@ class TestFreshnessSplitsTheStamp:
                 at=_FIXED_ET,
             )
         assert stamp.split("\n") == [
-            "[Delayed 15m: NVDA $233.45 (+2.31%)]",
+            "[Delayed 15m: NVDA $233.45 (+2.31%) @ 2026-07-01 14:22:05 ET]",
             "[Freshness unknown: AAPL $233.45 (+2.31%)]",
         ]
 
@@ -324,9 +384,23 @@ class TestFreshnessSplitsTheStamp:
 def test_block_clock_uses_the_clock_its_rows_share():
     at = datetime(2026, 9, 27, 1, 0, tzinfo=timezone.utc)
     assert block_clock([{"symbol": "AAPL"}, {"symbol": "MSFT"}], at) == "2026-09-26 21:00:00 ET"
-    assert block_clock([{"symbol": "600519.SS"}, {"symbol": "000858.SZ"}], at) == "2026-09-27 09:00:00 CST"
+    assert block_clock([{"symbol": "600519.SS"}, {"symbol": "000858.SZ"}], at) == "2026-09-27 09:00:00 UTC+8"
     # Mixed venues: no clock is neutral, so the card falls back to the reader's.
     assert block_clock([{"symbol": "600519.SS"}, {"symbol": "AAPL"}], at) is None
+
+
+def test_a_zone_with_only_a_numeric_abbreviation_prints_its_utc_offset():
+    at = datetime(2026, 9, 27, 1, 0, tzinfo=timezone.utc)
+    assert zone_label(at.astimezone(ZoneInfo("Asia/Singapore"))) == "UTC+8"
+    assert zone_label(at.astimezone(ZoneInfo("America/Sao_Paulo"))) == "UTC-3"
+    assert zone_label(at.astimezone(ZoneInfo("Asia/Hong_Kong"))) == "HKT"
+
+
+def test_an_abbreviation_two_zones_share_prints_its_utc_offset():
+    summer = datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc)
+    assert zone_label(summer.astimezone(ZoneInfo("Asia/Shanghai"))) == "UTC+8"
+    assert zone_label(summer.astimezone(ZoneInfo("Asia/Kolkata"))) == "UTC+5:30"
+    assert zone_label(summer.astimezone(ZoneInfo("Europe/London"))) == "UTC+1"
 
 
 class TestKnownAssetClass:
@@ -405,9 +479,10 @@ class TestExtendedHoursAndPrevCloseWording:
         }
         line = format_quote_line(snap, at=self._PRE_ET)
         assert "GOOG  last close $330.95 -1.62% vs prev close  vol 19.2M" in line
-        assert "10-21" not in line
+        assert "10-21" not in line.split(" (")[0]
         assert "today" not in line
         assert "(pre" in line
+        assert "2026-10-21 16:00:00 ET)" in line
 
     def test_extended_hours_appends_pre_and_post_segments(self):
         # DALTON-HOOK(extended-hours-quotes): Split regular close + regular move from pre-market/after-hours price + move.
@@ -520,7 +595,7 @@ class TestExtendedHoursAndPrevCloseWording:
             "after-hours $333.76 +0.85% vs last close  vol 19.2M"
         ) in line
         assert "today" not in line
-        assert "10-22" not in line
+        assert "10-22" not in line.split(" (")[0]
         assert "@ 17:15 ET" not in line
 
     def test_overnight_and_weekend_use_last_close_not_today(self):
@@ -669,9 +744,9 @@ class TestExtendedHoursAndPrevCloseWording:
         past_midnight_line = format_quote_line(ginlix_past_midnight, at=at_past_midnight)
         assert past_midnight_line == (
             "GOOG  last close $317.28 -1.08% vs prev close $320.76  "
-            "after-hours $318.10 +0.26% vs last close  vol 10.8M (closed)"
+            "after-hours $318.10 +0.26% vs last close  vol 10.8M (closed, 2026-10-24 00:30:00 ET)"
         )
-        assert "10-24" not in past_midnight_line
+        assert "10-24" not in past_midnight_line.split(" (")[0]
         assert "10-23" not in past_midnight_line
 
     def test_prior_day_as_of_without_regular_date_when_venue_open_writes_last_close(self):
@@ -798,7 +873,7 @@ class TestExtendedHoursAndPrevCloseWording:
         }
         closed_line = format_quote_line(goog_closed_regular_only, at=after_close_at)
         assert closed_line == (
-            "GOOG  close 10-23 $317.28 -1.08% vs prev close $320.76  vol 10.8M (closed)"
+            "GOOG  close 10-23 $317.28 -1.08% vs prev close $320.76  vol 10.8M (closed, 2026-10-23 16:00:00 ET)"
         )
 
         # 5) HK stock (港股): preserves existing layout and only appends "vs prev close HK$X".
@@ -818,6 +893,76 @@ class TestExtendedHoursAndPrevCloseWording:
             "0700.HK  HK$318.20  -0.50% today vs prev close HK$319.80  "
             "vol 12.0M (2026-07-02 10:30:00 HKT)"
         )
+
+    def test_price_clock_shown_unless_extended_subblock_rendered(self):
+        # DALTON-HOOK(extended-hours-quotes):
+        # 1) yfinance regular_only snapshot whose trade time is older than QUOTE_LIVE_S
+        #    during regular hours still shows its trade clock at the end of the line.
+        reg_at = _ET.localize(datetime(2026, 10, 23, 14, 30, 0))
+        older_trade_ms = int(
+            _ET.localize(datetime(2026, 10, 23, 14, 25, 0)).timestamp() * 1000
+        )
+        yf_reg_only = {
+            "symbol": "GOOG",
+            "price": 317.50,
+            "previous_close": 317.28,
+            "change_percent": 0.0693,
+            "volume": 10_800_000,
+            "as_of": older_trade_ms,
+            "regular_as_of": older_trade_ms,
+            "regular_trading_date": "2026-10-23",
+            "regular_only": True,
+            "tier": "delayed_15m",
+            "source": "yfinance",
+        }
+        yf_line = format_quote_line(yf_reg_only, at=reg_at)
+        assert yf_line.endswith("(delayed 15m, 2026-10-23 14:25:00 ET)")
+
+        # 2) Ginlix pre-market with price=None and early_trading_change_percent only
+        #    (no pre-market sub-block can be built) still shows the trade clock.
+        pre_at = _ET.localize(datetime(2026, 10, 26, 8, 15, 0))
+        pre_trade_ms = int(
+            _ET.localize(datetime(2026, 10, 26, 8, 10, 0)).timestamp() * 1000
+        )
+        ginlix_pre_no_reg_close = {
+            "symbol": "GOOG",
+            "price": None,
+            "last_trade_price": 322.26,
+            "last_trade_at": pre_trade_ms,
+            "early_trading_change_percent": 0.4676,
+            "market_status": "early_trading",
+            "as_of": int(pre_at.timestamp() * 1000),
+            "tier": "realtime",
+            "source": "ginlix-data",
+        }
+        ginlix_pre_line = format_quote_line(ginlix_pre_no_reg_close, at=pre_at)
+        assert "pre-market" not in ginlix_pre_line
+        assert ginlix_pre_line.endswith("(pre, 2026-10-26 08:10:00 ET)")
+
+        # 3) When the extended-hours sub-block with `@ HH:MM ET` IS rendered,
+        #    the trailing suffix does not repeat the trade timestamp.
+        ginlix_pre_with_subblock = {
+            **ginlix_pre_no_reg_close,
+            "price": 320.76,
+            "regular_close": 320.76,
+            "previous_close": 320.76,
+            "regular_trading_change": -3.46,
+            "regular_trading_change_percent": -1.0672,
+            "regular_trading_date": "2026-10-23",
+        }
+        subblock_line = format_quote_line(ginlix_pre_with_subblock, at=pre_at)
+        assert "pre-market $322.26 +0.47% vs last close @ 08:10 ET" in subblock_line
+        assert subblock_line.endswith("(pre)")
+        assert "2026-10-26 08:10:00 ET" not in subblock_line
+
+        # 4) A caller that renders no sub-block (the live stamp header) keeps the
+        #    trade clock even for the same snapshot: the suffix decision belongs
+        #    to the line that printed the `@ HH:MM`, not to price_clock.
+        from src.tools.market_data.quote_format import build_live_stamp
+
+        stamp = build_live_stamp([ginlix_pre_with_subblock], at=pre_at)
+        assert stamp is not None
+        assert "2026-10-26 08:10:00 ET" in stamp
 
 
 # DALTON-HOOK(extended-hours-quotes): a same-day non-US quote whose regular

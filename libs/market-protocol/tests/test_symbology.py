@@ -15,8 +15,10 @@ from market_protocol import (
     index_families,
     is_family_index,
     market_home,
+    market_of,
     parse_instrument_key,
     to_canonical,
+    to_request_spelling,
     to_display,
     to_legacy_api,
     vendor_spelling,
@@ -187,8 +189,8 @@ class TestJunkInput:
     @pytest.mark.parametrize(
         ("spelling", "key"),
         [
-            ("BRK.B", "BRK.B.XXXX"), ("BRK-B", "BRK-B.XNYS"), ("M&M.NS", "M&M.XNSE"),
-            ("ES=F", "ES=F.XNYS"), ("^GSPC", "SPX.INDEX"), ("I:SPX", "SPX.INDEX"),
+            ("BRK.B", "BRK-B.XNYS"), ("BRK-B", "BRK-B.XNYS"), ("M&M.NS", "M&M.XNSE"),
+            ("ES=F", "ES=F.GLBX"), ("^GSPC", "SPX.INDEX"), ("I:SPX", "SPX.INDEX"),
             ("EURUSD=X", "EUR-USD.FX"), ("BTC-USD.CRYPTO", "BTC-USD.CRYPTO"),
             # Surrounding whitespace is trimmed, as a pasted symbol carries it.
             (" aapl\n", "AAPL.XNAS"),
@@ -385,11 +387,28 @@ class TestEquityResolution:
         assert ref.currency == "GBP"
         assert ref.display_unit == "GBX"  # hint only; conversion is per-provider
 
-    def test_unknown_suffix_is_share_class_not_venue(self):
-        ref = to_canonical("BRK.B")
-        assert ref.symbol == "BRK.B"
-        assert ref.mic == "XXXX"
+    @pytest.mark.parametrize(
+        "spelling",
+        ["BRK.B", "BRK-B", "brk.b", "BRK.B.US", "BRK.B.XNYS", "BRK-B.XNYS", "BRK.B.XXXX"],
+    )
+    def test_a_us_class_share_is_one_listing_however_spelled(self, spelling):
+        # The exchange and Massive write BRK.B, FMP and yfinance BRK-B; a key
+        # an older pin minted on the unknown venue names the listing too.
+        ref = to_canonical(spelling)
+        assert ref.instrument_key == "BRK-B.XNYS"
+        assert (to_display(ref), vendor_symbol(ref)) == ("BRK-B", "BRK-B")
+        assert market_of(ref) == "us"
+
+    @pytest.mark.parametrize("spelling", ["SAP.F", "ABC.V", "BRK.D", "NOVO-B.CO", "0700.B"])
+    def test_another_unknown_suffix_stays_on_the_unknown_venue(self, spelling):
+        ref = to_canonical(spelling)
+        assert (ref.symbol, ref.mic) == (spelling, "XXXX")
         assert ref.tz == "America/New_York"
+
+    def test_no_class_suffix_names_a_venue(self):
+        # A class letter that were also a venue suffix would read a foreign
+        # listing (X.B on that venue) as a US class share.
+        assert not symbology._US_CLASS_SUFFIXES & set(symbology._SUFFIX_TO_MIC)
 
     def test_asset_class_hint_beats_index_autodetect(self):
         ref = to_canonical("SPX", asset_class=AssetClass.EQUITY)
@@ -531,7 +550,10 @@ class TestSuffixSpellings:
             ("600519．ｓｓ", "600519.SH", "600519.SS"),
             # A family index keeps its vendor name; that respelling is to_display's.
             ("GSPC", "GSPC", "GSPC"),
-            ("BRK.B", "BRK.B", "BRK.B"),
+            # A US class share takes the dash every vendor but Massive reads.
+            ("BRK.B", "BRK-B", "BRK-B"),
+            ("bf-b", "BF-B", "BF-B"),
+            ("BRK.D", "BRK.D", "BRK.D"),
         ],
     )
     def test_respell(self, raw, display, vendor):
@@ -807,3 +829,69 @@ class TestVenueHelpers:
             "N225", "FTSE", "GDAXI", "FCHI", "STOXX50E",
         }
         assert all(is_family_index(ref) and ref == to_canonical(ref.instrument_key) for ref in refs)
+
+
+class TestBarePairsAndFutures:
+    """Bare pair and futures spellings reach their own venues, under the equity
+    hint the provider chain passes too, so none trades on the NYSE calendar."""
+
+    @pytest.mark.parametrize(
+        ("spelling", "key"),
+        [
+            ("BTC-USD", "BTC-USD.CRYPTO"), ("BTCUSD", "BTC-USD.CRYPTO"),
+            ("BTCUSDT", "BTC-USDT.CRYPTO"), ("SHIB-USD", "SHIB-USD.CRYPTO"),
+            ("PEPE24478-USD", "PEPE24478-USD.CRYPTO"), ("ETH-BTC", "ETH-BTC.CRYPTO"),
+            ("EUR-USD", "EUR-USD.FX"), ("EURUSD", "EUR-USD.FX"), ("USDJPY", "USD-JPY.FX"),
+            ("USD-KZT", "USD-KZT.FX"), ("XAU-USD", "XAU-USD.FX"), ("USD-XCG", "USD-XCG.FX"),
+            ("XDR-USD", "XDR-USD.FX"), ("USDTUSD", "USDT-USD.CRYPTO"), ("USDCUSD", "USDC-USD.CRYPTO"),
+            # Yahoo numbers a coin whose ticker is a currency code.
+            ("RON14101-USD", "RON14101-USD.CRYPTO"),
+        ],
+    )
+    def test_a_pair_spelling_is_a_pair(self, spelling, key):
+        for hint in (None, AssetClass.EQUITY):
+            ref = to_canonical(spelling, asset_class=hint)
+            assert ref.instrument_key == key
+            assert ref.tz == "UTC"
+        assert to_canonical(spelling).calendar_id == (
+            "WEEKDAYS_24_5" if key.endswith(".FX") else "ALWAYS_24_7"
+        )
+
+    @pytest.mark.parametrize(
+        ("spelling", "key"),
+        [
+            # A share class, and FMP commodity codes shaped like a coin run.
+            ("BRK-B", "BRK-B.XNYS"), ("BF-A", "BF-A.XNYS"),
+            ("RTYUSD", "RTYUSD.XNYS"), ("GCUSD", "GCUSD.XNYS"),
+        ],
+    )
+    def test_a_listing_shaped_like_a_pair_stays_a_listing(self, spelling, key):
+        assert to_canonical(spelling).instrument_key == key
+
+    @pytest.mark.parametrize("spelling", ["GC=F", "ES=F", "CL=F"])
+    def test_a_futures_contract_trades_on_globex(self, spelling):
+        ref = to_canonical(spelling, asset_class=AssetClass.EQUITY)
+        assert (ref.instrument_key, ref.calendar_id) == (f"{spelling}.GLBX", "GLBX")
+        assert market_of(ref) == "futures"
+        assert to_legacy_api(ref) == spelling
+
+    def test_a_pair_hint_on_a_futures_contract_is_refused(self):
+        with pytest.raises(ValueError):
+            to_canonical("GC=F", asset_class=AssetClass.CRYPTO)
+
+    @pytest.mark.parametrize("spelling", ["KZT=X", "EURUSD=X", "BTC-USD", "GC=F"])
+    def test_the_legacy_spelling_resolves_back_to_the_same_instrument(self, spelling):
+        # The provider chain carries to_legacy_api's spelling and re-reads it.
+        ref = to_canonical(spelling)
+        assert to_canonical(to_legacy_api(ref), asset_class=AssetClass.EQUITY) == ref
+
+
+@pytest.mark.parametrize(
+    ("spelling", "asked"),
+    [("SPX", "^GSPC"), ("^GSPC", "^GSPC"), ("I:NDX", "^NDX"), ("^HSI", "^HSI"), ("0700.HK", "0700.HK"),
+     ("000001.SH", "000001.SH"), ("BRK.B", "BRK-B")],
+)
+def test_the_request_spelling_asks_for_the_same_instrument_on_a_stock_path(spelling, asked):
+    ref = to_canonical(spelling, asset_class=AssetClass.INDEX if spelling == "SPX" else None)
+    assert to_request_spelling(ref) == asked
+    assert to_canonical(asked, asset_class=AssetClass.EQUITY) == ref

@@ -27,11 +27,11 @@ from src.data_client.yfinance.data_source import (
 def _isolated_prev_close_daily_cache():
     """The snapshot path memoizes daily bars per (symbol, trading date); tests
     here stub different frames for the same symbol and must not share them."""
-    from src.data_client.yfinance import data_source as _ds
+    from src.data_client.yfinance import yahoo as _yh
 
-    _ds._clear_prev_close_daily_cache()
+    _yh._clear_prev_close_daily_cache()
     yield
-    _ds._clear_prev_close_daily_cache()
+    _yh._clear_prev_close_daily_cache()
 
 
 def _history_df(rows: list[dict], dates: list[str]) -> pd.DataFrame:
@@ -116,81 +116,72 @@ class TestFetchHistoryNanSafety:
 
 
 class TestFetchSnapshotNanSafety:
-    # DALTON-HOOK(yfinance-prev-close): `daily_df` feeds the snapshot's
-    # previous-close validation (a 1mo frame); the NaN cases keep the default
-    # unreadable-history stub so "cannot verify" still reads as unknown.
-    def _mock_ticker_with_fast_info(
-        self, fast_info: dict, daily_df: pd.DataFrame | None = None
+    # DALTON-HOOK(yfinance-prev-close): the stub can carry the prior session's bar,
+    # since Dalton validates the previous close against the daily rows.
+    def _mock_ticker(
+        self, meta: dict, day: dict | None = None, prior_day: dict | None = None
     ) -> MagicMock:
         ticker = MagicMock()
-        ticker.fast_info = fast_info
-        if daily_df is not None:
-            # Only period="1mo" (the previous-close check) gets bars; other
-            # periods keep the MagicMock that reads as an unreadable frame.
-            ticker.history.side_effect = (
-                lambda *a, **kw: daily_df if kw.get("period") == "1mo" else MagicMock()
-            )
+        rows: list[dict] = []
+        dates: list[pd.Timestamp] = []
+        if prior_day is not None:
+            rows.append(prior_day)
+            dates.append(pd.Timestamp("2026-06-30", tz="America/New_York"))
+        if day is not None:
+            rows.append(day)
+            dates.append(pd.Timestamp("2026-07-01", tz="America/New_York"))
+        day_df = pd.DataFrame(rows, index=dates) if rows else pd.DataFrame()
+        ticker.history.return_value = day_df
+        ticker.history_metadata = {
+            "exchangeTimezoneName": "America/New_York",
+            "regularMarketTime": pd.Timestamp("2026-07-01 16:00", tz="America/New_York"),
+            **meta,
+        }
         return ticker
 
     def test_nan_last_price_drops_snapshot(self):
         # A snapshot without a finite last price is no quote at all — a 0.0
         # would render as a real $0.00 downstream.
-        fi = {"lastPrice": float("nan"), "previousClose": 100.0}
+        meta = {"regularMarketPrice": float("nan"), "chartPreviousClose": 100.0}
         with patch(
             "src.data_client.yfinance.yahoo.yf.Ticker",
-            return_value=self._mock_ticker_with_fast_info(fi),
+            return_value=self._mock_ticker(meta),
         ):
             assert _fetch_single_snapshot("TEST") is None
 
     def test_nan_optional_fields_become_none_not_zero(self):
         # Valid price, NaN everything else: the snapshot survives with the
         # optional fields omitted (None), never coerced to phantom zeros.
-        fi = {
-            "lastPrice": 105.5,
-            "previousClose": float("nan"),
-            "open": float("nan"),
-            "dayHigh": float("nan"),
-            "dayLow": float("nan"),
-            "lastVolume": float("nan"),
-        }
+        nan = float("nan")
+        meta = {"regularMarketPrice": 105.5, "chartPreviousClose": nan}
+        day = {"Open": nan, "High": nan, "Low": nan, "Close": nan, "Volume": nan}
         with patch(
             "src.data_client.yfinance.yahoo.yf.Ticker",
-            return_value=self._mock_ticker_with_fast_info(fi),
+            return_value=self._mock_ticker(meta, day),
         ):
             snap = _fetch_single_snapshot("TEST")
 
         assert snap is not None
         assert snap["price"] == 105.5
         assert snap["previous_close"] is None
+        assert snap["change_percent"] is None
         assert snap["open"] is None
         assert snap["high"] is None
         assert snap["low"] is None
         assert snap["volume"] == 0
         json.dumps(snap, allow_nan=False)
 
-    def test_clean_fast_info_unchanged(self):
+    def test_clean_quote_unchanged(self):
         # DALTON-HOOK(yfinance-prev-close): the daily frame confirms the
-        # fast_info previous close (previous valid session closed at 100.0),
-        # so this test keeps mapping a *verified* quote like it did before
-        # the previous-close validation existed.
-        fi = {
-            "lastPrice": 105.5,
-            "previousClose": 100.0,
-            "open": 101.0,
-            "dayHigh": 106.0,
-            "dayLow": 100.5,
-            "lastVolume": 12345,
-        }
-        daily = _history_df(
-            [
-                {"Open": 100.0, "High": 101.0, "Low": 99.0, "Close": 100.0, "Volume": 5_000},
-                {"Open": 104.0, "High": 106.0, "Low": 103.0, "Close": 105.5, "Volume": 12_345},
-            ],
-            ["2026-10-24", "2026-10-27"],
-        )
+        # previous close (previous valid session closed at 100.0), so this test
+        # keeps mapping a *verified* quote like it did before the previous-close
+        # validation existed.
+        meta = {"regularMarketPrice": 105.5, "chartPreviousClose": 100.0}
+        prior_day = {"Open": 100.0, "High": 101.0, "Low": 99.0, "Close": 100.0, "Volume": 5000}
+        day = {"Open": 101.0, "High": 106.0, "Low": 100.5, "Close": 105.5, "Volume": 12345}
         with patch(
             "src.data_client.yfinance.yahoo.yf.Ticker",
-            return_value=self._mock_ticker_with_fast_info(fi, daily_df=daily),
+            return_value=self._mock_ticker(meta, day, prior_day=prior_day),
         ):
             snap = _fetch_single_snapshot("TEST")
 

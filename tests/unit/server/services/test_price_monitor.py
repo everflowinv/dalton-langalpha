@@ -505,12 +505,30 @@ class TestLoadAutomations:
                 await svc._load_automations()
 
         assert svc._monitored_listings == {
-            ("600519.SH", MarketType.STOCK), ("HSI", MarketType.INDEX), ("BRK.B", MarketType.STOCK),
+            ("600519.SH", MarketType.STOCK), ("HSI", MarketType.INDEX), ("BRK-B", MarketType.STOCK),
         }
-        assert svc._stock_ws_symbols == {"BRK.B"}
+        assert svc._stock_ws_symbols == {"BRK-B"}
         assert svc._index_ws_symbols == set()
-        svc._stock_handle.subscribe.assert_called_once_with(["BRK.B"])
+        svc._stock_handle.subscribe.assert_called_once_with(["BRK-B"])
         svc._index_handle.subscribe.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_class_share_bar_reaches_its_alert(self):
+        """The feed spells a class share as Massive does (BRK.B); the alert is
+        keyed in our spelling (BRK-B), and the bar still has to find it."""
+        svc = PriceMonitorService()
+        svc._stock_handle = AsyncMock()
+        auto = _make_automation(symbol="BRK.B")
+
+        with patch("src.server.database.automation.get_active_price_automations", AsyncMock(return_value=[auto])):
+            with patch.object(svc._evaluator, "refresh_references", new_callable=AsyncMock):
+                await svc._load_automations()
+
+        with patch.object(svc, "_evaluate_and_trigger", new_callable=AsyncMock) as mock_eval:
+            bar = {"symbol": "BRK.B", "close": 480.0, "open": 481.0, "high": 482.0, "low": 479.0, "volume": 100, "time": 1710000000000}
+            await svc._on_message('{"ev":"AM"}', bar)
+            assert mock_eval.await_count == 1
+            assert mock_eval.await_args.args[1] == 480.0
 
 
 class TestPollSnapshots:
@@ -629,6 +647,33 @@ class TestPollSnapshots:
         assert evaluator.evaluate(
             "pct_change_above", 1.0, "previous_close", 150.0, ("AAPL", MarketType.STOCK)
         ) is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "row, base",
+        [
+            # Not rolled yet at 04:05: the base is the close the row still holds.
+            ({"regular_close": 353.1, "previous_close": 395.75}, 353.1),
+            # Rolled: its previous close is already that close.
+            ({"regular_close": None, "previous_close": 353.1}, 353.1),
+        ],
+    )
+    async def test_a_pre_market_reference_is_the_close_the_row_holds(self, row, base):
+        """Rows roll listing by listing, some after the pre-market opens, and
+        a row that has not rolled still names the session before as its
+        previous close."""
+        evaluator = ConditionEvaluator()
+        provider = AsyncMock(get_snapshots=AsyncMock(return_value=[
+            {"symbol": "TSM", "open": None, **row},
+        ]))
+        pre_market = datetime(2026, 11, 6, 4, 5, tzinfo=ZoneInfo("America/New_York"))
+        with (
+            patch("src.data_client.get_market_data_provider", AsyncMock(return_value=provider)),
+            patch("src.server.services.price_monitor._now_utc", return_value=pre_market),
+        ):
+            await evaluator.refresh_references({("TSM", MarketType.STOCK)})
+
+        assert evaluator._reference_prices[("TSM", MarketType.STOCK)]["previous_close"] == base
 
     @pytest.mark.asyncio
     async def test_a_failed_stock_fetch_keeps_the_index_references(self):
@@ -831,7 +876,7 @@ class TestNonUsSymbolsPollInSession:
 
     @pytest.mark.parametrize("symbol, market, us", [
         ("AAPL", MarketType.STOCK, True),
-        # A dotted class share parses to no known venue, but trades on the US tape.
+        # A dotted class share is the US listing its dashed spelling names.
         ("BRK.B", MarketType.STOCK, True),
         ("BF.B", MarketType.STOCK, True),
         # Any other suffix the protocol does not know is a foreign venue, polled.

@@ -32,6 +32,7 @@ from src.observability import (
 )
 
 from src.server.database.computer import (
+    fence_running_computer,
     get_computer,
     stamp_running_computer,
     try_bind_computer_provider_ref,
@@ -49,6 +50,7 @@ from src.server.database.workspace import (
     update_workspace_status,
 )
 from src.server.models.computer import CLAIMABLE_FOR_START, ComputerStatus
+from src.server.services.computer_manager._attach_only import attaching_only, refuse_start
 from src.server.services.computer_manager._providers import host_outage_of
 from src.server.services.computer_manager._types import ComputerBinding
 from src.server.services.computer_start_failure import record_start_failure
@@ -431,6 +433,7 @@ class SessionLifecycleMixin:
         failing, forever). The CAS itself stays: it is what keeps a stop claimed
         on another worker from being stomped. The machine's actual state rides
         the error so the drill report says what was inconsistent."""
+        refuse_start(binding.computer_id)
         workspace_id = binding.workspace_id
         if stop_waits > 0:
             computer = await get_computer(binding.computer_id)
@@ -628,6 +631,7 @@ class SessionLifecycleMixin:
         stop_waits: int = 0,  # DALTON-HOOK(acquire-retry-bound): rides from acquisition
     ) -> Session:
         """Wait outside the machine lock so archived restores cannot block other ops."""
+        refuse_start(binding.computer_id)
         workspace_id = binding.workspace_id
         ws_done = await self._wait_for_start_completion(workspace_id)
         wait_status = ws_done["status"]
@@ -1219,7 +1223,8 @@ class SessionLifecycleMixin:
             # ahead. That makes the stamp the fence, so a write that fails
             # fails the attach before anything is built rather than letting it
             # reconnect unfenced.
-            if not await stamp_running_computer(computer_id):
+            stamp = fence_running_computer if attaching_only() else stamp_running_computer
+            if not await stamp(computer_id):
                 raise _MachineLeftRunning(computer_id)
             try:
                 await session.initialize(
@@ -1356,6 +1361,7 @@ class SessionLifecycleMixin:
         from_status: str,
     ) -> Optional[Session]:
         """Revert failed start claims so waiters need not exhaust the 300s timeout."""
+        refuse_start(binding.computer_id)
         workspace_id = binding.workspace_id
         claimed = await self._claim_machine_for_start(binding, from_status=from_status)
         if claimed is None:

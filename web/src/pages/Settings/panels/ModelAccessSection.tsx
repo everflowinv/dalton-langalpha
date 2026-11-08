@@ -8,15 +8,22 @@ import { isPlatformMode } from '@/config/hostMode';
 // DALTON-HOOK(team-credentials): team-shared credentials hint & PM disconnect guard
 import { isDaltonAuth } from '@/config/daltonAuth';
 import { TEAM_SHARED_CREDENTIALS_HINT, useTeamCredentials } from '@/hooks/useTeamCredentials';
+import { formatUnitList } from '@/lib/format';
 import { useConfiguredProviders, type ConfiguredProvider } from '@/hooks/useConfiguredProviders';
-import { useClaudeCodeStatus } from '@/hooks/useClaudeCode';
+import { useClaudeCodeSetup, useClaudeCodeStatus } from '@/hooks/useClaudeCode';
+import { useLocale } from '@/hooks/useLocale';
+import { useNow } from '@/hooks/useNow';
+import { useClaudeCodeCustody } from '@/hooks/useClaudeCodeCustody';
 import { useWorkspaceClaudeCode } from '@/hooks/useWorkspaceClaudeCode';
-import { CLAUDE_CODE, CLAUDE_CODE_CONNECTION, CLAUDE_CODE_TOKEN_PARAM, CLAUDE_CODE_WORKSPACE_PARAM } from '@/lib/claudeCode';
+import {
+  ANTHROPIC, CLAUDE_CODE, CLAUDE_CODE_CHOICE, CLAUDE_CODE_CONNECTION, CLAUDE_CODE_MODE_LABELS, CLAUDE_CODE_SETUP_STATUS,
+  CLAUDE_CODE_TOKEN_PARAM, CLAUDE_CODE_WORKSPACE_PARAM,
+} from '@/lib/claudeCode';
 import { useProviderCatalog } from '@/hooks/useProviderCatalog';
 import type { ProviderCatalogEntry } from '@/components/model/types';
 import { isSubscriptionProvider, subscriptionKey, type SubscriptionProvider } from '@/api/oauth';
 import { RemoveAccessDialog } from '@/components/modelAccess/RemoveAccessDialog';
-import { ClaudeCodeTokenSheet, RemoveClaudeCodeTokenDialog, TokenActions } from '@/components/modelAccess/ClaudeCodeToken';
+import { ClaudeCodeTokenSheet, RemoveClaudeCodeTokenDialog } from '@/components/modelAccess/ClaudeCodeToken';
 import { linkedSheetAction, useClaudeCodeTokenRows } from '@/components/modelAccess/tokenLine';
 import { tokenSheetTitle, type SheetAction, type TokenTarget } from '@/components/modelAccess/tokenTarget';
 import { planLabel } from '@/components/modelAccess/planLabel';
@@ -29,6 +36,8 @@ import { NO_FILTER, optionsOf, startingOption, type KeyFilter, type KeyOption, t
 import { AccessRow, Group, KeyRow } from './modelAccess/AccessRows';
 import { KeySheet } from './modelAccess/KeySheet';
 import { ManageSheet, SubscriptionFlow } from './modelAccess/ManageSheet';
+import { ClaudeCodeSheet } from './modelAccess/ClaudeCodeSheet';
+import { claudeCodeHeadline, computerTokenWorks } from './modelAccess/claudeCodeHeadline';
 
 const subscriptionName = (t: (k: string) => string, p: SubscriptionProvider) =>
   t(`modelAccess.${subscriptionKey(p)}.name`);
@@ -43,19 +52,27 @@ type Sheet =
   | { kind: 'connect-subscription'; provider: SubscriptionProvider }
   | { kind: 'pick-key' }
   | { kind: 'pick-local' }
-  | { kind: 'key'; group: ProviderGroup; option: KeyOption; origin: KeyOrigin }
+  /** `origin` null: the Anthropic key's sheet on its own, which Cancel
+   *  closes. */
+  | { kind: 'key'; group: ProviderGroup; option: KeyOption; origin: KeyOrigin | null }
   | { kind: 'local-key'; entry: ProviderCatalogEntry }
   | { kind: 'claude-code-token'; target: TokenTarget; action: SheetAction }
+  /** Claude Code itself: where it stands, what sets it apart, and each
+   *  computer's token, the saved one, and the choice for cloud computers. */
+  | { kind: 'claude-code' }
   /** `from` the add-key flow keeps that flow's width for the key it just saved.
    *  `justConnected`: the flow before it made the connection, so its models
    *  start picked. */
   | { kind: 'manage'; provider: string; from: 'list' | 'key-flow'; justConnected?: boolean };
 
-/** The add-key flow is one size from the list to the saved key's models; see KeyStepFrame. */
+/** The add-key flow is one size from the list to the saved key's models; see
+ *  KeyStepFrame. Claude Code's view is wide enough for a row's name and
+ *  detail beside its status and button on one line. */
 function isWide(sheet: Sheet): boolean {
   switch (sheet.kind) {
     case 'pick-key':
     case 'key':
+    case 'claude-code':
       return true;
     case 'manage':
       return sheet.from === 'key-flow';
@@ -68,7 +85,7 @@ function isWide(sheet: Sheet): boolean {
 function backFrom(sheet: Sheet): Sheet | null {
   switch (sheet.kind) {
     case 'connect-subscription': return { kind: 'pick-subscription' };
-    case 'key': return { kind: sheet.origin };
+    case 'key': return sheet.origin && { kind: sheet.origin };
     case 'local-key': return { kind: 'pick-local' };
     default: return null;
   }
@@ -94,9 +111,14 @@ export function ModelAccessSection() {
   const allowDisconnect = !isDaltonAuth || canDisconnect;
   const teamManagedByAdmin = isDaltonAuth && isTeamShared && !canManage;
   const tokenRows = useClaudeCodeTokenRows();
+  const { custody, isLoading: custodyLoading, unread: custodyUnread } = useClaudeCodeCustody();
+  const { setup, unread: setupUnread } = useClaudeCodeSetup();
+  const locale = useLocale();
+  const now = useNow();
   const [opened, setSheet] = useState<Sheet | null>(null);
   const [removing, setRemoving] = useState<ConfiguredProvider | null>(null);
   const [removingToken, setRemovingToken] = useState<TokenTarget | null>(null);
+  const [choiceCovered, setChoiceCovered] = useState(false);
   // A link elsewhere (the model picker, a refused turn) opens the sheet its
   // row's first button would, once Claude Code is on, for the token the
   // workspace it names runs its turns on: its computer's, where that is one
@@ -115,14 +137,26 @@ export function ModelAccessSection() {
     ? tokenRows.find(({ target }) => (target.kind === 'computer' ? target.computerId === linked.computerId : !linked.computerId))
     : undefined;
   const linkedAction = linkedRow && linkedSheetAction(linkedRow.line);
-  const sheet: Sheet | null = opened ?? (linkedRow && linkedAction ? { kind: 'claude-code-token', target: linkedRow.target, action: linkedAction } : null);
-  const closeSheet = () => {
-    setSheet(null);
+  // A link to the Anthropic key (the picker's, a refused turn's) opens its
+  // sheet, and drops once the key is saved or the sheet closed.
+  const anthropicGroup = keyGroups.find((g) => g.group === ANTHROPIC);
+  const anthropicKey = anthropicGroup ? { group: anthropicGroup, option: startingOption(anthropicGroup, configuredSet) } : null;
+  const anthropicKeySheet = (): Sheet | null => anthropicKey && { kind: 'key', ...anthropicKey, origin: null };
+  const linkedSheet: Sheet | null = linkedRow && linkedAction
+    ? { kind: 'claude-code-token', target: linkedRow.target, action: linkedAction }
+    : searchParams.get(CLAUDE_CODE_TOKEN_PARAM) === ANTHROPIC ? anthropicKeySheet()
+      : searchParams.get(CLAUDE_CODE_TOKEN_PARAM) === CLAUDE_CODE_CHOICE && (setup || setupUnread) ? { kind: 'claude-code' } : null;
+  const sheet: Sheet | null = opened ?? linkedSheet;
+  const dropLink = () => {
     if (searchParams.has(CLAUDE_CODE_TOKEN_PARAM)) setSearchParams((params) => {
       params.delete(CLAUDE_CODE_TOKEN_PARAM);
       params.delete(CLAUDE_CODE_WORKSPACE_PARAM);
       return params;
     }, { replace: true });
+  };
+  const closeSheet = () => {
+    setSheet(null);
+    dropLink();
   };
   // Kept here, not in the list, so Back from a provider returns to the same narrowed list.
   const [keyFilter, setKeyFilter] = useState<KeyFilter>(NO_FILTER);
@@ -160,11 +194,28 @@ export function ModelAccessSection() {
       case 'local-key': return providerTitle(sheet.entry.display_name, sheet.entry.provider);
       case 'manage': return managed ? nameOf(managed) : null;
       case 'claude-code-token': return tokenSheetTitle(t, sheet.target, sheet.action);
+      case 'claude-code': return <ProviderTitle name={CLAUDE_CODE_CONNECTION.display_name} markProvider={CLAUDE_CODE} title={CLAUDE_CODE_CONNECTION.display_name} />;
     }
   })();
 
   const subscriptionDetail = (p: ConfiguredProvider) =>
     [p.email || p.account_id, planLabel(p.provider, p.plan_type)].filter(Boolean).join(' · ') || null;
+
+  /** What Claude Code's row says: the computers a token works on, or what
+   *  it runs on there, else what the view leads with, or that it is off
+   *  with a token left behind. */
+  const claudeCodeDetail = () => {
+    if (!setup && setupUnread) return null;
+    if (!setup?.on) return t(tokenRows.some(({ key }) => key === 'saved') ? 'modelAccess.claudeCode.optOut.saved' : 'modelAccess.claudeCode.optOut.computer');
+    if (setup.state === 'checking') return null;
+    if (setup.state !== 'connected') return claudeCodeHeadline(t, setup, now).title;
+    const working = setup.computers.filter((c) => computerTokenWorks(c, now)).map((c) => c.name);
+    if (working.length > 0) return t('modelAccess.claudeCode.setup.listSummary', { names: formatUnitList(working, locale) });
+    if (custody?.runs_on) return t(CLAUDE_CODE_MODE_LABELS[custody.mode]);
+    // Until the choice is read, it may be the API key that connects it.
+    if (custodyLoading || custodyUnread) return null;
+    return t('modelAccess.claudeCode.detail');
+  };
 
   const rowStatus = (p: ConfiguredProvider): AccessStatus =>
     p.state === 'needs_reauth' ? 'needs_reauth' : 'connected';
@@ -202,26 +253,24 @@ export function ModelAccessSection() {
               }
             />
           )),
-          // Claude Code signs in with a setup token the user makes for it, so
-          // the token is all there is to add, replace or remove.
-          ...tokenRows.map(({ key, target, tag, line }) => (
+          // Claude Code is one row once it is on, or while a token is left
+          // behind after it was turned off (or the server stopped offering
+          // it), which its view offers to remove.
+          ...(setup?.on || tokenRows.length > 0 || (setupUnread && claudeCode.enabled) ? [(
             <AccessRow
-              key={`${CLAUDE_CODE}:${key}`}
+              key={CLAUDE_CODE}
               provider={CLAUDE_CODE}
               name={CLAUDE_CODE_CONNECTION.display_name}
-              tag={tag}
-              detail={line.detail}
+              detail={claudeCodeDetail()}
               wrapDetail
-              status={line.status}
+              status={setup?.on ? CLAUDE_CODE_SETUP_STATUS[setup.state] : setupUnread ? 'unknown' : 'off'}
               action={(
-                <TokenActions
-                  actions={line.actions}
-                  onOpen={(action) => setSheet({ kind: 'claude-code-token', target, action })}
-                  onRemove={() => setRemovingToken(target)}
-                />
+                <Button type="button" variant="ghost" size="sm" className="tap-target" onClick={() => setSheet({ kind: 'claude-code' })}>
+                  {t('modelAccess.manage')}
+                </Button>
               )}
             />
-          )),
+          )] : []),
         ]}
       </Group>
 
@@ -289,7 +338,7 @@ export function ModelAccessSection() {
           title={sheetTitle}
           onClose={closeSheet}
           width={isWide(sheet) ? 'wide' : 'standard'}
-          covered={!!removing}
+          covered={!!removing || (!!removingToken && sheet.kind === 'claude-code') || choiceCovered}
         >
           {sheet.kind === 'pick-subscription' && (
             <SubscriptionChoices
@@ -297,6 +346,9 @@ export function ModelAccessSection() {
               configured={configuredSet}
               onPickSignIn={(p) => setSheet(configuredSet.has(p) ? { kind: 'manage', provider: p, from: 'list' } : { kind: 'connect-subscription', provider: p })}
               onPickPlan={pickKeyGroup('pick-subscription')}
+              claudeCode={setup || setupUnread
+                ? { status: setup ? CLAUDE_CODE_SETUP_STATUS[setup.state] : 'unknown', onPick: () => setSheet({ kind: 'claude-code' }) }
+                : undefined}
             />
           )}
           {sheet.kind === 'connect-subscription' && (
@@ -345,8 +397,12 @@ export function ModelAccessSection() {
               option={sheet.option}
               group={sheet.group}
               configured={providers}
-              onSaved={(provider, fresh) => setSheet({ kind: 'manage', provider, from: 'key-flow', justConnected: fresh })}
-              onBack={back(sheet)}
+              onSaved={(provider, fresh) => {
+                dropLink();
+                setSheet({ kind: 'manage', provider, from: 'key-flow', justConnected: fresh });
+              }}
+              onBack={sheet.origin ? back(sheet) : undefined}
+              onCancel={sheet.origin ? undefined : closeSheet}
             />
           )}
           {sheet.kind === 'local-key' && (
@@ -370,6 +426,16 @@ export function ModelAccessSection() {
             />
           )}
           {sheet.kind === 'manage' && !managed && <StatusLabel status="working" />}
+          {sheet.kind === 'claude-code' && (setup || setupUnread || tokenRows.length > 0 ? (
+            <ClaudeCodeSheet
+              setup={setup}
+              tokenRows={tokenRows}
+              anthropicKey={anthropicKey}
+              configured={providers}
+              onRemoveToken={setRemovingToken}
+              onCover={setChoiceCovered}
+            />
+          ) : <StatusLabel status="working" />)}
           {sheet.kind === 'claude-code-token' && <ClaudeCodeTokenSheet target={sheet.target} onSaved={closeSheet} onCancel={closeSheet} />}
         </ModalShell>
       )}
@@ -384,7 +450,7 @@ export function ModelAccessSection() {
         />
       )}
 
-      {removingToken && <RemoveClaudeCodeTokenDialog target={removingToken} onClose={() => setRemovingToken(null)} />}
+      {removingToken && <RemoveClaudeCodeTokenDialog target={removingToken} stacked={!!sheet} onClose={() => setRemovingToken(null)} />}
     </div>
   );
 }

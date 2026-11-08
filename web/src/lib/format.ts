@@ -67,6 +67,12 @@ export function formatTimestamp(ts: string | null | undefined, locale: string): 
 }
 
 const listFormat = perLocale((locale) => new Intl.ListFormat(locale, { type: 'conjunction' }));
+const unitListFormat = perLocale((locale) => new Intl.ListFormat(locale, { type: 'unit' }));
+
+/** Names listed with no conjunction, as the locale says "A, B, C". */
+export function formatUnitList(items: readonly string[], locale: string): string {
+  return unitListFormat(locale).format(items);
+}
 
 /** Names joined as the locale says "A, B and C". A Chinese conjunction is a
  *  word and is spaced from a Latin name or a number beside it (`moomoo 和
@@ -135,6 +141,8 @@ export const integer = createFormatter({ maximumFractionDigits: 0 });
 export const fixed2 = createFormatter({ minimumFractionDigits: 2, maximumFractionDigits: 2, useGrouping: false });
 // `exceptZero` rather than `always`: a flat or sub-cent move prints `0.00`, not `-0.00`.
 export const signedFixed2 = createFormatter({ minimumFractionDigits: 2, maximumFractionDigits: 2, useGrouping: false, signDisplay: 'exceptZero' });
+/** The placeholder a quote figure prints while it has no value. */
+export const DASH = '—';
 export const compactNumberFixed2 = createFormatter({ notation: 'compact', minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
 // Calendar days, as a market's daily bar is dated: a `YYYY-MM-DD` with no

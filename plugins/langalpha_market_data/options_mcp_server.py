@@ -37,19 +37,36 @@ from data_client.ginlix_data import (
     close_ginlix_mcp_client,
     get_ginlix_mcp_client,
 )
-from market_protocol import to_canonical, to_display
+from market_protocol import market_of, to_canonical, to_display
 
 try:
-    from _envelope import error_from_upstream, make_error, make_response, normalize_interval
+    from _envelope import (
+        error_from_exception,
+        error_from_upstream,
+        make_error,
+        make_response,
+        normalize_interval,
+    )
 except ModuleNotFoundError:  # imported as a package module (tests)
     from mcp_servers._envelope import (
+        error_from_exception,
         error_from_upstream,
         make_error,
         make_response,
         normalize_interval,
     )
 
-from mcp_servers._schemas import RECORDS, STR, envelope_schema, output_model
+from mcp_servers._dates import DateBoundError, daily_days
+
+from mcp_servers._schemas import (
+    BOOL,
+    RECORDS,
+    STR,
+    TRUNCATED,
+    described,
+    envelope_schema,
+    output_model,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +138,10 @@ _OUT_GET_OPTIONS_CHAIN = output_model(
     envelope_schema(
         RECORDS,
         frame=("symbol", "currency", "timezone"),
-        echo={"underlying_ticker": STR},
+        echo={
+            "underlying_ticker": STR,
+            "truncated": described(BOOL, "Present and true if more contracts match than limit."),
+        },
     ),
 )
 
@@ -136,9 +156,9 @@ async def get_options_chain(
     strike_price_lte: Optional[float] = None,
     limit: int = 50,
 ) -> _OUT_GET_OPTIONS_CHAIN:
-    """List options contracts for an underlying; use to discover/filter contracts.
+    """List an underlying's options contracts; use to find contract tickers.
 
-    Filter by call/put, expiration range, and strike range. ginlix-data only.
+    US-listed underlyings only; a listing on a known non-US venue is refused.
 
     Args:
         underlying_ticker: Underlying stock ticker, e.g. "AAPL".
@@ -151,15 +171,25 @@ async def get_options_chain(
 
     Returns:
         dict: {symbol, underlying_ticker, currency, timezone, count, data,
-        source}. data: list of contract dicts with ticker, contract_type,
-        expiration_date, strike_price, shares_per_contract, primary_exchange;
-        strike_price in `currency` major units. On error: {error: <code>, detail}.
+        source, truncated?}. data: list of {ticker, contract_type,
+        expiration_date, strike_price, shares_per_contract, primary_exchange};
+        strike_price in `currency` major units. truncated: true if more
+        contracts match than limit. On error: {error: <code>, detail}.
     """
     try:
         ref = to_canonical(underlying_ticker)
         display, currency, timezone = to_display(ref), ref.price_currency, ref.tz
     except Exception:  # noqa: BLE001
-        display, currency, timezone = underlying_ticker, None, None
+        ref, display, currency, timezone = None, underlying_ticker, None, None
+
+    # ginlix-data lists US contracts only, so a listing it does not cover would
+    # read as one with no options. A venue the protocol does not know stays.
+    if ref is not None and market_of(ref) not in ("us", "other"):
+        return make_error(
+            "invalid_argument",
+            f"Options chains cover US-listed underlyings only; {display} is not one.",
+            symbol=display,
+        )
 
     if not await _ginlix.ensure():
         return make_error(
@@ -186,13 +216,18 @@ async def get_options_chain(
         symbol=display,
         currency=currency,
         timezone=timezone,
+        truncated=result.get("truncated", False),
         underlying_ticker=display,
     )
 
 
 _OUT_GET_OPTIONS_PRICES = output_model(
     "GetOptionsPricesOut",
-    envelope_schema(RECORDS, frame=("symbol", "interval", "currency", "timezone")),
+    envelope_schema(
+        RECORDS,
+        frame=("symbol", "interval", "currency", "timezone"),
+        echo={"truncated": TRUNCATED},
+    ),
 )
 
 
@@ -203,23 +238,24 @@ async def get_options_prices(
     to_date: str,
     interval: str = "1day",
 ) -> _OUT_GET_OPTIONS_PRICES:
-    """Fetch OHLCV bars for one options contract; use for option price history.
+    """Fetch OHLCV bars for one options contract.
 
     Intervals: 1min|5min|15min|30min|1hour|4hour|1day|1week|1month (aliases like
-    "1d"/"daily" accepted). ginlix-data only.
+    "1d"/"daily" accepted).
 
     Args:
         options_ticker: OCC contract ticker, e.g. "O:AAPL260618C00220000".
-        from_date: Start date "YYYY-MM-DD" (required).
-        to_date: End date "YYYY-MM-DD" (required).
-        interval: Bar size; one of the intervals above.
+        from_date: Start date "YYYY-MM-DD".
+        to_date: End date "YYYY-MM-DD".
+        interval: One of the intervals above.
 
     Returns:
-        dict: {symbol, interval, currency, timezone, count, data, source}. symbol
-        echoes the contract ticker; currency/timezone are the underlying's. data:
-        list of {date, open, high, low, close, volume} ascending (oldest first);
-        date exchange-local "YYYY-MM-DD[ HH:MM:SS]"; prices in `currency` major
-        units. On error: {error: <code>, detail}.
+        dict: {symbol, interval, currency, timezone, count, data, source,
+        truncated?}. symbol echoes the contract ticker; currency/timezone are the
+        underlying's. data: list of {date, open, high, low, close, volume}
+        ascending (oldest first); date exchange-local "YYYY-MM-DD[ HH:MM:SS]";
+        prices in `currency` major units. truncated: true if a size cap cut the
+        oldest bars. On error: {error: <code>, detail}.
     """
     opt = options_ticker.strip()
     _underlying, currency, timezone = _underlying_context(opt)
@@ -232,6 +268,15 @@ async def get_options_prices(
             symbol=opt,
             interval=interval,
             supported=sorted(_OPTION_INTERVALS),
+        )
+
+    # Bounds are read as the price tools read them, so a reversed or unreadable
+    # one is refused in their words rather than by the vendor.
+    try:
+        daily_days(from_date, to_date)
+    except DateBoundError as e:
+        return error_from_exception(
+            e, "Options prices fetch failed.", symbol=opt, interval=canonical
         )
 
     if not await _ginlix.ensure():
@@ -247,7 +292,7 @@ async def get_options_prices(
     if isinstance(result, dict):
         return _ginlix_error(result, symbol=opt, interval=canonical)
 
-    data = list(reversed(result))  # normalize_bars is descending → ascending
+    data = list(reversed(result.bars))  # normalize_bars is descending → ascending
     return make_response(
         data,
         source="ginlix-data",
@@ -255,6 +300,7 @@ async def get_options_prices(
         interval=canonical,
         currency=currency,
         timezone=timezone,
+        truncated=result.truncated,
     )
 
 

@@ -85,6 +85,25 @@ def _resolve(host: str) -> list[str]:
         return [info[4][0] for info in socket.getaddrinfo(host, None)]
 
 
+# DALTON-HOOK(fake-ip-allow): the same verdict ``GuardedAsyncTransport`` reaches,
+# for a caller that only asks whether a host may be fetched before handing the
+# fetch to that transport (the PDF renderer's request gate). Behind a fake-IP
+# proxy every public host answers with a fake-IP, which the strict test alone
+# refuses; the real-target recheck decides instead, failing closed.
+async def host_passes_guard(host: str) -> bool:
+    if not host or host == "localhost":
+        return False
+    try:
+        addresses = await asyncio.to_thread(_resolve, host)
+    except socket.gaierror:
+        return False
+    for ip in addresses:
+        if _ip_is_blocked(ip) and not _is_fake_ip(ipaddress.ip_address(ip)):
+            return False
+    reason, _ = await _fake_ip_recheck(host, addresses)
+    return reason is None
+
+
 class GuardedAsyncTransport(httpx.AsyncHTTPTransport):
     """httpx transport that blocks requests resolving to private/reserved IPs.
 

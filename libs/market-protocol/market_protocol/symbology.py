@@ -1,8 +1,9 @@
 """Canonical instrument identity: to_canonical / to_legacy_api / to_display.
 
 Instrument keys are ``symbol.MIC`` (ISO 10383): ``AAPL.XNAS``, ``0700.XHKG``;
-synthetic segments ``SPX.INDEX``, ``BTC-USD.CRYPTO``, ``EUR-USD.FX``. The MIC
-is *listing* identity; feeds stay consolidated tape (``FeedScope.COMPOSITE``).
+synthetic segments ``SPX.INDEX``, ``BTC-USD.CRYPTO``, ``EUR-USD.FX``; futures
+on CME Globex, ``GC=F.GLBX``. The MIC is *listing* identity; feeds stay
+consolidated tape (``FeedScope.COMPOSITE``).
 
 Suffix→MIC is a documented heuristic: a Yahoo/FMP suffix cannot always name
 the venue (``.DE`` can't tell XETR from XFRA) and a bare US ticker cannot name
@@ -54,6 +55,9 @@ US_DEFAULT_MIC = "XNYS"
 # fall back to US, the routing token is ``other``.
 UNKNOWN_MIC = "XXXX"
 
+# ISO 10383 MIC of CME Globex, also the id of its calendar.
+FUTURES_MIC = "GLBX"  # DALTON-HOOK(stock-move-upgrade)
+
 _MICS: dict[str, _MicInfo] = {
     "XNYS": _MicInfo("XNYS", "America/New_York", "USD", "us", suffix=""),
     "XNAS": _MicInfo("XNYS", "America/New_York", "USD", "us", suffix=""),
@@ -81,6 +85,8 @@ _MICS: dict[str, _MicInfo] = {
     "XSES": _MicInfo("XSES", "Asia/Singapore", "SGD", "sg", suffix="SI"),
     "XBOM": _MicInfo("XBOM", "Asia/Kolkata", "INR", "in", suffix="BO"),
     "XNSE": _MicInfo("XBOM", "Asia/Kolkata", "INR", "in", suffix="NS"),
+    # CME Globex, where CME Group's futures trade (GC=F, CL=F, ES=F).
+    FUTURES_MIC: _MicInfo(FUTURES_MIC, "America/Chicago", "USD", "futures"),  # DALTON-HOOK(stock-move-upgrade)
     UNKNOWN_MIC: _MicInfo("XNYS", "America/New_York", "USD", "other", suffix=None),
 }
 
@@ -128,6 +134,23 @@ def _venue_currency(symbol: str, mic: str, default: str) -> str:
     return default
 
 
+# A US class share is spelled with a dot by its exchange and Massive (BRK.B)
+# and with a dash by Yahoo and FMP (BRK-B). Both name one listing, keyed and
+# shown dashed, the spelling FMP and yfinance resolve. Only these classes read
+# so: a lone letter after a dot names a venue elsewhere (SAP.F is Frankfurt).
+_US_CLASS_SUFFIXES = frozenset("ABC")
+
+
+def us_class_share(symbol: str) -> tuple[str, str] | None:
+    """``(stem, class)`` when *symbol* is a US class share in either spelling
+    (BRK.B, BRK-B), else None."""
+    for separator in ".-":
+        stem, found, share_class = symbol.rpartition(separator)
+        if found and share_class in _US_CLASS_SUFFIXES and stem.isascii() and stem.isalpha():
+            return stem, share_class
+    return None
+
+
 def _venue_code(symbol: str, mic: str) -> str:
     """HKEX codes are written with and without leading zeros (700, 0700,
     00700); all name one listing, so they collapse to the four-digit form
@@ -141,6 +164,33 @@ _SYNTHETIC_SEGMENTS = frozenset({"INDEX", "CRYPTO", "FX"})
 
 ALWAYS_24_7 = "ALWAYS_24_7"
 WEEKDAYS_24_5 = "WEEKDAYS_24_5"
+
+# Active ISO 4217 currency and precious-metal codes, plus offshore yuan. A pair
+# with both legs here is a rate (EUR-USD, USD-KZT, XAU-USD); any other pair is
+# crypto. Yahoo numbers a coin whose ticker is a currency code (Ronin is
+# RON14101-USD), so the two never share a spelling.
+_FIAT = frozenset("""
+    AED AFN ALL AMD ANG AOA ARS AUD AWG AZN BAM BBD BDT BGN BHD BIF BMD BND BOB
+    BRL BSD BTN BWP BYN BZD CAD CDF CHF CLP CNH CNY COP CRC CUP CVE CZK DJF DKK
+    DOP DZD EGP ERN ETB EUR FJD FKP GBP GEL GHS GIP GMD GNF GTQ GYD HKD HNL HTG
+    HUF IDR ILS INR IQD IRR ISK JMD JOD JPY KES KGS KHR KMF KPW KRW KWD KYD KZT
+    LAK LBP LKR LRD LSL LYD MAD MDL MGA MKD MMK MNT MOP MRU MUR MVR MWK MXN MYR
+    MZN NAD NGN NIO NOK NPR NZD OMR PAB PEN PGK PHP PKR PLN PYG QAR RON RSD RUB
+    RWF SAR SBD SCR SDG SEK SGD SHP SLE SOS SRD SSP STN SVC SYP SZL THB TJS TMT
+    TND TOP TRY TTD TWD TZS UAH UGX USD UYU UZS VES VND VUV WST XAF XAG XAU XCD
+    XCG XDR XOF XPD XPF XPT YER ZAR ZMW ZWG
+""".split())
+# What vendors quote a coin in: money, a dollar stablecoin, or another coin.
+_CRYPTO_QUOTES = _FIAT | {"USDT", "USDC", "BTC", "ETH"}
+# The quotes a one-run spelling (BTCUSDT) ends in, longest first.
+_RUN_QUOTES = ("USDT", "USDC", "USD")
+# FMP spells a coin as one run (BTCUSD), the shape its commodity codes take
+# too (RTYUSD, MGCUSD), so a bare run names a coin only on these bases.
+_CRYPTO_RUN_BASES = frozenset({
+    "BTC", "ETH", "SOL", "XRP", "DOGE", "ADA", "LTC", "BNB", "AVAX", "DOT",
+    "LINK", "SHIB", "TRX", "TON", "BCH", "XLM", "UNI", "ATOM", "ETC", "XMR",
+    "NEAR", "SUI", "PEPE", "USDT", "USDC",
+})
 
 # ---------------------------------------------------------------------------
 # Index families
@@ -200,8 +250,6 @@ def market_of(ref: InstrumentRef) -> str:
         return "crypto"
     if ref.asset_class is AssetClass.FX:
         return "fx"
-    if ref.symbol.endswith("=F"):  # DALTON-HOOK(stock-move-upgrade)
-        return "other"
     info = _MICS.get(ref.calendar_id if ref.mic == "INDEX" else ref.mic)
     return info.market if info is not None else "other"
 
@@ -503,6 +551,11 @@ def _venue_ref(
     code space already separates it from stocks)."""
     _require_stem(symbol)
     symbol = _venue_code(symbol, mic)
+    share = us_class_share(symbol)
+    if share is not None and (mic == UNKNOWN_MIC or _MICS[mic].market == "us"):
+        symbol = "-".join(share)
+        if mic == UNKNOWN_MIC:
+            mic = US_DEFAULT_MIC
     # Seeds are keyed by our spelling on the parsed venue, so AMD.DE (or its
     # key AMD.XETR) never picks up the seed that pins US AMD to XNAS.
     seed = _seed_registry().get(_spell(symbol, mic)) or {}
@@ -534,12 +587,7 @@ def _venue_ref(
         currency=currency,
         price_currency=seed.get("price_currency", currency),
         display_unit=seed.get("display_unit", info.display_unit),
-        # WEEKDAYS_24_5 (UTC Mon-Sat) is an FX-calendar approximation for `*=F` futures;
-        # CME equity index futures open Sunday 18:00 ET and halt daily 17:00-18:00 ET for
-        # maintenance, neither of which is modeled here. DALTON-HOOK(stock-move-upgrade)
-        calendar_id=seed.get(  # DALTON-HOOK(stock-move-upgrade)
-            "calendar_id", WEEKDAYS_24_5 if symbol.endswith("=F") else info.calendar_id
-        ),
+        calendar_id=seed.get("calendar_id", info.calendar_id),
         tz=info.tz,
     )
 
@@ -571,14 +619,46 @@ def _index(spelling: str) -> InstrumentRef:
     return _index_ref(_INDEX_ALIASES.get(bare, bare))
 
 
+def _run_legs(run: str) -> tuple[str, str] | None:
+    """``(base, quote)`` of a pair spelled as one run: BTCUSDT, SHIBUSD, USDJPY."""
+    for quote in _RUN_QUOTES:
+        if run.endswith(quote) and len(run) - len(quote) >= 2:
+            return run[: -len(quote)], quote
+    return (run[:3], run[3:]) if len(run) == 6 else None
+
+
+def _bare_pair_segment(s: str) -> str | None:
+    """``CRYPTO`` or ``FX`` when the bare spelling *s* names a pair, else None.
+
+    Yahoo spells a coin BTC-USD and FMP spells pairs as one run (BTCUSD,
+    EURUSD). No US listing is spelled either way: a share class has a
+    one-letter leg (BRK-B), and a ticker runs to five letters.
+    """
+    if "-" in s:
+        base, _, quote = s.partition("-")
+        if len(base) < 2 or not (base.isascii() and base.isalnum()):
+            return None
+    else:
+        legs = _run_legs(s)
+        if legs is None:
+            return None
+        base, quote = legs
+        if base not in _CRYPTO_RUN_BASES and base not in _FIAT:
+            return None
+    if quote not in _CRYPTO_QUOTES:
+        return None
+    return "FX" if base in _FIAT and quote in _FIAT else "CRYPTO"
+
+
 def _pair_ref(symbol: str, segment: str) -> InstrumentRef:
     """Crypto/FX pair: ``BTC-USD.CRYPTO`` / ``EUR-USD.FX``.
 
-    A six-letter run splits here, so the key ``USDJPY.FX`` names the pair the
-    spelling ``USDJPY`` does, quoted in yen, not a second one quoted in dollars.
+    A run splits here, so the key ``USDJPY.FX`` names the pair the spelling
+    ``USDJPY`` does, quoted in yen, not a second one quoted in dollars, and
+    ``BTCUSD`` is the pair ``BTC-USD`` names.
     """
-    if "-" not in symbol and len(symbol) == 6:
-        symbol = f"{symbol[:3]}-{symbol[3:]}"  # EURUSD → EUR-USD
+    if "-" not in symbol and (legs := _run_legs(symbol)) is not None:
+        symbol = "-".join(legs)  # EURUSD → EUR-USD
     for leg in symbol.split("-"):
         _require_stem(leg)
     asset_class = AssetClass.CRYPTO if segment == "CRYPTO" else AssetClass.FX
@@ -628,6 +708,12 @@ def to_canonical(
             return _pair_ref(sym, segment)
         return _venue_ref(sym, segment, asset_class=asset_class)
 
+    if s.endswith("=F"):  # DALTON-HOOK(stock-move-upgrade)
+        # Yahoo's futures spelling names a contract on CME Globex, whatever
+        # the endpoint's hint says.
+        _refuse_pair_hint(s, asset_class)
+        return _venue_ref(s, FUTURES_MIC)
+
     if asset_class in _PAIR_CLASSES or s.endswith("=X"):
         # An =X suffix is an FX spelling whatever the hint says, so VOD.L=X is
         # refused like VOD.L with an FX hint rather than minted as VOD.L.FX,
@@ -641,6 +727,11 @@ def to_canonical(
             # Yahoo names a USD-based rate by its quote alone: JPY=X is USD-JPY.
             sym = f"USD-{sym}"
         return _pair_ref(sym, "CRYPTO" if pair_class is AssetClass.CRYPTO else "FX")
+
+    # A pair spelled without a hint, or reaching a stocks endpoint (the
+    # provider chain hints every non-index request as equity).
+    if asset_class in (None, AssetClass.EQUITY) and (segment := _bare_pair_segment(s)):
+        return _pair_ref(s, segment)
 
     is_index = (
         asset_class is AssetClass.INDEX
@@ -656,7 +747,8 @@ def to_canonical(
         stem, mic = venue
         return _venue_ref(stem, mic, asset_class=asset_class)
     if "." in bare:
-        # Unknown suffix (e.g. share classes): whole string is the symbol.
+        # Unknown suffix: the whole string is the symbol, on the unknown venue
+        # unless it is a US class share (BRK.B).
         return _venue_ref(bare, UNKNOWN_MIC, asset_class=asset_class)
     return _venue_ref(bare, US_DEFAULT_MIC, asset_class=asset_class)
 
@@ -664,8 +756,8 @@ def to_canonical(
 def from_instrument_key(key: str) -> InstrumentRef:
     """Ref for a key received from another service. Raises ValueError.
 
-    ``to_canonical`` reads an unknown last segment as part of the symbol (a
-    share class), so a key minted on a venue a newer pin added would resolve
+    ``to_canonical`` reads an unknown last segment as part of the symbol,
+    so a key minted on a venue a newer pin added would resolve
     here to a different key, on the US calendar and in dollars. A key from the
     wire is refused instead when its segment is not one this pin knows.
     """
@@ -704,6 +796,16 @@ def to_display(ref: InstrumentRef) -> str:
     return to_legacy_api(ref)
 
 
+def to_request_spelling(ref: InstrumentRef) -> str:
+    """The spelling that asks for *ref* again: ``AAPL``, ``0700.HK``, ``^GSPC``.
+
+    A family index keeps its caret, since its bare legacy (``GSPC``) and display
+    (``SPX``) spellings both read as stock tickers.
+    """
+    legacy = to_legacy_api(ref)
+    return f"^{legacy}" if is_family_index(ref) else legacy
+
+
 def vendor_symbol(ref: InstrumentRef) -> str:
     """The legacy spelling with the venue suffix FMP and yfinance resolve (``600519.SS``).
 
@@ -719,7 +821,8 @@ def _respell_suffix(symbol: str, *, vendor: bool) -> str:
     s = _clean(symbol)
     venue = _venue_suffix_split(s)
     if venue is None:
-        return s
+        share = us_class_share(s)
+        return "-".join(share) if share else s
     stem, mic = venue
     return _spell(_venue_code(stem, mic), mic, vendor=vendor)
 
@@ -729,10 +832,11 @@ def display_spelling(symbol: str) -> str:
 
     For strings that never went through :func:`to_canonical`: what a vendor row
     or a user typed, on its way into storage or a comparison (``600519.ss``
-    becomes ``600519.SH``, ``700.HK`` becomes ``0700.HK``). Only a venue-suffixed
-    symbol is respelled, so a caret, a family index or an unknown suffix
-    survives. It never raises, and so it validates nothing: what goes into a
-    request or a URL comes from :func:`vendor_spelling` or :func:`to_canonical`.
+    becomes ``600519.SH``, ``700.HK`` becomes ``0700.HK``, ``BRK.B`` becomes
+    ``BRK-B``). Only a venue suffix or a US class share is respelled, so a
+    caret, a family index or an unknown suffix survives. It never raises, and
+    so it validates nothing: what goes into a request or a URL comes from
+    :func:`vendor_spelling` or :func:`to_canonical`.
     """
     return _respell_suffix(symbol, vendor=False)
 

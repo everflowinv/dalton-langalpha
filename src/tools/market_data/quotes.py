@@ -2,30 +2,34 @@
 """Market intel snapshots: options chains, market movers, and live quotes."""
 
 from typing import Optional, Dict, Any, List, Tuple
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import logging
 
 from langchain_core.runnables import RunnableConfig
 
-from .currency import fmt_price
+from .currency import fmt_price, fmt_quote
 from .display import (
     _symbol_currency,
     resolve_listing,
     resolve_ref,
+    venue_phase,
 )
 from .quote_format import (
     block_clock,
+    current_price,
     format_quote_block,
     stamp_quote,
 )
-from src.data_client import get_financial_data_provider, get_market_data_provider
+from src.data_client import fallbacks, get_financial_data_provider
 from src.data_client.base import MoverRow
 from src.data_client.freshness import is_live
 from src.data_client.ginlix_data.directory import fill_quote_names
+from src.data_client.ginlix_data.pagination import follow_cursor
 from src.data_client.market_data_provider import snapshot_key
-from src.data_client.ginlix_data.pagination import paginate_cursor
 from src.observability import stamp_tool_provider
-from market_protocol import AssetClass, display_spelling
+from src.server.services.cache.quote_cache_service import QuoteCacheService
+from src.utils.market_hours import ET
+from market_protocol import AssetClass, InstrumentRef, MarketPhase, display_spelling, to_legacy_api
 
 from ._shared import _get_user_id, _mark_failure, _mark_no_data
 
@@ -86,7 +90,7 @@ async def fetch_options_chain(
                 underlying, user_id=user_id, **p,
             )
 
-        results = await paginate_cursor(_fetch_page, filters, limit=limit)
+        results, truncated = await follow_cursor(_fetch_page, filters, limit=limit)
 
         # Batch-fetch snapshots for pricing data
         snapshot_map: Dict[str, Dict] = {}
@@ -116,6 +120,11 @@ async def fetch_options_chain(
         lines.append(f"**Retrieved:** {timestamp}")
         if contract_type:
             lines.append(f"**Type:** {contract_type.upper()}")
+        if truncated:
+            lines.append(
+                f"**More contracts match than the {len(results)} shown.** "
+                "Raise limit or narrow the expiry or strike filters to see the rest."
+            )
         lines.append("")
 
         # Each contract carries its snapshot's session (close, change,
@@ -124,9 +133,9 @@ async def fetch_options_chain(
             {**c, "session": snapshot_map.get(c.get("ticker"), {}).get("session") or None}
             for c in results
         ]
-        if not contracts:
+        if not contracts and not truncated:
             lines.append("No contracts found matching the given criteria.")
-        else:
+        elif contracts:
             lines.append("| Ticker | Type | Strike | Expiry | Close | Chg% | Volume |")
             lines.append("|--------|------|--------|--------|-------|------|--------|")
             for c in contracts:
@@ -156,6 +165,7 @@ async def fetch_options_chain(
             "underlying": underlying,
             "contract_type": contract_type,
             "market_status": market_status,
+            "truncated": truncated,
             "currency": cur.currency,
             "as_of_ts": int(retrieved_at.timestamp() * 1000),
         }
@@ -190,6 +200,13 @@ def _movers_error(message: str) -> Tuple[str, Dict[str, Any]]:
     }
 
 
+# What "significant volume" means for a mover: the money traded in its session.
+_MIN_TRADED_VALUE = 100_000
+
+# How long after the bell the closing auction's print can report.
+_CLOSING_CROSS_REPORT = timedelta(seconds=10)
+
+
 class MoverCardRow(MoverRow):
     """A mover as the text and the card read it. The name and the currency are
     the tool's to add: the source names no mover, and a price is in its
@@ -197,6 +214,26 @@ class MoverCardRow(MoverRow):
 
     name: Optional[str]
     currency: Optional[str]
+
+
+def _trade_session(ref: Optional[InstrumentRef], at: Optional[datetime], day: date) -> str:
+    """A mover's last trade time (ET), dated when it is not *day*'s, and the
+    session it printed in.
+
+    A print in the seconds after the close is the closing auction's, which
+    crosses at the close and reports a moment later.
+    """
+    if at is None:
+        return "N/A"
+    when = f"{at:%H:%M}" if at.date() == day else f"{at:%Y-%m-%d %H:%M}"
+    phase = venue_phase(ref, at)
+    if phase is MarketPhase.POST and venue_phase(ref, at - _CLOSING_CROSS_REPORT) is MarketPhase.REGULAR:
+        phase = MarketPhase.REGULAR
+    if phase is MarketPhase.REGULAR:
+        return f"{when} Regular Hours"
+    if phase in (MarketPhase.PRE, MarketPhase.POST):
+        return f"{when} Extended Hours"
+    return when
 
 
 async def fetch_market_movers(
@@ -225,7 +262,26 @@ async def fetch_market_movers(
                 {"type": "market_movers", "results": []},
             )
 
-        movers = await provider.intel.get_movers(direction, user_id=user_id)
+        listed = await provider.intel.get_movers(direction, user_id=user_id)
+        # A source's own volume floor counts shares, which a sub-cent warrant
+        # clears with a few hundred dollars traded.
+        movers: List[MoverRow] = []
+        excluded: List[str] = []
+        for m in listed:
+            if m["traded_value"] is not None and m["traded_value"] < _MIN_TRADED_VALUE:
+                excluded.append(m["symbol"])
+            else:
+                movers.append(m)
+        traded = {m["symbol"]: datetime.fromtimestamp(m["traded_at"] / 1000, ET) for m in listed if m["traded_at"]}
+        newest = max(traded.values()).date() if traded else None
+
+        def shared_day(symbols: List[str]) -> str:
+            """' on <date>' when every one of *symbols* last traded that ET day."""
+            days = {traded[s].date() if s in traded else None for s in symbols}
+            return f" on {days.pop():%Y-%m-%d}" if len(days) == 1 and None not in days else ""
+
+        on_day = shared_day([m["symbol"] for m in movers])
+        excluded_day = shared_day(excluded)
         refs = [resolve_ref(m["symbol"]) for m in movers]
         rows: List[MoverCardRow] = [
             {**m, "name": None, "currency": ref.price_currency if ref is not None else None}
@@ -235,29 +291,48 @@ async def fetch_market_movers(
 
         retrieved_at = datetime.now(timezone.utc)
         timestamp = retrieved_at.strftime("%Y-%m-%d %H:%M UTC")
-        label = "Gainers" if direction == "gainers" else "Losers"
+        label, noun = ("Gainers", "gainer") if direction == "gainers" else ("Losers", "loser")
         lines: List[str] = []
         lines.append(f"## Market {label} ({len(rows)} stocks)")
         lines.append(f"**Retrieved:** {timestamp}")
+        if rows and any(m["symbol"] in traded for m in movers):
+            untimed = "" if all(m["symbol"] in traded for m in movers) else ", or its day close where Last Trade is N/A"
+            lines.append(
+                f"**Prices:** each stock's latest trade{on_day}"
+                f" (ET){untimed}; Change% is from the previous close"
+            )
+        if excluded:
+            lines.append(
+                f"**Excluded (under ${_MIN_TRADED_VALUE:,} traded{excluded_day}):** {', '.join(excluded)}"
+            )
         lines.append("")
 
         if not rows:
-            lines.append(f"No {direction} data available.")
+            lines.append(
+                f"No {noun} traded ${_MIN_TRADED_VALUE:,} or more{excluded_day}." if excluded
+                else f"No {direction} data available."
+            )
         else:
-            lines.append("| # | Symbol | Name | Price | Change% |")
-            lines.append("|---|--------|------|-------|---------|")
+            # Names come only for listings the directory knows (CN, HK); a column
+            # of N/A invites the reader to supply names from memory.
+            named = any(row["name"] for row in rows)
+            header = ["#", "Symbol", *(["Name"] if named else []), "Price", "Change%", "Last Trade (ET)"]
+            lines.append(f"| {' | '.join(header)} |")
+            lines.append(f"|{'|'.join('-' * (len(h) + 2) for h in header)}|")
             for i, (row, ref) in enumerate(zip(rows, refs), 1):
                 sym = row["symbol"]
                 name = row["name"] or "N/A"
                 if len(name) > 30:
                     name = name[:27] + "..."
-                price_str = fmt_price(row["price"], _symbol_currency(ref))
+                price_str = fmt_quote(row["price"], _symbol_currency(ref))
                 change_pct = row["change_percent"]
                 if change_pct is not None:
                     change_str = f"{change_pct:+.2f}%"
                 else:
                     change_str = "N/A"
-                lines.append(f"| {i} | {sym} | {name} | {price_str} | {change_str} |")
+                trade_str = _trade_session(ref, traded.get(sym), newest)
+                cells = [str(i), sym, *([name] if named else []), price_str, change_str, trade_str]
+                lines.append(f"| {' | '.join(cells)} |")
 
         content = "\n".join(lines)
         artifact = {
@@ -279,73 +354,40 @@ async def fetch_quote(
     asset_type: str = "stocks",
     config: Optional[RunnableConfig] = None,
 ) -> Tuple[str, Dict[str, Any]]:
-    """Fetch real-time quotes for up to 20 symbols via the snapshot provider chain."""
+    """Fetch real-time quotes for up to 20 symbols through the shared quote cache."""
     empty = {"type": "quote", "quotes": []}
     # LLM-supplied value that reaches the provider request path — restrict to
     # the two documented values so it can't smuggle path segments.
     if asset_type not in ("stocks", "indices"):
         asset_type = "stocks"
     asset_class = AssetClass.INDEX if asset_type == "indices" else AssetClass.EQUITY
-    syms = [display_spelling(s) for s in (symbols or []) if s and s.strip()][:20]
+    # Two spellings of one listing (BRK.B, BRK-B) ask for it once.
+    syms = list(dict.fromkeys(display_spelling(s) for s in (symbols or []) if s and s.strip()))[:20]
     if not syms:
         return "No symbols provided.", empty
     try:
-        provider = await get_market_data_provider()
-        user_id = _get_user_id(config)
-        # Canonicalize each symbol to the legacy REST spelling the snapshot
-        # provider chain expects (e.g. "0700.HK", index "^GSPC" -> "GSPC").
         # The class decides a bare alias: on the stocks path COMP is Compass,
-        # not the Nasdaq Composite.
-        listings = [resolve_listing(s, asset_class) for s in syms]
-        resolved = [spelling for _, spelling in listings]
-        asked = {snapshot_key(spelling): ref for ref, spelling in listings if ref is not None}
-        # DALTON-HOOK(stock-move-upgrade): caret-prefixed indexes (^TNX, ^VIX) passed in a
-        # mixed "stocks" batch resolve to AssetClass.INDEX with their caret stripped; query
-        # them on the indices path so Yahoo/FMP re-apply the caret.
-        if asset_type == "stocks" and any(
-            ref is not None and ref.asset_class is AssetClass.INDEX for ref, _ in listings
-        ):
-            stock_resolved = [
-                sp for ref, sp in listings if ref is None or ref.asset_class is not AssetClass.INDEX
-            ]
-            index_resolved = [
-                sp for ref, sp in listings if ref is not None and ref.asset_class is AssetClass.INDEX
-            ]
-            snaps = []
-            if stock_resolved:
-                snaps.extend(
-                    await provider.get_snapshots(
-                        stock_resolved, asset_type="stocks", user_id=user_id
-                    )
-                )
-            if index_resolved:
-                snaps.extend(
-                    await provider.get_snapshots(
-                        index_resolved, asset_type="indices", user_id=user_id
-                    )
-                )
-        else:
-            snaps = await provider.get_snapshots(resolved, asset_type=asset_type, user_id=user_id)
-        if asset_type == "stocks":
+        # not the Nasdaq Composite. A spelling only an index has (^GSPC, I:SPX,
+        # SPX.INDEX) resolves as the index on either path, and the cache asks
+        # each instrument on the endpoint of the class it resolved to.
+        refs = {s: resolve_ref(s, asset_class) for s in syms}
+        quotes, failure = await QuoteCacheService.get_instance().fetch_quotes(
+            [ref for ref in refs.values() if ref is not None],
+            _get_user_id(config),
             # A listing no provider quotes (Beijing has no realtime one) reads
             # its last daily close while its venue is closed, as the REST
             # quote routes do; empty, the agent goes to the web for it.
-            from src.server.services.cache.quote_daily_fallback import fill_from_daily
-
-            stock_asked = [
-                r for r in asked.values() if r.asset_class is not AssetClass.INDEX
-            ]  # DALTON-HOOK(stock-move-upgrade)
-            served = [
-                (asked[k], s)
-                for s in snaps
-                if (k := snapshot_key(s.get("symbol"))) in asked
-                and asked[k].asset_class is not AssetClass.INDEX
-            ]
-            filled = await fill_from_daily(served, stock_asked, user_id)
-            snaps = [*snaps, *(row for _, row in filled[len(served):])]
-        # The card names each row as the REST routes do; a daily row has none.
-        await fill_quote_names(snaps)
-        if not snaps:
+            daily_fallback=True,
+            # Read from the chain, not a row another request cached, so the
+            # Source fallbacks note names what this read's chain took.
+            fresh=True,
+        )
+        for ref, row in quotes:
+            if row.get("source") == "daily":
+                fallbacks.answered(snapshot_key(to_legacy_api(ref)), "quote", "daily close")
+        if not quotes:
+            if failure is not None:
+                raise failure.error
             _mark_no_data()
             return f"No quote data available for {', '.join(syms)}.", empty
         # Stamp each row with what it actually is: the declared tier, the
@@ -355,42 +397,50 @@ async def fetch_quote(
         # not located by the retrieval clock at all.
         retrieved_at = datetime.now(timezone.utc)
         all_realtime = True
-        for snap in snaps:
-            # Each row is the listing it was asked as and is measured on that
-            # listing's clock; the vendor's caret-free echo (GSPC) cannot tell
-            # an index from a stock, and a stock read as an index has its
-            # after-hours print called closed.
-            ref = asked.get(snapshot_key(snap.get("symbol"))) or resolve_ref(
-                snap.get("symbol"), asset_class
-            )
-            if ref is not None:
-                snap["asset_class"] = ref.asset_class.value
+        snaps: List[Dict[str, Any]] = []
+        for ref, row in quotes:
+            # A copy, since requests that shared one fetch share its rows. Each
+            # row is measured on the clock of the listing it was asked as; a
+            # stock read as an index has its after-hours print called closed.
+            snap = {**row, "asset_class": ref.asset_class.value}
             snap.update(stamp_quote(snap, retrieved_at, ref=ref))
+            # DALTON-HOOK(extended-hours-quotes): Preserve the regular-session
+            # close before current_price() overwrites snap["price"] with the
+            # extended-hours last_trade_price.
+            if "regular_close" not in snap or snap["regular_close"] is None:
+                snap["regular_close"] = snap.get("price")
+            # The row's price is the one its line shows: the last trade, which
+            # before the open is all a snapshot has.
+            snap["price"] = current_price(snap)
             # The card prints each row in its listing currency; an index level
             # is a bare number, so index rows carry none.
-            if (
-                asset_type == "stocks"
-                and ref is not None
-                and ref.asset_class is not AssetClass.INDEX  # DALTON-HOOK(stock-move-upgrade)
-                and not snap.get("currency")
-            ):
+            if ref.asset_class is not AssetClass.INDEX and not snap.get("currency"):  # DALTON-HOOK(stock-move-upgrade)
                 snap["currency"] = ref.price_currency
             all_realtime = all_realtime and is_live(snap["freshness"])
+            snaps.append(snap)
         content = format_quote_block(snaps, at=retrieved_at)
         # A batch can be split across the chain: one stable name for the set.
         sources = {snap.get("source") for snap in snaps}
         stamp_tool_provider(
             ",".join(sorted(s for s in sources if isinstance(s, str) and s)) or None
         )
-        # Diff on the RESOLVED spelling the provider actually saw (an alias like
-        # "SPX" is requested as "GSPC"), but report under the caller's input
-        # label, matched as the provider chain matches its rows.
-        returned = {snapshot_key(s.get("symbol")) for s in snaps}
+        # Report under the caller's input label. A failed request is not an
+        # absent listing: the agent may retry it, and a listing whose sources
+        # failed is named in the Source fallbacks note.
+        key = QuoteCacheService.quote_key
+        unreached = {key(ref) for ref in failure.refs} if failure else set()
+        seen = unreached | {key(ref) for ref, _ in quotes}
+        unsourced = {f.symbol for f in fallbacks.taken() if f.what == "quote" and f.served_by is None}
         missing = sorted(
-            syms[i] for i, r in enumerate(resolved) if snapshot_key(r) not in returned
+            s for s, ref in refs.items()
+            if ref is None or (key(ref) not in seen and snapshot_key(to_legacy_api(ref)) not in unsourced)
         )
         if missing:
             content += f"\n(no data: {', '.join(missing)})"
+        if failure is not None:
+            _mark_failure(failure.error)
+            failed = sorted(s for s, ref in refs.items() if ref is not None and key(ref) in unreached)
+            content += f"\n(request failed: {', '.join(failed)})"
         return content, {
             "type": "quote",
             "quotes": snaps,

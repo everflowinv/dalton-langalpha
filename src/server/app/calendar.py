@@ -86,7 +86,7 @@ async def get_economic_calendar(
         None, alias="from", description="Start date (YYYY-MM-DD). Defaults to today."
     ),
     to_date: Optional[str] = Query(
-        None, alias="to", description="End date (YYYY-MM-DD). Defaults to from+7."
+        None, alias="to", description="End date (YYYY-MM-DD). Defaults to 7 days after from."
     ),
 ) -> EconomicCalendarResponse:
     """Get upcoming and past economic data releases (GDP, CPI, etc.)."""
@@ -142,7 +142,7 @@ async def get_earnings_calendar(
         None, alias="from", description="Start date (YYYY-MM-DD). Defaults to today."
     ),
     to_date: Optional[str] = Query(
-        None, alias="to", description="End date (YYYY-MM-DD). Defaults to from+7."
+        None, alias="to", description="End date (YYYY-MM-DD). Defaults to 7 days after from."
     ),
 ) -> EarningsCalendarResponse:
     """Get upcoming and past earnings announcements with EPS and revenue data."""
@@ -188,7 +188,8 @@ async def get_earnings_calendar(
     if raw is not None:
         items: list = raw or []
         events = [EarningsEvent(**item) for item in items]
-        await _earnings_cache.set(items, from_date, to_date)
+        if not getattr(raw, "truncated", False):
+            await _earnings_cache.set(items, from_date, to_date)
     else:
         # DALTON-HOOK(market-data-fallback): Yahoo's calendar stands in for
         # FMP's; only a Yahoo failure too returns the empty 200 below.

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import create_autospec
 
 import pytest
 
@@ -40,9 +40,10 @@ def _artifact(artifact_id: str) -> Artifact:
 def _captured(*paths: str) -> SimpleNamespace:
     return SimpleNamespace(
         files=[SimpleNamespace(path=p) for p in paths],
-        entries=[],
+        entries=[SimpleNamespace(path=p, reason="page") for p in paths],
+        left_out=[],
         total=10,
-        blobs=[],
+        blobs={},
         title=None,
     )
 
@@ -61,12 +62,13 @@ def owners_workspace(monkeypatch):
     monkeypatch.setattr(
         snapshot,
         "db_get_workspace",
-        AsyncMock(
+        create_autospec(
+            snapshot.db_get_workspace,
             return_value={
                 "workspace_id": "ws-1",
                 "user_id": _OWNER,
                 "status": "running",
-            }
+            },
         ),
     )
 
@@ -81,10 +83,14 @@ async def test_a_colleague_turn_cuts_the_owners_link_as_the_owner(
     monkeypatch.setattr(
         snapshot.artifacts_db,
         "list_kept_updated",
-        AsyncMock(return_value=[artifact]),
+        create_autospec(
+            snapshot.artifacts_db.list_kept_updated, return_value=[artifact]
+        ),
     )
-    capture = AsyncMock(return_value=_captured(*artifact.files))
-    cut = AsyncMock()
+    capture = create_autospec(
+        snapshot._capture, return_value=_captured(*artifact.files)
+    )
+    cut = create_autospec(snapshot._cut)
     monkeypatch.setattr(snapshot, "_capture", capture)
     monkeypatch.setattr(snapshot, "_cut", cut)
 
@@ -108,9 +114,13 @@ async def test_one_links_failure_never_stops_the_workspaces_others(
     monkeypatch.setattr(
         snapshot.artifacts_db,
         "list_kept_updated",
-        AsyncMock(return_value=[first, second]),
+        create_autospec(
+            snapshot.artifacts_db.list_kept_updated, return_value=[first, second]
+        ),
     )
-    keep_one = AsyncMock(side_effect=[Exception("record gone"), None])
+    keep_one = create_autospec(
+        snapshot._keep_one, side_effect=[Exception("record gone"), None]
+    )
     monkeypatch.setattr(snapshot, "_keep_one", keep_one)
 
     # Never raises: the failure is logged for the one link and the loop goes on.

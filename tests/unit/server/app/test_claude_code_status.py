@@ -41,8 +41,7 @@ async def client():
 def _switches(*, runs=True, rows=True, opted_in=True):
     """The server's switches and the user's opt-in, as the flow and the store read them."""
     with (
-        patch(f"{FLOW}.backend_available", return_value=runs and rows),
-        patch(f"{SAVED}.backend_available", return_value=runs and rows),
+        patch("src.server.services.claude_code.hosted.backend_available", return_value=runs and rows),
         patch(f"{FLOW}.rows_available", return_value=rows),
         patch(f"{FLOW}.user_feature_enabled", new_callable=AsyncMock, return_value=opted_in),
     ):
@@ -55,7 +54,7 @@ async def _status(client, *, token="tok", answer=True, runs=True, rows=True, opt
     with (
         serving(cache if cache is not None else _Cache()),
         _switches(runs=runs, rows=rows, opted_in=opted_in),
-        patch(f"{SAVED}.stored_row", new_callable=AsyncMock, return_value={"access_token": token} if token else None),
+        patch(f"{SAVED}.stored_row", new_callable=AsyncMock, return_value={"access_token": token, "updated_at": None} if token else None),
         patch(f"{SAVED}.get_oauth_connection", new_callable=AsyncMock, return_value={"email": None} if token else None),
         patch("ptc_agent.agent.claude_code.runtime.token_works", check),
     ):

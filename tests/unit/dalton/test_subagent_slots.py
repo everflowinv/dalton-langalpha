@@ -1891,4 +1891,242 @@ class TestRound2Fixes:
             *(t.asyncio_task for t in (t1_a, t2_a, t3_a) if t.asyncio_task is not None)
         )
 
+    @pytest.mark.asyncio
+    async def test_release_subagent_slot_holds_slot_until_straggler_finishes_before_queued_peer_starts(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        fast_polling: ControllableClock,
+    ) -> None:
+        """When cap is 1 and A has a running straggler, release_subagent_slot(A)
+        keeps the slot occupied (and lease renewal active) so queued B cannot
+        acquire it until A's straggler finishes; cancelling the background
+        waiter still releases the slot without swallowing CancelledError.
+        """
+        cache, engine = make_fake_cache()
+        monkeypatch.setattr(subagent_slots, "get_cache_client", lambda: cache)
+        monkeypatch.setattr(
+            subagent_slots,
+            "get_subagent_limits",
+            lambda: SubagentLimits(max_running_per_thread=1, max_running_global=1),
+        )
+
+        reg = BackgroundTaskRegistry(thread_id="thread-straggler-cap")
+        task_a = await reg.register(
+            tool_call_id="tc-a",
+            description="task A",
+            prompt="p",
+            subagent_type="research",
+        )
+        task_b = await reg.register(
+            tool_call_id="tc-b",
+            description="task B",
+            prompt="p",
+            subagent_type="research",
+        )
+
+        lease_a = await subagent_slots.reserve_subagent_slot(
+            task_a,
+            "thread-straggler-cap",
+            clock=fast_polling,
+            renew_interval_s=30.0,
+        )
+        lease_b = await subagent_slots.reserve_subagent_slot(
+            task_b,
+            "thread-straggler-cap",
+            clock=fast_polling,
+            renew_interval_s=30.0,
+        )
+        assert lease_a is not None and lease_a.status == "running"
+        assert lease_b is not None and lease_b.is_queued
+
+        straggler_gate = asyncio.Event()
+
+        async def _slow_tool_cleanup() -> None:
+            await straggler_gate.wait()
+
+        straggler = asyncio.create_task(_slow_tool_cleanup())
+        task_a.keep_straggler(straggler)
+
+        b_waiter = asyncio.create_task(
+            subagent_slots.wait_for_subagent_slot(task_b, registry=reg)
+        )
+        await asyncio.sleep(0)
+
+        # Release A while its straggler is still running: slot stays occupied.
+        await release_subagent_slot(task_a)
+        await asyncio.sleep(0.03)
+
+        assert not lease_a._released
+        assert lease_a._renew_task is not None and not lease_a._renew_task.done()
+        assert engine._zcard(thread_slots_key("thread-straggler-cap")) == 1
+        assert engine._zcard(global_slots_key()) == 1
+        assert lease_b.is_queued
+        assert not b_waiter.done()
+
+        # Renewal continues to work while waiting for the straggler.
+        fast_polling.advance(60.0)
+        assert await lease_a.renew_once() is True
+
+        # Once A's straggler finishes, A's slot releases and B acquires it.
+        straggler_gate.set()
+        await straggler
+        await asyncio.wait_for(b_waiter, timeout=1.0)
+
+        assert lease_a._released
+        assert not lease_b.is_queued
+        assert lease_b.status == "running"
+        await release_subagent_slot(task_b)
+        assert engine._zcard(thread_slots_key("thread-straggler-cap")) == 0
+
+        # Also verify cancelling the background straggler waiter releases the
+        # slot in finally and does not swallow CancelledError.
+        task_c = await reg.register(
+            tool_call_id="tc-c",
+            description="task C",
+            prompt="p",
+            subagent_type="research",
+        )
+        lease_c = await reserve_subagent_slot(
+            task_c,
+            "thread-straggler-cap",
+            clock=fast_polling,
+            renew_interval_s=30.0,
+        )
+        assert lease_c is not None and lease_c.status == "running"
+        hung_straggler = asyncio.create_task(asyncio.Event().wait())
+        task_c.keep_straggler(hung_straggler)
+        await release_subagent_slot(task_c)
+        waiter_c = getattr(lease_c, "_straggler_release_task", None)
+        assert waiter_c is not None and not waiter_c.done()
+
+        waiter_c.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter_c
+        assert lease_c._released
+        assert engine._zcard(thread_slots_key("thread-straggler-cap")) == 0
+        hung_straggler.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await hung_straggler
+
+    @pytest.mark.asyncio
+    async def test_release_subagent_slot_releases_immediately_when_no_stragglers(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        fast_polling: ControllableClock,
+    ) -> None:
+        """Without unfinished stragglers, release_subagent_slot releases immediately."""
+        cache, engine = make_fake_cache()
+        monkeypatch.setattr(subagent_slots, "get_cache_client", lambda: cache)
+        monkeypatch.setattr(
+            subagent_slots,
+            "get_subagent_limits",
+            lambda: SubagentLimits(max_running_per_thread=1, max_running_global=1),
+        )
+
+        reg = BackgroundTaskRegistry(thread_id="thread-no-straggler")
+        task_a = await reg.register(
+            tool_call_id="tc-immediate",
+            description="immediate",
+            prompt="p",
+            subagent_type="research",
+        )
+        lease_a = await reserve_subagent_slot(
+            task_a,
+            "thread-no-straggler",
+            clock=fast_polling,
+            renew_interval_s=30.0,
+        )
+        assert lease_a is not None and lease_a.status == "running"
+        assert engine._zcard(thread_slots_key("thread-no-straggler")) == 1
+
+        await release_subagent_slot(task_a)
+        assert lease_a._released is True
+        assert getattr(lease_a, "_straggler_release_task", None) is None
+        assert engine._zcard(thread_slots_key("thread-no-straggler")) == 0
+        assert engine._zcard(global_slots_key()) == 0
+
+    @pytest.mark.asyncio
+    async def test_release_subagent_slot_called_twice_releases_only_once(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        fast_polling: ControllableClock,
+    ) -> None:
+        """Calling release_subagent_slot multiple times (both with and without
+        active stragglers) registers at most one waiter and invokes lease.release
+        only once.
+        """
+        cache, _ = make_fake_cache()
+        monkeypatch.setattr(subagent_slots, "get_cache_client", lambda: cache)
+        monkeypatch.setattr(
+            subagent_slots,
+            "get_subagent_limits",
+            lambda: SubagentLimits(max_running_per_thread=2, max_running_global=2),
+        )
+
+        reg = BackgroundTaskRegistry(thread_id="thread-idempotent-release")
+        task_a = await reg.register(
+            tool_call_id="tc-idem-a",
+            description="with straggler",
+            prompt="p",
+            subagent_type="research",
+        )
+        lease_a = await reserve_subagent_slot(
+            task_a,
+            "thread-idempotent-release",
+            clock=fast_polling,
+            renew_interval_s=30.0,
+        )
+        assert lease_a is not None
+        orig_release_a = lease_a.release
+        release_spy_a = create_autospec(orig_release_a, side_effect=orig_release_a)
+        monkeypatch.setattr(lease_a, "release", release_spy_a)
+
+        gate = asyncio.Event()
+        straggler = asyncio.create_task(gate.wait())
+        task_a.keep_straggler(straggler)
+
+        # Two back-to-back calls while straggler is still running (run_handler
+        # finally + _settle_terminal_run): only one waiter is created and
+        # lease.release has not been called yet.
+        await release_subagent_slot(task_a)
+        first_waiter = getattr(lease_a, "_straggler_release_task", None)
+        await release_subagent_slot(task_a)
+        second_waiter = getattr(lease_a, "_straggler_release_task", None)
+
+        assert first_waiter is not None
+        assert second_waiter is first_waiter
+        assert release_spy_a.await_count == 0
+
+        gate.set()
+        await straggler
+        await asyncio.wait_for(first_waiter, timeout=1.0)
+        assert release_spy_a.await_count == 1
+
+        # Calling again after straggler completion is also a no-op.
+        await release_subagent_slot(task_a)
+        assert release_spy_a.await_count == 1
+
+        # Without stragglers: two calls also invoke lease.release only once.
+        task_b = await reg.register(
+            tool_call_id="tc-idem-b",
+            description="without straggler",
+            prompt="p",
+            subagent_type="research",
+        )
+        lease_b = await reserve_subagent_slot(
+            task_b,
+            "thread-idempotent-release",
+            clock=fast_polling,
+            renew_interval_s=30.0,
+        )
+        assert lease_b is not None
+        orig_release_b = lease_b.release
+        release_spy_b = create_autospec(orig_release_b, side_effect=orig_release_b)
+        monkeypatch.setattr(lease_b, "release", release_spy_b)
+
+        await release_subagent_slot(task_b)
+        await release_subagent_slot(task_b)
+        assert release_spy_b.await_count == 1
+
+
 

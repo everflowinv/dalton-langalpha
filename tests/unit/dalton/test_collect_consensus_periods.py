@@ -102,12 +102,19 @@ def _real_analysis_with_trend() -> Any:
         }
 
     analysis = Analysis(None, "TEST")
-    analysis._earnings_trend = [
-        _period("0q", "2026-12-31", 1.03, 2.07e9),
-        _period("+1q", "2027-03-31", 1.11, 2.2e9),
-        _period("0y", "2026-12-31", 4.3, 9.1e9),
-        _period("+1y", "2027-12-31", 4.49, 10.1e9),
-    ]
+    # yfinance 1.8.0 caches the whole earningsTrend module per EPS methodology
+    # (None is the default the public tables read), not the bare 1.7 list.
+    analysis._earnings_trend = {
+        None: {
+            "trend": [
+                _period("0q", "2026-12-31", 1.03, 2.07e9),
+                _period("+1q", "2027-03-31", 1.11, 2.2e9),
+                _period("0y", "2026-12-31", 4.3, 9.1e9),
+                _period("+1y", "2027-12-31", 4.49, 10.1e9),
+            ],
+            "defaultMethodology": "normalized",
+        }
+    }
     return analysis
 
 
@@ -122,7 +129,7 @@ def test_snapshot_carries_period_end_from_yahoo_trend(
     ticker_stub = type("TickerStub", (), {})()
     ticker_stub._analysis = analysis
     # fetch_consensus_snapshot 经 getattr(t, field) 读四个表属性——用真实
-    # Analysis 的属性结果，锁定 yfinance 1.7.0 的真实数据形状。
+    # Analysis 的属性结果，锁定 yfinance 1.8.0 的真实数据形状。
     for field in ("earnings_estimate", "revenue_estimate", "eps_trend", "eps_revisions"):
         setattr(ticker_stub, field, getattr(analysis, field))
     ticker_stub.analyst_price_targets = {

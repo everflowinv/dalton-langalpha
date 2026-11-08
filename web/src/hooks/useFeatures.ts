@@ -2,6 +2,7 @@ import { queryOptions, useMutation, useQuery, useQueryClient } from '@tanstack/r
 import { queryKeys } from '../lib/queryKeys';
 import { getFeatures, setFeatureOverride } from '../api/features';
 import type { FeatureState } from '../types/api';
+import type { ClaudeCodeSetup } from '../api/model';
 
 // Flags change rarely; a 5-minute window avoids re-fetching on every mount
 // while still picking up server-side changes within a session.
@@ -35,18 +36,33 @@ export function useFeatureEnabled(key: string): boolean {
 }
 
 /** Mutation for a user override; setQueryData propagates the returned list
- *  instantly, and whatever is read under the flag's own key is read again. */
+ *  instantly, and whatever is read under the flag's own key is read again.
+ *  Toggling Claude Code also reads its choice for cloud computers again,
+ *  kept under the keys, and its status and computers, success or not:
+ *  turning it off drops a stored token, choice too, even where a turn on it
+ *  then fails to stop and the toggle is refused. */
 export function useSetFeatureOverride() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: ({ key, enabled }: { key: string; enabled: boolean | null }) =>
       setFeatureOverride(key, enabled),
-    onSuccess: (features: FeatureState[], { key }) => {
+    onSuccess: (features: FeatureState[], { key, enabled }) => {
       queryClient.setQueryData(queryKeys.features.list(), features);
+      // The setup answer says whether Claude Code is on; a reread that fails
+      // must not leave it saying otherwise.
+      if (key === 'claude_code_runtime' && enabled !== null) {
+        queryClient.setQueryData<ClaudeCodeSetup | null>(queryKeys.features.claudeCodeSetup(), (setup) => setup && { ...setup, on: enabled });
+      }
       queryClient.invalidateQueries({ queryKey: queryKeys.features.of(key) });
     },
     onError: () => {
       queryClient.invalidateQueries({ queryKey: queryKeys.features.list() });
+    },
+    onSettled: (_features, _error, { key }) => {
+      if (key === 'claude_code_runtime') {
+        queryClient.invalidateQueries({ queryKey: queryKeys.user.claudeCodeCustody() });
+        queryClient.invalidateQueries({ queryKey: queryKeys.features.claudeCode() });
+      }
     },
   });
 }

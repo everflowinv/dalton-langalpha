@@ -15,7 +15,7 @@ permanently stale against the wrong calendar.
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from functools import lru_cache
 from typing import Protocol
 from zoneinfo import ZoneInfo
@@ -29,7 +29,6 @@ from market_protocol.calendars import (
 )
 from market_protocol.enums import AssetClass, MarketPhase
 from market_protocol.symbology import UNKNOWN_MIC
-from src.data_client.normalize import _US_CLASS_SUFFIXES, is_us_class_share  # noqa: F401 (re-export)
 from src.utils.market_hours import LEGACY_PHASE, interval_seconds
 
 logger = logging.getLogger(__name__)
@@ -207,13 +206,23 @@ class CalendarClock:
         return edge
 
     def today_market_open_ms(self) -> int | None:
-        """Today's session open (exchange-local date), None before it opens."""
+        """Today's session open (exchange-local date), None before it opens.
+
+        A session that opened the evening before (CME Globex) answers local
+        midnight: a window from today starts there, not at the eve's open. On
+        a day with no session of its own (Sunday), the next day's session
+        answers once it has opened on that evening.
+        """
         now = datetime.now(timezone.utc)
+        now_ms = int(now.timestamp() * 1000)
         local_date = now.astimezone(self.tz).date()
         open_ms = self._cal.session_open_ms(local_date)
-        if open_ms is None or int(now.timestamp() * 1000) < open_ms:
+        if open_ms is None:
+            open_ms = self._cal.session_open_ms(local_date + timedelta(days=1))
+        if open_ms is None or now_ms < open_ms:
             return None
-        return open_ms
+        midnight_ms = int(datetime.combine(local_date, time(0, 0), tzinfo=self.tz).timestamp() * 1000)
+        return max(open_ms, midnight_ms)
 
 
 # Index families whose daily bars follow the US (XNYS) calendar. An unknown
@@ -237,9 +246,7 @@ def _classify(ref: InstrumentRef, is_index: bool, regular_only: bool = False) ->
         backstop = ref.calendar_id != "XNYS" or ref.index_family in _US_CALENDAR_INDEXES
         return CalendarClock(cal, daily_backstop=backstop, regular_only=True)
     if ref.calendar_id == "XNYS" and ref.mic == UNKNOWN_MIC:
-        return CalendarClock(
-            cal, daily_backstop=is_us_class_share(ref), regular_only=regular_only,
-        )
+        return CalendarClock(cal, daily_backstop=False, regular_only=regular_only)
     return CalendarClock(cal, regular_only=regular_only)
 
 

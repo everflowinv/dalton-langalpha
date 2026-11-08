@@ -98,11 +98,11 @@ def _period_granularity(per: str) -> str | None:
 
 
 def _extract_period_end_dates(ticker_obj: Any) -> dict[str, str]:
-    """从 yfinance 的原始 earningsTrend 列表取每个相对期间的真实结束日。
+    """从 yfinance 缓存的原始 earningsTrend 取每个相对期间的真实结束日（1.7 是列表，1.8.0 是按 EPS 口径分组的字典）。
 
     Yahoo 的 earningsTrend 每个期间都带 endDate；yfinance 的公开 DataFrame
     （earnings_estimate / revenue_estimate）在构造时把它丢掉了，所以这里从
-    Analysis 对象缓存的原始列表读回。属性是 yfinance 的内部缓存，版本漂移或
+    Analysis 对象缓存的原始数据读回。属性是 yfinance 的内部缓存，版本漂移或
     结构变化时返回空 dict——下游按"无期间信息"处理，不算修正。"""
     try:
         analysis = getattr(ticker_obj, "_analysis", None)
@@ -110,6 +110,16 @@ def _extract_period_end_dates(ticker_obj: Any) -> dict[str, str]:
     except Exception:  # noqa: BLE001 - 内部属性读取失败即无期间信息
         return {}
     out: dict[str, str] = {}
+    # yfinance 1.7 caches the raw list; 1.8.0 caches the whole module per EPS
+    # methodology ({None: {"trend": [...], ...}}), None being the default one
+    # earnings_estimate / revenue_estimate are built from.
+    if isinstance(trend, dict):
+        module = trend.get(None)
+        if not isinstance(module, dict):
+            module = next(
+                (m for m in trend.values() if isinstance(m, dict) and "trend" in m), None
+            )
+        trend = module.get("trend") if isinstance(module, dict) else None
     if isinstance(trend, list):
         for item in trend:
             if not isinstance(item, dict):

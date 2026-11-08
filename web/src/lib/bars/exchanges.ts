@@ -27,6 +27,9 @@ export interface ExchangeInfo {
    *  accepted, but `.SH` is the one stored, compared and shown (the backend's
    *  `display_spelling`). */
   displayAs?: string;
+  /** Places between the venue's quote unit and its currency's major unit:
+   *  London quotes in pence, which the backend serves in pounds. */
+  minorUnitPlaces?: number;
   /** Code prefix that marks an index on this venue. CN code ranges are
    *  partitioned by instrument type, so the code alone names the class
    *  (the backend's `_CN_INDEX_PREFIXES`). */
@@ -41,7 +44,7 @@ export interface ExchangeInfo {
 export const US_MARKET_TZ = 'America/New_York';
 
 const EXCHANGE_SUFFIXES: Record<string, ExchangeInfo> = {
-  L: { currency: 'GBP', foreign: true, tz: 'Europe/London', label: 'LON' }, // London
+  L: { currency: 'GBP', foreign: true, tz: 'Europe/London', label: 'LON', minorUnitPlaces: 2 }, // London
   HK: { currency: 'HKD', foreign: true, tz: 'Asia/Hong_Kong', label: 'HK', codeWidth: 4 }, // Hong Kong
   T: { currency: 'JPY', foreign: true, tz: 'Asia/Tokyo', label: 'TYO' }, // Tokyo
   TO: { currency: 'CAD', foreign: true, tz: 'America/Toronto', label: 'TSX' }, // Toronto
@@ -107,9 +110,19 @@ function exchangeInfoForSymbol(symbol: string): ExchangeInfo | null {
 }
 
 /**
+ * A US class share's stem and class in either spelling (`BRK.B`, `BRK-B`),
+ * or null. Only these classes read so: a lone letter after a dot names a venue
+ * elsewhere (`SAP.F` is Frankfurt).
+ */
+export function usClassShare(symbol: string): [string, string] | null {
+  const share = /^([A-Z]+)[.-]([ABC])$/.exec(symbol);
+  return share ? [share[1], share[2]] : null;
+}
+
+/**
  * The spelling a symbol is stored, compared and shown in: trimmed, uppercased,
  * and with its venue suffix and code in our form (`600519.ss` becomes
- * `600519.SH`, `700.HK` becomes `0700.HK`). Mirrors the backend's
+ * `600519.SH`, `700.HK` becomes `0700.HK`, `BRK.B` becomes `BRK-B`). Mirrors the backend's
  * `display_spelling`, so applying it where a symbol enters the page means
  * every key built from it matches the server's. A Chinese IME's full-width
  * forms fold first, and its ideographic full stop reads as a dot.
@@ -117,7 +130,10 @@ function exchangeInfoForSymbol(symbol: string): ExchangeInfo | null {
 export function displaySpelling(symbol: string): string {
   const s = symbol.normalize('NFKC').replace(/。/g, '.').trim().toUpperCase();
   const venue = splitVenueSuffix(s);
-  if (!venue) return s;
+  if (!venue) {
+    const share = usClassShare(s);
+    return share ? share.join('-') : s;
+  }
   const { stem, info } = venue;
   const code =
     info.codeWidth && /^\d+$/.test(stem)
@@ -145,6 +161,12 @@ export function isIndexListing(symbol: string | null | undefined, assetClass?: s
 export function currencyForSymbol(symbol?: string | null): string {
   if (!symbol) return 'USD';
   return exchangeInfoForSymbol(symbol)?.currency ?? 'USD';
+}
+
+/** Places a GBP price from a pence-quoted venue carries past the penny. */
+export function minorUnitPlacesForSymbol(symbol?: string | null): number {
+  if (!symbol) return 0;
+  return exchangeInfoForSymbol(symbol)?.minorUnitPlaces ?? 0;
 }
 
 /** Short venue name for a ticker's listing (`HK`, `SH`, `LON`), or null for

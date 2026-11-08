@@ -13,7 +13,10 @@ import { useQueryClient } from '@tanstack/react-query';
 import { getMarketDataWSUrl } from '../utils/api';
 import { getAccessToken } from '@/lib/authToken';
 import { writeQuoteFromWs } from '@/lib/quotes';
-import { timezoneForSymbol } from '@/lib/bars/exchanges';
+import { stockKey, type QuoteRow } from '@/lib/quotes/quoteBatcher';
+import { queryKeys } from '@/lib/queryKeys';
+import { timezoneForSymbol, usClassShare } from '@/lib/bars/exchanges';
+import { getExtendedHoursType } from '@/lib/bars/marketSession';
 import { dateStrInTz, utcMsToChartSec } from '@/lib/utils';
 // Reconnect parameters
 const INITIAL_BACKOFF_MS = 1000;
@@ -21,6 +24,19 @@ const MAX_BACKOFF_MS = 30000;
 const BACKOFF_MULTIPLIER = 2;
 const STALE_TIMEOUT_MS = 45000; // close if no message in 45s
 const HIDDEN_CLOSE_DELAY_MS = 60000; // close 60s after page hidden
+// A print older than this is no longer live: the socket stays up on
+// keepalives after the close, so its being connected says nothing about data.
+const TICK_MAX_AGE_MS = 5 * 60000;
+const TICK_SWEEP_MS = 30000;
+
+// The feed spells a US class share as Massive does (BRK.B) whichever spelling
+// subscribed to it (BRK-B), so a print belongs to each subscribed spelling.
+function subscribedSpellings(subscribed: Map<string, number>, symbol: string): string[] {
+  const share = usClassShare(symbol);
+  if (!share) return [symbol];
+  const spellings = [share.join('.'), share.join('-')].filter((s) => subscribed.has(s));
+  return spellings.length > 0 ? spellings : [symbol];
+}
 
 export interface BarData {
   time: number;
@@ -34,13 +50,15 @@ export interface BarData {
 export interface PriceUpdate {
   symbol: string;
   price: number;
-  open: number;
-  high: number;
-  low: number;
+  /** The day's regular-session open, high and low; null until a source states them. */
+  open: number | null;
+  high: number | null;
+  low: number | null;
   close: number;
   volume: number;
-  change: number;
-  changePercent: number;
+  /** Against the previous close; null when the symbol's quote row states none. */
+  change: number | null;
+  changePercent: number | null;
   timestamp: number;
   barData: BarData;
 }
@@ -55,15 +73,13 @@ export interface UseMarketDataWSReturn {
   ginlixDataEnabled: boolean;
   subscribe: (symbols: string[]) => void;
   unsubscribe: (symbols: string[]) => void;
-  setPreviousClose: (symbol: string, price: number) => void;
-  setDayOpen: (symbol: string, price: number) => void;
 }
 
 interface SessionData {
   date: string;
-  open: number;
-  high: number;
-  low: number;
+  open: number | null;
+  high: number | null;
+  low: number | null;
   volume: number;
 }
 
@@ -86,10 +102,9 @@ export default function useMarketDataWS(): UseMarketDataWSReturn {
 
   // Session OHLCV tracking per symbol (reset on new trading day)
   const sessionDataRef = useRef<Map<string, SessionData>>(new Map());
-
-  // Snapshot-seeded reference data for accurate change% calculation
-  const previousCloseRef = useRef<Map<string, number>>(new Map()); // symbol → previousClose price
-  const dayOpenRef = useRef<Map<string, number>>(new Map()); // symbol → actual market open price
+  // When each symbol's last print arrived, by this clock: the sweep below
+  // ages prints out on it, so a skewed client clock cannot.
+  const receivedAtRef = useRef<Map<string, number>>(new Map());
 
   const resetStaleTimer = useCallback((): void => {
     if (staleTimerRef.current) clearTimeout(staleTimerRef.current);
@@ -145,6 +160,7 @@ export default function useMarketDataWS(): UseMarketDataWSReturn {
       console.warn('[WS] aggregate missing symbol/close:', { symbol, close });
       return;
     }
+    const spellings = subscribedSpellings(subscribedRef.current, symbol);
 
     // Session OHLCV tracking
     // Timestamp is Unix ms from ginlix-data; convert to chart seconds in the
@@ -155,45 +171,62 @@ export default function useMarketDataWS(): UseMarketDataWSReturn {
     const venueTz = timezoneForSymbol(symbol);
     const barTime = utcMsToChartSec(tsMs, venueTz);
     const barDate = dateStrInTz(tsMs, venueTz);
+    // The symbol's quote row (REST, kept live by the write-through below) holds
+    // the day's figures the socket cannot: the previous close every change is
+    // measured against, and the regular session's open, high and low before
+    // the first tick. Only a row printed on the tick's venue day speaks for it.
+    const rows = spellings
+      .map((s) => queryClient.getQueryData<QuoteRow | null>(queryKeys.quote.detail(stockKey(s))))
+      .filter((r): r is QuoteRow => r != null);
+    const rowToday = rows.find((r) => r.as_of != null && dateStrInTz(r.as_of, venueTz) === barDate) ?? null;
+    const row = rowToday ?? rows[0];
     let session = sessionDataRef.current.get(symbol);
     if (!session || session.date !== barDate) {
-      // New trading day
-      session = { date: barDate, open, high, low, volume: 0 };
+      session = { date: barDate, open: null, high: null, low: null, volume: 0 };
       sessionDataRef.current.set(symbol, session);
     }
-    if (high > session.high) session.high = high;
-    if (low < session.low) session.low = low;
+    // Folded in on every print, since the row may land after the first one;
+    // its open is the official one, so it replaces a first print's. A zero is
+    // a row with no figure yet, not a price.
+    if (rowToday) {
+      if (rowToday.open) session.open = rowToday.open;
+      if (rowToday.high && (session.high == null || rowToday.high > session.high)) session.high = rowToday.high;
+      if (rowToday.low && (session.low == null || rowToday.low < session.low)) session.low = rowToday.low;
+    }
+    // Pre- and after-hours prints move the price but not the day's range.
+    if (getExtendedHoursType(barTime) == null) {
+      session.open ??= open;
+      if (session.high == null || high > session.high) session.high = high;
+      if (session.low == null || low < session.low) session.low = low;
+    }
     session.volume += volume || 0;
 
-    // Use snapshot previousClose for accurate change%; fall back to session open.
-    // Truthiness (not != null): a 0 prevClose would divide to Infinity and
-    // poison the shared quote cache via the write-through.
-    const prevClose = previousCloseRef.current.get(symbol);
-    const change = prevClose ? (close - prevClose) : (close - session.open);
-    const changePercent = prevClose
-      ? parseFloat(((change / prevClose) * 100).toFixed(2))
-      : session.open ? parseFloat((((close - session.open) / session.open) * 100).toFixed(2)) : 0;
-
-    // Use snapshot dayOpen if available (actual market open, not first WS tick)
-    const effectiveOpen = dayOpenRef.current.get(symbol) ?? session.open;
+    // A row from an earlier day (a tab left open overnight stops polling the
+    // symbol it streams) closed that day at its regular close. Truthiness (not
+    // != null): a 0 prevClose would divide to Infinity and poison the shared
+    // quote cache via the write-through.
+    const prevClose = rowToday ? rowToday.previous_close : row?.regular_close;
+    const change = prevClose ? close - prevClose : null;
+    const changePercent = prevClose && change != null ? (change / prevClose) * 100 : null;
 
     const priceUpdate: PriceUpdate = {
       symbol: symbol!,
-      price: Math.round(close * 100) / 100,
-      open: effectiveOpen,
+      price: close,
+      open: session.open,
       high: session.high,
       low: session.low,
       close,
       volume: session.volume,
-      change: Math.round(change * 100) / 100,
+      change,
       changePercent,
       timestamp,
       barData: { time: barTime, open, high, low, close, volume },
     };
 
+    spellings.forEach((s) => receivedAtRef.current.set(s, Date.now()));
     setPrices((prev) => {
       const next = new Map(prev);
-      next.set(symbol, priceUpdate);
+      spellings.forEach((s) => next.set(s, { ...priceUpdate, symbol: s }));
       return next;
     });
 
@@ -201,12 +234,14 @@ export default function useMarketDataWS(): UseMarketDataWSReturn {
     // live fields (price/change) are merged; name/previous_close/day-OHLC from
     // the REST snapshot are preserved, and an unwatched symbol is never seeded.
     // DALTON-HOOK(extended-hours-quotes): Include tick timestamp when writing through to quote cache.
-    writeQuoteFromWs(queryClient, symbol, {
-      price: priceUpdate.price,
-      change: priceUpdate.change,
-      changePercent: priceUpdate.changePercent,
-      timestamp: priceUpdate.timestamp,
-    });
+    spellings.forEach((s) =>
+      writeQuoteFromWs(queryClient, s, {
+        price: close,
+        change,
+        changePercent,
+        timestamp: priceUpdate.timestamp,
+      }),
+    );
   }, [resetStaleTimer, queryClient]);
 
   /**
@@ -297,6 +332,9 @@ export default function useMarketDataWS(): UseMarketDataWSReturn {
       console.info('[WS] closed: code=%d reason=%s', event.code, event.reason);
       if (staleTimerRef.current) clearTimeout(staleTimerRef.current);
       wsRef.current = null;
+      // A tick from a closed socket is history: the next connection is live
+      // only once it delivers one of its own.
+      setPrices((prev) => (prev.size ? new Map() : prev));
 
       if (!mountedRef.current) return;
 
@@ -416,6 +454,20 @@ export default function useMarketDataWS(): UseMarketDataWSReturn {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Drop prints past TICK_MAX_AGE_MS, so a symbol that stopped trading (the
+  // close, a halt, a thin name) falls back to its quote row instead of
+  // reading Live with its last print.
+  useEffect(() => {
+    const sweep = setInterval(() => {
+      const cutoff = Date.now() - TICK_MAX_AGE_MS;
+      setPrices((prev) => {
+        const fresh = [...prev].filter(([sym]) => (receivedAtRef.current.get(sym) ?? 0) >= cutoff);
+        return fresh.length === prev.size ? prev : new Map(fresh);
+      });
+    }, TICK_SWEEP_MS);
+    return () => clearInterval(sweep);
+  }, []);
+
   // Page visibility: close after 60s hidden, reconnect on visible
   useEffect(() => {
     const handleVisibility = (): void => {
@@ -443,13 +495,5 @@ export default function useMarketDataWS(): UseMarketDataWSReturn {
     };
   }, [connect, disconnect]);
 
-  const setPreviousClose = useCallback((symbol: string, price: number): void => {
-    if (symbol && price != null) previousCloseRef.current.set(symbol.toUpperCase(), price);
-  }, []);
-
-  const setDayOpen = useCallback((symbol: string, price: number): void => {
-    if (symbol && price != null) dayOpenRef.current.set(symbol.toUpperCase(), price);
-  }, []);
-
-  return { prices, connectionStatus, dataLevel, ginlixDataEnabled, subscribe, unsubscribe, setPreviousClose, setDayOpen };
+  return { prices, connectionStatus, dataLevel, ginlixDataEnabled, subscribe, unsubscribe };
 }

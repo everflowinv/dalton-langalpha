@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import create_autospec
+from unittest.mock import call, create_autospec
 
 import langgraph.graph.ui as lg_ui
 import pandas as pd
@@ -248,12 +248,20 @@ async def test_task_resume_on_workflow_redirects_to_run_workflow_resume() -> Non
 async def test_yfinance_keyerror_current_trading_period_falls_back_to_history_close(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When fast_info raises KeyError('currentTradingPeriod') on a weekend/ex-dividend day, _fetch_single_snapshot falls back to history(period='5d', auto_adjust=False) and uses unadjusted Close."""
+    """When fast_info raises KeyError('currentTradingPeriod') on a weekend/ex-dividend day, _fetch_single_snapshot reads history(period='5d', interval='1d', auto_adjust=False) and uses unadjusted Close."""
+    import src.dalton.extended_hours as eh_mod
+
     broken_fi = create_autospec(FastInfo, instance=True)
     broken_fi.get.side_effect = KeyError("currentTradingPeriod")
 
     ticker = create_autospec(yf.Ticker, instance=True)
     ticker.fast_info = broken_fi
+    ticker.info = {}
+    ticker.history_metadata = {
+        "regularMarketPrice": 582.5,
+        "regularMarketTime": 1792785600,  # 2026-10-23 16:00:00 EDT
+        "exchangeTimezoneName": "America/New_York",
+    }
     idx = pd.to_datetime(
         ["2026-10-22 00:00:00-04:00", "2026-10-23 00:00:00-04:00"]
     )
@@ -274,9 +282,9 @@ async def test_yfinance_keyerror_current_trading_period_falls_back_to_history_cl
     # Saturday 2026-10-24 15:00 UTC (11:00 ET): 2026-10-23 session is already closed
     now_sat = datetime(2026, 10, 24, 15, 0, tzinfo=timezone.utc)
     monkeypatch.setattr(
-        yf_ds_mod,
+        eh_mod,
         "_now_utc",
-        create_autospec(yf_ds_mod._now_utc, return_value=now_sat),
+        create_autospec(eh_mod._now_utc, return_value=now_sat),
     )
     monkeypatch.setattr(
         yf_ds_mod,
@@ -290,10 +298,13 @@ async def test_yfinance_keyerror_current_trading_period_falls_back_to_history_cl
     assert snap["price"] == 582.5
     assert snap["previous_close"] == 575.0
     assert snap["change"] == 7.5
-    assert snap["market_status"] == "closed"
+    assert snap["market_status"] is None
     assert snap["regular_trading_date"] == "2026-10-23"
     assert snap["as_of"] <= int(now_sat.timestamp() * 1000)
-    ticker.history.assert_called_once_with(period="5d", auto_adjust=False)
+    assert ticker.history.call_args_list == [
+        call(period="5d", interval="1d", auto_adjust=False),
+        call(period="1mo", auto_adjust=False),
+    ]
 
     main_seg, _parts = format_quote_change_parts(
         snap,
@@ -311,11 +322,19 @@ async def test_yfinance_keyerror_during_intraday_drops_unfinished_today_bar(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """When fast_info raises KeyError during regular trading hours (before 16:00 ET), today's unfinished bar is dropped and the prior completed session's close is returned with a non-future timestamp."""
+    import src.dalton.extended_hours as eh_mod
+
     broken_fi = create_autospec(FastInfo, instance=True)
     broken_fi.get.side_effect = KeyError("currentTradingPeriod")
 
     ticker = create_autospec(yf.Ticker, instance=True)
     ticker.fast_info = broken_fi
+    ticker.info = {}
+    ticker.history_metadata = {
+        "regularMarketPrice": 575.0,
+        "regularMarketTime": 1792699200,  # 2026-10-22 16:00:00 EDT
+        "exchangeTimezoneName": "America/New_York",
+    }
     idx = pd.to_datetime(
         [
             "2026-10-21 00:00:00-04:00",
@@ -338,9 +357,9 @@ async def test_yfinance_keyerror_during_intraday_drops_unfinished_today_bar(
     now_intraday = datetime(2026, 10, 23, 18, 30, tzinfo=timezone.utc)
     now_ms = int(now_intraday.timestamp() * 1000)
     monkeypatch.setattr(
-        yf_ds_mod,
+        eh_mod,
         "_now_utc",
-        create_autospec(yf_ds_mod._now_utc, return_value=now_intraday),
+        create_autospec(eh_mod._now_utc, return_value=now_intraday),
     )
     monkeypatch.setattr(
         yf_ds_mod,
@@ -356,7 +375,10 @@ async def test_yfinance_keyerror_during_intraday_drops_unfinished_today_bar(
     assert snap["change"] == 5.0
     assert snap["as_of"] is not None and snap["as_of"] <= now_ms
     assert snap["regular_as_of"] is not None and snap["regular_as_of"] <= now_ms
-    ticker.history.assert_called_once_with(period="5d", auto_adjust=False)
+    assert ticker.history.call_args_list == [
+        call(period="5d", interval="1d", auto_adjust=False),
+        call(period="1mo", auto_adjust=False),
+    ]
 
 
 @pytest.mark.asyncio
@@ -381,10 +403,18 @@ async def test_yfinance_keyerror_keeps_today_bar_once_its_session_closed(
     monkeypatch: pytest.MonkeyPatch, sym: str, dates: list[str], now: datetime
 ) -> None:
     """A bar whose exchange session has closed is kept even before 16:00 ET."""
+    import src.dalton.extended_hours as eh_mod
+
     broken_fi = create_autospec(FastInfo, instance=True)
     broken_fi.get.side_effect = KeyError("currentTradingPeriod")
     ticker = create_autospec(yf.Ticker, instance=True)
     ticker.fast_info = broken_fi
+    ticker.info = {}
+    ticker.history_metadata = {
+        "regularMarketPrice": 103.0,
+        "regularMarketTime": int(now.timestamp()) - 600,
+        "exchangeTimezoneName": "Asia/Hong_Kong" if sym.endswith(".HK") else "America/New_York",
+    }
     ticker.history.return_value = pd.DataFrame(
         {
             "Open": [100.0, 101.0, 102.0],
@@ -396,7 +426,7 @@ async def test_yfinance_keyerror_keeps_today_bar_once_its_session_closed(
         index=pd.to_datetime(dates),
     )
     monkeypatch.setattr(
-        yf_ds_mod, "_now_utc", create_autospec(yf_ds_mod._now_utc, return_value=now)
+        eh_mod, "_now_utc", create_autospec(eh_mod._now_utc, return_value=now)
     )
     monkeypatch.setattr(
         yf_ds_mod,
@@ -624,7 +654,11 @@ async def test_sandbox_pip_install_uses_system_and_skips_local_workspace_dirs(
 
     commands.clear()
     await mcp_setup._install_dependencies(sandbox)
-    assert any("uv pip install --system -q --override" in c for c in commands)
+    # Upstream d2b2cd0e4 (#718) dropped the curl_cffi>=0.14 override on purpose:
+    # yfinance 1.8.0 no longer caps curl_cffi and needs >=0.17 itself, which the
+    # override would replace. Dalton keeps only --system.
+    assert any(c.startswith("uv pip install --system -q ") for c in commands)
+    assert not any("--override" in c for c in commands)
 
     # 4. workspace_sandbox.install_sandbox_packages passes --system
     sandbox.execute_bash_command.return_value = {

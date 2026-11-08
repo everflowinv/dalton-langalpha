@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from src.config.core import get_infrastructure_config
 from src.config.models import (
+    ClaudeCodeConfig,
     McpDescriptionsConfig,
     NewsPollConfig,
     OrderReconcileConfig,
@@ -124,6 +125,10 @@ def is_brokerage_marks_warm_on_startup_enabled() -> bool:
 
 def is_langsmith_tracing_enabled() -> bool:
     return get_infrastructure_config().langsmith_tracing
+
+
+def is_langsmith_full_payloads_enabled() -> bool:
+    return get_infrastructure_config().langsmith_full_payloads
 
 
 # =============================================================================
@@ -386,6 +391,10 @@ def get_market_watch_max_symbols() -> int:
 
 def get_market_watch_target_warning_minutes() -> int:
     return get_infrastructure_config().market_watch.target_warning_minutes
+
+
+def get_claude_code_config() -> ClaudeCodeConfig:
+    return get_infrastructure_config().claude_code
 
 
 def get_redis_ttl_market_watch() -> int:
