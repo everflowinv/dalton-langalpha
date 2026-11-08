@@ -579,8 +579,9 @@ pinned_modified_sha256 = {
     "mcp:price_data:get_asset_data": "3298104ce597a535188c0e6b997e7bb433ac6caf44ce0840ddf026b16e0ff5f6",
     "mcp:price_data:get_stock_data": "7725a587e0702118bbcd29f9e5f4084347153d3b8812c21a6bff8bc724119692",
     # Prod-fix batch 2 (FMP 402): routes US statements to researchdata SEC
-    # first and names the yfinance fallback source.
-    "mcp:fundamentals:get_financial_statements": "e1aac0cb68f187c3e64395b670cb78915faeacdd98dfa771bbc2742363af0362",
+    # first and names the yfinance fallback source. sync4 S6: plus upstream
+    # #715 fallback_from in Returns.
+    "mcp:fundamentals:get_financial_statements": "ecbfe36be43cf746cca5061b49e2a4fbcb3752b86cdaac71fb40c2811e2122cc",
     # sync4 S4: upstream #694/#698 docstrings plus Dalton extended_hours
     "mcp:yf_price:get_multiple_stocks_history": "819253765db263f4e6cd7f78aa65a0d37f9d1cb6637f80baa00eed7dd9803288",
     "mcp:yf_price:get_stock_history": "969375a1cada68c0c684590a88b330e70b0b4cf55228be7d6ef8d3f6d0b40625",
