@@ -25,8 +25,10 @@ from src.dalton.data_jobs.runner_wrapper import (
 TerminalRunStatus = Literal["succeeded", "failed", "timed_out"]
 TimeoutKind = Literal["total", "no_output"]
 
+T1_JOB_KEY = "bbg-data-pull-asia"
 T5_JOB_KEY = "cn-leverage-daily"
 T18_JOB_KEY = "megacap-relative-signal-monitor"
+T29_JOB_KEY = "bbg-data-pull-us"
 
 
 def previous_weekday(ref_date: date) -> date:
@@ -92,8 +94,10 @@ EvaluatorFn = Callable[[TaskEvaluationContext], TaskEvaluationResult]
 
 EVALUATOR_REGISTRY: dict[str, EvaluatorFn] = {}
 _TASK_CODE_ALIASES: dict[str, str] = {
+    "T1": T1_JOB_KEY,
     "T5": T5_JOB_KEY,
     "T18": T18_JOB_KEY,
+    "T29": T29_JOB_KEY,
 }
 
 
@@ -403,6 +407,55 @@ def evaluate_t18_megacap_relative_signal_monitor(
     )
 
 
+@register_evaluator(T1_JOB_KEY, "T1", T29_JOB_KEY, "T29")
+def evaluate_t1_t29_bbg_data_pull(
+    ctx: TaskEvaluationContext,
+) -> TaskEvaluationResult:
+    """Core evaluator for T1 (`bbg-data-pull-asia`) and T29 (`bbg-data-pull-us`, §3.4.3).
+
+    Checks that the last JSON object in ``stdout`` has ``ok == true`` and ``lines >= 252``.
+    """
+    payload = extract_last_json_object(ctx.stdout)
+    if not isinstance(payload, dict):
+        return TaskEvaluationResult(
+            ok=False,
+            status="failed",
+            failure_reason="bbg_stdout_missing_json_object",
+        )
+    if payload.get("ok") is not True:
+        reason = payload.get("reason") or payload.get("error")
+        if reason == "openclaw_not_updated":
+            return TaskEvaluationResult(
+                ok=False,
+                status="failed",
+                failure_reason="openclaw_not_updated",
+            )
+        return TaskEvaluationResult(
+            ok=False,
+            status="failed",
+            failure_reason=f"bbg_json_ok_false:{reason or payload.get('ok')}",
+        )
+
+    lines_val = payload.get("lines")
+    if isinstance(lines_val, bool) or not isinstance(lines_val, int) or lines_val < 252:
+        return TaskEvaluationResult(
+            ok=False,
+            status="failed",
+            failure_reason=f"bbg_insufficient_lines:{lines_val}",
+        )
+
+    return TaskEvaluationResult(
+        ok=True,
+        status="succeeded",
+        details={
+            "lines": lines_val,
+            "source": payload.get("source"),
+            "path": payload.get("path"),
+            "timestamp": payload.get("timestamp"),
+        },
+    )
+
+
 def evaluate_task_run(ctx: TaskEvaluationContext) -> TaskEvaluationResult:
     """Run pre-checks (`timed_out`, wrapper exit codes 124/125, `oom_killed`, `exit_code == 0`) and dispatch."""
     if ctx.timed_out or ctx.exit_code in (EXIT_CODE_TOTAL_TIMEOUT, EXIT_CODE_NO_OUTPUT_TIMEOUT):
@@ -423,6 +476,22 @@ def evaluate_task_run(ctx: TaskEvaluationContext) -> TaskEvaluationResult:
             failure_reason="oom_killed",
         )
     if ctx.exit_code != 0:
+        if ctx.job_key in (T1_JOB_KEY, T29_JOB_KEY, "T1", "T29"):
+            last_obj = extract_last_json_object(ctx.stdout)
+            if isinstance(last_obj, dict):
+                err_reason = last_obj.get("reason") or last_obj.get("error")
+                if isinstance(err_reason, str) and err_reason.strip():
+                    return TaskEvaluationResult(
+                        ok=False,
+                        status="failed",
+                        failure_reason=err_reason.strip(),
+                    )
+            if "openclaw_not_updated" in (ctx.stdout or ""):
+                return TaskEvaluationResult(
+                    ok=False,
+                    status="failed",
+                    failure_reason="openclaw_not_updated",
+                )
         return TaskEvaluationResult(
             ok=False,
             status="failed",

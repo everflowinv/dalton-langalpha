@@ -24,6 +24,7 @@ class DataTaskManifestEntry(BaseModel):
     title: str
     batch_no: int = Field(ge=1, le=4)
     runner: Literal["container", "host"] = "container"
+    host_mode: Literal["mirror", "run"] | None = None
     cron: str
     timezone: str
     cutover_cron: str | None = None
