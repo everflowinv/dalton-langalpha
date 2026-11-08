@@ -34,6 +34,7 @@ from src.utils.market_hours import interval_seconds
 
 from .yahoo import (
     _recent_daily_rows_cached,  # DALTON-HOOK(yfinance-prev-close)
+    quote_type_from_history_metadata,  # DALTON-HOOK(yfinance-prev-close)
     validated_previous_close,  # DALTON-HOOK(yfinance-prev-close)
     yahoo_symbol,
     yahoo_ticker,
@@ -283,6 +284,9 @@ def _fetch_single_snapshot(sym: str) -> dict[str, Any] | None:
         # A live view that the next history() call replaces, and copying it
         # would fetch its lazy tradingPeriods: read what the quote needs now.
         meta = ticker.history_metadata
+        # DALTON-HOOK(yfinance-prev-close): capture the type now; the fallback
+        # history("1d") below replaces history_metadata (empty on failure).
+        quote_type = quote_type_from_history_metadata(meta)  # DALTON-HOOK(yfinance-prev-close)
         # NaN is truthy, so `nan or 0` stays NaN — route every numeric field
         # through _finite() so a snapshot can never carry non-finite floats.
         # No finite last price means no quote: a None snapshot beats a $0.00
@@ -311,7 +315,7 @@ def _fetch_single_snapshot(sym: str) -> dict[str, Any] | None:
                 daily_rows = [(d, c, 0.0) for d, c, _ in daily_rows]
             if daily_rows is not None and quote_date is None:
                 quote_date = daily_rows[-1][0]
-            prev = validated_previous_close(prev, daily_rows, quote_date)  # DALTON-HOOK(yfinance-prev-close)
+            prev = validated_previous_close(prev, daily_rows, quote_date, quote_type=quote_type)  # DALTON-HOOK(yfinance-prev-close)
         volume = _finite(bar["Volume"]) if bar is not None and not a_share_index else None
         change, change_pct = change_from(price, prev)
         snap = {

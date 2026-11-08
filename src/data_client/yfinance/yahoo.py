@@ -9,6 +9,7 @@ goes back through ``display_spelling`` before it leaves the package.
 from __future__ import annotations
 
 import math  # DALTON-HOOK(yfinance-prev-close)
+import threading  # DALTON-HOOK(yfinance-prev-close)
 import time  # DALTON-HOOK(yfinance-prev-close)
 from typing import Any  # DALTON-HOOK(yfinance-prev-close)
 
@@ -133,10 +134,36 @@ def regular_previous_close(fast_info) -> float | None:  # DALTON-HOOK(yfinance-p
     return None
 
 
+# DALTON-HOOK(yfinance-prev-close): quote types that trade with volume; for
+# these a window with no traded row is a long suspension, not a volumeless
+# instrument, so its zero-volume fills must never stand as a previous close.
+_VOLUME_REQUIRED_QUOTE_TYPES = frozenset({"EQUITY", "ETF"})  # DALTON-HOOK(yfinance-prev-close)
+
+
+def _normalize_quote_type(value: Any) -> str | None:  # DALTON-HOOK(yfinance-prev-close)
+    if isinstance(value, str) and value.strip():
+        return value.strip().upper()
+    return None
+
+
+def quote_type_from_history_metadata(meta: Any) -> str | None:  # DALTON-HOOK(yfinance-prev-close)
+    """Yahoo's ``instrumentType`` (yfinance's ``quoteType``) from ``history_metadata``.
+
+    Read it right after the snapshot's own ``history()`` call: yfinance's
+    ``history_metadata`` is a live view that a later ``history()`` call
+    replaces (emptied when that call fails), and reading it costs no request.
+    """
+    get = getattr(meta, "get", None)
+    if not callable(get):
+        return None
+    return _normalize_quote_type(get("instrumentType"))
+
+
 def validated_previous_close(  # DALTON-HOOK(yfinance-prev-close)
     fast_info_prev: float | None,
     daily_rows: list[tuple[str, float, float]] | None,
     quote_date: str | None,
+    quote_type: str | None = None,
 ) -> float | None:
     """The previous close, only once recent daily bars confirm it (2525.HK 2026-10).
 
@@ -163,12 +190,25 @@ def validated_previous_close(  # DALTON-HOOK(yfinance-prev-close)
     mean sessions in between were never fetched, so no bar can stand as the
     previous session's close — the previous close and the change come back
     unknown then too, not wrong.
+
+    *quote_type* is yfinance's ``quoteType`` when the caller already has it.
+    ``EQUITY``/``ETF`` trade with volume, so a whole window without one
+    traded row is a suspension longer than the window, not a volumeless
+    instrument: its fills are not a previous close and the result is unknown.
+    Volumeless types (``INDEX``, ``CURRENCY``, …) and an unknown type keep
+    the volumeless-window behaviour above, unchanged.
     """
+    normalized_type = _normalize_quote_type(quote_type)  # DALTON-HOOK(yfinance-prev-close)
     if daily_rows is None:
         return None
 
     rows_before = [r for r in daily_rows if not quote_date or r[0] < quote_date]
     any_volume = any(v > 0 for _, _, v in daily_rows)
+    if normalized_type in _VOLUME_REQUIRED_QUOTE_TYPES and not any_volume:  # DALTON-HOOK(yfinance-prev-close)
+        # EQUITY/ETF with no traded row in the whole window (suspended longer
+        # than a month): every row is Yahoo fill, so there is no previous
+        # session to quote against — unknown, never the fill price.
+        return None
     if not rows_before and not any_volume:
         # Volume-less instrument (e.g. an index) whose daily series holds
         # only the current session's bar: there are no fill rows before the
@@ -237,29 +277,40 @@ def _recent_daily_rows(ticker: Any) -> list[tuple[str, float, float]] | None:  #
 _DAILY_ROWS_CACHE_TTL_S = 600.0
 _DAILY_ROWS_CACHE_MAX = 256
 _daily_rows_cache: dict[tuple[str, str], tuple[float, list[tuple[str, float, float]]]] = {}
+# DALTON-HOOK(yfinance-prev-close): snapshots run in parallel threads; every
+# read, write and eviction of the memo below happens under this lock, or the
+# eviction's sorted(items()) can die with "dictionary changed size during
+# iteration" and take the whole snapshot's quote with it.
+_daily_rows_cache_lock = threading.Lock()  # DALTON-HOOK(yfinance-prev-close)
 
 
 def _clear_prev_close_daily_cache() -> None:  # DALTON-HOOK(yfinance-prev-close)
     """Empty the previous-close daily-rows memo (tests isolate through this)."""
-    _daily_rows_cache.clear()
+    with _daily_rows_cache_lock:  # DALTON-HOOK(yfinance-prev-close)
+        _daily_rows_cache.clear()
 
 
 def _recent_daily_rows_cached(  # DALTON-HOOK(yfinance-prev-close)
     sym: str, quote_date: str | None, ticker: Any
 ) -> list[tuple[str, float, float]] | None:
-    """`_recent_daily_rows` behind the (symbol, trading date) memo."""
-    now = time.monotonic()
-    key = (sym, quote_date or "")
-    hit = _daily_rows_cache.get(key)
-    if hit is not None and now - hit[0] < _DAILY_ROWS_CACHE_TTL_S:
-        return hit[1]
-    rows = _recent_daily_rows(ticker)
+    """`_recent_daily_rows` behind the (symbol, trading date) memo.
+
+    The lock is never held across the network fetch: check under the lock,
+    fetch unlocked on a miss, then write and evict under the lock again.
+    """
+    key = (sym, quote_date or "")  # DALTON-HOOK(yfinance-prev-close)
+    with _daily_rows_cache_lock:  # DALTON-HOOK(yfinance-prev-close)
+        hit = _daily_rows_cache.get(key)
+        if hit is not None and time.monotonic() - hit[0] < _DAILY_ROWS_CACHE_TTL_S:
+            return hit[1]
+    rows = _recent_daily_rows(ticker)  # DALTON-HOOK(yfinance-prev-close): fetched outside the lock
     if rows is not None:
-        _daily_rows_cache[key] = (now, rows)
-        if len(_daily_rows_cache) > _DAILY_ROWS_CACHE_MAX:
-            stale = sorted(_daily_rows_cache.items(), key=lambda kv: kv[1][0])
-            for stale_key, _entry in stale[: _DAILY_ROWS_CACHE_MAX // 2]:
-                _daily_rows_cache.pop(stale_key, None)
+        with _daily_rows_cache_lock:  # DALTON-HOOK(yfinance-prev-close)
+            _daily_rows_cache[key] = (time.monotonic(), rows)
+            if len(_daily_rows_cache) > _DAILY_ROWS_CACHE_MAX:
+                stale = sorted(_daily_rows_cache.items(), key=lambda kv: kv[1][0])
+                for stale_key, _entry in stale[: _DAILY_ROWS_CACHE_MAX // 2]:
+                    _daily_rows_cache.pop(stale_key, None)
     return rows
 
 
