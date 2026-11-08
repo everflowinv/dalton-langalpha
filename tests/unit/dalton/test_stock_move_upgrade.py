@@ -294,7 +294,7 @@ class TestFuturesCommoditiesRatesSymbologyAndRouting:
 
         mock_provider.get_snapshots.side_effect = _fake_get_snapshots
 
-        with patch("src.tools.market_data.quotes.get_market_data_provider", autospec=True) as mock_get_prov, patch("src.tools.market_data.quotes.fill_quote_names", autospec=True), patch("src.server.services.cache.quote_daily_fallback.fill_from_daily", autospec=True, side_effect=lambda served, asked, uid: served):
+        with patch("src.server.services.cache.quote_cache_service.get_market_data_provider", autospec=True) as mock_get_prov, patch("src.server.services.cache.quote_cache_service.fill_quote_names", autospec=True), patch("src.server.services.cache.quote_cache_service.fill_from_daily", autospec=True, side_effect=lambda served, asked, uid: served):
             mock_get_prov.return_value = mock_provider
             content, artifact = await fetch_quote(
                 ["GOOGL", "NQ=F", "CL=F", "^TNX", "^VIX", "DX-Y.NYB"],

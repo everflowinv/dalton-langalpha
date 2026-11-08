@@ -510,6 +510,8 @@ async def test_fetch_quote_fx_served_by_yfinance_when_fmp_quota_exhausted(
     fmp_source = create_autospec(FMPDataSource, instance=True)
     fmp_source.get_snapshots.side_effect = FmpQuotaExhausted(RESET)
 
+    import src.server.services.cache.quote_cache_service as quote_cache_mod
+
     provider = MarketDataProvider(
         entries=[
             ProviderEntry(name="yfinance", source=YFinanceDataSource(), markets={"all"}),
@@ -517,14 +519,14 @@ async def test_fetch_quote_fx_served_by_yfinance_when_fmp_quota_exhausted(
         ]
     )
     monkeypatch.setattr(
-        quotes_mod,
+        quote_cache_mod,
         "get_market_data_provider",
-        create_autospec(quotes_mod.get_market_data_provider, return_value=provider),
+        create_autospec(quote_cache_mod.get_market_data_provider, return_value=provider),
     )
     monkeypatch.setattr(
-        quotes_mod,
+        quote_cache_mod,
         "fill_quote_names",
-        create_autospec(quotes_mod.fill_quote_names, return_value=None),
+        create_autospec(quote_cache_mod.fill_quote_names, return_value=None),
     )
 
     content, artifact = await quotes_mod.fetch_quote([input_symbol])

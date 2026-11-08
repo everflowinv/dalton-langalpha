@@ -411,7 +411,16 @@ def _regular_move_basis(
                 .date()
             )
             if as_of_date != venue_today:
-                return "prev close" if is_pre else "last close"
+                if is_pre:
+                    return "prev close"
+                if (
+                    _is_us_equity(ref)
+                    and not has_ext
+                    and not snap.get("regular_only")
+                    and snap.get("previous_close") is None
+                ):
+                    return f"on {as_of_date.isoformat()}"
+                return "last close"
             if (
                 snap.get("regular_as_of") is None
                 and not snap.get("regular_trading_date")
@@ -451,9 +460,11 @@ def format_quote_change_parts(
     existing layout and appends ``vs prev close $X`` when available.
     """
     price_fn = fmt_price or (lambda p, _ref: f"${p:,.2f}")
-    reg_close = _finite(snap.get("regular_close"))
-    if reg_close is None:
-        reg_close = _finite(snap.get("price"))
+    reg_close = (
+        _finite(snap.get("regular_close"))
+        if "regular_close" in snap
+        else _finite(snap.get("price"))
+    )
     prev_close = _finite(snap.get("previous_close"))
     ext_price = _finite(snap.get("last_trade_price"))
     reg_pct = _finite(snap.get("regular_trading_change_percent"))
@@ -536,8 +547,8 @@ def format_quote_change_parts(
     )
     anchor_prev = _resolve_anchor_prev_close(snap, reg_close, prev_close, is_pre=is_pre)
 
-    if us_equity and (is_pre or is_post):
-        close_price = reg_close if reg_close is not None else fallback_price
+    if us_equity and (is_pre or is_post) and reg_close is not None:
+        close_price = reg_close
         reg_tokens: list[str] = []
         if close_price is not None:
             reg_tokens.append(f"{close_label} {price_fn(close_price, ref)}")

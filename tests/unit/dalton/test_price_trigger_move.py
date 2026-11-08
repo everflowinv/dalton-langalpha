@@ -801,6 +801,7 @@ async def test_isolated_dalton_refs_mixed_symbol_interleaved_ws_tick_and_deleted
     # String values on mixed symbol follow upstream baseline _positive (rejecting non-Real strings):
     # - price="94" (string) is skipped without triggering normal alert;
     # - previous_close="100" (string) does not call set_reference to overwrite the valid 100.0 reference with 0.0.
+    harness.set_time(fri_after_hours)
     svc_mixed._local_locks.clear()
     harness.redis_store.clear()
     harness.set_snapshots(
@@ -853,7 +854,7 @@ async def test_isolated_dalton_refs_mixed_symbol_interleaved_ws_tick_and_deleted
         "open": 99.0,
         "reference_date": "2026-10-26",
         "regular_as_of": _ms(fri_close),
-        "as_of": _ms(fri_close),
+        "as_of": _ms(mon_open),
     }
     harness.set_snapshots([unvalidated_monday_snap])
 

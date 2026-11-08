@@ -18,6 +18,7 @@ from datetime import datetime
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from src.data_client.base import IntervalNotSupported
 from src.data_client.normalize import (
     build_series,
     minor_unit_places,
@@ -111,7 +112,7 @@ class FMPDataSource:
         extended_hours: bool = False,  # DALTON-HOOK(stock-move-upgrade)
     ) -> list[dict[str, Any]]:
         if interval not in self._SUPPORTED_INTERVALS:
-            raise ValueError(
+            raise IntervalNotSupported(
                 f"Interval '{interval}' is not supported by this data source"
             )
         api_symbol = self._api_symbol(symbol, is_index)

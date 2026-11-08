@@ -42,6 +42,9 @@ Rules:
 - **Prices are major units** of `currency` (pence/GBX converted to pounds, etc.).
 - **Symbols** go through `market_protocol.symbology` at the boundary; the echoed
   `symbol` is the canonical display spelling, regardless of what the caller passed.
+  `price_data` echoes the spelling that asks for the instrument again
+  (`to_request_spelling`: `AAPL`, `0700.HK`, `^GSPC`): its `symbol` is sent back to
+  fetch more bars, and a bare `SPX` there names the stock listing.
 - **Interval vocab**: `1min|5min|15min|30min|1hour|4hour|1day|1week|1month`.
   Provider-native spellings (`1m`, `1wk`, `daily`, ...) are accepted as input aliases
   and normalized; native-only granularities a provider supports may pass through but
@@ -62,6 +65,13 @@ Rules:
   (`make_response(incomplete=...)`) when the source reports sessions missing
   within the window it was asked for (a CN refetch that failed), absent
   otherwise. It is not a cap and names no end.
+- **A failed source a fallback stood in for says so**: `fallback_from: "<source>"`
+  beside `source` when the read's first source failed (an error, not an empty
+  answer) and the next one answered, absent otherwise. If the next source has no
+  rows, the read is `upstream_error`: an empty success would read as "nothing
+  to report". If it fails too, its error stands, its detail naming the first
+  failure. Today this is the CN branch of the fundamentals tools and of the
+  daily stock bars (`tushare`, then FMP).
 
 ## Error envelope
 

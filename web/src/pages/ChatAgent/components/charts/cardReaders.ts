@@ -101,6 +101,8 @@ export interface IndexRow extends FreshnessFields {
   bars: ChartBar[];
   /** The bars carry a time of day: an epoch, or a datetime rather than a day. */
   intraday: boolean;
+  /** The session of the latest daily bar (`YYYY-MM-DD`), when the bars are daily. */
+  day?: string;
 }
 
 export function indexRows(artifact: Record<string, unknown> | undefined): IndexRow[] {
@@ -111,6 +113,7 @@ export function indexRows(artifact: Record<string, unknown> | undefined): IndexR
     const stats = record(data.stats);
     const rows = chartOhlcv.length ? chartOhlcv : ohlcv;
     const first = rows[0]?.time ?? rows[0]?.date;
+    const lastDay = text(ohlcv.at(-1)?.date);
     return {
       sym,
       name: text(data.name) ?? sym,
@@ -122,11 +125,14 @@ export function indexRows(artifact: Record<string, unknown> | undefined): IndexR
       stats,
       bars: inTimeOrder(chartBars(rows, timezoneForSymbol(sym))),
       intraday: typeof first === 'number' || (typeof first === 'string' && (first.includes(' ') || first.includes('T'))),
+      day: lastDay && /^\d{4}-\d{2}-\d{2}$/.test(lastDay) ? lastDay : undefined,
     };
   });
 }
 
 const SECTOR_ABBREVIATIONS: Record<string, string> = {
+  'Information Technology': 'Info. Technology',
+  'Consumer Discretionary': 'Cons. Discretionary',
   'Consumer Cyclical': 'Cons. Cyclical',
   'Consumer Defensive': 'Cons. Defensive',
   'Communication Services': 'Comm. Services',
@@ -516,7 +522,9 @@ export interface ScreenerRow {
   industry?: string;
   exchange?: string;
   country?: string;
-  currency: string;
+  /** Null for a listing on a venue the producer does not know: its figures
+   *  print with no currency rather than as dollars. */
+  currency: string | null;
 }
 
 export interface Screen {
@@ -544,8 +552,10 @@ export function readScreener(artifact: Record<string, unknown>): Screen {
         industry: text(s.industry),
         exchange: text(s.exchangeShortName),
         country: text(s.country),
-        // A screen can mix venues, so money resolves per row.
-        currency: resolveCurrency(null, symbol),
+        // A screen can mix venues, so money resolves per row. The producer names
+        // each row's currency, null for an unknown venue; a row saved before it
+        // did reads its symbol's suffix.
+        currency: 'currency' in s ? (text(s.currency) ?? null) : resolveCurrency(null, symbol),
       };
     }),
     filters: Object.entries(record(artifact.filters) ?? {}),

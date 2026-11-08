@@ -63,8 +63,8 @@ from market_protocol import (  # DALTON-HOOK(stock-move-upgrade)
     is_family_index,
     market_of,
     to_canonical,
-    to_display,
     to_legacy_api,
+    to_request_spelling,
 )
 from market_protocol.enums import AssetClass
 from market_protocol.symbology import FUTURES_MIC
@@ -89,13 +89,18 @@ except ModuleNotFoundError:  # imported as a package module (tests)
     from mcp_servers._yf_common import boundary as _yf_boundary  # DALTON-HOOK(market-data-fallback)
 
 from mcp_servers._dates import (
+    FROM_TO,
     NEW_YORK,
+    Bounds,
+    DateBoundError,
     commodity_daily_days,
     daily_days,
     intraday_window,
+    whole_daily_days,
 )
 from mcp_servers._schemas import (
     BAR_LABELS,
+    FALLBACK_FROM,
     INCOMPLETE,
     OBJECT,
     RECORDS,
@@ -154,14 +159,15 @@ _Resolved = tuple[str, str, Optional[str], Optional[str], Optional[InstrumentRef
 def _resolve(symbol: str, asset_class: Optional[AssetClass] = None) -> _Resolved:
     """Resolve a caller symbol via the protocol registry.
 
-    Returns ``(display, legacy, currency, timezone, ref)``: the canonical display
-    spelling, the legacy provider spelling, ISO-4217 price currency, IANA
-    timezone, and the ref itself. Falls back to the raw symbol with unknown
-    currency/tz and no ref.
+    Returns ``(display, legacy, currency, timezone, ref)``: the spelling the
+    tool answers with, the legacy provider spelling, ISO-4217 price currency,
+    IANA timezone, and the ref itself. Falls back to the raw symbol with unknown
+    currency/tz and no ref. A family index answers as ``^GSPC``, never its
+    family name: a bare ``SPX`` sent back would read as a stock listing.
     """
     try:
         ref = to_canonical(symbol, asset_class=asset_class)
-        return to_display(ref), to_legacy_api(ref), ref.price_currency, ref.tz, ref
+        return to_request_spelling(ref), to_legacy_api(ref), ref.price_currency, ref.tz, ref
     except Exception:  # noqa: BLE001
         return symbol, symbol, None, None, None
 
@@ -565,6 +571,8 @@ async def _fetch_stock_series(
     interval: str,
     start_date: Optional[str],
     end_date: Optional[str],
+    names: Bounds = ("start_date", "end_date"),
+    *,
     extended_hours: bool = False,  # DALTON-HOOK(stock-move-upgrade)
 ) -> tuple[Optional[dict], Optional[dict]]:
     """Fetch stock OHLCV: ginlix-data (CN daily, then US) → yfinance → FMP fallback (global).
@@ -576,7 +584,8 @@ async def _fetch_stock_series(
     The success kwargs carry canonical ``symbol``/``interval``, ``currency``,
     ``timezone``, ``data`` (ascending), the resolved ``source``, and for
     CN and HK listings the local-language ``name``, whichever source served
-    the bars.
+    the bars. *names* are the caller's names for the two bounds, which a
+    refusal quotes.
     """
     # A bare ticker is the listing (COMP the stock, not the Nasdaq Composite);
     # only an index spelling (^GSPC, I:SPX, SPX.INDEX) asks for index bars.
@@ -584,7 +593,7 @@ async def _fetch_stock_series(
     (name, _), (ok, err) = await asyncio.gather(
         _names.display_names(resolved[1]),
         _fetch_stock_bars(
-            resolved, interval, start_date, end_date, extended_hours=extended_hours
+            resolved, interval, start_date, end_date, names, extended_hours=extended_hours
         ),
     )
     if ok is not None:
@@ -599,6 +608,8 @@ async def _fetch_stock_bars(
     interval: str,
     start_date: Optional[str],
     end_date: Optional[str],
+    names: Bounds = ("start_date", "end_date"),
+    *,
     extended_hours: bool = False,  # DALTON-HOOK(stock-move-upgrade)
 ) -> tuple[Optional[dict], Optional[dict]]:
     display, legacy, currency, timezone, ref = resolved
@@ -610,7 +621,7 @@ async def _fetch_stock_bars(
     if intraday and (not start_date or not end_date):
         return None, make_error(
             "invalid_argument",
-            "start_date and end_date are required for intraday intervals "
+            f"{names[0]} and {names[1]} are required for intraday intervals "
             "(YYYY-MM-DD or YYYY-MM-DD HH:MM).",
             symbol=display,
             interval=canonical,
@@ -618,45 +629,100 @@ async def _fetch_stock_bars(
 
     # CN A-shares, daily bars only: ginlix-data's minute history is short, so
     # CN intraday stays on the existing fallbacks.
-    # Empty/error falls through the chain unchanged.
-    if not intraday and symbol_market(legacy) == "cn":
-        # The window runs back from the end the caller gave, else from today.
-        cn_start = start_date
-        if not start_date:
-            try:
-                end = datetime.strptime((end_date or "")[:10], "%Y-%m-%d")
-            except ValueError:
-                end = datetime.now(_tz.utc)
-            cn_start = (end - timedelta(days=_CN_DEFAULT_DAILY_DAYS)).strftime("%Y-%m-%d")
-        incomplete = False
+    if intraday or symbol_market(legacy) != "cn":
+        return await _fetch_chain_bars(
+            resolved, canonical, start_date, end_date, names, extended_hours=extended_hours
+        )
+
+    # A caller's bad bounds are refused here, before tushare is asked, so they
+    # never read as a tushare failure.
+    try:
+        daily_days(start_date, end_date, names)
+    except DateBoundError as e:
+        return None, error_from_exception(e, "FMP fetch failed.", symbol=display, interval=canonical)
+
+    # The window runs back from the end the caller gave, else from today.
+    cn_start = start_date
+    if not start_date:
         try:
-            fetched = await _cn.get_daily(legacy, cn_start, end_date)
-            # The series' coverage flag marks sessions missing inside the window
-            # (a refetch that failed), not a cap cutting either end.
-            bars, incomplete = fetched.bars, fetched.truncated
-        except httpx.HTTPError as exc:
-            # An upstream miss (a 503, a 429, a dropped connection) is expected and
-            # the chain answers instead, so one line is enough.
-            logger.warning("ginlix-data CN daily unavailable for %s: %s", display, _http_miss(exc))
-            bars = []
-        except Exception:  # noqa: BLE001 - soft miss, chain continues
-            logger.warning("ginlix-data CN daily failed for %s", display, exc_info=True)
-            bars = []
-        if bars:
+            end = datetime.strptime((end_date or "")[:10], "%Y-%m-%d")
+        except ValueError:
+            end = datetime.now(_tz.utc)
+        cn_start = (end - timedelta(days=_CN_DEFAULT_DAILY_DAYS)).strftime("%Y-%m-%d")
+    try:
+        fetched = await _cn.get_daily(legacy, cn_start, end_date)
+    except httpx.HTTPError as exc:
+        # An upstream miss (a 503, a 429, a dropped connection) is expected and
+        # the chain answers instead, so one line is enough.
+        failed = _http_miss(exc)
+        logger.warning("ginlix-data CN daily unavailable for %s: %s", display, failed)
+    except Exception as exc:  # noqa: BLE001 - the chain answers instead
+        failed = type(exc).__name__
+        logger.warning("ginlix-data CN daily failed for %s", display, exc_info=True)
+    else:
+        if fetched.bars:
             return {
-                "data": _display_rows(bars, legacy, intraday=False),
+                "data": _display_rows(fetched.bars, legacy, intraday=False),
                 "source": "tushare",
                 "symbol": display,
                 "interval": canonical,
                 "currency": currency,
                 "timezone": timezone,
-                "incomplete": incomplete,
+                # The series' coverage flag marks sessions missing inside the
+                # window (a refetch that failed), not a cap cutting either end.
+                "incomplete": fetched.truncated,
             }, None
+        return await _fetch_chain_bars(
+            resolved, canonical, start_date, end_date, names, extended_hours=extended_hours
+        )
+    # A failed tushare read is not a miss: the chain's rows name it, and with
+    # none the read is an error.
+    ok, err = await _fetch_chain_bars(
+        resolved, canonical, start_date, end_date, names, extended_hours=extended_hours
+    )
+    if ok is not None and ok["data"]:
+        return {**ok, "fallback_from": "tushare"}, None
+    if err is not None:
+        return None, {**err, "detail": f"tushare failed ({failed}) and {err['detail']}"}
+    return None, make_error(
+        "upstream_error",
+        f"tushare failed ({failed}) and FMP has no rows for this listing",
+        symbol=display,
+        interval=canonical,
+    )
+
+
+async def _fetch_chain_bars(
+    resolved: _Resolved,
+    canonical: str,
+    start_date: Optional[str],
+    end_date: Optional[str],
+    names: Bounds,
+    *,
+    extended_hours: bool = False,  # DALTON-HOOK(stock-move-upgrade)
+) -> tuple[Optional[dict], Optional[dict]]:
+    """Bars from ginlix-data's US tier, else FMP, in the shape of ``_fetch_stock_bars``."""
+    display, legacy, currency, timezone, ref = resolved
+    intraday = canonical not in DAILY_INTERVALS
+
+    # A daily window is read here, in the caller's words, before the US tier
+    # is asked: that tier reads only a whole window, so an undated read gets
+    # the one FMP would serve it and reaches the same source as a dated one.
+    yf_start, yf_end = start_date, end_date
+    if not intraday:
+        try:
+            yf_start, yf_end = daily_days(start_date, end_date, names)
+            start_date, end_date = whole_daily_days(start_date, end_date, names)
+        except DateBoundError as e:
+            return None, error_from_exception(
+                e, "FMP fetch failed.", symbol=display, interval=canonical
+            )
 
     # The legacy spelling of a family index is bare (GSPC), which every vendor
-    # reads as a stock ticker: FMP needs ^GSPC, Massive its I:SPX index ticker.
+    # reads as a stock ticker: FMP takes the request spelling (^GSPC), Massive
+    # its I:SPX index ticker.
     family = ref is not None and is_family_index(ref)
-    fmp_symbol = f"^{legacy}" if family else legacy
+    fmp_symbol = display
 
     # ginlix-data's US tier: US equities, and US family indexes on the index
     # market. A foreign family index has no tier and goes straight to FMP, as
@@ -717,8 +783,8 @@ async def _fetch_stock_bars(
                 _yf_fetch_history,
                 display,
                 canonical,
-                start_date,
-                end_date,
+                yf_start,
+                yf_end,
                 extended_hours=extended_hours,
             )
         except Exception:  # noqa: BLE001 - soft miss, chain continues
@@ -727,14 +793,14 @@ async def _fetch_stock_bars(
         if yf_rows:
             yf_data = _filter_display_rows_to_window(
                 _display_rows(yf_rows, legacy, intraday=intraday, places=places),
-                start_date,
-                end_date,
+                yf_start,
+                yf_end,
                 intraday=intraday,
             )
             if yf_data:
                 if _yf_covers_start(
                     yf_data,
-                    start_date,
+                    yf_start,
                     intraday=intraday,
                     display=display,
                     interval=canonical,
@@ -763,7 +829,7 @@ async def _fetch_stock_bars(
                     "timezone": timezone,
                     "note": (
                         f"yfinance partial coverage: actual covered range is "
-                        f"{actual_start} to {actual_end} (requested start_date={start_date}"
+                        f"{actual_start} to {actual_end} (requested start_date={yf_start}"
                     ),
                 }
 
@@ -784,14 +850,14 @@ async def _fetch_stock_bars(
 
     window = None
     try:
-        # A bound FMP would drop or a reversed window is refused here, as the
-        # hosted tools refuse it (mcp_servers/_dates.py). The ginlix-data tier
-        # above sends both on to this read rather than answering them.
+        # An intraday bound FMP would drop, or a reversed window, is refused
+        # here, as the hosted tools refuse it (mcp_servers/_dates.py). The
+        # ginlix-data tier above sends both on to this read rather than
+        # answering them.
         if canonical in DAILY_INTERVALS:
-            lo, hi = daily_days(start_date, end_date)
-            rows = await client.get_stock_price(fmp_symbol, from_date=lo, to_date=hi)
+            rows = await client.get_stock_price(fmp_symbol, from_date=start_date, to_date=end_date)
         else:
-            window = intraday_window(start_date, end_date, timezone)
+            window = intraday_window(start_date, end_date, timezone, names=names)
             rows = await client.get_intraday_chart(
                 fmp_symbol, canonical,
                 from_date=window.from_day, to_date=window.to_day,
@@ -846,7 +912,10 @@ _OUT_GET_STOCK_DATA = output_model(
     envelope_schema(
         RECORDS,
         frame=("symbol", "interval", "currency", "timezone"),
-        echo={**BAR_LABELS, "name": _NAME_ECHO, "truncated": TRUNCATED, "incomplete": INCOMPLETE},
+        echo={
+            **BAR_LABELS, "name": _NAME_ECHO, "truncated": TRUNCATED, "incomplete": INCOMPLETE,
+            "fallback_from": FALLBACK_FROM,
+        },
     ),
 )
 
@@ -896,7 +965,7 @@ _OUT_GET_ASSET_DATA = output_model(
         frame=("symbol", "interval", "currency", "timezone"),
         echo={
             "asset_type": STR, **BAR_LABELS, "name": _NAME_ECHO,
-            "truncated": TRUNCATED, "incomplete": INCOMPLETE,
+            "truncated": TRUNCATED, "incomplete": INCOMPLETE, "fallback_from": FALLBACK_FROM,
         },
     ),
 )
@@ -943,7 +1012,7 @@ async def get_asset_data(
 
     if at == "stock":
         env, err = await _fetch_stock_series(  # DALTON-HOOK(stock-move-upgrade)
-            symbol, interval, from_date, to_date, extended_hours=extended_hours  # DALTON-HOOK(stock-move-upgrade)
+            symbol, interval, from_date, to_date, FROM_TO, extended_hours=extended_hours  # DALTON-HOOK(stock-move-upgrade)
         )  # DALTON-HOOK(stock-move-upgrade)
         if err is not None:
             return err
@@ -1085,7 +1154,17 @@ async def get_short_data(
         short_volume_ratio is a percent (43.3 = 43.3%). Partial failures appear
         in an `errors` map. On error: {error: <code>, detail}.
     """
-    display, legacy, _currency, timezone, _ref = _resolve(symbol)
+    display, legacy, _currency, timezone, ref = _resolve(symbol, asset_class=AssetClass.EQUITY)
+
+    # FINRA's figures cover US listings only, so another market's listing would
+    # read as one with no short activity. A venue the protocol does not know stays.
+    if ref is not None and market_of(ref) not in ("us", "other"):
+        return make_error(
+            "invalid_argument",
+            f"Short data covers US listings only; {display} is not one.",
+            symbol=display,
+            data_type=data_type,
+        )
 
     if not await _ginlix.ensure():
         return make_error(

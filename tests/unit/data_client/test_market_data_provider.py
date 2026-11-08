@@ -197,14 +197,14 @@ class TestMarketDataProvider:
         assert bars == [] and source == "e1" and truncated is False
 
     @pytest.mark.asyncio
-    async def test_all_providers_fail_raises_last_exception(self):
+    async def test_all_providers_fail_raises_the_covering_sources_exception(self):
         src1 = FakeSource("a", fail=True)
         src2 = FakeSource("b", fail=True)
         provider = MarketDataProvider([
             ProviderEntry("a", src1, {"all"}),
             ProviderEntry("b", src2, {"all"}),
         ])
-        with pytest.raises(RuntimeError, match="b daily error"):
+        with pytest.raises(RuntimeError, match="a daily error"):
             await provider.get_daily(symbol="AAPL")
 
     @pytest.mark.asyncio
@@ -363,6 +363,17 @@ class TestMarketDataProvider:
         rows = {r["symbol"]: r for r in await provider.get_snapshots(["GSPC", "HSI"], asset_type="indices")}
         assert rows["GSPC"]["tier"] == "realtime"
         assert rows["HSI"]["tier"] == "delayed_15m"
+
+    @pytest.mark.asyncio
+    async def test_a_ginlix_data_index_reads_delayed_and_its_stocks_realtime(self):
+        """ginlix-data's index feed is the 15-minute delayed one; its US stocks
+        are not."""
+        gd = SnapshotSource("ginlix-data", {"GSPC": {"symbol": "GSPC", "price": 5000.0},
+                                            "AAPL": {"symbol": "AAPL", "price": 190.0}})
+        provider = MarketDataProvider([ProviderEntry("ginlix-data", gd, {"us"})])
+        index = await provider.get_snapshots(["GSPC"], asset_type="indices")
+        stock = await provider.get_snapshots(["AAPL"])
+        assert (index[0]["tier"], stock[0]["tier"]) == ("delayed_15m", "realtime")
 
     @pytest.mark.asyncio
     async def test_caret_index_on_the_stocks_endpoint_routes_to_its_home_market(self):
@@ -626,7 +637,7 @@ class TestMarketDataProvider:
         assert us_src.calls[0][1]["symbols"] == ["AAPL"]
 
     @pytest.mark.asyncio
-    async def test_get_snapshots_all_provider_errors_raise_last_exception(self):
+    async def test_get_snapshots_all_provider_errors_raise_the_covering_sources_exception(self):
         src1 = SnapshotSource("a", fail=True)
         src2 = SnapshotSource("b", fail=True)
         provider = MarketDataProvider(
@@ -636,7 +647,7 @@ class TestMarketDataProvider:
             ]
         )
 
-        with pytest.raises(RuntimeError, match="b snapshots error"):
+        with pytest.raises(RuntimeError, match="a snapshots error"):
             await provider.get_snapshots(["AAPL"])
 
     @pytest.mark.asyncio

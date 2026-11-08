@@ -42,6 +42,10 @@ _SNAPSHOT_PRICE_FIELDS = (
     "late_trading_change", "regular_trading_change",
 )
 
+# Screener row fields quoted in the listing's quote unit; marketCap is already
+# in the major unit (a London cap is in pounds beside a price in pence).
+_SCREEN_PRICE_FIELDS = ("price", "lastAnnualDividend")
+
 # Realtime-quote row fields that carry a price. changePercentage is a ratio,
 # volume and sharesOutstanding are counts, marketCap is already in the major
 # unit, and eps is per share in the reporting currency, so none of them scale.
@@ -116,6 +120,14 @@ def declared_venue(ref: InstrumentRef | None) -> str | None:
     return ref.calendar_id
 
 
+def listing_currency(ref: InstrumentRef | None) -> str | None:
+    """The ISO currency *ref* lists in; None for no instrument or a venue the
+    protocol does not know, which resolves to a USD default, not its currency."""
+    if ref is None or declared_venue(ref) == UNKNOWN_MIC:
+        return None
+    return ref.price_currency
+
+
 def _declared(publisher: str | None, venue: str | None) -> _Declared:
     declared = _DECLARED.get(publisher or "", _UNDECLARED)
     if publisher in _REALTIME_ON_US_TAPE_ONLY and venue and venue != _US_TAPE:
@@ -128,9 +140,19 @@ def bars_regular_only(publisher: str | None) -> bool:
     return publisher in _REGULAR_SESSION_BARS
 
 
-def snapshot_tier(publisher: str | None, venue: str | None = None) -> Tier:
+def snapshot_tier(
+    publisher: str | None, venue: str | None = None, asset_class: AssetClass | None = None
+) -> Tier:
     """Freshness of *publisher*'s quote on *venue* (a :func:`declared_venue`; None = publisher-wide)."""
+    if _delayed_index_feed(publisher, asset_class):
+        return Tier.DELAYED_15M
     return _declared(publisher, venue).quote_tier
+
+
+def _delayed_index_feed(publisher: str | None, asset_class: AssetClass | None) -> bool:
+    """ginlix-data's index feed, bars and quotes alike, is the 15-minute delayed one
+    (the live index stream is delayed-only too)."""
+    return publisher == "ginlix-data" and asset_class is AssetClass.INDEX
 
 
 def publisher_lineage(
@@ -154,10 +176,9 @@ def publisher_lineage(
         treatment = PriceTreatment.RAW
     elif publisher == "fmp" and venue == _CN_CALENDAR:
         treatment = PriceTreatment.RAW
-    if publisher == "ginlix-data" and asset_class is AssetClass.INDEX:
-        # Its index feed is the 15-minute delayed one (the live index stream is
-        # delayed-only too); declared realtime, a daily series would settle at
-        # 16:05 ET on a pre-close value and be held until the next open.
+    if _delayed_index_feed(publisher, asset_class):
+        # Declared realtime, a daily series would settle at 16:05 ET on a
+        # pre-close value and be held until the next open.
         tier = Tier.DELAYED_15M
     return treatment, tier
 
@@ -396,6 +417,32 @@ def scale_snapshot_prices(snap: dict, places: int) -> dict:
             if snap.get(field) is not None:
                 snap[field] = scale_price(snap[field], places)
     return snap
+
+
+def screen_row_units(rows: list[dict]) -> list[dict]:
+    """Screener *rows* in major units, each naming its ``currency`` and ``quoteUnit``.
+
+    A source sends each row in the unit its listing quotes in, and names that
+    unit when the symbol cannot (``currency`` null when it knows the unit is
+    unknown). Otherwise the symbol's venue names it, and a venue the protocol
+    does not know names none. A pence row's price and dividend move to pounds.
+    """
+    out = []
+    for row in rows:
+        if "currency" in row:
+            currency, unit = row["currency"], row.get("quoteUnit") or row["currency"]
+        else:
+            ref = None
+            try:
+                ref = to_canonical(str(row.get("symbol") or ""))
+            except Exception:
+                pass
+            currency = listing_currency(ref)
+            unit = (ref.display_unit or currency) if currency else None
+        places = MINOR_UNIT_PLACES.get(unit or "", 0)
+        scaled = {f: scale_price(row[f], places) for f in _SCREEN_PRICE_FIELDS if f in row} if places else {}
+        out.append({**row, **scaled, "currency": currency, "quoteUnit": unit if currency else None})
+    return out
 
 
 def scale_quote_prices(rows: list[dict], symbol: str) -> list[dict]:

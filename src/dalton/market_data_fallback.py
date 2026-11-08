@@ -109,6 +109,8 @@ class FallbackFinancialSource:
     where the miss hands the call to FMP — the same default as the flip.
     """
 
+    default_name = "yfinance"
+
     def __init__(self, fmp: Any, yfinance: Any) -> None:
         self._fmp = fmp
         self._yfinance = yfinance

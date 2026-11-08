@@ -45,6 +45,7 @@ _MAX_DOCSTRING_CHARS = 900
 _DALTON_HOOKED_DOCSTRING_CAPS = {
     ("price_data", "get_stock_data"): 1050,
     ("price_data", "get_asset_data"): 1050,
+    ("fundamentals", "get_financial_statements"): 1000,
     ("yf_price", "get_stock_history"): 1150,
     ("yf_price", "get_multiple_stocks_history"): 1200,
 }
