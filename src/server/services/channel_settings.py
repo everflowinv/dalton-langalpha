@@ -14,9 +14,11 @@ import hashlib
 import json
 import logging
 import re
+from collections.abc import Iterable
 from typing import Any, NamedTuple
 
 import httpx
+from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from ptc_agent.agent.backends.db_json_route import (
@@ -28,6 +30,9 @@ from ptc_agent.agent.backends.db_json_route import (
     UserDataValidationError,
 )
 from ptc_agent.core.sandbox.livefs_mount import CallContext
+# DALTON-HOOK(colleague-dispatch): colleague writable workspace resolution for channel settings
+from src.dalton import sharing as dalton_sharing
+from src.dalton.settings import is_colleague_dispatch_enabled
 from src.server.database import workspace as workspace_db
 from src.server.services.user_data_io import parse_json, serialize_json
 from src.server.utils.pg_sanitize import normalize_uuid
@@ -343,6 +348,58 @@ class Written(NamedTuple):
     unknown: list[tuple[tuple[Any, ...], str]]
 
 
+# DALTON-HOOK(colleague-dispatch): include colleague workspaces where caller has web write access
+async def _get_writable_workspace_names(
+    user_id: str, workspace_ids: Iterable[str] | None = None
+) -> dict[str, str]:
+    id_list = list(workspace_ids) if workspace_ids is not None else None
+    names = dict(await workspace_db.get_workspace_names(user_id, id_list))
+    if not is_colleague_dispatch_enabled():
+        return names
+    if id_list is not None:
+        seen: set[str] = set()
+        for raw_ws in id_list:
+            ws_id = normalize_uuid(raw_ws)
+            if not ws_id or ws_id in names or ws_id in seen:
+                continue
+            seen.add(ws_id)
+            try:
+                ws = await dalton_sharing.require_workspace_access(
+                    ws_id, user_id, channel="web", need="write"
+                )
+            except (HTTPException, Exception):
+                continue
+            if isinstance(ws, dict) and ws.get("name") is not None:
+                names[ws_id] = str(ws["name"])
+        return names
+
+    try:
+        groups = await dalton_sharing.list_team_workspaces(user_id)
+    except (HTTPException, Exception):
+        return names
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        for ws in group.get("workspaces") or []:
+            if not isinstance(ws, dict):
+                continue
+            ws_id = normalize_uuid(ws.get("workspace_id"))
+            if not ws_id or ws_id in names:
+                continue
+            if ws.get("web_access") != "rw" and ws.get("access") != "rw":
+                continue
+            try:
+                checked = await dalton_sharing.require_workspace_access(
+                    ws_id, user_id, channel="web", need="write", workspace=dict(ws)
+                )
+            except (HTTPException, Exception):
+                continue
+            name = (checked if isinstance(checked, dict) else ws).get("name")
+            if name is not None:
+                names[ws_id] = str(name)
+    return names
+
+
 class ChannelsFile(_GatewayFile[Snapshot, Written, tuple[str, dict[str, Any]] | None]):
     """``channels.json``: one save is one PUT of the whole settings."""
 
@@ -356,7 +413,8 @@ class ChannelsFile(_GatewayFile[Snapshot, Written, tuple[str, dict[str, Any]] | 
                 f"Channel settings can't be read right now: the messaging service sent an answer "
                 f"that could not be read. {_RETRY}"
             )
-        names = await workspace_db.get_workspace_names(
+        # DALTON-HOOK(colleague-dispatch): resolve both own and colleague writable workspace names
+        names = await _get_writable_workspace_names(
             user_id, [ws for _, ws in _workspace_ids(settings)]
         )
         return Snapshot(version, settings, names)
@@ -374,8 +432,9 @@ class ChannelsFile(_GatewayFile[Snapshot, Written, tuple[str, dict[str, Any]] | 
         if problems:
             raise _refused(problems)
         named = _workspace_ids(value)
+        # DALTON-HOOK(colleague-dispatch): allow own workspaces plus colleague workspaces with write access
         names = (
-            await workspace_db.get_workspace_names(user_id, [ws for _, ws in named])
+            await _get_writable_workspace_names(user_id, [ws for _, ws in named])
             if named
             else {}
         )
@@ -401,6 +460,7 @@ class ChannelsFile(_GatewayFile[Snapshot, Written, tuple[str, dict[str, Any]] | 
         # Only an id the save sets or moves must be the user's: one the
         # settings already hold at that place passes as it is, so a binding
         # left on a deleted workspace doesn't block an unrelated edit.
+        # DALTON-HOOK(colleague-dispatch): parsed.unknown excludes writable colleague workspaces resolved in parse()
         held = {_place(path, ws) for path, ws in _workspace_ids(rows.settings)}
         problems += [
             (
@@ -517,7 +577,8 @@ class AvailableFile(_GatewayFile[Choices, None, None]):
                 f"The available chats can't be read right now: the messaging service sent an answer "
                 f"that could not be read. {_RETRY}"
             )
-        return Choices(apps, await workspace_db.get_workspace_names(user_id))
+        # DALTON-HOOK(colleague-dispatch): list own workspaces plus writable colleague workspaces in available.json
+        return Choices(apps, await _get_writable_workspace_names(user_id))
 
     def render(self, rows: Choices) -> tuple[str, str]:
         apps = {}

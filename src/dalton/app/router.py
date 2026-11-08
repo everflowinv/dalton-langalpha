@@ -2279,5 +2279,11 @@ async def global_search_endpoint(
     return await global_search(user_id, cleaned_q, limit=limit)
 
 
+from src.dalton.app.channels_router import channels_router  # noqa: E402
+
+router.include_router(channels_router)
+
+
+
 
 
