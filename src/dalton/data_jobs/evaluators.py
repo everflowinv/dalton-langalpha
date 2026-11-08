@@ -6,7 +6,7 @@ T18 (`megacap-relative-signal-monitor`) evaluators to lock the interface contrac
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 import csv
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -62,6 +62,24 @@ T5_PIPELINE_SOFT_STEPS: tuple[str, ...] = (
     "微盘股相对强弱",
     "可转债估值",
 )
+T5_PIPELINE_ALL_STEPS: tuple[str, ...] = T5_PIPELINE_CORE_STEPS + T5_PIPELINE_SOFT_STEPS
+
+
+def extract_t5_pipeline_steps(pipeline_status: Mapping[str, Any]) -> dict[str, str | None]:
+    """Extract top-level pipeline step statuses from T5 ``pipeline_status.json`` (§3.4.3, §6.1)."""
+    step_statuses: dict[str, str | None] = {}
+    for step_name in T5_PIPELINE_ALL_STEPS:
+        step_info = pipeline_status.get(step_name)
+        step_st = step_info.get("status") if isinstance(step_info, Mapping) else None
+        step_statuses[step_name] = str(step_st) if step_st is not None else None
+    for key, val in sorted(pipeline_status.items(), key=lambda item: str(item[0])):
+        key_str = str(key)
+        if key_str in step_statuses:
+            continue
+        if isinstance(val, Mapping) and "status" in val:
+            raw_st = val.get("status")
+            step_statuses[key_str] = str(raw_st) if raw_st is not None else None
+    return step_statuses
 
 
 @dataclass
@@ -256,9 +274,9 @@ def evaluate_t5_cn_leverage_daily(ctx: TaskEvaluationContext) -> TaskEvaluationR
             warnings=warnings,
         )
 
+    step_statuses = extract_t5_pipeline_steps(pipeline_status)
     for step_name in T5_PIPELINE_CORE_STEPS:
-        step_info = pipeline_status.get(step_name)
-        step_st = step_info.get("status") if isinstance(step_info, dict) else None
+        step_st = step_statuses.get(step_name)
         if step_st != "completed":
             return TaskEvaluationResult(
                 ok=False,
@@ -268,8 +286,7 @@ def evaluate_t5_cn_leverage_daily(ctx: TaskEvaluationContext) -> TaskEvaluationR
             )
 
     for soft_step in T5_PIPELINE_SOFT_STEPS:
-        step_info = pipeline_status.get(soft_step)
-        step_st = step_info.get("status") if isinstance(step_info, dict) else None
+        step_st = step_statuses.get(soft_step)
         if step_st != "completed":
             warnings.append(f"pipeline_status.{soft_step}:{step_st or 'missing'}")
 

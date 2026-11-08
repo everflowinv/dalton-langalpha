@@ -4091,3 +4091,1323 @@ async def test_a_host_run_reply_without_exit_confirmed_counts_as_unconfirmed(
             scheduled_slot_utc="2026-11-07T10:00:00Z", timeout=60, no_output_timeout=30,
         )
         assert out.exit_confirmed is expected
+
+
+# ---------------------------------------------------------------------------
+# 11. PR 0-4: Data task notification wiring, per-slot freeze & parity tool
+# ---------------------------------------------------------------------------
+
+
+def test_pr04_data_task_notify_classification_and_route_keys() -> None:
+    from src.dalton.notify.dispatch import (
+        CATEGORY_BUSINESS_TAG_MAP,
+        NotifyClassification,
+        _notify_route_keys,
+        classify_automation_for_notify,
+        resolve_automation_notify_state,
+        resolve_notify_route_targets,
+    )
+
+    assert CATEGORY_BUSINESS_TAG_MAP["data_task"] == ("数据任务", "blue")
+
+    # 1. Recognized via metadata.dalton_kind == "data_task"
+    cls_meta = classify_automation_for_notify(
+        {
+            "automation_id": "data:cn-leverage-daily",
+            "name": "data:cn-leverage-daily",
+            "route_key": "data:cn-leverage-daily",
+            "metadata": {"dalton_kind": "data_task"},
+        }
+    )
+    assert isinstance(cls_meta, NotifyClassification)
+    assert not isinstance(cls_meta, dict)
+    assert cls_meta == NotifyClassification(
+        category="data_task",
+        label_zh="数据任务",
+        scope="cn-leverage-daily",
+        requires_non_no_change_verdict=False,
+    )
+
+    # 2. Recognized via name starting with "data:" (even without metadata)
+    cls_name = classify_automation_for_notify({"name": "data:softbank-nav-monitor"})
+    assert isinstance(cls_name, NotifyClassification)
+    assert not isinstance(cls_name, dict)
+    assert cls_name == NotifyClassification(
+        category="data_task",
+        label_zh="数据任务",
+        scope="softbank-nav-monitor",
+        requires_non_no_change_verdict=False,
+    )
+
+    # 3. Recognized via route_key starting with "data:"
+    cls_route = classify_automation_for_notify(
+        {"name": "", "route_key": "data:tsmc-adr-premium"}
+    )
+    assert isinstance(cls_route, NotifyClassification)
+    assert not isinstance(cls_route, dict)
+    assert cls_route == NotifyClassification(
+        category="data_task",
+        label_zh="数据任务",
+        scope="tsmc-adr-premium",
+        requires_non_no_change_verdict=False,
+    )
+
+    # 4. _notify_route_keys returns 3-level fallback keys: [f"data:{scope}", "data_task", "default"]
+    auto_obj = {
+        "automation_id": "data:softbank-nav-monitor",
+        "name": "data:softbank-nav-monitor",
+        "route_key": "data:softbank-nav-monitor",
+        "metadata": {"dalton_kind": "data_task"},
+    }
+    assert _notify_route_keys(auto_obj) == [
+        "data:softbank-nav-monitor",
+        "data_task",
+        "default",
+    ]
+
+    # Verify 3-level route fallback resolution (data:<job_key> -> data_task -> default)
+    personal = ["feishu:ou_pm"]
+    assert resolve_notify_route_targets(
+        auto_obj,
+        {
+            "data:softbank-nav-monitor": ["feishu:chat:oc_task"],
+            "data_task": ["feishu:chat:oc_cat"],
+            "default": ["feishu:chat:oc_def"],
+        },
+        personal,
+        include_chat_targets=True,
+    ) == ["feishu:chat:oc_task"]
+    assert resolve_notify_route_targets(
+        auto_obj,
+        {
+            "data_task": ["feishu:chat:oc_cat"],
+            "default": ["feishu:chat:oc_def"],
+        },
+        personal,
+        include_chat_targets=True,
+    ) == ["feishu:chat:oc_cat"]
+    assert resolve_notify_route_targets(
+        auto_obj,
+        {"default": ["feishu:chat:oc_def"]},
+        personal,
+        include_chat_targets=True,
+    ) == ["feishu:chat:oc_def"]
+
+    # Verify overrides also honor data:<job_key> -> data_task -> default
+    assert resolve_automation_notify_state(
+        auto_obj, {"data:softbank-nav-monitor": False}
+    ) == ("data_task", False, "task")
+    assert resolve_automation_notify_state(auto_obj, {"data_task": False}) == (
+        "data_task",
+        False,
+        "category",
+    )
+    assert resolve_automation_notify_state(auto_obj, {"default": False}) == (
+        "data_task",
+        False,
+        "default",
+    )
+
+
+@pytest.mark.asyncio
+async def test_pr04_scheduler_notify_dispatch_target_transitions_and_terminal_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.dalton.data_jobs.scheduler as sched_mod
+    from src.dalton.data_jobs.scheduler import (
+        build_data_task_notify_automation,
+        dispatch_data_task_run_notification,
+        dispatch_pending_data_task_notifications,
+    )
+    from src.dalton.notify.dispatch import (
+        claim_target_delivery,
+        evaluate_user_notify_eligibility,
+        mark_target_delivery,
+        post_bridge_notify,
+    )
+
+    monkeypatch.setattr(
+        sched_mod,
+        "get_configured_pm_user_ids",
+        create_autospec(
+            sched_mod.get_configured_pm_user_ids, return_value=["pm-admin-1"]
+        ),
+    )
+
+    path_map = build_path_map(
+        host_var_dir=tmp_path / "host_var",
+        backend_var_dir=tmp_path / "backend_var",
+    )
+
+    # Case 1: Outbox from .dalton-runs/<run_id>/outbox.json -> all targets sent -> notify_status = 'dispatched'
+    run_id_1 = "11111111-1111-1111-1111-111111111111"
+    art_dir_1 = path_map.backend_run_artifacts_dir(run_id_1)
+    art_dir_1.mkdir(parents=True, exist_ok=True)
+    (art_dir_1 / "outbox.json").write_text(
+        json.dumps(
+            {
+                "feishu_message": "SoftBank NAV discount widened to 48%",
+                "card": {
+                    "schema": "2.0",
+                    "header": {"title": {"tag": "plain_text", "content": "SoftBank NAV"}},
+                    "body": {"elements": []},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    delivery_ledger: dict[tuple[str, str, str], list[tuple[str, str | None]]] = {}
+
+    async def _fake_claim(
+        execution_id: str,
+        channel: str,
+        target: str,
+        *,
+        user_id: str = "",
+        automation_id: str | None = None,
+        payload: Any = None,
+        stale_pending_minutes: int = 10,
+    ) -> bool:
+        _ = (user_id, automation_id, payload, stale_pending_minutes)
+        delivery_ledger.setdefault((execution_id, channel, target), []).append(
+            ("pending", None)
+        )
+        return True
+
+    async def _fake_mark(
+        execution_id: str,
+        channel: str,
+        target: str,
+        *,
+        status: str,
+        error_code: str | None = None,
+        reason: str | None = None,
+        expected_status: Any = None,
+    ) -> bool:
+        _ = expected_status
+        delivery_ledger.setdefault((execution_id, channel, target), []).append(
+            (status, reason or error_code)
+        )
+        return True
+
+    claim_mock = create_autospec(claim_target_delivery, side_effect=_fake_claim)
+    mark_mock = create_autospec(mark_target_delivery, side_effect=_fake_mark)
+    eval_mock_1 = create_autospec(
+        evaluate_user_notify_eligibility,
+        return_value=(True, None, ["feishu:ou_pm", "feishu:chat:oc_alert"]),
+    )
+    post_mock_1 = create_autospec(
+        post_bridge_notify,
+        side_effect=lambda targets, text, card=None: {
+            "ok": True,
+            "status_code": 200,
+            "results": [{"target": t, "ok": True} for t in targets],
+        },
+    )
+
+    lock_conn_1, lock_state_1 = _make_autospec_db([{"fetchone": (1,)} for _ in range(10)])
+    conn_1, state_1 = _make_autospec_db(
+        [
+            {
+                "fetchall": [
+                    {
+                        "run_id": run_id_1,
+                        "job_key": "softbank-nav-monitor",
+                        "outbox_payload": None,
+                        "log_tail": "",
+                    }
+                ]
+            },
+            {"rowcount": 1},  # UPDATE dalton_data_task_runs SET notify_status = 'dispatched'
+        ]
+    )
+
+    res_1 = await dispatch_pending_data_task_notifications(
+        conn_1,
+        lock_conn=lock_conn_1,
+        path_map=path_map,
+        evaluate_eligibility_fn=eval_mock_1,
+        claim_target_fn=claim_mock,
+        post_notify_fn=post_mock_1,
+        mark_target_fn=mark_mock,
+    )
+    assert res_1 == [(run_id_1, "dispatched")]
+    eval_mock_1.assert_awaited_once_with(
+        "pm-admin-1",
+        build_data_task_notify_automation("softbank-nav-monitor"),
+    )
+    assert delivery_ledger[(run_id_1, "feishu", "feishu:ou_pm")] == [
+        ("pending", None),
+        ("sent", None),
+    ]
+    assert delivery_ledger[(run_id_1, "feishu", "feishu:chat:oc_alert")] == [
+        ("pending", None),
+        ("sent", None),
+    ]
+    assert state_1["executed"][-1][1]["notify_status"] == "dispatched"
+    # Scheduler lock verified before eligibility, each claim/post, and final DB update
+    assert len(lock_state_1["executed"]) >= 6
+
+    # Case 2: T32 (stdout payload) with 3 targets transitioning pending -> sent, failed, and skipped -> run stays 'pending_dispatch' (Item 3)
+    run_id_2 = "22222222-2222-2222-2222-222222222222"
+    eval_mock_2 = create_autospec(
+        evaluate_user_notify_eligibility,
+        return_value=(
+            True,
+            None,
+            ["feishu:ou_ok", "feishu:ou_fail", "feishu:ou_skip"],
+        ),
+    )
+
+    async def _post_mixed(
+        targets: list[str],
+        text: str,
+        card: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        assert "Quantum EW signal" in text
+        t = targets[0]
+        if t == "feishu:ou_ok":
+            return {"ok": True, "status_code": 200, "results": [{"target": t, "ok": True}]}
+        if t == "feishu:ou_fail":
+            return {
+                "ok": False,
+                "status_code": 200,
+                "results": [{"target": t, "ok": False, "error": "rate_limited"}],
+            }
+        return {
+            "ok": True,
+            "status_code": 200,
+            "results": [{"target": t, "ok": False, "status": "skipped", "reason": "target_removed"}],
+        }
+
+    post_mock_2 = create_autospec(post_bridge_notify, side_effect=_post_mixed)
+    lock_conn_2, _ = _make_autospec_db([{"fetchone": (1,)} for _ in range(12)])
+    conn_2, state_2 = _make_autospec_db([{"rowcount": 1}])
+
+    status_2 = await dispatch_data_task_run_notification(
+        conn_2,
+        lock_conn=lock_conn_2,
+        run_id=run_id_2,
+        job_key="quantum-ew-monitor",
+        log_tail='progress line\n{"feishu_message": "Quantum EW signal triggered"}\n',
+        path_map=path_map,
+        evaluate_eligibility_fn=eval_mock_2,
+        claim_target_fn=claim_mock,
+        post_notify_fn=post_mock_2,
+        mark_target_fn=mark_mock,
+    )
+    assert status_2 == "pending_dispatch"
+    assert delivery_ledger[(run_id_2, "feishu", "feishu:ou_ok")] == [
+        ("pending", None),
+        ("sent", None),
+    ]
+    assert delivery_ledger[(run_id_2, "feishu", "feishu:ou_fail")] == [
+        ("pending", None),
+        ("failed", "rate_limited"),
+    ]
+    assert delivery_ledger[(run_id_2, "feishu", "feishu:ou_skip")] == [
+        ("pending", None),
+        ("skipped", "target_removed"),
+    ]
+    assert state_2["executed"][-1][1]["notify_status"] == "pending_dispatch"
+
+    # Case 3: Ineligible (toggle_off with candidate target) -> target transitions pending -> skipped, run notify_status = 'skipped'
+    run_id_3 = "33333333-3333-3333-3333-333333333333"
+    eval_mock_3 = create_autospec(
+        evaluate_user_notify_eligibility,
+        return_value=(False, "toggle_off", ["feishu:ou_muted"]),
+    )
+    post_mock_3 = create_autospec(post_bridge_notify)
+    lock_conn_3, _ = _make_autospec_db([{"fetchone": (1,)} for _ in range(8)])
+    conn_3, state_3 = _make_autospec_db([{"rowcount": 1}])
+
+    status_3 = await dispatch_data_task_run_notification(
+        conn_3,
+        lock_conn=lock_conn_3,
+        run_id=run_id_3,
+        job_key="asia-leverage-crossview-daily",
+        log_tail='{"text": "Asia leverage crossview"}',
+        path_map=path_map,
+        evaluate_eligibility_fn=eval_mock_3,
+        claim_target_fn=claim_mock,
+        post_notify_fn=post_mock_3,
+        mark_target_fn=mark_mock,
+    )
+    assert status_3 == "skipped"
+    post_mock_3.assert_not_awaited()
+    assert delivery_ledger[(run_id_3, "feishu", "feishu:ou_muted")] == [
+        ("pending", None),
+        ("skipped", "toggle_off"),
+    ]
+    assert state_3["executed"][-1][1]["notify_status"] == "skipped"
+
+    # Case 4: Losing scheduler lock before post_bridge_notify aborts before external HTTP call
+    run_id_4 = "44444444-4444-4444-4444-444444444444"
+    post_mock_4 = create_autospec(post_bridge_notify)
+    lock_conn_4, _ = _make_autospec_db(
+        [
+            {"fetchone": (1,)},  # before evaluate_user_notify_eligibility
+            {"fetchone": (1,)},  # before claim_target_delivery
+            {"fetchone": None},  # lock lost before post_bridge_notify!
+        ]
+    )
+    conn_4, _ = _make_autospec_db([])
+    with pytest.raises(SchedulerLockLostError):
+        await dispatch_data_task_run_notification(
+            conn_4,
+            lock_conn=lock_conn_4,
+            run_id=run_id_4,
+            job_key="softbank-nav-monitor",
+            db_outbox_payload={"text": "test"},
+            path_map=path_map,
+            evaluate_eligibility_fn=eval_mock_1,
+            claim_target_fn=claim_mock,
+            post_notify_fn=post_mock_4,
+            mark_target_fn=mark_mock,
+        )
+    post_mock_4.assert_not_awaited()
+
+    # Case 5 (Item 2): Task disabled (enabled=False or notify_enabled=False) -> marked 'skipped', not sent
+    run_id_disabled = "55555555-5555-5555-5555-555555555555"
+    run_id_notify_off = "55555555-5555-5555-5555-555555555556"
+    post_mock_disabled = create_autospec(post_bridge_notify)
+    claim_mock_disabled = create_autospec(claim_target_delivery)
+    lock_conn_5, _ = _make_autospec_db([{"fetchone": (1,)} for _ in range(6)])
+    conn_5, state_5 = _make_autospec_db(
+        [
+            {
+                "fetchall": [
+                    {
+                        "run_id": run_id_disabled,
+                        "job_key": "softbank-nav-monitor",
+                        "outbox_payload": {"text": "should not send"},
+                        "log_tail": "",
+                        "task_enabled": False,
+                        "notify_enabled": True,
+                    },
+                    {
+                        "run_id": run_id_notify_off,
+                        "job_key": "softbank-nav-monitor",
+                        "outbox_payload": {"text": "should not send"},
+                        "log_tail": "",
+                        "task_enabled": True,
+                        "notify_enabled": False,
+                    },
+                ]
+            },
+            {"rowcount": 1},
+            {"rowcount": 1},
+        ]
+    )
+    res_5 = await dispatch_pending_data_task_notifications(
+        conn_5,
+        lock_conn=lock_conn_5,
+        path_map=path_map,
+        evaluate_eligibility_fn=eval_mock_1,
+        claim_target_fn=claim_mock_disabled,
+        post_notify_fn=post_mock_disabled,
+        mark_target_fn=mark_mock,
+    )
+    assert res_5 == [
+        (run_id_disabled, "skipped"),
+        (run_id_notify_off, "skipped"),
+    ]
+    assert "LEFT JOIN dalton_data_task_defs" in state_5["executed"][0][0]
+    claim_mock_disabled.assert_not_awaited()
+    post_mock_disabled.assert_not_awaited()
+
+    # Case 6 (Item 7): Non-T27/T32 task missing outbox does NOT fall back to log_tail; marks 'skipped' (outbox_missing)
+    run_id_no_outbox = "66666666-6666-6666-6666-666666666666"
+    post_mock_6 = create_autospec(post_bridge_notify)
+    claim_mock_6 = create_autospec(claim_target_delivery)
+    lock_conn_6, _ = _make_autospec_db([{"fetchone": (1,)} for _ in range(4)])
+    conn_6, state_6 = _make_autospec_db([{"rowcount": 1}])
+    status_6 = await dispatch_data_task_run_notification(
+        conn_6,
+        lock_conn=lock_conn_6,
+        run_id=run_id_no_outbox,
+        job_key="softbank-nav-monitor",
+        db_outbox_payload=None,
+        log_tail="some noisy stdout log that must NOT be sent as notification body",
+        path_map=path_map,
+        evaluate_eligibility_fn=eval_mock_1,
+        claim_target_fn=claim_mock_6,
+        post_notify_fn=post_mock_6,
+        mark_target_fn=mark_mock,
+    )
+    assert status_6 == "skipped"
+    claim_mock_6.assert_not_awaited()
+    post_mock_6.assert_not_awaited()
+    assert state_6["executed"][-1][1]["notify_status"] == "skipped"
+
+    # Case 7 (Item 3): Scheduler failover mid-dispatch & aggregation from dalton_notify_deliveries
+    from src.dalton.notify.dispatch import fetch_execution_deliveries
+
+    run_id_failover = "77777777-7777-7777-7777-777777777777"
+    persisted_rows_7: dict[tuple[str, str], str] = {
+        ("feishu", "feishu:ou_pm"): "sent",  # Already sent before scheduler failover!
+        ("feishu", "feishu:chat:oc_alert"): "pending",  # Still pending from previous leader!
+    }
+
+    async def _fetch_deliv_7(exec_id: str) -> list[dict[str, Any]]:
+        assert exec_id == run_id_failover
+        return [
+            {"execution_id": exec_id, "channel": ch, "target": tgt, "status": st}
+            for (ch, tgt), st in persisted_rows_7.items()
+        ]
+
+    fetch_mock_7 = create_autospec(fetch_execution_deliveries, side_effect=_fetch_deliv_7)
+    claim_unclaimed = create_autospec(claim_target_delivery, return_value=False)
+    post_mock_7 = create_autospec(post_bridge_notify)
+    lock_conn_7a, _ = _make_autospec_db([{"fetchone": (1,)} for _ in range(8)])
+    conn_7a, state_7a = _make_autospec_db([{"rowcount": 1}])
+
+    # 7a: Second target is still non-stale 'pending' (claim returns False) -> run MUST stay 'pending_dispatch', NEVER 'skipped', and first target is NOT re-claimed
+    status_7a = await dispatch_data_task_run_notification(
+        conn_7a,
+        lock_conn=lock_conn_7a,
+        run_id=run_id_failover,
+        job_key="softbank-nav-monitor",
+        db_outbox_payload={"text": "SoftBank NAV"},
+        path_map=path_map,
+        evaluate_eligibility_fn=eval_mock_1,
+        claim_target_fn=claim_unclaimed,
+        post_notify_fn=post_mock_7,
+        mark_target_fn=mark_mock,
+        fetch_deliveries_fn=fetch_mock_7,
+    )
+    assert status_7a == "pending_dispatch"
+    assert state_7a["executed"][-1][1]["notify_status"] == "pending_dispatch"
+    # First target ('feishu:ou_pm') was already 'sent', so claim was only attempted for the second target!
+    claim_unclaimed.assert_awaited_once()
+    assert claim_unclaimed.await_args.args[2] == "feishu:chat:oc_alert"
+    post_mock_7.assert_not_awaited()
+
+    # 7b: Now second target is claimed and sent (or already sent) -> aggregates all 'sent' -> 'dispatched' without re-sending first target
+    async def _claim_and_update_7b(
+        execution_id: str,
+        channel: str,
+        target: str,
+        *,
+        user_id: str = "",
+        automation_id: str | None = None,
+        payload: Any = None,
+        stale_pending_minutes: int = 10,
+    ) -> bool:
+        _ = (execution_id, user_id, automation_id, payload, stale_pending_minutes)
+        persisted_rows_7[(channel, target)] = "pending"
+        return True
+
+    async def _mark_and_update_7b(
+        execution_id: str,
+        channel: str,
+        target: str,
+        *,
+        status: str,
+        error_code: str | None = None,
+        reason: str | None = None,
+        expected_status: Any = None,
+    ) -> bool:
+        _ = (execution_id, error_code, reason, expected_status)
+        persisted_rows_7[(channel, target)] = status
+        return True
+
+    claim_mock_7b = create_autospec(claim_target_delivery, side_effect=_claim_and_update_7b)
+    mark_mock_7b = create_autospec(mark_target_delivery, side_effect=_mark_and_update_7b)
+    post_mock_7b = create_autospec(
+        post_bridge_notify,
+        side_effect=lambda targets, text, card=None: {
+            "ok": True,
+            "status_code": 200,
+            "results": [{"target": t, "ok": True} for t in targets],
+        },
+    )
+    lock_conn_7b, _ = _make_autospec_db([{"fetchone": (1,)} for _ in range(10)])
+    conn_7b, state_7b = _make_autospec_db([{"rowcount": 1}])
+
+    status_7b = await dispatch_data_task_run_notification(
+        conn_7b,
+        lock_conn=lock_conn_7b,
+        run_id=run_id_failover,
+        job_key="softbank-nav-monitor",
+        db_outbox_payload={"text": "SoftBank NAV"},
+        path_map=path_map,
+        evaluate_eligibility_fn=eval_mock_1,
+        claim_target_fn=claim_mock_7b,
+        post_notify_fn=post_mock_7b,
+        mark_target_fn=mark_mock_7b,
+        fetch_deliveries_fn=fetch_mock_7,
+    )
+    assert status_7b == "dispatched"
+    assert state_7b["executed"][-1][1]["notify_status"] == "dispatched"
+    claim_mock_7b.assert_awaited_once()
+    post_mock_7b.assert_awaited_once_with(
+        ["feishu:chat:oc_alert"],
+        "SoftBank NAV",
+        card=None,
+    )
+
+    # 7c: Mixed 'sent' + 'skipped' across targets -> converges to 'dispatched' (never stuck in 'pending_dispatch')
+    persisted_rows_7["feishu", "feishu:ou_pm"] = "sent"
+    persisted_rows_7["feishu", "feishu:chat:oc_alert"] = "skipped"
+    claim_mock_7c = create_autospec(claim_target_delivery)
+    post_mock_7c = create_autospec(post_bridge_notify)
+    lock_conn_7c, _ = _make_autospec_db([{"fetchone": (1,)} for _ in range(6)])
+    conn_7c, state_7c = _make_autospec_db([{"rowcount": 1}])
+    status_7c = await dispatch_data_task_run_notification(
+        conn_7c,
+        lock_conn=lock_conn_7c,
+        run_id=run_id_failover,
+        job_key="softbank-nav-monitor",
+        db_outbox_payload={"text": "SoftBank NAV"},
+        path_map=path_map,
+        evaluate_eligibility_fn=eval_mock_1,
+        claim_target_fn=claim_mock_7c,
+        post_notify_fn=post_mock_7c,
+        mark_target_fn=mark_mock_7b,
+        fetch_deliveries_fn=fetch_mock_7,
+    )
+    assert status_7c == "dispatched"
+    assert state_7c["executed"][-1][1]["notify_status"] == "dispatched"
+    claim_mock_7c.assert_not_awaited()
+    post_mock_7c.assert_not_awaited()
+
+    # 7d: All targets 'skipped' -> 'skipped'
+    persisted_rows_7["feishu", "feishu:ou_pm"] = "skipped"
+    persisted_rows_7["feishu", "feishu:chat:oc_alert"] = "skipped"
+    claim_mock_7d = create_autospec(claim_target_delivery)
+    post_mock_7d = create_autospec(post_bridge_notify)
+    lock_conn_7d, _ = _make_autospec_db([{"fetchone": (1,)} for _ in range(6)])
+    conn_7d, state_7d = _make_autospec_db([{"rowcount": 1}])
+    status_7d = await dispatch_data_task_run_notification(
+        conn_7d,
+        lock_conn=lock_conn_7d,
+        run_id=run_id_failover,
+        job_key="softbank-nav-monitor",
+        db_outbox_payload={"text": "SoftBank NAV"},
+        path_map=path_map,
+        evaluate_eligibility_fn=eval_mock_1,
+        claim_target_fn=claim_mock_7d,
+        post_notify_fn=post_mock_7d,
+        mark_target_fn=mark_mock_7b,
+        fetch_deliveries_fn=fetch_mock_7,
+    )
+    assert status_7d == "skipped"
+    assert state_7d["executed"][-1][1]["notify_status"] == "skipped"
+    claim_mock_7d.assert_not_awaited()
+    post_mock_7d.assert_not_awaited()
+
+    # 7e: Any target 'failed' (with another 'sent' or 'skipped') -> stays 'pending_dispatch'
+    persisted_rows_7["feishu", "feishu:ou_pm"] = "sent"
+    persisted_rows_7["feishu", "feishu:chat:oc_alert"] = "failed"
+    claim_mock_7e = create_autospec(claim_target_delivery, return_value=False)
+    post_mock_7e = create_autospec(post_bridge_notify)
+    lock_conn_7e, _ = _make_autospec_db([{"fetchone": (1,)} for _ in range(6)])
+    conn_7e, state_7e = _make_autospec_db([{"rowcount": 1}])
+    status_7e = await dispatch_data_task_run_notification(
+        conn_7e,
+        lock_conn=lock_conn_7e,
+        run_id=run_id_failover,
+        job_key="softbank-nav-monitor",
+        db_outbox_payload={"text": "SoftBank NAV"},
+        path_map=path_map,
+        evaluate_eligibility_fn=eval_mock_1,
+        claim_target_fn=claim_mock_7e,
+        post_notify_fn=post_mock_7e,
+        mark_target_fn=mark_mock_7b,
+        fetch_deliveries_fn=fetch_mock_7,
+    )
+    assert status_7e == "pending_dispatch"
+    assert state_7e["executed"][-1][1]["notify_status"] == "pending_dispatch"
+
+
+@pytest.mark.asyncio
+async def test_pr04_retry_failed_notify_deliveries_reconstructs_data_task_on_null_join(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.dalton.notify.dispatch as dispatch_mod
+    from src.dalton.notify.dispatch import (
+        _reconstruct_automation_from_delivery_row,
+        mark_target_delivery,
+        post_bridge_notify,
+        resolve_dalton_notify_enabled,
+        resolve_dalton_notify_overrides,
+        resolve_dalton_notify_routes,
+        resolve_dalton_notify_targets,
+        retry_failed_notify_deliveries,
+    )
+
+    expected_auto = {
+        "automation_id": "data:softbank-nav-monitor",
+        "name": "data:softbank-nav-monitor",
+        "route_key": "data:softbank-nav-monitor",
+        "metadata": {"dalton_kind": "data_task"},
+    }
+
+    # 1. Reconstruct from payload.route_key when LEFT JOIN automations returns NULL
+    from_route_key = _reconstruct_automation_from_delivery_row(
+        {
+            "automation_id": "data:softbank-nav-monitor",
+            "automation_name": None,
+            "automation_metadata": None,
+        },
+        {
+            "text": "SoftBank NAV",
+            "route_key": "data:softbank-nav-monitor",
+            "category": "data_task",
+        },
+    )
+    assert from_route_key == expected_auto
+
+    # 2. Reconstruct from data:-prefixed automation_id even without payload.route_key
+    from_auto_id = _reconstruct_automation_from_delivery_row(
+        {
+            "automation_id": "data:softbank-nav-monitor",
+            "automation_name": None,
+            "automation_metadata": None,
+        },
+        {"text": "SoftBank NAV"},
+    )
+    assert from_auto_id == expected_auto
+
+    # 3. End-to-end retry_failed_notify_deliveries with LEFT JOIN automations NULL
+    candidate_rows = [
+        {
+            "execution_id": "run-data-retry-1",
+            "automation_id": "data:softbank-nav-monitor",
+            "user_id": "pm-admin-1",
+            "channel": "feishu",
+            "target": "feishu:chat:oc_market_alert",
+            "status": "failed",
+            "attempt_count": 1,
+            "payload_json": {
+                "text": "SoftBank NAV Alert",
+                "card": {"schema": "2.0", "header": {"title": {"content": "NAV"}}},
+                "route_key": "data:softbank-nav-monitor",
+                "category": "data_task",
+            },
+            "automation_name": None,
+            "automation_metadata": None,
+            "data_task_enabled": True,
+            "data_task_notify_enabled": True,
+        }
+    ]
+
+    shared_db_conn, _ = _make_autospec_db(
+        [
+            {"fetchall": candidate_rows},
+            {"fetchone": {"attempt_count": 2}},
+        ]
+    )
+
+    real_get_db_connection = dispatch_mod.get_db_connection
+
+    @asynccontextmanager
+    async def _fake_get_db_conn(conn: Any = None):
+        yield shared_db_conn
+
+    monkeypatch.setattr(
+        dispatch_mod,
+        "get_db_connection",
+        create_autospec(real_get_db_connection, side_effect=_fake_get_db_conn),
+    )
+
+    post_fn = create_autospec(
+        post_bridge_notify,
+        return_value={
+            "ok": True,
+            "status_code": 200,
+            "results": [{"target": "feishu:chat:oc_market_alert", "ok": True}],
+        },
+    )
+    mark_fn = create_autospec(mark_target_delivery, return_value=True)
+    enabled_fn = create_autospec(resolve_dalton_notify_enabled, return_value=True)
+    overrides_fn = create_autospec(resolve_dalton_notify_overrides, return_value={})
+    targets_fn = create_autospec(
+        resolve_dalton_notify_targets, return_value=["feishu:ou_pm"]
+    )
+    routes_fn = create_autospec(
+        resolve_dalton_notify_routes,
+        return_value={"data:softbank-nav-monitor": ["feishu:chat:oc_market_alert"]},
+    )
+
+    async def _is_admin(_uid: str | None) -> bool:
+        return True
+
+    is_admin_fn = create_autospec(_is_admin, return_value=True)
+
+    sent = await retry_failed_notify_deliveries(
+        post_notify_fn=post_fn,
+        mark_delivery_fn=mark_fn,
+        resolve_enabled_fn=enabled_fn,
+        resolve_overrides_fn=overrides_fn,
+        resolve_targets_fn=targets_fn,
+        resolve_routes_fn=routes_fn,
+        is_admin_fn=is_admin_fn,
+    )
+    assert sent == 1
+    post_fn.assert_awaited_once_with(
+        ["feishu:chat:oc_market_alert"],
+        "SoftBank NAV Alert",
+        card={"schema": "2.0", "header": {"title": {"content": "NAV"}}},
+    )
+    mark_fn.assert_awaited_once_with(
+        "run-data-retry-1",
+        "feishu",
+        "feishu:chat:oc_market_alert",
+        status="sent",
+        error_code=None,
+        expected_status="pending",
+    )
+
+    # 4. Item 2: When data task is disabled (enabled=False or notify_enabled=False), retry marks delivery 'skipped' (error_code='task_disabled') and does NOT re-send
+    disabled_candidates = [
+        {
+            "execution_id": "run-data-retry-disabled",
+            "automation_id": "data:softbank-nav-monitor",
+            "user_id": "pm-admin-1",
+            "channel": "feishu",
+            "target": "feishu:chat:oc_market_alert",
+            "status": "failed",
+            "attempt_count": 1,
+            "payload_json": {
+                "text": "SoftBank NAV Alert",
+                "route_key": "data:softbank-nav-monitor",
+                "category": "data_task",
+            },
+            "automation_name": None,
+            "automation_metadata": None,
+            "data_task_enabled": False,
+            "data_task_notify_enabled": True,
+        }
+    ]
+    disabled_db_conn, _ = _make_autospec_db([{"fetchall": disabled_candidates}])
+
+    @asynccontextmanager
+    async def _fake_get_disabled_db_conn(conn: Any = None):
+        yield disabled_db_conn
+
+    monkeypatch.setattr(
+        dispatch_mod,
+        "get_db_connection",
+        create_autospec(
+            real_get_db_connection, side_effect=_fake_get_disabled_db_conn
+        ),
+    )
+    post_fn_disabled = create_autospec(post_bridge_notify)
+    mark_fn_disabled = create_autospec(mark_target_delivery, return_value=True)
+
+    sent_disabled = await retry_failed_notify_deliveries(
+        post_notify_fn=post_fn_disabled,
+        mark_delivery_fn=mark_fn_disabled,
+        resolve_enabled_fn=enabled_fn,
+        resolve_overrides_fn=overrides_fn,
+        resolve_targets_fn=targets_fn,
+        resolve_routes_fn=routes_fn,
+        is_admin_fn=is_admin_fn,
+    )
+    assert sent_disabled == 0
+    post_fn_disabled.assert_not_awaited()
+    mark_fn_disabled.assert_awaited_once_with(
+        "run-data-retry-disabled",
+        "feishu",
+        "feishu:chat:oc_market_alert",
+        status="skipped",
+        error_code="task_disabled",
+        reason="task_disabled",
+        expected_status=("failed", "pending"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_pr04_freeze_writes_done_json_atomically_and_failure_keeps_terminal_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    import logging
+    import src.dalton.data_jobs.freeze as freeze_mod
+    import src.dalton.data_jobs.scheduler as sched_mod
+    from src.dalton.data_jobs.evaluators import TaskEvaluationResult
+    from src.dalton.data_jobs.freeze import freeze_task_run_artifacts
+
+    # 1. Verify manifest freeze_paths populated for T5 and T18, and empty for the other 17 tasks
+    manifest = load_data_task_manifest()
+    by_code = manifest.by_task_code()
+    assert by_code["T5"].freeze_paths == [
+        "state/cn-leverage/pipeline_status.json",
+        "state/cn-leverage/quant_unwind_signals.csv",
+        "state/cn-leverage/*.csv",
+        "research-outputs/cn-leverage/index.html",
+    ]
+    assert by_code["T18"].freeze_paths == [
+        "temp/megacap-relative-signal-monitor/latest.json",
+    ]
+    for code, entry in by_code.items():
+        if code not in ("T5", "T18"):
+            assert entry.freeze_paths == [], f"Expected empty freeze_paths for {code}"
+
+    # 2. Prepare T5 artifacts and verify atomic done.json write (temp file -> os.replace)
+    data_root = tmp_path / "openclaw-data"
+    status_file = data_root / "state" / "cn-leverage" / "pipeline_status.json"
+    csv_file = data_root / "state" / "cn-leverage" / "quant_unwind_signals.csv"
+    html_file = data_root / "research-outputs" / "cn-leverage" / "index.html"
+    status_file.parent.mkdir(parents=True, exist_ok=True)
+    html_file.parent.mkdir(parents=True, exist_ok=True)
+
+    status_file.write_text(
+        json.dumps(
+            {
+                "trade_date": "2026-11-06",
+                "两融核心": {"status": "completed"},
+                "股指期货基差": {"status": "completed"},
+                "宽基ETF份额": {"status": "completed"},
+                "量化中性拥挤/Unwind": {"status": "completed"},
+                "北向资金": {"status": "skipped"},
+                "微盘股相对强弱": {"status": "completed"},
+                "可转债估值": {"status": "failed"},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    csv_file.write_text(
+        "date,score,signal\n2026-11-05,0.42,neutral\n2026-11-06,0.68,warn\n",
+        encoding="utf-8",
+    )
+    html_file.write_text("<html><body>dashboard</body></html>", encoding="utf-8")
+
+    replace_calls: list[tuple[Path, Path, bool]] = []
+    real_replace = os.replace
+
+    def _spy_replace(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+        src_p = Path(src)
+        dst_p = Path(dst)
+        # Temp file must already exist and have non-empty JSON before rename!
+        assert src_p.is_file()
+        assert src_p.parent == dst_p.parent
+        assert src_p.name != "done.json"
+        replace_calls.append((src_p, dst_p, src_p.is_file()))
+        real_replace(src_p, dst_p)
+
+    spy_replace = create_autospec(os.replace, side_effect=_spy_replace)
+    monkeypatch.setattr(freeze_mod.os, "replace", spy_replace)
+
+    slot_dt = datetime(2026, 11, 7, 9, 45, 0, tzinfo=timezone.utc)
+    completed_dt = datetime(2026, 11, 7, 9, 48, 12, tzinfo=timezone.utc)
+    done_path = freeze_task_run_artifacts(
+        data_root=data_root,
+        job_key=T5_JOB_KEY,
+        scheduled_slot_utc=slot_dt,
+        completed_at=completed_dt,
+        exit_code=0,
+    )
+    assert done_path is not None
+    assert done_path == (
+        data_root
+        / ".dalton-freeze"
+        / T5_JOB_KEY
+        / "2026-11-07T09:45:00Z"
+        / "done.json"
+    )
+    assert done_path.is_file()
+    assert len(replace_calls) == 1
+    assert replace_calls[0][1] == done_path
+    assert replace_calls[0][2] is True
+
+    done_data = json.loads(done_path.read_text(encoding="utf-8"))
+    assert done_data["job_key"] == T5_JOB_KEY
+    assert done_data["scheduled_slot_utc"] == "2026-11-07T09:45:00Z"
+    assert done_data["completed_at"] == "2026-11-07T09:48:12Z"
+    assert done_data["exit_code"] == 0
+    assert set(done_data["file_sha256"].keys()) == {
+        "state/cn-leverage/pipeline_status.json",
+        "state/cn-leverage/quant_unwind_signals.csv",
+        "research-outputs/cn-leverage/index.html",
+    }
+    assert done_data["csv_summary"]["state/cn-leverage/quant_unwind_signals.csv"] == {
+        "row_count": 2,
+        "latest_date": "2026-11-06",
+    }
+    assert done_data["core_metrics"]["pipeline_steps"] == {
+        "两融核心": "completed",
+        "股指期货基差": "completed",
+        "宽基ETF份额": "completed",
+        "量化中性拥挤/Unwind": "completed",
+        "北向资金": "skipped",
+        "微盘股相对强弱": "completed",
+        "可转债估值": "failed",
+    }
+    assert done_data["core_metrics"]["quant_unwind_row_count"] == 2
+    assert done_data["core_metrics"]["quant_unwind_latest_date"] == "2026-11-06"
+
+    # 2b. Item 1 & Item 4: Path boundary, symlink rejection, and missing artifact checks
+    outside_dir = tmp_path / "outside_secret_zone"
+    outside_dir.mkdir(parents=True, exist_ok=True)
+    outside_secret = outside_dir / "secret.txt"
+    outside_secret.write_text("TOP_SECRET_DATA", encoding="utf-8")
+
+    # (i) '..' in freeze_paths -> rejected, not copied, done.json NOT written
+    slot_dotdot = "2026-11-07T10:00:00Z"
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        res_dotdot = freeze_task_run_artifacts(
+            data_root=data_root,
+            job_key=T18_JOB_KEY,
+            scheduled_slot_utc=slot_dotdot,
+            freeze_paths=["../outside_secret_zone/secret.txt"],
+        )
+    assert res_dotdot is None
+    assert not (
+        data_root / ".dalton-freeze" / T18_JOB_KEY / slot_dotdot / "done.json"
+    ).exists()
+    assert "TOP_SECRET_DATA" not in "".join(
+        p.read_text(encoding="utf-8", errors="ignore")
+        for p in data_root.rglob("*")
+        if p.is_file()
+    )
+    assert any("unsafe freeze_path" in rec.getMessage() for rec in caplog.records)
+
+    # (ii) Absolute path in freeze_paths -> rejected (even if a matching relative path exists under data_root!), done.json NOT written
+    rel_inside = data_root / "temp" / "megacap-relative-signal-monitor" / "latest.json"
+    rel_inside.parent.mkdir(parents=True, exist_ok=True)
+    rel_inside.write_text('{"date": "2026-11-06", "rows": []}', encoding="utf-8")
+    slot_abs = "2026-11-07T10:05:00Z"
+    res_abs_1 = freeze_task_run_artifacts(
+        data_root=data_root,
+        job_key=T18_JOB_KEY,
+        scheduled_slot_utc=slot_abs,
+        freeze_paths=[str(outside_secret)],
+    )
+    res_abs_2 = freeze_task_run_artifacts(
+        data_root=data_root,
+        job_key=T18_JOB_KEY,
+        scheduled_slot_utc=slot_abs,
+        freeze_paths=["/temp/megacap-relative-signal-monitor/latest.json"],
+    )
+    assert res_abs_1 is None
+    assert res_abs_2 is None
+    assert not (
+        data_root / ".dalton-freeze" / T18_JOB_KEY / slot_abs / "done.json"
+    ).exists()
+
+    # (iii) Source file is a symlink pointing outside data_root (both literal and glob) -> rejected, done.json NOT written
+    symlink_src = data_root / "state" / "cn-leverage" / "linked_secret.csv"
+    symlink_src.symlink_to(outside_secret)
+    slot_sym_src = "2026-11-07T10:10:00Z"
+    res_sym_literal = freeze_task_run_artifacts(
+        data_root=data_root,
+        job_key=T18_JOB_KEY,
+        scheduled_slot_utc=slot_sym_src,
+        freeze_paths=["state/cn-leverage/linked_secret.csv"],
+    )
+    assert res_sym_literal is None
+    assert not (
+        data_root / ".dalton-freeze" / T18_JOB_KEY / slot_sym_src / "done.json"
+    ).exists()
+
+    # Glob matching both regular CSV and symlink CSV: skips symlink, never copies outside_secret!
+    slot_sym_glob = "2026-11-07T10:15:00Z"
+    res_sym_glob = freeze_task_run_artifacts(
+        data_root=data_root,
+        job_key=T5_JOB_KEY,
+        scheduled_slot_utc=slot_sym_glob,
+    )
+    assert res_sym_glob is not None
+    glob_done = json.loads(res_sym_glob.read_text(encoding="utf-8"))
+    assert "state/cn-leverage/linked_secret.csv" not in glob_done["file_sha256"]
+    assert not (
+        data_root
+        / ".dalton-freeze"
+        / T5_JOB_KEY
+        / slot_sym_glob
+        / "state"
+        / "cn-leverage"
+        / "linked_secret.csv"
+    ).exists()
+    symlink_src.unlink()
+
+    # (iv) Missing literal file or unmatched glob -> done.json NOT written and warning logged
+    slot_missing = "2026-11-07T10:20:00Z"
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        res_missing_lit = freeze_task_run_artifacts(
+            data_root=data_root,
+            job_key=T18_JOB_KEY,
+            scheduled_slot_utc=slot_missing,
+            freeze_paths=["temp/megacap-relative-signal-monitor/nonexistent.json"],
+        )
+        res_missing_glob = freeze_task_run_artifacts(
+            data_root=data_root,
+            job_key=T18_JOB_KEY,
+            scheduled_slot_utc=slot_missing,
+            freeze_paths=["temp/megacap-relative-signal-monitor/*.parquet"],
+        )
+    assert res_missing_lit is None
+    assert res_missing_glob is None
+    assert not (
+        data_root / ".dalton-freeze" / T18_JOB_KEY / slot_missing / "done.json"
+    ).exists()
+    assert any("nonexistent.json" in rec.getMessage() for rec in caplog.records)
+
+    # (v) .dalton-freeze is a symlink pointing outside data_root -> entire freeze aborted, nothing written outside
+    sym_root = tmp_path / "sym_freeze_root"
+    (sym_root / "temp" / "megacap-relative-signal-monitor").mkdir(
+        parents=True, exist_ok=True
+    )
+    (sym_root / "temp" / "megacap-relative-signal-monitor" / "latest.json").write_text(
+        '{"date": "2026-11-06", "rows": []}', encoding="utf-8"
+    )
+    outside_freeze_target = tmp_path / "outside_freeze_sink"
+    outside_freeze_target.mkdir(parents=True, exist_ok=True)
+    (sym_root / ".dalton-freeze").symlink_to(outside_freeze_target)
+
+    res_sym_freeze = freeze_task_run_artifacts(
+        data_root=sym_root,
+        job_key=T18_JOB_KEY,
+        scheduled_slot_utc="2026-11-07T10:25:00Z",
+    )
+    assert res_sym_freeze is None
+    assert list(outside_freeze_target.rglob("*")) == []
+
+    # 3. Freeze failure inside finalize_task_run only logs WARNING and does NOT alter terminal status
+    monkeypatch.setattr(
+        sched_mod,
+        "freeze_task_run_artifacts",
+        create_autospec(
+            sched_mod.freeze_task_run_artifacts,
+            side_effect=OSError("simulated readonly filesystem"),
+        ),
+    )
+    path_map = build_path_map(
+        host_var_dir=tmp_path / "host_var",
+        backend_var_dir=tmp_path / "backend_var",
+    )
+    claimed = ClaimedTaskRun(
+        run_id="run-freeze-err",
+        job_key=T5_JOB_KEY,
+        generation=1,
+        runner="container",
+        command_argv=["sh", "-c", "echo ok"],
+        workdir="/Users/everflow/.openclaw/workspace",
+        timeout_seconds=300,
+        no_output_timeout_seconds=None,
+        required_secrets=[],
+        cos_mode="skip",
+        notify_enabled=True,
+        scheduled_slot_utc=slot_dt,
+        deadline_utc=slot_dt + timedelta(minutes=5),
+    )
+    lock_conn, _ = _make_autospec_db([{"fetchone": (1,)}, {"fetchone": (1,)}])
+    conn, state = _make_autospec_db(
+        [
+            {"rowcount": 1},  # UPDATE runs SET status = 'succeeded', notify_status = 'pending_dispatch'
+            {"rowcount": 1, "fetchone": {"consecutive_failures": 0}},
+            {"rowcount": 1},  # UPDATE slot SET slot_state = 'idle'
+        ]
+    )
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        committed, cf = await finalize_task_run(
+            conn,
+            lock_conn=lock_conn,
+            docker_client=None,
+            claimed=claimed,
+            container_id=None,
+            outcome=ContainerInspectionOutcome("cid-1", 0, False, False, "ok"),
+            evaluation=TaskEvaluationResult(ok=True, status="succeeded"),
+            outbox_payload={"text": "ok"},
+            path_map=path_map,
+        )
+    assert committed is True
+    assert cf == 0
+    assert state["executed"][0][1]["terminal_status"] == "succeeded"
+    assert state["executed"][0][1]["notify_status"] == "pending_dispatch"
+    assert any(
+        "Failed to freeze artifacts" in rec.getMessage() for rec in caplog.records
+    )
+
+
+def test_pr04_data_tasks_parity_consistent_inconsistent_and_missing_one_side(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from scripts.dalton.data_tasks_parity import compare_data_tasks_parity, main
+    from src.dalton.data_jobs.freeze import freeze_task_run_artifacts
+
+    dalton_root = tmp_path / "dalton_data"
+    openclaw_root = tmp_path / "openclaw_data"
+
+    def _populate_t18_file(root: Path, payload: dict[str, Any]) -> None:
+        p = root / "temp" / "megacap-relative-signal-monitor" / "latest.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+    def _populate_csv_file(root: Path, content: str) -> None:
+        p = root / "state" / "cn-leverage" / "quant_unwind_signals.csv"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+
+    # Slot 1 (2026-11-05T13:30:00Z): Consistent on both sides
+    slot_1 = "2026-11-05T13:30:00Z"
+    payload_same = {
+        "date": "2026-11-05",
+        "rows": [{"ticker": "AAPL", "rsi30": 54.2, "stage2": True}],
+    }
+    _populate_t18_file(dalton_root, payload_same)
+    _populate_t18_file(openclaw_root, payload_same)
+    freeze_task_run_artifacts(
+        data_root=dalton_root,
+        job_key=T18_JOB_KEY,
+        scheduled_slot_utc=slot_1,
+        exit_code=0,
+    )
+    freeze_task_run_artifacts(
+        data_root=openclaw_root,
+        job_key=T18_JOB_KEY,
+        scheduled_slot_utc=slot_1,
+        exit_code=0,
+    )
+
+    # Slot 2 (2026-11-06T13:30:00Z): Inconsistent (different CSV row_count/latest_date, sha256, and core_metrics)
+    slot_2 = "2026-11-06T13:30:00Z"
+    _populate_t18_file(
+        dalton_root,
+        {
+            "date": "2026-11-06",
+            "rows": [{"ticker": "AAPL", "rsi30": 55.0, "stage2": True}],
+        },
+    )
+    _populate_t18_file(
+        openclaw_root,
+        {
+            "date": "2026-11-05",
+            "rows": [{"ticker": "AAPL", "rsi30": 49.0, "stage2": False}],
+        },
+    )
+    _populate_csv_file(
+        dalton_root,
+        "date,val\n2026-11-05,1\n2026-11-06,2\n",
+    )
+    _populate_csv_file(
+        openclaw_root,
+        "date,val\n2026-11-05,1\n",
+    )
+    freeze_task_run_artifacts(
+        data_root=dalton_root,
+        job_key=T18_JOB_KEY,
+        scheduled_slot_utc=slot_2,
+        exit_code=0,
+        freeze_paths=[
+            "temp/megacap-relative-signal-monitor/latest.json",
+            "state/cn-leverage/quant_unwind_signals.csv",
+        ],
+    )
+    freeze_task_run_artifacts(
+        data_root=openclaw_root,
+        job_key=T18_JOB_KEY,
+        scheduled_slot_utc=slot_2,
+        exit_code=0,
+        freeze_paths=[
+            "temp/megacap-relative-signal-monitor/latest.json",
+            "state/cn-leverage/quant_unwind_signals.csv",
+        ],
+    )
+
+    # Slot 3 (2026-11-07T13:30:00Z): Missing one side (only Dalton has done.json; OpenClaw has an unfinished dir without done.json)
+    slot_3 = "2026-11-07T13:30:00Z"
+    freeze_task_run_artifacts(
+        data_root=dalton_root,
+        job_key=T18_JOB_KEY,
+        scheduled_slot_utc=slot_3,
+        exit_code=0,
+    )
+    (openclaw_root / ".dalton-freeze" / T18_JOB_KEY / slot_3).mkdir(
+        parents=True, exist_ok=True
+    )
+
+    # Snapshot directory trees before running parity check to verify read-only behavior
+    before_dalton_files = sorted(
+        p.relative_to(dalton_root).as_posix() for p in dalton_root.rglob("*")
+    )
+    before_openclaw_files = sorted(
+        p.relative_to(openclaw_root).as_posix() for p in openclaw_root.rglob("*")
+    )
+
+    report = compare_data_tasks_parity(
+        dalton_root,
+        openclaw_root,
+        job_key=T18_JOB_KEY,
+    )
+
+    after_dalton_files = sorted(
+        p.relative_to(dalton_root).as_posix() for p in dalton_root.rglob("*")
+    )
+    after_openclaw_files = sorted(
+        p.relative_to(openclaw_root).as_posix() for p in openclaw_root.rglob("*")
+    )
+    assert before_dalton_files == after_dalton_files
+    assert before_openclaw_files == after_openclaw_files
+
+    assert report["summary"] == {
+        "total_slots": 3,
+        "consistent_count": 1,
+        "inconsistent_count": 1,
+        "missing_one_side_count": 1,
+        "all_consistent": False,
+    }
+    slots_by_utc = report["jobs"][T18_JOB_KEY]["slots"]
+
+    assert slots_by_utc[slot_1]["status"] == "consistent"
+    assert slots_by_utc[slot_1]["consistent"] is True
+    assert slots_by_utc[slot_1]["differences"] == []
+
+    assert slots_by_utc[slot_2]["status"] == "inconsistent"
+    assert slots_by_utc[slot_2]["consistent"] is False
+    diff_categories = {d["category"] for d in slots_by_utc[slot_2]["differences"]}
+    assert "sha256" in diff_categories
+    assert "csv_row_count" in diff_categories
+    assert "csv_latest_date" in diff_categories
+    assert "core_metrics" in diff_categories
+
+    assert slots_by_utc[slot_3]["status"] == "missing_one_side"
+    assert slots_by_utc[slot_3]["compared"] is False
+    assert slots_by_utc[slot_3]["missing_side"] == "openclaw"
+
+    # CLI exit code is 1 when differences/missing slots exist, and prints valid JSON
+    rc = main([str(dalton_root), str(openclaw_root), "--job-key", T18_JOB_KEY])
+    assert rc == 1
+    cli_out = json.loads(capsys.readouterr().out)
+    assert cli_out["summary"]["consistent_count"] == 1
+
+    # Item 5: Zero comparable slots (no done.json on both sides, unmatched --job-key, or nonexistent directories)
+    # must set all_consistent=False, include reason, and return non-zero CLI exit code (2)
+    rc_unmatched = main(
+        [str(dalton_root), str(openclaw_root), "--job-key", "nonexistent-job-key"]
+    )
+    assert rc_unmatched != 0
+    out_unmatched = json.loads(capsys.readouterr().out)
+    assert out_unmatched["summary"]["all_consistent"] is False
+    assert out_unmatched["summary"]["reason"] == "job_key_not_matched"
+
+    empty_d = tmp_path / "empty_dalton"
+    empty_o = tmp_path / "empty_openclaw"
+    empty_d.mkdir()
+    empty_o.mkdir()
+    rc_zero_slots = main([str(empty_d), str(empty_o)])
+    assert rc_zero_slots != 0
+    out_zero_slots = json.loads(capsys.readouterr().out)
+    assert out_zero_slots["summary"]["all_consistent"] is False
+    assert out_zero_slots["summary"]["reason"] == "no_completed_slots"
+
+    rc_no_dir = main(
+        [str(tmp_path / "does_not_exist_1"), str(tmp_path / "does_not_exist_2")]
+    )
+    assert rc_no_dir != 0
+    out_no_dir = json.loads(capsys.readouterr().out)
+    assert out_no_dir["summary"]["all_consistent"] is False
+    assert out_no_dir["summary"]["reason"] == "directory_not_found"
+

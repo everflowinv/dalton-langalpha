@@ -36,6 +36,7 @@ class DataTaskManifestEntry(BaseModel):
     command: str
     command_argv: list[str]
     secret_names: list[str] = Field(default_factory=list)
+    freeze_paths: list[str] = Field(default_factory=list)
     cos_mode: Literal["skip", "prod"] = "skip"
     notify_enabled: bool = False
     enabled: bool = False

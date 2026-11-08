@@ -37,6 +37,7 @@ from src.dalton.data_jobs.evaluators import (
     TimeoutKind,
     evaluate_task_run,
 )
+from src.dalton.data_jobs.freeze import freeze_task_run_artifacts
 from src.dalton.data_jobs.host_runner import (
     DataTaskHostBridgeClient,
     HostBridgeError,
@@ -51,6 +52,20 @@ from src.dalton.data_jobs.manifest import (
 from src.dalton.data_jobs.runner_wrapper import (
     EXIT_CODE_NO_OUTPUT_TIMEOUT,
     EXIT_CODE_TOTAL_TIMEOUT,
+    extract_last_json_object,
+    resolve_task_payload_source,
+)
+from src.dalton.notify.dispatch import (
+    _evaluate_target_results,
+    _invoke_mark_delivery,
+    _invoke_post_notify,
+    _shielded_mark_failed,
+    _split_target_channel,
+    claim_target_delivery,
+    evaluate_user_notify_eligibility,
+    fetch_execution_deliveries,
+    mark_target_delivery,
+    post_bridge_notify,
 )
 from src.dalton.settings import (
     get_configured_pm_user_ids,
@@ -1124,6 +1139,22 @@ async def finalize_task_run(
     except _TerminalRollback:
         return False, None
 
+    try:
+        freeze_task_run_artifacts(
+            data_root=paths.backend_data_root,
+            job_key=claimed.job_key,
+            scheduled_slot_utc=claimed.scheduled_slot_utc,
+            completed_at=datetime.now(timezone.utc),
+            exit_code=outcome.exit_code,
+        )
+    except Exception as freeze_exc:
+        logger.warning(
+            "Failed to freeze artifacts for data task run %s (%s): %s",
+            claimed.run_id,
+            claimed.job_key,
+            freeze_exc,
+        )
+
     if container_id and docker_client is not None:
         await check_scheduler_lock(lock_conn)
         try:
@@ -1934,6 +1965,571 @@ async def execute_claimed_host_run(
     )
 
 
+def build_data_task_notify_automation(job_key: str) -> dict[str, Any]:
+    """Construct the ``automation`` dict for an OC-1 data task notification (§5.1 item 2)."""
+    cleaned = str(job_key).strip()
+    if cleaned.lower().startswith("data:"):
+        cleaned = cleaned[5:].strip()
+    data_key = f"data:{cleaned}"
+    return {
+        "automation_id": data_key,
+        "name": data_key,
+        "route_key": data_key,
+        "metadata": {"dalton_kind": "data_task"},
+    }
+
+
+_STDOUT_NOTIFY_FALLBACK_JOB_KEYS: frozenset[str] = frozenset(
+    {
+        "asia-leverage-crossview-daily",
+        "quantum-ew-monitor",
+        "T27",
+        "T32",
+    }
+)
+
+
+def _resolve_run_notify_payload(
+    run_id: str,
+    job_key: str,
+    *,
+    db_outbox_payload: Any = None,
+    log_tail: str | None = None,
+    path_map: DataTaskPathMap | None = None,
+) -> tuple[str, dict[str, Any] | None, dict[str, Any]]:
+    """Resolve ``(text, card, payload_with_route_key)`` from ``.dalton-runs/<run_id>/outbox.json`` or stdout (§5.1 item 2).
+
+    Only T27 (``asia-leverage-crossview-daily``) and T32 (``quantum-ew-monitor``) may fall back to
+    ``log_tail`` (stdout) when ``outbox.json`` is missing.
+    """
+    paths = path_map or build_path_map()
+    disk_outbox, _ = read_run_artifacts(str(run_id), path_map=paths)
+
+    cleaned_key = str(job_key).strip()
+    if cleaned_key.lower().startswith("data:"):
+        cleaned_key = cleaned_key[5:].strip()
+    data_key = f"data:{cleaned_key}"
+
+    raw_payload: dict[str, Any] | None = None
+    if isinstance(disk_outbox, Mapping) and disk_outbox:
+        raw_payload = dict(disk_outbox)
+    elif isinstance(db_outbox_payload, Mapping) and db_outbox_payload:
+        raw_payload = dict(db_outbox_payload)
+    elif isinstance(db_outbox_payload, str) and db_outbox_payload.strip():
+        try:
+            loaded = json.loads(db_outbox_payload)
+            if isinstance(loaded, Mapping) and loaded:
+                raw_payload = dict(loaded)
+            elif not isinstance(loaded, Mapping):
+                raw_payload = {"text": db_outbox_payload.strip()}
+        except Exception:
+            raw_payload = {"text": db_outbox_payload.strip()}
+
+    if raw_payload is None and (
+        cleaned_key in _STDOUT_NOTIFY_FALLBACK_JOB_KEYS
+        or resolve_task_payload_source(cleaned_key) in ("stdout_markdown", "stdout_text")
+    ):
+        if log_tail and log_tail.strip():
+            parsed_stdout = extract_last_json_object(log_tail)
+            if isinstance(parsed_stdout, Mapping):
+                raw_payload = dict(parsed_stdout)
+            else:
+                raw_payload = {"text": log_tail.strip()}
+
+    outbox_missing = raw_payload is None
+    if raw_payload is None:
+        raw_payload = {}
+
+    card: dict[str, Any] | None = None
+    if isinstance(raw_payload.get("card"), Mapping):
+        card = dict(raw_payload["card"])
+    elif "header" in raw_payload and (
+        "body" in raw_payload
+        or "elements" in raw_payload
+        or "schema" in raw_payload
+    ):
+        card = dict(raw_payload)
+
+    text = ""
+    for candidate_field in (
+        "text",
+        "feishu_message",
+        "report_text",
+        "message",
+        "summary",
+    ):
+        val = raw_payload.get(candidate_field)
+        if isinstance(val, str) and val.strip():
+            text = val.strip()
+            break
+
+    if not text and card is not None:
+        header = card.get("header")
+        if isinstance(header, Mapping):
+            title = header.get("title")
+            if isinstance(title, Mapping) and isinstance(title.get("content"), str):
+                text = title["content"].strip()
+        if not text:
+            text = f"数据任务：{job_key}"
+
+    if not text and raw_payload:
+        text = json.dumps(raw_payload, ensure_ascii=False)
+
+    if not text and card is None:
+        outbox_missing = True
+
+    payload_with_route_key: dict[str, Any] = {
+        **raw_payload,
+        "text": text,
+        "card": card,
+        "category": "data_task",
+        "route_key": data_key,
+        "automation_id": data_key,
+        "automation_name": data_key,
+        "job_key": cleaned_key,
+    }
+    if outbox_missing:
+        payload_with_route_key["_outbox_missing"] = True
+    return text, card, payload_with_route_key
+
+
+def _extract_target_error_code(
+    target: str,
+    bridge_res: Any,
+    batch_err: str | None,
+) -> str:
+    if isinstance(bridge_res, Mapping):
+        results = bridge_res.get("results")
+        if isinstance(results, list):
+            for item in results:
+                if (
+                    isinstance(item, Mapping)
+                    and str(item.get("target") or "").strip() == target
+                ):
+                    err = str(item.get("error") or item.get("error_code") or "").strip()
+                    if err:
+                        return err
+    return batch_err or "target_failed"
+
+
+def _extract_target_skip_reason(target: str, bridge_res: Any) -> str | None:
+    if not isinstance(bridge_res, Mapping):
+        return None
+    results = bridge_res.get("results")
+    if not isinstance(results, list):
+        return None
+    for item in results:
+        if (
+            isinstance(item, Mapping)
+            and str(item.get("target") or "").strip() == target
+        ):
+            if (
+                item.get("skipped") is True
+                or str(item.get("status") or "").strip().lower() == "skipped"
+            ):
+                return str(
+                    item.get("reason") or item.get("error") or "skipped"
+                ).strip() or "skipped"
+    return None
+
+
+async def _safe_fetch_deliveries(
+    fetch_deliveries_fn: Callable[[str], Awaitable[Sequence[Mapping[str, Any]]]],
+    run_id: str,
+    *,
+    use_default_db: bool,
+) -> list[dict[str, Any]]:
+    if not use_default_db:
+        return []
+    try:
+        rows = await fetch_deliveries_fn(run_id)
+        return [dict(r) for r in (rows or []) if isinstance(r, Mapping)]
+    except Exception:
+        return []
+
+
+async def dispatch_data_task_run_notification(
+    conn: Any,
+    *,
+    lock_conn: Any,
+    run_id: str,
+    job_key: str,
+    db_outbox_payload: Any = None,
+    log_tail: str | None = None,
+    task_enabled: bool = True,
+    notify_enabled: bool = True,
+    path_map: DataTaskPathMap | None = None,
+    evaluate_eligibility_fn: Callable[..., Awaitable[tuple[bool, str | None, list[str]]]] = evaluate_user_notify_eligibility,
+    claim_target_fn: Callable[..., Awaitable[bool]] = claim_target_delivery,
+    post_notify_fn: Callable[..., Awaitable[dict[str, Any]]] = post_bridge_notify,
+    mark_target_fn: Callable[..., Awaitable[bool]] = mark_target_delivery,
+    fetch_deliveries_fn: Callable[[str], Awaitable[Sequence[Mapping[str, Any]]]] = fetch_execution_deliveries,
+) -> str:
+    """Dispatch initial notification for a single ``pending_dispatch`` data task run (§5.1 item 2)."""
+    if not task_enabled or not notify_enabled:
+        disabled_reason = "task_disabled" if not task_enabled else "notify_disabled"
+        logger.info(
+            "Skipping data task notification for run_id=%s job_key=%s (reason=%s)",
+            run_id,
+            job_key,
+            disabled_reason,
+        )
+        await check_scheduler_lock(lock_conn)
+        async with conn.transaction():
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE dalton_data_task_runs
+                    SET notify_status = %(notify_status)s,
+                        updated_at    = NOW()
+                    WHERE run_id = %(run_id)s::uuid
+                      AND notify_status = 'pending_dispatch'
+                    """,
+                    {
+                        "run_id": str(run_id),
+                        "notify_status": "skipped",
+                    },
+                )
+        return "skipped"
+
+    text, card, payload_with_route_key = _resolve_run_notify_payload(
+        str(run_id),
+        job_key,
+        db_outbox_payload=db_outbox_payload,
+        log_tail=log_tail,
+        path_map=path_map,
+    )
+    outbox_missing = bool(payload_with_route_key.pop("_outbox_missing", False))
+    if outbox_missing:
+        logger.warning(
+            "Skipping data task notification for run_id=%s job_key=%s (reason=outbox_missing)",
+            run_id,
+            job_key,
+        )
+        await check_scheduler_lock(lock_conn)
+        async with conn.transaction():
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE dalton_data_task_runs
+                    SET notify_status = %(notify_status)s,
+                        updated_at    = NOW()
+                    WHERE run_id = %(run_id)s::uuid
+                      AND notify_status = 'pending_dispatch'
+                    """,
+                    {
+                        "run_id": str(run_id),
+                        "notify_status": "skipped",
+                    },
+                )
+        return "skipped"
+
+    automation = build_data_task_notify_automation(job_key)
+    data_key = str(automation["automation_id"])
+
+    pm_ids = get_configured_pm_user_ids()
+    pm_user_id = str(pm_ids[0]).strip() if pm_ids else ""
+
+    await check_scheduler_lock(lock_conn)
+    allowed, skip_reason, targets = await evaluate_eligibility_fn(
+        pm_user_id,
+        automation,
+    )
+
+    valid_targets: list[tuple[str, str]] = []
+    for raw_tgt in targets or []:
+        ch, cleaned_tgt = _split_target_channel(raw_tgt)
+        if ch and cleaned_tgt and (ch, cleaned_tgt) not in valid_targets:
+            valid_targets.append((ch, cleaned_tgt))
+
+    use_delivery_db = (
+        claim_target_fn is claim_target_delivery
+        or mark_target_fn is mark_target_delivery
+        or fetch_deliveries_fn is not fetch_execution_deliveries
+    )
+    existing_by_target: dict[tuple[str, str], str] = {}
+    for d_row in await _safe_fetch_deliveries(
+        fetch_deliveries_fn,
+        str(run_id),
+        use_default_db=use_delivery_db,
+    ):
+        d_ch = str(d_row.get("channel") or "").strip().lower()
+        d_tgt = str(d_row.get("target") or "").strip()
+        d_st = str(d_row.get("status") or "").strip().lower()
+        if d_ch and d_tgt and d_st:
+            existing_by_target[(d_ch, d_tgt)] = d_st
+
+    local_by_target: dict[tuple[str, str], str] = {}
+    pending_targets: list[tuple[str, str]] = []
+
+    if not allowed:
+        for ch, cleaned_tgt in valid_targets:
+            if existing_by_target.get((ch, cleaned_tgt)) in ("sent", "skipped"):
+                continue
+            await check_scheduler_lock(lock_conn)
+            claimed_ok = await claim_target_fn(
+                str(run_id),
+                ch,
+                cleaned_tgt,
+                user_id=pm_user_id,
+                automation_id=data_key,
+                payload=payload_with_route_key,
+            )
+            if claimed_ok:
+                local_by_target[(ch, cleaned_tgt)] = "pending"
+                await check_scheduler_lock(lock_conn)
+                await _invoke_mark_delivery(
+                    mark_target_fn,
+                    str(run_id),
+                    ch,
+                    cleaned_tgt,
+                    status="skipped",
+                    reason=skip_reason or "toggle_off",
+                    error_code=skip_reason or "toggle_off",
+                    expected_status="pending",
+                )
+                local_by_target[(ch, cleaned_tgt)] = "skipped"
+    elif valid_targets:
+        for ch, cleaned_tgt in valid_targets:
+            if existing_by_target.get((ch, cleaned_tgt)) in ("sent", "skipped"):
+                continue
+            await check_scheduler_lock(lock_conn)
+            claimed_ok = await claim_target_fn(
+                str(run_id),
+                ch,
+                cleaned_tgt,
+                user_id=pm_user_id,
+                automation_id=data_key,
+                payload=payload_with_route_key,
+            )
+            if not claimed_ok:
+                continue
+            local_by_target[(ch, cleaned_tgt)] = "pending"
+            pending_targets.append((ch, cleaned_tgt))
+
+            await check_scheduler_lock(lock_conn)
+            try:
+                bridge_res = await _invoke_post_notify(
+                    post_notify_fn,
+                    [cleaned_tgt],
+                    text,
+                    card,
+                )
+            except asyncio.CancelledError:
+                for rem_ch, rem_tgt in list(pending_targets):
+                    await _shielded_mark_failed(
+                        mark_target_fn,
+                        str(run_id),
+                        rem_ch,
+                        rem_tgt,
+                        error_code="CancelledError",
+                        expected_status="pending",
+                    )
+                    local_by_target[(rem_ch, rem_tgt)] = "failed"
+                pending_targets.clear()
+                raise
+            except SchedulerLockLostError:
+                raise
+            except Exception as post_exc:
+                status_code = getattr(
+                    getattr(post_exc, "response", None), "status_code", None
+                )
+                err_code = (
+                    f"http_{status_code}"
+                    if status_code
+                    else type(post_exc).__name__
+                )
+                await _shielded_mark_failed(
+                    mark_target_fn,
+                    str(run_id),
+                    ch,
+                    cleaned_tgt,
+                    error_code=err_code,
+                    expected_status="pending",
+                )
+                local_by_target[(ch, cleaned_tgt)] = "failed"
+                if (ch, cleaned_tgt) in pending_targets:
+                    pending_targets.remove((ch, cleaned_tgt))
+                continue
+
+            target_skip_reason = _extract_target_skip_reason(cleaned_tgt, bridge_res)
+            if target_skip_reason is not None:
+                await _invoke_mark_delivery(
+                    mark_target_fn,
+                    str(run_id),
+                    ch,
+                    cleaned_tgt,
+                    status="skipped",
+                    reason=target_skip_reason,
+                    error_code=target_skip_reason,
+                    expected_status="pending",
+                )
+                local_by_target[(ch, cleaned_tgt)] = "skipped"
+                if (ch, cleaned_tgt) in pending_targets:
+                    pending_targets.remove((ch, cleaned_tgt))
+                continue
+
+            outcomes, batch_err = _evaluate_target_results([cleaned_tgt], bridge_res)
+            if outcomes.get(cleaned_tgt) is True:
+                await _invoke_mark_delivery(
+                    mark_target_fn,
+                    str(run_id),
+                    ch,
+                    cleaned_tgt,
+                    status="sent",
+                    error_code=None,
+                    expected_status="pending",
+                )
+                local_by_target[(ch, cleaned_tgt)] = "sent"
+            else:
+                err_code = _extract_target_error_code(cleaned_tgt, bridge_res, batch_err)
+                await _shielded_mark_failed(
+                    mark_target_fn,
+                    str(run_id),
+                    ch,
+                    cleaned_tgt,
+                    error_code=err_code,
+                    expected_status="pending",
+                )
+                local_by_target[(ch, cleaned_tgt)] = "failed"
+            if (ch, cleaned_tgt) in pending_targets:
+                pending_targets.remove((ch, cleaned_tgt))
+
+    persisted_by_target: dict[tuple[str, str], str] = dict(existing_by_target)
+    if (
+        mark_target_fn is not mark_target_delivery
+        and fetch_deliveries_fn is fetch_execution_deliveries
+    ):
+        persisted_by_target.update(local_by_target)
+    for d_row in await _safe_fetch_deliveries(
+        fetch_deliveries_fn,
+        str(run_id),
+        use_default_db=use_delivery_db,
+    ):
+        d_ch = str(d_row.get("channel") or "").strip().lower()
+        d_tgt = str(d_row.get("target") or "").strip()
+        d_st = str(d_row.get("status") or "").strip().lower()
+        if d_ch and d_tgt and d_st:
+            persisted_by_target[(d_ch, d_tgt)] = d_st
+
+    if not valid_targets and not persisted_by_target:
+        logger.info(
+            "Skipping data task notification for run_id=%s job_key=%s (reason=%s)",
+            run_id,
+            job_key,
+            skip_reason or "no_targets",
+        )
+        terminal_notify_status = "skipped"
+    else:
+        missing_expected = any(
+            tgt_key not in persisted_by_target for tgt_key in valid_targets
+        )
+        statuses = list(persisted_by_target.values())
+        # Every expected target persisted and settled: any `sent` means the
+        # run was dispatched (the rest were deliberately skipped); all
+        # `skipped` means nothing was sent. Anything else is still in flight.
+        if (
+            missing_expected
+            or not statuses
+            or any(st not in ("sent", "skipped") for st in statuses)
+        ):
+            terminal_notify_status = "pending_dispatch"
+        elif "sent" in statuses:
+            terminal_notify_status = "dispatched"
+        else:
+            terminal_notify_status = "skipped"
+
+    await check_scheduler_lock(lock_conn)
+    async with conn.transaction():
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE dalton_data_task_runs
+                SET notify_status = %(notify_status)s,
+                    updated_at    = NOW()
+                WHERE run_id = %(run_id)s::uuid
+                  AND notify_status = 'pending_dispatch'
+                """,
+                {
+                    "run_id": str(run_id),
+                    "notify_status": terminal_notify_status,
+                },
+            )
+    return terminal_notify_status
+
+
+async def dispatch_pending_data_task_notifications(
+    conn: Any,
+    *,
+    lock_conn: Any,
+    path_map: DataTaskPathMap | None = None,
+    evaluate_eligibility_fn: Callable[..., Awaitable[tuple[bool, str | None, list[str]]]] = evaluate_user_notify_eligibility,
+    claim_target_fn: Callable[..., Awaitable[bool]] = claim_target_delivery,
+    post_notify_fn: Callable[..., Awaitable[dict[str, Any]]] = post_bridge_notify,
+    mark_target_fn: Callable[..., Awaitable[bool]] = mark_target_delivery,
+    fetch_deliveries_fn: Callable[[str], Awaitable[Sequence[Mapping[str, Any]]]] = fetch_execution_deliveries,
+) -> list[tuple[str, str]]:
+    """Scan ``dalton_data_task_runs.notify_status = 'pending_dispatch'`` and dispatch notifications (§5.1 item 2)."""
+    async with conn.cursor(row_factory=dict_row) as cur:
+        await cur.execute(
+            """
+            SELECT r.run_id,
+                   r.job_key,
+                   r.outbox_payload,
+                   r.log_tail,
+                   d.enabled AS task_enabled,
+                   d.notify_enabled AS notify_enabled
+            FROM dalton_data_task_runs r
+            LEFT JOIN dalton_data_task_defs d
+              ON d.job_key = r.job_key
+            WHERE r.notify_status = 'pending_dispatch'
+            ORDER BY r.completed_at ASC NULLS LAST, r.created_at ASC
+            """
+        )
+        rows = await cur.fetchall()
+
+    if not rows:
+        return []
+
+    results: list[tuple[str, str]] = []
+    for row in rows:
+        run_id = str(_extract_field(row, "run_id", 0))
+        job_key = str(_extract_field(row, "job_key", 1))
+        db_outbox = _extract_field(row, "outbox_payload", 2)
+        log_tail_val = _extract_field(row, "log_tail", 3)
+        task_enabled_val = True
+        notify_enabled_val = True
+        if isinstance(row, Mapping):
+            if "task_enabled" in row:
+                task_enabled_val = bool(row.get("task_enabled"))
+            elif "enabled" in row:
+                task_enabled_val = bool(row.get("enabled"))
+            if "notify_enabled" in row:
+                notify_enabled_val = bool(row.get("notify_enabled"))
+        elif isinstance(row, Sequence) and len(row) >= 6:
+            task_enabled_val = bool(row[4])
+            notify_enabled_val = bool(row[5])
+
+        status = await dispatch_data_task_run_notification(
+            conn,
+            lock_conn=lock_conn,
+            run_id=run_id,
+            job_key=job_key,
+            db_outbox_payload=db_outbox,
+            log_tail=str(log_tail_val) if log_tail_val is not None else None,
+            task_enabled=task_enabled_val,
+            notify_enabled=notify_enabled_val,
+            path_map=path_map,
+            evaluate_eligibility_fn=evaluate_eligibility_fn,
+            claim_target_fn=claim_target_fn,
+            post_notify_fn=post_notify_fn,
+            mark_target_fn=mark_target_fn,
+            fetch_deliveries_fn=fetch_deliveries_fn,
+        )
+        results.append((run_id, status))
+    return results
+
+
 async def run_data_task_scheduler_loop(
     *,
     stop_event: asyncio.Event | None = None,
@@ -2061,6 +2657,11 @@ async def run_data_task_scheduler_loop(
                         active_exec_task = asyncio.create_task(
                             _run_claimed_in_background(claimed)
                         )
+
+                await dispatch_pending_data_task_notifications(
+                    work_conn,
+                    lock_conn=lock_conn,
+                )
 
             stop_waiter = asyncio.create_task(stop.wait())
             wait_tasks: set[asyncio.Task[Any]] = {stop_waiter}

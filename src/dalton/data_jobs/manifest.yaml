@@ -20,6 +20,7 @@ tasks:
       - "-c"
       - "bash /Users/everflow/.openclaw/workspace/scripts/bbg_remote_refresh.sh"
     secret_names: []
+    freeze_paths: []
     cos_mode: "skip"
     notify_enabled: false
     enabled: false
@@ -41,6 +42,11 @@ tasks:
       - "-c"
       - "bash /Users/everflow/.openclaw/workspace/skills/cn-leverage-monitor/run.sh update && bash /Users/everflow/.openclaw/workspace/skills/cn-leverage-monitor/run.sh dashboard"
     secret_names: []
+    freeze_paths:
+      - "state/cn-leverage/pipeline_status.json"
+      - "state/cn-leverage/quant_unwind_signals.csv"
+      - "state/cn-leverage/*.csv"
+      - "research-outputs/cn-leverage/index.html"
     cos_mode: "skip"
     notify_enabled: false
     enabled: false
@@ -62,6 +68,7 @@ tasks:
       - "-c"
       - "bash /Users/everflow/.openclaw/workspace/skills/jp-leverage-monitor/run.sh run"
     secret_names: []
+    freeze_paths: []
     cos_mode: "skip"
     notify_enabled: false
     enabled: false
@@ -83,6 +90,7 @@ tasks:
       - "-c"
       - "bash /Users/everflow/.openclaw/workspace/skills/kr-leverage-monitor/run.sh run"
     secret_names: []
+    freeze_paths: []
     cos_mode: "skip"
     notify_enabled: false
     enabled: false
@@ -136,6 +144,7 @@ tasks:
         test -n "$trade_date"
         echo "index-crowding refreshed: $trade_date"
     secret_names: []
+    freeze_paths: []
     cos_mode: "skip"
     notify_enabled: false
     enabled: false
@@ -161,6 +170,7 @@ tasks:
       - "TENCENT_COS_SECRET_KEY"
       - "FEISHU_APP_ID"
       - "FEISHU_APP_SECRET"
+    freeze_paths: []
     cos_mode: "skip"
     notify_enabled: false
     enabled: false
@@ -182,6 +192,8 @@ tasks:
       - "-c"
       - "bash scripts/run_json_task.sh python3 scripts/megacap_relative_signal_monitor.py --json"
     secret_names: []
+    freeze_paths:
+      - "temp/megacap-relative-signal-monitor/latest.json"
     cos_mode: "skip"
     notify_enabled: false
     enabled: false
@@ -203,6 +215,7 @@ tasks:
       - "-c"
       - "bash scripts/run_json_task.sh bash skills/us-bottom-monitor/run.sh --json run"
     secret_names: []
+    freeze_paths: []
     cos_mode: "skip"
     notify_enabled: false
     enabled: false
@@ -224,6 +237,7 @@ tasks:
       - "-c"
       - "bash scripts/run_json_task.sh bash skills/us-top-monitor/run.sh --json run"
     secret_names: []
+    freeze_paths: []
     cos_mode: "skip"
     notify_enabled: false
     enabled: false
@@ -247,6 +261,7 @@ tasks:
     secret_names:
       - "TENCENT_COS_SECRET_ID"
       - "TENCENT_COS_SECRET_KEY"
+    freeze_paths: []
     cos_mode: "skip"
     notify_enabled: false
     enabled: false
@@ -268,6 +283,7 @@ tasks:
       - "scripts/cron_command_tasks.py"
       - "us-topbottom-dm-v23"
     secret_names: []
+    freeze_paths: []
     cos_mode: "skip"
     notify_enabled: false
     enabled: false
@@ -289,6 +305,7 @@ tasks:
       - "-c"
       - "bash scripts/run_json_task.sh python3 scripts/asia_leverage_crossview.py --charts"
     secret_names: []
+    freeze_paths: []
     cos_mode: "skip"
     notify_enabled: false
     enabled: false
@@ -314,6 +331,7 @@ tasks:
       - "-c"
       - "bash /Users/everflow/.openclaw/workspace/skills/tw-leverage-monitor/run.sh update --quiet --json"
     secret_names: []
+    freeze_paths: []
     cos_mode: "skip"
     notify_enabled: false
     enabled: false
@@ -336,6 +354,7 @@ tasks:
       - "-c"
       - "bash /Users/everflow/.openclaw/workspace/scripts/bbg_remote_refresh.sh"
     secret_names: []
+    freeze_paths: []
     cos_mode: "skip"
     notify_enabled: false
     enabled: false
@@ -357,6 +376,7 @@ tasks:
       - "-c"
       - "bash scripts/run_json_task.sh bash scripts/quantum_ew_monitor.sh"
     secret_names: []
+    freeze_paths: []
     cos_mode: "skip"
     notify_enabled: false
     enabled: false
@@ -378,6 +398,7 @@ tasks:
       - "-c"
       - "bash scripts/run_json_task.sh bash skills/ah-premium-monitor/run.sh --json monitor"
     secret_names: []
+    freeze_paths: []
     cos_mode: "skip"
     notify_enabled: false
     enabled: false
@@ -401,6 +422,7 @@ tasks:
       - "-c"
       - "bash scripts/run_json_task.sh bash skills/ah-premium-monitor/run.sh --json monitor"
     secret_names: []
+    freeze_paths: []
     cos_mode: "skip"
     notify_enabled: false
     enabled: false
@@ -424,6 +446,7 @@ tasks:
     secret_names:
       - "FEISHU_APP_ID"
       - "FEISHU_APP_SECRET"
+    freeze_paths: []
     cos_mode: "skip"
     notify_enabled: false
     enabled: false
@@ -447,6 +470,7 @@ tasks:
     secret_names:
       - "FEISHU_APP_ID"
       - "FEISHU_APP_SECRET"
+    freeze_paths: []
     cos_mode: "skip"
     notify_enabled: false
     enabled: false

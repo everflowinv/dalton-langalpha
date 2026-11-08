@@ -83,6 +83,8 @@ CATEGORY_BUSINESS_TAG_MAP: dict[str, tuple[str, str]] = {
     "director_weekly": ("周报", "indigo"),
     "earnings_calendar": ("周报", "indigo"),
     "custom": ("定时任务", "indigo"),
+    # DALTON-HOOK(data-jobs): OC-1 data task category business tag
+    "data_task": ("数据任务", "blue"),
 }
 
 
@@ -179,8 +181,41 @@ def classify_automation_for_notify(
         )
 
     meta = automation.get("metadata")
+    route_key = str(automation.get("route_key") or "").strip()
+    lowered_route_key = route_key.lower()
+    kind = (
+        str(meta.get("dalton_kind") or "").strip().lower()
+        if isinstance(meta, Mapping)
+        else ""
+    )
+
+    # DALTON-HOOK(data-jobs): OC-1 data task classification (§5.1 item 2)
+    if (
+        kind == "data_task"
+        or lowered_name.startswith("data:")
+        or lowered_route_key.startswith("data:")
+    ):
+        job_key = ""
+        if lowered_route_key.startswith("data:"):
+            job_key = route_key[5:].strip()
+        elif lowered_name.startswith("data:"):
+            job_key = name[5:].strip()
+        elif isinstance(meta, Mapping) and str(meta.get("job_key") or "").strip():
+            job_key = str(meta.get("job_key") or "").strip()
+        else:
+            raw_auto_id = str(automation.get("automation_id") or "").strip()
+            if raw_auto_id.lower().startswith("data:"):
+                job_key = raw_auto_id[5:].strip()
+            else:
+                job_key = route_key or name
+        return NotifyClassification(
+            category="data_task",
+            label_zh="数据任务",
+            scope=job_key,
+            requires_non_no_change_verdict=False,
+        )
+
     if isinstance(meta, Mapping):
-        kind = str(meta.get("dalton_kind") or "").strip().lower()
         ticker = _resolve_ticker_label(automation, "Home")
         if kind == "earnings_t0":
             return NotifyClassification("earnings_t0", "财报 T0 快讯", ticker)
@@ -253,12 +288,26 @@ def resolve_automation_notify_state(
         return ("custom", True, "default")
     if isinstance(overrides, Mapping):
         name = str(automation.get("name") or "").strip()
-        for candidate_key, source in (
-            (name, "task"),
-            (name.lower(), "task"),
-            (f"category:{classification.category}", "category"),
-            (classification.category, "category"),
-        ):
+        if classification.category == "data_task":
+            data_scope_key = (
+                f"data:{classification.scope}" if classification.scope else ""
+            )
+            candidate_pairs: tuple[tuple[str, str], ...] = (
+                (data_scope_key, "task"),
+                (name, "task"),
+                (name.lower(), "task"),
+                (f"category:{classification.category}", "category"),
+                (classification.category, "category"),
+                ("default", "default"),
+            )
+        else:
+            candidate_pairs = (
+                (name, "task"),
+                (name.lower(), "task"),
+                (f"category:{classification.category}", "category"),
+                (classification.category, "category"),
+            )
+        for candidate_key, source in candidate_pairs:
             if candidate_key and candidate_key in overrides:
                 val = overrides[candidate_key]
                 if isinstance(val, bool):
@@ -924,6 +973,9 @@ def _notify_route_keys(automation: Mapping[str, Any] | None) -> list[str]:
     if classification is None:
         custom_key = _custom_automation_key(automation)
         return [custom_key] if custom_key else []
+    # DALTON-HOOK(data-jobs): OC-1 3-level route fallback keys (§5.1 item 2)
+    if classification.category == "data_task":
+        return [f"data:{classification.scope}", "data_task", "default"]
     name = str(automation.get("name") or "").strip()
     return [
         key
@@ -1221,6 +1273,29 @@ async def mark_target_delivery(
                 cur.rowcount if isinstance(cur.rowcount, int) else 0
             )
             return updated_rows > 0
+
+
+# DALTON-HOOK(data-jobs): fetch persisted delivery rows for an execution_id to aggregate run notify_status
+async def fetch_execution_deliveries(
+    execution_id: str,
+) -> list[dict[str, Any]]:
+    """Return all ``dalton_notify_deliveries`` rows for ``execution_id``."""
+    exec_id = (execution_id or "").strip()
+    if not exec_id:
+        return []
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT execution_id, channel, target, status, error_code, attempt_count
+                FROM dalton_notify_deliveries
+                WHERE execution_id = %s
+                ORDER BY created_at ASC, target ASC
+                """,
+                (exec_id,),
+            )
+            rows = await cur.fetchall()
+            return [dict(r) for r in (rows or []) if isinstance(r, Mapping)]
 
 
 async def _invoke_mark_delivery(
@@ -1525,6 +1600,23 @@ def _reconstruct_automation_from_delivery_row(
         str(row.get("automation_name") or "").strip()
         or str(payload.get("automation_name") or "").strip()
     )
+    route_key = str(payload.get("route_key") or "").strip()
+    # DALTON-HOOK(data-jobs): Reconstruct data task automation when LEFT JOIN automations misses (§5.1 item 2)
+    if not auto_name and (
+        route_key.lower().startswith("data:") or auto_id.lower().startswith("data:")
+    ):
+        raw_data_key = (
+            route_key if route_key.lower().startswith("data:") else auto_id
+        )
+        job_key = raw_data_key[5:].strip()
+        if job_key:
+            data_key = f"data:{job_key}"
+            return {
+                "automation_id": data_key,
+                "name": data_key,
+                "route_key": data_key,
+                "metadata": {"dalton_kind": "data_task"},
+            }
     raw_meta = row.get("automation_metadata")
     meta: dict[str, Any] = dict(raw_meta) if isinstance(raw_meta, Mapping) else {}
     if not meta and payload.get("category") and payload.get("category") != "custom":
@@ -1535,6 +1627,28 @@ def _reconstruct_automation_from_delivery_row(
             reconstructed["automation_id"] = auto_id
         return reconstructed
     return None
+
+
+# DALTON-HOOK(data-jobs): look up dalton_data_task_defs.enabled / notify_enabled for retry guard
+async def _fetch_data_task_def_notify_state(job_key: str) -> dict[str, Any] | None:
+    cleaned = (job_key or "").strip()
+    if not cleaned:
+        return None
+    try:
+        async with get_db_connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT enabled, notify_enabled
+                    FROM dalton_data_task_defs
+                    WHERE job_key = %s
+                    """,
+                    (cleaned,),
+                )
+                row = await cur.fetchone()
+                return dict(row) if isinstance(row, Mapping) else None
+    except Exception:
+        return None
 
 
 async def retry_failed_notify_deliveries(
@@ -1570,10 +1684,19 @@ async def retry_failed_notify_deliveries(
                            d.channel, d.target, d.status, d.attempt_count,
                            d.payload_json,
                            a.name AS automation_name,
-                           a.metadata AS automation_metadata
+                           a.metadata AS automation_metadata,
+                           -- DALTON-HOOK(data-jobs): join dalton_data_task_defs to check task/notify enabled on retry
+                           dt.enabled AS data_task_enabled,
+                           dt.notify_enabled AS data_task_notify_enabled
                     FROM dalton_notify_deliveries d
                     LEFT JOIN automations a
                       ON a.automation_id::text = d.automation_id
+                    LEFT JOIN dalton_data_task_defs dt
+                      ON dt.job_key = CASE
+                          WHEN d.automation_id LIKE 'data:%%' THEN SUBSTRING(d.automation_id FROM 6)
+                          WHEN (d.payload_json ->> 'route_key') LIKE 'data:%%' THEN SUBSTRING(d.payload_json ->> 'route_key' FROM 6)
+                          ELSE NULL
+                      END
                     WHERE (
                         (d.status = 'failed' AND d.attempt_count < %s)
                         OR (
@@ -1659,6 +1782,54 @@ async def retry_failed_notify_deliveries(
                 automation_info = _reconstruct_automation_from_delivery_row(
                     row, payload
                 )
+                # DALTON-HOOK(data-jobs): skip retry when data task is disabled in dalton_data_task_defs
+                raw_auto_id = str(row.get("automation_id") or "").strip()
+                raw_route_key = (
+                    str(automation_info.get("route_key") or "").strip()
+                    if isinstance(automation_info, Mapping)
+                    else ""
+                )
+                is_data_task_row = raw_auto_id.lower().startswith(
+                    "data:"
+                ) or raw_route_key.lower().startswith("data:")
+                if is_data_task_row:
+                    dt_enabled = row.get("data_task_enabled")
+                    dt_notify_enabled = row.get("data_task_notify_enabled")
+                    if (
+                        "data_task_enabled" not in row
+                        and "data_task_notify_enabled" not in row
+                    ):
+                        data_job_key = (
+                            raw_auto_id[5:].strip()
+                            if raw_auto_id.lower().startswith("data:")
+                            else raw_route_key[5:].strip()
+                        )
+                        dt_row = await _fetch_data_task_def_notify_state(data_job_key)
+                        if isinstance(dt_row, Mapping):
+                            dt_enabled = dt_row.get("enabled")
+                            dt_notify_enabled = dt_row.get("notify_enabled")
+                    if (
+                        dt_enabled is False
+                        or dt_notify_enabled is False
+                        or ("data_task_enabled" in row and dt_enabled is None)
+                    ):
+                        skipped_updated = await _invoke_mark_delivery(
+                            mark_delivery_fn,
+                            exec_id,
+                            ch,
+                            tgt,
+                            status="skipped",
+                            reason="task_disabled",
+                            error_code="task_disabled",
+                            expected_status=("failed", "pending"),
+                        )
+                        if skipped_updated:
+                            logger.info(
+                                "[DALTON_NOTIFY] Skipped retry delivery for disabled data task execution_id=%s",
+                                exec_id,
+                            )
+                        continue
+
                 allowed, skip_reason, _ = await evaluate_user_notify_eligibility(
                     user_id,
                     automation_info,
