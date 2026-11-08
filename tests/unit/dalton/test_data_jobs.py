@@ -6505,8 +6505,10 @@ def test_pr12_feishu_send_card_overlay_no_direct_send_and_dry_run_parity(
         / "scripts"
         / "feishu_send_card.py"
     )
+    # OpenClaw's feishu_send_card.py as of the overlay (tracked fixture; the
+    # .agy copy it was taken from is not part of the repository).
     original_script = (
-        repo_root / ".agy" / "oc1" / "openclaw" / "scripts" / "feishu_send_card.py"
+        repo_root / "tests" / "unit" / "dalton" / "fixtures" / "openclaw_feishu_send_card.py"
     )
     assert overlay_script.is_file()
     assert original_script.is_file()
