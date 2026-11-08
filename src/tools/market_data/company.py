@@ -15,8 +15,7 @@ import asyncio
 
 from langchain_core.runnables import RunnableConfig
 
-# DALTON-HOOK(extended-hours-quotes): the extended-hours lines take the overview's currency spec
-from .currency import CurrencyArg, DisplaySpec, _spec, fmt_count, fmt_money, fmt_price, fmt_quote, quote_spec
+from .currency import DisplaySpec, fmt_count, fmt_money, fmt_price, fmt_quote, quote_spec
 from .earnings import (
     EarningsReport,
     diluted_eps,
@@ -485,6 +484,9 @@ def _extended_session(snap: Dict[str, Any]) -> Optional[Tuple[str, str]]:
     session (ginlix-data's US rows) is labeled, and only when that session
     moved the price: an odd-lot print a cent off the close is no extended trade.
     """
+    # DALTON-HOOK(extended-hours-quotes): Compare against regular_close when present
+    # (since current_price may overwrite price) and require late_trading_change when
+    # closed so odd-lot prints without late-session change do not render as after-hours.
     status = snap.get("market_status") or ""
     named = _EXTENDED_SESSIONS.get(status)
     reg_close = snap.get("regular_close") if snap.get("regular_close") is not None else snap.get("price")
@@ -517,32 +519,30 @@ def _running_price_lines(snap: Dict[str, Any], cur: DisplaySpec) -> List[str]:
 
 def _settled_price_lines(
     snap: Dict[str, Any],
-    reg_close: Optional[float],
+    reg_close: float,
     cur: DisplaySpec,
-    status: str = "",
-    ref: Optional[InstrumentRef] = None,
+    ref: Optional[InstrumentRef] = None,  # DALTON-HOOK(extended-hours-quotes)
 ) -> List[str]:
     """The regular close, any extended-hours trade off it, and the day's move."""
     out = []
     last_price = snap.get("last_trade_price")  # actual current price
     reg_change = snap.get("regular_trading_change")
     reg_change_pct = snap.get("regular_trading_change_percent")
-    eff_status = status or snap.get("market_status") or ""
-    reg_date_mmdd, ext_time_str, _ = snapshot_quote_time_labels(snap, eff_status, ref)
+    # DALTON-HOOK(extended-hours-quotes): Label Regular Close with its trading date (MM-DD)
+    # and compute the exchange-local print time for the extended-hours price line.
+    reg_date_mmdd, ext_time_str, _ = snapshot_quote_time_labels(
+        snap, snap.get("market_status") or "", ref
+    )
     reg_label = f"Regular Close ({reg_date_mmdd})" if reg_date_mmdd else "Regular Close"
-    if reg_close is not None:
-        if reg_change is not None and reg_change_pct is not None:
-            sign = _plus(reg_change)
-            out.append(
-                f"**{reg_label}:** {fmt_quote(reg_close, cur)} ({sign}{reg_change:.{cur.decimals}f} / {sign}{reg_change_pct:.3f}%)"
-            )
-        else:
-            out.append(f"**{reg_label}:** {fmt_quote(reg_close, cur)}")
-
-    if eff_status == "closed" and finite_or_none(snap.get("late_trading_change")) is None:
-        extended = None
+    if reg_change is not None and reg_change_pct is not None:
+        sign = _plus(reg_change)
+        out.append(
+            f"**{reg_label}:** {fmt_quote(reg_close, cur)} ({sign}{reg_change:.{cur.decimals}f} / {sign}{reg_change_pct:.3f}%)"
+        )
     else:
-        extended = _extended_session({**snap, "market_status": snap.get("market_status") or eff_status})
+        out.append(f"**{reg_label}:** {fmt_quote(reg_close, cur)}")
+
+    extended = _extended_session(snap)
     if extended is not None:
         ext_label, session = extended
         ext_change = snap.get(f"{session}_change")
@@ -563,18 +563,6 @@ def _settled_price_lines(
             )
 
     return out + _day_change_line(snap.get("change"), snap.get("change_percent"), cur) + [""]
-
-
-def _snapshot_price_lines(
-    snap: Dict[str, Any],
-    status: str,
-    cur: CurrencyArg,
-    ref: Optional[InstrumentRef] = None,
-) -> List[str]:
-    """Regular close, the extended-hours print off it, and the day's move."""
-    # DALTON-HOOK(extended-hours-quotes): Compare against regular_close and require late_trading_change when closed.
-    raw_reg = snap.get("regular_close") if snap.get("regular_close") is not None else snap.get("price")
-    return _settled_price_lines(snap, finite_or_none(raw_reg), _spec(cur), status=status, ref=ref)
 
 
 def _day_change_line(change: Any, change_pct: Any, cur: DisplaySpec) -> List[str]:
@@ -655,7 +643,7 @@ def _quote_lines(inp: CompanyInputs) -> List[str]:
         reg_close = finite_or_none(raw_reg)
         settled = reg_close is not None and close_settled(venue_phase(inp.ref), freshness)
         out += (
-            _settled_price_lines(snap, reg_close, cur, status=status, ref=inp.ref)
+            _settled_price_lines(snap, reg_close, cur, ref=inp.ref)
             if settled
             else _running_price_lines(snap, cur)
         )

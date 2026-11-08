@@ -187,12 +187,20 @@ class _RoutedSource:
         served = populated(answer)
         source = route.name or "market source"
         if served or failure is not None:
+            # DALTON-HOOK(market-data-fallback): Read default_name from a composite
+            # default source per call so FallbackFinancialSource names whichever
+            # backend (fmp or yfinance) actually answered this request.
+            served_name = (
+                getattr(self._default, "default_name", None)
+                or self._default_name
+                or "default source"
+            )
             record(Fallback(
                 symbol=subject,
                 what=method.removeprefix("get_").replace("_", " "),
                 source=source,
                 error=error_label(failure) if failure is not None else None,
-                served_by=(self._default_name or "default source") if served else None,
+                served_by=served_name if served else None,
             ))
         if failure is not None and not served:
             raise surfaced(source, failure)
@@ -236,7 +244,6 @@ class RoutedFinancialSource(_RoutedSource):
     get_revenue_by_segment = _BySymbol(list)
 
     get_realtime_quote = _DefaultOnly(list)
-    get_sector_performance = _DefaultOnly(list)  # DALTON-HOOK(market-data-fallback)
 
     async def screen_stocks(self, **filters: Any) -> list[dict[str, Any]]:
         for route in self._by_market.values():

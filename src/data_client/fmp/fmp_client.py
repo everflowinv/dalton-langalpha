@@ -907,37 +907,6 @@ class FMPClient:
         return await self._make_request("company-screener", params=params)
 
     # =====================================================================
-    # Sector Performance
-    # =====================================================================
-
-    async def get_sector_performance(  # DALTON-HOOK(market-data-fallback)
-        self, target_date: Optional[str] = None
-    ) -> List[Dict]:
-        """Daily snapshot of US sector performance (NASDAQ-listed names)."""
-        def _fmt_sector_pct(row: Dict[str, Any]) -> Dict[str, Any]:
-            if "averageChange" not in row or "changePctStr" in row:
-                return row
-            val = row["averageChange"]
-            formatted = f"{val:.5f}%" if isinstance(val, (int, float)) else str(val)
-            return {**row, "changePctStr": formatted}
-
-        if target_date:
-            data = await self._make_request(
-                "sector-performance-snapshot", params={"date": target_date}
-            )
-            return [_fmt_sector_pct(row) for row in (data or [])]
-
-        today = _today_utc()
-        for offset in range(7):
-            probe = (today - timedelta(days=offset)).isoformat()
-            data = await self._make_request(
-                "sector-performance-snapshot", params={"date": probe}
-            )
-            if data:
-                return [_fmt_sector_pct(row) for row in data]
-        return []
-
-    # =====================================================================
     # Technical Indicators
     # =====================================================================
 

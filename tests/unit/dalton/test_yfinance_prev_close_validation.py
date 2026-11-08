@@ -24,7 +24,6 @@ from src.data_client.yfinance.data_source import (
 from src.data_client.yfinance.financial_source import (
     YFinanceFinancialSource,
     _get_realtime_quote,
-    _get_single_sector_perf,
 )
 from src.data_client.yfinance.yahoo import (
     regular_previous_close,
@@ -731,189 +730,66 @@ async def test_company_overview_formats_unknown_prev_close_without_zero_or_error
         assert art["quote"]["changePct"] is None
 
 
-def test_sector_etf_frozen_conflict_and_resumption_day_return_unknown():
-    from src.data_client.yfinance import data_source as yf_ds, financial_source as yf_fin
-
-    # 10/27 frozen-tail conflict (15.47 vs 13.57)
-    conflict_ticker = _stub_ticker(
-        _frozen_hk_rows()[:-1],
-        fast_info={"lastPrice": 12.90, "regularMarketPreviousClose": 15.47},
-    )
-    with (
-        patch(
-            "src.data_client.yfinance.financial_source.yahoo_ticker",
-            new=create_autospec(yf_fin.yahoo_ticker, return_value=conflict_ticker),
-        ),
-        patch(
-            "src.data_client.yfinance.data_source.yahoo_ticker",
-            new=create_autospec(yf_ds.yahoo_ticker, return_value=conflict_ticker),
-        ),
-    ):
-        assert _get_single_sector_perf("Technology", "XLK") is None
-
-    # 10/26 resumption day itself
-    resumption_ticker = _stub_ticker(
-        _frozen_hk_rows(),
-        fast_info={"lastPrice": 13.57, "regularMarketPreviousClose": 15.47},
-        regular_market_time=1793002099,
-    )
-    with (
-        patch(
-            "src.data_client.yfinance.financial_source.yahoo_ticker",
-            new=create_autospec(yf_fin.yahoo_ticker, return_value=resumption_ticker),
-        ),
-        patch(
-            "src.data_client.yfinance.data_source.yahoo_ticker",
-            new=create_autospec(yf_ds.yahoo_ticker, return_value=resumption_ticker),
-        ),
-    ):
-        assert _get_single_sector_perf("Technology", "XLK") is None
-
-
-@pytest.mark.parametrize("fast_prev", [None, 13.57])
-def test_sector_etf_post_resumption_uses_last_real_trading_day(
-    fast_prev: float | None,
-):
-    from src.data_client.yfinance import data_source as yf_ds, financial_source as yf_fin
-
-    fast_info: dict[str, object] = {"lastPrice": 12.90}
-    if fast_prev is not None:
-        fast_info["regularMarketPreviousClose"] = fast_prev
-    ticker = _stub_ticker(_frozen_hk_rows(), fast_info=fast_info)
-    with (
-        patch(
-            "src.data_client.yfinance.financial_source.yahoo_ticker",
-            new=create_autospec(yf_fin.yahoo_ticker, return_value=ticker),
-        ),
-        patch(
-            "src.data_client.yfinance.data_source.yahoo_ticker",
-            new=create_autospec(yf_ds.yahoo_ticker, return_value=ticker),
-        ),
-    ):
-        row = _get_single_sector_perf("Technology", "XLK")
-    assert row == {"sector": "Technology", "changePctStr": "-4.94%"}
-
-
-def test_sector_etf_stale_history_returns_unknown():
-    from src.data_client.yfinance import data_source as yf_ds, financial_source as yf_fin
-
-    stale_ticker = _stub_ticker(
-        _stale_hk_rows(),
-        fast_info={"lastPrice": 12.90, "regularMarketPreviousClose": 13.57},
-    )
-    stale_ticker.history_metadata["exchangeTimezoneName"] = "America/New_York"
-    with (
-        patch(
-            "src.data_client.yfinance.financial_source.yahoo_ticker",
-            new=create_autospec(yf_fin.yahoo_ticker, return_value=stale_ticker),
-        ),
-        patch(
-            "src.data_client.yfinance.data_source.yahoo_ticker",
-            new=create_autospec(yf_ds.yahoo_ticker, return_value=stale_ticker),
-        ),
-    ):
-        assert _get_single_sector_perf("Technology", "XLK") is None
-
-
-# Separate from the stale case: in one test the second call hit the first
-# one's cached daily history and never read the empty history at all.
-def test_sector_etf_empty_history_returns_unknown():
-    from src.data_client.yfinance import data_source as yf_ds, financial_source as yf_fin
-
-    empty_ticker = _stub_ticker(
-        None,
-        fast_info={"lastPrice": 203.0, "regularMarketPreviousClose": 200.0},
-    )
-    with (
-        patch(
-            "src.data_client.yfinance.financial_source.yahoo_ticker",
-            new=create_autospec(yf_fin.yahoo_ticker, return_value=empty_ticker),
-        ),
-        patch(
-            "src.data_client.yfinance.data_source.yahoo_ticker",
-            new=create_autospec(yf_ds.yahoo_ticker, return_value=empty_ticker),
-        ),
-    ):
-        assert _get_single_sector_perf("Technology", "XLK") is None
-
-
-def test_sector_etf_normal_day_unchanged():
-    from src.data_client.yfinance import data_source as yf_ds, financial_source as yf_fin
-
-    ticker = _stub_ticker(
-        [("2026-10-26", 200.0, 10_000_000), ("2026-10-27", 203.0, 12_000_000)],
-        fast_info={"lastPrice": 203.0, "regularMarketPreviousClose": 200.0},
-    )
-    with (
-        patch(
-            "src.data_client.yfinance.financial_source.yahoo_ticker",
-            new=create_autospec(yf_fin.yahoo_ticker, return_value=ticker),
-        ),
-        patch(
-            "src.data_client.yfinance.data_source.yahoo_ticker",
-            new=create_autospec(yf_ds.yahoo_ticker, return_value=ticker),
-        ),
-    ):
-        row = _get_single_sector_perf("Technology", "XLK")
-    assert row == {"sector": "Technology", "changePctStr": "+1.50%"}
-
-
 @pytest.mark.asyncio
 async def test_sector_performance_omits_unverified_etf_and_keeps_valid_sectors():
-    # Original behavior in YFinanceFinancialSource.get_sector_performance:
-    # an ETF whose previous close is unknown returns None and is omitted,
-    # while verified ETFs render unchanged without 0% or errors.
-    from src.data_client.financial_data_provider import FinancialDataProvider
-    from src.data_client.yfinance import data_source as yf_ds, financial_source as yf_fin
+    # Upstream SPDR daily-bar path in fetch_sector_performance:
+    # a fund missing the newest session's daily bar is omitted from the table
+    # and artifact, while funds with that session's bar render normally.
+    from src.data_client.market_data_provider import MarketDataProvider, ProviderEntry
+    from src.data_client.yfinance import data_source as yf_ds
+    from src.data_client.yfinance.data_source import YFinanceDataSource
     from src.tools.market_data import market_overview as mo_mod
 
     valid_ticker = _stub_ticker(
         [("2026-10-26", 200.0, 10_000_000), ("2026-10-27", 203.0, 12_000_000)],
         fast_info={"lastPrice": 203.0, "regularMarketPreviousClose": 200.0},
     )
-    frozen_ticker = _stub_ticker(
-        _frozen_hk_rows()[:-1],
-        fast_info={"lastPrice": 12.90, "regularMarketPreviousClose": 15.47},
+    stale_session_ticker = _stub_ticker(
+        [("2026-10-22", 100.0, 10_000_000), ("2026-10-23", 101.0, 10_000_000)],
+        fast_info={"lastPrice": 101.0, "regularMarketPreviousClose": 100.0},
     )
 
     def _pick_ticker(sym: str) -> object:
-        return valid_ticker if sym == "XLV" else frozen_ticker
+        return valid_ticker if sym == "XLV" else stale_session_ticker
 
-    fin_provider = FinancialDataProvider(financial=YFinanceFinancialSource())
+    mkt_provider = MarketDataProvider(
+        [ProviderEntry("yfinance", YFinanceDataSource(), {"all"})]
+    )
     with (
-        patch(
-            "src.data_client.yfinance.financial_source.yahoo_ticker",
-            new=create_autospec(yf_fin.yahoo_ticker, side_effect=_pick_ticker),
-        ),
         patch(
             "src.data_client.yfinance.data_source.yahoo_ticker",
             new=create_autospec(yf_ds.yahoo_ticker, side_effect=_pick_ticker),
         ),
         patch(
-            "src.tools.market_data.market_overview.get_financial_data_provider",
+            "src.tools.market_data.market_overview.get_market_data_provider",
             new=create_autospec(
-                mo_mod.get_financial_data_provider, return_value=fin_provider
+                mo_mod.get_market_data_provider, return_value=mkt_provider
             ),
         ),
     ):
-        content, artifact = await mo_mod.fetch_sector_performance()
+        content, artifact = await mo_mod.fetch_sector_performance(date="2026-10-27")
 
-    assert "Healthcare" in content
-    assert "+1.50%" in content
-    assert "Technology" not in content
-    assert "-16.61%" not in content
+    assert "| Health Care | XLV | +1.50% |" in content
+    assert "| Information Technology | XLK |" not in content
+    assert "_No bar for 2026-10-27:" in content and "Information Technology (XLK)" in content
     assert artifact == {
         "type": "sector_performance",
-        "sectors": [{"sector": "Healthcare", "changePercentage": 1.5}],
+        "date": "2026-10-27",
+        "in_progress": False,
+        "sectors": [{"sector": "Health Care", "changePercentage": 1.5}],
     }
 
 
-def test_sector_etf_extended_hours_uses_regular_session_change():
+@pytest.mark.asyncio
+async def test_sector_etf_extended_hours_uses_regular_session_change():
     # Previous close 100, regular close 105 (+5.00%), after-hours 106.
-    # Sector performance must report the regular session's +5.00%, not the
-    # extended-hours change_percent.
+    # Sector performance must report the regular session's +5.00% from daily
+    # closes, not the extended-hours change_percent.
     from src.dalton import extended_hours
+    from src.data_client.market_data_provider import MarketDataProvider, ProviderEntry
     from src.data_client.yfinance import data_source as yf_ds
+    from src.data_client.yfinance.data_source import YFinanceDataSource
+    from src.tools.market_data import market_overview as mo_mod
 
     et = ZoneInfo("America/New_York")
     reg_close_dt = datetime(2026, 10, 27, 16, 0, tzinfo=et)
@@ -934,11 +810,18 @@ def test_sector_etf_extended_hours_uses_regular_session_change():
         "postMarketPrice": 106.0,
         "postMarketTime": int(post_dt.timestamp()),
     }
+    empty_ticker = _stub_ticker(None, fast_info={"lastPrice": 100.0})
 
+    def _pick_ticker(sym: str) -> object:
+        return ticker if sym == "XLK" else empty_ticker
+
+    mkt_provider = MarketDataProvider(
+        [ProviderEntry("yfinance", YFinanceDataSource(), {"all"})]
+    )
     with (
         patch(
             "src.data_client.yfinance.data_source.yahoo_ticker",
-            new=create_autospec(yf_ds.yahoo_ticker, return_value=ticker),
+            new=create_autospec(yf_ds.yahoo_ticker, side_effect=_pick_ticker),
         ),
         patch(
             "src.dalton.extended_hours._now_utc",
@@ -947,15 +830,24 @@ def test_sector_etf_extended_hours_uses_regular_session_change():
                 return_value=now_dt.astimezone(timezone.utc),
             ),
         ),
+        patch(
+            "src.tools.market_data.market_overview.get_market_data_provider",
+            new=create_autospec(
+                mo_mod.get_market_data_provider, return_value=mkt_provider
+            ),
+        ),
     ):
         snap = _fetch_single_snapshot("XLK")
-        row = _get_single_sector_perf("Technology", "XLK")
+        content, artifact = await mo_mod.fetch_sector_performance(date="2026-10-27")
 
     assert snap is not None
     assert snap["late_trading_change_percent"] == pytest.approx((106.0 - 105.0) / 105.0 * 100.0, abs=1e-4)
     assert snap["regular_trading_change_percent"] == pytest.approx(5.0, abs=1e-4)
     assert snap["change_percent"] != pytest.approx(5.0, abs=1e-4)
-    assert row == {"sector": "Technology", "changePctStr": "+5.00%"}
+    assert "| Information Technology | XLK | +5.00% |" in content
+    assert artifact["sectors"] == [
+        {"sector": "Information Technology", "changePercentage": 5.0}
+    ]
 
 
 @pytest.mark.asyncio

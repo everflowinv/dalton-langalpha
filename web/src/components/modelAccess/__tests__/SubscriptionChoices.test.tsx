@@ -14,7 +14,8 @@ describe('SubscriptionChoices', () => {
       <SubscriptionChoices planGroups={[]} configured={new Set()} onPickSignIn={vi.fn()} onPickPlan={vi.fn()} claudeCode={{ status: 'needs_computer', onPick }} />,
     );
     const names = screen.getAllByRole('button').map((b) => b.querySelector('.truncate')?.textContent);
-    expect(names).toEqual(['ChatGPT', 'Claude', 'Claude Code', 'Grok']);
+    // DALTON-HOOK(native-oauth-ui): Subscription list includes Google Antigravity, Muse Code, and Grok (SuperGrok).
+    expect(names).toEqual(['ChatGPT', 'Claude', 'Claude Code', 'Google Antigravity', 'Muse Code', 'Grok (SuperGrok)']);
     expect(screen.getByText('Claude Pro or Max, called by LangAlpha')).toBeInTheDocument();
     expect(screen.getByText('Claude Pro or Max, run on your computer')).toBeInTheDocument();
     fireEvent.click(screen.getByText('No computer'));

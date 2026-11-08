@@ -121,10 +121,5 @@ class FMPFinancialSource:
     ) -> list[dict[str, Any]]:
         return await self._client.search_stocks(query=query, limit=limit)
 
-    async def get_sector_performance(
-        self, target_date: str | None = None
-    ) -> list[dict[str, Any]]:
-        return await self._client.get_sector_performance(target_date=target_date)
-
     async def close(self) -> None:
         pass  # client lifecycle managed by get_fmp_client singleton

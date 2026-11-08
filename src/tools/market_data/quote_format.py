@@ -214,6 +214,19 @@ def print_time(snap: dict[str, Any]) -> Optional[datetime]:
         return None
 
 
+def _has_extended_clock(
+    snap: dict[str, Any],
+    ref: Optional[InstrumentRef],
+    at: Optional[datetime],
+) -> bool:
+    """Whether the quote body already renders an extended-hours ``@ HH:MM`` sub-block."""
+    phase = venue_phase(ref, at) if ref is not None else None
+    _, change_parts = format_quote_change_parts(
+        snap, ref, at, phase, fallback_price=current_price(snap), fmt_price=price_text
+    )
+    return any(" @ " in part for part in change_parts)
+
+
 def price_clock(
     snap: dict[str, Any],
     ref: Optional[InstrumentRef],
@@ -231,11 +244,9 @@ def price_clock(
     if _is_us_clock(ref) and (
         printed is None
         or (is_live(freshness) and (now - printed).total_seconds() <= QUOTE_LIVE_S)
-        # DALTON-HOOK(extended-hours-quotes): Extended-hours and regular-only
-        # US rows already carry their session/trade-time label in the body.
-        or snap.get("regular_only")
-        or finite_or_none(snap.get("early_trading_change_percent")) is not None
-        or finite_or_none(snap.get("late_trading_change_percent")) is not None
+        # DALTON-HOOK(extended-hours-quotes): Omit the trailing clock only when
+        # the row body already emitted an extended-hours `@ HH:MM` sub-block.
+        or _has_extended_clock(snap, ref, at)
     ):
         return None
     return print_clock(ref, printed or now)

@@ -19,6 +19,7 @@ it may only mean the endpoint sits outside the plan.
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 import functools
 import logging
 from typing import Any
@@ -27,6 +28,10 @@ from src.data_client.financial_data_provider import _close_all
 from src.data_client.fmp.fmp_client import FMPRequestError, FmpQuotaExhausted
 
 logger = logging.getLogger(__name__)
+
+_last_served_by: ContextVar[str | None] = ContextVar(
+    "dalton_fallback_financial_served_by", default=None
+)
 
 # Quota (429), plan (402), and a key FMP refuses (401/403).
 _ACCOUNT_STATUSES = frozenset({401, 402, 403, 429})
@@ -109,11 +114,36 @@ class FallbackFinancialSource:
     where the miss hands the call to FMP — the same default as the flip.
     """
 
-    default_name = "yfinance"
-
-    def __init__(self, fmp: Any, yfinance: Any) -> None:
+    def __init__(
+        self,
+        fmp: Any,
+        yfinance: Any,
+        *,
+        primary_name: str = "fmp",
+        fallback_name: str = "yfinance",
+    ) -> None:
         self._fmp = fmp
         self._yfinance = yfinance
+        self._primary_name = (
+            getattr(fmp, "default_name", None)
+            or getattr(fmp, "name", None)
+            or primary_name
+        )
+        self._fallback_name = (
+            getattr(yfinance, "default_name", None)
+            or getattr(yfinance, "name", None)
+            or fallback_name
+        )
+
+    def _mark_served_by(self, name: str) -> None:
+        # Per-request (ContextVar), never instance state: one instance serves
+        # concurrent requests, so a shared field would name another call's source.
+        _last_served_by.set(name)
+
+    @property
+    def default_name(self) -> str:
+        """Name of the source that answered the current (or most recent) call."""
+        return _last_served_by.get() or self._fallback_name
 
     async def _call(self, method: str, /, *args: Any, **kwargs: Any) -> Any:
         if method in _FMP_ONLY:
@@ -133,7 +163,7 @@ class FallbackFinancialSource:
                 type(yf_exc).__name__,
             )
             try:
-                return await getattr(self._fmp, method)(*args, **kwargs)
+                fmp_result = await getattr(self._fmp, method)(*args, **kwargs)
             except FmpQuotaExhausted:
                 # The shared marker says FMP's quota is gone, so there is
                 # nothing to fall to; the yfinance failure is the answer.
@@ -143,7 +173,10 @@ class FallbackFinancialSource:
                     method,
                 )
                 raise yf_exc
+            self._mark_served_by(self._primary_name)
+            return fmp_result
         if _answered(result, quote=method in _QUOTE_METHODS):
+            self._mark_served_by(self._fallback_name)
             return result
         logger.warning(
             "financial_data.fallback | method=%s from=yfinance reason=empty to=fmp",
@@ -172,13 +205,20 @@ class FallbackFinancialSource:
                 method,
                 type(fmp_exc).__name__,
             )
+            self._mark_served_by(self._fallback_name)
             return result
-        return fmp_result if _answered(fmp_result, quote=method in _QUOTE_METHODS) else result
+        if _answered(fmp_result, quote=method in _QUOTE_METHODS):
+            self._mark_served_by(self._primary_name)
+            return fmp_result
+        self._mark_served_by(self._fallback_name)
+        return result
 
     async def _fmp_only(self, method: str, /, *args: Any, **kwargs: Any) -> Any:
         # Only FMP serves these; a tripped quota marker raises
         # FmpQuotaExhausted from FMPClient._make_request without a request.
-        return await getattr(self._fmp, method)(*args, **kwargs)
+        result = await getattr(self._fmp, method)(*args, **kwargs)
+        self._mark_served_by(self._primary_name)
+        return result
 
     get_company_profile = _Fallback()
     get_realtime_quote = _Fallback()
@@ -193,15 +233,6 @@ class FallbackFinancialSource:
     get_revenue_by_segment = _Fallback()
     screen_stocks = _Fallback()
     search_stocks = _Fallback()
-
-    async def get_sector_performance(
-        self, target_date: str | None = None
-    ) -> list[dict[str, Any]]:
-        if target_date:
-            # yfinance only has today's ETF snapshot; do not fall back and
-            # pass today's performance off as historical target_date data.
-            return await self._fmp_only("get_sector_performance", target_date=target_date)
-        return await self._call("get_sector_performance", target_date=target_date)
 
     async def close(self) -> None:
         await _close_all([("fmp", self._fmp), ("yfinance", self._yfinance)])

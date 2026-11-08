@@ -479,9 +479,10 @@ class TestExtendedHoursAndPrevCloseWording:
         }
         line = format_quote_line(snap, at=self._PRE_ET)
         assert "GOOG  last close $330.95 -1.62% vs prev close  vol 19.2M" in line
-        assert "10-21" not in line
+        assert "10-21" not in line.split(" (")[0]
         assert "today" not in line
         assert "(pre" in line
+        assert "2026-10-21 16:00:00 ET)" in line
 
     def test_extended_hours_appends_pre_and_post_segments(self):
         # DALTON-HOOK(extended-hours-quotes): Split regular close + regular move from pre-market/after-hours price + move.
@@ -594,7 +595,7 @@ class TestExtendedHoursAndPrevCloseWording:
             "after-hours $333.76 +0.85% vs last close  vol 19.2M"
         ) in line
         assert "today" not in line
-        assert "10-22" not in line
+        assert "10-22" not in line.split(" (")[0]
         assert "@ 17:15 ET" not in line
 
     def test_overnight_and_weekend_use_last_close_not_today(self):
@@ -743,9 +744,9 @@ class TestExtendedHoursAndPrevCloseWording:
         past_midnight_line = format_quote_line(ginlix_past_midnight, at=at_past_midnight)
         assert past_midnight_line == (
             "GOOG  last close $317.28 -1.08% vs prev close $320.76  "
-            "after-hours $318.10 +0.26% vs last close  vol 10.8M (closed)"
+            "after-hours $318.10 +0.26% vs last close  vol 10.8M (closed, 2026-10-24 00:30:00 ET)"
         )
-        assert "10-24" not in past_midnight_line
+        assert "10-24" not in past_midnight_line.split(" (")[0]
         assert "10-23" not in past_midnight_line
 
     def test_prior_day_as_of_without_regular_date_when_venue_open_writes_last_close(self):
@@ -872,7 +873,7 @@ class TestExtendedHoursAndPrevCloseWording:
         }
         closed_line = format_quote_line(goog_closed_regular_only, at=after_close_at)
         assert closed_line == (
-            "GOOG  close 10-23 $317.28 -1.08% vs prev close $320.76  vol 10.8M (closed)"
+            "GOOG  close 10-23 $317.28 -1.08% vs prev close $320.76  vol 10.8M (closed, 2026-10-23 16:00:00 ET)"
         )
 
         # 5) HK stock (港股): preserves existing layout and only appends "vs prev close HK$X".
@@ -892,6 +893,67 @@ class TestExtendedHoursAndPrevCloseWording:
             "0700.HK  HK$318.20  -0.50% today vs prev close HK$319.80  "
             "vol 12.0M (2026-07-02 10:30:00 HKT)"
         )
+
+    def test_price_clock_shown_unless_extended_subblock_rendered(self):
+        # DALTON-HOOK(extended-hours-quotes):
+        # 1) yfinance regular_only snapshot whose trade time is older than QUOTE_LIVE_S
+        #    during regular hours still shows its trade clock at the end of the line.
+        reg_at = _ET.localize(datetime(2026, 10, 23, 14, 30, 0))
+        older_trade_ms = int(
+            _ET.localize(datetime(2026, 10, 23, 14, 25, 0)).timestamp() * 1000
+        )
+        yf_reg_only = {
+            "symbol": "GOOG",
+            "price": 317.50,
+            "previous_close": 317.28,
+            "change_percent": 0.0693,
+            "volume": 10_800_000,
+            "as_of": older_trade_ms,
+            "regular_as_of": older_trade_ms,
+            "regular_trading_date": "2026-10-23",
+            "regular_only": True,
+            "tier": "delayed_15m",
+            "source": "yfinance",
+        }
+        yf_line = format_quote_line(yf_reg_only, at=reg_at)
+        assert yf_line.endswith("(delayed 15m, 2026-10-23 14:25:00 ET)")
+
+        # 2) Ginlix pre-market with price=None and early_trading_change_percent only
+        #    (no pre-market sub-block can be built) still shows the trade clock.
+        pre_at = _ET.localize(datetime(2026, 10, 26, 8, 15, 0))
+        pre_trade_ms = int(
+            _ET.localize(datetime(2026, 10, 26, 8, 10, 0)).timestamp() * 1000
+        )
+        ginlix_pre_no_reg_close = {
+            "symbol": "GOOG",
+            "price": None,
+            "last_trade_price": 322.26,
+            "last_trade_at": pre_trade_ms,
+            "early_trading_change_percent": 0.4676,
+            "market_status": "early_trading",
+            "as_of": int(pre_at.timestamp() * 1000),
+            "tier": "realtime",
+            "source": "ginlix-data",
+        }
+        ginlix_pre_line = format_quote_line(ginlix_pre_no_reg_close, at=pre_at)
+        assert "pre-market" not in ginlix_pre_line
+        assert ginlix_pre_line.endswith("(pre, 2026-10-26 08:10:00 ET)")
+
+        # 3) When the extended-hours sub-block with `@ HH:MM ET` IS rendered,
+        #    the trailing suffix does not repeat the trade timestamp.
+        ginlix_pre_with_subblock = {
+            **ginlix_pre_no_reg_close,
+            "price": 320.76,
+            "regular_close": 320.76,
+            "previous_close": 320.76,
+            "regular_trading_change": -3.46,
+            "regular_trading_change_percent": -1.0672,
+            "regular_trading_date": "2026-10-23",
+        }
+        subblock_line = format_quote_line(ginlix_pre_with_subblock, at=pre_at)
+        assert "pre-market $322.26 +0.47% vs last close @ 08:10 ET" in subblock_line
+        assert subblock_line.endswith("(pre)")
+        assert "2026-10-26 08:10:00 ET" not in subblock_line
 
 
 # DALTON-HOOK(extended-hours-quotes): a same-day non-US quote whose regular

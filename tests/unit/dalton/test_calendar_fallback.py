@@ -22,9 +22,7 @@ from pydantic import ValidationError
 import src.server.app.calendar as calendar_mod
 import src.tools.market_data.market_overview as market_overview
 from src.dalton.market_data import calendar_fallback as cf
-from src.data_client.base import FinancialDataSource
 from src.data_client.fmp.fmp_client import FMPClient, FMPRequestError, FmpQuotaExhausted
-from src.data_client.yfinance.financial_source import YFinanceFinancialSource
 from src.server.models.calendar import EconomicEvent, EarningsEvent
 from src.server.services.cache.earnings_cache_service import EarningsCacheService
 from src.utils.cache import redis_cache
@@ -726,97 +724,138 @@ async def test_yf_cache_stores_for_an_hour_and_never_empty(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _sector_provider(monkeypatch, answer: Any) -> Any:
-    """Point the overview at a provider whose sector call raises or returns *answer*."""
-    from src.data_client.financial_data_provider import FinancialDataProvider
+def _spdr_daily_bars(closes_by_day: list[tuple[str, float]]) -> list[dict[str, Any]]:
+    return [
+        {
+            "time": int(
+                datetime.fromisoformat(f"{day}T16:00:00-04:00").timestamp() * 1000
+            ),
+            "open": close,
+            "high": close,
+            "low": close,
+            "close": close,
+            "volume": 1_000,
+        }
+        for day, close in closes_by_day
+    ]
 
-    provider = create_autospec(FinancialDataProvider, instance=True)
-    provider.financial = create_autospec(FinancialDataSource, instance=True)
-    if isinstance(answer, BaseException):
-        provider.financial.get_sector_performance.side_effect = answer
-    else:
-        provider.financial.get_sector_performance.return_value = answer
+
+SECTOR_DAILY_BARS: dict[str, list[dict[str, Any]]] = {
+    "XLK": _spdr_daily_bars([("2026-10-22", 100.0), ("2026-10-23", 101.50)]),
+    "XLE": _spdr_daily_bars([("2026-10-22", 100.0), ("2026-10-23", 99.50)]),
+}
+
+
+def _sector_market_provider(
+    monkeypatch,
+    fmp_answer: dict[str, list[dict[str, Any]]] | BaseException | None,
+    yf_bars: dict[str, list[dict[str, Any]]],
+) -> tuple[Any, Any]:
+    """Wire a MarketDataProvider with FMP (optional) and yfinance daily sources."""
+    from src.data_client import get_market_data_provider as _real_get_market_data_provider
+    from src.data_client.base import MarketDataSource
+    from src.data_client.market_data_provider import MarketDataProvider, ProviderEntry
+
+    fmp_src = create_autospec(MarketDataSource, instance=True)
+    if isinstance(fmp_answer, BaseException):
+        fmp_src.get_daily.side_effect = fmp_answer
+    elif isinstance(fmp_answer, dict):
+        async def _fmp_daily(symbol: str, **kwargs):
+            return fmp_answer.get(symbol, [])
+
+        fmp_src.get_daily.side_effect = _fmp_daily
+
+    yf_src = create_autospec(MarketDataSource, instance=True)
+
+    async def _yf_daily(symbol: str, **kwargs):
+        return yf_bars.get(symbol, [])
+
+    yf_src.get_daily.side_effect = _yf_daily
+
+    entries = [ProviderEntry("yfinance", yf_src, {"all"})]
+    if fmp_answer is not None:
+        entries.insert(0, ProviderEntry("fmp", fmp_src, {"all"}))
+    provider = MarketDataProvider(entries)
     get_provider = create_autospec(
-        market_overview.get_financial_data_provider, return_value=provider
+        _real_get_market_data_provider, return_value=provider
     )
-    monkeypatch.setattr(market_overview, "get_financial_data_provider", get_provider)
-    return provider
-
-
-def _yf_sector_cls(monkeypatch, rows: list[dict[str, Any]] | None) -> Any:
-    yf_cls = create_autospec(YFinanceFinancialSource)
-    if rows is not None:
-        yf_cls.return_value.get_sector_performance.return_value = rows
-    import src.data_client.yfinance.financial_source as yf_fin
-
-    monkeypatch.setattr(yf_fin, "YFinanceFinancialSource", yf_cls)
-    return yf_cls
+    monkeypatch.setattr(market_overview, "get_market_data_provider", get_provider)
+    return fmp_src, yf_src
 
 
 @pytest.mark.asyncio
 async def test_sector_dateless_provider_failure_falls_back_to_yfinance(monkeypatch):
-    _sector_provider(monkeypatch, FmpQuotaExhausted(RESET))
-    yf_cls = _yf_sector_cls(monkeypatch, SECTOR_ROWS)
+    _, yf_src = _sector_market_provider(
+        monkeypatch, FmpQuotaExhausted(RESET), SECTOR_DAILY_BARS
+    )
 
     content, artifact = await market_overview.fetch_sector_performance(date=None)
 
-    assert "Technology" in content and "+1.10%" in content
+    assert "Information Technology" in content and "+1.50%" in content
     assert artifact["sectors"] == [
-        {"sector": "Technology", "changePercentage": 1.1},
-        {"sector": "Energy", "changePercentage": -0.4},
+        {"sector": "Information Technology", "changePercentage": 1.5},
+        {"sector": "Energy", "changePercentage": -0.5},
     ]
-    yf_cls.return_value.get_sector_performance.assert_awaited_once()
+    assert yf_src.get_daily.await_count == 11
+
+    # Also answers from daily bars when no FMP key is configured (yfinance-only chain).
+    _, yf_only_src = _sector_market_provider(monkeypatch, None, SECTOR_DAILY_BARS)
+    content_no_key, artifact_no_key = await market_overview.fetch_sector_performance(
+        date=None
+    )
+    assert "Information Technology" in content_no_key
+    assert artifact_no_key["sectors"] == artifact["sectors"]
+    assert yf_only_src.get_daily.await_count == 11
 
 
 @pytest.mark.asyncio
 async def test_sector_dateless_fallback_failure_shows_no_data(monkeypatch):
-    _sector_provider(monkeypatch, FmpQuotaExhausted(RESET))
-    _yf_sector_cls(monkeypatch, [])
+    _sector_market_provider(monkeypatch, FmpQuotaExhausted(RESET), {})
 
     content, artifact = await market_overview.fetch_sector_performance(date=None)
 
-    # B2: the exhausted quota is named, not swallowed as an empty table.
-    assert "额度已用完" in content
+    assert "quota is exhausted" in content.lower()
     assert artifact["sectors"] == []
-    assert artifact["error"] == "fmp_quota_exhausted"
+    assert "quota is exhausted" in artifact["error"].lower()
 
 
 @pytest.mark.asyncio
 async def test_sector_dated_failure_stays_fmp_only(monkeypatch):
-    provider = _sector_provider(monkeypatch, FmpQuotaExhausted(RESET))
-    yf_cls = _yf_sector_cls(monkeypatch, SECTOR_ROWS)
+    fmp_src, yf_src = _sector_market_provider(
+        monkeypatch, FmpQuotaExhausted(RESET), SECTOR_DAILY_BARS
+    )
 
     content, artifact = await market_overview.fetch_sector_performance(date="2026-10-23")
 
-    provider.financial.get_sector_performance.assert_awaited_once_with(
-        target_date="2026-10-23"
-    )
-    yf_cls.return_value.get_sector_performance.assert_not_awaited()
-    # B2: a dated request reports the quota, never yfinance's today snapshot.
-    assert "额度已用完" in content
-    assert "2026-10-23" in content
-    assert artifact["sectors"] == []
-    assert artifact["error"] == "fmp_quota_exhausted"
+    assert {c.kwargs["to_date"] for c in fmp_src.get_daily.await_args_list} == {
+        "2026-10-23"
+    }
+    assert {c.kwargs["to_date"] for c in yf_src.get_daily.await_args_list} == {
+        "2026-10-23"
+    }
+    assert artifact["date"] == "2026-10-23"
+    assert "S&P 500 sectors, 2026-10-23" in content
+    assert artifact["sectors"] == [
+        {"sector": "Information Technology", "changePercentage": 1.5},
+        {"sector": "Energy", "changePercentage": -0.5},
+    ]
 
 
 @pytest.mark.asyncio
 async def test_sector_provider_success_skips_yfinance(monkeypatch):
-    provider = _sector_provider(
-        monkeypatch,
-        [
-            {"sector": "Technology", "changePctStr": "+1.10%", "date": "2026-10-23"},
-            {"sector": "Energy", "changePctStr": "-0.40%", "date": "2026-10-23"},
-        ],
+    all_funds = {
+        sym: _spdr_daily_bars([("2026-10-22", 100.0), ("2026-10-23", 101.50)])
+        for sym in market_overview._SECTOR_FUNDS
+    }
+    fmp_src, yf_src = _sector_market_provider(
+        monkeypatch, all_funds, SECTOR_DAILY_BARS
     )
-    yf_cls = _yf_sector_cls(monkeypatch, SECTOR_ROWS)
 
     content, _ = await market_overview.fetch_sector_performance(date="2026-10-23")
 
-    provider.financial.get_sector_performance.assert_awaited_once_with(
-        target_date="2026-10-23"
-    )
-    yf_cls.return_value.get_sector_performance.assert_not_awaited()
-    assert "Technology" in content
+    assert fmp_src.get_daily.await_count == 11
+    yf_src.get_daily.assert_not_awaited()
+    assert "Information Technology" in content
 
 
 def test_lone_future_from_defaults_to_a_week_after_it():

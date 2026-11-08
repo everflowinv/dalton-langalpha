@@ -756,6 +756,8 @@ async def _cn_first(
     since neither source answered. *disp* is the display spelling, so a
     canonical ``600519.XSHG`` still gates in as a CN listing.
     """
+    # DALTON-HOOK(market-data-fallback): Forward yf_fallback into _from_fmp so
+    # non-CN (or tushare-miss) reads still fall back to yfinance on FMP 402.
     def fmp():
         return _from_fmp(
             disp, fmp_read, data_type=data_type, yf_fallback=yf_fallback, **extra

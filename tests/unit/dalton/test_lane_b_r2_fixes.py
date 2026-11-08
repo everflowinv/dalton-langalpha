@@ -761,7 +761,7 @@ class TestFmpQuotaClassification:
             httpx.Response(429, request=httpx.Request("GET", "https://fmp.example/x")),
         )
         with pytest.raises(FmpQuotaExhausted) as excinfo:
-            await client.get_sector_performance(target_date="2026-10-27")
+            await client.get_profile("AAPL")
         assert excinfo.value.status_code == 429
         assert excinfo.value.reset_at is not None
 
@@ -780,7 +780,7 @@ class TestFmpQuotaClassification:
             ),
         )
         with pytest.raises(FmpQuotaExhausted):
-            await client.get_sector_performance(target_date="2026-10-27")
+            await client.get_profile("AAPL")
 
     @pytest.mark.asyncio
     async def test_other_4xx_stays_a_plain_request_error(
@@ -793,7 +793,7 @@ class TestFmpQuotaClassification:
             httpx.Response(403, request=httpx.Request("GET", "https://fmp.example/x")),
         )
         with pytest.raises(FMPRequestError) as excinfo:
-            await client.get_sector_performance(target_date="2026-10-27")
+            await client.get_profile("AAPL")
         assert not isinstance(excinfo.value, FmpQuotaExhausted)
         assert excinfo.value.status_code == 403
 

@@ -2880,7 +2880,8 @@ class TestFetchQuote:
         from unittest.mock import create_autospec
         from src.data_client import get_market_data_provider
         from src.data_client.market_data_provider import MarketDataProvider
-        from src.tools.market_data.company import _quote_detail_rows, _snapshot_price_lines
+        from src.tools.market_data.company import _quote_detail_rows, _settled_price_lines
+        from src.tools.market_data.currency import DisplaySpec
 
         pre_et = datetime(2026, 10, 22, 8, 4, 0, tzinfo=ZoneInfo("America/New_York"))
         post_et = datetime(2026, 10, 22, 17, 15, 0, tzinfo=ZoneInfo("America/New_York"))
@@ -2973,8 +2974,9 @@ class TestFetchQuote:
             "after-hours $333.76 +0.85% vs close @ 17:15 ET  vol 19.2M"
         ) in post_content
 
-        closed_with_late = _snapshot_price_lines(
-            {**post_snaps[0], "price": 999.0, "regular_close": 330.95}, "closed", "USD"
+        usd = DisplaySpec("USD", 2)
+        closed_with_late = _settled_price_lines(
+            {**post_snaps[0], "price": 999.0, "regular_close": 330.95}, 330.95, usd
         )
         assert any("**Regular Close (10-22):** $330.95" in ln for ln in closed_with_late)
         assert any(
@@ -2983,17 +2985,22 @@ class TestFetchQuote:
         )
         detail_rows = dict(
             _quote_detail_rows(
-                "USD", None, 336.40, None, None, None, None, None, None,
+                usd, None, 336.40, None, None, None, None, None, None,
                 prev_close_date="10-21",
             )
         )
         assert detail_rows["Previous Close"] == "$336.40 (10-21 close)"
-        closed_odd_lot = _snapshot_price_lines(
-            {**post_snaps[0], "late_trading_change": None, "late_trading_change_percent": None},
-            "closed",
-            "USD",
+        closed_odd_lot = _settled_price_lines(
+            {
+                **post_snaps[0],
+                "market_status": "closed",
+                "late_trading_change": None,
+                "late_trading_change_percent": None,
+            },
+            330.95,
+            usd,
         )
-        assert not any("After-Hours Price" in ln for ln in closed_odd_lot)
+        assert not any("Extended-Hours Price" in ln or "After-Hours Price" in ln for ln in closed_odd_lot)
 
     @pytest.mark.asyncio
     async def test_no_row_for_any_symbol_is_unavailable(self):

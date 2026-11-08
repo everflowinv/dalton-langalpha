@@ -13,8 +13,7 @@ from .currency import fmt_count
 from .display import resolve_ref, venue_local_time
 from .quote_format import build_live_stamp, current_price, print_time, quote_freshness
 from .utils import finite_or_none
-from src.data_client import get_financial_data_provider, get_market_data_provider
-from src.data_client.fmp.fmp_client import FmpQuotaExhausted  # DALTON-HOOK(market-data-fallback)
+from src.data_client import get_market_data_provider
 from src.data_client.freshness import measure_daily
 from src.data_client.instrument_clock import clock_for
 from src.data_client.market_data_provider import MarketNotCovered, snapshot_key
@@ -117,150 +116,6 @@ def _get_index_name(symbol: str) -> str:
     return index_names.get(symbol, symbol)
 
 
-_DEFAULT_GET_FINANCIAL_DATA_PROVIDER = get_financial_data_provider
-
-
-async def _yfinance_sector_snapshot() -> List[Dict[str, Any]]:
-    """Today's sector-ETF snapshot from yfinance; ``[]`` when Yahoo fails too.
-
-    DALTON-HOOK(market-data-fallback): last resort for a dateless sector
-    request whose provider chain raised — keeps the overview's sector half
-    alive. Dated requests never come here: yfinance has no date-aware sector data.
-    """
-    try:
-        from src.data_client.yfinance.financial_source import YFinanceFinancialSource
-
-        return list(await YFinanceFinancialSource().get_sector_performance())
-    except Exception:
-        logger.warning("Sector performance yfinance fallback failed", exc_info=True)
-        return []
-
-
-_DEFAULT_YFINANCE_SECTOR_SNAPSHOT = _yfinance_sector_snapshot
-
-
-def _format_legacy_sectors_as_table(sectors_data: List[Dict[str, Any]]) -> str:
-    if not sectors_data:
-        return "No sector performance data available."
-    lines = [
-        "## Sector Performance",
-        "",
-        "| Sector                      | Change    | Status    |",
-        "|-----------------------------|-----------|-----------|",
-    ]
-    parsed_sectors = []
-    for sector in sectors_data:
-        sector_name = sector.get("sector", "N/A")
-        change_str = sector.get("changePctStr", "0%")
-        try:
-            change_val = float(change_str.replace("%", "").replace("+", ""))
-        except (ValueError, AttributeError):
-            change_val = 0.0
-        parsed_sectors.append(
-            {"name": sector_name, "change_str": change_str, "change_val": change_val}
-        )
-    parsed_sectors.sort(key=lambda x: x["change_val"], reverse=True)
-    for sector in parsed_sectors:
-        name = sector["name"]
-        change_str = sector["change_str"]
-        change_val = sector["change_val"]
-        status = "📈 Up" if change_val > 0 else ("📉 Down" if change_val < 0 else "➡️ Flat")
-        if not change_str.startswith("+") and not change_str.startswith("-") and change_val >= 0:
-            change_str = "+" + change_str
-        lines.append(f"| {name:27} | {change_str:>9} | {status:9} |")
-    if parsed_sectors:
-        best = parsed_sectors[0]
-        worst = parsed_sectors[-1]
-        lines.append("")
-        lines.append(f"**Best Performing:** {best['name']} ({best['change_str']})")
-        lines.append(f"**Worst Performing:** {worst['name']} ({worst['change_str']})")
-    return "\n".join(lines)
-
-
-async def _fetch_sector_performance_from_financial(
-    date: Optional[str] = None,
-) -> Tuple[str, Dict[str, Any]]:
-    def _build_sector_artifact(raw_results: List[Dict[str, Any]]) -> Dict[str, Any]:
-        sectors = []
-        for sector in raw_results:
-            sector_name = sector.get("sector", "N/A")
-            change_str = sector.get("changePctStr", "0%")
-            try:
-                change_val = float(change_str.replace("%", "").replace("+", ""))
-            except (ValueError, AttributeError):
-                change_val = 0.0
-            sectors.append({"sector": sector_name, "changePercentage": change_val})
-        sectors.sort(key=lambda x: x["changePercentage"], reverse=True)
-        return {"type": "sector_performance", "sectors": sectors}
-
-    provider = await get_financial_data_provider()
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    requested_date = date or _venue_today(["^GSPC"])
-    date_str = f" ({date})" if date else ""
-    header = (
-        f"## Sector Performance Analysis{date_str}\n"
-        f"**Retrieved:** {timestamp}\n"
-        f"**Market:** US Stock Market\n\n"
-    )
-    # DALTON-HOOK(market-data-fallback): passes date through to FMP's
-    # date-aware endpoint; calls with target_date do not fall back to yfinance.
-    if provider.financial is not None:
-        try:
-            results = await provider.financial.get_sector_performance(target_date=date)
-            if results:
-                actual_date = results[0].get("date") if isinstance(results[0], dict) else None
-                if actual_date and actual_date != requested_date:
-                    fallback_notice = (
-                        f"> ⚠️ **No data for {requested_date}** "
-                        f"(weekend / holiday / not yet published). "
-                        f"Showing the most recent available trading day: "
-                        f"**{actual_date}**.\n\n"
-                    )
-                    content = header + fallback_notice + _format_legacy_sectors_as_table(results)
-                else:
-                    content = header + _format_legacy_sectors_as_table(results)
-                return content, _build_sector_artifact(results)
-        except FmpQuotaExhausted:
-            # DALTON-HOOK(market-data-fallback): the dated answer is
-            # FMP-only — yfinance serves today's ETF snapshot and must not
-            # stand in for a target date — so say the quota is gone
-            # instead of returning an empty table that reads as "no data".
-            if date is None:
-                results = await _yfinance_sector_snapshot()
-                if results:
-                    return (
-                        header + _format_legacy_sectors_as_table(results),
-                        _build_sector_artifact(results),
-                    )
-            quota_note = (
-                "FMP 当日额度已用完，带日期的板块数据暂不可用；"
-                "无日期的当日板块表现可稍后重试。"
-                if date is None
-                else "FMP 当日额度已用完，带日期的板块数据暂不可用。"
-            )
-            return f"{header}**Status:** 数据暂不可用\n\n{quota_note}", {
-                "type": "sector_performance",
-                "sectors": [],
-                "error": "fmp_quota_exhausted",
-            }
-        except Exception:
-            # DALTON-HOOK(market-data-fallback): only a dateless request
-            # can be re-answered here — yfinance serves the latest ETF
-            # snapshot, not a target date, so dated calls stay FMP-only.
-            if date is None:
-                results = await _yfinance_sector_snapshot()
-                if results:
-                    return (
-                        header + _format_legacy_sectors_as_table(results),
-                        _build_sector_artifact(results),
-                    )
-    return (
-        f"{header}**Status:** No data available\n\n"
-        f"No sector performance data available for the specified period.",
-        {"type": "sector_performance", "sectors": []},
-    )
-
-
 async def fetch_sector_performance(
     date: Optional[str] = None,
     config: Optional[RunnableConfig] = None,
@@ -273,11 +128,6 @@ async def fetch_sector_performance(
     The change reads only the close, which settles at the regular close even
     though the day's aggregate keeps taking after-hours volume.
     """
-    if (
-        get_financial_data_provider is not _DEFAULT_GET_FINANCIAL_DATA_PROVIDER
-        or _yfinance_sector_snapshot is not _DEFAULT_YFINANCE_SECTOR_SNAPSHOT
-    ):
-        return await _fetch_sector_performance_from_financial(date=date)
     provider = await get_market_data_provider()
     user_id = _get_user_id(config)
     end = date or _venue_today(["^GSPC"])
