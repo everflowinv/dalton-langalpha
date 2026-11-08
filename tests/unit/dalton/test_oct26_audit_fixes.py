@@ -654,7 +654,11 @@ async def test_sandbox_pip_install_uses_system_and_skips_local_workspace_dirs(
 
     commands.clear()
     await mcp_setup._install_dependencies(sandbox)
-    assert any("uv pip install --system -q --override" in c for c in commands)
+    # Upstream d2b2cd0e4 (#718) dropped the curl_cffi>=0.14 override on purpose:
+    # yfinance 1.8.0 no longer caps curl_cffi and needs >=0.17 itself, which the
+    # override would replace. Dalton keeps only --system.
+    assert any(c.startswith("uv pip install --system -q ") for c in commands)
+    assert not any("--override" in c for c in commands)
 
     # 4. workspace_sandbox.install_sandbox_packages passes --system
     sandbox.execute_bash_command.return_value = {

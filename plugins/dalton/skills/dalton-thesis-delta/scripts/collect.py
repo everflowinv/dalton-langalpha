@@ -110,6 +110,16 @@ def _extract_period_end_dates(ticker_obj: Any) -> dict[str, str]:
     except Exception:  # noqa: BLE001 - 内部属性读取失败即无期间信息
         return {}
     out: dict[str, str] = {}
+    # yfinance 1.7 caches the raw list; 1.8.0 caches the whole module per EPS
+    # methodology ({None: {"trend": [...], ...}}), None being the default one
+    # earnings_estimate / revenue_estimate are built from.
+    if isinstance(trend, dict):
+        module = trend.get(None)
+        if not isinstance(module, dict):
+            module = next(
+                (m for m in trend.values() if isinstance(m, dict) and "trend" in m), None
+            )
+        trend = module.get("trend") if isinstance(module, dict) else None
     if isinstance(trend, list):
         for item in trend:
             if not isinstance(item, dict):
