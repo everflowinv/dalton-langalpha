@@ -791,17 +791,18 @@ async def lock_user_preferences(user_id: str, *, conn) -> Optional[Dict[str, Any
         return dict(row) if row else None
 
 
-async def delete_user_preferences(user_id: str) -> bool:
+async def delete_user_preferences(user_id: str, conn=None) -> bool:  # DALTON-HOOK(data-jobs): allow callers to delete inside an existing transaction and profile lock
     """
     Delete all preferences for a user.
 
     Args:
         user_id: User ID
+        conn: Optional existing database connection
 
     Returns:
         True if a row was deleted, False if no preferences existed
     """
-    async with get_db_connection() as conn, conn.transaction():
+    async with get_db_connection(conn) as conn, conn.transaction():
         async with conn.cursor() as cur:
             await lock_user_profile(cur, user_id)
             await cur.execute(

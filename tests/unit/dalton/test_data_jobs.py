@@ -594,6 +594,7 @@ async def test_queued_slot_wait_vs_low_memory_separation_and_superseded() -> Non
     assert enqueued == ["run-new-slot"]
     sup_sql, _ = state_sup["executed"][1]
     assert "status = 'skipped_superseded'" in sup_sql
+    assert "trigger_source = 'cron'" in sup_sql
     assert "%(run_id)s::uuid" in state_sup["executed"][2][0]
     assert not any("consecutive_failures" in sql for sql, _ in state_sup["executed"])
 

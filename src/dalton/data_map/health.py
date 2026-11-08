@@ -524,6 +524,113 @@ async def default_conversation_probe(*, conn: Any = None) -> dict[str, Any]:
     }
 
 
+async def check_data_task_runs_health(
+    *,
+    conn: Any = None,
+    now_utc: datetime | None = None,
+) -> dict[str, Any]:
+    """Check enabled data tasks for runs in the past 36h with ``status IN ('failed', 'timed_out', 'aborted', 'skipped_low_memory')`` not superseded by a subsequent ``succeeded`` run."""
+    from psycopg.rows import dict_row
+
+    ref_now = now_utc or datetime.now(UTC)
+    if ref_now.tzinfo is None:
+        ref_now = ref_now.replace(tzinfo=UTC)
+    cutoff_utc = ref_now - timedelta(hours=36)
+    t0 = time.monotonic()
+
+    sql = """
+        SELECT
+            d.job_key,
+            d.task_code,
+            d.title,
+            r.run_id,
+            r.status,
+            r.failure_reason,
+            r.exit_code,
+            COALESCE(r.completed_at, r.started_at, r.created_at) AS run_ts
+        FROM dalton_data_task_defs d
+        JOIN LATERAL (
+            SELECT
+                f.run_id,
+                f.status,
+                f.failure_reason,
+                f.exit_code,
+                f.completed_at,
+                f.started_at,
+                f.created_at
+            FROM dalton_data_task_runs f
+            WHERE f.job_key = d.job_key
+              AND f.status IN ('failed', 'timed_out', 'aborted', 'skipped_low_memory')
+              AND COALESCE(f.completed_at, f.started_at, f.created_at) >= %s
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM dalton_data_task_runs s
+                  WHERE s.job_key = d.job_key
+                    AND s.status = 'succeeded'
+                    AND COALESCE(s.completed_at, s.started_at, s.created_at)
+                        > COALESCE(f.completed_at, f.started_at, f.created_at)
+              )
+            ORDER BY COALESCE(f.completed_at, f.started_at, f.created_at) DESC
+            LIMIT 1
+        ) r ON TRUE
+        WHERE d.enabled = TRUE
+        ORDER BY d.batch_no ASC, d.task_code ASC, d.job_key ASC
+    """
+
+    rows: list[dict[str, Any]] = []
+    async with db_pool.get_db_connection(conn) as db_conn:
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(sql, (cutoff_utc,))
+            fetched = await cur.fetchall()
+            for r in fetched or []:
+                if isinstance(r, Mapping):
+                    run_ts = r.get("run_ts")
+                    rows.append(
+                        {
+                            "job_key": str(r.get("job_key") or ""),
+                            "task_code": str(r.get("task_code") or ""),
+                            "title": str(r.get("title") or ""),
+                            "run_id": str(r.get("run_id") or ""),
+                            "status": str(r.get("status") or ""),
+                            "failure_reason": r.get("failure_reason"),
+                            "exit_code": r.get("exit_code"),
+                            "run_ts": (
+                                run_ts.isoformat()
+                                if hasattr(run_ts, "isoformat")
+                                else str(run_ts or "")
+                            ),
+                        }
+                    )
+
+    latency_ms = int((time.monotonic() - t0) * 1000)
+    has_anomalies = bool(rows)
+    reason = (
+        f"过去 36 小时内有 {len(rows)} 个已启用数据任务运行异常且未恢复："
+        + ", ".join(f"{item['job_key']}({item['status']})" for item in rows)
+        if has_anomalies
+        else "过去 36 小时内无未恢复的数据任务异常"
+    )
+    return {
+        "ok": not has_anomalies,
+        "source_id": "data_tasks",
+        "category": "data_tasks",
+        "status": "unavailable" if has_anomalies else "available",
+        "has_anomalies": has_anomalies,
+        "failed_count": len(rows),
+        "failed_tasks": rows,
+        "anomalies": rows,
+        "latency_ms": latency_ms,
+        "latest_date": None,
+        "error_type": "DataTaskRunFailure" if has_anomalies else None,
+        "detail": {
+            "window_hours": 36,
+            "failed_count": len(rows),
+            "failed_tasks": rows,
+            "reason": reason,
+        },
+    }
+
+
 async def _run_single_probe(
     source_id: str,
     category: str,
@@ -1004,6 +1111,35 @@ async def run_all_health_checks(
             probe_conv=probe_conv,
         )
 
+        data_task_health: dict[str, Any] | None = None
+        try:
+            data_task_health = await check_data_task_runs_health(conn=conn)
+            if isinstance(data_task_health, Mapping):
+                probe_results.append(dict(data_task_health))
+        except Exception as exc:
+            err_cls = type(exc).__name__
+            sanitized_msg = sanitize_health_text(str(exc), max_len=80)
+            err_type = (
+                f"{err_cls}:{sanitized_msg}"
+                if sanitized_msg and sanitized_msg != err_cls
+                else err_cls
+            )
+            data_task_health = {
+                "ok": False,
+                "source_id": "data_tasks",
+                "category": "data_tasks",
+                "status": "unavailable",
+                "has_anomalies": True,
+                "failed_count": 0,
+                "failed_tasks": [],
+                "anomalies": [],
+                "latency_ms": 0,
+                "latest_date": None,
+                "error_type": sanitize_health_text(err_type, max_len=64),
+                "detail": {"reason": sanitized_msg or err_cls},
+            }
+            probe_results.append(dict(data_task_health))
+
         refreshed_map: dict[str, Any] | None = None
         if persist:
             await db_data_map.upsert_source_health_batch(probe_results, conn=conn)
@@ -1024,6 +1160,7 @@ async def run_all_health_checks(
             "unavailable_count": unavailable_count,
             "results": probe_results,
             "data_map": refreshed_map,
+            "data_task_health": data_task_health,
         }
     finally:
         if lock_conn is not None:

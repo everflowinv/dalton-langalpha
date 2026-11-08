@@ -1457,15 +1457,24 @@ async def test_a_non_boolean_subagents_default_is_rejected(client, value):
 
 
 @asynccontextmanager
-async def _dalton_prefs_endpoint(stored_model_preference=None):
+async def _dalton_prefs_endpoint(stored_model_preference=None, read_before_lock=None):
     """DALTON-HOOK(settings-section): preferences PUT harness using create_autospec instead of bare AsyncMock."""
     from unittest.mock import create_autospec
     import src.server.app.users as users_mod
+    import src.server.database.user as user_db_mod
 
+    unlocked_mp = (
+        read_before_lock if read_before_lock is not None else stored_model_preference
+    ) or {}
+    locked_mp = stored_model_preference or {}
     get_user_mock = create_autospec(users_mod.db_get_user, return_value=_user())
     get_prefs_mock = create_autospec(
         users_mod.db_get_user_preferences,
-        return_value={"model_preference": stored_model_preference or {}},
+        return_value={"model_preference": unlocked_mp},
+    )
+    lock_prefs_mock = create_autospec(
+        user_db_mod.lock_user_preferences,
+        return_value={"model_preference": locked_mp},
     )
     upsert_mock = create_autospec(
         users_mod.upsert_user_preferences, return_value=_prefs()
@@ -1474,6 +1483,7 @@ async def _dalton_prefs_endpoint(stored_model_preference=None):
     with (
         patch.object(users_mod, "db_get_user", new=get_user_mock),
         patch.object(users_mod, "db_get_user_preferences", new=get_prefs_mock),
+        patch.object(users_mod, "db_lock_user_preferences", new=lock_prefs_mock),
         patch.object(users_mod, "upsert_user_preferences", new=upsert_mock),
         patch.object(users_mod, "maybe_complete_onboarding", new=onboarding_mock),
     ):
@@ -1602,6 +1612,553 @@ async def test_dalton_stored_legacy_custom_value_does_not_block_unrelated_prefer
 
     assert resp.status_code == 200
     upsert.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "stored_routes, patch_routes",
+    [
+        # DALTON-HOOK(data-jobs): reject add, modify, delete, and map-clear on data:* routes
+        ({}, {"data:cn-leverage-daily": ["feishu:user:ou_me_1"]}),
+        (
+            {"data:cn-leverage-daily": ["feishu:user:ou_me_1"]},
+            {"data:cn-leverage-daily": ["feishu:user:ou_me_1", "feishu:user:ou_me_2"]},
+        ),
+        (
+            {"data:cn-leverage-daily": ["feishu:user:ou_me_1"]},
+            {"data:cn-leverage-daily": None},
+        ),
+        (
+            {"data:cn-leverage-daily": ["feishu:user:ou_me_1"]},
+            None,
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_dalton_preferences_rejects_direct_data_task_route_edits(
+    client, stored_routes, patch_routes
+):
+    """DALTON-HOOK(data-jobs): PUT /users/me/preferences rejects any add/modify/delete of `data:*` in dalton_notify_routes with 400."""
+    stored = {
+        "dalton_notify_targets": ["feishu:user:ou_me_1", "feishu:user:ou_me_2"],
+        "dalton_notify_routes": stored_routes,
+    }
+    async with _dalton_prefs_endpoint(stored_model_preference=stored) as upsert:
+        resp = await client.put(
+            "/api/v1/users/me/preferences",
+            json={"model_preference": {"dalton_notify_routes": patch_routes}},
+        )
+
+    assert resp.status_code == 400
+    assert "data:" in resp.json()["detail"]
+    upsert.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_dalton_preferences_allows_non_data_route_edits_and_auto_prunes_data_routes_with_audit(
+    client, monkeypatch: pytest.MonkeyPatch
+):
+    """DALTON-HOOK(data-jobs): editing non-`data:*` routes succeeds, and removing a personal target on the primary admin auto-prunes `data:*` routes and records `auto_prune_target` audit in the same transaction."""
+    from unittest.mock import create_autospec
+    import src.dalton.autonomy.system_jobs as system_jobs_mod
+
+    stored = {
+        "dalton_notify_targets": ["feishu:user:ou_kept", "feishu:user:ou_removed"],
+        "dalton_notify_routes": {
+            "data:cn-leverage-daily": ["feishu:user:ou_removed", "feishu:chat:oc_grp1"],
+            "automation:a-1": ["feishu:user:ou_kept"],
+        },
+    }
+    monkeypatch.setenv("DALTON_PM_USER_IDS", "test-user-123")
+    audit_mock = create_autospec(
+        system_jobs_mod.record_auto_pruned_data_task_routes, return_value=None
+    )
+    monkeypatch.setattr(
+        system_jobs_mod, "record_auto_pruned_data_task_routes", audit_mock
+    )
+
+    # 1) Updating a non-`data:*` route (plus unchanged `data:*` pass-through) succeeds without triggering auto-prune
+    async with _dalton_prefs_endpoint(stored_model_preference=stored) as upsert:
+        resp_other = await client.put(
+            "/api/v1/users/me/preferences",
+            json={
+                "model_preference": {
+                    "dalton_notify_routes": {
+                        "data:cn-leverage-daily": [
+                            "feishu:user:ou_removed",
+                            "feishu:chat:oc_grp1",
+                        ],
+                        "automation:a-1": ["feishu:user:ou_kept", "feishu:user:ou_removed"],
+                    }
+                }
+            },
+        )
+    assert resp_other.status_code == 200
+    upsert.assert_awaited_once()
+    audit_mock.assert_not_awaited()
+
+    # 2) Removing personal target `feishu:user:ou_removed` auto-prunes `data:cn-leverage-daily` and writes audit in-tx
+    async with _dalton_prefs_endpoint(stored_model_preference=stored) as upsert:
+        resp_prune = await client.put(
+            "/api/v1/users/me/preferences",
+            json={
+                "model_preference": {
+                    "dalton_notify_targets": ["feishu:user:ou_kept"],
+                }
+            },
+        )
+    assert resp_prune.status_code == 200
+    upsert.assert_awaited_once()
+    saved_mp = upsert.await_args.kwargs["model_preference"]
+    assert saved_mp["dalton_notify_routes"]["data:cn-leverage-daily"] == [
+        "feishu:chat:oc_grp1"
+    ]
+    audit_mock.assert_awaited_once()
+    assert audit_mock.await_args.kwargs["actor_user_id"] == "test-user-123"
+    assert audit_mock.await_args.kwargs["pruned_routes"] == {
+        "data:cn-leverage-daily": (
+            ["feishu:user:ou_removed", "feishu:chat:oc_grp1"],
+            ["feishu:chat:oc_grp1"],
+        )
+    }
+
+    # 3) DALTON-HOOK(data-jobs): if another writer updates `data:*`
+    # between the unlocked read (`read_before_lock`) and `db_lock_user_preferences`
+    # (`stored`), the comparison uses the locked row and rejects the stale pass-through.
+    stale_before_lock = {
+        "dalton_notify_targets": ["feishu:user:ou_kept", "feishu:user:ou_removed"],
+        "dalton_notify_routes": {
+            "data:cn-leverage-daily": ["feishu:user:ou_kept"],
+            "automation:a-1": ["feishu:user:ou_kept"],
+        },
+    }
+    async with _dalton_prefs_endpoint(
+        stored_model_preference=stored, read_before_lock=stale_before_lock
+    ) as upsert_stale:
+        resp_stale = await client.put(
+            "/api/v1/users/me/preferences",
+            json={
+                "model_preference": {
+                    "dalton_notify_routes": {
+                        "data:cn-leverage-daily": ["feishu:user:ou_kept"],
+                        "automation:a-1": ["feishu:user:ou_kept", "feishu:user:ou_removed"],
+                    }
+                }
+            },
+        )
+    assert resp_stale.status_code == 400
+    upsert_stale.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_delete_preferences_preserves_data_task_routes_for_primary_admin_only(
+    client, monkeypatch: pytest.MonkeyPatch
+):
+    """DALTON-HOOK(data-jobs): DELETE /users/me/preferences preserves all `dalton_notify*` keys in place when the caller is the primary admin (without writing audit or bumping version) and executes check + write/delete in the same transaction and lock; other users delete the row normally."""
+    from unittest.mock import create_autospec
+    import src.dalton.access_tiers as access_tiers_mod
+    import src.dalton.autonomy.system_jobs as system_jobs_mod
+    import src.dalton.notify.groups as groups_mod
+    import src.server.app.users as users_mod
+    import src.server.database.user as user_db_mod
+
+    monkeypatch.setenv("DALTON_PM_USER_IDS", "test-user-123")
+    audit_mock = create_autospec(
+        system_jobs_mod.record_auto_pruned_data_task_routes, return_value=None
+    )
+    monkeypatch.setattr(
+        system_jobs_mod, "record_auto_pruned_data_task_routes", audit_mock
+    )
+
+    locked_with_notify = {
+        "model_preference": {
+            "preferred_model": "gpt-5",
+            "dalton_notify_enabled": True,
+            "dalton_notify_targets": ["feishu:user:ou_me_1"],
+            "dalton_notify_target_labels": {"feishu:user:ou_me_1": "我本人"},
+            "dalton_notify_overrides": {"Morning Macro Digest": False},
+            "dalton_notify_routes": {
+                "data:cn-leverage-daily": ["feishu:chat:oc_grp1"],
+                "automation:a-1": ["feishu:user:ou_me_1"],
+            },
+            "dalton_notify_extra_flag": "kept",
+        },
+        "risk_preference": {"risk_level": "moderate"},
+        "investment_preference": {"markets": ["us"]},
+        "agent_preference": {"tone": "terse"},
+        "other_preference": {"search_provider": "tavily"},
+    }
+    get_user_mock = create_autospec(users_mod.db_get_user, return_value=_user())
+    lock_prefs_mock = create_autospec(
+        user_db_mod.lock_user_preferences, return_value=locked_with_notify
+    )
+    upsert_mock = create_autospec(
+        users_mod.upsert_user_preferences, return_value=_prefs()
+    )
+    delete_mock = create_autospec(
+        users_mod.db_delete_user_preferences, return_value=True
+    )
+    update_user_mock = create_autospec(
+        users_mod.db_update_user, return_value=_user()
+    )
+
+    with (
+        patch.object(users_mod, "db_get_user", new=get_user_mock),
+        patch.object(users_mod, "db_lock_user_preferences", new=lock_prefs_mock),
+        patch.object(users_mod, "upsert_user_preferences", new=upsert_mock),
+        patch.object(users_mod, "db_delete_user_preferences", new=delete_mock),
+        patch.object(users_mod, "db_update_user", new=update_user_mock),
+    ):
+        resp = await client.delete("/api/v1/users/me/preferences")
+
+    assert resp.status_code == 200
+    lock_prefs_mock.assert_awaited_once()
+    upsert_mock.assert_awaited_once()
+    assert (
+        upsert_mock.await_args.kwargs["conn"]
+        is lock_prefs_mock.await_args.kwargs["conn"]
+    )
+    assert upsert_mock.await_args.kwargs["conn"] is not None
+    assert upsert_mock.await_args.kwargs["replace"] is True
+    assert upsert_mock.await_args.kwargs["risk_preference"] == {}
+    assert upsert_mock.await_args.kwargs["investment_preference"] == {}
+    assert upsert_mock.await_args.kwargs["agent_preference"] == {}
+    assert upsert_mock.await_args.kwargs["other_preference"] == {}
+    assert upsert_mock.await_args.kwargs["model_preference"] == {
+        "dalton_notify_enabled": True,
+        "dalton_notify_targets": ["feishu:user:ou_me_1"],
+        "dalton_notify_target_labels": {"feishu:user:ou_me_1": "我本人"},
+        "dalton_notify_overrides": {"Morning Macro Digest": False},
+        "dalton_notify_routes": {
+            "data:cn-leverage-daily": ["feishu:chat:oc_grp1"],
+            "automation:a-1": ["feishu:user:ou_me_1"],
+        },
+        "dalton_notify_extra_flag": "kept",
+    }
+    delete_mock.assert_not_awaited()
+    audit_mock.assert_not_awaited()
+
+    # Primary admin with NO `dalton_notify*` keys deletes the row in the same
+    # transaction and lock (passing the exact same `conn` to `db_delete_user_preferences`).
+    locked_without_notify = {
+        "model_preference": {"preferred_model": "gpt-5"},
+        "risk_preference": {"risk_level": "moderate"},
+        "other_preference": {},
+    }
+    lock_prefs_empty_mock = create_autospec(
+        user_db_mod.lock_user_preferences, return_value=locked_without_notify
+    )
+    upsert_mock.reset_mock()
+    delete_mock.reset_mock()
+    with (
+        patch.object(users_mod, "db_get_user", new=get_user_mock),
+        patch.object(users_mod, "db_lock_user_preferences", new=lock_prefs_empty_mock),
+        patch.object(users_mod, "upsert_user_preferences", new=upsert_mock),
+        patch.object(users_mod, "db_delete_user_preferences", new=delete_mock),
+        patch.object(users_mod, "db_update_user", new=update_user_mock),
+    ):
+        resp_empty_pm = await client.delete("/api/v1/users/me/preferences")
+
+    assert resp_empty_pm.status_code == 200
+    lock_prefs_empty_mock.assert_awaited_once()
+    delete_mock.assert_awaited_once()
+    assert (
+        delete_mock.await_args.kwargs["conn"]
+        is lock_prefs_empty_mock.await_args.kwargs["conn"]
+    )
+    assert delete_mock.await_args.kwargs["conn"] is not None
+    upsert_mock.assert_not_awaited()
+    audit_mock.assert_not_awaited()
+
+    # Non-primary-admin user deletes preferences row normally
+    monkeypatch.setenv("DALTON_PM_USER_IDS", "other-primary-admin")
+    upsert_mock.reset_mock()
+    delete_mock.reset_mock()
+    with (
+        patch.object(users_mod, "db_get_user", new=get_user_mock),
+        patch.object(users_mod, "db_lock_user_preferences", new=lock_prefs_mock),
+        patch.object(users_mod, "upsert_user_preferences", new=upsert_mock),
+        patch.object(users_mod, "db_delete_user_preferences", new=delete_mock),
+        patch.object(users_mod, "db_update_user", new=update_user_mock),
+    ):
+        resp_other = await client.delete("/api/v1/users/me/preferences")
+
+    assert resp_other.status_code == 200
+    delete_mock.assert_awaited_once_with("test-user-123")
+    upsert_mock.assert_not_awaited()
+    audit_mock.assert_not_awaited()
+
+    # PUT /users/me/preferences with a Feishu group route fetches the group list
+    # BEFORE acquiring the profile lock (`db_lock_user_preferences`).
+    call_order: list[str] = []
+
+    async def _discover_before_lock() -> list[dict[str, str]]:
+        call_order.append("discover_feishu_notify_groups")
+        return [{"chat_id": "oc_grp1", "name": "投研群"}]
+
+    async def _lock_after_discover(user_id: str, conn=None):
+        call_order.append("db_lock_user_preferences")
+        return {**_prefs(), "model_preference": {"dalton_notify_routes": {}}}
+
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(access_tiers_mod.get_user_tier, return_value="admin"),
+    )
+    discover_mock = create_autospec(
+        groups_mod.discover_feishu_notify_groups,
+        side_effect=_discover_before_lock,
+    )
+    monkeypatch.setattr(
+        groups_mod,
+        "discover_feishu_notify_groups",
+        discover_mock,
+    )
+    with (
+        patch.object(users_mod, "db_get_user", new=get_user_mock),
+        patch.object(
+            users_mod,
+            "db_get_user_preferences",
+            new=create_autospec(
+                users_mod.db_get_user_preferences,
+                return_value={**_prefs(), "model_preference": {"dalton_notify_routes": {}}},
+            ),
+        ),
+        patch.object(
+            users_mod,
+            "db_lock_user_preferences",
+            new=create_autospec(
+                user_db_mod.lock_user_preferences,
+                side_effect=_lock_after_discover,
+            ),
+        ),
+        patch.object(users_mod, "upsert_user_preferences", new=upsert_mock),
+        patch.object(
+            users_mod,
+            "maybe_complete_onboarding",
+            new=create_autospec(users_mod.maybe_complete_onboarding, return_value=None),
+        ),
+    ):
+        resp_put_grp = await client.put(
+            "/api/v1/users/me/preferences",
+            json={
+                "model_preference": {
+                    "dalton_notify_routes": {
+                        "automation:a-1": ["feishu:chat:oc_grp1"]
+                    }
+                }
+            },
+        )
+    assert resp_put_grp.status_code == 200
+    assert call_order == [
+        "discover_feishu_notify_groups",
+        "db_lock_user_preferences",
+    ]
+
+    # Bridge unavailable: pure deletion ([oc_grp1, oc_grp2] -> [oc_grp1]) and
+    # unchanged keep ([oc_grp1] -> [oc_grp1]) both succeed without discovery;
+    # adding a new group returns 503.
+    call_order.clear()
+    stored_two_groups = {
+        **_prefs(),
+        "model_preference": {
+            "dalton_notify_routes": {
+                "automation:a-1": ["feishu:chat:oc_grp1", "feishu:chat:oc_grp2"]
+            }
+        },
+    }
+
+    async def _discover_down() -> list[dict[str, str]]:
+        call_order.append("discover_feishu_notify_groups")
+        raise groups_mod.FeishuGroupsUnavailable("bridge down")
+
+    discover_mock.side_effect = _discover_down
+    with (
+        patch.object(users_mod, "db_get_user", new=get_user_mock),
+        patch.object(
+            users_mod,
+            "db_get_user_preferences",
+            new=create_autospec(
+                users_mod.db_get_user_preferences,
+                return_value=stored_two_groups,
+            ),
+        ),
+        patch.object(
+            users_mod,
+            "db_lock_user_preferences",
+            new=create_autospec(
+                user_db_mod.lock_user_preferences,
+                return_value=stored_two_groups,
+            ),
+        ),
+        patch.object(users_mod, "upsert_user_preferences", new=upsert_mock),
+        patch.object(
+            users_mod,
+            "maybe_complete_onboarding",
+            new=create_autospec(users_mod.maybe_complete_onboarding, return_value=None),
+        ),
+    ):
+        resp_put_del = await client.put(
+            "/api/v1/users/me/preferences",
+            json={
+                "model_preference": {
+                    "dalton_notify_routes": {
+                        "automation:a-1": ["feishu:chat:oc_grp1"]
+                    }
+                }
+            },
+        )
+        assert resp_put_del.status_code == 200
+        assert call_order == []
+
+        resp_put_keep = await client.put(
+            "/api/v1/users/me/preferences",
+            json={
+                "model_preference": {
+                    "dalton_notify_routes": {
+                        "automation:a-1": [
+                            "feishu:chat:oc_grp1",
+                            "feishu:chat:oc_grp2",
+                        ]
+                    }
+                }
+            },
+        )
+        assert resp_put_keep.status_code == 200
+        assert call_order == []
+
+        resp_put_503 = await client.put(
+            "/api/v1/users/me/preferences",
+            json={
+                "model_preference": {
+                    "dalton_notify_routes": {
+                        "automation:a-1": [
+                            "feishu:chat:oc_grp1",
+                            "feishu:chat:oc_new",
+                        ]
+                    }
+                }
+            },
+        )
+        assert resp_put_503.status_code == 503
+        assert call_order == ["discover_feishu_notify_groups"]
+
+    # Stale pre-lock routes (db_get_user_preferences sees [oc_grp1], but
+    # db_lock_user_preferences sees {}) triggers one redo outside the lock and succeeds.
+    call_order.clear()
+    discover_mock.side_effect = _discover_before_lock
+    with (
+        patch.object(users_mod, "db_get_user", new=get_user_mock),
+        patch.object(
+            users_mod,
+            "db_get_user_preferences",
+            new=create_autospec(
+                users_mod.db_get_user_preferences,
+                return_value={
+                    **_prefs(),
+                    "model_preference": {
+                        "dalton_notify_routes": {
+                            "automation:a-1": ["feishu:chat:oc_grp1"]
+                        }
+                    },
+                },
+            ),
+        ),
+        patch.object(
+            users_mod,
+            "db_lock_user_preferences",
+            new=create_autospec(
+                user_db_mod.lock_user_preferences,
+                side_effect=_lock_after_discover,
+            ),
+        ),
+        patch.object(users_mod, "upsert_user_preferences", new=upsert_mock),
+        patch.object(
+            users_mod,
+            "maybe_complete_onboarding",
+            new=create_autospec(users_mod.maybe_complete_onboarding, return_value=None),
+        ),
+    ):
+        resp_put_redo = await client.put(
+            "/api/v1/users/me/preferences",
+            json={
+                "model_preference": {
+                    "dalton_notify_routes": {
+                        "automation:a-1": ["feishu:chat:oc_grp1"]
+                    }
+                }
+            },
+        )
+    assert resp_put_redo.status_code == 200
+    assert call_order == [
+        "db_lock_user_preferences",
+        "discover_feishu_notify_groups",
+        "db_lock_user_preferences",
+    ]
+
+    # Still inconsistent on the redo -> 409
+    call_order.clear()
+    lock_attempt = 0
+
+    async def _shifting_lock(user_id: str, conn=None):
+        nonlocal lock_attempt
+        _ = (user_id, conn)
+        lock_attempt += 1
+        call_order.append("db_lock_user_preferences")
+        if lock_attempt == 1:
+            return {**_prefs(), "model_preference": {"dalton_notify_routes": {}}}
+        return {
+            **_prefs(),
+            "model_preference": {
+                "dalton_notify_routes": {
+                    "automation:a-2": ["feishu:chat:oc_grp1"]
+                }
+            },
+        }
+
+    with (
+        patch.object(users_mod, "db_get_user", new=get_user_mock),
+        patch.object(
+            users_mod,
+            "db_get_user_preferences",
+            new=create_autospec(
+                users_mod.db_get_user_preferences,
+                return_value={
+                    **_prefs(),
+                    "model_preference": {
+                        "dalton_notify_routes": {
+                            "automation:a-1": ["feishu:chat:oc_grp1"]
+                        }
+                    },
+                },
+            ),
+        ),
+        patch.object(
+            users_mod,
+            "db_lock_user_preferences",
+            new=create_autospec(
+                user_db_mod.lock_user_preferences,
+                side_effect=_shifting_lock,
+            ),
+        ),
+        patch.object(users_mod, "upsert_user_preferences", new=upsert_mock),
+        patch.object(
+            users_mod,
+            "maybe_complete_onboarding",
+            new=create_autospec(users_mod.maybe_complete_onboarding, return_value=None),
+        ),
+    ):
+        resp_put_409 = await client.put(
+            "/api/v1/users/me/preferences",
+            json={
+                "model_preference": {
+                    "dalton_notify_routes": {
+                        "automation:a-1": ["feishu:chat:oc_grp1"]
+                    }
+                }
+            },
+        )
+    assert resp_put_409.status_code == 409
+    assert resp_put_409.json()["detail"] == "配置刚被其他人修改，请重试"
 
 
 # PUT /users/me/preferences: the structured profile

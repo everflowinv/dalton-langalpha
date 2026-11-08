@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import time
 from contextlib import ExitStack
-from datetime import UTC, datetime, timedelta
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import create_autospec, patch
 

@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import create_autospec
+from uuid import UUID
 
 import pytest
 from fastapi import FastAPI
@@ -341,7 +342,7 @@ async def test_manifest_includes_four_scopes_and_derives_statuses(
     assert manifest["ok"] is True
     jobs = manifest["jobs"]
     scopes_present = {j["scope"] for j in jobs}
-    assert scopes_present == {"company", "home", "host", "ops"}
+    assert scopes_present == {"company", "home", "host", "ops", "data"}
 
     required_fields = {
         "key",
@@ -2571,6 +2572,969 @@ async def test_archive_disconnects_only_owned_builtin_mcp_registry_and_archive_d
     assert count_file.read_text() == "1"
     assert "retry skipped: archive was switched off" in res_off.stdout
     assert json.loads(status_file.read_text(encoding="utf-8"))["exit_code"] == 3
+
+
+class _InMemoryDataTaskStore:
+    """In-memory ``dalton_data_task_defs`` + ``dalton_data_task_runs`` + ``user_preferences`` store wired with ``create_autospec``."""
+
+    def __init__(self) -> None:
+        from psycopg import AsyncCursor
+
+        self.defs: dict[str, dict[str, Any]] = {}
+        self.runs: list[dict[str, Any]] = []
+        self.user_model_prefs: dict[str, dict[str, Any]] = {
+            USER_ID: {
+                "dalton_notify_targets": [
+                    "feishu:user:ou_admin1",
+                    "feishu:user:ou_admin2",
+                    "feishu:user:ou_removed",
+                    "feishu:user:ou_kept",
+                ]
+            }
+        }
+        self._tx_lock = asyncio.Lock()
+        self.conn = create_autospec(AsyncConnection, instance=True)
+        self._cursor_cls = AsyncCursor
+
+        @asynccontextmanager
+        async def _tx_cm(*args: Any, **kwargs: Any):
+            async with self._tx_lock:
+                yield self.conn
+
+        self.conn.transaction.side_effect = _tx_cm
+
+        @asynccontextmanager
+        async def _cursor_cm(*args: Any, **kwargs: Any):
+            cur = create_autospec(self._cursor_cls, instance=True)
+            last_one: dict[str, Any] = {"val": None}
+            last_all: dict[str, list[Any]] = {"val": []}
+
+            async def _execute(query: Any, params: Any = None, **kw: Any) -> None:
+                q = " ".join(str(query).split())
+                p = list(params) if params is not None else []
+                last_one["val"] = None
+                last_all["val"] = []
+
+                if "FROM dalton_data_task_defs WHERE job_key =" in q:
+                    jk = str(p[0])
+                    row = self.defs.get(jk)
+                    last_one["val"] = dict(row) if row is not None else None
+                    return
+
+                if "FROM dalton_data_task_defs ORDER BY" in q:
+                    last_all["val"] = [dict(r) for r in self.defs.values()]
+                    return
+
+                if "INSERT INTO dalton_data_task_defs" in q:
+                    jk = str(p[0])
+                    if jk not in self.defs:
+                        audit_raw = getattr(p[15], "obj", p[15])
+                        self.defs[jk] = {
+                            "job_key": jk,
+                            "task_code": p[1],
+                            "title": p[2],
+                            "batch_no": int(p[3]),
+                            "runner": p[4],
+                            "cron_expr": p[5],
+                            "timezone": p[6],
+                            "timeout_seconds": p[7],
+                            "no_output_timeout_seconds": p[8],
+                            "command_argv": getattr(p[9], "obj", p[9]),
+                            "workdir": p[10],
+                            "required_secrets": getattr(p[11], "obj", p[11]),
+                            "cos_mode": p[12],
+                            "notify_enabled": bool(p[13]),
+                            "enabled": bool(p[14]),
+                            "paused_by_user": False,
+                            "consecutive_failures": 0,
+                            "config_version": 1,
+                            "active_version": 1,
+                            "updated_by": None,
+                            "audit_history": [dict(x) for x in audit_raw],
+                            "updated_at": "2026-11-08T00:00:00+00:00",
+                        }
+                    return
+
+                if "UPDATE dalton_data_task_defs" in q and "paused_by_user =" in q:
+                    enabled_val = bool(p[0])
+                    paused_val = bool(p[1])
+                    cfg_ver = int(p[2])
+                    act_ver = int(p[3])
+                    upd_by = p[4]
+                    hist_val = getattr(p[5], "obj", p[5])
+                    jk = str(p[6])
+                    self.defs[jk].update(
+                        {
+                            "enabled": enabled_val,
+                            "paused_by_user": paused_val,
+                            "config_version": cfg_ver,
+                            "active_version": act_ver,
+                            "updated_by": upd_by,
+                            "audit_history": [dict(x) for x in hist_val],
+                        }
+                    )
+                    return
+
+                if "UPDATE dalton_data_task_defs" in q and "paused_by_user =" not in q:
+                    cfg_ver = int(p[0])
+                    act_ver = int(p[1])
+                    upd_by = p[2]
+                    hist_val = getattr(p[3], "obj", p[3])
+                    jk = str(p[4])
+                    self.defs[jk].update(
+                        {
+                            "config_version": cfg_ver,
+                            "active_version": act_ver,
+                            "updated_by": upd_by,
+                            "audit_history": [dict(x) for x in hist_val],
+                        }
+                    )
+                    return
+
+                if "UPDATE dalton_data_task_runs SET status = 'cancelled'" in q:
+                    jk = str(p[0])
+                    for r in self.runs:
+                        if r["job_key"] == jk and r["status"] == "queued":
+                            r["status"] = "cancelled"
+                    return
+
+                if "INSERT INTO dalton_data_task_runs" in q:
+                    assert "run_id" in q, "INSERT INTO dalton_data_task_runs must explicitly provide run_id"
+                    run_id = str(UUID(str(p[0])))
+                    jk = str(p[1])
+                    actor_uid = str(p[2])
+                    slot_utc = p[3]
+                    deadline_utc = p[4]
+                    existing_q = next(
+                        (r for r in self.runs if r["job_key"] == jk and r["status"] == "queued"),
+                        None,
+                    )
+                    if existing_q is not None:
+                        last_one["val"] = None
+                        return
+                    row = {
+                        "run_id": run_id,
+                        "job_key": jk,
+                        "trigger_source": "manual",
+                        "triggered_by_user_id": actor_uid,
+                        "scheduled_slot_utc": slot_utc,
+                        "deadline_utc": deadline_utc,
+                        "status": "queued",
+                        "exit_code": None,
+                        "failure_reason": None,
+                        "started_at": None,
+                        "completed_at": None,
+                        "created_at": slot_utc,
+                    }
+                    self.runs.append(row)
+                    last_one["val"] = {"run_id": run_id}
+                    return
+
+                if "SELECT run_id FROM dalton_data_task_runs WHERE job_key = %s AND status = 'queued'" in q:
+                    jk = str(p[0])
+                    existing_q = next(
+                        (r for r in reversed(self.runs) if r["job_key"] == jk and r["status"] == "queued"),
+                        None,
+                    )
+                    last_one["val"] = {"run_id": existing_q["run_id"]} if existing_q else None
+                    return
+
+                if "FROM dalton_data_task_runs WHERE job_key = %s ORDER BY" in q:
+                    jk = str(p[0])
+                    matching = [r for r in self.runs if r["job_key"] == jk]
+                    last_one["val"] = dict(matching[-1]) if matching else None
+                    return
+
+                if "SELECT DISTINCT ON (job_key)" in q and "FROM dalton_data_task_runs" in q:
+                    latest_by_jk: dict[str, dict[str, Any]] = {}
+                    for r in self.runs:
+                        latest_by_jk[r["job_key"]] = dict(r)
+                    last_all["val"] = list(latest_by_jk.values())
+                    return
+
+                if "SELECT model_preference FROM user_preferences WHERE user_id = %s" in q:
+                    uid = str(p[0])
+                    mp = self.user_model_prefs.get(uid)
+                    last_one["val"] = {"model_preference": dict(mp)} if mp is not None else None
+                    return
+
+            cur.execute.side_effect = _execute
+            cur.fetchone.side_effect = lambda: last_one["val"]
+            cur.fetchall.side_effect = lambda: list(last_all["val"])
+            yield cur
+
+        self.conn.cursor.side_effect = _cursor_cm
+
+    def wire(self, monkeypatch: pytest.MonkeyPatch, tier_by_user: dict[str, str]) -> None:
+        from src.dalton import access_tiers as access_tiers_mod
+        import src.dalton.app.router as router_mod
+
+        @asynccontextmanager
+        async def _get_db_conn(conn: Any = None):
+            yield conn if conn is not None else self.conn
+
+        monkeypatch.setattr(
+            system_jobs_mod,
+            "get_db_connection",
+            create_autospec(system_jobs_mod.get_db_connection, side_effect=_get_db_conn),
+        )
+
+        async def _fake_get_tier(user_id: str | None) -> str:
+            uid = str(user_id or "").strip()
+            return tier_by_user.get(uid, "external")
+
+        mock_get_tier = create_autospec(access_tiers_mod.get_user_tier, side_effect=_fake_get_tier)
+        monkeypatch.setattr(access_tiers_mod, "get_user_tier", mock_get_tier)
+        monkeypatch.setattr(system_jobs_mod, "get_user_tier", mock_get_tier)
+        monkeypatch.setattr(router_mod, "_require_dalton_enabled", lambda: None)
+
+        async def _fake_lock_prefs(user_id: str, *, conn: Any = None) -> dict[str, Any] | None:
+            mp = self.user_model_prefs.get(user_id)
+            if mp is None:
+                return None
+            return {"user_id": user_id, "model_preference": dict(mp)}
+
+        async def _fake_get_prefs(user_id: str) -> dict[str, Any] | None:
+            mp = self.user_model_prefs.get(user_id)
+            if mp is None:
+                return None
+            return {"user_id": user_id, "model_preference": dict(mp)}
+
+        async def _fake_upsert_prefs(
+            user_id: str,
+            risk_preference: Any = None,
+            investment_preference: Any = None,
+            agent_preference: Any = None,
+            other_preference: Any = None,
+            model_preference: Any = None,
+            replace: bool = False,
+            conn: Any = None,
+        ) -> dict[str, Any]:
+            cur_mp = dict(self.user_model_prefs.get(user_id) or {})
+            if isinstance(model_preference, dict):
+                for k, v in model_preference.items():
+                    if isinstance(v, dict) and isinstance(cur_mp.get(k), dict):
+                        merged_sub = dict(cur_mp[k])
+                        for sk, sv in v.items():
+                            if sv is None:
+                                merged_sub.pop(sk, None)
+                            else:
+                                merged_sub[sk] = sv
+                        cur_mp[k] = merged_sub
+                    elif v is None:
+                        cur_mp.pop(k, None)
+                    else:
+                        cur_mp[k] = v
+            self.user_model_prefs[user_id] = cur_mp
+            return {"user_id": user_id, "model_preference": dict(cur_mp)}
+
+        monkeypatch.setattr(
+            system_jobs_mod,
+            "lock_user_preferences",
+            create_autospec(system_jobs_mod.lock_user_preferences, side_effect=_fake_lock_prefs),
+        )
+        monkeypatch.setattr(
+            system_jobs_mod,
+            "get_user_preferences",
+            create_autospec(system_jobs_mod.get_user_preferences, side_effect=_fake_get_prefs),
+        )
+        monkeypatch.setattr(
+            system_jobs_mod,
+            "upsert_user_preferences",
+            create_autospec(system_jobs_mod.upsert_user_preferences, side_effect=_fake_upsert_prefs),
+        )
+        monkeypatch.setattr(
+            system_jobs_mod,
+            "invalidate_user_prefs_cache",
+            create_autospec(system_jobs_mod.invalidate_user_prefs_cache, return_value=None),
+        )
+        import src.dalton.notify.groups as groups_mod
+
+        monkeypatch.setattr(
+            groups_mod,
+            "discover_feishu_notify_groups",
+            create_autospec(
+                groups_mod.discover_feishu_notify_groups,
+                return_value=[
+                    {"chat_id": "oc_macro_grp", "name": "宏观群"},
+                    {"chat_id": "oc_grp1", "name": "群1"},
+                ],
+            ),
+        )
+
+
+@pytest.mark.asyncio
+async def test_data_jobs_visibility_permissions_http_and_service_and_cos_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify §7.1 items 1, 2, 3, 6, 7:
+    - classify_system_job_key recognizes `data:<job_key>` for the 19 registered tasks and rejects unknown `data:*` keys;
+    - External members cannot see any `data` tasks in `list_system_jobs` and are rejected with 403/PermissionError on both HTTP and service layers;
+    - Internal and admin members see all 19 `data` tasks with `can_toggle`, `can_run_now`, `can_rollback`, and can operate on them with runtime owner resolved to `DALTON_PM_USER_IDS[0]`;
+    - Missing `DALTON_PM_USER_IDS` returns HTTP 503 on `data:*` mutations;
+    - Company/sector analysts in a workspace are blocked on `data:*` in `dalton_system_jobs`, while Chief of Staff with an internal user succeeds.
+    """
+    store = _InMemoryAutomationsStore()
+    _wire_store(monkeypatch, store)
+    data_store = _InMemoryDataTaskStore()
+    tiers = {
+        USER_ID: "admin",
+        "internal-colleague": "internal",
+        "external-guest": "external",
+    }
+    data_store.wire(monkeypatch, tiers)
+
+    monkeypatch.setattr(
+        system_jobs_mod,
+        "_call_host_bridge",
+        create_autospec(system_jobs_mod._call_host_bridge, return_value=(200, {"ok": True, "jobs": []})),
+    )
+
+    # 1) classify_system_job_key handles data:<job_key> before sector: and rejects unknown keys
+    assert system_jobs_mod.classify_system_job_key("data:cn-leverage-daily") == ("data", "cn-leverage-daily")
+    assert system_jobs_mod.classify_system_job_key("DATA:JP-LEVERAGE-DAILY") == ("data", "jp-leverage-daily")
+    with pytest.raises(ValueError, match="未知的数据任务键"):
+        system_jobs_mod.classify_system_job_key("data:nonexistent_task")
+
+    # 2) External member sees NO `data` tasks in `list_system_jobs`
+    ext_list = await system_jobs_mod.list_system_jobs("external-guest")
+    assert ext_list["ok"] is True
+    assert not [j for j in ext_list["jobs"] if j["scope"] == "data"]
+    assert "data" not in ext_list["groups"]
+
+    # Internal member sees all 19 `data` tasks with can_toggle=True, can_run_now=False, can_rollback=False initially
+    int_list = await system_jobs_mod.list_system_jobs("internal-colleague")
+    data_jobs = [j for j in int_list["jobs"] if j["scope"] == "data"]
+    assert len(data_jobs) == 19
+    assert len(int_list["groups"]["data"]) == 19
+    for dj in data_jobs:
+        assert dj["can_toggle"] is True
+        assert dj["can_run_now"] is False
+        assert dj["can_rollback"] is False
+        assert dj["enabled"] is False
+        assert dj["status"] == "off"
+
+    # 3) Service-layer guards reject external members on status, toggle, run_now, and rollback
+    with pytest.raises(PermissionError, match="仅内部成员"):
+        await system_jobs_mod.get_system_job_status("external-guest", "data:cn-leverage-daily")
+    with pytest.raises(PermissionError, match="仅内部成员"):
+        await system_jobs_mod.toggle_system_job("external-guest", "data:cn-leverage-daily", enabled=True)
+    with pytest.raises(PermissionError, match="仅内部成员"):
+        await system_jobs_mod.run_system_job_now("external-guest", "data:cn-leverage-daily")
+    with pytest.raises(PermissionError, match="仅内部成员"):
+        await system_jobs_mod.rollback_data_task_config("external-guest", "cn-leverage-daily")
+
+    # 4) HTTP endpoints: external member gets 403 on toggle, run, and rollback; internal member succeeds
+    app = FastAPI()
+    current_uid = {"uid": "external-guest"}
+    app.dependency_overrides[get_current_user_id] = lambda: current_uid["uid"]
+    app.include_router(dalton_router)
+    http_client = TestClient(app, raise_server_exceptions=False)
+
+    assert (
+        http_client.post(
+            "/api/v1/dalton/system-jobs/data:cn-leverage-daily",
+            json={"enabled": True},
+        ).status_code
+        == 403
+    )
+    assert (
+        http_client.post("/api/v1/dalton/system-jobs/data:cn-leverage-daily/run").status_code
+        == 403
+    )
+    assert (
+        http_client.post("/api/v1/dalton/system-jobs/data:cn-leverage-daily/rollback").status_code
+        == 403
+    )
+
+    # Missing DALTON_PM_USER_IDS returns HTTP 503 for internal member
+    current_uid["uid"] = "internal-colleague"
+    with monkeypatch.context() as mp:
+        mp.setenv("DALTON_PM_USER_IDS", "")
+        resp_503 = http_client.post(
+            "/api/v1/dalton/system-jobs/data:cn-leverage-daily",
+            json={"enabled": True},
+        )
+        assert resp_503.status_code == 503
+        assert "DALTON_PM_USER_IDS" in resp_503.json()["detail"]
+
+    # Non-standard route shorthands (`personal:...`, `group:...`) are rejected with HTTP 400
+    for invalid_route in ("personal:feishu_dm", "group:oc_macro_grp"):
+        resp_bad_route = http_client.post(
+            "/api/v1/dalton/system-jobs/data:cn-leverage-daily",
+            json={"enabled": True, "notify_routes": [invalid_route]},
+        )
+        assert resp_bad_route.status_code == 400
+
+    # Internal member enables task + sets notify_routes -> stored under primary PM USER_ID, actor is internal-colleague
+    resp_ok = http_client.post(
+        "/api/v1/dalton/system-jobs/data:cn-leverage-daily",
+        json={"enabled": True, "notify_routes": ["feishu:user:ou_admin1"]},
+    )
+    assert resp_ok.status_code == 200
+    body_ok = resp_ok.json()
+    assert body_ok["ok"] is True
+    assert body_ok["job"]["enabled"] is True
+    assert body_ok["job"]["can_run_now"] is True
+    assert body_ok["job"]["can_rollback"] is True
+    assert body_ok["job"]["updated_by"] == "internal-colleague"
+    assert (
+        data_store.user_model_prefs[USER_ID]["dalton_notify_routes"]["data:cn-leverage-daily"]
+        == ["feishu:user:ou_admin1"]
+    )
+    assert "internal-colleague" not in data_store.user_model_prefs
+
+    # 5) Chief of Staff tool vs Workspace Analyst tool
+    analyst_sys_tool = {t.name: t for t in build_director_tools(role="analyst")}["dalton_system_jobs"]
+    cos_sys_tool = {t.name: t for t in build_director_tools(role="chief_of_staff")}["dalton_system_jobs"]
+
+    analyst_cfg = {"configurable": {"user_id": "internal-colleague", "workspace_id": WS_NVDA}}
+    out_analyst_data = json.loads(
+        await analyst_sys_tool.ainvoke(
+            {"action": "enable", "key": "data:cn-leverage-daily"},
+            config=analyst_cfg,
+        )
+    )
+    assert out_analyst_data["ok"] is False
+    assert out_analyst_data["error"] == "forbidden_scope"
+
+    ext_cos_cfg = {"configurable": {"user_id": "external-guest", "workspace_id": "home"}}
+    out_ext_cos = json.loads(
+        await cos_sys_tool.ainvoke(
+            {"action": "enable", "key": "data:cn-leverage-daily"},
+            config=ext_cos_cfg,
+        )
+    )
+    assert out_ext_cos["ok"] is False
+    assert out_ext_cos["error"] == "forbidden_internal"
+
+    int_cos_cfg = {"configurable": {"user_id": "internal-colleague", "workspace_id": "home"}}
+    out_int_status = json.loads(
+        await cos_sys_tool.ainvoke(
+            {"action": "status", "key": "data:cn-leverage-daily"},
+            config=int_cos_cfg,
+        )
+    )
+    assert out_int_status["ok"] is True
+    assert out_int_status["job"]["key"] == "data:cn-leverage-daily"
+
+    out_int_run = json.loads(
+        await cos_sys_tool.ainvoke(
+            {"action": "run_now", "key": "data:cn-leverage-daily"},
+            config=int_cos_cfg,
+        )
+    )
+    assert out_int_run["ok"] is True
+    assert out_int_run["status"] == "queued"
+    assert str(UUID(str(out_int_run["run_id"]))) == out_int_run["run_id"]
+
+
+@pytest.mark.asyncio
+async def test_data_jobs_multi_step_rollback_audit_chain_and_run_now_queueing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify §7.1 items 3 & 5:
+    - Initial seed is v1 (`prev_version=None`, `enabled=False`, `notify_routes=[]`);
+    - `run_now` on disabled task returns 400 ("任务已关闭");
+    - 3 sequential updates produce v2 (prev=1), v3 (prev=2), v4 (prev=3) with complete audit entries;
+    - `run_now` on enabled task only inserts a `queued` row with `triggered_by_user_id = actor_user_id` and valid UUID `run_id`;
+    - 3 consecutive rollbacks step v4 -> v3 (writes v5, prev=2, restored_from=3) -> v2 (writes v6, prev=1, restored_from=2) -> v1 (writes v7, prev=None, restored_from=1), restoring both `enabled` and PM's `dalton_notify_routes["data:<job_key>"]`, and cancelling `queued` runs when restored to `enabled=False`;
+    - 4th rollback returns HTTP 400 ("已处于最早配置版本，无法继续回退");
+    - >200 updates do NOT truncate `audit_history`, and rolling back across >200 entries walks all the way back to v1.
+    """
+    store = _InMemoryAutomationsStore()
+    _wire_store(monkeypatch, store)
+    data_store = _InMemoryDataTaskStore()
+    tiers = {
+        USER_ID: "admin",
+        "internal-a": "internal",
+        "internal-b": "internal",
+    }
+    data_store.wire(monkeypatch, tiers)
+
+    app = FastAPI()
+    current_uid = {"uid": "internal-a"}
+    app.dependency_overrides[get_current_user_id] = lambda: current_uid["uid"]
+    app.include_router(dalton_router)
+    http_client = TestClient(app, raise_server_exceptions=False)
+
+    # 1) `run_now` when task is still disabled (v1) -> HTTP 400 "任务已关闭" and 0 runs inserted
+    resp_run_disabled = http_client.post("/api/v1/dalton/system-jobs/data:cn-leverage-daily/run")
+    assert resp_run_disabled.status_code == 400
+    assert "任务已关闭" in resp_run_disabled.json()["detail"]
+    assert len(data_store.runs) == 0
+
+    # Rollback at initial v1 -> HTTP 400 "已处于最早配置版本，无法继续回退"
+    resp_rb_initial = http_client.post("/api/v1/dalton/system-jobs/data:cn-leverage-daily/rollback")
+    assert resp_rb_initial.status_code == 400
+    assert "最早配置版本" in resp_rb_initial.json()["detail"]
+
+    # 2) Update 1 -> v2 (prev=1): enable=True, routes=["feishu:user:ou_admin1"] by internal-a
+    r_v2 = http_client.post(
+        "/api/v1/dalton/system-jobs/data:cn-leverage-daily",
+        json={"enabled": True, "notify_routes": ["feishu:user:ou_admin1"]},
+    )
+    assert r_v2.status_code == 200
+    b_v2 = r_v2.json()
+    assert b_v2["config_version"] == 2
+    assert b_v2["active_version"] == 2
+    assert b_v2["job"]["can_rollback"] is True
+
+    # 3) Update 2 -> v3 (prev=2): routes=["feishu:user:ou_admin1", "feishu:chat:oc_macro_grp"] by internal-b
+    current_uid["uid"] = "internal-b"
+    r_v3 = http_client.post(
+        "/api/v1/dalton/system-jobs/data:cn-leverage-daily",
+        json={"notify_routes": ["feishu:user:ou_admin1", "feishu:chat:oc_macro_grp"]},
+    )
+    assert r_v3.status_code == 200
+    b_v3 = r_v3.json()
+    assert b_v3["config_version"] == 3
+    assert b_v3["active_version"] == 3
+    assert b_v3["job"]["enabled"] is True
+    assert b_v3["job"]["notify_routes"] == ["feishu:user:ou_admin1", "feishu:chat:oc_macro_grp"]
+
+    # 4) Update 3 -> v4 (prev=3): notify_routes=["feishu:user:ou_admin2"] by internal-a
+    current_uid["uid"] = "internal-a"
+    r_v4 = http_client.post(
+        "/api/v1/dalton/system-jobs/data:cn-leverage-daily",
+        json={"notify_routes": ["feishu:user:ou_admin2"]},
+    )
+    assert r_v4.status_code == 200
+    b_v4 = r_v4.json()
+    assert b_v4["config_version"] == 4
+    assert b_v4["active_version"] == 4
+    assert b_v4["job"]["notify_routes"] == ["feishu:user:ou_admin2"]
+
+    # Enqueue a manual run while enabled=True at v4 -> inserts status='queued' with UUID run_id
+    r_run_ok = http_client.post("/api/v1/dalton/system-jobs/data:cn-leverage-daily/run")
+    assert r_run_ok.status_code == 200
+    run_payload = r_run_ok.json()
+    assert run_payload["status"] == "queued"
+    queued_run_id = run_payload["run_id"]
+    assert str(UUID(str(queued_run_id))) == queued_run_id
+    assert len(data_store.runs) == 1
+    assert data_store.runs[0]["run_id"] == queued_run_id
+    assert data_store.runs[0]["status"] == "queued"
+    assert data_store.runs[0]["triggered_by_user_id"] == "internal-a"
+
+    # 5) Rollback 1 (v4 -> v3): writes v5 (prev=2, restored_from=3), task remains enabled=True, queued run stays queued
+    current_uid["uid"] = "internal-b"
+    rb1 = http_client.post("/api/v1/dalton/system-jobs/data:cn-leverage-daily/rollback")
+    assert rb1.status_code == 200
+    rb1_body = rb1.json()
+    assert rb1_body["config_version"] == 5
+    assert rb1_body["active_version"] == 5
+    assert rb1_body["restored_from_version"] == 3
+    assert rb1_body["job"]["enabled"] is True
+    assert rb1_body["job"]["notify_routes"] == ["feishu:user:ou_admin1", "feishu:chat:oc_macro_grp"]
+    assert rb1_body["job"]["can_rollback"] is True
+    assert (
+        data_store.user_model_prefs[USER_ID]["dalton_notify_routes"]["data:cn-leverage-daily"]
+        == ["feishu:user:ou_admin1", "feishu:chat:oc_macro_grp"]
+    )
+    assert data_store.runs[0]["status"] == "queued"
+
+    v5_entry = rb1_body["job"]["audit_history"][-1]
+    assert v5_entry["version"] == 5
+    assert v5_entry["prev_version"] == 2
+    assert v5_entry["restored_from_version"] == 3
+    assert v5_entry["action"] == "rollback"
+    assert v5_entry["actor_user_id"] == "internal-b"
+
+    # 6) Rollback 2 (v3 -> v2): writes v6 (prev=1, restored_from=2)
+    rb2 = http_client.post("/api/v1/dalton/system-jobs/data:cn-leverage-daily/rollback")
+    assert rb2.status_code == 200
+    rb2_body = rb2.json()
+    assert rb2_body["config_version"] == 6
+    assert rb2_body["active_version"] == 6
+    assert rb2_body["restored_from_version"] == 2
+    assert rb2_body["job"]["enabled"] is True
+    assert rb2_body["job"]["notify_routes"] == ["feishu:user:ou_admin1"]
+    assert rb2_body["job"]["can_rollback"] is True
+    v6_entry = rb2_body["job"]["audit_history"][-1]
+    assert v6_entry["version"] == 6
+    assert v6_entry["prev_version"] == 1
+    assert v6_entry["restored_from_version"] == 2
+    assert v6_entry["action"] == "rollback"
+
+    # 7) Rollback 3 (v2 -> v1): writes v7 (prev=None, restored_from=1), restores enabled=False & routes=[], cancels queued run!
+    rb3 = http_client.post("/api/v1/dalton/system-jobs/data:cn-leverage-daily/rollback")
+    assert rb3.status_code == 200
+    rb3_body = rb3.json()
+    assert rb3_body["config_version"] == 7
+    assert rb3_body["active_version"] == 7
+    assert rb3_body["restored_from_version"] == 1
+    assert rb3_body["job"]["enabled"] is False
+    assert rb3_body["job"]["notify_routes"] == []
+    assert rb3_body["job"]["can_rollback"] is False
+    assert rb3_body["job"]["can_run_now"] is False
+    assert data_store.user_model_prefs[USER_ID]["dalton_notify_routes"]["data:cn-leverage-daily"] == []
+    assert data_store.runs[0]["status"] == "cancelled"
+
+    v7_entry = rb3_body["job"]["audit_history"][-1]
+    assert v7_entry["version"] == 7
+    assert v7_entry["prev_version"] is None
+    assert v7_entry["restored_from_version"] == 1
+    assert v7_entry["action"] == "rollback"
+
+    # 8) Rollback 4 -> already at v1 (prev_version is None) -> returns HTTP 400
+    rb4 = http_client.post("/api/v1/dalton/system-jobs/data:cn-leverage-daily/rollback")
+    assert rb4.status_code == 400
+    assert "最早配置版本" in rb4.json()["detail"]
+
+    # 9) >200 updates do NOT truncate `audit_history`; v1 remains at index 0 and full rollback chain reaches v7 (restored_from=1)
+    for step_idx in range(205):
+        await system_jobs_mod.toggle_system_job(
+            USER_ID,
+            "data:cn-leverage-daily",
+            enabled=bool(step_idx % 2 == 0),
+            actor_user_id="internal-a",
+        )
+    full_hist = data_store.defs["cn-leverage-daily"]["audit_history"]
+    assert len(full_hist) == 7 + 205
+    assert full_hist[0]["version"] == 1
+    for _ in range(205):
+        last_rb = await system_jobs_mod.rollback_data_task_config("internal-b", "cn-leverage-daily")
+    assert last_rb["restored_from_version"] == 7
+    assert last_rb["job"]["enabled"] is False
+    assert last_rb["job"]["can_rollback"] is False
+
+
+@pytest.mark.asyncio
+async def test_data_jobs_notify_route_preference_guard_and_auto_prune_audit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify §7.1 item 4:
+    - Direct add/modify/delete of `data:*` in `dalton_notify_routes` via `apply_dalton_notify_preference_patch` raises HTTP 400;
+    - Modifying non-`data:*` keys is unaffected;
+    - When the primary admin (`USER_ID`) deletes a personal notify target and triggers auto-pruning of `data:<job_key>`, `apply_dalton_notify_preference_patch` writes `action = "auto_prune_target"` and bumps `config_version` / `active_version` in the same transaction.
+    """
+    from fastapi import HTTPException
+    import src.dalton.llm.model_prefs as model_prefs_mod
+    import src.server.database.pool as pool_mod
+    import src.server.database.user as user_db_mod
+
+    store = _InMemoryAutomationsStore()
+    _wire_store(monkeypatch, store)
+    data_store = _InMemoryDataTaskStore()
+    tiers = {USER_ID: "admin", "internal-a": "internal"}
+    data_store.wire(monkeypatch, tiers)
+
+    # First configure `data:cn-leverage-daily` through the official toggle API -> v2
+    res_toggle = await system_jobs_mod.toggle_system_job(
+        USER_ID,
+        "data:cn-leverage-daily",
+        enabled=True,
+        notify_routes=["feishu:user:ou_removed", "feishu:chat:oc_grp1"],
+        actor_user_id="internal-a",
+    )
+    assert res_toggle["config_version"] == 2
+    assert res_toggle["active_version"] == 2
+
+    # Seed primary admin's personal targets and another automation route in `data_store`
+    data_store.user_model_prefs[USER_ID]["dalton_notify_targets"] = [
+        "feishu:user:ou_kept",
+        "feishu:user:ou_removed",
+    ]
+    data_store.user_model_prefs[USER_ID]["dalton_notify_routes"]["automation:a-1"] = [
+        "feishu:user:ou_kept"
+    ]
+
+    async def _fake_lock_prefs(user_id: str, *, conn: Any = None) -> dict[str, Any]:
+        _ = conn
+        return {
+            "user_id": user_id,
+            "model_preference": json.loads(json.dumps(data_store.user_model_prefs.get(user_id, {}))),
+            "other_preference": {},
+        }
+
+    async def _fake_upsert_prefs(
+        user_id: str,
+        *,
+        model_preference: dict[str, Any] | None = None,
+        conn: Any = None,
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        _ = conn
+        mp = dict(data_store.user_model_prefs.get(user_id, {}))
+        for k, v in (model_preference or {}).items():
+            if v is None:
+                mp.pop(k, None)
+            elif isinstance(v, dict) and isinstance(mp.get(k), dict):
+                merged = dict(mp[k])
+                for sk, sv in v.items():
+                    if sv is None:
+                        merged.pop(sk, None)
+                    else:
+                        merged[sk] = sv
+                mp[k] = merged
+            else:
+                mp[k] = v
+        data_store.user_model_prefs[user_id] = mp
+        return {"user_id": user_id, "model_preference": mp, "other_preference": {}}
+
+    monkeypatch.setattr(
+        user_db_mod,
+        "get_user_preferences",
+        create_autospec(user_db_mod.get_user_preferences, side_effect=_fake_lock_prefs),
+    )
+    monkeypatch.setattr(
+        user_db_mod,
+        "lock_user_preferences",
+        create_autospec(user_db_mod.lock_user_preferences, side_effect=_fake_lock_prefs),
+    )
+    monkeypatch.setattr(
+        user_db_mod,
+        "upsert_user_preferences",
+        create_autospec(user_db_mod.upsert_user_preferences, side_effect=_fake_upsert_prefs),
+    )
+    monkeypatch.setattr(
+        user_db_mod,
+        "invalidate_user_prefs_cache",
+        create_autospec(user_db_mod.invalidate_user_prefs_cache, return_value=None),
+    )
+    monkeypatch.setattr(
+        user_db_mod,
+        "invalidate_user_profile_cache",
+        create_autospec(user_db_mod.invalidate_user_profile_cache, return_value=None),
+    )
+    monkeypatch.setattr(
+        pool_mod,
+        "get_db_connection",
+        system_jobs_mod.get_db_connection,
+    )
+
+    # 1) Direct modify/add/delete of `data:*` in `dalton_notify_routes` raises HTTP 400
+    for bad_routes in (
+        {"data:cn-leverage-daily": ["feishu:user:ou_kept"]},
+        {"data:jp-leverage-daily": ["feishu:user:ou_kept"]},
+        {"data:cn-leverage-daily": None},
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await model_prefs_mod.apply_dalton_notify_preference_patch(
+                USER_ID,
+                {"dalton_notify_routes": bad_routes},
+            )
+        assert exc_info.value.status_code == 400
+        assert "data:" in str(exc_info.value.detail)
+
+    # 2) Modifying non-`data:*` route succeeds and does NOT change `cn-leverage-daily` version
+    await model_prefs_mod.apply_dalton_notify_preference_patch(
+        USER_ID,
+        {"dalton_notify_routes": {"automation:a-1": ["feishu:user:ou_kept", "feishu:user:ou_removed"]}},
+    )
+    assert data_store.defs["cn-leverage-daily"]["config_version"] == 2
+
+    # 3) Removing `feishu:user:ou_removed` from `dalton_notify_targets` auto-prunes `data:cn-leverage-daily`
+    # and writes an `auto_prune_target` audit entry (v3, prev=2) in the same transaction
+    await model_prefs_mod.apply_dalton_notify_preference_patch(
+        USER_ID,
+        {"dalton_notify_targets": ["feishu:user:ou_kept"]},
+    )
+    assert data_store.user_model_prefs[USER_ID]["dalton_notify_routes"]["data:cn-leverage-daily"] == [
+        "feishu:chat:oc_grp1"
+    ]
+    def_row = data_store.defs["cn-leverage-daily"]
+    assert def_row["config_version"] == 3
+    assert def_row["active_version"] == 3
+    last_audit = def_row["audit_history"][-1]
+    assert last_audit["version"] == 3
+    assert last_audit["prev_version"] == 2
+    assert last_audit["action"] == "auto_prune_target"
+    assert last_audit["actor_user_id"] == USER_ID
+    assert last_audit["changes"] == {
+        "notify_routes": {
+            "old": ["feishu:user:ou_removed", "feishu:chat:oc_grp1"],
+            "new": ["feishu:chat:oc_grp1"],
+        }
+    }
+    assert last_audit["snapshot"] == {
+        "enabled": True,
+        "notify_routes": ["feishu:chat:oc_grp1"],
+    }
+
+    # 4) `add_dalton_personal_notify_target` shrinking `data:*` routes (via `_validate_and_prune_notify_target_refs`)
+    # also writes an `auto_prune_target` audit entry and increments `config_version` / `active_version` in the same transaction
+    data_store.user_model_prefs[USER_ID]["dalton_notify_routes"]["data:cn-leverage-daily"] = [
+        "feishu:user:ou_dangling",
+        "feishu:chat:oc_grp1",
+    ]
+    await model_prefs_mod.add_dalton_personal_notify_target(
+        USER_ID,
+        target="feishu:user:ou_new_person",
+        label="新成员",
+    )
+    assert data_store.user_model_prefs[USER_ID]["dalton_notify_routes"]["data:cn-leverage-daily"] == [
+        "feishu:chat:oc_grp1"
+    ]
+    assert def_row["config_version"] == 4
+    assert def_row["active_version"] == 4
+    add_prune_audit = def_row["audit_history"][-1]
+    assert add_prune_audit["version"] == 4
+    assert add_prune_audit["prev_version"] == 3
+    assert add_prune_audit["action"] == "auto_prune_target"
+    assert add_prune_audit["actor_user_id"] == USER_ID
+    assert add_prune_audit["changes"] == {
+        "notify_routes": {
+            "old": ["feishu:user:ou_dangling", "feishu:chat:oc_grp1"],
+            "new": ["feishu:chat:oc_grp1"],
+        }
+    }
+    assert add_prune_audit["snapshot"] == {
+        "enabled": True,
+        "notify_routes": ["feishu:chat:oc_grp1"],
+    }
+
+    # 5) `toggle_system_job` with a Feishu group route:
+    #    - fetches the group list BEFORE acquiring `lock_user_preferences` only when adding a group;
+    #    - when bridge is unavailable, pure deletion and unchanged keep succeed, while adding a new group returns 503;
+    #    - when pre-lock routes are stale, redoes once outside the lock and succeeds;
+    #    - when still inconsistent on the redo, returns 409.
+    import src.dalton.notify.groups as groups_mod
+
+    order_events: list[str] = []
+
+    async def _discover_spy() -> list[dict[str, str]]:
+        order_events.append("discover_feishu_notify_groups")
+        return [
+            {"chat_id": "oc_grp1", "name": "投研群1"},
+            {"chat_id": "oc_grp2", "name": "投研群2"},
+        ]
+
+    async def _lock_spy(user_id: str, *, conn: Any = None) -> dict[str, Any]:
+        order_events.append("lock_user_preferences")
+        return await _fake_lock_prefs(user_id, conn=conn)
+
+    groups_mod.discover_feishu_notify_groups.side_effect = _discover_spy
+    system_jobs_mod.lock_user_preferences.side_effect = _lock_spy
+    await system_jobs_mod.toggle_system_job(
+        USER_ID,
+        "data:cn-leverage-daily",
+        notify_routes=["feishu:chat:oc_grp1", "feishu:chat:oc_grp2"],
+        actor_user_id="internal-a",
+    )
+    assert order_events == [
+        "discover_feishu_notify_groups",
+        "lock_user_preferences",
+    ]
+
+    # Bridge unavailable: pure deletion ([oc_grp1, oc_grp2] -> [oc_grp1]) and keep ([oc_grp1]) succeed
+    order_events.clear()
+
+    async def _discover_unavailable() -> list[dict[str, str]]:
+        order_events.append("discover_feishu_notify_groups")
+        raise groups_mod.FeishuGroupsUnavailable("bridge down")
+
+    groups_mod.discover_feishu_notify_groups.side_effect = _discover_unavailable
+    res_del = await system_jobs_mod.toggle_system_job(
+        USER_ID,
+        "data:cn-leverage-daily",
+        notify_routes=["feishu:chat:oc_grp1"],
+        actor_user_id="internal-a",
+    )
+    assert res_del["notify_routes"] == ["feishu:chat:oc_grp1"]
+    assert "discover_feishu_notify_groups" not in order_events
+
+    order_events.clear()
+    res_keep = await system_jobs_mod.toggle_system_job(
+        USER_ID,
+        "data:cn-leverage-daily",
+        notify_routes=["feishu:chat:oc_grp1"],
+        actor_user_id="internal-a",
+    )
+    assert res_keep["notify_routes"] == ["feishu:chat:oc_grp1"]
+    assert "discover_feishu_notify_groups" not in order_events
+
+    # Bridge unavailable + adding new group -> 503
+    order_events.clear()
+    with pytest.raises(HTTPException) as exc_503:
+        await system_jobs_mod.toggle_system_job(
+            USER_ID,
+            "data:cn-leverage-daily",
+            notify_routes=["feishu:chat:oc_grp1", "feishu:chat:oc_new"],
+            actor_user_id="internal-a",
+        )
+    assert exc_503.value.status_code == 503
+    assert order_events == [
+        "discover_feishu_notify_groups",
+        "lock_user_preferences",
+    ]
+
+    # Pre-lock routes stale: unlocked get_user_preferences sees [oc_grp1, oc_grp2],
+    # locked sees [oc_grp1] -> attempt 1 rolls back, discovers outside lock, attempt 2 succeeds.
+    order_events.clear()
+    groups_mod.discover_feishu_notify_groups.side_effect = _discover_spy
+
+    async def _stale_get_prefs(user_id: str) -> dict[str, Any]:
+        _ = user_id
+        return {
+            "model_preference": {
+                "dalton_notify_routes": {
+                    "data:cn-leverage-daily": [
+                        "feishu:chat:oc_grp1",
+                        "feishu:chat:oc_grp2",
+                    ]
+                }
+            },
+            "other_preference": {},
+        }
+
+    system_jobs_mod.get_user_preferences.side_effect = _stale_get_prefs
+    res_redo = await system_jobs_mod.toggle_system_job(
+        USER_ID,
+        "data:cn-leverage-daily",
+        notify_routes=["feishu:chat:oc_grp1", "feishu:chat:oc_grp2"],
+        actor_user_id="internal-a",
+    )
+    assert res_redo["notify_routes"] == ["feishu:chat:oc_grp1", "feishu:chat:oc_grp2"]
+    assert order_events == [
+        "lock_user_preferences",
+        "discover_feishu_notify_groups",
+        "lock_user_preferences",
+    ]
+
+    # Still inconsistent on the redo -> 409
+    data_store.user_model_prefs[USER_ID]["dalton_notify_routes"][
+        "data:cn-leverage-daily"
+    ] = ["feishu:chat:oc_grp1"]
+    lock_calls = 0
+
+    async def _shifting_lock_spy(user_id: str, *, conn: Any = None) -> dict[str, Any]:
+        nonlocal lock_calls
+        _ = (user_id, conn)
+        lock_calls += 1
+        order_events.append("lock_user_preferences")
+        if lock_calls == 1:
+            return {
+                "model_preference": {
+                    "dalton_notify_routes": {
+                        "data:cn-leverage-daily": ["feishu:chat:oc_grp1"]
+                    }
+                },
+                "other_preference": {},
+            }
+        return {
+            "model_preference": {
+                "dalton_notify_routes": {"data:cn-leverage-daily": []}
+            },
+            "other_preference": {},
+        }
+
+    order_events.clear()
+    system_jobs_mod.lock_user_preferences.side_effect = _shifting_lock_spy
+    with pytest.raises(HTTPException) as exc_409:
+        await system_jobs_mod.toggle_system_job(
+            USER_ID,
+            "data:cn-leverage-daily",
+            notify_routes=["feishu:chat:oc_grp1", "feishu:chat:oc_grp2"],
+            actor_user_id="internal-a",
+        )
+    assert exc_409.value.status_code == 409
+    assert exc_409.value.detail == "配置刚被其他人修改，请重试"
+
+
+
+
 
 
 

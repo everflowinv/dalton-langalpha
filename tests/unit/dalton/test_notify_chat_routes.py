@@ -48,9 +48,12 @@ from src.dalton.llm.model_prefs import (  # noqa: E402
     DALTON_NOTIFY_ROUTES_KEY,
     DALTON_NOTIFY_TARGET_LABELS_KEY,
     DALTON_NOTIFY_TARGETS_KEY,
+    FEISHU_GROUPS_UNAVAILABLE,
+    FeishuGroupsPrefetchRequired,
     is_dalton_chat_target,
     is_valid_dalton_personal_target,
     normalize_dalton_notify_label,
+    prefetch_feishu_groups_for_route_patch,
     resolve_dalton_notify_target_labels,
     resolve_dalton_notify_routes,
     validate_dalton_model_preferences,
@@ -280,20 +283,34 @@ async def test_route_write_chat_targets_admin_only_and_discovery_checked(
         "get_user_tier",
         create_autospec(get_user_tier, return_value="internal"),
     )
+    bad_submitted = {"task": ["feishu:chat:oc_not_joined"]}
+    prefetched_bad = await prefetch_feishu_groups_for_route_patch("u-pm", bad_submitted)
     with pytest.raises(HTTPException) as unknown:
         await validate_dalton_notify_routes_for_user(
-            "u-pm", {"task": ["feishu:chat:oc_not_joined"]}
+            "u-pm", bad_submitted, discovered_groups=prefetched_bad
         )
     assert unknown.value.status_code == 400
 
-    await validate_dalton_notify_routes_for_user("u-pm", submitted)
+    prefetched_ok = await prefetch_feishu_groups_for_route_patch("u-pm", submitted)
+    await validate_dalton_notify_routes_for_user(
+        "u-pm", submitted, discovered_groups=prefetched_ok
+    )
+
+    # In-lock validator never calls discover_feishu_notify_groups when discovered_groups=None:
+    with pytest.raises(FeishuGroupsPrefetchRequired):
+        await validate_dalton_notify_routes_for_user("u-pm", submitted)
 
     async def _unavailable() -> list[dict[str, str]]:
         raise groups_mod.FeishuGroupsUnavailable("bridge down")
 
     monkeypatch.setattr(groups_mod, "discover_feishu_notify_groups", _unavailable)
+    # Prefetch does NOT raise 503 outside the lock; it records FEISHU_GROUPS_UNAVAILABLE:
+    prefetched_unavail = await prefetch_feishu_groups_for_route_patch("u-pm", submitted)
+    assert prefetched_unavail is FEISHU_GROUPS_UNAVAILABLE
     with pytest.raises(HTTPException) as unavailable:
-        await validate_dalton_notify_routes_for_user("u-pm", submitted)
+        await validate_dalton_notify_routes_for_user(
+            "u-pm", submitted, discovered_groups=prefetched_unavail
+        )
     assert unavailable.value.status_code == 503
 
 
@@ -321,16 +338,20 @@ async def test_route_write_gates_only_groups_added_to_the_route(
         "u-pm", {"task": ["feishu:chat:oc_left_2"]}, stored
     )
 
+    added_sub = {"task": ["feishu:chat:oc_left_2", "feishu:chat:oc_unknown"]}
+    prefetched_added = await prefetch_feishu_groups_for_route_patch("u-pm", added_sub, stored)
     with pytest.raises(HTTPException) as added:
         await validate_dalton_notify_routes_for_user(
-            "u-pm", {"task": ["feishu:chat:oc_left_2", "feishu:chat:oc_unknown"]}, stored
+            "u-pm", added_sub, stored, discovered_groups=prefetched_added
         )
     assert added.value.status_code == 400
 
     # A stored group under one task is still new under another.
+    moved_sub = {"other": ["feishu:chat:oc_left_1"]}
+    prefetched_moved = await prefetch_feishu_groups_for_route_patch("u-pm", moved_sub, stored)
     with pytest.raises(HTTPException) as moved:
         await validate_dalton_notify_routes_for_user(
-            "u-pm", {"other": ["feishu:chat:oc_left_1"]}, stored
+            "u-pm", moved_sub, stored, discovered_groups=prefetched_moved
         )
     assert moved.value.status_code == 400
 
@@ -1397,8 +1418,13 @@ async def test_deleting_a_personal_target_survives_group_discovery_failures(
         create_autospec(get_user_tier, return_value="admin"),
     )
     with pytest.raises(HTTPException) as submitted_gate:
+        submitted_new_routes = {"task-new": ["feishu:chat:oc_gone_group"]}
         await validate_dalton_notify_routes_for_user(
-            "u-pm", {"task-new": ["feishu:chat:oc_gone_group"]}
+            "u-pm",
+            submitted_new_routes,
+            discovered_groups=await prefetch_feishu_groups_for_route_patch(
+                "u-pm", submitted_new_routes
+            ),
         )
     assert submitted_gate.value.status_code == 503
 
@@ -1499,8 +1525,13 @@ async def test_group_notify_permissions_by_user_tier_and_error_fallback(
 
     for allowed_uid in ("u-admin", "u-internal"):
         assert await access_tiers_mod.is_internal_or_admin(allowed_uid) is True
+        submitted_allowed = {"task": ["feishu:chat:oc_group_1"]}
         await validate_dalton_notify_routes_for_user(
-            allowed_uid, {"task": ["feishu:chat:oc_group_1"]}
+            allowed_uid,
+            submitted_allowed,
+            discovered_groups=await prefetch_feishu_groups_for_route_patch(
+                allowed_uid, submitted_allowed
+            ),
         )
         bot_res = await dalton_notify_feishu_bot_endpoint(user_id=allowed_uid)
         assert bot_res == {"ok": True, "app_name": "Everflow 投研"}
@@ -1858,7 +1889,6 @@ async def test_dalton_notify_settings_set_route_confirm_writes_via_shared_valida
     import src.dalton.tools.notify_tools as notify_tools_mod
     from src.dalton.tools.notify_tools import create_notify_tools
     from src.server.database import automation as auto_db
-    from src.server.database import user as user_db
     from src.tools.secretary._commands import hitl_confirm as real_hitl_confirm
 
     monkeypatch.setattr(
@@ -1884,56 +1914,9 @@ async def test_dalton_notify_settings_set_route_confirm_writes_via_shared_valida
         },
         "other_preference": {},
     }
-    monkeypatch.setattr(
-        model_prefs_mod,
-        "get_user_preferences",
-        create_autospec(model_prefs_mod.get_user_preferences, return_value=stored_prefs),
-    )
-    monkeypatch.setattr(
-        user_db,
-        "get_user_preferences",
-        create_autospec(user_db.get_user_preferences, return_value=stored_prefs),
-    )
-    monkeypatch.setattr(
-        user_db,
-        "invalidate_user_prefs_cache",
-        create_autospec(user_db.invalidate_user_prefs_cache, return_value=None),
-    )
-    monkeypatch.setattr(
-        user_db,
-        "invalidate_user_profile_cache",
-        create_autospec(user_db.invalidate_user_profile_cache, return_value=None),
-    )
-
+    # _mock_locked_prefs_db patches model_prefs.get_user_preferences itself.
     upserted_patches: list[dict[str, Any]] = []
-
-    async def _fake_upsert(
-        user_id: str,
-        risk_preference: dict[str, Any] | None = None,
-        investment_preference: dict[str, Any] | None = None,
-        agent_preference: dict[str, Any] | None = None,
-        other_preference: dict[str, Any] | None = None,
-        model_preference: dict[str, Any] | None = None,
-        replace: bool = False,
-        conn: Any = None,
-    ) -> dict[str, Any]:
-        _ = (
-            user_id,
-            risk_preference,
-            investment_preference,
-            agent_preference,
-            other_preference,
-            replace,
-            conn,
-        )
-        upserted_patches.append(dict(model_preference or {}))
-        return {"model_preference": model_preference}
-
-    monkeypatch.setattr(
-        user_db,
-        "upsert_user_preferences",
-        create_autospec(user_db.upsert_user_preferences, side_effect=_fake_upsert),
-    )
+    _mock_locked_prefs_db(monkeypatch, stored_prefs, upserted_patches)
 
     discovered_groups = [{"chat_id": "oc_g1", "name": "半导体投研群"}]
     monkeypatch.setattr(
@@ -3700,6 +3683,202 @@ async def test_hitl_confirm_rerun_from_top_with_stale_token_reports_only_current
         "route_key": "automation:a-rerun-2",
     }
     assert res_resume_set["current_targets"] == ["feishu:user:ou_imposter"]
+
+
+@pytest.mark.asyncio
+async def test_apply_dalton_notify_preference_patch_prefetch_redo_and_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR 0-3 R4: apply_dalton_notify_preference_patch only prefetches on newly
+    added group targets, tolerates bridge outage for delete/keep, redoes once
+    when pre-lock routes were stale, never calls discover_feishu_notify_groups
+    inside the lock, and raises 409 if routes change again on the redo."""
+    from fastapi import HTTPException
+    from src.dalton.llm.model_prefs import apply_dalton_notify_preference_patch
+    from src.server.database import user as user_db
+
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(get_user_tier, return_value="internal"),
+    )
+
+    stored_prefs: dict[str, Any] = {
+        "model_preference": {
+            "dalton_notify_targets": ["feishu:user:ou_me_1"],
+            "dalton_notify_routes": {
+                "automation:a-1": ["feishu:chat:oc_g1", "feishu:chat:oc_g2"]
+            },
+        },
+        "other_preference": {},
+    }
+    upserted: list[dict[str, Any]] = []
+    _mock_locked_prefs_db(monkeypatch, stored_prefs, upserted)
+
+    # 1. Bridge unavailable: pure deletion and unchanged keep both succeed without calling discovery
+    unavailable_spy = create_autospec(
+        groups_mod.discover_feishu_notify_groups,
+        side_effect=groups_mod.FeishuGroupsUnavailable("bridge down"),
+    )
+    monkeypatch.setattr(groups_mod, "discover_feishu_notify_groups", unavailable_spy)
+
+    # Pure deletion: [oc_g1, oc_g2] -> [oc_g1]
+    res_del = await apply_dalton_notify_preference_patch(
+        "u-internal",
+        {"dalton_notify_routes": {"automation:a-1": ["feishu:chat:oc_g1"]}},
+    )
+    assert res_del["model_preference"]["dalton_notify_routes"]["automation:a-1"] == [
+        "feishu:chat:oc_g1"
+    ]
+    assert unavailable_spy.await_count == 0
+
+    # Unchanged keep: [oc_g1] -> [oc_g1]
+    res_keep = await apply_dalton_notify_preference_patch(
+        "u-internal",
+        {"dalton_notify_routes": {"automation:a-1": ["feishu:chat:oc_g1"]}},
+    )
+    assert res_keep["model_preference"]["dalton_notify_routes"]["automation:a-1"] == [
+        "feishu:chat:oc_g1"
+    ]
+    assert unavailable_spy.await_count == 0
+
+    # 2. Bridge unavailable + newly added group -> 503 inside the lock
+    with pytest.raises(HTTPException) as exc_503:
+        await apply_dalton_notify_preference_patch(
+            "u-internal",
+            {
+                "dalton_notify_routes": {
+                    "automation:a-1": ["feishu:chat:oc_g1", "feishu:chat:oc_new"]
+                }
+            },
+        )
+    assert exc_503.value.status_code == 503
+    assert unavailable_spy.await_count == 1
+
+    # 3. Pre-lock routes stale (get_user_preferences sees [oc_g1, oc_g2], but
+    # lock_user_preferences sees [oc_g1]): attempt 1 discovers outside the lock
+    # was skipped, raises FeishuGroupsPrefetchRequired inside the lock, rolls back,
+    # prefetches outside the lock, and succeeds on attempt 2.
+    order_events: list[str] = []
+    in_lock = False
+
+    async def _stale_unlocked_get(user_id: str) -> dict[str, Any]:
+        _ = user_id
+        order_events.append("get_user_preferences")
+        return {
+            "model_preference": {
+                "dalton_notify_targets": ["feishu:user:ou_me_1"],
+                "dalton_notify_routes": {
+                    "automation:a-1": ["feishu:chat:oc_g1", "feishu:chat:oc_g2"]
+                },
+            },
+            "other_preference": {},
+        }
+
+    async def _locked_prefs_consistent(user_id: str, *, conn: Any) -> dict[str, Any]:
+        nonlocal in_lock
+        _ = (user_id, conn)
+        in_lock = True
+        order_events.append("lock_user_preferences")
+        return {
+            "model_preference": {
+                "dalton_notify_targets": ["feishu:user:ou_me_1"],
+                "dalton_notify_routes": {"automation:a-1": ["feishu:chat:oc_g1"]},
+            },
+            "other_preference": {},
+        }
+
+    async def _discover_outside_lock() -> list[dict[str, str]]:
+        assert in_lock is False, "discover_feishu_notify_groups must not run inside the lock"
+        order_events.append("discover_feishu_notify_groups")
+        return [
+            {"chat_id": "oc_g1", "name": "群1"},
+            {"chat_id": "oc_g2", "name": "群2"},
+        ]
+
+    fake_tx = create_autospec(psycopg.AsyncTransaction, instance=True)
+
+    async def _tx_enter() -> Any:
+        return fake_tx
+
+    async def _tx_exit(exc_type: Any, exc: Any, tb: Any) -> bool:
+        nonlocal in_lock
+        _ = (exc_type, exc, tb)
+        in_lock = False
+        return False
+
+    fake_tx.__aenter__.side_effect = _tx_enter
+    fake_tx.__aexit__.side_effect = _tx_exit
+    fake_conn = create_autospec(psycopg.AsyncConnection, instance=True)
+    fake_conn.transaction.return_value = fake_tx
+
+    @asynccontextmanager
+    async def _fake_get_db_conn():
+        yield fake_conn
+
+    pool_mod.get_db_connection.side_effect = _fake_get_db_conn
+    model_prefs_mod.get_user_preferences.side_effect = _stale_unlocked_get
+    user_db.lock_user_preferences.side_effect = _locked_prefs_consistent
+    unavailable_spy.reset_mock()
+    unavailable_spy.side_effect = _discover_outside_lock
+
+    res_redo = await apply_dalton_notify_preference_patch(
+        "u-internal",
+        {
+            "dalton_notify_routes": {
+                "automation:a-1": ["feishu:chat:oc_g1", "feishu:chat:oc_g2"]
+            }
+        },
+    )
+    assert res_redo["model_preference"]["dalton_notify_routes"]["automation:a-1"] == [
+        "feishu:chat:oc_g1",
+        "feishu:chat:oc_g2",
+    ]
+    assert order_events == [
+        "get_user_preferences",
+        "lock_user_preferences",
+        "discover_feishu_notify_groups",
+        "lock_user_preferences",
+    ]
+    assert unavailable_spy.await_count == 1
+
+    # 4. Still inconsistent on the redo -> HTTP 409
+    lock_attempt = 0
+
+    async def _locked_prefs_shifting(user_id: str, *, conn: Any) -> dict[str, Any]:
+        nonlocal in_lock, lock_attempt
+        _ = (user_id, conn)
+        in_lock = True
+        lock_attempt += 1
+        if lock_attempt == 1:
+            return {
+                "model_preference": {
+                    "dalton_notify_targets": ["feishu:user:ou_me_1"],
+                    "dalton_notify_routes": {"automation:a-1": ["feishu:chat:oc_g1"]},
+                },
+                "other_preference": {},
+            }
+        return {
+            "model_preference": {
+                "dalton_notify_targets": ["feishu:user:ou_me_1"],
+                "dalton_notify_routes": {"automation:a-1": []},
+            },
+            "other_preference": {},
+        }
+
+    user_db.lock_user_preferences.side_effect = _locked_prefs_shifting
+    with pytest.raises(HTTPException) as exc_409:
+        await apply_dalton_notify_preference_patch(
+            "u-internal",
+            {
+                "dalton_notify_routes": {
+                    "automation:a-1": ["feishu:chat:oc_g1", "feishu:chat:oc_g2"]
+                }
+            },
+        )
+    assert exc_409.value.status_code == 409
+    assert exc_409.value.detail == "配置刚被其他人修改，请重试"
+
 
 
 

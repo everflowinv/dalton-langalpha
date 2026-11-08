@@ -1724,7 +1724,13 @@ def build_director_tools(
                         ensure_ascii=False,
                     )
             if raw_key:
-                scope, target = classify_system_job_key(raw_key)
+                try:
+                    scope, target = classify_system_job_key(raw_key)
+                except ValueError as exc:
+                    return json.dumps(
+                        {"ok": False, "error": "invalid_key", "message": str(exc)},
+                        ensure_ascii=False,
+                    )
                 if scope == "sector":
                     return json.dumps(
                         {
@@ -1918,7 +1924,11 @@ def build_director_tools(
                 )
             raise
         except PermissionError as exc:
-            err_code = "ops_readonly" if scope == "ops" else "forbidden_pm"
+            err_code = (
+                "ops_readonly"
+                if scope == "ops"
+                else ("forbidden_internal" if scope == "data" else "forbidden_pm")
+            )
             return json.dumps(
                 {"ok": False, "error": err_code, "message": str(exc)},
                 ensure_ascii=False,
