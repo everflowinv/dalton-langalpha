@@ -106,6 +106,11 @@ class SchedulerLockLostError(RuntimeError):
     """Raised when the scheduler's session-level advisory lock connection is closed or fails ``SELECT 1``."""
 
 
+class ManualTaskRunConflictError(ValueError, RuntimeError):
+    """Raised when attempting to create a manual run while the task already has a queued or active run."""
+
+
+
 class _ClaimRollback(Exception):
     """Internal control-flow exception to force transaction rollback when a claim UPDATE affects != 1 row."""
 
@@ -138,6 +143,8 @@ class ClaimedTaskRun:
     deadline_utc: datetime
     timezone: str = "UTC"
     host_mode: str | None = None
+    trigger_source: str = "cron"
+    is_trial: bool = False
 
 
 def is_data_jobs_scheduler_enabled() -> bool:
@@ -290,7 +297,7 @@ async def enqueue_due_cron_tasks(
 
         async with conn.transaction():
             async with conn.cursor(row_factory=dict_row) as cur:
-                # §2.2.3.A & §3.2.2: if a prior period's queued row has not started yet,
+                # §2.2.3.A & §3.2.2: if a prior period's queued cron row has not started yet,
                 # mark it skipped_superseded (does NOT increment consecutive_failures)
                 # before inserting the new cycle's queued row.
                 await cur.execute(
@@ -302,8 +309,8 @@ async def enqueue_due_cron_tasks(
                         completed_at = NOW(),
                         updated_at = NOW()
                     WHERE job_key = %(job_key)s
-                      AND status = 'queued'
                       AND trigger_source = 'cron'
+                      AND status = 'queued'
                       AND scheduled_slot_utc < %(slot_utc)s
                     """,
                     {"job_key": job_key, "slot_utc": slot_utc},
@@ -346,10 +353,140 @@ async def enqueue_due_cron_tasks(
     return enqueued_run_ids
 
 
+def _normalize_manual_job_key(job_key: str) -> str:
+    cleaned = str(job_key or "").strip()
+    if cleaned.lower().startswith("data:"):
+        cleaned = cleaned[5:].strip()
+    if not cleaned:
+        raise ValueError("job_key must not be empty")
+    by_code = load_data_task_manifest().by_task_code()
+    if cleaned.upper() in by_code:
+        return by_code[cleaned.upper()].job_key
+    return cleaned
+
+
+async def enqueue_manual_task_run(
+    conn: Any,
+    job_key: str,
+    *,
+    triggered_by_user_id: str | None = None,
+    now_utc: datetime | None = None,
+) -> str:
+    """Insert a ``trigger_source = 'manual'`` queued trial run for a disabled task and return ``run_id``.
+
+    Only allows tasks where ``enabled = FALSE`` (for enabled tasks, raises
+    ``ManualTaskRunConflictError`` directing the caller to use the in-chat immediate run).
+    Also rejects creation with ``ManualTaskRunConflictError`` when the task already has a
+    queued or active (`queued`, `starting`, `running`) run from either `cron` or `manual`.
+    """
+    resolved_job_key = _normalize_manual_job_key(job_key)
+    slot_utc = (
+        now_utc.astimezone(timezone.utc)
+        if now_utc is not None
+        else datetime.now(timezone.utc).replace(microsecond=0)
+    )
+    new_run_id = str(uuid4())
+
+    async with conn.transaction():
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT job_key, timeout_seconds, runner, enabled
+                FROM dalton_data_task_defs
+                WHERE job_key = %(job_key)s
+                FOR UPDATE
+                """,
+                {"job_key": resolved_job_key},
+            )
+            def_row = await cur.fetchone()
+            if def_row is None:
+                raise ValueError(f"Unknown data task job_key: {resolved_job_key}")
+
+            enabled_raw = _extract_field(def_row, "enabled", 3)
+            if bool(enabled_raw):
+                raise ManualTaskRunConflictError(
+                    f"任务已开启，请用对话里的立即运行 (job_key={resolved_job_key})"
+                )
+
+            timeout_s = _extract_field(def_row, "timeout_seconds", 1)
+            runner = str(_extract_field(def_row, "runner", 2) or "container")
+            if runner not in ("container", "host"):
+                raise ValueError(f"Unsupported runner {runner!r} for data task {resolved_job_key}")
+
+            await cur.execute(
+                """
+                SELECT run_id, status, trigger_source
+                FROM dalton_data_task_runs
+                WHERE job_key = %(job_key)s
+                  AND status IN ('queued', 'starting', 'running')
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                {"job_key": resolved_job_key},
+            )
+            existing = await cur.fetchone()
+            if existing is not None:
+                existing_run_id = str(_extract_field(existing, "run_id", 0))
+                existing_status = str(_extract_field(existing, "status", 1))
+                existing_source = str(_extract_field(existing, "trigger_source", 2) or "")
+                raise ManualTaskRunConflictError(
+                    f"Data task {resolved_job_key!r} already has a {existing_status} run "
+                    f"(run_id={existing_run_id}, trigger_source={existing_source})"
+                )
+
+            effective_timeout = (
+                int(timeout_s) if timeout_s is not None else DEFAULT_TIMEOUT_SECONDS
+            )
+            deadline_utc = slot_utc + timedelta(seconds=effective_timeout)
+
+            await cur.execute(
+                """
+                INSERT INTO dalton_data_task_runs (
+                    run_id,
+                    job_key,
+                    trigger_source,
+                    triggered_by_user_id,
+                    scheduled_slot_utc,
+                    deadline_utc,
+                    status,
+                    created_at,
+                    updated_at
+                ) VALUES (
+                    %(run_id)s::uuid,
+                    %(job_key)s,
+                    'manual',
+                    %(triggered_by_user_id)s,
+                    %(slot_utc)s,
+                    %(deadline_utc)s,
+                    'queued',
+                    NOW(),
+                    NOW()
+                )
+                ON CONFLICT DO NOTHING
+                RETURNING run_id
+                """,
+                {
+                    "run_id": new_run_id,
+                    "job_key": resolved_job_key,
+                    "triggered_by_user_id": triggered_by_user_id,
+                    "slot_utc": slot_utc,
+                    "deadline_utc": deadline_utc,
+                },
+            )
+            inserted = await cur.fetchone()
+            if inserted is None:
+                raise ManualTaskRunConflictError(
+                    f"Data task {resolved_job_key!r} already has a queued run"
+                )
+            return str(_extract_field(inserted, "run_id", 0))
+
+
+
 async def expire_low_memory_runs(
     conn: Any,
     *,
     now_utc: datetime | None = None,
+    only_run_id: str | None = None,
 ) -> list[str]:
     """Transition ``queued`` runs with ``low_mem_since_utc IS NOT NULL`` past ``deadline_utc`` to ``skipped_low_memory`` (§2.2.3.B)."""
     ref_utc = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
@@ -358,12 +495,13 @@ async def expire_low_memory_runs(
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
             """
-            SELECT run_id, job_key
-            FROM dalton_data_task_runs
-            WHERE status = 'queued'
-              AND low_mem_since_utc IS NOT NULL
-              AND deadline_utc <= %(now_utc)s
-            ORDER BY scheduled_slot_utc ASC, created_at ASC
+            SELECT r.run_id, r.job_key, r.trigger_source, d.enabled
+            FROM dalton_data_task_runs r
+            LEFT JOIN dalton_data_task_defs d ON d.job_key = r.job_key
+            WHERE r.status = 'queued'
+              AND r.low_mem_since_utc IS NOT NULL
+              AND r.deadline_utc <= %(now_utc)s
+            ORDER BY r.scheduled_slot_utc ASC, r.created_at ASC
             """,
             {"now_utc": ref_utc},
         )
@@ -371,7 +509,21 @@ async def expire_low_memory_runs(
 
     for row in rows:
         run_id = str(_extract_field(row, "run_id", 0))
+        if only_run_id is not None and run_id != str(only_run_id):
+            continue
         job_key = str(_extract_field(row, "job_key", 1))
+        trigger_source = (
+            str(row.get("trigger_source") or "cron")
+            if isinstance(row, Mapping)
+            else (str(row[2] or "cron") if len(row) > 2 else "cron")
+        )
+        enabled_val = (
+            row.get("enabled", True)
+            if isinstance(row, Mapping)
+            else (row[3] if len(row) > 3 else True)
+        )
+        # 不变式：试跑在 queued/starting/running 期间禁止开启任务，因此当前 d.enabled 与入队/认领时一致，无需另存 is_trial。
+        is_trial = trigger_source == "manual" and not bool(enabled_val)
         async with conn.transaction():
             async with conn.cursor() as cur:
                 await cur.execute(
@@ -388,15 +540,16 @@ async def expire_low_memory_runs(
                     {"run_id": run_id},
                 )
                 if cur.rowcount == 1:
-                    await cur.execute(
-                        """
-                        UPDATE dalton_data_task_defs
-                        SET consecutive_failures = consecutive_failures + 1,
-                            updated_at = NOW()
-                        WHERE job_key = %(job_key)s
-                        """,
-                        {"job_key": job_key},
-                    )
+                    if not is_trial:
+                        await cur.execute(
+                            """
+                            UPDATE dalton_data_task_defs
+                            SET consecutive_failures = consecutive_failures + 1,
+                                updated_at = NOW()
+                            WHERE job_key = %(job_key)s
+                            """,
+                            {"job_key": job_key},
+                        )
                     expired_ids.append(run_id)
     return expired_ids
 
@@ -407,6 +560,7 @@ async def claim_next_queued_run(
     now_utc: datetime | None = None,
     available_memory_mb: int | None = None,
     min_free_mem_mb: int | None = None,
+    only_run_id: str | None = None,
 ) -> ClaimedTaskRun | None:
     """Clean unclaimable head rows and atomically claim the first eligible queued run (§2.2.3, §3.2.3).
 
@@ -414,13 +568,15 @@ async def claim_next_queued_run(
     - When ``dalton_data_task_slot.slot_state != 'idle'`` (`'running'` or `'reclaiming'`), returns
       ``None`` immediately; queued runs wait normally and are never marked ``skipped_low_memory``.
     - When ``slot_state == 'idle'``, expires any low-memory-blocked runs whose ``deadline_utc``
-      has passed, then scans ``status = 'queued'`` in ``scheduled_slot_utc ASC, created_at ASC`` order:
+      has passed, then scans ``status = 'queued'`` in ``scheduled_slot_utc ASC, created_at ASC`` order
+      (or only ``only_run_id`` when specified, leaving earlier queued runs untouched):
       - Unclaimable head rows (``enabled = FALSE``, ``paused_by_user = TRUE``, or ``runner != 'container'``
         before PR 0-2) are marked ``status = 'cancelled'`` and the loop continues to the next queued row.
       - For ``runner = 'container'``, checks ``MemAvailable >= min_free_mem_mb`` (default 1280 MB);
         if below threshold, sets ``low_mem_since_utc = COALESCE(low_mem_since_utc, NOW())`` (or
         transitions to ``skipped_low_memory`` if already past ``deadline_utc``) and stops claiming.
-      - Executes the two claim ``UPDATE`` statements inside a single transaction; both must affect
+      - Executes ``SELECT ... FOR SHARE`` on ``dalton_data_task_defs`` and the two claim ``UPDATE``
+        statements inside a single transaction; both ``UPDATE``s must affect
         exactly 1 row or the transaction rolls back.
     """
     ref_utc = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
@@ -438,7 +594,7 @@ async def claim_next_queued_run(
     if slot_row is None or str(_extract_field(slot_row, "slot_state", 2)) != "idle":
         return None
 
-    await expire_low_memory_runs(conn, now_utc=ref_utc)
+    await expire_low_memory_runs(conn, now_utc=ref_utc, only_run_id=only_run_id)
 
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
@@ -446,6 +602,7 @@ async def claim_next_queued_run(
             SELECT
                 r.run_id,
                 r.job_key,
+                r.trigger_source,
                 r.scheduled_slot_utc,
                 r.deadline_utc,
                 r.low_mem_since_utc,
@@ -477,15 +634,24 @@ async def claim_next_queued_run(
 
     for cand in candidates:
         run_id = str(cand["run_id"])
+        if only_run_id is not None and run_id != str(only_run_id):
+            continue
         job_key = str(cand["job_key"])
+        trigger_source = str(cand.get("trigger_source") or "cron")
         enabled = bool(cand.get("enabled"))
         paused = bool(cand.get("paused_by_user"))
+        is_trial = trigger_source == "manual" and not enabled
         runner = str(cand.get("runner") or "container")
         deadline_utc = cand["deadline_utc"]
 
-        # Unclaimable head row (disabled, paused, missing def, or unsupported runner):
-        # cancel and continue scanning the next queued row (§3.2.3).
-        if not enabled or paused or cand.get("command_argv") is None or runner not in ("container", "host"):
+        # Unclaimable head row (disabled/paused for non-trial runs, missing def, or unsupported runner):
+        # cancel and continue scanning the next queued row (§3.2.3). Trial runs (`trigger_source == 'manual'`
+        # while `enabled == False`) ignore `enabled` and `paused_by_user` so disabled tasks can be trial-run.
+        if (
+            (not is_trial and (not enabled or paused))
+            or cand.get("command_argv") is None
+            or runner not in ("container", "host")
+        ):
             cancel_reason = (
                 "unsupported_runner"
                 if runner not in ("container", "host")
@@ -533,7 +699,8 @@ async def claim_next_queued_run(
                                 """,
                                 {"run_id": run_id, "now_utc": ref_utc},
                             )
-                            if cur.rowcount == 1:
+                            # 不变式：试跑在 queued/starting/running 期间禁止开启任务，因此当前 enabled 与入队/认领时一致，无需另存 is_trial。
+                            if cur.rowcount == 1 and not is_trial:
                                 await cur.execute(
                                     """
                                     UPDATE dalton_data_task_defs
@@ -559,7 +726,8 @@ async def claim_next_queued_run(
                         )
                 return None
 
-        # Single-transaction atomic claim: both UPDATEs must affect 1 row or rollback (§3.2.3).
+        # Single-transaction atomic claim: lock task def FOR SHARE, update slot, and update run (§3.2.3).
+        # 不变式：认领事务通过 FOR SHARE 锁定任务定义行，且试跑进行中禁止开启任务，保证试跑从入队到终态 enabled 恒为 FALSE。
         claimed_generation: int | None = None
         try:
             async with conn.transaction():
@@ -587,6 +755,25 @@ async def claim_next_queued_run(
 
                     await cur.execute(
                         """
+                        SELECT enabled, paused_by_user
+                        FROM dalton_data_task_defs
+                        WHERE job_key = %(job_key)s
+                        FOR SHARE
+                        """,
+                        {"job_key": job_key},
+                    )
+                    locked_def = await cur.fetchone()
+                    if locked_def is None:
+                        raise _ClaimRollback(
+                            "run_not_claimable",
+                            unclaimable_run_id=run_id,
+                        )
+                    locked_enabled = bool(_extract_field(locked_def, "enabled", 0))
+                    locked_paused = bool(_extract_field(locked_def, "paused_by_user", 1))
+                    is_trial = trigger_source == "manual" and not locked_enabled
+
+                    await cur.execute(
+                        """
                         UPDATE dalton_data_task_runs r
                         SET status     = 'starting',
                             generation = %(generation)s,
@@ -595,11 +782,20 @@ async def claim_next_queued_run(
                         WHERE r.run_id = %(run_id)s::uuid
                           AND r.status = 'queued'
                           AND d.job_key = r.job_key
-                          AND d.enabled = TRUE
-                          AND d.paused_by_user = FALSE
+                          AND d.enabled = %(expected_enabled)s
+                          AND d.paused_by_user = %(expected_paused)s
+                          AND (
+                              (r.trigger_source = 'manual' AND %(expected_enabled)s = FALSE)
+                              OR (%(expected_enabled)s = TRUE AND %(expected_paused)s = FALSE)
+                          )
                           AND d.runner IN ('container', 'host')
                         """,
-                        {"run_id": run_id, "generation": claimed_generation},
+                        {
+                            "run_id": run_id,
+                            "generation": claimed_generation,
+                            "expected_enabled": locked_enabled,
+                            "expected_paused": locked_paused,
+                        },
                     )
                     if cur.rowcount != 1:
                         raise _ClaimRollback(
@@ -635,11 +831,15 @@ async def claim_next_queued_run(
             raw_secrets = json.loads(raw_secrets)
 
         manifest_entry = load_data_task_manifest().by_job_key().get(job_key)
-        host_mode = (
-            str(manifest_entry.host_mode or "mirror")
-            if runner == "host" and manifest_entry is not None
-            else ("mirror" if runner == "host" else None)
-        )
+        if runner == "host":
+            if is_trial:
+                host_mode: str | None = "run"
+            elif manifest_entry is not None:
+                host_mode = str(manifest_entry.host_mode or "mirror")
+            else:
+                host_mode = "mirror"
+        else:
+            host_mode = None
 
         return ClaimedTaskRun(
             run_id=run_id,
@@ -657,6 +857,8 @@ async def claim_next_queued_run(
             deadline_utc=cand["deadline_utc"],
             timezone=str(cand.get("timezone") or "UTC"),
             host_mode=host_mode,
+            trigger_source=trigger_source,
+            is_trial=is_trial,
         )
 
     return None
@@ -692,6 +894,7 @@ async def start_claimed_container_run(
         effective_secrets = await resolve_task_vault_secrets(claimed.required_secrets)
     write_run_secrets_dir(claimed.run_id, effective_secrets, path_map=paths)
     container_name = format_container_name(claimed.job_key, claimed.run_id)
+    effective_notify_enabled = False if claimed.is_trial else claimed.notify_enabled
     create_cfg = build_container_create_config(
         job_key=claimed.job_key,
         run_id=claimed.run_id,
@@ -700,7 +903,7 @@ async def start_claimed_container_run(
         workdir=claimed.workdir,
         timeout_seconds=claimed.timeout_seconds,
         no_output_timeout_seconds=claimed.no_output_timeout_seconds,
-        notify_enabled=claimed.notify_enabled,
+        notify_enabled=effective_notify_enabled,
         cos_mode=claimed.cos_mode,
         path_map=paths,
     )
@@ -1008,9 +1211,19 @@ def resolve_notify_status(
     terminal_status: str,
     notify_enabled: bool,
     has_outbox_payload: bool,
+    is_trial: bool = False,
 ) -> str:
-    """Compute ``notify_status`` for a completed run (§3.4.1)."""
-    if terminal_status != "succeeded" or not has_outbox_payload:
+    """Compute ``notify_status`` for a completed run (§3.4.1).
+
+    Trial runs (`is_trial == True`, i.e. manual runs claimed while task `enabled == False`)
+    never dispatch live notifications: when `terminal_status == 'succeeded'`,
+    `notify_status` is always `'preview_only'` regardless of `notify_enabled`.
+    """
+    if terminal_status != "succeeded":
+        return "skipped"
+    if is_trial:
+        return "preview_only"
+    if not has_outbox_payload:
         return "skipped"
     return "pending_dispatch" if notify_enabled else "preview_only"
 
@@ -1066,6 +1279,7 @@ async def finalize_task_run(
         terminal_status=terminal_status,
         notify_enabled=claimed.notify_enabled,
         has_outbox_payload=has_outbox,
+        is_trial=claimed.is_trial,
     )
     serialized_outbox = (
         json.dumps(outbox_payload, ensure_ascii=False) if outbox_payload is not None else None
@@ -1111,31 +1325,32 @@ async def finalize_task_run(
                 if cur.rowcount != 1:
                     raise _TerminalRollback()
 
-                if terminal_status == "succeeded":
-                    await cur.execute(
-                        """
-                        UPDATE dalton_data_task_defs
-                        SET consecutive_failures = 0,
-                            updated_at = NOW()
-                        WHERE job_key = %(job_key)s
-                        RETURNING consecutive_failures
-                        """,
-                        {"job_key": claimed.job_key},
-                    )
-                else:
-                    await cur.execute(
-                        """
-                        UPDATE dalton_data_task_defs
-                        SET consecutive_failures = consecutive_failures + 1,
-                            updated_at = NOW()
-                        WHERE job_key = %(job_key)s
-                        RETURNING consecutive_failures
-                        """,
-                        {"job_key": claimed.job_key},
-                    )
-                cf_row = await cur.fetchone()
-                if cf_row is not None:
-                    consecutive_failures = int(_extract_field(cf_row, "consecutive_failures", 0))
+                if not claimed.is_trial:
+                    if terminal_status == "succeeded":
+                        await cur.execute(
+                            """
+                            UPDATE dalton_data_task_defs
+                            SET consecutive_failures = 0,
+                                updated_at = NOW()
+                            WHERE job_key = %(job_key)s
+                            RETURNING consecutive_failures
+                            """,
+                            {"job_key": claimed.job_key},
+                        )
+                    else:
+                        await cur.execute(
+                            """
+                            UPDATE dalton_data_task_defs
+                            SET consecutive_failures = consecutive_failures + 1,
+                                updated_at = NOW()
+                            WHERE job_key = %(job_key)s
+                            RETURNING consecutive_failures
+                            """,
+                            {"job_key": claimed.job_key},
+                        )
+                    cf_row = await cur.fetchone()
+                    if cf_row is not None:
+                        consecutive_failures = int(_extract_field(cf_row, "consecutive_failures", 0))
     except _TerminalRollback:
         return False, None
 
@@ -1313,7 +1528,7 @@ async def recover_on_takeover(
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
-                SELECT r.run_id, r.job_key, r.status, r.container_id, d.runner
+                SELECT r.run_id, r.job_key, r.status, r.container_id, d.runner, r.trigger_source
                 FROM dalton_data_task_runs r
                 LEFT JOIN dalton_data_task_defs d
                   ON d.job_key = r.job_key
@@ -1328,15 +1543,25 @@ async def recover_on_takeover(
             job_key = str(_extract_field(run_row, "job_key", 1))
             run_cid = _extract_field(run_row, "container_id", 3)
             run_runner_raw: Any = None
+            run_trigger_raw: Any = None
             if isinstance(run_row, Mapping):
                 run_runner_raw = run_row.get("runner")
-            elif isinstance(run_row, (tuple, list)) and len(run_row) > 4:
-                run_runner_raw = run_row[4]
+                run_trigger_raw = run_row.get("trigger_source")
+            elif isinstance(run_row, (tuple, list)):
+                if len(run_row) > 4:
+                    run_runner_raw = run_row[4]
+                if len(run_row) > 5:
+                    run_trigger_raw = run_row[5]
             is_host_run = (
                 str(run_runner_raw) == "host"
                 if run_runner_raw is not None
                 else job_key in host_job_keys
             )
+            # Takeover aborts of manual runs (trial or in-chat run-now) never change
+            # consecutive_failures: an aborted manual run says nothing about the task's
+            # health, and the claim-time trial/run-now distinction is not stored, so
+            # re-deriving it from the current `enabled` flag would be wrong after a toggle.
+            skip_failure_count = str(run_trigger_raw or "cron") == "manual"
 
             # Even if leftover container cleanup failed, a non-terminal host task on the slot
             # must still undergo generation+1 and host-kill before deciding slot state.
@@ -1380,15 +1605,16 @@ async def recover_on_takeover(
                             {"run_id": active_run_id},
                         )
                         if cur.rowcount == 1:
-                            await cur.execute(
-                                """
-                                UPDATE dalton_data_task_defs
-                                SET consecutive_failures = consecutive_failures + 1,
-                                    updated_at = NOW()
-                                WHERE job_key = %(job_key)s
-                                """,
-                                {"job_key": job_key},
-                            )
+                            if not skip_failure_count:
+                                await cur.execute(
+                                    """
+                                    UPDATE dalton_data_task_defs
+                                    SET consecutive_failures = consecutive_failures + 1,
+                                        updated_at = NOW()
+                                    WHERE job_key = %(job_key)s
+                                    """,
+                                    {"job_key": job_key},
+                                )
                             recovery_outcome = "aborted"
                         else:
                             recovery_outcome = "cleaned_terminal"
@@ -1439,15 +1665,16 @@ async def recover_on_takeover(
                                 {"run_id": active_run_id},
                             )
                             if cur.rowcount == 1:
-                                await cur.execute(
-                                    """
-                                    UPDATE dalton_data_task_defs
-                                    SET consecutive_failures = consecutive_failures + 1,
-                                        updated_at = NOW()
-                                    WHERE job_key = %(job_key)s
-                                    """,
-                                    {"job_key": job_key},
-                                )
+                                if not skip_failure_count:
+                                    await cur.execute(
+                                        """
+                                        UPDATE dalton_data_task_defs
+                                        SET consecutive_failures = consecutive_failures + 1,
+                                            updated_at = NOW()
+                                        WHERE job_key = %(job_key)s
+                                        """,
+                                        {"job_key": job_key},
+                                    )
                                 recovery_outcome = "aborted"
                             else:
                                 recovery_outcome = "cleaned_terminal"
@@ -1650,7 +1877,7 @@ async def execute_claimed_host_run(
     if not started:
         return False, None
 
-    host_mode = claimed.host_mode
+    host_mode = "run" if claimed.is_trial else claimed.host_mode
     if not host_mode:
         try:
             for entry in load_data_task_manifest():

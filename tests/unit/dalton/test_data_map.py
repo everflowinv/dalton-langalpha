@@ -890,16 +890,19 @@ async def test_check_data_task_runs_health_and_run_all_health_checks_integration
             raise raise_on_query["err"]
 
     async def _fake_fetchall() -> list[dict[str, Any]]:
-        # Mirror the SQL filter: enabled tasks with failed/timed_out runs and no newer succeeded run
+        # Mirror the SQL filter: enabled tasks with failed/timed_out cron runs and no newer succeeded cron run
         out: list[dict[str, Any]] = []
         for r in run_rows:
             jk = r["job_key"]
             if not task_enabled.get(jk, False):
                 continue
+            if r.get("trigger_source", "cron") != "cron":
+                continue
             if r["status"] not in ("failed", "timed_out"):
                 continue
             has_newer_success = any(
                 s["job_key"] == jk
+                and s.get("trigger_source", "cron") == "cron"
                 and s["status"] == "succeeded"
                 and s["run_ts"] > r["run_ts"]
                 for s in run_rows
@@ -990,6 +993,26 @@ async def test_check_data_task_runs_health_and_run_all_health_checks_integration
     sql_executed = str(mock_cur.execute.await_args.args[0])
     assert "dalton_data_task_runs" in sql_executed
     assert "NOT EXISTS" in sql_executed
+    assert "f.trigger_source = 'cron'" in sql_executed
+    assert "s.trigger_source = 'cron'" in sql_executed
+
+    # 1b) Manual run failure is ignored by health check
+    run_rows.append(
+        {
+            "job_key": "cn-leverage-daily",
+            "task_code": "T5",
+            "title": "A股杠杆/拥挤度监控",
+            "run_id": "run-manual-fail",
+            "trigger_source": "manual",
+            "status": "failed",
+            "failure_reason": "non_zero_exit",
+            "exit_code": 2,
+            "run_ts": datetime(2026, 11, 8, 1, 15, tzinfo=timezone.utc),
+        }
+    )
+    summary_manual_ignored = await _run_check()
+    assert summary_manual_ignored["unavailable_count"] == 0
+    assert persisted_health["data_tasks"]["status"] == "available"
 
     # 2) Unrecovered failure within 36h on enabled task -> persisted as status="unavailable"
     run_rows.append(

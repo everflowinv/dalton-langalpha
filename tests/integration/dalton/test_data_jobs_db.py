@@ -1354,4 +1354,441 @@ async def test_pr04_failover_aggregates_existing_sent_deliveries_without_reclaim
         await admin_conn.close()
 
 
+@pytest.mark.asyncio
+async def test_manual_run_while_disabled_claims_succeeds_with_preview_only_and_zero_deliveries(
+    migrated_data_jobs_dsn: str,
+    tmp_path: Path,
+) -> None:
+    """Verify PR 1-1 against real PostgreSQL:
+    - Create a manual run (`enqueue_manual_task_run`) while the task is disabled (`enabled = FALSE`)
+      and `notify_enabled = TRUE`;
+    - Reject creating a second manual run while the first is still queued;
+    - Claim (`claim_next_queued_run`) and execute to completion using an autospec container executor
+      (`execute_claimed_container_run`);
+    - Terminal status is `succeeded`, `notify_status = 'preview_only'`, `notify_preview` and
+      `.dalton-runs/<run_id>/outbox.json` are written, and `dalton_notify_deliveries` has 0 rows
+      for this `execution_id` (even after `dispatch_pending_data_task_notifications`).
+    """
+    from src.dalton.data_jobs.scheduler import (
+        ManualTaskRunConflictError,
+        dispatch_pending_data_task_notifications,
+        enqueue_manual_task_run,
+        execute_claimed_container_run,
+    )
+    from src.dalton.notify.dispatch import post_bridge_notify
+
+    dsn = migrated_data_jobs_dsn
+    admin_conn = await psycopg.AsyncConnection.connect(dsn, autocommit=True)
+    lock_conn = await open_dedicated_lock_connection(dsn)
+    manual_run_id = ""
+    try:
+        assert await try_scheduler_lock(lock_conn) is True
+        await _reset_data_task_tables(admin_conn)
+        manifest = load_data_task_manifest()
+        async with admin_conn.transaction():
+            await sync_manifest_to_db(admin_conn, manifest)
+
+        # Turn notify on (the manifest seeds it off) so the test proves manual runs ignore it.
+        async with admin_conn.cursor() as cur:
+            await cur.execute(
+                "UPDATE dalton_data_task_defs SET notify_enabled = TRUE WHERE job_key = 'softbank-nav-monitor'"
+            )
+        # Confirm `softbank-nav-monitor` (T52) has `enabled = FALSE` and `notify_enabled = TRUE`
+        async with admin_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT enabled, paused_by_user, notify_enabled
+                FROM dalton_data_task_defs
+                WHERE job_key = 'softbank-nav-monitor'
+                """
+            )
+            def_row = await cur.fetchone()
+        assert def_row is not None
+        assert def_row["enabled"] is False
+        assert def_row["notify_enabled"] is True
+
+        slot_now = datetime(2026, 11, 8, 14, 0, tzinfo=timezone.utc)
+        manual_run_id = await enqueue_manual_task_run(
+            admin_conn,
+            "softbank-nav-monitor",
+            triggered_by_user_id="lead-admin",
+            now_utc=slot_now,
+        )
+        assert manual_run_id
+
+        # Attempting to create another manual run while queued must raise ManualTaskRunConflictError
+        with pytest.raises(ManualTaskRunConflictError):
+            await enqueue_manual_task_run(
+                admin_conn,
+                "softbank-nav-monitor",
+                now_utc=slot_now,
+            )
+
+        claimed = await claim_next_queued_run(
+            admin_conn,
+            now_utc=slot_now,
+            available_memory_mb=8192,
+        )
+        assert claimed is not None
+        assert claimed.run_id == manual_run_id
+        assert claimed.job_key == "softbank-nav-monitor"
+        assert claimed.trigger_source == "manual"
+        assert claimed.is_trial is True
+
+        path_map = build_path_map(
+            host_var_dir=tmp_path / "host_var",
+            backend_var_dir=tmp_path / "backend_var",
+        )
+        art_dir = path_map.backend_run_artifacts_dir(manual_run_id)
+        art_dir.mkdir(parents=True, exist_ok=True)
+        (art_dir / "outbox.json").write_text(
+            json.dumps({"feishu_message": "SoftBank NAV manual trial preview"}),
+            encoding="utf-8",
+        )
+
+        docker_client = create_autospec(DataTaskDockerClient, instance=True)
+        docker_client.create_container.return_value = "cid-manual-trial"
+        docker_client.collect_container_outcome.return_value = ContainerInspectionOutcome(
+            container_id="cid-manual-trial",
+            exit_code=0,
+            oom_killed=False,
+            running=False,
+            log_tail="SoftBank NAV discount: -42.1%\n",
+        )
+
+        committed, cf = await execute_claimed_container_run(
+            admin_conn,
+            lock_conn=lock_conn,
+            docker_client=docker_client,
+            claimed=claimed,
+            decrypted_secrets={},
+            path_map=path_map,
+        )
+        assert committed is True
+        assert cf is None
+
+        post_double = create_autospec(post_bridge_notify)
+        dispatched = await dispatch_pending_data_task_notifications(
+            admin_conn,
+            lock_conn=lock_conn,
+            path_map=path_map,
+            post_notify_fn=post_double,
+        )
+        assert dispatched == []
+        assert post_double.await_count == 0
+
+        async with admin_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT status, trigger_source, exit_code, notify_status, notify_preview, outbox_payload
+                FROM dalton_data_task_runs
+                WHERE run_id = %s::uuid
+                """,
+                (manual_run_id,),
+            )
+            run_row = await cur.fetchone()
+            await cur.execute(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM dalton_notify_deliveries
+                WHERE execution_id = %s
+                """,
+                (manual_run_id,),
+            )
+            deliv_cnt_row = await cur.fetchone()
+
+        assert run_row is not None
+        assert run_row["status"] == "succeeded"
+        assert run_row["trigger_source"] == "manual"
+        assert run_row["exit_code"] == 0
+        assert run_row["notify_status"] == "preview_only"
+        assert run_row["notify_preview"] == {
+            "feishu_message": "SoftBank NAV manual trial preview"
+        }
+        assert deliv_cnt_row is not None
+        assert int(deliv_cnt_row["cnt"]) == 0
+    finally:
+        await release_scheduler_lock(lock_conn, close_conn=True)
+        if manual_run_id:
+            try:
+                async with admin_conn.transaction():
+                    async with admin_conn.cursor() as cur:
+                        await cur.execute(
+                            "DELETE FROM dalton_notify_deliveries WHERE execution_id = %s",
+                            (manual_run_id,),
+                        )
+            except Exception:
+                pass
+        try:
+            await _reset_data_task_tables(admin_conn)
+        except Exception:
+            pass
+        await admin_conn.close()
+
+
+@pytest.mark.asyncio
+async def test_trial_run_blocks_enabling_until_finished(
+    migrated_data_jobs_dsn: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR 1-1 Round 4: while a trial run (`enabled = FALSE` + `trigger_source = 'manual'`) is active, enabling via `toggle_system_job` or `rollback_data_task_config` is rejected without mutating any fields; once the trial run finishes, enabling succeeds."""
+    from contextlib import asynccontextmanager
+    import src.dalton.access_tiers as access_tiers_mod
+    import src.dalton.autonomy.system_jobs as system_jobs_mod
+    from src.dalton.data_jobs.scheduler import (
+        enqueue_manual_task_run,
+        execute_claimed_container_run,
+    )
+    import src.dalton.notify.groups as groups_mod
+    from src.server.database.user import upsert_user_preferences
+
+    dsn = migrated_data_jobs_dsn
+    pm_user_id = f"test-pm-trial-{uuid4().hex[:8]}"
+
+    admin_conn = await psycopg.AsyncConnection.connect(dsn, autocommit=True)
+    lock_conn = await open_dedicated_lock_connection(dsn)
+    try:
+        assert await try_scheduler_lock(lock_conn) is True
+        await _reset_data_task_tables(admin_conn)
+        manifest = load_data_task_manifest()
+        async with admin_conn.transaction():
+            await sync_manifest_to_db(admin_conn, manifest)
+
+        async with admin_conn.transaction():
+            async with admin_conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO users (user_id, email, name, created_at, updated_at)
+                    VALUES (%s, %s, %s, NOW(), NOW())
+                    ON CONFLICT (user_id) DO NOTHING
+                    """,
+                    (pm_user_id, f"{pm_user_id}@example.com", "Test PM Trial"),
+                )
+            await upsert_user_preferences(
+                user_id=pm_user_id,
+                model_preference={
+                    "dalton_notify_targets": ["feishu:user:ou_1", "feishu:user:ou_2"]
+                },
+                conn=admin_conn,
+            )
+
+        @asynccontextmanager
+        async def _real_db_conn(conn=None):
+            if conn is not None:
+                yield conn
+                return
+            c = await psycopg.AsyncConnection.connect(dsn)
+            try:
+                yield c
+            finally:
+                await c.close()
+
+        async def _real_get_prefs(user_id: str) -> dict | None:
+            async with await psycopg.AsyncConnection.connect(dsn) as c:
+                async with c.cursor(row_factory=dict_row) as cur:
+                    await cur.execute(
+                        "SELECT model_preference, other_preference FROM user_preferences WHERE user_id = %s",
+                        (user_id,),
+                    )
+                    return await cur.fetchone()
+
+        monkeypatch.setenv("DALTON_PM_USER_IDS", pm_user_id)
+        monkeypatch.setattr(
+            system_jobs_mod,
+            "get_db_connection",
+            create_autospec(system_jobs_mod.get_db_connection, side_effect=_real_db_conn),
+        )
+        monkeypatch.setattr(
+            system_jobs_mod,
+            "get_user_tier",
+            create_autospec(system_jobs_mod.get_user_tier, return_value="internal"),
+        )
+        monkeypatch.setattr(
+            system_jobs_mod,
+            "get_user_preferences",
+            create_autospec(system_jobs_mod.get_user_preferences, side_effect=_real_get_prefs),
+        )
+        monkeypatch.setattr(
+            access_tiers_mod,
+            "get_user_tier",
+            create_autospec(access_tiers_mod.get_user_tier, return_value="internal"),
+        )
+        monkeypatch.setattr(
+            system_jobs_mod,
+            "invalidate_user_prefs_cache",
+            create_autospec(system_jobs_mod.invalidate_user_prefs_cache, return_value=None),
+        )
+        monkeypatch.setattr(
+            groups_mod,
+            "discover_feishu_notify_groups",
+            create_autospec(
+                groups_mod.discover_feishu_notify_groups,
+                return_value=[{"chat_id": "oc_g1", "name": "测试群"}],
+            ),
+        )
+
+        # 1) Disabled task (`softbank-nav-monitor`, enabled = FALSE) enqueues a trial run (kept `queued`)
+        slot_now = datetime(2026, 11, 8, 15, 0, tzinfo=timezone.utc)
+        trial_run_id = await enqueue_manual_task_run(
+            admin_conn,
+            "softbank-nav-monitor",
+            triggered_by_user_id="lead-admin",
+            now_utc=slot_now,
+        )
+        assert trial_run_id
+
+        # 2) Calling enable (`toggle_system_job`) while trial run is `queued` is rejected; task stays disabled
+        with pytest.raises(
+            ValueError,
+            match=rf"试跑进行中（run_id={trial_run_id}），结束后再开启",
+        ):
+            await system_jobs_mod.toggle_system_job(
+                pm_user_id,
+                "data:softbank-nav-monitor",
+                enabled=True,
+                notify_routes=["feishu:user:ou_1"],
+            )
+
+        async with admin_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT enabled, paused_by_user, notify_enabled, config_version
+                FROM dalton_data_task_defs
+                WHERE job_key = 'softbank-nav-monitor'
+                """
+            )
+            def_row = await cur.fetchone()
+            await cur.execute(
+                "SELECT status FROM dalton_data_task_runs WHERE run_id = %s::uuid",
+                (trial_run_id,),
+            )
+            run_row = await cur.fetchone()
+        assert def_row is not None
+        assert def_row["enabled"] is False
+        assert def_row["notify_enabled"] is False
+        assert int(def_row["config_version"]) == 1
+        assert run_row is not None
+        assert run_row["status"] == "queued"
+
+        # 3) Finish the trial run using `only_run_id=trial_run_id`
+        claimed = await claim_next_queued_run(
+            admin_conn,
+            now_utc=slot_now,
+            available_memory_mb=8192,
+            only_run_id=trial_run_id,
+        )
+        assert claimed is not None
+        assert claimed.run_id == trial_run_id
+        assert claimed.is_trial is True
+
+        path_map = build_path_map(
+            host_var_dir=tmp_path / "host_var_trial",
+            backend_var_dir=tmp_path / "backend_var_trial",
+        )
+        docker_client = create_autospec(DataTaskDockerClient, instance=True)
+        docker_client.create_container.return_value = "cid-trial-block"
+        docker_client.collect_container_outcome.return_value = ContainerInspectionOutcome(
+            container_id="cid-trial-block",
+            exit_code=0,
+            oom_killed=False,
+            running=False,
+            log_tail="ok\n",
+        )
+        committed, _ = await execute_claimed_container_run(
+            admin_conn,
+            lock_conn=lock_conn,
+            docker_client=docker_client,
+            claimed=claimed,
+            decrypted_secrets={},
+            path_map=path_map,
+        )
+        assert committed is True
+
+        # 4) Enabling now succeeds after trial run reached terminal status
+        enabled_res = await system_jobs_mod.toggle_system_job(
+            pm_user_id,
+            "data:softbank-nav-monitor",
+            enabled=True,
+            notify_routes=["feishu:user:ou_1"],
+        )
+        assert enabled_res["enabled"] is True
+
+        # 5) Disable task again, enqueue a second trial run, and verify `rollback_data_task_config`
+        # to the enabled version is also rejected until the second trial run finishes
+        disabled_res = await system_jobs_mod.toggle_system_job(
+            pm_user_id,
+            "data:softbank-nav-monitor",
+            enabled=False,
+        )
+        assert disabled_res["enabled"] is False
+
+        trial_run_id_2 = await enqueue_manual_task_run(
+            admin_conn,
+            "softbank-nav-monitor",
+            triggered_by_user_id="lead-admin",
+            now_utc=slot_now + timedelta(minutes=5),
+        )
+        with pytest.raises(
+            ValueError,
+            match=rf"试跑进行中（run_id={trial_run_id_2}），结束后再开启",
+        ):
+            await system_jobs_mod.rollback_data_task_config(
+                pm_user_id,
+                "softbank-nav-monitor",
+            )
+
+        async with admin_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT enabled FROM dalton_data_task_defs WHERE job_key = 'softbank-nav-monitor'"
+            )
+            def_row_after_rb_reject = await cur.fetchone()
+        assert def_row_after_rb_reject is not None
+        assert def_row_after_rb_reject["enabled"] is False
+
+        claimed_2 = await claim_next_queued_run(
+            admin_conn,
+            now_utc=slot_now + timedelta(minutes=5),
+            available_memory_mb=8192,
+            only_run_id=trial_run_id_2,
+        )
+        assert claimed_2 is not None
+        assert claimed_2.run_id == trial_run_id_2
+        assert claimed_2.is_trial is True
+        committed_2, _ = await execute_claimed_container_run(
+            admin_conn,
+            lock_conn=lock_conn,
+            docker_client=docker_client,
+            claimed=claimed_2,
+            decrypted_secrets={},
+            path_map=path_map,
+        )
+        assert committed_2 is True
+
+        rb_ok = await system_jobs_mod.rollback_data_task_config(
+            pm_user_id,
+            "softbank-nav-monitor",
+        )
+        assert rb_ok["job"]["enabled"] is True
+    finally:
+        await release_scheduler_lock(lock_conn, close_conn=True)
+        try:
+            async with admin_conn.transaction():
+                async with admin_conn.cursor() as cur:
+                    await cur.execute(
+                        "DELETE FROM user_preferences WHERE user_id = %s",
+                        (pm_user_id,),
+                    )
+                    await cur.execute(
+                        "DELETE FROM users WHERE user_id = %s",
+                        (pm_user_id,),
+                    )
+        except Exception:
+            pass
+        try:
+            await _reset_data_task_tables(admin_conn)
+        except Exception:
+            pass
+        await admin_conn.close()
+
 

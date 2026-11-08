@@ -1055,6 +1055,41 @@ async def _ensure_and_lock_data_task_def_row(
     return dict(seeded)
 
 
+async def _reject_enable_if_trial_run_active(
+    cur: Any,
+    job_key: str,
+    *,
+    current_enabled: bool,
+    target_enabled: bool,
+) -> None:
+    """Reject enabling a disabled data task while a manual trial run is queued or running.
+
+    Must be called inside a transaction that has already locked ``dalton_data_task_defs``
+    ``FOR UPDATE`` so trial-run claim (`FOR SHARE`) and task enable are mutually exclusive.
+    """
+    if current_enabled or not target_enabled:
+        return
+    await cur.execute(
+        """
+        SELECT run_id
+        FROM dalton_data_task_runs
+        WHERE job_key = %s
+          AND trigger_source = 'manual'
+          AND status IN ('queued', 'starting', 'running')
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (job_key,),
+    )
+    active_trial = await cur.fetchone()
+    if isinstance(active_trial, Mapping) and active_trial.get("run_id"):
+        trial_run_id = str(active_trial["run_id"])
+        raise ValueError(f"试跑进行中（run_id={trial_run_id}），结束后再开启")
+    if isinstance(active_trial, (tuple, list)) and active_trial and active_trial[0]:
+        trial_run_id = str(active_trial[0])
+        raise ValueError(f"试跑进行中（run_id={trial_run_id}），结束后再开启")
+
+
 async def _write_pm_data_task_notify_route_in_tx(
     conn: Any,
     *,
@@ -1206,6 +1241,12 @@ async def rollback_data_task_config(
 
             target_snapshot = target_entry["snapshot"]
             restored_enabled = bool(target_snapshot.get("enabled", False))
+            await _reject_enable_if_trial_run_active(
+                cur,
+                target,
+                current_enabled=old_enabled,
+                target_enabled=restored_enabled,
+            )
             restored_routes = [
                 str(x).strip()
                 for x in (target_snapshot.get("notify_routes") or [])
@@ -1750,6 +1791,12 @@ async def toggle_system_job(
 
                     new_enabled = (
                         bool(enabled) if enabled is not None else old_enabled
+                    )
+                    await _reject_enable_if_trial_run_active(
+                        cur,
+                        target,
+                        current_enabled=old_enabled,
+                        target_enabled=new_enabled,
                     )
                     new_routes = (
                         list(normalized_routes_local)
