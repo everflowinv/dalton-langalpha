@@ -500,76 +500,76 @@ async def run_wrapped_command(
     start_mono = clock()
     last_output_mono = start_mono
 
-    proc = await asyncio.create_subprocess_exec(
-        *command_argv,
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=workdir if Path(workdir).is_dir() else None,
-        env=child_env,
-        start_new_session=True,
-    )
-
-    stdout_chunks: list[str] = []
-    stderr_chunks: list[str] = []
-
-    async def _pump_stream(
-        reader: asyncio.StreamReader | None,
-        sink: TextIO,
-        collector: list[str],
-    ) -> None:
-        nonlocal last_output_mono
-        if reader is None:
-            return
-        while True:
-            line = await reader.readline()
-            if not line:
-                break
-            last_output_mono = clock()
-            decoded = line.decode("utf-8", errors="replace")
-            redacted_line = redactor.redact_text(decoded)
-            collector.append(redacted_line)
-            sink.write(redacted_line)
-            sink.flush()
-
-    pump_out = asyncio.create_task(_pump_stream(proc.stdout, out_stream, stdout_chunks))
-    pump_err = asyncio.create_task(_pump_stream(proc.stderr, err_stream, stderr_chunks))
-
-    timed_out = False
-    timeout_kind: str | None = None
-
     try:
-        while proc.returncode is None:
-            now_mono = clock()
-            if now_mono - start_mono > effective_timeout:
-                timed_out = True
-                timeout_kind = "total"
-                await _terminate_process_group(proc)
-                break
-            if effective_no_output is not None and (now_mono - last_output_mono > effective_no_output):
-                timed_out = True
-                timeout_kind = "no_output"
-                await _terminate_process_group(proc)
-                break
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=poll_interval_seconds)
-            except asyncio.TimeoutError:
-                continue
-    finally:
-        await asyncio.gather(pump_out, pump_err, return_exceptions=True)
-
-    if timed_out:
-        exit_code = (
-            EXIT_CODE_NO_OUTPUT_TIMEOUT
-            if timeout_kind == "no_output"
-            else EXIT_CODE_TOTAL_TIMEOUT
+        proc = await asyncio.create_subprocess_exec(
+            *command_argv,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=workdir if Path(workdir).is_dir() else None,
+            env=child_env,
+            start_new_session=True,
         )
-    else:
-        exit_code = int(proc.returncode or 0)
-    redacted_stdout = "".join(stdout_chunks)
-    redacted_stderr = "".join(stderr_chunks)
 
-    try:
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+
+        async def _pump_stream(
+            reader: asyncio.StreamReader | None,
+            sink: TextIO,
+            collector: list[str],
+        ) -> None:
+            nonlocal last_output_mono
+            if reader is None:
+                return
+            while True:
+                line = await reader.readline()
+                if not line:
+                    break
+                last_output_mono = clock()
+                decoded = line.decode("utf-8", errors="replace")
+                redacted_line = redactor.redact_text(decoded)
+                collector.append(redacted_line)
+                sink.write(redacted_line)
+                sink.flush()
+
+        pump_out = asyncio.create_task(_pump_stream(proc.stdout, out_stream, stdout_chunks))
+        pump_err = asyncio.create_task(_pump_stream(proc.stderr, err_stream, stderr_chunks))
+
+        timed_out = False
+        timeout_kind: str | None = None
+
+        try:
+            while proc.returncode is None:
+                now_mono = clock()
+                if now_mono - start_mono > effective_timeout:
+                    timed_out = True
+                    timeout_kind = "total"
+                    await _terminate_process_group(proc)
+                    break
+                if effective_no_output is not None and (now_mono - last_output_mono > effective_no_output):
+                    timed_out = True
+                    timeout_kind = "no_output"
+                    await _terminate_process_group(proc)
+                    break
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=poll_interval_seconds)
+                except asyncio.TimeoutError:
+                    continue
+        finally:
+            await asyncio.gather(pump_out, pump_err, return_exceptions=True)
+
+        if timed_out:
+            exit_code = (
+                EXIT_CODE_NO_OUTPUT_TIMEOUT
+                if timeout_kind == "no_output"
+                else EXIT_CODE_TOTAL_TIMEOUT
+            )
+        else:
+            exit_code = int(proc.returncode or 0)
+        redacted_stdout = "".join(stdout_chunks)
+        redacted_stderr = "".join(stderr_chunks)
+
         outbox_payload = persist_redacted_outbox(
             outbox_path=outbox_path,
             staging_outbox_path=staging_outbox_path,
@@ -578,6 +578,10 @@ async def run_wrapped_command(
             stdout_text=redacted_stdout,
         )
     finally:
+        try:
+            staging_outbox_path.unlink(missing_ok=True)
+        except Exception:
+            pass
         if cleanup_staging_dir:
             shutil.rmtree(staging_dir, ignore_errors=True)
 

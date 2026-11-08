@@ -110,11 +110,14 @@ def load_manifest_entries(path: Path | str | None = None) -> list[DataTaskManife
 async def sync_manifest_to_db(conn: Any, manifest: DataTaskManifest | None = None) -> int:
     """Idempotently synchronize the 19 task definitions into ``dalton_data_task_defs`` (§3.1, §7.1.5).
 
-    Synchronizes the active ``cron_expr`` and ``timezone`` from ``manifest.yaml`` (excluding
-    ``cutover_cron`` / ``cutover_timezone``). Existing rows keep their runtime state
-    (``enabled``, ``notify_enabled``, ``cos_mode``, ``paused_by_user``, ``consecutive_failures``,
-    ``config_version``, ``active_version``, ``updated_by``, ``audit_history``).
-    Newly inserted rows initialize ``audit_history`` with the ``version = 1`` baseline snapshot.
+    Newly inserted rows initialize ``cron_expr``, ``timezone``, ``enabled``, ``notify_enabled``,
+    and ``audit_history`` (``version = 1`` baseline snapshot) from ``manifest.yaml`` (excluding
+    ``cutover_cron`` / ``cutover_timezone``). Existing rows keep their versioned/runtime state
+    (``cron_expr``, ``timezone``, ``enabled``, ``notify_enabled``, ``cos_mode``, ``paused_by_user``,
+    ``consecutive_failures``, ``config_version``, ``active_version``, ``updated_by``, ``audit_history``)
+    while static execution fields (``task_code``, ``title``, ``batch_no``, ``runner``,
+    ``timeout_seconds``, ``no_output_timeout_seconds``, ``command_argv``, ``workdir``,
+    ``required_secrets``) are updated from ``manifest.yaml``.
     """
     loaded = manifest or load_data_task_manifest()
     now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -132,6 +135,8 @@ async def sync_manifest_to_db(conn: Any, manifest: DataTaskManifest | None = Non
                     "snapshot": {
                         "enabled": bool(entry.enabled),
                         "notify_routes": [],
+                        "cron_expr": entry.cron_expr,
+                        "timezone": entry.timezone,
                     },
                 }
             ]
@@ -189,8 +194,6 @@ async def sync_manifest_to_db(conn: Any, manifest: DataTaskManifest | None = Non
                     title                     = EXCLUDED.title,
                     batch_no                  = EXCLUDED.batch_no,
                     runner                    = EXCLUDED.runner,
-                    cron_expr                 = EXCLUDED.cron_expr,
-                    timezone                  = EXCLUDED.timezone,
                     timeout_seconds           = EXCLUDED.timeout_seconds,
                     no_output_timeout_seconds = EXCLUDED.no_output_timeout_seconds,
                     command_argv              = EXCLUDED.command_argv,

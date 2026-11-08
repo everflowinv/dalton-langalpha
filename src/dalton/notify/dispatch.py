@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 import inspect
@@ -1158,7 +1158,15 @@ async def claim_target_delivery(
                 ON CONFLICT (execution_id, channel, target) DO UPDATE
                 SET status = 'pending',
                     attempt_count = dalton_notify_deliveries.attempt_count + 1,
-                    payload_json = EXCLUDED.payload_json,
+                    payload_json = CASE
+                        WHEN dalton_notify_deliveries.payload_json ? 'cards_sent'
+                             AND NOT (EXCLUDED.payload_json ? 'cards_sent')
+                        THEN EXCLUDED.payload_json || jsonb_build_object(
+                            'cards_sent',
+                            dalton_notify_deliveries.payload_json -> 'cards_sent'
+                        )
+                        ELSE EXCLUDED.payload_json
+                    END,
                     updated_at = NOW()
                 WHERE (
                     dalton_notify_deliveries.status = 'failed'
@@ -1287,7 +1295,7 @@ async def fetch_execution_deliveries(
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
-                SELECT execution_id, channel, target, status, error_code, attempt_count
+                SELECT execution_id, channel, target, status, error_code, attempt_count, payload_json
                 FROM dalton_notify_deliveries
                 WHERE execution_id = %s
                 ORDER BY created_at ASC, target ASC
@@ -1296,6 +1304,41 @@ async def fetch_execution_deliveries(
             )
             rows = await cur.fetchall()
             return [dict(r) for r in (rows or []) if isinstance(r, Mapping)]
+
+
+async def update_delivery_cards_sent(
+    execution_id: str,
+    channel: str,
+    target: str,
+    cards_sent: int,
+) -> bool:
+    """Persist ``cards_sent`` progress inside ``dalton_notify_deliveries.payload_json``."""
+    exec_id = (execution_id or "").strip()
+    ch = (channel or "").strip().lower()
+    tgt = (target or "").strip()
+    if not (exec_id and ch and tgt):
+        return False
+    try:
+        async with get_db_connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    UPDATE dalton_notify_deliveries
+                    SET payload_json = COALESCE(payload_json, '{}'::jsonb)
+                        || jsonb_build_object('cards_sent', %s::int),
+                        updated_at = NOW()
+                    WHERE execution_id = %s
+                      AND channel = %s
+                      AND target = %s
+                    """,
+                    (int(cards_sent), exec_id, ch, tgt),
+                )
+                updated_rows = (
+                    cur.rowcount if isinstance(cur.rowcount, int) else 0
+                )
+                return updated_rows > 0
+    except Exception:
+        return False
 
 
 async def _invoke_mark_delivery(
@@ -1382,6 +1425,9 @@ async def post_bridge_notify(
     targets: list[str],
     text: str,
     card: dict[str, Any] | None = None,
+    *,
+    images: list[dict[str, Any]] | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     """Call the host bridge ``POST /notify`` endpoint using configured bridge URL and token.
 
@@ -1398,6 +1444,10 @@ async def post_bridge_notify(
     body: dict[str, Any] = {"targets": list(targets), "text": text}
     if card is not None:
         body["card"] = card
+    if images:
+        body["images"] = [dict(img) for img in images if isinstance(img, Mapping)]
+    if run_id:
+        body["run_id"] = str(run_id)
 
     http_timeout = get_notify_http_timeout_s()
     async with httpx.AsyncClient(
@@ -1536,21 +1586,165 @@ async def send_dalton_notify_test(
     return {"ok": False, "detail": detail, "error_code": error_code}
 
 
+def extract_feishu_cards_from_payload(
+    payload: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Return normalized ``feishu_cards`` entries from ``payload`` when non-empty, preserving card dicts as-is."""
+    if not isinstance(payload, Mapping):
+        return []
+    raw_cards = payload.get("feishu_cards")
+    if not isinstance(raw_cards, list) or not raw_cards:
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw_cards:
+        if not isinstance(item, Mapping):
+            continue
+        raw_card = item.get("card")
+        if not isinstance(raw_card, Mapping):
+            continue
+        entry: dict[str, Any] = {"card": dict(raw_card)}
+        raw_images = item.get("images")
+        if isinstance(raw_images, list):
+            entry["images"] = [
+                dict(img) for img in raw_images if isinstance(img, Mapping)
+            ]
+        else:
+            entry["images"] = []
+        if "chat_id" in item and item.get("chat_id") is not None:
+            entry["chat_id"] = str(item["chat_id"])
+        out.append(entry)
+    return out
+
+
+def _callable_accepts_kwarg(fn: Any, kwarg_name: str) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (ValueError, TypeError):
+        return False
+    if kwarg_name in sig.parameters:
+        return True
+    return any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
+
+
 async def _invoke_post_notify(
     post_notify_fn: Callable[..., Awaitable[dict[str, Any]]],
     targets: list[str],
     text: str,
     card: dict[str, Any] | None,
+    *,
+    images: list[dict[str, Any]] | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
-    try:
-        sig = inspect.signature(post_notify_fn)
-        if "card" in sig.parameters or any(
-            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-        ):
+    extra_kwargs: dict[str, Any] = {}
+    side_effect = getattr(post_notify_fn, "side_effect", None)
+    eff_fn = side_effect if callable(side_effect) else post_notify_fn
+    if images is not None and _callable_accepts_kwarg(post_notify_fn, "images") and _callable_accepts_kwarg(eff_fn, "images"):
+        extra_kwargs["images"] = images
+    if run_id is not None and _callable_accepts_kwarg(post_notify_fn, "run_id") and _callable_accepts_kwarg(eff_fn, "run_id"):
+        extra_kwargs["run_id"] = run_id
+
+    if _callable_accepts_kwarg(post_notify_fn, "card") and _callable_accepts_kwarg(eff_fn, "card"):
+        return await post_notify_fn(targets, text, card=card, **extra_kwargs)
+    if _callable_accepts_kwarg(post_notify_fn, "card"):
+        try:
             return await post_notify_fn(targets, text, card=card)
-    except (ValueError, TypeError):
-        pass
+        except TypeError:
+            pass
     return await post_notify_fn(targets, text)
+
+
+async def dispatch_target_with_payload(
+    post_notify_fn: Callable[..., Awaitable[dict[str, Any]]],
+    targets: list[str],
+    text: str,
+    card: dict[str, Any] | None,
+    payload: Mapping[str, Any] | None = None,
+    *,
+    run_id: str | None = None,
+    channel: str | None = None,
+    check_lock_fn: Callable[[], Awaitable[Any]] | None = None,
+    persist_cards_sent_fn: Callable[[str, str, str, int], Awaitable[Any]] | None = None,
+) -> dict[str, Any]:
+    """Forward ``payload['feishu_cards']`` in list order starting from ``cards_sent``; otherwise send ``(text, card)``."""
+    feishu_cards = extract_feishu_cards_from_payload(payload)
+    if not feishu_cards:
+        return await _invoke_post_notify(post_notify_fn, targets, text, card)
+
+    eff_run_id = (
+        str(run_id or (payload or {}).get("run_id") or "").strip() or None
+    )
+    raw_cards_sent = (
+        payload.get("cards_sent", 0) if isinstance(payload, Mapping) else 0
+    )
+    try:
+        start_idx = max(0, int(raw_cards_sent or 0))
+    except (TypeError, ValueError):
+        start_idx = 0
+
+    last_res: dict[str, Any] = {
+        "ok": True,
+        "status_code": 200,
+        "results": [{"target": t, "ok": True} for t in targets],
+    }
+    if start_idx >= len(feishu_cards):
+        return last_res
+
+    persist_fn = persist_cards_sent_fn or update_delivery_cards_sent
+    for card_idx in range(start_idx, len(feishu_cards)):
+        if card_idx > start_idx and check_lock_fn is not None:
+            await check_lock_fn()
+        card_item = feishu_cards[card_idx]
+        raw_card = card_item["card"]
+        raw_images = card_item.get("images")
+        images_arg = (
+            raw_images if isinstance(raw_images, list) and raw_images else None
+        )
+        last_res = await _invoke_post_notify(
+            post_notify_fn,
+            targets,
+            text,
+            raw_card,
+            images=images_arg,
+            run_id=eff_run_id,
+        )
+        # Stop immediately if any target was skipped or failed on this card
+        if isinstance(last_res, Mapping) and isinstance(last_res.get("results"), list):
+            any_skipped = any(
+                isinstance(r, Mapping)
+                and (
+                    r.get("skipped") is True
+                    or str(r.get("status") or "").strip().lower() == "skipped"
+                )
+                for r in last_res["results"]
+            )
+            if any_skipped:
+                return last_res
+        outcomes, _ = _evaluate_target_results(targets, last_res)
+        if not all(outcomes.get(t, False) for t in targets):
+            return last_res
+
+        new_cards_sent = card_idx + 1
+        if isinstance(payload, MutableMapping):
+            payload["cards_sent"] = new_cards_sent
+        if eff_run_id:
+            for t in targets:
+                eff_ch = (channel or "").strip().lower()
+                if not eff_ch:
+                    eff_ch, _ = _split_target_channel(t)
+                if eff_ch and t:
+                    persisted = await persist_fn(eff_run_id, eff_ch, t, new_cards_sent)
+                    if persisted is False:
+                        # DALTON-HOOK(data-jobs): without a stored position a retry
+                        # restarts from the first unsent card it knows of; sending
+                        # more cards now would only widen what gets repeated.
+                        logger.warning(
+                            "data_task_cards_progress_not_persisted | run=%s target=%s cards_sent=%s",
+                            eff_run_id, t, new_cards_sent,
+                        )
+                        return {"ok": False, "status_code": 500, "error": "cards_progress_persist_failed"}
+    return last_res
 
 
 def _evaluate_target_results(
@@ -1878,13 +2072,20 @@ async def retry_failed_notify_deliveries(
                                   )
                               )
                               AND attempt_count < %s
-                            RETURNING attempt_count
+                            RETURNING attempt_count, payload_json
                             """,
                             (exec_id, ch, tgt, stale_pending_minutes, max_attempts),
                         )
                         claimed_row = await cur.fetchone()
                         if claimed_row is not None:
                             row_claimed = True
+                            if isinstance(claimed_row, Mapping) and isinstance(
+                                claimed_row.get("payload_json"), Mapping
+                            ):
+                                if isinstance(payload, MutableMapping):
+                                    payload.update(claimed_row["payload_json"])
+                                else:
+                                    payload = dict(claimed_row["payload_json"])
                 if not row_claimed:
                     continue
 
@@ -1896,7 +2097,15 @@ async def retry_failed_notify_deliveries(
                 )
                 remaining_s = max(0.1, max_duration_s - (time.monotonic() - started_at))
                 bridge_res = await asyncio.wait_for(
-                    _invoke_post_notify(post_notify_fn, [tgt], text, card),
+                    dispatch_target_with_payload(
+                        post_notify_fn,
+                        [tgt],
+                        text,
+                        card,
+                        payload,
+                        run_id=exec_id,
+                        channel=ch,
+                    ),
                     timeout=remaining_s,
                 )
                 outcomes, batch_err = _evaluate_target_results([tgt], bridge_res)

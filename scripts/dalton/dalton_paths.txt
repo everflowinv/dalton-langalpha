@@ -166,6 +166,7 @@ src/dalton/data_jobs/freeze.py
 scripts/dalton/data_tasks_parity.py
 scripts/dalton/data_task_run_now.py
 scripts/dalton/seed_openclaw_data.sh
+scripts/dalton/openclaw_overlays/scripts/feishu_send_card.py
 tests/unit/dalton/fixtures/oc1_task_baseline.md
 tests/unit/dalton/test_data_jobs.py
 tests/integration/dalton/test_data_jobs_db.py

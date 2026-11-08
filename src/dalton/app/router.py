@@ -111,6 +111,8 @@ class UserSettingsUpdateRequest(BaseModel):
 class SystemJobToggleRequest(BaseModel):
     enabled: bool | None = None
     notify_routes: list[str] | None = None
+    cron_expr: str | None = None
+    timezone: str | None = None
 
 
 class CoverageMutateRequest(BaseModel):
@@ -1691,14 +1693,20 @@ async def toggle_system_job_endpoint(
                 key,
                 enabled=body.enabled,
                 notify_routes=body.notify_routes,
+                cron_expr=body.cron_expr,
+                timezone=body.timezone,
                 actor_user_id=str(user_id).strip(),
                 force=True,
                 respect_user_pause=False,
             )
-        if body.notify_routes is not None:
+        if (
+            body.notify_routes is not None
+            or body.cron_expr is not None
+            or body.timezone is not None
+        ):
             raise HTTPException(
                 status_code=400,
-                detail="仅公司公共数据任务支持通过此接口修改 notify_routes",
+                detail="仅公司公共数据任务支持通过此接口修改 notify_routes、cron_expr 或 timezone",
             )
         if body.enabled is None:
             raise HTTPException(status_code=400, detail="enabled 不能为空")

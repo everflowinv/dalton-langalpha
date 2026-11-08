@@ -11425,11 +11425,70 @@ class ResearchDataBridge:
         raw_targets = body.get("targets")
         raw_text = body.get("text")
         raw_card = body.get("card")
+        raw_feishu_cards = body.get("feishu_cards")
+        raw_images = body.get("images")
+        raw_run_id = body.get("run_id")
+
+        if raw_card is not None and not isinstance(raw_card, dict):
+            return 400, {"ok": False, "error": "card must be an object"}
         card_dict = raw_card if isinstance(raw_card, dict) else None
+
+        if raw_feishu_cards is not None and (
+            not isinstance(raw_feishu_cards, list) or not raw_feishu_cards
+        ):
+            return 400, {"ok": False, "error": "feishu_cards must be a non-empty list"}
+
         if not isinstance(raw_targets, list) or not raw_targets:
             return 400, {"ok": False, "error": "targets must be a non-empty list"}
-        if (not isinstance(raw_text, str) or not raw_text.strip()) and card_dict is None:
+        if (
+            (not isinstance(raw_text, str) or not raw_text.strip())
+            and card_dict is None
+            and raw_feishu_cards is None
+        ):
             return 400, {"ok": False, "error": "text must be a non-empty string"}
+
+        run_id_str = (
+            str(raw_run_id).strip()
+            if isinstance(raw_run_id, str) and raw_run_id.strip()
+            else None
+        )
+        data_root = Path(self.cfg.data_tasks_data_root)
+
+        prepared_cards: list[dict[str, Any]] = []
+        try:
+            if raw_feishu_cards is not None:
+                for card_entry in raw_feishu_cards:
+                    if not isinstance(card_entry, Mapping) or not isinstance(
+                        card_entry.get("card"), dict
+                    ):
+                        return 400, {
+                            "ok": False,
+                            "error": "each feishu_cards entry must contain a card object",
+                        }
+                    prepared_cards.append(
+                        _prepare_notify_card_with_images(
+                            card_entry["card"],
+                            card_entry.get("images"),
+                            data_root=data_root,
+                            run_id=run_id_str,
+                        )
+                    )
+            elif card_dict is not None:
+                prepared_cards.append(
+                    _prepare_notify_card_with_images(
+                        card_dict,
+                        raw_images,
+                        data_root=data_root,
+                        run_id=run_id_str,
+                    )
+                )
+            elif raw_images is not None:
+                return 400, {
+                    "ok": False,
+                    "error": "images cannot be provided without card or feishu_cards",
+                }
+        except ValueError as img_exc:
+            return 400, {"ok": False, "error": str(img_exc)}
 
         text = str(raw_text or "").strip()
         token = self.cfg.openclaw_gateway_token
@@ -11457,7 +11516,7 @@ class ResearchDataBridge:
                 kind = target_arg.split(":", 1)[0] if ":" in target_arg else "user"
                 display_target = f"feishu:{kind}:<id>"
 
-            if channel == "feishu" and card_dict is not None:
+            if channel == "feishu" and prepared_cards:
                 # Both feishu target shapes ride the same OpenClaw send-card
                 # script (it is the bot's own delivery channel); only the id
                 # namespace differs.
@@ -11470,40 +11529,47 @@ class ResearchDataBridge:
                     else target_arg
                 )
                 try:
-                    card_res = await asyncio.to_thread(
-                        _run_feishu_send_card,
-                        script_path=self.cfg.feishu_send_card_script,
-                        receive_id=receive_id,
-                        card=card_dict,
-                        receive_id_type=receive_id_type,
-                        timeout_s=self.cfg.feishu_send_card_timeout_s,
-                    )
-                    ok = card_res.get("ok") is True
-                    exit_code = card_res.get("exit_code")
-                    if ok:
+                    all_cards_ok = True
+                    last_exit_code: Any = 0
+                    last_err_code = "card_send_failed"
+                    for prepared_card in prepared_cards:
+                        card_res = await asyncio.to_thread(
+                            _run_feishu_send_card,
+                            script_path=self.cfg.feishu_send_card_script,
+                            receive_id=receive_id,
+                            card=prepared_card,
+                            receive_id_type=receive_id_type,
+                            timeout_s=self.cfg.feishu_send_card_timeout_s,
+                        )
+                        last_exit_code = card_res.get("exit_code")
+                        if card_res.get("ok") is not True:
+                            all_cards_ok = False
+                            last_err_code = str(
+                                card_res.get("error") or f"exit_code={last_exit_code}"
+                            )
+                            break
+
+                    if all_cards_ok:
                         logger.info(
                             "notify target=%s channel=feishu mode=card status=ok exit_code=%s",
                             display_target,
-                            exit_code,
+                            last_exit_code,
                         )
                         results.append(
                             {"target": target_str, "channel": "feishu", "ok": True}
                         )
                     else:
-                        err_code = str(
-                            card_res.get("error") or f"exit_code={exit_code}"
-                        )
                         logger.warning(
                             "notify target=%s channel=feishu mode=card status=error exit_code=%s",
                             display_target,
-                            exit_code,
+                            last_exit_code,
                         )
                         results.append(
                             {
                                 "target": target_str,
                                 "channel": "feishu",
                                 "ok": False,
-                                "error": err_code,
+                                "error": last_err_code,
                             }
                         )
                 except Exception as card_exc:
@@ -15122,6 +15188,11 @@ class ResearchDataBridge:
                 }
 
             child_env = seed_asr_client.strip_asr_credentials_from_env(dict(os.environ))
+            run_outbox_file = data_root / ".dalton-runs" / str(run_id) / "outbox.json"
+            run_outbox_file.parent.mkdir(parents=True, exist_ok=True)
+            child_env["DALTON_RUN_ID"] = str(run_id)
+            child_env["DALTON_RUN_DIR"] = str(run_outbox_file.parent)
+            child_env["DALTON_OUTBOX_FILE"] = str(run_outbox_file)
             if host_mode == "run":
                 child_env["OPENCLAW_WORKSPACE"] = str(data_root)
                 child_env["DALTON_PYTHON_BIN"] = str(os.environ.get("DALTON_PYTHON_BIN") or py_bin)
@@ -15580,6 +15651,155 @@ def build_feishu_send_card_cmd(
     return cmd
 
 
+def _resolve_and_validate_notify_image_path(
+    raw_path: str,
+    *,
+    data_root: Path,
+    run_id: str | None = None,
+) -> Path:
+    """Resolve and validate that an image file path stays strictly inside ``data_root``."""
+    cleaned = str(raw_path or "").strip()
+    if not cleaned:
+        raise ValueError("invalid_image_path: empty image path")
+
+    p = Path(cleaned)
+    if ".." in p.parts:
+        raise ValueError("invalid_image_path: path traversal ('..') is forbidden")
+
+    resolved_root = data_root.resolve()
+    cleaned_run_id: str | None = None
+    if run_id is not None and str(run_id).strip():
+        cleaned_run_id = str(run_id).strip()
+        if (
+            "/" in cleaned_run_id
+            or "\\" in cleaned_run_id
+            or ".." in Path(cleaned_run_id).parts
+        ):
+            raise ValueError("invalid_image_path: invalid run_id")
+
+    ocw_prefix = "/Users/everflow/.openclaw/workspace/"
+    if p.is_absolute():
+        if cleaned.startswith(ocw_prefix):
+            rel_str = cleaned[len(ocw_prefix) :].lstrip("/")
+            if not rel_str or ".." in Path(rel_str).parts:
+                raise ValueError(
+                    "invalid_image_path: invalid workspace-relative image path"
+                )
+            candidate = resolved_root / rel_str
+        else:
+            candidate = p
+    else:
+        if cleaned_run_id:
+            run_candidate = resolved_root / ".dalton-runs" / cleaned_run_id / p
+            root_candidate = resolved_root / p
+            candidate = (
+                run_candidate
+                if (run_candidate.exists() or not root_candidate.exists())
+                else root_candidate
+            )
+        else:
+            candidate = resolved_root / p
+
+    if candidate.is_symlink():
+        raise ValueError("invalid_image_path: symlinks are not allowed")
+
+    resolved = candidate.resolve()
+    if not resolved.is_relative_to(resolved_root) or resolved == resolved_root:
+        raise ValueError(
+            "invalid_image_path: image path must resolve inside data volume"
+        )
+
+    cur_dir = candidate.parent
+    while True:
+        if cur_dir.is_symlink():
+            target_dir = cur_dir.resolve()
+            if not target_dir.is_relative_to(resolved_root):
+                raise ValueError("invalid_image_path: symlink escapes data volume")
+        if cur_dir == resolved_root or cur_dir.parent == cur_dir:
+            break
+        cur_dir = cur_dir.parent
+
+    return resolved
+
+
+def _prepare_notify_card_with_images(
+    card: dict[str, Any],
+    images: Any,
+    *,
+    data_root: Path,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    """Validate ``images`` and ``__img__`` elements in ``card`` against ``data_root`` and rewrite ``__img__`` paths in a copy."""
+    prepared = json.loads(json.dumps(card))
+    placeholder_map: dict[str, str] = {}
+    ordered_resolved: list[str] = []
+
+    if images is not None:
+        if not isinstance(images, list):
+            raise ValueError("invalid_images: images must be a list")
+        for item in images:
+            if not isinstance(item, Mapping):
+                raise ValueError(
+                    "invalid_images: each image entry must be an object"
+                )
+            raw_path = item.get("path")
+            if not isinstance(raw_path, str) or not raw_path.strip():
+                raise ValueError(
+                    "invalid_image_path: image entry path must be a non-empty string"
+                )
+            resolved_path = _resolve_and_validate_notify_image_path(
+                raw_path,
+                data_root=data_root,
+                run_id=run_id,
+            )
+            resolved_str = str(resolved_path)
+            ordered_resolved.append(resolved_str)
+            raw_ph = item.get("placeholder")
+            if isinstance(raw_ph, str) and raw_ph.strip():
+                placeholder_map[raw_ph.strip()] = resolved_str
+                placeholder_map[raw_ph] = resolved_str
+
+    img_counter = 0
+
+    def _rewrite_elements(elements: list[Any]) -> None:
+        nonlocal img_counter
+        for el in elements:
+            if not isinstance(el, dict):
+                continue
+            if el.get("tag") == "__img__":
+                raw_el_path = el.get("path")
+                if not isinstance(raw_el_path, str) or not raw_el_path.strip():
+                    raise ValueError(
+                        "invalid_image_path: __img__ element missing path"
+                    )
+                if raw_el_path in placeholder_map:
+                    el["path"] = placeholder_map[raw_el_path]
+                elif raw_el_path.strip() in placeholder_map:
+                    el["path"] = placeholder_map[raw_el_path.strip()]
+                elif img_counter < len(ordered_resolved) and not placeholder_map:
+                    el["path"] = ordered_resolved[img_counter]
+                else:
+                    resolved_el = _resolve_and_validate_notify_image_path(
+                        raw_el_path,
+                        data_root=data_root,
+                        run_id=run_id,
+                    )
+                    el["path"] = str(resolved_el)
+                img_counter += 1
+            elif el.get("tag") == "collapsible_panel" and isinstance(
+                el.get("elements"), list
+            ):
+                _rewrite_elements(el["elements"])
+
+    body_obj = prepared.get("body")
+    if isinstance(body_obj, dict) and isinstance(body_obj.get("elements"), list):
+        _rewrite_elements(body_obj["elements"])
+    if isinstance(prepared.get("elements"), list):
+        _rewrite_elements(prepared["elements"])
+
+    return prepared
+
+
 def _run_feishu_send_card(
     *,
     script_path: Path,
@@ -15614,6 +15834,7 @@ def _run_feishu_send_card(
             dry_run=dry_run,
         )
         subproc_env = seed_asr_client.strip_asr_credentials_from_env(os.environ)
+        subproc_env.pop("DALTON_NO_DIRECT_SEND", None)
         proc = subprocess.run(
             cmd,
             env=subproc_env,

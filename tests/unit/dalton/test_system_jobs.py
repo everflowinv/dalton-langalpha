@@ -2656,23 +2656,46 @@ class _InMemoryDataTaskStore:
                     return
 
                 if "UPDATE dalton_data_task_defs" in q and "paused_by_user =" in q:
-                    enabled_val = bool(p[0])
-                    paused_val = bool(p[1])
-                    cfg_ver = int(p[2])
-                    act_ver = int(p[3])
-                    upd_by = p[4]
-                    hist_val = getattr(p[5], "obj", p[5])
-                    jk = str(p[6])
-                    self.defs[jk].update(
-                        {
-                            "enabled": enabled_val,
-                            "paused_by_user": paused_val,
-                            "config_version": cfg_ver,
-                            "active_version": act_ver,
-                            "updated_by": upd_by,
-                            "audit_history": [dict(x) for x in hist_val],
-                        }
-                    )
+                    if "cron_expr =" in q:
+                        enabled_val = bool(p[0])
+                        paused_val = bool(p[1])
+                        cron_val = str(p[2])
+                        tz_val = str(p[3])
+                        cfg_ver = int(p[4])
+                        act_ver = int(p[5])
+                        upd_by = p[6]
+                        hist_val = getattr(p[7], "obj", p[7])
+                        jk = str(p[8])
+                        self.defs[jk].update(
+                            {
+                                "enabled": enabled_val,
+                                "paused_by_user": paused_val,
+                                "cron_expr": cron_val,
+                                "timezone": tz_val,
+                                "config_version": cfg_ver,
+                                "active_version": act_ver,
+                                "updated_by": upd_by,
+                                "audit_history": [dict(x) for x in hist_val],
+                            }
+                        )
+                    else:
+                        enabled_val = bool(p[0])
+                        paused_val = bool(p[1])
+                        cfg_ver = int(p[2])
+                        act_ver = int(p[3])
+                        upd_by = p[4]
+                        hist_val = getattr(p[5], "obj", p[5])
+                        jk = str(p[6])
+                        self.defs[jk].update(
+                            {
+                                "enabled": enabled_val,
+                                "paused_by_user": paused_val,
+                                "config_version": cfg_ver,
+                                "active_version": act_ver,
+                                "updated_by": upd_by,
+                                "audit_history": [dict(x) for x in hist_val],
+                            }
+                        )
                     return
 
                 if "UPDATE dalton_data_task_defs" in q and "paused_by_user =" not in q:
@@ -3464,9 +3487,12 @@ async def test_data_jobs_notify_route_preference_guard_and_auto_prune_audit(
             "new": ["feishu:chat:oc_grp1"],
         }
     }
+    # Snapshots always carry the schedule, so a rollback to them restores it.
     assert last_audit["snapshot"] == {
         "enabled": True,
         "notify_routes": ["feishu:chat:oc_grp1"],
+        "cron_expr": "45 17 * * 1-5",
+        "timezone": "Asia/Shanghai",
     }
 
     # 4) `add_dalton_personal_notify_target` shrinking `data:*` routes (via `_validate_and_prune_notify_target_refs`)
@@ -3499,6 +3525,8 @@ async def test_data_jobs_notify_route_preference_guard_and_auto_prune_audit(
     assert add_prune_audit["snapshot"] == {
         "enabled": True,
         "notify_routes": ["feishu:chat:oc_grp1"],
+        "cron_expr": "45 17 * * 1-5",
+        "timezone": "Asia/Shanghai",
     }
 
     # 5) `toggle_system_job` with a Feishu group route:
@@ -3647,6 +3675,186 @@ async def test_data_jobs_notify_route_preference_guard_and_auto_prune_audit(
         )
     assert exc_409.value.status_code == 409
     assert exc_409.value.detail == "配置刚被其他人修改，请重试"
+
+
+@pytest.mark.asyncio
+async def test_pr12_data_jobs_schedule_routes_rollback_and_cos_conversation_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR 1-2 Item 4: Manage `data:*` schedule (`cron_expr`, `timezone`), `notify_routes`, `rollback`, and `run_now` in conversation (`dalton_system_jobs`)."""
+    store = _InMemoryAutomationsStore()
+    _wire_store(monkeypatch, store)
+    data_store = _InMemoryDataTaskStore()
+    tiers = {
+        USER_ID: "admin",
+        "internal-a": "internal",
+        "external-guest": "external",
+    }
+    data_store.wire(monkeypatch, tiers)
+    monkeypatch.setattr(
+        system_jobs_mod,
+        "_call_host_bridge",
+        create_autospec(
+            system_jobs_mod._call_host_bridge,
+            return_value=(200, {"ok": True, "jobs": []}),
+        ),
+    )
+
+    cos_sys_tool = {t.name: t for t in build_director_tools(role="chief_of_staff")}[
+        "dalton_system_jobs"
+    ]
+    int_cfg = {"configurable": {"user_id": "internal-a", "workspace_id": "home"}}
+    ext_cfg = {"configurable": {"user_id": "external-guest", "workspace_id": "home"}}
+
+    # 1) External user cannot see `data:*` in `list` and cannot modify schedule/routes or rollback
+    ext_list_out = json.loads(
+        await cos_sys_tool.ainvoke({"action": "list"}, config=ext_cfg)
+    )
+    assert ext_list_out["ok"] is True
+    assert not [j for j in ext_list_out["jobs"] if j["scope"] == "data"]
+
+    for ext_action_payload in (
+        {
+            "action": "update",
+            "key": "data:softbank-nav-monitor",
+            "cron_expr": "30 8 * * 1-5",
+            "timezone": "Asia/Tokyo",
+        },
+        {
+            "action": "rollback",
+            "key": "data:softbank-nav-monitor",
+        },
+    ):
+        ext_mut_out = json.loads(
+            await cos_sys_tool.ainvoke(ext_action_payload, config=ext_cfg)
+        )
+        assert ext_mut_out["ok"] is False
+        assert ext_mut_out["error"] == "forbidden_internal"
+
+    # 2) Invalid cron_expr or invalid timezone rejected with clear explanation
+    bad_cron_out = json.loads(
+        await cos_sys_tool.ainvoke(
+            {
+                "action": "update",
+                "key": "data:softbank-nav-monitor",
+                "cron_expr": "not a valid cron",
+            },
+            config=int_cfg,
+        )
+    )
+    assert bad_cron_out["ok"] is False
+    assert "非法 cron 表达式" in bad_cron_out["message"]
+
+    bad_tz_out = json.loads(
+        await cos_sys_tool.ainvoke(
+            {
+                "action": "update",
+                "key": "data:softbank-nav-monitor",
+                "timezone": "Mars/Olympus_Mons",
+            },
+            config=int_cfg,
+        )
+    )
+    assert bad_tz_out["ok"] is False
+    assert "非法时区" in bad_tz_out["message"]
+
+    # 3) Internal user updates schedule (`cron_expr`, `timezone`) and `notify_routes`, then enables -> versions v2, v3 with audit snapshots
+    orig_status = json.loads(
+        await cos_sys_tool.ainvoke(
+            {"action": "status", "key": "data:softbank-nav-monitor"},
+            config=int_cfg,
+        )
+    )
+    orig_cron = orig_status["job"]["schedule"]
+    orig_tz = orig_status["job"]["timezone"]
+
+    upd_v2 = json.loads(
+        await cos_sys_tool.ainvoke(
+            {
+                "action": "update",
+                "key": "data:softbank-nav-monitor",
+                "cron_expr": "45 16 * * 1-5",
+                "timezone": "Asia/Tokyo",
+                "notify_routes": ["feishu:chat:oc_macro_grp"],
+            },
+            config=int_cfg,
+        )
+    )
+    assert upd_v2["ok"] is True
+    assert upd_v2["config_version"] == 2
+    assert upd_v2["job"]["schedule"] == "45 16 * * 1-5"
+    assert upd_v2["job"]["timezone"] == "Asia/Tokyo"
+    assert upd_v2["job"]["notify_routes"] == ["feishu:chat:oc_macro_grp"]
+    v2_audit = upd_v2["job"]["audit_history"][-1]
+    assert v2_audit["version"] == 2
+    assert v2_audit["prev_version"] == 1
+    assert v2_audit["changes"]["cron_expr"] == {
+        "old": orig_cron,
+        "new": "45 16 * * 1-5",
+    }
+    assert v2_audit["changes"]["timezone"] == {
+        "old": orig_tz,
+        "new": "Asia/Tokyo",
+    }
+    assert v2_audit["snapshot"]["cron_expr"] == "45 16 * * 1-5"
+    assert v2_audit["snapshot"]["timezone"] == "Asia/Tokyo"
+
+    upd_v3 = json.loads(
+        await cos_sys_tool.ainvoke(
+            {
+                "action": "enable",
+                "key": "data:softbank-nav-monitor",
+                "cron_expr": "15 9 * * 1-5",
+                "timezone": "Asia/Shanghai",
+            },
+            config=int_cfg,
+        )
+    )
+    assert upd_v3["ok"] is True
+    assert upd_v3["config_version"] == 3
+    assert upd_v3["job"]["enabled"] is True
+    assert upd_v3["job"]["schedule"] == "15 9 * * 1-5"
+    assert upd_v3["job"]["timezone"] == "Asia/Shanghai"
+
+    # 4) `run_now` on enabled `data:*` succeeds and clearly states `where_to_check`
+    run_out = json.loads(
+        await cos_sys_tool.ainvoke(
+            {"action": "run_now", "key": "data:softbank-nav-monitor"},
+            config=int_cfg,
+        )
+    )
+    assert run_out["ok"] is True
+    assert run_out["status"] == "queued"
+    assert "数据任务面板" in run_out["where_to_check"]
+    assert run_out["where_to_check"] in run_out["message"]
+
+    # 5) Rollback v3 -> v2 restores previous schedule ("45 16 * * 1-5", "Asia/Tokyo") and enabled=False;
+    #    second rollback v2 -> v1 restores original manifest schedule (orig_cron, orig_tz).
+    rb_to_v2 = json.loads(
+        await cos_sys_tool.ainvoke(
+            {"action": "rollback", "key": "data:softbank-nav-monitor"},
+            config=int_cfg,
+        )
+    )
+    assert rb_to_v2["ok"] is True
+    assert rb_to_v2["restored_from_version"] == 2
+    assert rb_to_v2["job"]["enabled"] is False
+    assert rb_to_v2["job"]["schedule"] == "45 16 * * 1-5"
+    assert rb_to_v2["job"]["timezone"] == "Asia/Tokyo"
+    assert rb_to_v2["job"]["notify_routes"] == ["feishu:chat:oc_macro_grp"]
+
+    rb_to_v1 = json.loads(
+        await cos_sys_tool.ainvoke(
+            {"action": "rollback", "key": "data:softbank-nav-monitor"},
+            config=int_cfg,
+        )
+    )
+    assert rb_to_v1["ok"] is True
+    assert rb_to_v1["restored_from_version"] == 1
+    assert rb_to_v1["job"]["schedule"] == orig_cron
+    assert rb_to_v1["job"]["timezone"] == orig_tz
+    assert rb_to_v1["job"]["notify_routes"] == []
+
 
 
 
