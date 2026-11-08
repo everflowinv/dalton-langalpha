@@ -947,7 +947,7 @@ def test_container_create_config_and_path_mapping(tmp_path: Path) -> None:
     # Child outbox file points to tmpfs, not the persistent data volume
     assert env_map["DALTON_OUTBOX_FILE"] == f"{DEFAULT_TMPFS_OUTBOX_DIR}/outbox.json"
     assert "/app/.venv/bin" in env_map["PATH"]
-    assert env_map["PYTHONPATH"] == "/app"
+    assert env_map["PYTHONPATH"] == "/app:/app/src"
 
 
 # ---------------------------------------------------------------------------
@@ -979,7 +979,7 @@ async def test_wrapper_redacts_stdout_stderr_and_outbox_and_sets_env(tmp_path: P
     child_env = build_child_env(
         base_env={
             "PATH": "/usr/bin",
-            "PYTHONPATH": "/app:/Users/everflow/.openclaw/workspace/scripts",
+            "PYTHONPATH": "/app:/app/src:/Users/everflow/.openclaw/workspace/scripts",
         },
         workspace_dir=str(tmp_path),
         run_id="run-1",
@@ -993,7 +993,7 @@ async def test_wrapper_redacts_stdout_stderr_and_outbox_and_sets_env(tmp_path: P
     assert child_env["PYTHONPATH"] == "/Users/everflow/.openclaw/workspace/scripts"
 
     post_cutover_env = build_child_env(
-        base_env={"PYTHONPATH": "/app"},
+        base_env={"PYTHONPATH": "/app:/app/src"},
         workspace_dir=str(tmp_path),
         run_id="run-1",
         job_key=T5_JOB_KEY,

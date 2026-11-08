@@ -157,7 +157,10 @@ def build_container_create_config(
         "WORKDIR": str(paths.container_workspace_dir),
         "TZ": "America/New_York",
         "PATH": "/app/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        "PYTHONPATH": "/app",
+        # The image installs the core package editable only when the backend's
+        # entrypoint runs; task containers start under tini, so /app/src (where
+        # ptc_agent and friends live) has to be on the path explicitly.
+        "PYTHONPATH": "/app:/app/src",
         "DALTON_PYTHON_BIN": CONTAINER_PYTHON_BIN,
         "DALTON_NO_DIRECT_SEND": "1",
         "DALTON_NOTIFY_DRY_RUN": notify_dry_run,
