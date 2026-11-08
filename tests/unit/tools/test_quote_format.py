@@ -955,6 +955,15 @@ class TestExtendedHoursAndPrevCloseWording:
         assert subblock_line.endswith("(pre)")
         assert "2026-10-26 08:10:00 ET" not in subblock_line
 
+        # 4) A caller that renders no sub-block (the live stamp header) keeps the
+        #    trade clock even for the same snapshot: the suffix decision belongs
+        #    to the line that printed the `@ HH:MM`, not to price_clock.
+        from src.tools.market_data.quote_format import build_live_stamp
+
+        stamp = build_live_stamp([ginlix_pre_with_subblock], at=pre_at)
+        assert stamp is not None
+        assert "2026-10-26 08:10:00 ET" in stamp
+
 
 # DALTON-HOOK(extended-hours-quotes): a same-day non-US quote whose regular
 # fields are present but empty still reads "today", not "last close".

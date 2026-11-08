@@ -214,24 +214,13 @@ def print_time(snap: dict[str, Any]) -> Optional[datetime]:
         return None
 
 
-def _has_extended_clock(
-    snap: dict[str, Any],
-    ref: Optional[InstrumentRef],
-    at: Optional[datetime],
-) -> bool:
-    """Whether the quote body already renders an extended-hours ``@ HH:MM`` sub-block."""
-    phase = venue_phase(ref, at) if ref is not None else None
-    _, change_parts = format_quote_change_parts(
-        snap, ref, at, phase, fallback_price=current_price(snap), fmt_price=price_text
-    )
-    return any(" @ " in part for part in change_parts)
-
-
 def price_clock(
     snap: dict[str, Any],
     ref: Optional[InstrumentRef],
     freshness: Freshness | dict[str, Any],
     at: Optional[datetime] = None,
+    *,
+    body_has_clock: bool = False,
 ) -> Optional[str]:
     """Venue-local stamp for a row, at its print time when the provider gave one.
 
@@ -244,9 +233,10 @@ def price_clock(
     if _is_us_clock(ref) and (
         printed is None
         or (is_live(freshness) and (now - printed).total_seconds() <= QUOTE_LIVE_S)
-        # DALTON-HOOK(extended-hours-quotes): Omit the trailing clock only when
-        # the row body already emitted an extended-hours `@ HH:MM` sub-block.
-        or _has_extended_clock(snap, ref, at)
+        # DALTON-HOOK(extended-hours-quotes): omit the trailing clock only when
+        # the caller already rendered an extended-hours `@ HH:MM` sub-block in
+        # this row; callers that render none (stamps, headers) keep the clock.
+        or body_has_clock
     ):
         return None
     return print_clock(ref, printed or now)
@@ -318,7 +308,9 @@ def stamp_provider_quote(
     return stamp_quote(row, ref=ref)
 
 
-def _venue_suffix(row: _Row, at: Optional[datetime] = None) -> str:
+def _venue_suffix(
+    row: _Row, at: Optional[datetime] = None, *, body_has_clock: bool = False  # DALTON-HOOK(extended-hours-quotes)
+) -> str:
     """Per-line suffix: phase, freshness, and/or venue-local clock; '' on failure.
 
     A non-regular phase (pre/post/lunch/closed/halted) is surfaced so an
@@ -338,7 +330,7 @@ def _venue_suffix(row: _Row, at: Optional[datetime] = None) -> str:
         words = FRESHNESS_WORDS.get(row.freshness.label)
         if words:
             parts.append(words)
-        clock = price_clock(*row, at)
+        clock = price_clock(*row, at, body_has_clock=body_has_clock)  # DALTON-HOOK(extended-hours-quotes)
         if clock:
             parts.append(clock)
         return f" ({', '.join(parts)})" if parts else ""
@@ -381,7 +373,10 @@ def _line(row: _Row, prev_price: Optional[float], at: Optional[datetime]) -> str
     if prev_price and price is not None and prev_price > 0:
         delta_pct = (price - prev_price) / prev_price * 100
         parts.append(f"({'+' if delta_pct >= 0 else ''}{delta_pct:.2f}% since last check)")
-    return "  ".join(parts) + _venue_suffix(row, at)
+    # DALTON-HOOK(extended-hours-quotes): the suffix skips its clock only when
+    # this line already printed an extended-hours `@ HH:MM`.
+    body_has_clock = any(" @ " in part for part in change_parts)
+    return "  ".join(parts) + _venue_suffix(row, at, body_has_clock=body_has_clock)
 
 
 def format_quote_line(
