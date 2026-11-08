@@ -2202,7 +2202,7 @@ export function useChatMessages(
       const { reread, link, messageKey, messageValues } = claudeCodeRefusal(errorInfo.reason, workspaceId, errorInfo.limit);
       if (reread) refreshClaudeCode();
       const message = messageKey ? t(messageKey, messageValues) : worded;
-      return { banner: link ? { message, links: [link] } : message, answered: true };
+      return { banner: link ? { message, links: [link] } : { message }, answered: true };
     }
     return { banner: worded, answered: false };
   };

@@ -494,9 +494,19 @@ class SubagentSlotLease:
         return False
 
     async def wait_for_slot(self, task: Any, registry: Any = None) -> None:
+        wait_started = self.clock()
+        deferred_stop_at = getattr(task, "stop_at", None)
+        if (
+            self.status == "queued"
+            and not self._released
+            and deferred_stop_at is not None
+        ):
+            task.stop_at = None
         try:
             while self.status == "queued" and not self._released:
                 if getattr(task, "cancelled", False) or getattr(task, "completed", False):
+                    if getattr(task, "terminal_status", None) == "timeout":
+                        raise asyncio.CancelledError("subagent ran past its time limit")
                     raise asyncio.CancelledError(
                         "Subagent cancelled while queued for slot"
                     )
@@ -511,6 +521,8 @@ class SubagentSlotLease:
                     or getattr(task, "cancelled", False)
                     or getattr(task, "completed", False)
                 ):
+                    if getattr(task, "terminal_status", None) == "timeout":
+                        raise asyncio.CancelledError("subagent ran past its time limit")
                     raise asyncio.CancelledError(
                         "Subagent cancelled while queued for slot"
                     )
@@ -526,6 +538,11 @@ class SubagentSlotLease:
                 if await self.try_acquire_once(mode="acquire"):
                     now = self.clock()
                     task.last_updated_at = now
+                    if (
+                        deferred_stop_at is not None
+                        and getattr(task, "stop_at", None) is None
+                    ):
+                        task.stop_at = deferred_stop_at + max(0.0, now - wait_started)
                     if registry is not None and hasattr(registry, "note_alive"):
                         with contextlib.suppress(Exception):
                             await registry.note_alive(task)
@@ -739,6 +756,9 @@ async def wait_until_subagent_slot_acquired(task: Any) -> bool:
         writer = getattr(task, "asyncio_task", None)
         if writer is not None and not writer.done():
             acquire_waiter = asyncio.create_task(lease.acquired_event.wait())
+            acquire_waiter.add_done_callback(
+                lambda t: t.cancelled() or t.exception()
+            )
             try:
                 await asyncio.wait(
                     [acquire_waiter, writer],
@@ -747,19 +767,28 @@ async def wait_until_subagent_slot_acquired(task: Any) -> bool:
             finally:
                 if not acquire_waiter.done():
                     acquire_waiter.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await acquire_waiter
         else:
             await lease.acquired_event.wait()
     return bool(lease.was_queued and lease.acquired_at is not None)
 
 
-def abort_queued_subagent_on_cancel(task: Any) -> None:
+def abort_queued_subagent_on_cancel(
+    task: Any,
+    cancel: asyncio.CancelledError | None = None,
+) -> None:
     """If ``task`` is still waiting in the slot queue, cancel its handler task."""
     if is_subagent_queued(task):
         handler_task = getattr(task, "handler_task", None)
-        if handler_task is not None and not handler_task.done():
-            handler_task.cancel()
+        if (
+            handler_task is not None
+            and not handler_task.done()
+            and not handler_task.cancelling()
+        ):
+            msg = cancel.args[0] if cancel is not None and cancel.args else None
+            if msg is not None:
+                handler_task.cancel(msg)
+            else:
+                handler_task.cancel()
 
 
 async def release_subagent_slot(task: Any) -> None:

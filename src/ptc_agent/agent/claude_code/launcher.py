@@ -57,6 +57,7 @@ from claude_agent_sdk._internal.transport.subprocess_cli import (
     logger,
 )
 
+from ptc_agent.agent.claude_code.machine_token import _FD_ENV
 from ptc_agent.core.claude_code_managed import local_managed
 from src.llms.claude_code import ClaudeTurnFailed
 from src.server.database.encryption import get_encryption_key
@@ -70,14 +71,6 @@ _INHERITED = (
     "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy", "http_proxy", "no_proxy", "NODE_EXTRA_CA_CERTS",
 )
 _THREAD_KEY = re.compile(r"[A-Za-z0-9_-]{1,128}")
-#: The CLI reads an OAuth token from the descriptor this names, directly when
-#: it is a socket (macOS has no /proc/self/fd), and then drops the variable.
-TOKEN_FD_ENV = "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR"
-#: The same for an Anthropic API key, which the CLI reads once and keeps for
-#: the session (measured on CLI 2.1.310: a second query in one session runs
-#: on the key the descriptor gave the first).
-API_KEY_FD_ENV = "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR"
-_FD_ENV = {"setup_token": TOKEN_FD_ENV, "api_key": API_KEY_FD_ENV}
 #: The lines of the CLI's stderr kept, how long an exit waits for the last
 #: of them, and how much of them its log line holds.
 STDERR_KEPT = 50
@@ -143,27 +136,6 @@ def _token_socket(secret: str) -> socket.socket:
         child.close()
         raise
     return child
-
-
-class CliSlots:
-    """How many CLIs this worker runs at once: a run waits up to ``WAIT_S``
-    for a slot, then fails as ``busy`` before anything starts. It guards this
-    process's own children, so it is execution context, never read as status."""
-
-    WAIT_S = 30
-
-    def __init__(self, slots: int) -> None:
-        self.slots = slots
-        self._free = anyio.Semaphore(slots)
-
-    async def take(self) -> None:
-        with anyio.move_on_after(self.WAIT_S):
-            await self._free.acquire()
-            return
-        raise ClaudeTurnFailed("busy", f"all {self.slots} of this worker's Claude Code slots stayed in use")
-
-    def give(self) -> None:
-        self._free.release()
 
 
 @dataclass(frozen=True)
@@ -268,11 +240,12 @@ class Launcher(Protocol):
 class TokenStore(Protocol):
     """Where the credential a user's turns run on is kept: read as each run
     starts, so one replaced meanwhile is the one it runs on, and told when
-    Anthropic refuses it."""
+    Anthropic refuses what its last read returned. ``refused`` takes nothing:
+    the store knows what it handed out."""
 
     async def read(self) -> Credential | None: ...
 
-    async def refused(self, credential: Credential) -> None: ...
+    async def refused(self) -> None: ...
 
 
 class ScopedEnvTransport(SubprocessCLITransport):
@@ -283,16 +256,11 @@ class ScopedEnvTransport(SubprocessCLITransport):
     only, so a CLI that exits says why, as ``SSHTransport`` has it say.
     """
 
-    def __init__(
-        self, *, options: ClaudeAgentOptions, base_env: dict[str, str], credential: Credential | None,
-        slots: CliSlots | None = None,
-    ) -> None:
+    def __init__(self, *, options: ClaudeAgentOptions, base_env: dict[str, str], credential: Credential | None) -> None:
         self._stderr: deque[str] = deque(maxlen=STDERR_KEPT)
         super().__init__(prompt=_no_prompt(), options=replace(options, stderr=self._stderr.append))
         self._base_env = base_env
         self._credential = credential
-        self._slots = slots
-        self._holding = False
 
     async def read_messages(self) -> AsyncIterator[dict[str, Any]]:
         """The SDK's messages, with the CLI's own stderr on the ``ProcessError``
@@ -318,31 +286,6 @@ class ScopedEnvTransport(SubprocessCLITransport):
         return await exit_error(code, self._stderr, self._stderr_task.wait() if self._stderr_task is not None else None)
 
     async def connect(self) -> None:
-        """Start the CLI (``_start``) in one of the worker's ``slots``, held until
-        the transport closes, so the slots bound live CLIs alone."""
-        if self._process:
-            return
-        if self._slots is not None and not self._holding:
-            await self._slots.take()
-            self._holding = True
-        try:
-            await self._start()
-        except BaseException:
-            self._give_back()
-            raise
-
-    async def close(self) -> None:
-        try:
-            await super().close()
-        finally:
-            self._give_back()
-
-    def _give_back(self) -> None:
-        if self._holding:
-            self._holding = False
-            self._slots.give()
-
-    async def _start(self) -> None:
         """The SDK's ``connect`` (``SDK_CONNECT_SHA256``), changed in four places only.
 
         The environment is ``cli_env`` on ``base_env``, not ``os.environ``. The version
@@ -447,14 +390,12 @@ class LocalLauncher:
     run starts, which ``refused`` reports refused. ``env`` is for a test
     endpoint and its dummy credential. A worker an organization's managed
     Claude Code settings are installed on runs none (``local_managed``).
-    With ``slots`` each CLI the run starts holds one of them while it runs.
     """
 
     env: dict[str, str] = field(default_factory=dict, repr=False)
     cli_path: str | None = None
     token: str | None = field(default=None, repr=False)
     saved: TokenStore | None = None
-    slots: CliSlots | None = None
     _used: Credential | None = field(default=None, init=False, repr=False)
 
     async def _ready(self) -> None:
@@ -501,7 +442,7 @@ class LocalLauncher:
 
     async def refused(self) -> None:
         if self.saved is not None and self._used:
-            await self.saved.refused(self._used)
+            await self.saved.refused()
 
     async def release(self, prepared: Prepared) -> None:
         """Remove the turn's config dir. The thread's cwd stays: it holds nothing, and another run of the thread may be in it."""
@@ -512,7 +453,7 @@ class LocalLauncher:
 
     def transport(self, options: ClaudeAgentOptions) -> Transport:
         options = replace(options, cli_path=self.cli_path or options.cli_path)
-        return ScopedEnvTransport(options=options, base_env=self._base_env(), credential=self._used, slots=self.slots)
+        return ScopedEnvTransport(options=options, base_env=self._base_env(), credential=self._used)
 
 
 async def _no_prompt():
