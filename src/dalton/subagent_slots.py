@@ -791,6 +791,9 @@ def abort_queued_subagent_on_cancel(
                 handler_task.cancel()
 
 
+_STRAGGLER_RELEASE_WAITERS: set[asyncio.Task[None]] = set()
+
+
 # DALTON-HOOK(subagent-caps): keep the concurrency slot leased while any
 # ``task.stragglers`` left behind by a timed-out or slow-closing subagent
 # are still running, so a queued subagent cannot start under the cap while
@@ -839,10 +842,16 @@ async def release_subagent_slot(task: Any) -> None:
         finally:
             await _release_once()
 
-    lease._straggler_release_task = asyncio.create_task(  # type: ignore[attr-defined]
+    waiter = asyncio.create_task(
         _wait_stragglers_and_release(),
         name=f"subagent_slot_straggler_release_{lease.task_id}",
     )
+    lease._straggler_release_task = waiter  # type: ignore[attr-defined]
+    # The event loop holds tasks weakly; once the wrapper task is collected the
+    # lease may be the only referrer, so keep the waiter alive until it ends.
+    # Execution context only, never read as slot state.
+    _STRAGGLER_RELEASE_WAITERS.add(waiter)
+    waiter.add_done_callback(_STRAGGLER_RELEASE_WAITERS.discard)
     await asyncio.sleep(0)
 
 

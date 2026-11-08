@@ -21,6 +21,25 @@ from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
 import src.server.database.workspace as ws_db
 from src.server.utils.secret_redactor import SecretRedactor
 from src.tools.secretary import tools as secretary_tools
+
+
+@pytest.fixture(autouse=True)
+def _scan_rss_budget_from_now(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The PDF scan's RSS guard reads the process's
+    lifetime peak (ru_maxrss). In production the scan runs in a fresh heavy
+    subprocess; in a full unit run it shares one long-lived process whose peak
+    already exceeds the cap, so every PDF would read as unscannable. Give each
+    test the same budget above the peak it starts at."""
+    import resource
+    import sys
+
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    peak_bytes = peak if sys.platform == "darwin" else peak * 1024
+    monkeypatch.setattr(
+        secretary_tools,
+        "_COS_SCAN_MAX_RSS_BYTES",
+        peak_bytes + secretary_tools._COS_SCAN_MAX_RSS_BYTES,
+    )
 from src.tools.secretary.tools import (
     workspace_file_copy_cos,
     workspace_file_read_cos,
