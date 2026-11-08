@@ -168,6 +168,7 @@ scripts/dalton/data_task_run_now.py
 scripts/dalton/seed_openclaw_data.sh
 scripts/dalton/openclaw_overlays/scripts/feishu_send_card.py
 tests/unit/dalton/fixtures/oc1_task_baseline.md
+tests/unit/dalton/fixtures/openclaw_feishu_send_card.py
 tests/unit/dalton/test_data_jobs.py
 tests/integration/dalton/test_data_jobs_db.py
 # CH-1 Phase 1: channel gateway schema (d030), internal persistence APIs (I-1..I-9),
