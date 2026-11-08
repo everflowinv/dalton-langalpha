@@ -435,6 +435,328 @@ describe('useThreadModel', () => {
     });
   });
 
+  // DALTON-HOOK(ui-model-pick)
+  describe('a thread opened from another page with a picked model (UI-MODEL-1)', () => {
+    it('keeps the pick when the new thread row is read back naming the default model', async () => {
+      // The home composer navigates to the new thread with its pick as
+      // initialModel; the row is not read yet.
+      const queryClient = createTestQueryClient();
+      const { result, rerender } = setup(
+        { threadId: THREAD, isLoading: true, initialModel: 'model-beta' },
+        null,
+        queryClient,
+      );
+      expect(result.current.model).toBe('model-beta');
+
+      // During the first turn the row is read back still naming the default.
+      act(() => { queryClient.setQueryData(queryKeys.threads.detail(THREAD), row('model-default')); });
+      rerender({ threadId: THREAD, isLoading: true, initialModel: 'model-beta' });
+      expect(result.current.model).toBe('model-beta');
+
+      // The turn ends and the row catches up with the pick.
+      act(() => { queryClient.setQueryData(queryKeys.threads.detail(THREAD), row('model-beta')); });
+      rerender({ threadId: THREAD, isLoading: false, initialModel: 'model-beta' });
+      expect(result.current.model).toBe('model-beta');
+    });
+
+    it('keeps a pick on an existing thread when a stale reread during the turn names the old model', async () => {
+      const save = deferred<Thread>();
+      mocks.updateThread.mockReturnValueOnce(save.promise);
+      const { result, rerender, queryClient } = setup({ threadId: THREAD, isLoading: false }, row('model-default'));
+      let picked!: Promise<boolean>;
+      act(() => { picked = result.current.pickModel('model-beta'); });
+      expect(result.current.model).toBe('model-beta');
+
+      // A reread started before the save landed returns the old model mid-turn.
+      act(() => { queryClient.setQueryData(queryKeys.threads.detail(THREAD), row('model-default')); });
+      rerender({ threadId: THREAD, isLoading: true });
+      expect(result.current.model).toBe('model-beta');
+
+      // The turn ends; the composer keeps the pick across the turn-end reread.
+      mocks.server = row('model-beta');
+      rerender({ threadId: THREAD, isLoading: false });
+      expect(result.current.model).toBe('model-beta');
+      await act(async () => { save.resolve(row('model-beta')); await picked; });
+      await waitFor(() => expect(cachedModel(queryClient)).toBe('model-beta'));
+      expect(result.current.model).toBe('model-beta');
+    });
+
+    it('holds the pick on the turn-end render until the reread settles, following a different server model only on success and keeping the pick on failure', async () => {
+      // 1. Turn-end render before reread returns -> still the picked model;
+      //    reread returns the picked model -> still the picked model.
+      const rereadPicked = deferred<Thread>();
+      const qc1 = createTestQueryClient();
+      const first = setup(
+        { threadId: THREAD, isLoading: true, initialModel: 'model-beta' },
+        null,
+        qc1,
+      );
+      await waitFor(() => expect(qc1.isFetching()).toBe(0));
+      act(() => { qc1.setQueryData(queryKeys.threads.detail(THREAD), row('model-default')); });
+      first.rerender({ threadId: THREAD, isLoading: true, initialModel: 'model-beta' });
+      expect(first.result.current.model).toBe('model-beta');
+
+      mocks.getThread.mockReturnValueOnce(rereadPicked.promise);
+      first.rerender({ threadId: THREAD, isLoading: false, initialModel: 'model-beta' });
+      // On the turn-end render itself, before the reread resolves:
+      expect(first.result.current.model).toBe('model-beta');
+
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 5));
+        rereadPicked.resolve(row('model-beta'));
+      });
+      await waitFor(() => expect(cachedModel(qc1)).toBe('model-beta'));
+      expect(first.result.current.model).toBe('model-beta');
+
+      // 2. Reread returns a different model -> follows the server model.
+      const rereadOther = deferred<Thread>();
+      const qc2 = createTestQueryClient();
+      const second = setup(
+        { threadId: THREAD, isLoading: true, initialModel: 'model-beta' },
+        null,
+        qc2,
+      );
+      await waitFor(() => expect(qc2.isFetching()).toBe(0));
+      act(() => { qc2.setQueryData(queryKeys.threads.detail(THREAD), row('model-default')); });
+      second.rerender({ threadId: THREAD, isLoading: true, initialModel: 'model-beta' });
+
+      mocks.getThread.mockReturnValueOnce(rereadOther.promise);
+      second.rerender({ threadId: THREAD, isLoading: false, initialModel: 'model-beta' });
+      expect(second.result.current.model).toBe('model-beta');
+
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 5));
+        rereadOther.resolve(row('model-gamma'));
+      });
+      await waitFor(() => expect(second.result.current.model).toBe('model-gamma'));
+
+      // 3. Reread fails -> keeps the picked model instead of jumping to the stale cache.
+      const rereadFailed = deferred<Thread>();
+      const qc3 = createTestQueryClient();
+      const third = setup(
+        { threadId: THREAD, isLoading: true, initialModel: 'model-beta' },
+        null,
+        qc3,
+      );
+      await waitFor(() => expect(qc3.isFetching()).toBe(0));
+      act(() => { qc3.setQueryData(queryKeys.threads.detail(THREAD), row('model-default')); });
+      third.rerender({ threadId: THREAD, isLoading: true, initialModel: 'model-beta' });
+
+      mocks.getThread.mockReturnValueOnce(rereadFailed.promise);
+      third.rerender({ threadId: THREAD, isLoading: false, initialModel: 'model-beta' });
+      expect(third.result.current.model).toBe('model-beta');
+
+      await act(async () => {
+        await new Promise((r) => setTimeout(r, 5));
+        rereadFailed.reject(failure());
+      });
+      await waitFor(() => expect(qc3.isFetching()).toBe(0));
+      expect(third.result.current.model).toBe('model-beta');
+    });
+
+    it('lands on the thread row model when two consecutive picks during a turn both fail', async () => {
+      const x = deferred<Thread>();
+      const y = deferred<Thread>();
+      mocks.updateThread.mockReturnValueOnce(x.promise).mockReturnValueOnce(y.promise);
+      const { result, queryClient } = setup({ isLoading: true }, row('model-thread'));
+      await waitFor(() => expect(queryClient.isFetching()).toBe(0));
+
+      act(() => { void result.current.pickModel('model-x'); });
+      await waitFor(() => expect(cachedModel(queryClient)).toBe('model-x'));
+      act(() => { void result.current.pickModel('model-y'); });
+      await waitFor(() => expect(cachedModel(queryClient)).toBe('model-y'));
+
+      await act(async () => { x.reject(failure()); });
+      await waitFor(() => expect(mocks.updateThread).toHaveBeenCalledTimes(2));
+      await act(async () => { y.reject(failure()); });
+
+      expect(result.current.model).toBe('model-thread');
+      expect(cachedModel(queryClient)).toBe('model-thread');
+    });
+
+    it('switches to the default model when the current model is retired mid-turn', async () => {
+      mocks.catalogModelNames = new Set(['model-default', 'model-beta']);
+      mocks.updateThread.mockResolvedValue(row('model-beta'));
+      const { result, rerender } = setup({ threadId: THREAD, isLoading: true }, row('model-default'));
+
+      await act(async () => { await result.current.pickModel('model-beta'); });
+      expect(result.current.model).toBe('model-beta');
+
+      mocks.catalogModelNames = new Set(['model-default']);
+      rerender({ threadId: THREAD, isLoading: true });
+
+      expect(result.current.model).toBe('model-default');
+      expect(result.current.retired).toEqual({ model: 'model-beta', fallback: 'model-default' });
+    });
+
+    it("shows thread B's model when switching from running thread A to thread B whose row arrives later", async () => {
+      mocks.updateThread.mockResolvedValue(row('model-alpha'));
+      const bRow = deferred<Thread>();
+      const threadB = { thread_id: 'thread-2', llm_model: 'model-beta' } as unknown as Thread;
+      const { result, rerender, queryClient } = setup({ threadId: THREAD, isLoading: true }, row('model-thread'));
+      await waitFor(() => expect(queryClient.isFetching()).toBe(0));
+
+      await act(async () => { await result.current.pickModel('model-alpha'); });
+      expect(result.current.model).toBe('model-alpha');
+
+      mocks.getThread.mockImplementation((id: string) => (
+        id === 'thread-2' ? bRow.promise : Promise.resolve(row('model-alpha'))
+      ));
+      rerender({ threadId: 'thread-2', isLoading: true });
+      expect(result.current.model).toBeNull();
+
+      await act(async () => { bRow.resolve(threadB); });
+      await waitFor(() => expect(result.current.model).toBe('model-beta'));
+    });
+
+    it('keeps the pick when a title-only setQueryData lands after the turn ends before the reread returns', async () => {
+      const reread = deferred<Thread>();
+      const queryClient = createTestQueryClient();
+      const { result, rerender } = setup(
+        { threadId: THREAD, isLoading: true, initialModel: 'model-beta' },
+        null,
+        queryClient,
+      );
+      await waitFor(() => expect(queryClient.isFetching()).toBe(0));
+      act(() => { queryClient.setQueryData(queryKeys.threads.detail(THREAD), row('model-default')); });
+      rerender({ threadId: THREAD, isLoading: true, initialModel: 'model-beta' });
+      expect(result.current.model).toBe('model-beta');
+
+      mocks.getThread.mockReturnValueOnce(reread.promise);
+      rerender({ threadId: THREAD, isLoading: false, initialModel: 'model-beta' });
+      expect(result.current.model).toBe('model-beta');
+
+      // A title event patches the cached detail row before the turn-end reread returns;
+      // llm_model on the cached row is still the stale default.
+      act(() => {
+        queryClient.setQueryData<Thread>(queryKeys.threads.detail(THREAD), (current) => (
+          current ? { ...current, title: 'Generated title' } : current
+        ));
+      });
+      rerender({ threadId: THREAD, isLoading: false, initialModel: 'model-beta' });
+      expect(result.current.model).toBe('model-beta');
+
+      await act(async () => { reread.resolve(row('model-beta')); });
+      await waitFor(() => expect(cachedModel(queryClient)).toBe('model-beta'));
+      expect(result.current.model).toBe('model-beta');
+    });
+
+    it('keeps the pick when the turn-end reread is cancelled or fails', async () => {
+      // 1. Cancelled (e.g. another field write cancels the outgoing reread and updates dataUpdatedAt).
+      const rereadCancelled = deferred<Thread>();
+      const qc1 = createTestQueryClient();
+      const first = setup(
+        { threadId: THREAD, isLoading: true, initialModel: 'model-beta' },
+        null,
+        qc1,
+      );
+      await waitFor(() => expect(qc1.isFetching()).toBe(0));
+      act(() => { qc1.setQueryData(queryKeys.threads.detail(THREAD), row('model-default')); });
+      first.rerender({ threadId: THREAD, isLoading: true, initialModel: 'model-beta' });
+
+      mocks.getThread.mockReturnValueOnce(rereadCancelled.promise);
+      first.rerender({ threadId: THREAD, isLoading: false, initialModel: 'model-beta' });
+      await waitFor(() => expect(qc1.isFetching()).toBe(1));
+
+      await act(async () => {
+        await qc1.cancelQueries({ queryKey: queryKeys.threads.detail(THREAD) });
+        qc1.setQueryData(queryKeys.threads.detail(THREAD), {
+          ...row('model-default'),
+          subagents_allowed: false,
+        } as Thread);
+      });
+      first.rerender({ threadId: THREAD, isLoading: false, initialModel: 'model-beta' });
+      expect(first.result.current.model).toBe('model-beta');
+
+      // 2. Failed.
+      const rereadFailed = deferred<Thread>();
+      const qc2 = createTestQueryClient();
+      const second = setup(
+        { threadId: THREAD, isLoading: true, initialModel: 'model-beta' },
+        null,
+        qc2,
+      );
+      await waitFor(() => expect(qc2.isFetching()).toBe(0));
+      act(() => { qc2.setQueryData(queryKeys.threads.detail(THREAD), row('model-default')); });
+      second.rerender({ threadId: THREAD, isLoading: true, initialModel: 'model-beta' });
+
+      mocks.getThread.mockReturnValueOnce(rereadFailed.promise);
+      second.rerender({ threadId: THREAD, isLoading: false, initialModel: 'model-beta' });
+      await act(async () => { rereadFailed.reject(failure()); });
+      await waitFor(() => expect(qc2.isFetching()).toBe(0));
+      expect(second.result.current.model).toBe('model-beta');
+    });
+
+    it('follows the row back to the original model after an idle pick saves and another tab reverts it', async () => {
+      mocks.updateThread.mockResolvedValue(row('model-beta'));
+      const { result, queryClient } = setup({ threadId: THREAD, isLoading: false }, row('model-default'));
+      await waitFor(() => expect(queryClient.isFetching()).toBe(0));
+
+      await act(async () => { await result.current.pickModel('model-beta'); });
+      expect(result.current.model).toBe('model-beta');
+      expect(cachedModel(queryClient)).toBe('model-beta');
+
+      // Another tab sets the thread back to model-default and the detail cache refreshes.
+      act(() => { queryClient.setQueryData(queryKeys.threads.detail(THREAD), row('model-default')); });
+      await waitFor(() => expect(result.current.model).toBe('model-default'));
+    });
+
+    it('defers saving a pick made during thread creation until the first turn ends and its reread returns the first-send model', async () => {
+      mocks.updateThread.mockResolvedValue(row('model-beta'));
+      const queryClient = createTestQueryClient();
+      const { result, rerender } = setup(
+        { threadId: '__default__', isLoading: false },
+        null,
+        queryClient,
+      );
+
+      // First pick before sending, carried by the request that creates the thread.
+      await act(async () => { await result.current.pickModel('model-alpha'); });
+      rerender({ threadId: '__default__', isLoading: true });
+
+      // Second pick while the thread is still being created (no liveThreadId yet).
+      await act(async () => { await result.current.pickModel('model-beta'); });
+      expect(result.current.model).toBe('model-beta');
+      expect(mocks.updateThread).not.toHaveBeenCalled();
+
+      // The thread id arrives while the first turn is still running; no save yet.
+      mocks.server = row('model-alpha');
+      rerender({ threadId: THREAD, isLoading: true });
+      await waitFor(() => expect(queryClient.isFetching()).toBe(0));
+      expect(mocks.updateThread).not.toHaveBeenCalled();
+      expect(result.current.model).toBe('model-beta');
+
+      // First turn ends; reread returns model-alpha, then the deferred save writes model-beta.
+      const turnEndReread = deferred<Thread>();
+      mocks.getThread.mockReturnValueOnce(turnEndReread.promise);
+      rerender({ threadId: THREAD, isLoading: false });
+      expect(mocks.updateThread).not.toHaveBeenCalled();
+      expect(result.current.model).toBe('model-beta');
+
+      await act(async () => { turnEndReread.resolve(row('model-alpha')); });
+      await waitFor(() => expect(mocks.updateThread).toHaveBeenCalledWith(THREAD, { llm_model: 'model-beta' }));
+      await waitFor(() => expect(cachedModel(queryClient)).toBe('model-beta'));
+      expect(result.current.model).toBe('model-beta');
+    });
+  });
+
+  describe('a confirmed pick on a thread whose row is not cached yet (UI-MODEL-1 r3)', () => {
+    it('keeps the confirmed pick instead of falling back to initialModel', async () => {
+      // Opened from another page with model-beta; the row has not been read.
+      mocks.updateThread.mockResolvedValue(row('model-gamma'));
+      const queryClient = createTestQueryClient();
+      const { result } = setup(
+        { threadId: THREAD, isLoading: true, initialModel: 'model-beta' },
+        null,
+        queryClient,
+      );
+      expect(result.current.model).toBe('model-beta');
+
+      await act(async () => { await result.current.pickModel('model-gamma'); });
+      expect(result.current.model).toBe('model-gamma');
+    });
+  });
+
   describe('when a turn ends', () => {
     it('rereads the row, since the send stored its model there', () => {
       const { rerender, queryClient } = setup({ isLoading: true });
