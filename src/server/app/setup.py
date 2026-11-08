@@ -230,6 +230,8 @@ def _log_effective_concurrency() -> None:
 _dalton_health_startup_task: asyncio.Task | None = None
 # DALTON-HOOK(transcriptions-reconcile): hold strong reference to periodic ASR reconciliation task
 _dalton_transcription_reconcile_task: asyncio.Task | None = None
+# DALTON-HOOK(data-jobs): hold strong reference to OC-1 data task scheduler task
+_dalton_data_task_scheduler_task: asyncio.Task | None = None
 
 
 @asynccontextmanager
@@ -243,7 +245,8 @@ async def lifespan(app: FastAPI):
         store, \
         llm_service, \
         _dalton_health_startup_task, \
-        _dalton_transcription_reconcile_task
+        _dalton_transcription_reconcile_task, \
+        _dalton_data_task_scheduler_task
 
     # Configure logging based on environment settings (first thing on startup)
     configure_logging()
@@ -812,6 +815,18 @@ async def lifespan(app: FastAPI):
             name="dalton-transcription-reconcile",
         )
 
+    # DALTON-HOOK(data-jobs): start OC-1 data task scheduler loop when Dalton & data_jobs are enabled
+    from src.dalton.data_jobs.scheduler import (
+        is_data_jobs_scheduler_enabled,
+        run_data_task_scheduler_loop,
+    )
+
+    if is_data_jobs_scheduler_enabled():
+        _dalton_data_task_scheduler_task = asyncio.create_task(
+            run_data_task_scheduler_loop(),
+            name="dalton-data-task-scheduler",
+        )
+
     # A built-in remote server still down after boot's retry budget is retried
     # in the background, so this worker heals when it answers instead of
     # serving without its tools until a restart. Last, so nothing above can
@@ -851,6 +866,11 @@ async def lifespan(app: FastAPI):
         _dalton_transcription_reconcile_task.cancel()
         await asyncio.gather(_dalton_transcription_reconcile_task, return_exceptions=True)
         _dalton_transcription_reconcile_task = None
+    # DALTON-HOOK(data-jobs): cancel OC-1 data task scheduler task on shutdown
+    if _dalton_data_task_scheduler_task is not None:
+        _dalton_data_task_scheduler_task.cancel()
+        await asyncio.gather(_dalton_data_task_scheduler_task, return_exceptions=True)
+        _dalton_data_task_scheduler_task = None
     # Awaited, so a warm-up stopped midway releases its lock while Redis is
     # still open; a lock left to expire skips the warm-up of a quick restart.
     # The refreshes go after it, since the warm-up can start them.

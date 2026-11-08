@@ -260,6 +260,16 @@ class DaltonCoverageUnitsConfig(BaseModel):
     enabled: bool = False
 
 
+class DaltonDataJobsConfig(BaseModel):
+    """Master switch and memory admission threshold for OC-1 deterministic data tasks (`d029`).
+
+    Off (the default): the scheduler loop does not start and no task containers are created.
+    """
+
+    enabled: bool = False
+    min_free_mem_mb: int = Field(default=1280, ge=0)
+
+
 # A fake-IP exemption may never reach these, whatever the config says: they are
 # the internal services and metadata endpoint the fetch guard exists to protect.
 NEVER_EXEMPT_NETWORKS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = tuple(
@@ -395,6 +405,9 @@ class DaltonConfig(BaseModel):
     coverage_units: DaltonCoverageUnitsConfig = Field(
         default_factory=DaltonCoverageUnitsConfig
     )
+    data_jobs: DaltonDataJobsConfig = Field(
+        default_factory=DaltonDataJobsConfig
+    )
     models: DaltonModelsConfig = Field(default_factory=DaltonModelsConfig)
     budget: DaltonBudgetDefaults = Field(default_factory=DaltonBudgetDefaults)
     knowledge: DaltonKnowledgeConfig = Field(default_factory=DaltonKnowledgeConfig)
@@ -495,6 +508,45 @@ def is_coverage_units_enabled() -> bool:
     if env_flag is not None:
         return env_flag.strip().lower() in ("1", "true", "yes")
     return get_dalton_config().coverage_units.enabled
+
+
+def is_data_jobs_enabled() -> bool:
+    """Whether the OC-1 deterministic data tasks scheduler loop is enabled (default False)."""
+    if not is_dalton_enabled():
+        return False
+    env_flag = os.getenv("DALTON_DATA_JOBS_ENABLED")
+    if env_flag is not None:
+        return env_flag.strip().lower() in ("1", "true", "yes", "on")
+    return bool(get_dalton_config().data_jobs.enabled)
+
+
+
+
+def get_data_task_min_free_mem_mb() -> int:
+    """Return the minimum free host memory (MB) required before launching a container data task (§2.2.2)."""
+    raw = os.getenv("DALTON_DATA_TASK_MIN_FREE_MEM_MB", "").strip()
+    if raw:
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            pass
+    return int(get_dalton_config().data_jobs.min_free_mem_mb)
+
+
+def get_dalton_host_var_dir() -> str:
+    """Return the host-side ``var/dalton`` directory for Docker bind mounts (§2.1.3)."""
+    raw = os.getenv("DALTON_HOST_VAR_DIR", "").strip()
+    if raw:
+        return raw
+    return str(REPO_ROOT / "var" / "dalton")
+
+
+def get_dalton_backend_var_dir() -> str:
+    """Return the backend container's internal ``var/dalton`` path (§2.1.3, §4.1.1)."""
+    raw = os.getenv("DALTON_BACKEND_VAR_DIR", "").strip()
+    if raw:
+        return raw
+    return "/app/var/dalton"
 
 
 def is_budget_gate_enabled() -> bool:
