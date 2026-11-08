@@ -76,7 +76,9 @@ describe('FilePanel Excel range context', () => {
     const tab = await screen.findByRole('tab', { name: /model\.xlsx/ });
     expect(tab.className).toContain('is-preview');
 
-    fireEvent.click(await screen.findByText('add-range'));
+    // DALTON-HOOK(test-flaky-1): the range picker comes from a lazily loaded
+    // viewer that can take over the 1 s default wait when the full suite runs.
+    fireEvent.click(await screen.findByText('add-range', undefined, { timeout: 5000 }));
     expect(onAddContext).toHaveBeenCalledWith(expect.objectContaining({ path: 'model.xlsx', locator: 'Model!A1:B2' }));
     expect(screen.getByRole('tab', { name: /model\.xlsx/ }).className).not.toContain('is-preview');
 

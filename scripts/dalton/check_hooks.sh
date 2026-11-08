@@ -348,6 +348,9 @@ ALLOWED_HOOKS=(
   # OC-1 Phase 0 PR 0-1: scheduled data jobs layer foundation (lifespan loop in
   # src/server/app/setup.py and container Python dependencies in pyproject.toml).
   "data-jobs"
+  # TEST-FLAKY-1: FilePanel Excel context test waits up to 5 s for the lazily
+  # loaded range picker (FilePanel.excelContext.test.tsx).
+  "test-flaky-1"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
