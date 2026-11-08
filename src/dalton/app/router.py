@@ -109,7 +109,8 @@ class UserSettingsUpdateRequest(BaseModel):
 
 
 class SystemJobToggleRequest(BaseModel):
-    enabled: bool
+    enabled: bool | None = None
+    notify_routes: list[str] | None = None
 
 
 class CoverageMutateRequest(BaseModel):
@@ -1594,18 +1595,34 @@ async def update_workspace_tracking_endpoint(
 
 
 async def _authorize_system_job_mutation(key: str, user_id: str) -> str:
-    """Resolve effective owner ``user_id`` for company/sector jobs; Home/host/ops permissions are enforced in ``system_jobs``."""
+    """Resolve effective owner ``user_id`` for company/sector/data jobs; Home/host/ops permissions are enforced in ``system_jobs``."""
     _require_dalton_enabled()
+    from src.dalton.access_tiers import get_user_tier
     from src.dalton.autonomy.system_jobs import (
         _resolve_company_workspace_id,
         _resolve_sector_unit_for_key,
         classify_system_job_key,
     )
+    from src.dalton.settings import get_configured_pm_user_ids
 
     try:
         scope, target = classify_system_job_key(key)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    if scope == "data":
+        if await get_user_tier(str(user_id).strip()) not in ("admin", "internal"):
+            raise HTTPException(
+                status_code=403,
+                detail="仅内部成员可操作公司公共数据任务",
+            )
+        pm_ids = get_configured_pm_user_ids()
+        if not pm_ids:
+            raise HTTPException(
+                status_code=503,
+                detail="未配置首位管理员 DALTON_PM_USER_IDS，无法操作数据任务",
+            )
+        return pm_ids[0]
 
     if scope in ("ops", "home", "host"):
         return str(user_id).strip()
@@ -1663,10 +1680,28 @@ async def toggle_system_job_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
     from src.dalton.autonomy.schedule import AutomationLockError
-    from src.dalton.autonomy.system_jobs import toggle_system_job
+    from src.dalton.autonomy.system_jobs import classify_system_job_key, toggle_system_job
 
     owner_id = await _authorize_system_job_mutation(key, user_id)
+    scope, _ = classify_system_job_key(key)
     try:
+        if scope == "data":
+            return await toggle_system_job(
+                owner_id,
+                key,
+                enabled=body.enabled,
+                notify_routes=body.notify_routes,
+                actor_user_id=str(user_id).strip(),
+                force=True,
+                respect_user_pause=False,
+            )
+        if body.notify_routes is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="仅公司公共数据任务支持通过此接口修改 notify_routes",
+            )
+        if body.enabled is None:
+            raise HTTPException(status_code=400, detail="enabled 不能为空")
         return await toggle_system_job(
             owner_id,
             key,
@@ -1691,11 +1726,52 @@ async def run_system_job_now_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
     from src.dalton.autonomy.schedule import AutomationLockError
-    from src.dalton.autonomy.system_jobs import run_system_job_now
+    from src.dalton.autonomy.system_jobs import classify_system_job_key, run_system_job_now
 
     owner_id = await _authorize_system_job_mutation(key, user_id)
+    scope, _ = classify_system_job_key(key)
     try:
+        if scope == "data":
+            return await run_system_job_now(
+                owner_id,
+                key,
+                actor_user_id=str(user_id).strip(),
+            )
         return await run_system_job_now(owner_id, key)
+    except AutomationLockError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post("/system-jobs/{key}/rollback")
+@handle_api_exceptions("rollback dalton system job", logger)
+async def rollback_system_job_endpoint(
+    key: str,
+    user_id: CurrentUserId,
+) -> dict[str, Any]:
+    from src.dalton.autonomy.schedule import AutomationLockError
+    from src.dalton.autonomy.system_jobs import (
+        classify_system_job_key,
+        rollback_data_task_config,
+    )
+
+    await _authorize_system_job_mutation(key, user_id)
+    scope, target = classify_system_job_key(key)
+    if scope != "data":
+        raise HTTPException(
+            status_code=400,
+            detail="仅公司公共数据任务支持按版本链回退",
+        )
+    try:
+        return await rollback_data_task_config(
+            actor_user_id=str(user_id).strip(),
+            job_key=target,
+        )
     except AutomationLockError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except PermissionError as exc:

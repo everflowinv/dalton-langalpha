@@ -44,14 +44,13 @@ from src.dalton.data_jobs.scheduler import (
     start_claimed_container_run,
     try_scheduler_lock,
 )
-from src.dalton.migrations.versions import d029_data_tasks
 
 pytestmark = pytest.mark.integration
 
 
 @pytest.fixture(scope="session", autouse=True)
 def dalton_schema():
-    """Override directory conftest autouse fixture; this module manages d029 directly via DALTON_DATA_JOBS_TEST_DSN."""
+    """Override directory conftest autouse fixture; this module manages schema via `migrated_data_jobs_dsn` when `DALTON_DATA_JOBS_TEST_DSN` is set."""
     yield
 
 
@@ -68,46 +67,88 @@ def _get_test_dsn() -> str:
     return dsn
 
 
-async def _run_d029_upgrade(conn: psycopg.AsyncConnection) -> None:
-    statements: list[str] = []
-    orig_execute = d029_data_tasks.op.execute
-    d029_data_tasks.op.execute = create_autospec(
-        orig_execute,
-        side_effect=lambda sql: statements.append(str(sql)),
-    )
-    try:
-        d029_data_tasks.downgrade()
-        d029_data_tasks.upgrade()
-    finally:
-        d029_data_tasks.op.execute = orig_execute
+def _ensure_alembic_upgraded_to_head(dsn: str) -> None:
+    """Run real upstream (`alembic.ini`) and Dalton (`src/dalton/alembic.ini`) Alembic migrations to head, skipping any chain already at head."""
+    from alembic import command
+    from alembic.config import Config
+    from alembic.runtime.migration import MigrationContext
+    from alembic.script import ScriptDirectory
+    from sqlalchemy import create_engine, pool
 
+    project_root = Path(__file__).resolve().parents[3]
+    if dsn.startswith("postgresql://"):
+        sa_url = dsn.replace("postgresql://", "postgresql+psycopg://", 1)
+    elif dsn.startswith("postgres://"):
+        sa_url = dsn.replace("postgres://", "postgresql+psycopg://", 1)
+    else:
+        sa_url = dsn
+
+    chains = [
+        (
+            project_root / "alembic.ini",
+            project_root / "migrations",
+            "alembic_version",
+        ),
+        (
+            project_root / "src" / "dalton" / "alembic.ini",
+            project_root / "src" / "dalton" / "migrations",
+            "alembic_version_dalton",
+        ),
+    ]
+
+    engine = create_engine(sa_url, poolclass=pool.NullPool)
+    try:
+        for ini_path, script_dir, version_table in chains:
+            cfg = Config(str(ini_path))
+            cfg.set_main_option("script_location", str(script_dir))
+            cfg.set_main_option("sqlalchemy.url", sa_url.replace("%", "%%"))
+            script = ScriptDirectory.from_config(cfg)
+            expected_heads = set(script.get_heads())
+            with engine.connect() as sa_conn:
+                ctx = MigrationContext.configure(
+                    sa_conn, opts={"version_table": version_table}
+                )
+                current_heads = set(ctx.get_current_heads())
+            if current_heads != expected_heads:
+                command.upgrade(cfg, "head")
+    finally:
+        engine.dispose()
+
+
+@pytest.fixture(scope="session")
+def migrated_data_jobs_dsn() -> str:
+    """Session-scoped fixture that upgrades upstream and Dalton Alembic migrations on the test DB (or skips if already at head)."""
+    dsn = _get_test_dsn()
+    _ensure_alembic_upgraded_to_head(dsn)
+    return dsn
+
+
+async def _reset_data_task_tables(conn: psycopg.AsyncConnection) -> None:
+    """Reset `dalton_data_task_runs`, `dalton_data_task_defs`, and `dalton_data_task_slot` between integration tests."""
     async with conn.transaction():
         async with conn.cursor() as cur:
-            for stmt in statements:
-                await cur.execute(stmt)
-
-
-async def _run_d029_downgrade(conn: psycopg.AsyncConnection) -> None:
-    statements: list[str] = []
-    orig_execute = d029_data_tasks.op.execute
-    d029_data_tasks.op.execute = create_autospec(
-        orig_execute,
-        side_effect=lambda sql: statements.append(str(sql)),
-    )
-    try:
-        d029_data_tasks.downgrade()
-    finally:
-        d029_data_tasks.op.execute = orig_execute
-
-    async with conn.transaction():
-        async with conn.cursor() as cur:
-            for stmt in statements:
-                await cur.execute(stmt)
+            await cur.execute(
+                "TRUNCATE TABLE dalton_data_task_runs, dalton_data_task_defs CASCADE"
+            )
+            await cur.execute(
+                """
+                INSERT INTO dalton_data_task_slot (slot_id, generation, slot_state)
+                VALUES (1, 0, 'idle')
+                ON CONFLICT (slot_id) DO UPDATE
+                SET generation = 0,
+                    slot_state = 'idle',
+                    active_run_id = NULL,
+                    active_job_key = NULL,
+                    updated_at = NOW()
+                """
+            )
 
 
 @pytest.mark.asyncio
-async def test_real_postgres_data_jobs_end_to_end(tmp_path: Path) -> None:
-    dsn = _get_test_dsn()
+async def test_real_postgres_data_jobs_end_to_end(
+    tmp_path: Path, migrated_data_jobs_dsn: str
+) -> None:
+    dsn = migrated_data_jobs_dsn
     path_map = build_path_map(
         host_var_dir=tmp_path / "host_var",
         backend_var_dir=tmp_path / "backend_var",
@@ -135,8 +176,8 @@ async def test_real_postgres_data_jobs_end_to_end(tmp_path: Path) -> None:
         lock_conn1 = await open_dedicated_lock_connection(dsn)
         assert await try_scheduler_lock(lock_conn1) is True
 
-        # 2. Apply d029 migration upgrade SQL and sync manifest
-        await _run_d029_upgrade(conn)
+        # 2. Reset tables and sync manifest
+        await _reset_data_task_tables(conn)
         manifest = load_data_task_manifest()
         async with conn.transaction():
             synced = await sync_manifest_to_db(conn, manifest)
@@ -523,9 +564,281 @@ async def test_real_postgres_data_jobs_end_to_end(tmp_path: Path) -> None:
         assert def2_row["consecutive_failures"] == 0
     finally:
         try:
-            await _run_d029_downgrade(conn)
+            await _reset_data_task_tables(conn)
         except Exception:
             pass
         await release_scheduler_lock(lock_conn1, close_conn=True)
         await release_scheduler_lock(lock_conn2, close_conn=True)
         await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_concurrent_config_updates_and_multi_step_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+    migrated_data_jobs_dsn: str,
+) -> None:
+    """Verify §7.1 item 5 & Round 2 items 1, 2, 4, 7, 8 against real PostgreSQL:
+    - Uses real upstream + Dalton Alembic migrations (no manual table DDL);
+    - Two separate database connections concurrently modifying the same data task serialize on the unified lock order (`lock_user_preferences` -> `dalton_data_task_defs FOR UPDATE`) without losing versions or audit entries;
+    - `run_system_job_now` inserts a `queued` row with a generated UUID `run_id`, and a subsequent `enqueue_due_cron_tasks` tick does NOT supersede the manual queued row;
+    - Consecutive multi-step rollbacks step backward along `prev_version` (`v4 -> v3 -> v2 -> v1`), restore `enabled` and PM `dalton_notify_routes`, cancel `queued` runs when rolling back to `enabled = FALSE`, and reject a 4th rollback at the earliest version.
+    """
+    import asyncio
+    from contextlib import asynccontextmanager
+    from uuid import UUID
+    import src.dalton.autonomy.system_jobs as system_jobs_mod
+    import src.dalton.notify.groups as groups_mod
+    from src.server.database.user import upsert_user_preferences
+
+    dsn = migrated_data_jobs_dsn
+    pm_user_id = f"test-pm-oc1-{uuid4().hex[:8]}"
+
+    admin_conn = await psycopg.AsyncConnection.connect(dsn, autocommit=True)
+    try:
+        await _reset_data_task_tables(admin_conn)
+        manifest = load_data_task_manifest()
+        async with admin_conn.transaction():
+            await sync_manifest_to_db(admin_conn, manifest)
+
+        # Seed PM user row in upstream `users` and personal notify targets in `user_preferences`
+        async with admin_conn.transaction():
+            async with admin_conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO users (user_id, email, name, created_at, updated_at)
+                    VALUES (%s, %s, %s, NOW(), NOW())
+                    ON CONFLICT (user_id) DO NOTHING
+                    """,
+                    (pm_user_id, f"{pm_user_id}@example.com", "Test PM"),
+                )
+            await upsert_user_preferences(
+                user_id=pm_user_id,
+                model_preference={
+                    "dalton_notify_targets": ["feishu:user:ou_1", "feishu:user:ou_2"]
+                },
+                conn=admin_conn,
+            )
+
+        # Each `get_db_connection()` call opens a distinct real PostgreSQL connection
+        @asynccontextmanager
+        async def _real_db_conn(conn=None):
+            if conn is not None:
+                yield conn
+                return
+            c = await psycopg.AsyncConnection.connect(dsn)
+            try:
+                yield c
+            finally:
+                await c.close()
+
+        monkeypatch.setenv("DALTON_PM_USER_IDS", pm_user_id)
+        monkeypatch.setattr(
+            system_jobs_mod,
+            "get_db_connection",
+            create_autospec(system_jobs_mod.get_db_connection, side_effect=_real_db_conn),
+        )
+        monkeypatch.setattr(
+            system_jobs_mod,
+            "get_user_tier",
+            create_autospec(system_jobs_mod.get_user_tier, return_value="internal"),
+        )
+        # The outside-lock prefetch reads the PM's stored routes through the
+        # global pool (get_user_preferences); point it at the test database.
+        async def _real_get_prefs(user_id: str) -> dict | None:
+            async with await psycopg.AsyncConnection.connect(dsn) as c:
+                async with c.cursor(row_factory=dict_row) as cur:
+                    await cur.execute(
+                        "SELECT model_preference, other_preference FROM user_preferences WHERE user_id = %s",
+                        (user_id,),
+                    )
+                    return await cur.fetchone()
+
+        monkeypatch.setattr(
+            system_jobs_mod,
+            "get_user_preferences",
+            create_autospec(system_jobs_mod.get_user_preferences, side_effect=_real_get_prefs),
+        )
+        # Route validation checks the actor's tier through access_tiers itself
+        # (is_internal_or_admin), not through system_jobs' import of it.
+        import src.dalton.access_tiers as access_tiers_mod
+
+        monkeypatch.setattr(
+            access_tiers_mod,
+            "get_user_tier",
+            create_autospec(access_tiers_mod.get_user_tier, return_value="internal"),
+        )
+        monkeypatch.setattr(
+            system_jobs_mod,
+            "invalidate_user_prefs_cache",
+            create_autospec(system_jobs_mod.invalidate_user_prefs_cache, return_value=None),
+        )
+        monkeypatch.setattr(
+            groups_mod,
+            "discover_feishu_notify_groups",
+            create_autospec(
+                groups_mod.discover_feishu_notify_groups,
+                return_value=[{"chat_id": "oc_g1", "name": "测试群"}],
+            ),
+        )
+
+        # 1) Seed baseline v1 and verify two concurrent connections modifying `cn-leverage-daily`
+        # serialize on `lock_user_preferences` + `SELECT ... FOR UPDATE` without losing versions:
+        # First update brings task to v2 (`enabled=True`, `routes=["feishu:user:ou_1"]`).
+        res_v2 = await system_jobs_mod.toggle_system_job(
+            pm_user_id,
+            "data:cn-leverage-daily",
+            enabled=True,
+            notify_routes=["feishu:user:ou_1"],
+            actor_user_id="internal-user-1",
+        )
+        assert res_v2["config_version"] == 2
+        assert res_v2["active_version"] == 2
+
+        # Next, run two concurrent updates on separate connections while holding a brief row lock
+        # on `admin_conn` so both connections contend on the locks simultaneously.
+        async with admin_conn.transaction():
+            async with admin_conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT job_key FROM dalton_data_task_defs WHERE job_key = %s FOR UPDATE",
+                    ("cn-leverage-daily",),
+                )
+                task_a = asyncio.create_task(
+                    system_jobs_mod.toggle_system_job(
+                        pm_user_id,
+                        "data:cn-leverage-daily",
+                        enabled=True,
+                        notify_routes=["feishu:user:ou_1", "feishu:chat:oc_g1"],
+                        actor_user_id="internal-user-2",
+                    )
+                )
+                task_b = asyncio.create_task(
+                    system_jobs_mod.toggle_system_job(
+                        pm_user_id,
+                        "data:cn-leverage-daily",
+                        enabled=True,
+                        notify_routes=["feishu:user:ou_2"],
+                        actor_user_id="internal-user-3",
+                    )
+                )
+                await asyncio.sleep(0.05)
+            # Exiting `admin_conn.transaction()` releases the row lock so `task_a` and `task_b` race
+
+        out_a, out_b = await asyncio.gather(task_a, task_b)
+        versions_returned = sorted([out_a["config_version"], out_b["config_version"]])
+        assert versions_returned == [3, 4]
+
+        status_v4 = await system_jobs_mod.get_system_job_status(
+            "internal-user-1", "data:cn-leverage-daily"
+        )
+        job_v4 = status_v4["job"]
+        assert job_v4["config_version"] == 4
+        assert job_v4["active_version"] == 4
+        assert len(job_v4["audit_history"]) == 4
+        assert [e["version"] for e in job_v4["audit_history"]] == [1, 2, 3, 4]
+        assert [e["prev_version"] for e in job_v4["audit_history"]] == [None, 1, 2, 3]
+
+        # 2) Enqueue a manual run while enabled=True -> inserts `queued` row with UUID `run_id`
+        run_res = await system_jobs_mod.run_system_job_now(
+            pm_user_id,
+            "data:cn-leverage-daily",
+            actor_user_id="internal-user-2",
+        )
+        assert run_res["status"] == "queued"
+        queued_run_id = run_res["run_id"]
+        assert str(UUID(str(queued_run_id))) == queued_run_id
+
+        # Verify a subsequent cron slot enqueue does NOT supersede the manual queued run (Item 7)
+        async with admin_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT cron_expr, timezone FROM dalton_data_task_defs WHERE job_key = %s",
+                ("cn-leverage-daily",),
+            )
+            def_cron_row = await cur.fetchone()
+        assert def_cron_row is not None
+        from croniter import croniter
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo(str(def_cron_row["timezone"]))
+        next_local_slot = croniter(
+            str(def_cron_row["cron_expr"]),
+            datetime.now(timezone.utc).astimezone(tz) + timedelta(minutes=2),
+        ).get_next(datetime)
+        next_slot_utc = next_local_slot.astimezone(timezone.utc)
+        cron_enqueued = await enqueue_due_cron_tasks(admin_conn, now_utc=next_slot_utc)
+        assert len(cron_enqueued) == 0
+
+        async with admin_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT status, trigger_source, triggered_by_user_id FROM dalton_data_task_runs WHERE run_id = %s::uuid",
+                (queued_run_id,),
+            )
+            manual_row_after_cron = await cur.fetchone()
+        assert manual_row_after_cron is not None
+        assert manual_row_after_cron["status"] == "queued"
+        assert manual_row_after_cron["status"] != "skipped_superseded"
+        assert manual_row_after_cron["trigger_source"] == "manual"
+        assert manual_row_after_cron["triggered_by_user_id"] == "internal-user-2"
+
+        # 3) Three consecutive rollbacks: v4 -> v3 (writes v5) -> v2 (writes v6) -> v1 (writes v7)
+        rb1 = await system_jobs_mod.rollback_data_task_config(
+            "internal-user-1", "cn-leverage-daily"
+        )
+        assert rb1["config_version"] == 5
+        assert rb1["active_version"] == 5
+        assert rb1["restored_from_version"] == 3
+        assert rb1["job"]["enabled"] is True
+
+        rb2 = await system_jobs_mod.rollback_data_task_config(
+            "internal-user-2", "cn-leverage-daily"
+        )
+        assert rb2["config_version"] == 6
+        assert rb2["active_version"] == 6
+        assert rb2["restored_from_version"] == 2
+        assert rb2["job"]["enabled"] is True
+        assert rb2["job"]["notify_routes"] == ["feishu:user:ou_1"]
+
+        rb3 = await system_jobs_mod.rollback_data_task_config(
+            "internal-user-3", "cn-leverage-daily"
+        )
+        assert rb3["config_version"] == 7
+        assert rb3["active_version"] == 7
+        assert rb3["restored_from_version"] == 1
+        assert rb3["job"]["enabled"] is False
+        assert rb3["job"]["notify_routes"] == []
+        assert rb3["job"]["can_rollback"] is False
+
+        # Queued run must be cancelled when rolled back to `enabled = False`
+        async with admin_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT status, failure_reason FROM dalton_data_task_runs WHERE run_id = %s::uuid",
+                (queued_run_id,),
+            )
+            q_row = await cur.fetchone()
+        assert q_row is not None
+        assert q_row["status"] == "cancelled"
+
+        # 4) 4th rollback at earliest version raises ValueError
+        with pytest.raises(ValueError, match="最早配置版本"):
+            await system_jobs_mod.rollback_data_task_config(
+                "internal-user-1", "cn-leverage-daily"
+            )
+    finally:
+        try:
+            async with admin_conn.transaction():
+                async with admin_conn.cursor() as cur:
+                    await cur.execute(
+                        "DELETE FROM user_preferences WHERE user_id = %s",
+                        (pm_user_id,),
+                    )
+                    await cur.execute(
+                        "DELETE FROM users WHERE user_id = %s",
+                        (pm_user_id,),
+                    )
+        except Exception:
+            pass
+        try:
+            await _reset_data_task_tables(admin_conn)
+        except Exception:
+            pass
+        await admin_conn.close()
+

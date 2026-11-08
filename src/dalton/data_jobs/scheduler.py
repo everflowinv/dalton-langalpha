@@ -288,6 +288,7 @@ async def enqueue_due_cron_tasks(
                         updated_at = NOW()
                     WHERE job_key = %(job_key)s
                       AND status = 'queued'
+                      AND trigger_source = 'cron'
                       AND scheduled_slot_utc < %(slot_utc)s
                     """,
                     {"job_key": job_key, "slot_utc": slot_utc},

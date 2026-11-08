@@ -10,10 +10,11 @@ Reads go through ``get_user_preferences`` (Redis-cached); no in-process cache is
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
+import copy
 import logging
 import re
-from typing import Any
+from typing import Any, TypeVar
 
 from src.dalton.credentials import get_team_credential_holder_id
 from src.dalton.settings import get_assist_fallback_models, get_dalton_settings
@@ -921,33 +922,10 @@ def _merged_map_view(
     return merged
 
 
-async def validate_dalton_notify_routes_for_user(
-    user_id: str | None,
+def _new_chat_targets_in_routes(
     submitted_routes: Mapping[str, Any] | None,
     stored_routes: Mapping[str, Any] | None = None,
-) -> None:
-    """Enforce the group-target rules a user-context-less validator cannot.
-
-    ``submitted_routes`` is what the caller actually put in the patch — not the
-    normalized-and-cleaned version ``validate_dalton_model_preferences``
-    produces: entries the server-side cleanup keeps (a group left behind when
-    its task's personal target was deleted) are pass-through, not a new
-    submission, so a user must stay able to delete their own personal targets
-    while discovery is down, the bot left the group, or they lost internal/admin
-    tier. Group targets are restricted to internal/admin members and must be in
-    the bot's discovered chat list at write time. Raises ``HTTPException``: 403
-    for an external member writing a group target, 503 when the discovery list is
-    unavailable (the write should retry later), 400 for a group the bot is not
-    in. A submission that names no group target passes without any discovery
-    call.
-
-    Only groups *added* to a route are gated: one already in ``stored_routes``
-    under the same key stays as it was, so a route still holding groups the bot
-    has since left can be edited one removal at a time (each removal submits
-    the rest, and re-checking them would 400 every step).
-    """
-    from fastapi import HTTPException
-
+) -> set[str]:
     def _stored_chats(key: str) -> set[str]:
         if not isinstance(stored_routes, Mapping):
             return set()
@@ -966,6 +944,100 @@ async def validate_dalton_notify_routes_for_user(
                 cleaned = item.strip() if isinstance(item, str) else ""
                 if cleaned and is_dalton_chat_target(cleaned) and cleaned not in already:
                     chat_targets.add(cleaned)
+    return chat_targets
+
+
+class _FeishuGroupsUnavailableSentinel:
+    """Marker indicating outside-lock Feishu group discovery failed (``FeishuGroupsUnavailable``)."""
+
+
+FEISHU_GROUPS_UNAVAILABLE = _FeishuGroupsUnavailableSentinel()
+_PrefetchReturnT = TypeVar("_PrefetchReturnT")
+
+
+def _snapshot_routes_for_prefetch(
+    stored_routes: Mapping[str, Any] | None,
+) -> dict[str, list[str]]:
+    if not isinstance(stored_routes, Mapping):
+        return {}
+    snap: dict[str, list[str]] = {}
+    for raw_k, raw_v in stored_routes.items():
+        if isinstance(raw_k, str) and raw_k.strip() and isinstance(raw_v, list):
+            snap[raw_k.strip()] = _dedup_str_list(raw_v)
+    return snap
+
+
+class FeishuGroupsPrefetchRequired(Exception):
+    """Raised inside the preference lock when a route adds a group target that
+    was not prefetched outside the lock (or when locked routes changed again on redo)."""
+
+    def __init__(self, locked_routes: Mapping[str, Any] | None) -> None:
+        super().__init__("Feishu group prefetch required")
+        self.locked_routes: dict[str, list[str]] = _snapshot_routes_for_prefetch(
+            locked_routes
+        )
+
+
+async def prefetch_feishu_groups_for_route_patch(
+    user_id: str | None,
+    submitted_routes: Mapping[str, Any] | None,
+    stored_routes: Mapping[str, Any] | None = None,
+) -> list[dict[str, str]] | _FeishuGroupsUnavailableSentinel | None:
+    """Fetch the Feishu group list before acquiring any DB lock only when
+    ``submitted_routes`` adds a ``feishu:chat:`` target not already in ``stored_routes``.
+
+    Never raises 503 outside the lock: when the bridge is down, returns
+    ``FEISHU_GROUPS_UNAVAILABLE`` so the in-lock check raises 503 only after
+    confirming a group target is genuinely newly added.
+    """
+    chat_targets = _new_chat_targets_in_routes(submitted_routes, stored_routes)
+    if not chat_targets:
+        return None
+
+    from src.dalton.access_tiers import is_internal_or_admin
+
+    if not await is_internal_or_admin(user_id):
+        return []
+
+    from src.dalton.notify.groups import (
+        FeishuGroupsUnavailable,
+        discover_feishu_notify_groups,
+    )
+
+    try:
+        return await discover_feishu_notify_groups()
+    except FeishuGroupsUnavailable:
+        return FEISHU_GROUPS_UNAVAILABLE
+
+
+async def validate_dalton_notify_routes_for_user(
+    user_id: str | None,
+    submitted_routes: Mapping[str, Any] | None,
+    stored_routes: Mapping[str, Any] | None = None,
+    *,
+    discovered_groups: Iterable[Mapping[str, Any]]
+    | _FeishuGroupsUnavailableSentinel
+    | None = None,
+    expected_stored_routes: Mapping[str, list[str]] | None = None,
+) -> None:
+    """Enforce the group-target rules inside the preference lock without making
+    any network call.
+
+    Never calls ``discover_feishu_notify_groups``: if a newly added group target
+    is discovered inside the lock while ``discovered_groups is None`` (or if
+    ``expected_stored_routes`` on the redo no longer matches ``stored_routes``),
+    raises ``FeishuGroupsPrefetchRequired`` so the caller rolls back the
+    transaction, releases the lock, prefetches outside the lock, and retries once.
+    """
+    from fastapi import HTTPException
+
+    if (
+        expected_stored_routes is not None
+        and _snapshot_routes_for_prefetch(stored_routes) != dict(expected_stored_routes)
+    ):
+        raise FeishuGroupsPrefetchRequired(stored_routes)
+
+    chat_targets = _new_chat_targets_in_routes(submitted_routes, stored_routes)
     if not chat_targets:
         return
 
@@ -976,16 +1048,14 @@ async def validate_dalton_notify_routes_for_user(
             status_code=403,
             detail="外部成员不能使用飞书群推送",
         )
-
-    from src.dalton.notify.groups import FeishuGroupsUnavailable, discover_feishu_notify_groups
-
-    try:
-        groups = await discover_feishu_notify_groups()
-    except FeishuGroupsUnavailable:
+    if discovered_groups is None:
+        raise FeishuGroupsPrefetchRequired(stored_routes)
+    if isinstance(discovered_groups, _FeishuGroupsUnavailableSentinel):
         raise HTTPException(
             status_code=503,
             detail="飞书群列表暂时不可用，请稍后再试",
-        ) from None
+        )
+    groups = list(discovered_groups)
     known = {f"feishu:chat:{g['chat_id']}" for g in groups}
     unknown = sorted(chat_targets - known)
     if unknown:
@@ -995,42 +1065,237 @@ async def validate_dalton_notify_routes_for_user(
         )
 
 
+async def run_with_feishu_group_prefetch(
+    *,
+    user_id: str | None,
+    submitted_routes: Mapping[str, Any] | None,
+    read_unlocked_routes: Callable[[], Awaitable[Mapping[str, Any] | None]],
+    run_in_lock: Callable[
+        [
+            list[dict[str, str]] | _FeishuGroupsUnavailableSentinel | None,
+            dict[str, list[str]] | None,
+        ],
+        Awaitable[_PrefetchReturnT],
+    ],
+) -> _PrefetchReturnT:
+    """Shared 'outside-lock prefetch -> in-lock validation -> at most one redo' helper
+    used by ``toggle_system_job``, ``PUT /api/v1/users/me/preferences``, and
+    ``apply_dalton_notify_preference_patch``."""
+    unlocked_routes = (
+        await read_unlocked_routes()
+        if _new_chat_targets_in_routes(submitted_routes, None)
+        else None
+    )
+    prefetched = await prefetch_feishu_groups_for_route_patch(
+        user_id,
+        submitted_routes,
+        unlocked_routes,
+    )
+    try:
+        return await run_in_lock(prefetched, None)
+    except FeishuGroupsPrefetchRequired as first_exc:
+        retry_prefetched = await prefetch_feishu_groups_for_route_patch(
+            user_id,
+            submitted_routes,
+            first_exc.locked_routes,
+        )
+        try:
+            return await run_in_lock(retry_prefetched, first_exc.locked_routes)
+        except FeishuGroupsPrefetchRequired as second_exc:
+            from fastapi import HTTPException
+
+            raise HTTPException(
+                status_code=409,
+                detail="配置刚被其他人修改，请重试",
+            ) from second_exc
+
+
+def reject_direct_data_task_route_edits(
+    model_pref: Mapping[str, Any] | None,
+    submitted_routes: Any,
+    stored_routes: Any = None,
+) -> None:
+    """Reject any direct addition, modification, or deletion of ``data:*`` keys via user preferences API.
+
+    Unchanged pass-through ``data:*`` entries (identical to ``stored_routes``) are permitted
+    so callers submitting a full ``dalton_notify_routes`` bag while editing non-``data:*`` keys
+    are not blocked.
+    """
+    if not isinstance(model_pref, Mapping):
+        return
+    from fastapi import HTTPException
+
+    detail_msg = (
+        "公司公共数据任务的推送路由请通过系统任务接口 "
+        "POST /api/v1/dalton/system-jobs/data:<job_key> 修改"
+    )
+    stored_data_routes: dict[str, list[str]] = {}
+    if isinstance(stored_routes, Mapping):
+        for sk, sv in stored_routes.items():
+            if isinstance(sk, str) and sk.strip().lower().startswith("data:") and isinstance(sv, list):
+                stored_data_routes[sk.strip()] = _dedup_str_list(sv)
+
+    if DALTON_NOTIFY_ROUTES_KEY in model_pref and submitted_routes is None:
+        if stored_data_routes:
+            raise HTTPException(status_code=400, detail=detail_msg)
+        return
+
+    if not isinstance(submitted_routes, Mapping):
+        return
+
+    for raw_k, raw_v in submitted_routes.items():
+        if not isinstance(raw_k, str):
+            continue
+        cleaned_k = raw_k.strip()
+        if not cleaned_k.lower().startswith("data:"):
+            continue
+        if raw_v is None or not isinstance(raw_v, list):
+            raise HTTPException(status_code=400, detail=detail_msg)
+        if any(not isinstance(item, str) or not item.strip() for item in raw_v):
+            raise HTTPException(status_code=400, detail=detail_msg)
+        norm_sub = _dedup_str_list(raw_v)
+        if cleaned_k not in stored_data_routes or norm_sub != stored_data_routes[cleaned_k]:
+            raise HTTPException(status_code=400, detail=detail_msg)
+
+
+def collect_auto_pruned_data_task_routes(
+    user_id: str | None,
+    post_validation_routes: Any,
+    stored_routes: Any = None,
+) -> dict[str, tuple[list[str], list[str]]]:
+    """Return ``{route_key: (old_targets, new_targets)}`` for ``data:*`` routes auto-pruned for the primary admin."""
+    from src.dalton.settings import get_configured_pm_user_ids
+
+    uid = str(user_id or "").strip()
+    pm_ids = get_configured_pm_user_ids()
+    if not uid or not pm_ids or uid != pm_ids[0]:
+        return {}
+    if not isinstance(post_validation_routes, Mapping) or not isinstance(stored_routes, Mapping):
+        return {}
+
+    stored_data_routes: dict[str, list[str]] = {}
+    for sk, sv in stored_routes.items():
+        if isinstance(sk, str) and sk.strip().lower().startswith("data:") and isinstance(sv, list):
+            stored_data_routes[sk.strip()] = _dedup_str_list(sv)
+
+    pruned: dict[str, tuple[list[str], list[str]]] = {}
+    for rk, rv in post_validation_routes.items():
+        if not isinstance(rk, str) or not isinstance(rv, list):
+            continue
+        cleaned_rk = rk.strip()
+        if not cleaned_rk.lower().startswith("data:"):
+            continue
+        old_targets = stored_data_routes.get(cleaned_rk)
+        new_targets = _dedup_str_list(rv)
+        if old_targets is not None and new_targets != old_targets:
+            pruned[cleaned_rk] = (old_targets, new_targets)
+    return pruned
+
+
 async def apply_dalton_notify_preference_patch(
     user_id: str,
     model_pref_patch: dict[str, Any],
 ) -> dict[str, Any]:
     """Validate and persist a ``model_preference`` patch using the exact same
     validation pipeline as ``PUT /api/v1/users/me/preferences``."""
+    from src.server.database.pool import get_db_connection
     from src.server.database.user import (
-        get_user_preferences as db_get_user_preferences,
         invalidate_user_prefs_cache,
         invalidate_user_profile_cache,
+        lock_user_preferences,
         upsert_user_preferences,
     )
 
-    stored = await db_get_user_preferences(user_id)
-    stored_model_pref = dict((stored or {}).get("model_preference") or {})
-    model_pref = dict(model_pref_patch)
-    effective = {
-        **stored_model_pref,
-        **{k: v for k, v in model_pref.items() if v is not None},
-    }
-    submitted_routes = model_pref.get(DALTON_NOTIFY_ROUTES_KEY)
-
-    validate_dalton_model_preferences(
-        model_pref,
-        effective_model_preference=effective,
-        stored_model_preference=stored_model_pref,
-    )
-    await validate_dalton_notify_routes_for_user(
-        user_id,
-        submitted_routes,
-        stored_model_pref.get(DALTON_NOTIFY_ROUTES_KEY),
+    raw_patch_routes = model_pref_patch.get(DALTON_NOTIFY_ROUTES_KEY)
+    non_data_submitted_routes = (
+        {
+            k: v
+            for k, v in raw_patch_routes.items()
+            if isinstance(k, str) and not k.strip().lower().startswith("data:")
+        }
+        if isinstance(raw_patch_routes, Mapping)
+        else None
     )
 
-    updated = await upsert_user_preferences(
+    async def _read_unlocked_routes() -> Mapping[str, Any] | None:
+        unlocked = await get_user_preferences(user_id)
+        unlocked_mp = (
+            (unlocked or {}).get("model_preference")
+            if isinstance(unlocked, Mapping)
+            else None
+        )
+        routes = (
+            unlocked_mp.get(DALTON_NOTIFY_ROUTES_KEY)
+            if isinstance(unlocked_mp, Mapping)
+            else None
+        )
+        return routes if isinstance(routes, Mapping) else None
+
+    async def _run_in_lock(
+        prefetched_groups: list[dict[str, str]]
+        | _FeishuGroupsUnavailableSentinel
+        | None,
+        expected_stored_routes: dict[str, list[str]] | None,
+    ) -> dict[str, Any]:
+        async with get_db_connection() as conn, conn.transaction():
+            locked = await lock_user_preferences(user_id, conn=conn)
+            stored_model_pref = dict((locked or {}).get("model_preference") or {})
+            model_pref = copy.deepcopy(model_pref_patch)
+            effective = {
+                **stored_model_pref,
+                **{k: v for k, v in model_pref.items() if v is not None},
+            }
+            raw_submitted_routes = model_pref.get(DALTON_NOTIFY_ROUTES_KEY)
+            submitted_routes = (
+                dict(raw_submitted_routes)
+                if isinstance(raw_submitted_routes, Mapping)
+                else raw_submitted_routes
+            )
+            stored_routes = stored_model_pref.get(DALTON_NOTIFY_ROUTES_KEY)
+            reject_direct_data_task_route_edits(
+                model_pref, submitted_routes, stored_routes
+            )
+
+            validate_dalton_model_preferences(
+                model_pref,
+                effective_model_preference=effective,
+                stored_model_preference=stored_model_pref,
+            )
+            pruned_data_task_routes = collect_auto_pruned_data_task_routes(
+                user_id,
+                model_pref.get(DALTON_NOTIFY_ROUTES_KEY),
+                stored_routes,
+            )
+            await validate_dalton_notify_routes_for_user(
+                user_id,
+                submitted_routes,
+                stored_routes,
+                discovered_groups=prefetched_groups,
+                expected_stored_routes=expected_stored_routes,
+            )
+
+            updated_row = await upsert_user_preferences(
+                user_id=user_id,
+                model_preference=model_pref,
+                conn=conn,
+            )
+            if pruned_data_task_routes:
+                from src.dalton.autonomy.system_jobs import (
+                    record_auto_pruned_data_task_routes,
+                )
+
+                await record_auto_pruned_data_task_routes(
+                    conn,
+                    actor_user_id=str(user_id).strip(),
+                    pruned_routes=pruned_data_task_routes,
+                )
+            return updated_row
+
+    updated = await run_with_feishu_group_prefetch(
         user_id=user_id,
-        model_preference=model_pref,
+        submitted_routes=non_data_submitted_routes,
+        read_unlocked_routes=_read_unlocked_routes,
+        run_in_lock=_run_in_lock,
     )
     await invalidate_user_prefs_cache(user_id)
     await invalidate_user_profile_cache(user_id)
@@ -1091,16 +1356,22 @@ async def add_dalton_personal_notify_target(
             **{k: v for k, v in model_pref.items() if v is not None},
         }
         submitted_routes = model_pref.get(DALTON_NOTIFY_ROUTES_KEY)
+        stored_routes = stored_model_pref.get(DALTON_NOTIFY_ROUTES_KEY)
 
         validate_dalton_model_preferences(
             model_pref,
             effective_model_preference=effective,
             stored_model_preference=stored_model_pref,
         )
+        pruned_data_task_routes = collect_auto_pruned_data_task_routes(
+            user_id,
+            model_pref.get(DALTON_NOTIFY_ROUTES_KEY),
+            stored_routes,
+        )
         await validate_dalton_notify_routes_for_user(
             user_id,
             submitted_routes,
-            stored_model_pref.get(DALTON_NOTIFY_ROUTES_KEY),
+            stored_routes,
         )
 
         updated = await upsert_user_preferences(
@@ -1108,6 +1379,16 @@ async def add_dalton_personal_notify_target(
             model_preference=model_pref,
             conn=conn,
         )
+        if pruned_data_task_routes:
+            from src.dalton.autonomy.system_jobs import (
+                record_auto_pruned_data_task_routes,
+            )
+
+            await record_auto_pruned_data_task_routes(
+                conn,
+                actor_user_id=str(user_id).strip(),
+                pruned_routes=pruned_data_task_routes,
+            )
 
     await invalidate_user_prefs_cache(user_id)
     await invalidate_user_profile_cache(user_id)

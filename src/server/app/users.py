@@ -577,6 +577,27 @@ async def update_preferences(
     sets_structured = _sets_structured_key(profile)
 
     stored = await db_get_user_preferences(user_id) if model_pref else None
+    # DALTON-HOOK(data-jobs): hold notify patch inputs for in-lock
+    # comparison and track auto-pruned `data:*` routes for in-transaction audit.
+    touches_dalton_notify = bool(
+        model_pref
+        and any(
+            notify_key in model_pref
+            for notify_key in (
+                "dalton_notify_targets",
+                "dalton_notify_routes",
+                "dalton_notify_target_labels",
+            )
+        )
+    )
+    raw_submitted_routes = (
+        model_pref.get("dalton_notify_routes") if model_pref else None
+    )
+    submitted_routes = (
+        dict(raw_submitted_routes)
+        if isinstance(raw_submitted_routes, dict)
+        else raw_submitted_routes
+    )
 
     if model_pref:
         stored_model_pref = (stored or {}).get("model_preference") or {}
@@ -605,37 +626,19 @@ async def update_preferences(
         _validate_model_tuning(model_pref, effective)
         _validate_default_model_choices(model_pref)
         # DALTON-HOOK(settings-section): validate Dalton model preference keys (catalog membership, dedup, timeout 60..1800).
-        # notify-routes: the stored bag rides along so the route/label cleanup
-        # sees the sub-keys a partial patch does not name (the same hand-off
-        # _clear_unhonored_efforts uses for profiles).
-        from src.dalton.llm.model_prefs import (
-            validate_dalton_model_preferences,
-            validate_dalton_notify_routes_for_user,
-        )
+        # When notify keys are touched, validation and `data:*` route diffing run
+        # inside the profile lock below so concurrent writes cannot be overwritten.
+        if not touches_dalton_notify:
+            from src.dalton.llm.model_prefs import validate_dalton_model_preferences
 
-        # DALTON-HOOK(notify-routes): the route entries the caller actually submitted —
-        # the validator below normalizes and cleans `model_pref` in place, and only
-        # the submitted entries (not the cleanup's pass-through groups) are
-        # gated on internal/admin rights and live group discovery.
-        submitted_routes = model_pref.get("dalton_notify_routes")
-
-        try:
-            validate_dalton_model_preferences(
-                model_pref,
-                effective_model_preference=effective,
-                stored_model_preference=stored_model_pref,
-            )
-        except TuningError as exc:
-            raise _tuning_400(exc) from exc
-
-        # DALTON-HOOK(notify-routes): group targets in notify routes are restricted
-        # to internal/admin members and must be in the bot's discovered chat list;
-        # the sync validator above has no user context, this one does.
-        await validate_dalton_notify_routes_for_user(
-            user_id,
-            submitted_routes,
-            (stored_model_pref or {}).get("dalton_notify_routes"),
-        )
+            try:
+                validate_dalton_model_preferences(
+                    model_pref,
+                    effective_model_preference=effective,
+                    stored_model_preference=stored_model_pref,
+                )
+            except TuningError as exc:
+                raise _tuning_400(exc) from exc
 
         # After validation, so a bad level in the patch still gets its 400 and
         # only levels already in the row are cleared.
@@ -688,8 +691,42 @@ async def update_preferences(
     # One transaction under the profile lock: the default a write replaces is
     # read where no other write can move it, and the threads move with the
     # write or not at all, so a failed move leaves nothing a retry cannot redo.
-    threads_reassigned = 0
-    try:
+    # DALTON-HOOK(data-jobs): use the shared "outside-lock prefetch ->
+    # in-lock validation -> at most one redo" helper when notify keys are touched.
+    import copy as _copy
+    from src.dalton.llm.model_prefs import run_with_feishu_group_prefetch
+
+    base_model_pref = _copy.deepcopy(model_pref)
+    base_profile = _copy.deepcopy(profile)
+    non_data_submitted_routes = (
+        {
+            k: v
+            for k, v in submitted_routes.items()
+            if isinstance(k, str) and not k.strip().lower().startswith("data:")
+        }
+        if touches_dalton_notify and isinstance(submitted_routes, dict)
+        else None
+    )
+
+    async def _read_unlocked_routes():
+        unlocked_mp = (stored or {}).get("model_preference") or {}
+        routes = (
+            unlocked_mp.get("dalton_notify_routes")
+            if isinstance(unlocked_mp, dict)
+            else None
+        )
+        return routes if isinstance(routes, dict) else None
+
+    async def _run_preferences_in_lock(
+        prefetched_feishu_groups, expected_stored_routes
+    ):
+        attempt_model_pref = _copy.deepcopy(base_model_pref)
+        attempt_profile = _copy.deepcopy(base_profile)
+        attempt_risk = risk_pref
+        attempt_investment = investment_pref
+        attempt_agent = agent_pref
+        pruned_data_task_routes: dict[str, tuple[list[str], list[str]]] = {}
+        attempt_threads_reassigned = 0
         async with get_db_connection() as conn, conn.transaction():
             # One read under the lock serves the default move and the profile
             # check. A structured key is checked against the row the write
@@ -698,44 +735,113 @@ async def update_preferences(
             # against the row read here: a read before the lock can be
             # overtaken by another write, and the old value would then be
             # written back over a newer valid one.
+            # DALTON-HOOK(data-jobs): also acquire the profile
+            # lock when notify keys are touched so `data:*` route comparisons
+            # and auto-prune diffs read the locked row before locking task rows.
             locked = (
                 await db_lock_user_preferences(user_id, conn=conn)
-                if changes_default or sets_structured
+                if changes_default or sets_structured or touches_dalton_notify
                 else None
             )
             before = locked if changes_default else None
+            # DALTON-HOOK(data-jobs): re-evaluate `data:*` route
+            # guard, target cleanup, and auto-prune diff inside the profile lock
+            # against `locked` (never against the unlocked pre-transaction read).
+            if attempt_model_pref and touches_dalton_notify:
+                from src.dalton.llm.model_prefs import (
+                    collect_auto_pruned_data_task_routes,
+                    reject_direct_data_task_route_edits,
+                    validate_dalton_model_preferences,
+                    validate_dalton_notify_routes_for_user,
+                )
+
+                locked_model_pref = (locked or {}).get("model_preference") or {}
+                locked_effective = _effective_model_preference(
+                    locked_model_pref, attempt_model_pref
+                )
+                locked_routes = (
+                    locked_model_pref.get("dalton_notify_routes")
+                    if isinstance(locked_model_pref, dict)
+                    else None
+                )
+                reject_direct_data_task_route_edits(
+                    attempt_model_pref,
+                    submitted_routes,
+                    locked_routes,
+                )
+                validate_dalton_model_preferences(
+                    attempt_model_pref,
+                    effective_model_preference=locked_effective,
+                    stored_model_preference=locked_model_pref,
+                )
+                pruned_data_task_routes = collect_auto_pruned_data_task_routes(
+                    user_id,
+                    attempt_model_pref.get("dalton_notify_routes"),
+                    locked_routes,
+                )
+                await validate_dalton_notify_routes_for_user(
+                    user_id,
+                    submitted_routes,
+                    locked_routes,
+                    discovered_groups=prefetched_feishu_groups,
+                    expected_stored_routes=expected_stored_routes,
+                )
             if sets_structured:
                 # Every value outside its vocabulary, in any column, in one
                 # 422, so a form can mark them all at once. Raising here rolls
                 # the transaction back with nothing written.
-                profile, problems = check_profile(profile, locked)
+                attempt_profile, problems = check_profile(attempt_profile, locked)
                 if problems:
                     raise HTTPException(
                         status_code=422,
-                        detail="; ".join(f"{path}: {message}" for path, message in problems),
+                        detail="; ".join(
+                            f"{path}: {message}" for path, message in problems
+                        ),
                     )
-                risk_pref, investment_pref, agent_pref = (
-                    profile["risk_preference"],
-                    profile["investment_preference"],
-                    profile["agent_preference"],
+                attempt_risk, attempt_investment, attempt_agent = (
+                    attempt_profile["risk_preference"],
+                    attempt_profile["investment_preference"],
+                    attempt_profile["agent_preference"],
                 )
-            preferences = await upsert_user_preferences(
+            prefs_row = await upsert_user_preferences(
                 user_id=user_id,
-                risk_preference=risk_pref,
-                investment_preference=investment_pref,
-                agent_preference=agent_pref,
+                risk_preference=attempt_risk,
+                investment_preference=attempt_investment,
+                agent_preference=attempt_agent,
                 other_preference=other_pref,
-                model_preference=model_pref,
+                model_preference=attempt_model_pref,
                 conn=conn,
             )
+            # DALTON-HOOK(data-jobs): write `action = "auto_prune_target"`
+            # audit snapshot and increment version for any auto-pruned `data:*` routes
+            # in the same transaction as the preference update.
+            if pruned_data_task_routes:
+                from src.dalton.autonomy.system_jobs import (
+                    record_auto_pruned_data_task_routes,
+                )
+
+                await record_auto_pruned_data_task_routes(
+                    conn,
+                    actor_user_id=str(user_id).strip(),
+                    pruned_routes=pruned_data_task_routes,
+                )
             if changes_default:
-                threads_reassigned = await carry_default_change(
+                attempt_threads_reassigned = await carry_default_change(
                     user_id,
                     before=model_preference_of(before),
-                    after=model_preference_of(preferences),
+                    after=model_preference_of(prefs_row),
                     apply_to=request.apply_default_to,
                     conn=conn,
                 )
+            return prefs_row, attempt_threads_reassigned
+
+    try:
+        preferences, threads_reassigned = await run_with_feishu_group_prefetch(
+            user_id=user_id,
+            submitted_routes=non_data_submitted_routes,
+            read_unlocked_routes=_read_unlocked_routes,
+            run_in_lock=_run_preferences_in_lock,
+        )
     except TuningError as exc:
         raise _tuning_400(exc) from exc
 
@@ -757,7 +863,43 @@ async def delete_preferences(user_id: CurrentUserId):
     if not user:
         raise_not_found("User")
 
-    await db_delete_user_preferences(user_id)
+    # DALTON-HOOK(data-jobs): when the primary admin resets their
+    # preferences, preserve all `dalton_notify*` keys in place (without
+    # writing an audit entry or bumping `config_version`) and perform the
+    # check + write/delete in a single transaction and profile lock.
+    from src.dalton.settings import get_configured_pm_user_ids
+
+    pm_ids = get_configured_pm_user_ids()
+    uid_clean = str(user_id or "").strip()
+    if pm_ids and uid_clean == pm_ids[0]:
+        async with get_db_connection() as conn, conn.transaction():
+            locked = await db_lock_user_preferences(user_id, conn=conn)
+            locked_model_pref = (locked or {}).get("model_preference") or {}
+            locked_other_pref = (locked or {}).get("other_preference") or {}
+            preserved_notify_prefs: dict[str, object] = {}
+            if isinstance(locked_other_pref, dict):
+                for k, v in locked_other_pref.items():
+                    if isinstance(k, str) and k.strip().startswith("dalton_notify"):
+                        preserved_notify_prefs[k.strip()] = v
+            if isinstance(locked_model_pref, dict):
+                for k, v in locked_model_pref.items():
+                    if isinstance(k, str) and k.strip().startswith("dalton_notify"):
+                        preserved_notify_prefs[k.strip()] = v
+            if preserved_notify_prefs:
+                await upsert_user_preferences(
+                    user_id=user_id,
+                    risk_preference={},
+                    investment_preference={},
+                    agent_preference={},
+                    other_preference={},
+                    model_preference=preserved_notify_prefs,
+                    replace=True,
+                    conn=conn,
+                )
+            else:
+                await db_delete_user_preferences(user_id, conn=conn)
+    else:
+        await db_delete_user_preferences(user_id)
     await invalidate_user_prefs_cache(user_id)
     await invalidate_user_profile_cache(user_id)
     await db_update_user(user_id=user_id, onboarding_completed=False)

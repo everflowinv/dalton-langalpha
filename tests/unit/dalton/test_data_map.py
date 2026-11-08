@@ -861,3 +861,200 @@ def test_conversation_search_docstring_contract() -> None:
     returns_lines = lines[returns_idx + 1 :]
     assert len(returns_lines) == 1
     assert "openclaw://" in returns_lines[0]
+
+
+@pytest.mark.asyncio
+async def test_check_data_task_runs_health_and_run_all_health_checks_integration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify §7.2 & Round 2 Item 6:
+    - `check_data_task_runs_health()` queries `dalton_data_task_runs` for unrecovered failures in the past 36h on enabled tasks;
+    - `data_tasks` is always written into `probe_results` and persisted to `dalton_data_source_health`;
+    - Failure -> subsequent recovery (`succeeded` run) overwrites DB health row back to `available`;
+    - Failure -> task disabled (`enabled=False`) overwrites DB health row back to `available` (no stale anomaly left);
+    - Query exception is recorded as `status="unavailable"` in `probe_results` and counted in `unavailable_count`.
+    """
+    from contextlib import asynccontextmanager
+    from datetime import datetime, timezone
+    from psycopg import AsyncCursor
+
+    task_enabled = {"cn-leverage-daily": True}
+    run_rows: list[dict[str, Any]] = []
+    raise_on_query = {"err": None}
+
+    mock_cur = create_autospec(AsyncCursor, instance=True)
+
+    async def _fake_execute(sql: Any, params: Any = None, **_kw: Any) -> None:
+        _ = (sql, params)
+        if raise_on_query["err"] is not None:
+            raise raise_on_query["err"]
+
+    async def _fake_fetchall() -> list[dict[str, Any]]:
+        # Mirror the SQL filter: enabled tasks with failed/timed_out runs and no newer succeeded run
+        out: list[dict[str, Any]] = []
+        for r in run_rows:
+            jk = r["job_key"]
+            if not task_enabled.get(jk, False):
+                continue
+            if r["status"] not in ("failed", "timed_out"):
+                continue
+            has_newer_success = any(
+                s["job_key"] == jk
+                and s["status"] == "succeeded"
+                and s["run_ts"] > r["run_ts"]
+                for s in run_rows
+            )
+            if not has_newer_success:
+                out.append(dict(r))
+        return out
+
+    mock_cur.execute.side_effect = _fake_execute
+    mock_cur.fetchall.side_effect = _fake_fetchall
+
+    @asynccontextmanager
+    async def _fake_cursor(*_args: Any, **_kwargs: Any):
+        yield mock_cur
+
+    mock_conn = create_autospec(AsyncConnection, instance=True)
+    mock_conn.cursor.side_effect = _fake_cursor
+
+    @asynccontextmanager
+    async def _fake_get_db_conn(*_args: Any, **_kwargs: Any):
+        yield mock_conn
+
+    monkeypatch.setattr(
+        health_mod.db_pool,
+        "get_db_connection",
+        create_autospec(health_mod.db_pool.get_db_connection, side_effect=_fake_get_db_conn),
+    )
+
+    persisted_health: dict[str, dict[str, Any]] = {}
+
+    async def _fake_upsert_batch(
+        results: list[dict[str, Any]], *, conn: Any = None
+    ) -> int:
+        _ = conn
+        for item in results:
+            persisted_health[str(item["source_id"])] = dict(item)
+        return len(results)
+
+    monkeypatch.setattr(
+        db_data_map,
+        "upsert_source_health_batch",
+        create_autospec(db_data_map.upsert_source_health_batch, side_effect=_fake_upsert_batch),
+    )
+    monkeypatch.setattr(
+        health_mod,
+        "refresh_daily_data_map",
+        create_autospec(
+            health_mod.refresh_daily_data_map,
+            return_value={"rendered_markdown": "## Dalton 数据地图", "token_estimate": 500},
+        ),
+    )
+
+    mock_resolve_endpoint = create_autospec(
+        health_mod.resolve_researchdata_endpoint_and_token,
+        return_value=("http://127.0.0.1:8960/mcp", "fixed-test-token", set(FIXED_HANDOFF_ROUTES)),
+    )
+    monkeypatch.setattr(
+        health_mod,
+        "resolve_researchdata_endpoint_and_token",
+        mock_resolve_endpoint,
+    )
+    mock_bridge = create_autospec(
+        health_mod.default_bridge_rpc_call,
+        return_value={"ok": True, "routes": []},
+    )
+    mock_web = create_autospec(health_mod.default_web_search_probe, return_value={"latest_date": "2026-11-08"})
+    mock_x = create_autospec(health_mod.default_x_search_probe, return_value={"latest_date": "2026-11-08"})
+    mock_mkt = create_autospec(health_mod.default_market_quote_probe, return_value={"latest_date": None})
+    mock_sec = create_autospec(health_mod.default_sec_filings_probe, return_value={"latest_date": "2026-11-07"})
+    mock_conv = create_autospec(health_mod.default_conversation_probe, return_value={"latest_date": "2026-11-08"})
+
+    async def _run_check() -> dict[str, Any]:
+        return await health_mod.run_all_health_checks(
+            item_timeout_s=5.0,
+            bridge_caller=mock_bridge,
+            web_search_prober=mock_web,
+            x_search_prober=mock_x,
+            market_quote_prober=mock_mkt,
+            sec_filings_prober=mock_sec,
+            conversation_prober=mock_conv,
+            persist=True,
+        )
+
+    # 1) Initial clean check -> `data_tasks` is persisted with status="available"
+    clean_res = await health_mod.check_data_task_runs_health()
+    assert clean_res["source_id"] == "data_tasks"
+    assert clean_res["status"] == "available"
+    sql_executed = str(mock_cur.execute.await_args.args[0])
+    assert "dalton_data_task_runs" in sql_executed
+    assert "NOT EXISTS" in sql_executed
+
+    # 2) Unrecovered failure within 36h on enabled task -> persisted as status="unavailable"
+    run_rows.append(
+        {
+            "job_key": "cn-leverage-daily",
+            "task_code": "T5",
+            "title": "A股杠杆/拥挤度监控",
+            "run_id": "run-123",
+            "status": "failed",
+            "failure_reason": "non_zero_exit",
+            "exit_code": 2,
+            "run_ts": datetime(2026, 11, 8, 2, 15, tzinfo=timezone.utc),
+        }
+    )
+    summary_fail = await _run_check()
+    assert summary_fail["unavailable_count"] == 1
+    assert persisted_health["data_tasks"]["status"] == "unavailable"
+    assert persisted_health["data_tasks"]["detail"]["failed_count"] == 1
+
+    # 3) Failure -> recovery (newer succeeded run) -> next health check overwrites DB back to "available"
+    run_rows.append(
+        {
+            "job_key": "cn-leverage-daily",
+            "task_code": "T5",
+            "title": "A股杠杆/拥挤度监控",
+            "run_id": "run-124",
+            "status": "succeeded",
+            "failure_reason": None,
+            "exit_code": 0,
+            "run_ts": datetime(2026, 11, 8, 3, 15, tzinfo=timezone.utc),
+        }
+    )
+    summary_recovered = await _run_check()
+    assert summary_recovered["unavailable_count"] == 0
+    assert persisted_health["data_tasks"]["status"] == "available"
+    assert persisted_health["data_tasks"]["error_type"] is None
+    assert persisted_health["data_tasks"]["detail"]["failed_count"] == 0
+
+    # 4) Failure again -> task disabled (`enabled=False`) -> next health check clears old anomaly in DB
+    run_rows.append(
+        {
+            "job_key": "cn-leverage-daily",
+            "task_code": "T5",
+            "title": "A股杠杆/拥挤度监控",
+            "run_id": "run-125",
+            "status": "timed_out",
+            "failure_reason": "wall_clock_timeout",
+            "exit_code": -9,
+            "run_ts": datetime(2026, 11, 8, 4, 15, tzinfo=timezone.utc),
+        }
+    )
+    summary_fail2 = await _run_check()
+    assert summary_fail2["unavailable_count"] == 1
+    assert persisted_health["data_tasks"]["status"] == "unavailable"
+
+    task_enabled["cn-leverage-daily"] = False
+    summary_disabled = await _run_check()
+    assert summary_disabled["unavailable_count"] == 0
+    assert persisted_health["data_tasks"]["status"] == "available"
+    assert persisted_health["data_tasks"]["detail"]["failed_count"] == 0
+
+    # 5) Query itself raises exception -> counted as unavailable and persisted as status="unavailable"
+    raise_on_query["err"] = RuntimeError("db query boom")
+    summary_exc = await _run_check()
+    assert summary_exc["unavailable_count"] == 1
+    assert persisted_health["data_tasks"]["status"] == "unavailable"
+    assert "RuntimeError" in str(persisted_health["data_tasks"]["error_type"])
+
