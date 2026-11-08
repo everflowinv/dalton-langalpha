@@ -109,6 +109,73 @@ def test_volumeless_instrument_uses_date_adjacent_row():
     assert prev == 5_801.0
 
 
+@pytest.mark.parametrize("quote_type", ["EQUITY", "ETF"])
+def test_equity_like_long_suspension_all_zero_volume_returns_unknown(quote_type: str):
+    # Long suspension: the whole 1mo window is zero-volume fill rows. For
+    # EQUITY/ETF that is not a volumeless instrument — no real trade means
+    # no previous close, even when fast_info agrees with the fill price.
+    rows = [("2026-09-21", 15.47, 0.0), ("2026-10-20", 15.47, 0.0)]
+    assert validated_previous_close(15.47, rows, "2026-10-21", quote_type=quote_type) is None
+    assert validated_previous_close(None, rows, "2026-10-21", quote_type=quote_type) is None
+
+
+@pytest.mark.parametrize("quote_type", ["EQUITY", "ETF"])
+def test_equity_like_with_real_trades_unchanged(quote_type: str):
+    assert validated_previous_close(13.57, _frozen_hk_rows(), "2026-10-27", quote_type=quote_type) == 13.57
+    assert validated_previous_close(15.47, _frozen_hk_rows(), "2026-10-27", quote_type=quote_type) is None
+    assert validated_previous_close(15.47, _frozen_hk_rows(), "2026-10-26", quote_type=quote_type) is None
+
+
+@pytest.mark.parametrize("quote_type", ["INDEX", "CURRENCY"])
+def test_volumeless_types_keep_existing_logic(quote_type: str):
+    rows = [("2026-10-19", 15.47, 0.0), ("2026-10-20", 15.47, 0.0)]
+    assert validated_previous_close(15.47, rows, "2026-10-21", quote_type=quote_type) == 15.47
+    assert validated_previous_close(16.10, rows, "2026-10-21", quote_type=quote_type) is None
+
+
+def test_unknown_quote_type_keeps_existing_logic():
+    rows = [("2026-10-19", 15.47, 0.0), ("2026-10-20", 15.47, 0.0)]
+    assert validated_previous_close(15.47, rows, "2026-10-21", quote_type=None) == 15.47
+    assert validated_previous_close(15.47, rows, "2026-10-21") == 15.47
+
+
+def test_recent_daily_rows_cached_concurrent_eviction_no_runtime_error():
+    # More distinct keys than the 256-entry cap, from many threads at once:
+    # eviction must not raise RuntimeError: dictionary changed size.
+    import threading
+
+    from src.data_client.yfinance import yahoo as yahoo_mod
+
+    rows = [("2026-10-27", 12.90, 30_000_000.0)]
+    fake_fetch = create_autospec(
+        yahoo_mod._recent_daily_rows, side_effect=lambda ticker: list(rows)
+    )
+    ticker = create_autospec(yf.Ticker, instance=True)
+    barrier = threading.Barrier(16)
+    errors: list[BaseException] = []
+
+    def _call(offset: int) -> None:
+        try:
+            barrier.wait(timeout=10)
+            for i in range(24):
+                result = yahoo_mod._recent_daily_rows_cached(
+                    f"SYM{offset * 24 + i}", "2026-10-27", ticker
+                )
+                assert result == rows
+        except BaseException as exc:  # noqa: BLE001 - collected and asserted below
+            errors.append(exc)
+
+    with patch.object(yahoo_mod, "_recent_daily_rows", new=fake_fetch):
+        threads = [threading.Thread(target=_call, args=(n,)) for n in range(16)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+    assert not any(t.is_alive() for t in threads)
+    assert errors == []
+    assert len(yahoo_mod._daily_rows_cache) <= yahoo_mod._DAILY_ROWS_CACHE_MAX
+
+
 def test_unavailable_history_returns_unknown():
     # Round-2 fix: with no daily bars to cross-check against, the fast_info
     # number is exactly the unverified tail that once read −16.61% — the
@@ -130,17 +197,25 @@ def _history_frame(rows: list[tuple[str, float, float]]) -> pd.DataFrame:
 def _stub_ticker(rows_1mo: list[tuple[str, float, float]] | None,
                  fast_info: dict[str, object],
                  regular_market_time: int | None = 1793088499,
-                 info: dict[str, object] | None = None) -> object:
+                 info: dict[str, object] | None = None,
+                 quote_type: str | None = None) -> object:
     # 1793088499 = 2026-10-27 16:08:19 HKT, the exported quote's print time.
     ticker = create_autospec(yf.Ticker, instance=True)
+    fast_info = dict(fast_info)
+    if quote_type is not None:
+        fast_info["quoteType"] = quote_type
     ticker.fast_info = fast_info
     merged_info = dict(info) if info is not None else {"longName": "Test Corp"}
+    if quote_type is not None:
+        merged_info["quoteType"] = quote_type
     if "marketCap" in fast_info and "marketCap" not in merged_info:
         merged_info["marketCap"] = fast_info["marketCap"]
     ticker.info = merged_info
     last_price = fast_info.get("lastPrice")
     raw_prev = regular_previous_close(fast_info)
     meta: dict[str, object] = {"exchangeTimezoneName": "Asia/Hong_Kong"}
+    if quote_type is not None:
+        meta["instrumentType"] = quote_type
     if regular_market_time is not None:
         meta["regularMarketTime"] = regular_market_time
     if last_price is not None:
@@ -278,6 +353,46 @@ def test_fetch_single_snapshot_normal_day_unchanged():
     assert snap["previous_close"] == 13.57
     assert snap["change"] == pytest.approx(-0.67)
     assert snap["change_percent"] == pytest.approx((12.90 - 13.57) / 13.57 * 100, abs=1e-4)
+
+
+def test_fetch_single_snapshot_equity_long_suspension_reports_unknown():
+    # EQUITY suspended >1mo: 1mo window is all zero-volume fills at 15.47 and
+    # the bar-derived previous close agrees with it — still unknown.
+    from src.dalton import extended_hours
+    from src.data_client.yfinance import data_source as yf_ds
+
+    ticker = _stub_ticker(
+        [("2026-09-21", 15.47, 0.0), ("2026-10-20", 15.47, 0.0),
+         ("2026-10-26", 15.47, 0.0), ("2026-10-27", 12.90, 0.0)],
+        fast_info={
+            "lastPrice": 12.90,
+            "regularMarketPreviousClose": 15.47,
+            "open": 13.40,
+            "dayHigh": 13.55,
+            "dayLow": 12.80,
+            "lastVolume": 0,
+        },
+        quote_type="EQUITY",
+    )
+    with (
+        patch(
+            "src.data_client.yfinance.data_source.yahoo_ticker",
+            new=create_autospec(yf_ds.yahoo_ticker, return_value=ticker),
+        ),
+        patch(
+            "src.dalton.extended_hours.enrich_yfinance_snapshot_extended_hours",
+            new=create_autospec(
+                extended_hours.enrich_yfinance_snapshot_extended_hours,
+                side_effect=lambda snap, sym, tk: snap,
+            ),
+        ),
+    ):
+        snap = _fetch_single_snapshot("2525.HK")
+    assert snap is not None
+    assert snap["price"] == 12.90
+    assert snap["previous_close"] is None
+    assert snap["change"] is None
+    assert snap["change_percent"] is None
 
 
 def test_fetch_single_snapshot_unavailable_history_reports_unknown():
@@ -927,3 +1042,59 @@ async def test_realtime_quote_restores_52_week_range_and_avg_volume():
     assert artifact["quote"]["avgVolume"] == 60_000_000
 
 
+
+
+def test_fetch_single_snapshot_quote_type_survives_fallback_history_call():
+    # The 5d window lacks the prior session, so the snapshot falls back to
+    # history("1d"), which in yfinance replaces history_metadata (empty on a
+    # swallowed error). The EQUITY type must be captured before that call, or
+    # the all-fill window is read as a volumeless instrument and its fill
+    # price (15.47) comes back as a fake previous close.
+    from src.dalton import extended_hours
+    from src.data_client.yfinance import data_source as yf_ds
+
+    rows = [("2026-09-21", 15.47, 0.0), ("2026-10-20", 15.47, 0.0),
+            ("2026-10-26", 15.47, 0.0), ("2026-10-27", 12.90, 0.0)]
+    ticker = _stub_ticker(
+        rows,
+        fast_info={
+            "lastPrice": 12.90,
+            "regularMarketPreviousClose": 15.47,
+            "open": 13.40,
+            "dayHigh": 13.55,
+            "dayLow": 12.80,
+            "lastVolume": 0,
+        },
+    )
+    # Real yfinance carries the type only in history_metadata here.
+    ticker.history_metadata["instrumentType"] = "EQUITY"
+
+    def _history(*_args: object, **kwargs: object) -> pd.DataFrame:
+        period = kwargs.get("period")
+        if period == "5d":
+            return _history_frame(rows[-1:])
+        if period == "1d":
+            # yfinance's history_metadata is a live view: the same object
+            # the snapshot already holds goes empty.
+            ticker.history_metadata.clear()
+            return pd.DataFrame()
+        return _history_frame(rows)
+
+    ticker.history.side_effect = _history
+    with (
+        patch(
+            "src.data_client.yfinance.data_source.yahoo_ticker",
+            new=create_autospec(yf_ds.yahoo_ticker, return_value=ticker),
+        ),
+        patch(
+            "src.dalton.extended_hours.enrich_yfinance_snapshot_extended_hours",
+            new=create_autospec(
+                extended_hours.enrich_yfinance_snapshot_extended_hours,
+                side_effect=lambda snap, sym, tk: snap,
+            ),
+        ),
+    ):
+        snap = _fetch_single_snapshot("2525.HK")
+    assert snap is not None
+    assert snap["previous_close"] is None
+    assert snap["change"] is None
