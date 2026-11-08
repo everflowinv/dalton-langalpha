@@ -791,11 +791,59 @@ def abort_queued_subagent_on_cancel(
                 handler_task.cancel()
 
 
+# DALTON-HOOK(subagent-caps): keep the concurrency slot leased while any
+# ``task.stragglers`` left behind by a timed-out or slow-closing subagent
+# are still running, so a queued subagent cannot start under the cap while
+# the previous run's in-flight tool or graph step is still executing.
 async def release_subagent_slot(task: Any) -> None:
-    """Idempotently release ``task``'s Redis slot or queue entry."""
+    """Idempotently release ``task``'s Redis slot or queue entry once ``task``
+    and any in-flight ``task.stragglers`` have finished.
+    """
     lease = getattr(task, "slot_lease", None)
-    if isinstance(lease, SubagentSlotLease):
+    if not isinstance(lease, SubagentSlotLease) or lease._released:
+        return
+
+    def _live_stragglers() -> list[asyncio.Task[Any]]:
+        raw = getattr(task, "stragglers", None)
+        if not raw:
+            return []
+        try:
+            return [w for w in raw if w is not None and not w.done()]
+        except TypeError:
+            return []
+
+    async def _release_once() -> None:
+        if lease._released or getattr(lease, "_release_called", False):
+            return
+        lease._release_called = True  # type: ignore[attr-defined]
         await lease.release()
+
+    waiter: asyncio.Task[None] | None = getattr(
+        lease, "_straggler_release_task", None
+    )
+    stragglers = _live_stragglers()
+    if not stragglers:
+        if waiter is not None and not waiter.done():
+            await waiter
+            return
+        await _release_once()
+        return
+
+    if waiter is not None and not waiter.done():
+        return
+
+    async def _wait_stragglers_and_release() -> None:
+        try:
+            while pending := _live_stragglers():
+                await asyncio.wait(pending)
+        finally:
+            await _release_once()
+
+    lease._straggler_release_task = asyncio.create_task(  # type: ignore[attr-defined]
+        _wait_stragglers_and_release(),
+        name=f"subagent_slot_straggler_release_{lease.task_id}",
+    )
+    await asyncio.sleep(0)
 
 
 def is_subagent_queued(task: Any) -> bool:
