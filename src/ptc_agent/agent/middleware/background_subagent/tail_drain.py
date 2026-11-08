@@ -104,11 +104,13 @@ async def drain_tail_writers(
                     started, now - max(0.0, time.time() - task.last_updated_at)
                 )
                 own_end = first_settled.setdefault(task.task_id, settled_at) + SETTLED_UNWIND_S
+            # DALTON-HOOK(subagent-caps): a slot-queued task has no running clock yet.
             elif task.stop_at is not None and not is_subagent_queued(task):
                 own_end = now + task.stop_at - time.time() + TAIL_DRAIN_SLACK_S
             else:
                 own_end = None
             ends[task.task_id] = min(
+                # DALTON-HOOK(subagent-caps): per-task fallback clock (from slot acquisition).
                 (end for end in (task_clock_end, own_end) if end is not None),
                 default=None,
             )
