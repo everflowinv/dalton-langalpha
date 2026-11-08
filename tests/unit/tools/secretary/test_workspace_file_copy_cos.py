@@ -23,6 +23,12 @@ from src.server.utils.secret_redactor import SecretRedactor
 from src.tools.secretary import tools as secretary_tools
 
 
+from src.tools.secretary.tools import (
+    workspace_file_copy_cos,
+    workspace_file_read_cos,
+)
+
+
 @pytest.fixture(autouse=True)
 def _scan_rss_budget_from_now(monkeypatch: pytest.MonkeyPatch) -> None:
     """The PDF scan's RSS guard reads the process's
@@ -40,10 +46,6 @@ def _scan_rss_budget_from_now(monkeypatch: pytest.MonkeyPatch) -> None:
         "_COS_SCAN_MAX_RSS_BYTES",
         peak_bytes + secretary_tools._COS_SCAN_MAX_RSS_BYTES,
     )
-from src.tools.secretary.tools import (
-    workspace_file_copy_cos,
-    workspace_file_read_cos,
-)
 
 OWNER_SECRET = "sk-proj-owner-vault-secret-9999"
 
