@@ -149,3 +149,19 @@ web/src/pages/ChatAgent/session/stream/__tests__/provenanceBatch.test.ts
 web/src/pages/ChatAgent/session/history/__tests__/replayHistory.provenanceBatch.test.ts
 # Notify settings conversational tool for internal/admin members.
 src/dalton/tools/notify_tools.py
+# PW-1: permanent Chinese research judgment and writing rules prompt component.
+src/ptc_agent/agent/prompts/templates/components/research_writing.md.j2
+# OC-1 Phase 0 PR 0-1: scheduled data jobs layer foundation (migration, manifest,
+# scheduler core, container runner, wrapper process, evaluators & unit tests).
+src/dalton/migrations/versions/d029_data_tasks.py
+src/dalton/data_jobs/__init__.py
+src/dalton/data_jobs/manifest.yaml
+src/dalton/data_jobs/manifest.py
+src/dalton/data_jobs/scheduler.py
+src/dalton/data_jobs/container_runner.py
+src/dalton/data_jobs/host_runner.py
+src/dalton/data_jobs/runner_wrapper.py
+src/dalton/data_jobs/evaluators.py
+tests/unit/dalton/fixtures/oc1_task_baseline.md
+tests/unit/dalton/test_data_jobs.py
+tests/integration/dalton/test_data_jobs_db.py

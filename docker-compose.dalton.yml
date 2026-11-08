@@ -49,6 +49,7 @@ services:
       # default in src/dalton/dalton.yaml stays off. Set to 0 in the shell or
       # .env and recreate the backend to turn it back off.
       DALTON_COVERAGE_UNITS_ENABLED: "${DALTON_COVERAGE_UNITS_ENABLED:-1}"
+      DALTON_HOST_VAR_DIR: "${DALTON_HOST_VAR_DIR:-${PWD}/var/dalton}"
     volumes:
       - ./agent_config.dalton.yaml:/app/agent_config.dalton.yaml:ro
       - ./config.dalton.yaml:/app/config.dalton.yaml:ro

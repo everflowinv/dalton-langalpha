@@ -31,10 +31,16 @@ RUN if [ "$INSTALL_OBSERVABILITY" = "true" ]; then \
 RUN uv run patchright install --with-deps chromium \
     && uv run scrapling install
 
-# Install git at image build time (never at container startup via apt-get)
-RUN apt-get update && apt-get install -y --no-install-recommends git \
+# Install git + OC-1 data-task APT packages (poppler-utils, fonts-noto-cjk) at image build time
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    poppler-utils \
+    fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/* \
-    && git config --system --add safe.directory '*'
+    && git config --system --add safe.directory '*' \
+    && mkdir -p /opt/homebrew/bin \
+    && ln -s /app/.venv/bin/python /opt/homebrew/bin/python3 \
+    && ln -s /app/.venv/bin/python /opt/homebrew/bin/python3.14
 
 COPY src/ src/
 COPY server.py .

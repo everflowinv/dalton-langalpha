@@ -188,6 +188,7 @@ async def build_ptc_graph(
     )
     # DALTON-HOOK(team-memory-toggle): resolve per-turn Team Memory switch from Postgres
     from src.dalton.data_map import warm_turn_data_map
+    from src.dalton.settings import is_dalton_enabled  # DALTON-HOOK(research-writing)
     from src.dalton.sharing import resolve_turn_team_memory_enabled
 
     caller_tier: str | None = None
@@ -229,6 +230,11 @@ async def build_ptc_graph(
             if team_memory_enabled
             else {}
         ),  # DALTON-HOOK(team-memory-toggle)
+        **(
+            {"research_writing_enabled": True}
+            if is_dalton_enabled()
+            else {}
+        ),  # DALTON-HOOK(research-writing)
     )
 
     logger.debug(
@@ -357,6 +363,7 @@ async def build_ptc_graph_with_session(
 
     # DALTON-HOOK(team-memory-toggle): resolve per-turn Team Memory switch from Postgres
     from src.dalton.data_map import warm_turn_data_map
+    from src.dalton.settings import is_dalton_enabled  # DALTON-HOOK(research-writing)
     from src.dalton.sharing import resolve_turn_team_memory_enabled
 
     team_memory_enabled = await resolve_turn_team_memory_enabled(
@@ -422,6 +429,11 @@ async def build_ptc_graph_with_session(
             if team_memory_enabled
             else {}
         ),  # DALTON-HOOK(team-memory-toggle)
+        **(
+            {"research_writing_enabled": True}
+            if is_dalton_enabled()
+            else {}
+        ),  # DALTON-HOOK(research-writing)
     )
 
     logger.debug(

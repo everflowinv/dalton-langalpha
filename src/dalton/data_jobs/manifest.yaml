@@ -1,0 +1,452 @@
+# OC-1 Phase 1 deterministic data tasks manifest (19 tasks).
+# Fields match DESIGN_data_task_layer.FINAL_20261107.md §1.1 (TASK_BASELINE.md + approved changes for T28 & T44).
+# All tasks default to enabled: false in PR 0-1 so merging does not alter production behavior.
+tasks:
+  - task_code: "T1"
+    job_key: "bbg-data-pull-asia"
+    title: "BBG数据拉取（亚洲时段）：SSH触发Windows BBG刷新+拉CSV"
+    batch_no: 2
+    runner: "host"
+    host_mode: "mirror"
+    cron: "0 10,17 * * 1-5"
+    timezone: "Asia/Hong_Kong"
+    timeout_seconds: 900
+    no_output_timeout_seconds: 420
+    output_max_bytes: null
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "bash /Users/everflow/.openclaw/workspace/scripts/bbg_remote_refresh.sh"
+    command_argv:
+      - "sh"
+      - "-c"
+      - "bash /Users/everflow/.openclaw/workspace/scripts/bbg_remote_refresh.sh"
+    secret_names: []
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T5"
+    job_key: "cn-leverage-daily"
+    title: "A股杠杆/拥挤度监控每日增量抓取+看板重建（两融/期指基差/ETF份额/涨停炸板/转债/北向）"
+    batch_no: 3
+    runner: "container"
+    cron: "45 17 * * 1-5"
+    timezone: "Asia/Shanghai"
+    timeout_seconds: 900
+    no_output_timeout_seconds: null
+    output_max_bytes: null
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "bash /Users/everflow/.openclaw/workspace/skills/cn-leverage-monitor/run.sh update && bash /Users/everflow/.openclaw/workspace/skills/cn-leverage-monitor/run.sh dashboard"
+    command_argv:
+      - "sh"
+      - "-c"
+      - "bash /Users/everflow/.openclaw/workspace/skills/cn-leverage-monitor/run.sh update && bash /Users/everflow/.openclaw/workspace/skills/cn-leverage-monitor/run.sh dashboard"
+    secret_names: []
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T7"
+    job_key: "jp-leverage-daily"
+    title: "日本杠杆/拥挤度监控每日增量抓取+看板重建 (JPX/JSF/NEXT FUNDS/Nikkei)"
+    batch_no: 3
+    runner: "container"
+    cron: "35 19 * * 1-5"
+    timezone: "Asia/Tokyo"
+    timeout_seconds: 900
+    no_output_timeout_seconds: 300
+    output_max_bytes: 30000
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "bash /Users/everflow/.openclaw/workspace/skills/jp-leverage-monitor/run.sh run"
+    command_argv:
+      - "sh"
+      - "-c"
+      - "bash /Users/everflow/.openclaw/workspace/skills/jp-leverage-monitor/run.sh run"
+    secret_names: []
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T8"
+    job_key: "kr-leverage-daily"
+    title: "韩国杠杆/拥挤度监控日频抓取+看板重建 (KOFIA/Naver -> research-outputs/kr-leverage)"
+    batch_no: 3
+    runner: "container"
+    cron: "40 5 * * 1-5"
+    timezone: "America/New_York"
+    timeout_seconds: null
+    no_output_timeout_seconds: null
+    output_max_bytes: null
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "bash /Users/everflow/.openclaw/workspace/skills/kr-leverage-monitor/run.sh run"
+    command_argv:
+      - "sh"
+      - "-c"
+      - "bash /Users/everflow/.openclaw/workspace/skills/kr-leverage-monitor/run.sh run"
+    secret_names: []
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T10"
+    job_key: "index-crowding-html-daily"
+    title: "每工作日刷新指数拥挤度数据（喂 sentiment 看板），不再向 Discord 推送 HTML"
+    batch_no: 3
+    runner: "container"
+    cron: "30 19 * * 1-5"
+    timezone: "Asia/Hong_Kong"
+    timeout_seconds: 900
+    no_output_timeout_seconds: 900
+    output_max_bytes: 20000
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: |-
+      set -euo pipefail
+      cd /Users/everflow/.openclaw/workspace
+      mkdir -p temp
+      bash skills/index-crowding-research/scripts/run.sh --json self-test > temp/index-crowding-cron-selftest.json
+      python3 -m json.tool temp/index-crowding-cron-selftest.json >/dev/null
+      bash skills/index-crowding-research/scripts/run.sh --json mirror > temp/index-crowding-cron-mirror-metadata.json
+      python3 -m json.tool temp/index-crowding-cron-mirror-metadata.json >/dev/null
+      bash skills/index-crowding-research/scripts/run.sh --json fetch-history --workers 8 --refresh > temp/index-crowding-cron-history.json
+      python3 -m json.tool temp/index-crowding-cron-history.json >/dev/null
+      bash skills/index-crowding-research/scripts/run.sh --json mirror > temp/index-crowding-cron-mirror-chart.json
+      python3 -m json.tool temp/index-crowding-cron-mirror-chart.json >/dev/null
+      bash skills/index-crowding-research/scripts/run.sh --json optimize-recent > temp/index-crowding-cron-optimize.json
+      python3 -m json.tool temp/index-crowding-cron-optimize.json >/dev/null
+      trade_date=$(python3 -c 'import json; print(json.load(open("research-outputs/index-crowding/official-all.json"))["trade_date"])')
+      test -n "$trade_date"
+      echo "index-crowding refreshed: $trade_date"
+    command_argv:
+      - "bash"
+      - "-c"
+      - |-
+        set -euo pipefail
+        cd /Users/everflow/.openclaw/workspace
+        mkdir -p temp
+        bash skills/index-crowding-research/scripts/run.sh --json self-test > temp/index-crowding-cron-selftest.json
+        python3 -m json.tool temp/index-crowding-cron-selftest.json >/dev/null
+        bash skills/index-crowding-research/scripts/run.sh --json mirror > temp/index-crowding-cron-mirror-metadata.json
+        python3 -m json.tool temp/index-crowding-cron-mirror-metadata.json >/dev/null
+        bash skills/index-crowding-research/scripts/run.sh --json fetch-history --workers 8 --refresh > temp/index-crowding-cron-history.json
+        python3 -m json.tool temp/index-crowding-cron-history.json >/dev/null
+        bash skills/index-crowding-research/scripts/run.sh --json mirror > temp/index-crowding-cron-mirror-chart.json
+        python3 -m json.tool temp/index-crowding-cron-mirror-chart.json >/dev/null
+        bash skills/index-crowding-research/scripts/run.sh --json optimize-recent > temp/index-crowding-cron-optimize.json
+        python3 -m json.tool temp/index-crowding-cron-optimize.json >/dev/null
+        trade_date=$(python3 -c 'import json; print(json.load(open("research-outputs/index-crowding/official-all.json"))["trade_date"])')
+        test -n "$trade_date"
+        echo "index-crowding refreshed: $trade_date"
+    secret_names: []
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T13"
+    job_key: "sentiment-dashboard-digest"
+    title: "情绪看板每日速览：港时20:30重建看板+上传COS，把 signals.json 渲染成飞书卡片发 Market Alert 群；替代原来六组各自发卡的监控 cron"
+    batch_no: 3
+    runner: "container"
+    cron: "30 20 * * 1-5"
+    timezone: "Asia/Hong_Kong"
+    timeout_seconds: 1200
+    no_output_timeout_seconds: 420
+    output_max_bytes: 20000
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "bash scripts/sentiment_dashboard_digest.sh"
+    command_argv:
+      - "sh"
+      - "-c"
+      - "bash scripts/sentiment_dashboard_digest.sh"
+    secret_names:
+      - "TENCENT_COS_SECRET_ID"
+      - "TENCENT_COS_SECRET_KEY"
+      - "FEISHU_APP_ID"
+      - "FEISHU_APP_SECRET"
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T18"
+    job_key: "megacap-relative-signal-monitor"
+    title: "六大科技股相对QQQ RSI(30)+200DMA二阶段确认；美股盘前1小时发飞书Market Alert表格"
+    batch_no: 1
+    runner: "container"
+    cron: "30 8 * * 1-5"
+    timezone: "America/New_York"
+    timeout_seconds: 600
+    no_output_timeout_seconds: null
+    output_max_bytes: null
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "bash scripts/run_json_task.sh python3 scripts/megacap_relative_signal_monitor.py --json"
+    command_argv:
+      - "sh"
+      - "-c"
+      - "bash scripts/run_json_task.sh python3 scripts/megacap_relative_signal_monitor.py --json"
+    secret_names: []
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T21"
+    job_key: "us-bottom-monitor"
+    title: "us-bottom-monitor"
+    batch_no: 2
+    runner: "container"
+    cron: "5 22 * * 1-5"
+    timezone: "Asia/Hong_Kong"
+    timeout_seconds: 600
+    no_output_timeout_seconds: null
+    output_max_bytes: null
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "bash scripts/run_json_task.sh bash skills/us-bottom-monitor/run.sh --json run"
+    command_argv:
+      - "sh"
+      - "-c"
+      - "bash scripts/run_json_task.sh bash skills/us-bottom-monitor/run.sh --json run"
+    secret_names: []
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T22"
+    job_key: "us-top-monitor"
+    title: "us-top-monitor"
+    batch_no: 2
+    runner: "container"
+    cron: "10 22 * * 1-5"
+    timezone: "Asia/Hong_Kong"
+    timeout_seconds: 600
+    no_output_timeout_seconds: null
+    output_max_bytes: null
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "bash scripts/run_json_task.sh bash skills/us-top-monitor/run.sh --json run"
+    command_argv:
+      - "sh"
+      - "-c"
+      - "bash scripts/run_json_task.sh bash skills/us-top-monitor/run.sh --json run"
+    secret_names: []
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T25"
+    job_key: "sentiment-dashboard-refresh"
+    title: "市场情绪HTML看板工作日香港时间10:20和22:20重建并上传腾讯云COS"
+    batch_no: 3
+    runner: "container"
+    cron: "20 10,22 * * 1-5"
+    timezone: "Asia/Hong_Kong"
+    timeout_seconds: 900
+    no_output_timeout_seconds: 300
+    output_max_bytes: 20000
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "bash skills/sentiment-dashboard/scripts/run.sh self-test --json && bash skills/sentiment-dashboard/scripts/run.sh build --no-cache --json && [REDACTED] scripts/sentiment_dashboard_cos_upload.py"
+    command_argv:
+      - "sh"
+      - "-c"
+      - "bash skills/sentiment-dashboard/scripts/run.sh self-test --json && bash skills/sentiment-dashboard/scripts/run.sh build --no-cache --json && /app/.venv/bin/python scripts/sentiment_dashboard_cos_upload.py"
+    secret_names:
+      - "TENCENT_COS_SECRET_ID"
+      - "TENCENT_COS_SECRET_KEY"
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T26"
+    job_key: "us-topbottom-dm-v23"
+    title: "us-topbottom-dm-v23"
+    batch_no: 4
+    runner: "container"
+    cron: "25 22 * * 1-5"
+    timezone: "Asia/Hong_Kong"
+    timeout_seconds: 600
+    no_output_timeout_seconds: 600
+    output_max_bytes: 50000
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "python3 scripts/cron_command_tasks.py us-topbottom-dm-v23"
+    command_argv:
+      - "python3"
+      - "scripts/cron_command_tasks.py"
+      - "us-topbottom-dm-v23"
+    secret_names: []
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T27"
+    job_key: "asia-leverage-crossview-daily"
+    title: "四地(CN/KR/JP/TW)杠杆拥挤度跨市场日频监控 v3.1: 拥挤度=主杠杆存量三视角加权(40/40/20); 卡片=结论与观察+定性判断+去杠杆进度对标+历史图内嵌, 发送到飞书 Eve tracking 群"
+    batch_no: 3
+    runner: "container"
+    cron: "30 22 * * 1-5"
+    timezone: "Asia/Hong_Kong"
+    timeout_seconds: 900
+    no_output_timeout_seconds: null
+    output_max_bytes: null
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "bash scripts/run_json_task.sh python3 scripts/asia_leverage_crossview.py --charts"
+    command_argv:
+      - "sh"
+      - "-c"
+      - "bash scripts/run_json_task.sh python3 scripts/asia_leverage_crossview.py --charts"
+    secret_names: []
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T28"
+    job_key: "tw-leverage-daily"
+    title: "台湾杠杆/拥挤度监控日频增量+看板重建 (TWSE/TPEx/TAIFEX/CBC -> research-outputs/tw-leverage)"
+    batch_no: 3
+    runner: "container"
+    # Active schedule during shadow-run matches baseline 40 9 * * 1-5 America/New_York (§1.1, §6.1.2).
+    # Cutover schedule (40 21 * * 1-5 Asia/Hong_Kong) is stored in cutover_cron/cutover_timezone and unused in PR 0-1.
+    cron: "40 9 * * 1-5"
+    timezone: "America/New_York"
+    cutover_cron: "40 21 * * 1-5"
+    cutover_timezone: "Asia/Hong_Kong"
+    timeout_seconds: 3600
+    no_output_timeout_seconds: null
+    output_max_bytes: null
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "bash /Users/everflow/.openclaw/workspace/skills/tw-leverage-monitor/run.sh update --quiet --json"
+    command_argv:
+      - "sh"
+      - "-c"
+      - "bash /Users/everflow/.openclaw/workspace/skills/tw-leverage-monitor/run.sh update --quiet --json"
+    secret_names: []
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T29"
+    job_key: "bbg-data-pull-us"
+    title: "BBG数据拉取（美盘时段）：SSH触发Windows BBG刷新+拉CSV，自动跟夏冬令时"
+    batch_no: 2
+    runner: "host"
+    host_mode: "mirror"
+    cron: "0 10 * * 1-5"
+    timezone: "America/New_York"
+    timeout_seconds: 900
+    no_output_timeout_seconds: 420
+    output_max_bytes: null
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "bash /Users/everflow/.openclaw/workspace/scripts/bbg_remote_refresh.sh"
+    command_argv:
+      - "sh"
+      - "-c"
+      - "bash /Users/everflow/.openclaw/workspace/scripts/bbg_remote_refresh.sh"
+    secret_names: []
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T32"
+    job_key: "quantum-ew-monitor"
+    title: "quantum-ew-monitor"
+    batch_no: 1
+    runner: "container"
+    cron: "27 10 * * 1-5"
+    timezone: "America/New_York"
+    timeout_seconds: 600
+    no_output_timeout_seconds: null
+    output_max_bytes: null
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "bash scripts/run_json_task.sh bash scripts/quantum_ew_monitor.sh"
+    command_argv:
+      - "sh"
+      - "-c"
+      - "bash scripts/run_json_task.sh bash scripts/quantum_ew_monitor.sh"
+    secret_names: []
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T40"
+    job_key: "ah-premium-am"
+    title: "ah-premium-am"
+    batch_no: 2
+    runner: "container"
+    cron: "5 10 * * 1-5"
+    timezone: "Asia/Hong_Kong"
+    timeout_seconds: 600
+    no_output_timeout_seconds: null
+    output_max_bytes: null
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "bash scripts/run_json_task.sh bash skills/ah-premium-monitor/run.sh --json monitor"
+    command_argv:
+      - "sh"
+      - "-c"
+      - "bash scripts/run_json_task.sh bash skills/ah-premium-monitor/run.sh --json monitor"
+    secret_names: []
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T44"
+    job_key: "ah-premium-pm"
+    title: "ah-premium-pm"
+    batch_no: 2
+    runner: "container"
+    # Approved migration change #2 (USER_DECISIONS_20261107.md §2, design §1.1):
+    # explicitly set timezone to America/New_York (baseline had timezone omitted).
+    cron: "40 21 * * 1-5"
+    timezone: "America/New_York"
+    timeout_seconds: 600
+    no_output_timeout_seconds: null
+    output_max_bytes: null
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "bash scripts/run_json_task.sh bash skills/ah-premium-monitor/run.sh --json monitor"
+    command_argv:
+      - "sh"
+      - "-c"
+      - "bash scripts/run_json_task.sh bash skills/ah-premium-monitor/run.sh --json monitor"
+    secret_names: []
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T52"
+    job_key: "softbank-nav-monitor"
+    title: "softbank-nav-monitor"
+    batch_no: 1
+    runner: "container"
+    cron: "0 16 * * 1-5"
+    timezone: "Asia/Hong_Kong"
+    timeout_seconds: 600
+    no_output_timeout_seconds: 600
+    output_max_bytes: 50000
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "python3 scripts/cron_command_tasks.py softbank-nav-monitor"
+    command_argv:
+      - "python3"
+      - "scripts/cron_command_tasks.py"
+      - "softbank-nav-monitor"
+    secret_names:
+      - "FEISHU_APP_ID"
+      - "FEISHU_APP_SECRET"
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false
+
+  - task_code: "T54"
+    job_key: "tsmc-adr-premium"
+    title: "tsmc-adr-premium"
+    batch_no: 1
+    runner: "container"
+    cron: "15 16 * * 1-5"
+    timezone: "Asia/Hong_Kong"
+    timeout_seconds: 120
+    no_output_timeout_seconds: 120
+    output_max_bytes: 50000
+    cwd: "/Users/everflow/.openclaw/workspace"
+    command: "python3 scripts/cron_command_tasks.py tsmc-adr-premium"
+    command_argv:
+      - "python3"
+      - "scripts/cron_command_tasks.py"
+      - "tsmc-adr-premium"
+    secret_names:
+      - "FEISHU_APP_ID"
+      - "FEISHU_APP_SECRET"
+    cos_mode: "skip"
+    notify_enabled: false
+    enabled: false

@@ -75,6 +75,10 @@ defaults:
   # The agent builds pass false when the chart-annotation skill is off, and
   # the subagent compiler always does: only the main agent binds the tools.
   chart_annotation_enabled: true
+  # DALTON-HOOK(research-writing): permanent Chinese research judgment and
+  # writing rules component; default false so upstream renders and request
+  # locks stay unchanged, enabled at Dalton runtime.
+  research_writing_enabled: false
 
 # System prompt template metadata (for documentation)
 system:

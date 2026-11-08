@@ -132,6 +132,13 @@ dependencies = [
     # Past threads are searched on the server with the agent's own pattern;
     # RE2 matches in linear time, so no pattern can hold a worker's loop.
     "google-re2>=1.1.20251105",
+    # DALTON-HOOK(data-jobs): runtime Python dependencies for OC-1 container data tasks
+    "cos-python-sdk-v5",
+    "akshare==1.19.1",
+    "xlrd>=2.0",
+    "opencc-python-reimplemented",
+    "curl_cffi>=0.14",
+    "openpyxl>=3.1.5",
 ]
 
 [tool.uv.sources]
@@ -152,8 +159,7 @@ test = [
     # Ceiling: tests/integration/conftest.py turns its last rerun of a Daytona
     # outage into a skip, which leans on how it reports reruns.
     "pytest-rerunfailures>=16.7,<17",
-    # The xlsx skill test builds fixture workbooks; openpyxl is a sandbox package, not an app one.
-    "openpyxl>=3.1.5",
+    # DALTON-HOOK(data-jobs): openpyxl moved into main dependencies for OC-1 container data tasks
 ]
 # OpenTelemetry SDK + OTLP exporter + auto-instrumentations. Install when
 # OTEL_EXPORTER_OTLP_ENDPOINT will be set, otherwise the API ships its own

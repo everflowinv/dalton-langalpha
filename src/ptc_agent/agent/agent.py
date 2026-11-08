@@ -217,6 +217,8 @@ class PTCAgent:
         claude_code: bool = False,
         # DALTON-HOOK(team-memory-toggle): gate conversation_search prompt sentence on whether tool is mounted
         conversation_search_enabled: bool = False,
+        # DALTON-HOOK(research-writing): gate permanent Chinese research judgment and writing rules
+        research_writing_enabled: bool = False,
     ) -> str:
         """Build the static system prompt (excludes time/profile for cacheability).
 
@@ -261,6 +263,8 @@ class PTCAgent:
             claude_code=claude_code,
             # DALTON-HOOK(team-memory-toggle): gate conversation_search prompt sentence on whether tool is mounted
             conversation_search_enabled=conversation_search_enabled,
+            # DALTON-HOOK(research-writing): gate permanent Chinese research judgment and writing rules
+            research_writing_enabled=research_writing_enabled,
         )
 
     def _get_tool_summary(self, mcp_registry: MCPRegistry) -> str:
@@ -310,6 +314,8 @@ class PTCAgent:
         claude_code_launcher: "Callable[[PTCSandbox, str | None, str | None], Launcher] | None" = None,
         # DALTON-HOOK(team-memory-toggle): per-workspace / Home user-level Team Memory switch
         team_memory_enabled: bool = False,
+        # DALTON-HOOK(research-writing): permanent Chinese research judgment and writing rules
+        research_writing_enabled: bool = False,
     ) -> Any:
         """Create a deepagent with PTC pattern capabilities.
 
@@ -782,6 +788,7 @@ class PTCAgent:
                 or "",
                 skill_registry=subagent_skill_registry,
                 scratchpad=scratchpad.folder if scratchpad is not None else None,
+                research_writing_enabled=research_writing_enabled,  # DALTON-HOOK(research-writing)
             )
             # DALTON-HOOK(dalton-tools): Dalton workflows drive the two
             # language-review rounds through general-purpose dispatches, and
@@ -922,6 +929,7 @@ class PTCAgent:
             channels_enabled=gates.channels,
             claude_code=claude_code,
             conversation_search_enabled=conversation_search_enabled,  # DALTON-HOOK(team-memory-toggle)
+            research_writing_enabled=research_writing_enabled,  # DALTON-HOOK(research-writing)
         )
         # Read once: the baseline freezes this value per epoch, and the
         # prompt is sent with the frozen one (FrozenPromptMiddleware).

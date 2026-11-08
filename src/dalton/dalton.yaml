@@ -32,6 +32,11 @@ artifact_publishing:
 coverage_units:
   enabled: false
 
+# OC-1 确定性数据任务层（d029）。默认关闭：关闭时不启动调度循环、不建任何容器。
+data_jobs:
+  enabled: false
+  min_free_mem_mb: 1280
+
 network:
   # The host proxy runs in fake-IP mode: inside the backend container DNS answers
   # every public host with an address in 198.18.0.0/15 (benchmarking space, which
