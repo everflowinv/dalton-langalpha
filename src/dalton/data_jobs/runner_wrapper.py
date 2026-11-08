@@ -228,12 +228,12 @@ def build_child_env(
     """
     env = dict(base_env if base_env is not None else os.environ)
 
-    # §2.1.2: wrapper runs with PYTHONPATH=/app, but child task scripts must NOT inherit /app
-    # on PYTHONPATH to avoid shadowing script-local module imports.
+    # §2.1.2: wrapper runs with PYTHONPATH=/app:/app/src, but child task scripts must NOT
+    # inherit either on PYTHONPATH to avoid shadowing script-local module imports.
     raw_pythonpath = env.get("PYTHONPATH", "")
     if raw_pythonpath:
         kept_parts = [
-            p for p in raw_pythonpath.split(os.pathsep) if p and Path(p).resolve() != Path("/app")
+            p for p in raw_pythonpath.split(os.pathsep) if p and Path(p).resolve() not in (Path("/app"), Path("/app/src"))
         ]
         if kept_parts:
             env["PYTHONPATH"] = os.pathsep.join(kept_parts)
