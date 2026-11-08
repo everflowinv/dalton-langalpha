@@ -3162,23 +3162,22 @@ async def test_process_identity_lstart_mismatch_not_killed_and_child_cmd_prevent
     # 2. Group leader matches `lstart`, then after SIGTERM the leader exits but a child with a different
     #    command (`sleep 60`, no `bbg_remote_refresh.sh` in command) remains in `pgid` -> NOT exited, escalates to SIGKILL!
     killpg_calls.clear()
+    # The fake process table follows the signals actually sent, not a call count,
+    # so the result does not depend on how many times the grace loop polls.
+    def _table_after_signals() -> list[tuple[int, int, str, str]]:
+        sent = {sig for (pg, sig) in killpg_calls if pg == 5151}
+        if int(signal.SIGKILL) in sent:
+            return []
+        child = (5152, 5151, "Sat Nov  7 10:00:01 2026", "sleep 60")
+        if int(signal.SIGTERM) in sent:
+            return [child]  # the leader exited on SIGTERM, its child ignores it
+        return [
+            (5151, 5151, "Sat Nov  7 10:00:00 2026", f"python {bridge_mod.HOST_TASK_GATE_FLAG}"),
+            child,
+        ]
+
     ps_child_remains = create_autospec(
-        bridge_mod._list_host_processes_ps,
-        side_effect=[
-            # Initial check: leader (pid==pgid==5151) has matching lstart
-            [
-                (5151, 5151, "Sat Nov  7 10:00:00 2026", f"python {bridge_mod.HOST_TASK_GATE_FLAG}"),
-                (5152, 5151, "Sat Nov  7 10:00:01 2026", "sleep 60"),
-            ],
-            # During SIGTERM grace: leader exited, but child `sleep 60` still has pgid=5151
-            [(5152, 5151, "Sat Nov  7 10:00:01 2026", "sleep 60")],
-            [(5152, 5151, "Sat Nov  7 10:00:01 2026", "sleep 60")],
-            [(5152, 5151, "Sat Nov  7 10:00:01 2026", "sleep 60")],
-            [(5152, 5151, "Sat Nov  7 10:00:01 2026", "sleep 60")],
-            # After SIGKILL: child is gone
-            [],
-            [],
-        ],
+        bridge_mod._list_host_processes_ps, side_effect=_table_after_signals
     )
     stopped_2, remaining_2 = bridge_mod._stop_and_verify_host_pgids_sync(
         [{"pgid": 5151, "lstart": "Sat Nov 7 10:00:00 2026"}],
