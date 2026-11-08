@@ -548,11 +548,14 @@ async def test_owned_runs_bind_normalized_ids_and_owner():
     with patch("src.server.database.pool.get_db_connection", new=fake_db):
         await handoff_liveness.get_owned_runs([valid.upper(), "junk"], CALLER)
 
-    sql, (bound_ids, bound_user) = cursor.execute.await_args.args
+    # DALTON-HOOK(colleague-dispatch): query binds workspace owner and thread owner
+    sql, (bound_ids, bound_ws_owner, bound_thread_owner) = cursor.execute.await_args.args
     assert bound_ids == [valid]
-    assert bound_user == CALLER
-    # Ownership is in the query itself, through the run's workspace.
-    assert "w.user_id = %s" in sql
+    assert bound_ws_owner == CALLER
+    assert bound_thread_owner == CALLER
+    # Ownership is in the query itself, through the run's workspace or thread owner.
+    assert "(w.user_id = %s OR COALESCE(ct.user_id, w.user_id) = %s)" in sql
+    assert sql.count("%s") == 3
 
 
 @pytest.mark.asyncio
