@@ -6491,6 +6491,7 @@ def test_pr11_seed_openclaw_data_script_dry_run_and_apply_exclusions(
 
 def test_pr12_feishu_send_card_overlay_no_direct_send_and_dry_run_parity(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import subprocess
     import urllib.request
@@ -6652,7 +6653,8 @@ def test_pr12_feishu_send_card_overlay_no_direct_send_and_dry_run_parity(
         urllib.request.urlopen,
         side_effect=AssertionError("Network call must not happen when DALTON_NO_DIRECT_SEND=1"),
     )
-    overlay_mod.urllib.request.urlopen = urlopen_Guard
+    # urllib is the process-wide module: patch through monkeypatch so it is restored.
+    monkeypatch.setattr(overlay_mod.urllib.request, "urlopen", urlopen_Guard)
 
     # Call 1: --file (T52/T54 style)
     res_call1 = subprocess.run(
