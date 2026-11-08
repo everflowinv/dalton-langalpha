@@ -351,6 +351,9 @@ ALLOWED_HOOKS=(
   # TEST-FLAKY-1: FilePanel Excel context test waits up to 5 s for the lazily
   # loaded range picker (FilePanel.excelContext.test.tsx).
   "test-flaky-1"
+  # UI-MODEL-1: the thread composer holds a picked model as pending until the
+  # server confirms it, instead of following a stale row reread (useThreadModel.ts).
+  "ui-model-pick"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
