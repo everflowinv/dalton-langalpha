@@ -174,6 +174,17 @@ RSYNC_ARGS=(
 
 SYMLINK_REL="state/sentiment-dashboard/cos-venv/bin/python"
 SYMLINK_TARGET="/app/.venv/bin/python"
+OVERLAY_DIR="${SCRIPT_DIR}/openclaw_overlays"
+
+OVERLAY_FILES=()
+if [[ -d "${OVERLAY_DIR}" ]]; then
+  while IFS= read -r rel_overlay; do
+    [[ -n "${rel_overlay}" ]] && OVERLAY_FILES+=("${rel_overlay}")
+  done < <(
+    cd "${OVERLAY_DIR}"
+    find . -type f | sed 's|^\./||' | LC_ALL=C sort
+  )
+fi
 
 if [[ "${MODE}" == "dry-run" ]]; then
   RSYNC_ARGS+=(--dry-run --itemize-changes)
@@ -186,6 +197,9 @@ if [[ "${MODE}" == "dry-run" ]]; then
   else
     TOTAL_SIZE_LINE="Total file size: 0 B"
   fi
+  for rel_overlay in "${OVERLAY_FILES[@]}"; do
+    echo "[seed_openclaw_data] DRY-RUN overlay: ${OVERLAY_DIR}/${rel_overlay} -> ${TARGET_DIR}/${rel_overlay}"
+  done
   echo "[seed_openclaw_data] DRY-RUN symlink: ${TARGET_DIR}/${SYMLINK_REL} -> ${SYMLINK_TARGET}"
   echo "[seed_openclaw_data] DRY-RUN total size (${TOTAL_SIZE_LINE:-Total file size: 0 B})"
   exit 0
@@ -198,6 +212,12 @@ mkdir -p "${TARGET_DIR}"
 if [[ -s "${FILES_FROM_TMP}" ]]; then
   rsync "${RSYNC_ARGS[@]}" "${SOURCE_DIR}/" "${TARGET_DIR}/"
 fi
+
+for rel_overlay in "${OVERLAY_FILES[@]}"; do
+  mkdir -p "$(dirname "${TARGET_DIR}/${rel_overlay}")"
+  cp -p "${OVERLAY_DIR}/${rel_overlay}" "${TARGET_DIR}/${rel_overlay}"
+  echo "[seed_openclaw_data] Applied overlay: ${OVERLAY_DIR}/${rel_overlay} -> ${TARGET_DIR}/${rel_overlay}"
+done
 
 mkdir -p "$(dirname "${TARGET_DIR}/${SYMLINK_REL}")"
 ln -sfn "${SYMLINK_TARGET}" "${TARGET_DIR}/${SYMLINK_REL}"

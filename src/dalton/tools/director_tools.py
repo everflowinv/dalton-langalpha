@@ -1601,27 +1601,36 @@ def build_director_tools(
     async def dalton_system_jobs(
         action: str = "list",
         key: str | None = None,
+        cron_expr: str | None = None,
+        timezone: str | None = None,
+        notify_routes: list[str] | None = None,
         config: RunnableConfig = None,
     ) -> str:
-        """Inspect, toggle, or immediately trigger Dalton system jobs across company, Home, host, and ops scopes.
+        """Inspect, toggle, update, rollback, or immediately trigger Dalton system jobs across company, Home, host, data, and ops scopes.
 
         Use when the user asks to view all scheduled jobs, enable/disable global Home tasks
         (`dalton-earnings-calendar`, `dalton-director-daily`, `dalton-director-weekly`, `dalton-data-health`),
-        toggle or trigger host `conversation-archive`, or manage company auto-tracking (`company:<TICKER>`).
+        toggle or trigger host `conversation-archive`, manage company auto-tracking (`company:<TICKER>`),
+        or manage company-wide data tasks (`data:<job_key>`). For `data:<job_key>` (Chief of Staff + internal/admin only),
+        `update`/`enable`/`disable` also support modifying schedule (`cron_expr`, `timezone`) and `notify_routes`, and `rollback` restores the previous version.
         Ops jobs (`ops-*`) are strictly read-only. When `action="run_now"` succeeds, always inform the user
         that the job runs asynchronously in the background and state where to check the result (`where_to_check`).
 
         Args:
-            action: `"list"` (all jobs), `"status"` (single job by `key`), `"enable"`, `"disable"`, or `"run_now"`.
-            key: Job key (e.g. `"dalton-data-health"`, `"conversation-archive"`, `"company:NVDA"`, `"ops-db-backup"`). Required except for `"list"`.
+            action: `"list"` (all jobs), `"status"` (single job by `key`), `"enable"`, `"disable"`, `"update"`, `"rollback"`, or `"run_now"`.
+            key: Job key (e.g. `"dalton-data-health"`, `"conversation-archive"`, `"company:NVDA"`, `"data:softbank-nav-monitor"`, `"ops-db-backup"`). Required except for `"list"`.
+            cron_expr: Optional 5-field cron expression when updating a `data:<job_key>` task.
+            timezone: Optional IANA timezone name (e.g. `"Asia/Shanghai"`, `"America/New_York"`) when updating a `data:<job_key>` task.
+            notify_routes: Optional list of notification target strings when updating a `data:<job_key>` task.
 
         Returns:
-            JSON object with job manifest/status (`on` | `off` | `partial` | `unknown`) or async `run_now` dispatch details (`async`, `where_to_check`, `message`).
+            JSON object with job manifest/status (`on` | `off` | `partial` | `unknown`), config version details, or async `run_now` dispatch details (`async`, `where_to_check`, `message`).
         """
         from src.dalton.autonomy.system_jobs import (
             classify_system_job_key,
             get_system_job_status,
             list_system_jobs,
+            rollback_data_task_config,
             run_system_job_now,
             toggle_system_job,
         )
@@ -1631,12 +1640,20 @@ def build_director_tools(
         )
 
         act = str(action or "").strip().lower()
-        if act not in ("list", "status", "enable", "disable", "run_now"):
+        if act not in (
+            "list",
+            "status",
+            "enable",
+            "disable",
+            "update",
+            "rollback",
+            "run_now",
+        ):
             return json.dumps(
                 {
                     "ok": False,
                     "error": "invalid_action",
-                    "message": "action 必须为 list、status、enable、disable 或 run_now",
+                    "message": "action 必须为 list、status、enable、disable、update、rollback 或 run_now",
                 },
                 ensure_ascii=False,
             )
@@ -1709,6 +1726,15 @@ def build_director_tools(
                     )
                     res = await get_system_job_status(status_owner, sector_key)
                     return json.dumps(res, ensure_ascii=False, default=str)
+                if act in ("update", "rollback") or cron_expr is not None or timezone is not None or notify_routes is not None:
+                    return json.dumps(
+                        {
+                            "ok": False,
+                            "error": "unsupported_scope",
+                            "message": "仅公司公共数据任务（data:*）支持修改时间表（cron_expr/timezone）、推送目标（notify_routes）或按版本回退（rollback）。",
+                        },
+                        ensure_ascii=False,
+                    )
                 await _verify_tracking_workspace_owner(current_ws, user_id)
                 if act in ("enable", "disable"):
                     return await dalton_coverage_tracking.ainvoke(
@@ -1802,6 +1828,15 @@ def build_director_tools(
                 )
                 res = await get_system_job_status(status_owner, current_ws)
                 return json.dumps(res, ensure_ascii=False, default=str)
+            if act in ("update", "rollback") or cron_expr is not None or timezone is not None or notify_routes is not None:
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "error": "unsupported_scope",
+                        "message": "仅公司公共数据任务（data:*）支持修改时间表（cron_expr/timezone）、推送目标（notify_routes）或按版本回退（rollback）。",
+                    },
+                    ensure_ascii=False,
+                )
             await _verify_tracking_workspace_owner(current_ws, user_id)
             if act in ("enable", "disable"):
                 return await dalton_coverage_tracking.ainvoke(
@@ -1903,12 +1938,60 @@ def build_director_tools(
             return json.dumps(res, ensure_ascii=False, default=str)
 
         try:
+            if scope != "data" and (
+                act in ("update", "rollback")
+                or cron_expr is not None
+                or timezone is not None
+                or notify_routes is not None
+            ):
+                return json.dumps(
+                    {
+                        "ok": False,
+                        "error": "unsupported_scope",
+                        "message": "仅公司公共数据任务（data:*）支持修改时间表（cron_expr/timezone）、推送目标（notify_routes）或按版本回退（rollback）。",
+                    },
+                    ensure_ascii=False,
+                )
+
             if act == "status":
                 res = await get_system_job_status(user_id, raw_key)
+            elif act == "rollback":
+                res = await rollback_data_task_config(
+                    actor_user_id=user_id,
+                    job_key=raw_key,
+                )
+            elif act == "update":
+                res = await toggle_system_job(
+                    user_id,
+                    raw_key,
+                    enabled=None,
+                    notify_routes=notify_routes,
+                    cron_expr=cron_expr,
+                    timezone=timezone,
+                    actor_user_id=user_id,
+                )
             elif act in ("enable", "disable"):
-                res = await toggle_system_job(user_id, raw_key, enabled=(act == "enable"))
+                if scope == "data":
+                    res = await toggle_system_job(
+                        user_id,
+                        raw_key,
+                        enabled=(act == "enable"),
+                        notify_routes=notify_routes,
+                        cron_expr=cron_expr,
+                        timezone=timezone,
+                        actor_user_id=user_id,
+                    )
+                else:
+                    res = await toggle_system_job(user_id, raw_key, act == "enable")
             else:
-                res = await run_system_job_now(user_id, raw_key)
+                if scope == "data":
+                    res = await run_system_job_now(
+                        user_id,
+                        raw_key,
+                        actor_user_id=user_id,
+                    )
+                else:
+                    res = await run_system_job_now(user_id, raw_key)
             return json.dumps(res, ensure_ascii=False, default=str)
         except HTTPException as exc:
             # Round-2 F: toggle/run_now 深处的调度层所有者 403 统一换成

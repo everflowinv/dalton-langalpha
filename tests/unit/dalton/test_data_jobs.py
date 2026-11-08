@@ -6473,4 +6473,965 @@ def test_pr11_seed_openclaw_data_script_dry_run_and_apply_exclusions(
     assert symlink_path.is_symlink()
     assert os.readlink(symlink_path) == "/app/.venv/bin/python"
 
+    # Overlay script scripts/feishu_send_card.py must be printed in --dry-run and overlaid in --apply
+    assert "DRY-RUN overlay:" in dry_res.stdout
+    assert "scripts/feishu_send_card.py" in dry_res.stdout
+    overlay_src = (
+        repo_root
+        / "scripts"
+        / "dalton"
+        / "openclaw_overlays"
+        / "scripts"
+        / "feishu_send_card.py"
+    )
+    overlaid_dst = dst_dir / "scripts" / "feishu_send_card.py"
+    assert overlaid_dst.is_file()
+    assert overlaid_dst.read_bytes() == overlay_src.read_bytes()
+
+
+def test_pr12_feishu_send_card_overlay_no_direct_send_and_dry_run_parity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess
+    import urllib.request
+
+    repo_root = Path(__file__).resolve().parents[3]
+    overlay_script = (
+        repo_root
+        / "scripts"
+        / "dalton"
+        / "openclaw_overlays"
+        / "scripts"
+        / "feishu_send_card.py"
+    )
+    original_script = (
+        repo_root / ".agy" / "oc1" / "openclaw" / "scripts" / "feishu_send_card.py"
+    )
+    assert overlay_script.is_file()
+    assert original_script.is_file()
+
+    # Prepare sample markdown (T52/T54 style with table + IMG:) and sample card JSON file (T13 style with collapsible_panel + __img__)
+    img1 = tmp_path / "nav_chart.png"
+    img1.write_bytes(b"\x89PNG\r\n\x1a\nfake-png-1")
+    img2 = tmp_path / "sentiment_panel.png"
+    img2.write_bytes(b"\x89PNG\r\n\x1a\nfake-png-2")
+
+    md_file = tmp_path / "t52_report.md"
+    md_file.write_text(
+        f"# SoftBank NAV Monitor\n\n"
+        f"| Metric | Value |\n"
+        f"|---|---|\n"
+        f"| Discount | 48.2% |\n\n"
+        f"IMG:{img1}\n",
+        encoding="utf-8",
+    )
+
+    t13_card_obj = {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": "📊 情绪仪表盘日报"},
+            "template": "wathet",
+        },
+        "body": {
+            "elements": [
+                {"tag": "markdown", "content": "**主信号汇总**"},
+                {"tag": "__img__", "path": str(img2), "alt": "Sentiment Dashboard"},
+                {
+                    "tag": "collapsible_panel",
+                    "expanded": False,
+                    "header": {
+                        "title": {"tag": "plain_text", "content": "展开详情"}
+                    },
+                    "elements": [
+                        {"tag": "markdown", "content": "详细分位数表"},
+                        {"tag": "__img__", "path": str(img1), "alt": "Sub Chart"},
+                    ],
+                },
+            ]
+        },
+    }
+    card_json_file = tmp_path / "t13_card.json"
+    card_json_file.write_text(
+        json.dumps(t13_card_obj, ensure_ascii=False), encoding="utf-8"
+    )
+
+    # 1. Without DALTON_NO_DIRECT_SEND, --dry-run output is byte-for-byte identical to original script
+    base_env = {
+        k: v for k, v in os.environ.items() if k != "DALTON_NO_DIRECT_SEND"
+    }
+    orig_dry_md = subprocess.run(
+        [
+            sys.executable,
+            str(original_script),
+            "--chat-id",
+            "oc_test_chat_1",
+            "--file",
+            str(md_file),
+            "--dry-run",
+        ],
+        env=base_env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    overlay_dry_md = subprocess.run(
+        [
+            sys.executable,
+            str(overlay_script),
+            "--chat-id",
+            "oc_test_chat_1",
+            "--file",
+            str(md_file),
+            "--dry-run",
+        ],
+        env=base_env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert overlay_dry_md.stdout == orig_dry_md.stdout
+
+    orig_dry_json = subprocess.run(
+        [
+            sys.executable,
+            str(original_script),
+            "--chat-id",
+            "oc_test_chat_2",
+            "--card-json-file",
+            str(card_json_file),
+            "--dry-run",
+        ],
+        env=base_env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    overlay_dry_json = subprocess.run(
+        [
+            sys.executable,
+            str(overlay_script),
+            "--chat-id",
+            "oc_test_chat_2",
+            "--card-json-file",
+            str(card_json_file),
+            "--dry-run",
+        ],
+        env=base_env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert overlay_dry_json.stdout == orig_dry_json.stdout
+
+    # 2. With DALTON_NO_DIRECT_SEND=1, both --file (T52/T54) and --card-json-file (T13)
+    #    make zero network calls, exit 0, print "✅ 卡片发送成功", copy images into run_dir
+    #    with sanitized filenames, and stage cards ONLY to tmpfs (DALTON_OUTBOX_FILE),
+    #    leaving zero unredacted JSON files in the persistent run_dir.
+    run_dir = tmp_path / ".dalton-runs" / "run-123"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    staging_outbox = tmp_path / "tmpfs_outbox" / "outbox.json"
+
+    no_send_env = dict(base_env)
+    no_send_env["DALTON_NO_DIRECT_SEND"] = "1"
+    no_send_env["DALTON_RUN_ID"] = "run-123"
+    no_send_env["DALTON_RUN_DIR"] = str(run_dir)
+    no_send_env["DALTON_OUTBOX_FILE"] = str(staging_outbox)
+
+    # Also test in-process with urllib.request.urlopen autospecced to fail if any network call is attempted
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "feishu_send_card_overlay_test", overlay_script
+    )
+    assert spec is not None and spec.loader is not None
+    overlay_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(overlay_mod)
+
+    urlopen_Guard = create_autospec(
+        urllib.request.urlopen,
+        side_effect=AssertionError("Network call must not happen when DALTON_NO_DIRECT_SEND=1"),
+    )
+    # urllib is the process-wide module: patch through monkeypatch so it is restored.
+    monkeypatch.setattr(overlay_mod.urllib.request, "urlopen", urlopen_Guard)
+
+    # Call 1: --file (T52/T54 style)
+    res_call1 = subprocess.run(
+        [
+            sys.executable,
+            str(overlay_script),
+            "--chat-id",
+            "oc_test_chat_1",
+            "--file",
+            str(md_file),
+        ],
+        env=no_send_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_call1.returncode == 0, res_call1.stderr
+    assert "✅ 卡片发送成功:" in res_call1.stdout
+
+    # Call 2: --card-json-file (T13 style) with --json flag
+    res_call2 = subprocess.run(
+        [
+            sys.executable,
+            str(overlay_script),
+            "--chat-id",
+            "oc_test_chat_2",
+            "--card-json-file",
+            str(card_json_file),
+            "--json",
+        ],
+        env=no_send_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_call2.returncode == 0, res_call2.stderr
+    call2_stdout_obj = json.loads(res_call2.stdout.strip())
+    assert call2_stdout_obj["status"] == "ok"
+    assert call2_stdout_obj["result"]["code"] == 0
+    urlopen_Guard.assert_not_called()
+
+    # Persistent run_dir has NO card_N.json and NO unredacted outbox.json prior to wrapper redaction
+    assert not (run_dir / "outbox.json").exists()
+    assert not (run_dir / "card_0.json").exists()
+    assert not (run_dir / "card_1.json").exists()
+
+    assert staging_outbox.is_file()
+    outbox_data = json.loads(staging_outbox.read_text(encoding="utf-8"))
+    assert "feishu_cards" in outbox_data
+    feishu_cards = outbox_data["feishu_cards"]
+    assert len(feishu_cards) == 2
+
+    # First card matches original --dry-run output for --file
+    expected_card_1 = json.loads(orig_dry_md.stdout)
+    assert feishu_cards[0]["card"] == expected_card_1
+    assert feishu_cards[0]["chat_id"] == "oc_test_chat_1"
+    assert len(feishu_cards[0]["images"]) == 1
+    assert feishu_cards[0]["images"][0]["placeholder"] == str(img1)
+    assert feishu_cards[0]["images"][0]["path"] == "images/card_0_img_0.png"
+    copied_img_1 = run_dir / feishu_cards[0]["images"][0]["path"]
+    assert copied_img_1.is_file()
+    assert copied_img_1.read_bytes() == img1.read_bytes()
+
+    # Second card matches original --dry-run output for --card-json-file
+    expected_card_2 = json.loads(orig_dry_json.stdout)
+    assert feishu_cards[1]["card"] == expected_card_2
+    assert feishu_cards[1]["chat_id"] == "oc_test_chat_2"
+    assert len(feishu_cards[1]["images"]) == 2
+    assert [im["placeholder"] for im in feishu_cards[1]["images"]] == [
+        str(img2),
+        str(img1),
+    ]
+    assert [im["path"] for im in feishu_cards[1]["images"]] == [
+        "images/card_1_img_0.png",
+        "images/card_1_img_1.png",
+    ]
+    for im_entry in feishu_cards[1]["images"]:
+        copied_p = run_dir / im_entry["path"]
+        assert copied_p.is_file()
+
+
+@pytest.mark.asyncio
+async def test_pr12_dispatch_and_retry_feishu_cards_raw_order_and_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.dalton.data_jobs.scheduler as sched_mod
+    import src.dalton.notify.dispatch as dispatch_mod
+    from src.dalton.data_jobs.scheduler import (
+        _resolve_run_notify_payload,
+        dispatch_data_task_run_notification,
+    )
+    from src.dalton.notify.dispatch import (
+        claim_target_delivery,
+        evaluate_user_notify_eligibility,
+        mark_target_delivery,
+        post_bridge_notify,
+        resolve_dalton_notify_enabled,
+        resolve_dalton_notify_overrides,
+        resolve_dalton_notify_routes,
+        resolve_dalton_notify_targets,
+        retry_failed_notify_deliveries,
+    )
+
+    monkeypatch.setattr(
+        sched_mod,
+        "get_configured_pm_user_ids",
+        create_autospec(
+            sched_mod.get_configured_pm_user_ids, return_value=["pm-user-1"]
+        ),
+    )
+    # Card progress is stored per delivery row; this test has no database.
+    real_update_cards_sent = dispatch_mod.update_delivery_cards_sent
+    monkeypatch.setattr(
+        dispatch_mod,
+        "update_delivery_cards_sent",
+        create_autospec(real_update_cards_sent, return_value=True),
+    )
+
+    path_map = build_path_map(
+        host_var_dir=tmp_path / "host_var",
+        backend_var_dir=tmp_path / "backend_var",
+    )
+    run_id = "run-pr12-cards-1"
+    run_dir = path_map.backend_run_artifacts_dir(run_id)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    card_1 = {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": "SoftBank NAV #1"},
+            "template": "blue",
+        },
+        "body": {
+            "elements": [
+                {"tag": "markdown", "content": "First card with [link](https://example.com)"},
+                {"tag": "__img__", "path": "/tmp/chart1.png", "alt": "Chart 1"},
+            ]
+        },
+    }
+    card_2 = {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": "SoftBank NAV #2"},
+            "template": "wathet",
+        },
+        "body": {
+            "elements": [
+                {"tag": "markdown", "content": "Second card summary"},
+            ]
+        },
+    }
+    raw_outbox = {
+        "text": "SoftBank NAV #1",
+        "feishu_cards": [
+            {
+                "card": json.loads(json.dumps(card_1)),
+                "images": [
+                    {
+                        "placeholder": "/tmp/chart1.png",
+                        "path": "outbox_images/000_chart1.png",
+                    }
+                ],
+                "chat_id": "oc_ignored_original_chat",
+            },
+            {
+                "card": json.loads(json.dumps(card_2)),
+                "images": [],
+                "chat_id": "oc_ignored_original_chat",
+            },
+        ],
+    }
+
+    _text, _card, resolved_payload = _resolve_run_notify_payload(
+        run_id,
+        "softbank-nav-monitor",
+        db_outbox_payload=raw_outbox,
+        path_map=path_map,
+    )
+    assert resolved_payload is not None
+    assert len(resolved_payload["feishu_cards"]) == 2
+
+    # 1. Dispatch with `feishu_cards`: sends each card in order as-is (deep-equal, no "在 Dalton 中打开" button, no link stripping)
+    #    and routes via `data:<job_key>` (ignoring `chat_id` inside `feishu_cards`)
+    eval_mock = create_autospec(
+        evaluate_user_notify_eligibility,
+        return_value=(True, None, ["feishu:chat:oc_routed_target"]),
+    )
+    claim_mock = create_autospec(claim_target_delivery, return_value=True)
+    post_calls: list[dict[str, Any]] = []
+
+    async def _record_post_notify(
+        targets: list[str],
+        message: str,
+        *,
+        card: dict[str, Any] | None = None,
+        images: list[dict[str, str]] | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        post_calls.append(
+            {
+                "targets": list(targets),
+                "message": message,
+                "card": json.loads(json.dumps(card)) if card is not None else None,
+                "images": list(images) if images is not None else None,
+                "run_id": run_id,
+            }
+        )
+        return {
+            "ok": True,
+            "status_code": 200,
+            "results": [{"target": t, "ok": True} for t in targets],
+        }
+
+    post_mock = create_autospec(post_bridge_notify, side_effect=_record_post_notify)
+    mark_mock = create_autospec(mark_target_delivery, return_value=True)
+    lock_conn, _ = _make_autospec_db([{"fetchone": (1,)} for _ in range(10)])
+    conn, _ = _make_autospec_db([{"rowcount": 1}])
+
+    status = await dispatch_data_task_run_notification(
+        conn,
+        lock_conn=lock_conn,
+        run_id=run_id,
+        job_key="softbank-nav-monitor",
+        db_outbox_payload=raw_outbox,
+        path_map=path_map,
+        evaluate_eligibility_fn=eval_mock,
+        claim_target_fn=claim_mock,
+        post_notify_fn=post_mock,
+        mark_target_fn=mark_mock,
+    )
+    assert status == "dispatched"
+    assert len(post_calls) == 2
+    assert post_calls[0]["targets"] == ["feishu:chat:oc_routed_target"]
+    assert post_calls[0]["card"] == card_1
+    assert post_calls[0]["images"] == [
+        {
+            "placeholder": "/tmp/chart1.png",
+            "path": "outbox_images/000_chart1.png",
+        }
+    ]
+    assert post_calls[0]["run_id"] == run_id
+    assert "在 Dalton 中打开" not in json.dumps(
+        post_calls[0]["card"], ensure_ascii=False
+    )
+
+    assert post_calls[1]["targets"] == ["feishu:chat:oc_routed_target"]
+    assert post_calls[1]["card"] == card_2
+    assert post_calls[1]["images"] is None
+    assert post_calls[1]["run_id"] == run_id
+
+    # Claim persisted payload_json with feishu_cards and run_id for retry
+    claimed_payload = claim_mock.await_args.kwargs["payload"]
+    assert claimed_payload["run_id"] == run_id
+    assert len(claimed_payload["feishu_cards"]) == 2
+    assert claimed_payload["cards_sent"] == 2
+
+    # Calling dispatch again when all cards are already sent (cards_sent == 2) sends nothing
+    post_calls.clear()
+    await dispatch_mod.dispatch_target_with_payload(
+        post_mock,
+        ["feishu:chat:oc_routed_target"],
+        "SoftBank NAV #1",
+        None,
+        claimed_payload,
+        run_id=run_id,
+        channel="feishu",
+    )
+    assert len(post_calls) == 0
+
+    # 2. Partial failure (card 1 succeeds, card 2 fails) -> records cards_sent=1 -> retry sends ONLY card 2
+    partial_run_id = "run-cards-partial-2"
+    partial_post_calls: list[dict[str, Any]] = []
+
+    async def _record_partial_post(
+        targets: list[str],
+        message: str,
+        *,
+        card: dict[str, Any] | None = None,
+        images: list[dict[str, str]] | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        call_idx = len(partial_post_calls)
+        partial_post_calls.append(
+            {
+                "targets": list(targets),
+                "message": message,
+                "card": json.loads(json.dumps(card)) if card is not None else None,
+                "images": list(images) if images is not None else None,
+                "run_id": run_id,
+            }
+        )
+        if call_idx == 0:
+            return {
+                "ok": True,
+                "status_code": 200,
+                "results": [{"target": t, "ok": True} for t in targets],
+            }
+        return {
+            "ok": False,
+            "status_code": 502,
+            "error_code": "http_502",
+            "results": [{"target": t, "ok": False, "error": "http_502"} for t in targets],
+        }
+
+    partial_claim_mock = create_autospec(claim_target_delivery, return_value=True)
+    partial_post_mock = create_autospec(
+        post_bridge_notify, side_effect=_record_partial_post
+    )
+    partial_mark_mock = create_autospec(mark_target_delivery, return_value=True)
+    persisted_progress: list[tuple[str, str, str, int]] = []
+
+    async def _record_cards_sent(
+        execution_id: str, channel: str, target: str, cards_sent: int
+    ) -> bool:
+        persisted_progress.append((execution_id, channel, target, cards_sent))
+        return True
+
+    monkeypatch.setattr(
+        dispatch_mod,
+        "update_delivery_cards_sent",
+        create_autospec(
+            real_update_cards_sent, side_effect=_record_cards_sent
+        ),
+    )
+
+    partial_lock_conn, _ = _make_autospec_db([{"fetchone": (1,)} for _ in range(10)])
+    partial_conn, _ = _make_autospec_db([{"rowcount": 1}])
+
+    partial_status = await dispatch_data_task_run_notification(
+        partial_conn,
+        lock_conn=partial_lock_conn,
+        run_id=partial_run_id,
+        job_key="softbank-nav-monitor",
+        db_outbox_payload=raw_outbox,
+        path_map=path_map,
+        evaluate_eligibility_fn=eval_mock,
+        claim_target_fn=partial_claim_mock,
+        post_notify_fn=partial_post_mock,
+        mark_target_fn=partial_mark_mock,
+    )
+    assert partial_status == "pending_dispatch"
+    assert len(partial_post_calls) == 2
+    assert partial_post_calls[0]["card"] == card_1
+    assert partial_post_calls[1]["card"] == card_2
+    partial_claimed_payload = partial_claim_mock.await_args.kwargs["payload"]
+    assert partial_claimed_payload["cards_sent"] == 1
+    assert persisted_progress == [
+        (partial_run_id, "feishu", "feishu:chat:oc_routed_target", 1)
+    ]
+
+    # Retry (`retry_failed_notify_deliveries`) resumes at cards_sent=1 and sends ONLY card 2
+    retry_post_calls: list[dict[str, Any]] = []
+
+    async def _record_retry_post(
+        targets: list[str],
+        message: str,
+        *,
+        card: dict[str, Any] | None = None,
+        images: list[dict[str, str]] | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        retry_post_calls.append(
+            {
+                "targets": list(targets),
+                "message": message,
+                "card": json.loads(json.dumps(card)) if card is not None else None,
+                "images": list(images) if images is not None else None,
+                "run_id": run_id,
+            }
+        )
+        return {
+            "ok": True,
+            "status_code": 200,
+            "results": [{"target": t, "ok": True} for t in targets],
+        }
+
+    retry_post_mock = create_autospec(
+        post_bridge_notify, side_effect=_record_retry_post
+    )
+    retry_mark_mock = create_autospec(mark_target_delivery, return_value=True)
+    candidate_rows = [
+        {
+            "execution_id": partial_run_id,
+            "automation_id": "data:softbank-nav-monitor",
+            "user_id": "pm-user-1",
+            "channel": "feishu",
+            "target": "feishu:chat:oc_routed_target",
+            "status": "failed",
+            "attempt_count": 1,
+            "payload_json": partial_claimed_payload,
+            "automation_name": None,
+            "automation_metadata": None,
+            "data_task_enabled": True,
+            "data_task_notify_enabled": True,
+        }
+    ]
+    retry_db_conn, _ = _make_autospec_db(
+        [
+            {"fetchall": candidate_rows},
+            {"fetchone": {"attempt_count": 2}},
+            {"fetchall": candidate_rows},
+            {"fetchone": {"attempt_count": 3}},
+        ]
+    )
+
+    @asynccontextmanager
+    async def _fake_get_db_conn(conn: Any = None):
+        yield retry_db_conn
+
+    monkeypatch.setattr(
+        dispatch_mod,
+        "get_db_connection",
+        create_autospec(dispatch_mod.get_db_connection, side_effect=_fake_get_db_conn),
+    )
+
+    async def _is_admin(_uid: str | None) -> bool:
+        return True
+
+    sent_count = await retry_failed_notify_deliveries(
+        post_notify_fn=retry_post_mock,
+        mark_delivery_fn=retry_mark_mock,
+        resolve_enabled_fn=create_autospec(
+            resolve_dalton_notify_enabled, return_value=True
+        ),
+        resolve_overrides_fn=create_autospec(
+            resolve_dalton_notify_overrides, return_value={}
+        ),
+        resolve_targets_fn=create_autospec(
+            resolve_dalton_notify_targets, return_value=[]
+        ),
+        resolve_routes_fn=create_autospec(
+            resolve_dalton_notify_routes,
+            return_value={
+                "data:softbank-nav-monitor": ["feishu:chat:oc_routed_target"]
+            },
+        ),
+        is_admin_fn=create_autospec(_is_admin, return_value=True),
+    )
+    assert sent_count == 1
+    assert len(retry_post_calls) == 1
+    assert retry_post_calls[0]["card"] == card_2
+    assert retry_post_calls[0]["images"] is None
+    assert retry_post_calls[0]["run_id"] == partial_run_id
+    assert partial_claimed_payload["cards_sent"] == 2
+    assert persisted_progress[-1] == (
+        partial_run_id,
+        "feishu",
+        "feishu:chat:oc_routed_target",
+        2,
+    )
+
+    # Calling retry again once cards_sent == 2 sends zero cards
+    retry_post_calls.clear()
+    sent_count_again = await retry_failed_notify_deliveries(
+        post_notify_fn=retry_post_mock,
+        mark_delivery_fn=retry_mark_mock,
+        resolve_enabled_fn=create_autospec(
+            resolve_dalton_notify_enabled, return_value=True
+        ),
+        resolve_overrides_fn=create_autospec(
+            resolve_dalton_notify_overrides, return_value={}
+        ),
+        resolve_targets_fn=create_autospec(
+            resolve_dalton_notify_targets, return_value=[]
+        ),
+        resolve_routes_fn=create_autospec(
+            resolve_dalton_notify_routes,
+            return_value={
+                "data:softbank-nav-monitor": ["feishu:chat:oc_routed_target"]
+            },
+        ),
+        is_admin_fn=create_autospec(_is_admin, return_value=True),
+    )
+    assert sent_count_again == 1
+    assert len(retry_post_calls) == 0
+
+
+@pytest.mark.asyncio
+async def test_pr12_bridge_handle_notify_feishu_cards_and_image_path_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scripts.dalton.researchdata_bridge as bridge_mod
+
+    cfg = bridge_mod.BridgeConfig()
+    cfg.data_tasks_data_root = tmp_path / "openclaw-data"
+    cfg.data_tasks_data_root.mkdir(parents=True, exist_ok=True)
+    cfg.openclaw_workspace = tmp_path / "openclaw-ws"
+    (cfg.openclaw_workspace / "scripts").mkdir(parents=True, exist_ok=True)
+    send_script = cfg.openclaw_workspace / "scripts" / "feishu_send_card.py"
+    send_script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+
+    bridge = bridge_mod.ResearchDataBridge(cfg)
+
+    # Create a valid image inside run directory under data_tasks_data_root
+    run_id = "run-bridge-img-1"
+    run_dir = cfg.data_tasks_data_root / ".dalton-runs" / run_id
+    img_dir = run_dir / "outbox_images"
+    img_dir.mkdir(parents=True, exist_ok=True)
+    valid_img = img_dir / "000_chart.png"
+    valid_img.write_bytes(b"\x89PNG\r\n\x1a\nvalid")
+
+    # Also create an outside file and a symlink inside run_dir pointing outside
+    outside_file = tmp_path / "outside_secret.png"
+    outside_file.write_bytes(b"outside-secret")
+    escaping_symlink = img_dir / "symlink_outside.png"
+    escaping_symlink.symlink_to(outside_file)
+
+    captured_cards: list[dict[str, Any]] = []
+
+    def _fake_run_feishu_send_card(
+        *,
+        script_path: Path,
+        receive_id: str,
+        card: dict[str, Any],
+        receive_id_type: str = "open_id",
+        timeout_s: float = 30.0,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        _ = (script_path, receive_id_type, timeout_s, dry_run)
+        captured_cards.append(
+            {"chat_id": receive_id, "card": json.loads(json.dumps(card))}
+        )
+        return {"ok": True, "exit_code": 0}
+
+    monkeypatch.setattr(
+        bridge_mod,
+        "_run_feishu_send_card",
+        create_autospec(
+            bridge_mod._run_feishu_send_card, side_effect=_fake_run_feishu_send_card
+        ),
+    )
+
+    # 1. Valid card + relative image path inside run_dir -> rewrites __img__.path to resolved host path and calls feishu_send_card.py
+    card_payload = {
+        "schema": "2.0",
+        "header": {"title": {"tag": "plain_text", "content": "TSMC ADR"}},
+        "body": {
+            "elements": [
+                {"tag": "markdown", "content": "Premium +18.2%"},
+                {"tag": "__img__", "path": "/tmp/container_chart.png", "alt": "Chart"},
+            ]
+        },
+    }
+    status_ok, resp_ok = await bridge.handle_notify(
+        {
+            "targets": ["feishu:chat:oc_target_1"],
+            "message": "TSMC ADR",
+            "card": card_payload,
+            "images": [
+                {
+                    "placeholder": "/tmp/container_chart.png",
+                    "path": "outbox_images/000_chart.png",
+                }
+            ],
+            "run_id": run_id,
+        }
+    )
+    assert status_ok == 200
+    assert resp_ok["ok"] is True
+    assert len(captured_cards) == 1
+    assert captured_cards[0]["chat_id"] == "oc_target_1"
+    rewritten_img_el = captured_cards[0]["card"]["body"]["elements"][1]
+    assert rewritten_img_el["tag"] == "__img__"
+    assert rewritten_img_el["path"] == str(valid_img.resolve())
+
+    # 2. Path traversal ('..') in images[].path -> rejected with HTTP 400
+    status_dotdot, resp_dotdot = await bridge.handle_notify(
+        {
+            "targets": ["feishu:chat:oc_target_1"],
+            "message": "TSMC ADR",
+            "card": card_payload,
+            "images": [
+                {
+                    "placeholder": "/tmp/container_chart.png",
+                    "path": "../../../outside_secret.png",
+                }
+            ],
+            "run_id": run_id,
+        }
+    )
+    assert status_dotdot == 400
+    assert resp_dotdot["ok"] is False
+    assert "invalid_image_path" in resp_dotdot["error"]
+
+    # 3. Absolute path outside data_tasks_data_root -> rejected with HTTP 400
+    status_outside, resp_outside = await bridge.handle_notify(
+        {
+            "targets": ["feishu:chat:oc_target_1"],
+            "message": "TSMC ADR",
+            "card": card_payload,
+            "images": [
+                {
+                    "placeholder": "/tmp/container_chart.png",
+                    "path": str(outside_file),
+                }
+            ],
+            "run_id": run_id,
+        }
+    )
+    assert status_outside == 400
+    assert resp_outside["ok"] is False
+    assert "invalid_image_path" in resp_outside["error"]
+
+    # 4. Symlink inside run_dir escaping data_tasks_data_root -> rejected with HTTP 400
+    status_sym, resp_sym = await bridge.handle_notify(
+        {
+            "targets": ["feishu:chat:oc_target_1"],
+            "message": "TSMC ADR",
+            "card": card_payload,
+            "images": [
+                {
+                    "placeholder": "/tmp/container_chart.png",
+                    "path": "outbox_images/symlink_outside.png",
+                }
+            ],
+            "run_id": run_id,
+        }
+    )
+    assert status_sym == 400
+    assert resp_sym["ok"] is False
+    assert "invalid_image_path" in resp_sym["error"]
+
+
+@pytest.mark.asyncio
+async def test_pr12_round2_overlay_redaction_and_manifest_sync_preserves_schedule(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import importlib.util
+    import re
+    from src.dalton.data_jobs.runner_wrapper import (
+        SecretRedactor,
+        persist_redacted_outbox,
+    )
+
+    # 1. sync_manifest_to_db inserts initial cron_expr/timezone on new rows,
+    #    updates static fields (command_argv, timeout_seconds, runner, required_secrets, etc.) on conflict,
+    #    and NEVER overwrites conversation-modifiable fields (cron_expr, timezone, enabled, notify_enabled, routes)
+    manifest = load_data_task_manifest()
+    conn, state = _make_autospec_db()
+    count = await sync_manifest_to_db(conn, manifest)
+    assert count == 19
+    sql_executed, params_executed = state["executed"][0]
+    insert_clause, conflict_clause = sql_executed.split(
+        "ON CONFLICT (job_key) DO UPDATE SET", 1
+    )
+    # Initial insert still provides cron_expr and timezone defaults for new rows
+    assert "cron_expr" in insert_clause
+    assert "timezone" in insert_clause
+    assert params_executed["cron_expr"]
+    assert params_executed["timezone"]
+    # ON CONFLICT DO UPDATE SET must NOT overwrite conversation-modifiable fields
+    for conversational_col in (
+        "cron_expr",
+        "timezone",
+        "enabled",
+        "notify_enabled",
+        "notify_routes",
+        "config_version",
+        "active_version",
+        "audit_history",
+    ):
+        assert not re.search(
+            rf"\b{conversational_col}\s*=", conflict_clause
+        ), f"{conversational_col} must not be overwritten in ON CONFLICT DO UPDATE SET"
+    # Static manifest fields MUST still be updated on conflict
+    for static_col in (
+        "task_code",
+        "title",
+        "batch_no",
+        "runner",
+        "timeout_seconds",
+        "no_output_timeout_seconds",
+        "command_argv",
+        "workdir",
+        "required_secrets",
+        "updated_at",
+    ):
+        assert re.search(
+            rf"\b{static_col}\s*=\s*(EXCLUDED\.{static_col}|NOW\(\))",
+            conflict_clause,
+        ), f"{static_col} must be synced in ON CONFLICT DO UPDATE SET"
+
+    # 2. Overlay feishu_send_card.py under DALTON_NO_DIRECT_SEND=1 writes zero files containing
+    #    raw secret to the persistent run directory; after wrapper redaction, outbox.json has [REDACTED]
+    overlay_path = (
+        Path(__file__).resolve().parents[3]
+        / "scripts"
+        / "dalton"
+        / "openclaw_overlays"
+        / "scripts"
+        / "feishu_send_card.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "feishu_send_card_overlay_r2", overlay_path
+    )
+    assert spec is not None and spec.loader is not None
+    overlay_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(overlay_mod)
+
+    raw_secret = "sk-live-super-secret-value-998877"
+    run_dir = tmp_path / "persistent-runs" / "run-secret-r2"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    tmpfs_outbox = tmp_path / "tmpfs-staging" / "outbox.json"
+
+    # Even if an image filename contains a secret, the copied filename in run_dir/images/ is sanitized
+    src_img_dir = tmp_path / "src-charts"
+    src_img_dir.mkdir(parents=True, exist_ok=True)
+    secret_named_img = src_img_dir / f"chart_{raw_secret}.png"
+    secret_named_img.write_bytes(b"\x89PNG\r\n\x1a\nfake-png")
+
+    md_file = tmp_path / "secret_report.md"
+    md_file.write_text(
+        f"# Report\nToken leaked in body: {raw_secret}\nIMG:{secret_named_img}\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("DALTON_NO_DIRECT_SEND", "1")
+    monkeypatch.setenv("DALTON_RUN_DIR", str(run_dir))
+    monkeypatch.setenv("DALTON_OUTBOX_FILE", str(tmpfs_outbox))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(overlay_path),
+            "--chat-id",
+            "oc_secret_test",
+            "--title",
+            f"Title with {raw_secret}",
+            "--file",
+            str(md_file),
+        ],
+    )
+    overlay_mod.main()
+
+    # Check persistent run_dir BEFORE wrapper redaction:
+    # - Neither card_N.json nor outbox.json exists in run_dir yet
+    # - Zero files or filenames under run_dir contain raw_secret
+    assert not (run_dir / "outbox.json").exists()
+    assert list(run_dir.glob("card_*.json")) == []
+    for p in run_dir.rglob("*"):
+        assert raw_secret not in p.name
+        if p.is_file():
+            raw_bytes = p.read_bytes()
+            assert raw_secret.encode("utf-8") not in raw_bytes
+
+    # Now run wrapper's persist_redacted_outbox with SecretRedactor
+    redactor = SecretRedactor([raw_secret])
+    persisted_outbox_path = run_dir / "outbox.json"
+    persisted = persist_redacted_outbox(
+        outbox_path=persisted_outbox_path,
+        staging_outbox_path=tmpfs_outbox,
+        job_key="softbank-nav-monitor",
+        redactor=redactor,
+    )
+    assert persisted is not None
+    assert not tmpfs_outbox.exists()
+    assert persisted_outbox_path.is_file()
+    persisted_text = persisted_outbox_path.read_text(encoding="utf-8")
+    assert raw_secret not in persisted_text
+    assert "[REDACTED]" in persisted_text
+    persisted_data = json.loads(persisted_text)
+    assert len(persisted_data["feishu_cards"]) == 1
+    assert "[REDACTED]" in json.dumps(
+        persisted_data["feishu_cards"][0]["card"], ensure_ascii=False
+    )
+    assert persisted_data["feishu_cards"][0]["images"] == [
+        {
+            "placeholder": f"{src_img_dir}/chart_[REDACTED].png",
+            "path": "images/card_0_img_0.png",
+        }
+    ]
+
+
+
 

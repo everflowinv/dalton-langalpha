@@ -58,11 +58,12 @@ from src.dalton.data_jobs.runner_wrapper import (
 from src.dalton.notify.dispatch import (
     _evaluate_target_results,
     _invoke_mark_delivery,
-    _invoke_post_notify,
     _shielded_mark_failed,
     _split_target_channel,
     claim_target_delivery,
+    dispatch_target_with_payload,
     evaluate_user_notify_eligibility,
+    extract_feishu_cards_from_payload,
     fetch_execution_deliveries,
     mark_target_delivery,
     post_bridge_notify,
@@ -2267,6 +2268,8 @@ def _resolve_run_notify_payload(
     if raw_payload is None:
         raw_payload = {}
 
+    feishu_cards = extract_feishu_cards_from_payload(raw_payload)
+
     card: dict[str, Any] | None = None
     if isinstance(raw_payload.get("card"), Mapping):
         card = dict(raw_payload["card"])
@@ -2290,6 +2293,17 @@ def _resolve_run_notify_payload(
             text = val.strip()
             break
 
+    if not text and feishu_cards:
+        first_card = feishu_cards[0].get("card")
+        if isinstance(first_card, Mapping):
+            header = first_card.get("header")
+            if isinstance(header, Mapping):
+                title = header.get("title")
+                if isinstance(title, Mapping) and isinstance(title.get("content"), str):
+                    text = title["content"].strip()
+        if not text:
+            text = f"数据任务：{cleaned_key}"
+
     if not text and card is not None:
         header = card.get("header")
         if isinstance(header, Mapping):
@@ -2299,10 +2313,10 @@ def _resolve_run_notify_payload(
         if not text:
             text = f"数据任务：{job_key}"
 
-    if not text and raw_payload:
+    if not text and raw_payload and not feishu_cards:
         text = json.dumps(raw_payload, ensure_ascii=False)
 
-    if not text and card is None:
+    if not text and card is None and not feishu_cards:
         outbox_missing = True
 
     payload_with_route_key: dict[str, Any] = {
@@ -2314,7 +2328,10 @@ def _resolve_run_notify_payload(
         "automation_id": data_key,
         "automation_name": data_key,
         "job_key": cleaned_key,
+        "run_id": str(run_id),
     }
+    if feishu_cards:
+        payload_with_route_key["feishu_cards"] = feishu_cards
     if outbox_missing:
         payload_with_route_key["_outbox_missing"] = True
     return text, card, payload_with_route_key
@@ -2475,6 +2492,7 @@ async def dispatch_data_task_run_notification(
         or fetch_deliveries_fn is not fetch_execution_deliveries
     )
     existing_by_target: dict[tuple[str, str], str] = {}
+    existing_payload_by_target: dict[tuple[str, str], dict[str, Any]] = {}
     for d_row in await _safe_fetch_deliveries(
         fetch_deliveries_fn,
         str(run_id),
@@ -2485,6 +2503,9 @@ async def dispatch_data_task_run_notification(
         d_st = str(d_row.get("status") or "").strip().lower()
         if d_ch and d_tgt and d_st:
             existing_by_target[(d_ch, d_tgt)] = d_st
+            d_payload = d_row.get("payload_json")
+            if isinstance(d_payload, Mapping):
+                existing_payload_by_target[(d_ch, d_tgt)] = dict(d_payload)
 
     local_by_target: dict[tuple[str, str], str] = {}
     pending_targets: list[tuple[str, str]] = []
@@ -2500,7 +2521,7 @@ async def dispatch_data_task_run_notification(
                 cleaned_tgt,
                 user_id=pm_user_id,
                 automation_id=data_key,
-                payload=payload_with_route_key,
+                payload=dict(payload_with_route_key),
             )
             if claimed_ok:
                 local_by_target[(ch, cleaned_tgt)] = "pending"
@@ -2520,6 +2541,10 @@ async def dispatch_data_task_run_notification(
         for ch, cleaned_tgt in valid_targets:
             if existing_by_target.get((ch, cleaned_tgt)) in ("sent", "skipped"):
                 continue
+            target_payload = dict(payload_with_route_key)
+            prev_payload = existing_payload_by_target.get((ch, cleaned_tgt))
+            if isinstance(prev_payload, Mapping) and "cards_sent" in prev_payload:
+                target_payload["cards_sent"] = prev_payload["cards_sent"]
             await check_scheduler_lock(lock_conn)
             claimed_ok = await claim_target_fn(
                 str(run_id),
@@ -2527,7 +2552,7 @@ async def dispatch_data_task_run_notification(
                 cleaned_tgt,
                 user_id=pm_user_id,
                 automation_id=data_key,
-                payload=payload_with_route_key,
+                payload=target_payload,
             )
             if not claimed_ok:
                 continue
@@ -2536,11 +2561,15 @@ async def dispatch_data_task_run_notification(
 
             await check_scheduler_lock(lock_conn)
             try:
-                bridge_res = await _invoke_post_notify(
+                bridge_res = await dispatch_target_with_payload(
                     post_notify_fn,
                     [cleaned_tgt],
                     text,
                     card,
+                    target_payload,
+                    run_id=str(run_id),
+                    channel=ch,
+                    check_lock_fn=lambda: check_scheduler_lock(lock_conn),
                 )
             except asyncio.CancelledError:
                 for rem_ch, rem_tgt in list(pending_targets):

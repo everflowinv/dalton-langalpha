@@ -633,7 +633,51 @@ def _parse_audit_history(raw: Any) -> list[dict[str, Any]]:
     return []
 
 
-def _default_seed_audit_history(enabled: bool = False) -> list[dict[str, Any]]:
+def _validate_data_task_cron_expr(cron_expr: str) -> str:
+    if not isinstance(cron_expr, str) or not cron_expr.strip():
+        raise ValueError(
+            "非法 cron 表达式：cron_expr 必须为非空 5 段标准 cron 表达式（如 `30 7 * * 1-5`）"
+        )
+    cleaned = cron_expr.strip()
+    if len(cleaned.split()) != 5 or not croniter.is_valid(cleaned):
+        raise ValueError(
+            f"非法 cron 表达式 `{cron_expr}`：必须为合法的 5 段标准 cron 表达式（如 `30 7 * * 1-5`）"
+        )
+    try:
+        croniter(cleaned, datetime.now(UTC)).get_next(datetime)
+    except Exception as exc:
+        raise ValueError(
+            f"非法 cron 表达式 `{cron_expr}`：必须为合法的 5 段标准 cron 表达式（如 `30 7 * * 1-5`）"
+        ) from exc
+    return cleaned
+
+
+def _validate_data_task_timezone(tz_name: str) -> str:
+    if not isinstance(tz_name, str) or not tz_name.strip():
+        raise ValueError(
+            "非法时区：timezone 必须为非空 IANA 时区名称（如 `Asia/Shanghai`、`America/New_York`）"
+        )
+    cleaned = tz_name.strip()
+    try:
+        ZoneInfo(cleaned)
+    except Exception as exc:
+        raise ValueError(
+            f"非法时区 `{tz_name}`：必须为合法的 IANA 时区名称（如 `Asia/Shanghai`、`America/New_York`）"
+        ) from exc
+    return cleaned
+
+
+def _default_seed_audit_history(
+    enabled: bool = False,
+    *,
+    cron_expr: str | None = None,
+    timezone: str | None = None,
+) -> list[dict[str, Any]]:
+    snap: dict[str, Any] = {"enabled": bool(enabled), "notify_routes": []}
+    if cron_expr:
+        snap["cron_expr"] = str(cron_expr).strip()
+    if timezone:
+        snap["timezone"] = str(timezone).strip()
     return [
         {
             "version": 1,
@@ -642,7 +686,7 @@ def _default_seed_audit_history(enabled: bool = False) -> list[dict[str, Any]]:
             "changed_at": "2026-11-07T00:00:00Z",
             "action": "seed",
             "changes": {},
-            "snapshot": {"enabled": bool(enabled), "notify_routes": []},
+            "snapshot": snap,
         }
     ]
 
@@ -995,7 +1039,11 @@ async def _ensure_and_lock_data_task_def_row(
     if isinstance(row, Mapping):
         return dict(row)
 
-    seed_audit = _default_seed_audit_history(enabled=manifest_entry.enabled)
+    seed_audit = _default_seed_audit_history(
+        enabled=manifest_entry.enabled,
+        cron_expr=manifest_entry.cron_expr,
+        timezone=manifest_entry.timezone,
+    )
     await cur.execute(
         """
         INSERT INTO dalton_data_task_defs (
@@ -1149,9 +1197,22 @@ async def record_auto_pruned_data_task_routes(
             old_ver = int(def_row.get("config_version") or 1)
             active_ver = int(def_row.get("active_version") or 1)
             cur_enabled = bool(def_row.get("enabled", False))
+            cur_cron = str(def_row.get("cron_expr") or manifest_entry.cron_expr).strip()
+            cur_tz = str(def_row.get("timezone") or manifest_entry.timezone).strip()
             history = _parse_audit_history(def_row.get("audit_history"))
             if not history:
-                history = _default_seed_audit_history(enabled=cur_enabled)
+                history = _default_seed_audit_history(
+                    enabled=cur_enabled,
+                    cron_expr=cur_cron,
+                    timezone=cur_tz,
+                )
+
+            prune_snapshot: dict[str, Any] = {
+                "enabled": cur_enabled,
+                "notify_routes": list(new_routes),
+                "cron_expr": cur_cron,
+                "timezone": cur_tz,
+            }
 
             new_ver = old_ver + 1
             entry = {
@@ -1166,10 +1227,7 @@ async def record_auto_pruned_data_task_routes(
                         "new": list(new_routes),
                     }
                 },
-                "snapshot": {
-                    "enabled": cur_enabled,
-                    "notify_routes": list(new_routes),
-                },
+                "snapshot": prune_snapshot,
             }
             updated_history = history + [entry]
             await cur.execute(
@@ -1226,9 +1284,15 @@ async def rollback_data_task_config(
             old_ver = int(def_row.get("config_version") or 1)
             active_ver = int(def_row.get("active_version") or 1)
             old_enabled = bool(def_row.get("enabled", False))
+            old_cron = str(def_row.get("cron_expr") or manifest_entry.cron_expr).strip()
+            old_tz = str(def_row.get("timezone") or manifest_entry.timezone).strip()
             history = _parse_audit_history(def_row.get("audit_history"))
             if not history:
-                history = _default_seed_audit_history(enabled=old_enabled)
+                history = _default_seed_audit_history(
+                    enabled=old_enabled,
+                    cron_expr=old_cron,
+                    timezone=old_tz,
+                )
 
             active_entry = _find_audit_entry(history, active_ver)
             if active_entry is None or active_entry.get("prev_version") is None:
@@ -1252,6 +1316,11 @@ async def rollback_data_task_config(
                 for x in (target_snapshot.get("notify_routes") or [])
                 if isinstance(x, str) and str(x).strip()
             ]
+            # A snapshot without a schedule (the seed, or one taken before the
+            # schedule became editable) leaves the current schedule in place:
+            # the manifest no longer owns these columns once the row exists.
+            restored_cron = str(target_snapshot.get("cron_expr") or old_cron).strip()
+            restored_tz = str(target_snapshot.get("timezone") or old_tz).strip()
 
             stored_routes_map = _extract_data_routes_from_model_pref(
                 (locked_prefs or {}).get("model_preference")
@@ -1272,6 +1341,21 @@ async def rollback_data_task_config(
             else:
                 old_routes = []
 
+            rollback_changes: dict[str, Any] = {
+                "enabled": {"old": old_enabled, "new": restored_enabled},
+                "notify_routes": {"old": old_routes, "new": restored_routes},
+            }
+            if old_cron != restored_cron or "cron_expr" in target_snapshot:
+                rollback_changes["cron_expr"] = {
+                    "old": old_cron,
+                    "new": restored_cron,
+                }
+            if old_tz != restored_tz or "timezone" in target_snapshot:
+                rollback_changes["timezone"] = {
+                    "old": old_tz,
+                    "new": restored_tz,
+                }
+
             new_ver = old_ver + 1
             rollback_entry = {
                 "version": new_ver,
@@ -1280,13 +1364,12 @@ async def rollback_data_task_config(
                 "actor_user_id": actor_uid,
                 "changed_at": now_iso,
                 "action": "rollback",
-                "changes": {
-                    "enabled": {"old": old_enabled, "new": restored_enabled},
-                    "notify_routes": {"old": old_routes, "new": restored_routes},
-                },
+                "changes": rollback_changes,
                 "snapshot": {
                     "enabled": restored_enabled,
                     "notify_routes": restored_routes,
+                    "cron_expr": restored_cron,
+                    "timezone": restored_tz,
                 },
             }
             updated_history = history + [rollback_entry]
@@ -1297,6 +1380,8 @@ async def rollback_data_task_config(
                 SET
                     enabled = %s,
                     paused_by_user = %s,
+                    cron_expr = %s,
+                    timezone = %s,
                     config_version = %s,
                     active_version = %s,
                     updated_by = %s,
@@ -1307,6 +1392,8 @@ async def rollback_data_task_config(
                 (
                     restored_enabled,
                     not restored_enabled,
+                    restored_cron,
+                    restored_tz,
                     new_ver,
                     new_ver,
                     actor_uid,
@@ -1665,11 +1752,13 @@ async def toggle_system_job(
     enabled: bool | None = None,
     *,
     notify_routes: list[str] | None = None,
+    cron_expr: str | None = None,
+    timezone: str | None = None,
     actor_user_id: str | None = None,
     force: bool = True,
     respect_user_pause: bool = False,
 ) -> dict[str, Any]:
-    """Enable (upsert/resume) or disable (pause with ``paused_by_user``) a system job."""
+    """Enable (upsert/resume), disable (pause with ``paused_by_user``), or update schedule/routes of a system job."""
     uid = str(user_id or "").strip()
     if not uid:
         raise ValueError("user_id is required")
@@ -1682,10 +1771,27 @@ async def toggle_system_job(
         actor_uid = str(actor_user_id if actor_user_id is not None else uid).strip()
         if not actor_uid or await get_user_tier(actor_uid) not in ("admin", "internal"):
             raise PermissionError("仅内部成员可操作公司公共数据任务")
-        if enabled is None and notify_routes is None:
-            raise ValueError("请至少提供 enabled 或 notify_routes")
+        if (
+            enabled is None
+            and notify_routes is None
+            and cron_expr is None
+            and timezone is None
+        ):
+            raise ValueError(
+                "请至少提供 enabled、notify_routes、cron_expr 或 timezone"
+            )
         if notify_routes is not None and not isinstance(notify_routes, list):
             raise ValueError("notify_routes 必须为字符串列表")
+        cleaned_cron = (
+            _validate_data_task_cron_expr(cron_expr)
+            if cron_expr is not None
+            else None
+        )
+        cleaned_tz = (
+            _validate_data_task_timezone(timezone)
+            if timezone is not None
+            else None
+        )
         pm_ids = get_configured_pm_user_ids()
         if not pm_ids:
             raise RuntimeError("未配置首位管理员 DALTON_PM_USER_IDS，无法操作数据任务")
@@ -1767,9 +1873,19 @@ async def toggle_system_job(
                     old_ver = int(def_row.get("config_version") or 1)
                     active_ver = int(def_row.get("active_version") or 1)
                     old_enabled = bool(def_row.get("enabled", False))
+                    old_cron = str(
+                        def_row.get("cron_expr") or manifest_entry.cron_expr
+                    ).strip()
+                    old_tz = str(
+                        def_row.get("timezone") or manifest_entry.timezone
+                    ).strip()
                     history = _parse_audit_history(def_row.get("audit_history"))
                     if not history:
-                        history = _default_seed_audit_history(enabled=old_enabled)
+                        history = _default_seed_audit_history(
+                            enabled=old_enabled,
+                            cron_expr=old_cron,
+                            timezone=old_tz,
+                        )
 
                     stored_routes_map = _extract_data_routes_from_model_pref(
                         locked_model_pref
@@ -1803,6 +1919,10 @@ async def toggle_system_job(
                         if normalized_routes_local is not None
                         else list(old_routes)
                     )
+                    new_cron = (
+                        cleaned_cron if cleaned_cron is not None else old_cron
+                    )
+                    new_tz = cleaned_tz if cleaned_tz is not None else old_tz
 
                     changes: dict[str, Any] = {}
                     if enabled is not None or new_enabled != old_enabled:
@@ -1814,6 +1934,16 @@ async def toggle_system_job(
                         changes["notify_routes"] = {
                             "old": old_routes,
                             "new": new_routes,
+                        }
+                    if cleaned_cron is not None or new_cron != old_cron:
+                        changes["cron_expr"] = {
+                            "old": old_cron,
+                            "new": new_cron,
+                        }
+                    if cleaned_tz is not None or new_tz != old_tz:
+                        changes["timezone"] = {
+                            "old": old_tz,
+                            "new": new_tz,
                         }
 
                     new_ver = old_ver + 1
@@ -1827,6 +1957,8 @@ async def toggle_system_job(
                         "snapshot": {
                             "enabled": new_enabled,
                             "notify_routes": new_routes,
+                            "cron_expr": new_cron,
+                            "timezone": new_tz,
                         },
                     }
                     updated_history = history + [audit_entry]
@@ -1837,6 +1969,8 @@ async def toggle_system_job(
                         SET
                             enabled = %s,
                             paused_by_user = %s,
+                            cron_expr = %s,
+                            timezone = %s,
                             config_version = %s,
                             active_version = %s,
                             updated_by = %s,
@@ -1847,6 +1981,8 @@ async def toggle_system_job(
                         (
                             new_enabled,
                             not new_enabled,
+                            new_cron,
+                            new_tz,
                             new_ver,
                             new_ver,
                             actor_uid,
@@ -1901,13 +2037,21 @@ async def toggle_system_job(
             "key": f"data:{target}",
             "enabled": new_enabled,
             "notify_routes": new_routes,
+            "schedule": job_entry.get("schedule"),
+            "timezone": job_entry.get("timezone"),
             "config_version": new_ver,
             "active_version": new_ver,
             "job": job_entry,
         }
 
-    if notify_routes is not None:
-        raise ValueError("仅公司公共数据任务支持通过此接口修改 notify_routes")
+    if (
+        notify_routes is not None
+        or cron_expr is not None
+        or timezone is not None
+    ):
+        raise ValueError(
+            "仅公司公共数据任务支持通过此接口修改 notify_routes、cron_expr 或 timezone"
+        )
     if enabled is None:
         raise ValueError("enabled 不能为空")
 
