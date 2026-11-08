@@ -53,6 +53,7 @@ from src.dalton.data_jobs.manifest import (
 )
 from src.dalton.data_jobs.scheduler import (
     ClaimedTaskRun,
+    ManualTaskRunConflictError,
     SchedulerLockLostError,
     build_data_task_notify_automation,
     bump_slot_generation_and_kill_host_task,
@@ -61,6 +62,7 @@ from src.dalton.data_jobs.scheduler import (
     dispatch_data_task_run_notification,
     dispatch_pending_data_task_notifications,
     enqueue_due_cron_tasks,
+    enqueue_manual_task_run,
     execute_claimed_container_run,
     execute_claimed_host_run,
     expire_low_memory_runs,
@@ -94,6 +96,7 @@ __all__ = [
     "HostKillOutcome",
     "HostRunOutcome",
     "MANIFEST_PATH",
+    "ManualTaskRunConflictError",
     "SchedulerLockLostError",
     "TaskEvaluationContext",
     "TaskEvaluationResult",
@@ -108,6 +111,7 @@ __all__ = [
     "dispatch_data_task_run_notification",
     "dispatch_pending_data_task_notifications",
     "enqueue_due_cron_tasks",
+    "enqueue_manual_task_run",
     "evaluate_t18_megacap_relative_signal_monitor",
     "evaluate_t1_t29_bbg_data_pull",
     "evaluate_t5_cn_leverage_daily",

@@ -2739,6 +2739,25 @@ class _InMemoryDataTaskStore:
                     last_one["val"] = {"run_id": existing_q["run_id"]} if existing_q else None
                     return
 
+                if (
+                    "FROM dalton_data_task_runs" in q
+                    and "trigger_source = 'manual'" in q
+                    and "status IN ('queued', 'starting', 'running')" in q
+                ):
+                    jk = str(p[0])
+                    active_trial = next(
+                        (
+                            r
+                            for r in reversed(self.runs)
+                            if r["job_key"] == jk
+                            and r.get("trigger_source") == "manual"
+                            and r["status"] in ("queued", "starting", "running")
+                        ),
+                        None,
+                    )
+                    last_one["val"] = {"run_id": active_trial["run_id"]} if active_trial else None
+                    return
+
                 if "FROM dalton_data_task_runs WHERE job_key = %s ORDER BY" in q:
                     jk = str(p[0])
                     matching = [r for r in self.runs if r["job_key"] == jk]
@@ -3198,6 +3217,103 @@ async def test_data_jobs_multi_step_rollback_audit_chain_and_run_now_queueing(
     assert last_rb["restored_from_version"] == 7
     assert last_rb["job"]["enabled"] is False
     assert last_rb["job"]["can_rollback"] is False
+
+    # 10) While a disabled task has a queued or running trial run (`trigger_source = 'manual'`),
+    # enabling the task via `toggle_system_job` or rolling back to an enabled version via
+    # `rollback_data_task_config` is rejected with "试跑进行中（run_id=…），结束后再开启" and does NOT
+    # alter any task fields; once the trial run finishes, enabling and rollback succeed.
+    # First create an enabled version -> disabled version on `jp-leverage-daily` so we can also test rollback:
+    await system_jobs_mod.toggle_system_job(
+        USER_ID,
+        "data:jp-leverage-daily",
+        enabled=True,
+        notify_routes=["feishu:user:ou_admin1"],
+        actor_user_id="internal-a",
+    )
+    await system_jobs_mod.toggle_system_job(
+        USER_ID,
+        "data:jp-leverage-daily",
+        enabled=False,
+        actor_user_id="internal-a",
+    )
+    jp_def_before = json.loads(json.dumps(data_store.defs["jp-leverage-daily"]))
+    jp_routes_before = list(
+        data_store.user_model_prefs[USER_ID]["dalton_notify_routes"]["data:jp-leverage-daily"]
+    )
+    assert jp_def_before["enabled"] is False
+
+    trial_run_row = {
+        "run_id": "11111111-2222-3333-4444-555555555555",
+        "job_key": "jp-leverage-daily",
+        "trigger_source": "manual",
+        "triggered_by_user_id": "internal-a",
+        "scheduled_slot_utc": "2026-11-08T12:00:00+00:00",
+        "deadline_utc": "2026-11-08T12:30:00+00:00",
+        "status": "queued",
+        "exit_code": None,
+        "failure_reason": None,
+        "started_at": None,
+        "completed_at": None,
+        "created_at": "2026-11-08T12:00:00+00:00",
+    }
+    data_store.runs.append(trial_run_row)
+
+    for active_status in ("queued", "starting", "running"):
+        trial_run_row["status"] = active_status
+        with pytest.raises(
+            ValueError,
+            match="试跑进行中（run_id=11111111-2222-3333-4444-555555555555），结束后再开启",
+        ):
+            await system_jobs_mod.toggle_system_job(
+                USER_ID,
+                "data:jp-leverage-daily",
+                enabled=True,
+                notify_routes=["feishu:user:ou_admin2"],
+                actor_user_id="internal-b",
+            )
+        assert data_store.defs["jp-leverage-daily"] == jp_def_before
+        assert (
+            data_store.user_model_prefs[USER_ID]["dalton_notify_routes"]["data:jp-leverage-daily"]
+            == jp_routes_before
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="试跑进行中（run_id=11111111-2222-3333-4444-555555555555），结束后再开启",
+        ):
+            await system_jobs_mod.rollback_data_task_config(
+                "internal-b",
+                "jp-leverage-daily",
+            )
+        assert data_store.defs["jp-leverage-daily"] == jp_def_before
+        assert (
+            data_store.user_model_prefs[USER_ID]["dalton_notify_routes"]["data:jp-leverage-daily"]
+            == jp_routes_before
+        )
+
+    # Once the trial run reaches a terminal status, rollback to enabled and toggle enable both succeed
+    trial_run_row["status"] = "succeeded"
+    rb_after_trial = await system_jobs_mod.rollback_data_task_config(
+        "internal-b",
+        "jp-leverage-daily",
+    )
+    assert rb_after_trial["ok"] is True
+    assert rb_after_trial["job"]["enabled"] is True
+
+    await system_jobs_mod.toggle_system_job(
+        USER_ID,
+        "data:jp-leverage-daily",
+        enabled=False,
+        actor_user_id="internal-a",
+    )
+    en_after_trial = await system_jobs_mod.toggle_system_job(
+        USER_ID,
+        "data:jp-leverage-daily",
+        enabled=True,
+        actor_user_id="internal-a",
+    )
+    assert en_after_trial["ok"] is True
+    assert en_after_trial["job"]["enabled"] is True
 
 
 @pytest.mark.asyncio

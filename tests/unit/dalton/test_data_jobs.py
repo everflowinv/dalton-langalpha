@@ -415,9 +415,11 @@ async def test_claim_transaction_rolls_back_when_run_update_affects_zero_rows() 
             },
             # 4. UPDATE dalton_data_task_slot -> rowcount = 1, generation = 5
             {"rowcount": 1, "fetchone": {"generation": 5}},
-            # 5. UPDATE dalton_data_task_runs -> rowcount = 0
+            # 5. SELECT enabled, paused_by_user ... FOR SHARE
+            {"fetchone": {"enabled": True, "paused_by_user": False}},
+            # 6. UPDATE dalton_data_task_runs -> rowcount = 0
             {"rowcount": 0},
-            # 6. UPDATE dalton_data_task_runs SET status = 'cancelled' in fallback tx
+            # 7. UPDATE dalton_data_task_runs SET status = 'cancelled' in fallback tx
             {"rowcount": 1},
         ]
     )
@@ -480,7 +482,9 @@ async def test_unclaimable_queue_head_is_cancelled_and_next_run_is_claimed() -> 
             {"rowcount": 1},
             # 5. UPDATE dalton_data_task_slot for second run
             {"rowcount": 1, "fetchone": {"generation": 8}},
-            # 6. UPDATE dalton_data_task_runs SET status = 'starting' for second run
+            # 6. SELECT enabled, paused_by_user ... FOR SHARE for second run
+            {"fetchone": {"enabled": True, "paused_by_user": False}},
+            # 7. UPDATE dalton_data_task_runs SET status = 'starting' for second run
             {"rowcount": 1},
         ]
     )
@@ -1374,6 +1378,7 @@ async def test_host_runner_tasks_enqueued_and_claimed() -> None:
                 ]
             },
             {"rowcount": 1, "fetchone": {"generation": 2}},  # UPDATE slot
+            {"fetchone": {"enabled": True, "paused_by_user": False}},  # SELECT def FOR SHARE
             {"rowcount": 1},  # UPDATE run SET status = 'starting'
         ]
     )
@@ -5410,4 +5415,1062 @@ def test_pr04_data_tasks_parity_consistent_inconsistent_and_missing_one_side(
     out_no_dir = json.loads(capsys.readouterr().out)
     assert out_no_dir["summary"]["all_consistent"] is False
     assert out_no_dir["summary"]["reason"] == "directory_not_found"
+
+
+@pytest.mark.asyncio
+async def test_pr11_manual_run_enqueue_claim_when_disabled_and_preview_only_notify_status(
+    tmp_path: Path,
+) -> None:
+    """Verify PR 1-1 Round 3 distinction between trial runs (`enabled = False`) and immediate runs (`enabled = True`):
+    - `enqueue_manual_task_run` succeeds when task `enabled = False` and rejects with `"任务已开启，请用对话里的立即运行"` when `enabled = True`;
+    - Rejects creating a manual run when a queued or active (`queued`, `starting`, `running`) run already exists (whether `cron` or `manual`);
+    - `enqueue_due_cron_tasks` only supersedes prior queued `cron` runs and does NOT supersede queued `manual` runs;
+    - At claim time, `ClaimedTaskRun.is_trial` is `True` when `trigger_source == 'manual' and not enabled`, and `False` when `enabled = True`;
+    - Trial run (`is_trial = True`): ignores `paused_by_user`, uses `host_mode = 'run'` for host tasks, sets `notify_status = 'preview_only'`, and never modifies `consecutive_failures`;
+    - Immediate run (`trigger_source == 'manual'` with `enabled = True`, `is_trial = False`): requires `paused_by_user = False`, uses manifest's `host_mode` (`mirror`), dispatches notifications (`pending_dispatch`), and updates `consecutive_failures`.
+    """
+    from src.dalton.data_jobs.evaluators import TaskEvaluationResult
+    from src.dalton.data_jobs.host_runner import HostRunOutcome
+    from src.dalton.data_jobs.scheduler import (
+        ManualTaskRunConflictError,
+        claim_next_queued_run,
+        enqueue_due_cron_tasks,
+        enqueue_manual_task_run,
+        execute_claimed_host_run,
+        expire_low_memory_runs,
+        finalize_task_run,
+        recover_on_takeover,
+        resolve_notify_status,
+    )
+
+    now = datetime(2026, 11, 8, 12, 30, tzinfo=timezone.utc)
+
+    # 1a. Enqueue manual trial run when task is disabled (`enabled = False`) -> succeeds and returns run_id
+    conn_ok, state_ok = _make_autospec_db(
+        [
+            {
+                "fetchone": {
+                    "job_key": T18_JOB_KEY,
+                    "timeout_seconds": 300,
+                    "runner": "container",
+                    "enabled": False,
+                }
+            },
+            {"fetchone": None},
+            {"fetchone": {"run_id": "manual-run-1"}},
+        ]
+    )
+    run_id = await enqueue_manual_task_run(
+        conn_ok,
+        "T18",
+        triggered_by_user_id="lead-admin",
+        now_utc=now,
+    )
+    assert run_id == "manual-run-1"
+    insert_sql, insert_params = state_ok["executed"][2]
+    assert "'manual'" in insert_sql
+    assert insert_params["job_key"] == T18_JOB_KEY
+    assert insert_params["slot_utc"] == now
+    assert insert_params["deadline_utc"] == now + timedelta(seconds=300)
+
+    # 1b. Rejects `enqueue_manual_task_run` when task is enabled (`enabled = True`)
+    conn_enabled, _ = _make_autospec_db(
+        [
+            {
+                "fetchone": {
+                    "job_key": T18_JOB_KEY,
+                    "timeout_seconds": 300,
+                    "runner": "container",
+                    "enabled": True,
+                }
+            }
+        ]
+    )
+    with pytest.raises(ManualTaskRunConflictError, match="任务已开启，请用对话里的立即运行"):
+        await enqueue_manual_task_run(conn_enabled, "T18", now_utc=now)
+
+    # 2. Rejects creating manual run when a queued or running run already exists (cron or manual)
+    for conflict_status, conflict_src in (
+        ("queued", "cron"),
+        ("queued", "manual"),
+        ("starting", "manual"),
+        ("running", "cron"),
+    ):
+        conn_conflict, _ = _make_autospec_db(
+            [
+                {
+                    "fetchone": {
+                        "job_key": T18_JOB_KEY,
+                        "timeout_seconds": 300,
+                        "runner": "container",
+                        "enabled": False,
+                    }
+                },
+                {
+                    "fetchone": {
+                        "run_id": "existing-run-99",
+                        "status": conflict_status,
+                        "trigger_source": conflict_src,
+                    }
+                },
+            ]
+        )
+        with pytest.raises(ManualTaskRunConflictError, match="existing-run-99"):
+            await enqueue_manual_task_run(conn_conflict, T18_JOB_KEY, now_utc=now)
+
+    # 2b. `enqueue_due_cron_tasks` only supersedes prior queued `cron` runs (does NOT supersede `manual`)
+    conn_cron_sup, state_cron_sup = _make_autospec_db(
+        [
+            {
+                "fetchall": [
+                    {
+                        "job_key": T18_JOB_KEY,
+                        "cron_expr": "*/5 9-16 * * 1-5",
+                        "timezone": "America/New_York",
+                        "timeout_seconds": 240,
+                        "enabled": True,
+                        "paused_by_user": False,
+                        "runner": "container",
+                    }
+                ]
+            },
+            {"rowcount": 1},  # UPDATE prior queued cron run -> skipped_superseded
+            {"rowcount": 1, "fetchone": {"run_id": "cron-slot-run-1"}},
+        ]
+    )
+    tick_utc = datetime(2026, 11, 6, 15, 5, 10, tzinfo=timezone.utc)
+    enqueued_cron = await enqueue_due_cron_tasks(conn_cron_sup, now_utc=tick_utc)
+    assert enqueued_cron == ["cron-slot-run-1"]
+    sup_sql, _ = state_cron_sup["executed"][1]
+    assert "status = 'skipped_superseded'" in sup_sql
+    assert "trigger_source = 'cron'" in sup_sql
+    assert "trigger_source = 'manual'" not in sup_sql
+
+    # 3. Claim:
+    # - disabled cron head row is cancelled;
+    # - enabled-but-paused manual head row is cancelled (`is_trial = False`);
+    # - disabled manual row is claimed as a trial run (`is_trial = True`) even with `paused_by_user = True`!
+    conn_claim, state_claim = _make_autospec_db(
+        [
+            {
+                "fetchone": {
+                    "slot_id": 1,
+                    "generation": 7,
+                    "slot_state": "idle",
+                    "active_run_id": None,
+                    "active_job_key": None,
+                }
+            },
+            {"fetchall": []},
+            {
+                "fetchall": [
+                    {
+                        "run_id": "cron-disabled-1",
+                        "job_key": T18_JOB_KEY,
+                        "trigger_source": "cron",
+                        "scheduled_slot_utc": now - timedelta(minutes=5),
+                        "deadline_utc": now + timedelta(minutes=5),
+                        "low_mem_since_utc": None,
+                        "enabled": False,
+                        "paused_by_user": True,
+                        "runner": "container",
+                        "command_argv": ["python3", "script.py"],
+                        "workdir": "/Users/everflow/.openclaw/workspace",
+                        "timeout_seconds": 300,
+                        "no_output_timeout_seconds": 120,
+                        "required_secrets": [],
+                        "cos_mode": "skip",
+                        "notify_enabled": True,
+                        "timezone": "America/New_York",
+                    },
+                    {
+                        "run_id": "manual-enabled-paused-1",
+                        "job_key": T18_JOB_KEY,
+                        "trigger_source": "manual",
+                        "scheduled_slot_utc": now - timedelta(minutes=2),
+                        "deadline_utc": now + timedelta(minutes=5),
+                        "low_mem_since_utc": None,
+                        "enabled": True,
+                        "paused_by_user": True,
+                        "runner": "container",
+                        "command_argv": ["python3", "script.py"],
+                        "workdir": "/Users/everflow/.openclaw/workspace",
+                        "timeout_seconds": 300,
+                        "no_output_timeout_seconds": 120,
+                        "required_secrets": [],
+                        "cos_mode": "skip",
+                        "notify_enabled": True,
+                        "timezone": "America/New_York",
+                    },
+                    {
+                        "run_id": "manual-disabled-2",
+                        "job_key": T18_JOB_KEY,
+                        "trigger_source": "manual",
+                        "scheduled_slot_utc": now,
+                        "deadline_utc": now + timedelta(minutes=5),
+                        "low_mem_since_utc": None,
+                        "enabled": False,
+                        "paused_by_user": True,
+                        "runner": "container",
+                        "command_argv": ["python3", "script.py"],
+                        "workdir": "/Users/everflow/.openclaw/workspace",
+                        "timeout_seconds": 300,
+                        "no_output_timeout_seconds": 120,
+                        "required_secrets": [],
+                        "cos_mode": "skip",
+                        "notify_enabled": True,
+                        "timezone": "America/New_York",
+                    },
+                ]
+            },
+            {"rowcount": 1},  # cancel cron-disabled-1
+            {"rowcount": 1},  # cancel manual-enabled-paused-1
+            {"rowcount": 1, "fetchone": {"generation": 8}},
+            {"fetchone": {"enabled": False, "paused_by_user": True}},  # SELECT def FOR SHARE
+            {"rowcount": 1},
+        ]
+    )
+    claimed = await claim_next_queued_run(
+        conn_claim,
+        now_utc=now,
+        available_memory_mb=4096,
+    )
+    assert claimed is not None
+    assert claimed.run_id == "manual-disabled-2"
+    assert claimed.trigger_source == "manual"
+    assert claimed.is_trial is True
+    assert claimed.generation == 8
+    cancel_sql_1, cancel_params_1 = state_claim["executed"][3]
+    assert "SET status = 'cancelled'" in cancel_sql_1
+    assert cancel_params_1["run_id"] == "cron-disabled-1"
+    cancel_sql_2, cancel_params_2 = state_claim["executed"][4]
+    assert "SET status = 'cancelled'" in cancel_sql_2
+    assert cancel_params_2["run_id"] == "manual-enabled-paused-1"
+    for_share_sql, for_share_params = state_claim["executed"][6]
+    assert "FOR SHARE" in for_share_sql
+    assert for_share_params["job_key"] == T18_JOB_KEY
+    claim_run_sql, claim_run_params = state_claim["executed"][7]
+    assert "(r.trigger_source = 'manual' AND %(expected_enabled)s = FALSE)" in claim_run_sql
+    assert claim_run_params["run_id"] == "manual-disabled-2"
+    assert claim_run_params["expected_enabled"] is False
+    assert claim_run_params["expected_paused"] is True
+
+    # 3a-bis. `claim_next_queued_run(only_run_id=...)` only claims the target `run_id` and leaves
+    # earlier queued runs in the queue completely untouched (neither cancelling nor claiming them)
+    conn_only, state_only = _make_autospec_db(
+        [
+            {
+                "fetchone": {
+                    "slot_id": 1,
+                    "generation": 20,
+                    "slot_state": "idle",
+                    "active_run_id": None,
+                    "active_job_key": None,
+                }
+            },
+            {"fetchall": [{"run_id": "earlier-low-mem", "job_key": T5_JOB_KEY, "trigger_source": "cron", "enabled": True}]},
+            {
+                "fetchall": [
+                    {
+                        "run_id": "earlier-disabled-cron",
+                        "job_key": T5_JOB_KEY,
+                        "trigger_source": "cron",
+                        "scheduled_slot_utc": now - timedelta(minutes=10),
+                        "deadline_utc": now + timedelta(minutes=5),
+                        "low_mem_since_utc": None,
+                        "enabled": False,
+                        "paused_by_user": True,
+                        "runner": "container",
+                        "command_argv": ["python3", "t5.py"],
+                        "workdir": "/Users/everflow/.openclaw/workspace",
+                        "timeout_seconds": 300,
+                        "no_output_timeout_seconds": 120,
+                        "required_secrets": [],
+                        "cos_mode": "skip",
+                        "notify_enabled": False,
+                        "timezone": "America/New_York",
+                    },
+                    {
+                        "run_id": "earlier-claimable-cron",
+                        "job_key": T5_JOB_KEY,
+                        "trigger_source": "cron",
+                        "scheduled_slot_utc": now - timedelta(minutes=5),
+                        "deadline_utc": now + timedelta(minutes=5),
+                        "low_mem_since_utc": None,
+                        "enabled": True,
+                        "paused_by_user": False,
+                        "runner": "container",
+                        "command_argv": ["python3", "t5.py"],
+                        "workdir": "/Users/everflow/.openclaw/workspace",
+                        "timeout_seconds": 300,
+                        "no_output_timeout_seconds": 120,
+                        "required_secrets": [],
+                        "cos_mode": "skip",
+                        "notify_enabled": False,
+                        "timezone": "America/New_York",
+                    },
+                    {
+                        "run_id": "target-trial-run",
+                        "job_key": T18_JOB_KEY,
+                        "trigger_source": "manual",
+                        "scheduled_slot_utc": now,
+                        "deadline_utc": now + timedelta(minutes=5),
+                        "low_mem_since_utc": None,
+                        "enabled": False,
+                        "paused_by_user": False,
+                        "runner": "container",
+                        "command_argv": ["python3", "script.py"],
+                        "workdir": "/Users/everflow/.openclaw/workspace",
+                        "timeout_seconds": 300,
+                        "no_output_timeout_seconds": 120,
+                        "required_secrets": [],
+                        "cos_mode": "skip",
+                        "notify_enabled": True,
+                        "timezone": "America/New_York",
+                    },
+                ]
+            },
+            {"rowcount": 1, "fetchone": {"generation": 21}},
+            {"fetchone": {"enabled": False, "paused_by_user": False}},
+            {"rowcount": 1},
+        ]
+    )
+    claimed_only = await claim_next_queued_run(
+        conn_only,
+        now_utc=now,
+        available_memory_mb=4096,
+        only_run_id="target-trial-run",
+    )
+    assert claimed_only is not None
+    assert claimed_only.run_id == "target-trial-run"
+    assert claimed_only.is_trial is True
+    assert not any(
+        isinstance(params, dict)
+        and params.get("run_id") in ("earlier-low-mem", "earlier-disabled-cron", "earlier-claimable-cron")
+        for _, params in state_only["executed"]
+    )
+
+    # 3b. Claim & execute trial host run (`enabled = False`, `trigger_source = 'manual'`) -> `is_trial = True`, `host_mode = 'run'`
+    conn_claim_host, _ = _make_autospec_db(
+        [
+            {
+                "fetchone": {
+                    "slot_id": 1,
+                    "generation": 10,
+                    "slot_state": "idle",
+                    "active_run_id": None,
+                    "active_job_key": None,
+                }
+            },
+            {"fetchall": []},
+            {
+                "fetchall": [
+                    {
+                        "run_id": "manual-host-1",
+                        "job_key": T29_JOB_KEY,
+                        "trigger_source": "manual",
+                        "scheduled_slot_utc": now,
+                        "deadline_utc": now + timedelta(minutes=15),
+                        "low_mem_since_utc": None,
+                        "enabled": False,
+                        "paused_by_user": False,
+                        "runner": "host",
+                        "command_argv": ["bash", "scripts/bbg_remote_refresh.sh"],
+                        "workdir": "/Users/everflow/.openclaw/workspace",
+                        "timeout_seconds": 900,
+                        "no_output_timeout_seconds": 420,
+                        "required_secrets": [],
+                        "cos_mode": "skip",
+                        "notify_enabled": False,
+                        "timezone": "America/New_York",
+                    }
+                ]
+            },
+            {"rowcount": 1, "fetchone": {"generation": 11}},
+            {"fetchone": {"enabled": False, "paused_by_user": False}},
+            {"rowcount": 1},
+        ]
+    )
+    claimed_host_manual = await claim_next_queued_run(conn_claim_host, now_utc=now)
+    assert claimed_host_manual is not None
+    assert claimed_host_manual.runner == "host"
+    assert claimed_host_manual.trigger_source == "manual"
+    assert claimed_host_manual.is_trial is True
+    assert claimed_host_manual.host_mode == "run"
+
+    # 3c. Claim immediate host run (`enabled = True`, `trigger_source = 'manual'`) -> `is_trial = False`, `host_mode = 'mirror'`
+    conn_claim_host_imm, _ = _make_autospec_db(
+        [
+            {
+                "fetchone": {
+                    "slot_id": 1,
+                    "generation": 12,
+                    "slot_state": "idle",
+                    "active_run_id": None,
+                    "active_job_key": None,
+                }
+            },
+            {"fetchall": []},
+            {
+                "fetchall": [
+                    {
+                        "run_id": "manual-host-immediate-1",
+                        "job_key": T29_JOB_KEY,
+                        "trigger_source": "manual",
+                        "scheduled_slot_utc": now,
+                        "deadline_utc": now + timedelta(minutes=15),
+                        "low_mem_since_utc": None,
+                        "enabled": True,
+                        "paused_by_user": False,
+                        "runner": "host",
+                        "command_argv": ["bash", "scripts/bbg_remote_refresh.sh"],
+                        "workdir": "/Users/everflow/.openclaw/workspace",
+                        "timeout_seconds": 900,
+                        "no_output_timeout_seconds": 420,
+                        "required_secrets": [],
+                        "cos_mode": "skip",
+                        "notify_enabled": True,
+                        "timezone": "America/New_York",
+                    }
+                ]
+            },
+            {"rowcount": 1, "fetchone": {"generation": 13}},
+            {"fetchone": {"enabled": True, "paused_by_user": False}},
+            {"rowcount": 1},
+        ]
+    )
+    claimed_host_imm = await claim_next_queued_run(conn_claim_host_imm, now_utc=now)
+    assert claimed_host_imm is not None
+    assert claimed_host_imm.trigger_source == "manual"
+    assert claimed_host_imm.is_trial is False
+    assert claimed_host_imm.host_mode == "mirror"
+
+    path_map = build_path_map(
+        host_var_dir=tmp_path / "host_var",
+        backend_var_dir=tmp_path / "backend_var",
+    )
+    bbg_csv = path_map.backend_data_root / "temp" / "bbg_data_latest.csv"
+    bbg_xlsx = path_map.backend_data_root / "temp" / "bbg_data_remote.xlsx"
+    bbg_csv.parent.mkdir(parents=True, exist_ok=True)
+    bbg_csv.write_text("Date,SPX\n" + "\n".join(f"2026-01-{(i % 28) + 1:02d},5000" for i in range(260)) + "\n", encoding="utf-8")
+    bbg_xlsx.write_bytes(b"PK\x03\x04fake-xlsx-content")
+
+    host_bridge_double = create_autospec(DataTaskHostBridgeClient, instance=True)
+    host_bridge_double.run_host_task.return_value = HostRunOutcome(
+        ok=True,
+        status_code=200,
+        exit_code=0,
+        timed_out=False,
+        timeout_kind=None,
+        log_tail='{"ok": true, "lines": 260, "detail": {"counts": {"SPX": 260}, "last_dates": {"SPX": "2026-11-08"}}}\n',
+        failure_reason=None,
+    )
+    lock_conn_host, _ = _make_autospec_db([{"fetchone": (1,)} for _ in range(6)])
+    conn_exec_host, state_exec_host = _make_autospec_db(
+        [
+            {"rowcount": 1},  # start_claimed_host_run: UPDATE starting -> running
+            {"rowcount": 1},  # finalize_task_run: UPDATE runs -> succeeded (no consecutive_failures update for trial!)
+            {"rowcount": 1},  # finalize_task_run: UPDATE slot -> idle
+        ]
+    )
+    host_committed, host_cf = await execute_claimed_host_run(
+        conn_exec_host,
+        lock_conn=lock_conn_host,
+        host_client=host_bridge_double,
+        claimed=claimed_host_manual,
+        path_map=path_map,
+    )
+    assert host_committed is True
+    assert host_cf is None
+    assert host_bridge_double.run_host_task.await_args.kwargs["host_mode"] == "run"
+    assert not any("consecutive_failures" in sql for sql, _ in state_exec_host["executed"])
+
+    # 4. Finalize trial run (`is_trial = True`) vs immediate run (`is_trial = False`):
+    assert (
+        resolve_notify_status(
+            terminal_status="succeeded",
+            notify_enabled=True,
+            has_outbox_payload=True,
+            is_trial=True,
+        )
+        == "preview_only"
+    )
+    assert (
+        resolve_notify_status(
+            terminal_status="succeeded",
+            notify_enabled=True,
+            has_outbox_payload=False,
+            is_trial=True,
+        )
+        == "preview_only"
+    )
+    assert (
+        resolve_notify_status(
+            terminal_status="failed",
+            notify_enabled=True,
+            has_outbox_payload=True,
+            is_trial=True,
+        )
+        == "skipped"
+    )
+    assert (
+        resolve_notify_status(
+            terminal_status="succeeded",
+            notify_enabled=True,
+            has_outbox_payload=True,
+            is_trial=False,
+        )
+        == "pending_dispatch"
+    )
+
+    lock_conn, _ = _make_autospec_db([{"fetchone": (1,)}, {"fetchone": (1,)}])
+    conn_fin, state_fin = _make_autospec_db(
+        [
+            {"rowcount": 1},  # UPDATE dalton_data_task_runs
+            {"rowcount": 1},  # UPDATE dalton_data_task_slot SET slot_state = 'idle'
+        ]
+    )
+    outbox_data = {"feishu_message": "Manual trial preview payload"}
+    committed, cf = await finalize_task_run(
+        conn_fin,
+        lock_conn=lock_conn,
+        docker_client=None,
+        claimed=claimed,
+        container_id=None,
+        outcome=ContainerInspectionOutcome("cid-manual", 0, False, False, "done\n"),
+        evaluation=TaskEvaluationResult(ok=True, status="succeeded"),
+        outbox_payload=outbox_data,
+        path_map=path_map,
+    )
+    assert committed is True
+    assert cf is None
+    fin_params = state_fin["executed"][0][1]
+    assert fin_params["terminal_status"] == "succeeded"
+    assert fin_params["notify_status"] == "preview_only"
+    assert json.loads(fin_params["notify_preview"]) == outbox_data
+    assert not any("consecutive_failures" in sql for sql, _ in state_fin["executed"])
+    outbox_on_disk = path_map.backend_run_artifacts_dir("manual-disabled-2") / "outbox.json"
+    assert not outbox_on_disk.exists()
+
+    # Trial failure also does NOT increment consecutive_failures
+    lock_conn_fail, _ = _make_autospec_db([{"fetchone": (1,)}, {"fetchone": (1,)}])
+    conn_fin_fail, state_fin_fail = _make_autospec_db(
+        [
+            {"rowcount": 1},  # UPDATE dalton_data_task_runs
+            {"rowcount": 1},  # UPDATE dalton_data_task_slot SET slot_state = 'idle'
+        ]
+    )
+    committed_fail, cf_fail = await finalize_task_run(
+        conn_fin_fail,
+        lock_conn=lock_conn_fail,
+        docker_client=None,
+        claimed=claimed,
+        container_id=None,
+        outcome=ContainerInspectionOutcome("cid-manual-fail", 1, False, False, "err\n"),
+        evaluation=TaskEvaluationResult(ok=False, status="failed", failure_reason="non_zero_exit"),
+        outbox_payload=None,
+        path_map=path_map,
+    )
+    assert committed_fail is True
+    assert cf_fail is None
+    assert not any("consecutive_failures" in sql for sql, _ in state_fin_fail["executed"])
+
+    # Immediate run (`trigger_source == 'manual'` with `enabled == True`, so `is_trial == False`)
+    # sets `notify_status = 'pending_dispatch'` and updates `consecutive_failures`
+    lock_conn_imm, _ = _make_autospec_db([{"fetchone": (1,)}, {"fetchone": (1,)}])
+    conn_fin_imm, state_fin_imm = _make_autospec_db(
+        [
+            {"rowcount": 1},  # UPDATE dalton_data_task_runs
+            {"rowcount": 1, "fetchone": {"consecutive_failures": 0}},  # UPDATE dalton_data_task_defs
+            {"rowcount": 1},  # UPDATE dalton_data_task_slot SET slot_state = 'idle'
+        ]
+    )
+    committed_imm, cf_imm = await finalize_task_run(
+        conn_fin_imm,
+        lock_conn=lock_conn_imm,
+        docker_client=None,
+        claimed=claimed_host_imm,
+        container_id=None,
+        outcome=ContainerInspectionOutcome("host:manual-host-immediate-1", 0, False, False, "done\n"),
+        evaluation=TaskEvaluationResult(ok=True, status="succeeded"),
+        outbox_payload=outbox_data,
+        path_map=path_map,
+    )
+    assert committed_imm is True
+    assert cf_imm == 0
+    fin_imm_params = state_fin_imm["executed"][0][1]
+    assert fin_imm_params["notify_status"] == "pending_dispatch"
+    assert any("consecutive_failures = 0" in sql for sql, _ in state_fin_imm["executed"])
+
+    # Trial low-memory expiry (`enabled = False`) and takeover (`enabled = False`) do NOT increment consecutive_failures
+    conn_exp_man, state_exp_man = _make_autospec_db(
+        [
+            {
+                "fetchall": [
+                    {
+                        "run_id": "manual-low-mem-1",
+                        "job_key": T18_JOB_KEY,
+                        "trigger_source": "manual",
+                        "enabled": False,
+                    }
+                ]
+            },
+            {"rowcount": 1},  # UPDATE status = 'skipped_low_memory'
+        ]
+    )
+    expired_man = await expire_low_memory_runs(conn_exp_man, now_utc=now + timedelta(minutes=10))
+    assert expired_man == ["manual-low-mem-1"]
+    assert not any("consecutive_failures" in sql for sql, _ in state_exp_man["executed"])
+
+    lock_takeover, _ = _make_autospec_db([{"fetchone": (1,)} for _ in range(5)])
+    conn_takeover_man, state_takeover_man = _make_autospec_db(
+        [
+            {
+                "fetchone": {
+                    "slot_id": 1,
+                    "generation": 4,
+                    "slot_state": "running",
+                    "active_run_id": "manual-active-1",
+                    "active_job_key": T18_JOB_KEY,
+                }
+            },
+            {
+                "fetchone": {
+                    "run_id": "manual-active-1",
+                    "job_key": T18_JOB_KEY,
+                    "status": "running",
+                    "container_id": None,
+                    "runner": "container",
+                    "trigger_source": "manual",
+                    "enabled": False,
+                }
+            },
+            {"rowcount": 1},  # UPDATE status = 'aborted'
+            {"rowcount": 1},  # UPDATE slot_state = 'idle'
+        ]
+    )
+    takeover_res = await recover_on_takeover(
+        conn_takeover_man,
+        lock_conn=lock_takeover,
+        docker_client=None,
+        path_map=path_map,
+    )
+    assert takeover_res == "aborted"
+    assert not any("consecutive_failures" in sql for sql, _ in state_takeover_man["executed"])
+
+
+@pytest.mark.asyncio
+async def test_pr11_data_task_run_now_script_wait_and_no_wait(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Verify `scripts/dalton/data_task_run_now.py` Round 2 & Round 3 behavior:
+    - Always waits until `run_id` reaches `TERMINAL_RUN_STATUSES` (even without `--wait`);
+    - When scheduler lock is held by daemon (`try_scheduler_lock -> False`), polls until terminal;
+    - When lock is acquired but `claim_next_queued_run` returns `None` initially, releases lock and retries until claimed & terminal;
+    - When `deadline_utc + 10 minutes` is exceeded while still non-terminal, exits with non-zero code (1) and prints current status;
+    - When task is already enabled (`enabled = True`), rejects with `"任务已开启，请用对话里的立即运行"` and exits with non-zero code (1).
+    """
+    import scripts.dalton.data_task_run_now as run_now_mod
+    from src.dalton.data_jobs.scheduler import ClaimedTaskRun, ManualTaskRunConflictError
+
+    orig_enqueue = run_now_mod.enqueue_manual_task_run
+    orig_run_manual = run_now_mod.run_manual_task_now
+
+    now = datetime(2026, 11, 8, 13, 0, tzinfo=timezone.utc)
+    deadline = now + timedelta(minutes=5)
+    path_map = build_path_map(
+        host_var_dir=tmp_path / "host_var",
+        backend_var_dir=tmp_path / "backend_var",
+    )
+    docker_double = create_autospec(DataTaskDockerClient, instance=True)
+    host_double = create_autospec(DataTaskHostBridgeClient, instance=True)
+
+    # 1) Lock held by persistent daemon (`try_scheduler_lock -> False`): polls until terminal status
+    lock_conn_busy, _ = _make_autospec_db(
+        [
+            {"fetchone": (False,)},  # tick 1: lock busy
+            {"fetchone": (False,)},  # tick 2: lock busy
+        ]
+    )
+    conn_busy_poll, _ = _make_autospec_db(
+        [
+            {
+                "fetchone": {
+                    "run_id": "run-poll-1",
+                    "job_key": T18_JOB_KEY,
+                    "status": "running",
+                    "exit_code": None,
+                    "failure_reason": None,
+                    "log_tail": "",
+                    "notify_status": "skipped",
+                    "notify_preview": None,
+                    "scheduled_slot_utc": now,
+                    "deadline_utc": deadline,
+                }
+            },
+            {
+                "fetchone": {
+                    "run_id": "run-poll-1",
+                    "job_key": T18_JOB_KEY,
+                    "status": "succeeded",
+                    "exit_code": 0,
+                    "failure_reason": None,
+                    "log_tail": "polled daemon result",
+                    "notify_status": "preview_only",
+                    "notify_preview": {"feishu_message": "daemon preview"},
+                    "scheduled_slot_utc": now,
+                    "deadline_utc": deadline,
+                }
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        run_now_mod,
+        "enqueue_manual_task_run",
+        create_autospec(orig_enqueue, return_value="run-poll-1"),
+    )
+    res_polled = await run_now_mod.run_manual_task_now(
+        T18_JOB_KEY,
+        wait=False,  # Even with wait=False, always waits until terminal!
+        conn=conn_busy_poll,
+        lock_conn=lock_conn_busy,
+        docker_client=docker_double,
+        host_client=host_double,
+        path_map=path_map,
+        sync_manifest=False,
+        poll_interval_seconds=0.0,
+        now_fn=lambda: now,
+    )
+    assert res_polled["run_id"] == "run-poll-1"
+    assert res_polled["status"] == "succeeded"
+    assert res_polled["terminal"] is True
+    assert res_polled["timed_out_waiting"] is False
+
+    # 2) Lock acquired, first claim returns None (e.g. memory admission), releases lock, retries and claims on 2nd attempt
+    claimed_manual = ClaimedTaskRun(
+        run_id="run-retry-2",
+        job_key=T18_JOB_KEY,
+        generation=3,
+        runner="container",
+        command_argv=["python3", "s.py"],
+        workdir="/Users/everflow/.openclaw/workspace",
+        timeout_seconds=300,
+        no_output_timeout_seconds=120,
+        required_secrets=[],
+        cos_mode="skip",
+        notify_enabled=True,
+        scheduled_slot_utc=now,
+        deadline_utc=deadline,
+        timezone="America/New_York",
+        trigger_source="manual",
+        is_trial=True,
+    )
+    lock_conn_retry, lock_state_retry = _make_autospec_db(
+        [
+            # Attempt 1: acquire -> check -> check -> release
+            {"fetchone": (True,)},
+            {"fetchone": (1,)},
+            {"fetchone": (1,)},
+            {"fetchone": (True,)},
+            # Attempt 2: acquire -> check -> check -> release
+            {"fetchone": (True,)},
+            {"fetchone": (1,)},
+            {"fetchone": (1,)},
+            {"fetchone": (True,)},
+        ]
+    )
+    conn_retry, _ = _make_autospec_db(
+        [
+            # Attempt 1: slot check -> idle; fetch state -> still queued
+            {"fetchone": {"slot_state": "idle"}},
+            {
+                "fetchone": {
+                    "run_id": "run-retry-2",
+                    "job_key": T18_JOB_KEY,
+                    "status": "queued",
+                    "exit_code": None,
+                    "failure_reason": None,
+                    "log_tail": None,
+                    "notify_status": "skipped",
+                    "notify_preview": None,
+                    "scheduled_slot_utc": now,
+                    "deadline_utc": deadline,
+                }
+            },
+            # Attempt 2: slot check -> idle; fetch state after execute -> succeeded
+            {"fetchone": {"slot_state": "idle"}},
+            {
+                "fetchone": {
+                    "run_id": "run-retry-2",
+                    "job_key": T18_JOB_KEY,
+                    "status": "succeeded",
+                    "exit_code": 0,
+                    "failure_reason": None,
+                    "log_tail": "T18 output summary line",
+                    "notify_status": "preview_only",
+                    "notify_preview": {"feishu_message": "T18 preview"},
+                    "scheduled_slot_utc": now,
+                    "deadline_utc": deadline,
+                }
+            },
+        ]
+    )
+    claim_double = create_autospec(
+        run_now_mod.claim_next_queued_run,
+        side_effect=[None, claimed_manual],
+    )
+    exec_container_double = create_autospec(
+        run_now_mod.execute_claimed_container_run, return_value=(True, None)
+    )
+    monkeypatch.setattr(
+        run_now_mod,
+        "enqueue_manual_task_run",
+        create_autospec(orig_enqueue, return_value="run-retry-2"),
+    )
+    monkeypatch.setattr(run_now_mod, "claim_next_queued_run", claim_double)
+    monkeypatch.setattr(run_now_mod, "execute_claimed_container_run", exec_container_double)
+
+    res_wait = await run_now_mod.run_manual_task_now(
+        "T18",
+        conn=conn_retry,
+        lock_conn=lock_conn_retry,
+        docker_client=docker_double,
+        host_client=host_double,
+        path_map=path_map,
+        sync_manifest=False,
+        poll_interval_seconds=0.0,
+        now_fn=lambda: now,
+    )
+    assert res_wait["run_id"] == "run-retry-2"
+    assert res_wait["status"] == "succeeded"
+    assert res_wait["exit_code"] == 0
+    assert res_wait["notify_status"] == "preview_only"
+    assert res_wait["notify_preview"] == {"feishu_message": "T18 preview"}
+    assert res_wait["stdout_summary"] == "T18 output summary line"
+    assert res_wait["freeze_dir"].endswith(
+        f".dalton-freeze/{T18_JOB_KEY}/2026-11-08T13:00:00Z"
+    )
+    assert claim_double.await_count == 2
+    for call in claim_double.await_args_list:
+        assert call.kwargs.get("only_run_id") == "run-retry-2"
+    exec_container_double.assert_awaited_once()
+    assert any("pg_advisory_unlock" in sql for sql, _ in lock_state_retry["executed"])
+
+    # 3) Exceeding wait deadline (`deadline_utc + 10 minutes`) while non-terminal -> returns timed_out_waiting=True and CLI exits 1
+    lock_conn_timeout, _ = _make_autospec_db([{"fetchone": (False,)}])
+    conn_timeout, _ = _make_autospec_db(
+        [
+            {
+                "fetchone": {
+                    "run_id": "run-timeout-3",
+                    "job_key": T18_JOB_KEY,
+                    "status": "queued",
+                    "exit_code": None,
+                    "failure_reason": None,
+                    "log_tail": "",
+                    "notify_status": "skipped",
+                    "notify_preview": None,
+                    "scheduled_slot_utc": now,
+                    "deadline_utc": deadline,
+                }
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        run_now_mod,
+        "enqueue_manual_task_run",
+        create_autospec(orig_enqueue, return_value="run-timeout-3"),
+    )
+    past_wait_limit = deadline + timedelta(minutes=10, seconds=1)
+    res_timeout = await run_now_mod.run_manual_task_now(
+        "T18",
+        conn=conn_timeout,
+        lock_conn=lock_conn_timeout,
+        docker_client=docker_double,
+        host_client=host_double,
+        path_map=path_map,
+        sync_manifest=False,
+        poll_interval_seconds=0.0,
+        now_fn=lambda: past_wait_limit,
+    )
+    assert res_timeout["timed_out_waiting"] is True
+    assert res_timeout["terminal"] is False
+    assert res_timeout["status"] == "queued"
+
+    # 4) CLI async_main() exit codes:
+    # - succeeded (even without --wait) -> 0
+    monkeypatch.setattr(
+        run_now_mod,
+        "run_manual_task_now",
+        create_autospec(orig_run_manual, return_value=res_wait),
+    )
+    assert await run_now_mod.async_main(["--job-key", "T18"]) == 0
+    ok_out = capsys.readouterr()
+    assert "status: succeeded" in ok_out.out
+    assert "exit_code: 0" in ok_out.out
+    assert "notify_preview:" in ok_out.out
+    assert "freeze_dir:" in ok_out.out
+
+    # - timed_out_waiting -> non-zero exit (1) and prints current status
+    monkeypatch.setattr(
+        run_now_mod,
+        "run_manual_task_now",
+        create_autospec(orig_run_manual, return_value=res_timeout),
+    )
+    assert await run_now_mod.async_main(["--job-key", "T18"]) == 1
+    timeout_io = capsys.readouterr()
+    assert "status: queued" in timeout_io.out
+    assert "超时" in timeout_io.err
+
+    # - enabled task (`enabled = True`) -> non-zero exit (1) and prints "任务已开启，请用对话里的立即运行"
+    monkeypatch.setattr(
+        run_now_mod,
+        "run_manual_task_now",
+        create_autospec(
+            orig_run_manual,
+            side_effect=ManualTaskRunConflictError(
+                f"任务已开启，请用对话里的立即运行 (job_key={T18_JOB_KEY})"
+            ),
+        ),
+    )
+    assert await run_now_mod.async_main(["--job-key", "T18"]) == 1
+    enabled_io = capsys.readouterr()
+    assert "任务已开启，请用对话里的立即运行" in enabled_io.err
+
+
+def test_pr11_seed_openclaw_data_script_dry_run_and_apply_exclusions(
+    tmp_path: Path,
+) -> None:
+    """Verify `scripts/dalton/seed_openclaw_data.sh` with temporary directories:
+    - Default (`--dry-run`) prints total size and does not write to target;
+    - `--apply` syncs ONLY paths listed in Design §6.2 table (14 scripts, 9 skills, listed data paths,
+      and `state/cron-command/{us-topbottom-dm-v23,softbank-nav-monitor,tsmc-adr-premium}/last-run.json`);
+    - Does NOT sync unlisted directories/files (`memory/`, `media/`, `wiki/`, `backups/`, `markx/`,
+      unlisted scripts, or unlisted skills);
+    - Excludes `venv/`, `.venv/`, `cos-venv/`, `pending.json`, `*inflight*`, `.git/`, and `.dalton-freeze/`,
+      and creates the `state/sentiment-dashboard/cos-venv/bin/python -> /app/.venv/bin/python` symlink.
+    """
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parents[3]
+    script_path = repo_root / "scripts" / "dalton" / "seed_openclaw_data.sh"
+
+    src_dir = tmp_path / "fake_openclaw_workspace"
+    dst_dir = tmp_path / "fake_dalton_data"
+    src_dir.mkdir(parents=True)
+
+    # Wanted listed files from §6.2
+    (src_dir / "scripts").mkdir(parents=True)
+    (src_dir / "scripts" / "megacap_relative_signal_monitor.py").write_text(
+        "print('ok')\n", encoding="utf-8"
+    )
+    (src_dir / "skills" / "ah-premium-monitor" / "scripts").mkdir(parents=True)
+    (src_dir / "skills" / "ah-premium-monitor" / "scripts" / "ah_premium_monitor_cli.py").write_text(
+        "print('ah')\n", encoding="utf-8"
+    )
+    (src_dir / "skills" / "ah-premium-monitor" / "venv").mkdir(parents=True)
+    (src_dir / "skills" / "ah-premium-monitor" / "venv" / "ignored.py").write_text(
+        "ignored\n", encoding="utf-8"
+    )
+    (src_dir / "state" / "cn-leverage").mkdir(parents=True)
+    (src_dir / "state" / "cn-leverage" / "pipeline_status.json").write_text(
+        '{"ok": true}\n', encoding="utf-8"
+    )
+    (src_dir / "state" / "cn-leverage" / "margin_core.csv").write_text(
+        "date,val\n2026-11-08,1\n", encoding="utf-8"
+    )
+    (src_dir / "research-outputs" / "sentiment-dashboard").mkdir(parents=True)
+    (src_dir / "research-outputs" / "sentiment-dashboard" / "signals.json").write_text(
+        '{"date": "2026-11-08"}\n', encoding="utf-8"
+    )
+    (src_dir / "state" / "cron-command" / "softbank-nav-monitor").mkdir(parents=True)
+    (src_dir / "state" / "cron-command" / "softbank-nav-monitor" / "last-run.json").write_text(
+        '{"next": 1}\n', encoding="utf-8"
+    )
+    (src_dir / "state" / "cron-command" / "softbank-nav-monitor" / "pending.json").write_text(
+        '{"inflight": 0}\n', encoding="utf-8"
+    )
+    (src_dir / "state" / "cron-command" / "softbank-nav-monitor" / "receipts").mkdir(parents=True)
+    (src_dir / "state" / "cron-command" / "softbank-nav-monitor" / "receipts" / "r1.json").write_text(
+        "{}\n", encoding="utf-8"
+    )
+
+    # Unlisted directories and files that must NOT be synced
+    for unlisted_dir in ("memory", "media", "wiki", "backups", "markx"):
+        d = src_dir / unlisted_dir
+        d.mkdir(parents=True)
+        (d / "secret.txt").write_text("do_not_sync", encoding="utf-8")
+    (src_dir / "scripts" / "e_watch_monitor.py").write_text("unlisted_script", encoding="utf-8")
+    (src_dir / "skills" / "quantum-ew-bottom-monitor").mkdir(parents=True)
+    (src_dir / "skills" / "quantum-ew-bottom-monitor" / "unused.txt").write_text(
+        "unlisted_skill", encoding="utf-8"
+    )
+
+    # 1. Default mode (dry-run) must NOT create or populate dst_dir and must print total size
+    dry_res = subprocess.run(
+        ["bash", str(script_path), "--source", str(src_dir), "--target", str(dst_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert dry_res.returncode == 0, dry_res.stderr
+    assert "Mode: DRY-RUN" in dry_res.stdout
+    assert "DRY-RUN total size" in dry_res.stdout
+    assert not dst_dir.exists()
+
+    # Pre-populate dst_dir with an existing file to verify incremental sync preserves extra target files
+    (dst_dir / "existing_only_in_target").mkdir(parents=True)
+    extra_target_file = dst_dir / "existing_only_in_target" / "keep_me.txt"
+    extra_target_file.write_text("preserved", encoding="utf-8")
+
+    # 2. --apply mode syncs ONLY allowed manifest paths, excludes forbidden paths, and creates symlink
+    apply_res = subprocess.run(
+        [
+            "bash",
+            str(script_path),
+            "--apply",
+            "--source",
+            str(src_dir),
+            "--target",
+            str(dst_dir),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert apply_res.returncode == 0, apply_res.stderr
+    assert (dst_dir / "scripts" / "megacap_relative_signal_monitor.py").is_file()
+    assert (
+        dst_dir / "skills" / "ah-premium-monitor" / "scripts" / "ah_premium_monitor_cli.py"
+    ).is_file()
+    assert (dst_dir / "state" / "cn-leverage" / "pipeline_status.json").is_file()
+    assert (dst_dir / "state" / "cn-leverage" / "margin_core.csv").is_file()
+    assert (dst_dir / "research-outputs" / "sentiment-dashboard" / "signals.json").is_file()
+    assert (
+        dst_dir / "state" / "cron-command" / "softbank-nav-monitor" / "last-run.json"
+    ).is_file()
+    assert extra_target_file.read_text(encoding="utf-8") == "preserved"
+
+    # Excluded & unlisted items must NOT exist in dst_dir
+    assert not (dst_dir / "skills" / "ah-premium-monitor" / "venv").exists()
+    assert not (
+        dst_dir / "state" / "cron-command" / "softbank-nav-monitor" / "pending.json"
+    ).exists()
+    assert not (
+        dst_dir / "state" / "cron-command" / "softbank-nav-monitor" / "receipts"
+    ).exists()
+    for unlisted_name in ("memory", "media", "wiki", "backups", "markx"):
+        assert not (dst_dir / unlisted_name).exists()
+    assert not (dst_dir / "scripts" / "e_watch_monitor.py").exists()
+    assert not (dst_dir / "skills" / "quantum-ew-bottom-monitor").exists()
+
+    # Symlink state/sentiment-dashboard/cos-venv/bin/python -> /app/.venv/bin/python must exist
+    symlink_path = (
+        dst_dir / "state" / "sentiment-dashboard" / "cos-venv" / "bin" / "python"
+    )
+    assert symlink_path.is_symlink()
+    assert os.readlink(symlink_path) == "/app/.venv/bin/python"
+
 

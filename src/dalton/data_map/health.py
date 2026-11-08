@@ -560,12 +560,14 @@ async def check_data_task_runs_health(
                 f.created_at
             FROM dalton_data_task_runs f
             WHERE f.job_key = d.job_key
+              AND f.trigger_source = 'cron'
               AND f.status IN ('failed', 'timed_out', 'aborted', 'skipped_low_memory')
               AND COALESCE(f.completed_at, f.started_at, f.created_at) >= %s
               AND NOT EXISTS (
                   SELECT 1
                   FROM dalton_data_task_runs s
                   WHERE s.job_key = d.job_key
+                    AND s.trigger_source = 'cron'
                     AND s.status = 'succeeded'
                     AND COALESCE(s.completed_at, s.started_at, s.created_at)
                         > COALESCE(f.completed_at, f.started_at, f.created_at)
