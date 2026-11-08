@@ -159,6 +159,7 @@ src/dalton/data_jobs/manifest.yaml
 src/dalton/data_jobs/manifest.py
 src/dalton/data_jobs/scheduler.py
 src/dalton/data_jobs/container_runner.py
+src/dalton/data_jobs/host_runner.py
 src/dalton/data_jobs/runner_wrapper.py
 src/dalton/data_jobs/evaluators.py
 tests/unit/dalton/fixtures/oc1_task_baseline.md

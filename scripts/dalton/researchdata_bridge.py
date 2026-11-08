@@ -41,6 +41,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zipfile
 from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -1445,6 +1446,15 @@ class BridgeConfig:
         self.feishu_default_grant_chat_id: str = os.environ.get(
             "FEISHU_DEFAULT_GRANT_CHAT_ID", FEISHU_DEFAULT_GRANT_CHAT_ID
         ).strip()
+        # DALTON-HOOK(data-jobs): host data task runner root & settings (§2.3 item 3)
+        # Resolved once here: host-run writes this path into child command lines
+        # and kill/scan match on it, so both sides must see the same string even
+        # if a segment of var/dalton/openclaw-data is a symlink.
+        self.data_tasks_data_root: Path = (
+            Path(__file__).resolve().parents[2] / "var/dalton/openclaw-data"
+        ).resolve()
+        self.host_task_sigterm_grace_s: float = 5.0
+        self.host_task_mirror_poll_interval_s: float = 15.0
         self.test_mode: bool = os.environ.get("DALTON_BRIDGE_TEST_MODE", "0").strip().lower() in (
             "1",
             "true",
@@ -6171,6 +6181,16 @@ class ResearchDataBridge:
         self._archive_watch_task: asyncio.Task[Any] | None = None
         self._archive_last_status: dict[str, Any] = {}
         self._last_ae_fanout_limit_clamped: list[int] | None = None
+        # DALTON-HOOK(data-jobs): host data-task runner state & lock (§2.3 item 3)
+        self._host_runner_lock = asyncio.Lock()
+        self._host_max_seen_generation: int = 0
+        self._host_active_runs: dict[int, dict[str, Any]] = {}
+        self._host_running_procs: dict[int, Any] = {}
+        self._host_killed_pgids: set[int] = set()
+        self._host_fence_lost: bool = False
+        self._host_ps_list_fn: Any = None
+        self._host_task_command_override: list[str] | None = None
+        self._host_abort_before_gate_release: bool = False
         if not getattr(cfg, "admin_token", ""):
             logger.warning(
                 "DALTON_BRIDGE_ADMIN_TOKEN is not set (checked env and ~/.config/dalton/researchdata-bridge.env); "
@@ -14549,6 +14569,704 @@ class ResearchDataBridge:
         """Handle ``POST /transcriptions/{id}/cancel``."""
         return await self._asr_job_manager().cancel_job(job_id, body)
 
+    # ------------------------------------------------------------------
+    # DALTON-HOOK(data-jobs): Host data task runner (T1 / T29, §2.3 item 3)
+    # ------------------------------------------------------------------
+
+    def _get_ps_list_fn(self) -> Any:
+        """Return configured process-table reader (`_list_host_processes_ps` unless injected in tests)."""
+        return self._host_ps_list_fn or _list_host_processes_ps
+
+    def _host_runner_state_file(self) -> Path:
+        """Return `<data_root>/.dalton-host-runner-state.json`."""
+        return Path(self.cfg.data_tasks_data_root).resolve() / HOST_TASK_STATE_FILENAME
+
+    def _host_runner_fence_lost_file(self) -> Path:
+        """Return `<data_root>/.dalton-host-runner-fence-lost`."""
+        return Path(self.cfg.data_tasks_data_root).resolve() / HOST_TASK_FENCE_LOST_FILENAME
+
+    def _has_fence_lost_marker_file_sync(self) -> bool:
+        """Return True when `<data_root>/.dalton-host-runner-fence-lost` exists."""
+        return self._host_runner_fence_lost_file().exists()
+
+    def _write_fence_lost_marker_file_sync(self, *, reason: str = "corrupt_state_file") -> None:
+        """Atomically create `<data_root>/.dalton-host-runner-fence-lost` with mode `0600`, recording timestamp and reason."""
+        marker_file = self._host_runner_fence_lost_file()
+        marker_file.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "reason": str(reason),
+        }
+        encoded = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        tmp_path = marker_file.with_name(
+            f".{marker_file.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+        )
+        fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
+            os.write(fd, encoded)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, marker_file)
+        os.chmod(marker_file, 0o600)
+
+    def _remove_fence_lost_marker_file_sync(self) -> None:
+        """Remove `<data_root>/.dalton-host-runner-fence-lost` if present."""
+        marker_file = self._host_runner_fence_lost_file()
+        try:
+            marker_file.unlink()
+        except FileNotFoundError:
+            pass
+
+    def _write_host_runner_state_file_sync(
+        self,
+        *,
+        max_seen_generation: int | None = None,
+        active_runs: dict[int, dict[str, Any]] | None = None,
+        fence_lost: bool | None = None,
+    ) -> None:
+        """Atomically persist `fence_lost`, `max_seen_generation`, and active process groups (`pgid` + leader `lstart`) with mode `0600`."""
+        if fence_lost is not None:
+            self._host_fence_lost = bool(fence_lost)
+        if max_seen_generation is not None:
+            self._host_max_seen_generation = int(max_seen_generation)
+        if active_runs is not None:
+            self._host_active_runs = {int(k): dict(v) for k, v in active_runs.items()}
+        state_file = self._host_runner_state_file()
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "fence_lost": bool(self._host_fence_lost),
+            "max_seen_generation": 0 if self._host_fence_lost else int(self._host_max_seen_generation),
+            "pgids": sorted(int(k) for k in self._host_active_runs.keys()),
+            "active_runs": [
+                dict(self._host_active_runs[k]) for k in sorted(self._host_active_runs.keys())
+            ],
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        encoded = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+        tmp_path = state_file.with_name(
+            f".{state_file.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+        )
+        fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            try:
+                os.fchmod(fd, 0o600)
+            except OSError:
+                pass
+            os.write(fd, encoded)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, state_file)
+        os.chmod(state_file, 0o600)
+
+    def _read_host_runner_state_file_sync(
+        self,
+    ) -> tuple[int, dict[int, dict[str, Any]], bool, bool]:
+        """Read and validate `.dalton-host-runner-state.json`.
+
+        Returns `(max_seen_generation, active_runs_by_pgid, is_corrupt, fence_lost)`.
+        When the file does not exist, returns `(0, {}, False, False)`.
+        When JSON parsing fails or any field has an invalid type/missing leader `lstart`,
+        returns `(0, {}, True, False)`.
+        """
+        state_file = self._host_runner_state_file()
+        if not state_file.exists():
+            return 0, {}, False, False
+        if not state_file.is_file():
+            return 0, {}, True, False
+        try:
+            raw = json.loads(state_file.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Host runner state file is corrupt (invalid JSON): %s", type(exc).__name__)
+            return 0, {}, True, False
+        if not isinstance(raw, dict):
+            logger.warning("Host runner state file is corrupt (root is not object)")
+            return 0, {}, True, False
+        raw_fence_lost = raw.get("fence_lost", False)
+        if not isinstance(raw_fence_lost, bool):
+            logger.warning("Host runner state file is corrupt (invalid fence_lost)")
+            return 0, {}, True, False
+        if "max_seen_generation" not in raw:
+            logger.warning("Host runner state file is corrupt (missing max_seen_generation)")
+            return 0, {}, True, False
+        raw_gen = raw.get("max_seen_generation")
+        if isinstance(raw_gen, bool) or not isinstance(raw_gen, int) or raw_gen < 0:
+            logger.warning("Host runner state file is corrupt (invalid max_seen_generation)")
+            return 0, {}, True, False
+
+        if "active_runs" not in raw and "pgids" not in raw:
+            logger.warning("Host runner state file is corrupt (missing active_runs/pgids)")
+            return 0, {}, True, False
+
+        allow_null_lstart = bool(raw_fence_lost) or self._has_fence_lost_marker_file_sync()
+        active: dict[int, dict[str, Any]] = {}
+        if "active_runs" in raw:
+            raw_runs = raw.get("active_runs")
+            if not isinstance(raw_runs, list):
+                logger.warning("Host runner state file is corrupt (active_runs is not list)")
+                return 0, {}, True, False
+            for item in raw_runs:
+                if not isinstance(item, dict):
+                    logger.warning("Host runner state file is corrupt (active_runs entry is not dict)")
+                    return 0, {}, True, False
+                pgid_val = item.get("pgid")
+                lstart_val = item.get("lstart")
+                if isinstance(pgid_val, bool) or not isinstance(pgid_val, int) or pgid_val <= 0:
+                    logger.warning("Host runner state file is corrupt (invalid pgid in active_runs)")
+                    return 0, {}, True, False
+                if allow_null_lstart and lstart_val is None:
+                    norm_lstart: str | None = None
+                elif isinstance(lstart_val, str) and _normalize_lstart(lstart_val):
+                    norm_lstart = _normalize_lstart(lstart_val)
+                else:
+                    logger.warning("Host runner state file is corrupt (missing/invalid lstart in active_runs)")
+                    return 0, {}, True, False
+                entry_copy = dict(item)
+                entry_copy["pgid"] = int(pgid_val)
+                entry_copy["lstart"] = norm_lstart
+                active[int(pgid_val)] = entry_copy
+
+        if "pgids" in raw:
+            raw_pgids = raw.get("pgids")
+            if not isinstance(raw_pgids, list):
+                logger.warning("Host runner state file is corrupt (pgids is not list)")
+                return 0, {}, True, False
+            for p in raw_pgids:
+                if isinstance(p, bool) or not isinstance(p, int) or p <= 0:
+                    logger.warning("Host runner state file is corrupt (invalid entry in pgids)")
+                    return 0, {}, True, False
+                if int(p) not in active:
+                    logger.warning("Host runner state file is corrupt (pgid %s missing active_runs lstart)", p)
+                    return 0, {}, True, False
+
+        return int(raw_gen), active, False, bool(raw_fence_lost)
+
+    def _enter_fence_lost_on_corrupt_state_sync(self) -> tuple[list[int], list[int], bool]:
+        """Atomically create `.dalton-host-runner-fence-lost` (0600) first; only on success archive corrupt state file, write new state file, and scan/stop Dalton task groups."""
+        self._host_fence_lost = True
+        self._host_max_seen_generation = 0
+        try:
+            self._write_fence_lost_marker_file_sync(reason="corrupt_state_file")
+        except Exception as exc:
+            logger.error(
+                "Failed writing host runner fence_lost marker file %s: %s",
+                self._host_runner_fence_lost_file(),
+                type(exc).__name__,
+            )
+            return [], sorted(self._host_active_runs.keys()), False
+
+        state_file = self._host_runner_state_file()
+        if state_file.exists():
+            utc_tag = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            archive_path = state_file.with_name(f"{state_file.name}.corrupt-{utc_tag}")
+            suffix = 1
+            while archive_path.exists():
+                archive_path = state_file.with_name(f"{state_file.name}.corrupt-{utc_tag}-{suffix}")
+                suffix += 1
+            try:
+                os.replace(state_file, archive_path)
+                logger.warning("Archived corrupt host runner state file to %s", archive_path)
+            except OSError as exc:
+                logger.warning("Failed archiving corrupt host runner state file: %s", type(exc).__name__)
+
+        try:
+            self._write_host_runner_state_file_sync()
+        except Exception as exc:
+            logger.warning("Failed writing initial fence_lost state file: %s", type(exc).__name__)
+
+        data_root = Path(self.cfg.data_tasks_data_root).resolve()
+        stopped, remaining, remaining_active, scan_confirmed = _scan_and_stop_fence_lost_pgids_sync(
+            data_root,
+            active_runs=self._host_active_runs,
+            sigterm_grace_s=self.cfg.host_task_sigterm_grace_s,
+            ps_list_fn=self._get_ps_list_fn(),
+        )
+        self._host_active_runs = remaining_active
+        for pgid in stopped:
+            self._host_running_procs.pop(pgid, None)
+        try:
+            self._write_host_runner_state_file_sync()
+        except Exception as exc:
+            logger.warning("Failed persisting fence_lost state file: %s", type(exc).__name__)
+        return stopped, remaining, scan_confirmed
+
+    def recover_host_runner_state_sync(self) -> dict[str, Any]:
+        """Synchronously check `.dalton-host-runner-fence-lost` and state file, restore `max_seen_generation`, and stop/verify recorded `pgid`s."""
+        marker_exists = self._has_fence_lost_marker_file_sync()
+        loaded_gen, loaded_active, is_corrupt, _file_fence_lost = self._read_host_runner_state_file_sync()
+        if is_corrupt:
+            stopped_corrupt, remaining_corrupt, _ = self._enter_fence_lost_on_corrupt_state_sync()
+            return {
+                "max_seen_generation": 0,
+                "stopped_pgids": stopped_corrupt,
+                "remaining_pgids": remaining_corrupt,
+                "confirmed": False,
+                "fence_lost": True,
+            }
+
+        if marker_exists or self._host_fence_lost:
+            self._host_fence_lost = True
+            self._host_max_seen_generation = 0
+            for pgid, info in loaded_active.items():
+                self._host_active_runs.setdefault(pgid, info)
+            data_root = Path(self.cfg.data_tasks_data_root).resolve()
+            stopped_fl, remaining_fl, remaining_active_fl, _ = _scan_and_stop_fence_lost_pgids_sync(
+                data_root,
+                active_runs=self._host_active_runs,
+                sigterm_grace_s=self.cfg.host_task_sigterm_grace_s,
+                ps_list_fn=self._get_ps_list_fn(),
+            )
+            self._host_active_runs = remaining_active_fl
+            for pgid in stopped_fl:
+                self._host_running_procs.pop(pgid, None)
+            if marker_exists:
+                try:
+                    self._write_host_runner_state_file_sync()
+                except Exception as exc:
+                    logger.warning("Failed writing fence_lost state on startup recovery: %s", type(exc).__name__)
+            return {
+                "max_seen_generation": 0,
+                "stopped_pgids": stopped_fl,
+                "remaining_pgids": remaining_fl,
+                "confirmed": False,
+                "fence_lost": True,
+            }
+
+        if loaded_gen > self._host_max_seen_generation:
+            self._host_max_seen_generation = loaded_gen
+        for pgid, info in loaded_active.items():
+            self._host_active_runs.setdefault(pgid, info)
+
+        stopped_pgids: list[int] = []
+        remaining_pgids: list[int] = []
+        if self._host_active_runs:
+            stopped_pgids, remaining_pgids = _stop_and_verify_host_pgids_sync(
+                self._host_active_runs,
+                data_root=Path(self.cfg.data_tasks_data_root).resolve(),
+                sigterm_grace_s=self.cfg.host_task_sigterm_grace_s,
+                ps_list_fn=self._get_ps_list_fn(),
+            )
+            for pgid in stopped_pgids:
+                self._host_active_runs.pop(pgid, None)
+                self._host_running_procs.pop(pgid, None)
+
+        if (
+            self._host_runner_state_file().is_file()
+            or self._host_max_seen_generation > 0
+            or self._host_active_runs
+        ):
+            try:
+                self._write_host_runner_state_file_sync()
+            except Exception as exc:
+                logger.warning("Failed writing host runner state on startup recovery: %s", type(exc).__name__)
+
+        return {
+            "max_seen_generation": self._host_max_seen_generation,
+            "stopped_pgids": stopped_pgids,
+            "remaining_pgids": remaining_pgids,
+            "confirmed": len(remaining_pgids) == 0 and not self._host_fence_lost,
+            "fence_lost": self._host_fence_lost,
+        }
+
+    async def recover_host_runner_state_on_startup(self) -> dict[str, Any]:
+        """Restore `max_seen_generation` and stop/verify recorded host task process groups before serving."""
+        async with self._host_runner_lock:
+            return await asyncio.to_thread(self.recover_host_runner_state_sync)
+
+    async def handle_data_task_host_kill(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Handle `POST /internal/data-tasks/host-kill` (§2.3 item 3).
+
+        Raises `max_seen_generation` monotonically, stops all recorded data-task process
+        groups on the bridge (`SIGTERM` -> 5s -> `SIGKILL`), and only removes records /
+        confirms once all target process groups are verified exited via `ps -ww -x -o pid=,pgid=,lstart=,command=`.
+        """
+        raw_gen = body.get("generation")
+        if raw_gen is not None and (isinstance(raw_gen, bool) or not isinstance(raw_gen, int) or raw_gen < 0):
+            return 400, {"ok": False, "confirmed": False, "error": "generation must be a non-negative integer"}
+
+        async with self._host_runner_lock:
+            marker_exists = await asyncio.to_thread(self._has_fence_lost_marker_file_sync)
+            loaded_gen, loaded_active, is_corrupt, _file_fence_lost = await asyncio.to_thread(
+                self._read_host_runner_state_file_sync
+            )
+            corrupt_stopped: list[int] = []
+            corrupt_remaining: list[int] = []
+            corrupt_scan_confirmed = True
+            if is_corrupt:
+                corrupt_stopped, corrupt_remaining, corrupt_scan_confirmed = await asyncio.to_thread(
+                    self._enter_fence_lost_on_corrupt_state_sync
+                )
+            else:
+                if marker_exists:
+                    self._host_fence_lost = True
+                    self._host_max_seen_generation = 0
+                elif not self._host_fence_lost and loaded_gen > self._host_max_seen_generation:
+                    self._host_max_seen_generation = loaded_gen
+                for pgid, info in loaded_active.items():
+                    self._host_active_runs.setdefault(pgid, info)
+
+            if self._host_fence_lost and (
+                raw_gen is None or isinstance(raw_gen, bool) or not isinstance(raw_gen, int) or raw_gen < 1
+            ):
+                return 400, {
+                    "ok": False,
+                    "confirmed": False,
+                    "error": "generation must be a positive integer when recovering from fence_lost",
+                }
+
+            # Mark all active pgids as killed by host-kill and close any open stdin pipes.
+            for pgid, proc in list(self._host_running_procs.items()):
+                self._host_killed_pgids.add(pgid)
+                stdin_pipe = getattr(proc, "stdin", None)
+                if stdin_pipe is not None:
+                    try:
+                        stdin_pipe.close()
+                    except Exception:
+                        pass
+
+            if self._host_fence_lost:
+                if is_corrupt:
+                    stopped_pgids = corrupt_stopped
+                    remaining_pgids = corrupt_remaining
+                    scan_confirmed = corrupt_scan_confirmed
+                else:
+                    stopped_pgids, remaining_pgids, remaining_active, scan_confirmed = await asyncio.to_thread(
+                        _scan_and_stop_fence_lost_pgids_sync,
+                        Path(self.cfg.data_tasks_data_root).resolve(),
+                        active_runs=self._host_active_runs,
+                        sigterm_grace_s=self.cfg.host_task_sigterm_grace_s,
+                        ps_list_fn=self._get_ps_list_fn(),
+                    )
+                    self._host_active_runs = remaining_active
+                    for pgid in stopped_pgids:
+                        self._host_running_procs.pop(pgid, None)
+
+                confirmed = len(remaining_pgids) == 0 and scan_confirmed
+                if confirmed:
+                    self._host_fence_lost = False
+                    self._host_max_seen_generation = int(raw_gen)
+                    await asyncio.to_thread(self._write_host_runner_state_file_sync)
+                    await asyncio.to_thread(self._remove_fence_lost_marker_file_sync)
+                else:
+                    self._host_fence_lost = True
+                    self._host_max_seen_generation = 0
+                    if await asyncio.to_thread(self._has_fence_lost_marker_file_sync):
+                        await asyncio.to_thread(self._write_host_runner_state_file_sync)
+            else:
+                if isinstance(raw_gen, int) and raw_gen > self._host_max_seen_generation:
+                    self._host_max_seen_generation = raw_gen
+                await asyncio.to_thread(self._write_host_runner_state_file_sync)
+                stopped_pgids, remaining_pgids = await asyncio.to_thread(
+                    _stop_and_verify_host_pgids_sync,
+                    self._host_active_runs,
+                    data_root=Path(self.cfg.data_tasks_data_root).resolve(),
+                    sigterm_grace_s=self.cfg.host_task_sigterm_grace_s,
+                    ps_list_fn=self._get_ps_list_fn(),
+                )
+                for pgid in stopped_pgids:
+                    self._host_active_runs.pop(pgid, None)
+                    self._host_running_procs.pop(pgid, None)
+                confirmed = len(remaining_pgids) == 0
+                await asyncio.to_thread(self._write_host_runner_state_file_sync)
+
+            return 200, {
+                "ok": confirmed,
+                "confirmed": confirmed,
+                "max_seen_generation": self._host_max_seen_generation,
+                "stopped_pgids": stopped_pgids,
+                "remaining_pgids": remaining_pgids,
+                **({} if confirmed else {"error": "process_group_still_alive"}),
+            }
+
+    async def handle_data_task_host_run(self, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Handle `POST /internal/data-tasks/host-run` (§2.3 item 3).
+
+        Serializes generation validation and state-file registration under `self._host_runner_lock`,
+        launches the task through the `--dalton-host-task-gate` control-pipe wrapper, streams and
+        redacts stdout/stderr in real time, and enforces total and no-output timeouts.
+        """
+        raw_gen = body.get("generation")
+        if isinstance(raw_gen, bool) or not isinstance(raw_gen, int) or raw_gen < 1:
+            return 400, {"ok": False, "error": "generation must be a positive integer"}
+        generation = int(raw_gen)
+
+        raw_run_id = body.get("run_id", "")
+        if isinstance(raw_run_id, bool) or not isinstance(raw_run_id, (int, str)):
+            return 400, {"ok": False, "error": "run_id must be a string or integer"}
+        run_id: int | str = raw_run_id if isinstance(raw_run_id, int) else str(raw_run_id).strip()
+
+        job_key = str(body.get("job_key") or "").strip()
+        if not job_key:
+            return 400, {"ok": False, "error": "job_key is required"}
+
+        host_mode = str(body.get("host_mode") or "mirror").strip().lower()
+        if host_mode not in ("mirror", "run"):
+            return 400, {"ok": False, "error": "host_mode must be 'mirror' or 'run'"}
+
+        scheduled_slot_utc = body.get("scheduled_slot_utc")
+        if scheduled_slot_utc is None:
+            scheduled_slot_utc = datetime.now(timezone.utc).isoformat()
+
+        raw_timeout = body.get("timeout", body.get("timeout_seconds", 900))
+        if raw_timeout is None:
+            timeout_s = 900.0
+        elif isinstance(raw_timeout, (int, float)) and not isinstance(raw_timeout, bool) and float(raw_timeout) > 0:
+            timeout_s = float(raw_timeout)
+        else:
+            return 400, {"ok": False, "error": "timeout must be a positive number"}
+
+        raw_no_output = body.get("no_output_timeout", body.get("no_output_timeout_seconds", 420))
+        if raw_no_output is None:
+            no_output_timeout_s: float | None = None
+        elif isinstance(raw_no_output, (int, float)) and not isinstance(raw_no_output, bool) and float(raw_no_output) > 0:
+            no_output_timeout_s = float(raw_no_output)
+        else:
+            return 400, {"ok": False, "error": "no_output_timeout must be a positive number or null"}
+
+        data_root = Path(self.cfg.data_tasks_data_root).resolve()
+        ocw_root = Path(self.cfg.ocw_root).expanduser().resolve()
+        py_bin = self._resolve_archive_python_bin()
+
+        async with self._host_runner_lock:
+            marker_exists = await asyncio.to_thread(self._has_fence_lost_marker_file_sync)
+            loaded_gen, loaded_active, is_corrupt, _file_fence_lost = await asyncio.to_thread(
+                self._read_host_runner_state_file_sync
+            )
+            if is_corrupt:
+                await asyncio.to_thread(self._enter_fence_lost_on_corrupt_state_sync)
+            elif marker_exists:
+                self._host_fence_lost = True
+                self._host_max_seen_generation = 0
+                for pgid, info in loaded_active.items():
+                    self._host_active_runs.setdefault(pgid, info)
+            elif not self._host_fence_lost:
+                if loaded_gen > self._host_max_seen_generation:
+                    self._host_max_seen_generation = loaded_gen
+                for pgid, info in loaded_active.items():
+                    self._host_active_runs.setdefault(pgid, info)
+
+            if self._host_fence_lost:
+                return 409, {
+                    "ok": False,
+                    "rejected": True,
+                    "error": "fence_lost",
+                }
+
+            if generation < self._host_max_seen_generation:
+                return 409, {
+                    "ok": False,
+                    "rejected": True,
+                    "error": "stale_generation",
+                    "generation": generation,
+                    "max_seen_generation": self._host_max_seen_generation,
+                }
+
+            # If any previous process group is still recorded, verify it has exited before accepting a new host-run.
+            if self._host_active_runs:
+                lingering_pgids = sorted(self._host_active_runs.keys())
+                if any(p in self._host_running_procs for p in lingering_pgids):
+                    return 409, {
+                        "ok": False,
+                        "rejected": True,
+                        "error": "host_runner_busy",
+                        "active_pgids": lingering_pgids,
+                    }
+                stopped_lingering, remaining_lingering = await asyncio.to_thread(
+                    _stop_and_verify_host_pgids_sync,
+                    self._host_active_runs,
+                    data_root=data_root,
+                    sigterm_grace_s=self.cfg.host_task_sigterm_grace_s,
+                    ps_list_fn=self._get_ps_list_fn(),
+                )
+                for p in stopped_lingering:
+                    self._host_active_runs.pop(p, None)
+                if remaining_lingering:
+                    await asyncio.to_thread(self._write_host_runner_state_file_sync)
+                    return 409, {
+                        "ok": False,
+                        "rejected": True,
+                        "error": "previous_process_group_not_exited",
+                        "remaining_pgids": remaining_lingering,
+                    }
+
+            self._host_max_seen_generation = max(self._host_max_seen_generation, generation)
+
+            if self._host_task_command_override is not None:
+                gate_spec = {
+                    "mode": "command",
+                    "command_argv": [str(x) for x in self._host_task_command_override],
+                    "cwd": str(data_root),
+                }
+            elif host_mode == "mirror":
+                gate_spec = {
+                    "mode": "mirror",
+                    "ocw_root": str(ocw_root),
+                    "data_root": str(data_root),
+                    "scheduled_slot_utc": str(scheduled_slot_utc),
+                    "timeout_s": timeout_s,
+                    "poll_interval_s": float(self.cfg.host_task_mirror_poll_interval_s),
+                }
+            else:
+                bbg_script = data_root / "scripts" / "bbg_remote_refresh.sh"
+                gate_spec = {
+                    "mode": "command",
+                    "command_argv": ["bash", str(bbg_script)],
+                    "cwd": str(data_root),
+                }
+
+            child_env = seed_asr_client.strip_asr_credentials_from_env(dict(os.environ))
+            if host_mode == "run":
+                child_env["OPENCLAW_WORKSPACE"] = str(data_root)
+                child_env["DALTON_PYTHON_BIN"] = str(os.environ.get("DALTON_PYTHON_BIN") or py_bin)
+                child_env["TZ"] = "America/New_York"
+                child_env["DALTON_NO_DIRECT_SEND"] = "1"
+            else:
+                child_env.setdefault("TZ", "America/New_York")
+                child_env["DALTON_NO_DIRECT_SEND"] = "1"
+
+            data_root.mkdir(parents=True, exist_ok=True)
+            proc = await asyncio.create_subprocess_exec(
+                py_bin,
+                "-u",
+                str(Path(__file__).resolve()),
+                HOST_TASK_GATE_FLAG,
+                json.dumps(gate_spec, ensure_ascii=False),
+                cwd=str(data_root),
+                env=child_env,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+            pgid = int(proc.pid)
+            leader_lstart: str | None = None
+            try:
+                leader_lstart = await asyncio.to_thread(
+                    _get_process_leader_lstart_sync,
+                    pgid,
+                    ps_list_fn=self._get_ps_list_fn(),
+                )
+                if not leader_lstart:
+                    raise RuntimeError("leader_lstart_unavailable")
+                self._host_active_runs[pgid] = {
+                    "pgid": pgid,
+                    "pid": pgid,
+                    "lstart": leader_lstart,
+                    "generation": generation,
+                    "run_id": run_id,
+                    "job_key": job_key,
+                    "host_mode": host_mode,
+                    "started_at": datetime.now(timezone.utc).isoformat(),
+                }
+                self._host_running_procs[pgid] = proc
+                await asyncio.to_thread(self._write_host_runner_state_file_sync)
+                if self._host_abort_before_gate_release:
+                    raise RuntimeError("aborted_before_gate_release")
+                if proc.stdin is not None:
+                    proc.stdin.write(b"GO\n")
+                    await proc.stdin.drain()
+                    proc.stdin.close()
+            except Exception as exc:
+                if proc.stdin is not None:
+                    try:
+                        proc.stdin.close()
+                    except Exception:
+                        pass
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)
+                except Exception:
+                    pass
+                stopped, _remaining = await asyncio.to_thread(
+                    _stop_and_verify_host_pgids_sync,
+                    [{"pgid": pgid, "lstart": leader_lstart}],
+                    data_root=data_root,
+                    sigterm_grace_s=1.0,
+                    ps_list_fn=self._get_ps_list_fn(),
+                )
+                if pgid in stopped:
+                    self._host_active_runs.pop(pgid, None)
+                    self._host_running_procs.pop(pgid, None)
+                try:
+                    if not self._host_fence_lost:
+                        await asyncio.to_thread(self._write_host_runner_state_file_sync)
+                except Exception:
+                    pass
+                return 500, {
+                    "ok": False,
+                    "error": f"gate_registration_failed:{type(exc).__name__}",
+                }
+
+        redactor = HostSecretRedactor()
+        timed_out = False
+        timeout_kind: str | None = None
+        exit_code: int = 1
+        stdout_text = ""
+        stderr_text = ""
+
+        try:
+            exit_code, timed_out, timeout_kind, stdout_text, stderr_text = (
+                await _stream_and_wait_host_proc(
+                    proc=proc,
+                    pgid=pgid,
+                    leader_lstart=leader_lstart,
+                    data_root=data_root,
+                    redactor=redactor,
+                    timeout_s=timeout_s,
+                    no_output_timeout_s=no_output_timeout_s,
+                    sigterm_grace_s=self.cfg.host_task_sigterm_grace_s,
+                    ps_list_fn=self._get_ps_list_fn(),
+                )
+            )
+        finally:
+            async with self._host_runner_lock:
+                self._host_running_procs.pop(pgid, None)
+                if pgid in self._host_active_runs:
+                    stopped_end, _remaining_end = await asyncio.to_thread(
+                        _stop_and_verify_host_pgids_sync,
+                        [self._host_active_runs[pgid]],
+                        data_root=data_root,
+                        sigterm_grace_s=self.cfg.host_task_sigterm_grace_s,
+                        ps_list_fn=self._get_ps_list_fn(),
+                    )
+                    if pgid in stopped_end:
+                        self._host_active_runs.pop(pgid, None)
+                    try:
+                        if not self._host_fence_lost:
+                            await asyncio.to_thread(self._write_host_runner_state_file_sync)
+                    except Exception as exc:
+                        logger.warning("Failed updating host runner state file after run: %s", type(exc).__name__)
+
+        killed_by_host_kill = pgid in self._host_killed_pgids
+        self._host_killed_pgids.discard(pgid)
+        # The run is over only once its whole group is gone; a group the final
+        # check could not confirm stays registered, and the scheduler must not
+        # free the slot on this answer (it kills and confirms first).
+        exit_confirmed = pgid not in self._host_active_runs
+        combined_tail = stdout_text
+        if stderr_text:
+            combined_tail = (stdout_text.rstrip("\n") + "\n" + stderr_text) if stdout_text else stderr_text
+        return 200, {
+            "ok": exit_code == 0 and not timed_out and not killed_by_host_kill,
+            "run_id": run_id,
+            "job_key": job_key,
+            "generation": generation,
+            "exit_code": int(exit_code),
+            "timed_out": bool(timed_out),
+            "timeout_kind": timeout_kind,
+            "killed_by_host_kill": bool(killed_by_host_kill),
+            "exit_confirmed": bool(exit_confirmed),
+            "stdout": stdout_text,
+            "stderr": stderr_text,
+            "log_tail": combined_tail,
+        }
+
 
 
 
@@ -16556,6 +17274,959 @@ class FeishuClient:
         )
         return f"email:{email}", phases
 
+
+# ----------------------------------------------------------------------
+# DALTON-HOOK(data-jobs): Standalone host task helpers (§2.3 item 3)
+# ----------------------------------------------------------------------
+
+HOST_TASK_GATE_FLAG = "--dalton-host-task-gate"
+HOST_TASK_STATE_FILENAME = ".dalton-host-runner-state.json"
+HOST_TASK_FENCE_LOST_FILENAME = ".dalton-host-runner-fence-lost"
+HOST_TASK_MIN_SECRET_LEN = 4
+HOST_TASK_REDACTED_PLACEHOLDER = "[REDACTED]"
+HOST_TASK_EXIT_TOTAL_TIMEOUT = 124
+HOST_TASK_EXIT_NO_OUTPUT_TIMEOUT = 125
+
+BBG_REQUIRED_SERIES: dict[str, tuple[int, int]] = {
+    "cyc_price": (0, 1),
+    "cyc_rsi14": (3, 4),
+    "momentum_rsi": (6, 7),
+    "qqq_vol_1m": (9, 10),
+    "qqq_vol_3m": (12, 13),
+    "ah_price": (15, 16),
+    "ah_rsi30": (18, 19),
+}
+BBG_MIN_LINES = 252
+BBG_FORMULA_ERROR_RE = re.compile(r"#N/A|#REF!|#DIV/0!|#VALUE!|#NAME\?", re.IGNORECASE)
+
+
+def _managed_host_secret_token_values() -> tuple[str, ...]:
+    """Return non-empty management tokens from `os.environ` matching `src/dalton/settings.py:managed_secret_token_values`."""
+    return tuple(
+        t
+        for t in (
+            os.environ.get("DALTON_BRIDGE_ADMIN_TOKEN", "").strip(),
+            os.environ.get("INTERNAL_SERVICE_TOKEN", "").strip(),
+            os.environ.get("DALTON_TRANSCRIPTION_TICKET_SECRET", "").strip(),
+        )
+        if t
+    )
+
+
+def _redact_host_managed_tokens(text: Any) -> Any:
+    """Replace management token values with `***` matching `src/dalton/settings.py:redact_managed_tokens`."""
+    if not isinstance(text, str):
+        return text
+    for token in _managed_host_secret_token_values():
+        text = text.replace(token, "***")
+    return text
+
+
+def _collect_host_secret_strings(value: Any, out: set[str]) -> None:
+    """Recursively collect non-empty string values of length >= 4 matching `runner_wrapper._collect_secret_strings`."""
+    if isinstance(value, str):
+        stripped = value.strip()
+        if len(stripped) >= HOST_TASK_MIN_SECRET_LEN:
+            out.add(stripped)
+        if len(value) >= HOST_TASK_MIN_SECRET_LEN:
+            out.add(value)
+        if stripped.startswith(("{", "[")):
+            try:
+                parsed = json.loads(stripped)
+            except Exception:
+                return
+            _collect_host_secret_strings(parsed, out)
+    elif isinstance(value, Mapping):
+        for v in value.values():
+            _collect_host_secret_strings(v, out)
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            _collect_host_secret_strings(item, out)
+
+
+class HostSecretRedactor:
+    """In-memory redactor matching `src/dalton/data_jobs/runner_wrapper.py:SecretRedactor` (§4.4.3)."""
+
+    def __init__(self, secret_values: Any = ()) -> None:
+        collected: set[str] = set()
+        for raw in secret_values:
+            _collect_host_secret_strings(raw, collected)
+        for token in _managed_host_secret_token_values():
+            if token:
+                collected.add(token)
+        self._patterns: tuple[str, ...] = tuple(
+            sorted((s for s in collected if s), key=len, reverse=True)
+        )
+
+    @property
+    def patterns(self) -> tuple[str, ...]:
+        return self._patterns
+
+    def redact_text(self, text: str) -> str:
+        if not text:
+            return text
+        out = text
+        for pattern in self._patterns:
+            if pattern in out:
+                out = out.replace(pattern, HOST_TASK_REDACTED_PLACEHOLDER)
+        out = str(_redact_host_managed_tokens(out))
+        return out
+
+    def redact_value(self, obj: Any) -> Any:
+        if isinstance(obj, str):
+            return self.redact_text(obj)
+        if isinstance(obj, Mapping):
+            return {
+                (self.redact_text(k) if isinstance(k, str) else k): self.redact_value(v)
+                for k, v in obj.items()
+            }
+        if isinstance(obj, list):
+            return [self.redact_value(item) for item in obj]
+        if isinstance(obj, tuple):
+            return tuple(self.redact_value(item) for item in obj)
+        return obj
+
+
+def _normalize_lstart(val: Any) -> str:
+    """Normalize a `ps -o lstart=` string by collapsing internal whitespace."""
+    return " ".join(str(val or "").split())
+
+
+def _list_host_processes_ps() -> list[tuple[int, int, str, str]] | None:
+    """Run `ps -ww -x -o pid=,pgid=,lstart=,command=` and return `(pid, pgid, lstart, command)` tuples.
+
+    Returns `None` if `ps` execution fails so callers treat process state as unconfirmed.
+    """
+    try:
+        res = subprocess.run(
+            ["ps", "-ww", "-x", "-o", "pid=,pgid=,lstart=,command="],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            # LC_ALL=C: lstart is locale-formatted (zh_CN prints "四 11/15 …", four
+            # tokens), and the split below needs the fixed five-token C form.
+            env={**seed_asr_client.strip_asr_credentials_from_env(dict(os.environ)), "LC_ALL": "C", "LANG": "C"},
+        )
+        if res.returncode != 0:
+            return None
+        rows: list[tuple[int, int, str, str]] = []
+        for line in (res.stdout or "").splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            # pid, pgid, 5 tokens of lstart (dow mon dom hh:mm:ss yyyy), command
+            parts = stripped.split(None, 7)
+            if len(parts) < 8:
+                continue
+            try:
+                pid = int(parts[0])
+                pgid = int(parts[1])
+            except ValueError:
+                continue
+            lstart = " ".join(parts[2:7])
+            command = parts[7]
+            rows.append((pid, pgid, lstart, command))
+        return rows
+    except Exception:
+        return None
+
+
+def _normalize_ps_rows(raw_rows: Any) -> list[tuple[int, int, str, str]] | None:
+    """Normalize process rows from `_list_host_processes_ps` into 4-tuples `(pid, pgid, lstart, command)`."""
+    if raw_rows is None:
+        return None
+    normalized: list[tuple[int, int, str, str]] = []
+    for item in raw_rows:
+        if not isinstance(item, (tuple, list)):
+            continue
+        if len(item) >= 4:
+            normalized.append(
+                (int(item[0]), int(item[1]), _normalize_lstart(item[2]), str(item[3]))
+            )
+        elif len(item) == 3:
+            normalized.append((int(item[0]), int(item[1]), "", str(item[2])))
+    return normalized
+
+
+def _get_process_leader_lstart_sync(
+    pgid: int,
+    *,
+    ps_list_fn: Any = None,
+) -> str | None:
+    """Look up `lstart` for the process group leader (`pid == pgid`) via `ps`."""
+    list_fn = ps_list_fn or _list_host_processes_ps
+    rows = _normalize_ps_rows(list_fn())
+    if rows is None:
+        return None
+    for pid, r_pgid, lstart, _cmd in rows:
+        if pid == pgid and r_pgid == pgid and lstart:
+            return lstart
+    return None
+
+
+def _reap_pgid_zombies(pgid: int) -> None:
+    """Reap any zombie child processes belonging to `pgid` in the current process."""
+    if pgid <= 0:
+        return
+    for target in (-pgid, pgid):
+        for _ in range(8):
+            try:
+                wpid, _ = os.waitpid(target, os.WNOHANG)
+                if wpid <= 0:
+                    break
+            except (ChildProcessError, PermissionError, OSError):
+                break
+
+
+def _is_fence_lost_dalton_task_command(command: str, *, data_root: Path | None = None) -> bool:
+    """Match Dalton host-task commands by Dalton markers.
+
+    Matches ONLY `--dalton-host-task-gate` or full paths under `<data_root>/scripts/`
+    (`bbg_remote_refresh.sh`, `bbg_export_to_csv.py`), never bare script names.
+    """
+    if HOST_TASK_GATE_FLAG in command:
+        return True
+    if data_root is None:
+        return False
+    scripts_dir = Path(data_root) / "scripts"
+    return (
+        str(scripts_dir / "bbg_remote_refresh.sh") in command
+        or str(scripts_dir / "bbg_export_to_csv.py") in command
+    )
+
+
+def _scan_and_stop_fence_lost_pgids_sync(
+    data_root: Path,
+    *,
+    active_runs: dict[int, dict[str, Any]] | None = None,
+    sigterm_grace_s: float = 5.0,
+    sigkill_wait_s: float = 2.0,
+    ps_list_fn: Any = None,
+) -> tuple[list[int], list[int], dict[int, dict[str, Any]], bool]:
+    """Scan process table on `fence_lost`, merge with recorded `active_runs`, and stop/verify Dalton task groups."""
+    list_fn = ps_list_fn or _list_host_processes_ps
+    merged_active: dict[int, dict[str, Any]] = {}
+    for raw_k, raw_v in (active_runs or {}).items():
+        if isinstance(raw_v, dict):
+            p_val = raw_v.get("pgid", raw_k)
+            lstart_raw = raw_v.get("lstart")
+            norm_lstart = _normalize_lstart(lstart_raw) if isinstance(lstart_raw, str) else None
+            if isinstance(p_val, int) and not isinstance(p_val, bool) and p_val > 0:
+                merged_active[int(p_val)] = {
+                    "pgid": int(p_val),
+                    "lstart": norm_lstart if norm_lstart else None,
+                }
+        elif isinstance(raw_k, int) and not isinstance(raw_k, bool) and raw_k > 0:
+            merged_active[int(raw_k)] = {"pgid": int(raw_k), "lstart": None}
+
+    rows = _normalize_ps_rows(list_fn())
+    if rows is None:
+        return [], sorted(merged_active.keys()), merged_active, False
+
+    self_pid = os.getpid()
+    leaders_by_pgid: dict[int, str] = {}
+    for pid, r_pgid, lstart, _cmd in rows:
+        if r_pgid > 0 and pid == r_pgid and pid != self_pid:
+            leaders_by_pgid[r_pgid] = lstart
+
+    scanned_pgids = sorted(
+        {
+            r_pgid
+            for (pid, r_pgid, _lstart, cmd) in rows
+            if r_pgid > 0
+            and pid != self_pid
+            and _is_fence_lost_dalton_task_command(cmd, data_root=data_root)
+        }
+    )
+    for p in scanned_pgids:
+        if p not in merged_active:
+            merged_active[p] = {
+                "pgid": p,
+                "lstart": leaders_by_pgid.get(p),
+            }
+
+    if not merged_active:
+        return [], [], {}, True
+
+    stopped, remaining = _stop_and_verify_host_pgids_sync(
+        merged_active,
+        data_root=data_root,
+        sigterm_grace_s=sigterm_grace_s,
+        sigkill_wait_s=sigkill_wait_s,
+        ps_list_fn=list_fn,
+    )
+    remaining_set = set(remaining)
+    remaining_active = {
+        p: info for p, info in sorted(merged_active.items()) if p in remaining_set
+    }
+    return stopped, remaining, remaining_active, len(remaining) == 0
+
+
+def _stop_and_verify_host_pgids_sync(
+    targets: Any,
+    *,
+    data_root: Path | None = None,
+    sigterm_grace_s: float = 5.0,
+    sigkill_wait_s: float = 2.0,
+    ps_list_fn: Any = None,
+) -> tuple[list[int], list[int]]:
+    """Verify process identity via `ps -ww -x -o pid=,pgid=,lstart=,command=` and stop process groups.
+
+    - Identity check before signaling:
+      1. Group leader (`pid == pgid`) present and `lstart` matches recorded `lstart`:
+         Dalton's group -> stop and confirm.
+      2. Group leader present and `lstart` does not match recorded `lstart` (or no `lstart`
+         was recorded and the leader command lacks Dalton markers):
+         `pgid` was reused -> do NOT signal; mark stopped so caller removes stale record, and log warning.
+      3. Group leader absent (`pid == pgid` not in `ps`) and group still has processes:
+         ONLY if at least one member in the group has a Dalton marker (`--dalton-host-task-gate`,
+         or `<data_root>/scripts/bbg_remote_refresh.sh` / `<data_root>/scripts/bbg_export_to_csv.py`)
+         do we signal and wait for the entire group to exit; otherwise do NOT signal, keep unconfirmed
+         (`remaining`), and log an ERROR with `pgid` and member command lines for manual intervention.
+      4. Group leader absent and group has no processes:
+         Already stopped.
+    - Exit confirmation:
+      Once signaled, as long as ANY process in `ps` still has `pgid` equal to this group
+      (regardless of command line), it is not considered exited; after `sigterm_grace_s`,
+      `SIGKILL` is sent to the group; only when the entire group disappears is it confirmed.
+    - If `ps` fails (`None`), treats the group as unconfirmed (`remaining_pgids`).
+    """
+    list_fn = ps_list_fn or _list_host_processes_ps
+    normalized_targets: list[tuple[int, str]] = []
+    seen_pgids: set[int] = set()
+    iterable_targets = targets.values() if isinstance(targets, dict) else (targets or [])
+    for item in iterable_targets:
+        if isinstance(item, dict):
+            raw_pgid = item.get("pgid")
+            raw_lstart = _normalize_lstart(item.get("lstart"))
+        else:
+            raw_pgid = item
+            raw_lstart = ""
+        if isinstance(raw_pgid, int) and not isinstance(raw_pgid, bool) and raw_pgid > 0:
+            if raw_pgid not in seen_pgids:
+                seen_pgids.add(raw_pgid)
+                normalized_targets.append((raw_pgid, raw_lstart))
+
+    if not normalized_targets:
+        return [], []
+
+    self_pid = os.getpid()
+    stopped: list[int] = []
+    remaining: list[int] = []
+
+    for pgid, expected_lstart in normalized_targets:
+        _reap_pgid_zombies(pgid)
+        rows = _normalize_ps_rows(list_fn())
+        if rows is None:
+            remaining.append(pgid)
+            continue
+
+        group_rows = [
+            (pid, r_pgid, lstart, cmd)
+            for (pid, r_pgid, lstart, cmd) in rows
+            if r_pgid == pgid and pid != self_pid
+        ]
+        if not group_rows:
+            stopped.append(pgid)
+            continue
+
+        leader_rows = [
+            (pid, r_pgid, lstart, cmd)
+            for (pid, r_pgid, lstart, cmd) in group_rows
+            if pid == pgid
+        ]
+        if leader_rows:
+            leader_lstart, leader_cmd = leader_rows[0][2], leader_rows[0][3]
+            if expected_lstart:
+                if leader_lstart != expected_lstart:
+                    logger.warning(
+                        "Host task pgid=%s leader lstart mismatch (recorded=%r, current=%r); "
+                        "skipping kill and dropping stale state entry",
+                        pgid,
+                        expected_lstart,
+                        leader_lstart,
+                    )
+                    stopped.append(pgid)
+                    continue
+            else:
+                has_dalton_marker = _is_fence_lost_dalton_task_command(
+                    leader_cmd, data_root=data_root
+                )
+                if not has_dalton_marker:
+                    logger.warning(
+                        "Host task pgid=%s leader present without recorded lstart or Dalton marker (cmd=%r); "
+                        "skipping kill and dropping stale state entry",
+                        pgid,
+                        leader_cmd,
+                    )
+                    stopped.append(pgid)
+                    continue
+        else:
+            has_group_dalton_marker = any(
+                _is_fence_lost_dalton_task_command(cmd, data_root=data_root)
+                for (_pid, _r_pgid, _lstart, cmd) in group_rows
+            )
+            if not has_group_dalton_marker:
+                group_cmds = [cmd for (_pid, _r_pgid, _lstart, cmd) in group_rows]
+                logger.error(
+                    "Host task pgid=%s leader absent and no group member has Dalton marker (commands=%r); "
+                    "not signaling and keeping unconfirmed for manual intervention",
+                    pgid,
+                    group_cmds,
+                )
+                remaining.append(pgid)
+                continue
+
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            pass
+        except OSError:
+            pass
+
+        ps_failed = False
+        deadline = time.monotonic() + max(0.05, float(sigterm_grace_s))
+        while time.monotonic() < deadline:
+            _reap_pgid_zombies(pgid)
+            cur_rows = _normalize_ps_rows(list_fn())
+            if cur_rows is None:
+                ps_failed = True
+                break
+            still_there = [
+                (pid, r_pgid, lstart, cmd)
+                for (pid, r_pgid, lstart, cmd) in cur_rows
+                if r_pgid == pgid and pid != self_pid
+            ]
+            if not still_there:
+                break
+            time.sleep(0.05)
+
+        if ps_failed:
+            remaining.append(pgid)
+            continue
+
+        _reap_pgid_zombies(pgid)
+        cur_rows = _normalize_ps_rows(list_fn())
+        if cur_rows is None:
+            remaining.append(pgid)
+            continue
+
+        still_there = [
+            (pid, r_pgid, lstart, cmd)
+            for (pid, r_pgid, lstart, cmd) in cur_rows
+            if r_pgid == pgid and pid != self_pid
+        ]
+        if still_there:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                pass
+            except OSError:
+                pass
+
+            kill_deadline = time.monotonic() + max(0.05, float(sigkill_wait_s))
+            while time.monotonic() < kill_deadline:
+                _reap_pgid_zombies(pgid)
+                cur_rows = _normalize_ps_rows(list_fn())
+                if cur_rows is None:
+                    ps_failed = True
+                    break
+                still_there = [
+                    (pid, r_pgid, lstart, cmd)
+                    for (pid, r_pgid, lstart, cmd) in cur_rows
+                    if r_pgid == pgid and pid != self_pid
+                ]
+                if not still_there:
+                    break
+                time.sleep(0.05)
+
+        if ps_failed:
+            remaining.append(pgid)
+            continue
+
+        _reap_pgid_zombies(pgid)
+        final_rows = _normalize_ps_rows(list_fn())
+        if final_rows is None:
+            remaining.append(pgid)
+            continue
+        final_matching = [
+            (pid, r_pgid, lstart, cmd)
+            for (pid, r_pgid, lstart, cmd) in final_rows
+            if r_pgid == pgid and pid != self_pid
+        ]
+        if final_matching:
+            remaining.append(pgid)
+        else:
+            stopped.append(pgid)
+
+    return stopped, remaining
+
+
+async def _stream_and_wait_host_proc(
+    *,
+    proc: asyncio.subprocess.Process,
+    pgid: int,
+    leader_lstart: str | None = None,
+    data_root: Path | None = None,
+    redactor: HostSecretRedactor,
+    timeout_s: float,
+    no_output_timeout_s: float | None,
+    sigterm_grace_s: float = 5.0,
+    ps_list_fn: Any = None,
+) -> tuple[int, bool, str | None, str, str]:
+    """Stream and redact stdout/stderr in real time while enforcing total and no-output timeouts."""
+    start_mono = time.monotonic()
+    last_output_mono = start_mono
+    max_secret_len = max((len(p) for p in redactor.patterns), default=0)
+    tail_keep = max(0, max_secret_len - 1)
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+
+    async def _pump(stream: asyncio.StreamReader | None, sink: list[str]) -> None:
+        nonlocal last_output_mono
+        if stream is None:
+            return
+        pending = ""
+        while True:
+            chunk = await stream.read(4096)
+            if not chunk:
+                break
+            last_output_mono = time.monotonic()
+            decoded = chunk.decode("utf-8", errors="replace")
+            combined = redactor.redact_text(pending + decoded)
+            if tail_keep > 0 and len(combined) > tail_keep:
+                flushed = combined[:-tail_keep]
+                pending = combined[-tail_keep:]
+                sink.append(flushed)
+            elif tail_keep == 0:
+                sink.append(combined)
+                pending = ""
+            else:
+                pending = combined
+        if pending:
+            sink.append(redactor.redact_text(pending))
+
+    pump_out = asyncio.create_task(_pump(proc.stdout, stdout_chunks))
+    pump_err = asyncio.create_task(_pump(proc.stderr, stderr_chunks))
+    wait_task = asyncio.create_task(proc.wait())
+
+    timed_out = False
+    timeout_kind: str | None = None
+    try:
+        while not wait_task.done():
+            now = time.monotonic()
+            elapsed = now - start_mono
+            if elapsed >= timeout_s:
+                timed_out = True
+                timeout_kind = "total"
+                break
+            if no_output_timeout_s is not None and (now - last_output_mono) >= no_output_timeout_s:
+                timed_out = True
+                timeout_kind = "no_output"
+                break
+            remaining = timeout_s - elapsed
+            if no_output_timeout_s is not None:
+                remaining = min(remaining, no_output_timeout_s - (now - last_output_mono))
+            sleep_step = max(0.02, min(0.25, remaining))
+            done, _ = await asyncio.wait({wait_task}, timeout=sleep_step)
+            if done:
+                break
+
+        if timed_out:
+            await asyncio.to_thread(
+                _stop_and_verify_host_pgids_sync,
+                [{"pgid": pgid, "lstart": leader_lstart}],
+                data_root=data_root,
+                sigterm_grace_s=sigterm_grace_s,
+                ps_list_fn=ps_list_fn,
+            )
+            try:
+                await asyncio.wait_for(wait_task, timeout=2.0)
+            except Exception:
+                pass
+    finally:
+        for t in (pump_out, pump_err):
+            try:
+                await asyncio.wait_for(t, timeout=2.0)
+            except Exception:
+                t.cancel()
+        if not wait_task.done():
+            wait_task.cancel()
+
+    if timed_out:
+        exit_code = (
+            HOST_TASK_EXIT_NO_OUTPUT_TIMEOUT
+            if timeout_kind == "no_output"
+            else HOST_TASK_EXIT_TOTAL_TIMEOUT
+        )
+    else:
+        rc = proc.returncode
+        exit_code = int(rc) if isinstance(rc, int) and not isinstance(rc, bool) else 1
+
+    return (
+        exit_code,
+        timed_out,
+        timeout_kind,
+        "".join(stdout_chunks),
+        "".join(stderr_chunks),
+    )
+
+
+def _parse_slot_utc_epoch(raw_slot: Any) -> float:
+    """Parse `scheduled_slot_utc` (ISO-8601 string, datetime, or numeric epoch) into UTC epoch seconds."""
+    if isinstance(raw_slot, (int, float)) and not isinstance(raw_slot, bool):
+        return float(raw_slot)
+    if isinstance(raw_slot, datetime):
+        dt = raw_slot if raw_slot.tzinfo is not None else raw_slot.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    text = str(raw_slot or "").strip()
+    if not text:
+        return 0.0
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    dt = datetime.fromisoformat(text)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def validate_bbg_mirror_files(csv_path: Path, xlsx_path: Path) -> dict[str, Any]:
+    """Validate staged BBG CSV and XLSX files before replacing existing files in `<data_root>/temp/` (§2.3 item 3).
+
+    Column indices are hardcoded to match `.agy/oc1/openclaw/scripts/bbg_export_to_csv.py:30-38`:
+    - `cyc_price`: (0, 1)
+    - `cyc_rsi14`: (3, 4)
+    - `momentum_rsi`: (6, 7)
+    - `qqq_vol_1m`: (9, 10)
+    - `qqq_vol_3m`: (12, 13)
+    - `ah_price`: (15, 16)
+    - `ah_rsi30`: (18, 19)
+    Header row with fewer than 20 columns fails validation immediately; short data rows
+    skip missing series columns and count only valid points per series (`bbg_export_to_csv.py:95-99`).
+    """
+    if not xlsx_path.is_file() or xlsx_path.stat().st_size == 0:
+        return {"ok": False, "reason": "xlsx_missing_or_empty"}
+    if not zipfile.is_zipfile(xlsx_path):
+        return {"ok": False, "reason": "xlsx_not_valid_zip"}
+    try:
+        with zipfile.ZipFile(xlsx_path, "r") as zf:
+            if not zf.namelist() or zf.testzip() is not None:
+                return {"ok": False, "reason": "xlsx_corrupt_zip"}
+    except Exception as exc:
+        return {"ok": False, "reason": f"xlsx_zip_error:{type(exc).__name__}"}
+
+    if not csv_path.is_file() or csv_path.stat().st_size == 0:
+        return {"ok": False, "reason": "csv_missing_or_empty"}
+    try:
+        raw_text = csv_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        return {"ok": False, "reason": f"csv_read_error:{type(exc).__name__}"}
+
+    if BBG_FORMULA_ERROR_RE.search(raw_text):
+        return {"ok": False, "reason": "csv_contains_formula_error"}
+
+    lines_count = len(raw_text.splitlines())
+    if lines_count < BBG_MIN_LINES:
+        return {"ok": False, "reason": f"csv_lines_below_252:{lines_count}"}
+
+    try:
+        rows = list(csv.reader(io.StringIO(raw_text)))
+    except Exception as exc:
+        return {"ok": False, "reason": f"csv_parse_error:{type(exc).__name__}"}
+
+    if len(rows) < 2:
+        return {"ok": False, "reason": "csv_missing_data_rows"}
+
+    header = [str(col).strip() for col in rows[0]]
+    if len(header) < 20:
+        return {"ok": False, "reason": f"csv_columns_below_20:{len(header)}"}
+
+    data_rows = rows[1:]
+    counts: dict[str, int] = {name: 0 for name in BBG_REQUIRED_SERIES}
+    last_dates: dict[str, str] = {name: "" for name in BBG_REQUIRED_SERIES}
+
+    for row in data_rows:
+        for name, (d_col, v_col) in BBG_REQUIRED_SERIES.items():
+            if len(row) <= v_col or len(row) <= d_col:
+                continue
+            d_str = str(row[d_col]).strip()
+            v_str = str(row[v_col]).strip()
+            if not d_str or not v_str or v_str == "None":
+                continue
+            try:
+                num = float(v_str)
+            except ValueError:
+                continue
+            if math.isnan(num) or math.isinf(num):
+                continue
+            counts[name] += 1
+            if d_str >= last_dates[name]:
+                last_dates[name] = d_str
+
+    for name in BBG_REQUIRED_SERIES:
+        if counts[name] < BBG_MIN_LINES:
+            return {
+                "ok": False,
+                "reason": f"series_below_252:{name}:{counts[name]}",
+                "counts": counts,
+                "last_dates": last_dates,
+            }
+
+    return {
+        "ok": True,
+        "lines": lines_count,
+        "counts": counts,
+        "last_dates": last_dates,
+    }
+
+
+def _has_non_dalton_bbg_refresh_process(
+    rows: list[tuple[int, int, str, str]] | list[tuple[int, int, str]],
+    *,
+    dalton_pgids: set[int],
+    data_root: Path,
+) -> bool:
+    """Return True if any non-Dalton `bbg_remote_refresh.sh` process is running on the host."""
+    norm_rows = _normalize_ps_rows(rows) or []
+    data_root_str = str(data_root)
+    for _pid, pgid, _lstart, cmd in norm_rows:
+        if "bbg_remote_refresh.sh" not in cmd:
+            continue
+        if pgid in dalton_pgids:
+            continue
+        if HOST_TASK_GATE_FLAG in cmd or data_root_str in cmd:
+            continue
+        return True
+    return False
+
+
+def _stage_and_commit_bbg_mirror(
+    *,
+    ocw_root: Path,
+    data_root: Path,
+) -> tuple[int, str]:
+    """Atomically stage and validate OpenClaw BBG CSV/XLSX into `<data_root>/temp/`."""
+    src_csv = ocw_root / "temp" / "bbg_data_latest.csv"
+    src_xlsx = ocw_root / "temp" / "bbg_data_remote.xlsx"
+    dst_dir = data_root / "temp"
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    dst_csv = dst_dir / "bbg_data_latest.csv"
+    dst_xlsx = dst_dir / "bbg_data_remote.xlsx"
+
+    if not src_csv.is_file() or not src_xlsx.is_file():
+        err_out = {
+            "ok": False,
+            "error": "source_files_missing",
+            "reason": "source_files_missing",
+            "source": "openclaw_mirror",
+        }
+        return 1, json.dumps(err_out, ensure_ascii=False) + "\n"
+
+    tag = f"{os.getpid()}.{uuid.uuid4().hex[:8]}"
+    tmp_csv = dst_dir / f".bbg_data_latest.csv.{tag}.tmp"
+    tmp_xlsx = dst_dir / f".bbg_data_remote.xlsx.{tag}.tmp"
+    try:
+        shutil.copy2(src_csv, tmp_csv)
+        shutil.copy2(src_xlsx, tmp_xlsx)
+        verdict = validate_bbg_mirror_files(tmp_csv, tmp_xlsx)
+        if not verdict.get("ok"):
+            tmp_csv.unlink(missing_ok=True)
+            tmp_xlsx.unlink(missing_ok=True)
+            reason = str(verdict.get("reason") or "validation_failed")
+            err_out = {
+                "ok": False,
+                "error": reason,
+                "reason": reason,
+                "source": "openclaw_mirror",
+            }
+            return 1, json.dumps(err_out, ensure_ascii=False) + "\n"
+
+        os.replace(tmp_xlsx, dst_xlsx)
+        os.replace(tmp_csv, dst_csv)
+        out = {
+            "ok": True,
+            "lines": int(verdict["lines"]),
+            "source": "openclaw_mirror",
+            "path": str(dst_csv),
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "detail": {
+                "counts": verdict["counts"],
+                "last_dates": verdict["last_dates"],
+            },
+        }
+        return 0, json.dumps(out, ensure_ascii=False) + "\n"
+    finally:
+        tmp_csv.unlink(missing_ok=True)
+        tmp_xlsx.unlink(missing_ok=True)
+
+
+def run_bbg_mirror_sync(
+    *,
+    ocw_root: Path | None = None,
+    openclaw_workspace: Path | None = None,
+    data_root: Path,
+    scheduled_slot_utc: Any,
+    timeout_s: float = 900.0,
+    poll_interval_s: float = 15.0,
+    dalton_pgids: set[int] | None = None,
+    clock_fn: Any = time.monotonic,
+    sleep_fn: Any = time.sleep,
+    process_list_fn: Any = None,
+    ps_list_fn: Any = None,
+    redactor: HostSecretRedactor | None = None,
+    stream_stdout: Any = None,
+) -> tuple[int, str]:
+    """Synchronously wait for OpenClaw BBG completion and atomically mirror/validate into `<data_root>/temp/`.
+
+    On every poll iteration, prints a redacted progress line (`waiting for openclaw update: mtime=..., openclaw_running=...`)
+    so the parent bridge's no-output timeout monitor is refreshed while waiting up to `timeout_s - 60`.
+    """
+    resolved_ocw_root = Path(ocw_root if ocw_root is not None else openclaw_workspace)
+    list_fn = ps_list_fn or process_list_fn or _list_host_processes_ps
+    active_redactor = redactor or HostSecretRedactor()
+    slot_epoch = _parse_slot_utc_epoch(scheduled_slot_utc)
+    own_pgids = set(dalton_pgids or set())
+    try:
+        own_pgids.add(os.getpgrp())
+    except OSError:
+        pass
+    src_csv = resolved_ocw_root / "temp" / "bbg_data_latest.csv"
+    deadline_wait_s = max(0.0, float(timeout_s) - 60.0)
+    start_mono = float(clock_fn())
+    progress_lines: list[str] = []
+
+    while True:
+        if src_csv.is_file():
+            mtime_val = float(src_csv.stat().st_mtime)
+            csv_ready = mtime_val >= slot_epoch
+            mtime_str = f"{mtime_val:.3f}"
+        else:
+            csv_ready = False
+            mtime_str = "missing"
+        raw_rows = list_fn()
+        norm_rows = _normalize_ps_rows(raw_rows)
+        if norm_rows is None:
+            busy = True
+        else:
+            busy = _has_non_dalton_bbg_refresh_process(
+                norm_rows, dalton_pgids=own_pgids, data_root=data_root
+            )
+        if csv_ready and not busy:
+            break
+        progress_line = active_redactor.redact_text(
+            f"waiting for openclaw update: mtime={mtime_str}, openclaw_running={busy}\n"
+        )
+        progress_lines.append(progress_line)
+        if stream_stdout is not None:
+            stream_stdout.write(progress_line)
+            stream_stdout.flush()
+
+        elapsed = float(clock_fn()) - start_mono
+        if elapsed >= deadline_wait_s:
+            err_out = {
+                "ok": False,
+                "error": "openclaw_not_updated",
+                "reason": "openclaw_not_updated",
+                "source": "openclaw_mirror",
+            }
+            final_line = active_redactor.redact_text(
+                json.dumps(err_out, ensure_ascii=False) + "\n"
+            )
+            if stream_stdout is not None:
+                return 1, final_line
+            return 1, "".join(progress_lines) + final_line
+        step = min(float(poll_interval_s), max(0.0, deadline_wait_s - elapsed))
+        sleep_fn(step if step > 0 else float(poll_interval_s))
+
+    rc, final_json = _stage_and_commit_bbg_mirror(
+        ocw_root=resolved_ocw_root, data_root=data_root
+    )
+    redacted_final = active_redactor.redact_text(final_json)
+    if stream_stdout is not None:
+        return rc, redacted_final
+    return rc, "".join(progress_lines) + redacted_final
+
+
+def _run_host_task_gate_cli(argv: list[str]) -> int:
+    """Entry point for the `--dalton-host-task-gate` wrapper process (§2.3 item 3).
+
+    Blocks on stdin waiting for release signal (`b"GO\\n"`). If stdin closes before release,
+    exits immediately without executing the task.
+    """
+    try:
+        idx = argv.index(HOST_TASK_GATE_FLAG)
+        rem = argv[idx + 1 :]
+    except ValueError:
+        return 1
+    if not rem:
+        return 1
+
+    spec: dict[str, Any]
+    try:
+        parsed = json.loads(rem[0])
+        if isinstance(parsed, dict) and len(rem) == 1:
+            spec = parsed
+        else:
+            spec = {"mode": "command", "command_argv": [str(x) for x in rem]}
+    except Exception:
+        spec = {"mode": "command", "command_argv": [str(x) for x in rem]}
+
+    release_line = sys.stdin.buffer.readline()
+    if release_line not in (b"GO\n", b"1\n", b"RELEASE\n"):
+        return 1
+
+    mode = str(spec.get("mode") or "command")
+    if mode == "hold_until_eof":
+        try:
+            sys.stdin.buffer.read()
+        except Exception:
+            pass
+        return 0
+
+    if mode == "mirror":
+        redactor = HostSecretRedactor()
+        rc, out_str = run_bbg_mirror_sync(
+            ocw_root=Path(spec["ocw_root"]),
+            data_root=Path(spec["data_root"]),
+            scheduled_slot_utc=spec.get("scheduled_slot_utc"),
+            timeout_s=float(spec.get("timeout_s", 900.0)),
+            poll_interval_s=float(spec.get("poll_interval_s", 15.0)),
+            redactor=redactor,
+            stream_stdout=sys.stdout,
+        )
+        if out_str:
+            sys.stdout.write(out_str)
+            sys.stdout.flush()
+        return int(rc)
+
+    cmd_argv = spec.get("command_argv")
+    if not isinstance(cmd_argv, list) or not cmd_argv:
+        return 1
+    cwd = spec.get("cwd") or None
+    child = subprocess.Popen(
+        [str(x) for x in cmd_argv],
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        start_new_session=False,
+        env=seed_asr_client.strip_asr_credentials_from_env(dict(os.environ)),
+    )
+
+    def _forward_term(signum: int, _frame: Any) -> None:
+        try:
+            child.send_signal(signum)
+        except Exception:
+            pass
+
+    signal.signal(signal.SIGTERM, _forward_term)
+    signal.signal(signal.SIGINT, _forward_term)
+    return int(child.wait())
+
+
 async def _send_http(
     writer: asyncio.StreamWriter,
     status_code: int,
@@ -17188,6 +18859,35 @@ async def _handle_client(
             await _send_http(writer, 404, "Not Found", {"ok": False, "error": "Not Found"})
             return
 
+        # Route 9: POST /internal/data-tasks/host-run and POST /internal/data-tasks/host-kill
+        # DALTON-HOOK(data-jobs): host data task execution behind the admin token gate (§2.3 item 3)
+        if path in ("/internal/data-tasks/host-run", "/internal/data-tasks/host-kill"):
+            if method != "POST":
+                await _send_http(
+                    writer, 405, "Method Not Allowed", {"ok": False, "error": "Method Not Allowed"}
+                )
+                return
+            try:
+                task_body = json.loads(body_bytes.decode("utf-8"))
+                if not isinstance(task_body, dict):
+                    raise ValueError("Expected JSON object")
+            except Exception:
+                await _send_http(writer, 400, "Bad Request", {"ok": False, "error": "Parse error"})
+                return
+            if path == "/internal/data-tasks/host-run":
+                code, payload = await bridge.handle_data_task_host_run(task_body)
+            else:
+                code, payload = await bridge.handle_data_task_host_kill(task_body)
+            status_label = {
+                200: "OK",
+                400: "Bad Request",
+                403: "Forbidden",
+                409: "Conflict",
+                500: "Internal Server Error",
+            }.get(code, "Bad Gateway")
+            await _send_http(writer, code, status_label, payload)
+            return
+
         await _send_http(writer, 404, "Not Found", {"error": "Not Found"})
     except Exception as exc:
         # P0 fix1 7: the request that died carries its correlation id in the
@@ -17240,6 +18940,11 @@ async def main() -> None:
         bridge._asr_job_manager().recover_incomplete_jobs()
     except Exception as exc:
         logger.warning("Startup ASR job recovery warning: %s", type(exc).__name__)
+    # DALTON-HOOK(data-jobs): recover host runner state and stop leftover process groups before serving (§2.3 item 3)
+    try:
+        await bridge.recover_host_runner_state_on_startup()
+    except Exception as exc:
+        logger.warning("Startup host data-task runner recovery warning: %s", type(exc).__name__)
 
     server = await asyncio.start_server(
         lambda r, w: _handle_client(bridge, r, w),
@@ -17262,6 +18967,8 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    if HOST_TASK_GATE_FLAG in sys.argv:
+        sys.exit(_run_host_task_gate_cli(sys.argv))
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

@@ -37,7 +37,17 @@ from src.dalton.data_jobs.evaluators import (
     TimeoutKind,
     evaluate_task_run,
 )
-from src.dalton.data_jobs.manifest import DEFAULT_TIMEOUT_SECONDS, sync_manifest_to_db
+from src.dalton.data_jobs.host_runner import (
+    DataTaskHostBridgeClient,
+    HostBridgeError,
+    HostKillOutcome,
+    HostRunOutcome,
+)
+from src.dalton.data_jobs.manifest import (
+    DEFAULT_TIMEOUT_SECONDS,
+    load_data_task_manifest,
+    sync_manifest_to_db,
+)
 from src.dalton.data_jobs.runner_wrapper import (
     EXIT_CODE_NO_OUTPUT_TIMEOUT,
     EXIT_CODE_TOTAL_TIMEOUT,
@@ -112,6 +122,7 @@ class ClaimedTaskRun:
     scheduled_slot_utc: datetime
     deadline_utc: datetime
     timezone: str = "UTC"
+    host_mode: str | None = None
 
 
 def is_data_jobs_scheduler_enabled() -> bool:
@@ -221,10 +232,7 @@ async def enqueue_due_cron_tasks(
     *,
     now_utc: datetime | None = None,
 ) -> list[str]:
-    """Scan enabled container task defs and enqueue due cron runs, superseding stale queued rows (§2.2.3.A, §3.2.2).
-
-    Before PR 0-2, ``runner = 'host'`` tasks (T1, T29) are excluded from cron enqueueing.
-    """
+    """Scan enabled container and host task defs and enqueue due cron runs, superseding stale queued rows (§2.2.3.A, §3.2.2)."""
     ref_utc = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
     slot_utc = ref_utc.replace(second=0, microsecond=0)
 
@@ -235,7 +243,7 @@ async def enqueue_due_cron_tasks(
             FROM dalton_data_task_defs
             WHERE enabled = TRUE
               AND paused_by_user = FALSE
-              AND runner = 'container'
+              AND runner IN ('container', 'host')
             ORDER BY job_key ASC
             """
         )
@@ -244,7 +252,7 @@ async def enqueue_due_cron_tasks(
     enqueued_run_ids: list[str] = []
     for task_def in defs:
         runner = str(task_def.get("runner") or "container")
-        if runner != "container":
+        if runner not in ("container", "host"):
             continue
         job_key = str(task_def["job_key"])
         cron_expr = str(task_def["cron_expr"])
@@ -459,12 +467,12 @@ async def claim_next_queued_run(
         runner = str(cand.get("runner") or "container")
         deadline_utc = cand["deadline_utc"]
 
-        # Unclaimable head row (disabled, paused, missing def, or host runner before PR 0-2):
+        # Unclaimable head row (disabled, paused, missing def, or unsupported runner):
         # cancel and continue scanning the next queued row (§3.2.3).
-        if not enabled or paused or cand.get("command_argv") is None or runner != "container":
+        if not enabled or paused or cand.get("command_argv") is None or runner not in ("container", "host"):
             cancel_reason = (
-                "host_runner_not_enabled"
-                if runner != "container"
+                "unsupported_runner"
+                if runner not in ("container", "host")
                 else "task_disabled_before_claim"
             )
             async with conn.transaction():
@@ -485,54 +493,55 @@ async def claim_next_queued_run(
             continue
 
         # Memory admission check for container tasks when slot is idle (§2.2.2, §2.2.3.B, §3.2.3).
-        avail_mb = (
-            int(available_memory_mb)
-            if available_memory_mb is not None
-            else read_host_available_memory_mb()
-        )
-        if avail_mb < threshold_mb:
-            if isinstance(deadline_utc, datetime) and ref_utc >= deadline_utc:
+        if runner == "container":
+            avail_mb = (
+                int(available_memory_mb)
+                if available_memory_mb is not None
+                else read_host_available_memory_mb()
+            )
+            if avail_mb < threshold_mb:
+                if isinstance(deadline_utc, datetime) and ref_utc >= deadline_utc:
+                    async with conn.transaction():
+                        async with conn.cursor() as cur:
+                            await cur.execute(
+                                """
+                                UPDATE dalton_data_task_runs
+                                SET status = 'skipped_low_memory',
+                                    low_mem_since_utc = COALESCE(low_mem_since_utc, %(now_utc)s),
+                                    failure_reason = 'low_memory_deadline_exceeded',
+                                    notify_status = 'skipped',
+                                    completed_at = NOW(),
+                                    updated_at = NOW()
+                                WHERE run_id = %(run_id)s::uuid
+                                  AND status = 'queued'
+                                """,
+                                {"run_id": run_id, "now_utc": ref_utc},
+                            )
+                            if cur.rowcount == 1:
+                                await cur.execute(
+                                    """
+                                    UPDATE dalton_data_task_defs
+                                    SET consecutive_failures = consecutive_failures + 1,
+                                        updated_at = NOW()
+                                    WHERE job_key = %(job_key)s
+                                    """,
+                                    {"job_key": job_key},
+                                )
+                    continue
+
                 async with conn.transaction():
                     async with conn.cursor() as cur:
                         await cur.execute(
                             """
                             UPDATE dalton_data_task_runs
-                            SET status = 'skipped_low_memory',
-                                low_mem_since_utc = COALESCE(low_mem_since_utc, %(now_utc)s),
-                                failure_reason = 'low_memory_deadline_exceeded',
-                                notify_status = 'skipped',
-                                completed_at = NOW(),
+                            SET low_mem_since_utc = COALESCE(low_mem_since_utc, %(now_utc)s),
                                 updated_at = NOW()
                             WHERE run_id = %(run_id)s::uuid
                               AND status = 'queued'
                             """,
                             {"run_id": run_id, "now_utc": ref_utc},
                         )
-                        if cur.rowcount == 1:
-                            await cur.execute(
-                                """
-                                UPDATE dalton_data_task_defs
-                                SET consecutive_failures = consecutive_failures + 1,
-                                    updated_at = NOW()
-                                WHERE job_key = %(job_key)s
-                                """,
-                                {"job_key": job_key},
-                            )
-                continue
-
-            async with conn.transaction():
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        """
-                        UPDATE dalton_data_task_runs
-                        SET low_mem_since_utc = COALESCE(low_mem_since_utc, %(now_utc)s),
-                            updated_at = NOW()
-                        WHERE run_id = %(run_id)s::uuid
-                          AND status = 'queued'
-                        """,
-                        {"run_id": run_id, "now_utc": ref_utc},
-                    )
-            return None
+                return None
 
         # Single-transaction atomic claim: both UPDATEs must affect 1 row or rollback (§3.2.3).
         claimed_generation: int | None = None
@@ -572,7 +581,7 @@ async def claim_next_queued_run(
                           AND d.job_key = r.job_key
                           AND d.enabled = TRUE
                           AND d.paused_by_user = FALSE
-                          AND d.runner = 'container'
+                          AND d.runner IN ('container', 'host')
                         """,
                         {"run_id": run_id, "generation": claimed_generation},
                     )
@@ -609,6 +618,13 @@ async def claim_next_queued_run(
         if isinstance(raw_secrets, str):
             raw_secrets = json.loads(raw_secrets)
 
+        manifest_entry = load_data_task_manifest().by_job_key().get(job_key)
+        host_mode = (
+            str(manifest_entry.host_mode or "mirror")
+            if runner == "host" and manifest_entry is not None
+            else ("mirror" if runner == "host" else None)
+        )
+
         return ClaimedTaskRun(
             run_id=run_id,
             job_key=job_key,
@@ -624,6 +640,7 @@ async def claim_next_queued_run(
             scheduled_slot_utc=cand["scheduled_slot_utc"],
             deadline_utc=cand["deadline_utc"],
             timezone=str(cand.get("timezone") or "UTC"),
+            host_mode=host_mode,
         )
 
     return None
@@ -783,6 +800,7 @@ async def start_claimed_host_run(
 ) -> bool:
     """Transition a ``runner = 'host'`` run from ``starting`` to ``running`` with pre-write lock check (§3.2.4)."""
     await check_scheduler_lock(lock_conn)
+    updated_rows = 0
     async with conn.transaction():
         async with conn.cursor() as cur:
             await cur.execute(
@@ -800,10 +818,75 @@ async def start_claimed_host_run(
                     "generation": claimed.generation,
                 },
             )
-            if cur.rowcount != 1:
-                return False
+            updated_rows = int(cur.rowcount or 0)
+    if updated_rows != 1:
+        await check_scheduler_lock(lock_conn)
+        async with conn.transaction():
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE dalton_data_task_runs
+                    SET status         = 'aborted',
+                        failure_reason = 'start_run_row_mismatch',
+                        notify_status  = 'skipped',
+                        completed_at   = NOW(),
+                        updated_at     = NOW()
+                    WHERE run_id = %(run_id)s::uuid
+                      AND status IN ('queued', 'starting', 'running')
+                    """,
+                    {"run_id": claimed.run_id},
+                )
+                await cur.execute(
+                    """
+                    UPDATE dalton_data_task_slot
+                    SET slot_state     = 'idle',
+                        active_run_id  = NULL,
+                        active_job_key = NULL,
+                        started_at     = NULL,
+                        updated_at     = NOW()
+                    WHERE slot_id = 1
+                      AND active_run_id = %(run_id)s::uuid
+                    """,
+                    {"run_id": claimed.run_id},
+                )
+        return False
     await check_scheduler_lock(lock_conn)
     return True
+
+
+async def bump_slot_generation_and_kill_host_task(
+    conn: Any,
+    *,
+    lock_conn: Any,
+    host_client: DataTaskHostBridgeClient,
+    run_id: str | int | None = None,
+    reason: str | None = None,
+) -> tuple[int, HostKillOutcome]:
+    """Increment `dalton_data_task_slot.generation` in a transaction (after lock check), then call `host-kill` (§2.3 item 3, §3.3)."""
+    await check_scheduler_lock(lock_conn)
+    new_generation = 1
+    async with conn.transaction():
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                UPDATE dalton_data_task_slot
+                SET generation = generation + 1,
+                    updated_at = NOW()
+                WHERE slot_id = 1
+                RETURNING generation
+                """
+            )
+            gen_row = await cur.fetchone()
+            if gen_row is not None:
+                new_generation = int(_extract_field(gen_row, "generation", 0))
+
+    await check_scheduler_lock(lock_conn)
+    kill_outcome = await host_client.kill_host_tasks(
+        generation=new_generation,
+        run_id=run_id,
+        reason=reason,
+    )
+    return new_generation, kill_outcome
 
 
 async def monitor_container_until_exit(
@@ -1131,15 +1214,19 @@ async def recover_on_takeover(
     *,
     lock_conn: Any,
     docker_client: DataTaskDockerClient | None = None,
+    host_client: DataTaskHostBridgeClient | None = None,
     path_map: DataTaskPathMap | None = None,
 ) -> str | None:
-    """Reconcile active slot and leftover containers on scheduler startup/takeover (§3.4.2).
+    """Reconcile active slot, leftover containers, and in-flight host tasks on scheduler startup/takeover (§3.4.2).
 
     Contract:
-    - Every external Docker call (`stop`, `kill`, `remove`) is preceded by `check_scheduler_lock(lock_conn)`.
+    - Every external Docker or host-bridge call is preceded by `check_scheduler_lock(lock_conn)`.
     - Running containers must be confirmed stopped (`Running == False`) and removed before any terminal
-      `aborted` status is written or the execution slot is released to `'idle'`. If any container fails
-      to stop or be removed, the slot is set to `'reclaiming'` and retried on the next cycle.
+      `aborted` status is written or the execution slot is released to `'idle'`.
+    - For a non-terminal `runner = 'host'` run, `dalton_data_task_slot.generation` is incremented in a
+      transaction (after lock check) and `host-kill` is called with the new generation; only after
+      `host-kill` confirms all processes exited (`confirmed == True`) is `aborted` written and the slot
+      released. Otherwise the slot is kept in `'reclaiming'` for retry on the next tick.
     - If the run referenced by ``dalton_data_task_slot.active_run_id`` is ALREADY in a terminal
       status (`succeeded`, `failed`, `timed_out`, `aborted`, `skipped_low_memory`,
       `skipped_superseded`, `cancelled`), **do NOT modify the run row, do NOT increment
@@ -1179,19 +1266,14 @@ async def recover_on_takeover(
     active_run_id = str(active_run_id_raw) if active_run_id_raw else None
     recovery_outcome: str | None = None
 
-    if not all_confirmed_stopped:
-        await check_scheduler_lock(lock_conn)
-        async with conn.transaction():
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    """
-                    UPDATE dalton_data_task_slot
-                    SET slot_state = 'reclaiming',
-                        updated_at = NOW()
-                    WHERE slot_id = 1
-                    """
-                )
-        return "reclaiming"
+    host_job_keys: set[str] = {"bbg-data-pull-asia", "bbg-data-pull-us", "T1", "T29"}
+    try:
+        for entry in load_data_task_manifest():
+            if entry.runner == "host":
+                host_job_keys.add(entry.job_key)
+                host_job_keys.add(entry.task_id)
+    except Exception:
+        pass
 
     all_removed = True
     removed_cids: set[str] = set()
@@ -1199,9 +1281,11 @@ async def recover_on_takeover(
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 """
-                SELECT run_id, job_key, status, container_id
-                FROM dalton_data_task_runs
-                WHERE run_id = %(run_id)s::uuid
+                SELECT r.run_id, r.job_key, r.status, r.container_id, d.runner
+                FROM dalton_data_task_runs r
+                LEFT JOIN dalton_data_task_defs d
+                  ON d.job_key = r.job_key
+                WHERE r.run_id = %(run_id)s::uuid
                 """,
                 {"run_id": active_run_id},
             )
@@ -1211,8 +1295,42 @@ async def recover_on_takeover(
             run_status = str(_extract_field(run_row, "status", 2))
             job_key = str(_extract_field(run_row, "job_key", 1))
             run_cid = _extract_field(run_row, "container_id", 3)
+            run_runner_raw: Any = None
+            if isinstance(run_row, Mapping):
+                run_runner_raw = run_row.get("runner")
+            elif isinstance(run_row, (tuple, list)) and len(run_row) > 4:
+                run_runner_raw = run_row[4]
+            is_host_run = (
+                str(run_runner_raw) == "host"
+                if run_runner_raw is not None
+                else job_key in host_job_keys
+            )
 
-            if run_status in NON_TERMINAL_RUN_STATUSES:
+            # Even if leftover container cleanup failed, a non-terminal host task on the slot
+            # must still undergo generation+1 and host-kill before deciding slot state.
+            if run_status in NON_TERMINAL_RUN_STATUSES and is_host_run:
+                effective_host_client = host_client or DataTaskHostBridgeClient()
+                _, kill_outcome = await bump_slot_generation_and_kill_host_task(
+                    conn,
+                    lock_conn=lock_conn,
+                    host_client=effective_host_client,
+                    run_id=active_run_id,
+                    reason="scheduler_takeover",
+                )
+                if not kill_outcome.confirmed:
+                    await check_scheduler_lock(lock_conn)
+                    async with conn.transaction():
+                        async with conn.cursor() as cur:
+                            await cur.execute(
+                                """
+                                UPDATE dalton_data_task_slot
+                                SET slot_state = 'reclaiming',
+                                    updated_at = NOW()
+                                WHERE slot_id = 1
+                                """
+                            )
+                    return "reclaiming"
+
                 await check_scheduler_lock(lock_conn)
                 async with conn.transaction():
                     async with conn.cursor() as cur:
@@ -1242,9 +1360,68 @@ async def recover_on_takeover(
                             recovery_outcome = "aborted"
                         else:
                             recovery_outcome = "cleaned_terminal"
+
+                if not all_confirmed_stopped:
+                    await check_scheduler_lock(lock_conn)
+                    async with conn.transaction():
+                        async with conn.cursor() as cur:
+                            await cur.execute(
+                                """
+                                UPDATE dalton_data_task_slot
+                                SET slot_state = 'reclaiming',
+                                    updated_at = NOW()
+                                WHERE slot_id = 1
+                                """
+                            )
+                    return "reclaiming"
             else:
-                # Already terminal: do NOT alter dalton_data_task_runs or consecutive_failures!
-                recovery_outcome = "cleaned_terminal"
+                if not all_confirmed_stopped:
+                    await check_scheduler_lock(lock_conn)
+                    async with conn.transaction():
+                        async with conn.cursor() as cur:
+                            await cur.execute(
+                                """
+                                UPDATE dalton_data_task_slot
+                                SET slot_state = 'reclaiming',
+                                    updated_at = NOW()
+                                WHERE slot_id = 1
+                                """
+                            )
+                    return "reclaiming"
+
+                if run_status in NON_TERMINAL_RUN_STATUSES:
+                    await check_scheduler_lock(lock_conn)
+                    async with conn.transaction():
+                        async with conn.cursor() as cur:
+                            await cur.execute(
+                                """
+                                UPDATE dalton_data_task_runs
+                                SET status         = 'aborted',
+                                    failure_reason = 'scheduler_takeover_aborted',
+                                    notify_status  = 'skipped',
+                                    completed_at   = NOW(),
+                                    updated_at     = NOW()
+                                WHERE run_id = %(run_id)s::uuid
+                                  AND status IN ('starting', 'running')
+                                """,
+                                {"run_id": active_run_id},
+                            )
+                            if cur.rowcount == 1:
+                                await cur.execute(
+                                    """
+                                    UPDATE dalton_data_task_defs
+                                    SET consecutive_failures = consecutive_failures + 1,
+                                        updated_at = NOW()
+                                    WHERE job_key = %(job_key)s
+                                    """,
+                                    {"job_key": job_key},
+                                )
+                                recovery_outcome = "aborted"
+                            else:
+                                recovery_outcome = "cleaned_terminal"
+                else:
+                    # Already terminal: do NOT alter dalton_data_task_runs or consecutive_failures!
+                    recovery_outcome = "cleaned_terminal"
 
             if run_cid and docker_client is not None:
                 cid_str = str(run_cid)
@@ -1255,6 +1432,32 @@ async def recover_on_takeover(
                 except Exception as exc:
                     if not is_container_not_found_error(exc):
                         all_removed = False
+        elif not all_confirmed_stopped:
+            await check_scheduler_lock(lock_conn)
+            async with conn.transaction():
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        UPDATE dalton_data_task_slot
+                        SET slot_state = 'reclaiming',
+                            updated_at = NOW()
+                        WHERE slot_id = 1
+                        """
+                    )
+            return "reclaiming"
+    elif not all_confirmed_stopped:
+        await check_scheduler_lock(lock_conn)
+        async with conn.transaction():
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE dalton_data_task_slot
+                    SET slot_state = 'reclaiming',
+                        updated_at = NOW()
+                    WHERE slot_id = 1
+                    """
+                )
+        return "reclaiming"
 
     if docker_client is not None:
         for item in leftover_containers:
@@ -1383,10 +1586,358 @@ async def execute_claimed_container_run(
     )
 
 
+async def execute_claimed_host_run(
+    conn: Any,
+    *,
+    lock_conn: Any,
+    host_client: DataTaskHostBridgeClient,
+    claimed: ClaimedTaskRun,
+    path_map: DataTaskPathMap | None = None,
+    heartbeat_interval_seconds: float = LOCK_HEARTBEAT_INTERVAL_S,
+) -> tuple[bool, int | None]:
+    """Run the full host-task lifecycle (`UPDATE starting->running` -> `host-run` with lease heartbeats -> evaluate -> ledger) (§2.3 item 3, §3.2–§3.4).
+
+    Contract:
+    - Calls `host-run` synchronously while checking the scheduler advisory lock every
+      `heartbeat_interval_seconds`.
+    - When a timeout occurs (either returned by `host-run` or detected by the scheduler),
+      first increments `dalton_data_task_slot.generation` in a transaction (after lock check)
+      and calls `host-kill` with the new generation; only writes terminal `timed_out` and
+      releases the slot if `host-kill` confirms all processes exited (`confirmed == True`).
+      If unconfirmed, keeps the slot in `'reclaiming'` for retry on the next tick.
+    - When the bridge is unreachable or auth fails, marks the run `failed` with a clear
+      `failure_reason` and releases the slot without retrying the same period.
+    """
+    paths = path_map or build_path_map()
+    started_at = datetime.now(timezone.utc)
+    started = await start_claimed_host_run(
+        conn,
+        lock_conn=lock_conn,
+        claimed=claimed,
+    )
+    if not started:
+        return False, None
+
+    host_mode = claimed.host_mode
+    if not host_mode:
+        try:
+            for entry in load_data_task_manifest():
+                if entry.job_key == claimed.job_key and entry.host_mode:
+                    host_mode = entry.host_mode
+                    break
+        except Exception:
+            pass
+    effective_host_mode = host_mode or "mirror"
+
+    slot_dt = claimed.scheduled_slot_utc
+    if slot_dt.tzinfo is None:
+        slot_dt = slot_dt.replace(tzinfo=timezone.utc)
+    scheduled_slot_iso = slot_dt.astimezone(timezone.utc).isoformat()
+
+    async def _run_once_with_heartbeats(gen: int) -> tuple[HostRunOutcome | None, bool]:
+        await check_scheduler_lock(lock_conn)
+        run_coro = host_client.run_host_task(
+            generation=gen,
+            run_id=claimed.run_id,
+            job_key=claimed.job_key,
+            host_mode=effective_host_mode,
+            scheduled_slot_utc=scheduled_slot_iso,
+            timeout=claimed.timeout_seconds,
+            no_output_timeout=claimed.no_output_timeout_seconds,
+        )
+        run_task: asyncio.Task[HostRunOutcome] = asyncio.create_task(run_coro)
+        timed_out_local = False
+        outcome_local: HostRunOutcome | None = None
+        effective_wait_timeout = float(claimed.timeout_seconds) + 30.0
+        start_mono = time.monotonic()
+
+        try:
+            while not run_task.done():
+                elapsed = time.monotonic() - start_mono
+                remaining = effective_wait_timeout - elapsed
+                if remaining <= 0:
+                    timed_out_local = True
+                    run_task.cancel()
+                    await asyncio.gather(run_task, return_exceptions=True)
+                    break
+                wait_step = min(heartbeat_interval_seconds, remaining)
+                done, _ = await asyncio.wait({run_task}, timeout=wait_step)
+                if not done:
+                    await check_scheduler_lock(lock_conn)
+            if not timed_out_local:
+                try:
+                    outcome_local = await run_task
+                except (asyncio.TimeoutError, TimeoutError):
+                    timed_out_local = True
+                except HostBridgeError as exc:
+                    outcome_local = HostRunOutcome(
+                        ok=False,
+                        status_code=409 if exc.code == "fence_lost" else 0,
+                        exit_code=None,
+                        timed_out=False,
+                        timeout_kind=None,
+                        log_tail="",
+                        failure_reason=exc.code if exc.code in ("bridge_unreachable", "bridge_result_unknown", "fence_lost") else str(exc),
+                        bridge_unreachable=(exc.code == "bridge_unreachable"),
+                        result_unknown=(exc.code == "bridge_result_unknown"),
+                        fence_lost=(exc.code == "fence_lost"),
+                        auth_failed=(exc.code in ("bridge_unauthorized", "bridge_forbidden")),
+                    )
+        except BaseException:
+            if not run_task.done():
+                run_task.cancel()
+                await asyncio.gather(run_task, return_exceptions=True)
+            raise
+        return outcome_local, timed_out_local
+
+    host_outcome, scheduler_timed_out = await _run_once_with_heartbeats(claimed.generation)
+
+    # On `fence_lost`: bump generation + 1 in tx, call host-kill, and if confirmed retry host-run once.
+    if (
+        not scheduler_timed_out
+        and host_outcome is not None
+        and (
+            host_outcome.fence_lost
+            or host_outcome.failure_reason in ("fence_lost", "host_bridge_error:fence_lost")
+        )
+    ):
+        new_gen, fence_kill_outcome = await bump_slot_generation_and_kill_host_task(
+            conn,
+            lock_conn=lock_conn,
+            host_client=host_client,
+            run_id=claimed.run_id,
+            reason="fence_lost",
+        )
+        if not fence_kill_outcome.confirmed:
+            evaluation = TaskEvaluationResult(
+                ok=False,
+                status="failed",
+                failure_reason="fence_lost",
+            )
+            container_like_outcome = ContainerInspectionOutcome(
+                container_id=f"host:{claimed.run_id}",
+                running=True,
+                exit_code=None,
+                oom_killed=False,
+                log_tail=host_outcome.log_tail or "",
+            )
+            return await finalize_task_run(
+                conn,
+                lock_conn=lock_conn,
+                docker_client=None,
+                claimed=claimed,
+                container_id=None,
+                outcome=container_like_outcome,
+                evaluation=evaluation,
+                path_map=paths,
+            )
+
+        await check_scheduler_lock(lock_conn)
+        async with conn.transaction():
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE dalton_data_task_runs
+                    SET generation = %(generation)s,
+                        updated_at = NOW()
+                    WHERE run_id = %(run_id)s::uuid
+                      AND status IN ('starting', 'running')
+                    """,
+                    {"run_id": claimed.run_id, "generation": new_gen},
+                )
+        claimed.generation = new_gen
+        host_outcome, scheduler_timed_out = await _run_once_with_heartbeats(new_gen)
+
+    is_timeout = scheduler_timed_out or (
+        host_outcome is not None
+        and (
+            host_outcome.timed_out
+            or host_outcome.exit_code in (EXIT_CODE_TOTAL_TIMEOUT, EXIT_CODE_NO_OUTPUT_TIMEOUT)
+        )
+    )
+
+    if is_timeout:
+        raw_kind = host_outcome.timeout_kind if host_outcome is not None else None
+        if raw_kind not in ("total", "no_output"):
+            if (
+                host_outcome is not None
+                and host_outcome.exit_code == EXIT_CODE_NO_OUTPUT_TIMEOUT
+            ):
+                raw_kind = "no_output"
+            else:
+                raw_kind = "total"
+        timeout_kind: TimeoutKind = "no_output" if raw_kind == "no_output" else "total"
+        exit_code = (
+            host_outcome.exit_code
+            if host_outcome is not None and host_outcome.exit_code is not None
+            else (
+                EXIT_CODE_NO_OUTPUT_TIMEOUT
+                if timeout_kind == "no_output"
+                else EXIT_CODE_TOTAL_TIMEOUT
+            )
+        )
+        log_tail = host_outcome.log_tail if host_outcome is not None else ""
+
+        _, kill_outcome = await bump_slot_generation_and_kill_host_task(
+            conn,
+            lock_conn=lock_conn,
+            host_client=host_client,
+            run_id=claimed.run_id,
+            reason="host_task_timeout",
+        )
+        still_running = not bool(kill_outcome.confirmed)
+        evaluation = TaskEvaluationResult(
+            ok=False,
+            status="timed_out",
+            failure_reason=(
+                "no_output_timeout_exceeded"
+                if timeout_kind == "no_output"
+                else "total_timeout_exceeded"
+            ),
+        )
+        container_like_outcome = ContainerInspectionOutcome(
+            container_id=f"host:{claimed.run_id}",
+            running=still_running,
+            exit_code=exit_code,
+            oom_killed=False,
+            log_tail=log_tail,
+            timeout_kind=timeout_kind,
+        )
+        return await finalize_task_run(
+            conn,
+            lock_conn=lock_conn,
+            docker_client=None,
+            claimed=claimed,
+            container_id=None,
+            outcome=container_like_outcome,
+            evaluation=evaluation,
+            path_map=paths,
+        )
+
+    assert host_outcome is not None
+
+    # Error after request was sent (`result_unknown` / `bridge_result_unknown`):
+    # bump generation + 1 in tx, call host-kill, and only mark `failed` + release slot once confirmed.
+    # A 200 reply whose process group the bridge could not confirm gone takes
+    # the same path: the slot is freed only after host-kill confirms.
+    exit_unconfirmed = host_outcome.status_code == 200 and not host_outcome.exit_confirmed
+    if (
+        host_outcome.result_unknown
+        or host_outcome.failure_reason == "bridge_result_unknown"
+        or exit_unconfirmed
+    ):
+        unknown_reason = "host_exit_unconfirmed" if exit_unconfirmed and not host_outcome.result_unknown else "bridge_result_unknown"
+        _, unknown_kill_outcome = await bump_slot_generation_and_kill_host_task(
+            conn,
+            lock_conn=lock_conn,
+            host_client=host_client,
+            run_id=claimed.run_id,
+            reason=unknown_reason,
+        )
+        still_running = not bool(unknown_kill_outcome.confirmed)
+        evaluation = TaskEvaluationResult(
+            ok=False,
+            status="failed",
+            failure_reason=unknown_reason,
+        )
+        container_like_outcome = ContainerInspectionOutcome(
+            container_id=f"host:{claimed.run_id}",
+            running=still_running,
+            exit_code=host_outcome.exit_code,
+            oom_killed=False,
+            log_tail=host_outcome.log_tail or "",
+        )
+        return await finalize_task_run(
+            conn,
+            lock_conn=lock_conn,
+            docker_client=None,
+            claimed=claimed,
+            container_id=None,
+            outcome=container_like_outcome,
+            evaluation=evaluation,
+            path_map=paths,
+        )
+
+    if (
+        host_outcome.bridge_unreachable
+        or host_outcome.fence_lost
+        or host_outcome.auth_failed
+        or host_outcome.status_code != 200
+    ):
+        if host_outcome.auth_failed:
+            reason = host_outcome.failure_reason or "host_bridge_auth_failed"
+        elif host_outcome.bridge_unreachable:
+            reason = host_outcome.failure_reason or "bridge_unreachable"
+        elif host_outcome.fence_lost:
+            reason = "fence_lost"
+        else:
+            reason = host_outcome.failure_reason or f"host_bridge_http_{host_outcome.status_code}"
+        evaluation = TaskEvaluationResult(
+            ok=False,
+            status="failed",
+            failure_reason=reason,
+        )
+        container_like_outcome = ContainerInspectionOutcome(
+            container_id=f"host:{claimed.run_id}",
+            running=False,
+            exit_code=host_outcome.exit_code,
+            oom_killed=False,
+            log_tail=host_outcome.log_tail or "",
+        )
+        return await finalize_task_run(
+            conn,
+            lock_conn=lock_conn,
+            docker_client=None,
+            claimed=claimed,
+            container_id=None,
+            outcome=container_like_outcome,
+            evaluation=evaluation,
+            path_map=paths,
+        )
+
+    try:
+        task_tz = ZoneInfo(claimed.timezone)
+    except Exception:
+        task_tz = timezone.utc
+    reference_date = slot_dt.astimezone(task_tz).date()
+
+    evaluation = evaluate_task_run(
+        TaskEvaluationContext(
+            job_key=claimed.job_key,
+            exit_code=host_outcome.exit_code,
+            oom_killed=False,
+            timed_out=False,
+            timeout_kind=None,
+            stdout=host_outcome.log_tail,
+            data_root=paths.backend_data_root,
+            started_at=started_at,
+            reference_date=reference_date,
+        )
+    )
+    container_like_outcome = ContainerInspectionOutcome(
+        container_id=f"host:{claimed.run_id}",
+        running=False,
+        exit_code=host_outcome.exit_code,
+        oom_killed=False,
+        log_tail=host_outcome.log_tail or "",
+    )
+    return await finalize_task_run(
+        conn,
+        lock_conn=lock_conn,
+        docker_client=None,
+        claimed=claimed,
+        container_id=None,
+        outcome=container_like_outcome,
+        evaluation=evaluation,
+        path_map=paths,
+    )
+
+
 async def run_data_task_scheduler_loop(
     *,
     stop_event: asyncio.Event | None = None,
     docker_client: DataTaskDockerClient | None = None,
+    host_client: DataTaskHostBridgeClient | None = None,
     db_conn_factory: Callable[[], Any] = get_db_connection,
     lock_conn_factory: Callable[[], Awaitable[Any]] | None = None,
     poll_interval_seconds: float = SCHEDULER_POLL_INTERVAL_S,
@@ -1400,8 +1951,8 @@ async def run_data_task_scheduler_loop(
     - Holds the session advisory lock on a dedicated, non-pooled connection opened via
       ``open_dedicated_lock_connection``; on exit (including exceptions), explicitly calls
       ``pg_advisory_unlock`` and closes the connection.
-    - Runs claimed container executions in a background ``asyncio.Task`` so the main loop continues
-      waking every minute to enqueue due cron tasks even while a container is running, and only
+    - Runs claimed container or host executions in a background ``asyncio.Task`` so the main loop
+      continues waking every minute to enqueue due cron tasks even while a task is running, and only
       claims a new run when the execution slot is idle.
     """
     if not is_data_jobs_scheduler_enabled():
@@ -1410,6 +1961,7 @@ async def run_data_task_scheduler_loop(
 
     owns_docker = docker_client is None
     client = docker_client or DataTaskDockerClient()
+    bridge_client = host_client or DataTaskHostBridgeClient()
     stop = stop_event or asyncio.Event()
     open_lock_conn = lock_conn_factory or open_dedicated_lock_connection
     lock_conn: Any = None
@@ -1417,12 +1969,20 @@ async def run_data_task_scheduler_loop(
 
     async def _run_claimed_in_background(claimed_run: ClaimedTaskRun) -> None:
         async with db_conn_factory() as exec_conn:
-            await execute_claimed_container_run(
-                exec_conn,
-                lock_conn=lock_conn,
-                docker_client=client,
-                claimed=claimed_run,
-            )
+            if claimed_run.runner == "host":
+                await execute_claimed_host_run(
+                    exec_conn,
+                    lock_conn=lock_conn,
+                    host_client=bridge_client,
+                    claimed=claimed_run,
+                )
+            else:
+                await execute_claimed_container_run(
+                    exec_conn,
+                    lock_conn=lock_conn,
+                    docker_client=client,
+                    claimed=claimed_run,
+                )
 
     try:
         lock_conn = await open_lock_conn()
@@ -1450,6 +2010,7 @@ async def run_data_task_scheduler_loop(
                 work_conn,
                 lock_conn=lock_conn,
                 docker_client=client,
+                host_client=bridge_client,
             )
 
         while not stop.is_set():
@@ -1490,11 +2051,12 @@ async def run_data_task_scheduler_loop(
                             work_conn,
                             lock_conn=lock_conn,
                             docker_client=client,
+                            host_client=bridge_client,
                         )
 
                     await check_scheduler_lock(lock_conn)
                     claimed = await claim_next_queued_run(work_conn)
-                    if claimed is not None and claimed.runner == "container":
+                    if claimed is not None and claimed.runner in ("container", "host"):
                         active_exec_task = asyncio.create_task(
                             _run_claimed_in_background(claimed)
                         )

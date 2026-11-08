@@ -8,6 +8,7 @@ and cleans up via ``d029_data_tasks.downgrade()`` afterwards.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 import os
 from pathlib import Path
 from unittest.mock import create_autospec
@@ -24,13 +25,18 @@ from src.dalton.data_jobs.container_runner import (
 )
 from src.dalton.data_jobs.evaluators import (
     T5_JOB_KEY,
-     T18_JOB_KEY,
+    T18_JOB_KEY,
     TaskEvaluationResult,
+)
+from src.dalton.data_jobs.host_runner import (
+    DataTaskHostBridgeClient,
+    HostRunOutcome,
 )
 from src.dalton.data_jobs.manifest import load_data_task_manifest, sync_manifest_to_db
 from src.dalton.data_jobs.scheduler import (
     claim_next_queued_run,
     enqueue_due_cron_tasks,
+    execute_claimed_host_run,
     finalize_task_run,
     open_dedicated_lock_connection,
     recover_on_takeover,
@@ -152,18 +158,13 @@ async def test_real_postgres_data_jobs_end_to_end(tmp_path: Path) -> None:
             "TENCENT_COS_SECRET_KEY",
         ]
 
-        # 3. Host task exclusion on enqueue: enable T29 (host) and T18 (container)
+        # 3. Enable T29 (host) and T18 (container)
         async with conn.transaction():
             async with conn.cursor() as cur:
                 await cur.execute(
                     "UPDATE dalton_data_task_defs SET enabled = TRUE WHERE job_key IN (%s, %s)",
                     ("bbg-data-pull-us", T18_JOB_KEY),
                 )
-
-        # T29 cron is 0 10 * * 1-5 America/New_York -> 2026-11-06 15:00 UTC
-        t29_slot = datetime(2026, 11, 6, 15, 0, tzinfo=timezone.utc)
-        enq_host = await enqueue_due_cron_tasks(conn, now_utc=t29_slot)
-        assert enq_host == []
 
         # T18 cron is 30 8 * * 1-5 America/New_York -> 2026-11-06 13:30 UTC
         t18_slot_1 = datetime(2026, 11, 6, 13, 30, tzinfo=timezone.utc)
@@ -187,9 +188,8 @@ async def test_real_postgres_data_jobs_end_to_end(tmp_path: Path) -> None:
         assert first_row is not None
         assert first_row["status"] == "skipped_superseded"
 
-        # 4. Unclaimable head (disabled task) + host task queued in DB are cancelled before claiming eligible run
+        # 4. Unclaimable head (disabled task) is cancelled before claiming eligible run
         disabled_run_id = str(uuid4())
-        host_run_id = str(uuid4())
         async with conn.transaction():
             async with conn.cursor() as cur:
                 await cur.execute(
@@ -197,15 +197,12 @@ async def test_real_postgres_data_jobs_end_to_end(tmp_path: Path) -> None:
                     INSERT INTO dalton_data_task_runs (
                         run_id, job_key, trigger_source, scheduled_slot_utc, deadline_utc, status
                     ) VALUES
-                        (%(r1)s::uuid, %(j1)s, 'manual', %(slot1)s, %(dl)s, 'queued'),
-                        (%(r2)s::uuid, 'bbg-data-pull-us', 'manual', %(slot2)s, %(dl)s, 'queued')
+                        (%(r1)s::uuid, %(j1)s, 'manual', %(slot1)s, %(dl)s, 'queued')
                     """,
                     {
                         "r1": disabled_run_id,
                         "j1": T5_JOB_KEY,  # T5 is still enabled=FALSE
                         "slot1": t18_slot_1 - timedelta(minutes=10),
-                        "r2": host_run_id,
-                        "slot2": t18_slot_1 - timedelta(minutes=5),
                         "dl": t18_slot_2 + timedelta(hours=1),
                     },
                 )
@@ -295,6 +292,78 @@ async def test_real_postgres_data_jobs_end_to_end(tmp_path: Path) -> None:
                     await cur.execute("DROP TRIGGER IF EXISTS trg_test_block_starting ON dalton_data_task_runs")
                     await cur.execute("DROP FUNCTION IF EXISTS _test_block_starting()")
 
+        # Verify disabled_run_id was cancelled
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT status FROM dalton_data_task_runs WHERE run_id = %(r1)s::uuid",
+                {"r1": disabled_run_id},
+            )
+            disabled_row = await cur.fetchone()
+        assert disabled_row is not None
+        assert disabled_row["status"] == "cancelled"
+
+        # Host task (T29 bbg-data-pull-us) is enqueued, claimed, and executed via bridge double
+        t29_slot = datetime(2026, 11, 9, 15, 0, tzinfo=timezone.utc)  # 10:00 EST
+        enq_host = await enqueue_due_cron_tasks(conn, now_utc=t29_slot)
+        assert len(enq_host) == 1
+        host_run_id = enq_host[0]
+
+        claimed_host = await claim_next_queued_run(
+            conn, now_utc=t29_slot, available_memory_mb=512
+        )
+        assert claimed_host is not None
+        assert claimed_host.run_id == host_run_id
+        assert claimed_host.job_key == "bbg-data-pull-us"
+        assert claimed_host.runner == "host"
+        assert claimed_host.host_mode == "mirror"
+        assert claimed_host.generation == 1
+
+        host_client = create_autospec(DataTaskHostBridgeClient, instance=True)
+        host_client.run_host_task.return_value = HostRunOutcome(
+            ok=True,
+            status_code=200,
+            exit_code=0,
+            timed_out=False,
+            timeout_kind=None,
+            log_tail=json.dumps(
+                {
+                    "ok": True,
+                    "lines": 260,
+                    "source": "openclaw_mirror",
+                    "path": "/var/dalton/openclaw-data/temp/bbg_data_latest.csv",
+                    "timestamp": "2026-11-09T15:01:00Z",
+                    "detail": {"counts": {}, "last_dates": {}},
+                }
+            )
+            + "\n",
+        )
+        host_committed, host_cf = await execute_claimed_host_run(
+            conn,
+            lock_conn=lock_conn1,
+            host_client=host_client,
+            claimed=claimed_host,
+            path_map=path_map,
+        )
+        assert host_committed is True
+        assert host_cf == 0
+
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT status, exit_code FROM dalton_data_task_runs WHERE run_id = %(r)s::uuid",
+                {"r": host_run_id},
+            )
+            host_run_row = await cur.fetchone()
+            await cur.execute(
+                "SELECT slot_state, generation FROM dalton_data_task_slot WHERE slot_id = 1"
+            )
+            slot_after_host = await cur.fetchone()
+        assert host_run_row is not None
+        assert host_run_row["status"] == "succeeded"
+        assert host_run_row["exit_code"] == 0
+        assert slot_after_host is not None
+        assert slot_after_host["slot_state"] == "idle"
+        assert slot_after_host["generation"] == 1
+
         # Re-insert an eligible T18 queued run and claim it normally
         eligible_run_id = str(uuid4())
         async with conn.transaction():
@@ -318,18 +387,7 @@ async def test_real_postgres_data_jobs_end_to_end(tmp_path: Path) -> None:
         claimed = await claim_next_queued_run(conn, now_utc=t18_slot_2, available_memory_mb=2048)
         assert claimed is not None
         assert claimed.run_id == eligible_run_id
-        assert claimed.generation == 1
-
-        # Verify disabled_run_id and host_run_id were cancelled
-        async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(
-                "SELECT run_id::text, status, failure_reason FROM dalton_data_task_runs WHERE run_id IN (%(r1)s::uuid, %(r2)s::uuid)",
-                {"r1": disabled_run_id, "r2": host_run_id},
-            )
-            cancelled_rows = {r["run_id"]: r for r in await cur.fetchall()}
-        assert cancelled_rows[disabled_run_id]["status"] == "cancelled"
-        assert cancelled_rows[host_run_id]["status"] == "cancelled"
-        assert cancelled_rows[host_run_id]["failure_reason"] == "host_runner_not_enabled"
+        assert claimed.generation == 2
 
         # 5. Startup UPDATE affecting 0 rows: aborts run, removes container, and releases slot to idle
         async with conn.transaction():
