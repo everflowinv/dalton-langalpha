@@ -162,6 +162,8 @@ src/dalton/data_jobs/container_runner.py
 src/dalton/data_jobs/host_runner.py
 src/dalton/data_jobs/runner_wrapper.py
 src/dalton/data_jobs/evaluators.py
+src/dalton/data_jobs/freeze.py
+scripts/dalton/data_tasks_parity.py
 tests/unit/dalton/fixtures/oc1_task_baseline.md
 tests/unit/dalton/test_data_jobs.py
 tests/integration/dalton/test_data_jobs_db.py
