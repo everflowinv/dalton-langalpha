@@ -72,6 +72,8 @@ export interface PendingReplayFallbackEntry {
   targetAddress: string;
   inboundMessageId?: string | null;
   scopeKey?: string | null;
+  generation?: number | null;
+  activityOrigin?: DeliveryActivityOrigin | null;
   isBackgroundRun?: boolean;
 }
 
@@ -271,6 +273,7 @@ export class ChannelGatewayOrchestrator {
           targetAddress: event.chatAddress,
           inboundMessageId: event.messageId,
           scopeKey: event.threadScopeKey,
+          generation: resolved.generation,
         });
       }
       return;
@@ -525,6 +528,13 @@ export class ChannelGatewayOrchestrator {
     const { event, cmd, targetKind, workspaceQuery, cmdRes } = params;
 
     if (
+      cmdRes.command_reply_pending === false &&
+      (cmd !== "stop" || cmdRes.command_effect_status === "done")
+    ) {
+      return;
+    }
+
+    if (
       !cmdRes.ok &&
       (cmdRes.linked === false || cmdRes.deny_reason === "not_linked")
     ) {
@@ -540,18 +550,91 @@ export class ChannelGatewayOrchestrator {
 
     const userId = cmdRes.dalton_user_id ?? null;
 
-    if (cmd === "stop" && cmdRes.ok && cmdRes.thread_id) {
+    if (cmd === "stop" && cmdRes.ok) {
       if (cmdRes.command_effect_status !== "done") {
-        await this.backend.cancelThreadTurn(
-          userId ?? "",
-          cmdRes.thread_id,
-          cmdRes.run_id ?? null,
-        );
-        await this.backend.updateInboundProgress({
-          platform: event.platform,
-          message_id: event.messageId,
-          command_effect_status: "done",
-        });
+        if (!cmdRes.thread_id || !cmdRes.run_id) {
+          await this.backend.updateInboundProgress({
+            platform: event.platform,
+            message_id: event.messageId,
+            command_effect_status: "done",
+          });
+        } else {
+          let cancelStatus: number | null = null;
+          try {
+            const cancelRes = await this.backend.cancelThreadTurn(
+              userId ?? "",
+              cmdRes.thread_id,
+              cmdRes.run_id,
+            );
+            cancelStatus = cancelRes.status;
+          } catch (err) {
+            if (err instanceof BackendHttpError) {
+              cancelStatus = err.status;
+            } else {
+              cancelStatus = null;
+            }
+          }
+
+          const isConfirmedOrAlreadyEnded =
+            cancelStatus === 200 ||
+            cancelStatus === 202 ||
+            cancelStatus === 204 ||
+            cancelStatus === 404 ||
+            cancelStatus === 409;
+          const isPermanentDenial =
+            cancelStatus !== null &&
+            cancelStatus >= 400 &&
+            cancelStatus < 500 &&
+            cancelStatus !== 404 &&
+            cancelStatus !== 409 &&
+            cancelStatus !== 429;
+
+          if (isConfirmedOrAlreadyEnded) {
+            await this.backend.updateInboundProgress({
+              platform: event.platform,
+              message_id: event.messageId,
+              command_effect_status: "done",
+            });
+          } else if (isPermanentDenial) {
+            const failText = `Failed to stop the current run (status ${cancelStatus}).`;
+            if (cmdRes.command_reply_pending !== false) {
+              if (userId) {
+                await this.sendNoticeDelivery({
+                  deliveryKey: `notice:${event.platform}:${event.messageId}:command_err`,
+                  userId,
+                  threadId: cmdRes.thread_id,
+                  runId: cmdRes.run_id,
+                  platform: event.platform,
+                  target: event.chatAddress,
+                  inboundMessageId: event.messageId,
+                  text: failText,
+                  replyToMessageId: event.messageId,
+                  threadScopeKey: event.threadScopeKey,
+                  sourceScopeKey: event.threadScopeKey,
+                  sourceGeneration:
+                    typeof cmdRes.generation === "number"
+                      ? cmdRes.generation
+                      : null,
+                  activityOrigin: "none",
+                });
+              } else {
+                await this.sendDirectAdapterNotice(event, failText);
+              }
+            }
+            await this.backend.updateInboundProgress({
+              platform: event.platform,
+              message_id: event.messageId,
+              status: "failed",
+              command_effect_status: "done",
+              command_reply_pending: false,
+              fallback_pending: false,
+            });
+            return;
+          } else {
+            // Transient failure (5xx, 429, or network error): keep `pending_cancel` persisted for recovery
+            return;
+          }
+        }
       }
     }
 
@@ -693,6 +776,9 @@ export class ChannelGatewayOrchestrator {
           ? `workspace \`${cmdRes.workspace_name}\` (\`${cmdRes.workspace_id}\`)`
           : `workspace \`${cmdRes.workspace_id}\``
         : "Home (Chief of Staff)";
+      if (cmdRes.switched === false) {
+        return `Already in ${targetLabel}. Keeping current conversation.`;
+      }
       return `Switched this conversation to ${targetLabel} and started a new thread.`;
     }
 
@@ -723,6 +809,9 @@ export class ChannelGatewayOrchestrator {
     }
     if (!cmdRes.thread_id) {
       return "No active conversation thread to stop.";
+    }
+    if (!cmdRes.run_id) {
+      return "No active run to stop in the current session.";
     }
     return "Stopped the current run.";
   }
@@ -1573,6 +1662,7 @@ export class ChannelGatewayOrchestrator {
           targetAddress: event.chatAddress,
           inboundMessageId: event.messageId,
           scopeKey: event.threadScopeKey,
+          generation: resolved.generation,
         });
       }
       await this.backend.updateInboundProgress({
@@ -2151,6 +2241,7 @@ export class ChannelGatewayOrchestrator {
           targetAddress: event.chatAddress,
           inboundMessageId: event.messageId,
           scopeKey: event.threadScopeKey,
+          generation: resolved.generation,
         });
         return;
       }
@@ -2252,6 +2343,7 @@ export class ChannelGatewayOrchestrator {
             targetAddress: event.chatAddress,
             inboundMessageId: event.messageId,
             scopeKey: event.threadScopeKey,
+            generation: resolved.generation,
           });
           return;
         }
@@ -2308,6 +2400,12 @@ export class ChannelGatewayOrchestrator {
                 platform: event.platform,
                 scope_key: event.threadScopeKey,
                 dalton_user_id: userId,
+                generation: resolved.generation,
+                thread_id: targetTid,
+                run_id:
+                  resolved.pending_interrupt?.run_id ?? conflictRunId ?? null,
+                interrupt_id:
+                  resolved.pending_interrupt?.interrupt_id ?? null,
                 pending_interrupt: null,
               },
             });
@@ -2418,6 +2516,7 @@ export class ChannelGatewayOrchestrator {
               targetAddress: event.chatAddress,
               inboundMessageId: event.messageId,
               scopeKey: event.threadScopeKey,
+              generation: resolved.generation,
             });
             return;
           }
@@ -3432,6 +3531,8 @@ export class ChannelGatewayOrchestrator {
             targetAddress: event.chatAddress,
             inboundMessageId: event.messageId,
             scopeKey: event.threadScopeKey,
+            generation: resolved.generation,
+            activityOrigin: params.isAttachedStream ? "replay" : "conversation",
           });
           watchHandle.needsReconnectSync = true;
         }
@@ -3580,6 +3681,7 @@ export class ChannelGatewayOrchestrator {
           targetAddress: event.chatAddress,
           inboundMessageId: event.messageId,
           scopeKey: event.threadScopeKey,
+          generation: resolved.generation,
         });
       }
       await this.backend.updateInboundProgress({
@@ -3696,7 +3798,7 @@ export class ChannelGatewayOrchestrator {
     inboundMessageId?: string | null;
     scopeKey?: string | null;
     generation?: number | null;
-    activityOrigin?: "conversation" | "replay" | "notification" | "command" | null;
+    activityOrigin?: DeliveryActivityOrigin | null;
     isBackgroundRun?: boolean;
     deferFinalCompletion?: boolean;
   }): Promise<boolean> {
@@ -4716,6 +4818,8 @@ export class ChannelGatewayOrchestrator {
           targetAddress,
           inboundMessageId,
           scopeKey,
+          generation,
+          activityOrigin,
           isBackgroundRun,
         });
         watchHandle.needsReconnectSync = true;
@@ -5258,6 +5362,10 @@ export class ChannelGatewayOrchestrator {
 
     const isStaleSessionInterrupt =
       prog.session_is_current_for_interrupt === false;
+    const hasCurrentGeneration =
+      !isStaleSessionInterrupt &&
+      typeof generation === "number" &&
+      generation > 0;
     const promptText = this.formatInterruptPrompt(
       pendingState,
       isStaleSessionInterrupt,
@@ -5273,6 +5381,9 @@ export class ChannelGatewayOrchestrator {
       inboundMessageId: inboundMessageId ?? null,
       text: promptText,
       threadScopeKey: scopeKey,
+      sourceScopeKey: scopeKey,
+      sourceGeneration: hasCurrentGeneration ? generation : null,
+      activityOrigin: hasCurrentGeneration ? "conversation" : "none",
     });
     return deliveryRes.status === "sent" || deliveryRes.status === "partial";
   }
@@ -5371,6 +5482,7 @@ export class ChannelGatewayOrchestrator {
       targetAddress: event.chatAddress,
       inboundMessageId: event.messageId,
       scopeKey: event.threadScopeKey,
+      generation: resolved.generation,
       deferFinalCompletion,
     });
   }
@@ -5391,8 +5503,15 @@ export class ChannelGatewayOrchestrator {
     const existing = this.activeWatches.get(params.threadId);
     if (existing) {
       existing.targetAddress = params.targetAddress;
-      existing.scopeKey = params.scopeKey;
-      existing.generation = params.generation;
+      if (
+        params.scopeKey &&
+        (params.scopeKey !== params.targetAddress || !existing.scopeKey)
+      ) {
+        existing.scopeKey = params.scopeKey;
+      }
+      if (params.generation > 0) {
+        existing.generation = params.generation;
+      }
       if (params.lastSeenTurnIndex > existing.lastSeenTurnIndex) {
         existing.lastSeenTurnIndex = params.lastSeenTurnIndex;
       }
@@ -5492,6 +5611,7 @@ export class ChannelGatewayOrchestrator {
                         platform: handle.platform,
                         targetAddress: handle.targetAddress,
                         scopeKey: handle.scopeKey,
+                        generation: handle.generation,
                         isBackgroundRun: true,
                       });
                       if (!recentSettled) {
@@ -6047,6 +6167,7 @@ export class ChannelGatewayOrchestrator {
         platform: handle.platform,
         targetAddress: handle.targetAddress,
         scopeKey: handle.scopeKey,
+        generation: handle.generation,
       });
       if (settled) {
         handle.lastSeenTurnIndex = Math.max(
@@ -6251,6 +6372,7 @@ export class ChannelGatewayOrchestrator {
             platform: handle.platform,
             targetAddress: handle.targetAddress,
             scopeKey: handle.scopeKey,
+            generation: handle.generation,
             isBackgroundRun: true,
           });
           if (settled) {
@@ -6312,6 +6434,9 @@ export class ChannelGatewayOrchestrator {
               platform: handle.platform,
               targetAddress: handle.targetAddress,
               threadScopeKey: handle.scopeKey,
+              sourceScopeKey: handle.scopeKey,
+              sourceGeneration: handle.generation,
+              activityOrigin: "notification",
               trimmedText: trimmed,
               sentToCurrentCount: prog.sent_to_current_count,
             });
@@ -6333,6 +6458,7 @@ export class ChannelGatewayOrchestrator {
                 platform: handle.platform,
                 targetAddress: handle.targetAddress,
                 scopeKey: handle.scopeKey,
+                generation: handle.generation,
                 isBackgroundRun: true,
               });
             }
@@ -6348,6 +6474,7 @@ export class ChannelGatewayOrchestrator {
               platform: handle.platform,
               targetAddress: handle.targetAddress,
               scopeKey: handle.scopeKey,
+              generation: handle.generation,
               isBackgroundRun: true,
             });
             if (!settled) {
@@ -6637,7 +6764,10 @@ export class ChannelGatewayOrchestrator {
       }
 
       for (const bg of rec.background_runs ?? []) {
-        const bgOk = await this.recoverSingleBackgroundRun(bg);
+        const bgOk = await this.recoverSingleBackgroundRun(
+          bg,
+          rec.thread_watches,
+        );
         if (!bgOk) {
           allSettled = false;
         }
@@ -6694,6 +6824,7 @@ export class ChannelGatewayOrchestrator {
                 platform: w.platform,
                 targetAddress: w.target_address,
                 scopeKey: w.scope_key,
+                generation: w.generation,
               });
               if (!turnOk) {
                 allSettled = false;
@@ -6725,7 +6856,7 @@ export class ChannelGatewayOrchestrator {
     });
 
     for (const bg of rec.background_runs ?? []) {
-      await this.recoverSingleBackgroundRun(bg);
+      await this.recoverSingleBackgroundRun(bg, rec.thread_watches);
     }
 
     for (const w of rec.thread_watches ?? []) {
@@ -6753,6 +6884,7 @@ export class ChannelGatewayOrchestrator {
               platform: w.platform,
               targetAddress: w.target_address,
               scopeKey: w.scope_key,
+              generation: w.generation,
             });
           }
         }
@@ -6847,7 +6979,7 @@ export class ChannelGatewayOrchestrator {
         this.recoverSingleInboundRow(row),
       ),
       ...(recovery.background_runs ?? []).map((bg) =>
-        this.recoverSingleBackgroundRun(bg),
+        this.recoverSingleBackgroundRun(bg, recovery.thread_watches),
       ),
       ...(recovery.thread_watches ?? []).map((w) =>
         this.recoverSingleThreadWatch(w),
@@ -6916,11 +7048,14 @@ export class ChannelGatewayOrchestrator {
             ? row.raw_payload.sender_id
             : "") || "recovered_user";
     const generation =
-      typeof row.generation === "number"
-        ? row.generation
-        : typeof row.raw_payload?.generation === "number"
-          ? row.raw_payload.generation
-          : 0;
+      typeof row.session_generation === "number" && row.session_generation > 0
+        ? row.session_generation
+        : typeof row.generation === "number" && row.generation > 0
+          ? row.generation
+          : typeof row.raw_payload?.generation === "number" &&
+              row.raw_payload.generation > 0
+            ? row.raw_payload.generation
+            : 0;
 
     const recoveredAttachments = this.parseRecoveredAttachments(
       row.raw_payload?.attachments,
@@ -6975,45 +7110,97 @@ export class ChannelGatewayOrchestrator {
         cmdReq.target_kind === "shortcut_name"
           ? cmdReq.target_kind
           : null;
+      const workspaceId =
+        typeof cmdReq.workspace_id === "string" ? cmdReq.workspace_id : null;
       const workspaceQuery =
         typeof cmdReq.workspace_query === "string"
           ? cmdReq.workspace_query
           : null;
-      const syntheticCmdRes: I3SessionCommandResponse = {
-        ...(cmdResRaw as unknown as I3SessionCommandResponse),
-        ok:
-          typeof cmdResRaw.ok === "boolean"
-            ? cmdResRaw.ok
-            : row.status !== "failed",
-        linked: true,
-        dalton_user_id: userId,
-        generation:
-          typeof cmdResRaw.generation === "number"
-            ? cmdResRaw.generation
-            : generation,
-        external_thread_id:
-          typeof cmdResRaw.external_thread_id === "string"
-            ? cmdResRaw.external_thread_id
-            : row.external_thread_id,
-        thread_id:
-          typeof cmdResRaw.thread_id === "string"
+      const reauthorizedRes = await this.backend.sessionCommand({
+        cmd,
+        platform: row.platform,
+        platform_user_id: platformUserId,
+        chat_type: row.chat_type,
+        chat_address: row.chat_address,
+        chat_id: syntheticEvent.chatId,
+        chat_name: syntheticEvent.chatName ?? null,
+        scope_key: row.thread_scope_key,
+        message_id: row.message_id,
+        request_key:
+          row.request_key ||
+          makeInboundRequestKey(row.platform, row.message_id),
+        raw_payload: row.raw_payload ?? {},
+        target_kind: targetKind,
+        workspace_id: workspaceId,
+        workspace_query: workspaceQuery,
+      });
+      const persistedStopRunId =
+        typeof row.run_id === "string" && row.run_id.length > 0
+          ? row.run_id
+          : typeof cmdResRaw.run_id === "string" && cmdResRaw.run_id.length > 0
+            ? cmdResRaw.run_id
+            : null;
+      const persistedStopThreadId =
+        typeof row.thread_id === "string" && row.thread_id.length > 0
+          ? row.thread_id
+          : typeof cmdResRaw.thread_id === "string" &&
+              cmdResRaw.thread_id.length > 0
             ? cmdResRaw.thread_id
-            : row.thread_id,
+            : null;
+      const effectiveCmdRes: I3SessionCommandResponse = {
+        ...(cmdResRaw as unknown as I3SessionCommandResponse),
+        ...reauthorizedRes,
+        generation:
+          typeof reauthorizedRes.generation === "number" &&
+          reauthorizedRes.generation > 0
+            ? reauthorizedRes.generation
+            : typeof cmdResRaw.generation === "number"
+              ? cmdResRaw.generation
+              : generation,
+        external_thread_id:
+          reauthorizedRes.external_thread_id ??
+          (typeof cmdResRaw.external_thread_id === "string"
+            ? cmdResRaw.external_thread_id
+            : row.external_thread_id),
+        thread_id:
+          cmd === "stop"
+            ? persistedStopThreadId
+            : (reauthorizedRes.thread_id ??
+              (typeof cmdResRaw.thread_id === "string"
+                ? cmdResRaw.thread_id
+                : row.thread_id)),
         run_id:
-          typeof cmdResRaw.run_id === "string" ? cmdResRaw.run_id : row.run_id,
+          cmd === "stop"
+            ? persistedStopRunId
+            : (reauthorizedRes.run_id ??
+              (typeof cmdResRaw.run_id === "string"
+                ? cmdResRaw.run_id
+                : row.run_id)),
         command_effect_status:
-          row.command_effect_status ??
-          (cmd === "stop" && (cmdResRaw.thread_id || row.thread_id)
-            ? "pending_cancel"
-            : "done"),
-        command_reply_pending: row.command_reply_pending ?? true,
+          !reauthorizedRes.ok ||
+          (cmd === "stop" && (!persistedStopThreadId || !persistedStopRunId))
+            ? "done"
+            : row.command_effect_status === "done"
+              ? "done"
+              : (reauthorizedRes.command_effect_status ??
+                row.command_effect_status ??
+                (cmd === "stop" ? "pending_cancel" : "done")),
+        command_reply_pending:
+          !reauthorizedRes.ok &&
+          reauthorizedRes.command_reply_pending === false
+            ? false
+            : row.command_reply_pending === false
+              ? false
+              : (reauthorizedRes.command_reply_pending ??
+                row.command_reply_pending ??
+                true),
       };
       await this.completeSessionCommandExecution({
         event: syntheticEvent,
         cmd,
         targetKind,
         workspaceQuery,
-        cmdRes: syntheticCmdRes,
+        cmdRes: effectiveCmdRes,
       });
       return;
     }
@@ -7062,6 +7249,7 @@ export class ChannelGatewayOrchestrator {
         targetAddress: row.chat_address,
         inboundMessageId: row.message_id,
         scopeKey: row.thread_scope_key,
+        generation,
       });
       return;
     }
@@ -7177,6 +7365,7 @@ export class ChannelGatewayOrchestrator {
           targetAddress: row.chat_address,
           inboundMessageId: row.message_id,
           scopeKey: row.thread_scope_key,
+          generation,
           deferFinalCompletion: true,
         });
       }
@@ -7259,6 +7448,7 @@ export class ChannelGatewayOrchestrator {
           targetAddress: row.chat_address,
           inboundMessageId: row.message_id,
           scopeKey: row.thread_scope_key,
+          generation,
         });
         return;
       }
@@ -7359,7 +7549,30 @@ export class ChannelGatewayOrchestrator {
 
   private async recoverSingleBackgroundRun(
     bg: RecoverBackgroundRunRow,
+    recoveredWatches?: RecoverThreadWatchRow[],
   ): Promise<boolean> {
+    const activeWatch = this.activeWatches.get(bg.thread_id);
+    const recoveredWatch = recoveredWatches?.find(
+      (w) => w.thread_id === bg.thread_id,
+    );
+    const bgScopeKey =
+      (typeof bg.scope_key === "string" && bg.scope_key.length > 0
+        ? bg.scope_key
+        : undefined) ??
+      activeWatch?.scopeKey ??
+      recoveredWatch?.scope_key ??
+      bg.target_address;
+    const bgGeneration =
+      typeof bg.session_generation === "number" && bg.session_generation > 0
+        ? bg.session_generation
+        : typeof bg.generation === "number" && bg.generation > 0
+          ? bg.generation
+          : activeWatch && activeWatch.generation > 0
+            ? activeWatch.generation
+            : recoveredWatch && recoveredWatch.generation > 0
+              ? recoveredWatch.generation
+              : 0;
+
     if (
       (bg.status === "completed" || bg.status === "failed") &&
       bg.fallback_pending
@@ -7371,6 +7584,8 @@ export class ChannelGatewayOrchestrator {
         turnIndex: bg.turn_index,
         platform: bg.platform,
         targetAddress: bg.target_address,
+        scopeKey: bgScopeKey,
+        generation: bgGeneration > 0 ? bgGeneration : null,
         isBackgroundRun: true,
       });
     }
@@ -7388,8 +7603,8 @@ export class ChannelGatewayOrchestrator {
           userId: bg.dalton_user_id,
           platform: bg.platform,
           targetAddress: bg.target_address,
-          scopeKey: bg.target_address,
-          generation: 0,
+          scopeKey: bgScopeKey,
+          generation: bgGeneration,
           lastSeenTurnIndex: bg.turn_index ?? 0,
         });
         return await this.consumeBackgroundRunStream({
@@ -7412,6 +7627,8 @@ export class ChannelGatewayOrchestrator {
           turnIndex: bg.turn_index,
           platform: bg.platform,
           targetAddress: bg.target_address,
+          scopeKey: bgScopeKey,
+          generation: bgGeneration > 0 ? bgGeneration : null,
           isBackgroundRun: true,
         });
       }
@@ -7460,6 +7677,7 @@ export class ChannelGatewayOrchestrator {
           platform: w.platform,
           targetAddress: w.target_address,
           scopeKey: w.scope_key,
+          generation: w.generation,
         });
       }
     }

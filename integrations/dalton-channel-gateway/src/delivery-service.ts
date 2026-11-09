@@ -391,13 +391,28 @@ export class DeliveryService {
             threadScopeKey: options.threadScopeKey ?? null,
             weixinContextToken: claim.weixin_context_token ?? null,
           });
-          platformMessageIds.push(sendRes.messageId);
-          anyFileSucceeded = true;
+          const fileSucceeded =
+            sendRes.status === "sent" || sendRes.status === "linked";
+          if (fileSucceeded) {
+            platformMessageIds.push(sendRes.messageId);
+            anyFileSucceeded = true;
+          } else {
+            anyFileFailed = true;
+          }
           fileOutcomes.push({
             path: fileRef.path,
             status: sendRes.status,
             reason: sendRes.reason ?? null,
           });
+          if (fileSucceeded) {
+            await this.backend.updateDeliveryProgress({
+              delivery_key: options.deliveryKey,
+              sent_chunks: sentChunks,
+              total_chunks: totalChunks,
+              platform_message_ids: [...platformMessageIds],
+              files_status: [...fileOutcomes],
+            });
+          }
         } catch (err) {
           anyFileFailed = true;
           if (err instanceof ChannelDeliveryError && err.outcome === "unknown") {

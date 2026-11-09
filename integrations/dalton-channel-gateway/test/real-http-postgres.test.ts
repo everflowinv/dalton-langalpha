@@ -10,7 +10,10 @@ import { FakeChannelAdapter } from "../src/channels/fake-adapter.js";
 import { FeishuChannelAdapter } from "../src/channels/feishu/index.js";
 import { loadConfig } from "../src/config.js";
 import { createGatewayApp } from "../src/server.js";
-import type { ChannelAdapter } from "../src/channels/adapter.js";
+import {
+  ChannelDeliveryError,
+  type ChannelAdapter,
+} from "../src/channels/adapter.js";
 import type { ChannelPlatform } from "../src/types.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -39,12 +42,12 @@ function resolveTestDsn(): string | null {
 
 function resolvePythonBin(): string {
   const candidates = [
-    resolve(REPO_ROOT, "../laneD/.venv/bin/python"),
+    process.env.DALTON_TEST_PYTHON_BIN,
     resolve(REPO_ROOT, ".venv/bin/python"),
     "python3",
   ];
   for (const cand of candidates) {
-    if (cand === "python3" || existsSync(cand)) {
+    if (cand && (cand === "python3" || existsSync(cand))) {
       return cand;
     }
   }
@@ -96,6 +99,12 @@ interface InspectResponse {
     command_effect_status: string | null;
     command_reply_pending: boolean;
   } | null;
+  threads: Array<{
+    thread_id: string;
+    thread_index: number;
+    external_id: string | null;
+    turn_indexes: number[];
+  }>;
 }
 
 async function startOrAttachRealBackend(): Promise<{
@@ -282,18 +291,28 @@ describe("Real HTTP End-to-End: FeishuChannelAdapter -> GatewayOrchestrator -> H
           scopeKey?: string;
           userId?: string;
           messageId?: string;
+          workspaceId?: string;
         }): Promise<InspectResponse> => {
           const qs = new URLSearchParams({ platform: "feishu" });
           if (params.scopeKey) qs.set("scope_key", params.scopeKey);
           if (params.userId) qs.set("dalton_user_id", params.userId);
           if (params.messageId) qs.set("message_id", params.messageId);
+          if (params.workspaceId) qs.set("workspace_id", params.workspaceId);
           const deadline = Date.now() + 5_000;
           while (true) {
             const r = await fetch(`${baseUrl}/test-harness/inspect?${qs.toString()}`);
             expect(r.status).toBe(200);
             const snapshot = (await r.json()) as InspectResponse;
-            if (!params.messageId || !snapshot.inbound ||
-                ["completed", "failed", "denied"].includes(snapshot.inbound.status) || Date.now() >= deadline) {
+            if (
+              !params.messageId ||
+              !snapshot.inbound ||
+              ["completed", "failed", "denied", "ignored"].includes(
+                snapshot.inbound.status,
+              ) ||
+              (snapshot.inbound.event_kind === "command" &&
+                snapshot.inbound.command_effect_status === "pending_cancel") ||
+              Date.now() >= deadline
+            ) {
               return snapshot;
             }
             await new Promise((resolve) => setTimeout(resolve, 20));
@@ -396,6 +415,36 @@ describe("Real HTTP End-to-End: FeishuChannelAdapter -> GatewayOrchestrator -> H
         expect(feishuOutbound.sentTexts.at(-1)?.text).toContain(
           `ws=${boot.home_ws_a}`,
         );
+
+        const mDm1Turn2 = `${boot.prefix}_om_dm_1_turn2`;
+        await feishuInboundAdapter.receiveRawEvent({
+          sender: {
+            sender_id: { open_id: boot.puid_a },
+            sender_type: "user",
+          },
+          message: {
+            message_id: mDm1Turn2,
+            chat_id: "oc_dm_a",
+            chat_type: "p2p",
+            message_type: "text",
+            content: JSON.stringify({
+              text: "Second turn on the same thread",
+            }),
+          },
+        });
+        const snapDm1Turn2 = await inspectDb({
+          scopeKey: dmScopeA,
+          userId: boot.user_a,
+          messageId: mDm1Turn2,
+          workspaceId: boot.home_ws_a,
+        });
+        expect(snapDm1Turn2.session?.generation).toBe(1);
+        expect(snapDm1Turn2.inbound?.thread_id).toBe(snapDm1.inbound?.thread_id);
+        const firstHomeThread = (snapDm1Turn2.threads ?? []).find(
+          (thread) => thread.thread_id === snapDm1.inbound?.thread_id,
+        );
+        expect(firstHomeThread?.turn_indexes).toEqual([1, 2]);
+        const stableHomeThreadIndex = firstHomeThread?.thread_index;
 
         // -------------------------------------------------------------------
         // 2. Chinese + space workspace name (`/<cn_name>`), duplicate candidates,
@@ -683,6 +732,26 @@ describe("Real HTTP End-to-End: FeishuChannelAdapter -> GatewayOrchestrator -> H
         expect(snapAfter6h.inbound?.workspace_id).toBe(boot.home_ws_a);
         expect(snapAfter6h.session?.generation).toBe(7);
         expect(snapAfter6h.session?.override_workspace_id).toBeNull();
+        const homeThreads =
+          (
+            await inspectDb({
+              workspaceId: boot.home_ws_a,
+            })
+          ).threads ?? [];
+        const gen1Thread = homeThreads.find(
+          (thread) => thread.thread_id === snapDm1.inbound?.thread_id,
+        );
+        const gen7Thread = homeThreads.find(
+          (thread) => thread.thread_id === snapAfter6h.inbound?.thread_id,
+        );
+        expect(gen1Thread?.thread_index).toBe(stableHomeThreadIndex);
+        expect(gen1Thread?.turn_indexes).toEqual([1, 2]);
+        expect(gen7Thread?.thread_id).not.toBe(gen1Thread?.thread_id);
+        expect(gen7Thread?.thread_index).not.toBe(gen1Thread?.thread_index);
+        expect(gen7Thread?.turn_indexes).toEqual([1]);
+        expect(new Set(homeThreads.map((thread) => thread.thread_index)).size).toBe(
+          homeThreads.length,
+        );
 
         // -------------------------------------------------------------------
         // 5. Delivery Activity Guards: notification & stale-generation deliveries do NOT extend activity
@@ -744,6 +813,111 @@ describe("Real HTTP End-to-End: FeishuChannelAdapter -> GatewayOrchestrator -> H
           agedGen7.activity_epoch,
           3,
         );
+
+        // 5c. Standalone assistant delivery (`activityOrigin: "conversation"`) updates `last_conversation_activity_at`
+        //     per attachment incrementally via I-7, even if attachment #2 fails.
+        //     Bytes are uploaded to and downloaded from the harness file HTTP routes.
+        const fileWorkspaceId =
+          snapAfter6h.inbound?.workspace_id ?? boot.home_ws_a;
+        await realBackendClient.uploadWorkspaceFile(
+          boot.user_a,
+          fileWorkspaceId,
+          "reports/att1.pdf",
+          "att1.pdf",
+          Buffer.from("ATT_1"),
+          "application/pdf",
+        );
+        await realBackendClient.uploadWorkspaceFile(
+          boot.user_a,
+          fileWorkspaceId,
+          "reports/att2.pdf",
+          "att2.pdf",
+          Buffer.from("ATT_2"),
+          "application/pdf",
+        );
+        let attCallCount = 0;
+        let epochAfterFirstAttachment = 0;
+        feishuOutbound.setSendFileBehavior(async (params) => {
+          attCallCount += 1;
+          if (attCallCount === 1) {
+            expect(params.content.equals(Buffer.from("ATT_1"))).toBe(true);
+            return {
+              messageId: "feishu_file_att_1",
+              status: "sent",
+              reason: null,
+            };
+          }
+          const snapMidAttachments = await inspectDb({
+            scopeKey: dmScopeA,
+            userId: boot.user_a,
+          });
+          epochAfterFirstAttachment =
+            snapMidAttachments.session?.activity_epoch ?? 0;
+          expect(epochAfterFirstAttachment).toBeGreaterThan(
+            agedGen7.activity_epoch,
+          );
+          throw new ChannelDeliveryError(
+            "simulated second attachment failure",
+            { outcome: "failed", code: "unavailable" },
+          );
+        });
+        try {
+          const partialAttRes = await app1.deliveryService.executeDelivery({
+            deliveryKey: `conv_inc_att:${curRunId}`,
+            kind: "agent_send",
+            userId: boot.user_a,
+            threadId: curThreadId,
+            runId: curRunId,
+            platform: "feishu",
+            target: "feishu:@me",
+            inboundMessageId: mAfter6h,
+            text: "",
+            files: [
+              {
+                path: "reports/att1.pdf",
+                workspace_id: fileWorkspaceId,
+              },
+              {
+                path: "reports/att2.pdf",
+                workspace_id: fileWorkspaceId,
+              },
+            ],
+            sourceScopeKey: dmScopeA,
+            sourceGeneration: 7,
+            activityOrigin: "conversation",
+          });
+          expect(partialAttRes.status).toBe("partial");
+          expect(epochAfterFirstAttachment).toBeGreaterThan(
+            agedGen7.activity_epoch,
+          );
+          const snapAfterPartialAtt = await inspectDb({
+            scopeKey: dmScopeA,
+            userId: boot.user_a,
+          });
+          expect(
+            snapAfterPartialAtt.session?.activity_epoch ?? 0,
+          ).toBeGreaterThan(agedGen7.activity_epoch);
+        } finally {
+          feishuOutbound.setSendFileBehavior(null);
+        }
+
+        // 5d. Spoofed `source_generation` on `staleThreadId` (gen 6) is rejected by real I-6 over HTTP
+        const spoofClaim = await realBackendClient.authorizeAndClaimDelivery({
+          delivery_key: `spoof_gen7:${staleRunId}`,
+          kind: "fallback",
+          user_id: boot.user_a,
+          thread_id: staleThreadId,
+          run_id: staleRunId,
+          platform: "feishu",
+          target: "feishu:@me",
+          inbound_message_id: mBefore6h,
+          has_non_empty_text: true,
+          total_chunks: 1,
+          source_scope_key: dmScopeA,
+          source_generation: 7,
+          activity_origin: "conversation",
+        });
+        expect(spoofClaim.claim_status).toBe("denied");
 
         // -------------------------------------------------------------------
         // 6. Group Chat Mention Triggering & Per-User Session Isolation
@@ -833,6 +1007,184 @@ describe("Real HTTP End-to-End: FeishuChannelAdapter -> GatewayOrchestrator -> H
         expect(snapGrpB.inbound?.workspace_id).not.toBe(boot.ws_a1);
         expect(snapGrpB.session?.generation).toBe(1);
         expect(snapGrpB.session?.override_workspace_id).toBeNull();
+
+        // 6d. Same-workspace switch keeps generation 2 in `ws_cn` and does not start a model turn.
+        // The reply names that workspace and its id.
+        const threadsBeforeSameSwitch =
+          (
+            await inspectDb({
+              workspaceId: boot.ws_cn,
+            })
+          ).threads ?? [];
+        const mGrpSwSame = `${boot.prefix}_om_grp_sw_same`;
+        await feishuInboundAdapter.receiveRawEvent({
+          sender: {
+            sender_id: { open_id: boot.puid_a },
+            sender_type: "user",
+          },
+          message: {
+            message_id: mGrpSwSame,
+            chat_id: boot.grp_chat_id,
+            chat_type: "group",
+            message_type: "text",
+            content: JSON.stringify({ text: `@_user_1 /${boot.cn_name}` }),
+            mentions: [
+              {
+                key: "@_user_1",
+                name: "DaltonBot",
+                id: { open_id: BOT_OPEN_ID },
+              },
+            ],
+          },
+        });
+        const snapGrpSame = await inspectDb({
+          scopeKey: boot.grp_scope,
+          userId: boot.user_a,
+          messageId: mGrpSwSame,
+        });
+        expect(snapGrpSame.session?.generation).toBe(2);
+        expect(snapGrpSame.session?.override_workspace_id).toBe(boot.ws_cn);
+        expect(snapGrpSame.inbound?.event_kind).toBe("command");
+        expect(snapGrpSame.inbound?.thread_id ?? null).toBeNull();
+        expect(snapGrpSame.inbound?.run_id ?? null).toBeNull();
+        expect(snapGrpSame.inbound?.command_result).toMatchObject({
+          ok: true,
+          switched: false,
+          generation: 2,
+          workspace_id: boot.ws_cn,
+          workspace_name: boot.cn_name,
+        });
+        expect(feishuOutbound.sentTexts.at(-1)?.text).toBe(
+          `Already in workspace \`${boot.cn_name}\` (\`${boot.ws_cn}\`). Keeping current conversation.`,
+        );
+        expect(
+          (
+            await inspectDb({
+              workspaceId: boot.ws_cn,
+            })
+          ).threads ?? [],
+        ).toEqual(threadsBeforeSameSwitch);
+
+        // -------------------------------------------------------------------
+        // 7. `/stop` Pinning, 503 Transient Failure -> Startup Recovery 200, and Idempotent `done` Activity Timestamp
+        // -------------------------------------------------------------------
+        await fetch(`${baseUrl}/test-harness/cancel-config`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ next_status: 200, clear_calls: true }),
+        });
+
+        // 7a. `/stop` when thread has NO active run (`curThreadId`'s turn already completed): `run_id: null`, `command_effect_status: "done"`
+        const mStopIdle = `${boot.prefix}_om_stop_idle`;
+        await feishuInboundAdapter.receiveRawEvent({
+          sender: {
+            sender_id: { open_id: boot.puid_a },
+            sender_type: "user",
+          },
+          message: {
+            message_id: mStopIdle,
+            chat_id: "oc_dm_a",
+            chat_type: "p2p",
+            message_type: "text",
+            content: JSON.stringify({ text: "/stop" }),
+          },
+        });
+        const snapStopIdle = await inspectDb({
+          scopeKey: dmScopeA,
+          userId: boot.user_a,
+          messageId: mStopIdle,
+        });
+        expect(snapStopIdle.inbound?.run_id).toBeNull();
+        expect(snapStopIdle.inbound?.command_effect_status).toBe("done");
+        expect(feishuOutbound.sentTexts.at(-1)?.text).toContain(
+          "No active run to stop in the current session.",
+        );
+
+        // 7b. Set an active `in_progress` run on `curThreadId`, configure `/cancel` to return 503, and send `/stop`
+        const activeRunRes = await fetch(
+          `${baseUrl}/test-harness/set-active-run`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              thread_id: curThreadId,
+              user_id: boot.user_a,
+              status: "in_progress",
+            }),
+          },
+        );
+        const { run_id: pinnedRunId } = (await activeRunRes.json()) as {
+          run_id: string;
+        };
+        await fetch(`${baseUrl}/test-harness/cancel-config`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ next_status: 503, clear_calls: true }),
+        });
+
+        const mStop503 = `${boot.prefix}_om_stop_503`;
+        await feishuInboundAdapter.receiveRawEvent({
+          sender: {
+            sender_id: { open_id: boot.puid_a },
+            sender_type: "user",
+          },
+          message: {
+            message_id: mStop503,
+            chat_id: "oc_dm_a",
+            chat_type: "p2p",
+            message_type: "text",
+            content: JSON.stringify({ text: "/stop" }),
+          },
+        });
+        const snapStop503 = await inspectDb({
+          scopeKey: dmScopeA,
+          userId: boot.user_a,
+          messageId: mStop503,
+        });
+        expect(snapStop503.inbound?.thread_id).toBe(curThreadId);
+        expect(snapStop503.inbound?.run_id).toBe(pinnedRunId);
+        expect(snapStop503.inbound?.command_effect_status).toBe(
+          "pending_cancel",
+        );
+        expect(snapStop503.inbound?.command_reply_pending).toBe(true);
+
+        // Now restore `/cancel` to 200 and run startup recovery -> completes cancellation and marks `done`
+        await fetch(`${baseUrl}/test-harness/cancel-config`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ next_status: 200 }),
+        });
+        await app2.orchestrator.runStartupRecovery();
+        const snapStopRecovered = await inspectDb({
+          scopeKey: dmScopeA,
+          userId: boot.user_a,
+          messageId: mStop503,
+        });
+        expect(snapStopRecovered.inbound?.status).toBe("completed");
+        expect(snapStopRecovered.inbound?.command_effect_status).toBe("done");
+        expect(snapStopRecovered.inbound?.command_reply_pending).toBe(false);
+
+        // 7c. Repeating `command_effect_status: "done"` via I-7 does NOT re-extend `last_conversation_activity_at`
+        const agedAfterStop = await ageSession({
+          scopeKey: dmScopeA,
+          userId: boot.user_a,
+          secondsAgo: 1200,
+        });
+        await realBackendClient.updateInboundProgress({
+          platform: "feishu",
+          message_id: mStop503,
+          status: "completed",
+          command_effect_status: "done",
+          command_reply_pending: false,
+        });
+        const snapAfterDupDone = await inspectDb({
+          scopeKey: dmScopeA,
+          userId: boot.user_a,
+        });
+        expect(snapAfterDupDone.session?.activity_epoch).toBeCloseTo(
+          agedAfterStop.activity_epoch,
+          3,
+        );
       } finally {
         if (app2) {
           await app2.stop();

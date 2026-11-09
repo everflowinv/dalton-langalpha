@@ -242,6 +242,7 @@ export interface I3SessionCommandResponse {
   run_id?: string | null;
   command_effect_status?: string | null;
   command_reply_pending?: boolean;
+  switched?: boolean;
 }
 
 export interface I4StateResponse {
@@ -511,6 +512,9 @@ export interface RecoverBackgroundRunRow {
   dalton_user_id: string;
   platform: ChannelPlatform;
   target_address: string;
+  scope_key?: string | null;
+  generation?: number | null;
+  session_generation?: number | null;
   turn_index: number | null;
   status: "streaming" | "running" | "completed" | "failed";
   fallback_pending: boolean;

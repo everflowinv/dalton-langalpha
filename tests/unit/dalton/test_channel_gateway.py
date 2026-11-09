@@ -274,15 +274,29 @@ class InMemoryChannelStore:
                     return [{"thread_id": r["thread_id"]}]
             return []
 
-        if "SELECT run_id FROM dalton_channel_inbound_events WHERE thread_id = %s AND status IN ('accepted', 'streaming')" in norm:
+        if "SELECT run_id FROM dalton_channel_inbound_events WHERE thread_id = %s AND status IN" in norm:
             tid = str(params[0])
             for r in reversed(list(self.inbound_events.values())):
                 if (
                     str(r.get("thread_id") or "") == tid
-                    and r.get("status") in ("accepted", "streaming")
+                    and r.get("status") in ("accepted", "streaming", "dispatched")
                     and r.get("run_id") is not None
                 ):
                     return [{"run_id": r["run_id"]}]
+            return []
+
+        if (
+            "UPDATE dalton_channel_inbound_events SET command_effect_status = 'done'" in norm
+            and "WHERE event_kind = 'command' AND command_effect_status = 'pending_cancel' AND run_id IS NULL" in norm
+        ):
+            for r in self.inbound_events.values():
+                if (
+                    r.get("event_kind") == "command"
+                    and r.get("command_effect_status") == "pending_cancel"
+                    and r.get("run_id") is None
+                ):
+                    r["command_effect_status"] = "done"
+                    r["updated_at"] = now
             return []
 
         if "UPDATE dalton_channel_inbound_events" in norm and "WHERE platform = %s AND message_id = %s" in norm:
@@ -291,7 +305,16 @@ class InMemoryChannelStore:
             row = self.inbound_events.get((plat, mid))
             if not row:
                 return []
-            if "SET status = 'ignored'" in norm and len(params) == 2:
+            if "SET status = 'ignored', command_effect_status = 'done', command_reply_pending = FALSE" in norm:
+                row["status"] = "ignored"
+                row["command_effect_status"] = "done"
+                row["command_reply_pending"] = False
+            elif "SET command_result = %s, updated_at = NOW()" in norm:
+                val = params[0].obj if hasattr(params[0], "obj") else params[0]
+                row["command_result"] = dict(val)
+            elif "SET command_effect_status = 'done', updated_at = NOW()" in norm and len(params) == 2:
+                row["command_effect_status"] = "done"
+            elif "SET status = 'ignored'" in norm and len(params) == 2:
                 row["status"] = "ignored"
             elif "SET dalton_user_id = %s, status = 'ignored'" in norm:
                 row["dalton_user_id"] = str(params[0])
@@ -801,13 +824,29 @@ class InMemoryChannelStore:
                 p_int = p_int_arg.obj if hasattr(p_int_arg, "obj") else p_int_arg
             else:
                 p_int = (prev or {}).get("pending_interrupt")
+            prev_scope = str((prev or {}).get("scope_key") or "")
+            prev_gen = int((prev or {}).get("generation") or 0)
+            eff_scope = (
+                prev_scope
+                if prev
+                and (
+                    scope == ""
+                    or (
+                        scope == addr
+                        and prev_scope != ""
+                        and prev_scope != addr
+                    )
+                )
+                else scope
+            )
+            eff_gen = prev_gen if (prev and gen <= 0 and prev_gen > 0) else gen
             self.thread_watches[tid] = {
                 "thread_id": UUID(tid),
                 "dalton_user_id": uid,
                 "platform": plat,
                 "target_address": addr,
-                "scope_key": scope,
-                "generation": gen,
+                "scope_key": eff_scope,
+                "generation": eff_gen,
                 "last_seen_turn_index": max(
                     last_turn, int((prev or {}).get("last_seen_turn_index") or 0)
                 ),
@@ -910,6 +949,16 @@ class InMemoryChannelStore:
             and "SELECT" in norm
             and "SELECT COALESCE(MAX(sent_to_current_count)" not in norm
         ):
+            if "WHERE thread_id = %s AND status IN ('running', 'streaming')" in norm:
+                tid = str(params[0])
+                for r in reversed(list(self.background_runs.values())):
+                    if (
+                        str(r.get("thread_id") or "") == tid
+                        and r.get("status") in ("running", "streaming")
+                        and r.get("run_id") is not None
+                    ):
+                        return [{"run_id": r["run_id"]}]
+                return []
             if "WHERE thread_id = %s AND fallback_pending = TRUE" in norm:
                 tid = str(params[0])
                 return [
@@ -984,12 +1033,20 @@ class InMemoryChannelStore:
                 "platform_message_ids": list((prev_dlv or {}).get("platform_message_ids") or []),
                 "files_status": list((prev_dlv or {}).get("files_status") or []),
                 "first_response_json": (prev_dlv or {}).get("first_response_json"),
-                "source_scope_key": str(src_scope) if src_scope else (prev_dlv or {}).get("source_scope_key"),
-                "source_generation": int(src_gen) if src_gen is not None else (prev_dlv or {}).get("source_generation"),
+                "source_scope_key": (
+                    prev_dlv.get("source_scope_key")
+                    if prev_dlv is not None
+                    else (str(src_scope) if src_scope else None)
+                ),
+                "source_generation": (
+                    prev_dlv.get("source_generation")
+                    if prev_dlv is not None
+                    else (int(src_gen) if src_gen is not None else None)
+                ),
                 "activity_origin": (
-                    str(act_origin)
-                    if act_origin and str(act_origin) != "none"
-                    else str((prev_dlv or {}).get("activity_origin") or "none")
+                    str(prev_dlv.get("activity_origin") or "none")
+                    if prev_dlv is not None
+                    else str(act_origin or "none")
                 ),
                 "error_code": None,
                 "error_message": None,
@@ -4551,3 +4608,523 @@ def test_ch1_atomic_command_idempotency_recovery_and_hitl_isolation_unit(
     ).json()
     assert r_claim_denied["claim_status"] == "denied"
     assert r_claim_denied["code"] == "not_allowed"
+
+
+def test_ch1_stop_pinning_reauth_hitl_source_and_delivery_immutability_unit(
+    channel_test_env: dict[str, Any],
+) -> None:
+    """Verify CH-1 persistent recovery & security invariants:
+    - `/stop` pins concrete active `run_id` at command execution time; if no active run exists on the thread, `command_effect_status='done'` and `run_id=None` immediately, and startup recovery heals any `pending_cancel` row without `run_id`;
+    - same-workspace switch (`switched=False`) preserves `generation` and `pending_interrupt`, and case-sensitive workspace match takes priority before case-insensitive fallback;
+    - command redelivery/recovery re-verifies identity binding and workspace write access, filters `workspace_list` against current writable workspaces, and never leaks old results or re-applies `new`/`workspace_switch` side effects;
+    - `session_interrupt_update` rejects `generation=None` unless backed by a persisted source matching the current generation, and clearing `pending_interrupt` requires a matching `interrupt_id`/`run_id`/`thread_id`;
+    - `I-6` derives `source_scope_key` and `source_generation` from the persisted source row, rejects spoofed mismatches, and keeps delivery source fields immutable across conflict retries;
+    - `I-7` `command_effect_status='done'` extends `last_conversation_activity_at` only on the first transition from `pending_cancel` to `done`.
+    """
+    client: TestClient = channel_test_env["client"]
+    headers = channel_test_env["headers"]
+    store: InMemoryChannelStore = channel_test_env["store"]
+    writable_by_user = channel_test_env["writable_by_user"]
+
+    ws_upper = str(uuid4())
+    ws_lower = str(uuid4())
+    ws_extra = str(uuid4())
+    for wid, wname in (
+        (ws_upper, "Alpha"),
+        (ws_lower, "alpha"),
+        (ws_extra, "Beta"),
+    ):
+        store.workspaces[wid] = {
+            "workspace_id": UUID(wid),
+            "user_id": "u-owner",
+            "name": wname,
+            "status": "running",
+            "is_home": False,
+        }
+    writable_by_user["u-alice"] = {
+        ws_upper: "Alpha",
+        ws_lower: "alpha",
+        ws_extra: "Beta",
+    }
+    writable_by_user["u-bob"] = {ws_extra: "Beta"}
+
+    t0 = datetime(2026, 11, 9, 8, 0, 0, tzinfo=timezone.utc)
+    store.current_time = t0
+
+    channel_test_env["current_web_user"]["user_id"] = "u-alice"
+    code = client.post(
+        "/api/v1/dalton/channels/bind-codes", json={"platform": "feishu"}
+    ).json()["code"]
+    client.post(
+        "/api/v1/dalton/channels/internal/bind-code/consume",
+        headers=headers,
+        json={
+            "action": "bind",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_sec",
+            "code": code,
+            "is_group": False,
+        },
+    )
+    dm_scope = "dm:ou_alice_sec"
+
+    # 1. Exact case-sensitive workspace match takes priority over case-insensitive match (`Alpha` vs `alpha`)
+    r_sw_upper = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_switch",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_sec",
+            "chat_type": "dm",
+            "scope_key": dm_scope,
+            "message_id": "om_sec_sw_upper",
+            "workspace_query": "Alpha",
+            "target_kind": "shortcut_name",
+        },
+    ).json()
+    assert r_sw_upper["ok"] is True
+    assert r_sw_upper["workspace_id"] == ws_upper
+    assert r_sw_upper["switched"] is True
+    assert r_sw_upper["generation"] == 2
+
+    # 2. Switching to the SAME workspace (`Alpha`) while not expired preserves generation (2) and `pending_interrupt` (`switched=False`)
+    store.session_generations[("feishu", dm_scope, "u-alice")]["pending_interrupt"] = {
+        "interrupt_id": "int_keep",
+        "generation": 2,
+    }
+    r_sw_same = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_switch",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_sec",
+            "chat_type": "dm",
+            "scope_key": dm_scope,
+            "message_id": "om_sec_sw_same",
+            "workspace_query": "Alpha",
+            "target_kind": "shortcut_name",
+        },
+    ).json()
+    assert r_sw_same["ok"] is True
+    assert r_sw_same["workspace_id"] == ws_upper
+    assert r_sw_same["switched"] is False
+    assert r_sw_same["generation"] == 2
+    assert store.session_generations[("feishu", dm_scope, "u-alice")][
+        "pending_interrupt"
+    ] == {"interrupt_id": "int_keep", "generation": 2}
+
+    # 3. `/stop` when thread exists but has NO active run: `run_id=None`, `command_effect_status='done'`
+    r_in_g2 = client.post(
+        "/api/v1/dalton/channels/internal/inbound/register-and-resolve",
+        headers=headers,
+        json={
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_sec",
+            "chat_type": "dm",
+            "chat_address": "feishu:@me",
+            "thread_scope_key": dm_scope,
+            "message_id": "om_sec_turn_1",
+        },
+    ).json()
+    assert r_in_g2["generation"] == 2
+    tid_g2 = str(uuid4())
+    rid_g2_done = str(uuid4())
+    client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=headers,
+        json={
+            "platform": "feishu",
+            "message_id": "om_sec_turn_1",
+            "status": "completed",
+            "thread_id": tid_g2,
+            "run_id": rid_g2_done,
+            "turn_index": 1,
+        },
+    )
+    store.conversation_responses[rid_g2_done] = {
+        "conversation_thread_id": tid_g2,
+        "status": "completed",
+    }
+
+    r_stop_idle = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "stop",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_sec",
+            "chat_type": "dm",
+            "scope_key": dm_scope,
+            "message_id": "om_sec_stop_idle",
+        },
+    ).json()
+    assert r_stop_idle["ok"] is True
+    assert r_stop_idle["thread_id"] == tid_g2
+    assert r_stop_idle["run_id"] is None
+    assert r_stop_idle["command_effect_status"] == "done"
+    assert (
+        store.inbound_events[("feishu", "om_sec_stop_idle")]["command_effect_status"]
+        == "done"
+    )
+
+    # 4. `/stop` when an active run IS in progress: pins `run_id = rid_g2_active` and `command_effect_status = 'pending_cancel'`
+    rid_g2_active = str(uuid4())
+    store.conversation_responses[rid_g2_active] = {
+        "conversation_thread_id": tid_g2,
+        "status": "in_progress",
+    }
+    r_stop_active = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "stop",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_sec",
+            "chat_type": "dm",
+            "scope_key": dm_scope,
+            "message_id": "om_sec_stop_active",
+        },
+    ).json()
+    assert r_stop_active["ok"] is True
+    assert r_stop_active["thread_id"] == tid_g2
+    assert r_stop_active["run_id"] == rid_g2_active
+    assert r_stop_active["command_effect_status"] == "pending_cancel"
+
+    # 5. Idempotent `command_effect_status='done'` activity timestamp update:
+    # First transition from `pending_cancel` -> `done` at t0 + 10m advances `last_conversation_activity_at`,
+    # but repeating `command_effect_status='done'` at t0 + 20m does NOT advance it again!
+    t_done_1 = t0 + timedelta(minutes=10)
+    store.current_time = t_done_1
+    client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=headers,
+        json={
+            "platform": "feishu",
+            "message_id": "om_sec_stop_active",
+            "status": "completed",
+            "command_effect_status": "done",
+            "command_reply_pending": False,
+        },
+    )
+    assert (
+        store.session_generations[("feishu", dm_scope, "u-alice")][
+            "last_conversation_activity_at"
+        ]
+        == t_done_1
+    )
+
+    t_done_2 = t0 + timedelta(minutes=20)
+    store.current_time = t_done_2
+    client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=headers,
+        json={
+            "platform": "feishu",
+            "message_id": "om_sec_stop_active",
+            "status": "completed",
+            "command_effect_status": "done",
+            "command_reply_pending": False,
+        },
+    )
+    assert (
+        store.session_generations[("feishu", dm_scope, "u-alice")][
+            "last_conversation_activity_at"
+        ]
+        == t_done_1
+    )
+
+    # 6. Command redelivery & recovery authorization:
+    # Execute `workspace_list` while u-alice has access to Alpha, alpha, Beta
+    r_list_1 = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_list",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_sec",
+            "chat_type": "dm",
+            "scope_key": dm_scope,
+            "message_id": "om_sec_list_1",
+        },
+    ).json()
+    assert r_list_1["ok"] is True
+    assert {w["workspace_id"] for w in r_list_1["workspaces"]} == {
+        ws_upper,
+        ws_lower,
+        ws_extra,
+    }
+
+    # Revoke `ws_extra` from u-alice -> replaying `om_sec_list_1` filters out `ws_extra`!
+    writable_by_user["u-alice"].pop(ws_extra, None)
+    r_list_replay = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_list",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_sec",
+            "chat_type": "dm",
+            "scope_key": dm_scope,
+            "message_id": "om_sec_list_1",
+        },
+    ).json()
+    assert r_list_replay["ok"] is True
+    assert r_list_replay["duplicate"] is True
+    assert {w["workspace_id"] for w in r_list_replay["workspaces"]} == {
+        ws_upper,
+        ws_lower,
+    }
+
+    # Rebind `ou_alice_sec` to `u-bob` -> replaying `om_sec_list_1` (originally executed by `u-alice`)
+    # MUST fail with `not_linked` and mark the command row ignored/done without leaking u-alice's workspaces!
+    channel_test_env["current_web_user"]["user_id"] = "u-bob"
+    code_bob = client.post(
+        "/api/v1/dalton/channels/bind-codes", json={"platform": "feishu"}
+    ).json()["code"]
+    client.post(
+        "/api/v1/dalton/channels/internal/bind-code/consume",
+        headers=headers,
+        json={
+            "action": "bind",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_sec",
+            "code": code_bob,
+            "is_group": False,
+        },
+    )
+    r_list_hijack = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_list",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_sec",
+            "chat_type": "dm",
+            "scope_key": dm_scope,
+            "message_id": "om_sec_list_1",
+        },
+    ).json()
+    assert r_list_hijack["ok"] is False
+    assert r_list_hijack["linked"] is False
+    assert r_list_hijack["deny_reason"] == "not_linked"
+    assert "workspaces" not in r_list_hijack
+    assert "command_reply_pending" not in r_list_hijack
+    hijack_row = store.inbound_events[("feishu", "om_sec_list_1")]
+    assert hijack_row["status"] == "ignored"
+    assert hijack_row["command_effect_status"] == "done"
+    assert hijack_row["command_reply_pending"] is False
+    assert hijack_row["dalton_user_id"] == "u-alice"
+    assert "workspaces" not in (hijack_row.get("command_result") or {})
+
+    # Bind `ou_alice_sec_2` for u-alice to test HITL & I-6 spoofing protection
+    channel_test_env["current_web_user"]["user_id"] = "u-alice"
+    code_a2 = client.post(
+        "/api/v1/dalton/channels/bind-codes", json={"platform": "feishu"}
+    ).json()["code"]
+    client.post(
+        "/api/v1/dalton/channels/internal/bind-code/consume",
+        headers=headers,
+        json={
+            "action": "bind",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_sec_2",
+            "code": code_a2,
+            "is_group": False,
+        },
+    )
+    dm_scope_2 = "dm:ou_alice_sec_2"
+    r_in_s2 = client.post(
+        "/api/v1/dalton/channels/internal/inbound/register-and-resolve",
+        headers=headers,
+        json={
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_sec_2",
+            "chat_type": "dm",
+            "chat_address": "feishu:@me",
+            "thread_scope_key": dm_scope_2,
+            "message_id": "om_s2_g1",
+        },
+    ).json()
+    assert r_in_s2["generation"] == 1
+    tid_s2_g1 = str(uuid4())
+    rid_s2_g1 = str(uuid4())
+    client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=headers,
+        json={
+            "platform": "feishu",
+            "message_id": "om_s2_g1",
+            "status": "streaming",
+            "thread_id": tid_s2_g1,
+            "run_id": rid_s2_g1,
+            "turn_index": 1,
+            "thread_watch": {
+                "thread_id": tid_s2_g1,
+                "dalton_user_id": "u-alice",
+                "platform": "feishu",
+                "target_address": "feishu:@me",
+                "scope_key": dm_scope_2,
+                "generation": 1,
+                "last_seen_turn_index": 1,
+                "watch_active": True,
+            },
+        },
+    )
+
+    # Advance session to gen 2 via `/new` and set an active pending_interrupt on gen 2
+    client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "new",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_sec_2",
+            "chat_type": "dm",
+            "scope_key": dm_scope_2,
+            "message_id": "om_s2_new_g2",
+        },
+    )
+    tid_s2_g2 = str(uuid4())
+    rid_s2_g2 = str(uuid4())
+    int_g2 = {
+        "interrupt_id": "int_g2_active",
+        "thread_id": tid_s2_g2,
+        "run_id": rid_s2_g2,
+        "generation": 2,
+    }
+    r_set_int_g2 = client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=headers,
+        json={
+            "session_interrupt_update": {
+                "platform": "feishu",
+                "scope_key": dm_scope_2,
+                "dalton_user_id": "u-alice",
+                "generation": 2,
+                "thread_id": tid_s2_g2,
+                "run_id": rid_s2_g2,
+                "interrupt_id": "int_g2_active",
+                "pending_interrupt": int_g2,
+            },
+            "thread_watch": {
+                "thread_id": tid_s2_g2,
+                "dalton_user_id": "u-alice",
+                "platform": "feishu",
+                "target_address": "feishu:@me",
+                "scope_key": dm_scope_2,
+                "generation": 2,
+                "last_seen_turn_index": 1,
+                "watch_active": True,
+                "pending_interrupt": int_g2,
+            },
+        },
+    ).json()
+    assert r_set_int_g2["session_is_current_for_interrupt"] is True
+    assert (
+        store.session_generations[("feishu", dm_scope_2, "u-alice")][
+            "pending_interrupt"
+        ]
+        == int_g2
+    )
+    g1_source = store.inbound_events[("feishu", "om_s2_g1")]
+    assert g1_source["session_generation"] == 1
+    assert str(g1_source["thread_id"]) == tid_s2_g1
+    assert g1_source["run_id"] == rid_s2_g1
+
+    # 7. `generation: None` sourced from stale gen-1 `tid_s2_g1` must not clear gen 2.
+    # A clear whose interrupt_id, run_id, and thread_id do not match the current
+    # interrupt is refused even when generation 2 is the current session.
+    r_stale_none_gen = client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=headers,
+        json={
+            "session_interrupt_update": {
+                "platform": "feishu",
+                "scope_key": dm_scope_2,
+                "dalton_user_id": "u-alice",
+                "generation": None,
+                "thread_id": tid_s2_g1,
+                "run_id": rid_s2_g1,
+                "pending_interrupt": None,
+            },
+        },
+    ).json()
+    assert r_stale_none_gen["session_is_current_for_interrupt"] is False
+    assert (
+        store.session_generations[("feishu", dm_scope_2, "u-alice")][
+            "pending_interrupt"
+        ]
+        == int_g2
+    )
+
+    r_wrong_clear = client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=headers,
+        json={
+            "session_interrupt_update": {
+                "platform": "feishu",
+                "scope_key": dm_scope_2,
+                "dalton_user_id": "u-alice",
+                "generation": 2,
+                "thread_id": str(uuid4()),
+                "run_id": str(uuid4()),
+                "interrupt_id": "wrong_int_id",
+                "pending_interrupt": None,
+            },
+        },
+    ).json()
+    assert r_wrong_clear["session_is_current_for_interrupt"] is True
+    assert (
+        store.session_generations[("feishu", dm_scope_2, "u-alice")][
+            "pending_interrupt"
+        ]
+        == int_g2
+    )
+
+    # Clearing with matching generation=2 AND matching interrupt_id succeeds
+    client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=headers,
+        json={
+            "session_interrupt_update": {
+                "platform": "feishu",
+                "scope_key": dm_scope_2,
+                "dalton_user_id": "u-alice",
+                "generation": 2,
+                "thread_id": tid_s2_g2,
+                "run_id": rid_s2_g2,
+                "interrupt_id": "int_g2_active",
+                "pending_interrupt": None,
+            },
+        },
+    )
+    assert (
+        store.session_generations[("feishu", dm_scope_2, "u-alice")][
+            "pending_interrupt"
+        ]
+        is None
+    )
+
+    # 8. `I-6` (`authorize_and_claim_delivery`) rejects spoofed `source_generation` / `source_scope_key`
+    # when they disagree with the persisted `dalton_channel_inbound_events` row (`tid_s2_g1`, gen 1, `dm_scope_2`)
+    r_spoof_gen = client.post(
+        "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
+        headers=headers,
+        json={
+            "delivery_key": f"fallback:{rid_s2_g1}:spoof",
+            "kind": "fallback",
+            "user_id": "u-alice",
+            "thread_id": tid_s2_g1,
+            "run_id": rid_s2_g1,
+            "platform": "feishu",
+            "has_non_empty_text": True,
+            "total_chunks": 1,
+            "source_scope_key": dm_scope_2,
+            "source_generation": 2,
+            "activity_origin": "conversation",
+        },
+    ).json()
+    assert r_spoof_gen["claim_status"] == "denied"
+    assert r_spoof_gen["code"] == "not_allowed"

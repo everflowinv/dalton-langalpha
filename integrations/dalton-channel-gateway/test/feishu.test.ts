@@ -5717,6 +5717,416 @@ describe("main.ts adapter registration & shared helpers", () => {
       expect(lastSent).toContain("Which benchmark index should we use?");
       expect(lastSent).toContain("earlier conversation thread");
       expect(lastSent).toContain(`/chat/t/${THREAD_ID}`);
+      const staleInterruptClaim = h.backend.deliveryClaims.at(-1);
+      expect(staleInterruptClaim?.activity_origin).toBe("none");
+      expect(staleInterruptClaim?.source_generation).toBeNull();
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("enforces /stop HTTP status handling (503 retry, 403 refusal, null run_id guard), command recovery re-auth, same-workspace reply, per-attachment incremental I-7 progress, and background run watch generation fidelity", async () => {
+    const h = createTestHarness();
+    try {
+      // 1. `/stop` with 503 transient failure keeps `pending_cancel` and does NOT send premature success reply
+      vi.mocked(h.backend.cancelThreadTurn).mockResolvedValueOnce({
+        status: 503,
+      });
+      await h.feishuAdapter.emitInbound({
+        platform: "feishu",
+        platformUserId: "ou_alice",
+        chatType: "dm",
+        chatAddress: "feishu:@me",
+        chatId: "oc_dm_1",
+        threadScopeKey: "dm:ou_alice",
+        messageId: "om_stop_503_1",
+        text: "/stop",
+      });
+      expect(h.backend.cancelThreadTurn).toHaveBeenCalledWith(
+        USER_ID,
+        THREAD_ID,
+        RUN_ID,
+      );
+      expect(
+        h.backend.progressUpdates.some(
+          (u) =>
+            u.message_id === "om_stop_503_1" &&
+            u.command_effect_status === "done",
+        ),
+      ).toBe(false);
+      expect(
+        h.feishuAdapter.sentTexts.some((t) =>
+          t.text.includes("Stopped the current run."),
+        ),
+      ).toBe(false);
+
+      // Startup recovery retries the `pending_cancel` row when `cancelThreadTurn` returns 200
+      vi.mocked(h.backend.cancelThreadTurn).mockResolvedValueOnce({
+        status: 200,
+      });
+      vi.mocked(h.backend.recoverState).mockResolvedValueOnce({
+        mode: "startup",
+        inbound_events: [
+          {
+            platform: "feishu",
+            message_id: "om_stop_503_1",
+            platform_user_id: "ou_alice",
+            dalton_user_id: USER_ID,
+            chat_type: "dm",
+            chat_address: "feishu:@me",
+            thread_scope_key: "dm:ou_alice",
+            request_key: "rk_stop_503_1",
+            retry_request_key: null,
+            resubmitted_request_key: null,
+            steered_into_run_id: null,
+            thread_id: THREAD_ID,
+            run_id: RUN_ID,
+            turn_index: null,
+            workspace_id: WORKSPACE_ID,
+            external_thread_id: "feishu:dm:ou_alice:gen:1",
+            generation: 1,
+            session_generation: 1,
+            event_kind: "command",
+            command_request: { cmd: "stop" },
+            command_result: {
+              ok: true,
+              linked: true,
+              thread_id: THREAD_ID,
+              run_id: RUN_ID,
+              generation: 1,
+            },
+            command_effect_status: "pending_cancel",
+            command_reply_pending: true,
+            status: "received",
+            fallback_pending: false,
+            sent_to_current_count: 0,
+            uploaded_attachments: [],
+            raw_payload: { text: "/stop", platform_user_id: "ou_alice" },
+            pending_interrupt: null,
+          },
+        ],
+        background_runs: [],
+        thread_watches: [],
+        automation_runs: [],
+      });
+      await h.app.orchestrator.runStartupRecovery();
+      expect(
+        h.backend.progressUpdates.some(
+          (u) =>
+            u.message_id === "om_stop_503_1" &&
+            u.status === "completed" &&
+            u.command_effect_status === "done" &&
+            u.command_reply_pending === false,
+        ),
+      ).toBe(true);
+      expect(h.feishuAdapter.sentTexts.at(-1)?.text).toContain(
+        "Stopped the current run.",
+      );
+
+      // 2. `/stop` with 403 permanent refusal marks `status: "failed"`, `command_effect_status: "done"` and sends explicit refusal notice
+      vi.mocked(h.backend.cancelThreadTurn).mockResolvedValueOnce({
+        status: 403,
+      });
+      await h.feishuAdapter.emitInbound({
+        platform: "feishu",
+        platformUserId: "ou_alice",
+        chatType: "dm",
+        chatAddress: "feishu:@me",
+        chatId: "oc_dm_1",
+        threadScopeKey: "dm:ou_alice",
+        messageId: "om_stop_403_1",
+        text: "/stop",
+      });
+      expect(
+        h.backend.progressUpdates.some(
+          (u) =>
+            u.message_id === "om_stop_403_1" &&
+            u.status === "failed" &&
+            u.command_effect_status === "done" &&
+            u.command_reply_pending === false,
+        ),
+      ).toBe(true);
+      expect(h.feishuAdapter.sentTexts.at(-1)?.text).toContain(
+        "Failed to stop the current run (status 403).",
+      );
+
+      // 3. `/stop` when no active `run_id` exists (`run_id: null`): marks `done` and NEVER calls `cancelThreadTurn`
+      const cancelCallsBeforeNullRun = vi.mocked(h.backend.cancelThreadTurn)
+        .mock.calls.length;
+      vi.mocked(h.backend.sessionCommand).mockResolvedValueOnce({
+        ok: true,
+        linked: true,
+        allowed: true,
+        dalton_user_id: USER_ID,
+        workspace_id: WORKSPACE_ID,
+        is_home: false,
+        thread_id: THREAD_ID,
+        run_id: null,
+        generation: 1,
+        command_effect_status: "done",
+        command_reply_pending: true,
+      });
+      await h.feishuAdapter.emitInbound({
+        platform: "feishu",
+        platformUserId: "ou_alice",
+        chatType: "dm",
+        chatAddress: "feishu:@me",
+        chatId: "oc_dm_1",
+        threadScopeKey: "dm:ou_alice",
+        messageId: "om_stop_no_run_1",
+        text: "/stop",
+      });
+      expect(vi.mocked(h.backend.cancelThreadTurn).mock.calls.length).toBe(
+        cancelCallsBeforeNullRun,
+      );
+      expect(h.feishuAdapter.sentTexts.at(-1)?.text).toContain(
+        "No active run to stop in the current session.",
+      );
+
+      // 4. Command recovery re-authorization via `sessionCommand` when user unlinked or lost workspace access
+      const sentBeforeDeniedRecovery = h.feishuAdapter.sentTexts.length;
+      vi.mocked(h.backend.sessionCommand).mockResolvedValueOnce({
+        ok: false,
+        linked: false,
+        deny_reason: "not_linked",
+        command_effect_status: "done",
+        command_reply_pending: false,
+      });
+      vi.mocked(h.backend.recoverState).mockResolvedValueOnce({
+        mode: "startup",
+        inbound_events: [
+          {
+            platform: "feishu",
+            message_id: "om_rec_unlinked_stop_1",
+            platform_user_id: "ou_alice",
+            dalton_user_id: USER_ID,
+            chat_type: "dm",
+            chat_address: "feishu:@me",
+            thread_scope_key: "dm:ou_alice",
+            request_key: "rk_rec_unlinked_stop_1",
+            retry_request_key: null,
+            resubmitted_request_key: null,
+            steered_into_run_id: null,
+            thread_id: THREAD_ID,
+            run_id: RUN_ID,
+            turn_index: null,
+            workspace_id: WORKSPACE_ID,
+            external_thread_id: "feishu:dm:ou_alice:gen:1",
+            generation: 1,
+            event_kind: "command",
+            command_request: { cmd: "stop" },
+            command_result: {
+              ok: true,
+              thread_id: THREAD_ID,
+              run_id: RUN_ID,
+              generation: 1,
+            },
+            command_effect_status: "pending_cancel",
+            command_reply_pending: true,
+            status: "received",
+            fallback_pending: false,
+            sent_to_current_count: 0,
+            uploaded_attachments: [],
+            raw_payload: { text: "/stop", platform_user_id: "ou_alice" },
+            pending_interrupt: null,
+          },
+        ],
+        background_runs: [],
+        thread_watches: [],
+        automation_runs: [],
+      });
+      await h.app.orchestrator.runStartupRecovery();
+      expect(vi.mocked(h.backend.cancelThreadTurn).mock.calls.length).toBe(
+        cancelCallsBeforeNullRun,
+      );
+      expect(h.feishuAdapter.sentTexts.length).toBe(sentBeforeDeniedRecovery);
+
+      // 5. Same-workspace switch (`switched: false`, generation 2) keeps this conversation
+      // and does not start a model turn. The reply names the workspace and its id.
+      const createCallsBeforeSameWs = h.backend.createCalls.length;
+      const appendCallsBeforeSameWs = h.backend.appendCalls.length;
+      vi.mocked(h.backend.sessionCommand).mockResolvedValueOnce({
+        ok: true,
+        linked: true,
+        allowed: true,
+        dalton_user_id: USER_ID,
+        workspace_id: WORKSPACE_ID,
+        workspace_name: "Quant Workspace",
+        is_home: false,
+        switched: false,
+        generation: 2,
+        command_effect_status: "done",
+        command_reply_pending: true,
+      });
+      await h.feishuAdapter.emitInbound({
+        platform: "feishu",
+        platformUserId: "ou_alice",
+        chatType: "dm",
+        chatAddress: "feishu:@me",
+        chatId: "oc_dm_1",
+        threadScopeKey: "dm:ou_alice",
+        messageId: "om_sw_same_1",
+        text: "/Quant Workspace",
+      });
+      expect(h.feishuAdapter.sentTexts.at(-1)?.text).toBe(
+        `Already in workspace \`Quant Workspace\` (\`${WORKSPACE_ID}\`). Keeping current conversation.`,
+      );
+      expect(h.backend.createCalls).toHaveLength(createCallsBeforeSameWs);
+      expect(h.backend.appendCalls).toHaveLength(appendCallsBeforeSameWs);
+      expect(
+        h.backend.deliveryClaims.find(
+          (claim) => claim.delivery_key === "notice:feishu:om_sw_same_1:command",
+        ),
+      ).toMatchObject({
+        kind: "notice",
+        thread_id: null,
+        run_id: null,
+        source_generation: 2,
+        activity_origin: "command",
+      });
+
+      // 6. Per-attachment incremental `updateDeliveryProgress` in `DeliveryService`.
+      // File bytes come from `downloadWorkspaceFile`. Each successful `sendFile`
+      // persists `files_status` before the next file is attempted.
+      vi.mocked(h.backend.downloadWorkspaceFile).mockImplementation(
+        async (_userId, _workspaceId, workspacePath) => ({
+          content: Buffer.from(
+            workspacePath.endsWith("first.pdf") ? "PDF_1" : "PDF_2",
+            "utf8",
+          ),
+          mimeType: "application/pdf",
+        }),
+      );
+      let attachmentCallIdx = 0;
+      h.feishuAdapter.setSendFileBehavior(async (params) => {
+        attachmentCallIdx += 1;
+        if (attachmentCallIdx === 1) {
+          expect(params.path).toBe("reports/first.pdf");
+          expect(params.content.equals(Buffer.from("PDF_1", "utf8"))).toBe(
+            true,
+          );
+          return {
+            messageId: "feishu_file_first",
+            status: "sent",
+            reason: null,
+          };
+        }
+        const incrementalUpdate = h.backend.deliveryUpdates.find(
+          (u) =>
+            u.delivery_key === "tool:run_inc_att:1" &&
+            u.files_status?.some(
+              (f) => f.path === "reports/first.pdf" && f.status === "sent",
+            ) &&
+            !u.files_status?.some((f) => f.path === "reports/second.pdf"),
+        );
+        expect(incrementalUpdate).toBeDefined();
+        throw new ChannelDeliveryError(
+          "second attachment failed across boundary",
+          { outcome: "failed", code: "unavailable" },
+        );
+      });
+
+      const attRes = await h.app.deliveryService.executeDelivery({
+        deliveryKey: "tool:run_inc_att:1",
+        kind: "agent_send",
+        userId: USER_ID,
+        threadId: THREAD_ID,
+        runId: RUN_ID,
+        platform: "feishu",
+        target: "feishu:@me",
+        text: "",
+        files: [
+          { path: "reports/first.pdf", workspace_id: WORKSPACE_ID },
+          { path: "reports/second.pdf", workspace_id: WORKSPACE_ID },
+        ],
+        sourceScopeKey: "dm:ou_alice",
+        sourceGeneration: 2,
+        activityOrigin: "conversation",
+      });
+      expect(attRes.status).toBe("partial");
+      expect(attRes.files).toEqual([
+        expect.objectContaining({
+          path: "reports/first.pdf",
+          status: "sent",
+        }),
+        expect.objectContaining({
+          path: "reports/second.pdf",
+          status: "failed",
+        }),
+      ]);
+      expect(h.backend.downloadWorkspaceFile).toHaveBeenCalledWith(
+        USER_ID,
+        WORKSPACE_ID,
+        "reports/first.pdf",
+      );
+      expect(h.backend.downloadWorkspaceFile).toHaveBeenCalledWith(
+        USER_ID,
+        WORKSPACE_ID,
+        "reports/second.pdf",
+      );
+      const attUpdates = h.backend.deliveryUpdates.filter(
+        (u) => u.delivery_key === "tool:run_inc_att:1",
+      );
+      expect(
+        attUpdates.some(
+          (u) =>
+            u.files_status?.some(
+              (f) => f.path === "reports/first.pdf" && f.status === "sent",
+            ) && !u.files_status?.some((f) => f.path === "reports/second.pdf"),
+        ),
+      ).toBe(true);
+      expect(attUpdates.at(-1)?.files_status).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            path: "reports/first.pdf",
+            status: "sent",
+          }),
+        ]),
+      );
+      h.feishuAdapter.setSendFileBehavior(null);
+
+      // 7. `recoverSingleBackgroundRun` preserves `scope_key` and `generation` from recovered watch/background row
+      vi.mocked(h.backend.recoverState).mockResolvedValueOnce({
+        mode: "startup",
+        inbound_events: [],
+        background_runs: [
+          {
+            run_id: "bg_run_gen5",
+            thread_id: THREAD_ID,
+            dalton_user_id: USER_ID,
+            platform: "feishu",
+            target_address: "feishu:@me",
+            scope_key: "dm:ou_alice",
+            generation: 5,
+            turn_index: 2,
+            status: "completed",
+            fallback_pending: true,
+            sent_to_current_count: 0,
+          },
+        ],
+        thread_watches: [
+          {
+            thread_id: THREAD_ID,
+            dalton_user_id: USER_ID,
+            platform: "feishu",
+            target_address: "feishu:@me",
+            scope_key: "dm:ou_alice",
+            generation: 5,
+            last_seen_turn_index: 2,
+            watch_active: true,
+            pending_interrupt: null,
+          },
+        ],
+        automation_runs: [],
+      });
+      await h.app.orchestrator.runStartupRecovery();
+      const bgWatchUpdates = h.backend.progressUpdates.filter(
+        (u) => u.thread_watch?.thread_id === THREAD_ID,
+      );
+      expect(bgWatchUpdates.at(-1)?.thread_watch?.generation).toBe(5);
+      expect(bgWatchUpdates.at(-1)?.thread_watch?.scope_key).toBe(
+        "dm:ou_alice",
+      );
     } finally {
       await h.cleanup();
     }
