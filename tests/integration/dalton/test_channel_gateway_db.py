@@ -26,6 +26,7 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import Response, StreamingResponse
+from httpx import ASGITransport, AsyncClient
 import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
@@ -2879,6 +2880,456 @@ async def test_ch1_stop_pinning_reauth_hitl_source_delivery_immutability_and_con
     assert list_after_unbind["deny_reason"] == "not_linked"
 
 
+@pytest.mark.asyncio
+async def test_ch1_failed_conversation_delivery_replays_without_extending_activity(
+    db_env: dict[str, Any],
+) -> None:
+    """A failed conversation delivery can be reclaimed as replay on the same key.
+
+    The same scope and generation are required. The stored origin becomes replay,
+    so the recovered send does not move last_conversation_activity_at. A different
+    scope or generation, another origin, or an in-flight or unknown row is not resent.
+    """
+    prefix = db_env["prefix"]
+    user_a = db_env["user_a"]
+    pool: AsyncConnectionPool = db_env["pool"]
+    ws_a1 = db_env["ws_a1"]
+    scope = f"dm:{prefix}_replay_a"
+    puid = f"{prefix}_ou_replay_a"
+
+    code = await cg_db.create_bind_code(user_id=user_a, platform="feishu")
+    await cg_db.consume_bind_code_or_unbind(
+        action="bind",
+        platform="feishu",
+        platform_user_id=puid,
+        code=code["code"],
+        is_group=False,
+    )
+    await cg_db.register_and_resolve_inbound(
+        platform="feishu",
+        platform_user_id=puid,
+        chat_type="dm",
+        chat_address="feishu:@me",
+        thread_scope_key=scope,
+        message_id=f"{prefix}_replay_init",
+    )
+    switched = await cg_db.execute_session_command(
+        cmd="workspace_switch",
+        platform="feishu",
+        platform_user_id=puid,
+        chat_type="dm",
+        chat_address="feishu:@me",
+        scope_key=scope,
+        message_id=f"{prefix}_replay_switch",
+        target_kind="workspace_id",
+        workspace_id=ws_a1,
+    )
+    assert switched["ok"] is True
+    assert switched["generation"] == 2
+    turn = await cg_db.register_and_resolve_inbound(
+        platform="feishu",
+        platform_user_id=puid,
+        chat_type="dm",
+        chat_address="feishu:@me",
+        thread_scope_key=scope,
+        message_id=f"{prefix}_replay_turn",
+    )
+    assert turn["generation"] == 2
+    assert turn["workspace_id"] == ws_a1
+    tid = str(uuid4())
+    run_id = str(uuid4())
+    db_env["cleanup_thread_ids"].append(tid)
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO conversation_threads (
+                    conversation_thread_id, workspace_id, user_id, current_status,
+                    thread_index, external_id, platform, created_at, updated_at
+                )
+                VALUES (%s, %s, %s, 'completed', 0, %s, 'feishu', NOW(), NOW())
+                """,
+                (tid, ws_a1, user_a, turn["external_thread_id"]),
+            )
+            await cur.execute(
+                """
+                UPDATE dalton_channel_session_generations
+                SET last_conversation_activity_at = NOW() - INTERVAL '2 hours'
+                WHERE platform = 'feishu' AND scope_key = %s AND dalton_user_id = %s
+                RETURNING last_conversation_activity_at
+                """,
+                (scope, user_a),
+            )
+            aged = (await cur.fetchone())["last_conversation_activity_at"]
+    await cg_db.update_inbound_progress(
+        platform="feishu",
+        message_id=f"{prefix}_replay_turn",
+        thread_id=tid,
+        run_id=run_id,
+        turn_index=0,
+        status="dispatched",
+    )
+
+    async def _claim(
+        key: str,
+        *,
+        origin: str,
+        source_scope: str | None = scope,
+        source_generation: int | None = 2,
+    ) -> dict[str, Any]:
+        return await cg_db.authorize_and_claim_delivery(
+            delivery_key=key,
+            kind="fallback",
+            user_id=user_a,
+            thread_id=tid,
+            run_id=run_id,
+            platform="feishu",
+            target="feishu:@me",
+            inbound_message_id=f"{prefix}_replay_turn",
+            has_non_empty_text=True,
+            total_chunks=1,
+            source_scope_key=source_scope,
+            source_generation=source_generation,
+            activity_origin=origin,
+        )
+
+    async def _row(key: str) -> dict[str, Any]:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT status, activity_origin, user_id, platform, target_address
+                    FROM dalton_channel_deliveries
+                    WHERE delivery_key = %s
+                    """,
+                    (key,),
+                )
+                return dict(await cur.fetchone())
+
+    async def _activity() -> Any:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT generation,
+                           override_workspace_id::text AS override_workspace_id,
+                           last_conversation_activity_at
+                    FROM dalton_channel_session_generations
+                    WHERE platform = 'feishu' AND scope_key = %s AND dalton_user_id = %s
+                    """,
+                    (scope, user_a),
+                )
+                return dict(await cur.fetchone())
+
+    recover_key = f"fallback:{run_id}"
+    first = await _claim(recover_key, origin="conversation")
+    assert first["claim_status"] == "claimed"
+    await cg_db.update_delivery_progress(
+        delivery_key=recover_key,
+        status="failed",
+        sent_chunks=0,
+        total_chunks=1,
+        error_code="unavailable",
+        error_message="send failed",
+    )
+    assert (await _row(recover_key))["status"] == "failed"
+    assert (await _activity())["last_conversation_activity_at"] == aged
+
+    recovered = await _claim(recover_key, origin="replay")
+    assert recovered["claim_status"] == "claimed"
+    assert recovered["target_address"] == "feishu:@me"
+    stored = await _row(recover_key)
+    assert stored["status"] == "in_flight"
+    assert stored["activity_origin"] == "replay"
+    assert stored["user_id"] == user_a
+    assert stored["target_address"] == "feishu:@me"
+    await cg_db.update_delivery_progress(
+        delivery_key=recover_key,
+        status="sent",
+        sent_chunks=1,
+        total_chunks=1,
+        platform_message_ids=["om_replay_recovered"],
+    )
+    after = await _activity()
+    assert after["last_conversation_activity_at"] == aged
+    assert after["generation"] == 2
+    assert after["override_workspace_id"] == ws_a1
+    assert (await _row(recover_key))["activity_origin"] == "replay"
+
+    async def _deny_stays(key: str, **claim_kwargs: Any) -> None:
+        denied = await _claim(key, **claim_kwargs)
+        assert denied["claim_status"] == "denied"
+        assert denied["code"] == "not_allowed"
+        row = await _row(key)
+        assert row["status"] == "failed"
+        assert row["activity_origin"] == "conversation"
+        assert row["target_address"] == "feishu:@me"
+
+    scope_key = f"fallback:{run_id}:scope"
+    assert (await _claim(scope_key, origin="conversation"))["claim_status"] == "claimed"
+    await cg_db.update_delivery_progress(
+        delivery_key=scope_key, status="failed", sent_chunks=0, total_chunks=1
+    )
+    await _deny_stays(scope_key, origin="replay", source_scope=f"{scope}:other")
+
+    gen_key = f"fallback:{run_id}:gen"
+    assert (await _claim(gen_key, origin="conversation"))["claim_status"] == "claimed"
+    await cg_db.update_delivery_progress(
+        delivery_key=gen_key, status="failed", sent_chunks=0, total_chunks=1
+    )
+    await _deny_stays(gen_key, origin="replay", source_generation=9)
+
+    notice_key = f"fallback:{run_id}:notice"
+    assert (await _claim(notice_key, origin="conversation"))["claim_status"] == "claimed"
+    await cg_db.update_delivery_progress(
+        delivery_key=notice_key, status="failed", sent_chunks=0, total_chunks=1
+    )
+    await _deny_stays(notice_key, origin="notification")
+
+    # Activity was checked above. This sent row is a separate current conversation
+    # delivery, so its own progress may move the activity clock.
+    sent_key = f"fallback:{run_id}:sent"
+    assert (await _claim(sent_key, origin="conversation"))["claim_status"] == "claimed"
+    await cg_db.update_delivery_progress(
+        delivery_key=sent_key,
+        status="sent",
+        sent_chunks=1,
+        total_chunks=1,
+        platform_message_ids=["om_replay_sent"],
+    )
+    replay_sent = await _claim(sent_key, origin="replay")
+    assert replay_sent["claim_status"] == "denied"
+    assert replay_sent["code"] == "not_allowed"
+    same_sent = await _claim(sent_key, origin="conversation")
+    assert same_sent["claim_status"] == "already_completed"
+    sent_row = await _row(sent_key)
+    assert sent_row["status"] == "sent"
+    assert sent_row["activity_origin"] == "conversation"
+
+    ident_key = f"fallback:{run_id}:ident"
+    assert (await _claim(ident_key, origin="conversation"))["claim_status"] == "claimed"
+    await cg_db.update_delivery_progress(
+        delivery_key=ident_key, status="failed", sent_chunks=0, total_chunks=1
+    )
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE dalton_channel_deliveries
+                SET target_address = 'feishu:tampered'
+                WHERE delivery_key = %s
+                """,
+                (ident_key,),
+            )
+    ident_denied = await _claim(ident_key, origin="replay")
+    assert ident_denied["claim_status"] == "denied"
+    assert ident_denied["code"] == "not_allowed"
+    ident_row = await _row(ident_key)
+    assert ident_row["status"] == "failed"
+    assert ident_row["activity_origin"] == "conversation"
+    assert ident_row["target_address"] == "feishu:tampered"
+    assert ident_row["user_id"] == user_a
+
+    flight_key = f"fallback:{run_id}:flight"
+    assert (await _claim(flight_key, origin="conversation"))["claim_status"] == "claimed"
+    flight_again = await _claim(flight_key, origin="conversation")
+    assert flight_again["claim_status"] == "in_flight_or_unknown"
+    assert flight_again["code"] == "in_flight"
+    flight_replay = await _claim(flight_key, origin="replay")
+    assert flight_replay["claim_status"] == "denied"
+    assert flight_replay["code"] == "not_allowed"
+    flight_row = await _row(flight_key)
+    assert flight_row["status"] == "in_flight"
+    assert flight_row["activity_origin"] == "conversation"
+
+    unknown_key = f"fallback:{run_id}:unknown"
+    assert (await _claim(unknown_key, origin="conversation"))["claim_status"] == "claimed"
+    await cg_db.update_delivery_progress(
+        delivery_key=unknown_key, status="unknown", sent_chunks=0, total_chunks=1
+    )
+    unknown_same = await _claim(unknown_key, origin="conversation")
+    assert unknown_same["claim_status"] == "in_flight_or_unknown"
+    assert unknown_same["code"] == "in_flight"
+    unknown_replay = await _claim(unknown_key, origin="replay")
+    assert unknown_replay["claim_status"] == "denied"
+    assert unknown_replay["code"] == "not_allowed"
+    unknown_row = await _row(unknown_key)
+    assert unknown_row["status"] == "unknown"
+    assert unknown_row["activity_origin"] == "conversation"
+    final = await _activity()
+    assert final["generation"] == 2
+    assert final["override_workspace_id"] == ws_a1
+
+
+@pytest.mark.asyncio
+async def test_ch1_denied_command_resend_keeps_selection(
+    db_env: dict[str, Any],
+) -> None:
+    """A denied command stays denied when the same message_id is delivered again.
+
+    After the user switches to another workspace and one duplicate name disappears,
+    the old event does not change generation, the current workspace, or activity.
+    """
+    prefix = db_env["prefix"]
+    user_a = db_env["user_a"]
+    pool: AsyncConnectionPool = db_env["pool"]
+    ws_a1 = db_env["ws_a1"]
+    dup_name = f"{prefix} Research"
+    ws_dup_1 = str(uuid4())
+    ws_dup_2 = str(uuid4())
+    db_env["cleanup_workspace_ids"].extend([ws_dup_1, ws_dup_2])
+    scope = f"dm:{prefix}_deny_cmd"
+    puid = f"{prefix}_ou_deny_cmd"
+    ambiguous_id = f"{prefix}_cmd_ambiguous"
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO workspaces (workspace_id, user_id, name, status, created_at, updated_at)
+                VALUES (%s, %s, %s, 'running', NOW(), NOW()),
+                       (%s, %s, %s, 'running', NOW(), NOW())
+                """,
+                (ws_dup_1, user_a, dup_name, ws_dup_2, user_a, dup_name),
+            )
+    code = await cg_db.create_bind_code(user_id=user_a, platform="feishu")
+    await cg_db.consume_bind_code_or_unbind(
+        action="bind",
+        platform="feishu",
+        platform_user_id=puid,
+        code=code["code"],
+        is_group=False,
+    )
+    await cg_db.register_and_resolve_inbound(
+        platform="feishu",
+        platform_user_id=puid,
+        chat_type="dm",
+        chat_address="feishu:@me",
+        thread_scope_key=scope,
+        message_id=f"{prefix}_deny_init",
+    )
+    denied = await cg_db.execute_session_command(
+        cmd="workspace_switch",
+        platform="feishu",
+        platform_user_id=puid,
+        chat_type="dm",
+        chat_address="feishu:@me",
+        scope_key=scope,
+        message_id=ambiguous_id,
+        target_kind="shortcut_name",
+        workspace_query=dup_name,
+    )
+    assert denied["ok"] is False
+    assert denied["deny_reason"] == "workspace_ambiguous"
+    assert denied["duplicate"] is False
+    assert {c["workspace_id"] for c in denied["candidates"]} == {ws_dup_1, ws_dup_2}
+
+    chosen = await cg_db.execute_session_command(
+        cmd="workspace_switch",
+        platform="feishu",
+        platform_user_id=puid,
+        chat_type="dm",
+        chat_address="feishu:@me",
+        scope_key=scope,
+        message_id=f"{prefix}_cmd_choose_a1",
+        target_kind="workspace_id",
+        workspace_id=ws_a1,
+    )
+    assert chosen["ok"] is True
+    assert chosen["generation"] == 2
+    assert chosen["workspace_id"] == ws_a1
+
+    async def _session() -> dict[str, Any]:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT generation,
+                           override_workspace_id::text AS override_workspace_id,
+                           last_conversation_activity_at
+                    FROM dalton_channel_session_generations
+                    WHERE platform = 'feishu' AND scope_key = %s AND dalton_user_id = %s
+                    """,
+                    (scope, user_a),
+                )
+                return dict(await cur.fetchone())
+
+    async def _inbound() -> dict[str, Any]:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT status, command_result, command_reply_pending, command_effect_status
+                    FROM dalton_channel_inbound_events
+                    WHERE platform = 'feishu' AND message_id = %s
+                    """,
+                    (ambiguous_id,),
+                )
+                return dict(await cur.fetchone())
+
+    pinned = await _session()
+    assert pinned["generation"] == 2
+    assert pinned["override_workspace_id"] == ws_a1
+    assert (await _inbound())["command_reply_pending"] is True
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE workspaces
+                SET name = %s, updated_at = NOW()
+                WHERE workspace_id = %s
+                """,
+                (f"{dup_name} renamed", ws_dup_2),
+            )
+
+    resent = await cg_db.execute_session_command(
+        cmd="workspace_switch",
+        platform="feishu",
+        platform_user_id=puid,
+        chat_type="dm",
+        chat_address="feishu:@me",
+        scope_key=scope,
+        message_id=ambiguous_id,
+        target_kind="shortcut_name",
+        workspace_query=dup_name,
+    )
+    assert resent["ok"] is False
+    assert resent["duplicate"] is True
+    assert resent["deny_reason"] == "workspace_ambiguous"
+    assert resent["command_reply_pending"] is True
+    assert {c["workspace_id"] for c in resent["candidates"]} == {ws_dup_1, ws_dup_2}
+    assert (await _session()) == pinned
+    stored = await _inbound()
+    assert stored["status"] == "accepted"
+    assert stored["command_reply_pending"] is True
+    assert stored["command_effect_status"] == "done"
+    assert stored["command_result"]["ok"] is False
+    assert stored["command_result"]["deny_reason"] == "workspace_ambiguous"
+
+    await cg_db.update_inbound_progress(
+        platform="feishu",
+        message_id=ambiguous_id,
+        command_reply_pending=False,
+    )
+    resent_done = await cg_db.execute_session_command(
+        cmd="workspace_switch",
+        platform="feishu",
+        platform_user_id=puid,
+        chat_type="dm",
+        chat_address="feishu:@me",
+        scope_key=scope,
+        message_id=ambiguous_id,
+        target_kind="shortcut_name",
+        workspace_query=dup_name,
+    )
+    assert resent_done["ok"] is False
+    assert resent_done["duplicate"] is True
+    assert resent_done["deny_reason"] == "workspace_ambiguous"
+    assert resent_done["command_reply_pending"] is False
+    assert (await _session()) == pinned
+    assert (await _inbound())["command_reply_pending"] is False
+
 
 def _create_real_http_test_app(
     pool: AsyncConnectionPool,
@@ -2892,12 +3343,103 @@ def _create_real_http_test_app(
     app.include_router(channels_router, prefix="/api/v1/dalton")
     workspace_files: dict[tuple[str, str], tuple[bytes, str]] = {}
 
+    async def _authorize_existing_thread_turn(
+        thread_id: str, user_id: str, requested_ws_id: str | None
+    ) -> str:
+        """Owner, workspace, and live-run checks used by the message route.
+
+        A non-owner follows the message route: when Supabase auth is on, colleague
+        write access is checked and then the route still refuses the send. A
+        workspace id on the request must match the thread. An in-progress response
+        is the running admission conflict.
+        """
+        from src.dalton.settings import (
+            is_colleague_dispatch_enabled,
+            is_dalton_supabase_auth_enabled,
+        )
+        from src.server.database.conversation.threads_read import get_thread_auth_meta
+        from src.server.database.runs.lifecycle import get_active_run
+        from src.server.handlers.chat.admission_gate import admission_conflict_detail
+
+        meta = await get_thread_auth_meta(thread_id)
+        if meta is None:
+            raise HTTPException(status_code=404, detail="Thread not found")
+        owner_id = meta.get("user_id")
+        if owner_id is not None and str(owner_id) != user_id:
+            if is_dalton_supabase_auth_enabled():
+                from src.dalton.sharing import require_thread_access
+
+                if not is_colleague_dispatch_enabled():
+                    await require_thread_access(
+                        thread_id,
+                        user_id,
+                        channel="web",
+                        need="read",
+                        owner_id=str(owner_id),
+                        workspace_owner_id=meta.get("workspace_owner_id"),
+                        workspace_id=meta.get("workspace_id"),
+                    )
+                    raise HTTPException(status_code=403, detail="该功能尚未开放")
+                await require_thread_access(
+                    thread_id,
+                    user_id,
+                    channel="web",
+                    need="write",
+                    owner_id=str(owner_id),
+                    workspace_owner_id=meta.get("workspace_owner_id"),
+                    workspace_id=meta.get("workspace_id"),
+                )
+            raise HTTPException(status_code=403, detail="Forbidden")
+
+        thread_ws = meta.get("workspace_id")
+        ws_id = requested_ws_id or ""
+        if thread_ws:
+            thread_ws_id = str(thread_ws)
+            if requested_ws_id and requested_ws_id != thread_ws_id:
+                raise HTTPException(
+                    status_code=400,
+                    detail="workspace_id does not match thread's workspace",
+                )
+            ws_id = thread_ws_id
+        if not ws_id:
+            ws_id = cg_db.get_home_workspace_id(user_id)
+        if await get_active_run(thread_id) is not None:
+            raise HTTPException(
+                status_code=409, detail=admission_conflict_detail("running")
+            )
+        return ws_id
+
+    async def _authorize_thread_status(thread_id: str, user_id: str) -> dict[str, Any]:
+        """Same caller check as ``GET /threads/{id}/status`` before the ledger read."""
+        from src.dalton.settings import is_dalton_supabase_auth_enabled
+        from src.server.database.conversation.threads_read import get_thread_auth_meta
+
+        meta = await get_thread_auth_meta(thread_id)
+        if meta is None:
+            raise HTTPException(status_code=404, detail="Thread not found")
+        if is_dalton_supabase_auth_enabled():
+            from src.dalton.sharing import require_thread_reader
+
+            await require_thread_reader(
+                thread_id,
+                user_id,
+                owner_id=str(meta.get("user_id") or ""),
+                workspace_owner_id=meta.get("workspace_owner_id"),
+                workspace_id=meta.get("workspace_id"),
+            )
+        elif str(meta.get("user_id") or "") != user_id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        return meta
+
     async def _handle_thread_turn(
         request: Request, existing_thread_id: str | None = None
     ) -> StreamingResponse:
         user_id = (request.headers.get("X-User-Id") or "").strip()
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Authentication required")
         body = await request.json()
-        ws_id = str(body.get("workspace_id") or cg_db.get_home_workspace_id(user_id))
+        raw_ws = body.get("workspace_id")
+        requested_ws_id = str(raw_ws).strip() if raw_ws else None
         platform = str(body.get("platform") or "feishu")
         ext_id = body.get("external_thread_id")
         msgs = body.get("messages") or []
@@ -2907,6 +3449,30 @@ def _create_real_http_test_app(
             user_text = c if isinstance(c, str) else json.dumps(c, ensure_ascii=False)
 
         thread_id = existing_thread_id
+        if not thread_id and ext_id:
+            async with pool.connection() as conn:
+                async with conn.cursor() as cur:
+                    await cur.execute(
+                        """
+                        SELECT conversation_thread_id
+                        FROM conversation_threads
+                        WHERE platform = %s AND external_id = %s AND user_id = %s
+                        LIMIT 1
+                        """,
+                        (platform, ext_id, user_id),
+                    )
+                    t_row = await cur.fetchone()
+                    if t_row:
+                        thread_id = str(t_row["conversation_thread_id"])
+
+        # Reject before inserting a workspace, so a forbidden request creates no rows.
+        if thread_id:
+            ws_id = await _authorize_existing_thread_turn(
+                thread_id, user_id, requested_ws_id
+            )
+        else:
+            ws_id = requested_ws_id or cg_db.get_home_workspace_id(user_id)
+
         run_id = str(uuid4())
         turn_index = 1
 
@@ -2923,20 +3489,6 @@ def _create_real_http_test_app(
                     )
                     if ws_id not in cleanup_workspace_ids:
                         cleanup_workspace_ids.append(ws_id)
-
-                    if not thread_id and ext_id:
-                        await cur.execute(
-                            """
-                            SELECT conversation_thread_id
-                            FROM conversation_threads
-                            WHERE platform = %s AND external_id = %s AND user_id = %s
-                            LIMIT 1
-                            """,
-                            (platform, ext_id, user_id),
-                        )
-                        t_row = await cur.fetchone()
-                        if t_row:
-                            thread_id = str(t_row["conversation_thread_id"])
 
                     if not thread_id:
                         await cur.execute(
@@ -3114,13 +3666,41 @@ def _create_real_http_test_app(
         return {"thread_id": thread_id, "run_id": run_id, "status": status}
 
     @app.get("/api/v1/threads/{thread_id}/status")
-    async def status_thread_stub(thread_id: str) -> dict[str, Any]:
+    async def status_thread_stub(thread_id: str, request: Request) -> dict[str, Any]:
+        """Ledger status for the caller. One latest attempt, without Redis or checkpoints."""
+        from src.server.contracts.status import to_public
+        from src.server.database.runs.lifecycle import get_latest_attempt
+
+        user_id = (request.headers.get("X-User-Id") or "").strip()
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        meta = await _authorize_thread_status(thread_id, user_id)
+        is_non_owner = str(meta.get("user_id") or "") != user_id
+        latest = await get_latest_attempt(thread_id)
+        run_id = None
+        can_reconnect = False
+        if latest is not None and latest.get("status") == "in_progress":
+            status = to_public(
+                latest["status"],
+                cancel_requested_at=latest.get("cancel_requested_at"),
+            )
+            # A non-owner reader sees the public status and not the live run id.
+            if not is_non_owner:
+                run_id = str(latest["conversation_response_id"])
+                can_reconnect = status in ("running", "stopping")
+        else:
+            status = to_public(latest["status"]) if latest is not None else "idle"
+        # conversation_queries is empty in this harness. The response turn is the
+        # index the gateway uses when it recovers a turn it has not seen.
+        latest_turn_index = None
+        if latest is not None and latest.get("turn_index") is not None:
+            latest_turn_index = int(latest["turn_index"])
         return {
             "thread_id": thread_id,
-            "run_id": None,
-            "status": "idle",
-            "can_reconnect": False,
-            "latest_turn_index": 1,
+            "run_id": run_id,
+            "status": status,
+            "can_reconnect": can_reconnect,
+            "latest_turn_index": latest_turn_index,
             "pending_report_back": False,
             "report_back_run_id": None,
             "recent_report_back_run_ids": [],
@@ -3486,6 +4066,222 @@ async def _seed_real_http_e2e_fixture(
         "grp_addr": grp_addr,
         "grp_scope": grp_scope,
     }
+
+
+@pytest.mark.asyncio
+async def test_ch1_harness_thread_routes_keep_access_workspace_and_run_checks(
+    db_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Thread message and status routes keep the caller's access, workspace, and run state.
+
+    Another user's thread, a workspace that does not match the thread, and a thread
+    with an in-progress response are refused. The owner's idle thread in its own
+    workspace still accepts a turn. Status comes from the latest response, not a
+    fixed idle value.
+    """
+    prefix = db_env["prefix"]
+    user_a = db_env["user_a"]
+    user_b = db_env["user_b"]
+    pool: AsyncConnectionPool = db_env["pool"]
+    ws_a1 = db_env["ws_a1"]
+    ws_a2 = db_env["ws_a2"]
+    monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
+    monkeypatch.setenv("DALTON_COLLEAGUE_DISPATCH_ENABLED", "true")
+    monkeypatch.setenv(
+        "DALTON_ALLOWED_EMAILS",
+        f"{user_a}@example.com,{user_b}@example.com",
+    )
+
+    tid_idle = str(uuid4())
+    tid_running = str(uuid4())
+    rid_idle = str(uuid4())
+    rid_running = str(uuid4())
+    ext_running = f"{prefix}_ext_running"
+    db_env["cleanup_thread_ids"].extend([tid_idle, tid_running])
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT COALESCE(MAX(thread_index), -1) + 1 AS next_index
+                FROM conversation_threads
+                WHERE workspace_id = %s
+                """,
+                (ws_a1,),
+            )
+            next_index = int((await cur.fetchone())["next_index"])
+            await cur.execute(
+                """
+                INSERT INTO conversation_threads (
+                    conversation_thread_id, workspace_id, user_id, current_status,
+                    thread_index, external_id, platform, created_at, updated_at
+                )
+                VALUES (%s, %s, %s, 'completed', %s, %s, 'feishu', NOW(), NOW()),
+                       (%s, %s, %s, 'completed', %s, %s, 'feishu', NOW(), NOW())
+                """,
+                (
+                    tid_idle,
+                    ws_a1,
+                    user_a,
+                    next_index,
+                    f"{prefix}_ext_idle",
+                    tid_running,
+                    ws_a1,
+                    user_a,
+                    next_index + 1,
+                    ext_running,
+                ),
+            )
+            await cur.execute(
+                """
+                INSERT INTO conversation_responses (
+                    conversation_response_id, conversation_thread_id,
+                    turn_index, status, user_id, created_at
+                )
+                VALUES (%s, %s, 1, 'in_progress', %s, NOW()),
+                       (%s, %s, 1, 'in_progress', %s, NOW())
+                """,
+                (rid_idle, tid_idle, user_a, rid_running, tid_running, user_a),
+            )
+            await cur.execute(
+                """
+                UPDATE conversation_responses
+                SET status = 'completed'
+                WHERE conversation_response_id = %s AND status = 'in_progress'
+                """,
+                (rid_idle,),
+            )
+
+    async def _response_count(thread_id: str) -> int:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT COUNT(*) AS n
+                    FROM conversation_responses
+                    WHERE conversation_thread_id = %s
+                    """,
+                    (thread_id,),
+                )
+                return int((await cur.fetchone())["n"])
+
+    async def _thread_index(thread_id: str) -> int:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT thread_index
+                    FROM conversation_threads
+                    WHERE conversation_thread_id = %s
+                    """,
+                    (thread_id,),
+                )
+                return int((await cur.fetchone())["thread_index"])
+
+    idle_index = await _thread_index(tid_idle)
+    app = _create_real_http_test_app(
+        pool,
+        bootstrap_state={"prefix": prefix},
+        cleanup_workspace_ids=db_env["cleanup_workspace_ids"],
+        cleanup_thread_ids=db_env["cleanup_thread_ids"],
+    )
+
+    def _messages(workspace_id: str, external_id: str | None = None) -> dict[str, Any]:
+        body: dict[str, Any] = {
+            "workspace_id": workspace_id,
+            "platform": "feishu",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+        if external_id:
+            body["external_thread_id"] = external_id
+        return body
+
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        missing_user = await client.post(
+            f"/api/v1/threads/{tid_idle}/messages",
+            json=_messages(ws_a1),
+        )
+        assert missing_user.status_code == 401
+        assert await _response_count(tid_idle) == 1
+
+        other_user = await client.post(
+            f"/api/v1/threads/{tid_idle}/messages",
+            headers={"X-User-Id": user_b},
+            json=_messages(ws_a1),
+        )
+        assert other_user.status_code in (403, 404)
+        assert await _response_count(tid_idle) == 1
+
+        wrong_ws = await client.post(
+            f"/api/v1/threads/{tid_idle}/messages",
+            headers={"X-User-Id": user_a},
+            json=_messages(ws_a2),
+        )
+        assert wrong_ws.status_code == 400
+        assert wrong_ws.json()["detail"] == (
+            "workspace_id does not match thread's workspace"
+        )
+        assert await _response_count(tid_idle) == 1
+        assert await _thread_index(tid_idle) == idle_index
+
+        running = await client.post(
+            f"/api/v1/threads/{tid_running}/messages",
+            headers={"X-User-Id": user_a},
+            json=_messages(ws_a1),
+        )
+        assert running.status_code == 409
+        assert running.json()["detail"]["code"] == "running"
+        assert await _response_count(tid_running) == 1
+
+        reused = await client.post(
+            "/api/v1/threads/messages",
+            headers={"X-User-Id": user_a},
+            json=_messages(ws_a1, ext_running),
+        )
+        assert reused.status_code == 409
+        assert reused.json()["detail"]["code"] == "running"
+        assert await _response_count(tid_running) == 1
+
+        accepted = await client.post(
+            f"/api/v1/threads/{tid_idle}/messages",
+            headers={"X-User-Id": user_a},
+            json=_messages(ws_a1),
+        )
+        assert accepted.status_code == 200
+        assert await _response_count(tid_idle) == 2
+        assert await _thread_index(tid_idle) == idle_index
+
+        no_status_user = await client.get(f"/api/v1/threads/{tid_running}/status")
+        assert no_status_user.status_code == 401
+
+        other_status = await client.get(
+            f"/api/v1/threads/{tid_running}/status",
+            headers={"X-User-Id": user_b},
+        )
+        assert other_status.status_code in (403, 404)
+
+        live = await client.get(
+            f"/api/v1/threads/{tid_running}/status",
+            headers={"X-User-Id": user_a},
+        )
+        assert live.status_code == 200
+        live_body = live.json()
+        assert live_body["status"] == "running"
+        assert live_body["run_id"] == rid_running
+        assert live_body["can_reconnect"] is True
+        assert live_body["latest_turn_index"] == 1
+
+        settled = await client.get(
+            f"/api/v1/threads/{tid_idle}/status",
+            headers={"X-User-Id": user_a},
+        )
+        assert settled.status_code == 200
+        settled_body = settled.json()
+        assert settled_body["status"] == "completed"
+        assert settled_body["run_id"] is None
+        assert settled_body["latest_turn_index"] == 2
 
 
 @pytest.mark.asyncio

@@ -1912,7 +1912,8 @@ async def _execute_session_command_once(
 
                 home_ws_id = get_home_workspace_id(cleaned_uid)
 
-                # 3. Idempotent return for already-succeeded command with same message_id (with live permission re-verification)
+                # 3. Idempotent return for a command that already has a result for this message_id.
+                # Success re-checks live write permission. Any other stored result is final.
                 if existing_inbound is not None and isinstance(
                     existing_inbound.get("command_result"), dict
                 ):
@@ -2022,6 +2023,24 @@ async def _execute_session_command_once(
                             ),
                             "existing_status": existing_inbound.get("status"),
                         }
+
+                    # A stored denial or other non-success is final for this message_id.
+                    # Resending it restores an unsent reply and does not run the command again,
+                    # so a later rename or workspace switch cannot turn the old event into a new selection.
+                    return {
+                        **stored_res,
+                        "dalton_user_id": cleaned_uid,
+                        "user_tier": user_tier,
+                        "duplicate": True,
+                        "command_effect_status": existing_inbound.get(
+                            "command_effect_status"
+                        )
+                        or "done",
+                        "command_reply_pending": bool(
+                            existing_inbound.get("command_reply_pending", False)
+                        ),
+                        "existing_status": existing_inbound.get("status"),
+                    }
 
                 # Read-only internal query path (e.g. GET /agent/session when message_id is omitted)
                 if cleaned_cmd == "workspace_list" and is_internal_query and not cleaned_msg_id:
@@ -3447,6 +3466,8 @@ async def authorize_and_claim_delivery(
                     (cleaned_key,),
                 )
                 existing = await cur.fetchone()
+                # True only when this claim may persist activity_origin conversation -> replay.
+                replay_recovery = False
                 if existing:
                     ex_scope = (
                         str(existing.get("source_scope_key") or "").strip() or None
@@ -3461,13 +3482,27 @@ async def authorize_and_claim_delivery(
                         .strip()
                         .lower()
                     )
-                    if (
-                        (eff_source_scope is not None and ex_scope != eff_source_scope)
-                        or (eff_source_gen is not None and ex_gen != eff_source_gen)
-                        or (
-                            activity_origin is not None
-                            and ex_origin != eff_activity_origin
-                        )
+                    ex_status = str(existing["status"])
+                    scope_mismatch = (
+                        eff_source_scope is not None and ex_scope != eff_source_scope
+                    )
+                    gen_mismatch = (
+                        eff_source_gen is not None and ex_gen != eff_source_gen
+                    )
+                    origin_differs = (
+                        activity_origin is not None
+                        and ex_origin != eff_activity_origin
+                    )
+                    # Absent scope or generation matches only another absent value.
+                    replay_recovery = (
+                        ex_status == "failed"
+                        and ex_origin == "conversation"
+                        and eff_activity_origin == "replay"
+                        and ex_scope == eff_source_scope
+                        and ex_gen == eff_source_gen
+                    )
+                    if scope_mismatch or gen_mismatch or (
+                        origin_differs and not replay_recovery
                     ):
                         return {
                             "claim_status": "denied",
@@ -3475,7 +3510,6 @@ async def authorize_and_claim_delivery(
                             "code": "not_allowed",
                             "message": "Delivery source metadata is immutable and does not match existing record.",
                         }
-                    ex_status = str(existing["status"])
                     if ex_status in ("sent", "partial"):
                         return {
                             "claim_status": "already_completed",
@@ -4183,7 +4217,30 @@ async def authorize_and_claim_delivery(
                         eff_source_scope = None
                         eff_source_gen = None
 
-                # 3. Atomic claim in dalton_channel_deliveries (source_scope_key, source_generation, activity_origin are immutable once inserted)
+                # Reclaim keeps the delivery key. A different user, platform, or destination
+                # is rejected and does not retarget the stored row.
+                if existing is not None:
+                    ex_user = str(existing.get("user_id") or "").strip()
+                    ex_plat = str(existing.get("platform") or "").strip().lower()
+                    ex_target = str(existing.get("target_address") or "").strip()
+                    got_user = str(resolved_user_id or "").strip()
+                    got_plat = str(resolved_platform or "").strip().lower()
+                    got_target = str(resolved_target_address or "").strip()
+                    if (
+                        ex_user != got_user
+                        or ex_plat != got_plat
+                        or ex_target != got_target
+                    ):
+                        return {
+                            "claim_status": "denied",
+                            "status": "failed",
+                            "code": "not_allowed",
+                            "message": "Delivery identity or destination does not match the existing record.",
+                        }
+
+                # 3. Atomic claim. Scope and generation stay as first stored.
+                # A failed conversation delivery reclaimed as replay persists activity_origin='replay'
+                # so a later progress update does not extend last_conversation_activity_at.
                 await cur.execute(
                     """
                     INSERT INTO dalton_channel_deliveries (
@@ -4205,6 +4262,13 @@ async def authorize_and_claim_delivery(
                         total_chunks = EXCLUDED.total_chunks,
                         error_code = NULL,
                         error_message = NULL,
+                        activity_origin = CASE
+                            WHEN %s
+                             AND dalton_channel_deliveries.status = 'failed'
+                             AND dalton_channel_deliveries.activity_origin = 'conversation'
+                            THEN 'replay'
+                            ELSE dalton_channel_deliveries.activity_origin
+                        END,
                         updated_at = NOW()
                     """,
                     (
@@ -4222,6 +4286,7 @@ async def authorize_and_claim_delivery(
                         eff_source_scope,
                         eff_source_gen,
                         eff_activity_origin,
+                        replay_recovery,
                     ),
                 )
 

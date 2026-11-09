@@ -982,6 +982,9 @@ class InMemoryChannelStore:
 
         if "INSERT INTO dalton_channel_deliveries" in norm:
             if len(params) >= 14:
+                # The product conflict update may append a flag that rewrites a failed
+                # conversation origin to replay. Scope and generation stay on the first row.
+                replay_origin = bool(params[14]) if len(params) >= 15 else False
                 (
                     dkey,
                     kind,
@@ -997,7 +1000,7 @@ class InMemoryChannelStore:
                     src_scope,
                     src_gen,
                     act_origin,
-                ) = params
+                ) = params[:14]
             else:
                 (
                     dkey,
@@ -1015,7 +1018,20 @@ class InMemoryChannelStore:
                 src_scope = None
                 src_gen = None
                 act_origin = "none"
+                replay_origin = False
             prev_dlv = self.deliveries.get(str(dkey))
+            stored_origin = str(act_origin or "none")
+            if prev_dlv is not None:
+                prev_origin = str(prev_dlv.get("activity_origin") or "none")
+                prev_status = str(prev_dlv.get("status") or "")
+                if (
+                    replay_origin
+                    and prev_status == "failed"
+                    and prev_origin == "conversation"
+                ):
+                    stored_origin = "replay"
+                else:
+                    stored_origin = prev_origin
             self.deliveries[str(dkey)] = {
                 "delivery_key": str(dkey),
                 "kind": str(kind),
@@ -1043,11 +1059,7 @@ class InMemoryChannelStore:
                     if prev_dlv is not None
                     else (int(src_gen) if src_gen is not None else None)
                 ),
-                "activity_origin": (
-                    str(prev_dlv.get("activity_origin") or "none")
-                    if prev_dlv is not None
-                    else str(act_origin or "none")
-                ),
+                "activity_origin": stored_origin,
                 "error_code": None,
                 "error_message": None,
                 "created_at": (prev_dlv or {}).get("created_at") or now,
