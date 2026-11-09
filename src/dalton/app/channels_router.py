@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import os
 from typing import Any
+from urllib.parse import parse_qsl, urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
@@ -90,6 +91,9 @@ class InboundRegisterResolveRequest(BaseModel):
     request_key: str | None = None
     raw_payload: dict[str, Any] = Field(default_factory=dict)
     weixin_context_token: str | None = None
+    weixin_bot_id: str | None = None
+    weixin_bot_generation: int | None = None
+    weixin_context_seq: int | None = None
 
 
 class BindCodeConsumeRequest(BaseModel):
@@ -101,6 +105,9 @@ class BindCodeConsumeRequest(BaseModel):
     platform_username: str | None = None
     platform_tenant_key: str | None = None
     weixin_context_token: str | None = None
+    weixin_bot_id: str | None = None
+    weixin_bot_generation: int | None = None
+    inbound_message_id: str | None = None
     code: str | None = None
     is_group: bool = False
     user_id: str | None = None
@@ -217,16 +224,30 @@ class AutomationRunFinishRequest(BaseModel):
 
 
 class WeixinStatePutRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
     ilink_bot_id: str | None = None
     owner_user_id: str | None = None
     bot_token: str | None = None
     base_url: str | None = None
+    cdn_base_url: str | None = None
     get_updates_buf: str | None = None
     status: str | None = None
     ilink_user_id: str | None = None
     ilink_username: str | None = None
+    expected_bot_generation: int | None = None
+    expected_ilink_bot_id: str | None = None
+    expected_get_updates_buf: str | None = None
+    login_action: str | None = None
+    login_session_action: str | None = None
+    login_session_key: str | None = None
+    login_owner_user_id: str | None = None
+    expected_login_version: int | None = None
+    login_version: int | None = None
+    login_status: str | None = None
+    login_qrcode: str | None = None
+    login_qrcode_img_content: str | None = None
+    login_redirect_base_url: str | None = None
+    login_expires_in_seconds: int | None = None
+    login_expires_at: str | None = None
 
 
 class BindCodeCreateRequest(BaseModel):
@@ -236,6 +257,101 @@ class BindCodeCreateRequest(BaseModel):
 class WeixinVerifyCodeRequest(BaseModel):
     session_key: str
     verify_code: str
+
+
+_WEIXIN_QR_PUBLIC_WHITELIST: tuple[str, ...] = (
+    "session_key",
+    "status",
+    "qrcode_url",
+    "qrcode_img_content",
+    "expires_at",
+    "ilink_bot_id",
+    "ilink_user_id",
+    "ilink_username",
+    "bot_generation",
+    "connected",
+    "already_connected",
+    "verify_code_accepted",
+    "need_rescan",
+    "message",
+)
+
+_WEIXIN_BOT_PUBLIC_WHITELIST: tuple[str, ...] = (
+    "configured",
+    "status",
+    "ilink_bot_id",
+    "owner_user_id",
+    "ilink_user_id",
+    "ilink_username",
+    "bot_generation",
+    "updated_at",
+)
+
+_FORBIDDEN_URL_PARAM_KEYS: frozenset[str] = frozenset(
+    {
+        "token",
+        "bot_token",
+        "context_token",
+        "weixin_context_token",
+        "access_token",
+        "secret",
+        "password",
+        "key",
+        "aeskey",
+        "aes_key",
+    }
+)
+
+
+def _sanitize_public_url(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    raw = value.strip()
+    if raw.startswith("data:image/"):
+        return raw
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return None
+    if parsed.username or parsed.password:
+        return None
+    if parsed.scheme not in ("https", "http"):
+        return None
+    for k, _ in parse_qsl(parsed.query, keep_blank_values=True):
+        if k.strip().lower() in _FORBIDDEN_URL_PARAM_KEYS:
+            return None
+    return raw
+
+
+def _shape_public_weixin_qr_response(raw: dict[str, Any]) -> dict[str, Any]:
+    if set(raw.keys()) == {"proxied", "user_id"}:
+        return dict(raw)
+    out: dict[str, Any] = {}
+    for key in _WEIXIN_QR_PUBLIC_WHITELIST:
+        if key not in raw:
+            continue
+        val = raw[key]
+        if key == "qrcode_url":
+            sanitized = _sanitize_public_url(val)
+            if sanitized is not None:
+                out[key] = sanitized
+        elif key == "qrcode_img_content":
+            if isinstance(val, str) and val.strip():
+                if val.strip().startswith(("http://", "https://")):
+                    sanitized = _sanitize_public_url(val)
+                    if sanitized is not None:
+                        out[key] = sanitized
+                else:
+                    out[key] = val.strip()
+        else:
+            out[key] = val
+    return out
+
+
+def _shape_public_weixin_bot_state(raw: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    return {key: raw.get(key) for key in _WEIXIN_BOT_PUBLIC_WHITELIST if key in raw}
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +377,9 @@ async def internal_inbound_register_and_resolve_endpoint(
         request_key=body.request_key,
         raw_payload=body.raw_payload,
         weixin_context_token=body.weixin_context_token,
+        weixin_bot_id=body.weixin_bot_id,
+        weixin_bot_generation=body.weixin_bot_generation,
+        weixin_context_seq=body.weixin_context_seq,
     )
 
 
@@ -281,6 +400,9 @@ async def internal_bind_code_consume_endpoint(
         platform_username=body.platform_username,
         platform_tenant_key=body.platform_tenant_key,
         weixin_context_token=body.weixin_context_token,
+        weixin_bot_id=body.weixin_bot_id,
+        weixin_bot_generation=body.weixin_bot_generation,
+        inbound_message_id=body.inbound_message_id,
         code=body.code,
         is_group=body.is_group,
         user_id=eff_uid,
@@ -516,9 +638,17 @@ async def internal_automation_runs_finish_endpoint(
     "/internal/weixin-state",
     dependencies=[Depends(require_channel_service_token)],
 )
-async def internal_weixin_state_get_endpoint() -> dict[str, Any]:
+async def internal_weixin_state_get_endpoint(
+    include_token: bool = Query(default=True),
+    recipient_platform_user_id: str | None = Query(default=None),
+    inbound_message_id: str | None = Query(default=None),
+) -> dict[str, Any]:
     """I-9 (1): Read singleton Weixin state with decrypted `bot_token`."""
-    return await get_weixin_state(include_token=True)
+    return await get_weixin_state(
+        include_token=include_token,
+        recipient_platform_user_id=recipient_platform_user_id,
+        inbound_message_id=inbound_message_id,
+    )
 
 
 @channels_router.put(
@@ -534,10 +664,26 @@ async def internal_weixin_state_put_endpoint(
         owner_user_id=body.owner_user_id,
         bot_token=body.bot_token,
         base_url=body.base_url,
+        cdn_base_url=body.cdn_base_url,
         get_updates_buf=body.get_updates_buf,
         status=body.status,
         ilink_user_id=body.ilink_user_id,
         ilink_username=body.ilink_username,
+        expected_bot_generation=body.expected_bot_generation,
+        expected_ilink_bot_id=body.expected_ilink_bot_id,
+        expected_get_updates_buf=body.expected_get_updates_buf,
+        login_action=body.login_action,
+        login_session_action=body.login_session_action,
+        login_session_key=body.login_session_key,
+        login_owner_user_id=body.login_owner_user_id,
+        expected_login_version=body.expected_login_version,
+        login_version=body.login_version,
+        login_status=body.login_status,
+        login_qrcode=body.login_qrcode,
+        login_qrcode_img_content=body.login_qrcode_img_content,
+        login_redirect_base_url=body.login_redirect_base_url,
+        login_expires_in_seconds=body.login_expires_in_seconds,
+        login_expires_at=body.login_expires_at,
     )
 
 
@@ -560,9 +706,13 @@ async def web_get_bindings_endpoint(
     user_id: CurrentUserId,
 ) -> dict[str, Any]:
     """§1.5 (2): Return user's bindings across Feishu/Discord/Weixin and (for admin) global Weixin bot status."""
-    state = await get_channel_internal_state(user_id=user_id)
+    state = await get_channel_internal_state(user_id=user_id, include_secrets=False)
     identities = {
-        p: {k: v for k, v in info.items() if k != "weixin_context_token"}
+        p: {
+            k: v
+            for k, v in info.items()
+            if k not in ("weixin_context_token", "encrypted_weixin_context_token")
+        }
         for p, info in state["identities"].items()
     }
     bindings: dict[str, dict[str, Any]] = {}
@@ -587,7 +737,8 @@ async def web_get_bindings_endpoint(
 
     weixin_bot = None
     if state["user_tier"] == "admin":
-        weixin_bot = await get_weixin_state(include_token=False)
+        raw_wx_bot = await get_weixin_state(include_token=False)
+        weixin_bot = _shape_public_weixin_bot_state(raw_wx_bot)
 
     return {
         "user_id": state["user_id"],
@@ -716,11 +867,13 @@ async def web_weixin_qrcode_start_endpoint(
 ) -> dict[str, Any]:
     """§1.5 (4a): Admin-only endpoint to start Weixin iLink Bot QR code login."""
     await _require_weixin_admin(user_id)
-    return await _proxy_to_gateway_weixin(
+    raw = await _proxy_to_gateway_weixin(
         "POST",
         "/internal/weixin/qrcode/start",
         user_id=user_id,
     )
+    await _require_weixin_admin(user_id)
+    return _shape_public_weixin_qr_response(raw)
 
 
 @channels_router.get("/weixin/qrcode/wait")
@@ -730,12 +883,14 @@ async def web_weixin_qrcode_wait_endpoint(
 ) -> dict[str, Any]:
     """§1.5 (4b): Admin-only endpoint to poll Weixin QR code login status."""
     await _require_weixin_admin(user_id)
-    return await _proxy_to_gateway_weixin(
+    raw = await _proxy_to_gateway_weixin(
         "GET",
         "/internal/weixin/qrcode/wait",
         user_id=user_id,
         params={"session_key": session_key},
     )
+    await _require_weixin_admin(user_id)
+    return _shape_public_weixin_qr_response(raw)
 
 
 @channels_router.post("/weixin/qrcode/verify-code")
@@ -745,7 +900,7 @@ async def web_weixin_qrcode_verify_code_endpoint(
 ) -> dict[str, Any]:
     """§1.5 (4c): Admin-only endpoint to submit phone verification code during Weixin QR login."""
     await _require_weixin_admin(user_id)
-    return await _proxy_to_gateway_weixin(
+    raw = await _proxy_to_gateway_weixin(
         "POST",
         "/internal/weixin/qrcode/verify-code",
         user_id=user_id,
@@ -754,3 +909,5 @@ async def web_weixin_qrcode_verify_code_endpoint(
             "verify_code": body.verify_code,
         },
     )
+    await _require_weixin_admin(user_id)
+    return _shape_public_weixin_qr_response(raw)

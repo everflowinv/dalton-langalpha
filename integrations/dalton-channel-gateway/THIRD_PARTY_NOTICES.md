@@ -21,14 +21,28 @@ This package (`@dalton/channel-gateway`) includes code adapted from the OpenClaw
 | `src/channels/feishu/directory.ts` | `feishu/dist/.setup/channel.runtime-CC15v8AP.mjs`, `feishu/dist/.setup/chat-fC3dvxFs.mjs` | `91–183`, `46–101` |
 | `src/channels/feishu/monitor.ts` | `feishu/dist/.setup/monitor.account-UbN1RhlP.mjs` | `858–872`, `5215–5309`, `5343–5565`, `5622–5760`, `6228–6317` |
 
+## Referenced and Adapted Tencent Weixin iLink Files (`@tencent-weixin/openclaw-weixin`, v2.1.5)
+
+| Target File in `@dalton/channel-gateway` | Reference Source (`.agy/ref_openclaw_weixin/src/`) |
+|---|---|
+| `src/channels/weixin/types.ts` | `api/types.ts` |
+| `src/channels/weixin/api.ts` | `api/api.ts`, `api/session-guard.ts` |
+| `src/channels/weixin/cdn.ts` | `cdn/aes-ecb.ts`, `cdn/pic-decrypt.ts`, `cdn/cdn-url.ts`, `cdn/cdn-upload.ts`, `cdn/upload.ts`, `media/mime.ts` |
+| `src/channels/weixin/markdown-filter.ts` | `messaging/markdown-filter.ts` |
+| `src/channels/weixin/inbound.ts` | `messaging/inbound.ts`, `messaging/partial-quote.ts`, `messaging/process-message.ts` |
+| `src/channels/weixin/send.ts` | `messaging/send.ts`, `messaging/send-media.ts` |
+| `src/channels/weixin/login-qr.ts` | `auth/login-qr.ts` |
+| `src/channels/weixin/monitor.ts` | `monitor/monitor.ts` |
+
 ---
 
-## OpenClaw License
+## OpenClaw & Tencent Weixin Plugin Licenses
 
 ```text
 MIT License
 
 Copyright (c) 2025 Peter Steinberger
+Copyright (c) 2026 Tencent
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

@@ -426,6 +426,7 @@ export const queryKeys = {
     // DALTON-HOOK(team-memory-toggle): workspace and user-level Team Memory settings query keys
     workspaceSettings: (workspaceId: string) => [...queryKeys.dalton.all, 'workspace-settings', workspaceId],
     userSettings: () => [...queryKeys.dalton.all, 'user-settings'],
+    channelBindings: () => [...queryKeys.dalton.all, 'channels', 'bindings'],
   },
 };
 

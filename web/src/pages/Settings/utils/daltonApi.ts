@@ -778,3 +778,136 @@ export async function fetchDaltonFeishuGroups(): Promise<DaltonFeishuGroupsRespo
   );
   return data;
 }
+
+export interface DaltonChannelIdentityItem {
+  platform_user_id: string;
+  platform_display_name: string | null;
+  bound_at: string | null;
+  last_active_at: string | null;
+}
+
+export interface DaltonWeixinBotPublicState {
+  connected: boolean;
+  status: 'unconfigured' | 'connected' | 'expired' | 'error';
+  ilink_bot_id: string | null;
+  ilink_user_id: string | null;
+  base_url: string | null;
+  bot_generation?: number;
+  bound_user_id?: string | null;
+  bound_user_tier?: string | null;
+  bound_user_is_active?: boolean | null;
+  bound_is_self?: boolean;
+  updated_at?: string | null;
+}
+
+export interface DaltonChannelBindingsResponse {
+  user_id: string;
+  user_tier: 'admin' | 'internal' | 'external' | string;
+  identities: {
+    feishu: DaltonChannelIdentityItem | null;
+    weixin: DaltonChannelIdentityItem | null;
+  };
+  active_bind_codes: Array<{
+    platform: 'feishu' | 'weixin' | string;
+    expires_at: string | null;
+    created_at: string | null;
+  }>;
+  weixin_bot: DaltonWeixinBotPublicState | null;
+  feishu_bot_configured: boolean;
+}
+
+export interface DaltonChannelBindCodeCreateResponse {
+  code: string;
+  platform: 'feishu' | 'weixin';
+  expires_at: string | null;
+  ttl_seconds: number;
+  instruction: string;
+}
+
+export interface DaltonChannelUnbindResponse {
+  unbound: boolean;
+  platform: 'feishu' | 'weixin' | string;
+}
+
+export type DaltonWeixinQrPublicStatus =
+  | 'wait'
+  | 'scaned'
+  | 'need_verifycode'
+  | 'scaned_but_redirect'
+  | 'verify_code_blocked'
+  | 'expired'
+  | 'binded_redirect'
+  | 'saving'
+  | 'confirmed'
+  | 'error'
+  | 'superseded';
+
+export interface DaltonWeixinQrPublicResponse {
+  session_key: string;
+  status: DaltonWeixinQrPublicStatus;
+  connected?: boolean;
+  qrcode_url?: string | null;
+  expires_at?: string | null;
+  ilink_bot_id?: string | null;
+  ilink_user_id?: string | null;
+  base_url?: string | null;
+  bot_generation?: number | null;
+  bound_user_id?: string | null;
+  verify_code_accepted?: boolean | null;
+  message?: string | null;
+}
+
+export async function fetchDaltonChannelBindings(): Promise<DaltonChannelBindingsResponse> {
+  const { data } = await api.get<DaltonChannelBindingsResponse>(
+    '/api/v1/dalton/channels/bindings',
+  );
+  return data;
+}
+
+export async function createDaltonChannelBindCode(
+  platform: 'feishu' | 'weixin',
+): Promise<DaltonChannelBindCodeCreateResponse> {
+  const { data } = await api.post<DaltonChannelBindCodeCreateResponse>(
+    '/api/v1/dalton/channels/bind-codes',
+    { platform },
+  );
+  return data;
+}
+
+export async function unbindDaltonChannel(
+  platform: 'feishu' | 'weixin',
+): Promise<DaltonChannelUnbindResponse> {
+  const { data } = await api.delete<DaltonChannelUnbindResponse>(
+    `/api/v1/dalton/channels/bindings/${encodeURIComponent(platform)}`,
+  );
+  return data;
+}
+
+export async function startDaltonWeixinQrLogin(): Promise<DaltonWeixinQrPublicResponse> {
+  const { data } = await api.post<DaltonWeixinQrPublicResponse>(
+    '/api/v1/dalton/channels/weixin/qrcode/start',
+    {},
+  );
+  return data;
+}
+
+export async function waitDaltonWeixinQrLogin(
+  sessionKey: string,
+): Promise<DaltonWeixinQrPublicResponse> {
+  const { data } = await api.get<DaltonWeixinQrPublicResponse>(
+    '/api/v1/dalton/channels/weixin/qrcode/wait',
+    { params: { session_key: sessionKey } },
+  );
+  return data;
+}
+
+export async function verifyDaltonWeixinQrCode(
+  sessionKey: string,
+  verifyCode: string,
+): Promise<DaltonWeixinQrPublicResponse> {
+  const { data } = await api.post<DaltonWeixinQrPublicResponse>(
+    '/api/v1/dalton/channels/weixin/qrcode/verify-code',
+    { session_key: sessionKey, verify_code: verifyCode },
+  );
+  return data;
+}

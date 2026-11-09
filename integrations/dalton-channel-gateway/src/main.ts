@@ -4,6 +4,10 @@ import {
   FeishuChannelAdapter,
   type FeishuChannelAdapterOptions,
 } from "./channels/feishu/index.js";
+import {
+  WeixinChannelAdapter,
+  type WeixinChannelAdapterOptions,
+} from "./channels/weixin/index.js";
 import { type GatewayConfig, loadConfig } from "./config.js";
 import { createGatewayApp } from "./server.js";
 import type { ChannelPlatform } from "./types.js";
@@ -12,6 +16,7 @@ export function buildConfiguredAdapters(
   config: GatewayConfig,
   overrides?: {
     feishu?: Partial<FeishuChannelAdapterOptions>;
+    weixin?: Partial<WeixinChannelAdapterOptions>;
   },
 ): Map<ChannelPlatform, ChannelAdapter> {
   const adapters = new Map<ChannelPlatform, ChannelAdapter>();
@@ -27,6 +32,17 @@ export function buildConfiguredAdapters(
         appId: config.channels.feishu.appId,
         appSecret: config.channels.feishu.appSecret,
         ...overrides?.feishu,
+      }),
+    );
+  }
+
+  if (config.channels.weixin.enabled) {
+    adapters.set(
+      "weixin",
+      new WeixinChannelAdapter({
+        baseUrl: config.channels.weixin.apiBaseUrl,
+        cdnBaseUrl: config.channels.weixin.cdnBaseUrl,
+        ...overrides?.weixin,
       }),
     );
   }

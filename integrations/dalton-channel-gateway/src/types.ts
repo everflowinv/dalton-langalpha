@@ -214,6 +214,14 @@ export interface InboundChannelEvent {
   attachments?: InboundAttachmentDescriptor[];
   /** Weixin `context_token` when `platform === "weixin"`. */
   weixinContextToken?: string;
+  /** Stable Weixin `ilink_bot_id` when `platform === "weixin"`. */
+  weixinBotId?: string;
+  /** Active Weixin `bot_generation` when `platform === "weixin"`. */
+  weixinBotGeneration?: number;
+  /** Monotonic sequence/timestamp for Weixin context token ordering. */
+  weixinContextSeq?: number;
+  /** True when a Weixin voice message had no server-side text transcription. */
+  voiceWithoutTranscription?: boolean;
   /** Arbitrary platform payload saved in `raw_payload`. */
   rawPayload?: Record<string, unknown>;
 }

@@ -1,4 +1,4 @@
-import { readFileSync, statSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
@@ -169,14 +169,15 @@ describe("Startup Recovery & Non-Blocking Server Start (§5.2, Codex r2 #17/#18,
 
     await h.app.orchestrator.runStartupRecovery();
 
-    // Verify Weixin cache directory & state.json permissions and content
+    // Verify Weixin state is loaded into adapter memory from I-9 and never written as plaintext state.json
     const wxDir = join(h.tempDir, "weixin");
     const wxFile = join(wxDir, "state.json");
-    expect(statSync(wxDir).mode & 0o777).toBe(0o700);
-    expect(statSync(wxFile).mode & 0o777).toBe(0o600);
-    const cachedWx = JSON.parse(readFileSync(wxFile, "utf8"));
-    expect(cachedWx.bot_token).toBe("decrypted_secret_bot_token");
-    expect(cachedWx.get_updates_buf).toBe("cursor_xyz");
+    expect(existsSync(wxFile)).toBe(false);
+    expect(h.weixinAdapter.persistedWeixinState).toMatchObject({
+      configured: true,
+      bot_token: "decrypted_secret_bot_token",
+      get_updates_buf: "cursor_xyz",
+    });
 
     // Verify `dispatched` row without `run_id` re-dispatched with `missingRunKey`
     expect(

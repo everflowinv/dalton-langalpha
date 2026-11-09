@@ -8,12 +8,30 @@
  * payloads are buffered in memory up to `MAX_ATTACHMENT_BYTES` (20 MB).
  */
 
+import { lookup as dnsLookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import { MAX_ATTACHMENT_BYTES } from "../types.js";
 
+export const MAX_CIPHERTEXT_ATTACHMENT_BYTES = MAX_ATTACHMENT_BYTES + 16;
 export const DEFAULT_SAFE_FETCH_TIMEOUT_MS = 30_000;
 export const DEFAULT_CHUNK_IDLE_TIMEOUT_MS = 15_000;
 export const MAX_SAFE_FETCH_REDIRECTS = 5;
+
+export type HostIpResolver = (hostname: string) => Promise<readonly string[]>;
+
+export async function defaultResolveHostIps(
+  hostname: string,
+): Promise<readonly string[]> {
+  const normalized = hostname
+    .trim()
+    .replace(/^\[|\]$/g, "")
+    .replace(/\.$/, "");
+  if (isIP(normalized) !== 0) {
+    return [normalized];
+  }
+  const records = await dnsLookup(normalized, { all: true, verbatim: true });
+  return records.map((r) => r.address);
+}
 
 export class SafeFetchError extends Error {
   readonly code:
@@ -212,7 +230,7 @@ export async function readStreamWithLimit(
   options: ReadStreamWithLimitOptions = {},
 ): Promise<Buffer> {
   const maxBytes = Math.min(
-    MAX_ATTACHMENT_BYTES,
+    MAX_CIPHERTEXT_ATTACHMENT_BYTES,
     Math.max(1, options.maxBytes ?? MAX_ATTACHMENT_BYTES),
   );
   const chunkIdleTimeoutMs =
@@ -363,7 +381,12 @@ export async function readStreamWithLimit(
 
 export interface SafeFetchOptions {
   allowedDomains?: readonly string[];
+  requireHttps?: boolean;
+  resolveHostIps?: HostIpResolver;
+  checkResolvedIps?: boolean;
   maxBytes?: number;
+  declaredSizeBytes?: number;
+  expectedExactBytes?: number;
   timeoutMs?: number;
   chunkIdleTimeoutMs?: number;
   headers?: Record<string, string>;
@@ -371,11 +394,52 @@ export interface SafeFetchOptions {
   fetchImpl?: typeof fetch;
 }
 
+export interface SafeFetchRequestOptions {
+  method?: "GET" | "POST" | "PUT";
+  allowedDomains?: readonly string[];
+  requireHttps?: boolean;
+  resolveHostIps?: HostIpResolver;
+  checkResolvedIps?: boolean;
+  headers?: Record<string, string>;
+  body?: BodyInit | Buffer | Uint8Array | string;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  fetchImpl?: typeof fetch;
+  maxRedirects?: number;
+}
+
 export interface SafeFetchResult {
   buffer: Buffer;
   contentType: string | null;
   contentDisposition: string | null;
   status: number;
+  headers: Headers;
+}
+
+const SENSITIVE_REDIRECT_HEADER_NAMES = new Set([
+  "authorization",
+  "cookie",
+  "proxy-authorization",
+  "x-service-token",
+  "x-user-id",
+  "x-wechat-uin",
+]);
+
+function stripSensitiveHeadersOnCrossOrigin(
+  headers: Record<string, string> | undefined,
+  initialOrigin: string,
+  targetOrigin: string,
+): Record<string, string> | undefined {
+  if (!headers || initialOrigin === targetOrigin) {
+    return headers;
+  }
+  const filtered: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers)) {
+    if (!SENSITIVE_REDIRECT_HEADER_NAMES.has(k.trim().toLowerCase())) {
+      filtered[k] = v;
+    }
+  }
+  return filtered;
 }
 
 async function cancelResponseBody(response: Response): Promise<void> {
@@ -386,13 +450,21 @@ async function cancelResponseBody(response: Response): Promise<void> {
   }
 }
 
-function validateSafeFetchTargetUrl(
+export function validateSafeFetchTargetUrl(
   targetUrl: URL,
   allowedDomains: readonly string[] | undefined,
   isRedirect: boolean,
+  requireHttps = false,
 ): void {
   const prefix = isRedirect ? "Redirected attachment" : "Attachment";
-  if (targetUrl.protocol !== "https:" && targetUrl.protocol !== "http:") {
+  if (requireHttps) {
+    if (targetUrl.protocol !== "https:") {
+      throw new SafeFetchError(
+        "invalid_url",
+        `${prefix} URL must use HTTPS: ${targetUrl.protocol}`,
+      );
+    }
+  } else if (targetUrl.protocol !== "https:" && targetUrl.protocol !== "http:") {
     throw new SafeFetchError(
       "invalid_url",
       `Unsupported ${prefix.toLowerCase()} URL protocol: ${targetUrl.protocol}`,
@@ -421,6 +493,195 @@ function validateSafeFetchTargetUrl(
   }
 }
 
+export async function validateSafeTargetUrlWithDns(
+  targetUrl: URL,
+  options: {
+    allowedDomains?: readonly string[];
+    requireHttps?: boolean;
+    isRedirect?: boolean;
+    resolveHostIps?: HostIpResolver;
+    checkResolvedIps?: boolean;
+  },
+): Promise<void> {
+  const isRedirect = Boolean(options.isRedirect);
+  validateSafeFetchTargetUrl(
+    targetUrl,
+    options.allowedDomains,
+    isRedirect,
+    Boolean(options.requireHttps),
+  );
+
+  const resolver =
+    options.resolveHostIps ??
+    (options.checkResolvedIps ? defaultResolveHostIps : undefined);
+  if (resolver) {
+    let resolvedIps: readonly string[];
+    try {
+      resolvedIps = await resolver(targetUrl.hostname);
+    } catch (error) {
+      throw new SafeFetchError(
+        "blocked_host",
+        `Failed to resolve host "${targetUrl.hostname}"`,
+        { cause: error },
+      );
+    }
+    if (!resolvedIps || resolvedIps.length === 0) {
+      throw new SafeFetchError(
+        "blocked_host",
+        `Host "${targetUrl.hostname}" resolved to no IP addresses`,
+      );
+    }
+    for (const ip of resolvedIps) {
+      if (isBlockedHostnameOrIp(ip)) {
+        throw new SafeFetchError(
+          "blocked_host",
+          `Host "${targetUrl.hostname}" resolved to blocked IP address "${ip}"`,
+        );
+      }
+    }
+  }
+}
+
+export async function safeFetchResponse(
+  rawUrl: string | URL,
+  options: SafeFetchRequestOptions = {},
+): Promise<Response> {
+  let currentUrl: URL;
+  try {
+    currentUrl =
+      typeof rawUrl === "string"
+        ? new URL(rawUrl)
+        : new URL(rawUrl.toString());
+  } catch (error) {
+    throw new SafeFetchError("invalid_url", "Invalid request URL", {
+      cause: error,
+    });
+  }
+
+  await validateSafeTargetUrlWithDns(currentUrl, {
+    allowedDomains: options.allowedDomains,
+    requireHttps: options.requireHttps,
+    isRedirect: false,
+    resolveHostIps: options.resolveHostIps,
+    checkResolvedIps: options.checkResolvedIps,
+  });
+
+  const initialOrigin = currentUrl.origin;
+  const timeoutMs = options.timeoutMs ?? DEFAULT_SAFE_FETCH_TIMEOUT_MS;
+  const fetchFn = options.fetchImpl ?? globalThis.fetch;
+  const maxRedirects = options.maxRedirects ?? MAX_SAFE_FETCH_REDIRECTS;
+  let method = options.method ?? "GET";
+  let body = options.body;
+
+  const controller = new AbortController();
+  const onParentAbort = (): void => controller.abort();
+  options.signal?.addEventListener("abort", onParentAbort, { once: true });
+  if (options.signal?.aborted) {
+    controller.abort();
+  }
+  const timer =
+    timeoutMs > 0
+      ? setTimeout(() => controller.abort(), timeoutMs)
+      : undefined;
+
+  try {
+    let redirectHops = 0;
+    while (true) {
+      if (controller.signal.aborted) {
+        throw new SafeFetchError(
+          "timeout",
+          `Request timed out or aborted after ${timeoutMs}ms`,
+        );
+      }
+
+      const effectiveHeaders = stripSensitiveHeadersOnCrossOrigin(
+        options.headers,
+        initialOrigin,
+        currentUrl.origin,
+      );
+
+      let response: Response;
+      try {
+        response = await fetchFn(currentUrl.toString(), {
+          method,
+          headers: effectiveHeaders,
+          body: body as BodyInit | undefined,
+          redirect: "manual",
+          signal: controller.signal,
+        });
+      } catch (error) {
+        if (controller.signal.aborted) {
+          throw new SafeFetchError(
+            "timeout",
+            `Request timed out after ${timeoutMs}ms`,
+            { cause: error },
+          );
+        }
+        throw error;
+      }
+
+      if (response.status >= 300 && response.status < 400) {
+        const locationHeader = response.headers.get("location")?.trim();
+        await cancelResponseBody(response);
+
+        if (!locationHeader) {
+          throw new SafeFetchError(
+            "http_error",
+            `Redirect response HTTP ${response.status} is missing Location header`,
+          );
+        }
+
+        if (redirectHops >= maxRedirects) {
+          throw new SafeFetchError(
+            "http_error",
+            `Request exceeded maximum redirect hops (${maxRedirects})`,
+          );
+        }
+
+        let nextUrl: URL;
+        try {
+          nextUrl = new URL(locationHeader, currentUrl);
+        } catch (error) {
+          throw new SafeFetchError(
+            "invalid_url",
+            "Invalid redirect Location URL",
+            { cause: error },
+          );
+        }
+
+        await validateSafeTargetUrlWithDns(nextUrl, {
+          allowedDomains: options.allowedDomains,
+          requireHttps: options.requireHttps,
+          isRedirect: true,
+          resolveHostIps: options.resolveHostIps,
+          checkResolvedIps: options.checkResolvedIps,
+        });
+
+        if (
+          response.status === 301 ||
+          response.status === 302 ||
+          response.status === 303
+        ) {
+          if (method !== "GET") {
+            method = "GET";
+            body = undefined;
+          }
+        }
+        currentUrl = nextUrl;
+        redirectHops += 1;
+        continue;
+      }
+
+      return response;
+    }
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+    options.signal?.removeEventListener("abort", onParentAbort);
+  }
+}
+
 export async function safeFetchBuffer(
   rawUrl: string | URL,
   options: SafeFetchOptions = {},
@@ -437,18 +698,39 @@ export async function safeFetchBuffer(
     });
   }
 
-  validateSafeFetchTargetUrl(currentUrl, options.allowedDomains, false);
+  await validateSafeTargetUrlWithDns(currentUrl, {
+    allowedDomains: options.allowedDomains,
+    requireHttps: options.requireHttps,
+    isRedirect: false,
+    resolveHostIps: options.resolveHostIps,
+    checkResolvedIps: options.checkResolvedIps,
+  });
 
   const maxBytes = Math.min(
-    MAX_ATTACHMENT_BYTES,
+    MAX_CIPHERTEXT_ATTACHMENT_BYTES,
     Math.max(1, options.maxBytes ?? MAX_ATTACHMENT_BYTES),
   );
+  if (
+    options.declaredSizeBytes !== undefined &&
+    Number.isFinite(options.declaredSizeBytes) &&
+    options.declaredSizeBytes > maxBytes
+  ) {
+    throw new SafeFetchError(
+      "size_exceeded",
+      `Declared attachment size (${options.declaredSizeBytes}) exceeds maximum allowed size of ${maxBytes} bytes`,
+    );
+  }
+
+  const initialOrigin = currentUrl.origin;
   const timeoutMs = options.timeoutMs ?? DEFAULT_SAFE_FETCH_TIMEOUT_MS;
   const fetchFn = options.fetchImpl ?? globalThis.fetch;
 
   const controller = new AbortController();
   const onParentAbort = (): void => controller.abort();
   options.signal?.addEventListener("abort", onParentAbort, { once: true });
+  if (options.signal?.aborted) {
+    controller.abort();
+  }
   const timer =
     timeoutMs > 0
       ? setTimeout(() => controller.abort(), timeoutMs)
@@ -459,10 +741,15 @@ export async function safeFetchBuffer(
     let redirectHops = 0;
 
     while (true) {
+      const effectiveHeaders = stripSensitiveHeadersOnCrossOrigin(
+        options.headers,
+        initialOrigin,
+        currentUrl.origin,
+      );
       try {
         response = await fetchFn(currentUrl.toString(), {
           method: "GET",
-          headers: options.headers,
+          headers: effectiveHeaders,
           redirect: "manual",
           signal: controller.signal,
         });
@@ -506,7 +793,13 @@ export async function safeFetchBuffer(
           );
         }
 
-        validateSafeFetchTargetUrl(nextUrl, options.allowedDomains, true);
+        await validateSafeTargetUrlWithDns(nextUrl, {
+          allowedDomains: options.allowedDomains,
+          requireHttps: options.requireHttps,
+          isRedirect: true,
+          resolveHostIps: options.resolveHostIps,
+          checkResolvedIps: options.checkResolvedIps,
+        });
         currentUrl = nextUrl;
         redirectHops += 1;
         continue;
@@ -524,14 +817,28 @@ export async function safeFetchBuffer(
     }
 
     const contentLengthHeader = response.headers.get("content-length");
+    let contentLengthValue: number | undefined;
     if (contentLengthHeader) {
       const contentLength = Number.parseInt(contentLengthHeader, 10);
-      if (Number.isFinite(contentLength) && contentLength > maxBytes) {
-        await cancelResponseBody(response);
-        throw new SafeFetchError(
-          "size_exceeded",
-          `Attachment Content-Length (${contentLength}) exceeds maximum allowed size of ${maxBytes} bytes`,
-        );
+      if (Number.isFinite(contentLength) && contentLength >= 0) {
+        contentLengthValue = contentLength;
+        if (contentLength > maxBytes) {
+          await cancelResponseBody(response);
+          throw new SafeFetchError(
+            "size_exceeded",
+            `Attachment Content-Length (${contentLength}) exceeds maximum allowed size of ${maxBytes} bytes`,
+          );
+        }
+        if (
+          options.expectedExactBytes !== undefined &&
+          contentLength !== options.expectedExactBytes
+        ) {
+          await cancelResponseBody(response);
+          throw new SafeFetchError(
+            "size_exceeded",
+            `Attachment Content-Length (${contentLength}) does not match expected size (${options.expectedExactBytes})`,
+          );
+        }
       }
     }
 
@@ -549,12 +856,31 @@ export async function safeFetchBuffer(
         `Attachment size (${buffer.byteLength}) exceeds maximum allowed size of ${maxBytes} bytes`,
       );
     }
+    if (
+      contentLengthValue !== undefined &&
+      buffer.byteLength !== contentLengthValue
+    ) {
+      throw new SafeFetchError(
+        "size_exceeded",
+        `Attachment actual size (${buffer.byteLength}) does not match Content-Length (${contentLengthValue})`,
+      );
+    }
+    if (
+      options.expectedExactBytes !== undefined &&
+      buffer.byteLength !== options.expectedExactBytes
+    ) {
+      throw new SafeFetchError(
+        "size_exceeded",
+        `Attachment actual size (${buffer.byteLength}) does not match declared size (${options.expectedExactBytes})`,
+      );
+    }
 
     return {
       buffer,
       contentType: response.headers.get("content-type"),
       contentDisposition: response.headers.get("content-disposition"),
       status: response.status,
+      headers: response.headers,
     };
   } finally {
     if (timer !== undefined) {

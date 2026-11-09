@@ -42,6 +42,16 @@ export class FakeChannelAdapter implements ChannelAdapter {
 
   readonly sentTexts: FakeSentTextRecord[] = [];
   readonly sentFiles: FakeSentFileRecord[] = [];
+  persistedWeixinState: {
+    configured: boolean;
+    status: string;
+    bot_token: string | null;
+    ilink_bot_id: string | null;
+    ilink_user_id: string | null;
+    base_url: string | null;
+    get_updates_buf: string;
+    bot_generation?: number;
+  } | null = null;
 
   private inboundHandler: ((event: InboundChannelEvent) => Promise<void>) | null = null;
   private msgCounter = 0;
@@ -294,5 +304,20 @@ export class FakeChannelAdapter implements ChannelAdapter {
       return await this.qrVerifyBehavior(options);
     }
     return { status: "confirmed" };
+  }
+
+  applyPersistedState(state: {
+    configured: boolean;
+    status: string;
+    bot_token: string | null;
+    ilink_bot_id: string | null;
+    ilink_user_id: string | null;
+    base_url: string | null;
+    get_updates_buf: string;
+    bot_generation?: number;
+  }): void {
+    this.persistedWeixinState = { ...state };
+    this.configured = state.configured;
+    this.connected = state.configured && state.status === "active";
   }
 }

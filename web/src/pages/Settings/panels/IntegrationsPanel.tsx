@@ -6,6 +6,7 @@ import { ConsoleLink } from '../components/ConsoleLink';
 import { SettingRow, SettingsGroup } from '../components/SettingsLayout';
 import { useSettingCopy } from '../components/useSettingCopy';
 import { SETTINGS } from '../sections';
+import { DaltonWeixinChannelCard } from './dalton/DaltonWeixinChannelCard';
 
 /**
  * Integrations: each chat app with whether it is linked, and the way to set it
@@ -56,6 +57,8 @@ export function IntegrationsPanel() {
           </ConsoleLink>
         </SettingRow>
       </SettingsGroup>
+
+      <DaltonWeixinChannelCard />
     </>
   );
 }

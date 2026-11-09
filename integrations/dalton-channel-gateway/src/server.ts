@@ -9,6 +9,7 @@ import { AgentRoutesHandler } from "./agent-routes.js";
 import { extractUserIdHeader, verifyServiceToken } from "./auth.js";
 import type { BackendClient } from "./backend-client.js";
 import type { ChannelAdapter } from "./channels/adapter.js";
+import { WeixinQrLoginError } from "./channels/weixin/index.js";
 import type { GatewayConfig } from "./config.js";
 import { DeliveryService } from "./delivery-service.js";
 import { ChannelGatewayOrchestrator } from "./orchestrator.js";
@@ -58,6 +59,98 @@ function sendJson(
   res.end(body);
 }
 
+function sanitizePublicQrUrl(rawUrl: unknown): string | undefined {
+  if (typeof rawUrl !== "string" || !rawUrl.trim()) {
+    return undefined;
+  }
+  const trimmed = rawUrl.trim();
+  if (trimmed.toLowerCase().startsWith("data:image/")) {
+    return trimmed;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== "https:" || parsed.username || parsed.password) {
+      return undefined;
+    }
+    for (const key of [...parsed.searchParams.keys()]) {
+      const lower = key.toLowerCase();
+      if (
+        lower.includes("token") ||
+        lower.includes("secret") ||
+        lower.includes("key") ||
+        lower.includes("auth") ||
+        lower.includes("pass")
+      ) {
+        parsed.searchParams.delete(key);
+      }
+    }
+    return parsed.toString();
+  } catch {
+    return undefined;
+  }
+}
+
+export function sanitizePublicWeixinQrResponse(
+  payload: unknown,
+): Record<string, unknown> {
+  if (!payload || typeof payload !== "object") {
+    return { status: "error", message: "Invalid QR response" };
+  }
+  const src = payload as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  if (typeof src.session_key === "string" && src.session_key.trim()) {
+    out.session_key = src.session_key.trim();
+  }
+  const safeQrUrl = sanitizePublicQrUrl(src.qrcode_url);
+  if (safeQrUrl) {
+    out.qrcode_url = safeQrUrl;
+  }
+  const safeQrContent = sanitizePublicQrUrl(src.qrcode_img_content);
+  if (safeQrContent) {
+    out.qrcode_img_content = safeQrContent;
+  }
+  if (typeof src.status === "string" && src.status.trim()) {
+    out.status = src.status.trim();
+  }
+  if (typeof src.connected === "boolean") {
+    out.connected = src.connected;
+  }
+  if (typeof src.already_connected === "boolean") {
+    out.already_connected = src.already_connected;
+  }
+  if (typeof src.need_rescan === "boolean") {
+    out.need_rescan = src.need_rescan;
+  }
+  if (typeof src.expires_at === "string" && src.expires_at.trim()) {
+    out.expires_at = src.expires_at.trim();
+  }
+  if (typeof src.ilink_bot_id === "string" && src.ilink_bot_id.trim()) {
+    out.ilink_bot_id = src.ilink_bot_id.trim();
+  }
+  if (typeof src.ilink_user_id === "string" && src.ilink_user_id.trim()) {
+    out.ilink_user_id = src.ilink_user_id.trim();
+  }
+  if (typeof src.ilink_username === "string" && src.ilink_username.trim()) {
+    out.ilink_username = src.ilink_username.trim();
+  }
+  if (
+    typeof src.bot_generation === "number" &&
+    Number.isFinite(src.bot_generation)
+  ) {
+    out.bot_generation = Math.trunc(src.bot_generation);
+  }
+  if (typeof src.verify_code_accepted === "boolean") {
+    out.verify_code_accepted = src.verify_code_accepted;
+  }
+  if (typeof src.message === "string" && src.message.trim()) {
+    out.message = src.message.trim();
+  }
+  if (typeof src.error_code === "string" && src.error_code.trim()) {
+    out.error_code = src.error_code.trim();
+  }
+  return out;
+}
+
 export function createGatewayApp(options: {
   config: GatewayConfig;
   backend: BackendClient;
@@ -71,6 +164,11 @@ export function createGatewayApp(options: {
     throw new Error(
       `Gateway server must bind only to 127.0.0.1 (got "${config.host}")`,
     );
+  }
+
+  const wxInitial = adapters.get("weixin");
+  if (wxInitial?.setBackendClient) {
+    wxInitial.setBackendClient(backend);
   }
 
   const deliveryService = new DeliveryService({ backend, adapters });
@@ -226,7 +324,7 @@ export function createGatewayApp(options: {
           return;
         }
         const out = await wxAdapter.startQrLogin({ userId: uid });
-        sendJson(res, 200, out);
+        sendJson(res, 200, sanitizePublicWeixinQrResponse(out));
         return;
       }
 
@@ -257,18 +355,7 @@ export function createGatewayApp(options: {
           userId: uid,
           sessionKey,
         });
-        if (out.status === "confirmed" && out.bot_token && out.ilink_bot_id) {
-          await backend.putWeixinState({
-            ilink_bot_id: out.ilink_bot_id,
-            owner_user_id: uid,
-            bot_token: out.bot_token,
-            base_url: out.base_url ?? null,
-            status: "active",
-            ilink_user_id: out.ilink_user_id ?? null,
-            ilink_username: out.ilink_username ?? null,
-          });
-        }
-        sendJson(res, 200, out);
+        sendJson(res, 200, sanitizePublicWeixinQrResponse(out));
         return;
       }
 
@@ -293,23 +380,19 @@ export function createGatewayApp(options: {
           sessionKey: body.session_key,
           code: body.verify_code ?? body.code ?? "",
         });
-        if (out.status === "confirmed" && out.bot_token && out.ilink_bot_id) {
-          await backend.putWeixinState({
-            ilink_bot_id: out.ilink_bot_id,
-            owner_user_id: uid,
-            bot_token: out.bot_token,
-            base_url: out.base_url ?? null,
-            status: "active",
-            ilink_user_id: out.ilink_user_id ?? null,
-            ilink_username: out.ilink_username ?? null,
-          });
-        }
-        sendJson(res, 200, out);
+        sendJson(res, 200, sanitizePublicWeixinQrResponse(out));
         return;
       }
 
       sendJson(res, 404, { detail: "Not found" });
     } catch (err) {
+      if (err instanceof WeixinQrLoginError) {
+        sendJson(res, err.statusCode, {
+          detail: err.message,
+          code: err.code,
+        });
+        return;
+      }
       sendJson(res, 500, {
         detail: err instanceof Error ? err.message : "Internal gateway error",
       });
@@ -327,7 +410,7 @@ export function createGatewayApp(options: {
     async start(): Promise<{ host: string; port: number }> {
       await orchestrator.syncWeixinStateCache();
       for (const adapter of adapters.values()) {
-        if (adapter.isConfigured()) {
+        if (adapter.isConfigured() || adapter.platform === "weixin") {
           await adapter.start();
         }
       }

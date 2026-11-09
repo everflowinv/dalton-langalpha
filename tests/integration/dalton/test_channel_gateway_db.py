@@ -1,8 +1,8 @@
-"""Real Postgres integration tests for CH-1 Phase 1 (`d030_channel_gateway`).
+"""Real Postgres integration tests for CH-1 (`d030_channel_gateway` + `d032_weixin_state`).
 
 Reads the test database connection string from ``DALTON_CHANNEL_GATEWAY_TEST_DSN``
 (or ``DALTON_TEST_DB_DSN`` / ``TEST_DATABASE_URL``); skips cleanly when unset.
-A session-scoped fixture upgrades the test database to upstream head and Dalton ``d030``
+A session-scoped fixture upgrades the test database to upstream head and Dalton ``d032``
 (skipping if already at head, never dropping ``public`` schema), and each test uses
 a unique prefix and cleans up its own rows on teardown.
 """
@@ -31,6 +31,7 @@ import pytest_asyncio
 from src.dalton import sharing as dalton_sharing
 from src.dalton.database import channel_gateway as cg_db
 from src.server.database import pool as db_pool
+from src.server.database import user as user_db
 from src.server.database.runs import handoff_liveness
 
 pytestmark = pytest.mark.integration
@@ -104,7 +105,7 @@ async def _ensure_alembic_upgraded_to_head(dsn: str) -> None:
         "script_location", str(project_root / "src" / "dalton" / "migrations")
     )
     dalton_cfg.set_main_option("sqlalchemy.url", sa_url)
-    dalton_target = "d030"
+    dalton_target = "d032"
 
     current_upstream: str | None = None
     current_dalton: str | None = None
@@ -169,18 +170,41 @@ async def _cleanup_test_rows(
     user_ids: list[str],
     workspace_ids: list[str],
     thread_ids: list[str],
+    session_keys: list[str] | None = None,
 ) -> None:
     like_pat = f"%{prefix}%"
     ws_uuids = [w for w in workspace_ids if w]
     th_uuids = [t for t in thread_ids if t]
+    sess_keys = [s for s in (session_keys or []) if s]
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
                 """
-                DELETE FROM dalton_channel_weixin_state
-                WHERE owner_user_id = ANY(%s) OR ilink_bot_id LIKE %s
+                DELETE FROM dalton_channel_weixin_context_tokens
+                WHERE ilink_bot_id LIKE %s OR platform_user_id LIKE %s
                 """,
-                (user_ids, like_pat),
+                (like_pat, like_pat),
+            )
+            await cur.execute(
+                """
+                DELETE FROM dalton_channel_weixin_state
+                WHERE owner_user_id = ANY(%s)
+                   OR ilink_bot_id LIKE %s
+                   OR ilink_user_id LIKE %s
+                   OR login_owner_user_id = ANY(%s)
+                   OR login_session_key LIKE %s
+                   OR login_session_key = ANY(%s)
+                   OR login_qrcode LIKE %s
+                """,
+                (
+                    user_ids,
+                    like_pat,
+                    like_pat,
+                    user_ids,
+                    like_pat,
+                    sess_keys,
+                    like_pat,
+                ),
             )
             await cur.execute(
                 """
@@ -299,6 +323,7 @@ async def db_env(
     monkeypatch.setattr(db_pool, "get_db_connection", mock_gdc)
     monkeypatch.setattr(cg_db, "get_db_connection", mock_gdc)
     monkeypatch.setattr(dalton_sharing, "get_db_connection", mock_gdc)
+    monkeypatch.setattr(user_db, "get_db_connection", mock_gdc)
 
     prefix = f"ch1_{uuid4().hex[:8]}"
     user_a = f"{prefix}_user_a"
@@ -1519,3 +1544,568 @@ async def test_concurrent_unbind_rebind_and_first_bind_vs_first_settings_save(
     state_b = await cg_db.get_channel_internal_state(user_id=user_b)
     assert state_b["identities"]["feishu"]["platform_user_id"] == f"{prefix}_ou_first_b"
 
+
+@pytest.mark.asyncio
+async def test_d032_weixin_login_sessions_context_tokens_and_group_rejection_real_pg(
+    db_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real Postgres verification of `d032_weixin_state` schema and runtime behavior:
+    - Admin QR login session concurrency (`start` supersedes old pending session, stale confirm rejected, admin role revocation mid-flow rejected via real `get_user_tier`, confirm atomically advances `bot_generation`, resets cursor, invalidates old context tokens, duplicate confirm is idempotent, stale `-14` expiry rejected);
+    - Non-empty `group_id` on Weixin is durably rejected (`weixin_group_unsupported`) and does not persist `context_token`;
+    - Encrypted `context_token` persistence (`pgp_sym_encrypt`/`pgp_sym_decrypt`) with monotonic `seq` ordering and `I-6` selection for `notice` vs `agent_send`;
+    - Idempotent `/bind` via `consumed_bind_result` on `dalton_channel_inbound_events`. The same inbound keeps its original seq. A newer message that arrives first stays in place when an older bind message runs later.
+    """
+    prefix = db_env["prefix"]
+    user_a = db_env["user_a"]
+    user_b = db_env["user_b"]
+    pool: AsyncConnectionPool = db_env["pool"]
+
+    # Configure real access tiers via DALTON_PM_USER_IDS + DALTON_ALLOWED_EMAILS (no monkeypatch on get_user_tier)
+    monkeypatch.setenv("DALTON_PM_USER_IDS", f"{user_a},{user_b}")
+    monkeypatch.setenv(
+        "DALTON_ALLOWED_EMAILS", f"{user_a}@example.com,{user_b}@example.com"
+    )
+
+    bot_1 = f"{prefix}_wx_bot_1@im.wechat"
+    bot_2 = f"{prefix}_wx_bot_2@im.wechat"
+    wx_alice = f"{prefix}_wx_alice@im.wechat"
+
+    # Pre-save unowned/unlinked control rows under a separate prefix to verify scoped cleanup preserves them
+    ctrl_prefix = f"ctrl_other_{uuid4().hex[:8]}"
+    ctrl_bot = f"{ctrl_prefix}_bot@im.wechat"
+    ctrl_user = f"{ctrl_prefix}_user@im.wechat"
+    ctrl_msg_id = f"{ctrl_bot}:ctrl_msg_1"
+    ctrl_sess_key = f"{ctrl_prefix}_sess"
+    ctrl_req_key = str(uuid4())
+
+    try:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_channel_weixin_context_tokens (
+                        ilink_bot_id, bot_generation, platform_user_id,
+                        encrypted_context_token, seq, updated_at
+                    )
+                    VALUES (%s, 1, %s, pgp_sym_encrypt('ctrl-token', %s), 7, NOW())
+                    """,
+                    (
+                        ctrl_bot,
+                        ctrl_user,
+                        os.environ["BYOK_ENCRYPTION_KEY"],
+                    ),
+                )
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_channel_inbound_events (
+                        platform, message_id, request_key, dalton_user_id,
+                        chat_type, chat_address, thread_scope_key, status,
+                        fallback_pending, raw_payload
+                    )
+                    VALUES (
+                        'weixin', %s, %s, NULL,
+                        'dm', 'weixin:@me', %s, 'ignored',
+                        FALSE, '{"deny_reason": "not_linked"}'::jsonb
+                    )
+                    """,
+                    (ctrl_msg_id, ctrl_req_key, f"dm:{ctrl_user}"),
+                )
+
+        # 1. Seed initial active bot via real `start` -> `confirm` flow
+        seed_start = await cg_db.upsert_weixin_state(
+            login_session_action="start",
+            login_session_key=f"{prefix}-sess-init",
+            login_owner_user_id=user_a,
+            login_status="wait",
+            login_qrcode=f"{prefix}-qr-init",
+            login_qrcode_img_content="data:image/png;base64,AAAA",
+            login_expires_in_seconds=300,
+        )
+        assert seed_start["ok"] is True
+        assert seed_start["updated"] is True
+        v_init = int(seed_start["login_version"])
+        exp_gen_init = int(seed_start["expected_bot_generation"])
+
+        init_res = await cg_db.upsert_weixin_state(
+            login_session_action="confirm",
+            login_session_key=f"{prefix}-sess-init",
+            login_owner_user_id=user_a,
+            expected_login_version=v_init,
+            expected_bot_generation=exp_gen_init,
+            ilink_bot_id=bot_1,
+            owner_user_id=user_a,
+            bot_token="secret-pg-token-gen1",
+            base_url="https://ilinkai.weixin.qq.com",
+            status="active",
+            ilink_user_id=f"{prefix}_wx_admin_a@im.wechat",
+            ilink_username="Admin A",
+        )
+        assert init_res["ok"] is True
+        assert init_res["updated"] is True
+        gen_1 = int(init_res["bot_generation"])
+
+        # 2. Non-empty group_id on Weixin is durably rejected (`weixin_group_unsupported`)
+        grp_msg_id = f"{bot_1}:msg_grp_1"
+        grp_res = await cg_db.register_and_resolve_inbound(
+            platform="weixin",
+            platform_user_id=wx_alice,
+            chat_type="dm",
+            chat_address="weixin:@me",
+            thread_scope_key=f"dm:{wx_alice}",
+            message_id=grp_msg_id,
+            weixin_context_token="ctx-should-not-persist",
+            raw_payload={
+                "group_id": f"{prefix}_chatroom@chatroom",
+                "ilink_bot_id": bot_1,
+                "seq": 10,
+            },
+        )
+        assert grp_res["allowed"] is False
+        assert grp_res["deny_reason"] == "weixin_group_unsupported"
+
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT 1 FROM dalton_channel_weixin_context_tokens
+                    WHERE ilink_bot_id = %s AND platform_user_id = %s
+                    """,
+                    (bot_1, wx_alice),
+                )
+                assert await cur.fetchone() is None
+
+        # 3. Unlinked DM persists encrypted `context_token` with monotonic `seq` guard
+        unlinked_mid_20 = f"{bot_1}:msg_u_20"
+        u20 = await cg_db.register_and_resolve_inbound(
+            platform="weixin",
+            platform_user_id=wx_alice,
+            chat_type="dm",
+            chat_address="weixin:@me",
+            thread_scope_key=f"dm:{wx_alice}",
+            message_id=unlinked_mid_20,
+            weixin_context_token="ctx-pg-seq-20",
+            raw_payload={"ilink_bot_id": bot_1, "seq": 20},
+        )
+        assert u20["linked"] is False
+        assert u20["deny_reason"] == "not_linked"
+
+        # Out-of-order lower seq (seq=12 < 20) does not overwrite `ctx-pg-seq-20`
+        await cg_db.register_and_resolve_inbound(
+            platform="weixin",
+            platform_user_id=wx_alice,
+            chat_type="dm",
+            chat_address="weixin:@me",
+            thread_scope_key=f"dm:{wx_alice}",
+            message_id=f"{bot_1}:msg_u_12",
+            weixin_context_token="ctx-pg-stale-12",
+            raw_payload={"ilink_bot_id": bot_1, "seq": 12},
+        )
+
+        # I-6 notice delivery selects `ctx-pg-seq-20` for the original sender and denies a mismatched recipient
+        notice_claim = await cg_db.authorize_and_claim_delivery(
+            delivery_key=f"{prefix}:notice:u20",
+            kind="notice",
+            platform="weixin",
+            target=f"weixin:{wx_alice}",
+            inbound_message_id=unlinked_mid_20,
+            has_non_empty_text=True,
+            total_chunks=1,
+        )
+        assert notice_claim["claim_status"] == "claimed"
+        assert notice_claim["weixin_context_token"] == "ctx-pg-seq-20"
+
+        notice_mismatch = await cg_db.authorize_and_claim_delivery(
+            delivery_key=f"{prefix}:notice:u20:mismatch",
+            kind="notice",
+            platform="weixin",
+            target=f"weixin:{prefix}_other@im.wechat",
+            inbound_message_id=unlinked_mid_20,
+            has_non_empty_text=True,
+            total_chunks=1,
+        )
+        assert notice_mismatch["claim_status"] == "denied"
+        assert notice_mismatch["code"] == "not_allowed"
+        assert (
+            notice_mismatch["message"]
+            == "Notice target does not match original inbound conversation."
+        )
+        assert not notice_mismatch.get("weixin_context_token")
+
+        # 4. Higher seq (seq=30 > 20) updates context_token, and `/bind` with `inbound_message_id` is idempotent
+        bind_mid_30 = f"{bot_1}:msg_bind_30"
+        await cg_db.register_and_resolve_inbound(
+            platform="weixin",
+            platform_user_id=wx_alice,
+            chat_type="dm",
+            chat_address="weixin:@me",
+            thread_scope_key=f"dm:{wx_alice}",
+            message_id=bind_mid_30,
+            weixin_context_token="ctx-pg-seq-30",
+            raw_payload={"ilink_bot_id": bot_1, "seq": 30},
+        )
+        code_wx = await cg_db.create_bind_code(user_id=user_b, platform="weixin")
+        bind_1 = await cg_db.consume_bind_code_or_unbind(
+            action="bind",
+            platform="weixin",
+            platform_user_id=wx_alice,
+            platform_username="Alice PG",
+            code=code_wx["code"],
+            is_group=False,
+            inbound_message_id=bind_mid_30,
+            weixin_context_token="ctx-pg-seq-30",
+        )
+        assert bind_1["ok"] is True
+        assert bind_1["user_id"] == user_b
+
+        # Replay `/bind` with same `inbound_message_id` -> returns cached `consumed_bind_result`
+        bind_replay = await cg_db.consume_bind_code_or_unbind(
+            action="bind",
+            platform="weixin",
+            platform_user_id=wx_alice,
+            platform_username="Alice PG",
+            code=code_wx["code"],
+            is_group=False,
+            inbound_message_id=bind_mid_30,
+            weixin_context_token="ctx-pg-seq-30",
+        )
+        assert bind_1.get("idempotent") is not True
+        assert bind_replay["idempotent"] is True
+        for field in ("ok", "user_id", "platform", "platform_user_id", "generation"):
+            assert bind_replay[field] == bind_1[field]
+        assert bind_replay["ok"] is True
+        assert bind_replay["user_id"] == user_b
+        assert bind_replay["platform"] == "weixin"
+        assert bind_replay["platform_user_id"] == wx_alice
+        enc_key = os.environ["BYOK_ENCRYPTION_KEY"]
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT COUNT(*) AS cnt
+                    FROM dalton_channel_bind_codes
+                    WHERE user_id = %s AND platform = 'weixin' AND used_at IS NOT NULL
+                    """,
+                    (user_b,),
+                )
+                assert (await cur.fetchone())["cnt"] == 1
+                await cur.execute(
+                    """
+                    SELECT seq,
+                           pgp_sym_decrypt(encrypted_context_token, %s) AS context_token
+                    FROM dalton_channel_weixin_context_tokens
+                    WHERE ilink_bot_id = %s
+                      AND bot_generation = %s
+                      AND platform_user_id = %s
+                    """,
+                    (enc_key, bot_1, gen_1, wx_alice),
+                )
+                token_row = await cur.fetchone()
+                assert token_row["seq"] == 30
+                assert token_row["context_token"] == "ctx-pg-seq-30"
+                await cur.execute(
+                    """
+                    SELECT weixin_context_seq,
+                           pgp_sym_decrypt(encrypted_weixin_context_token, %s) AS context_token
+                    FROM dalton_channel_identities
+                    WHERE user_id = %s AND platform = 'weixin'
+                    """,
+                    (enc_key, user_b),
+                )
+                identity_row = await cur.fetchone()
+                assert identity_row["weixin_context_seq"] == 30
+                assert identity_row["context_token"] == "ctx-pg-seq-30"
+
+        # A newer message arrives first. The older inbound can then store that
+        # newer seq beside its own ciphertext. Binding the older message keeps
+        # the newer token and its original seq, and leaves the seq-30 row alone.
+        wx_carol = f"{prefix}_wx_carol@im.wechat"
+        newer_mid = f"{bot_1}:msg_u_45"
+        older_mid = f"{bot_1}:msg_bind_16"
+        await cg_db.register_and_resolve_inbound(
+            platform="weixin",
+            platform_user_id=wx_carol,
+            chat_type="dm",
+            chat_address="weixin:@me",
+            thread_scope_key=f"dm:{wx_carol}",
+            message_id=newer_mid,
+            weixin_context_token="ctx-pg-seq-45",
+            raw_payload={"ilink_bot_id": bot_1, "seq": 45},
+        )
+        await cg_db.register_and_resolve_inbound(
+            platform="weixin",
+            platform_user_id=wx_carol,
+            chat_type="dm",
+            chat_address="weixin:@me",
+            thread_scope_key=f"dm:{wx_carol}",
+            message_id=older_mid,
+            weixin_context_token="ctx-pg-old-16",
+            raw_payload={"ilink_bot_id": bot_1, "seq": 16},
+        )
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT weixin_context_seq,
+                           raw_payload->>'seq' AS payload_seq,
+                           pgp_sym_decrypt(encrypted_weixin_context_token, %s) AS context_token
+                    FROM dalton_channel_inbound_events
+                    WHERE platform = 'weixin' AND message_id = %s
+                    """,
+                    (enc_key, older_mid),
+                )
+                older_inbound = await cur.fetchone()
+                assert older_inbound["payload_seq"] == "16"
+                assert older_inbound["weixin_context_seq"] == 45
+                assert older_inbound["context_token"] == "ctx-pg-old-16"
+        code_carol = await cg_db.create_bind_code(user_id=user_a, platform="weixin")
+        bind_older = await cg_db.consume_bind_code_or_unbind(
+            action="bind",
+            platform="weixin",
+            platform_user_id=wx_carol,
+            platform_username="Carol PG",
+            code=code_carol["code"],
+            is_group=False,
+            inbound_message_id=older_mid,
+            weixin_context_token="ctx-pg-old-16",
+        )
+        assert bind_older["ok"] is True
+        assert bind_older["user_id"] == user_a
+        assert bind_older.get("idempotent") is not True
+        bind_older_replay = await cg_db.consume_bind_code_or_unbind(
+            action="bind",
+            platform="weixin",
+            platform_user_id=wx_carol,
+            platform_username="Carol PG",
+            code=code_carol["code"],
+            is_group=False,
+            inbound_message_id=older_mid,
+            weixin_context_token="ctx-pg-old-16",
+        )
+        assert bind_older_replay["idempotent"] is True
+        for field in ("ok", "user_id", "platform", "platform_user_id", "generation"):
+            assert bind_older_replay[field] == bind_older[field]
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT seq,
+                           pgp_sym_decrypt(encrypted_context_token, %s) AS context_token
+                    FROM dalton_channel_weixin_context_tokens
+                    WHERE ilink_bot_id = %s
+                      AND bot_generation = %s
+                      AND platform_user_id = %s
+                    """,
+                    (enc_key, bot_1, gen_1, wx_carol),
+                )
+                carol_token = await cur.fetchone()
+                assert carol_token["seq"] == 45
+                assert carol_token["context_token"] == "ctx-pg-seq-45"
+                await cur.execute(
+                    """
+                    SELECT weixin_context_seq,
+                           pgp_sym_decrypt(encrypted_weixin_context_token, %s) AS context_token
+                    FROM dalton_channel_identities
+                    WHERE user_id = %s AND platform = 'weixin'
+                    """,
+                    (enc_key, user_a),
+                )
+                carol_identity = await cur.fetchone()
+                assert carol_identity["weixin_context_seq"] == 45
+                assert carol_identity["context_token"] == "ctx-pg-seq-45"
+                await cur.execute(
+                    """
+                    SELECT seq,
+                           pgp_sym_decrypt(encrypted_context_token, %s) AS context_token
+                    FROM dalton_channel_weixin_context_tokens
+                    WHERE ilink_bot_id = %s
+                      AND bot_generation = %s
+                      AND platform_user_id = %s
+                    """,
+                    (enc_key, bot_1, gen_1, wx_alice),
+                )
+                alice_token = await cur.fetchone()
+                assert alice_token["seq"] == 30
+                assert alice_token["context_token"] == "ctx-pg-seq-30"
+                await cur.execute(
+                    """
+                    SELECT weixin_context_seq,
+                           pgp_sym_decrypt(encrypted_weixin_context_token, %s) AS context_token
+                    FROM dalton_channel_identities
+                    WHERE user_id = %s AND platform = 'weixin'
+                    """,
+                    (enc_key, user_b),
+                )
+                alice_identity = await cur.fetchone()
+                assert alice_identity["weixin_context_seq"] == 30
+                assert alice_identity["context_token"] == "ctx-pg-seq-30"
+
+        # 5. Concurrent Admin QR login sessions: S1 started by user_a, superseded by S2 started by user_b
+        s1 = await cg_db.upsert_weixin_state(
+            login_session_action="start",
+            login_session_key=f"{prefix}-sess-1",
+            login_owner_user_id=user_a,
+            login_status="wait",
+        )
+        assert s1["updated"] is True
+        v1 = int(s1["login_version"])
+
+        s2 = await cg_db.upsert_weixin_state(
+            login_session_action="start",
+            login_session_key=f"{prefix}-sess-2",
+            login_owner_user_id=user_b,
+            login_status="wait",
+        )
+        assert s2["updated"] is True
+        v2 = int(s2["login_version"])
+        assert v2 > v1
+
+        # Stale confirmation from S1 is rejected
+        stale_c1 = await cg_db.upsert_weixin_state(
+            login_session_action="confirm",
+            login_session_key=f"{prefix}-sess-1",
+            expected_login_version=v1,
+            expected_bot_generation=gen_1,
+            login_owner_user_id=user_a,
+            ilink_bot_id=f"{prefix}_wx_stale@im.wechat",
+            owner_user_id=user_a,
+            bot_token="stale-token",
+            status="active",
+        )
+        assert stale_c1["updated"] is False
+        assert stale_c1["stale_session"] is True
+        assert stale_c1["reason"] == "session_replaced"
+
+        # Revoking user_b's admin permission before confirm causes real `get_user_tier` to reject S2 confirm
+        monkeypatch.setenv("DALTON_PM_USER_IDS", user_a)
+        revoked_c2 = await cg_db.upsert_weixin_state(
+            login_session_action="confirm",
+            login_session_key=f"{prefix}-sess-2",
+            expected_login_version=v2,
+            expected_bot_generation=gen_1,
+            login_owner_user_id=user_b,
+            ilink_bot_id=bot_2,
+            owner_user_id=user_b,
+            bot_token="secret-pg-token-gen2",
+            status="active",
+        )
+        assert revoked_c2["ok"] is False
+        assert revoked_c2["updated"] is False
+        assert revoked_c2["reason"] == "admin_required"
+
+        # Restore user_b admin tier and confirm S2 -> advances bot_generation to gen_1 + 1, resets cursor, invalidates old context tokens
+        monkeypatch.setenv("DALTON_PM_USER_IDS", f"{user_a},{user_b}")
+        confirm_s2 = await cg_db.upsert_weixin_state(
+            login_session_action="confirm",
+            login_session_key=f"{prefix}-sess-2",
+            expected_login_version=v2,
+            expected_bot_generation=gen_1,
+            login_owner_user_id=user_b,
+            ilink_bot_id=bot_2,
+            owner_user_id=user_b,
+            bot_token="secret-pg-token-gen2",
+            base_url="https://ilinkai.weixin.qq.com",
+            status="active",
+            ilink_user_id=f"{prefix}_wx_admin_b@im.wechat",
+            ilink_username="Admin B",
+        )
+        assert confirm_s2["updated"] is True
+        gen_2 = int(confirm_s2["bot_generation"])
+        assert gen_2 == gen_1 + 1
+        assert confirm_s2["get_updates_buf"] == ""
+
+        # Duplicate confirmation of S2 is idempotent
+        confirm_s2_dup = await cg_db.upsert_weixin_state(
+            login_session_action="confirm",
+            login_session_key=f"{prefix}-sess-2",
+            expected_login_version=v2,
+            expected_bot_generation=gen_1,
+            login_owner_user_id=user_b,
+            ilink_bot_id=bot_2,
+            owner_user_id=user_b,
+            bot_token="secret-pg-token-gen2",
+            base_url="https://ilinkai.weixin.qq.com",
+            status="active",
+            ilink_user_id=f"{prefix}_wx_admin_b@im.wechat",
+            ilink_username="Admin B",
+        )
+        assert confirm_s2_dup["ok"] is True
+        assert confirm_s2_dup["updated"] is False
+        assert confirm_s2_dup["already_connected"] is True
+        assert confirm_s2_dup["idempotent"] is True
+        assert int(confirm_s2_dup["bot_generation"]) == gen_2
+
+        # Stale `-14` expiry from gen_1 poller is rejected (`stale_generation`) and keeps `active`
+        stale_exp = await cg_db.upsert_weixin_state(
+            ilink_bot_id=bot_1,
+            expected_bot_generation=gen_1,
+            status="expired",
+        )
+        assert stale_exp["updated"] is False
+        assert stale_exp["stale_generation"] is True
+        assert stale_exp["status"] == "active"
+
+        # 6. Verify scoped cleanup removes this test's own rows while preserving another test's unowned/unlinked control rows
+        await _cleanup_test_rows(
+            pool,
+            prefix=prefix,
+            user_ids=db_env["cleanup_user_ids"],
+            workspace_ids=[],
+            thread_ids=[],
+        )
+
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT COUNT(*) AS cnt FROM dalton_channel_weixin_context_tokens WHERE ilink_bot_id = %s",
+                    (ctrl_bot,),
+                )
+                assert (await cur.fetchone())["cnt"] == 1
+
+                await cur.execute(
+                    "SELECT COUNT(*) AS cnt FROM dalton_channel_inbound_events WHERE message_id = %s",
+                    (ctrl_msg_id,),
+                )
+                assert (await cur.fetchone())["cnt"] == 1
+
+                # Seed an unowned control row in dalton_channel_weixin_state (owner_user_id IS NULL, login_owner_user_id IS NULL)
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_channel_weixin_state (
+                        singleton_id, ilink_bot_id, owner_user_id, encrypted_bot_token,
+                        base_url, get_updates_buf, status, bot_generation,
+                        login_session_key, login_owner_user_id, login_version, updated_at
+                    )
+                    VALUES (
+                        1, NULL, NULL, NULL,
+                        'https://ilinkai.weixin.qq.com', '', 'unconfigured', 1,
+                        %s, NULL, 1, NOW()
+                    )
+                    """,
+                    (ctrl_sess_key,),
+                )
+
+        # Running this test's cleanup must NOT delete the unowned control row in dalton_channel_weixin_state
+        await _cleanup_test_rows(
+            pool,
+            prefix=prefix,
+            user_ids=db_env["cleanup_user_ids"],
+            workspace_ids=[],
+            thread_ids=[],
+        )
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT COUNT(*) AS cnt FROM dalton_channel_weixin_state WHERE login_session_key = %s AND owner_user_id IS NULL",
+                    (ctrl_sess_key,),
+                )
+                assert (await cur.fetchone())["cnt"] == 1
+    finally:
+        # Clean up the control rows using the control test's own prefix/session key
+        await _cleanup_test_rows(
+            pool,
+            prefix=ctrl_prefix,
+            user_ids=[],
+            workspace_ids=[],
+            thread_ids=[],
+            session_keys=[ctrl_sess_key],
+        )
