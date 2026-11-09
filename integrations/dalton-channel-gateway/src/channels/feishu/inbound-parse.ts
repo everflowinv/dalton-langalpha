@@ -278,6 +278,7 @@ export function normalizeMentions(
 export function parseMessageContent(
   content: string,
   messageType: string,
+  botOpenId?: string,
 ): string {
   if (!content) {
     return "";
@@ -285,16 +286,16 @@ export function parseMessageContent(
   const normalizedType = messageType.trim().toLowerCase();
 
   if (normalizedType === "post") {
-    return parsePostContent(content).textContent;
+    return parsePostContent(content, botOpenId).textContent;
   }
   if (normalizedType === "interactive") {
-    return parseInteractiveCardContent(content);
+    return parseInteractiveCardContent(content, botOpenId);
   }
   if (normalizedType === "merge_forward") {
     return parseMergeForwardContent({
       content,
       formatSubMessage: (subType, subBody) =>
-        parseMessageContent(subBody, subType),
+        parseMessageContent(subBody, subType, botOpenId),
     });
   }
   if (normalizedType === "share_chat") {
@@ -718,7 +719,7 @@ export function parseFeishuInboundEvent(
 
   const postParsed =
     messageType.toLowerCase() === "post"
-      ? parsePostContent(rawContent)
+      ? parsePostContent(rawContent, options.botOpenId)
       : undefined;
 
   const mentionsBot = checkBotMentioned({
@@ -736,7 +737,11 @@ export function parseFeishuInboundEvent(
     botOpenId: options.botOpenId,
   });
 
-  const parsedContentText = parseMessageContent(rawContent, messageType);
+  const parsedContentText = parseMessageContent(
+    rawContent,
+    messageType,
+    options.botOpenId,
+  );
   const text = normalizeMentions(
     parsedContentText,
     message.mentions,

@@ -762,11 +762,15 @@ export interface ParsedPostContent {
   mentionedOpenIds: string[];
 }
 
-export function renderPostContent(content: string): ParsedPostContent | null {
+export function renderPostContent(
+  content: string,
+  botOpenId?: string,
+): ParsedPostContent | null {
   const resolved = resolvePostPayload(content);
   if (!resolved) {
     return null;
   }
+  const normalizedBotId = botOpenId?.trim() ?? "";
   const imageKeys: string[] = [];
   const mediaKeys: Array<{ fileKey: string; fileName?: string }> = [];
   const mentionedOpenIds: string[] = [];
@@ -802,9 +806,15 @@ export function renderPostContent(content: string): ParsedPostContent | null {
         continue;
       }
       if (tag === "at") {
-        const userId = typeof rawEl.user_id === "string" ? rawEl.user_id.trim() : "";
+        const userId =
+          (typeof rawEl.user_id === "string" && rawEl.user_id.trim()) ||
+          (typeof rawEl.open_id === "string" && rawEl.open_id.trim()) ||
+          "";
         if (userId) {
           mentionedOpenIds.push(userId);
+        }
+        if (normalizedBotId && userId === normalizedBotId) {
+          continue;
         }
         const userName =
           typeof rawEl.user_name === "string" && rawEl.user_name
@@ -892,8 +902,11 @@ export function renderPostContent(content: string): ParsedPostContent | null {
   };
 }
 
-export function parsePostContent(content: string): ParsedPostContent {
-  const rendered = renderPostContent(content);
+export function parsePostContent(
+  content: string,
+  botOpenId?: string,
+): ParsedPostContent {
+  const rendered = renderPostContent(content, botOpenId);
   if (rendered) {
     return rendered;
   }
@@ -1114,7 +1127,10 @@ function extractInteractiveElementsText(
   return texts.join("\n").trim();
 }
 
-export function parseInteractiveCardContent(content: string): string {
+export function parseInteractiveCardContent(
+  content: string,
+  botOpenId?: string,
+): string {
   try {
     const parsed = JSON.parse(content) as unknown;
     if (!isRecord(parsed)) {
@@ -1157,7 +1173,7 @@ export function parseInteractiveCardContent(content: string): string {
         return title ? `${title}\n${text}` : text;
       }
     }
-    const postText = parsePostContent(content).textContent.trim();
+    const postText = parsePostContent(content, botOpenId).textContent.trim();
     if (postText && postText !== "[Rich text message]") {
       return postText;
     }
