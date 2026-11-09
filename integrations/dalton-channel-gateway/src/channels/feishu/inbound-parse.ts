@@ -489,8 +489,6 @@ export function extractInboundAttachments(
 const FEISHU_EXTERNAL_KEY_PATTERN =
   /^(?!\s)(?![\s\S]*\s$)(?![\s\S]*\.\.)[^\p{Cc}\p{Cs}/\\]{1,512}$/u;
 
-const SLASH_COMMAND_RE = /^\/(bind|unbind|workspace|new|stop)(?:\s|$)/i;
-
 function normalizeFeishuExternalKey(value: unknown): string | undefined {
   if (typeof value !== "string") {
     return undefined;
@@ -747,7 +745,6 @@ export function parseFeishuInboundEvent(
     message.mentions,
     options.botOpenId,
   );
-  const isSlashCommand = SLASH_COMMAND_RE.test(text.trim());
 
   const attachments = extractInboundAttachments(rawContent, messageType);
 
@@ -767,8 +764,8 @@ export function parseFeishuInboundEvent(
     }),
     messageId,
     text,
-    isGroupTrigger:
-      chatType === "group" ? mentionsBot || isSlashCommand : undefined,
+    commandText: text,
+    isGroupTrigger: chatType === "group" ? mentionsBot : undefined,
     attachments: attachments.length > 0 ? attachments : undefined,
     rawPayload: rawPayload as Record<string, unknown>,
   };

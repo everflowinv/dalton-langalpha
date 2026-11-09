@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { basename } from "node:path";
-import type { BackendClient } from "./backend-client.js";
+import type { BackendClient, DeliveryActivityOrigin } from "./backend-client.js";
 import { ChannelDeliveryError, type ChannelAdapter } from "./channels/adapter.js";
 import {
   type AgentSendFileOutcome,
@@ -31,6 +31,9 @@ export interface ExecuteDeliveryOptions {
   replyToMessageId?: string | null;
   newThread?: boolean;
   threadScopeKey?: string | null;
+  sourceScopeKey?: string | null;
+  sourceGeneration?: number | null;
+  activityOrigin?: DeliveryActivityOrigin | null;
 }
 
 export class DeliveryService {
@@ -140,6 +143,9 @@ export class DeliveryService {
       inbound_message_id: options.inboundMessageId ?? null,
       has_non_empty_text: hasNonEmptyText,
       total_chunks: Math.max(preliminaryChunks.length, hasNonEmptyText ? 1 : 0),
+      source_scope_key: options.sourceScopeKey ?? options.threadScopeKey ?? null,
+      source_generation: options.sourceGeneration ?? null,
+      activity_origin: options.activityOrigin ?? null,
     });
 
     if (claim.claim_status === "already_completed") {

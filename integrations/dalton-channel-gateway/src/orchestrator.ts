@@ -4,11 +4,14 @@ import type { AgentRoutesHandler } from "./agent-routes.js";
 import {
   type BackendClient,
   BackendHttpError,
+  type DeliveryActivityOrigin,
   type I1RegisterAndResolveResponse,
+  type I3SessionCommandResponse,
   type RecoverAutomationRunRow,
   type RecoverBackgroundRunRow,
   type RecoverInboundEventRow,
   type RecoverThreadWatchRow,
+  type SessionCommandTargetKind,
   type SseEvent,
   type SseOrErrorResponse,
   type ThreadMessageDispatchPayload,
@@ -16,6 +19,7 @@ import {
   type ThreadWakeupItem,
 } from "./backend-client.js";
 import type { ChannelAdapter } from "./channels/adapter.js";
+import { parseSlashCommand, type ParsedSlashCommand } from "./commands.js";
 import type { DeliveryService } from "./delivery-service.js";
 import {
   ACTIVE_WAKEUP_STATES,
@@ -142,19 +146,19 @@ export class ChannelGatewayOrchestrator {
   // =========================================================================
 
   async handleInboundEvent(event: InboundChannelEvent): Promise<void> {
-    // Group chats require explicit trigger (@bot or slash command)
-    if (event.chatType === "group" && event.isGroupTrigger === false) {
+    // Group chats require explicit structured mention trigger (`isGroupTrigger === true`)
+    if (event.chatType === "group" && event.isGroupTrigger !== true) {
       return;
     }
 
-    const trimmedText = (event.text ?? "").trim();
-
-    // Check for slash commands (§3.3): /bind, /unbind, /workspace, /new, /stop
-    if (trimmedText.startsWith("/")) {
-      const handled = await this.tryHandleSlashCommand(event, trimmedText);
-      if (handled) {
-        return;
-      }
+    // Check for slash commands (§3.3): /bind, /unbind, /workspace, /main, /new, /stop, /<workspace_name>
+    const parsedCmd = parseSlashCommand(
+      event.commandText ?? event.text ?? "",
+      event.chatType,
+    );
+    if (parsedCmd) {
+      await this.tryHandleSlashCommand(event, parsedCmd);
+      return;
     }
 
     const requestKey = makeInboundRequestKey(event.platform, event.messageId);
@@ -397,23 +401,20 @@ export class ChannelGatewayOrchestrator {
   }
 
   // =========================================================================
-  // §3.3 Slash Commands (`/bind`, `/unbind`, `/workspace`, `/new`, `/stop`)
+  // §3.3 Slash Commands (`/bind`, `/unbind`, `/workspace`, `/main`, `/new`, `/stop`, `/<workspace_name>`)
   // =========================================================================
 
   private async tryHandleSlashCommand(
     event: InboundChannelEvent,
-    trimmedText: string,
+    parsedCmd: ParsedSlashCommand,
   ): Promise<boolean> {
-    const match = /^\/(bind|unbind|workspace|new|stop)(?:\s+(.*))?$/i.exec(
-      trimmedText,
-    );
-    if (!match) {
-      return false;
+    if (parsedCmd.kind === "invalid") {
+      await this.sendDirectAdapterNotice(event, parsedCmd.message);
+      return true;
     }
-    const cmdName = match[1]!.toLowerCase();
-    const arg = (match[2] ?? "").trim();
 
-    if (cmdName === "bind") {
+    if (parsedCmd.kind === "bind") {
+      const arg = parsedCmd.code;
       if (!arg) {
         await this.sendDirectAdapterNotice(
           event,
@@ -457,7 +458,7 @@ export class ChannelGatewayOrchestrator {
       return true;
     }
 
-    if (cmdName === "unbind") {
+    if (parsedCmd.kind === "unbind") {
       const res = await this.backend.consumeBindCode({
         action: "unbind",
         platform: event.platform,
@@ -481,190 +482,249 @@ export class ChannelGatewayOrchestrator {
       return true;
     }
 
-    // For `/workspace`, `/new`, `/stop`, resolve user identity via I-1
     const reqKey = makeInboundRequestKey(event.platform, event.messageId);
-    const resolved = await this.backend.registerAndResolveInbound({
+    const cmdRes = await this.backend.sessionCommand({
+      cmd: parsedCmd.cmd,
       platform: event.platform,
       platform_user_id: event.platformUserId,
       chat_type: event.chatType,
       chat_address: event.chatAddress,
-      thread_scope_key: event.threadScopeKey,
+      chat_id: event.chatId,
+      chat_name: event.chatName ?? null,
+      scope_key: event.threadScopeKey,
       message_id: event.messageId,
       request_key: reqKey,
-      raw_payload: { command: cmdName, arg },
+      raw_payload: {
+        ...this.buildInboundRawPayload(event),
+        command: parsedCmd.canonicalCommand,
+        cmd: parsedCmd.cmd,
+      },
       weixin_context_token: event.weixinContextToken ?? null,
+      target_kind: parsedCmd.targetKind ?? null,
+      workspace_id: parsedCmd.workspaceId ?? null,
+      workspace_query: parsedCmd.workspaceQuery ?? null,
     });
 
-    if (!resolved.linked || !resolved.dalton_user_id) {
-      await this.backend.updateInboundProgress({
-        platform: event.platform,
-        message_id: event.messageId,
-        status: "failed",
-      });
+    await this.completeSessionCommandExecution({
+      event,
+      cmd: parsedCmd.cmd,
+      targetKind: parsedCmd.targetKind ?? null,
+      workspaceQuery: parsedCmd.workspaceQuery ?? null,
+      cmdRes,
+    });
+    return true;
+  }
+
+  private async completeSessionCommandExecution(params: {
+    event: InboundChannelEvent;
+    cmd: "workspace_list" | "workspace_switch" | "new" | "stop";
+    targetKind?: SessionCommandTargetKind | null;
+    workspaceQuery?: string | null;
+    cmdRes: I3SessionCommandResponse;
+  }): Promise<void> {
+    const { event, cmd, targetKind, workspaceQuery, cmdRes } = params;
+
+    if (
+      !cmdRes.ok &&
+      (cmdRes.linked === false || cmdRes.deny_reason === "not_linked")
+    ) {
       await this.sendDirectAdapterNotice(
         event,
-        this.formatDenyNotice(event.platform, "not_linked"),
+        this.formatDenyNotice(
+          event.platform,
+          cmdRes.deny_reason ?? "not_linked",
+        ),
       );
-      return true;
+      return;
     }
 
-    const userId = resolved.dalton_user_id;
+    const userId = cmdRes.dalton_user_id ?? null;
 
-    if (cmdName === "workspace") {
-      if (!arg) {
-        const listRes = await this.backend.sessionCommand({
-          cmd: "workspace_list",
-          platform: event.platform,
-          dalton_user_id: userId,
-          chat_type: event.chatType,
-          chat_address: event.chatAddress,
-          chat_id: event.chatId,
-          chat_name: event.chatName ?? null,
-          scope_key: event.threadScopeKey,
-        });
+    if (cmd === "stop" && cmdRes.ok && cmdRes.thread_id) {
+      if (cmdRes.command_effect_status !== "done") {
+        await this.backend.cancelThreadTurn(
+          userId ?? "",
+          cmdRes.thread_id,
+          cmdRes.run_id ?? null,
+        );
         await this.backend.updateInboundProgress({
           platform: event.platform,
           message_id: event.messageId,
-          status: "completed",
+          command_effect_status: "done",
         });
-        if (!listRes.ok) {
-          await this.sendDirectAdapterNotice(
-            event,
-            this.formatDenyNotice(
-              event.platform,
-              listRes.deny_reason ?? "workspace_write_denied",
-            ),
-          );
-          return true;
-        }
-        const currentWs = listRes.current_workspace_id;
-        const lines = [
-          `Current workspace: ${currentWs ? `\`${currentWs}\`` : "Home (Chief of Staff)"}`,
-          "Available workspaces:",
-          "- `home` (Chief of Staff)",
-          ...(listRes.workspaces ?? []).map(
-            (w) =>
-              `- \`${w.name}\` (\`${w.workspace_id}\`)${w.workspace_id === currentWs ? " [current]" : ""}`,
-          ),
-          "Use `/workspace <name|id|home>` to switch.",
-        ];
-        await this.sendDirectAdapterNotice(event, lines.join("\n"));
-        return true;
       }
-
-      const switchRes = await this.backend.sessionCommand({
-        cmd: "workspace_switch",
-        platform: event.platform,
-        dalton_user_id: userId,
-        chat_type: event.chatType,
-        chat_address: event.chatAddress,
-        chat_id: event.chatId,
-        chat_name: event.chatName ?? null,
-        scope_key: event.threadScopeKey,
-        workspace_query: arg,
-      });
-      await this.backend.updateInboundProgress({
-        platform: event.platform,
-        message_id: event.messageId,
-        status: "completed",
-      });
-      if (!switchRes.ok) {
-        await this.sendDirectAdapterNotice(
-          event,
-          this.formatDenyNotice(
-            event.platform,
-            switchRes.deny_reason ?? "workspace_not_found",
-          ),
-        );
-        return true;
-      }
-      const targetLabel = switchRes.workspace_id
-        ? `workspace \`${switchRes.workspace_id}\``
-        : "Home (Chief of Staff)";
-      await this.sendDirectAdapterNotice(
-        event,
-        `Switched this conversation to ${targetLabel} and started a new thread.`,
-      );
-      return true;
     }
 
-    if (cmdName === "new") {
-      const newRes = await this.backend.sessionCommand({
-        cmd: "new",
-        platform: event.platform,
-        dalton_user_id: userId,
-        chat_type: event.chatType,
-        chat_address: event.chatAddress,
-        chat_id: event.chatId,
-        chat_name: event.chatName ?? null,
-        scope_key: event.threadScopeKey,
-      });
-      await this.backend.updateInboundProgress({
-        platform: event.platform,
-        message_id: event.messageId,
-        status: "completed",
-      });
-      if (!newRes.ok) {
-        await this.sendDirectAdapterNotice(
-          event,
-          this.formatDenyNotice(
-            event.platform,
-            newRes.deny_reason ?? "external_member_group_forbidden",
-          ),
-        );
-        return true;
-      }
-      await this.sendDirectAdapterNotice(
-        event,
-        "Started a new conversation thread.",
-      );
-      return true;
+    if (cmdRes.command_reply_pending === false) {
+      return;
     }
 
-    if (cmdName === "stop") {
-      const stopRes = await this.backend.sessionCommand({
-        cmd: "stop",
-        platform: event.platform,
-        dalton_user_id: userId,
-        chat_type: event.chatType,
-        chat_address: event.chatAddress,
-        chat_id: event.chatId,
-        chat_name: event.chatName ?? null,
-        scope_key: event.threadScopeKey,
-        external_thread_id: resolved.external_thread_id,
-      });
-      await this.backend.updateInboundProgress({
-        platform: event.platform,
-        message_id: event.messageId,
-        status: "completed",
-      });
-      if (!stopRes.ok) {
-        await this.sendDirectAdapterNotice(
-          event,
-          this.formatDenyNotice(
-            event.platform,
-            stopRes.deny_reason ?? "external_member_group_forbidden",
-          ),
-        );
-        return true;
-      }
-      if (!stopRes.thread_id) {
-        await this.sendDirectAdapterNotice(
-          event,
-          "No active conversation thread to stop.",
-        );
-        return true;
-      }
-      await this.backend.cancelThreadTurn(
+    const replyText = this.formatSessionCommandReply({
+      platform: event.platform,
+      cmd,
+      targetKind: targetKind ?? null,
+      workspaceQuery: workspaceQuery ?? null,
+      cmdRes,
+    });
+
+    if (userId) {
+      const delivered = await this.sendNoticeDelivery({
+        deliveryKey: `notice:${event.platform}:${event.messageId}:command`,
         userId,
-        stopRes.thread_id,
-        stopRes.run_id,
-      );
-      await this.sendDirectAdapterNotice(event, "Stopped the current run.");
-      return true;
+        threadId: cmd === "stop" ? (cmdRes.thread_id ?? null) : null,
+        runId: cmd === "stop" ? (cmdRes.run_id ?? null) : null,
+        platform: event.platform,
+        target: event.chatAddress,
+        inboundMessageId: event.messageId,
+        text: replyText,
+        replyToMessageId: event.messageId,
+        threadScopeKey: event.threadScopeKey,
+        sourceScopeKey: event.threadScopeKey,
+        sourceGeneration:
+          typeof cmdRes.generation === "number" ? cmdRes.generation : null,
+        activityOrigin: "command",
+      });
+      if (delivered) {
+        await this.backend.updateInboundProgress({
+          platform: event.platform,
+          message_id: event.messageId,
+          status: cmdRes.ok ? "completed" : "failed",
+          command_reply_pending: false,
+          fallback_pending: false,
+          ...(cmd === "stop" && cmdRes.ok
+            ? { command_effect_status: "done" }
+            : {}),
+        });
+      }
+    } else {
+      await this.sendDirectAdapterNotice(event, replyText);
+      await this.backend.updateInboundProgress({
+        platform: event.platform,
+        message_id: event.messageId,
+        status: cmdRes.ok ? "completed" : "failed",
+        command_reply_pending: false,
+        fallback_pending: false,
+        ...(cmd === "stop" && cmdRes.ok
+          ? { command_effect_status: "done" }
+          : {}),
+      });
+    }
+  }
+
+  private formatSessionCommandReply(params: {
+    platform: ChannelPlatform;
+    cmd: "workspace_list" | "workspace_switch" | "new" | "stop";
+    targetKind: SessionCommandTargetKind | null;
+    workspaceQuery: string | null;
+    cmdRes: I3SessionCommandResponse;
+  }): string {
+    const { platform, cmd, targetKind, workspaceQuery, cmdRes } = params;
+
+    if (cmd === "workspace_list") {
+      if (!cmdRes.ok) {
+        return this.formatDenyNotice(
+          platform,
+          cmdRes.deny_reason ?? "workspace_write_denied",
+        );
+      }
+      const currentWs = cmdRes.current_workspace_id ?? null;
+      const isCurrentHome =
+        cmdRes.is_home === true ||
+        currentWs === null ||
+        (cmdRes.home_workspace_id !== undefined &&
+          cmdRes.home_workspace_id !== null &&
+          currentWs === cmdRes.home_workspace_id);
+      const currentWsName =
+        cmdRes.current_workspace_name ??
+        (cmdRes.workspaces ?? []).find((w) => w.workspace_id === currentWs)
+          ?.name ??
+        null;
+      const currentLabel = !isCurrentHome && currentWs
+        ? currentWsName
+          ? `\`${currentWsName}\` (\`${currentWs}\`)`
+          : `\`${currentWs}\``
+        : "Home (Chief of Staff)";
+      const lines = [
+        `Current workspace: ${currentLabel}`,
+        "Available workspaces:",
+        `- \`home\` / \`/main\` (Chief of Staff)${isCurrentHome ? " [current]" : ""}`,
+        ...(cmdRes.workspaces ?? []).map(
+          (w) =>
+            `- \`${w.name}\` (\`${w.workspace_id}\`)${!isCurrentHome && w.workspace_id === currentWs ? " [current]" : ""}`,
+        ),
+        "Use `/main` for Chief of Staff, `/<workspace name>`, or `/workspace <name|id|home>` to switch.",
+      ];
+      return lines.join("\n");
     }
 
-    return false;
+    if (cmd === "workspace_switch") {
+      if (!cmdRes.ok) {
+        if (cmdRes.deny_reason === "workspace_ambiguous") {
+          const candidates = cmdRes.candidates ?? [];
+          const candidateLines = candidates.map(
+            (c) => `- \`${c.name}\` (\`${c.workspace_id}\`)`,
+          );
+          return [
+            `Multiple workspaces match "${workspaceQuery ?? ""}":`,
+            ...candidateLines,
+            "Current session was not changed. Use `/workspace <workspace_id>` to select a specific workspace.",
+          ].join("\n");
+        }
+        if (cmdRes.deny_reason === "workspace_not_found") {
+          if (targetKind === "shortcut_name") {
+            return `Unknown command or workspace "${workspaceQuery ?? ""}". Current session unchanged. Use \`/workspace\` to list workspaces, \`/main\` for Chief of Staff, or \`/new\` to start a new thread.`;
+          }
+          return `Workspace "${workspaceQuery ?? ""}" was not found or you do not have write access. Current session unchanged. Use \`/workspace\` to list available workspaces.`;
+        }
+        return this.formatDenyNotice(
+          platform,
+          cmdRes.deny_reason ?? "workspace_not_found",
+        );
+      }
+      const isHomeTarget =
+        cmdRes.is_home === true ||
+        targetKind === "home" ||
+        !cmdRes.workspace_id ||
+        (cmdRes.override_workspace_id === null &&
+          (cmdRes.workspace_name === "Chief of Staff" ||
+            cmdRes.workspace_id === cmdRes.home_workspace_id));
+      const targetLabel = !isHomeTarget && cmdRes.workspace_id
+        ? cmdRes.workspace_name && cmdRes.workspace_name !== cmdRes.workspace_id
+          ? `workspace \`${cmdRes.workspace_name}\` (\`${cmdRes.workspace_id}\`)`
+          : `workspace \`${cmdRes.workspace_id}\``
+        : "Home (Chief of Staff)";
+      return `Switched this conversation to ${targetLabel} and started a new thread.`;
+    }
+
+    if (cmd === "new") {
+      if (!cmdRes.ok) {
+        return this.formatDenyNotice(
+          platform,
+          cmdRes.deny_reason ?? "external_member_group_forbidden",
+        );
+      }
+      const isHomeNew =
+        cmdRes.is_home === true ||
+        !cmdRes.workspace_id ||
+        (cmdRes.override_workspace_id === null &&
+          (cmdRes.workspace_name === "Chief of Staff" ||
+            cmdRes.workspace_id === cmdRes.home_workspace_id));
+      const wsLabel = !isHomeNew && cmdRes.workspace_id
+        ? `workspace \`${cmdRes.workspace_name ?? cmdRes.workspace_id}\``
+        : "Home (Chief of Staff)";
+      return `Started a new conversation thread in ${wsLabel}.`;
+    }
+
+    if (!cmdRes.ok) {
+      return this.formatDenyNotice(
+        platform,
+        cmdRes.deny_reason ?? "external_member_group_forbidden",
+      );
+    }
+    if (!cmdRes.thread_id) {
+      return "No active conversation thread to stop.";
+    }
+    return "Stopped the current run.";
   }
 
   // =========================================================================
@@ -907,6 +967,10 @@ export class ChannelGatewayOrchestrator {
             platform: event.platform,
             scope_key: event.threadScopeKey,
             dalton_user_id: userId,
+            generation: resolved.generation,
+            thread_id: threadId,
+            run_id: pendingInterrupt.run_id,
+            interrupt_id: interruptId,
             pending_interrupt: null,
           },
         });
@@ -2720,6 +2784,12 @@ export class ChannelGatewayOrchestrator {
                     platform: event.platform,
                     scope_key: event.threadScopeKey,
                     dalton_user_id: userId,
+                    generation: resolved.generation,
+                    thread_id: currentThreadId,
+                    run_id:
+                      resolved.pending_interrupt?.run_id ?? currentRunId,
+                    interrupt_id:
+                      resolved.pending_interrupt?.interrupt_id ?? null,
                     pending_interrupt: null,
                   },
                 }
@@ -2832,6 +2902,7 @@ export class ChannelGatewayOrchestrator {
             platform: event.platform,
             targetAddress: event.chatAddress,
             scopeKey: event.threadScopeKey,
+            generation: resolved.generation,
             inboundMessageId: event.messageId,
           });
           if (!intDelivered) {
@@ -3154,6 +3225,10 @@ export class ChannelGatewayOrchestrator {
               platform: event.platform,
               scope_key: event.threadScopeKey,
               dalton_user_id: userId,
+              generation: resolved.generation,
+              thread_id: currentThreadId,
+              run_id: resolved.pending_interrupt?.run_id ?? currentRunId,
+              interrupt_id: resolved.pending_interrupt?.interrupt_id ?? null,
               pending_interrupt: null,
             },
           });
@@ -3168,6 +3243,8 @@ export class ChannelGatewayOrchestrator {
           targetAddress: event.chatAddress,
           inboundMessageId: event.messageId,
           scopeKey: event.threadScopeKey,
+          generation: resolved.generation,
+          activityOrigin: params.isAttachedStream ? "replay" : "conversation",
           deferFinalCompletion: params.deferFinalCompletion,
         });
         if (replaySettled) {
@@ -3204,6 +3281,10 @@ export class ChannelGatewayOrchestrator {
           platform: event.platform,
           scope_key: event.threadScopeKey,
           dalton_user_id: userId,
+          generation: resolved.generation,
+          thread_id: currentThreadId,
+          run_id: resolved.pending_interrupt?.run_id ?? currentRunId,
+          interrupt_id: resolved.pending_interrupt?.interrupt_id ?? null,
           pending_interrupt: null,
         },
       });
@@ -3225,6 +3306,8 @@ export class ChannelGatewayOrchestrator {
         targetAddress: event.chatAddress,
         inboundMessageId: event.messageId,
         scopeKey: event.threadScopeKey,
+        generation: resolved.generation,
+        activityOrigin: params.isAttachedStream ? "replay" : "conversation",
         deferFinalCompletion: params.deferFinalCompletion,
       });
       return settled;
@@ -3258,6 +3341,9 @@ export class ChannelGatewayOrchestrator {
         inboundMessageId: event.messageId,
         replyToMessageId: event.messageId,
         threadScopeKey: event.threadScopeKey,
+        sourceScopeKey: event.threadScopeKey,
+        sourceGeneration: resolved.generation,
+        activityOrigin: params.isAttachedStream ? "replay" : "conversation",
         trimmedText: trimmedAssistant,
         sentToCurrentCount: prog.sent_to_current_count,
       });
@@ -3281,6 +3367,8 @@ export class ChannelGatewayOrchestrator {
         targetAddress: event.chatAddress,
         inboundMessageId: event.messageId,
         scopeKey: event.threadScopeKey,
+        generation: resolved.generation,
+        activityOrigin: "replay",
         deferFinalCompletion: params.deferFinalCompletion,
       });
       return settled;
@@ -3401,6 +3489,7 @@ export class ChannelGatewayOrchestrator {
                 platform: event.platform,
                 targetAddress: event.chatAddress,
                 scopeKey: event.threadScopeKey,
+                generation: resolved.generation,
                 inboundMessageId: event.messageId,
               });
               if (!intOk) {
@@ -3606,6 +3695,8 @@ export class ChannelGatewayOrchestrator {
     targetAddress: string;
     inboundMessageId?: string | null;
     scopeKey?: string | null;
+    generation?: number | null;
+    activityOrigin?: "conversation" | "replay" | "notification" | "command" | null;
     isBackgroundRun?: boolean;
     deferFinalCompletion?: boolean;
   }): Promise<boolean> {
@@ -3618,6 +3709,8 @@ export class ChannelGatewayOrchestrator {
       targetAddress,
       inboundMessageId,
       scopeKey,
+      generation,
+      activityOrigin,
       isBackgroundRun,
       deferFinalCompletion,
     } = params;
@@ -4145,6 +4238,7 @@ export class ChannelGatewayOrchestrator {
               targetAddress,
               inboundMessageId,
               scopeKey,
+              generation,
             });
             if (!liveSettled.settled) {
               // The attached live stream broke before `run_end` / `interrupt`, or attached with cursor `N > 0` without
@@ -4212,6 +4306,7 @@ export class ChannelGatewayOrchestrator {
                   platform,
                   targetAddress,
                   scopeKey,
+                  generation,
                   inboundMessageId: inboundMessageId ?? undefined,
                 });
                 if (intOk) {
@@ -4339,6 +4434,7 @@ export class ChannelGatewayOrchestrator {
                     platform,
                     targetAddress,
                     scopeKey,
+                    generation,
                     inboundMessageId: inboundMessageId ?? undefined,
                   });
                   if (intOk) {
@@ -4776,6 +4872,10 @@ export class ChannelGatewayOrchestrator {
         targetAddress,
         inboundMessageId: inboundMessageId ?? null,
         threadScopeKey: scopeKey ?? null,
+        sourceScopeKey: scopeKey ?? null,
+        sourceGeneration: generation ?? null,
+        activityOrigin:
+          activityOrigin ?? (isBackgroundRun ? "notification" : "replay"),
         trimmedText: trimmed,
         sentToCurrentCount: prog.sent_to_current_count,
       });
@@ -4852,6 +4952,7 @@ export class ChannelGatewayOrchestrator {
     targetAddress: string;
     inboundMessageId?: string | null;
     scopeKey?: string | null;
+    generation?: number | null;
   }): Promise<{ settled: boolean; runEnded: boolean; assistantText: string }> {
     try {
       const streamResp = await this.backend.streamThreadMessages(
@@ -4951,6 +5052,7 @@ export class ChannelGatewayOrchestrator {
               platform: params.platform,
               targetAddress: params.targetAddress,
               scopeKey: params.scopeKey,
+              generation: params.generation ?? null,
               inboundMessageId: params.inboundMessageId ?? undefined,
             });
           }
@@ -5019,6 +5121,7 @@ export class ChannelGatewayOrchestrator {
     platform: ChannelPlatform;
     targetAddress: string;
     scopeKey: string;
+    generation?: number | null;
     inboundMessageId?: string;
   }): Promise<boolean> {
     const {
@@ -5030,6 +5133,7 @@ export class ChannelGatewayOrchestrator {
       platform,
       targetAddress,
       scopeKey,
+      generation,
       inboundMessageId,
     } = params;
 
@@ -5139,16 +5243,25 @@ export class ChannelGatewayOrchestrator {
       prompt: promptTextFromPayload,
     };
 
-    await this.backend.updateInboundProgress({
+    const prog = await this.backend.updateInboundProgress({
       session_interrupt_update: {
         platform,
         scope_key: scopeKey,
         dalton_user_id: userId,
+        generation: generation ?? null,
+        thread_id: threadId,
+        run_id: runId,
+        interrupt_id: interruptId,
         pending_interrupt: pendingState,
       },
     });
 
-    const promptText = this.formatInterruptPrompt(pendingState);
+    const isStaleSessionInterrupt =
+      prog.session_is_current_for_interrupt === false;
+    const promptText = this.formatInterruptPrompt(
+      pendingState,
+      isStaleSessionInterrupt,
+    );
     const deliveryRes = await this.deliveryService.executeDelivery({
       deliveryKey: `interrupt:${runId}:${interruptId}`,
       kind: "interrupt",
@@ -5164,15 +5277,21 @@ export class ChannelGatewayOrchestrator {
     return deliveryRes.status === "sent" || deliveryRes.status === "partial";
   }
 
-  private formatInterruptPrompt(state: PendingInterruptState): string {
+  private formatInterruptPrompt(
+    state: PendingInterruptState,
+    isStaleSessionInterrupt = false,
+  ): string {
+    const threadLink = `${this.webBaseUrl}/chat/t/${state.thread_id}`;
     if (state.kind === "web_only_approval") {
-      return `Action requires confirmation in the web UI (${state.action_type ?? "approval"}): ${this.webBaseUrl}/chat/t/${state.thread_id}`;
+      return `Action requires confirmation in the web UI (${state.action_type ?? "approval"}): ${threadLink}`;
     }
     if (state.kind === "credit_pause") {
-      return (
+      const baseText =
         state.prompt ||
-        "This run is paused due to credit limits. Reply `continue` (or send additional instructions) after topping up credits to resume."
-      );
+        "This run is paused due to credit limits. Reply `continue` (or send additional instructions) after topping up credits to resume.";
+      return isStaleSessionInterrupt
+        ? `${baseText}\nThis request belongs to an earlier conversation thread. Please resume it in the web UI: ${threadLink}`
+        : baseText;
     }
     if (state.questions && state.questions.length > 0) {
       const lines: string[] = [];
@@ -5182,10 +5301,20 @@ export class ChannelGatewayOrchestrator {
           lines.push(`${idx + 1}. ${opt.label}`);
         });
       }
-      lines.push("Reply with an option number, your answer, or `skip`.");
+      if (isStaleSessionInterrupt) {
+        lines.push(
+          `This question belongs to an earlier conversation thread. Please reply in the web UI: ${threadLink}`,
+        );
+      } else {
+        lines.push("Reply with an option number, your answer, or `skip`.");
+      }
       return lines.join("\n");
     }
-    return state.prompt || "Please reply to continue, or reply `skip`.";
+    const basePrompt =
+      state.prompt || "Please reply to continue, or reply `skip`.";
+    return isStaleSessionInterrupt
+      ? `${basePrompt}\nThis request belongs to an earlier conversation thread. Please reply in the web UI: ${threadLink}`
+      : basePrompt;
   }
 
   private async attachToLiveStreamOrReplay(params: {
@@ -6083,6 +6212,7 @@ export class ChannelGatewayOrchestrator {
               platform: handle.platform,
               targetAddress: handle.targetAddress,
               scopeKey: handle.scopeKey,
+              generation: handle.generation,
             });
           }
         }
@@ -6823,6 +6953,71 @@ export class ChannelGatewayOrchestrator {
       rawPayload: row.raw_payload ?? {},
     };
 
+    if (row.event_kind === "command") {
+      const cmdReq = (row.command_request ?? {}) as Record<string, unknown>;
+      const cmdResRaw = (row.command_result ?? {}) as Record<string, unknown>;
+      const rawCmd =
+        typeof cmdReq.cmd === "string"
+          ? cmdReq.cmd
+          : typeof cmdResRaw.cmd === "string"
+            ? cmdResRaw.cmd
+            : "workspace_list";
+      const cmd: "workspace_list" | "workspace_switch" | "new" | "stop" =
+        rawCmd === "workspace_switch" ||
+        rawCmd === "new" ||
+        rawCmd === "stop"
+          ? rawCmd
+          : "workspace_list";
+      const targetKind =
+        cmdReq.target_kind === "home" ||
+        cmdReq.target_kind === "workspace_id" ||
+        cmdReq.target_kind === "exact_name" ||
+        cmdReq.target_kind === "shortcut_name"
+          ? cmdReq.target_kind
+          : null;
+      const workspaceQuery =
+        typeof cmdReq.workspace_query === "string"
+          ? cmdReq.workspace_query
+          : null;
+      const syntheticCmdRes: I3SessionCommandResponse = {
+        ...(cmdResRaw as unknown as I3SessionCommandResponse),
+        ok:
+          typeof cmdResRaw.ok === "boolean"
+            ? cmdResRaw.ok
+            : row.status !== "failed",
+        linked: true,
+        dalton_user_id: userId,
+        generation:
+          typeof cmdResRaw.generation === "number"
+            ? cmdResRaw.generation
+            : generation,
+        external_thread_id:
+          typeof cmdResRaw.external_thread_id === "string"
+            ? cmdResRaw.external_thread_id
+            : row.external_thread_id,
+        thread_id:
+          typeof cmdResRaw.thread_id === "string"
+            ? cmdResRaw.thread_id
+            : row.thread_id,
+        run_id:
+          typeof cmdResRaw.run_id === "string" ? cmdResRaw.run_id : row.run_id,
+        command_effect_status:
+          row.command_effect_status ??
+          (cmd === "stop" && (cmdResRaw.thread_id || row.thread_id)
+            ? "pending_cancel"
+            : "done"),
+        command_reply_pending: row.command_reply_pending ?? true,
+      };
+      await this.completeSessionCommandExecution({
+        event: syntheticEvent,
+        cmd,
+        targetKind,
+        workspaceQuery,
+        cmdRes: syntheticCmdRes,
+      });
+      return;
+    }
+
     const pendingFromRow =
       row.pending_interrupt ??
       (row.raw_payload?.pending_interrupt &&
@@ -7405,6 +7600,9 @@ export class ChannelGatewayOrchestrator {
     inboundMessageId?: string | null;
     replyToMessageId?: string | null;
     threadScopeKey?: string | null;
+    sourceScopeKey?: string | null;
+    sourceGeneration?: number | null;
+    activityOrigin?: DeliveryActivityOrigin | null;
     trimmedText: string;
     sentToCurrentCount: number;
   }): Promise<boolean> {
@@ -7422,6 +7620,10 @@ export class ChannelGatewayOrchestrator {
         text: params.trimmedText,
         replyToMessageId: params.replyToMessageId ?? null,
         threadScopeKey: params.threadScopeKey ?? null,
+        sourceScopeKey:
+          params.sourceScopeKey ?? params.threadScopeKey ?? null,
+        sourceGeneration: params.sourceGeneration ?? null,
+        activityOrigin: params.activityOrigin ?? null,
       });
       if (
         deliveryRes.status !== "sent" &&
@@ -7449,6 +7651,10 @@ export class ChannelGatewayOrchestrator {
         inbound_message_id: params.inboundMessageId ?? null,
         has_non_empty_text: true,
         total_chunks: 1,
+        source_scope_key:
+          params.sourceScopeKey ?? params.threadScopeKey ?? null,
+        source_generation: params.sourceGeneration ?? null,
+        activity_origin: params.activityOrigin ?? null,
       });
       if (claim.claim_status === "already_completed") {
         const prev = (claim.first_response_json ?? {}) as { status?: string };
@@ -7502,6 +7708,9 @@ export class ChannelGatewayOrchestrator {
     text: string;
     replyToMessageId?: string | null;
     threadScopeKey?: string | null;
+    sourceScopeKey?: string | null;
+    sourceGeneration?: number | null;
+    activityOrigin?: DeliveryActivityOrigin | null;
   }): Promise<boolean> {
     const res = await this.deliveryService.executeDelivery({
       deliveryKey: options.deliveryKey,
@@ -7515,6 +7724,10 @@ export class ChannelGatewayOrchestrator {
       text: options.text,
       replyToMessageId: options.replyToMessageId ?? null,
       threadScopeKey: options.threadScopeKey ?? null,
+      sourceScopeKey:
+        options.sourceScopeKey ?? options.threadScopeKey ?? null,
+      sourceGeneration: options.sourceGeneration ?? null,
+      activityOrigin: options.activityOrigin ?? "none",
     });
     return res.status === "sent" || res.status === "partial";
   }
