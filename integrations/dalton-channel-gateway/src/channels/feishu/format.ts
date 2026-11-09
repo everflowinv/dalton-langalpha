@@ -1159,10 +1159,8 @@ function extractInteractiveElementText(
     if (normalizedBotId && resolvedUserId === normalizedBotId) {
       return undefined;
     }
-    const mention = normalizeInteractiveValue(
-      element.user_name ?? element.user_id ?? element.open_id,
-      variables,
-    );
+    const mention =
+      normalizeInteractiveValue(element.user_name, variables).trim() || resolvedUserId;
     return mention
       ? mention.startsWith("@")
         ? mention

@@ -161,6 +161,7 @@ trap 'rm -f "${FILES_FROM_TMP}" "${RSYNC_OUT_TMP}"' EXIT
 
 RSYNC_ARGS=(
   -ar
+  --copy-dirlinks
   --stats
   "--exclude=venv/"
   "--exclude=.venv/"

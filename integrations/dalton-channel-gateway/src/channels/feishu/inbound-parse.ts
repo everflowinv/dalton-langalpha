@@ -13,7 +13,6 @@
  */
 
 import crypto from "node:crypto";
-import { escapeRegExp } from "../../shared/text.js";
 import type {
   InboundAttachmentDescriptor,
   InboundChannelEvent,
@@ -248,7 +247,7 @@ export function normalizeMentions(
     return text.trim();
   }
 
-  let result = text;
+  const replacements = new Map<string, string>();
   const normalizedBotId = botStripId?.trim();
 
   for (const mention of mentions) {
@@ -257,19 +256,22 @@ export function normalizeMentions(
     const openId = extractMentionOpenId(mention);
     const isBot = Boolean(normalizedBotId && openId === normalizedBotId);
 
+    if (!key) continue;
     if (isBot) {
-      if (key) {
-        result = result.replace(
-          new RegExp(`\\s*${escapeRegExp(key)}\\s*`, "g"),
-          " ",
-        );
-      }
+      replacements.set(key, "");
     } else if (key && name) {
-      result = result.replace(new RegExp(escapeRegExp(key), "g"), `@${name}`);
+      replacements.set(key, `@${name}`);
     }
   }
 
-  return result.trim();
+  return text.replace(
+    /(\s*)(@_user_\d+|@_all)(?![A-Za-z0-9_])/g,
+    (match, spacing: string, key: string) => {
+      const replacement = replacements.get(key);
+      if (replacement === undefined) return match;
+      return replacement ? `${spacing}${replacement}` : "";
+    },
+  ).trim();
 }
 
 export function parseMessageContent(
@@ -606,7 +608,7 @@ function resolveTextRetryDedupeKey(
 /**
  * Resolves the canonical deduplication key from a raw Feishu
  * `im.message.receive_v1` event payload, matching
- * `monitor.account-UbN1RhlP.mjs:822-872` (`codex-4`, `grok 高-3`).
+ * `monitor.account-UbN1RhlP.mjs:822-872`.
  */
 export function resolveFeishuMessageDedupeKey(
   rawPayload: unknown,
@@ -737,11 +739,10 @@ export function parseFeishuInboundEvent(
     normalizedMessageType === "post" && postParsed !== undefined
       ? postParsed.textContent
       : parseMessageContent(rawContent, messageType, options.botOpenId);
-  const text = normalizeMentions(
-    parsedContentText,
-    message.mentions,
-    options.botOpenId,
-  );
+  // Text messages encode mentions as placeholders; rich formats carry IDs in nodes.
+  const text = normalizedMessageType === "text"
+    ? normalizeMentions(parsedContentText, message.mentions, options.botOpenId)
+    : parsedContentText.trim();
   const rawCommandCandidate =
     normalizedMessageType === "post" && postParsed !== undefined
       ? (postParsed.commandText ?? postParsed.textContent)
@@ -751,11 +752,9 @@ export function parseFeishuInboundEvent(
           parsedContentText === postParsed.textContent.trim()
         ? (postParsed.commandText ?? parsedContentText)
         : parsedContentText;
-  const commandText = normalizeMentions(
-    rawCommandCandidate,
-    message.mentions,
-    options.botOpenId,
-  );
+  const commandText = normalizedMessageType === "text"
+    ? normalizeMentions(rawCommandCandidate, message.mentions, options.botOpenId)
+    : rawCommandCandidate.trim();
 
   const attachments = extractInboundAttachments(rawContent, messageType);
 

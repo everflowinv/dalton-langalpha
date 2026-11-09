@@ -256,7 +256,7 @@ function sanitizeSdkLogEntry(
 /**
  * Creates a `@larksuiteoapi/node-sdk` compatible `Lark.Logger` that routes SDK
  * logs through `src/shared/logger.ts` while stripping `appId`, `appSecret`,
- * `tenant_access_token`, and Axios request `config`/`data` objects (`codex-1`, `grok-9`).
+ * `tenant_access_token`, and Axios request `config`/`data` objects.
  */
 export function createFeishuSdkLogger(options: {
   appId: string;

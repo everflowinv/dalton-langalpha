@@ -738,6 +738,105 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
     ).toBe("/bind 654321");
   });
 
+  it("normalizes complete mention tokens once regardless of mention order", () => {
+    const bot = { key: "@_user_1", id: { open_id: BOT_OPEN_ID }, name: "Bot" };
+    const colleague = { key: "@_user_10", id: { open_id: "ou_colleague" }, name: "Carol" };
+    for (const mentions of [[bot, colleague], [colleague, bot]]) {
+      const event = parseFeishuInboundEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_complete_mentions", chat_id: "oc_group", chat_type: "group",
+          message_type: "text", content: JSON.stringify({ text: "@_user_1 @_user_10 /stop" }),
+          mentions,
+        },
+      }, { botOpenId: BOT_OPEN_ID });
+      expect(event).toMatchObject({ text: "@Carol /stop", commandText: "@Carol /stop", isGroupTrigger: true });
+    }
+    expect(normalizeMentions("@_user_1 @_user_10 /stop", [bot], BOT_OPEN_ID))
+      .toBe("@_user_10 /stop");
+    const other = { key: "@_user_1", id: { open_id: "ou_other" }, name: "Alice" };
+    for (const mentions of [[other, colleague], [colleague, other]]) {
+      expect(normalizeMentions("@_user_1 @_user_10", mentions, BOT_OPEN_ID))
+        .toBe("@Alice @Carol");
+    }
+    const literalName = { ...colleague, name: "@_user_1 $& $1" };
+    for (const mentions of [[bot, literalName], [literalName, bot]]) {
+      expect(normalizeMentions("@_user_10 @_user_1 /stop", mentions, BOT_OPEN_ID))
+        .toBe("@@_user_1 $& $1 /stop");
+    }
+    expect(normalizeMentions("hello @_user_1 world", [bot], BOT_OPEN_ID)).toBe("hello world");
+    expect(normalizeMentions("@_user_10suffix /stop", [colleague], BOT_OPEN_ID))
+      .toBe("@_user_10suffix /stop");
+  });
+
+  it.each(["post", "wrapped_post", "card", "wrapped_card"] as const)("preserves placeholder-shaped display names in %s without executing a command", async (format) => {
+    const nodes = [
+      { tag: "at", user_id: BOT_OPEN_ID, user_name: "DaltonBot" },
+      { tag: "at", user_id: "ou_other", user_name: "_user_1" },
+      { tag: "text", text: " /stop" },
+    ];
+    const post = { title: "", content: [nodes] };
+    const content = format === "post" ? post
+      : format === "card" ? { elements: [nodes] }
+        : { post: { zh_cn: post } };
+    const parsed = parseFeishuInboundEvent({
+      sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+      message: {
+        message_id: `om_display_placeholder_${format}`, chat_id: "oc_grp_1", chat_type: "group",
+        message_type: format.includes("card") ? "interactive" : "post",
+        content: JSON.stringify(content),
+        mentions: [
+          { key: "@_user_1", id: { open_id: BOT_OPEN_ID }, name: "DaltonBot" },
+          { key: "@_user_2", id: { open_id: "ou_other" }, name: "_user_1" },
+        ],
+      },
+    }, { botOpenId: BOT_OPEN_ID });
+    expect(parsed).toMatchObject({
+      text: format === "card" ? "@_user_1 /stop" : "@\\_user\\_1 /stop",
+      commandText: "@_user_1 /stop",
+      isGroupTrigger: true,
+    });
+    const h = createTestHarness();
+    try {
+      await h.app.orchestrator.handleInboundEvent(parsed!);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(h.backend.cancelThreadTurn).not.toHaveBeenCalled();
+      expect(vi.mocked(h.backend.sessionCommand).mock.calls.some(([request]) => request.cmd === "stop"))
+        .toBe(false);
+      expect(h.backend.appendCalls).toHaveLength(1);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it.each(["", "   ", null, undefined])("preserves a card mention with display name %s before a command", async (displayName) => {
+    const parsed = parseFeishuInboundEvent({
+      sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+      message: {
+        message_id: `om_card_empty_name_${String(displayName)}`,
+        chat_id: "oc_grp_1", chat_type: "group", message_type: "interactive",
+        content: JSON.stringify({ elements: [[
+          { tag: "at", user_id: BOT_OPEN_ID },
+          { tag: "at", open_id: "ou_other", user_name: displayName },
+          { tag: "text", text: " /stop" },
+        ]] }),
+        mentions: [{ key: "@_user_1", id: { open_id: BOT_OPEN_ID }, name: "DaltonBot" }],
+      },
+    }, { botOpenId: BOT_OPEN_ID });
+    expect(parsed).toMatchObject({ text: "@ou_other /stop", commandText: "@ou_other /stop", isGroupTrigger: true });
+    const h = createTestHarness();
+    try {
+      await h.app.orchestrator.handleInboundEvent(parsed!);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(h.backend.cancelThreadTurn).not.toHaveBeenCalled();
+      expect(vi.mocked(h.backend.sessionCommand).mock.calls.some(([request]) => request.cmd === "stop"))
+        .toBe(false);
+      expect(h.backend.appendCalls).toHaveLength(1);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
   it("parses post rich text, image, and file messages", () => {
     const postRaw = {
       sender: {
@@ -1306,7 +1405,7 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
       const registrationOrder: string[] = [];
       vi.mocked(h.backend.registerAndResolveInbound).mockImplementation(
         async (req) => {
-          // Simulate a 25ms I-1 database round-trip (longer than the old 10ms timer)
+          // Simulate a 25ms I-1 database round-trip
           await new Promise((r) => setTimeout(r, 25));
           registrationOrder.push(req.message_id);
           return defaultImpl(req);
@@ -3324,7 +3423,7 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
     }
   });
 
-  it("turns a streamed size_exceeded attachment failure into a terminal limit notice and does not retry it on startup recovery", async () => {
+  it.each(["stream", "buffer", "arrayBuffer", "rawBuffer", "rawArrayBuffer"] as const)("reports an oversized %s attachment once without retrying it on startup recovery", async (responseType) => {
     const MESSAGE_ID = "om_post_too_large_1";
     const postContent = JSON.stringify({
       content: [[{ tag: "text", text: "请分析附件" }]],
@@ -3336,11 +3435,21 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
     try {
       const { client, calls } = createFakeLarkClient({
         onMessageResourceGet: async () => {
+          const bytes = Buffer.alloc(21 * 1024 * 1024, 7);
+          const headers = { "content-type": "application/pdf" };
+          if (responseType === "rawBuffer") return bytes;
+          if (responseType === "rawArrayBuffer") {
+            return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+          }
+          if (responseType === "buffer") return { data: bytes, headers };
+          if (responseType === "arrayBuffer") {
+            return { data: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength), headers };
+          }
           const stream = new PassThrough();
-          stream.end(Buffer.alloc(21 * 1024 * 1024, 7));
+          stream.end(bytes);
           return {
             getReadableStream: () => stream,
-            headers: { "content-type": "application/pdf" },
+            headers,
           };
         },
       });
@@ -4292,7 +4401,7 @@ describe("Feishu outbound sending, media upload/download & error classification"
   });
 
   it("throws ChannelDeliveryError with accurate outcome and code across send and upload stages", async () => {
-    // 1. Rate limit (230020) -> outcome: "rate_limited", code: "rate_limited" (`grok-8`, `codex-12`)
+    // 1. Rate limit (230020) -> outcome: "rate_limited", code: "rate_limited"
     const rateLimitedFake = createFakeLarkClient({
       onMessageCreate: async () => ({
         code: 230020,
@@ -4367,7 +4476,7 @@ describe("Feishu outbound sending, media upload/download & error classification"
       code: "not_allowed",
     } satisfies Partial<ChannelDeliveryError>);
 
-    // 4. Confirmed undelivered non-permission 4xx / business error (230099) -> outcome: "failed", code: "unavailable" (`grok-8`)
+    // 4. Confirmed undelivered non-permission 4xx / business error (230099) -> outcome: "failed", code: "unavailable"
     const badReqFake = createFakeLarkClient({
       onMessageCreate: async () => ({
         code: 230099,
@@ -4419,7 +4528,7 @@ describe("Feishu outbound sending, media upload/download & error classification"
       code: "unavailable",
     } satisfies Partial<ChannelDeliveryError>);
 
-    // 6. Upload-stage timeout / 5xx (message not sent yet) -> outcome: "failed", code: "unavailable" (`codex-12`)
+    // 6. Upload-stage timeout / 5xx (message not sent yet) -> outcome: "failed", code: "unavailable"
     const uploadTimeoutFake = createFakeLarkClient({
       onFileCreate: async () => {
         const err = Object.assign(new Error("upload ETIMEDOUT"), {
@@ -4447,7 +4556,7 @@ describe("Feishu outbound sending, media upload/download & error classification"
       code: "unavailable",
     } satisfies Partial<ChannelDeliveryError>);
 
-    // 7. Missing message_id on code=0 -> outcome: "unknown", code: "unavailable" (`grok-16`)
+    // 7. Missing message_id on code=0 -> outcome: "unknown", code: "unavailable"
     const missingMsgIdFake = createFakeLarkClient({
       onMessageCreate: async () => ({
         code: 0,
@@ -4472,7 +4581,7 @@ describe("Feishu outbound sending, media upload/download & error classification"
       code: "unavailable",
     } satisfies Partial<ChannelDeliveryError>);
 
-    // 8. Truncated/aborted HTTP response stream during send (ERR_BAD_RESPONSE) -> outcome: "unknown" (`codex-5`)
+    // 8. Truncated/aborted HTTP response stream during send (ERR_BAD_RESPONSE) -> outcome: "unknown"
     const badRespSendFake = createFakeLarkClient({
       onMessageCreate: async () => {
         throw Object.assign(new Error("stream has been aborted"), {
@@ -4498,7 +4607,7 @@ describe("Feishu outbound sending, media upload/download & error classification"
       code: "unavailable",
     } satisfies Partial<ChannelDeliveryError>);
 
-    // 9. Truncated/aborted HTTP response stream during upload (ERR_BAD_RESPONSE) -> outcome: "failed" (`codex-5`)
+    // 9. Truncated/aborted HTTP response stream during upload (ERR_BAD_RESPONSE) -> outcome: "failed"
     const badRespUploadFake = createFakeLarkClient({
       onFileCreate: async () => {
         throw Object.assign(new Error("stream has been aborted"), {
@@ -4662,7 +4771,7 @@ describe("Feishu listAvailableChats pagination, seenPageTokens loop guard & chec
     expect(nonMemberCheck.ok).toBe(false);
     expect(nonMemberCheck.message).toContain("not a member");
 
-    // Repeated page_token in chatMembers.get reports incomplete pagination instead of "not a member" (`grok 中-1`)
+    // Repeated page_token in chatMembers.get reports incomplete pagination instead of "not a member"
     const { client: truncatedMembersClient } = createFakeLarkClient({
       onChatGet: async (call) => ({
         code: 0,
