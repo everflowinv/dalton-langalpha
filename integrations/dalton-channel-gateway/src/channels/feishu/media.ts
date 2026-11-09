@@ -15,7 +15,7 @@
 
 import path from "node:path";
 import type * as Lark from "@larksuiteoapi/node-sdk";
-import { readStreamWithLimit } from "../../shared/safe-fetch.js";
+import { readStreamWithLimit, SafeFetchError } from "../../shared/safe-fetch.js";
 import { MAX_ATTACHMENT_BYTES } from "../../types.js";
 import { ChannelDeliveryError } from "../adapter.js";
 import {
@@ -227,7 +227,8 @@ async function readFeishuResourceResponseBuffer(
 }> {
   if (Buffer.isBuffer(response)) {
     if (response.byteLength > maxBytes) {
-      throw new Error(
+      throw new SafeFetchError(
+        "size_exceeded",
         `Feishu attachment size (${response.byteLength} bytes) exceeds maximum limit (${maxBytes} bytes)`,
       );
     }
@@ -235,7 +236,8 @@ async function readFeishuResourceResponseBuffer(
   }
   if (response instanceof ArrayBuffer) {
     if (response.byteLength > maxBytes) {
-      throw new Error(
+      throw new SafeFetchError(
+        "size_exceeded",
         `Feishu attachment size (${response.byteLength} bytes) exceeds maximum limit (${maxBytes} bytes)`,
       );
     }
@@ -263,7 +265,8 @@ async function readFeishuResourceResponseBuffer(
 
   if (Buffer.isBuffer(response.data)) {
     if (response.data.byteLength > maxBytes) {
-      throw new Error(
+      throw new SafeFetchError(
+        "size_exceeded",
         `Feishu attachment size (${response.data.byteLength} bytes) exceeds maximum limit (${maxBytes} bytes)`,
       );
     }
@@ -271,7 +274,8 @@ async function readFeishuResourceResponseBuffer(
   }
   if (response.data instanceof ArrayBuffer) {
     if (response.data.byteLength > maxBytes) {
-      throw new Error(
+      throw new SafeFetchError(
+        "size_exceeded",
         `Feishu attachment size (${response.data.byteLength} bytes) exceeds maximum limit (${maxBytes} bytes)`,
       );
     }

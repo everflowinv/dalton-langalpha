@@ -20,6 +20,7 @@ import {
   FEISHU_CARD_TABLE_LIMIT,
   FEISHU_POST_MAX_BYTES,
   FeishuChannelAdapter,
+  type FeishuMentionItem,
   type FeishuWSClientLike,
   type FeishuWSClientOptions,
   formatFeishuTarget,
@@ -738,6 +739,105 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
     ).toBe("/bind 654321");
   });
 
+  it("normalizes complete mention tokens once regardless of mention order", () => {
+    const bot = { key: "@_user_1", id: { open_id: BOT_OPEN_ID }, name: "Bot" };
+    const colleague = { key: "@_user_10", id: { open_id: "ou_colleague" }, name: "Carol" };
+    for (const mentions of [[bot, colleague], [colleague, bot]]) {
+      const event = parseFeishuInboundEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_complete_mentions", chat_id: "oc_group", chat_type: "group",
+          message_type: "text", content: JSON.stringify({ text: "@_user_1 @_user_10 /stop" }),
+          mentions,
+        },
+      }, { botOpenId: BOT_OPEN_ID });
+      expect(event).toMatchObject({ text: "@Carol /stop", commandText: "@Carol /stop", isGroupTrigger: true });
+    }
+    expect(normalizeMentions("@_user_1 @_user_10 /stop", [bot], BOT_OPEN_ID))
+      .toBe("@_user_10 /stop");
+    const other = { key: "@_user_1", id: { open_id: "ou_other" }, name: "Alice" };
+    for (const mentions of [[other, colleague], [colleague, other]]) {
+      expect(normalizeMentions("@_user_1 @_user_10", mentions, BOT_OPEN_ID))
+        .toBe("@Alice @Carol");
+    }
+    const literalName = { ...colleague, name: "@_user_1 $& $1" };
+    for (const mentions of [[bot, literalName], [literalName, bot]]) {
+      expect(normalizeMentions("@_user_10 @_user_1 /stop", mentions, BOT_OPEN_ID))
+        .toBe("@@_user_1 $& $1 /stop");
+    }
+    expect(normalizeMentions("hello @_user_1 world", [bot], BOT_OPEN_ID)).toBe("hello world");
+    expect(normalizeMentions("@_user_10suffix /stop", [colleague], BOT_OPEN_ID))
+      .toBe("@_user_10suffix /stop");
+  });
+
+  it.each(["post", "wrapped_post", "card", "wrapped_card"] as const)("preserves placeholder-shaped display names in %s without executing a command", async (format) => {
+    const nodes = [
+      { tag: "at", user_id: BOT_OPEN_ID, user_name: "DaltonBot" },
+      { tag: "at", user_id: "ou_other", user_name: "_user_1" },
+      { tag: "text", text: " /stop" },
+    ];
+    const post = { title: "", content: [nodes] };
+    const content = format === "post" ? post
+      : format === "card" ? { elements: [nodes] }
+        : { post: { zh_cn: post } };
+    const parsed = parseFeishuInboundEvent({
+      sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+      message: {
+        message_id: `om_display_placeholder_${format}`, chat_id: "oc_grp_1", chat_type: "group",
+        message_type: format.includes("card") ? "interactive" : "post",
+        content: JSON.stringify(content),
+        mentions: [
+          { key: "@_user_1", id: { open_id: BOT_OPEN_ID }, name: "DaltonBot" },
+          { key: "@_user_2", id: { open_id: "ou_other" }, name: "_user_1" },
+        ],
+      },
+    }, { botOpenId: BOT_OPEN_ID });
+    expect(parsed).toMatchObject({
+      text: format === "card" ? "@_user_1 /stop" : "@\\_user\\_1 /stop",
+      commandText: "@_user_1 /stop",
+      isGroupTrigger: true,
+    });
+    const h = createTestHarness();
+    try {
+      await h.app.orchestrator.handleInboundEvent(parsed!);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(h.backend.cancelThreadTurn).not.toHaveBeenCalled();
+      expect(vi.mocked(h.backend.sessionCommand).mock.calls.some(([request]) => request.cmd === "stop"))
+        .toBe(false);
+      expect(h.backend.appendCalls).toHaveLength(1);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it.each(["", "   ", null, undefined])("preserves a card mention with display name %s before a command", async (displayName) => {
+    const parsed = parseFeishuInboundEvent({
+      sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+      message: {
+        message_id: `om_card_empty_name_${String(displayName)}`,
+        chat_id: "oc_grp_1", chat_type: "group", message_type: "interactive",
+        content: JSON.stringify({ elements: [[
+          { tag: "at", user_id: BOT_OPEN_ID },
+          { tag: "at", open_id: "ou_other", user_name: displayName },
+          { tag: "text", text: " /stop" },
+        ]] }),
+        mentions: [{ key: "@_user_1", id: { open_id: BOT_OPEN_ID }, name: "DaltonBot" }],
+      },
+    }, { botOpenId: BOT_OPEN_ID });
+    expect(parsed).toMatchObject({ text: "@ou_other /stop", commandText: "@ou_other /stop", isGroupTrigger: true });
+    const h = createTestHarness();
+    try {
+      await h.app.orchestrator.handleInboundEvent(parsed!);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(h.backend.cancelThreadTurn).not.toHaveBeenCalled();
+      expect(vi.mocked(h.backend.sessionCommand).mock.calls.some(([request]) => request.cmd === "stop"))
+        .toBe(false);
+      expect(h.backend.appendCalls).toHaveLength(1);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
   it("parses post rich text, image, and file messages", () => {
     const postRaw = {
       sender: {
@@ -887,6 +987,221 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
     expect(receivedMerge[0]?.text).toBe(
       "[Merged and Forwarded Messages]\n- First sub-message\n- Second sub-message",
     );
+  });
+
+  it("requires a structured bot mention for group slash commands and text while ignoring unmentioned group messages with zero backend or send calls and keeping DM commands mention-free", async () => {
+    const botMention = {
+      key: "@_user_1",
+      id: { open_id: BOT_OPEN_ID },
+      name: "DaltonBot",
+    };
+
+    const groupBindEvent = parseFeishuInboundEvent(
+      {
+        sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
+        message: {
+          message_id: "om_grp_bind_1",
+          chat_id: "oc_grp_1",
+          chat_type: "group",
+          message_type: "text",
+          content: JSON.stringify({ text: "@_user_1 /bind 123456" }),
+          mentions: [botMention],
+        },
+      },
+      { botOpenId: BOT_OPEN_ID },
+    );
+    expect(groupBindEvent?.isGroupTrigger).toBe(true);
+    expect(groupBindEvent?.text).toBe("/bind 123456");
+
+    for (const cmd of ["/workspace", "/workspace list", "/new", "/stop", "/unbind"]) {
+      const mentionedEv = parseFeishuInboundEvent(
+        {
+          sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
+          message: {
+            message_id: `om_grp_mentioned_${cmd}`,
+            chat_id: "oc_grp_1",
+            chat_type: "group",
+            message_type: "text",
+            content: JSON.stringify({ text: `@_user_1 ${cmd}` }),
+            mentions: [botMention],
+          },
+        },
+        { botOpenId: BOT_OPEN_ID },
+      );
+      expect(mentionedEv?.isGroupTrigger).toBe(true);
+      expect(mentionedEv?.text).toBe(cmd);
+    }
+
+    for (const unmentionedText of [
+      "/main",
+      "/new",
+      "/workspace",
+      "/workspace W2",
+      "/bind 123456",
+      "/unbind",
+      "/stop",
+      "casual chat without mention",
+      "@DaltonBot /stop",
+      "@DaltonBot /workspace W2",
+      `@ou_bot_dalton /new`,
+    ]) {
+      const ev = parseFeishuInboundEvent(
+        {
+          sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
+          message: {
+            message_id: `om_grp_unmentioned_${unmentionedText}`,
+            chat_id: "oc_grp_1",
+            chat_type: "group",
+            message_type: "text",
+            content: JSON.stringify({ text: unmentionedText }),
+            mentions: [],
+          },
+        },
+        { botOpenId: BOT_OPEN_ID },
+      );
+      expect(ev?.isGroupTrigger).toBe(false);
+    }
+
+    const broadcastSlashEvent = parseFeishuInboundEvent(
+      {
+        sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
+        message: {
+          message_id: "om_grp_broadcast_slash",
+          chat_id: "oc_grp_1",
+          chat_type: "group",
+          message_type: "text",
+          content: JSON.stringify({ text: "@_all /workspace W2" }),
+          mentions: [{ key: "@_all", id: { open_id: "all" }, name: "All" }],
+        },
+      },
+      { botOpenId: BOT_OPEN_ID },
+    );
+    expect(broadcastSlashEvent?.isGroupTrigger).toBe(false);
+
+    const h = createTestHarness();
+    try {
+      const { client, calls } = createFakeLarkClient();
+      const realAdapter = new FeishuChannelAdapter({
+        appId: "cli_test_app",
+        appSecret: "sec_test_secret",
+        botOpenId: BOT_OPEN_ID,
+        client,
+      });
+      realAdapter.onInboundEvent(async (ev) => {
+        await h.app.orchestrator.handleInboundEvent(ev);
+      });
+
+      let idx = 0;
+      for (const rawPayload of [
+        {
+          message_id: `om_grp_ignore_${++idx}`,
+          content: JSON.stringify({ text: "/main" }),
+          mentions: [],
+        },
+        {
+          message_id: `om_grp_ignore_${++idx}`,
+          content: JSON.stringify({ text: "/new" }),
+          mentions: [],
+        },
+        {
+          message_id: `om_grp_ignore_${++idx}`,
+          content: JSON.stringify({ text: "/workspace W2" }),
+          mentions: [],
+        },
+        {
+          message_id: `om_grp_ignore_${++idx}`,
+          content: JSON.stringify({ text: "/bind 123456" }),
+          mentions: [],
+        },
+        {
+          message_id: `om_grp_ignore_${++idx}`,
+          content: JSON.stringify({ text: "ordinary group text" }),
+          mentions: [],
+        },
+        {
+          message_id: `om_grp_ignore_${++idx}`,
+          content: JSON.stringify({ text: "@_all /new" }),
+          mentions: [{ key: "@_all", id: { open_id: "all" }, name: "所有人" }],
+        },
+        {
+          message_id: `om_grp_ignore_${++idx}`,
+          content: JSON.stringify({ text: "@DaltonBot /new" }),
+          mentions: [],
+        },
+      ]) {
+        await realAdapter.receiveRawEvent({
+          sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
+          message: {
+            ...rawPayload,
+            chat_id: "oc_grp_1",
+            chat_type: "group",
+            message_type: "text",
+          },
+        });
+      }
+
+      // Direct orchestrator entry also ignores group events when isGroupTrigger is undefined
+      await h.app.orchestrator.handleInboundEvent({
+        platform: "feishu",
+        platformUserId: "ou_alice_1",
+        chatType: "group",
+        chatAddress: "feishu:oc_grp_1",
+        chatId: "oc_grp_1",
+        threadScopeKey: "chat:oc_grp_1",
+        messageId: "om_grp_undef_trigger",
+        text: "/new",
+        commandText: "/new",
+        isGroupTrigger: undefined,
+      });
+
+      await new Promise((r) => setTimeout(r, 20));
+      expect(h.backend.consumeBindCode).not.toHaveBeenCalled();
+      expect(h.backend.sessionCommand).not.toHaveBeenCalled();
+      expect(h.backend.registerAndResolveInbound).not.toHaveBeenCalled();
+      expect(h.backend.appendCalls).toHaveLength(0);
+      expect(h.backend.createCalls).toHaveLength(0);
+      expect(h.feishuAdapter.sentTexts).toHaveLength(0);
+      expect(calls.messageCreate).toHaveLength(0);
+      expect(calls.messageReply).toHaveLength(0);
+
+      // Mentioned group /bind triggers and revokes leaked group bind codes
+      vi.mocked(h.backend.consumeBindCode).mockResolvedValueOnce({
+        ok: false,
+        reason: "revoked_in_group",
+      });
+      await h.feishuAdapter.emitInbound(groupBindEvent!);
+      expect(h.backend.consumeBindCode).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: "bind",
+          platform: "feishu",
+          code: "123456",
+          is_group: true,
+        }),
+      );
+      expect(h.feishuAdapter.sentTexts.at(-1)?.text).toContain("revoked");
+
+      // DM slash command without mention continues to work normally
+      await realAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_dm_new_no_mention",
+          chat_id: "oc_dm_1",
+          chat_type: "p2p",
+          message_type: "text",
+          content: JSON.stringify({ text: "/new" }),
+        },
+      });
+      expect(h.backend.sessionCommand).toHaveBeenCalledWith(
+        expect.objectContaining({
+          platform: "feishu",
+          dalton_user_id: "user_alice_123",
+          scope_key: "dm:ou_alice",
+          cmd: "new",
+        }),
+      );
+    } finally {
+      await h.cleanup();
+    }
   });
 
   it("requires structured @bot mention for group slash commands and ignores unmentioned, plain-text @bot, broadcast @_all, or undefined-trigger group events", async () => {
@@ -1216,7 +1531,7 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
       const registrationOrder: string[] = [];
       vi.mocked(h.backend.registerAndResolveInbound).mockImplementation(
         async (req) => {
-          // Simulate a 25ms I-1 database round-trip (longer than the old 10ms timer)
+          // Simulate a 25ms I-1 database round-trip
           await new Promise((r) => setTimeout(r, 25));
           registrationOrder.push(req.message_id);
           return defaultImpl(req);
@@ -1926,9 +2241,20 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
     expect(received[2]).toMatchObject({
       messageId: "om_identity_plain_command",
       chatType: "group",
-      isGroupTrigger: true,
+      isGroupTrigger: false,
       text: "/stop",
     });
+
+    const h = createTestHarness();
+    try {
+      await h.app.orchestrator.handleInboundEvent(received[0]!);
+      await h.app.orchestrator.handleInboundEvent(received[2]!);
+      expect(h.backend.registerAndResolveInbound).not.toHaveBeenCalled();
+      expect(h.backend.sessionCommand).not.toHaveBeenCalled();
+      expect(h.feishuAdapter.sentTexts).toHaveLength(0);
+    } finally {
+      await h.cleanup();
+    }
   });
 
   it("keeps same-conversation arrival order when bot identity lookup is delayed so the message after /workspace uses the new workspace", async () => {
@@ -1987,8 +2313,14 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
           chat_id: "oc_grp_order",
           chat_type: "group",
           message_type: "text",
-          content: JSON.stringify({ text: "/workspace W2" }),
-          mentions: [],
+          content: JSON.stringify({ text: "@_user_1 /workspace W2" }),
+          mentions: [
+            {
+              key: "@_user_1",
+              id: { open_id: BOT_OPEN_ID },
+              name: "DaltonBot",
+            },
+          ],
         },
       });
       const second = adapter.receiveRawEvent({
@@ -2882,7 +3214,348 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
     }
   });
 
-  it("turns a streamed size_exceeded attachment failure into a terminal limit notice and does not retry it on startup recovery", async () => {
+  it("preserves same-name other user mentions and plain-text @DaltonBot across text, post, wrapped post, and interactive card with empty or non-empty mentions so mentioning another DaltonBot before /stop does not cancel", async () => {
+    const botMention = {
+      key: "@_user_1",
+      id: { open_id: BOT_OPEN_ID },
+      name: "DaltonBot",
+    };
+    const otherSameNameMention = {
+      key: "@_user_2",
+      id: { open_id: "ou_other" },
+      name: "DaltonBot",
+    };
+
+    expect(
+      normalizeMentions(
+        "@_user_1 @_user_2 /stop",
+        [botMention, otherSameNameMention],
+        BOT_OPEN_ID,
+      ),
+    ).toBe("@DaltonBot /stop");
+    expect(
+      normalizeMentions(
+        "@_user_1 @_user_2 /stop",
+        [otherSameNameMention, botMention],
+        BOT_OPEN_ID,
+      ),
+    ).toBe("@DaltonBot /stop");
+    expect(
+      normalizeMentions(
+        "@_user_1 @DaltonBot /stop",
+        [botMention],
+        BOT_OPEN_ID,
+      ),
+    ).toBe("@DaltonBot /stop");
+
+    const postSameNameContent = JSON.stringify({
+      content: [
+        [
+          { tag: "at", user_id: BOT_OPEN_ID, user_name: "DaltonBot" },
+          { tag: "at", user_id: "ou_other", user_name: "DaltonBot" },
+          { tag: "text", text: " /stop" },
+        ],
+      ],
+    });
+    const wrappedPostSameNameContent = JSON.stringify({
+      post: {
+        zh_cn: {
+          title: "",
+          content: [
+            [
+              { tag: "at", open_id: BOT_OPEN_ID, user_name: "DaltonBot" },
+              { tag: "at", open_id: "ou_other", user_name: "DaltonBot" },
+              { tag: "text", text: " /stop" },
+            ],
+          ],
+        },
+      },
+    });
+    const interactiveCardSameNameContent = JSON.stringify({
+      elements: [
+        [
+          { tag: "at", user_id: BOT_OPEN_ID, user_name: "DaltonBot" },
+          { tag: "at", user_id: "ou_other", user_name: "DaltonBot" },
+          { tag: "text", text: " /stop" },
+        ],
+      ],
+    });
+    const postPlainSameNameContent = JSON.stringify({
+      content: [
+        [
+          { tag: "at", user_id: BOT_OPEN_ID, user_name: "DaltonBot" },
+          { tag: "text", text: " @DaltonBot /stop" },
+        ],
+      ],
+    });
+
+    for (const mentions of [
+      [] as FeishuMentionItem[],
+      [botMention],
+      [botMention, otherSameNameMention],
+      [otherSameNameMention, botMention],
+    ]) {
+      for (const [label, messageType, content] of [
+        ["post", "post", postSameNameContent],
+        ["wrapped_post", "post", wrappedPostSameNameContent],
+        ["card_elements", "interactive", interactiveCardSameNameContent],
+        ["card_fallback", "interactive", wrappedPostSameNameContent],
+        ["post_plain_name", "post", postPlainSameNameContent],
+      ] as const) {
+        const parsed = parseFeishuInboundEvent(
+          {
+            sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+            message: {
+              message_id: `om_same_name_${label}_${mentions.length}`,
+              chat_id: "oc_grp_same_name",
+              chat_type: "group",
+              message_type: messageType,
+              content,
+              mentions,
+            },
+          },
+          { botOpenId: BOT_OPEN_ID },
+        );
+        expect(parsed?.isGroupTrigger).toBe(true);
+        expect(parsed?.text).toBe("@DaltonBot /stop");
+        expect(parsed?.commandText).toBe("@DaltonBot /stop");
+      }
+    }
+
+    const textSameNameEvent = parseFeishuInboundEvent(
+      {
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_text_same_name_1",
+          chat_id: "oc_grp_same_name",
+          chat_type: "group",
+          message_type: "text",
+          content: JSON.stringify({ text: "@_user_1 @_user_2 /stop" }),
+          mentions: [botMention, otherSameNameMention],
+        },
+      },
+      { botOpenId: BOT_OPEN_ID },
+    );
+    expect(textSameNameEvent?.isGroupTrigger).toBe(true);
+    expect(textSameNameEvent?.text).toBe("@DaltonBot /stop");
+    expect(textSameNameEvent?.commandText).toBe("@DaltonBot /stop");
+
+    const h = createTestHarness();
+    try {
+      const feishuAdapter = new FeishuChannelAdapter({
+        appId: "cli_test_app",
+        appSecret: "sec_test_secret",
+        botOpenId: BOT_OPEN_ID,
+        client: createFakeLarkClient().client,
+      });
+      feishuAdapter.onInboundEvent(async (ev) => {
+        await h.app.orchestrator.handleInboundEvent(ev);
+      });
+
+      // Mentioning bot + same-name other user followed by " /stop" with non-empty mentions must NOT execute /stop
+      await feishuAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_entry_same_name_nonempty",
+          chat_id: "oc_grp_same_name_entry",
+          chat_type: "group",
+          message_type: "post",
+          content: postSameNameContent,
+          mentions: [botMention, otherSameNameMention],
+        },
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(h.backend.cancelThreadTurn).not.toHaveBeenCalled();
+      expect(
+        vi
+          .mocked(h.backend.sessionCommand)
+          .mock.calls.some(([req]) => req.cmd === "stop"),
+      ).toBe(false);
+      expect(h.backend.appendCalls).toHaveLength(1);
+      expect(
+        JSON.stringify(h.backend.appendCalls[0]?.payload.messages[0]?.content),
+      ).toContain("@DaltonBot /stop");
+
+      // Also verify with empty mentions
+      await feishuAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_entry_same_name_empty",
+          chat_id: "oc_grp_same_name_entry",
+          chat_type: "group",
+          message_type: "post",
+          content: postSameNameContent,
+          mentions: [],
+        },
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(h.backend.cancelThreadTurn).not.toHaveBeenCalled();
+      expect(h.backend.appendCalls).toHaveLength(2);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("extracts unescaped commandText for rich-text post slash commands while keeping Markdown rendering for normal conversation and preserving legitimate backslashes", async () => {
+    const postBotCommand = (rawArg: string) =>
+      JSON.stringify({
+        content: [
+          [
+            { tag: "at", user_id: BOT_OPEN_ID, user_name: "DaltonBot" },
+            { tag: "text", text: ` /workspace ${rawArg}` },
+          ],
+        ],
+      });
+
+    const parsedHyphen = parseFeishuInboundEvent(
+      {
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_post_hyphen_parse",
+          chat_id: "oc_grp_cmd_escape",
+          chat_type: "group",
+          message_type: "post",
+          content: postBotCommand("research-2026"),
+          mentions: [],
+        },
+      },
+      { botOpenId: BOT_OPEN_ID },
+    );
+    expect(parsedHyphen?.text).toBe("/workspace research\\-2026");
+    expect(parsedHyphen?.commandText).toBe("/workspace research-2026");
+
+    const parsedBackslash = parseFeishuInboundEvent(
+      {
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_post_backslash_parse",
+          chat_id: "oc_grp_cmd_escape",
+          chat_type: "group",
+          message_type: "post",
+          content: postBotCommand(String.raw`domain\team_2026-A`),
+          mentions: [],
+        },
+      },
+      { botOpenId: BOT_OPEN_ID },
+    );
+    expect(parsedBackslash?.commandText).toBe(
+      String.raw`/workspace domain\team_2026-A`,
+    );
+
+    const h = createTestHarness();
+    try {
+      const feishuAdapter = new FeishuChannelAdapter({
+        appId: "cli_test_app",
+        appSecret: "sec_test_secret",
+        botOpenId: BOT_OPEN_ID,
+        client: createFakeLarkClient().client,
+      });
+      feishuAdapter.onInboundEvent(async (ev) => {
+        await h.app.orchestrator.handleInboundEvent(ev);
+      });
+
+      const workspaceQueries = [
+        "research-2026",
+        "quant_alpha_1",
+        "半导体研究-2026_A组",
+        "Macro Research 2026 - Core_1",
+        "99999999-8888-7777-6666-555555555555",
+      ];
+
+      for (let i = 0; i < workspaceQueries.length; i += 1) {
+        const query = workspaceQueries[i]!;
+        await feishuAdapter.receiveRawEvent({
+          sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+          message: {
+            message_id: `om_post_ws_arg_${i}`,
+            chat_id: "oc_grp_cmd_escape",
+            chat_type: "group",
+            message_type: "post",
+            content: postBotCommand(query),
+            mentions: [
+              {
+                key: "@_user_1",
+                id: { open_id: BOT_OPEN_ID },
+                name: "DaltonBot",
+              },
+            ],
+          },
+        });
+      }
+      await new Promise((r) => setTimeout(r, 20));
+
+      const switchQueries = vi
+        .mocked(h.backend.sessionCommand)
+        .mock.calls.filter(([req]) => req.cmd === "workspace_switch")
+        .map(([req]) => req.workspace_query);
+      expect(switchQueries).toEqual(workspaceQueries);
+      expect(h.backend.appendCalls).toHaveLength(0);
+
+      // Mentioning another user before /workspace in post does NOT falsely trigger a slash command
+      await feishuAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_post_other_user_before_cmd",
+          chat_id: "oc_grp_cmd_escape",
+          chat_type: "group",
+          message_type: "post",
+          content: JSON.stringify({
+            content: [
+              [
+                { tag: "at", user_id: BOT_OPEN_ID, user_name: "DaltonBot" },
+                { tag: "at", user_id: "ou_bob", user_name: "Bob" },
+                { tag: "text", text: " /workspace research-2026" },
+              ],
+            ],
+          }),
+          mentions: [],
+        },
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(
+        vi
+          .mocked(h.backend.sessionCommand)
+          .mock.calls.filter(([req]) => req.cmd === "workspace_switch"),
+      ).toHaveLength(workspaceQueries.length);
+      expect(h.backend.appendCalls).toHaveLength(1);
+      expect(h.backend.appendCalls[0]?.payload.messages[0]?.content).toBe(
+        "@Bob /workspace research\\-2026",
+      );
+
+      // Normal conversation post keeps Markdown rendering (bold, links, escaped specials)
+      await feishuAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_post_normal_markdown",
+          chat_id: "oc_dm_cmd_escape",
+          chat_type: "p2p",
+          message_type: "post",
+          content: JSON.stringify({
+            content: [
+              [
+                { tag: "text", text: "Review " },
+                {
+                  tag: "text",
+                  text: "research-2026",
+                  style: { bold: true },
+                },
+                { tag: "text", text: " and model_v1" },
+              ],
+            ],
+          }),
+        },
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(h.backend.appendCalls).toHaveLength(2);
+      expect(h.backend.appendCalls[1]?.payload.messages[0]?.content).toBe(
+        "Review **research\\-2026** and model\\_v1",
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it.each(["stream", "buffer", "arrayBuffer", "rawBuffer", "rawArrayBuffer"] as const)("reports an oversized %s attachment once without retrying it on startup recovery", async (responseType) => {
     const MESSAGE_ID = "om_post_too_large_1";
     const postContent = JSON.stringify({
       content: [[{ tag: "text", text: "请分析附件" }]],
@@ -2894,11 +3567,21 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
     try {
       const { client, calls } = createFakeLarkClient({
         onMessageResourceGet: async () => {
+          const bytes = Buffer.alloc(21 * 1024 * 1024, 7);
+          const headers = { "content-type": "application/pdf" };
+          if (responseType === "rawBuffer") return bytes;
+          if (responseType === "rawArrayBuffer") {
+            return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+          }
+          if (responseType === "buffer") return { data: bytes, headers };
+          if (responseType === "arrayBuffer") {
+            return { data: bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength), headers };
+          }
           const stream = new PassThrough();
-          stream.end(Buffer.alloc(21 * 1024 * 1024, 7));
+          stream.end(bytes);
           return {
             getReadableStream: () => stream,
-            headers: { "content-type": "application/pdf" },
+            headers,
           };
         },
       });
@@ -3491,6 +4174,103 @@ describe("Feishu outbound formatting & chunking", () => {
       ).toBeLessThanOrEqual(FEISHU_CARD_MAX_BYTES);
     }
   });
+
+  it("re-chunks post-routed segments after card table splitting so every chunk stays within 30,720 serialized bytes in its final sendTextChunk format", async () => {
+    const smallTable = "| A | B |\n| - | - |\n| 1 | 2 |";
+    const tenTablesBlock = Array.from({ length: 10 }, () => smallTable).join(
+      "\n\n",
+    );
+    const thousandLinesOf27A = Array.from({ length: 1000 }, () =>
+      "a".repeat(27),
+    ).join("\n");
+    const combinedTenTablesAndLines = `${tenTablesBlock}\n\n${thousandLinesOf27A}`;
+
+    const chunks = chunkFeishuOutboundText(combinedTenTablesAndLines);
+    expect(chunks.length).toBe(4);
+    expect(shouldUseFeishuCard(chunks[0]!)).toBe(true);
+    expect(shouldUseFeishuCard(chunks[1]!)).toBe(true);
+    expect(shouldUseFeishuCard(chunks[2]!)).toBe(false);
+    expect(shouldUseFeishuCard(chunks[3]!)).toBe(false);
+
+    const { client, calls } = createFakeLarkClient();
+    const adapter = new FeishuChannelAdapter({
+      appId: "cli_app_chunk_verify",
+      appSecret: "secret_chunk_verify",
+      client,
+    });
+
+    for (let i = 0; i < chunks.length; i += 1) {
+      await adapter.sendTextChunk({
+        targetAddress: "feishu:oc_group_chunk_verify",
+        text: chunks[i]!,
+        chunkIndex: i,
+        totalChunks: chunks.length,
+      });
+    }
+
+    expect(calls.messageCreate).toHaveLength(chunks.length);
+    expect(calls.messageCreate[0]?.data.msg_type).toBe("interactive");
+    expect(calls.messageCreate[1]?.data.msg_type).toBe("interactive");
+    expect(calls.messageCreate[2]?.data.msg_type).toBe("post");
+    expect(calls.messageCreate[3]?.data.msg_type).toBe("post");
+
+    let deliveredTableCount = 0;
+    let deliveredACount = 0;
+    for (const call of calls.messageCreate) {
+      const byteLen = Buffer.byteLength(call.data.content, "utf8");
+      expect(byteLen).toBeLessThanOrEqual(FEISHU_POST_MAX_BYTES);
+      const parsed = JSON.parse(call.data.content);
+      if (call.data.msg_type === "interactive") {
+        const cardMd = parsed.body.elements[0].content as string;
+        deliveredTableCount += countMarkdownTables(cardMd);
+      } else {
+        const postMd = parsed.zh_cn.content[0][0].text as string;
+        deliveredACount += (postMd.match(/a/g) ?? []).length;
+      }
+    }
+    expect(deliveredTableCount).toBe(10);
+    expect(deliveredACount).toBe(27_000);
+
+    // Also verify mixed tables + multibyte CJK + soft line breaks + quotes
+    const sixTables = Array.from({ length: 6 }, (_, idx) =>
+      `| 指标_${idx + 1} | 数值 |\n| --- | --- |\n| "营收" | ${idx + 1}00 |`,
+    ).join("\n\n");
+    const cjkQuotedLines = Array.from(
+      { length: 600 },
+      (_, idx) => `第${idx + 1}行："核心结论"与"风险提示"——毛利率稳健增长`,
+    ).join("\n");
+    const mixedInput = `${sixTables}\n\n${cjkQuotedLines}`;
+    const mixedChunks = chunkFeishuOutboundText(mixedInput);
+    expect(mixedChunks.length).toBeGreaterThanOrEqual(3);
+
+    calls.messageCreate.length = 0;
+    for (let i = 0; i < mixedChunks.length; i += 1) {
+      await adapter.sendTextChunk({
+        targetAddress: "feishu:oc_group_chunk_verify",
+        text: mixedChunks[i]!,
+        chunkIndex: i,
+        totalChunks: mixedChunks.length,
+      });
+    }
+    expect(calls.messageCreate).toHaveLength(mixedChunks.length);
+    const extractedTexts: string[] = [];
+    for (const call of calls.messageCreate) {
+      expect(Buffer.byteLength(call.data.content, "utf8")).toBeLessThanOrEqual(
+        FEISHU_POST_MAX_BYTES,
+      );
+      const parsed = JSON.parse(call.data.content);
+      if (call.data.msg_type === "interactive") {
+        extractedTexts.push(parsed.body.elements[0].content as string);
+      } else {
+        extractedTexts.push(parsed.zh_cn.content[0][0].text as string);
+      }
+    }
+    const joinedDelivered = extractedTexts.join("\n");
+    expect(joinedDelivered).toContain("指标_1");
+    expect(joinedDelivered).toContain("指标_6");
+    expect(joinedDelivered).toContain("第1行：\"核心结论\"与\"风险提示\"");
+    expect(joinedDelivered).toContain("第600行：\"核心结论\"与\"风险提示\"");
+  });
 });
 
 describe("Feishu outbound sending, media upload/download & error classification", () => {
@@ -3753,7 +4533,7 @@ describe("Feishu outbound sending, media upload/download & error classification"
   });
 
   it("throws ChannelDeliveryError with accurate outcome and code across send and upload stages", async () => {
-    // 1. Rate limit (230020) -> outcome: "rate_limited", code: "rate_limited" (`grok-8`, `codex-12`)
+    // 1. Rate limit (230020) -> outcome: "rate_limited", code: "rate_limited"
     const rateLimitedFake = createFakeLarkClient({
       onMessageCreate: async () => ({
         code: 230020,
@@ -3828,7 +4608,7 @@ describe("Feishu outbound sending, media upload/download & error classification"
       code: "not_allowed",
     } satisfies Partial<ChannelDeliveryError>);
 
-    // 4. Confirmed undelivered non-permission 4xx / business error (230099) -> outcome: "failed", code: "unavailable" (`grok-8`)
+    // 4. Confirmed undelivered non-permission 4xx / business error (230099) -> outcome: "failed", code: "unavailable"
     const badReqFake = createFakeLarkClient({
       onMessageCreate: async () => ({
         code: 230099,
@@ -3880,7 +4660,7 @@ describe("Feishu outbound sending, media upload/download & error classification"
       code: "unavailable",
     } satisfies Partial<ChannelDeliveryError>);
 
-    // 6. Upload-stage timeout / 5xx (message not sent yet) -> outcome: "failed", code: "unavailable" (`codex-12`)
+    // 6. Upload-stage timeout / 5xx (message not sent yet) -> outcome: "failed", code: "unavailable"
     const uploadTimeoutFake = createFakeLarkClient({
       onFileCreate: async () => {
         const err = Object.assign(new Error("upload ETIMEDOUT"), {
@@ -3908,7 +4688,7 @@ describe("Feishu outbound sending, media upload/download & error classification"
       code: "unavailable",
     } satisfies Partial<ChannelDeliveryError>);
 
-    // 7. Missing message_id on code=0 -> outcome: "unknown", code: "unavailable" (`grok-16`)
+    // 7. Missing message_id on code=0 -> outcome: "unknown", code: "unavailable"
     const missingMsgIdFake = createFakeLarkClient({
       onMessageCreate: async () => ({
         code: 0,
@@ -3933,7 +4713,7 @@ describe("Feishu outbound sending, media upload/download & error classification"
       code: "unavailable",
     } satisfies Partial<ChannelDeliveryError>);
 
-    // 8. Truncated/aborted HTTP response stream during send (ERR_BAD_RESPONSE) -> outcome: "unknown" (`codex-5`)
+    // 8. Truncated/aborted HTTP response stream during send (ERR_BAD_RESPONSE) -> outcome: "unknown"
     const badRespSendFake = createFakeLarkClient({
       onMessageCreate: async () => {
         throw Object.assign(new Error("stream has been aborted"), {
@@ -3959,7 +4739,7 @@ describe("Feishu outbound sending, media upload/download & error classification"
       code: "unavailable",
     } satisfies Partial<ChannelDeliveryError>);
 
-    // 9. Truncated/aborted HTTP response stream during upload (ERR_BAD_RESPONSE) -> outcome: "failed" (`codex-5`)
+    // 9. Truncated/aborted HTTP response stream during upload (ERR_BAD_RESPONSE) -> outcome: "failed"
     const badRespUploadFake = createFakeLarkClient({
       onFileCreate: async () => {
         throw Object.assign(new Error("stream has been aborted"), {
@@ -4123,7 +4903,7 @@ describe("Feishu listAvailableChats pagination, seenPageTokens loop guard & chec
     expect(nonMemberCheck.ok).toBe(false);
     expect(nonMemberCheck.message).toContain("not a member");
 
-    // Repeated page_token in chatMembers.get reports incomplete pagination instead of "not a member" (`grok 中-1`)
+    // Repeated page_token in chatMembers.get reports incomplete pagination instead of "not a member"
     const { client: truncatedMembersClient } = createFakeLarkClient({
       onChatGet: async (call) => ({
         code: 0,

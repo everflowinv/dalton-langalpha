@@ -13,7 +13,6 @@
  */
 
 import crypto from "node:crypto";
-import { escapeRegExp } from "../../shared/text.js";
 import type {
   InboundAttachmentDescriptor,
   InboundChannelEvent,
@@ -214,7 +213,10 @@ export function hasUnresolvedGroupMention(
   const messageType = (message.message_type ?? message.msg_type ?? "")
     .trim()
     .toLowerCase();
-  if (messageType === "post" && typeof message.content === "string") {
+  if (
+    (messageType === "post" || messageType === "interactive") &&
+    typeof message.content === "string"
+  ) {
     const mentionedOpenIds = new Set([
       ...parsePostContent(message.content).mentionedOpenIds,
       ...extractPostMentionedOpenIds(message.content),
@@ -229,7 +231,7 @@ export function hasUnresolvedGroupMention(
 
 /**
  * Normalizes Feishu `@_user_N` mention placeholders in message text:
- * - Strips the bot's own `@_user_N` / `@BotName` mention so command prefixes
+ * - Strips the bot's own `@_user_N` placeholder so command prefixes
  *   (e.g. `@Bot /bind 123456`) are clean;
  * - Replaces other user `@_user_N` placeholders with `@DisplayName`.
  */
@@ -245,7 +247,7 @@ export function normalizeMentions(
     return text.trim();
   }
 
-  let result = text;
+  const replacements = new Map<string, string>();
   const normalizedBotId = botStripId?.trim();
 
   for (const mention of mentions) {
@@ -254,25 +256,22 @@ export function normalizeMentions(
     const openId = extractMentionOpenId(mention);
     const isBot = Boolean(normalizedBotId && openId === normalizedBotId);
 
+    if (!key) continue;
     if (isBot) {
-      if (key) {
-        result = result.replace(
-          new RegExp(`\\s*${escapeRegExp(key)}\\s*`, "g"),
-          " ",
-        );
-      }
-      if (name) {
-        result = result.replace(
-          new RegExp(`@${escapeRegExp(name)}\\s*`, "g"),
-          "",
-        );
-      }
+      replacements.set(key, "");
     } else if (key && name) {
-      result = result.replace(new RegExp(escapeRegExp(key), "g"), `@${name}`);
+      replacements.set(key, `@${name}`);
     }
   }
 
-  return result.trim();
+  return text.replace(
+    /(\s*)(@_user_\d+|@_all)(?![A-Za-z0-9_])/g,
+    (match, spacing: string, key: string) => {
+      const replacement = replacements.get(key);
+      if (replacement === undefined) return match;
+      return replacement ? `${spacing}${replacement}` : "";
+    },
+  ).trim();
 }
 
 export function parseMessageContent(
@@ -609,7 +608,7 @@ function resolveTextRetryDedupeKey(
 /**
  * Resolves the canonical deduplication key from a raw Feishu
  * `im.message.receive_v1` event payload, matching
- * `monitor.account-UbN1RhlP.mjs:822-872` (`codex-4`, `grok 高-3`).
+ * `monitor.account-UbN1RhlP.mjs:822-872`.
  */
 export function resolveFeishuMessageDedupeKey(
   rawPayload: unknown,
@@ -713,10 +712,11 @@ export function parseFeishuInboundEvent(
     message.msg_type ??
     "text"
   ).trim();
+  const normalizedMessageType = messageType.toLowerCase();
   const rawContent = typeof message.content === "string" ? message.content : "";
 
   const postParsed =
-    messageType.toLowerCase() === "post"
+    normalizedMessageType === "post" || normalizedMessageType === "interactive"
       ? parsePostContent(rawContent, options.botOpenId)
       : undefined;
 
@@ -735,16 +735,26 @@ export function parseFeishuInboundEvent(
     botOpenId: options.botOpenId,
   });
 
-  const parsedContentText = parseMessageContent(
-    rawContent,
-    messageType,
-    options.botOpenId,
-  );
-  const text = normalizeMentions(
-    parsedContentText,
-    message.mentions,
-    options.botOpenId,
-  );
+  const parsedContentText =
+    normalizedMessageType === "post" && postParsed !== undefined
+      ? postParsed.textContent
+      : parseMessageContent(rawContent, messageType, options.botOpenId);
+  // Text messages encode mentions as placeholders; rich formats carry IDs in nodes.
+  const text = normalizedMessageType === "text"
+    ? normalizeMentions(parsedContentText, message.mentions, options.botOpenId)
+    : parsedContentText.trim();
+  const rawCommandCandidate =
+    normalizedMessageType === "post" && postParsed !== undefined
+      ? (postParsed.commandText ?? postParsed.textContent)
+      : normalizedMessageType === "interactive" &&
+          postParsed !== undefined &&
+          postParsed.textContent.trim() !== "[Rich text message]" &&
+          parsedContentText === postParsed.textContent.trim()
+        ? (postParsed.commandText ?? parsedContentText)
+        : parsedContentText;
+  const commandText = normalizedMessageType === "text"
+    ? normalizeMentions(rawCommandCandidate, message.mentions, options.botOpenId)
+    : rawCommandCandidate.trim();
 
   const attachments = extractInboundAttachments(rawContent, messageType);
 
@@ -764,7 +774,7 @@ export function parseFeishuInboundEvent(
     }),
     messageId,
     text,
-    commandText: text,
+    commandText,
     isGroupTrigger: chatType === "group" ? mentionsBot : undefined,
     attachments: attachments.length > 0 ? attachments : undefined,
     rawPayload: rawPayload as Record<string, unknown>,
