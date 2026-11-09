@@ -6373,7 +6373,7 @@ def test_pr11_seed_openclaw_data_script_dry_run_and_apply_exclusions(
     - Does NOT sync unlisted directories/files (`memory/`, `media/`, `wiki/`, `backups/`, `markx/`,
       unlisted scripts, or unlisted skills);
     - Excludes `venv/`, `.venv/`, `cos-venv/`, `pending.json`, `*inflight*`, `.git/`, and `.dalton-freeze/`,
-      and creates the `state/sentiment-dashboard/cos-venv/bin/python -> /app/.venv/bin/python` symlink.
+      and creates a Python launcher that executes `/app/.venv/bin/python`.
     """
     import subprocess
 
@@ -6448,7 +6448,7 @@ def test_pr11_seed_openclaw_data_script_dry_run_and_apply_exclusions(
     extra_target_file = dst_dir / "existing_only_in_target" / "keep_me.txt"
     extra_target_file.write_text("preserved", encoding="utf-8")
 
-    # 2. --apply mode syncs ONLY allowed manifest paths, excludes forbidden paths, and creates symlink
+    # 2. --apply syncs allowed paths, excludes forbidden paths, and installs the launcher.
     apply_res = subprocess.run(
         [
             "bash",
@@ -6489,12 +6489,12 @@ def test_pr11_seed_openclaw_data_script_dry_run_and_apply_exclusions(
     assert not (dst_dir / "scripts" / "e_watch_monitor.py").exists()
     assert not (dst_dir / "skills" / "quantum-ew-bottom-monitor").exists()
 
-    # Symlink state/sentiment-dashboard/cos-venv/bin/python -> /app/.venv/bin/python must exist
-    symlink_path = (
+    launcher_path = (
         dst_dir / "state" / "sentiment-dashboard" / "cos-venv" / "bin" / "python"
     )
-    assert symlink_path.is_symlink()
-    assert os.readlink(symlink_path) == "/app/.venv/bin/python"
+    assert launcher_path.is_file() and not launcher_path.is_symlink()
+    assert launcher_path.stat().st_mode & 0o777 == 0o755
+    assert launcher_path.read_text() == '#!/bin/sh\nexec /app/.venv/bin/python "$@"\n'
 
     # Overlay script scripts/feishu_send_card.py must be printed in --dry-run and overlaid in --apply
     assert "DRY-RUN overlay:" in dry_res.stdout
