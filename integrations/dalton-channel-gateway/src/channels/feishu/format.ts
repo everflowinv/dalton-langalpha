@@ -131,36 +131,42 @@ function collectSoftBreakOffsets(
   tree: FeishuMarkdownAstNode,
   text: string,
 ): number[] {
-  const offsets = new Set<number>();
+  const offsets: number[] = [];
   visitFeishuMarkdown(tree, (node) => {
-    if (node.type !== "text" || typeof (node as { value?: unknown }).value !== "string") {
+    if (node.type !== "text") {
       return;
     }
-    const value = (node as unknown as { value: string }).value;
-    const startOffset = node.position?.start?.offset;
-    if (typeof startOffset !== "number") {
+    const start = node.position?.start?.offset;
+    const end = node.position?.end?.offset;
+    if (typeof start !== "number" || typeof end !== "number") {
       return;
     }
-    for (let index = 0; index < value.length; index += 1) {
-      if (value[index] !== "\n") {
+    for (let offset = start; offset < end; offset += 1) {
+      const char = text[offset];
+      if (char === "\n") {
+        if (text[offset - 1] !== "\r") {
+          offsets.push(offset);
+        }
         continue;
       }
-      const lineBreakOffset = startOffset + index;
-      if (text[lineBreakOffset] === "\n") {
-        offsets.add(lineBreakOffset);
+      if (char === "\r") {
+        offsets.push(offset);
+        if (text[offset + 1] === "\n") {
+          offset += 1;
+        }
       }
     }
   });
-  return [...offsets].sort((left, right) => left - right);
+  return offsets.sort((left, right) => left - right);
 }
 
 /**
  * Materializes Markdown soft line breaks inside AST text nodes by appending
- * two trailing spaces (`"  "`) before `\n` (or `\r\n`), preserving list/blockquote
+ * two trailing spaces (`"  "`) before `\n` (or `\r\n` / `\r`), preserving list/blockquote
  * structure instead of inserting blank lines (`reply-delivery-result-iCCrdxE1.mjs:495-536`).
  */
 export function materializeFeishuPostMarkdownSoftBreaks(text: string): string {
-  if (!text.includes("\n")) {
+  if (!text.includes("\n") && !text.includes("\r")) {
     return text;
   }
   const softBreakOffsets = collectSoftBreakOffsets(
@@ -172,13 +178,14 @@ export function materializeFeishuPostMarkdownSoftBreaks(text: string): string {
   }
   let cursor = 0;
   let output = "";
-  for (const lineBreakOffset of softBreakOffsets) {
-    const hasCarriageReturn =
-      lineBreakOffset > cursor && text[lineBreakOffset - 1] === "\r";
-    const breakStart = hasCarriageReturn
-      ? lineBreakOffset - 1
-      : lineBreakOffset;
-    let trimmedBreakStart = breakStart;
+  for (const offset of softBreakOffsets) {
+    const lineEnding =
+      text[offset] === "\r"
+        ? text[offset + 1] === "\n"
+          ? "\r\n"
+          : "\r"
+        : "\n";
+    let trimmedBreakStart = offset;
     while (
       trimmedBreakStart > cursor &&
       (text[trimmedBreakStart - 1] === " " ||
@@ -187,8 +194,8 @@ export function materializeFeishuPostMarkdownSoftBreaks(text: string): string {
       trimmedBreakStart -= 1;
     }
     output += text.slice(cursor, trimmedBreakStart);
-    output += `  ${hasCarriageReturn ? "\r\n" : "\n"}`;
-    cursor = lineBreakOffset + 1;
+    output += `  ${lineEnding}`;
+    cursor = offset + lineEnding.length;
   }
   output += text.slice(cursor);
   return output;
@@ -455,38 +462,34 @@ export function chunkFeishuMarkdownByEnvelope(
         currentLimit,
         chunkMode,
       );
-      if (candidates.length > 1 && candidates.every(options.fits)) {
-        return candidates;
-      }
-      if (
-        candidates.length > 1 &&
-        candidates[0] &&
-        options.fits(candidates[0])
-      ) {
-        const first = candidates[0];
-        const rest = segment.slice(first.length).replace(/^\n+/, "");
-        if (!rest || rest.length === segment.length) {
-          break;
+      let largestContentBytes = 0;
+      let oversizedChunk: string | undefined;
+      for (const chunk of candidates) {
+        const bytes = options.payloadBytes
+          ? options.payloadBytes(chunk)
+          : Buffer.byteLength(chunk, "utf8") * 2;
+        largestContentBytes = Math.max(largestContentBytes, bytes);
+        if (!options.fits(chunk) && oversizedChunk === undefined) {
+          oversizedChunk = chunk;
         }
-        return [first, ...splitOversizedSegment(rest)];
+      }
+      if (oversizedChunk === undefined && candidates.length > 0) {
+        return candidates;
       }
       if (currentLimit === 1) {
         break;
       }
-      const firstCandidate = candidates[0] ?? segment;
-      const actualBytes = options.payloadBytes
-        ? options.payloadBytes(firstCandidate)
-        : Buffer.byteLength(firstCandidate, "utf8") * 2;
       const targetMaxBytes = options.maxBytes ?? initialLimit;
-      const reductionRatio =
-        actualBytes > targetMaxBytes && actualBytes > 0
-          ? (targetMaxBytes / actualBytes) * 0.9
-          : 0.5;
-      const nextLimit = Math.max(
-        1,
-        Math.floor(currentLimit * Math.min(0.75, reductionRatio)),
+      const effectiveBase = Math.min(
+        currentLimit,
+        (oversizedChunk ?? segment).length,
       );
-      currentLimit = nextLimit < currentLimit ? nextLimit : currentLimit - 1;
+      const ratioLimit =
+        largestContentBytes > targetMaxBytes && largestContentBytes > 0
+          ? Math.floor((effectiveBase * targetMaxBytes) / largestContentBytes) -
+            1
+          : Math.floor(effectiveBase * 0.75);
+      currentLimit = Math.max(1, Math.min(currentLimit - 1, ratioLimit));
     }
 
     let low = 1;

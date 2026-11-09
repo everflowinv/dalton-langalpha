@@ -247,19 +247,25 @@ export async function readStreamWithLimit(
     readNext = () => iterator.next();
     cancelSource = async () => {
       try {
-        if (typeof iterator.return === "function") {
-          await iterator.return();
-        }
-      } catch {
-        // Ignore iterator closure errors
-      }
-      try {
         const destroyable = stream as { destroy?: () => void };
         if (typeof destroyable.destroy === "function") {
           destroyable.destroy();
         }
       } catch {
         // Ignore destroy errors
+      }
+      try {
+        if (typeof iterator.return === "function") {
+          await Promise.race([
+            iterator.return(),
+            new Promise<void>((resolve) => {
+              const timer = setTimeout(resolve, 50);
+              timer.unref?.();
+            }),
+          ]);
+        }
+      } catch {
+        // Ignore iterator closure errors
       }
     };
     releaseSource = async () => {

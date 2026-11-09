@@ -136,10 +136,12 @@ export function normalizeMultipartUploadData(opts: unknown): unknown {
     const fileName =
       typeof coercedData.file_name === "string" && coercedData.file_name.trim()
         ? coercedData.file_name.trim()
-        : "upload.bin";
+        : undefined;
     for (const [key, value] of entries) {
       if (Buffer.isBuffer(value)) {
-        formData.append(key, new Blob([bufferToBlobPart(value)]), fileName);
+        const blobName =
+          key === "file" && fileName ? fileName : `${key}.bin`;
+        formData.append(key, new Blob([bufferToBlobPart(value)]), blobName);
         continue;
       }
       if (

@@ -140,7 +140,6 @@ export async function monitorWebSocket(
   const logger = options.logger ?? createSubsystemLogger("feishu/monitor");
   const dedupe = options.dedupe ?? createMemoryDedupe();
   const queue = options.queue ?? createSequentialQueue();
-  const inFlightDedupeKeys = new Set<string>();
   let currentBotOpenId = options.botOpenId?.trim() || undefined;
   let wsConnected = false;
   let stopped = false;
@@ -177,10 +176,7 @@ export async function monitorWebSocket(
       rawPayload,
       options.creds.accountId,
     );
-    if (
-      dedupeKey &&
-      (dedupe.peek(dedupeKey) || inFlightDedupeKeys.has(dedupeKey))
-    ) {
+    if (dedupeKey && dedupe.peek(dedupeKey)) {
       logger.debug("Skipping duplicate Feishu inbound message", { dedupeKey });
       return;
     }
@@ -202,69 +198,40 @@ export async function monitorWebSocket(
       return;
     }
 
-    if (dedupeKey) {
-      inFlightDedupeKeys.add(dedupeKey);
-    }
-
-    let turnPromise: Promise<void> | undefined;
-    try {
-      await queue.enqueue(parsed.threadScopeKey, async () => {
-        if (dedupeKey && dedupe.peek(dedupeKey)) {
-          return;
-        }
-        if (
-          messageType === "merge_forward" &&
-          options.client &&
-          parsed.text === "[Merged and Forwarded Message]"
-        ) {
-          const fetched = await getMessageFeishu(options.client, {
-            messageId: parsed.messageId,
-          });
-          if (fetched?.content) {
-            parsed.text = fetched.content;
-          }
-        }
-
-        turnPromise = (async () => {
-          try {
-            await options.onEvent(parsed);
-            if (dedupeKey) {
-              dedupe.record(dedupeKey);
-            }
-          } catch (err) {
-            if (dedupeKey) {
-              dedupe.delete(dedupeKey);
-            }
-            logger.error("Feishu inbound handler error", {
-              messageId: parsed.messageId,
-              threadScopeKey: parsed.threadScopeKey,
-              error: err,
-            });
-          } finally {
-            if (dedupeKey) {
-              inFlightDedupeKeys.delete(dedupeKey);
-            }
-          }
-        })();
-
-        // Hold the per-conversation sequential queue only across the initial
-        // admission/registration handoff window (`codex-4`), then release it
-        // so mid-turn interjections and `/stop` are not blocked by a model turn.
-        await Promise.race([
-          turnPromise,
-          new Promise<void>((resolve) => setTimeout(resolve, 10)),
-        ]);
-      });
-    } catch (err) {
-      if (dedupeKey) {
-        inFlightDedupeKeys.delete(dedupeKey);
+    await queue.enqueue(parsed.threadScopeKey, async () => {
+      if (dedupeKey && dedupe.peek(dedupeKey)) {
+        return;
       }
-      throw err;
-    }
+      if (
+        messageType === "merge_forward" &&
+        options.client &&
+        parsed.text === "[Merged and Forwarded Message]"
+      ) {
+        const fetched = await getMessageFeishu(options.client, {
+          messageId: parsed.messageId,
+        });
+        if (fetched?.content) {
+          parsed.text = fetched.content;
+        }
+      }
 
-    if (turnPromise) {
-      await turnPromise;
-    }
+      try {
+        await options.onEvent(parsed);
+        if (dedupeKey) {
+          dedupe.record(dedupeKey);
+        }
+      } catch (err) {
+        if (dedupeKey) {
+          dedupe.delete(dedupeKey);
+        }
+        logger.error("Feishu inbound handler error", {
+          messageId: parsed.messageId,
+          threadScopeKey: parsed.threadScopeKey,
+          error: err,
+        });
+        throw err;
+      }
+    });
   };
 
   eventDispatcher.register({
@@ -340,7 +307,6 @@ export class FeishuChannelAdapter implements ChannelAdapter {
     creds: Pick<FeishuCredentials, "encryptKey" | "verificationToken">,
   ) => Lark.EventDispatcher;
   private readonly dedupe: MemoryDedupeGuard;
-  private readonly inFlightDedupeKeys = new Set<string>();
   private readonly queue: SequentialQueue;
   private readonly logger: SubsystemLogger;
   private readonly handlers: Array<(event: InboundChannelEvent) => Promise<void>> =
@@ -497,10 +463,7 @@ export class FeishuChannelAdapter implements ChannelAdapter {
       return;
     }
     const dedupeKey = resolveFeishuMessageDedupeKey(rawPayload);
-    if (
-      dedupeKey &&
-      (this.dedupe.peek(dedupeKey) || this.inFlightDedupeKeys.has(dedupeKey))
-    ) {
+    if (dedupeKey && this.dedupe.peek(dedupeKey)) {
       return;
     }
 
@@ -521,68 +484,42 @@ export class FeishuChannelAdapter implements ChannelAdapter {
       return;
     }
 
-    if (dedupeKey) {
-      this.inFlightDedupeKeys.add(dedupeKey);
-    }
-
-    let turnPromise: Promise<void> | undefined;
-    try {
-      await this.queue.enqueue(parsed.threadScopeKey, async () => {
-        if (dedupeKey && this.dedupe.peek(dedupeKey)) {
-          return;
-        }
-        if (
-          messageType === "merge_forward" &&
-          this.clientInstance &&
-          parsed.text === "[Merged and Forwarded Message]"
-        ) {
-          const fetched = await getMessageFeishu(this.clientInstance, {
-            messageId: parsed.messageId,
-          });
-          if (fetched?.content) {
-            parsed.text = fetched.content;
-          }
-        }
-
-        turnPromise = (async () => {
-          try {
-            for (const handler of this.handlers) {
-              await handler(parsed);
-            }
-            if (dedupeKey) {
-              this.dedupe.record(dedupeKey);
-            }
-          } catch (err) {
-            if (dedupeKey) {
-              this.dedupe.delete(dedupeKey);
-            }
-            this.logger.error("Feishu inbound handler error", {
-              messageId: parsed.messageId,
-              threadScopeKey: parsed.threadScopeKey,
-              error: err,
-            });
-          } finally {
-            if (dedupeKey) {
-              this.inFlightDedupeKeys.delete(dedupeKey);
-            }
-          }
-        })();
-
-        await Promise.race([
-          turnPromise,
-          new Promise<void>((resolve) => setTimeout(resolve, 10)),
-        ]);
-      });
-    } catch (err) {
-      if (dedupeKey) {
-        this.inFlightDedupeKeys.delete(dedupeKey);
+    await this.queue.enqueue(parsed.threadScopeKey, async () => {
+      if (dedupeKey && this.dedupe.peek(dedupeKey)) {
+        return;
       }
-      throw err;
-    }
+      if (
+        messageType === "merge_forward" &&
+        this.clientInstance &&
+        parsed.text === "[Merged and Forwarded Message]"
+      ) {
+        const fetched = await getMessageFeishu(this.clientInstance, {
+          messageId: parsed.messageId,
+        });
+        if (fetched?.content) {
+          parsed.text = fetched.content;
+        }
+      }
 
-    if (turnPromise) {
-      await turnPromise;
-    }
+      try {
+        for (const handler of this.handlers) {
+          await handler(parsed);
+        }
+        if (dedupeKey) {
+          this.dedupe.record(dedupeKey);
+        }
+      } catch (err) {
+        if (dedupeKey) {
+          this.dedupe.delete(dedupeKey);
+        }
+        this.logger.error("Feishu inbound handler error", {
+          messageId: parsed.messageId,
+          threadScopeKey: parsed.threadScopeKey,
+          error: err,
+        });
+        throw err;
+      }
+    });
   }
 
   splitTextChunks(text: string): string[] {

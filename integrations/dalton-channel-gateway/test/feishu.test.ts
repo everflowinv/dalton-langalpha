@@ -1,3 +1,4 @@
+import { PassThrough } from "node:stream";
 import type * as Lark from "@larksuiteoapi/node-sdk";
 import { describe, expect, it, vi } from "vitest";
 import { ChannelDeliveryError } from "../src/channels/adapter.js";
@@ -9,6 +10,7 @@ import {
   buildStructuredCard,
   checkBotMentioned,
   chunkFeishuCardMarkdown,
+  chunkFeishuOutboundText,
   chunkFeishuPostMarkdown,
   countMarkdownTables,
   createFeishuSdkLogger,
@@ -57,6 +59,13 @@ import {
 import { downloadWorkspaceFileToBuffer } from "../src/shared/workspace-download.js";
 import { uploadAttachmentToWorkspace } from "../src/shared/workspace-upload.js";
 import type { InboundChannelEvent } from "../src/types.js";
+import {
+  createTestHarness,
+  makeSseEventsFromFixture,
+  RUN_ID,
+  THREAD_ID,
+  USER_ID,
+} from "./helpers.js";
 
 // --- Realistic Lark.Client Test Double (Strict Method Signatures) ---
 
@@ -161,6 +170,7 @@ function createFakeLarkClient(overrides?: {
       };
     }>;
     onMessageGet?: (call: {
+      params?: { card_msg_content_type?: string };
       path: { message_id: string };
     }) => Promise<{
       code?: number;
@@ -178,7 +188,10 @@ function createFakeLarkClient(overrides?: {
     const calls = {
       messageCreate: [] as MessageCreateCall[],
       messageReply: [] as MessageReplyCall[],
-      messageGet: [] as Array<{ path: { message_id: string } }>,
+      messageGet: [] as Array<{
+        params?: { card_msg_content_type?: string };
+        path: { message_id: string };
+      }>,
       imageCreate: [] as ImageCreateCall[],
       fileCreate: [] as FileCreateCall[],
       messageResourceGet: [] as MessageResourceGetCall[],
@@ -231,7 +244,10 @@ function createFakeLarkClient(overrides?: {
               data: { message_id: `om_replied_${seq++}` },
             };
           },
-          get: async (call: { path: { message_id: string } }) => {
+          get: async (call: {
+            params?: { card_msg_content_type?: string };
+            path: { message_id: string };
+          }) => {
             calls.messageGet.push(call);
             if (overrides?.onMessageGet) {
               return overrides.onMessageGet(call);
@@ -624,23 +640,23 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
     ]);
   });
 
-  it("fetches merge_forward sub-messages via im.message.get when push payload only contains placeholder", async () => {
+  it("fetches merge_forward sub-messages via im.message.get with card_msg_content_type=user_card_content even when container is not items[0]", async () => {
     const { client, calls } = createFakeLarkClient({
       onMessageGet: async () => ({
         code: 0,
         data: {
           items: [
             {
-              message_id: "om_merge_api_1",
-              msg_type: "merge_forward",
-              body: { content: "Merged and Forwarded Message" },
-            },
-            {
               message_id: "om_sub_2",
               upper_message_id: "om_merge_api_1",
               create_time: "2000",
               msg_type: "text",
               body: { content: JSON.stringify({ text: "Second sub-message" }) },
+            },
+            {
+              message_id: "om_merge_api_1",
+              msg_type: "merge_forward",
+              body: { content: "Merged and Forwarded Message" },
             },
             {
               message_id: "om_sub_1",
@@ -674,14 +690,87 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
       },
     });
     expect(calls.messageGet).toHaveLength(1);
+    expect(calls.messageGet[0]).toEqual({
+      params: { card_msg_content_type: "user_card_content" },
+      path: { message_id: "om_merge_api_1" },
+    });
     expect(receivedMerge).toHaveLength(1);
     expect(receivedMerge[0]?.text).toBe(
       "[Merged and Forwarded Messages]\n- First sub-message\n- Second sub-message",
     );
   });
 
-  it("builds composite Feishu dedupe keys for text, media (file_key/image_key), post (thread_id/root_id), and message_id-less retries", () => {
-    const textPayload = {
+  it("treats group slash commands (/bind, /unbind, /workspace, /new, /stop) without @bot as group triggers and revokes leaked group bind codes", async () => {
+    const groupBindEvent = parseFeishuInboundEvent(
+      {
+        sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
+        message: {
+          message_id: "om_grp_bind_1",
+          chat_id: "oc_grp_1",
+          chat_type: "group",
+          message_type: "text",
+          content: JSON.stringify({ text: "/bind 123456" }),
+        },
+      },
+      { botOpenId: BOT_OPEN_ID },
+    );
+    expect(groupBindEvent?.isGroupTrigger).toBe(true);
+
+    for (const cmd of ["/workspace", "/workspace list", "/new", "/stop", "/unbind"]) {
+      const ev = parseFeishuInboundEvent(
+        {
+          sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
+          message: {
+            message_id: `om_grp_${cmd}`,
+            chat_id: "oc_grp_1",
+            chat_type: "group",
+            message_type: "text",
+            content: JSON.stringify({ text: cmd }),
+          },
+        },
+        { botOpenId: BOT_OPEN_ID },
+      );
+      expect(ev?.isGroupTrigger).toBe(true);
+    }
+
+    const nonTriggerGroupEvent = parseFeishuInboundEvent(
+      {
+        sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
+        message: {
+          message_id: "om_grp_plain_1",
+          chat_id: "oc_grp_1",
+          chat_type: "group",
+          message_type: "text",
+          content: JSON.stringify({ text: "casual chat without mention" }),
+        },
+      },
+      { botOpenId: BOT_OPEN_ID },
+    );
+    expect(nonTriggerGroupEvent?.isGroupTrigger).toBe(false);
+
+    const h = createTestHarness();
+    try {
+      vi.mocked(h.backend.consumeBindCode).mockResolvedValueOnce({
+        ok: false,
+        reason: "revoked_in_group",
+      });
+      await h.feishuAdapter.emitInbound(groupBindEvent!);
+      expect(h.backend.consumeBindCode).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: "bind",
+          platform: "feishu",
+          code: "123456",
+          is_group: true,
+        }),
+      );
+      expect(h.feishuAdapter.sentTexts.at(-1)?.text).toContain("revoked");
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("builds Feishu dedupe keys matching monitor.account-UbN1RhlP.mjs:858-872 across media, text retries, and post topics", async () => {
+    const textWithoutCreateTime = {
       sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
       message: {
         message_id: "om_dup_100",
@@ -691,21 +780,40 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
         content: JSON.stringify({ text: "Hello once" }),
       },
     };
-    expect(resolveFeishuMessageDedupeKey(textPayload)).toBe("feishu:om_dup_100");
+    expect(resolveFeishuMessageDedupeKey(textWithoutCreateTime)).toBe("om_dup_100");
 
-    expect(
-      resolveFeishuMessageDedupeKey({
-        sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
-        message: {
-          message_id: "om_img_dup_1",
-          chat_id: "oc_dm_1",
-          chat_type: "p2p",
-          message_type: "image",
-          content: JSON.stringify({ image_key: "img_v3_dup" }),
-        },
-      }),
-    ).toBe("feishu:media:image:img:img_v3_dup");
+    // Media messages include messageId + mediaParts so distinct messages sending the same image are NOT dropped
+    const imgMsg1 = {
+      sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
+      message: {
+        message_id: "om_img_dup_1",
+        chat_id: "oc_dm_1",
+        chat_type: "p2p",
+        message_type: "image",
+        content: JSON.stringify({ image_key: "img_v3_dup" }),
+      },
+    };
+    const imgMsg2 = {
+      sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
+      message: {
+        message_id: "om_img_dup_2",
+        chat_id: "oc_dm_1",
+        chat_type: "p2p",
+        message_type: "image",
+        content: JSON.stringify({ image_key: "img_v3_dup" }),
+      },
+    };
+    expect(resolveFeishuMessageDedupeKey(imgMsg1)).toBe(
+      JSON.stringify(["om_img_dup_1", "image_key:img_v3_dup"]),
+    );
+    expect(resolveFeishuMessageDedupeKey(imgMsg2)).toBe(
+      JSON.stringify(["om_img_dup_2", "image_key:img_v3_dup"]),
+    );
+    expect(resolveFeishuMessageDedupeKey(imgMsg1)).not.toBe(
+      resolveFeishuMessageDedupeKey(imgMsg2),
+    );
 
+    // Post message with embedded media uses [messageId, ...mediaParts]
     expect(
       resolveFeishuMessageDedupeKey({
         sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
@@ -723,22 +831,80 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
           }),
         },
       }),
-    ).toBe("feishu:om_post_dup_1:post:omt_99:img:img_post_99");
+    ).toBe(JSON.stringify(["om_post_dup_1", "image_key:img_post_99"]));
 
-    const noIdKey = resolveFeishuMessageDedupeKey({
+    // Text retry with same (sender, chat_id, create_time, content) but different message_id produces the SAME dedupe key
+    const textRetry1 = {
       sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
       message: {
+        message_id: "om_retry_a",
         chat_id: "oc_dm_1",
         chat_type: "p2p",
         create_time: "1700000000",
         message_type: "text",
         content: JSON.stringify({ text: "Retry text" }),
       },
+    };
+    const textRetry2 = {
+      sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
+      message: {
+        message_id: "om_retry_b",
+        chat_id: "oc_dm_1",
+        chat_type: "p2p",
+        create_time: "1700000000",
+        message_type: "text",
+        content: JSON.stringify({ text: "Retry text" }),
+      },
+    };
+    const retryKey1 = resolveFeishuMessageDedupeKey(textRetry1);
+    const retryKey2 = resolveFeishuMessageDedupeKey(textRetry2);
+    expect(retryKey1).toBe(retryKey2);
+    expect(JSON.parse(retryKey1!)).toEqual([
+      "text-retry",
+      "ou_alice_1",
+      "oc_dm_1",
+      "1700000000",
+      expect.stringMatching(/^[0-9a-f]{32}$/),
+    ]);
+
+    // Post without media in a topic wraps [retryKey, topicId]
+    const postTopicKey = resolveFeishuMessageDedupeKey({
+      sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
+      message: {
+        message_id: "om_post_text_1",
+        thread_id: "omt_topic_7",
+        chat_id: "oc_grp_1",
+        chat_type: "group",
+        create_time: "1700000000",
+        message_type: "post",
+        content: JSON.stringify({
+          zh_cn: {
+            title: "T",
+            content: [[{ tag: "text", text: "Hello topic" }]],
+          },
+        }),
+      },
     });
-    expect(noIdKey).toMatch(/^feishu:text:ou_alice_1:oc_dm_1:1700000000:[0-9a-f]{16}$/);
+    const parsedPostTopicKey = JSON.parse(postTopicKey!) as [string, string];
+    expect(parsedPostTopicKey[1]).toBe("omt_topic_7");
+    expect(JSON.parse(parsedPostTopicKey[0])[0]).toBe("text-retry");
+
+    // Missing message_id returns undefined
+    expect(
+      resolveFeishuMessageDedupeKey({
+        sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
+        message: {
+          chat_id: "oc_dm_1",
+          chat_type: "p2p",
+          create_time: "1700000000",
+          message_type: "text",
+          content: JSON.stringify({ text: "No id" }),
+        },
+      }),
+    ).toBeUndefined();
   });
 
-  it("records dedupe key only after handler succeeds and deletes it on handler error so retries can re-run", async () => {
+  it("propagates handler error to SDK (no false ACK), deletes dedupe key on error, and records it only after retry succeeds", async () => {
     const textPayload = {
       sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
       message: {
@@ -769,8 +935,10 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
       received.push(ev);
     });
 
-    // 1st delivery fails -> dedupe key rolled back
-    await adapter.receiveRawEvent(textPayload);
+    // 1st delivery fails -> error is rethrown to SDK (so WSClient replies 500 instead of 200) and dedupe key is rolled back
+    await expect(adapter.receiveRawEvent(textPayload)).rejects.toThrow(
+      "Simulated transient I-1 failure on first delivery",
+    );
     expect(attempts).toBe(1);
     expect(received).toHaveLength(0);
 
@@ -785,63 +953,262 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
     expect(received).toHaveLength(1);
   });
 
-  it("releases per-conversation sequential queue after admission handoff so /stop can enter during an active turn", async () => {
-    const turnAdapter = new FeishuChannelAdapter({
-      appId: "cli_test_app",
-      appSecret: "sec_test_secret",
-      botOpenId: BOT_OPEN_ID,
-    });
-    const timeline: string[] = [];
-    let releaseLongTurn!: () => void;
-    const longTurnGate = new Promise<void>((resolve) => {
-      releaseLongTurn = resolve;
-    });
+  it("returns from adapter inbound callback right after I-1 registration while keeping slow registrations ordered and letting /stop enter during an active model turn", async () => {
+    const h = createTestHarness();
+    try {
+      const feishuAdapter = new FeishuChannelAdapter({
+        appId: "cli_test_app",
+        appSecret: "sec_test_secret",
+        botOpenId: BOT_OPEN_ID,
+        client: createFakeLarkClient().client,
+      });
+      feishuAdapter.onInboundEvent(async (ev) => {
+        await h.app.orchestrator.handleInboundEvent(ev);
+      });
 
-    turnAdapter.onInboundEvent(async (ev: InboundChannelEvent) => {
-      timeline.push(`enter:${ev.messageId}`);
-      if (ev.messageId === "om_turn_1") {
-        await longTurnGate;
-      }
-      timeline.push(`exit:${ev.messageId}`);
-    });
+      const origRegister = h.backend.registerAndResolveInbound;
+      const defaultImpl = vi.mocked(origRegister).getMockImplementation()!;
+      const registrationOrder: string[] = [];
+      vi.mocked(h.backend.registerAndResolveInbound).mockImplementation(
+        async (req) => {
+          // Simulate a 25ms I-1 database round-trip (longer than the old 10ms timer)
+          await new Promise((r) => setTimeout(r, 25));
+          registrationOrder.push(req.message_id);
+          return defaultImpl(req);
+        },
+      );
 
-    const pTurn1 = turnAdapter.receiveRawEvent({
-      sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
-      message: {
-        message_id: "om_turn_1",
-        chat_id: "oc_dm_1",
-        chat_type: "p2p",
-        message_type: "text",
-        content: JSON.stringify({ text: "Run long research task" }),
-      },
-    });
+      let finishSseStream!: () => void;
+      const sseHold = new Promise<void>((resolve) => {
+        finishSseStream = resolve;
+      });
+      vi.mocked(h.backend.appendThreadMessages).mockImplementationOnce(
+        async () => ({
+          status: 200,
+          isSse: true,
+          events: (async function* () {
+            yield {
+              event: "metadata",
+              data: JSON.stringify({
+                thread_id: THREAD_ID,
+                run_id: RUN_ID,
+                turn_index: 1,
+              }),
+            };
+            await sseHold;
+            yield {
+              event: "run_end",
+              data: JSON.stringify({
+                thread_id: THREAD_ID,
+                run_id: RUN_ID,
+                turn_index: 1,
+                outcome: "cancelled",
+              }),
+            };
+          })(),
+        }),
+      );
 
-    // Wait past the 10ms admission handoff window while om_turn_1 is still running
-    await new Promise((r) => setTimeout(r, 25));
+      // 1. Send the long-running turn message; receiveRawEvent returns right after I-1 registration
+      await feishuAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_turn_slow_reg_1",
+          chat_id: "oc_dm_1",
+          chat_type: "p2p",
+          message_type: "text",
+          content: JSON.stringify({ text: "Start deep analysis" }),
+        },
+      });
 
-    const pStop = turnAdapter.receiveRawEvent({
-      sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
-      message: {
-        message_id: "om_stop_2",
-        chat_id: "oc_dm_1",
-        chat_type: "p2p",
-        message_type: "text",
-        content: JSON.stringify({ text: "/stop" }),
-      },
-    });
+      expect(registrationOrder).toEqual(["om_turn_slow_reg_1"]);
+      expect(h.backend.appendCalls).toHaveLength(1);
+      expect(h.backend.cancelThreadTurn).not.toHaveBeenCalled();
 
-    await pStop;
-    // `/stop` entered AND completed while `om_turn_1` is still running!
-    expect(timeline).toEqual(["enter:om_turn_1", "enter:om_stop_2", "exit:om_stop_2"]);
+      // 2. While the model turn is still streaming, send `/stop` on the same conversation
+      await feishuAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_stop_during_turn_2",
+          chat_id: "oc_dm_1",
+          chat_type: "p2p",
+          message_type: "text",
+          content: JSON.stringify({ text: "/stop" }),
+        },
+      });
 
-    releaseLongTurn();
-    await pTurn1;
-    expect(timeline).toEqual([
-      "enter:om_turn_1",
-      "enter:om_stop_2",
-      "exit:om_stop_2",
-      "exit:om_turn_1",
-    ]);
+      expect(registrationOrder).toEqual([
+        "om_turn_slow_reg_1",
+        "om_stop_during_turn_2",
+      ]);
+      expect(h.backend.cancelThreadTurn).toHaveBeenCalledWith(
+        USER_ID,
+        THREAD_ID,
+        RUN_ID,
+      );
+
+      finishSseStream();
+      await new Promise((r) => setTimeout(r, 20));
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("completes the detached model turn in the background after the inbound callback has returned", async () => {
+    const h = createTestHarness();
+    try {
+      const { client, calls } = createFakeLarkClient();
+      const feishuAdapter = new FeishuChannelAdapter({
+        appId: "cli_test_app",
+        appSecret: "sec_test_secret",
+        botOpenId: BOT_OPEN_ID,
+        client,
+      });
+      feishuAdapter.onInboundEvent(async (ev) => {
+        await h.app.orchestrator.handleInboundEvent(ev);
+      });
+
+      let releaseTurnEnd!: () => void;
+      const turnEndGate = new Promise<void>((resolve) => {
+        releaseTurnEnd = resolve;
+      });
+
+      vi.mocked(h.backend.appendThreadMessages).mockImplementationOnce(
+        async () => ({
+          status: 200,
+          isSse: true,
+          events: (async function* () {
+            for await (const ev of makeSseEventsFromFixture([
+              {
+                event: "metadata",
+                data: {
+                  thread_id: THREAD_ID,
+                  run_id: RUN_ID,
+                  turn_index: 1,
+                },
+              },
+            ])) {
+              yield ev;
+            }
+            await turnEndGate;
+            for await (const ev of makeSseEventsFromFixture([
+              {
+                event: "message_chunk",
+                data: {
+                  id: "msg_1",
+                  role: "assistant",
+                  content_type: "text",
+                  content: "Background turn finished.",
+                },
+              },
+              {
+                event: "run_end",
+                data: {
+                  thread_id: THREAD_ID,
+                  run_id: RUN_ID,
+                  turn_index: 1,
+                  outcome: "completed",
+                },
+              },
+            ])) {
+              yield ev;
+            }
+          })(),
+        }),
+      );
+
+      await feishuAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_bg_complete_1",
+          chat_id: "oc_dm_1",
+          chat_type: "p2p",
+          message_type: "text",
+          content: JSON.stringify({ text: "Compute valuation" }),
+        },
+      });
+
+      // Callback returned while turn is still in progress
+      expect(
+        h.backend.progressUpdates.some(
+          (u) =>
+            u.message_id === "om_bg_complete_1" && u.status === "completed",
+        ),
+      ).toBe(false);
+
+      // Release SSE stream and verify background turn settles to "completed" and delivers reply
+      releaseTurnEnd();
+      await new Promise((r) => setTimeout(r, 25));
+
+      expect(
+        h.backend.progressUpdates.some(
+          (u) =>
+            u.message_id === "om_bg_complete_1" &&
+            u.status === "completed" &&
+            u.fallback_pending === false,
+        ),
+      ).toBe(true);
+      expect(
+        h.feishuAdapter.sentTexts.some((t) =>
+          t.text.includes("Background turn finished."),
+        ) || calls.messageCreate.length > 0,
+      ).toBe(true);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("marks inbound event status as failed when the detached background turn throws an error", async () => {
+    const h = createTestHarness();
+    try {
+      const feishuAdapter = new FeishuChannelAdapter({
+        appId: "cli_test_app",
+        appSecret: "sec_test_secret",
+        botOpenId: BOT_OPEN_ID,
+        client: createFakeLarkClient().client,
+      });
+      feishuAdapter.onInboundEvent(async (ev) => {
+        await h.app.orchestrator.handleInboundEvent(ev);
+      });
+
+      let rejectTurn!: (err: Error) => void;
+      const turnErrorGate = new Promise<never>((_, reject) => {
+        rejectTurn = reject;
+      });
+
+      vi.mocked(h.backend.appendThreadMessages).mockImplementationOnce(
+        async () => {
+          await turnErrorGate;
+          throw new Error("unreachable");
+        },
+      );
+
+      await feishuAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_bg_fail_1",
+          chat_id: "oc_dm_1",
+          chat_type: "p2p",
+          message_type: "text",
+          content: JSON.stringify({ text: "Trigger turn crash" }),
+        },
+      });
+
+      // Reject the detached turn after the inbound callback has already returned
+      rejectTurn(new Error("Unexpected downstream dispatch crash"));
+      await new Promise((r) => setTimeout(r, 25));
+
+      expect(
+        h.backend.progressUpdates.some(
+          (u) =>
+            u.message_id === "om_bg_fail_1" &&
+            u.status === "failed" &&
+            u.fallback_pending === false,
+        ),
+      ).toBe(true);
+    } finally {
+      await h.cleanup();
+    }
   });
 
   it("executes queued tasks sequentially per conversation key in createSequentialQueue", async () => {
@@ -988,11 +1355,65 @@ describe("Feishu outbound formatting & chunking", () => {
     expect(withinCardTableLimit(tableMarkdown)).toBe(true);
   });
 
-  it("preserves list structure when materializing soft breaks inside multi-line Markdown list items", () => {
+  it("preserves list structure when materializing soft breaks inside multi-line Markdown list items and lines with HTML entities", () => {
     const listMarkdown = "- item 1\n  continuation line\n- item 2";
     expect(materializeFeishuPostMarkdownSoftBreaks(listMarkdown)).toBe(
       "- item 1  \n  continuation line\n- item 2",
     );
+    expect(materializeFeishuPostMarkdownSoftBreaks("a &amp;\nb")).toBe(
+      "a &amp;  \nb",
+    );
+    expect(materializeFeishuPostMarkdownSoftBreaks("a \\*\r\nb")).toBe(
+      "a \\*  \r\nb",
+    );
+  });
+
+  it("splits an ultra-long CJK line without newlines within the 30 KB envelope without losing characters", () => {
+    const singleLongCjkLine = "中".repeat(12000);
+    const chunks = chunkFeishuOutboundText(singleLongCjkLine);
+    expect(chunks.length).toBe(2);
+    for (const chunk of chunks) {
+      const serialized = buildFeishuPostMessageContent({ messageText: chunk });
+      expect(Buffer.byteLength(serialized, "utf8")).toBeLessThanOrEqual(
+        FEISHU_POST_MAX_BYTES,
+      );
+    }
+    expect(chunks.join("")).toBe(singleLongCjkLine);
+  });
+
+  it("handles fence-only inputs and overlong fence info strings followed by surrogate-pair emoji without hanging", () => {
+    expect(chunkFeishuOutboundText("```\n```")).toEqual(["```\n```"]);
+
+    const overlongInfoFence = `\`\`\`${"中".repeat(11000)}\n😀\n\`\`\``;
+    const chunks = chunkFeishuOutboundText(overlongInfoFence);
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const chunk of chunks) {
+      const built = buildStructuredCard(chunk);
+      expect(
+        Buffer.byteLength(JSON.stringify(built), "utf8"),
+      ).toBeLessThanOrEqual(FEISHU_CARD_MAX_BYTES);
+    }
+    const combined = chunks.join("\n");
+    const cjkMatches = combined.match(/中/g) ?? [];
+    expect(cjkMatches.length).toBe(11000);
+    expect(combined).toContain("😀");
+  });
+
+  it("preserves every character and balances code fences when splitting ultra-long lines inside a fenced code block", () => {
+    const fencedMixedLongLines = `\`\`\`text\n${"a".repeat(8000)}\n${"中".repeat(11000)}\n\`\`\``;
+    const chunks = chunkFeishuOutboundText(fencedMixedLongLines);
+    expect(chunks.length).toBeGreaterThan(1);
+    for (const chunk of chunks) {
+      expect(chunk.startsWith("```text\n")).toBe(true);
+      expect(chunk.endsWith("\n```")).toBe(true);
+      const built = buildStructuredCard(chunk);
+      expect(
+        Buffer.byteLength(JSON.stringify(built), "utf8"),
+      ).toBeLessThanOrEqual(FEISHU_CARD_MAX_BYTES);
+    }
+    const combined = chunks.join("\n");
+    expect((combined.match(/a/g) ?? []).length).toBe(8000);
+    expect((combined.match(/中/g) ?? []).length).toBe(11000);
   });
 
   it("splits oversized post payloads within the 30 KB UTF-8 byte limit", () => {
@@ -1298,7 +1719,7 @@ describe("Feishu outbound sending, media upload/download & error classification"
     expect(recoveredMedia.content.toString("utf8")).toBe("recovered-video-bytes");
   });
 
-  it("converts multipart upload request bodies to FormData and strips json Content-Type header", () => {
+  it("converts multipart upload request bodies to FormData and strips json Content-Type header", async () => {
     const rawUint8 = new Uint8Array([1, 2, 3]);
     const normalized = normalizeMultipartUploadData({ file: rawUint8 }) as {
       file: Buffer;
@@ -1325,8 +1746,25 @@ describe("Feishu outbound sending, media upload/download & error classification"
     expect(multipartReq.headers["Content-Type"]).toBeUndefined();
     expect(multipartReq.headers["User-Agent"]).toBe("dalton");
     expect(multipartReq.data.get("file_type")).toBe("pdf");
-    const blobField = multipartReq.data.get("file") as Blob | null;
+    const blobField = multipartReq.data.get("file") as File | null;
     expect(blobField).toBeInstanceOf(Blob);
+    expect(blobField?.name).toBe("report.pdf");
+    expect(await blobField?.text()).toBe("%PDF-1.7");
+
+    const imageMultipartReq = normalizeMultipartUploadData({
+      method: "POST",
+      url: "https://open.feishu.cn/open-apis/im/v1/images",
+      data: {
+        image_type: "message",
+        image: Buffer.from("png-data"),
+      },
+    }) as {
+      data: FormData;
+    };
+    const imgBlobField = imageMultipartReq.data.get("image") as File | null;
+    expect(imgBlobField).toBeInstanceOf(Blob);
+    expect(imgBlobField?.name).toBe("image.bin");
+    expect(await imgBlobField?.text()).toBe("png-data");
   });
 
   it("throws ChannelDeliveryError with accurate outcome and code across send and upload stages", async () => {
@@ -1509,6 +1947,59 @@ describe("Feishu outbound sending, media upload/download & error classification"
       outcome: "unknown",
       code: "unavailable",
     } satisfies Partial<ChannelDeliveryError>);
+
+    // 8. Truncated/aborted HTTP response stream during send (ERR_BAD_RESPONSE) -> outcome: "unknown" (`codex-5`)
+    const badRespSendFake = createFakeLarkClient({
+      onMessageCreate: async () => {
+        throw Object.assign(new Error("stream has been aborted"), {
+          code: "ERR_BAD_RESPONSE",
+        });
+      },
+    });
+    const badRespSendAdapter = new FeishuChannelAdapter({
+      appId: "cli_app_1",
+      appSecret: "secret_1",
+      client: badRespSendFake.client,
+    });
+    await expect(
+      badRespSendAdapter.sendTextChunk({
+        targetAddress: "feishu:oc_group_1",
+        text: "test",
+        chunkIndex: 0,
+        totalChunks: 1,
+      }),
+    ).rejects.toMatchObject({
+      name: "ChannelDeliveryError",
+      outcome: "unknown",
+      code: "unavailable",
+    } satisfies Partial<ChannelDeliveryError>);
+
+    // 9. Truncated/aborted HTTP response stream during upload (ERR_BAD_RESPONSE) -> outcome: "failed" (`codex-5`)
+    const badRespUploadFake = createFakeLarkClient({
+      onFileCreate: async () => {
+        throw Object.assign(new Error("stream has been aborted"), {
+          code: "ERR_BAD_RESPONSE",
+        });
+      },
+    });
+    const badRespUploadAdapter = new FeishuChannelAdapter({
+      appId: "cli_app_1",
+      appSecret: "secret_1",
+      client: badRespUploadFake.client,
+    });
+    await expect(
+      badRespUploadAdapter.sendFile({
+        targetAddress: "feishu:oc_group_1",
+        path: "reports/q4.pdf",
+        filename: "q4.pdf",
+        content: Buffer.from("%PDF-1.7"),
+        mimeType: "application/pdf",
+      }),
+    ).rejects.toMatchObject({
+      name: "ChannelDeliveryError",
+      outcome: "failed",
+      code: "unavailable",
+    } satisfies Partial<ChannelDeliveryError>);
   });
 });
 
@@ -1646,6 +2137,36 @@ describe("Feishu listAvailableChats pagination, seenPageTokens loop guard & chec
     });
     expect(nonMemberCheck.ok).toBe(false);
     expect(nonMemberCheck.message).toContain("not a member");
+
+    // Repeated page_token in chatMembers.get reports incomplete pagination instead of "not a member" (`grok 中-1`)
+    const { client: truncatedMembersClient } = createFakeLarkClient({
+      onChatGet: async (call) => ({
+        code: 0,
+        data: { name: `Large Group (${call.path.chat_id})` },
+      }),
+      onChatMembersGet: async () => ({
+        code: 0,
+        data: {
+          has_more: true,
+          page_token: "stuck_member_tok",
+          items: [{ member_id: "ou_someone_else", name: "Other" }],
+        },
+      }),
+    });
+    const truncatedMembersAdapter = new FeishuChannelAdapter({
+      appId: "cli_app_1",
+      appSecret: "secret_1",
+      client: truncatedMembersClient,
+    });
+    const indeterminateCheck = await truncatedMembersAdapter.checkTargetLive({
+      userId: "user_1",
+      platformUserId: "ou_member_alice",
+      address: "feishu:oc_large_group",
+      purpose: "send",
+    });
+    expect(indeterminateCheck.ok).toBe(false);
+    expect(indeterminateCheck.message).toContain("pagination incomplete");
+    expect(indeterminateCheck.message).not.toContain("not a member");
   });
 });
 
@@ -1714,16 +2235,20 @@ describe("main.ts adapter registration & shared helpers", () => {
   });
 
   it("validates each manual redirect hop against blocked hosts and allowedDomains in safeFetchBuffer", async () => {
-    const redirectFetchLoopback = vi.fn(async (url: string | URL | Request) => {
-      const urlStr = String(url);
-      if (urlStr.includes("feishu.cn")) {
-        return new Response(null, {
-          status: 302,
-          headers: { location: "http://127.0.0.1:8080/internal-secret" },
-        });
-      }
-      return new Response("leaked", { status: 200 });
-    });
+    const loopbackCalls: Array<{ url: string; redirect?: RequestRedirect }> = [];
+    const redirectFetchLoopback = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const urlStr = String(url);
+        loopbackCalls.push({ url: urlStr, redirect: init?.redirect });
+        if (urlStr.includes("feishu.cn")) {
+          return new Response(null, {
+            status: 302,
+            headers: { location: "http://127.0.0.1:8080/internal-secret" },
+          });
+        }
+        return new Response("leaked", { status: 200 });
+      },
+    );
     await expect(
       safeFetchBuffer("https://file.feishu.cn/download/1", {
         allowedDomains: ["feishu.cn"],
@@ -1733,18 +2258,25 @@ describe("main.ts adapter registration & shared helpers", () => {
       name: "SafeFetchError",
       code: "blocked_host",
     } satisfies Partial<SafeFetchError>);
-    expect(redirectFetchLoopback).toHaveBeenCalledTimes(1);
+    expect(loopbackCalls).toEqual([
+      { url: "https://file.feishu.cn/download/1", redirect: "manual" },
+    ]);
 
-    const redirectFetchDisallowed = vi.fn(async (url: string | URL | Request) => {
-      const urlStr = String(url);
-      if (urlStr.includes("feishu.cn")) {
-        return new Response(null, {
-          status: 302,
-          headers: { location: "https://evil.example.com/payload.bin" },
-        });
-      }
-      return new Response("leaked", { status: 200 });
-    });
+    const disallowedCalls: Array<{ url: string; redirect?: RequestRedirect }> =
+      [];
+    const redirectFetchDisallowed = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const urlStr = String(url);
+        disallowedCalls.push({ url: urlStr, redirect: init?.redirect });
+        if (urlStr.includes("feishu.cn")) {
+          return new Response(null, {
+            status: 302,
+            headers: { location: "https://evil.example.com/payload.bin" },
+          });
+        }
+        return new Response("leaked", { status: 200 });
+      },
+    );
     await expect(
       safeFetchBuffer("https://file.feishu.cn/download/2", {
         allowedDomains: ["feishu.cn"],
@@ -1754,7 +2286,44 @@ describe("main.ts adapter registration & shared helpers", () => {
       name: "SafeFetchError",
       code: "disallowed_domain",
     } satisfies Partial<SafeFetchError>);
-    expect(redirectFetchDisallowed).toHaveBeenCalledTimes(1);
+    expect(disallowedCalls).toEqual([
+      { url: "https://file.feishu.cn/download/2", redirect: "manual" },
+    ]);
+
+    const allowedRedirectCalls: Array<{
+      url: string;
+      redirect?: RequestRedirect;
+    }> = [];
+    const redirectFetchAllowed = vi.fn(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        const urlStr = String(url);
+        allowedRedirectCalls.push({ url: urlStr, redirect: init?.redirect });
+        if (urlStr === "https://open.feishu.cn/start") {
+          return new Response(null, {
+            status: 302,
+            headers: {
+              location: "https://lf3-static.feishucdn.com/obj/file.bin",
+            },
+          });
+        }
+        return new Response("hop-ok", { status: 200 });
+      },
+    );
+    const redirectedRes = await safeFetchBuffer(
+      "https://open.feishu.cn/start",
+      {
+        allowedDomains: ["feishu.cn", "feishucdn.com"],
+        fetchImpl: redirectFetchAllowed as unknown as typeof fetch,
+      },
+    );
+    expect(redirectedRes.buffer.toString("utf8")).toBe("hop-ok");
+    expect(allowedRedirectCalls).toEqual([
+      { url: "https://open.feishu.cn/start", redirect: "manual" },
+      {
+        url: "https://lf3-static.feishucdn.com/obj/file.bin",
+        redirect: "manual",
+      },
+    ]);
   });
 
   it("blocks IPv4-mapped IPv6 private, loopback, and link-local addresses in decimal and hex notation", async () => {
@@ -1825,6 +2394,41 @@ describe("main.ts adapter registration & shared helpers", () => {
       code: "timeout",
     } satisfies Partial<SafeFetchError>);
     expect(stalledStreamCancelled).toBe(true);
+  });
+
+  it("destroys an unended Node PassThrough stream and rejects with size_exceeded when bytes exceed maxBytes", async () => {
+    const nodeStream = new PassThrough();
+    nodeStream.write(Buffer.alloc(64, 0x61));
+    nodeStream.write(Buffer.alloc(64, 0x62));
+    // Intentionally do not call nodeStream.end()
+
+    await expect(
+      readStreamWithLimit(nodeStream, {
+        maxBytes: 100,
+        chunkIdleTimeoutMs: 50,
+      }),
+    ).rejects.toMatchObject({
+      name: "SafeFetchError",
+      code: "size_exceeded",
+    } satisfies Partial<SafeFetchError>);
+    expect(nodeStream.destroyed).toBe(true);
+  });
+
+  it("destroys a stalled Node PassThrough stream and rejects with timeout on chunkIdleTimeoutMs without hanging", async () => {
+    const stalledNodeStream = new PassThrough();
+    stalledNodeStream.write(Buffer.from("partial"));
+    // Intentionally stall without calling stalledNodeStream.end()
+
+    await expect(
+      readStreamWithLimit(stalledNodeStream, {
+        maxBytes: 1024,
+        chunkIdleTimeoutMs: 20,
+      }),
+    ).rejects.toMatchObject({
+      name: "SafeFetchError",
+      code: "timeout",
+    } satisfies Partial<SafeFetchError>);
+    expect(stalledNodeStream.destroyed).toBe(true);
   });
 
   it("scrubs appId, appSecret, and bearer/tenant tokens from Feishu SDK logger and Error.message", () => {

@@ -386,12 +386,16 @@ export async function isFeishuChatMember(
     }
     const nextToken = res.pageToken?.trim();
     if (!nextToken || seenPageTokens.has(nextToken)) {
-      return false;
+      throw new Error(
+        `Unable to verify membership for user ${senderOpenId} in chat ${chatId}: member list pagination incomplete`,
+      );
     }
     seenPageTokens.add(nextToken);
     pageToken = nextToken;
   }
-  return false;
+  throw new Error(
+    `Unable to verify membership for user ${senderOpenId} in chat ${chatId}: member list pagination incomplete`,
+  );
 }
 
 export async function assertFeishuChatMember(

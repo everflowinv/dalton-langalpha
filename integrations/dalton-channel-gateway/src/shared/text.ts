@@ -205,6 +205,8 @@ export function chunkByParagraph(
   return chunks;
 }
 
+const MAX_FENCE_INFO_CHARS = 64;
+
 /**
  * Splits Markdown text while keeping fenced code blocks balanced across chunks
  * when a single code block exceeds `maxChars`.
@@ -227,23 +229,135 @@ export function chunkTextForOutbound(text: string, maxChars: number): string[] {
     markerChar: string;
     markerLen: number;
   } | null = null;
+  let reopenedEmptyFence = false;
 
   const flushCurrent = (): void => {
     if (!current) {
       return;
     }
     if (activeFence) {
+      if (reopenedEmptyFence && current === activeFence.openLine) {
+        return;
+      }
       results.push(`${current}\n${activeFence.closeLine}`.trimEnd());
+      current = activeFence.openLine;
+      reopenedEmptyFence = true;
     } else {
       results.push(current);
+      current = "";
+      reopenedEmptyFence = false;
     }
-    current = activeFence ? activeFence.openLine : "";
+  };
+
+  const splitOverlongLine = (lineToSplit: string): void => {
+    const fenceOverhead = activeFence
+      ? activeFence.openLine.length + activeFence.closeLine.length + 4
+      : 0;
+    const step = Math.max(1, limit - fenceOverhead);
+    let rest = lineToSplit;
+    while (rest.length > step) {
+      let piece = truncateUtf16Safe(rest, step);
+      if (!piece) {
+        piece = rest.slice(0, Math.min(rest.length, 2));
+      }
+      if (activeFence) {
+        results.push(
+          `${activeFence.openLine}\n${piece}\n${activeFence.closeLine}`,
+        );
+      } else {
+        results.push(piece);
+      }
+      rest = rest.slice(piece.length);
+    }
+    current = activeFence ? `${activeFence.openLine}\n${rest}` : rest;
+    reopenedEmptyFence = false;
   };
 
   for (const line of lines) {
     const fenceMatch = line.match(/^\s*(`{3,}|~{3,})(.*)$/);
+
+    if (activeFence && fenceMatch) {
+      const marker = fenceMatch[1]!;
+      const trailing = (fenceMatch[2] ?? "").trim();
+      if (
+        trailing === "" &&
+        marker[0] === activeFence.markerChar &&
+        marker.length >= activeFence.markerLen
+      ) {
+        if (reopenedEmptyFence && current === activeFence.openLine) {
+          current = "";
+          activeFence = null;
+          reopenedEmptyFence = false;
+          continue;
+        }
+        const candidate = current ? `${current}\n${line}` : line;
+        if (candidate.length <= limit) {
+          current = candidate;
+        } else {
+          flushCurrent();
+          current = "";
+        }
+        activeFence = null;
+        reopenedEmptyFence = false;
+        continue;
+      }
+    }
+
+    if (!activeFence && fenceMatch) {
+      const marker = fenceMatch[1]!;
+      const markerChar = marker[0]!;
+      const markerLen = marker.length;
+      const closeLine = markerChar.repeat(markerLen);
+      const canBalance = closeLine.length * 2 + 4 <= limit;
+      const rawInfo = (fenceMatch[2] ?? "").trimEnd();
+      const candidateOpenLine = `${marker}${rawInfo}`;
+      const openLine =
+        rawInfo.length <= MAX_FENCE_INFO_CHARS &&
+        candidateOpenLine.length + closeLine.length + 4 <= limit
+          ? candidateOpenLine
+          : closeLine;
+
+      if (line.length > limit) {
+        if (current) {
+          flushCurrent();
+        }
+        if (canBalance) {
+          activeFence = {
+            openLine: closeLine,
+            closeLine,
+            markerChar,
+            markerLen,
+          };
+          const markerEnd = line.indexOf(marker) + marker.length;
+          splitOverlongLine(line.slice(markerEnd));
+        } else {
+          splitOverlongLine(line);
+        }
+        continue;
+      }
+
+      const candidate = current ? `${current}\n${line}` : line;
+      const reserve = canBalance ? closeLine.length + 2 : 0;
+      if (candidate.length + reserve > limit && current.length > 0) {
+        flushCurrent();
+      }
+      current = current ? `${current}\n${line}` : line;
+      if (canBalance) {
+        activeFence = {
+          openLine,
+          closeLine,
+          markerChar,
+          markerLen,
+        };
+        reopenedEmptyFence = false;
+      }
+      continue;
+    }
+
     const candidate = current ? `${current}\n${line}` : line;
-    const fenceClosingReserve = activeFence ? activeFence.closeLine.length + 2 : 0;
+    const fenceClosingReserve = activeFence
+      ? activeFence.closeLine.length + 2
+      : 0;
 
     if (candidate.length + fenceClosingReserve > limit && current.length > 0) {
       flushCurrent();
@@ -253,53 +367,22 @@ export function chunkTextForOutbound(text: string, maxChars: number): string[] {
       ? activeFence.openLine.length + activeFence.closeLine.length + 4
       : 0;
     if (line.length + fenceOverhead > limit) {
-      if (current && current !== (activeFence ? activeFence.openLine : "")) {
+      if (current && !(reopenedEmptyFence && activeFence && current === activeFence.openLine)) {
         flushCurrent();
       }
-      const step = Math.max(1, limit - fenceOverhead);
-      let rest = line;
-      while (rest.length > step) {
-        const piece = truncateUtf16Safe(rest, step);
-        if (activeFence) {
-          results.push(
-            `${activeFence.openLine}\n${piece}\n${activeFence.closeLine}`,
-          );
-        } else {
-          results.push(piece);
-        }
-        rest = rest.slice(piece.length);
-      }
-      current = activeFence ? `${activeFence.openLine}\n${rest}` : rest;
+      splitOverlongLine(line);
     } else {
       current = current ? `${current}\n${line}` : line;
-    }
-
-    if (fenceMatch) {
-      const marker = fenceMatch[1]!;
-      const trailing = (fenceMatch[2] ?? "").trim();
-      if (!activeFence) {
-        const markerChar = marker[0]!;
-        const markerLen = marker.length;
-        activeFence = {
-          openLine: `${marker}${fenceMatch[2] ?? ""}`.trimEnd(),
-          closeLine: markerChar.repeat(markerLen),
-          markerChar,
-          markerLen,
-        };
-      } else if (
-        trailing === "" &&
-        marker[0] === activeFence.markerChar &&
-        marker.length >= activeFence.markerLen
-      ) {
-        activeFence = null;
-      }
+      reopenedEmptyFence = false;
     }
   }
 
   if (current) {
-    if (activeFence && current !== activeFence.openLine) {
-      results.push(`${current}\n${activeFence.closeLine}`);
-    } else if (!activeFence) {
+    if (activeFence) {
+      if (!(reopenedEmptyFence && current === activeFence.openLine)) {
+        results.push(`${current}\n${activeFence.closeLine}`);
+      }
+    } else {
       results.push(current);
     }
   }

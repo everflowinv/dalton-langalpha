@@ -101,6 +101,7 @@ export class ChannelGatewayOrchestrator {
 
   readonly activeWatches = new Map<string, ActiveWatchHandle>();
   private readonly activeBackgroundRunIds = new Map<string, Set<string>>();
+  private readonly activeInboundTurns = new Set<Promise<void>>();
   private startupRecoveryPromise: Promise<void> | null = null;
 
   constructor(options: {
@@ -173,6 +174,50 @@ export class ChannelGatewayOrchestrator {
       weixin_context_token: event.weixinContextToken ?? null,
     });
 
+    await this.launchInboundTurn(event, () =>
+      this.executeRegisteredInboundTurn(event, resolved),
+    );
+  }
+
+  private async launchInboundTurn(
+    event: InboundChannelEvent,
+    runTurn: () => Promise<void>,
+  ): Promise<void> {
+    const turnPromise = (async () => {
+      try {
+        await runTurn();
+      } catch {
+        try {
+          await this.backend.updateInboundProgress({
+            platform: event.platform,
+            message_id: event.messageId,
+            status: "failed",
+            fallback_pending: false,
+          });
+        } catch {
+          // Ignore secondary progress update failure
+        }
+      }
+    })();
+
+    this.activeInboundTurns.add(turnPromise);
+    void turnPromise.finally(() => {
+      this.activeInboundTurns.delete(turnPromise);
+    });
+
+    await new Promise<void>((resolve) => {
+      const timer = setImmediate(resolve);
+      void turnPromise.finally(() => {
+        clearImmediate(timer);
+        resolve();
+      });
+    });
+  }
+
+  private async executeRegisteredInboundTurn(
+    event: InboundChannelEvent,
+    resolved: I1RegisterAndResolveResponse,
+  ): Promise<void> {
     // Step 1: Deduplication check on existing_status
     if (
       resolved.existing_status === "completed" ||

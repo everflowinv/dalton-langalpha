@@ -279,7 +279,7 @@ export function classifyFeishuDeliveryError(
   }
 
   return new ChannelDeliveryError(formattedMsg, {
-    outcome: "failed",
+    outcome: stage === "upload" ? "failed" : "unknown",
     code: "unavailable",
   });
 }
@@ -521,6 +521,7 @@ export async function getMessageFeishu(
 ): Promise<FeishuFetchedMessage | null> {
   try {
     const response = (await client.im.message.get({
+      params: { card_msg_content_type: "user_card_content" },
       path: { message_id: params.messageId },
     })) as {
       code?: number;
@@ -528,6 +529,8 @@ export async function getMessageFeishu(
       data?: {
         items?: Array<{
           message_id?: string;
+          upper_message_id?: string;
+          root_id?: string;
           chat_id?: string;
           chat_type?: "p2p" | "group" | "private";
           msg_type?: string;
@@ -544,7 +547,11 @@ export async function getMessageFeishu(
     }
 
     const items = response.data?.items ?? [];
-    const item = items[0];
+    const item =
+      items.find(
+        (candidate) =>
+          candidate.msg_type === "merge_forward" && !candidate.upper_message_id,
+      ) ?? items[0];
     if (!item) {
       return null;
     }
