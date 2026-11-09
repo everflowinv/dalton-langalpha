@@ -184,3 +184,8 @@ tests/integration/dalton/test_channel_gateway_db.py
 integrations/dalton-channel-gateway/
 scripts/dalton/launchd/com.dalton.channel-gateway.plist.template
 scripts/dalton/gen_channel_gateway_fixtures.py
+# CH-1 Phase 3 (PR 1): shared channel helpers, Feishu adapter, third-party notices, and Vitest suite.
+integrations/dalton-channel-gateway/THIRD_PARTY_NOTICES.md
+integrations/dalton-channel-gateway/src/shared/
+integrations/dalton-channel-gateway/src/channels/feishu/
+integrations/dalton-channel-gateway/test/feishu.test.ts
