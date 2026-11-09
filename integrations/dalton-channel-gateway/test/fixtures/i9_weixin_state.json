@@ -1,0 +1,31 @@
+{
+  "get_unconfigured": {
+    "configured": false,
+    "ilink_bot_id": null,
+    "owner_user_id": null,
+    "base_url": "https://ilinkai.weixin.qq.com",
+    "get_updates_buf": "",
+    "status": "unconfigured",
+    "updated_at": null,
+    "bot_token": null
+  },
+  "get_configured": {
+    "configured": true,
+    "ilink_bot_id": "ilink_bot_88",
+    "owner_user_id": "user_alice_123",
+    "base_url": "https://ilinkai.weixin.qq.com",
+    "get_updates_buf": "cursor_xyz",
+    "status": "active",
+    "updated_at": "2026-11-08T00:00:00+00:00",
+    "bot_token": "decrypted_secret_bot_token"
+  },
+  "put_saved": {
+    "ok": true,
+    "ilink_bot_id": "ilink_bot_88",
+    "owner_user_id": "user_alice_123",
+    "base_url": "https://ilinkai.weixin.qq.com",
+    "get_updates_buf": "cursor_xyz",
+    "status": "active",
+    "updated_at": "2026-11-08T00:00:00+00:00"
+  }
+}

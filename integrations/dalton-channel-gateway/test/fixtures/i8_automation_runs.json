@@ -1,0 +1,58 @@
+{
+  "register_dm": {
+    "targets": [
+      {
+        "entry": "feishu",
+        "address": "feishu:@me",
+        "name": "Alice (feishu DM)",
+        "ok": true,
+        "message": null
+      }
+    ]
+  },
+  "finish_claim_finishing": {
+    "execution_id": "22222222-3333-4444-5555-666666666666",
+    "status": "finishing",
+    "previous_status": "registered",
+    "user_id": "user_alice_123",
+    "workspace_id": "99999999-8888-7777-6666-555555555555",
+    "thread_id": "11111111-2222-3333-4444-555555555555",
+    "automation_name": "Daily Morning Brief",
+    "finish_status": "completed",
+    "final_text": "Summary of market moves.",
+    "targets": [
+      {
+        "entry": "feishu",
+        "address": "feishu:@me",
+        "name": "Alice (feishu DM)",
+        "ok": true,
+        "message": null,
+        "agent_sent": false
+      }
+    ]
+  },
+  "finish_mark_finished": {
+    "execution_id": "22222222-3333-4444-5555-666666666666",
+    "status": "finished",
+    "previous_status": "finishing",
+    "user_id": "user_alice_123",
+    "workspace_id": "99999999-8888-7777-6666-555555555555",
+    "thread_id": "11111111-2222-3333-4444-555555555555",
+    "automation_name": "Daily Morning Brief",
+    "finish_status": "completed",
+    "final_text": "Summary of market moves.",
+    "targets": [
+      {
+        "entry": "feishu",
+        "address": "feishu:@me",
+        "name": "Alice (feishu DM)",
+        "ok": true,
+        "message": null,
+        "agent_sent": false,
+        "reached": true,
+        "via": "fallback",
+        "error": null
+      }
+    ]
+  }
+}

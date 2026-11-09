@@ -1,0 +1,99 @@
+{
+  "default_state": {
+    "user_id": "user_alice_123",
+    "user_tier": "internal",
+    "home_workspace_id": "00000000-0000-0000-0000-000000000001",
+    "identities": {
+      "feishu": {
+        "platform": "feishu",
+        "platform_user_id": "ou_alice",
+        "platform_username": "Alice",
+        "platform_tenant_key": "t_1",
+        "weixin_context_token": null,
+        "created_at": "2026-11-08T00:00:00+00:00",
+        "updated_at": "2026-11-08T00:00:00+00:00"
+      },
+      "discord": {
+        "platform": "discord",
+        "platform_user_id": "dc_alice",
+        "platform_username": "alice#0001",
+        "platform_tenant_key": null,
+        "weixin_context_token": null,
+        "created_at": "2026-11-08T00:00:00+00:00",
+        "updated_at": "2026-11-08T00:00:00+00:00"
+      },
+      "weixin": {
+        "platform": "weixin",
+        "platform_user_id": "wx_alice",
+        "platform_username": "AliceWX",
+        "platform_tenant_key": null,
+        "weixin_context_token": "ctx_tok_123",
+        "created_at": "2026-11-08T00:00:00+00:00",
+        "updated_at": "2026-11-08T00:00:00+00:00"
+      }
+    },
+    "settings": {
+      "version": "v1",
+      "apps": {
+        "feishu": {
+          "preferred": "feishu:@me",
+          "chats": {
+            "feishu:oc_group1": {
+              "workspace_id": "99999999-8888-7777-6666-555555555555"
+            }
+          },
+          "automation_output": {
+            "99999999-8888-7777-6666-555555555555": "feishu:oc_group1"
+          },
+          "agent_messages": {
+            "enabled": true,
+            "allowed": [
+              "feishu:@me",
+              "feishu:oc_group1"
+            ]
+          }
+        },
+        "discord": {
+          "preferred": null,
+          "chats": {},
+          "automation_output": {},
+          "agent_messages": {
+            "enabled": true,
+            "allowed": [
+              "discord:@me"
+            ]
+          }
+        },
+        "weixin": {
+          "preferred": "weixin:@me",
+          "chats": {},
+          "automation_output": {},
+          "agent_messages": {
+            "enabled": true,
+            "allowed": [
+              "weixin:@me"
+            ]
+          }
+        }
+      }
+    },
+    "chat_bindings": [
+      {
+        "platform": "feishu",
+        "chat_address": "feishu:oc_group1",
+        "chat_name": "Alpha Research Group",
+        "workspace_id": "99999999-8888-7777-6666-555555555555",
+        "bound_by_user_id": "user_alice_123",
+        "last_used_at": 1700000000
+      }
+    ],
+    "current_conversation": {
+      "address": "feishu:@me",
+      "platform": "feishu",
+      "thread_id": "11111111-2222-3333-4444-555555555555",
+      "run_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      "external_thread_id": "feishu:dm:ou_alice:gen:1"
+    },
+    "resolved_thread_id": "11111111-2222-3333-4444-555555555555"
+  }
+}

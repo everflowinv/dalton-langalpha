@@ -1,0 +1,367 @@
+{
+  "http_409_admission_running": {
+    "detail": {
+      "code": "running",
+      "message": "The turn is still running. Wait a moment, then retry — or use /reconnect to continue streaming, or /cancel to stop it."
+    }
+  },
+  "http_409_admission_not_running": {
+    "detail": {
+      "code": "not_running",
+      "message": "No turn is running to steer. Resubmit as a new message."
+    }
+  },
+  "http_409_admission_stopping": {
+    "detail": {
+      "code": "stopping",
+      "message": "The turn is stopping. Wait a moment, then retry."
+    }
+  },
+  "http_409_admission_compacting": {
+    "detail": {
+      "code": "compacting",
+      "message": "The assistant is compacting its context. Wait a moment, then retry."
+    }
+  },
+  "http_409_admission_workspace_moving": {
+    "detail": {
+      "code": "workspace_moving",
+      "message": "This workspace is moving to another computer. Try again when the move finishes."
+    }
+  },
+  "http_409_admission_turn_conflict": {
+    "detail": {
+      "code": "running",
+      "message": "The turn is still running. Wait a moment, then retry — or use /reconnect to continue streaming, or /cancel to stop it."
+    }
+  },
+  "http_503_writer_capacity": {
+    "detail": {
+      "code": "writer_capacity",
+      "message": "The server is at its concurrent-run capacity; please retry in a moment."
+    }
+  },
+  "sse_error_admission_running": {
+    "event": "error",
+    "data": {
+      "thread_id": "11111111-2222-3333-4444-555555555555",
+      "error": "The turn is still running. Wait a moment, then retry — or use /reconnect to continue streaming, or /cancel to stop it.",
+      "type": "workflow_error",
+      "error_type": "admission_conflict",
+      "error_class": "RunSlotBusyError",
+      "code": "running"
+    }
+  },
+  "http_409_duplicate_in_progress": {
+    "detail": {
+      "code": "duplicate_request",
+      "message": "This request was already accepted; reconnect to the existing run instead of resending.",
+      "thread_id": "11111111-2222-3333-4444-555555555555",
+      "run_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      "run_status": "in_progress",
+      "retryable": false
+    }
+  },
+  "http_409_duplicate_cancelled_retryable": {
+    "detail": {
+      "code": "duplicate_request",
+      "message": "This request was already accepted; reconnect to the existing run instead of resending.",
+      "thread_id": "11111111-2222-3333-4444-555555555555",
+      "run_id": "ffffffff-1111-2222-3333-444444444444",
+      "run_status": "cancelled",
+      "retryable": true
+    }
+  },
+  "http_409_duplicate_error_retryable": {
+    "detail": {
+      "code": "duplicate_request",
+      "message": "This request was already accepted; reconnect to the existing run instead of resending.",
+      "thread_id": "11111111-2222-3333-4444-555555555555",
+      "run_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      "run_status": "error",
+      "retryable": true
+    }
+  },
+  "http_409_resend_required": {
+    "detail": {
+      "code": "resend_required",
+      "message": "The failed turn's input was more than its stored message; send it again."
+    }
+  },
+  "sse_error_duplicate_in_progress": {
+    "event": "error",
+    "data": {
+      "thread_id": "11111111-2222-3333-4444-555555555555",
+      "error": "This request was already accepted; reconnect to the existing run instead of resending.",
+      "type": "workflow_error",
+      "error_type": "duplicate_request",
+      "error_class": "DuplicateRequestError",
+      "code": "duplicate_request",
+      "run_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      "run_status": "in_progress",
+      "run_thread_id": "11111111-2222-3333-4444-555555555555",
+      "retryable": false
+    }
+  },
+  "sse_error_writer_capacity": {
+    "event": "error",
+    "data": {
+      "thread_id": "11111111-2222-3333-4444-555555555555",
+      "error": "The server is at its concurrent-run capacity; please retry in a moment.",
+      "type": "workflow_error",
+      "error_type": "capacity_limit",
+      "error_class": "WriterGuardUnavailable",
+      "code": "writer_capacity"
+    }
+  },
+  "sse_error_external_id_conflict": {
+    "event": "error",
+    "data": {
+      "thread_id": "11111111-2222-3333-4444-555555555555",
+      "error": "This (platform, external_id) is already linked to another thread.",
+      "type": "workflow_error",
+      "error_type": "external_id_conflict",
+      "error_class": "ExternalIdConflictError",
+      "platform": "feishu",
+      "external_id": "feishu:dm:ou_alice:gen:2"
+    }
+  },
+  "http_409_external_id_conflict": {
+    "detail": {
+      "error_type": "external_id_conflict",
+      "message": "This (platform, external_id) is already linked to another thread.",
+      "platform": "feishu",
+      "external_id": "feishu:dm:ou_alice:gen:2"
+    }
+  },
+  "sse_retry_recoverable": {
+    "event": "retry",
+    "data": {
+      "message": "Temporary error occurred, you can retry or resume the turn",
+      "thread_id": "11111111-2222-3333-4444-555555555555",
+      "auto_retry": true,
+      "error_type": "rate_limit",
+      "error_class": "RateLimitError",
+      "retry_count": 1,
+      "max_retries": 3,
+      "recovery": "retry",
+      "run_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    }
+  },
+  "sse_retry_resend": {
+    "event": "retry",
+    "data": {
+      "message": "Temporary error occurred, you can retry or resume the turn",
+      "thread_id": "11111111-2222-3333-4444-555555555555",
+      "auto_retry": true,
+      "error_type": "rate_limit",
+      "error_class": "RateLimitError",
+      "retry_count": 1,
+      "max_retries": 3,
+      "recovery": "resend",
+      "run_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    }
+  },
+  "sse_steering_accepted": {
+    "event": "steering_accepted",
+    "data": {
+      "thread_id": "11111111-2222-3333-4444-555555555555",
+      "run_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      "status": "accepted",
+      "delivery": "steering"
+    }
+  },
+  "sse_run_end_completed": {
+    "event": "run_end",
+    "data": {
+      "thread_id": "11111111-2222-3333-4444-555555555555",
+      "run_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      "outcome": "completed"
+    }
+  },
+  "sse_run_end_error": {
+    "event": "run_end",
+    "data": {
+      "thread_id": "11111111-2222-3333-4444-555555555555",
+      "run_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+      "outcome": "error"
+    }
+  },
+  "sse_stream_gap": {
+    "event": "stream_gap",
+    "data": {
+      "expected_from": 3,
+      "first_available": 10
+    }
+  },
+  "sse_stream_new_thread": [
+    {
+      "event": "metadata",
+      "data": {
+        "thread_id": "11111111-2222-3333-4444-555555555555",
+        "run_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "turn_index": 0
+      }
+    },
+    {
+      "event": "message_chunk",
+      "data": {
+        "thread_id": "11111111-2222-3333-4444-555555555555",
+        "agent": "main",
+        "id": "msg_new_1",
+        "role": "assistant",
+        "content": "Hello from new thread!",
+        "content_type": "text"
+      }
+    },
+    {
+      "event": "run_end",
+      "data": {
+        "thread_id": "11111111-2222-3333-4444-555555555555",
+        "run_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "outcome": "completed"
+      }
+    }
+  ],
+  "sse_stream_existing_thread": [
+    {
+      "event": "metadata",
+      "data": {
+        "thread_id": "11111111-2222-3333-4444-555555555555",
+        "run_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "turn_index": 1
+      }
+    },
+    {
+      "event": "message_chunk",
+      "data": {
+        "thread_id": "11111111-2222-3333-4444-555555555555",
+        "agent": "main",
+        "id": "msg_ext_1",
+        "role": "assistant",
+        "content": "Assistant reply on existing thread.",
+        "content_type": "text"
+      }
+    },
+    {
+      "event": "run_end",
+      "data": {
+        "thread_id": "11111111-2222-3333-4444-555555555555",
+        "run_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "outcome": "completed"
+      }
+    }
+  ],
+  "sse_stream_retry_turn": [
+    {
+      "event": "metadata",
+      "data": {
+        "thread_id": "11111111-2222-3333-4444-555555555555",
+        "run_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "turn_index": 1
+      }
+    },
+    {
+      "event": "message_chunk",
+      "data": {
+        "thread_id": "11111111-2222-3333-4444-555555555555",
+        "agent": "main",
+        "id": "msg_retry_1",
+        "role": "assistant",
+        "content": "Retried failed turn!",
+        "content_type": "text"
+      }
+    },
+    {
+      "event": "run_end",
+      "data": {
+        "thread_id": "11111111-2222-3333-4444-555555555555",
+        "run_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "outcome": "completed"
+      }
+    }
+  ],
+  "sse_stream_attached": [
+    {
+      "event": "message_chunk",
+      "data": {
+        "thread_id": "11111111-2222-3333-4444-555555555555",
+        "agent": "main",
+        "id": "msg_att_1",
+        "role": "assistant",
+        "content": "Streamed output.",
+        "content_type": "text"
+      }
+    },
+    {
+      "event": "run_end",
+      "data": {
+        "thread_id": "11111111-2222-3333-4444-555555555555",
+        "run_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "outcome": "completed"
+      }
+    }
+  ],
+  "sse_stream_after_cursor_tail": [
+    {
+      "event": "message_chunk",
+      "data": {
+        "thread_id": "11111111-2222-3333-4444-555555555555",
+        "agent": "main",
+        "id": "msg_att_tail_1",
+        "role": "assistant",
+        "content": "Tail after cursor.",
+        "content_type": "text"
+      }
+    },
+    {
+      "event": "run_end",
+      "data": {
+        "thread_id": "11111111-2222-3333-4444-555555555555",
+        "run_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "outcome": "completed"
+      }
+    }
+  ],
+  "sse_stream_after_cursor_run_end_only": [
+    {
+      "event": "run_end",
+      "data": {
+        "thread_id": "11111111-2222-3333-4444-555555555555",
+        "run_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "outcome": "completed"
+      }
+    }
+  ],
+  "sse_stream_partial_eof": [
+    {
+      "event": "metadata",
+      "data": {
+        "thread_id": "11111111-2222-3333-4444-555555555555",
+        "run_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        "turn_index": 1
+      }
+    },
+    {
+      "event": "message_chunk",
+      "data": {
+        "thread_id": "11111111-2222-3333-4444-555555555555",
+        "agent": "main",
+        "id": "msg_partial_1",
+        "role": "assistant",
+        "content": "TRUNCATED_PARTIAL_TEXT_DO_NOT_SEND",
+        "content_type": "text"
+      }
+    }
+  ],
+  "sse_stream_retry_partial_eof": [
+    {
+      "event": "metadata",
+      "data": {
+        "thread_id": "11111111-2222-3333-4444-555555555555",
+        "run_id": "run_retry_2",
+        "turn_index": 1
+      }
+    }
+  ]
+}

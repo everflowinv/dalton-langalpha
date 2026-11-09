@@ -1,0 +1,127 @@
+{
+  "ask_user_question_sse": {
+    "event": "interrupt",
+    "data": {
+      "thread_id": "11111111-2222-3333-4444-555555555555",
+      "interrupt_id": "int_ask_1",
+      "action_requests": [
+        {
+          "type": "ask_user_question",
+          "question": "Which time horizon should I analyze?",
+          "options": [
+            "1 Year",
+            "5 Years"
+          ],
+          "allow_multiple": false
+        }
+      ],
+      "role": "assistant",
+      "finish_reason": "interrupt"
+    }
+  },
+  "credit_pause_sse": {
+    "event": "interrupt",
+    "data": {
+      "thread_id": "11111111-2222-3333-4444-555555555555",
+      "interrupt_id": "int_credit_1",
+      "action_requests": [
+        {
+          "type": "credit_pause",
+          "message": "Your credit limit was reached for this turn."
+        }
+      ],
+      "role": "assistant",
+      "finish_reason": "interrupt"
+    }
+  },
+  "order_approval_sse": {
+    "event": "interrupt",
+    "data": {
+      "thread_id": "11111111-2222-3333-4444-555555555555",
+      "interrupt_id": "int_order_1",
+      "kind": "order_approval",
+      "action_requests": [
+        {
+          "name": "place_equity_order",
+          "args": {
+            "symbol": "AAPL",
+            "qty": 10,
+            "side": "buy"
+          },
+          "description": "Buy 10 shares of AAPL at market",
+          "tool_call_id": "call_order_1",
+          "attempt_id": "att_order_1",
+          "order": {
+            "symbol": "AAPL",
+            "qty": 10,
+            "side": "buy"
+          }
+        }
+      ],
+      "role": "assistant",
+      "finish_reason": "interrupt"
+    }
+  },
+  "publish_approval_sse": {
+    "event": "interrupt",
+    "data": {
+      "thread_id": "11111111-2222-3333-4444-555555555555",
+      "interrupt_id": "int_publish_1",
+      "kind": "publish_approval",
+      "action_requests": [
+        {
+          "type": "publish_report",
+          "name": "publish_report",
+          "tool_call_id": "call_publish_1",
+          "attempt_id": "req_pub_1",
+          "description": "正式发布《AAPL Deep Dive》",
+          "args": {
+            "request_id": "req_pub_1",
+            "ticker": "AAPL",
+            "title": "AAPL Deep Dive",
+            "kind": "company_in_depth",
+            "draft_path": "reports/aapl_draft.md",
+            "published_path": "published/aapl_deep_dive.md",
+            "updates_thesis": true,
+            "thesis_version": "v2"
+          }
+        }
+      ],
+      "role": "assistant",
+      "finish_reason": "interrupt"
+    }
+  },
+  "hitl_response_approve": {
+    "int_ask_1": {
+      "decisions": [
+        {
+          "type": "approve",
+          "message": "5 Years"
+        }
+      ]
+    }
+  },
+  "hitl_response_skip_reject": {
+    "int_ask_1": {
+      "decisions": [
+        {
+          "type": "reject",
+          "message": ""
+        }
+      ]
+    }
+  },
+  "hitl_response_skip_serialized_by_backend": {
+    "int_ask_1": {
+      "decisions": [
+        {
+          "type": "reject",
+          "message": "User rejected this action. No specific feedback was provided.",
+          "overrides": null,
+          "confirm_token": null
+        }
+      ],
+      "order_decisions": null
+    }
+  }
+}
