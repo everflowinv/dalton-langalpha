@@ -24,7 +24,48 @@ export interface LoggerSink {
 }
 
 const SENSITIVE_KEY_PATTERN =
-  /^(?:text|content|body|raw_body|message_body|prompt|secret|app_secret|appsecret|token|service_token|access_token|refresh_token|bot_token|authorization|x-service-token|password|cookie|buffer|file_bytes|audio_bytes)$/i;
+  /(?:^(?:text|content|body|raw_body|message_body|prompt|buffer|file_bytes|audio_bytes)$|secret|token|password|authorization|cookie|api[_-]?key|app[_-]?secret|app[_-]?id|tenant[_-]?access[_-]?token|bearer|credential)/i;
+
+const MAX_LOG_STRING_LENGTH = 512;
+
+/**
+ * Scrubs credential-like substrings (Bearer tokens, JSON/query secret fields,
+ * URL userinfo, Feishu tenant/app tokens) and truncates long strings so raw
+ * secrets or oversized payloads never reach stdout/stderr.
+ */
+export function redactCredentialString(
+  value: string,
+  maxLength: number = MAX_LOG_STRING_LENGTH,
+): string {
+  if (!value) {
+    return value;
+  }
+  const scrubbed = value
+    // URL userinfo: https://user:secret@host -> https://[REDACTED]@host
+    .replace(
+      /\b([a-z][a-z0-9+.-]*:\/\/)([^/\s:@]+:[^/\s@]+)@/gi,
+      "$1[REDACTED]@",
+    )
+    // Authorization: Bearer <token>
+    .replace(/\b(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, "$1[REDACTED]")
+    // JSON key-value pairs for sensitive keys
+    .replace(
+      /("(?:app_secret|appSecret|app_id|appId|tenant_access_token|user_access_token|access_token|refresh_token|client_secret|api_key|apiKey|password|secret|token|authorization)"\s*:\s*)"[^"]*"/gi,
+      '$1"[REDACTED]"',
+    )
+    // Query/header/key=value or key: value pairs for sensitive keys
+    .replace(
+      /\b((?:app_secret|appSecret|app_id|appId|tenant_access_token|user_access_token|access_token|refresh_token|client_secret|api_key|apiKey|password|secret|token)\s*[=:]\s*)(?:[^\s,&"'}]+)/gi,
+      "$1[REDACTED]",
+    )
+    // Feishu tenant/user access tokens (e.g. t-g104...)
+    .replace(/\b(t-[a-zA-Z0-9_-]{8,})\b/g, "[REDACTED]");
+
+  if (scrubbed.length > maxLength) {
+    return `${scrubbed.slice(0, 128)}...[truncated:${scrubbed.length}]`;
+  }
+  return scrubbed;
+}
 
 function sanitizeValue(value: unknown, depth = 0): unknown {
   if (value === null || value === undefined) {
@@ -34,10 +75,7 @@ function sanitizeValue(value: unknown, depth = 0): unknown {
     return `[RedactedBuffer:${value.byteLength}B]`;
   }
   if (typeof value === "string") {
-    if (value.length > 512) {
-      return `${value.slice(0, 128)}...[truncated:${value.length}]`;
-    }
-    return value;
+    return redactCredentialString(value);
   }
   if (typeof value === "number" || typeof value === "boolean") {
     return value;
@@ -45,7 +83,7 @@ function sanitizeValue(value: unknown, depth = 0): unknown {
   if (value instanceof Error) {
     return {
       name: value.name,
-      message: value.message,
+      message: redactCredentialString(value.message),
       ...("code" in value && value.code !== undefined ? { code: value.code } : {}),
     };
   }
@@ -66,7 +104,7 @@ function sanitizeValue(value: unknown, depth = 0): unknown {
     }
     return out;
   }
-  return String(value);
+  return redactCredentialString(String(value));
 }
 
 export function sanitizeLogMeta(
@@ -99,10 +137,11 @@ export function createSubsystemLogger(
     if (level === "debug" && !enableDebug) {
       return;
     }
+    const safeMessage = redactCredentialString(message);
     const safeMeta = sanitizeLogMeta(meta);
     const metaSuffix =
       safeMeta && Object.keys(safeMeta).length > 0 ? ` ${JSON.stringify(safeMeta)}` : "";
-    const line = `[${subsystem}] ${message}${metaSuffix}`;
+    const line = `[${subsystem}] ${safeMessage}${metaSuffix}`;
     if (level === "debug") {
       (sink.debug ?? sink.info)(line);
     } else if (level === "info") {

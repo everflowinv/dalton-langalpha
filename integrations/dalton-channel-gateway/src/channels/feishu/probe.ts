@@ -29,6 +29,7 @@ export interface FeishuProbeOptions {
   timeoutMs?: number;
   abortSignal?: AbortSignal;
   skipCache?: boolean;
+  forceRefresh?: boolean;
   client?: Lark.Client;
 }
 
@@ -93,7 +94,7 @@ export async function probeFeishu(
   const now = Date.now();
   pruneProbeCache(now);
 
-  if (!options.skipCache) {
+  if (!options.skipCache && !options.forceRefresh) {
     const cached = probeCache.get(cacheKey);
     if (cached && cached.expiresAt > now) {
       return cached.result;

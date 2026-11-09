@@ -20,6 +20,7 @@ import {
   buildFeishuPostMessageContent,
   buildStructuredCard,
   type FeishuSchema2Card,
+  parseMergeForwardContent,
 } from "./format.js";
 import { parseMessageContent } from "./inbound-parse.js";
 import {
@@ -183,13 +184,24 @@ export function shouldFallbackFromReplyTarget(err: unknown): boolean {
 
 /**
  * Classifies a Feishu SDK or HTTP error into a `ChannelDeliveryError` with the
- * appropriate `outcome` (`"failed"` vs `"unknown"`) and `code`.
+ * appropriate `outcome` (`"failed"`, `"rate_limited"`, or `"unknown"`) and `code`.
+ *
+ * When `options.stage === "upload"`, the message has not yet been dispatched, so
+ * network/5xx/timeout errors are confirmed undelivered (`outcome: "failed"`).
  */
 export function classifyFeishuDeliveryError(
   err: unknown,
   defaultPrefix = "Feishu message send failed",
+  options?: { stage?: "upload" | "send" },
 ): ChannelDeliveryError {
+  const stage = options?.stage ?? "send";
   if (err instanceof ChannelDeliveryError) {
+    if (stage === "upload" && err.outcome === "unknown") {
+      return new ChannelDeliveryError(err.message, {
+        outcome: "failed",
+        code: err.code,
+      });
+    }
     return err;
   }
 
@@ -201,8 +213,7 @@ export function classifyFeishuDeliveryError(
         ? Number.parseInt(meta.feishuCode, 10)
         : undefined;
 
-  const detailMsg =
-    meta.feishuMsg || meta.message || defaultPrefix;
+  const detailMsg = meta.feishuMsg || meta.message || defaultPrefix;
   const formattedMsg = `${defaultPrefix}: ${detailMsg}`;
 
   if (
@@ -211,7 +222,7 @@ export function classifyFeishuDeliveryError(
       FEISHU_SEND_RATE_LIMIT_CODES.has(numericFeishuCode))
   ) {
     return new ChannelDeliveryError(formattedMsg, {
-      outcome: "failed",
+      outcome: "rate_limited",
       code: "rate_limited",
     });
   }
@@ -250,7 +261,7 @@ export function classifyFeishuDeliveryError(
     (meta.httpStatus !== undefined && meta.httpStatus >= 500)
   ) {
     return new ChannelDeliveryError(formattedMsg, {
-      outcome: "unknown",
+      outcome: stage === "upload" ? "failed" : "unknown",
       code: "unavailable",
     });
   }
@@ -263,7 +274,7 @@ export function classifyFeishuDeliveryError(
   ) {
     return new ChannelDeliveryError(formattedMsg, {
       outcome: "failed",
-      code: "not_allowed",
+      code: "unavailable",
     });
   }
 
@@ -282,8 +293,18 @@ export function toFeishuMessageSendResult(
   response: { data?: { message_id?: string } } | undefined,
   chatId: string,
 ): FeishuMessageSendResult {
+  const messageId = response?.data?.message_id?.trim();
+  if (!messageId) {
+    throw new ChannelDeliveryError(
+      "Feishu send succeeded without returning a message_id",
+      {
+        outcome: "unknown",
+        code: "unavailable",
+      },
+    );
+  }
   return {
-    messageId: response?.data?.message_id?.trim() || "unknown",
+    messageId,
     chatId,
   };
 }
@@ -522,14 +543,23 @@ export async function getMessageFeishu(
       return null;
     }
 
-    const item = response.data?.items?.[0];
+    const items = response.data?.items ?? [];
+    const item = items[0];
     if (!item) {
       return null;
     }
 
     const msgType = item.msg_type ?? "text";
     const rawContent = item.body?.content ?? "";
-    const content = parseMessageContent(rawContent, msgType);
+    const content =
+      msgType === "merge_forward" && items.length > 0
+        ? parseMergeForwardContent({
+            items,
+            content: rawContent,
+            formatSubMessage: (subType, subBody) =>
+              parseMessageContent(subBody, subType),
+          })
+        : parseMessageContent(rawContent, msgType);
 
     return {
       messageId: item.message_id ?? params.messageId,

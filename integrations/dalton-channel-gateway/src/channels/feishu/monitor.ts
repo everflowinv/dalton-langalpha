@@ -48,17 +48,16 @@ import {
   createFeishuWSClient,
   type FeishuCredentials,
   type FeishuDomain,
+  type FeishuWSClientOptions,
 } from "./client.js";
 import {
   assertFeishuChatMember,
   getChatInfo,
-  listFeishuDirectoryGroupsLive,
+  listFeishuDirectoryGroupsDetailed,
 } from "./directory.js";
 import {
-  chunkFeishuCardMarkdown,
   chunkFeishuOutboundText,
   shouldUseFeishuCard,
-  withinCardTableLimit,
 } from "./format.js";
 import {
   parseFeishuInboundEvent,
@@ -66,7 +65,11 @@ import {
 } from "./inbound-parse.js";
 import { downloadMessageResourceFeishu, sendMediaFeishu } from "./media.js";
 import { probeFeishu } from "./probe.js";
-import { sendMessageFeishu, sendStructuredCardFeishu } from "./send.js";
+import {
+  getMessageFeishu,
+  sendMessageFeishu,
+  sendStructuredCardFeishu,
+} from "./send.js";
 import {
   normalizeFeishuTarget,
   resolveDaltonOutboundTarget,
@@ -76,16 +79,22 @@ import {
 export interface FeishuWSClientLike {
   start(params: { eventDispatcher: Lark.EventDispatcher }): Promise<void> | void;
   close?(params?: { force?: boolean }): void;
+  getConnectionStatus?(): {
+    state?: "idle" | "connecting" | "connected" | "reconnecting" | "failed";
+    reconnectAttempts?: number;
+  };
 }
 
 export interface MonitorFeishuWebSocketOptions {
   creds: FeishuCredentials;
   botOpenId?: string;
+  resolveBotOpenId?: () => Promise<string | undefined>;
+  client?: Lark.Client;
   onEvent: (event: InboundChannelEvent) => Promise<void>;
   dedupe?: MemoryDedupeGuard;
   queue?: SequentialQueue;
   logger?: SubsystemLogger;
-  wsClientFactory?: (creds: FeishuCredentials) => FeishuWSClientLike;
+  wsClientFactory?: (creds: FeishuWSClientOptions) => FeishuWSClientLike;
   eventDispatcherFactory?: (
     creds: Pick<FeishuCredentials, "encryptKey" | "verificationToken">,
   ) => Lark.EventDispatcher;
@@ -94,8 +103,35 @@ export interface MonitorFeishuWebSocketOptions {
 export interface MonitorFeishuWebSocketHandle {
   wsClient: FeishuWSClientLike;
   eventDispatcher: Lark.EventDispatcher;
+  isConnected(): boolean;
   dispatchRawEvent(rawPayload: unknown): Promise<void>;
   stop(): Promise<void>;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function extractRawMessageMeta(rawPayload: unknown): {
+  chatType?: string;
+  messageType?: string;
+} {
+  if (!isRecord(rawPayload)) {
+    return {};
+  }
+  const eventObj = isRecord(rawPayload.event) ? rawPayload.event : rawPayload;
+  const messageObj = isRecord(eventObj.message) ? eventObj.message : undefined;
+  const chatType =
+    typeof messageObj?.chat_type === "string"
+      ? messageObj.chat_type.trim().toLowerCase()
+      : undefined;
+  const messageType =
+    typeof messageObj?.message_type === "string"
+      ? messageObj.message_type.trim().toLowerCase()
+      : typeof messageObj?.msg_type === "string"
+        ? messageObj.msg_type.trim().toLowerCase()
+        : undefined;
+  return { chatType, messageType };
 }
 
 export async function monitorWebSocket(
@@ -104,9 +140,31 @@ export async function monitorWebSocket(
   const logger = options.logger ?? createSubsystemLogger("feishu/monitor");
   const dedupe = options.dedupe ?? createMemoryDedupe();
   const queue = options.queue ?? createSequentialQueue();
-  const wsClient = (options.wsClientFactory ?? createFeishuWSClient)(
-    options.creds,
-  );
+  const inFlightDedupeKeys = new Set<string>();
+  let currentBotOpenId = options.botOpenId?.trim() || undefined;
+  let wsConnected = false;
+  let stopped = false;
+
+  const wsClient = (options.wsClientFactory ?? createFeishuWSClient)({
+    ...options.creds,
+    logger,
+    onReady: () => {
+      if (!stopped) {
+        wsConnected = true;
+      }
+    },
+    onReconnected: () => {
+      if (!stopped) {
+        wsConnected = true;
+      }
+    },
+    onReconnecting: () => {
+      wsConnected = false;
+    },
+    onError: () => {
+      wsConnected = false;
+    },
+  });
   const eventDispatcher = (
     options.eventDispatcherFactory ?? createEventDispatcher
   )({
@@ -115,30 +173,98 @@ export async function monitorWebSocket(
   });
 
   const dispatchRawEvent = async (rawPayload: unknown): Promise<void> => {
-    const dedupeKey = resolveFeishuMessageDedupeKey(rawPayload);
-    if (dedupeKey && dedupe.check(dedupeKey)) {
+    const dedupeKey = resolveFeishuMessageDedupeKey(
+      rawPayload,
+      options.creds.accountId,
+    );
+    if (
+      dedupeKey &&
+      (dedupe.peek(dedupeKey) || inFlightDedupeKeys.has(dedupeKey))
+    ) {
       logger.debug("Skipping duplicate Feishu inbound message", { dedupeKey });
       return;
     }
 
+    const { chatType, messageType } = extractRawMessageMeta(rawPayload);
+    const isGroupChat =
+      chatType !== undefined &&
+      chatType !== "p2p" &&
+      chatType !== "private" &&
+      chatType !== "dm";
+    if (!currentBotOpenId && isGroupChat && options.resolveBotOpenId) {
+      currentBotOpenId = await options.resolveBotOpenId();
+    }
+
     const parsed = parseFeishuInboundEvent(rawPayload, {
-      botOpenId: options.botOpenId,
+      botOpenId: currentBotOpenId,
     });
     if (!parsed) {
       return;
     }
 
-    await queue.enqueue(parsed.threadScopeKey, async () => {
-      try {
-        await options.onEvent(parsed);
-      } catch (err) {
-        logger.error("Feishu inbound handler error", {
-          messageId: parsed.messageId,
-          threadScopeKey: parsed.threadScopeKey,
-          error: err,
-        });
+    if (dedupeKey) {
+      inFlightDedupeKeys.add(dedupeKey);
+    }
+
+    let turnPromise: Promise<void> | undefined;
+    try {
+      await queue.enqueue(parsed.threadScopeKey, async () => {
+        if (dedupeKey && dedupe.peek(dedupeKey)) {
+          return;
+        }
+        if (
+          messageType === "merge_forward" &&
+          options.client &&
+          parsed.text === "[Merged and Forwarded Message]"
+        ) {
+          const fetched = await getMessageFeishu(options.client, {
+            messageId: parsed.messageId,
+          });
+          if (fetched?.content) {
+            parsed.text = fetched.content;
+          }
+        }
+
+        turnPromise = (async () => {
+          try {
+            await options.onEvent(parsed);
+            if (dedupeKey) {
+              dedupe.record(dedupeKey);
+            }
+          } catch (err) {
+            if (dedupeKey) {
+              dedupe.delete(dedupeKey);
+            }
+            logger.error("Feishu inbound handler error", {
+              messageId: parsed.messageId,
+              threadScopeKey: parsed.threadScopeKey,
+              error: err,
+            });
+          } finally {
+            if (dedupeKey) {
+              inFlightDedupeKeys.delete(dedupeKey);
+            }
+          }
+        })();
+
+        // Hold the per-conversation sequential queue only across the initial
+        // admission/registration handoff window (`codex-4`), then release it
+        // so mid-turn interjections and `/stop` are not blocked by a model turn.
+        await Promise.race([
+          turnPromise,
+          new Promise<void>((resolve) => setTimeout(resolve, 10)),
+        ]);
+      });
+    } catch (err) {
+      if (dedupeKey) {
+        inFlightDedupeKeys.delete(dedupeKey);
       }
-    });
+      throw err;
+    }
+
+    if (turnPromise) {
+      await turnPromise;
+    }
   };
 
   eventDispatcher.register({
@@ -148,12 +274,27 @@ export async function monitorWebSocket(
   });
 
   await wsClient.start({ eventDispatcher });
+  wsConnected = true;
 
   return {
     wsClient,
     eventDispatcher,
+    isConnected: () => {
+      if (stopped) {
+        return false;
+      }
+      if (typeof wsClient.getConnectionStatus === "function") {
+        const status = wsClient.getConnectionStatus();
+        if (status && typeof status.state === "string") {
+          return status.state === "connected";
+        }
+      }
+      return wsConnected;
+    },
     dispatchRawEvent,
     stop: async () => {
+      stopped = true;
+      wsConnected = false;
       try {
         wsClient.close?.({ force: true });
       } catch (err) {
@@ -172,7 +313,7 @@ export interface FeishuChannelAdapterOptions {
   botOpenId?: string;
   maxChunkChars?: number;
   client?: Lark.Client;
-  wsClientFactory?: (creds: FeishuCredentials) => FeishuWSClientLike;
+  wsClientFactory?: (creds: FeishuWSClientOptions) => FeishuWSClientLike;
   eventDispatcherFactory?: (
     creds: Pick<FeishuCredentials, "encryptKey" | "verificationToken">,
   ) => Lark.EventDispatcher;
@@ -193,12 +334,13 @@ export class FeishuChannelAdapter implements ChannelAdapter {
   private botOpenId?: string;
   private clientInstance?: Lark.Client;
   private readonly wsClientFactory?: (
-    creds: FeishuCredentials,
+    creds: FeishuWSClientOptions,
   ) => FeishuWSClientLike;
   private readonly eventDispatcherFactory?: (
     creds: Pick<FeishuCredentials, "encryptKey" | "verificationToken">,
   ) => Lark.EventDispatcher;
   private readonly dedupe: MemoryDedupeGuard;
+  private readonly inFlightDedupeKeys = new Set<string>();
   private readonly queue: SequentialQueue;
   private readonly logger: SubsystemLogger;
   private readonly handlers: Array<(event: InboundChannelEvent) => Promise<void>> =
@@ -229,7 +371,10 @@ export class FeishuChannelAdapter implements ChannelAdapter {
   }
 
   isConnected(): boolean {
-    return this.connected;
+    if (!this.connected || !this.monitorHandle) {
+      return false;
+    }
+    return this.monitorHandle.isConnected();
   }
 
   getBotOpenId(): string | undefined {
@@ -252,8 +397,41 @@ export class FeishuChannelAdapter implements ChannelAdapter {
       domain: this.domain,
       encryptKey: this.encryptKey,
       verificationToken: this.verificationToken,
+      logger: this.logger,
     });
     return this.clientInstance;
+  }
+
+  private async ensureBotOpenId(): Promise<string | undefined> {
+    if (this.botOpenId) {
+      return this.botOpenId;
+    }
+    if (!this.isConfigured()) {
+      return undefined;
+    }
+    const creds: FeishuCredentials = {
+      appId: this.appId,
+      appSecret: this.appSecret,
+      domain: this.domain,
+      encryptKey: this.encryptKey,
+      verificationToken: this.verificationToken,
+      logger: this.logger,
+    };
+    const probe = await probeFeishu(creds, {
+      client: this.clientInstance,
+      skipCache: true,
+      forceRefresh: true,
+    });
+    if (probe.ok && probe.botOpenId) {
+      this.botOpenId = probe.botOpenId;
+      return this.botOpenId;
+    }
+    if (!probe.ok) {
+      this.logger.warn("Feishu bot probe did not return botOpenId", {
+        error: probe.error,
+      });
+    }
+    return undefined;
   }
 
   async start(): Promise<void> {
@@ -270,25 +448,18 @@ export class FeishuChannelAdapter implements ChannelAdapter {
       domain: this.domain,
       encryptKey: this.encryptKey,
       verificationToken: this.verificationToken,
+      logger: this.logger,
     };
 
     if (!this.botOpenId) {
-      const probe = await probeFeishu(creds, {
-        client: this.clientInstance,
-      });
-      if (probe.ok && probe.botOpenId) {
-        this.botOpenId = probe.botOpenId;
-      } else if (!probe.ok) {
-        this.logger.warn("Feishu bot probe did not return botOpenId", {
-          appId: this.appId,
-          error: probe.error,
-        });
-      }
+      await this.ensureBotOpenId();
     }
 
     this.monitorHandle = await monitorWebSocket({
       creds,
       botOpenId: this.botOpenId,
+      resolveBotOpenId: () => this.ensureBotOpenId(),
+      client: this.clientInstance ?? (this.isConfigured() ? this.getClient() : undefined),
       dedupe: this.dedupe,
       queue: this.queue,
       logger: this.logger,
@@ -326,20 +497,92 @@ export class FeishuChannelAdapter implements ChannelAdapter {
       return;
     }
     const dedupeKey = resolveFeishuMessageDedupeKey(rawPayload);
-    if (dedupeKey && this.dedupe.check(dedupeKey)) {
+    if (
+      dedupeKey &&
+      (this.dedupe.peek(dedupeKey) || this.inFlightDedupeKeys.has(dedupeKey))
+    ) {
       return;
     }
+
+    const { chatType, messageType } = extractRawMessageMeta(rawPayload);
+    const isGroupChat =
+      chatType !== undefined &&
+      chatType !== "p2p" &&
+      chatType !== "private" &&
+      chatType !== "dm";
+    if (!this.botOpenId && isGroupChat) {
+      await this.ensureBotOpenId();
+    }
+
     const parsed = parseFeishuInboundEvent(rawPayload, {
       botOpenId: this.botOpenId,
     });
     if (!parsed) {
       return;
     }
-    await this.queue.enqueue(parsed.threadScopeKey, async () => {
-      for (const handler of this.handlers) {
-        await handler(parsed);
+
+    if (dedupeKey) {
+      this.inFlightDedupeKeys.add(dedupeKey);
+    }
+
+    let turnPromise: Promise<void> | undefined;
+    try {
+      await this.queue.enqueue(parsed.threadScopeKey, async () => {
+        if (dedupeKey && this.dedupe.peek(dedupeKey)) {
+          return;
+        }
+        if (
+          messageType === "merge_forward" &&
+          this.clientInstance &&
+          parsed.text === "[Merged and Forwarded Message]"
+        ) {
+          const fetched = await getMessageFeishu(this.clientInstance, {
+            messageId: parsed.messageId,
+          });
+          if (fetched?.content) {
+            parsed.text = fetched.content;
+          }
+        }
+
+        turnPromise = (async () => {
+          try {
+            for (const handler of this.handlers) {
+              await handler(parsed);
+            }
+            if (dedupeKey) {
+              this.dedupe.record(dedupeKey);
+            }
+          } catch (err) {
+            if (dedupeKey) {
+              this.dedupe.delete(dedupeKey);
+            }
+            this.logger.error("Feishu inbound handler error", {
+              messageId: parsed.messageId,
+              threadScopeKey: parsed.threadScopeKey,
+              error: err,
+            });
+          } finally {
+            if (dedupeKey) {
+              this.inFlightDedupeKeys.delete(dedupeKey);
+            }
+          }
+        })();
+
+        await Promise.race([
+          turnPromise,
+          new Promise<void>((resolve) => setTimeout(resolve, 10)),
+        ]);
+      });
+    } catch (err) {
+      if (dedupeKey) {
+        this.inFlightDedupeKeys.delete(dedupeKey);
       }
-    });
+      throw err;
+    }
+
+    if (turnPromise) {
+      await turnPromise;
+    }
   }
 
   splitTextChunks(text: string): string[] {
@@ -368,30 +611,13 @@ export class FeishuChannelAdapter implements ChannelAdapter {
     }
 
     if (shouldUseFeishuCard(options.text)) {
-      if (withinCardTableLimit(options.text)) {
-        const res = await sendStructuredCardFeishu(client, {
-          to: target,
-          text: options.text,
-          replyToMessageId: options.replyToMessageId,
-        });
-        return {
-          messageId: res.messageId,
-          resolvedAddress: options.targetAddress,
-        };
-      }
-
-      const subChunks = chunkFeishuCardMarkdown(options.text);
-      let lastMessageId = "unknown";
-      for (const subChunk of subChunks) {
-        const res = await sendStructuredCardFeishu(client, {
-          to: target,
-          text: subChunk,
-          replyToMessageId: options.replyToMessageId,
-        });
-        lastMessageId = res.messageId;
-      }
+      const res = await sendStructuredCardFeishu(client, {
+        to: target,
+        text: options.text,
+        replyToMessageId: options.replyToMessageId,
+      });
       return {
-        messageId: lastMessageId,
+        messageId: res.messageId,
         resolvedAddress: options.targetAddress,
       };
     }
@@ -488,15 +714,15 @@ export class FeishuChannelAdapter implements ChannelAdapter {
     platformUserId: string;
   }): Promise<AvailableChatsResult> {
     const client = this.getClient();
-    const groups = await listFeishuDirectoryGroupsLive(client);
+    const listing = await listFeishuDirectoryGroupsDetailed(client);
     return {
-      chats: groups.map((group) => ({
+      chats: listing.groups.map((group) => ({
         address: `feishu:${group.id}`,
         name: group.name || group.id,
         kind: "group" as const,
       })),
-      complete: true,
-      error: null,
+      complete: listing.complete,
+      error: listing.error,
     };
   }
 

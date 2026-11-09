@@ -2,21 +2,20 @@
  * Workspace inbound attachment upload helper (`src/shared/workspace-upload.ts`).
  *
  * Design §1.3.1 & §4.1:
- * Delegates to the existing `BackendClient` methods (`ensureHomeWorkspace`,
- * `startWorkspace`, `uploadWorkspaceFile`) in `src/backend-client.ts` rather
- * than duplicating HTTP calls.
+ * Delegates to `BackendClient.uploadWorkspaceFile` in `src/backend-client.ts`.
+ * Workspace readiness (`ensureHomeWorkspace`, `startWorkspace`, and the
+ * "owner may start / colleague must already be running" policy) lives
+ * exclusively in `ChannelGatewayOrchestrator` (`src/orchestrator.ts`) and is
+ * not duplicated here.
  */
 
 import type { BackendClient } from "../backend-client.js";
 import { type ChannelPlatform, MAX_ATTACHMENT_BYTES } from "../types.js";
 
 export interface UploadInboundAttachmentOptions {
-  backendClient: Pick<
-    BackendClient,
-    "ensureHomeWorkspace" | "startWorkspace" | "uploadWorkspaceFile"
-  >;
+  backendClient: Pick<BackendClient, "uploadWorkspaceFile">;
   userId: string;
-  workspaceId?: string | null;
+  workspaceId: string;
   platform: ChannelPlatform | string;
   messageId: string;
   filename: string;
@@ -71,13 +70,10 @@ export async function uploadAttachmentToWorkspace(
     );
   }
 
-  let workspaceId = options.workspaceId?.trim() || "";
+  const workspaceId = options.workspaceId?.trim() || "";
   if (!workspaceId) {
-    const home = await options.backendClient.ensureHomeWorkspace(options.userId);
-    workspaceId = home.workspace_id;
+    throw new Error("workspaceId is required for uploadAttachmentToWorkspace");
   }
-
-  await options.backendClient.startWorkspace(options.userId, workspaceId);
 
   const { workspacePath, safeFilename } = buildInboundAttachmentWorkspacePath({
     platform: options.platform,

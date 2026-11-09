@@ -13,10 +13,18 @@
 
 import type * as Lark from "@larksuiteoapi/node-sdk";
 
+export const MAX_FEISHU_DIRECTORY_PAGES = 100;
+
 export interface FeishuDirectoryGroup {
   kind: "group";
   id: string;
   name?: string;
+}
+
+export interface FeishuDirectoryGroupListResult {
+  groups: FeishuDirectoryGroup[];
+  complete: boolean;
+  error: string | null;
 }
 
 export interface FeishuDirectoryPeer {
@@ -48,25 +56,37 @@ export interface FeishuChatMembersPage {
 
 /**
  * Lists groups the Feishu bot is in via `client.im.chat.list`, guarding
- * pagination with `seenPageTokens` to prevent infinite page-token loops.
+ * pagination with `seenPageTokens` and `MAX_FEISHU_DIRECTORY_PAGES` (`grok-7`, `codex-14`),
+ * and reporting whether the listing is `complete` or was truncated/aborted.
  */
-export async function listFeishuDirectoryGroupsLive(
+export async function listFeishuDirectoryGroupsDetailed(
   client: Lark.Client,
   params: {
     query?: string;
     limit?: number;
     pageSize?: number;
+    maxPages?: number;
   } = {},
-): Promise<FeishuDirectoryGroup[]> {
+): Promise<FeishuDirectoryGroupListResult> {
   const limit = Math.max(1, params.limit ?? 200);
+  const maxPages = Math.max(1, params.maxPages ?? MAX_FEISHU_DIRECTORY_PAGES);
   const q = params.query?.trim().toLowerCase() || "";
   const pageSize = Math.min(Math.max(1, params.pageSize ?? Math.min(limit, 100)), 100);
   const groups: FeishuDirectoryGroup[] = [];
   const seenGroupIds = new Set<string>();
   const seenPageTokens = new Set<string>();
   let pageToken: string | undefined;
+  let pagesFetched = 0;
 
   while (groups.length < limit) {
+    if (pagesFetched >= maxPages) {
+      return {
+        groups,
+        complete: false,
+        error: `Feishu im.chat.list exceeded maximum pagination limit (${maxPages} pages)`,
+      };
+    }
+
     const response = (await client.im.chat.list({
       params: {
         page_size: pageSize,
@@ -81,6 +101,7 @@ export async function listFeishuDirectoryGroupsLive(
         page_token?: string;
       };
     };
+    pagesFetched += 1;
 
     if (response.code !== undefined && response.code !== 0) {
       throw new Error(
@@ -89,7 +110,9 @@ export async function listFeishuDirectoryGroupsLive(
     }
 
     const items = response.data?.items ?? [];
-    for (const chat of items) {
+    let truncatedInPage = false;
+    for (let idx = 0; idx < items.length; idx += 1) {
+      const chat = items[idx]!;
       const chatId = chat.chat_id?.trim();
       if (!chatId || seenGroupIds.has(chatId)) {
         continue;
@@ -100,6 +123,10 @@ export async function listFeishuDirectoryGroupsLive(
         chatId.toLowerCase().includes(q) ||
         (name?.toLowerCase().includes(q) ?? false)
       ) {
+        if (groups.length >= limit) {
+          truncatedInPage = true;
+          break;
+        }
         seenGroupIds.add(chatId);
         groups.push({
           kind: "group",
@@ -107,23 +134,62 @@ export async function listFeishuDirectoryGroupsLive(
           name,
         });
       }
-      if (groups.length >= limit) {
-        break;
-      }
     }
 
-    if (!response.data?.has_more || groups.length >= limit) {
-      break;
+    const hasMore = Boolean(response.data?.has_more);
+    if (truncatedInPage || (groups.length >= limit && hasMore)) {
+      return {
+        groups,
+        complete: false,
+        error: null,
+      };
     }
-    const nextPageToken = response.data.page_token?.trim();
-    if (!nextPageToken || seenPageTokens.has(nextPageToken)) {
-      break;
+
+    if (!hasMore) {
+      return {
+        groups,
+        complete: true,
+        error: null,
+      };
+    }
+
+    const nextPageToken = response.data?.page_token?.trim();
+    if (!nextPageToken) {
+      return {
+        groups,
+        complete: false,
+        error: "Feishu im.chat.list returned has_more=true without a page_token",
+      };
+    }
+    if (seenPageTokens.has(nextPageToken)) {
+      return {
+        groups,
+        complete: false,
+        error: `Feishu im.chat.list returned repeated page_token: ${nextPageToken}`,
+      };
     }
     seenPageTokens.add(nextPageToken);
     pageToken = nextPageToken;
   }
 
-  return groups;
+  return {
+    groups,
+    complete: true,
+    error: null,
+  };
+}
+
+export async function listFeishuDirectoryGroupsLive(
+  client: Lark.Client,
+  params: {
+    query?: string;
+    limit?: number;
+    pageSize?: number;
+    maxPages?: number;
+  } = {},
+): Promise<FeishuDirectoryGroup[]> {
+  const result = await listFeishuDirectoryGroupsDetailed(client, params);
+  return result.groups;
 }
 
 export async function listFeishuDirectoryPeersLive(
@@ -141,8 +207,10 @@ export async function listFeishuDirectoryPeersLive(
   const seenPeerIds = new Set<string>();
   const seenPageTokens = new Set<string>();
   let pageToken: string | undefined;
+  let pagesFetched = 0;
 
-  while (peers.length < limit) {
+  while (peers.length < limit && pagesFetched < MAX_FEISHU_DIRECTORY_PAGES) {
+    pagesFetched += 1;
     const response = (await client.contact.user.list({
       params: {
         page_size: pageSize,
@@ -305,8 +373,10 @@ export async function isFeishuChatMember(
 
   let pageToken: string | undefined;
   const seenPageTokens = new Set<string>();
+  let pagesFetched = 0;
 
-  while (true) {
+  while (pagesFetched < MAX_FEISHU_DIRECTORY_PAGES) {
+    pagesFetched += 1;
     const res = await getChatMembers(client, chatId, 100, pageToken, "open_id");
     if (res.members.some((item) => item.memberId?.trim() === targetOpenId)) {
       return true;
@@ -321,6 +391,7 @@ export async function isFeishuChatMember(
     seenPageTokens.add(nextToken);
     pageToken = nextToken;
   }
+  return false;
 }
 
 export async function assertFeishuChatMember(

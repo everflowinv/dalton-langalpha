@@ -12,6 +12,7 @@
  * Design §4.2 row 4 (`src/channels/feishu/inbound-parse.ts`).
  */
 
+import crypto from "node:crypto";
 import { escapeRegExp } from "../../shared/text.js";
 import type {
   InboundAttachmentDescriptor,
@@ -394,23 +395,138 @@ export function extractInboundAttachments(
   return [];
 }
 
+function resolvePostMediaParts(content?: string): string[] {
+  if (!content) {
+    return [];
+  }
+  const { imageKeys, mediaKeys } = parsePostContent(content);
+  return [
+    ...imageKeys.map((key) => `img:${key}`),
+    ...mediaKeys.map(({ fileKey }) => `media:${fileKey}`),
+  ];
+}
+
+function resolveMessageMediaParts(
+  message: FeishuRawMessage | undefined,
+): string[] {
+  if (!message) {
+    return [];
+  }
+  const messageType = (
+    message.message_type ??
+    message.msg_type ??
+    ""
+  ).trim().toLowerCase();
+  const content = typeof message.content === "string" ? message.content : undefined;
+  if (messageType === "post") {
+    return resolvePostMediaParts(content);
+  }
+  if (
+    !content ||
+    !["image", "file", "audio", "video", "media", "sticker"].includes(
+      messageType,
+    )
+  ) {
+    return [];
+  }
+  const mediaKeys = parseMediaKeys(content, messageType);
+  return [
+    mediaKeys.imageKey ? `img:${mediaKeys.imageKey}` : undefined,
+    mediaKeys.fileKey ? `file:${mediaKeys.fileKey}` : undefined,
+  ].filter((part): part is string => Boolean(part));
+}
+
+function resolveTextRetryDedupeKey(
+  eventObj: FeishuMessageReceiveEventPayload,
+  prefix: string,
+): string | undefined {
+  const message = eventObj.message;
+  if (!message) {
+    return undefined;
+  }
+  const messageType = (
+    message.message_type ??
+    message.msg_type ??
+    ""
+  ).trim().toLowerCase();
+  if (messageType !== "text" && messageType !== "post") {
+    return undefined;
+  }
+  const senderId =
+    eventObj.sender?.sender_id?.open_id?.trim() ||
+    eventObj.sender?.sender_id?.user_id?.trim();
+  const chatId = message.chat_id?.trim();
+  const createTime = message.create_time?.trim();
+  const content = typeof message.content === "string" ? message.content.trim() : "";
+  if (!senderId || !chatId || !createTime || !content) {
+    return undefined;
+  }
+  const contentDigest = crypto
+    .createHash("sha256")
+    .update(content)
+    .digest("hex")
+    .slice(0, 16);
+  return `${prefix}:text:${senderId}:${chatId}:${createTime}:${contentDigest}`;
+}
+
 /**
- * Resolves the canonical deduplication key (`feishu:<message_id>`) from a raw
- * Feishu `im.message.receive_v1` event payload.
+ * Resolves the canonical deduplication key from a raw Feishu
+ * `im.message.receive_v1` event payload, matching
+ * `monitor.account-UbN1RhlP.mjs:803-872` (`grok-11`).
  */
 export function resolveFeishuMessageDedupeKey(
   rawPayload: unknown,
+  accountId?: string,
 ): string | undefined {
   if (!isRecord(rawPayload)) {
     return undefined;
   }
-  const eventObj = isRecord(rawPayload.event) ? rawPayload.event : rawPayload;
-  const messageObj = isRecord(eventObj.message) ? eventObj.message : undefined;
+  const eventObj = (
+    isRecord(rawPayload.event) ? rawPayload.event : rawPayload
+  ) as FeishuMessageReceiveEventPayload;
+  const message = isRecord(eventObj.message)
+    ? (eventObj.message as FeishuRawMessage)
+    : undefined;
   const messageId =
-    (typeof messageObj?.message_id === "string" && messageObj.message_id.trim()) ||
+    (typeof message?.message_id === "string" && message.message_id.trim()) ||
     (typeof rawPayload.message_id === "string" && rawPayload.message_id.trim()) ||
     undefined;
-  return messageId ? `feishu:${messageId}` : undefined;
+
+  const prefix = accountId?.trim() ? `feishu:${accountId.trim()}` : "feishu";
+  const messageType = (
+    message?.message_type ??
+    message?.msg_type ??
+    ""
+  ).trim().toLowerCase();
+  const mediaParts = resolveMessageMediaParts(message);
+
+  if (messageType === "post") {
+    const postKeySuffix = [
+      message?.root_id?.trim() || message?.thread_id?.trim() || undefined,
+      mediaParts.length > 0 ? mediaParts.join("|") : undefined,
+    ]
+      .filter((part): part is string => Boolean(part))
+      .join(":");
+    if (postKeySuffix) {
+      return messageId
+        ? `${prefix}:${messageId}:post:${postKeySuffix}`
+        : `${prefix}:post:${postKeySuffix}`;
+    }
+    if (!messageId) {
+      return resolveTextRetryDedupeKey(eventObj, prefix);
+    }
+    return `${prefix}:${messageId}`;
+  }
+
+  if (mediaParts.length > 0) {
+    return `${prefix}:media:${messageType}:${mediaParts.join("|")}`;
+  }
+
+  if (!messageId) {
+    return resolveTextRetryDedupeKey(eventObj, prefix);
+  }
+
+  return `${prefix}:${messageId}`;
 }
 
 /**
@@ -500,6 +616,7 @@ export function parseFeishuInboundEvent(
       chatType,
       chatId,
       senderOpenId,
+      threadId: message.thread_id,
     }),
     messageId,
     text,

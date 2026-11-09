@@ -13,6 +13,7 @@ import { MAX_ATTACHMENT_BYTES } from "../types.js";
 
 export const DEFAULT_SAFE_FETCH_TIMEOUT_MS = 30_000;
 export const DEFAULT_CHUNK_IDLE_TIMEOUT_MS = 15_000;
+export const MAX_SAFE_FETCH_REDIRECTS = 5;
 
 export class SafeFetchError extends Error {
   readonly code:
@@ -34,11 +35,71 @@ export class SafeFetchError extends Error {
   }
 }
 
+function parseIpv4Octets(text: string): [number, number, number, number] | null {
+  const parts = text.split(".");
+  if (parts.length !== 4) {
+    return null;
+  }
+  const octets: number[] = [];
+  for (const part of parts) {
+    if (!/^\d{1,3}$/.test(part)) {
+      return null;
+    }
+    const n = Number.parseInt(part, 10);
+    if (!Number.isInteger(n) || n < 0 || n > 255) {
+      return null;
+    }
+    octets.push(n);
+  }
+  return [octets[0]!, octets[1]!, octets[2]!, octets[3]!];
+}
+
+function isBlockedIpv4Octets([a, b, c]: [number, number, number, number]): boolean {
+  return (
+    a === 0 || // 0.0.0.0/8
+    a === 10 || // 10.0.0.0/8 RFC1918
+    a === 127 || // 127.0.0.0/8 loopback
+    (a === 169 && b === 254) || // 169.254.0.0/16 link-local / cloud metadata
+    (a === 172 && b >= 16 && b <= 31) || // 172.16.0.0/12 RFC1918
+    (a === 192 && b === 168) || // 192.168.0.0/16 RFC1918
+    (a === 100 && b >= 64 && b <= 127) || // 100.64.0.0/10 CGNAT RFC6598
+    (a === 192 && b === 0 && (c === 0 || c === 2)) || // 192.0.0.0/24, 192.0.2.0/24
+    (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) || // 198.18.0.0/15, 198.51.100.0/24
+    (a === 203 && b === 0 && c === 113) || // 203.0.113.0/24
+    a >= 224 // 224.0.0.0/4 multicast & 240.0.0.0/4 reserved/broadcast
+  );
+}
+
+function extractIpv4FromMappedIpv6(
+  normalizedIpv6: string,
+): [number, number, number, number] | null {
+  const mappedMatch =
+    /^(?:::ffff:(?:0+:)?|(?:0+:){5}ffff:|0*:0*:0*:0*:0*:0*ffff:)(.+)$/i.exec(
+      normalizedIpv6,
+    );
+  const tail = mappedMatch?.[1]?.trim();
+  if (!tail) {
+    return null;
+  }
+  const dotted = parseIpv4Octets(tail);
+  if (dotted) {
+    return dotted;
+  }
+  const hexMatch = /^([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i.exec(tail);
+  if (!hexMatch) {
+    return null;
+  }
+  const hi = Number.parseInt(hexMatch[1]!, 16);
+  const lo = Number.parseInt(hexMatch[2]!, 16);
+  return [(hi >> 8) & 0xff, hi & 0xff, (lo >> 8) & 0xff, lo & 0xff];
+}
+
 export function isBlockedHostnameOrIp(hostname: string): boolean {
   const normalized = hostname
     .trim()
     .toLowerCase()
-    .replace(/^\[|\]$/g, "");
+    .replace(/^\[|\]$/g, "")
+    .replace(/\.$/, "");
   if (!normalized) {
     return true;
   }
@@ -51,41 +112,34 @@ export function isBlockedHostnameOrIp(hostname: string): boolean {
     return true;
   }
 
-  const ipVersion = isIP(normalized);
-  if (ipVersion === 4) {
-    const parts = normalized.split(".").map((p) => Number.parseInt(p, 10));
-    if (parts.length !== 4 || parts.some((n) => Number.isNaN(n))) {
-      return true;
-    }
-    const [a, b] = parts;
-    if (
-      a === 0 ||
-      a === 10 ||
-      a === 127 ||
-      (a === 169 && b === 254) ||
-      (a === 172 && b !== undefined && b >= 16 && b <= 31) ||
-      (a === 192 && b === 168) ||
-      (a === 100 && b !== undefined && b >= 64 && b <= 127)
-    ) {
-      return true;
-    }
-    return false;
+  const ipv4Octets = parseIpv4Octets(normalized);
+  if (ipv4Octets) {
+    return isBlockedIpv4Octets(ipv4Octets);
   }
 
-  if (ipVersion === 6) {
+  const ipVersion = isIP(normalized);
+  if (ipVersion === 4) {
+    return true;
+  }
+
+  if (ipVersion === 6 || normalized.includes(":")) {
     if (
       normalized === "::1" ||
       normalized === "::" ||
-      normalized.startsWith("fc") ||
-      normalized.startsWith("fd") ||
-      normalized.startsWith("fe8") ||
-      normalized.startsWith("fe9") ||
-      normalized.startsWith("fea") ||
-      normalized.startsWith("feb") ||
-      normalized.startsWith("::ffff:127.") ||
-      normalized.startsWith("::ffff:10.") ||
-      normalized.startsWith("::ffff:192.168.")
+      /^0*(?::0*){1,7}$/.test(normalized) ||
+      /^0*(?::0*){0,6}:0*1$/.test(normalized) ||
+      /^f[cd][0-9a-f]{0,2}:/i.test(normalized) ||
+      /^fe[89ab][0-9a-f]?:/i.test(normalized) ||
+      /^ff[0-9a-f]{0,2}:/i.test(normalized) ||
+      /^2001:0*db8:/i.test(normalized)
     ) {
+      return true;
+    }
+    const mappedOctets = extractIpv4FromMappedIpv6(normalized);
+    if (mappedOctets) {
+      return isBlockedIpv4Octets(mappedOctets);
+    }
+    if (normalized.includes("ffff:")) {
       return true;
     }
     return false;
@@ -96,13 +150,17 @@ export function isBlockedHostnameOrIp(hostname: string): boolean {
 
 export function isAllowedAttachmentHostname(
   hostname: string,
-  allowedDomains: readonly string[],
+  allowedDomains?: readonly string[],
 ): boolean {
-  const host = hostname.trim().toLowerCase().replace(/\.$/, "");
+  const host = hostname
+    .trim()
+    .toLowerCase()
+    .replace(/^\[|\]$/g, "")
+    .replace(/\.$/, "");
   if (!host || isBlockedHostnameOrIp(host)) {
     return false;
   }
-  if (allowedDomains.length === 0) {
+  if (!allowedDomains || allowedDomains.length === 0) {
     return false;
   }
   for (const rawDomain of allowedDomains) {
@@ -147,6 +205,7 @@ function toBufferChunk(chunk: unknown): Buffer {
 /**
  * Reads an AsyncIterable / ReadableStream into an in-memory `Buffer` while
  * enforcing `maxBytes` (default 20 MB) and per-chunk idle timeout.
+ * Cancels the active reader/iterator cleanly without unhandled rejections.
  */
 export async function readStreamWithLimit(
   stream: AsyncIterable<unknown> | ReadableStream<Uint8Array>,
@@ -159,59 +218,95 @@ export async function readStreamWithLimit(
   const chunkIdleTimeoutMs =
     options.chunkIdleTimeoutMs ?? DEFAULT_CHUNK_IDLE_TIMEOUT_MS;
 
-  const asyncIterable: AsyncIterable<unknown> =
-    Symbol.asyncIterator in stream
-      ? (stream as AsyncIterable<unknown>)
-      : {
-          async *[Symbol.asyncIterator]() {
-            const reader = (stream as ReadableStream<Uint8Array>).getReader();
-            try {
-              while (true) {
-                const { done, value } = await reader.read();
-                if (done) {
-                  return;
-                }
-                yield value;
-              }
-            } finally {
-              reader.releaseLock();
-            }
-          },
-        };
+  const isWebReadable =
+    typeof (stream as ReadableStream<Uint8Array>).getReader === "function";
 
-  const iterator = asyncIterable[Symbol.asyncIterator]();
+  let readNext: () => Promise<IteratorResult<unknown>>;
+  let cancelSource: () => Promise<void>;
+  let releaseSource: () => Promise<void>;
+
+  if (isWebReadable) {
+    const reader = (stream as ReadableStream<Uint8Array>).getReader();
+    readNext = () => reader.read();
+    cancelSource = async () => {
+      try {
+        await reader.cancel();
+      } catch {
+        // Ignore cancellation errors on aborted/errored streams
+      }
+    };
+    releaseSource = async () => {
+      try {
+        reader.releaseLock();
+      } catch {
+        // Ignore lock release errors
+      }
+    };
+  } else {
+    const iterator = (stream as AsyncIterable<unknown>)[Symbol.asyncIterator]();
+    readNext = () => iterator.next();
+    cancelSource = async () => {
+      try {
+        if (typeof iterator.return === "function") {
+          await iterator.return();
+        }
+      } catch {
+        // Ignore iterator closure errors
+      }
+      try {
+        const destroyable = stream as { destroy?: () => void };
+        if (typeof destroyable.destroy === "function") {
+          destroyable.destroy();
+        }
+      } catch {
+        // Ignore destroy errors
+      }
+    };
+    releaseSource = async () => {
+      try {
+        if (typeof iterator.return === "function") {
+          await iterator.return();
+        }
+      } catch {
+        // Ignore iterator closure errors
+      }
+    };
+  }
+
   const chunks: Buffer[] = [];
   let totalBytes = 0;
   let exhausted = false;
+  let cancelled = false;
 
-  const destroySourceIfPossible = (): void => {
-    const candidate = stream as { destroy?: () => void; cancel?: () => void };
-    if (typeof candidate.destroy === "function") {
-      candidate.destroy();
-    } else if (typeof candidate.cancel === "function") {
-      try {
-        candidate.cancel();
-      } catch {
-        // Ignore cancellation errors on teardown
-      }
+  const safeCancel = async (): Promise<void> => {
+    if (cancelled) {
+      return;
     }
+    cancelled = true;
+    await cancelSource();
   };
 
   try {
     while (true) {
       if (options.signal?.aborted) {
+        await safeCancel();
         throw new SafeFetchError("timeout", "Attachment stream aborted");
       }
 
       let idleTimer: ReturnType<typeof setTimeout> | undefined;
-      const nextPromise = iterator.next();
+      const nextPromise = readNext();
+      // Attach a no-op rejection handler immediately so if idle timeout wins
+      // Promise.race and the pending read later rejects, no unhandled rejection occurs.
+      nextPromise.catch(() => undefined);
+
+      let timedOut = false;
       const raced =
         chunkIdleTimeoutMs > 0
           ? await Promise.race([
               nextPromise,
               new Promise<never>((_, reject) => {
                 idleTimer = setTimeout(() => {
-                  destroySourceIfPossible();
+                  timedOut = true;
                   reject(
                     new SafeFetchError(
                       "timeout",
@@ -227,6 +322,10 @@ export async function readStreamWithLimit(
             })
           : await nextPromise;
 
+      if (timedOut) {
+        await safeCancel();
+      }
+
       if (raced.done) {
         exhausted = true;
         break;
@@ -235,7 +334,7 @@ export async function readStreamWithLimit(
       const buf = toBufferChunk(raced.value);
       totalBytes += buf.byteLength;
       if (totalBytes > maxBytes) {
-        destroySourceIfPossible();
+        await safeCancel();
         throw new SafeFetchError(
           "size_exceeded",
           `Attachment exceeds maximum allowed size of ${maxBytes} bytes`,
@@ -243,10 +342,14 @@ export async function readStreamWithLimit(
       }
       chunks.push(buf);
     }
+  } catch (err) {
+    await safeCancel();
+    throw err;
   } finally {
-    if (!exhausted && typeof iterator.return === "function") {
-      await iterator.return().catch(() => undefined);
+    if (!exhausted && !cancelled) {
+      await safeCancel();
     }
+    await releaseSource();
   }
 
   return Buffer.concat(chunks, totalBytes);
@@ -269,51 +372,66 @@ export interface SafeFetchResult {
   status: number;
 }
 
+async function cancelResponseBody(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // Ignore body cancellation errors
+  }
+}
+
+function validateSafeFetchTargetUrl(
+  targetUrl: URL,
+  allowedDomains: readonly string[] | undefined,
+  isRedirect: boolean,
+): void {
+  const prefix = isRedirect ? "Redirected attachment" : "Attachment";
+  if (targetUrl.protocol !== "https:" && targetUrl.protocol !== "http:") {
+    throw new SafeFetchError(
+      "invalid_url",
+      `Unsupported ${prefix.toLowerCase()} URL protocol: ${targetUrl.protocol}`,
+    );
+  }
+
+  if (targetUrl.username || targetUrl.password) {
+    throw new SafeFetchError(
+      "invalid_url",
+      `${prefix} URL must not contain embedded credentials`,
+    );
+  }
+
+  if (isBlockedHostnameOrIp(targetUrl.hostname)) {
+    throw new SafeFetchError(
+      "blocked_host",
+      `${prefix} host is blocked: ${targetUrl.hostname}`,
+    );
+  }
+
+  if (!isAllowedAttachmentHostname(targetUrl.hostname, allowedDomains)) {
+    throw new SafeFetchError(
+      "disallowed_domain",
+      `${prefix} host "${targetUrl.hostname}" is not in the allowed domain list`,
+    );
+  }
+}
+
 export async function safeFetchBuffer(
   rawUrl: string | URL,
   options: SafeFetchOptions = {},
 ): Promise<SafeFetchResult> {
-  let parsedUrl: URL;
+  let currentUrl: URL;
   try {
-    parsedUrl = typeof rawUrl === "string" ? new URL(rawUrl) : new URL(rawUrl.toString());
+    currentUrl =
+      typeof rawUrl === "string"
+        ? new URL(rawUrl)
+        : new URL(rawUrl.toString());
   } catch (error) {
-    throw new SafeFetchError(
-      "invalid_url",
-      `Invalid attachment URL: ${String(rawUrl)}`,
-      { cause: error },
-    );
+    throw new SafeFetchError("invalid_url", "Invalid attachment URL", {
+      cause: error,
+    });
   }
 
-  if (parsedUrl.protocol !== "https:" && parsedUrl.protocol !== "http:") {
-    throw new SafeFetchError(
-      "invalid_url",
-      `Unsupported attachment URL protocol: ${parsedUrl.protocol}`,
-    );
-  }
-
-  if (parsedUrl.username || parsedUrl.password) {
-    throw new SafeFetchError(
-      "invalid_url",
-      "Attachment URL must not contain embedded credentials",
-    );
-  }
-
-  if (isBlockedHostnameOrIp(parsedUrl.hostname)) {
-    throw new SafeFetchError(
-      "blocked_host",
-      `Attachment host is blocked: ${parsedUrl.hostname}`,
-    );
-  }
-
-  if (
-    options.allowedDomains &&
-    !isAllowedAttachmentHostname(parsedUrl.hostname, options.allowedDomains)
-  ) {
-    throw new SafeFetchError(
-      "disallowed_domain",
-      `Attachment host "${parsedUrl.hostname}" is not in the allowed domain list`,
-    );
-  }
+  validateSafeFetchTargetUrl(currentUrl, options.allowedDomains, false);
 
   const maxBytes = Math.min(
     MAX_ATTACHMENT_BYTES,
@@ -332,51 +450,67 @@ export async function safeFetchBuffer(
 
   try {
     let response: Response;
-    try {
-      response = await fetchFn(parsedUrl.toString(), {
-        method: "GET",
-        headers: options.headers,
-        redirect: "follow",
-        signal: controller.signal,
-      });
-    } catch (error) {
-      if (controller.signal.aborted) {
-        throw new SafeFetchError(
-          "timeout",
-          `Attachment download timed out after ${timeoutMs}ms`,
-          { cause: error },
-        );
-      }
-      throw error;
-    }
+    let redirectHops = 0;
 
-    // If redirected, verify final URL domain as well.
-    if (response.url) {
+    while (true) {
       try {
-        const finalUrl = new URL(response.url);
-        if (isBlockedHostnameOrIp(finalUrl.hostname)) {
+        response = await fetchFn(currentUrl.toString(), {
+          method: "GET",
+          headers: options.headers,
+          redirect: "manual",
+          signal: controller.signal,
+        });
+      } catch (error) {
+        if (controller.signal.aborted) {
           throw new SafeFetchError(
-            "blocked_host",
-            `Redirected attachment host is blocked: ${finalUrl.hostname}`,
+            "timeout",
+            `Attachment download timed out after ${timeoutMs}ms`,
+            { cause: error },
           );
         }
-        if (
-          options.allowedDomains &&
-          !isAllowedAttachmentHostname(finalUrl.hostname, options.allowedDomains)
-        ) {
-          throw new SafeFetchError(
-            "disallowed_domain",
-            `Redirected attachment host "${finalUrl.hostname}" is not in the allowed domain list`,
-          );
-        }
-      } catch (err) {
-        if (err instanceof SafeFetchError) {
-          throw err;
-        }
+        throw error;
       }
+
+      if (response.status >= 300 && response.status < 400) {
+        const locationHeader = response.headers.get("location")?.trim();
+        await cancelResponseBody(response);
+
+        if (!locationHeader) {
+          throw new SafeFetchError(
+            "http_error",
+            `Redirect response HTTP ${response.status} is missing Location header`,
+          );
+        }
+
+        if (redirectHops >= MAX_SAFE_FETCH_REDIRECTS) {
+          throw new SafeFetchError(
+            "http_error",
+            `Attachment download exceeded maximum redirect hops (${MAX_SAFE_FETCH_REDIRECTS})`,
+          );
+        }
+
+        let nextUrl: URL;
+        try {
+          nextUrl = new URL(locationHeader, currentUrl);
+        } catch (error) {
+          throw new SafeFetchError(
+            "invalid_url",
+            "Invalid redirect Location URL",
+            { cause: error },
+          );
+        }
+
+        validateSafeFetchTargetUrl(nextUrl, options.allowedDomains, true);
+        currentUrl = nextUrl;
+        redirectHops += 1;
+        continue;
+      }
+
+      break;
     }
 
     if (!response.ok) {
+      await cancelResponseBody(response);
       throw new SafeFetchError(
         "http_error",
         `Attachment download failed with HTTP ${response.status}`,
@@ -387,11 +521,7 @@ export async function safeFetchBuffer(
     if (contentLengthHeader) {
       const contentLength = Number.parseInt(contentLengthHeader, 10);
       if (Number.isFinite(contentLength) && contentLength > maxBytes) {
-        try {
-          await response.body?.cancel();
-        } catch {
-          // ignore
-        }
+        await cancelResponseBody(response);
         throw new SafeFetchError(
           "size_exceeded",
           `Attachment Content-Length (${contentLength}) exceeds maximum allowed size of ${maxBytes} bytes`,
@@ -405,7 +535,7 @@ export async function safeFetchBuffer(
           chunkIdleTimeoutMs: options.chunkIdleTimeoutMs,
           signal: controller.signal,
         })
-      : Buffer.from(await response.arrayBuffer());
+      : Buffer.alloc(0);
 
     if (buffer.byteLength > maxBytes) {
       throw new SafeFetchError(

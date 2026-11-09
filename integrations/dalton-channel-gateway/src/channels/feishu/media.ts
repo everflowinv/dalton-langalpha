@@ -304,9 +304,23 @@ async function readFeishuResourceResponseBuffer(
   );
 }
 
+function isFeishuHttpStatus(err: unknown, status: number): boolean {
+  if (!isRecord(err)) {
+    return false;
+  }
+  const response = isRecord(err.response) ? err.response : undefined;
+  return (
+    response?.status === status ||
+    err.status === status ||
+    err.httpStatus === status
+  );
+}
+
 /**
  * Downloads an inbound Feishu message attachment (`image` or `file`) into an
  * in-memory `Buffer` while enforcing `maxBytes` (default 20 MB).
+ * Retries once with `type: "media"` when `type: "file"` fails with HTTP 502
+ * (`reply-delivery-result-iCCrdxE1.mjs:2673-2681`).
  */
 export async function downloadMessageResourceFeishu(
   client: Lark.Client,
@@ -328,15 +342,36 @@ export async function downloadMessageResourceFeishu(
     Math.max(1, params.maxBytes ?? FEISHU_MAX_FILE_UPLOAD_BYTES),
   );
 
-  const response = await client.im.messageResource.get({
-    path: {
-      message_id: params.messageId,
-      file_key: params.fileKey,
-    },
-    params: {
-      type: params.type,
-    },
-  });
+  let response: unknown;
+  try {
+    response = await client.im.messageResource.get({
+      path: {
+        message_id: params.messageId,
+        file_key: params.fileKey,
+      },
+      params: {
+        type: params.type,
+      },
+    });
+  } catch (err) {
+    if (params.type === "file" && isFeishuHttpStatus(err, 502)) {
+      try {
+        response = await client.im.messageResource.get({
+          path: {
+            message_id: params.messageId,
+            file_key: params.fileKey,
+          },
+          params: {
+            type: "media" as unknown as "file",
+          },
+        });
+      } catch {
+        throw err;
+      }
+    } else {
+      throw err;
+    }
+  }
 
   const { buffer, contentType, fileName } =
     await readFeishuResourceResponseBuffer(response, maxBytes);
@@ -388,6 +423,7 @@ export async function uploadImageFeishu(
       throw classifyFeishuDeliveryError(
         { response: { status: 200, data: response } },
         "Feishu image upload failed",
+        { stage: "upload" },
       );
     }
 
@@ -401,7 +437,9 @@ export async function uploadImageFeishu(
     }
     return { imageKey };
   } catch (err) {
-    throw classifyFeishuDeliveryError(err, "Feishu image upload failed");
+    throw classifyFeishuDeliveryError(err, "Feishu image upload failed", {
+      stage: "upload",
+    });
   }
 }
 
@@ -442,6 +480,7 @@ export async function uploadFileFeishu(
       throw classifyFeishuDeliveryError(
         { response: { status: 200, data: response } },
         "Feishu file upload failed",
+        { stage: "upload" },
       );
     }
 
@@ -455,7 +494,9 @@ export async function uploadFileFeishu(
     }
     return { fileKey };
   } catch (err) {
-    throw classifyFeishuDeliveryError(err, "Feishu file upload failed");
+    throw classifyFeishuDeliveryError(err, "Feishu file upload failed", {
+      stage: "upload",
+    });
   }
 }
 

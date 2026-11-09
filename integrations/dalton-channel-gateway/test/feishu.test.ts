@@ -11,13 +11,17 @@ import {
   chunkFeishuCardMarkdown,
   chunkFeishuPostMarkdown,
   countMarkdownTables,
+  createFeishuSdkLogger,
   detectIdType,
   FEISHU_CARD_MAX_BYTES,
   FEISHU_CARD_TABLE_LIMIT,
   FEISHU_POST_MAX_BYTES,
   FeishuChannelAdapter,
+  type FeishuWSClientLike,
+  type FeishuWSClientOptions,
   formatFeishuTarget,
   looksLikeFeishuId,
+  materializeFeishuPostMarkdownSoftBreaks,
   normalizeFeishuTarget,
   normalizeMentions,
   normalizeMultipartUploadData,
@@ -36,11 +40,20 @@ import { buildConfiguredAdapters } from "../src/main.js";
 import { createMemoryDedupe } from "../src/shared/dedupe.js";
 import { createSequentialQueue } from "../src/shared/keyed-queue.js";
 import {
+  createSubsystemLogger,
+  redactCredentialString,
+} from "../src/shared/logger.js";
+import {
   isAllowedAttachmentHostname,
+  isBlockedHostnameOrIp,
+  readStreamWithLimit,
   SafeFetchError,
   safeFetchBuffer,
 } from "../src/shared/safe-fetch.js";
-import { convertMarkdownTables } from "../src/shared/text.js";
+import {
+  chunkTextForOutbound,
+  convertMarkdownTables,
+} from "../src/shared/text.js";
 import { downloadWorkspaceFileToBuffer } from "../src/shared/workspace-download.js";
 import { uploadAttachmentToWorkspace } from "../src/shared/workspace-upload.js";
 import type { InboundChannelEvent } from "../src/types.js";
@@ -72,7 +85,7 @@ interface FileCreateCall {
 
 interface MessageResourceGetCall {
   path: { message_id: string; file_key: string };
-  params: { type: "image" | "file" };
+  params: { type: "image" | "file" | "media" };
 }
 
 interface ChatListCall {
@@ -136,59 +149,99 @@ function createFakeLarkClient(overrides?: {
     msg?: string;
     data?: { name?: string; chat_mode?: string; chat_type?: string };
   }>;
-  onChatMembersGet?: (
-    call: ChatMembersGetCall,
-  ) => Promise<{
-    code?: number;
-    msg?: string;
-    data?: {
-      has_more?: boolean;
-      page_token?: string;
-      items?: Array<{ member_id?: string; name?: string }>;
+    onChatMembersGet?: (
+      call: ChatMembersGetCall,
+    ) => Promise<{
+      code?: number;
+      msg?: string;
+      data?: {
+        has_more?: boolean;
+        page_token?: string;
+        items?: Array<{ member_id?: string; name?: string }>;
+      };
+    }>;
+    onMessageGet?: (call: {
+      path: { message_id: string };
+    }) => Promise<{
+      code?: number;
+      msg?: string;
+      data?: {
+        items?: Array<Record<string, unknown>>;
+      };
+    }>;
+    onRequest?: (call: {
+      method: string;
+      url: string;
+      data?: Record<string, unknown>;
+    }) => Promise<unknown>;
+  }) {
+    const calls = {
+      messageCreate: [] as MessageCreateCall[],
+      messageReply: [] as MessageReplyCall[],
+      messageGet: [] as Array<{ path: { message_id: string } }>,
+      imageCreate: [] as ImageCreateCall[],
+      fileCreate: [] as FileCreateCall[],
+      messageResourceGet: [] as MessageResourceGetCall[],
+      chatList: [] as ChatListCall[],
+      chatGet: [] as ChatGetCall[],
+      chatMembersGet: [] as ChatMembersGetCall[],
+      request: [] as Array<{
+        method: string;
+        url: string;
+        data?: Record<string, unknown>;
+      }>,
     };
-  }>;
-}) {
-  const calls = {
-    messageCreate: [] as MessageCreateCall[],
-    messageReply: [] as MessageReplyCall[],
-    imageCreate: [] as ImageCreateCall[],
-    fileCreate: [] as FileCreateCall[],
-    messageResourceGet: [] as MessageResourceGetCall[],
-    chatList: [] as ChatListCall[],
-    chatGet: [] as ChatGetCall[],
-    chatMembersGet: [] as ChatMembersGetCall[],
-  };
 
-  let seq = 1;
+    let seq = 1;
 
-  const client = {
-    im: {
-      message: {
-        create: async (call: MessageCreateCall) => {
-          calls.messageCreate.push(call);
-          if (overrides?.onMessageCreate) {
-            return overrides.onMessageCreate(call);
-          }
-          return {
-            code: 0,
-            data: { message_id: `om_created_${seq++}` },
-          };
-        },
-        reply: async (call: MessageReplyCall) => {
-          calls.messageReply.push(call);
-          if (overrides?.onMessageReply) {
-            return overrides.onMessageReply(call);
-          }
-          return {
-            code: 0,
-            data: { message_id: `om_replied_${seq++}` },
-          };
-        },
-        get: async (_call: { path: { message_id: string } }) => ({
+    const client = {
+      request: async (call: {
+        method: string;
+        url: string;
+        data?: Record<string, unknown>;
+      }) => {
+        calls.request.push(call);
+        if (overrides?.onRequest) {
+          return overrides.onRequest(call);
+        }
+        return {
           code: 0,
-          data: { items: [] },
-        }),
+          bot: { open_id: "ou_bot_probed", app_name: "DaltonBot" },
+        };
       },
+      im: {
+        message: {
+          create: async (call: MessageCreateCall) => {
+            calls.messageCreate.push(call);
+            if (overrides?.onMessageCreate) {
+              return overrides.onMessageCreate(call);
+            }
+            return {
+              code: 0,
+              data: { message_id: `om_created_${seq++}` },
+            };
+          },
+          reply: async (call: MessageReplyCall) => {
+            calls.messageReply.push(call);
+            if (overrides?.onMessageReply) {
+              return overrides.onMessageReply(call);
+            }
+            return {
+              code: 0,
+              data: { message_id: `om_replied_${seq++}` },
+            };
+          },
+          get: async (call: { path: { message_id: string } }) => {
+            calls.messageGet.push(call);
+            if (overrides?.onMessageGet) {
+              return overrides.onMessageGet(call);
+            }
+            return {
+              code: 0,
+              data: { items: [] },
+            };
+          },
+        },
       image: {
         create: async (call: ImageCreateCall) => {
           calls.imageCreate.push(call);
@@ -277,7 +330,7 @@ describe("Feishu conversation ID & target codec", () => {
   it("round-trips oc_, ou_, and on_ targets and conversation scopes", () => {
     expect(detectIdType("oc_chat123")).toBe("chat_id");
     expect(detectIdType("ou_user456")).toBe("open_id");
-    expect(detectIdType("on_union789")).toBe("open_id");
+    expect(detectIdType("on_union789")).toBe("user_id");
     expect(detectIdType("custom_user_id")).toBe("user_id");
 
     expect(resolveReceiveIdType("feishu:oc_chat123")).toBe("chat_id");
@@ -285,7 +338,7 @@ describe("Feishu conversation ID & target codec", () => {
     expect(resolveReceiveIdType("feishu:ou_user456")).toBe("open_id");
     expect(resolveReceiveIdType("user:ou_user456")).toBe("open_id");
     expect(resolveReceiveIdType("user:employee_01")).toBe("user_id");
-    expect(resolveReceiveIdType("on_union789")).toBe("open_id");
+    expect(resolveReceiveIdType("on_union789")).toBe("user_id");
 
     expect(normalizeFeishuTarget("feishu:oc_chat123")).toBe("oc_chat123");
     expect(normalizeFeishuTarget("feishu:@me")).toBe("@me");
@@ -304,7 +357,7 @@ describe("Feishu conversation ID & target codec", () => {
       "on_union789",
     );
     expect(parseFeishuDirectConversationId("feishu:oc_chat123")).toBeUndefined();
-    expect(parseFeishuTargetId("feishu:group:oc_chat123")).toBe("oc_chat123");
+    expect(parseFeishuTargetId("chat:oc_chat123")).toBe("oc_chat123");
 
     const scopes = [
       {
@@ -339,7 +392,9 @@ describe("Feishu conversation ID & target codec", () => {
       expect(decoded?.topicId).toBe(item.topicId);
       expect(decoded?.canonicalConversationId).toBe(encoded);
     }
+  });
 
+  it("formats threadScopeKey as dm:<open_id>, chat:<chat_id>, and chat:<chat_id>:thread:<thread_id>", () => {
     expect(
       buildDaltonFeishuChatAddress({ chatType: "p2p", chatId: "oc_dm_1" }),
     ).toBe("feishu:@me");
@@ -352,14 +407,22 @@ describe("Feishu conversation ID & target codec", () => {
         chatId: "oc_dm_1",
         senderOpenId: "ou_alice",
       }),
-    ).toBe("feishu:p2p:ou_alice");
+    ).toBe("dm:ou_alice");
     expect(
       buildDaltonFeishuThreadScopeKey({
         chatType: "group",
         chatId: "oc_grp_1",
         senderOpenId: "ou_alice",
       }),
-    ).toBe("feishu:group:oc_grp_1");
+    ).toBe("chat:oc_grp_1");
+    expect(
+      buildDaltonFeishuThreadScopeKey({
+        chatType: "group",
+        chatId: "oc_grp_1",
+        senderOpenId: "ou_alice",
+        threadId: "omt_topic_42",
+      }),
+    ).toBe("chat:oc_grp_1:thread:omt_topic_42");
     expect(
       resolveDaltonOutboundTarget({
         targetAddress: "feishu:@me",
@@ -377,7 +440,7 @@ describe("Feishu conversation ID & target codec", () => {
 describe("Feishu inbound event parsing, deduplication & sequential queue", () => {
   const BOT_OPEN_ID = "ou_bot_dalton";
 
-  it("parses DM and group plain text messages and @bot mentions", () => {
+  it("parses DM and group plain text messages, thread_id scopes, and @bot mentions", () => {
     const dmRaw = {
       sender: {
         sender_id: { open_id: "ou_alice_1" },
@@ -400,7 +463,7 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
       chatType: "dm",
       chatAddress: "feishu:@me",
       chatId: "oc_dm_chat_1",
-      threadScopeKey: "feishu:p2p:ou_alice_1",
+      threadScopeKey: "dm:ou_alice_1",
       platformUserId: "ou_alice_1",
       platformUsername: "Alice",
       text: "Analyze NVDA Q4 earnings",
@@ -415,6 +478,7 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
       message: {
         message_id: "om_msg_grp_1",
         parent_id: "om_parent_0",
+        thread_id: "omt_thread_9",
         chat_id: "oc_research_grp",
         chat_type: "group",
         message_type: "text",
@@ -445,7 +509,7 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
       chatType: "group",
       chatAddress: "feishu:oc_research_grp",
       chatId: "oc_research_grp",
-      threadScopeKey: "feishu:group:oc_research_grp",
+      threadScopeKey: "chat:oc_research_grp:thread:omt_thread_9",
       platformUserId: "ou_bob_2",
       text: "@Carol please check the model",
       isGroupTrigger: true,
@@ -469,7 +533,7 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
     ).toBe("/bind 654321");
   });
 
-  it("parses post rich text, image, file, and merge_forward messages", () => {
+  it("parses post rich text, image, and file messages", () => {
     const postRaw = {
       sender: {
         sender_id: { open_id: "ou_alice_1" },
@@ -558,38 +622,124 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
         sizeBytes: 4096,
       },
     ]);
+  });
 
-    const mergeForwardRaw = {
+  it("fetches merge_forward sub-messages via im.message.get when push payload only contains placeholder", async () => {
+    const { client, calls } = createFakeLarkClient({
+      onMessageGet: async () => ({
+        code: 0,
+        data: {
+          items: [
+            {
+              message_id: "om_merge_api_1",
+              msg_type: "merge_forward",
+              body: { content: "Merged and Forwarded Message" },
+            },
+            {
+              message_id: "om_sub_2",
+              upper_message_id: "om_merge_api_1",
+              create_time: "2000",
+              msg_type: "text",
+              body: { content: JSON.stringify({ text: "Second sub-message" }) },
+            },
+            {
+              message_id: "om_sub_1",
+              upper_message_id: "om_merge_api_1",
+              create_time: "1000",
+              msg_type: "text",
+              body: { content: JSON.stringify({ text: "First sub-message" }) },
+            },
+          ],
+        },
+      }),
+    });
+    const adapter = new FeishuChannelAdapter({
+      appId: "cli_test_app",
+      appSecret: "sec_test_secret",
+      botOpenId: BOT_OPEN_ID,
+      client,
+    });
+    const receivedMerge: InboundChannelEvent[] = [];
+    adapter.onInboundEvent(async (ev) => {
+      receivedMerge.push(ev);
+    });
+    await adapter.receiveRawEvent({
       sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
       message: {
-        message_id: "om_merge_1",
+        message_id: "om_merge_api_1",
         chat_id: "oc_dm_1",
         chat_type: "p2p",
         message_type: "merge_forward",
-        content: JSON.stringify({
-          messages: [
-            {
-              msg_type: "text",
-              body: { content: JSON.stringify({ text: "First forwarded line" }) },
-            },
-            {
-              msg_type: "text",
-              body: { content: JSON.stringify({ text: "Second forwarded line" }) },
-            },
-          ],
-        }),
+        content: "Merged and Forwarded Message",
       },
-    };
-    const mergeEvent = parseFeishuInboundEvent(mergeForwardRaw, {
-      botOpenId: BOT_OPEN_ID,
     });
-    expect(mergeEvent?.text).toContain("[Merged and Forwarded Messages]");
-    expect(mergeEvent?.text).toContain("First forwarded line");
-    expect(mergeEvent?.text).toContain("Second forwarded line");
+    expect(calls.messageGet).toHaveLength(1);
+    expect(receivedMerge).toHaveLength(1);
+    expect(receivedMerge[0]?.text).toBe(
+      "[Merged and Forwarded Messages]\n- First sub-message\n- Second sub-message",
+    );
   });
 
-  it("deduplicates repeated message_ids and serializes per-conversation events", async () => {
-    const payload = {
+  it("builds composite Feishu dedupe keys for text, media (file_key/image_key), post (thread_id/root_id), and message_id-less retries", () => {
+    const textPayload = {
+      sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
+      message: {
+        message_id: "om_dup_100",
+        chat_id: "oc_dm_1",
+        chat_type: "p2p",
+        message_type: "text",
+        content: JSON.stringify({ text: "Hello once" }),
+      },
+    };
+    expect(resolveFeishuMessageDedupeKey(textPayload)).toBe("feishu:om_dup_100");
+
+    expect(
+      resolveFeishuMessageDedupeKey({
+        sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
+        message: {
+          message_id: "om_img_dup_1",
+          chat_id: "oc_dm_1",
+          chat_type: "p2p",
+          message_type: "image",
+          content: JSON.stringify({ image_key: "img_v3_dup" }),
+        },
+      }),
+    ).toBe("feishu:media:image:img:img_v3_dup");
+
+    expect(
+      resolveFeishuMessageDedupeKey({
+        sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
+        message: {
+          message_id: "om_post_dup_1",
+          thread_id: "omt_99",
+          chat_id: "oc_grp_1",
+          chat_type: "group",
+          message_type: "post",
+          content: JSON.stringify({
+            zh_cn: {
+              title: "T",
+              content: [[{ tag: "img", image_key: "img_post_99" }]],
+            },
+          }),
+        },
+      }),
+    ).toBe("feishu:om_post_dup_1:post:omt_99:img:img_post_99");
+
+    const noIdKey = resolveFeishuMessageDedupeKey({
+      sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
+      message: {
+        chat_id: "oc_dm_1",
+        chat_type: "p2p",
+        create_time: "1700000000",
+        message_type: "text",
+        content: JSON.stringify({ text: "Retry text" }),
+      },
+    });
+    expect(noIdKey).toMatch(/^feishu:text:ou_alice_1:oc_dm_1:1700000000:[0-9a-f]{16}$/);
+  });
+
+  it("records dedupe key only after handler succeeds and deletes it on handler error so retries can re-run", async () => {
+    const textPayload = {
       sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
       message: {
         message_id: "om_dup_100",
@@ -600,25 +750,101 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
       },
     };
 
-    expect(resolveFeishuMessageDedupeKey(payload)).toBe("feishu:om_dup_100");
-
     const adapter = new FeishuChannelAdapter({
       appId: "cli_test_app",
       appSecret: "sec_test_secret",
       botOpenId: BOT_OPEN_ID,
+      logger: createSubsystemLogger("test", {
+        sink: { info: () => {}, warn: () => {}, error: () => {} },
+      }),
     });
 
+    let attempts = 0;
     const received: InboundChannelEvent[] = [];
     adapter.onInboundEvent(async (ev: InboundChannelEvent) => {
+      attempts += 1;
+      if (attempts === 1) {
+        throw new Error("Simulated transient I-1 failure on first delivery");
+      }
       received.push(ev);
     });
 
-    await adapter.receiveRawEvent(payload);
-    await adapter.receiveRawEvent(payload);
-    expect(received).toHaveLength(1);
-    expect(received[0]?.messageId).toBe("om_dup_100");
+    // 1st delivery fails -> dedupe key rolled back
+    await adapter.receiveRawEvent(textPayload);
+    expect(attempts).toBe(1);
+    expect(received).toHaveLength(0);
 
-    // Verify per-key sequential execution order
+    // 2nd delivery of the exact same message_id retries and succeeds -> dedupe key recorded
+    await adapter.receiveRawEvent(textPayload);
+    expect(attempts).toBe(2);
+    expect(received).toHaveLength(1);
+
+    // 3rd delivery after success is deduplicated
+    await adapter.receiveRawEvent(textPayload);
+    expect(attempts).toBe(2);
+    expect(received).toHaveLength(1);
+  });
+
+  it("releases per-conversation sequential queue after admission handoff so /stop can enter during an active turn", async () => {
+    const turnAdapter = new FeishuChannelAdapter({
+      appId: "cli_test_app",
+      appSecret: "sec_test_secret",
+      botOpenId: BOT_OPEN_ID,
+    });
+    const timeline: string[] = [];
+    let releaseLongTurn!: () => void;
+    const longTurnGate = new Promise<void>((resolve) => {
+      releaseLongTurn = resolve;
+    });
+
+    turnAdapter.onInboundEvent(async (ev: InboundChannelEvent) => {
+      timeline.push(`enter:${ev.messageId}`);
+      if (ev.messageId === "om_turn_1") {
+        await longTurnGate;
+      }
+      timeline.push(`exit:${ev.messageId}`);
+    });
+
+    const pTurn1 = turnAdapter.receiveRawEvent({
+      sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
+      message: {
+        message_id: "om_turn_1",
+        chat_id: "oc_dm_1",
+        chat_type: "p2p",
+        message_type: "text",
+        content: JSON.stringify({ text: "Run long research task" }),
+      },
+    });
+
+    // Wait past the 10ms admission handoff window while om_turn_1 is still running
+    await new Promise((r) => setTimeout(r, 25));
+
+    const pStop = turnAdapter.receiveRawEvent({
+      sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
+      message: {
+        message_id: "om_stop_2",
+        chat_id: "oc_dm_1",
+        chat_type: "p2p",
+        message_type: "text",
+        content: JSON.stringify({ text: "/stop" }),
+      },
+    });
+
+    await pStop;
+    // `/stop` entered AND completed while `om_turn_1` is still running!
+    expect(timeline).toEqual(["enter:om_turn_1", "enter:om_stop_2", "exit:om_stop_2"]);
+
+    releaseLongTurn();
+    await pTurn1;
+    expect(timeline).toEqual([
+      "enter:om_turn_1",
+      "enter:om_stop_2",
+      "exit:om_stop_2",
+      "exit:om_turn_1",
+    ]);
+  });
+
+  it("executes queued tasks sequentially per conversation key in createSequentialQueue", async () => {
     const queue = createSequentialQueue();
     const order: string[] = [];
     const p1 = queue.enqueue("chat_A", async () => {
@@ -631,18 +857,121 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
     await Promise.all([p1, p2]);
     expect(order).toEqual(["A1", "A2"]);
   });
+
+  it("retries botOpenId probe before group messages when initial startup probe fails", async () => {
+    let probeCalls = 0;
+    const { client } = createFakeLarkClient({
+      onRequest: async () => {
+        probeCalls += 1;
+        if (probeCalls === 1) {
+          throw new Error("Temporary network error during startup probe");
+        }
+        return {
+          code: 0,
+          bot: { open_id: BOT_OPEN_ID, app_name: "DaltonBot" },
+        };
+      },
+    });
+
+    const adapter = new FeishuChannelAdapter({
+      appId: "cli_retry_app",
+      appSecret: "sec_retry_secret",
+      client,
+      wsClientFactory: () => ({
+        start: async () => {},
+        close: () => {},
+        getConnectionStatus: () => ({ state: "connected" as const }),
+      }),
+      logger: createSubsystemLogger("test", {
+        sink: { info: () => {}, warn: () => {}, error: () => {} },
+      }),
+    });
+
+    await adapter.start();
+    expect(probeCalls).toBe(1);
+    expect(adapter.getBotOpenId()).toBeUndefined();
+
+    const received: InboundChannelEvent[] = [];
+    adapter.onInboundEvent(async (ev) => {
+      received.push(ev);
+    });
+    await adapter.receiveRawEvent({
+      sender: { sender_id: { open_id: "ou_bob_2" }, sender_type: "user" },
+      message: {
+        message_id: "om_grp_after_retry",
+        chat_id: "oc_grp_retry",
+        chat_type: "group",
+        message_type: "text",
+        content: JSON.stringify({ text: "@_user_1 hello bot" }),
+        mentions: [
+          {
+            key: "@_user_1",
+            id: { open_id: BOT_OPEN_ID },
+            name: "DaltonBot",
+          },
+        ],
+      },
+    });
+
+    expect(probeCalls).toBe(2);
+    expect(adapter.getBotOpenId()).toBe(BOT_OPEN_ID);
+    expect(received).toHaveLength(1);
+    expect(received[0]?.isGroupTrigger).toBe(true);
+    expect(received[0]?.text).toBe("hello bot");
+
+    await adapter.stop();
+  });
+
+  it("tracks live WebSocket connection status across reconnecting and reconnected events", async () => {
+    const { client } = createFakeLarkClient();
+    let wsCallbacks: FeishuWSClientOptions | undefined;
+    let wsState: "connected" | "reconnecting" | "failed" = "connected";
+    const fakeWsClient: FeishuWSClientLike = {
+      start: async () => {
+        wsState = "connected";
+      },
+      close: () => {
+        wsState = "failed";
+      },
+      getConnectionStatus: () => ({ state: wsState }),
+    };
+
+    const adapter = new FeishuChannelAdapter({
+      appId: "cli_ws_app",
+      appSecret: "sec_ws_secret",
+      client,
+      wsClientFactory: (opts) => {
+        wsCallbacks = opts;
+        return fakeWsClient;
+      },
+    });
+
+    await adapter.start();
+    expect(adapter.isConnected()).toBe(true);
+
+    wsState = "reconnecting";
+    wsCallbacks?.onReconnecting?.();
+    expect(adapter.isConnected()).toBe(false);
+
+    wsState = "connected";
+    wsCallbacks?.onReconnected?.();
+    expect(adapter.isConnected()).toBe(true);
+
+    await adapter.stop();
+    expect(adapter.isConnected()).toBe(false);
+  });
 });
 
 describe("Feishu outbound formatting & chunking", () => {
-  it("routes plain text to post and tables/code blocks to Schema 2.0 card", () => {
+  it("routes plain text to post (with AST two-space soft breaks) and tables/code blocks to Schema 2.0 card", () => {
     const plainText = "Here is a concise summary of the quarter.\nNext line.";
     expect(shouldUseFeishuCard(plainText)).toBe(false);
     const postJson = JSON.parse(
       buildFeishuPostMessageContent({ messageText: plainText }),
     );
     expect(postJson.zh_cn.content[0][0].tag).toBe("md");
-    expect(postJson.zh_cn.content[0][0].text).toContain(
-      "Here is a concise summary of the quarter.\n\nNext line.",
+    expect(postJson.zh_cn.content[0][0].text).toBe(
+      "Here is a concise summary of the quarter.  \nNext line.",
     );
 
     const codeMarkdown = "Summary:\n```python\nprint('eps =', 4.25)\n```";
@@ -659,8 +988,14 @@ describe("Feishu outbound formatting & chunking", () => {
     expect(withinCardTableLimit(tableMarkdown)).toBe(true);
   });
 
-  it("splits oversized post and card payloads and enforces <= 5 tables per card", () => {
-    // 1. Oversized post (> 30,720 bytes)
+  it("preserves list structure when materializing soft breaks inside multi-line Markdown list items", () => {
+    const listMarkdown = "- item 1\n  continuation line\n- item 2";
+    expect(materializeFeishuPostMarkdownSoftBreaks(listMarkdown)).toBe(
+      "- item 1  \n  continuation line\n- item 2",
+    );
+  });
+
+  it("splits oversized post payloads within the 30 KB UTF-8 byte limit", () => {
     const hugePlainParagraphs = Array.from(
       { length: 400 },
       (_, idx) =>
@@ -678,8 +1013,41 @@ describe("Feishu outbound formatting & chunking", () => {
         FEISHU_POST_MAX_BYTES,
       );
     }
+  });
 
-    // 2. Markdown with 8 tables (> FEISHU_CARD_TABLE_LIMIT = 5)
+  it("splits oversized multi-byte CJK post payloads within the 30 KB UTF-8 byte limit", () => {
+    const hugeCjkText = Array.from(
+      { length: 250 },
+      (_, idx) => `第${idx + 1}段：${"飞书渠道网关深度研究与财务模型分析报告".repeat(3)}`,
+    ).join("\n\n");
+    expect(Buffer.byteLength(hugeCjkText, "utf8")).toBeGreaterThan(
+      FEISHU_POST_MAX_BYTES,
+    );
+    const cjkChunks = chunkFeishuPostMarkdown(hugeCjkText);
+    expect(cjkChunks.length).toBeGreaterThan(1);
+    for (const chunk of cjkChunks) {
+      const serialized = buildFeishuPostMessageContent({ messageText: chunk });
+      expect(Buffer.byteLength(serialized, "utf8")).toBeLessThanOrEqual(
+        FEISHU_POST_MAX_BYTES,
+      );
+    }
+  });
+
+  it("closes and reopens tilde (~~~) and 4-backtick (````) code fences across outbound chunks", () => {
+    const tildeFenced = `~~~python\n${"x = 1\n".repeat(30)}~~~`;
+    const tildeChunks = chunkTextForOutbound(tildeFenced, 80);
+    expect(tildeChunks.length).toBeGreaterThan(1);
+    expect(tildeChunks[0]?.endsWith("~~~")).toBe(true);
+    expect(tildeChunks[1]?.startsWith("~~~python\n")).toBe(true);
+
+    const quadBacktickFenced = `\`\`\`\`markdown\n\`\`\`ts\nconst a = 1;\n\`\`\`\n${"line\n".repeat(25)}\`\`\`\``;
+    const quadChunks = chunkTextForOutbound(quadBacktickFenced, 80);
+    expect(quadChunks.length).toBeGreaterThan(1);
+    expect(quadChunks[0]?.endsWith("````")).toBe(true);
+    expect(quadChunks[1]?.startsWith("````markdown\n")).toBe(true);
+  });
+
+  it("splits Markdown cards with more than 5 tables and oversized card payloads within limits", () => {
     const eightTablesMarkdown = Array.from({ length: 8 }, (_, idx) =>
       [
         `### Table ${idx + 1}`,
@@ -701,7 +1069,6 @@ describe("Feishu outbound formatting & chunking", () => {
       FEISHU_CARD_TABLE_LIMIT,
     );
 
-    // 3. Oversized card (> 30,720 bytes)
     const hugeCodeMarkdown =
       "```text\n" +
       Array.from(
@@ -796,7 +1163,7 @@ describe("Feishu outbound sending, media upload/download & error classification"
     expect(calls.messageCreate[0]?.data.receive_id).toBe("oc_group_alpha");
   });
 
-  it("uploads images and files and sends media messages, plus downloads inbound attachments", async () => {
+  it("uploads images and files, sends media messages, and downloads inbound attachments", async () => {
     const { client, calls } = createFakeLarkClient();
     const adapter = new FeishuChannelAdapter({
       appId: "cli_app_1",
@@ -854,7 +1221,6 @@ describe("Feishu outbound sending, media upload/download & error classification"
       },
     });
 
-    // Inbound attachment download
     const downloaded = await adapter.downloadAttachment(
       {
         id: "file_key_inbound_1",
@@ -867,7 +1233,7 @@ describe("Feishu outbound sending, media upload/download & error classification"
         chatType: "dm",
         chatAddress: "feishu:@me",
         chatId: "oc_dm_1",
-        threadScopeKey: "feishu:p2p:ou_user_alice",
+        threadScopeKey: "dm:ou_user_alice",
         platformUserId: "ou_user_alice",
         text: "",
       },
@@ -882,17 +1248,89 @@ describe("Feishu outbound sending, media upload/download & error classification"
     });
     expect(downloaded.content.toString("utf8")).toBe("default-resource-bytes");
     expect(downloaded.filename).toBe("memo.pdf");
+  });
 
-    // Multipart normalization check
+  it("retries inbound attachment download with type=media when type=file fails with HTTP 502", async () => {
+    let resourceAttempt = 0;
+    const fallbackFake = createFakeLarkClient({
+      onMessageResourceGet: async (call) => {
+        resourceAttempt += 1;
+        if (resourceAttempt === 1 && call.params.type === "file") {
+          const err = Object.assign(new Error("Request failed with status code 502"), {
+            response: { status: 502 },
+          });
+          throw err;
+        }
+        return {
+          data: Buffer.from("recovered-video-bytes"),
+          headers: { "content-type": "video/mp4" },
+        };
+      },
+    });
+    const fallbackAdapter = new FeishuChannelAdapter({
+      appId: "cli_app_1",
+      appSecret: "secret_1",
+      client: fallbackFake.client,
+    });
+    const recoveredMedia = await fallbackAdapter.downloadAttachment(
+      {
+        id: "file_key_video_502",
+        filename: "clip.mp4",
+        mimeType: "video/mp4",
+      },
+      {
+        platform: "feishu",
+        messageId: "om_inbound_video_88",
+        chatType: "dm",
+        chatAddress: "feishu:@me",
+        chatId: "oc_dm_1",
+        threadScopeKey: "dm:ou_user_alice",
+        platformUserId: "ou_user_alice",
+        text: "",
+        rawPayload: {
+          message: { message_type: "media" },
+        },
+      },
+    );
+    expect(fallbackFake.calls.messageResourceGet).toHaveLength(2);
+    expect(fallbackFake.calls.messageResourceGet[0]?.params.type).toBe("file");
+    expect(fallbackFake.calls.messageResourceGet[1]?.params.type).toBe("media");
+    expect(recoveredMedia.content.toString("utf8")).toBe("recovered-video-bytes");
+  });
+
+  it("converts multipart upload request bodies to FormData and strips json Content-Type header", () => {
     const rawUint8 = new Uint8Array([1, 2, 3]);
     const normalized = normalizeMultipartUploadData({ file: rawUint8 }) as {
       file: Buffer;
     };
     expect(Buffer.isBuffer(normalized.file)).toBe(true);
+
+    const multipartReq = normalizeMultipartUploadData({
+      method: "POST",
+      url: "https://open.feishu.cn/open-apis/im/v1/files",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": "dalton",
+      },
+      data: {
+        file_type: "pdf",
+        file_name: "report.pdf",
+        file: Buffer.from("%PDF-1.7"),
+      },
+    }) as {
+      headers: Record<string, string>;
+      data: FormData;
+    };
+    expect(multipartReq.data).toBeInstanceOf(FormData);
+    expect(multipartReq.headers["Content-Type"]).toBeUndefined();
+    expect(multipartReq.headers["User-Agent"]).toBe("dalton");
+    expect(multipartReq.data.get("file_type")).toBe("pdf");
+    const blobField = multipartReq.data.get("file") as Blob | null;
+    expect(blobField).toBeInstanceOf(Blob);
   });
 
-  it("throws ChannelDeliveryError with accurate outcome and code on failures", async () => {
-    // 1. Rate limit (230020) -> outcome: "failed", code: "rate_limited"
+  it("throws ChannelDeliveryError with accurate outcome and code across send and upload stages", async () => {
+    // 1. Rate limit (230020) -> outcome: "rate_limited", code: "rate_limited" (`grok-8`, `codex-12`)
     const rateLimitedFake = createFakeLarkClient({
       onMessageCreate: async () => ({
         code: 230020,
@@ -913,7 +1351,7 @@ describe("Feishu outbound sending, media upload/download & error classification"
       }),
     ).rejects.toMatchObject({
       name: "ChannelDeliveryError",
-      outcome: "failed",
+      outcome: "rate_limited",
       code: "rate_limited",
     } satisfies Partial<ChannelDeliveryError>);
 
@@ -942,7 +1380,57 @@ describe("Feishu outbound sending, media upload/download & error classification"
       code: "target_not_found",
     } satisfies Partial<ChannelDeliveryError>);
 
-    // 3. Network timeout (ETIMEDOUT) -> outcome: "unknown", code: "unavailable"
+    // 3. Permission denied (99991672 / 403) -> outcome: "failed", code: "not_allowed"
+    const permFake = createFakeLarkClient({
+      onMessageCreate: async () => ({
+        code: 99991672,
+        msg: "Missing required scope im:message",
+      }),
+    });
+    const permAdapter = new FeishuChannelAdapter({
+      appId: "cli_app_1",
+      appSecret: "secret_1",
+      client: permFake.client,
+    });
+    await expect(
+      permAdapter.sendTextChunk({
+        targetAddress: "feishu:oc_group_1",
+        text: "test",
+        chunkIndex: 0,
+        totalChunks: 1,
+      }),
+    ).rejects.toMatchObject({
+      name: "ChannelDeliveryError",
+      outcome: "failed",
+      code: "not_allowed",
+    } satisfies Partial<ChannelDeliveryError>);
+
+    // 4. Confirmed undelivered non-permission 4xx / business error (230099) -> outcome: "failed", code: "unavailable" (`grok-8`)
+    const badReqFake = createFakeLarkClient({
+      onMessageCreate: async () => ({
+        code: 230099,
+        msg: "Invalid message content format",
+      }),
+    });
+    const badReqAdapter = new FeishuChannelAdapter({
+      appId: "cli_app_1",
+      appSecret: "secret_1",
+      client: badReqFake.client,
+    });
+    await expect(
+      badReqAdapter.sendTextChunk({
+        targetAddress: "feishu:oc_group_1",
+        text: "test",
+        chunkIndex: 0,
+        totalChunks: 1,
+      }),
+    ).rejects.toMatchObject({
+      name: "ChannelDeliveryError",
+      outcome: "failed",
+      code: "unavailable",
+    } satisfies Partial<ChannelDeliveryError>);
+
+    // 5. Send-stage network timeout (ETIMEDOUT) -> outcome: "unknown", code: "unavailable"
     const timeoutFake = createFakeLarkClient({
       onMessageCreate: async () => {
         const err = Object.assign(new Error("connect ETIMEDOUT"), {
@@ -968,12 +1456,65 @@ describe("Feishu outbound sending, media upload/download & error classification"
       outcome: "unknown",
       code: "unavailable",
     } satisfies Partial<ChannelDeliveryError>);
+
+    // 6. Upload-stage timeout / 5xx (message not sent yet) -> outcome: "failed", code: "unavailable" (`codex-12`)
+    const uploadTimeoutFake = createFakeLarkClient({
+      onFileCreate: async () => {
+        const err = Object.assign(new Error("upload ETIMEDOUT"), {
+          code: "ETIMEDOUT",
+        });
+        throw err;
+      },
+    });
+    const uploadTimeoutAdapter = new FeishuChannelAdapter({
+      appId: "cli_app_1",
+      appSecret: "secret_1",
+      client: uploadTimeoutFake.client,
+    });
+    await expect(
+      uploadTimeoutAdapter.sendFile({
+        targetAddress: "feishu:oc_group_1",
+        path: "reports/q4.pdf",
+        filename: "q4.pdf",
+        content: Buffer.from("%PDF-1.7"),
+        mimeType: "application/pdf",
+      }),
+    ).rejects.toMatchObject({
+      name: "ChannelDeliveryError",
+      outcome: "failed",
+      code: "unavailable",
+    } satisfies Partial<ChannelDeliveryError>);
+
+    // 7. Missing message_id on code=0 -> outcome: "unknown", code: "unavailable" (`grok-16`)
+    const missingMsgIdFake = createFakeLarkClient({
+      onMessageCreate: async () => ({
+        code: 0,
+        data: {},
+      }),
+    });
+    const missingMsgIdAdapter = new FeishuChannelAdapter({
+      appId: "cli_app_1",
+      appSecret: "secret_1",
+      client: missingMsgIdFake.client,
+    });
+    await expect(
+      missingMsgIdAdapter.sendTextChunk({
+        targetAddress: "feishu:oc_group_1",
+        text: "test",
+        chunkIndex: 0,
+        totalChunks: 1,
+      }),
+    ).rejects.toMatchObject({
+      name: "ChannelDeliveryError",
+      outcome: "unknown",
+      code: "unavailable",
+    } satisfies Partial<ChannelDeliveryError>);
   });
 });
 
 describe("Feishu listAvailableChats pagination, seenPageTokens loop guard & checkTargetLive", () => {
-  it("paginates im.chat.list and breaks on repeated page_token (seenPageTokens)", async () => {
-    const { client, calls } = createFakeLarkClient({
+  it("breaks pagination loop and sets complete=false when im.chat.list returns a repeated page_token", async () => {
+    const { client: cycleClient, calls: cycleCalls } = createFakeLarkClient({
       onChatList: async (call) => {
         if (!call.params.page_token) {
           return {
@@ -991,7 +1532,6 @@ describe("Feishu listAvailableChats pagination, seenPageTokens loop guard & chec
             data: {
               items: [{ chat_id: "oc_page_2", name: "Beta Research" }],
               has_more: true,
-              // Intentional cycle back to tok_page_2 to test seenPageTokens guard!
               page_token: "tok_page_2",
             },
           };
@@ -1000,24 +1540,59 @@ describe("Feishu listAvailableChats pagination, seenPageTokens loop guard & chec
       },
     });
 
-    const adapter = new FeishuChannelAdapter({
+    const cycleAdapter = new FeishuChannelAdapter({
       appId: "cli_app_1",
       appSecret: "secret_1",
-      client,
+      client: cycleClient,
     });
 
-    const result = await adapter.listAvailableChats({
+    const cycleResult = await cycleAdapter.listAvailableChats({
       userId: "user_1",
       platformUserId: "ou_member_1",
     });
 
-    expect(calls.chatList).toHaveLength(2);
-    expect(result.chats).toEqual([
+    expect(cycleCalls.chatList).toHaveLength(2);
+    expect(cycleResult.chats).toEqual([
       { address: "feishu:oc_page_1", name: "Alpha Team", kind: "group" },
       { address: "feishu:oc_page_2", name: "Beta Research", kind: "group" },
     ]);
-    expect(result.complete).toBe(true);
-    expect(result.error).toBeNull();
+    expect(cycleResult.complete).toBe(false);
+    expect(cycleResult.error).toContain("repeated page_token");
+  });
+
+  it("paginates im.chat.list across multiple pages and sets complete=true on normal termination", async () => {
+    const { client: cleanClient } = createFakeLarkClient({
+      onChatList: async (call) => {
+        if (!call.params.page_token) {
+          return {
+            code: 0,
+            data: {
+              items: [{ chat_id: "oc_page_1", name: "Alpha Team" }],
+              has_more: true,
+              page_token: "tok_page_2",
+            },
+          };
+        }
+        return {
+          code: 0,
+          data: {
+            items: [{ chat_id: "oc_page_2", name: "Beta Research" }],
+            has_more: false,
+          },
+        };
+      },
+    });
+    const cleanAdapter = new FeishuChannelAdapter({
+      appId: "cli_app_1",
+      appSecret: "secret_1",
+      client: cleanClient,
+    });
+    const cleanResult = await cleanAdapter.listAvailableChats({
+      userId: "user_1",
+      platformUserId: "ou_member_1",
+    });
+    expect(cleanResult.complete).toBe(true);
+    expect(cleanResult.error).toBeNull();
   });
 
   it("verifies group existence and sender membership in checkTargetLive", async () => {
@@ -1106,7 +1681,7 @@ describe("main.ts adapter registration & shared helpers", () => {
     expect(configuredMap.get("feishu")?.isConfigured()).toBe(true);
   });
 
-  it("enforces domain allowlist and 20 MB cap in safeFetchBuffer and delegates workspace upload/download to BackendClient", async () => {
+  it("rejects safeFetchBuffer by default when allowedDomains is omitted or empty", async () => {
     expect(
       isAllowedAttachmentHostname("internal-api-lark-file.feishu.cn", [
         "feishu.cn",
@@ -1115,22 +1690,191 @@ describe("main.ts adapter registration & shared helpers", () => {
     expect(
       isAllowedAttachmentHostname("127.0.0.1", ["127.0.0.1"]),
     ).toBe(false);
+    expect(
+      isAllowedAttachmentHostname("internal-api-lark-file.feishu.cn", []),
+    ).toBe(false);
+    expect(
+      isAllowedAttachmentHostname("internal-api-lark-file.feishu.cn"),
+    ).toBe(false);
 
     await expect(
-      safeFetchBuffer("https://evil.example.com/file.bin", {
-        allowedDomains: ["feishu.cn"],
-      }),
+      safeFetchBuffer("https://internal-api-lark-file.feishu.cn/file.bin"),
     ).rejects.toMatchObject({
       name: "SafeFetchError",
       code: "disallowed_domain",
     } satisfies Partial<SafeFetchError>);
 
+    try {
+      await safeFetchBuffer("https://user:top_secret_pw@not a valid url", {
+        allowedDomains: ["feishu.cn"],
+      });
+    } catch (err) {
+      expect((err as Error).message).not.toContain("top_secret_pw");
+    }
+  });
+
+  it("validates each manual redirect hop against blocked hosts and allowedDomains in safeFetchBuffer", async () => {
+    const redirectFetchLoopback = vi.fn(async (url: string | URL | Request) => {
+      const urlStr = String(url);
+      if (urlStr.includes("feishu.cn")) {
+        return new Response(null, {
+          status: 302,
+          headers: { location: "http://127.0.0.1:8080/internal-secret" },
+        });
+      }
+      return new Response("leaked", { status: 200 });
+    });
+    await expect(
+      safeFetchBuffer("https://file.feishu.cn/download/1", {
+        allowedDomains: ["feishu.cn"],
+        fetchImpl: redirectFetchLoopback as unknown as typeof fetch,
+      }),
+    ).rejects.toMatchObject({
+      name: "SafeFetchError",
+      code: "blocked_host",
+    } satisfies Partial<SafeFetchError>);
+    expect(redirectFetchLoopback).toHaveBeenCalledTimes(1);
+
+    const redirectFetchDisallowed = vi.fn(async (url: string | URL | Request) => {
+      const urlStr = String(url);
+      if (urlStr.includes("feishu.cn")) {
+        return new Response(null, {
+          status: 302,
+          headers: { location: "https://evil.example.com/payload.bin" },
+        });
+      }
+      return new Response("leaked", { status: 200 });
+    });
+    await expect(
+      safeFetchBuffer("https://file.feishu.cn/download/2", {
+        allowedDomains: ["feishu.cn"],
+        fetchImpl: redirectFetchDisallowed as unknown as typeof fetch,
+      }),
+    ).rejects.toMatchObject({
+      name: "SafeFetchError",
+      code: "disallowed_domain",
+    } satisfies Partial<SafeFetchError>);
+    expect(redirectFetchDisallowed).toHaveBeenCalledTimes(1);
+  });
+
+  it("blocks IPv4-mapped IPv6 private, loopback, and link-local addresses in decimal and hex notation", async () => {
+    expect(isBlockedHostnameOrIp("::ffff:169.254.169.254")).toBe(true);
+    expect(isBlockedHostnameOrIp("[::ffff:a9fe:a9fe]")).toBe(true);
+    expect(isBlockedHostnameOrIp("::ffff:172.16.0.1")).toBe(true);
+    expect(isBlockedHostnameOrIp("[::ffff:ac10:1]")).toBe(true);
+    expect(isBlockedHostnameOrIp("::ffff:100.64.0.1")).toBe(true);
+    expect(isBlockedHostnameOrIp("::ffff:0.0.0.0")).toBe(true);
+
+    await expect(
+      safeFetchBuffer("http://[::ffff:169.254.169.254]/latest/meta-data", {
+        allowedDomains: ["feishu.cn"],
+      }),
+    ).rejects.toMatchObject({
+      name: "SafeFetchError",
+      code: "blocked_host",
+    } satisfies Partial<SafeFetchError>);
+  });
+
+  it("enforces streaming byte limit and cancels the response reader when Content-Length is absent", async () => {
+    let streamCancelled = false;
+    const oversizedWebStream = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.enqueue(new Uint8Array(64));
+      },
+      cancel() {
+        streamCancelled = true;
+      },
+    });
+    const streamingFetch = vi.fn(
+      async () =>
+        new Response(oversizedWebStream, {
+          status: 200,
+          headers: { "content-type": "application/octet-stream" },
+        }),
+    );
+    await expect(
+      safeFetchBuffer("https://file.feishu.cn/stream.bin", {
+        allowedDomains: ["feishu.cn"],
+        maxBytes: 100,
+        fetchImpl: streamingFetch as unknown as typeof fetch,
+      }),
+    ).rejects.toMatchObject({
+      name: "SafeFetchError",
+      code: "size_exceeded",
+    } satisfies Partial<SafeFetchError>);
+    expect(streamCancelled).toBe(true);
+  });
+
+  it("aborts stalled ReadableStream on chunk idle timeout and cancels the reader cleanly", async () => {
+    let stalledStreamCancelled = false;
+    const stalledStream = new ReadableStream<Uint8Array>({
+      start() {
+        // Never enqueues data
+      },
+      cancel() {
+        stalledStreamCancelled = true;
+      },
+    });
+    await expect(
+      readStreamWithLimit(stalledStream, {
+        maxBytes: 1024,
+        chunkIdleTimeoutMs: 20,
+      }),
+    ).rejects.toMatchObject({
+      name: "SafeFetchError",
+      code: "timeout",
+    } satisfies Partial<SafeFetchError>);
+    expect(stalledStreamCancelled).toBe(true);
+  });
+
+  it("scrubs appId, appSecret, and bearer/tenant tokens from Feishu SDK logger and Error.message", () => {
+    const loggedLines: string[] = [];
+    const testLogger = createSubsystemLogger("feishu/test", {
+      sink: {
+        debug: (l) => loggedLines.push(l),
+        info: (l) => loggedLines.push(l),
+        warn: (l) => loggedLines.push(l),
+        error: (l) => loggedLines.push(l),
+      },
+      enableDebug: true,
+    });
+
+    const sdkLogger = createFeishuSdkLogger({
+      appId: "cli_secret_app_id_999",
+      appSecret: "sec_ultra_secret_value_888",
+      logger: testLogger,
+    });
+
+    sdkLogger.error([
+      {
+        message:
+          'Request failed: {"app_id":"cli_secret_app_id_999","app_secret":"sec_ultra_secret_value_888","tenant_access_token":"t-g104999secret"}',
+        config: {
+          url: "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+          data: '{"app_id":"cli_secret_app_id_999","app_secret":"sec_ultra_secret_value_888"}',
+          headers: { Authorization: "Bearer t-g104999secret" },
+        },
+      },
+    ]);
+
+    testLogger.error("Error with token", {
+      error: new Error(
+        "Failed with Bearer secret_jwt_token_123 and app_secret=sec_ultra_secret_value_888",
+      ),
+    });
+
+    const combinedLogs = loggedLines.join("\n");
+    expect(combinedLogs).not.toContain("cli_secret_app_id_999");
+    expect(combinedLogs).not.toContain("sec_ultra_secret_value_888");
+    expect(combinedLogs).not.toContain("t-g104999secret");
+    expect(combinedLogs).not.toContain("secret_jwt_token_123");
+    expect(
+      redactCredentialString('{"app_secret":"my_sec","token":"abc"}'),
+    ).toBe('{"app_secret":"[REDACTED]","token":"[REDACTED]"}');
+  });
+
+  it("delegates workspace upload and download to BackendClient and sanitizes traversal filenames", async () => {
     const fakeBackend = {
-      ensureHomeWorkspace: vi.fn(async () => ({
-        workspace_id: "ws_home_1",
-        status: "ready",
-      })),
-      startWorkspace: vi.fn(async () => ({ status: "running" })),
       uploadWorkspaceFile: vi.fn(async () => undefined),
       downloadWorkspaceFile: vi.fn(async () => ({
         content: Buffer.from("report-bytes"),
@@ -1141,6 +1885,7 @@ describe("main.ts adapter registration & shared helpers", () => {
     const uploaded = await uploadAttachmentToWorkspace({
       backendClient: fakeBackend,
       userId: "user_1",
+      workspaceId: "ws_home_1",
       platform: "feishu",
       messageId: "om_msg_1",
       filename: "../unsafe/chart.png",
@@ -1167,7 +1912,6 @@ describe("main.ts adapter registration & shared helpers", () => {
       "reports/report.pdf",
     );
 
-    // Table conversion helper for non-card fallback
     const converted = convertMarkdownTables(
       "| Col1 | Col2 |\n| --- | --- |\n| A | B |",
       "code",
@@ -1175,7 +1919,6 @@ describe("main.ts adapter registration & shared helpers", () => {
     expect(converted).toContain("```");
     expect(converted).toContain("| Col1 | Col2 |");
 
-    // Memory dedupe TTL expiration
     let now = 1000;
     const dedupe = createMemoryDedupe({ ttlMs: 500, now: () => now });
     expect(dedupe.check("k1")).toBe(false);

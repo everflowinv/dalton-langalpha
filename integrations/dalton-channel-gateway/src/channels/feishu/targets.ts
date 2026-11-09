@@ -44,9 +44,6 @@ export function detectIdType(id: string): FeishuIdType | null {
   if (trimmed.startsWith(OPEN_ID_PREFIX)) {
     return "open_id";
   }
-  if (trimmed.startsWith("on_")) {
-    return "open_id";
-  }
   if (USER_ID_REGEX.test(trimmed)) {
     return "user_id";
   }
@@ -116,15 +113,10 @@ export function resolveReceiveIdType(target: string): FeishuIdType {
   if (raw.startsWith(OPEN_ID_PREFIX)) {
     return "open_id";
   }
-  // Note: `on_` is union_id in Feishu API, or user_id when alphanumeric;
-  // default to open_id for `ou_` / `on_` and user_id otherwise.
-  if (raw.startsWith("on_")) {
-    return "open_id";
-  }
   if (USER_ID_REGEX.test(raw)) {
     return "user_id";
   }
-  return "open_id";
+  return "user_id";
 }
 
 export function looksLikeFeishuId(raw: string): boolean {
@@ -318,20 +310,25 @@ export function buildDaltonFeishuChatAddress(params: {
 }
 
 /**
- * Builds the Dalton `threadScopeKey` per Design §1.5:
- * - DM (`p2p` / `dm`): `"feishu:p2p:<sender_open_id>"`
- * - Group (`group`): `"feishu:group:<chat_id>"`
+ * Builds the Dalton `threadScopeKey` per `src/types.ts` and Design §3.2:
+ * - DM (`p2p` / `dm`): `"dm:<sender_open_id>"`
+ * - Group (`group`): `"chat:<chat_id>"` (or `"chat:<chat_id>:thread:<thread_id>"` when `threadId` is present)
  */
 export function buildDaltonFeishuThreadScopeKey(params: {
   chatType: "dm" | "p2p" | "group";
   chatId: string;
   senderOpenId: string;
+  threadId?: string | null;
 }): string {
   if (params.chatType === "p2p" || params.chatType === "dm") {
-    return `feishu:p2p:${params.senderOpenId.trim()}`;
+    return `dm:${params.senderOpenId.trim()}`;
   }
   const cleanChatId = stripFeishuProviderPrefix(params.chatId);
-  return `feishu:group:${cleanChatId}`;
+  const cleanThreadId = params.threadId?.trim();
+  if (cleanThreadId) {
+    return `chat:${cleanChatId}:thread:${cleanThreadId}`;
+  }
+  return `chat:${cleanChatId}`;
 }
 
 /**

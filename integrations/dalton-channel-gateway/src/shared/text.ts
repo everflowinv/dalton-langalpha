@@ -221,62 +221,84 @@ export function chunkTextForOutbound(text: string, maxChars: number): string[] {
   const results: string[] = [];
   const lines = text.split("\n");
   let current = "";
-  let activeFence: string | null = null;
+  let activeFence: {
+    openLine: string;
+    closeLine: string;
+    markerChar: string;
+    markerLen: number;
+  } | null = null;
 
   const flushCurrent = (): void => {
     if (!current) {
       return;
     }
     if (activeFence) {
-      results.push(`${current}\n\`\`\`\n`.trimEnd());
+      results.push(`${current}\n${activeFence.closeLine}`.trimEnd());
     } else {
       results.push(current);
     }
-    current = activeFence ? `${activeFence}\n` : "";
+    current = activeFence ? activeFence.openLine : "";
   };
 
   for (const line of lines) {
-    const fenceMatch = line.match(/^\s*(```+|~~~+)(.*)$/);
+    const fenceMatch = line.match(/^\s*(`{3,}|~{3,})(.*)$/);
     const candidate = current ? `${current}\n${line}` : line;
-    const fenceClosingReserve = activeFence ? 5 : 0;
+    const fenceClosingReserve = activeFence ? activeFence.closeLine.length + 2 : 0;
 
     if (candidate.length + fenceClosingReserve > limit && current.length > 0) {
       flushCurrent();
     }
 
-    if (line.length + (activeFence ? activeFence.length + 6 : 0) > limit) {
-      if (current && current !== (activeFence ? `${activeFence}\n` : "")) {
+    const fenceOverhead = activeFence
+      ? activeFence.openLine.length + activeFence.closeLine.length + 4
+      : 0;
+    if (line.length + fenceOverhead > limit) {
+      if (current && current !== (activeFence ? activeFence.openLine : "")) {
         flushCurrent();
       }
-      const step = Math.max(1, limit - (activeFence ? activeFence.length + 8 : 0));
+      const step = Math.max(1, limit - fenceOverhead);
       let rest = line;
       while (rest.length > step) {
         const piece = truncateUtf16Safe(rest, step);
         if (activeFence) {
-          results.push(`${activeFence}\n${piece}\n\`\`\``);
+          results.push(
+            `${activeFence.openLine}\n${piece}\n${activeFence.closeLine}`,
+          );
         } else {
           results.push(piece);
         }
         rest = rest.slice(piece.length);
       }
-      current = activeFence ? `${activeFence}\n${rest}` : rest;
+      current = activeFence ? `${activeFence.openLine}\n${rest}` : rest;
     } else {
       current = current ? `${current}\n${line}` : line;
     }
 
     if (fenceMatch) {
-      const marker = fenceMatch[1];
+      const marker = fenceMatch[1]!;
+      const trailing = (fenceMatch[2] ?? "").trim();
       if (!activeFence) {
-        activeFence = `${marker}${fenceMatch[2] ?? ""}`.trimEnd();
-      } else if (marker.startsWith(activeFence.slice(0, 3))) {
+        const markerChar = marker[0]!;
+        const markerLen = marker.length;
+        activeFence = {
+          openLine: `${marker}${fenceMatch[2] ?? ""}`.trimEnd(),
+          closeLine: markerChar.repeat(markerLen),
+          markerChar,
+          markerLen,
+        };
+      } else if (
+        trailing === "" &&
+        marker[0] === activeFence.markerChar &&
+        marker.length >= activeFence.markerLen
+      ) {
         activeFence = null;
       }
     }
   }
 
   if (current) {
-    if (activeFence && current !== `${activeFence}\n`) {
-      results.push(`${current}\n\`\`\``);
+    if (activeFence && current !== activeFence.openLine) {
+      results.push(`${current}\n${activeFence.closeLine}`);
     } else if (!activeFence) {
       results.push(current);
     }

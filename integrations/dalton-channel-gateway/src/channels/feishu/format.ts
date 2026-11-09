@@ -127,60 +127,71 @@ export function shouldUseFeishuCard(text: string): boolean {
   return countMarkdownTables(text) > 0;
 }
 
-export function materializeFeishuPostMarkdownSoftBreaks(text: string): string {
-  const normalized = text.replace(/\r\n?/g, "\n");
-  if (!normalized.includes("\n")) {
-    return normalized;
-  }
-  const lines = normalized.split("\n");
-  if (lines.length < 2) {
-    return normalized;
-  }
-
-  let inFence = false;
-  let fenceMarkerChar = "";
-  let fenceMarkerLength = 0;
-  const output: string[] = [];
-
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index]!;
-    const trimmedStart = line.trimStart();
-    const fenceMatch = trimmedStart.match(/^(`{3,}|~{3,})/);
-
-    if (fenceMatch) {
-      const marker = fenceMatch[1]!;
-      const markerChar = marker[0]!;
-      if (!inFence) {
-        inFence = true;
-        fenceMarkerChar = markerChar;
-        fenceMarkerLength = marker.length;
-      } else if (
-        markerChar === fenceMarkerChar &&
-        marker.length >= fenceMarkerLength &&
-        trimmedStart.slice(marker.length).trim() === ""
-      ) {
-        inFence = false;
-        fenceMarkerChar = "";
-        fenceMarkerLength = 0;
+function collectSoftBreakOffsets(
+  tree: FeishuMarkdownAstNode,
+  text: string,
+): number[] {
+  const offsets = new Set<number>();
+  visitFeishuMarkdown(tree, (node) => {
+    if (node.type !== "text" || typeof (node as { value?: unknown }).value !== "string") {
+      return;
+    }
+    const value = (node as unknown as { value: string }).value;
+    const startOffset = node.position?.start?.offset;
+    if (typeof startOffset !== "number") {
+      return;
+    }
+    for (let index = 0; index < value.length; index += 1) {
+      if (value[index] !== "\n") {
+        continue;
       }
-      output.push(line);
-      continue;
+      const lineBreakOffset = startOffset + index;
+      if (text[lineBreakOffset] === "\n") {
+        offsets.add(lineBreakOffset);
+      }
     }
+  });
+  return [...offsets].sort((left, right) => left - right);
+}
 
-    const nextLine = lines[index + 1];
-    if (
-      inFence ||
-      nextLine === undefined ||
-      line.trim() === "" ||
-      nextLine.trim() === ""
-    ) {
-      output.push(line);
-      continue;
-    }
-    output.push(line, "");
+/**
+ * Materializes Markdown soft line breaks inside AST text nodes by appending
+ * two trailing spaces (`"  "`) before `\n` (or `\r\n`), preserving list/blockquote
+ * structure instead of inserting blank lines (`reply-delivery-result-iCCrdxE1.mjs:495-536`).
+ */
+export function materializeFeishuPostMarkdownSoftBreaks(text: string): string {
+  if (!text.includes("\n")) {
+    return text;
   }
-
-  return output.join("\n");
+  const softBreakOffsets = collectSoftBreakOffsets(
+    parseFeishuMarkdown(text),
+    text,
+  );
+  if (softBreakOffsets.length === 0) {
+    return text;
+  }
+  let cursor = 0;
+  let output = "";
+  for (const lineBreakOffset of softBreakOffsets) {
+    const hasCarriageReturn =
+      lineBreakOffset > cursor && text[lineBreakOffset - 1] === "\r";
+    const breakStart = hasCarriageReturn
+      ? lineBreakOffset - 1
+      : lineBreakOffset;
+    let trimmedBreakStart = breakStart;
+    while (
+      trimmedBreakStart > cursor &&
+      (text[trimmedBreakStart - 1] === " " ||
+        text[trimmedBreakStart - 1] === "\t")
+    ) {
+      trimmedBreakStart -= 1;
+    }
+    output += text.slice(cursor, trimmedBreakStart);
+    output += `  ${hasCarriageReturn ? "\r\n" : "\n"}`;
+    cursor = lineBreakOffset + 1;
+  }
+  output += text.slice(cursor);
+  return output;
 }
 
 export function buildFeishuPostMessagePayload(params: {
@@ -423,6 +434,8 @@ export function chunkFeishuMarkdownByEnvelope(
     fits: (chunk: string) => boolean;
     chunkMode?: ChunkMode;
     initialLimit?: number;
+    payloadBytes?: (chunk: string) => number;
+    maxBytes?: number;
   },
 ): string[] {
   if (!text) {
@@ -435,17 +448,45 @@ export function chunkFeishuMarkdownByEnvelope(
     if (!segment || options.fits(segment)) {
       return segment ? [segment] : [];
     }
-    let limit = Math.min(segment.length - 1, initialLimit);
-    while (limit >= 1) {
-      const candidates = chunkMarkdownTextWithMode(segment, limit, chunkMode);
-      if (candidates.length > 1) {
-        return candidates.flatMap((candidate) =>
-          options.fits(candidate)
-            ? [candidate]
-            : splitOversizedSegment(candidate),
-        );
+    let currentLimit = Math.max(1, Math.min(initialLimit, segment.length - 1));
+    while (currentLimit >= 1) {
+      const candidates = chunkMarkdownTextWithMode(
+        segment,
+        currentLimit,
+        chunkMode,
+      );
+      if (candidates.length > 1 && candidates.every(options.fits)) {
+        return candidates;
       }
-      limit = Math.floor(limit / 2);
+      if (
+        candidates.length > 1 &&
+        candidates[0] &&
+        options.fits(candidates[0])
+      ) {
+        const first = candidates[0];
+        const rest = segment.slice(first.length).replace(/^\n+/, "");
+        if (!rest || rest.length === segment.length) {
+          break;
+        }
+        return [first, ...splitOversizedSegment(rest)];
+      }
+      if (currentLimit === 1) {
+        break;
+      }
+      const firstCandidate = candidates[0] ?? segment;
+      const actualBytes = options.payloadBytes
+        ? options.payloadBytes(firstCandidate)
+        : Buffer.byteLength(firstCandidate, "utf8") * 2;
+      const targetMaxBytes = options.maxBytes ?? initialLimit;
+      const reductionRatio =
+        actualBytes > targetMaxBytes && actualBytes > 0
+          ? (targetMaxBytes / actualBytes) * 0.9
+          : 0.5;
+      const nextLimit = Math.max(
+        1,
+        Math.floor(currentLimit * Math.min(0.75, reductionRatio)),
+      );
+      currentLimit = nextLimit < currentLimit ? nextLimit : currentLimit - 1;
     }
 
     let low = 1;
@@ -478,12 +519,15 @@ export function chunkFeishuPostMarkdown(
   text: string,
   maxBytes: number = FEISHU_POST_MAX_BYTES,
 ): string[] {
+  const measurePostBytes = (chunk: string): number =>
+    Buffer.byteLength(
+      buildFeishuPostMessageContent({ messageText: chunk }),
+      "utf8",
+    );
   return chunkFeishuMarkdownByEnvelope(text, {
-    fits: (chunk) =>
-      Buffer.byteLength(
-        buildFeishuPostMessageContent({ messageText: chunk }),
-        "utf8",
-      ) <= maxBytes,
+    fits: (chunk) => measurePostBytes(chunk) <= maxBytes,
+    payloadBytes: measurePostBytes,
+    maxBytes,
     initialLimit: Math.max(1, Math.min(text.length, maxBytes)),
   });
 }
@@ -567,10 +611,14 @@ export function chunkFeishuCardMarkdown(
   const maxTables = options?.maxTables ?? FEISHU_CARD_TABLE_LIMIT;
 
   const tableSegments = splitMarkdownByTableLimit(text, maxTables);
+  const measureCardBytes = (chunk: string): number =>
+    Buffer.byteLength(JSON.stringify(buildStructuredCard(chunk)), "utf8");
   return tableSegments.flatMap((segment) =>
     chunkFeishuMarkdownByEnvelope(segment, {
       chunkMode: options?.chunkMode,
       initialLimit: Math.max(1, Math.min(segment.length, maxBytes)),
+      payloadBytes: measureCardBytes,
+      maxBytes,
       fits: (chunk) => {
         const card = buildStructuredCard(chunk);
         return (
@@ -849,44 +897,129 @@ export function parseInteractiveCardContent(content: string): string {
   }
 }
 
-export function parseMergeForwardContent(params: {
-  content: string;
-  depth?: number;
-  maxDepth?: number;
-  formatSubMessage?: (msgType: string, bodyContent: string) => string;
-}): string {
+function formatDefaultSubMessageContent(
+  rawBody: string,
+  msgType: string,
+): string {
+  try {
+    const parsed = JSON.parse(rawBody);
+    switch (msgType) {
+      case "text":
+        return isRecord(parsed) && typeof parsed.text === "string"
+          ? parsed.text
+          : rawBody;
+      case "post":
+        return parsePostContent(rawBody).textContent;
+      case "interactive":
+        return parseInteractiveCardContent(rawBody);
+      case "image":
+        return "[Image]";
+      case "file":
+        return `[File: ${isRecord(parsed) && typeof parsed.file_name === "string" ? parsed.file_name : "unknown"}]`;
+      case "audio":
+        return "[Audio]";
+      case "video":
+      case "media":
+        return "[Video]";
+      case "merge_forward":
+        return "[Nested Merged Forward]";
+      default:
+        return `[${msgType}]`;
+    }
+  } catch {
+    return rawBody || `[${msgType}]`;
+  }
+}
+
+function parseCreateTimeInt(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+    return Number.parseInt(value.trim(), 10);
+  }
+  return 0;
+}
+
+/**
+ * Formats sub-messages from a Feishu `merge_forward` message (`im.message.get`
+ * `items` array or JSON string), matching `reply-delivery-result-iCCrdxE1.mjs:2182-2195`.
+ */
+export function parseMergeForwardContent(
+  input:
+    | unknown[]
+    | {
+        content?: string;
+        items?: unknown[];
+        depth?: number;
+        maxDepth?: number;
+        formatSubMessage?: (msgType: string, bodyContent: string) => string;
+      },
+): string {
+  const isArrayInput = Array.isArray(input);
+  const params = isArrayInput ? { items: input } : input;
   const maxDepth = params.maxDepth ?? 3;
   const depth = params.depth ?? 0;
   if (depth >= maxDepth) {
     return "[Merged and Forwarded Message]";
   }
+
   let rawMessages: unknown[];
-  try {
-    const parsed = JSON.parse(params.content);
-    if (Array.isArray(parsed)) {
-      rawMessages = parsed;
-    } else if (isRecord(parsed) && Array.isArray(parsed.messages)) {
-      rawMessages = parsed.messages;
-    } else if (isRecord(parsed) && Array.isArray(parsed.items)) {
-      rawMessages = parsed.items;
-    } else {
+  if (Array.isArray(params.items)) {
+    rawMessages = params.items;
+  } else if (typeof params.content === "string" && params.content.trim()) {
+    try {
+      const parsed = JSON.parse(params.content);
+      if (Array.isArray(parsed)) {
+        rawMessages = parsed;
+      } else if (isRecord(parsed) && Array.isArray(parsed.messages)) {
+        rawMessages = parsed.messages;
+      } else if (isRecord(parsed) && Array.isArray(parsed.items)) {
+        rawMessages = parsed.items;
+      } else {
+        return "[Merged and Forwarded Message]";
+      }
+    } catch {
       return "[Merged and Forwarded Message]";
     }
-  } catch {
+  } else {
     return "[Merged and Forwarded Message]";
   }
 
   if (rawMessages.length === 0) {
-    return "[Merged and Forwarded Message (empty)]";
+    return "[Merged and Forwarded Message - no sub-messages]";
   }
 
-  const lines: string[] = ["[Merged and Forwarded Messages]"];
-  const indent = "  ".repeat(depth + 1);
+  const recordItems = rawMessages.filter(isRecord);
+  const hasApiHierarchy = recordItems.some(
+    (item) =>
+      typeof item.upper_message_id === "string" ||
+      (item.msg_type === "merge_forward" && !item.upper_message_id && recordItems.length > 1),
+  );
 
-  for (const item of rawMessages) {
-    if (!isRecord(item)) {
-      continue;
+  let subMessages: Record<string, unknown>[];
+  if (hasApiHierarchy) {
+    const container = recordItems.find(
+      (item) => item.msg_type === "merge_forward" && !item.upper_message_id,
+    );
+    subMessages = container
+      ? recordItems.filter((item) => item !== container)
+      : recordItems.filter((item) => Boolean(item.upper_message_id));
+    if (subMessages.length === 0) {
+      return "[Merged and Forwarded Message - no sub-messages found]";
     }
+    subMessages = [...subMessages].sort(
+      (a, b) => parseCreateTimeInt(a.create_time) - parseCreateTimeInt(b.create_time),
+    );
+  } else {
+    subMessages = recordItems;
+  }
+
+  const maxMessages = 50;
+  const lines: string[] = ["[Merged and Forwarded Messages]"];
+  const indent = depth > 0 ? "  ".repeat(depth + 1) : "";
+
+  for (const item of subMessages.slice(0, maxMessages)) {
     const msgType =
       (typeof item.msg_type === "string" ? item.msg_type : undefined) ??
       (typeof item.message_type === "string" ? item.message_type : undefined) ??
@@ -897,19 +1030,29 @@ export function parseMergeForwardContent(params: {
       (typeof item.content === "string" ? item.content : "");
     let formatted: string;
     if (msgType === "merge_forward") {
-      formatted = parseMergeForwardContent({
-        content: rawBody,
-        depth: depth + 1,
-        maxDepth,
-        formatSubMessage: params.formatSubMessage,
-      });
+      formatted = hasApiHierarchy
+        ? "[Nested Merged Forward]"
+        : parseMergeForwardContent({
+            content: rawBody,
+            depth: depth + 1,
+            maxDepth,
+            formatSubMessage: params.formatSubMessage,
+          });
     } else if (params.formatSubMessage) {
       formatted = params.formatSubMessage(msgType, rawBody);
     } else {
-      formatted = rawBody;
+      formatted = formatDefaultSubMessageContent(rawBody, msgType);
     }
     lines.push(`${indent}- ${formatted}`);
   }
 
-  return lines.join("\n");
+  if (subMessages.length > maxMessages) {
+    lines.push(`... and ${subMessages.length - maxMessages} more messages`);
+  }
+
+  const rendered = lines.join("\n");
+  if (rendered.length <= 20_000) {
+    return rendered;
+  }
+  return `${rendered.slice(0, 19_961).trimEnd()}\n... [Merged-forward content truncated]`;
 }
