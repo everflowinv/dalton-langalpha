@@ -53,6 +53,7 @@ from src.dalton.data_jobs.manifest import (
 )
 from src.dalton.data_jobs.runner_wrapper import (
     DEFAULT_TMPFS_OUTBOX_DIR,
+    CHILD_SITE_DIR,
     EXIT_CODE_NO_OUTPUT_TIMEOUT,
     EXIT_CODE_TOTAL_TIMEOUT,
     TASK_NOTIFY_PAYLOAD_SOURCES,
@@ -990,7 +991,10 @@ async def test_wrapper_redacts_stdout_stderr_and_outbox_and_sets_env(tmp_path: P
     assert child_env["DALTON_NO_DIRECT_SEND"] == "1"
     assert child_env["DALTON_NOTIFY_DRY_RUN"] == "1"
     assert child_env["DALTON_OUTBOX_FILE"] == f"{DEFAULT_TMPFS_OUTBOX_DIR}/outbox.json"
-    assert child_env["PYTHONPATH"] == "/Users/everflow/.openclaw/workspace/scripts"
+    assert child_env["PYTHONPATH"] == os.pathsep.join(
+        [str(CHILD_SITE_DIR), "/Users/everflow/.openclaw/workspace/scripts"]
+    )
+    assert (CHILD_SITE_DIR / "sitecustomize.py").is_file()
 
     post_cutover_env = build_child_env(
         base_env={"PYTHONPATH": "/app:/app/src"},
@@ -1001,7 +1005,8 @@ async def test_wrapper_redacts_stdout_stderr_and_outbox_and_sets_env(tmp_path: P
         secret_env=secrets,
     )
     assert post_cutover_env["DALTON_NOTIFY_DRY_RUN"] == "0"
-    assert "PYTHONPATH" not in post_cutover_env
+    # Only the CJK-font sitecustomize directory remains on the child path.
+    assert post_cutover_env["PYTHONPATH"] == str(CHILD_SITE_DIR)
 
     staging_tmpfs = tmp_path / "tmpfs_outbox"
     staging_tmpfs.mkdir()
