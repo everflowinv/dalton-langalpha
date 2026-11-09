@@ -41,6 +41,16 @@ def test_bbg_uses_task_workspace_and_python(tmp_path, conversion_succeeds):
         'printf "%s\\n" "$dest" >> "$TEST_TRANSFERS"\n'
         'printf "new data\\n" > "$dest"\n',
     )
+    for command in ("tee", "rm", "mv"):
+        binary = f"/bin/{command}" if command in ("rm", "mv") else "/usr/bin/tee"
+        _executable(
+            commands / command,
+            "#!/bin/sh\n"
+            'for arg do\n'
+            '  case "$arg" in -*) continue ;; "$TEST_WORKSPACE"/temp/*) ;; *) exit 90 ;; esac\n'
+            'done\n'
+            f'exec {binary} "$@"\n',
+        )
     python = commands / "task-python"
     _executable(
         python,
@@ -81,3 +91,20 @@ def test_bbg_uses_task_workspace_and_python(tmp_path, conversion_succeeds):
     assert all(str(workspace / "temp") in p for p in transfers.read_text().splitlines())
     assert str(workspace / "scripts/bbg_export_to_csv.py") in python_calls.read_text()
     assert (workspace / "temp/bbg_remote_refresh.log").is_file()
+
+    foreign_workspace = tmp_path / "foreign workspace"
+    foreign_temp = foreign_workspace / "temp"
+    foreign_temp.mkdir(parents=True)
+    for name in ("bbg_remote_refresh.log", "bbg_data_remote.incoming.csv", "bbg_data_remote.incoming.xlsx"):
+        (foreign_temp / name).write_text("preserved\n")
+    altered_entry = tmp_path / "fixed-workspace.sh"
+    altered_entry.write_text(ENTRY.read_text().replace(
+        'WORKSPACE="${OPENCLAW_WORKSPACE:-/Users/everflow/.openclaw/workspace}"',
+        f"WORKSPACE={shlex.quote(str(foreign_workspace))}",
+    ))
+    rejected = subprocess.run(
+        ["bash", str(altered_entry), "--pull-only"],
+        env=env, capture_output=True, text=True, timeout=10,
+    )
+    assert rejected.returncode != 0
+    assert all(path.read_text() == "preserved\n" for path in foreign_temp.iterdir())
