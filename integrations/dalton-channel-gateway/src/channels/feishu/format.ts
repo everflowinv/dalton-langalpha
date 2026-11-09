@@ -1,0 +1,1445 @@
+/**
+ * Feishu outbound formatting (Post rich text & Schema 2.0 Interactive Cards),
+ * Markdown table/size chunking, and inbound Post/Card/MergeForward rendering.
+ *
+ * Adapted from:
+ * - `.agy/ref_openclaw_channels/feishu/dist/.setup/reply-delivery-result-iCCrdxE1.mjs` (lines 36–630)
+ * - `.agy/ref_openclaw_channels/feishu/dist/.setup/monitor.account-UbN1RhlP.mjs` (lines 295–345)
+ * License: MIT, © OpenClaw contributors.
+ *
+ * Design §4.2 row 5 (`src/channels/feishu/format.ts`).
+ */
+
+import { fromMarkdown } from "mdast-util-from-markdown";
+import { gfmTableFromMarkdown } from "mdast-util-gfm-table";
+import { gfmTable } from "micromark-extension-gfm-table";
+import { chunkMarkdownTextWithMode, type ChunkMode } from "../../shared/text.js";
+
+export const FEISHU_POST_MAX_BYTES = 30_720;
+export const FEISHU_CARD_MAX_BYTES = 30_720;
+export const FEISHU_CARD_MAX_ELEMENTS = 200;
+export const FEISHU_CARD_TABLE_LIMIT = 5;
+
+export interface FeishuMarkdownAstNode {
+  type: string;
+  children?: FeishuMarkdownAstNode[];
+  position?: {
+    start?: { line: number; column: number; offset?: number };
+    end?: { line: number; column: number; offset?: number };
+  };
+  [key: string]: unknown;
+}
+
+export interface FeishuSchema2CardElement {
+  tag: "markdown" | "hr" | "div" | "button" | "action";
+  content?: string;
+  [key: string]: unknown;
+}
+
+export interface FeishuSchema2Card {
+  schema: "2.0";
+  config: {
+    width_mode?: "fill" | "default";
+    wide_screen_mode?: boolean;
+    [key: string]: unknown;
+  };
+  header?: {
+    title: {
+      tag: "plain_text";
+      content: string;
+    };
+    template?: string;
+  };
+  body: {
+    elements: FeishuSchema2CardElement[];
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+const feishuMarkdownExtensions = [gfmTable()];
+const feishuMdastExtensions = [gfmTableFromMarkdown()];
+
+export function parseFeishuMarkdown(text: string): FeishuMarkdownAstNode {
+  return fromMarkdown(text, {
+    extensions: feishuMarkdownExtensions,
+    mdastExtensions: feishuMdastExtensions,
+  }) as unknown as FeishuMarkdownAstNode;
+}
+
+export function visitFeishuMarkdown(
+  tree: FeishuMarkdownAstNode,
+  visitor: (node: FeishuMarkdownAstNode) => void,
+): void {
+  const stack: FeishuMarkdownAstNode[] = [tree];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (!current) {
+      continue;
+    }
+    visitor(current);
+    if (!Array.isArray(current.children)) {
+      continue;
+    }
+    for (let index = current.children.length - 1; index >= 0; index -= 1) {
+      const child = current.children[index];
+      if (child && typeof child === "object" && "type" in child) {
+        stack.push(child);
+      }
+    }
+  }
+}
+
+export function countMarkdownTables(text: string): number {
+  if (!text.includes("|")) {
+    return 0;
+  }
+  let tables = 0;
+  visitFeishuMarkdown(parseFeishuMarkdown(text), (node) => {
+    if (node.type === "table") {
+      tables += 1;
+    }
+  });
+  return tables;
+}
+
+export function withinCardTableLimit(
+  text: string,
+  maxTables: number = FEISHU_CARD_TABLE_LIMIT,
+): boolean {
+  return countMarkdownTables(text) <= maxTables;
+}
+
+/**
+ * Determines whether outbound Markdown text should be rendered as a Schema 2.0
+ * interactive card (contains fenced code blocks or GFM tables) rather than a
+ * rich-text `post` message.
+ */
+export function shouldUseFeishuCard(text: string): boolean {
+  if (/```[\s\S]*?```/.test(text) || /~~~[\s\S]*?~~~/.test(text)) {
+    return true;
+  }
+  if (!text.includes("|")) {
+    return false;
+  }
+  return countMarkdownTables(text) > 0;
+}
+
+function collectSoftBreakOffsets(
+  tree: FeishuMarkdownAstNode,
+  text: string,
+): number[] {
+  const offsets: number[] = [];
+  visitFeishuMarkdown(tree, (node) => {
+    if (node.type !== "text") {
+      return;
+    }
+    const start = node.position?.start?.offset;
+    const end = node.position?.end?.offset;
+    if (typeof start !== "number" || typeof end !== "number") {
+      return;
+    }
+    for (let offset = start; offset < end; offset += 1) {
+      const char = text[offset];
+      if (char === "\n") {
+        if (text[offset - 1] !== "\r") {
+          offsets.push(offset);
+        }
+        continue;
+      }
+      if (char === "\r") {
+        offsets.push(offset);
+        if (text[offset + 1] === "\n") {
+          offset += 1;
+        }
+      }
+    }
+  });
+  return offsets.sort((left, right) => left - right);
+}
+
+/**
+ * Materializes Markdown soft line breaks inside AST text nodes by appending
+ * two trailing spaces (`"  "`) before `\n` (or `\r\n` / `\r`), preserving list/blockquote
+ * structure instead of inserting blank lines (`reply-delivery-result-iCCrdxE1.mjs:495-536`).
+ */
+export function materializeFeishuPostMarkdownSoftBreaks(text: string): string {
+  if (!text.includes("\n") && !text.includes("\r")) {
+    return text;
+  }
+  const softBreakOffsets = collectSoftBreakOffsets(
+    parseFeishuMarkdown(text),
+    text,
+  );
+  if (softBreakOffsets.length === 0) {
+    return text;
+  }
+  let cursor = 0;
+  let output = "";
+  for (const offset of softBreakOffsets) {
+    const lineEnding =
+      text[offset] === "\r"
+        ? text[offset + 1] === "\n"
+          ? "\r\n"
+          : "\r"
+        : "\n";
+    let trimmedBreakStart = offset;
+    while (
+      trimmedBreakStart > cursor &&
+      (text[trimmedBreakStart - 1] === " " ||
+        text[trimmedBreakStart - 1] === "\t")
+    ) {
+      trimmedBreakStart -= 1;
+    }
+    output += text.slice(cursor, trimmedBreakStart);
+    output += `  ${lineEnding}`;
+    cursor = offset + lineEnding.length;
+  }
+  output += text.slice(cursor);
+  return output;
+}
+
+export function buildFeishuPostMessagePayload(params: {
+  messageText: string;
+}): {
+  zh_cn: {
+    content: Array<Array<{ tag: "md"; text: string }>>;
+  };
+} {
+  return {
+    zh_cn: {
+      content: [
+        [
+          {
+            tag: "md",
+            text: materializeFeishuPostMarkdownSoftBreaks(params.messageText),
+          },
+        ],
+      ],
+    },
+  };
+}
+
+export function buildFeishuPostMessageContent(params: {
+  messageText: string;
+}): string {
+  return JSON.stringify(buildFeishuPostMessagePayload(params));
+}
+
+export function escapeFeishuCardPlainText(text: string): string {
+  return text.replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+const FEISHU_CARD_ALLOWED_OPEN_TAG_RE =
+  /^<(?:font\b[^>\n]*|at\b[^>\n]*|text_tag\b[^>\n]*|[biu]|del|s|br\s*\/?)>/i;
+const FEISHU_CARD_ALLOWED_CLOSE_TAG_RE =
+  /^<\/(?:font|at|text_tag|[biu]|del|s)>/i;
+
+function isAllowedFeishuCardTag(text: string, ltIndex: number): boolean {
+  const rest = text.slice(ltIndex);
+  return (
+    FEISHU_CARD_ALLOWED_OPEN_TAG_RE.test(rest) ||
+    FEISHU_CARD_ALLOWED_CLOSE_TAG_RE.test(rest)
+  );
+}
+
+function escapeNonFeishuTagAngles(segment: string): string {
+  let out = "";
+  for (let index = 0; index < segment.length; index += 1) {
+    const ch = segment[index]!;
+    if (ch !== "<") {
+      out += ch;
+      continue;
+    }
+    if (isAllowedFeishuCardTag(segment, index)) {
+      const closeIndex = segment.indexOf(">", index + 1);
+      if (closeIndex !== -1) {
+        out += segment.slice(index, closeIndex + 1);
+        index = closeIndex;
+        continue;
+      }
+    }
+    out += "&lt;";
+  }
+  return out;
+}
+
+export function escapeFeishuCardMarkdownText(text: string): string {
+  if (!text.includes("<")) {
+    return text;
+  }
+  const pattern = /(```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]+`)/g;
+  let out = "";
+  let lastIndex = 0;
+  for (const match of text.matchAll(pattern)) {
+    const matchIndex = match.index ?? 0;
+    out += escapeNonFeishuTagAngles(text.slice(lastIndex, matchIndex));
+    out += match[0];
+    lastIndex = matchIndex + match[0].length;
+  }
+  out += escapeNonFeishuTagAngles(text.slice(lastIndex));
+  return out;
+}
+
+function splitMarkdownSectionsByHr(text: string): string[] {
+  const lines = text.split("\n");
+  const sections: string[] = [];
+  let current: string[] = [];
+  let inFence = false;
+
+  for (const line of lines) {
+    if (/^\s*(```|~~~)/.test(line)) {
+      inFence = !inFence;
+      current.push(line);
+      continue;
+    }
+    if (!inFence && /^\s*(?:-\s*){3,}$|^\s*(?:\*\s*){3,}$|^\s*(?:_\s*){3,}$/.test(line)) {
+      sections.push(current.join("\n"));
+      current = [];
+      continue;
+    }
+    current.push(line);
+  }
+  sections.push(current.join("\n"));
+  return sections;
+}
+
+/**
+ * Builds a Schema 2.0 Feishu interactive card (`schema: "2.0"`).
+ */
+export function buildStructuredCard(
+  text: string,
+  options?: { title?: string; template?: string },
+): FeishuSchema2Card {
+  const sections = splitMarkdownSectionsByHr(text);
+  const elements: FeishuSchema2CardElement[] = [];
+
+  for (let i = 0; i < sections.length; i += 1) {
+    const content = sections[i]!.trim();
+    if (content) {
+      elements.push({
+        tag: "markdown",
+        content: escapeFeishuCardMarkdownText(content),
+      });
+    }
+    if (i < sections.length - 1) {
+      elements.push({ tag: "hr" });
+    }
+  }
+
+  if (elements.length === 0) {
+    elements.push({
+      tag: "markdown",
+      content: escapeFeishuCardMarkdownText(text),
+    });
+  }
+
+  const title = options?.title?.trim();
+  return {
+    schema: "2.0",
+    config: {
+      width_mode: "fill",
+    },
+    ...(title
+      ? {
+          header: {
+            title: {
+              tag: "plain_text",
+              content: title,
+            },
+            template: options?.template ?? "blue",
+          },
+        }
+      : {}),
+    body: {
+      elements,
+    },
+  };
+}
+
+function countCardBodyElements(card: Record<string, unknown>): number {
+  const body = isRecord(card.body) ? card.body : undefined;
+  const elements = Array.isArray(body?.elements)
+    ? body.elements
+    : Array.isArray(card.elements)
+      ? card.elements
+      : [];
+  let total = elements.length;
+  for (const element of elements) {
+    if (!isRecord(element)) {
+      continue;
+    }
+    if (element.tag === "action" && Array.isArray(element.actions)) {
+      total += element.actions.length;
+    }
+  }
+  return total;
+}
+
+export function isFeishuCardWithinEnvelope(
+  card: Record<string, unknown> | FeishuSchema2Card,
+  options?: { maxBytes?: number; maxElements?: number },
+): boolean {
+  const maxBytes = options?.maxBytes ?? FEISHU_CARD_MAX_BYTES;
+  const maxElements = options?.maxElements ?? FEISHU_CARD_MAX_ELEMENTS;
+  return (
+    Buffer.byteLength(JSON.stringify(card), "utf8") <= maxBytes &&
+    countCardBodyElements(card as Record<string, unknown>) <= maxElements
+  );
+}
+
+export function feishuCardWithinTableLimit(
+  card: Record<string, unknown> | FeishuSchema2Card,
+  maxTables: number = FEISHU_CARD_TABLE_LIMIT,
+): boolean {
+  const rawCard = card as Record<string, unknown>;
+  const body = isRecord(rawCard.body) ? rawCard.body : undefined;
+  const elements = Array.isArray(body?.elements)
+    ? body.elements
+    : Array.isArray(rawCard.elements)
+      ? rawCard.elements
+      : [];
+  let tables = 0;
+  for (const element of elements) {
+    if (!isRecord(element) || typeof element.content !== "string") {
+      continue;
+    }
+    tables += countMarkdownTables(element.content);
+    if (tables > maxTables) {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function assertFeishuCardWithinEnvelope(
+  card: Record<string, unknown> | FeishuSchema2Card,
+  context = "Feishu card",
+  options?: { maxBytes?: number; maxElements?: number },
+): void {
+  const maxBytes = options?.maxBytes ?? FEISHU_CARD_MAX_BYTES;
+  const maxElements = options?.maxElements ?? FEISHU_CARD_MAX_ELEMENTS;
+  const bytes = Buffer.byteLength(JSON.stringify(card), "utf8");
+  if (bytes > maxBytes) {
+    throw new Error(
+      `${context} exceeds ${maxBytes} byte card limit (${bytes} bytes)`,
+    );
+  }
+  const elements = countCardBodyElements(card as Record<string, unknown>);
+  if (elements > maxElements) {
+    throw new Error(
+      `${context} exceeds ${maxElements} element card limit (${elements} elements)`,
+    );
+  }
+}
+
+export function chunkFeishuMarkdownByEnvelope(
+  text: string,
+  options: {
+    fits: (chunk: string) => boolean;
+    chunkMode?: ChunkMode;
+    initialLimit?: number;
+    payloadBytes?: (chunk: string) => number;
+    maxBytes?: number;
+  },
+): string[] {
+  if (!text) {
+    return [];
+  }
+  const chunkMode = options.chunkMode ?? "length";
+  const initialLimit = Math.max(1, options.initialLimit ?? text.length);
+
+  const splitOversizedSegment = (segment: string): string[] => {
+    if (!segment || options.fits(segment)) {
+      return segment ? [segment] : [];
+    }
+    let currentLimit = Math.max(1, Math.min(initialLimit, segment.length - 1));
+    while (currentLimit >= 1) {
+      const candidates = chunkMarkdownTextWithMode(
+        segment,
+        currentLimit,
+        chunkMode,
+      );
+      let largestContentBytes = 0;
+      let oversizedChunk: string | undefined;
+      for (const chunk of candidates) {
+        const bytes = options.payloadBytes
+          ? options.payloadBytes(chunk)
+          : Buffer.byteLength(chunk, "utf8") * 2;
+        largestContentBytes = Math.max(largestContentBytes, bytes);
+        if (!options.fits(chunk) && oversizedChunk === undefined) {
+          oversizedChunk = chunk;
+        }
+      }
+      if (oversizedChunk === undefined && candidates.length > 0) {
+        return candidates;
+      }
+      if (currentLimit === 1) {
+        break;
+      }
+      const targetMaxBytes = options.maxBytes ?? initialLimit;
+      const effectiveBase = Math.min(
+        currentLimit,
+        (oversizedChunk ?? segment).length,
+      );
+      const ratioLimit =
+        largestContentBytes > targetMaxBytes && largestContentBytes > 0
+          ? Math.floor((effectiveBase * targetMaxBytes) / largestContentBytes) -
+            1
+          : Math.floor(effectiveBase * 0.75);
+      currentLimit = Math.max(1, Math.min(currentLimit - 1, ratioLimit));
+    }
+
+    let low = 1;
+    let high = segment.length;
+    let best = 1;
+    while (low <= high) {
+      const mid = Math.floor((low + high) / 2);
+      const prefix = segment.slice(0, mid);
+      if (options.fits(prefix)) {
+        best = mid;
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+    let splitAt = best;
+    const prevCode = segment.charCodeAt(splitAt - 1);
+    if (splitAt > 1 && prevCode >= 0xd800 && prevCode <= 0xdbff) {
+      splitAt -= 1;
+    }
+    while (splitAt > 1 && !options.fits(segment.slice(0, splitAt))) {
+      splitAt -= 1;
+      const code = segment.charCodeAt(splitAt - 1);
+      if (splitAt > 1 && code >= 0xd800 && code <= 0xdbff) {
+        splitAt -= 1;
+      }
+    }
+    const head = segment.slice(0, splitAt);
+    const tail = segment.slice(splitAt);
+    return [head, ...(tail ? splitOversizedSegment(tail) : [])];
+  };
+
+  return splitOversizedSegment(text);
+}
+
+export function chunkFeishuPostMarkdown(
+  text: string,
+  maxBytes: number = FEISHU_POST_MAX_BYTES,
+): string[] {
+  const measurePostBytes = (chunk: string): number =>
+    Buffer.byteLength(
+      buildFeishuPostMessageContent({ messageText: chunk }),
+      "utf8",
+    );
+  return chunkFeishuMarkdownByEnvelope(text, {
+    fits: (chunk) => measurePostBytes(chunk) <= maxBytes,
+    payloadBytes: measurePostBytes,
+    maxBytes,
+    initialLimit: Math.max(1, Math.min(text.length, maxBytes)),
+  });
+}
+
+/**
+ * Splits Markdown containing more than `maxTables` (default 5) GFM tables into
+ * segments where each segment contains at most `maxTables` tables.
+ */
+export function splitMarkdownByTableLimit(
+  text: string,
+  maxTables: number = FEISHU_CARD_TABLE_LIMIT,
+): string[] {
+  if (!text) {
+    return [];
+  }
+  const limit = Math.max(1, maxTables);
+  if ( withinCardTableLimit(text, limit) ) {
+    return [text];
+  }
+
+  const tree = parseFeishuMarkdown(text);
+  const tableEndOffsets: number[] = [];
+  visitFeishuMarkdown(tree, (node) => {
+    if (node.type === "table") {
+      const endOffset = node.position?.end?.offset;
+      if (typeof endOffset === "number" && endOffset > 0) {
+        tableEndOffsets.push(endOffset);
+      }
+    }
+  });
+  tableEndOffsets.sort((a, b) => a - b);
+
+  if (tableEndOffsets.length <= limit) {
+    return [text];
+  }
+
+  const chunks: string[] = [];
+  let startOffset = 0;
+  for (let i = limit - 1; i < tableEndOffsets.length; i += limit) {
+    const cutOffset = tableEndOffsets[i]!;
+    // Advance past trailing newline if present
+    let sliceEnd = cutOffset;
+    while (sliceEnd < text.length && (text[sliceEnd] === "\r" || text[sliceEnd] === "\n")) {
+      sliceEnd += 1;
+    }
+    const piece = text.slice(startOffset, sliceEnd).trim();
+    if (piece.length > 0) {
+      chunks.push(piece);
+    }
+    startOffset = sliceEnd;
+  }
+
+  const remainder = text.slice(startOffset).trim();
+  if (remainder.length > 0) {
+    chunks.push(remainder);
+  }
+
+  return chunks.length > 0 ? chunks : [text];
+}
+
+/**
+ * Splits Markdown for Schema 2.0 Interactive Cards so that every returned chunk:
+ * 1. Contains at most `FEISHU_CARD_TABLE_LIMIT` (5) Markdown tables;
+ * 2. Serializes to at most `FEISHU_CARD_MAX_BYTES` (30,720 bytes) and
+ *    `FEISHU_CARD_MAX_ELEMENTS` (200 elements).
+ */
+export function chunkFeishuCardMarkdown(
+  text: string,
+  options?: {
+    maxBytes?: number;
+    maxElements?: number;
+    maxTables?: number;
+    chunkMode?: ChunkMode;
+  },
+): string[] {
+  if (!text) {
+    return [];
+  }
+  const maxBytes = options?.maxBytes ?? FEISHU_CARD_MAX_BYTES;
+  const maxElements = options?.maxElements ?? FEISHU_CARD_MAX_ELEMENTS;
+  const maxTables = options?.maxTables ?? FEISHU_CARD_TABLE_LIMIT;
+
+  const tableSegments = splitMarkdownByTableLimit(text, maxTables);
+  const measureCardBytes = (chunk: string): number =>
+    Buffer.byteLength(JSON.stringify(buildStructuredCard(chunk)), "utf8");
+  return tableSegments.flatMap((segment) =>
+    chunkFeishuMarkdownByEnvelope(segment, {
+      chunkMode: options?.chunkMode,
+      initialLimit: Math.max(1, Math.min(segment.length, maxBytes)),
+      payloadBytes: measureCardBytes,
+      maxBytes,
+      fits: (chunk) => {
+        const card = buildStructuredCard(chunk);
+        return (
+          isFeishuCardWithinEnvelope(card, { maxBytes, maxElements }) &&
+          feishuCardWithinTableLimit(card, maxTables)
+        );
+      },
+    }),
+  );
+}
+
+/**
+ * High-level outbound text chunker for `FeishuChannelAdapter.splitTextChunks`.
+ * Initial chunking uses Schema 2.0 card rules when `shouldUseFeishuCard(text)` is
+ * true or rich-text `post` rules otherwise, then verifies and re-chunks each
+ * resulting piece in the final format (`card` vs `post`) that `sendTextChunk`
+ * will select for that piece so no chunk exceeds its serialized byte envelope.
+ */
+export function chunkFeishuOutboundText(
+  text: string,
+  options?: {
+    maxBytes?: number;
+    maxTables?: number;
+  },
+): string[] {
+  if (!text) {
+    return [];
+  }
+  const maxTables = options?.maxTables ?? FEISHU_CARD_TABLE_LIMIT;
+  const cardMaxBytes = options?.maxBytes ?? FEISHU_CARD_MAX_BYTES;
+  const postMaxBytes = options?.maxBytes ?? FEISHU_POST_MAX_BYTES;
+
+  const initialChunks = shouldUseFeishuCard(text)
+    ? chunkFeishuCardMarkdown(text, {
+        maxBytes: cardMaxBytes,
+        maxTables,
+      })
+    : chunkFeishuPostMarkdown(text, postMaxBytes);
+
+  const finalizeChunk = (chunk: string): string[] => {
+    if (!chunk) {
+      return [];
+    }
+    if (shouldUseFeishuCard(chunk)) {
+      const card = buildStructuredCard(chunk);
+      if (
+        isFeishuCardWithinEnvelope(card, {
+          maxBytes: cardMaxBytes,
+          maxElements: FEISHU_CARD_MAX_ELEMENTS,
+        }) &&
+        feishuCardWithinTableLimit(card, maxTables)
+      ) {
+        return [chunk];
+      }
+      const subChunks = chunkFeishuCardMarkdown(chunk, {
+        maxBytes: cardMaxBytes,
+        maxTables,
+      });
+      if (subChunks.length === 1 && subChunks[0] === chunk) {
+        return subChunks;
+      }
+      return subChunks.flatMap(finalizeChunk);
+    }
+
+    const postBytes = Buffer.byteLength(
+      buildFeishuPostMessageContent({ messageText: chunk }),
+      "utf8",
+    );
+    if (postBytes <= postMaxBytes) {
+      return [chunk];
+    }
+    const subChunks = chunkFeishuPostMarkdown(chunk, postMaxBytes);
+    if (subChunks.length === 1 && subChunks[0] === chunk) {
+      return subChunks;
+    }
+    return subChunks.flatMap(finalizeChunk);
+  };
+
+  return initialChunks.flatMap(finalizeChunk);
+}
+
+// --- Inbound Post, Interactive Card, and Merge-Forward Parsers ---
+
+function toBoolean(value: unknown): boolean {
+  return value === true;
+}
+
+function wrapStyle(text: string, style: unknown): string {
+  if (!text || !isRecord(style)) {
+    return text;
+  }
+  let out = text;
+  if (toBoolean(style.code)) {
+    return `\`${out}\``;
+  }
+  if (toBoolean(style.bold)) {
+    out = `**${out}**`;
+  }
+  if (toBoolean(style.italic)) {
+    out = `*${out}*`;
+  }
+  if (toBoolean(style.strikethrough) || toBoolean(style.lineThrough)) {
+    out = `~~${out}~~`;
+  }
+  if (toBoolean(style.underline)) {
+    out = `<u>${out}</u>`;
+  }
+  return out;
+}
+
+function escapeMarkdownText(text: string): string {
+  return text.replace(/([\\`*_{}[\]()#+\-.!|>~])/g, "\\$1");
+}
+
+function sanitizeFenceLanguage(lang: string): string {
+  return lang.trim().replace(/[^a-zA-Z0-9_+#.-]/g, "");
+}
+
+interface PostPayload {
+  title: string;
+  paragraphs: unknown[];
+  files: unknown[];
+}
+
+function toPostPayload(candidate: unknown): PostPayload | null {
+  if (!isRecord(candidate) || !Array.isArray(candidate.content)) {
+    return null;
+  }
+  return {
+    title: typeof candidate.title === "string" ? candidate.title : "",
+    paragraphs: candidate.content,
+    files: Array.isArray(candidate.files) ? candidate.files : [],
+  };
+}
+
+function resolveLocalePayload(candidate: unknown): PostPayload | null {
+  const direct = toPostPayload(candidate);
+  if (direct) {
+    return direct;
+  }
+  if (!isRecord(candidate)) {
+    return null;
+  }
+  for (const value of Object.values(candidate)) {
+    const localePayload = toPostPayload(value);
+    if (localePayload) {
+      return localePayload;
+    }
+  }
+  return null;
+}
+
+function resolvePostPayload(content: string): PostPayload | null {
+  try {
+    const parsed = JSON.parse(content) as unknown;
+    if (!isRecord(parsed)) {
+      return null;
+    }
+    const payload =
+      toPostPayload(parsed) ??
+      resolveLocalePayload(parsed.post) ??
+      resolveLocalePayload(parsed);
+    if (!payload) {
+      return null;
+    }
+    const files = [...payload.files];
+    if (Array.isArray(parsed.files)) {
+      files.push(...parsed.files);
+    }
+    return { ...payload, files };
+  } catch {
+    return null;
+  }
+}
+
+export interface ParsedPostContent {
+  textContent: string;
+  commandText?: string;
+  imageKeys: string[];
+  mediaKeys: Array<{ fileKey: string; fileName?: string }>;
+  files: Array<{ fileKey: string; fileName?: string }>;
+  mentionedOpenIds: string[];
+}
+
+export function renderPostContent(
+  content: string,
+  botOpenId?: string,
+): ParsedPostContent | null {
+  const resolved = resolvePostPayload(content);
+  if (!resolved) {
+    return null;
+  }
+  const normalizedBotId = botOpenId?.trim() ?? "";
+  const imageKeys: string[] = [];
+  const mediaKeys: Array<{ fileKey: string; fileName?: string }> = [];
+  const mentionedOpenIds: string[] = [];
+  const paragraphLines: string[] = [];
+  const rawParagraphLines: string[] = [];
+
+  for (const paragraph of resolved.paragraphs) {
+    if (!Array.isArray(paragraph)) {
+      continue;
+    }
+    let line = "";
+    let rawLine = "";
+    for (const rawEl of paragraph) {
+      if (!isRecord(rawEl)) {
+        continue;
+      }
+      const tag = typeof rawEl.tag === "string" ? rawEl.tag : "";
+      if (tag === "text") {
+        const text = typeof rawEl.text === "string" ? rawEl.text : "";
+        line += toBoolean(rawEl.un_escape)
+          ? wrapStyle(text, rawEl.style)
+          : wrapStyle(escapeMarkdownText(text), rawEl.style);
+        rawLine += text;
+        continue;
+      }
+      if (tag === "a") {
+        const text =
+          typeof rawEl.text === "string" && rawEl.text
+            ? rawEl.text
+            : typeof rawEl.href === "string"
+              ? rawEl.href
+              : "";
+        const href = typeof rawEl.href === "string" ? rawEl.href.trim() : "";
+        const styled = wrapStyle(escapeMarkdownText(text), rawEl.style);
+        line += href ? `[${styled}](${href})` : styled;
+        rawLine += text;
+        continue;
+      }
+      if (tag === "at") {
+        const userId =
+          (typeof rawEl.user_id === "string" && rawEl.user_id.trim()) ||
+          (typeof rawEl.open_id === "string" && rawEl.open_id.trim()) ||
+          "";
+        if (userId) {
+          mentionedOpenIds.push(userId);
+        }
+        if (normalizedBotId && userId === normalizedBotId) {
+          continue;
+        }
+        const userName =
+          typeof rawEl.user_name === "string" && rawEl.user_name
+            ? rawEl.user_name
+            : userId;
+        line += wrapStyle(`@${escapeMarkdownText(userName)}`, rawEl.style);
+        rawLine += `@${userName}`;
+        continue;
+      }
+      if (tag === "img") {
+        if (typeof rawEl.image_key === "string" && rawEl.image_key) {
+          imageKeys.push(rawEl.image_key);
+          line += "![image]";
+          rawLine += "![image]";
+        }
+        continue;
+      }
+      if (tag === "media") {
+        if (typeof rawEl.file_key === "string" && rawEl.file_key) {
+          const fileName =
+            typeof rawEl.file_name === "string" && rawEl.file_name
+              ? rawEl.file_name
+              : undefined;
+          mediaKeys.push({ fileKey: rawEl.file_key, fileName });
+          const label = fileName ? `[media: ${fileName}]` : "[media]";
+          line += label;
+          rawLine += label;
+        }
+        continue;
+      }
+      if (tag === "code_block") {
+        const lang = sanitizeFenceLanguage(
+          typeof rawEl.language === "string" ? rawEl.language : "",
+        );
+        const code = (typeof rawEl.text === "string" ? rawEl.text : "").replace(
+          /\r\n/g,
+          "\n",
+        );
+        const trailingNewline = code.endsWith("\n") ? "" : "\n";
+        const fenced = `\n\`\`\`${lang}\n${code}${trailingNewline}\`\`\`\n`;
+        line += fenced;
+        rawLine += fenced;
+        continue;
+      }
+      if (tag === "hr") {
+        line += "\n---\n";
+        rawLine += "\n---\n";
+        continue;
+      }
+      if (tag === "md") {
+        const mdText = typeof rawEl.text === "string" ? rawEl.text : "";
+        line += mdText;
+        rawLine += mdText;
+        continue;
+      }
+      if (tag === "emotion") {
+        const emojiType =
+          typeof rawEl.emoji_type === "string" && rawEl.emoji_type
+            ? rawEl.emoji_type
+            : "emoji";
+        const token = `:${emojiType}:`;
+        line += token;
+        rawLine += token;
+      }
+    }
+    paragraphLines.push(line.trim());
+    rawParagraphLines.push(rawLine.trim());
+  }
+
+  const files: Array<{ fileKey: string; fileName?: string }> = [];
+  const seenFileKeys = new Set(mediaKeys.map((media) => media.fileKey));
+  for (const entry of resolved.files) {
+    if (!isRecord(entry) || entry.is_folder === true) {
+      continue;
+    }
+    const fileKey =
+      typeof entry.file_key === "string" ? entry.file_key.trim() : "";
+    if (!fileKey || seenFileKeys.has(fileKey)) {
+      continue;
+    }
+    seenFileKeys.add(fileKey);
+    const fileName =
+      typeof entry.file_name === "string" && entry.file_name
+        ? entry.file_name
+        : undefined;
+    files.push({ fileKey, ...(fileName ? { fileName } : {}) });
+  }
+
+  const title = resolved.title.trim();
+  const body = paragraphLines.filter((row) => row.length > 0).join("\n");
+  const rawBody = rawParagraphLines.filter((row) => row.length > 0).join("\n");
+  return {
+    textContent: [title, body].filter(Boolean).join("\n\n").trim(),
+    commandText: [title, rawBody].filter(Boolean).join("\n\n").trim(),
+    imageKeys,
+    mediaKeys,
+    files,
+    mentionedOpenIds,
+  };
+}
+
+export function parsePostContent(
+  content: string,
+  botOpenId?: string,
+): ParsedPostContent {
+  const rendered = renderPostContent(content, botOpenId);
+  if (rendered) {
+    return rendered;
+  }
+  return {
+    textContent: "[Rich text message]",
+    commandText: "",
+    imageKeys: [],
+    mediaKeys: [],
+    files: [],
+    mentionedOpenIds: [],
+  };
+}
+
+function normalizeCardTemplateVariable(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (
+    typeof value === "number" ||
+    typeof value === "boolean" ||
+    typeof value === "bigint"
+  ) {
+    return String(value);
+  }
+  return undefined;
+}
+
+function readCardTemplateVariables(
+  parsed: Record<string, unknown>,
+): Map<string, string> {
+  const variables = new Map<string, string>();
+  for (const source of [parsed.template_variable, parsed.template_variables]) {
+    if (!isRecord(source)) {
+      continue;
+    }
+    for (const [key, value] of Object.entries(source)) {
+      const normalized = normalizeCardTemplateVariable(value);
+      if (normalized !== undefined) {
+        variables.set(key, normalized);
+      }
+    }
+  }
+  return variables;
+}
+
+function applyCardTemplateVariables(
+  text: string,
+  variables: Map<string, string>,
+): string {
+  if (variables.size === 0) {
+    return text;
+  }
+  return text.replace(
+    /\$\{([A-Za-z0-9_.-]+)\}|\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g,
+    (match, a: string | undefined, b: string | undefined) => {
+      const name = typeof a === "string" ? a : b;
+      return (name ? variables.get(name) : undefined) ?? match;
+    },
+  );
+}
+
+function normalizeInteractiveValue(
+  value: unknown,
+  variables: Map<string, string>,
+): string {
+  const scalar = normalizeCardTemplateVariable(value);
+  if (scalar !== undefined) {
+    return applyCardTemplateVariables(scalar, variables);
+  }
+  if (Array.isArray(value)) {
+    return value
+      .map((entry) => normalizeInteractiveValue(entry, variables))
+      .filter(Boolean)
+      .join(", ");
+  }
+  if (!isRecord(value)) {
+    return "";
+  }
+  for (const key of [
+    "content",
+    "text",
+    "label",
+    "name",
+    "display_name",
+    "user_name",
+    "user_id",
+    "open_id",
+    "id",
+    "value",
+  ]) {
+    const text = normalizeInteractiveValue(value[key], variables);
+    if (text) {
+      return text;
+    }
+  }
+  return "";
+}
+
+function extractInteractiveTableText(
+  element: Record<string, unknown>,
+  variables: Map<string, string>,
+): string | undefined {
+  if (!Array.isArray(element.columns) || !Array.isArray(element.rows)) {
+    return undefined;
+  }
+  const columns: Array<{ name: string; title: string }> = [];
+  for (const column of element.columns) {
+    if (!isRecord(column) || typeof column.name !== "string") {
+      continue;
+    }
+    columns.push({
+      name: column.name,
+      title:
+        typeof column.display_name === "string"
+          ? column.display_name
+          : column.name,
+    });
+  }
+  if (columns.length === 0) {
+    return undefined;
+  }
+  const lines = [
+    columns
+      .map((column) => applyCardTemplateVariables(column.title, variables))
+      .join(" | "),
+  ];
+  for (const row of element.rows) {
+    if (!isRecord(row)) {
+      continue;
+    }
+    const cells = columns.map((column) =>
+      normalizeInteractiveValue(row[column.name], variables),
+    );
+    if (cells.some(Boolean)) {
+      lines.push(cells.join(" | "));
+    }
+  }
+  return lines.join("\n");
+}
+
+function extractInteractiveElementText(
+  element: unknown,
+  variables: Map<string, string>,
+  normalizedBotId = "",
+): string | undefined {
+  if (!isRecord(element)) {
+    return undefined;
+  }
+  const tag = typeof element.tag === "string" ? element.tag : "";
+  const text = isRecord(element.text) ? element.text : undefined;
+  if (tag === "div") {
+    const parts = [normalizeInteractiveValue(element.text, variables)];
+    if (Array.isArray(element.fields)) {
+      parts.push(
+        extractInteractiveElementsText(
+          element.fields,
+          variables,
+          normalizedBotId,
+        ),
+      );
+    }
+    return parts.filter(Boolean).join("\n") || undefined;
+  }
+  if (
+    (tag === "markdown" || tag === "lark_md" || tag === "plain_text") &&
+    typeof element.content === "string"
+  ) {
+    return applyCardTemplateVariables(element.content, variables);
+  }
+  if ((tag === "text" || tag === "a" || tag === "button") && element.text !== undefined) {
+    return normalizeInteractiveValue(element.text, variables) || undefined;
+  }
+  if (tag === "at") {
+    const rawUserId =
+      (typeof element.user_id === "string" && element.user_id.trim()) ||
+      (typeof element.open_id === "string" && element.open_id.trim()) ||
+      "";
+    const resolvedUserId = rawUserId
+      ? applyCardTemplateVariables(rawUserId, variables).trim()
+      : "";
+    if (normalizedBotId && resolvedUserId === normalizedBotId) {
+      return undefined;
+    }
+    const mention =
+      normalizeInteractiveValue(element.user_name, variables).trim() || resolvedUserId;
+    return mention
+      ? mention.startsWith("@")
+        ? mention
+        : `@${mention}`
+      : undefined;
+  }
+  if (tag === "table") {
+    return extractInteractiveTableText(element, variables);
+  }
+  if (tag === "hr") {
+    return "---";
+  }
+  const nested = [
+    element.elements,
+    element.columns,
+    element.children,
+    element.fields,
+    element.actions,
+  ]
+    .filter(Array.isArray)
+    .map((children) =>
+      extractInteractiveElementsText(children, variables, normalizedBotId),
+    )
+    .filter(Boolean)
+    .join("\n");
+  return nested || (typeof text?.content === "string" ? text.content : undefined);
+}
+
+function extractInteractiveElementsText(
+  elements: unknown[],
+  variables: Map<string, string>,
+  normalizedBotId = "",
+): string {
+  const texts: string[] = [];
+  for (const element of elements) {
+    if (Array.isArray(element)) {
+      const row = element
+        .map((part) =>
+          extractInteractiveElementText(part, variables, normalizedBotId),
+        )
+        .filter((part): part is string => Boolean(part))
+        .map((part) => part.trim())
+        .filter(Boolean)
+        .join(" ")
+        .trim();
+      if (row) {
+        texts.push(row);
+      }
+      continue;
+    }
+    const text = extractInteractiveElementText(
+      element,
+      variables,
+      normalizedBotId,
+    );
+    if (text !== undefined) {
+      texts.push(text);
+    }
+  }
+  return texts.join("\n").trim();
+}
+
+export function parseInteractiveCardContent(
+  content: string,
+  botOpenId?: string,
+): string {
+  try {
+    const parsed = JSON.parse(content) as unknown;
+    if (!isRecord(parsed)) {
+      return "[Interactive card]";
+    }
+    const normalizedBotId = botOpenId?.trim() ?? "";
+    const variables = readCardTemplateVariables(parsed);
+    let title = "";
+    if (typeof parsed.title === "string") {
+      title = applyCardTemplateVariables(parsed.title, variables).trim();
+    } else {
+      const header = isRecord(parsed.header) ? parsed.header : undefined;
+      const headerTitle = isRecord(header?.title) ? header.title : undefined;
+      if (typeof headerTitle?.content === "string") {
+        title = applyCardTemplateVariables(
+          headerTitle.content,
+          variables,
+        ).trim();
+      }
+    }
+    const body = isRecord(parsed.body) ? parsed.body : undefined;
+    const elementArrays: unknown[][] = [];
+    if (Array.isArray(parsed.elements)) {
+      elementArrays.push(parsed.elements);
+    }
+    if (Array.isArray(body?.elements)) {
+      elementArrays.push(body.elements);
+    }
+    for (const candidate of [parsed.i18n_elements, body?.i18n_elements]) {
+      if (isRecord(candidate)) {
+        for (const value of Object.values(candidate)) {
+          if (Array.isArray(value)) {
+            elementArrays.push(value);
+          }
+        }
+      }
+    }
+    for (const elements of elementArrays) {
+      const text = extractInteractiveElementsText(
+        elements,
+        variables,
+        normalizedBotId,
+      );
+      if (text) {
+        return title ? `${title}\n${text}` : text;
+      }
+    }
+    const postText = parsePostContent(content, botOpenId).textContent.trim();
+    if (postText && postText !== "[Rich text message]") {
+      return postText;
+    }
+    return title || "[Interactive card]";
+  } catch {
+    return "[Interactive card]";
+  }
+}
+
+function formatDefaultSubMessageContent(
+  rawBody: string,
+  msgType: string,
+): string {
+  try {
+    const parsed = JSON.parse(rawBody);
+    switch (msgType) {
+      case "text":
+        return isRecord(parsed) && typeof parsed.text === "string"
+          ? parsed.text
+          : rawBody;
+      case "post":
+        return parsePostContent(rawBody).textContent;
+      case "interactive":
+        return parseInteractiveCardContent(rawBody);
+      case "image":
+        return "[Image]";
+      case "file":
+        return `[File: ${isRecord(parsed) && typeof parsed.file_name === "string" ? parsed.file_name : "unknown"}]`;
+      case "audio":
+        return "[Audio]";
+      case "video":
+      case "media":
+        return "[Video]";
+      case "merge_forward":
+        return "[Nested Merged Forward]";
+      default:
+        return `[${msgType}]`;
+    }
+  } catch {
+    return rawBody || `[${msgType}]`;
+  }
+}
+
+function parseCreateTimeInt(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string" && /^\d+$/.test(value.trim())) {
+    return Number.parseInt(value.trim(), 10);
+  }
+  return 0;
+}
+
+/**
+ * Formats sub-messages from a Feishu `merge_forward` message (`im.message.get`
+ * `items` array or JSON string), matching `reply-delivery-result-iCCrdxE1.mjs:2182-2195`.
+ */
+export function parseMergeForwardContent(
+  input:
+    | unknown[]
+    | {
+        content?: string;
+        items?: unknown[];
+        depth?: number;
+        maxDepth?: number;
+        formatSubMessage?: (msgType: string, bodyContent: string) => string;
+      },
+): string {
+  const isArrayInput = Array.isArray(input);
+  const params = isArrayInput ? { items: input } : input;
+  const maxDepth = params.maxDepth ?? 3;
+  const depth = params.depth ?? 0;
+  if (depth >= maxDepth) {
+    return "[Merged and Forwarded Message]";
+  }
+
+  let rawMessages: unknown[];
+  if (Array.isArray(params.items)) {
+    rawMessages = params.items;
+  } else if (typeof params.content === "string" && params.content.trim()) {
+    try {
+      const parsed = JSON.parse(params.content);
+      if (Array.isArray(parsed)) {
+        rawMessages = parsed;
+      } else if (isRecord(parsed) && Array.isArray(parsed.messages)) {
+        rawMessages = parsed.messages;
+      } else if (isRecord(parsed) && Array.isArray(parsed.items)) {
+        rawMessages = parsed.items;
+      } else {
+        return "[Merged and Forwarded Message]";
+      }
+    } catch {
+      return "[Merged and Forwarded Message]";
+    }
+  } else {
+    return "[Merged and Forwarded Message]";
+  }
+
+  if (rawMessages.length === 0) {
+    return "[Merged and Forwarded Message - no sub-messages]";
+  }
+
+  const recordItems = rawMessages.filter(isRecord);
+  const hasApiHierarchy = recordItems.some(
+    (item) =>
+      typeof item.upper_message_id === "string" ||
+      (item.msg_type === "merge_forward" && !item.upper_message_id && recordItems.length > 1),
+  );
+
+  let subMessages: Record<string, unknown>[];
+  if (hasApiHierarchy) {
+    const container = recordItems.find(
+      (item) => item.msg_type === "merge_forward" && !item.upper_message_id,
+    );
+    subMessages = container
+      ? recordItems.filter((item) => item !== container)
+      : recordItems.filter((item) => Boolean(item.upper_message_id));
+    if (subMessages.length === 0) {
+      return "[Merged and Forwarded Message - no sub-messages found]";
+    }
+    subMessages = [...subMessages].sort(
+      (a, b) => parseCreateTimeInt(a.create_time) - parseCreateTimeInt(b.create_time),
+    );
+  } else {
+    subMessages = recordItems;
+  }
+
+  const maxMessages = 50;
+  const lines: string[] = ["[Merged and Forwarded Messages]"];
+  const indent = depth > 0 ? "  ".repeat(depth + 1) : "";
+
+  for (const item of subMessages.slice(0, maxMessages)) {
+    const msgType =
+      (typeof item.msg_type === "string" ? item.msg_type : undefined) ??
+      (typeof item.message_type === "string" ? item.message_type : undefined) ??
+      "text";
+    const bodyObj = isRecord(item.body) ? item.body : undefined;
+    const rawBody =
+      (typeof bodyObj?.content === "string" ? bodyObj.content : undefined) ??
+      (typeof item.content === "string" ? item.content : "");
+    let formatted: string;
+    if (msgType === "merge_forward") {
+      formatted = hasApiHierarchy
+        ? "[Nested Merged Forward]"
+        : parseMergeForwardContent({
+            content: rawBody,
+            depth: depth + 1,
+            maxDepth,
+            formatSubMessage: params.formatSubMessage,
+          });
+    } else if (params.formatSubMessage) {
+      formatted = params.formatSubMessage(msgType, rawBody);
+    } else {
+      formatted = formatDefaultSubMessageContent(rawBody, msgType);
+    }
+    lines.push(`${indent}- ${formatted}`);
+  }
+
+  if (subMessages.length > maxMessages) {
+    lines.push(`... and ${subMessages.length - maxMessages} more messages`);
+  }
+
+  const rendered = lines.join("\n");
+  if (rendered.length <= 20_000) {
+    return rendered;
+  }
+  return `${rendered.slice(0, 19_961).trimEnd()}\n... [Merged-forward content truncated]`;
+}

@@ -203,9 +203,36 @@ export class FakeChannelAdapter implements ChannelAdapter {
     return { messageId, status: "sent", reason: null };
   }
 
+  private downloadAttachmentDelegate:
+    | ((
+        descriptor: InboundAttachmentDescriptor,
+        event: InboundChannelEvent,
+      ) => Promise<DownloadedAttachment>)
+    | null = null;
+
+  setDownloadAttachmentDelegate(
+    fn:
+      | ((
+          descriptor: InboundAttachmentDescriptor,
+          event: InboundChannelEvent,
+        ) => Promise<DownloadedAttachment>)
+      | null,
+  ): void {
+    this.downloadAttachmentDelegate = fn;
+  }
+
   async downloadAttachment(
     descriptor: InboundAttachmentDescriptor,
+    event?: InboundChannelEvent,
   ): Promise<DownloadedAttachment> {
+    if (this.downloadAttachmentDelegate) {
+      if (!event) {
+        throw new Error(
+          "FakeChannelAdapter download delegate requires the inbound event",
+        );
+      }
+      return this.downloadAttachmentDelegate(descriptor, event);
+    }
     const found = this.attachments.get(descriptor.id);
     if (!found) {
       throw new Error(`Attachment not found in FakeChannelAdapter: ${descriptor.id}`);
