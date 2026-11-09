@@ -184,6 +184,9 @@ tests/integration/dalton/test_channel_gateway_db.py
 integrations/dalton-channel-gateway/
 scripts/dalton/launchd/com.dalton.channel-gateway.plist.template
 scripts/dalton/gen_channel_gateway_fixtures.py
+# JPX market-wide and Kioxia daily margin monitor CLI overlay and offline regression tests.
+scripts/dalton/openclaw_overlays/skills/jp-leverage-monitor/scripts/jp_leverage_monitor_cli.py
+tests/unit/dalton/test_jp_leverage_monitor.py
 # CH-1 Phase 3 (PR 1): shared channel helpers, Feishu adapter, third-party notices, and Vitest suite.
 integrations/dalton-channel-gateway/THIRD_PARTY_NOTICES.md
 integrations/dalton-channel-gateway/src/shared/
@@ -191,4 +194,5 @@ integrations/dalton-channel-gateway/src/channels/feishu/
 integrations/dalton-channel-gateway/test/feishu.test.ts
 
 scripts/dalton/openclaw_overlays/skills/sentiment-dashboard/scripts/run.sh
+scripts/dalton/openclaw_overlays/scripts/sentiment_dashboard_cos_upload.py
 scripts/dalton/openclaw_overlays/scripts/bbg_remote_refresh.sh
