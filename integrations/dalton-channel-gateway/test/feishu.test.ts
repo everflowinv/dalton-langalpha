@@ -348,6 +348,188 @@ function createFakeLarkClient(overrides?: {
   return { client, calls };
 }
 
+function installStatefulRecoveryBackend(
+  h: ReturnType<typeof createTestHarness>,
+  messageId: string,
+  options?: { failRecoveryQueryOnce?: boolean },
+) {
+  const defaultRegister = vi
+    .mocked(h.backend.registerAndResolveInbound)
+    .getMockImplementation()!;
+  const defaultProgress = vi
+    .mocked(h.backend.updateInboundProgress)
+    .getMockImplementation()!;
+  const row: {
+    status:
+      | "pending"
+      | "received"
+      | "accepted"
+      | "dispatched"
+      | "streaming"
+      | "steered"
+      | "pending_resubmit"
+      | "returned_unresubmitted"
+      | "completed"
+      | "failed"
+      | "ignored"
+      | null;
+    thread_id: string | null;
+    run_id: string | null;
+    turn_index: number | null;
+    fallback_pending: boolean;
+    uploaded_attachments: Array<{
+      filename: string;
+      workspace_path: string;
+      mime_type: string;
+      size_bytes: number;
+      data_url?: string;
+    }>;
+    raw_payload: Record<string, unknown>;
+    request_key: string;
+  } = {
+    status: "pending",
+    thread_id: null,
+    run_id: null,
+    turn_index: null,
+    fallback_pending: false,
+    uploaded_attachments: [],
+    raw_payload: {},
+    request_key: "",
+  };
+  const state = {
+    row,
+    logicalTurns: [] as Array<{
+      request_key: string;
+      thread_id: string;
+      run_id: string;
+    }>,
+    registerCalls: 0,
+    registered: false,
+    snapshotRow: () => ({
+      platform: "feishu" as const,
+      message_id: messageId,
+      platform_user_id: "ou_alice",
+      dalton_user_id: USER_ID,
+      chat_type: "dm" as const,
+      chat_address: "feishu:@me",
+      thread_scope_key: "dm:ou_alice",
+      request_key: row.request_key,
+      retry_request_key: null,
+      resubmitted_request_key: null,
+      steered_into_run_id: null,
+      thread_id: row.thread_id,
+      run_id: row.run_id,
+      turn_index: row.turn_index,
+      workspace_id: "99999999-8888-7777-6666-555555555555",
+      external_thread_id: "feishu:dm:ou_alice:gen:1",
+      generation: 1,
+      status: (row.status ?? "pending") as "pending",
+      fallback_pending: row.fallback_pending,
+      sent_to_current_count: 0,
+      uploaded_attachments: structuredClone(row.uploaded_attachments),
+      raw_payload: structuredClone(row.raw_payload),
+      pending_interrupt: null,
+    }),
+  };
+
+  vi.mocked(h.backend.registerAndResolveInbound).mockImplementation(
+    async (req) => {
+      state.registerCalls += 1;
+      if (
+        options?.failRecoveryQueryOnce &&
+        state.registerCalls === 2
+      ) {
+        throw new Error("temporary recovery query failure");
+      }
+      const isFirstRegistration = !state.registered;
+      state.registered = true;
+      row.request_key = req.request_key;
+      row.raw_payload = req.raw_payload ?? row.raw_payload;
+      const base = await defaultRegister(req);
+      return {
+        ...base,
+        existing_status: isFirstRegistration ? null : row.status,
+        thread_id: row.thread_id,
+        run_id: row.run_id,
+        turn_index: row.turn_index,
+        fallback_pending: row.fallback_pending,
+        uploaded_attachments: structuredClone(row.uploaded_attachments),
+        request_key: req.request_key,
+        raw_payload: structuredClone(row.raw_payload),
+      };
+    },
+  );
+
+  vi.mocked(h.backend.updateInboundProgress).mockImplementation(
+    async (req) => {
+      if (req.message_id === messageId) {
+        if (req.status !== undefined) {
+          row.status = req.status;
+        }
+        if (req.thread_id !== undefined) {
+          row.thread_id = req.thread_id;
+        }
+        if (req.run_id !== undefined) {
+          row.run_id = req.run_id;
+        }
+        if (req.turn_index !== undefined) {
+          row.turn_index = req.turn_index;
+        }
+        if (req.fallback_pending !== undefined) {
+          row.fallback_pending = req.fallback_pending;
+        }
+        if (req.uploaded_attachments !== undefined) {
+          row.uploaded_attachments = structuredClone(
+            req.uploaded_attachments,
+          );
+        }
+      }
+      return defaultProgress(req);
+    },
+  );
+
+  vi.mocked(h.backend.createThreadMessages).mockImplementation(
+    async (_userId, payload) => {
+      const requestKey = payload.request_key ?? "";
+      const existing = state.logicalTurns.find(
+        (turn) => turn.request_key === requestKey,
+      );
+      if (existing) {
+        return {
+          status: 409,
+          isSse: false,
+          errorBody: {
+            detail: {
+              code: "duplicate_request",
+              thread_id: existing.thread_id,
+              run_id: existing.run_id,
+              run_status: "completed",
+              retryable: false,
+              turn_index: 1,
+            },
+          },
+        };
+      }
+      state.logicalTurns.push({
+        request_key: requestKey,
+        thread_id: THREAD_ID,
+        run_id: RUN_ID,
+      });
+      throw new Error("connection reset before metadata");
+    },
+  );
+
+  vi.mocked(h.backend.recoverState).mockImplementation(async () => ({
+    mode: "startup" as const,
+    inbound_events: [state.snapshotRow()],
+    background_runs: [],
+    thread_watches: [],
+    automation_runs: [],
+  }));
+
+  return state;
+}
+
 describe("Feishu conversation ID & target codec", () => {
   it("round-trips oc_, ou_, and on_ targets and conversation scopes", () => {
     expect(detectIdType("oc_chat123")).toBe("chat_id");
@@ -1176,34 +1358,9 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
       feishuAdapter.onInboundEvent(async (ev) => {
         await h.app.orchestrator.handleInboundEvent(ev);
       });
-
-      const defaultRegister = vi
-        .mocked(h.backend.registerAndResolveInbound)
-        .getMockImplementation()!;
-      let registerCalls = 0;
-      const registerKeys: string[] = [];
-      vi.mocked(h.backend.registerAndResolveInbound).mockImplementation(
-        async (req) => {
-          registerCalls += 1;
-          registerKeys.push(req.request_key);
-          const base = await defaultRegister(req);
-          if (registerCalls === 1) {
-            return { ...base, thread_id: null };
-          }
-          return {
-            ...base,
-            existing_status: "streaming" as const,
-            thread_id: THREAD_ID,
-            run_id: RUN_ID,
-            turn_index: 1,
-            fallback_pending: true,
-          };
-        },
-      );
-      vi.mocked(h.backend.createThreadMessages).mockImplementationOnce(
-        async () => {
-          throw new Error("connection reset before metadata");
-        },
+      const state = installStatefulRecoveryBackend(
+        h,
+        "om_bg_lost_response_1",
       );
 
       await feishuAdapter.receiveRawEvent({
@@ -1218,29 +1375,24 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
       });
       await new Promise((r) => setTimeout(r, 50));
 
-      expect(h.backend.createCalls).toHaveLength(1);
-      const originalKey = h.backend.createCalls[0]!.payload.request_key;
-      expect(registerKeys.length).toBeGreaterThanOrEqual(2);
-      expect(registerKeys[1]).toBe(originalKey);
+      const expectedKey = makeInboundRequestKey(
+        "feishu",
+        "om_bg_lost_response_1",
+      );
+      expect(state.logicalTurns).toHaveLength(1);
+      expect(state.logicalTurns[0]?.request_key).toBe(expectedKey);
+      expect(h.backend.createCalls.length).toBeGreaterThanOrEqual(2);
       expect(
-        h.backend.progressUpdates.some(
-          (u) =>
-            u.message_id === "om_bg_lost_response_1" &&
-            u.status === "failed" &&
-            u.fallback_pending === false,
+        h.backend.createCalls.every(
+          (call) => call.payload.request_key === expectedKey,
         ),
-      ).toBe(false);
+      ).toBe(true);
+      expect(state.row.thread_id).toBe(THREAD_ID);
+      expect(state.row.status).toBe("completed");
+      expect(state.row.fallback_pending).toBe(false);
       expect(
         h.feishuAdapter.sentTexts.some((t) =>
           t.text.includes("Replayed assistant output."),
-        ),
-      ).toBe(true);
-      expect(
-        h.backend.progressUpdates.some(
-          (u) =>
-            u.message_id === "om_bg_lost_response_1" &&
-            u.status === "completed" &&
-            u.fallback_pending === false,
         ),
       ).toBe(true);
     } finally {
@@ -1260,28 +1412,10 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
       feishuAdapter.onInboundEvent(async (ev) => {
         await h.app.orchestrator.handleInboundEvent(ev);
       });
-
-      const defaultRegister = vi
-        .mocked(h.backend.registerAndResolveInbound)
-        .getMockImplementation()!;
-      let registerCalls = 0;
-      vi.mocked(h.backend.registerAndResolveInbound).mockImplementation(
-        async (req) => {
-          registerCalls += 1;
-          if (registerCalls === 2) {
-            throw new Error("temporary recovery query failure");
-          }
-          const base = await defaultRegister(req);
-          if (registerCalls === 1) {
-            return { ...base, thread_id: null };
-          }
-          return base;
-        },
-      );
-      vi.mocked(h.backend.createThreadMessages).mockImplementationOnce(
-        async () => {
-          throw new Error("connection reset before metadata");
-        },
+      const state = installStatefulRecoveryBackend(
+        h,
+        "om_bg_recovery_transient_1",
+        { failRecoveryQueryOnce: true },
       );
 
       await feishuAdapter.receiveRawEvent({
@@ -1296,82 +1430,33 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
       });
       await new Promise((r) => setTimeout(r, 50));
 
-      expect(
-        h.backend.progressUpdates.some(
-          (u) =>
-            u.message_id === "om_bg_recovery_transient_1" &&
-            u.status === "failed" &&
-            u.fallback_pending === false,
-        ),
-      ).toBe(false);
+      const expectedKey = makeInboundRequestKey(
+        "feishu",
+        "om_bg_recovery_transient_1",
+      );
+      expect(state.row.status).toBe("pending");
+      expect(state.row.thread_id).toBeNull();
+      expect(state.row.run_id).toBeNull();
+      expect(state.row.request_key).toBe(expectedKey);
+      expect(state.logicalTurns).toHaveLength(1);
       expect(
         h.feishuAdapter.sentTexts.some((t) =>
           t.text.includes("Replayed assistant output."),
         ),
       ).toBe(false);
 
-      const capturedOriginalKey =
-        h.backend.createCalls[0]!.payload.request_key;
-      expect(capturedOriginalKey).toBe(
-        makeInboundRequestKey("feishu", "om_bg_recovery_transient_1"),
-      );
-      if (
-        typeof capturedOriginalKey !== "string" ||
-        capturedOriginalKey.length === 0
-      ) {
-        throw new Error("Expected the accepted creation request key");
-      }
-      const originalKey: string = capturedOriginalKey;
-      vi.mocked(h.backend.recoverState).mockImplementationOnce(async () => ({
-        mode: "startup" as const,
-        inbound_events: [
-          {
-            platform: "feishu" as const,
-            message_id: "om_bg_recovery_transient_1",
-            platform_user_id: "ou_alice",
-            dalton_user_id: USER_ID,
-            chat_type: "dm" as const,
-            chat_address: "feishu:@me",
-            thread_scope_key: "dm:ou_alice",
-            request_key: originalKey,
-            retry_request_key: null,
-            resubmitted_request_key: null,
-            steered_into_run_id: null,
-            thread_id: THREAD_ID,
-            run_id: RUN_ID,
-            turn_index: 1,
-            workspace_id: "99999999-8888-7777-6666-555555555555",
-            external_thread_id: "feishu:dm:ou_alice:gen:1",
-            generation: 1,
-            status: "streaming" as const,
-            fallback_pending: true,
-            sent_to_current_count: 0,
-            uploaded_attachments: [],
-            raw_payload: {
-              platform_user_id: "ou_alice",
-              text: "Compute valuation",
-              chat_id: "oc_dm_1",
-            },
-            pending_interrupt: null,
-          },
-        ],
-        background_runs: [],
-        thread_watches: [],
-        automation_runs: [],
-      }));
       await h.app.orchestrator.runStartupRecovery();
 
+      expect(state.logicalTurns).toHaveLength(1);
+      expect(
+        h.backend.createCalls.every(
+          (call) => call.payload.request_key === expectedKey,
+        ),
+      ).toBe(true);
+      expect(state.row.status).toBe("completed");
       expect(
         h.feishuAdapter.sentTexts.some((t) =>
           t.text.includes("Replayed assistant output."),
-        ),
-      ).toBe(true);
-      expect(
-        h.backend.progressUpdates.some(
-          (u) =>
-            u.message_id === "om_bg_recovery_transient_1" &&
-            u.status === "completed" &&
-            u.fallback_pending === false,
         ),
       ).toBe(true);
     } finally {
@@ -1455,6 +1540,332 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
     expect(received[0]?.text).toBe("hello bot");
 
     await adapter.stop();
+  });
+
+  it("fails structured group mentions and @bot commands without recording dedupe when bot identity lookup temporarily fails on receiveRawEvent, then processes each once after recovery", async () => {
+    let probeShouldFail = true;
+    const { client } = createFakeLarkClient({
+      onRequest: async () => {
+        if (probeShouldFail) {
+          throw new Error("Temporary bot identity lookup failure");
+        }
+        return {
+          code: 0,
+          bot: { open_id: BOT_OPEN_ID, app_name: "DaltonBot" },
+        };
+      },
+    });
+    const adapter = new FeishuChannelAdapter({
+      appId: "cli_identity_raw_1",
+      appSecret: "sec_identity_raw_1",
+      client,
+      logger: createSubsystemLogger("test", {
+        sink: { info: () => {}, warn: () => {}, error: () => {} },
+      }),
+    });
+    const received: InboundChannelEvent[] = [];
+    adapter.onInboundEvent(async (ev) => {
+      received.push(ev);
+    });
+
+    const mentionPayload = {
+      sender: { sender_id: { open_id: "ou_bob_2" }, sender_type: "user" },
+      message: {
+        message_id: "om_identity_raw_mention",
+        chat_id: "oc_grp_identity_raw",
+        chat_type: "group",
+        message_type: "text",
+        content: JSON.stringify({ text: "@_user_1 分析这家公司" }),
+        mentions: [
+          {
+            key: "@_user_1",
+            id: { open_id: BOT_OPEN_ID },
+            name: "DaltonBot",
+          },
+        ],
+      },
+    };
+    const commandPayload = {
+      sender: { sender_id: { open_id: "ou_bob_2" }, sender_type: "user" },
+      message: {
+        message_id: "om_identity_raw_command",
+        chat_id: "oc_grp_identity_raw",
+        chat_type: "group",
+        message_type: "text",
+        content: JSON.stringify({ text: "@_user_1 /workspace W2" }),
+        mentions: [
+          {
+            key: "@_user_1",
+            id: { open_id: BOT_OPEN_ID },
+            name: "DaltonBot",
+          },
+        ],
+      },
+    };
+
+    await expect(adapter.receiveRawEvent(mentionPayload)).rejects.toThrow(
+      "Feishu bot identity is not resolved",
+    );
+    await expect(adapter.receiveRawEvent(commandPayload)).rejects.toThrow(
+      "Feishu bot identity is not resolved",
+    );
+    expect(received).toHaveLength(0);
+
+    probeShouldFail = false;
+    await adapter.receiveRawEvent(mentionPayload);
+    await adapter.receiveRawEvent(commandPayload);
+    expect(received).toHaveLength(2);
+    expect(received[0]).toMatchObject({
+      messageId: "om_identity_raw_mention",
+      isGroupTrigger: true,
+      text: "分析这家公司",
+    });
+    expect(received[1]).toMatchObject({
+      messageId: "om_identity_raw_command",
+      isGroupTrigger: true,
+      text: "/workspace W2",
+    });
+
+    await adapter.receiveRawEvent(mentionPayload);
+    expect(received).toHaveLength(2);
+  });
+
+  it("fails a group post at without recording dedupe when bot identity is unresolved, then processes it once after recovery", async () => {
+    let probeShouldFail = true;
+    const { client } = createFakeLarkClient({
+      onRequest: async () => {
+        if (probeShouldFail) {
+          throw new Error("Temporary bot identity lookup failure");
+        }
+        return {
+          code: 0,
+          bot: { open_id: BOT_OPEN_ID, app_name: "DaltonBot" },
+        };
+      },
+    });
+    const adapter = new FeishuChannelAdapter({
+      appId: "cli_identity_post_1",
+      appSecret: "sec_identity_post_1",
+      client,
+      logger: createSubsystemLogger("test", {
+        sink: { info: () => {}, warn: () => {}, error: () => {} },
+      }),
+    });
+    const received: InboundChannelEvent[] = [];
+    adapter.onInboundEvent(async (ev) => {
+      received.push(ev);
+    });
+
+    const postPayload = {
+      sender: { sender_id: { open_id: "ou_bob_2" }, sender_type: "user" },
+      message: {
+        message_id: "om_identity_post_at",
+        chat_id: "oc_grp_identity_post",
+        chat_type: "group",
+        message_type: "post",
+        content: JSON.stringify({
+          content: [
+            [
+              { tag: "at", user_id: BOT_OPEN_ID, user_name: "DaltonBot" },
+              { tag: "text", text: " 分析这家公司" },
+            ],
+          ],
+        }),
+        mentions: [],
+      },
+    };
+
+    await expect(adapter.receiveRawEvent(postPayload)).rejects.toThrow(
+      "Feishu bot identity is not resolved",
+    );
+    expect(received).toHaveLength(0);
+
+    probeShouldFail = false;
+    await adapter.receiveRawEvent(postPayload);
+    expect(received).toHaveLength(1);
+    expect(received[0]).toMatchObject({
+      messageId: "om_identity_post_at",
+      isGroupTrigger: true,
+    });
+
+    await adapter.receiveRawEvent(postPayload);
+    expect(received).toHaveLength(1);
+
+    const openIdAtEvent = parseFeishuInboundEvent(
+      {
+        sender: { sender_id: { open_id: "ou_bob_2" }, sender_type: "user" },
+        message: {
+          message_id: "om_identity_post_at_open_id",
+          chat_id: "oc_grp_identity_post",
+          chat_type: "group",
+          message_type: "post",
+          content: JSON.stringify({
+            content: [
+              [
+                { tag: "at", open_id: BOT_OPEN_ID, user_name: "DaltonBot" },
+                { tag: "text", text: " 分析这家公司" },
+              ],
+            ],
+          }),
+          mentions: [],
+        },
+      },
+      { botOpenId: BOT_OPEN_ID },
+    );
+    expect(openIdAtEvent?.isGroupTrigger).toBe(true);
+  });
+
+  it("fails structured group mentions without recording dedupe on the WebSocket path when bot identity lookup temporarily fails, then processes the same message once after recovery", async () => {
+    let probeShouldFail = true;
+    const { client } = createFakeLarkClient({
+      onRequest: async () => {
+        if (probeShouldFail) {
+          throw new Error("Temporary bot identity lookup failure");
+        }
+        return {
+          code: 0,
+          bot: { open_id: BOT_OPEN_ID, app_name: "DaltonBot" },
+        };
+      },
+    });
+    const adapter = new FeishuChannelAdapter({
+      appId: "cli_identity_ws_1",
+      appSecret: "sec_identity_ws_1",
+      client,
+      wsClientFactory: () => ({
+        start: async () => {},
+        close: () => {},
+        getConnectionStatus: () => ({ state: "connected" as const }),
+      }),
+      logger: createSubsystemLogger("test", {
+        sink: { info: () => {}, warn: () => {}, error: () => {} },
+      }),
+    });
+    const received: InboundChannelEvent[] = [];
+    adapter.onInboundEvent(async (ev) => {
+      received.push(ev);
+    });
+
+    const mentionPayload = {
+      sender: { sender_id: { open_id: "ou_bob_2" }, sender_type: "user" },
+      message: {
+        message_id: "om_identity_ws_mention",
+        chat_id: "oc_grp_identity_ws",
+        chat_type: "group",
+        message_type: "text",
+        content: JSON.stringify({ text: "@_user_1 分析这家公司" }),
+        mentions: [
+          {
+            key: "@_user_1",
+            id: { open_id: BOT_OPEN_ID },
+            name: "DaltonBot",
+          },
+        ],
+      },
+    };
+
+    try {
+      await adapter.start();
+      expect(adapter.getBotOpenId()).toBeUndefined();
+
+      await expect(adapter.receiveRawEvent(mentionPayload)).rejects.toThrow(
+        "Feishu bot identity is not resolved",
+      );
+      expect(received).toHaveLength(0);
+
+      probeShouldFail = false;
+      await adapter.receiveRawEvent(mentionPayload);
+      expect(received).toHaveLength(1);
+      expect(received[0]).toMatchObject({
+        messageId: "om_identity_ws_mention",
+        isGroupTrigger: true,
+        text: "分析这家公司",
+      });
+
+      await adapter.receiveRawEvent(mentionPayload);
+      expect(received).toHaveLength(1);
+    } finally {
+      await adapter.stop();
+    }
+  });
+
+  it("does not block broadcast mentions, direct messages or mention-free group commands when bot identity is unresolved", async () => {
+    const { client } = createFakeLarkClient({
+      onRequest: async () => {
+        throw new Error("Temporary bot identity lookup failure");
+      },
+    });
+    const adapter = new FeishuChannelAdapter({
+      appId: "cli_identity_open_1",
+      appSecret: "sec_identity_open_1",
+      client,
+      logger: createSubsystemLogger("test", {
+        sink: { info: () => {}, warn: () => {}, error: () => {} },
+      }),
+    });
+    const received: InboundChannelEvent[] = [];
+    adapter.onInboundEvent(async (ev) => {
+      received.push(ev);
+    });
+
+    await adapter.receiveRawEvent({
+      sender: { sender_id: { open_id: "ou_bob_2" }, sender_type: "user" },
+      message: {
+        message_id: "om_identity_broadcast",
+        chat_id: "oc_grp_identity_open",
+        chat_type: "group",
+        message_type: "text",
+        content: JSON.stringify({ text: "@_all 大家好" }),
+        mentions: [
+          { key: "@_all", id: { open_id: "all" }, name: "所有人" },
+        ],
+      },
+    });
+    await adapter.receiveRawEvent({
+      sender: { sender_id: { open_id: "ou_bob_2" }, sender_type: "user" },
+      message: {
+        message_id: "om_identity_dm",
+        chat_id: "oc_dm_identity_open",
+        chat_type: "p2p",
+        message_type: "text",
+        content: JSON.stringify({ text: "@_user_1 你好" }),
+        mentions: [
+          {
+            key: "@_user_1",
+            id: { open_id: BOT_OPEN_ID },
+            name: "DaltonBot",
+          },
+        ],
+      },
+    });
+    await adapter.receiveRawEvent({
+      sender: { sender_id: { open_id: "ou_bob_2" }, sender_type: "user" },
+      message: {
+        message_id: "om_identity_plain_command",
+        chat_id: "oc_grp_identity_open",
+        chat_type: "group",
+        message_type: "text",
+        content: JSON.stringify({ text: "/stop" }),
+        mentions: [],
+      },
+    });
+
+    expect(received).toHaveLength(3);
+    expect(received[0]).toMatchObject({
+      messageId: "om_identity_broadcast",
+      chatType: "group",
+      isGroupTrigger: false,
+    });
+    expect(received[1]).toMatchObject({
+      messageId: "om_identity_dm",
+      chatType: "dm",
+    });
+    expect(received[2]).toMatchObject({
+      messageId: "om_identity_plain_command",
+      chatType: "group",
+      isGroupTrigger: true,
+      text: "/stop",
+    });
   });
 
   it("keeps same-conversation arrival order when bot identity lookup is delayed so the message after /workspace uses the new workspace", async () => {
@@ -1782,20 +2193,12 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
         botOpenId: BOT_OPEN_ID,
         client,
       });
-      let inboundEventForDownload: InboundChannelEvent | undefined;
       adapter.onInboundEvent(async (ev) => {
-        inboundEventForDownload = ev;
         await h.app.orchestrator.handleInboundEvent(ev);
       });
-      h.feishuAdapter.downloadAttachment = async (descriptor) => {
-        if (!inboundEventForDownload) {
-          throw new Error("Expected the inbound event before download");
-        }
-        return adapter.downloadAttachment(
-          descriptor,
-          inboundEventForDownload,
-        );
-      };
+      h.feishuAdapter.setDownloadAttachmentDelegate(
+        (descriptor, event) => adapter.downloadAttachment(descriptor, event),
+      );
       await adapter.receiveRawEvent({
         sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
         message: {
@@ -1838,6 +2241,367 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
       );
     } finally {
       await h.cleanup();
+    }
+  });
+
+  it("resolves wrapped post payloads for post, card fallback and merge-forward parsing and keeps the original message as the file source", async () => {
+    const wrapped = JSON.stringify({
+      post: {
+        zh_cn: {
+          title: "业绩",
+          content: [[{ tag: "text", text: "收入增长25%" }]],
+          files: [
+            { file_key: "file_abc", file_name: "report.pdf", is_folder: false },
+          ],
+        },
+      },
+    });
+    const parsedWrapped = parsePostContent(wrapped);
+    expect(parsedWrapped.textContent).toContain("业绩");
+    expect(parsedWrapped.textContent).toContain("收入增长25%");
+    expect(parsedWrapped.files).toEqual([
+      { fileKey: "file_abc", fileName: "report.pdf" },
+    ]);
+
+    const otherLocale = JSON.stringify({
+      post: {
+        fr_fr: {
+          title: "Résultats",
+          content: [[{ tag: "text", text: "收入增长25%" }]],
+        },
+      },
+    });
+    expect(parsePostContent(otherLocale).textContent).toContain("Résultats");
+    expect(parsePostContent(otherLocale).textContent).toContain(
+      "收入增长25%",
+    );
+    const outerLocale = JSON.stringify({
+      de_de: {
+        title: "Ergebnisse",
+        content: [[{ tag: "text", text: "收入增长25%" }]],
+      },
+    });
+    expect(parsePostContent(outerLocale).textContent).toContain(
+      "Ergebnisse",
+    );
+
+    expect(parseInteractiveCardContent(wrapped)).toContain("业绩");
+    expect(parseInteractiveCardContent(wrapped)).toContain("收入增长25%");
+
+    const merged = parseMergeForwardContent({
+      items: [{ msg_type: "post", body: { content: wrapped } }],
+      formatSubMessage: (subType, subBody) =>
+        parseMessageContent(subBody, subType),
+    });
+    expect(merged).toContain("业绩");
+    expect(merged).toContain("收入增长25%");
+
+    const event = parseFeishuInboundEvent(
+      {
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_wrapped_post_1",
+          chat_id: "oc_dm_1",
+          chat_type: "p2p",
+          message_type: "post",
+          content: wrapped,
+        },
+      },
+      { botOpenId: BOT_OPEN_ID },
+    );
+    expect(event?.text).toContain("收入增长25%");
+    expect(event?.attachments).toEqual([
+      { id: "file_abc", filename: "report.pdf", mimeType: "application/pdf" },
+    ]);
+
+    const { client, calls } = createFakeLarkClient({
+      onMessageResourceGet: async () => ({
+        data: Buffer.from("PDF_REPORT_CONTENT", "utf8"),
+        headers: { "content-type": "application/pdf" },
+      }),
+    });
+    const adapter = new FeishuChannelAdapter({
+      appId: "cli_test_app",
+      appSecret: "sec_test_secret",
+      botOpenId: BOT_OPEN_ID,
+      client,
+    });
+    const downloaded = await adapter.downloadAttachment(
+      event!.attachments![0]!,
+      event!,
+    );
+    expect(calls.messageResourceGet).toEqual([
+      {
+        path: { message_id: "om_wrapped_post_1", file_key: "file_abc" },
+        params: { type: "file" },
+      },
+    ]);
+    expect(downloaded.content.toString("utf8")).toBe("PDF_REPORT_CONTENT");
+    expect(downloaded.filename).toBe("report.pdf");
+    expect(downloaded.mimeType).toBe("application/pdf");
+  });
+
+  it("recovers an interrupted attachment upload at startup without submitting text before the uploaded record is saved", async () => {
+    const MESSAGE_ID = "om_post_recovery_1";
+    const postContent = JSON.stringify({
+      content: [[{ tag: "text", text: "请分析附件" }]],
+      files: [
+        { file_key: "file_abc", file_name: "report.pdf", is_folder: false },
+      ],
+    });
+    const saved: {
+      status: "pending" | "completed" | "failed";
+      thread_id: string | null;
+      run_id: string | null;
+      turn_index: number | null;
+      fallback_pending: boolean;
+      uploaded_attachments: Array<{
+        filename: string;
+        workspace_path: string;
+        mime_type: string;
+        size_bytes: number;
+        data_url?: string;
+      }>;
+      raw_payload: Record<string, unknown>;
+      request_key: string;
+      registered: boolean;
+    } = {
+      status: "pending",
+      thread_id: null,
+      run_id: null,
+      turn_index: null,
+      fallback_pending: false,
+      uploaded_attachments: [],
+      raw_payload: {},
+      request_key: "",
+      registered: false,
+    };
+    let downloadShouldFail = true;
+    let uploadedSaveShouldFail = false;
+
+    const { client, calls } = createFakeLarkClient({
+      onMessageResourceGet: async () => {
+        if (downloadShouldFail) {
+          throw new Error("temporary download failure");
+        }
+        return {
+          data: Buffer.from("PDF_REPORT_CONTENT", "utf8"),
+          headers: { "content-type": "application/pdf" },
+        };
+      },
+    });
+    const realAdapter = new FeishuChannelAdapter({
+      appId: "cli_test_app",
+      appSecret: "sec_test_secret",
+      botOpenId: BOT_OPEN_ID,
+      client,
+    });
+
+    const wireStatefulBackend = (
+      h: ReturnType<typeof createTestHarness>,
+    ): void => {
+      const defaultRegister = vi
+        .mocked(h.backend.registerAndResolveInbound)
+        .getMockImplementation()!;
+      const defaultProgress = vi
+        .mocked(h.backend.updateInboundProgress)
+        .getMockImplementation()!;
+      vi.mocked(h.backend.registerAndResolveInbound).mockImplementation(
+        async (req) => {
+          const isFirstRegistration = !saved.registered;
+          saved.registered = true;
+          saved.request_key = req.request_key;
+          if (req.raw_payload) {
+            saved.raw_payload = req.raw_payload;
+          }
+          const base = await defaultRegister(req);
+          return {
+            ...base,
+            existing_status: isFirstRegistration ? null : saved.status,
+            thread_id: saved.thread_id,
+            run_id: saved.run_id,
+            turn_index: saved.turn_index,
+            fallback_pending: saved.fallback_pending,
+            uploaded_attachments: structuredClone(
+              saved.uploaded_attachments,
+            ),
+            request_key: req.request_key,
+            raw_payload: structuredClone(saved.raw_payload),
+          };
+        },
+      );
+      vi.mocked(h.backend.updateInboundProgress).mockImplementation(
+        async (req) => {
+          if (req.message_id === MESSAGE_ID) {
+            if (
+              req.uploaded_attachments !== undefined &&
+              uploadedSaveShouldFail
+            ) {
+              throw new Error("temporary uploaded record save failure");
+            }
+            if (req.status !== undefined) {
+              saved.status = req.status as typeof saved.status;
+            }
+            if (req.thread_id !== undefined) {
+              saved.thread_id = req.thread_id;
+            }
+            if (req.run_id !== undefined) {
+              saved.run_id = req.run_id;
+            }
+            if (req.turn_index !== undefined) {
+              saved.turn_index = req.turn_index;
+            }
+            if (req.fallback_pending !== undefined) {
+              saved.fallback_pending = req.fallback_pending;
+            }
+            if (req.uploaded_attachments !== undefined) {
+              saved.uploaded_attachments = structuredClone(
+                req.uploaded_attachments,
+              );
+            }
+          }
+          return defaultProgress(req);
+        },
+      );
+      vi.mocked(h.backend.recoverState).mockImplementation(async () => ({
+        mode: "startup" as const,
+        inbound_events: [
+          {
+            platform: "feishu" as const,
+            message_id: MESSAGE_ID,
+            platform_user_id: "ou_alice",
+            dalton_user_id: USER_ID,
+            chat_type: "dm" as const,
+            chat_address: "feishu:@me",
+            thread_scope_key: "dm:ou_alice",
+            request_key: saved.request_key,
+            retry_request_key: null,
+            resubmitted_request_key: null,
+            steered_into_run_id: null,
+            thread_id: saved.thread_id,
+            run_id: saved.run_id,
+            turn_index: saved.turn_index,
+            workspace_id: "99999999-8888-7777-6666-555555555555",
+            external_thread_id: "feishu:dm:ou_alice:gen:1",
+            generation: 1,
+            status: saved.status,
+            fallback_pending: saved.fallback_pending,
+            sent_to_current_count: 0,
+            uploaded_attachments: structuredClone(
+              saved.uploaded_attachments,
+            ),
+            raw_payload: structuredClone(saved.raw_payload),
+            pending_interrupt: null,
+          },
+        ],
+        background_runs: [],
+        thread_watches: [],
+        automation_runs: [],
+      }));
+      h.feishuAdapter.setDownloadAttachmentDelegate((descriptor, event) =>
+        realAdapter.downloadAttachment(descriptor, event),
+      );
+    };
+
+    const h1 = createTestHarness();
+    const extraHarnesses: Array<ReturnType<typeof createTestHarness>> = [];
+    try {
+      wireStatefulBackend(h1);
+      realAdapter.onInboundEvent(async (ev) => {
+        await h1.app.orchestrator.handleInboundEvent(ev);
+      });
+      await realAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: MESSAGE_ID,
+          chat_id: "oc_dm_1",
+          chat_type: "p2p",
+          message_type: "post",
+          content: postContent,
+        },
+      });
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(saved.raw_payload.attachments).toEqual([
+        {
+          id: "file_abc",
+          filename: "report.pdf",
+          mimeType: "application/pdf",
+        },
+      ]);
+      expect(saved.status).toBe("pending");
+      expect(saved.uploaded_attachments).toEqual([]);
+      expect(h1.backend.appendCalls).toHaveLength(0);
+      expect(h1.backend.createCalls).toHaveLength(0);
+      expect(calls.messageResourceGet.length).toBeGreaterThanOrEqual(1);
+      expect(calls.messageResourceGet[0]).toEqual({
+        path: { message_id: MESSAGE_ID, file_key: "file_abc" },
+        params: { type: "file" },
+      });
+
+      downloadShouldFail = false;
+      uploadedSaveShouldFail = true;
+      const h2 = createTestHarness();
+      extraHarnesses.push(h2);
+      wireStatefulBackend(h2);
+      await h2.app.orchestrator.runStartupRecovery();
+
+      expect(h2.backend.uploadWorkspaceFile).toHaveBeenCalledTimes(1);
+      expect(saved.uploaded_attachments).toEqual([]);
+      expect(h2.backend.appendCalls).toHaveLength(0);
+      expect(h2.backend.createCalls).toHaveLength(0);
+
+      uploadedSaveShouldFail = false;
+      const h3 = createTestHarness();
+      extraHarnesses.push(h3);
+      wireStatefulBackend(h3);
+      await h3.app.orchestrator.runStartupRecovery();
+
+      const uploadCalls = vi.mocked(h3.backend.uploadWorkspaceFile).mock
+        .calls;
+      expect(uploadCalls).toHaveLength(1);
+      expect(uploadCalls[0]?.[0]).toBe(USER_ID);
+      expect(uploadCalls[0]?.[2]).toBe(
+        "uploads/feishu/om_post_recovery_1/report.pdf",
+      );
+      expect(uploadCalls[0]?.[3]).toBe("report.pdf");
+      expect((uploadCalls[0]?.[4] as Buffer).toString("utf8")).toBe(
+        "PDF_REPORT_CONTENT",
+      );
+      expect(uploadCalls[0]?.[5]).toBe("application/pdf");
+      expect(saved.uploaded_attachments).toEqual([
+        {
+          filename: "report.pdf",
+          workspace_path: "uploads/feishu/om_post_recovery_1/report.pdf",
+          mime_type: "application/pdf",
+          size_bytes: Buffer.byteLength("PDF_REPORT_CONTENT", "utf8"),
+        },
+      ]);
+      const submitted = (
+        h3.backend.appendCalls[0] ?? h3.backend.createCalls[0]
+      )?.payload.messages[0]?.content;
+      const submittedText = Array.isArray(submitted)
+        ? submitted
+            .map((item) => (item.type === "text" ? item.text : ""))
+            .join("\n")
+        : String(submitted ?? "");
+      expect(submittedText).toContain("请分析附件");
+      expect(submittedText).toContain(
+        "uploads/feishu/om_post_recovery_1/report.pdf",
+      );
+      expect(
+        calls.messageResourceGet.every(
+          (call) =>
+            call.path.message_id === MESSAGE_ID &&
+            call.path.file_key === "file_abc" &&
+            call.params.type === "file",
+        ),
+      ).toBe(true);
+    } finally {
+      await h1.cleanup();
+      for (const extra of extraHarnesses) {
+        await extra.cleanup();
+      }
     }
   });
 

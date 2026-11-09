@@ -60,6 +60,7 @@ import {
   shouldUseFeishuCard,
 } from "./format.js";
 import {
+  hasUnresolvedGroupMention,
   parseFeishuInboundEvent,
   resolveFeishuMessageDedupeKey,
 } from "./inbound-parse.js";
@@ -241,6 +242,14 @@ export async function monitorWebSocket(
       });
       if (!parsed) {
         return;
+      }
+      if (hasUnresolvedGroupMention(rawPayload, currentBotOpenId)) {
+        if (dedupeKey) {
+          dedupe.delete(dedupeKey);
+        }
+        throw new Error(
+          "Feishu bot identity is not resolved; a group message with structured mentions cannot be classified yet",
+        );
       }
       if (
         messageType === "merge_forward" &&
@@ -526,6 +535,14 @@ export class FeishuChannelAdapter implements ChannelAdapter {
       });
       if (!parsed) {
         return;
+      }
+      if (hasUnresolvedGroupMention(rawPayload, this.botOpenId)) {
+        if (dedupeKey) {
+          this.dedupe.delete(dedupeKey);
+        }
+        throw new Error(
+          "Feishu bot identity is not resolved; a group message with structured mentions cannot be classified yet",
+        );
       }
       if (
         messageType === "merge_forward" &&

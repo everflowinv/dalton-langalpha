@@ -137,8 +137,93 @@ export function checkBotMentioned(params: {
     return false;
   }
 
-  // If botOpenId was not resolved from probe, only treat explicit non-broadcast
-  // mentions with `@_user_` placeholder as mentioning when there is a single bot mention
+  // Without a resolved bot identity, no structured mention can be matched
+  // to the bot.
+  return false;
+}
+
+function extractPostMentionedOpenIds(content: string): string[] {
+  const mentioned: string[] = [];
+  const seen = new Set<string>();
+  const visit = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        visit(entry);
+      }
+      return;
+    }
+    if (!isRecord(value)) {
+      return;
+    }
+    if (value.tag === "at") {
+      const id =
+        (typeof value.user_id === "string" && value.user_id.trim()) ||
+        (typeof value.open_id === "string" && value.open_id.trim()) ||
+        "";
+      if (id && !seen.has(id)) {
+        seen.add(id);
+        mentioned.push(id);
+      }
+    }
+    for (const entry of Object.values(value)) {
+      visit(entry);
+    }
+  };
+  try {
+    visit(JSON.parse(content) as unknown);
+  } catch {
+    return [];
+  }
+  return mentioned;
+}
+
+export function hasUnresolvedGroupMention(
+  rawPayload: unknown,
+  botOpenId?: string,
+): boolean {
+  if (botOpenId?.trim()) {
+    return false;
+  }
+  if (!isRecord(rawPayload)) {
+    return false;
+  }
+  const eventObj = isRecord(rawPayload.event)
+    ? (rawPayload.event as FeishuMessageReceiveEventPayload)
+    : (rawPayload as FeishuMessageReceiveEventPayload);
+  const message = eventObj.message;
+  if (!message) {
+    return false;
+  }
+  const rawChatType = (message.chat_type ?? "p2p").trim().toLowerCase();
+  if (
+    rawChatType === "p2p" ||
+    rawChatType === "private" ||
+    rawChatType === "dm"
+  ) {
+    return false;
+  }
+  const mentions = Array.isArray(message.mentions) ? message.mentions : [];
+  for (const mention of mentions) {
+    if (isFeishuBroadcastMention(mention)) {
+      continue;
+    }
+    if (extractMentionOpenId(mention) || mention.key?.trim()) {
+      return true;
+    }
+  }
+  const messageType = (message.message_type ?? message.msg_type ?? "")
+    .trim()
+    .toLowerCase();
+  if (messageType === "post" && typeof message.content === "string") {
+    const mentionedOpenIds = new Set([
+      ...parsePostContent(message.content).mentionedOpenIds,
+      ...extractPostMentionedOpenIds(message.content),
+    ]);
+    return [...mentionedOpenIds].some((id) => {
+      const normalized = id.trim().toLowerCase();
+      return normalized.length > 0 && normalized !== "all" && normalized !== "@_all";
+    });
+  }
   return false;
 }
 
@@ -638,7 +723,15 @@ export function parseFeishuInboundEvent(
 
   const mentionsBot = checkBotMentioned({
     mentions: message.mentions,
-    postMentionedOpenIds: postParsed?.mentionedOpenIds,
+    postMentionedOpenIds:
+      postParsed !== undefined
+        ? [
+            ...new Set([
+              ...postParsed.mentionedOpenIds,
+              ...extractPostMentionedOpenIds(rawContent),
+            ]),
+          ]
+        : undefined,
     rawContent,
     botOpenId: options.botOpenId,
   });

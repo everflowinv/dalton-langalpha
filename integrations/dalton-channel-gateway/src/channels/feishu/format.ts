@@ -697,39 +697,58 @@ function sanitizeFenceLanguage(lang: string): string {
   return lang.trim().replace(/[^a-zA-Z0-9_+#.-]/g, "");
 }
 
-function resolvePostPayload(content: string): {
+interface PostPayload {
   title: string;
   paragraphs: unknown[];
   files: unknown[];
-} | null {
+}
+
+function toPostPayload(candidate: unknown): PostPayload | null {
+  if (!isRecord(candidate) || !Array.isArray(candidate.content)) {
+    return null;
+  }
+  return {
+    title: typeof candidate.title === "string" ? candidate.title : "",
+    paragraphs: candidate.content,
+    files: Array.isArray(candidate.files) ? candidate.files : [],
+  };
+}
+
+function resolveLocalePayload(candidate: unknown): PostPayload | null {
+  const direct = toPostPayload(candidate);
+  if (direct) {
+    return direct;
+  }
+  if (!isRecord(candidate)) {
+    return null;
+  }
+  for (const value of Object.values(candidate)) {
+    const localePayload = toPostPayload(value);
+    if (localePayload) {
+      return localePayload;
+    }
+  }
+  return null;
+}
+
+function resolvePostPayload(content: string): PostPayload | null {
   try {
-    const parsed = JSON.parse(content);
+    const parsed = JSON.parse(content) as unknown;
     if (!isRecord(parsed)) {
       return null;
     }
-    const candidate =
-      isRecord(parsed.zh_cn)
-        ? parsed.zh_cn
-        : isRecord(parsed.en_us)
-          ? parsed.en_us
-          : isRecord(parsed.ja_jp)
-            ? parsed.ja_jp
-            : parsed;
-    if (!isRecord(candidate)) {
+    const payload =
+      toPostPayload(parsed) ??
+      resolveLocalePayload(parsed.post) ??
+      resolveLocalePayload(parsed);
+    if (!payload) {
       return null;
     }
-    const files: unknown[] = [];
-    if (Array.isArray(candidate.files)) {
-      files.push(...candidate.files);
-    }
-    if (candidate !== parsed && Array.isArray(parsed.files)) {
+    const files = [...payload.files];
+    if (Array.isArray(parsed.files)) {
       files.push(...parsed.files);
     }
-    return {
-      title: typeof candidate.title === "string" ? candidate.title : "",
-      paragraphs: Array.isArray(candidate.content) ? candidate.content : [],
-      files,
-    };
+    return { ...payload, files };
   } catch {
     return null;
   }
