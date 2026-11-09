@@ -178,7 +178,14 @@ interface PendingDispatch {
   eventName: string;
   data: unknown;
   seq: number | null;
+  sessionEpoch: number;
+  messageId: string | null;
   attempts: number;
+}
+
+function extractDispatchMessageId(eventName: string, data: unknown): string | null {
+  if (eventName !== "MESSAGE_CREATE" || !isRecord(data)) return null;
+  return typeof data.id === "string" && data.id.trim().length > 0 ? data.id.trim() : null;
 }
 
 export class DiscordGatewayClient {
@@ -204,7 +211,9 @@ export class DiscordGatewayClient {
   private readonly activeWaitTimers = new Set<{ timer: ReturnType<typeof setTimeout>; cancel: () => void }>();
   private pendingDispatches: PendingDispatch[] = [];
   private isDrainingDispatches = false;
-  private sessionGeneration = 0;
+  private wakeDrainImmediately = false;
+  private stopGeneration = 0;
+  private protocolSessionEpoch = 0;
   private shouldReconnect = false;
   private isConnecting = false;
   private connected = false;
@@ -300,7 +309,9 @@ export class DiscordGatewayClient {
   /** Stops the socket, heartbeat, and any pending reconnect/retry/quota waits; no further reconnects occur. */
   async stop(): Promise<void> {
     this.shouldReconnect = false;
-    this.sessionGeneration += 1;
+    this.stopGeneration += 1;
+    this.protocolSessionEpoch += 1;
+    this.wakeDrainImmediately = false;
     this.stopHeartbeat();
     if (this.reconnectTimer) {
       this.timerDeps.clearTimeoutFn(this.reconnectTimer);
@@ -487,14 +498,17 @@ export class DiscordGatewayClient {
     const seq = payload.s ?? null;
 
     if (payload.t === "READY" && isRecord(payload.d)) {
-      this.sessionGeneration += 1;
+      this.protocolSessionEpoch += 1;
+      for (const item of this.pendingDispatches) {
+        item.attempts = 0;
+      }
       this.clearDispatchRetryTimer();
-      this.pendingDispatches = [];
+      if (this.isDrainingDispatches) {
+        this.wakeDrainImmediately = true;
+      }
       this.sessionId = typeof payload.d.session_id === "string" ? payload.d.session_id : null;
       this.resumeGatewayUrl = typeof payload.d.resume_gateway_url === "string" ? payload.d.resume_gateway_url : null;
-      if (seq !== null) {
-        this.ackedSequence = seq;
-      }
+      this.ackedSequence = seq;
       this.reconnectAttempts = 0;
       this.consecutiveResumeFailures = 0;
       this.connected = true;
@@ -508,15 +522,45 @@ export class DiscordGatewayClient {
       this.reconnectAttempts = 0;
       this.consecutiveResumeFailures = 0;
       this.connected = true;
+      for (const item of this.pendingDispatches) {
+        item.attempts = 0;
+      }
       this.clearDispatchRetryTimer();
+      if (this.isDrainingDispatches) {
+        this.wakeDrainImmediately = true;
+      }
     }
 
-    if (payload.t !== "READY" && payload.t !== "RESUMED" && seq !== null) {
-      if (this.ackedSequence !== null && seq <= this.ackedSequence) {
+    const currentEpoch = this.protocolSessionEpoch;
+    const messageId = extractDispatchMessageId(payload.t, payload.d);
+
+    if (payload.t !== "READY" && payload.t !== "RESUMED") {
+      if (
+        seq !== null &&
+        this.ackedSequence !== null &&
+        seq <= this.ackedSequence &&
+        !this.pendingDispatches.some(
+          (item) =>
+            (item.sessionEpoch === currentEpoch && item.seq === seq) ||
+            (messageId !== null && item.messageId === messageId),
+        )
+      ) {
         return;
       }
-      if (this.pendingDispatches.some((item) => item.seq === seq)) {
+      const existing = this.pendingDispatches.find(
+        (item) =>
+          (seq !== null && item.sessionEpoch === currentEpoch && item.seq === seq) ||
+          (messageId !== null && item.messageId === messageId),
+      );
+      if (existing) {
+        if (seq !== null && existing.sessionEpoch === currentEpoch) {
+          existing.seq = seq;
+        }
+        existing.attempts = 0;
         this.clearDispatchRetryTimer();
+        if (this.isDrainingDispatches) {
+          this.wakeDrainImmediately = true;
+        }
         await this.drainPendingDispatches();
         return;
       }
@@ -532,8 +576,14 @@ export class DiscordGatewayClient {
       eventName: payload.t,
       data: payload.d,
       seq,
+      sessionEpoch: currentEpoch,
+      messageId,
       attempts: 0,
     });
+
+    if (this.pendingDispatches[0] && this.pendingDispatches[0].sessionEpoch !== currentEpoch) {
+      this.clearDispatchRetryTimer();
+    }
 
     await this.drainPendingDispatches();
   }
@@ -541,16 +591,22 @@ export class DiscordGatewayClient {
   private async drainPendingDispatches(): Promise<void> {
     if (this.isDrainingDispatches || !this.shouldReconnect || this.dispatchRetryTimer) return;
     this.isDrainingDispatches = true;
-    const generation = this.sessionGeneration;
+    const stopGen = this.stopGeneration;
     try {
-      while (this.shouldReconnect && generation === this.sessionGeneration && this.pendingDispatches.length > 0) {
+      while (this.shouldReconnect && stopGen === this.stopGeneration && this.pendingDispatches.length > 0) {
         const current = this.pendingDispatches[0]!;
+        this.wakeDrainImmediately = false;
         try {
           await this.onDispatch?.(current.eventName, current.data, current.seq ?? this.ackedSequence);
         } catch (err) {
-          if (!this.shouldReconnect || generation !== this.sessionGeneration) return;
-          current.attempts += 1;
+          if (!this.shouldReconnect || stopGen !== this.stopGeneration) return;
           this.emitError(err instanceof Error ? err : new Error(String(err)));
+          if (this.wakeDrainImmediately) {
+            this.wakeDrainImmediately = false;
+            current.attempts = 0;
+            continue;
+          }
+          current.attempts += 1;
           if (current.attempts >= MAX_DISPATCH_RETRY_ATTEMPTS) {
             current.attempts = 0;
             this.scheduleReconnect({ preferResume: true, reason: "dispatch-retry-exhausted" });
@@ -560,14 +616,18 @@ export class DiscordGatewayClient {
             DISPATCH_RETRY_MAX_DELAY_MS,
             DISPATCH_RETRY_BASE_DELAY_MS * 2 ** (current.attempts - 1),
           );
-          this.scheduleDispatchRetry(retryDelayMs, generation);
+          this.scheduleDispatchRetry(retryDelayMs, stopGen);
           return;
         }
-        if (!this.shouldReconnect || generation !== this.sessionGeneration) return;
+        if (!this.shouldReconnect || stopGen !== this.stopGeneration) return;
         if (this.pendingDispatches[0] === current) {
           this.pendingDispatches.shift();
         }
-        if (current.seq !== null && (this.ackedSequence === null || current.seq > this.ackedSequence)) {
+        if (
+          current.sessionEpoch === this.protocolSessionEpoch &&
+          current.seq !== null &&
+          (this.ackedSequence === null || current.seq > this.ackedSequence)
+        ) {
           this.ackedSequence = current.seq;
         }
       }
@@ -576,12 +636,12 @@ export class DiscordGatewayClient {
     }
   }
 
-  private scheduleDispatchRetry(delayMs: number, generation: number): void {
+  private scheduleDispatchRetry(delayMs: number, stopGen: number): void {
     this.clearDispatchRetryTimer();
-    if (!this.shouldReconnect || generation !== this.sessionGeneration) return;
+    if (!this.shouldReconnect || stopGen !== this.stopGeneration) return;
     this.dispatchRetryTimer = this.timerDeps.setTimeoutFn(() => {
       this.dispatchRetryTimer = undefined;
-      if (!this.shouldReconnect || generation !== this.sessionGeneration) return;
+      if (!this.shouldReconnect || stopGen !== this.stopGeneration) return;
       void this.drainPendingDispatches();
     }, Math.max(0, delayMs));
     (this.dispatchRetryTimer as { unref?: () => void }).unref?.();
@@ -700,9 +760,8 @@ export class DiscordGatewayClient {
   }
 
   private resetSession(): void {
-    this.sessionGeneration += 1;
+    this.protocolSessionEpoch += 1;
     this.clearDispatchRetryTimer();
-    this.pendingDispatches = [];
     this.sessionId = null;
     this.resumeGatewayUrl = null;
     this.lastReceivedSequence = null;

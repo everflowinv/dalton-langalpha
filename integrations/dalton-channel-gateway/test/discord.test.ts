@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ChannelDeliveryError, type ChannelAdapter } from "../src/channels/adapter.js";
 import {
   chunkDiscordText,
@@ -24,7 +24,8 @@ import { loadConfig } from "../src/config.js";
 import { buildConfiguredAdapters } from "../src/main.js";
 import { createGatewayApp } from "../src/server.js";
 import type { ChannelPlatform, InboundChannelEvent } from "../src/types.js";
-import { createMockBackend, TEST_SERVICE_TOKEN } from "./helpers.js";
+import { makeInboundRequestKey } from "../src/uuid.js";
+import { createMockBackend, HOME_WS_ID, TEST_SERVICE_TOKEN } from "./helpers.js";
 
 const BOT_ID = "999000111";
 const USER_ID = "111222333";
@@ -333,6 +334,186 @@ describe("DiscordGatewayClient", () => {
     await client.stop();
   });
 
+  it("retains received messages across a fresh Identify until inbound persistence succeeds", async () => {
+    const timers = new FakeTimers();
+    const sockets: FakeWebSocket[] = [];
+    let blocked = true;
+    const accepted: unknown[] = [];
+    const client = new DiscordGatewayClient({
+      token: "test-bot-token",
+      webSocketFactory: (url) => {
+        const socket = new FakeWebSocket(url);
+        sockets.push(socket);
+        return socket;
+      },
+      timerDeps: { setTimeoutFn: timers.setTimeoutFn, clearTimeoutFn: timers.clearTimeoutFn, now: () => timers.nowMs, random: () => 0 },
+      onDispatch: async (name, data) => {
+        if (name !== "MESSAGE_CREATE") return;
+        if (blocked) throw new Error("inbound persistence unavailable");
+        accepted.push(data);
+      },
+      onError: () => {},
+    });
+    try {
+      await client.start();
+      await helloAndReady(sockets[0]!);
+      sockets[0]!.receive({ op: 0, s: 2, t: "MESSAGE_CREATE", d: { id: "old-message" } });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      sockets[0]!.receive({ op: 9, d: false });
+      timers.advance(5000);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      blocked = false;
+      const nextSocket = sockets[sockets.length - 1]!;
+      expect(nextSocket).not.toBe(sockets[0]);
+      await helloAndReady(nextSocket);
+      nextSocket.receive({ op: 0, s: 2, t: "MESSAGE_CREATE", d: { id: "new-message" } });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(accepted).toEqual([{ id: "old-message" }, { id: "new-message" }]);
+    } finally {
+      await client.stop();
+    }
+  });
+
+  it("preserves single ordered delivery when an in-flight handler outlives a new READY, reuses sequence numbers, and recovers after consecutive I-1 failures", async () => {
+    const timers = new FakeTimers();
+    const sockets: FakeWebSocket[] = [];
+    const accepted: string[] = [];
+
+    let resolveInflightOld!: () => void;
+    const inflightOldGate = new Promise<void>((r) => { resolveInflightOld = r; });
+    let resolveInflightStarted!: () => void;
+    const inflightStarted = new Promise<void>((r) => { resolveInflightStarted = r; });
+
+    let resolveNewSeq2Gate!: () => void;
+    const newSeq2Gate = new Promise<void>((r) => { resolveNewSeq2Gate = r; });
+    let resolveNewSeq2Started!: () => void;
+    const newSeq2Started = new Promise<void>((r) => { resolveNewSeq2Started = r; });
+
+    let consecutiveFailuresLeft = 3;
+    let resolveRetry4Accepted!: () => void;
+    const retry4Accepted = new Promise<void>((r) => { resolveRetry4Accepted = r; });
+
+    const client = new DiscordGatewayClient({
+      token: "test-bot-token",
+      webSocketFactory: (url) => {
+        const socket = new FakeWebSocket(url);
+        sockets.push(socket);
+        return socket;
+      },
+      timerDeps: {
+        setTimeoutFn: timers.setTimeoutFn,
+        clearTimeoutFn: timers.clearTimeoutFn,
+        now: () => timers.nowMs,
+        random: () => 0,
+      },
+      onDispatch: async (name, data) => {
+        if (name !== "MESSAGE_CREATE") return;
+        const msgId = (data as { id: string }).id;
+        if (msgId === "old-inflight-seq5") {
+          resolveInflightStarted();
+          await inflightOldGate;
+          accepted.push(msgId);
+          return;
+        }
+        if (msgId === "new-seq2") {
+          resolveNewSeq2Started();
+          await newSeq2Gate;
+          accepted.push(msgId);
+          return;
+        }
+        if (msgId === "retry-after-3-failures") {
+          if (consecutiveFailuresLeft > 0) {
+            consecutiveFailuresLeft -= 1;
+            throw new Error(`consecutive I-1 failure (${consecutiveFailuresLeft} remaining)`);
+          }
+          accepted.push(msgId);
+          resolveRetry4Accepted();
+          return;
+        }
+        accepted.push(msgId);
+      },
+      onError: () => {},
+    });
+
+    try {
+      await client.start();
+      const ws1 = sockets[0]!;
+      await helloAndReady(ws1, 1);
+
+      // 1. Old session receives s=5 and its async handler remains in-flight across InvalidSession(false) + fresh READY.
+      ws1.receive({ op: 0, s: 5, t: "MESSAGE_CREATE", d: { id: "old-inflight-seq5" } });
+      await inflightStarted;
+      expect(client.getLastReceivedSequence()).toBe(5);
+      expect(client.getSequence()).toBe(1);
+
+      ws1.receive({ op: 9, d: false });
+      timers.advance(5000);
+      await flushMicrotasks();
+
+      const ws2 = sockets[sockets.length - 1]!;
+      expect(ws2).not.toBe(ws1);
+      ws2.open();
+      ws2.receive({ op: 10, d: { heartbeat_interval: 1000 } });
+      await flushMicrotasks();
+      ws2.receive({
+        op: 0,
+        s: 1,
+        t: "READY",
+        d: { session_id: "sess-2", resume_gateway_url: "wss://resume2.example.gg", user: { id: BOT_ID } },
+      });
+      // New session reuses sequence numbers s=2 and s=5 while old-inflight-seq5 is still awaiting.
+      ws2.receive({ op: 0, s: 2, t: "MESSAGE_CREATE", d: { id: "new-seq2" } });
+      ws2.receive({ op: 0, s: 5, t: "MESSAGE_CREATE", d: { id: "new-reused-seq5" } });
+      await flushMicrotasks();
+
+      expect(accepted).toEqual([]);
+      expect(client.getLastReceivedSequence()).toBe(5);
+      expect(client.getSequence()).toBe(1);
+
+      // 2. Finish in-flight old-session message (s=5): it must NOT advance the new session's acked sequence (still 1).
+      resolveInflightOld();
+      await newSeq2Started;
+      expect(accepted).toEqual(["old-inflight-seq5"]);
+      expect(client.getSequence()).toBe(1);
+
+      // 3. Finish new-seq2 (s=2) and new-reused-seq5 (s=5): acked sequence advances to 5 in the new session.
+      resolveNewSeq2Gate();
+      await flushMicrotasks();
+      expect(accepted).toEqual(["old-inflight-seq5", "new-seq2", "new-reused-seq5"]);
+      expect(client.getSequence()).toBe(5);
+
+      // 4. Consecutive I-1 failures (3 failures + 4th attempt succeeds via retry backoff timers).
+      ws2.receive({ op: 0, s: 6, t: "MESSAGE_CREATE", d: { id: "retry-after-3-failures" } });
+      await flushMicrotasks();
+      expect(consecutiveFailuresLeft).toBe(2);
+      expect(client.getSequence()).toBe(5);
+
+      timers.advance(500);
+      await flushMicrotasks();
+      expect(consecutiveFailuresLeft).toBe(1);
+      expect(client.getSequence()).toBe(5);
+
+      timers.advance(1000);
+      await flushMicrotasks();
+      expect(consecutiveFailuresLeft).toBe(0);
+      expect(client.getSequence()).toBe(5);
+
+      timers.advance(2000);
+      await retry4Accepted;
+      await flushMicrotasks();
+      expect(accepted).toEqual([
+        "old-inflight-seq5",
+        "new-seq2",
+        "new-reused-seq5",
+        "retry-after-3-failures",
+      ]);
+      expect(client.getSequence()).toBe(6);
+    } finally {
+      await client.stop();
+      expect(timers.pendingCount).toBe(0);
+    }
+  });
+
   it("does not reconnect after a fatal close code", async () => {
     const timers = new FakeTimers();
     const sockets: FakeWebSocket[] = [];
@@ -505,6 +686,11 @@ describe("DiscordGatewayClient", () => {
     const timers = new FakeTimers();
     const sockets: FakeWebSocket[] = [];
     const errors: Error[] = [];
+    let resolveFirstFailure!: () => void;
+    const firstFailureObserved = new Promise<void>((r) => { resolveFirstFailure = r; });
+    let resolveBothRegistered!: () => void;
+    const bothRegistered = new Promise<void>((r) => { resolveBothRegistered = r; });
+
     const { rest } = makeRest(async (call) => {
       if (routeOf(call.url) === "/users/@me") return jsonResponse({ id: BOT_ID });
       if (routeOf(call.url) === `/channels/${CHANNEL_ID}`) {
@@ -530,7 +716,12 @@ describe("DiscordGatewayClient", () => {
         now: () => timers.nowMs,
         random: () => 0,
       },
-      onError: (err) => { errors.push(err); },
+      onError: (err) => {
+        errors.push(err);
+        if (err.message.includes("transient I-1 failure on m-gw-1")) {
+          resolveFirstFailure();
+        }
+      },
     });
 
     const adapter = new DiscordChannelAdapter({
@@ -549,6 +740,9 @@ describe("DiscordGatewayClient", () => {
         throw new Error("transient I-1 failure on m-gw-1");
       }
       registered.push(`${event.messageId}:${event.text}`);
+      if (registered.length === 2) {
+        resolveBothRegistered();
+      }
     });
 
     await adapter.start();
@@ -569,8 +763,7 @@ describe("DiscordGatewayClient", () => {
       t: "MESSAGE_CREATE",
       d: guildMessage({ id: "m-gw-2", content: `<@${BOT_ID}> second` }),
     });
-    await flushMicrotasks();
-    await flushMicrotasks();
+    await firstFailureObserved;
 
     // Heartbeat must report the latest received sequence (3), while Resume state stays at last acked sequence (1).
     expect(gatewayClient.getLastReceivedSequence()).toBe(3);
@@ -625,8 +818,7 @@ describe("DiscordGatewayClient", () => {
       d: guildMessage({ id: "m-gw-2", content: `<@${BOT_ID}> second` }),
     });
     ws2.receive({ op: 0, s: 3, t: "RESUMED", d: {} });
-    await flushMicrotasks();
-    await flushMicrotasks();
+    await bothRegistered;
     await flushMicrotasks();
 
     // Original message registered once, in strict order before m-gw-2, and acked sequence advances to 3.
@@ -998,10 +1190,11 @@ describe("Discord attachments", () => {
       const targetUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
       cdnUrls.push(targetUrl);
       cdnHeaders.push(new Headers(init?.headers));
-      if (targetUrl.includes("ex=expired")) {
+      const exParam = new URL(targetUrl).searchParams.get("ex");
+      if (exParam === "expired") {
         return new Response("expired signature", { status: 403 });
       }
-      if (targetUrl.includes("ex=fresh")) {
+      if (exParam === "fresh") {
         return new Response(null, {
           status: 302,
           headers: { location: "https://media.discordapp.net/attachments/1/2/report.pdf?ex=fresh2" },
@@ -1038,7 +1231,6 @@ describe("Discord attachments", () => {
 
   it("recovers a guild thread attachment through the real orchestrator using persisted raw_payload.discord_message.channel_id", async () => {
     const backend = createMockBackend();
-    backend.seedLink("discord", USER_ID, "user_alice_123");
 
     const restRoutes: string[] = [];
     const { rest } = makeRest(async (call) => {
@@ -1077,11 +1269,18 @@ describe("Discord attachments", () => {
     });
 
     let allowMediaDownload = false;
+    let initialCrashAttempts = 0;
+    let resolveInitialCrashSettled!: () => void;
+    const initialCrashSettled = new Promise<void>((r) => { resolveInitialCrashSettled = r; });
     const mediaHeaders: Headers[] = [];
     const mediaFetchImpl: typeof fetch = async (input: string | URL | Request, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
       mediaHeaders.push(new Headers(init?.headers));
       if (!allowMediaDownload) {
+        initialCrashAttempts += 1;
+        if (initialCrashAttempts >= 2) {
+          resolveInitialCrashSettled();
+        }
         throw new Error("simulated crash before initial attachment download completes");
       }
       expect(url).toBe("https://media.discordapp.net/attachments/recovered/model.pdf?ex=fresh");
@@ -1129,19 +1328,57 @@ describe("Discord attachments", () => {
         ],
       }) as never,
     );
+    await initialCrashSettled;
+    await flushMicrotasks();
 
-    const persistedRow = backend.state.inboundRows.get("discord:msg-thread-att");
-    expect(persistedRow).toBeDefined();
+    const registerCalls = vi.mocked(backend.registerAndResolveInbound).mock.calls;
+    expect(registerCalls.length).toBeGreaterThanOrEqual(1);
+    const persistedReq = registerCalls[0]![0];
+    const persistedRawPayload = persistedReq.raw_payload ?? {};
+    expect(persistedReq.chat_address).toBe(`discord:${GUILD_ID}/${CHANNEL_ID}`);
+    expect(persistedReq.thread_scope_key).toBe(`chat:${GUILD_ID}/${CHANNEL_ID}:thread:${THREAD_ID}`);
     // Verify orchestrator's persisted raw_payload stripped attachment URL/channelId but retained discord_message.channel_id.
-    expect(persistedRow!.raw_payload.chat_id).toBe(`${GUILD_ID}/${CHANNEL_ID}`);
-    expect((persistedRow!.raw_payload.discord_message as { channel_id?: string }).channel_id).toBe(THREAD_ID);
-    expect(persistedRow!.raw_payload.attachments).toEqual([
+    expect(persistedRawPayload.chat_id).toBe(`${GUILD_ID}/${CHANNEL_ID}`);
+    expect((persistedRawPayload.discord_message as { channel_id?: string }).channel_id).toBe(THREAD_ID);
+    expect(persistedRawPayload.attachments).toEqual([
       { id: "att-thread-target", filename: "model.pdf", mimeType: "application/pdf", sizeBytes: 9 },
     ]);
+    expect(vi.mocked(backend.uploadWorkspaceFile)).not.toHaveBeenCalled();
 
-    // 2. Simulate startup recovery of this in-flight row (status = "dispatched", no uploaded_attachments yet).
-    persistedRow!.status = "dispatched";
-    persistedRow!.uploaded_attachments = [];
+    // 2. Simulate startup recovery of this in-flight row (crashed before attachment upload completed).
+    vi.mocked(backend.recoverState).mockImplementationOnce(async () => ({
+      mode: "startup" as const,
+      inbound_events: [
+        {
+          platform: "discord" as const,
+          message_id: "msg-thread-att",
+          platform_user_id: USER_ID,
+          dalton_user_id: "user_alice_123",
+          chat_type: "group" as const,
+          chat_address: persistedReq.chat_address,
+          thread_scope_key: persistedReq.thread_scope_key,
+          request_key: makeInboundRequestKey("discord", "msg-thread-att"),
+          retry_request_key: null,
+          resubmitted_request_key: null,
+          steered_into_run_id: null,
+          thread_id: "11111111-2222-3333-4444-555555555555",
+          run_id: null,
+          turn_index: null,
+          workspace_id: HOME_WS_ID,
+          external_thread_id: `discord:${persistedReq.thread_scope_key}:gen:1`,
+          generation: 1,
+          status: "pending" as const,
+          fallback_pending: false,
+          sent_to_current_count: 0,
+          uploaded_attachments: [],
+          raw_payload: structuredClone(persistedRawPayload),
+          pending_interrupt: null,
+        },
+      ],
+      background_runs: [],
+      thread_watches: [],
+      automation_runs: [],
+    }));
     allowMediaDownload = true;
 
     await app.orchestrator.runStartupRecovery();
@@ -1149,11 +1386,20 @@ describe("Discord attachments", () => {
     // Verify recovery looked up the message in THREAD_ID (not parent CHANNEL_ID), matched att-thread-target, and uploaded it.
     expect(restRoutes).toContain(`GET /channels/${THREAD_ID}/messages/msg-thread-att`);
     expect(restRoutes).not.toContain(`GET /channels/${CHANNEL_ID}/messages/msg-thread-att`);
-    expect(backend.uploadWorkspaceFile).toHaveBeenCalledTimes(1);
-    const uploadArgs = backend.uploadWorkspaceFile.mock.calls[0]!;
+    const uploadCalls = vi.mocked(backend.uploadWorkspaceFile).mock.calls;
+    expect(uploadCalls).toHaveLength(1);
+    const uploadArgs = uploadCalls[0]!;
+    expect(uploadArgs[0]).toBe("user_alice_123");
+    expect(uploadArgs[2]).toBe("uploads/discord/msg-thread-att/model.pdf");
     expect(uploadArgs[3]).toBe("model.pdf");
-    expect((uploadArgs[4] as Buffer).toString()).toBe("pdf-model");
-    expect(persistedRow!.status).toBe("completed");
+    expect((uploadArgs[4] as Buffer).toString("utf8")).toBe("pdf-model");
+    expect(uploadArgs[5]).toBe("application/pdf");
+    expect(backend.appendCalls).toHaveLength(1);
+    expect(
+      backend.progressUpdates.some(
+        (u) => u.platform === "discord" && u.message_id === "msg-thread-att" && u.status === "completed",
+      ),
+    ).toBe(true);
     for (const h of mediaHeaders) {
       expect(h.get("Authorization")).toBeNull();
     }

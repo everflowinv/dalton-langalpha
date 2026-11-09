@@ -52,7 +52,7 @@ export interface DiscordMessageLike {
     id?: string; filename?: string; content_type?: string; size?: number;
     url?: string; proxy_url?: string;
   }>;
-  thread?: { id?: string };
+  thread?: { id?: string; parent_id?: string };
   [key: string]: unknown;
 }
 
