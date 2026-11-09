@@ -511,9 +511,11 @@ def _build_current_week_rows(
     return [row + [11111.0] * extra_cols for row in base_rows]
 
 
-def _build_legacy_mtgk_rows() -> list[list[object]]:
+def _build_legacy_mtgk_rows(
+    data_rows: list[list[object]] | None = None,
+) -> list[list[object]]:
     """Build rows matching legacy `20260925_mtgk.xls` detailed history through 2026-09-18."""
-    return [
+    header_rows: list[list[object]] = [
         ["信用取引現在高（一般信用取引・制度信用取引別）"] + [None] * 12,
         [
             "月日",
@@ -545,27 +547,33 @@ def _build_legacy_mtgk_rows() -> list[list[object]]:
             "株数",
             "金額",
         ],
-        [
-            dt.datetime(2026, 9, 18),
-            510000,
-            980000,
-            3400000,
-            6100000,
-            210000,
-            420000,
-            300000,
-            560000,
-            1750000,
-            2800000,
-            1650000,
-            3300000,
-        ],
     ]
+    if data_rows is None:
+        data_rows = [
+            [
+                dt.datetime(2026, 9, 18),
+                510000,
+                980000,
+                3400000,
+                6100000,
+                210000,
+                420000,
+                300000,
+                560000,
+                1750000,
+                2800000,
+                1650000,
+                3300000,
+            ],
+        ]
+    return header_rows + data_rows
 
 
-def _build_legacy_mtsk_rows() -> list[list[object]]:
+def _build_legacy_mtsk_rows(
+    data_rows: list[list[object]] | None = None,
+) -> list[list[object]]:
     """Build rows matching legacy `20260925_mtsk.xls` credit-total / JSF history through 2026-09-18."""
-    return [
+    header_rows: list[list[object]] = [
         ["信用取引現在高"] + [None] * 21,
         [
             "月日",
@@ -615,31 +623,35 @@ def _build_legacy_mtsk_rows() -> list[list[object]]:
             "株数",
             "金額",
         ],
-        [
-            dt.datetime(2026, 9, 18),
-            70000,
-            95000,
-            1500,
-            2000,
-            440000,
-            885000,
-            3398500,
-            6098000,
-            510000,
-            980000,
-            3400000,
-            6100000,
-            160000,
-            155000,
-            205000,
-            245000,
-            430000,
-            200000,
-            370000,
-            2900000,
-            5100000,
-        ],
     ]
+    if data_rows is None:
+        data_rows = [
+            [
+                dt.datetime(2026, 9, 18),
+                70000,
+                95000,
+                1500,
+                2000,
+                440000,
+                885000,
+                3398500,
+                6098000,
+                510000,
+                980000,
+                3400000,
+                6100000,
+                160000,
+                155000,
+                205000,
+                245000,
+                430000,
+                200000,
+                370000,
+                2900000,
+                5100000,
+            ],
+        ]
+    return header_rows + data_rows
 
 
 KIOXIA_SAMPLE_PAGE_TEXT = """\
@@ -933,6 +945,29 @@ def test_explicit_finite_zero_preserved_in_workbooks_pdf_and_merges(
     assert len(parsed) == 1
     for col in cli.MARGIN_HEADER[1:]:
         assert parsed[0][col] == 0.0
+
+    mtgk_zero_bytes = _rows_to_xlsx_bytes(
+        "Sheet1",
+        _build_legacy_mtgk_rows([[dt.datetime(2026, 9, 18)] + [0] * 12]),
+    )
+    parsed_mtgk_zero = cli.parse_margin_book(mtgk_zero_bytes, True)
+    assert len(parsed_mtgk_zero) == 1
+    for col in cli.LEGACY_MTGK_REQUIRED_FIELDS:
+        assert parsed_mtgk_zero[0][col] == 0.0
+    assert "jsf_stock_loan_value_mjpy" not in parsed_mtgk_zero[0]
+    assert "jsf_funding_value_mjpy" not in parsed_mtgk_zero[0]
+
+    mtsk_zero_bytes = _rows_to_xlsx_bytes(
+        "Sheet1",
+        _build_legacy_mtsk_rows([[dt.datetime(2026, 9, 18)] + [0] * 21]),
+    )
+    parsed_mtsk_zero = cli.parse_margin_book(mtsk_zero_bytes, False)
+    assert len(parsed_mtsk_zero) == 1
+    assert parsed_mtsk_zero[0] == {
+        "date": "2026-09-18",
+        "jsf_stock_loan_value_mjpy": 0.0,
+        "jsf_funding_value_mjpy": 0.0,
+    }
 
     csv_path = tmp_path / "margin_weekly.csv"
     cli.merge_margin_rows(
@@ -2030,3 +2065,297 @@ def test_current_discovery_failure_or_text_date_15col_mismatch_with_valid_histor
     assert float(stored3["2026-11-06"]["short_value_mjpy"]) == 643859.0
     assert float(stored3["2026-09-11"]["neg_short_value_mjpy"]) == 0.0
 
+
+def test_history_workbooks_reject_all_invalid_or_partial_invalid_numeric_date_rows() -> None:
+    cli = _load_cli_module()
+
+    inspect.signature(cli.parse_margin_history_book).bind(b"", detailed=None)
+    inspect.signature(cli.parse_margin_book).bind(b"", detailed=None)
+
+    # 1. Combined history: all numeric cells N/A -> rejected.
+    combined_all_na = _rows_to_xlsx_bytes(
+        "信用取引現在高",
+        _build_combined_history_rows([[dt.datetime(2026, 10, 30)] + ["N/A"] * 25]),
+    )
+    with pytest.raises(ValueError, match="contained no valid numeric date rows"):
+        cli.parse_margin_history_book(combined_all_na)
+    with pytest.raises(ValueError, match="contained no valid numeric date rows"):
+        cli.parse_margin_book(combined_all_na)
+
+    # 2. Combined history: partial missing required cell (proprietary standardized short col 2 is N/A) -> rejected.
+    valid_combined_row = list(_build_combined_history_rows()[10])
+    partial_combined_row = list(valid_combined_row)
+    partial_combined_row[2] = "N/A"
+    combined_partial_na = _rows_to_xlsx_bytes(
+        "信用取引現在高",
+        _build_combined_history_rows([partial_combined_row]),
+    )
+    with pytest.raises(ValueError, match="std_short_value_mjpy"):
+        cli.parse_margin_book(combined_partial_na)
+
+    # 3. Legacy mtgk: all 8 responsible margin columns N/A -> rejected.
+    mtgk_all_na = _rows_to_xlsx_bytes(
+        "Sheet1",
+        _build_legacy_mtgk_rows([[dt.datetime(2026, 9, 18)] + ["N/A"] * 12]),
+    )
+    with pytest.raises(ValueError, match="Legacy mtgk margin workbook contained no valid numeric date rows"):
+        cli.parse_margin_history_book(mtgk_all_na, True)
+    with pytest.raises(ValueError, match="Legacy mtgk margin workbook contained no valid numeric date rows"):
+        cli.parse_margin_book(mtgk_all_na, True)
+
+    # 4. Legacy mtgk: partial missing required column (std_long_value_mjpy at col 12 is "-") -> rejected.
+    valid_mtgk_row = list(_build_legacy_mtgk_rows()[3])
+    partial_mtgk_row = list(valid_mtgk_row)
+    partial_mtgk_row[12] = "-"
+    mtgk_partial_na = _rows_to_xlsx_bytes(
+        "Sheet1",
+        _build_legacy_mtgk_rows([partial_mtgk_row]),
+    )
+    with pytest.raises(ValueError, match="std_long_value_mjpy"):
+        cli.parse_margin_book(mtgk_partial_na, True)
+
+    # 5. Legacy mtsk: both responsible JSF columns N/A -> rejected.
+    mtsk_all_na = _rows_to_xlsx_bytes(
+        "Sheet1",
+        _build_legacy_mtsk_rows([[dt.datetime(2026, 9, 18)] + ["N/A"] * 21]),
+    )
+    with pytest.raises(ValueError, match="Legacy mtsk margin workbook contained no valid numeric date rows"):
+        cli.parse_margin_history_book(mtsk_all_na, False)
+    with pytest.raises(ValueError, match="Legacy mtsk margin workbook contained no valid numeric date rows"):
+        cli.parse_margin_book(mtsk_all_na, False)
+
+    # 6. Legacy mtsk: partial missing required column (jsf_funding_value_mjpy at col 17 is N/A) -> rejected.
+    valid_mtsk_row = list(_build_legacy_mtsk_rows()[3])
+    partial_mtsk_row = list(valid_mtsk_row)
+    partial_mtsk_row[17] = "N/A"
+    mtsk_partial_na = _rows_to_xlsx_bytes(
+        "Sheet1",
+        _build_legacy_mtsk_rows([partial_mtsk_row]),
+    )
+    with pytest.raises(ValueError, match="jsf_funding_value_mjpy"):
+        cli.parse_margin_book(mtsk_partial_na, False)
+
+
+def test_legacy_mtsk_omits_unpublished_lending_sections() -> None:
+    cli = _load_cli_module()
+    unpublished = [dt.datetime(2020, 1, 10)] + [100] * 12 + ["-"] * 9
+    valid = list(_build_legacy_mtsk_rows()[3])
+    book = _rows_to_xlsx_bytes("Sheet1", _build_legacy_mtsk_rows([unpublished, valid]))
+    rows, errors = cli.parse_margin_history_book(book, False)
+    assert errors == []
+    assert [row["date"] for row in rows] == [valid[0].strftime("%Y-%m-%d")]
+    empty_book = _rows_to_xlsx_bytes("Sheet1", _build_legacy_mtsk_rows([unpublished]))
+    with pytest.raises(ValueError, match="contained no worksheet date rows"):
+        cli.parse_margin_history_book(empty_book, False)
+    partial = list(unpublished)
+    partial[17] = 0
+    partial_book = _rows_to_xlsx_bytes("Sheet1", _build_legacy_mtsk_rows([partial, valid]))
+    rows, errors = cli.parse_margin_history_book(partial_book, False)
+    assert len(rows) == 1
+    assert len(errors) == 1
+    assert "jsf_stock_loan_value_mjpy" in errors[0]
+
+
+def test_history_workbooks_all_invalid_or_mixed_valid_invalid_rows_preserve_valid_omit_empty_and_exit_nonzero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli = _load_cli_module()
+    out_root = tmp_path / "jp-leverage"
+    data_dir = out_root / "data"
+    html_path = out_root / "index.html"
+    monkeypatch.setattr(cli, "OUT_ROOT", out_root)
+    monkeypatch.setattr(cli, "DATA_DIR", data_dir)
+    monkeypatch.setattr(cli, "HTML_PATH", html_path)
+
+    _seed_dashboard_inputs(cli, data_dir, include_margin=False)
+    # Pre-seed an older historical row with an explicit finite zero.
+    cli.merge_margin_rows(
+        data_dir / "margin_weekly.csv",
+        [
+            {
+                "date": "2026-09-11",
+                "short_shares_k": 500000.0,
+                "short_value_mjpy": 950000.0,
+                "long_shares_k": 3300000.0,
+                "long_value_mjpy": 6000000.0,
+                "neg_short_value_mjpy": 0.0,
+                "std_short_value_mjpy": 950000.0,
+                "neg_long_value_mjpy": 2700000.0,
+                "std_long_value_mjpy": 3300000.0,
+                "jsf_stock_loan_value_mjpy": 0.0,
+                "jsf_funding_value_mjpy": 410000.0,
+            }
+        ],
+    )
+
+    history_html = """
+    <table>
+      <tr><th>信用取引現在高</th><td><a href="tvdivq0000001rq1-att/20260925_mtsk.xls">Excel</a></td></tr>
+      <tr><th>信用取引現在高（一般信用取引・制度信用取引別）</th><td><a href="tvdivq0000001rq1-att/20260925_mtgk.xls">Excel</a></td></tr>
+      <tr><th>信用取引現在高</th><td><a href="tvdivq0000001rq1-att/tvdivq0000015969.xlsx">Excel</a></td></tr>
+    </table>
+    """
+    current_html = """
+    <table>
+      <tr><th>2026年11月6日申込現在</th><td><a href="tvdivq0000001rk9-att/20261106_mtcurrent.xlsx">Excel</a></td></tr>
+    </table>
+    """
+    valid_current_bytes = _rows_to_xlsx_bytes(
+        "レイアウト",
+        _build_current_week_rows(
+            app_date=dt.datetime(2026, 11, 6),
+            pub_date=dt.datetime(2026, 11, 10),
+        ),
+    )
+
+    # Scenario 1: All three history workbooks contain only unparseable numeric cells for new dates
+    # (2026-09-18, 2026-09-25, 2026-10-30). None of those dates may be written as empty rows.
+    mtgk_bytes = _rows_to_xlsx_bytes(
+        "Sheet1",
+        _build_legacy_mtgk_rows([[dt.datetime(2026, 9, 18)] + ["N/A"] * 12]),
+    )
+    mtsk_bytes = _rows_to_xlsx_bytes(
+        "Sheet1",
+        _build_legacy_mtsk_rows([[dt.datetime(2026, 9, 18)] + ["N/A"] * 21]),
+    )
+    combined_bytes = _rows_to_xlsx_bytes(
+        "信用取引現在高",
+        _build_combined_history_rows(
+            [
+                [dt.datetime(2026, 9, 25)] + ["N/A"] * 25,
+                [dt.datetime(2026, 10, 30)] + [""] * 25,
+            ]
+        ),
+    )
+
+    orig_get = cli.get
+    orig_sync_kioxia_weekly = cli.sync_kioxia_weekly
+    orig_sync_jsf_daily = cli.sync_jsf_daily
+    orig_sync_jsf_issue_history = cli.sync_jsf_issue_history
+    orig_sync_investor_flows = cli.sync_investor_flows
+    orig_sync_short_selling = cli.sync_short_selling
+    orig_sync_etf_units = cli.sync_etf_units
+    orig_sync_etf_prices = cli.sync_etf_prices
+    orig_sync_reference = cli.sync_reference
+
+    def _fake_get(url: str, **kw) -> requests.Response:
+        resp = create_autospec(requests.Response, instance=True)
+        if url == cli.MARGIN_HISTORY_URL:
+            resp.text = history_html
+            resp.content = history_html.encode("utf-8")
+            return resp
+        if url == cli.MARGIN_CURRENT_URL:
+            resp.text = current_html
+            resp.content = current_html.encode("utf-8")
+            return resp
+        if url.endswith("20260925_mtgk.xls"):
+            resp.content = mtgk_bytes
+            return resp
+        if url.endswith("20260925_mtsk.xls"):
+            resp.content = mtsk_bytes
+            return resp
+        if url.endswith("tvdivq0000015969.xlsx"):
+            resp.content = combined_bytes
+            return resp
+        if url.endswith("20261106_mtcurrent.xlsx"):
+            resp.content = valid_current_bytes
+            return resp
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    def _stub_reference() -> None:
+        _write_reference_fixture(cli, data_dir)
+
+    monkeypatch.setattr(cli, "get", create_autospec(orig_get, side_effect=_fake_get))
+    monkeypatch.setattr(cli, "sync_kioxia_weekly", create_autospec(orig_sync_kioxia_weekly, return_value=None))
+    monkeypatch.setattr(cli, "sync_jsf_daily", create_autospec(orig_sync_jsf_daily, return_value=None))
+    monkeypatch.setattr(cli, "sync_jsf_issue_history", create_autospec(orig_sync_jsf_issue_history, return_value=None))
+    monkeypatch.setattr(cli, "sync_investor_flows", create_autospec(orig_sync_investor_flows, return_value=None))
+    monkeypatch.setattr(cli, "sync_short_selling", create_autospec(orig_sync_short_selling, return_value=None))
+    monkeypatch.setattr(cli, "sync_etf_units", create_autospec(orig_sync_etf_units, return_value=None))
+    monkeypatch.setattr(cli, "sync_etf_prices", create_autospec(orig_sync_etf_prices, return_value=None))
+    monkeypatch.setattr(cli, "sync_reference", create_autospec(orig_sync_reference, side_effect=_stub_reference))
+    monkeypatch.setattr(sys, "argv", [str(CLI_PATH), "--json", "run"])
+
+    with pytest.raises(SystemExit) as exc_info1:
+        cli.main()
+    assert exc_info1.value.code == 1
+
+    out1 = capsys.readouterr().out.strip()
+    payload1 = json.loads(out1)
+    assert payload1["ok"] is False
+    assert payload1["update"]["ok"] is False
+    assert "sync_reference" in payload1["update"]["done"]
+    w1 = [w for w in payload1["update"]["warnings"] if w["step"] == "sync_margin_weekly"]
+    assert len(w1) == 1
+    assert "JPX margin history workbooks yielded no rows" in w1[0]["error"]
+    assert "20260925_mtgk.xls" in w1[0]["error"]
+    assert "20260925_mtsk.xls" in w1[0]["error"]
+    assert "tvdivq0000015969.xlsx" in w1[0]["error"]
+
+    stored1 = cli.read_rows(data_dir / "margin_weekly.csv")
+    # Only pre-seeded 2026-09-11 and valid current 2026-11-06 exist; no date-only empty rows were written.
+    assert set(stored1) == {"2026-09-11", "2026-11-06"}
+    assert float(stored1["2026-09-11"]["neg_short_value_mjpy"]) == 0.0
+    assert float(stored1["2026-11-06"]["short_value_mjpy"]) == 643859.0
+    assert (data_dir / "market_reference.csv").is_file()
+
+    # Scenario 2: Each of mtgk, mtsk, and combined history contains a mix of valid and invalid date rows.
+    # Valid rows must be saved (including explicit 0.0), invalid rows must be omitted, and main must exit non-zero.
+    valid_mtgk_row = list(_build_legacy_mtgk_rows()[3])
+    valid_mtgk_row[6] = 0  # explicit finite zero for neg_short_value_mjpy on 2026-09-18
+    invalid_mtgk_row = list(valid_mtgk_row)
+    invalid_mtgk_row[0] = dt.datetime(2026, 9, 19)
+    invalid_mtgk_row[12] = "N/A"  # partial invalid required field (std_long_value_mjpy)
+    mtgk_bytes = _rows_to_xlsx_bytes(
+        "Sheet1",
+        _build_legacy_mtgk_rows([valid_mtgk_row, invalid_mtgk_row]),
+    )
+
+    valid_mtsk_row = list(_build_legacy_mtsk_rows()[3])
+    invalid_mtsk_row = [dt.datetime(2026, 9, 20)] + ["N/A"] * 21
+    mtsk_bytes = _rows_to_xlsx_bytes(
+        "Sheet1",
+        _build_legacy_mtsk_rows([valid_mtsk_row, invalid_mtsk_row]),
+    )
+
+    base_combined = _build_combined_history_rows()
+    valid_sep25_row = list(base_combined[10])
+    invalid_oct30_row = list(base_combined[11])
+    invalid_oct30_row[6] = "N/A"  # partial invalid standardized customer short value on 2026-10-30
+    combined_bytes = _rows_to_xlsx_bytes(
+        "信用取引現在高",
+        _build_combined_history_rows([valid_sep25_row, invalid_oct30_row]),
+    )
+
+    with pytest.raises(SystemExit) as exc_info2:
+        cli.main()
+    assert exc_info2.value.code == 1
+
+    out2 = capsys.readouterr().out.strip()
+    payload2 = json.loads(out2)
+    assert payload2["ok"] is False
+    assert payload2["update"]["ok"] is False
+    assert "sync_reference" in payload2["update"]["done"]
+    w2 = [w for w in payload2["update"]["warnings"] if w["step"] == "sync_margin_weekly"]
+    assert len(w2) == 1
+    assert "JPX margin history refresh incomplete (3 error(s))" in w2[0]["error"]
+    assert "20260925_mtgk.xls" in w2[0]["error"]
+    assert "2026-09-19" in w2[0]["error"]
+    assert "20260925_mtsk.xls" in w2[0]["error"]
+    assert "2026-09-20" in w2[0]["error"]
+    assert "tvdivq0000015969.xlsx" in w2[0]["error"]
+    assert "2026-10-30" in w2[0]["error"]
+
+    stored2 = cli.read_rows(data_dir / "margin_weekly.csv")
+    # Valid rows from mtgk + mtsk (2026-09-18) and combined history (2026-09-25) are saved;
+    # invalid dates (2026-09-19, 2026-09-20, 2026-10-30) are omitted.
+    assert set(stored2) == {"2026-09-11", "2026-09-18", "2026-09-25", "2026-11-06"}
+    assert float(stored2["2026-09-18"]["short_shares_k"]) == 510000.0
+    assert float(stored2["2026-09-18"]["neg_short_value_mjpy"]) == 0.0
+    assert float(stored2["2026-09-18"]["jsf_stock_loan_value_mjpy"]) == 205000.0
+    assert float(stored2["2026-09-18"]["jsf_funding_value_mjpy"]) == 430000.0
+    assert float(stored2["2026-09-25"]["short_value_mjpy"]) == 1047238.0
+    assert float(stored2["2026-09-25"]["jsf_funding_value_mjpy"]) == 466788.0
+    assert float(stored2["2026-09-11"]["neg_short_value_mjpy"]) == 0.0

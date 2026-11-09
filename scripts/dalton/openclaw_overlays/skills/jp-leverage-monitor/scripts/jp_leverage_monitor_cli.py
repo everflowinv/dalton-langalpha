@@ -272,6 +272,44 @@ MARGIN_HEADER = ["date", "short_shares_k", "short_value_mjpy", "long_shares_k",
                  "long_value_mjpy", "neg_short_value_mjpy", "std_short_value_mjpy",
                  "neg_long_value_mjpy", "std_long_value_mjpy",
                  "jsf_stock_loan_value_mjpy", "jsf_funding_value_mjpy"]
+# Schema-specific required numeric fields for JPX margin history workbooks:
+# - Combined history (`tvdivq0000015969.xlsx`) supplies all 10 margin and JSF fields.
+# - Pre-2026-09-25 history is split across two official workbooks: `mtgk` supplies the 8
+#   margin balance/breakdown fields (JSF columns are omitted by design) and `mtsk` supplies
+#   the 2 JSF loan/funding value fields (margin breakdown columns are omitted by design).
+COMBINED_HISTORY_REQUIRED_FIELDS: tuple[str, ...] = tuple(MARGIN_HEADER[1:])
+LEGACY_MTGK_REQUIRED_FIELDS: tuple[str, ...] = tuple(MARGIN_HEADER[1:9])
+LEGACY_MTSK_REQUIRED_FIELDS: tuple[str, ...] = (
+    "jsf_stock_loan_value_mjpy",
+    "jsf_funding_value_mjpy",
+)
+
+
+def _partition_validated_history_rows(
+    candidate_rows: Sequence[dict],
+    required_fields: Sequence[str],
+    schema_label: str,
+) -> tuple[list[dict], list[str]]:
+    """Split worksheet date rows into complete valid records and per-row numeric validation errors."""
+    if not candidate_rows:
+        raise ValueError(f"{schema_label} contained no worksheet date rows")
+    valid_rows: list[dict] = []
+    row_errors: list[str] = []
+    for rec in candidate_rows:
+        missing = [field for field in required_fields if rec.get(field) is None]
+        if missing:
+            row_errors.append(
+                f"{rec['date']}: missing or unparseable numeric fields ({', '.join(missing)})"
+            )
+        else:
+            valid_rows.append(rec)
+    if not valid_rows:
+        detail = "; ".join(row_errors[:5])
+        raise ValueError(
+            f"{schema_label} contained no valid numeric date rows"
+            + (f" ({detail})" if detail else "")
+        )
+    return valid_rows, row_errors
 
 
 def _as_worksheet_date(v) -> str | None:
@@ -360,14 +398,17 @@ def _is_combined_history_schema(d: pd.DataFrame, first_date_row: int) -> bool:
     return True
 
 
-def _parse_combined_history_df(d: pd.DataFrame, first_date_row: int) -> list[dict]:
-    out: list[dict] = []
+def _parse_combined_history_rows(
+    d: pd.DataFrame,
+    first_date_row: int,
+) -> tuple[list[dict], list[str]]:
+    candidates: list[dict] = []
     for idx in range(first_date_row, len(d)):
         r = d.iloc[idx]
         day = _as_worksheet_date(r.iloc[0])
         if day is None:
             continue
-        out.append({
+        candidates.append({
             "date": day,
             "short_shares_k": num(r.iloc[13]),
             "short_value_mjpy": num(r.iloc[14]),
@@ -380,9 +421,70 @@ def _parse_combined_history_df(d: pd.DataFrame, first_date_row: int) -> list[dic
             "jsf_stock_loan_value_mjpy": num(r.iloc[19]),
             "jsf_funding_value_mjpy": num(r.iloc[21]),
         })
-    if not out:
-        raise ValueError("Combined JPX margin history workbook contained no worksheet date rows")
-    return out
+    return _partition_validated_history_rows(
+        candidates,
+        COMBINED_HISTORY_REQUIRED_FIELDS,
+        "Combined JPX margin history workbook",
+    )
+
+
+def _parse_combined_history_df(d: pd.DataFrame, first_date_row: int) -> list[dict]:
+    valid_rows, row_errors = _parse_combined_history_rows(d, first_date_row)
+    if row_errors:
+        detail = "; ".join(row_errors[:5])
+        raise ValueError(
+            f"Combined JPX margin history workbook contained {len(row_errors)} invalid numeric date row(s) ({detail})"
+        )
+    return valid_rows
+
+
+def _parse_legacy_mtgk_rows(
+    d: pd.DataFrame,
+    first_date_row: int,
+) -> tuple[list[dict], list[str]]:
+    candidates: list[dict] = []
+    indices = (1, 2, 3, 4, 6, 8, 10, 12)
+    for idx in range(first_date_row, len(d)):
+        r = d.iloc[idx]
+        day = _as_worksheet_date(r.iloc[0])
+        if day is None:
+            continue
+        vals = [num(r.iloc[i]) if i < len(r) else None for i in indices]
+        rec = {"date": day}
+        rec.update(dict(zip(LEGACY_MTGK_REQUIRED_FIELDS, vals)))
+        candidates.append(rec)
+    return _partition_validated_history_rows(
+        candidates,
+        LEGACY_MTGK_REQUIRED_FIELDS,
+        "Legacy mtgk margin workbook",
+    )
+
+
+def _parse_legacy_mtsk_rows(
+    d: pd.DataFrame,
+    first_date_row: int,
+) -> tuple[list[dict], list[str]]:
+    candidates: list[dict] = []
+    for idx in range(first_date_row, len(d)):
+        r = d.iloc[idx]
+        day = _as_worksheet_date(r.iloc[0])
+        if day is None:
+            continue
+        # JPX marks an unpublished lending section with dashes beside numeric margin totals.
+        if len(r) >= 22 and all(_norm_cell_text(r.iloc[i]) == "-" for i in range(13, 22)) and all(
+            num(r.iloc[i]) is not None for i in range(1, 13)
+        ):
+            continue
+        candidates.append({
+            "date": day,
+            "jsf_stock_loan_value_mjpy": num(r.iloc[15]) if len(r) > 15 else None,
+            "jsf_funding_value_mjpy": num(r.iloc[17]) if len(r) > 17 else None,
+        })
+    return _partition_validated_history_rows(
+        candidates,
+        LEGACY_MTSK_REQUIRED_FIELDS,
+        "Legacy mtsk margin workbook",
+    )
 
 
 def _is_legacy_mtgk_schema(d: pd.DataFrame, first_date_row: int) -> bool:
@@ -541,13 +643,17 @@ def _parse_current_weekly_df(d: pd.DataFrame) -> list[dict]:
     return [rec]
 
 
-def parse_margin_book(content: bytes, detailed: bool | None = None) -> list[dict]:
+def parse_margin_history_book(
+    content: bytes,
+    detailed: bool | None = None,
+) -> tuple[list[dict], list[str]]:
+    """Parse a JPX margin history workbook into `(valid_rows, row_errors)`."""
     d = pd.read_excel(io.BytesIO(content), sheet_name=0, header=None)
     if d.empty:
         raise ValueError("Empty JPX margin workbook")
 
     if _is_current_weekly_layout(d):
-        return _parse_current_weekly_df(d)
+        return _parse_current_weekly_df(d), []
 
     first_date_row: int | None = None
     for idx in range(len(d)):
@@ -557,39 +663,13 @@ def parse_margin_book(content: bytes, detailed: bool | None = None) -> list[dict
 
     if first_date_row is not None:
         if _is_combined_history_schema(d, first_date_row):
-            return _parse_combined_history_df(d, first_date_row)
+            return _parse_combined_history_rows(d, first_date_row)
 
         if detailed is not False and _is_legacy_mtgk_schema(d, first_date_row):
-            out = []
-            indices = [1, 2, 3, 4, 6, 8, 10, 12]
-            for idx in range(first_date_row, len(d)):
-                r = d.iloc[idx]
-                day = _as_worksheet_date(r.iloc[0])
-                if day is None:
-                    continue
-                vals = [num(r.iloc[i]) if i < len(r) else None for i in indices]
-                rec = {"date": day}
-                rec.update(dict(zip(MARGIN_HEADER[1:9], vals)))
-                out.append(rec)
-            if not out:
-                raise ValueError("Legacy mtgk margin workbook contained no rows")
-            return out
+            return _parse_legacy_mtgk_rows(d, first_date_row)
 
         if detailed is not True and _is_legacy_mtsk_schema(d, first_date_row):
-            out = []
-            for idx in range(first_date_row, len(d)):
-                r = d.iloc[idx]
-                day = _as_worksheet_date(r.iloc[0])
-                if day is None:
-                    continue
-                out.append({
-                    "date": day,
-                    "jsf_stock_loan_value_mjpy": num(r.iloc[15]) if len(r) > 15 else None,
-                    "jsf_funding_value_mjpy": num(r.iloc[17]) if len(r) > 17 else None,
-                })
-            if not out:
-                raise ValueError("Legacy mtsk margin workbook contained no rows")
-            return out
+            return _parse_legacy_mtsk_rows(d, first_date_row)
 
         raise ValueError("Unrecognized JPX margin history workbook schema")
 
@@ -615,7 +695,7 @@ def parse_margin_book(content: bytes, detailed: bool | None = None) -> list[dict
         if any(v is None for v in parsed_fields.values()):
             raise ValueError("Unrecognized JPX cross-sectional margin workbook schema")
         rec.update(parsed_fields)
-        return [rec]
+        return [rec], []
     if detailed is False and len(d) > 17 and d.shape[1] > 7 and "貸借" in body_text:
         values = d.iloc[17]
         loan_val = num(values.iloc[5])
@@ -624,8 +704,18 @@ def parse_margin_book(content: bytes, detailed: bool | None = None) -> list[dict
             raise ValueError("Unrecognized JPX cross-sectional margin workbook schema")
         rec["jsf_stock_loan_value_mjpy"] = loan_val
         rec["jsf_funding_value_mjpy"] = fund_val
-        return [rec]
+        return [rec], []
     raise ValueError("Unrecognized JPX cross-sectional margin workbook schema")
+
+
+def parse_margin_book(content: bytes, detailed: bool | None = None) -> list[dict]:
+    valid_rows, row_errors = parse_margin_history_book(content, detailed=detailed)
+    if row_errors:
+        detail = "; ".join(row_errors[:5])
+        raise ValueError(
+            f"JPX margin workbook contained {len(row_errors)} invalid numeric date row(s) ({detail})"
+        )
+    return valid_rows
 
 
 def sync_margin_weekly():
@@ -652,11 +742,18 @@ def sync_margin_weekly():
 
     for url, detailed_flag in hist_specs:
         try:
-            parsed = parse_margin_book(get(url).content, detailed_flag)
+            parsed, row_errors = parse_margin_history_book(get(url).content, detailed_flag)
             if not parsed:
                 raise ValueError("workbook yielded no rows")
             hist_rows.extend(parsed)
             merge_margin_records(bydate, parsed)
+            if row_errors:
+                detail = "; ".join(row_errors[:5])
+                err_msg = (
+                    f"JPX margin history workbook contained {len(row_errors)} invalid numeric date row(s) ({detail})"
+                )
+                hist_errors.append(f"{url}: {err_msg}")
+                log(f"JPX margin history row skip {url}: {err_msg}")
         except Exception as e:
             hist_errors.append(f"{url}: {e}")
             log(f"JPX margin history skip {url}: {e}")
