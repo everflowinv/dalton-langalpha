@@ -256,10 +256,10 @@ def test_manifest_matches_baseline_and_approved_changes() -> None:
         assert entry.command == base["command"]
         assert "-lc" not in entry.command_argv, f"{code} must not use login shell (-lc)"
 
-        # Runner check: T1 and T29 are host (mirror mode), all others are container
+        # Runner check: T1 and T29 actively refresh on the host, all others are container
         if code in {"T1", "T29"}:
             assert entry.runner == "host"
-            assert entry.host_mode == "mirror"
+            assert entry.host_mode == "run"
         else:
             assert entry.runner == "container"
             assert entry.host_mode is None
@@ -1398,7 +1398,7 @@ async def test_host_runner_tasks_enqueued_and_claimed() -> None:
     assert claimed.run_id == "run-host-1"
     assert claimed.job_key == T29_JOB_KEY
     assert claimed.runner == "host"
-    assert claimed.host_mode == "mirror"
+    assert claimed.host_mode == "run"
     assert claimed.generation == 2
     assert state_claim["tx_commits"] == 1
 
@@ -5438,7 +5438,7 @@ async def test_pr11_manual_run_enqueue_claim_when_disabled_and_preview_only_noti
     - `enqueue_due_cron_tasks` only supersedes prior queued `cron` runs and does NOT supersede queued `manual` runs;
     - At claim time, `ClaimedTaskRun.is_trial` is `True` when `trigger_source == 'manual' and not enabled`, and `False` when `enabled = True`;
     - Trial run (`is_trial = True`): ignores `paused_by_user`, uses `host_mode = 'run'` for host tasks, sets `notify_status = 'preview_only'`, and never modifies `consecutive_failures`;
-    - Immediate run (`trigger_source == 'manual'` with `enabled = True`, `is_trial = False`): requires `paused_by_user = False`, uses manifest's `host_mode` (`mirror`), dispatches notifications (`pending_dispatch`), and updates `consecutive_failures`.
+    - Immediate run (`trigger_source == 'manual'` with `enabled = True`, `is_trial = False`): requires `paused_by_user = False`, uses manifest's `host_mode` (`run`), dispatches notifications (`pending_dispatch`), and updates `consecutive_failures`.
     """
     from src.dalton.data_jobs.evaluators import TaskEvaluationResult
     from src.dalton.data_jobs.host_runner import HostRunOutcome
@@ -5809,7 +5809,7 @@ async def test_pr11_manual_run_enqueue_claim_when_disabled_and_preview_only_noti
     assert claimed_host_manual.is_trial is True
     assert claimed_host_manual.host_mode == "run"
 
-    # 3c. Claim immediate host run (`enabled = True`, `trigger_source = 'manual'`) -> `is_trial = False`, `host_mode = 'mirror'`
+    # 3c. Claim immediate host run (`enabled = True`, `trigger_source = 'manual'`) -> `is_trial = False`, `host_mode = 'run'`
     conn_claim_host_imm, _ = _make_autospec_db(
         [
             {
@@ -5854,7 +5854,7 @@ async def test_pr11_manual_run_enqueue_claim_when_disabled_and_preview_only_noti
     assert claimed_host_imm is not None
     assert claimed_host_imm.trigger_source == "manual"
     assert claimed_host_imm.is_trial is False
-    assert claimed_host_imm.host_mode == "mirror"
+    assert claimed_host_imm.host_mode == "run"
 
     path_map = build_path_map(
         host_var_dir=tmp_path / "host_var",
