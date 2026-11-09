@@ -1,11 +1,41 @@
 import { HttpBackendClient } from "./backend-client.js";
 import type { ChannelAdapter } from "./channels/adapter.js";
-import { loadConfig } from "./config.js";
+import {
+  FeishuChannelAdapter,
+  type FeishuChannelAdapterOptions,
+} from "./channels/feishu/index.js";
+import { type GatewayConfig, loadConfig } from "./config.js";
 import { createGatewayApp } from "./server.js";
 import type { ChannelPlatform } from "./types.js";
 
-async function main(): Promise<void> {
-  const config = loadConfig(process.env);
+export function buildConfiguredAdapters(
+  config: GatewayConfig,
+  overrides?: {
+    feishu?: Partial<FeishuChannelAdapterOptions>;
+  },
+): Map<ChannelPlatform, ChannelAdapter> {
+  const adapters = new Map<ChannelPlatform, ChannelAdapter>();
+
+  if (
+    config.channels.feishu.enabled &&
+    config.channels.feishu.appId &&
+    config.channels.feishu.appSecret
+  ) {
+    adapters.set(
+      "feishu",
+      new FeishuChannelAdapter({
+        appId: config.channels.feishu.appId,
+        appSecret: config.channels.feishu.appSecret,
+        ...overrides?.feishu,
+      }),
+    );
+  }
+
+  return adapters;
+}
+
+export async function main(env: NodeJS.ProcessEnv = process.env): Promise<void> {
+  const config = loadConfig(env);
   if (!config.serviceToken || config.serviceToken.length < 32) {
     throw new Error(
       "INTERNAL_SERVICE_TOKEN must be set and at least 32 characters long.",
@@ -17,8 +47,7 @@ async function main(): Promise<void> {
     serviceToken: config.serviceToken,
   });
 
-  // Phase 3 registers live Feishu, Discord, and Weixin adapters here
-  const adapters = new Map<ChannelPlatform, ChannelAdapter>();
+  const adapters = buildConfiguredAdapters(config);
 
   const app = createGatewayApp({
     config,

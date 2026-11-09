@@ -37,6 +37,7 @@
     <string>__INTERNAL_SERVICE_TOKEN__</string>
     <key>DALTON_COLLEAGUE_DISPATCH_ENABLED</key>
     <string>true</string>
+    <!-- Feishu Bot Credentials: set DALTON_FEISHU_ENABLED=true and both DALTON_FEISHU_APP_ID and DALTON_FEISHU_APP_SECRET to enable Feishu long-connection (WSClient). -->
     <key>DALTON_FEISHU_ENABLED</key>
     <string>__DALTON_FEISHU_ENABLED__</string>
     <key>DALTON_FEISHU_APP_ID</key>
