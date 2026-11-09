@@ -184,3 +184,6 @@ tests/integration/dalton/test_channel_gateway_db.py
 integrations/dalton-channel-gateway/
 scripts/dalton/launchd/com.dalton.channel-gateway.plist.template
 scripts/dalton/gen_channel_gateway_fixtures.py
+# JPX market-wide and Kioxia daily margin monitor CLI overlay and offline regression tests.
+scripts/dalton/openclaw_overlays/skills/jp-leverage-monitor/scripts/jp_leverage_monitor_cli.py
+tests/unit/dalton/test_jp_leverage_monitor.py
