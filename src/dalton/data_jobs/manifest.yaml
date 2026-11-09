@@ -7,7 +7,7 @@ tasks:
     title: "BBG数据拉取（亚洲时段）：SSH触发Windows BBG刷新+拉CSV"
     batch_no: 2
     runner: "host"
-    host_mode: "mirror"
+    host_mode: "run"
     cron: "0 10,17 * * 1-5"
     timezone: "Asia/Hong_Kong"
     timeout_seconds: 900
@@ -341,7 +341,7 @@ tasks:
     title: "BBG数据拉取（美盘时段）：SSH触发Windows BBG刷新+拉CSV，自动跟夏冬令时"
     batch_no: 2
     runner: "host"
-    host_mode: "mirror"
+    host_mode: "run"
     cron: "0 10 * * 1-5"
     timezone: "America/New_York"
     timeout_seconds: 900
