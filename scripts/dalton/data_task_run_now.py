@@ -19,7 +19,9 @@ import argparse
 import asyncio
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 from typing import Any
@@ -35,6 +37,7 @@ from src.dalton.data_jobs.container_runner import (  # noqa: E402
     DataTaskPathMap,
     build_path_map,
 )
+from src.dalton.data_jobs.evaluators import T1_JOB_KEY, T29_JOB_KEY  # noqa: E402
 from src.dalton.data_jobs.freeze import (  # noqa: E402
     FREEZE_DIR_NAME,
     format_freeze_slot_utc,
@@ -44,6 +47,7 @@ from src.dalton.data_jobs.manifest import sync_manifest_to_db  # noqa: E402
 from src.dalton.data_jobs.scheduler import (  # noqa: E402
     DEFAULT_TIMEOUT_SECONDS,
     TERMINAL_RUN_STATUSES,
+    _normalize_manual_job_key,
     check_scheduler_lock,
     claim_next_queued_run,
     enqueue_manual_task_run,
@@ -58,6 +62,15 @@ from src.server.database.pool import get_or_create_pool  # noqa: E402
 
 STDOUT_SUMMARY_MAX_CHARS = 1000
 WAIT_GRACE_PAST_DEADLINE = timedelta(minutes=10)
+BBG_HOST_JOB_KEYS: frozenset[str] = frozenset({T1_JOB_KEY, T29_JOB_KEY})
+
+
+def _is_bbg_host_job_key(job_key: str) -> bool:
+    try:
+        normalized = _normalize_manual_job_key(job_key)
+    except Exception:
+        normalized = str(job_key or "").strip()
+    return normalized in BBG_HOST_JOB_KEYS
 
 
 def _utc_now() -> datetime:
@@ -99,18 +112,21 @@ async def _fetch_run_state(
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
             """
-            SELECT run_id,
-                   job_key,
-                   status,
-                   exit_code,
-                   failure_reason,
-                   log_tail,
-                   notify_status,
-                   notify_preview,
-                   scheduled_slot_utc,
-                   deadline_utc
-            FROM dalton_data_task_runs
-            WHERE run_id = %(run_id)s::uuid
+            SELECT r.run_id,
+                   r.job_key,
+                   r.status,
+                   r.exit_code,
+                   r.failure_reason,
+                   r.log_tail,
+                   r.notify_status,
+                   r.notify_preview,
+                   r.scheduled_slot_utc,
+                   r.deadline_utc,
+                   r.trigger_source,
+                   d.enabled AS task_enabled
+            FROM dalton_data_task_runs r
+            LEFT JOIN dalton_data_task_defs d ON d.job_key = r.job_key
+            WHERE r.run_id = %(run_id)s::uuid
             """,
             {"run_id": run_id},
         )
@@ -128,6 +144,10 @@ async def _fetch_run_state(
     notify_preview = _extract_row_field(run_row, "notify_preview", 7, None)
     scheduled_slot_utc = _extract_row_field(run_row, "scheduled_slot_utc", 8, None)
     raw_deadline_utc = _extract_row_field(run_row, "deadline_utc", 9, None)
+    raw_trigger_source = _extract_row_field(run_row, "trigger_source", 10, None)
+    raw_task_enabled = _extract_row_field(run_row, "task_enabled", 11, None)
+    if raw_task_enabled is None and isinstance(run_row, Mapping) and "enabled" in run_row:
+        raw_task_enabled = run_row.get("enabled")
 
     if isinstance(notify_preview, str):
         try:
@@ -153,7 +173,7 @@ async def _fetch_run_state(
         else ""
     )
 
-    return {
+    state: dict[str, Any] = {
         "run_id": run_id,
         "job_key": resolved_job_key,
         "waited": True,
@@ -169,6 +189,205 @@ async def _fetch_run_state(
         "wait_deadline_utc": wait_deadline_utc,
         "timed_out_waiting": False,
     }
+    if raw_task_enabled is not None:
+        trigger_str = str(raw_trigger_source or "manual")
+        state["_persisted_is_trial"] = trigger_str == "manual" and not bool(raw_task_enabled)
+    return state
+
+
+def _summarize_bbg_root_files(root: Path) -> dict[str, Any]:
+    raw_root = Path(root).expanduser()
+    temp_dir = raw_root / "temp"
+    files_info: dict[str, Any] = {}
+    for key, rel_name in (("csv", "bbg_data_latest.csv"), ("xlsx", "bbg_data_remote.xlsx")):
+        fpath = temp_dir / rel_name
+        try:
+            is_sym = fpath.is_symlink()
+        except OSError:
+            is_sym = False
+        if is_sym:
+            files_info[key] = {"path": str(fpath), "exists": True, "is_symlink": True}
+            continue
+        try:
+            if not fpath.is_file():
+                files_info[key] = {"path": str(fpath), "exists": False, "is_symlink": False}
+                continue
+            st = fpath.stat(follow_symlinks=False)
+            raw_bytes = fpath.read_bytes()
+            info: dict[str, Any] = {
+                "path": str(fpath),
+                "exists": True,
+                "is_symlink": False,
+                "size_bytes": int(st.st_size),
+                "mtime_epoch": round(float(st.st_mtime), 3),
+                "mtime_utc": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+                "sha256": hashlib.sha256(raw_bytes).hexdigest(),
+            }
+            if key == "csv":
+                info["lines"] = len(raw_bytes.decode("utf-8", errors="replace").splitlines())
+            files_info[key] = info
+        except OSError as exc:
+            files_info[key] = {
+                "path": str(fpath),
+                "exists": False,
+                "is_symlink": False,
+                "error": type(exc).__name__,
+            }
+    return {
+        "root": str(raw_root),
+        "csv": files_info["csv"],
+        "xlsx": files_info["xlsx"],
+    }
+
+
+def _capture_trial_source_summary(paths: DataTaskPathMap) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "captured_at_utc": _utc_now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "dalton_data_root": _summarize_bbg_root_files(paths.backend_data_root),
+    }
+    raw_ocw = os.environ.get("DALTON_OCW_ROOT", "").strip()
+    if raw_ocw:
+        summary["legacy_ocw_root"] = _summarize_bbg_root_files(Path(raw_ocw))
+    return summary
+
+
+def _resolve_persisted_is_trial(
+    *,
+    state: Mapping[str, Any],
+    claimed_is_trial: bool | None,
+) -> bool:
+    if claimed_is_trial is not None:
+        return bool(claimed_is_trial)
+    persisted_flag = state.get("_persisted_is_trial")
+    if isinstance(persisted_flag, bool):
+        return persisted_flag
+    notify_status = state.get("notify_status")
+    if notify_status == "preview_only":
+        return True
+    if notify_status in ("pending_dispatch", "dispatched"):
+        return False
+    return True
+
+
+def _finalize_bbg_run_source_summary(
+    *,
+    paths: DataTaskPathMap,
+    run_id: str,
+    state: dict[str, Any],
+    before_summary: dict[str, Any] | None,
+    claimed_is_trial: bool | None,
+    timed_out_waiting: bool,
+) -> None:
+    run_dir = paths.backend_data_root / ".dalton-runs" / str(run_id)
+    summary_file = run_dir / "source_summary.json"
+    effective_is_trial = _resolve_persisted_is_trial(
+        state=state,
+        claimed_is_trial=claimed_is_trial,
+    )
+    resolved_before: dict[str, Any] | None = before_summary
+    resolved_after: dict[str, Any] | None = None
+    try:
+        existing: dict[str, Any] = {}
+        if summary_file.exists():
+            if summary_file.is_dir():
+                raise IsADirectoryError(f"{summary_file} is a directory")
+            loaded = json.loads(summary_file.read_text(encoding="utf-8"))
+            if not isinstance(loaded, dict):
+                raise ValueError("source_summary.json root must be a JSON object")
+            existing = loaded
+
+        if isinstance(existing.get("is_trial"), bool):
+            effective_is_trial = existing["is_trial"]
+
+        existing_before = existing.get("before_source_summary")
+        if isinstance(existing_before, dict):
+            resolved_before = existing_before
+        elif resolved_before is None:
+            resolved_before = _capture_trial_source_summary(paths)
+
+        existing_after = existing.get("after_source_summary")
+        if isinstance(existing_after, dict):
+            resolved_after = existing_after
+            summary_complete = bool(
+                existing.get(
+                    "summary_complete",
+                    existing_after.get("summary_complete", True),
+                )
+            )
+            capture_scope = str(
+                existing.get(
+                    "capture_scope",
+                    existing_after.get("capture_scope", "bridge_lock"),
+                )
+            )
+        else:
+            resolved_after = _capture_trial_source_summary(paths)
+            summary_complete = (
+                bool(state.get("terminal"))
+                and not timed_out_waiting
+                and state.get("status") == "succeeded"
+            )
+            capture_scope = "cli_fallback"
+            resolved_after["summary_complete"] = summary_complete
+            resolved_after["capture_scope"] = capture_scope
+            if not summary_complete:
+                resolved_after["incomplete_reason"] = (
+                    "wait_deadline_exceeded"
+                    if timed_out_waiting
+                    else str(
+                        state.get("failure_reason")
+                        or state.get("status")
+                        or "non_succeeded_terminal"
+                    )
+                )
+
+        needs_write = (
+            not existing
+            or not isinstance(existing.get("is_trial"), bool)
+            or not isinstance(existing_before, dict)
+            or not isinstance(existing_after, dict)
+        )
+        if needs_write:
+            run_dir.mkdir(parents=True, exist_ok=True)
+            payload: dict[str, Any] = {
+                **existing,
+                "run_id": str(run_id),
+                "job_key": str(state.get("job_key") or ""),
+                "is_trial": effective_is_trial,
+                "summary_complete": summary_complete,
+                "capture_scope": capture_scope,
+                "before_source_summary": resolved_before,
+                "after_source_summary": resolved_after,
+            }
+            if not summary_complete and "incomplete_reason" not in payload:
+                payload["incomplete_reason"] = resolved_after.get("incomplete_reason")
+            summary_file.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+
+        state["is_trial"] = effective_is_trial
+        state["before_source_summary"] = resolved_before
+        state["after_source_summary"] = resolved_after
+        state["source_summary_file"] = str(summary_file)
+    except Exception as exc:
+        if resolved_before is None:
+            try:
+                resolved_before = _capture_trial_source_summary(paths)
+            except Exception:
+                resolved_before = {}
+        if resolved_after is None:
+            try:
+                resolved_after = _capture_trial_source_summary(paths)
+            except Exception:
+                resolved_after = {}
+        state["is_trial"] = effective_is_trial
+        state["before_source_summary"] = resolved_before
+        state["after_source_summary"] = resolved_after
+        state["source_summary_file"] = None
+        state["source_summary_error"] = f"{type(exc).__name__}: {exc}"
 
 
 async def run_manual_task_now(
@@ -187,6 +406,9 @@ async def run_manual_task_now(
     """Enqueue a manual data task run and wait until `run_id` reaches a terminal status (or `deadline_utc + 10m`)."""
     _ = wait  # Always waits until terminal status regardless of whether --wait was passed.
     paths = path_map or build_path_map()
+    is_bbg_task = _is_bbg_host_job_key(job_key)
+    before_source_summary = _capture_trial_source_summary(paths) if is_bbg_task else None
+    claimed_is_trial: bool | None = None
     owns_conn = conn is None
     owns_lock_conn = lock_conn is None
     owns_docker = docker_client is None
@@ -255,6 +477,7 @@ async def run_manual_task_now(
                         only_run_id=run_id,
                     )
                     if claimed is not None:
+                        claimed_is_trial = bool(claimed.is_trial)
                         if claimed.runner == "host":
                             await execute_claimed_host_run(
                                 work_conn,
@@ -281,11 +504,31 @@ async def run_manual_task_now(
                 fallback_now=enqueue_time,
             )
             if state["terminal"]:
+                if is_bbg_task or _is_bbg_host_job_key(state["job_key"]):
+                    _finalize_bbg_run_source_summary(
+                        paths=paths,
+                        run_id=str(run_id),
+                        state=state,
+                        before_summary=before_source_summary,
+                        claimed_is_trial=claimed_is_trial,
+                        timed_out_waiting=False,
+                    )
+                state.pop("_persisted_is_trial", None)
                 return state
 
             current_now = now_fn().astimezone(timezone.utc)
             if current_now >= state["wait_deadline_utc"]:
                 state["timed_out_waiting"] = True
+                if is_bbg_task or _is_bbg_host_job_key(state["job_key"]):
+                    _finalize_bbg_run_source_summary(
+                        paths=paths,
+                        run_id=str(run_id),
+                        state=state,
+                        before_summary=before_source_summary,
+                        claimed_is_trial=claimed_is_trial,
+                        timed_out_waiting=True,
+                    )
+                state.pop("_persisted_is_trial", None)
                 return state
 
             await asyncio.sleep(poll_interval_seconds)
@@ -350,6 +593,10 @@ async def async_main(argv: Sequence[str] | None = None) -> int:
         f"notify_preview: {json.dumps(result['notify_preview'], ensure_ascii=False)}"
     )
     print(f"freeze_dir: {result['freeze_dir']}")
+    if result.get("source_summary_file"):
+        print(f"source_summary_file: {result['source_summary_file']}")
+    if result.get("source_summary_error"):
+        print(f"source_summary_error: {result['source_summary_error']}", file=sys.stderr)
     print("stdout_summary:")
     print(result["stdout_summary"] or "(empty)")
 

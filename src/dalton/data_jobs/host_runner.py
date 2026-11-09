@@ -70,6 +70,9 @@ class HostRunOutcome:
     exit_confirmed: bool = True
     fence_lost: bool = False
     auth_failed: bool = False
+    before_source_summary: dict[str, Any] | None = None
+    after_source_summary: dict[str, Any] | None = None
+    consumer_sync: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if self.log_tail and not self.stdout:
@@ -177,6 +180,7 @@ async def post_bridge_host_run(
     scheduled_slot_utc: datetime | str,
     timeout: int,
     no_output_timeout: int | None = None,
+    is_trial: bool = False,
 ) -> HostRunOutcome:
     """Send `POST /internal/data-tasks/host-run` and wait synchronously for the outcome."""
     body: dict[str, Any] = {
@@ -187,6 +191,7 @@ async def post_bridge_host_run(
         "scheduled_slot_utc": _format_scheduled_slot_utc(scheduled_slot_utc),
         "timeout": int(timeout),
         "no_output_timeout": (int(no_output_timeout) if no_output_timeout is not None else None),
+        "is_trial": bool(is_trial),
     }
     http_timeout = max(30.0, float(timeout) + HOST_RUN_HTTP_OVERHEAD_S)
     try:
@@ -270,6 +275,9 @@ async def post_bridge_host_run(
         elif payload.get("error"):
             failure_reason = str(payload["error"])
 
+    before_summary = payload.get("before_source_summary")
+    after_summary = payload.get("after_source_summary")
+    consumer_sync = payload.get("consumer_sync")
     return HostRunOutcome(
         ok=ok,
         status_code=200,
@@ -283,6 +291,9 @@ async def post_bridge_host_run(
         failure_reason=failure_reason,
         # Strict: a reply without the field is treated as unconfirmed.
         exit_confirmed=payload.get("exit_confirmed") is True,
+        before_source_summary=before_summary if isinstance(before_summary, dict) else None,
+        after_source_summary=after_summary if isinstance(after_summary, dict) else None,
+        consumer_sync=consumer_sync if isinstance(consumer_sync, dict) else None,
     )
 
 
@@ -368,6 +379,7 @@ class DataTaskHostBridgeClient:
         scheduled_slot_utc: datetime | str,
         timeout: int,
         no_output_timeout: int | None = None,
+        is_trial: bool = False,
     ) -> HostRunOutcome:
         """Execute a host data task via `POST /internal/data-tasks/host-run` and return a structured outcome."""
         return await post_bridge_host_run(
@@ -378,6 +390,7 @@ class DataTaskHostBridgeClient:
             scheduled_slot_utc=scheduled_slot_utc,
             timeout=timeout,
             no_output_timeout=no_output_timeout,
+            is_trial=is_trial,
         )
 
     async def kill_host_tasks(

@@ -1904,6 +1904,7 @@ async def execute_claimed_host_run(
             scheduled_slot_utc=scheduled_slot_iso,
             timeout=claimed.timeout_seconds,
             no_output_timeout=claimed.no_output_timeout_seconds,
+            **({"is_trial": True} if claimed.is_trial else {}),
         )
         run_task: asyncio.Task[HostRunOutcome] = asyncio.create_task(run_coro)
         timed_out_local = False

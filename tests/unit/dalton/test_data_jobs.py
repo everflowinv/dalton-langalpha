@@ -8,6 +8,7 @@ from datetime import date, datetime, timedelta, timezone
 import io
 import json
 import os
+import shutil
 from pathlib import Path
 import stat
 import sys
@@ -256,10 +257,10 @@ def test_manifest_matches_baseline_and_approved_changes() -> None:
         assert entry.command == base["command"]
         assert "-lc" not in entry.command_argv, f"{code} must not use login shell (-lc)"
 
-        # Runner check: T1 and T29 are host (mirror mode), all others are container
+        # Runner check: T1 and T29 are host (run mode), all others are container
         if code in {"T1", "T29"}:
             assert entry.runner == "host"
-            assert entry.host_mode == "mirror"
+            assert entry.host_mode == "run"
         else:
             assert entry.runner == "container"
             assert entry.host_mode is None
@@ -1398,7 +1399,7 @@ async def test_host_runner_tasks_enqueued_and_claimed() -> None:
     assert claimed.run_id == "run-host-1"
     assert claimed.job_key == T29_JOB_KEY
     assert claimed.runner == "host"
-    assert claimed.host_mode == "mirror"
+    assert claimed.host_mode == "run"
     assert claimed.generation == 2
     assert state_claim["tx_commits"] == 1
 
@@ -2118,6 +2119,7 @@ async def test_bridge_host_run_state_file_0600_generation_fence_host_kill_and_st
     cfg = bridge_mod.BridgeConfig()
     cfg.admin_token = "test-bridge-admin-token"
     cfg.data_tasks_data_root = tmp_path / "openclaw-data"
+    cfg.ocw_root = tmp_path / "openclaw-ws"
     cfg.host_task_sigterm_grace_s = 0.3
 
     # Verify default data_root derivation on a fresh BridgeConfig matches repo/var/dalton/openclaw-data
@@ -2126,7 +2128,13 @@ async def test_bridge_host_run_state_file_0600_generation_fence_host_kill_and_st
         Path(bridge_mod.__file__).resolve().parents[2] / "var" / "dalton" / "openclaw-data"
     )
 
-    # Create a real executable script at <data_root>/scripts/bbg_remote_refresh.sh
+    # Create valid BBG artifacts under <data_root>/temp and an executable script at <data_root>/scripts/bbg_remote_refresh.sh
+    data_temp_dir = cfg.data_tasks_data_root / "temp"
+    data_temp_dir.mkdir(parents=True, exist_ok=True)
+    (data_temp_dir / "bbg_data_latest.csv").write_text(
+        _make_valid_bbg_csv_content(260), encoding="utf-8"
+    )
+    _write_valid_xlsx_zip(data_temp_dir / "bbg_data_remote.xlsx")
     scripts_dir = cfg.data_tasks_data_root / "scripts"
     scripts_dir.mkdir(parents=True, exist_ok=True)
     refresh_script = scripts_dir / "bbg_remote_refresh.sh"
@@ -5854,7 +5862,7 @@ async def test_pr11_manual_run_enqueue_claim_when_disabled_and_preview_only_noti
     assert claimed_host_imm is not None
     assert claimed_host_imm.trigger_source == "manual"
     assert claimed_host_imm.is_trial is False
-    assert claimed_host_imm.host_mode == "mirror"
+    assert claimed_host_imm.host_mode == "run"
 
     path_map = build_path_map(
         host_var_dir=tmp_path / "host_var",
@@ -7475,3 +7483,800 @@ def test_wrapper_prewarms_yfinance_caches_before_the_task(monkeypatch: pytest.Mo
     runner_wrapper._prewarm_yfinance_cache()
     tz_cache.return_value.lookup.assert_called_once_with("QQQ")
     cookie_cache.return_value.lookup.assert_called_once_with("basic")
+
+
+def test_bbg_consumer_sync_order_validation_partial_replace_retry_and_symlink_safety(
+    tmp_path: Path,
+) -> None:
+    import scripts.dalton.researchdata_bridge as bridge_mod
+
+    data_root = tmp_path / "dalton-data"
+    ocw_root = tmp_path / "openclaw-consumer"
+    src_temp = data_root / "temp"
+    dst_temp = ocw_root / "temp"
+    src_temp.mkdir(parents=True, exist_ok=True)
+    dst_temp.mkdir(parents=True, exist_ok=True)
+
+    src_csv = src_temp / "bbg_data_latest.csv"
+    src_xlsx = src_temp / "bbg_data_remote.xlsx"
+    extra_src = src_temp / "unrelated_temp_note.txt"
+    extra_src.write_text("do-not-sync\n", encoding="utf-8")
+
+    dst_csv = dst_temp / "bbg_data_latest.csv"
+    dst_xlsx = dst_temp / "bbg_data_remote.xlsx"
+    existing_csv_text = "legacy-consumer-csv\n"
+    existing_xlsx_bytes = b"legacy-consumer-xlsx"
+    dst_csv.write_text(existing_csv_text, encoding="utf-8")
+    dst_xlsx.write_bytes(existing_xlsx_bytes)
+
+    # 1. Invalid source CSV -> validation fails before modifying target files in ocw_root
+    src_csv.write_text("bad,csv\n1,2\n", encoding="utf-8")
+    _write_valid_xlsx_zip(src_xlsx)
+    rc_bad, out_bad = bridge_mod._stage_and_commit_bbg_consumer_sync(
+        data_root=data_root,
+        ocw_root=ocw_root,
+    )
+    assert rc_bad == 1
+    bad_obj = json.loads(out_bad)
+    assert bad_obj["ok"] is False
+    assert bad_obj["consumer_sync"]["xlsx_replaced"] is False
+    assert bad_obj["consumer_sync"]["csv_replaced"] is False
+    assert dst_csv.read_text(encoding="utf-8") == existing_csv_text
+    assert dst_xlsx.read_bytes() == existing_xlsx_bytes
+    assert not list(dst_temp.glob(".*.tmp"))
+
+    # 2. Staging copy failure -> cleans up temp files and leaves target files untouched
+    valid_csv_text = _make_valid_bbg_csv_content(265)
+    src_csv.write_text(valid_csv_text, encoding="utf-8")
+    _write_valid_xlsx_zip(src_xlsx)
+    valid_xlsx_bytes = src_xlsx.read_bytes()
+
+    def _failing_copy(src: Path, dst: Path) -> None:
+        shutil.copy2(src, dst, follow_symlinks=False)
+        if dst.name.startswith(".bbg_data_latest.csv."):
+            raise OSError("disk_full_during_stage")
+
+    rc_stage_err, out_stage_err = bridge_mod._stage_and_commit_bbg_consumer_sync(
+        data_root=data_root,
+        ocw_root=ocw_root,
+        copy_fn=_failing_copy,
+    )
+    assert rc_stage_err == 1
+    stage_err_obj = json.loads(out_stage_err)
+    assert stage_err_obj["ok"] is False
+    assert "consumer_sync_stage_failed:OSError" in stage_err_obj["reason"]
+    assert dst_csv.read_text(encoding="utf-8") == existing_csv_text
+    assert dst_xlsx.read_bytes() == existing_xlsx_bytes
+    assert not list(dst_temp.glob(".*.tmp"))
+
+    # 3. Mid-replacement failure (XLSX replaced, CSV replace raises OSError) -> explicit failure & retryable
+    replace_calls: list[str] = []
+
+    def _fail_on_csv_replace(src: Path, dst: Path) -> None:
+        replace_calls.append(Path(dst).name)
+        if Path(dst).name == "bbg_data_latest.csv":
+            raise PermissionError("simulated_csv_replace_failure")
+        os.replace(src, dst)
+
+    rc_partial, out_partial = bridge_mod._stage_and_commit_bbg_consumer_sync(
+        data_root=data_root,
+        ocw_root=ocw_root,
+        replace_fn=_fail_on_csv_replace,
+    )
+    assert rc_partial == 1
+    assert replace_calls == ["bbg_data_remote.xlsx", "bbg_data_latest.csv"]
+    partial_obj = json.loads(out_partial)
+    assert partial_obj["ok"] is False
+    assert partial_obj["xlsx_replaced"] is True
+    assert partial_obj["csv_replaced"] is False
+    assert partial_obj["partial_replace"] is True
+    assert partial_obj["retryable"] is True
+    assert dst_xlsx.read_bytes() == valid_xlsx_bytes
+    assert dst_csv.read_text(encoding="utf-8") == existing_csv_text
+    assert not list(dst_temp.glob(".*.tmp"))
+
+    # 4. Retry after partial replacement succeeds, replaces XLSX then CSV, and does not copy unrelated files
+    retry_order: list[str] = []
+
+    def _recording_replace(src: Path, dst: Path) -> None:
+        retry_order.append(Path(dst).name)
+        os.replace(src, dst)
+
+    rc_ok, out_ok = bridge_mod._stage_and_commit_bbg_consumer_sync(
+        data_root=data_root,
+        ocw_root=ocw_root,
+        replace_fn=_recording_replace,
+    )
+    assert rc_ok == 0
+    assert retry_order == ["bbg_data_remote.xlsx", "bbg_data_latest.csv"]
+    ok_obj = json.loads(out_ok)
+    assert ok_obj["ok"] is True
+    assert ok_obj["lines"] == 266
+    assert ok_obj["consumer_sync"]["ok"] is True
+    assert ok_obj["consumer_sync"]["synced"] is True
+    assert ok_obj["consumer_sync"]["replace_order"] == [
+        "bbg_data_remote.xlsx",
+        "bbg_data_latest.csv",
+    ]
+    assert dst_xlsx.read_bytes() == valid_xlsx_bytes
+    assert dst_csv.read_text(encoding="utf-8") == valid_csv_text
+    assert not (dst_temp / "unrelated_temp_note.txt").exists()
+
+    # 5. Rejects same root and symlinks on ocw_root or target files
+    rc_same, out_same = bridge_mod._stage_and_commit_bbg_consumer_sync(
+        data_root=data_root,
+        ocw_root=data_root,
+    )
+    assert rc_same == 1
+    assert json.loads(out_same)["reason"] == "consumer_sync_same_root"
+
+    symlink_ocw = tmp_path / "symlink-ocw"
+    symlink_ocw.symlink_to(ocw_root)
+    rc_sym_root, out_sym_root = bridge_mod._stage_and_commit_bbg_consumer_sync(
+        data_root=data_root,
+        ocw_root=symlink_ocw,
+    )
+    assert rc_sym_root == 1
+    assert json.loads(out_sym_root)["reason"] == "consumer_sync_symlink_rejected"
+
+    dst_csv.unlink()
+    outside_target = tmp_path / "outside.csv"
+    outside_target.write_text("outside-untouched\n", encoding="utf-8")
+    dst_csv.symlink_to(outside_target)
+    rc_sym_file, out_sym_file = bridge_mod._stage_and_commit_bbg_consumer_sync(
+        data_root=data_root,
+        ocw_root=ocw_root,
+    )
+    assert rc_sym_file == 1
+    assert json.loads(out_sym_file)["reason"] == "consumer_sync_symlink_rejected"
+    assert outside_target.read_text(encoding="utf-8") == "outside-untouched\n"
+
+
+@pytest.mark.asyncio
+async def test_bridge_host_run_formal_vs_trial_preview_and_source_summary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import scripts.dalton.researchdata_bridge as bridge_mod
+
+    monkeypatch.setenv("DALTON_BRIDGE_ADMIN_TOKEN", "test-bridge-admin-token")
+    cfg = bridge_mod.BridgeConfig()
+    cfg.admin_token = "test-bridge-admin-token"
+    cfg.data_tasks_data_root = tmp_path / "dalton-data"
+    cfg.ocw_root = tmp_path / "openclaw-consumer"
+    cfg.host_task_sigterm_grace_s = 0.3
+
+    src_temp = cfg.data_tasks_data_root / "temp"
+    dst_temp = cfg.ocw_root / "temp"
+    scripts_dir = cfg.data_tasks_data_root / "scripts"
+    src_temp.mkdir(parents=True, exist_ok=True)
+    dst_temp.mkdir(parents=True, exist_ok=True)
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+
+    # Seed initial files in both Dalton data_root and legacy consumer ocw_root
+    (src_temp / "bbg_data_latest.csv").write_text(
+        _make_valid_bbg_csv_content(255), encoding="utf-8"
+    )
+    _write_valid_xlsx_zip(src_temp / "bbg_data_remote.xlsx")
+    (dst_temp / "bbg_data_latest.csv").write_text("legacy-initial-csv\n", encoding="utf-8")
+    (dst_temp / "bbg_data_remote.xlsx").write_bytes(b"legacy-initial-xlsx")
+
+    # Refresh script updates Dalton data_root/temp CSV to 270 rows
+    updated_csv = _make_valid_bbg_csv_content(270)
+    updated_csv_file = tmp_path / "updated_source.csv"
+    updated_csv_file.write_text(updated_csv, encoding="utf-8")
+    refresh_script = scripts_dir / "bbg_remote_refresh.sh"
+    refresh_script.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        f'cp "{updated_csv_file}" "$OPENCLAW_WORKSPACE/temp/bbg_data_latest.csv"\n'
+        'echo "{\\"ok\\": true, \\"lines\\": 271, \\"source\\": \\"bbg_remote\\"}"\n',
+        encoding="utf-8",
+    )
+    refresh_script.chmod(0o755)
+
+    bridge = bridge_mod.ResearchDataBridge(cfg)
+    bridge._host_ps_list_fn = create_autospec(
+        bridge_mod._list_host_processes_ps,
+        return_value=[(99999, 99999, "Sat Nov  7 10:00:00 2026", "gate")],
+    )
+    monkeypatch.setattr(
+        bridge_mod,
+        "_get_process_leader_lstart_sync",
+        lambda pgid, ps_list_fn=None: "Sat Nov  7 10:00:00 2026",
+    )
+    monkeypatch.setattr(
+        bridge_mod,
+        "_stop_and_verify_host_pgids_sync",
+        lambda runs, **kw: ([int(r["pgid"]) for r in (runs.values() if isinstance(runs, dict) else runs)], []),
+    )
+
+    # 1. Trial preview mode (`is_trial=True`) updates Dalton data_root, saves before/after summaries,
+    #    and does NOT write back to legacy consumer ocw_root.
+    status_trial, resp_trial = await bridge.handle_data_task_host_run(
+        {
+            "generation": 1,
+            "run_id": "run-trial-1",
+            "job_key": T1_JOB_KEY,
+            "host_mode": "run",
+            "scheduled_slot_utc": "2026-11-09T10:00:00Z",
+            "timeout": 30,
+            "no_output_timeout": 15,
+            "is_trial": True,
+        }
+    )
+    assert status_trial == 200
+    assert resp_trial["ok"] is True
+    assert resp_trial["consumer_sync"]["synced"] is False
+    assert resp_trial["consumer_sync"]["skipped"] is True
+    assert resp_trial["consumer_sync"]["reason"] == "trial_preview_no_writeback"
+    assert resp_trial["before_source_summary"]["dalton_data_root"]["lines"] == 256
+    assert resp_trial["after_source_summary"]["dalton_data_root"]["lines"] == 271
+    assert resp_trial["after_source_summary"]["summary_complete"] is True
+    assert resp_trial["after_source_summary"]["capture_scope"] == "gate_post_run"
+    assert (dst_temp / "bbg_data_latest.csv").read_text(encoding="utf-8") == "legacy-initial-csv\n"
+    assert (dst_temp / "bbg_data_remote.xlsx").read_bytes() == b"legacy-initial-xlsx"
+    trial_summary_file = cfg.data_tasks_data_root / ".dalton-runs" / "run-trial-1" / "source_summary.json"
+    assert trial_summary_file.is_file()
+    saved_trial_summary = json.loads(trial_summary_file.read_text(encoding="utf-8"))
+    assert saved_trial_summary["is_trial"] is True
+    assert saved_trial_summary["summary_complete"] is True
+    assert saved_trial_summary["capture_scope"] == "gate_post_run"
+
+    # 2. Formal run mode (`is_trial=False`) writes back to legacy consumer ocw_root and records summaries
+    status_formal, resp_formal = await bridge.handle_data_task_host_run(
+        {
+            "generation": 2,
+            "run_id": "run-formal-2",
+            "job_key": T1_JOB_KEY,
+            "host_mode": "run",
+            "scheduled_slot_utc": "2026-11-09T10:05:00Z",
+            "timeout": 30,
+            "no_output_timeout": 15,
+            "is_trial": False,
+        }
+    )
+    assert status_formal == 200
+    assert resp_formal["ok"] is True
+    assert resp_formal["consumer_sync"]["ok"] is True
+    assert resp_formal["consumer_sync"]["synced"] is True
+    assert (dst_temp / "bbg_data_latest.csv").read_text(encoding="utf-8") == updated_csv
+    assert (dst_temp / "bbg_data_remote.xlsx").read_bytes() == (
+        src_temp / "bbg_data_remote.xlsx"
+    ).read_bytes()
+    assert (
+        resp_formal["after_source_summary"]["legacy_ocw_root"]["csv"]["sha256"]
+        == resp_formal["after_source_summary"]["dalton_data_root"]["csv"]["sha256"]
+    )
+    assert resp_formal["after_source_summary"]["summary_complete"] is True
+    assert resp_formal["after_source_summary"]["capture_scope"] == "gate_post_run"
+    formal_summary_file = (
+        cfg.data_tasks_data_root / ".dalton-runs" / "run-formal-2" / "source_summary.json"
+    )
+    assert formal_summary_file.is_file()
+    saved_formal_summary = json.loads(formal_summary_file.read_text(encoding="utf-8"))
+    assert saved_formal_summary["is_trial"] is False
+    assert saved_formal_summary["summary_complete"] is True
+    assert saved_formal_summary["capture_scope"] == "gate_post_run"
+
+
+@pytest.mark.asyncio
+async def test_bridge_host_run_in_lock_summary_and_raw_ocw_root_symlink_rejection_and_trial_missing_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import scripts.dalton.researchdata_bridge as bridge_mod
+
+    monkeypatch.setenv("DALTON_BRIDGE_ADMIN_TOKEN", "test-bridge-admin-token")
+    monkeypatch.setattr(
+        bridge_mod,
+        "_get_process_leader_lstart_sync",
+        lambda pgid, ps_list_fn=None: "Sat Nov  7 10:00:00 2026",
+    )
+    monkeypatch.setattr(
+        bridge_mod,
+        "_stop_and_verify_host_pgids_sync",
+        lambda runs, **kw: (
+            [int(r["pgid"]) for r in (runs.values() if isinstance(runs, dict) else runs)],
+            [],
+        ),
+    )
+
+    data_root = tmp_path / "dalton-data"
+    real_ocw_root = tmp_path / "real-openclaw-consumer"
+    src_temp = data_root / "temp"
+    dst_temp = real_ocw_root / "temp"
+    scripts_dir = data_root / "scripts"
+    src_temp.mkdir(parents=True, exist_ok=True)
+    dst_temp.mkdir(parents=True, exist_ok=True)
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+
+    valid_csv_text = _make_valid_bbg_csv_content(260)
+    (src_temp / "bbg_data_latest.csv").write_text(valid_csv_text, encoding="utf-8")
+    _write_valid_xlsx_zip(src_temp / "bbg_data_remote.xlsx")
+    (dst_temp / "bbg_data_latest.csv").write_text("legacy-untouched-csv\n", encoding="utf-8")
+    (dst_temp / "bbg_data_remote.xlsx").write_bytes(b"legacy-untouched-xlsx")
+
+    refresh_script = scripts_dir / "bbg_remote_refresh.sh"
+    refresh_script.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        'echo "{\\"ok\\": true, \\"lines\\": 261, \\"source\\": \\"bbg_remote\\"}"\n',
+        encoding="utf-8",
+    )
+    refresh_script.chmod(0o755)
+
+    # 1. DALTON_OCW_ROOT is itself a symlink -> BridgeConfig resolves cfg.ocw_root
+    #    for normal reads, but retains cfg.ocw_root_raw so handle_data_task_host_run rejects symlinked root.
+    symlink_ocw_root = tmp_path / "symlink-ocw-root"
+    symlink_ocw_root.symlink_to(real_ocw_root)
+    # BridgeConfig reads ocw_root from DALTON_OCW_ROOT and keeps the raw path.
+    # data_tasks_data_root is the repo var path (not an env var); point every
+    # instance at this test's temp directory, same as the other host-run tests.
+    monkeypatch.setenv("DALTON_OCW_ROOT", str(symlink_ocw_root))
+
+    cfg_sym_root = bridge_mod.BridgeConfig()
+    cfg_sym_root.admin_token = "test-bridge-admin-token"
+    cfg_sym_root.data_tasks_data_root = data_root
+    assert cfg_sym_root.ocw_root == real_ocw_root.resolve()
+    assert cfg_sym_root.ocw_root_raw == symlink_ocw_root
+
+    bridge_sym_root = bridge_mod.ResearchDataBridge(cfg_sym_root)
+    bridge_sym_root._host_ps_list_fn = create_autospec(
+        bridge_mod._list_host_processes_ps,
+        return_value=[(99999, 99999, "Sat Nov  7 10:00:00 2026", "gate")],
+    )
+    status_sym_root, resp_sym_root = await bridge_sym_root.handle_data_task_host_run(
+        {
+            "generation": 1,
+            "run_id": "run-sym-root",
+            "job_key": T1_JOB_KEY,
+            "host_mode": "run",
+            "scheduled_slot_utc": "2026-11-09T10:10:00Z",
+            "timeout": 30,
+            "no_output_timeout": 15,
+            "is_trial": False,
+        }
+    )
+    assert status_sym_root == 200
+    assert resp_sym_root["ok"] is False
+    assert resp_sym_root["exit_code"] == 1
+    assert resp_sym_root["consumer_sync"]["ok"] is False
+    assert resp_sym_root["consumer_sync"]["reason"] == "consumer_sync_symlink_rejected"
+    assert (dst_temp / "bbg_data_latest.csv").read_text(encoding="utf-8") == "legacy-untouched-csv\n"
+    assert (dst_temp / "bbg_data_remote.xlsx").read_bytes() == b"legacy-untouched-xlsx"
+
+    # 2. DALTON_OCW_ROOT has a symlinked ancestor directory -> rejected and target untouched.
+    real_parent = tmp_path / "real-parent-dir"
+    real_nested_ocw = real_parent / "consumer-ws"
+    (real_nested_ocw / "temp").mkdir(parents=True, exist_ok=True)
+    (real_nested_ocw / "temp" / "bbg_data_latest.csv").write_text(
+        "nested-legacy-untouched\n", encoding="utf-8"
+    )
+    (real_nested_ocw / "temp" / "bbg_data_remote.xlsx").write_bytes(b"nested-legacy-xlsx")
+    symlink_parent = tmp_path / "symlink-parent-dir"
+    symlink_parent.symlink_to(real_parent)
+    anc_ocw_path = symlink_parent / "consumer-ws"
+    monkeypatch.setenv("DALTON_OCW_ROOT", str(anc_ocw_path))
+
+    cfg_sym_anc = bridge_mod.BridgeConfig()
+    cfg_sym_anc.admin_token = "test-bridge-admin-token"
+    cfg_sym_anc.data_tasks_data_root = data_root
+    assert cfg_sym_anc.ocw_root == real_nested_ocw.resolve()
+    assert cfg_sym_anc.ocw_root_raw == anc_ocw_path
+
+    bridge_sym_anc = bridge_mod.ResearchDataBridge(cfg_sym_anc)
+    bridge_sym_anc._host_ps_list_fn = create_autospec(
+        bridge_mod._list_host_processes_ps,
+        return_value=[(99999, 99999, "Sat Nov  7 10:00:00 2026", "gate")],
+    )
+    status_sym_anc, resp_sym_anc = await bridge_sym_anc.handle_data_task_host_run(
+        {
+            "generation": 2,
+            "run_id": "run-sym-ancestor",
+            "job_key": T1_JOB_KEY,
+            "host_mode": "run",
+            "scheduled_slot_utc": "2026-11-09T10:15:00Z",
+            "timeout": 30,
+            "no_output_timeout": 15,
+            "is_trial": False,
+        }
+    )
+    assert status_sym_anc == 200
+    assert resp_sym_anc["ok"] is False
+    assert resp_sym_anc["exit_code"] == 1
+    assert resp_sym_anc["consumer_sync"]["ok"] is False
+    assert resp_sym_anc["consumer_sync"]["reason"] == "consumer_sync_symlink_rejected"
+    assert (real_nested_ocw / "temp" / "bbg_data_latest.csv").read_text(
+        encoding="utf-8"
+    ) == "nested-legacy-untouched\n"
+    assert (
+        real_nested_ocw / "temp" / "bbg_data_remote.xlsx"
+    ).read_bytes() == b"nested-legacy-xlsx"
+
+    # 3. Real subprocess gate entry in trial mode (`is_trial=True`) when refresh script
+    #    prints `{"ok": true, ...}` and exits 0, but `bbg_data_remote.xlsx` is missing (or CSV is invalid).
+    monkeypatch.setenv("DALTON_OCW_ROOT", str(real_ocw_root))
+    cfg_real = bridge_mod.BridgeConfig()
+    cfg_real.admin_token = "test-bridge-admin-token"
+    cfg_real.data_tasks_data_root = data_root
+    cfg_real.host_task_sigterm_grace_s = 0.2
+    bridge_real = bridge_mod.ResearchDataBridge(cfg_real)
+    bridge_real._host_ps_list_fn = create_autospec(
+        bridge_mod._list_host_processes_ps,
+        return_value=[(99999, 99999, "Sat Nov  7 10:00:00 2026", "gate")],
+    )
+
+    # 3a. Missing XLSX in trial mode while script exits 0 -> gate fails with exit_code=1 & source_files_missing
+    (src_temp / "bbg_data_remote.xlsx").unlink()
+    status_missing, resp_missing = await bridge_real.handle_data_task_host_run(
+        {
+            "generation": 3,
+            "run_id": "run-trial-missing-xlsx",
+            "job_key": T1_JOB_KEY,
+            "host_mode": "run",
+            "scheduled_slot_utc": "2026-11-09T10:20:00Z",
+            "timeout": 30,
+            "no_output_timeout": 15,
+            "is_trial": True,
+        }
+    )
+    assert status_missing == 200
+    assert resp_missing["ok"] is False
+    assert resp_missing["exit_code"] == 1
+    eval_missing = evaluate_task_run(
+        TaskEvaluationContext(
+            job_key=T1_JOB_KEY,
+            exit_code=resp_missing["exit_code"],
+            stdout=resp_missing["log_tail"],
+        )
+    )
+    assert eval_missing.ok is False
+    assert eval_missing.status == "failed"
+    assert eval_missing.failure_reason == "source_files_missing"
+    assert (dst_temp / "bbg_data_latest.csv").read_text(encoding="utf-8") == "legacy-untouched-csv\n"
+    assert (dst_temp / "bbg_data_remote.xlsx").read_bytes() == b"legacy-untouched-xlsx"
+
+    # 3b. Invalid CSV in trial mode while script exits 0 -> gate fails with exit_code=1
+    _write_valid_xlsx_zip(src_temp / "bbg_data_remote.xlsx")
+    (src_temp / "bbg_data_latest.csv").write_text(
+        "bad,csv\n" + "1,2\n" * 252, encoding="utf-8"
+    )
+    status_invalid_trial, resp_invalid_trial = await bridge_real.handle_data_task_host_run(
+        {
+            "generation": 4,
+            "run_id": "run-trial-invalid-csv",
+            "job_key": T1_JOB_KEY,
+            "host_mode": "run",
+            "scheduled_slot_utc": "2026-11-09T10:25:00Z",
+            "timeout": 30,
+            "no_output_timeout": 15,
+            "is_trial": True,
+        }
+    )
+    assert status_invalid_trial == 200
+    assert resp_invalid_trial["ok"] is False
+    assert resp_invalid_trial["exit_code"] == 1
+    eval_invalid_trial = evaluate_task_run(
+        TaskEvaluationContext(
+            job_key=T1_JOB_KEY,
+            exit_code=resp_invalid_trial["exit_code"],
+            stdout=resp_invalid_trial["log_tail"],
+        )
+    )
+    assert eval_invalid_trial.ok is False
+    assert eval_invalid_trial.status == "failed"
+    assert "csv_columns_below_20" in (eval_invalid_trial.failure_reason or "")
+    assert (dst_temp / "bbg_data_latest.csv").read_text(encoding="utf-8") == "legacy-untouched-csv\n"
+    assert (dst_temp / "bbg_data_remote.xlsx").read_bytes() == b"legacy-untouched-xlsx"
+
+    # 4. Timeout/error path captures `after_source_summary` inside `_host_runner_lock`
+    #    before releasing active run protection, and marks `summary_complete=False` with `incomplete_reason`.
+    (src_temp / "bbg_data_latest.csv").write_text(valid_csv_text, encoding="utf-8")
+    refresh_script.write_text(
+        "#!/usr/bin/env bash\n"
+        "sleep 30\n",
+        encoding="utf-8",
+    )
+    refresh_script.chmod(0o755)
+
+    active_runs_when_persisting: list[int] = []
+    lock_held_when_persisting: list[bool] = []
+    orig_write_state = bridge_real._write_host_runner_state_file_sync
+
+    def _spy_write_state(*args: Any, **kwargs: Any) -> None:
+        if not bridge_real._host_active_runs:
+            summary_on_disk = (
+                data_root / ".dalton-runs" / "run-timeout-summary" / "source_summary.json"
+            )
+            if summary_on_disk.is_file():
+                active_runs_when_persisting.append(len(bridge_real._host_active_runs))
+                lock_held_when_persisting.append(bridge_real._host_runner_lock.locked())
+        orig_write_state(*args, **kwargs)
+
+    monkeypatch.setattr(bridge_real, "_write_host_runner_state_file_sync", _spy_write_state)
+
+    status_to, resp_to = await bridge_real.handle_data_task_host_run(
+        {
+            "generation": 5,
+            "run_id": "run-timeout-summary",
+            "job_key": T1_JOB_KEY,
+            "host_mode": "run",
+            "scheduled_slot_utc": "2026-11-09T10:30:00Z",
+            "timeout": 0.25,
+            "no_output_timeout": 0.25,
+            "is_trial": True,
+        }
+    )
+    assert status_to == 200
+    assert resp_to["ok"] is False
+    assert resp_to["timed_out"] is True
+    assert resp_to["after_source_summary"]["summary_complete"] is False
+    assert (
+        resp_to["after_source_summary"]["capture_scope"]
+        == "bridge_in_lock_aborted_or_failed"
+    )
+    assert resp_to["after_source_summary"]["incomplete_reason"] in (
+        "timed_out:total",
+        "timed_out:no_output",
+    )
+    assert lock_held_when_persisting == [True]
+    timeout_summary_file = (
+        data_root / ".dalton-runs" / "run-timeout-summary" / "source_summary.json"
+    )
+    assert timeout_summary_file.is_file()
+    timeout_summary_payload = json.loads(timeout_summary_file.read_text(encoding="utf-8"))
+    assert timeout_summary_payload["summary_complete"] is False
+    assert timeout_summary_payload["capture_scope"] == "bridge_in_lock_aborted_or_failed"
+
+
+@pytest.mark.asyncio
+async def test_data_task_run_now_bbg_only_summary_preserves_formal_mode_and_reports_write_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import scripts.dalton.data_task_run_now as run_now_mod
+    from src.dalton.data_jobs.scheduler import ClaimedTaskRun
+
+    orig_enqueue = run_now_mod.enqueue_manual_task_run
+    now = datetime(2026, 11, 9, 14, 0, tzinfo=timezone.utc)
+    deadline = now + timedelta(minutes=5)
+    path_map = build_path_map(
+        host_var_dir=tmp_path / "host_var",
+        backend_var_dir=tmp_path / "backend_var",
+    )
+    docker_double = create_autospec(DataTaskDockerClient, instance=True)
+    host_double = create_autospec(DataTaskHostBridgeClient, instance=True)
+
+    # 1. Non-BBG task (T18): does NOT call _capture_trial_source_summary or create source_summary.json
+    capture_spy = create_autospec(
+        run_now_mod._capture_trial_source_summary,
+        wraps=run_now_mod._capture_trial_source_summary,
+    )
+    monkeypatch.setattr(run_now_mod, "_capture_trial_source_summary", capture_spy)
+    monkeypatch.setattr(
+        run_now_mod,
+        "enqueue_manual_task_run",
+        create_autospec(orig_enqueue, return_value="run-t18-no-bbg"),
+    )
+    lock_conn_t18, _ = _make_autospec_db([{"fetchone": (False,)}])
+    conn_t18, _ = _make_autospec_db(
+        [
+            {
+                "fetchone": {
+                    "run_id": "run-t18-no-bbg",
+                    "job_key": T18_JOB_KEY,
+                    "status": "succeeded",
+                    "exit_code": 0,
+                    "failure_reason": None,
+                    "log_tail": "t18 ok",
+                    "notify_status": "preview_only",
+                    "notify_preview": None,
+                    "scheduled_slot_utc": now,
+                    "deadline_utc": deadline,
+                    "trigger_source": "manual",
+                    "task_enabled": False,
+                }
+            }
+        ]
+    )
+    res_t18 = await run_now_mod.run_manual_task_now(
+        "T18",
+        conn=conn_t18,
+        lock_conn=lock_conn_t18,
+        docker_client=docker_double,
+        host_client=host_double,
+        path_map=path_map,
+        sync_manifest=False,
+        poll_interval_seconds=0.0,
+        now_fn=lambda: now,
+    )
+    assert capture_spy.call_count == 0
+    assert "before_source_summary" not in res_t18
+    assert "after_source_summary" not in res_t18
+    assert "source_summary_file" not in res_t18
+    assert not (
+        path_map.backend_data_root / ".dalton-runs" / "run-t18-no-bbg" / "source_summary.json"
+    ).exists()
+
+    # 2. BBG task (T1) when Bridge already wrote `source_summary.json` (formal mode `is_trial=False`):
+    #    - Preserves `is_trial=False` (never overwrites to True)
+    #    - Returns Bridge's exact in-lock `before_source_summary` & `after_source_summary` rather than
+    #      overwriting with a CLI secondary sample after a subsequent run modifies the shared CSV.
+    bridge_before = {
+        "captured_at_utc": "2026-11-09T14:00:01Z",
+        "dalton_data_root": {"csv": {"lines": 255, "sha256": "before-sha"}},
+    }
+    bridge_after = {
+        "captured_at_utc": "2026-11-09T14:00:05Z",
+        "summary_complete": True,
+        "capture_scope": "gate_post_run",
+        "dalton_data_root": {"csv": {"lines": 270, "sha256": "bridge-in-lock-after-sha"}},
+    }
+    formal_run_dir = path_map.backend_data_root / ".dalton-runs" / "run-t1-formal"
+    formal_run_dir.mkdir(parents=True, exist_ok=True)
+    formal_summary_path = formal_run_dir / "source_summary.json"
+    formal_summary_path.write_text(
+        json.dumps(
+            {
+                "run_id": "run-t1-formal",
+                "job_key": T1_JOB_KEY,
+                "host_mode": "run",
+                "is_trial": False,
+                "summary_complete": True,
+                "capture_scope": "gate_post_run",
+                "before_source_summary": bridge_before,
+                "after_source_summary": bridge_after,
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    # Simulate another run overwriting the shared CSV on disk before CLI finishes polling
+    temp_dir = path_map.backend_data_root / "temp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    (temp_dir / "bbg_data_latest.csv").write_text(
+        _make_valid_bbg_csv_content(299), encoding="utf-8"
+    )
+
+    monkeypatch.setattr(
+        run_now_mod,
+        "enqueue_manual_task_run",
+        create_autospec(orig_enqueue, return_value="run-t1-formal"),
+    )
+    lock_conn_t1, _ = _make_autospec_db([{"fetchone": (False,)}])
+    conn_t1, _ = _make_autospec_db(
+        [
+            {
+                "fetchone": {
+                    "run_id": "run-t1-formal",
+                    "job_key": T1_JOB_KEY,
+                    "status": "succeeded",
+                    "exit_code": 0,
+                    "failure_reason": None,
+                    "log_tail": '{"ok": true, "lines": 270}\n',
+                    "notify_status": "pending_dispatch",
+                    "notify_preview": None,
+                    "scheduled_slot_utc": now,
+                    "deadline_utc": deadline,
+                    "trigger_source": "manual",
+                    "task_enabled": True,
+                }
+            }
+        ]
+    )
+    res_t1_formal = await run_now_mod.run_manual_task_now(
+        "T1",
+        conn=conn_t1,
+        lock_conn=lock_conn_t1,
+        docker_client=docker_double,
+        host_client=host_double,
+        path_map=path_map,
+        sync_manifest=False,
+        poll_interval_seconds=0.0,
+        now_fn=lambda: now,
+    )
+    assert res_t1_formal["is_trial"] is False
+    assert res_t1_formal["before_source_summary"] == bridge_before
+    assert res_t1_formal["after_source_summary"] == bridge_after
+    assert res_t1_formal["source_summary_file"] == str(formal_summary_path)
+    disk_formal = json.loads(formal_summary_path.read_text(encoding="utf-8"))
+    assert disk_formal["is_trial"] is False
+    assert disk_formal["before_source_summary"] == bridge_before
+    assert disk_formal["after_source_summary"] == bridge_after
+
+    # 3. Write failure on `source_summary.json` (e.g. `source_summary.json` path is a directory):
+    #    must NOT swallow the exception and return a fake `source_summary_file` path; must set
+    #    `source_summary_file = None` and record `source_summary_error`.
+    err_run_dir = path_map.backend_data_root / ".dalton-runs" / "run-t29-write-err"
+    (err_run_dir / "source_summary.json").mkdir(parents=True, exist_ok=True)
+    claimed_t29 = ClaimedTaskRun(
+        run_id="run-t29-write-err",
+        job_key=T29_JOB_KEY,
+        generation=9,
+        runner="host",
+        command_argv=["bash", "scripts/bbg_remote_refresh.sh"],
+        workdir="/Users/everflow/.openclaw/workspace",
+        timeout_seconds=900,
+        no_output_timeout_seconds=420,
+        required_secrets=[],
+        cos_mode="skip",
+        notify_enabled=False,
+        scheduled_slot_utc=now,
+        deadline_utc=deadline,
+        timezone="America/New_York",
+        trigger_source="manual",
+        is_trial=False,
+        host_mode="run",
+    )
+    monkeypatch.setattr(
+        run_now_mod,
+        "enqueue_manual_task_run",
+        create_autospec(orig_enqueue, return_value="run-t29-write-err"),
+    )
+    monkeypatch.setattr(
+        run_now_mod,
+        "claim_next_queued_run",
+        create_autospec(run_now_mod.claim_next_queued_run, return_value=claimed_t29),
+    )
+    monkeypatch.setattr(
+        run_now_mod,
+        "execute_claimed_host_run",
+        create_autospec(run_now_mod.execute_claimed_host_run, return_value=(True, 0)),
+    )
+    lock_conn_err, _ = _make_autospec_db(
+        [
+            {"fetchone": (True,)},
+            {"fetchone": (1,)},
+            {"fetchone": (1,)},
+            {"fetchone": (True,)},
+        ]
+    )
+    conn_err, _ = _make_autospec_db(
+        [
+            {"fetchone": {"slot_state": "idle"}},
+            {
+                "fetchone": {
+                    "run_id": "run-t29-write-err",
+                    "job_key": T29_JOB_KEY,
+                    "status": "succeeded",
+                    "exit_code": 0,
+                    "failure_reason": None,
+                    "log_tail": '{"ok": true, "lines": 299}\n',
+                    "notify_status": "skipped",
+                    "notify_preview": None,
+                    "scheduled_slot_utc": now,
+                    "deadline_utc": deadline,
+                    "trigger_source": "manual",
+                    "task_enabled": True,
+                }
+            },
+        ]
+    )
+    res_write_err = await run_now_mod.run_manual_task_now(
+        "T29",
+        conn=conn_err,
+        lock_conn=lock_conn_err,
+        docker_client=docker_double,
+        host_client=host_double,
+        path_map=path_map,
+        sync_manifest=False,
+        poll_interval_seconds=0.0,
+        now_fn=lambda: now,
+    )
+    assert res_write_err["is_trial"] is False
+    assert res_write_err["source_summary_file"] is None
+    assert "IsADirectoryError" in res_write_err["source_summary_error"]
+
+    orig_run_manual = run_now_mod.run_manual_task_now
+    monkeypatch.setattr(
+        run_now_mod,
+        "run_manual_task_now",
+        create_autospec(orig_run_manual, return_value=res_write_err),
+    )
+    assert await run_now_mod.async_main(["--job-key", "T29"]) == 0
+    cli_io = capsys.readouterr()
+    assert "source_summary_file:" not in cli_io.out
+    assert "source_summary_error: IsADirectoryError" in cli_io.err

@@ -461,15 +461,22 @@ def evaluate_t1_t29_bbg_data_pull(
             failure_reason=f"bbg_insufficient_lines:{lines_val}",
         )
 
+    details: dict[str, Any] = {
+        "lines": lines_val,
+        "source": payload.get("source"),
+        "path": payload.get("path"),
+        "timestamp": payload.get("timestamp"),
+    }
+    if isinstance(payload.get("consumer_sync"), dict):
+        details["consumer_sync"] = payload["consumer_sync"]
+    if isinstance(payload.get("before_source_summary"), dict):
+        details["before_source_summary"] = payload["before_source_summary"]
+    if isinstance(payload.get("after_source_summary"), dict):
+        details["after_source_summary"] = payload["after_source_summary"]
     return TaskEvaluationResult(
         ok=True,
         status="succeeded",
-        details={
-            "lines": lines_val,
-            "source": payload.get("source"),
-            "path": payload.get("path"),
-            "timestamp": payload.get("timestamp"),
-        },
+        details=details,
     )
 
 

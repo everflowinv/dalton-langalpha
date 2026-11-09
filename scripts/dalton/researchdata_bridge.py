@@ -1089,12 +1089,19 @@ class BridgeConfig:
         self.port: int = int(os.environ.get("DALTON_BRIDGE_PORT", "8960"))
         self.token: str = os.environ.get("DALTON_BRIDGE_TOKEN", "").strip()
         self.admin_token: str = os.environ.get("DALTON_BRIDGE_ADMIN_TOKEN", "").strip()
-        self.ocw_root: Path = Path(
-            os.environ.get(
-                "DALTON_OCW_ROOT",
-                os.path.expanduser("~/.openclaw/workspace"),
-            )
-        ).resolve()
+        raw_ocw_env = os.environ.get("DALTON_OCW_ROOT")
+        raw_ocw_str = (
+            raw_ocw_env.strip()
+            if raw_ocw_env is not None
+            else os.path.expanduser("~/.openclaw/workspace")
+        )
+        self.ocw_root_raw: Path | None = (
+            Path(raw_ocw_str).expanduser() if raw_ocw_str else None
+        )
+        self.ocw_root: Path = (
+            self.ocw_root_raw.resolve() if self.ocw_root_raw is not None else Path()
+        )
+        self._init_ocw_root: Path = self.ocw_root
         self.python_bin: str = os.environ.get(
             "DALTON_OCW_PYTHON", "/opt/homebrew/bin/python3"
         )
@@ -1450,9 +1457,10 @@ class BridgeConfig:
         # Resolved once here: host-run writes this path into child command lines
         # and kill/scan match on it, so both sides must see the same string even
         # if a segment of var/dalton/openclaw-data is a symlink.
-        self.data_tasks_data_root: Path = (
-            Path(__file__).resolve().parents[2] / "var/dalton/openclaw-data"
-        ).resolve()
+        raw_data_root_path = Path(__file__).resolve().parents[2] / "var/dalton/openclaw-data"
+        self.data_tasks_data_root_raw: Path = raw_data_root_path
+        self.data_tasks_data_root: Path = raw_data_root_path.resolve()
+        self._init_data_tasks_data_root: Path = self.data_tasks_data_root
         self.host_task_sigterm_grace_s: float = 5.0
         self.host_task_mirror_poll_interval_s: float = 15.0
         self.test_mode: bool = os.environ.get("DALTON_BRIDGE_TEST_MODE", "0").strip().lower() in (
@@ -15096,8 +15104,42 @@ class ResearchDataBridge:
         else:
             return 400, {"ok": False, "error": "no_output_timeout must be a positive number or null"}
 
-        data_root = Path(self.cfg.data_tasks_data_root).resolve()
-        ocw_root = Path(self.cfg.ocw_root).expanduser().resolve()
+        raw_is_trial = body.get("is_trial", False)
+        if not isinstance(raw_is_trial, bool):
+            return 400, {"ok": False, "error": "is_trial must be a boolean"}
+        is_trial = bool(raw_is_trial)
+
+        cfg_data_root = getattr(self.cfg, "data_tasks_data_root", None)
+        cfg_data_root_raw = getattr(self.cfg, "data_tasks_data_root_raw", None)
+        init_data_root = getattr(self.cfg, "_init_data_tasks_data_root", None)
+        if (
+            init_data_root is not None
+            and cfg_data_root is not None
+            and Path(cfg_data_root) != Path(init_data_root)
+        ):
+            raw_data_root = Path(cfg_data_root).expanduser()
+        elif cfg_data_root_raw is not None:
+            raw_data_root = Path(cfg_data_root_raw).expanduser()
+        else:
+            raw_data_root = Path(cfg_data_root).expanduser()
+        data_root = raw_data_root.resolve()
+
+        configured_ocw = getattr(self.cfg, "openclaw_workspace", None)
+        cfg_ocw = getattr(self.cfg, "ocw_root", None)
+        cfg_ocw_raw = getattr(self.cfg, "ocw_root_raw", None)
+        init_ocw = getattr(self.cfg, "_init_ocw_root", None)
+        if configured_ocw is not None and str(configured_ocw).strip():
+            raw_ocw_root: Path | None = Path(configured_ocw).expanduser()
+        elif cfg_ocw is None or not str(cfg_ocw).strip():
+            raw_ocw_root = None
+        elif init_ocw is not None and Path(cfg_ocw) != Path(init_ocw):
+            raw_ocw_root = Path(cfg_ocw).expanduser()
+        elif cfg_ocw_raw is not None and str(cfg_ocw_raw).strip():
+            raw_ocw_root = Path(cfg_ocw_raw).expanduser()
+        else:
+            raw_ocw_root = Path(cfg_ocw).expanduser()
+
+        ocw_root = raw_ocw_root.resolve() if raw_ocw_root is not None else data_root
         py_bin = self._resolve_archive_python_bin()
 
         async with self._host_runner_lock:
@@ -15164,6 +15206,14 @@ class ResearchDataBridge:
 
             self._host_max_seen_generation = max(self._host_max_seen_generation, generation)
 
+            before_source_summary = await asyncio.to_thread(
+                _build_bbg_source_summary,
+                data_root=raw_data_root,
+                ocw_root=raw_ocw_root,
+                summary_complete=True,
+                capture_scope="bridge_pre_run_in_lock",
+            )
+
             if self._host_task_command_override is not None:
                 gate_spec = {
                     "mode": "command",
@@ -15185,6 +15235,11 @@ class ResearchDataBridge:
                     "mode": "command",
                     "command_argv": ["bash", str(bbg_script)],
                     "cwd": str(data_root),
+                    "data_root": str(raw_data_root),
+                    "ocw_root": str(raw_ocw_root) if raw_ocw_root is not None else "",
+                    "is_trial": is_trial,
+                    "sync_consumer": not is_trial,
+                    "before_source_summary": before_source_summary,
                 }
 
             child_env = seed_asr_client.strip_asr_credentials_from_env(dict(os.environ))
@@ -15281,6 +15336,13 @@ class ResearchDataBridge:
         stdout_text = ""
         stderr_text = ""
 
+        after_source_summary: dict[str, Any] | None = None
+        last_stdout_obj: dict[str, Any] | None = None
+        consumer_sync_info: dict[str, Any] | None = None
+        error_reason: str | None = None
+        killed_by_host_kill = False
+        exit_confirmed = False
+
         try:
             exit_code, timed_out, timeout_kind, stdout_text, stderr_text = (
                 await _stream_and_wait_host_proc(
@@ -15298,6 +15360,7 @@ class ResearchDataBridge:
         finally:
             async with self._host_runner_lock:
                 self._host_running_procs.pop(pgid, None)
+                stopped_end: list[int] = []
                 if pgid in self._host_active_runs:
                     stopped_end, _remaining_end = await asyncio.to_thread(
                         _stop_and_verify_host_pgids_sync,
@@ -15306,6 +15369,98 @@ class ResearchDataBridge:
                         sigterm_grace_s=self.cfg.host_task_sigterm_grace_s,
                         ps_list_fn=self._get_ps_list_fn(),
                     )
+                killed_by_host_kill = pgid in self._host_killed_pgids
+                self._host_killed_pgids.discard(pgid)
+
+                last_stdout_obj = _extract_last_stdout_json_dict(stdout_text)
+                if isinstance(last_stdout_obj, dict) and isinstance(last_stdout_obj.get("consumer_sync"), dict):
+                    consumer_sync_info = last_stdout_obj["consumer_sync"]
+                elif host_mode == "run" and is_trial:
+                    consumer_sync_info = {
+                        "ok": True,
+                        "synced": False,
+                        "skipped": True,
+                        "reason": "trial_preview_no_writeback",
+                    }
+                if exit_code != 0 and isinstance(last_stdout_obj, dict):
+                    raw_err = last_stdout_obj.get("reason") or last_stdout_obj.get("error")
+                    if isinstance(raw_err, str) and raw_err.strip():
+                        error_reason = raw_err.strip()
+
+                run_succeeded = exit_code == 0 and not timed_out and not killed_by_host_kill
+                if (
+                    isinstance(last_stdout_obj, dict)
+                    and isinstance(last_stdout_obj.get("after_source_summary"), dict)
+                    and not timed_out
+                    and not killed_by_host_kill
+                ):
+                    gate_after = dict(last_stdout_obj["after_source_summary"])
+                    gate_after.setdefault("summary_complete", bool(run_succeeded))
+                    gate_after.setdefault(
+                        "capture_scope",
+                        "gate_post_run" if run_succeeded else "gate_error_exit",
+                    )
+                    if not run_succeeded and error_reason:
+                        gate_after.setdefault("incomplete_reason", error_reason)
+                    after_source_summary = gate_after
+                else:
+                    if timed_out:
+                        inc_reason: str | None = f"timed_out:{timeout_kind or 'total'}"
+                    elif killed_by_host_kill:
+                        inc_reason = "killed_by_host_kill"
+                    elif not run_succeeded:
+                        inc_reason = error_reason or f"exit_code_{exit_code}"
+                    else:
+                        inc_reason = None
+                    after_source_summary = await asyncio.to_thread(
+                        _build_bbg_source_summary,
+                        data_root=raw_data_root,
+                        ocw_root=raw_ocw_root,
+                        summary_complete=bool(run_succeeded),
+                        capture_scope=(
+                            "bridge_in_lock"
+                            if run_succeeded
+                            else "bridge_in_lock_aborted_or_failed"
+                        ),
+                        incomplete_reason=inc_reason,
+                    )
+
+                summary_complete_val = bool(
+                    after_source_summary.get("summary_complete", run_succeeded)
+                )
+                capture_scope_val = str(
+                    after_source_summary.get(
+                        "capture_scope",
+                        "gate_post_run"
+                        if run_succeeded
+                        else "bridge_in_lock_aborted_or_failed",
+                    )
+                )
+                summary_record: dict[str, Any] = {
+                    "run_id": run_id,
+                    "job_key": job_key,
+                    "generation": generation,
+                    "host_mode": host_mode,
+                    "is_trial": is_trial,
+                    "summary_complete": summary_complete_val,
+                    "capture_scope": capture_scope_val,
+                    "before_source_summary": before_source_summary,
+                    "after_source_summary": after_source_summary,
+                    "consumer_sync": consumer_sync_info,
+                }
+                if not summary_complete_val and after_source_summary.get("incomplete_reason"):
+                    summary_record["incomplete_reason"] = after_source_summary["incomplete_reason"]
+                try:
+                    summary_path = run_outbox_file.parent / "source_summary.json"
+                    await asyncio.to_thread(
+                        summary_path.write_text,
+                        json.dumps(summary_record, ensure_ascii=False, indent=2) + "\n",
+                        "utf-8",
+                    )
+                except Exception as exc:
+                    logger.warning("Failed writing host task source summary: %s", type(exc).__name__)
+
+                if pgid in self._host_active_runs:
                     if pgid in stopped_end:
                         self._host_active_runs.pop(pgid, None)
                     try:
@@ -15313,17 +15468,16 @@ class ResearchDataBridge:
                             await asyncio.to_thread(self._write_host_runner_state_file_sync)
                     except Exception as exc:
                         logger.warning("Failed updating host runner state file after run: %s", type(exc).__name__)
+                # The run is over only once its whole group is gone; a group the final
+                # check could not confirm stays registered, and the scheduler must not
+                # free the slot on this answer (it kills and confirms first).
+                exit_confirmed = pgid not in self._host_active_runs
 
-        killed_by_host_kill = pgid in self._host_killed_pgids
-        self._host_killed_pgids.discard(pgid)
-        # The run is over only once its whole group is gone; a group the final
-        # check could not confirm stays registered, and the scheduler must not
-        # free the slot on this answer (it kills and confirms first).
-        exit_confirmed = pgid not in self._host_active_runs
         combined_tail = stdout_text
         if stderr_text:
             combined_tail = (stdout_text.rstrip("\n") + "\n" + stderr_text) if stdout_text else stderr_text
-        return 200, {
+
+        resp_payload: dict[str, Any] = {
             "ok": exit_code == 0 and not timed_out and not killed_by_host_kill,
             "run_id": run_id,
             "job_key": job_key,
@@ -15336,7 +15490,13 @@ class ResearchDataBridge:
             "stdout": stdout_text,
             "stderr": stderr_text,
             "log_tail": combined_tail,
+            "before_source_summary": before_source_summary,
+            "after_source_summary": after_source_summary,
+            "consumer_sync": consumer_sync_info,
         }
+        if error_reason:
+            resp_payload["error"] = error_reason
+        return 200, resp_payload
 
 
 
@@ -18286,6 +18446,480 @@ def _stage_and_commit_bbg_mirror(
         tmp_xlsx.unlink(missing_ok=True)
 
 
+BBG_SYNC_RELATIVE_FILES: tuple[str, str] = (
+    "bbg_data_remote.xlsx",
+    "bbg_data_latest.csv",
+)
+
+
+def _extract_last_stdout_json_dict(text: str | None) -> dict[str, Any] | None:
+    if not text:
+        return None
+    for raw_line in reversed(text.splitlines()):
+        stripped = raw_line.strip()
+        if not (stripped.startswith("{") and stripped.endswith("}")):
+            continue
+        try:
+            obj = json.loads(stripped)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return None
+
+
+def _summarize_bbg_file_artifact(path: Path) -> dict[str, Any]:
+    is_sym = False
+    try:
+        is_sym = path.is_symlink()
+    except OSError:
+        is_sym = False
+    if is_sym:
+        return {
+            "path": str(path),
+            "exists": True,
+            "is_symlink": True,
+        }
+    try:
+        if not path.is_file():
+            return {
+                "path": str(path),
+                "exists": False,
+                "is_symlink": False,
+            }
+        st = path.stat(follow_symlinks=False)
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        return {
+            "path": str(path),
+            "exists": True,
+            "is_symlink": False,
+            "size_bytes": int(st.st_size),
+            "mtime_epoch": round(float(st.st_mtime), 3),
+            "mtime_utc": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            ),
+            "sha256": digest,
+        }
+    except OSError as exc:
+        return {
+            "path": str(path),
+            "exists": False,
+            "is_symlink": False,
+            "error": type(exc).__name__,
+        }
+
+
+_ALLOWED_SYSTEM_ROOT_SYMLINKS: frozenset[Path] = frozenset(
+    {Path("/var"), Path("/tmp"), Path("/etc")}
+)
+
+
+def _has_disallowed_path_symlink(path: Path) -> bool:
+    raw = Path(path).expanduser()
+    for candidate in (raw, *raw.parents):
+        if candidate == Path("/") or candidate in _ALLOWED_SYSTEM_ROOT_SYMLINKS:
+            continue
+        try:
+            if candidate.is_symlink():
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def _summarize_bbg_root_artifacts(root: Path) -> dict[str, Any]:
+    raw_root = Path(root).expanduser()
+    root_is_sym = _has_disallowed_path_symlink(raw_root)
+    temp_dir = raw_root / "temp"
+    temp_is_sym = False
+    if not root_is_sym:
+        try:
+            temp_is_sym = temp_dir.is_symlink()
+        except OSError:
+            temp_is_sym = False
+    csv_path = temp_dir / "bbg_data_latest.csv"
+    xlsx_path = temp_dir / "bbg_data_remote.xlsx"
+    if root_is_sym or temp_is_sym:
+        return {
+            "root": str(raw_root),
+            "root_is_symlink": root_is_sym,
+            "temp_is_symlink": temp_is_sym,
+            "csv": {"path": str(csv_path), "exists": False, "is_symlink": root_is_sym or temp_is_sym},
+            "xlsx": {"path": str(xlsx_path), "exists": False, "is_symlink": root_is_sym or temp_is_sym},
+            "valid": False,
+        }
+    csv_info = _summarize_bbg_file_artifact(csv_path)
+    xlsx_info = _summarize_bbg_file_artifact(xlsx_path)
+    summary: dict[str, Any] = {
+        "root": str(raw_root),
+        "root_is_symlink": False,
+        "temp_is_symlink": False,
+        "csv": csv_info,
+        "xlsx": xlsx_info,
+    }
+    if (
+        csv_info.get("exists")
+        and not csv_info.get("is_symlink")
+        and xlsx_info.get("exists")
+        and not xlsx_info.get("is_symlink")
+    ):
+        verdict = validate_bbg_mirror_files(csv_path, xlsx_path)
+        summary["valid"] = bool(verdict.get("ok"))
+        if verdict.get("ok"):
+            summary["lines"] = int(verdict["lines"])
+            summary["counts"] = verdict["counts"]
+            summary["last_dates"] = verdict["last_dates"]
+        else:
+            summary["validation_reason"] = str(verdict.get("reason") or "validation_failed")
+    else:
+        summary["valid"] = False
+    return summary
+
+
+def _build_bbg_source_summary(
+    *,
+    data_root: Path,
+    ocw_root: Path | None = None,
+    summary_complete: bool = True,
+    capture_scope: str = "gate_post_run",
+    incomplete_reason: str | None = None,
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "captured_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "summary_complete": bool(summary_complete),
+        "capture_scope": str(capture_scope),
+        "dalton_data_root": _summarize_bbg_root_artifacts(Path(data_root)),
+    }
+    if incomplete_reason:
+        summary["incomplete_reason"] = str(incomplete_reason)
+    if ocw_root is not None and str(ocw_root).strip():
+        summary["legacy_ocw_root"] = _summarize_bbg_root_artifacts(Path(ocw_root))
+    return summary
+
+
+def _stage_and_commit_bbg_consumer_sync(
+    *,
+    data_root: Path,
+    ocw_root: Path | None,
+    replace_fn: Any = os.replace,
+    copy_fn: Any = None,
+) -> tuple[int, str]:
+    """Validate Dalton BBG artifacts and atomically sync XLSX then CSV to legacy OpenClaw root.
+
+    Copies only `temp/bbg_data_remote.xlsx` and `temp/bbg_data_latest.csv` from `data_root` into
+    temporary files under `<ocw_root>/temp/`, validates the staged copies, and replaces targets
+    one file at a time (XLSX first, then CSV). Rejects symlinks and non-configured or identical
+    roots; if validation or staging fails, target files in `ocw_root` are not modified. If CSV
+    replacement fails after XLSX replacement succeeded, returns a retryable failure outcome with
+    explicit per-file replacement flags.
+    """
+    if ocw_root is None or not str(ocw_root).strip():
+        err_out = {
+            "ok": False,
+            "error": "consumer_root_not_configured",
+            "reason": "consumer_root_not_configured",
+            "source": "dalton_consumer_sync",
+            "consumer_sync": {
+                "ok": False,
+                "synced": False,
+                "reason": "consumer_root_not_configured",
+                "xlsx_replaced": False,
+                "csv_replaced": False,
+                "retryable": False,
+            },
+        }
+        return 1, json.dumps(err_out, ensure_ascii=False) + "\n"
+
+    raw_data_root = Path(data_root).expanduser()
+    raw_ocw_root = Path(ocw_root).expanduser()
+    if not raw_data_root.is_absolute() or not raw_ocw_root.is_absolute():
+        err_out = {
+            "ok": False,
+            "error": "consumer_sync_non_absolute_root",
+            "reason": "consumer_sync_non_absolute_root",
+            "source": "dalton_consumer_sync",
+            "consumer_sync": {
+                "ok": False,
+                "synced": False,
+                "reason": "consumer_sync_non_absolute_root",
+                "xlsx_replaced": False,
+                "csv_replaced": False,
+                "retryable": False,
+            },
+        }
+        return 1, json.dumps(err_out, ensure_ascii=False) + "\n"
+
+    src_dir = raw_data_root / "temp"
+    src_xlsx = src_dir / "bbg_data_remote.xlsx"
+    src_csv = src_dir / "bbg_data_latest.csv"
+    dst_dir = raw_ocw_root / "temp"
+    dst_xlsx = dst_dir / "bbg_data_remote.xlsx"
+    dst_csv = dst_dir / "bbg_data_latest.csv"
+
+    for candidate in (
+        raw_data_root,
+        src_dir,
+        src_xlsx,
+        src_csv,
+        raw_ocw_root,
+        dst_dir,
+        dst_xlsx,
+        dst_csv,
+    ):
+        if _has_disallowed_path_symlink(candidate):
+            err_out = {
+                "ok": False,
+                "error": "consumer_sync_symlink_rejected",
+                "reason": "consumer_sync_symlink_rejected",
+                "source": "dalton_consumer_sync",
+                "consumer_sync": {
+                    "ok": False,
+                    "synced": False,
+                    "reason": "consumer_sync_symlink_rejected",
+                    "xlsx_replaced": False,
+                    "csv_replaced": False,
+                    "retryable": False,
+                },
+            }
+            return 1, json.dumps(err_out, ensure_ascii=False) + "\n"
+
+    resolved_data_root = raw_data_root.resolve()
+    resolved_ocw_root = raw_ocw_root.resolve()
+    if resolved_data_root == resolved_ocw_root:
+        err_out = {
+            "ok": False,
+            "error": "consumer_sync_same_root",
+            "reason": "consumer_sync_same_root",
+            "source": "dalton_consumer_sync",
+            "consumer_sync": {
+                "ok": False,
+                "synced": False,
+                "reason": "consumer_sync_same_root",
+                "xlsx_replaced": False,
+                "csv_replaced": False,
+                "retryable": False,
+            },
+        }
+        return 1, json.dumps(err_out, ensure_ascii=False) + "\n"
+
+    if not src_csv.is_file() or not src_xlsx.is_file():
+        err_out = {
+            "ok": False,
+            "error": "source_files_missing",
+            "reason": "source_files_missing",
+            "source": "dalton_consumer_sync",
+            "consumer_sync": {
+                "ok": False,
+                "synced": False,
+                "reason": "source_files_missing",
+                "xlsx_replaced": False,
+                "csv_replaced": False,
+                "retryable": True,
+            },
+        }
+        return 1, json.dumps(err_out, ensure_ascii=False) + "\n"
+
+    resolved_src_dir = src_dir.resolve()
+    if (
+        resolved_src_dir.parent != resolved_data_root
+        or src_xlsx.resolve().parent != resolved_src_dir
+        or src_csv.resolve().parent != resolved_src_dir
+    ):
+        err_out = {
+            "ok": False,
+            "error": "consumer_sync_symlink_rejected",
+            "reason": "consumer_sync_symlink_rejected",
+            "source": "dalton_consumer_sync",
+            "consumer_sync": {
+                "ok": False,
+                "synced": False,
+                "reason": "consumer_sync_symlink_rejected",
+                "xlsx_replaced": False,
+                "csv_replaced": False,
+                "retryable": False,
+            },
+        }
+        return 1, json.dumps(err_out, ensure_ascii=False) + "\n"
+
+    src_verdict = validate_bbg_mirror_files(src_csv, src_xlsx)
+    if not src_verdict.get("ok"):
+        reason = str(src_verdict.get("reason") or "validation_failed")
+        err_out = {
+            "ok": False,
+            "error": reason,
+            "reason": reason,
+            "source": "dalton_consumer_sync",
+            "consumer_sync": {
+                "ok": False,
+                "synced": False,
+                "reason": reason,
+                "xlsx_replaced": False,
+                "csv_replaced": False,
+                "retryable": False,
+            },
+        }
+        return 1, json.dumps(err_out, ensure_ascii=False) + "\n"
+
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    resolved_dst_dir = dst_dir.resolve()
+    if (
+        dst_dir.is_symlink()
+        or resolved_dst_dir.parent != resolved_ocw_root
+        or dst_xlsx.is_symlink()
+        or dst_csv.is_symlink()
+    ):
+        err_out = {
+            "ok": False,
+            "error": "consumer_sync_symlink_rejected",
+            "reason": "consumer_sync_symlink_rejected",
+            "source": "dalton_consumer_sync",
+            "consumer_sync": {
+                "ok": False,
+                "synced": False,
+                "reason": "consumer_sync_symlink_rejected",
+                "xlsx_replaced": False,
+                "csv_replaced": False,
+                "retryable": False,
+            },
+        }
+        return 1, json.dumps(err_out, ensure_ascii=False) + "\n"
+
+    tag = f"{os.getpid()}.{uuid.uuid4().hex[:8]}"
+    tmp_xlsx = dst_dir / f".bbg_data_remote.xlsx.{tag}.tmp"
+    tmp_csv = dst_dir / f".bbg_data_latest.csv.{tag}.tmp"
+    active_copy = copy_fn or (lambda s, d: shutil.copy2(s, d, follow_symlinks=False))
+    try:
+        try:
+            active_copy(src_xlsx, tmp_xlsx)
+            active_copy(src_csv, tmp_csv)
+        except Exception as exc:
+            tmp_xlsx.unlink(missing_ok=True)
+            tmp_csv.unlink(missing_ok=True)
+            reason = f"consumer_sync_stage_failed:{type(exc).__name__}"
+            err_out = {
+                "ok": False,
+                "error": reason,
+                "reason": reason,
+                "source": "dalton_consumer_sync",
+                "consumer_sync": {
+                    "ok": False,
+                    "synced": False,
+                    "reason": reason,
+                    "xlsx_replaced": False,
+                    "csv_replaced": False,
+                    "partial_replace": False,
+                    "retryable": True,
+                },
+            }
+            return 1, json.dumps(err_out, ensure_ascii=False) + "\n"
+
+        verdict = validate_bbg_mirror_files(tmp_csv, tmp_xlsx)
+        if not verdict.get("ok"):
+            tmp_xlsx.unlink(missing_ok=True)
+            tmp_csv.unlink(missing_ok=True)
+            reason = str(verdict.get("reason") or "validation_failed")
+            err_out = {
+                "ok": False,
+                "error": reason,
+                "reason": reason,
+                "source": "dalton_consumer_sync",
+                "consumer_sync": {
+                    "ok": False,
+                    "synced": False,
+                    "reason": reason,
+                    "xlsx_replaced": False,
+                    "csv_replaced": False,
+                    "partial_replace": False,
+                    "retryable": False,
+                },
+            }
+            return 1, json.dumps(err_out, ensure_ascii=False) + "\n"
+
+        try:
+            replace_fn(tmp_xlsx, dst_xlsx)
+        except Exception as exc:
+            tmp_xlsx.unlink(missing_ok=True)
+            tmp_csv.unlink(missing_ok=True)
+            reason = f"consumer_sync_replace_xlsx_failed:{type(exc).__name__}"
+            err_out = {
+                "ok": False,
+                "error": reason,
+                "reason": reason,
+                "source": "dalton_consumer_sync",
+                "xlsx_replaced": False,
+                "csv_replaced": False,
+                "partial_replace": False,
+                "retryable": True,
+                "consumer_sync": {
+                    "ok": False,
+                    "synced": False,
+                    "reason": reason,
+                    "xlsx_replaced": False,
+                    "csv_replaced": False,
+                    "partial_replace": False,
+                    "retryable": True,
+                },
+            }
+            return 1, json.dumps(err_out, ensure_ascii=False) + "\n"
+
+        try:
+            replace_fn(tmp_csv, dst_csv)
+        except Exception as exc:
+            tmp_csv.unlink(missing_ok=True)
+            tmp_xlsx.unlink(missing_ok=True)
+            reason = f"consumer_sync_partial_replace_csv_failed:{type(exc).__name__}"
+            err_out = {
+                "ok": False,
+                "error": reason,
+                "reason": reason,
+                "source": "dalton_consumer_sync",
+                "xlsx_replaced": True,
+                "csv_replaced": False,
+                "partial_replace": True,
+                "retryable": True,
+                "consumer_sync": {
+                    "ok": False,
+                    "synced": False,
+                    "reason": reason,
+                    "ocw_root": str(raw_ocw_root),
+                    "xlsx_path": str(dst_xlsx),
+                    "csv_path": str(dst_csv),
+                    "xlsx_replaced": True,
+                    "csv_replaced": False,
+                    "partial_replace": True,
+                    "retryable": True,
+                },
+            }
+            return 1, json.dumps(err_out, ensure_ascii=False) + "\n"
+
+        out = {
+            "ok": True,
+            "lines": int(verdict["lines"]),
+            "source": "bbg_remote",
+            "path": str(src_csv),
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "detail": {
+                "counts": verdict["counts"],
+                "last_dates": verdict["last_dates"],
+            },
+            "consumer_sync": {
+                "ok": True,
+                "synced": True,
+                "ocw_root": str(raw_ocw_root),
+                "xlsx_path": str(dst_xlsx),
+                "csv_path": str(dst_csv),
+                "xlsx_replaced": True,
+                "csv_replaced": True,
+                "partial_replace": False,
+                "replace_order": list(BBG_SYNC_RELATIVE_FILES),
+            },
+        }
+        return 0, json.dumps(out, ensure_ascii=False) + "\n"
+    finally:
+        tmp_csv.unlink(missing_ok=True)
+        tmp_xlsx.unlink(missing_ok=True)
+
+
 def run_bbg_mirror_sync(
     *,
     ocw_root: Path | None = None,
@@ -18445,7 +19079,183 @@ def _run_host_task_gate_cli(argv: list[str]) -> int:
 
     signal.signal(signal.SIGTERM, _forward_term)
     signal.signal(signal.SIGINT, _forward_term)
-    return int(child.wait())
+    child_rc = int(child.wait())
+    if child_rc != 0:
+        return child_rc
+
+    if spec.get("sync_consumer") is True:
+        redactor = HostSecretRedactor()
+        raw_data_root = Path(str(spec.get("data_root") or cwd or ""))
+        raw_ocw_str = str(spec.get("ocw_root") or "").strip()
+        raw_ocw_root = Path(raw_ocw_str) if raw_ocw_str else None
+        sync_rc, sync_json = _stage_and_commit_bbg_consumer_sync(
+            data_root=raw_data_root,
+            ocw_root=raw_ocw_root,
+        )
+        sync_obj: dict[str, Any] | None = None
+        try:
+            parsed_sync = json.loads(sync_json)
+            if isinstance(parsed_sync, dict):
+                sync_obj = parsed_sync
+        except Exception:
+            sync_obj = None
+        sync_err_reason = (
+            str(sync_obj.get("reason") or sync_obj.get("error") or "consumer_sync_failed")
+            if (sync_rc != 0 and isinstance(sync_obj, dict))
+            else None
+        )
+        after_summary = _build_bbg_source_summary(
+            data_root=raw_data_root,
+            ocw_root=raw_ocw_root,
+            summary_complete=(sync_rc == 0),
+            capture_scope="gate_post_run" if sync_rc == 0 else "gate_error_exit",
+            incomplete_reason=sync_err_reason,
+        )
+        if isinstance(sync_obj, dict):
+            if isinstance(spec.get("before_source_summary"), dict):
+                sync_obj["before_source_summary"] = spec["before_source_summary"]
+            sync_obj["after_source_summary"] = after_summary
+            sync_json = json.dumps(sync_obj, ensure_ascii=False) + "\n"
+        sys.stdout.write(redactor.redact_text(sync_json))
+        sys.stdout.flush()
+        return int(sync_rc)
+
+    if spec.get("is_trial") is True and spec.get("data_root"):
+        redactor = HostSecretRedactor()
+        raw_data_root = Path(str(spec["data_root"])).expanduser()
+        raw_ocw_str = str(spec.get("ocw_root") or "").strip()
+        raw_ocw_root = Path(raw_ocw_str).expanduser() if raw_ocw_str else None
+        src_dir = raw_data_root / "temp"
+        src_csv = src_dir / "bbg_data_latest.csv"
+        src_xlsx = src_dir / "bbg_data_remote.xlsx"
+
+        if any(
+            _has_disallowed_path_symlink(p)
+            for p in (raw_data_root, src_dir, src_csv, src_xlsx)
+        ):
+            reason = "trial_source_symlink_rejected"
+            after_summary = _build_bbg_source_summary(
+                data_root=raw_data_root,
+                ocw_root=raw_ocw_root,
+                summary_complete=False,
+                capture_scope="gate_error_exit",
+                incomplete_reason=reason,
+            )
+            err_out: dict[str, Any] = {
+                "ok": False,
+                "error": reason,
+                "reason": reason,
+                "source": "bbg_remote",
+                "consumer_sync": {
+                    "ok": True,
+                    "synced": False,
+                    "skipped": True,
+                    "reason": "trial_preview_no_writeback",
+                },
+                "after_source_summary": after_summary,
+            }
+            if isinstance(spec.get("before_source_summary"), dict):
+                err_out["before_source_summary"] = spec["before_source_summary"]
+            sys.stdout.write(
+                redactor.redact_text(json.dumps(err_out, ensure_ascii=False) + "\n")
+            )
+            sys.stdout.flush()
+            return 1
+
+        if not src_csv.is_file() or not src_xlsx.is_file():
+            reason = "source_files_missing"
+            after_summary = _build_bbg_source_summary(
+                data_root=raw_data_root,
+                ocw_root=raw_ocw_root,
+                summary_complete=False,
+                capture_scope="gate_error_exit",
+                incomplete_reason=reason,
+            )
+            err_out = {
+                "ok": False,
+                "error": reason,
+                "reason": reason,
+                "source": "bbg_remote",
+                "consumer_sync": {
+                    "ok": True,
+                    "synced": False,
+                    "skipped": True,
+                    "reason": "trial_preview_no_writeback",
+                },
+                "after_source_summary": after_summary,
+            }
+            if isinstance(spec.get("before_source_summary"), dict):
+                err_out["before_source_summary"] = spec["before_source_summary"]
+            sys.stdout.write(
+                redactor.redact_text(json.dumps(err_out, ensure_ascii=False) + "\n")
+            )
+            sys.stdout.flush()
+            return 1
+
+        verdict = validate_bbg_mirror_files(src_csv, src_xlsx)
+        if verdict.get("ok"):
+            after_summary = _build_bbg_source_summary(
+                data_root=raw_data_root,
+                ocw_root=raw_ocw_root,
+                summary_complete=True,
+                capture_scope="gate_post_run",
+            )
+            trial_out: dict[str, Any] = {
+                "ok": True,
+                "lines": int(verdict["lines"]),
+                "source": "bbg_remote",
+                "path": str(src_csv),
+                "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "detail": {
+                    "counts": verdict["counts"],
+                    "last_dates": verdict["last_dates"],
+                },
+                "consumer_sync": {
+                    "ok": True,
+                    "synced": False,
+                    "skipped": True,
+                    "reason": "trial_preview_no_writeback",
+                },
+                "after_source_summary": after_summary,
+            }
+            if isinstance(spec.get("before_source_summary"), dict):
+                trial_out["before_source_summary"] = spec["before_source_summary"]
+            sys.stdout.write(
+                redactor.redact_text(json.dumps(trial_out, ensure_ascii=False) + "\n")
+            )
+            sys.stdout.flush()
+            return 0
+
+        reason = str(verdict.get("reason") or "validation_failed")
+        after_summary = _build_bbg_source_summary(
+            data_root=raw_data_root,
+            ocw_root=raw_ocw_root,
+            summary_complete=False,
+            capture_scope="gate_error_exit",
+            incomplete_reason=reason,
+        )
+        err_out = {
+            "ok": False,
+            "error": reason,
+            "reason": reason,
+            "source": "bbg_remote",
+            "consumer_sync": {
+                "ok": True,
+                "synced": False,
+                "skipped": True,
+                "reason": "trial_preview_no_writeback",
+            },
+            "after_source_summary": after_summary,
+        }
+        if isinstance(spec.get("before_source_summary"), dict):
+            err_out["before_source_summary"] = spec["before_source_summary"]
+        sys.stdout.write(
+            redactor.redact_text(json.dumps(err_out, ensure_ascii=False) + "\n")
+        )
+        sys.stdout.flush()
+        return 1
+
+    return child_rc
 
 
 async def _send_http(
