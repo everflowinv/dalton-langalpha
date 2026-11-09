@@ -179,6 +179,30 @@ export class ChannelGatewayOrchestrator {
     );
   }
 
+  private async recoverDetachedInboundTurn(
+    event: InboundChannelEvent,
+  ): Promise<void> {
+    const requestKey = makeInboundRequestKey(event.platform, event.messageId);
+    const reresolved = await this.backend.registerAndResolveInbound({
+      platform: event.platform,
+      platform_user_id: event.platformUserId,
+      chat_type: event.chatType,
+      chat_address: event.chatAddress,
+      thread_scope_key: event.threadScopeKey,
+      message_id: event.messageId,
+      request_key: requestKey,
+      raw_payload: {
+        ...(event.rawPayload ?? {}),
+        platform_user_id: event.platformUserId,
+        text: event.text,
+        chat_id: event.chatId,
+        chat_name: event.chatName ?? null,
+      },
+      weixin_context_token: event.weixinContextToken ?? null,
+    });
+    await this.executeRegisteredInboundTurn(event, reresolved);
+  }
+
   private async launchInboundTurn(
     event: InboundChannelEvent,
     runTurn: () => Promise<void>,
@@ -188,14 +212,10 @@ export class ChannelGatewayOrchestrator {
         await runTurn();
       } catch {
         try {
-          await this.backend.updateInboundProgress({
-            platform: event.platform,
-            message_id: event.messageId,
-            status: "failed",
-            fallback_pending: false,
-          });
+          await this.recoverDetachedInboundTurn(event);
         } catch {
-          // Ignore secondary progress update failure
+          // The inbound row keeps its last persisted state, so a later
+          // recovery pass can query and replay with the same request key.
         }
       }
     })();

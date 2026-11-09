@@ -15,6 +15,7 @@ import {
   countMarkdownTables,
   createFeishuSdkLogger,
   detectIdType,
+  extractInboundAttachments,
   FEISHU_CARD_MAX_BYTES,
   FEISHU_CARD_TABLE_LIMIT,
   FEISHU_POST_MAX_BYTES,
@@ -28,6 +29,10 @@ import {
   normalizeMentions,
   normalizeMultipartUploadData,
   parseFeishuConversationId,
+  parseInteractiveCardContent,
+  parseMergeForwardContent,
+  parseMessageContent,
+  parsePostContent,
   parseFeishuDirectConversationId,
   parseFeishuInboundEvent,
   parseFeishuTargetId,
@@ -59,6 +64,7 @@ import {
 import { downloadWorkspaceFileToBuffer } from "../src/shared/workspace-download.js";
 import { uploadAttachmentToWorkspace } from "../src/shared/workspace-upload.js";
 import type { InboundChannelEvent } from "../src/types.js";
+import { makeInboundRequestKey } from "../src/uuid.js";
 import {
   createTestHarness,
   makeSseEventsFromFixture,
@@ -1158,7 +1164,7 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
     }
   });
 
-  it("marks inbound event status as failed when the detached background turn throws an error", async () => {
+  it("recovers the original turn with the same request key when the backend accepted creation but the response is lost before metadata", async () => {
     const h = createTestHarness();
     try {
       const feishuAdapter = new FeishuChannelAdapter({
@@ -1171,38 +1177,200 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
         await h.app.orchestrator.handleInboundEvent(ev);
       });
 
-      let rejectTurn!: (err: Error) => void;
-      const turnErrorGate = new Promise<never>((_, reject) => {
-        rejectTurn = reject;
-      });
-
-      vi.mocked(h.backend.appendThreadMessages).mockImplementationOnce(
+      const defaultRegister = vi
+        .mocked(h.backend.registerAndResolveInbound)
+        .getMockImplementation()!;
+      let registerCalls = 0;
+      const registerKeys: string[] = [];
+      vi.mocked(h.backend.registerAndResolveInbound).mockImplementation(
+        async (req) => {
+          registerCalls += 1;
+          registerKeys.push(req.request_key);
+          const base = await defaultRegister(req);
+          if (registerCalls === 1) {
+            return { ...base, thread_id: null };
+          }
+          return {
+            ...base,
+            existing_status: "streaming" as const,
+            thread_id: THREAD_ID,
+            run_id: RUN_ID,
+            turn_index: 1,
+            fallback_pending: true,
+          };
+        },
+      );
+      vi.mocked(h.backend.createThreadMessages).mockImplementationOnce(
         async () => {
-          await turnErrorGate;
-          throw new Error("unreachable");
+          throw new Error("connection reset before metadata");
         },
       );
 
       await feishuAdapter.receiveRawEvent({
         sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
         message: {
-          message_id: "om_bg_fail_1",
+          message_id: "om_bg_lost_response_1",
           chat_id: "oc_dm_1",
           chat_type: "p2p",
           message_type: "text",
-          content: JSON.stringify({ text: "Trigger turn crash" }),
+          content: JSON.stringify({ text: "Compute valuation" }),
         },
       });
+      await new Promise((r) => setTimeout(r, 50));
 
-      // Reject the detached turn after the inbound callback has already returned
-      rejectTurn(new Error("Unexpected downstream dispatch crash"));
-      await new Promise((r) => setTimeout(r, 25));
+      expect(h.backend.createCalls).toHaveLength(1);
+      const originalKey = h.backend.createCalls[0]!.payload.request_key;
+      expect(registerKeys.length).toBeGreaterThanOrEqual(2);
+      expect(registerKeys[1]).toBe(originalKey);
+      expect(
+        h.backend.progressUpdates.some(
+          (u) =>
+            u.message_id === "om_bg_lost_response_1" &&
+            u.status === "failed" &&
+            u.fallback_pending === false,
+        ),
+      ).toBe(false);
+      expect(
+        h.feishuAdapter.sentTexts.some((t) =>
+          t.text.includes("Replayed assistant output."),
+        ),
+      ).toBe(true);
+      expect(
+        h.backend.progressUpdates.some(
+          (u) =>
+            u.message_id === "om_bg_lost_response_1" &&
+            u.status === "completed" &&
+            u.fallback_pending === false,
+        ),
+      ).toBe(true);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("keeps the inbound row recoverable when the recovery query temporarily fails and a later recovery retrieves the original turn", async () => {
+    const h = createTestHarness();
+    try {
+      const feishuAdapter = new FeishuChannelAdapter({
+        appId: "cli_test_app",
+        appSecret: "sec_test_secret",
+        botOpenId: BOT_OPEN_ID,
+        client: createFakeLarkClient().client,
+      });
+      feishuAdapter.onInboundEvent(async (ev) => {
+        await h.app.orchestrator.handleInboundEvent(ev);
+      });
+
+      const defaultRegister = vi
+        .mocked(h.backend.registerAndResolveInbound)
+        .getMockImplementation()!;
+      let registerCalls = 0;
+      vi.mocked(h.backend.registerAndResolveInbound).mockImplementation(
+        async (req) => {
+          registerCalls += 1;
+          if (registerCalls === 2) {
+            throw new Error("temporary recovery query failure");
+          }
+          const base = await defaultRegister(req);
+          if (registerCalls === 1) {
+            return { ...base, thread_id: null };
+          }
+          return base;
+        },
+      );
+      vi.mocked(h.backend.createThreadMessages).mockImplementationOnce(
+        async () => {
+          throw new Error("connection reset before metadata");
+        },
+      );
+
+      await feishuAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_bg_recovery_transient_1",
+          chat_id: "oc_dm_1",
+          chat_type: "p2p",
+          message_type: "text",
+          content: JSON.stringify({ text: "Compute valuation" }),
+        },
+      });
+      await new Promise((r) => setTimeout(r, 50));
 
       expect(
         h.backend.progressUpdates.some(
           (u) =>
-            u.message_id === "om_bg_fail_1" &&
+            u.message_id === "om_bg_recovery_transient_1" &&
             u.status === "failed" &&
+            u.fallback_pending === false,
+        ),
+      ).toBe(false);
+      expect(
+        h.feishuAdapter.sentTexts.some((t) =>
+          t.text.includes("Replayed assistant output."),
+        ),
+      ).toBe(false);
+
+      const capturedOriginalKey =
+        h.backend.createCalls[0]!.payload.request_key;
+      expect(capturedOriginalKey).toBe(
+        makeInboundRequestKey("feishu", "om_bg_recovery_transient_1"),
+      );
+      if (
+        typeof capturedOriginalKey !== "string" ||
+        capturedOriginalKey.length === 0
+      ) {
+        throw new Error("Expected the accepted creation request key");
+      }
+      const originalKey: string = capturedOriginalKey;
+      vi.mocked(h.backend.recoverState).mockImplementationOnce(async () => ({
+        mode: "startup" as const,
+        inbound_events: [
+          {
+            platform: "feishu" as const,
+            message_id: "om_bg_recovery_transient_1",
+            platform_user_id: "ou_alice",
+            dalton_user_id: USER_ID,
+            chat_type: "dm" as const,
+            chat_address: "feishu:@me",
+            thread_scope_key: "dm:ou_alice",
+            request_key: originalKey,
+            retry_request_key: null,
+            resubmitted_request_key: null,
+            steered_into_run_id: null,
+            thread_id: THREAD_ID,
+            run_id: RUN_ID,
+            turn_index: 1,
+            workspace_id: "99999999-8888-7777-6666-555555555555",
+            external_thread_id: "feishu:dm:ou_alice:gen:1",
+            generation: 1,
+            status: "streaming" as const,
+            fallback_pending: true,
+            sent_to_current_count: 0,
+            uploaded_attachments: [],
+            raw_payload: {
+              platform_user_id: "ou_alice",
+              text: "Compute valuation",
+              chat_id: "oc_dm_1",
+            },
+            pending_interrupt: null,
+          },
+        ],
+        background_runs: [],
+        thread_watches: [],
+        automation_runs: [],
+      }));
+      await h.app.orchestrator.runStartupRecovery();
+
+      expect(
+        h.feishuAdapter.sentTexts.some((t) =>
+          t.text.includes("Replayed assistant output."),
+        ),
+      ).toBe(true);
+      expect(
+        h.backend.progressUpdates.some(
+          (u) =>
+            u.message_id === "om_bg_recovery_transient_1" &&
+            u.status === "completed" &&
             u.fallback_pending === false,
         ),
       ).toBe(true);
@@ -1287,6 +1455,390 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
     expect(received[0]?.text).toBe("hello bot");
 
     await adapter.stop();
+  });
+
+  it("keeps same-conversation arrival order when bot identity lookup is delayed so the message after /workspace uses the new workspace", async () => {
+    const h = createTestHarness();
+    try {
+      const NEW_WS = "99999999-1111-2222-3333-444444444444";
+      const order: string[] = [];
+      let switched = false;
+      const defaultRegister = vi
+        .mocked(h.backend.registerAndResolveInbound)
+        .getMockImplementation()!;
+      vi.mocked(h.backend.registerAndResolveInbound).mockImplementation(
+        async (req) => {
+          order.push(`register:${req.message_id}`);
+          const base = await defaultRegister(req);
+          return switched && req.message_id === "om_order_msg2"
+            ? { ...base, workspace_id: NEW_WS }
+            : base;
+        },
+      );
+      const defaultSession = vi
+        .mocked(h.backend.sessionCommand)
+        .getMockImplementation()!;
+      vi.mocked(h.backend.sessionCommand).mockImplementation(async (req) => {
+        const res = await defaultSession(req);
+        if (req.cmd === "workspace_switch") {
+          switched = true;
+          order.push("workspace_switch");
+        }
+        return res;
+      });
+
+      const probeResolvers: Array<(value: unknown) => void> = [];
+      const { client } = createFakeLarkClient({
+        onRequest: async () =>
+          new Promise<unknown>((resolve) => {
+            probeResolvers.push(resolve);
+          }),
+      });
+      const adapter = new FeishuChannelAdapter({
+        appId: "cli_order_app",
+        appSecret: "sec_order_secret",
+        client,
+        logger: createSubsystemLogger("test", {
+          sink: { info: () => {}, warn: () => {}, error: () => {} },
+        }),
+      });
+      adapter.onInboundEvent(async (ev) => {
+        await h.app.orchestrator.handleInboundEvent(ev);
+      });
+
+      const first = adapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_order_ws1",
+          chat_id: "oc_grp_order",
+          chat_type: "group",
+          message_type: "text",
+          content: JSON.stringify({ text: "/workspace W2" }),
+          mentions: [],
+        },
+      });
+      const second = adapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_order_msg2",
+          chat_id: "oc_grp_order",
+          chat_type: "group",
+          message_type: "text",
+          content: JSON.stringify({ text: "@_user_1 分析这家公司" }),
+          mentions: [
+            {
+              key: "@_user_1",
+              id: { open_id: BOT_OPEN_ID },
+              name: "DaltonBot",
+            },
+          ],
+        },
+      });
+      await new Promise((r) => setTimeout(r, 0));
+      for (const resolveProbe of [...probeResolvers].reverse()) {
+        resolveProbe({
+          code: 0,
+          bot: { open_id: BOT_OPEN_ID, app_name: "DaltonBot" },
+        });
+      }
+      await Promise.all([first, second]);
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(order.indexOf("workspace_switch")).toBeGreaterThanOrEqual(0);
+      expect(order.indexOf("workspace_switch")).toBeLessThan(
+        order.indexOf("register:om_order_msg2"),
+      );
+      expect(
+        h.backend.appendCalls.some((c) => c.payload.workspace_id === NEW_WS),
+      ).toBe(true);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("does not start a model turn for group text that only contains the bot id as plain text", async () => {
+    expect(
+      checkBotMentioned({
+        mentions: [],
+        postMentionedOpenIds: [],
+        rawContent: JSON.stringify({
+          text: "日志中的 @ou_bot 是一个字符串",
+        }),
+        botOpenId: "ou_bot",
+      }),
+    ).toBe(false);
+    expect(
+      checkBotMentioned({
+        mentions: [],
+        postMentionedOpenIds: [],
+        rawContent: JSON.stringify({ text: "日志中的 @ou_bot_other" }),
+        botOpenId: "ou_bot",
+      }),
+    ).toBe(false);
+
+    const parsed = parseFeishuInboundEvent(
+      {
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_plain_bot_id_1",
+          chat_id: "oc_grp_plain",
+          chat_type: "group",
+          message_type: "text",
+          content: JSON.stringify({
+            text: "日志中的 @ou_bot_dalton 是一个字符串",
+          }),
+          mentions: [],
+        },
+      },
+      { botOpenId: BOT_OPEN_ID },
+    );
+    expect(parsed?.isGroupTrigger).toBe(false);
+
+    const h = createTestHarness();
+    try {
+      const adapter = new FeishuChannelAdapter({
+        appId: "cli_test_app",
+        appSecret: "sec_test_secret",
+        botOpenId: BOT_OPEN_ID,
+        client: createFakeLarkClient().client,
+      });
+      adapter.onInboundEvent(async (ev) => {
+        await h.app.orchestrator.handleInboundEvent(ev);
+      });
+      await adapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_plain_bot_id_1",
+          chat_id: "oc_grp_plain",
+          chat_type: "group",
+          message_type: "text",
+          content: JSON.stringify({
+            text: "日志中的 @ou_bot_dalton 是一个字符串",
+          }),
+          mentions: [],
+        },
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(h.backend.appendCalls).toHaveLength(0);
+      expect(h.backend.createCalls).toHaveLength(0);
+      expect(
+        vi
+          .mocked(h.backend.registerAndResolveInbound)
+          .mock.calls.some(([req]) => req.message_id === "om_plain_bot_id_1"),
+      ).toBe(false);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("preserves interactive card title, row arrays, columns and fields in direct and merged-forward messages", () => {
+    const rowCard = JSON.stringify({
+      title: "业绩",
+      elements: [[{ tag: "text", text: "收入增长25%" }]],
+    });
+    const rowText = parseInteractiveCardContent(rowCard);
+    expect(rowText).toContain("业绩");
+    expect(rowText).toContain("收入增长25%");
+
+    const direct = parseFeishuInboundEvent(
+      {
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_card_direct_1",
+          chat_id: "oc_dm_1",
+          chat_type: "p2p",
+          message_type: "interactive",
+          content: rowCard,
+        },
+      },
+      { botOpenId: BOT_OPEN_ID },
+    );
+    expect(direct?.text).toContain("业绩");
+    expect(direct?.text).toContain("收入增长25%");
+
+    const columnCard = JSON.stringify({
+      header: {
+        title: { tag: "plain_text", content: "分栏业绩" },
+      },
+      body: {
+        elements: [
+          {
+            tag: "column_set",
+            columns: [
+              {
+                tag: "column",
+                elements: [
+                  {
+                    tag: "div",
+                    text: { tag: "plain_text", content: "左栏收入" },
+                  },
+                ],
+              },
+              {
+                tag: "column",
+                elements: [
+                  { tag: "markdown", content: "右栏利润" },
+                ],
+              },
+            ],
+          },
+          {
+            tag: "div",
+            fields: [
+              {
+                is_short: true,
+                text: { tag: "lark_md", content: "**收入** 100" },
+              },
+              {
+                is_short: true,
+                text: { tag: "lark_md", content: "**利润** 20" },
+              },
+            ],
+          },
+        ],
+      },
+    });
+    const columnText = parseInteractiveCardContent(columnCard);
+    expect(columnText).toContain("分栏业绩");
+    expect(columnText).toContain("左栏收入");
+    expect(columnText).toContain("右栏利润");
+    expect(columnText).toContain("**收入** 100");
+    expect(columnText).toContain("**利润** 20");
+
+    const merged = parseMergeForwardContent({
+      items: [
+        {
+          msg_type: "interactive",
+          body: { content: rowCard },
+        },
+      ],
+      formatSubMessage: (subType, subBody) =>
+        parseMessageContent(subBody, subType),
+    });
+    expect(merged).toContain("业绩");
+    expect(merged).toContain("收入增长25%");
+  });
+
+  it("extracts top-level post files with deduplication and folder filtering and uploads report.pdf through the workspace path", async () => {
+    const postContent = JSON.stringify({
+      content: [[{ tag: "text", text: "请分析附件" }]],
+      files: [
+        { file_key: "file_abc", file_name: "report.pdf", is_folder: false },
+        { file_key: "file_abc", file_name: "report.pdf", is_folder: false },
+        { file_key: "file_dir", file_name: "folder", is_folder: true },
+      ],
+    });
+    const parsedPost = parsePostContent(postContent);
+    expect(parsedPost.textContent).toContain("请分析附件");
+    expect(parsedPost.files).toEqual([
+      { fileKey: "file_abc", fileName: "report.pdf" },
+    ]);
+    expect(extractInboundAttachments(postContent, "post")).toEqual([
+      { id: "file_abc", filename: "report.pdf", mimeType: "application/pdf" },
+    ]);
+
+    const rawWithFiles = {
+      sender: {
+        sender_id: { open_id: "ou_alice" },
+        sender_type: "user",
+        tenant_key: "t1",
+      },
+      message: {
+        message_id: "om_post_file_key_1",
+        chat_id: "oc_dm_1",
+        chat_type: "p2p",
+        message_type: "post",
+        content: postContent,
+        create_time: "1700000000000",
+      },
+    };
+    const rawWithoutFiles = {
+      ...rawWithFiles,
+      message: {
+        ...rawWithFiles.message,
+        content: JSON.stringify({
+          content: [[{ tag: "text", text: "请分析附件" }]],
+        }),
+      },
+    };
+    expect(resolveFeishuMessageDedupeKey(rawWithFiles)).not.toContain(
+      "file_abc",
+    );
+    expect(resolveFeishuMessageDedupeKey(rawWithoutFiles)).not.toContain(
+      "file_abc",
+    );
+
+    const h = createTestHarness();
+    try {
+      const { client, calls } = createFakeLarkClient({
+        onMessageResourceGet: async () => ({
+          data: Buffer.from("PDF_REPORT_CONTENT", "utf8"),
+          headers: { "content-type": "application/pdf" },
+        }),
+      });
+      const adapter = new FeishuChannelAdapter({
+        appId: "cli_test_app",
+        appSecret: "sec_test_secret",
+        botOpenId: BOT_OPEN_ID,
+        client,
+      });
+      let inboundEventForDownload: InboundChannelEvent | undefined;
+      adapter.onInboundEvent(async (ev) => {
+        inboundEventForDownload = ev;
+        await h.app.orchestrator.handleInboundEvent(ev);
+      });
+      h.feishuAdapter.downloadAttachment = async (descriptor) => {
+        if (!inboundEventForDownload) {
+          throw new Error("Expected the inbound event before download");
+        }
+        return adapter.downloadAttachment(
+          descriptor,
+          inboundEventForDownload,
+        );
+      };
+      await adapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_post_file_1",
+          chat_id: "oc_dm_1",
+          chat_type: "p2p",
+          message_type: "post",
+          content: postContent,
+        },
+      });
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(calls.messageResourceGet).toHaveLength(1);
+      expect(calls.messageResourceGet[0]).toEqual({
+        path: { message_id: "om_post_file_1", file_key: "file_abc" },
+        params: { type: "file" },
+      });
+      const uploadCalls = vi.mocked(h.backend.uploadWorkspaceFile).mock.calls;
+      expect(uploadCalls).toHaveLength(1);
+      expect(uploadCalls[0]?.[0]).toBe(USER_ID);
+      expect(uploadCalls[0]?.[2]).toBe(
+        "uploads/feishu/om_post_file_1/report.pdf",
+      );
+      expect(uploadCalls[0]?.[3]).toBe("report.pdf");
+      expect((uploadCalls[0]?.[4] as Buffer).toString("utf8")).toBe(
+        "PDF_REPORT_CONTENT",
+      );
+      expect(uploadCalls[0]?.[5]).toBe("application/pdf");
+      const appendPayload = h.backend.appendCalls[0]?.payload;
+      const firstContent = appendPayload?.messages[0]?.content;
+      const contentText = Array.isArray(firstContent)
+        ? firstContent
+            .map((item) =>
+              item.type === "text" ? (item.text ?? "") : "",
+            )
+            .join("\n")
+        : String(firstContent ?? "");
+      expect(contentText).toContain(
+        "uploads/feishu/om_post_file_1/report.pdf",
+      );
+    } finally {
+      await h.cleanup();
+    }
   });
 
   it("tracks live WebSocket connection status across reconnecting and reconnected events", async () => {

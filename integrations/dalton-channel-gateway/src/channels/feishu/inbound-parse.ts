@@ -134,12 +134,6 @@ export function checkBotMentioned(params: {
     if (postMentioned.includes(botId)) {
       return true;
     }
-    if (
-      typeof params.rawContent === "string" &&
-      params.rawContent.includes(`@${botId}`)
-    ) {
-      return true;
-    }
     return false;
   }
 
@@ -335,6 +329,17 @@ export function extractInboundAttachments(
         id: media.fileKey,
         filename: media.fileName || `media_${idx + 1}.mp4`,
         mimeType: "video/mp4",
+      });
+    }
+    for (let idx = 0; idx < post.files.length; idx += 1) {
+      const file = post.files[idx]!;
+      const filename = file.fileName || `${file.fileKey}.bin`;
+      descriptors.push({
+        id: file.fileKey,
+        filename,
+        mimeType: filename.toLowerCase().endsWith(".pdf")
+          ? "application/pdf"
+          : "application/octet-stream",
       });
     }
     return descriptors;

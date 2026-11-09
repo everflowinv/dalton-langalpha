@@ -700,6 +700,7 @@ function sanitizeFenceLanguage(lang: string): string {
 function resolvePostPayload(content: string): {
   title: string;
   paragraphs: unknown[];
+  files: unknown[];
 } | null {
   try {
     const parsed = JSON.parse(content);
@@ -717,9 +718,17 @@ function resolvePostPayload(content: string): {
     if (!isRecord(candidate)) {
       return null;
     }
+    const files: unknown[] = [];
+    if (Array.isArray(candidate.files)) {
+      files.push(...candidate.files);
+    }
+    if (candidate !== parsed && Array.isArray(parsed.files)) {
+      files.push(...parsed.files);
+    }
     return {
       title: typeof candidate.title === "string" ? candidate.title : "",
       paragraphs: Array.isArray(candidate.content) ? candidate.content : [],
+      files,
     };
   } catch {
     return null;
@@ -730,6 +739,7 @@ export interface ParsedPostContent {
   textContent: string;
   imageKeys: string[];
   mediaKeys: Array<{ fileKey: string; fileName?: string }>;
+  files: Array<{ fileKey: string; fileName?: string }>;
   mentionedOpenIds: string[];
 }
 
@@ -833,12 +843,32 @@ export function renderPostContent(content: string): ParsedPostContent | null {
     paragraphLines.push(line.trim());
   }
 
+  const files: Array<{ fileKey: string; fileName?: string }> = [];
+  const seenFileKeys = new Set(mediaKeys.map((media) => media.fileKey));
+  for (const entry of resolved.files) {
+    if (!isRecord(entry) || entry.is_folder === true) {
+      continue;
+    }
+    const fileKey =
+      typeof entry.file_key === "string" ? entry.file_key.trim() : "";
+    if (!fileKey || seenFileKeys.has(fileKey)) {
+      continue;
+    }
+    seenFileKeys.add(fileKey);
+    const fileName =
+      typeof entry.file_name === "string" && entry.file_name
+        ? entry.file_name
+        : undefined;
+    files.push({ fileKey, ...(fileName ? { fileName } : {}) });
+  }
+
   const title = resolved.title.trim();
   const body = paragraphLines.filter((row) => row.length > 0).join("\n");
   return {
     textContent: [title, body].filter(Boolean).join("\n\n").trim(),
     imageKeys,
     mediaKeys,
+    files,
     mentionedOpenIds,
   };
 }
@@ -852,49 +882,267 @@ export function parsePostContent(content: string): ParsedPostContent {
     textContent: "[Rich text message]",
     imageKeys: [],
     mediaKeys: [],
+    files: [],
     mentionedOpenIds: [],
   };
 }
 
+function normalizeCardTemplateVariable(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (
+    typeof value === "number" ||
+    typeof value === "boolean" ||
+    typeof value === "bigint"
+  ) {
+    return String(value);
+  }
+  return undefined;
+}
+
+function readCardTemplateVariables(
+  parsed: Record<string, unknown>,
+): Map<string, string> {
+  const variables = new Map<string, string>();
+  for (const source of [parsed.template_variable, parsed.template_variables]) {
+    if (!isRecord(source)) {
+      continue;
+    }
+    for (const [key, value] of Object.entries(source)) {
+      const normalized = normalizeCardTemplateVariable(value);
+      if (normalized !== undefined) {
+        variables.set(key, normalized);
+      }
+    }
+  }
+  return variables;
+}
+
+function applyCardTemplateVariables(
+  text: string,
+  variables: Map<string, string>,
+): string {
+  if (variables.size === 0) {
+    return text;
+  }
+  return text.replace(
+    /\$\{([A-Za-z0-9_.-]+)\}|\{\{\s*([A-Za-z0-9_.-]+)\s*\}\}/g,
+    (match, a: string | undefined, b: string | undefined) => {
+      const name = typeof a === "string" ? a : b;
+      return (name ? variables.get(name) : undefined) ?? match;
+    },
+  );
+}
+
+function normalizeInteractiveValue(
+  value: unknown,
+  variables: Map<string, string>,
+): string {
+  const scalar = normalizeCardTemplateVariable(value);
+  if (scalar !== undefined) {
+    return applyCardTemplateVariables(scalar, variables);
+  }
+  if (Array.isArray(value)) {
+    return value
+      .map((entry) => normalizeInteractiveValue(entry, variables))
+      .filter(Boolean)
+      .join(", ");
+  }
+  if (!isRecord(value)) {
+    return "";
+  }
+  for (const key of [
+    "content",
+    "text",
+    "label",
+    "name",
+    "display_name",
+    "user_name",
+    "user_id",
+    "open_id",
+    "id",
+    "value",
+  ]) {
+    const text = normalizeInteractiveValue(value[key], variables);
+    if (text) {
+      return text;
+    }
+  }
+  return "";
+}
+
+function extractInteractiveTableText(
+  element: Record<string, unknown>,
+  variables: Map<string, string>,
+): string | undefined {
+  if (!Array.isArray(element.columns) || !Array.isArray(element.rows)) {
+    return undefined;
+  }
+  const columns: Array<{ name: string; title: string }> = [];
+  for (const column of element.columns) {
+    if (!isRecord(column) || typeof column.name !== "string") {
+      continue;
+    }
+    columns.push({
+      name: column.name,
+      title:
+        typeof column.display_name === "string"
+          ? column.display_name
+          : column.name,
+    });
+  }
+  if (columns.length === 0) {
+    return undefined;
+  }
+  const lines = [
+    columns
+      .map((column) => applyCardTemplateVariables(column.title, variables))
+      .join(" | "),
+  ];
+  for (const row of element.rows) {
+    if (!isRecord(row)) {
+      continue;
+    }
+    const cells = columns.map((column) =>
+      normalizeInteractiveValue(row[column.name], variables),
+    );
+    if (cells.some(Boolean)) {
+      lines.push(cells.join(" | "));
+    }
+  }
+  return lines.join("\n");
+}
+
+function extractInteractiveElementText(
+  element: unknown,
+  variables: Map<string, string>,
+): string | undefined {
+  if (!isRecord(element)) {
+    return undefined;
+  }
+  const tag = typeof element.tag === "string" ? element.tag : "";
+  const text = isRecord(element.text) ? element.text : undefined;
+  if (tag === "div") {
+    const parts = [normalizeInteractiveValue(element.text, variables)];
+    if (Array.isArray(element.fields)) {
+      parts.push(extractInteractiveElementsText(element.fields, variables));
+    }
+    return parts.filter(Boolean).join("\n") || undefined;
+  }
+  if (
+    (tag === "markdown" || tag === "lark_md" || tag === "plain_text") &&
+    typeof element.content === "string"
+  ) {
+    return applyCardTemplateVariables(element.content, variables);
+  }
+  if ((tag === "text" || tag === "a" || tag === "button") && element.text !== undefined) {
+    return normalizeInteractiveValue(element.text, variables) || undefined;
+  }
+  if (tag === "at") {
+    const mention = normalizeInteractiveValue(
+      element.user_name ?? element.user_id,
+      variables,
+    );
+    return mention
+      ? mention.startsWith("@")
+        ? mention
+        : `@${mention}`
+      : undefined;
+  }
+  if (tag === "table") {
+    return extractInteractiveTableText(element, variables);
+  }
+  if (tag === "hr") {
+    return "---";
+  }
+  const nested = [
+    element.elements,
+    element.columns,
+    element.children,
+    element.fields,
+    element.actions,
+  ]
+    .filter(Array.isArray)
+    .map((children) => extractInteractiveElementsText(children, variables))
+    .filter(Boolean)
+    .join("\n");
+  return nested || (typeof text?.content === "string" ? text.content : undefined);
+}
+
+function extractInteractiveElementsText(
+  elements: unknown[],
+  variables: Map<string, string>,
+): string {
+  const texts: string[] = [];
+  for (const element of elements) {
+    if (Array.isArray(element)) {
+      const row = element
+        .map((part) => extractInteractiveElementText(part, variables))
+        .filter((part): part is string => Boolean(part))
+        .join(" ")
+        .trim();
+      if (row) {
+        texts.push(row);
+      }
+      continue;
+    }
+    const text = extractInteractiveElementText(element, variables);
+    if (text !== undefined) {
+      texts.push(text);
+    }
+  }
+  return texts.join("\n").trim();
+}
+
 export function parseInteractiveCardContent(content: string): string {
   try {
-    const parsed = JSON.parse(content);
+    const parsed = JSON.parse(content) as unknown;
     if (!isRecord(parsed)) {
       return "[Interactive card]";
     }
-    const texts: string[] = [];
-
-    const header = isRecord(parsed.header) ? parsed.header : undefined;
-    const headerTitle = isRecord(header?.title) ? header.title : undefined;
-    if (typeof headerTitle?.content === "string" && headerTitle.content.trim()) {
-      texts.push(headerTitle.content.trim());
+    const variables = readCardTemplateVariables(parsed);
+    let title = "";
+    if (typeof parsed.title === "string") {
+      title = applyCardTemplateVariables(parsed.title, variables).trim();
+    } else {
+      const header = isRecord(parsed.header) ? parsed.header : undefined;
+      const headerTitle = isRecord(header?.title) ? header.title : undefined;
+      if (typeof headerTitle?.content === "string") {
+        title = applyCardTemplateVariables(
+          headerTitle.content,
+          variables,
+        ).trim();
+      }
     }
-
-    const extractElements = (elements: unknown[]): void => {
-      for (const el of elements) {
-        if (!isRecord(el)) {
-          continue;
-        }
-        if (el.tag === "div" && isRecord(el.text) && typeof el.text.content === "string") {
-          texts.push(el.text.content);
-        } else if (el.tag === "markdown" && typeof el.content === "string") {
-          texts.push(el.content);
-        } else if (el.tag === "hr") {
-          texts.push("---");
-        } else if (Array.isArray(el.elements)) {
-          extractElements(el.elements);
+    const body = isRecord(parsed.body) ? parsed.body : undefined;
+    const elementArrays: unknown[][] = [];
+    if (Array.isArray(parsed.elements)) {
+      elementArrays.push(parsed.elements);
+    }
+    if (Array.isArray(body?.elements)) {
+      elementArrays.push(body.elements);
+    }
+    for (const candidate of [parsed.i18n_elements, body?.i18n_elements]) {
+      if (isRecord(candidate)) {
+        for (const value of Object.values(candidate)) {
+          if (Array.isArray(value)) {
+            elementArrays.push(value);
+          }
         }
       }
-    };
-
-    const body = isRecord(parsed.body) ? parsed.body : undefined;
-    if (Array.isArray(body?.elements)) {
-      extractElements(body.elements);
-    } else if (Array.isArray(parsed.elements)) {
-      extractElements(parsed.elements);
     }
-
-    return texts.filter(Boolean).join("\n").trim() || "[Interactive card]";
+    for (const elements of elementArrays) {
+      const text = extractInteractiveElementsText(elements, variables);
+      if (text) {
+        return title ? `${title}\n${text}` : text;
+      }
+    }
+    const postText = parsePostContent(content).textContent.trim();
+    if (postText && postText !== "[Rich text message]") {
+      return postText;
+    }
+    return title || "[Interactive card]";
   } catch {
     return "[Interactive card]";
   }

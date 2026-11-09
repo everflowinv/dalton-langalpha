@@ -71,6 +71,7 @@ import {
   sendStructuredCardFeishu,
 } from "./send.js";
 import {
+  buildDaltonFeishuThreadScopeKey,
   normalizeFeishuTarget,
   resolveDaltonOutboundTarget,
   stripFeishuProviderPrefix,
@@ -134,6 +135,46 @@ function extractRawMessageMeta(rawPayload: unknown): {
   return { chatType, messageType };
 }
 
+function extractRawQueueKey(rawPayload: unknown): string {
+  if (!isRecord(rawPayload)) {
+    return "__default__";
+  }
+  const eventObj = isRecord(rawPayload.event) ? rawPayload.event : rawPayload;
+  const messageObj = isRecord(eventObj.message) ? eventObj.message : undefined;
+  const senderObj = isRecord(eventObj.sender) ? eventObj.sender : undefined;
+  const senderIdObj = isRecord(senderObj?.sender_id)
+    ? senderObj.sender_id
+    : undefined;
+  const chatId =
+    typeof messageObj?.chat_id === "string" ? messageObj.chat_id.trim() : "";
+  const senderOpenId =
+    (typeof senderIdObj?.open_id === "string" && senderIdObj.open_id.trim()) ||
+    (typeof senderIdObj?.user_id === "string" && senderIdObj.user_id.trim()) ||
+    "";
+  const messageId =
+    typeof messageObj?.message_id === "string"
+      ? messageObj.message_id.trim()
+      : "";
+  if (!chatId || !senderOpenId) {
+    return messageId ? `raw:${messageId}` : "__default__";
+  }
+  const rawChatType =
+    typeof messageObj?.chat_type === "string"
+      ? messageObj.chat_type.trim().toLowerCase()
+      : "p2p";
+  const threadId =
+    typeof messageObj?.thread_id === "string" ? messageObj.thread_id : undefined;
+  return buildDaltonFeishuThreadScopeKey({
+    chatType:
+      rawChatType === "p2p" || rawChatType === "private" || rawChatType === "dm"
+        ? "p2p"
+        : "group",
+    chatId,
+    senderOpenId,
+    threadId,
+  });
+}
+
 export async function monitorWebSocket(
   options: MonitorFeishuWebSocketOptions,
 ): Promise<MonitorFeishuWebSocketHandle> {
@@ -181,25 +222,24 @@ export async function monitorWebSocket(
       return;
     }
 
-    const { chatType, messageType } = extractRawMessageMeta(rawPayload);
-    const isGroupChat =
-      chatType !== undefined &&
-      chatType !== "p2p" &&
-      chatType !== "private" &&
-      chatType !== "dm";
-    if (!currentBotOpenId && isGroupChat && options.resolveBotOpenId) {
-      currentBotOpenId = await options.resolveBotOpenId();
-    }
-
-    const parsed = parseFeishuInboundEvent(rawPayload, {
-      botOpenId: currentBotOpenId,
-    });
-    if (!parsed) {
-      return;
-    }
-
-    await queue.enqueue(parsed.threadScopeKey, async () => {
+    const queueKey = extractRawQueueKey(rawPayload);
+    await queue.enqueue(queueKey, async () => {
       if (dedupeKey && dedupe.peek(dedupeKey)) {
+        return;
+      }
+      const { chatType, messageType } = extractRawMessageMeta(rawPayload);
+      const isGroupChat =
+        chatType !== undefined &&
+        chatType !== "p2p" &&
+        chatType !== "private" &&
+        chatType !== "dm";
+      if (!currentBotOpenId && isGroupChat && options.resolveBotOpenId) {
+        currentBotOpenId = await options.resolveBotOpenId();
+      }
+      const parsed = parseFeishuInboundEvent(rawPayload, {
+        botOpenId: currentBotOpenId,
+      });
+      if (!parsed) {
         return;
       }
       if (
@@ -467,25 +507,24 @@ export class FeishuChannelAdapter implements ChannelAdapter {
       return;
     }
 
-    const { chatType, messageType } = extractRawMessageMeta(rawPayload);
-    const isGroupChat =
-      chatType !== undefined &&
-      chatType !== "p2p" &&
-      chatType !== "private" &&
-      chatType !== "dm";
-    if (!this.botOpenId && isGroupChat) {
-      await this.ensureBotOpenId();
-    }
-
-    const parsed = parseFeishuInboundEvent(rawPayload, {
-      botOpenId: this.botOpenId,
-    });
-    if (!parsed) {
-      return;
-    }
-
-    await this.queue.enqueue(parsed.threadScopeKey, async () => {
+    const queueKey = extractRawQueueKey(rawPayload);
+    await this.queue.enqueue(queueKey, async () => {
       if (dedupeKey && this.dedupe.peek(dedupeKey)) {
+        return;
+      }
+      const { chatType, messageType } = extractRawMessageMeta(rawPayload);
+      const isGroupChat =
+        chatType !== undefined &&
+        chatType !== "p2p" &&
+        chatType !== "private" &&
+        chatType !== "dm";
+      if (!this.botOpenId && isGroupChat) {
+        await this.ensureBotOpenId();
+      }
+      const parsed = parseFeishuInboundEvent(rawPayload, {
+        botOpenId: this.botOpenId,
+      });
+      if (!parsed) {
         return;
       }
       if (
