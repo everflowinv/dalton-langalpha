@@ -1305,7 +1305,13 @@ def test_evaluators_registry_and_t5_t18(tmp_path: Path) -> None:
 async def test_data_jobs_switch_default_off_does_not_start_scheduler(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("DALTON_DATA_JOBS_ENABLED", raising=False)
+    from src.dalton.settings import DaltonDataJobsConfig
+
+    # The model defaults to off; the shipped dalton.yaml turns the loop on at
+    # the OC-1 cutover (per-task switches still start disabled). Switch it off
+    # explicitly to pin the "off means no loop, no containers" contract.
+    assert DaltonDataJobsConfig().enabled is False
+    monkeypatch.setenv("DALTON_DATA_JOBS_ENABLED", "0")
     get_dalton_config.cache_clear()
 
     assert is_data_jobs_enabled() is False

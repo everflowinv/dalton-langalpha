@@ -34,7 +34,9 @@ coverage_units:
 
 # OC-1 确定性数据任务层（d029）。默认关闭：关闭时不启动调度循环、不建任何容器。
 data_jobs:
-  enabled: false
+  # OC-1 cutover (11-08): the scheduler loop runs; each task still has its
+  # own switch (dalton_data_task_defs.enabled) and starts disabled.
+  enabled: true
   min_free_mem_mb: 1280
 
 network:
