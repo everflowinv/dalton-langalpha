@@ -356,7 +356,7 @@ async def test_real_postgres_data_jobs_end_to_end(
         assert claimed_host.run_id == host_run_id
         assert claimed_host.job_key == "bbg-data-pull-us"
         assert claimed_host.runner == "host"
-        assert claimed_host.host_mode == "mirror"
+        assert claimed_host.host_mode == "run"
         assert claimed_host.generation == 1
 
         host_client = create_autospec(DataTaskHostBridgeClient, instance=True)
