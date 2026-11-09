@@ -37,6 +37,7 @@ import {
   PUBLIC_REPLAY_NEEDED_STATUSES,
   type UploadedAttachmentRecord,
 } from "./types.js";
+import { SafeFetchError } from "./shared/safe-fetch.js";
 import {
   makeCreditSupplementSteerKey,
   makeInboundRequestKey,
@@ -141,16 +142,16 @@ export class ChannelGatewayOrchestrator {
   // =========================================================================
 
   async handleInboundEvent(event: InboundChannelEvent): Promise<void> {
-    // Group chats require explicit trigger (@bot or slash command)
-    if (event.chatType === "group" && event.isGroupTrigger === false) {
+    // Group chats require an explicit bot mention trigger
+    if (event.chatType === "group" && event.isGroupTrigger !== true) {
       return;
     }
 
-    const trimmedText = (event.text ?? "").trim();
+    const commandText = (event.commandText ?? event.text ?? "").trim();
 
     // Check for slash commands (§3.3): /bind, /unbind, /workspace, /new, /stop
-    if (trimmedText.startsWith("/")) {
-      const handled = await this.tryHandleSlashCommand(event, trimmedText);
+    if (commandText.startsWith("/")) {
+      const handled = await this.tryHandleSlashCommand(event, commandText);
       if (handled) {
         return;
       }
@@ -744,7 +745,9 @@ export class ChannelGatewayOrchestrator {
       event.messageId.replace(/[^a-zA-Z0-9._-]/g, "_") || "message";
     const remainingDescriptors = descriptors.slice(uploaded.length);
 
-    for (const desc of remainingDescriptors) {
+    for (let remainingIndex = 0; remainingIndex < remainingDescriptors.length; remainingIndex += 1) {
+      const desc = remainingDescriptors[remainingIndex]!;
+      const descriptorIndex = alreadyUploaded.length + remainingIndex;
       if (desc.sizeBytes !== undefined && desc.sizeBytes > MAX_ATTACHMENT_BYTES) {
         return {
           ok: false,
@@ -752,7 +755,18 @@ export class ChannelGatewayOrchestrator {
         };
       }
 
-      const downloaded = await adapter.downloadAttachment(desc, event);
+      let downloaded: Awaited<ReturnType<typeof adapter.downloadAttachment>>;
+      try {
+        downloaded = await adapter.downloadAttachment(desc, event);
+      } catch (err) {
+        if (err instanceof SafeFetchError && err.code === "size_exceeded") {
+          return {
+            ok: false,
+            errorMessage: `Attachment "${desc.filename}" exceeds the 20 MB per-file limit.`,
+          };
+        }
+        throw err;
+      }
       const byteLength = downloaded.content.byteLength;
       if (byteLength > MAX_ATTACHMENT_BYTES) {
         return {
@@ -773,7 +787,17 @@ export class ChannelGatewayOrchestrator {
         downloaded.filename || desc.filename || "attachment",
       );
       // Upload to non-restricted `uploads/...` path (`_is_non_owner_blocked_path` blocks `.agents/` for non-owners)
-      const workspacePath = `uploads/${event.platform}/${safeMsgId}/${safeFilename}`;
+      let workspacePath = `uploads/${event.platform}/${safeMsgId}/${safeFilename}`;
+      if (uploaded.some((record) => record.workspace_path === workspacePath)) {
+        let suffix = descriptorIndex + 1;
+        workspacePath = `uploads/${event.platform}/${safeMsgId}/${suffix}-${safeFilename}`;
+        while (
+          uploaded.some((record) => record.workspace_path === workspacePath)
+        ) {
+          suffix += 1;
+          workspacePath = `uploads/${event.platform}/${safeMsgId}/${suffix}-${safeFilename}`;
+        }
+      }
 
       await this.backend.uploadWorkspaceFile(
         userId,

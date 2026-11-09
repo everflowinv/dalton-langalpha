@@ -510,6 +510,13 @@ export function chunkFeishuMarkdownByEnvelope(
     if (splitAt > 1 && prevCode >= 0xd800 && prevCode <= 0xdbff) {
       splitAt -= 1;
     }
+    while (splitAt > 1 && !options.fits(segment.slice(0, splitAt))) {
+      splitAt -= 1;
+      const code = segment.charCodeAt(splitAt - 1);
+      if (splitAt > 1 && code >= 0xd800 && code <= 0xdbff) {
+        splitAt -= 1;
+      }
+    }
     const head = segment.slice(0, splitAt);
     const tail = segment.slice(splitAt);
     return [head, ...(tail ? splitOversizedSegment(tail) : [])];
@@ -635,8 +642,10 @@ export function chunkFeishuCardMarkdown(
 
 /**
  * High-level outbound text chunker for `FeishuChannelAdapter.splitTextChunks`.
- * Uses Schema 2.0 card chunking when `shouldUseFeishuCard(text)` is true,
- * or rich-text `post` chunking otherwise.
+ * Initial chunking uses Schema 2.0 card rules when `shouldUseFeishuCard(text)` is
+ * true or rich-text `post` rules otherwise, then verifies and re-chunks each
+ * resulting piece in the final format (`card` vs `post`) that `sendTextChunk`
+ * will select for that piece so no chunk exceeds its serialized byte envelope.
  */
 export function chunkFeishuOutboundText(
   text: string,
@@ -648,16 +657,57 @@ export function chunkFeishuOutboundText(
   if (!text) {
     return [];
   }
-  if (shouldUseFeishuCard(text)) {
-    return chunkFeishuCardMarkdown(text, {
-      maxBytes: options?.maxBytes ?? FEISHU_CARD_MAX_BYTES,
-      maxTables: options?.maxTables ?? FEISHU_CARD_TABLE_LIMIT,
-    });
-  }
-  return chunkFeishuPostMarkdown(
-    text,
-    options?.maxBytes ?? FEISHU_POST_MAX_BYTES,
-  );
+  const maxTables = options?.maxTables ?? FEISHU_CARD_TABLE_LIMIT;
+  const cardMaxBytes = options?.maxBytes ?? FEISHU_CARD_MAX_BYTES;
+  const postMaxBytes = options?.maxBytes ?? FEISHU_POST_MAX_BYTES;
+
+  const initialChunks = shouldUseFeishuCard(text)
+    ? chunkFeishuCardMarkdown(text, {
+        maxBytes: cardMaxBytes,
+        maxTables,
+      })
+    : chunkFeishuPostMarkdown(text, postMaxBytes);
+
+  const finalizeChunk = (chunk: string): string[] => {
+    if (!chunk) {
+      return [];
+    }
+    if (shouldUseFeishuCard(chunk)) {
+      const card = buildStructuredCard(chunk);
+      if (
+        isFeishuCardWithinEnvelope(card, {
+          maxBytes: cardMaxBytes,
+          maxElements: FEISHU_CARD_MAX_ELEMENTS,
+        }) &&
+        feishuCardWithinTableLimit(card, maxTables)
+      ) {
+        return [chunk];
+      }
+      const subChunks = chunkFeishuCardMarkdown(chunk, {
+        maxBytes: cardMaxBytes,
+        maxTables,
+      });
+      if (subChunks.length === 1 && subChunks[0] === chunk) {
+        return subChunks;
+      }
+      return subChunks.flatMap(finalizeChunk);
+    }
+
+    const postBytes = Buffer.byteLength(
+      buildFeishuPostMessageContent({ messageText: chunk }),
+      "utf8",
+    );
+    if (postBytes <= postMaxBytes) {
+      return [chunk];
+    }
+    const subChunks = chunkFeishuPostMarkdown(chunk, postMaxBytes);
+    if (subChunks.length === 1 && subChunks[0] === chunk) {
+      return subChunks;
+    }
+    return subChunks.flatMap(finalizeChunk);
+  };
+
+  return initialChunks.flatMap(finalizeChunk);
 }
 
 // --- Inbound Post, Interactive Card, and Merge-Forward Parsers ---
@@ -756,27 +806,34 @@ function resolvePostPayload(content: string): PostPayload | null {
 
 export interface ParsedPostContent {
   textContent: string;
+  commandText?: string;
   imageKeys: string[];
   mediaKeys: Array<{ fileKey: string; fileName?: string }>;
   files: Array<{ fileKey: string; fileName?: string }>;
   mentionedOpenIds: string[];
 }
 
-export function renderPostContent(content: string): ParsedPostContent | null {
+export function renderPostContent(
+  content: string,
+  botOpenId?: string,
+): ParsedPostContent | null {
   const resolved = resolvePostPayload(content);
   if (!resolved) {
     return null;
   }
+  const normalizedBotId = botOpenId?.trim() ?? "";
   const imageKeys: string[] = [];
   const mediaKeys: Array<{ fileKey: string; fileName?: string }> = [];
   const mentionedOpenIds: string[] = [];
   const paragraphLines: string[] = [];
+  const rawParagraphLines: string[] = [];
 
   for (const paragraph of resolved.paragraphs) {
     if (!Array.isArray(paragraph)) {
       continue;
     }
     let line = "";
+    let rawLine = "";
     for (const rawEl of paragraph) {
       if (!isRecord(rawEl)) {
         continue;
@@ -787,6 +844,7 @@ export function renderPostContent(content: string): ParsedPostContent | null {
         line += toBoolean(rawEl.un_escape)
           ? wrapStyle(text, rawEl.style)
           : wrapStyle(escapeMarkdownText(text), rawEl.style);
+        rawLine += text;
         continue;
       }
       if (tag === "a") {
@@ -799,24 +857,33 @@ export function renderPostContent(content: string): ParsedPostContent | null {
         const href = typeof rawEl.href === "string" ? rawEl.href.trim() : "";
         const styled = wrapStyle(escapeMarkdownText(text), rawEl.style);
         line += href ? `[${styled}](${href})` : styled;
+        rawLine += text;
         continue;
       }
       if (tag === "at") {
-        const userId = typeof rawEl.user_id === "string" ? rawEl.user_id.trim() : "";
+        const userId =
+          (typeof rawEl.user_id === "string" && rawEl.user_id.trim()) ||
+          (typeof rawEl.open_id === "string" && rawEl.open_id.trim()) ||
+          "";
         if (userId) {
           mentionedOpenIds.push(userId);
+        }
+        if (normalizedBotId && userId === normalizedBotId) {
+          continue;
         }
         const userName =
           typeof rawEl.user_name === "string" && rawEl.user_name
             ? rawEl.user_name
             : userId;
         line += wrapStyle(`@${escapeMarkdownText(userName)}`, rawEl.style);
+        rawLine += `@${userName}`;
         continue;
       }
       if (tag === "img") {
         if (typeof rawEl.image_key === "string" && rawEl.image_key) {
           imageKeys.push(rawEl.image_key);
           line += "![image]";
+          rawLine += "![image]";
         }
         continue;
       }
@@ -827,7 +894,9 @@ export function renderPostContent(content: string): ParsedPostContent | null {
               ? rawEl.file_name
               : undefined;
           mediaKeys.push({ fileKey: rawEl.file_key, fileName });
-          line += fileName ? `[media: ${fileName}]` : "[media]";
+          const label = fileName ? `[media: ${fileName}]` : "[media]";
+          line += label;
+          rawLine += label;
         }
         continue;
       }
@@ -840,15 +909,20 @@ export function renderPostContent(content: string): ParsedPostContent | null {
           "\n",
         );
         const trailingNewline = code.endsWith("\n") ? "" : "\n";
-        line += `\n\`\`\`${lang}\n${code}${trailingNewline}\`\`\`\n`;
+        const fenced = `\n\`\`\`${lang}\n${code}${trailingNewline}\`\`\`\n`;
+        line += fenced;
+        rawLine += fenced;
         continue;
       }
       if (tag === "hr") {
         line += "\n---\n";
+        rawLine += "\n---\n";
         continue;
       }
       if (tag === "md") {
-        line += typeof rawEl.text === "string" ? rawEl.text : "";
+        const mdText = typeof rawEl.text === "string" ? rawEl.text : "";
+        line += mdText;
+        rawLine += mdText;
         continue;
       }
       if (tag === "emotion") {
@@ -856,10 +930,13 @@ export function renderPostContent(content: string): ParsedPostContent | null {
           typeof rawEl.emoji_type === "string" && rawEl.emoji_type
             ? rawEl.emoji_type
             : "emoji";
-        line += `:${emojiType}:`;
+        const token = `:${emojiType}:`;
+        line += token;
+        rawLine += token;
       }
     }
     paragraphLines.push(line.trim());
+    rawParagraphLines.push(rawLine.trim());
   }
 
   const files: Array<{ fileKey: string; fileName?: string }> = [];
@@ -883,8 +960,10 @@ export function renderPostContent(content: string): ParsedPostContent | null {
 
   const title = resolved.title.trim();
   const body = paragraphLines.filter((row) => row.length > 0).join("\n");
+  const rawBody = rawParagraphLines.filter((row) => row.length > 0).join("\n");
   return {
     textContent: [title, body].filter(Boolean).join("\n\n").trim(),
+    commandText: [title, rawBody].filter(Boolean).join("\n\n").trim(),
     imageKeys,
     mediaKeys,
     files,
@@ -892,13 +971,17 @@ export function renderPostContent(content: string): ParsedPostContent | null {
   };
 }
 
-export function parsePostContent(content: string): ParsedPostContent {
-  const rendered = renderPostContent(content);
+export function parsePostContent(
+  content: string,
+  botOpenId?: string,
+): ParsedPostContent {
+  const rendered = renderPostContent(content, botOpenId);
   if (rendered) {
     return rendered;
   }
   return {
     textContent: "[Rich text message]",
+    commandText: "",
     imageKeys: [],
     mediaKeys: [],
     files: [],
@@ -1036,6 +1119,7 @@ function extractInteractiveTableText(
 function extractInteractiveElementText(
   element: unknown,
   variables: Map<string, string>,
+  normalizedBotId = "",
 ): string | undefined {
   if (!isRecord(element)) {
     return undefined;
@@ -1045,7 +1129,13 @@ function extractInteractiveElementText(
   if (tag === "div") {
     const parts = [normalizeInteractiveValue(element.text, variables)];
     if (Array.isArray(element.fields)) {
-      parts.push(extractInteractiveElementsText(element.fields, variables));
+      parts.push(
+        extractInteractiveElementsText(
+          element.fields,
+          variables,
+          normalizedBotId,
+        ),
+      );
     }
     return parts.filter(Boolean).join("\n") || undefined;
   }
@@ -1059,8 +1149,18 @@ function extractInteractiveElementText(
     return normalizeInteractiveValue(element.text, variables) || undefined;
   }
   if (tag === "at") {
+    const rawUserId =
+      (typeof element.user_id === "string" && element.user_id.trim()) ||
+      (typeof element.open_id === "string" && element.open_id.trim()) ||
+      "";
+    const resolvedUserId = rawUserId
+      ? applyCardTemplateVariables(rawUserId, variables).trim()
+      : "";
+    if (normalizedBotId && resolvedUserId === normalizedBotId) {
+      return undefined;
+    }
     const mention = normalizeInteractiveValue(
-      element.user_name ?? element.user_id,
+      element.user_name ?? element.user_id ?? element.open_id,
       variables,
     );
     return mention
@@ -1083,7 +1183,9 @@ function extractInteractiveElementText(
     element.actions,
   ]
     .filter(Array.isArray)
-    .map((children) => extractInteractiveElementsText(children, variables))
+    .map((children) =>
+      extractInteractiveElementsText(children, variables, normalizedBotId),
+    )
     .filter(Boolean)
     .join("\n");
   return nested || (typeof text?.content === "string" ? text.content : undefined);
@@ -1092,13 +1194,18 @@ function extractInteractiveElementText(
 function extractInteractiveElementsText(
   elements: unknown[],
   variables: Map<string, string>,
+  normalizedBotId = "",
 ): string {
   const texts: string[] = [];
   for (const element of elements) {
     if (Array.isArray(element)) {
       const row = element
-        .map((part) => extractInteractiveElementText(part, variables))
+        .map((part) =>
+          extractInteractiveElementText(part, variables, normalizedBotId),
+        )
         .filter((part): part is string => Boolean(part))
+        .map((part) => part.trim())
+        .filter(Boolean)
         .join(" ")
         .trim();
       if (row) {
@@ -1106,7 +1213,11 @@ function extractInteractiveElementsText(
       }
       continue;
     }
-    const text = extractInteractiveElementText(element, variables);
+    const text = extractInteractiveElementText(
+      element,
+      variables,
+      normalizedBotId,
+    );
     if (text !== undefined) {
       texts.push(text);
     }
@@ -1114,12 +1225,16 @@ function extractInteractiveElementsText(
   return texts.join("\n").trim();
 }
 
-export function parseInteractiveCardContent(content: string): string {
+export function parseInteractiveCardContent(
+  content: string,
+  botOpenId?: string,
+): string {
   try {
     const parsed = JSON.parse(content) as unknown;
     if (!isRecord(parsed)) {
       return "[Interactive card]";
     }
+    const normalizedBotId = botOpenId?.trim() ?? "";
     const variables = readCardTemplateVariables(parsed);
     let title = "";
     if (typeof parsed.title === "string") {
@@ -1152,12 +1267,16 @@ export function parseInteractiveCardContent(content: string): string {
       }
     }
     for (const elements of elementArrays) {
-      const text = extractInteractiveElementsText(elements, variables);
+      const text = extractInteractiveElementsText(
+        elements,
+        variables,
+        normalizedBotId,
+      );
       if (text) {
         return title ? `${title}\n${text}` : text;
       }
     }
-    const postText = parsePostContent(content).textContent.trim();
+    const postText = parsePostContent(content, botOpenId).textContent.trim();
     if (postText && postText !== "[Rich text message]") {
       return postText;
     }

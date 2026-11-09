@@ -20,6 +20,7 @@ import {
   FEISHU_CARD_TABLE_LIMIT,
   FEISHU_POST_MAX_BYTES,
   FeishuChannelAdapter,
+  type FeishuMentionItem,
   type FeishuWSClientLike,
   type FeishuWSClientOptions,
   formatFeishuTarget,
@@ -888,7 +889,13 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
     );
   });
 
-  it("treats group slash commands (/bind, /unbind, /workspace, /new, /stop) without @bot as group triggers and revokes leaked group bind codes", async () => {
+  it("requires a structured bot mention for group slash commands and text while ignoring unmentioned group messages with zero backend or send calls and keeping DM commands mention-free", async () => {
+    const botMention = {
+      key: "@_user_1",
+      id: { open_id: BOT_OPEN_ID },
+      name: "DaltonBot",
+    };
+
     const groupBindEvent = parseFeishuInboundEvent(
       {
         sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
@@ -897,47 +904,167 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
           chat_id: "oc_grp_1",
           chat_type: "group",
           message_type: "text",
-          content: JSON.stringify({ text: "/bind 123456" }),
+          content: JSON.stringify({ text: "@_user_1 /bind 123456" }),
+          mentions: [botMention],
         },
       },
       { botOpenId: BOT_OPEN_ID },
     );
     expect(groupBindEvent?.isGroupTrigger).toBe(true);
+    expect(groupBindEvent?.text).toBe("/bind 123456");
 
     for (const cmd of ["/workspace", "/workspace list", "/new", "/stop", "/unbind"]) {
-      const ev = parseFeishuInboundEvent(
+      const mentionedEv = parseFeishuInboundEvent(
         {
           sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
           message: {
-            message_id: `om_grp_${cmd}`,
+            message_id: `om_grp_mentioned_${cmd}`,
             chat_id: "oc_grp_1",
             chat_type: "group",
             message_type: "text",
-            content: JSON.stringify({ text: cmd }),
+            content: JSON.stringify({ text: `@_user_1 ${cmd}` }),
+            mentions: [botMention],
           },
         },
         { botOpenId: BOT_OPEN_ID },
       );
-      expect(ev?.isGroupTrigger).toBe(true);
+      expect(mentionedEv?.isGroupTrigger).toBe(true);
+      expect(mentionedEv?.text).toBe(cmd);
     }
 
-    const nonTriggerGroupEvent = parseFeishuInboundEvent(
+    for (const unmentionedText of [
+      "/main",
+      "/new",
+      "/workspace",
+      "/workspace W2",
+      "/bind 123456",
+      "/unbind",
+      "/stop",
+      "casual chat without mention",
+      "@DaltonBot /stop",
+      "@DaltonBot /workspace W2",
+      `@ou_bot_dalton /new`,
+    ]) {
+      const ev = parseFeishuInboundEvent(
+        {
+          sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
+          message: {
+            message_id: `om_grp_unmentioned_${unmentionedText}`,
+            chat_id: "oc_grp_1",
+            chat_type: "group",
+            message_type: "text",
+            content: JSON.stringify({ text: unmentionedText }),
+            mentions: [],
+          },
+        },
+        { botOpenId: BOT_OPEN_ID },
+      );
+      expect(ev?.isGroupTrigger).toBe(false);
+    }
+
+    const broadcastSlashEvent = parseFeishuInboundEvent(
       {
         sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
         message: {
-          message_id: "om_grp_plain_1",
+          message_id: "om_grp_broadcast_slash",
           chat_id: "oc_grp_1",
           chat_type: "group",
           message_type: "text",
-          content: JSON.stringify({ text: "casual chat without mention" }),
+          content: JSON.stringify({ text: "@_all /workspace W2" }),
+          mentions: [{ key: "@_all", id: { open_id: "all" }, name: "All" }],
         },
       },
       { botOpenId: BOT_OPEN_ID },
     );
-    expect(nonTriggerGroupEvent?.isGroupTrigger).toBe(false);
+    expect(broadcastSlashEvent?.isGroupTrigger).toBe(false);
 
     const h = createTestHarness();
     try {
+      const { client, calls } = createFakeLarkClient();
+      const realAdapter = new FeishuChannelAdapter({
+        appId: "cli_test_app",
+        appSecret: "sec_test_secret",
+        botOpenId: BOT_OPEN_ID,
+        client,
+      });
+      realAdapter.onInboundEvent(async (ev) => {
+        await h.app.orchestrator.handleInboundEvent(ev);
+      });
+
+      let idx = 0;
+      for (const rawPayload of [
+        {
+          message_id: `om_grp_ignore_${++idx}`,
+          content: JSON.stringify({ text: "/main" }),
+          mentions: [],
+        },
+        {
+          message_id: `om_grp_ignore_${++idx}`,
+          content: JSON.stringify({ text: "/new" }),
+          mentions: [],
+        },
+        {
+          message_id: `om_grp_ignore_${++idx}`,
+          content: JSON.stringify({ text: "/workspace W2" }),
+          mentions: [],
+        },
+        {
+          message_id: `om_grp_ignore_${++idx}`,
+          content: JSON.stringify({ text: "/bind 123456" }),
+          mentions: [],
+        },
+        {
+          message_id: `om_grp_ignore_${++idx}`,
+          content: JSON.stringify({ text: "ordinary group text" }),
+          mentions: [],
+        },
+        {
+          message_id: `om_grp_ignore_${++idx}`,
+          content: JSON.stringify({ text: "@_all /new" }),
+          mentions: [{ key: "@_all", id: { open_id: "all" }, name: "所有人" }],
+        },
+        {
+          message_id: `om_grp_ignore_${++idx}`,
+          content: JSON.stringify({ text: "@DaltonBot /new" }),
+          mentions: [],
+        },
+      ]) {
+        await realAdapter.receiveRawEvent({
+          sender: { sender_id: { open_id: "ou_alice_1" }, sender_type: "user" },
+          message: {
+            ...rawPayload,
+            chat_id: "oc_grp_1",
+            chat_type: "group",
+            message_type: "text",
+          },
+        });
+      }
+
+      // Direct orchestrator entry also ignores group events when isGroupTrigger is undefined
+      await h.app.orchestrator.handleInboundEvent({
+        platform: "feishu",
+        platformUserId: "ou_alice_1",
+        chatType: "group",
+        chatAddress: "feishu:oc_grp_1",
+        chatId: "oc_grp_1",
+        threadScopeKey: "chat:oc_grp_1",
+        messageId: "om_grp_undef_trigger",
+        text: "/new",
+        commandText: "/new",
+        isGroupTrigger: undefined,
+      });
+
+      await new Promise((r) => setTimeout(r, 20));
+      expect(h.backend.consumeBindCode).not.toHaveBeenCalled();
+      expect(h.backend.sessionCommand).not.toHaveBeenCalled();
+      expect(h.backend.registerAndResolveInbound).not.toHaveBeenCalled();
+      expect(h.backend.appendCalls).toHaveLength(0);
+      expect(h.backend.createCalls).toHaveLength(0);
+      expect(h.feishuAdapter.sentTexts).toHaveLength(0);
+      expect(calls.messageCreate).toHaveLength(0);
+      expect(calls.messageReply).toHaveLength(0);
+
+      // Mentioned group /bind triggers and revokes leaked group bind codes
       vi.mocked(h.backend.consumeBindCode).mockResolvedValueOnce({
         ok: false,
         reason: "revoked_in_group",
@@ -952,6 +1079,26 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
         }),
       );
       expect(h.feishuAdapter.sentTexts.at(-1)?.text).toContain("revoked");
+
+      // DM slash command without mention continues to work normally
+      await realAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_dm_new_no_mention",
+          chat_id: "oc_dm_1",
+          chat_type: "p2p",
+          message_type: "text",
+          content: JSON.stringify({ text: "/new" }),
+        },
+      });
+      expect(h.backend.sessionCommand).toHaveBeenCalledWith(
+        expect.objectContaining({
+          platform: "feishu",
+          dalton_user_id: "user_alice_123",
+          scope_key: "dm:ou_alice",
+          cmd: "new",
+        }),
+      );
     } finally {
       await h.cleanup();
     }
@@ -1863,9 +2010,20 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
     expect(received[2]).toMatchObject({
       messageId: "om_identity_plain_command",
       chatType: "group",
-      isGroupTrigger: true,
+      isGroupTrigger: false,
       text: "/stop",
     });
+
+    const h = createTestHarness();
+    try {
+      await h.app.orchestrator.handleInboundEvent(received[0]!);
+      await h.app.orchestrator.handleInboundEvent(received[2]!);
+      expect(h.backend.registerAndResolveInbound).not.toHaveBeenCalled();
+      expect(h.backend.sessionCommand).not.toHaveBeenCalled();
+      expect(h.feishuAdapter.sentTexts).toHaveLength(0);
+    } finally {
+      await h.cleanup();
+    }
   });
 
   it("keeps same-conversation arrival order when bot identity lookup is delayed so the message after /workspace uses the new workspace", async () => {
@@ -1924,8 +2082,14 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
           chat_id: "oc_grp_order",
           chat_type: "group",
           message_type: "text",
-          content: JSON.stringify({ text: "/workspace W2" }),
-          mentions: [],
+          content: JSON.stringify({ text: "@_user_1 /workspace W2" }),
+          mentions: [
+            {
+              key: "@_user_1",
+              id: { open_id: BOT_OPEN_ID },
+              name: "DaltonBot",
+            },
+          ],
         },
       });
       const second = adapter.receiveRawEvent({
@@ -2605,6 +2769,953 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
     }
   });
 
+  it("strips only the bot post at by identity so /workspace switches and /stop cancels through the real inbound path", async () => {
+    const postWithBotAt = (text: string) =>
+      JSON.stringify({
+        content: [
+          [
+            { tag: "at", user_id: BOT_OPEN_ID, user_name: "DaltonBot" },
+            { tag: "text", text: ` ${text}` },
+          ],
+        ],
+      });
+    const direct = parseFeishuInboundEvent(
+      {
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_post_cmd_direct_parse",
+          chat_id: "oc_grp_postcmd_parse",
+          chat_type: "group",
+          message_type: "post",
+          content: postWithBotAt("/workspace W2"),
+          mentions: [],
+        },
+      },
+      { botOpenId: BOT_OPEN_ID },
+    );
+    expect(direct?.text).toBe("/workspace W2");
+    expect(direct?.isGroupTrigger).toBe(true);
+
+    const wrapped = parseFeishuInboundEvent(
+      {
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_post_cmd_wrapped_parse",
+          chat_id: "oc_grp_postcmd_parse",
+          chat_type: "group",
+          message_type: "post",
+          content: JSON.stringify({
+            post: {
+              zh_cn: {
+                title: "",
+                content: [
+                  [
+                    {
+                      tag: "at",
+                      open_id: BOT_OPEN_ID,
+                      user_name: "DaltonBot",
+                    },
+                    { tag: "text", text: " /workspace W2" },
+                  ],
+                ],
+              },
+            },
+          }),
+          mentions: [],
+        },
+      },
+      { botOpenId: BOT_OPEN_ID },
+    );
+    expect(wrapped?.text).toBe("/workspace W2");
+
+    const otherLocale = parseFeishuInboundEvent(
+      {
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_post_cmd_locale_parse",
+          chat_id: "oc_grp_postcmd_parse",
+          chat_type: "group",
+          message_type: "post",
+          content: JSON.stringify({
+            fr_fr: {
+              content: [
+                [
+                  { tag: "at", user_id: BOT_OPEN_ID, user_name: "DaltonBot" },
+                  { tag: "text", text: " /workspace W2" },
+                ],
+              ],
+            },
+          }),
+          mentions: [],
+        },
+      },
+      { botOpenId: BOT_OPEN_ID },
+    );
+    expect(otherLocale?.text).toBe("/workspace W2");
+
+    const preserved = parseFeishuInboundEvent(
+      {
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_post_cmd_preserve_parse",
+          chat_id: "oc_grp_postcmd_parse",
+          chat_type: "group",
+          message_type: "post",
+          content: JSON.stringify({
+            content: [
+              [
+                { tag: "at", user_id: BOT_OPEN_ID, user_name: "DaltonBot" },
+                { tag: "text", text: " /workspace W2" },
+              ],
+              [
+                {
+                  tag: "at",
+                  user_id: "ou_other_same_name",
+                  user_name: "DaltonBot",
+                },
+                { tag: "text", text: " @DaltonBot" },
+              ],
+            ],
+          }),
+          mentions: [],
+        },
+      },
+      { botOpenId: BOT_OPEN_ID },
+    );
+    expect(preserved?.text).toBe("/workspace W2\n@DaltonBot @DaltonBot");
+
+    const h = createTestHarness();
+    try {
+      const feishuAdapter = new FeishuChannelAdapter({
+        appId: "cli_test_app",
+        appSecret: "sec_test_secret",
+        botOpenId: BOT_OPEN_ID,
+        client: createFakeLarkClient().client,
+      });
+      feishuAdapter.onInboundEvent(async (ev) => {
+        await h.app.orchestrator.handleInboundEvent(ev);
+      });
+
+      await feishuAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_post_workspace_1",
+          chat_id: "oc_grp_postcmd",
+          chat_type: "group",
+          message_type: "post",
+          content: postWithBotAt("/workspace W2"),
+          mentions: [],
+        },
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(
+        vi
+          .mocked(h.backend.sessionCommand)
+          .mock.calls.some(([req]) => req.cmd === "workspace_switch"),
+      ).toBe(true);
+      expect(h.backend.appendCalls).toHaveLength(0);
+      expect(h.backend.createCalls).toHaveLength(0);
+
+      let finishSseStream!: () => void;
+      const sseHold = new Promise<void>((resolve) => {
+        finishSseStream = resolve;
+      });
+      vi.mocked(h.backend.appendThreadMessages).mockImplementationOnce(
+        async () => ({
+          status: 200,
+          isSse: true,
+          events: (async function* () {
+            yield {
+              event: "metadata",
+              data: JSON.stringify({
+                thread_id: THREAD_ID,
+                run_id: RUN_ID,
+                turn_index: 1,
+              }),
+            };
+            await sseHold;
+            yield {
+              event: "run_end",
+              data: JSON.stringify({
+                thread_id: THREAD_ID,
+                run_id: RUN_ID,
+                turn_index: 1,
+                outcome: "cancelled",
+              }),
+            };
+          })(),
+        }),
+      );
+      await feishuAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_post_turn_1",
+          chat_id: "oc_grp_postcmd",
+          chat_type: "group",
+          message_type: "post",
+          content: postWithBotAt("Start deep analysis"),
+          mentions: [],
+        },
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(h.backend.appendCalls).toHaveLength(1);
+
+      await feishuAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_post_stop_1",
+          chat_id: "oc_grp_postcmd",
+          chat_type: "group",
+          message_type: "post",
+          content: postWithBotAt("/stop"),
+          mentions: [],
+        },
+      });
+      expect(h.backend.cancelThreadTurn).toHaveBeenCalledWith(
+        USER_ID,
+        THREAD_ID,
+        RUN_ID,
+      );
+      finishSseStream();
+      await new Promise((r) => setTimeout(r, 20));
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("preserves same-name other user mentions and plain-text @DaltonBot across text, post, wrapped post, and interactive card with empty or non-empty mentions so mentioning another DaltonBot before /stop does not cancel", async () => {
+    const botMention = {
+      key: "@_user_1",
+      id: { open_id: BOT_OPEN_ID },
+      name: "DaltonBot",
+    };
+    const otherSameNameMention = {
+      key: "@_user_2",
+      id: { open_id: "ou_other" },
+      name: "DaltonBot",
+    };
+
+    expect(
+      normalizeMentions(
+        "@_user_1 @_user_2 /stop",
+        [botMention, otherSameNameMention],
+        BOT_OPEN_ID,
+      ),
+    ).toBe("@DaltonBot /stop");
+    expect(
+      normalizeMentions(
+        "@_user_1 @_user_2 /stop",
+        [otherSameNameMention, botMention],
+        BOT_OPEN_ID,
+      ),
+    ).toBe("@DaltonBot /stop");
+    expect(
+      normalizeMentions(
+        "@_user_1 @DaltonBot /stop",
+        [botMention],
+        BOT_OPEN_ID,
+      ),
+    ).toBe("@DaltonBot /stop");
+
+    const postSameNameContent = JSON.stringify({
+      content: [
+        [
+          { tag: "at", user_id: BOT_OPEN_ID, user_name: "DaltonBot" },
+          { tag: "at", user_id: "ou_other", user_name: "DaltonBot" },
+          { tag: "text", text: " /stop" },
+        ],
+      ],
+    });
+    const wrappedPostSameNameContent = JSON.stringify({
+      post: {
+        zh_cn: {
+          title: "",
+          content: [
+            [
+              { tag: "at", open_id: BOT_OPEN_ID, user_name: "DaltonBot" },
+              { tag: "at", open_id: "ou_other", user_name: "DaltonBot" },
+              { tag: "text", text: " /stop" },
+            ],
+          ],
+        },
+      },
+    });
+    const interactiveCardSameNameContent = JSON.stringify({
+      elements: [
+        [
+          { tag: "at", user_id: BOT_OPEN_ID, user_name: "DaltonBot" },
+          { tag: "at", user_id: "ou_other", user_name: "DaltonBot" },
+          { tag: "text", text: " /stop" },
+        ],
+      ],
+    });
+    const postPlainSameNameContent = JSON.stringify({
+      content: [
+        [
+          { tag: "at", user_id: BOT_OPEN_ID, user_name: "DaltonBot" },
+          { tag: "text", text: " @DaltonBot /stop" },
+        ],
+      ],
+    });
+
+    for (const mentions of [
+      [] as FeishuMentionItem[],
+      [botMention],
+      [botMention, otherSameNameMention],
+      [otherSameNameMention, botMention],
+    ]) {
+      for (const [label, messageType, content] of [
+        ["post", "post", postSameNameContent],
+        ["wrapped_post", "post", wrappedPostSameNameContent],
+        ["card_elements", "interactive", interactiveCardSameNameContent],
+        ["card_fallback", "interactive", wrappedPostSameNameContent],
+        ["post_plain_name", "post", postPlainSameNameContent],
+      ] as const) {
+        const parsed = parseFeishuInboundEvent(
+          {
+            sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+            message: {
+              message_id: `om_same_name_${label}_${mentions.length}`,
+              chat_id: "oc_grp_same_name",
+              chat_type: "group",
+              message_type: messageType,
+              content,
+              mentions,
+            },
+          },
+          { botOpenId: BOT_OPEN_ID },
+        );
+        expect(parsed?.isGroupTrigger).toBe(true);
+        expect(parsed?.text).toBe("@DaltonBot /stop");
+        expect(parsed?.commandText).toBe("@DaltonBot /stop");
+      }
+    }
+
+    const textSameNameEvent = parseFeishuInboundEvent(
+      {
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_text_same_name_1",
+          chat_id: "oc_grp_same_name",
+          chat_type: "group",
+          message_type: "text",
+          content: JSON.stringify({ text: "@_user_1 @_user_2 /stop" }),
+          mentions: [botMention, otherSameNameMention],
+        },
+      },
+      { botOpenId: BOT_OPEN_ID },
+    );
+    expect(textSameNameEvent?.isGroupTrigger).toBe(true);
+    expect(textSameNameEvent?.text).toBe("@DaltonBot /stop");
+    expect(textSameNameEvent?.commandText).toBe("@DaltonBot /stop");
+
+    const h = createTestHarness();
+    try {
+      const feishuAdapter = new FeishuChannelAdapter({
+        appId: "cli_test_app",
+        appSecret: "sec_test_secret",
+        botOpenId: BOT_OPEN_ID,
+        client: createFakeLarkClient().client,
+      });
+      feishuAdapter.onInboundEvent(async (ev) => {
+        await h.app.orchestrator.handleInboundEvent(ev);
+      });
+
+      // Mentioning bot + same-name other user followed by " /stop" with non-empty mentions must NOT execute /stop
+      await feishuAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_entry_same_name_nonempty",
+          chat_id: "oc_grp_same_name_entry",
+          chat_type: "group",
+          message_type: "post",
+          content: postSameNameContent,
+          mentions: [botMention, otherSameNameMention],
+        },
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(h.backend.cancelThreadTurn).not.toHaveBeenCalled();
+      expect(
+        vi
+          .mocked(h.backend.sessionCommand)
+          .mock.calls.some(([req]) => req.cmd === "stop"),
+      ).toBe(false);
+      expect(h.backend.appendCalls).toHaveLength(1);
+      expect(
+        JSON.stringify(h.backend.appendCalls[0]?.payload.messages[0]?.content),
+      ).toContain("@DaltonBot /stop");
+
+      // Also verify with empty mentions
+      await feishuAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_entry_same_name_empty",
+          chat_id: "oc_grp_same_name_entry",
+          chat_type: "group",
+          message_type: "post",
+          content: postSameNameContent,
+          mentions: [],
+        },
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(h.backend.cancelThreadTurn).not.toHaveBeenCalled();
+      expect(h.backend.appendCalls).toHaveLength(2);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("extracts unescaped commandText for rich-text post slash commands while keeping Markdown rendering for normal conversation and preserving legitimate backslashes", async () => {
+    const postBotCommand = (rawArg: string) =>
+      JSON.stringify({
+        content: [
+          [
+            { tag: "at", user_id: BOT_OPEN_ID, user_name: "DaltonBot" },
+            { tag: "text", text: ` /workspace ${rawArg}` },
+          ],
+        ],
+      });
+
+    const parsedHyphen = parseFeishuInboundEvent(
+      {
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_post_hyphen_parse",
+          chat_id: "oc_grp_cmd_escape",
+          chat_type: "group",
+          message_type: "post",
+          content: postBotCommand("research-2026"),
+          mentions: [],
+        },
+      },
+      { botOpenId: BOT_OPEN_ID },
+    );
+    expect(parsedHyphen?.text).toBe("/workspace research\\-2026");
+    expect(parsedHyphen?.commandText).toBe("/workspace research-2026");
+
+    const parsedBackslash = parseFeishuInboundEvent(
+      {
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_post_backslash_parse",
+          chat_id: "oc_grp_cmd_escape",
+          chat_type: "group",
+          message_type: "post",
+          content: postBotCommand(String.raw`domain\team_2026-A`),
+          mentions: [],
+        },
+      },
+      { botOpenId: BOT_OPEN_ID },
+    );
+    expect(parsedBackslash?.commandText).toBe(
+      String.raw`/workspace domain\team_2026-A`,
+    );
+
+    const h = createTestHarness();
+    try {
+      const feishuAdapter = new FeishuChannelAdapter({
+        appId: "cli_test_app",
+        appSecret: "sec_test_secret",
+        botOpenId: BOT_OPEN_ID,
+        client: createFakeLarkClient().client,
+      });
+      feishuAdapter.onInboundEvent(async (ev) => {
+        await h.app.orchestrator.handleInboundEvent(ev);
+      });
+
+      const workspaceQueries = [
+        "research-2026",
+        "quant_alpha_1",
+        "半导体研究-2026_A组",
+        "Macro Research 2026 - Core_1",
+        "99999999-8888-7777-6666-555555555555",
+      ];
+
+      for (let i = 0; i < workspaceQueries.length; i += 1) {
+        const query = workspaceQueries[i]!;
+        await feishuAdapter.receiveRawEvent({
+          sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+          message: {
+            message_id: `om_post_ws_arg_${i}`,
+            chat_id: "oc_grp_cmd_escape",
+            chat_type: "group",
+            message_type: "post",
+            content: postBotCommand(query),
+            mentions: [
+              {
+                key: "@_user_1",
+                id: { open_id: BOT_OPEN_ID },
+                name: "DaltonBot",
+              },
+            ],
+          },
+        });
+      }
+      await new Promise((r) => setTimeout(r, 20));
+
+      const switchQueries = vi
+        .mocked(h.backend.sessionCommand)
+        .mock.calls.filter(([req]) => req.cmd === "workspace_switch")
+        .map(([req]) => req.workspace_query);
+      expect(switchQueries).toEqual(workspaceQueries);
+      expect(h.backend.appendCalls).toHaveLength(0);
+
+      // Mentioning another user before /workspace in post does NOT falsely trigger a slash command
+      await feishuAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_post_other_user_before_cmd",
+          chat_id: "oc_grp_cmd_escape",
+          chat_type: "group",
+          message_type: "post",
+          content: JSON.stringify({
+            content: [
+              [
+                { tag: "at", user_id: BOT_OPEN_ID, user_name: "DaltonBot" },
+                { tag: "at", user_id: "ou_bob", user_name: "Bob" },
+                { tag: "text", text: " /workspace research-2026" },
+              ],
+            ],
+          }),
+          mentions: [],
+        },
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(
+        vi
+          .mocked(h.backend.sessionCommand)
+          .mock.calls.filter(([req]) => req.cmd === "workspace_switch"),
+      ).toHaveLength(workspaceQueries.length);
+      expect(h.backend.appendCalls).toHaveLength(1);
+      expect(h.backend.appendCalls[0]?.payload.messages[0]?.content).toBe(
+        "@Bob /workspace research\\-2026",
+      );
+
+      // Normal conversation post keeps Markdown rendering (bold, links, escaped specials)
+      await feishuAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_post_normal_markdown",
+          chat_id: "oc_dm_cmd_escape",
+          chat_type: "p2p",
+          message_type: "post",
+          content: JSON.stringify({
+            content: [
+              [
+                { tag: "text", text: "Review " },
+                {
+                  tag: "text",
+                  text: "research-2026",
+                  style: { bold: true },
+                },
+                { tag: "text", text: " and model_v1" },
+              ],
+            ],
+          }),
+        },
+      });
+      await new Promise((r) => setTimeout(r, 20));
+      expect(h.backend.appendCalls).toHaveLength(2);
+      expect(h.backend.appendCalls[1]?.payload.messages[0]?.content).toBe(
+        "Review **research\\-2026** and model\\_v1",
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("turns a streamed size_exceeded attachment failure into a terminal limit notice and does not retry it on startup recovery", async () => {
+    const MESSAGE_ID = "om_post_too_large_1";
+    const postContent = JSON.stringify({
+      content: [[{ tag: "text", text: "请分析附件" }]],
+      files: [
+        { file_key: "file_big", file_name: "report.pdf", is_folder: false },
+      ],
+    });
+    const h = createTestHarness();
+    try {
+      const { client, calls } = createFakeLarkClient({
+        onMessageResourceGet: async () => {
+          const stream = new PassThrough();
+          stream.end(Buffer.alloc(21 * 1024 * 1024, 7));
+          return {
+            getReadableStream: () => stream,
+            headers: { "content-type": "application/pdf" },
+          };
+        },
+      });
+      const realAdapter = new FeishuChannelAdapter({
+        appId: "cli_test_app",
+        appSecret: "sec_test_secret",
+        botOpenId: BOT_OPEN_ID,
+        client,
+      });
+      realAdapter.onInboundEvent(async (ev) => {
+        await h.app.orchestrator.handleInboundEvent(ev);
+      });
+      h.feishuAdapter.setDownloadAttachmentDelegate((descriptor, event) =>
+        realAdapter.downloadAttachment(descriptor, event),
+      );
+
+      await realAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: MESSAGE_ID,
+          chat_id: "oc_dm_1",
+          chat_type: "p2p",
+          message_type: "post",
+          content: postContent,
+        },
+      });
+      await new Promise((r) => setTimeout(r, 50));
+
+      expect(calls.messageResourceGet).toHaveLength(1);
+      expect(h.backend.appendCalls).toHaveLength(0);
+      expect(h.backend.createCalls).toHaveLength(0);
+      expect(
+        h.backend.progressUpdates.some(
+          (u) => u.message_id === MESSAGE_ID && u.status === "failed",
+        ),
+      ).toBe(true);
+      expect(
+        h.feishuAdapter.sentTexts.some((t) =>
+          t.text.includes("exceeds the 20 MB per-file limit"),
+        ),
+      ).toBe(true);
+
+      vi.mocked(h.backend.recoverState).mockImplementationOnce(async () => ({
+        mode: "startup" as const,
+        inbound_events: [
+          {
+            platform: "feishu" as const,
+            message_id: MESSAGE_ID,
+            platform_user_id: "ou_alice",
+            dalton_user_id: USER_ID,
+            chat_type: "dm" as const,
+            chat_address: "feishu:@me",
+            thread_scope_key: "dm:ou_alice",
+            request_key: makeInboundRequestKey("feishu", MESSAGE_ID),
+            retry_request_key: null,
+            resubmitted_request_key: null,
+            steered_into_run_id: null,
+            thread_id: THREAD_ID,
+            run_id: RUN_ID,
+            turn_index: 1,
+            workspace_id: "99999999-8888-7777-6666-555555555555",
+            external_thread_id: "feishu:dm:ou_alice:gen:1",
+            generation: 1,
+            status: "failed" as const,
+            fallback_pending: false,
+            sent_to_current_count: 0,
+            uploaded_attachments: [],
+            raw_payload: {
+              platform_user_id: "ou_alice",
+              text: "请分析附件",
+              chat_id: "oc_dm_1",
+              attachments: [
+                {
+                  id: "file_big",
+                  filename: "report.pdf",
+                  mimeType: "application/pdf",
+                },
+              ],
+            },
+            pending_interrupt: null,
+          },
+        ],
+        background_runs: [],
+        thread_watches: [],
+        automation_runs: [],
+      }));
+      await h.app.orchestrator.runStartupRecovery();
+      expect(calls.messageResourceGet).toHaveLength(1);
+      expect(h.backend.appendCalls).toHaveLength(0);
+      expect(h.backend.createCalls).toHaveLength(0);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("uploads same-name attachments to unique stable paths with their own bytes, including sanitized collisions", async () => {
+    const h = createTestHarness();
+    try {
+      const contentsByKey: Record<string, string> = {
+        file_one: "FIRST_PDF_BYTES",
+        file_two: "SECOND_PDF_BYTES",
+        file_three: "THIRD_FILE_BYTES",
+        file_four: "FOURTH_FILE_BYTES",
+      };
+      const { client } = createFakeLarkClient({
+        onMessageResourceGet: async (args) => ({
+          data: Buffer.from(
+            contentsByKey[args.path.file_key] ?? "UNKNOWN",
+            "utf8",
+          ),
+          headers: { "content-type": "application/pdf" },
+        }),
+      });
+      const realAdapter = new FeishuChannelAdapter({
+        appId: "cli_test_app",
+        appSecret: "sec_test_secret",
+        botOpenId: BOT_OPEN_ID,
+        client,
+      });
+      realAdapter.onInboundEvent(async (ev) => {
+        await h.app.orchestrator.handleInboundEvent(ev);
+      });
+      h.feishuAdapter.setDownloadAttachmentDelegate((descriptor, event) =>
+        realAdapter.downloadAttachment(descriptor, event),
+      );
+
+      await realAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: "om_post_same_name_1",
+          chat_id: "oc_dm_1",
+          chat_type: "p2p",
+          message_type: "post",
+          content: JSON.stringify({
+            content: [[{ tag: "text", text: "请分析附件" }]],
+            files: [
+              {
+                file_key: "file_one",
+                file_name: "report.pdf",
+                is_folder: false,
+              },
+              {
+                file_key: "file_two",
+                file_name: "report.pdf",
+                is_folder: false,
+              },
+              {
+                file_key: "file_three",
+                file_name: "my report.pdf",
+                is_folder: false,
+              },
+              {
+                file_key: "file_four",
+                file_name: "my?report.pdf",
+                is_folder: false,
+              },
+            ],
+          }),
+        },
+      });
+      await new Promise((r) => setTimeout(r, 50));
+
+      const uploads = vi.mocked(h.backend.uploadWorkspaceFile).mock.calls;
+      expect(uploads).toHaveLength(4);
+      const byPath = new Map(
+        uploads.map((call) => [
+          call[2] as string,
+          (call[4] as Buffer).toString("utf8"),
+        ]),
+      );
+      expect(byPath.get("uploads/feishu/om_post_same_name_1/report.pdf")).toBe(
+        "FIRST_PDF_BYTES",
+      );
+      expect(
+        byPath.get("uploads/feishu/om_post_same_name_1/2-report.pdf"),
+      ).toBe("SECOND_PDF_BYTES");
+      expect(
+        byPath.get("uploads/feishu/om_post_same_name_1/my_report.pdf"),
+      ).toBe("THIRD_FILE_BYTES");
+      expect(
+        byPath.get("uploads/feishu/om_post_same_name_1/4-my_report.pdf"),
+      ).toBe("FOURTH_FILE_BYTES");
+      const submitted = h.backend.appendCalls[0]?.payload.messages[0]
+        ?.content;
+      const submittedText = Array.isArray(submitted)
+        ? submitted
+            .map((item) => (item.type === "text" ? item.text : ""))
+            .join("\n")
+        : String(submitted ?? "");
+      expect(submittedText).toContain(
+        "uploads/feishu/om_post_same_name_1/report.pdf",
+      );
+      expect(submittedText).toContain(
+        "uploads/feishu/om_post_same_name_1/2-report.pdf",
+      );
+      expect(submittedText).toContain(
+        "uploads/feishu/om_post_same_name_1/my_report.pdf",
+      );
+      expect(submittedText).toContain(
+        "uploads/feishu/om_post_same_name_1/4-my_report.pdf",
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("keeps the saved path for a same-name attachment already uploaded and gives the remaining one a unique path on startup recovery", async () => {
+    const MESSAGE_ID = "om_post_same_name_recovery_1";
+    const postContent = JSON.stringify({
+      content: [[{ tag: "text", text: "请分析附件" }]],
+      files: [
+        { file_key: "file_one", file_name: "report.pdf", is_folder: false },
+        { file_key: "file_two", file_name: "report.pdf", is_folder: false },
+      ],
+    });
+    let failSecondDownload = true;
+    const { client, calls } = createFakeLarkClient({
+      onMessageResourceGet: async (args) => {
+        if (failSecondDownload && args.path.file_key === "file_two") {
+          throw new Error("temporary second download failure");
+        }
+        return {
+          data: Buffer.from(
+            args.path.file_key === "file_one"
+              ? "FIRST_PDF_BYTES"
+              : "SECOND_PDF_BYTES",
+            "utf8",
+          ),
+          headers: { "content-type": "application/pdf" },
+        };
+      },
+    });
+    const realAdapter = new FeishuChannelAdapter({
+      appId: "cli_test_app",
+      appSecret: "sec_test_secret",
+      botOpenId: BOT_OPEN_ID,
+      client,
+    });
+
+    const h1 = createTestHarness();
+    const extraHarnesses: Array<ReturnType<typeof createTestHarness>> = [];
+    try {
+      realAdapter.onInboundEvent(async (ev) => {
+        await h1.app.orchestrator.handleInboundEvent(ev);
+      });
+      h1.feishuAdapter.setDownloadAttachmentDelegate((descriptor, event) =>
+        realAdapter.downloadAttachment(descriptor, event),
+      );
+      await realAdapter.receiveRawEvent({
+        sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+        message: {
+          message_id: MESSAGE_ID,
+          chat_id: "oc_dm_1",
+          chat_type: "p2p",
+          message_type: "post",
+          content: postContent,
+        },
+      });
+      await new Promise((r) => setTimeout(r, 50));
+
+      const savedUploaded = [
+        ...h1.backend.progressUpdates
+          .filter((u) => u.message_id === MESSAGE_ID)
+          .flatMap((u) => u.uploaded_attachments ?? []),
+      ].slice(-1);
+      const firstRecord = h1.backend.progressUpdates
+        .filter((u) => u.message_id === MESSAGE_ID && u.uploaded_attachments)
+        .at(-1)?.uploaded_attachments;
+      expect(firstRecord).toHaveLength(1);
+      expect(firstRecord?.[0]?.workspace_path).toBe(
+        "uploads/feishu/om_post_same_name_recovery_1/report.pdf",
+      );
+      expect(savedUploaded).toHaveLength(1);
+      expect(h1.backend.appendCalls).toHaveLength(0);
+      expect(h1.backend.createCalls).toHaveLength(0);
+      const registeredRawPayload = vi.mocked(
+        h1.backend.registerAndResolveInbound,
+      ).mock.calls[0]?.[0].raw_payload;
+      const downloadsBeforeRecovery = calls.messageResourceGet.length;
+
+      failSecondDownload = false;
+      const h2 = createTestHarness();
+      extraHarnesses.push(h2);
+      h2.feishuAdapter.setDownloadAttachmentDelegate((descriptor, event) =>
+        realAdapter.downloadAttachment(descriptor, event),
+      );
+      const defaultRegister = vi
+        .mocked(h2.backend.registerAndResolveInbound)
+        .getMockImplementation()!;
+      vi.mocked(h2.backend.registerAndResolveInbound).mockImplementation(
+        async (req) => {
+          const base = await defaultRegister(req);
+          return {
+            ...base,
+            existing_status: "pending" as const,
+            thread_id: THREAD_ID,
+            run_id: null,
+            uploaded_attachments: structuredClone(firstRecord ?? []),
+            raw_payload: req.raw_payload ?? {},
+          };
+        },
+      );
+      vi.mocked(h2.backend.recoverState).mockImplementation(async () => ({
+        mode: "startup" as const,
+        inbound_events: [
+          {
+            platform: "feishu" as const,
+            message_id: MESSAGE_ID,
+            platform_user_id: "ou_alice",
+            dalton_user_id: USER_ID,
+            chat_type: "dm" as const,
+            chat_address: "feishu:@me",
+            thread_scope_key: "dm:ou_alice",
+            request_key: makeInboundRequestKey("feishu", MESSAGE_ID),
+            retry_request_key: null,
+            resubmitted_request_key: null,
+            steered_into_run_id: null,
+            thread_id: THREAD_ID,
+            run_id: null,
+            turn_index: null,
+            workspace_id: "99999999-8888-7777-6666-555555555555",
+            external_thread_id: "feishu:dm:ou_alice:gen:1",
+            generation: 1,
+            status: "pending" as const,
+            fallback_pending: false,
+            sent_to_current_count: 0,
+            uploaded_attachments: structuredClone(firstRecord ?? []),
+            raw_payload: structuredClone(registeredRawPayload ?? {}),
+            pending_interrupt: null,
+          },
+        ],
+        background_runs: [],
+        thread_watches: [],
+        automation_runs: [],
+      }));
+      await h2.app.orchestrator.runStartupRecovery();
+
+      const recoveryDownloads = calls.messageResourceGet.slice(
+        downloadsBeforeRecovery,
+      );
+      expect(recoveryDownloads).toEqual([
+        {
+          path: { message_id: MESSAGE_ID, file_key: "file_two" },
+          params: { type: "file" },
+        },
+      ]);
+      const h2Uploads = vi.mocked(h2.backend.uploadWorkspaceFile).mock.calls;
+      expect(h2Uploads).toHaveLength(1);
+      expect(h2Uploads[0]?.[2]).toBe(
+        "uploads/feishu/om_post_same_name_recovery_1/2-report.pdf",
+      );
+      expect((h2Uploads[0]?.[4] as Buffer).toString("utf8")).toBe(
+        "SECOND_PDF_BYTES",
+      );
+      const submitted = h2.backend.appendCalls[0]?.payload.messages[0]
+        ?.content;
+      const submittedText = Array.isArray(submitted)
+        ? submitted
+            .map((item) => (item.type === "text" ? item.text : ""))
+            .join("\n")
+        : String(submitted ?? "");
+      expect(submittedText).toContain(
+        "uploads/feishu/om_post_same_name_recovery_1/report.pdf",
+      );
+      expect(submittedText).toContain(
+        "uploads/feishu/om_post_same_name_recovery_1/2-report.pdf",
+      );
+    } finally {
+      await h1.cleanup();
+      for (const extra of extraHarnesses) {
+        await extra.cleanup();
+      }
+    }
+  });
+
   it("tracks live WebSocket connection status across reconnecting and reconnected events", async () => {
     const { client } = createFakeLarkClient();
     let wsCallbacks: FeishuWSClientOptions | undefined;
@@ -2821,6 +3932,103 @@ describe("Feishu outbound formatting & chunking", () => {
         Buffer.byteLength(JSON.stringify(built), "utf8"),
       ).toBeLessThanOrEqual(FEISHU_CARD_MAX_BYTES);
     }
+  });
+
+  it("re-chunks post-routed segments after card table splitting so every chunk stays within 30,720 serialized bytes in its final sendTextChunk format", async () => {
+    const smallTable = "| A | B |\n| - | - |\n| 1 | 2 |";
+    const tenTablesBlock = Array.from({ length: 10 }, () => smallTable).join(
+      "\n\n",
+    );
+    const thousandLinesOf27A = Array.from({ length: 1000 }, () =>
+      "a".repeat(27),
+    ).join("\n");
+    const combinedTenTablesAndLines = `${tenTablesBlock}\n\n${thousandLinesOf27A}`;
+
+    const chunks = chunkFeishuOutboundText(combinedTenTablesAndLines);
+    expect(chunks.length).toBe(4);
+    expect(shouldUseFeishuCard(chunks[0]!)).toBe(true);
+    expect(shouldUseFeishuCard(chunks[1]!)).toBe(true);
+    expect(shouldUseFeishuCard(chunks[2]!)).toBe(false);
+    expect(shouldUseFeishuCard(chunks[3]!)).toBe(false);
+
+    const { client, calls } = createFakeLarkClient();
+    const adapter = new FeishuChannelAdapter({
+      appId: "cli_app_chunk_verify",
+      appSecret: "secret_chunk_verify",
+      client,
+    });
+
+    for (let i = 0; i < chunks.length; i += 1) {
+      await adapter.sendTextChunk({
+        targetAddress: "feishu:oc_group_chunk_verify",
+        text: chunks[i]!,
+        chunkIndex: i,
+        totalChunks: chunks.length,
+      });
+    }
+
+    expect(calls.messageCreate).toHaveLength(chunks.length);
+    expect(calls.messageCreate[0]?.data.msg_type).toBe("interactive");
+    expect(calls.messageCreate[1]?.data.msg_type).toBe("interactive");
+    expect(calls.messageCreate[2]?.data.msg_type).toBe("post");
+    expect(calls.messageCreate[3]?.data.msg_type).toBe("post");
+
+    let deliveredTableCount = 0;
+    let deliveredACount = 0;
+    for (const call of calls.messageCreate) {
+      const byteLen = Buffer.byteLength(call.data.content, "utf8");
+      expect(byteLen).toBeLessThanOrEqual(FEISHU_POST_MAX_BYTES);
+      const parsed = JSON.parse(call.data.content);
+      if (call.data.msg_type === "interactive") {
+        const cardMd = parsed.body.elements[0].content as string;
+        deliveredTableCount += countMarkdownTables(cardMd);
+      } else {
+        const postMd = parsed.zh_cn.content[0][0].text as string;
+        deliveredACount += (postMd.match(/a/g) ?? []).length;
+      }
+    }
+    expect(deliveredTableCount).toBe(10);
+    expect(deliveredACount).toBe(27_000);
+
+    // Also verify mixed tables + multibyte CJK + soft line breaks + quotes
+    const sixTables = Array.from({ length: 6 }, (_, idx) =>
+      `| 指标_${idx + 1} | 数值 |\n| --- | --- |\n| "营收" | ${idx + 1}00 |`,
+    ).join("\n\n");
+    const cjkQuotedLines = Array.from(
+      { length: 600 },
+      (_, idx) => `第${idx + 1}行："核心结论"与"风险提示"——毛利率稳健增长`,
+    ).join("\n");
+    const mixedInput = `${sixTables}\n\n${cjkQuotedLines}`;
+    const mixedChunks = chunkFeishuOutboundText(mixedInput);
+    expect(mixedChunks.length).toBeGreaterThanOrEqual(3);
+
+    calls.messageCreate.length = 0;
+    for (let i = 0; i < mixedChunks.length; i += 1) {
+      await adapter.sendTextChunk({
+        targetAddress: "feishu:oc_group_chunk_verify",
+        text: mixedChunks[i]!,
+        chunkIndex: i,
+        totalChunks: mixedChunks.length,
+      });
+    }
+    expect(calls.messageCreate).toHaveLength(mixedChunks.length);
+    const extractedTexts: string[] = [];
+    for (const call of calls.messageCreate) {
+      expect(Buffer.byteLength(call.data.content, "utf8")).toBeLessThanOrEqual(
+        FEISHU_POST_MAX_BYTES,
+      );
+      const parsed = JSON.parse(call.data.content);
+      if (call.data.msg_type === "interactive") {
+        extractedTexts.push(parsed.body.elements[0].content as string);
+      } else {
+        extractedTexts.push(parsed.zh_cn.content[0][0].text as string);
+      }
+    }
+    const joinedDelivered = extractedTexts.join("\n");
+    expect(joinedDelivered).toContain("指标_1");
+    expect(joinedDelivered).toContain("指标_6");
+    expect(joinedDelivered).toContain("第1行：\"核心结论\"与\"风险提示\"");
+    expect(joinedDelivered).toContain("第600行：\"核心结论\"与\"风险提示\"");
   });
 });
 
