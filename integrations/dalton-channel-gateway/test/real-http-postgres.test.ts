@@ -10,7 +10,8 @@ import { FakeChannelAdapter } from "../src/channels/fake-adapter.js";
 import { FeishuChannelAdapter } from "../src/channels/feishu/index.js";
 import { loadConfig } from "../src/config.js";
 import { createGatewayApp } from "../src/server.js";
-import type { ChannelAdapter, ChannelPlatform } from "../src/types.js";
+import type { ChannelAdapter } from "../src/channels/adapter.js";
+import type { ChannelPlatform } from "../src/types.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "../../..");
@@ -286,11 +287,17 @@ describe("Real HTTP End-to-End: FeishuChannelAdapter -> GatewayOrchestrator -> H
           if (params.scopeKey) qs.set("scope_key", params.scopeKey);
           if (params.userId) qs.set("dalton_user_id", params.userId);
           if (params.messageId) qs.set("message_id", params.messageId);
-          const r = await fetch(
-            `${baseUrl}/test-harness/inspect?${qs.toString()}`,
-          );
-          expect(r.status).toBe(200);
-          return (await r.json()) as InspectResponse;
+          const deadline = Date.now() + 5_000;
+          while (true) {
+            const r = await fetch(`${baseUrl}/test-harness/inspect?${qs.toString()}`);
+            expect(r.status).toBe(200);
+            const snapshot = (await r.json()) as InspectResponse;
+            if (!params.messageId || !snapshot.inbound ||
+                ["completed", "failed", "denied"].includes(snapshot.inbound.status) || Date.now() >= deadline) {
+              return snapshot;
+            }
+            await new Promise((resolve) => setTimeout(resolve, 20));
+          }
         };
 
         const ageSession = async (params: {

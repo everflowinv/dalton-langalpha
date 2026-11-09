@@ -1881,7 +1881,7 @@ async def test_ch1_six_hour_inactivity_before_boundary_after_and_concurrent_work
         thread_scope_key=scope_a,
         message_id=f"{prefix}_6h_msg_before",
     )
-    assert replay_before["existing_status"] == "received"
+    assert replay_before["existing_status"] == "pending"
     assert replay_before["workspace_id"] == ws_a1
     assert replay_before["generation"] == 2
 
@@ -2207,10 +2207,25 @@ async def test_ch1_command_idempotency_late_delivery_group_isolation_and_recover
     # 3. Group chat two members (`user_a` and `user_b`) have completely isolated workspace selections
     # Even when the group chat notification binding (`dalton_channel_chat_bindings`) points to `ws_a1`,
     # both members start in their own Chief of Staff (Home) workspace.
+    member_message_id = f"{prefix}_group_membership"
+    await cg_db.register_and_resolve_inbound(
+        platform="feishu",
+        platform_user_id=puid_a,
+        chat_type="group",
+        chat_address=grp_addr,
+        thread_scope_key=grp_scope,
+        message_id=member_message_id,
+    )
+    await cg_db.update_inbound_progress(
+        platform="feishu", message_id=member_message_id, status="completed"
+    )
     await cg_db.update_user_channel_settings(
         user_id=user_a,
         settings={
             "feishu": {
+                "preferred": "feishu:@me",
+                "automation_output": {},
+                "agent_messages": {"enabled": True, "allowed": ["feishu:@me"]},
                 "chats": {
                     grp_addr: {"name": "Research Group", "workspace_id": ws_a1}
                 }
@@ -2361,9 +2376,13 @@ def _create_real_http_test_app(
                         conversation_response_id, conversation_thread_id,
                         turn_index, status, user_id, created_at
                     )
-                    VALUES (%s, %s, %s, 'completed', %s, NOW())
+                    VALUES (%s, %s, %s, 'in_progress', %s, NOW())
                     """,
                     (run_id, thread_id, turn_index, user_id),
+                )
+                await cur.execute(
+                    "UPDATE conversation_responses SET status = 'completed' WHERE conversation_response_id = %s",
+                    (run_id,),
                 )
 
         reply_text = f"[stub-reply ws={ws_id} thread={thread_id} turn={turn_index}] {user_text}".strip()
@@ -2489,7 +2508,7 @@ def _create_real_http_test_app(
                     WHERE platform = %s AND scope_key = %s AND dalton_user_id = %s
                     RETURNING generation,
                               override_workspace_id::text AS override_workspace_id,
-                              EXTRACT(EPOCH FROM last_conversation_activity_at) AS activity_epoch
+                              EXTRACT(EPOCH FROM last_conversation_activity_at)::double precision AS activity_epoch
                     """,
                     (seconds_ago, platform, scope_key, dalton_user_id),
                 )
@@ -2511,8 +2530,8 @@ def _create_real_http_test_app(
                         """
                         SELECT generation,
                                override_workspace_id::text AS override_workspace_id,
-                               EXTRACT(EPOCH FROM last_conversation_activity_at) AS activity_epoch,
-                               EXTRACT(EPOCH FROM selection_initialized_at) AS initialized_epoch
+                               EXTRACT(EPOCH FROM last_conversation_activity_at)::double precision AS activity_epoch,
+                               EXTRACT(EPOCH FROM selection_initialized_at)::double precision AS initialized_epoch
                         FROM dalton_channel_session_generations
                         WHERE platform = %s AND scope_key = %s AND dalton_user_id = %s
                         """,
@@ -2606,6 +2625,7 @@ async def _seed_real_http_e2e_fixture(
     """Seed users, workspaces (Chinese + space, duplicate names, literal 'main', private B), bindings, and default notification settings."""
     service_token = "0123456789abcdef0123456789abcdef_real_http_token"
     os.environ["INTERNAL_SERVICE_TOKEN"] = service_token
+    os.environ["DALTON_COLLEAGUE_DISPATCH_ENABLED"] = "true"
     os.environ["DALTON_ALLOWED_EMAILS"] = f"{user_a}@example.com,{user_b}@example.com"
 
     ws_cn = str(uuid4())
@@ -2673,11 +2693,26 @@ async def _seed_real_http_e2e_fixture(
 
     # Configure both default notification workspace and group notification binding to `ws_a1`;
     # conversations must still default to Chief of Staff (Home)!
+    member_message_id = f"{prefix}_group_membership"
+    await cg_db.register_and_resolve_inbound(
+        platform="feishu",
+        platform_user_id=puid_a,
+        chat_type="group",
+        chat_address=grp_addr,
+        thread_scope_key=grp_scope,
+        message_id=member_message_id,
+    )
+    await cg_db.update_inbound_progress(
+        platform="feishu", message_id=member_message_id, status="completed"
+    )
     await cg_db.update_user_channel_settings(
         user_id=user_a,
         settings={
             "default": {"workspace_id": ws_a1},
             "feishu": {
+                "preferred": "feishu:@me",
+                "automation_output": {},
+                "agent_messages": {"enabled": True, "allowed": ["feishu:@me"]},
                 "chats": {
                     grp_addr: {"name": "HTTP E2E Group", "workspace_id": ws_a1}
                 }

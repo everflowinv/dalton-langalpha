@@ -1194,7 +1194,8 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
       expect(h.backend.sessionCommand).toHaveBeenCalledWith(
         expect.objectContaining({
           platform: "feishu",
-          dalton_user_id: "user_alice_123",
+          platform_user_id: "ou_alice",
+          message_id: "om_dm_new_no_mention",
           scope_key: "dm:ou_alice",
           cmd: "new",
         }),
