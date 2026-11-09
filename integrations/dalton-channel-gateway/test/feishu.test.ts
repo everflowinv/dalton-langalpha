@@ -809,6 +809,34 @@ describe("Feishu inbound event parsing, deduplication & sequential queue", () =>
     }
   });
 
+  it.each(["", "   ", null, undefined])("preserves a card mention with display name %s before a command", async (displayName) => {
+    const parsed = parseFeishuInboundEvent({
+      sender: { sender_id: { open_id: "ou_alice" }, sender_type: "user" },
+      message: {
+        message_id: `om_card_empty_name_${String(displayName)}`,
+        chat_id: "oc_grp_1", chat_type: "group", message_type: "interactive",
+        content: JSON.stringify({ elements: [[
+          { tag: "at", user_id: BOT_OPEN_ID },
+          { tag: "at", open_id: "ou_other", user_name: displayName },
+          { tag: "text", text: " /stop" },
+        ]] }),
+        mentions: [{ key: "@_user_1", id: { open_id: BOT_OPEN_ID }, name: "DaltonBot" }],
+      },
+    }, { botOpenId: BOT_OPEN_ID });
+    expect(parsed).toMatchObject({ text: "@ou_other /stop", commandText: "@ou_other /stop", isGroupTrigger: true });
+    const h = createTestHarness();
+    try {
+      await h.app.orchestrator.handleInboundEvent(parsed!);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(h.backend.cancelThreadTurn).not.toHaveBeenCalled();
+      expect(vi.mocked(h.backend.sessionCommand).mock.calls.some(([request]) => request.cmd === "stop"))
+        .toBe(false);
+      expect(h.backend.appendCalls).toHaveLength(1);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
   it("parses post rich text, image, and file messages", () => {
     const postRaw = {
       sender: {
