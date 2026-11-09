@@ -16,6 +16,7 @@ import { syncDiscordNativeCommands } from "./discord-registrar.js";
 import { syncFeishuNativeCommands } from "./feishu-registrar.js";
 import {
   createStderrLoggerSink,
+  sanitizeNativeCommandSyncResult,
   scrubNativeCommandSecrets,
 } from "./redact.js";
 import {
@@ -481,31 +482,27 @@ export async function runNativeCommandsCli(
       });
     }
 
+    const safeResult = sanitizeNativeCommandSyncResult(result, envSecrets);
+
     if (wantJson) {
-      stdout.write(
-        `${scrubNativeCommandSecrets(JSON.stringify(result, null, 2), envSecrets, 65_536)}\n`,
-      );
+      stdout.write(`${JSON.stringify(safeResult, null, 2)}\n`);
     } else {
-      stdout.write(
-        scrubNativeCommandSecrets(
-          formatNativeCommandSyncResult(result),
-          envSecrets,
-          65_536,
-        ),
-      );
+      stdout.write(formatNativeCommandSyncResult(safeResult));
     }
 
     if (
-      !result.ok ||
-      result.status === "unconfirmed" ||
-      result.status === "failed"
+      !safeResult.ok ||
+      safeResult.status === "unconfirmed" ||
+      safeResult.status === "failed"
     ) {
       const code =
-        result.errorCode ??
-        (result.status === "unconfirmed" ? "unconfirmed_write" : "http_error");
-      if (result.errorMessage) {
+        safeResult.errorCode ??
+        (safeResult.status === "unconfirmed"
+          ? "unconfirmed_write"
+          : "http_error");
+      if (safeResult.errorMessage) {
         stderr.write(
-          `[dalton-native-commands] error (${code}): ${scrubNativeCommandSecrets(result.errorMessage, envSecrets, 2048)}\n`,
+          `[dalton-native-commands] error (${code}): ${safeResult.errorMessage}\n`,
         );
       }
       return exitCodeForErrorCode(code);
@@ -515,7 +512,7 @@ export async function runNativeCommandsCli(
   } catch (err) {
     const exitCode = exitCodeForNativeCommandError(err);
     const rawMsg = err instanceof Error ? err.message : String(err);
-    const safeMsg = scrubNativeCommandSecrets(rawMsg, envSecrets, 2048);
+    const safeMsg = scrubNativeCommandSecrets(rawMsg, envSecrets, 4096);
     const errorCode =
       err instanceof NativeCommandRegistrationError
         ? err.code

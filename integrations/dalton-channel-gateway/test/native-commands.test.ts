@@ -2684,3 +2684,695 @@ describe("Localization query preservation, PATCH verification, partial-apply out
     }
   });
 });
+
+describe("Structured result sanitization, JSON integrity, and dynamic token scrubbing in outbound results", () => {
+  const TEST_DISCORD_APP_ID = "123456789012345678";
+
+  function spawnNodeCli(
+    args: readonly string[],
+    env: NodeJS.ProcessEnv,
+  ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
+    return new Promise((resolveRun, rejectRun) => {
+      const child = spawn(process.execPath, [...args], {
+        env,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      const outBufs: Buffer[] = [];
+      const errBufs: Buffer[] = [];
+      child.stdout.on("data", (chunk: Buffer) => outBufs.push(chunk));
+      child.stderr.on("data", (chunk: Buffer) => errBufs.push(chunk));
+      child.on("error", rejectRun);
+      child.on("close", (code) => {
+        resolveRun({
+          exitCode: code ?? 1,
+          stdout: Buffer.concat(outBufs).toString("utf8"),
+          stderr: Buffer.concat(errBufs).toString("utf8"),
+        });
+      });
+    });
+  }
+
+  it("preserves valid JSON in a real CLI child process when applicationName has quotes/backslashes/token=\"demo\" and output exceeds 65,536 chars", async () => {
+    const OPAQUE_DISCORD_SECRET = "custom_opaque_discord_bot_secret_r4_998877";
+    const TRICKY_APP_NAME = 'Dalton "Pro" \\ Ops token="demo"';
+    const LONG_UNMANAGED_PREFIX = `ext_"quote"\\slash_${"A".repeat(4950)}`;
+    const LONG_UNMANAGED_RAW = `${LONG_UNMANAGED_PREFIX}_${OPAQUE_DISCORD_SECRET}`;
+
+    const preservedRemoteItems = Array.from({ length: 900 }, (_, idx) => {
+      if (idx === 0) {
+        return {
+          id: `id_long_${OPAQUE_DISCORD_SECRET}`,
+          type: 1,
+          name: LONG_UNMANAGED_RAW,
+          description: "Long unmanaged command",
+        };
+      }
+      return {
+        id: `id_legacy_${String(idx).padStart(4, "0")}`,
+        type: 1,
+        name: `legacy_custom_command_${String(idx).padStart(4, "0")}`,
+        description: "Legacy command",
+      };
+    });
+
+    const srv = await startLocalHttpServer((_req, res, rec) => {
+      if (rec.pathname === "/api/v10/oauth2/applications/@me") {
+        sendJson(res, 200, {
+          id: TEST_DISCORD_APP_ID,
+          name: TRICKY_APP_NAME,
+        });
+        return;
+      }
+      const base = `/api/v10/applications/${TEST_DISCORD_APP_ID}/commands`;
+      if (rec.method === "GET" && rec.pathname === base) {
+        sendJson(res, 200, [
+          {
+            id: "id_ws_existing",
+            type: 1,
+            name: "workspace",
+            description: "旧版工作区说明",
+            integration_types: [0],
+            contexts: [0, 1],
+            options: [
+              {
+                name: "workspace",
+                type: 3,
+                description: "旧版工作区参数说明",
+                required: false,
+                autocomplete: true,
+                description_localizations: {
+                  "en-US": `Target "ws" \\ path token="demo" ${OPAQUE_DISCORD_SECRET}`,
+                },
+              },
+            ],
+          },
+          ...preservedRemoteItems,
+        ]);
+        return;
+      }
+      sendJson(res, 404, {});
+    });
+
+    const here = dirname(fileURLToPath(import.meta.url));
+    const tempDir = mkdtempSync(join(tmpdir(), "dalton-native-cli-r4-"));
+    const bundlePath = join(tempDir, "native-commands.mjs");
+
+    try {
+      await build({
+        entryPoints: [resolve(here, "../src/native-commands/cli.ts")],
+        outfile: bundlePath,
+        bundle: true,
+        platform: "node",
+        target: "node22",
+        format: "esm",
+        banner: { js: "#!/usr/bin/env node" },
+        logLevel: "silent",
+      });
+
+      const childJson = await spawnNodeCli(
+        [
+          "--input-type=module",
+          "-e",
+          "const m = await import(process.env.CLI_BUNDLE_URL); process.exitCode = await m.runNativeCommandsCli(['--platform', 'discord', '--json'], { testApiOrigin: process.env.TEST_ORIGIN });",
+        ],
+        {
+          PATH: process.env.PATH ?? "",
+          CLI_BUNDLE_URL: pathToFileURL(bundlePath).href,
+          TEST_ORIGIN: srv.origin,
+          DALTON_DISCORD_BOT_TOKEN: OPAQUE_DISCORD_SECRET,
+          DALTON_DISCORD_APPLICATION_ID: TEST_DISCORD_APP_ID,
+        },
+      );
+
+      expect(childJson.exitCode).toBe(0);
+      expect(childJson.stdout.length).toBeGreaterThan(65_536);
+      expect(childJson.stdout).not.toContain(OPAQUE_DISCORD_SECRET);
+      expect(childJson.stderr).not.toContain(OPAQUE_DISCORD_SECRET);
+
+      const parsed = JSON.parse(childJson.stdout) as {
+        ok: boolean;
+        status: string;
+        applicationName: string;
+        plan: Array<{
+          name: string;
+          requestBody?: {
+            options?: Array<{
+              description_localizations?: Record<string, string>;
+            }>;
+          };
+        }>;
+        preservedCommands: Array<{ name: string; remoteId?: string }>;
+      };
+
+      expect(parsed.ok).toBe(true);
+      expect(parsed.status).toBe("preview");
+      expect(parsed.applicationName).toBe(TRICKY_APP_NAME);
+      expect(parsed.preservedCommands).toHaveLength(900);
+      expect(parsed.preservedCommands[899]?.name).toBe(
+        "legacy_custom_command_0899",
+      );
+      expect(parsed.preservedCommands[0]?.remoteId).toBe("id_long_[REDACTED]");
+      // Individual >4096-char free-text leaf is bounded sensibly (~4096 chars), never sliced to 128 chars
+      expect(parsed.preservedCommands[0]!.name.length).toBeGreaterThan(4_000);
+      expect(
+        parsed.preservedCommands[0]!.name.startsWith('ext_"quote"\\slash_'),
+      ).toBe(true);
+
+      // Deep nested object structure (> depth 4) remains intact and scrubbed
+      const wsPlan = parsed.plan.find((p) => p.name === "workspace")!;
+      expect(
+        wsPlan.requestBody?.options?.[0]?.description_localizations?.["en-US"],
+      ).toBe('Target "ws" \\ path token="demo" [REDACTED]');
+
+      // Large text output (>65,536 chars when formatted) also stays untruncated and secret-free
+      const childText = await spawnNodeCli(
+        [
+          "--input-type=module",
+          "-e",
+          "const m = await import(process.env.CLI_BUNDLE_URL); process.exitCode = await m.runNativeCommandsCli(['--platform', 'discord'], { testApiOrigin: process.env.TEST_ORIGIN });",
+        ],
+        {
+          PATH: process.env.PATH ?? "",
+          CLI_BUNDLE_URL: pathToFileURL(bundlePath).href,
+          TEST_ORIGIN: srv.origin,
+          DALTON_DISCORD_BOT_TOKEN: OPAQUE_DISCORD_SECRET,
+          DALTON_DISCORD_APPLICATION_ID: TEST_DISCORD_APP_ID,
+        },
+      );
+      expect(childText.exitCode).toBe(0);
+      expect(childText.stdout).toContain(TRICKY_APP_NAME);
+      expect(childText.stdout).toContain("legacy_custom_command_0899");
+      expect(childText.stdout).not.toContain(OPAQUE_DISCORD_SECRET);
+      expect(childText.stderr).not.toContain(OPAQUE_DISCORD_SECRET);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("scrubs dynamic Feishu tenant_access_token from command_id and public fields across preview, applied, failed, and unconfirmed results while sending real IDs on internal PATCH requests", async () => {
+    const FEISHU_APP_ID = "cli_dalton_r4_feishu";
+    const FEISHU_SECRET = "feishu_env_secret_r4_112233";
+    // Opaque token without `t-` prefix: CLI `envSecrets` cannot know this value;
+    // only the registrar's `activeSecrets` knows it.
+    const DYN_TENANT_TOKEN = "opaque_dyn_feishu_tok_r4_445566";
+
+    type FeishuItem = {
+      command_id: string;
+      command: string;
+      description: { default_value: string; i18n?: Record<string, string> };
+    };
+
+    let store: FeishuItem[] = [];
+    const resetStore = () => {
+      store = [
+        {
+          command_id: `unmanaged_id_${DYN_TENANT_TOKEN}`,
+          command: `ops_${DYN_TENANT_TOKEN}`,
+          description: { default_value: "运维命令" },
+        },
+        {
+          command_id: `id_main_${DYN_TENANT_TOKEN}`,
+          command: "main",
+          description: { default_value: "返回 Chief of Staff" },
+        },
+        {
+          command_id: `id_ws_${DYN_TENANT_TOKEN}`,
+          command: "workspace",
+          description: {
+            default_value: "旧工作区说明",
+            i18n: { en_us: `Switch workspace ${DYN_TENANT_TOKEN}` },
+          },
+        },
+      ];
+    };
+    resetStore();
+
+    let stopBehavior: "succeed" | "fail_403" | "disconnect_unconfirmed" =
+      "succeed";
+
+    const srv = await startLocalHttpServer((req, res, rec) => {
+      if (rec.pathname === "/open-apis/auth/v3/tenant_access_token/internal") {
+        sendJson(res, 200, {
+          code: 0,
+          tenant_access_token: DYN_TENANT_TOKEN,
+        });
+        return;
+      }
+
+      if (
+        rec.method === "GET" &&
+        rec.pathname === FEISHU_SLASH_COMMAND_BASE_PATH
+      ) {
+        sendJson(res, 200, {
+          code: 0,
+          data: { items: store, has_more: false },
+        });
+        return;
+      }
+
+      if (
+        rec.method === "PATCH" &&
+        rec.pathname.startsWith(`${FEISHU_SLASH_COMMAND_BASE_PATH}/`)
+      ) {
+        const targetId = decodeURIComponent(
+          rec.pathname.slice(`${FEISHU_SLASH_COMMAND_BASE_PATH}/`.length),
+        );
+        const found = store.find((item) => item.command_id === targetId);
+        if (!found) {
+          sendJson(res, 404, { code: 40400, msg: "command_id not found" });
+          return;
+        }
+        const patch = rec.jsonBody as {
+          description: { default_value: string; i18n?: Record<string, string> };
+        };
+        found.description = patch.description;
+        sendJson(res, 200, { code: 0, data: found });
+        return;
+      }
+
+      if (
+        rec.method === "POST" &&
+        rec.pathname === FEISHU_SLASH_COMMAND_BASE_PATH
+      ) {
+        const body = rec.jsonBody as {
+          command: string;
+          description: { default_value: string };
+        };
+        if (body.command === "stop" && stopBehavior === "fail_403") {
+          sendJson(res, 403, {
+            code: 99991672,
+            msg: `Forbidden creating stop with ${DYN_TENANT_TOKEN}`,
+          });
+          return;
+        }
+        if (
+          body.command === "stop" &&
+          stopBehavior === "disconnect_unconfirmed"
+        ) {
+          req.socket.destroy();
+          return;
+        }
+        const created: FeishuItem = {
+          command_id: `id_${body.command}_${DYN_TENANT_TOKEN}`,
+          command: body.command,
+          description: body.description,
+        };
+        store.push(created);
+        sendJson(res, 200, { code: 0, data: created });
+        return;
+      }
+
+      sendJson(res, 404, { code: 404 });
+    });
+
+    const here = dirname(fileURLToPath(import.meta.url));
+    const tempDir = mkdtempSync(join(tmpdir(), "dalton-feishu-cli-r4-"));
+    const bundlePath = join(tempDir, "native-commands.mjs");
+
+    try {
+      await build({
+        entryPoints: [resolve(here, "../src/native-commands/cli.ts")],
+        outfile: bundlePath,
+        bundle: true,
+        platform: "node",
+        target: "node22",
+        format: "esm",
+        banner: { js: "#!/usr/bin/env node" },
+        logLevel: "silent",
+      });
+
+      const baseChildEnv = {
+        PATH: process.env.PATH ?? "",
+        CLI_BUNDLE_URL: pathToFileURL(bundlePath).href,
+        TEST_ORIGIN: srv.origin,
+        DALTON_FEISHU_APP_ID: FEISHU_APP_ID,
+        DALTON_FEISHU_APP_SECRET: FEISHU_SECRET,
+      };
+
+      // 1. Preview (real child process `--json` + CLI text)
+      const previewChild = await spawnNodeCli(
+        [
+          "--input-type=module",
+          "-e",
+          "const m = await import(process.env.CLI_BUNDLE_URL); process.exitCode = await m.runNativeCommandsCli(['--platform', 'feishu', '--json'], { testApiOrigin: process.env.TEST_ORIGIN });",
+        ],
+        baseChildEnv,
+      );
+      expect(previewChild.exitCode).toBe(0);
+      expect(previewChild.stdout).not.toContain(DYN_TENANT_TOKEN);
+      expect(previewChild.stdout).not.toContain(FEISHU_SECRET);
+      expect(previewChild.stderr).not.toContain(DYN_TENANT_TOKEN);
+      const previewJson = JSON.parse(previewChild.stdout) as {
+        status: string;
+        plan: Array<{
+          name: string;
+          remoteId?: string;
+          requestPath?: string;
+          requestBody?: { description?: { i18n?: Record<string, string> } };
+        }>;
+        preservedCommands: Array<{ name: string; remoteId?: string }>;
+      };
+      expect(previewJson.status).toBe("preview");
+      expect(previewJson.plan.find((p) => p.name === "main")?.remoteId).toBe(
+        "id_main_[REDACTED]",
+      );
+      const wsPreview = previewJson.plan.find((p) => p.name === "workspace")!;
+      expect(wsPreview.remoteId).toBe("id_ws_[REDACTED]");
+      expect(wsPreview.requestPath).toBe(
+        `${FEISHU_SLASH_COMMAND_BASE_PATH}/id_ws_[REDACTED]`,
+      );
+      expect(wsPreview.requestBody?.description?.i18n?.en_us).toBe(
+        "Switch workspace [REDACTED]",
+      );
+      expect(previewJson.preservedCommands).toEqual([
+        { name: "ops_[REDACTED]", remoteId: "unmanaged_id_[REDACTED]" },
+      ]);
+
+      const previewTextOut = createBufferWriter();
+      const previewTextErr = createBufferWriter();
+      await runNativeCommandsCli(["--platform", "feishu"], {
+        env: baseChildEnv,
+        stdout: previewTextOut,
+        stderr: previewTextErr,
+        testApiOrigin: srv.origin,
+      });
+      expect(previewTextOut.text()).toContain("id_main_[REDACTED]");
+      expect(previewTextOut.text()).not.toContain(DYN_TENANT_TOKEN);
+      expect(previewTextErr.text()).not.toContain(DYN_TENANT_TOKEN);
+
+      // 2. Partial apply failure (`stop` returns 403): internal PATCH must still hit real ID!
+      resetStore();
+      srv.requests.length = 0;
+      stopBehavior = "fail_403";
+
+      const failedChild = await spawnNodeCli(
+        [
+          "--input-type=module",
+          "-e",
+          "const m = await import(process.env.CLI_BUNDLE_URL); process.exitCode = await m.runNativeCommandsCli(['--platform', 'feishu', '--apply', '--json'], { testApiOrigin: process.env.TEST_ORIGIN });",
+        ],
+        baseChildEnv,
+      );
+      expect(failedChild.exitCode).toBe(3);
+      // Verify outbound HTTP PATCH targeted the REAL unredacted command_id and i18n
+      const patchReq = srv.requests.find((r) => r.method === "PATCH")!;
+      expect(patchReq.pathname).toBe(
+        `${FEISHU_SLASH_COMMAND_BASE_PATH}/id_ws_${DYN_TENANT_TOKEN}`,
+      );
+      expect(patchReq.jsonBody).toEqual({
+        description: {
+          default_value: "查看可访问的工作区",
+          i18n: { en_us: `Switch workspace ${DYN_TENANT_TOKEN}` },
+        },
+      });
+      expect(failedChild.stdout).not.toContain(DYN_TENANT_TOKEN);
+      expect(failedChild.stderr).not.toContain(DYN_TENANT_TOKEN);
+      const failedJson = JSON.parse(failedChild.stdout) as {
+        ok: boolean;
+        status: string;
+        outcomes: Array<{ name: string; status: string; remoteId?: string }>;
+      };
+      expect(failedJson.ok).toBe(false);
+      expect(failedJson.status).toBe("failed");
+      expect(failedJson.outcomes.map((o) => [o.name, o.status, o.remoteId])).toEqual([
+        ["main", "unchanged", "id_main_[REDACTED]"],
+        ["workspace", "updated", "id_ws_[REDACTED]"],
+        ["new", "created", "id_new_[REDACTED]"],
+        ["stop", "failed", undefined],
+      ]);
+
+      // 3. Unconfirmed write (`stop` socket drops and live GET does not show `stop`)
+      stopBehavior = "disconnect_unconfirmed";
+      const unconfirmedChild = await spawnNodeCli(
+        [
+          "--input-type=module",
+          "-e",
+          "const m = await import(process.env.CLI_BUNDLE_URL); process.exitCode = await m.runNativeCommandsCli(['--platform', 'feishu', '--apply', '--json'], { testApiOrigin: process.env.TEST_ORIGIN });",
+        ],
+        baseChildEnv,
+      );
+      expect(unconfirmedChild.exitCode).toBe(4);
+      expect(unconfirmedChild.stdout).not.toContain(DYN_TENANT_TOKEN);
+      expect(unconfirmedChild.stderr).not.toContain(DYN_TENANT_TOKEN);
+      const unconfirmedJson = JSON.parse(unconfirmedChild.stdout) as {
+        ok: boolean;
+        status: string;
+        outcomes: Array<{ name: string; status: string; remoteId?: string }>;
+      };
+      expect(unconfirmedJson.ok).toBe(false);
+      expect(unconfirmedJson.status).toBe("unconfirmed");
+      expect(
+        unconfirmedJson.outcomes.find((o) => o.name === "new")?.remoteId,
+      ).toBe("id_new_[REDACTED]");
+
+      // Also check text mode on unconfirmed result
+      const unconfirmedTextOut = createBufferWriter();
+      const unconfirmedTextErr = createBufferWriter();
+      const unconfirmedTextCode = await runNativeCommandsCli(
+        ["--platform", "feishu", "--apply"],
+        {
+          env: baseChildEnv,
+          stdout: unconfirmedTextOut,
+          stderr: unconfirmedTextErr,
+          testApiOrigin: srv.origin,
+        },
+      );
+      expect(unconfirmedTextCode).toBe(4);
+      expect(unconfirmedTextOut.text()).not.toContain(DYN_TENANT_TOKEN);
+      expect(unconfirmedTextErr.text()).not.toContain(DYN_TENANT_TOKEN);
+
+      // 4. Full apply success (`resetStore` + `stopBehavior = "succeed"`)
+      resetStore();
+      srv.requests.length = 0;
+      stopBehavior = "succeed";
+
+      const appliedChild = await spawnNodeCli(
+        [
+          "--input-type=module",
+          "-e",
+          "const m = await import(process.env.CLI_BUNDLE_URL); process.exitCode = await m.runNativeCommandsCli(['--platform', 'feishu', '--apply', '--json'], { testApiOrigin: process.env.TEST_ORIGIN });",
+        ],
+        baseChildEnv,
+      );
+      expect(appliedChild.exitCode).toBe(0);
+      expect(
+        srv.requests.some(
+          (r) =>
+            r.method === "PATCH" &&
+            r.pathname ===
+              `${FEISHU_SLASH_COMMAND_BASE_PATH}/id_ws_${DYN_TENANT_TOKEN}`,
+        ),
+      ).toBe(true);
+      expect(appliedChild.stdout).not.toContain(DYN_TENANT_TOKEN);
+      expect(appliedChild.stdout).not.toContain(FEISHU_SECRET);
+      expect(appliedChild.stderr).not.toContain(DYN_TENANT_TOKEN);
+      expect(appliedChild.stderr).not.toContain(FEISHU_SECRET);
+
+      const appliedJson = JSON.parse(appliedChild.stdout) as {
+        ok: boolean;
+        status: string;
+        outcomes: Array<{ name: string; status: string; remoteId?: string }>;
+      };
+      expect(appliedJson.ok).toBe(true);
+      expect(appliedJson.status).toBe("applied");
+      expect(
+        appliedJson.outcomes.map((o) => [o.name, o.status, o.remoteId]),
+      ).toEqual([
+        ["main", "unchanged", "id_main_[REDACTED]"],
+        ["workspace", "updated", "id_ws_[REDACTED]"],
+        ["new", "created", "id_new_[REDACTED]"],
+        ["stop", "created", "id_stop_[REDACTED]"],
+      ]);
+
+      const appliedTextOut = createBufferWriter();
+      const appliedTextErr = createBufferWriter();
+      const appliedTextCode = await runNativeCommandsCli(
+        ["--platform", "feishu", "--apply"],
+        {
+          env: baseChildEnv,
+          stdout: appliedTextOut,
+          stderr: appliedTextErr,
+          testApiOrigin: srv.origin,
+        },
+      );
+      expect(appliedTextCode).toBe(0);
+      expect(appliedTextOut.text()).toContain("id_stop_[REDACTED]");
+      expect(appliedTextOut.text()).not.toContain(DYN_TENANT_TOKEN);
+      expect(appliedTextErr.text()).not.toContain(DYN_TENANT_TOKEN);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  it("scrubs opaque Discord bot tokens echoed in remote command IDs, applicationName, and localizations across preview, applied, failed, and unconfirmed results without breaking internal PATCH IDs", async () => {
+    const OPAQUE_BOT_TOKEN = "custom_opaque_discord_tok_r4_667788";
+    type DiscordCmd = Record<string, unknown>;
+    let store: DiscordCmd[] = [];
+    const resetStore = () => {
+      store = [
+        {
+          id: `id_extra_${OPAQUE_BOT_TOKEN}`,
+          type: 1,
+          name: `extra_${OPAQUE_BOT_TOKEN}`,
+          description: "Extra command",
+        },
+        {
+          id: `id_main_${OPAQUE_BOT_TOKEN}`,
+          type: 1,
+          name: "main",
+          description: "返回 Chief of Staff",
+          integration_types: [0],
+          contexts: [0, 1],
+        },
+        {
+          id: `id_ws_${OPAQUE_BOT_TOKEN}`,
+          type: 1,
+          name: "workspace",
+          description: "旧描述",
+          integration_types: [0],
+          contexts: [0, 1],
+          options: [
+            {
+              name: "workspace",
+              type: 3,
+              description: "旧参数说明",
+              required: false,
+              autocomplete: true,
+              name_localizations: { "en-US": `ws_${OPAQUE_BOT_TOKEN}` },
+            },
+          ],
+        },
+      ];
+    };
+    resetStore();
+
+    let stopBehavior: "succeed" | "fail_403" | "disconnect_unconfirmed" =
+      "succeed";
+    const base = `/api/v10/applications/${TEST_DISCORD_APP_ID}/commands`;
+
+    const srv = await startLocalHttpServer((req, res, rec) => {
+      if (rec.pathname === "/api/v10/oauth2/applications/@me") {
+        sendJson(res, 200, {
+          id: TEST_DISCORD_APP_ID,
+          name: `Dalton "App" \\ ${OPAQUE_BOT_TOKEN}`,
+        });
+        return;
+      }
+      if (rec.method === "GET" && rec.pathname === base) {
+        sendJson(res, 200, store);
+        return;
+      }
+      if (rec.method === "PATCH" && rec.pathname.startsWith(`${base}/`)) {
+        const targetId = decodeURIComponent(
+          rec.pathname.slice(`${base}/`.length),
+        );
+        const found = store.find((c) => c.id === targetId);
+        if (!found) {
+          sendJson(res, 404, { message: "Unknown Application Command" });
+          return;
+        }
+        Object.assign(found, rec.jsonBody as Record<string, unknown>);
+        sendJson(res, 200, found);
+        return;
+      }
+      if (rec.method === "POST" && rec.pathname === base) {
+        const body = rec.jsonBody as Record<string, unknown>;
+        if (body.name === "stop" && stopBehavior === "fail_403") {
+          sendJson(res, 403, {
+            code: 50013,
+            message: `Missing Permissions for ${OPAQUE_BOT_TOKEN}`,
+          });
+          return;
+        }
+        if (body.name === "stop" && stopBehavior === "disconnect_unconfirmed") {
+          req.socket.destroy();
+          return;
+        }
+        const created: DiscordCmd = {
+          id: `id_${String(body.name)}_${OPAQUE_BOT_TOKEN}`,
+          ...body,
+        };
+        store.push(created);
+        sendJson(res, 201, created);
+        return;
+      }
+      sendJson(res, 404, {});
+    });
+
+    // 1. Preview via library
+    const previewRes = await syncDiscordNativeCommands({
+      botToken: OPAQUE_BOT_TOKEN,
+      applicationId: TEST_DISCORD_APP_ID,
+      mode: "preview",
+      testApiOrigin: srv.origin,
+    });
+    expect(previewRes.applicationName).toBe('Dalton "App" \\ [REDACTED]');
+    expect(JSON.stringify(previewRes)).not.toContain(OPAQUE_BOT_TOKEN);
+
+    // 2. Partial failure (`stop` 403) — internal PATCH uses real ID
+    stopBehavior = "fail_403";
+    srv.requests.length = 0;
+    const failedRes = await syncDiscordNativeCommands({
+      botToken: OPAQUE_BOT_TOKEN,
+      applicationId: TEST_DISCORD_APP_ID,
+      mode: "apply",
+      testApiOrigin: srv.origin,
+    });
+    expect(failedRes.status).toBe("failed");
+    const discordPatch = srv.requests.find((r) => r.method === "PATCH")!;
+    expect(discordPatch.pathname).toBe(`${base}/id_ws_${OPAQUE_BOT_TOKEN}`);
+    expect(discordPatch.jsonBody).toMatchObject({
+      options: [
+        {
+          name_localizations: { "en-US": `ws_${OPAQUE_BOT_TOKEN}` },
+        },
+      ],
+    });
+    expect(JSON.stringify(failedRes)).not.toContain(OPAQUE_BOT_TOKEN);
+
+    // 3. Unconfirmed (`stop` socket drops)
+    stopBehavior = "disconnect_unconfirmed";
+    const unconfirmedRes = await syncDiscordNativeCommands({
+      botToken: OPAQUE_BOT_TOKEN,
+      applicationId: TEST_DISCORD_APP_ID,
+      mode: "apply",
+      testApiOrigin: srv.origin,
+    });
+    expect(unconfirmedRes.status).toBe("unconfirmed");
+    expect(JSON.stringify(unconfirmedRes)).not.toContain(OPAQUE_BOT_TOKEN);
+
+    // 4. Full apply success
+    resetStore();
+    stopBehavior = "succeed";
+    const outJson = createBufferWriter();
+    const errJson = createBufferWriter();
+    const exitCode = await runNativeCommandsCli(
+      ["--platform", "discord", "--apply", "--json"],
+      {
+        env: {
+          DALTON_DISCORD_BOT_TOKEN: OPAQUE_BOT_TOKEN,
+          DALTON_DISCORD_APPLICATION_ID: TEST_DISCORD_APP_ID,
+        },
+        stdout: outJson,
+        stderr: errJson,
+        testApiOrigin: srv.origin,
+      },
+    );
+    expect(exitCode).toBe(0);
+    expect(outJson.text()).not.toContain(OPAQUE_BOT_TOKEN);
+    expect(errJson.text()).not.toContain(OPAQUE_BOT_TOKEN);
+    const parsedApplied = JSON.parse(outJson.text()) as {
+      status: string;
+      applicationName: string;
+      outcomes: Array<{ name: string; remoteId?: string }>;
+    };
+    expect(parsedApplied.status).toBe("applied");
+    expect(parsedApplied.applicationName).toBe('Dalton "App" \\ [REDACTED]');
+    expect(parsedApplied.outcomes.map((o) => [o.name, o.remoteId])).toEqual([
+      ["main", "id_main_[REDACTED]"],
+      ["workspace", "id_ws_[REDACTED]"],
+      ["new", "id_new_[REDACTED]"],
+      ["stop", "id_stop_[REDACTED]"],
+    ]);
+  });
+});

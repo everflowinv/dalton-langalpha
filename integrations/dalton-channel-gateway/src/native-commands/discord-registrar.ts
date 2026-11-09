@@ -29,6 +29,8 @@ import {
 } from "./manifest.js";
 import {
   createSecretAwareLogger,
+  MAX_STRUCTURED_STRING_LENGTH,
+  sanitizeNativeCommandSyncResult,
   sanitizeRegistrationError,
   scrubNativeCommandSecrets,
 } from "./redact.js";
@@ -325,7 +327,17 @@ export async function syncDiscordNativeCommands(
 
   const activeSecrets = new Set<string>([botToken]);
   const redact = (text: string): string =>
-    scrubNativeCommandSecrets(text, activeSecrets, 2048);
+    scrubNativeCommandSecrets(
+      text,
+      activeSecrets,
+      MAX_STRUCTURED_STRING_LENGTH,
+    );
+  // Sanitize an outbound copy with `activeSecrets` only at return boundaries so
+  // internal HTTP calls continue using real remote command IDs and localizations.
+  const finalizeResult = (
+    rawResult: NativeCommandSyncResult,
+  ): NativeCommandSyncResult =>
+    sanitizeNativeCommandSyncResult(rawResult, activeSecrets);
   const logger = createSecretAwareLogger({
     subsystem: "native-commands/discord",
     baseLogger: options.logger,
@@ -389,7 +401,7 @@ export async function syncDiscordNativeCommands(
     const applicationName =
       typeof identityResp.data.name === "string" &&
       identityResp.data.name.trim().length > 0
-        ? redact(identityResp.data.name.trim())
+        ? identityResp.data.name.trim()
         : undefined;
 
     if (!actualAppId) {
@@ -523,7 +535,7 @@ export async function syncDiscordNativeCommands(
         unchangedCount: plan.filter((p) => p.action === "unchanged").length,
         preservedCount: preservedCommands.length,
       });
-      return {
+      return finalizeResult({
         ok: true,
         status: "preview",
         platform: "discord",
@@ -539,7 +551,7 @@ export async function syncDiscordNativeCommands(
             ? "全局命令显式启用服务器频道 (GUILD=0) 与机器人私聊 (BOT_DM=1) 上下文。"
             : `当前仅针对测试服务器 (${scope.guildId}) 预览，不包含机器人私聊全局菜单。`,
         ],
-      };
+      });
     }
 
     // 4. Execute targeted creates/updates with post-disconnect state verification
@@ -634,7 +646,7 @@ export async function syncDiscordNativeCommands(
             scope: scopeLabel,
             code: regErr.code,
           });
-          return {
+          return finalizeResult({
             ok: false,
             status: "failed",
             platform: "discord",
@@ -648,7 +660,7 @@ export async function syncDiscordNativeCommands(
             notes: [],
             errorCode: regErr.code,
             errorMessage,
-          };
+          });
         }
 
         const safeReason = redact(err.reason);
@@ -732,7 +744,7 @@ export async function syncDiscordNativeCommands(
 
         const errorMessage = `Discord 命令 "/${item.name}" 写入结果未确认（${fullUnconfirmedReason}）。为避免盲目重复创建，已停止后续写入；可重新执行预览或 --apply 进行幂等核对。`;
         logger.error(errorMessage);
-        return {
+        return finalizeResult({
           ok: false,
           status: "unconfirmed",
           platform: "discord",
@@ -746,7 +758,7 @@ export async function syncDiscordNativeCommands(
           notes: [],
           errorCode: "unconfirmed_write",
           errorMessage,
-        };
+        });
       }
     }
 
@@ -768,7 +780,7 @@ export async function syncDiscordNativeCommands(
       preservedCount: preservedCommands.length,
     });
 
-    return {
+    return finalizeResult({
       ok: true,
       status: "applied",
       platform: "discord",
@@ -780,7 +792,7 @@ export async function syncDiscordNativeCommands(
       outcomes,
       preservedCommands,
       notes,
-    };
+    });
   } catch (err) {
     throw sanitizeRegistrationError(err, activeSecrets, "discord");
   }

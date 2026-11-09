@@ -16,11 +16,15 @@ import {
 import {
   type NativeCommandPlatform,
   NativeCommandRegistrationError,
+  type NativeCommandSyncResult,
 } from "./types.js";
 
 const DISCORD_BOT_AUTH_PATTERN = /\b(Bot\s+)[A-Za-z0-9._~+/=-]+/gi;
 const DISCORD_TOKEN_SHAPE_PATTERN =
   /\b[MN][A-Za-z\d]{20,}\.[\w-]{6}\.[\w-]{25,}\b/g;
+const ALREADY_TRUNCATED_SUFFIX = /\.\.\.\[truncated:\d+\]$/;
+
+export const MAX_STRUCTURED_STRING_LENGTH = 4_096;
 
 function collectSecretVariants(secrets: Iterable<string>): string[] {
   const variants = new Set<string>();
@@ -52,17 +56,34 @@ function collectSecretVariants(secrets: Iterable<string>): string[] {
   return [...variants].sort((a, b) => b.length - a.length);
 }
 
-export function scrubNativeCommandSecrets(
+function truncatePreservingHead(value: string, maxLength: number): string {
+  if (
+    value.length <= maxLength ||
+    (value.length <= maxLength + 32 && ALREADY_TRUNCATED_SUFFIX.test(value))
+  ) {
+    return value;
+  }
+  let end = maxLength;
+  if (end > 0) {
+    const lastCode = value.charCodeAt(end - 1);
+    if (lastCode >= 0xd800 && lastCode <= 0xdbff) {
+      end -= 1;
+    }
+  }
+  return `${value.slice(0, end)}...[truncated:${value.length}]`;
+}
+
+function scrubStringWithVariants(
   value: string,
-  secrets: Iterable<string> = [],
-  maxLength = 512,
+  secretVariants: readonly string[],
+  maxLength: number,
 ): string {
   if (!value) {
     return value;
   }
 
   let out = value;
-  for (const secret of collectSecretVariants(secrets)) {
+  for (const secret of secretVariants) {
     if (out.includes(secret)) {
       out = out.split(secret).join("[REDACTED]");
     }
@@ -72,7 +93,104 @@ export function scrubNativeCommandSecrets(
     .replace(DISCORD_BOT_AUTH_PATTERN, "$1[REDACTED]")
     .replace(DISCORD_TOKEN_SHAPE_PATTERN, "[REDACTED]");
 
-  return redactCredentialString(out, maxLength);
+  // Run pattern-based credential scrubbing over the entire string without
+  // invoking `redactCredentialString`'s 128-character log head slice.
+  out = redactCredentialString(out, Number.MAX_SAFE_INTEGER);
+  return truncatePreservingHead(out, maxLength);
+}
+
+export function scrubNativeCommandSecrets(
+  value: string,
+  secrets: Iterable<string> = [],
+  maxLength = 512,
+): string {
+  if (!value) {
+    return value;
+  }
+
+  return scrubStringWithVariants(
+    value,
+    collectSecretVariants(secrets),
+    maxLength,
+  );
+}
+
+function sanitizeStructuredData(
+  value: unknown,
+  secretVariants: readonly string[],
+  maxStringLength: number,
+  ancestors: WeakSet<object>,
+): unknown {
+  if (value === null || value === undefined) {
+    return value;
+  }
+  if (typeof value === "string") {
+    return scrubStringWithVariants(value, secretVariants, maxStringLength);
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    if (ancestors.has(value)) {
+      return [];
+    }
+    ancestors.add(value);
+    try {
+      return value.map((entry) =>
+        sanitizeStructuredData(
+          entry,
+          secretVariants,
+          maxStringLength,
+          ancestors,
+        ),
+      );
+    } finally {
+      ancestors.delete(value);
+    }
+  }
+  if (typeof value === "object") {
+    if (ancestors.has(value)) {
+      return {};
+    }
+    ancestors.add(value);
+    try {
+      const out: Record<string, unknown> = {};
+      for (const [rawKey, rawVal] of Object.entries(
+        value as Record<string, unknown>,
+      )) {
+        const safeKey = scrubStringWithVariants(rawKey, secretVariants, 256);
+        out[safeKey] = sanitizeStructuredData(
+          rawVal,
+          secretVariants,
+          maxStringLength,
+          ancestors,
+        );
+      }
+      return out;
+    } finally {
+      ancestors.delete(value);
+    }
+  }
+  return scrubStringWithVariants(String(value), secretVariants, maxStringLength);
+}
+
+/**
+ * Returns a deep-cloned `NativeCommandSyncResult` with every string leaf and
+ * dynamic key scrubbed against `secrets` while preserving all array entries
+ * and nested object structures intact.
+ */
+export function sanitizeNativeCommandSyncResult(
+  result: NativeCommandSyncResult,
+  secrets: Iterable<string> = [],
+  maxStringLength: number = MAX_STRUCTURED_STRING_LENGTH,
+): NativeCommandSyncResult {
+  const secretVariants = collectSecretVariants(secrets);
+  return sanitizeStructuredData(
+    result,
+    secretVariants,
+    maxStringLength,
+    new WeakSet<object>(),
+  ) as NativeCommandSyncResult;
 }
 
 function scrubMetaValue(

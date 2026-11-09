@@ -28,6 +28,8 @@ import {
 } from "./manifest.js";
 import {
   createSecretAwareLogger,
+  MAX_STRUCTURED_STRING_LENGTH,
+  sanitizeNativeCommandSyncResult,
   sanitizeRegistrationError,
   scrubNativeCommandSecrets,
 } from "./redact.js";
@@ -336,7 +338,18 @@ export async function syncFeishuNativeCommands(
 
   const activeSecrets = new Set<string>([appSecret]);
   const redact = (text: string): string =>
-    scrubNativeCommandSecrets(text, activeSecrets, 2048);
+    scrubNativeCommandSecrets(
+      text,
+      activeSecrets,
+      MAX_STRUCTURED_STRING_LENGTH,
+    );
+  // Sanitize an outbound copy with `activeSecrets` (including dynamic
+  // `tenant_access_token`) only at return boundaries so internal HTTP calls
+  // continue using real remote command IDs and preserved fields.
+  const finalizeResult = (
+    rawResult: NativeCommandSyncResult,
+  ): NativeCommandSyncResult =>
+    sanitizeNativeCommandSyncResult(rawResult, activeSecrets);
   const logger = createSecretAwareLogger({
     subsystem: "native-commands/feishu",
     baseLogger: options.logger,
@@ -557,7 +570,7 @@ export async function syncFeishuNativeCommands(
         unchangedCount: plan.filter((p) => p.action === "unchanged").length,
         preservedCount: preservedCommands.length,
       });
-      return {
+      return finalizeResult({
         ok: true,
         status: "preview",
         platform: "feishu",
@@ -568,7 +581,7 @@ export async function syncFeishuNativeCommands(
         notes: [
           "当前为预览模式（未携带 --apply），未执行任何创建或修改请求。",
         ],
-      };
+      });
     }
 
     // 4. Apply planned mutations with post-disconnect state verification and
@@ -662,7 +675,7 @@ export async function syncFeishuNativeCommands(
             command: item.name,
             code: regErr.code,
           });
-          return {
+          return finalizeResult({
             ok: false,
             status: "failed",
             platform: "feishu",
@@ -674,7 +687,7 @@ export async function syncFeishuNativeCommands(
             notes: wroteAny ? [FEISHU_CLIENT_CACHE_NOTE] : [],
             errorCode: regErr.code,
             errorMessage,
-          };
+          });
         }
 
         const safeReason = redact(err.reason);
@@ -752,7 +765,7 @@ export async function syncFeishuNativeCommands(
 
         const errorMessage = `飞书命令 "/${item.name}" 写入结果未确认（${fullUnconfirmedReason}）。为避免盲目重复创建，已停止后续写入；可重新执行预览或 --apply 进行幂等核对。`;
         logger.error(errorMessage);
-        return {
+        return finalizeResult({
           ok: false,
           status: "unconfirmed",
           platform: "feishu",
@@ -764,7 +777,7 @@ export async function syncFeishuNativeCommands(
           notes: wroteAny ? [FEISHU_CLIENT_CACHE_NOTE] : [],
           errorCode: "unconfirmed_write",
           errorMessage,
-        };
+        });
       }
     }
 
@@ -776,7 +789,7 @@ export async function syncFeishuNativeCommands(
       preservedCount: preservedCommands.length,
     });
 
-    return {
+    return finalizeResult({
       ok: true,
       status: "applied",
       platform: "feishu",
@@ -786,7 +799,7 @@ export async function syncFeishuNativeCommands(
       outcomes,
       preservedCommands,
       notes,
-    };
+    });
   } catch (err) {
     throw sanitizeRegistrationError(err, activeSecrets, "feishu");
   }
