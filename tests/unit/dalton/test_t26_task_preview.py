@@ -1263,3 +1263,232 @@ def test_t26_dalton_python_bin_priority_stale_venv_ignored_and_external_run_dir_
     assert fallback_res.returncode == 0, fallback_res.stderr
     assert fallback_outbox.is_file()
     _assert_no_bootstrap_or_openclaw(tmp_path, ws, expect_no_skill_venv=False)
+
+
+@pytest.mark.asyncio
+async def test_t26_external_dir_symlink_to_workspace_png_fails_without_copy_and_preserves_other_collector(
+    tmp_path: Path,
+) -> None:
+    # Simulate macOS-style system root symlink (/var -> /private/var) above the workspace directory
+    # so both raw_ws and resolved ws_root normalization are exercised alongside external symlink rejection.
+    real_var = tmp_path / "real_var"
+    real_ws = real_var / "workspace"
+    real_ws.mkdir(parents=True)
+    os_var_alias = tmp_path / "os_var_alias"
+    os_var_alias.symlink_to(real_var)
+    raw_ws_via_parent = os_var_alias / "workspace"
+    ws_root = real_ws.resolve(strict=True)
+
+    _setup_workspace(ws_root)
+    fake_bin, _, _ = _install_trap_openclaw(tmp_path)
+    base_env = _build_clean_base_env(fake_bin)
+    empty_secrets = tmp_path / "empty_secrets"
+    empty_secrets.mkdir()
+
+    specs_dir = tmp_path / "specs"
+    invocation_log = tmp_path / "invocations.log"
+    bottom_spec = specs_dir / "bottom.json"
+    top_spec = specs_dir / "top.json"
+    _write_collector_fixture(
+        ws_root, "us-bottom-monitor", spec_file=bottom_spec, invocation_log=invocation_log
+    )
+    _write_collector_fixture(
+        ws_root, "us-top-monitor", spec_file=top_spec, invocation_log=invocation_log
+    )
+
+    bottom_chart_dir = ws_root / "temp" / "us-bottom-monitor"
+    bottom_chart_dir.mkdir(parents=True, exist_ok=True)
+    bottom_aliased_bytes = b"\x89PNG\r\n\x1a\nVALID-IN-WS-VIA-EXTERNAL-SYMLINK"
+    top_valid_bytes = b"\x89PNG\r\n\x1a\nVALID-TOP-KEEP-ON-PARTIAL-FAIL"
+
+    # External directory symlink outside workspace pointing to valid chart directory inside workspace.
+    external_chart_alias = tmp_path / "chart-alias"
+    external_chart_alias.symlink_to(bottom_chart_dir)
+
+    _write_spec(
+        bottom_spec,
+        feishu_message="BOTTOM-THROUGH-EXTERNAL-ALIAS",
+        chart=str(external_chart_alias / "chart.png"),
+        write_chart_rel="temp/us-bottom-monitor/chart.png",
+        chart_bytes=bottom_aliased_bytes,
+    )
+    _write_spec(
+        top_spec,
+        feishu_message="TOP-VALID-PRESERVED",
+        chart="temp/us-top-monitor/valid_top.png",
+        write_chart_rel="temp/us-top-monitor/valid_top.png",
+        chart_bytes=top_valid_bytes,
+    )
+
+    run_id_ext = "run-ext-dir-symlink-chart"
+    outbox_tmp_ext = tmp_path / "tmpfs_ext_alias"
+    res_ext = await run_wrapped_command(
+        [sys.executable, "scripts/cron_command_tasks.py", T26_JOB_KEY],
+        run_id=run_id_ext,
+        job_key=T26_JOB_KEY,
+        workdir=str(raw_ws_via_parent),
+        workspace_dir=str(raw_ws_via_parent),
+        secrets_dir=empty_secrets,
+        outbox_tmp_dir=outbox_tmp_ext,
+        base_env=base_env,
+        stdout_sink=io.StringIO(),
+        stderr_sink=io.StringIO(),
+    )
+
+    # 1. External symlink alias to in-workspace PNG must fail, not copy bottom chart, and preserve top chart.
+    assert (ws_root / "temp" / "us-bottom-monitor" / "chart.png").is_file()
+    assert res_ext.exit_code == 1
+    eval_ext = evaluate_task_run(
+        TaskEvaluationContext(job_key=T26_JOB_KEY, exit_code=res_ext.exit_code)
+    )
+    assert eval_ext.ok is False and eval_ext.status == "failed"
+    assert res_ext.outbox_payload is not None
+    assert res_ext.outbox_payload["ok"] is False
+    assert res_ext.outbox_payload["delivered"] is False
+    assert res_ext.outbox_payload["delivery_status"] == "failed"
+    assert res_ext.outbox_payload["error"].startswith("us-bottom-monitor：")
+    assert "附件不存在或不在 workspace" in res_ext.outbox_payload["error"]
+
+    run_dir_ext = ws_root / ".dalton-runs" / run_id_ext
+    att_files_ext = sorted(p.name for p in (run_dir_ext / "attachments").iterdir())
+    assert att_files_ext == ["0.png"]
+    assert (run_dir_ext / "attachments" / "0.png").read_bytes() == top_valid_bytes
+    for p in run_dir_ext.rglob("*"):
+        if p.is_file():
+            assert bottom_aliased_bytes not in p.read_bytes()
+
+    assert len(res_ext.outbox_payload["items"]) == 1
+    kept_item = res_ext.outbox_payload["items"][0]
+    assert kept_item["skill"] == "us-top-monitor"
+    assert kept_item["channel"] == "discord"
+    assert kept_item["target"] == EXPECTED_DISCORD_TARGET
+    assert kept_item["original_text"] == "TOP-VALID-PRESERVED"
+    assert kept_item["text"] == (
+        "TOP-VALID-PRESERVED\n⚠️ 另一份未取得：" + res_ext.outbox_payload["error"]
+    )
+    assert kept_item["media"] == "attachments/0.png"
+    assert kept_item["delivered"] is False
+
+    last_run_path = ws_root / "state" / "cron-command" / T26_JOB_KEY / "last-run.json"
+    lr_ext = json.loads(last_run_path.read_text(encoding="utf-8"))
+    assert lr_ext["ok"] is False and lr_ext["delivered"] is False
+    assert lr_ext["plan"]["error"] == res_ext.outbox_payload["error"]
+    assert lr_ext["plan"]["items"] == [
+        {
+            "channel": "discord",
+            "target": EXPECTED_DISCORD_TARGET,
+            "text": kept_item["text"],
+            "media": str((run_dir_ext / "attachments" / "0.png").resolve()),
+        }
+    ]
+    assert invocation_log.read_text(encoding="utf-8").splitlines() == [
+        f"us-bottom-monitor:{SKILL_CLI_REL_PATHS['us-bottom-monitor']}:--json run",
+        f"us-top-monitor:{SKILL_CLI_REL_PATHS['us-top-monitor']}:--json run",
+    ]
+
+    # Also test a /tmp-anchored external directory symlink (/tmp/.../chart-alias/chart.png -> ws/temp).
+    if Path("/tmp").is_dir() and os.access("/tmp", os.W_OK):
+        with tempfile.TemporaryDirectory(dir="/tmp", prefix="t26-ext-alias-") as slash_tmp_dir:
+            slash_tmp_alias = Path(slash_tmp_dir) / "chart-alias"
+            slash_tmp_alias.symlink_to(bottom_chart_dir)
+            _write_spec(
+                bottom_spec,
+                feishu_message="BOTTOM-THROUGH-SLASH-TMP-ALIAS",
+                chart=str(slash_tmp_alias / "chart.png"),
+                write_chart_rel="temp/us-bottom-monitor/chart.png",
+                chart_bytes=bottom_aliased_bytes,
+            )
+            res_slash_tmp = await run_wrapped_command(
+                [sys.executable, "scripts/cron_command_tasks.py", T26_JOB_KEY],
+                run_id="run-slash-tmp-alias-chart",
+                job_key=T26_JOB_KEY,
+                workdir=str(raw_ws_via_parent),
+                workspace_dir=str(raw_ws_via_parent),
+                secrets_dir=empty_secrets,
+                outbox_tmp_dir=tmp_path / "tmpfs_slash_tmp_alias",
+                base_env=base_env,
+                stdout_sink=io.StringIO(),
+                stderr_sink=io.StringIO(),
+            )
+            assert res_slash_tmp.exit_code == 1
+            assert res_slash_tmp.outbox_payload is not None
+            assert res_slash_tmp.outbox_payload["ok"] is False
+            assert "附件不存在或不在 workspace" in res_slash_tmp.outbox_payload["error"]
+            run_dir_slash = ws_root / ".dalton-runs" / "run-slash-tmp-alias-chart"
+            assert sorted(p.name for p in (run_dir_slash / "attachments").iterdir()) == ["0.png"]
+            for p in run_dir_slash.rglob("*"):
+                if p.is_file():
+                    assert bottom_aliased_bytes not in p.read_bytes()
+
+    # 2. In-workspace directory symlink pointing to in-workspace PNG is also rejected without copying.
+    internal_chart_alias = ws_root / "temp" / "internal-chart-alias"
+    internal_chart_alias.symlink_to(bottom_chart_dir)
+    _write_spec(
+        bottom_spec,
+        feishu_message="BOTTOM-THROUGH-INTERNAL-ALIAS",
+        chart=str(raw_ws_via_parent / "temp" / "internal-chart-alias" / "chart.png"),
+        write_chart_rel="temp/us-bottom-monitor/chart.png",
+        chart_bytes=bottom_aliased_bytes,
+    )
+    run_id_int = "run-int-dir-symlink-chart"
+    outbox_tmp_int = tmp_path / "tmpfs_int_alias"
+    res_int = await run_wrapped_command(
+        [sys.executable, "scripts/cron_command_tasks.py", T26_JOB_KEY],
+        run_id=run_id_int,
+        job_key=T26_JOB_KEY,
+        workdir=str(raw_ws_via_parent),
+        workspace_dir=str(raw_ws_via_parent),
+        secrets_dir=empty_secrets,
+        outbox_tmp_dir=outbox_tmp_int,
+        base_env=base_env,
+        stdout_sink=io.StringIO(),
+        stderr_sink=io.StringIO(),
+    )
+    assert res_int.exit_code == 1
+    assert res_int.outbox_payload is not None
+    assert res_int.outbox_payload["ok"] is False
+    assert "附件路径包含软链接" in res_int.outbox_payload["error"]
+    run_dir_int = ws_root / ".dalton-runs" / run_id_int
+    assert sorted(p.name for p in (run_dir_int / "attachments").iterdir()) == ["0.png"]
+    for p in run_dir_int.rglob("*"):
+        if p.is_file():
+            assert bottom_aliased_bytes not in p.read_bytes()
+
+    # 3. Legitimate raw_ws and normalized ws_root absolute chart paths still succeed cleanly.
+    _write_spec(
+        bottom_spec,
+        feishu_message="BOTTOM-RAW-WS-VALID",
+        chart=str(raw_ws_via_parent / "temp" / "us-bottom-monitor" / "chart.png"),
+        write_chart_rel="temp/us-bottom-monitor/chart.png",
+        chart_bytes=bottom_aliased_bytes,
+    )
+    _write_spec(
+        top_spec,
+        feishu_message="TOP-RESOLVED-WS-VALID",
+        chart=str(ws_root / "temp" / "us-top-monitor" / "valid_top.png"),
+        write_chart_rel="temp/us-top-monitor/valid_top.png",
+        chart_bytes=top_valid_bytes,
+    )
+    run_id_norm = "run-valid-ws-root-normalization"
+    outbox_tmp_norm = tmp_path / "tmpfs_norm"
+    res_norm = await run_wrapped_command(
+        [sys.executable, "scripts/cron_command_tasks.py", T26_JOB_KEY],
+        run_id=run_id_norm,
+        job_key=T26_JOB_KEY,
+        workdir=str(raw_ws_via_parent),
+        workspace_dir=str(raw_ws_via_parent),
+        secrets_dir=empty_secrets,
+        outbox_tmp_dir=outbox_tmp_norm,
+        base_env=base_env,
+        stdout_sink=io.StringIO(),
+        stderr_sink=io.StringIO(),
+    )
+    assert res_norm.exit_code == 0, res_norm.redacted_stderr
+    assert res_norm.outbox_payload is not None
+    assert res_norm.outbox_payload["ok"] is True
+    assert res_norm.outbox_payload["delivered"] is False
+    run_dir_norm = ws_root / ".dalton-runs" / run_id_norm
+    assert (run_dir_norm / "attachments" / "0.png").read_bytes() == bottom_aliased_bytes
+    assert (run_dir_norm / "attachments" / "1.png").read_bytes() == top_valid_bytes
+    _assert_no_bootstrap_or_openclaw(tmp_path, ws_root)
+    _assert_no_temp_files(ws_root, outbox_tmp_ext, outbox_tmp_int, outbox_tmp_norm)

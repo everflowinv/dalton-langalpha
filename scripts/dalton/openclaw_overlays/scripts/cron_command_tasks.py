@@ -251,7 +251,10 @@ def _resolve_dalton_workspace() -> tuple[Path, Path]:
             raise ValueError(f'workspace 路径不能为软链接：{raw_path}')
         if not raw_path.exists() or not raw_path.is_dir():
             raise ValueError(f'workspace 目录不存在：{raw_path}')
-        return raw_path.resolve(strict=True), raw_path
+        raw_abs = Path(os.path.abspath(raw_path))
+        if raw_abs.is_symlink():
+            raise ValueError(f'workspace 路径不能为软链接：{raw_abs}')
+        return raw_abs.resolve(strict=True), raw_abs
     if not WS.exists() or not WS.is_dir():
         raise ValueError(f'workspace 目录不存在：{WS}')
     return WS.resolve(strict=True), WS
@@ -437,7 +440,10 @@ def _assert_no_symlinks_under_base(base: Path, rel_parts: tuple[str, ...]) -> No
 def _validate_workspace_chart(chart_raw: Any, ws_root: Path, raw_ws: Path) -> Path:
     if not isinstance(chart_raw, str) or not chart_raw.strip() or '\x00' in chart_raw:
         raise ValueError('采集输出缺少有效 chart')
-    raw_p = Path(chart_raw.strip())
+    stripped = chart_raw.strip()
+    if stripped.endswith(('/', '\\')):
+        raise ValueError(f'附件不存在或不在 workspace：{chart_raw}')
+    raw_p = Path(stripped)
     if '..' in raw_p.parts:
         raise ValueError(f'附件路径包含越界片段：{chart_raw}')
 
@@ -448,12 +454,18 @@ def _validate_workspace_chart(chart_raw: Any, ws_root: Path, raw_ws: Path) -> Pa
         _assert_no_symlinks_under_base(ws_root, rel_parts)
         candidate = ws_root.joinpath(*rel_parts)
     else:
-        if raw_p.is_symlink():
-            raise ValueError(f'附件不能为软链接：{raw_p}')
-        if raw_p.is_relative_to(raw_ws):
-            _assert_no_symlinks_under_base(raw_ws, tuple(raw_p.relative_to(raw_ws).parts))
-        if raw_p.is_relative_to(ws_root):
-            _assert_no_symlinks_under_base(ws_root, tuple(raw_p.relative_to(ws_root).parts))
+        matched_roots: list[Path] = []
+        for allowed_ws in (raw_ws, ws_root):
+            if raw_p.is_relative_to(allowed_ws) and raw_p != allowed_ws:
+                if allowed_ws not in matched_roots:
+                    matched_roots.append(allowed_ws)
+        if not matched_roots:
+            raise ValueError(f'附件不存在或不在 workspace：{raw_p}')
+        for allowed_ws in matched_roots:
+            rel_parts = tuple(raw_p.relative_to(allowed_ws).parts)
+            if not rel_parts:
+                raise ValueError(f'附件不存在或不在 workspace：{raw_p}')
+            _assert_no_symlinks_under_base(allowed_ws, rel_parts)
         candidate = raw_p
 
     try:
