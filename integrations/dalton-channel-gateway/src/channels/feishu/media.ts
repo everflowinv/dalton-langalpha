@@ -227,7 +227,8 @@ async function readFeishuResourceResponseBuffer(
 }> {
   if (Buffer.isBuffer(response)) {
     if (response.byteLength > maxBytes) {
-      throw new Error(
+      throw new SafeFetchError(
+        "size_exceeded",
         `Feishu attachment size (${response.byteLength} bytes) exceeds maximum limit (${maxBytes} bytes)`,
       );
     }
@@ -235,7 +236,8 @@ async function readFeishuResourceResponseBuffer(
   }
   if (response instanceof ArrayBuffer) {
     if (response.byteLength > maxBytes) {
-      throw new Error(
+      throw new SafeFetchError(
+        "size_exceeded",
         `Feishu attachment size (${response.byteLength} bytes) exceeds maximum limit (${maxBytes} bytes)`,
       );
     }

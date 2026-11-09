@@ -56,7 +56,7 @@ export interface FeishuChatMembersPage {
 
 /**
  * Lists groups the Feishu bot is in via `client.im.chat.list`, guarding
- * pagination with `seenPageTokens` and `MAX_FEISHU_DIRECTORY_PAGES` (`grok-7`, `codex-14`),
+ * pagination with `seenPageTokens` and `MAX_FEISHU_DIRECTORY_PAGES`,
  * and reporting whether the listing is `complete` or was truncated/aborted.
  */
 export async function listFeishuDirectoryGroupsDetailed(

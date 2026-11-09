@@ -608,7 +608,7 @@ function resolveTextRetryDedupeKey(
 /**
  * Resolves the canonical deduplication key from a raw Feishu
  * `im.message.receive_v1` event payload, matching
- * `monitor.account-UbN1RhlP.mjs:822-872` (`codex-4`, `grok 高-3`).
+ * `monitor.account-UbN1RhlP.mjs:822-872`.
  */
 export function resolveFeishuMessageDedupeKey(
   rawPayload: unknown,
@@ -739,11 +739,10 @@ export function parseFeishuInboundEvent(
     normalizedMessageType === "post" && postParsed !== undefined
       ? postParsed.textContent
       : parseMessageContent(rawContent, messageType, options.botOpenId);
-  const text = normalizeMentions(
-    parsedContentText,
-    message.mentions,
-    options.botOpenId,
-  );
+  // Text messages encode mentions as placeholders; rich formats carry IDs in nodes.
+  const text = normalizedMessageType === "text"
+    ? normalizeMentions(parsedContentText, message.mentions, options.botOpenId)
+    : parsedContentText.trim();
   const rawCommandCandidate =
     normalizedMessageType === "post" && postParsed !== undefined
       ? (postParsed.commandText ?? postParsed.textContent)
@@ -753,11 +752,9 @@ export function parseFeishuInboundEvent(
           parsedContentText === postParsed.textContent.trim()
         ? (postParsed.commandText ?? parsedContentText)
         : parsedContentText;
-  const commandText = normalizeMentions(
-    rawCommandCandidate,
-    message.mentions,
-    options.botOpenId,
-  );
+  const commandText = normalizedMessageType === "text"
+    ? normalizeMentions(rawCommandCandidate, message.mentions, options.botOpenId)
+    : rawCommandCandidate.trim();
 
   const attachments = extractInboundAttachments(rawContent, messageType);
 
