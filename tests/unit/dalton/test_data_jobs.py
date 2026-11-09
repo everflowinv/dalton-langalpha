@@ -7437,3 +7437,30 @@ async def test_pr12_round2_overlay_redaction_and_manifest_sync_preserves_schedul
 
 
 
+
+
+def test_task_container_mounts_host_src_read_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.dalton.data_jobs.container_runner import build_path_map
+
+    monkeypatch.delenv("DALTON_HOST_SRC_DIR", raising=False)
+    paths = build_path_map(host_var_dir="/repo/var/dalton", backend_var_dir="/app/var/dalton")
+    assert "/repo/src:/app/src:ro" in paths.docker_binds("run-1")
+
+    monkeypatch.setenv("DALTON_HOST_SRC_DIR", "/elsewhere/src")
+    assert "/elsewhere/src:/app/src:ro" in paths.docker_binds("run-1")
+
+
+def test_wrapper_prewarms_yfinance_caches_before_the_task(monkeypatch: pytest.MonkeyPatch) -> None:
+    import yfinance.cache as yf_cache
+
+    from src.dalton.data_jobs import runner_wrapper
+
+    tz_cache = create_autospec(yf_cache.get_tz_cache, return_value=create_autospec(yf_cache._TzCache, instance=True))
+    cookie_cache = create_autospec(
+        yf_cache.get_cookie_cache, return_value=create_autospec(yf_cache._CookieCache, instance=True)
+    )
+    monkeypatch.setattr(yf_cache, "get_tz_cache", tz_cache)
+    monkeypatch.setattr(yf_cache, "get_cookie_cache", cookie_cache)
+    runner_wrapper._prewarm_yfinance_cache()
+    tz_cache.return_value.lookup.assert_called_once_with("QQQ")
+    cookie_cache.return_value.lookup.assert_called_once_with("basic")

@@ -623,6 +623,28 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _prewarm_yfinance_cache() -> None:
+    """Create yfinance's SQLite caches before the task starts its download threads.
+
+    Every task runs in a fresh container, so the caches under
+    ``~/.cache/py-yfinance`` do not exist yet; ``yf.download(threads=True)``
+    then creates them from several threads at once and the losers fail with
+    ``database is locked`` (T18's first production trial, 11-08). Creating
+    them here, single-threaded, removes the race. Best effort: a task that
+    does not use yfinance is unaffected, and a failure here only means the
+    task meets the original behaviour.
+    """
+    try:
+        import yfinance.cache as yf_cache
+    except Exception:
+        return
+    try:
+        yf_cache.get_tz_cache().lookup("QQQ")
+        yf_cache.get_cookie_cache().lookup("basic")
+    except Exception as exc:  # pragma: no cover - logged and ignored
+        print(f"runner_wrapper: yfinance cache prewarm skipped: {exc}", file=sys.stderr)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
@@ -632,6 +654,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not cmd:
         parser.error("Missing command_argv after '--'")
 
+    _prewarm_yfinance_cache()
     result = asyncio.run(
         run_wrapped_command(
             cmd,

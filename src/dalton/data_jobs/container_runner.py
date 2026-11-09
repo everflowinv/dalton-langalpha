@@ -52,6 +52,22 @@ class DataTaskPathMap:
     def backend_data_root(self) -> Path:
         return self.backend_var_dir / "openclaw-data"
 
+    @property
+    def host_src_dir(self) -> Path:
+        """Host ``src/`` mounted read-only at ``/app/src`` in task containers.
+
+        The backend runs the bind-mounted checkout, while the image's own
+        ``/app/src`` is whatever was current when the image was built; the
+        wrapper must run the same code as the backend that started it, or a
+        wrapper change (outbox redaction, cache prewarm) silently waits for
+        the next image rebuild. ``DALTON_HOST_SRC_DIR`` overrides the default
+        ``<repo>/src`` next to ``var/dalton``.
+        """
+        override = os.getenv("DALTON_HOST_SRC_DIR", "").strip()
+        if override:
+            return Path(override)
+        return self.host_var_dir.parent.parent / "src"
+
     def host_run_secrets_dir(self, run_id: str | UUID) -> Path:
         return self.host_var_dir / "run-secrets" / str(run_id)
 
@@ -73,6 +89,7 @@ class DataTaskPathMap:
         return [
             f"{self.host_data_root}:{self.container_workspace_dir}:rw",
             f"{self.host_run_secrets_dir(run_id)}:{self.container_secrets_dir}:ro",
+            f"{self.host_src_dir}:/app/src:ro",
         ]
 
     def docker_tmpfs(self) -> dict[str, str]:
