@@ -38,6 +38,7 @@ from src.dalton.settings import managed_secret_token_values, redact_managed_toke
 DEFAULT_WORKSPACE_DIR = "/Users/everflow/.openclaw/workspace"
 DEFAULT_SECRETS_DIR = "/run/dalton-secrets"
 DEFAULT_TMPFS_OUTBOX_DIR = "/run/dalton-outbox"
+CHILD_SITE_DIR = Path(__file__).resolve().parent / "child_site"
 DEFAULT_TMPFS_OUTBOX_FILE = f"{DEFAULT_TMPFS_OUTBOX_DIR}/outbox.json"
 MIN_SECRET_LEN = 4
 REDACTED_PLACEHOLDER = "[REDACTED]"
@@ -235,12 +236,12 @@ def build_child_env(
         kept_parts = [
             p for p in raw_pythonpath.split(os.pathsep) if p and Path(p).resolve() not in (Path("/app"), Path("/app/src"))
         ]
-        if kept_parts:
-            env["PYTHONPATH"] = os.pathsep.join(kept_parts)
-        else:
-            env.pop("PYTHONPATH", None)
     else:
-        env.pop("PYTHONPATH", None)
+        kept_parts = []
+    # The child still gets ``child_site`` first: its sitecustomize gives matplotlib a
+    # Chinese glyph fallback, since the scripts name macOS fonts the container lacks.
+    child_site = str(CHILD_SITE_DIR)
+    env["PYTHONPATH"] = os.pathsep.join([child_site, *[p for p in kept_parts if p != child_site]])
 
     venv_bin = "/app/.venv/bin"
     cur_path = env.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
