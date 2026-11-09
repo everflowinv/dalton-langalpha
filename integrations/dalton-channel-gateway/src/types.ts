@@ -206,7 +206,9 @@ export interface InboundChannelEvent {
   messageId: string;
   /** User text content (trimmed or raw). */
   text: string;
-  /** Whether the message is a valid trigger in a group chat (e.g. @bot or slash command). */
+  /** Unescaped raw text used for slash-command recognition and arguments when `text` is Markdown-rendered. */
+  commandText?: string;
+  /** Whether the message is a valid trigger in a group chat (explicit bot mention). */
   isGroupTrigger?: boolean;
   /** Inbound attachments on this message. */
   attachments?: InboundAttachmentDescriptor[];

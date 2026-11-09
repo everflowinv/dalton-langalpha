@@ -142,16 +142,16 @@ export class ChannelGatewayOrchestrator {
   // =========================================================================
 
   async handleInboundEvent(event: InboundChannelEvent): Promise<void> {
-    // Group chats require explicit trigger (@bot or slash command)
-    if (event.chatType === "group" && event.isGroupTrigger === false) {
+    // Group chats require an explicit bot mention trigger
+    if (event.chatType === "group" && event.isGroupTrigger !== true) {
       return;
     }
 
-    const trimmedText = (event.text ?? "").trim();
+    const commandText = (event.commandText ?? event.text ?? "").trim();
 
     // Check for slash commands (§3.3): /bind, /unbind, /workspace, /new, /stop
-    if (trimmedText.startsWith("/")) {
-      const handled = await this.tryHandleSlashCommand(event, trimmedText);
+    if (commandText.startsWith("/")) {
+      const handled = await this.tryHandleSlashCommand(event, commandText);
       if (handled) {
         return;
       }

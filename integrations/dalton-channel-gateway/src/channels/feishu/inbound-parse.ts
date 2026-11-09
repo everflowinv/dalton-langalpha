@@ -214,7 +214,10 @@ export function hasUnresolvedGroupMention(
   const messageType = (message.message_type ?? message.msg_type ?? "")
     .trim()
     .toLowerCase();
-  if (messageType === "post" && typeof message.content === "string") {
+  if (
+    (messageType === "post" || messageType === "interactive") &&
+    typeof message.content === "string"
+  ) {
     const mentionedOpenIds = new Set([
       ...parsePostContent(message.content).mentionedOpenIds,
       ...extractPostMentionedOpenIds(message.content),
@@ -229,7 +232,7 @@ export function hasUnresolvedGroupMention(
 
 /**
  * Normalizes Feishu `@_user_N` mention placeholders in message text:
- * - Strips the bot's own `@_user_N` / `@BotName` mention so command prefixes
+ * - Strips the bot's own `@_user_N` placeholder so command prefixes
  *   (e.g. `@Bot /bind 123456`) are clean;
  * - Replaces other user `@_user_N` placeholders with `@DisplayName`.
  */
@@ -259,12 +262,6 @@ export function normalizeMentions(
         result = result.replace(
           new RegExp(`\\s*${escapeRegExp(key)}\\s*`, "g"),
           " ",
-        );
-      }
-      if (name) {
-        result = result.replace(
-          new RegExp(`@${escapeRegExp(name)}\\s*`, "g"),
-          "",
         );
       }
     } else if (key && name) {
@@ -488,8 +485,6 @@ export function extractInboundAttachments(
 
 const FEISHU_EXTERNAL_KEY_PATTERN =
   /^(?!\s)(?![\s\S]*\s$)(?![\s\S]*\.\.)[^\p{Cc}\p{Cs}/\\]{1,512}$/u;
-
-const SLASH_COMMAND_RE = /^\/(bind|unbind|workspace|new|stop)(?:\s|$)/i;
 
 function normalizeFeishuExternalKey(value: unknown): string | undefined {
   if (typeof value !== "string") {
@@ -715,10 +710,11 @@ export function parseFeishuInboundEvent(
     message.msg_type ??
     "text"
   ).trim();
+  const normalizedMessageType = messageType.toLowerCase();
   const rawContent = typeof message.content === "string" ? message.content : "";
 
   const postParsed =
-    messageType.toLowerCase() === "post"
+    normalizedMessageType === "post" || normalizedMessageType === "interactive"
       ? parsePostContent(rawContent, options.botOpenId)
       : undefined;
 
@@ -737,17 +733,29 @@ export function parseFeishuInboundEvent(
     botOpenId: options.botOpenId,
   });
 
-  const parsedContentText = parseMessageContent(
-    rawContent,
-    messageType,
-    options.botOpenId,
-  );
+  const parsedContentText =
+    normalizedMessageType === "post" && postParsed !== undefined
+      ? postParsed.textContent
+      : parseMessageContent(rawContent, messageType, options.botOpenId);
   const text = normalizeMentions(
     parsedContentText,
     message.mentions,
     options.botOpenId,
   );
-  const isSlashCommand = SLASH_COMMAND_RE.test(text.trim());
+  const rawCommandCandidate =
+    normalizedMessageType === "post" && postParsed !== undefined
+      ? (postParsed.commandText ?? postParsed.textContent)
+      : normalizedMessageType === "interactive" &&
+          postParsed !== undefined &&
+          postParsed.textContent.trim() !== "[Rich text message]" &&
+          parsedContentText === postParsed.textContent.trim()
+        ? (postParsed.commandText ?? parsedContentText)
+        : parsedContentText;
+  const commandText = normalizeMentions(
+    rawCommandCandidate,
+    message.mentions,
+    options.botOpenId,
+  );
 
   const attachments = extractInboundAttachments(rawContent, messageType);
 
@@ -767,8 +775,8 @@ export function parseFeishuInboundEvent(
     }),
     messageId,
     text,
-    isGroupTrigger:
-      chatType === "group" ? mentionsBot || isSlashCommand : undefined,
+    commandText,
+    isGroupTrigger: chatType === "group" ? mentionsBot : undefined,
     attachments: attachments.length > 0 ? attachments : undefined,
     rawPayload: rawPayload as Record<string, unknown>,
   };
