@@ -4,7 +4,7 @@
 # from Design §6.2 table (lines 724-739) from ~/.openclaw/workspace/ to
 # <repo>/var/dalton/openclaw-data/, excluding venv/, .venv/, cos-venv/,
 # pending.json, *inflight*, .git/, and .dalton-freeze/, and creates the
-# state/sentiment-dashboard/cos-venv/bin/python -> /app/.venv/bin/python symlink.
+# state/sentiment-dashboard/cos-venv/bin/python launcher for /app/.venv/bin/python.
 #
 # Defaults to --dry-run (safe preview + total size summary); pass --apply to execute.
 
@@ -23,7 +23,7 @@ Usage: scripts/dalton/seed_openclaw_data.sh [--dry-run | --apply] [--source <dir
 
 Options:
   --dry-run          Preview rsync changes without writing (default), printing total size at the end.
-  --apply            Perform the sync and create the cos-venv python symlink.
+  --apply            Perform the sync and create the cos-venv python launcher.
   --source <dir>     Source OpenClaw workspace directory (default: ~/.openclaw/workspace).
   --target <dir>     Target Dalton data root directory (default: <repo>/var/dalton/openclaw-data).
   -h, --help         Show this help message.
@@ -145,7 +145,8 @@ fi
 
 FILES_FROM_TMP="$(mktemp "${TMPDIR:-/tmp}/dalton_seed_files.XXXXXX")"
 RSYNC_OUT_TMP="$(mktemp "${TMPDIR:-/tmp}/dalton_seed_rsync.XXXXXX")"
-trap 'rm -f "${FILES_FROM_TMP}" "${RSYNC_OUT_TMP}"' EXIT
+LAUNCHER_TMP=""
+trap 'rm -f "${FILES_FROM_TMP}" "${RSYNC_OUT_TMP}"; [[ -z "${LAUNCHER_TMP}" ]] || rm -f "${LAUNCHER_TMP}"' EXIT
 
 (
   cd "${SOURCE_DIR}"
@@ -173,8 +174,7 @@ RSYNC_ARGS=(
   "--files-from=${FILES_FROM_TMP}"
 )
 
-SYMLINK_REL="state/sentiment-dashboard/cos-venv/bin/python"
-SYMLINK_TARGET="/app/.venv/bin/python"
+LAUNCHER_REL="state/sentiment-dashboard/cos-venv/bin/python"
 OVERLAY_DIR="${SCRIPT_DIR}/openclaw_overlays"
 
 OVERLAY_FILES=()
@@ -201,7 +201,7 @@ if [[ "${MODE}" == "dry-run" ]]; then
   for rel_overlay in "${OVERLAY_FILES[@]}"; do
     echo "[seed_openclaw_data] DRY-RUN overlay: ${OVERLAY_DIR}/${rel_overlay} -> ${TARGET_DIR}/${rel_overlay}"
   done
-  echo "[seed_openclaw_data] DRY-RUN symlink: ${TARGET_DIR}/${SYMLINK_REL} -> ${SYMLINK_TARGET}"
+  echo "[seed_openclaw_data] DRY-RUN launcher: ${TARGET_DIR}/${LAUNCHER_REL} executes /app/.venv/bin/python"
   echo "[seed_openclaw_data] DRY-RUN total size (${TOTAL_SIZE_LINE:-Total file size: 0 B})"
   exit 0
 fi
@@ -220,6 +220,13 @@ for rel_overlay in "${OVERLAY_FILES[@]}"; do
   echo "[seed_openclaw_data] Applied overlay: ${OVERLAY_DIR}/${rel_overlay} -> ${TARGET_DIR}/${rel_overlay}"
 done
 
-mkdir -p "$(dirname "${TARGET_DIR}/${SYMLINK_REL}")"
-ln -sfn "${SYMLINK_TARGET}" "${TARGET_DIR}/${SYMLINK_REL}"
-echo "[seed_openclaw_data] Created symlink: ${TARGET_DIR}/${SYMLINK_REL} -> ${SYMLINK_TARGET}"
+mkdir -p "$(dirname "${TARGET_DIR}/${LAUNCHER_REL}")"
+LAUNCHER_TMP="$(mktemp "${TARGET_DIR}/${LAUNCHER_REL}.XXXXXX")"
+cat > "${LAUNCHER_TMP}" <<'EOF'
+#!/bin/sh
+exec /app/.venv/bin/python "$@"
+EOF
+chmod 755 "${LAUNCHER_TMP}"
+mv -f "${LAUNCHER_TMP}" "${TARGET_DIR}/${LAUNCHER_REL}"
+LAUNCHER_TMP=""
+echo "[seed_openclaw_data] Created launcher: ${TARGET_DIR}/${LAUNCHER_REL} executes /app/.venv/bin/python"
