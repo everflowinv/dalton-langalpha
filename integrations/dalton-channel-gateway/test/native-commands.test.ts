@@ -3375,4 +3375,221 @@ describe("Structured result sanitization, JSON integrity, and dynamic token scru
       ["stop", "id_stop_[REDACTED]"],
     ]);
   });
+
+  it("registers both top-level and data Feishu tenant_access_token candidates into activeSecrets before early auth errors or app_id mismatch checks without accepting invalid auth", async () => {
+    const EXPECTED_APP_ID = "cli_dalton_r5_expected";
+    const APP_SECRET = "feishu_r5_env_secret_13579";
+    const TOP_DYN_TOK = "opaque_r5_top_tenant_tok_24680";
+    const DATA_DYN_TOK = "opaque_r5_data_tenant_tok_97531";
+
+    type AuthBranch =
+      | "top_app_id_mismatch"
+      | "nested_only_app_id_mismatch"
+      | "dual_tokens_nested_app_id_mismatch"
+      | "nonzero_code_with_dual_tokens"
+      | "http_403_with_dual_tokens"
+      | "http_500_with_dual_tokens";
+
+    let branch: AuthBranch = "top_app_id_mismatch";
+    let slashCommandEndpointHit = false;
+
+    const srv = await startLocalHttpServer((_req, res, rec) => {
+      if (rec.pathname === "/open-apis/auth/v3/tenant_access_token/internal") {
+        switch (branch) {
+          case "top_app_id_mismatch":
+            sendJson(res, 200, {
+              code: 0,
+              tenant_access_token: TOP_DYN_TOK,
+              app_id: TOP_DYN_TOK,
+            });
+            return;
+          case "nested_only_app_id_mismatch":
+            sendJson(res, 200, {
+              code: 0,
+              data: {
+                tenant_access_token: DATA_DYN_TOK,
+                app_id: DATA_DYN_TOK,
+              },
+            });
+            return;
+          case "dual_tokens_nested_app_id_mismatch":
+            sendJson(res, 200, {
+              code: 0,
+              tenant_access_token: TOP_DYN_TOK,
+              app_id: EXPECTED_APP_ID,
+              data: {
+                tenant_access_token: DATA_DYN_TOK,
+                app_id: `mismatch_${TOP_DYN_TOK}_${DATA_DYN_TOK}`,
+              },
+            });
+            return;
+          case "nonzero_code_with_dual_tokens":
+            sendJson(res, 200, {
+              code: 10014,
+              tenant_access_token: TOP_DYN_TOK,
+              data: {
+                tenant_access_token: DATA_DYN_TOK,
+              },
+              msg: `Invalid secret ${APP_SECRET}; echo top=${TOP_DYN_TOK} data=${DATA_DYN_TOK}`,
+            });
+            return;
+          case "http_403_with_dual_tokens":
+            sendJson(res, 403, {
+              code: 99991401,
+              tenant_access_token: TOP_DYN_TOK,
+              data: {
+                tenant_access_token: DATA_DYN_TOK,
+              },
+              msg: `IP blocked top=${TOP_DYN_TOK} data=${DATA_DYN_TOK}`,
+            });
+            return;
+          case "http_500_with_dual_tokens":
+            sendJson(res, 500, {
+              code: 50000,
+              tenant_access_token: TOP_DYN_TOK,
+              data: {
+                tenant_access_token: DATA_DYN_TOK,
+              },
+              msg: `Upstream crash top=${TOP_DYN_TOK} data=${DATA_DYN_TOK}`,
+            });
+            return;
+        }
+      }
+
+      slashCommandEndpointHit = true;
+      sendJson(res, 500, { code: 50000, msg: "Should never reach command API" });
+    });
+
+    const assertZeroLeakageAcrossLibraryAndCli = async (
+      currentBranch: AuthBranch,
+      expectedErrorCode: string,
+      expectedExitCode: number,
+    ) => {
+      branch = currentBranch;
+      srv.requests.length = 0;
+
+      // 1. Direct library call (`message`, `stack`, `JSON.stringify`, `util.inspect`)
+      let caught: unknown;
+      try {
+        await syncFeishuNativeCommands({
+          appId: EXPECTED_APP_ID,
+          appSecret: APP_SECRET,
+          mode: "apply",
+          testApiOrigin: srv.origin,
+        });
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(NativeCommandRegistrationError);
+      expect((caught as NativeCommandRegistrationError).code).toBe(
+        expectedErrorCode,
+      );
+      const serializedErr = [
+        (caught as Error).message,
+        (caught as Error).stack ?? "",
+        JSON.stringify(caught),
+        inspect(caught, { depth: 6 }),
+      ].join("\n");
+      expect(serializedErr).not.toContain(TOP_DYN_TOK);
+      expect(serializedErr).not.toContain(DATA_DYN_TOK);
+      expect(serializedErr).not.toContain(APP_SECRET);
+
+      // 2. CLI `--json` mode
+      const jsonOut = createBufferWriter();
+      const jsonErr = createBufferWriter();
+      const jsonCode = await runNativeCommandsCli(
+        ["--platform", "feishu", "--apply", "--json"],
+        {
+          env: {
+            DALTON_FEISHU_APP_ID: EXPECTED_APP_ID,
+            DALTON_FEISHU_APP_SECRET: APP_SECRET,
+          },
+          stdout: jsonOut,
+          stderr: jsonErr,
+          testApiOrigin: srv.origin,
+        },
+      );
+      expect(jsonCode).toBe(expectedExitCode);
+      expect(jsonOut.text()).not.toContain(TOP_DYN_TOK);
+      expect(jsonOut.text()).not.toContain(DATA_DYN_TOK);
+      expect(jsonOut.text()).not.toContain(APP_SECRET);
+      expect(jsonErr.text()).not.toContain(TOP_DYN_TOK);
+      expect(jsonErr.text()).not.toContain(DATA_DYN_TOK);
+      expect(jsonErr.text()).not.toContain(APP_SECRET);
+      const parsedJson = JSON.parse(jsonOut.text()) as {
+        ok: boolean;
+        status: string;
+        code: string;
+      };
+      expect(parsedJson).toMatchObject({
+        ok: false,
+        status: "error",
+        code: expectedErrorCode,
+      });
+
+      // 3. CLI plain-text mode
+      const textOut = createBufferWriter();
+      const textErr = createBufferWriter();
+      const textCode = await runNativeCommandsCli(
+        ["--platform", "feishu", "--apply"],
+        {
+          env: {
+            DALTON_FEISHU_APP_ID: EXPECTED_APP_ID,
+            DALTON_FEISHU_APP_SECRET: APP_SECRET,
+          },
+          stdout: textOut,
+          stderr: textErr,
+          testApiOrigin: srv.origin,
+        },
+      );
+      expect(textCode).toBe(expectedExitCode);
+      expect(textOut.text()).not.toContain(TOP_DYN_TOK);
+      expect(textOut.text()).not.toContain(DATA_DYN_TOK);
+      expect(textOut.text()).not.toContain(APP_SECRET);
+      expect(textErr.text()).not.toContain(TOP_DYN_TOK);
+      expect(textErr.text()).not.toContain(DATA_DYN_TOK);
+      expect(textErr.text()).not.toContain(APP_SECRET);
+
+      // Invalid/mismatched auth must NEVER issue any subsequent request with Authorization
+      expect(slashCommandEndpointHit).toBe(false);
+      expect(
+        srv.requests.every(
+          (r) =>
+            r.pathname === "/open-apis/auth/v3/tenant_access_token/internal" &&
+            r.headers.authorization === undefined,
+        ),
+      ).toBe(true);
+    };
+
+    await assertZeroLeakageAcrossLibraryAndCli(
+      "top_app_id_mismatch",
+      "identity_mismatch",
+      3,
+    );
+    await assertZeroLeakageAcrossLibraryAndCli(
+      "nested_only_app_id_mismatch",
+      "identity_mismatch",
+      3,
+    );
+    await assertZeroLeakageAcrossLibraryAndCli(
+      "dual_tokens_nested_app_id_mismatch",
+      "identity_mismatch",
+      3,
+    );
+    await assertZeroLeakageAcrossLibraryAndCli(
+      "nonzero_code_with_dual_tokens",
+      "auth_error",
+      3,
+    );
+    await assertZeroLeakageAcrossLibraryAndCli(
+      "http_403_with_dual_tokens",
+      "permission_denied",
+      3,
+    );
+    await assertZeroLeakageAcrossLibraryAndCli(
+      "http_500_with_dual_tokens",
+      "http_error",
+      1,
+    );
+  });
 });

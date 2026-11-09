@@ -74,6 +74,35 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
+/**
+ * Registers any non-empty `tenant_access_token` present at top level or under
+ * `data` into `activeSecrets` before error formatting or identity validation,
+ * without treating unvalidated tokens as usable credentials.
+ */
+function registerCandidateTenantTokens(
+  payload: unknown,
+  activeSecrets: Set<string>,
+): void {
+  if (!isPlainRecord(payload)) {
+    return;
+  }
+  if (typeof payload.tenant_access_token === "string") {
+    const topToken = payload.tenant_access_token.trim();
+    if (topToken.length > 0) {
+      activeSecrets.add(topToken);
+    }
+  }
+  if (
+    isPlainRecord(payload.data) &&
+    typeof payload.data.tenant_access_token === "string"
+  ) {
+    const nestedToken = payload.data.tenant_access_token.trim();
+    if (nestedToken.length > 0) {
+      activeSecrets.add(nestedToken);
+    }
+  }
+}
+
 function isFeishuPermissionMessage(msg: string): boolean {
   return /(?:scope|permission|forbidden|access\s+denied|insufficient|unauthorized|app_slash_command)/i.test(
     msg,
@@ -390,9 +419,18 @@ export async function syncFeishuNativeCommands(
         app_secret: appSecret,
       },
       isMutation: false,
+      onParsedJson: (parsed) =>
+        registerCandidateTenantTokens(parsed, activeSecrets),
     });
 
+    // Ensure both top-level and `data.tenant_access_token` (even if distinct)
+    // are scrubbed before any early error message or identity check runs.
+    registerCandidateTenantTokens(tokenResp.data, activeSecrets);
+
     const tokenBody = isPlainRecord(tokenResp.data) ? tokenResp.data : undefined;
+    const tokenDataObj = isPlainRecord(tokenBody?.data)
+      ? tokenBody.data
+      : undefined;
     const tokenCode =
       typeof tokenBody?.code === "number" ? tokenBody.code : undefined;
     const tokenMsg = redact(
@@ -423,29 +461,31 @@ export async function syncFeishuNativeCommands(
       );
     }
 
-    const tokenDataObj = isPlainRecord(tokenBody.data)
-      ? tokenBody.data
-      : undefined;
-    const returnedAppId =
-      typeof tokenBody.app_id === "string"
-        ? tokenBody.app_id.trim()
-        : typeof tokenDataObj?.app_id === "string"
-          ? tokenDataObj.app_id.trim()
-          : undefined;
-    if (returnedAppId && returnedAppId !== appId) {
-      throw new NativeCommandRegistrationError(
-        "identity_mismatch",
-        `飞书凭据返回的应用身份 (${redact(returnedAppId)}) 与配置 DALTON_FEISHU_APP_ID (${appId}) 不一致，已拒绝执行。`,
-        { platform: "feishu" },
-      );
+    const topAppId =
+      typeof tokenBody.app_id === "string" ? tokenBody.app_id.trim() : "";
+    const nestedAppId =
+      typeof tokenDataObj?.app_id === "string"
+        ? tokenDataObj.app_id.trim()
+        : "";
+    for (const candidateAppId of [topAppId, nestedAppId]) {
+      if (candidateAppId && candidateAppId !== appId) {
+        throw new NativeCommandRegistrationError(
+          "identity_mismatch",
+          `飞书凭据返回的应用身份 (${redact(candidateAppId)}) 与配置 DALTON_FEISHU_APP_ID (${appId}) 不一致，已拒绝执行。`,
+          { platform: "feishu" },
+        );
+      }
     }
 
-    const rawTenantToken =
+    const topTenantToken =
       typeof tokenBody.tenant_access_token === "string"
         ? tokenBody.tenant_access_token.trim()
-        : typeof tokenDataObj?.tenant_access_token === "string"
-          ? tokenDataObj.tenant_access_token.trim()
-          : "";
+        : "";
+    const nestedTenantToken =
+      typeof tokenDataObj?.tenant_access_token === "string"
+        ? tokenDataObj.tenant_access_token.trim()
+        : "";
+    const rawTenantToken = topTenantToken || nestedTenantToken;
 
     if (!rawTenantToken) {
       throw new NativeCommandRegistrationError(
@@ -454,9 +494,6 @@ export async function syncFeishuNativeCommands(
         { httpStatus: tokenResp.status, platform: "feishu" },
       );
     }
-
-    // Register tenant token immediately so all subsequent logs and errors scrub it.
-    activeSecrets.add(rawTenantToken);
 
     const authHeaders = {
       Authorization: `Bearer ${rawTenantToken}`,

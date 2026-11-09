@@ -238,6 +238,7 @@ export class BoundedHttpClient {
     headers: Record<string, string>;
     body?: Record<string, unknown>;
     isMutation?: boolean;
+    onParsedJson?: (data: unknown) => void;
   }): Promise<JsonHttpResponse> {
     const isMutation = Boolean(params.isMutation);
 
@@ -336,7 +337,6 @@ export class BoundedHttpClient {
         clearTimeout(timer);
       }
 
-      const safeRawText = this.redact(rawText);
       let parsedData: unknown = undefined;
       let jsonValid = false;
       if (rawText.trim().length > 0) {
@@ -349,6 +349,12 @@ export class BoundedHttpClient {
       } else {
         jsonValid = response.status === 204;
       }
+
+      if (jsonValid && parsedData !== undefined) {
+        params.onParsedJson?.(parsedData);
+      }
+
+      const safeRawText = this.redact(rawText);
 
       if (response.status === 429) {
         if (isPlainRecord(parsedData) && parsedData.code === 30034) {
