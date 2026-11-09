@@ -9434,9 +9434,11 @@ async def test_bridge_host_run_explicit_missing_or_file_consumer_root_creates_no
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_signal", [signal.SIGTERM, signal.SIGINT], ids=["sigterm", "sigint"])
 async def test_bridge_host_run_signal_during_refresh_does_not_sync_consumer(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    terminal_signal: int,
 ) -> None:
     import scripts.dalton.researchdata_bridge as bridge_mod
 
@@ -9466,7 +9468,7 @@ async def test_bridge_host_run_signal_during_refresh_does_not_sync_consumer(
     status, resp, gate_pid, group_alive = await _signal_running_host_run(
         bridge,
         _host_run_body(1, "run-signal-during-refresh"),
-        signal.SIGTERM,
+        terminal_signal,
         _ready,
     )
     assert status == 200
