@@ -1,7 +1,10 @@
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { SubsystemLogger } from "../shared/logger.js";
+import {
+  createSubsystemLogger,
+  type SubsystemLogger,
+} from "../shared/logger.js";
 import {
   DALTON_DISCORD_BOT_TOKEN_ENV,
   DALTON_FEISHU_APP_SECRET_ENV,
@@ -11,9 +14,13 @@ import {
 } from "./config.js";
 import { syncDiscordNativeCommands } from "./discord-registrar.js";
 import { syncFeishuNativeCommands } from "./feishu-registrar.js";
-import { scrubNativeCommandSecrets } from "./redact.js";
+import {
+  createStderrLoggerSink,
+  scrubNativeCommandSecrets,
+} from "./redact.js";
 import {
   type DiscordRegistrationScope,
+  exitCodeForErrorCode,
   exitCodeForNativeCommandError,
   type NativeCommandPlatform,
   NativeCommandRegistrationError,
@@ -308,6 +315,7 @@ const OUTCOME_LABELS = {
   created: "已创建",
   updated: "已修改",
   unchanged: "无需修改",
+  failed: "失败",
   unconfirmed: "未确认",
   skipped: "已跳过",
 } as const;
@@ -345,13 +353,15 @@ export function formatNativeCommandSyncResult(
       const label = OUTCOME_LABELS[outcome.status];
       const idPart = outcome.remoteId ? ` (id: ${outcome.remoteId})` : "";
       const verifiedPart = outcome.verifiedAfterDisconnect
-        ? " [连接中断后回查确认]"
+        ? " [状态回查确认]"
         : "";
-      const detailPart = outcome.unconfirmedReason
-        ? ` — ${outcome.unconfirmedReason}`
-        : outcome.status === "updated" && outcome.changedFields.length > 0
-          ? ` — 字段: ${outcome.changedFields.join(", ")}`
-          : "";
+      const detailPart = outcome.failureReason
+        ? ` — ${outcome.failureReason}`
+        : outcome.unconfirmedReason
+          ? ` — ${outcome.unconfirmedReason}`
+          : outcome.status === "updated" && outcome.changedFields.length > 0
+            ? ` — 字段: ${outcome.changedFields.join(", ")}`
+            : "";
       lines.push(
         `  [${label}] /${outcome.name}${idPart}${verifiedPart}${detailPart}`,
       );
@@ -422,14 +432,25 @@ export async function runNativeCommandsCli(
       return 0;
     }
 
+    const platform: NativeCommandPlatform =
+      parsed.platform === "feishu" ? "feishu" : "discord";
+    // Default CLI logger always emits to stderr under `native-commands/<platform>`
+    // (matching the registrars' own default subsystem) so stdout remains purely
+    // the formatted summary or single JSON document.
+    const effectiveLogger =
+      options.logger ??
+      createSubsystemLogger(`native-commands/${platform}`, {
+        sink: createStderrLoggerSink(stderr),
+      });
+
     let result: NativeCommandSyncResult;
-    if (parsed.platform === "feishu") {
+    if (platform === "feishu") {
       const creds = loadFeishuNativeCommandCredentials(env);
       result = await syncFeishuNativeCommands({
         appId: creds.appId,
         appSecret: creds.appSecret,
         mode: parsed.mode,
-        logger: options.logger,
+        logger: effectiveLogger,
         testApiOrigin: options.testApiOrigin,
         requestTimeoutMs: options.requestTimeoutMs,
         totalTimeoutMs: options.totalTimeoutMs,
@@ -447,7 +468,7 @@ export async function runNativeCommandsCli(
         applicationId: creds.applicationId,
         scope: parsed.discordScope,
         mode: parsed.mode,
-        logger: options.logger,
+        logger: effectiveLogger,
         testApiOrigin: options.testApiOrigin,
         requestTimeoutMs: options.requestTimeoutMs,
         totalTimeoutMs: options.totalTimeoutMs,
@@ -474,13 +495,20 @@ export async function runNativeCommandsCli(
       );
     }
 
-    if (!result.ok || result.status === "unconfirmed") {
+    if (
+      !result.ok ||
+      result.status === "unconfirmed" ||
+      result.status === "failed"
+    ) {
+      const code =
+        result.errorCode ??
+        (result.status === "unconfirmed" ? "unconfirmed_write" : "http_error");
       if (result.errorMessage) {
         stderr.write(
-          `[dalton-native-commands] error: ${scrubNativeCommandSecrets(result.errorMessage, envSecrets, 2048)}\n`,
+          `[dalton-native-commands] error (${code}): ${scrubNativeCommandSecrets(result.errorMessage, envSecrets, 2048)}\n`,
         );
       }
-      return 4;
+      return exitCodeForErrorCode(code);
     }
 
     return 0;

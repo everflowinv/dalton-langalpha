@@ -46,6 +46,7 @@ export type AppliedCommandStatus =
   | "created"
   | "updated"
   | "unchanged"
+  | "failed"
   | "unconfirmed"
   | "skipped";
 
@@ -55,12 +56,14 @@ export interface AppliedCommandOutcome {
   readonly remoteId?: string;
   readonly changedFields: readonly string[];
   readonly verifiedAfterDisconnect?: boolean;
+  readonly errorCode?: NativeCommandErrorCode;
+  readonly failureReason?: string;
   readonly unconfirmedReason?: string;
 }
 
 export interface NativeCommandSyncResult {
   readonly ok: boolean;
-  readonly status: "preview" | "applied" | "unconfirmed";
+  readonly status: "preview" | "applied" | "failed" | "unconfirmed";
   readonly platform: NativeCommandPlatform;
   readonly mode: "preview" | "apply";
   readonly scopeLabel: string;
@@ -70,6 +73,7 @@ export interface NativeCommandSyncResult {
   readonly outcomes?: readonly AppliedCommandOutcome[];
   readonly preservedCommands: readonly PreservedRemoteCommand[];
   readonly notes: readonly string[];
+  readonly errorCode?: NativeCommandErrorCode;
   readonly errorMessage?: string;
 }
 
@@ -137,24 +141,30 @@ export class NativeCommandRegistrationError extends Error {
   }
 }
 
+export function exitCodeForErrorCode(
+  code: NativeCommandErrorCode | undefined,
+): 1 | 2 | 3 | 4 {
+  switch (code) {
+    case "usage_error":
+      return 2;
+    case "missing_config":
+    case "invalid_config":
+    case "auth_error":
+    case "permission_denied":
+    case "identity_mismatch":
+      return 3;
+    case "unconfirmed_write":
+      return 4;
+    default:
+      return 1;
+  }
+}
+
 export function exitCodeForNativeCommandError(
   error: unknown,
 ): 1 | 2 | 3 | 4 {
   if (error instanceof NativeCommandRegistrationError) {
-    switch (error.code) {
-      case "usage_error":
-        return 2;
-      case "missing_config":
-      case "invalid_config":
-      case "auth_error":
-      case "permission_denied":
-      case "identity_mismatch":
-        return 3;
-      case "unconfirmed_write":
-        return 4;
-      default:
-        return 1;
-    }
+    return exitCodeForErrorCode(error.code);
   }
   return 1;
 }

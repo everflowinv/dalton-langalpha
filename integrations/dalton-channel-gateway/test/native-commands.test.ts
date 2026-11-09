@@ -1,3 +1,5 @@
+import { spawn } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
 import {
   createServer,
   type IncomingMessage,
@@ -5,7 +7,12 @@ import {
   type ServerResponse,
 } from "node:http";
 import type { AddressInfo, Socket } from "node:net";
-import { afterEach, describe, expect, it } from "vitest";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { inspect } from "node:util";
+import { build } from "esbuild";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   DALTON_NATIVE_COMMANDS,
   DISCORD_APPLICATION_COMMAND_TYPE_CHAT_INPUT,
@@ -947,6 +954,7 @@ describe("Feishu native slash-command registration (local HTTP server)", () => {
         name: "main",
         status: "unconfirmed",
         changedFields: ["command", "description.default_value"],
+        errorCode: "unconfirmed_write",
         unconfirmedReason: expect.stringContaining("写后回查未在服务端命令列表中找到"),
       },
       {
@@ -1080,12 +1088,39 @@ describe("Discord API v10 native command registration (local HTTP server)", () =
       const globalBase = `/api/v10/applications/${TEST_DISCORD_APP_ID}/commands`;
       const guildBase = `/api/v10/applications/${TEST_DISCORD_APP_ID}/guilds/${TEST_GUILD_ID}/commands`;
 
+      const stripLocalizationsForDefaultList = (
+        cmd: Record<string, unknown>,
+      ): Record<string, unknown> => {
+        const clone: Record<string, unknown> = { ...cmd };
+        delete clone.name_localizations;
+        delete clone.description_localizations;
+        if (Array.isArray(clone.options)) {
+          clone.options = clone.options.map((opt) => {
+            const optClone = { ...(opt as Record<string, unknown>) };
+            delete optClone.name_localizations;
+            delete optClone.description_localizations;
+            return optClone;
+          });
+        }
+        return clone;
+      };
+
       const handleCollection = (
         list: Array<Record<string, unknown>>,
         basePath: string,
       ): boolean => {
         if (rec.method === "GET" && rec.pathname === basePath) {
-          sendJson(res, 200, list);
+          // Real Discord API v10 only returns full `*_localizations` dictionaries
+          // when `with_localizations=true` is explicitly passed on the query string.
+          const includeLocalizations =
+            rec.query.get("with_localizations") === "true";
+          sendJson(
+            res,
+            200,
+            includeLocalizations
+              ? list
+              : list.map((cmd) => stripLocalizationsForDefaultList(cmd)),
+          );
           return true;
         }
         if (rec.method === "POST" && rec.pathname === basePath) {
@@ -1155,9 +1190,9 @@ describe("Discord API v10 native command registration (local HTTP server)", () =
       { name: "help", remoteId: "cmd_legacy_help", commandType: 1 },
       { name: "main", remoteId: "cmd_user_ctx_main", commandType: 2 },
     ]);
-    expect(srv.requests.map((r) => `${r.method} ${r.pathname}`)).toEqual([
+    expect(srv.requests.map((r) => `${r.method} ${r.url}`)).toEqual([
       "GET /api/v10/oauth2/applications/@me",
-      `GET /api/v10/applications/${TEST_DISCORD_APP_ID}/commands`,
+      `GET /api/v10/applications/${TEST_DISCORD_APP_ID}/commands?with_localizations=true`,
     ]);
 
     // 2. Global `--apply`
@@ -1169,9 +1204,9 @@ describe("Discord API v10 native command registration (local HTTP server)", () =
       testApiOrigin: srv.origin,
     });
     expect(applyRes.ok).toBe(true);
-    expect(srv.requests.map((r) => `${r.method} ${r.pathname}`)).toEqual([
+    expect(srv.requests.map((r) => `${r.method} ${r.url}`)).toEqual([
       "GET /api/v10/oauth2/applications/@me",
-      `GET /api/v10/applications/${TEST_DISCORD_APP_ID}/commands`,
+      `GET /api/v10/applications/${TEST_DISCORD_APP_ID}/commands?with_localizations=true`,
       `PATCH /api/v10/applications/${TEST_DISCORD_APP_ID}/commands/cmd_chat_ws`,
       `POST /api/v10/applications/${TEST_DISCORD_APP_ID}/commands`,
       `POST /api/v10/applications/${TEST_DISCORD_APP_ID}/commands`,
@@ -1219,12 +1254,12 @@ describe("Discord API v10 native command registration (local HTTP server)", () =
     expect(rerunGlobal.outcomes?.every((o) => o.status === "unchanged")).toBe(
       true,
     );
-    expect(srv.requests.map((r) => `${r.method} ${r.pathname}`)).toEqual([
+    expect(srv.requests.map((r) => `${r.method} ${r.url}`)).toEqual([
       "GET /api/v10/oauth2/applications/@me",
-      `GET /api/v10/applications/${TEST_DISCORD_APP_ID}/commands`,
+      `GET /api/v10/applications/${TEST_DISCORD_APP_ID}/commands?with_localizations=true`,
     ]);
 
-    // 4. Guild-scoped CLI `--apply --guild-id <ID>` hits guild endpoints and omits global-only contexts/integration_types
+    // 4. Guild-scoped CLI `--apply --guild-id <ID>` hits guild endpoints (including ?with_localizations=true) and omits global-only contexts/integration_types
     srv.requests.length = 0;
     const guildExit = await runNativeCommandsCli(
       [
@@ -1245,9 +1280,9 @@ describe("Discord API v10 native command registration (local HTTP server)", () =
       },
     );
     expect(guildExit).toBe(0);
-    expect(srv.requests.map((r) => `${r.method} ${r.pathname}`)).toEqual([
+    expect(srv.requests.map((r) => `${r.method} ${r.url}`)).toEqual([
       "GET /api/v10/oauth2/applications/@me",
-      `GET /api/v10/applications/${TEST_DISCORD_APP_ID}/guilds/${TEST_GUILD_ID}/commands`,
+      `GET /api/v10/applications/${TEST_DISCORD_APP_ID}/guilds/${TEST_GUILD_ID}/commands?with_localizations=true`,
       `POST /api/v10/applications/${TEST_DISCORD_APP_ID}/guilds/${TEST_GUILD_ID}/commands`,
       `POST /api/v10/applications/${TEST_DISCORD_APP_ID}/guilds/${TEST_GUILD_ID}/commands`,
       `POST /api/v10/applications/${TEST_DISCORD_APP_ID}/guilds/${TEST_GUILD_ID}/commands`,
@@ -1486,14 +1521,21 @@ describe("Discord API v10 native command registration (local HTTP server)", () =
     expect(stderr.text()).toContain("写入结果未确认");
 
     returnDailyQuotaError = true;
-    await expect(
-      syncDiscordNativeCommands({
-        botToken: TEST_DISCORD_BOT_TOKEN,
-        applicationId: TEST_DISCORD_APP_ID,
-        mode: "apply",
-        testApiOrigin: srv.origin,
-      }),
-    ).rejects.toMatchObject({ code: "daily_create_limit" });
+    const quotaResult = await syncDiscordNativeCommands({
+      botToken: TEST_DISCORD_BOT_TOKEN,
+      applicationId: TEST_DISCORD_APP_ID,
+      mode: "apply",
+      testApiOrigin: srv.origin,
+    });
+    expect(quotaResult.ok).toBe(false);
+    expect(quotaResult.status).toBe("failed");
+    expect(quotaResult.errorCode).toBe("daily_create_limit");
+    expect(quotaResult.outcomes?.map((o) => [o.name, o.status])).toEqual([
+      ["main", "failed"],
+      ["workspace", "skipped"],
+      ["new", "skipped"],
+      ["stop", "skipped"],
+    ]);
   });
 
   it("enforces per-request timeout and bounded maxRequests budget", async () => {
@@ -1521,15 +1563,22 @@ describe("Discord API v10 native command registration (local HTTP server)", () =
     ).rejects.toMatchObject({ code: "timeout" });
 
     hangList = false;
-    await expect(
-      syncDiscordNativeCommands({
-        botToken: TEST_DISCORD_BOT_TOKEN,
-        applicationId: TEST_DISCORD_APP_ID,
-        mode: "apply",
-        maxRequests: 2,
-        testApiOrigin: srv.origin,
-      }),
-    ).rejects.toMatchObject({ code: "request_limit_exceeded" });
+    const budgetResult = await syncDiscordNativeCommands({
+      botToken: TEST_DISCORD_BOT_TOKEN,
+      applicationId: TEST_DISCORD_APP_ID,
+      mode: "apply",
+      maxRequests: 2,
+      testApiOrigin: srv.origin,
+    });
+    expect(budgetResult.ok).toBe(false);
+    expect(budgetResult.status).toBe("failed");
+    expect(budgetResult.errorCode).toBe("request_limit_exceeded");
+    expect(budgetResult.outcomes?.map((o) => [o.name, o.status])).toEqual([
+      ["main", "failed"],
+      ["workspace", "skipped"],
+      ["new", "skipped"],
+      ["stop", "skipped"],
+    ]);
   });
 });
 
@@ -1612,5 +1661,1026 @@ describe("Credential redaction across errors, HTTP payloads, CLI output, and log
       ...discordCapture.lines,
     ].join("\n");
     expect(allDiscordText).not.toContain(RAW_DISCORD_TOKEN);
+  });
+
+  it("omits raw duplicate pagination cursors and scrubs opaque dynamic Feishu tenant_access_token from stdout, stderr, logs, and Error objects when returned as page_token", async () => {
+    const TEST_APP_SECRET = "feishu_cursor_secret_val_334455";
+    // Intentionally opaque (does not start with `t-`) so static token regexes cannot catch it;
+    // only cursor omission + dynamic `activeSecrets` redaction can prevent leakage.
+    const MALICIOUS_DYN_TOKEN = "opaque_dyn_feishu_tenant_tok_90817263";
+    let mode: "duplicate_cursor" | "page2_failure" = "duplicate_cursor";
+
+    const srv = await startLocalHttpServer((_req, res, rec) => {
+      if (rec.pathname === "/open-apis/auth/v3/tenant_access_token/internal") {
+        sendJson(res, 200, {
+          code: 0,
+          tenant_access_token: MALICIOUS_DYN_TOKEN,
+        });
+        return;
+      }
+
+      if (rec.method === "GET" && rec.pathname === FEISHU_SLASH_COMMAND_BASE_PATH) {
+        const cursor = rec.query.get("page_token");
+        if (mode === "page2_failure" && cursor) {
+          sendJson(res, 500, {
+            code: 50000,
+            msg: `Upstream failure on cursor ${MALICIOUS_DYN_TOKEN} with ${TEST_APP_SECRET}`,
+          });
+          return;
+        }
+        sendJson(res, 200, {
+          code: 0,
+          data: {
+            items: [
+              {
+                command_id: "cmd_1",
+                command: "main",
+                description: { default_value: "返回 Chief of Staff" },
+              },
+            ],
+            has_more: true,
+            page_token: MALICIOUS_DYN_TOKEN,
+          },
+        });
+        return;
+      }
+
+      sendJson(res, 404, { code: 404 });
+    });
+
+    // 1. Direct library call: inspect the thrown Error object (message, stack, cause, JSON, util.inspect)
+    let caughtErr: unknown;
+    try {
+      await syncFeishuNativeCommands({
+        appId: "cli_cursor_redact",
+        appSecret: TEST_APP_SECRET,
+        mode: "apply",
+        testApiOrigin: srv.origin,
+      });
+    } catch (err) {
+      caughtErr = err;
+    }
+    expect(caughtErr).toBeInstanceOf(NativeCommandRegistrationError);
+    expect((caughtErr as NativeCommandRegistrationError).code).toBe(
+      "pagination_error",
+    );
+    const serializedError = [
+      (caughtErr as Error).message,
+      (caughtErr as Error).stack ?? "",
+      String((caughtErr as { cause?: unknown }).cause ?? ""),
+      JSON.stringify(caughtErr),
+      inspect(caughtErr, { depth: 6 }),
+    ].join("\n");
+    expect(serializedError).not.toContain(MALICIOUS_DYN_TOKEN);
+    expect(serializedError).not.toContain(TEST_APP_SECRET);
+
+    // 2. CLI call (`--json` and text) on duplicate cursor
+    const capture = createCapturingLogger();
+    const cliOut = createBufferWriter();
+    const cliErr = createBufferWriter();
+    const dupExit = await runNativeCommandsCli(
+      ["--platform", "feishu", "--json"],
+      {
+        env: {
+          DALTON_FEISHU_APP_ID: "cli_cursor_redact",
+          DALTON_FEISHU_APP_SECRET: TEST_APP_SECRET,
+        },
+        stdout: cliOut,
+        stderr: cliErr,
+        logger: capture.logger,
+        testApiOrigin: srv.origin,
+      },
+    );
+    expect(dupExit).toBe(1);
+    const combinedDupOutput = [
+      cliOut.text(),
+      cliErr.text(),
+      ...capture.lines,
+    ].join("\n");
+    expect(combinedDupOutput).not.toContain(MALICIOUS_DYN_TOKEN);
+    expect(combinedDupOutput).not.toContain(TEST_APP_SECRET);
+
+    // 3. Second-page HTTP 500 failure where `?page_token=<MALICIOUS_DYN_TOKEN>` was in the request path
+    mode = "page2_failure";
+    let page2Err: unknown;
+    try {
+      await syncFeishuNativeCommands({
+        appId: "cli_cursor_redact",
+        appSecret: TEST_APP_SECRET,
+        testApiOrigin: srv.origin,
+      });
+    } catch (err) {
+      page2Err = err;
+    }
+    expect(page2Err).toBeInstanceOf(NativeCommandRegistrationError);
+    const serializedPage2Err = [
+      (page2Err as Error).message,
+      (page2Err as Error).stack ?? "",
+      inspect(page2Err, { depth: 6 }),
+    ].join("\n");
+    expect(serializedPage2Err).not.toContain(MALICIOUS_DYN_TOKEN);
+    expect(serializedPage2Err).not.toContain(TEST_APP_SECRET);
+  });
+});
+
+describe("Localization query preservation, PATCH verification, partial-apply outcomes, and CLI stream isolation", () => {
+  const TEST_DISCORD_APP_ID = "123456789012345678";
+  const TEST_GUILD_ID = "987654321098765432";
+  const TEST_DISCORD_BOT_TOKEN =
+    "MTIzNDU2Nzg5MDEyMzQ1Njc4.GhIjKl.secretDiscordBotTokenValue987654321";
+  const TEST_FEISHU_APP_ID = "cli_dalton_r2_app";
+  const TEST_FEISHU_SECRET = "feishu_r2_secret_value_654321";
+  const TEST_FEISHU_DYN_TOKEN = "opaque_r2_tenant_access_token_112233";
+
+  it("passes with_localizations=true on every paginated Discord GET (global and guild) so unmanaged option localizations survive PATCH", async () => {
+    const makeWorkspaceEntry = (id: string) => ({
+      id,
+      type: 1,
+      application_id: TEST_DISCORD_APP_ID,
+      name: "workspace",
+      description: "旧版说明",
+      name_localizations: { "en-US": "workspace" },
+      description_localizations: { "en-US": "Browse workspaces" },
+      integration_types: [0],
+      contexts: [0, 1],
+      options: [
+        {
+          name: "workspace",
+          type: 3,
+          description: "旧参数说明",
+          required: false,
+          autocomplete: true,
+          name_localizations: { "en-US": "target", ja: "ワークスペース" },
+          description_localizations: {
+            "en-US": "Target workspace name",
+            ja: "切り替えるワークスペース名",
+          },
+        },
+      ],
+    });
+
+    const page1Global: Array<Record<string, unknown>> = [
+      {
+        id: "g_main",
+        type: 1,
+        name: "main",
+        description: "返回 Chief of Staff",
+        integration_types: [0],
+        contexts: [0, 1],
+      },
+      {
+        id: "g_new",
+        type: 1,
+        name: "new",
+        description: "在当前工作区新建会话",
+        integration_types: [0],
+        contexts: [0, 1],
+      },
+    ];
+    const page2Global: Array<Record<string, unknown>> = [
+      makeWorkspaceEntry("g_ws"),
+      {
+        id: "g_stop",
+        type: 1,
+        name: "stop",
+        description: "停止当前任务",
+        integration_types: [0],
+        contexts: [0, 1],
+      },
+    ];
+    const guildPage1: Array<Record<string, unknown>> = [
+      {
+        id: "guild_main",
+        type: 1,
+        name: "main",
+        description: "返回 Chief of Staff",
+      },
+      {
+        id: "guild_new",
+        type: 1,
+        name: "new",
+        description: "在当前工作区新建会话",
+      },
+    ];
+    const guildPage2: Array<Record<string, unknown>> = [
+      {
+        ...makeWorkspaceEntry("guild_ws"),
+        integration_types: undefined,
+        contexts: undefined,
+      },
+      {
+        id: "guild_stop",
+        type: 1,
+        name: "stop",
+        description: "停止当前任务",
+      },
+    ];
+
+    const stripIfNoFlag = (
+      items: Array<Record<string, unknown>>,
+      withLoc: boolean,
+    ) =>
+      items.map((cmd) => {
+        if (withLoc) {
+          return cmd;
+        }
+        const copy: Record<string, unknown> = { ...cmd };
+        delete copy.name_localizations;
+        delete copy.description_localizations;
+        if (Array.isArray(copy.options)) {
+          copy.options = copy.options.map((o) => {
+            const oc = { ...(o as Record<string, unknown>) };
+            delete oc.name_localizations;
+            delete oc.description_localizations;
+            return oc;
+          });
+        }
+        return copy;
+      });
+
+    const srv = await startLocalHttpServer((_req, res, rec) => {
+      if (rec.pathname === "/api/v10/oauth2/applications/@me") {
+        sendJson(res, 200, { id: TEST_DISCORD_APP_ID, name: "Dalton" });
+        return;
+      }
+
+      const globalBase = `/api/v10/applications/${TEST_DISCORD_APP_ID}/commands`;
+      const guildBase = `/api/v10/applications/${TEST_DISCORD_APP_ID}/guilds/${TEST_GUILD_ID}/commands`;
+
+      for (const [base, p1, p2] of [
+        [globalBase, page1Global, page2Global],
+        [guildBase, guildPage1, guildPage2],
+      ] as const) {
+        if (rec.method === "GET" && rec.pathname === base) {
+          const withLoc = rec.query.get("with_localizations") === "true";
+          const cursor = rec.query.get("page_token");
+          if (!cursor) {
+            sendJson(res, 200, {
+              items: stripIfNoFlag(p1, withLoc),
+              has_more: true,
+              page_token: "next_page_2",
+            });
+            return;
+          }
+          if (cursor === "next_page_2") {
+            sendJson(res, 200, {
+              items: stripIfNoFlag(p2, withLoc),
+              has_more: false,
+            });
+            return;
+          }
+        }
+        if (rec.method === "PATCH" && rec.pathname.startsWith(`${base}/`)) {
+          const id = decodeURIComponent(rec.pathname.slice(`${base}/`.length));
+          const found = [...p1, ...p2].find((c) => c.id === id);
+          if (!found) {
+            sendJson(res, 404, { message: "Not Found" });
+            return;
+          }
+          Object.assign(found, rec.jsonBody as Record<string, unknown>);
+          sendJson(res, 200, found);
+          return;
+        }
+      }
+
+      sendJson(res, 404, { message: "Unexpected route" });
+    });
+
+    const globalApply = await syncDiscordNativeCommands({
+      botToken: TEST_DISCORD_BOT_TOKEN,
+      applicationId: TEST_DISCORD_APP_ID,
+      mode: "apply",
+      testApiOrigin: srv.origin,
+    });
+    expect(globalApply.ok).toBe(true);
+    expect(srv.requests.map((r) => `${r.method} ${r.url}`)).toEqual([
+      "GET /api/v10/oauth2/applications/@me",
+      `GET /api/v10/applications/${TEST_DISCORD_APP_ID}/commands?with_localizations=true`,
+      `GET /api/v10/applications/${TEST_DISCORD_APP_ID}/commands?with_localizations=true&page_token=next_page_2`,
+      `PATCH /api/v10/applications/${TEST_DISCORD_APP_ID}/commands/g_ws`,
+    ]);
+    expect(srv.requests[3]!.jsonBody).toEqual({
+      description: "查看可访问的工作区",
+      options: [
+        {
+          name: "workspace",
+          description: "要切换的工作区名称，留空查看可访问列表",
+          type: 3,
+          required: false,
+          autocomplete: true,
+          name_localizations: { "en-US": "target", ja: "ワークスペース" },
+          description_localizations: {
+            "en-US": "Target workspace name",
+            ja: "切り替えるワークスペース名",
+          },
+        },
+      ],
+    });
+
+    srv.requests.length = 0;
+    const guildApply = await syncDiscordNativeCommands({
+      botToken: TEST_DISCORD_BOT_TOKEN,
+      applicationId: TEST_DISCORD_APP_ID,
+      scope: { kind: "guild", guildId: TEST_GUILD_ID },
+      mode: "apply",
+      testApiOrigin: srv.origin,
+    });
+    expect(guildApply.ok).toBe(true);
+    expect(srv.requests.map((r) => `${r.method} ${r.url}`)).toEqual([
+      "GET /api/v10/oauth2/applications/@me",
+      `GET /api/v10/applications/${TEST_DISCORD_APP_ID}/guilds/${TEST_GUILD_ID}/commands?with_localizations=true`,
+      `GET /api/v10/applications/${TEST_DISCORD_APP_ID}/guilds/${TEST_GUILD_ID}/commands?with_localizations=true&page_token=next_page_2`,
+      `PATCH /api/v10/applications/${TEST_DISCORD_APP_ID}/guilds/${TEST_GUILD_ID}/commands/guild_ws`,
+    ]);
+    expect(srv.requests[3]!.jsonBody).toMatchObject({
+      options: [
+        expect.objectContaining({
+          name_localizations: { "en-US": "target", ja: "ワークスペース" },
+          description_localizations: {
+            "en-US": "Target workspace name",
+            ja: "切り替えるワークスペース名",
+          },
+        }),
+      ],
+    });
+  });
+
+  it("verifies live state when Discord PATCH returns 200 {} and supports valid empty-data Feishu PATCH while verifying malformed Feishu PATCH without blind POSTs", async () => {
+    // --- Part A: Discord PATCH returning `200 {}` ---
+    let discordApplyMutationOnServer = false;
+    let discordPostCount = 0;
+    const makeDiscordStore = (): Array<Record<string, unknown>> => [
+      {
+        id: "dc_m",
+        type: 1,
+        name: "main",
+        description: "旧描述",
+        integration_types: [0],
+        contexts: [0, 1],
+      },
+      {
+        id: "dc_w",
+        type: 1,
+        name: "workspace",
+        description: "查看可访问的工作区",
+        integration_types: [0],
+        contexts: [0, 1],
+        options: [
+          {
+            name: "workspace",
+            description: "要切换的工作区名称，留空查看可访问列表",
+            type: 3,
+            required: false,
+            autocomplete: true,
+          },
+        ],
+      },
+      {
+        id: "dc_n",
+        type: 1,
+        name: "new",
+        description: "在当前工作区新建会话",
+        integration_types: [0],
+        contexts: [0, 1],
+      },
+      {
+        id: "dc_s",
+        type: 1,
+        name: "stop",
+        description: "停止当前任务",
+        integration_types: [0],
+        contexts: [0, 1],
+      },
+    ];
+    let discordStore = makeDiscordStore();
+
+    const discordSrv = await startLocalHttpServer((_req, res, rec) => {
+      if (rec.pathname === "/api/v10/oauth2/applications/@me") {
+        sendJson(res, 200, { id: TEST_DISCORD_APP_ID, name: "Dalton" });
+        return;
+      }
+      const base = `/api/v10/applications/${TEST_DISCORD_APP_ID}/commands`;
+      if (rec.method === "GET" && rec.pathname === base) {
+        sendJson(res, 200, discordStore);
+        return;
+      }
+      if (rec.method === "POST") {
+        discordPostCount += 1;
+        sendJson(res, 500, {});
+        return;
+      }
+      if (rec.method === "PATCH" && rec.pathname === `${base}/dc_m`) {
+        if (discordApplyMutationOnServer) {
+          Object.assign(
+            discordStore[0]!,
+            rec.jsonBody as Record<string, unknown>,
+          );
+        }
+        // Return HTTP 200 with empty `{}` (missing `id` and command fields)
+        sendJson(res, 200, {});
+        return;
+      }
+      sendJson(res, 404, {});
+    });
+
+    // Subcase A1: Server returned `200 {}` WITHOUT updating remote command -> must read back via GET and return unconfirmed (exit 4)
+    const staleEmptyPatchExit = await runNativeCommandsCli(
+      ["--platform", "discord", "--apply"],
+      {
+        env: {
+          DALTON_DISCORD_BOT_TOKEN: TEST_DISCORD_BOT_TOKEN,
+          DALTON_DISCORD_APPLICATION_ID: TEST_DISCORD_APP_ID,
+        },
+        stdout: createBufferWriter(),
+        stderr: createBufferWriter(),
+        testApiOrigin: discordSrv.origin,
+      },
+    );
+    expect(staleEmptyPatchExit).toBe(4);
+    expect(discordPostCount).toBe(0);
+    // Initial GET + verification GET both requested `with_localizations=true`
+    expect(
+      discordSrv.requests.filter((r) => r.method === "GET" && r.pathname.endsWith("/commands")),
+    ).toHaveLength(2);
+
+    // Subcase A2: Server DID update remote command before returning `200 {}` -> live GET confirms `updated`
+    discordStore = makeDiscordStore();
+    discordApplyMutationOnServer = true;
+    const confirmedEmptyPatch = await syncDiscordNativeCommands({
+      botToken: TEST_DISCORD_BOT_TOKEN,
+      applicationId: TEST_DISCORD_APP_ID,
+      mode: "apply",
+      testApiOrigin: discordSrv.origin,
+    });
+    expect(confirmedEmptyPatch.ok).toBe(true);
+    expect(confirmedEmptyPatch.outcomes?.[0]).toEqual({
+      name: "main",
+      status: "updated",
+      remoteId: "dc_m",
+      changedFields: ["description"],
+      verifiedAfterDisconnect: true,
+    });
+    expect(discordPostCount).toBe(0);
+
+    // --- Part B: Feishu PATCH response structures (`larksuite/cli` `CallAPITyped` contract) ---
+    let feishuPatchMode:
+      | "code0_nil_data"
+      | "code0_empty_data"
+      | "missing_code_stale"
+      | "missing_code_committed" = "code0_nil_data";
+    let feishuPostCount = 0;
+
+    const makeFeishuStore = () => [
+      {
+        command_id: "fs_m",
+        command: "main",
+        description: { default_value: "旧主菜单描述" },
+      },
+      {
+        command_id: "fs_w",
+        command: "workspace",
+        description: { default_value: "查看可访问的工作区" },
+      },
+      {
+        command_id: "fs_n",
+        command: "new",
+        description: { default_value: "在当前工作区新建会话" },
+      },
+      {
+        command_id: "fs_s",
+        command: "stop",
+        description: { default_value: "停止当前任务" },
+      },
+    ];
+    let feishuStore = makeFeishuStore();
+
+    const feishuSrv = await startLocalHttpServer((_req, res, rec) => {
+      if (rec.pathname === "/open-apis/auth/v3/tenant_access_token/internal") {
+        sendJson(res, 200, {
+          code: 0,
+          tenant_access_token: TEST_FEISHU_DYN_TOKEN,
+        });
+        return;
+      }
+      if (rec.method === "GET" && rec.pathname === FEISHU_SLASH_COMMAND_BASE_PATH) {
+        sendJson(res, 200, {
+          code: 0,
+          data: { items: feishuStore, has_more: false },
+        });
+        return;
+      }
+      if (rec.method === "POST") {
+        feishuPostCount += 1;
+        sendJson(res, 500, { code: 500 });
+        return;
+      }
+      if (
+        rec.method === "PATCH" &&
+        rec.pathname === `${FEISHU_SLASH_COMMAND_BASE_PATH}/fs_m`
+      ) {
+        const body = rec.jsonBody as {
+          description: { default_value: string };
+        };
+        if (feishuPatchMode === "code0_nil_data") {
+          feishuStore[0]!.description = body.description;
+          sendJson(res, 200, { code: 0, msg: "success", data: null });
+          return;
+        }
+        if (feishuPatchMode === "code0_empty_data") {
+          feishuStore[0]!.description = body.description;
+          sendJson(res, 200, { code: 0, msg: "success", data: {} });
+          return;
+        }
+        if (feishuPatchMode === "missing_code_committed") {
+          feishuStore[0]!.description = body.description;
+          sendJson(res, 200, {});
+          return;
+        }
+        // `missing_code_stale`: HTTP 200 `{}` without `code` and without mutating server state
+        sendJson(res, 200, {});
+        return;
+      }
+      sendJson(res, 404, { code: 404 });
+    });
+
+    // B1: `{ code: 0, msg: "success", data: null }` succeeds directly without extra GET
+    feishuSrv.requests.length = 0;
+    const nilDataRes = await syncFeishuNativeCommands({
+      appId: TEST_FEISHU_APP_ID,
+      appSecret: TEST_FEISHU_SECRET,
+      mode: "apply",
+      testApiOrigin: feishuSrv.origin,
+    });
+    expect(nilDataRes.ok).toBe(true);
+    expect(nilDataRes.outcomes?.[0]).toEqual({
+      name: "main",
+      status: "updated",
+      remoteId: "fs_m",
+      changedFields: ["description.default_value"],
+    });
+    expect(
+      feishuSrv.requests.filter((r) => r.method === "GET"),
+    ).toHaveLength(1);
+
+    // B2: `{ code: 0, msg: "success", data: {} }` also succeeds directly without requiring `command_id` in PATCH response
+    feishuStore = makeFeishuStore();
+    feishuPatchMode = "code0_empty_data";
+    feishuSrv.requests.length = 0;
+    const emptyDataRes = await syncFeishuNativeCommands({
+      appId: TEST_FEISHU_APP_ID,
+      appSecret: TEST_FEISHU_SECRET,
+      mode: "apply",
+      testApiOrigin: feishuSrv.origin,
+    });
+    expect(emptyDataRes.ok).toBe(true);
+    expect(emptyDataRes.outcomes?.[0]?.status).toBe("updated");
+    expect(
+      feishuSrv.requests.filter((r) => r.method === "GET"),
+    ).toHaveLength(1);
+
+    // B3: `200 {}` (missing `code`) when server is still stale -> reads back via GET and returns unconfirmed (exit 4)
+    feishuStore = makeFeishuStore();
+    feishuPatchMode = "missing_code_stale";
+    const staleFeishuExit = await runNativeCommandsCli(
+      ["--platform", "feishu", "--apply"],
+      {
+        env: {
+          DALTON_FEISHU_APP_ID: TEST_FEISHU_APP_ID,
+          DALTON_FEISHU_APP_SECRET: TEST_FEISHU_SECRET,
+        },
+        stdout: createBufferWriter(),
+        stderr: createBufferWriter(),
+        testApiOrigin: feishuSrv.origin,
+      },
+    );
+    expect(staleFeishuExit).toBe(4);
+    expect(feishuPostCount).toBe(0);
+
+    // B4: `200 {}` (missing `code`) when server DID commit -> live GET confirms `updated`
+    feishuStore = makeFeishuStore();
+    feishuPatchMode = "missing_code_committed";
+    const committedFeishuRes = await syncFeishuNativeCommands({
+      appId: TEST_FEISHU_APP_ID,
+      appSecret: TEST_FEISHU_SECRET,
+      mode: "apply",
+      testApiOrigin: feishuSrv.origin,
+    });
+    expect(committedFeishuRes.ok).toBe(true);
+    expect(committedFeishuRes.outcomes?.[0]).toEqual({
+      name: "main",
+      status: "updated",
+      remoteId: "fs_m",
+      changedFields: ["description.default_value"],
+      verifiedAfterDisconnect: true,
+    });
+    expect(feishuPostCount).toBe(0);
+  });
+
+  it("preserves previously completed outcomes, marks failed and skipped commands clearly, redacts secrets, and exits non-zero on mid-apply explicit errors", async () => {
+    // 1. Feishu: `main` created, `workspace` fails with 403 permission error echoing secrets -> `new` & `stop` skipped, exit 3
+    const feishuCapture = createCapturingLogger();
+    const feishuSrv = await startLocalHttpServer((_req, res, rec) => {
+      if (rec.pathname === "/open-apis/auth/v3/tenant_access_token/internal") {
+        sendJson(res, 200, {
+          code: 0,
+          tenant_access_token: TEST_FEISHU_DYN_TOKEN,
+        });
+        return;
+      }
+      if (rec.method === "GET" && rec.pathname === FEISHU_SLASH_COMMAND_BASE_PATH) {
+        sendJson(res, 200, { code: 0, data: { items: [], has_more: false } });
+        return;
+      }
+      if (rec.method === "POST" && rec.pathname === FEISHU_SLASH_COMMAND_BASE_PATH) {
+        const body = rec.jsonBody as { command: string };
+        if (body.command === "main") {
+          sendJson(res, 200, {
+            code: 0,
+            data: {
+              command_id: "cmd_main_ok",
+              command: "main",
+              description: { default_value: "返回 Chief of Staff" },
+            },
+          });
+          return;
+        }
+        sendJson(res, 403, {
+          code: 99991672,
+          msg: `Missing application:app_slash_command:write for ${TEST_FEISHU_SECRET} / ${TEST_FEISHU_DYN_TOKEN}`,
+        });
+      }
+    });
+
+    const fsTextOut = createBufferWriter();
+    const fsTextErr = createBufferWriter();
+    const fsExit = await runNativeCommandsCli(
+      ["--platform", "feishu", "--apply"],
+      {
+        env: {
+          DALTON_FEISHU_APP_ID: TEST_FEISHU_APP_ID,
+          DALTON_FEISHU_APP_SECRET: TEST_FEISHU_SECRET,
+        },
+        stdout: fsTextOut,
+        stderr: fsTextErr,
+        logger: feishuCapture.logger,
+        testApiOrigin: feishuSrv.origin,
+      },
+    );
+
+    expect(fsExit).toBe(3);
+    expect(fsTextOut.text()).toContain("[已创建] /main (id: cmd_main_ok)");
+    expect(fsTextOut.text()).toContain("[失败] /workspace");
+    expect(fsTextOut.text()).toContain("[已跳过] /new");
+    expect(fsTextOut.text()).toContain("[已跳过] /stop");
+    expect(fsTextOut.text()).toContain("5 分钟");
+
+    const allFsLeaksCheck = [
+      fsTextOut.text(),
+      fsTextErr.text(),
+      ...feishuCapture.lines,
+    ].join("\n");
+    expect(allFsLeaksCheck).not.toContain(TEST_FEISHU_SECRET);
+    expect(allFsLeaksCheck).not.toContain(TEST_FEISHU_DYN_TOKEN);
+
+    // 2. Discord: `main` unchanged, `workspace` created, `new` fails with daily quota 30034 (and later `maxRequests` budget), `stop` skipped -> exit 1
+    let failMode: "quota_30034" | "budget" = "quota_30034";
+    const discordSrv = await startLocalHttpServer((_req, res, rec) => {
+      if (rec.pathname === "/api/v10/oauth2/applications/@me") {
+        sendJson(res, 200, { id: TEST_DISCORD_APP_ID, name: "Dalton" });
+        return;
+      }
+      const base = `/api/v10/applications/${TEST_DISCORD_APP_ID}/commands`;
+      if (rec.method === "GET" && rec.pathname === base) {
+        sendJson(res, 200, [
+          {
+            id: "dc_existing_main",
+            type: 1,
+            name: "main",
+            description: "返回 Chief of Staff",
+            integration_types: [0],
+            contexts: [0, 1],
+          },
+        ]);
+        return;
+      }
+      if (rec.method === "POST" && rec.pathname === base) {
+        const body = rec.jsonBody as Record<string, unknown>;
+        if (body.name === "workspace") {
+          sendJson(res, 201, {
+            id: "dc_created_ws",
+            ...body,
+          });
+          return;
+        }
+        if (failMode === "quota_30034") {
+          sendJson(res, 429, {
+            code: 30034,
+            message: `Daily command create quota hit for ${TEST_DISCORD_BOT_TOKEN}`,
+            retry_after: 86400,
+          });
+          return;
+        }
+        sendJson(res, 201, { id: "unexpected", ...body });
+      }
+    });
+
+    const dcJsonOut = createBufferWriter();
+    const dcJsonErr = createBufferWriter();
+    const dcQuotaExit = await runNativeCommandsCli(
+      ["--platform", "discord", "--apply", "--json"],
+      {
+        env: {
+          DALTON_DISCORD_BOT_TOKEN: TEST_DISCORD_BOT_TOKEN,
+          DALTON_DISCORD_APPLICATION_ID: TEST_DISCORD_APP_ID,
+        },
+        stdout: dcJsonOut,
+        stderr: dcJsonErr,
+        testApiOrigin: discordSrv.origin,
+      },
+    );
+    expect(dcQuotaExit).toBe(1);
+    const parsedDcQuota = JSON.parse(dcJsonOut.text()) as {
+      ok: boolean;
+      status: string;
+      errorCode: string;
+      outcomes: Array<{
+        name: string;
+        status: string;
+        remoteId?: string;
+        errorCode?: string;
+      }>;
+    };
+    expect(parsedDcQuota.ok).toBe(false);
+    expect(parsedDcQuota.status).toBe("failed");
+    expect(parsedDcQuota.errorCode).toBe("daily_create_limit");
+    expect(parsedDcQuota.outcomes.map((o) => [o.name, o.status, o.remoteId])).toEqual([
+      ["main", "unchanged", "dc_existing_main"],
+      ["workspace", "created", "dc_created_ws"],
+      ["new", "failed", undefined],
+      ["stop", "skipped", undefined],
+    ]);
+    expect(dcJsonOut.text()).not.toContain(TEST_DISCORD_BOT_TOKEN);
+    expect(dcJsonErr.text()).not.toContain(TEST_DISCORD_BOT_TOKEN);
+
+    // Also verify `maxRequests: 3` (`@me` + `GET` + `POST workspace` = 3, then `POST new` hits budget limit)
+    failMode = "budget";
+    const dcBudgetOut = createBufferWriter();
+    const dcBudgetExit = await runNativeCommandsCli(
+      ["--platform", "discord", "--apply"],
+      {
+        env: {
+          DALTON_DISCORD_BOT_TOKEN: TEST_DISCORD_BOT_TOKEN,
+          DALTON_DISCORD_APPLICATION_ID: TEST_DISCORD_APP_ID,
+        },
+        stdout: dcBudgetOut,
+        stderr: createBufferWriter(),
+        maxRequests: 3,
+        testApiOrigin: discordSrv.origin,
+      },
+    );
+    expect(dcBudgetExit).toBe(1);
+    expect(dcBudgetOut.text()).toContain("[无需修改] /main (id: dc_existing_main)");
+    expect(dcBudgetOut.text()).toContain("[已创建] /workspace (id: dc_created_ws)");
+    expect(dcBudgetOut.text()).toContain("[失败] /new");
+    expect(dcBudgetOut.text()).toContain("[已跳过] /stop");
+  });
+
+  it("writes default CLI logs to stderr so --json stdout is strictly a single parseable JSON document (both in-process and in a real Node child process)", async () => {
+    const srv = await startLocalHttpServer((_req, res, rec) => {
+      if (rec.pathname === "/open-apis/auth/v3/tenant_access_token/internal") {
+        sendJson(res, 200, {
+          code: 0,
+          tenant_access_token: TEST_FEISHU_DYN_TOKEN,
+        });
+        return;
+      }
+      if (
+        rec.method === "GET" &&
+        rec.pathname === FEISHU_SLASH_COMMAND_BASE_PATH
+      ) {
+        sendJson(res, 200, {
+          code: 0,
+          data: { items: [], has_more: false },
+        });
+        return;
+      }
+      if (rec.pathname === "/api/v10/oauth2/applications/@me") {
+        sendJson(res, 200, { id: TEST_DISCORD_APP_ID, name: "Dalton" });
+        return;
+      }
+      const base = `/api/v10/applications/${TEST_DISCORD_APP_ID}/commands`;
+      if (rec.method === "GET" && rec.pathname === base) {
+        sendJson(res, 200, []);
+        return;
+      }
+      if (rec.method === "POST" && rec.pathname === base) {
+        const body = rec.jsonBody as Record<string, unknown>;
+        sendJson(res, 201, {
+          id: `id_${String(body.name)}`,
+          ...body,
+        });
+        return;
+      }
+      sendJson(res, 404, {});
+    });
+
+    // 1. In-process call WITHOUT injecting `logger`, `stdout`, or `stderr`:
+    //    intercept `process.stdout.write`, `process.stderr.write`, and `console.log/info/debug`.
+    const realStdoutChunks: string[] = [];
+    const realStderrChunks: string[] = [];
+    const stdoutSpy = vi
+      .spyOn(process.stdout, "write")
+      .mockImplementation((chunk: string | Uint8Array) => {
+        realStdoutChunks.push(
+          typeof chunk === "string"
+            ? chunk
+            : Buffer.from(chunk).toString("utf8"),
+        );
+        return true;
+      });
+    const stderrSpy = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation((chunk: string | Uint8Array) => {
+        realStderrChunks.push(
+          typeof chunk === "string"
+            ? chunk
+            : Buffer.from(chunk).toString("utf8"),
+        );
+        return true;
+      });
+    const consoleLogSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    const consoleInfoSpy = vi
+      .spyOn(console, "info")
+      .mockImplementation(() => {});
+    const consoleDebugSpy = vi
+      .spyOn(console, "debug")
+      .mockImplementation(() => {});
+
+    try {
+      const inProcCode = await runNativeCommandsCli(
+        ["--platform", "discord", "--json"],
+        {
+          env: {
+            DALTON_DISCORD_BOT_TOKEN: TEST_DISCORD_BOT_TOKEN,
+            DALTON_DISCORD_APPLICATION_ID: TEST_DISCORD_APP_ID,
+          },
+          testApiOrigin: srv.origin,
+        },
+      );
+      expect(inProcCode).toBe(0);
+      expect(consoleLogSpy).not.toHaveBeenCalled();
+      expect(consoleInfoSpy).not.toHaveBeenCalled();
+      expect(consoleDebugSpy).not.toHaveBeenCalled();
+
+      const rawStdout = realStdoutChunks.join("");
+      const rawStderr = realStderrChunks.join("");
+      const parsedInProc = JSON.parse(rawStdout) as {
+        ok: boolean;
+        status: string;
+      };
+      expect(parsedInProc.ok).toBe(true);
+      expect(parsedInProc.status).toBe("preview");
+      expect(rawStdout).not.toContain("[native-commands");
+      expect(rawStdout).not.toContain(TEST_DISCORD_BOT_TOKEN);
+      expect(rawStderr).toContain("[native-commands/discord]");
+      expect(rawStderr).not.toContain(TEST_DISCORD_BOT_TOKEN);
+    } finally {
+      stdoutSpy.mockRestore();
+      stderrSpy.mockRestore();
+      consoleLogSpy.mockRestore();
+      consoleInfoSpy.mockRestore();
+      consoleDebugSpy.mockRestore();
+    }
+
+    // 2. Real bundled CLI artifact (`esbuild` -> temp `.mjs`):
+    //    verify side-effect-free `import()` AND real OS child-process `stdout`/`stderr` pipes.
+    const here = dirname(fileURLToPath(import.meta.url));
+    const tempDir = mkdtempSync(join(tmpdir(), "dalton-native-cli-test-"));
+    const bundlePath = join(tempDir, "native-commands.mjs");
+
+    const runNodeChild = (
+      args: readonly string[],
+      env: NodeJS.ProcessEnv,
+    ): Promise<{ exitCode: number; stdout: string; stderr: string }> =>
+      new Promise((resolveRun, rejectRun) => {
+        const child = spawn(process.execPath, [...args], {
+          env,
+          stdio: ["ignore", "pipe", "pipe"],
+        });
+        const outBufs: Buffer[] = [];
+        const errBufs: Buffer[] = [];
+        child.stdout.on("data", (chunk: Buffer) => outBufs.push(chunk));
+        child.stderr.on("data", (chunk: Buffer) => errBufs.push(chunk));
+        child.on("error", rejectRun);
+        child.on("close", (code) => {
+          resolveRun({
+            exitCode: code ?? 1,
+            stdout: Buffer.concat(outBufs).toString("utf8"),
+            stderr: Buffer.concat(errBufs).toString("utf8"),
+          });
+        });
+      });
+
+    try {
+      await build({
+        entryPoints: [resolve(here, "../src/native-commands/cli.ts")],
+        outfile: bundlePath,
+        bundle: true,
+        platform: "node",
+        target: "node22",
+        format: "esm",
+        banner: { js: "#!/usr/bin/env node" },
+        logLevel: "silent",
+      });
+
+      // Importing the compiled CLI bundle must never perform network I/O or run the CLI
+      const origFetch = globalThis.fetch;
+      let fetchTriggeredOnImport = false;
+      globalThis.fetch = (async () => {
+        fetchTriggeredOnImport = true;
+        throw new Error("Network call during module import");
+      }) as typeof fetch;
+      try {
+        await import(pathToFileURL(bundlePath).href);
+      } finally {
+        globalThis.fetch = origFetch;
+      }
+      expect(fetchTriggeredOnImport).toBe(false);
+
+      // Direct execution of compiled CLI binary (`--json` error path without credentials)
+      const directMissingCreds = await runNodeChild(
+        [bundlePath, "--platform", "discord", "--json"],
+        { PATH: process.env.PATH ?? "" },
+      );
+      expect(directMissingCreds.exitCode).toBe(3);
+      expect(directMissingCreds.stdout).not.toContain("[native-commands");
+      expect(JSON.parse(directMissingCreds.stdout)).toMatchObject({
+        ok: false,
+        status: "error",
+        code: "missing_config",
+      });
+
+      // Real child process running Discord `--apply --json` with NO logger/stdout/stderr overrides
+      const childApply = await runNodeChild(
+        [
+          "--input-type=module",
+          "-e",
+          "const m = await import(process.env.CLI_BUNDLE_URL); process.exitCode = await m.runNativeCommandsCli(['--platform', 'discord', '--apply', '--json'], { testApiOrigin: process.env.TEST_ORIGIN });",
+        ],
+        {
+          PATH: process.env.PATH ?? "",
+          CLI_BUNDLE_URL: pathToFileURL(bundlePath).href,
+          TEST_ORIGIN: srv.origin,
+          DALTON_DISCORD_BOT_TOKEN: TEST_DISCORD_BOT_TOKEN,
+          DALTON_DISCORD_APPLICATION_ID: TEST_DISCORD_APP_ID,
+        },
+      );
+      expect(childApply.exitCode).toBe(0);
+      const parsedChildJson = JSON.parse(childApply.stdout) as {
+        ok: boolean;
+        status: string;
+        outcomes: Array<{ status: string }>;
+      };
+      expect(parsedChildJson.ok).toBe(true);
+      expect(parsedChildJson.status).toBe("applied");
+      expect(parsedChildJson.outcomes).toHaveLength(4);
+      expect(childApply.stderr).toContain("[native-commands/discord]");
+      expect(childApply.stderr).not.toContain(TEST_DISCORD_BOT_TOKEN);
+      expect(childApply.stdout).not.toContain("[native-commands");
+      expect(childApply.stdout).not.toContain(TEST_DISCORD_BOT_TOKEN);
+
+      // Real child process running Feishu `--json` preview with NO logger/stdout/stderr overrides
+      const childFeishuPreview = await runNodeChild(
+        [
+          "--input-type=module",
+          "-e",
+          "const m = await import(process.env.CLI_BUNDLE_URL); process.exitCode = await m.runNativeCommandsCli(['--platform', 'feishu', '--json'], { testApiOrigin: process.env.TEST_ORIGIN });",
+        ],
+        {
+          PATH: process.env.PATH ?? "",
+          CLI_BUNDLE_URL: pathToFileURL(bundlePath).href,
+          TEST_ORIGIN: srv.origin,
+          DALTON_FEISHU_APP_ID: TEST_FEISHU_APP_ID,
+          DALTON_FEISHU_APP_SECRET: TEST_FEISHU_SECRET,
+        },
+      );
+      expect(childFeishuPreview.exitCode).toBe(0);
+      const parsedFeishuChild = JSON.parse(childFeishuPreview.stdout) as {
+        ok: boolean;
+        status: string;
+        platform: string;
+      };
+      expect(parsedFeishuChild.ok).toBe(true);
+      expect(parsedFeishuChild.status).toBe("preview");
+      expect(parsedFeishuChild.platform).toBe("feishu");
+      expect(childFeishuPreview.stderr).toContain("[native-commands/feishu]");
+      expect(childFeishuPreview.stderr).not.toContain(TEST_FEISHU_SECRET);
+      expect(childFeishuPreview.stderr).not.toContain(TEST_FEISHU_DYN_TOKEN);
+      expect(childFeishuPreview.stdout).not.toContain("[native-commands");
+      expect(childFeishuPreview.stdout).not.toContain(TEST_FEISHU_SECRET);
+      expect(childFeishuPreview.stdout).not.toContain(TEST_FEISHU_DYN_TOKEN);
+    } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
   });
 });

@@ -369,13 +369,17 @@ function buildDiscordOptionPayload(
   };
   // Preserve unmanaged localization maps on an existing option of the same name.
   if (existingOpt && existingOpt.name === specOpt.name) {
-    if (isPlainRecord(existingOpt.name_localizations)) {
-      payload.name_localizations = { ...existingOpt.name_localizations };
+    const nameLocalizations = extractNonEmptyStringMap(
+      existingOpt.name_localizations,
+    );
+    if (nameLocalizations) {
+      payload.name_localizations = nameLocalizations;
     }
-    if (isPlainRecord(existingOpt.description_localizations)) {
-      payload.description_localizations = {
-        ...existingOpt.description_localizations,
-      };
+    const descriptionLocalizations = extractNonEmptyStringMap(
+      existingOpt.description_localizations,
+    );
+    if (descriptionLocalizations) {
+      payload.description_localizations = descriptionLocalizations;
     }
   }
   return payload;

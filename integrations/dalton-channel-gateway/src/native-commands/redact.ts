@@ -9,9 +9,14 @@
 
 import {
   createSubsystemLogger,
+  type LoggerSink,
   redactCredentialString,
   type SubsystemLogger,
 } from "../shared/logger.js";
+import {
+  type NativeCommandPlatform,
+  NativeCommandRegistrationError,
+} from "./types.js";
 
 const DISCORD_BOT_AUTH_PATTERN = /\b(Bot\s+)[A-Za-z0-9._~+/=-]+/gi;
 const DISCORD_TOKEN_SHAPE_PATTERN =
@@ -119,13 +124,63 @@ function scrubMetaValue(
   return scrubNativeCommandSecrets(String(value), secrets);
 }
 
+export function createStderrLoggerSink(
+  stderr: { write(chunk: string): unknown } = process.stderr,
+): LoggerSink {
+  const writeLine = (line: string): void => {
+    stderr.write(`${line}\n`);
+  };
+  return {
+    debug: writeLine,
+    info: writeLine,
+    warn: writeLine,
+    error: writeLine,
+  };
+}
+
+export function sanitizeRegistrationError(
+  error: unknown,
+  secrets: Iterable<string>,
+  platform: NativeCommandPlatform,
+): NativeCommandRegistrationError {
+  const secretList = [...secrets];
+  if (error instanceof NativeCommandRegistrationError) {
+    const safeMsg = scrubNativeCommandSecrets(error.message, secretList, 2048);
+    const sanitized = new NativeCommandRegistrationError(error.code, safeMsg, {
+      httpStatus: error.httpStatus,
+      platform: error.platform ?? platform,
+    });
+    if (sanitized.stack) {
+      sanitized.stack = scrubNativeCommandSecrets(
+        sanitized.stack,
+        secretList,
+        4096,
+      );
+    }
+    return sanitized;
+  }
+
+  const rawMsg = error instanceof Error ? error.message : String(error);
+  const safeMsg = scrubNativeCommandSecrets(rawMsg, secretList, 2048);
+  const wrapped = new NativeCommandRegistrationError("network_error", safeMsg, {
+    platform,
+  });
+  if (wrapped.stack) {
+    wrapped.stack = scrubNativeCommandSecrets(wrapped.stack, secretList, 4096);
+  }
+  return wrapped;
+}
+
 export function createSecretAwareLogger(options: {
   subsystem: string;
   baseLogger?: SubsystemLogger;
   getSecrets: () => Iterable<string>;
 }): SubsystemLogger {
   const target =
-    options.baseLogger ?? createSubsystemLogger(options.subsystem);
+    options.baseLogger ??
+    createSubsystemLogger(options.subsystem, {
+      sink: createStderrLoggerSink(process.stderr),
+    });
 
   const sanitizeCall = (
     message: string,

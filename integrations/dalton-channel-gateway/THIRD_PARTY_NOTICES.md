@@ -26,7 +26,7 @@ This package (`@dalton/channel-gateway`) includes code adapted from the OpenClaw
 
 | Target File in `@dalton/channel-gateway` | `larksuite/cli` Source (`7dbefd9cf17357545450ca53007d413212bc8aba`) | Referenced Lines |
 |---|---|---|
-| `src/native-commands/manifest.ts`, `src/native-commands/feishu-registrar.ts` | `shortcuts/application/slash_command_create.go`, `shortcuts/application/slash_command_common.go`, `shortcuts/application/slash_command_resolve.go` | `1–113`, `1–105`, `1–54` |
+| `src/native-commands/manifest.ts`, `src/native-commands/feishu-registrar.ts` | `shortcuts/application/slash_command_create.go`, `shortcuts/application/slash_command_update.go`, `shortcuts/application/slash_command_common.go`, `shortcuts/application/slash_command_resolve.go` | `1–113`, `1–95`, `1–105`, `1–54` |
 
 ---
 

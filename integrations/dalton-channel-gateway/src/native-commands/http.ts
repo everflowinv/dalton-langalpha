@@ -271,6 +271,7 @@ export class BoundedHttpClient {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), attemptTimeoutMs);
       const url = `${this.baseOrigin}${params.path}`;
+      const safePath = this.redact(params.path.split("?")[0] || params.path);
 
       let response: Response;
       let rawText: string;
@@ -319,18 +320,17 @@ export class BoundedHttpClient {
         if (isMutation) {
           throw new AmbiguousMutationError(
             timedOut
-              ? `${params.method} ${params.path} 请求超时 (${attemptTimeoutMs}ms)`
-              : `${params.method} ${params.path} 连接中断: ${safeErrMsg}`,
-            err,
+              ? `${params.method} ${safePath} 请求超时 (${attemptTimeoutMs}ms)`
+              : `${params.method} ${safePath} 连接中断: ${safeErrMsg}`,
           );
         }
 
         throw new NativeCommandRegistrationError(
           timedOut ? "timeout" : "network_error",
           timedOut
-            ? `${this.platform} 请求 ${params.method} ${params.path} 超时 (${attemptTimeoutMs}ms)。`
-            : `${this.platform} 请求 ${params.method} ${params.path} 网络错误: ${safeErrMsg}`,
-          { platform: this.platform, cause: err },
+            ? `${this.platform} 请求 ${params.method} ${safePath} 超时 (${attemptTimeoutMs}ms)。`
+            : `${this.platform} 请求 ${params.method} ${safePath} 网络错误: ${safeErrMsg}`,
+          { platform: this.platform },
         );
       } finally {
         clearTimeout(timer);
@@ -379,7 +379,7 @@ export class BoundedHttpClient {
 
         this.logger?.warn("HTTP 429 rate limited; waiting before retry", {
           method: params.method,
-          path: params.path,
+          path: safePath,
           retryAfterMs,
           attempt: rateLimitAttempt + 1,
         });
@@ -390,12 +390,12 @@ export class BoundedHttpClient {
       if (response.status >= 500) {
         if (isMutation) {
           throw new AmbiguousMutationError(
-            `${params.method} ${params.path} 返回服务端异常 HTTP ${response.status}`,
+            `${params.method} ${safePath} 返回服务端异常 HTTP ${response.status}`,
           );
         }
         throw new NativeCommandRegistrationError(
           "http_error",
-          `${this.platform} 请求 ${params.method} ${params.path} 失败 (HTTP ${response.status})${safeRawText ? `: ${safeRawText}` : ""}`,
+          `${this.platform} 请求 ${params.method} ${safePath} 失败 (HTTP ${response.status})${safeRawText ? `: ${safeRawText}` : ""}`,
           { httpStatus: response.status, platform: this.platform },
         );
       }
@@ -403,12 +403,12 @@ export class BoundedHttpClient {
       if (response.ok && response.status !== 204 && !jsonValid) {
         if (isMutation) {
           throw new AmbiguousMutationError(
-            `${params.method} ${params.path} 响应体不完整或非合法 JSON`,
+            `${params.method} ${safePath} 响应体不完整或非合法 JSON`,
           );
         }
         throw new NativeCommandRegistrationError(
           "malformed_response",
-          `${this.platform} 请求 ${params.method} ${params.path} 返回非合法 JSON 响应。`,
+          `${this.platform} 请求 ${params.method} ${safePath} 返回非合法 JSON 响应。`,
           { httpStatus: response.status, platform: this.platform },
         );
       }
@@ -478,7 +478,7 @@ export async function collectPaginatedItems<T>(options: {
     if (seenCursors.has(nextCursor)) {
       throw new NativeCommandRegistrationError(
         "pagination_error",
-        `${options.platform} 命令列表返回重复分页游标 (${nextCursor})，拒绝使用不完整列表计算或写入命令。`,
+        `${options.platform} 命令列表返回重复分页游标，拒绝使用不完整列表计算或写入命令。`,
         { platform: options.platform },
       );
     }
