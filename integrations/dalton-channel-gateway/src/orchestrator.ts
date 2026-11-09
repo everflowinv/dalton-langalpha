@@ -23,6 +23,7 @@ import {
   buildSurfaceRules,
   type ChannelPlatform,
   type ChatContentItem,
+  type InboundAttachmentDescriptor,
   type InboundChannelEvent,
   INLINE_IMAGE_MIME_TYPES,
   INTERNAL_REPLAY_NEEDED_OUTCOMES,
@@ -36,6 +37,7 @@ import {
   PUBLIC_REPLAY_NEEDED_STATUSES,
   type UploadedAttachmentRecord,
 } from "./types.js";
+import { SafeFetchError } from "./shared/safe-fetch.js";
 import {
   makeCreditSupplementSteerKey,
   makeInboundRequestKey,
@@ -101,6 +103,7 @@ export class ChannelGatewayOrchestrator {
 
   readonly activeWatches = new Map<string, ActiveWatchHandle>();
   private readonly activeBackgroundRunIds = new Map<string, Set<string>>();
+  private readonly activeInboundTurns = new Set<Promise<void>>();
   private startupRecoveryPromise: Promise<void> | null = null;
 
   constructor(options: {
@@ -139,16 +142,16 @@ export class ChannelGatewayOrchestrator {
   // =========================================================================
 
   async handleInboundEvent(event: InboundChannelEvent): Promise<void> {
-    // Group chats require explicit trigger (@bot or slash command)
-    if (event.chatType === "group" && event.isGroupTrigger === false) {
+    // Group chats require an explicit bot mention trigger
+    if (event.chatType === "group" && event.isGroupTrigger !== true) {
       return;
     }
 
-    const trimmedText = (event.text ?? "").trim();
+    const commandText = (event.commandText ?? event.text ?? "").trim();
 
     // Check for slash commands (§3.3): /bind, /unbind, /workspace, /new, /stop
-    if (trimmedText.startsWith("/")) {
-      const handled = await this.tryHandleSlashCommand(event, trimmedText);
+    if (commandText.startsWith("/")) {
+      const handled = await this.tryHandleSlashCommand(event, commandText);
       if (handled) {
         return;
       }
@@ -163,16 +166,88 @@ export class ChannelGatewayOrchestrator {
       thread_scope_key: event.threadScopeKey,
       message_id: event.messageId,
       request_key: requestKey,
-      raw_payload: {
-        ...(event.rawPayload ?? {}),
-        platform_user_id: event.platformUserId,
-        text: event.text,
-        chat_id: event.chatId,
-        chat_name: event.chatName ?? null,
-      },
+      raw_payload: this.buildInboundRawPayload(event),
       weixin_context_token: event.weixinContextToken ?? null,
     });
 
+    await this.launchInboundTurn(event, () =>
+      this.executeRegisteredInboundTurn(event, resolved),
+    );
+  }
+
+  private buildInboundRawPayload(
+    event: InboundChannelEvent,
+  ): Record<string, unknown> {
+    return {
+      ...(event.rawPayload ?? {}),
+      platform_user_id: event.platformUserId,
+      text: event.text,
+      chat_id: event.chatId,
+      chat_name: event.chatName ?? null,
+      attachments: (event.attachments ?? []).map((attachment) => ({
+        id: attachment.id,
+        filename: attachment.filename,
+        mimeType: attachment.mimeType,
+        ...(attachment.sizeBytes !== undefined
+          ? { sizeBytes: attachment.sizeBytes }
+          : {}),
+      })),
+    };
+  }
+
+  private async recoverDetachedInboundTurn(
+    event: InboundChannelEvent,
+  ): Promise<void> {
+    const requestKey = makeInboundRequestKey(event.platform, event.messageId);
+    const reresolved = await this.backend.registerAndResolveInbound({
+      platform: event.platform,
+      platform_user_id: event.platformUserId,
+      chat_type: event.chatType,
+      chat_address: event.chatAddress,
+      thread_scope_key: event.threadScopeKey,
+      message_id: event.messageId,
+      request_key: requestKey,
+      raw_payload: this.buildInboundRawPayload(event),
+      weixin_context_token: event.weixinContextToken ?? null,
+    });
+    await this.executeRegisteredInboundTurn(event, reresolved);
+  }
+
+  private async launchInboundTurn(
+    event: InboundChannelEvent,
+    runTurn: () => Promise<void>,
+  ): Promise<void> {
+    const turnPromise = (async () => {
+      try {
+        await runTurn();
+      } catch {
+        try {
+          await this.recoverDetachedInboundTurn(event);
+        } catch {
+          // The inbound row keeps its last persisted state, so a later
+          // recovery pass can query and replay with the same request key.
+        }
+      }
+    })();
+
+    this.activeInboundTurns.add(turnPromise);
+    void turnPromise.finally(() => {
+      this.activeInboundTurns.delete(turnPromise);
+    });
+
+    await new Promise<void>((resolve) => {
+      const timer = setImmediate(resolve);
+      void turnPromise.finally(() => {
+        clearImmediate(timer);
+        resolve();
+      });
+    });
+  }
+
+  private async executeRegisteredInboundTurn(
+    event: InboundChannelEvent,
+    resolved: I1RegisterAndResolveResponse,
+  ): Promise<void> {
     // Step 1: Deduplication check on existing_status
     if (
       resolved.existing_status === "completed" ||
@@ -253,15 +328,16 @@ export class ChannelGatewayOrchestrator {
     let uploadedAttachments: UploadedAttachmentRecord[] =
       resolved.uploaded_attachments ?? [];
 
+    const attachmentDescriptors = event.attachments ?? [];
     if (
-      uploadedAttachments.length === 0 &&
-      event.attachments &&
-      event.attachments.length > 0
+      attachmentDescriptors.length > 0 &&
+      uploadedAttachments.length < attachmentDescriptors.length
     ) {
       const uploadOutcome = await this.downloadAndUploadAttachments(
         event,
         resolved,
         userId,
+        uploadedAttachments,
       );
       if (!uploadOutcome.ok) {
         await this.backend.updateInboundProgress({
@@ -282,11 +358,6 @@ export class ChannelGatewayOrchestrator {
         return;
       }
       uploadedAttachments = uploadOutcome.uploaded;
-      await this.backend.updateInboundProgress({
-        platform: event.platform,
-        message_id: event.messageId,
-        uploaded_attachments: uploadedAttachments,
-      });
     }
 
     const messageContent = this.buildMessageContent(
@@ -604,6 +675,7 @@ export class ChannelGatewayOrchestrator {
     event: InboundChannelEvent,
     resolved: I1RegisterAndResolveResponse,
     userId: string,
+    alreadyUploaded: UploadedAttachmentRecord[] = [],
   ): Promise<
     | { ok: true; uploaded: UploadedAttachmentRecord[] }
     | { ok: false; errorMessage: string }
@@ -664,12 +736,18 @@ export class ChannelGatewayOrchestrator {
       }
     }
 
-    const uploaded: UploadedAttachmentRecord[] = [];
-    let totalBytes = 0;
+    const uploaded: UploadedAttachmentRecord[] = [...alreadyUploaded];
+    let totalBytes = uploaded.reduce(
+      (sum, record) => sum + record.size_bytes,
+      0,
+    );
     const safeMsgId =
       event.messageId.replace(/[^a-zA-Z0-9._-]/g, "_") || "message";
+    const remainingDescriptors = descriptors.slice(uploaded.length);
 
-    for (const desc of descriptors) {
+    for (let remainingIndex = 0; remainingIndex < remainingDescriptors.length; remainingIndex += 1) {
+      const desc = remainingDescriptors[remainingIndex]!;
+      const descriptorIndex = alreadyUploaded.length + remainingIndex;
       if (desc.sizeBytes !== undefined && desc.sizeBytes > MAX_ATTACHMENT_BYTES) {
         return {
           ok: false,
@@ -677,7 +755,18 @@ export class ChannelGatewayOrchestrator {
         };
       }
 
-      const downloaded = await adapter.downloadAttachment(desc, event);
+      let downloaded: Awaited<ReturnType<typeof adapter.downloadAttachment>>;
+      try {
+        downloaded = await adapter.downloadAttachment(desc, event);
+      } catch (err) {
+        if (err instanceof SafeFetchError && err.code === "size_exceeded") {
+          return {
+            ok: false,
+            errorMessage: `Attachment "${desc.filename}" exceeds the 20 MB per-file limit.`,
+          };
+        }
+        throw err;
+      }
       const byteLength = downloaded.content.byteLength;
       if (byteLength > MAX_ATTACHMENT_BYTES) {
         return {
@@ -698,7 +787,17 @@ export class ChannelGatewayOrchestrator {
         downloaded.filename || desc.filename || "attachment",
       );
       // Upload to non-restricted `uploads/...` path (`_is_non_owner_blocked_path` blocks `.agents/` for non-owners)
-      const workspacePath = `uploads/${event.platform}/${safeMsgId}/${safeFilename}`;
+      let workspacePath = `uploads/${event.platform}/${safeMsgId}/${safeFilename}`;
+      if (uploaded.some((record) => record.workspace_path === workspacePath)) {
+        let suffix = descriptorIndex + 1;
+        workspacePath = `uploads/${event.platform}/${safeMsgId}/${suffix}-${safeFilename}`;
+        while (
+          uploaded.some((record) => record.workspace_path === workspacePath)
+        ) {
+          suffix += 1;
+          workspacePath = `uploads/${event.platform}/${safeMsgId}/${suffix}-${safeFilename}`;
+        }
+      }
 
       await this.backend.uploadWorkspaceFile(
         userId,
@@ -729,6 +828,11 @@ export class ChannelGatewayOrchestrator {
         mime_type: mimeType,
         size_bytes: byteLength,
         ...(dataUrl ? { data_url: dataUrl } : {}),
+      });
+      await this.backend.updateInboundProgress({
+        platform: event.platform,
+        message_id: event.messageId,
+        uploaded_attachments: [...uploaded],
       });
     }
 
@@ -6624,6 +6728,40 @@ export class ChannelGatewayOrchestrator {
     ]);
   }
 
+  private parseRecoveredAttachments(
+    value: unknown,
+  ): InboundAttachmentDescriptor[] {
+    if (!Array.isArray(value)) {
+      return [];
+    }
+    const attachments: InboundAttachmentDescriptor[] = [];
+    for (const entry of value) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        continue;
+      }
+      const record = entry as Record<string, unknown>;
+      const id = typeof record.id === "string" ? record.id.trim() : "";
+      const filename =
+        typeof record.filename === "string" ? record.filename.trim() : "";
+      const mimeType =
+        typeof record.mimeType === "string" ? record.mimeType.trim() : "";
+      if (!id || !filename || !mimeType) {
+        continue;
+      }
+      attachments.push({
+        id,
+        filename,
+        mimeType,
+        ...(typeof record.sizeBytes === "number" &&
+        Number.isFinite(record.sizeBytes) &&
+        record.sizeBytes >= 0
+          ? { sizeBytes: record.sizeBytes }
+          : {}),
+      });
+    }
+    return attachments;
+  }
+
   private async recoverSingleInboundRow(
     row: RecoverInboundEventRow,
   ): Promise<void> {
@@ -6654,15 +6792,35 @@ export class ChannelGatewayOrchestrator {
           ? row.raw_payload.generation
           : 0;
 
+    const recoveredAttachments = this.parseRecoveredAttachments(
+      row.raw_payload?.attachments,
+    );
     const syntheticEvent: InboundChannelEvent = {
       platform: row.platform,
       platformUserId,
+      ...(typeof row.raw_payload?.platform_username === "string" &&
+      row.raw_payload.platform_username
+        ? { platformUsername: row.raw_payload.platform_username }
+        : {}),
       chatType: row.chat_type,
       chatAddress: row.chat_address,
-      chatId: String(row.raw_payload?.chat_id ?? row.chat_address),
+      chatId:
+        typeof row.raw_payload?.chat_id === "string" &&
+        row.raw_payload.chat_id
+          ? row.raw_payload.chat_id
+          : row.chat_address,
+      ...(typeof row.raw_payload?.chat_name === "string" &&
+      row.raw_payload.chat_name
+        ? { chatName: row.raw_payload.chat_name }
+        : {}),
       threadScopeKey: row.thread_scope_key,
       messageId: row.message_id,
-      text: String(row.raw_payload?.text ?? ""),
+      text:
+        typeof row.raw_payload?.text === "string" ? row.raw_payload.text : "",
+      ...(recoveredAttachments.length > 0
+        ? { attachments: recoveredAttachments }
+        : {}),
+      rawPayload: row.raw_payload ?? {},
     };
 
     const pendingFromRow =
@@ -6981,57 +7139,25 @@ export class ChannelGatewayOrchestrator {
       row.status === "pending" ||
       row.status === "accepted"
     ) {
-      const messageContent = this.buildMessageContent(
-        syntheticEvent.text,
-        row.uploaded_attachments ?? [],
-      );
-
-      // Check if the session has an active `pending_interrupt` (either on `row` or via idempotent `I-1`)
-      let activeInterrupt = syntheticResolved.pending_interrupt;
-      if (!activeInterrupt) {
-        try {
-          const reresolved = await this.backend.registerAndResolveInbound({
-            platform: row.platform,
-            platform_user_id: platformUserId,
-            chat_type: row.chat_type,
-            chat_address: row.chat_address,
-            thread_scope_key: row.thread_scope_key,
-            message_id: row.message_id,
-            request_key: row.request_key,
-            raw_payload: row.raw_payload ?? {},
-          });
-          activeInterrupt = reresolved.pending_interrupt ?? null;
-          syntheticResolved.pending_interrupt = activeInterrupt;
-        } catch {
-          // Proceed if registerAndResolveInbound is not mocked in unit test
-        }
-      }
-
-      if (activeInterrupt && activeInterrupt.thread_id) {
-        const handledHitl = await this.handlePendingInterruptReply({
-          event: syntheticEvent,
-          userId,
-          resolved: syntheticResolved,
-          messageContent,
-          pendingInterrupt: activeInterrupt,
-        });
-        if (handledHitl) {
-          return;
-        }
-      }
-
-      const effectiveKey =
-        row.resubmitted_request_key ?? row.retry_request_key ?? row.request_key;
-      await this.dispatchConversationTurn({
-        event: syntheticEvent,
-        userId,
-        resolved: syntheticResolved,
-        messageContent,
-        requestKey: effectiveKey,
-        steerOnly: false,
-        retryAttempt: 0,
-        busyWaitStartedAtMs: recoveredBusyWaitStartedAtMs,
-        explicitThreadId: row.thread_id,
+      const reresolved = await this.backend.registerAndResolveInbound({
+        platform: row.platform,
+        platform_user_id: platformUserId,
+        chat_type: row.chat_type,
+        chat_address: row.chat_address,
+        thread_scope_key: row.thread_scope_key,
+        message_id: row.message_id,
+        request_key: row.request_key,
+        raw_payload: row.raw_payload ?? {},
+      });
+      await this.executeRegisteredInboundTurn(syntheticEvent, {
+        ...reresolved,
+        pending_interrupt:
+          reresolved.pending_interrupt ?? syntheticResolved.pending_interrupt,
+        uploaded_attachments:
+          reresolved.uploaded_attachments &&
+          reresolved.uploaded_attachments.length > 0
+            ? reresolved.uploaded_attachments
+            : (row.uploaded_attachments ?? []),
       });
     }
   }

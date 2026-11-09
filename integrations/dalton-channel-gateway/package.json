@@ -14,6 +14,12 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "1.74.0",
+    "mdast-util-from-markdown": "2.0.3",
+    "mdast-util-gfm-table": "2.0.0",
+    "micromark-extension-gfm-table": "2.1.2"
+  },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "esbuild": "^0.25.0",
