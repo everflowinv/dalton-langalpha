@@ -453,7 +453,7 @@ describe("DiscordGatewayClient", () => {
       const ws2 = sockets[sockets.length - 1]!;
       expect(ws2).not.toBe(ws1);
       ws2.open();
-      ws2.receive({ op: 10, d: { heartbeat_interval: 1000 } });
+      ws2.receive({ op: 10, d: { heartbeat_interval: 60000 } });
       await flushMicrotasks();
       ws2.receive({
         op: 0,
@@ -819,7 +819,7 @@ describe("DiscordGatewayClient", () => {
     });
     ws2.receive({ op: 0, s: 3, t: "RESUMED", d: {} });
     await bothRegistered;
-    await flushMicrotasks();
+    await vi.waitFor(() => expect(gatewayClient.getSequence()).toBe(3));
 
     // Original message registered once, in strict order before m-gw-2, and acked sequence advances to 3.
     expect(registered).toEqual(["m-gw-1:first", "m-gw-2:second"]);
