@@ -501,3 +501,78 @@ def test_freshness_detail_and_page_script_do_not_say_zero_days() -> None:
     assert "st.live&&st.live.length?st.live:(s.today||[])" in source
     vol_init = source.index("function volInit")
     assert "cnOpen(st.cfg)" in source[vol_init:vol_init + 600]
+
+
+def _official_hedge_clause(card: str) -> str:
+    marker = "正式提醒截至"
+    assert marker in card
+    return card.split(marker, 1)[1]
+
+
+def test_put_hedge_card_separates_ratio_date_from_official_as_of() -> None:
+    page = _top_page(
+        {
+            "metrics": {"as_of": "2026-11-06", "vvix_vix": 4.2},
+            "stage": "无信号",
+            "summary": "无活动信号",
+            "strength": "",
+            "environment": {},
+            "projection": {"scenario": {"available": True, "as_of": "2026-11-09"}},
+            "put_hedge": {
+                "on": True,
+                "as_of": "2026-11-06",
+                "vix": 16.4,
+                "put_cost_pct_1m_atm": 0.82,
+                "stats": {
+                    "start": "2018-01-01",
+                    "segments": 12,
+                    "horizon_td": 20,
+                    "segments_evaluated": 10,
+                    "segments_dd_ge_10pct": 3,
+                    "control_dd_ge_10pct_rate": 0.2,
+                },
+            },
+        },
+        vvix_vix=_span("2026-11-09", 5.5, "2026-11-06", 4.2),
+    )
+    card = _card(page, "指数 put 保护提醒（VVIX/VIX）")
+    assert ">提醒</div>" in card
+    assert "VVIX/VIX 5.50（2026-11-09 盘中）" in card
+    assert "VIX 16.4" in card
+    assert "1月平值put≈0.8%名义" in card
+    assert "4.20" not in card
+    assert "数据截至" not in card
+    official = _official_hedge_clause(card)
+    assert official.startswith(" 2026-11-06")
+    assert "2026-11-09" not in official
+    assert "VIX 16.4" in official
+    assert "1月平值put≈0.8%名义" in official
+    assert "2018年起12段" in card
+    assert "正式提醒截至 2026-11-06" in card
+    assert "当前5.50（2026-11-09 盘中）" in page
+    assert "指数put保护：提醒" in page
+
+    missing = _top_page(
+        {
+            "metrics": {"as_of": "2026-11-06"},
+            "stage": "无信号",
+            "summary": "无活动信号",
+            "strength": "",
+            "environment": {},
+            "projection": {"scenario": {"available": True, "as_of": "2026-11-09"}},
+            "put_hedge": {"on": False, "vix": 16.4, "put_cost_pct_1m_atm": 0.82},
+        },
+        vvix_vix=_span("2026-11-09", 5.5, "2026-11-06", 4.2),
+    )
+    missing_card = _card(missing, "指数 put 保护提醒（VVIX/VIX）")
+    assert ">无</div>" in missing_card
+    assert "VVIX/VIX 5.50（2026-11-09 盘中）" in missing_card
+    assert "VIX 16.4" in missing_card
+    assert "1月平值put≈0.8%名义" in missing_card
+    assert "正式提醒截至 —" in missing_card
+    assert "数据截至" not in missing_card
+    assert "历史样本不足" in missing_card
+    missing_official = _official_hedge_clause(missing_card)
+    assert missing_official.startswith(" —")
+    assert "2026-11-09" not in missing_official
+    assert "2026-11-06" not in missing_official

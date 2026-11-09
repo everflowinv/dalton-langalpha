@@ -499,19 +499,21 @@ def top_monitor_section(
     put_hedge = top_framework.get("put_hedge") or {}
     hedge_stats = put_hedge.get("stats") or {}
     hedge_on = bool(put_hedge.get("on"))
+    # The formal reminder, VIX, and put cost share put_hedge.as_of.
+    hedge_as_of = _obs_date_str(put_hedge.get("as_of"))
+    official_note = f"正式提醒截至 {hedge_as_of or '—'}"
     hedge_sub = (
         f"VVIX/VIX {fmt(vvix_ratio, 2)}{vvix_ratio_tag}（提醒线 ≥{top_cfg.put_hedge_vvix_vix:.1f}）；"
-        f"VIX {fmt(put_hedge.get('vix'), 1)}，1月平值put≈{fmt(put_hedge.get('put_cost_pct_1m_atm'), 1, '%')}名义"
+        f"{official_note}：VIX {fmt(put_hedge.get('vix'), 1)}，1月平值put≈{fmt(put_hedge.get('put_cost_pct_1m_atm'), 1, '%')}名义"
     )
     hedge_eval = hedge_stats.get("segments_evaluated") or 0
     hedge_rate10 = hedge_stats.get("control_dd_ge_10pct_rate")
-    hedge_obs_meta = _obs_meta(vvix_ratio_date, formal_as_of, scenario_as_of=scenario_as_of, explicit_intraday=vvix_ratio_intraday)
     hedge_meta = (
         f"{str(hedge_stats.get('start') or '')[:4]}年起{hedge_stats.get('segments')}段：起点后{hedge_stats.get('horizon_td')}日QQQ回撤≥10%的"
         f"{hedge_stats.get('segments_dd_ge_10pct')}/{hedge_eval}段（VIX<{top_cfg.put_hedge_cheap_vix:.0f}对照日{fmt(None if hedge_rate10 is None else hedge_rate10 * 100, 0, '%')}）；"
-        f"买便宜尾部保险的窗口，不是顶部信号，不进状态机；{hedge_obs_meta}"
+        f"买便宜尾部保险的窗口，不是顶部信号，不进状态机；{official_note}"
         if hedge_eval
-        else f"历史样本不足；买便宜尾部保险的窗口，不是顶部信号，不进状态机；{hedge_obs_meta}"
+        else f"历史样本不足；买便宜尾部保险的窗口，不是顶部信号，不进状态机；{official_note}"
     )
     confirm_value = signed(round_high_pct) if round_high_pct is not None else "无活动轮次"
     confirm_tone = "hot" if round_high_pct is not None and round_high_pct <= -top_cfg.confirm_drawdown_pct else "neutral"
