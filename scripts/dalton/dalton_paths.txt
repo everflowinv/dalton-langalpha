@@ -191,3 +191,4 @@ integrations/dalton-channel-gateway/src/channels/feishu/
 integrations/dalton-channel-gateway/test/feishu.test.ts
 
 scripts/dalton/openclaw_overlays/skills/sentiment-dashboard/scripts/run.sh
+scripts/dalton/openclaw_overlays/scripts/sentiment_dashboard_cos_upload.py

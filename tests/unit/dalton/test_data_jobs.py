@@ -7475,3 +7475,536 @@ def test_wrapper_prewarms_yfinance_caches_before_the_task(monkeypatch: pytest.Mo
     runner_wrapper._prewarm_yfinance_cache()
     tz_cache.return_value.lookup.assert_called_once_with("QQQ")
     cookie_cache.return_value.lookup.assert_called_once_with("basic")
+
+
+def test_sentiment_dashboard_cos_upload_overlay_skip_subprocess_without_sdk_credentials_or_network(
+    tmp_path: Path,
+) -> None:
+    import hashlib
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parents[3]
+    overlay_script = (
+        repo_root
+        / "scripts"
+        / "dalton"
+        / "openclaw_overlays"
+        / "scripts"
+        / "sentiment_dashboard_cos_upload.py"
+    )
+    assert overlay_script.is_file()
+
+    # Guard site blocks qcloud_cos imports and all socket / urllib network connections in the subprocess.
+    guard_site = tmp_path / "guard_site"
+    guard_site.mkdir(parents=True)
+    (guard_site / "qcloud_cos.py").write_text(
+        "raise RuntimeError('qcloud_cos must not be imported in skip mode')\n",
+        encoding="utf-8",
+    )
+    (guard_site / "sitecustomize.py").write_text(
+        "import socket, urllib.request\n"
+        "def _deny(*args, **kwargs):\n"
+        "    raise RuntimeError('Network access is forbidden')\n"
+        "socket.socket.connect = _deny\n"
+        "socket.create_connection = _deny\n"
+        "urllib.request.urlopen = _deny\n",
+        encoding="utf-8",
+    )
+
+    # Guard binary on PATH records if macOS Keychain (`security`) is ever invoked.
+    fake_bin = tmp_path / "fake_bin"
+    fake_bin.mkdir(parents=True)
+    keychain_marker = tmp_path / "keychain_called.txt"
+    fake_security = fake_bin / "security"
+    fake_security.write_text(
+        f"#!/bin/sh\necho called > {str(keychain_marker)!r}\nexit 99\n",
+        encoding="utf-8",
+    )
+    fake_security.chmod(0o755)
+
+    base_env = {
+        k: v
+        for k, v in os.environ.items()
+        if k
+        not in (
+            "TENCENT_COS_SECRET_ID",
+            "TENCENT_COS_SECRET_KEY",
+            "DALTON_COS_UPLOAD_MODE",
+        )
+    }
+    skip_env = {
+        **base_env,
+        "DALTON_COS_UPLOAD_MODE": "skip",
+        "DALTON_RUN_ID": "run-skip-check",
+        "DALTON_NO_DIRECT_SEND": "1",
+        "PYTHONPATH": str(guard_site),
+        "PATH": f"{fake_bin}{os.pathsep}{base_env.get('PATH', '/usr/bin:/bin')}",
+    }
+
+    html_file = tmp_path / "index.html"
+    html_bytes = b"<!DOCTYPE html>\n<html><head><title>Sentiment</title></head><body>ok</body></html>\n"
+    html_file.write_bytes(html_bytes)
+    expected_sha256 = hashlib.sha256(html_bytes).hexdigest()
+
+    # 1. Valid HTML in skip mode exits 0 and emits exact preview metadata without SDK, credentials, Keychain, or network.
+    res_ok = subprocess.run(
+        [sys.executable, str(overlay_script), "--file", str(html_file)],
+        env=skip_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_ok.returncode == 0, res_ok.stderr
+    assert res_ok.stderr == ""
+    assert json.loads(res_ok.stdout.strip()) == {
+        "ok": True,
+        "status": "skipped",
+        "mode": "skip",
+        "sha256": expected_sha256,
+        "bytes": len(html_bytes),
+    }
+    assert not keychain_marker.exists()
+
+    # 2. Missing HTML file in skip mode still exits non-zero and never fakes success.
+    missing_file = tmp_path / "does_not_exist.html"
+    res_missing = subprocess.run(
+        [sys.executable, str(overlay_script), "--file", str(missing_file)],
+        env=skip_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_missing.returncode == 1
+    assert res_missing.stdout == ""
+    err_missing = json.loads(res_missing.stderr.strip())
+    assert err_missing["ok"] is False
+    assert "Dashboard HTML not found" in err_missing["error"]
+    assert not keychain_marker.exists()
+
+    # 3. Invalid HTML content in skip mode still exits non-zero and never fakes success.
+    bad_html_file = tmp_path / "bad.html"
+    bad_html_file.write_bytes(b"{\"not\": \"an html document\"}")
+    res_bad = subprocess.run(
+        [sys.executable, str(overlay_script), "--file", str(bad_html_file)],
+        env=skip_env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert res_bad.returncode == 1
+    assert res_bad.stdout == ""
+    err_bad = json.loads(res_bad.stderr.strip())
+    assert err_bad["ok"] is False
+    assert "Not a complete HTML document" in err_bad["error"]
+    assert not keychain_marker.exists()
+
+    # 4. Unknown mode and missing mode inside Dalton runner environment are rejected before any SDK/Keychain/network access.
+    for invalid_env in (
+        {**skip_env, "DALTON_COS_UPLOAD_MODE": "dry-run"},
+        {k: v for k, v in skip_env.items() if k != "DALTON_COS_UPLOAD_MODE"},
+        {**skip_env, "DALTON_COS_UPLOAD_MODE": "   "},
+    ):
+        res_mode = subprocess.run(
+            [sys.executable, str(overlay_script), "--file", str(html_file)],
+            env=invalid_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert res_mode.returncode == 1
+        assert res_mode.stdout == ""
+        err_mode = json.loads(res_mode.stderr.strip())
+        assert err_mode["ok"] is False
+        assert "DALTON_COS_UPLOAD_MODE" in err_mode["error"]
+        assert not keychain_marker.exists()
+
+
+def test_sentiment_dashboard_cos_upload_overlay_prod_sdk_and_credential_rules(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    import gzip
+    import hashlib
+    import importlib.util
+    import types
+    import urllib.request
+
+    repo_root = Path(__file__).resolve().parents[3]
+    overlay_script = (
+        repo_root
+        / "scripts"
+        / "dalton"
+        / "openclaw_overlays"
+        / "scripts"
+        / "sentiment_dashboard_cos_upload.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "sentiment_dashboard_cos_upload_overlay_test", overlay_script
+    )
+    assert spec is not None and spec.loader is not None
+    overlay_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(overlay_mod)
+    real_urlopen = urllib.request.urlopen
+    real_keychain = overlay_mod.keychain
+
+    class FakeCosServiceError(Exception):
+        def __init__(self, error_code: str) -> None:
+            super().__init__(error_code)
+            self._error_code = error_code
+
+        def get_error_code(self) -> str:
+            return self._error_code
+
+    class FakeCosConfig:
+        def __init__(
+            self,
+            *,
+            Region: str,
+            SecretId: str,
+            SecretKey: str,
+            Scheme: str = "https",
+        ) -> None:
+            self.region = Region
+            self.secret_id = SecretId
+            self.secret_key = SecretKey
+            self.scheme = Scheme
+
+    class FakeCosS3Client:
+        def __init__(self, config: FakeCosConfig) -> None:
+            self.config = config
+
+        def get_bucket_website(self, *, Bucket: str) -> dict[str, Any]:
+            raise NotImplementedError
+
+        def put_bucket_website(
+            self,
+            *,
+            Bucket: str,
+            WebsiteConfiguration: dict[str, Any],
+        ) -> dict[str, Any]:
+            raise NotImplementedError
+
+        def put_object(
+            self,
+            *,
+            Bucket: str,
+            Key: str,
+            Body: bytes,
+            ContentType: str,
+            ContentEncoding: str,
+            ContentDisposition: str,
+            CacheControl: str,
+            ACL: str,
+        ) -> dict[str, Any]:
+            raise NotImplementedError
+
+    class FakeHttpResponse:
+        def __init__(self, body: bytes, headers: dict[str, str]) -> None:
+            self._body = body
+            self.headers = headers
+
+        def read(self) -> bytes:
+            return self._body
+
+        def __enter__(self) -> FakeHttpResponse:
+            return self
+
+        def __exit__(
+            self,
+            exc_type: type[BaseException] | None,
+            exc: BaseException | None,
+            tb: Any,
+        ) -> bool:
+            return False
+
+    fake_cos_client = create_autospec(FakeCosS3Client, instance=True)
+    created_configs: list[FakeCosConfig] = []
+
+    def _make_config(
+        *,
+        Region: str,
+        SecretId: str,
+        SecretKey: str,
+        Scheme: str = "https",
+    ) -> FakeCosConfig:
+        cfg = FakeCosConfig(
+            Region=Region,
+            SecretId=SecretId,
+            SecretKey=SecretKey,
+            Scheme=Scheme,
+        )
+        created_configs.append(cfg)
+        return cfg
+
+    def _make_client(config: FakeCosConfig) -> Any:
+        fake_cos_client.config = config
+        return fake_cos_client
+
+    fake_qcloud_mod = types.ModuleType("qcloud_cos")
+    fake_qcloud_mod.CosServiceError = FakeCosServiceError  # type: ignore[attr-defined]
+    fake_qcloud_mod.CosConfig = create_autospec(FakeCosConfig, side_effect=_make_config)  # type: ignore[attr-defined]
+    fake_qcloud_mod.CosS3Client = create_autospec(FakeCosS3Client, side_effect=_make_client)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "qcloud_cos", fake_qcloud_mod)
+
+    keychain_spy = create_autospec(
+        real_keychain,
+        side_effect=AssertionError("Keychain must not be called when env credentials or Dalton runner env is active"),
+    )
+    monkeypatch.setattr(overlay_mod, "keychain", keychain_spy)
+
+    html_file = tmp_path / "index.html"
+    html_bytes = b"<!doctype html><html><body><h1>Sentiment Dashboard</h1></body></html>"
+    html_file.write_bytes(html_bytes)
+    expected_sha = hashlib.sha256(html_bytes).hexdigest()
+    expected_gzip = gzip.compress(html_bytes, compresslevel=6, mtime=0)
+
+    # 1. Prod upload with paired environment credentials configures website on NoSuchWebsiteConfiguration,
+    #    uploads gzipped HTML with expected metadata, and verifies remote gzipped body sha256.
+    for var in overlay_mod.DALTON_RUNNER_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("DALTON_RUN_ID", "run-prod-1")
+    monkeypatch.setenv("DALTON_COS_UPLOAD_MODE", "prod")
+    monkeypatch.setenv("TENCENT_COS_SECRET_ID", "SecretId-Prod-111")
+    monkeypatch.setenv("TENCENT_COS_SECRET_KEY", "SecretKey-Prod-222")
+
+    fake_cos_client.get_bucket_website.side_effect = FakeCosServiceError("NoSuchWebsiteConfiguration")
+    fake_cos_client.put_bucket_website.return_value = {}
+    fake_cos_client.put_object.return_value = {"ETag": '"etag-prod-123"'}
+
+    def _urlopen_ok(req: urllib.request.Request, timeout: float = 30) -> FakeHttpResponse:
+        assert req.full_url == overlay_mod.PUBLIC_URL
+        assert timeout == 30
+        return FakeHttpResponse(
+            body=expected_gzip,
+            headers={
+                "Content-Type": "text/html; charset=utf-8",
+                "Content-Encoding": "gzip",
+                "Content-Disposition": "inline",
+                "Cache-Control": "public, max-age=300",
+                "x-cos-force-download": "false",
+            },
+        )
+
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        create_autospec(real_urlopen, side_effect=_urlopen_ok),
+    )
+
+    result = overlay_mod.upload(html_file)
+    assert len(created_configs) == 1
+    assert created_configs[0].region == "ap-hongkong"
+    assert created_configs[0].secret_id == "SecretId-Prod-111"
+    assert created_configs[0].secret_key == "SecretKey-Prod-222"
+    assert created_configs[0].scheme == "https"
+    keychain_spy.assert_not_called()
+
+    fake_cos_client.get_bucket_website.assert_called_once_with(Bucket="everflow-1320643462")
+    fake_cos_client.put_bucket_website.assert_called_once_with(
+        Bucket="everflow-1320643462",
+        WebsiteConfiguration={"IndexDocument": {"Suffix": "index.html"}},
+    )
+    fake_cos_client.put_object.assert_called_once_with(
+        Bucket="everflow-1320643462",
+        Key="index.html",
+        Body=expected_gzip,
+        ContentType="text/html; charset=utf-8",
+        ContentEncoding="gzip",
+        ContentDisposition="inline",
+        CacheControl="public, max-age=300",
+        ACL="public-read",
+    )
+    uploaded_body = fake_cos_client.put_object.call_args.kwargs["Body"]
+    assert gzip.decompress(uploaded_body) == html_bytes
+
+    assert result == {
+        "ok": True,
+        "bucket": "everflow-1320643462",
+        "region": "ap-hongkong",
+        "key": "index.html",
+        "bytes": len(html_bytes),
+        "bytes_gzip": len(expected_gzip),
+        "etag": "etag-prod-123",
+        "sha256": expected_sha,
+        "content_type": "text/html; charset=utf-8",
+        "content_encoding": "gzip",
+        "cache_control": "public, max-age=300",
+        "content_disposition": "inline",
+        "force_download": False,
+        "browser_renderable": True,
+        "origin_website_url": "https://everflow-1320643462.cos-website.ap-hongkong.myqcloud.com/",
+        "public_url": "https://eve.lumos.space/",
+        "website_configured": True,
+        "warnings": [],
+    }
+
+    # 2. Remote sha256 mismatch raises RuntimeError during read-back verification.
+    fake_cos_client.get_bucket_website.side_effect = None
+    fake_cos_client.get_bucket_website.return_value = {"IndexDocument": {"Suffix": "index.html"}}
+    monkeypatch.setattr(
+        urllib.request,
+        "urlopen",
+        create_autospec(
+            real_urlopen,
+            return_value=FakeHttpResponse(
+                body=gzip.compress(b"<html><body>stale</body></html>"),
+                headers={"Content-Encoding": "gzip"},
+            ),
+        ),
+    )
+    with pytest.raises(RuntimeError, match="COS verification mismatch"):
+        overlay_mod.upload(html_file)
+
+    # 3. Half-pair credentials (only ID or only KEY) are rejected in both Dalton and host environments,
+    #    never call Keychain, and never print secret values in stderr.
+    secret_id_val = "AKID-SUPER-SECRET-ID-999"
+    secret_key_val = "SK-SUPER-SECRET-KEY-888"
+    for is_dalton in (True, False):
+        if is_dalton:
+            monkeypatch.setenv("DALTON_RUN_ID", "run-half-pair")
+            monkeypatch.setenv("DALTON_COS_UPLOAD_MODE", "prod")
+        else:
+            for var in overlay_mod.DALTON_RUNNER_ENV_VARS:
+                monkeypatch.delenv(var, raising=False)
+            monkeypatch.delenv("DALTON_COS_UPLOAD_MODE", raising=False)
+
+        # Only SECRET_ID set, SECRET_KEY missing
+        monkeypatch.setenv("TENCENT_COS_SECRET_ID", secret_id_val)
+        monkeypatch.delenv("TENCENT_COS_SECRET_KEY", raising=False)
+        monkeypatch.setattr(sys, "argv", [str(overlay_script), "--file", str(html_file)])
+        capsys.readouterr()
+        assert overlay_mod.main() == 1
+        captured_id_only = capsys.readouterr()
+        assert secret_id_val not in captured_id_only.out
+        assert secret_id_val not in captured_id_only.err
+        err_id_only = json.loads(captured_id_only.err.strip())
+        assert err_id_only["ok"] is False
+        assert "TENCENT_COS_SECRET_KEY" in err_id_only["error"]
+
+        # Only SECRET_KEY set, SECRET_ID empty
+        monkeypatch.setenv("TENCENT_COS_SECRET_ID", "")
+        monkeypatch.setenv("TENCENT_COS_SECRET_KEY", secret_key_val)
+        assert overlay_mod.main() == 1
+        captured_key_only = capsys.readouterr()
+        assert secret_key_val not in captured_key_only.out
+        assert secret_key_val not in captured_key_only.err
+        err_key_only = json.loads(captured_key_only.err.strip())
+        assert err_key_only["ok"] is False
+        assert "TENCENT_COS_SECRET_ID" in err_key_only["error"]
+
+    # 4. Both credentials missing inside Dalton container/runner raises explicit missing-credentials error without calling Keychain.
+    monkeypatch.setenv("DALTON_RUN_ID", "run-missing-both")
+    monkeypatch.setenv("DALTON_COS_UPLOAD_MODE", "prod")
+    monkeypatch.delenv("TENCENT_COS_SECRET_ID", raising=False)
+    monkeypatch.delenv("TENCENT_COS_SECRET_KEY", raising=False)
+    assert overlay_mod.main() == 1
+    captured_missing = capsys.readouterr()
+    err_missing_both = json.loads(captured_missing.err.strip())
+    assert err_missing_both["ok"] is False
+    assert "Dalton runner environment" in err_missing_both["error"]
+    keychain_spy.assert_not_called()
+
+    # 5. Even if an exception message contains a secret value, main() redacts it before printing to stderr.
+    monkeypatch.setenv("TENCENT_COS_SECRET_ID", secret_id_val)
+    monkeypatch.setenv("TENCENT_COS_SECRET_KEY", secret_key_val)
+    fake_cos_client.put_object.side_effect = RuntimeError(
+        f"Upstream error echoing {secret_id_val} and {secret_key_val}"
+    )
+    assert overlay_mod.main() == 1
+    captured_redacted = capsys.readouterr()
+    assert secret_id_val not in captured_redacted.err
+    assert secret_key_val not in captured_redacted.err
+    err_redacted = json.loads(captured_redacted.err.strip())
+    assert "[REDACTED]" in err_redacted["error"]
+    fake_cos_client.put_object.side_effect = None
+
+    # 6. Standalone non-Dalton host with unset DALTON_COS_UPLOAD_MODE and unset env credentials falls back to Keychain.
+    for var in overlay_mod.DALTON_RUNNER_ENV_VARS:
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.delenv("DALTON_COS_UPLOAD_MODE", raising=False)
+    monkeypatch.delenv("TENCENT_COS_SECRET_ID", raising=False)
+    monkeypatch.delenv("TENCENT_COS_SECRET_KEY", raising=False)
+
+    def _fake_keychain(service: str) -> str:
+        if service == overlay_mod.KEYCHAIN_SECRET_ID:
+            return "kc-secret-id"
+        if service == overlay_mod.KEYCHAIN_SECRET_KEY:
+            return "kc-secret-key"
+        raise AssertionError(f"Unexpected keychain service: {service}")
+
+    kc_fallback_spy = create_autospec(real_keychain, side_effect=_fake_keychain)
+    monkeypatch.setattr(overlay_mod, "keychain", kc_fallback_spy)
+    assert overlay_mod.resolve_upload_mode() == "prod"
+    assert overlay_mod.resolve_credentials() == ("kc-secret-id", "kc-secret-key")
+    assert kc_fallback_spy.call_count == 2
+
+
+def test_seed_openclaw_data_applies_cos_upload_overlay_and_preserves_send_protection(
+    tmp_path: Path,
+) -> None:
+    import subprocess
+
+    repo_root = Path(__file__).resolve().parents[3]
+    seed_script = repo_root / "scripts" / "dalton" / "seed_openclaw_data.sh"
+    orig_feishu_script = (
+        repo_root / "tests" / "unit" / "dalton" / "fixtures" / "openclaw_feishu_send_card.py"
+    )
+    overlay_cos_script = (
+        repo_root
+        / "scripts"
+        / "dalton"
+        / "openclaw_overlays"
+        / "scripts"
+        / "sentiment_dashboard_cos_upload.py"
+    )
+    overlay_feishu_script = (
+        repo_root
+        / "scripts"
+        / "dalton"
+        / "openclaw_overlays"
+        / "scripts"
+        / "feishu_send_card.py"
+    )
+
+    src_dir = tmp_path / "openclaw_host_ws"
+    dst_dir = tmp_path / "dalton_data_vol"
+    (src_dir / "scripts").mkdir(parents=True)
+
+    # Populate the source workspace with host scripts.
+    host_cos_bytes = b"#!/usr/bin/env python3\nfrom qcloud_cos import CosS3Client\n"
+    host_feishu_bytes = orig_feishu_script.read_bytes()
+    (src_dir / "scripts" / "sentiment_dashboard_cos_upload.py").write_bytes(host_cos_bytes)
+    (src_dir / "scripts" / "feishu_send_card.py").write_bytes(host_feishu_bytes)
+
+    dry_res = subprocess.run(
+        ["bash", str(seed_script), "--dry-run", "--source", str(src_dir), "--target", str(dst_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert dry_res.returncode == 0, dry_res.stderr
+    assert "scripts/sentiment_dashboard_cos_upload.py" in dry_res.stdout
+    assert "scripts/feishu_send_card.py" in dry_res.stdout
+
+    apply_res = subprocess.run(
+        ["bash", str(seed_script), "--apply", "--source", str(src_dir), "--target", str(dst_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert apply_res.returncode == 0, apply_res.stderr
+
+    # Both overlays are installed into the target data volume and the source workspace is untouched.
+    assert (
+        dst_dir / "scripts" / "sentiment_dashboard_cos_upload.py"
+    ).read_bytes() == overlay_cos_script.read_bytes()
+    assert (
+        dst_dir / "scripts" / "feishu_send_card.py"
+    ).read_bytes() == overlay_feishu_script.read_bytes()
+    assert (src_dir / "scripts" / "sentiment_dashboard_cos_upload.py").read_bytes() == host_cos_bytes
+    assert (src_dir / "scripts" / "feishu_send_card.py").read_bytes() == host_feishu_bytes
+    assert b"DALTON_NO_DIRECT_SEND" in (dst_dir / "scripts" / "feishu_send_card.py").read_bytes()
+    assert b"DALTON_COS_UPLOAD_MODE" in (
+        dst_dir / "scripts" / "sentiment_dashboard_cos_upload.py"
+    ).read_bytes()
