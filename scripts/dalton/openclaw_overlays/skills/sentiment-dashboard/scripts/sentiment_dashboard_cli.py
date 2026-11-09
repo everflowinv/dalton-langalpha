@@ -26,7 +26,9 @@ import numpy as np
 import pandas as pd
 
 from us_bottom_framework import BottomFrameworkConfig, alert_projection_digest_lines, alert_projection_lead, bottom_environment_digest_line, build_bottom_environment, evaluate_bottom_framework, projection_digest_lines
+from us_bottom_environment_selftest import bottom_environment_checks as bottom_environment_checks
 from us_top_framework import TopFrameworkConfig, evaluate_top_framework, top_digest_lines
+from us_top_framework_selftest import top_framework_checks as top_framework_checks
 from us_market_sections import MONITOR_CSS, bottom_monitor_section, state_monitor_section, top_monitor_section
 from gs_prime_positioning import evaluate_gs_prime_signals, render_gs_prime_section, update_gs_prime_store
 
