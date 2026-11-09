@@ -1826,7 +1826,7 @@ async def get_channel_internal_state(
                     params.append(platform.strip().lower())
                 await cur.execute(
                     f"""
-                    SELECT platform, chat_address, thread_id, run_id, external_thread_id
+                    SELECT platform, chat_address, thread_scope_key, thread_id, run_id, external_thread_id
                     FROM dalton_channel_inbound_events
                     WHERE {" AND ".join(clauses)}
                     ORDER BY created_at DESC
@@ -1839,6 +1839,7 @@ async def get_channel_internal_state(
                     current_conversation = {
                         "address": in_match["chat_address"],
                         "platform": in_match["platform"],
+                        "thread_scope_key": in_match.get("thread_scope_key"),
                         "thread_id": (
                             str(in_match["thread_id"])
                             if in_match.get("thread_id")
@@ -1871,13 +1872,57 @@ async def get_channel_internal_state(
                     )
                     bg_match = await cur.fetchone()
                     if bg_match:
+                        bg_scope_key = await _resolve_thread_scope_key_for_thread(
+                            cur,
+                            str(bg_match["thread_id"]),
+                            target_address=str(bg_match["target_address"]),
+                        )
                         current_conversation = {
                             "address": bg_match["target_address"],
                             "platform": bg_match["platform"],
+                            "thread_scope_key": bg_scope_key,
                             "thread_id": str(bg_match["thread_id"]),
                             "run_id": bg_match["run_id"],
                             "external_thread_id": None,
                         }
+                    elif norm_tid:
+                        await cur.execute(
+                            """
+                            SELECT dalton_user_id, platform, target_address,
+                                   scope_key AS thread_scope_key, thread_id
+                            FROM dalton_channel_thread_watches
+                            WHERE thread_id = %s
+                            """,
+                            (norm_tid,),
+                        )
+                        w_match = await cur.fetchone()
+                        if (
+                            w_match
+                            and str(w_match["dalton_user_id"]) == cleaned_uid
+                            and (
+                                not platform
+                                or str(w_match["platform"]).lower()
+                                == platform.strip().lower()
+                            )
+                        ):
+                            w_scope_key = await _resolve_thread_scope_key_for_thread(
+                                cur,
+                                str(w_match["thread_id"]),
+                                fallback_scope_key=(
+                                    str(w_match["thread_scope_key"])
+                                    if w_match.get("thread_scope_key")
+                                    else None
+                                ),
+                                target_address=str(w_match["target_address"]),
+                            )
+                            current_conversation = {
+                                "address": w_match["target_address"],
+                                "platform": w_match["platform"],
+                                "thread_scope_key": w_scope_key,
+                                "thread_id": str(w_match["thread_id"]),
+                                "run_id": cleaned_rid,
+                                "external_thread_id": None,
+                            }
 
     return {
         "user_id": cleaned_uid,
@@ -2413,6 +2458,203 @@ async def _update_user_channel_settings_once(
 # ---------------------------------------------------------------------------
 
 
+async def _resolve_thread_scope_key_for_thread(
+    cur: Any,
+    thread_id: str | None,
+    *,
+    fallback_scope_key: str | None = None,
+    target_address: str | None = None,
+) -> str | None:
+    """Resolve the canonical thread scope key (`chat:...:thread:...`, `chat:...`, or `dm:...`)
+    for `thread_id` from `dalton_channel_thread_watches` or `dalton_channel_inbound_events`.
+    """
+    cleaned_fallback = str(fallback_scope_key or "").strip() or None
+    cleaned_target = str(target_address or "").strip() or None
+    if cleaned_fallback and cleaned_fallback != cleaned_target:
+        return cleaned_fallback
+
+    norm_tid = normalize_uuid(thread_id)
+    if norm_tid:
+        await cur.execute(
+            """
+            SELECT scope_key FROM dalton_channel_thread_watches
+            WHERE thread_id = %s
+            """,
+            (norm_tid,),
+        )
+        w_row = await cur.fetchone()
+        w_scope = (
+            str(w_row["scope_key"]).strip()
+            if w_row and w_row.get("scope_key")
+            else None
+        )
+        if w_scope and w_scope != cleaned_target:
+            return w_scope
+
+        await cur.execute(
+            """
+            SELECT thread_scope_key FROM dalton_channel_inbound_events
+            WHERE thread_id = %s
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (norm_tid,),
+        )
+        in_row = await cur.fetchone()
+        in_scope = (
+            str(in_row["thread_scope_key"]).strip()
+            if in_row and in_row.get("thread_scope_key")
+            else None
+        )
+        if in_scope:
+            return in_scope
+
+        if w_scope:
+            return w_scope
+
+    return cleaned_fallback
+
+
+async def _find_current_conversation_source(
+    cur: Any,
+    *,
+    user_id: str | None,
+    run_id: str | None,
+    thread_id: str | None,
+) -> dict[str, Any] | None:
+    """Resolve the current channel conversation source row and its `thread_scope_key`
+    across `dalton_channel_inbound_events`, `dalton_channel_background_runs`, and
+    `dalton_channel_thread_watches`.
+    """
+    cleaned_uid = str(user_id or "").strip() or None
+    cleaned_rid = str(run_id or "").strip() or None
+    norm_tid = normalize_uuid(thread_id)
+    if not cleaned_rid and not norm_tid:
+        return None
+
+    source_row: dict[str, Any] | None = None
+    in_clauses: list[str] = []
+    in_params: list[Any] = []
+    if cleaned_uid:
+        in_clauses.append("dalton_user_id = %s")
+        in_params.append(cleaned_uid)
+    if cleaned_rid:
+        in_clauses.append("run_id = %s")
+        in_params.append(cleaned_rid)
+    if norm_tid:
+        in_clauses.append("thread_id = %s")
+        in_params.append(norm_tid)
+
+    if in_clauses:
+        await cur.execute(
+            f"""
+            SELECT dalton_user_id, platform, chat_address AS target_address,
+                   thread_scope_key, thread_id, run_id
+            FROM dalton_channel_inbound_events
+            WHERE {" AND ".join(in_clauses)}
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            tuple(in_params),
+        )
+        found_in = await cur.fetchone()
+        if found_in:
+            source_row = dict(found_in)
+
+    if source_row is None and in_clauses:
+        await cur.execute(
+            f"""
+            SELECT dalton_user_id, platform, target_address,
+                   thread_id, run_id
+            FROM dalton_channel_background_runs
+            WHERE {" AND ".join(in_clauses)}
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            tuple(in_params),
+        )
+        found_bg = await cur.fetchone()
+        if found_bg:
+            source_row = dict(found_bg)
+
+    if source_row is None and norm_tid:
+        await cur.execute(
+            """
+            SELECT dalton_user_id, platform, target_address,
+                   scope_key AS thread_scope_key, thread_id
+            FROM dalton_channel_thread_watches
+            WHERE thread_id = %s
+            """,
+            (norm_tid,),
+        )
+        found_w = await cur.fetchone()
+        if found_w and (
+            not cleaned_uid
+            or str(found_w["dalton_user_id"]) == cleaned_uid
+        ):
+            source_row = dict(found_w)
+
+    if source_row is None and cleaned_rid and norm_tid:
+        tid_clauses: list[str] = ["thread_id = %s"]
+        tid_params: list[Any] = [norm_tid]
+        if cleaned_uid:
+            tid_clauses.insert(0, "dalton_user_id = %s")
+            tid_params.insert(0, cleaned_uid)
+        await cur.execute(
+            f"""
+            SELECT dalton_user_id, platform, chat_address AS target_address,
+                   thread_scope_key, thread_id, run_id
+            FROM dalton_channel_inbound_events
+            WHERE {" AND ".join(tid_clauses)}
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            tuple(tid_params),
+        )
+        found_tid_in = await cur.fetchone()
+        if found_tid_in:
+            source_row = dict(found_tid_in)
+        else:
+            await cur.execute(
+                f"""
+                SELECT dalton_user_id, platform, target_address,
+                       thread_id, run_id
+                FROM dalton_channel_background_runs
+                WHERE {" AND ".join(tid_clauses)}
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                tuple(tid_params),
+            )
+            found_tid_bg = await cur.fetchone()
+            if found_tid_bg:
+                source_row = dict(found_tid_bg)
+
+    if not source_row:
+        return None
+
+    eff_tid = (
+        str(source_row["thread_id"])
+        if source_row.get("thread_id")
+        else norm_tid
+    )
+    source_row["thread_scope_key"] = await _resolve_thread_scope_key_for_thread(
+        cur,
+        eff_tid,
+        fallback_scope_key=(
+            str(source_row["thread_scope_key"])
+            if source_row.get("thread_scope_key")
+            else None
+        ),
+        target_address=(
+            str(source_row["target_address"])
+            if source_row.get("target_address")
+            else None
+        ),
+    )
+    return source_row
+
+
 async def authorize_and_claim_delivery(
     *,
     delivery_key: str,
@@ -2462,6 +2704,48 @@ async def authorize_and_claim_delivery(
                 existing = await cur.fetchone()
                 if existing:
                     ex_status = str(existing["status"])
+                    ex_is_current = bool(existing.get("is_current", False))
+                    ex_scope_key: str | None = None
+                    if ex_status in ("sent", "partial", "in_flight", "unknown"):
+                        if (
+                            cleaned_kind == "notice"
+                            and cleaned_inbound_mid
+                            and (existing.get("platform") or cleaned_platform)
+                        ):
+                            await cur.execute(
+                                """
+                                SELECT * FROM dalton_channel_inbound_events
+                                WHERE platform = %s AND message_id = %s
+                                """,
+                                (
+                                    str(existing.get("platform") or cleaned_platform),
+                                    cleaned_inbound_mid,
+                                ),
+                            )
+                            ex_in_row = await cur.fetchone()
+                            if ex_in_row and ex_in_row.get("thread_scope_key"):
+                                ex_scope_key = str(ex_in_row["thread_scope_key"])
+                        elif ex_is_current:
+                            ex_src = await _find_current_conversation_source(
+                                cur,
+                                user_id=(
+                                    str(existing["user_id"])
+                                    if existing.get("user_id")
+                                    else cleaned_uid
+                                ),
+                                run_id=(
+                                    str(existing["run_id"])
+                                    if existing.get("run_id")
+                                    else cleaned_rid
+                                ),
+                                thread_id=(
+                                    str(existing["thread_id"])
+                                    if existing.get("thread_id")
+                                    else norm_tid
+                                ),
+                            )
+                            if ex_src and ex_src.get("thread_scope_key"):
+                                ex_scope_key = str(ex_src["thread_scope_key"])
                     if ex_status in ("sent", "partial"):
                         return {
                             "claim_status": "already_completed",
@@ -2469,7 +2753,8 @@ async def authorize_and_claim_delivery(
                             "first_response_json": existing.get("first_response_json"),
                             "platform": existing["platform"],
                             "target_address": existing["target_address"],
-                            "is_current": bool(existing.get("is_current", False)),
+                            "thread_scope_key": ex_scope_key,
+                            "is_current": ex_is_current,
                         }
                     if ex_status in ("in_flight", "unknown"):
                         return {
@@ -2479,7 +2764,8 @@ async def authorize_and_claim_delivery(
                             "message": "An earlier attempt of this same call is still delivering it.",
                             "platform": existing["platform"],
                             "target_address": existing["target_address"],
-                            "is_current": bool(existing.get("is_current", False)),
+                            "thread_scope_key": ex_scope_key,
+                            "is_current": ex_is_current,
                         }
 
                 # Guard final text fallback (`fallback:<run_id>`) when an `unknown` current-turn text delivery exists (§1.3.3)
@@ -2514,6 +2800,7 @@ async def authorize_and_claim_delivery(
                 # 2. Scenario-based authorization
                 resolved_platform: str | None = None
                 resolved_target_address: str | None = None
+                resolved_thread_scope_key: str | None = None
                 resolved_recipient_id: str | None = None
                 resolved_user_id: str | None = cleaned_uid
                 is_current = False
@@ -2538,6 +2825,11 @@ async def authorize_and_claim_delivery(
                         }
                     resolved_platform = str(in_row["platform"])
                     resolved_target_address = str(in_row["chat_address"])
+                    resolved_thread_scope_key = (
+                        str(in_row["thread_scope_key"])
+                        if in_row.get("thread_scope_key")
+                        else None
+                    )
                     raw_p = in_row.get("raw_payload") or {}
                     puid = str(raw_p.get("platform_user_id") or "")
                     resolved_user_id = (
@@ -2666,64 +2958,12 @@ async def authorize_and_claim_delivery(
                     or cleaned_kind in ("fallback", "interrupt")
                     or (cleaned_kind == "notice" and cleaned_inbound_mid is None)
                 ):
-                    source_row: dict[str, Any] | None = None
-                    if cleaned_rid or norm_tid:
-                        in_clauses: list[str] = []
-                        in_params: list[Any] = []
-                        if cleaned_uid:
-                            in_clauses.append("dalton_user_id = %s")
-                            in_params.append(cleaned_uid)
-                        if cleaned_rid:
-                            in_clauses.append("run_id = %s")
-                            in_params.append(cleaned_rid)
-                        if norm_tid:
-                            in_clauses.append("thread_id = %s")
-                            in_params.append(norm_tid)
-                        if in_clauses:
-                            await cur.execute(
-                                f"""
-                                SELECT dalton_user_id, platform, chat_address AS target_address,
-                                       thread_id, run_id
-                                FROM dalton_channel_inbound_events
-                                WHERE {" AND ".join(in_clauses)}
-                                ORDER BY created_at DESC
-                                LIMIT 1
-                                """,
-                                tuple(in_params),
-                            )
-                            found_in = await cur.fetchone()
-                            if found_in:
-                                source_row = dict(found_in)
-                        if source_row is None and in_clauses:
-                            await cur.execute(
-                                f"""
-                                SELECT dalton_user_id, platform, target_address,
-                                       thread_id, run_id
-                                FROM dalton_channel_background_runs
-                                WHERE {" AND ".join(in_clauses)}
-                                ORDER BY created_at DESC
-                                LIMIT 1
-                                """,
-                                tuple(in_params),
-                            )
-                            found_bg = await cur.fetchone()
-                            if found_bg:
-                                source_row = dict(found_bg)
-                        if source_row is None and norm_tid:
-                            await cur.execute(
-                                """
-                                SELECT dalton_user_id, platform, target_address, thread_id
-                                FROM dalton_channel_thread_watches
-                                WHERE thread_id = %s
-                                """,
-                                (norm_tid,),
-                            )
-                            found_w = await cur.fetchone()
-                            if found_w and (
-                                not cleaned_uid
-                                or str(found_w["dalton_user_id"]) == cleaned_uid
-                            ):
-                                source_row = dict(found_w)
+                    source_row = await _find_current_conversation_source(
+                        cur,
+                        user_id=cleaned_uid,
+                        run_id=cleaned_rid,
+                        thread_id=norm_tid,
+                    )
 
                     if not source_row:
                         return {
@@ -2746,6 +2986,11 @@ async def authorize_and_claim_delivery(
                     resolved_user_id = str(source_row["dalton_user_id"])
                     resolved_platform = str(source_row["platform"]).lower()
                     resolved_target_address = str(source_row["target_address"])
+                    resolved_thread_scope_key = (
+                        str(source_row["thread_scope_key"])
+                        if source_row.get("thread_scope_key")
+                        else None
+                    )
                     is_current = True
 
                     await cur.execute(
@@ -2924,28 +3169,25 @@ async def authorize_and_claim_delivery(
                     else:
                         resolved_recipient_id = str(id_row["platform_user_id"])
 
-                    # Check whether explicit target happens to match the turn's current conversation
+                    # Check whether explicit target matches the turn's current conversation
                     if cleaned_rid or norm_tid:
-                        await cur.execute(
-                            """
-                            SELECT chat_address FROM dalton_channel_inbound_events
-                            WHERE dalton_user_id = %s
-                              AND (%s::text IS NULL OR run_id = %s)
-                              AND (%s::uuid IS NULL OR thread_id = %s)
-                            ORDER BY created_at DESC
-                            LIMIT 1
-                            """,
-                            (
-                                resolved_user_id,
-                                cleaned_rid,
-                                cleaned_rid,
-                                norm_tid,
-                                norm_tid,
-                            ),
+                        cur_source = await _find_current_conversation_source(
+                            cur,
+                            user_id=resolved_user_id,
+                            run_id=cleaned_rid,
+                            thread_id=norm_tid,
                         )
-                        cur_in = await cur.fetchone()
-                        if cur_in and str(cur_in["chat_address"]) == resolved_target_address:
+                        if (
+                            cur_source
+                            and str(cur_source["target_address"])
+                            == resolved_target_address
+                        ):
                             is_current = True
+                            resolved_thread_scope_key = (
+                                str(cur_source["thread_scope_key"])
+                                if cur_source.get("thread_scope_key")
+                                else None
+                            )
 
                 # 3. Atomic claim in dalton_channel_deliveries
                 await cur.execute(
@@ -2959,6 +3201,10 @@ async def authorize_and_claim_delivery(
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'in_flight', %s, 0, '[]'::jsonb, '[]'::jsonb, NOW(), NOW())
                     ON CONFLICT (delivery_key) DO UPDATE SET
                         status = 'in_flight',
+                        is_current = EXCLUDED.is_current,
+                        has_non_empty_text = EXCLUDED.has_non_empty_text,
+                        platform = EXCLUDED.platform,
+                        target_address = EXCLUDED.target_address,
                         total_chunks = EXCLUDED.total_chunks,
                         error_code = NULL,
                         error_message = NULL,
@@ -2990,6 +3236,7 @@ async def authorize_and_claim_delivery(
                     "recipient_id": resolved_recipient_id,
                     "platform": resolved_platform,
                     "target_address": resolved_target_address,
+                    "thread_scope_key": resolved_thread_scope_key,
                     "is_current": is_current,
                     "home_workspace_id": home_ws_id,
                     "weixin_context_token": weixin_ctx_token,
@@ -3633,6 +3880,37 @@ async def _backfill_watch_notification_runs_in_tx(
             )
 
 
+async def _enrich_recovery_scope_keys(
+    cur: Any,
+    background_runs: list[dict[str, Any]],
+    thread_watches: list[dict[str, Any]],
+) -> None:
+    """Populate `scope_key` and `thread_scope_key` on recovered background runs and thread watches."""
+    for w in thread_watches:
+        resolved_w_scope = await _resolve_thread_scope_key_for_thread(
+            cur,
+            str(w["thread_id"]) if w.get("thread_id") else None,
+            fallback_scope_key=str(w["scope_key"]) if w.get("scope_key") else None,
+            target_address=str(w["target_address"]) if w.get("target_address") else None,
+        )
+        if resolved_w_scope:
+            w["scope_key"] = resolved_w_scope
+            w["thread_scope_key"] = resolved_w_scope
+
+    for bg in background_runs:
+        resolved_bg_scope = await _resolve_thread_scope_key_for_thread(
+            cur,
+            str(bg["thread_id"]) if bg.get("thread_id") else None,
+            fallback_scope_key=(
+                str(bg.get("thread_scope_key") or bg.get("scope_key") or "").strip()
+                or None
+            ),
+            target_address=str(bg["target_address"]) if bg.get("target_address") else None,
+        )
+        bg["scope_key"] = resolved_bg_scope
+        bg["thread_scope_key"] = resolved_bg_scope
+
+
 async def recover_channel_state(
     *,
     mode: str = "startup",
@@ -3697,6 +3975,7 @@ async def recover_channel_state(
                         (norm_tid, norm_tid),
                     )
                     updated_watches = [dict(r) for r in await cur.fetchall()]
+                    await _enrich_recovery_scope_keys(cur, bg_runs, updated_watches)
                     return {
                         "mode": "watch_reconnect",
                         "background_runs": _json_safe_rows(bg_runs),
@@ -3754,6 +4033,7 @@ async def recover_channel_state(
                     """
                 )
                 thread_watches = [dict(r) for r in await cur.fetchall()]
+                await _enrich_recovery_scope_keys(cur, background_runs, thread_watches)
 
                 await cur.execute(
                     """

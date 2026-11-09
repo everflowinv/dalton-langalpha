@@ -68,8 +68,12 @@ export class DiscordChannelAdapter implements ChannelAdapter {
   private readonly dmChannelCache = new Map<string, string>();
   private restInstance?: RequestClient;
   private gatewayInstance?: DiscordGatewayClient;
+  private readonly baseGatewayOnReady?: DiscordGatewayClientOptions["onReady"];
   private botUserId?: string;
   private started = false;
+  private lifecycleEpoch = 0;
+  private startPromise: Promise<void> | null = null;
+  private lifecycleAbortController = new AbortController();
 
   constructor(private readonly options: DiscordChannelAdapterOptions = {}) {
     this.botToken = options.botToken?.trim() ?? "";
@@ -77,6 +81,7 @@ export class DiscordChannelAdapter implements ChannelAdapter {
     this.logger = options.logger ?? createSubsystemLogger("discord");
     this.restInstance = options.rest;
     this.gatewayInstance = options.gatewayClient;
+    this.baseGatewayOnReady = options.gatewayClient?.onReady ?? options.gatewayOptions?.onReady;
     this.botUserId = options.botUserId?.trim() || undefined;
     this.dedupe = createMemoryDedupe({ ttlMs: options.dedupeTtlMs });
     this.queue = createSequentialQueue({ taskTimeoutMs: options.queueTaskTimeoutMs });
@@ -108,7 +113,7 @@ export class DiscordChannelAdapter implements ChannelAdapter {
       onDispatch: (name, data) => this.handleDispatch(name, data),
       onReady: (info) => {
         if (info.botUserId) this.botUserId = info.botUserId;
-        this.options.gatewayOptions?.onReady?.(info);
+        this.baseGatewayOnReady?.(info);
       },
       onError: (err) => {
         this.logger.error("Discord gateway error", { error: err });
@@ -120,27 +125,54 @@ export class DiscordChannelAdapter implements ChannelAdapter {
 
   async start(): Promise<void> {
     if (!this.isConfigured() || this.started) return;
-    // Resolve the bot identity first so group mentions can be classified.
-    try {
-      const me = (await this.getRest().get("/users/@me")) as { id?: string } | undefined;
-      if (me?.id) this.botUserId = me.id;
-    } catch (err) {
-      this.logger.warn("Discord bot identity lookup failed; group mentions need gateway READY", { error: err });
+    if (this.startPromise) {
+      await this.startPromise;
+      return;
     }
-    const gateway = this.getGateway();
-    // Re-wire dispatch in case a gateway was injected without handlers.
-    gateway.onDispatch = (name, data) => this.handleDispatch(name, data);
-    const previousReady = gateway.onReady;
-    gateway.onReady = (info) => {
-      if (info.botUserId) this.botUserId = info.botUserId;
-      previousReady?.(info);
+    const epoch = ++this.lifecycleEpoch;
+    if (this.lifecycleAbortController.signal.aborted) {
+      this.lifecycleAbortController = new AbortController();
+    }
+    const runStart = async (): Promise<void> => {
+      // Resolve the bot identity first so group mentions can be classified.
+      try {
+        const me = (await this.getRest().get("/users/@me")) as { id?: string } | undefined;
+        if (epoch !== this.lifecycleEpoch) return;
+        if (me?.id) this.botUserId = me.id;
+      } catch (err) {
+        if (epoch !== this.lifecycleEpoch) return;
+        this.logger.warn("Discord bot identity lookup failed; group mentions need gateway READY", { error: err });
+      }
+      if (epoch !== this.lifecycleEpoch) return;
+      const gateway = this.getGateway();
+      // Re-wire dispatch and ready handlers without nesting across restarts.
+      gateway.onDispatch = (name, data) => {
+        if (epoch !== this.lifecycleEpoch) return;
+        return this.handleDispatch(name, data);
+      };
+      gateway.onReady = (info) => {
+        if (epoch !== this.lifecycleEpoch) return;
+        if (info.botUserId) this.botUserId = info.botUserId;
+        this.baseGatewayOnReady?.(info);
+      };
+      this.started = true;
+      await gateway.start();
+      if (epoch !== this.lifecycleEpoch) return;
     };
-    this.started = true;
-    await gateway.start();
+    const p = runStart().finally(() => {
+      if (this.startPromise === p) {
+        this.startPromise = null;
+      }
+    });
+    this.startPromise = p;
+    await p;
   }
 
   async stop(): Promise<void> {
+    this.lifecycleEpoch += 1;
+    this.startPromise = null;
     this.started = false;
+    this.lifecycleAbortController.abort();
     if (this.gatewayInstance) await this.gatewayInstance.stop();
     this.restInstance?.abortAllRequests();
   }
@@ -316,6 +348,7 @@ export class DiscordChannelAdapter implements ChannelAdapter {
     const res = await downloadDiscordAttachment(this.getRest(), descriptor, event, {
       fetchImpl: this.options.mediaFetchImpl,
       maxBytes: MAX_ATTACHMENT_BYTES,
+      signal: this.lifecycleAbortController.signal,
     });
     return { content: res.content, filename: res.filename, mimeType: res.mimeType };
   }

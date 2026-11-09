@@ -10,7 +10,6 @@
  */
 
 import {
-  chunkTextForOutbound,
   convertMarkdownTables,
   findCodeRegions,
   truncateUtf16Safe,
@@ -34,14 +33,15 @@ export function findGraphemeChunkEnd(text: string, start: number, maxEnd: number
   const after = text.charCodeAt(hardEnd);
   if (before <= 127 && after <= 127 && !(before === 13 && after === 10)) return hardEnd;
   let end = start;
-  for (const seg of graphemeSegmenter().segment(text.slice(start, hardEnd + 2))) {
+  const lookaheadEnd = Math.min(text.length, hardEnd + 64);
+  for (const seg of graphemeSegmenter().segment(text.slice(start, lookaheadEnd))) {
     const segEnd = start + seg.index + seg.segment.length;
     if (segEnd <= hardEnd) end = segEnd;
     else break;
   }
   if (end > start) return end;
   const safe = truncateUtf16Safe(text.slice(start, hardEnd), hardEnd - start);
-  return start + (safe.length || Math.min(2, hardEnd - start));
+  return start + (safe.length || 1);
 }
 
 /**
@@ -88,6 +88,37 @@ function splitOverlong(text: string, limit: number): string[] {
   return pieces;
 }
 
+function splitOverlongGraphemeLine(line: string, step: number): string[] {
+  const out: string[] = [];
+  let start = 0;
+  while (start < line.length) {
+    if (line.length - start <= step) {
+      out.push(line.slice(start));
+      break;
+    }
+    const graphemeEnd = findGraphemeChunkEnd(line, start, start + step);
+    const window = line.slice(start, graphemeEnd);
+    const wsIdx = Math.max(window.lastIndexOf(" "), window.lastIndexOf("\t"));
+    if (wsIdx > Math.floor(step * 0.5)) {
+      out.push(window.slice(0, wsIdx));
+      start += wsIdx + 1;
+      while (start < line.length && (line[start] === " " || line[start] === "\t")) {
+        start += 1;
+      }
+    } else {
+      const end = graphemeEnd > start ? graphemeEnd : start + 1;
+      out.push(line.slice(start, end));
+      start = end;
+    }
+  }
+  return out;
+}
+
+function isFenceLine(line: string): boolean {
+  const trimmed = line.trimStart();
+  return trimmed.startsWith("```") || trimmed.startsWith("~~~");
+}
+
 /**
  * Splits rendered Discord markdown into chunks of at most 2000 characters,
  * balancing fenced code blocks and never splitting a grapheme/surrogate pair.
@@ -97,14 +128,100 @@ function splitOverlong(text: string, limit: number): string[] {
 export function chunkDiscordText(text: string, opts: { maxChars?: number } = {}): string[] {
   const limit = Math.max(1, Math.floor(opts.maxChars ?? DISCORD_MAX_CHARS));
   if (!text) return [];
-  const rendered = renderDiscordMarkdown(text);
+  const rendered = renderDiscordMarkdown(text).replace(/\r\n/g, "\n");
   if (rendered.length <= limit) return [rendered];
+
+  const lines = rendered.split("\n");
   const chunks: string[] = [];
-  for (const chunk of chunkTextForOutbound(rendered, limit)) {
-    if (chunk.length <= limit) chunks.push(chunk);
-    else chunks.push(...splitOverlong(chunk, limit));
+  let buf = "";
+  let openFence: string | null = null;
+  let fenceMarker = "```";
+
+  const closeFence = (marker: string): string => `\n${marker}`;
+
+  const flush = (isFinal = false): void => {
+    if (buf.length === 0) return;
+    if (openFence !== null) {
+      if (!isFinal && buf === openFence) {
+        buf = "";
+        return;
+      }
+      if (!isFinal && buf.endsWith(`\n${openFence}`)) {
+        const prose = buf.slice(0, buf.length - openFence.length - 1);
+        if (prose.length > 0) chunks.push(prose);
+        buf = "";
+        return;
+      }
+      chunks.push(`${buf}${closeFence(fenceMarker)}`);
+    } else {
+      chunks.push(buf);
+    }
+    buf = "";
+  };
+
+  for (const line of lines) {
+    const togglesFence = isFenceLine(line);
+    const nextFence: string | null = togglesFence
+      ? openFence === null
+        ? line.trimEnd()
+        : null
+      : openFence;
+    if (togglesFence && openFence === null) {
+      fenceMarker = line.trimStart().startsWith("~~~") ? "~~~" : "```";
+    }
+    const reserve = nextFence !== null ? closeFence(fenceMarker).length : 0;
+    const candidate = buf.length === 0 ? line : `${buf}\n${line}`;
+
+    if (candidate.length + reserve > limit) {
+      if (buf.length > 0) flush(false);
+      const prefix = openFence !== null ? `${openFence}\n` : "";
+      const lineReserve = openFence !== null ? closeFence(fenceMarker).length : 0;
+      if (prefix.length + lineReserve >= limit) {
+        openFence = null;
+        for (const piece of splitOverlong(line, limit)) {
+          chunks.push(piece);
+        }
+        continue;
+      }
+      if (prefix.length + line.length + lineReserve > limit) {
+        const step = Math.max(1, limit - prefix.length - lineReserve);
+        const pieces = splitOverlongGraphemeLine(line, step);
+        if (openFence !== null) {
+          for (let i = 0; i < pieces.length - 1; i++) {
+            chunks.push(`${prefix}${pieces[i]!}${closeFence(fenceMarker)}`);
+          }
+          if (pieces.length > 0) {
+            buf = `${prefix}${pieces[pieces.length - 1]!}`;
+          }
+        } else {
+          for (let i = 0; i < pieces.length - 1; i++) {
+            chunks.push(pieces[i]!);
+          }
+          if (pieces.length > 0) {
+            buf = pieces[pieces.length - 1]!;
+          }
+        }
+        openFence = nextFence;
+        continue;
+      }
+      buf = `${prefix}${line}`;
+      openFence = nextFence;
+      continue;
+    }
+
+    buf = candidate;
+    openFence = nextFence;
   }
-  return chunks.filter((c) => c.length > 0);
+
+  flush(true);
+
+  const safeChunks: string[] = [];
+  for (const chunk of chunks) {
+    if (!chunk) continue;
+    if (chunk.length <= limit) safeChunks.push(chunk);
+    else safeChunks.push(...splitOverlong(chunk, limit));
+  }
+  return safeChunks;
 }
 
 export function chunkDiscordTextWithMode(

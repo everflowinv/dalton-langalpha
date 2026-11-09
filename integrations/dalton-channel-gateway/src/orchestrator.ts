@@ -5262,8 +5262,15 @@ export class ChannelGatewayOrchestrator {
     const existing = this.activeWatches.get(params.threadId);
     if (existing) {
       existing.targetAddress = params.targetAddress;
-      existing.scopeKey = params.scopeKey;
-      existing.generation = params.generation;
+      if (
+        params.scopeKey &&
+        (params.scopeKey !== params.targetAddress || !existing.scopeKey)
+      ) {
+        existing.scopeKey = params.scopeKey;
+      }
+      if (params.generation > 0 || existing.generation === 0) {
+        existing.generation = params.generation;
+      }
       if (params.lastSeenTurnIndex > existing.lastSeenTurnIndex) {
         existing.lastSeenTurnIndex = params.lastSeenTurnIndex;
       }
@@ -6507,7 +6514,15 @@ export class ChannelGatewayOrchestrator {
       }
 
       for (const bg of rec.background_runs ?? []) {
-        const bgOk = await this.recoverSingleBackgroundRun(bg);
+        const matchedWatch = (rec.thread_watches ?? []).find(
+          (w) => w.thread_id === bg.thread_id,
+        );
+        const bgOk = await this.recoverSingleBackgroundRun(
+          bg,
+          matchedWatch?.thread_scope_key ??
+            matchedWatch?.scope_key ??
+            handle.scopeKey,
+        );
         if (!bgOk) {
           allSettled = false;
         }
@@ -6595,7 +6610,16 @@ export class ChannelGatewayOrchestrator {
     });
 
     for (const bg of rec.background_runs ?? []) {
-      await this.recoverSingleBackgroundRun(bg);
+      const matchedWatch = (rec.thread_watches ?? []).find(
+        (w) => w.thread_id === bg.thread_id,
+      );
+      await this.recoverSingleBackgroundRun(
+        bg,
+        matchedWatch?.thread_scope_key ??
+          matchedWatch?.scope_key ??
+          this.activeWatches.get(bg.thread_id)?.scopeKey ??
+          null,
+      );
     }
 
     for (const w of rec.thread_watches ?? []) {
@@ -6712,13 +6736,29 @@ export class ChannelGatewayOrchestrator {
     const recovery = await this.backend.recoverState({ mode: "startup" });
 
     // Run recovery tasks concurrently so one long-lived SSE stream does not block other rows
+    const watchByThread = new Map(
+      (recovery.thread_watches ?? []).map((w) => [w.thread_id, w] as const),
+    );
+    const inboundScopeByThread = new Map<string, string>();
+    for (const inRow of recovery.inbound_events ?? []) {
+      if (inRow.thread_id && inRow.thread_scope_key) {
+        inboundScopeByThread.set(inRow.thread_id, inRow.thread_scope_key);
+      }
+    }
     await Promise.allSettled([
       ...(recovery.inbound_events ?? []).map((row) =>
         this.recoverSingleInboundRow(row),
       ),
-      ...(recovery.background_runs ?? []).map((bg) =>
-        this.recoverSingleBackgroundRun(bg),
-      ),
+      ...(recovery.background_runs ?? []).map((bg) => {
+        const matchedW = watchByThread.get(bg.thread_id);
+        return this.recoverSingleBackgroundRun(
+          bg,
+          matchedW?.thread_scope_key ??
+            matchedW?.scope_key ??
+            inboundScopeByThread.get(bg.thread_id) ??
+            null,
+        );
+      }),
       ...(recovery.thread_watches ?? []).map((w) =>
         this.recoverSingleThreadWatch(w),
       ),
@@ -7164,7 +7204,22 @@ export class ChannelGatewayOrchestrator {
 
   private async recoverSingleBackgroundRun(
     bg: RecoverBackgroundRunRow,
+    fallbackScopeKey?: string | null,
   ): Promise<boolean> {
+    const resolvedScopeKey =
+      (typeof bg.thread_scope_key === "string" &&
+      bg.thread_scope_key.trim().length > 0
+        ? bg.thread_scope_key.trim()
+        : null) ??
+      (typeof bg.scope_key === "string" && bg.scope_key.trim().length > 0
+        ? bg.scope_key.trim()
+        : null) ??
+      (typeof fallbackScopeKey === "string" && fallbackScopeKey.trim().length > 0
+        ? fallbackScopeKey.trim()
+        : null) ??
+      this.activeWatches.get(bg.thread_id)?.scopeKey ??
+      null;
+
     if (
       (bg.status === "completed" || bg.status === "failed") &&
       bg.fallback_pending
@@ -7176,6 +7231,7 @@ export class ChannelGatewayOrchestrator {
         turnIndex: bg.turn_index,
         platform: bg.platform,
         targetAddress: bg.target_address,
+        scopeKey: resolvedScopeKey,
         isBackgroundRun: true,
       });
     }
@@ -7193,8 +7249,11 @@ export class ChannelGatewayOrchestrator {
           userId: bg.dalton_user_id,
           platform: bg.platform,
           targetAddress: bg.target_address,
-          scopeKey: bg.target_address,
-          generation: 0,
+          scopeKey: resolvedScopeKey ?? bg.target_address,
+          generation:
+            typeof bg.generation === "number"
+              ? bg.generation
+              : (this.activeWatches.get(bg.thread_id)?.generation ?? 0),
           lastSeenTurnIndex: bg.turn_index ?? 0,
         });
         return await this.consumeBackgroundRunStream({
@@ -7217,6 +7276,7 @@ export class ChannelGatewayOrchestrator {
           turnIndex: bg.turn_index,
           platform: bg.platform,
           targetAddress: bg.target_address,
+          scopeKey: resolvedScopeKey,
           isBackgroundRun: true,
         });
       }

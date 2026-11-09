@@ -363,6 +363,8 @@ export async function readStreamWithLimit(
 
 export interface SafeFetchOptions {
   allowedDomains?: readonly string[];
+  allowedProtocols?: readonly string[];
+  requireHttps?: boolean;
   maxBytes?: number;
   timeoutMs?: number;
   chunkIdleTimeoutMs?: number;
@@ -390,9 +392,15 @@ function validateSafeFetchTargetUrl(
   targetUrl: URL,
   allowedDomains: readonly string[] | undefined,
   isRedirect: boolean,
+  protocolOptions?: { allowedProtocols?: readonly string[]; requireHttps?: boolean },
 ): void {
   const prefix = isRedirect ? "Redirected attachment" : "Attachment";
-  if (targetUrl.protocol !== "https:" && targetUrl.protocol !== "http:") {
+  const allowedProtocols = protocolOptions?.requireHttps
+    ? ["https:"]
+    : protocolOptions?.allowedProtocols && protocolOptions.allowedProtocols.length > 0
+      ? protocolOptions.allowedProtocols
+      : ["https:", "http:"];
+  if (!allowedProtocols.includes(targetUrl.protocol)) {
     throw new SafeFetchError(
       "invalid_url",
       `Unsupported ${prefix.toLowerCase()} URL protocol: ${targetUrl.protocol}`,
@@ -437,7 +445,7 @@ export async function safeFetchBuffer(
     });
   }
 
-  validateSafeFetchTargetUrl(currentUrl, options.allowedDomains, false);
+  validateSafeFetchTargetUrl(currentUrl, options.allowedDomains, false, options);
 
   const maxBytes = Math.min(
     MAX_ATTACHMENT_BYTES,
@@ -448,7 +456,11 @@ export async function safeFetchBuffer(
 
   const controller = new AbortController();
   const onParentAbort = (): void => controller.abort();
-  options.signal?.addEventListener("abort", onParentAbort, { once: true });
+  if (options.signal?.aborted) {
+    controller.abort();
+  } else {
+    options.signal?.addEventListener("abort", onParentAbort, { once: true });
+  }
   const timer =
     timeoutMs > 0
       ? setTimeout(() => controller.abort(), timeoutMs)
@@ -459,6 +471,12 @@ export async function safeFetchBuffer(
     let redirectHops = 0;
 
     while (true) {
+      if (controller.signal.aborted) {
+        throw new SafeFetchError(
+          "timeout",
+          `Attachment download timed out after ${timeoutMs}ms`,
+        );
+      }
       try {
         response = await fetchFn(currentUrl.toString(), {
           method: "GET",
@@ -506,7 +524,7 @@ export async function safeFetchBuffer(
           );
         }
 
-        validateSafeFetchTargetUrl(nextUrl, options.allowedDomains, true);
+        validateSafeFetchTargetUrl(nextUrl, options.allowedDomains, true, options);
         currentUrl = nextUrl;
         redirectHops += 1;
         continue;

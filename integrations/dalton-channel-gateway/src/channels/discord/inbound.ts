@@ -269,19 +269,34 @@ async function fetchFreshAttachmentFromMessage(
   };
 }
 
+function throwIfDownloadAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw classifyDiscordDeliveryError(new DOMException("Aborted", "AbortError"), {
+      stage: "read",
+      message: "Discord attachment download aborted",
+    });
+  }
+}
+
 /**
  * Downloads one inbound attachment into memory. Uses the descriptor's signed
  * CDN URL when present; if absent or expired, re-fetches the original message
  * through the REST client by saved channel/message/attachment ids to obtain a
- * fresh URL. The bot token is only sent to the Discord API, never to CDN or
- * redirect targets.
+ * fresh URL. Only HTTPS CDN targets and redirect hops are accepted, and the bot
+ * token is never sent to CDN or redirect targets.
  */
 export async function downloadDiscordAttachment(
   rest: RequestClient,
   descriptor: InboundAttachmentDescriptor,
   event: InboundChannelEvent,
-  options: { fetchImpl?: SafeFetchOptions["fetchImpl"]; timeoutMs?: number; maxBytes?: number } = {},
+  options: {
+    fetchImpl?: SafeFetchOptions["fetchImpl"];
+    timeoutMs?: number;
+    maxBytes?: number;
+    signal?: AbortSignal;
+  } = {},
 ): Promise<{ content: Buffer; filename: string; mimeType: string }> {
+  throwIfDownloadAborted(options.signal);
   const maxBytes = options.maxBytes ?? MAX_ATTACHMENT_BYTES;
   if (descriptor.sizeBytes !== undefined && descriptor.sizeBytes > maxBytes) {
     throw classifyDiscordDeliveryError(new Error(`Attachment exceeds maximum allowed size of ${maxBytes} bytes`), {
@@ -294,29 +309,38 @@ export async function downloadDiscordAttachment(
   let refreshedFromRest = false;
 
   if (!url) {
+    throwIfDownloadAborted(options.signal);
     const fresh = await fetchFreshAttachmentFromMessage(rest, descriptor, event);
+    throwIfDownloadAborted(options.signal);
     url = fresh.url;
     if (fresh.filename) filename = fresh.filename;
     if (fresh.mimeType) mimeType = fresh.mimeType;
     refreshedFromRest = true;
   }
 
-  const fetchFromCdn = async (targetUrl: string) =>
-    safeFetchBuffer(targetUrl, {
+  const fetchFromCdn = async (targetUrl: string) => {
+    throwIfDownloadAborted(options.signal);
+    return safeFetchBuffer(targetUrl, {
       allowedDomains: DISCORD_MEDIA_SSRF_POLICY.hostnameAllowlist,
+      allowedProtocols: ["https:"],
+      requireHttps: true,
       maxBytes,
       timeoutMs: options.timeoutMs ?? 30_000,
+      signal: options.signal,
       fetchImpl: options.fetchImpl,
       // Deliberately no Authorization header: CDN URLs are signed and the bot
       // token must not leak to CDN or redirect targets (validated per hop).
     });
+  };
 
   let result: Awaited<ReturnType<typeof safeFetchBuffer>>;
   try {
     result = await fetchFromCdn(url);
   } catch (err) {
+    throwIfDownloadAborted(options.signal);
     if (!refreshedFromRest && err instanceof SafeFetchError && err.code === "http_error") {
       const fresh = await fetchFreshAttachmentFromMessage(rest, descriptor, event);
+      throwIfDownloadAborted(options.signal);
       url = fresh.url;
       if (fresh.filename) filename = fresh.filename;
       if (fresh.mimeType) mimeType = fresh.mimeType;

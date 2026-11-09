@@ -247,6 +247,7 @@ export interface I4StateResponse {
     thread_id: string | null;
     run_id: string | null;
     external_thread_id: string | null;
+    thread_scope_key?: string | null;
   } | null;
   resolved_thread_id?: string | null;
 }
@@ -313,6 +314,7 @@ export interface I6AuthorizeAndClaimResponse {
   recipient_id?: string;
   platform?: string | null;
   target_address?: string | null;
+  thread_scope_key?: string | null;
   is_current?: boolean;
   home_workspace_id?: string;
   weixin_context_token?: string | null;
@@ -460,6 +462,9 @@ export interface RecoverBackgroundRunRow {
   dalton_user_id: string;
   platform: ChannelPlatform;
   target_address: string;
+  scope_key?: string | null;
+  thread_scope_key?: string | null;
+  generation?: number;
   turn_index: number | null;
   status: "streaming" | "running" | "completed" | "failed";
   fallback_pending: boolean;
@@ -472,6 +477,7 @@ export interface RecoverThreadWatchRow {
   platform: ChannelPlatform;
   target_address: string;
   scope_key: string;
+  thread_scope_key?: string | null;
   generation: number;
   last_seen_turn_index: number;
   watch_active: boolean;

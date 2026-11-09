@@ -202,6 +202,7 @@ export class DiscordGatewayClient {
   private resumeGatewayUrl: string | null = null;
   private gatewayUrl: string;
   private sessionStartLimit: DiscordGatewayInfo["session_start_limit"] | null = null;
+  private sessionStartResetAt: number | null = null;
   private gatewayInfoLoaded = false;
   private lastHeartbeatAck = true;
   private heartbeatTimer: ReturnType<typeof setTimeout> | undefined;
@@ -213,6 +214,7 @@ export class DiscordGatewayClient {
   private isDrainingDispatches = false;
   private wakeDrainImmediately = false;
   private stopGeneration = 0;
+  private refreshGeneration = 0;
   private protocolSessionEpoch = 0;
   private shouldReconnect = false;
   private isConnecting = false;
@@ -231,15 +233,6 @@ export class DiscordGatewayClient {
     this.onDispatch = options.onDispatch;
     this.onReady = options.onReady;
     this.onError = options.onError;
-    this.requiresGatewayInfo = Boolean(options.fetchGatewayInfo || options.gatewayInfo !== undefined);
-    if (options.gatewayInfo !== undefined && isValidDiscordGatewayInfo(options.gatewayInfo)) {
-      this.gatewayUrl = options.gatewayUrl ?? options.gatewayInfo.url.trim();
-      this.sessionStartLimit = { ...options.gatewayInfo.session_start_limit };
-      this.gatewayInfoLoaded = true;
-    } else {
-      this.gatewayUrl = options.gatewayUrl ?? DISCORD_GATEWAY_URL;
-      this.gatewayInfoLoaded = !this.requiresGatewayInfo;
-    }
     this.timerDeps = {
       setTimeoutFn: options.timerDeps?.setTimeoutFn ?? ((fn, ms) => setTimeout(fn, ms)),
       clearTimeoutFn: options.timerDeps?.clearTimeoutFn ?? ((t) => clearTimeout(t)),
@@ -247,6 +240,16 @@ export class DiscordGatewayClient {
       random: options.timerDeps?.random ?? Math.random,
     };
     this.identifyLimiter = options.identifyLimiter ?? new GatewayIdentifyLimiter(options.timerDeps);
+    this.requiresGatewayInfo = Boolean(options.fetchGatewayInfo || options.gatewayInfo !== undefined);
+    if (options.gatewayInfo !== undefined && isValidDiscordGatewayInfo(options.gatewayInfo)) {
+      this.gatewayUrl = options.gatewayUrl ?? options.gatewayInfo.url.trim();
+      this.sessionStartLimit = { ...options.gatewayInfo.session_start_limit };
+      this.sessionStartResetAt = this.timerDeps.now() + options.gatewayInfo.session_start_limit.reset_after;
+      this.gatewayInfoLoaded = true;
+    } else {
+      this.gatewayUrl = options.gatewayUrl ?? DISCORD_GATEWAY_URL;
+      this.gatewayInfoLoaded = !this.requiresGatewayInfo;
+    }
   }
 
   isConnected(): boolean { return this.connected && this.ws?.readyState === 1; }
@@ -259,18 +262,22 @@ export class DiscordGatewayClient {
     return this.sessionStartLimit ? { ...this.sessionStartLimit } : null;
   }
 
-  private async refreshGatewayInfo(): Promise<boolean> {
+  private async refreshGatewayInfo(
+    expectedStopGen = this.stopGeneration,
+  ): Promise<"ok" | "failed" | "stale"> {
     if (!this.options.fetchGatewayInfo) {
-      if (this.options.gatewayInfo !== undefined && isValidDiscordGatewayInfo(this.options.gatewayInfo)) {
-        this.sessionStartLimit = { ...this.options.gatewayInfo.session_start_limit };
-        if (!this.options.gatewayUrl) this.gatewayUrl = this.options.gatewayInfo.url.trim();
-        this.gatewayInfoLoaded = true;
-        return true;
-      }
-      return !this.requiresGatewayInfo;
+      return !this.shouldReconnect || expectedStopGen !== this.stopGeneration ? "stale" : "failed";
     }
+    const refreshGen = ++this.refreshGeneration;
     try {
       const info = await this.options.fetchGatewayInfo();
+      if (
+        !this.shouldReconnect ||
+        expectedStopGen !== this.stopGeneration ||
+        refreshGen !== this.refreshGeneration
+      ) {
+        return "stale";
+      }
       if (!isValidDiscordGatewayInfo(info)) {
         throw new Error("Discord /gateway/bot returned an invalid gateway info payload");
       }
@@ -278,23 +285,32 @@ export class DiscordGatewayClient {
         this.gatewayUrl = info.url.trim();
       }
       this.sessionStartLimit = { ...info.session_start_limit };
+      this.sessionStartResetAt = this.timerDeps.now() + info.session_start_limit.reset_after;
       this.gatewayInfoLoaded = true;
-      return true;
+      return "ok";
     } catch (err) {
+      if (
+        !this.shouldReconnect ||
+        expectedStopGen !== this.stopGeneration ||
+        refreshGen !== this.refreshGeneration
+      ) {
+        return "stale";
+      }
       this.gatewayInfoLoaded = false;
       const error = err instanceof Error ? err : new Error(String(err));
       this.logger.warn("Discord gateway info lookup failed", { error });
       this.emitError(error);
-      return false;
+      return "failed";
     }
   }
 
   async start(): Promise<void> {
+    const stopGen = ++this.stopGeneration;
     this.shouldReconnect = true;
     if (this.options.fetchGatewayInfo) {
-      const ok = await this.refreshGatewayInfo();
-      if (!this.shouldReconnect) return;
-      if (!ok) {
+      const status = await this.refreshGatewayInfo(stopGen);
+      if (!this.shouldReconnect || stopGen !== this.stopGeneration || status === "stale") return;
+      if (status !== "ok") {
         this.scheduleReconnect({ preferResume: false, reason: "gateway-info-error" });
         return;
       }
@@ -303,6 +319,7 @@ export class DiscordGatewayClient {
       this.scheduleReconnect({ preferResume: false, reason: "gateway-info-error" });
       return;
     }
+    if (!this.shouldReconnect || stopGen !== this.stopGeneration) return;
     this.connect(false);
   }
 
@@ -310,6 +327,7 @@ export class DiscordGatewayClient {
   async stop(): Promise<void> {
     this.shouldReconnect = false;
     this.stopGeneration += 1;
+    this.refreshGeneration += 1;
     this.protocolSessionEpoch += 1;
     this.wakeDrainImmediately = false;
     this.stopHeartbeat();
@@ -391,9 +409,10 @@ export class DiscordGatewayClient {
 
   private async connectAfterGatewayInfo(): Promise<void> {
     if (!this.shouldReconnect || this.isConnecting) return;
-    const ok = await this.refreshGatewayInfo();
-    if (!this.shouldReconnect) return;
-    if (!ok) {
+    const stopGen = this.stopGeneration;
+    const status = await this.refreshGatewayInfo(stopGen);
+    if (!this.shouldReconnect || stopGen !== this.stopGeneration || status === "stale") return;
+    if (status !== "ok") {
       if (!this.options.fetchGatewayInfo) {
         this.emitError(new Error("Discord gateway info is invalid"));
       }
@@ -433,6 +452,7 @@ export class DiscordGatewayClient {
   private handleClose(code: number): void {
     this.stopHeartbeat();
     this.clearDispatchRetryTimer();
+    this.cancelAllWaitTimers();
     this.isConnecting = false;
     this.connected = false;
     this.ws = null;
@@ -682,53 +702,64 @@ export class DiscordGatewayClient {
   }
 
   private async identify(socket: DiscordWebSocketLike): Promise<void> {
+    const stopGen = this.stopGeneration;
     if (socket !== this.ws || !this.shouldReconnect) return;
 
     if (this.requiresGatewayInfo && !this.gatewayInfoLoaded) {
-      const ok = await this.refreshGatewayInfo();
-      if (socket !== this.ws || !this.shouldReconnect) return;
-      if (!ok) {
+      const status = await this.refreshGatewayInfo(stopGen);
+      if (socket !== this.ws || !this.shouldReconnect || stopGen !== this.stopGeneration || status === "stale") return;
+      if (status !== "ok") {
         this.scheduleReconnect({ preferResume: false, reason: "gateway-info-error" });
         return;
       }
     }
 
     if (this.sessionStartLimit && this.sessionStartLimit.remaining <= 0) {
-      const waitMs = Math.max(1, this.sessionStartLimit.reset_after);
-      this.logger.warn("Discord session_start_limit exhausted; waiting for reset_after before Identify", {
-        resetAfterMs: waitMs,
-      });
-      const waited = await this.waitCancellable(waitMs);
-      if (!waited || socket !== this.ws || !this.shouldReconnect) return;
-
-      if (this.options.fetchGatewayInfo) {
-        const ok = await this.refreshGatewayInfo();
-        if (socket !== this.ws || !this.shouldReconnect) return;
-        if (!ok) {
-          this.scheduleReconnect({ preferResume: false, reason: "gateway-info-error" });
-          return;
-        }
-      } else if (this.sessionStartLimit) {
-        const refreshedTotal = Math.max(1, this.sessionStartLimit.total);
-        this.sessionStartLimit = {
-          ...this.sessionStartLimit,
-          remaining: refreshedTotal,
-          reset_after: 0,
-        };
+      const now = this.timerDeps.now();
+      const waitMs =
+        this.sessionStartResetAt !== null
+          ? Math.max(0, this.sessionStartResetAt - now)
+          : Math.max(0, this.sessionStartLimit.reset_after);
+      if (waitMs > 0) {
+        this.logger.warn("Discord session_start_limit exhausted; waiting for reset_after before Identify", {
+          resetAfterMs: waitMs,
+        });
+        const waited = await this.waitCancellable(waitMs);
+        if (!waited || socket !== this.ws || !this.shouldReconnect || stopGen !== this.stopGeneration) return;
       }
 
-      if (this.sessionStartLimit && this.sessionStartLimit.remaining <= 0) {
+      if (!this.options.fetchGatewayInfo) {
+        this.emitError(new Error("Discord session_start_limit exhausted and no fetchGatewayInfo source is configured"));
         this.scheduleReconnect({
           preferResume: false,
           reason: "session-start-limit-exhausted",
-          minDelayMs: Math.max(1000, this.sessionStartLimit.reset_after),
+        });
+        return;
+      }
+
+      const status = await this.refreshGatewayInfo(stopGen);
+      if (socket !== this.ws || !this.shouldReconnect || stopGen !== this.stopGeneration || status === "stale") return;
+      if (status !== "ok") {
+        this.scheduleReconnect({ preferResume: false, reason: "gateway-info-error" });
+        return;
+      }
+
+      if (this.sessionStartLimit && this.sessionStartLimit.remaining <= 0) {
+        const remainingResetMs =
+          this.sessionStartResetAt !== null
+            ? Math.max(1000, this.sessionStartResetAt - this.timerDeps.now())
+            : Math.max(1000, this.sessionStartLimit.reset_after);
+        this.scheduleReconnect({
+          preferResume: false,
+          reason: "session-start-limit-exhausted",
+          minDelayMs: remainingResetMs,
         });
         return;
       }
     }
 
     const allowed = await this.identifyLimiter.wait();
-    if (!allowed || socket !== this.ws || !this.shouldReconnect) return;
+    if (!allowed || socket !== this.ws || !this.shouldReconnect || stopGen !== this.stopGeneration) return;
     if (socket.readyState !== 1) {
       this.scheduleReconnect({ preferResume: false, reason: "identify" });
       return;
@@ -773,6 +804,7 @@ export class DiscordGatewayClient {
     if (!this.shouldReconnect) return;
     this.stopHeartbeat();
     this.clearDispatchRetryTimer();
+    this.cancelAllWaitTimers();
     if (this.reconnectTimer) this.timerDeps.clearTimeoutFn(this.reconnectTimer);
     const ws = this.ws;
     this.ws = null;

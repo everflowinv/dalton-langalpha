@@ -4,9 +4,11 @@ import {
   chunkDiscordText,
   classifyDiscordDeliveryError,
   createDiscordMessageNonce,
+  DISCORD_MAX_NONCE_CHARS,
   DiscordChannelAdapter,
   DiscordError,
   DiscordGatewayClient,
+  DiscordQueueError,
   downloadDiscordAttachment,
   fetchDiscordGatewayInfo,
   normalizeDiscordBold,
@@ -23,9 +25,10 @@ import {
 import { loadConfig } from "../src/config.js";
 import { buildConfiguredAdapters } from "../src/main.js";
 import { createGatewayApp } from "../src/server.js";
+import { SafeFetchError } from "../src/shared/safe-fetch.js";
 import type { ChannelPlatform, InboundChannelEvent } from "../src/types.js";
 import { makeInboundRequestKey } from "../src/uuid.js";
-import { createMockBackend, HOME_WS_ID, TEST_SERVICE_TOKEN } from "./helpers.js";
+import { createMockBackend, fetchGatewayServer, HOME_WS_ID, makeSseEventsFromFixture, TEST_SERVICE_TOKEN } from "./helpers.js";
 
 const BOT_ID = "999000111";
 const USER_ID = "111222333";
@@ -230,11 +233,234 @@ describe("Discord REST client", () => {
     await expect(rest.post("/channels/1/messages", { content: "x" })).rejects.toBeInstanceOf(TypeError);
   });
 
-  it("keeps nonces stable in shape and unique per create call", () => {
+  it("keeps nonces within Discord's 25-character v10 limit across text/file request bodies and 429 retries", async () => {
     const a = createDiscordMessageNonce();
     const b = createDiscordMessageNonce();
     expect(a).not.toBe(b);
     expect(a).toMatch(/^[0-9a-f]+$/);
+    expect(a.length).toBeGreaterThan(0);
+    expect(a.length).toBeLessThanOrEqual(DISCORD_MAX_NONCE_CHARS);
+    expect(DISCORD_MAX_NONCE_CHARS).toBe(25);
+
+    const textBodies: Array<{ content?: string; nonce?: string }> = [];
+    const filePayloads: Array<{ content?: string; nonce?: string; attachments?: Array<{ id: number; filename: string }> }> = [];
+    let textAttempts = 0;
+    let fileAttempts = 0;
+
+    const { rest } = makeRest(async (call) => {
+      if (call.init.body instanceof FormData) {
+        fileAttempts += 1;
+        const payloadRaw = String(call.init.body.get("payload_json") ?? "{}");
+        filePayloads.push(JSON.parse(payloadRaw) as { content?: string; nonce?: string; attachments?: Array<{ id: number; filename: string }> });
+        if (fileAttempts === 1) {
+          return jsonResponse({ message: "rate limited", retry_after: 0, global: false }, 429, {
+            "x-ratelimit-bucket": "bucket-msg",
+          });
+        }
+        return jsonResponse({ id: "file-msg-ok" });
+      }
+      textAttempts += 1;
+      textBodies.push(JSON.parse(String(call.init.body ?? "{}")) as { content?: string; nonce?: string });
+      if (textAttempts === 1) {
+        return jsonResponse({ message: "rate limited", retry_after: 0, global: false }, 429, {
+          "x-ratelimit-bucket": "bucket-msg",
+        });
+      }
+      return jsonResponse({ id: "text-msg-ok" });
+    });
+
+    const adapter = new DiscordChannelAdapter({ botToken: "t", botUserId: BOT_ID, rest });
+    await adapter.sendTextChunk({
+      targetAddress: `discord:${GUILD_ID}/${CHANNEL_ID}`,
+      text: "hello nonce",
+      chunkIndex: 0,
+      totalChunks: 1,
+    });
+    expect(textBodies).toHaveLength(2);
+    expect(typeof textBodies[0]!.nonce).toBe("string");
+    expect(textBodies[0]!.nonce!.length).toBeGreaterThan(0);
+    expect(textBodies[0]!.nonce!.length).toBeLessThanOrEqual(DISCORD_MAX_NONCE_CHARS);
+    expect(textBodies[1]!.nonce).toBe(textBodies[0]!.nonce);
+
+    await adapter.sendFile({
+      targetAddress: `discord:${GUILD_ID}/${CHANNEL_ID}`,
+      path: "reports/memo.pdf",
+      filename: "memo.pdf",
+      content: Buffer.from("pdf-bytes"),
+      mimeType: "application/pdf",
+    });
+    expect(filePayloads).toHaveLength(2);
+    expect(typeof filePayloads[0]!.nonce).toBe("string");
+    expect(filePayloads[0]!.nonce!.length).toBeGreaterThan(0);
+    expect(filePayloads[0]!.nonce!.length).toBeLessThanOrEqual(DISCORD_MAX_NONCE_CHARS);
+    expect(filePayloads[1]!.nonce).toBe(filePayloads[0]!.nonce);
+    expect(filePayloads[0]!.nonce).not.toBe(textBodies[0]!.nonce);
+  });
+
+  it("distinguishes pre-dispatch queue errors (failed, retryable, 0 HTTP requests) from post-dispatch timeout/abort (unknown, non-repeatable, 1 HTTP request)", async () => {
+    expect(classifyDiscordDeliveryError(new DiscordQueueError("queue_full", "queue full")).outcome).toBe("failed");
+    expect(classifyDiscordDeliveryError(new DiscordQueueError("queue_cleared", "queue cleared")).outcome).toBe("failed");
+    expect(classifyDiscordDeliveryError(new DiscordQueueError("queue_aborted", "queue aborted")).outcome).toBe("failed");
+    expect(classifyDiscordDeliveryError(new DiscordQueueError("queue_stale", "queue stale")).outcome).toBe("failed");
+    expect(classifyDiscordDeliveryError(new DOMException("Aborted", "AbortError"), { stage: "send" }).outcome).toBe("unknown");
+
+    const backend = createMockBackend();
+    let releaseBlocker!: () => void;
+    let blockerEntered!: () => void;
+    const blockerEnteredPromise = new Promise<void>((r) => { blockerEntered = r; });
+    let holdBlocker = true;
+    let simulateSendTimeout = false;
+    let messagePostAttempts = 0;
+
+    const rest = new RequestClient("test-bot-token", {
+      timeoutMs: 30,
+      schedulerOptions: { maxQueueSize: 1 },
+      fetchImpl: async (url, init) => {
+        const route = routeOf(url);
+        if (route === "/channels/blocker") {
+          blockerEntered();
+          if (holdBlocker) {
+            await new Promise<void>((r) => { releaseBlocker = r; });
+          }
+          return jsonResponse({ id: "blocker-ok" });
+        }
+        if (route === `/channels/${CHANNEL_ID}`) {
+          return jsonResponse({ id: CHANNEL_ID, type: 0, guild_id: GUILD_ID });
+        }
+        if (route === `/channels/${CHANNEL_ID}/messages` && init.method === "POST") {
+          messagePostAttempts += 1;
+          if (simulateSendTimeout) {
+            return await new Promise<Response>((_resolve, reject) => {
+              init.signal?.addEventListener(
+                "abort",
+                () => reject(new DOMException("The operation was aborted", "AbortError")),
+                { once: true },
+              );
+            });
+          }
+          return jsonResponse({ id: `msg-${messagePostAttempts}` });
+        }
+        return jsonResponse({});
+      },
+    });
+
+    const adapter = new DiscordChannelAdapter({ botToken: "t", botUserId: BOT_ID, rest });
+    vi.spyOn(adapter, "start").mockResolvedValue(undefined);
+    vi.spyOn(adapter, "isConnected").mockReturnValue(true);
+    adapter.handleDispatch("CHANNEL_CREATE", { id: CHANNEL_ID, type: 0, guild_id: GUILD_ID, name: "general" });
+
+    const app = createGatewayApp({
+      config: loadConfig({
+        GATEWAY_HOST: "127.0.0.1",
+        GATEWAY_PORT: "0",
+        INTERNAL_SERVICE_TOKEN: TEST_SERVICE_TOKEN,
+        DALTON_BACKEND_URL: "http://127.0.0.1:8000",
+        WEB_BASE_URL: "https://app.dalton.test",
+        DALTON_WEIXIN_CACHE_DIR: "/tmp/dalton-wx-discord-queue-test",
+        DALTON_DISCORD_ENABLED: "true",
+        DALTON_DISCORD_BOT_TOKEN: "t",
+        DALTON_DISCORD_APPLICATION_ID: BOT_ID,
+      }),
+      backend,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["discord", adapter]]),
+    });
+
+    try {
+      const { host, port } = await app.start();
+      const postAgentSend = async (payload: Record<string, unknown>) => {
+        const res = await fetchGatewayServer(app, `http://${host}:${port}/agent/send`, {
+          method: "POST",
+          headers: {
+            "X-Service-Token": TEST_SERVICE_TOKEN,
+            "X-User-Id": "11111111-1111-4111-8111-111111111111",
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(payload),
+        });
+        return {
+          statusCode: res.status,
+          body: (await res.json()) as Record<string, unknown>,
+        };
+      };
+
+      // 1. Occupy the single scheduler queue slot (maxQueueSize=1) so the next request is rejected pre-dispatch with queue_full.
+      const blockerPromise = rest.get("/channels/blocker");
+      await blockerEnteredPromise;
+
+      const preDispatchFullRes = await postAgentSend({
+        thread_id: "33333333-3333-4333-8333-333333333333",
+        run_id: "run-queue-test",
+        tool_call_id: "tc-pre-dispatch-1",
+        turn_platform: "discord",
+        target: `discord:${GUILD_ID}/${CHANNEL_ID}`,
+        text: "hello after queue full",
+      });
+      expect(preDispatchFullRes.statusCode).toBe(200);
+      expect(preDispatchFullRes.body).toMatchObject({
+        status: "failed",
+        code: "unavailable",
+      });
+      // Request was rejected before dispatch -> 0 message POST requests sent to Discord.
+      expect(messagePostAttempts).toBe(0);
+
+      // Release the blocker and retry the exact same tool_call_id: because the first attempt was `failed`,
+      // I-6 allows re-claiming and the retry succeeds with exactly 1 HTTP POST.
+      holdBlocker = false;
+      releaseBlocker();
+      await blockerPromise;
+
+      const retryAfterPreDispatchRes = await postAgentSend({
+        thread_id: "33333333-3333-4333-8333-333333333333",
+        run_id: "run-queue-test",
+        tool_call_id: "tc-pre-dispatch-1",
+        turn_platform: "discord",
+        target: `discord:${GUILD_ID}/${CHANNEL_ID}`,
+        text: "hello after queue full",
+      });
+      expect(retryAfterPreDispatchRes.statusCode).toBe(200);
+      expect(retryAfterPreDispatchRes.body).toMatchObject({
+        status: "sent",
+        code: null,
+      });
+      expect(messagePostAttempts).toBe(1);
+
+      // 2. Post-dispatch timeout: HTTP POST reaches fetchImpl (messagePostAttempts increments to 2) and times out.
+      //    Must be classified as `unknown`, and a subsequent retry with the same tool_call_id must NOT re-send!
+      simulateSendTimeout = true;
+      const postDispatchTimeoutRes = await postAgentSend({
+        thread_id: "33333333-3333-4333-8333-333333333333",
+        run_id: "run-queue-test",
+        tool_call_id: "tc-post-dispatch-timeout",
+        turn_platform: "discord",
+        target: `discord:${GUILD_ID}/${CHANNEL_ID}`,
+        text: "ambiguous timeout message",
+      });
+      expect(postDispatchTimeoutRes.statusCode).toBe(200);
+      expect(postDispatchTimeoutRes.body).toMatchObject({
+        status: "unknown",
+        code: "unavailable",
+      });
+      expect(messagePostAttempts).toBe(2);
+
+      simulateSendTimeout = false;
+      const duplicateAfterUnknownRes = await postAgentSend({
+        thread_id: "33333333-3333-4333-8333-333333333333",
+        run_id: "run-queue-test",
+        tool_call_id: "tc-post-dispatch-timeout",
+        turn_platform: "discord",
+        target: `discord:${GUILD_ID}/${CHANNEL_ID}`,
+        text: "ambiguous timeout message",
+      });
+      expect(duplicateAfterUnknownRes.statusCode).toBe(200);
+      expect(duplicateAfterUnknownRes.body).toMatchObject({
+        status: "unknown",
+        code: "in_flight",
+      });
+      // Request count stays fixed at 2: no duplicate HTTP POST after post-dispatch timeout!
+      expect(messagePostAttempts).toBe(2);
+    } finally {
+      await app.stop();
+    }
   });
 });
 
@@ -828,6 +1054,395 @@ describe("DiscordGatewayClient", () => {
     expect(gatewayClient.getSequence()).toBe(3);
     await adapter.stop();
   });
+
+  it("tracks the absolute session_start_limit reset deadline across long-lived sessions, mid-wait disconnects, and static quotas", async () => {
+    // 1. Exhausted after initial Identify (remaining: 1 -> 0, reset_after: 10_000 at t=0), stays online past t=10_000,
+    //    then loses session (InvalidSession(false)): must refresh quota and Identify immediately without waiting another 10_000ms.
+    const timers1 = new FakeTimers();
+    const sockets1: FakeWebSocket[] = [];
+    let infoCalls1 = 0;
+    const client1 = new DiscordGatewayClient({
+      token: "test-bot-token",
+      webSocketFactory: (url) => {
+        const ws = new FakeWebSocket(url);
+        sockets1.push(ws);
+        return ws;
+      },
+      fetchGatewayInfo: async (): Promise<DiscordGatewayInfo> => {
+        infoCalls1 += 1;
+        if (infoCalls1 === 1) {
+          return {
+            url: "wss://gateway.discord.gg",
+            session_start_limit: { total: 1000, remaining: 1, reset_after: 10_000, max_concurrency: 1 },
+          };
+        }
+        return {
+          url: "wss://gateway.discord.gg",
+          session_start_limit: { total: 1000, remaining: 5, reset_after: 86_400_000, max_concurrency: 1 },
+        };
+      },
+      timerDeps: {
+        setTimeoutFn: timers1.setTimeoutFn,
+        clearTimeoutFn: timers1.clearTimeoutFn,
+        now: () => timers1.nowMs,
+        random: () => 0,
+      },
+    });
+
+    await client1.start();
+    const ws1a = sockets1[0]!;
+    ws1a.open();
+    ws1a.receive({ op: 10, d: { heartbeat_interval: 60_000 } });
+    await flushMicrotasks();
+    ws1a.receive({
+      op: 0,
+      s: 1,
+      t: "READY",
+      d: { session_id: "sess-long", resume_gateway_url: "wss://resume.example.gg", user: { id: BOT_ID } },
+    });
+    await flushMicrotasks();
+    expect(client1.getSessionStartLimit()?.remaining).toBe(0);
+    expect(infoCalls1).toBe(1);
+
+    // Stay online for 15_000ms (past the t=10_000 reset deadline), then receive InvalidSession(false).
+    timers1.nowMs = 15_000;
+    ws1a.receive({ op: 9, d: false });
+    await flushMicrotasks();
+    timers1.advance(2_000); // Reconnect fires at t=17_000
+    await flushMicrotasks();
+    const ws1b = sockets1[1]!;
+    ws1b.open();
+    ws1b.receive({ op: 10, d: { heartbeat_interval: 60_000 } });
+    await flushMicrotasks();
+
+    // Deadline (10_000) has already passed at t=17_000 -> refreshes immediately and sends Identify without extra 10_000ms wait.
+    expect(infoCalls1).toBe(2);
+    expect(ws1b.sent.map((s) => (JSON.parse(s) as { op: number }).op)).toContain(2);
+    expect(client1.getSessionStartLimit()?.remaining).toBe(4);
+    await client1.stop();
+
+    // 2. Socket disconnects while waiting for session_start_limit reset (deadline t=10_000):
+    //    reconnect socket must only wait the remaining time until t=10_000, not a fresh 10_000ms cycle.
+    const timers2 = new FakeTimers();
+    const sockets2: FakeWebSocket[] = [];
+    let infoCalls2 = 0;
+    const client2 = new DiscordGatewayClient({
+      token: "test-bot-token",
+      webSocketFactory: (url) => {
+        const ws = new FakeWebSocket(url);
+        sockets2.push(ws);
+        return ws;
+      },
+      fetchGatewayInfo: async (): Promise<DiscordGatewayInfo> => {
+        infoCalls2 += 1;
+        if (infoCalls2 === 1) {
+          return {
+            url: "wss://gateway.discord.gg",
+            session_start_limit: { total: 1000, remaining: 0, reset_after: 10_000, max_concurrency: 1 },
+          };
+        }
+        return {
+          url: "wss://gateway.discord.gg",
+          session_start_limit: { total: 1000, remaining: 2, reset_after: 60_000, max_concurrency: 1 },
+        };
+      },
+      timerDeps: {
+        setTimeoutFn: timers2.setTimeoutFn,
+        clearTimeoutFn: timers2.clearTimeoutFn,
+        now: () => timers2.nowMs,
+        random: () => 0,
+      },
+    });
+
+    await client2.start();
+    const ws2a = sockets2[0]!;
+    ws2a.open();
+    ws2a.receive({ op: 10, d: { heartbeat_interval: 60_000 } });
+    await flushMicrotasks();
+
+    // At t=3_000 (7_000ms remaining until t=10_000), ws2a disconnects; reconnect opens ws2b at t=5_000 (5_000ms remaining).
+    timers2.advance(3_000);
+    await flushMicrotasks();
+    ws2a.serverClose(1006);
+    await flushMicrotasks();
+    timers2.advance(2_000);
+    await flushMicrotasks();
+    expect(timers2.nowMs).toBe(5_000);
+
+    const ws2b = sockets2[1]!;
+    ws2b.open();
+    ws2b.receive({ op: 10, d: { heartbeat_interval: 60_000 } });
+    await flushMicrotasks();
+
+    // At t=9_999 (4_999ms after ws2b Hello), still before original deadline t=10_000 -> must NOT Identify yet.
+    timers2.advance(4_999);
+    await flushMicrotasks();
+    expect(infoCalls2).toBe(1);
+    expect(ws2b.sent.map((s) => (JSON.parse(s) as { op: number }).op)).not.toContain(2);
+
+    // At t=10_000 (+1ms), original deadline is reached -> refreshes quota and sends Identify on ws2b!
+    timers2.advance(1);
+    await flushMicrotasks();
+    expect(infoCalls2).toBe(2);
+    expect(ws2b.sent.map((s) => (JSON.parse(s) as { op: number }).op)).toContain(2);
+    expect(client2.getSessionStartLimit()?.remaining).toBe(1);
+    await client2.stop();
+
+    // 3. Static gatewayInfo without fetchGatewayInfo must never fabricate unlimited quota or re-issue the same quota.
+    const timers3 = new FakeTimers();
+    const sockets3: FakeWebSocket[] = [];
+    const errors3: Error[] = [];
+    const client3 = new DiscordGatewayClient({
+      token: "test-bot-token",
+      gatewayInfo: {
+        url: "wss://gateway.discord.gg",
+        session_start_limit: { total: 1000, remaining: 1, reset_after: 5_000, max_concurrency: 1 },
+      },
+      webSocketFactory: (url) => {
+        const ws = new FakeWebSocket(url);
+        sockets3.push(ws);
+        return ws;
+      },
+      timerDeps: {
+        setTimeoutFn: timers3.setTimeoutFn,
+        clearTimeoutFn: timers3.clearTimeoutFn,
+        now: () => timers3.nowMs,
+        random: () => 0,
+      },
+      onError: (err) => { errors3.push(err); },
+    });
+
+    await client3.start();
+    const ws3a = sockets3[0]!;
+    await helloAndReady(ws3a, 1);
+    expect(client3.getSessionStartLimit()?.remaining).toBe(0);
+
+    // Lose session after reset_after; without fetchGatewayInfo, must NOT mint new quota or send Identify on ws3b.
+    timers3.nowMs = 10_000;
+    ws3a.receive({ op: 9, d: false });
+    await flushMicrotasks();
+    timers3.advance(2_000);
+    await flushMicrotasks();
+    const ws3b = sockets3[1]!;
+    ws3b.open();
+    ws3b.receive({ op: 10, d: { heartbeat_interval: 60_000 } });
+    await flushMicrotasks();
+    expect(ws3b.sent.map((s) => (JSON.parse(s) as { op: number }).op)).not.toContain(2);
+    expect(errors3.some((e) => /session_start_limit exhausted/i.test(e.message))).toBe(true);
+    await client3.stop();
+  });
+
+  it("cancels start() when stop() runs during /users/@me, deduplicates concurrent start(), and allows clean restart without nesting onReady", async () => {
+    const timers = new FakeTimers();
+    const sockets: FakeWebSocket[] = [];
+    let meCalls = 0;
+    let releaseFirstMe!: () => void;
+    const firstMeEntered = new Promise<void>((resolve) => {
+      releaseFirstMe = resolve;
+    });
+
+    const { rest } = makeRest(async (call) => {
+      if (routeOf(call.url) === "/users/@me") {
+        meCalls += 1;
+        if (meCalls === 1) {
+          releaseFirstMe();
+          await new Promise<void>((_resolve, reject) => {
+            call.init.signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+          });
+        }
+        return jsonResponse({ id: BOT_ID });
+      }
+      return jsonResponse({});
+    });
+
+    const readyEvents: string[] = [];
+    const gatewayClient = new DiscordGatewayClient({
+      token: "test-bot-token",
+      gatewayInfo: {
+        url: "wss://gateway.discord.gg",
+        session_start_limit: { total: 1000, remaining: 10, reset_after: 60_000, max_concurrency: 1 },
+      },
+      webSocketFactory: (url) => {
+        const ws = new FakeWebSocket(url);
+        sockets.push(ws);
+        return ws;
+      },
+      timerDeps: {
+        setTimeoutFn: timers.setTimeoutFn,
+        clearTimeoutFn: timers.clearTimeoutFn,
+        now: () => timers.nowMs,
+        random: () => 0,
+      },
+      onReady: (info) => {
+        readyEvents.push(info.sessionId);
+      },
+    });
+
+    const adapter = new DiscordChannelAdapter({
+      botToken: "test-bot-token",
+      rest,
+      gatewayClient,
+    });
+
+    // 1. Start adapter, then call stop() while /users/@me is still in-flight.
+    const start1 = adapter.start();
+    await firstMeEntered;
+    await adapter.stop();
+    await start1;
+
+    // Cancelled start1 must NOT mark adapter started or open a gateway socket.
+    expect(adapter.isConnected()).toBe(false);
+    expect(sockets).toHaveLength(0);
+
+    // 2. Concurrent start() calls after stop() must share a single startup and open only one socket.
+    await Promise.all([adapter.start(), adapter.start(), adapter.start()]);
+    expect(meCalls).toBe(2);
+    expect(sockets).toHaveLength(1);
+    await helloAndReady(sockets[0]!, 1);
+    expect(adapter.isConnected()).toBe(true);
+    expect(readyEvents).toEqual(["sess-1"]);
+
+    // 3. Stop and start again: onReady must NOT be nested/duplicated across restarts.
+    await adapter.stop();
+    expect(adapter.isConnected()).toBe(false);
+    await adapter.start();
+    expect(sockets).toHaveLength(2);
+    await helloAndReady(sockets[1]!, 1);
+    expect(readyEvents).toEqual(["sess-1", "sess-1"]);
+    await adapter.stop();
+  });
+
+  it("ignores late /gateway/bot success or failure from a stopped start() after a subsequent start() has connected", async () => {
+    for (const lateOutcome of ["late-success", "late-failure"] as const) {
+      const timers = new FakeTimers();
+      const sockets: FakeWebSocket[] = [];
+      const errors: Error[] = [];
+      let meCalls = 0;
+      let gatewayInfoCalls = 0;
+
+      let markFirstGatewayInfoEntered!: () => void;
+      const firstGatewayInfoEntered = new Promise<void>((r) => {
+        markFirstGatewayInfoEntered = r;
+      });
+      let resolveFirstGatewayInfo!: (info: DiscordGatewayInfo) => void;
+      let rejectFirstGatewayInfo!: (err: Error) => void;
+      const firstGatewayInfoPromise = new Promise<DiscordGatewayInfo>((resolve, reject) => {
+        resolveFirstGatewayInfo = resolve;
+        rejectFirstGatewayInfo = reject;
+      });
+
+      const { rest } = makeRest(async (call) => {
+        if (routeOf(call.url) === "/users/@me") {
+          meCalls += 1;
+          return jsonResponse({ id: meCalls === 1 ? "stale-bot-user" : BOT_ID });
+        }
+        return jsonResponse({});
+      });
+
+      const fetchGatewayInfo = async (): Promise<DiscordGatewayInfo> => {
+        gatewayInfoCalls += 1;
+        if (gatewayInfoCalls === 1) {
+          markFirstGatewayInfoEntered();
+          return await firstGatewayInfoPromise;
+        }
+        return {
+          url: "wss://fresh.discord.gg",
+          session_start_limit: {
+            total: 1000,
+            remaining: 42,
+            reset_after: 60_000,
+            max_concurrency: 1,
+          },
+        };
+      };
+
+      const gatewayClient = new DiscordGatewayClient({
+        token: "test-bot-token",
+        fetchGatewayInfo,
+        webSocketFactory: (url) => {
+          const ws = new FakeWebSocket(url);
+          sockets.push(ws);
+          return ws;
+        },
+        timerDeps: {
+          setTimeoutFn: timers.setTimeoutFn,
+          clearTimeoutFn: timers.clearTimeoutFn,
+          now: () => timers.nowMs,
+          random: () => 0,
+        },
+        onError: (err) => {
+          errors.push(err);
+        },
+      });
+
+      const adapter = new DiscordChannelAdapter({
+        botToken: "test-bot-token",
+        rest,
+        gatewayClient,
+        fetchGatewayInfoFn: fetchGatewayInfo,
+      });
+
+      // 1. start1 finishes /users/@me and blocks inside /gateway/bot (refreshGatewayInfo).
+      const start1 = adapter.start();
+      await firstGatewayInfoEntered;
+      expect(sockets).toHaveLength(0);
+
+      // 2. stop() cancels start1's lifecycle; then start2 runs and connects cleanly.
+      await adapter.stop();
+      await adapter.start();
+      expect(sockets).toHaveLength(1);
+      const activeWs = sockets[0]!;
+      expect(activeWs.url).toContain("wss://fresh.discord.gg");
+      await helloAndReady(activeWs, 1);
+
+      expect(adapter.isConnected()).toBe(true);
+      expect(adapter.getBotUserId()).toBe(BOT_ID);
+      expect(gatewayClient.getSessionStartLimit()?.remaining).toBe(41);
+
+      // 3. Now start1's delayed /gateway/bot settles (either late success or late failure).
+      if (lateOutcome === "late-success") {
+        resolveFirstGatewayInfo({
+          url: "wss://stale.discord.gg",
+          session_start_limit: {
+            total: 1000,
+            remaining: 2,
+            reset_after: 5_000,
+            max_concurrency: 1,
+          },
+        });
+      } else {
+        rejectFirstGatewayInfo(new Error("late /gateway/bot failure"));
+      }
+      await start1;
+      await flushMicrotasks();
+
+      // Neither late outcome may stop the active gateway, close activeWs, open another socket,
+      // overwrite bot identity or session_start_limit quota, emit stale errors, or schedule a reconnect timer.
+      expect(adapter.isConnected()).toBe(true);
+      expect(activeWs.readyState).toBe(1);
+      expect(activeWs.closeCalls).toBe(0);
+      expect(sockets).toHaveLength(1);
+      expect(adapter.getBotUserId()).toBe(BOT_ID);
+      expect(gatewayClient.getSessionStartLimit()?.remaining).toBe(41);
+      expect(errors).toHaveLength(0);
+
+      // Advance timers past any reconnect backoff window and ACK each heartbeat (including initial t=0 jitter heartbeat).
+      timers.advance(0);
+      activeWs.receive({ op: 11, d: null });
+      timers.advance(1_000);
+      activeWs.receive({ op: 11, d: null });
+      timers.advance(1_000);
+      activeWs.receive({ op: 11, d: null });
+      timers.advance(1_000);
+      activeWs.receive({ op: 11, d: null });
+      await flushMicrotasks();
+      expect(adapter.isConnected()).toBe(true);
+      expect(activeWs.closeCalls).toBe(0);
+      expect(sockets).toHaveLength(1);
+
+      await adapter.stop();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1405,6 +2020,178 @@ describe("Discord attachments", () => {
     }
     await app.stop();
   });
+
+  it("rejects initial http:// CDN URLs and https->http downgrade redirects before issuing HTTP requests", async () => {
+    const { rest } = makeRest(async () => jsonResponse({}));
+    const event = parseDiscordInboundMessage(guildMessage(), { botUserId: BOT_ID })!;
+    const descriptor = { id: "att-https", filename: "a.pdf", mimeType: "application/pdf" };
+
+    // 1. Initial http:// URL on an allowed Discord CDN host must be rejected before fetchImpl is called.
+    const initialHttpCalls: string[] = [];
+    const initialHttpFetch: typeof fetch = async (input: string | URL | Request) => {
+      initialHttpCalls.push(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
+      return new Response("should not be reached", { status: 200 });
+    };
+    await expect(
+      downloadDiscordAttachment(
+        rest,
+        { ...descriptor, url: "http://cdn.discordapp.com/attachments/1/2/a.pdf" },
+        event,
+        { fetchImpl: initialHttpFetch },
+      ),
+    ).rejects.toMatchObject({
+      name: "SafeFetchError",
+      code: "invalid_url",
+    });
+    expect(initialHttpCalls).toHaveLength(0);
+
+    // 2. https:// initial URL that redirects (302) to http:// on an allowed CDN host must be rejected before the second request.
+    const redirectCalls: string[] = [];
+    const redirectHeaders: Headers[] = [];
+    const downgradeFetch: typeof fetch = async (input: string | URL | Request, init?: RequestInit) => {
+      const targetUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      redirectCalls.push(targetUrl);
+      redirectHeaders.push(new Headers(init?.headers));
+      return new Response(null, {
+        status: 302,
+        headers: { location: "http://media.discordapp.net/attachments/1/2/a.pdf" },
+      });
+    };
+    let caughtError: unknown;
+    try {
+      await downloadDiscordAttachment(
+        rest,
+        { ...descriptor, url: "https://cdn.discordapp.com/attachments/1/2/a.pdf" },
+        event,
+        { fetchImpl: downgradeFetch },
+      );
+    } catch (err) {
+      caughtError = err;
+    }
+    expect(caughtError).toBeInstanceOf(SafeFetchError);
+    expect((caughtError as SafeFetchError).code).toBe("invalid_url");
+    expect(redirectCalls).toEqual(["https://cdn.discordapp.com/attachments/1/2/a.pdf"]);
+    expect(redirectHeaders[0]!.get("Authorization")).toBeNull();
+  });
+
+  it("aborts in-flight CDN streams on adapter.stop(), prevents post-stop REST refresh on HTTP error, and uses a fresh signal on restart", async () => {
+    const timers = new FakeTimers();
+    const sockets: FakeWebSocket[] = [];
+    const restRoutes: string[] = [];
+    const { rest } = makeRest(async (call) => {
+      const route = routeOf(call.url);
+      restRoutes.push(route);
+      if (route === "/users/@me") return jsonResponse({ id: BOT_ID });
+      if (route === `/channels/${CHANNEL_ID}/messages/msg-att-stop`) {
+        return jsonResponse({
+          id: "msg-att-stop",
+          attachments: [
+            { id: "att-stop", filename: "doc.pdf", content_type: "application/pdf", url: "https://media.discordapp.net/doc.pdf?ex=fresh" },
+          ],
+        });
+      }
+      return jsonResponse({});
+    });
+
+    const gatewayClient = new DiscordGatewayClient({
+      token: "test-bot-token",
+      gatewayInfo: {
+        url: "wss://gateway.discord.gg",
+        session_start_limit: { total: 1000, remaining: 10, reset_after: 60_000, max_concurrency: 1 },
+      },
+      webSocketFactory: (url) => {
+        const ws = new FakeWebSocket(url);
+        sockets.push(ws);
+        return ws;
+      },
+      timerDeps: {
+        setTimeoutFn: timers.setTimeoutFn,
+        clearTimeoutFn: timers.clearTimeoutFn,
+        now: () => timers.nowMs,
+        random: () => 0,
+      },
+    });
+
+    let mode: "slow-stream" | "http-error-on-stop" | "fresh-after-restart" = "slow-stream";
+    let resolveSlowChunkEntered!: () => void;
+    const slowChunkEntered = new Promise<void>((r) => { resolveSlowChunkEntered = r; });
+    let streamCancelled = false;
+    const cdnCalls: string[] = [];
+
+    const mediaFetchImpl: typeof fetch = async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      cdnCalls.push(url);
+      expect(new Headers(init?.headers).get("Authorization")).toBeNull();
+
+      if (mode === "slow-stream") {
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new Uint8Array([1, 2, 3]));
+            resolveSlowChunkEntered();
+          },
+          cancel() {
+            streamCancelled = true;
+          },
+        });
+        return new Response(stream, {
+          status: 200,
+          headers: { "content-type": "application/pdf" },
+        });
+      }
+
+      if (mode === "http-error-on-stop") {
+        // Simulate stop() happening right as CDN returns HTTP 403; must NOT trigger a REST refresh or second CDN call.
+        await adapter.stop();
+        return new Response("expired", { status: 403 });
+      }
+
+      expect(init?.signal?.aborted).toBe(false);
+      return new Response(Buffer.from("restarted-ok"), {
+        status: 200,
+        headers: { "content-type": "application/pdf" },
+      });
+    };
+
+    const adapter = new DiscordChannelAdapter({
+      botToken: "test-bot-token",
+      botUserId: BOT_ID,
+      rest,
+      gatewayClient,
+      mediaFetchImpl,
+    });
+
+    const event = parseDiscordInboundMessage(guildMessage({ id: "msg-att-stop" }), { botUserId: BOT_ID })!;
+    const descriptor = {
+      id: "att-stop",
+      filename: "doc.pdf",
+      mimeType: "application/pdf",
+      url: "https://cdn.discordapp.com/attachments/1/2/doc.pdf?ex=1",
+    };
+
+    // 1. Slow stream is aborted immediately when adapter.stop() is called.
+    await adapter.start();
+    const slowDownloadPromise = adapter.downloadAttachment(descriptor, event);
+    await slowChunkEntered;
+    await adapter.stop();
+    await expect(slowDownloadPromise).rejects.toThrow();
+    expect(streamCancelled).toBe(true);
+    expect(restRoutes.filter((r) => r.startsWith("/channels/"))).toHaveLength(0);
+
+    // 2. Restart, then encounter HTTP 403 while stopping: must NOT issue REST refresh or second CDN request.
+    await adapter.start();
+    mode = "http-error-on-stop";
+    const cdnCountBefore = cdnCalls.length;
+    await expect(adapter.downloadAttachment(descriptor, event)).rejects.toThrow(/aborted/i);
+    expect(cdnCalls.length).toBe(cdnCountBefore + 1);
+    expect(restRoutes.filter((r) => r.startsWith("/channels/"))).toHaveLength(0);
+
+    // 3. Explicit start() after stop() creates a fresh non-aborted signal that downloads normally.
+    mode = "fresh-after-restart";
+    await adapter.start();
+    const downloaded = await adapter.downloadAttachment(descriptor, event);
+    expect(downloaded.content.toString("utf8")).toBe("restarted-ok");
+    await adapter.stop();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -1428,6 +2215,72 @@ describe("Discord outbound", () => {
     expect(table).toContain("```");
     expect(sanitizeDiscordThreadName("  # Hello world  \nsecond", "m1")).toBe("Hello world");
     expect(sanitizeDiscordThreadName("", "m123")).toBe("Thread m123");
+  });
+
+  it("splits initial chunks on grapheme boundaries across combining marks, ZWJ/skin-tone/flag emoji, code fences, and overlong single graphemes", () => {
+    // 1. "a".repeat(1999) + "e\u0301" (2001 UTF-16 code units): must not split 'e' from combining acute accent '\u0301'.
+    const combiningText = "a".repeat(1999) + "e\u0301";
+    const combiningChunks = chunkDiscordText(combiningText);
+    expect(combiningChunks).toEqual(["a".repeat(1999), "e\u0301"]);
+
+    // 2. ZWJ family emoji, skin-tone modifier, regional indicator flag, and Chinese + combining mark straddling 2000-char boundary.
+    const zwj = "👨‍👩‍👧‍👦"; // 11 UTF-16 code units
+    const skinTone = "👍🏽"; // 4 UTF-16 code units
+    const flag = "🇺🇸"; // 4 UTF-16 code units
+    for (const cluster of [zwj, skinTone, flag, "中\u0301"]) {
+      const prefixLen = 1999;
+      const input = "x".repeat(prefixLen) + cluster + "尾部中文";
+      const out = chunkDiscordText(input);
+      expect(out).toHaveLength(2);
+      expect(out[0]).toBe("x".repeat(prefixLen));
+      expect(out[1]).toBe(cluster + "尾部中文");
+      for (const c of out) expect(c.length).toBeLessThanOrEqual(2000);
+    }
+
+    // 3. Inside fenced code blocks: grapheme clusters straddling the fenced line step must not be split, and fences stay balanced.
+    for (const cluster of [zwj, skinTone, flag, "e\u0301"]) {
+      // Opening "```txt\n" is 7 chars, closing "\n```" is 4 chars -> step is 1989 chars.
+      // Prefix of 1988 chars puts `cluster` right across the 1989-char step boundary.
+      const fencedInput = "```txt\n" + "b".repeat(1988) + cluster + "end\n```";
+      const fencedChunks = chunkDiscordText(fencedInput);
+      expect(fencedChunks).toHaveLength(2);
+      for (const c of fencedChunks) {
+        expect(c.length).toBeLessThanOrEqual(2000);
+        expect((c.match(/```/g) ?? []).length % 2).toBe(0);
+      }
+      expect(fencedChunks[0]).toBe("```txt\n" + "b".repeat(1988) + "\n```");
+      expect(fencedChunks[1]).toBe("```txt\n" + cluster + "end\n```");
+    }
+
+    // 4. Single grapheme cluster larger than the limit must make forward progress without infinite loops or lone surrogates.
+    const giantCombiningGrapheme = "e" + "\u0301".repeat(2500);
+    const giantChunks = chunkDiscordText(giantCombiningGrapheme);
+    expect(giantChunks.length).toBe(2);
+    for (const c of giantChunks) {
+      expect(c.length).toBeGreaterThan(0);
+      expect(c.length).toBeLessThanOrEqual(2000);
+    }
+    expect(giantChunks.join("")).toBe(giantCombiningGrapheme);
+
+    const smallLimitZwj = chunkDiscordText(zwj, { maxChars: 5 });
+    expect(smallLimitZwj.length).toBeGreaterThan(1);
+    for (const c of smallLimitZwj) {
+      expect(c.length).toBeGreaterThan(0);
+      expect(c.length).toBeLessThanOrEqual(5);
+      // Verify no lone surrogates were created when splitting the overlong grapheme.
+      for (let i = 0; i < c.length; i++) {
+        const code = c.charCodeAt(i);
+        if (code >= 0xd800 && code <= 0xdbff) {
+          const next = c.charCodeAt(i + 1);
+          expect(next).toBeGreaterThanOrEqual(0xdc00);
+          expect(next).toBeLessThanOrEqual(0xdfff);
+          i += 1;
+        } else {
+          expect(code < 0xdc00 || code > 0xdfff).toBe(true);
+        }
+      }
+    }
+    expect(smallLimitZwj.join("")).toBe(zwj);
   });
 
   it("resolves DM channels first, then sends; newThread address stays consistent for later chunks", async () => {
@@ -1535,5 +2388,433 @@ describe("Discord outbound", () => {
       ...env, DALTON_DISCORD_BOT_TOKEN: "",
     } as NodeJS.ProcessEnv));
     expect(noToken.has("discord")).toBe(false);
+  });
+
+  it("delivers current-conversation text and files to the Discord thread channel via I-6 claim, skips fallback after current send, preserves explicit non-current targets, and recovers thread scope across background/watch and retry claims", async () => {
+    const OTHER_CHANNEL_ID = "700000099";
+    const DALTON_USER_ID = "11111111-1111-4111-8111-111111111111";
+    const TURN_THREAD_ID = "33333333-3333-4333-8333-333333333333";
+    const TURN_RUN_ID = "44444444-4444-4444-8444-444444444444";
+    const BG_RUN_ID = "55555555-5555-4555-8555-555555555555";
+    const EXPECTED_SCOPE_KEY = `chat:${GUILD_ID}/${CHANNEL_ID}:thread:${THREAD_ID}`;
+
+    const backend = createMockBackend();
+    const baseResolveImpl = vi.mocked(backend.registerAndResolveInbound).getMockImplementation()!;
+    vi.spyOn(backend, "registerAndResolveInbound").mockImplementation(async (req) => {
+      const base = await baseResolveImpl(req);
+      return {
+        ...base,
+        dalton_user_id: DALTON_USER_ID,
+        thread_id: null,
+        workspace_id: HOME_WS_ID,
+      };
+    });
+    vi.spyOn(backend, "downloadWorkspaceFile").mockResolvedValue({
+      content: Buffer.from("chart-png-bytes"),
+      mimeType: "image/png",
+    });
+
+    let releaseTurnSse!: () => void;
+    const turnSseGate = new Promise<void>((r) => { releaseTurnSse = r; });
+    let resolveTurnDispatched!: () => void;
+    const turnDispatched = new Promise<void>((r) => { resolveTurnDispatched = r; });
+
+    vi.spyOn(backend, "createThreadMessages").mockImplementation(async () => {
+      resolveTurnDispatched();
+      async function* gatedEvents() {
+        yield {
+          event: "metadata",
+          data: JSON.stringify({
+            thread_id: TURN_THREAD_ID,
+            run_id: TURN_RUN_ID,
+            turn_index: 0,
+          }),
+        };
+        await turnSseGate;
+        yield {
+          event: "message_chunk",
+          data: JSON.stringify({
+            agent: "main",
+            role: "assistant",
+            content_type: "text",
+            content: "Final assistant text that should be skipped because agent/send already sent to current thread.",
+          }),
+        };
+        yield {
+          event: "run_end",
+          data: JSON.stringify({
+            thread_id: TURN_THREAD_ID,
+            run_id: TURN_RUN_ID,
+            turn_index: 0,
+            status: "completed",
+          }),
+        };
+      }
+      return { status: 200, isSse: true, events: gatedEvents() };
+    });
+
+    let failNextThreadPostWith400 = false;
+    const sentMessages: Array<{ route: string; isMultipart: boolean; bodyText: string }> = [];
+
+    const { rest, calls } = makeRest(async (call) => {
+      const route = routeOf(call.url);
+      if (route === `/channels/${THREAD_ID}` && call.init.method === "GET") {
+        return jsonResponse({
+          id: THREAD_ID,
+          type: 11,
+          guild_id: GUILD_ID,
+          parent_id: CHANNEL_ID,
+          name: "earnings-thread",
+          thread_metadata: { archived: false },
+        });
+      }
+      if (route === `/channels/${CHANNEL_ID}` && call.init.method === "GET") {
+        return jsonResponse({ id: CHANNEL_ID, type: 0, guild_id: GUILD_ID, name: "equities" });
+      }
+      if (route === `/channels/${OTHER_CHANNEL_ID}` && call.init.method === "GET") {
+        return jsonResponse({ id: OTHER_CHANNEL_ID, type: 0, guild_id: GUILD_ID, name: "alerts" });
+      }
+      if (route.endsWith("/messages") && call.init.method === "POST") {
+        if (route === `/channels/${THREAD_ID}/messages` && failNextThreadPostWith400) {
+          failNextThreadPostWith400 = false;
+          return jsonResponse({ code: 50035, message: "Invalid Form Body" }, 400);
+        }
+        const isMultipart = call.init.body instanceof FormData;
+        const bodyText = isMultipart
+          ? String((call.init.body as FormData).get("payload_json") ?? "")
+          : String(call.init.body ?? "");
+        sentMessages.push({ route, isMultipart, bodyText });
+        return jsonResponse({ id: `discord-msg-${sentMessages.length}` });
+      }
+      throw new Error(`unexpected ${call.init.method} ${route}`);
+    });
+    const describeRest = (items: typeof calls) =>
+      items.map((call) => ({
+        method: String(call.init.method ?? "GET").toUpperCase(),
+        route: routeOf(call.url),
+      }));
+    const isParentChannelRoute = (route: string) =>
+      route === `/channels/${CHANNEL_ID}` || route.startsWith(`/channels/${CHANNEL_ID}/`);
+    const messagePostRoutes = (items: Array<{ method: string; route: string }>) =>
+      items
+        .filter((call) => call.method === "POST" && call.route.endsWith("/messages"))
+        .map((call) => call.route);
+
+    const adapter = new DiscordChannelAdapter({ botToken: "t", botUserId: BOT_ID, rest });
+    vi.spyOn(adapter, "start").mockResolvedValue(undefined);
+    vi.spyOn(adapter, "isConnected").mockReturnValue(true);
+
+    const app = createGatewayApp({
+      config: loadConfig({
+        GATEWAY_HOST: "127.0.0.1",
+        GATEWAY_PORT: "0",
+        INTERNAL_SERVICE_TOKEN: TEST_SERVICE_TOKEN,
+        DALTON_BACKEND_URL: "http://127.0.0.1:8000",
+        WEB_BASE_URL: "https://app.dalton.test",
+        DALTON_WEIXIN_CACHE_DIR: "/tmp/dalton-wx-discord-thread-test",
+        DALTON_DISCORD_ENABLED: "true",
+        DALTON_DISCORD_BOT_TOKEN: "t",
+        DALTON_DISCORD_APPLICATION_ID: BOT_ID,
+      }),
+      backend,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["discord", adapter]]),
+    });
+
+    try {
+      const { host, port } = await app.start();
+      const postAgentSend = async (payload: Record<string, unknown>) => {
+        const res = await fetchGatewayServer(app, `http://${host}:${port}/agent/send`, {
+          method: "POST",
+          headers: {
+            "X-Service-Token": TEST_SERVICE_TOKEN,
+            "X-User-Id": DALTON_USER_ID,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(payload),
+        });
+        return { statusCode: res.status, body: (await res.json()) as Record<string, unknown> };
+      };
+
+      // 1. User mentions the bot inside a Discord guild thread (channel_id = THREAD_ID, parent_id = CHANNEL_ID).
+      const inboundPromise = adapter.dispatchMessage({
+        id: "msg-in-thread-1",
+        channel_id: THREAD_ID,
+        guild_id: GUILD_ID,
+        content: `<@${BOT_ID}> analyze Q4 margins and send the chart`,
+        author: { id: USER_ID, username: "alice", global_name: "Alice" },
+        mentions: [{ id: BOT_ID, username: "DaltonBot" }],
+        thread: { id: THREAD_ID, type: 11, guild_id: GUILD_ID, parent_id: CHANNEL_ID, name: "earnings-thread" },
+        attachments: [],
+      } as never);
+
+      await turnDispatched;
+      // Wait for metadata SSE event to be processed into I-7 updateInboundProgress (`status: "streaming"`)
+      await vi.waitFor(() => {
+        expect(
+          backend.progressUpdates.some(
+            (u) => u.message_id === "msg-in-thread-1" && u.run_id === TURN_RUN_ID,
+          ),
+        ).toBe(true);
+      });
+      expect(backend.registerAndResolveInbound).toHaveBeenCalledWith(
+        expect.objectContaining({
+          platform: "discord",
+          chat_address: `discord:${GUILD_ID}/${CHANNEL_ID}`,
+          thread_scope_key: EXPECTED_SCOPE_KEY,
+          message_id: "msg-in-thread-1",
+        }),
+      );
+
+      // 2. Agent calls POST /agent/send with omitted `target` (current conversation) for both text and a file.
+      const currentSendRes = await postAgentSend({
+        thread_id: TURN_THREAD_ID,
+        run_id: TURN_RUN_ID,
+        tool_call_id: "tc-thread-current-1",
+        turn_platform: "discord",
+        text: "Q4 gross margin expanded 180 bps.",
+        files: [{ workspace_id: HOME_WS_ID, path: "reports/q4-margins.png" }],
+      });
+      expect(currentSendRes.statusCode).toBe(200);
+      expect(currentSendRes.body).toEqual({
+        status: "sent",
+        code: null,
+        address: `discord:${GUILD_ID}/${CHANNEL_ID}`,
+        current: true,
+        duplicate: false,
+        message: `Delivered to discord:${GUILD_ID}/${CHANNEL_ID}.`,
+        files: [{ path: "reports/q4-margins.png", status: "sent", reason: null }],
+      });
+
+      // The API address is the parent channel. thread_scope_key still selects the
+      // thread for both the text POST and the multipart file POST.
+      expect(sentMessages).toHaveLength(2);
+      expect(sentMessages[0]!.route).toBe(`/channels/${THREAD_ID}/messages`);
+      expect(sentMessages[0]!.isMultipart).toBe(false);
+      expect(sentMessages[0]!.bodyText).toContain("Q4 gross margin expanded 180 bps.");
+      expect(sentMessages[1]!.route).toBe(`/channels/${THREAD_ID}/messages`);
+      expect(sentMessages[1]!.isMultipart).toBe(true);
+      expect(sentMessages[1]!.bodyText).toContain("q4-margins.png");
+      expect(sentMessages.some((m) => m.route === `/channels/${CHANNEL_ID}/messages`)).toBe(false);
+      const currentRoutes = describeRest(calls);
+      expect(messagePostRoutes(currentRoutes)).toEqual([
+        `/channels/${THREAD_ID}/messages`,
+        `/channels/${THREAD_ID}/messages`,
+      ]);
+      expect(currentRoutes.some((call) => isParentChannelRoute(call.route))).toBe(false);
+      expect(
+        currentRoutes.some((call) => call.method === "GET" && call.route === `/channels/${THREAD_ID}`),
+      ).toBe(true);
+
+      // 3. Complete the turn SSE stream: because current conversation already received text, fallback must be skipped.
+      releaseTurnSse();
+      await inboundPromise;
+      await vi.waitFor(() => {
+        expect(
+          backend.progressUpdates.some(
+            (u) => u.message_id === "msg-in-thread-1" && u.status === "completed",
+          ),
+        ).toBe(true);
+      });
+      expect(sentMessages).toHaveLength(2);
+      expect(sentMessages.some((m) => m.route === `/channels/${CHANNEL_ID}/messages`)).toBe(false);
+      const restCountBeforeExplicit = calls.length;
+
+      // 4. Explicit `target` to another channel must deliver to that channel with `current: false` and not to THREAD_ID.
+      const explicitOtherRes = await postAgentSend({
+        thread_id: TURN_THREAD_ID,
+        run_id: TURN_RUN_ID,
+        tool_call_id: "tc-explicit-other-1",
+        turn_platform: "discord",
+        target: `discord:${GUILD_ID}/${OTHER_CHANNEL_ID}`,
+        text: "Cross-channel alert",
+      });
+      expect(explicitOtherRes.statusCode).toBe(200);
+      expect(explicitOtherRes.body).toMatchObject({
+        status: "sent",
+        address: `discord:${GUILD_ID}/${OTHER_CHANNEL_ID}`,
+        current: false,
+      });
+      expect(sentMessages).toHaveLength(3);
+      expect(sentMessages[2]!.route).toBe(`/channels/${OTHER_CHANNEL_ID}/messages`);
+      const explicitRoutes = describeRest(calls.slice(restCountBeforeExplicit));
+      expect(messagePostRoutes(explicitRoutes)).toEqual([
+        `/channels/${OTHER_CHANNEL_ID}/messages`,
+      ]);
+      expect(explicitRoutes.some((call) => call.route.includes(THREAD_ID))).toBe(false);
+      expect(explicitRoutes.some((call) => isParentChannelRoute(call.route))).toBe(false);
+      const restCountBeforeRetry = calls.length;
+
+      // 5. Retry claim after a failed delivery (HTTP 400) preserves thread_scope_key and delivers to THREAD_ID.
+      failNextThreadPostWith400 = true;
+      const failedAttemptRes = await postAgentSend({
+        thread_id: TURN_THREAD_ID,
+        run_id: TURN_RUN_ID,
+        tool_call_id: "tc-thread-retry-1",
+        turn_platform: "discord",
+        text: "Retryable thread reply",
+      });
+      expect(failedAttemptRes.body).toMatchObject({ status: "failed" });
+      expect(sentMessages).toHaveLength(3);
+
+      const retriedAttemptRes = await postAgentSend({
+        thread_id: TURN_THREAD_ID,
+        run_id: TURN_RUN_ID,
+        tool_call_id: "tc-thread-retry-1",
+        turn_platform: "discord",
+        text: "Retryable thread reply",
+      });
+      expect(retriedAttemptRes.body).toMatchObject({
+        status: "sent",
+        address: `discord:${GUILD_ID}/${CHANNEL_ID}`,
+        current: true,
+        message: `Delivered to discord:${GUILD_ID}/${CHANNEL_ID}.`,
+      });
+      expect(sentMessages).toHaveLength(4);
+      expect(sentMessages[3]!.route).toBe(`/channels/${THREAD_ID}/messages`);
+      const retryRoutes = describeRest(calls.slice(restCountBeforeRetry));
+      expect(messagePostRoutes(retryRoutes)).toEqual([
+        `/channels/${THREAD_ID}/messages`,
+        `/channels/${THREAD_ID}/messages`,
+      ]);
+      expect(retryRoutes.some((call) => isParentChannelRoute(call.route))).toBe(false);
+      expect(retryRoutes.some((call) => call.route.includes(OTHER_CHANNEL_ID))).toBe(false);
+
+      // 6. Background run / watch recovery preserves `thread_scope_key` and delivers replay fallback to THREAD_ID.
+      await backend.updateInboundProgress({
+        thread_watch: {
+          thread_id: TURN_THREAD_ID,
+          dalton_user_id: DALTON_USER_ID,
+          platform: "discord",
+          target_address: `discord:${GUILD_ID}/${CHANNEL_ID}`,
+          scope_key: EXPECTED_SCOPE_KEY,
+          generation: 0,
+          last_seen_turn_index: 0,
+          watch_active: true,
+        },
+        background_run: {
+          run_id: BG_RUN_ID,
+          thread_id: TURN_THREAD_ID,
+          dalton_user_id: DALTON_USER_ID,
+          platform: "discord",
+          target_address: `discord:${GUILD_ID}/${CHANNEL_ID}`,
+          turn_index: 1,
+          status: "completed",
+          fallback_pending: true,
+        },
+      });
+      // Recovery asks replay for this background run at turn 1. The mock's
+      // default page is a settled turn for a different run, so prepare this
+      // run's own completed page and a matching idle status.
+      const recoveredText = "Recovered background thread analysis.";
+      vi.spyOn(backend, "replayThreadMessages").mockResolvedValue({
+        status: 200,
+        isSse: true,
+        events: makeSseEventsFromFixture([
+          {
+            event: "history_page",
+            data: { first_turn_index: 1, has_more: false },
+          },
+          {
+            event: "user_message",
+            data: {
+              thread_id: TURN_THREAD_ID,
+              turn_index: 1,
+              content: "Background turn prompt",
+              run_id: BG_RUN_ID,
+              run_completed_at: "2026-11-08T00:00:01+00:00",
+            },
+          },
+          {
+            event: "message_chunk",
+            data: {
+              thread_id: TURN_THREAD_ID,
+              agent: "main",
+              role: "assistant",
+              content: recoveredText,
+              content_type: "text",
+              finish_reason: "stop",
+              turn_index: 1,
+              response_id: BG_RUN_ID,
+            },
+          },
+          {
+            event: "replay_done",
+            data: {
+              thread_id: TURN_THREAD_ID,
+              latest_run_id: BG_RUN_ID,
+              latest_turn_index: 1,
+              oldest_turn_index: 1,
+              has_more: false,
+            },
+          },
+        ]),
+      });
+      const baseGetThreadStatus = vi.mocked(backend.getThreadStatus).getMockImplementation()!;
+      vi.spyOn(backend, "getThreadStatus").mockImplementation(async (userId, threadId) => {
+        const base = await baseGetThreadStatus(userId, threadId);
+        if (threadId !== TURN_THREAD_ID) return base;
+        return {
+          ...base,
+          run_id: BG_RUN_ID,
+          status: "idle",
+          latest_turn_index: 1,
+          turn_index: 1,
+          pending_report_back: false,
+        };
+      });
+      vi.spyOn(backend, "recoverState").mockResolvedValueOnce({
+        mode: "startup",
+        inbound_events: [],
+        background_runs: [
+          {
+            run_id: BG_RUN_ID,
+            thread_id: TURN_THREAD_ID,
+            dalton_user_id: DALTON_USER_ID,
+            platform: "discord",
+            target_address: `discord:${GUILD_ID}/${CHANNEL_ID}`,
+            scope_key: EXPECTED_SCOPE_KEY,
+            thread_scope_key: EXPECTED_SCOPE_KEY,
+            turn_index: 1,
+            status: "completed",
+            fallback_pending: true,
+            sent_to_current_count: 0,
+          },
+        ],
+        thread_watches: [
+          {
+            thread_id: TURN_THREAD_ID,
+            dalton_user_id: DALTON_USER_ID,
+            platform: "discord",
+            target_address: `discord:${GUILD_ID}/${CHANNEL_ID}`,
+            scope_key: EXPECTED_SCOPE_KEY,
+            thread_scope_key: EXPECTED_SCOPE_KEY,
+            generation: 0,
+            last_seen_turn_index: 1,
+            watch_active: false,
+          },
+        ],
+        automation_runs: [],
+      });
+
+      await app.orchestrator.runStartupRecovery();
+      expect(sentMessages).toHaveLength(5);
+      expect(sentMessages[4]!.route).toBe(`/channels/${THREAD_ID}/messages`);
+      expect(sentMessages[4]!.bodyText).toContain(recoveredText);
+      expect(sentMessages.some((m) => m.route === `/channels/${CHANNEL_ID}/messages`)).toBe(false);
+      expect(messagePostRoutes(describeRest(calls))).toEqual([
+        `/channels/${THREAD_ID}/messages`,
+        `/channels/${THREAD_ID}/messages`,
+        `/channels/${OTHER_CHANNEL_ID}/messages`,
+        `/channels/${THREAD_ID}/messages`,
+        `/channels/${THREAD_ID}/messages`,
+        `/channels/${THREAD_ID}/messages`,
+      ]);
+      expect(describeRest(calls).some((call) => isParentChannelRoute(call.route))).toBe(false);
+    } finally {
+      // Let the inbound turn stream this test is holding finish, then stop.
+      releaseTurnSse();
+      resolveTurnDispatched();
+      await app.stop();
+    }
   });
 });

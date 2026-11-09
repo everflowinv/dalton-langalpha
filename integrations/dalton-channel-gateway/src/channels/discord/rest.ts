@@ -96,6 +96,27 @@ export class RateLimitError extends DiscordError {
   }
 }
 
+export type DiscordQueueErrorReason =
+  | "queue_full"
+  | "queue_cleared"
+  | "queue_aborted"
+  | "queue_stale";
+
+/**
+ * Raised when a request is rejected by the local scheduler before any HTTP
+ * request is dispatched to Discord. Because the payload never left the gateway,
+ * message creates are confirmed `failed` rather than `unknown`.
+ */
+export class DiscordQueueError extends Error {
+  readonly reason: DiscordQueueErrorReason;
+  readonly dispatched = false as const;
+  constructor(reason: DiscordQueueErrorReason, message: string) {
+    super(redactCredentialString(message));
+    this.name = "DiscordQueueError";
+    this.reason = reason;
+  }
+}
+
 function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
@@ -186,6 +207,7 @@ const MAX_CONCURRENT_WORKERS = 4;
 const BACKGROUND_STALE_MS = 20_000;
 
 export interface RestSchedulerOptions {
+  maxQueueSize?: number;
   now?: () => number;
   setTimeoutFn?: (fn: () => void, ms: number) => ReturnType<typeof setTimeout>;
   clearTimeoutFn?: (t: ReturnType<typeof setTimeout>) => void;
@@ -203,6 +225,7 @@ export class RestScheduler {
   private laneCursor = 0;
   private queueGeneration = 0;
   private drainTimer: ReturnType<typeof setTimeout> | undefined;
+  private readonly maxQueueSize: number;
   private readonly now: () => number;
   private readonly setTimeoutFn: NonNullable<RestSchedulerOptions["setTimeoutFn"]>;
   private readonly clearTimeoutFn: NonNullable<RestSchedulerOptions["clearTimeoutFn"]>;
@@ -211,6 +234,7 @@ export class RestScheduler {
     private readonly executor: (req: QueuedRequest) => Promise<unknown>,
     options: RestSchedulerOptions = {},
   ) {
+    this.maxQueueSize = options.maxQueueSize ?? MAX_QUEUE_SIZE;
     this.now = options.now ?? Date.now;
     this.setTimeoutFn = options.setTimeoutFn ?? ((fn, ms) => setTimeout(fn, ms));
     this.clearTimeoutFn = options.clearTimeoutFn ?? ((t) => clearTimeout(t));
@@ -222,7 +246,9 @@ export class RestScheduler {
     method: string; path: string; priority?: DiscordRequestPriority;
     data?: unknown; query?: DiscordRequestOptions["query"]; idempotent?: boolean;
   }): Promise<unknown> {
-    if (this.queuedRequests >= MAX_QUEUE_SIZE) throw new Error("Discord request queue is full");
+    if (this.queuedRequests >= this.maxQueueSize) {
+      return Promise.reject(new DiscordQueueError("queue_full", "Discord request queue is full"));
+    }
     const routeKey = createRouteKey(params.method, params.path);
     const bucket = this.getBucket(this.routeBuckets.get(routeKey) ?? routeKey);
     const priority = params.priority ?? (params.method.toUpperCase() === "GET" ? "background" : "standard");
@@ -242,12 +268,12 @@ export class RestScheduler {
   clearQueue(): void {
     this.queueGeneration += 1;
     if (this.drainTimer) { this.clearTimeoutFn(this.drainTimer); this.drainTimer = undefined; }
-    this.rejectPending(new Error("Discord request queue cleared"));
+    this.rejectPending(new DiscordQueueError("queue_cleared", "Discord request queue cleared"));
   }
 
   abortPending(): void {
     this.queueGeneration += 1;
-    this.rejectPending(new DOMException("Aborted", "AbortError"));
+    this.rejectPending(new DiscordQueueError("queue_aborted", "Discord request aborted before dispatch"));
   }
 
   private rejectPending(error: unknown): void {
@@ -352,7 +378,12 @@ export class RestScheduler {
             const stale = queue.shift()!;
             this.queuedRequests = Math.max(0, this.queuedRequests - 1);
             this.queuedByLane[lane] = Math.max(0, this.queuedByLane[lane] - 1);
-            stale.reject(new Error(`Dropped stale background request after ${now - stale.enqueuedAt}ms`));
+            stale.reject(
+              new DiscordQueueError(
+                "queue_stale",
+                `Dropped stale background request after ${now - stale.enqueuedAt}ms`,
+              ),
+            );
           }
         }
         if (queue.length === 0 || bucket.active > 0) continue;
@@ -538,6 +569,12 @@ export function classifyDiscordDeliveryError(
   if (err instanceof ChannelDeliveryError) return err;
   const prefix = options.message ?? "Discord message send failed";
   const stage = options.stage ?? "send";
+  if (err instanceof DiscordQueueError) {
+    return new ChannelDeliveryError(`${prefix}: ${err.message}`, {
+      outcome: "failed",
+      code: "unavailable",
+    });
+  }
   if (err instanceof RateLimitError) {
     return new ChannelDeliveryError(`${prefix}: rate limited`, { outcome: "rate_limited", code: "rate_limited" });
   }
@@ -559,11 +596,8 @@ export function classifyDiscordDeliveryError(
     return new ChannelDeliveryError(`${prefix}: ${err.message}`, { outcome: "failed", code: "unavailable" });
   }
   const message = err instanceof Error ? err.message : String(err);
-  const isTimeout =
-    (err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError")) ||
-    /timeout|timed out|socket|econnreset|fetch failed|network/i.test(message);
   return new ChannelDeliveryError(`${prefix}: ${redactCredentialString(message)}`, {
-    outcome: stage === "send" && isTimeout ? "unknown" : stage === "send" ? "unknown" : "failed",
+    outcome: stage === "send" ? "unknown" : "failed",
     code: "unavailable",
   });
 }

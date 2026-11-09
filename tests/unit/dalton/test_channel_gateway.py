@@ -625,19 +625,19 @@ class InMemoryChannelStore:
             if "WHERE thread_id = %s" in norm:
                 tid = str(params[0])
                 r = self.thread_watches.get(tid)
-                return [dict(r)] if r else []
+                return [{**r, "thread_scope_key": r.get("scope_key")}] if r else []
             if "WHERE (%s::uuid IS NULL AND watch_active = TRUE) OR thread_id = %s" in norm:
                 tid = str(params[0]) if params[0] else None
                 if tid:
                     r = self.thread_watches.get(tid)
-                    return [dict(r)] if r else []
+                    return [{**r, "thread_scope_key": r.get("scope_key")}] if r else []
                 return [
-                    dict(r)
+                    {**r, "thread_scope_key": r.get("scope_key")}
                     for r in self.thread_watches.values()
                     if r.get("watch_active")
                 ]
             return [
-                dict(r)
+                {**r, "thread_scope_key": r.get("scope_key")}
                 for r in self.thread_watches.values()
                 if r.get("watch_active")
             ]
@@ -712,6 +712,36 @@ class InMemoryChannelStore:
                     for r in self.background_runs.values()
                     if r.get("fallback_pending")
                 ]
+            if "WHERE" in norm:
+                p_idx = 0
+                uid_filter = None
+                rid_filter = None
+                tid_filter = None
+                if "dalton_user_id = %s" in norm:
+                    uid_filter = str(params[p_idx]) if params[p_idx] is not None else None
+                    p_idx += 1
+                if "%s::text IS NULL OR run_id = %s" in norm:
+                    rid_filter = str(params[p_idx]) if params[p_idx] is not None else None
+                    p_idx += 2
+                elif "run_id = %s" in norm:
+                    rid_filter = str(params[p_idx]) if params[p_idx] is not None else None
+                    p_idx += 1
+                if "%s::uuid IS NULL OR thread_id = %s" in norm:
+                    tid_filter = str(params[p_idx]) if params[p_idx] is not None else None
+                    p_idx += 2
+                elif "thread_id = %s" in norm:
+                    tid_filter = str(params[p_idx]) if params[p_idx] is not None else None
+                    p_idx += 1
+                matched = []
+                for r in reversed(list(self.background_runs.values())):
+                    if uid_filter and str(r.get("dalton_user_id")) != uid_filter:
+                        continue
+                    if rid_filter and str(r.get("run_id")) != rid_filter:
+                        continue
+                    if tid_filter and str(r.get("thread_id")) != tid_filter:
+                        continue
+                    matched.append(dict(r))
+                return matched[:1] if "LIMIT 1" in norm else matched
             return [dict(r) for r in self.background_runs.values()]
 
         # Deliveries
@@ -832,22 +862,54 @@ class InMemoryChannelStore:
             ]
             return [{"cnt": max(counts) if counts else 0}]
 
+        if "SELECT thread_scope_key FROM dalton_channel_inbound_events WHERE thread_id = %s" in norm:
+            tid = str(params[0])
+            for r in reversed(list(self.inbound_events.values())):
+                if str(r.get("thread_id") or "") == tid:
+                    return [{"thread_scope_key": r.get("thread_scope_key")}]
+            return []
+
         if "FROM dalton_channel_inbound_events WHERE dalton_user_id = %s" in norm or (
             "SELECT dalton_user_id, platform, chat_address AS target_address" in norm
         ):
+            p_idx = 0
+            uid_filter = None
+            rid_filter = None
+            tid_filter = None
+            if "dalton_user_id = %s" in norm:
+                uid_filter = str(params[p_idx]) if params[p_idx] is not None else None
+                p_idx += 1
+            if "%s::text IS NULL OR run_id = %s" in norm:
+                rid_filter = str(params[p_idx]) if params[p_idx] is not None else None
+                p_idx += 2
+            elif "run_id = %s" in norm:
+                rid_filter = str(params[p_idx]) if params[p_idx] is not None else None
+                p_idx += 1
+            if "%s::uuid IS NULL OR thread_id = %s" in norm:
+                tid_filter = str(params[p_idx]) if params[p_idx] is not None else None
+                p_idx += 2
+            elif "thread_id = %s" in norm:
+                tid_filter = str(params[p_idx]) if params[p_idx] is not None else None
+                p_idx += 1
             for r in reversed(list(self.inbound_events.values())):
-                if r.get("run_id") and r.get("run_id") in params:
-                    return [
-                        {
-                            "dalton_user_id": r["dalton_user_id"],
-                            "platform": r["platform"],
-                            "target_address": r["chat_address"],
-                            "chat_address": r["chat_address"],
-                            "thread_id": r.get("thread_id"),
-                            "run_id": r.get("run_id"),
-                            "external_thread_id": r.get("external_thread_id"),
-                        }
-                    ]
+                if uid_filter and str(r.get("dalton_user_id") or "") != uid_filter:
+                    continue
+                if rid_filter and str(r.get("run_id") or "") != rid_filter:
+                    continue
+                if tid_filter and str(r.get("thread_id") or "") != tid_filter:
+                    continue
+                return [
+                    {
+                        "dalton_user_id": r["dalton_user_id"],
+                        "platform": r["platform"],
+                        "target_address": r["chat_address"],
+                        "chat_address": r["chat_address"],
+                        "thread_scope_key": r.get("thread_scope_key"),
+                        "thread_id": r.get("thread_id"),
+                        "run_id": r.get("run_id"),
+                        "external_thread_id": r.get("external_thread_id"),
+                    }
+                ]
             return []
 
         if "SELECT * FROM dalton_channel_inbound_events WHERE status IN" in norm:
@@ -3256,4 +3318,466 @@ async def test_round6_tx_retry_helper_and_unbind_lock_order_unit(
     assert settings_lock_idx < identity_delete_idx
 
 
+def test_discord_thread_current_conversation_delivery_claim_and_recovery(
+    channel_test_env: dict[str, Any],
+) -> None:
+    """Verify I-1 -> I-4 -> I-6 -> I-7 recovers and returns `thread_scope_key`
+    across inbound events, background runs, and thread watches, retry claims after
+    `failed`, duplicate claims (`already_completed` / `in_flight_or_unknown`), and
+    explicit `target` rules without altering unauthorized targets or DM/Feishu behavior.
+    """
+    client: TestClient = channel_test_env["client"]
+    store: InMemoryChannelStore = channel_test_env["store"]
+    writable: dict[str, dict[str, str]] = channel_test_env["writable_by_user"]
+    headers = channel_test_env["headers"]
 
+    ws_id = str(uuid4())
+    writable["u-alice"] = {ws_id: "Equities Research"}
+    store.workspaces[ws_id] = {
+        "workspace_id": UUID(ws_id),
+        "user_id": "u-alice",
+        "name": "Equities Research",
+        "status": "running",
+        "is_default": False,
+    }
+
+    # Link Discord identity for u-alice
+    code_res = client.post(
+        "/api/v1/dalton/channels/bind-codes", json={"platform": "discord"}
+    )
+    assert code_res.status_code == 200
+    bind_res = client.post(
+        "/api/v1/dalton/channels/internal/bind-code/consume",
+        headers=headers,
+        json={
+            "action": "bind",
+            "platform": "discord",
+            "platform_user_id": "dc_alice_1",
+            "platform_username": "alice",
+            "code": code_res.json()["code"],
+            "is_group": False,
+        },
+    )
+    assert bind_res.status_code == 200
+    assert bind_res.json()["ok"] is True
+
+    parent_addr = "discord:700000001/700000002"
+    other_allowed_addr = "discord:700000001/700000099"
+    unauthorized_addr = "discord:700000001/700000888"
+    thread_scope_key = "chat:700000001/700000002:thread:700000003"
+    watch_only_scope_key = "chat:700000001/700000002:thread:700000004"
+
+    # Bind parent_addr and other_allowed_addr to workspace and enable in agent_messages.allowed.
+    # I-3 is /internal/session/command. An internal user must already have an inbound
+    # membership row on each group address before settings can change that group.
+    for addr, cname in ((parent_addr, "equities"), (other_allowed_addr, "alerts")):
+        sw_res = client.post(
+            "/api/v1/dalton/channels/internal/session/command",
+            headers=headers,
+            json={
+                "cmd": "workspace_switch",
+                "platform": "discord",
+                "dalton_user_id": "u-alice",
+                "chat_type": "group",
+                "chat_address": addr,
+                "chat_name": cname,
+                "scope_key": f"chat:{addr.split(':', 1)[1]}",
+                "workspace_id": ws_id,
+            },
+        )
+        assert sw_res.status_code == 200
+        assert sw_res.json()["ok"] is True
+
+    for addr, mid in (
+        (parent_addr, "msg-member-equities"),
+        (other_allowed_addr, "msg-member-alerts"),
+    ):
+        member_res = client.post(
+            "/api/v1/dalton/channels/internal/inbound/register-and-resolve",
+            headers=headers,
+            json={
+                "platform": "discord",
+                "platform_user_id": "dc_alice_1",
+                "chat_type": "group",
+                "chat_address": addr,
+                "thread_scope_key": f"chat:{addr.split(':', 1)[1]}",
+                "message_id": mid,
+                "raw_payload": {"platform_user_id": "dc_alice_1"},
+            },
+        )
+        assert member_res.status_code == 200
+        assert member_res.json()["allowed"] is True
+
+    put_settings_res = client.put(
+        "/api/v1/dalton/channels/internal/settings",
+        headers=headers,
+        json={
+            "user_id": "u-alice",
+            "version": "v1",
+            "settings": {
+                "discord": {
+                    "preferred": "discord:@me",
+                    "chats": {
+                        parent_addr: {"name": "equities", "workspace_id": ws_id},
+                        other_allowed_addr: {"name": "alerts", "workspace_id": ws_id},
+                    },
+                    "automation_output": {},
+                    "agent_messages": {
+                        "enabled": True,
+                        "allowed": [parent_addr, other_allowed_addr],
+                    },
+                }
+            },
+        },
+    )
+    assert put_settings_res.status_code == 200, put_settings_res.text
+
+    # 1. Register inbound message in Discord guild thread (I-1)
+    turn_tid = str(uuid4())
+    turn_rid = "run-discord-thread-1"
+    i1_res = client.post(
+        "/api/v1/dalton/channels/internal/inbound/register-and-resolve",
+        headers=headers,
+        json={
+            "platform": "discord",
+            "platform_user_id": "dc_alice_1",
+            "chat_type": "group",
+            "chat_address": parent_addr,
+            "thread_scope_key": thread_scope_key,
+            "message_id": "msg-discord-thread-1",
+            "request_key": "channel:discord:msg-discord-thread-1",
+            "raw_payload": {"text": "analyze nvda"},
+        },
+    )
+    assert i1_res.status_code == 200
+    assert i1_res.json()["allowed"] is True
+
+    # Attach thread_id, run_id, and thread_watch via I-7 inbound/progress
+    prog_res = client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=headers,
+        json={
+            "platform": "discord",
+            "message_id": "msg-discord-thread-1",
+            "status": "streaming",
+            "thread_id": turn_tid,
+            "run_id": turn_rid,
+            "turn_index": 0,
+            "fallback_pending": True,
+            "thread_watch": {
+                "thread_id": turn_tid,
+                "dalton_user_id": "u-alice",
+                "platform": "discord",
+                "target_address": parent_addr,
+                "scope_key": thread_scope_key,
+                "generation": 1,
+                "last_seen_turn_index": 0,
+                "watch_active": True,
+            },
+        },
+    )
+    assert prog_res.status_code == 200
+
+    # 2. Verify I-4 state includes thread_scope_key on current_conversation
+    i4_res = client.get(
+        "/api/v1/dalton/channels/internal/state",
+        headers=headers,
+        params={
+            "user_id": "u-alice",
+            "platform": "discord",
+            "thread_id": turn_tid,
+            "run_id": turn_rid,
+        },
+    )
+    assert i4_res.status_code == 200
+    assert i4_res.json()["current_conversation"] == {
+        "address": parent_addr,
+        "platform": "discord",
+        "thread_id": turn_tid,
+        "run_id": turn_rid,
+        "external_thread_id": f"discord:{thread_scope_key}:user:u-alice:gen:1",
+        "thread_scope_key": thread_scope_key,
+    }
+
+    # 3. Scenario A1 (notice with inbound_message_id) returns thread_scope_key
+    a1_res = client.post(
+        "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
+        headers=headers,
+        json={
+            "delivery_key": "notice:discord:msg-discord-thread-1:busy",
+            "kind": "notice",
+            "user_id": "u-alice",
+            "platform": "discord",
+            "inbound_message_id": "msg-discord-thread-1",
+            "has_non_empty_text": True,
+            "total_chunks": 1,
+        },
+    )
+    assert a1_res.status_code == 200
+    assert a1_res.json()["claim_status"] == "claimed"
+    assert a1_res.json()["target_address"] == parent_addr
+    assert a1_res.json()["thread_scope_key"] == thread_scope_key
+
+    # 4. Scenario A2 (current conversation, target=None) returns thread_scope_key and is_current=True
+    dkey_current = f"agent:{turn_rid}:tc-current-1"
+    a2_res = client.post(
+        "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
+        headers=headers,
+        json={
+            "delivery_key": dkey_current,
+            "kind": "agent_send",
+            "user_id": "u-alice",
+            "thread_id": turn_tid,
+            "run_id": turn_rid,
+            "platform": "discord",
+            "target": None,
+            "has_non_empty_text": True,
+            "total_chunks": 1,
+        },
+    )
+    assert a2_res.status_code == 200
+    assert a2_res.json()["claim_status"] == "claimed"
+    assert a2_res.json()["target_address"] == parent_addr
+    assert a2_res.json()["thread_scope_key"] == thread_scope_key
+    assert a2_res.json()["is_current"] is True
+
+    # 5. Duplicate claim while in_flight returns in_flight_or_unknown with thread_scope_key
+    dup_inflight = client.post(
+        "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
+        headers=headers,
+        json={
+            "delivery_key": dkey_current,
+            "kind": "agent_send",
+            "user_id": "u-alice",
+            "thread_id": turn_tid,
+            "run_id": turn_rid,
+            "platform": "discord",
+            "target": None,
+            "has_non_empty_text": True,
+            "total_chunks": 1,
+        },
+    )
+    assert dup_inflight.status_code == 200
+    assert dup_inflight.json()["claim_status"] == "in_flight_or_unknown"
+    assert dup_inflight.json()["thread_scope_key"] == thread_scope_key
+
+    # 6. Mark delivery failed, then retry claim with same delivery_key -> re-claimed with thread_scope_key
+    client.post(
+        "/api/v1/dalton/channels/internal/deliveries/progress",
+        headers=headers,
+        json={
+            "delivery_key": dkey_current,
+            "status": "failed",
+            "error_code": "unavailable",
+        },
+    )
+    retry_claim = client.post(
+        "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
+        headers=headers,
+        json={
+            "delivery_key": dkey_current,
+            "kind": "agent_send",
+            "user_id": "u-alice",
+            "thread_id": turn_tid,
+            "run_id": turn_rid,
+            "platform": "discord",
+            "target": None,
+            "has_non_empty_text": True,
+            "total_chunks": 1,
+        },
+    )
+    assert retry_claim.status_code == 200
+    assert retry_claim.json()["claim_status"] == "claimed"
+    assert retry_claim.json()["thread_scope_key"] == thread_scope_key
+    assert retry_claim.json()["is_current"] is True
+
+    # Complete delivery -> increments sent_to_current_count, and duplicate claim returns already_completed with thread_scope_key
+    sent_prog = client.post(
+        "/api/v1/dalton/channels/internal/deliveries/progress",
+        headers=headers,
+        json={
+            "delivery_key": dkey_current,
+            "sent_chunks": 1,
+            "total_chunks": 1,
+            "status": "sent",
+            "first_response_json": {"status": "sent"},
+        },
+    )
+    assert sent_prog.status_code == 200
+    assert sent_prog.json()["sent_to_current_count"] == 1
+
+    dup_completed = client.post(
+        "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
+        headers=headers,
+        json={
+            "delivery_key": dkey_current,
+            "kind": "agent_send",
+            "user_id": "u-alice",
+            "thread_id": turn_tid,
+            "run_id": turn_rid,
+            "platform": "discord",
+            "target": None,
+            "has_non_empty_text": True,
+            "total_chunks": 1,
+        },
+    )
+    assert dup_completed.status_code == 200
+    assert dup_completed.json()["claim_status"] == "already_completed"
+    assert dup_completed.json()["thread_scope_key"] == thread_scope_key
+    assert dup_completed.json()["is_current"] is True
+
+    # 7. Background run source on the same thread_id (new run_id) recovers thread_scope_key
+    bg_rid = "run-discord-bg-2"
+    client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=headers,
+        json={
+            "background_run": {
+                "run_id": bg_rid,
+                "thread_id": turn_tid,
+                "dalton_user_id": "u-alice",
+                "platform": "discord",
+                "target_address": parent_addr,
+                "turn_index": 1,
+                "status": "streaming",
+                "fallback_pending": True,
+            }
+        },
+    )
+    bg_claim = client.post(
+        "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
+        headers=headers,
+        json={
+            "delivery_key": f"agent:{bg_rid}:tc-bg-1",
+            "kind": "agent_send",
+            "user_id": "u-alice",
+            "thread_id": turn_tid,
+            "run_id": bg_rid,
+            "platform": "discord",
+            "target": None,
+            "has_non_empty_text": True,
+            "total_chunks": 1,
+        },
+    )
+    assert bg_claim.status_code == 200
+    assert bg_claim.json()["claim_status"] == "claimed"
+    assert bg_claim.json()["target_address"] == parent_addr
+    assert bg_claim.json()["thread_scope_key"] == thread_scope_key
+    assert bg_claim.json()["is_current"] is True
+
+    # 8. Thread-watch-only source recovers scope_key as thread_scope_key
+    watch_tid = str(uuid4())
+    watch_rid = "run-discord-watch-3"
+    client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=headers,
+        json={
+            "thread_watch": {
+                "thread_id": watch_tid,
+                "dalton_user_id": "u-alice",
+                "platform": "discord",
+                "target_address": parent_addr,
+                "scope_key": watch_only_scope_key,
+                "generation": 1,
+                "last_seen_turn_index": 0,
+                "watch_active": True,
+            }
+        },
+    )
+    watch_claim = client.post(
+        "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
+        headers=headers,
+        json={
+            "delivery_key": f"agent:{watch_rid}:tc-watch-1",
+            "kind": "agent_send",
+            "user_id": "u-alice",
+            "thread_id": watch_tid,
+            "run_id": watch_rid,
+            "platform": "discord",
+            "target": None,
+            "has_non_empty_text": True,
+            "total_chunks": 1,
+        },
+    )
+    assert watch_claim.status_code == 200
+    assert watch_claim.json()["claim_status"] == "claimed"
+    assert watch_claim.json()["target_address"] == parent_addr
+    assert watch_claim.json()["thread_scope_key"] == watch_only_scope_key
+    assert watch_claim.json()["is_current"] is True
+
+    # 9. Scenario C: explicit target to another allowed channel -> is_current=False, thread_scope_key=None
+    other_claim = client.post(
+        "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
+        headers=headers,
+        json={
+            "delivery_key": f"agent:{turn_rid}:tc-other-1",
+            "kind": "agent_send",
+            "user_id": "u-alice",
+            "thread_id": turn_tid,
+            "run_id": turn_rid,
+            "platform": "discord",
+            "target": other_allowed_addr,
+            "has_non_empty_text": True,
+            "total_chunks": 1,
+        },
+    )
+    assert other_claim.status_code == 200
+    assert other_claim.json()["claim_status"] == "claimed"
+    assert other_claim.json()["target_address"] == other_allowed_addr
+    assert other_claim.json()["thread_scope_key"] is None
+    assert other_claim.json()["is_current"] is False
+
+    # 10. Scenario C: explicit target to an unauthorized channel -> denied (not_allowed)
+    unauth_claim = client.post(
+        "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
+        headers=headers,
+        json={
+            "delivery_key": f"agent:{turn_rid}:tc-unauth-1",
+            "kind": "agent_send",
+            "user_id": "u-alice",
+            "thread_id": turn_tid,
+            "run_id": turn_rid,
+            "platform": "discord",
+            "target": unauthorized_addr,
+            "has_non_empty_text": True,
+            "total_chunks": 1,
+        },
+    )
+    assert unauth_claim.status_code == 200
+    assert unauth_claim.json()["claim_status"] == "denied"
+    assert unauth_claim.json()["code"] == "not_allowed"
+
+    # 11. Scenario C: explicit target matching current conversation's chat_address -> is_current=True and thread_scope_key=thread_scope_key
+    same_chat_claim = client.post(
+        "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
+        headers=headers,
+        json={
+            "delivery_key": f"agent:{turn_rid}:tc-same-chat-1",
+            "kind": "agent_send",
+            "user_id": "u-alice",
+            "thread_id": turn_tid,
+            "run_id": turn_rid,
+            "platform": "discord",
+            "target": parent_addr,
+            "has_non_empty_text": True,
+            "total_chunks": 1,
+        },
+    )
+    assert same_chat_claim.status_code == 200
+    assert same_chat_claim.json()["claim_status"] == "claimed"
+    assert same_chat_claim.json()["target_address"] == parent_addr
+    assert same_chat_claim.json()["thread_scope_key"] == thread_scope_key
+    assert same_chat_claim.json()["is_current"] is True
+
+    # 12. I-7 recover (watch_reconnect and startup) enriches background_runs and thread_watches with scope_key / thread_scope_key
+    rec_watch = client.get(
+        "/api/v1/dalton/channels/internal/recover",
+        headers=headers,
+        params={"mode": "watch_reconnect", "thread_id": turn_tid},
+    )
+    assert rec_watch.status_code == 200
+    rec_bg_list = rec_watch.json()["background_runs"]
+    assert len(rec_bg_list) == 1
+    assert rec_bg_list[0]["run_id"] == bg_rid
+    assert rec_bg_list[0]["scope_key"] == thread_scope_key
+    assert rec_bg_list[0]["thread_scope_key"] == thread_scope_key

@@ -9,10 +9,12 @@
  * delivery progress accounting stay with the caller / delivery service.
  */
 
-import { randomUUID } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { ChannelDeliveryError } from "../adapter.js";
 import { classifyDiscordDeliveryError, type DiscordFilePart, type RequestClient } from "./rest.js";
 import { createThreadDiscord, ensureThreadUnarchived, getDiscordChannel, sanitizeDiscordThreadName } from "./threading.js";
+
+export const DISCORD_MAX_NONCE_CHARS = 25;
 
 export interface ParsedDiscordTarget {
   kind: "dm" | "channel" | "thread";
@@ -62,10 +64,10 @@ export function threadIdFromScopeKey(scopeKey?: string | null): string | null {
 }
 
 export function createDiscordMessageNonce(): string {
-  // Discord accepts a client nonce per message create; reusing the same
-  // request body on a 429 retry keeps this value identical. It does not by
-  // itself guarantee exactly-once delivery.
-  return randomUUID().replace(/-/g, "");
+  // Discord v10 limits `nonce` to at most 25 characters (`RESTPostAPIChannelMessageJSONBody`).
+  // 12 random bytes encoded as 24 hex characters stay within the limit while providing
+  // 96 bits of entropy; reusing the same request body on a 429 retry keeps the nonce identical.
+  return randomBytes(12).toString("hex");
 }
 
 export interface SendMessageDiscordParams {
