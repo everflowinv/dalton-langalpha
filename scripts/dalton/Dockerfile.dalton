@@ -22,6 +22,7 @@ COPY pyproject.toml uv.lock README.md ./
 COPY libs/market-protocol/ libs/market-protocol/
 
 ARG INSTALL_OBSERVABILITY=false
+ARG UV_CONCURRENT_DOWNLOADS=4
 RUN if [ "$INSTALL_OBSERVABILITY" = "true" ]; then \
         uv sync --frozen --no-dev --extra observability; \
     else \
