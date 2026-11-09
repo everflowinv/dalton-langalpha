@@ -1090,11 +1090,16 @@ class BridgeConfig:
         self.token: str = os.environ.get("DALTON_BRIDGE_TOKEN", "").strip()
         self.admin_token: str = os.environ.get("DALTON_BRIDGE_ADMIN_TOKEN", "").strip()
         raw_ocw_env = os.environ.get("DALTON_OCW_ROOT")
-        raw_ocw_str = (
-            raw_ocw_env.strip()
-            if raw_ocw_env is not None
-            else os.path.expanduser("~/.openclaw/workspace")
-        )
+        explicit_ocw = raw_ocw_env.strip() if isinstance(raw_ocw_env, str) else ""
+        # Non-blank DALTON_OCW_ROOT is an explicit consumer root. When the variable
+        # is unset, ocw_root stays the default workspace for other bridge reads.
+        self.ocw_root_explicit: bool = bool(explicit_ocw)
+        if explicit_ocw:
+            raw_ocw_str = explicit_ocw
+        elif raw_ocw_env is None:
+            raw_ocw_str = os.path.expanduser("~/.openclaw/workspace")
+        else:
+            raw_ocw_str = ""
         self.ocw_root_raw: Path | None = (
             Path(raw_ocw_str).expanduser() if raw_ocw_str else None
         )
@@ -15141,6 +15146,9 @@ class ResearchDataBridge:
 
         ocw_root = raw_ocw_root.resolve() if raw_ocw_root is not None else data_root
         py_bin = self._resolve_archive_python_bin()
+        bbg_refresh = host_mode == "run" and self._host_task_command_override is None
+        explicit_consumer = _explicit_bbg_consumer_root(self.cfg) if bbg_refresh else None
+        summary_ocw = explicit_consumer if bbg_refresh else raw_ocw_root
 
         async with self._host_runner_lock:
             marker_exists = await asyncio.to_thread(self._has_fence_lost_marker_file_sync)
@@ -15204,12 +15212,32 @@ class ResearchDataBridge:
                         "remaining_pgids": remaining_lingering,
                     }
 
+            # Fence, generation, and active-group rejections stay first. A disallowed
+            # source path or a missing explicit consumer is refused after those checks
+            # and before this call creates a run directory or a child process.
+            if bbg_refresh and _bbg_refresh_source_has_disallowed_symlink(raw_data_root):
+                return _host_run_refused_before_start(
+                    run_id=run_id,
+                    job_key=job_key,
+                    generation=generation,
+                    reason="bbg_source_symlink_rejected",
+                    is_trial=is_trial,
+                )
+            if bbg_refresh and not is_trial and explicit_consumer is None:
+                return _host_run_refused_before_start(
+                    run_id=run_id,
+                    job_key=job_key,
+                    generation=generation,
+                    reason="consumer_root_not_configured",
+                    is_trial=False,
+                )
+
             self._host_max_seen_generation = max(self._host_max_seen_generation, generation)
 
             before_source_summary = await asyncio.to_thread(
                 _build_bbg_source_summary,
                 data_root=raw_data_root,
-                ocw_root=raw_ocw_root,
+                ocw_root=summary_ocw,
                 summary_complete=True,
                 capture_scope="bridge_pre_run_in_lock",
             )
@@ -15236,7 +15264,7 @@ class ResearchDataBridge:
                     "command_argv": ["bash", str(bbg_script)],
                     "cwd": str(data_root),
                     "data_root": str(raw_data_root),
-                    "ocw_root": str(raw_ocw_root) if raw_ocw_root is not None else "",
+                    "ocw_root": str(explicit_consumer) if explicit_consumer is not None else "",
                     "is_trial": is_trial,
                     "sync_consumer": not is_trial,
                     "before_source_summary": before_source_summary,
@@ -15415,7 +15443,7 @@ class ResearchDataBridge:
                     after_source_summary = await asyncio.to_thread(
                         _build_bbg_source_summary,
                         data_root=raw_data_root,
-                        ocw_root=raw_ocw_root,
+                        ocw_root=summary_ocw,
                         summary_complete=bool(run_succeeded),
                         capture_scope=(
                             "bridge_in_lock"
@@ -18597,21 +18625,205 @@ def _build_bbg_source_summary(
     return summary
 
 
+class _ConsumerSyncInterrupted(Exception):
+    """Raised when SIGTERM or SIGINT arrives before the next consumer-file replace."""
+
+
+_BBG_CONSUMER_SYNC_CHECKPOINT_ENV = "DALTON_BBG_CONSUMER_SYNC_CHECKPOINT"
+
+
+def _explicit_bbg_consumer_root(cfg: Any) -> Path | None:
+    """Return the raw consumer root for a formal BBG write, or None when none is configured.
+
+    A non-blank ``DALTON_OCW_ROOT`` supplies ``ocw_root_raw`` so a symlink stays visible to the
+    sync checks. An in-process ``ocw_root`` or ``openclaw_workspace`` that differs from the read
+    default is also a configured root. The default workspace used when ``DALTON_OCW_ROOT`` is
+    unset, and a blank ``DALTON_OCW_ROOT``, are not formal write targets.
+    """
+    configured_ocw = getattr(cfg, "openclaw_workspace", None)
+    if configured_ocw is not None and str(configured_ocw).strip():
+        return Path(configured_ocw).expanduser()
+    cfg_ocw = getattr(cfg, "ocw_root", None)
+    init_ocw = getattr(cfg, "_init_ocw_root", None)
+    if cfg_ocw is not None and init_ocw is not None and Path(cfg_ocw) != Path(init_ocw):
+        return Path(cfg_ocw).expanduser()
+    if getattr(cfg, "ocw_root_explicit", False):
+        cfg_ocw_raw = getattr(cfg, "ocw_root_raw", None)
+        if cfg_ocw_raw is not None and str(cfg_ocw_raw).strip():
+            return Path(cfg_ocw_raw).expanduser()
+    return None
+
+
+def _bbg_refresh_source_has_disallowed_symlink(raw_data_root: Path) -> bool:
+    """Return true when the raw BBG source root or its refresh paths contain a disallowed symlink."""
+    root = Path(raw_data_root).expanduser()
+    candidates = (
+        root,
+        root / "temp",
+        root / "temp" / "bbg_data_latest.csv",
+        root / "temp" / "bbg_data_remote.xlsx",
+        root / "scripts",
+        root / "scripts" / "bbg_remote_refresh.sh",
+    )
+    return any(_has_disallowed_path_symlink(path) for path in candidates)
+
+
+def _host_run_refused_before_start(
+    *,
+    run_id: int | str,
+    job_key: str,
+    generation: int,
+    reason: str,
+    is_trial: bool,
+) -> tuple[int, dict[str, Any]]:
+    """Return a host-run failure that did not start a child or create run files."""
+    consumer_sync: dict[str, Any] = {
+        "ok": False,
+        "synced": False,
+        "reason": reason,
+        "xlsx_replaced": False,
+        "csv_replaced": False,
+        "partial_replace": False,
+        "retryable": False,
+    }
+    if is_trial:
+        consumer_sync["skipped"] = True
+    payload = {
+        "ok": False,
+        "error": reason,
+        "reason": reason,
+        "source": "bbg_remote",
+        "consumer_sync": consumer_sync,
+    }
+    line = json.dumps(payload, ensure_ascii=False) + "\n"
+    return 200, {
+        "ok": False,
+        "run_id": run_id,
+        "job_key": job_key,
+        "generation": generation,
+        "exit_code": 1,
+        "timed_out": False,
+        "timeout_kind": None,
+        "killed_by_host_kill": False,
+        "exit_confirmed": True,
+        "stdout": line,
+        "stderr": "",
+        "log_tail": line,
+        "before_source_summary": None,
+        "after_source_summary": None,
+        "consumer_sync": consumer_sync,
+        "error": reason,
+    }
+
+
+def _consumer_sync_failure(
+    reason: str,
+    *,
+    retryable: bool,
+    xlsx_replaced: bool = False,
+    csv_replaced: bool = False,
+    partial_replace: bool = False,
+    extra_sync: dict[str, Any] | None = None,
+) -> tuple[int, str]:
+    sync: dict[str, Any] = {
+        "ok": False,
+        "synced": False,
+        "reason": reason,
+        "xlsx_replaced": xlsx_replaced,
+        "csv_replaced": csv_replaced,
+        "partial_replace": partial_replace,
+        "retryable": retryable,
+    }
+    if extra_sync:
+        sync.update(extra_sync)
+    err_out = {
+        "ok": False,
+        "error": reason,
+        "reason": reason,
+        "source": "dalton_consumer_sync",
+        "xlsx_replaced": xlsx_replaced,
+        "csv_replaced": csv_replaced,
+        "partial_replace": partial_replace,
+        "retryable": retryable,
+        "consumer_sync": sync,
+    }
+    return 1, json.dumps(err_out, ensure_ascii=False) + "\n"
+
+
+def _wait_bbg_consumer_sync_checkpoint(phase: str, abort_fn: Any) -> None:
+    """Hold at `phase` while test mode points the checkpoint file at this phase.
+
+    The checkpoint file's text is the phase to hold. The sibling ``*.phase`` file receives
+    ``<phase> <pid>`` when this phase is reached. The wait ends when the checkpoint text changes,
+    the file disappears, or `abort_fn` reports a termination signal.
+    """
+    mode = os.environ.get("DALTON_BRIDGE_TEST_MODE", "").strip().lower()
+    if mode not in {"1", "true", "yes"}:
+        return
+    raw = os.environ.get(_BBG_CONSUMER_SYNC_CHECKPOINT_ENV, "").strip()
+    if not raw:
+        return
+    control = Path(raw).expanduser()
+    try:
+        if not control.is_absolute() or not control.is_file():
+            return
+        hold_phase = control.read_text(encoding="utf-8").strip()
+    except OSError:
+        return
+    phase_path = control.with_name(control.name + ".phase")
+    phase_tmp = phase_path.with_name(phase_path.name + ".tmp")
+    try:
+        phase_tmp.write_text(f"{phase} {os.getpid()}\n", encoding="utf-8")
+        os.replace(phase_tmp, phase_path)
+    except OSError:
+        return
+    if hold_phase not in {phase, "*"}:
+        return
+    while True:
+        if abort_fn is not None and abort_fn():
+            return
+        try:
+            if not control.is_file():
+                return
+            current = control.read_text(encoding="utf-8").strip()
+        except OSError:
+            return
+        if current not in {phase, "*"}:
+            return
+        time.sleep(0.05)
+
+
+def _exit_for_terminal_signal(signum: int) -> None:
+    """Restore the default handler and re-send `signum` so the wrapper dies by that signal."""
+    try:
+        signal.signal(signum, signal.SIG_DFL)
+    except Exception:
+        pass
+    try:
+        os.kill(os.getpid(), int(signum))
+    except Exception:
+        pass
+    raise SystemExit(128 + int(signum))
+
+
 def _stage_and_commit_bbg_consumer_sync(
     *,
     data_root: Path,
     ocw_root: Path | None,
     replace_fn: Any = os.replace,
     copy_fn: Any = None,
+    abort_fn: Any = None,
 ) -> tuple[int, str]:
-    """Validate Dalton BBG artifacts and atomically sync XLSX then CSV to legacy OpenClaw root.
+    """Validate Dalton BBG artifacts and atomically sync XLSX then CSV to the configured consumer root.
 
     Copies only `temp/bbg_data_remote.xlsx` and `temp/bbg_data_latest.csv` from `data_root` into
     temporary files under `<ocw_root>/temp/`, validates the staged copies, and replaces targets
-    one file at a time (XLSX first, then CSV). Rejects symlinks and non-configured or identical
-    roots; if validation or staging fails, target files in `ocw_root` are not modified. If CSV
-    replacement fails after XLSX replacement succeeded, returns a retryable failure outcome with
-    explicit per-file replacement flags.
+    one file at a time (XLSX first, then CSV). The consumer root must already exist as a real
+    directory; only its `temp` directory is created. Rejects symlinks, a missing or non-directory
+    root, and identical roots. If validation or staging fails, target files are not modified.
+    If CSV replacement fails after XLSX replacement succeeded, or termination arrives after XLSX
+    replacement, returns a retryable failure with per-file replacement flags. `abort_fn` returning
+    true stops the sync before the next consumer write and removes temporary files.
     """
     if ocw_root is None or not str(ocw_root).strip():
         err_out = {
@@ -18760,7 +18972,25 @@ def _stage_and_commit_bbg_consumer_sync(
         }
         return 1, json.dumps(err_out, ensure_ascii=False) + "\n"
 
-    dst_dir.mkdir(parents=True, exist_ok=True)
+    if not raw_ocw_root.exists():
+        return _consumer_sync_failure("consumer_root_not_found", retryable=False)
+    if raw_ocw_root.is_symlink() or not raw_ocw_root.is_dir():
+        reason = (
+            "consumer_sync_symlink_rejected"
+            if raw_ocw_root.is_symlink()
+            else "consumer_root_not_directory"
+        )
+        return _consumer_sync_failure(reason, retryable=False)
+    if dst_dir.is_symlink():
+        return _consumer_sync_failure("consumer_sync_symlink_rejected", retryable=False)
+    if dst_dir.exists() and not dst_dir.is_dir():
+        return _consumer_sync_failure("consumer_root_not_directory", retryable=False)
+    try:
+        dst_dir.mkdir(exist_ok=True)
+    except FileNotFoundError:
+        return _consumer_sync_failure("consumer_root_not_found", retryable=False)
+    except OSError:
+        return _consumer_sync_failure("consumer_root_not_directory", retryable=False)
     resolved_dst_dir = dst_dir.resolve()
     if (
         dst_dir.is_symlink()
@@ -18788,10 +19018,20 @@ def _stage_and_commit_bbg_consumer_sync(
     tmp_xlsx = dst_dir / f".bbg_data_remote.xlsx.{tag}.tmp"
     tmp_csv = dst_dir / f".bbg_data_latest.csv.{tag}.tmp"
     active_copy = copy_fn or (lambda s, d: shutil.copy2(s, d, follow_symlinks=False))
+    xlsx_replaced = False
+
+    def _checkpoint(phase: str) -> None:
+        _wait_bbg_consumer_sync_checkpoint(phase, abort_fn)
+        if abort_fn is not None and abort_fn():
+            raise _ConsumerSyncInterrupted
+
     try:
+        _checkpoint("before_stage")
         try:
             active_copy(src_xlsx, tmp_xlsx)
             active_copy(src_csv, tmp_csv)
+        except _ConsumerSyncInterrupted:
+            raise
         except Exception as exc:
             tmp_xlsx.unlink(missing_ok=True)
             tmp_csv.unlink(missing_ok=True)
@@ -18835,8 +19075,12 @@ def _stage_and_commit_bbg_consumer_sync(
             }
             return 1, json.dumps(err_out, ensure_ascii=False) + "\n"
 
+        _checkpoint("before_xlsx_replace")
         try:
             replace_fn(tmp_xlsx, dst_xlsx)
+            xlsx_replaced = True
+        except _ConsumerSyncInterrupted:
+            raise
         except Exception as exc:
             tmp_xlsx.unlink(missing_ok=True)
             tmp_csv.unlink(missing_ok=True)
@@ -18862,8 +19106,11 @@ def _stage_and_commit_bbg_consumer_sync(
             }
             return 1, json.dumps(err_out, ensure_ascii=False) + "\n"
 
+        _checkpoint("before_csv_replace")
         try:
             replace_fn(tmp_csv, dst_csv)
+        except _ConsumerSyncInterrupted:
+            raise
         except Exception as exc:
             tmp_csv.unlink(missing_ok=True)
             tmp_xlsx.unlink(missing_ok=True)
@@ -18915,6 +19162,22 @@ def _stage_and_commit_bbg_consumer_sync(
             },
         }
         return 0, json.dumps(out, ensure_ascii=False) + "\n"
+    except _ConsumerSyncInterrupted:
+        extra_sync = None
+        if xlsx_replaced:
+            extra_sync = {
+                "ocw_root": str(raw_ocw_root),
+                "xlsx_path": str(dst_xlsx),
+                "csv_path": str(dst_csv),
+            }
+        return _consumer_sync_failure(
+            "consumer_sync_interrupted",
+            retryable=True,
+            xlsx_replaced=xlsx_replaced,
+            csv_replaced=False,
+            partial_replace=xlsx_replaced,
+            extra_sync=extra_sync,
+        )
     finally:
         tmp_csv.unlink(missing_ok=True)
         tmp_xlsx.unlink(missing_ok=True)
@@ -19007,11 +19270,153 @@ def run_bbg_mirror_sync(
     return rc, "".join(progress_lines) + redacted_final
 
 
+def _dedicated_host_gate_session() -> bool:
+    """Return True when this process leads its own session and process group.
+
+    The host runner starts the gate with a new session. That group holds only this
+    wrapper and the refresh command it spawned, so a group signal stays inside this task.
+    """
+    pid = os.getpid()
+    try:
+        return pid > 1 and os.getpgrp() == pid and os.getsid(pid) == pid
+    except OSError:
+        return False
+
+
+def _signal_live_child(child_pid: int | None, signum: int) -> None:
+    """Signal the refresh child when its process is still present."""
+    if child_pid is None or child_pid <= 1 or child_pid == os.getpid():
+        return
+    try:
+        os.kill(child_pid, int(signum))
+    except OSError:
+        return
+
+
+def _signal_refresh_session_group(signum: int, child_pid: int | None) -> None:
+    """Stop this gate's refresh child and the descendants that share its session.
+
+    ``os.killpg`` delivers ``signum`` to the wrapper as well. The wrapper ignores that
+    delivery for the call so the handler does not re-enter and this process can still
+    wait for the refresh tree. A process that is not a dedicated session leader signals
+    only its direct child, never a process group shared with another task.
+    """
+    delivered = int(signum)
+    if not _dedicated_host_gate_session():
+        _signal_live_child(child_pid, delivered)
+        return
+    try:
+        previous = signal.signal(delivered, signal.SIG_IGN)
+    except (OSError, ValueError):
+        _signal_live_child(child_pid, delivered)
+        return
+    try:
+        try:
+            os.killpg(os.getpgrp(), delivered)
+        except OSError:
+            _signal_live_child(child_pid, delivered)
+    finally:
+        try:
+            signal.signal(delivered, previous)
+        except (OSError, ValueError):
+            pass
+
+
+def _own_session_group_members() -> list[tuple[int, str]] | None:
+    """Return ``(pid, lstart)`` for other members of this gate session.
+
+    ``None`` means ``ps`` failed and membership is unconfirmed. An empty list means
+    this wrapper is the only process left in its group.
+    """
+    if not _dedicated_host_gate_session():
+        return []
+    my_pid = os.getpid()
+    my_pgid = os.getpgrp()
+    rows = _normalize_ps_rows(_list_host_processes_ps())
+    if rows is None:
+        return None
+    # ``ps`` can list itself in this group and then exit before the snapshot is read.
+    # Keep a row only when the pid is still in this session, so a finished ``ps`` is not
+    # treated as a live refresh descendant.
+    found: list[tuple[int, str]] = []
+    for pid, pgid, lstart, _cmd in rows:
+        if pid <= 1 or pid == my_pid or pgid != my_pgid:
+            continue
+        try:
+            if os.getpgid(pid) != my_pgid:
+                continue
+        except OSError:
+            continue
+        found.append((pid, lstart))
+    return found
+
+
+def _signal_confirmed_group_members(signum: int, members: list[tuple[int, str]]) -> None:
+    """Signal pids that a fresh ``ps`` row still shows in this session with the same ``lstart``.
+
+    A pid whose ``lstart`` changed, or whose group is no longer this session, is left
+    alone so a reused pid is not signaled. Signals go to those pids one at a time.
+    ``SIGKILL`` cannot be ignored, so it is never sent to the whole group: the wrapper
+    is a member and has to stay alive until the other members are gone.
+    """
+    fresh = _own_session_group_members()
+    if not fresh:
+        return
+    fresh_lstart = {pid: lstart for pid, lstart in fresh}
+    my_pid = os.getpid()
+    my_pgid = os.getpgrp()
+    for pid, lstart in members:
+        if pid <= 1 or pid == my_pid or fresh_lstart.get(pid) != lstart:
+            continue
+        try:
+            if os.getpgid(pid) != my_pgid:
+                continue
+            os.kill(pid, int(signum))
+        except OSError:
+            continue
+
+
+def _wait_refresh_session_group_exit() -> None:
+    """Reap this gate session after a terminal signal, including refresh descendants.
+
+    SIGTERM or SIGINT has already been sent to the group. Members still present after
+    a short grace are SIGKILLed one pid at a time once ``ps`` and ``getpgid`` still
+    identify them. This wrapper is not signaled.
+    """
+    if not _dedicated_host_gate_session():
+        return
+    my_pgid = os.getpgrp()
+    grace_deadline = time.monotonic() + 0.3
+    while True:
+        members = _own_session_group_members()
+        if members is not None and not members:
+            _reap_pgid_zombies(my_pgid)
+            return
+        if time.monotonic() >= grace_deadline:
+            break
+        _reap_pgid_zombies(my_pgid)
+        time.sleep(0.05)
+    members = _own_session_group_members()
+    if members:
+        _signal_confirmed_group_members(signal.SIGKILL, members)
+    kill_deadline = time.monotonic() + 0.5
+    while time.monotonic() < kill_deadline:
+        members = _own_session_group_members()
+        if members is not None and not members:
+            break
+        _reap_pgid_zombies(my_pgid)
+        time.sleep(0.05)
+    _reap_pgid_zombies(my_pgid)
+
+
 def _run_host_task_gate_cli(argv: list[str]) -> int:
     """Entry point for the `--dalton-host-task-gate` wrapper process (§2.3 item 3).
 
     Blocks on stdin waiting for release signal (`b"GO\\n"`). If stdin closes before release,
-    exits immediately without executing the task.
+    exits immediately without executing the task. SIGTERM and SIGINT stop the refresh child
+    and the other members of this gate session; the wrapper reaps that group before it exits
+    and does not continue consumer sync. After the refresh child has already exited, the same
+    signals stop staging and replacement, and the wrapper then exits by that signal.
     """
     try:
         idx = argv.index(HOST_TASK_GATE_FLAG)
@@ -19063,6 +19468,26 @@ def _run_host_task_gate_cli(argv: list[str]) -> int:
     if not isinstance(cmd_argv, list) or not cmd_argv:
         return 1
     cwd = spec.get("cwd") or None
+    abort_signum: list[int] = []
+    child_box: list[Any] = []
+
+    def _forward_term(signum: int, _frame: Any) -> None:
+        # A group signal is delivered to this wrapper too. A second entry must not
+        # signal the group again, or the restored handler would keep re-entering.
+        if abort_signum:
+            return
+        abort_signum.append(int(signum))
+        child_proc = child_box[-1] if child_box else None
+        child_pid: int | None = None
+        if child_proc is not None and child_proc.poll() is None:
+            child_pid = int(child_proc.pid)
+        _signal_refresh_session_group(int(signum), child_pid)
+
+    def _aborted() -> bool:
+        return bool(abort_signum)
+
+    signal.signal(signal.SIGTERM, _forward_term)
+    signal.signal(signal.SIGINT, _forward_term)
     child = subprocess.Popen(
         [str(x) for x in cmd_argv],
         cwd=cwd,
@@ -19070,18 +19495,16 @@ def _run_host_task_gate_cli(argv: list[str]) -> int:
         start_new_session=False,
         env=seed_asr_client.strip_asr_credentials_from_env(dict(os.environ)),
     )
-
-    def _forward_term(signum: int, _frame: Any) -> None:
-        try:
-            child.send_signal(signum)
-        except Exception:
-            pass
-
-    signal.signal(signal.SIGTERM, _forward_term)
-    signal.signal(signal.SIGINT, _forward_term)
+    child_box.append(child)
+    if abort_signum and child.poll() is None:
+        _signal_refresh_session_group(abort_signum[0], int(child.pid))
     child_rc = int(child.wait())
+    if abort_signum:
+        _wait_refresh_session_group_exit()
     if child_rc != 0:
         return child_rc
+    if abort_signum:
+        _exit_for_terminal_signal(abort_signum[0])
 
     if spec.get("sync_consumer") is True:
         redactor = HostSecretRedactor()
@@ -19091,6 +19514,7 @@ def _run_host_task_gate_cli(argv: list[str]) -> int:
         sync_rc, sync_json = _stage_and_commit_bbg_consumer_sync(
             data_root=raw_data_root,
             ocw_root=raw_ocw_root,
+            abort_fn=_aborted,
         )
         sync_obj: dict[str, Any] | None = None
         try:
@@ -19118,7 +19542,14 @@ def _run_host_task_gate_cli(argv: list[str]) -> int:
             sync_json = json.dumps(sync_obj, ensure_ascii=False) + "\n"
         sys.stdout.write(redactor.redact_text(sync_json))
         sys.stdout.flush()
+        if abort_signum:
+            _wait_refresh_session_group_exit()
+            _exit_for_terminal_signal(abort_signum[0])
         return int(sync_rc)
+
+    if abort_signum:
+        _wait_refresh_session_group_exit()
+        _exit_for_terminal_signal(abort_signum[0])
 
     if spec.get("is_trial") is True and spec.get("data_root"):
         redactor = HostSecretRedactor()

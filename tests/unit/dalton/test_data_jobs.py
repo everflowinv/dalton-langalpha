@@ -9,6 +9,8 @@ import io
 import json
 import os
 import shutil
+import signal
+import time
 from pathlib import Path
 import stat
 import sys
@@ -2120,6 +2122,8 @@ async def test_bridge_host_run_state_file_0600_generation_fence_host_kill_and_st
     cfg.admin_token = "test-bridge-admin-token"
     cfg.data_tasks_data_root = tmp_path / "openclaw-data"
     cfg.ocw_root = tmp_path / "openclaw-ws"
+    # Formal BBG sync requires the configured consumer directory to already exist.
+    cfg.ocw_root.mkdir()
     cfg.host_task_sigterm_grace_s = 0.3
 
     # Verify default data_root derivation on a fresh BridgeConfig matches repo/var/dalton/openclaw-data
@@ -8860,3 +8864,882 @@ def test_sentiment_dashboard_cos_upload_skip_never_reads_credentials(tmp_path, m
         captured = capsys.readouterr()
         assert json.loads(captured.out if expected == 0 else captured.err)["ok"] is (expected == 0)
         assert credential_reads == []
+
+
+# ---------------------------------------------------------------------------
+# BBG consumer root, raw source symlink refusal, and termination during sync
+# ---------------------------------------------------------------------------
+
+
+def _bash_quote(value: str) -> str:
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
+def _isolate_bridge_config_env(monkeypatch: pytest.MonkeyPatch, home: Path) -> Path:
+    """Point BridgeConfig at an empty env file and a temporary home.
+
+    Keeps ``DALTON_OCW_ROOT`` unset so a caller can choose an explicit value.
+    BridgeConfig drops ``GEMINI_API_KEY`` when the env file omits it; registering
+    the current value with monkeypatch restores it when the test ends.
+    """
+    home.mkdir(parents=True, exist_ok=True)
+    env_file = home / "researchdata-bridge.env"
+    env_file.write_text("", encoding="utf-8")
+    gemini = os.environ.get("GEMINI_API_KEY")
+    if gemini is not None:
+        monkeypatch.setenv("GEMINI_API_KEY", gemini)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("DALTON_OCW_HOME", str(home / "ocw-home"))
+    monkeypatch.setenv("DALTON_BRIDGE_ENV_FILE", str(env_file))
+    monkeypatch.setenv("DALTON_BRIDGE_ADMIN_TOKEN", "test-bridge-admin-token")
+    monkeypatch.delenv("DALTON_OCW_ROOT", raising=False)
+    monkeypatch.delenv("DALTON_BRIDGE_TEST_MODE", raising=False)
+    monkeypatch.delenv("DALTON_BRIDGE_TEST_DELAY_S", raising=False)
+    monkeypatch.delenv("DALTON_BBG_CONSUMER_SYNC_CHECKPOINT", raising=False)
+    return env_file
+
+
+def _assert_home_untouched(home: Path) -> None:
+    assert {path.name for path in home.iterdir()} == {"researchdata-bridge.env"}
+    assert not (home / ".openclaw").exists()
+    assert not (home / "ocw-home").exists()
+
+
+def _cwd_bbg_snapshot() -> tuple[bool, dict[str, tuple[int, int] | None]]:
+    cwd = Path.cwd()
+    relative_names = (
+        "temp/bbg_data_latest.csv",
+        "temp/bbg_data_remote.xlsx",
+        "bbg_data_latest.csv",
+        "bbg_data_remote.xlsx",
+    )
+    stamps: dict[str, tuple[int, int] | None] = {}
+    for name in relative_names:
+        path = cwd / name
+        if path.exists() or path.is_symlink():
+            st = path.lstat()
+            stamps[name] = (st.st_mtime_ns, st.st_size)
+        else:
+            stamps[name] = None
+    return (cwd / "temp").exists(), stamps
+
+
+def _refresh_script(
+    *,
+    marker: Path | None = None,
+    sleep_s: int | None = None,
+    finished: Path | None = None,
+) -> str:
+    lines = ["#!/usr/bin/env bash", "set -euo pipefail"]
+    if marker is not None:
+        lines.append(f"printf '%s\\n' started > {_bash_quote(str(marker))}")
+    if sleep_s is not None:
+        lines.append(f"sleep {int(sleep_s)}")
+    if finished is not None:
+        lines.append(f"printf '%s\\n' finished > {_bash_quote(str(finished))}")
+    if sleep_s is None:
+        lines.append(
+            "printf '%s\\n' '{\"ok\": true, \"lines\": 261, \"source\": \"bbg_remote\"}'"
+        )
+        lines.append("exit 0")
+    return "\n".join(lines) + "\n"
+
+
+def _prepare_bbg_data_root(data_root: Path, script: str) -> None:
+    src_temp = data_root / "temp"
+    scripts = data_root / "scripts"
+    src_temp.mkdir(parents=True, exist_ok=True)
+    scripts.mkdir(parents=True, exist_ok=True)
+    (src_temp / "bbg_data_latest.csv").write_text(
+        _make_valid_bbg_csv_content(260), encoding="utf-8"
+    )
+    _write_valid_xlsx_zip(src_temp / "bbg_data_remote.xlsx")
+    refresh = scripts / "bbg_remote_refresh.sh"
+    refresh.write_text(script, encoding="utf-8")
+    refresh.chmod(0o755)
+
+
+def _seed_consumer_files(ocw_root: Path) -> tuple[str, bytes]:
+    dst_temp = ocw_root / "temp"
+    dst_temp.mkdir(parents=True, exist_ok=True)
+    csv_text = "legacy-consumer-csv\n"
+    xlsx_bytes = b"legacy-consumer-xlsx"
+    (dst_temp / "bbg_data_latest.csv").write_text(csv_text, encoding="utf-8")
+    (dst_temp / "bbg_data_remote.xlsx").write_bytes(xlsx_bytes)
+    return csv_text, xlsx_bytes
+
+
+def _assert_no_tmp_files(root: Path) -> None:
+    if not root.exists() or not root.is_dir():
+        return
+    leftovers = [path.name for path in root.rglob("*") if path.is_file() and ".tmp" in path.name]
+    assert leftovers == []
+
+
+def _host_run_body(
+    generation: int,
+    run_id: str,
+    *,
+    is_trial: bool = False,
+    host_mode: str = "run",
+    timeout: int = 25,
+) -> dict[str, Any]:
+    return {
+        "generation": generation,
+        "run_id": run_id,
+        "job_key": T1_JOB_KEY,
+        "host_mode": host_mode,
+        "scheduled_slot_utc": "2026-11-09T12:00:00Z",
+        "timeout": timeout,
+        "no_output_timeout": 20,
+        "is_trial": is_trial,
+    }
+
+
+def _bridge_for_data_root(
+    bridge_mod: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    data_root: Path,
+    *,
+    ocw_root: Path | None,
+):
+    if ocw_root is None:
+        monkeypatch.delenv("DALTON_OCW_ROOT", raising=False)
+    else:
+        monkeypatch.setenv("DALTON_OCW_ROOT", str(ocw_root))
+    cfg = bridge_mod.BridgeConfig()
+    cfg.admin_token = "test-bridge-admin-token"
+    cfg.data_tasks_data_root = data_root
+    cfg.host_task_sigterm_grace_s = 1.0
+    cfg.host_task_mirror_poll_interval_s = 0.05
+    return cfg, bridge_mod.ResearchDataBridge(cfg)
+
+
+def _evaluate_host_response(resp: dict[str, Any]):
+    return evaluate_task_run(
+        TaskEvaluationContext(
+            job_key=T1_JOB_KEY,
+            exit_code=resp["exit_code"],
+            stdout=resp.get("log_tail") or "",
+            timed_out=bool(resp.get("timed_out")),
+            timeout_kind=resp.get("timeout_kind"),
+        )
+    )
+
+
+def _assert_prestart_refusal(status: int, resp: dict[str, Any], reason: str, *, trial: bool) -> None:
+    assert status == 200
+    assert resp["ok"] is False
+    assert resp["exit_code"] == 1
+    assert resp["timed_out"] is False
+    assert resp["killed_by_host_kill"] is False
+    assert resp["exit_confirmed"] is True
+    assert resp["error"] == reason
+    assert resp["before_source_summary"] is None
+    assert resp["after_source_summary"] is None
+    sync = resp["consumer_sync"]
+    assert sync["ok"] is False
+    assert sync["synced"] is False
+    assert sync["reason"] == reason
+    assert sync["xlsx_replaced"] is False
+    assert sync["csv_replaced"] is False
+    assert sync["partial_replace"] is False
+    assert sync["retryable"] is False
+    if trial:
+        assert sync["skipped"] is True
+    else:
+        assert "skipped" not in sync
+    stdout_obj = json.loads(resp["stdout"])
+    assert stdout_obj["reason"] == reason
+    assert _evaluate_host_response(resp).failure_reason == reason
+
+
+def _pgid_alive(pgid: int) -> bool:
+    if pgid <= 1 or pgid == os.getpgrp():
+        return False
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _kill_saved_group(pgid: int | None) -> None:
+    if pgid is None or pgid <= 1 or pgid == os.getpgrp():
+        return
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def _read_phase_pid(phase_path: Path, phase: str) -> int | None:
+    try:
+        parts = phase_path.read_text(encoding="utf-8").split()
+    except OSError:
+        return None
+    if len(parts) < 2 or parts[0] != phase:
+        return None
+    try:
+        return int(parts[1])
+    except ValueError:
+        return None
+
+
+async def _poll_until(task: asyncio.Task, ready, what: str, timeout_s: float = 12.0) -> int:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        found = ready()
+        if found is not None:
+            return int(found)
+        if task.done():
+            exc = task.exception()
+            if exc is not None:
+                raise AssertionError(f"{what}: host-run failed") from exc
+            status, resp = task.result()
+            raise AssertionError(f"{what}: host-run finished early: {status} {resp!r}")
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"timed out waiting for {what}")
+
+
+async def _signal_running_host_run(
+    bridge: Any,
+    body: dict[str, Any],
+    signum: int,
+    ready,
+) -> tuple[int, dict[str, Any], int, bool]:
+    task: asyncio.Task | None = None
+    saved_pgid: int | None = None
+    try:
+        task = asyncio.create_task(bridge.handle_data_task_host_run(body))
+        gate_pid = await _poll_until(task, ready, f"signal {signum}")
+        saved_pgid = os.getpgid(gate_pid)
+        assert gate_pid > 1
+        assert gate_pid != os.getpid()
+        assert saved_pgid != os.getpgrp()
+        os.kill(gate_pid, signum)
+        status, resp = await asyncio.wait_for(task, timeout=15)
+        group_alive = _pgid_alive(saved_pgid)
+        return status, resp, gate_pid, group_alive
+    finally:
+        if saved_pgid is None:
+            active = getattr(bridge, "_host_active_runs", None) or {}
+            if active:
+                saved_pgid = int(next(iter(active)))
+        _kill_saved_group(saved_pgid)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if saved_pgid is None:
+            active = getattr(bridge, "_host_active_runs", None) or {}
+            if active:
+                saved_pgid = int(next(iter(active)))
+                _kill_saved_group(saved_pgid)
+
+
+def test_bbg_consumer_sync_requires_existing_directory_and_stops_on_abort(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import scripts.dalton.researchdata_bridge as bridge_mod
+
+    monkeypatch.delenv("DALTON_BRIDGE_TEST_MODE", raising=False)
+    monkeypatch.delenv("DALTON_BBG_CONSUMER_SYNC_CHECKPOINT", raising=False)
+
+    data_root = tmp_path / "dalton-data"
+    _prepare_bbg_data_root(data_root, _refresh_script())
+    src_temp = data_root / "temp"
+    valid_csv = (src_temp / "bbg_data_latest.csv").read_text(encoding="utf-8")
+    valid_xlsx = (src_temp / "bbg_data_remote.xlsx").read_bytes()
+
+    missing = tmp_path / "no-such-parent" / "consumer"
+    rc_missing, out_missing = bridge_mod._stage_and_commit_bbg_consumer_sync(
+        data_root=data_root,
+        ocw_root=missing,
+    )
+    assert rc_missing == 1
+    assert json.loads(out_missing)["reason"] == "consumer_root_not_found"
+    assert json.loads(out_missing)["consumer_sync"]["retryable"] is False
+    assert not missing.parent.exists()
+
+    file_root = tmp_path / "consumer-as-file"
+    file_root.write_bytes(b"keep-these-bytes")
+    rc_file, out_file = bridge_mod._stage_and_commit_bbg_consumer_sync(
+        data_root=data_root,
+        ocw_root=file_root,
+    )
+    assert rc_file == 1
+    assert json.loads(out_file)["reason"] == "consumer_root_not_directory"
+    assert file_root.read_bytes() == b"keep-these-bytes"
+    assert file_root.is_file()
+
+    root_with_file_temp = tmp_path / "root-with-file-temp"
+    root_with_file_temp.mkdir()
+    temp_file = root_with_file_temp / "temp"
+    temp_file.write_bytes(b"temp-is-a-file")
+    rc_temp_file, out_temp_file = bridge_mod._stage_and_commit_bbg_consumer_sync(
+        data_root=data_root,
+        ocw_root=root_with_file_temp,
+    )
+    assert rc_temp_file == 1
+    assert json.loads(out_temp_file)["reason"] == "consumer_root_not_directory"
+    assert temp_file.read_bytes() == b"temp-is-a-file"
+    assert root_with_file_temp.is_dir()
+
+    created_temp_root = tmp_path / "consumer-without-temp"
+    created_temp_root.mkdir()
+    rc_ok, out_ok = bridge_mod._stage_and_commit_bbg_consumer_sync(
+        data_root=data_root,
+        ocw_root=created_temp_root,
+    )
+    assert rc_ok == 0
+    assert json.loads(out_ok)["consumer_sync"]["synced"] is True
+    assert (created_temp_root / "temp").is_dir()
+    assert (created_temp_root / "temp" / "bbg_data_latest.csv").read_text(encoding="utf-8") == valid_csv
+    assert (created_temp_root / "temp" / "bbg_data_remote.xlsx").read_bytes() == valid_xlsx
+    assert not (tmp_path / "not-created").exists()
+    _assert_no_tmp_files(created_temp_root)
+
+    untouched = tmp_path / "consumer-abort-before-write"
+    legacy_csv, legacy_xlsx = _seed_consumer_files(untouched)
+
+    def _abort_immediately() -> bool:
+        return True
+
+    rc_abort, out_abort = bridge_mod._stage_and_commit_bbg_consumer_sync(
+        data_root=data_root,
+        ocw_root=untouched,
+        abort_fn=_abort_immediately,
+    )
+    abort_obj = json.loads(out_abort)
+    assert rc_abort == 1
+    assert abort_obj["reason"] == "consumer_sync_interrupted"
+    assert abort_obj["consumer_sync"]["xlsx_replaced"] is False
+    assert abort_obj["consumer_sync"]["csv_replaced"] is False
+    assert abort_obj["consumer_sync"]["partial_replace"] is False
+    assert abort_obj["consumer_sync"]["retryable"] is True
+    assert (untouched / "temp" / "bbg_data_latest.csv").read_text(encoding="utf-8") == legacy_csv
+    assert (untouched / "temp" / "bbg_data_remote.xlsx").read_bytes() == legacy_xlsx
+    _assert_no_tmp_files(untouched)
+
+    partial = tmp_path / "consumer-abort-after-xlsx"
+    partial_csv, _partial_xlsx = _seed_consumer_files(partial)
+    abort_calls = {"n": 0}
+
+    def _abort_before_csv() -> bool:
+        abort_calls["n"] += 1
+        return abort_calls["n"] >= 3
+
+    rc_partial, out_partial = bridge_mod._stage_and_commit_bbg_consumer_sync(
+        data_root=data_root,
+        ocw_root=partial,
+        abort_fn=_abort_before_csv,
+    )
+    partial_obj = json.loads(out_partial)
+    assert rc_partial == 1
+    assert abort_calls["n"] == 3
+    assert partial_obj["reason"] == "consumer_sync_interrupted"
+    assert partial_obj["xlsx_replaced"] is True
+    assert partial_obj["csv_replaced"] is False
+    assert partial_obj["partial_replace"] is True
+    assert partial_obj["retryable"] is True
+    assert partial_obj["consumer_sync"]["xlsx_replaced"] is True
+    assert partial_obj["consumer_sync"]["csv_replaced"] is False
+    assert (partial / "temp" / "bbg_data_remote.xlsx").read_bytes() == valid_xlsx
+    assert (partial / "temp" / "bbg_data_latest.csv").read_text(encoding="utf-8") == partial_csv
+    assert sorted(path.name for path in (partial / "temp").iterdir()) == [
+        "bbg_data_latest.csv",
+        "bbg_data_remote.xlsx",
+    ]
+    _assert_no_tmp_files(partial)
+
+
+@pytest.mark.asyncio
+async def test_bbg_formal_host_run_rejects_unset_or_blank_ocw_root_without_writing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import scripts.dalton.researchdata_bridge as bridge_mod
+
+    home = tmp_path / "home"
+    _isolate_bridge_config_env(monkeypatch, home)
+    cwd_before = _cwd_bbg_snapshot()
+    default_ws = home / ".openclaw" / "workspace"
+
+    data_root = tmp_path / "dalton-data"
+    refresh_marker = data_root / "refresh-started"
+    _prepare_bbg_data_root(data_root, _refresh_script(marker=refresh_marker))
+    cfg, bridge = _bridge_for_data_root(
+        bridge_mod, monkeypatch, data_root, ocw_root=None
+    )
+    assert cfg.ocw_root_explicit is False
+    assert cfg.ocw_root_raw == default_ws
+    assert not default_ws.exists()
+
+    status_formal, resp_formal = await bridge.handle_data_task_host_run(
+        _host_run_body(1, "run-unset-formal", is_trial=False)
+    )
+    _assert_prestart_refusal(status_formal, resp_formal, "consumer_root_not_configured", trial=False)
+    assert not refresh_marker.exists()
+    assert not (data_root / ".dalton-runs").exists()
+    assert not (data_root / ".dalton-host-runner-state.json").exists()
+    _assert_home_untouched(home)
+    assert _cwd_bbg_snapshot() == cwd_before
+
+    override_marker = data_root / "override-ran"
+    override_script = tmp_path / "override_ok.py"
+    override_script.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(override_marker)!r}).write_text('ran', encoding='utf-8')\n"
+        "print('ok')\n",
+        encoding="utf-8",
+    )
+    bridge._host_task_command_override = [sys.executable, str(override_script)]
+    status_override, resp_override = await bridge.handle_data_task_host_run(
+        _host_run_body(2, "run-override", is_trial=False)
+    )
+    assert status_override == 200
+    assert resp_override["ok"] is True
+    assert resp_override["exit_code"] == 0
+    assert "error" not in resp_override
+    assert resp_override["consumer_sync"] is None
+    assert override_marker.read_text(encoding="utf-8") == "ran"
+    assert not refresh_marker.exists()
+    _assert_home_untouched(home)
+    bridge._host_task_command_override = None
+
+    status_trial, resp_trial = await bridge.handle_data_task_host_run(
+        _host_run_body(3, "run-unset-trial", is_trial=True)
+    )
+    assert status_trial == 200
+    assert resp_trial["ok"] is True
+    assert resp_trial["exit_code"] == 0
+    assert resp_trial["consumer_sync"]["skipped"] is True
+    assert resp_trial["consumer_sync"]["synced"] is False
+    assert refresh_marker.read_text(encoding="utf-8") == "started\n"
+    assert (data_root / ".dalton-runs" / "run-unset-trial").is_dir()
+    _assert_home_untouched(home)
+    assert _cwd_bbg_snapshot() == cwd_before
+
+    status_mirror, resp_mirror = await bridge.handle_data_task_host_run(
+        _host_run_body(4, "run-mirror", host_mode="mirror")
+    )
+    assert status_mirror == 200
+    assert resp_mirror["ok"] is False
+    assert resp_mirror["exit_code"] == 1
+    assert resp_mirror["error"] == "openclaw_not_updated"
+    assert resp_mirror["consumer_sync"] is None
+    _assert_home_untouched(home)
+    assert _cwd_bbg_snapshot() == cwd_before
+
+    blank_root = tmp_path / "blank-data"
+    blank_marker = blank_root / "refresh-started"
+    _prepare_bbg_data_root(blank_root, _refresh_script(marker=blank_marker))
+    monkeypatch.setenv("DALTON_OCW_ROOT", "   ")
+    cfg_blank = bridge_mod.BridgeConfig()
+    cfg_blank.admin_token = "test-bridge-admin-token"
+    cfg_blank.data_tasks_data_root = blank_root
+    cfg_blank.host_task_sigterm_grace_s = 1.0
+    bridge_blank = bridge_mod.ResearchDataBridge(cfg_blank)
+    assert cfg_blank.ocw_root_explicit is False
+    assert cfg_blank.ocw_root_raw is None
+    assert cfg_blank.ocw_root == Path()
+
+    status_blank, resp_blank = await bridge_blank.handle_data_task_host_run(
+        _host_run_body(1, "run-blank-formal", is_trial=False)
+    )
+    _assert_prestart_refusal(status_blank, resp_blank, "consumer_root_not_configured", trial=False)
+    assert not blank_marker.exists()
+    assert not (blank_root / ".dalton-runs").exists()
+    _assert_home_untouched(home)
+    assert _cwd_bbg_snapshot() == cwd_before
+
+
+@pytest.mark.asyncio
+async def test_bridge_host_run_explicit_missing_or_file_consumer_root_creates_no_parents(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import scripts.dalton.researchdata_bridge as bridge_mod
+
+    home = tmp_path / "home"
+    _isolate_bridge_config_env(monkeypatch, home)
+
+    missing_parent = tmp_path / "no-such-parent"
+    missing_consumer = missing_parent / "consumer"
+    missing_data = tmp_path / "missing-data"
+    missing_marker = missing_data / "refresh-started"
+    _prepare_bbg_data_root(missing_data, _refresh_script(marker=missing_marker))
+    cfg_missing, bridge_missing = _bridge_for_data_root(
+        bridge_mod, monkeypatch, missing_data, ocw_root=missing_consumer
+    )
+    assert cfg_missing.ocw_root_explicit is True
+    assert cfg_missing.ocw_root_raw == missing_consumer
+    assert missing_consumer.is_relative_to(tmp_path)
+
+    status_missing, resp_missing = await bridge_missing.handle_data_task_host_run(
+        _host_run_body(1, "run-missing-consumer", is_trial=False)
+    )
+    assert status_missing == 200
+    assert resp_missing["ok"] is False
+    assert resp_missing["exit_code"] == 1
+    assert resp_missing["exit_confirmed"] is True
+    assert resp_missing["timed_out"] is False
+    assert resp_missing["killed_by_host_kill"] is False
+    assert resp_missing["error"] == "consumer_root_not_found"
+    assert resp_missing["consumer_sync"]["reason"] == "consumer_root_not_found"
+    assert resp_missing["consumer_sync"]["xlsx_replaced"] is False
+    assert resp_missing["consumer_sync"]["csv_replaced"] is False
+    assert resp_missing["consumer_sync"]["partial_replace"] is False
+    assert resp_missing["consumer_sync"]["retryable"] is False
+    assert missing_marker.read_text(encoding="utf-8") == "started\n"
+    assert (missing_data / ".dalton-runs" / "run-missing-consumer").is_dir()
+    assert not missing_parent.exists()
+    assert _evaluate_host_response(resp_missing).failure_reason == "consumer_root_not_found"
+    _assert_home_untouched(home)
+
+    file_consumer = tmp_path / "consumer-as-file"
+    file_consumer.write_bytes(b"keep-these-bytes")
+    file_data = tmp_path / "file-data"
+    file_marker = file_data / "refresh-started"
+    _prepare_bbg_data_root(file_data, _refresh_script(marker=file_marker))
+    cfg_file, bridge_file = _bridge_for_data_root(
+        bridge_mod, monkeypatch, file_data, ocw_root=file_consumer
+    )
+    assert cfg_file.ocw_root_explicit is True
+    assert cfg_file.ocw_root_raw == file_consumer
+
+    status_file, resp_file = await bridge_file.handle_data_task_host_run(
+        _host_run_body(1, "run-file-consumer", is_trial=False)
+    )
+    assert status_file == 200
+    assert resp_file["ok"] is False
+    assert resp_file["exit_code"] == 1
+    assert resp_file["error"] == "consumer_root_not_directory"
+    assert resp_file["consumer_sync"]["reason"] == "consumer_root_not_directory"
+    assert resp_file["consumer_sync"]["xlsx_replaced"] is False
+    assert resp_file["consumer_sync"]["csv_replaced"] is False
+    assert resp_file["consumer_sync"]["retryable"] is False
+    assert file_consumer.is_file()
+    assert file_consumer.read_bytes() == b"keep-these-bytes"
+    assert not (file_consumer / "temp").exists()
+    assert file_marker.read_text(encoding="utf-8") == "started\n"
+    assert _evaluate_host_response(resp_file).failure_reason == "consumer_root_not_directory"
+    _assert_home_untouched(home)
+
+
+@pytest.mark.asyncio
+async def test_bridge_host_run_signal_during_refresh_does_not_sync_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import scripts.dalton.researchdata_bridge as bridge_mod
+
+    home = tmp_path / "home"
+    _isolate_bridge_config_env(monkeypatch, home)
+    consumer = tmp_path / "consumer"
+    legacy_csv, legacy_xlsx = _seed_consumer_files(consumer)
+    data_root = tmp_path / "dalton-data"
+    started = data_root / "refresh-started"
+    finished = data_root / "refresh-finished"
+    _prepare_bbg_data_root(
+        data_root,
+        _refresh_script(marker=started, sleep_s=30, finished=finished),
+    )
+    cfg, bridge = _bridge_for_data_root(
+        bridge_mod, monkeypatch, data_root, ocw_root=consumer
+    )
+    assert cfg.ocw_root_explicit is True
+    assert cfg.ocw_root_raw == consumer
+    assert consumer.is_relative_to(tmp_path)
+
+    def _ready() -> int | None:
+        if not started.is_file() or not bridge._host_active_runs:
+            return None
+        return int(next(iter(bridge._host_active_runs)))
+
+    status, resp, gate_pid, group_alive = await _signal_running_host_run(
+        bridge,
+        _host_run_body(1, "run-signal-during-refresh"),
+        signal.SIGTERM,
+        _ready,
+    )
+    assert status == 200
+    assert resp["ok"] is False
+    assert resp["exit_code"] not in (0, 124, 125)
+    assert resp["timed_out"] is False
+    assert resp["killed_by_host_kill"] is False
+    assert resp["exit_confirmed"] is True
+    assert group_alive is False
+    assert resp["consumer_sync"] is None
+    assert "Traceback" not in (resp["stderr"] or "")
+    assert started.read_text(encoding="utf-8") == "started\n"
+    assert not finished.exists()
+    assert (consumer / "temp" / "bbg_data_latest.csv").read_text(encoding="utf-8") == legacy_csv
+    assert (consumer / "temp" / "bbg_data_remote.xlsx").read_bytes() == legacy_xlsx
+    assert sorted(path.name for path in (consumer / "temp").iterdir()) == [
+        "bbg_data_latest.csv",
+        "bbg_data_remote.xlsx",
+    ]
+    _assert_no_tmp_files(consumer)
+    _assert_home_untouched(home)
+    evaluation = _evaluate_host_response(resp)
+    assert evaluation.ok is False
+    assert evaluation.failure_reason == f"exit_code_{resp['exit_code']}"
+    assert gate_pid > 1
+
+
+@pytest.mark.asyncio
+async def test_bridge_host_run_signal_during_stage_leaves_consumer_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import scripts.dalton.researchdata_bridge as bridge_mod
+
+    home = tmp_path / "home"
+    _isolate_bridge_config_env(monkeypatch, home)
+    consumer = tmp_path / "consumer"
+    legacy_csv, legacy_xlsx = _seed_consumer_files(consumer)
+    data_root = tmp_path / "dalton-data"
+    marker = data_root / "refresh-started"
+    _prepare_bbg_data_root(data_root, _refresh_script(marker=marker))
+    control = tmp_path / "checkpoint-before-stage.txt"
+    control.write_text("before_stage\n", encoding="utf-8")
+    assert control.is_absolute()
+    monkeypatch.setenv("DALTON_BRIDGE_TEST_MODE", "1")
+    monkeypatch.setenv("DALTON_BBG_CONSUMER_SYNC_CHECKPOINT", str(control))
+    phase_path = control.with_name(control.name + ".phase")
+    cfg, bridge = _bridge_for_data_root(
+        bridge_mod, monkeypatch, data_root, ocw_root=consumer
+    )
+    assert cfg.ocw_root_explicit is True
+    assert cfg.ocw_root_raw == consumer
+
+    def _ready() -> int | None:
+        pid = _read_phase_pid(phase_path, "before_stage")
+        if pid is None or pid not in bridge._host_active_runs:
+            return None
+        return pid
+
+    status, resp, _gate_pid, group_alive = await _signal_running_host_run(
+        bridge,
+        _host_run_body(1, "run-signal-before-stage"),
+        signal.SIGTERM,
+        _ready,
+    )
+    assert status == 200
+    assert group_alive is False
+    assert resp["ok"] is False
+    assert resp["timed_out"] is False
+    assert resp["killed_by_host_kill"] is False
+    assert resp["exit_confirmed"] is True
+    assert resp["exit_code"] in {-signal.SIGTERM, 128 + signal.SIGTERM}
+    assert resp["error"] == "consumer_sync_interrupted"
+    sync = resp["consumer_sync"]
+    assert sync["reason"] == "consumer_sync_interrupted"
+    assert sync["xlsx_replaced"] is False
+    assert sync["csv_replaced"] is False
+    assert sync["partial_replace"] is False
+    assert sync["retryable"] is True
+    assert resp["after_source_summary"]["summary_complete"] is False
+    assert resp["after_source_summary"]["incomplete_reason"] == "consumer_sync_interrupted"
+    assert resp["after_source_summary"]["capture_scope"] == "gate_error_exit"
+    assert (
+        resp["after_source_summary"]["legacy_ocw_root"]["csv"]["sha256"]
+        != resp["after_source_summary"]["dalton_data_root"]["csv"]["sha256"]
+    )
+    assert (
+        resp["after_source_summary"]["legacy_ocw_root"]["xlsx"]["sha256"]
+        != resp["after_source_summary"]["dalton_data_root"]["xlsx"]["sha256"]
+    )
+    assert marker.read_text(encoding="utf-8") == "started\n"
+    assert (consumer / "temp" / "bbg_data_latest.csv").read_text(encoding="utf-8") == legacy_csv
+    assert (consumer / "temp" / "bbg_data_remote.xlsx").read_bytes() == legacy_xlsx
+    assert sorted(path.name for path in (consumer / "temp").iterdir()) == [
+        "bbg_data_latest.csv",
+        "bbg_data_remote.xlsx",
+    ]
+    _assert_no_tmp_files(consumer)
+    assert "Traceback" not in (resp["stderr"] or "")
+    assert _evaluate_host_response(resp).failure_reason == "consumer_sync_interrupted"
+    _assert_home_untouched(home)
+
+
+@pytest.mark.asyncio
+async def test_bridge_host_run_signal_after_xlsx_replace_does_not_replace_csv(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import scripts.dalton.researchdata_bridge as bridge_mod
+
+    home = tmp_path / "home"
+    _isolate_bridge_config_env(monkeypatch, home)
+    consumer = tmp_path / "consumer"
+    legacy_csv, legacy_xlsx = _seed_consumer_files(consumer)
+    data_root = tmp_path / "dalton-data"
+    _prepare_bbg_data_root(data_root, _refresh_script())
+    valid_xlsx = (data_root / "temp" / "bbg_data_remote.xlsx").read_bytes()
+    control = tmp_path / "checkpoint-before-csv.txt"
+    control.write_text("before_csv_replace\n", encoding="utf-8")
+    monkeypatch.setenv("DALTON_BRIDGE_TEST_MODE", "1")
+    monkeypatch.setenv("DALTON_BBG_CONSUMER_SYNC_CHECKPOINT", str(control))
+    phase_path = control.with_name(control.name + ".phase")
+    cfg, bridge = _bridge_for_data_root(
+        bridge_mod, monkeypatch, data_root, ocw_root=consumer
+    )
+    assert cfg.ocw_root_explicit is True
+    assert cfg.ocw_root_raw == consumer
+    assert legacy_xlsx != valid_xlsx
+
+    def _ready() -> int | None:
+        pid = _read_phase_pid(phase_path, "before_csv_replace")
+        if pid is None or pid not in bridge._host_active_runs:
+            return None
+        return pid
+
+    status, resp, _gate_pid, group_alive = await _signal_running_host_run(
+        bridge,
+        _host_run_body(1, "run-signal-before-csv"),
+        signal.SIGINT,
+        _ready,
+    )
+    assert status == 200
+    assert group_alive is False
+    assert resp["ok"] is False
+    assert resp["timed_out"] is False
+    assert resp["killed_by_host_kill"] is False
+    assert resp["exit_confirmed"] is True
+    assert resp["exit_code"] in {-signal.SIGINT, 128 + signal.SIGINT}
+    assert resp["error"] == "consumer_sync_interrupted"
+    sync = resp["consumer_sync"]
+    assert sync["reason"] == "consumer_sync_interrupted"
+    assert sync["xlsx_replaced"] is True
+    assert sync["csv_replaced"] is False
+    assert sync["partial_replace"] is True
+    assert sync["retryable"] is True
+    assert Path(sync["ocw_root"]) == consumer
+    assert resp["after_source_summary"]["summary_complete"] is False
+    assert resp["after_source_summary"]["incomplete_reason"] == "consumer_sync_interrupted"
+    assert resp["after_source_summary"]["capture_scope"] == "gate_error_exit"
+    assert (
+        resp["after_source_summary"]["legacy_ocw_root"]["xlsx"]["sha256"]
+        == resp["after_source_summary"]["dalton_data_root"]["xlsx"]["sha256"]
+    )
+    assert (
+        resp["after_source_summary"]["legacy_ocw_root"]["csv"]["sha256"]
+        != resp["after_source_summary"]["dalton_data_root"]["csv"]["sha256"]
+    )
+    assert (consumer / "temp" / "bbg_data_remote.xlsx").read_bytes() == valid_xlsx
+    assert (consumer / "temp" / "bbg_data_latest.csv").read_text(encoding="utf-8") == legacy_csv
+    assert sorted(path.name for path in (consumer / "temp").iterdir()) == [
+        "bbg_data_latest.csv",
+        "bbg_data_remote.xlsx",
+    ]
+    _assert_no_tmp_files(consumer)
+    assert "Traceback" not in (resp["stderr"] or "")
+    assert _evaluate_host_response(resp).failure_reason == "consumer_sync_interrupted"
+    _assert_home_untouched(home)
+
+
+@pytest.mark.asyncio
+async def test_bridge_host_run_rejects_raw_source_symlink_before_subprocess(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import scripts.dalton.researchdata_bridge as bridge_mod
+
+    home = tmp_path / "home"
+    _isolate_bridge_config_env(monkeypatch, home)
+    for alias in (Path("/tmp"), Path("/var"), Path("/etc")):
+        assert alias in bridge_mod._ALLOWED_SYSTEM_ROOT_SYMLINKS
+        assert bridge_mod._has_disallowed_path_symlink(alias) is False
+
+    real_data = tmp_path / "real-data"
+    refresh_marker = real_data / "refresh-started"
+    _prepare_bbg_data_root(real_data, _refresh_script(marker=refresh_marker))
+    link = tmp_path / "linked-data"
+    link.symlink_to(real_data, target_is_directory=True)
+    assert bridge_mod._bbg_refresh_source_has_disallowed_symlink(link) is True
+    cfg_link, bridge_link = _bridge_for_data_root(
+        bridge_mod, monkeypatch, link, ocw_root=None
+    )
+    assert cfg_link.data_tasks_data_root == link
+    assert cfg_link.ocw_root_explicit is False
+
+    status_trial, resp_trial = await bridge_link.handle_data_task_host_run(
+        _host_run_body(1, "run-source-symlink-trial", is_trial=True)
+    )
+    _assert_prestart_refusal(status_trial, resp_trial, "bbg_source_symlink_rejected", trial=True)
+    status_formal, resp_formal = await bridge_link.handle_data_task_host_run(
+        _host_run_body(2, "run-source-symlink-formal", is_trial=False)
+    )
+    _assert_prestart_refusal(
+        status_formal, resp_formal, "bbg_source_symlink_rejected", trial=False
+    )
+    assert not refresh_marker.exists()
+    assert not (real_data / ".dalton-runs").exists()
+    assert not (real_data / ".dalton-host-runner-state.json").exists()
+
+    override_marker = real_data / "override-ran"
+    override_script = tmp_path / "override_on_symlink.py"
+    override_script.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(override_marker)!r}).write_text('ran', encoding='utf-8')\n"
+        "print('ok')\n",
+        encoding="utf-8",
+    )
+    bridge_link._host_task_command_override = [sys.executable, str(override_script)]
+    status_override, resp_override = await bridge_link.handle_data_task_host_run(
+        _host_run_body(3, "run-override-on-symlink", is_trial=False)
+    )
+    assert status_override == 200
+    assert resp_override["ok"] is True
+    assert resp_override["exit_code"] == 0
+    assert override_marker.read_text(encoding="utf-8") == "ran"
+    assert not refresh_marker.exists()
+    assert (real_data / ".dalton-runs" / "run-override-on-symlink").is_dir()
+
+    cfg_real, bridge_real = _bridge_for_data_root(
+        bridge_mod, monkeypatch, real_data, ocw_root=None
+    )
+    assert bridge_mod._bbg_refresh_source_has_disallowed_symlink(real_data) is False
+    assert cfg_real.data_tasks_data_root == real_data
+    status_normal, resp_normal = await bridge_real.handle_data_task_host_run(
+        _host_run_body(4, "run-normal-trial", is_trial=True)
+    )
+    assert status_normal == 200
+    assert resp_normal["ok"] is True
+    assert resp_normal["exit_code"] == 0
+    assert refresh_marker.read_text(encoding="utf-8") == "started\n"
+    assert (real_data / ".dalton-runs" / "run-normal-trial").is_dir()
+    _assert_home_untouched(home)
+
+    allow_root = Path("/tmp") / f"dalton-bbg-allow-{os.getpid()}-{tmp_path.name}"
+    assert allow_root.parent == Path("/tmp")
+    assert allow_root.name.startswith("dalton-bbg-allow-")
+    assert ".openclaw" not in allow_root.parts
+    try:
+        if allow_root.exists():
+            shutil.rmtree(allow_root)
+        allow_marker = allow_root / "refresh-started"
+        _prepare_bbg_data_root(allow_root, _refresh_script(marker=allow_marker))
+        assert bridge_mod._bbg_refresh_source_has_disallowed_symlink(allow_root) is False
+        _cfg_allow, bridge_allow = _bridge_for_data_root(
+            bridge_mod, monkeypatch, allow_root, ocw_root=None
+        )
+        status_allow, resp_allow = await bridge_allow.handle_data_task_host_run(
+            _host_run_body(1, "run-tmp-alias-trial", is_trial=True)
+        )
+        assert status_allow == 200
+        assert resp_allow["ok"] is True
+        assert resp_allow["exit_code"] == 0
+        assert allow_marker.read_text(encoding="utf-8") == "started\n"
+        assert (allow_root / ".dalton-runs" / "run-tmp-alias-trial").is_dir()
+        _assert_home_untouched(home)
+    finally:
+        shutil.rmtree(allow_root, ignore_errors=True)
