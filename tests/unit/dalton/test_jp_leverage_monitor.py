@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import importlib.util
+import inspect
 import io
 import json
 from pathlib import Path
@@ -737,9 +738,8 @@ def test_old_history_compatibility_and_complementary_field_merge(tmp_path: Path)
 
     csv_path = tmp_path / "margin_weekly.csv"
     # Pre-seed an older historical row that must be preserved.
-    cli.merge_rows(
+    cli.merge_margin_rows(
         csv_path,
-        cli.MARGIN_HEADER,
         [
             {
                 "date": "2026-09-11",
@@ -758,8 +758,8 @@ def test_old_history_compatibility_and_complementary_field_merge(tmp_path: Path)
     )
 
     # 1. Write detailed margin row first, then merge partial JSF row: margin columns must not be erased.
-    cli.merge_rows(csv_path, cli.MARGIN_HEADER, detailed_rows)
-    cli.merge_rows(csv_path, cli.MARGIN_HEADER, jsf_rows)
+    cli.merge_margin_rows(csv_path, detailed_rows)
+    cli.merge_margin_rows(csv_path, jsf_rows)
     stored = cli.read_rows(csv_path)
     assert set(stored) == {"2026-09-11", "2026-09-18"}
     assert float(stored["2026-09-18"]["short_shares_k"]) == 510000.0
@@ -776,7 +776,12 @@ def test_old_history_compatibility_and_complementary_field_merge(tmp_path: Path)
             "jsf_funding_value_mjpy": "",
         }
     ]
-    cli.merge_rows(csv_path, cli.MARGIN_HEADER, partial_margin_update)
+    cli.merge_rows(
+        csv_path,
+        cli.MARGIN_HEADER,
+        partial_margin_update,
+        preserve_complementary=True,
+    )
     stored_after = cli.read_rows(csv_path)
     assert float(stored_after["2026-09-18"]["short_shares_k"]) == 512000.0
     assert float(stored_after["2026-09-18"]["long_value_mjpy"]) == 6100000.0
@@ -785,6 +790,104 @@ def test_old_history_compatibility_and_complementary_field_merge(tmp_path: Path)
     assert float(stored_after["2026-09-11"]["short_shares_k"]) == 500000.0
     # Ensure no leftover temp files remain next to the CSV.
     assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_non_margin_providers_overwrite_same_day_explicit_nulls_while_margin_preserves_complementary_fields(
+    tmp_path: Path,
+) -> None:
+    cli = _load_cli_module()
+
+    # Validate helper signatures via inspect.signature.bind.
+    inspect.signature(cli.merge_rows).bind(
+        tmp_path / "jsf.csv",
+        cli.JSF_HIST_HEADER,
+        [],
+        ("date", "code"),
+        preserve_complementary=False,
+    )
+    inspect.signature(cli.merge_margin_rows).bind(
+        tmp_path / "margin_weekly.csv",
+        [],
+        cli.MARGIN_HEADER,
+        ("date",),
+    )
+
+    # 1. Non-margin providers (default preserve_complementary=False) must overwrite prior values
+    #    when a same-key update explicitly sets a field to None (e.g. JSF loan_price_jpy=None on "-").
+    jsf_csv = tmp_path / "jsf_issue_history.csv"
+    cli.merge_rows(
+        jsf_csv,
+        cli.JSF_HIST_HEADER,
+        [
+            {
+                "date": "2026-11-06",
+                "code": "285A",
+                "name": "Kioxia Holdings",
+                "funding_shares": 120000,
+                "stockloan_shares": 45000,
+                "net_shares": 75000,
+                "loan_price_jpy": 1650.0,
+            }
+        ],
+        ("date", "code"),
+    )
+    assert float(cli.read_rows(jsf_csv, ("date", "code"))["2026-11-06|285A"]["loan_price_jpy"]) == 1650.0
+
+    cli.merge_rows(
+        jsf_csv,
+        cli.JSF_HIST_HEADER,
+        [
+            {
+                "date": "2026-11-06",
+                "code": "285A",
+                "name": "Kioxia Holdings",
+                "funding_shares": 125000,
+                "stockloan_shares": 40000,
+                "net_shares": 85000,
+                "loan_price_jpy": None,
+            }
+        ],
+        ("date", "code"),
+    )
+    jsf_stored = cli.read_rows(jsf_csv, ("date", "code"))["2026-11-06|285A"]
+    assert int(jsf_stored["funding_shares"]) == 125000
+    assert jsf_stored["loan_price_jpy"] == ""
+
+    # 2. JPX market-wide margin (merge_margin_rows / preserve_complementary=True) still preserves
+    #    complementary fields across partial detailed-margin and JSF records on the same date.
+    margin_csv = tmp_path / "margin_weekly.csv"
+    cli.merge_margin_rows(
+        margin_csv,
+        [
+            {
+                "date": "2026-09-18",
+                "short_shares_k": 510000.0,
+                "short_value_mjpy": 980000.0,
+                "long_shares_k": 3400000.0,
+                "long_value_mjpy": 6100000.0,
+                "neg_short_value_mjpy": 420000.0,
+                "std_short_value_mjpy": 560000.0,
+                "neg_long_value_mjpy": 2800000.0,
+                "std_long_value_mjpy": 3300000.0,
+            }
+        ],
+    )
+    cli.merge_margin_rows(
+        margin_csv,
+        [
+            {
+                "date": "2026-09-18",
+                "short_shares_k": None,
+                "jsf_stock_loan_value_mjpy": 205000.0,
+                "jsf_funding_value_mjpy": 430000.0,
+            }
+        ],
+    )
+    margin_stored = cli.read_rows(margin_csv)["2026-09-18"]
+    assert float(margin_stored["short_shares_k"]) == 510000.0
+    assert float(margin_stored["long_value_mjpy"]) == 6100000.0
+    assert float(margin_stored["jsf_stock_loan_value_mjpy"]) == 205000.0
+    assert float(margin_stored["jsf_funding_value_mjpy"]) == 430000.0
 
 
 def test_explicit_finite_zero_preserved_in_workbooks_pdf_and_merges(
@@ -828,9 +931,8 @@ def test_explicit_finite_zero_preserved_in_workbooks_pdf_and_merges(
         assert parsed[0][col] == 0.0
 
     csv_path = tmp_path / "margin_weekly.csv"
-    cli.merge_rows(
+    cli.merge_margin_rows(
         csv_path,
-        cli.MARGIN_HEADER,
         [
             {
                 "date": "2026-10-30",
@@ -848,11 +950,12 @@ def test_explicit_finite_zero_preserved_in_workbooks_pdf_and_merges(
         ],
     )
     # Overwrite with explicit zeros, then merge a partial row with None: zeros must be retained.
-    cli.merge_rows(csv_path, cli.MARGIN_HEADER, parsed)
+    cli.merge_margin_rows(csv_path, parsed)
     cli.merge_rows(
         csv_path,
         cli.MARGIN_HEADER,
         [{"date": "2026-10-30", "short_shares_k": None, "jsf_funding_value_mjpy": float("nan")}],
+        preserve_complementary=True,
     )
     stored = cli.read_rows(csv_path)["2026-10-30"]
     for col in cli.MARGIN_HEADER[1:]:
@@ -863,7 +966,8 @@ def test_explicit_finite_zero_preserved_in_workbooks_pdf_and_merges(
         "B キオクシアホールディングス 普通株式 プライム 貸 285A0 JP3236330001 株数 Shs. "
         "0 0 * 0 0 - 0 0 0 0 0 0 0 0\n"
     )
-    pdf_text_mock = create_autospec(cli.pdf_text, return_value=zero_pdf_text)
+    orig_pdf_text = cli.pdf_text
+    pdf_text_mock = create_autospec(orig_pdf_text, return_value=zero_pdf_text)
     monkeypatch.setattr(cli, "pdf_text", pdf_text_mock)
     kioxia_zero = cli.parse_kioxia_pdf(b"%PDF-stub", "https://www.jpx.co.jp/01/20261106_mtall.pdf")
     assert kioxia_zero == {
@@ -1082,40 +1186,27 @@ def test_link_discovery_independent_of_page_ordering_and_relative_url_resolution
     ]
 
 
-def test_jpx_refresh_failure_preserves_unrelated_sources_and_exposes_nonzero_exit(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    cli = _load_cli_module()
-    out_root = tmp_path / "jp-leverage"
-    data_dir = out_root / "data"
-    html_path = out_root / "index.html"
-    monkeypatch.setattr(cli, "OUT_ROOT", out_root)
-    monkeypatch.setattr(cli, "DATA_DIR", data_dir)
-    monkeypatch.setattr(cli, "HTML_PATH", html_path)
-
-    # Pre-seed core CSVs so build_dashboard() can run while sync_kioxia_weekly fails.
-    cli.merge_rows(
-        data_dir / "margin_weekly.csv",
-        cli.MARGIN_HEADER,
-        [
-            {
-                "date": f"2026-10-{d:02d}",
-                "short_shares_k": 340000.0 + d,
-                "short_value_mjpy": 640000.0 + d,
-                "long_shares_k": 3600000.0 + d,
-                "long_value_mjpy": 6500000.0 + d,
-                "neg_short_value_mjpy": 170000.0,
-                "std_short_value_mjpy": 470000.0,
-                "neg_long_value_mjpy": 2900000.0,
-                "std_long_value_mjpy": 3600000.0,
-                "jsf_stock_loan_value_mjpy": 190000.0,
-                "jsf_funding_value_mjpy": 380000.0,
-            }
-            for d in range(1, 7)
-        ],
-    )
+def _seed_dashboard_inputs(cli, data_dir: Path, include_margin: bool = True) -> None:
+    if include_margin:
+        cli.merge_margin_rows(
+            data_dir / "margin_weekly.csv",
+            [
+                {
+                    "date": f"2026-10-{d:02d}",
+                    "short_shares_k": 340000.0 + d,
+                    "short_value_mjpy": 640000.0 + d,
+                    "long_shares_k": 3600000.0 + d,
+                    "long_value_mjpy": 6500000.0 + d,
+                    "neg_short_value_mjpy": 170000.0,
+                    "std_short_value_mjpy": 470000.0,
+                    "neg_long_value_mjpy": 2900000.0,
+                    "std_long_value_mjpy": 3600000.0,
+                    "jsf_stock_loan_value_mjpy": 190000.0,
+                    "jsf_funding_value_mjpy": 380000.0,
+                }
+                for d in range(1, 7)
+            ],
+        )
     cli.merge_rows(
         data_dir / "etf_nav_units_daily.csv",
         cli.ETF_HEADER,
@@ -1137,23 +1228,75 @@ def test_jpx_refresh_failure_preserves_unrelated_sources_and_exposes_nonzero_exi
         ],
         ("date", "code"),
     )
-
     cli.merge_rows(
         data_dir / "etf_prices_daily.csv",
         cli.ETF_PX_HEADER,
         [
             {
-                "date": "2026-10-06", "code": code,
-                "name": cli.ETF_SPECS[code][0], "open": 29900.0,
-                "high": 30100.0, "low": 29800.0, "close": 30000.0,
-                "volume": 1000000.0, "turnover_bnjpy": 30.0,
+                "date": "2026-10-06",
+                "code": code,
+                "name": cli.ETF_SPECS[code][0],
+                "open": 29900.0,
+                "high": 30100.0,
+                "low": 29800.0,
+                "close": 30000.0,
+                "volume": 1000000.0,
+                "turnover_bnjpy": 30.0,
             }
             for code in ("1570", "1357")
         ],
         ("date", "code"),
     )
 
-    def _fake_get(url: str, **kwargs) -> requests.Response:
+
+def _write_reference_fixture(cli, data_dir: Path) -> None:
+    cli.merge_rows(
+        data_dir / "market_reference.csv",
+        cli.REF_HEADER,
+        [
+            {
+                "date": f"2026-10-{d:02d}",
+                "nikkei_close": 39000.0 + d * 10,
+                "nikkei_open": 38900.0,
+                "nikkei_high": 39100.0,
+                "nikkei_low": 38800.0,
+                "nikkei_vi_close": 20.0 + d * 0.1,
+                "nikkei_vi_open": 20.0,
+                "nikkei_vi_high": 21.0,
+                "nikkei_vi_low": 19.5,
+            }
+            for d in range(1, 7)
+        ],
+    )
+
+
+def test_jpx_refresh_failure_preserves_unrelated_sources_and_exposes_nonzero_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli = _load_cli_module()
+    out_root = tmp_path / "jp-leverage"
+    data_dir = out_root / "data"
+    html_path = out_root / "index.html"
+    monkeypatch.setattr(cli, "OUT_ROOT", out_root)
+    monkeypatch.setattr(cli, "DATA_DIR", data_dir)
+    monkeypatch.setattr(cli, "HTML_PATH", html_path)
+
+    _seed_dashboard_inputs(cli, data_dir, include_margin=True)
+
+    orig_get = cli.get
+    orig_pdf_text = cli.pdf_text
+    orig_sync_margin_weekly = cli.sync_margin_weekly
+    orig_sync_jsf_daily = cli.sync_jsf_daily
+    orig_sync_jsf_issue_history = cli.sync_jsf_issue_history
+    orig_sync_investor_flows = cli.sync_investor_flows
+    orig_sync_short_selling = cli.sync_short_selling
+    orig_sync_etf_units = cli.sync_etf_units
+    orig_sync_etf_prices = cli.sync_etf_prices
+    orig_sync_reference = cli.sync_reference
+
+    def _fake_get(url: str, **kw) -> requests.Response:
         resp = create_autospec(requests.Response, instance=True)
         if url == cli.STOCK_MARGIN_URL:
             resp.text = '<a href="tvdivq-att/20261106_mtall.pdf">PDF</a>'
@@ -1165,48 +1308,28 @@ def test_jpx_refresh_failure_preserves_unrelated_sources_and_exposes_nonzero_exi
             return resp
         raise AssertionError(f"Unexpected URL: {url}")
 
-    monkeypatch.setattr(cli, "get", create_autospec(cli.get, side_effect=_fake_get))
+    monkeypatch.setattr(cli, "get", create_autospec(orig_get, side_effect=_fake_get))
     monkeypatch.setattr(
         cli,
         "pdf_text",
-        create_autospec(cli.pdf_text, return_value="2026/11/6 申込み現在\nempty page\n"),
+        create_autospec(orig_pdf_text, return_value="2026/11/6 申込み現在\nempty page\n"),
     )
 
     # Kioxia sync must raise when all discovered PDFs yield 0 rows.
     with pytest.raises(RuntimeError, match="Kioxia daily margin refresh yielded 0 rows"):
         cli.sync_kioxia_weekly()
 
-    # In `run`, if sync_kioxia_weekly fails while sync_reference succeeds, unrelated source data
-    # (`market_reference.csv`) is still written, dashboard is built, and main() exits non-zero with ok=False.
     def _stub_reference() -> None:
-        cli.merge_rows(
-            data_dir / "market_reference.csv",
-            cli.REF_HEADER,
-            [
-                {
-                    "date": f"2026-10-{d:02d}",
-                    "nikkei_close": 39000.0 + d * 10,
-                    "nikkei_open": 38900.0,
-                    "nikkei_high": 39100.0,
-                    "nikkei_low": 38800.0,
-                    "nikkei_vi_close": 20.0 + d * 0.1,
-                    "nikkei_vi_open": 20.0,
-                    "nikkei_vi_high": 21.0,
-                    "nikkei_vi_low": 19.5,
-                }
-                for d in range(1, 7)
-            ],
-        )
+        _write_reference_fixture(cli, data_dir)
 
-    noop = lambda: None  # noqa: E731
-    monkeypatch.setattr(cli, "sync_margin_weekly", create_autospec(cli.sync_margin_weekly, side_effect=noop))
-    monkeypatch.setattr(cli, "sync_jsf_daily", create_autospec(cli.sync_jsf_daily, side_effect=noop))
-    monkeypatch.setattr(cli, "sync_jsf_issue_history", create_autospec(cli.sync_jsf_issue_history, side_effect=noop))
-    monkeypatch.setattr(cli, "sync_investor_flows", create_autospec(cli.sync_investor_flows, side_effect=lambda full=False: None))
-    monkeypatch.setattr(cli, "sync_short_selling", create_autospec(cli.sync_short_selling, side_effect=lambda full=False: None))
-    monkeypatch.setattr(cli, "sync_etf_units", create_autospec(cli.sync_etf_units, side_effect=noop))
-    monkeypatch.setattr(cli, "sync_etf_prices", create_autospec(cli.sync_etf_prices, side_effect=noop))
-    monkeypatch.setattr(cli, "sync_reference", create_autospec(cli.sync_reference, side_effect=_stub_reference))
+    monkeypatch.setattr(cli, "sync_margin_weekly", create_autospec(orig_sync_margin_weekly, return_value=None))
+    monkeypatch.setattr(cli, "sync_jsf_daily", create_autospec(orig_sync_jsf_daily, return_value=None))
+    monkeypatch.setattr(cli, "sync_jsf_issue_history", create_autospec(orig_sync_jsf_issue_history, return_value=None))
+    monkeypatch.setattr(cli, "sync_investor_flows", create_autospec(orig_sync_investor_flows, return_value=None))
+    monkeypatch.setattr(cli, "sync_short_selling", create_autospec(orig_sync_short_selling, return_value=None))
+    monkeypatch.setattr(cli, "sync_etf_units", create_autospec(orig_sync_etf_units, return_value=None))
+    monkeypatch.setattr(cli, "sync_etf_prices", create_autospec(orig_sync_etf_prices, return_value=None))
+    monkeypatch.setattr(cli, "sync_reference", create_autospec(orig_sync_reference, side_effect=_stub_reference))
     monkeypatch.setattr(sys, "argv", [str(CLI_PATH), "--json", "run"])
 
     with pytest.raises(SystemExit) as exc_info:
@@ -1224,6 +1347,210 @@ def test_jpx_refresh_failure_preserves_unrelated_sources_and_exposes_nonzero_exi
     html_text = html_path.read_text(encoding="utf-8")
     assert "Kioxia 个股信用余额（JPX 全市场日频余额）" in html_text
     assert "信用买残(JPX日频)" in html_text
+
+
+def test_latest_weekly_margin_failure_with_older_weekly_success_saves_valid_rows_and_exposes_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli = _load_cli_module()
+    out_root = tmp_path / "jp-leverage"
+    data_dir = out_root / "data"
+    html_path = out_root / "index.html"
+    monkeypatch.setattr(cli, "OUT_ROOT", out_root)
+    monkeypatch.setattr(cli, "DATA_DIR", data_dir)
+    monkeypatch.setattr(cli, "HTML_PATH", html_path)
+
+    _seed_dashboard_inputs(cli, data_dir, include_margin=False)
+
+    combined_bytes = _rows_to_xlsx_bytes("信用取引現在高", _build_combined_history_rows())
+    older_week_bytes = _rows_to_xlsx_bytes(
+        "レイアウト",
+        _build_current_week_rows(
+            app_date=dt.datetime(2026, 10, 30),
+            pub_date=dt.datetime(2026, 11, 4),
+        ),
+    )
+    bad_latest_week_bytes = _rows_to_xlsx_bytes("Unrelated", [["A", "B"], [1, 2]])
+
+    history_html = """
+    <table>
+      <tr><th>信用取引現在高</th><td><a href="tvdivq0000001rq1-att/tvdivq0000015969.xlsx">Excel</a></td></tr>
+    </table>
+    """
+    current_html = """
+    <table>
+      <tr><th>2026年10月30日申込現在</th><td><a href="tvdivq0000001rk9-att/20261030_mtcurrent.xlsx">Excel</a></td></tr>
+      <tr><th>2026年11月6日申込現在</th><td><a href="tvdivq0000001rk9-att/20261106_mtcurrent.xlsx">Excel</a></td></tr>
+    </table>
+    """
+
+    orig_get = cli.get
+    orig_sync_kioxia_weekly = cli.sync_kioxia_weekly
+    orig_sync_jsf_daily = cli.sync_jsf_daily
+    orig_sync_jsf_issue_history = cli.sync_jsf_issue_history
+    orig_sync_investor_flows = cli.sync_investor_flows
+    orig_sync_short_selling = cli.sync_short_selling
+    orig_sync_etf_units = cli.sync_etf_units
+    orig_sync_etf_prices = cli.sync_etf_prices
+    orig_sync_reference = cli.sync_reference
+
+    def _fake_get(url: str, **kw) -> requests.Response:
+        resp = create_autospec(requests.Response, instance=True)
+        if url == cli.MARGIN_HISTORY_URL:
+            resp.text = history_html
+            resp.content = history_html.encode("utf-8")
+            return resp
+        if url == cli.MARGIN_CURRENT_URL:
+            resp.text = current_html
+            resp.content = current_html.encode("utf-8")
+            return resp
+        if url.endswith("tvdivq0000015969.xlsx"):
+            resp.content = combined_bytes
+            return resp
+        if url.endswith("20261030_mtcurrent.xlsx"):
+            resp.content = older_week_bytes
+            return resp
+        if url.endswith("20261106_mtcurrent.xlsx"):
+            resp.content = bad_latest_week_bytes
+            return resp
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    def _stub_reference() -> None:
+        _write_reference_fixture(cli, data_dir)
+
+    monkeypatch.setattr(cli, "get", create_autospec(orig_get, side_effect=_fake_get))
+    monkeypatch.setattr(cli, "sync_kioxia_weekly", create_autospec(orig_sync_kioxia_weekly, return_value=None))
+    monkeypatch.setattr(cli, "sync_jsf_daily", create_autospec(orig_sync_jsf_daily, return_value=None))
+    monkeypatch.setattr(cli, "sync_jsf_issue_history", create_autospec(orig_sync_jsf_issue_history, return_value=None))
+    monkeypatch.setattr(cli, "sync_investor_flows", create_autospec(orig_sync_investor_flows, return_value=None))
+    monkeypatch.setattr(cli, "sync_short_selling", create_autospec(orig_sync_short_selling, return_value=None))
+    monkeypatch.setattr(cli, "sync_etf_units", create_autospec(orig_sync_etf_units, return_value=None))
+    monkeypatch.setattr(cli, "sync_etf_prices", create_autospec(orig_sync_etf_prices, return_value=None))
+    monkeypatch.setattr(cli, "sync_reference", create_autospec(orig_sync_reference, side_effect=_stub_reference))
+    monkeypatch.setattr(sys, "argv", [str(CLI_PATH), "--json", "run"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+    assert exc_info.value.code == 1
+
+    out = capsys.readouterr().out.strip()
+    payload = json.loads(out)
+    assert payload["ok"] is False
+    assert payload["update"]["ok"] is False
+    assert "sync_reference" in payload["update"]["done"]
+    margin_warnings = [w for w in payload["update"]["warnings"] if w["step"] == "sync_margin_weekly"]
+    assert len(margin_warnings) == 1
+    assert "20261106_mtcurrent.xlsx" in margin_warnings[0]["error"]
+    assert "Unrecognized" in margin_warnings[0]["error"]
+
+    # Valid rows from history and the older weekly workbook must still be saved.
+    stored_margin = cli.read_rows(data_dir / "margin_weekly.csv")
+    assert {"2026-09-25", "2026-10-30"} <= set(stored_margin)
+    assert float(stored_margin["2026-10-30"]["short_value_mjpy"]) == 643859.0
+    assert (data_dir / "market_reference.csv").is_file()
+
+
+def test_latest_kioxia_pdf_failure_with_older_pdf_success_saves_valid_rows_and_exposes_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli = _load_cli_module()
+    out_root = tmp_path / "jp-leverage"
+    data_dir = out_root / "data"
+    html_path = out_root / "index.html"
+    monkeypatch.setattr(cli, "OUT_ROOT", out_root)
+    monkeypatch.setattr(cli, "DATA_DIR", data_dir)
+    monkeypatch.setattr(cli, "HTML_PATH", html_path)
+
+    _seed_dashboard_inputs(cli, data_dir, include_margin=True)
+
+    stocks_html = """
+    <table>
+      <tr><th>2026年11月6日申込分</th><td><a href="tvdivq0000001rnl-att/20261106_mtall.pdf">PDF</a></td></tr>
+      <tr><th>2026年11月5日申込分</th><td><a href="tvdivq0000001rnl-att/20261105_mtall.pdf">PDF</a></td></tr>
+    </table>
+    """
+    older_pdf_text = (
+        "2026/11/5 申込み現在  （単位：一株、一円） 2026/11/6\n"
+        "B キオクシアホールディングス 普通株式 プライム 貸 285A0 JP3236330001 株数 Shs. "
+        "2,078,700 ▲ 15,200 * 52,850,100 ▲ 1,100,000 - 600,000 ▲ 5,000 1,478,700 ▲ 10,200 19,000,000 0 33,850,100 ▲ 1,100,000\n"
+    )
+    latest_pdf_no_kioxia_text = "2026/11/6 申込み現在  （単位：一株、一円） 2026/11/9\nother stock rows only\n"
+
+    orig_get = cli.get
+    orig_pdf_text = cli.pdf_text
+    orig_sync_margin_weekly = cli.sync_margin_weekly
+    orig_sync_jsf_daily = cli.sync_jsf_daily
+    orig_sync_jsf_issue_history = cli.sync_jsf_issue_history
+    orig_sync_investor_flows = cli.sync_investor_flows
+    orig_sync_short_selling = cli.sync_short_selling
+    orig_sync_etf_units = cli.sync_etf_units
+    orig_sync_etf_prices = cli.sync_etf_prices
+    orig_sync_reference = cli.sync_reference
+
+    def _fake_get(url: str, **kw) -> requests.Response:
+        resp = create_autospec(requests.Response, instance=True)
+        if url == cli.STOCK_MARGIN_URL:
+            resp.text = stocks_html
+            resp.content = stocks_html.encode("utf-8")
+            return resp
+        if url.endswith("20261106_mtall.pdf"):
+            resp.content = b"%PDF-20261106-missing-kioxia"
+            resp.text = ""
+            return resp
+        if url.endswith("20261105_mtall.pdf"):
+            resp.content = b"%PDF-20261105-valid"
+            resp.text = ""
+            return resp
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    def _fake_pdf_text(content: bytes) -> str:
+        if content == b"%PDF-20261106-missing-kioxia":
+            return latest_pdf_no_kioxia_text
+        if content == b"%PDF-20261105-valid":
+            return older_pdf_text
+        raise AssertionError(f"Unexpected PDF content: {content!r}")
+
+    def _stub_reference() -> None:
+        _write_reference_fixture(cli, data_dir)
+
+    monkeypatch.setattr(cli, "get", create_autospec(orig_get, side_effect=_fake_get))
+    monkeypatch.setattr(cli, "pdf_text", create_autospec(orig_pdf_text, side_effect=_fake_pdf_text))
+    monkeypatch.setattr(cli, "sync_margin_weekly", create_autospec(orig_sync_margin_weekly, return_value=None))
+    monkeypatch.setattr(cli, "sync_jsf_daily", create_autospec(orig_sync_jsf_daily, return_value=None))
+    monkeypatch.setattr(cli, "sync_jsf_issue_history", create_autospec(orig_sync_jsf_issue_history, return_value=None))
+    monkeypatch.setattr(cli, "sync_investor_flows", create_autospec(orig_sync_investor_flows, return_value=None))
+    monkeypatch.setattr(cli, "sync_short_selling", create_autospec(orig_sync_short_selling, return_value=None))
+    monkeypatch.setattr(cli, "sync_etf_units", create_autospec(orig_sync_etf_units, return_value=None))
+    monkeypatch.setattr(cli, "sync_etf_prices", create_autospec(orig_sync_etf_prices, return_value=None))
+    monkeypatch.setattr(cli, "sync_reference", create_autospec(orig_sync_reference, side_effect=_stub_reference))
+    monkeypatch.setattr(sys, "argv", [str(CLI_PATH), "--json", "run"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+    assert exc_info.value.code == 1
+
+    out = capsys.readouterr().out.strip()
+    payload = json.loads(out)
+    assert payload["ok"] is False
+    assert payload["update"]["ok"] is False
+    assert "sync_reference" in payload["update"]["done"]
+    kioxia_warnings = [w for w in payload["update"]["warnings"] if w["step"] == "sync_kioxia_weekly"]
+    assert len(kioxia_warnings) == 1
+    assert "20261106_mtall.pdf" in kioxia_warnings[0]["error"]
+    assert "Kioxia share row not found" in kioxia_warnings[0]["error"]
+
+    # Valid row from the older PDF must be saved before reporting step failure.
+    stored_kioxia = cli.read_rows(data_dir / "kioxia_margin_weekly.csv")
+    assert set(stored_kioxia) == {"2026-11-05"}
+    assert int(stored_kioxia["2026-11-05"]["short_shares"]) == 2078700
+    assert int(stored_kioxia["2026-11-05"]["short_change"]) == -15200
+    assert int(stored_kioxia["2026-11-05"]["long_shares"]) == 52850100
+    assert int(stored_kioxia["2026-11-05"]["long_change"]) == -1100000
+    assert (data_dir / "market_reference.csv").is_file()
 
 
 def test_sync_margin_weekly_combines_legacy_and_current_workbooks_and_fails_on_empty_current(
@@ -1257,7 +1584,9 @@ def test_sync_margin_weekly_combines_legacy_and_current_workbooks_and_fails_on_e
     </table>
     """
 
-    def _fake_get(url: str, **kwargs) -> requests.Response:
+    orig_get = cli.get
+
+    def _fake_get(url: str, **kw) -> requests.Response:
         resp = create_autospec(requests.Response, instance=True)
         if url == cli.MARGIN_HISTORY_URL:
             resp.text = history_html
@@ -1281,7 +1610,7 @@ def test_sync_margin_weekly_combines_legacy_and_current_workbooks_and_fails_on_e
             return resp
         raise AssertionError(f"Unexpected URL: {url}")
 
-    monkeypatch.setattr(cli, "get", create_autospec(cli.get, side_effect=_fake_get))
+    monkeypatch.setattr(cli, "get", create_autospec(orig_get, side_effect=_fake_get))
     cli.sync_margin_weekly()
 
     stored = cli.read_rows(tmp_path / "margin_weekly.csv")

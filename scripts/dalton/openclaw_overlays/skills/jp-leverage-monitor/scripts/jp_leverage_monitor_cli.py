@@ -213,12 +213,22 @@ def merge_margin_records(
     return bydate
 
 
-def merge_rows(path: Path, header: list[str], rows: list[dict], keycols=("date",)):
+def merge_rows(
+    path: Path,
+    header: list[str],
+    rows: list[dict],
+    keycols=("date",),
+    preserve_complementary: bool = False,
+):
+    """Merge keyed rows into CSV atomically; preserve prior non-null fields only when requested."""
     old = read_rows(path, keycols)
     before = len(old)
     for row in rows:
         key = "|".join(str(row[k]) for k in keycols)
-        old[key] = merge_record_fields(old.get(key), row, header)
+        if preserve_complementary:
+            old[key] = merge_record_fields(old.get(key), row, header)
+        else:
+            old[key] = {h: ("" if row.get(h) is None else row.get(h, "")) for h in header}
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
         dir=str(path.parent),
@@ -239,6 +249,22 @@ def merge_rows(path: Path, header: list[str], rows: list[dict], keycols=("date",
         tmp_path.unlink(missing_ok=True)
         raise
     return len(old) - before, len(old)
+
+
+def merge_margin_rows(
+    path: Path,
+    rows: list[dict],
+    header: list[str] | None = None,
+    keycols=("date",),
+):
+    """Persist JPX market-wide margin rows while preserving complementary fields across partial sources."""
+    return merge_rows(
+        path,
+        list(header or MARGIN_HEADER),
+        rows,
+        keycols=keycols,
+        preserve_complementary=True,
+    )
 
 
 # -------------------------- JPX market-wide weekly margin (official, 2002+)
@@ -602,38 +628,63 @@ def sync_margin_weekly():
         raise RuntimeError("JPX margin history workbooks not found")
 
     bydate: dict[str, dict] = {}
-    for url in hist_links["detailed"]:
-        merge_margin_records(bydate, parse_margin_book(get(url).content, True))
-    for url in hist_links["jsf"]:
-        merge_margin_records(bydate, parse_margin_book(get(url).content, False))
-    for url in hist_links["combined"]:
-        merge_margin_records(bydate, parse_margin_book(get(url).content))
+    hist_errors: list[str] = []
+    hist_specs: list[tuple[str, bool | None]] = (
+        [(u, True) for u in hist_links["detailed"]]
+        + [(u, False) for u in hist_links["jsf"]]
+        + [(u, None) for u in hist_links["combined"]]
+    )
+    for url, detailed_flag in hist_specs:
+        try:
+            parsed = parse_margin_book(get(url).content, detailed_flag)
+            if not parsed:
+                raise ValueError("workbook yielded no rows")
+            merge_margin_records(bydate, parsed)
+        except Exception as e:
+            hist_errors.append(f"{url}: {e}")
+            log(f"JPX margin history skip {url}: {e}")
     if not bydate:
-        raise RuntimeError("JPX margin history workbooks yielded no rows")
+        raise RuntimeError(
+            "JPX margin history workbooks yielded no rows"
+            + (f" ({'; '.join(hist_errors)})" if hist_errors else "")
+        )
 
     current_urls = discover_margin_current_links(MARGIN_CURRENT_URL)
     if not current_urls:
+        merge_margin_rows(DATA_DIR / "margin_weekly.csv", list(bydate.values()), MARGIN_HEADER)
         raise RuntimeError("JPX current weekly margin workbooks not found")
     current_rows: list[dict] = []
     current_errors: list[str] = []
     for url in sorted(current_urls):
         try:
             parsed = parse_margin_book(get(url).content)
-            if parsed:
-                current_rows.extend(parsed)
-                merge_margin_records(bydate, parsed)
+            if not parsed:
+                raise ValueError("workbook yielded no rows")
+            current_rows.extend(parsed)
+            merge_margin_records(bydate, parsed)
         except Exception as e:
             current_errors.append(f"{url}: {e}")
             log(f"JPX current margin skip {url}: {e}")
+
+    if bydate:
+        added, total = merge_margin_rows(
+            DATA_DIR / "margin_weekly.csv",
+            list(bydate.values()),
+            MARGIN_HEADER,
+        )
+        log(f"JPX margin weekly: fetched {len(bydate)}, +{added}, total {total}")
+
     if not current_rows:
         raise RuntimeError(
             "JPX current weekly margin workbooks yielded no rows"
-            + (f" ({current_errors[0]})" if current_errors else "")
+            + (f" ({'; '.join(current_errors)})" if current_errors else "")
         )
-
-    added, total = merge_rows(DATA_DIR / "margin_weekly.csv", MARGIN_HEADER,
-                              list(bydate.values()))
-    log(f"JPX margin weekly: fetched {len(bydate)}, +{added}, total {total}")
+    all_errors = hist_errors + current_errors
+    if all_errors:
+        raise RuntimeError(
+            f"JPX weekly margin refresh incomplete ({len(all_errors)} workbook(s) failed): "
+            + "; ".join(all_errors)
+        )
 
 
 # -------------------------- stock-level daily margin PDF (Kioxia focus)
@@ -754,17 +805,25 @@ def sync_kioxia_weekly():
             if r:
                 rows.append(r)
             else:
-                errors.append(f"{u}: Kioxia share row not found")
+                reason = "Kioxia share row not found"
+                errors.append(f"{u}: {reason}")
+                log(f"Kioxia PDF skip {u}: {reason}")
         except Exception as e:
             errors.append(f"{u}: {e}")
             log(f"Kioxia PDF skip {u}: {e}")
+    if rows:
+        added, total = merge_rows(DATA_DIR / "kioxia_margin_weekly.csv", KIOXIA_HEADER, rows)
+        log(f"Kioxia daily margin: fetched {len(rows)}, +{added}, total {total}")
     if not rows:
         raise RuntimeError(
             f"Kioxia daily margin refresh yielded 0 rows from {len(urls)} PDF(s)"
-            + (f" ({errors[0]})" if errors else "")
+            + (f" ({'; '.join(errors)})" if errors else "")
         )
-    added, total = merge_rows(DATA_DIR / "kioxia_margin_weekly.csv", KIOXIA_HEADER, rows)
-    log(f"Kioxia daily margin: fetched {len(rows)}, +{added}, total {total}")
+    if errors:
+        raise RuntimeError(
+            f"Kioxia daily margin refresh incomplete ({len(errors)}/{len(urls)} PDF(s) failed): "
+            + "; ".join(errors)
+        )
 
 
 # -------------------------- JSF daily snapshot (official daily leading proxy)
