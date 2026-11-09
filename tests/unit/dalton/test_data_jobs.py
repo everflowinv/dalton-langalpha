@@ -8945,6 +8945,36 @@ def _refresh_script(
     return "\n".join(lines) + "\n"
 
 
+def _signal_ignoring_refresh_script() -> str:
+    """Refresh child that ignores SIGTERM and SIGINT, then backgrounds an ignorer.
+
+    Paths come from ``DALTON_TEST_IGNORER_PID`` and ``DALTON_TEST_IGNORER_MARKER``.
+    The python process installs those ignores before writing either file. Without job
+    control it stays in this shell's process group. ``wait`` keeps the shell alive too.
+    """
+    code = "\n".join(
+        [
+            "import os",
+            "import signal",
+            "import time",
+            "from pathlib import Path",
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)",
+            "signal.signal(signal.SIGINT, signal.SIG_IGN)",
+            'Path(os.environ["DALTON_TEST_IGNORER_PID"]).write_text(str(os.getpid()) + "\\n", encoding="utf-8")',
+            'Path(os.environ["DALTON_TEST_IGNORER_MARKER"]).write_text("started\\n", encoding="utf-8")',
+            "time.sleep(30)",
+        ]
+    )
+    return "\n".join(
+        [
+            "#!/usr/bin/env bash",
+            "trap '' TERM INT",
+            f"{_bash_quote(sys.executable)} -c {_bash_quote(code)} &",
+            "wait",
+        ]
+    ) + "\n"
+
+
 def _prepare_bbg_data_root(data_root: Path, script: str) -> None:
     src_temp = data_root / "temp"
     scripts = data_root / "scripts"
@@ -9745,3 +9775,454 @@ async def test_bridge_host_run_rejects_raw_source_symlink_before_subprocess(
         _assert_home_untouched(home)
     finally:
         shutil.rmtree(allow_root, ignore_errors=True)
+
+
+def test_wait_refresh_session_group_exit_retries_ps_failure_and_holds_for_slow_descendant() -> None:
+    import inspect
+    import threading
+
+    import scripts.dalton.researchdata_bridge as bridge_mod
+
+    inspect.signature(bridge_mod._wait_refresh_session_group_exit).bind()
+    lstart = "Mon Nov 9 00:00:01 2026"
+    descendant = (4242, lstart)
+    started = time.monotonic()
+    stop = {"v": False}
+    state = {"calls": 0, "members": 0, "second_fail": 0, "first": None}
+    observations: list[tuple[str, float]] = []
+    kills: list[tuple[int, list[tuple[int, str]]]] = []
+    reaped: list[int] = []
+    reaped_children: list[int] = []
+    errors: list[BaseException] = []
+
+    def members() -> list[tuple[int, str]] | None:
+        if stop["v"]:
+            observations.append(("empty", time.monotonic() - started))
+            return []
+        now_t = time.monotonic() - started
+        state["calls"] += 1
+        if state["calls"] <= 3:
+            observations.append(("ps_fail", now_t))
+            return None
+        first = state["first"]
+        if (
+            state["members"] >= 1
+            and isinstance(first, float)
+            and state["second_fail"] < 2
+            and now_t >= first + 0.4
+        ):
+            state["second_fail"] += 1
+            observations.append(("ps_fail", now_t))
+            return None
+        if not isinstance(first, float):
+            state["first"] = now_t
+            first = now_t
+        if state["second_fail"] < 2 or now_t < first + 1.0:
+            state["members"] += 1
+            observations.append(("member", now_t))
+            return [descendant]
+        observations.append(("empty", now_t))
+        return []
+
+    def signal_members(signum: int, group_members: list[tuple[int, str]]) -> None:
+        kills.append((int(signum), list(group_members)))
+
+    def reap(pgid: int) -> None:
+        reaped.append(int(pgid))
+
+    def reap_child() -> None:
+        reaped_children.append(1)
+
+    inspect.signature(bridge_mod._wait_refresh_session_group_exit).bind(
+        members_fn=members,
+        signal_members_fn=signal_members,
+        reap_fn=reap,
+        reap_child_fn=reap_child,
+        dedicated_fn=lambda: True,
+        my_pgid=99,
+        my_pid=7,
+    )
+
+    def _run_wait() -> None:
+        try:
+            bridge_mod._wait_refresh_session_group_exit(
+                members_fn=members,
+                signal_members_fn=signal_members,
+                reap_fn=reap,
+                reap_child_fn=reap_child,
+                dedicated_fn=lambda: True,
+                my_pgid=99,
+                my_pid=7,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=_run_wait, daemon=True)
+    started_thread = False
+    try:
+        thread.start()
+        started_thread = True
+        thread.join(5.0)
+        assert errors == []
+        assert thread.is_alive() is False
+        kinds = [kind for kind, _observed_at in observations]
+        assert kinds[:3] == ["ps_fail", "ps_fail", "ps_fail"]
+        assert "member" in kinds
+        assert kinds[-1] == "empty"
+        first_member_at = next(observed_at for kind, observed_at in observations if kind == "member")
+        assert any(
+            kind == "ps_fail" and observed_at > first_member_at
+            for kind, observed_at in observations
+        )
+        empty_at = next(observed_at for kind, observed_at in reversed(observations) if kind == "empty")
+        assert empty_at >= first_member_at + 1.0
+        assert kills
+        assert {pgid for pgid in reaped} == {99}
+        assert reaped_children
+        for signum, group_members in kills:
+            assert signum == signal.SIGKILL
+            assert group_members == [descendant]
+    finally:
+        stop["v"] = True
+        if started_thread:
+            thread.join(1.0)
+
+
+def test_signal_confirmed_group_members_keeps_other_groups_and_reused_pids() -> None:
+    import scripts.dalton.researchdata_bridge as bridge_mod
+
+    my_pid = 7
+    my_pgid = 99
+    rows = [
+        (my_pid, my_pgid, "Mon Nov 9 00:00:00 2026", "python gate"),
+        (10, my_pgid, "Mon Nov 9 00:00:01 2026", "sleep 30"),
+        (11, my_pgid, "Mon Nov 9 00:00:08 2026", "sleep 30"),
+        (12, 50, "Mon Nov 9 00:00:03 2026", "sleep 30"),
+        (13, my_pgid, "Mon Nov 9 00:00:04 2026", "python -c sleep"),
+        (14, 77, "Mon Nov 9 00:00:05 2026", "ssh remote"),
+    ]
+    pgids = {my_pid: my_pgid, 10: my_pgid, 11: my_pgid, 12: 50, 13: 77, 14: 77}
+    members = [
+        (10, "Mon Nov 9 00:00:01 2026"),
+        (11, "Mon Nov 9 00:00:02 2026"),
+        (12, "Mon Nov 9 00:00:03 2026"),
+        (my_pid, "Mon Nov 9 00:00:00 2026"),
+        (13, "Mon Nov 9 00:00:04 2026"),
+        (14, "Mon Nov 9 00:00:05 2026"),
+        (1, "Mon Nov 9 00:00:01 2026"),
+    ]
+    killed: list[tuple[int, int]] = []
+
+    def getpgid(pid: int) -> int:
+        try:
+            return pgids[pid]
+        except KeyError as exc:
+            raise ProcessLookupError(pid) from exc
+
+    def kill(pid: int, signum: int) -> None:
+        killed.append((int(pid), int(signum)))
+
+    found = bridge_mod._own_session_group_members(
+        ps_list_fn=lambda: rows,
+        dedicated_fn=lambda: True,
+        getpgid_fn=getpgid,
+        my_pid=my_pid,
+        my_pgid=my_pgid,
+    )
+    assert found == [
+        (10, "Mon Nov 9 00:00:01 2026"),
+        (11, "Mon Nov 9 00:00:08 2026"),
+    ]
+    assert (
+        bridge_mod._own_session_group_members(
+            ps_list_fn=lambda: None,
+            dedicated_fn=lambda: True,
+            getpgid_fn=getpgid,
+            my_pid=my_pid,
+            my_pgid=my_pgid,
+        )
+        is None
+    )
+    assert (
+        bridge_mod._own_session_group_members(
+            ps_list_fn=lambda: rows,
+            dedicated_fn=lambda: False,
+            getpgid_fn=getpgid,
+            my_pid=my_pid,
+            my_pgid=my_pgid,
+        )
+        == []
+    )
+
+    bridge_mod._signal_confirmed_group_members(
+        signal.SIGKILL,
+        members,
+        ps_list_fn=lambda: rows,
+        dedicated_fn=lambda: True,
+        getpgid_fn=getpgid,
+        kill_fn=kill,
+        my_pid=my_pid,
+        my_pgid=my_pgid,
+    )
+    assert killed == [(10, signal.SIGKILL)]
+
+    killed.clear()
+    bridge_mod._signal_confirmed_group_members(
+        signal.SIGKILL,
+        members,
+        ps_list_fn=lambda: None,
+        dedicated_fn=lambda: True,
+        getpgid_fn=getpgid,
+        kill_fn=kill,
+        my_pid=my_pid,
+        my_pgid=my_pgid,
+    )
+    assert killed == []
+
+    bridge_mod._signal_confirmed_group_members(
+        signal.SIGKILL,
+        members,
+        ps_list_fn=lambda: rows,
+        dedicated_fn=lambda: False,
+        getpgid_fn=getpgid,
+        kill_fn=kill,
+        my_pid=my_pid,
+        my_pgid=my_pgid,
+    )
+    assert killed == []
+
+
+def _process_alive(pid: int) -> bool:
+    if pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_signal", [signal.SIGTERM, signal.SIGINT], ids=["sigterm", "sigint"])
+async def test_bridge_host_run_cancel_stops_signal_ignoring_refresh_tree(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    terminal_signal: int,
+) -> None:
+    import scripts.dalton.researchdata_bridge as bridge_mod
+
+    home = tmp_path / "home"
+    _isolate_bridge_config_env(monkeypatch, home)
+    consumer = tmp_path / "consumer"
+    legacy_csv, legacy_xlsx = _seed_consumer_files(consumer)
+    data_root = tmp_path / "dalton-data"
+    marker = data_root / "refresh-started"
+    pid_path = data_root / "ignorer.pid"
+    _prepare_bbg_data_root(data_root, _signal_ignoring_refresh_script())
+    monkeypatch.setenv("DALTON_TEST_IGNORER_MARKER", str(marker))
+    monkeypatch.setenv("DALTON_TEST_IGNORER_PID", str(pid_path))
+    cfg, bridge = _bridge_for_data_root(
+        bridge_mod, monkeypatch, data_root, ocw_root=consumer
+    )
+    # Parent SIGKILL waits out this grace after the gate exits. The assertion window
+    # below is shorter, so a descendant that is still alive was not killed by that grace.
+    cfg.host_task_sigterm_grace_s = 3.0
+    assert cfg.ocw_root_explicit is True
+    assert cfg.ocw_root_raw == consumer
+
+    def _ready() -> int | None:
+        if not marker.is_file() or not pid_path.is_file() or not bridge._host_active_runs:
+            return None
+        return int(next(iter(bridge._host_active_runs)))
+
+    task: asyncio.Task | None = None
+    saved_pgid: int | None = None
+    ignorer_pid: int | None = None
+    try:
+        body = _host_run_body(1, "run-ignore-signal-refresh", timeout=60)
+        body["no_output_timeout"] = 60
+        task = asyncio.create_task(bridge.handle_data_task_host_run(body))
+        gate_pid = await _poll_until(task, _ready, f"ignorer {terminal_signal}")
+        saved_pgid = os.getpgid(gate_pid)
+        ignorer_pid = int(pid_path.read_text(encoding="utf-8").strip())
+        assert gate_pid > 1
+        assert gate_pid != os.getpid()
+        assert saved_pgid == gate_pid
+        assert saved_pgid != os.getpgrp()
+        assert ignorer_pid > 1
+        assert ignorer_pid != gate_pid
+        assert os.getpgid(ignorer_pid) == saved_pgid
+        os.kill(ignorer_pid, signal.SIGTERM)
+        os.kill(ignorer_pid, signal.SIGINT)
+        await asyncio.sleep(0.2)
+        assert _process_alive(ignorer_pid) is True
+        assert os.getpgid(ignorer_pid) == saved_pgid
+
+        signaled_at = time.monotonic()
+        os.kill(gate_pid, terminal_signal)
+        gate_gone_at: float | None = None
+        deadline = signaled_at + 8.0
+        while time.monotonic() < deadline:
+            if task.done() and task.exception() is not None:
+                raise AssertionError("host-run failed before the gate exited") from task.exception()
+            if not _process_alive(gate_pid):
+                gate_gone_at = time.monotonic()
+                break
+            await asyncio.sleep(0.02)
+        assert gate_gone_at is not None
+        cleared = False
+        window_end = gate_gone_at + 0.8
+        while True:
+            ignorer_alive = _process_alive(ignorer_pid)
+            group_alive = _pgid_alive(saved_pgid)
+            if not ignorer_alive and not group_alive:
+                cleared = True
+                break
+            if time.monotonic() >= window_end:
+                break
+            await asyncio.sleep(0.02)
+        assert cleared is True
+        assert time.monotonic() - signaled_at < 8.0
+
+        status, resp = await asyncio.wait_for(task, timeout=5)
+        assert status == 200
+        assert resp["ok"] is False
+        assert resp["exit_code"] not in (0, 124, 125)
+        assert resp["timed_out"] is False
+        assert resp["killed_by_host_kill"] is False
+        assert resp["exit_confirmed"] is True
+        assert _pgid_alive(saved_pgid) is False
+        assert _process_alive(ignorer_pid) is False
+        assert resp["consumer_sync"] is None
+        assert "Traceback" not in (resp["stderr"] or "")
+        assert marker.read_text(encoding="utf-8") == "started\n"
+        assert (consumer / "temp" / "bbg_data_latest.csv").read_text(encoding="utf-8") == legacy_csv
+        assert (consumer / "temp" / "bbg_data_remote.xlsx").read_bytes() == legacy_xlsx
+        assert sorted(path.name for path in (consumer / "temp").iterdir()) == [
+            "bbg_data_latest.csv",
+            "bbg_data_remote.xlsx",
+        ]
+        _assert_no_tmp_files(consumer)
+        _assert_home_untouched(home)
+        evaluation = _evaluate_host_response(resp)
+        assert evaluation.ok is False
+        assert evaluation.failure_reason == f"exit_code_{resp['exit_code']}"
+    finally:
+        if ignorer_pid is not None:
+            try:
+                os.kill(ignorer_pid, signal.SIGKILL)
+            except OSError:
+                pass
+        if saved_pgid is None and task is not None:
+            active = getattr(bridge, "_host_active_runs", None) or {}
+            if active:
+                saved_pgid = int(next(iter(active)))
+        _kill_saved_group(saved_pgid)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+
+def _assert_no_successful_summary(text: str) -> None:
+    compact = text.replace(" ", "")
+    assert '"summary_complete":true' not in compact
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("{"):
+            continue
+        try:
+            obj = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        assert obj.get("summary_complete") is not True
+        summary = obj.get("after_source_summary")
+        if isinstance(summary, dict):
+            assert summary.get("summary_complete") is not True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("terminal_signal", "phase"),
+    [
+        (signal.SIGTERM, "trial_after_validate"),
+        (signal.SIGINT, "trial_after_summary"),
+    ],
+    ids=["sigterm-after-validate", "sigint-after-summary"],
+)
+async def test_bridge_host_run_trial_cancel_does_not_report_success(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    terminal_signal: int,
+    phase: str,
+) -> None:
+    import scripts.dalton.researchdata_bridge as bridge_mod
+
+    home = tmp_path / "home"
+    _isolate_bridge_config_env(monkeypatch, home)
+    consumer = tmp_path / "consumer"
+    legacy_csv, legacy_xlsx = _seed_consumer_files(consumer)
+    data_root = tmp_path / "dalton-data"
+    marker = data_root / "refresh-started"
+    _prepare_bbg_data_root(data_root, _refresh_script(marker=marker))
+    control = tmp_path / "trial-checkpoint.txt"
+    control.write_text(phase + "\n", encoding="utf-8")
+    assert control.is_absolute()
+    monkeypatch.setenv("DALTON_BRIDGE_TEST_MODE", "1")
+    monkeypatch.setenv("DALTON_BBG_CONSUMER_SYNC_CHECKPOINT", str(control))
+    phase_path = control.with_name(control.name + ".phase")
+    cfg, bridge = _bridge_for_data_root(
+        bridge_mod, monkeypatch, data_root, ocw_root=consumer
+    )
+    assert cfg.ocw_root_explicit is True
+    assert cfg.ocw_root_raw == consumer
+    run_id = f"run-trial-cancel-{phase}"
+
+    def _ready() -> int | None:
+        pid = _read_phase_pid(phase_path, phase)
+        if pid is None or pid not in bridge._host_active_runs:
+            return None
+        return pid
+
+    status, resp, gate_pid, group_alive = await _signal_running_host_run(
+        bridge,
+        _host_run_body(1, run_id, is_trial=True),
+        terminal_signal,
+        _ready,
+    )
+    assert status == 200
+    assert group_alive is False
+    assert gate_pid > 1
+    assert resp["ok"] is False
+    assert resp["exit_code"] in {-terminal_signal, 128 + terminal_signal}
+    assert resp["timed_out"] is False
+    assert resp["killed_by_host_kill"] is False
+    assert resp["exit_confirmed"] is True
+    assert resp["after_source_summary"]["summary_complete"] is False
+    assert resp["consumer_sync"]["synced"] is False
+    assert resp["consumer_sync"]["skipped"] is True
+    _assert_no_successful_summary(resp["stdout"])
+    _assert_no_successful_summary(resp.get("log_tail") or "")
+    summary_path = data_root / ".dalton-runs" / run_id / "source_summary.json"
+    saved = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert saved["summary_complete"] is False
+    assert saved["after_source_summary"]["summary_complete"] is False
+    assert marker.read_text(encoding="utf-8") == "started\n"
+    assert (consumer / "temp" / "bbg_data_latest.csv").read_text(encoding="utf-8") == legacy_csv
+    assert (consumer / "temp" / "bbg_data_remote.xlsx").read_bytes() == legacy_xlsx
+    assert sorted(path.name for path in (consumer / "temp").iterdir()) == [
+        "bbg_data_latest.csv",
+        "bbg_data_remote.xlsx",
+    ]
+    _assert_no_tmp_files(consumer)
+    _assert_home_untouched(home)
+    assert "Traceback" not in (resp["stderr"] or "")
+    evaluation = _evaluate_host_response(resp)
+    assert evaluation.ok is False
+    assert evaluation.failure_reason == f"exit_code_{resp['exit_code']}"

@@ -19322,28 +19322,40 @@ def _signal_refresh_session_group(signum: int, child_pid: int | None) -> None:
             pass
 
 
-def _own_session_group_members() -> list[tuple[int, str]] | None:
+def _own_session_group_members(
+    *,
+    ps_list_fn: Any = None,
+    dedicated_fn: Any = None,
+    getpgid_fn: Any = None,
+    my_pid: int | None = None,
+    my_pgid: int | None = None,
+) -> list[tuple[int, str]] | None:
     """Return ``(pid, lstart)`` for other members of this gate session.
 
     ``None`` means ``ps`` failed and membership is unconfirmed. An empty list means
     this wrapper is the only process left in its group.
     """
-    if not _dedicated_host_gate_session():
+    is_dedicated = _dedicated_host_gate_session if dedicated_fn is None else dedicated_fn
+    if not is_dedicated():
         return []
-    my_pid = os.getpid()
-    my_pgid = os.getpgrp()
-    rows = _normalize_ps_rows(_list_host_processes_ps())
+    if my_pid is None:
+        my_pid = os.getpid()
+    if my_pgid is None:
+        my_pgid = os.getpgrp()
+    list_ps = _list_host_processes_ps if ps_list_fn is None else ps_list_fn
+    rows = _normalize_ps_rows(list_ps())
     if rows is None:
         return None
     # ``ps`` can list itself in this group and then exit before the snapshot is read.
     # Keep a row only when the pid is still in this session, so a finished ``ps`` is not
     # treated as a live refresh descendant.
+    pgid_of = os.getpgid if getpgid_fn is None else getpgid_fn
     found: list[tuple[int, str]] = []
     for pid, pgid, lstart, _cmd in rows:
         if pid <= 1 or pid == my_pid or pgid != my_pgid:
             continue
         try:
-            if os.getpgid(pid) != my_pgid:
+            if pgid_of(pid) != my_pgid:
                 continue
         except OSError:
             continue
@@ -19351,7 +19363,17 @@ def _own_session_group_members() -> list[tuple[int, str]] | None:
     return found
 
 
-def _signal_confirmed_group_members(signum: int, members: list[tuple[int, str]]) -> None:
+def _signal_confirmed_group_members(
+    signum: int,
+    members: list[tuple[int, str]],
+    *,
+    ps_list_fn: Any = None,
+    dedicated_fn: Any = None,
+    getpgid_fn: Any = None,
+    kill_fn: Any = None,
+    my_pid: int | None = None,
+    my_pgid: int | None = None,
+) -> None:
     """Signal pids that a fresh ``ps`` row still shows in this session with the same ``lstart``.
 
     A pid whose ``lstart`` changed, or whose group is no longer this session, is left
@@ -19359,54 +19381,134 @@ def _signal_confirmed_group_members(signum: int, members: list[tuple[int, str]])
     ``SIGKILL`` cannot be ignored, so it is never sent to the whole group: the wrapper
     is a member and has to stay alive until the other members are gone.
     """
-    fresh = _own_session_group_members()
+    fresh = _own_session_group_members(
+        ps_list_fn=ps_list_fn,
+        dedicated_fn=dedicated_fn,
+        getpgid_fn=getpgid_fn,
+        my_pid=my_pid,
+        my_pgid=my_pgid,
+    )
     if not fresh:
         return
     fresh_lstart = {pid: lstart for pid, lstart in fresh}
-    my_pid = os.getpid()
-    my_pgid = os.getpgrp()
+    if my_pid is None:
+        my_pid = os.getpid()
+    if my_pgid is None:
+        my_pgid = os.getpgrp()
+    pgid_of = os.getpgid if getpgid_fn is None else getpgid_fn
+    send = os.kill if kill_fn is None else kill_fn
     for pid, lstart in members:
         if pid <= 1 or pid == my_pid or fresh_lstart.get(pid) != lstart:
             continue
         try:
-            if os.getpgid(pid) != my_pgid:
+            if pgid_of(pid) != my_pgid:
                 continue
-            os.kill(pid, int(signum))
+            send(pid, int(signum))
         except OSError:
             continue
 
 
-def _wait_refresh_session_group_exit() -> None:
-    """Reap this gate session after a terminal signal, including refresh descendants.
+def _wait_refresh_session_group_exit(
+    *,
+    members_fn: Any = None,
+    signal_members_fn: Any = None,
+    reap_fn: Any = None,
+    reap_child_fn: Any = None,
+    sleep_fn: Any = None,
+    monotonic_fn: Any = None,
+    dedicated_fn: Any = None,
+    my_pgid: int | None = None,
+    ps_list_fn: Any = None,
+    getpgid_fn: Any = None,
+    kill_fn: Any = None,
+    my_pid: int | None = None,
+) -> None:
+    """Stay alive until ``ps`` confirms this gate session has no other members.
 
-    SIGTERM or SIGINT has already been sent to the group. Members still present after
-    a short grace are SIGKILLed one pid at a time once ``ps`` and ``getpgid`` still
-    identify them. This wrapper is not signaled.
+    A failed ``ps`` is retried and is not treated as an empty group. After a short
+    grace for the terminal signal already sent, members whose fresh ``lstart`` and
+    ``pgid`` still match are SIGKILLed one pid at a time. Exited children are reaped
+    on each pass. This wrapper is not signaled, and neither is any other group.
     """
-    if not _dedicated_host_gate_session():
+    is_dedicated = _dedicated_host_gate_session if dedicated_fn is None else dedicated_fn
+    if not is_dedicated():
         return
-    my_pgid = os.getpgrp()
-    grace_deadline = time.monotonic() + 0.3
-    while True:
-        members = _own_session_group_members()
-        if members is not None and not members:
-            _reap_pgid_zombies(my_pgid)
+    if my_pgid is None:
+        my_pgid = os.getpgrp()
+    pause = time.sleep if sleep_fn is None else sleep_fn
+    now = time.monotonic if monotonic_fn is None else monotonic_fn
+    reap = _reap_pgid_zombies if reap_fn is None else reap_fn
+
+    def _members() -> list[tuple[int, str]] | None:
+        if members_fn is not None:
+            return members_fn()
+        return _own_session_group_members(
+            ps_list_fn=ps_list_fn,
+            dedicated_fn=dedicated_fn,
+            getpgid_fn=getpgid_fn,
+            my_pid=my_pid,
+            my_pgid=my_pgid,
+        )
+
+    def _signal_members(signum: int, members: list[tuple[int, str]]) -> None:
+        if signal_members_fn is not None:
+            signal_members_fn(signum, members)
             return
-        if time.monotonic() >= grace_deadline:
-            break
-        _reap_pgid_zombies(my_pgid)
-        time.sleep(0.05)
-    members = _own_session_group_members()
-    if members:
-        _signal_confirmed_group_members(signal.SIGKILL, members)
-    kill_deadline = time.monotonic() + 0.5
-    while time.monotonic() < kill_deadline:
-        members = _own_session_group_members()
+        _signal_confirmed_group_members(
+            signum,
+            members,
+            ps_list_fn=ps_list_fn,
+            dedicated_fn=dedicated_fn,
+            getpgid_fn=getpgid_fn,
+            kill_fn=kill_fn,
+            my_pid=my_pid,
+            my_pgid=my_pgid,
+        )
+
+    grace_deadline = now() + 0.3
+    while True:
+        if reap_child_fn is not None:
+            reap_child_fn()
+        reap(my_pgid)
+        members = _members()
         if members is not None and not members:
-            break
-        _reap_pgid_zombies(my_pgid)
-        time.sleep(0.05)
-    _reap_pgid_zombies(my_pgid)
+            if reap_child_fn is not None:
+                reap_child_fn()
+            reap(my_pgid)
+            return
+        if members and now() >= grace_deadline:
+            _signal_members(signal.SIGKILL, members)
+        pause(0.05)
+
+
+def _finish_refresh_child(child: Any, abort_signum: list[int]) -> int:
+    """Collect the refresh child's exit status.
+
+    The wait is bounded. Once a terminal signal is recorded, group confirmation
+    and SIGKILL of members that still match run before the direct child's status
+    is collected, including when that child ignores SIGTERM and SIGINT.
+    """
+
+    def _confirm_and_collect() -> int:
+        child_pid = int(child.pid) if child.poll() is None else None
+        if abort_signum:
+            _signal_refresh_session_group(int(abort_signum[0]), child_pid)
+        _wait_refresh_session_group_exit(reap_child_fn=child.poll)
+        if child.poll() is None:
+            try:
+                child.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                return 1
+        return int(child.returncode if child.returncode is not None else 1)
+
+    if abort_signum:
+        return _confirm_and_collect()
+    while True:
+        try:
+            return int(child.wait(timeout=0.05))
+        except subprocess.TimeoutExpired:
+            if abort_signum:
+                return _confirm_and_collect()
 
 
 def _run_host_task_gate_cli(argv: list[str]) -> int:
@@ -19414,9 +19516,11 @@ def _run_host_task_gate_cli(argv: list[str]) -> int:
 
     Blocks on stdin waiting for release signal (`b"GO\\n"`). If stdin closes before release,
     exits immediately without executing the task. SIGTERM and SIGINT stop the refresh child
-    and the other members of this gate session; the wrapper reaps that group before it exits
-    and does not continue consumer sync. After the refresh child has already exited, the same
-    signals stop staging and replacement, and the wrapper then exits by that signal.
+    and the other members of this gate session. The wrapper waits until that group is confirmed
+    gone, then exits, and does not continue consumer sync. After the refresh child has already
+    exited, the same signals stop staging and replacement. A trial preview checks the same
+    signals after each validation or summary step and exits by that signal instead of reporting
+    success.
     """
     try:
         idx = argv.index(HOST_TASK_GATE_FLAG)
@@ -19486,6 +19590,12 @@ def _run_host_task_gate_cli(argv: list[str]) -> int:
     def _aborted() -> bool:
         return bool(abort_signum)
 
+    def _stop_trial_if_aborted() -> None:
+        if not abort_signum:
+            return
+        _wait_refresh_session_group_exit()
+        _exit_for_terminal_signal(abort_signum[0])
+
     signal.signal(signal.SIGTERM, _forward_term)
     signal.signal(signal.SIGINT, _forward_term)
     child = subprocess.Popen(
@@ -19496,11 +19606,9 @@ def _run_host_task_gate_cli(argv: list[str]) -> int:
         env=seed_asr_client.strip_asr_credentials_from_env(dict(os.environ)),
     )
     child_box.append(child)
-    if abort_signum and child.poll() is None:
-        _signal_refresh_session_group(abort_signum[0], int(child.pid))
-    child_rc = int(child.wait())
+    child_rc = _finish_refresh_child(child, abort_signum)
     if abort_signum:
-        _wait_refresh_session_group_exit()
+        _wait_refresh_session_group_exit(reap_child_fn=child.poll)
     if child_rc != 0:
         return child_rc
     if abort_signum:
@@ -19564,6 +19672,7 @@ def _run_host_task_gate_cli(argv: list[str]) -> int:
             _has_disallowed_path_symlink(p)
             for p in (raw_data_root, src_dir, src_csv, src_xlsx)
         ):
+            _stop_trial_if_aborted()
             reason = "trial_source_symlink_rejected"
             after_summary = _build_bbg_source_summary(
                 data_root=raw_data_root,
@@ -19587,13 +19696,17 @@ def _run_host_task_gate_cli(argv: list[str]) -> int:
             }
             if isinstance(spec.get("before_source_summary"), dict):
                 err_out["before_source_summary"] = spec["before_source_summary"]
+            _stop_trial_if_aborted()
             sys.stdout.write(
                 redactor.redact_text(json.dumps(err_out, ensure_ascii=False) + "\n")
             )
             sys.stdout.flush()
+            _stop_trial_if_aborted()
             return 1
 
+        _stop_trial_if_aborted()
         if not src_csv.is_file() or not src_xlsx.is_file():
+            _stop_trial_if_aborted()
             reason = "source_files_missing"
             after_summary = _build_bbg_source_summary(
                 data_root=raw_data_root,
@@ -19617,13 +19730,18 @@ def _run_host_task_gate_cli(argv: list[str]) -> int:
             }
             if isinstance(spec.get("before_source_summary"), dict):
                 err_out["before_source_summary"] = spec["before_source_summary"]
+            _stop_trial_if_aborted()
             sys.stdout.write(
                 redactor.redact_text(json.dumps(err_out, ensure_ascii=False) + "\n")
             )
             sys.stdout.flush()
+            _stop_trial_if_aborted()
             return 1
 
+        _stop_trial_if_aborted()
         verdict = validate_bbg_mirror_files(src_csv, src_xlsx)
+        _wait_bbg_consumer_sync_checkpoint("trial_after_validate", _aborted)
+        _stop_trial_if_aborted()
         if verdict.get("ok"):
             after_summary = _build_bbg_source_summary(
                 data_root=raw_data_root,
@@ -19631,6 +19749,8 @@ def _run_host_task_gate_cli(argv: list[str]) -> int:
                 summary_complete=True,
                 capture_scope="gate_post_run",
             )
+            _wait_bbg_consumer_sync_checkpoint("trial_after_summary", _aborted)
+            _stop_trial_if_aborted()
             trial_out: dict[str, Any] = {
                 "ok": True,
                 "lines": int(verdict["lines"]),
@@ -19651,12 +19771,15 @@ def _run_host_task_gate_cli(argv: list[str]) -> int:
             }
             if isinstance(spec.get("before_source_summary"), dict):
                 trial_out["before_source_summary"] = spec["before_source_summary"]
+            _stop_trial_if_aborted()
             sys.stdout.write(
                 redactor.redact_text(json.dumps(trial_out, ensure_ascii=False) + "\n")
             )
             sys.stdout.flush()
+            _stop_trial_if_aborted()
             return 0
 
+        _stop_trial_if_aborted()
         reason = str(verdict.get("reason") or "validation_failed")
         after_summary = _build_bbg_source_summary(
             data_root=raw_data_root,
@@ -19665,6 +19788,7 @@ def _run_host_task_gate_cli(argv: list[str]) -> int:
             capture_scope="gate_error_exit",
             incomplete_reason=reason,
         )
+        _stop_trial_if_aborted()
         err_out = {
             "ok": False,
             "error": reason,
@@ -19680,10 +19804,12 @@ def _run_host_task_gate_cli(argv: list[str]) -> int:
         }
         if isinstance(spec.get("before_source_summary"), dict):
             err_out["before_source_summary"] = spec["before_source_summary"]
+        _stop_trial_if_aborted()
         sys.stdout.write(
             redactor.redact_text(json.dumps(err_out, ensure_ascii=False) + "\n")
         )
         sys.stdout.flush()
+        _stop_trial_if_aborted()
         return 1
 
     return child_rc
