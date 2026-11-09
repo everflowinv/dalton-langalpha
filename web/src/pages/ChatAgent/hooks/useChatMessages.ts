@@ -11,6 +11,7 @@ import { flushSync } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 import { useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
+import { randomUUID } from '@/lib/randomUUID';
 import { claudeCodeRefusal } from '@/lib/claudeCode';
 import { holdReload } from '@/lib/reloadHolds';
 import { useHomeTimezone } from '@/hooks/useHomeTimezone';
@@ -4018,7 +4019,8 @@ export function useChatMessages(
     setMessageError(null);
     setFallbackSuggestion(null);
     const edited = createUserMessage(newContent, turnIndex);
-    const assistantId = `assistant-${Date.now()}`;
+    // DALTON-HOOK(fork-message-identifiers): each fork owns a distinct reply bubble.
+    const assistantId = `assistant-${randomUUID()}`;
     setMessages((prev) => [
       ...prev.slice(0, msgIndex),
       edited,
@@ -4082,7 +4084,8 @@ export function useChatMessages(
     setIsLoading(true);
     setMessageError(null);
     setFallbackSuggestion(null);
-    const assistantId = `assistant-${Date.now()}`;
+    // DALTON-HOOK(fork-message-identifiers): each fork owns a distinct reply bubble.
+    const assistantId = `assistant-${randomUUID()}`;
     setMessages((prev) => [
       ...prev.slice(0, truncateIndex),
       createAssistantMessage(assistantId, turnIndex),

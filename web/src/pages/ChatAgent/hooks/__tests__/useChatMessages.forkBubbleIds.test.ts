@@ -1,10 +1,11 @@
+// DALTON-HOOK(fork-message-identifiers): forks preserve distinct identities at the same clock tick.
 /**
  * An edit or regenerate draws its bubbles before it reads the checkpoint it
  * forks from, and the fork's own bubbles take their ids: a new id remounts the
  * bubble, so a message just sent and its turn's row would play their entrance
  * a second time once the read came back.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { Mock } from 'vitest';
 import { act, waitFor } from '@testing-library/react';
 import { renderHookWithProviders } from '@/test/utils';
@@ -55,7 +56,7 @@ async function sent() {
 }
 
 /** Holds the checkpoint read open until the bubbles it draws are on screen,
- * then lets a millisecond pass, so an id minted after the read would differ. */
+ * then advances the clock so a newly minted id would differ. */
 async function forkHeldAtRead(result: Hook, fork: () => Promise<void>) {
   let release!: (value: typeof turns) => void;
   (fetchThreadTurns as Mock).mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
@@ -65,7 +66,7 @@ async function forkHeldAtRead(result: Hook, fork: () => Promise<void>) {
   });
   await waitFor(() => expect(fetchThreadTurns).toHaveBeenCalled());
   const drawn = ids(result);
-  await new Promise((resolve) => setTimeout(resolve, 2));
+  vi.mocked(Date.now).mockReturnValue(Date.now() + 2);
   await act(async () => {
     release(turns);
     await done;
@@ -76,6 +77,7 @@ async function forkHeldAtRead(result: Hook, fork: () => Promise<void>) {
 describe('useChatMessages – a fork keeps the bubbles it drew', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    vi.spyOn(Date, 'now').mockReturnValue(1794233575027);
     (fetchThreadTurns as Mock).mockResolvedValue(turns);
     mockSendStream.mockImplementation(async (...args: unknown[]) => {
       (args[3] as { onEvent: (e: Record<string, unknown>) => void }).onEvent({ event: 'thread_id', thread_id: 'thread-1' });
@@ -83,13 +85,19 @@ describe('useChatMessages – a fork keeps the bubbles it drew', () => {
     });
   });
 
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   it('keeps the edited message and its reply under the ids they were drawn with', async () => {
     const result = await sent();
-    const userId = result.current.messages.find((m) => m.role === 'user')!.id;
+    const before = ids(result);
+    const userId = before[0].id;
 
     const drawn = await forkHeldAtRead(result, () => result.current.handleEditMessage(userId, 'hello again'));
     expect(drawn.map((m) => m.role)).toEqual(['user', 'assistant']);
     expect(drawn[0].id).not.toBe(userId);
+    expect(drawn[1].id).not.toBe(before[1].id);
     expect(ids(result)).toEqual(drawn);
     expect(mockSendStream.mock.lastCall?.[0]).toBe('hello again');
   });
@@ -102,5 +110,12 @@ describe('useChatMessages – a fork keeps the bubbles it drew', () => {
     expect(drawn[0]).toEqual(before[0]);
     expect(drawn[1].id).not.toBe(before[1].id);
     expect(ids(result)).toEqual(drawn);
+
+    vi.mocked(Date.now).mockReturnValue(1794233575027);
+    const regenerated = await forkHeldAtRead(result, () => result.current.handleRegenerate(drawn[1].id));
+    expect(regenerated[0]).toEqual(before[0]);
+    expect(regenerated[1].id).not.toBe(drawn[1].id);
+    expect(regenerated[1].id).not.toBe(before[1].id);
+    expect(ids(result)).toEqual(regenerated);
   });
 });
