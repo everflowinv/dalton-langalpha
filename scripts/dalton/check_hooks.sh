@@ -354,6 +354,8 @@ ALLOWED_HOOKS=(
   # UI-MODEL-1: the thread composer holds a picked model as pending until the
   # server confirms it, instead of following a stale row reread (useThreadModel.ts).
   "ui-model-pick"
+  # Forked replies keep a unique bubble identifier throughout checkpoint loading.
+  "fork-message-identifiers"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
