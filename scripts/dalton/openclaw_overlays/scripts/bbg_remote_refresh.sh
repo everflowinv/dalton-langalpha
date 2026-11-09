@@ -1,14 +1,8 @@
 #!/bin/bash
-# bbg_remote_refresh.sh — 远程触发 Windows BBG 刷新，拉回导出结果并校验后落盘
-# 用法: bash scripts/bbg_remote_refresh.sh [--pull-only]
-#   --pull-only: 只拉取，不触发刷新（用于刷新已在 Windows 完成的场景）
-#
-# Windows 侧两个产物都可能坏，坏法不一样，所以两个都拉、都过同一道校验，谁先通过用谁：
-#   1) output/bbg_data_latest.csv —— 等 BDH 落定 30 秒后导出的，正常情况下最可靠；
-#      BBG 连接断掉时会退化成 8 行 #N/A Connection（2026-08-09）。
-#   2) data.xlsx —— 同一次刷新保存的工作簿；保存前脚本会把 BDH 公式还原，Excel 随即重算，
-#      缓存值常停在 #N/A Requesting Data...（2026-08-09 起一直如此，CSV 因此三天没更新）。
-# 两个都不过就非零退出，本地 CSV 保持原样，绝不用坏数据覆盖。
+# Refresh Bloomberg data on Windows and validate the downloaded exports.
+# Usage: bash scripts/bbg_remote_refresh.sh [--pull-only]
+# --pull-only downloads existing exports without starting a refresh.
+# Try the CSV first, then the workbook. Replace the local CSV only after validation.
 
 set -euo pipefail
 

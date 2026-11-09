@@ -37,6 +37,7 @@ def test_bbg_uses_task_workspace_and_python(tmp_path, conversion_succeeds):
     _executable(
         commands / "scp",
         "#!/bin/sh\nfor dest do :; done\n"
+        'case "$dest" in "$TEST_WORKSPACE"/temp/*) ;; *) exit 90 ;; esac\n'
         'printf "%s\\n" "$dest" >> "$TEST_TRANSFERS"\n'
         'printf "new data\\n" > "$dest"\n',
     )
@@ -62,6 +63,7 @@ def test_bbg_uses_task_workspace_and_python(tmp_path, conversion_succeeds):
         "PATH": f"{commands}{os.pathsep}{os.environ['PATH']}",
         "OPENCLAW_WORKSPACE": str(workspace),
         "DALTON_PYTHON_BIN": str(python),
+        "TEST_WORKSPACE": str(workspace),
         "TEST_TRANSFERS": str(transfers),
         "TEST_PYTHON_CALLS": str(python_calls),
         "TEST_CONVERSION_SUCCEEDS": "1" if conversion_succeeds else "0",
