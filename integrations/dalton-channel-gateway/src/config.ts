@@ -26,6 +26,7 @@ export interface GatewayConfig {
     discord: {
       enabled: boolean;
       botToken: string;
+      applicationId: string;
     };
     weixin: {
       enabled: boolean;
@@ -76,6 +77,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
       discord: {
         enabled: parseBool(env.DALTON_DISCORD_ENABLED, false),
         botToken: (env.DALTON_DISCORD_BOT_TOKEN ?? "").trim(),
+        applicationId: (env.DALTON_DISCORD_APPLICATION_ID ?? "").trim(),
       },
       weixin: {
         enabled: parseBool(env.DALTON_WEIXIN_ENABLED, false),
