@@ -8,6 +8,33 @@ SCRIPT = Path(__file__).resolve().parents[3] / "scripts/dalton/seed_openclaw_dat
 
 
 class SeedOpenClawDataTests(unittest.TestCase):
+    def test_python_launcher_replaces_link_without_changing_interpreter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            target = root / "target"
+            interpreter = root / "interpreter"
+            interpreter.write_text("preserve existing interpreter\n")
+            launcher = target / "state/sentiment-dashboard/cos-venv/bin/python"
+            launcher.parent.mkdir(parents=True)
+            launcher.symlink_to(interpreter)
+
+            for _ in range(2):
+                result = subprocess.run(
+                    ["bash", str(SCRIPT), "--apply", "--source", str(source),
+                     "--target", str(target)],
+                    capture_output=True, text=True, check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertFalse(launcher.is_symlink())
+                self.assertEqual(launcher.stat().st_mode & 0o777, 0o755)
+                self.assertEqual(
+                    launcher.read_text(), '#!/bin/sh\nexec /app/.venv/bin/python "$@"\n'
+                )
+                self.assertEqual(interpreter.read_text(), "preserve existing interpreter\n")
+                self.assertEqual(list(launcher.parent.glob("python.*")), [])
+
     def test_linked_skill_is_portable_and_excludes_virtualenv(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
