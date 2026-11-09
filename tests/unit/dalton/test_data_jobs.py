@@ -8008,3 +8008,50 @@ def test_seed_openclaw_data_applies_cos_upload_overlay_and_preserves_send_protec
     assert b"DALTON_COS_UPLOAD_MODE" in (
         dst_dir / "scripts" / "sentiment_dashboard_cos_upload.py"
     ).read_bytes()
+
+
+def test_sentiment_dashboard_cos_upload_skip_never_reads_credentials(tmp_path, monkeypatch, capsys):
+    import importlib.util
+    from collections.abc import MutableMapping
+
+    path = Path(__file__).resolve().parents[3] / "scripts/dalton/openclaw_overlays/scripts/sentiment_dashboard_cos_upload.py"
+    spec = importlib.util.spec_from_file_location("cos_skip_credential_reads", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    credential_reads = []
+
+    class GuardedEnvironment(MutableMapping):
+        def __init__(self):
+            self.values = {"DALTON_COS_UPLOAD_MODE": "skip"}
+
+        def __getitem__(self, key):
+            if key in ("TENCENT_COS_SECRET_ID", "TENCENT_COS_SECRET_KEY"):
+                credential_reads.append(key)
+                raise AssertionError("Preview attempted to read credentials")
+            return self.values[key]
+
+        def __setitem__(self, key, value):
+            self.values[key] = value
+
+        def __delitem__(self, key):
+            del self.values[key]
+
+        def __iter__(self):
+            return iter(self.values)
+
+        def __len__(self):
+            return len(self.values)
+
+    monkeypatch.setattr(module.os, "environ", GuardedEnvironment())
+    html = tmp_path / "index.html"
+    monkeypatch.setattr(sys, "argv", [str(path), "--file", str(html)])
+    for content, expected in ((b"<!doctype html><html></html>", 0), (b"invalid", 1), (None, 1)):
+        if content is None:
+            html.unlink()
+        else:
+            html.write_bytes(content)
+        assert module.main() == expected
+        captured = capsys.readouterr()
+        assert json.loads(captured.out if expected == 0 else captured.err)["ok"] is (expected == 0)
+        assert credential_reads == []

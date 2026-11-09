@@ -254,6 +254,8 @@ def upload(path: Path) -> dict[str, object]:
 
 
 def _redact_secrets(text: str) -> str:
+    if os.environ.get(ENV_UPLOAD_MODE, "").strip().lower() == "skip":
+        return text
     if not text:
         return text
     out = text
