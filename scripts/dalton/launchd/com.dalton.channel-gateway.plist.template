@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent template for Dalton Channel Gateway (127.0.0.1:8962).
+  Install to ~/Library/LaunchAgents/com.dalton.channel-gateway.plist:
+    1. Build the bundle: cd integrations/dalton-channel-gateway && pnpm install && pnpm build
+    2. Replace __PROJECT_DIR__, __NODE_BIN__, __LOG_DIR__, and environment placeholders.
+    3. Load with: launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dalton.channel-gateway.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.dalton.channel-gateway</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__NODE_BIN__</string>
+    <string>__PROJECT_DIR__/integrations/dalton-channel-gateway/dist/index.mjs</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__PROJECT_DIR__/integrations/dalton-channel-gateway</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>GATEWAY_HOST</key>
+    <string>127.0.0.1</string>
+    <key>GATEWAY_PORT</key>
+    <string>8962</string>
+    <key>DALTON_BACKEND_URL</key>
+    <string>http://127.0.0.1:8000</string>
+    <key>WEB_BASE_URL</key>
+    <string>__WEB_BASE_URL__</string>
+    <key>INTERNAL_SERVICE_TOKEN</key>
+    <string>__INTERNAL_SERVICE_TOKEN__</string>
+    <key>DALTON_COLLEAGUE_DISPATCH_ENABLED</key>
+    <string>true</string>
+    <key>DALTON_FEISHU_ENABLED</key>
+    <string>__DALTON_FEISHU_ENABLED__</string>
+    <key>DALTON_FEISHU_APP_ID</key>
+    <string>__DALTON_FEISHU_APP_ID__</string>
+    <key>DALTON_FEISHU_APP_SECRET</key>
+    <string>__DALTON_FEISHU_APP_SECRET__</string>
+    <key>DALTON_DISCORD_ENABLED</key>
+    <string>__DALTON_DISCORD_ENABLED__</string>
+    <key>DALTON_DISCORD_BOT_TOKEN</key>
+    <string>__DALTON_DISCORD_BOT_TOKEN__</string>
+    <key>DALTON_WEIXIN_ENABLED</key>
+    <string>__DALTON_WEIXIN_ENABLED__</string>
+    <key>DALTON_WEIXIN_API_BASE_URL</key>
+    <string>https://ilinkai.weixin.qq.com</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+
+  <key>StandardOutPath</key>
+  <string>__LOG_DIR__/dalton-channel-gateway.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>__LOG_DIR__/dalton-channel-gateway.err.log</string>
+</dict>
+</plist>

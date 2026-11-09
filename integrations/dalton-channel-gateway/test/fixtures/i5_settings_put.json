@@ -1,0 +1,93 @@
+{
+  "put_success": {
+    "version": "v2",
+    "settings": {
+      "feishu": {
+        "preferred": "feishu:@me",
+        "chats": {},
+        "automation_output": {},
+        "agent_messages": {
+          "enabled": true,
+          "allowed": [
+            "feishu:@me"
+          ]
+        }
+      },
+      "discord": {
+        "preferred": "discord:@me",
+        "chats": {},
+        "automation_output": {},
+        "agent_messages": {
+          "enabled": true,
+          "allowed": [
+            "discord:@me"
+          ]
+        }
+      },
+      "weixin": {
+        "preferred": "weixin:@me",
+        "chats": {},
+        "automation_output": {},
+        "agent_messages": {
+          "enabled": true,
+          "allowed": [
+            "weixin:@me"
+          ]
+        }
+      }
+    },
+    "changes": [
+      "Updated feishu settings"
+    ]
+  },
+  "automation_output_success": {
+    "version": "v2",
+    "settings": {
+      "feishu": {
+        "preferred": "feishu:@me",
+        "chats": {},
+        "automation_output": {},
+        "agent_messages": {
+          "enabled": true,
+          "allowed": [
+            "feishu:@me"
+          ]
+        }
+      },
+      "discord": {
+        "preferred": "discord:@me",
+        "chats": {},
+        "automation_output": {},
+        "agent_messages": {
+          "enabled": true,
+          "allowed": [
+            "discord:@me"
+          ]
+        }
+      },
+      "weixin": {
+        "preferred": "weixin:@me",
+        "chats": {},
+        "automation_output": {},
+        "agent_messages": {
+          "enabled": true,
+          "allowed": [
+            "weixin:@me"
+          ]
+        }
+      }
+    },
+    "address": "feishu:oc_group1",
+    "name": "feishu:oc_group1",
+    "changes": [
+      "Set feishu automation output for workspace 99999999-8888-7777-6666-555555555555 to feishu:oc_group1"
+    ]
+  },
+  "version_conflict_409": {
+    "code": "version_conflict",
+    "message": "Channel settings version conflict: expected v2, got v1."
+  },
+  "group_permission_403": {
+    "detail": "You do not have permission to manage group chat feishu:oc_secret"
+  }
+}

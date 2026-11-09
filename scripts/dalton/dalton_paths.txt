@@ -178,3 +178,8 @@ src/dalton/database/channel_gateway.py
 src/dalton/app/channels_router.py
 tests/unit/dalton/test_channel_gateway.py
 tests/integration/dalton/test_channel_gateway_db.py
+# CH-1 Phase 2: channel gateway core framework, 9 /agent/* endpoints, recovery state machine,
+# channel adapter contract & fake adapter, launchd template, and Vitest suite.
+integrations/dalton-channel-gateway/
+scripts/dalton/launchd/com.dalton.channel-gateway.plist.template
+scripts/dalton/gen_channel_gateway_fixtures.py

@@ -1,0 +1,55 @@
+{
+  "claimed_feishu_dm": {
+    "claim_status": "claimed",
+    "recipient_id": "ou_alice",
+    "platform": "feishu",
+    "target_address": "feishu:@me",
+    "is_current": true,
+    "home_workspace_id": "00000000-0000-0000-0000-000000000001",
+    "weixin_context_token": null
+  },
+  "already_completed_sent": {
+    "claim_status": "already_completed",
+    "status": "sent",
+    "platform": "feishu",
+    "target_address": "feishu:@me",
+    "is_current": true,
+    "first_response_json": {
+      "status": "sent",
+      "code": null,
+      "address": "feishu:@me",
+      "current": true,
+      "message": "Delivered to feishu:@me.",
+      "files": []
+    }
+  },
+  "already_completed_partial": {
+    "claim_status": "already_completed",
+    "status": "partial",
+    "platform": "feishu",
+    "target_address": "feishu:@me",
+    "is_current": true,
+    "first_response_json": {
+      "status": "partial",
+      "code": "unavailable",
+      "address": "feishu:@me",
+      "current": true,
+      "message": "Delivered 1/2 text chunks before error: Feishu rate limit on chunk 2",
+      "files": []
+    }
+  },
+  "in_flight_or_unknown": {
+    "claim_status": "in_flight_or_unknown",
+    "status": "unknown",
+    "code": "in_flight",
+    "platform": "feishu",
+    "target_address": "feishu:@me",
+    "is_current": true
+  },
+  "denied_not_allowed": {
+    "claim_status": "denied",
+    "status": "failed",
+    "code": "not_allowed",
+    "message": "Target 'feishu:oc_group2' is not in agent_messages.allowed."
+  }
+}

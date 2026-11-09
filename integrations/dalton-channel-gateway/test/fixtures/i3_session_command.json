@@ -1,0 +1,35 @@
+{
+  "workspace_list": {
+    "ok": true,
+    "current_workspace_id": "99999999-8888-7777-6666-555555555555",
+    "home_workspace_id": "00000000-0000-0000-0000-000000000001",
+    "workspaces": [
+      {
+        "workspace_id": "00000000-0000-0000-0000-000000000001",
+        "name": "Home"
+      },
+      {
+        "workspace_id": "99999999-8888-7777-6666-555555555555",
+        "name": "Quant Workspace"
+      }
+    ]
+  },
+  "workspace_switch_dm": {
+    "ok": true,
+    "workspace_id": "99999999-8888-7777-6666-555555555555",
+    "override_workspace_id": "99999999-8888-7777-6666-555555555555",
+    "generation": 2,
+    "external_thread_id": "feishu:dm:ou_alice:gen:2"
+  },
+  "new_session": {
+    "ok": true,
+    "generation": 2,
+    "external_thread_id": "feishu:dm:ou_alice:gen:2"
+  },
+  "stop_session": {
+    "ok": true,
+    "thread_id": "11111111-2222-3333-4444-555555555555",
+    "run_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+    "external_thread_id": "feishu:dm:ou_alice:gen:1"
+  }
+}

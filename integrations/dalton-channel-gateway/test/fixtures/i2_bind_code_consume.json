@@ -1,0 +1,25 @@
+{
+  "bind_success": {
+    "ok": true,
+    "user_id": "user_alice_123",
+    "platform": "feishu",
+    "platform_user_id": "ou_alice",
+    "generation": 1
+  },
+  "bind_revoked_in_group": {
+    "ok": false,
+    "reason": "revoked_in_group"
+  },
+  "bind_invalid_or_expired": {
+    "ok": false,
+    "reason": "invalid_or_expired"
+  },
+  "unbind_success": {
+    "ok": true,
+    "user_id": "user_alice_123",
+    "platform": "feishu",
+    "generations": {
+      "dm:ou_alice": 2
+    }
+  }
+}
