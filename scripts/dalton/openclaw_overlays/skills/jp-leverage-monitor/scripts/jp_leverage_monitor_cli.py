@@ -600,9 +600,9 @@ def parse_margin_book(content: bytes, detailed: bool | None = None) -> list[dict
         raise ValueError("Unrecognized JPX margin workbook schema")
     rec = {"date": f"{md.group(1)}-{int(md.group(2)):02d}-{int(md.group(3)):02d}"}
     body_text = " ".join(_norm_cell_text(x) for x in d.to_numpy().ravel() if _norm_cell_text(x))
-    if detailed is not False and len(d) > 7 and d.shape[1] > 14 and "売残" in body_text and "買残" in body_text:
+    if detailed is True and len(d) > 7 and d.shape[1] > 14 and "売残" in body_text and "買残" in body_text:
         shares, values = d.iloc[6], d.iloc[7]
-        rec.update({
+        parsed_fields = {
             "short_shares_k": num(shares.iloc[4]),
             "short_value_mjpy": num(values.iloc[4]),
             "long_shares_k": num(shares.iloc[6]),
@@ -611,53 +611,72 @@ def parse_margin_book(content: bytes, detailed: bool | None = None) -> list[dict
             "std_short_value_mjpy": num(values.iloc[10]),
             "neg_long_value_mjpy": num(values.iloc[12]),
             "std_long_value_mjpy": num(values.iloc[14]),
-        })
+        }
+        if any(v is None for v in parsed_fields.values()):
+            raise ValueError("Unrecognized JPX cross-sectional margin workbook schema")
+        rec.update(parsed_fields)
         return [rec]
     if detailed is False and len(d) > 17 and d.shape[1] > 7 and "貸借" in body_text:
         values = d.iloc[17]
-        rec["jsf_stock_loan_value_mjpy"] = num(values.iloc[5])
-        rec["jsf_funding_value_mjpy"] = num(values.iloc[7])
+        loan_val = num(values.iloc[5])
+        fund_val = num(values.iloc[7])
+        if loan_val is None or fund_val is None:
+            raise ValueError("Unrecognized JPX cross-sectional margin workbook schema")
+        rec["jsf_stock_loan_value_mjpy"] = loan_val
+        rec["jsf_funding_value_mjpy"] = fund_val
         return [rec]
     raise ValueError("Unrecognized JPX cross-sectional margin workbook schema")
 
 
 def sync_margin_weekly():
-    hist_html = get(MARGIN_HISTORY_URL).text
-    hist_links = discover_margin_history_links(MARGIN_HISTORY_URL, html=hist_html)
-    if not hist_links["combined"] and not (hist_links["detailed"] and hist_links["jsf"]):
-        raise RuntimeError("JPX margin history workbooks not found")
-
     bydate: dict[str, dict] = {}
+    hist_rows: list[dict] = []
     hist_errors: list[str] = []
-    hist_specs: list[tuple[str, bool | None]] = (
-        [(u, True) for u in hist_links["detailed"]]
-        + [(u, False) for u in hist_links["jsf"]]
-        + [(u, None) for u in hist_links["combined"]]
-    )
+    hist_specs: list[tuple[str, bool | None]] = []
+
+    try:
+        hist_html = get(MARGIN_HISTORY_URL).text
+        hist_links = discover_margin_history_links(MARGIN_HISTORY_URL, html=hist_html)
+        hist_specs = (
+            [(u, True) for u in hist_links["detailed"]]
+            + [(u, False) for u in hist_links["jsf"]]
+            + [(u, None) for u in hist_links["combined"]]
+        )
+        if not hist_links["combined"] and not (hist_links["detailed"] and hist_links["jsf"]):
+            reason = "JPX margin history workbooks not found"
+            hist_errors.append(f"{MARGIN_HISTORY_URL}: {reason}")
+            log(f"JPX margin history discovery skip {MARGIN_HISTORY_URL}: {reason}")
+    except Exception as e:
+        hist_errors.append(f"{MARGIN_HISTORY_URL}: {e}")
+        log(f"JPX margin history discovery skip {MARGIN_HISTORY_URL}: {e}")
+
     for url, detailed_flag in hist_specs:
         try:
             parsed = parse_margin_book(get(url).content, detailed_flag)
             if not parsed:
                 raise ValueError("workbook yielded no rows")
+            hist_rows.extend(parsed)
             merge_margin_records(bydate, parsed)
         except Exception as e:
             hist_errors.append(f"{url}: {e}")
             log(f"JPX margin history skip {url}: {e}")
-    if not bydate:
-        raise RuntimeError(
-            "JPX margin history workbooks yielded no rows"
-            + (f" ({'; '.join(hist_errors)})" if hist_errors else "")
-        )
 
-    current_urls = discover_margin_current_links(MARGIN_CURRENT_URL)
-    if not current_urls:
-        merge_margin_rows(DATA_DIR / "margin_weekly.csv", list(bydate.values()), MARGIN_HEADER)
-        raise RuntimeError("JPX current weekly margin workbooks not found")
+    current_urls: list[str] = []
     current_rows: list[dict] = []
     current_errors: list[str] = []
+    try:
+        current_urls = discover_margin_current_links(MARGIN_CURRENT_URL)
+        if not current_urls:
+            reason = "JPX current weekly margin workbooks not found"
+            current_errors.append(f"{MARGIN_CURRENT_URL}: {reason}")
+            log(f"JPX current margin discovery skip {MARGIN_CURRENT_URL}: {reason}")
+    except Exception as e:
+        current_errors.append(f"{MARGIN_CURRENT_URL}: {e}")
+        log(f"JPX current margin discovery skip {MARGIN_CURRENT_URL}: {e}")
+
     for url in sorted(current_urls):
         try:
-            parsed = parse_margin_book(get(url).content)
+            parsed = parse_margin_current_book(get(url).content)
             if not parsed:
                 raise ValueError("workbook yielded no rows")
             current_rows.extend(parsed)
@@ -674,17 +693,33 @@ def sync_margin_weekly():
         )
         log(f"JPX margin weekly: fetched {len(bydate)}, +{added}, total {total}")
 
+    reasons: list[str] = []
+    if not hist_rows:
+        hist_detail = f" ({'; '.join(hist_errors)})" if hist_errors else ""
+        if not hist_specs:
+            reasons.append(f"JPX margin history workbooks not found{hist_detail}")
+        else:
+            reasons.append(f"JPX margin history workbooks yielded no rows{hist_detail}")
+    elif hist_errors:
+        reasons.append(
+            f"JPX margin history refresh incomplete ({len(hist_errors)} error(s)): "
+            + "; ".join(hist_errors)
+        )
+
     if not current_rows:
-        raise RuntimeError(
-            "JPX current weekly margin workbooks yielded no rows"
-            + (f" ({'; '.join(current_errors)})" if current_errors else "")
+        current_detail = f" ({'; '.join(current_errors)})" if current_errors else ""
+        if not current_urls:
+            reasons.append(f"JPX current weekly margin workbooks not found{current_detail}")
+        else:
+            reasons.append(f"JPX current weekly margin workbooks yielded no rows{current_detail}")
+    elif current_errors:
+        reasons.append(
+            f"JPX current weekly margin refresh incomplete ({len(current_errors)}/{len(current_urls)} workbook(s) failed): "
+            + "; ".join(current_errors)
         )
-    all_errors = hist_errors + current_errors
-    if all_errors:
-        raise RuntimeError(
-            f"JPX weekly margin refresh incomplete ({len(all_errors)} workbook(s) failed): "
-            + "; ".join(all_errors)
-        )
+
+    if reasons:
+        raise RuntimeError("; ".join(reasons))
 
 
 # -------------------------- stock-level daily margin PDF (Kioxia focus)

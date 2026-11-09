@@ -299,9 +299,10 @@ def _build_current_week_rows(
     app_date: object = dt.datetime(2026, 10, 30),
     pub_date: object = dt.datetime(2026, 11, 4),
     scope_e6: str = "二市場 Tokyo&Nagoya",
+    extra_cols: int = 0,
 ) -> list[list[object]]:
     """Build rows matching the official JPX `/04.html` `YYYYMMDD_mtcurrent.xlsx` layout (`レイアウト`)."""
-    return [
+    base_rows: list[list[object]] = [
         [None, app_date, None, None, None, None, None, None, None, None, None, None],
         [None, app_date, app_date, None, None, None, None, None, None, None, None, None],
         [None, pub_date, pub_date, None, None, None, None, None, None, None, None, None],
@@ -505,6 +506,9 @@ def _build_current_week_rows(
             4285.0,
         ],
     ]
+    if extra_cols <= 0:
+        return base_rows
+    return [row + [11111.0] * extra_cols for row in base_rows]
 
 
 def _build_legacy_mtgk_rows() -> list[list[object]]:
@@ -1018,6 +1022,34 @@ def test_unknown_workbook_schemas_rejected() -> None:
     non_date_hist = _rows_to_xlsx_bytes("信用取引現在高", non_date_hist_rows)
     with pytest.raises(ValueError, match="Unrecognized"):
         cli.parse_margin_book(non_date_hist)
+
+    # 5. Current weekly workbook with text application date and >=15 columns but mismatched scope or balance header
+    #    must be rejected by both parse_margin_current_book and parse_margin_book without legacy fallback.
+    text_date_bad_scope = _rows_to_xlsx_bytes(
+        "レイアウト",
+        _build_current_week_rows(
+            app_date="2026/11/6 申込現在",
+            pub_date="2026/11/10 公表",
+            scope_e6="東京 Tokyo",
+            extra_cols=4,
+        ),
+    )
+    with pytest.raises(ValueError, match="Unrecognized"):
+        cli.parse_margin_current_book(text_date_bad_scope)
+    with pytest.raises(ValueError, match="Unrecognized"):
+        cli.parse_margin_book(text_date_bad_scope)
+
+    text_date_bad_header_rows = _build_current_week_rows(
+        app_date="2026/11/6 申込現在",
+        pub_date="2026/11/10 公表",
+        extra_cols=4,
+    )
+    text_date_bad_header_rows[6][4] = "前週比\nWeekly change"
+    text_date_bad_header = _rows_to_xlsx_bytes("レイアウト", text_date_bad_header_rows)
+    with pytest.raises(ValueError, match="Unrecognized"):
+        cli.parse_margin_current_book(text_date_bad_header)
+    with pytest.raises(ValueError, match="Unrecognized"):
+        cli.parse_margin_book(text_date_bad_header)
 
 
 def test_parse_kioxia_pdf_date_units_signs_ratios_and_legacy_layout(
@@ -1629,4 +1661,372 @@ def test_sync_margin_weekly_combines_legacy_and_current_workbooks_and_fails_on_e
     current_bytes = bad_current_bytes
     with pytest.raises(RuntimeError, match="JPX current weekly margin workbooks yielded no rows"):
         cli.sync_margin_weekly()
+
+
+def test_history_discovery_or_attachments_failure_with_valid_current_saves_current_and_exposes_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli = _load_cli_module()
+    out_root = tmp_path / "jp-leverage"
+    data_dir = out_root / "data"
+    html_path = out_root / "index.html"
+    monkeypatch.setattr(cli, "OUT_ROOT", out_root)
+    monkeypatch.setattr(cli, "DATA_DIR", data_dir)
+    monkeypatch.setattr(cli, "HTML_PATH", html_path)
+
+    _seed_dashboard_inputs(cli, data_dir, include_margin=True)
+    # Pre-seed an older historical row with an explicit finite zero to verify both are preserved.
+    cli.merge_margin_rows(
+        data_dir / "margin_weekly.csv",
+        [
+            {
+                "date": "2026-09-11",
+                "short_shares_k": 500000.0,
+                "short_value_mjpy": 950000.0,
+                "long_shares_k": 3300000.0,
+                "long_value_mjpy": 6000000.0,
+                "neg_short_value_mjpy": 0.0,
+                "std_short_value_mjpy": 950000.0,
+                "neg_long_value_mjpy": 2700000.0,
+                "std_long_value_mjpy": 3300000.0,
+                "jsf_stock_loan_value_mjpy": 0.0,
+                "jsf_funding_value_mjpy": 410000.0,
+            }
+        ],
+    )
+
+    valid_current_bytes = _rows_to_xlsx_bytes(
+        "レイアウト",
+        _build_current_week_rows(
+            app_date="2026/11/6 申込現在",
+            pub_date="2026/11/10 公表",
+            extra_cols=4,
+        ),
+    )
+    current_html = """
+    <table>
+      <tr><th>2026年11月6日申込現在</th><td><a href="tvdivq0000001rk9-att/20261106_mtcurrent.xlsx">Excel</a></td></tr>
+    </table>
+    """
+
+    orig_get = cli.get
+    orig_sync_kioxia_weekly = cli.sync_kioxia_weekly
+    orig_sync_jsf_daily = cli.sync_jsf_daily
+    orig_sync_jsf_issue_history = cli.sync_jsf_issue_history
+    orig_sync_investor_flows = cli.sync_investor_flows
+    orig_sync_short_selling = cli.sync_short_selling
+    orig_sync_etf_units = cli.sync_etf_units
+    orig_sync_etf_prices = cli.sync_etf_prices
+    orig_sync_reference = cli.sync_reference
+
+    # Case 1: History discovery HTTP failure while current weekly workbook is valid.
+    mode = "hist_discovery_http_error"
+    history_html_with_links = """
+    <table>
+      <tr><th>信用取引現在高</th><td><a href="tvdivq0000001rq1-att/tvdivq0000015969.xlsx">Excel</a></td></tr>
+    </table>
+    """
+    bad_hist_bytes = _rows_to_xlsx_bytes("Unrelated", [["X", "Y"], [1, 2]])
+
+    def _fake_get(url: str, **kw) -> requests.Response:
+        resp = create_autospec(requests.Response, instance=True)
+        if url == cli.MARGIN_HISTORY_URL:
+            if mode == "hist_discovery_http_error":
+                raise requests.ConnectionError("history page unreachable")
+            if mode == "hist_discovery_zero_links":
+                resp.text = "<table><tr><th>No links</th></tr></table>"
+                resp.content = resp.text.encode("utf-8")
+                return resp
+            resp.text = history_html_with_links
+            resp.content = history_html_with_links.encode("utf-8")
+            return resp
+        if url == cli.MARGIN_CURRENT_URL:
+            resp.text = current_html
+            resp.content = current_html.encode("utf-8")
+            return resp
+        if url.endswith("tvdivq0000015969.xlsx"):
+            resp.content = bad_hist_bytes
+            return resp
+        if url.endswith("20261106_mtcurrent.xlsx"):
+            resp.content = valid_current_bytes
+            return resp
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    def _stub_reference() -> None:
+        _write_reference_fixture(cli, data_dir)
+
+    monkeypatch.setattr(cli, "get", create_autospec(orig_get, side_effect=_fake_get))
+    monkeypatch.setattr(cli, "sync_kioxia_weekly", create_autospec(orig_sync_kioxia_weekly, return_value=None))
+    monkeypatch.setattr(cli, "sync_jsf_daily", create_autospec(orig_sync_jsf_daily, return_value=None))
+    monkeypatch.setattr(cli, "sync_jsf_issue_history", create_autospec(orig_sync_jsf_issue_history, return_value=None))
+    monkeypatch.setattr(cli, "sync_investor_flows", create_autospec(orig_sync_investor_flows, return_value=None))
+    monkeypatch.setattr(cli, "sync_short_selling", create_autospec(orig_sync_short_selling, return_value=None))
+    monkeypatch.setattr(cli, "sync_etf_units", create_autospec(orig_sync_etf_units, return_value=None))
+    monkeypatch.setattr(cli, "sync_etf_prices", create_autospec(orig_sync_etf_prices, return_value=None))
+    monkeypatch.setattr(cli, "sync_reference", create_autospec(orig_sync_reference, side_effect=_stub_reference))
+    monkeypatch.setattr(sys, "argv", [str(CLI_PATH), "--json", "run"])
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main()
+    assert exc_info.value.code == 1
+
+    out1 = capsys.readouterr().out.strip()
+    payload1 = json.loads(out1)
+    assert payload1["ok"] is False
+    assert payload1["update"]["ok"] is False
+    assert "sync_reference" in payload1["update"]["done"]
+    w1 = [w for w in payload1["update"]["warnings"] if w["step"] == "sync_margin_weekly"]
+    assert len(w1) == 1
+    assert "JPX margin history workbooks not found" in w1[0]["error"]
+    assert "history page unreachable" in w1[0]["error"]
+
+    stored1 = cli.read_rows(data_dir / "margin_weekly.csv")
+    assert "2026-11-06" in stored1
+    assert float(stored1["2026-11-06"]["short_value_mjpy"]) == 643859.0
+    assert float(stored1["2026-09-11"]["short_shares_k"]) == 500000.0
+    assert float(stored1["2026-09-11"]["neg_short_value_mjpy"]) == 0.0
+    assert (data_dir / "market_reference.csv").is_file()
+
+    # Case 2: History discovery succeeds, all history attachments fail, while current weekly workbook is valid (2026-11-13).
+    mode = "hist_attachments_all_fail"
+    valid_current_bytes = _rows_to_xlsx_bytes(
+        "レイアウト",
+        _build_current_week_rows(
+            app_date="2026/11/13 申込現在",
+            pub_date="2026/11/17 公表",
+            extra_cols=4,
+        ),
+    )
+    with pytest.raises(SystemExit) as exc_info2:
+        cli.main()
+    assert exc_info2.value.code == 1
+
+    out2 = capsys.readouterr().out.strip()
+    payload2 = json.loads(out2)
+    assert payload2["ok"] is False
+    assert payload2["update"]["ok"] is False
+    w2 = [w for w in payload2["update"]["warnings"] if w["step"] == "sync_margin_weekly"]
+    assert len(w2) == 1
+    assert "JPX margin history workbooks yielded no rows" in w2[0]["error"]
+    assert "tvdivq0000015969.xlsx" in w2[0]["error"]
+
+    stored2 = cli.read_rows(data_dir / "margin_weekly.csv")
+    assert {"2026-09-11", "2026-11-06", "2026-11-13"} <= set(stored2)
+    assert float(stored2["2026-11-13"]["long_value_mjpy"]) == 6505887.0
+    assert float(stored2["2026-09-11"]["neg_short_value_mjpy"]) == 0.0
+
+    # Case 3: History page returns 0 workbook links while current weekly workbook is valid (2026-11-20).
+    mode = "hist_discovery_zero_links"
+    valid_current_bytes = _rows_to_xlsx_bytes(
+        "レイアウト",
+        _build_current_week_rows(
+            app_date="2026/11/20 申込現在",
+            pub_date="2026/11/25 公表",
+            extra_cols=4,
+        ),
+    )
+    with pytest.raises(SystemExit) as exc_info3:
+        cli.main()
+    assert exc_info3.value.code == 1
+
+    out3 = capsys.readouterr().out.strip()
+    payload3 = json.loads(out3)
+    assert payload3["ok"] is False
+    w3 = [w for w in payload3["update"]["warnings"] if w["step"] == "sync_margin_weekly"]
+    assert len(w3) == 1
+    assert "JPX margin history workbooks not found" in w3[0]["error"]
+
+    stored3 = cli.read_rows(data_dir / "margin_weekly.csv")
+    assert {"2026-09-11", "2026-11-06", "2026-11-13", "2026-11-20"} <= set(stored3)
+    assert float(stored3["2026-11-20"]["short_value_mjpy"]) == 643859.0
+    assert float(stored3["2026-09-11"]["neg_short_value_mjpy"]) == 0.0
+
+
+def test_current_discovery_failure_or_text_date_15col_mismatch_with_valid_history_saves_history_and_exposes_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    cli = _load_cli_module()
+    out_root = tmp_path / "jp-leverage"
+    data_dir = out_root / "data"
+    html_path = out_root / "index.html"
+    monkeypatch.setattr(cli, "OUT_ROOT", out_root)
+    monkeypatch.setattr(cli, "DATA_DIR", data_dir)
+    monkeypatch.setattr(cli, "HTML_PATH", html_path)
+
+    _seed_dashboard_inputs(cli, data_dir, include_margin=False)
+    # Pre-seed an older historical row with explicit zero and an existing 2026-11-06 row that must not be corrupted.
+    cli.merge_margin_rows(
+        data_dir / "margin_weekly.csv",
+        [
+            {
+                "date": "2026-09-11",
+                "short_shares_k": 500000.0,
+                "short_value_mjpy": 950000.0,
+                "long_shares_k": 3300000.0,
+                "long_value_mjpy": 6000000.0,
+                "neg_short_value_mjpy": 0.0,
+                "std_short_value_mjpy": 950000.0,
+                "neg_long_value_mjpy": 2700000.0,
+                "std_long_value_mjpy": 3300000.0,
+                "jsf_stock_loan_value_mjpy": 0.0,
+                "jsf_funding_value_mjpy": 410000.0,
+            },
+            {
+                "date": "2026-11-06",
+                "short_shares_k": 349230.0,
+                "short_value_mjpy": 643859.0,
+                "long_shares_k": 3654854.0,
+                "long_value_mjpy": 6505887.0,
+                "neg_short_value_mjpy": 177627.0,
+                "std_short_value_mjpy": 466231.0,
+                "neg_long_value_mjpy": 2945730.0,
+                "std_long_value_mjpy": 3560156.0,
+                "jsf_stock_loan_value_mjpy": 195538.0,
+                "jsf_funding_value_mjpy": 385576.0,
+            },
+        ],
+    )
+
+    combined_bytes = _rows_to_xlsx_bytes("信用取引現在高", _build_combined_history_rows())
+    history_html = """
+    <table>
+      <tr><th>信用取引現在高</th><td><a href="tvdivq0000001rq1-att/tvdivq0000015969.xlsx">Excel</a></td></tr>
+    </table>
+    """
+    current_html = """
+    <table>
+      <tr><th>2026年11月6日申込現在</th><td><a href="tvdivq0000001rk9-att/20261106_mtcurrent.xlsx">Excel</a></td></tr>
+    </table>
+    """
+    # 16-column (>=15) current workbook with text date at B1 but Tokyo-only scope at E6.
+    mismatched_16col_current_bytes = _rows_to_xlsx_bytes(
+        "レイアウト",
+        _build_current_week_rows(
+            app_date="2026/11/6 申込現在",
+            pub_date="2026/11/10 公表",
+            scope_e6="東京 Tokyo",
+            extra_cols=4,
+        ),
+    )
+
+    orig_get = cli.get
+    orig_sync_kioxia_weekly = cli.sync_kioxia_weekly
+    orig_sync_jsf_daily = cli.sync_jsf_daily
+    orig_sync_jsf_issue_history = cli.sync_jsf_issue_history
+    orig_sync_investor_flows = cli.sync_investor_flows
+    orig_sync_short_selling = cli.sync_short_selling
+    orig_sync_etf_units = cli.sync_etf_units
+    orig_sync_etf_prices = cli.sync_etf_prices
+    orig_sync_reference = cli.sync_reference
+
+    mode = "current_discovery_http_error"
+
+    def _fake_get(url: str, **kw) -> requests.Response:
+        resp = create_autospec(requests.Response, instance=True)
+        if url == cli.MARGIN_HISTORY_URL:
+            resp.text = history_html
+            resp.content = history_html.encode("utf-8")
+            return resp
+        if url == cli.MARGIN_CURRENT_URL:
+            if mode == "current_discovery_http_error":
+                raise requests.ConnectionError("current weekly page unreachable")
+            resp.text = current_html
+            resp.content = current_html.encode("utf-8")
+            return resp
+        if url.endswith("tvdivq0000015969.xlsx"):
+            resp.content = combined_bytes
+            return resp
+        if url.endswith("20261106_mtcurrent.xlsx"):
+            resp.content = mismatched_16col_current_bytes
+            return resp
+        raise AssertionError(f"Unexpected URL: {url}")
+
+    def _stub_reference() -> None:
+        _write_reference_fixture(cli, data_dir)
+
+    monkeypatch.setattr(cli, "get", create_autospec(orig_get, side_effect=_fake_get))
+    monkeypatch.setattr(cli, "sync_kioxia_weekly", create_autospec(orig_sync_kioxia_weekly, return_value=None))
+    monkeypatch.setattr(cli, "sync_jsf_daily", create_autospec(orig_sync_jsf_daily, return_value=None))
+    monkeypatch.setattr(cli, "sync_jsf_issue_history", create_autospec(orig_sync_jsf_issue_history, return_value=None))
+    monkeypatch.setattr(cli, "sync_investor_flows", create_autospec(orig_sync_investor_flows, return_value=None))
+    monkeypatch.setattr(cli, "sync_short_selling", create_autospec(orig_sync_short_selling, return_value=None))
+    monkeypatch.setattr(cli, "sync_etf_units", create_autospec(orig_sync_etf_units, return_value=None))
+    monkeypatch.setattr(cli, "sync_etf_prices", create_autospec(orig_sync_etf_prices, return_value=None))
+    monkeypatch.setattr(cli, "sync_reference", create_autospec(orig_sync_reference, side_effect=_stub_reference))
+    monkeypatch.setattr(sys, "argv", [str(CLI_PATH), "--json", "run"])
+
+    # Case 1: Current discovery HTTP failure while history is valid -> history rows saved, step fails.
+    with pytest.raises(SystemExit) as exc_info1:
+        cli.main()
+    assert exc_info1.value.code == 1
+
+    out1 = capsys.readouterr().out.strip()
+    payload1 = json.loads(out1)
+    assert payload1["ok"] is False
+    assert payload1["update"]["ok"] is False
+    assert "sync_reference" in payload1["update"]["done"]
+    w1 = [w for w in payload1["update"]["warnings"] if w["step"] == "sync_margin_weekly"]
+    assert len(w1) == 1
+    assert "JPX current weekly margin workbooks not found" in w1[0]["error"]
+    assert "current weekly page unreachable" in w1[0]["error"]
+
+    stored1 = cli.read_rows(data_dir / "margin_weekly.csv")
+    assert {"2026-09-11", "2026-09-25", "2026-10-30", "2026-11-06"} <= set(stored1)
+    assert float(stored1["2026-09-25"]["short_value_mjpy"]) == 1047238.0
+    assert float(stored1["2026-10-30"]["long_value_mjpy"]) == 6505887.0
+    assert float(stored1["2026-09-11"]["neg_short_value_mjpy"]) == 0.0
+    assert (data_dir / "market_reference.csv").is_file()
+
+    # Case 2: Current workbook has text date and 16 columns (>=15) with mismatched scope -> rejected,
+    # existing 2026-11-06 row is not overwritten with row-7/8 numbers, and main exits non-zero.
+    mode = "current_16col_text_date_mismatch"
+    with pytest.raises(SystemExit) as exc_info2:
+        cli.main()
+    assert exc_info2.value.code == 1
+
+    out2 = capsys.readouterr().out.strip()
+    payload2 = json.loads(out2)
+    assert payload2["ok"] is False
+    assert payload2["update"]["ok"] is False
+    w2 = [w for w in payload2["update"]["warnings"] if w["step"] == "sync_margin_weekly"]
+    assert len(w2) == 1
+    assert "JPX current weekly margin workbooks yielded no rows" in w2[0]["error"]
+    assert "20261106_mtcurrent.xlsx" in w2[0]["error"]
+    assert "Unrecognized" in w2[0]["error"]
+
+    stored2 = cli.read_rows(data_dir / "margin_weekly.csv")
+    # 2026-11-06 retains its valid pre-seeded values rather than row 8's 78597.0.
+    assert float(stored2["2026-11-06"]["short_shares_k"]) == 349230.0
+    assert float(stored2["2026-11-06"]["short_value_mjpy"]) == 643859.0
+    assert float(stored2["2026-09-11"]["neg_short_value_mjpy"]) == 0.0
+
+    # Case 3: Current workbook has text date and 16 columns (>=15) with mismatched balance header at E7.
+    bad_header_16col_rows = _build_current_week_rows(
+        app_date="2026/11/6 申込現在",
+        pub_date="2026/11/10 公表",
+        extra_cols=4,
+    )
+    bad_header_16col_rows[6][4] = "前週比\nWeekly change"
+    mismatched_16col_current_bytes = _rows_to_xlsx_bytes("レイアウト", bad_header_16col_rows)
+    with pytest.raises(SystemExit) as exc_info3:
+        cli.main()
+    assert exc_info3.value.code == 1
+
+    out3 = capsys.readouterr().out.strip()
+    payload3 = json.loads(out3)
+    assert payload3["ok"] is False
+    w3 = [w for w in payload3["update"]["warnings"] if w["step"] == "sync_margin_weekly"]
+    assert len(w3) == 1
+    assert "JPX current weekly margin workbooks yielded no rows" in w3[0]["error"]
+    assert "20261106_mtcurrent.xlsx" in w3[0]["error"]
+    assert "Unrecognized" in w3[0]["error"]
+
+    stored3 = cli.read_rows(data_dir / "margin_weekly.csv")
+    assert float(stored3["2026-11-06"]["short_shares_k"]) == 349230.0
+    assert float(stored3["2026-11-06"]["short_value_mjpy"]) == 643859.0
+    assert float(stored3["2026-09-11"]["neg_short_value_mjpy"]) == 0.0
 
