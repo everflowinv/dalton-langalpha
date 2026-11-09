@@ -57,6 +57,7 @@ async function sent() {
 
 /** Holds the checkpoint read open until the bubbles it draws are on screen,
  * then advances the clock so a newly minted id would differ. */
+// DALTON-HOOK(fork-message-identifiers): hold the read across a controlled clock change.
 async function forkHeldAtRead(result: Hook, fork: () => Promise<void>) {
   let release!: (value: typeof turns) => void;
   (fetchThreadTurns as Mock).mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
@@ -89,6 +90,7 @@ describe('useChatMessages – a fork keeps the bubbles it drew', () => {
     vi.restoreAllMocks();
   });
 
+  // DALTON-HOOK(fork-message-identifiers): forks keep their own identity before and after loading.
   it('keeps the edited message and its reply under the ids they were drawn with', async () => {
     const result = await sent();
     const before = ids(result);

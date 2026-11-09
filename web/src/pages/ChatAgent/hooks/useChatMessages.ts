@@ -11,7 +11,7 @@ import { flushSync } from 'react-dom';
 import { useTranslation } from 'react-i18next';
 import { useQueryClient } from '@tanstack/react-query';
 import { queryKeys } from '@/lib/queryKeys';
-import { randomUUID } from '@/lib/randomUUID';
+import { randomUUID } from '@/lib/randomUUID'; // DALTON-HOOK(fork-message-identifiers)
 import { claudeCodeRefusal } from '@/lib/claudeCode';
 import { holdReload } from '@/lib/reloadHolds';
 import { useHomeTimezone } from '@/hooks/useHomeTimezone';
