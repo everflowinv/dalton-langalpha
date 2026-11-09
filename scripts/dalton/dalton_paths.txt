@@ -196,3 +196,7 @@ integrations/dalton-channel-gateway/test/feishu.test.ts
 scripts/dalton/openclaw_overlays/skills/sentiment-dashboard/scripts/run.sh
 scripts/dalton/openclaw_overlays/scripts/sentiment_dashboard_cos_upload.py
 scripts/dalton/openclaw_overlays/scripts/bbg_remote_refresh.sh
+# Sentiment dashboard: per-series observation dates and the missing-volume note.
+scripts/dalton/openclaw_overlays/skills/sentiment-dashboard/scripts/us_market_sections.py
+scripts/dalton/openclaw_overlays/skills/sentiment-dashboard/scripts/sentiment_dashboard_cli.py
+tests/unit/dalton/test_sentiment_observation_dates.py
