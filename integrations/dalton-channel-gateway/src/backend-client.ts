@@ -255,6 +255,21 @@ export interface I3SessionCommandResponse {
   switched?: boolean;
 }
 
+/** Stored I-2 bind/unbind result. `user_id` may remain after the platform identity is removed. */
+export interface StoredBindingCommandResult {
+  ok: boolean;
+  reason?: string | null;
+  expected_platform?: string | null;
+  user_id?: string | null;
+  platform?: string | null;
+  platform_user_id?: string | null;
+  duplicate?: boolean;
+  command_effect_status?: string | null;
+  command_reply_pending?: boolean;
+  generation?: number | null;
+  generations?: Record<string, number> | null;
+}
+
 export interface I4StateResponse {
   user_id: string;
   user_tier: string;
@@ -506,7 +521,10 @@ export interface RecoverInboundEventRow {
   session_generation?: number | null;
   event_kind?: "message" | "command" | string;
   command_request?: Record<string, unknown> | null;
-  command_result?: I3SessionCommandResponse | null;
+  command_result?:
+    | (I3SessionCommandResponse & Partial<StoredBindingCommandResult>)
+    | StoredBindingCommandResult
+    | null;
   command_effect_status?: string | null;
   command_reply_pending?: boolean;
   pending_interrupt_snapshot?: PendingInterruptState | null;

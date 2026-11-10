@@ -77,6 +77,10 @@ export interface SendMessageDiscordParams {
   replyToMessageId?: string | null;
   newThread?: boolean;
   threadScopeKey?: string | null;
+  /** Stable delivery id. Standalone thread recovery reuses it across retries. */
+  deliveryKey?: string | null;
+  /** Current bot user. A standalone thread is adopted only when this user owns it. */
+  botUserId?: string | null;
   /** Resolves (and caches) a DM channel id for a recipient user id. */
   resolveDmChannelId?: (recipientUserId: string) => Promise<string>;
 }
@@ -125,16 +129,19 @@ export async function sendMessageDiscord(
   }
 
   if (params.newThread && parsed.kind !== "dm" && !scopeThreadId && parsed.kind !== "thread") {
-    const name = sanitizeDiscordThreadName(params.text, params.replyToMessageId ?? undefined);
+    const messageId = params.replyToMessageId?.trim() || null;
+    const name = sanitizeDiscordThreadName(params.text, messageId ?? undefined);
     const thread = await createThreadDiscord(rest, {
       channelId,
-      messageId: params.replyToMessageId ?? null,
+      messageId,
       name,
+      deliveryKey: params.deliveryKey,
+      botUserId: params.botUserId,
     });
     channelId = thread.id;
     resolvedAddress = formatDiscordThreadAddress({
-      guildId: parsed.guildId ?? thread.guild_id,
-      parentChannelId: parsed.channelId,
+      guildId: thread.guild_id ?? parsed.guildId,
+      parentChannelId: thread.parent_id ?? parsed.channelId,
       threadId: thread.id,
     });
   }

@@ -297,6 +297,7 @@ export class DeliveryService {
           replyToMessageId: i === 0 ? options.replyToMessageId : null,
           newThread: i === 0 ? options.newThread : false,
           threadScopeKey: effectiveThreadScopeKey,
+          deliveryKey: options.deliveryKey,
           weixinContextToken: claim.weixin_context_token ?? null,
         });
         sentChunks += 1;

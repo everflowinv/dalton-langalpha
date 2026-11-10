@@ -344,6 +344,8 @@ export class DiscordChannelAdapter implements ChannelAdapter {
       replyToMessageId: options.replyToMessageId,
       newThread: options.newThread,
       threadScopeKey: options.threadScopeKey,
+      deliveryKey: options.deliveryKey,
+      botUserId: this.botUserId,
       resolveDmChannelId: (id) => this.resolveDmChannelId(id),
     });
     return { messageId: res.messageId, resolvedAddress: res.resolvedAddress };

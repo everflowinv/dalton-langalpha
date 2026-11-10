@@ -5382,6 +5382,116 @@ def test_bind_message_id_persists_command_result_and_replay_does_not_reapply(
         == 1
     )
 
+    invalid = consume(
+        {
+            "action": "bind",
+            "platform": "feishu",
+            "platform_user_id": "ou_bind_invalid",
+            "code": "ZZZZZZ",
+            "is_group": False,
+            "message_id": "om_bind_invalid_atomic",
+            "chat_type": "dm",
+            "chat_address": "feishu:@me",
+            "scope_key": "dm:ou_bind_invalid",
+            "request_key": str(uuid4()),
+        }
+    )
+    assert invalid["ok"] is False
+    assert invalid["reason"] == "invalid_or_expired"
+    assert invalid.get("user_id") is None
+    assert invalid["command_reply_pending"] is True
+    assert ("u-alice", "feishu") not in store.identities
+
+    discord_code = client.post(
+        "/api/v1/dalton/channels/bind-codes", json={"platform": "discord"}
+    ).json()["code"]
+    mismatch = consume(
+        {
+            "action": "bind",
+            "platform": "feishu",
+            "platform_user_id": "ou_bind_mismatch",
+            "code": discord_code,
+            "is_group": False,
+            "message_id": "om_bind_mismatch_atomic",
+            "chat_type": "dm",
+            "chat_address": "feishu:@me",
+            "scope_key": "dm:ou_bind_mismatch",
+            "request_key": str(uuid4()),
+        }
+    )
+    assert mismatch["ok"] is False
+    assert mismatch["reason"] == "platform_mismatch"
+    assert mismatch["expected_platform"] == "discord"
+    assert mismatch["command_reply_pending"] is True
+    assert store.bind_codes[hash_bind_code(discord_code)]["used_at"] is None
+    assert store.bind_codes[hash_bind_code(discord_code)]["revoked_reason"] is None
+
+    # Startup recovery must return the unfinished confirmations, including
+    # unbind after the identity is gone and failed binds with no Dalton user.
+    # It must not return the bind whose confirmation was already acknowledged,
+    # and the read must not restore that identity or consume the mismatched code.
+    gen_before = dict(store.session_generations[gen_key])
+    assert gen_before["generation"] == 2
+    identity_keys = set(store.identities)
+    recovered = client.get(
+        "/api/v1/dalton/channels/internal/recover",
+        headers=headers,
+        params={"mode": "startup"},
+    )
+    assert recovered.status_code == 200, recovered.text
+    by_id = {row["message_id"]: row for row in recovered.json()["inbound_events"]}
+    assert "om_bind_atomic_1" not in by_id
+
+    unbind_row = by_id["om_unbind_atomic_1"]
+    assert unbind_row["event_kind"] == "command"
+    assert unbind_row["status"] == "completed"
+    assert unbind_row["dalton_user_id"] == "u-alice"
+    assert unbind_row["command_reply_pending"] is True
+    assert unbind_row["command_request"] == {"action": "unbind", "is_group": False}
+    assert unbind_row["command_result"]["ok"] is True
+    assert unbind_row["command_result"]["user_id"] == "u-alice"
+    assert "code" not in unbind_row["command_request"]
+    assert "code" not in unbind_row["command_result"]
+
+    group_row = by_id["om_bind_group_atomic"]
+    assert group_row["dalton_user_id"] is None
+    assert group_row["status"] == "failed"
+    assert group_row["command_reply_pending"] is True
+    assert group_row["command_request"] == {"action": "bind", "is_group": True}
+    assert group_row["command_result"]["ok"] is False
+    assert group_row["command_result"]["reason"] == "revoked_in_group"
+    assert group_code not in group_row["command_request"].values()
+    assert group_code not in (group_row.get("raw_payload") or {}).values()
+
+    invalid_row = by_id["om_bind_invalid_atomic"]
+    assert invalid_row["dalton_user_id"] is None
+    assert invalid_row["status"] == "failed"
+    assert invalid_row["command_reply_pending"] is True
+    assert invalid_row["command_result"]["ok"] is False
+    assert invalid_row["command_result"]["reason"] == "invalid_or_expired"
+    assert "ZZZZZZ" not in invalid_row["command_request"].values()
+    assert "ZZZZZZ" not in (invalid_row.get("raw_payload") or {}).values()
+
+    mismatch_row = by_id["om_bind_mismatch_atomic"]
+    assert mismatch_row["dalton_user_id"] is None
+    assert mismatch_row["status"] == "failed"
+    assert mismatch_row["command_reply_pending"] is True
+    assert mismatch_row["command_result"]["reason"] == "platform_mismatch"
+    assert mismatch_row["command_result"]["expected_platform"] == "discord"
+    assert "code" not in mismatch_row["command_request"]
+    assert discord_code not in mismatch_row["command_request"].values()
+    assert discord_code not in (mismatch_row.get("raw_payload") or {}).values()
+
+    assert ("u-alice", "feishu") not in store.identities
+    assert set(store.identities) == identity_keys
+    assert store.session_generations[gen_key]["generation"] == 2
+    assert (
+        store.session_generations[gen_key]["last_conversation_activity_at"]
+        == gen_before["last_conversation_activity_at"]
+    )
+    assert store.bind_codes[hash_bind_code(discord_code)]["used_at"] is None
+    assert store.bind_codes[hash_bind_code(discord_code)]["revoked_reason"] is None
+
     plain_code = client.post(
         "/api/v1/dalton/channels/bind-codes", json={"platform": "feishu"}
     ).json()["code"]

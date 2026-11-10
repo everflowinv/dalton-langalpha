@@ -39,6 +39,11 @@ export interface SendTextChunkOptions {
   replyToMessageId?: string | null;
   newThread?: boolean;
   threadScopeKey?: string | null;
+  /**
+   * Stable delivery id from DeliveryService. Discord standalone thread recovery
+   * is bound to this id, the parent channel, and the current bot.
+   */
+  deliveryKey?: string | null;
   weixinContextToken?: string | null;
 }
 

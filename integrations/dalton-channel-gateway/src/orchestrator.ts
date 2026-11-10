@@ -95,6 +95,66 @@ export interface ActiveWatchHandle {
   pendingReplayFallbacks?: Map<string, PendingReplayFallbackEntry>;
 }
 
+function storedBindingAction(
+  request: unknown,
+): "bind" | "unbind" | null {
+  if (!request || typeof request !== "object" || Array.isArray(request)) {
+    return null;
+  }
+  const action = (request as Record<string, unknown>).action;
+  const cleaned = typeof action === "string" ? action.trim().toLowerCase() : "";
+  return cleaned === "bind" || cleaned === "unbind" ? cleaned : null;
+}
+
+function storedBindingResult(value: unknown): {
+  ok: boolean;
+  reason: string | null;
+  expectedPlatform: string | null;
+  userId: string | null;
+} | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (typeof record.ok !== "boolean") return null;
+  const userId =
+    typeof record.user_id === "string" && record.user_id.trim().length > 0
+      ? record.user_id.trim()
+      : null;
+  return {
+    ok: record.ok,
+    reason: typeof record.reason === "string" ? record.reason : null,
+    expectedPlatform:
+      typeof record.expected_platform === "string"
+        ? record.expected_platform
+        : null,
+    userId,
+  };
+}
+
+/** Same bind/unbind confirmation text for the live command and startup recovery. */
+function formatBindUnbindReply(params: {
+  action: "bind" | "unbind";
+  platform: string;
+  ok: boolean;
+  reason?: string | null;
+  expectedPlatform?: string | null;
+}): string {
+  if (params.action === "unbind") {
+    return params.ok
+      ? `Unlinked your ${params.platform} account from Dalton.`
+      : `Your ${params.platform} account is not currently linked.`;
+  }
+  if (!params.ok) {
+    if (params.reason === "revoked_in_group") {
+      return "For security, `/bind` cannot be used in a group chat. This code has been revoked; please generate a new code and send `/bind <CODE>` in a direct message.";
+    }
+    if (params.reason === "platform_mismatch") {
+      return `This bind code was generated for ${params.expectedPlatform ?? "another platform"}, not ${params.platform}.`;
+    }
+    return "Bind code is invalid or expired. Please generate a new code in Web Settings → Channels.";
+  }
+  return `Successfully linked your ${params.platform} account to Dalton.`;
+}
+
 export class ChannelGatewayOrchestrator {
   private readonly backend: BackendClient;
   private readonly adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
@@ -440,13 +500,13 @@ export class ChannelGatewayOrchestrator {
         scope_key: event.threadScopeKey,
         request_key: makeInboundRequestKey(event.platform, event.messageId),
       });
-      const reply = !res.ok
-        ? res.reason === "revoked_in_group"
-          ? "For security, `/bind` cannot be used in a group chat. This code has been revoked; please generate a new code and send `/bind <CODE>` in a direct message."
-          : res.reason === "platform_mismatch"
-            ? `This bind code was generated for ${res.expected_platform ?? "another platform"}, not ${event.platform}.`
-            : "Bind code is invalid or expired. Please generate a new code in Web Settings → Channels."
-        : `Successfully linked your ${event.platform} account to Dalton.`;
+      const reply = formatBindUnbindReply({
+        action: "bind",
+        platform: event.platform,
+        ok: Boolean(res.ok),
+        reason: res.reason,
+        expectedPlatform: res.expected_platform,
+      });
       await this.deliverStoredCommandConfirmation(event, {
         userId: res.user_id?.trim() || null,
         reply,
@@ -473,9 +533,11 @@ export class ChannelGatewayOrchestrator {
       }
       await this.deliverStoredCommandConfirmation(event, {
         userId: res.user_id?.trim() || null,
-        reply: res.ok
-          ? `Unlinked your ${event.platform} account from Dalton.`
-          : `Your ${event.platform} account is not currently linked.`,
+        reply: formatBindUnbindReply({
+          action: "unbind",
+          platform: event.platform,
+          ok: Boolean(res.ok),
+        }),
         ok: Boolean(res.ok),
         replyPending: res.command_reply_pending,
       });
@@ -7098,9 +7160,81 @@ export class ChannelGatewayOrchestrator {
     return attachments;
   }
 
+  private bindingRecoveryEvent(
+    row: RecoverInboundEventRow,
+  ): InboundChannelEvent {
+    const platformUserId =
+      (typeof row.platform_user_id === "string" &&
+      row.platform_user_id.trim().length > 0
+        ? row.platform_user_id.trim()
+        : typeof row.raw_payload?.platform_user_id === "string" &&
+            row.raw_payload.platform_user_id.trim().length > 0
+          ? row.raw_payload.platform_user_id.trim()
+          : typeof row.raw_payload?.sender_id === "string" &&
+              row.raw_payload.sender_id.trim().length > 0
+            ? row.raw_payload.sender_id.trim()
+            : "");
+    const chatId =
+      typeof row.raw_payload?.chat_id === "string" && row.raw_payload.chat_id
+        ? row.raw_payload.chat_id
+        : row.chat_address;
+    return {
+      platform: row.platform,
+      platformUserId,
+      ...(typeof row.raw_payload?.platform_username === "string" &&
+      row.raw_payload.platform_username
+        ? { platformUsername: row.raw_payload.platform_username }
+        : {}),
+      chatType: row.chat_type,
+      chatAddress: row.chat_address,
+      chatId,
+      ...(typeof row.raw_payload?.chat_name === "string" &&
+      row.raw_payload.chat_name
+        ? { chatName: row.raw_payload.chat_name }
+        : {}),
+      threadScopeKey: row.thread_scope_key,
+      messageId: row.message_id,
+      text: "",
+      rawPayload: row.raw_payload ?? {},
+    };
+  }
+
+  /**
+   * Delivers the stored bind/unbind confirmation. Does not consume a code,
+   * change identity, or run a workspace command.
+   */
+  private async recoverStoredBindingConfirmation(
+    row: RecoverInboundEventRow,
+    action: "bind" | "unbind",
+  ): Promise<void> {
+    const stored = storedBindingResult(row.command_result);
+    if (!stored) return;
+    const rowUserId =
+      typeof row.dalton_user_id === "string" && row.dalton_user_id.trim()
+        ? row.dalton_user_id.trim()
+        : null;
+    await this.deliverStoredCommandConfirmation(this.bindingRecoveryEvent(row), {
+      userId: stored.userId ?? rowUserId,
+      reply: formatBindUnbindReply({
+        action,
+        platform: row.platform,
+        ok: stored.ok,
+        reason: stored.reason,
+        expectedPlatform: stored.expectedPlatform,
+      }),
+      ok: stored.ok,
+      replyPending: row.command_reply_pending,
+    });
+  }
+
   private async recoverSingleInboundRow(
     row: RecoverInboundEventRow,
   ): Promise<void> {
+    const bindingAction = storedBindingAction(row.command_request);
+    if (bindingAction) {
+      await this.recoverStoredBindingConfirmation(row, bindingAction);
+      return;
+    }
     const userId = row.dalton_user_id;
     if (!userId) {
       await this.backend.updateInboundProgress({
