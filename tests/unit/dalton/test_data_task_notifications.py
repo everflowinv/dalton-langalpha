@@ -1981,6 +1981,10 @@ async def test_bounded_run_metadata_and_database_precedence_across_scheduler_and
             async def execute(self, sql: str, _params: Any = None) -> None:
                 self._sql = sql
 
+            async def fetchall(self) -> list[dict[str, Any]]:
+                assert "FROM dalton_notify_deliveries" in self._sql
+                return []
+
             async def fetchone(self) -> dict[str, Any] | None:
                 if "FROM dalton_data_task_runs" in self._sql:
                     return {

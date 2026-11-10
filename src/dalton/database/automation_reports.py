@@ -4,8 +4,8 @@ A report batch is one original-card payload, or one failure text, for one
 ``report_run_id`` of one automation. Rows land in ``dalton_notify_deliveries``
 only after the running execution matches the server-supplied identity and
 every configured recipient for that outcome is still authorized. This module
-does not send, claim, or open a gateway call. A later stage reads the saved
-rows and delivers them.
+does not send or open a gateway call. Native plan and claim call the helpers
+below to re-read these rows; they do not accept a replacement body.
 
 Identity arguments are server-sourced. The caller does not name an owner,
 task, execution, thread, run, or recipient inside the report body.
@@ -1123,3 +1123,460 @@ async def _authorize_all_targets(
             if not bound or bound != ident:
                 return None, "target_revoked"
         return list(intended), None
+
+
+def native_items_from_report_payload(
+    payload: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]] | None, str | None]:
+    """Return ordered native items copied from a saved report payload.
+
+    Cards stay in stored order and carry no images and no artifact. Failure
+    text is one text item. The digest is not rebuilt from jsonb.
+    """
+    if not is_automation_report_payload(payload):
+        return None, "payload_invalid"
+    if not str(payload.get("content_sha256") or "").strip():
+        return None, "payload_invalid"
+    expected = payload.get("expected_item_count")
+    if isinstance(expected, bool) or not isinstance(expected, int) or expected <= 0:
+        return None, "payload_invalid"
+    kind = payload.get("content_kind")
+    if kind == "cards":
+        cards = payload.get("cards")
+        if not isinstance(cards, list) or not cards or expected != len(cards):
+            return None, "payload_invalid"
+        items: list[dict[str, Any]] = []
+        for index, card in enumerate(cards):
+            if not isinstance(card, Mapping):
+                return None, "payload_invalid"
+            items.append(
+                {
+                    "item_index": index,
+                    "kind": "feishu_card",
+                    "card": deepcopy(dict(card)),
+                    "images": [],
+                }
+            )
+        return items, None
+    if kind == "failure_text":
+        text = payload.get("failure_text")
+        if not isinstance(text, str) or not text or expected != 1:
+            return None, "payload_invalid"
+        return [{"item_index": 0, "kind": "text", "text": text}], None
+    return None, "payload_invalid"
+
+
+def saved_report_target_still_configured(
+    automation: Any,
+    payload: Mapping[str, Any],
+    target: str,
+) -> tuple[bool, str]:
+    """Return whether ``target`` is still on the task's current report profile.
+
+    A removed or replaced route is not a reason to choose another recipient.
+    The saved snapshot is left unchanged.
+    """
+    cleaned = str(target or "").strip()
+    if not is_automation_report_payload(payload) or not cleaned:
+        return False, "payload_invalid"
+    if not automation_has_validated_report_profile(automation):
+        return False, "profile_invalid"
+    parsed, err = parse_report_profile(
+        automation.get("metadata") if isinstance(automation, Mapping) else None
+    )
+    if err or parsed is None:
+        return False, "profile_invalid"
+    if str(parsed.get("profile") or "") != str(payload.get("profile") or ""):
+        return False, "profile_invalid"
+    snapshot = payload.get("target_snapshot")
+    if not isinstance(snapshot, list) or cleaned not in snapshot:
+        return False, "target_removed"
+    kind = str(payload.get("content_kind") or "")
+    intended = (
+        parsed.get("report_targets")
+        if kind == "cards"
+        else parsed.get("failure_targets")
+        if kind == "failure_text"
+        else None
+    )
+    if not isinstance(intended, list) or cleaned not in intended:
+        return False, "target_removed"
+    return True, ""
+
+
+def report_status_view(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Saved-row view. Confirmed only when every snapshot target is sent."""
+    if not rows:
+        return {
+            "ok": False,
+            "code": "not_found",
+            "delivery_confirmed": False,
+            "status": "pending",
+            "targets": [],
+            "results": [],
+        }
+    payload = _payload_dict(rows[0].get("payload_json"))
+    targets = _snapshot_of(rows)
+    status, confirmed = aggregate_report_delivery(rows, targets)
+    return {
+        "ok": True,
+        "execution_id": str(
+            payload.get("first_execution_id") or rows[0].get("execution_id") or ""
+        ),
+        "report_run_id": str(payload.get("report_run_id") or ""),
+        "profile": str(payload.get("profile") or ""),
+        "content_kind": str(payload.get("content_kind") or ""),
+        "content_sha256": str(payload.get("content_sha256") or ""),
+        "delivery_confirmed": confirmed,
+        "status": status,
+        "targets": targets,
+        "payload": payload,
+        "results": [
+            {
+                "target": str(row.get("target") or ""),
+                "status": str(row.get("status") or ""),
+                "error_code": row.get("error_code"),
+                "attempt_count": row.get("attempt_count"),
+            }
+            for row in rows
+        ],
+    }
+
+
+async def load_execution_report_rows(
+    execution_id: str,
+    *,
+    conn: Any = None,
+) -> list[dict[str, Any]]:
+    """Return saved report rows for one original execution, or an empty list."""
+    exec_id = str(execution_id or "").strip()
+    if not exec_id:
+        return []
+    async with get_db_connection(conn) as owned:
+        async with owned.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT delivery_id::text AS delivery_id,
+                       execution_id,
+                       automation_id,
+                       user_id,
+                       channel,
+                       target,
+                       status,
+                       error_code,
+                       attempt_count,
+                       payload_json
+                FROM dalton_notify_deliveries
+                WHERE lower(execution_id) = lower(%s)
+                  AND COALESCE(payload_json->>'source', '') = 'automation_report'
+                ORDER BY target ASC, delivery_id ASC
+                """,
+                (exec_id,),
+            )
+            fetched = await cur.fetchall()
+    if not isinstance(fetched, list):
+        return []
+    return [dict(row) for row in fetched if isinstance(row, Mapping)]
+
+
+async def read_execution_report_confirmed(
+    execution_id: str,
+    *,
+    conn: Any = None,
+) -> bool:
+    """True only when this execution's saved report is fully sent.
+
+    A missing batch, including a quiet no-change report that stored nothing,
+    is not sent. Rows from another execution are not read.
+    """
+    rows = await load_execution_report_rows(execution_id, conn=conn)
+    if not rows:
+        return False
+    return bool(report_status_view(rows).get("delivery_confirmed"))
+
+
+async def lock_saved_report_automation(cur: Any, execution_id: str) -> bool:
+    """Share-lock the task row when this execution saved a report.
+
+    Callers take this lock before the outer-identity advisory lock. The
+    execution row is not locked: a settled run can still be delivered.
+    Returns False when the execution has no saved report.
+    """
+    exec_id = str(execution_id or "").strip()
+    if not exec_id:
+        return False
+    await cur.execute(
+        """
+        SELECT DISTINCT automation_id
+        FROM dalton_notify_deliveries
+        WHERE lower(execution_id) = lower(%s)
+          AND COALESCE(payload_json->>'source', '') = 'automation_report'
+        """,
+        (exec_id,),
+    )
+    fetched = await cur.fetchall()
+    if not isinstance(fetched, list):
+        return False
+    automation_ids = sorted(
+        {
+            str(row.get("automation_id") or "").strip()
+            for row in fetched
+            if isinstance(row, Mapping)
+            and _UUID_RE.fullmatch(str(row.get("automation_id") or "").strip())
+        }
+    )
+    for automation_id in automation_ids:
+        await cur.execute(_LOCK_AUTOMATION_FOR_SHARE_SQL, (automation_id,))
+    return bool(automation_ids)
+
+
+def _deny_report(
+    *,
+    status: str,
+    code: str,
+    message: str,
+) -> dict[str, Any]:
+    return {
+        "scope": "report",
+        "allowed": False,
+        "deny_status": status,
+        "deny_code": code,
+        "deny_message": message,
+    }
+
+
+async def authorize_saved_report_target(
+    cur: Any,
+    conn: Any,
+    *,
+    execution_id: str,
+    target: str,
+    resolve_enabled_fn: Callable[[str | None], Awaitable[bool]] | None = None,
+    resolve_overrides_fn: Callable[[str | None], Awaitable[dict[str, bool]]] | None = None,
+    resolve_targets_fn: Callable[[str | None], Awaitable[list[str]]] | None = None,
+    resolve_routes_fn: Callable[[str | None], Awaitable[dict[str, list[str]]]] | None = None,
+    is_admin_fn: Callable[[str | None], Awaitable[bool]] | None = None,
+) -> dict[str, Any]:
+    """Authorize one saved report target from immutable rows and live eligibility.
+
+    ``scope="none"`` means this execution has no saved report; the caller keeps
+    the data-task path. A report execution never falls through. The recipient
+    is the identity frozen in the saved target, not a later account binding.
+    """
+    from src.dalton.database import channel_gateway as channel_gateway_db
+    from src.dalton.database.data_task_notifications import _parse_requested_notify_target
+    from src.dalton.notify.dispatch import evaluate_user_notify_eligibility
+
+    exec_id = str(execution_id or "").strip()
+    cleaned_target = str(target or "").strip()
+    await cur.execute(
+        """
+        SELECT delivery_id::text AS delivery_id,
+               execution_id,
+               automation_id,
+               user_id,
+               channel,
+               target,
+               status,
+               error_code,
+               attempt_count,
+               payload_json
+        FROM dalton_notify_deliveries
+        WHERE lower(execution_id) = lower(%s)
+          AND COALESCE(payload_json->>'source', '') = 'automation_report'
+        ORDER BY target ASC, delivery_id ASC
+        FOR UPDATE
+        """,
+        (exec_id,),
+    )
+    fetched = await cur.fetchall()
+    rows = [dict(row) for row in fetched if isinstance(row, Mapping)] if isinstance(fetched, list) else []
+    if not rows:
+        return {"scope": "none"}
+    matched = [row for row in rows if str(row.get("target") or "").strip() == cleaned_target]
+    if len(matched) != 1:
+        return _deny_report(
+            status="skipped",
+            code="target_not_routed",
+            message="Requested target is not in the saved report batch.",
+        )
+    row = matched[0]
+    payload = _payload_dict(row.get("payload_json"))
+    if not is_automation_report_payload(payload):
+        return _deny_report(
+            status="failed",
+            code="payload_invalid",
+            message="Saved report payload is missing.",
+        )
+    stored_execution = str(payload.get("first_execution_id") or "").strip()
+    row_execution = str(row.get("execution_id") or "").strip()
+    if (
+        not _UUID_RE.fullmatch(stored_execution)
+        or stored_execution.lower() != row_execution.lower()
+        or stored_execution.lower() != exec_id.lower()
+    ):
+        return _deny_report(
+            status="failed",
+            code="payload_invalid",
+            message="Saved report execution does not match this request.",
+        )
+    owner_user_id = str(payload.get("owner_user_id") or "").strip()
+    automation_id = str(payload.get("automation_id") or "").strip()
+    row_owner = str(row.get("user_id") or "").strip()
+    row_automation = str(row.get("automation_id") or "").strip()
+    if (
+        not owner_user_id
+        or owner_user_id != row_owner
+        or not _UUID_RE.fullmatch(automation_id)
+        or automation_id.lower() != row_automation.lower()
+    ):
+        return _deny_report(
+            status="failed",
+            code="owner_mismatch",
+            message="Saved report owner does not match the delivery row.",
+        )
+    items, item_err = native_items_from_report_payload(payload)
+    if item_err or items is None:
+        return _deny_report(
+            status="failed",
+            code=item_err or "payload_invalid",
+            message="Saved report body is not a native card batch or failure text.",
+        )
+    await cur.execute(
+        """
+        SELECT automation_id::text AS automation_id,
+               user_id,
+               name,
+               metadata
+        FROM automations
+        WHERE automation_id = %s::uuid
+        """,
+        (automation_id,),
+    )
+    automation_row = await cur.fetchone()
+    if not isinstance(automation_row, Mapping):
+        return _deny_report(
+            status="skipped",
+            code="profile_invalid",
+            message="The report task no longer exists.",
+        )
+    if str(automation_row.get("user_id") or "").strip() != owner_user_id:
+        return _deny_report(
+            status="failed",
+            code="owner_mismatch",
+            message="The task owner no longer matches the saved report.",
+        )
+    automation = _automation_view(automation_row)
+    configured, config_code = saved_report_target_still_configured(
+        automation, payload, cleaned_target
+    )
+    if not configured:
+        return _deny_report(
+            status="skipped",
+            code=config_code,
+            message="The saved target is no longer on the current report profile.",
+        )
+    parsed_target = _parse_requested_notify_target(cleaned_target)
+    if parsed_target is None:
+        return _deny_report(
+            status="failed",
+            code="invalid_target",
+            message="Saved report target format is not allowed.",
+        )
+    platform, target_kind, raw_ident = parsed_target
+    if target_kind == "group":
+        canonical_target_address = f"{platform}:{raw_ident}"
+        recipient_id = raw_ident
+    else:
+        canonical_target_address = f"{platform}:@me"
+        recipient_id = raw_ident
+    frozen_recipient = str(payload.get("reconcile_recipient_id") or "").strip()
+    frozen_platform = str(payload.get("reconcile_platform") or "").strip().lower()
+    frozen_canon = str(payload.get("reconcile_canonical_target") or "").strip()
+    if frozen_recipient and (
+        frozen_recipient != recipient_id
+        or (frozen_platform and frozen_platform != platform)
+        or (frozen_canon and frozen_canon != canonical_target_address)
+    ):
+        return _deny_report(
+            status="failed",
+            code="recipient_identity_conflict",
+            message="Frozen report recipient does not match the saved target.",
+        )
+    kwargs: dict[str, Any] = {}
+    if resolve_enabled_fn is not None:
+        kwargs["resolve_enabled_fn"] = resolve_enabled_fn
+    if resolve_overrides_fn is not None:
+        kwargs["resolve_overrides_fn"] = resolve_overrides_fn
+    if resolve_targets_fn is not None:
+        kwargs["resolve_targets_fn"] = resolve_targets_fn
+    if resolve_routes_fn is not None:
+        kwargs["resolve_routes_fn"] = resolve_routes_fn
+    if is_admin_fn is not None:
+        kwargs["is_admin_fn"] = is_admin_fn
+    async with _use_held_connection(conn):
+        user_tier = await channel_gateway_db.get_user_tier(owner_user_id)
+        allowed, reason, _effective = await evaluate_user_notify_eligibility(
+            owner_user_id,
+            automation,
+            target=cleaned_target,
+            **kwargs,
+        )
+    if not allowed:
+        skip_code = reason or "toggle_off"
+        return _deny_report(
+            status="skipped",
+            code=skip_code,
+            message="Current notification settings do not allow this saved target.",
+        )
+    if target_kind == "group":
+        ok_group, group_err, _name = await channel_gateway_db._verify_group_target_deliverable(
+            cur,
+            user_id=owner_user_id,
+            user_tier=user_tier,
+            platform=platform,
+            chat_address=canonical_target_address,
+            conn=conn,
+        )
+        if not ok_group:
+            return _deny_report(
+                status="skipped",
+                code="target_revoked",
+                message=group_err or "Group target is no longer deliverable.",
+            )
+    else:
+        await cur.execute(
+            """
+            SELECT platform_user_id
+            FROM dalton_channel_identities
+            WHERE user_id = %s AND platform = %s
+            """,
+            (owner_user_id, platform),
+        )
+        id_row = await cur.fetchone()
+        bound = (
+            str(id_row.get("platform_user_id") or "").strip()
+            if isinstance(id_row, Mapping)
+            else ""
+        )
+        if not bound or bound != raw_ident:
+            return _deny_report(
+                status="skipped",
+                code="target_revoked",
+                message="The saved personal target is no longer bound to the owner.",
+            )
+    return {
+        "scope": "report",
+        "allowed": True,
+        "run_id": stored_execution.lower(),
+        "job_key": automation_id.lower(),
+        "owner_user_id": owner_user_id,
+        "owner_platform_user_id": recipient_id if target_kind == "dm" else None,
+        "platform": platform,
+        "target_kind": target_kind,
+        "requested_target": cleaned_target,
+        "canonical_target_address": canonical_target_address,
+        "recipient_id": recipient_id,
+        "items": items,
+        "payload": payload,
+    }
