@@ -1584,6 +1584,7 @@ async def update_workspace_tracking_endpoint(
 ) -> dict[str, Any]:
     from src.dalton.autonomy.schedule import AutomationLockError
     from src.dalton.autonomy.tracking import disable_tracking, enable_tracking
+    from src.dalton.services.company_automations import automation_history_context
 
     owner_id, _ = await _resolve_tracking_workspace_owner(
         workspace_id,
@@ -1591,15 +1592,19 @@ async def update_workspace_tracking_endpoint(
         require_write=True,
     )
     try:
-        if body.enabled:
-            res = await enable_tracking(
-                owner_id,
-                workspace_id,
-                tier=body.tier,
-                force=True,
-            )
-        else:
-            res = await disable_tracking(owner_id, workspace_id)
+        with automation_history_context(
+            actor_user_id=str(user_id).strip(),
+            skip_if_unchanged=True,
+        ):
+            if body.enabled:
+                res = await enable_tracking(
+                    owner_id,
+                    workspace_id,
+                    tier=body.tier,
+                    force=True,
+                )
+            else:
+                res = await disable_tracking(owner_id, workspace_id)
     except AutomationLockError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ValueError as exc:
@@ -1726,13 +1731,19 @@ async def toggle_system_job_endpoint(
             )
         if body.enabled is None:
             raise HTTPException(status_code=400, detail="enabled 不能为空")
-        return await toggle_system_job(
-            owner_id,
-            key,
-            enabled=body.enabled,
-            force=True,
-            respect_user_pause=False,
-        )
+        from src.dalton.services.company_automations import automation_history_context
+
+        with automation_history_context(
+            actor_user_id=str(user_id).strip(),
+            skip_if_unchanged=True,
+        ):
+            return await toggle_system_job(
+                owner_id,
+                key,
+                enabled=body.enabled,
+                force=True,
+                respect_user_pause=False,
+            )
     except AutomationLockError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except PermissionError as exc:
@@ -1761,7 +1772,13 @@ async def run_system_job_now_endpoint(
                 key,
                 actor_user_id=str(user_id).strip(),
             )
-        return await run_system_job_now(owner_id, key)
+        from src.dalton.services.company_automations import automation_history_context
+
+        with automation_history_context(
+            actor_user_id=str(user_id).strip(),
+            skip_if_unchanged=True,
+        ):
+            return await run_system_job_now(owner_id, key)
     except AutomationLockError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except PermissionError as exc:
