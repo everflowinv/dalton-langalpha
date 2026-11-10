@@ -6,6 +6,8 @@ from unittest.mock import patch
 import pytest
 
 from src.server.database import automation_executions as exec_db
+# DALTON-HOOK(company-automations): computer execution reads exclude Home and other computers
+from src.server.database.home_workspace import get_home_workspace_id
 
 
 @pytest.fixture
@@ -30,4 +32,24 @@ async def test_a_page_reads_one_row_past_itself(db, fetched, has_more):
     db.execute.assert_awaited_once()
     sql, params = db.execute.await_args.args
     assert "COUNT" not in sql.upper()
+    assert "execution_workspace" not in sql
     assert params[-2:] == (3, 4)
+    assert sql.index("WHERE") < sql.index("LIMIT")
+
+
+@pytest.mark.asyncio
+async def test_computer_token_filters_the_run_workspace_before_the_page(db):
+    # DALTON-HOOK(company-automations): filter task and execution workspaces before pagination
+    db.fetchall.return_value = []
+    home_id = get_home_workspace_id("user-1")
+
+    await exec_db.list_executions("user-1", computer_id="comp-b", limit=2, offset=0)
+
+    sql, params = db.execute.await_args.args
+    assert "a.workspace_id <> %s::uuid" in sql
+    assert "w.workspace_id = a.workspace_id" in sql
+    assert "COALESCE(t.workspace_id, a.workspace_id) <> %s::uuid" in sql
+    assert "execution_workspace.workspace_id = COALESCE(t.workspace_id, a.workspace_id)" in sql
+    assert "execution_workspace.computer_id = %s::uuid" in sql
+    assert sql.index("execution_workspace") < sql.index("LIMIT")
+    assert params == ("user-1", home_id, "comp-b", home_id, "comp-b", 3, 0)

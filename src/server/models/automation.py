@@ -8,7 +8,8 @@ automations and their execution history.
 import re
 from datetime import UTC, datetime
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional
+# DALTON-HOOK(company-automations): discriminated agent and script response types
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 from uuid import UUID
 
 from croniter import croniter
@@ -758,10 +759,68 @@ class AutomationResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+# DALTON-HOOK(company-automations): script read model for manifest data tasks
+class ScriptExecutionResponse(BaseModel):
+    """One real data-task run. There is no conversation thread to link."""
+
+    automation_execution_id: UUID
+    automation_id: str
+    status: str
+    scheduled_at: datetime
+    created_at: datetime
+    engine_kind: Literal["script"] = "script"
+    conversation_thread_id: None = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    exit_code: Optional[int] = None
+    failure_reason: Optional[str] = None
+    notify_status: Optional[str] = None
+    triggered_by_user_id: Optional[str] = None
+    log_tail: Optional[str] = None
+    trigger_source: Optional[str] = None
+
+    model_config = {"from_attributes": True}
+
+
+class ScriptAutomationResponse(BaseModel):
+    """Company catalog row for one manifest script. Agent-only fields are absent."""
+
+    automation_id: str
+    name: str
+    status: str
+    enabled: bool
+    paused_by_user: bool
+    cron_expression: str
+    timezone: str
+    config_version: int
+    active_version: int
+    updated_at: datetime
+    notify_storage_mode: str
+    engine_kind: Literal["script"] = "script"
+    scope: Literal["company"] = "company"
+    description: None = None
+    next_run_at: Optional[datetime] = None
+    last_run_at: Optional[datetime] = None
+    updated_by: Optional[str] = None
+    dalton_notify_category: Optional[str] = None
+    dalton_notify_effective: Optional[bool] = None
+    dalton_notify_source: Optional[str] = None
+    dalton_notify_route_targets: Optional[List[str]] = None
+    last_execution: Optional[ScriptExecutionResponse] = None
+
+    model_config = {"from_attributes": True}
+
+
+AutomationReadResponse = Annotated[
+    Union[AutomationResponse, ScriptAutomationResponse],
+    Field(discriminator="engine_kind"),
+]
+
+
 class AutomationsListResponse(BaseModel):
     """Response model for listing automations."""
 
-    automations: List[AutomationResponse]
+    automations: List[AutomationReadResponse]
     total: int
 
 
@@ -771,10 +830,44 @@ class AutomationRunResponse(AutomationExecutionResponse):
     automation_name: str
     trigger_type: str
     workspace_id: Optional[UUID] = None
+    # DALTON-HOOK(company-automations): discriminate agent runs from script runs
+    engine_kind: Literal["agent"] = "agent"
+
+
+class ScriptRunResponse(BaseModel):
+    """A script run in the shared execution feed. ``trigger_type`` is not invented."""
+
+    automation_execution_id: UUID
+    automation_id: str
+    automation_name: str
+    status: str
+    scheduled_at: datetime
+    created_at: datetime
+    engine_kind: Literal["script"] = "script"
+    conversation_thread_id: None = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    exit_code: Optional[int] = None
+    failure_reason: Optional[str] = None
+    notify_status: Optional[str] = None
+    triggered_by_user_id: Optional[str] = None
+    log_tail: Optional[str] = None
+    trigger_source: Optional[str] = None
+    workspace_id: None = None
+    excerpt: None = None
+
+    model_config = {"from_attributes": True}
+
+
+AutomationRunReadResponse = Annotated[
+    Union[AutomationRunResponse, ScriptRunResponse],
+    Field(discriminator="engine_kind"),
+]
 
 
 class AutomationRunsListResponse(BaseModel):
     """A page of runs: the user-wide feed, or one automation's history."""
 
-    executions: List[AutomationRunResponse]
+    # DALTON-HOOK(company-automations): expose both engine types in execution pages
+    executions: List[AutomationRunReadResponse]
     has_more: bool

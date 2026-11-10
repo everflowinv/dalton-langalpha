@@ -13,6 +13,7 @@ from src.server.database.automation import (
     UNSETTLED_STATUSES,
     not_a_server_skip,
 )
+from src.server.database.home_workspace import get_home_workspace_id
 from src.server.database.pool import get_db_connection
 from src.server.utils.db import UpdateQueryBuilder
 
@@ -311,6 +312,8 @@ async def list_executions(
     status: Optional[str] = None,
     limit: int = 20,
     offset: int = 0,
+    scope: Optional[str] = None,
+    computer_id: Optional[str] = None,
 ) -> tuple[List[Dict[str, Any]], bool]:
     """A page of a user's executions newest first, narrowed to one
     automation, thread or status when given, and whether more follow it.
@@ -321,7 +324,19 @@ async def list_executions(
     automation names now, which a move may have changed since. One row past
     the page answers whether another follows, where a count would read every
     run the user has.
+
+    ``scope`` and ``computer_id`` are optional. Omitted, the query is the
+    caller's own executions with no extra predicate. Company runs are not
+    selected here.
+
+    A computer token keeps the automation on that computer, outside Home, and
+    applies the same rule to the run's effective workspace
+    ``COALESCE(t.workspace_id, a.workspace_id)``. A later move changes
+    ``a.workspace_id`` while an older thread still names the computer the run
+    happened on. A run with no thread keeps the current automation workspace.
+    Both predicates are in the WHERE, so LIMIT/OFFSET page the rows that remain.
     """
+    # DALTON-HOOK(company-automations): optional scope and computer reach on the owner feed
     where_parts = ["a.user_id = %s"]
     params: list = [user_id]
     for column, value in (
@@ -332,6 +347,24 @@ async def list_executions(
         if value:
             where_parts.append(f"{column} = %s")
             params.append(value)
+    if scope is not None:
+        where_parts.append("a.scope = %s")
+        params.append(scope)
+    if computer_id is not None:
+        home_id = get_home_workspace_id(user_id)
+        where_parts.append(
+            "a.workspace_id <> %s::uuid AND EXISTS (SELECT 1 FROM workspaces w"
+            " WHERE w.workspace_id = a.workspace_id"
+            " AND w.computer_id = %s::uuid)"
+        )
+        where_parts.append(
+            "COALESCE(t.workspace_id, a.workspace_id) <> %s::uuid"
+            " AND EXISTS (SELECT 1 FROM workspaces execution_workspace"
+            " WHERE execution_workspace.workspace_id"
+            " = COALESCE(t.workspace_id, a.workspace_id)"
+            " AND execution_workspace.computer_id = %s::uuid)"
+        )
+        params.extend([home_id, computer_id, home_id, computer_id])
     where_clause = " AND ".join(where_parts)
 
     async with get_db_connection() as conn:

@@ -45,6 +45,7 @@ from src.dalton.database import budget as budget_db
 from src.dalton.database import company_automations as company_auto_db
 from src.dalton.notify import dispatch as notify_dispatch
 from src.dalton.services import company_automations as company_auto_svc
+from src.dalton.services import company_task_read
 from src.dalton.settings import DaltonBudgetDefaults
 from src.server.app import automations as automations_app
 from src.server.auth import jwt_bearer, oauth_resource, pats, ws_auth
@@ -56,7 +57,9 @@ from src.server.dependencies import principal as principal_mod
 from src.server.dependencies.principal import Principal, get_principal
 from src.server.models.automation import (
     AutomationCreate,
+    AutomationResponse,
     AutomationUpdate,
+    AutomationsListResponse,
 )
 from src.server.services import cli_tokens
 from src.server.services.automations import lifecycle as lifecycle_mod
@@ -1115,6 +1118,21 @@ async def test_list_automations_scopes_permissions_and_company_notify_isolation(
         mock_scoped_db,
     )
 
+    async def _fake_company_list(principal, *, status=None, limit=50, offset=0):
+        resp = AutomationResponse.model_validate(company_task_row)
+        company_auto_svc.apply_company_notify_representation(resp, company_task_row)
+        return AutomationsListResponse(automations=[resp], total=1)
+
+    mock_company_list = create_autospec(
+        company_task_read.list_company_automations,
+        side_effect=_fake_company_list,
+    )
+    monkeypatch.setattr(
+        company_task_read,
+        "list_company_automations",
+        mock_company_list,
+    )
+
     internal_app = _build_automations_test_app(
         Principal(user_id=INTERNAL_UID, auth="session")
     )
@@ -1164,6 +1182,7 @@ async def test_list_automations_scopes_permissions_and_company_notify_isolation(
 
     # 4. External member gets 403 on scope=company BEFORE any DB query.
     mock_scoped_db.reset_mock()
+    mock_company_list.reset_mock()
     ext_app = _build_automations_test_app(
         Principal(user_id=EXTERNAL_UID, auth="session")
     )
@@ -1173,6 +1192,7 @@ async def test_list_automations_scopes_permissions_and_company_notify_isolation(
         r_ext = await ext_client.get("/api/v1/automations?scope=company")
         assert r_ext.status_code == 403
         mock_scoped_db.assert_not_awaited()
+        mock_company_list.assert_not_awaited()
 
     # 5. Computer token (even owned by ADMIN_UID) gets 403 on scope=company BEFORE any DB query.
     comp_token_app = _build_automations_test_app(
@@ -1189,6 +1209,7 @@ async def test_list_automations_scopes_permissions_and_company_notify_isolation(
         r_comp_tok = await comp_client.get("/api/v1/automations?scope=company")
         assert r_comp_tok.status_code == 403
         mock_scoped_db.assert_not_awaited()
+        mock_company_list.assert_not_awaited()
 
         # Personal scope passes computer_id through to DB filter.
         r_pers_tok = await comp_client.get("/api/v1/automations?scope=personal")
