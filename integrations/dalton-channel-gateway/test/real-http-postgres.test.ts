@@ -19,6 +19,7 @@ import { FeishuChannelAdapter } from "../src/channels/feishu/index.js";
 import { loadConfig } from "../src/config.js";
 import { createGatewayApp } from "../src/server.js";
 import type { ChannelPlatform } from "../src/types.js";
+import { makeInboundRequestKey } from "../src/uuid.js";
 import { fetchGatewayServer } from "./helpers.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -329,14 +330,54 @@ function createMinimalFakeLarkClient(): Lark.Client {
   } as unknown as Lark.Client;
 }
 
-const hasRealEnv = Boolean(
-  process.env.DALTON_REAL_BACKEND_URL?.trim() || resolveTestDsn(),
-);
+const REAL_HTTP_SUITE_NAMES = ["discord", "feishu"] as const;
+type RealHttpSuiteName = (typeof REAL_HTTP_SUITE_NAMES)[number];
 
-describe("Real HTTP End-to-End: DiscordChannelAdapter -> GatewayOrchestrator -> POST /agent/send -> HttpBackendClient -> FastAPI channels_router -> Isolated Postgres (d030)", () => {
-  it.skipIf(!hasRealEnv)(
+function isRealHttpSuiteName(value: string): value is RealHttpSuiteName {
+  return value === "discord" || value === "feishu";
+}
+
+const externalRealBackendUrl = process.env.DALTON_REAL_BACKEND_URL?.trim() ?? "";
+const realHttpSuiteRaw = (process.env.DALTON_REAL_HTTP_SUITE ?? "")
+  .trim()
+  .toLowerCase();
+
+function realHttpSuiteGate(suite: RealHttpSuiteName): "run" | "skip" | "fail" {
+  if (isRealHttpSuiteName(realHttpSuiteRaw)) {
+    return realHttpSuiteRaw === suite ? "run" : "skip";
+  }
+  // No external backend and no selector: each describe starts its own harness.
+  // An external backend, or any selector that is not discord|feishu, must fail
+  // rather than run both suites against one backend or match zero tests.
+  if (externalRealBackendUrl || realHttpSuiteRaw) {
+    return "fail";
+  }
+  return "run";
+}
+
+function realHttpSuiteSelectionError(suite: RealHttpSuiteName): string {
+  const shown = realHttpSuiteRaw || "<unset>";
+  return (
+    `Refusing to run the ${suite} real HTTP suite against ${
+      externalRealBackendUrl ? "the supplied DALTON_REAL_BACKEND_URL" : "an invalid selector"
+    }. ` +
+    `DALTON_REAL_HTTP_SUITE=${shown}. Set it to "discord" or "feishu" so only that suite uses the external backend.`
+  );
+}
+
+const hasRealEnv = Boolean(
+  externalRealBackendUrl || resolveTestDsn(),
+);
+const discordSuiteGate = realHttpSuiteGate("discord");
+const feishuSuiteGate = realHttpSuiteGate("feishu");
+
+describe.skipIf(discordSuiteGate === "skip")("Real HTTP End-to-End: DiscordChannelAdapter -> GatewayOrchestrator -> POST /agent/send -> HttpBackendClient -> FastAPI channels_router -> Isolated Postgres (d030)", () => {
+  it.skipIf(!hasRealEnv && discordSuiteGate !== "fail")(
     "delivers current-conversation text and files to the Discord thread channel via real I-6 claim, enforces real workspace permissions on explicit targets, skips fallback after current send, and recovers thread scope across retry claims and background/watch startup recovery",
     async () => {
+      if (discordSuiteGate === "fail") {
+        throw new Error(realHttpSuiteSelectionError("discord"));
+      }
       const BOT_ID = "999000111";
       const tempDir = mkdtempSync(join(tmpdir(), "dalton-discord-real-http-"));
       let backendHandle: { baseUrl: string; stop: () => Promise<void> } | null =
@@ -496,6 +537,100 @@ describe("Real HTTP End-to-End: DiscordChannelAdapter -> GatewayOrchestrator -> 
           serviceToken: boot.service_token,
         });
 
+        // Select ws_a1 before the gateway starts. Startup recovery would otherwise
+        // resend a still-pending command confirmation and change later send counts.
+        const homeProbeId = `${boot.prefix}_msg_home_probe`;
+        const homeProbe = await realBackendClient.registerAndResolveInbound({
+          platform: "discord",
+          platform_user_id: boot.puid_a,
+          chat_type: "group",
+          chat_address: boot.parent_addr,
+          thread_scope_key: boot.thread_scope_key,
+          message_id: homeProbeId,
+          request_key: makeInboundRequestKey("discord", homeProbeId),
+          raw_payload: { platform_user_id: boot.puid_a },
+        });
+        expect(homeProbe.allowed).toBe(true);
+        expect(homeProbe.dalton_user_id).toBe(boot.user_a);
+        expect(homeProbe.workspace_id).toBe(boot.home_ws_a);
+        expect(homeProbe.workspace_id).not.toBe(boot.ws_a1);
+        expect(homeProbe.generation).toBe(1);
+        expect(homeProbe.external_thread_id).toBe(
+          `discord:${boot.thread_scope_key}:user:${boot.user_a}:gen:1`,
+        );
+        const snapHome = await inspectDb({ messageId: homeProbeId });
+        expect(snapHome.inbound?.workspace_id).toBe(boot.home_ws_a);
+        expect(snapHome.inbound?.thread_scope_key).toBe(boot.thread_scope_key);
+        expect(snapHome.inbound?.session_generation).toBe(1);
+        expect(snapHome.inbound?.event_kind).toBe("message");
+        await realBackendClient.updateInboundProgress({
+          platform: "discord",
+          message_id: homeProbeId,
+          status: "completed",
+          fallback_pending: false,
+        });
+
+        const switchMsgId = `${boot.prefix}_cmd_sw_ws_a1`;
+        const switchReq = {
+          cmd: "workspace_switch" as const,
+          platform: "discord" as const,
+          dalton_user_id: boot.user_a,
+          platform_user_id: boot.puid_a,
+          chat_type: "group" as const,
+          chat_address: boot.parent_addr,
+          scope_key: boot.thread_scope_key,
+          message_id: switchMsgId,
+          workspace_id: boot.ws_a1,
+          target_kind: "workspace_id" as const,
+        };
+        const switched = await realBackendClient.sessionCommand(switchReq);
+        expect(switched.ok).toBe(true);
+        expect(switched.duplicate).toBe(false);
+        expect(switched.switched).toBe(true);
+        expect(switched.workspace_id).toBe(boot.ws_a1);
+        expect(switched.override_workspace_id).toBe(boot.ws_a1);
+        expect(switched.is_home).toBe(false);
+        expect(switched.generation).toBe(2);
+        expect(switched.command_effect_status).toBe("done");
+        expect(switched.command_reply_pending).toBe(true);
+        const threadSessionGeneration = switched.generation ?? 0;
+        expect(switched.external_thread_id).toBe(
+          `discord:${boot.thread_scope_key}:user:${boot.user_a}:gen:${threadSessionGeneration}`,
+        );
+        const snapSwitch = await inspectDb({ messageId: switchMsgId });
+        expect(snapSwitch.inbound?.event_kind).toBe("command");
+        expect(snapSwitch.inbound?.status).toBe("accepted");
+        expect(snapSwitch.inbound?.workspace_id).toBe(boot.ws_a1);
+        expect(snapSwitch.inbound?.thread_scope_key).toBe(boot.thread_scope_key);
+        expect(snapSwitch.inbound?.session_generation).toBe(threadSessionGeneration);
+        expect(snapSwitch.inbound?.command_effect_status).toBe("done");
+        expect(snapSwitch.inbound?.command_reply_pending).toBe(true);
+
+        const replayed = await realBackendClient.sessionCommand(switchReq);
+        expect(replayed.ok).toBe(true);
+        expect(replayed.duplicate).toBe(true);
+        expect(replayed.generation).toBe(threadSessionGeneration);
+        expect(replayed.workspace_id).toBe(boot.ws_a1);
+        expect(replayed.override_workspace_id).toBe(boot.ws_a1);
+        expect(replayed.command_effect_status).toBe("done");
+        expect(replayed.command_reply_pending).toBe(true);
+        expect(replayed.external_thread_id).toBe(switched.external_thread_id);
+
+        await realBackendClient.updateInboundProgress({
+          platform: "discord",
+          message_id: switchMsgId,
+          status: "completed",
+          command_reply_pending: false,
+          fallback_pending: false,
+        });
+        const snapSwitchAck = await inspectDb({ messageId: switchMsgId });
+        expect(snapSwitchAck.inbound?.status).toBe("completed");
+        expect(snapSwitchAck.inbound?.session_generation).toBe(
+          threadSessionGeneration,
+        );
+        expect(snapSwitchAck.inbound?.command_effect_status).toBe("done");
+        expect(snapSwitchAck.inbound?.command_reply_pending).toBe(false);
+
         const adapters = new Map<ChannelPlatform, ChannelAdapter>([
           ["discord", discordAdapter],
         ]);
@@ -569,6 +704,12 @@ describe("Real HTTP End-to-End: DiscordChannelAdapter -> GatewayOrchestrator -> 
           boot.thread_scope_key,
         );
         expect(snapStreaming.inbound?.workspace_id).toBe(boot.ws_a1);
+        expect(snapStreaming.inbound?.session_generation).toBe(
+          threadSessionGeneration,
+        );
+        expect(snapStreaming.inbound?.external_thread_id).toBe(
+          `discord:${boot.thread_scope_key}:user:${boot.user_a}:gen:${threadSessionGeneration}`,
+        );
 
         // -------------------------------------------------------------------
         // 2. Current-conversation POST /agent/send (omitted `target`) delivers
@@ -790,7 +931,7 @@ describe("Real HTTP End-to-End: DiscordChannelAdapter -> GatewayOrchestrator -> 
             platform: "discord",
             target_address: boot.parent_addr,
             scope_key: boot.thread_scope_key,
-            generation: 1,
+            generation: threadSessionGeneration,
             last_seen_turn_index: 1,
             watch_active: false,
           },
@@ -860,10 +1001,13 @@ describe("Real HTTP End-to-End: DiscordChannelAdapter -> GatewayOrchestrator -> 
 });
 
 
-describe("Real HTTP End-to-End: FeishuChannelAdapter -> GatewayOrchestrator -> HttpBackendClient -> FastAPI channels_router -> Isolated Postgres", () => {
-  it.skipIf(!hasRealEnv)(
+describe.skipIf(feishuSuiteGate === "skip")("Real HTTP End-to-End: FeishuChannelAdapter -> GatewayOrchestrator -> HttpBackendClient -> FastAPI channels_router -> Isolated Postgres", () => {
+  it.skipIf(!hasRealEnv && feishuSuiteGate !== "fail")(
     "verifies I-1/I-3/I-6/I-7 wire parameters, default Home, Chinese+space workspace, duplicate candidates, real permission check, /workspace main vs /main, /new idempotency, 6-hour expiry, group mention gating, per-user group isolation, and delivery activity guards",
     async () => {
+      if (feishuSuiteGate === "fail") {
+        throw new Error(realHttpSuiteSelectionError("feishu"));
+      }
       const BOT_OPEN_ID = "ou_bot_real_http";
       const tempDir = mkdtempSync(join(tmpdir(), "dalton-gw-real-http-"));
       let backendHandle: { baseUrl: string; stop: () => Promise<void> } | null =

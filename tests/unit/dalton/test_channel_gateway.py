@@ -5332,9 +5332,6 @@ def test_bind_message_id_persists_command_result_and_replay_does_not_reapply(
     group_code = client.post(
         "/api/v1/dalton/channels/bind-codes", json={"platform": "feishu"}
     ).json()["code"]
-    other_code = client.post(
-        "/api/v1/dalton/channels/bind-codes", json={"platform": "feishu"}
-    ).json()["code"]
     group_body = {
         "action": "bind",
         "platform": "feishu",
@@ -5359,6 +5356,9 @@ def test_bind_message_id_persists_command_result_and_replay_does_not_reapply(
         if row["revoked_reason"] == "sent_in_group"
     ]
     assert len(revoked) == 1
+    other_code = client.post(
+        "/api/v1/dalton/channels/bind-codes", json={"platform": "feishu"}
+    ).json()["code"]
     unused_after_revoke = sum(
         1 for row in store.bind_codes.values() if row["used_at"] is None
     )

@@ -21,7 +21,7 @@ import logging
 import random
 import secrets
 from typing import Any
-from uuid import UUID, uuid4, uuid5
+from uuid import UUID, uuid5
 
 from fastapi import HTTPException
 import psycopg

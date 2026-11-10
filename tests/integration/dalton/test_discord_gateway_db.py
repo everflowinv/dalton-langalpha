@@ -3,7 +3,7 @@
 Reads the isolated test database connection string from ``DALTON_CHANNEL_GATEWAY_TEST_DSN``
 (or ``DALTON_TEST_DB_DSN`` / ``TEST_DATABASE_URL``); skips cleanly when unset and unreachable.
 Enforces that the target database name ends with ``_test``, upgrades upstream Alembic to ``head``
-and Dalton Alembic to ``d030``, and exercises real permission checks, real FastAPI routes, and
+and Dalton Alembic to ``d031``, and exercises real permission checks, real FastAPI routes, and
 real HTTP-to-FastAPI-to-PostgreSQL flows with ``DiscordChannelAdapter`` and ``GatewayOrchestrator``.
 """
 
@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import sys
 from typing import Any
@@ -113,8 +114,8 @@ def _run_alembic_upgrade_sync(cfg: Config, revision: str) -> None:
     command.upgrade(cfg, revision)
 
 
-async def _ensure_alembic_upgraded_to_d030(dsn: str) -> None:
-    """Upgrade upstream Alembic chain to head and Dalton Alembic chain to d030."""
+async def _ensure_alembic_upgraded_to_d031(dsn: str) -> None:
+    """Upgrade upstream Alembic chain to head and Dalton Alembic chain to d031."""
     project_root = Path(__file__).resolve().parents[3]
     sa_url = dsn.replace("postgresql://", "postgresql+psycopg://", 1).replace(
         "%", "%%"
@@ -130,7 +131,7 @@ async def _ensure_alembic_upgraded_to_d030(dsn: str) -> None:
         "script_location", str(project_root / "src" / "dalton" / "migrations")
     )
     dalton_cfg.set_main_option("sqlalchemy.url", sa_url)
-    dalton_target = "d030"
+    dalton_target = "d031"
 
     current_upstream: str | None = None
     current_dalton: str | None = None
@@ -165,13 +166,13 @@ async def _ensure_alembic_upgraded_to_d030(dsn: str) -> None:
 
 @pytest_asyncio.fixture(scope="session")
 async def channel_gateway_db_pool():
-    """Ensure upstream (`head`) + Dalton (`d030`) migrations are applied and yield a connection pool."""
+    """Ensure upstream (`head`) + Dalton (`d031`) migrations are applied and yield a connection pool."""
     dsn = _get_test_dsn()
     os.environ.setdefault(
         "BYOK_ENCRYPTION_KEY", "test-channel-gateway-encryption-key-32b"
     )
 
-    await _ensure_alembic_upgraded_to_d030(dsn)
+    await _ensure_alembic_upgraded_to_d031(dsn)
 
     pool = AsyncConnectionPool(
         conninfo=dsn,
@@ -715,7 +716,172 @@ async def test_discord_thread_delivery_claim_recovery_and_real_permissions(
                     (private_b_addr, user_a),
                 )
 
-        # 4. Register Discord guild thread inbound event via I-1 (`chat_address` = parent, `thread_scope_key` = thread)
+        # 4. A new thread scope starts in Chief of Staff (Home). Select ws_a1 on that
+        #    same scope through the real session command before workspace delivery.
+        home_ws_a = cg_db.get_home_workspace_id(user_a)
+        home_probe_mid = f"{prefix}_msg_home_probe"
+        r_home = await client.post(
+            "/api/v1/dalton/channels/internal/inbound/register-and-resolve",
+            headers=headers,
+            json={
+                "platform": "discord",
+                "platform_user_id": puid_a,
+                "chat_type": "group",
+                "chat_address": parent_addr,
+                "thread_scope_key": thread_scope_key,
+                "message_id": home_probe_mid,
+                "raw_payload": {"platform_user_id": puid_a},
+            },
+        )
+        assert r_home.status_code == 200, r_home.text
+        home_data = r_home.json()
+        assert home_data["allowed"] is True
+        assert home_data["dalton_user_id"] == user_a
+        assert home_data["workspace_id"] == home_ws_a
+        assert home_data["workspace_id"] != ws_a1
+        assert home_data["generation"] == 1
+        assert home_data["external_thread_id"] == (
+            f"discord:{thread_scope_key}:user:{user_a}:gen:1"
+        )
+        r_home_done = await client.post(
+            "/api/v1/dalton/channels/internal/inbound/progress",
+            headers=headers,
+            json={
+                "platform": "discord",
+                "message_id": home_probe_mid,
+                "status": "completed",
+                "fallback_pending": False,
+            },
+        )
+        assert r_home_done.status_code == 200, r_home_done.text
+
+        switch_mid = f"{prefix}_cmd_sw_ws_a1"
+        switch_json = {
+            "cmd": "workspace_switch",
+            "platform": "discord",
+            "platform_user_id": puid_a,
+            "chat_type": "group",
+            "chat_address": parent_addr,
+            "scope_key": thread_scope_key,
+            "message_id": switch_mid,
+            "workspace_id": ws_a1,
+            "target_kind": "workspace_id",
+        }
+        r_sw = await client.post(
+            "/api/v1/dalton/channels/internal/session/command",
+            headers=headers,
+            json=switch_json,
+        )
+        assert r_sw.status_code == 200, r_sw.text
+        sw_data = r_sw.json()
+        assert sw_data["ok"] is True
+        assert sw_data["duplicate"] is False
+        assert sw_data["switched"] is True
+        assert sw_data["workspace_id"] == ws_a1
+        assert sw_data["override_workspace_id"] == ws_a1
+        assert sw_data["is_home"] is False
+        assert sw_data["generation"] == 2
+        assert sw_data["command_effect_status"] == "done"
+        assert sw_data["command_reply_pending"] is True
+        assert sw_data["external_thread_id"] == (
+            f"discord:{thread_scope_key}:user:{user_a}:gen:2"
+        )
+
+        r_sw_replay = await client.post(
+            "/api/v1/dalton/channels/internal/session/command",
+            headers=headers,
+            json=switch_json,
+        )
+        assert r_sw_replay.status_code == 200, r_sw_replay.text
+        sw_replay = r_sw_replay.json()
+        assert sw_replay["ok"] is True
+        assert sw_replay["duplicate"] is True
+        assert sw_replay["generation"] == 2
+        assert sw_replay["workspace_id"] == ws_a1
+        assert sw_replay["override_workspace_id"] == ws_a1
+        assert sw_replay["command_effect_status"] == "done"
+        assert sw_replay["command_reply_pending"] is True
+        assert sw_replay["external_thread_id"] == sw_data["external_thread_id"]
+
+        async with db_env["pool"].connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT generation, override_workspace_id::text AS override_workspace_id
+                    FROM dalton_channel_session_generations
+                    WHERE platform = 'discord' AND scope_key = %s AND dalton_user_id = %s
+                    """,
+                    (thread_scope_key, user_a),
+                )
+                sess_row = await cur.fetchone()
+                await cur.execute(
+                    """
+                    SELECT event_kind,
+                           status,
+                           workspace_id::text AS workspace_id,
+                           thread_scope_key,
+                           session_generation,
+                           command_effect_status,
+                           command_reply_pending
+                    FROM dalton_channel_inbound_events
+                    WHERE platform = 'discord' AND message_id = %s
+                    """,
+                    (switch_mid,),
+                )
+                cmd_row = await cur.fetchone()
+        assert sess_row is not None
+        assert int(sess_row["generation"]) == 2
+        assert sess_row["override_workspace_id"] == ws_a1
+        assert cmd_row is not None
+        assert cmd_row["event_kind"] == "command"
+        assert cmd_row["status"] == "accepted"
+        assert cmd_row["workspace_id"] == ws_a1
+        assert cmd_row["thread_scope_key"] == thread_scope_key
+        assert int(cmd_row["session_generation"]) == 2
+        assert cmd_row["command_effect_status"] == "done"
+        assert cmd_row["command_reply_pending"] is True
+
+        r_sw_ack = await client.post(
+            "/api/v1/dalton/channels/internal/inbound/progress",
+            headers=headers,
+            json={
+                "platform": "discord",
+                "message_id": switch_mid,
+                "status": "completed",
+                "command_reply_pending": False,
+                "fallback_pending": False,
+            },
+        )
+        assert r_sw_ack.status_code == 200, r_sw_ack.text
+        async with db_env["pool"].connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT generation
+                    FROM dalton_channel_session_generations
+                    WHERE platform = 'discord' AND scope_key = %s AND dalton_user_id = %s
+                    """,
+                    (thread_scope_key, user_a),
+                )
+                sess_after_ack = await cur.fetchone()
+                await cur.execute(
+                    """
+                    SELECT status, session_generation, command_effect_status, command_reply_pending
+                    FROM dalton_channel_inbound_events
+                    WHERE platform = 'discord' AND message_id = %s
+                    """,
+                    (switch_mid,),
+                )
+                cmd_after_ack = await cur.fetchone()
+        assert sess_after_ack is not None
+        assert int(sess_after_ack["generation"]) == 2
+        assert cmd_after_ack is not None
+        assert cmd_after_ack["status"] == "completed"
+        assert int(cmd_after_ack["session_generation"]) == 2
+        assert cmd_after_ack["command_effect_status"] == "done"
+        assert cmd_after_ack["command_reply_pending"] is False
+
+        # Register Discord guild thread inbound event via I-1 (`chat_address` = parent, `thread_scope_key` = thread)
         r_in = await client.post(
             "/api/v1/dalton/channels/internal/inbound/register-and-resolve",
             headers=headers,
@@ -741,6 +907,10 @@ async def test_discord_thread_delivery_claim_recovery_and_real_permissions(
         assert in_data["allowed"] is True
         assert in_data["dalton_user_id"] == user_a
         assert in_data["workspace_id"] == ws_a1
+        assert in_data["generation"] == 2
+        assert in_data["external_thread_id"] == (
+            f"discord:{thread_scope_key}:user:{user_a}:gen:2"
+        )
 
         # Advance inbound event to streaming with turn_tid / turn_rid via I-7
         r_prog = await client.post(
@@ -993,7 +1163,7 @@ async def test_discord_thread_delivery_claim_recovery_and_real_permissions(
                     "platform": "discord",
                     "target_address": parent_addr,
                     "scope_key": thread_scope_key,
-                    "generation": 1,
+                    "generation": 2,
                     "last_seen_turn_index": 0,
                     "watch_active": True,
                 },
@@ -1042,6 +1212,7 @@ async def test_discord_thread_delivery_claim_recovery_and_real_permissions(
                     "platform": "discord",
                     "target_address": parent_addr,
                     "scope_key": watch_scope_key,
+                    # This watch scope was not switched, so its session generation stays 1.
                     "generation": 1,
                     "last_seen_turn_index": 0,
                     "watch_active": True,
@@ -1453,14 +1624,20 @@ def _create_real_http_test_app(
                     await cur.execute(
                         """
                         SELECT message_id,
+                               event_kind,
                                status,
                                dalton_user_id,
                                chat_address,
                                thread_scope_key,
                                workspace_id::text AS workspace_id,
                                external_thread_id,
+                               session_generation,
                                thread_id::text AS thread_id,
                                run_id,
+                               command_request,
+                               command_result,
+                               command_effect_status,
+                               command_reply_pending,
                                fallback_pending,
                                sent_to_current_count
                         FROM dalton_channel_inbound_events
@@ -1731,6 +1908,26 @@ async def _seed_real_http_discord_fixture(
     }
 
 
+def _assert_one_selected_vitest_suite(output: str, *, suite_token: str) -> None:
+    """Fail unless Vitest passed exactly one test. A filter that matches nothing is not a pass."""
+    normalized = output.replace("\u00a0", " ").replace("\u202f", " ")
+    summaries = re.findall(r"(?m)^\s*Tests\s+(.+?)\s*$", normalized)
+    assert summaries, f"Vitest did not print a Tests summary:\n{output}"
+    body = summaries[-1]
+    passed_match = re.search(r"(\d+)\s+passed", body)
+    failed_match = re.search(r"(\d+)\s+failed", body)
+    passed_n = int(passed_match.group(1)) if passed_match else 0
+    failed_n = int(failed_match.group(1)) if failed_match else 0
+    assert failed_n == 0, f"Vitest reported {failed_n} failed test(s):\n{output}"
+    assert passed_n == 1, (
+        "Expected exactly 1 selected real HTTP suite to pass "
+        f"(got {passed_n}). A selector that matches nothing is not a pass:\n{output}"
+    )
+    assert suite_token in normalized, (
+        f"Vitest output did not include the selected suite {suite_token!r}:\n{output}"
+    )
+
+
 @pytest.mark.asyncio
 async def test_real_http_discord_gateway_orchestrator_to_fastapi_and_postgres(
     db_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
@@ -1773,11 +1970,14 @@ async def test_real_http_discord_gateway_orchestrator_to_fastapi_and_postgres(
             **os.environ,
             "DALTON_REAL_BACKEND_URL": base_url,
             "DALTON_REAL_SERVICE_TOKEN": bootstrap["service_token"],
+            "DALTON_REAL_HTTP_SUITE": "discord",
         }
         proc = await asyncio.create_subprocess_exec(
             str(vitest_bin),
             "run",
             "test/real-http-postgres.test.ts",
+            "-t",
+            "DiscordChannelAdapter",
             "--pool=forks",
             "--poolOptions.forks.singleFork=true",
             cwd=str(gateway_dir),
@@ -1796,6 +1996,9 @@ async def test_real_http_discord_gateway_orchestrator_to_fastapi_and_postgres(
 
         output = stdout_bytes.decode("utf-8", errors="replace")
         assert proc.returncode == 0, f"Vitest real HTTP test failed:\n{output}"
+        _assert_one_selected_vitest_suite(
+            output, suite_token="DiscordChannelAdapter"
+        )
 
 
 async def _serve_cli_harness_main() -> None:
@@ -1804,7 +2007,7 @@ async def _serve_cli_harness_main() -> None:
     os.environ.setdefault(
         "BYOK_ENCRYPTION_KEY", "test-channel-gateway-encryption-key-32b"
     )
-    await _ensure_alembic_upgraded_to_d030(dsn)
+    await _ensure_alembic_upgraded_to_d031(dsn)
 
     pool = AsyncConnectionPool(
         conninfo=dsn,
