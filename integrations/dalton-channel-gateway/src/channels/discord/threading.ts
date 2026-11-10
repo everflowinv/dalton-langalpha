@@ -17,7 +17,11 @@
  * not post. A well-formed empty list before that request is the signal to post
  * once. After the request has been sent, only a positive match is reused. An
  * empty or failed lookup then stays unknown, and the durable delivery record
- * is what stops another create.
+ * is what stops another create. A local queue rejection never leaves the
+ * gateway, so that attempt stays failed and does not look the thread up.
+ * A channel GET is kept only when its id is a non-empty string and every
+ * present optional field has the expected type. A text channel or DM does not
+ * need thread-only fields. A malformed channel body stays a read failure.
  */
 
 import { createHash } from "node:crypto";
@@ -27,6 +31,7 @@ import { ChannelDeliveryError } from "../adapter.js";
 import {
   classifyDiscordDeliveryError,
   DiscordError,
+  DiscordQueueError,
   RateLimitError,
   type RequestClient,
 } from "./rest.js";
@@ -123,24 +128,38 @@ export interface DiscordChannelInfo {
 }
 
 export async function getDiscordChannel(rest: RequestClient, channelId: string): Promise<DiscordChannelInfo> {
+  let body: unknown;
   try {
-    return (await rest.get(`/channels/${encodeURIComponent(channelId)}`)) as DiscordChannelInfo;
+    body = await rest.get(`/channels/${encodeURIComponent(channelId)}`);
   } catch (err) {
     throw classifyDiscordDeliveryError(err, { stage: "read", message: "Discord channel lookup failed" });
   }
+  const channel = parseDiscordThreadChannel(body);
+  if (!channel) {
+    throw new ChannelDeliveryError("Discord channel lookup failed", {
+      outcome: "failed",
+      code: "unavailable",
+    });
+  }
+  return channel;
 }
 
 /** Unarchives a thread so a new message can be posted to it. No-op for non-threads. */
 export async function ensureThreadUnarchived(rest: RequestClient, channel: DiscordChannelInfo): Promise<DiscordChannelInfo> {
-  if (channel.thread_metadata?.archived) {
-    try {
-      const updated = (await rest.patch(`/channels/${encodeURIComponent(channel.id)}`, { archived: false })) as DiscordChannelInfo;
-      return updated && typeof updated === "object" ? updated : { ...channel, thread_metadata: { ...channel.thread_metadata, archived: false } };
-    } catch (err) {
-      throw classifyDiscordDeliveryError(err, { stage: "read", message: "Discord thread unarchive failed" });
-    }
+  if (!channel.thread_metadata?.archived) return channel;
+  try {
+    const updated = parseDiscordThreadChannel(
+      await rest.patch(`/channels/${encodeURIComponent(channel.id)}`, { archived: false }),
+    );
+    // A successful unarchive whose body is not a channel still continues from
+    // the channel that was already validated, marked no longer archived.
+    return updated ?? {
+      ...channel,
+      thread_metadata: { ...channel.thread_metadata, archived: false },
+    };
+  } catch (err) {
+    throw classifyDiscordDeliveryError(err, { stage: "read", message: "Discord thread unarchive failed" });
   }
-  return channel;
 }
 
 function isDiscordThreadType(type: number | undefined): type is DiscordThreadType {
@@ -242,13 +261,22 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-/** Copies one channel object. A missing id, or a present field of the wrong type, rejects the entry. */
+function optionalInteger(value: unknown): boolean {
+  return value === undefined || (typeof value === "number" && Number.isInteger(value));
+}
+
+/**
+ * Copies one channel object. The id must be a non-empty string. A present
+ * field of the wrong type rejects the entry. Thread type, owner, name mark,
+ * and thread metadata are not required, so a text channel or DM still passes.
+ */
 function parseDiscordThreadChannel(value: unknown): DiscordChannelInfo | null {
   if (!isRecord(value)) return null;
-  const id = value.id;
-  if (typeof id !== "string" || id.length === 0) return null;
+  if (typeof value.id !== "string") return null;
+  const id = value.id.trim();
+  if (id.length === 0) return null;
   const type = value.type;
-  if (type !== undefined && typeof type !== "number") return null;
+  if (type !== undefined && (typeof type !== "number" || !Number.isInteger(type))) return null;
   const guildId = value.guild_id;
   if (guildId !== undefined && typeof guildId !== "string") return null;
   const parentId = value.parent_id;
@@ -257,11 +285,13 @@ function parseDiscordThreadChannel(value: unknown): DiscordChannelInfo | null {
   if (name !== undefined && typeof name !== "string") return null;
   const ownerId = value.owner_id;
   if (ownerId !== undefined && ownerId !== null && typeof ownerId !== "string") return null;
+  if (!optionalInteger(value.flags)) return null;
   const metadata = value.thread_metadata;
   if (metadata !== undefined && !isRecord(metadata)) return null;
   if (isRecord(metadata)) {
     if (metadata.archived !== undefined && typeof metadata.archived !== "boolean") return null;
     if (metadata.locked !== undefined && typeof metadata.locked !== "boolean") return null;
+    if (!optionalInteger(metadata.flags)) return null;
   }
   const thread: DiscordChannelInfo = { id };
   if (typeof type === "number") thread.type = type;
@@ -439,7 +469,13 @@ async function postDiscordThread(
   return parseDiscordThreadChannel(response);
 }
 
+/**
+ * The create request did not leave the gateway, or Discord rejected it.
+ * A timeout, a lost response, and HTTP 500 and above are not definite:
+ * those stay unknown and must not create again.
+ */
 function isDefiniteThreadPostFailure(err: unknown): boolean {
+  if (err instanceof DiscordQueueError) return true;
   if (err instanceof RateLimitError) return true;
   return err instanceof DiscordError && err.status < 500;
 }

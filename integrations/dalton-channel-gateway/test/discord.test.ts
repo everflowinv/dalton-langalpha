@@ -22,6 +22,7 @@ import {
   DISCORD_THREAD_NAME_LIMIT,
   discordStandaloneThreadName,
   discordThreadRequestMark,
+  getDiscordChannel,
   sanitizeDiscordThreadName,
   type DiscordGatewayInfo,
   type DiscordWebSocketLike,
@@ -2964,10 +2965,11 @@ describe("Discord outbound", () => {
       backend: ReturnType<typeof createMockBackend>;
       restartGateway: () => Promise<DeliveryService>;
     }) => Promise<void>,
+    options?: { createRest?: (handler: FetchHandler) => RequestClient },
   ): Promise<void> {
     const timers = new FakeTimers();
     const sockets: FakeWebSocket[] = [];
-    const { rest } = makeRest(handler);
+    const rest = options?.createRest?.(handler) ?? makeRest(handler).rest;
     const gatewayClient = new DiscordGatewayClient({
       token: "test-bot-token",
       gatewayInfo: {
@@ -3368,6 +3370,496 @@ describe("Discord outbound", () => {
       expect(threadPosts).toBe(1);
       expect(messagePosts).toBe(0);
       expect(messageLookups).toBe(2);
+    });
+  });
+
+  function malformedChannelResponses(): Array<{ label: string; response: () => Response }> {
+    const json = (label: string, body: unknown) => ({
+      label,
+      response: () => jsonResponse(body),
+    });
+    return [
+      json("null", null),
+      json("array", []),
+      json("empty-object", {}),
+      { label: "empty-204", response: () => new Response(null, { status: 204 }) },
+      { label: "empty-200", response: () => new Response("", { status: 200 }) },
+      json("blank-id", { id: "" }),
+      json("whitespace-id", { id: "   " }),
+      json("numeric-id", { id: 42, guild_id: GUILD_ID, type: 0 }),
+      json("string-type", { id: CHANNEL_ID, type: "0" }),
+      json("fractional-type", { id: CHANNEL_ID, type: 1.5 }),
+      json("numeric-guild", { id: CHANNEL_ID, guild_id: 1 }),
+      json("numeric-parent", { id: CHANNEL_ID, parent_id: 1 }),
+      json("numeric-name", { id: CHANNEL_ID, name: 1 }),
+      json("numeric-owner", { id: CHANNEL_ID, owner_id: 1 }),
+      json("string-metadata", { id: CHANNEL_ID, thread_metadata: "no" }),
+      json("array-metadata", { id: CHANNEL_ID, thread_metadata: [] }),
+      json("null-metadata", { id: CHANNEL_ID, thread_metadata: null }),
+      json("string-archived", { id: CHANNEL_ID, thread_metadata: { archived: "yes" } }),
+      json("string-locked", { id: CHANNEL_ID, thread_metadata: { locked: "no" } }),
+      json("string-flags", { id: CHANNEL_ID, flags: "nope" }),
+      json("fractional-flags", { id: CHANNEL_ID, flags: 1.5 }),
+      json("null-flags", { id: CHANNEL_ID, flags: null }),
+      json("metadata-string-flags", { id: CHANNEL_ID, thread_metadata: { flags: "nope" } }),
+      json("metadata-fractional-flags", {
+        id: CHANNEL_ID,
+        thread_metadata: { archived: false, flags: 1.5 },
+      }),
+    ];
+  }
+
+  function validGuildChannel() {
+    return {
+      id: CHANNEL_ID,
+      type: 0,
+      guild_id: GUILD_ID,
+      parent_id: "category-1",
+      name: "general",
+      flags: 0,
+    };
+  }
+
+  function validThreadChannel(archived = false) {
+    return {
+      id: THREAD_ID,
+      type: 11,
+      guild_id: GUILD_ID,
+      parent_id: CHANNEL_ID,
+      name: "topic",
+      owner_id: BOT_ID,
+      flags: 0,
+      thread_metadata: { archived, locked: false, flags: 0 },
+    };
+  }
+
+  function confirmedCreatedThread(id: string, name: string) {
+    return {
+      id,
+      name,
+      type: 11,
+      guild_id: GUILD_ID,
+      parent_id: CHANNEL_ID,
+      owner_id: BOT_ID,
+      flags: 0,
+      thread_metadata: { archived: false, locked: false, flags: 0 },
+    };
+  }
+
+  // The real scheduler frees a completed GET before the next enqueue, so a full
+  // queue cannot reject only the later create. Reject that POST at enqueue,
+  // before fetchImpl, which is what counts a dispatched create.
+  function restRejectingUndispatchedThreadCreate(rejectCreate: { current: boolean }) {
+    return (handler: FetchHandler): RequestClient => {
+      const { rest } = makeRest(handler);
+      const enqueue = rest.scheduler.enqueue.bind(rest.scheduler);
+      vi.spyOn(rest.scheduler, "enqueue").mockImplementation((params) => {
+        const path = params.path.split("?")[0] ?? params.path;
+        if (rejectCreate.current && params.method.toUpperCase() === "POST" && path.endsWith("/threads")) {
+          return Promise.reject(new DiscordQueueError("queue_full", "Discord request queue is full"));
+        }
+        return enqueue(params);
+      });
+      return rest;
+    };
+  }
+
+  it("accepts DM and guild channel bodies that omit thread-only fields", async () => {
+    const { rest } = makeRest(async (call) => {
+      const route = routeOf(call.url);
+      if (route === "/channels/dm-1") {
+        return jsonResponse({ id: "dm-1", type: 1, name: "alice", parent_id: null, flags: 0 });
+      }
+      if (route === `/channels/${CHANNEL_ID}`) {
+        return jsonResponse({ ...validGuildChannel(), owner_id: null });
+      }
+      if (route === `/channels/${THREAD_ID}`) return jsonResponse(validThreadChannel(false));
+      throw new Error(`unexpected ${route}`);
+    });
+    expect(await getDiscordChannel(rest, "dm-1")).toEqual({
+      id: "dm-1",
+      type: 1,
+      name: "alice",
+      parent_id: null,
+    });
+    expect(await getDiscordChannel(rest, CHANNEL_ID)).toEqual({
+      id: CHANNEL_ID,
+      type: 0,
+      guild_id: GUILD_ID,
+      parent_id: "category-1",
+      name: "general",
+      owner_id: null,
+    });
+    expect(await getDiscordChannel(rest, THREAD_ID)).toEqual({
+      id: THREAD_ID,
+      type: 11,
+      guild_id: GUILD_ID,
+      parent_id: CHANNEL_ID,
+      name: "topic",
+      owner_id: BOT_ID,
+      thread_metadata: { archived: false, locked: false },
+    });
+  });
+
+  it("keeps a local thread-create queue rejection failed and creates once on the same delivery key", async () => {
+    const standaloneKey = "notice:discord:thread-queue-standalone";
+    const messageKey = "notice:discord:thread-queue-message";
+    const rejectCreate = { current: true };
+    let threadPosts = 0;
+    let messagePosts = 0;
+    let activeGets = 0;
+    let messageLookups = 0;
+    const createRoutes: string[] = [];
+    await withDiscordDelivery(async (call) => {
+      const route = routeOf(call.url);
+      const method = (call.init.method ?? "GET").toUpperCase();
+      if (route === "/users/@me") return jsonResponse({ id: BOT_ID });
+      if (route === `/channels/${CHANNEL_ID}/threads/active`) {
+        throw new Error("channel active-thread route is not a Discord v10 endpoint");
+      }
+      if (route === `/channels/${CHANNEL_ID}` && method === "GET") {
+        return jsonResponse(validGuildChannel());
+      }
+      if (route === `/guilds/${GUILD_ID}/threads/active` && method === "GET") {
+        activeGets += 1;
+        return jsonResponse({ threads: [], members: [] });
+      }
+      if (route === "/channels/m-queue" && method === "GET") {
+        messageLookups += 1;
+        return jsonResponse({ message: "Unknown Channel" }, 404);
+      }
+      if (method === "POST" && route.endsWith("/threads")) {
+        threadPosts += 1;
+        createRoutes.push(route);
+        const body = JSON.parse(String(call.init.body)) as { name: string };
+        const id = route.endsWith("/messages/m-queue/threads") ? "m-queue" : "thread-queue-standalone";
+        return jsonResponse(confirmedCreatedThread(id, body.name));
+      }
+      if (method === "POST" && route.endsWith("/messages")) {
+        messagePosts += 1;
+        return jsonResponse({ id: `msg-${messagePosts}` });
+      }
+      throw new Error(`unexpected ${method} ${route}`);
+    }, async ({ delivery, backend }) => {
+      const standalone = newThreadDelivery(standaloneKey);
+      const blocked = await delivery.executeDelivery(standalone);
+      expect(blocked.status).toBe("failed");
+      expect(blocked.code).toBe("unavailable");
+      expect(blocked.message).toMatch(/creation failed/i);
+      expect(blocked.message).toMatch(/queue is full/i);
+      expect(blocked.message).not.toMatch(/was not confirmed|could not be confirmed/i);
+      expect(threadPosts).toBe(0);
+      expect(messagePosts).toBe(0);
+      expect(activeGets).toBe(1);
+      expect(messageLookups).toBe(0);
+      expect(createRoutes).toEqual([]);
+      expect(progressStatuses(backend, standaloneKey)).toEqual(["failed"]);
+
+      const attached = newThreadDelivery(messageKey, "m-queue");
+      const attachedBlocked = await delivery.executeDelivery(attached);
+      expect(attachedBlocked.status).toBe("failed");
+      expect(attachedBlocked.code).toBe("unavailable");
+      expect(attachedBlocked.message).toMatch(/creation failed/i);
+      expect(attachedBlocked.message).toMatch(/queue is full/i);
+      expect(attachedBlocked.message).not.toMatch(/was not confirmed|could not be confirmed/i);
+      expect(threadPosts).toBe(0);
+      expect(messagePosts).toBe(0);
+      expect(activeGets).toBe(1);
+      expect(messageLookups).toBe(1);
+      expect(createRoutes).toEqual([]);
+      expect(progressStatuses(backend, messageKey)).toEqual(["failed"]);
+
+      rejectCreate.current = false;
+      const created = await delivery.executeDelivery(standalone);
+      expect(created.status).toBe("sent");
+      expect(created.address).toBe(`discord:${GUILD_ID}/${CHANNEL_ID}:thread:thread-queue-standalone`);
+      expect(threadPosts).toBe(1);
+      expect(messagePosts).toBe(1);
+      expect(activeGets).toBe(2);
+      expect(messageLookups).toBe(1);
+      expect(progressStatuses(backend, standaloneKey)).toEqual(["failed", "sent"]);
+
+      const attachedCreated = await delivery.executeDelivery(attached);
+      expect(attachedCreated.status).toBe("sent");
+      expect(attachedCreated.address).toBe(`discord:${GUILD_ID}/${CHANNEL_ID}:thread:m-queue`);
+      expect(threadPosts).toBe(2);
+      expect(messagePosts).toBe(2);
+      expect(activeGets).toBe(2);
+      expect(messageLookups).toBe(2);
+      expect(createRoutes).toEqual([
+        `/channels/${CHANNEL_ID}/threads`,
+        `/channels/${CHANNEL_ID}/messages/m-queue/threads`,
+      ]);
+      expect(progressStatuses(backend, messageKey)).toEqual(["failed", "sent"]);
+    }, { createRest: restRejectingUndispatchedThreadCreate(rejectCreate) });
+  });
+
+  it("keeps a malformed channel read failed and creates once that delivery sees a valid channel", async () => {
+    let channelGets = 0;
+    let threadPosts = 0;
+    let messagePosts = 0;
+    let activeGets = 0;
+    let channelResponse = () => jsonResponse(validGuildChannel());
+    await withDiscordDelivery(async (call) => {
+      const route = routeOf(call.url);
+      const method = (call.init.method ?? "GET").toUpperCase();
+      if (route === "/users/@me") return jsonResponse({ id: BOT_ID });
+      if (route === `/channels/${CHANNEL_ID}/threads/active`) {
+        throw new Error("channel active-thread route is not a Discord v10 endpoint");
+      }
+      if (route === `/channels/${CHANNEL_ID}` && method === "GET") {
+        channelGets += 1;
+        return channelResponse();
+      }
+      if (route === `/guilds/${GUILD_ID}/threads/active` && method === "GET") {
+        activeGets += 1;
+        return jsonResponse({ threads: [], members: [] });
+      }
+      if (route === `/channels/${CHANNEL_ID}/threads` && method === "POST") {
+        threadPosts += 1;
+        const body = JSON.parse(String(call.init.body)) as { name: string };
+        return jsonResponse(confirmedCreatedThread(`thread-read-${threadPosts}`, body.name));
+      }
+      if (method === "POST" && route.endsWith("/messages")) {
+        messagePosts += 1;
+        return jsonResponse({ id: `msg-${messagePosts}` });
+      }
+      throw new Error(`unexpected ${method} ${route}`);
+    }, async ({ delivery, backend }) => {
+      for (const [index, fixture] of malformedChannelResponses().entries()) {
+        const deliveryKey = `notice:discord:channel-read-${index}`;
+        const options = newThreadDelivery(deliveryKey);
+        channelResponse = fixture.response;
+        const getsBefore = channelGets;
+        const postsBefore = threadPosts;
+        const messagesBefore = messagePosts;
+        const listsBefore = activeGets;
+        const failed = await delivery.executeDelivery(options);
+        expect(failed.status, fixture.label).toBe("failed");
+        expect(failed.code, fixture.label).toBe("unavailable");
+        expect(failed.message, fixture.label).toMatch(/channel lookup failed/i);
+        expect(failed.message, fixture.label).not.toMatch(/was not confirmed|could not be confirmed/i);
+        expect(channelGets, fixture.label).toBe(getsBefore + 1);
+        expect(threadPosts, fixture.label).toBe(postsBefore);
+        expect(messagePosts, fixture.label).toBe(messagesBefore);
+        expect(activeGets, fixture.label).toBe(listsBefore);
+        expect(progressStatuses(backend, deliveryKey), fixture.label).toEqual(["failed"]);
+
+        channelResponse = () => jsonResponse(validGuildChannel());
+        const sent = await delivery.executeDelivery(options);
+        expect(sent.status, fixture.label).toBe("sent");
+        expect(sent.address, fixture.label).toBe(`discord:${GUILD_ID}/${CHANNEL_ID}:thread:thread-read-${postsBefore + 1}`);
+        expect(channelGets, fixture.label).toBe(getsBefore + 2);
+        expect(threadPosts, fixture.label).toBe(postsBefore + 1);
+        expect(messagePosts, fixture.label).toBe(messagesBefore + 1);
+        expect(activeGets, fixture.label).toBe(listsBefore + 1);
+        expect(progressStatuses(backend, deliveryKey), fixture.label).toEqual(["failed", "sent"]);
+      }
+
+      channelResponse = () => jsonResponse({ message: "Unknown Channel", code: 10003 }, 404);
+      const missingKey = "notice:discord:channel-missing";
+      const postsBefore = threadPosts;
+      const messagesBefore = messagePosts;
+      const listsBefore = activeGets;
+      const missing = await delivery.executeDelivery(newThreadDelivery(missingKey));
+      expect(missing.status).toBe("failed");
+      expect(missing.code).toBe("target_not_found");
+      expect(missing.message).toMatch(/channel lookup failed/i);
+      expect(threadPosts).toBe(postsBefore);
+      expect(messagePosts).toBe(messagesBefore);
+      expect(activeGets).toBe(listsBefore);
+      expect(progressStatuses(backend, missingKey)).toEqual(["failed"]);
+    });
+  });
+
+  it("keeps a malformed parent read failed and creates once the parent channel is valid", async () => {
+    let threadReads = 0;
+    let parentReads = 0;
+    let threadPosts = 0;
+    let messagePosts = 0;
+    let activeGets = 0;
+    let parentResponse = () => jsonResponse(validGuildChannel());
+    await withDiscordDelivery(async (call) => {
+      const route = routeOf(call.url);
+      const method = (call.init.method ?? "GET").toUpperCase();
+      if (route === "/users/@me") return jsonResponse({ id: BOT_ID });
+      if (route === `/channels/${THREAD_ID}` && method === "GET") {
+        threadReads += 1;
+        return jsonResponse(validThreadChannel(false));
+      }
+      if (route === `/channels/${CHANNEL_ID}` && method === "GET") {
+        parentReads += 1;
+        return parentResponse();
+      }
+      if (route === `/guilds/${GUILD_ID}/threads/active` && method === "GET") {
+        activeGets += 1;
+        return jsonResponse({ threads: [], members: [] });
+      }
+      if (route === `/channels/${CHANNEL_ID}/threads` && method === "POST") {
+        threadPosts += 1;
+        const body = JSON.parse(String(call.init.body)) as { name: string };
+        return jsonResponse(confirmedCreatedThread(`thread-parent-${threadPosts}`, body.name));
+      }
+      if (method === "POST" && route.endsWith("/messages")) {
+        messagePosts += 1;
+        return jsonResponse({ id: `msg-${messagePosts}` });
+      }
+      throw new Error(`unexpected ${method} ${route}`);
+    }, async ({ delivery, backend }) => {
+      for (const [index, fixture] of malformedChannelResponses().entries()) {
+        const deliveryKey = `notice:discord:parent-read-${index}`;
+        const options = {
+          ...newThreadDelivery(deliveryKey),
+          target: `discord:${GUILD_ID}/${THREAD_ID}`,
+        };
+        parentResponse = fixture.response;
+        const threadReadsBefore = threadReads;
+        const parentReadsBefore = parentReads;
+        const postsBefore = threadPosts;
+        const messagesBefore = messagePosts;
+        const listsBefore = activeGets;
+        const failed = await delivery.executeDelivery(options);
+        expect(failed.status, fixture.label).toBe("failed");
+        expect(failed.code, fixture.label).toBe("unavailable");
+        expect(failed.message, fixture.label).toMatch(/channel lookup failed/i);
+        expect(failed.message, fixture.label).not.toMatch(/was not confirmed|could not be confirmed/i);
+        expect(threadReads, fixture.label).toBe(threadReadsBefore + 1);
+        expect(parentReads, fixture.label).toBe(parentReadsBefore + 1);
+        expect(threadPosts, fixture.label).toBe(postsBefore);
+        expect(messagePosts, fixture.label).toBe(messagesBefore);
+        expect(activeGets, fixture.label).toBe(listsBefore);
+        expect(progressStatuses(backend, deliveryKey), fixture.label).toEqual(["failed"]);
+
+        parentResponse = () => jsonResponse(validGuildChannel());
+        const sent = await delivery.executeDelivery(options);
+        expect(sent.status, fixture.label).toBe("sent");
+        expect(sent.address, fixture.label).toBe(
+          `discord:${GUILD_ID}/${CHANNEL_ID}:thread:thread-parent-${postsBefore + 1}`,
+        );
+        expect(threadReads, fixture.label).toBe(threadReadsBefore + 2);
+        expect(parentReads, fixture.label).toBe(parentReadsBefore + 2);
+        expect(threadPosts, fixture.label).toBe(postsBefore + 1);
+        expect(messagePosts, fixture.label).toBe(messagesBefore + 1);
+        expect(activeGets, fixture.label).toBe(listsBefore + 1);
+        expect(progressStatuses(backend, deliveryKey), fixture.label).toEqual(["failed", "sent"]);
+      }
+
+      parentResponse = () => jsonResponse({ message: "Missing Access" }, 403);
+      const deniedKey = "notice:discord:parent-forbidden";
+      const postsBefore = threadPosts;
+      const messagesBefore = messagePosts;
+      const listsBefore = activeGets;
+      const denied = await delivery.executeDelivery({
+        ...newThreadDelivery(deniedKey),
+        target: `discord:${GUILD_ID}/${THREAD_ID}`,
+      });
+      expect(denied.status).toBe("failed");
+      expect(denied.code).toBe("not_allowed");
+      expect(denied.message).toMatch(/channel lookup failed/i);
+      expect(threadPosts).toBe(postsBefore);
+      expect(messagePosts).toBe(messagesBefore);
+      expect(activeGets).toBe(listsBefore);
+      expect(progressStatuses(backend, deniedKey)).toEqual(["failed"]);
+    });
+  });
+
+  it("keeps a malformed existing-thread read failed and sends once the thread channel is valid", async () => {
+    let threadReads = 0;
+    let patches = 0;
+    let messagePosts = 0;
+    const messageRoutes: string[] = [];
+    let threadResponse = () => jsonResponse(validThreadChannel(false));
+    let patchResponse = () => jsonResponse(validThreadChannel(false));
+    await withDiscordDelivery(async (call) => {
+      const route = routeOf(call.url);
+      const method = (call.init.method ?? "GET").toUpperCase();
+      if (route === "/users/@me") return jsonResponse({ id: BOT_ID });
+      if (route.endsWith("/threads/active") || route.endsWith("/threads")) {
+        throw new Error(`existing thread send must not create or list ${route}`);
+      }
+      if (route === `/channels/${THREAD_ID}` && method === "GET") {
+        threadReads += 1;
+        return threadResponse();
+      }
+      if (route === `/channels/${THREAD_ID}` && method === "PATCH") {
+        patches += 1;
+        return patchResponse();
+      }
+      if (method === "POST" && route.endsWith("/messages")) {
+        messagePosts += 1;
+        messageRoutes.push(route);
+        return jsonResponse({ id: `msg-${messagePosts}` });
+      }
+      throw new Error(`unexpected ${method} ${route}`);
+    }, async ({ delivery, backend }) => {
+      const threadTarget = `discord:${GUILD_ID}/${CHANNEL_ID}:thread:${THREAD_ID}`;
+      for (const [index, fixture] of malformedChannelResponses().entries()) {
+        const deliveryKey = `notice:discord:thread-send-${index}`;
+        const options = {
+          ...newThreadDelivery(deliveryKey),
+          newThread: false,
+          target: threadTarget,
+        };
+        threadResponse = fixture.response;
+        const readsBefore = threadReads;
+        const patchesBefore = patches;
+        const messagesBefore = messagePosts;
+        const failed = await delivery.executeDelivery(options);
+        expect(failed.status, fixture.label).toBe("failed");
+        expect(failed.code, fixture.label).toBe("unavailable");
+        expect(failed.message, fixture.label).toMatch(/channel lookup failed/i);
+        expect(failed.message, fixture.label).not.toMatch(/was not confirmed|could not be confirmed/i);
+        expect(threadReads, fixture.label).toBe(readsBefore + 1);
+        expect(patches, fixture.label).toBe(patchesBefore);
+        expect(messagePosts, fixture.label).toBe(messagesBefore);
+        expect(progressStatuses(backend, deliveryKey), fixture.label).toEqual(["failed"]);
+
+        threadResponse = () => jsonResponse(validThreadChannel(false));
+        const sent = await delivery.executeDelivery(options);
+        expect(sent.status, fixture.label).toBe("sent");
+        expect(sent.address, fixture.label).toBe(threadTarget);
+        expect(threadReads, fixture.label).toBe(readsBefore + 2);
+        expect(patches, fixture.label).toBe(patchesBefore);
+        expect(messagePosts, fixture.label).toBe(messagesBefore + 1);
+        expect(messageRoutes.at(-1), fixture.label).toBe(`/channels/${THREAD_ID}/messages`);
+        expect(progressStatuses(backend, deliveryKey), fixture.label).toEqual(["failed", "sent"]);
+      }
+
+      const archivedKey = "notice:discord:thread-archived-retry";
+      const archived = {
+        ...newThreadDelivery(archivedKey),
+        newThread: false,
+        target: threadTarget,
+      };
+      threadResponse = () => jsonResponse(null);
+      const blocked = await delivery.executeDelivery(archived);
+      expect(blocked.status).toBe("failed");
+      expect(blocked.code).toBe("unavailable");
+      expect(patches).toBe(0);
+      const messagesBeforeArchive = messagePosts;
+      threadResponse = () => jsonResponse(validThreadChannel(true));
+      patchResponse = () => jsonResponse(validThreadChannel(false));
+      const unarchived = await delivery.executeDelivery(archived);
+      expect(unarchived.status).toBe("sent");
+      expect(patches).toBe(1);
+      expect(messagePosts).toBe(messagesBeforeArchive + 1);
+      expect(messageRoutes.at(-1)).toBe(`/channels/${THREAD_ID}/messages`);
+      expect(progressStatuses(backend, archivedKey)).toEqual(["failed", "sent"]);
+
+      const patchKey = "notice:discord:thread-bad-patch";
+      threadResponse = () => jsonResponse(validThreadChannel(true));
+      patchResponse = () => jsonResponse({ id: 42, type: 11 });
+      const sentAnyway = await delivery.executeDelivery({
+        ...newThreadDelivery(patchKey),
+        newThread: false,
+        target: threadTarget,
+      });
+      expect(sentAnyway.status).toBe("sent");
+      expect(patches).toBe(2);
+      expect(messagePosts).toBe(messagesBeforeArchive + 2);
+      expect(messageRoutes.at(-1)).toBe(`/channels/${THREAD_ID}/messages`);
+      expect(messageRoutes).not.toContain("/channels/42/messages");
+      expect(progressStatuses(backend, patchKey)).toEqual(["sent"]);
     });
   });
 
