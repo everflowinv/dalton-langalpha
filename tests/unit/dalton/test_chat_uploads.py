@@ -44,6 +44,7 @@ _REAL_COMPLETE_MULTIPART_UPLOAD = chat_upload_storage.complete_multipart_upload
 _REAL_UPLOAD_PART_BYTES = chat_upload_storage.upload_part_bytes
 _REAL_PULL_DIRECT = svc.pull_direct
 _REAL_CLAIM_CLEANUP_BATCH = db_chat_uploads.claim_cleanup_batch
+_REAL_IS_UPLOAD_RETAINED_FOR_RECOVERY = db_chat_uploads.is_upload_retained_for_recovery
 
 
 # ---------------------------------------------------------------------------
@@ -5998,3 +5999,251 @@ async def test_delete_pending_not_swept_by_time_and_shared_writer_deletes_with_c
     assert upload_env["ledger"].rows[uid_retained]["state"] == "aborted"
     assert upload_env["ledger"].rows[uid_retained]["cleaned_at"] is not None
     assert key_retained not in upload_env["store"].objects
+
+
+@pytest.mark.asyncio
+async def test_materialize_placement_errors_recheck_retained_state_and_preserve_transient_or_cancellation(
+    upload_env, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify placement exceptions in materialize_chat_uploads and materialize_steered_chat_uploads:
+    - Direct 404 and chunked NoSuchKey after concurrent deletion (retained -> False) become HTTP 410 /
+      SteerAttachmentPermanentError('http_410') with no target file and no reminder.
+    - Unchanged retained state (retained -> True) preserves the original exception / SteerAttachmentTransientError.
+    - Failed post-error DB recheck or asyncio.CancelledError never falsely turns into 410."""
+    from botocore.exceptions import ClientError
+    from src.server.database import workspace as ws_db
+
+    owner = "user-r17-recheck"
+    ws_id = str(uuid.uuid4())
+    ws_meta = {
+        "workspace_id": ws_id,
+        "user_id": owner,
+        "status": "running",
+        "dir_name": "RecheckWS",
+    }
+    upload_env["workspaces"][ws_id] = ws_meta
+    monkeypatch.setattr(
+        ws_db, "get_workspace", create_autospec(ws_db.get_workspace, return_value=ws_meta)
+    )
+
+    sbx = _RealPosixSandbox(str(tmp_path / "r17_root"), dir_name="RecheckWS")
+    project = ProjectContext(workspace_id=ws_id, dir_name="RecheckWS")
+    layout = sbx.workspace(project)
+
+    async def _make_retained_upload(tag: str) -> tuple[str, ChatUploadContext, str, str]:
+        payload = f"R17_PAYLOAD_{tag}_".encode("utf-8") * 128
+        created = await svc.initiate_chat_upload(
+            user_id=owner,
+            workspace_id=ws_id,
+            filename=f"doc_{tag}.bin",
+            size_bytes=len(payload),
+        )
+        uid = created["upload_id"]
+        await svc.receive_chat_upload_part(
+            upload_id=uid, part_number=1, user_id=owner, stream=_bytes_stream(payload)
+        )
+        await svc.complete_chat_upload(upload_id=uid, user_id=owner)
+        ctx = ChatUploadContext(
+            upload_id=uid,
+            name=f"doc_{tag}.bin",
+            mime_type="application/octet-stream",
+            size=len(payload),
+        )
+        await svc.confirm_request_chat_uploads([ctx], user_id=owner, workspace_id=ws_id)
+        row = upload_env["ledger"].rows[uid]
+        rel = svc.build_sandbox_upload_rel_path(row)
+        return uid, ctx, rel, f"{layout.workspace}/{rel}"
+
+    # 1. Direct 404 after concurrent deletion (before storage bytes arrive) -> permanent 410 / http_410
+    uid_d, ctx_d, rel_d, abs_d = await _make_retained_upload("direct_del")
+    sbx.provider.direct_blob_transfer = True
+
+    async def _direct_404_after_delete(
+        sandbox: Any,
+        entries: list[dict[str, Any]],
+        *,
+        layout: WorkspaceLayout,
+        defer_dir_modes: bool = False,
+        sweep_orphans: bool = True,
+    ) -> dict[str, dict[str, Any]]:
+        del sandbox, layout, defer_dir_modes, sweep_orphans
+        await svc.retire_deleted_workspace_chat_uploads(
+            workspace_id=ws_id, caller_user_id=owner, deleted_client_paths=[rel_d]
+        )
+        return {entries[0]["path"]: {"status": "failed", "error": "404"}}
+
+    monkeypatch.setattr(
+        svc, "pull_direct", create_autospec(_REAL_PULL_DIRECT, side_effect=_direct_404_after_delete)
+    )
+    in_msgs = [{"role": "user", "content": "Check file"}]
+    with pytest.raises(HTTPException) as exc_d:
+        await attach_request_files(
+            in_msgs,
+            ChatRequest(messages=in_msgs, additional_context=[ctx_d]),
+            _FakeSession(sbx),
+            effective_model="claude-sonnet-4-5",
+            config=type("Cfg", (), {"input_modalities": ["text"], "llm_client": None})(),
+            project=project,
+            user_id=owner,
+            workspace_id=ws_id,
+        )
+    assert exc_d.value.status_code == 410
+    assert in_msgs == [{"role": "user", "content": "Check file"}]
+    assert not os.path.exists(abs_d)
+
+    uid_ds, ctx_ds, rel_ds, abs_ds = await _make_retained_upload("direct_steer_del")
+
+    async def _direct_404_steer(
+        sandbox: Any,
+        entries: list[dict[str, Any]],
+        *,
+        layout: WorkspaceLayout,
+        defer_dir_modes: bool = False,
+        sweep_orphans: bool = True,
+    ) -> dict[str, dict[str, Any]]:
+        del sandbox, layout, defer_dir_modes, sweep_orphans
+        await svc.retire_deleted_workspace_chat_uploads(
+            workspace_id=ws_id, caller_user_id=owner, deleted_client_paths=[rel_ds]
+        )
+        return {entries[0]["path"]: {"status": "failed", "error": "404"}}
+
+    monkeypatch.setattr(
+        svc, "pull_direct", create_autospec(_REAL_PULL_DIRECT, side_effect=_direct_404_steer)
+    )
+    with pytest.raises(svc.SteerAttachmentPermanentError) as exc_ds:
+        await svc.materialize_steered_chat_uploads(
+            {
+                "content": "Steer",
+                "user_id": owner,
+                "workspace_id": ws_id,
+                "chat_uploads": [ctx_ds.model_dump()],
+            },
+            session=_FakeSession(sbx),
+            project=project,
+        )
+    assert exc_ds.value.code == "http_410"
+    assert not os.path.exists(abs_ds)
+
+    # 2. Chunked NoSuchKey after concurrent deletion (before first byte read) -> permanent 410 / http_410
+    sbx.provider.direct_blob_transfer = False
+    real_iter_chunks = chat_upload_storage.iter_stored_object_chunks
+    uid_c, ctx_c, rel_c, abs_c = await _make_retained_upload("chunk_del")
+    no_such_key = ClientError(
+        {"Error": {"Code": "NoSuchKey", "Message": "The specified key does not exist."}},
+        "GetObject",
+    )
+
+    def _chunked_nosuchkey_after_delete(object_key: str, *, chunk_size: int = 4194304):
+        del object_key, chunk_size
+        upload_env["ledger"].rows[uid_c]["error"] = "explicit_delete_pending"
+        raise no_such_key
+        yield b""
+
+    monkeypatch.setattr(
+        chat_upload_storage,
+        "iter_stored_object_chunks",
+        create_autospec(
+            real_iter_chunks,
+            side_effect=_chunked_nosuchkey_after_delete,
+        ),
+    )
+    with pytest.raises(svc.SteerAttachmentPermanentError) as exc_cs:
+        await svc.materialize_steered_chat_uploads(
+            {
+                "content": "Steer chunked",
+                "user_id": owner,
+                "workspace_id": ws_id,
+                "chat_uploads": [ctx_c.model_dump()],
+            },
+            session=_FakeSession(sbx),
+            project=project,
+        )
+    assert exc_cs.value.code == "http_410"
+    assert not os.path.exists(abs_c)
+
+    # 3. Still-retained attachment keeps original exception (and SteerAttachmentTransientError on steer)
+    uid_t, ctx_t, _, abs_t = await _make_retained_upload("still_retained")
+
+    def _chunked_transient_error(object_key: str, *, chunk_size: int = 4194304):
+        del object_key, chunk_size
+        raise no_such_key
+        yield b""
+
+    monkeypatch.setattr(
+        chat_upload_storage,
+        "iter_stored_object_chunks",
+        create_autospec(
+            real_iter_chunks,
+            side_effect=_chunked_transient_error,
+        ),
+    )
+    with pytest.raises(ClientError) as exc_orig:
+        await svc.materialize_chat_uploads(
+            [ctx_t], sandbox=sbx, user_id=owner, workspace_id=ws_id, project=project
+        )
+    assert exc_orig.value is no_such_key
+    with pytest.raises(svc.SteerAttachmentTransientError):
+        await svc.materialize_steered_chat_uploads(
+            {
+                "content": "Steer transient",
+                "user_id": owner,
+                "workspace_id": ws_id,
+                "chat_uploads": [ctx_t.model_dump()],
+            },
+            session=_FakeSession(sbx),
+            project=project,
+        )
+    assert not os.path.exists(abs_t)
+
+    # 4. Failed DB recheck after placement failure never falsely asserts permanent 410 deletion
+    orig_is_retained = db_chat_uploads.is_upload_retained_for_recovery
+    recheck_calls = 0
+
+    async def _fail_on_post_error_recheck(
+        upload_id: str, workspace_id: str, *, conn: Any = None
+    ) -> bool:
+        nonlocal recheck_calls
+        recheck_calls += 1
+        if recheck_calls >= 4:
+            raise RuntimeError("transient db error during recheck")
+        return await orig_is_retained(upload_id, workspace_id, conn=conn)
+
+    monkeypatch.setattr(
+        db_chat_uploads,
+        "is_upload_retained_for_recovery",
+        create_autospec(_REAL_IS_UPLOAD_RETAINED_FOR_RECOVERY, side_effect=_fail_on_post_error_recheck),
+    )
+    with pytest.raises(svc.SteerAttachmentTransientError):
+        await svc.materialize_steered_chat_uploads(
+            {
+                "content": "Steer db recheck error",
+                "user_id": owner,
+                "workspace_id": ws_id,
+                "chat_uploads": [ctx_t.model_dump()],
+            },
+            session=_FakeSession(sbx),
+            project=project,
+        )
+    monkeypatch.setattr(db_chat_uploads, "is_upload_retained_for_recovery", orig_is_retained)
+
+    # 5. Cancellation (asyncio.CancelledError) propagates directly and never turns into 410
+    async def _cancel_during_place(*_args: Any, **_kwargs: Any) -> bool:
+        raise asyncio.CancelledError("cancelled placement")
+
+    monkeypatch.setattr(
+        svc,
+        "_place_row_in_sandbox",
+        create_autospec(svc._place_row_in_sandbox, side_effect=_cancel_during_place),
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await svc.materialize_steered_chat_uploads(
+            {
+                "content": "Steer cancelled",
+                "user_id": owner,
+                "workspace_id": ws_id,
+                "chat_uploads": [ctx_t.model_dump()],
+            },
+            session=_FakeSession(sbx),
+            project=project,
+        )
+

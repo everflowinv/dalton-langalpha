@@ -2687,15 +2687,31 @@ async def materialize_chat_uploads(
                     workspace_id,
                     is_existing_colleague_thread=is_existing_colleague_thread,
                 )
-                placed_ok = await _place_row_in_sandbox(
-                    sandbox,
-                    t_row,
-                    layout=layout,
-                    abs_path=t_abs,
-                    rel_path=t_rel,
-                    can_direct=can_direct,
-                    verify_retained=True,
-                )
+                try:
+                    placed_ok = await _place_row_in_sandbox(
+                        sandbox,
+                        t_row,
+                        layout=layout,
+                        abs_path=t_abs,
+                        rel_path=t_rel,
+                        can_direct=can_direct,
+                        verify_retained=True,
+                    )
+                except HTTPException:
+                    raise
+                except Exception as exc:
+                    try:
+                        still_retained = await db.is_upload_retained_for_recovery(
+                            str(t_row["upload_id"]), str(t_row["workspace_id"])
+                        )
+                    except Exception:
+                        still_retained = True
+                    if not still_retained:
+                        raise HTTPException(
+                            status_code=410,
+                            detail="Attachment has expired or was removed",
+                        ) from exc
+                    raise
                 if not placed_ok:
                     raise HTTPException(
                         status_code=410,

@@ -5444,3 +5444,134 @@ class TestChatLargeUploadRealInfra:
                             )
                     finally:
                         docker_ptc_sandbox.provider.direct_blob_transfer = orig_direct_flag
+
+            # (g) Deletion completed after final retained DB check but BEFORE first storage byte read:
+            #     direct pull_direct hits real MinIO 404 and chunked iter_stored_object_chunks hits
+            #     real MinIO NoSuchKey; both recheck DB retention and raise permanent 410 / http_410!
+            from src.dalton.services.chat_uploads import (
+                SteerAttachmentPermanentError,
+                materialize_steered_chat_uploads,
+            )
+
+            real_iter_chunks = storage.iter_stored_object_chunks
+            for pre_mode in ("direct", "chunked"):
+                up_p, key_p, _ = await _upload_streamed_file_via_http(
+                    chat_upload_infra.client,
+                    user_id=user["user_id"],
+                    workspace_id=workspace_id,
+                    filename=f"pre_read_{pre_mode}.bin",
+                    mime_type="application/octet-stream",
+                    total_bytes=1 * _MIB,
+                    seed_tag=f"pre-read-{pre_mode}".encode("utf-8"),
+                    tracked_keys=chat_upload_infra.tracked_keys,
+                    tracked_multiparts=chat_upload_infra.tracked_multiparts,
+                )
+                ctx_p = {
+                    "type": "chat_upload",
+                    "upload_id": up_p["upload_id"],
+                    "name": f"pre_read_{pre_mode}.bin",
+                    "mime_type": "application/octet-stream",
+                    "size": 1 * _MIB,
+                }
+                await confirm_request_chat_uploads(
+                    [ctx_p], user_id=user["user_id"], workspace_id=workspace_id
+                )
+                row_p = await chat_uploads_db.get_upload(up_p["upload_id"])
+                assert row_p is not None
+                rel_p = build_sandbox_upload_rel_path(row_p)
+                abs_p = f"{layout.workspace}/{rel_p}"
+
+                @asynccontextmanager
+                async def _noop_pre_lock(_p: str):
+                    yield
+
+                async def _delete_before_direct_download(_uid: str, _abs_t: str) -> None:
+                    del_p = await ws_crud.delete_workspace_files(
+                        workspace_id=workspace_id,
+                        x_user_id=user["user_id"],
+                        body=ws_crud.DeleteFilesRequest(paths=[rel_p]),
+                    )
+                    assert del_p == {"deleted": [rel_p], "errors": []}
+
+                pre_ready_evt = threading.Event()
+                pre_go_evt = threading.Event()
+
+                def _iter_after_pre_read_delete(object_key: str, *, chunk_size: int = 4 * _MIB):
+                    pre_ready_evt.set()
+                    assert pre_go_evt.wait(10.0), "timed out waiting for pre-read delete"
+                    yield from real_iter_chunks(object_key, chunk_size=chunk_size)
+
+                orig_direct_p = getattr(docker_ptc_sandbox.provider, "direct_blob_transfer", True)
+                docker_ptc_sandbox.provider.direct_blob_transfer = pre_mode == "direct"
+                pre_task = None
+                try:
+                    with (
+                        patch.object(docker_ptc_sandbox, "path_write_lock", side_effect=_noop_pre_lock),
+                        patch.object(
+                            cu_svc,
+                            "_AFTER_FINAL_RECOVERY_DB_CHECK_HOOK",
+                            _delete_before_direct_download if pre_mode == "direct" else None,
+                        ),
+                        patch.object(
+                            storage,
+                            "iter_stored_object_chunks",
+                            create_autospec(
+                                real_iter_chunks,
+                                side_effect=(
+                                    _iter_after_pre_read_delete
+                                    if pre_mode == "chunked"
+                                    else real_iter_chunks
+                                ),
+                            ),
+                        ),
+                    ):
+                        steer_p = {
+                            "content": f"Steer pre-read {pre_mode}",
+                            "user_id": user["user_id"],
+                            "workspace_id": workspace_id,
+                            "chat_uploads": [ctx_p],
+                        }
+                        if pre_mode == "direct":
+                            with pytest.raises(SteerAttachmentPermanentError) as exc_p:
+                                await materialize_steered_chat_uploads(
+                                    steer_p,
+                                    session=SimpleNamespace(sandbox=docker_ptc_sandbox),
+                                    project=project,
+                                )
+                            assert exc_p.value.code == "http_410"
+                        else:
+                            pre_task = asyncio.create_task(
+                                materialize_steered_chat_uploads(
+                                    steer_p,
+                                    session=SimpleNamespace(sandbox=docker_ptc_sandbox),
+                                    project=project,
+                                )
+                            )
+                            assert await asyncio.to_thread(pre_ready_evt.wait, 10.0)
+                            del_p = await ws_crud.delete_workspace_files(
+                                workspace_id=workspace_id,
+                                x_user_id=user["user_id"],
+                                body=ws_crud.DeleteFilesRequest(paths=[rel_p]),
+                            )
+                            assert del_p == {"deleted": [rel_p], "errors": []}
+                            pre_go_evt.set()
+                            with pytest.raises(SteerAttachmentPermanentError) as exc_p:
+                                await pre_task
+                            assert exc_p.value.code == "http_410"
+
+                    p_probe = await docker_ptc_sandbox.execute_bash_command(
+                        f"test ! -e {shlex.quote(abs_p)} && echo absent"
+                    )
+                    assert "absent" in (p_probe.get("stdout") or "")
+                    assert storage.object_size(key_p) is None
+                finally:
+                    pre_go_evt.set()
+                    if pre_task is not None and not pre_task.done():
+                        try:
+                            await asyncio.wait_for(asyncio.shield(pre_task), timeout=5.0)
+                        except BaseException:
+                            if not pre_task.done():
+                                pre_task.cancel()
+                                with suppress(BaseException):
+                                    await pre_task
+                    docker_ptc_sandbox.provider.direct_blob_transfer = orig_direct_p
