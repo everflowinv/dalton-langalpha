@@ -470,6 +470,78 @@ def test_a_response_with_no_response_metadata_still_bills():
 class TestNotionalCostTracking:
     """Verify per-call notional_cost is recorded for subscription models without affecting cash cost."""
 
+    @pytest.mark.parametrize(
+        ("input_tokens", "expected"),
+        [(150_000, 0.0155), (200_001, 0.0615003)],
+    )
+    def test_nominal_card_uses_stamped_model_identity(self, input_tokens, expected):
+        from src.utils.tracking.core import calculate_cost_from_per_call_records
+
+        record = _make_per_call_record(
+            model_name="muse-spark-1.3-oauth",
+            input_tokens=input_tokens,
+            output_tokens=1_000,
+            billing_type="oauth",
+        )
+        record.update(
+            pricing_model_id="muse-ember-1.0", pricing_provider="muse-oauth"
+        )
+        result = calculate_cost_from_per_call_records([record])
+
+        assert result["total_cost"] == 0.0
+        assert result["platform_cost"] == 0.0
+        assert result["per_call_costs"][0]["notional_cost"] == pytest.approx(expected)
+        assert result["by_model"]["muse-spark-1.3-oauth"]["notional_cost"] == pytest.approx(expected)
+
+    def test_stamped_nominal_identity_uses_its_oauth_card(self):
+        from src.dalton.llm.notional_pricing import resolve_notional_card
+
+        ember_card = {"input": 0.1, "output": 0.5, "cached_input": 0.004}
+        index = {
+            "display-alias": {"input": 99.0, "output": 99.0},
+            "muse-ember-1.0-oauth": ember_card,
+        }
+        assert resolve_notional_card(
+            "display-alias", pricing_model_id="muse-ember-1.0", index=index
+        ) == ember_card
+        assert resolve_notional_card(
+            "display-alias", pricing_model_id="unlisted-model", index=index
+        ) is None
+        assert resolve_notional_card("display-alias", index=index) == index["display-alias"]
+
+    def test_custom_cash_route_with_subscription_display_name(self):
+        from src.utils.tracking.core import calculate_cost_from_per_call_records
+
+        record = _make_per_call_record(
+            model_name="muse-spark-1.3-oauth",
+            input_tokens=1_000,
+            output_tokens=100,
+            billing_type="byok",
+        )
+        record.update(pricing_model_id="gpt-6-astra", pricing_provider="openai")
+        result = calculate_cost_from_per_call_records([record])
+
+        assert result["total_cost"] == pytest.approx(0.015)
+        assert result["platform_cost"] == 0.0
+        assert result["notional_cost"] == 0.0
+        assert result["per_call_costs"][0]["notional_cost"] == 0.0
+
+    def test_stamped_coding_subscription_retains_nominal_cost(self):
+        from src.utils.tracking.core import calculate_cost_from_per_call_records
+
+        record = _make_per_call_record(
+            model_name="glm-5.3-plan",
+            input_tokens=1_000,
+            output_tokens=500,
+            billing_type="byok",
+        )
+        record.update(pricing_model_id="glm-5.3", pricing_provider="z-ai-cn-coding")
+        result = calculate_cost_from_per_call_records([record])
+
+        assert result["total_cost"] == 0.0
+        assert result["platform_cost"] == 0.0
+        assert result["notional_cost"] == pytest.approx(0.00314)
+
     def test_muse_ember_per_call_notional_cost_and_zero_platform_cost(self):
         from src.utils.tracking.core import calculate_cost_from_per_call_records
 

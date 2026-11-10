@@ -248,15 +248,10 @@ def resolve_notional_card(
 ) -> dict[str, Any] | None:
     """Resolve the normalized nominal pricing card for a model or stamped pricing id."""
     idx = index if index is not None else build_notional_price_index(overlay_loader=overlay_loader)
+    identity = pricing_model_id or model_name
     for candidate in (
-        model_name,
-        pricing_model_id,
-        f"{model_name}-oauth" if model_name and not model_name.endswith("-oauth") else None,
-        (
-            f"{pricing_model_id}-oauth"
-            if pricing_model_id and not pricing_model_id.endswith("-oauth")
-            else None
-        ),
+        identity,
+        f"{identity}-oauth" if identity and not identity.endswith("-oauth") else None,
     ):
         if candidate and candidate in idx:
             return copy.deepcopy(idx[candidate])

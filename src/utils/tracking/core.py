@@ -212,6 +212,19 @@ class PricingResolver:
             pricing_model_id=stamped_id,
             pricing_provider=stamped_provider,
         )
+        if is_sub and stamped_id and stamped_provider and billing_type != "oauth":
+            from src.llms.llm import LLM
+
+            provider_info = LLM.get_model_config().get_provider_info(stamped_provider)
+            access_type = provider_info.get("access_type", "api_key")
+            # DALTON-HOOK(notional-pricing): use the stamped cash card for custom
+            # API-key routes; coding subscriptions retain their nominal accounting.
+            if (
+                access_type not in ("oauth", "coding_plan")
+                and stamped_provider != "z-ai-cn-coding"
+                and self.card_for(record)[0] is not None
+            ):
+                is_sub = False
         notional_card: Optional[Dict[str, Any]] = None
         if is_sub:
             if self._notional_index is None:
@@ -221,6 +234,16 @@ class PricingResolver:
                 pricing_model_id=stamped_id,
                 index=self._notional_index,
             )
+            if notional_card is None and stamped_id and stamped_provider:
+                from src.llms.pricing_utils import resolve_pricing_identity
+
+                if resolve_pricing_identity(model_name, billing_type=billing_type) == (
+                    stamped_provider,
+                    stamped_id,
+                ):
+                    notional_card = resolve_notional_card(
+                        model_name, index=self._notional_index
+                    )
 
         self._notional_resolved[cache_key] = (notional_card, is_sub)
         return self._notional_resolved[cache_key]
