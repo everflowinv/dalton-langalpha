@@ -373,6 +373,24 @@ export interface I6AuthorizeAndClaimResponse {
   recipient_id?: string;
   platform?: string | null;
   target_address?: string | null;
+  /**
+   * Discord thread address confirmed before the first message.
+   * Null when this delivery has not confirmed a thread.
+   * Distinct from `target_address`, which stays the original parent.
+   */
+  confirmed_thread_address?: string | null;
+  /**
+   * `before_body` means no Discord body request has been authorized.
+   * `dispatching` means a body request may already have reached Discord.
+   * Null does not prove the body is unsent.
+   */
+  discord_body_phase?: "before_body" | "dispatching" | null;
+  /**
+   * Claim generation returned by I-6.
+   * A claimed response is the generation this attempt must send back.
+   * A blocked or completed response is the generation already stored.
+   */
+  delivery_attempt?: number;
   thread_scope_key?: string | null;
   is_current?: boolean;
   home_workspace_id?: string;
@@ -396,6 +414,18 @@ export interface I7DeliveriesProgressRequest {
   status?: "in_flight" | "sent" | "partial" | "failed" | "unknown";
   error_code?: string | null;
   error_message?: string | null;
+  /** Full Discord thread address. Omitted unless this call confirms a thread. */
+  confirmed_thread_address?: string | null;
+  /**
+   * Forward-only Discord body phase. Omitted when this call does not set one.
+   * `before_body` authorizes no message POST. `dispatching` does.
+   */
+  discord_body_phase?: "before_body" | "dispatching" | null;
+  /**
+   * Claim generation from I-6. Omitted by callers that have not adopted it.
+   * An older generation does not change the delivery.
+   */
+  delivery_attempt?: number;
 }
 
 export interface I7DeliveriesProgressResponse {
@@ -403,6 +433,12 @@ export interface I7DeliveriesProgressResponse {
   delivery_key: string;
   status: string;
   sent_to_current_count: number;
+  /** Echo of the stored Discord thread address, or null when none is stored. */
+  confirmed_thread_address?: string | null;
+  /** Echo of the stored Discord body phase, or null when none is stored. */
+  discord_body_phase?: "before_body" | "dispatching" | null;
+  /** Echo of the stored claim generation. Progress does not increment it. */
+  delivery_attempt?: number;
 }
 
 export type InboundEventStatus =
