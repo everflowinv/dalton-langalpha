@@ -15,7 +15,8 @@ from src.dalton.autonomy.units_view import (
     load_dalton_automations_by_user,
 )
 from src.dalton.budget.service import get_budget_today
-from src.dalton.coverage import get_user_coverage
+from src.dalton.company_identity import is_company_system_user
+from src.dalton.coverage import get_company_coverage, get_user_coverage, infer_market
 from src.dalton.coverage.identity import resolve_workspace_coverage_identity
 from src.dalton.database.coverage_units import load_active_units_by_workspace
 from src.dalton.settings import get_dalton_settings, is_coverage_units_enabled
@@ -211,8 +212,56 @@ def _extract_scenario_version_increment_at(
     return last_inc_at
 
 
+def _company_coverage_key(ticker: str, market: str) -> str:
+    return f"{str(ticker).strip().upper()}|{str(market).strip().upper()}"
+
+
+def _company_content_market(ticker: str, company_content: Any) -> str:
+    content = company_content if isinstance(company_content, dict) else {}
+    raw = content.get("market")
+    if raw is not None and str(raw).strip():
+        return str(raw).strip().upper()
+    return infer_market(ticker)
+
+
+def _company_coverage_meta(
+    cov_map: dict[str, Any],
+    ticker: str,
+    company_content: Any,
+) -> dict[str, Any]:
+    sym = str(ticker or "").strip().upper()
+    if not sym:
+        return {}
+    # company_content market when set, otherwise infer_market. A different
+    # market's row is not a ticker-only fallback.
+    market = _company_content_market(sym, company_content)
+    meta = cov_map.get(_company_coverage_key(sym, market))
+    return meta if isinstance(meta, dict) else {}
+
+
+def _index_company_coverage_entries(raw: Any) -> dict[str, dict[str, Any]]:
+    entries: Any = []
+    if isinstance(raw, dict):
+        entries = raw.get("companies") or raw.get("coverage") or []
+    out: dict[str, dict[str, Any]] = {}
+    if not isinstance(entries, list):
+        return out
+    for item in entries:
+        if isinstance(item, dict) and item.get("ticker"):
+            ticker = str(item["ticker"]).strip().upper()
+            raw_market = item.get("market")
+            market = str(raw_market).strip().upper() if raw_market is not None else ""
+            if not market:
+                market = infer_market(ticker)
+            out[_company_coverage_key(ticker, market)] = item
+    return out
+
+
 async def _load_user_coverage_map(user_id: str | None) -> dict[str, dict[str, Any]]:
     try:
+        if is_company_system_user(user_id):
+            raw = await get_company_coverage()
+            return _index_company_coverage_entries(raw)
         raw = await get_user_coverage(user_id)
         entries = raw.get("companies") or raw.get("coverage") or []
         out: dict[str, dict[str, Any]] = {}
@@ -557,7 +606,11 @@ async def build_coverage_board(
             ticker = identity.ticker
             market_tz = ticker_market_timezone(ticker, company_content)
 
-            cov_meta = cov_map.get(ticker) or {}
+            cov_meta = (
+                _company_coverage_meta(cov_map, ticker, company_content)
+                if is_company_system_user(user_id)
+                else (cov_map.get(ticker) or {})
+            )
             house_view = thesis_content.get("house_view") or {}
             one_liner = (
                 house_view.get("one_liner")
