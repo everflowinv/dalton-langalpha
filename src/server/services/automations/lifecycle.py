@@ -12,7 +12,7 @@ field it is about, so an automation's file can point at that field.
 import asyncio
 import logging
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass  # DALTON-HOOK(company-automations): shared prepared-update value for personal and company tasks
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 from uuid import UUID

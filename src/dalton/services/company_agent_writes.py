@@ -54,6 +54,16 @@ _PROTECTED_WRITE_KEYS = (
     "deleted_by",
 )
 
+# Migration state and pre-migration identity backups stay under server control.
+# Replacing ordinary metadata preserves these stored values under the row lock.
+_PROTECTED_MIGRATION_METADATA_KEYS = frozenset(
+    {
+        "pre_company_migration",
+        "company_migration",
+        "company_migration_batches",
+    }
+)
+
 
 def company_migration_stage(metadata: Any) -> str | None:
     """Return the stored ``company_migration.stage`` text, or None when absent."""
@@ -136,20 +146,105 @@ def _strip_company_protected_kwargs(effective_kwargs: dict[str, Any]) -> None:
         effective_kwargs.pop(key, None)
 
 
-def _raw_delivery(request: AutomationUpdate | None, fields: Mapping[str, Any]) -> Any:
-    if request is not None and "delivery_config_raw" in request.model_fields_set:
-        return request.delivery_config_raw
+def _plain_delivery(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    return value
+
+
+def _delivery_bodies(request: AutomationUpdate | None, fields: Mapping[str, Any]) -> list[Any]:
+    """Delivery bodies taken from the actual ``delivery_config``.
+
+    ``delivery_config_raw`` counts only when the model derived it from that
+    same ``delivery_config`` (so keys ``DeliveryConfig`` drops are still
+    visible). A caller-supplied raw without ``delivery_config`` is ignored.
+    The parsed delivery is always checked too, so raw null or ``{}`` cannot
+    hide methods.
+    """
+    bodies: list[Any] = []
+    if request is not None and "delivery_config" in request.model_fields_set:
+        if "delivery_config_raw" in request.model_fields_set:
+            bodies.append(request.delivery_config_raw)
+        bodies.append(_plain_delivery(request.delivery_config))
     if "delivery_config" in fields:
-        return fields.get("delivery_config")
-    return None
+        bodies.append(fields.get("delivery_config"))
+    return bodies
 
 
 def _refuse_company_delivery(request: AutomationUpdate | None, fields: Mapping[str, Any]) -> None:
-    if company_delivery_is_nonempty(_raw_delivery(request, fields)):
+    if any(company_delivery_is_nonempty(body) for body in _delivery_bodies(request, fields)):
         raise HTTPException(
             status_code=400,
             detail="Company automations cannot set a non-empty delivery_config",
         )
+
+
+def _migration_metadata_name(key: Any) -> str | None:
+    text = str(key).strip().lower()
+    if text in _PROTECTED_MIGRATION_METADATA_KEYS:
+        return text
+    return None
+
+
+def _contains_protected_migration_metadata(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            if _migration_metadata_name(key) is not None:
+                return True
+            if _contains_protected_migration_metadata(child):
+                return True
+        return False
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return any(_contains_protected_migration_metadata(item) for item in value)
+    return False
+
+
+def _submitted_metadata(
+    request: AutomationUpdate | None, fields: Mapping[str, Any]
+) -> list[Any]:
+    payloads: list[Any] = []
+    if request is not None and "metadata" in request.model_fields_set:
+        payloads.append(request.metadata)
+    if "metadata" in fields:
+        payloads.append(fields.get("metadata"))
+    return payloads
+
+
+def _refuse_protected_migration_metadata(
+    request: AutomationUpdate | None, fields: Mapping[str, Any]
+) -> None:
+    """Reject client writes of migration state or the pre-migration backup."""
+    if any(
+        _contains_protected_migration_metadata(payload)
+        for payload in _submitted_metadata(request, fields)
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Company automation metadata cannot set migration or backup fields",
+        )
+
+
+def _retain_protected_migration_metadata(
+    locked_row: Mapping[str, Any], effective_kwargs: dict[str, Any]
+) -> None:
+    """Keep stored migration and backup metadata when ordinary metadata is replaced."""
+    if "metadata" not in effective_kwargs:
+        return
+    incoming = effective_kwargs.get("metadata")
+    if not isinstance(incoming, Mapping):
+        return
+    if _contains_protected_migration_metadata(incoming):
+        raise HTTPException(
+            status_code=400,
+            detail="Company automation metadata cannot set migration or backup fields",
+        )
+    merged = dict(incoming)
+    stored = locked_row.get("metadata")
+    if isinstance(stored, Mapping):
+        for key, value in stored.items():
+            if _migration_metadata_name(key) is not None:
+                merged[key] = value
+    effective_kwargs["metadata"] = merged
 
 
 async def _company_write_allowed(principal: Principal, automation_id: str) -> bool:
@@ -199,10 +294,12 @@ async def update_company_agent(
         return None
     version = _require_company_version(expected_config_version)
     _refuse_company_delivery(request, fields)
+    _refuse_protected_migration_metadata(request, fields)
     writable = {
         key: value
         for key, value in fields.items()
-        if key not in _PROTECTED_WRITE_KEYS and key != "expected_config_version"
+        if key not in _PROTECTED_WRITE_KEYS
+        and key not in {"expected_config_version", "delivery_config_raw"}
     }
     try:
         prepared = await lifecycle.prepare_owned_automation_update(
@@ -230,6 +327,7 @@ async def update_company_agent(
     ) -> None:
         assert_locked_company_agent(locked_row)
         _strip_company_protected_kwargs(effective_kwargs)
+        _retain_protected_migration_metadata(locked_row, effective_kwargs)
         if not prepared.update_kwargs:
             return
         await lifecycle.recheck_locked_automation_update(

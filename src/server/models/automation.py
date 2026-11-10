@@ -612,10 +612,19 @@ class AutomationUpdate(_ScheduleFields):
     @classmethod
     def _retired_agent_mode(cls, value: Any) -> Any:
         value = _refuse_retired_agent_mode(value)
-        # DALTON-HOOK(company-automations): capture delivery before DeliveryConfig strips unknown keys
-        if isinstance(value, dict) and "delivery_config" in value and "delivery_config_raw" not in value:
-            value = dict(value)
+        # DALTON-HOOK(company-automations): derive the raw delivery body from
+        # delivery_config before typed normalization removes unknown keys.
+        if not isinstance(value, dict):
+            return value
+        has_delivery = "delivery_config" in value
+        has_raw = "delivery_config_raw" in value
+        if not has_delivery and not has_raw:
+            return value
+        value = dict(value)
+        if has_delivery:
             value["delivery_config_raw"] = value.get("delivery_config")
+        else:
+            value.pop("delivery_config_raw", None)
         return value
 
     @model_validator(mode="after")

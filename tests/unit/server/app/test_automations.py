@@ -330,6 +330,7 @@ async def test_update_automation(client):
 
 @pytest.mark.asyncio
 async def test_update_automation_not_found(client):
+    # DALTON-HOOK(company-automations): a missing task is absent from both ownership lookups.
     fake_id = str(uuid.uuid4())
     with (
         patch(
@@ -611,6 +612,7 @@ async def test_pause_automation(client):
 
 @pytest.mark.asyncio
 async def test_pause_automation_not_found(client):
+    # DALTON-HOOK(company-automations): a missing task is absent from both ownership lookups.
     fake_id = str(uuid.uuid4())
     with (
         patch(

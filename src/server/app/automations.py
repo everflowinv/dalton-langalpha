@@ -75,6 +75,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["Automations"])
 
 
+# DALTON-HOOK(company-automations): company changes record a human caller and return public task fields.
 def _refuse_company_service_actor(user_id: str) -> None:
     """The company system identity cannot call update, pause, or resume."""
     if is_company_system_user(user_id):
