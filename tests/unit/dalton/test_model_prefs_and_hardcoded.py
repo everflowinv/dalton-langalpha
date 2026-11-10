@@ -29,6 +29,10 @@ _MODEL_LITERAL_RE = re.compile(
 # Every entry here is a provider ID, a family/broker prefix pattern (ending with '-' or '-oauth'),
 # or an OAuth CLI User-Agent string — never a concrete model name.
 HARDCODED_LITERAL_ALLOWLIST: dict[tuple[str, str], str] = {
+    ("llm/notional_pricing.py", "-oauth"): "Nominal pricing model reference normalization",
+    ("llm/notional_pricing.py", "{candidate}-oauth"): "Nominal pricing model reference normalization",
+    ("llm/notional_pricing.py", "{identity}-oauth"): "Nominal pricing model reference normalization",
+    ("llm/notional_pricing.py", "ocb-"): "Nominal pricing model reference normalization",
     # The two Grok keys Dalton pins to its own xai-oauth line
     # (PINNED_OVERLAY_MODEL_KEYS; upstream grew same-named entries on grok-oauth).
     ("llm/overlay.py", "grok-4.7-oauth"): "Pinned overlay route key",
@@ -157,15 +161,13 @@ HARDCODED_LITERAL_ALLOWLIST: dict[tuple[str, str], str] = {
     ("llm/providers/muse/oauth.py", "muse-build/0.1.0"): "Required Meta Muse OAuth User-Agent header",
     ("llm/providers/muse/oauth.py", "muse-code/launcher-1.4.12"): "Required Meta Muse OAuth launcher header",
     # Fallback nominal rate table in budget/service.py when models.json price card is unavailable
-    ("budget/service.py", "claude-opus-5-5-high-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
-    ("budget/service.py", "claude-opus-5-5-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
-    ("budget/service.py", "claude-sonnet-5-5-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
-    ("budget/service.py", "gemini-3.8-flash-low-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
-    ("budget/service.py", "gemini-3.8-flash-medium-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
-    ("budget/service.py", "gemini-4-argon-high-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
-    ("budget/service.py", "gpt-6-astra-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
-    ("budget/service.py", "gpt-6.1-sol-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
-    ("budget/service.py", "muse-spark-1.3-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
+    ("llm/notional_pricing.py", "claude-opus-5-5-high-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
+    ("llm/notional_pricing.py", "claude-opus-5-5-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
+    ("llm/notional_pricing.py", "gemini-3.8-flash-low-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
+    ("llm/notional_pricing.py", "gemini-3.8-flash-medium-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
+    ("llm/notional_pricing.py", "gemini-4-argon-high-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
+    ("llm/notional_pricing.py", "gpt-6-astra-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
+    ("llm/notional_pricing.py", "gpt-6.1-sol-oauth"): "Fallback nominal rate in _notional_price_index when models.json price card is unavailable",
     # Default model field on ChatAntigravity LangChain wrapper
     ("llm/providers/antigravity/client.py", "gemini-4-argon-medium"): "Default model attribute on ChatAntigravity LangChain wrapper",
     ("settings.py", "gemini-4-argon-medium-oauth"): "Default extractor_fallback_model on DaltonConversationsConfig",
@@ -516,6 +518,7 @@ async def test_restore_probe_models_budget_fallback_and_complete_empty_model_gua
     """Verify probe_models config lookup, budget fallback nominal rates, and dalton_complete empty-model guard."""
     from src.dalton.budget import service as budget_mod
     from src.dalton.llm import complete as complete_mod
+    from src.dalton.llm import overlay as overlay_mod
     from src.dalton.services import provider_status as ps_mod
 
     # 1. _pick_probe_model reads from dalton.yaml models.probe_models table
@@ -539,9 +542,9 @@ async def test_restore_probe_models_budget_fallback_and_complete_empty_model_gua
         create_autospec(budget_mod.load_overlay_data, return_value={}),
     )
     monkeypatch.setattr(
-        budget_mod,
+        overlay_mod,
         "load_dalton_meta",
-        create_autospec(budget_mod.load_dalton_meta, return_value={}),
+        create_autospec(overlay_mod.load_dalton_meta, return_value={}),
     )
     rates = budget_mod._notional_price_index()
     assert rates["claude-opus-5-5-oauth"]["input"] == 5.0

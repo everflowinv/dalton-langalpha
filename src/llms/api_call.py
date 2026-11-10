@@ -105,6 +105,11 @@ async def make_api_call(
             return content
 
         # Case 2: Native structured output
+        # DALTON-HOOK(notional-pricing): retain raw usage when native structured output
+        # returns a raw response whose parsed field is None, and record per-attempt
+        # usage dicts (`per_call_usages`) across fallback retries so threshold-priced
+        # models evaluate each request's input length individually.
+        raw_token_info: Dict[str, Any] = {}
         try:
             # Use include_raw=True to get token usage with structured output
             client = llm.with_structured_output(response_schema, include_raw=True)
@@ -115,12 +120,19 @@ async def make_api_call(
             # Extract the parsed response and raw response
             # Check if response_with_raw is not None before checking if it's a dict
             if response_with_raw is not None and isinstance(response_with_raw, dict) and 'raw' in response_with_raw:
+                raw_response = response_with_raw['raw']
+                if raw_response is not None:
+                    token_info = extract_token_usage(raw_response)
+                    if token_info:
+                        raw_token_info = {
+                            k: v
+                            for k, v in token_info.items()
+                            if isinstance(v, (int, float)) and not isinstance(v, bool)
+                        }
                 response = response_with_raw.get('parsed')
                 if response is None:
                     # Parsing failed, fall back to manual parsing
                     raise Exception("Structured output parsing returned None")
-                raw_response = response_with_raw['raw']
-                token_info = extract_token_usage(raw_response)
             else:
                 # Fallback to direct response if include_raw didn't work
                 client = llm.with_structured_output(response_schema)
@@ -136,6 +148,11 @@ async def make_api_call(
 
             last_error = None
             total_token_info = {}
+            per_call_usages: list[Dict[str, Any]] = []
+            if raw_token_info:
+                for key, value in raw_token_info.items():
+                    total_token_info[key] = total_token_info.get(key, 0) + value
+                per_call_usages.append(dict(raw_token_info))
             retry_count = 0
 
             for attempt in range(max_parsing_retries):
@@ -146,10 +163,17 @@ async def make_api_call(
                     content = get_message_content(response)
 
                     # Extract and accumulate token usage
+                    # DALTON-HOOK(notional-pricing): accumulate scalar token counts and
+                    # append each real response's usage to `per_call_usages`.
                     token_info = extract_token_usage(response)
                     if token_info:
+                        call_usage: Dict[str, Any] = {}
                         for key, value in token_info.items():
-                            total_token_info[key] = total_token_info.get(key, 0) + value
+                            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                                total_token_info[key] = total_token_info.get(key, 0) + value
+                                call_usage[key] = value
+                        if call_usage:
+                            per_call_usages.append(call_usage)
 
                     # Flatten content_blocks (reasoning + text) to text.
                     if isinstance(content, list):
@@ -181,7 +205,10 @@ async def make_api_call(
                             parsed = response_schema(**data)
 
                             # Add retry metadata to token info
+                            # DALTON-HOOK(notional-pricing): attach per_call_usages for per-attempt threshold pricing.
                             total_token_info['retry_attempts'] = retry_count
+                            if per_call_usages:
+                                total_token_info['per_call_usages'] = per_call_usages
 
                             if return_token_usage:
                                 return parsed, total_token_info
@@ -203,7 +230,10 @@ async def make_api_call(
                         continue
 
             # All retries failed, raise the last error with context
+            # DALTON-HOOK(notional-pricing): retain per_call_usages on exhausted parsing retries.
             total_token_info['retry_attempts'] = retry_count
+            if per_call_usages:
+                total_token_info['per_call_usages'] = per_call_usages
             total_token_info['parsing_failed'] = True
 
             error_msg = f"Failed to parse response after {retry_count} attempts. Last error: {last_error}"

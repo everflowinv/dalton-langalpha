@@ -359,6 +359,11 @@ ALLOWED_HOOKS=(
   # AU1 Batch 1: company system identity external auth refusal, automation scope
   # classification/backfill, scoped read-only listing, and modification history.
   "company-automations"
+  # Nominal subscription token pricing: per-call notional_cost and notional_rates
+  # in tracking/core.py and per-attempt per_call_usages in llms/api_call.py so
+  # threshold-priced subscription models (e.g. Muse Ember 1.0) evaluate per
+  # request while keeping cash and platform cost at zero.
+  "notional-pricing"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
