@@ -1,5 +1,5 @@
 // DALTON-HOOK(company-automations): paged agent and script reads. No poll and no prefetch.
-import { useQuery, type QueryObserverResult, type RefetchOptions } from '@tanstack/react-query';
+import { useQuery, useQueryClient, type QueryObserverResult, type RefetchOptions } from '@tanstack/react-query';
 import { apiErrorStatus } from '@/api/errors';
 import { useAuth } from '@/contexts/AuthContext';
 import { queryKeys } from '@/lib/queryKeys';
@@ -20,7 +20,7 @@ import {
 } from '../utils/api';
 
 /** What `refetch` resolves to. A 403 sets `data` to undefined and `isSuccess` to
- *  false. The query cache may still hold the previous page; this object does not. */
+ *  false. That page is removed from this query, so a later failure cannot return it. */
 export interface AutomationReadFetchResult<T> {
   data: T | undefined;
   error: Error | null;
@@ -68,8 +68,8 @@ function isForbidden(error: unknown): boolean {
 }
 
 /** The observer keeps the last page when a refetch fails. Copy a 403 result
- *  and drop that page. Other statuses keep the observer result, including a
- *  404 or 503 that still carries the last successful page and is not success. */
+ *  and drop that page. A 404 or 503 that never followed a 403 still carries
+ *  its last successful page and is not success. */
 function presentRefetch<T>(result: QueryObserverResult<T, Error>): AutomationReadFetchResult<T> {
   if (!isForbidden(result.error)) return result;
   return { ...result, data: undefined, isSuccess: false };
@@ -77,15 +77,33 @@ function presentRefetch<T>(result: QueryObserverResult<T, Error>): AutomationRea
 
 /**
  * A new scope, id, user, or page is a different key, so the previous page is
- * not kept. A 403 drops data the cache still holds: the rendered page and the
- * object `refetch` resolves to both omit it.
+ * not kept. A 403 drops this query's cached page before the error is recorded,
+ * so a later 503 cannot hand that page back. The rendered page and `refetch`
+ * both omit it. A later success stores a new page.
  */
 function useAutomationReadQuery<T>(
   queryKey: readonly unknown[],
-  queryFn: () => Promise<T>,
+  read: () => Promise<T>,
   enabled: boolean,
 ): AutomationReadState<T> {
-  const query = useQuery({ queryKey, queryFn, enabled });
+  const queryClient = useQueryClient();
+  const query = useQuery({
+    queryKey,
+    enabled,
+    queryFn: async () => {
+      try {
+        return await read();
+      } catch (error) {
+        if (isForbidden(error)) {
+          queryClient.getQueryCache().find({ queryKey, exact: true })?.setState({
+            data: undefined,
+            dataUpdatedAt: 0,
+          });
+        }
+        throw error;
+      }
+    },
+  });
   const forbidden = isForbidden(query.error);
   return {
     data: forbidden ? undefined : query.data,

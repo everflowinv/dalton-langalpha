@@ -623,8 +623,8 @@ describe('useAutomationReads requests', () => {
     expect(refused.isError).toBe(true);
     expect(refused.isSuccess).toBe(false);
     expect(refused.status).toBe('error');
-    expect(refused.isRefetchError).toBe(true);
-    expect(refused.isLoadingError).toBe(false);
+    expect(refused.isRefetchError).toBe(false);
+    expect(refused.isLoadingError).toBe(true);
     expect(apiErrorStatus(refused.error)).toBe(403);
     expect(refused.data).not.toEqual(cached);
     await waitFor(() => {
@@ -780,5 +780,241 @@ describe('useAutomationReads requests', () => {
         view.unmount();
       }
     }
+  });
+
+  it('does not restore a forbidden list when the next refetch fails', async () => {
+    const cached: AutomationReadList = {
+      automations: [{ engine_kind: 'script', automation_id: SCRIPT_ID, name: 'Daily prices' } as AutomationRead],
+      total: 4,
+    };
+    const fresh = listPage(1);
+    const client = retainingClient();
+    let calls = 0;
+    vi.mocked(api.listAutomationReads).mockImplementation(async () => {
+      calls += 1;
+      if (calls === 1) return ok(cached);
+      if (calls === 2) throw httpError(403);
+      if (calls === 3) throw httpError(503);
+      if (calls === 4) return ok(fresh);
+      throw new Error(`unexpected list read ${calls}`);
+    });
+    const view = renderRead(
+      (props: { scope: 'company' }) => useAutomationReadList(props),
+      { scope: 'company' },
+      client,
+    );
+    await waitFor(() => expect(view.result.current.data).toEqual(cached));
+    const forbidden = await readRefetch(view.result.current.refetch);
+    expect(forbidden.data).toBeUndefined();
+    expect(forbidden.isSuccess).toBe(false);
+    expect(apiErrorStatus(forbidden.error)).toBe(403);
+    await waitFor(() => {
+      expect(view.result.current.data).toBeUndefined();
+      expect(view.result.current.isError).toBe(true);
+      expect(apiErrorStatus(view.result.current.error)).toBe(403);
+    });
+    expect(client.getQueryData(listKey('company'))).toBeUndefined();
+    const failed = await readRefetch(view.result.current.refetch);
+    expect(failed.data).toBeUndefined();
+    expect(failed.isSuccess).toBe(false);
+    expect(failed.isError).toBe(true);
+    expect(apiErrorStatus(failed.error)).toBe(503);
+    await waitFor(() => {
+      expect(view.result.current.data).toBeUndefined();
+      expect(view.result.current.isSuccess).toBe(false);
+      expect(apiErrorStatus(view.result.current.error)).toBe(503);
+    });
+    expect(view.result.current.data).not.toEqual(cached);
+    expect(calls).toBe(3);
+    const restored = await readRefetch(view.result.current.refetch);
+    expect(restored.data).toEqual(fresh);
+    expect(restored.isSuccess).toBe(true);
+    expect(restored.error).toBeNull();
+    await waitFor(() => {
+      expect(view.result.current.data).toEqual(fresh);
+      expect(view.result.current.isSuccess).toBe(true);
+      expect(view.result.current.isError).toBe(false);
+    });
+    expect(calls).toBe(4);
+  });
+
+  it('does not show a forbidden page after remount', async () => {
+    const cached = listPage(4);
+    const client = retainingClient();
+    let calls = 0;
+    const remount = deferred();
+    vi.mocked(api.listAutomationReads).mockImplementation(async () => {
+      calls += 1;
+      if (calls === 1) return ok(cached);
+      if (calls === 2) throw httpError(403);
+      if (calls === 3) {
+        await remount.promise;
+        throw httpError(503);
+      }
+      throw new Error(`unexpected list read ${calls}`);
+    });
+    const props = { scope: 'company' as const };
+    const first = renderRead(
+      (next: { scope: 'company' }) => useAutomationReadList(next),
+      props,
+      client,
+    );
+    await waitFor(() => expect(first.result.current.data).toEqual(cached));
+    const forbidden = await readRefetch(first.result.current.refetch);
+    expect(forbidden.data).toBeUndefined();
+    await waitFor(() => expect(first.result.current.data).toBeUndefined());
+    expect(calls).toBe(2);
+    first.unmount();
+
+    const second = renderRead(
+      (next: { scope: 'company' }) => useAutomationReadList(next),
+      props,
+      client,
+    );
+    await waitFor(() => expect(calls).toBe(3));
+    expect(second.result.current.data).toBeUndefined();
+    expect(second.result.current.isSuccess).toBe(false);
+    expect(second.result.current.data).not.toEqual(cached);
+    remount.resolve();
+    await waitFor(() => expect(apiErrorStatus(second.result.current.error)).toBe(503));
+    expect(second.result.current.data).toBeUndefined();
+    expect(second.result.current.isSuccess).toBe(false);
+    expect(second.result.current.isError).toBe(true);
+    expect(calls).toBe(3);
+    expect(client.getQueryData(listKey('company'))).toBeUndefined();
+  });
+
+  it('does not clear a different query when one read is forbidden', async () => {
+    const company = listPage(4);
+    const personal = listPage(2);
+    const client = retainingClient();
+    const calls = { company: 0, personal: 0 };
+    vi.mocked(api.listAutomationReads).mockImplementation(async (params = {}) => {
+      if (params.scope === 'personal') {
+        calls.personal += 1;
+        return ok(personal);
+      }
+      calls.company += 1;
+      if (calls.company === 1) return ok(company);
+      if (calls.company === 2) throw httpError(403);
+      if (calls.company === 3) throw httpError(503);
+      throw new Error(`unexpected company read ${calls.company}`);
+    });
+    const companyView = renderRead(
+      (props: { scope: AutomationScope }) => useAutomationReadList(props),
+      { scope: 'company' },
+      client,
+    );
+    const personalView = renderRead(
+      (props: { scope: AutomationScope }) => useAutomationReadList(props),
+      { scope: 'personal' },
+      client,
+    );
+    await waitFor(() => expect(companyView.result.current.data).toEqual(company));
+    await waitFor(() => expect(personalView.result.current.data).toEqual(personal));
+    const forbidden = await readRefetch(companyView.result.current.refetch);
+    expect(forbidden.data).toBeUndefined();
+    expect(apiErrorStatus(forbidden.error)).toBe(403);
+    await waitFor(() => expect(companyView.result.current.data).toBeUndefined());
+    expect(personalView.result.current.data).toEqual(personal);
+    expect(client.getQueryData(listKey('personal'))).toEqual(personal);
+    expect(client.getQueryData(listKey('company'))).toBeUndefined();
+    const failed = await readRefetch(companyView.result.current.refetch);
+    expect(failed.data).toBeUndefined();
+    expect(apiErrorStatus(failed.error)).toBe(503);
+    await waitFor(() => expect(apiErrorStatus(companyView.result.current.error)).toBe(503));
+    expect(companyView.result.current.data).toBeUndefined();
+    expect(companyView.result.current.isSuccess).toBe(false);
+    expect(personalView.result.current.data).toEqual(personal);
+    expect(personalView.result.current.isSuccess).toBe(true);
+    expect(calls).toEqual({ company: 3, personal: 1 });
+  });
+
+  it('discards a forbidden page for detail, feed, runs, and history when a later refetch fails', async () => {
+    const task = { engine_kind: 'script', automation_id: SCRIPT_ID, name: 'Daily prices' } as AutomationRead;
+    const feed: AutomationRunReadList = {
+      executions: [{ engine_kind: 'script', automation_id: SCRIPT_ID, status: 'succeeded' } as AutomationRunRead],
+      has_more: true,
+    };
+    const runs: AutomationRunReadList = {
+      executions: [{ engine_kind: 'script', automation_id: SCRIPT_ID, status: 'succeeded' } as AutomationRunRead],
+      has_more: false,
+    };
+    const history: AutomationHistory = {
+      automation_id: SCRIPT_ID,
+      scope: 'company',
+      engine_kind: 'script',
+      config_version: 4,
+      active_version: 3,
+      entries: [],
+      total: 3,
+      limit: 50,
+      offset: 0,
+    };
+    const script = async <T,>(pages: (T | Error)[]) => {
+      let calls = 0;
+      return async () => {
+        calls += 1;
+        const page = pages[calls - 1];
+        if (calls > 3) throw new Error(`unexpected read ${calls}`);
+        if (page instanceof Error) throw page;
+        return ok(page as T);
+      };
+    };
+    vi.mocked(api.getAutomationRead).mockImplementation(await script<AutomationRead>([task, httpError(403), httpError(503)]));
+    vi.mocked(api.listAutomationRunReads).mockImplementation(await script<AutomationRunReadList>([feed, httpError(403), httpError(503)]));
+    vi.mocked(api.listAutomationExecutionReads).mockImplementation(await script<AutomationRunReadList>([runs, httpError(403), httpError(503)]));
+    vi.mocked(api.listAutomationHistory).mockImplementation(await script<AutomationHistory>([history, httpError(403), httpError(503)]));
+
+    const detail = renderRead(
+      (props: { id: string }) => useAutomationRead(props.id),
+      { id: SCRIPT_ID },
+      retainingClient(),
+    );
+    const feedView = renderRead(
+      (props: { scope: 'company' }) => useAutomationRunReads(props),
+      { scope: 'company' },
+      retainingClient(),
+    );
+    const runsView = renderRead(
+      (props: { id: string }) => useAutomationExecutionReads(props.id),
+      { id: SCRIPT_ID },
+      retainingClient(),
+    );
+    const historyView = renderRead(
+      (props: { id: string }) => useAutomationHistory(props.id),
+      { id: SCRIPT_ID },
+      retainingClient(),
+    );
+    await waitFor(() => expect(detail.result.current.data).toEqual(task));
+    await waitFor(() => expect(feedView.result.current.data).toEqual(feed));
+    await waitFor(() => expect(runsView.result.current.data).toEqual(runs));
+    await waitFor(() => expect(historyView.result.current.data).toEqual(history));
+
+    for (const view of [detail, feedView, runsView, historyView]) {
+      const forbidden = await readRefetch<AutomationRead | AutomationRunReadList | AutomationHistory>(view.result.current.refetch);
+      expect(forbidden.data).toBeUndefined();
+      expect(forbidden.isSuccess).toBe(false);
+      expect(apiErrorStatus(forbidden.error)).toBe(403);
+      await waitFor(() => expect(view.result.current.data).toBeUndefined());
+      const failed = await readRefetch<AutomationRead | AutomationRunReadList | AutomationHistory>(view.result.current.refetch);
+      expect(failed.data).toBeUndefined();
+      expect(failed.isSuccess).toBe(false);
+      expect(apiErrorStatus(failed.error)).toBe(503);
+      await waitFor(() => {
+        expect(view.result.current.data).toBeUndefined();
+        expect(view.result.current.isSuccess).toBe(false);
+        expect(view.result.current.isError).toBe(true);
+        expect(apiErrorStatus(view.result.current.error)).toBe(503);
+      });
+    }
+    expect(vi.mocked(api.getAutomationRead)).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(api.listAutomationRunReads)).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(api.listAutomationExecutionReads)).toHaveBeenCalledTimes(3);
+    expect(vi.mocked(api.listAutomationHistory)).toHaveBeenCalledTimes(3);
+    expect(detail.result.current.data).not.toEqual(task);
+    expect(feedView.result.current.data).not.toEqual(feed);
+    expect(runsView.result.current.data).not.toEqual(runs);
+    expect(historyView.result.current.data).not.toEqual(history);
   });
 });
