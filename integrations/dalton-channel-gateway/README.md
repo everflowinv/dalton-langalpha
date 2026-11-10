@@ -16,6 +16,40 @@ pnpm test        # 运行 Vitest 单元测试
 
 ---
 
+## 网关服务启动、Vault 凭据引导与数据任务群组报告推送
+
+### 1. 启动模式与无明文飞书凭据机制
+
+网关监听本地回环地址 `127.0.0.1:8962`（拒绝任何非 `127.0.0.1` 绑定），支持两种运行模式：
+
+- `DALTON_GATEWAY_MODE=outgoing`（或 CLI 参数 `--outgoing-only` / `--mode=outgoing`）：专用于出站通知与数据任务报告投递，不启动飞书 WebSocket 长连接、不加载微信状态、不执行入站会话恢复。
+- `DALTON_GATEWAY_MODE=incoming`（默认）：同时启动入站消息监听、恢复扫描与出站投递。
+
+生产环境下飞书专用应用凭据（`DALTON_FEISHU_APP_ID`、`DALTON_FEISHU_APP_SECRET`）不在 LaunchAgent plist、环境变量文件、仓库配置或命令行参数中落盘明文：
+
+1. **后端受控内部接口**：`POST /api/v1/dalton/channels/internal/data-task-notifications/feishu-credentials` 要求 `X-Service-Token` 鉴权，拒绝任何调用方传入的查询参数、`X-User-Id` 请求头或额外 JSON 字段，仅按服务端配置的唯一主管理员账号（`DALTON_PM_USER_IDS[0]`）从 Dalton Vault（`user_vault_secrets`）解密读取固定的两项键名，并设置 `Cache-Control: no-store`。
+2. **启动期内存加载（Fail-Closed）**：当 `DALTON_FEISHU_CREDENTIAL_SOURCE=vault` 时，`prepareGatewayRuntime()` 在构造适配器与监听端口（输出就绪日志）**之前**以有界超时、`redirect: "error"` 与 `cache: "no-store"` 拉取并校验这两项非空凭据，仅存于当前进程内存中的 `FeishuChannelAdapter` 实例。若 Vault 不可达、鉴权失败、重定向、JSON 异常或任一凭据缺失，启动立即失败退出，绝不静默回退到环境变量或 OpenClaw 凭据，且日志与错误消息至多包含凭据键名，绝不输出凭据值或原始响应体。
+3. **服务鉴权令牌文件**：LaunchAgent 模板（`scripts/dalton/launchd/com.dalton.channel-gateway.plist.template`）通过 `DALTON_CHANNEL_GATEWAY_ENV_FILE` 指向权限严格为 `0600` 的普通文件 `~/.config/dalton/channel-gateway.env`（拒绝符号链接或组/其他用户可读权限）提供 `INTERNAL_SERVICE_TOKEN`；在 `vault` 模式下，该文件若出现明文飞书凭据键将被直接拒绝。
+
+### 2. 飞书专用凭据安全刷新与重启流程
+
+网关运行期间不会在投递中途热替换内存凭据，以保证正在进行的卡片或图表上传原子一致。更新飞书凭据的标准步骤：
+
+1. 主管理员在 Dalton Web 设置的 Vault 中更新 `DALTON_FEISHU_APP_ID` 与/或 `DALTON_FEISHU_APP_SECRET`。
+2. 由运维/主助手在确认无在途关键投递窗口后执行受控重启（例如 `launchctl kickstart -k gui/$(id -u)/com.dalton.channel-gateway`）。
+3. 新进程在对外就绪（`server.listen`）前重新向后端 Vault 接口加载最新凭据；若新凭据不完整或后端校验未通过，新进程拒绝就绪并不会生成半可用适配器。
+
+### 3. 管理员数据任务群组报告投递授权
+
+- **私聊（`dm`）**：继续严格要求属主在 `dalton_channel_identities` 中绑定 Dalton 专用平台个人身份，并保留跨用户与跨应用 `open_id` 拦截。
+- **群组（`group`）**：主管理员无需绑定个人聊天账号或事先在群内触发入站消息即可向已授权群组投递生产数据任务报告，但必须同时满足：
+  1. 生产运行已成功（拒绝 `preview_only` 试跑）、任务启用且通知开关开启；
+  2. 当前通知路由（`evaluate_user_notify_eligibility`）显式包含该群组目标；
+  3. 群组已在 Dalton 渠道设置（`dalton_channel_user_settings` 与 `dalton_channel_chat_bindings`）中显式登记，且属主具备绑定工作区写权限（绝不以“机器人在群列表中可见”替代 Dalton 渠道授权）；
+  4. 网关发送首条消息前通过适配器实时核验机器人群组可达性（飞书调用完整分页的 `im.chat.list` 与 `im.chat.get`，若分页未完成返回 `unavailable`，若机器人不在目标群返回 `not_allowed`，均在写入发送台账或调用发送接口前中止）。
+
+---
+
 ## 平台原生命令菜单注册（`dalton-native-commands`）
 
 > **部署顺序说明**：当前仅提供共享固定命令清单、飞书/Discord 平台菜单注册库与独立 CLI。原生命令入站事件解析与会话接入尚未合并部署，真实应用的菜单注册尚未执行；须待入站原生命令处理器合并并部署就绪后，再由主助手在目标环境执行菜单预览与 `--apply` 注册，并进行真实平台联调验证。
