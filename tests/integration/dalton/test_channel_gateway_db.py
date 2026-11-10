@@ -2,8 +2,8 @@
 
 Reads the test database connection string from ``DALTON_CHANNEL_GATEWAY_TEST_DSN``
 (or ``DALTON_TEST_DB_DSN`` / ``TEST_DATABASE_URL``); skips cleanly when unset.
-A session-scoped fixture upgrades the test database to upstream head and Dalton ``d031``
-when the Dalton revision is missing or older. A later revision such as ``d036`` is left
+A session-scoped fixture upgrades the test database to upstream head and at least Dalton ``d036``
+when the Dalton revision is missing or older. A later revision is left
 in place. It never drops the ``public`` schema. Each test uses
 a unique prefix and cleans up its own rows on teardown.
 """
@@ -119,12 +119,12 @@ def _revision_is_target_or_descendant(
     return False
 
 
-async def _ensure_alembic_upgraded_to_head(dsn: str) -> None:
-    """Upgrade upstream to head and Dalton to d031 or leave a later Dalton revision in place.
+async def _ensure_alembic_upgraded_to_d036(dsn: str) -> None:
+    """Upgrade upstream to head and Dalton to at least d036.
 
-    The Dalton version table is ``alembic_version_dalton``. d035 and d036 are
-    descendants of d031, so this fixture must not call ``upgrade("d031")``
-    after either of them has been applied.
+    Current I-6 reads ``delivery_attempt``, which d031 and d035 do not have.
+    A descendant of d036 is left in place. This does not downgrade. The Dalton
+    version table is ``alembic_version_dalton``.
     """
     project_root = Path(__file__).resolve().parents[3]
     sa_url = dsn.replace("postgresql://", "postgresql+psycopg://", 1).replace("%", "%%")
@@ -140,7 +140,7 @@ async def _ensure_alembic_upgraded_to_head(dsn: str) -> None:
     )
     dalton_cfg.set_main_option("sqlalchemy.url", sa_url)
     dalton_script = ScriptDirectory.from_config(dalton_cfg)
-    dalton_target = "d031"
+    dalton_target = "d036"
 
     current_upstream: str | None = None
     dalton_versions: list[str] = []
@@ -182,11 +182,11 @@ async def _ensure_alembic_upgraded_to_head(dsn: str) -> None:
 
 @pytest_asyncio.fixture(scope="session")
 async def channel_gateway_db_pool():
-    """Ensure upstream + Dalton (`d031`) migrations are applied and yield a connection pool."""
+    """Ensure upstream + Dalton (at least `d036`) migrations are applied and yield a connection pool."""
     dsn = _get_test_dsn()
     os.environ.setdefault("BYOK_ENCRYPTION_KEY", "test-channel-gateway-encryption-key-32b")
 
-    await _ensure_alembic_upgraded_to_head(dsn)
+    await _ensure_alembic_upgraded_to_d036(dsn)
 
     pool = AsyncConnectionPool(
         conninfo=dsn,
@@ -4709,7 +4709,7 @@ async def _serve_cli_harness_main() -> None:
     os.environ.setdefault(
         "BYOK_ENCRYPTION_KEY", "test-channel-gateway-encryption-key-32b"
     )
-    await _ensure_alembic_upgraded_to_head(dsn)
+    await _ensure_alembic_upgraded_to_d036(dsn)
 
     pool = AsyncConnectionPool(
         conninfo=dsn,

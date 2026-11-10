@@ -2,7 +2,11 @@
 
 The columns are applied by the Dalton Alembic chain. Claim, progress, and startup
 recovery call the real channel-gateway functions. This file does not ALTER a
-stamped schema by hand.
+stamped schema by hand. A Discord ``data_task`` row is inserted with the real
+columns and updated through I-7, including the HTTP route. This branch has no
+data_task claim handler. Startup recovery between the dispatch acknowledgment
+and the final result is also covered here. That test calls the real recovery
+function, which rewrites every ``in_flight`` delivery on the database.
 
 ``--serve-http-harness`` upgrades to at least d036 and serves the Discord HTTP
 app used by the gateway vitest. Startup recovery rewrites every ``in_flight``
@@ -22,7 +26,8 @@ from typing import Any
 from unittest.mock import create_autospec
 from uuid import uuid4
 
-from fastapi import HTTPException
+import httpx
+from fastapi import FastAPI, HTTPException
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 import pytest
@@ -30,14 +35,16 @@ import pytest_asyncio
 
 from src.dalton import invites as dalton_invites
 from src.dalton import sharing as dalton_sharing
+from src.dalton.app.channels_router import channels_router
 from src.dalton.database import channel_gateway as cg_db
 from src.server.database import pool as db_pool
 from src.server.database import user as user_db
 from src.server.database import workspace as workspace_db
 from tests.integration.dalton.test_discord_gateway_db import (
     _cleanup_test_rows,
-    _ensure_alembic_upgraded_to_d031,
+    _ensure_alembic_upgraded_to_d036,
     _get_test_dsn,
+    _run_ephemeral_fastapi_server,
     _seed_real_http_discord_fixture,
     serve_discord_http_harness,
 )
@@ -72,7 +79,7 @@ async def thread_persistence_pool():
     os.environ.setdefault(
         "BYOK_ENCRYPTION_KEY", "test-channel-gateway-encryption-key-32b"
     )
-    await _ensure_alembic_upgraded_to_d031(dsn, minimum="d036")
+    await _ensure_alembic_upgraded_to_d036(dsn, minimum="d036")
     pool = AsyncConnectionPool(
         conninfo=dsn,
         min_size=2,
@@ -265,6 +272,7 @@ async def _delivery_row(pool: AsyncConnectionPool, delivery_key: str) -> dict[st
             await cur.execute(
                 """
                 SELECT status,
+                       kind,
                        platform,
                        target_address,
                        confirmed_thread_address,
@@ -282,6 +290,63 @@ async def _delivery_row(pool: AsyncConnectionPool, delivery_key: str) -> dict[st
             row = await cur.fetchone()
             assert row is not None, delivery_key
             return dict(row)
+
+
+async def _insert_unknown_discord_delivery(
+    pool: AsyncConnectionPool,
+    *,
+    delivery_key: str,
+    user_id: str,
+    kind: str,
+    target_address: str,
+    delivery_attempt: int = 1,
+) -> None:
+    """Store one Discord delivery directly. This branch has no data_task claim path."""
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO dalton_channel_deliveries (
+                    delivery_key, kind, user_id, platform, target_address,
+                    status, delivery_attempt, error_code, error_message,
+                    is_current, has_non_empty_text, total_chunks, sent_chunks
+                )
+                VALUES (
+                    %s, %s, %s, 'discord', %s,
+                    'unknown', %s, 'gateway_restarted',
+                    'startup left this delivery unknown',
+                    FALSE, TRUE, 1, 0
+                )
+                """,
+                (delivery_key, kind, user_id, target_address, delivery_attempt),
+            )
+
+
+async def _arm_discord_dispatch(
+    user_id: str, delivery_key: str, parent: str, confirmed: str
+) -> int:
+    """Claim one Discord send, store its thread, and record dispatching.
+
+    This does not call Discord. The body phase is dispatching before any final
+    status, which is the window startup recovery can mark unknown.
+    """
+    claimed = await _claim(user_id, delivery_key, parent)
+    assert claimed["claim_status"] == "claimed"
+    attempt = int(claimed["delivery_attempt"])
+    stored = await cg_db.update_delivery_progress(
+        delivery_key=delivery_key,
+        delivery_attempt=attempt,
+        confirmed_thread_address=confirmed,
+    )
+    assert stored["discord_body_phase"] == "before_body"
+    marked = await cg_db.update_delivery_progress(
+        delivery_key=delivery_key,
+        delivery_attempt=attempt,
+        discord_body_phase="dispatching",
+    )
+    assert marked["discord_body_phase"] == "dispatching"
+    assert marked["delivery_attempt"] == attempt
+    return attempt
 
 
 async def _claim(user_id: str, delivery_key: str, target: str) -> dict[str, Any]:
@@ -860,6 +925,681 @@ async def test_feishu_unknown_can_still_be_completed(
     assert row["first_response_json"]["status"] == "sent"
     assert row["confirmed_thread_address"] is None
     assert row["discord_body_phase"] is None
+
+
+_UNKNOWN_FROZEN = "Discord delivery status unknown cannot be changed"
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_discord_data_task_unknown_can_be_completed(
+    seeded_env: dict[str, Any],
+) -> None:
+    """A stored Discord data_task can leave unknown. An agent_send row cannot."""
+    pool: AsyncConnectionPool = seeded_env["pool"]
+    user_a = seeded_env["user_a"]
+    prefix = seeded_env["prefix"]
+    target = seeded_env["bootstrap"]["parent_addr"]
+    await _assert_d036_column(pool)
+
+    omitted_key = f"{prefix}_data_task_omit"
+    token_key = f"{prefix}_data_task_token"
+    sent_key = f"{prefix}_agent_unknown_sent"
+    failed_key = f"{prefix}_agent_unknown_failed"
+    await _insert_unknown_discord_delivery(
+        pool,
+        delivery_key=omitted_key,
+        user_id=user_a,
+        kind="data_task",
+        target_address=target,
+    )
+    await _insert_unknown_discord_delivery(
+        pool,
+        delivery_key=token_key,
+        user_id=user_a,
+        kind="data_task",
+        target_address=target,
+    )
+    await _insert_unknown_discord_delivery(
+        pool,
+        delivery_key=sent_key,
+        user_id=user_a,
+        kind="agent_send",
+        target_address=target,
+    )
+    await _insert_unknown_discord_delivery(
+        pool,
+        delivery_key=failed_key,
+        user_id=user_a,
+        kind="agent_send",
+        target_address=target,
+    )
+
+    omitted = await cg_db.update_delivery_progress(
+        delivery_key=omitted_key,
+        status="sent",
+        platform_message_ids=["dt-omit"],
+        first_response_json={"status": "sent"},
+    )
+    assert omitted["ok"] is True
+    assert omitted["status"] == "sent"
+    assert omitted["delivery_attempt"] == 1
+    omitted_row = await _delivery_row(pool, omitted_key)
+    assert omitted_row["kind"] == "data_task"
+    assert omitted_row["platform"] == "discord"
+    assert omitted_row["status"] == "sent"
+    assert omitted_row["delivery_attempt"] == 1
+    assert omitted_row["platform_message_ids"] == ["dt-omit"]
+    assert omitted_row["first_response_json"]["status"] == "sent"
+
+    matched = await cg_db.update_delivery_progress(
+        delivery_key=token_key,
+        delivery_attempt=1,
+        status="sent",
+        platform_message_ids=["dt-token"],
+        first_response_json={"status": "sent"},
+    )
+    assert matched["ok"] is True
+    assert matched["status"] == "sent"
+    assert matched["delivery_attempt"] == 1
+    token_row = await _delivery_row(pool, token_key)
+    assert token_row["kind"] == "data_task"
+    assert token_row["status"] == "sent"
+    assert token_row["delivery_attempt"] == 1
+    assert token_row["platform_message_ids"] == ["dt-token"]
+
+    with pytest.raises(HTTPException) as stale_data_task:
+        await cg_db.update_delivery_progress(
+            delivery_key=token_key,
+            delivery_attempt=0,
+            status="unknown",
+            platform_message_ids=[],
+            first_response_json={"status": "unknown"},
+        )
+    assert stale_data_task.value.status_code == 409
+    assert stale_data_task.value.detail["code"] == "conflict"
+    assert (
+        stale_data_task.value.detail["message"]
+        == "delivery_attempt is no longer the current attempt"
+    )
+    assert (await _delivery_row(pool, token_key))["status"] == "sent"
+    assert (await _delivery_row(pool, token_key))["platform_message_ids"] == ["dt-token"]
+
+    with pytest.raises(HTTPException) as sent_rejected:
+        await cg_db.update_delivery_progress(
+            delivery_key=sent_key,
+            delivery_attempt=1,
+            status="sent",
+            platform_message_ids=["should-not-send"],
+            first_response_json={"status": "sent"},
+        )
+    assert sent_rejected.value.status_code == 409
+    assert sent_rejected.value.detail["code"] == "conflict"
+    assert sent_rejected.value.detail["message"] == _UNKNOWN_FROZEN
+    sent_row = await _delivery_row(pool, sent_key)
+    assert sent_row["kind"] == "agent_send"
+    assert sent_row["status"] == "unknown"
+    assert sent_row["delivery_attempt"] == 1
+    assert sent_row["platform_message_ids"] == []
+    assert sent_row["first_response_json"] is None
+    assert sent_row["error_code"] == "gateway_restarted"
+    assert sent_row["discord_body_phase"] is None
+
+    with pytest.raises(HTTPException) as failed_rejected:
+        await cg_db.update_delivery_progress(
+            delivery_key=failed_key,
+            delivery_attempt=1,
+            status="failed",
+            error_code="not_allowed",
+            error_message="stale worker",
+            platform_message_ids=["should-not-fail"],
+            first_response_json={"status": "failed"},
+        )
+    assert failed_rejected.value.status_code == 409
+    assert failed_rejected.value.detail["code"] == "conflict"
+    assert failed_rejected.value.detail["message"] == _UNKNOWN_FROZEN
+    failed_row = await _delivery_row(pool, failed_key)
+    assert failed_row["kind"] == "agent_send"
+    assert failed_row["status"] == "unknown"
+    assert failed_row["delivery_attempt"] == 1
+    assert failed_row["platform_message_ids"] == []
+    assert failed_row["first_response_json"] is None
+    assert failed_row["error_code"] == "gateway_restarted"
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_discord_data_task_unknown_progress_over_http(
+    seeded_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same I-7 rules over the real progress route. No Discord API call."""
+    pool: AsyncConnectionPool = seeded_env["pool"]
+    user_a = seeded_env["user_a"]
+    prefix = seeded_env["prefix"]
+    target = seeded_env["bootstrap"]["parent_addr"]
+    token = "0123456789abcdef0123456789abcdef_data_task_http"
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", token)
+    await _assert_d036_column(pool)
+
+    omitted_key = f"{prefix}_http_data_task_omit"
+    token_key = f"{prefix}_http_data_task_token"
+    sent_key = f"{prefix}_http_agent_unknown_sent"
+    failed_key = f"{prefix}_http_agent_unknown_failed"
+    for key, kind in (
+        (omitted_key, "data_task"),
+        (token_key, "data_task"),
+        (sent_key, "agent_send"),
+        (failed_key, "agent_send"),
+    ):
+        await _insert_unknown_discord_delivery(
+            pool,
+            delivery_key=key,
+            user_id=user_a,
+            kind=kind,
+            target_address=target,
+        )
+
+    app = FastAPI()
+    app.include_router(channels_router, prefix="/api/v1/dalton")
+
+    async with _run_ephemeral_fastapi_server(app) as base_url:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+
+            async def post(body: dict[str, Any]) -> httpx.Response:
+                return await client.post(
+                    f"{base_url}/api/v1/dalton/channels/internal/deliveries/progress",
+                    headers={"X-Service-Token": token},
+                    json=body,
+                )
+
+            omitted = await post(
+                {
+                    "delivery_key": omitted_key,
+                    "status": "sent",
+                    "platform_message_ids": ["dt-http-omit"],
+                    "first_response_json": {"status": "sent"},
+                }
+            )
+            assert omitted.status_code == 200
+            omitted_body = omitted.json()
+            assert omitted_body["ok"] is True
+            assert omitted_body["status"] == "sent"
+            assert omitted_body["delivery_attempt"] == 1
+
+            matched = await post(
+                {
+                    "delivery_key": token_key,
+                    "delivery_attempt": 1,
+                    "status": "sent",
+                    "platform_message_ids": ["dt-http-token"],
+                    "first_response_json": {"status": "sent"},
+                }
+            )
+            assert matched.status_code == 200
+            assert matched.json()["status"] == "sent"
+            assert matched.json()["delivery_attempt"] == 1
+
+            sent_rejected = await post(
+                {
+                    "delivery_key": sent_key,
+                    "delivery_attempt": 1,
+                    "status": "sent",
+                    "platform_message_ids": ["should-not-send"],
+                    "first_response_json": {"status": "sent"},
+                }
+            )
+            assert sent_rejected.status_code == 409
+            assert sent_rejected.json()["detail"]["code"] == "conflict"
+            assert sent_rejected.json()["detail"]["message"] == _UNKNOWN_FROZEN
+
+            failed_rejected = await post(
+                {
+                    "delivery_key": failed_key,
+                    "delivery_attempt": 1,
+                    "status": "failed",
+                    "error_code": "not_allowed",
+                    "error_message": "stale worker",
+                    "platform_message_ids": ["should-not-fail"],
+                    "first_response_json": {"status": "failed"},
+                }
+            )
+            assert failed_rejected.status_code == 409
+            assert failed_rejected.json()["detail"]["code"] == "conflict"
+            assert failed_rejected.json()["detail"]["message"] == _UNKNOWN_FROZEN
+
+    omitted_row = await _delivery_row(pool, omitted_key)
+    assert omitted_row["kind"] == "data_task"
+    assert omitted_row["platform"] == "discord"
+    assert omitted_row["status"] == "sent"
+    assert omitted_row["delivery_attempt"] == 1
+    assert omitted_row["platform_message_ids"] == ["dt-http-omit"]
+    token_row = await _delivery_row(pool, token_key)
+    assert token_row["kind"] == "data_task"
+    assert token_row["status"] == "sent"
+    assert token_row["delivery_attempt"] == 1
+    assert token_row["platform_message_ids"] == ["dt-http-token"]
+    sent_row = await _delivery_row(pool, sent_key)
+    assert sent_row["kind"] == "agent_send"
+    assert sent_row["status"] == "unknown"
+    assert sent_row["delivery_attempt"] == 1
+    assert sent_row["platform_message_ids"] == []
+    assert sent_row["first_response_json"] is None
+    assert sent_row["error_code"] == "gateway_restarted"
+    failed_row = await _delivery_row(pool, failed_key)
+    assert failed_row["kind"] == "agent_send"
+    assert failed_row["status"] == "unknown"
+    assert failed_row["delivery_attempt"] == 1
+    assert failed_row["platform_message_ids"] == []
+    assert failed_row["first_response_json"] is None
+    assert failed_row["error_code"] == "gateway_restarted"
+
+
+def _assert_recovered_dispatch(row: dict[str, Any], confirmed: str, attempt: int) -> None:
+    assert row["status"] == "unknown"
+    assert row["error_code"] == "gateway_restarted"
+    assert row["delivery_attempt"] == attempt
+    assert row["discord_body_phase"] == "dispatching"
+    assert row["confirmed_thread_address"] == confirmed
+    assert row["platform_message_ids"] == []
+    assert row["sent_chunks"] == 0
+    assert row["first_response_json"] is None
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_current_attempt_finishes_after_startup_recovery(
+    seeded_env: dict[str, Any],
+) -> None:
+    """Startup may mark a dispatching attempt unknown. That attempt can still finish.
+
+    A second claim while the row is unknown and dispatching does not reclaim it,
+    so a retry would not send another body. A lost-response unknown, an omitted
+    token, a stale attempt, and a return to in_flight stay rejected.
+    """
+    pool: AsyncConnectionPool = seeded_env["pool"]
+    user_a = seeded_env["user_a"]
+    prefix = seeded_env["prefix"]
+    parent = seeded_env["bootstrap"]["parent_addr"]
+    confirmed = (
+        f"discord:{seeded_env['bootstrap']['guild_id']}/"
+        f"{seeded_env['bootstrap']['parent_cid']}:thread:{THREAD_ID}"
+    )
+    await _assert_d036_column(pool)
+    sent_key = f"{prefix}_recover_sent"
+    failed_key = f"{prefix}_recover_failed"
+    partial_key = f"{prefix}_recover_partial"
+    sent_attempt = await _arm_discord_dispatch(user_a, sent_key, parent, confirmed)
+    failed_attempt = await _arm_discord_dispatch(user_a, failed_key, parent, confirmed)
+    partial_attempt = await _arm_discord_dispatch(
+        user_a, partial_key, parent, confirmed
+    )
+    assert sent_attempt == failed_attempt == partial_attempt == 1
+    for key in (sent_key, failed_key, partial_key):
+        flying = await _delivery_row(pool, key)
+        assert flying["status"] == "in_flight"
+        assert flying["error_code"] is None
+        assert flying["discord_body_phase"] == "dispatching"
+
+    await cg_db.recover_channel_state(mode="startup")
+
+    for key in (sent_key, failed_key, partial_key):
+        _assert_recovered_dispatch(await _delivery_row(pool, key), confirmed, 1)
+        blocked = await _claim(user_a, key, parent)
+        assert blocked["claim_status"] == "in_flight_or_unknown"
+        assert blocked["code"] == "in_flight"
+        assert blocked["delivery_attempt"] == 1
+        assert blocked["discord_body_phase"] == "dispatching"
+        assert blocked["confirmed_thread_address"] == confirmed
+        _assert_recovered_dispatch(await _delivery_row(pool, key), confirmed, 1)
+
+    with pytest.raises(HTTPException) as omitted:
+        await cg_db.update_delivery_progress(
+            delivery_key=sent_key,
+            status="sent",
+            platform_message_ids=["omitted-token"],
+            first_response_json={"status": "sent"},
+        )
+    assert omitted.value.status_code == 409
+    assert omitted.value.detail["message"] == _UNKNOWN_FROZEN
+    with pytest.raises(HTTPException) as stale:
+        await cg_db.update_delivery_progress(
+            delivery_key=sent_key,
+            delivery_attempt=0,
+            status="sent",
+            platform_message_ids=["stale-attempt"],
+            first_response_json={"status": "sent"},
+        )
+    assert stale.value.status_code == 409
+    assert (
+        stale.value.detail["message"]
+        == "delivery_attempt is no longer the current attempt"
+    )
+    with pytest.raises(HTTPException) as reopened:
+        await cg_db.update_delivery_progress(
+            delivery_key=sent_key,
+            delivery_attempt=1,
+            status="in_flight",
+        )
+    assert reopened.value.status_code == 409
+    assert reopened.value.detail["message"] == _UNKNOWN_FROZEN
+    _assert_recovered_dispatch(await _delivery_row(pool, sent_key), confirmed, 1)
+
+    finished = await cg_db.update_delivery_progress(
+        delivery_key=sent_key,
+        delivery_attempt=1,
+        status="sent",
+        platform_message_ids=["m-sent"],
+        first_response_json={"status": "sent", "address": confirmed},
+    )
+    assert finished["ok"] is True
+    assert finished["status"] == "sent"
+    assert finished["delivery_attempt"] == 1
+    assert finished["confirmed_thread_address"] == confirmed
+    assert finished["discord_body_phase"] == "dispatching"
+    sent_row = await _delivery_row(pool, sent_key)
+    assert sent_row["status"] == "sent"
+    assert sent_row["delivery_attempt"] == 1
+    assert sent_row["platform_message_ids"] == ["m-sent"]
+    assert sent_row["confirmed_thread_address"] == confirmed
+    assert sent_row["discord_body_phase"] == "dispatching"
+    assert sent_row["sent_chunks"] == 0
+    completed = await _claim(user_a, sent_key, parent)
+    assert completed["claim_status"] == "already_completed"
+    assert completed["delivery_attempt"] == 1
+    with pytest.raises(HTTPException) as stale_sent:
+        await cg_db.update_delivery_progress(
+            delivery_key=sent_key,
+            delivery_attempt=0,
+            status="unknown",
+            platform_message_ids=[],
+            first_response_json={"status": "unknown"},
+        )
+    assert stale_sent.value.status_code == 409
+    assert (
+        stale_sent.value.detail["message"]
+        == "delivery_attempt is no longer the current attempt"
+    )
+    assert (await _delivery_row(pool, sent_key))["platform_message_ids"] == ["m-sent"]
+    assert (await _delivery_row(pool, sent_key))["confirmed_thread_address"] == confirmed
+
+    failed = await cg_db.update_delivery_progress(
+        delivery_key=failed_key,
+        delivery_attempt=1,
+        status="failed",
+        error_code="not_allowed",
+        error_message="Discord message send failed",
+        platform_message_ids=["m-fail"],
+        first_response_json={"status": "failed", "address": confirmed},
+    )
+    assert failed["ok"] is True
+    assert failed["status"] == "failed"
+    assert failed["delivery_attempt"] == 1
+    failed_row = await _delivery_row(pool, failed_key)
+    assert failed_row["status"] == "failed"
+    assert failed_row["platform_message_ids"] == ["m-fail"]
+    assert failed_row["confirmed_thread_address"] == confirmed
+    assert failed_row["discord_body_phase"] == "dispatching"
+    assert failed_row["delivery_attempt"] == 1
+    reclaimed = await _claim(user_a, failed_key, parent)
+    assert reclaimed["claim_status"] == "claimed"
+    assert reclaimed["delivery_attempt"] == 2
+    assert reclaimed["confirmed_thread_address"] == confirmed
+    assert reclaimed["discord_body_phase"] == "dispatching"
+    with pytest.raises(HTTPException) as old_attempt:
+        await cg_db.update_delivery_progress(
+            delivery_key=failed_key,
+            delivery_attempt=1,
+            status="sent",
+            platform_message_ids=["replaced"],
+            first_response_json={"status": "sent"},
+        )
+    assert old_attempt.value.status_code == 409
+    assert (
+        old_attempt.value.detail["message"]
+        == "delivery_attempt is no longer the current attempt"
+    )
+    after_old = await _delivery_row(pool, failed_key)
+    assert after_old["status"] == "in_flight"
+    assert after_old["delivery_attempt"] == 2
+    assert after_old["platform_message_ids"] == ["m-fail"]
+    assert after_old["confirmed_thread_address"] == confirmed
+    assert after_old["discord_body_phase"] == "dispatching"
+
+    partial = await cg_db.update_delivery_progress(
+        delivery_key=partial_key,
+        delivery_attempt=1,
+        status="partial",
+        platform_message_ids=["m-partial"],
+        first_response_json={"status": "partial", "address": confirmed},
+    )
+    assert partial["ok"] is True
+    assert partial["status"] == "partial"
+    assert partial["delivery_attempt"] == 1
+    partial_row = await _delivery_row(pool, partial_key)
+    assert partial_row["status"] == "partial"
+    assert partial_row["delivery_attempt"] == 1
+    assert partial_row["platform_message_ids"] == ["m-partial"]
+    assert partial_row["confirmed_thread_address"] == confirmed
+    assert partial_row["discord_body_phase"] == "dispatching"
+    partial_again = await _claim(user_a, partial_key, parent)
+    assert partial_again["claim_status"] == "already_completed"
+    assert partial_again["delivery_attempt"] == 1
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_current_attempt_finishes_after_startup_recovery_over_http(
+    seeded_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same recovery window over the real claim, recover, and progress routes."""
+    pool: AsyncConnectionPool = seeded_env["pool"]
+    user_a = seeded_env["user_a"]
+    prefix = seeded_env["prefix"]
+    parent = seeded_env["bootstrap"]["parent_addr"]
+    confirmed = (
+        f"discord:{seeded_env['bootstrap']['guild_id']}/"
+        f"{seeded_env['bootstrap']['parent_cid']}:thread:{THREAD_ID}"
+    )
+    token = "0123456789abcdef0123456789abcdef_recovery_http"
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", token)
+    await _assert_d036_column(pool)
+    sent_key = f"{prefix}_http_recover_sent"
+    failed_key = f"{prefix}_http_recover_failed"
+    partial_key = f"{prefix}_http_recover_partial"
+    app = FastAPI()
+    app.include_router(channels_router, prefix="/api/v1/dalton")
+
+    async with _run_ephemeral_fastapi_server(app) as base_url:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            claim_url = (
+                f"{base_url}/api/v1/dalton/channels/internal/deliveries/authorize-and-claim"
+            )
+            progress_url = (
+                f"{base_url}/api/v1/dalton/channels/internal/deliveries/progress"
+            )
+            recover_url = f"{base_url}/api/v1/dalton/channels/internal/recover"
+            headers = {"X-Service-Token": token}
+
+            async def claim(key: str) -> dict[str, Any]:
+                response = await client.post(
+                    claim_url,
+                    headers=headers,
+                    json={
+                        "delivery_key": key,
+                        "kind": "agent_send",
+                        "user_id": user_a,
+                        "platform": "discord",
+                        "target": parent,
+                        "has_non_empty_text": True,
+                        "total_chunks": 1,
+                    },
+                )
+                assert response.status_code == 200, response.text
+                return response.json()
+
+            async def progress(body: dict[str, Any]) -> httpx.Response:
+                return await client.post(progress_url, headers=headers, json=body)
+
+            async def arm(key: str) -> int:
+                claimed = await claim(key)
+                assert claimed["claim_status"] == "claimed"
+                attempt = int(claimed["delivery_attempt"])
+                stored = await progress(
+                    {
+                        "delivery_key": key,
+                        "delivery_attempt": attempt,
+                        "confirmed_thread_address": confirmed,
+                    }
+                )
+                assert stored.status_code == 200, stored.text
+                assert stored.json()["discord_body_phase"] == "before_body"
+                marked = await progress(
+                    {
+                        "delivery_key": key,
+                        "delivery_attempt": attempt,
+                        "discord_body_phase": "dispatching",
+                    }
+                )
+                assert marked.status_code == 200, marked.text
+                assert marked.json()["discord_body_phase"] == "dispatching"
+                assert marked.json()["delivery_attempt"] == attempt
+                return attempt
+
+            sent_attempt = await arm(sent_key)
+            failed_attempt = await arm(failed_key)
+            partial_attempt = await arm(partial_key)
+            assert sent_attempt == failed_attempt == partial_attempt == 1
+            recovered = await client.get(
+                recover_url, headers=headers, params={"mode": "startup"}
+            )
+            assert recovered.status_code == 200, recovered.text
+
+            for key in (sent_key, failed_key, partial_key):
+                _assert_recovered_dispatch(await _delivery_row(pool, key), confirmed, 1)
+                blocked = await claim(key)
+                assert blocked["claim_status"] == "in_flight_or_unknown"
+                assert blocked["code"] == "in_flight"
+                assert blocked["delivery_attempt"] == 1
+                assert blocked["confirmed_thread_address"] == confirmed
+                assert blocked["discord_body_phase"] == "dispatching"
+                _assert_recovered_dispatch(await _delivery_row(pool, key), confirmed, 1)
+
+            omitted = await progress(
+                {
+                    "delivery_key": sent_key,
+                    "status": "sent",
+                    "platform_message_ids": ["omitted-token"],
+                    "first_response_json": {"status": "sent"},
+                }
+            )
+            assert omitted.status_code == 409
+            assert omitted.json()["detail"]["message"] == _UNKNOWN_FROZEN
+            stale = await progress(
+                {
+                    "delivery_key": sent_key,
+                    "delivery_attempt": 0,
+                    "status": "sent",
+                    "platform_message_ids": ["stale-attempt"],
+                    "first_response_json": {"status": "sent"},
+                }
+            )
+            assert stale.status_code == 409
+            assert (
+                stale.json()["detail"]["message"]
+                == "delivery_attempt is no longer the current attempt"
+            )
+            reopened = await progress(
+                {
+                    "delivery_key": sent_key,
+                    "delivery_attempt": 1,
+                    "status": "in_flight",
+                }
+            )
+            assert reopened.status_code == 409
+            assert reopened.json()["detail"]["message"] == _UNKNOWN_FROZEN
+            _assert_recovered_dispatch(await _delivery_row(pool, sent_key), confirmed, 1)
+
+            finished = await progress(
+                {
+                    "delivery_key": sent_key,
+                    "delivery_attempt": 1,
+                    "status": "sent",
+                    "platform_message_ids": ["m-sent"],
+                    "first_response_json": {"status": "sent", "address": confirmed},
+                }
+            )
+            assert finished.status_code == 200, finished.text
+            assert finished.json()["status"] == "sent"
+            assert finished.json()["delivery_attempt"] == 1
+            assert finished.json()["confirmed_thread_address"] == confirmed
+            assert finished.json()["discord_body_phase"] == "dispatching"
+            sent_done = await claim(sent_key)
+            assert sent_done["claim_status"] == "already_completed"
+            assert sent_done["delivery_attempt"] == 1
+
+            failed = await progress(
+                {
+                    "delivery_key": failed_key,
+                    "delivery_attempt": 1,
+                    "status": "failed",
+                    "error_code": "not_allowed",
+                    "error_message": "Discord message send failed",
+                    "platform_message_ids": ["m-fail"],
+                    "first_response_json": {"status": "failed", "address": confirmed},
+                }
+            )
+            assert failed.status_code == 200, failed.text
+            assert failed.json()["status"] == "failed"
+            assert failed.json()["delivery_attempt"] == 1
+            reclaimed = await claim(failed_key)
+            assert reclaimed["claim_status"] == "claimed"
+            assert reclaimed["delivery_attempt"] == 2
+            assert reclaimed["confirmed_thread_address"] == confirmed
+            assert reclaimed["discord_body_phase"] == "dispatching"
+            old_attempt = await progress(
+                {
+                    "delivery_key": failed_key,
+                    "delivery_attempt": 1,
+                    "status": "sent",
+                    "platform_message_ids": ["replaced"],
+                    "first_response_json": {"status": "sent"},
+                }
+            )
+            assert old_attempt.status_code == 409
+            assert (
+                old_attempt.json()["detail"]["message"]
+                == "delivery_attempt is no longer the current attempt"
+            )
+
+            partial = await progress(
+                {
+                    "delivery_key": partial_key,
+                    "delivery_attempt": 1,
+                    "status": "partial",
+                    "platform_message_ids": ["m-partial"],
+                    "first_response_json": {"status": "partial", "address": confirmed},
+                }
+            )
+            assert partial.status_code == 200, partial.text
+            assert partial.json()["status"] == "partial"
+            assert partial.json()["delivery_attempt"] == 1
+            assert partial.json()["discord_body_phase"] == "dispatching"
+
+    sent_row = await _delivery_row(pool, sent_key)
+    assert sent_row["status"] == "sent"
+    assert sent_row["delivery_attempt"] == 1
+    assert sent_row["platform_message_ids"] == ["m-sent"]
+    assert sent_row["confirmed_thread_address"] == confirmed
+    assert sent_row["discord_body_phase"] == "dispatching"
+    assert sent_row["sent_chunks"] == 0
+    failed_row = await _delivery_row(pool, failed_key)
+    assert failed_row["status"] == "in_flight"
+    assert failed_row["delivery_attempt"] == 2
+    assert failed_row["platform_message_ids"] == ["m-fail"]
+    assert failed_row["confirmed_thread_address"] == confirmed
+    assert failed_row["discord_body_phase"] == "dispatching"
+    partial_row = await _delivery_row(pool, partial_key)
+    assert partial_row["status"] == "partial"
+    assert partial_row["delivery_attempt"] == 1
+    assert partial_row["platform_message_ids"] == ["m-partial"]
+    assert partial_row["confirmed_thread_address"] == confirmed
+    assert partial_row["discord_body_phase"] == "dispatching"
 
 
 if __name__ == "__main__" and "--serve-http-harness" in sys.argv:

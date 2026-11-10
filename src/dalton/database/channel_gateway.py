@@ -5203,15 +5203,32 @@ async def _update_delivery_progress_once(
                     _reject_delivery_update(
                         409, "delivery_attempt is no longer the current attempt"
                     )
-                # Discord unknown stays unknown. A stale worker must not turn an
-                # uncertain Discord body into a retryable failed, sent, partial,
-                # or in_flight delivery. Feishu, Weixin, and data tasks keep the
-                # previous rule and can still record a later completion.
+                # Discord unknown stays unknown, except a stored data_task row
+                # and one case: startup recovery rewrote this same attempt from
+                # in_flight to unknown after the body phase was already
+                # dispatching. That attempt may still record sent, failed, or
+                # partial. It may not return the row to in_flight. The kind,
+                # phase, and error_code come from the locked row. A caller that
+                # omits the attempt, a stale attempt, and a worker that stored
+                # unknown itself still cannot change Discord unknown. Feishu,
+                # Weixin, and a Discord data_task can still record a later
+                # completion. Startup does not increment delivery_attempt.
+                locked_kind = str(row.get("kind") or "").strip().lower()
+                requested_status = str(status or "").strip().lower()
+                recovery_terminal = (
+                    requested_attempt is not None
+                    and requested_attempt == current_attempt
+                    and str(row.get("error_code") or "").strip() == "gateway_restarted"
+                    and _delivery_discord_body_phase(row) == "dispatching"
+                    and requested_status in ("sent", "failed", "partial")
+                )
                 if (
                     locked_plat == "discord"
+                    and locked_kind != "data_task"
                     and prev_status == "unknown"
                     and status is not None
                     and str(status) != "unknown"
+                    and not recovery_terminal
                 ):
                     _reject_delivery_update(
                         409, "Discord delivery status unknown cannot be changed"

@@ -3,7 +3,7 @@
 Reads the isolated test database connection string from ``DALTON_CHANNEL_GATEWAY_TEST_DSN``
 (or ``DALTON_TEST_DB_DSN`` / ``TEST_DATABASE_URL``); skips cleanly when unset and unreachable.
 Enforces that the target database name ends with ``_test``, upgrades upstream Alembic to ``head``
-and Dalton Alembic to ``d031`` or leaves a later Dalton revision in place, and exercises real permission checks, real FastAPI routes, and
+and Dalton Alembic to at least ``d036`` or leaves a later Dalton revision in place, and exercises real permission checks, real FastAPI routes, and
 real HTTP-to-FastAPI-to-PostgreSQL flows with ``DiscordChannelAdapter`` and ``GatewayOrchestrator``.
 """
 
@@ -132,14 +132,15 @@ def _revision_is_target_or_descendant(
     return False
 
 
-async def _ensure_alembic_upgraded_to_d031(
-    dsn: str, *, minimum: str = "d031"
+async def _ensure_alembic_upgraded_to_d036(
+    dsn: str, *, minimum: str = "d036"
 ) -> None:
     """Upgrade upstream to head and Dalton to ``minimum`` when the database is behind it.
 
-    A database already at ``minimum`` or a descendant (d035, d036, …) is left
-    alone. Alembic cannot upgrade to an older revision, so this must not call
-    ``upgrade("d031")`` after a later revision has been applied. The Dalton
+    The default minimum is d036 because current I-6 reads ``delivery_attempt``.
+    A database already at ``minimum`` or a descendant is left alone. Alembic
+    cannot upgrade to an older revision, so this must not call
+    ``upgrade("d036")`` after a later revision has been applied. The Dalton
     version table is ``alembic_version_dalton``.
     """
     project_root = Path(__file__).resolve().parents[3]
@@ -197,13 +198,13 @@ async def _ensure_alembic_upgraded_to_d031(
 
 @pytest_asyncio.fixture(scope="session")
 async def channel_gateway_db_pool():
-    """Ensure upstream (`head`) + Dalton (`d031`) migrations are applied and yield a connection pool."""
+    """Ensure upstream (`head`) + Dalton (at least `d036`) migrations are applied and yield a connection pool."""
     dsn = _get_test_dsn()
     os.environ.setdefault(
         "BYOK_ENCRYPTION_KEY", "test-channel-gateway-encryption-key-32b"
     )
 
-    await _ensure_alembic_upgraded_to_d031(dsn)
+    await _ensure_alembic_upgraded_to_d036(dsn)
 
     pool = AsyncConnectionPool(
         conninfo=dsn,
@@ -2090,18 +2091,18 @@ async def test_real_http_discord_gateway_orchestrator_to_fastapi_and_postgres(
         )
 
 
-async def serve_discord_http_harness(*, dalton_revision: str = "d031") -> None:
+async def serve_discord_http_harness(*, dalton_revision: str = "d036") -> None:
     """Serve the Discord HTTP harness until SIGINT or SIGTERM.
 
-    ``dalton_revision`` is the minimum Dalton revision. The default stays d031
-    for the existing real HTTP suite. A descendant already applied is not
-    downgraded. The confirmed-thread suite passes ``d036``.
+    ``dalton_revision`` is the minimum Dalton revision. The default is d036
+    because current I-6 reads ``delivery_attempt``. A descendant already
+    applied is not downgraded. A caller that needs an older revision passes it.
     """
     dsn = _get_test_dsn()
     os.environ.setdefault(
         "BYOK_ENCRYPTION_KEY", "test-channel-gateway-encryption-key-32b"
     )
-    await _ensure_alembic_upgraded_to_d031(dsn, minimum=dalton_revision)
+    await _ensure_alembic_upgraded_to_d036(dsn, minimum=dalton_revision)
 
     pool = AsyncConnectionPool(
         conninfo=dsn,
