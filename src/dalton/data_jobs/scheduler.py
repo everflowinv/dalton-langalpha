@@ -29,6 +29,7 @@ from src.dalton.data_jobs.container_runner import (
     format_container_name,
     is_container_not_found_error,
     read_run_artifacts,
+    read_validated_run_json_metadata,
     write_run_secrets_dir,
 )
 from src.dalton.data_jobs.evaluators import (
@@ -62,6 +63,7 @@ from src.dalton.data_jobs.runner_wrapper import (
     extract_last_json_object,
     resolve_task_payload_source,
 )
+from src.dalton.data_jobs.safe_fs import SafeFsError
 from src.dalton.notify.channel_transport import (
     extract_target_uncertain_code,
     post_data_task_gateway_notify,
@@ -1828,7 +1830,18 @@ async def execute_claimed_container_run(
         raw_timeout_kind if raw_timeout_kind in ("total", "no_output") else None
     )
 
-    outbox_payload, frozen_manifest = read_run_artifacts(claimed.run_id, path_map=paths)
+    metadata_error: SafeFsError | None = None
+    try:
+        outbox_payload, frozen_manifest = read_run_artifacts(
+            claimed.run_id,
+            path_map=paths,
+            strict=True,
+        )
+    except SafeFsError as meta_exc:
+        metadata_error = meta_exc
+        outbox_payload = None
+        frozen_manifest = None
+
     evaluation = evaluate_task_run(
         TaskEvaluationContext(
             job_key=claimed.job_key,
@@ -1842,7 +1855,18 @@ async def execute_claimed_container_run(
             reference_date=reference_date,
         )
     )
-    if (
+    if metadata_error is not None:
+        evaluation = TaskEvaluationResult(
+            ok=False,
+            status="failed",
+            failure_reason=f"invalid_run_metadata:{metadata_error.code}",
+            warnings=list(evaluation.warnings),
+            details={
+                **evaluation.details,
+                "metadata_error_code": metadata_error.code,
+            },
+        )
+    elif (
         claimed.job_key == T27_JOB_KEY
         and evaluation.ok
         and evaluation.status == "succeeded"
@@ -1864,9 +1888,13 @@ async def execute_claimed_container_run(
                 workspace_dir=paths.backend_data_root,
                 run_artifacts_dir=run_art_dir,
             )
-            atomic_write_json(run_art_dir / "outbox.json", prepared_t27)
+            atomic_write_json(
+                run_art_dir / "outbox.json",
+                prepared_t27,
+                anchor_dir=paths.backend_data_root,
+            )
             outbox_payload = prepared_t27
-        except DataTaskNotificationPrepError as prep_exc:
+        except (DataTaskNotificationPrepError, SafeFsError) as prep_exc:
             outbox_payload = None
             evaluation = TaskEvaluationResult(
                 ok=False,
@@ -2268,23 +2296,20 @@ def _resolve_run_notify_payload(
     log_tail: str | None = None,
     path_map: DataTaskPathMap | None = None,
 ) -> tuple[str, dict[str, Any] | None, dict[str, Any]]:
-    """Resolve ``(text, card, payload_with_route_key)`` from ``.dalton-runs/<run_id>/outbox.json`` or stdout (§5.1 item 2).
+    """Resolve ``(text, card, payload_with_route_key)`` with DB precedence over bounded disk fallback.
 
-    Only T27 (``asia-leverage-crossview-daily``) and T32 (``quantum-ew-monitor``) may fall back to
-    ``log_tail`` (stdout) when ``outbox.json`` is missing.
+    Persisted ``db_outbox_payload`` is authoritative and performs zero disk metadata reads.
+    When absent, reads only ``outbox.json`` (never ``frozen_manifest.json``) with bounded,
+    descriptor-based validation. Only T27 (``asia-leverage-crossview-daily``) and T32
+    (``quantum-ew-monitor``) may fall back to ``log_tail`` when ``outbox.json`` is genuinely absent.
     """
-    paths = path_map or build_path_map()
-    disk_outbox, _ = read_run_artifacts(str(run_id), path_map=paths)
-
     cleaned_key = str(job_key).strip()
     if cleaned_key.lower().startswith("data:"):
         cleaned_key = cleaned_key[5:].strip()
     data_key = f"data:{cleaned_key}"
 
     raw_payload: dict[str, Any] | None = None
-    if isinstance(disk_outbox, Mapping) and disk_outbox:
-        raw_payload = dict(disk_outbox)
-    elif isinstance(db_outbox_payload, Mapping) and db_outbox_payload:
+    if isinstance(db_outbox_payload, Mapping) and db_outbox_payload:
         raw_payload = dict(db_outbox_payload)
     elif isinstance(db_outbox_payload, str) and db_outbox_payload.strip():
         try:
@@ -2296,9 +2321,29 @@ def _resolve_run_notify_payload(
         except Exception:
             raw_payload = {"text": db_outbox_payload.strip()}
 
-    if raw_payload is None and (
-        cleaned_key in _STDOUT_NOTIFY_FALLBACK_JOB_KEYS
-        or resolve_task_payload_source(cleaned_key) in ("stdout_markdown", "stdout_text")
+    metadata_error_code: str | None = None
+    if raw_payload is None:
+        paths = path_map or build_path_map()
+        try:
+            disk_outbox = read_validated_run_json_metadata(
+                str(run_id),
+                "outbox.json",
+                path_map=paths,
+            )
+            if isinstance(disk_outbox, Mapping) and disk_outbox:
+                raw_payload = dict(disk_outbox)
+            elif isinstance(disk_outbox, Mapping):
+                metadata_error_code = "invalid_metadata"
+        except SafeFsError as meta_exc:
+            metadata_error_code = meta_exc.code
+
+    if (
+        raw_payload is None
+        and metadata_error_code is None
+        and (
+            cleaned_key in _STDOUT_NOTIFY_FALLBACK_JOB_KEYS
+            or resolve_task_payload_source(cleaned_key) in ("stdout_markdown", "stdout_text")
+        )
     ):
         if log_tail and log_tail.strip():
             parsed_stdout = extract_last_json_object(log_tail)
@@ -2307,7 +2352,7 @@ def _resolve_run_notify_payload(
             else:
                 raw_payload = {"text": log_tail.strip()}
 
-    outbox_missing = raw_payload is None
+    outbox_missing = raw_payload is None and metadata_error_code is None
     if raw_payload is None:
         raw_payload = {}
 
@@ -2366,8 +2411,17 @@ def _resolve_run_notify_payload(
     if not text and raw_payload and not feishu_cards:
         text = json.dumps(raw_payload, ensure_ascii=False)
 
-    if not text and card is None and not feishu_cards:
+    if metadata_error_code is None and not text and card is None and not feishu_cards:
         outbox_missing = True
+
+    if feishu_cards:
+        expected_item_count = len(feishu_cards)
+    elif isinstance(raw_payload.get("items"), list) and raw_payload["items"]:
+        expected_item_count = len(raw_payload["items"])
+    elif not outbox_missing and metadata_error_code is None:
+        expected_item_count = 1
+    else:
+        expected_item_count = 0
 
     payload_with_route_key: dict[str, Any] = {
         **raw_payload,
@@ -2380,9 +2434,13 @@ def _resolve_run_notify_payload(
         "job_key": cleaned_key,
         "run_id": str(run_id),
     }
+    if expected_item_count > 0:
+        payload_with_route_key["expected_item_count"] = expected_item_count
     if feishu_cards:
         payload_with_route_key["feishu_cards"] = feishu_cards
-    if outbox_missing:
+    if metadata_error_code is not None:
+        payload_with_route_key["_metadata_error_code"] = metadata_error_code
+    elif outbox_missing:
         payload_with_route_key["_outbox_missing"] = True
     return text, card, payload_with_route_key
 
@@ -2493,6 +2551,32 @@ async def dispatch_data_task_run_notification(
         log_tail=log_tail,
         path_map=path_map,
     )
+    metadata_error_code = payload_with_route_key.pop("_metadata_error_code", None)
+    if metadata_error_code:
+        logger.warning(
+            "Failing data task notification for run_id=%s job_key=%s (reason=invalid_outbox:%s)",
+            run_id,
+            job_key,
+            metadata_error_code,
+        )
+        await check_scheduler_lock(lock_conn)
+        async with conn.transaction():
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE dalton_data_task_runs
+                    SET notify_status = %(notify_status)s,
+                        updated_at    = NOW()
+                    WHERE run_id = %(run_id)s::uuid
+                      AND notify_status = 'pending_dispatch'
+                    """,
+                    {
+                        "run_id": str(run_id),
+                        "notify_status": "failed",
+                    },
+                )
+        return "failed"
+
     outbox_missing = bool(payload_with_route_key.pop("_outbox_missing", False))
     if outbox_missing:
         logger.warning(

@@ -967,6 +967,8 @@ export class HttpBackendClient implements BackendClient {
       timeoutMs?: number;
       redirect?: RequestRedirect;
       cache?: RequestCache;
+      strictJson?: boolean;
+      operationLabel?: string;
     },
   ): Promise<{ status: number; data: T }> {
     const url = new URL(`${this.baseUrl}${path}`);
@@ -992,6 +994,41 @@ export class HttpBackendClient implements BackendClient {
     };
     const resp = await this.fetchImpl(url, init);
     const text = await resp.text();
+    if (options?.strictJson) {
+      const label = options.operationLabel ?? path;
+      if (resp.status >= 300 && resp.status < 400) {
+        throw new BackendHttpError(
+          `${label} redirect rejected (${resp.status})`,
+          resp.status,
+          null,
+        );
+      }
+      if (resp.status >= 400) {
+        throw new BackendHttpError(
+          `${label} failed (${resp.status})`,
+          resp.status,
+          null,
+        );
+      }
+      if (!text.trim()) {
+        throw new BackendHttpError(
+          `${label} returned an empty response body (${resp.status})`,
+          resp.status,
+          null,
+        );
+      }
+      let strictParsed: unknown;
+      try {
+        strictParsed = JSON.parse(text);
+      } catch {
+        throw new BackendHttpError(
+          `${label} returned malformed JSON (${resp.status})`,
+          resp.status,
+          null,
+        );
+      }
+      return { status: resp.status, data: strictParsed as T };
+    }
     let parsed: unknown = {};
     if (text) {
       try {
@@ -1150,6 +1187,22 @@ export class HttpBackendClient implements BackendClient {
   async authorizeAndClaimDelivery(
     req: I6AuthorizeAndClaimRequest,
   ): Promise<I6AuthorizeAndClaimResponse> {
+    if (req.kind === "data_task") {
+      const { data } = await this.jsonRequest<I6AuthorizeAndClaimResponse>(
+        "POST",
+        "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
+        {
+          userId: req.user_id,
+          body: req,
+          timeoutMs: 15_000,
+          redirect: "error",
+          cache: "no-store",
+          strictJson: true,
+          operationLabel: "I-6 authorize-and-claim",
+        },
+      );
+      return data;
+    }
     const { status, data } = await this.jsonRequest<I6AuthorizeAndClaimResponse>(
       "POST",
       "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
@@ -1165,6 +1218,24 @@ export class HttpBackendClient implements BackendClient {
   async updateDeliveryProgress(
     req: I7DeliveriesProgressRequest,
   ): Promise<I7DeliveriesProgressResponse> {
+    if (
+      typeof req.delivery_key === "string" &&
+      req.delivery_key.startsWith("data_task:")
+    ) {
+      const { data } = await this.jsonRequest<I7DeliveriesProgressResponse>(
+        "POST",
+        "/api/v1/dalton/channels/internal/deliveries/progress",
+        {
+          body: req,
+          timeoutMs: 15_000,
+          redirect: "error",
+          cache: "no-store",
+          strictJson: true,
+          operationLabel: "I-7 deliveries/progress",
+        },
+      );
+      return data;
+    }
     const { status, data } = await this.jsonRequest<I7DeliveriesProgressResponse>(
       "POST",
       "/api/v1/dalton/channels/internal/deliveries/progress",
@@ -1595,7 +1666,7 @@ export class HttpBackendClient implements BackendClient {
   async authorizeDataTaskNotificationPlan(
     req: DataTaskNotificationRequest,
   ): Promise<DataTaskAuthorizePlanResponse> {
-    const { status, data } = await this.jsonRequest<DataTaskAuthorizePlanResponse>(
+    const { data } = await this.jsonRequest<DataTaskAuthorizePlanResponse>(
       "POST",
       "/api/v1/dalton/channels/internal/data-task-notifications/plan",
       {
@@ -1606,15 +1677,10 @@ export class HttpBackendClient implements BackendClient {
         timeoutMs: 15_000,
         redirect: "error",
         cache: "no-store",
+        strictJson: true,
+        operationLabel: "authorizeDataTaskNotificationPlan",
       },
     );
-    if (status >= 300) {
-      throw new BackendHttpError(
-        `authorizeDataTaskNotificationPlan failed (${status})`,
-        status,
-        data,
-      );
-    }
     return data;
   }
 
@@ -1634,6 +1700,7 @@ export class HttpBackendClient implements BackendClient {
       signal: AbortSignal.timeout(30_000),
     });
     if (resp.status >= 300 && resp.status < 400) {
+      void resp.body?.cancel().catch(() => undefined);
       throw new BackendHttpError(
         `downloadDataTaskRunArtifact redirect rejected (${resp.status})`,
         resp.status,
@@ -1641,16 +1708,11 @@ export class HttpBackendClient implements BackendClient {
       );
     }
     if (!resp.ok) {
-      let body: unknown = null;
-      try {
-        body = await resp.json();
-      } catch {
-        body = null;
-      }
+      void resp.body?.cancel().catch(() => undefined);
       throw new BackendHttpError(
         `downloadDataTaskRunArtifact failed (${resp.status})`,
         resp.status,
-        body,
+        null,
       );
     }
 

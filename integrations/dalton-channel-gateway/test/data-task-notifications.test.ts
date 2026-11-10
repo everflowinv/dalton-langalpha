@@ -455,6 +455,8 @@ describe("Dalton data-task report delivery via channel gateway", () => {
       target_address: "feishu:@me",
       recipient_id: "ou_synth_owner",
       is_current: false,
+      home_workspace_id: "00000000-0000-0000-0000-000000000001",
+      weixin_context_token: null,
     });
     vi.mocked(backend.downloadDataTaskRunArtifact).mockImplementation(
       async (_runId, artifactId) => {
@@ -589,6 +591,15 @@ describe("Dalton data-task report delivery via channel gateway", () => {
     vi.mocked(backend.authorizeDataTaskNotificationPlan).mockResolvedValue(
       structuredClone(t26Plan),
     );
+    vi.mocked(backend.authorizeAndClaimDelivery).mockResolvedValue({
+      claim_status: "claimed",
+      platform: "discord",
+      target_address: "discord:@me",
+      recipient_id: "100000000000000001",
+      is_current: false,
+      home_workspace_id: "00000000-0000-0000-0000-000000000001",
+      weixin_context_token: null,
+    });
     vi.mocked(backend.downloadDataTaskRunArtifact).mockImplementation(
       async (_runId, artifactId) => {
         const buf = artifactId === "item0-media0" ? chart0 : chart1;
@@ -791,6 +802,7 @@ describe("Dalton data-task report delivery via channel gateway", () => {
               status: existing.status,
               platform: "feishu",
               target_address: "feishu:@me",
+              is_current: false,
             };
           }
           if (existing.status === "in_flight" || existing.status === "unknown") {
@@ -800,6 +812,7 @@ describe("Dalton data-task report delivery via channel gateway", () => {
               code: "in_flight",
               platform: "feishu",
               target_address: "feishu:@me",
+              is_current: false,
             };
           }
         }
@@ -809,6 +822,9 @@ describe("Dalton data-task report delivery via channel gateway", () => {
           platform: "feishu",
           target_address: "feishu:@me",
           recipient_id: "ou_synth_pm",
+          is_current: false,
+          home_workspace_id: "00000000-0000-0000-0000-000000000001",
+          weixin_context_token: null,
         };
       },
     );
@@ -995,6 +1011,7 @@ describe("Dalton data-task report delivery via channel gateway", () => {
             status: "sent",
             platform: "feishu",
             target_address: "feishu:@me",
+            is_current: false,
           };
         }
         return {
@@ -1002,6 +1019,9 @@ describe("Dalton data-task report delivery via channel gateway", () => {
           platform: "feishu",
           target_address: "feishu:@me",
           recipient_id: "ou_synth",
+          is_current: false,
+          home_workspace_id: "00000000-0000-0000-0000-000000000001",
+          weixin_context_token: null,
         };
       },
     );
@@ -1247,6 +1267,8 @@ describe("Dalton data-task report delivery via channel gateway", () => {
       target_address: groupAddress,
       recipient_id: "oc_synth_joined_group",
       is_current: false,
+      home_workspace_id: "00000000-0000-0000-0000-000000000001",
+      weixin_context_token: null,
     });
     vi.mocked(backend.downloadDataTaskRunArtifact).mockResolvedValue({
       content: img0,
@@ -1383,6 +1405,9 @@ describe("Dalton data-task report delivery via channel gateway", () => {
       platform: "discord",
       target_address: "discord:999999999999999999",
       recipient_id: "999999999999999999",
+      is_current: false,
+      home_workspace_id: "00000000-0000-0000-0000-000000000001",
+      weixin_context_token: null,
     });
 
     const inspectApp = createGatewayApp({
@@ -2250,6 +2275,641 @@ describe("Dalton data-task report delivery via channel gateway", () => {
       pendingTimers.clear();
       bodyServer.closeAllConnections();
       await closeHttpServer(bodyServer);
+    }
+  });
+
+  it("requires explicit valid I-6 claims before sending and valid I-7 progress acknowledgements before reporting sent over real HttpBackendClient", async () => {
+    const RAW_CLAIM_SECRET = "RAW_UPSTREAM_CLAIM_BODY_DO_NOT_LEAK_701";
+    const RAW_PROGRESS_SECRET = "RAW_UPSTREAM_PROGRESS_BODY_DO_NOT_LEAK_702";
+    const imgBuf = makeSyntheticPng("ACK-VERIFY-IMG");
+
+    const { client: fakeLark, uploadedImages, sentMessages } =
+      createFakeOutboundLarkClient();
+    const feishuAdapter = new FeishuChannelAdapter({
+      appId: "cli_synth_ack_app",
+      appSecret: "sec_synth_ack_secret",
+      outgoingOnly: true,
+      client: fakeLark,
+    });
+    const discordAdapter = new FakeChannelAdapter("discord", 20);
+    discordAdapter.connected = false;
+    discordAdapter.outboundReady = true;
+
+    type WireReply = {
+      status: number;
+      contentType?: string;
+      rawBody: string;
+    };
+
+    const observedClaimBodies: Array<Record<string, unknown>> = [];
+    const observedProgressBodies: Array<Record<string, unknown>> = [];
+
+    let nextPlanHandler: (reqBody: Record<string, unknown>) => WireReply = () => ({
+      status: 500,
+      rawBody: "unconfigured",
+    });
+    let nextClaimHandler: (reqBody: Record<string, unknown>) => WireReply = () => ({
+      status: 500,
+      rawBody: "unconfigured",
+    });
+    let nextProgressHandler: (reqBody: Record<string, unknown>) => WireReply =
+      () => ({
+        status: 500,
+        rawBody: "unconfigured",
+      });
+
+    const ackBackendServer = createServer((req, res) => {
+      if (req.headers["x-service-token"] !== TEST_SERVICE_TOKEN) {
+        res.writeHead(401, { "Cache-Control": "no-store" }).end();
+        return;
+      }
+
+      if (
+        req.method === "GET" &&
+        req.url?.startsWith(
+          "/api/v1/dalton/channels/internal/data-task-notifications/runs/",
+        )
+      ) {
+        res.writeHead(200, {
+          "Content-Type": "image/png",
+          "Content-Length": String(imgBuf.byteLength),
+          "X-Artifact-Filename": "0.png",
+          "X-Artifact-Sha256": sha256Hex(imgBuf),
+        });
+        res.end(imgBuf);
+        return;
+      }
+
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () => {
+        const parsedReq = JSON.parse(
+          Buffer.concat(chunks).toString("utf8") || "{}",
+        ) as Record<string, unknown>;
+
+        let reply: WireReply | null = null;
+        if (
+          req.method === "POST" &&
+          req.url ===
+            "/api/v1/dalton/channels/internal/data-task-notifications/plan"
+        ) {
+          reply = nextPlanHandler(parsedReq);
+        } else if (
+          req.method === "POST" &&
+          req.url ===
+            "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim"
+        ) {
+          observedClaimBodies.push(parsedReq);
+          reply = nextClaimHandler(parsedReq);
+        } else if (
+          req.method === "POST" &&
+          req.url === "/api/v1/dalton/channels/internal/deliveries/progress"
+        ) {
+          observedProgressBodies.push(parsedReq);
+          reply = nextProgressHandler(parsedReq);
+        }
+
+        if (!reply) {
+          res.writeHead(404).end();
+          return;
+        }
+        res.writeHead(reply.status, {
+          "Content-Type": reply.contentType ?? "application/json",
+          "Cache-Control": "no-store",
+        });
+        res.end(reply.rawBody);
+      });
+    });
+
+    const backendPort = await listenEphemeralLoopback(ackBackendServer);
+    const httpBackend = new HttpBackendClient({
+      baseUrl: `http://127.0.0.1:${backendPort}`,
+      serviceToken: TEST_SERVICE_TOKEN,
+    });
+
+    const gatewayApp = createGatewayApp({
+      config: loadConfig({
+        GATEWAY_HOST: "127.0.0.1",
+        GATEWAY_PORT: "0",
+        DALTON_GATEWAY_MODE: "outgoing",
+        INTERNAL_SERVICE_TOKEN: TEST_SERVICE_TOKEN,
+      }),
+      backend: httpBackend,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([
+        ["feishu", feishuAdapter],
+        ["discord", discordAdapter],
+      ]),
+    });
+
+    const makeFeishuPlan = (runId: string): DataTaskAuthorizePlanResponse => ({
+      authorized: true,
+      status: "authorized",
+      run_id: runId,
+      job_key: "softbank-nav-monitor",
+      owner_user_id: SYNTH_USER_ID,
+      owner_platform_user_id: "ou_ack_owner",
+      platform: "feishu",
+      target_kind: "dm",
+      requested_target: "feishu:@me",
+      canonical_target_address: "feishu:@me",
+      recipient_id: "ou_ack_owner",
+      items: [
+        {
+          item_index: 0,
+          delivery_key: `data_task:${runId}:feishu:ou_ack_owner:item:0`,
+          kind: "feishu_card",
+          card: {
+            schema: "2.0",
+            body: {
+              elements: [
+                { tag: "markdown", content: "Synthetic Ack Verification" },
+                { tag: "__img__", path: "artifact:card0-img0" },
+              ],
+            },
+          },
+          images: [
+            {
+              artifact_id: "card0-img0",
+              placeholder: "artifact:card0-img0",
+              filename: "0.png",
+              mime_type: "image/png",
+              size_bytes: imgBuf.byteLength,
+              sha256: sha256Hex(imgBuf),
+            },
+          ],
+        },
+      ],
+    });
+
+    const validFeishuClaim = () => ({
+      claim_status: "claimed",
+      recipient_id: "ou_ack_owner",
+      platform: "feishu",
+      target_address: "feishu:@me",
+      is_current: false,
+      home_workspace_id: "00000000-0000-0000-0000-000000000001",
+      weixin_context_token: null,
+    });
+
+    const { host, port } = await gatewayApp.start();
+    const notifyUrl = `http://${host}:${port}/internal/data-task-notifications`;
+
+    const postNotify = async (
+      runId: string,
+      target = "feishu:@me",
+    ): Promise<DataTaskNotificationResponse> => {
+      const r = await fetch(notifyUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Service-Token": TEST_SERVICE_TOKEN,
+        },
+        body: JSON.stringify({ run_id: runId, target }),
+      });
+      expect(r.status).toBe(200);
+      return (await r.json()) as DataTaskNotificationResponse;
+    };
+
+    try {
+      // ---------------------------------------------------------------------
+      // 1. Invalid / malformed / mismatched I-6 claim responses -> 0 platform calls, status="unknown"
+      // ---------------------------------------------------------------------
+      const invalidClaimReplies: WireReply[] = [
+        { status: 200, rawBody: "{}" },
+        { status: 200, rawBody: "null" },
+        { status: 200, rawBody: "" },
+        {
+          status: 200,
+          rawBody: `{"claim_status":"claimed","secret":"${RAW_CLAIM_SECRET}`,
+        },
+        {
+          status: 500,
+          rawBody: JSON.stringify({ detail: `crash ${RAW_CLAIM_SECRET}` }),
+        },
+        {
+          status: 200,
+          rawBody: JSON.stringify({
+            ...validFeishuClaim(),
+            claim_status: "approved",
+          }),
+        },
+        {
+          status: 200,
+          rawBody: JSON.stringify({
+            claim_status: "claimed",
+            platform: "feishu",
+            target_address: "feishu:@me",
+            is_current: false,
+            home_workspace_id: "00000000-0000-0000-0000-000000000001",
+            weixin_context_token: null,
+            // recipient_id omitted -> must NOT fall back to plan.recipient_id!
+          }),
+        },
+        {
+          status: 200,
+          rawBody: JSON.stringify({
+            claim_status: "claimed",
+            recipient_id: "ou_ack_owner",
+            platform: "feishu",
+            is_current: false,
+            home_workspace_id: "00000000-0000-0000-0000-000000000001",
+            weixin_context_token: null,
+            // target_address omitted -> must NOT fall back to plan.canonical_target_address!
+          }),
+        },
+        {
+          status: 200,
+          rawBody: JSON.stringify({
+            ...validFeishuClaim(),
+            is_current: true,
+          }),
+        },
+        {
+          status: 200,
+          rawBody: JSON.stringify({
+            ...validFeishuClaim(),
+            home_workspace_id: 12345,
+          }),
+        },
+        {
+          status: 200,
+          rawBody: JSON.stringify({
+            ...validFeishuClaim(),
+            weixin_context_token: 67890,
+          }),
+        },
+        {
+          status: 200,
+          rawBody: JSON.stringify({
+            ...validFeishuClaim(),
+            platform: "discord",
+          }),
+        },
+        {
+          status: 200,
+          rawBody: JSON.stringify({
+            ...validFeishuClaim(),
+            recipient_id: "ou_different_user",
+          }),
+        },
+        {
+          status: 200,
+          rawBody: JSON.stringify({
+            ...validFeishuClaim(),
+            target_address: "feishu:oc_wrong_chat",
+          }),
+        },
+        {
+          status: 200,
+          rawBody: JSON.stringify({
+            claim_status: "already_completed",
+            status: "in_flight",
+            platform: "feishu",
+            target_address: "feishu:@me",
+          }),
+        },
+        {
+          status: 200,
+          rawBody: JSON.stringify({
+            claim_status: "denied",
+            status: "failed",
+          }),
+        },
+      ];
+
+      for (let idx = 0; idx < invalidClaimReplies.length; idx += 1) {
+        const runId = `44444444-4444-4444-8444-${String(idx).padStart(12, "0")}`;
+        nextPlanHandler = () => ({
+          status: 200,
+          rawBody: JSON.stringify(makeFeishuPlan(runId)),
+        });
+        nextClaimHandler = () => invalidClaimReplies[idx]!;
+
+        const body = await postNotify(runId);
+        expect(body.ok).toBe(false);
+        expect(body.status).toBe("unknown");
+        expect(body.code).toBe("delivery_uncertain");
+        expect(body.items_sent).toBe(0);
+        expect(body.items[0]?.status).toBe("unknown");
+        expect(body.message).not.toContain(RAW_CLAIM_SECRET);
+      }
+      expect(uploadedImages).toHaveLength(0);
+      expect(sentMessages).toHaveLength(0);
+      expect(observedProgressBodies).toHaveLength(0);
+
+      // ---------------------------------------------------------------------
+      // 2. Valid claim + malformed/mismatched I-7 progress responses -> 1 send, status="unknown",
+      //    retains platform_message_ids, never resets claim, and repeated request sends NOTHING
+      // ---------------------------------------------------------------------
+      const invalidProgressBuilders: Array<
+        (deliveryKey: string) => WireReply
+      > = [
+        () => ({ status: 200, rawBody: "{}" }),
+        () => ({ status: 200, rawBody: "null" }),
+        () => ({ status: 200, rawBody: "" }),
+        () => ({
+          status: 200,
+          rawBody: `{"ok":true,"secret":"${RAW_PROGRESS_SECRET}`,
+        }),
+        (dk) => ({
+          status: 200,
+          rawBody: JSON.stringify({
+            ok: false,
+            delivery_key: dk,
+            status: "sent",
+            sent_to_current_count: 0,
+          }),
+        }),
+        () => ({
+          status: 200,
+          rawBody: JSON.stringify({
+            ok: true,
+            delivery_key: "data_task:other:feishu:ou_ack_owner:item:0",
+            status: "sent",
+            sent_to_current_count: 0,
+          }),
+        }),
+        (dk) => ({
+          status: 200,
+          rawBody: JSON.stringify({
+            ok: true,
+            delivery_key: dk,
+            status: "in_flight",
+            sent_to_current_count: 0,
+          }),
+        }),
+        (dk) => ({
+          status: 200,
+          rawBody: JSON.stringify({
+            ok: true,
+            delivery_key: dk,
+            status: "completed_bogus",
+            sent_to_current_count: 0,
+          }),
+        }),
+        (dk) => ({
+          status: 200,
+          rawBody: JSON.stringify({
+            ok: true,
+            delivery_key: dk,
+            status: "sent",
+            sent_to_current_count: -1,
+          }),
+        }),
+        (dk) => ({
+          status: 200,
+          rawBody: JSON.stringify({
+            ok: true,
+            delivery_key: dk,
+            status: "sent",
+            sent_to_current_count: "0",
+          }),
+        }),
+      ];
+
+      for (let idx = 0; idx < invalidProgressBuilders.length; idx += 1) {
+        const runId = `55555555-5555-4555-8555-${String(idx).padStart(12, "0")}`;
+        const dKey = `data_task:${runId}:feishu:ou_ack_owner:item:0`;
+        const sendsBefore = sentMessages.length;
+        const progressCountBefore = observedProgressBodies.length;
+
+        //Simulate durable DB state: first attempt claims `in_flight`, then I-7 ack is malformed.
+        let durableState: "none" | "in_flight" | "sent" = "none";
+        nextPlanHandler = () => ({
+          status: 200,
+          rawBody: JSON.stringify(makeFeishuPlan(runId)),
+        });
+        nextClaimHandler = () => {
+          if (durableState === "in_flight") {
+            return {
+              status: 200,
+              rawBody: JSON.stringify({
+                claim_status: "in_flight_or_unknown",
+                status: "unknown",
+                code: "in_flight",
+                platform: "feishu",
+                target_address: "feishu:@me",
+                is_current: false,
+              }),
+            };
+          }
+          if (durableState === "sent") {
+            return {
+              status: 200,
+              rawBody: JSON.stringify({
+                claim_status: "already_completed",
+                status: "sent",
+                platform: "feishu",
+                target_address: "feishu:@me",
+                is_current: false,
+                first_response_json: {
+                  status: "sent",
+                  platform_message_ids: [`om_synth_${sendsBefore + 1}`],
+                },
+              }),
+            };
+          }
+          durableState = "in_flight";
+          return {
+            status: 200,
+            rawBody: JSON.stringify(validFeishuClaim()),
+          };
+        };
+        nextProgressHandler = () => invalidProgressBuilders[idx]!(dKey);
+
+        const firstAttempt = await postNotify(runId);
+        expect(firstAttempt.ok).toBe(false);
+        expect(firstAttempt.status).toBe("unknown");
+        expect(firstAttempt.code).toBe("delivery_uncertain");
+        expect(firstAttempt.items_sent).toBe(0);
+        expect(sentMessages).toHaveLength(sendsBefore + 1);
+        expect(firstAttempt.items[0]?.platform_message_ids).toEqual([
+          `om_synth_${sendsBefore + 1}`,
+        ]);
+        expect(firstAttempt.message).not.toContain(RAW_PROGRESS_SECRET);
+        // Must NOT make a second progress call to reset or overwrite the claim!
+        expect(observedProgressBodies).toHaveLength(progressCountBefore + 1);
+
+        // Repeated request while backend durable state is still `in_flight` -> 0 additional sends!
+        const repeatInFlight = await postNotify(runId);
+        expect(repeatInFlight.ok).toBe(false);
+        expect(repeatInFlight.status).toBe("unknown");
+        expect(repeatInFlight.code).toBe("in_flight");
+        expect(sentMessages).toHaveLength(sendsBefore + 1);
+
+        // Repeated request after backend durable state committed `sent` -> duplicate completion, 0 additional sends!
+        durableState = "sent";
+        const repeatCommitted = await postNotify(runId);
+        expect(repeatCommitted.ok).toBe(true);
+        expect(repeatCommitted.status).toBe("sent");
+        expect(repeatCommitted.items_sent).toBe(1);
+        expect(repeatCommitted.items[0]?.duplicate).toBe(true);
+        expect(repeatCommitted.items[0]?.platform_message_ids).toEqual([
+          `om_synth_${sendsBefore + 1}`,
+        ]);
+        expect(sentMessages).toHaveLength(sendsBefore + 1);
+      }
+
+      // ---------------------------------------------------------------------
+      // 3. Multi-chunk text_and_file: invalid intermediate chunk progress ack halts immediately without sending chunk 2 or file
+      // ---------------------------------------------------------------------
+      const chunkRunId = "66666666-6666-4666-8666-666666666666";
+      const chunkKey = `data_task:${chunkRunId}:discord:100000000000000001:item:0`;
+      let chunkDurableInFlight = false;
+      nextPlanHandler = () => ({
+        status: 200,
+        rawBody: JSON.stringify({
+          authorized: true,
+          status: "authorized",
+          run_id: chunkRunId,
+          job_key: "us-topbottom-dm-v23",
+          owner_user_id: SYNTH_USER_ID,
+          owner_platform_user_id: "100000000000000001",
+          platform: "discord",
+          target_kind: "dm",
+          requested_target: "discord:@me",
+          canonical_target_address: "discord:@me",
+          recipient_id: "100000000000000001",
+          items: [
+            {
+              item_index: 0,
+              delivery_key: chunkKey,
+              kind: "text_and_file",
+              // 35 chars > maxChunkChars=20 -> splits into 2 chunks
+              text: "ChunkOneSyntheticText\nChunkTwoText",
+              artifact: {
+                artifact_id: "item0-media0",
+                filename: "0.png",
+                mime_type: "image/png",
+                size_bytes: imgBuf.byteLength,
+                sha256: sha256Hex(imgBuf),
+              },
+            },
+          ],
+        }),
+      });
+      nextClaimHandler = () => {
+        if (chunkDurableInFlight) {
+          return {
+            status: 200,
+            rawBody: JSON.stringify({
+              claim_status: "in_flight_or_unknown",
+              status: "unknown",
+              code: "in_flight",
+              platform: "discord",
+              target_address: "discord:@me",
+              is_current: false,
+            }),
+          };
+        }
+        chunkDurableInFlight = true;
+        return {
+          status: 200,
+          rawBody: JSON.stringify({
+            claim_status: "claimed",
+            recipient_id: "100000000000000001",
+            platform: "discord",
+            target_address: "discord:@me",
+            is_current: false,
+            home_workspace_id: "00000000-0000-0000-0000-000000000001",
+            weixin_context_token: null,
+          }),
+        };
+      };
+      const progressBeforeChunk = observedProgressBodies.length;
+      nextProgressHandler = () => ({
+        status: 200,
+        // Mismatched status ("sent" instead of expected "in_flight" for intermediate chunk update)
+        rawBody: JSON.stringify({
+          ok: true,
+          delivery_key: chunkKey,
+          status: "sent",
+          sent_to_current_count: 0,
+        }),
+      });
+
+      const chunkResult = await postNotify(chunkRunId, "discord:@me");
+      expect(chunkResult.ok).toBe(false);
+      expect(chunkResult.status).toBe("unknown");
+      expect(chunkResult.code).toBe("delivery_uncertain");
+      expect(discordAdapter.sentTexts).toHaveLength(1);
+      expect(discordAdapter.sentFiles).toHaveLength(0);
+      expect(chunkResult.items[0]?.platform_message_ids).toHaveLength(1);
+      // Did not emit a second progress update overwriting durable state!
+      expect(observedProgressBodies).toHaveLength(progressBeforeChunk + 1);
+
+      const chunkRepeat = await postNotify(chunkRunId, "discord:@me");
+      expect(chunkRepeat.status).toBe("unknown");
+      expect(discordAdapter.sentTexts).toHaveLength(1);
+      expect(discordAdapter.sentFiles).toHaveLength(0);
+
+      // ---------------------------------------------------------------------
+      // 4. Normal valid acknowledgements + duplicate completed item
+      // ---------------------------------------------------------------------
+      const okRunId = "77777777-7777-4777-8777-777777777777";
+      const okKey = `data_task:${okRunId}:feishu:ou_ack_owner:item:0`;
+      const sendsBeforeOk = sentMessages.length;
+      let okCompleted = false;
+
+      nextPlanHandler = () => ({
+        status: 200,
+        rawBody: JSON.stringify(makeFeishuPlan(okRunId)),
+      });
+      nextClaimHandler = () => {
+        if (okCompleted) {
+          return {
+            status: 200,
+            rawBody: JSON.stringify({
+              claim_status: "already_completed",
+              status: "sent",
+              platform: "feishu",
+              target_address: "feishu:@me",
+              is_current: false,
+              first_response_json: {
+                status: "sent",
+                platform_message_ids: [`om_synth_${sendsBeforeOk + 1}`],
+              },
+            }),
+          };
+        }
+        return {
+          status: 200,
+          rawBody: JSON.stringify(validFeishuClaim()),
+        };
+      };
+      nextProgressHandler = (reqBody) => {
+        if (reqBody.status === "sent") {
+          okCompleted = true;
+        }
+        return {
+          status: 200,
+          rawBody: JSON.stringify({
+            ok: true,
+            delivery_key: okKey,
+            status: reqBody.status ?? "in_flight",
+            sent_to_current_count: 0,
+          }),
+        };
+      };
+
+      const okFirst = await postNotify(okRunId);
+      expect(okFirst.ok).toBe(true);
+      expect(okFirst.status).toBe("sent");
+      expect(okFirst.items_sent).toBe(1);
+      expect(okFirst.items[0]?.duplicate).toBe(false);
+      expect(sentMessages).toHaveLength(sendsBeforeOk + 1);
+
+      const okDup = await postNotify(okRunId);
+      expect(okDup.ok).toBe(true);
+      expect(okDup.status).toBe("sent");
+      expect(okDup.items_sent).toBe(1);
+      expect(okDup.items[0]?.duplicate).toBe(true);
+      expect(sentMessages).toHaveLength(sendsBeforeOk + 1);
+      expect(observedClaimBodies.length).toBeGreaterThan(0);
+    } finally {
+      await gatewayApp.stop();
+      ackBackendServer.closeAllConnections();
+      await closeHttpServer(ackBackendServer);
     }
   });
 });

@@ -1234,3 +1234,882 @@ def test_artifact_fifo_rejected_promptly_without_blocking_in_isolated_subprocess
             proc.wait(timeout=5.0)
         shutil.rmtree(tmp_dir, ignore_errors=True)
     assert not tmp_dir.exists()
+
+
+# ---------------------------------------------------------------------------
+# Round 4: Descriptor-Based Snapshot/Outbox Creation & Metadata Precedence
+# ---------------------------------------------------------------------------
+
+
+def test_snapshot_and_outbox_writer_reject_temp_and_destination_symlinks_without_touching_external_files(
+    tmp_path: Path,
+) -> None:
+    """§1 & §2 (1, 2): Dangling or existing temp-file symlinks and destination symlinks are refused safely."""
+    from src.dalton.data_jobs.notification_payloads import _atomic_write_snapshot_file
+    from src.dalton.data_jobs.runner_wrapper import atomic_write_json, atomic_write_text
+    from src.dalton.data_jobs.safe_fs import SafeFsError, safe_atomic_write_bytes
+
+    path_map = build_path_map(
+        host_var_dir=tmp_path / "host_var",
+        backend_var_dir=tmp_path / "backend_var",
+    )
+    run_id = str(uuid4())
+    run_dir = path_map.backend_run_artifacts_dir(run_id)
+    images_dir = run_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    outside_dir = tmp_path / "outside_sensitive"
+    outside_dir.mkdir(parents=True, exist_ok=True)
+    dangling_outside = outside_dir / "must_never_be_created.bin"
+    existing_outside = outside_dir / "must_never_be_modified.bin"
+    existing_outside.write_bytes(b"ORIGINAL-EXTERNAL-CONTENT")
+
+    pid = os.getpid()
+
+    # 1a. Legacy predictable temp symlink names AND forced exact random-token collision on dangling symlink
+    os.symlink(dangling_outside, images_dir / f".chart.png.tmp.{pid}")
+    os.symlink(dangling_outside, run_dir / f".tmp.outbox.json.{pid}")
+    os.symlink(dangling_outside, images_dir / f".tmp.chart.png.{pid}.forceddangling")
+
+    with pytest.raises(SafeFsError) as exc_dangling_collision:
+        safe_atomic_write_bytes(
+            path_map.backend_data_root,
+            (".dalton-runs", run_id, "images", "chart.png"),
+            b"snapshot-bytes",
+            _token_supplier=lambda: "forceddangling",
+        )
+    assert exc_dangling_collision.value.code == "temp_create_collision"
+    assert not dangling_outside.exists()
+    assert not (images_dir / "chart.png").exists()
+
+    # Normal random token bypasses legacy `.chart.png.tmp.<pid>` and `.tmp.outbox.json.<pid>` symlinks safely
+    written_snap = _atomic_write_snapshot_file(
+        run_dir,
+        "images/chart.png",
+        b"clean-snapshot",
+        anchor_dir=path_map.backend_data_root,
+    )
+    assert written_snap.is_file() and not written_snap.is_symlink()
+    assert written_snap.read_bytes() == b"clean-snapshot"
+    assert not dangling_outside.exists()
+
+    atomic_write_json(
+        run_dir / "outbox.json",
+        {"ok": True, "label": "中文测试"},
+        anchor_dir=path_map.backend_data_root,
+    )
+    assert (run_dir / "outbox.json").is_file() and not (run_dir / "outbox.json").is_symlink()
+    assert not dangling_outside.exists()
+
+    # 1b. Forced temp collision against symlink pointing to an EXISTING external file
+    os.symlink(existing_outside, images_dir / f".tmp.other.png.{pid}.forcedexisting")
+    with pytest.raises(SafeFsError) as exc_existing_collision:
+        safe_atomic_write_bytes(
+            path_map.backend_data_root,
+            (".dalton-runs", run_id, "images", "other.png"),
+            b"overwrite-attempt",
+            _token_supplier=lambda: "forcedexisting",
+        )
+    assert exc_existing_collision.value.code == "temp_create_collision"
+    assert existing_outside.read_bytes() == b"ORIGINAL-EXTERNAL-CONTENT"
+    assert not (images_dir / "other.png").exists()
+
+    # 2a. Destination is a dangling symlink -> refused, external target never created, output stays untouched symlink
+    dest_dangling_snap = images_dir / "dest_dangling.png"
+    os.symlink(dangling_outside, dest_dangling_snap)
+    with pytest.raises(DataTaskNotificationPrepError) as exc_dest_dangling:
+        _atomic_write_snapshot_file(
+            run_dir,
+            "images/dest_dangling.png",
+            b"blocked",
+            anchor_dir=path_map.backend_data_root,
+        )
+    assert exc_dest_dangling.value.code == "symlink_rejected"
+    assert not dangling_outside.exists()
+    assert dest_dangling_snap.is_symlink()
+
+    # 2b. Destination is a symlink to an existing external file -> refused on both snapshot & outbox writers
+    dest_existing_snap = images_dir / "dest_existing.png"
+    os.symlink(existing_outside, dest_existing_snap)
+    with pytest.raises(DataTaskNotificationPrepError) as exc_dest_existing:
+        _atomic_write_snapshot_file(
+            run_dir,
+            "images/dest_existing.png",
+            b"blocked",
+            anchor_dir=path_map.backend_data_root,
+        )
+    assert exc_dest_existing.value.code == "symlink_rejected"
+    assert existing_outside.read_bytes() == b"ORIGINAL-EXTERNAL-CONTENT"
+
+    dest_outbox_symlink = run_dir / "symlink_outbox.json"
+    os.symlink(existing_outside, dest_outbox_symlink)
+    with pytest.raises(SafeFsError) as exc_outbox_dest:
+        atomic_write_json(
+            dest_outbox_symlink,
+            {"blocked": True},
+            anchor_dir=path_map.backend_data_root,
+        )
+    assert exc_outbox_dest.value.code == "symlink_rejected"
+    with pytest.raises(SafeFsError):
+        atomic_write_text(
+            dest_outbox_symlink,
+            "blocked",
+            anchor_dir=path_map.backend_data_root,
+        )
+    assert existing_outside.read_bytes() == b"ORIGINAL-EXTERNAL-CONTENT"
+
+
+def test_snapshot_writer_rejects_run_root_symlinks_and_deterministic_directory_replacement(
+    tmp_path: Path,
+) -> None:
+    """§1 & §2 (3): Symlink components and mid-operation directory swaps cannot redirect writes outside."""
+    from src.dalton.data_jobs.notification_payloads import _atomic_write_snapshot_file
+    from src.dalton.data_jobs.safe_fs import SafeFsError, safe_atomic_write_bytes
+
+    outside_dir = tmp_path / "outside_redirect"
+    outside_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Symlink at `.dalton-runs`, `<run_id>`, or `images` is rejected; configured storage-root symlink is allowed
+    real_storage = tmp_path / "real_var_storage"
+    real_storage.mkdir(parents=True, exist_ok=True)
+    configured_root_symlink = tmp_path / "mac_like_var_link"
+    os.symlink(real_storage, configured_root_symlink)
+
+    ok_run_id = str(uuid4())
+    ok_file = _atomic_write_snapshot_file(
+        configured_root_symlink / ".dalton-runs" / ok_run_id,
+        "images/0_cn_latest.png",
+        _make_synthetic_png(b"MAC-ROOT"),
+        anchor_dir=configured_root_symlink,
+    )
+    assert ok_file.is_file() and not ok_file.is_symlink()
+
+    symlink_run_id = str(uuid4())
+    os.symlink(outside_dir, real_storage / ".dalton-runs" / symlink_run_id)
+    with pytest.raises(DataTaskNotificationPrepError) as exc_run_sym:
+        _atomic_write_snapshot_file(
+            configured_root_symlink / ".dalton-runs" / symlink_run_id,
+            "images/0_cn_latest.png",
+            b"must-not-write",
+            anchor_dir=configured_root_symlink,
+        )
+    assert exc_run_sym.value.code == "symlink_rejected"
+    assert list(outside_dir.iterdir()) == []
+
+    # 2. Deterministic directory swap AFTER directory verification, BEFORE temp creation
+    swap1_run = real_storage / ".dalton-runs" / str(uuid4())
+    (swap1_run / "images").mkdir(parents=True, exist_ok=True)
+
+    def _swap_after_verify() -> None:
+        moved = swap1_run / "images_moved_1"
+        os.rename(swap1_run / "images", moved)
+        os.symlink(outside_dir, swap1_run / "images")
+
+    with pytest.raises(SafeFsError) as exc_swap1:
+        safe_atomic_write_bytes(
+            configured_root_symlink,
+            (".dalton-runs", swap1_run.name, "images", "chart.png"),
+            b"swap-before-open",
+            _on_dir_verified=_swap_after_verify,
+        )
+    assert exc_swap1.value.code in ("directory_changed", "symlink_rejected")
+    assert list(outside_dir.iterdir()) == []
+    assert list((swap1_run / "images_moved_1").iterdir()) == []
+
+    # 3. Deterministic directory swap AFTER temp write/fsync, BEFORE atomic replace
+    swap2_run = real_storage / ".dalton-runs" / str(uuid4())
+    (swap2_run / "images").mkdir(parents=True, exist_ok=True)
+
+    def _swap_before_publish() -> None:
+        moved = swap2_run / "images_moved_2"
+        os.rename(swap2_run / "images", moved)
+        os.symlink(outside_dir, swap2_run / "images")
+
+    with pytest.raises(SafeFsError) as exc_swap2:
+        safe_atomic_write_bytes(
+            configured_root_symlink,
+            (".dalton-runs", swap2_run.name, "images", "chart.png"),
+            b"swap-before-replace",
+            _on_before_publish=_swap_before_publish,
+        )
+    assert exc_swap2.value.code in ("directory_changed", "symlink_rejected")
+    assert list(outside_dir.iterdir()) == []
+    # Temp file created inside the verified descriptor was cleaned up via `dir_fd`
+    assert list((swap2_run / "images_moved_2").iterdir()) == []
+
+
+def test_concurrent_snapshot_writes_and_failure_cleanup_close_descriptors_and_preserve_existing_files(
+    tmp_path: Path,
+) -> None:
+    """§2 (4, 5, 6): Concurrent writers isolate temp files; failures close fds and preserve existing files."""
+    from concurrent.futures import ThreadPoolExecutor
+    import errno
+    import threading
+
+    from src.dalton.data_jobs.safe_fs import safe_atomic_write_bytes
+
+    data_root = tmp_path / "data_root"
+    run_id = str(uuid4())
+    rel_parts = (".dalton-runs", run_id, "images", "concurrent.png")
+    images_dir = data_root / ".dalton-runs" / run_id / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Concurrent invocations targeting the same basename use distinct `.tmp.*` files
+    payload_a = _make_synthetic_png(b"CONCURRENT-A-" * 64)
+    payload_b = _make_synthetic_png(b"CONCURRENT-B-" * 64)
+    barrier = threading.Barrier(2, timeout=3.0)
+    observed_temp_snapshots: list[list[str]] = []
+    lock = threading.Lock()
+
+    def _sync_before_publish() -> None:
+        with lock:
+            observed_temp_snapshots.append(
+                sorted(p.name for p in images_dir.iterdir() if p.name.startswith(".tmp."))
+            )
+        barrier.wait()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_a = pool.submit(
+            safe_atomic_write_bytes,
+            data_root,
+            rel_parts,
+            payload_a,
+            _on_before_publish=_sync_before_publish,
+        )
+        fut_b = pool.submit(
+            safe_atomic_write_bytes,
+            data_root,
+            rel_parts,
+            payload_b,
+            _on_before_publish=_sync_before_publish,
+        )
+        fut_a.result(timeout=5.0)
+        fut_b.result(timeout=5.0)
+
+    assert any(len(names) == 2 for names in observed_temp_snapshots)
+    final_file = images_dir / "concurrent.png"
+    assert final_file.is_file() and not final_file.is_symlink()
+    assert final_file.read_bytes() in (payload_a, payload_b)
+    assert [p.name for p in images_dir.iterdir() if p.name.startswith(".tmp.")] == []
+
+    # 2. Partial-write chunk loop succeeds cleanly when `os.write` writes short chunks
+    chunked_payload = b"0123456789abcdef" * 128
+
+    def _short_writer(fd: int, view: memoryview) -> int:
+        return os.write(fd, view[:17])
+
+    safe_atomic_write_bytes(
+        data_root,
+        (".dalton-runs", run_id, "images", "chunked.png"),
+        chunked_payload,
+        _write_chunk_fn=_short_writer,
+    )
+    assert (images_dir / "chunked.png").read_bytes() == chunked_payload
+
+    # 3. Failure during writing closes temp fd, removes only its own temp file, and preserves prior output + unrelated temp
+    unrelated_entry = images_dir / ".tmp.chunked.png.other_worker"
+    unrelated_entry.write_bytes(b"KEEP-OTHER-WORKER-TEMP")
+    captured_write_fds: list[int] = []
+
+    def _failing_writer(fd: int, view: memoryview) -> int:
+        if not captured_write_fds:
+            captured_write_fds.append(fd)
+            return os.write(fd, view[:8])
+        raise OSError(errno.ENOSPC, "synthetic disk full")
+
+    with pytest.raises(OSError):
+        safe_atomic_write_bytes(
+            data_root,
+            (".dalton-runs", run_id, "images", "chunked.png"),
+            b"partial-should-never-publish" * 10,
+            _write_chunk_fn=_failing_writer,
+        )
+
+    assert len(captured_write_fds) == 1
+    with pytest.raises(OSError) as exc_closed_fd:
+        os.fstat(captured_write_fds[0])
+    assert exc_closed_fd.value.errno == errno.EBADF
+    assert (images_dir / "chunked.png").read_bytes() == chunked_payload
+    assert unrelated_entry.read_bytes() == b"KEEP-OTHER-WORKER-TEMP"
+    assert [
+        p.name
+        for p in images_dir.iterdir()
+        if p.name.startswith(".tmp.") and p.name != unrelated_entry.name
+    ] == []
+
+    # 4. Failure during publication leaves existing valid output and unrelated entry intact
+    with pytest.raises(RuntimeError, match="abort-before-replace"):
+        safe_atomic_write_bytes(
+            data_root,
+            (".dalton-runs", run_id, "images", "chunked.png"),
+            b"aborted-publish",
+            _on_before_publish=lambda: (_ for _ in ()).throw(RuntimeError("abort-before-replace")),
+        )
+    assert (images_dir / "chunked.png").read_bytes() == chunked_payload
+    assert unrelated_entry.read_bytes() == b"KEEP-OTHER-WORKER-TEMP"
+    assert [
+        p.name
+        for p in images_dir.iterdir()
+        if p.name.startswith(".tmp.") and p.name != unrelated_entry.name
+    ] == []
+
+
+@pytest.mark.asyncio
+async def test_t27_scheduler_execution_publishes_safe_outbox_and_preserves_four_market_digests(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """§1 & §2 (6): T27 preparation + scheduler `outbox.json` publication preserve CN/KR/JP/TW order and digests."""
+    from datetime import datetime, timezone
+
+    from src.dalton.data_jobs import scheduler as sched_mod
+    from src.dalton.data_jobs.container_runner import (
+        ContainerInspectionOutcome,
+        DataTaskDockerClient,
+    )
+
+    path_map = build_path_map(
+        host_var_dir=tmp_path / "host_var",
+        backend_var_dir=tmp_path / "backend_var",
+    )
+    charts_dir = path_map.backend_data_root / "temp" / "asia-leverage-crossview" / "charts"
+    charts_dir.mkdir(parents=True, exist_ok=True)
+    expected_market_bytes: list[tuple[str, bytes, str]] = []
+    for idx, code in enumerate(("cn", "kr", "jp", "tw")):
+        raw = _make_synthetic_png(f"MKT-{code.upper()}".encode("ascii"))
+        (charts_dir / f"{code}_latest.png").write_bytes(raw)
+        expected_market_bytes.append(
+            (f"images/t27_{idx}_{code}_latest.png", raw, hashlib.sha256(raw).hexdigest())
+        )
+
+    run_id = str(uuid4())
+    run_dir = path_map.backend_run_artifacts_dir(run_id)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    outside_target = tmp_path / "outside_outbox_target.json"
+    # Plant legacy `.tmp.outbox.json.<pid>` symlink to verify scheduler T27 write never follows it
+    os.symlink(outside_target, run_dir / f".tmp.outbox.json.{os.getpid()}")
+
+    markdown = _make_synthetic_t27_markdown()
+    fake_outcome = ContainerInspectionOutcome(
+        container_id="cid-synth-t27",
+        exit_code=0,
+        oom_killed=False,
+        running=False,
+        log_tail=markdown,
+    )
+
+    finalized_calls: list[dict[str, Any]] = []
+
+    async def _fake_finalize(conn: Any, **kwargs: Any) -> tuple[bool, int | None]:
+        finalized_calls.append(kwargs)
+        return True, 0
+
+    monkeypatch.setattr(
+        sched_mod,
+        "start_claimed_container_run",
+        create_autospec(sched_mod.start_claimed_container_run, return_value="cid-synth-t27"),
+    )
+    monkeypatch.setattr(
+        sched_mod,
+        "monitor_container_until_exit",
+        create_autospec(sched_mod.monitor_container_until_exit, return_value=(fake_outcome, False)),
+    )
+    monkeypatch.setattr(
+        sched_mod,
+        "finalize_task_run",
+        create_autospec(sched_mod.finalize_task_run, side_effect=_fake_finalize),
+    )
+
+    slot = datetime(2026, 11, 9, 10, 0, tzinfo=timezone.utc)
+    claimed_run = sched_mod.ClaimedTaskRun(
+        run_id=run_id,
+        job_key=T27_JOB_KEY,
+        generation=1,
+        runner="container",
+        command_argv=["python3", "t27.py"],
+        workdir="/workspace",
+        timeout_seconds=60,
+        no_output_timeout_seconds=60,
+        required_secrets=[],
+        cos_mode="skip",
+        notify_enabled=True,
+        scheduled_slot_utc=slot,
+        deadline_utc=slot,
+    )
+
+    await sched_mod.execute_claimed_container_run(
+        object(),
+        lock_conn=object(),
+        docker_client=create_autospec(DataTaskDockerClient, instance=True),
+        claimed=claimed_run,
+        path_map=path_map,
+    )
+
+    assert not outside_target.exists()
+    outbox_file = run_dir / "outbox.json"
+    assert outbox_file.is_file() and not outbox_file.is_symlink()
+    persisted_outbox = finalized_calls[0]["outbox_payload"]
+    assert json.loads(outbox_file.read_text(encoding="utf-8")) == persisted_outbox
+
+    plan = build_data_task_delivery_plan(
+        run_id=run_id,
+        job_key=T27_JOB_KEY,
+        raw_outbox=persisted_outbox,
+        run_artifacts_dir=run_dir,
+    )
+    assert len(plan.items) == 1
+    card_images = plan.items[0].images
+    assert [plan.artifacts_by_id[img.artifact_id].rel_path for img in card_images] == [
+        m[0] for m in expected_market_bytes
+    ]
+    assert [img.size_bytes for img in card_images] == [len(m[1]) for m in expected_market_bytes]
+    assert [img.sha256 for img in card_images] == [m[2] for m in expected_market_bytes]
+
+
+@pytest.mark.asyncio
+async def test_bounded_run_metadata_and_database_precedence_across_scheduler_and_api_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """§3: Valid DB outbox takes strict precedence with zero disk metadata reads; fallback is bounded & safe."""
+    from contextlib import asynccontextmanager
+    from datetime import datetime, timezone
+    import shutil
+    import subprocess
+    import tempfile
+
+    from src.dalton.data_jobs import scheduler as sched_mod
+    from src.dalton.data_jobs.container_runner import (
+        ContainerInspectionOutcome,
+        DataTaskDockerClient,
+        read_run_artifacts,
+    )
+    from src.dalton.data_jobs.safe_fs import MAX_RUN_METADATA_BYTES
+
+    path_map = build_path_map(
+        host_var_dir=tmp_path / "host_var",
+        backend_var_dir=tmp_path / "backend_var",
+    )
+    outside_secret = tmp_path / "outside_secret_outbox.json"
+    outside_secret.write_text('{"feishu_cards": [{"card": {"schema": "2.0"}}]}', encoding="utf-8")
+
+    # -------------------------------------------------------------------------
+    # 1. DB outbox precedence despite hostile symlink / oversized disk `outbox.json` & `frozen_manifest.json`
+    # -------------------------------------------------------------------------
+    db_run_id = str(uuid4())
+    db_run_dir = path_map.backend_run_artifacts_dir(db_run_id)
+    (db_run_dir / "images").mkdir(parents=True, exist_ok=True)
+    chart_bytes = _make_synthetic_png(b"DB-PRECEDENCE")
+    (db_run_dir / "images" / "c0.png").write_bytes(chart_bytes)
+    # Plant hostile symlink at `outbox.json` AND oversized file at `frozen_manifest.json`
+    os.symlink(outside_secret, db_run_dir / "outbox.json")
+    (db_run_dir / "frozen_manifest.json").write_bytes(b"{" + b"x" * (MAX_RUN_METADATA_BYTES + 128))
+
+    valid_db_outbox = {
+        "feishu_cards": [
+            {
+                "card": {
+                    "schema": "2.0",
+                    "body": {"elements": [{"tag": "__img__", "path": "p0"}]},
+                },
+                "images": [{"placeholder": "p0", "path": "images/c0.png"}],
+            }
+        ]
+    }
+
+    loaded_from_db = dtn_db._load_persisted_run_raw_outbox(
+        db_run_id,
+        "softbank-nav-monitor",
+        db_outbox_payload=valid_db_outbox,
+        log_tail=None,
+        path_map=path_map,
+    )
+    assert loaded_from_db == valid_db_outbox
+
+    _, _, resolved_sched_payload = sched_mod._resolve_run_notify_payload(
+        db_run_id,
+        "softbank-nav-monitor",
+        db_outbox_payload=valid_db_outbox,
+        log_tail=None,
+        path_map=path_map,
+    )
+    assert resolved_sched_payload["expected_item_count"] == 1
+    assert "_metadata_error_code" not in resolved_sched_payload
+
+    # -------------------------------------------------------------------------
+    # 2. Absent DB outbox fallback: valid disk `outbox.json` works WITHOUT opening `frozen_manifest.json`;
+    #    missing `outbox.json` preserves normal `None` / stdout fallback; hostile files fail with classified codes
+    # -------------------------------------------------------------------------
+    fallback_run_id = str(uuid4())
+    fb_dir = path_map.backend_run_artifacts_dir(fallback_run_id)
+    fb_dir.mkdir(parents=True, exist_ok=True)
+    (fb_dir / "outbox.json").write_text(
+        json.dumps({"items": [{"text": "Fallback item 0"}]}),
+        encoding="utf-8",
+    )
+    # Poison `frozen_manifest.json` as a symlink to outside file -> notification path must NEVER open it!
+    os.symlink(outside_secret, fb_dir / "frozen_manifest.json")
+
+    assert dtn_db._load_persisted_run_raw_outbox(
+        fallback_run_id,
+        T26_JOB_KEY,
+        db_outbox_payload=None,
+        log_tail=None,
+        path_map=path_map,
+    ) == {"items": [{"text": "Fallback item 0"}]}
+
+    _, _, fb_sched = sched_mod._resolve_run_notify_payload(
+        fallback_run_id,
+        T26_JOB_KEY,
+        db_outbox_payload=None,
+        log_tail=None,
+        path_map=path_map,
+    )
+    assert fb_sched["expected_item_count"] == 1
+    assert "_metadata_error_code" not in fb_sched
+
+    # Execution completion DOES read `frozen_manifest.json` with strict=True and rejects the symlink!
+    with pytest.raises(Exception) as exc_manifest_sym:
+        read_run_artifacts(fallback_run_id, path_map=path_map, strict=True)
+    assert getattr(exc_manifest_sym.value, "code", None) == "symlink_rejected"
+
+    # Missing files return normal `(None, None)` and preserve stdout fallback
+    missing_run_id = str(uuid4())
+    assert read_run_artifacts(missing_run_id, path_map=path_map, strict=True) == (None, None)
+    _, _, t32_stdout_payload = sched_mod._resolve_run_notify_payload(
+        missing_run_id,
+        "quantum-ew-monitor",
+        db_outbox_payload=None,
+        log_tail="ALERT_FOUND: synthetic quantum signal",
+        path_map=path_map,
+    )
+    assert t32_stdout_payload["expected_item_count"] == 1
+    assert "_outbox_missing" not in t32_stdout_payload
+
+    # Symlink `outbox.json` leaf (reproducing `.agy/outbox_symlink_diagnostic.json`) & oversized metadata (> 1 MiB)
+    sym_run_id = str(uuid4())
+    sym_dir = path_map.backend_run_artifacts_dir(sym_run_id)
+    sym_dir.mkdir(parents=True, exist_ok=True)
+    os.symlink(outside_secret, sym_dir / "outbox.json")
+
+    with pytest.raises(DataTaskArtifactError) as exc_api_sym:
+        dtn_db._load_persisted_run_raw_outbox(
+            sym_run_id,
+            "softbank-nav-monitor",
+            db_outbox_payload=None,
+            log_tail=None,
+            path_map=path_map,
+        )
+    assert exc_api_sym.value.code == "symlink_rejected"
+    _, _, sym_sched = sched_mod._resolve_run_notify_payload(
+        sym_run_id,
+        "softbank-nav-monitor",
+        db_outbox_payload=None,
+        log_tail=None,
+        path_map=path_map,
+    )
+    assert sym_sched.get("_metadata_error_code") == "symlink_rejected"
+
+    oversized_run_id = str(uuid4())
+    ov_dir = path_map.backend_run_artifacts_dir(oversized_run_id)
+    ov_dir.mkdir(parents=True, exist_ok=True)
+    (ov_dir / "outbox.json").write_bytes(
+        b'{"pad":"' + (b"a" * MAX_RUN_METADATA_BYTES) + b'"}'
+    )
+    with pytest.raises(DataTaskArtifactError) as exc_ov:
+        dtn_db._load_persisted_run_raw_outbox(
+            oversized_run_id,
+            "softbank-nav-monitor",
+            db_outbox_payload=None,
+            log_tail=None,
+            path_map=path_map,
+        )
+    assert exc_ov.value.code == "metadata_too_large"
+    _, _, ov_sched = sched_mod._resolve_run_notify_payload(
+        oversized_run_id,
+        "softbank-nav-monitor",
+        db_outbox_payload=None,
+        log_tail=None,
+        path_map=path_map,
+    )
+    assert ov_sched.get("_metadata_error_code") == "metadata_too_large"
+
+    # Verify `execute_claimed_container_run` fails the run cleanly on hostile disk metadata
+    recorded_finalizations: list[dict[str, Any]] = []
+
+    async def _capture_finalize(conn: Any, **kwargs: Any) -> tuple[bool, int | None]:
+        recorded_finalizations.append(kwargs)
+        return True, 0
+
+    monkeypatch.setattr(
+        sched_mod,
+        "start_claimed_container_run",
+        create_autospec(sched_mod.start_claimed_container_run, return_value="cid-synth-hostile"),
+    )
+    monkeypatch.setattr(
+        sched_mod,
+        "monitor_container_until_exit",
+        create_autospec(
+            sched_mod.monitor_container_until_exit,
+            return_value=(
+                ContainerInspectionOutcome(
+                    container_id="cid-synth-hostile",
+                    exit_code=0,
+                    oom_killed=False,
+                    running=False,
+                    log_tail="",
+                ),
+                False,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        sched_mod,
+        "finalize_task_run",
+        create_autospec(sched_mod.finalize_task_run, side_effect=_capture_finalize),
+    )
+    slot = datetime(2026, 11, 9, 12, 0, tzinfo=timezone.utc)
+    await sched_mod.execute_claimed_container_run(
+        object(),
+        lock_conn=object(),
+        docker_client=create_autospec(DataTaskDockerClient, instance=True),
+        claimed=sched_mod.ClaimedTaskRun(
+            run_id=sym_run_id,
+            job_key="softbank-nav-monitor",
+            generation=1,
+            runner="container",
+            command_argv=["python3", "sb.py"],
+            workdir="/workspace",
+            timeout_seconds=60,
+            no_output_timeout_seconds=60,
+            required_secrets=[],
+            cos_mode="skip",
+            notify_enabled=True,
+            scheduled_slot_utc=slot,
+            deadline_utc=slot,
+        ),
+        path_map=path_map,
+    )
+    eval_res = recorded_finalizations[0]["evaluation"]
+    assert eval_res.status == "failed"
+    assert eval_res.failure_reason == "invalid_run_metadata:symlink_rejected"
+
+    # Verify FastAPI `/plan` endpoint converts hostile metadata when DB outbox is NULL into clean `authorized: False` (not 500!)
+    @asynccontextmanager
+    async def _fake_conn(_c: Any = None):
+        class _Cur:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_a):
+                return None
+
+            async def execute(self, sql: str, _params: Any = None) -> None:
+                self._sql = sql
+
+            async def fetchone(self) -> dict[str, Any] | None:
+                if "FROM dalton_data_task_runs" in self._sql:
+                    return {
+                        "run_id": sym_run_id,
+                        "job_key": "softbank-nav-monitor",
+                        "status": "succeeded",
+                        "notify_status": "pending_dispatch",
+                        "outbox_payload": None,
+                        "log_tail": None,
+                        "def_job_key": "softbank-nav-monitor",
+                        "task_enabled": True,
+                        "task_notify_enabled": True,
+                    }
+                if "FROM dalton_channel_identities" in self._sql:
+                    return {"platform_user_id": "ou_synth_pm"}
+                return None
+
+        class _Conn:
+            @asynccontextmanager
+            async def transaction(self):
+                yield
+
+            def cursor(self, **_kw):
+                return _Cur()
+
+        yield _Conn()
+
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", SERVICE_TOKEN)
+    monkeypatch.setenv("DALTON_PM_USER_IDS", "pm_meta_owner")
+    monkeypatch.setattr(
+        dtn_db,
+        "get_db_connection",
+        create_autospec(dtn_db.get_db_connection, side_effect=_fake_conn),
+    )
+    monkeypatch.setattr(
+        dtn_db,
+        "build_path_map",
+        create_autospec(dtn_db.build_path_map, return_value=path_map),
+    )
+    monkeypatch.setattr(
+        dtn_db,
+        "load_owner_notify_preferences",
+        create_autospec(
+            dtn_db.load_owner_notify_preferences,
+            return_value={
+                "dalton_notify_enabled": True,
+                "dalton_notify_targets": ["feishu:@me"],
+                "dalton_notify_routes": {"data:softbank-nav-monitor": ["feishu:@me"]},
+            },
+        ),
+    )
+    app = FastAPI()
+    app.include_router(dalton_router)
+    with TestClient(app) as tc:
+        r_plan = tc.post(
+            "/api/v1/dalton/channels/internal/data-task-notifications/plan",
+            headers={"X-Service-Token": SERVICE_TOKEN},
+            json={"run_id": sym_run_id, "target": "feishu:@me"},
+        )
+        assert r_plan.status_code == 200
+        assert r_plan.json()["authorized"] is False
+        assert r_plan.json()["code"] == "symlink_rejected"
+
+    # -------------------------------------------------------------------------
+    # 3. Isolated bounded subprocess check for writerless FIFO `outbox.json` & `frozen_manifest.json`
+    # -------------------------------------------------------------------------
+    fifo_tmp = Path(tempfile.mkdtemp(prefix="dalton-meta-fifo-"))
+    proc: subprocess.Popen[str] | None = None
+    try:
+        project_root = Path(__file__).resolve().parents[3]
+        child_code = "\n".join(
+            [
+                "import json, os, uuid",
+                "from pathlib import Path",
+                "from src.dalton.data_jobs.container_runner import build_path_map, read_run_artifacts",
+                "from src.dalton.data_jobs.notification_payloads import DataTaskArtifactError",
+                "from src.dalton.data_jobs import scheduler as sched_mod",
+                "from src.dalton.database import data_task_notifications as dtn_db",
+                f"base = Path({str(fifo_tmp)!r})",
+                "pm = build_path_map(host_var_dir=base / 'h', backend_var_dir=base / 'b')",
+                # Run A: valid `outbox.json`, writerless FIFO at `frozen_manifest.json` -> notification must NOT open manifest; strict completion rejects FIFO promptly
+                "rid_a = str(uuid.uuid4())",
+                "dir_a = pm.backend_run_artifacts_dir(rid_a)",
+                "dir_a.mkdir(parents=True, exist_ok=True)",
+                "(dir_a / 'outbox.json').write_text(json.dumps({'items': [{'text': 'ok'}]}), encoding='utf-8')",
+                "os.mkfifo(dir_a / 'frozen_manifest.json')",
+                "a_api = dtn_db._load_persisted_run_raw_outbox(rid_a, 'us-topbottom-dm-v23', db_outbox_payload=None, log_tail=None, path_map=pm)",
+                "_, _, a_sched = sched_mod._resolve_run_notify_payload(rid_a, 'us-topbottom-dm-v23', db_outbox_payload=None, log_tail=None, path_map=pm)",
+                "manifest_fifo_code = None",
+                "try:",
+                "    read_run_artifacts(rid_a, path_map=pm, strict=True)",
+                "except Exception as exc:",
+                "    manifest_fifo_code = getattr(exc, 'code', None)",
+                # Run B: writerless FIFO at `outbox.json` -> DB precedence ignores it; absent-DB rejects promptly without blocking
+                "rid_b = str(uuid.uuid4())",
+                "dir_b = pm.backend_run_artifacts_dir(rid_b)",
+                "dir_b.mkdir(parents=True, exist_ok=True)",
+                "os.mkfifo(dir_b / 'outbox.json')",
+                "b_db_prec = dtn_db._load_persisted_run_raw_outbox(rid_b, 'us-topbottom-dm-v23', db_outbox_payload={'items': [{'text': 'from-db'}]}, log_tail=None, path_map=pm)",
+                "outbox_fifo_api = None",
+                "try:",
+                "    dtn_db._load_persisted_run_raw_outbox(rid_b, 'us-topbottom-dm-v23', db_outbox_payload=None, log_tail=None, path_map=pm)",
+                "except DataTaskArtifactError as exc:",
+                "    outbox_fifo_api = exc.code",
+                "_, _, outbox_fifo_sched = sched_mod._resolve_run_notify_payload(rid_b, 'us-topbottom-dm-v23', db_outbox_payload=None, log_tail=None, path_map=pm)",
+                "print(json.dumps({",
+                "    'a_api_ok': a_api == {'items': [{'text': 'ok'}]},",
+                "    'a_sched_count': a_sched.get('expected_item_count'),",
+                "    'manifest_fifo_code': manifest_fifo_code,",
+                "    'b_db_prec_ok': b_db_prec == {'items': [{'text': 'from-db'}]},",
+                "    'outbox_fifo_api': outbox_fifo_api,",
+                "    'outbox_fifo_sched_err': outbox_fifo_sched.get('_metadata_error_code'),",
+                "}), flush=True)",
+            ]
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", child_code],
+            cwd=project_root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            stdout_text, stderr_text = proc.communicate(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate(timeout=5.0)
+            pytest.fail(
+                "Metadata FIFO open blocked in isolated child subprocess beyond 3.0s hard timeout"
+            )
+        assert proc.returncode == 0, f"Child subprocess failed: {stderr_text}"
+        parsed_res = json.loads(stdout_text.strip().splitlines()[-1])
+        assert parsed_res == {
+            "a_api_ok": True,
+            "a_sched_count": 1,
+            "manifest_fifo_code": "non_regular_file",
+            "b_db_prec_ok": True,
+            "outbox_fifo_api": "non_regular_file",
+            "outbox_fifo_sched_err": "non_regular_file",
+        }
+    finally:
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5.0)
+        shutil.rmtree(fifo_tmp, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_uncertain_data_task_deliveries_expected_count_and_db_read_failure_safety(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """§4 (unit): Frozen payload item-count derivation is strict and DB read errors leave uncertain state intact."""
+    from contextlib import asynccontextmanager
+
+    assert dtn_db._derive_expected_item_count_from_persisted_payload(
+        {"expected_item_count": 2, "text": "summary"}
+    ) == 2
+    assert dtn_db._derive_expected_item_count_from_persisted_payload(
+        {
+            "feishu_cards": [
+                {"card": {"schema": "2.0"}},
+                {"card": {"schema": "2.0"}},
+            ]
+        }
+    ) == 2
+    assert dtn_db._derive_expected_item_count_from_persisted_payload(
+        {"items": [{"index": 0, "text": "a"}, {"index": 1, "text": "b"}]}
+    ) == 2
+    # Non-contiguous item indices or empty payload -> refused (`None`)
+    assert dtn_db._derive_expected_item_count_from_persisted_payload(
+        {"items": [{"index": 0, "text": "a"}, {"index": 2, "text": "b"}]}
+    ) is None
+    assert dtn_db._derive_expected_item_count_from_persisted_payload({}) is None
+
+    # Database read error inside `reconcile_uncertain_data_task_deliveries` leaves state intact and returns 0
+    executed_statements: list[str] = []
+
+    @asynccontextmanager
+    async def _broken_read_conn(_c: Any = None):
+        class _Cur:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_a):
+                return None
+
+            async def execute(self, sql: str, _params: Any = None) -> None:
+                executed_statements.append(sql)
+                raise RuntimeError("simulated transient PostgreSQL read error")
+
+        class _Conn:
+            def cursor(self, **_kw):
+                return _Cur()
+
+        yield _Conn()
+
+    monkeypatch.setattr(
+        dtn_db,
+        "get_db_connection",
+        create_autospec(dtn_db.get_db_connection, side_effect=_broken_read_conn),
+    )
+
+    reconciled_count = await dtn_db.reconcile_uncertain_data_task_deliveries(limit=5)
+    assert reconciled_count == 0
+    assert len(executed_statements) == 1
+    assert "UPDATE " not in executed_statements[0]

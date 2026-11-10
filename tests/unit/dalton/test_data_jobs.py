@@ -8110,3 +8110,80 @@ def test_sentiment_dashboard_cos_upload_skip_never_reads_credentials(tmp_path, m
         captured = capsys.readouterr()
         assert json.loads(captured.out if expected == 0 else captured.err)["ok"] is (expected == 0)
         assert credential_reads == []
+
+
+@pytest.mark.asyncio
+async def test_runner_wrapper_safe_atomic_writes_preserve_json_format_and_reject_symlinks(
+    tmp_path: Path,
+) -> None:
+    """Runner `atomic_write_json`, `atomic_write_text`, and `persist_redacted_outbox` reject symlinks and preserve format."""
+    from src.dalton.data_jobs.runner_wrapper import (
+        SecretRedactor,
+        atomic_write_json,
+        atomic_write_text,
+        persist_redacted_outbox,
+        run_wrapped_command,
+    )
+    from src.dalton.data_jobs.safe_fs import SafeFsError
+
+    data_root = tmp_path / "data_root"
+    artifacts_dir = data_root / ".dalton-runs" / "run-1"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir(parents=True, exist_ok=True)
+    outside_file = outside_dir / "external.json"
+    outside_file.write_text('{"untouched": true}\n', encoding="utf-8")
+
+    # 1. Exact JSON formatting (`ensure_ascii=False, indent=2`) and text formatting preserved
+    json_path = artifacts_dir / "outbox.json"
+    sample_obj = {"status": "ok", "title": "亚洲杠杆监控", "count": 4}
+    atomic_write_json(json_path, sample_obj, anchor_dir=data_root)
+    assert json_path.read_text(encoding="utf-8") == json.dumps(
+        sample_obj, ensure_ascii=False, indent=2
+    )
+
+    txt_path = artifacts_dir / "note.txt"
+    atomic_write_text(txt_path, "hello-world\n", anchor_dir=data_root)
+    assert txt_path.read_text(encoding="utf-8") == "hello-world\n"
+
+    # 2. Dangling `.tmp.outbox.json.<pid>` symlink in artifacts_dir cannot create external file
+    dangling_target = outside_dir / "never_created.json"
+    os.symlink(dangling_target, artifacts_dir / f".tmp.outbox.json.{os.getpid()}")
+    atomic_write_json(
+        json_path,
+        {"status": "updated", "secret": "s"},
+        anchor_dir=data_root,
+    )
+    assert not dangling_target.exists()
+    assert json.loads(json_path.read_text(encoding="utf-8"))["status"] == "updated"
+
+    # 3. Destination `outbox.json` symlink (both existing and dangling) is refused by `atomic_write_json` and `persist_redacted_outbox`
+    json_path.unlink()
+    os.symlink(outside_file, json_path)
+    with pytest.raises(SafeFsError) as exc_sym:
+        atomic_write_json(json_path, {"hijack": True}, anchor_dir=data_root)
+    assert exc_sym.value.code == "symlink_rejected"
+    assert outside_file.read_text(encoding="utf-8") == '{"untouched": true}\n'
+
+    redactor = SecretRedactor(["SECRET_VAL_123"])
+    with pytest.raises(SafeFsError):
+        persist_redacted_outbox(
+            outbox_path=json_path,
+            explicit_payload={"hijack": True},
+            redactor=redactor,
+        )
+    assert outside_file.read_text(encoding="utf-8") == '{"untouched": true}\n'
+
+    # 4. `run_wrapped_command` encountering a symlink `outbox.json` fails safely and does NOT unlink external target
+    wrap_res = await run_wrapped_command(
+        [sys.executable, "-c", "print('{\"feishu_message\": \"hi\"}')"],
+        run_id="run-1",
+        job_key="ah-premium-am",
+        workdir=str(data_root),
+        workspace_dir=str(data_root),
+        secrets_dir=str(tmp_path / "empty_secrets"),
+        outbox_tmp_dir=str(tmp_path / "tmp_outbox"),
+    )
+    assert wrap_res.exit_code == 1
+    assert outside_file.exists()
+    assert outside_file.read_text(encoding="utf-8") == '{"untouched": true}\n'

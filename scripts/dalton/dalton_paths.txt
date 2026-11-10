@@ -210,6 +210,7 @@ scripts/dalton/openclaw_overlays/skills/sentiment-dashboard/scripts/us_market_se
 scripts/dalton/openclaw_overlays/skills/sentiment-dashboard/scripts/sentiment_dashboard_cli.py
 tests/unit/dalton/test_sentiment_observation_dates.py
 # Dalton data-task report delivery via dedicated channel gateway:
+src/dalton/data_jobs/safe_fs.py
 src/dalton/data_jobs/notification_payloads.py
 src/dalton/notify/channel_transport.py
 src/dalton/database/data_task_notifications.py

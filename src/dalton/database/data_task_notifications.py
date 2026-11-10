@@ -7,10 +7,13 @@ as the single authoritative platform-send ledger without manufacturing conversat
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import asyncio
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 import json
+import logging
 import re
+import time
 from typing import Any
 
 from psycopg.rows import dict_row
@@ -18,7 +21,7 @@ from psycopg.rows import dict_row
 from src.dalton.data_jobs.container_runner import (
     DataTaskPathMap,
     build_path_map,
-    read_run_artifacts,
+    read_validated_run_json_metadata,
 )
 from src.dalton.data_jobs.notification_payloads import (
     DataTaskArtifactError,
@@ -34,13 +37,17 @@ from src.dalton.data_jobs.runner_wrapper import (
     extract_last_json_object,
     resolve_task_payload_source,
 )
+from src.dalton.data_jobs.safe_fs import SafeFsError
 from src.dalton.data_jobs.scheduler import build_data_task_notify_automation
 from src.dalton.database.channel_gateway import _verify_group_target_deliverable
 from src.dalton.llm.model_prefs import resolve_dalton_notify_targets
+from src.dalton.notify.channel_transport import UNCERTAIN_NOTIFY_ERROR_CODES
 from src.dalton.notify.dispatch import evaluate_user_notify_eligibility
 from src.dalton.settings import get_configured_pm_user_ids, get_dalton_settings
 from src.server.database.home_workspace import get_home_workspace_id
 from src.server.database.pool import get_db_connection
+
+logger = logging.getLogger(__name__)
 
 FEISHU_CHAT_ID_RE = re.compile(r"^oc_[A-Za-z0-9_-]{3,128}$")
 FEISHU_OPEN_ID_RE = re.compile(r"^ou_[A-Za-z0-9_-]{3,128}$")
@@ -133,10 +140,12 @@ def _load_persisted_run_raw_outbox(
     log_tail: Any,
     path_map: DataTaskPathMap,
 ) -> dict[str, Any] | None:
-    disk_outbox, _ = read_run_artifacts(run_id, path_map=path_map)
-    if isinstance(disk_outbox, Mapping) and disk_outbox:
-        return dict(disk_outbox)
+    """Resolve persisted run outbox with database precedence over bounded `outbox.json` fallback.
 
+    Valid database `outbox_payload` takes strict precedence and performs zero disk metadata reads.
+    When absent, reads only `outbox.json` (never `frozen_manifest.json`) via bounded, non-blocking,
+    symlink-rejecting descriptor checks.
+    """
     if isinstance(db_outbox_payload, Mapping) and db_outbox_payload:
         return dict(db_outbox_payload)
     if isinstance(db_outbox_payload, str) and db_outbox_payload.strip():
@@ -144,8 +153,27 @@ def _load_persisted_run_raw_outbox(
             parsed = json.loads(db_outbox_payload)
             if isinstance(parsed, Mapping) and parsed:
                 return dict(parsed)
+            if not isinstance(parsed, Mapping):
+                return {"text": db_outbox_payload.strip()}
         except ValueError:
             return {"text": db_outbox_payload.strip()}
+
+    try:
+        disk_outbox = read_validated_run_json_metadata(
+            run_id,
+            "outbox.json",
+            path_map=path_map,
+        )
+    except SafeFsError as exc:
+        raise DataTaskArtifactError(str(exc), code=exc.code) from exc
+
+    if isinstance(disk_outbox, Mapping):
+        if not disk_outbox:
+            raise DataTaskArtifactError(
+                "Run outbox.json object is empty",
+                code="invalid_metadata",
+            )
+        return dict(disk_outbox)
 
     cleaned_key = str(job_key or "").strip()
     if cleaned_key == "quantum-ew-monitor" or resolve_task_payload_source(cleaned_key) == "stdout_text":
@@ -413,14 +441,14 @@ async def _authorize_run_and_target_in_tx(
     resolved_plan: ResolvedDataTaskPlan | None = None
     if require_plan:
         paths = path_map or build_path_map()
-        raw_outbox = _load_persisted_run_raw_outbox(
-            norm_run_id,
-            job_key,
-            db_outbox_payload=run_row.get("outbox_payload"),
-            log_tail=run_row.get("log_tail"),
-            path_map=paths,
-        )
         try:
+            raw_outbox = _load_persisted_run_raw_outbox(
+                norm_run_id,
+                job_key,
+                db_outbox_payload=run_row.get("outbox_payload"),
+                log_tail=run_row.get("log_tail"),
+                path_map=paths,
+            )
             resolved_plan = build_data_task_delivery_plan(
                 run_id=norm_run_id,
                 job_key=job_key,
@@ -725,3 +753,369 @@ async def load_authorized_data_task_artifact(
         plan=plan,
         run_artifacts_dir=run_art_dir,
     )
+
+
+def _derive_expected_item_count_from_persisted_payload(
+    payload: Mapping[str, Any] | None,
+) -> int | None:
+    """Derive expected item count `N` (`0 .. N-1`) strictly from frozen outer `payload_json`."""
+    if not isinstance(payload, Mapping) or not payload:
+        return None
+
+    raw_cards = payload.get("feishu_cards")
+    if raw_cards is not None:
+        if not isinstance(raw_cards, list) or not raw_cards:
+            return None
+        if not all(
+            isinstance(entry, Mapping) and isinstance(entry.get("card"), Mapping)
+            for entry in raw_cards
+        ):
+            return None
+        return len(raw_cards)
+
+    raw_items = payload.get("items")
+    if raw_items is not None:
+        if not isinstance(raw_items, list) or not raw_items:
+            return None
+        seen_indices: set[int] = set()
+        for pos, raw_item in enumerate(raw_items):
+            if not isinstance(raw_item, Mapping):
+                return None
+            try:
+                idx_val = int(raw_item.get("index", pos))
+            except (TypeError, ValueError):
+                return None
+            if idx_val < 0 or idx_val in seen_indices:
+                return None
+            seen_indices.add(idx_val)
+        if sorted(seen_indices) != list(range(len(raw_items))):
+            return None
+        return len(raw_items)
+
+    explicit_count = payload.get("expected_item_count")
+    if isinstance(explicit_count, int) and not isinstance(explicit_count, bool) and explicit_count > 0:
+        return explicit_count
+
+    if isinstance(payload.get("card"), Mapping):
+        return 1
+
+    for text_key in ("feishu_message", "message", "text", "summary"):
+        val = payload.get(text_key)
+        if isinstance(val, str) and val.strip():
+            return 1
+
+    return None
+
+
+async def _resolve_reconcile_recipient_identity(
+    cur: Any,
+    *,
+    owner_user_id: str,
+    platform: str,
+    target_kind: str,
+    raw_ident: str,
+) -> tuple[str, str] | None:
+    """Resolve `(canonical_target_address, recipient_id)` for read-only ledger reconciliation."""
+    if target_kind == "group":
+        return f"{platform}:{raw_ident}", raw_ident
+
+    canonical_target_address = f"{platform}:@me"
+    if raw_ident != "@me":
+        await cur.execute(
+            """
+            SELECT user_id
+            FROM dalton_channel_identities
+            WHERE platform = %s AND platform_user_id = %s
+            """,
+            (platform, raw_ident),
+        )
+        other_row = await cur.fetchone()
+        if other_row and str(other_row.get("user_id") or "").strip() != owner_user_id:
+            return None
+
+    await cur.execute(
+        """
+        SELECT platform_user_id
+        FROM dalton_channel_identities
+        WHERE user_id = %s AND platform = %s
+        """,
+        (owner_user_id, platform),
+    )
+    id_row = await cur.fetchone()
+    bound_uid = str(id_row.get("platform_user_id") or "").strip() if id_row else ""
+
+    if platform == "discord":
+        if raw_ident == "@me":
+            if not bound_uid:
+                return None
+            return canonical_target_address, bound_uid
+        if bound_uid and bound_uid != raw_ident:
+            return None
+        return canonical_target_address, raw_ident
+
+    # Feishu DM
+    if raw_ident == "@me":
+        if not bound_uid:
+            return None
+        return canonical_target_address, bound_uid
+    if bound_uid:
+        return canonical_target_address, bound_uid
+    return canonical_target_address, raw_ident
+
+
+async def reconcile_uncertain_data_task_deliveries(
+    *,
+    limit: int = 5,
+    max_duration_s: float = 30.0,
+    started_at: float | None = None,
+    mark_delivery_fn: Callable[..., Awaitable[Any]] | None = None,
+    conn: Any = None,
+) -> int:
+    """Read-only reconciliation of uncertain `dalton_notify_deliveries` rows against `dalton_channel_deliveries`.
+
+    Remains active even after `attempt_count >= max_attempts`. Never authorizes a claim,
+    never invokes platform/gateway sends, never resets unknown items, and never increments
+    `attempt_count`. Marks the outer row `sent` iff all expected items for the exact original
+    `(run_id, owner_user_id, platform, canonical_target_address, recipient_id)` are durably `sent`.
+    """
+    eff_limit = max(1, int(limit or 5))
+    t0 = started_at if started_at is not None else time.monotonic()
+    uncertain_codes = sorted(UNCERTAIN_NOTIFY_ERROR_CODES)
+    rotation_seed = str(time.time_ns())
+    reconciled_count = 0
+
+    try:
+        async with get_db_connection(conn) as owned_conn:
+            async with owned_conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT d.execution_id, d.automation_id, d.user_id,
+                           d.channel, d.target, d.status, d.attempt_count,
+                           d.error_code, d.payload_json
+                    FROM dalton_notify_deliveries d
+                    WHERE d.status = 'pending'
+                      AND COALESCE(d.error_code, '') = ANY(%s)
+                      AND (
+                          d.automation_id LIKE 'data:%%'
+                          OR (d.payload_json ->> 'route_key') LIKE 'data:%%'
+                      )
+                    ORDER BY
+                        (
+                            EXISTS (
+                                SELECT 1
+                                FROM dalton_channel_deliveries cd
+                                WHERE cd.kind = 'data_task'
+                                  AND cd.run_id = d.execution_id
+                                  AND cd.user_id = d.user_id
+                                  AND cd.platform = d.channel
+                                  AND cd.status = 'sent'
+                            )
+                            AND NOT EXISTS (
+                                SELECT 1
+                                FROM dalton_channel_deliveries cd2
+                                WHERE cd2.kind = 'data_task'
+                                  AND cd2.run_id = d.execution_id
+                                  AND cd2.user_id = d.user_id
+                                  AND cd2.platform = d.channel
+                                  AND cd2.status <> 'sent'
+                            )
+                        ) DESC,
+                        md5(
+                            COALESCE(d.execution_id, '') || ':' ||
+                            COALESCE(d.channel, '') || ':' ||
+                            COALESCE(d.target, '') || ':' || %s
+                        ) ASC
+                    LIMIT %s
+                    """,
+                    (uncertain_codes, rotation_seed, eff_limit),
+                )
+                candidates = await cur.fetchall()
+
+        for row in candidates or []:
+            if time.monotonic() - t0 >= max_duration_s:
+                break
+
+            raw_exec_id = str(row.get("execution_id") or "").strip()
+            owner_user_id = str(row.get("user_id") or "").strip()
+            channel = str(row.get("channel") or "").strip().lower()
+            target = str(row.get("target") or "").strip()
+            payload = (
+                row.get("payload_json")
+                if isinstance(row.get("payload_json"), Mapping)
+                else None
+            )
+            if not (raw_exec_id and owner_user_id and channel and target):
+                continue
+
+            try:
+                norm_run_id = normalize_run_uuid(raw_exec_id)
+            except DataTaskArtifactError:
+                continue
+
+            parsed_target = _parse_requested_notify_target(target)
+            if parsed_target is None:
+                continue
+            platform, target_kind, raw_ident = parsed_target
+            if platform != channel:
+                continue
+
+            expected_count = _derive_expected_item_count_from_persisted_payload(payload)
+            if expected_count is None or expected_count <= 0:
+                continue
+
+            try:
+                async with get_db_connection(conn) as row_conn:
+                    async with row_conn.cursor(row_factory=dict_row) as cur:
+                        resolved_ident = await _resolve_reconcile_recipient_identity(
+                            cur,
+                            owner_user_id=owner_user_id,
+                            platform=platform,
+                            target_kind=target_kind,
+                            raw_ident=raw_ident,
+                        )
+                        if resolved_ident is None:
+                            continue
+                        canonical_target_address, recipient_id = resolved_ident
+                        expected_keys = [
+                            build_data_task_item_delivery_key(
+                                run_id=norm_run_id,
+                                platform=platform,
+                                recipient_id=recipient_id,
+                                item_index=idx,
+                            )
+                            for idx in range(expected_count)
+                        ]
+
+                        await cur.execute(
+                            """
+                            SELECT delivery_key, status
+                            FROM dalton_channel_deliveries
+                            WHERE delivery_key = ANY(%s)
+                              AND kind = 'data_task'
+                              AND run_id = %s
+                              AND user_id = %s
+                              AND platform = %s
+                              AND target_address = %s
+                            """,
+                            (
+                                expected_keys,
+                                norm_run_id,
+                                owner_user_id,
+                                platform,
+                                canonical_target_address,
+                            ),
+                        )
+                        item_rows = await cur.fetchall()
+
+                    status_by_key = {
+                        str(ir["delivery_key"]): str(ir.get("status") or "").strip().lower()
+                        for ir in (item_rows or [])
+                    }
+                    if len(status_by_key) != expected_count or not all(
+                        status_by_key.get(k) == "sent" for k in expected_keys
+                    ):
+                        continue
+
+                    updated_outer = False
+                    async with row_conn.transaction():
+                        async with row_conn.cursor(row_factory=dict_row) as tx_cur:
+                            await tx_cur.execute(
+                                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                                (f"dalton_reconcile:{norm_run_id}:{channel}:{target}",),
+                            )
+                            await tx_cur.execute(
+                                """
+                                SELECT delivery_key, status
+                                FROM dalton_channel_deliveries
+                                WHERE delivery_key = ANY(%s)
+                                  AND kind = 'data_task'
+                                  AND run_id = %s
+                                  AND user_id = %s
+                                  AND platform = %s
+                                  AND target_address = %s
+                                """,
+                                (
+                                    expected_keys,
+                                    norm_run_id,
+                                    owner_user_id,
+                                    platform,
+                                    canonical_target_address,
+                                ),
+                            )
+                            tx_items = await tx_cur.fetchall()
+                            tx_status_by_key = {
+                                str(ir["delivery_key"]): str(ir.get("status") or "").strip().lower()
+                                for ir in (tx_items or [])
+                            }
+                            if len(tx_status_by_key) != expected_count or not all(
+                                tx_status_by_key.get(k) == "sent" for k in expected_keys
+                            ):
+                                continue
+
+                            await tx_cur.execute(
+                                """
+                                UPDATE dalton_notify_deliveries
+                                SET status = 'sent',
+                                    error_code = NULL,
+                                    updated_at = NOW()
+                                WHERE execution_id = %s
+                                  AND channel = %s
+                                  AND target = %s
+                                  AND status = 'pending'
+                                  AND COALESCE(error_code, '') = ANY(%s)
+                                """,
+                                (raw_exec_id, channel, target, uncertain_codes),
+                            )
+                            if isinstance(tx_cur.rowcount, int) and tx_cur.rowcount > 0:
+                                updated_outer = True
+                                await tx_cur.execute(
+                                    """
+                                    UPDATE dalton_data_task_runs r
+                                    SET notify_status = 'dispatched',
+                                        updated_at = NOW()
+                                    WHERE r.run_id = %s::uuid
+                                      AND r.notify_status = 'pending_dispatch'
+                                      AND EXISTS (
+                                          SELECT 1
+                                          FROM dalton_notify_deliveries d
+                                          WHERE d.execution_id = %s
+                                            AND d.status = 'sent'
+                                      )
+                                      AND NOT EXISTS (
+                                          SELECT 1
+                                          FROM dalton_notify_deliveries d
+                                          WHERE d.execution_id = %s
+                                            AND d.status NOT IN ('sent', 'skipped')
+                                      )
+                                    """,
+                                    (norm_run_id, raw_exec_id, raw_exec_id),
+                                )
+
+                    if updated_outer:
+                        reconciled_count += 1
+                        if mark_delivery_fn is not None:
+                            await mark_delivery_fn(
+                                raw_exec_id,
+                                channel,
+                                target,
+                                status="sent",
+                                error_code=None,
+                                expected_status="pending",
+                            )
+            except asyncio.CancelledError:
+                raise
+            except Exception as row_exc:
+                logger.warning(
+                    "Data-task uncertain delivery reconciliation skipped row execution_id=%s: error_type=%s",
+                    raw_exec_id,
+                    type(row_exc).__name__,
+                )
+    except asyncio.CancelledError:
+        raise
+    except Exception as scan_exc:
+        logger.warning(
+            "Data-task uncertain delivery reconciliation scan failed: error_type=%s",
+            type(scan_exc).__name__,
+        )
+
+    return reconciled_count

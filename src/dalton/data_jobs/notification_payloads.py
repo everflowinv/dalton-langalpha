@@ -6,19 +6,21 @@ Constructs validated, secret-redacted delivery plans from persisted run artifact
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 import copy
 from dataclasses import dataclass, field
-import errno
 import hashlib
-import os
 from pathlib import Path, PurePosixPath
 import re
-import stat
 from typing import Any
 from uuid import UUID
 
 from src.dalton.data_jobs.runner_wrapper import SecretRedactor
+from src.dalton.data_jobs.safe_fs import (
+    SafeFsError,
+    safe_atomic_write_bytes,
+    safe_read_contained_regular_bytes,
+)
 
 MAX_NOTIFICATION_ARTIFACT_BYTES = 20 * 1024 * 1024  # 20 MiB hard ceiling
 
@@ -535,162 +537,56 @@ def _safe_read_contained_regular_file(
     Opens the leaf with ``O_NONBLOCK`` so FIFOs or special nodes cannot block ``open(2)``
     before ``fstat`` rejects non-regular descriptors.
     """
-    parts = _normalize_strict_relative_parts(relative_path)
-    base_str = os.fspath(base_dir)
+    norm_rel = "/".join(_normalize_strict_relative_parts(relative_path))
     try:
-        base_lstat = os.lstat(base_str)
-    except FileNotFoundError as exc:
-        raise DataTaskArtifactError("Artifact base directory does not exist", code="artifact_missing") from exc
-    except OSError as exc:
-        raise DataTaskArtifactError(f"Unable to stat artifact base directory: {exc.errno}") from exc
+        data = safe_read_contained_regular_bytes(
+            base_dir,
+            norm_rel,
+            max_bytes=max_bytes,
+            reject_base_symlink=reject_base_symlink,
+            allow_missing=False,
+            too_large_code="artifact_too_large",
+            empty_code="artifact_empty",
+            nonregular_code="unsupported_media_type",
+        )
+    except SafeFsError as exc:
+        raise DataTaskArtifactError(str(exc), code=exc.code) from exc
+    if data is None:
+        raise DataTaskArtifactError("Artifact file not found", code="artifact_missing")
+    return data
 
-    if reject_base_symlink and stat.S_ISLNK(base_lstat.st_mode):
-        raise DataTaskArtifactError("Artifact base directory cannot be a symlink", code="symlink_rejected")
 
-    cloexec_flag = getattr(os, "O_CLOEXEC", 0)
-    nonblock_flag = getattr(os, "O_NONBLOCK", 0)
-    dir_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | cloexec_flag
-    if reject_base_symlink:
-        dir_flags |= getattr(os, "O_NOFOLLOW", 0)
-
-    nofollow_dir_flags = (
-        os.O_RDONLY
-        | getattr(os, "O_DIRECTORY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | cloexec_flag
-    )
-    nofollow_file_flags = (
-        os.O_RDONLY
-        | getattr(os, "O_NOFOLLOW", 0)
-        | nonblock_flag
-        | cloexec_flag
-    )
-
-    current_fd: int | None = None
+def _atomic_write_snapshot_file(
+    run_artifacts_dir: Path,
+    rel_dest: str,
+    content: bytes,
+    *,
+    anchor_dir: Path | None = None,
+    _token_supplier: Callable[[], str] | None = None,
+    _on_dir_verified: Callable[[], None] | None = None,
+    _on_before_publish: Callable[..., None] | None = None,
+    _write_chunk_fn: Callable[[int, memoryview], int] | None = None,
+) -> Path:
+    """Atomically publish ``rel_dest`` inside ``run_artifacts_dir`` via verified ``dir_fd``s."""
     try:
-        try:
-            current_fd = os.open(base_str, dir_flags)
-        except OSError as exc:
-            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
-                raise DataTaskArtifactError(
-                    "Symlink or non-directory rejected on base directory",
-                    code="symlink_rejected",
-                ) from exc
-            raise DataTaskArtifactError("Artifact base directory cannot be opened", code="artifact_missing") from exc
-
-        for dir_part in parts[:-1]:
-            try:
-                next_fd = os.open(dir_part, nofollow_dir_flags, dir_fd=current_fd)
-            except FileNotFoundError as exc:
-                raise DataTaskArtifactError("Artifact directory does not exist", code="artifact_missing") from exc
-            except OSError as exc:
-                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
-                    raise DataTaskArtifactError(
-                        "Symlink traversal in artifact directory is forbidden",
-                        code="symlink_rejected",
-                    ) from exc
-                raise DataTaskArtifactError("Failed to traverse artifact directory") from exc
-            prev_fd = current_fd
-            current_fd = next_fd
-            os.close(prev_fd)
-
-        leaf_name = parts[-1]
-        try:
-            file_fd = os.open(leaf_name, nofollow_file_flags, dir_fd=current_fd)
-        except FileNotFoundError as exc:
-            raise DataTaskArtifactError(f"Artifact file not found: {leaf_name}", code="artifact_missing") from exc
-        except OSError as exc:
-            if exc.errno in (errno.ELOOP, errno.EISDIR):
-                raise DataTaskArtifactError(
-                    "Symlink or directory target is forbidden for artifact file",
-                    code="symlink_rejected",
-                ) from exc
-            if exc.errno in (
-                errno.ENXIO,
-                getattr(errno, "EOPNOTSUPP", errno.ENXIO),
-                getattr(errno, "ENOTSUP", errno.ENXIO),
-            ):
-                raise DataTaskArtifactError(
-                    "Artifact target is not a regular file",
-                    code="unsupported_media_type",
-                ) from exc
-            raise DataTaskArtifactError("Failed to open artifact file") from exc
-
-        try:
-            file_stat = os.fstat(file_fd)
-            if not stat.S_ISREG(file_stat.st_mode):
-                raise DataTaskArtifactError(
-                    "Artifact target is not a regular file",
-                    code="unsupported_media_type",
-                )
-            if file_stat.st_size <= 0:
-                raise DataTaskArtifactError("Artifact file is empty", code="artifact_empty")
-            if file_stat.st_size > max_bytes:
-                raise DataTaskArtifactError(
-                    f"Artifact exceeds maximum size ({file_stat.st_size} > {max_bytes} bytes)",
-                    code="artifact_too_large",
-                )
-
-            if nonblock_flag and hasattr(os, "set_blocking"):
-                os.set_blocking(file_fd, True)
-
-            chunks: list[bytes] = []
-            total = 0
-            while True:
-                chunk = os.read(file_fd, min(65536, max_bytes + 1 - total))
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                total += len(chunk)
-                if total > max_bytes:
-                    raise DataTaskArtifactError(
-                        f"Artifact grew beyond maximum size ({max_bytes} bytes)",
-                        code="artifact_too_large",
-                    )
-            data = b"".join(chunks)
-            if len(data) != file_stat.st_size:
-                raise DataTaskArtifactError(
-                    "Artifact size changed while reading",
-                    code="artifact_changed",
-                )
-            return data
-        finally:
-            os.close(file_fd)
-    finally:
-        if current_fd is not None:
-            os.close(current_fd)
-
-
-def _atomic_write_snapshot_file(run_artifacts_dir: Path, rel_dest: str, content: bytes) -> None:
-    parts = _normalize_strict_relative_parts(rel_dest)
+        norm_rel = "/".join(_normalize_strict_relative_parts(rel_dest))
+    except DataTaskArtifactError as exc:
+        raise DataTaskNotificationPrepError(str(exc), code=exc.code) from exc
     try:
-        if run_artifacts_dir.is_symlink():
-            raise DataTaskNotificationPrepError(
-                "Run artifacts directory cannot be a symlink",
-                code="symlink_rejected",
-            )
-    except OSError as exc:
-        raise DataTaskNotificationPrepError("Unable to inspect run artifacts directory") from exc
-
-    run_artifacts_dir.mkdir(parents=True, exist_ok=True)
-    cur = run_artifacts_dir
-    for part in parts[:-1]:
-        cur = cur / part
-        if cur.exists() and cur.is_symlink():
-            raise DataTaskNotificationPrepError(
-                "Run artifacts subdirectory cannot be a symlink",
-                code="symlink_rejected",
-            )
-        cur.mkdir(parents=True, exist_ok=True)
-
-    dest_file = cur / parts[-1]
-    if dest_file.exists() and dest_file.is_symlink():
-        raise DataTaskNotificationPrepError("Snapshot destination cannot be a symlink", code="symlink_rejected")
-    tmp_file = cur / f".{parts[-1]}.tmp.{os.getpid()}"
-    if tmp_file.exists() and tmp_file.is_symlink():
-        raise DataTaskNotificationPrepError("Temporary snapshot file cannot be a symlink", code="symlink_rejected")
-    tmp_file.write_bytes(content)
-    os.replace(tmp_file, dest_file)
+        return safe_atomic_write_bytes(
+            run_artifacts_dir,
+            norm_rel,
+            content,
+            anchor_dir=anchor_dir,
+            reject_base_symlink=True,
+            mode=0o600,
+            _token_supplier=_token_supplier,
+            _on_dir_verified=_on_dir_verified,
+            _on_before_publish=_on_before_publish,
+            _write_chunk_fn=_write_chunk_fn,
+        )
+    except SafeFsError as exc:
+        raise DataTaskNotificationPrepError(str(exc), code=exc.code) from exc
 
 
 # ---------------------------------------------------------------------------

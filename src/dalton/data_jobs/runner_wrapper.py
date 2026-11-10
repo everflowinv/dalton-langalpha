@@ -33,6 +33,12 @@ import time
 from typing import Any, TextIO
 
 from src.dalton.data_jobs.manifest import CONTAINER_PYTHON_BIN, DEFAULT_TIMEOUT_SECONDS
+from src.dalton.data_jobs.safe_fs import (
+    SafeFsError,
+    _open_verified_dir_chain,
+    safe_atomic_write_bytes,
+    safe_unlink_contained_regular_file,
+)
 from src.dalton.settings import managed_secret_token_values, redact_managed_tokens
 
 DEFAULT_WORKSPACE_DIR = "/Users/everflow/.openclaw/workspace"
@@ -192,21 +198,32 @@ def load_secrets_from_dir(
     return env_secrets, SecretRedactor(secret_values)
 
 
-def atomic_write_text(target_path: Path, content: str) -> None:
-    """Atomically write ``target_path`` via a same-directory temporary file + ``os.replace`` (§4.2)."""
-    target_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = target_path.parent / f".tmp.{target_path.name}.{os.getpid()}"
-    with open(tmp_path, "w", encoding="utf-8") as fh:
-        fh.write(content)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp_path, target_path)
+def atomic_write_text(
+    target_path: Path,
+    content: str,
+    *,
+    anchor_dir: Path | None = None,
+) -> None:
+    """Atomically write ``target_path`` via verified ``dir_fd``s + unpredictable temp file + ``os.replace`` (§4.2)."""
+    safe_atomic_write_bytes(
+        target_path.parent,
+        target_path.name,
+        content.encode("utf-8"),
+        anchor_dir=anchor_dir,
+        reject_base_symlink=True,
+        mode=0o600,
+    )
 
 
-def atomic_write_json(target_path: Path, payload: Any) -> None:
+def atomic_write_json(
+    target_path: Path,
+    payload: Any,
+    *,
+    anchor_dir: Path | None = None,
+) -> None:
     """Atomically serialize ``payload`` as UTF-8 JSON to ``target_path`` (§4.2)."""
     serialized = json.dumps(payload, ensure_ascii=False, indent=2)
-    atomic_write_text(target_path, serialized)
+    atomic_write_text(target_path, serialized, anchor_dir=anchor_dir)
 
 
 def build_child_env(
@@ -320,7 +337,7 @@ def persist_redacted_outbox(
     """
     raw_payload: Any = explicit_payload
     source_file = staging_outbox_path if staging_outbox_path is not None else outbox_path
-    if raw_payload is None and source_file.is_file():
+    if raw_payload is None and not source_file.is_symlink() and source_file.is_file():
         try:
             raw_text = source_file.read_text(encoding="utf-8")
             try:
@@ -487,7 +504,17 @@ async def run_wrapped_command(
     redactor = SecretRedactor(combined_secrets)
 
     outbox_path = Path(workspace_dir) / ".dalton-runs" / str(run_id) / "outbox.json"
-    outbox_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        pre_chain = _open_verified_dir_chain(
+            outbox_path.parent,
+            (),
+            anchor_dir=Path(workspace_dir),
+            create_missing=True,
+        )
+        if pre_chain is not None:
+            pre_chain.close()
+    except SafeFsError:
+        pass
 
     staging_dir, cleanup_staging_dir = _prepare_staging_outbox_dir(outbox_tmp_dir, str(run_id))
     staging_outbox_path = staging_dir / "outbox.json"
@@ -602,7 +629,7 @@ async def run_wrapped_command(
                 stdout_text=redacted_stdout,
                 workspace_dir=workspace_dir if exit_code == 0 else None,
             )
-        except DataTaskNotificationPrepError as prep_exc:
+        except (DataTaskNotificationPrepError, SafeFsError) as prep_exc:
             redacted_err = redactor.redact_text(
                 f"runner_wrapper: report preparation failed: {prep_exc}\n"
             )
@@ -610,7 +637,11 @@ async def run_wrapped_command(
             err_stream.flush()
             redacted_stderr = f"{redacted_stderr}{redacted_err}"
             outbox_payload = None
-            outbox_path.unlink(missing_ok=True)
+            safe_unlink_contained_regular_file(
+                outbox_path.parent,
+                outbox_path.name,
+                anchor_dir=Path(workspace_dir),
+            )
             if exit_code == 0:
                 exit_code = 1
     finally:

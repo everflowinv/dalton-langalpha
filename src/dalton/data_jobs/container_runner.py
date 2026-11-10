@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-import json
 import logging
 import os
 from pathlib import Path
@@ -17,6 +16,12 @@ from src.dalton.data_jobs.runner_wrapper import (
     DEFAULT_SECRETS_DIR,
     DEFAULT_TMPFS_OUTBOX_DIR,
     DEFAULT_WORKSPACE_DIR,
+)
+from src.dalton.data_jobs.safe_fs import (
+    MAX_RUN_METADATA_BYTES,
+    SafeFsError,
+    normalize_strict_relative_parts,
+    safe_read_json_object,
 )
 from src.dalton.settings import get_dalton_backend_var_dir, get_dalton_host_var_dir
 
@@ -257,33 +262,72 @@ def truncate_log_tail(log_text: str, max_bytes: int = LOG_TAIL_MAX_BYTES) -> str
     return sliced.decode("utf-8", errors="ignore")
 
 
+def read_validated_run_json_metadata(
+    run_id: str | UUID,
+    filename: str,
+    *,
+    path_map: DataTaskPathMap | None = None,
+    max_bytes: int = MAX_RUN_METADATA_BYTES,
+) -> dict[str, Any] | None:
+    """Safely read one bounded JSON metadata object (`outbox.json` or `frozen_manifest.json`).
+
+    Validates `.dalton-runs`, `<run_id>`, and `<filename>` via verified directory descriptors
+    with `O_NOFOLLOW | O_NONBLOCK`, returning `None` when absent and raising `SafeFsError` on
+    symlinks, FIFOs/non-regular files, oversized files, or invalid JSON objects.
+    """
+    run_parts = normalize_strict_relative_parts(str(run_id))
+    file_parts = normalize_strict_relative_parts(filename)
+    if len(run_parts) != 1 or len(file_parts) != 1:
+        raise SafeFsError(
+            "Run identifier and metadata filename must each be a single relative segment",
+            code="path_traversal",
+        )
+    paths = path_map or build_path_map()
+    art_dir = paths.backend_run_artifacts_dir(run_parts[0])
+    return safe_read_json_object(
+        art_dir,
+        file_parts[0],
+        anchor_dir=paths.backend_data_root,
+        reject_base_symlink=True,
+        allow_missing=True,
+        max_bytes=max_bytes,
+    )
+
+
 def read_run_artifacts(
     run_id: str | UUID,
     *,
     path_map: DataTaskPathMap | None = None,
+    include_outbox: bool = True,
+    include_manifest: bool = True,
+    strict: bool = False,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    """Read ``outbox.json`` and ``frozen_manifest.json`` from ``<data_root>/.dalton-runs/<run_id>/``."""
-    paths = path_map or build_path_map()
-    art_dir = paths.backend_run_artifacts_dir(run_id)
+    """Read bounded, regular-file ``outbox.json`` and/or ``frozen_manifest.json`` safely."""
     outbox_payload: dict[str, Any] | None = None
     frozen_manifest: dict[str, Any] | None = None
 
-    outbox_file = art_dir / "outbox.json"
-    if outbox_file.is_file():
+    if include_outbox:
         try:
-            parsed = json.loads(outbox_file.read_text(encoding="utf-8"))
-            if isinstance(parsed, dict):
-                outbox_payload = parsed
-        except Exception:
+            outbox_payload = read_validated_run_json_metadata(
+                run_id,
+                "outbox.json",
+                path_map=path_map,
+            )
+        except SafeFsError:
+            if strict:
+                raise
             outbox_payload = None
 
-    manifest_file = art_dir / "frozen_manifest.json"
-    if manifest_file.is_file():
+    if include_manifest:
         try:
-            parsed_manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
-            if isinstance(parsed_manifest, dict):
-                frozen_manifest = parsed_manifest
-        except Exception:
+            frozen_manifest = read_validated_run_json_metadata(
+                run_id,
+                "frozen_manifest.json",
+                path_map=path_map,
+            )
+        except SafeFsError:
+            if strict:
+                raise
             frozen_manifest = None
 
     return outbox_payload, frozen_manifest

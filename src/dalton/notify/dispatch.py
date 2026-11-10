@@ -1178,6 +1178,7 @@ async def claim_target_delivery(
                     dalton_notify_deliveries.status = 'failed'
                     OR (
                         dalton_notify_deliveries.status = 'pending'
+                        AND COALESCE(dalton_notify_deliveries.error_code, '') <> ALL(%s)
                         AND dalton_notify_deliveries.updated_at
                             <= NOW() - make_interval(mins => %s)
                     )
@@ -1193,6 +1194,7 @@ async def claim_target_delivery(
                     ch,
                     tgt,
                     Json(dict(payload or {})),
+                    sorted(UNCERTAIN_NOTIFY_ERROR_CODES),
                     stale_pending_minutes,
                 ),
             )
@@ -1855,6 +1857,7 @@ async def retry_failed_notify_deliveries(
     *,
     post_notify_fn: Callable[..., Awaitable[dict[str, Any]]] = post_bridge_notify,
     data_task_notify_fn: Callable[..., Awaitable[dict[str, Any]]] = post_data_task_gateway_notify,
+    reconcile_data_tasks_fn: Callable[..., Awaitable[int]] | None = None,
     mark_delivery_fn: Callable[..., Awaitable[Any]] = mark_target_delivery,
     resolve_enabled_fn: Callable[[str | None], Awaitable[bool]] = resolve_dalton_notify_enabled,
     resolve_overrides_fn: Callable[[str | None], Awaitable[dict[str, bool]]] = resolve_dalton_notify_overrides,
@@ -1871,13 +1874,36 @@ async def retry_failed_notify_deliveries(
 
     Re-checks user master switch, per-task override, and target configuration before
     re-sending; marks rows whose conditions no longer hold as ``skipped`` with
-    ``reason`` = ``toggle_off`` or ``target_removed``. Processes at most ``limit``
-    rows within ``max_duration_s`` seconds. 会传播 ``CancelledError``，其他异常不抛出。
+    ``reason`` = ``toggle_off`` or ``target_removed``. Uncertain data-task rows are
+    reconciled read-only against ``dalton_channel_deliveries`` (independent of
+    ``attempt_count``) and excluded from send-retry selection so unresolved uncertain
+    rows never starve retryable work. Processes bounded batches within ``max_duration_s``
+    seconds. 会传播 ``CancelledError``，其他异常不抛出。
     """
     sent_count = 0
     started_at = time.monotonic()
     uncertain_codes_list = sorted(UNCERTAIN_NOTIFY_ERROR_CODES)
     try:
+        if reconcile_data_tasks_fn is not None or post_notify_fn is post_bridge_notify:
+            reconciler = reconcile_data_tasks_fn
+            if reconciler is None:
+                from src.dalton.database.data_task_notifications import (
+                    reconcile_uncertain_data_task_deliveries,
+                )
+
+                reconciler = reconcile_uncertain_data_task_deliveries
+            custom_mark = (
+                mark_delivery_fn if mark_delivery_fn is not mark_target_delivery else None
+            )
+            sent_count += await reconciler(
+                limit=limit,
+                max_duration_s=max_duration_s,
+                started_at=started_at,
+                mark_delivery_fn=custom_mark,
+            )
+            if time.monotonic() - started_at >= max_duration_s:
+                return sent_count
+
         async with get_db_connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute(
@@ -1904,14 +1930,21 @@ async def retry_failed_notify_deliveries(
                         (d.status = 'failed' AND d.attempt_count < %s)
                         OR (
                             d.status = 'pending'
+                            AND COALESCE(d.error_code, '') <> ALL(%s)
                             AND d.updated_at <= NOW() - make_interval(mins => %s)
                         )
                     )
                       AND d.created_at >= NOW() - make_interval(hours => %s)
-                    ORDER BY d.created_at ASC
+                    ORDER BY d.updated_at ASC, d.created_at ASC
                     LIMIT %s
                     """,
-                    (max_attempts, stale_pending_minutes, lookback_hours, limit),
+                    (
+                        max_attempts,
+                        uncertain_codes_list,
+                        stale_pending_minutes,
+                        lookback_hours,
+                        limit,
+                    ),
                 )
                 candidates = await cur.fetchall()
 
@@ -2082,13 +2115,21 @@ async def retry_failed_notify_deliveries(
                                   status = 'failed'
                                   OR (
                                       status = 'pending'
+                                      AND COALESCE(error_code, '') <> ALL(%s)
                                       AND updated_at <= NOW() - make_interval(mins => %s)
                                   )
                               )
                               AND attempt_count < %s
                             RETURNING attempt_count, payload_json
                             """,
-                            (exec_id, ch, tgt, stale_pending_minutes, max_attempts),
+                            (
+                                exec_id,
+                                ch,
+                                tgt,
+                                uncertain_codes_list,
+                                stale_pending_minutes,
+                                max_attempts,
+                            ),
                         )
                         claimed_row = await cur.fetchone()
                         if claimed_row is not None:
