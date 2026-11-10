@@ -605,11 +605,27 @@ class AutomationUpdate(_ScheduleFields):
     metadata: Optional[Dict[str, Any]] = None
     # DALTON-HOOK(company-automations): optional expected_config_version for optimistic concurrency check
     expected_config_version: Any = Field(default=None, exclude=True)
+    # DALTON-HOOK(company-automations): keep the raw delivery object, including keys DeliveryConfig drops
+    delivery_config_raw: Any = Field(default=None, exclude=True)
 
     @model_validator(mode="before")
     @classmethod
     def _retired_agent_mode(cls, value: Any) -> Any:
-        return _refuse_retired_agent_mode(value)
+        value = _refuse_retired_agent_mode(value)
+        # DALTON-HOOK(company-automations): derive the raw delivery body from
+        # delivery_config before typed normalization removes unknown keys.
+        if not isinstance(value, dict):
+            return value
+        has_delivery = "delivery_config" in value
+        has_raw = "delivery_config_raw" in value
+        if not has_delivery and not has_raw:
+            return value
+        value = dict(value)
+        if has_delivery:
+            value["delivery_config_raw"] = value.get("delivery_config")
+        else:
+            value.pop("delivery_config_raw", None)
+        return value
 
     @model_validator(mode="after")
     def _keeps_the_stored_kind(self, info: ValidationInfo) -> "AutomationUpdate":

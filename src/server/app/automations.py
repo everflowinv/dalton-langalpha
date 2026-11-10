@@ -31,6 +31,7 @@ from fastapi import APIRouter, Body, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import ValidationError
 
+from src.dalton.company_identity import is_company_system_user  # DALTON-HOOK(company-automations)
 from src.dalton.services.company_automations import (  # DALTON-HOOK(company-automations)
     AutomationHistoryResponse,
     automation_history_context,
@@ -58,7 +59,6 @@ from src.server.dependencies.principal import (
     ReadUserId,
     RunUserId,
     WorkspaceSendPrincipal,
-    WorkspaceSendUserId,
     WorkspaceWritePrincipal,
     WorkspaceWriteUserId,
     assert_automation_target,
@@ -73,6 +73,19 @@ from src.server.utils.api import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1", tags=["Automations"])
+
+
+# DALTON-HOOK(company-automations): company changes record a human caller and return public task fields.
+def _refuse_company_service_actor(user_id: str) -> None:
+    """The company system identity cannot call update, pause, or resume."""
+    if is_company_system_user(user_id):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+
+def _company_write_response(row: dict[str, Any]):
+    from src.dalton.services.company_agent_writes import company_agent_write_response
+
+    return company_agent_write_response(row)
 
 
 # =============================================================================
@@ -362,6 +375,8 @@ async def update_automation(
 ):
     """Partial update of an automation."""
     user_id = principal.user_id
+    # DALTON-HOOK(company-automations): company system identity cannot write through this route
+    _refuse_company_service_actor(user_id)
     await assert_automation_target(
         principal,
         http_request,
@@ -394,14 +409,26 @@ async def update_automation(
             status_code=422,
             detail=e.errors(include_url=False, include_context=False, include_input=False),
         )
-    if not automation:
-        raise_not_found("Automation")
-    resp = AutomationResponse.model_validate(automation)
-    # DALTON-HOOK(dalton-notify): populate user-specific notify effective value and source
-    from src.dalton.notify.dispatch import populate_automation_notify_state
+    if automation:
+        resp = AutomationResponse.model_validate(automation)
+        # DALTON-HOOK(dalton-notify): populate user-specific notify effective value and source
+        from src.dalton.notify.dispatch import populate_automation_notify_state
 
-    await populate_automation_notify_state(user_id, [resp])
-    return resp
+        await populate_automation_notify_state(user_id, [resp])
+        return resp
+    # DALTON-HOOK(company-automations): a miss on the caller may be an existing company row
+    from src.dalton.services.company_agent_writes import update_company_agent
+
+    company_row = await update_company_agent(
+        principal,
+        str(automation_id),
+        fields,
+        request=request,
+        expected_config_version=expected_cv,
+    )
+    if not company_row:
+        raise_not_found("Automation")
+    return _company_write_response(company_row)
 
 
 @router.delete("/automations/{automation_id}", status_code=204)
@@ -437,10 +464,13 @@ async def trigger_automation(
 @handle_api_exceptions("pause automation", logger, conflict_on_value_error=True)
 async def pause_automation(
     automation_id: UUID,
-    user_id: WorkspaceWriteUserId,
+    principal: WorkspaceWritePrincipal,
     body: Any = Body(default=None),
 ):
     """Pause an active automation."""
+    user_id = principal.user_id
+    # DALTON-HOOK(company-automations): company system identity cannot pause through this route
+    _refuse_company_service_actor(user_id)
     # DALTON-HOOK(company-automations): validate optional expected_config_version on pause
     expected_cv = extract_expected_config_version(body)
     with automation_history_context(
@@ -449,14 +479,24 @@ async def pause_automation(
         expected_config_version=expected_cv,
     ):
         automation = await handler.pause_automation(str(automation_id), user_id)
-    if not automation:
-        raise_not_found("Automation")
-    resp = AutomationResponse.model_validate(automation)
-    # DALTON-HOOK(dalton-notify): populate user-specific notify effective value and source
-    from src.dalton.notify.dispatch import populate_automation_notify_state
+    if automation:
+        resp = AutomationResponse.model_validate(automation)
+        # DALTON-HOOK(dalton-notify): populate user-specific notify effective value and source
+        from src.dalton.notify.dispatch import populate_automation_notify_state
 
-    await populate_automation_notify_state(user_id, [resp])
-    return resp
+        await populate_automation_notify_state(user_id, [resp])
+        return resp
+    # DALTON-HOOK(company-automations): a miss on the caller may be an existing company row
+    from src.dalton.services.company_agent_writes import pause_company_agent
+
+    company_row = await pause_company_agent(
+        principal,
+        str(automation_id),
+        expected_config_version=expected_cv,
+    )
+    if not company_row:
+        raise_not_found("Automation")
+    return _company_write_response(company_row)
 
 
 @router.post("/automations/{automation_id}/resume", response_model=AutomationResponse)
@@ -464,10 +504,13 @@ async def pause_automation(
 async def resume_automation(
     automation_id: UUID,
     # Re-arms runs into the automation's thread, so not the call's own.
-    user_id: WorkspaceSendUserId,
+    principal: WorkspaceSendPrincipal,
     body: Any = Body(default=None),
 ):
     """Resume a paused or disabled automation."""
+    user_id = principal.user_id
+    # DALTON-HOOK(company-automations): company system identity cannot resume through this route
+    _refuse_company_service_actor(user_id)
     # DALTON-HOOK(company-automations): validate optional expected_config_version on resume
     expected_cv = extract_expected_config_version(body)
     with automation_history_context(
@@ -476,14 +519,24 @@ async def resume_automation(
         expected_config_version=expected_cv,
     ):
         automation = await handler.resume_automation(str(automation_id), user_id)
-    if not automation:
-        raise_not_found("Automation")
-    resp = AutomationResponse.model_validate(automation)
-    # DALTON-HOOK(dalton-notify): populate user-specific notify effective value and source
-    from src.dalton.notify.dispatch import populate_automation_notify_state
+    if automation:
+        resp = AutomationResponse.model_validate(automation)
+        # DALTON-HOOK(dalton-notify): populate user-specific notify effective value and source
+        from src.dalton.notify.dispatch import populate_automation_notify_state
 
-    await populate_automation_notify_state(user_id, [resp])
-    return resp
+        await populate_automation_notify_state(user_id, [resp])
+        return resp
+    # DALTON-HOOK(company-automations): a miss on the caller may be an existing company row
+    from src.dalton.services.company_agent_writes import resume_company_agent
+
+    company_row = await resume_company_agent(
+        principal,
+        str(automation_id),
+        expected_config_version=expected_cv,
+    )
+    if not company_row:
+        raise_not_found("Automation")
+    return _company_write_response(company_row)
 
 
 @router.post("/automations/{automation_id}/executions/{execution_id}/skip")
