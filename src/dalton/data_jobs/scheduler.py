@@ -550,6 +550,101 @@ async def enqueue_manual_task_run(
 
 
 
+def _manual_trial_from_locked_def(locked: Any, trigger_source: str) -> bool:
+    """A manual run of a disabled task is a trial and does not count as a failure.
+
+    ``enabled`` comes from the definition row locked in this transaction. A
+    missing definition is not a trial; there is no failure counter to update.
+    """
+    if locked is None:
+        return False
+    enabled = bool(_extract_field(locked, "enabled", 0))
+    return trigger_source == "manual" and not enabled
+
+
+async def _skip_queued_run_for_low_memory(
+    conn: Any,
+    *,
+    run_id: str,
+    job_key: str,
+    now_utc: datetime,
+    require_low_mem_since: bool,
+    stamp_low_mem_since: bool,
+) -> bool:
+    """Skip one queued run that is still past its low-memory deadline.
+
+    The definition lock is the first statement, before the run row changes.
+    Pause and schedule writes lock that definition and then cancel queued runs.
+    Locking the run first deadlocks those writes. After the lock, the run is
+    updated only when it is still the same queued row and still past
+    ``deadline_utc``. A pause or schedule change that already cancelled it
+    leaves the row and the failure counter untouched. A trial does not
+    increment ``consecutive_failures``. The update matches one ``run_id``.
+    """
+    low_mem_assign = ""
+    if stamp_low_mem_since:
+        low_mem_assign = (
+            "low_mem_since_utc = COALESCE(low_mem_since_utc, %(now_utc)s),"
+        )
+    async with conn.transaction():
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT enabled
+                FROM dalton_data_task_defs
+                WHERE job_key = %(job_key)s
+                FOR UPDATE
+                """,
+                {"job_key": job_key},
+            )
+            locked = await cur.fetchone()
+            await cur.execute(
+                f"""
+                UPDATE dalton_data_task_runs
+                SET status = 'skipped_low_memory',
+                    {low_mem_assign}
+                    failure_reason = 'low_memory_deadline_exceeded',
+                    notify_status = 'skipped',
+                    completed_at = NOW(),
+                    updated_at = NOW()
+                WHERE run_id = %(run_id)s::uuid
+                  AND job_key = %(job_key)s
+                  AND status = 'queued'
+                  AND deadline_utc <= %(now_utc)s
+                  AND (
+                        %(require_low_mem_since)s = FALSE
+                        OR low_mem_since_utc IS NOT NULL
+                  )
+                RETURNING trigger_source
+                """,
+                {
+                    "run_id": run_id,
+                    "job_key": job_key,
+                    "now_utc": now_utc,
+                    "require_low_mem_since": require_low_mem_since,
+                },
+            )
+            skipped = await cur.fetchone()
+            if skipped is None or cur.rowcount != 1:
+                return False
+            trigger_source = str(
+                _extract_field(skipped, "trigger_source", 0) or "cron"
+            )
+            if locked is not None and not _manual_trial_from_locked_def(
+                locked, trigger_source
+            ):
+                await cur.execute(
+                    """
+                    UPDATE dalton_data_task_defs
+                    SET consecutive_failures = consecutive_failures + 1,
+                        updated_at = NOW()
+                    WHERE job_key = %(job_key)s
+                    """,
+                    {"job_key": job_key},
+                )
+            return True
+
+
 async def expire_low_memory_runs(
     conn: Any,
     *,
@@ -563,9 +658,8 @@ async def expire_low_memory_runs(
     async with conn.cursor(row_factory=dict_row) as cur:
         await cur.execute(
             """
-            SELECT r.run_id, r.job_key, r.trigger_source, d.enabled
+            SELECT r.run_id, r.job_key
             FROM dalton_data_task_runs r
-            LEFT JOIN dalton_data_task_defs d ON d.job_key = r.job_key
             WHERE r.status = 'queued'
               AND r.low_mem_since_utc IS NOT NULL
               AND r.deadline_utc <= %(now_utc)s
@@ -580,45 +674,16 @@ async def expire_low_memory_runs(
         if only_run_id is not None and run_id != str(only_run_id):
             continue
         job_key = str(_extract_field(row, "job_key", 1))
-        trigger_source = (
-            str(row.get("trigger_source") or "cron")
-            if isinstance(row, Mapping)
-            else (str(row[2] or "cron") if len(row) > 2 else "cron")
+        skipped = await _skip_queued_run_for_low_memory(
+            conn,
+            run_id=run_id,
+            job_key=job_key,
+            now_utc=ref_utc,
+            require_low_mem_since=True,
+            stamp_low_mem_since=False,
         )
-        enabled_val = (
-            row.get("enabled", True)
-            if isinstance(row, Mapping)
-            else (row[3] if len(row) > 3 else True)
-        )
-        # 不变式：试跑在 queued/starting/running 期间禁止开启任务，因此当前 d.enabled 与入队/认领时一致，无需另存 is_trial。
-        is_trial = trigger_source == "manual" and not bool(enabled_val)
-        async with conn.transaction():
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    """
-                    UPDATE dalton_data_task_runs
-                    SET status = 'skipped_low_memory',
-                        failure_reason = 'low_memory_deadline_exceeded',
-                        notify_status = 'skipped',
-                        completed_at = NOW(),
-                        updated_at = NOW()
-                    WHERE run_id = %(run_id)s::uuid
-                      AND status = 'queued'
-                    """,
-                    {"run_id": run_id},
-                )
-                if cur.rowcount == 1:
-                    if not is_trial:
-                        await cur.execute(
-                            """
-                            UPDATE dalton_data_task_defs
-                            SET consecutive_failures = consecutive_failures + 1,
-                                updated_at = NOW()
-                            WHERE job_key = %(job_key)s
-                            """,
-                            {"job_key": job_key},
-                        )
-                    expired_ids.append(run_id)
+        if skipped:
+            expired_ids.append(run_id)
     return expired_ids
 
 
@@ -751,33 +816,16 @@ async def claim_next_queued_run(
             )
             if avail_mb < threshold_mb:
                 if isinstance(deadline_utc, datetime) and ref_utc >= deadline_utc:
-                    async with conn.transaction():
-                        async with conn.cursor() as cur:
-                            await cur.execute(
-                                """
-                                UPDATE dalton_data_task_runs
-                                SET status = 'skipped_low_memory',
-                                    low_mem_since_utc = COALESCE(low_mem_since_utc, %(now_utc)s),
-                                    failure_reason = 'low_memory_deadline_exceeded',
-                                    notify_status = 'skipped',
-                                    completed_at = NOW(),
-                                    updated_at = NOW()
-                                WHERE run_id = %(run_id)s::uuid
-                                  AND status = 'queued'
-                                """,
-                                {"run_id": run_id, "now_utc": ref_utc},
-                            )
-                            # 不变式：试跑在 queued/starting/running 期间禁止开启任务，因此当前 enabled 与入队/认领时一致，无需另存 is_trial。
-                            if cur.rowcount == 1 and not is_trial:
-                                await cur.execute(
-                                    """
-                                    UPDATE dalton_data_task_defs
-                                    SET consecutive_failures = consecutive_failures + 1,
-                                        updated_at = NOW()
-                                    WHERE job_key = %(job_key)s
-                                    """,
-                                    {"job_key": job_key},
-                                )
+                    # Same definition-then-run order as expire_low_memory_runs.
+                    # The locked enabled flag, not the earlier scan, decides the trial.
+                    await _skip_queued_run_for_low_memory(
+                        conn,
+                        run_id=run_id,
+                        job_key=job_key,
+                        now_utc=ref_utc,
+                        require_low_mem_since=False,
+                        stamp_low_mem_since=True,
+                    )
                     continue
 
                 async with conn.transaction():

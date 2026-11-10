@@ -25,7 +25,11 @@ import pytest_asyncio
 from src.dalton.autonomy.system_jobs import toggle_system_job
 from src.dalton.company_identity import COMPANY_SYSTEM_USER_ID
 from src.dalton.data_jobs.manifest import sync_manifest_to_db
-from src.dalton.data_jobs.scheduler import enqueue_due_cron_tasks
+from src.dalton.data_jobs.scheduler import (
+    claim_next_queued_run,
+    enqueue_due_cron_tasks,
+    expire_low_memory_runs,
+)
 from src.dalton.services import company_automations as company_auto_svc
 from src.dalton.services.company_script_writes import (
     pause_company_script,
@@ -204,6 +208,8 @@ async def _insert_run(
     status: str,
     trigger_source: str,
     slot: datetime,
+    deadline: datetime | None = None,
+    low_mem_since: datetime | None = None,
 ) -> str:
     run_id = str(uuid4())
     started = slot if status in {"starting", "running"} else None
@@ -212,9 +218,9 @@ async def _insert_run(
             """
             INSERT INTO dalton_data_task_runs (
                 run_id, job_key, trigger_source, scheduled_slot_utc, deadline_utc,
-                status, started_at, created_at, updated_at
+                low_mem_since_utc, status, started_at, created_at, updated_at
             ) VALUES (
-                %s::uuid, %s, %s, %s, %s, %s, %s, %s, %s
+                %s::uuid, %s, %s, %s, %s, %s, %s, %s, %s, %s
             )
             """,
             (
@@ -222,7 +228,8 @@ async def _insert_run(
                 JOB,
                 trigger_source,
                 slot,
-                slot + timedelta(hours=1),
+                deadline if deadline is not None else slot + timedelta(hours=1),
+                low_mem_since,
                 status,
                 started,
                 slot,
@@ -919,3 +926,282 @@ async def test_pause_does_not_take_the_profile_advisory_lock(
     assert row["paused_by_user"] is True
     assert row["updated_by"] == INTERNAL
     assert row["config_version"] == 2
+
+
+LOW_MEM_DEADLINE = datetime(2026, 11, 6, 1, 0, tzinfo=UTC)
+LOW_MEM_NOW = datetime(2026, 11, 6, 2, 0, tzinfo=UTC)
+
+
+async def _failure_count(pool: AsyncConnectionPool) -> int:
+    async with pool.connection() as conn:
+        row = await (
+            await conn.execute(
+                """
+                SELECT consecutive_failures
+                FROM dalton_data_task_defs
+                WHERE job_key = %s
+                """,
+                (JOB,),
+            )
+        ).fetchone()
+    assert row is not None
+    return int(row[0])
+
+
+async def _slot_state(pool: AsyncConnectionPool) -> str:
+    async with pool.connection() as conn:
+        row = await (
+            await conn.execute(
+                "SELECT slot_state FROM dalton_data_task_slot WHERE slot_id = 1"
+            )
+        ).fetchone()
+    assert row is not None
+    return str(row[0])
+
+
+async def _prepare_low_memory_run(
+    pool: AsyncConnectionPool,
+    *,
+    low_mem: bool,
+    trigger_source: str = "cron",
+    enabled: bool = True,
+) -> tuple[str, str]:
+    """One untouched starting run and one queued run past its deadline."""
+    await _set_def(
+        pool,
+        enabled=enabled,
+        paused_by_user=not enabled,
+        cron_expr=MATCH_CRON,
+        timezone=ZONE,
+        consecutive_failures=0,
+        runner="container",
+        command_argv=["echo", "low-memory"],
+    )
+    async with pool.connection() as conn:
+        await conn.execute(
+            "DELETE FROM dalton_data_task_runs WHERE job_key = %s",
+            (JOB,),
+        )
+        await conn.execute(
+            """
+            INSERT INTO dalton_data_task_slot (slot_id, generation, slot_state)
+            VALUES (1, 0, 'idle')
+            ON CONFLICT (slot_id) DO UPDATE
+            SET slot_state = 'idle',
+                active_run_id = NULL,
+                active_job_key = NULL,
+                updated_at = NOW()
+            """
+        )
+    starting = await _insert_run(
+        pool,
+        status="starting",
+        trigger_source="cron",
+        slot=LOW_MEM_DEADLINE - timedelta(days=1),
+    )
+    queued = await _insert_run(
+        pool,
+        status="queued",
+        trigger_source=trigger_source,
+        slot=LOW_MEM_DEADLINE,
+        deadline=LOW_MEM_DEADLINE,
+        low_mem_since=LOW_MEM_DEADLINE if low_mem else None,
+    )
+    return starting, queued
+
+
+async def _race_def_holder(pool: AsyncConnectionPool, waiter: Any, mutate: Any) -> Any:
+    """Hold the definition lock, then let expiry block before the queued run changes."""
+    async with pool.connection() as conn_b:
+        pid_row = await (await conn_b.execute("SELECT pg_backend_pid()")).fetchone()
+        assert pid_row is not None
+        pid = int(pid_row[0])
+        async with pool.connection() as conn_a:
+            task = None
+            try:
+                async with conn_a.transaction():
+                    await conn_a.execute(
+                        """
+                        SELECT job_key
+                        FROM dalton_data_task_defs
+                        WHERE job_key = %s
+                        FOR UPDATE
+                        """,
+                        (JOB,),
+                    )
+                    task = asyncio.create_task(waiter(conn_b))
+                    await _wait_for_def_lock(pool, pid, conn_a.info.backend_pid)
+                    await mutate(conn_a)
+                return await asyncio.wait_for(task, timeout=5)
+            finally:
+                if task is not None and not task.done():
+                    task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await task
+
+
+async def _cancel_queued(conn: Any, *, reason: str, cron_only: bool) -> None:
+    sql = """
+        UPDATE dalton_data_task_runs
+        SET status = 'cancelled',
+            failure_reason = %s,
+            notify_status = 'skipped',
+            completed_at = NOW(),
+            updated_at = NOW()
+        WHERE job_key = %s
+          AND status = 'queued'
+    """
+    params: list[Any] = [reason, JOB]
+    if cron_only:
+        sql += " AND trigger_source = 'cron'"
+    await conn.execute(sql, tuple(params))
+
+
+async def _pause_while_holding_def(conn: Any) -> None:
+    await conn.execute(
+        """
+        UPDATE dalton_data_task_defs
+        SET enabled = FALSE, paused_by_user = TRUE
+        WHERE job_key = %s
+        """,
+        (JOB,),
+    )
+    await _cancel_queued(conn, reason="paused_before_start", cron_only=False)
+
+
+async def _reschedule_while_holding_def(conn: Any) -> None:
+    await conn.execute(
+        """
+        UPDATE dalton_data_task_defs
+        SET cron_expr = %s
+        WHERE job_key = %s
+        """,
+        (OFF_CRON, JOB),
+    )
+    await _cancel_queued(conn, reason="schedule_changed_before_start", cron_only=True)
+
+
+def _run(rows: list[dict[str, Any]], run_id: str) -> dict[str, Any]:
+    return next(row for row in rows if row["run_id"] == run_id)
+
+
+async def _expire_at(conn: Any) -> list[str]:
+    return await expire_low_memory_runs(conn, now_utc=LOW_MEM_NOW)
+
+
+async def _claim_past_deadline(conn: Any) -> Any:
+    return await claim_next_queued_run(
+        conn,
+        now_utc=LOW_MEM_NOW,
+        available_memory_mb=1,
+        min_free_mem_mb=1280,
+    )
+
+
+async def _assert_cancel_won(
+    pool: AsyncConnectionPool,
+    *,
+    starting_id: str,
+    queued_id: str,
+    reason: str,
+) -> None:
+    rows = await _runs(pool)
+    starting = _run(rows, starting_id)
+    queued = _run(rows, queued_id)
+    assert starting["status"] == "starting"
+    assert starting["failure_reason"] is None
+    assert queued["status"] == "cancelled"
+    assert queued["failure_reason"] == reason
+    assert queued["notify_status"] == "skipped"
+    assert await _failure_count(pool) == 0
+    assert await _slot_state(pool) == "idle"
+
+
+@pytest.mark.asyncio
+async def test_low_memory_expiry_counts_one_run_and_not_a_trial(
+    script_db: AsyncConnectionPool,
+) -> None:
+    pool = script_db
+    starting_id, queued_id = await _prepare_low_memory_run(pool, low_mem=True)
+    async with pool.connection() as conn:
+        expired = await _expire_at(conn)
+    assert expired == [queued_id]
+    rows = await _runs(pool)
+    assert _run(rows, starting_id)["status"] == "starting"
+    skipped = _run(rows, queued_id)
+    assert skipped["status"] == "skipped_low_memory"
+    assert skipped["failure_reason"] == "low_memory_deadline_exceeded"
+    assert skipped["notify_status"] == "skipped"
+    assert await _failure_count(pool) == 1
+    async with pool.connection() as conn:
+        assert await _expire_at(conn) == []
+    assert await _failure_count(pool) == 1
+
+    _, trial_id = await _prepare_low_memory_run(
+        pool,
+        low_mem=True,
+        trigger_source="manual",
+        enabled=False,
+    )
+    async with pool.connection() as conn:
+        assert await _expire_at(conn) == [trial_id]
+    trial = _run(await _runs(pool), trial_id)
+    assert trial["status"] == "skipped_low_memory"
+    assert await _failure_count(pool) == 0
+
+
+@pytest.mark.asyncio
+async def test_expire_low_memory_waits_for_pause_or_schedule(
+    script_db: AsyncConnectionPool,
+) -> None:
+    pool = script_db
+    starting_id, queued_id = await _prepare_low_memory_run(pool, low_mem=True)
+    expired = await _race_def_holder(pool, _expire_at, _pause_while_holding_def)
+    assert expired == []
+    await _assert_cancel_won(
+        pool,
+        starting_id=starting_id,
+        queued_id=queued_id,
+        reason="paused_before_start",
+    )
+
+    starting_id, queued_id = await _prepare_low_memory_run(pool, low_mem=True)
+    expired = await _race_def_holder(pool, _expire_at, _reschedule_while_holding_def)
+    assert expired == []
+    await _assert_cancel_won(
+        pool,
+        starting_id=starting_id,
+        queued_id=queued_id,
+        reason="schedule_changed_before_start",
+    )
+    assert (await _read_def(pool))["cron_expr"] == OFF_CRON
+
+
+@pytest.mark.asyncio
+async def test_claim_deadline_waits_for_pause_or_schedule(
+    script_db: AsyncConnectionPool,
+) -> None:
+    pool = script_db
+    starting_id, queued_id = await _prepare_low_memory_run(pool, low_mem=False)
+    claimed = await _race_def_holder(
+        pool, _claim_past_deadline, _pause_while_holding_def
+    )
+    assert claimed is None
+    await _assert_cancel_won(
+        pool,
+        starting_id=starting_id,
+        queued_id=queued_id,
+        reason="paused_before_start",
+    )
+
+    starting_id, queued_id = await _prepare_low_memory_run(pool, low_mem=False)
+    claimed = await _race_def_holder(
+        pool, _claim_past_deadline, _reschedule_while_holding_def
+    )
+    assert claimed is None
+    await _assert_cancel_won(
+        pool,
+        starting_id=starting_id,
+        queued_id=queued_id,
+        reason="schedule_changed_before_start",
+    )
