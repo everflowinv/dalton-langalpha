@@ -44,6 +44,16 @@ export interface SendTextChunkOptions {
    * is bound to this id, the parent channel, and the current bot.
    */
   deliveryKey?: string | null;
+  /**
+   * Thread address already stored for this delivery. When set, Discord posts
+   * into that thread and does not create another one.
+   */
+  confirmedThreadAddress?: string | null;
+  /**
+   * Called after Discord confirms a new thread and before the message POST.
+   * The send does not continue unless this resolves.
+   */
+  onConfirmedThread?: (confirmed: { address: string }) => Promise<void>;
   weixinContextToken?: string | null;
 }
 

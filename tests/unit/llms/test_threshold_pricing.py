@@ -221,4 +221,3 @@ class TestMuseEmberNominalThresholdPricing:
         )
         # 200k * 0.10/1M + 1k * 0.50/1M = 0.0205 (reasoning 600 is part of 1k output, not added again)
         assert cost_usd == pytest.approx(0.0205, rel=1e-9)
-

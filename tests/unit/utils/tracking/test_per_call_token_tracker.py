@@ -503,4 +503,3 @@ class TestNotionalCostTracking:
         assert model_entry["total_cost"] == 0.0
         assert model_entry["notional_cost"] == pytest.approx(0.0155 + 0.0615003, rel=1e-9)
         assert len(model_entry.get("notional_rates") or []) == 2
-

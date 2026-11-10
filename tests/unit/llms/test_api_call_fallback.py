@@ -374,4 +374,3 @@ async def test_native_structured_raw_parse_failure_retains_usage_and_no_response
     cash_e, notional_e = compute_call_costs("muse-ember-1.0-oauth", "oauth", usage_err)
     assert cash_e == Decimal("0")
     assert notional_e == Decimal("0.015500")
-

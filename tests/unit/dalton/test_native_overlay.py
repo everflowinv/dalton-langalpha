@@ -1563,4 +1563,3 @@ async def test_muse_ember_client_wire_payload_contributor_zero_and_tool_calling(
         assert body_2["tools"][0]["name"] == "add_numbers"
         assert resp_tool.tool_calls and resp_tool.tool_calls[0]["name"] == "add_numbers"
         assert resp_tool.tool_calls[0]["args"] == {"a": 2, "b": 3}
-

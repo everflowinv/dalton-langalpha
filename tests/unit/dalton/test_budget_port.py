@@ -1638,7 +1638,3 @@ def test_muse_ember_nominal_pricing_tracking_budget_breakdown_and_journal(
         }
     ]
     assert compute_subscription_notional_usd(legacy_multi_call_row) == Decimal("0.030000")
-
-
-
-
