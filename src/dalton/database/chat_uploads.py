@@ -33,6 +33,7 @@ _COLUMN_NAMES = (
     "object_key",
     "store_upload_id",
     "uploaded_parts",
+    "pending_claims",
     "expected_sha256",
     "actual_sha256",
     "state",
@@ -48,6 +49,35 @@ _COLUMN_NAMES = (
 
 _COLUMNS = ",\n    ".join(_COLUMN_NAMES)
 _U_COLUMNS = ",\n    ".join(f"u.{col}" for col in _COLUMN_NAMES)
+
+
+def _live_provisional_sql(alias: str = "", now_expr: str = "NOW()") -> str:
+    prefix = f"{alias}." if alias else ""
+    return (
+        "EXISTS ("
+        "SELECT 1 "
+        f"FROM jsonb_each_text(COALESCE({prefix}pending_claims, '{{}}'::jsonb)) "
+        "AS kv(claim_key, claim_until) "
+        f"WHERE kv.claim_until::timestamptz > {now_expr}"
+        ")"
+    )
+
+
+def _pruned_claims_sql(
+    alias: str = "",
+    *,
+    now_expr: str = "NOW()",
+    drop_key_param: str | None = None,
+) -> str:
+    prefix = f"{alias}." if alias else ""
+    key_guard = f"AND kv.key <> {drop_key_param} " if drop_key_param else ""
+    return (
+        "COALESCE(("
+        "SELECT jsonb_object_agg(kv.key, to_jsonb(kv.value)) "
+        f"FROM jsonb_each_text(COALESCE({prefix}pending_claims, '{{}}'::jsonb)) AS kv "
+        f"WHERE kv.value::timestamptz > {now_expr} {key_guard}"
+        "), '{}'::jsonb)"
+    )
 
 
 async def create_upload_guarded(
@@ -68,7 +98,7 @@ async def create_upload_guarded(
     max_active_uploads: int,
     max_active_bytes: int,
 ) -> dict[str, Any] | None:
-    """Insert an ``uploading`` row if the user is within active count and byte quotas."""
+    """Insert an ``uploading`` row if the user is within unaccepted count and byte quotas."""
     async with get_db_connection() as conn:
         async with conn.transaction():
             async with conn.cursor(row_factory=dict_row) as cur:
@@ -77,14 +107,24 @@ async def create_upload_guarded(
                     (_USER_UPLOAD_LOCK_NS, user_id),
                 )
                 await cur.execute(
-                    """
+                    f"""
                     SELECT
                         COUNT(*)::int AS active_count,
-                        COALESCE(SUM(size_bytes), 0)::bigint AS active_bytes
-                    FROM dalton_chat_file_uploads
-                    WHERE user_id = %s
-                      AND state IN ('uploading', 'completing')
-                      AND expires_at > NOW()
+                        COALESCE(SUM(u.size_bytes), 0)::bigint AS active_bytes
+                    FROM dalton_chat_file_uploads AS u
+                    WHERE u.user_id = %s
+                      AND u.cleaned_at IS NULL
+                      AND (
+                          (u.state IN ('uploading', 'completing') AND u.expires_at > NOW())
+                          OR (
+                              u.state = 'ready'
+                              AND u.used_at IS NULL
+                              AND (
+                                  (u.expires_at IS NOT NULL AND u.expires_at > NOW())
+                                  OR {_live_provisional_sql("u", "NOW()")}
+                              )
+                          )
+                      )
                     """,
                     (user_id,),
                 )
@@ -359,19 +399,23 @@ async def abort_upload(
     *,
     user_id: str,
 ) -> dict[str, Any] | None:
-    """Cancel an upload owned by ``user_id`` unless it is already referenced by a chat turn."""
+    """Cancel an upload owned by ``user_id`` unless it is claimed or referenced by a chat turn."""
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 f"""
                 WITH prior AS (
-                    SELECT upload_id, state AS prev_state
-                    FROM dalton_chat_file_uploads
-                    WHERE upload_id = %s
-                      AND user_id = %s
+                    SELECT u.upload_id, u.state AS prev_state
+                    FROM dalton_chat_file_uploads AS u
+                    WHERE u.upload_id = %s
+                      AND u.user_id = %s
                       AND (
-                          state IN ('uploading', 'completing', 'failed')
-                          OR (state = 'ready' AND used_at IS NULL)
+                          u.state IN ('uploading', 'completing', 'failed')
+                          OR (
+                              u.state = 'ready'
+                              AND u.used_at IS NULL
+                              AND NOT {_live_provisional_sql("u", "NOW()")}
+                          )
                       )
                     FOR UPDATE
                 )
@@ -379,6 +423,7 @@ async def abort_upload(
                 SET state = 'aborted',
                     claim_token = NULL,
                     lease_until = NULL,
+                    pending_claims = '{{}}'::jsonb,
                     cleaned_at = NULL,
                     expires_at = LEAST(COALESCE(u.expires_at, NOW()), NOW()),
                     updated_at = NOW()
@@ -419,28 +464,269 @@ async def mark_used(
     now: datetime | None = None,
 ) -> dict[str, Any] | None:
     """Stamp ``used_at`` and clear ``expires_at`` so an accepted upload stays durable for workspace life."""
+    now_expr = "COALESCE(%(now)s::timestamptz, NOW())"
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 f"""
-                UPDATE dalton_chat_file_uploads
-                SET used_at = COALESCE(used_at, COALESCE(%s::timestamptz, NOW())),
+                UPDATE dalton_chat_file_uploads AS u
+                SET used_at = COALESCE(u.used_at, {now_expr}),
                     expires_at = NULL,
-                    updated_at = COALESCE(%s::timestamptz, NOW())
-                WHERE upload_id = %s
-                  AND user_id = %s
-                  AND workspace_id = %s
-                  AND state = 'ready'
-                  AND cleaned_at IS NULL
+                    pending_claims = {_pruned_claims_sql("u", now_expr=now_expr)},
+                    updated_at = {now_expr}
+                WHERE u.upload_id = %(upload_id)s
+                  AND u.user_id = %(user_id)s
+                  AND u.workspace_id = %(workspace_id)s
+                  AND u.state = 'ready'
+                  AND u.cleaned_at IS NULL
                   AND (
-                      used_at IS NOT NULL
-                      OR (expires_at IS NOT NULL AND expires_at > COALESCE(%s::timestamptz, NOW()))
+                      u.used_at IS NOT NULL
+                      OR (u.expires_at IS NOT NULL AND u.expires_at > {now_expr})
+                      OR {_live_provisional_sql("u", now_expr)}
                   )
-                RETURNING {_COLUMNS}
+                RETURNING {_U_COLUMNS}
                 """,
-                (now, now, upload_id, user_id, workspace_id, now),
+                {
+                    "now": now,
+                    "upload_id": upload_id,
+                    "user_id": user_id,
+                    "workspace_id": workspace_id,
+                },
             )
             return await cur.fetchone()
+
+
+async def claim_provisional_batch(
+    upload_ids: Sequence[str],
+    *,
+    user_id: str,
+    workspace_id: str,
+    claim_key: str,
+    ttl: timedelta,
+    now: datetime | None = None,
+) -> dict[str, dict[str, Any]] | None:
+    """Atomically place a bounded provisional claim on all ``upload_ids`` without mutating ``used_at`` or ``expires_at``."""
+    unique_ids = [str(uid) for uid in dict.fromkeys(upload_ids) if uid]
+    if not unique_ids:
+        return {}
+    key = str(claim_key or "").strip()
+    if not key:
+        return None
+    now_expr = "COALESCE(%(now)s::timestamptz, NOW())"
+    async with get_db_connection() as conn:
+        async with conn.transaction():
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    f"""
+                    SELECT u.upload_id
+                    FROM dalton_chat_file_uploads AS u
+                    WHERE u.upload_id = ANY(%(ids)s)
+                      AND u.user_id = %(user_id)s
+                      AND u.workspace_id = %(workspace_id)s
+                      AND u.state = 'ready'
+                      AND u.cleaned_at IS NULL
+                      AND (
+                          u.used_at IS NOT NULL
+                          OR (u.expires_at IS NOT NULL AND u.expires_at > {now_expr})
+                          OR {_live_provisional_sql("u", now_expr)}
+                      )
+                    ORDER BY u.upload_id
+                    FOR UPDATE
+                    """,
+                    {
+                        "ids": unique_ids,
+                        "user_id": user_id,
+                        "workspace_id": workspace_id,
+                        "now": now,
+                    },
+                )
+                locked = await cur.fetchall()
+                if len(locked) != len(unique_ids):
+                    return None
+                await cur.execute(
+                    f"""
+                    UPDATE dalton_chat_file_uploads AS u
+                    SET pending_claims = {_pruned_claims_sql("u", now_expr=now_expr, drop_key_param="%(claim_key)s")}
+                            || jsonb_build_object(
+                                %(claim_key)s::text,
+                                to_jsonb({now_expr} + %(ttl)s::interval)
+                            ),
+                        updated_at = {now_expr}
+                    WHERE u.upload_id = ANY(%(ids)s)
+                    RETURNING {_U_COLUMNS}
+                    """,
+                    {
+                        "ids": unique_ids,
+                        "claim_key": key,
+                        "ttl": ttl,
+                        "now": now,
+                    },
+                )
+                rows = await cur.fetchall()
+                return {str(r["upload_id"]): dict(r) for r in rows}
+
+
+async def confirm_provisional_claims(
+    upload_ids: Sequence[str],
+    *,
+    user_id: str,
+    workspace_id: str,
+    claim_key: str | None = None,
+    conn: Any = None,
+    now: datetime | None = None,
+) -> dict[str, dict[str, Any]] | None:
+    """Finalize durable retention (``used_at``, ``expires_at = NULL``) in the caller's admission transaction."""
+    unique_ids = [str(uid) for uid in dict.fromkeys(upload_ids) if uid]
+    if not unique_ids:
+        return {}
+
+    async def _run_on_conn(active_conn: Any) -> dict[str, dict[str, Any]] | None:
+        now_expr = "COALESCE(%(now)s::timestamptz, NOW())"
+        clean_key = str(claim_key).strip() if claim_key else None
+        pruned_expr = (
+            _pruned_claims_sql("u", now_expr=now_expr, drop_key_param="%(claim_key)s")
+            if clean_key
+            else _pruned_claims_sql("u", now_expr=now_expr)
+        )
+        async with active_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                SELECT u.upload_id
+                FROM dalton_chat_file_uploads AS u
+                WHERE u.upload_id = ANY(%(ids)s)
+                  AND u.user_id = %(user_id)s
+                  AND u.workspace_id = %(workspace_id)s
+                  AND u.state = 'ready'
+                  AND u.cleaned_at IS NULL
+                  AND (
+                      u.used_at IS NOT NULL
+                      OR (u.expires_at IS NOT NULL AND u.expires_at > {now_expr})
+                      OR {_live_provisional_sql("u", now_expr)}
+                  )
+                ORDER BY u.upload_id
+                FOR UPDATE
+                """,
+                {
+                    "ids": unique_ids,
+                    "user_id": user_id,
+                    "workspace_id": workspace_id,
+                    "now": now,
+                },
+            )
+            locked = await cur.fetchall()
+            if len(locked) != len(unique_ids):
+                return None
+            await cur.execute(
+                f"""
+                UPDATE dalton_chat_file_uploads AS u
+                SET used_at = COALESCE(u.used_at, {now_expr}),
+                    expires_at = NULL,
+                    pending_claims = {pruned_expr},
+                    updated_at = {now_expr}
+                WHERE u.upload_id = ANY(%(ids)s)
+                RETURNING {_U_COLUMNS}
+                """,
+                {
+                    "ids": unique_ids,
+                    "claim_key": clean_key,
+                    "now": now,
+                },
+            )
+            rows = await cur.fetchall()
+            return {str(r["upload_id"]): dict(r) for r in rows}
+
+    if conn is not None:
+        return await _run_on_conn(conn)
+    async with get_db_connection() as owned:
+        async with owned.transaction():
+            return await _run_on_conn(owned)
+
+
+async def release_provisional_claims(
+    *,
+    user_id: str,
+    claim_key: str,
+    request_key: str | None = None,
+    upload_ids: Sequence[str] | None = None,
+    now: datetime | None = None,
+) -> int:
+    """Release ``claim_key`` on rejection unless another copy with ``request_key`` was durably accepted."""
+    key = str(claim_key or "").strip()
+    if not key:
+        return 0
+    from src.server.database.runs.lifecycle import request_key_has_run
+    from src.server.database.runs.outbox import steer_key_taken
+
+    unique_ids = (
+        [str(uid) for uid in dict.fromkeys(upload_ids) if uid]
+        if upload_ids is not None
+        else None
+    )
+    if unique_ids is not None and not unique_ids:
+        return 0
+    now_expr = "COALESCE(%(now)s::timestamptz, NOW())"
+    id_filter = "AND u.upload_id = ANY(%(ids)s)" if unique_ids is not None else ""
+    async with get_db_connection() as conn:
+        async with conn.transaction():
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    f"""
+                    SELECT u.upload_id
+                    FROM dalton_chat_file_uploads AS u
+                    WHERE u.user_id = %(user_id)s
+                      {id_filter}
+                      AND COALESCE(u.pending_claims, '{{}}'::jsonb) ? %(claim_key)s
+                    ORDER BY u.upload_id
+                    FOR UPDATE
+                    """,
+                    {
+                        "user_id": user_id,
+                        "ids": unique_ids,
+                        "claim_key": key,
+                    },
+                )
+                locked_ids = [str(r["upload_id"]) for r in await cur.fetchall()]
+                if not locked_ids:
+                    return 0
+
+                clean_req_key = str(request_key).strip() if request_key else ""
+                if clean_req_key and (
+                    await request_key_has_run(conn, clean_req_key)
+                    or await steer_key_taken(conn, clean_req_key)
+                ):
+                    await cur.execute(
+                        f"""
+                        UPDATE dalton_chat_file_uploads AS u
+                        SET used_at = COALESCE(u.used_at, {now_expr}),
+                            expires_at = NULL,
+                            pending_claims = {_pruned_claims_sql("u", now_expr=now_expr, drop_key_param="%(claim_key)s")},
+                            updated_at = {now_expr}
+                        WHERE u.upload_id = ANY(%(locked_ids)s)
+                          AND u.state = 'ready'
+                          AND u.cleaned_at IS NULL
+                        """,
+                        {
+                            "locked_ids": locked_ids,
+                            "claim_key": key,
+                            "now": now,
+                        },
+                    )
+                    return 0
+
+                await cur.execute(
+                    f"""
+                    UPDATE dalton_chat_file_uploads AS u
+                    SET pending_claims = {_pruned_claims_sql("u", now_expr=now_expr, drop_key_param="%(claim_key)s")},
+                        updated_at = {now_expr}
+                    WHERE u.upload_id = ANY(%(locked_ids)s)
+                    """,
+                    {
+                        "locked_ids": locked_ids,
+                        "claim_key": key,
+                        "now": now,
+                    },
+                )
+                return int(cur.rowcount or 0)
 
 
 async def has_retained_workspace_uploads(
@@ -516,6 +802,7 @@ async def retire_uploads_by_ids(
                 SET state = 'aborted',
                     claim_token = NULL,
                     lease_until = NULL,
+                    pending_claims = '{{}}'::jsonb,
                     cleaned_at = NULL,
                     expires_at = NOW(),
                     updated_at = NOW()
@@ -545,6 +832,7 @@ async def retire_workspace_uploads(workspace_id: str) -> list[dict[str, Any]]:
                 SET state = 'aborted',
                     claim_token = NULL,
                     lease_until = NULL,
+                    pending_claims = '{{}}'::jsonb,
                     cleaned_at = NULL,
                     expires_at = NOW(),
                     updated_at = NOW()
@@ -572,6 +860,7 @@ async def claim_cleanup_batch(
     """
     capped = max(1, min(int(limit), 100))
     token = str(claim_token).strip() if claim_token else str(uuid.uuid4())
+    now_expr = "COALESCE(%(now)s::timestamptz, NOW())"
     async with get_db_connection() as conn:
         async with conn.transaction():
             async with conn.cursor(row_factory=dict_row) as cur:
@@ -583,20 +872,21 @@ async def claim_cleanup_batch(
                         WHERE u.cleaned_at IS NULL
                           AND (
                               u.lease_until IS NULL
-                              OR u.lease_until < COALESCE(%(now)s::timestamptz, NOW())
+                              OR u.lease_until < {now_expr}
                           )
                           AND (
                               u.state IN ('aborted', 'failed')
                               OR (
                                   u.state IN ('uploading', 'completing')
                                   AND u.expires_at IS NOT NULL
-                                  AND u.expires_at <= COALESCE(%(now)s::timestamptz, NOW())
+                                  AND u.expires_at <= {now_expr}
                               )
                               OR (
                                   u.state = 'ready'
                                   AND u.used_at IS NULL
                                   AND u.expires_at IS NOT NULL
-                                  AND u.expires_at <= COALESCE(%(now)s::timestamptz, NOW())
+                                  AND u.expires_at <= {now_expr}
+                                  AND NOT {_live_provisional_sql("u", now_expr)}
                               )
                               OR EXISTS (
                                   SELECT 1
@@ -615,8 +905,9 @@ async def claim_cleanup_batch(
                             ELSE u.state
                         END,
                         claim_token = %(claim_token)s,
-                        lease_until = COALESCE(%(now)s::timestamptz, NOW()) + %(claim_lease)s::interval,
-                        updated_at = COALESCE(%(now)s::timestamptz, NOW())
+                        pending_claims = '{{}}'::jsonb,
+                        lease_until = {now_expr} + %(claim_lease)s::interval,
+                        updated_at = {now_expr}
                     FROM due
                     WHERE u.upload_id = due.upload_id
                     RETURNING {_U_COLUMNS}

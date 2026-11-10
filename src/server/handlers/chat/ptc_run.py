@@ -192,6 +192,8 @@ async def astream_ptc_workflow(
     extra_configurable: dict | None = None,
     named_model: NamedModel | None = None,
     setup_over: asyncio.Event | None = None,
+    # DALTON-HOOK(chat-large-upload): adopt provisional claim acquired pre-stream in messaging.py
+    upload_preclaimed: bool = False,
 ):
     """Async generator that streams PTC agent workflow events.
 
@@ -272,337 +274,353 @@ async def astream_ptc_workflow(
         await admission_lock.acquire()
         scope.hold_admission(admission_lock)
 
-        # Idempotency probe under the admission lock: a retransmitted
-        # request_key resolves to its existing run HERE, before the steering
-        # or fork paths below can act on the duplicate (raises
-        # DuplicateRequestError → structured duplicate_request SSE).
-        await dedup_retransmit_or_raise(
-            thread_id, request.request_key, except_job_id=request.steer_job_id
-        )
+        # DALTON-HOOK(chat-large-upload): hold provisional attachment claims across admission and release on rejection
+        from src.dalton.services.chat_uploads import ChatUploadSendScope
 
-        # DALTON-HOOK(artifact-publishing-off): defense in depth for the send
-        # route's own pre-stream check (messaging.py): a request carrying file
-        # comments while artifact publishing is deployment-disabled is refused
-        # here too, before CommentSendScope can take (and later un-take) them.
-        if request.artifact_comment_ids:
-            from src.dalton.settings import is_artifact_publishing_enabled
-
-            if not is_artifact_publishing_enabled():
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "code": "artifact_publishing_disabled",
-                        "message": "File comments are disabled on this deployment.",
-                    },
-                )
-
-        # File comments go out as this send's message, taken under its key
-        # here because admission needs the message; the scope gives them back
-        # if the send fails before a run or a steer takes it.
-        async with CommentSendScope(
-            thread_id=thread_id,
+        async with ChatUploadSendScope(
+            additional_context=(
+                None if request.hitl_response else request.additional_context
+            ),
             user_id=user_id,
-            chief_of_staff=route.role == "chief_of_staff",
-            timezone=request.timezone,
-        ) as comments:
-            request, user_input = await comments.take(
-                request,
-                user_input,
-                make_thread=partial(
-                    make_thread,
+            workspace_id=workspace_id,
+            request_key=request.request_key,
+            run_id=run_id,
+            is_existing_colleague_thread=(workspace_owner_id != str(user_id)),
+            preclaimed=upload_preclaimed,
+        ) as upload_claims:
+            # Idempotency probe under the admission lock: a retransmitted
+            # request_key resolves to its existing run HERE, before the steering
+            # or fork paths below can act on the duplicate (raises
+            # DuplicateRequestError → structured duplicate_request SSE).
+            await dedup_retransmit_or_raise(
+                thread_id, request.request_key, except_job_id=request.steer_job_id
+            )
+
+            # DALTON-HOOK(artifact-publishing-off): defense in depth for the send
+            # route's own pre-stream check (messaging.py): a request carrying file
+            # comments while artifact publishing is deployment-disabled is refused
+            # here too, before CommentSendScope can take (and later un-take) them.
+            if request.artifact_comment_ids:
+                from src.dalton.settings import is_artifact_publishing_enabled
+
+                if not is_artifact_publishing_enabled():
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "artifact_publishing_disabled",
+                            "message": "File comments are disabled on this deployment.",
+                        },
+                    )
+
+            # File comments go out as this send's message, taken under its key
+            # here because admission needs the message; the scope gives them back
+            # if the send fails before a run or a steer takes it.
+            async with CommentSendScope(
+                thread_id=thread_id,
+                user_id=user_id,
+                chief_of_staff=route.role == "chief_of_staff",
+                timezone=request.timezone,
+            ) as comments:
+                request, user_input = await comments.take(
                     request,
-                    thread_id,
-                    workspace_id,
-                    user_id,
-                    # DALTON-HOOK(colleague-dispatch): a thread comments.take
-                    # creates in a colleague's workspace carries the same
-                    # dispatched_by metadata ensure_thread would stamp.
-                    workspace_owner_id=workspace_owner_id,
-                    origin_channel=origin_channel,
-                    is_colleague_turn=workspace_owner_id != str(user_id),
-                ),
-            )
-
-            # =====================================================================
-            # Early steering routing
-            # =====================================================================
-            # If a workflow is already running for this thread, route this POST
-            # into it as a steer *before* any turn row is written. Detecting steering
-            # here keeps ``conversation_queries`` clean — a steering message is
-            # neither a run nor a turn (v4 identity model); its content is archived
-            # on the owning response's metadata at finalize.
-            workspace_manager = WorkspaceManager.get_instance()
-            needs_startup = not workspace_manager.has_ready_session(workspace_id)
-            # When the workspace was evicted/restarted, any in-BTM LocalRunExecution for
-            # this thread holds a stale sandbox reference — cancel it first so
-            # admission/steering routes against live state only (this run isn't
-            # registered anywhere yet; its row commits at START, below).
-            if needs_startup:
-                await manager.cancel_stale_workflow(thread_id)
-            from src.server.services.thread_mutation import ThreadMutationRunner
-
-            # A send held behind a thread mutation (a /compact, the hand-off at a
-            # model switch) is told why it waits, as a cold start is. Not a
-            # dispatch's primer or a steer probe, which read the first frame as
-            # their answer.
-            held_by = (
-                None
-                if dispatched or request.steer_only
-                else await ThreadMutationRunner.get_instance().holding_verb(thread_id)
-            )
-            # Admit a fresh turn, steer the running one, or 409 — see
-            # ``wait_or_steer``; who may steer at all is ``steer_allowed``.
-            # DALTON-HOOK(chat-large-upload): carry validated chat_upload descriptors on steers
-            from src.dalton.services.chat_uploads import extract_chat_upload_contexts
-
-            admit = partial(
-                wait_or_steer,
-                manager,
-                thread_id,
-                user_input,
-                user_id,
-                steer_only=request.steer_only,
-                platform=request.platform,
-                request_key=request.request_key,
-                workspace_id=workspace_id,
-                steer_job_id=request.steer_job_id,
-                # A hand-off into a running turn answers the dispatch primer
-                # with ``HandOffSteered``: that run's id and the steer's.
-                agent=agent_steer_of(request, dispatched=dispatched, run_id=run_id),
-                can_steer=steer_allowed(
-                    request, dispatched=dispatched, steerable=steerable
-                ),
-                artifact_comments=request.artifact_comments,
-                chat_uploads=extract_chat_upload_contexts(request.additional_context)
-                or None,
-            )
-            if held_by is None:
-                ready, steering_event = await admit()
-            else:
-                yield _turn_held({"status": "held", "reason": held_by})
-                ready, steering_event = await admit()
-                yield _turn_held({"status": "released"})
-            if not ready:
-                # Steered: the running turn, or the turn it becomes, has it.
-                await comments.admitted()
-                await scope.release_slot()
-                # Release admission immediately — no workflow will register
-                # under this lock, so holding it would needlessly block any
-                # follow-up POST.
-                scope.release_admission()
-                if steering_event:
-                    yield steering_event
-                return
-
-            # =====================================================================
-            # Database Persistence Setup
-            # =====================================================================
-
-            if comments.made_thread:
-                prior_thread = PriorThread()
-            else:
-                # DALTON-HOOK(colleague-dispatch): pass workspace_owner_id and origin_channel to ensure_thread for colleague thread metadata
-                prior_thread = await ensure_thread(
-                    request,
-                    thread_id,
-                    workspace_id,
-                    user_id,
-                    initial_query=user_input,
-                    row_ensured=comments.row_ensured,
-                    **(
-                        {
-                            "workspace_owner_id": workspace_owner_id,
-                            "origin_channel": origin_channel,
-                        }
-                        if workspace_owner_id != str(user_id)
-                        else {}
+                    user_input,
+                    make_thread=partial(
+                        make_thread,
+                        request,
+                        thread_id,
+                        workspace_id,
+                        user_id,
+                        # DALTON-HOOK(colleague-dispatch): a thread comments.take
+                        # creates in a colleague's workspace carries the same
+                        # dispatched_by metadata ensure_thread would stamp.
+                        workspace_owner_id=workspace_owner_id,
+                        origin_channel=origin_channel,
+                        is_colleague_turn=workspace_owner_id != str(user_id),
                     ),
                 )
-            # /retry builds its attempt with no surface: it runs where the
-            # attempt it retries did, under the same rules.
-            request, inherits_rules = await retried_on_its_surface(request)
-            disk_free_mb, disk_known = await read_disk_notice(workspace_id)
-            user_profile = (
-                await get_user_profile_for_prompt(user_id) if user_id else None
-            )
-            # DALTON-HOOK(i18n): a user with no saved users.locale gets the Dalton default (zh-CN), matching the web UI
-            from src.dalton.user_locale import with_default_locale
 
-            user_profile = with_default_locale(user_profile)
-            turn_context = build_turn_context(
-                request,
-                prior_thread,
-                user_profile=user_profile,
-                disk_free_mb=disk_free_mb,
-                disk_known=disk_known,
-                inherits_rules=inherits_rules,
-                sent_at=start_time,
-            )
+                # =====================================================================
+                # Early steering routing
+                # =====================================================================
+                # If a workflow is already running for this thread, route this POST
+                # into it as a steer *before* any turn row is written. Detecting steering
+                # here keeps ``conversation_queries`` clean — a steering message is
+                # neither a run nor a turn (v4 identity model); its content is archived
+                # on the owning response's metadata at finalize.
+                workspace_manager = WorkspaceManager.get_instance()
+                needs_startup = not workspace_manager.has_ready_session(workspace_id)
+                # When the workspace was evicted/restarted, any in-BTM LocalRunExecution for
+                # this thread holds a stale sandbox reference — cancel it first so
+                # admission/steering routes against live state only (this run isn't
+                # registered anywhere yet; its row commits at START, below).
+                if needs_startup:
+                    await manager.cancel_stale_workflow(thread_id)
+                from src.server.services.thread_mutation import ThreadMutationRunner
 
-            query_type, fork = _resolve_fork(request=request, thread_id=thread_id)
-            is_checkpoint_replay = bool(request.checkpoint_id and not request.messages)
+                # A send held behind a thread mutation (a /compact, the hand-off at a
+                # model switch) is told why it waits, as a cold start is. Not a
+                # dispatch's primer or a steer probe, which read the first frame as
+                # their answer.
+                held_by = (
+                    None
+                    if dispatched or request.steer_only
+                    else await ThreadMutationRunner.get_instance().holding_verb(thread_id)
+                )
+                # Admit a fresh turn, steer the running one, or 409 — see
+                # ``wait_or_steer``; who may steer at all is ``steer_allowed``.
+                # DALTON-HOOK(chat-large-upload): carry validated chat_upload descriptors on steers
+                from src.dalton.services.chat_uploads import extract_chat_upload_contexts
 
-            # Resolve LLM config (pre-resolved by the route handler, fallback for
-            # standalone use). Ahead of the metadata below on purpose: that block
-            # records the model and the detected slash command, and both are read
-            # off this config. Resolved late, the standalone path would stamp a
-            # skill the turn then refuses, because activation gates on the
-            # resolved registry while the metadata had nothing to gate on. The
-            # route already resolves before this generator runs, so this only
-            # moves the standalone path onto the ordering production has.
-            if config is None:
-                config = await resolve_llm_config(
-                    setup.agent_config,
+                admit = partial(
+                    wait_or_steer,
+                    manager,
+                    thread_id,
+                    user_input,
                     user_id,
-                    request.llm_model,
-                    is_byok,
-                    reasoning_effort=getattr(request, "reasoning_effort", None),
-                    fast_mode=getattr(request, "fast_mode", None),
-                    thread_id=thread_id,
-                    enabled_subagents=request.subagents_enabled,
+                    steer_only=request.steer_only,
+                    platform=request.platform,
+                    request_key=request.request_key,
                     workspace_id=workspace_id,
-                    role=route.role,
+                    steer_job_id=request.steer_job_id,
+                    # A hand-off into a running turn answers the dispatch primer
+                    # with ``HandOffSteered``: that run's id and the steer's.
+                    agent=agent_steer_of(request, dispatched=dispatched, run_id=run_id),
+                    can_steer=steer_allowed(
+                        request, dispatched=dispatched, steerable=steerable
+                    ),
+                    artifact_comments=request.artifact_comments,
+                    chat_uploads=extract_chat_upload_contexts(request.additional_context)
+                    or None,
+                )
+                if held_by is None:
+                    ready, steering_event = await admit()
+                else:
+                    yield _turn_held({"status": "held", "reason": held_by})
+                    ready, steering_event = await admit()
+                    yield _turn_held({"status": "released"})
+                if not ready:
+                    # Steered: the running turn, or the turn it becomes, has it.
+                    upload_claims.mark_admitted()
+                    await comments.admitted()
+                    await scope.release_slot()
+                    # Release admission immediately — no workflow will register
+                    # under this lock, so holding it would needlessly block any
+                    # follow-up POST.
+                    scope.release_admission()
+                    if steering_event:
+                        yield steering_event
+                    return
+
+                # =====================================================================
+                # Database Persistence Setup
+                # =====================================================================
+
+                if comments.made_thread:
+                    prior_thread = PriorThread()
+                else:
+                    # DALTON-HOOK(colleague-dispatch): pass workspace_owner_id and origin_channel to ensure_thread for colleague thread metadata
+                    prior_thread = await ensure_thread(
+                        request,
+                        thread_id,
+                        workspace_id,
+                        user_id,
+                        initial_query=user_input,
+                        row_ensured=comments.row_ensured,
+                        **(
+                            {
+                                "workspace_owner_id": workspace_owner_id,
+                                "origin_channel": origin_channel,
+                            }
+                            if workspace_owner_id != str(user_id)
+                            else {}
+                        ),
+                    )
+                # /retry builds its attempt with no surface: it runs where the
+                # attempt it retries did, under the same rules.
+                request, inherits_rules = await retried_on_its_surface(request)
+                disk_free_mb, disk_known = await read_disk_notice(workspace_id)
+                user_profile = (
+                    await get_user_profile_for_prompt(user_id) if user_id else None
+                )
+                # DALTON-HOOK(i18n): a user with no saved users.locale gets the Dalton default (zh-CN), matching the web UI
+                from src.dalton.user_locale import with_default_locale
+
+                user_profile = with_default_locale(user_profile)
+                turn_context = build_turn_context(
+                    request,
+                    prior_thread,
+                    user_profile=user_profile,
+                    disk_free_mb=disk_free_mb,
+                    disk_known=disk_known,
+                    inherits_rules=inherits_rules,
+                    sent_at=start_time,
                 )
 
-            # Persist query start
-            feedback_action = None
-            query_content = user_input
-            effective_model = config.llm.name if config and config.llm else None
-            if config is not None:
-                require_attended(config, request)
-            # DALTON-HOOK(turn-row-model-line): the anchor row states the model
-            # the server resolved for this turn (the automation's llm_model, a
-            # client-named model, or the account default) as a settled fact.
-            turn_context = with_resolved_model(turn_context, effective_model)
-            # Off the resolved credential, not off ``is_byok``: that flag answers
-            # which ladder to try, and an automation with only an OAuth token
-            # passes it false while still paying its own vendor bill.
-            own_key = is_own_key_turn(config)
-            query_metadata = {
-                # The resolved one: a request may name a former Home row.
-                "workspace_id": workspace_id,
-            }
-            if effective_model:
-                query_metadata["llm_model"] = effective_model
-            query_metadata.update(provenance_metadata(request))
+                query_type, fork = _resolve_fork(request=request, thread_id=thread_id)
+                is_checkpoint_replay = bool(request.checkpoint_id and not request.messages)
 
-            # Extract attachment and context metadata for display in history
-            # (skipped for HITL resumes)
-            widget_ctxs = parse_widget_contexts(request.additional_context)
-            chart_selections = parse_chart_selection_contexts(
-                request.additional_context
-            )
-            if request.additional_context and not request.hitl_response:
-                multimodal_ctxs = parse_multimodal_contexts(request.additional_context)
-                # DALTON-HOOK(chat-large-upload): record history attachment metadata for server-stored chat_upload items
-                from src.dalton.services.chat_uploads import (
-                    build_chat_upload_history_metadata,
-                    extract_chat_upload_contexts,
-                )
+                # Resolve LLM config (pre-resolved by the route handler, fallback for
+                # standalone use). Ahead of the metadata below on purpose: that block
+                # records the model and the detected slash command, and both are read
+                # off this config. Resolved late, the standalone path would stamp a
+                # skill the turn then refuses, because activation gates on the
+                # resolved registry while the metadata had nothing to gate on. The
+                # route already resolves before this generator runs, so this only
+                # moves the standalone path onto the ordering production has.
+                if config is None:
+                    config = await resolve_llm_config(
+                        setup.agent_config,
+                        user_id,
+                        request.llm_model,
+                        is_byok,
+                        reasoning_effort=getattr(request, "reasoning_effort", None),
+                        fast_mode=getattr(request, "fast_mode", None),
+                        thread_id=thread_id,
+                        enabled_subagents=request.subagents_enabled,
+                        workspace_id=workspace_id,
+                        role=route.role,
+                    )
 
-                chat_upload_ctxs = extract_chat_upload_contexts(
+                # Persist query start
+                feedback_action = None
+                query_content = user_input
+                effective_model = config.llm.name if config and config.llm else None
+                if config is not None:
+                    require_attended(config, request)
+                # DALTON-HOOK(turn-row-model-line): the anchor row states the model
+                # the server resolved for this turn (the automation's llm_model, a
+                # client-named model, or the account default) as a settled fact.
+                turn_context = with_resolved_model(turn_context, effective_model)
+                # Off the resolved credential, not off ``is_byok``: that flag answers
+                # which ladder to try, and an automation with only an OAuth token
+                # passes it false while still paying its own vendor bill.
+                own_key = is_own_key_turn(config)
+                query_metadata = {
+                    # The resolved one: a request may name a former Home row.
+                    "workspace_id": workspace_id,
+                }
+                if effective_model:
+                    query_metadata["llm_model"] = effective_model
+                query_metadata.update(provenance_metadata(request))
+
+                # Extract attachment and context metadata for display in history
+                # (skipped for HITL resumes)
+                widget_ctxs = parse_widget_contexts(request.additional_context)
+                chart_selections = parse_chart_selection_contexts(
                     request.additional_context
                 )
-                # A retry writes no query row, so a second upload would be
-                # stored for nothing.
-                if (multimodal_ctxs or chat_upload_ctxs) and not request.retry_of_run_id:
-                    att_meta: list[dict] = []
-                    if multimodal_ctxs:
-                        att_meta.extend(
-                            await build_attachment_metadata(multimodal_ctxs, thread_id)
-                        )
-                    if chat_upload_ctxs:
-                        att_meta.extend(
-                            await build_chat_upload_history_metadata(
-                                request.additional_context,
-                                user_id=user_id,
-                                workspace_id=workspace_id,
+                if request.additional_context and not request.hitl_response:
+                    multimodal_ctxs = parse_multimodal_contexts(request.additional_context)
+                    # DALTON-HOOK(chat-large-upload): record history attachment metadata for server-stored chat_upload items
+                    from src.dalton.services.chat_uploads import (
+                        build_chat_upload_history_metadata,
+                        extract_chat_upload_contexts,
+                    )
+
+                    chat_upload_ctxs = extract_chat_upload_contexts(
+                        request.additional_context
+                    )
+                    # A retry writes no query row, so a second upload would be
+                    # stored for nothing.
+                    if (multimodal_ctxs or chat_upload_ctxs) and not request.retry_of_run_id:
+                        att_meta: list[dict] = []
+                        if multimodal_ctxs:
+                            att_meta.extend(
+                                await build_attachment_metadata(multimodal_ctxs, thread_id)
                             )
+                        if chat_upload_ctxs:
+                            att_meta.extend(
+                                await build_chat_upload_history_metadata(
+                                    request.additional_context,
+                                    user_id=user_id,
+                                    workspace_id=workspace_id,
+                                )
+                            )
+                        if att_meta:
+                            query_metadata["attachments"] = att_meta
+                    if widget_ctxs:
+                        query_metadata["widget_contexts"] = (
+                            serialize_widget_contexts_for_metadata(widget_ctxs)
                         )
-                    if att_meta:
-                        query_metadata["attachments"] = att_meta
-                if widget_ctxs:
-                    query_metadata["widget_contexts"] = (
-                        serialize_widget_contexts_for_metadata(widget_ctxs)
-                    )
-                if chart_selections:
-                    query_metadata["chart_selections"] = (
-                        serialize_chart_selections_for_metadata(chart_selections)
-                    )
+                    if chart_selections:
+                        query_metadata["chart_selections"] = (
+                            serialize_chart_selections_for_metadata(chart_selections)
+                        )
 
-            # Persist lightweight additional_context + slash command fallback
-            # (serialize_context_metadata's slash-command branch already guards
-            # on `not request.hitl_response`, so this is safe to call always.)
-            if not request.hitl_response:
-                serialize_context_metadata(
-                    request,
-                    query_metadata,
-                    user_input,
-                    extra_commands=user_skill_commands(config),
-                    allowed_skills=turn_skill_names(config),
-                )
-
-            if request.artifact_comments:
-                query_metadata["artifact_comments"] = (
-                    request.artifact_comments.model_dump(mode="json")
-                )
-
-            if request.hitl_response:
-                prepared = process_hitl_response(request)
-                feedback_action = prepared.feedback_action
-                query_content = prepared.query_content
-                query_metadata.update(prepared.metadata)
-
-            # =====================================================================
-            # START txn (v4): query row + in_progress run row + thread projection
-            # in one transaction (begin_run owns the attempt-chain derivation).
-            # =====================================================================
-            # Resolved ONCE and reused by the tracker re-mark below: the raw
-            # request field is empty on public follow-ups (HITL resume, user
-            # continuation), and stamping the durable row with the inherited gen
-            # while re-marking the tracker with None would make a live admitted
-            # run read as unadmitted to the fenced-teardown probe.
-            origin_meta = await _resolve_origin_meta(request, thread_id)
-            carried = await carry.carried_pair(request, thread_id)
-            # A resume or a retry names no automation run of its own: it sends for
-            # the one the turn it continues sent for.
-            if automation_delivery.delivery_of_turn(extra_configurable or {}) is None:
-                sends_for = await carry.carried_delivery(request, thread_id)
-                if sends_for:
-                    extra_configurable = {**(extra_configurable or {}), **sends_for}
-            run_handle = await begin_run(
-                request,
-                scope=scope,
-                thread_id=thread_id,
-                run_id=run_id,
-                workspace_id=workspace_id,
-                user_id=user_id,
-                is_byok=is_byok,
-                query_content=query_content,
-                query_type=query_type,
-                feedback_action=feedback_action,
-                query_metadata=query_metadata,
-                fork=fork,
-                is_checkpoint_replay=is_checkpoint_replay,
-                extra_run_metadata={
-                    **origin_meta,
-                    **carried,
-                    **surface_stamp(
+                # Persist lightweight additional_context + slash command fallback
+                # (serialize_context_metadata's slash-command branch already guards
+                # on `not request.hitl_response`, so this is safe to call always.)
+                if not request.hitl_response:
+                    serialize_context_metadata(
                         request,
-                        prior_thread,
-                        inherits_rules=turn_context.inherits_rules,
-                    ),
-                    **automation_delivery.turn_metadata(extra_configurable),
-                    **run_stamp(config),
-                    **(run_metadata or {}),
-                },
-            )
-            # DALTON-HOOK(colleague-dispatch): promote to tail_turn_no_new_work when START lock re-check admitted a tail turn after revocation
-            if getattr(run_handle, "tail_turn_no_new_work", False):
-                tail_turn_no_new_work = True
-                if isinstance(run_metadata, dict):
-                    run_metadata["tail_turn_no_new_work"] = True
-            await comments.admitted()
+                        query_metadata,
+                        user_input,
+                        extra_commands=user_skill_commands(config),
+                        allowed_skills=turn_skill_names(config),
+                    )
+
+                if request.artifact_comments:
+                    query_metadata["artifact_comments"] = (
+                        request.artifact_comments.model_dump(mode="json")
+                    )
+
+                if request.hitl_response:
+                    prepared = process_hitl_response(request)
+                    feedback_action = prepared.feedback_action
+                    query_content = prepared.query_content
+                    query_metadata.update(prepared.metadata)
+
+                # =====================================================================
+                # START txn (v4): query row + in_progress run row + thread projection
+                # in one transaction (begin_run owns the attempt-chain derivation).
+                # =====================================================================
+                # Resolved ONCE and reused by the tracker re-mark below: the raw
+                # request field is empty on public follow-ups (HITL resume, user
+                # continuation), and stamping the durable row with the inherited gen
+                # while re-marking the tracker with None would make a live admitted
+                # run read as unadmitted to the fenced-teardown probe.
+                origin_meta = await _resolve_origin_meta(request, thread_id)
+                carried = await carry.carried_pair(request, thread_id)
+                # A resume or a retry names no automation run of its own: it sends for
+                # the one the turn it continues sent for.
+                if automation_delivery.delivery_of_turn(extra_configurable or {}) is None:
+                    sends_for = await carry.carried_delivery(request, thread_id)
+                    if sends_for:
+                        extra_configurable = {**(extra_configurable or {}), **sends_for}
+                run_handle = await begin_run(
+                    request,
+                    scope=scope,
+                    thread_id=thread_id,
+                    run_id=run_id,
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    is_byok=is_byok,
+                    query_content=query_content,
+                    query_type=query_type,
+                    feedback_action=feedback_action,
+                    query_metadata=query_metadata,
+                    fork=fork,
+                    is_checkpoint_replay=is_checkpoint_replay,
+                    extra_run_metadata={
+                        **origin_meta,
+                        **carried,
+                        **surface_stamp(
+                            request,
+                            prior_thread,
+                            inherits_rules=turn_context.inherits_rules,
+                        ),
+                        **automation_delivery.turn_metadata(extra_configurable),
+                        **run_stamp(config),
+                        **(run_metadata or {}),
+                    },
+                )
+                # DALTON-HOOK(colleague-dispatch): promote to tail_turn_no_new_work when START lock re-check admitted a tail turn after revocation
+                if getattr(run_handle, "tail_turn_no_new_work", False):
+                    tail_turn_no_new_work = True
+                    if isinstance(run_metadata, dict):
+                        run_metadata["tail_turn_no_new_work"] = True
+                upload_claims.mark_admitted()
+                await comments.admitted()
         if not is_checkpoint_replay:
             logger.debug(
                 f"[PTC_CHAT] Run started: workspace_id={workspace_id} "
@@ -1035,8 +1053,14 @@ async def astream_ptc_workflow(
         # lands on ExecutionInfo.run_id and CheckpointMetadata.run_id so
         # LangSmith / checkpoint inspection can correlate by this UUID.
         graph_config["run_id"] = run_id
+        # DALTON-HOOK(chat-large-upload): pass verified project and session into deferred steer materialization
         steer_input_id = await open_with_steers_ahead(
-            thread_id, run_id, request, input_state
+            thread_id,
+            run_id,
+            request,
+            input_state,
+            project=project,
+            session=session,
         )
         if steer_input_id:
             graph_config["configurable"]["steer_input_message_id"] = steer_input_id

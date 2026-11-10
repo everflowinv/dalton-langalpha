@@ -162,7 +162,9 @@ function turnOpenerRow(event: HistoryEvent, pairIndex: number, text: string): Me
       ...(event.report_run_id ? { runId: event.report_run_id } : {}),
     }) : null;
   }
-  if (!text) return null;
+  // DALTON-HOOK(chat-large-upload): render user turn opener for file-only messages and parked steers
+  const hasAttachments = Array.isArray(event.metadata?.attachments) && event.metadata.attachments.length > 0;
+  if (!text && !hasAttachments) return null;
   const row: MessageRecord = {
     id, role: 'user', content: event.content, contentType: 'text', timestamp,
     isStreaming: false, isHistory: true, turnIndex: pairIndex,

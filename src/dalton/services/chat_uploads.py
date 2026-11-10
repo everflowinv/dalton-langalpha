@@ -11,12 +11,11 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Sequence
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import logging
 import math
-import os
 import posixpath
 import re
 import shlex
@@ -30,7 +29,12 @@ from ptc_agent.core.project_context import ProjectContext, current_project
 from ptc_agent.core.sandbox.retry import RetryPolicy
 from src.dalton import chat_upload_storage as storage
 from src.dalton.database import chat_uploads as db
-from src.dalton.settings import get_dalton_settings, is_dalton_supabase_auth_enabled
+from src.dalton.settings import (
+    get_chat_upload_part_idle_timeout_s,
+    get_chat_upload_part_total_timeout_s,
+    get_dalton_settings,
+    is_chat_upload_cleanup_enabled,
+)
 from src.server.database.home_workspace import get_home_workspace_id, is_home_id, is_home_row
 from src.server.services.computer_disk import CRITICAL_FREE_BYTES, disk_command, parse_df
 from src.server.services.persistence.transfer import pull_direct, transfer_timeout_s
@@ -55,6 +59,7 @@ MAX_ACTIVE_USER_UPLOAD_BYTES = 1000 * _MIB
 UPLOADING_TTL = timedelta(hours=6)
 COMPLETE_LEASE = timedelta(minutes=5)
 READY_UNUSED_TTL = timedelta(hours=24)
+PROVISIONAL_CLAIM_TTL = timedelta(minutes=15)
 
 CLEANUP_INTERVAL_S = 300.0
 CLEANUP_BATCH_LIMIT = 25
@@ -307,10 +312,66 @@ async def _require_owned_upload(upload_id: str, user_id: str) -> dict[str, Any]:
     return row
 
 
+def _as_utc(ts: Any) -> datetime | None:
+    if not isinstance(ts, datetime):
+        return None
+    return ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
+
+
+def _has_live_provisional_claim(row: dict[str, Any], now_utc: datetime) -> bool:
+    claims = row.get("pending_claims")
+    if not isinstance(claims, dict) or not claims:
+        return False
+    for raw_until in claims.values():
+        if not raw_until:
+            continue
+        try:
+            parsed = datetime.fromisoformat(str(raw_until).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        until_utc = _as_utc(parsed)
+        if until_utc is not None and until_utc > now_utc:
+            return True
+    return False
+
+
 async def get_chat_upload_status(*, upload_id: str, user_id: str) -> dict[str, Any]:
     _ensure_feature_ready()
     row = await _require_owned_upload(upload_id, user_id)
     return _serialize_upload_row(row)
+
+
+def _check_part_accepting_row(
+    row: dict[str, Any],
+    part_number: int,
+    *,
+    now_utc: datetime,
+) -> dict[str, Any] | None:
+    """Return an idempotent response dict if already ``ready``, or raise if not accepting parts."""
+    state = str(row["state"])
+    if state == "ready" and row.get("cleaned_at") is None:
+        uploaded = (row.get("uploaded_parts") or {}).get(str(int(part_number)))
+        if uploaded:
+            return {
+                "upload_id": str(row["upload_id"]),
+                "part_number": int(part_number),
+                "size_bytes": int(uploaded["size"]),
+                "sha256": str(uploaded["sha256"]),
+                "state": "ready",
+            }
+        raise HTTPException(status_code=409, detail="Upload is already completed")
+    if state != "uploading" or row.get("cleaned_at") is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot upload part while upload is {state}",
+        )
+    exp = _as_utc(row.get("expires_at"))
+    if exp is None or exp <= now_utc:
+        raise HTTPException(
+            status_code=410,
+            detail="Upload has expired",
+        )
+    return None
 
 
 async def receive_chat_upload_part(
@@ -322,27 +383,15 @@ async def receive_chat_upload_part(
     content_length_header: str | None = None,
     expected_part_sha256: str | None = None,
 ) -> dict[str, Any]:
-    """Stream one bounded part from client to MinIO without buffering > ``part_size``."""
+    """Stream one bounded part from client to MinIO under idle and total deadlines."""
     _ensure_feature_ready()
     row = await _require_owned_upload(upload_id, user_id)
 
-    state = str(row["state"])
-    if state == "ready":
-        uploaded = (row.get("uploaded_parts") or {}).get(str(int(part_number)))
-        if uploaded:
-            return {
-                "upload_id": str(row["upload_id"]),
-                "part_number": int(part_number),
-                "size_bytes": int(uploaded["size"]),
-                "sha256": str(uploaded["sha256"]),
-                "state": "ready",
-            }
-        raise HTTPException(status_code=409, detail="Upload is already completed")
-    if state != "uploading":
-        raise HTTPException(
-            status_code=409,
-            detail=f"Cannot upload part while upload is {state}",
-        )
+    early_ready = _check_part_accepting_row(
+        row, int(part_number), now_utc=datetime.now(timezone.utc)
+    )
+    if early_ready is not None:
+        return early_ready
 
     expected_len = expected_part_size(row, int(part_number))
     normalized_part_sha = _normalize_sha256(
@@ -365,10 +414,56 @@ async def receive_chat_upload_part(
                 status_code=400, detail="Part is shorter than expected byte length"
             )
 
-    async with _PART_UPLOAD_SEMAPHORE:
-        buf = bytearray()
+    idle_timeout_s = get_chat_upload_part_idle_timeout_s()
+    total_timeout_s = get_chat_upload_part_total_timeout_s()
+    loop = asyncio.get_running_loop()
+    overall_deadline = loop.time() + total_timeout_s
+
+    try:
+        await asyncio.wait_for(
+            _PART_UPLOAD_SEMAPHORE.acquire(),
+            timeout=max(0.01, overall_deadline - loop.time()),
+        )
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=408,
+            detail="Part upload timed out waiting for an available upload slot",
+        ) from exc
+
+    buf = bytearray()
+    payload: bytes | None = None
+    etag: str | None = None
+    part_sha = ""
+    try:
+        # Re-verify durable state and expiry after acquiring the semaphore slot.
+        row = await _require_owned_upload(upload_id, user_id)
+        slot_ready = _check_part_accepting_row(
+            row, int(part_number), now_utc=datetime.now(timezone.utc)
+        )
+        if slot_ready is not None:
+            return slot_ready
+
         digest = hashlib.sha256()
-        async for chunk in stream:
+        aiter = stream.__aiter__()
+        while True:
+            remaining_total = overall_deadline - loop.time()
+            if remaining_total <= 0:
+                raise HTTPException(
+                    status_code=408,
+                    detail="Part upload exceeded total body read deadline",
+                )
+            step_timeout = min(idle_timeout_s, remaining_total)
+            try:
+                chunk = await asyncio.wait_for(aiter.__anext__(), timeout=step_timeout)
+            except StopAsyncIteration:
+                break
+            except TimeoutError as exc:
+                detail = (
+                    "Part upload timed out waiting for request body bytes"
+                    if remaining_total > idle_timeout_s
+                    else "Part upload exceeded total body read deadline"
+                )
+                raise HTTPException(status_code=408, detail=detail) from exc
             if not chunk:
                 continue
             if len(buf) + len(chunk) > expected_len:
@@ -392,17 +487,31 @@ async def receive_chat_upload_part(
                 detail="Part checksum mismatch",
             )
 
+        # Re-check upload state and expiry right before writing to object storage so an
+        # upload cancelled or expired mid-stream never sends late parts to MinIO.
+        fresh = await db.get_upload(str(row["upload_id"]))
+        if not fresh:
+            raise HTTPException(status_code=404, detail="Upload not found")
+        post_read_ready = _check_part_accepting_row(
+            fresh, int(part_number), now_utc=datetime.now(timezone.utc)
+        )
+        if post_read_ready is not None:
+            return post_read_ready
+
         payload = bytes(buf)
         buf.clear()
 
         etag = await asyncio.to_thread(
             storage.upload_part_bytes,
-            str(row["object_key"]),
-            str(row["store_upload_id"]),
+            str(fresh["object_key"]),
+            str(fresh["store_upload_id"]),
             part_number=int(part_number),
             data=payload,
         )
-        del payload
+    finally:
+        buf.clear()
+        payload = None
+        _PART_UPLOAD_SEMAPHORE.release()
 
     if not etag:
         raise HTTPException(
@@ -869,19 +978,68 @@ def extract_chat_upload_contexts(
     return extracted
 
 
-async def validate_and_claim_request_attachments(
+class SteerAttachmentTransientError(RuntimeError):
+    """Retryable failure while materializing a steered chat upload."""
+
+
+class SteerAttachmentPermanentError(Exception):
+    """Non-retryable failure (revoked access, deleted upload, invalid reference) on a steered chat upload."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+def chat_upload_claim_key(
+    *, request_key: str | None = None, run_id: str | None = None
+) -> str:
+    """Deterministic provisional claim token scoped to one logical send or run."""
+    clean_req = str(request_key or "").strip()
+    if clean_req:
+        return f"req:{clean_req}"
+    clean_run = str(run_id or "").strip()
+    if clean_run:
+        return f"run:{clean_run}"
+    return f"ephemeral:{uuid.uuid4()}"
+
+
+def _canonical_workspace_id(user_id: str, workspace_id: str | None) -> str:
+    raw_ws = str(workspace_id or "").strip()
+    if not raw_ws or raw_ws.lower() == "home":
+        return get_home_workspace_id(str(user_id).strip())
+    return _validate_uuid(raw_ws, field_name="workspace_id")
+
+
+def _row_to_history_attachment(row: dict[str, Any]) -> dict[str, Any]:
+    mime = str(row["mime_type"])
+    att_type = (
+        "pdf"
+        if mime == "application/pdf"
+        else "image"
+        if mime.startswith("image/")
+        else "file"
+    )
+    return {
+        "name": str(row["filename"]),
+        "type": att_type,
+        "mime_type": mime,
+        "size": int(row["size_bytes"]),
+        "status": "uploaded",
+        "upload_id": str(row["upload_id"]),
+    }
+
+
+async def _validate_attachment_batch(
     additional_context: Sequence[Any] | None,
     *,
     user_id: str,
     workspace_id: str,
     is_existing_colleague_thread: bool = False,
-) -> list[dict[str, Any]]:
-    """Validate inline budgets + ``chat_upload`` references pre-stream, stamping ``used_at``.
-
-    Returns the verified ``dalton_chat_file_uploads`` rows in attachment order.
-    """
+) -> tuple[str, list[str], list[dict[str, Any]]]:
+    """Validate the entire inline + ``chat_upload`` batch before mutating any DB state."""
     if not additional_context:
-        return []
+        return "", [], []
 
     inline_count = 0
     inline_bytes = 0
@@ -922,7 +1080,7 @@ async def validate_and_claim_request_attachments(
         )
 
     if not upload_items:
-        return []
+        return "", [], []
 
     _ensure_feature_ready()
     canonical_ws = await resolve_and_verify_upload_workspace(
@@ -935,6 +1093,7 @@ async def validate_and_claim_request_attachments(
         _validate_uuid(u["upload_id"], field_name="upload_id") for u in upload_items
     ]
     rows_by_id = await db.get_uploads_by_ids(upload_ids)
+    now_utc = datetime.now(timezone.utc)
 
     verified_rows: list[dict[str, Any]] = []
     total_bytes = inline_bytes
@@ -967,18 +1126,18 @@ async def validate_and_claim_request_attachments(
                 status_code=410,
                 detail="Attachment has expired or was removed",
             )
-
-        stamped = await db.mark_used(
-            uid,
-            user_id=user_id,
-            workspace_id=canonical_ws,
-        )
-        if stamped is None:
+        exp = _as_utc(row.get("expires_at"))
+        if (
+            row.get("used_at") is None
+            and (exp is None or exp <= now_utc)
+            and not _has_live_provisional_claim(row, now_utc)
+        ):
             raise HTTPException(
                 status_code=410,
                 detail="Attachment has expired or was removed",
             )
-        size = int(stamped["size_bytes"])
+
+        size = int(row["size_bytes"])
         if size <= 0 or size > MAX_CHAT_UPLOAD_BYTES:
             raise HTTPException(
                 status_code=413, detail="Attachment exceeds the 200 MB limit"
@@ -989,9 +1148,168 @@ async def validate_and_claim_request_attachments(
                 status_code=413,
                 detail="Attachments exceed the per-message total size limit",
             )
-        verified_rows.append(stamped)
+        verified_rows.append(row)
 
-    return verified_rows
+    return canonical_ws, upload_ids, verified_rows
+
+
+async def validate_and_claim_request_attachments(
+    additional_context: Sequence[Any] | None,
+    *,
+    user_id: str,
+    workspace_id: str,
+    is_existing_colleague_thread: bool = False,
+    claim_key: str | None = None,
+    ttl: timedelta = PROVISIONAL_CLAIM_TTL,
+) -> list[dict[str, Any]]:
+    """Validate the full attachment batch first, then acquire a bounded provisional claim.
+
+    Permanent retention (``used_at``, ``expires_at = NULL``) is deferred until
+    durable run START or steer acceptance via :func:`confirm_request_chat_uploads`.
+    """
+    canonical_ws, upload_ids, _ = await _validate_attachment_batch(
+        additional_context,
+        user_id=user_id,
+        workspace_id=workspace_id,
+        is_existing_colleague_thread=is_existing_colleague_thread,
+    )
+    if not upload_ids:
+        return []
+
+    eff_key = str(claim_key or "").strip() or chat_upload_claim_key()
+    claimed_by_id = await db.claim_provisional_batch(
+        upload_ids,
+        user_id=user_id,
+        workspace_id=canonical_ws,
+        claim_key=eff_key,
+        ttl=ttl,
+    )
+    if claimed_by_id is None:
+        raise HTTPException(
+            status_code=410,
+            detail="Attachment has expired or was removed",
+        )
+    return [claimed_by_id[uid] for uid in upload_ids]
+
+
+async def confirm_request_chat_uploads(
+    additional_context: Sequence[Any] | None,
+    *,
+    user_id: str,
+    workspace_id: str,
+    claim_key: str | None = None,
+    conn: Any = None,
+) -> list[dict[str, Any]]:
+    """Finalize permanent retention inside the durable START or steer admission transaction."""
+    upload_items = extract_chat_upload_contexts(additional_context)
+    if not upload_items:
+        return []
+    target_ws = _canonical_workspace_id(user_id, workspace_id)
+    upload_ids = [
+        _validate_uuid(u["upload_id"], field_name="upload_id") for u in upload_items
+    ]
+    confirmed = await db.confirm_provisional_claims(
+        upload_ids,
+        user_id=user_id,
+        workspace_id=target_ws,
+        claim_key=claim_key,
+        conn=conn,
+    )
+    if confirmed is None:
+        raise HTTPException(
+            status_code=410,
+            detail="Attachment has expired or was removed",
+        )
+    return [confirmed[uid] for uid in upload_ids]
+
+
+async def release_request_chat_uploads(
+    *,
+    user_id: str,
+    claim_key: str,
+    request_key: str | None = None,
+    additional_context: Sequence[Any] | None = None,
+) -> int:
+    """Release a provisional claim on rejection while protecting any accepted request."""
+    upload_ids: list[str] | None = None
+    if additional_context is not None:
+        upload_items = extract_chat_upload_contexts(additional_context)
+        if not upload_items:
+            return 0
+        parsed_ids: list[str] = []
+        for item in upload_items:
+            try:
+                parsed_ids.append(_validate_uuid(item["upload_id"]))
+            except HTTPException:
+                continue
+        if not parsed_ids:
+            return 0
+        upload_ids = parsed_ids
+    return await db.release_provisional_claims(
+        user_id=user_id,
+        claim_key=claim_key,
+        request_key=request_key,
+        upload_ids=upload_ids,
+    )
+
+
+class ChatUploadSendScope:
+    """Request-scoped provisional claim guard across chat turn/steer admission."""
+
+    def __init__(
+        self,
+        *,
+        additional_context: Sequence[Any] | None,
+        user_id: str,
+        workspace_id: str,
+        request_key: str | None = None,
+        run_id: str | None = None,
+        is_existing_colleague_thread: bool = False,
+        preclaimed: bool = False,
+    ) -> None:
+        self.additional_context = additional_context
+        self.user_id = str(user_id or "")
+        self.workspace_id = str(workspace_id or "")
+        self.request_key = request_key
+        self.claim_key = chat_upload_claim_key(request_key=request_key, run_id=run_id)
+        self.is_existing_colleague_thread = is_existing_colleague_thread
+        self._has_uploads = bool(extract_chat_upload_contexts(additional_context))
+        self._claimed = bool(preclaimed and self._has_uploads)
+        self._admitted = False
+
+    async def __aenter__(self) -> "ChatUploadSendScope":
+        if not self._claimed and self.additional_context:
+            await validate_and_claim_request_attachments(
+                self.additional_context,
+                user_id=self.user_id,
+                workspace_id=self.workspace_id,
+                is_existing_colleague_thread=self.is_existing_colleague_thread,
+                claim_key=self.claim_key,
+            )
+            self._claimed = self._has_uploads
+        return self
+
+    def mark_admitted(self) -> None:
+        self._admitted = True
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        if self._has_uploads and not self._admitted and self.user_id:
+            try:
+                await asyncio.shield(
+                    release_request_chat_uploads(
+                        user_id=self.user_id,
+                        claim_key=self.claim_key,
+                        request_key=self.request_key,
+                        additional_context=self.additional_context,
+                    )
+                )
+            except Exception:
+                logger.warning(
+                    "Releasing provisional chat upload claims failed for key %s",
+                    self.claim_key,
+                    exc_info=True,
+                )
+        return False
 
 
 async def build_chat_upload_history_metadata(
@@ -1004,6 +1322,15 @@ async def build_chat_upload_history_metadata(
     upload_items = extract_chat_upload_contexts(additional_context)
     if not upload_items:
         return []
+
+    canonical_ws: str | None = None
+    if workspace_id is not None and user_id is not None:
+        try:
+            canonical_ws = _canonical_workspace_id(user_id, workspace_id)
+        except HTTPException:
+            canonical_ws = workspace_id
+    else:
+        canonical_ws = workspace_id
 
     valid_ids: list[str] = []
     for item in upload_items:
@@ -1020,26 +1347,12 @@ async def build_chat_upload_history_metadata(
         if (
             row is not None
             and (user_id is None or str(row["user_id"]) == str(user_id))
-            and (workspace_id is None or str(row["workspace_id"]) == str(workspace_id))
+            and (
+                canonical_ws is None
+                or str(row["workspace_id"]) == str(canonical_ws)
+            )
         ):
-            mime = str(row["mime_type"])
-            att_type = (
-                "pdf"
-                if mime == "application/pdf"
-                else "image"
-                if mime.startswith("image/")
-                else "file"
-            )
-            out.append(
-                {
-                    "name": str(row["filename"]),
-                    "type": att_type,
-                    "mime_type": mime,
-                    "size": int(row["size_bytes"]),
-                    "status": "uploaded",
-                    "upload_id": str(row["upload_id"]),
-                }
-            )
+            out.append(_row_to_history_attachment(row))
         else:
             out.append(
                 {
@@ -1281,7 +1594,7 @@ async def materialize_chat_uploads(
     if not user_id or not workspace_id:
         raise PermissionError("Missing caller or workspace identity for chat upload")
 
-    verified_rows = await validate_and_claim_request_attachments(
+    _, _, verified_rows = await _validate_attachment_batch(
         upload_items,
         user_id=user_id,
         workspace_id=workspace_id,
@@ -1345,38 +1658,147 @@ async def materialize_chat_uploads(
     return notes
 
 
-async def materialize_steered_chat_uploads(payload: dict[str, Any]) -> str:
-    """Materialize ``chat_uploads`` carried on a held steer job and return its reminder block."""
+async def materialize_steered_chat_uploads(
+    payload: dict[str, Any],
+    *,
+    project: ProjectContext | None = None,
+    session: Any | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Materialize ``chat_uploads`` on a held steer job into the verified workspace folder.
+
+    Returns ``(model_file_reminder, verified_attachment_metadata)``.
+    Raises :class:`SteerAttachmentPermanentError` on authorization/reference failures
+    and :class:`SteerAttachmentTransientError` on temporary sandbox/storage errors.
+    """
     chat_uploads = payload.get("chat_uploads")
     if not chat_uploads:
-        return ""
+        return "", []
     user_id = str(payload.get("user_id") or "").strip()
     workspace_id = str(payload.get("workspace_id") or "").strip()
     if not user_id or not workspace_id:
-        return ""
+        raise SteerAttachmentPermanentError(
+            "invalid_steer_payload",
+            "Steered attachment is missing user or workspace identity",
+        )
 
+    from src.dalton.sharing import ColleagueAccessRevokedError
     from src.server.database.workspace import get_workspace
+    from src.server.services.workspace_layout import (
+        WorkspaceFolderMoving,
+        WorkspaceLayoutUnavailable,
+        resolve_project_context,
+    )
     from src.server.services.workspace_manager import WorkspaceManager
     from src.server.utils.multimodal_context import build_file_reminder
 
-    ws_row = await get_workspace(workspace_id)
+    try:
+        normalized_ws = _validate_uuid(workspace_id, field_name="workspace_id")
+    except HTTPException as exc:
+        raise SteerAttachmentPermanentError(
+            "invalid_workspace",
+            str(exc.detail),
+        ) from exc
+
+    ws_row = await get_workspace(normalized_ws)
+    if ws_row is None and not is_home_id(user_id, normalized_ws):
+        raise SteerAttachmentPermanentError(
+            "workspace_not_found",
+            "Target workspace no longer exists",
+        )
+    if ws_row is not None and str(ws_row.get("status") or "") == "deleted":
+        raise SteerAttachmentPermanentError(
+            "workspace_deleted",
+            "Target workspace has been deleted",
+        )
+
     ws_owner = (
         str(ws_row["user_id"])
         if ws_row and ws_row.get("user_id")
         else user_id
     )
     is_colleague = ws_owner != user_id
-    wm = WorkspaceManager.get_instance()
-    session = await wm.get_session_for_workspace(workspace_id, user_id=ws_owner)
-    notes = await materialize_chat_uploads(
-        chat_uploads,
-        sandbox=session.sandbox if session else None,
-        user_id=user_id,
-        workspace_id=workspace_id,
-        project=current_project(),
-        is_existing_colleague_thread=is_colleague,
-    )
-    return build_file_reminder(notes) if notes else ""
+
+    try:
+        _, _, verified_rows = await _validate_attachment_batch(
+            chat_uploads,
+            user_id=user_id,
+            workspace_id=normalized_ws,
+            is_existing_colleague_thread=is_colleague,
+        )
+    except ColleagueAccessRevokedError as exc:
+        raise SteerAttachmentPermanentError(exc.code, exc.message) from exc
+    except PermissionError as exc:
+        raise SteerAttachmentPermanentError("forbidden", str(exc)) from exc
+    except HTTPException as exc:
+        if exc.status_code in (400, 401, 403, 404, 410, 413):
+            raise SteerAttachmentPermanentError(
+                f"http_{exc.status_code}",
+                str(exc.detail),
+            ) from exc
+        raise SteerAttachmentTransientError(str(exc.detail)) from exc
+    except Exception as exc:
+        raise SteerAttachmentTransientError(str(exc)) from exc
+
+    if session is None:
+        try:
+            wm = WorkspaceManager.get_instance()
+            session = await wm.get_session_for_workspace(normalized_ws, user_id=ws_owner)
+        except Exception as exc:
+            raise SteerAttachmentTransientError(str(exc)) from exc
+
+    sandbox = getattr(session, "sandbox", None) if session is not None else None
+    if sandbox is None:
+        raise SteerAttachmentTransientError(
+            "Workspace sandbox is unavailable for steered upload"
+        )
+
+    eff_project = project if project is not None else current_project()
+    try:
+        if (
+            eff_project is None
+            or str(eff_project.workspace_id or "") != normalized_ws
+            or not str(eff_project.dir_name or "").strip()
+        ):
+            eff_project = await resolve_project_context(session, normalized_ws)
+    except (WorkspaceLayoutUnavailable, WorkspaceFolderMoving) as exc:
+        raise SteerAttachmentTransientError(str(exc)) from exc
+    except Exception as exc:
+        raise SteerAttachmentTransientError(str(exc)) from exc
+
+    if (
+        eff_project is None
+        or str(eff_project.workspace_id or "") != normalized_ws
+        or not str(eff_project.dir_name or "").strip()
+    ):
+        raise SteerAttachmentTransientError(
+            f"Verified workspace folder is unavailable for workspace {normalized_ws}"
+        )
+
+    try:
+        notes = await materialize_chat_uploads(
+            chat_uploads,
+            sandbox=sandbox,
+            user_id=user_id,
+            workspace_id=normalized_ws,
+            project=eff_project,
+            is_existing_colleague_thread=is_colleague,
+        )
+    except ColleagueAccessRevokedError as exc:
+        raise SteerAttachmentPermanentError(exc.code, exc.message) from exc
+    except PermissionError as exc:
+        raise SteerAttachmentPermanentError("forbidden", str(exc)) from exc
+    except HTTPException as exc:
+        if exc.status_code in (400, 401, 403, 404, 410, 413):
+            raise SteerAttachmentPermanentError(
+                f"http_{exc.status_code}",
+                str(exc.detail),
+            ) from exc
+        raise SteerAttachmentTransientError(str(exc.detail)) from exc
+    except Exception as exc:
+        raise SteerAttachmentTransientError(str(exc)) from exc
+
+    verified_meta = [_row_to_history_attachment(row) for row in verified_rows]
+    return (build_file_reminder(notes) if notes else ""), verified_meta
 
 
 # ---------------------------------------------------------------------------
@@ -1412,7 +1834,8 @@ async def _is_authorized_row_for_recovery(
     ws_row: dict[str, Any] | None,
     conn: Any = None,
 ) -> bool:
-    """Verify row ownership, workspace scope, key isolation, and live workspace permissions."""
+    """Verify retained-row durability, workspace binding, Home single-owner isolation, and key prefix."""
+    del conn
     if ws_status in ("deleted", "invalid"):
         return False
     if str(row.get("workspace_id") or "") != str(workspace_id):
@@ -1440,32 +1863,13 @@ async def _is_authorized_row_for_recovery(
         # Unbound Home before its workspaces row is inserted: must match row_user_id's Home ID.
         return is_home_id(row_user_id, workspace_id)
 
-    if row_user_id == ws_owner_id:
-        return True
-
     # Cross-user upload in Home is never allowed.
     if is_home_row(ws_row) or is_home_id(ws_owner_id, workspace_id):
-        return False
+        return row_user_id == ws_owner_id
 
-    if not is_dalton_supabase_auth_enabled() or ws_row is None:
-        return False
-
-    from src.dalton.sharing import ColleagueAccessRevokedError, require_workspace_access
-
-    for channel in ("web", "cos"):
-        try:
-            await require_workspace_access(
-                ws_row,
-                row_user_id,
-                channel=channel,
-                need="write",
-                workspace=ws_row,
-                conn=conn,
-            )
-            return True
-        except (HTTPException, ColleagueAccessRevokedError):
-            continue
-    return False
+    # Accepted files in a live non-Home workspace belong to that workspace's retained content
+    # even if a former collaborator's sharing permission was later removed.
+    return ws_row is not None
 
 
 async def has_retained_workspace_chat_uploads(
@@ -1813,12 +2217,7 @@ async def run_chat_upload_cleanup_loop(
     *, interval_s: float = CLEANUP_INTERVAL_S
 ) -> None:
     """Periodic lifespan cleanup loop for ``dalton_chat_file_uploads``."""
-    if os.getenv("DALTON_CHAT_UPLOAD_CLEANUP_ENABLED", "1").strip().lower() in (
-        "0",
-        "false",
-        "no",
-        "off",
-    ):
+    if not is_chat_upload_cleanup_enabled():
         return
     while True:
         await asyncio.sleep(interval_s)

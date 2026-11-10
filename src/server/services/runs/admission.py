@@ -488,6 +488,13 @@ async def begin_run(
         user_id=user_id,
         is_byok=is_byok,
     )
+    # DALTON-HOOK(chat-large-upload): confirm request attachment retention inside START's transaction
+    from src.dalton.services.chat_uploads import extract_chat_upload_contexts
+
+    has_chat_uploads = bool(
+        not request.hitl_response
+        and extract_chat_upload_contexts(request.additional_context)
+    )
     started: list = []
     start = spawn_protected(
         RunCoordinator.get_instance().start_run(
@@ -543,8 +550,15 @@ async def begin_run(
             pending_input=executor_input_stamp(request),
             on_started=started.append,
             before_commit=(
-                partial(_start_checks, request, thread_id=thread_id, run_id=run_id)
-                if request.request_key or request.steer_job_id
+                partial(
+                    _start_checks,
+                    request,
+                    thread_id=thread_id,
+                    run_id=run_id,
+                    user_id=user_id,
+                    workspace_id=workspace_id,
+                )
+                if request.request_key or request.steer_job_id or has_chat_uploads
                 else None
             ),
         ),
@@ -575,7 +589,13 @@ async def begin_run(
 
 
 async def _start_checks(
-    request: "ChatRequest", conn, *, thread_id: str, run_id: str
+    request: "ChatRequest",
+    conn,
+    *,
+    thread_id: str,
+    run_id: str,
+    user_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> None:
     if request.request_key:
         await refuse_copy_read_as_steer(
@@ -583,6 +603,24 @@ async def _start_checks(
         )
     if request.steer_job_id:
         await claim_steer_or_refuse(conn, request.steer_job_id, run_id)
+    # DALTON-HOOK(chat-large-upload): stamp used_at and clear expires_at atomically with START
+    if not request.hitl_response and request.additional_context:
+        from src.dalton.services.chat_uploads import (
+            chat_upload_claim_key,
+            confirm_request_chat_uploads,
+            extract_chat_upload_contexts,
+        )
+
+        if extract_chat_upload_contexts(request.additional_context):
+            await confirm_request_chat_uploads(
+                request.additional_context,
+                user_id=str(user_id or ""),
+                workspace_id=str(workspace_id or ""),
+                claim_key=chat_upload_claim_key(
+                    request_key=request.request_key, run_id=run_id
+                ),
+                conn=conn,
+            )
 
 
 async def _settle_after_start(

@@ -13,6 +13,17 @@ import {
 import { MAX_FILE_SIZE, MAX_TOTAL_ATTACHMENTS_BYTES } from '../chat-input.helpers';
 import ChatInput, { type ChatInputHandle, type ChatInputProps } from '../chat-input';
 import { attachmentsToContexts } from '@/pages/ChatAgent/utils/fileUpload';
+import {
+  foldSteeringDelivery,
+  steeringDeliveredEntries,
+} from '@/pages/ChatAgent/session/stream/steeringDelivery';
+import {
+  handleHistorySteeringDelivered,
+  handleHistoryUserMessage,
+} from '@/pages/ChatAgent/session/history/historyHandlers';
+import type { ChatMessage, UserMessage } from '@/types/chat';
+import type { MessageRecord, SetMessages } from '@/pages/ChatAgent/hooks/utils/types';
+import type { PairState } from '@/pages/ChatAgent/session/types';
 
 const {
   apiPostMock,
@@ -686,5 +697,142 @@ describe('ChatInput large file uploads (up to 200 MiB)', () => {
     expect(sendButton()).toBeDisabled();
     fireEvent.keyDown(box, { key: 'Enter' });
     expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it('renders steered large-file and file-only deliveries across live fold and history reload without model instructions', () => {
+    const attachmentChip = {
+      name: 'q4_margins_200m.parquet',
+      type: 'file',
+      mime_type: 'application/octet-stream',
+      size: 200 * 1024 * 1024,
+      status: 'uploaded',
+      upload_id: 'up-steer-200m',
+    };
+    const fileOnlyChip = {
+      name: 'audio_drop.wav',
+      type: 'file',
+      mime_type: 'audio/wav',
+      size: 64 * 1024 * 1024,
+      status: 'uploaded',
+      upload_id: 'up-steer-fileonly',
+    };
+
+    // 1. Live fold claims optimistic waiting steer + adds unclaimed file-only steer from another tab
+    const waitingSteer: UserMessage = {
+      id: 'user-live-steer-1',
+      role: 'user',
+      content: 'Compare Q4 vs Q3 margins',
+      contentType: 'text',
+      timestamp: new Date(1700000000000),
+      isStreaming: false,
+      steering: true,
+      requestKey: 'req-steer-1',
+      turnIndex: 0,
+    };
+    const deliveryPayload = {
+      messages: [
+        {
+          content: 'Compare Q4 vs Q3 margins',
+          request_key: 'req-steer-1',
+          timestamp: 1700000001,
+          attachments: [attachmentChip],
+        },
+        {
+          content: '',
+          request_key: 'req-steer-fileonly',
+          timestamp: 1700000002,
+          attachments: [fileOnlyChip],
+        },
+      ],
+    };
+
+    const entries = steeringDeliveredEntries(deliveryPayload);
+    let seq = 0;
+    const liveFold = foldSteeringDelivery(
+      [waitingSteer] as ChatMessage[],
+      entries,
+      0,
+      (kind) => `live-${kind}-${++seq}`,
+    );
+
+    expect(liveFold.settledKeys).toEqual(['req-steer-1']);
+    const userRows = liveFold.messages.filter((m): m is UserMessage => m.role === 'user');
+    expect(userRows).toHaveLength(2);
+    expect(userRows[0]).toMatchObject({
+      id: 'user-live-steer-1',
+      content: 'Compare Q4 vs Q3 margins',
+      steering: false,
+      steeringDelivered: true,
+      attachments: [attachmentChip],
+    });
+    expect(userRows[0].content).not.toContain('<system-reminder>');
+    expect(userRows[1]).toMatchObject({
+      content: '',
+      steeringDelivered: true,
+      requestKey: 'req-steer-fileonly',
+      attachments: [fileOnlyChip],
+    });
+
+    // 2. History reload replays both text+file steer, file-only steer, and file-only turn opener
+    let historyMessages: MessageRecord[] = [];
+    const setMessages: SetMessages = (updater) => {
+      historyMessages = typeof updater === 'function' ? updater(historyMessages) : updater;
+    };
+    const assistantByPair = new Map<number, string>();
+    const pairStateByPair = new Map<number, PairState>();
+    const newMessagesStartIndexRef = { current: 0 };
+
+    handleHistoryUserMessage({
+      event: {
+        content: '',
+        timestamp: '2026-11-09T12:00:00Z',
+        metadata: {
+          attachments: [fileOnlyChip],
+        },
+      },
+      pairIndex: 0,
+      assistantMessagesByPair: assistantByPair,
+      pairStateByPair,
+      refs: {
+        recentlySentTracker: { isRecentlySent: () => false },
+        currentMessageRef: { current: null },
+        newMessagesStartIndexRef,
+      },
+      setMessages,
+    });
+
+    handleHistorySteeringDelivered({
+      event: deliveryPayload,
+      pairIndex: 0,
+      assistantMessagesByPair: assistantByPair,
+      pairStateByPair,
+      refs: { newMessagesStartIndexRef },
+      setMessages,
+    });
+
+    const replayedUsers = historyMessages.filter((m) => m.role === 'user');
+    expect(replayedUsers).toHaveLength(3);
+    // Turn opener (file-only send)
+    expect(replayedUsers[0]).toMatchObject({
+      id: 'history-user-0',
+      content: '',
+      isHistory: true,
+      attachments: [fileOnlyChip],
+    });
+    // Steer 1 (user text + 200 MiB attachment, no <system-reminder>)
+    expect(replayedUsers[1]).toMatchObject({
+      content: 'Compare Q4 vs Q3 margins',
+      steeringDelivered: true,
+      isHistory: true,
+      attachments: [attachmentChip],
+    });
+    expect(String(replayedUsers[1].content)).not.toContain('<system-reminder>');
+    // Steer 2 (file-only steer)
+    expect(replayedUsers[2]).toMatchObject({
+      content: '',
+      steeringDelivered: true,
+      isHistory: true,
+      attachments: [fileOnlyChip],
+    });
   });
 });

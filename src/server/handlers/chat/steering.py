@@ -36,11 +36,18 @@ def fresh_input_message_id(request, input_state) -> str | None:
     return None
 
 
+# DALTON-HOOK(chat-large-upload): thread explicit project and session into deferred steer materialization
 async def open_with_steers_ahead(
-    thread_id: str, run_id: str, request, input_state
+    thread_id: str,
+    run_id: str,
+    request,
+    input_state,
+    *,
+    project: Any = None,
+    session: Any = None,
 ) -> str | None:
     """Put the steers sent before this fresh turn ahead of its input, and
-    return the input's id (None for a turn with no input of its own).
+    return the input's id (None for a turn with no input of their own).
 
     In the input itself, so the turn's input checkpoint holds them: a
     regenerate starts over from that checkpoint, and would otherwise lose
@@ -51,7 +58,9 @@ async def open_with_steers_ahead(
     from ptc_agent.agent.middleware.steering import steers_ahead_message
     from src.server.services.report_back.steer import take_steers_ahead
 
-    steers = await take_steers_ahead(thread_id, run_id)
+    steers = await take_steers_ahead(
+        thread_id, run_id, project=project, session=session
+    )
     if steers:
         messages = input_state["messages"]
         at = next(
@@ -84,8 +93,9 @@ def steer_payload(
     request_key: str | None = None,
     origin: dict | None = None,
     artifact_comments: ShownSend | None = None,
-    # DALTON-HOOK(chat-large-upload): carry lightweight chat_upload references (never file bytes)
+    # DALTON-HOOK(chat-large-upload): carry lightweight chat_upload references and verified attachment metadata
     chat_uploads: list[dict[str, Any]] | None = None,
+    attachments: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """A main-thread steer job's payload, before any lifecycle key.
 
@@ -111,6 +121,8 @@ def steer_payload(
         payload["artifact_comments"] = artifact_comments.model_dump(mode="json")
     if chat_uploads:
         payload["chat_uploads"] = chat_uploads
+    if attachments:
+        payload["attachments"] = attachments
     return payload
 
 

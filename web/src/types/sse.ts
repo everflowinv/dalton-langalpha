@@ -268,6 +268,8 @@ export interface DeliveredSteer {
   origin?: ThreadOrigin;
   /** On a steer that sent file comments, what the chat shows for it. */
   artifact_comments?: ArtifactCommentsShown;
+  // DALTON-HOOK(chat-large-upload): verified attachment metadata carried on steered deliveries
+  attachments?: Attachment[];
   report_source?: never;
   market_alert?: never;
   wakeup?: never;

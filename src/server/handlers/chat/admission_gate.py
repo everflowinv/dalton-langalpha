@@ -246,6 +246,20 @@ async def wait_or_steer(
     from src.server.database.runs import outbox as outbox_db
     from src.server.handlers.chat.steering import steer_payload
 
+    # DALTON-HOOK(chat-large-upload): build verified attachment metadata once for steered chat_uploads
+    steer_attachments: list[dict] | None = None
+    if chat_uploads:
+        from src.dalton.services.chat_uploads import build_chat_upload_history_metadata
+
+        steer_attachments = (
+            await build_chat_upload_history_metadata(
+                chat_uploads,
+                user_id=user_id,
+                workspace_id=workspace_id,
+            )
+            or None
+        )
+
     for _lap in range(_STEER_ADMISSION_LAPS):
         state, active_row = await manager.wait_for_admission(thread_id)
         # A START that committed before that read, or a steer admitted
@@ -270,7 +284,7 @@ async def wait_or_steer(
             )
 
         active_run_id = str(active_row["conversation_response_id"])
-        # DALTON-HOOK(chat-large-upload): persist chat_upload descriptors in steer outbox payload
+        # DALTON-HOOK(chat-large-upload): persist chat_upload descriptors and verified attachments in steer outbox payload
         payload = steer_payload(
             user_input,
             user_id,
@@ -281,6 +295,7 @@ async def wait_or_steer(
             origin=agent.origin if agent else None,
             artifact_comments=artifact_comments,
             chat_uploads=chat_uploads,
+            attachments=steer_attachments,
         )
         if agent is not None:
             idempotency_key = agent.idempotency_key
@@ -309,6 +324,8 @@ async def wait_or_steer(
                 accepted["artifact_comments"] = artifact_comments.model_dump(
                     mode="json"
                 )
+            if steer_attachments:
+                accepted["attachments"] = steer_attachments
             event_data = json.dumps(accepted)
             return False, f"event: steering_accepted\ndata: {event_data}\n\n"
         if result["state"] == "duplicate":

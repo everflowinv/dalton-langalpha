@@ -53,7 +53,40 @@ class InMemoryChatUploadLedger:
     def __init__(self, workspaces: dict[str, dict[str, Any]] | None = None) -> None:
         self.rows: dict[str, dict[str, Any]] = {}
         self.workspaces = workspaces if workspaces is not None else {}
+        self.accepted_request_keys: set[str] = set()
         self._lock = asyncio.Lock()
+
+    @staticmethod
+    def _has_live_claim(row: dict[str, Any], now: datetime) -> bool:
+        claims = row.get("pending_claims") or {}
+        for raw_until in claims.values():
+            try:
+                parsed = datetime.fromisoformat(str(raw_until).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            if parsed > now:
+                return True
+        return False
+
+    @staticmethod
+    def _pruned_claims(
+        row: dict[str, Any], now: datetime, *, drop_key: str | None = None
+    ) -> dict[str, str]:
+        kept: dict[str, str] = {}
+        for k, raw_until in (row.get("pending_claims") or {}).items():
+            if drop_key is not None and k == drop_key:
+                continue
+            try:
+                parsed = datetime.fromisoformat(str(raw_until).replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            if parsed > now:
+                kept[k] = str(raw_until)
+        return kept
 
     async def create_upload_guarded(
         self,
@@ -80,9 +113,22 @@ class InMemoryChatUploadLedger:
                 r
                 for r in self.rows.values()
                 if r["user_id"] == user_id
-                and r["state"] in ("uploading", "completing")
-                and r["expires_at"] is not None
-                and r["expires_at"] > now
+                and r["cleaned_at"] is None
+                and (
+                    (
+                        r["state"] in ("uploading", "completing")
+                        and r["expires_at"] is not None
+                        and r["expires_at"] > now
+                    )
+                    or (
+                        r["state"] == "ready"
+                        and r["used_at"] is None
+                        and (
+                            (r["expires_at"] is not None and r["expires_at"] > now)
+                            or self._has_live_claim(r, now)
+                        )
+                    )
+                )
             ]
             if len(active_rows) >= max_active_uploads:
                 return None
@@ -103,6 +149,7 @@ class InMemoryChatUploadLedger:
                 "expected_sha256": expected_sha256,
                 "actual_sha256": None,
                 "uploaded_parts": {},
+                "pending_claims": {},
                 "state": "uploading",
                 "error": None,
                 "claim_token": None,
@@ -283,7 +330,9 @@ class InMemoryChatUploadLedger:
             if not row or row["user_id"] != user_id:
                 return None
             allowed = row["state"] in ("uploading", "completing", "failed") or (
-                row["state"] == "ready" and row["used_at"] is None
+                row["state"] == "ready"
+                and row["used_at"] is None
+                and not self._has_live_claim(row, now)
             )
             if not allowed:
                 return None
@@ -291,6 +340,7 @@ class InMemoryChatUploadLedger:
             row["state"] = "aborted"
             row["claim_token"] = None
             row["lease_until"] = None
+            row["pending_claims"] = {}
             row["cleaned_at"] = None
             row["expires_at"] = min(row["expires_at"] or now, now)
             row["updated_at"] = now
@@ -327,14 +377,155 @@ class InMemoryChatUploadLedger:
                 or row["cleaned_at"] is not None
             ):
                 return None
-            if row["used_at"] is None and (
-                row["expires_at"] is None or row["expires_at"] <= eff_now
+            if (
+                row["used_at"] is None
+                and (row["expires_at"] is None or row["expires_at"] <= eff_now)
+                and not self._has_live_claim(row, eff_now)
             ):
                 return None
             row["used_at"] = row["used_at"] or eff_now
             row["expires_at"] = None
+            row["pending_claims"] = self._pruned_claims(row, eff_now)
             row["updated_at"] = eff_now
             return dict(row)
+
+    async def claim_provisional_batch(
+        self,
+        upload_ids: Sequence[str],
+        *,
+        user_id: str,
+        workspace_id: str,
+        claim_key: str,
+        ttl: timedelta,
+        now: datetime | None = None,
+    ) -> dict[str, dict[str, Any]] | None:
+        unique_ids = [str(uid) for uid in dict.fromkeys(upload_ids) if uid]
+        if not unique_ids:
+            return {}
+        key = str(claim_key or "").strip()
+        if not key:
+            return None
+        eff_now = now or datetime.now(timezone.utc)
+        async with self._lock:
+            for uid in unique_ids:
+                row = self.rows.get(uid)
+                if (
+                    not row
+                    or row["user_id"] != user_id
+                    or row["workspace_id"] != workspace_id
+                    or row["state"] != "ready"
+                    or row["cleaned_at"] is not None
+                ):
+                    return None
+                if (
+                    row["used_at"] is None
+                    and (row["expires_at"] is None or row["expires_at"] <= eff_now)
+                    and not self._has_live_claim(row, eff_now)
+                ):
+                    return None
+            out: dict[str, dict[str, Any]] = {}
+            until_iso = (eff_now + ttl).isoformat()
+            for uid in unique_ids:
+                row = self.rows[uid]
+                claims = self._pruned_claims(row, eff_now, drop_key=key)
+                claims[key] = until_iso
+                row["pending_claims"] = claims
+                row["updated_at"] = eff_now
+                out[uid] = dict(row)
+            return out
+
+    async def confirm_provisional_claims(
+        self,
+        upload_ids: Sequence[str],
+        *,
+        user_id: str,
+        workspace_id: str,
+        claim_key: str | None = None,
+        conn: Any = None,
+        now: datetime | None = None,
+    ) -> dict[str, dict[str, Any]] | None:
+        del conn
+        unique_ids = [str(uid) for uid in dict.fromkeys(upload_ids) if uid]
+        if not unique_ids:
+            return {}
+        clean_key = str(claim_key).strip() if claim_key else None
+        eff_now = now or datetime.now(timezone.utc)
+        async with self._lock:
+            for uid in unique_ids:
+                row = self.rows.get(uid)
+                if (
+                    not row
+                    or row["user_id"] != user_id
+                    or row["workspace_id"] != workspace_id
+                    or row["state"] != "ready"
+                    or row["cleaned_at"] is not None
+                ):
+                    return None
+                if (
+                    row["used_at"] is None
+                    and (row["expires_at"] is None or row["expires_at"] <= eff_now)
+                    and not self._has_live_claim(row, eff_now)
+                ):
+                    return None
+            out: dict[str, dict[str, Any]] = {}
+            for uid in unique_ids:
+                row = self.rows[uid]
+                row["used_at"] = row["used_at"] or eff_now
+                row["expires_at"] = None
+                row["pending_claims"] = self._pruned_claims(
+                    row, eff_now, drop_key=clean_key
+                )
+                row["updated_at"] = eff_now
+                out[uid] = dict(row)
+            return out
+
+    async def release_provisional_claims(
+        self,
+        *,
+        user_id: str,
+        claim_key: str,
+        request_key: str | None = None,
+        upload_ids: Sequence[str] | None = None,
+        now: datetime | None = None,
+    ) -> int:
+        key = str(claim_key or "").strip()
+        if not key:
+            return 0
+        wanted = (
+            {str(uid) for uid in upload_ids if uid}
+            if upload_ids is not None
+            else None
+        )
+        if wanted is not None and not wanted:
+            return 0
+        eff_now = now or datetime.now(timezone.utc)
+        clean_req = str(request_key or "").strip()
+        async with self._lock:
+            matched = [
+                row
+                for uid, row in self.rows.items()
+                if row["user_id"] == user_id
+                and (wanted is None or uid in wanted)
+                and key in (row.get("pending_claims") or {})
+            ]
+            if not matched:
+                return 0
+            if clean_req and clean_req in self.accepted_request_keys:
+                for row in matched:
+                    if row["state"] == "ready" and row["cleaned_at"] is None:
+                        row["used_at"] = row["used_at"] or eff_now
+                        row["expires_at"] = None
+                        row["pending_claims"] = self._pruned_claims(
+                            row, eff_now, drop_key=key
+                        )
+                        row["updated_at"] = eff_now
+                return 0
+            for row in matched:
+                row["pending_claims"] = self._pruned_claims(
+                    row, eff_now, drop_key=key
+                )
+                row["updated_at"] = eff_now
+            return len(matched)
 
     async def has_retained_workspace_uploads(
         self, workspace_id: str, *, conn: Any = None
@@ -370,6 +561,7 @@ class InMemoryChatUploadLedger:
                     row["state"] = "aborted"
                     row["claim_token"] = None
                     row["lease_until"] = None
+                    row["pending_claims"] = {}
                     row["cleaned_at"] = None
                     row["expires_at"] = now
                     row["updated_at"] = now
@@ -386,6 +578,7 @@ class InMemoryChatUploadLedger:
                     row["state"] = "aborted"
                     row["claim_token"] = None
                     row["lease_until"] = None
+                    row["pending_claims"] = {}
                     row["cleaned_at"] = None
                     row["expires_at"] = now
                     row["updated_at"] = now
@@ -429,6 +622,7 @@ class InMemoryChatUploadLedger:
                         and row["used_at"] is None
                         and row["expires_at"] is not None
                         and row["expires_at"] <= eff_now
+                        and not self._has_live_claim(row, eff_now)
                     )
                     or ws_deleted
                 )
@@ -437,6 +631,7 @@ class InMemoryChatUploadLedger:
                 if row["state"] in ("uploading", "completing", "ready"):
                     row["state"] = "aborted"
                 row["claim_token"] = token
+                row["pending_claims"] = {}
                 row["lease_until"] = eff_now + claim_lease
                 row["updated_at"] = eff_now
                 claimed.append(dict(row))
@@ -627,6 +822,9 @@ def upload_env(monkeypatch: pytest.MonkeyPatch):
         "abort_upload",
         "reopen_terminal_cleanup",
         "mark_used",
+        "claim_provisional_batch",
+        "confirm_provisional_claims",
+        "release_provisional_claims",
         "has_retained_workspace_uploads",
         "list_retained_workspace_uploads",
         "retire_uploads_by_ids",
@@ -718,6 +916,7 @@ def test_migration_d033_contract() -> None:
         d033_chat_file_uploads.upgrade()
         assert any("CREATE TABLE IF NOT EXISTS dalton_chat_file_uploads" in s for s in executed_sql)
         assert any("claim_token TEXT" in s for s in executed_sql)
+        assert any("pending_claims JSONB" in s for s in executed_sql)
         assert any("chk_dalton_chat_file_uploads_cleaned_terminal" in s for s in executed_sql)
         assert any("idx_dalton_chat_file_uploads_cleanup" in s for s in executed_sql)
 
@@ -1040,14 +1239,30 @@ async def test_ownership_workspace_isolation_and_inline_budget(upload_env) -> No
         )
     assert inline_exc.value.status_code == 413
 
-    # Valid send in ws_a stamps used_at, blocks DELETE (409), and permits idempotent /retry
+    # Valid pre-stream claim acquires a bounded provisional claim (leaving used_at unset),
+    # blocks DELETE (409) while in-flight, and stamps used_at at durable acceptance.
     claimed_rows = await svc.validate_and_claim_request_attachments(
         [ChatUploadContext(upload_id=uid, name="model.xlsx", size=len(data))],
         user_id=alice,
         workspace_id=ws_a,
+        claim_key="req:alice-turn-1",
     )
     assert len(claimed_rows) == 1
-    assert claimed_rows[0]["used_at"] is not None
+    assert claimed_rows[0]["used_at"] is None
+    assert "req:alice-turn-1" in claimed_rows[0]["pending_claims"]
+
+    with pytest.raises(HTTPException) as cancel_inflight_exc:
+        await svc.cancel_chat_upload(upload_id=uid, user_id=alice)
+    assert cancel_inflight_exc.value.status_code == 409
+
+    accepted_rows = await svc.confirm_request_chat_uploads(
+        [ChatUploadContext(upload_id=uid, name="model.xlsx", size=len(data))],
+        user_id=alice,
+        workspace_id=ws_a,
+        claim_key="req:alice-turn-1",
+    )
+    assert accepted_rows[0]["used_at"] is not None
+    assert accepted_rows[0]["expires_at"] is None
 
     with pytest.raises(HTTPException) as cancel_used_exc:
         await svc.cancel_chat_upload(upload_id=uid, user_id=alice)
@@ -1193,10 +1408,18 @@ async def test_expired_and_cancelled_cleanup_preserves_active_used_files_beyond_
         stream=_bytes_stream(b"k" * 512),
     )
     await svc.complete_chat_upload(upload_id=up_used["upload_id"], user_id=user_id)
-    claimed = await svc.validate_and_claim_request_attachments(
+    provisional = await svc.validate_and_claim_request_attachments(
         [ChatUploadContext(upload_id=up_used["upload_id"], name="kept_200m.bin", size=512)],
         user_id=user_id,
         workspace_id=ws_id,
+        claim_key="req:clean-turn-1",
+    )
+    assert provisional[0]["used_at"] is None
+    claimed = await svc.confirm_request_chat_uploads(
+        [ChatUploadContext(upload_id=up_used["upload_id"], name="kept_200m.bin", size=512)],
+        user_id=user_id,
+        workspace_id=ws_id,
+        claim_key="req:clean-turn-1",
     )
     assert claimed[0]["used_at"] is not None
     assert claimed[0]["expires_at"] is None
@@ -1696,9 +1919,10 @@ async def test_recovery_rejects_unauthorized_owner_key_mismatch_and_deleted_work
         "updated_at": now,
     }
 
-    # 2. Tampered object_key pointing into another workspace's prefix + unauthorized user row
+    # 2. Tampered object_key pointing into another workspace's prefix + unaccepted upload row
     bad_key_uid = str(uuid.uuid4())
-    bad_user_uid = str(uuid.uuid4())
+    unaccepted_uid = str(uuid.uuid4())
+    colleague_accepted_uid = str(uuid.uuid4())
     upload_env["ledger"].rows[bad_key_uid] = {
         **upload_env["ledger"].rows[bad_home_uid],
         "upload_id": bad_key_uid,
@@ -1708,21 +1932,18 @@ async def test_recovery_rejects_unauthorized_owner_key_mismatch_and_deleted_work
             ws_other, bad_key_uid, "wrong_ws.bin"
         ),
     }
-    upload_env["ledger"].rows[bad_user_uid] = {
+    upload_env["ledger"].rows[unaccepted_uid] = {
         **upload_env["ledger"].rows[bad_home_uid],
-        "upload_id": bad_user_uid,
+        "upload_id": unaccepted_uid,
         "user_id": mallory,
         "workspace_id": ws_alice,
+        "used_at": None,
+        "expires_at": now + timedelta(hours=12),
         "object_key": chat_upload_storage.build_chat_upload_key(
-            ws_alice, bad_user_uid, "mallory.bin"
+            ws_alice, unaccepted_uid, "unaccepted.bin"
         ),
     }
 
-    monkeypatch.setattr(
-        svc,
-        "is_dalton_supabase_auth_enabled",
-        create_autospec(svc.is_dalton_supabase_auth_enabled, return_value=False),
-    )
     pull_spy = create_autospec(svc.pull_direct, return_value={})
     monkeypatch.setattr(svc, "pull_direct", pull_spy)
 
@@ -1738,6 +1959,53 @@ async def test_recovery_rejects_unauthorized_owner_key_mismatch_and_deleted_work
     )
     assert res_ws == {"restored": 0, "errors": 0}
     pull_spy.assert_not_called()
+
+    # 3. Deleted workspace never recovers even accepted rows
+    upload_env["workspaces"][ws_alice]["status"] = "deleted"
+    upload_env["ledger"].rows[colleague_accepted_uid] = {
+        **upload_env["ledger"].rows[bad_home_uid],
+        "upload_id": colleague_accepted_uid,
+        "user_id": mallory,
+        "workspace_id": ws_alice,
+        "used_at": now,
+        "expires_at": None,
+        "object_key": chat_upload_storage.build_chat_upload_key(
+            ws_alice, colleague_accepted_uid, "shared_model.xlsx"
+        ),
+    }
+    res_deleted = await svc.rematerialize_workspace_chat_uploads(
+        ws_alice, sbx, layout=WorkspaceLayout(root="/home/workspace", dir_name="Proj")
+    )
+    assert res_deleted == {"restored": 0, "errors": 0}
+    pull_spy.assert_not_called()
+
+    # 4. In a live workspace, an already-accepted colleague file recovers for the owner even
+    # after the colleague's access is removed, while the removed colleague gets 403 on new uploads.
+    upload_env["workspaces"][ws_alice]["status"] = "running"
+    expected_colleague_rel = svc.build_sandbox_upload_rel_path(
+        upload_env["ledger"].rows[colleague_accepted_uid]
+    )
+    monkeypatch.setattr(
+        svc,
+        "pull_direct",
+        create_autospec(
+            svc.pull_direct,
+            return_value={expected_colleague_rel: {"status": "ok"}},
+        ),
+    )
+    res_owner_recover = await svc.rematerialize_workspace_chat_uploads(
+        ws_alice, sbx, layout=WorkspaceLayout(root="/home/workspace", dir_name="Proj")
+    )
+    assert res_owner_recover == {"restored": 1, "errors": 0}
+
+    with pytest.raises(HTTPException) as removed_colleague_exc:
+        await svc.initiate_chat_upload(
+            user_id=mallory,
+            workspace_id=ws_alice,
+            filename="new_attempt.bin",
+            size_bytes=1024,
+        )
+    assert removed_colleague_exc.value.status_code == 403
 
 
 @pytest.mark.asyncio
@@ -1768,7 +2036,7 @@ async def test_explicit_file_delete_and_workspace_delete_cleanup_with_permission
         upload_id=uid_1, part_number=1, user_id=owner, stream=_bytes_stream(b"1" * 2048)
     )
     await svc.complete_chat_upload(upload_id=uid_1, user_id=owner)
-    await svc.validate_and_claim_request_attachments(
+    await svc.confirm_request_chat_uploads(
         [ChatUploadContext(upload_id=uid_1, name="drop_me.zip", size=2048)],
         user_id=owner,
         workspace_id=ws_file_del,
@@ -1816,7 +2084,7 @@ async def test_explicit_file_delete_and_workspace_delete_cleanup_with_permission
         upload_id=uid_2, part_number=1, user_id=owner, stream=_bytes_stream(b"2" * 2048)
     )
     await svc.complete_chat_upload(upload_id=uid_2, user_id=owner)
-    await svc.validate_and_claim_request_attachments(
+    await svc.confirm_request_chat_uploads(
         [ChatUploadContext(upload_id=uid_2, name="ws_bound.zip", size=2048)],
         user_id=owner,
         workspace_id=ws_tombstone,
@@ -1959,7 +2227,7 @@ async def test_completion_lease_expiry_and_reclaim_preserves_ready_and_used_uplo
         assert second["state"] == "ready"
         assert second["sha256"] == expected_sha
 
-        claimed_turn = await svc.validate_and_claim_request_attachments(
+        claimed_turn = await svc.confirm_request_chat_uploads(
             [ChatUploadContext(upload_id=uid, name="lease_race.bin", size=len(payload))],
             user_id=user_id,
             workspace_id=ws_id,
@@ -2098,7 +2366,7 @@ async def test_stale_completion_errors_cannot_reopen_fail_or_delete_successor(
             upload_id=uid_2, user_id=user_id, expected_sha256=sha_2
         )
         assert done_2b["state"] == "ready"
-        await svc.validate_and_claim_request_attachments(
+        await svc.confirm_request_chat_uploads(
             [ChatUploadContext(upload_id=uid_2, name="fail_guard.bin", size=len(payload_2))],
             user_id=user_id,
             workspace_id=ws_id,
@@ -2208,3 +2476,282 @@ async def test_cancel_during_finalization_cleans_late_assembled_object_and_sweep
     assert swept == 1
     assert key_2 not in upload_env["store"].objects
     assert row_2["cleaned_at"] is not None
+
+
+# ---------------------------------------------------------------------------
+# 7. Batch validation, provisional claims, part deadlines, steers & ready quotas
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_batch_validation_and_provisional_claims_release_on_rejection_and_protect_accepted(
+    upload_env,
+) -> None:
+    """Rejected 4x200 MiB (413), later invalid ID (404), or admission rejection leaves
+    uploads unused/cancellable with expiry intact, while protecting concurrent accepted requests."""
+    user_id = "user-batch-prov"
+    ws_id = str(uuid.uuid4())
+    upload_env["workspaces"][ws_id] = {
+        "workspace_id": ws_id,
+        "user_id": user_id,
+        "status": "running",
+    }
+    now = datetime.now(timezone.utc)
+
+    # Seed 4 ready 200 MiB rows directly
+    uids_200: list[str] = []
+    for idx in range(4):
+        uid = str(uuid.uuid4())
+        uids_200.append(uid)
+        obj_key = chat_upload_storage.build_chat_upload_key(ws_id, uid, f"f{idx}.bin")
+        upload_env["store"].objects[obj_key] = b"x"
+        upload_env["ledger"].rows[uid] = {
+            "upload_id": uid,
+            "user_id": user_id,
+            "workspace_id": ws_id,
+            "filename": f"f{idx}.bin",
+            "safe_filename": f"f{idx}.bin",
+            "mime_type": "application/octet-stream",
+            "size_bytes": svc.MAX_CHAT_UPLOAD_BYTES,
+            "part_size": svc.CHAT_UPLOAD_PART_SIZE,
+            "part_count": 25,
+            "object_key": obj_key,
+            "store_upload_id": f"mp-b-{idx}",
+            "expected_sha256": "a" * 64,
+            "actual_sha256": "a" * 64,
+            "uploaded_parts": {},
+            "pending_claims": {},
+            "state": "ready",
+            "error": None,
+            "claim_token": None,
+            "lease_until": None,
+            "expires_at": now + timedelta(hours=24),
+            "used_at": None,
+            "cleaned_at": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+
+    # 1. 4 x 200 MiB = 800 MiB > 600 MiB rejected 413 BEFORE touching any row
+    with pytest.raises(HTTPException) as over_total_exc:
+        await svc.validate_and_claim_request_attachments(
+            [
+                ChatUploadContext(upload_id=u, name="f.bin", size=svc.MAX_CHAT_UPLOAD_BYTES)
+                for u in uids_200
+            ],
+            user_id=user_id,
+            workspace_id=ws_id,
+            claim_key="req:over-total",
+        )
+    assert over_total_exc.value.status_code == 413
+    for u in uids_200:
+        r = upload_env["ledger"].rows[u]
+        assert r["used_at"] is None
+        assert r["expires_at"] is not None
+        assert r["pending_claims"] == {}
+
+    # 2. Valid first ID followed by nonexistent second ID -> 404, first ID stays unused & cancellable
+    with pytest.raises(HTTPException) as bad_later_exc:
+        await svc.validate_and_claim_request_attachments(
+            [
+                ChatUploadContext(upload_id=uids_200[0], name="f0.bin", size=svc.MAX_CHAT_UPLOAD_BYTES),
+                ChatUploadContext(upload_id=str(uuid.uuid4()), name="missing.bin", size=1024),
+            ],
+            user_id=user_id,
+            workspace_id=ws_id,
+            claim_key="req:bad-later",
+        )
+    assert bad_later_exc.value.status_code == 404
+    assert upload_env["ledger"].rows[uids_200[0]]["used_at"] is None
+    assert upload_env["ledger"].rows[uids_200[0]]["pending_claims"] == {}
+
+    # 3. ChatUploadSendScope rejected before admission releases its claim so cancel succeeds
+    target_uid = uids_200[0]
+    with pytest.raises(HTTPException) as conflict_exc:
+        async with svc.ChatUploadSendScope(
+            additional_context=[
+                ChatUploadContext(upload_id=target_uid, name="f0.bin", size=svc.MAX_CHAT_UPLOAD_BYTES)
+            ],
+            user_id=user_id,
+            workspace_id=ws_id,
+            request_key=str(uuid.uuid4()),
+        ):
+            assert upload_env["ledger"].rows[target_uid]["used_at"] is None
+            assert len(upload_env["ledger"].rows[target_uid]["pending_claims"]) == 1
+            raise HTTPException(status_code=409, detail="running")
+    assert conflict_exc.value.status_code == 409
+    assert upload_env["ledger"].rows[target_uid]["used_at"] is None
+    assert upload_env["ledger"].rows[target_uid]["pending_claims"] == {}
+    assert upload_env["ledger"].rows[target_uid]["expires_at"] is not None
+
+    # 4. Concurrent accepted + rejected requests referencing the same upload:
+    # releasing the rejected request preserves the accepted request's retention.
+    shared_uid = uids_200[1]
+    req_accepted = str(uuid.uuid4())
+    req_rejected = str(uuid.uuid4())
+    await svc.validate_and_claim_request_attachments(
+        [ChatUploadContext(upload_id=shared_uid, name="f1.bin", size=svc.MAX_CHAT_UPLOAD_BYTES)],
+        user_id=user_id,
+        workspace_id=ws_id,
+        claim_key=f"req:{req_accepted}",
+    )
+    await svc.validate_and_claim_request_attachments(
+        [ChatUploadContext(upload_id=shared_uid, name="f1.bin", size=svc.MAX_CHAT_UPLOAD_BYTES)],
+        user_id=user_id,
+        workspace_id=ws_id,
+        claim_key=f"req:{req_rejected}",
+    )
+    await svc.confirm_request_chat_uploads(
+        [ChatUploadContext(upload_id=shared_uid, name="f1.bin", size=svc.MAX_CHAT_UPLOAD_BYTES)],
+        user_id=user_id,
+        workspace_id=ws_id,
+        claim_key=f"req:{req_accepted}",
+    )
+    await svc.release_request_chat_uploads(
+        user_id=user_id,
+        claim_key=f"req:{req_rejected}",
+        request_key=req_rejected,
+        additional_context=[ChatUploadContext(upload_id=shared_uid, name="f1.bin", size=svc.MAX_CHAT_UPLOAD_BYTES)],
+    )
+    assert upload_env["ledger"].rows[shared_uid]["used_at"] is not None
+    assert upload_env["ledger"].rows[shared_uid]["expires_at"] is None
+
+    # Meanwhile unused target_uid can still be cancelled immediately
+    cancelled = await svc.cancel_chat_upload(upload_id=target_uid, user_id=user_id)
+    assert cancelled["state"] == "aborted"
+
+
+@pytest.mark.asyncio
+async def test_part_upload_idle_and_total_deadlines_release_slots_and_recheck_expiry(
+    upload_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stalled part streams fail with 408, release all 6 semaphore slots, and expired/aborted
+    uploads fail fast after slot wait without sending bytes to MinIO."""
+    user_id = "user-part-deadline"
+    ws_id = str(uuid.uuid4())
+    upload_env["workspaces"][ws_id] = {
+        "workspace_id": ws_id,
+        "user_id": user_id,
+        "status": "running",
+    }
+
+    monkeypatch.setattr(
+        svc,
+        "get_chat_upload_part_idle_timeout_s",
+        create_autospec(svc.get_chat_upload_part_idle_timeout_s, return_value=0.05),
+    )
+    monkeypatch.setattr(
+        svc,
+        "get_chat_upload_part_total_timeout_s",
+        create_autospec(svc.get_chat_upload_part_total_timeout_s, return_value=0.15),
+    )
+
+    payload = b"p" * 4096
+    up = await svc.initiate_chat_upload(
+        user_id=user_id, workspace_id=ws_id, filename="deadline.bin", size_bytes=len(payload)
+    )
+    uid = up["upload_id"]
+
+    async def _stalled_stream():
+        yield b"p" * 512
+        await asyncio.sleep(5.0)
+
+    # Saturate all 6 semaphore slots simultaneously with stalled streams -> all time out 408 & release slots
+    stalled_outcomes = await asyncio.gather(
+        *(
+            svc.receive_chat_upload_part(
+                upload_id=uid,
+                part_number=1,
+                user_id=user_id,
+                stream=_stalled_stream(),
+            )
+            for _ in range(6)
+        ),
+        return_exceptions=True,
+    )
+    for err in stalled_outcomes:
+        assert isinstance(err, HTTPException)
+        assert err.status_code == 408
+
+    # Subsequent valid part upload immediately succeeds because all semaphore slots were freed
+    ok_part = await svc.receive_chat_upload_part(
+        upload_id=uid,
+        part_number=1,
+        user_id=user_id,
+        stream=_bytes_stream(payload),
+    )
+    assert ok_part["size_bytes"] == len(payload)
+
+    # Expired upload fails with 410 before touching MinIO upload_part_bytes
+    up_exp = await svc.initiate_chat_upload(
+        user_id=user_id, workspace_id=ws_id, filename="expired_part.bin", size_bytes=len(payload)
+    )
+    uid_exp = up_exp["upload_id"]
+    upload_env["ledger"].rows[uid_exp]["expires_at"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+    with pytest.raises(HTTPException) as exp_exc:
+        await svc.receive_chat_upload_part(
+            upload_id=uid_exp,
+            part_number=1,
+            user_id=user_id,
+            stream=_bytes_stream(payload),
+        )
+    assert exp_exc.value.status_code == 410
+
+
+@pytest.mark.asyncio
+async def test_ready_unused_uploads_count_toward_quota_until_cancelled_swept_or_accepted(
+    upload_env,
+) -> None:
+    """Completed-but-unused ready uploads count toward the 10-file / 1000 MiB per-user cap;
+    cancelling, sweeping, or durably accepting an upload releases temporary quota."""
+    user_id = "user-ready-quota"
+    ws_id = str(uuid.uuid4())
+    upload_env["workspaces"][ws_id] = {
+        "workspace_id": ws_id,
+        "user_id": user_id,
+        "status": "running",
+    }
+
+    # Complete 10 small uploads to 'ready' without sending -> 11th initiate must hit 429
+    ready_ids: list[str] = []
+    for i in range(svc.MAX_ACTIVE_USER_UPLOADS):
+        created = await svc.initiate_chat_upload(
+            user_id=user_id,
+            workspace_id=ws_id,
+            filename=f"u{i}.bin",
+            size_bytes=512,
+        )
+        uid = created["upload_id"]
+        await svc.receive_chat_upload_part(
+            upload_id=uid, part_number=1, user_id=user_id, stream=_bytes_stream(b"q" * 512)
+        )
+        done = await svc.complete_chat_upload(upload_id=uid, user_id=user_id)
+        assert done["state"] == "ready"
+        ready_ids.append(uid)
+
+    with pytest.raises(HTTPException) as cap_count_exc:
+        await svc.initiate_chat_upload(
+            user_id=user_id,
+            workspace_id=ws_id,
+            filename="u10.bin",
+            size_bytes=512,
+        )
+    assert cap_count_exc.value.status_code == 429
+
+    # Cancelling one ready unused upload releases a slot
+    await svc.cancel_chat_upload(upload_id=ready_ids[0], user_id=user_id)
+    eleventh = await svc.initiate_chat_upload(
+        user_id=user_id, workspace_id=ws_id, filename="u10_ok.bin", size_bytes=512
+    )
+    await svc.cancel_chat_upload(upload_id=eleventh["upload_id"], user_id=user_id)
+
+    # Durably accepting ready_ids[1] into a message moves it out of temporary upload quota
+    await svc.confirm_request_chat_uploads(
+        [ChatUploadContext(upload_id=ready_ids[1], name="u1.bin", size=512)],
+        user_id=user_id,
+        workspace_id=ws_id,
+    )
+    after_accept = await svc.initiate_chat_upload(
+        user_id=user_id, workspace_id=ws_id, filename="after_accept.bin", size_bytes=512
+    )
+    assert after_accept["state"] == "uploading"

@@ -1958,7 +1958,7 @@ async def admit_steer(
                         if await cur.fetchone() is not None:
                             return {"state": "owned_elsewhere"}
                         return {"state": "not_running"}
-                return await _admit(
+                admitted = await _admit(
                     cur,
                     owner_sql="""
                         SELECT conversation_response_id AS run_id
@@ -1972,6 +1972,34 @@ async def admit_steer(
                     position_key=ordering_key,
                     target="thread",
                 )
+                # DALTON-HOOK(chat-large-upload): finalize attachment retention inside steer acceptance txn
+                if admitted.get("state") == "accepted" and payload.get("chat_uploads"):
+                    from src.dalton.database.chat_uploads import (
+                        confirm_provisional_claims,
+                    )
+
+                    upload_ids = [
+                        str(item.get("upload_id") or "").strip().lower()
+                        for item in (payload.get("chat_uploads") or [])
+                        if isinstance(item, dict) and item.get("upload_id")
+                    ]
+                    req_key = str(payload.get("request_key") or "").strip()
+                    claim_key = f"req:{req_key}" if req_key else None
+                    confirmed = await confirm_provisional_claims(
+                        upload_ids,
+                        user_id=str(payload.get("user_id") or ""),
+                        workspace_id=str(payload.get("workspace_id") or ""),
+                        claim_key=claim_key,
+                        conn=conn,
+                    )
+                    if confirmed is None:
+                        from fastapi import HTTPException
+
+                        raise HTTPException(
+                            status_code=410,
+                            detail="Attachment has expired or was removed",
+                        )
+                return admitted
 
 
 async def admit_task_steer(
@@ -2434,6 +2462,75 @@ async def release_jobs(job_ids: List[str], *, owner: Tuple[str, str]) -> List[st
     return won
 
 
+# DALTON-HOOK(chat-large-upload): per-job hold ownership check and permanent attachment failure settlement
+async def is_job_held_by(job_id: str, *, owner: Tuple[str, str]) -> bool:
+    """True while ``owner`` still holds ``job_id`` live in ``hook_outbox``."""
+    _, owner_id = owner
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                f"""
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM hook_outbox o
+                    WHERE o.hook_outbox_id = %s::uuid
+                      AND o.status = 'pending'
+                      AND o.payload->>'steered_run_id' = %s::text
+                      AND {_steer_sql(_LIVE_STEER_SQL)}
+                )
+                """,
+                (job_id, owner_id),
+            )
+            row = await cur.fetchone()
+            return bool(row and row[0])
+
+
+async def fail_held_steer_job(
+    job_id: str,
+    *,
+    owner: Tuple[str, str],
+    error_code: str,
+    error_message: str,
+) -> bool:
+    """Close a held steer job permanently when its attachment is revoked, deleted, or forbidden."""
+    _, owner_id = owner
+    patch = {
+        "delivery_error": {
+            "code": str(error_code or "attachment_failed")[:100],
+            "message": str(error_message or "Attachment could not be delivered")[:500],
+        }
+    }
+    async with pool.get_db_connection() as conn:
+        async with conn.transaction():
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    f"""
+                    UPDATE hook_outbox o
+                    SET status = 'done',
+                        completed_at = NOW(),
+                        next_retry_at = NULL,
+                        lease_expires_at = NULL,
+                        payload = (o.payload - 'steered_run_id')
+                            || jsonb_build_object('outcome', 'dropped')
+                            || %(patch)s::jsonb
+                    WHERE o.hook_outbox_id = %(job_id)s::uuid
+                      AND o.status = 'pending'
+                      AND o.payload->>'steered_run_id' = %(owner)s::text
+                      AND {_steer_sql(_LIVE_STEER_SQL)}
+                    RETURNING o.payload
+                    """,
+                    {
+                        "job_id": job_id,
+                        "owner": owner_id,
+                        "patch": SafeJson(patch),
+                    },
+                )
+                closed = [dict(r) for r in await cur.fetchall()]
+                if closed:
+                    await _give_back_comments(conn, closed)
+                return bool(closed)
+
+
 _CONFIRMED_OUTCOME_SQL = (
     "(CASE WHEN o.payload ? 'resumed_by' THEN 'resumed'"
     " ELSE %(outcome)s::text END)"
@@ -2765,6 +2862,9 @@ def _returned_entry(row: Dict[str, Any]) -> Dict[str, Any]:
     }
     if shown:
         entry["artifact_comments"] = shown
+    # DALTON-HOOK(chat-large-upload): preserve verified attachment metadata on returned/listed steers
+    if payload.get("attachments"):
+        entry["attachments"] = payload["attachments"]
     return entry
 
 

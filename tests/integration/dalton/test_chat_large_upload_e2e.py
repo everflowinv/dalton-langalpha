@@ -54,22 +54,28 @@ from ptc_agent.config.core import (
     SandboxConfig,
     SecurityConfig,
 )
+from ptc_agent.agent.middleware.steering import _steering_message
 from ptc_agent.core.paths import WorkspaceLayout
-from ptc_agent.core.project_context import ProjectContext
+from ptc_agent.core.project_context import ProjectContext, current_project
 from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
 
 import src.dalton.database as dalton_database_pkg
 import src.dalton.database.chat_uploads as chat_uploads_db
 from src.dalton import chat_upload_storage as storage
+from src.dalton import sharing as dalton_sharing
 from src.dalton import transcription_storage as asr_store
 from src.dalton.app.chat_uploads import router as chat_uploads_router
 from src.dalton.services.chat_uploads import (
     CHAT_UPLOAD_PART_SIZE,
+    MAX_ACTIVE_USER_UPLOADS,
     MAX_CHAT_UPLOAD_BYTES,
+    ChatUploadSendScope,
     build_chat_upload_history_metadata,
     build_sandbox_upload_rel_path,
     cleanup_deleted_workspace_chat_uploads,
+    confirm_request_chat_uploads,
     ensure_workspace_chat_uploads_present,
+    release_request_chat_uploads,
     retire_deleted_workspace_chat_uploads,
     sweep_expired_chat_uploads_once,
     validate_and_claim_request_attachments,
@@ -82,23 +88,34 @@ from src.server.database.computer import (
     try_claim_computer_for_start,
     update_computer_status,
 )
+from src.server.database.conversation.threads_write import create_thread
 from src.server.database.home_workspace import get_home_workspace_id
 from src.server.database.pool import _configure_postgres_connection
+from src.server.database.runs import lifecycle as tl_db
+from src.server.database.runs import outbox as outbox_db
 from src.server.database.session_lock import close_shared_lock_session
 from src.server.database.user import create_user
 from src.server.database.workspace import (
+    bind_workspace_to_computer,
     create_workspace,
     create_workspace_on_computer,
     delete_workspace as db_delete_workspace,
     files_restore_incomplete,
+    get_or_create_home_workspace,
 )
+from src.server.handlers.chat.admission_gate import wait_or_steer
 from src.server.handlers.chat.attachments import attach_request_files
 from src.server.handlers.chat.request_prep import serialize_context_metadata
+from src.server.handlers.chat.steering import open_with_steers_ahead, steer_payload
 from src.server.models.chat import ChatMessage, ChatRequest
 from src.server.services.persistence.file import (
     FilePersistenceService,
     RestoreIdentityLost,
 )
+from src.server.services.report_back.steer import SteeredReportInbox
+from src.server.services.runs.admission import RunScope, begin_run
+from src.server.services.runs.executor import LocalRunExecutor
+from src.server.services.workspace_manager import WorkspaceManager
 from src.server.utils.api import get_current_user_id
 
 pytestmark = pytest.mark.integration
@@ -242,6 +259,13 @@ async def _ensure_migrations_applied(dsn: str) -> None:
                         WHERE table_schema = 'public'
                           AND table_name = 'dalton_chat_file_uploads'
                           AND column_name = 'claim_token'
+                    ),
+                    EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = 'public'
+                          AND table_name = 'dalton_chat_file_uploads'
+                          AND column_name = 'pending_claims'
                     )
                 """
             )
@@ -250,7 +274,7 @@ async def _ensure_migrations_applied(dsn: str) -> None:
             assert str(verified[0]).endswith("_test")
             assert verified[1] is not None, "Dalton migration d033 did not create dalton_chat_file_uploads"
             assert verified[2] is not None, "alembic_version_dalton table missing after d033 upgrade"
-            if not verified[3]:
+            if not (verified[3] and verified[4]):
                 await asyncio.to_thread(command.downgrade, dalton_cfg, "d030")
                 await asyncio.to_thread(command.upgrade, dalton_cfg, "d033")
 
@@ -266,13 +290,20 @@ async def _ensure_migrations_applied(dsn: str) -> None:
                     ),
                     EXISTS (
                         SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = 'public'
+                          AND table_name = 'dalton_chat_file_uploads'
+                          AND column_name = 'pending_claims'
+                    ),
+                    EXISTS (
+                        SELECT 1
                         FROM pg_constraint
                         WHERE conname = 'chk_dalton_chat_file_uploads_cleaned_terminal'
                     )
                 """
             )
             schema_flags = await cur.fetchone()
-            assert schema_flags == (True, True), f"Incomplete d033 schema on _test DB: {schema_flags!r}"
+            assert schema_flags == (True, True, True), f"Incomplete d033 schema on _test DB: {schema_flags!r}"
 
 
 @pytest_asyncio.fixture(scope="session")
@@ -513,6 +544,70 @@ async def chat_upload_infra(monkeypatch, chat_upload_db_pool):
                 try:
                     async with _test_get_db_connection() as conn:
                         await conn.execute("TRUNCATE TABLE dalton_chat_file_uploads CASCADE")
+                        await conn.execute(
+                            """
+                            DELETE FROM hook_outbox
+                            WHERE conversation_thread_id IN (
+                                SELECT conversation_thread_id FROM conversation_threads
+                                WHERE workspace_id IN (
+                                    SELECT workspace_id FROM workspaces
+                                    WHERE user_id IN (
+                                        SELECT user_id FROM users WHERE email LIKE '%@chat-upload-e2e.test'
+                                    )
+                                )
+                            )
+                            """
+                        )
+                        await conn.execute(
+                            """
+                            DELETE FROM conversation_responses
+                            WHERE conversation_thread_id IN (
+                                SELECT conversation_thread_id FROM conversation_threads
+                                WHERE workspace_id IN (
+                                    SELECT workspace_id FROM workspaces
+                                    WHERE user_id IN (
+                                        SELECT user_id FROM users WHERE email LIKE '%@chat-upload-e2e.test'
+                                    )
+                                )
+                            )
+                            """
+                        )
+                        await conn.execute(
+                            """
+                            DELETE FROM conversation_queries
+                            WHERE conversation_thread_id IN (
+                                SELECT conversation_thread_id FROM conversation_threads
+                                WHERE workspace_id IN (
+                                    SELECT workspace_id FROM workspaces
+                                    WHERE user_id IN (
+                                        SELECT user_id FROM users WHERE email LIKE '%@chat-upload-e2e.test'
+                                    )
+                                )
+                            )
+                            """
+                        )
+                        await conn.execute(
+                            """
+                            DELETE FROM conversation_threads
+                            WHERE workspace_id IN (
+                                SELECT workspace_id FROM workspaces
+                                WHERE user_id IN (
+                                    SELECT user_id FROM users WHERE email LIKE '%@chat-upload-e2e.test'
+                                )
+                            )
+                            """
+                        )
+                        await conn.execute(
+                            """
+                            DELETE FROM dalton_workspace_sharing
+                            WHERE workspace_id IN (
+                                SELECT workspace_id FROM workspaces
+                                WHERE user_id IN (
+                                    SELECT user_id FROM users WHERE email LIKE '%@chat-upload-e2e.test'
+                                )
+                            )
+                            """
+                        )
                         await conn.execute(
                             """
                             DELETE FROM workspace_files
@@ -830,13 +925,23 @@ class TestChatLargeUploadRealInfra:
             additional_context=additional_context,
         )
 
-        # 1. Pre-stream claim & ownership check (`messaging.py` path)
+        # 1. Pre-stream provisional claim (`messaging.py` path) leaves used_at unset until durable admission
         claimed = await validate_and_claim_request_attachments(
             chat_req.additional_context,
             user_id=user["user_id"],
             workspace_id=workspace_id,
+            claim_key="req:e2e-hash-1",
         )
         assert [c["upload_id"] for c in claimed] == [up36["upload_id"], up200["upload_id"]]
+        assert all(c["used_at"] is None for c in claimed)
+
+        confirmed = await confirm_request_chat_uploads(
+            chat_req.additional_context,
+            user_id=user["user_id"],
+            workspace_id=workspace_id,
+            claim_key="req:e2e-hash-1",
+        )
+        assert all(c["used_at"] is not None and c["expires_at"] is None for c in confirmed)
 
         # 2. History & metadata serialization carry zero file bytes / base64
         query_meta: dict[str, object] = {}
@@ -1279,6 +1384,11 @@ class TestChatLargeUploadRealInfra:
                     }
                 ],
             )
+            await confirm_request_chat_uploads(
+                chat_req.additional_context,
+                user_id=owner["user_id"],
+                workspace_id=workspace_id,
+            )
             await attach_request_files(
                 [{"role": "user", "content": "Store 200 MiB archive"}],
                 chat_req,
@@ -1445,7 +1555,7 @@ class TestChatLargeUploadRealInfra:
                 tracked_keys=chat_upload_infra.tracked_keys,
                 tracked_multiparts=chat_upload_infra.tracked_multiparts,
             )
-            await validate_and_claim_request_attachments(
+            await confirm_request_chat_uploads(
                 [
                     {
                         "type": "chat_upload",
@@ -1566,7 +1676,7 @@ class TestChatLargeUploadRealInfra:
                 assert resp_1b.json()["state"] == "ready"
                 assert resp_1b.json()["sha256"] == sha_1
 
-                claimed_1 = await validate_and_claim_request_attachments(
+                claimed_1 = await confirm_request_chat_uploads(
                     [
                         {
                             "type": "chat_upload",
@@ -1925,3 +2035,1253 @@ class TestChatLargeUploadRealInfra:
         assert final_3b is not None and final_3b["cleaned_at"] is not None
         assert storage.list_uploaded_parts(key_3b, store_uid_3b) is None
         assert storage.object_size(key_3b) is None
+
+    @pytest.mark.asyncio
+    async def test_durable_acceptance_batch_validation_admission_conflicts_concurrent_claims_and_quotas(
+        self,
+        chat_upload_infra,
+    ) -> None:
+        """Verify whole-batch validation before mutation (413/404), atomic retention at real
+        PostgreSQL run/steer admission, rollback on 409 conflict, concurrent accepted + rejected
+        request safety, and per-user active + ready-unused file/byte quotas."""
+        uid_tag = uuid4().hex[:8]
+        user = await create_user(
+            user_id=f"u-admit-{uid_tag}",
+            email=f"admit-{uid_tag}@chat-upload-e2e.test",
+            name="Admission Durability Tester",
+        )
+        ws = await create_workspace(
+            user_id=user["user_id"],
+            name="Admission Durability WS",
+            description="Durable acceptance E2E",
+            status="running",
+        )
+        workspace_id = str(ws["workspace_id"])
+        headers = {"x-test-user-id": user["user_id"]}
+
+        # Upload 4 x 200 MiB ready unused files (streamed in 8 MiB parts).
+        uploads_200: list[tuple[dict, str, str]] = []
+        for idx in range(1, 5):
+            up_item = await _upload_streamed_file_via_http(
+                chat_upload_infra.client,
+                user_id=user["user_id"],
+                workspace_id=workspace_id,
+                filename=f"batch_200m_{idx}.bin",
+                mime_type="application/octet-stream",
+                total_bytes=_SIZE_200_MIB,
+                seed_tag=f"admit-200m-{idx}".encode(),
+                tracked_keys=chat_upload_infra.tracked_keys,
+                tracked_multiparts=chat_upload_infra.tracked_multiparts,
+            )
+            uploads_200.append(up_item)
+
+        # 1a. Rejected 4 x 200 MiB (800 MiB > 600 MiB message cap) -> 413 without mutating any row
+        ctx_4x200 = [
+            {
+                "type": "chat_upload",
+                "upload_id": up["upload_id"],
+                "name": up["filename"],
+                "mime_type": up["mime_type"],
+                "size": _SIZE_200_MIB,
+            }
+            for up, _, _ in uploads_200
+        ]
+        with pytest.raises(HTTPException) as over_batch_exc:
+            await validate_and_claim_request_attachments(
+                ctx_4x200,
+                user_id=user["user_id"],
+                workspace_id=workspace_id,
+                claim_key="req:rejected-4x200",
+            )
+        assert over_batch_exc.value.status_code == 413
+
+        for up, _, _ in uploads_200:
+            row = await chat_uploads_db.get_upload(up["upload_id"])
+            assert row is not None
+            assert row["used_at"] is None
+            assert row["expires_at"] is not None
+            assert (row["pending_claims"] or {}) == {}
+
+        # 1b. Valid first upload + unknown second upload -> 404 without mutating the first upload
+        with pytest.raises(HTTPException) as bad_second_exc:
+            await validate_and_claim_request_attachments(
+                [
+                    ctx_4x200[0],
+                    {
+                        "type": "chat_upload",
+                        "upload_id": str(uuid4()),
+                        "name": "missing.bin",
+                        "mime_type": "application/octet-stream",
+                        "size": 1024,
+                    },
+                ],
+                user_id=user["user_id"],
+                workspace_id=workspace_id,
+                claim_key="req:rejected-missing-id",
+            )
+        assert bad_second_exc.value.status_code == 404
+        row_first = await chat_uploads_db.get_upload(uploads_200[0][0]["upload_id"])
+        assert row_first is not None
+        assert row_first["used_at"] is None
+        assert row_first["expires_at"] is not None
+        assert (row_first["pending_claims"] or {}) == {}
+
+        # 1c. Upload 5th 200 MiB file -> 5 x 200 MiB = 1000 MiB ready-unused byte cap reached;
+        #     6th initiation (1 MiB) is rejected with HTTP 429.
+        up5, key5, _ = await _upload_streamed_file_via_http(
+            chat_upload_infra.client,
+            user_id=user["user_id"],
+            workspace_id=workspace_id,
+            filename="batch_200m_5.bin",
+            mime_type="application/octet-stream",
+            total_bytes=_SIZE_200_MIB,
+            seed_tag=b"admit-200m-5",
+            tracked_keys=chat_upload_infra.tracked_keys,
+            tracked_multiparts=chat_upload_infra.tracked_multiparts,
+        )
+        over_byte_quota = await chat_upload_infra.client.post(
+            "/api/v1/dalton/chat-uploads",
+            headers=headers,
+            json={
+                "workspace_id": workspace_id,
+                "filename": "over_1000m_cap.bin",
+                "mime_type": "application/octet-stream",
+                "size_bytes": _MIB,
+            },
+        )
+        assert over_byte_quota.status_code == 429, over_byte_quota.text
+
+        # Cancel uploads #4 and #5 via DELETE -> proves rejected 413/404 left rows cancellable
+        # and frees 400 MiB of byte quota.
+        for cancel_uid, cancel_key in (
+            (uploads_200[3][0]["upload_id"], uploads_200[3][1]),
+            (up5["upload_id"], key5),
+        ):
+            del_resp = await chat_upload_infra.client.delete(
+                f"/api/v1/dalton/chat-uploads/{cancel_uid}",
+                headers=headers,
+            )
+            assert del_resp.status_code == 200, del_resp.text
+            assert del_resp.json()["state"] == "aborted"
+            assert storage.object_size(cancel_key) is None
+
+        # 2. Real PostgreSQL START admission (`begin_run`), 409 conflict release, and concurrent steer
+        up_turn1, key_turn1, _ = uploads_200[0]
+        up_conflict, key_conflict, _ = uploads_200[1]
+        up_shared, key_shared, _ = uploads_200[2]
+
+        thread_id = str(uuid4())
+        await create_thread(
+            thread_id,
+            workspace_id,
+            "idle",
+            user_id=user["user_id"],
+        )
+
+        ctx_turn1 = [ctx_4x200[0]]
+        prov_turn1 = await validate_and_claim_request_attachments(
+            ctx_turn1,
+            user_id=user["user_id"],
+            workspace_id=workspace_id,
+            claim_key="req:rk-turn1",
+        )
+        assert prov_turn1[0]["used_at"] is None
+        assert "req:rk-turn1" in (prov_turn1[0]["pending_claims"] or {})
+
+        req_turn1 = ChatRequest(
+            messages=[ChatMessage(role="user", content="Start turn 1")],
+            workspace_id=workspace_id,
+            request_key="rk-turn1",
+            additional_context=ctx_turn1,
+        )
+        run_a_id = str(uuid4())
+        scope_a = RunScope(user_id=user["user_id"], burst_slot_id=None)
+        try:
+            await begin_run(
+                req_turn1,
+                scope=scope_a,
+                thread_id=thread_id,
+                run_id=run_a_id,
+                workspace_id=workspace_id,
+                user_id=user["user_id"],
+                is_byok=False,
+                query_content="Start turn 1",
+                query_type="initial",
+                feedback_action=None,
+                query_metadata={},
+                fork=None,
+                is_checkpoint_replay=False,
+            )
+            run_a_row = await tl_db.get_run(run_a_id)
+            assert run_a_row is not None and run_a_row["status"] == "in_progress"
+
+            row_turn1_after = await chat_uploads_db.get_upload(up_turn1["upload_id"])
+            assert row_turn1_after is not None
+            assert row_turn1_after["used_at"] is not None
+            assert row_turn1_after["expires_at"] is None
+            assert (row_turn1_after["pending_claims"] or {}) == {}
+            assert storage.object_size(key_turn1) == _SIZE_200_MIB
+
+            # Conflicting non-steerable send (`can_steer=False`) hits 409 and releases provisional claim
+            ctx_conflict = [ctx_4x200[1]]
+            prov_conflict = await validate_and_claim_request_attachments(
+                ctx_conflict,
+                user_id=user["user_id"],
+                workspace_id=workspace_id,
+                claim_key="req:rk-conflict",
+            )
+            assert prov_conflict[0]["used_at"] is None
+            assert "req:rk-conflict" in (prov_conflict[0]["pending_claims"] or {})
+
+            with pytest.raises(HTTPException) as conflict_exc:
+                async with ChatUploadSendScope(
+                    upload_ids=[up_conflict["upload_id"]],
+                    user_id=user["user_id"],
+                    request_key="rk-conflict",
+                ):
+                    await wait_or_steer(
+                        LocalRunExecutor.get_instance(),
+                        thread_id,
+                        "Non-steerable follow-up",
+                        user["user_id"],
+                        can_steer=False,
+                        request_key="rk-conflict",
+                        workspace_id=workspace_id,
+                        chat_uploads=ctx_conflict,
+                    )
+            assert conflict_exc.value.status_code == 409
+            assert isinstance(conflict_exc.value.detail, dict)
+            assert conflict_exc.value.detail.get("code") == "running"
+
+            row_conflict_after = await chat_uploads_db.get_upload(up_conflict["upload_id"])
+            assert row_conflict_after is not None
+            assert row_conflict_after["used_at"] is None
+            assert row_conflict_after["expires_at"] is not None
+            assert (row_conflict_after["pending_claims"] or {}) == {}
+
+            del_conflict = await chat_upload_infra.client.delete(
+                f"/api/v1/dalton/chat-uploads/{up_conflict['upload_id']}",
+                headers=headers,
+            )
+            assert del_conflict.status_code == 200, del_conflict.text
+            assert storage.object_size(key_conflict) is None
+
+            # Concurrent accepted steer (`rk-win`) + rejected request (`rk-lose`) on `up_shared`
+            ctx_shared = [ctx_4x200[2]]
+            await validate_and_claim_request_attachments(
+                ctx_shared,
+                user_id=user["user_id"],
+                workspace_id=workspace_id,
+                claim_key="req:rk-win",
+            )
+            await validate_and_claim_request_attachments(
+                ctx_shared,
+                user_id=user["user_id"],
+                workspace_id=workspace_id,
+                claim_key="req:rk-lose",
+            )
+            row_both = await chat_uploads_db.get_upload(up_shared["upload_id"])
+            assert row_both is not None and row_both["used_at"] is None
+            assert set((row_both["pending_claims"] or {}).keys()) == {
+                "req:rk-win",
+                "req:rk-lose",
+            }
+
+            ready_flag, steer_sse = await wait_or_steer(
+                LocalRunExecutor.get_instance(),
+                thread_id,
+                "Steer with shared 200 MiB",
+                user["user_id"],
+                can_steer=True,
+                request_key="rk-win",
+                workspace_id=workspace_id,
+                chat_uploads=ctx_shared,
+            )
+            assert ready_flag is False
+            assert isinstance(steer_sse, str)
+            assert steer_sse.startswith("event: steering_accepted\ndata: ")
+            accepted_json = json.loads(
+                steer_sse.split("data: ", 1)[1].strip()
+            )
+            assert len(accepted_json.get("attachments") or []) == 1
+            assert accepted_json["attachments"][0]["name"] == up_shared["filename"]
+
+            # Rejecting `rk-lose` AND releasing duplicate `rk-win` must NOT undo durable acceptance
+            await release_request_chat_uploads(
+                [up_shared["upload_id"]],
+                user_id=user["user_id"],
+                request_key="rk-lose",
+            )
+            await release_request_chat_uploads(
+                [up_shared["upload_id"]],
+                user_id=user["user_id"],
+                request_key="rk-win",
+            )
+            row_shared_final = await chat_uploads_db.get_upload(up_shared["upload_id"])
+            assert row_shared_final is not None
+            assert row_shared_final["used_at"] is not None
+            assert row_shared_final["expires_at"] is None
+            assert storage.object_size(key_shared) == _SIZE_200_MIB
+        finally:
+            await scope_a.fail_open("test-cleanup")
+
+        # 3. Per-user 10-file count quota across ready-unused rows + release via cancel/sweep/confirm
+        user_q = await create_user(
+            user_id=f"u-quota-{uid_tag}",
+            email=f"quota-{uid_tag}@chat-upload-e2e.test",
+            name="Quota Tester",
+        )
+        ws_q = await create_workspace(
+            user_id=user_q["user_id"],
+            name="Quota WS",
+            description="Ready unused count quota",
+            status="running",
+        )
+        ws_q_id = str(ws_q["workspace_id"])
+        q_headers = {"x-test-user-id": user_q["user_id"]}
+
+        ready_q_ids: list[str] = []
+        for idx in range(MAX_ACTIVE_USER_UPLOADS):
+            up_q, _, _ = await _upload_streamed_file_via_http(
+                chat_upload_infra.client,
+                user_id=user_q["user_id"],
+                workspace_id=ws_q_id,
+                filename=f"ready_slot_{idx}.bin",
+                mime_type="application/octet-stream",
+                total_bytes=64 * 1024,
+                seed_tag=f"slot-{idx}".encode(),
+                tracked_keys=chat_upload_infra.tracked_keys,
+                tracked_multiparts=chat_upload_infra.tracked_multiparts,
+            )
+            ready_q_ids.append(str(up_q["upload_id"]))
+
+        resp_11th = await chat_upload_infra.client.post(
+            "/api/v1/dalton/chat-uploads",
+            headers=q_headers,
+            json={
+                "workspace_id": ws_q_id,
+                "filename": "blocked_11th.bin",
+                "mime_type": "application/octet-stream",
+                "size_bytes": 64 * 1024,
+            },
+        )
+        assert resp_11th.status_code == 429, resp_11th.text
+
+        # Cancel slot 0 -> frees 1 slot
+        del_q0 = await chat_upload_infra.client.delete(
+            f"/api/v1/dalton/chat-uploads/{ready_q_ids[0]}",
+            headers=q_headers,
+        )
+        assert del_q0.status_code == 200, del_q0.text
+        up_q10, _, _ = await _upload_streamed_file_via_http(
+            chat_upload_infra.client,
+            user_id=user_q["user_id"],
+            workspace_id=ws_q_id,
+            filename="ready_slot_10.bin",
+            mime_type="application/octet-stream",
+            total_bytes=64 * 1024,
+            seed_tag=b"slot-10",
+            tracked_keys=chat_upload_infra.tracked_keys,
+            tracked_multiparts=chat_upload_infra.tracked_multiparts,
+        )
+        ready_q_ids.append(str(up_q10["upload_id"]))
+
+        # Expire slot 1 + run sweeper -> frees 1 slot
+        async with chat_upload_infra.db() as conn:
+            await conn.execute(
+                """
+                UPDATE dalton_chat_file_uploads
+                SET expires_at = NOW() - INTERVAL '10 minutes'
+                WHERE upload_id = %s
+                """,
+                (ready_q_ids[1],),
+            )
+        assert await sweep_expired_chat_uploads_once() >= 1
+        up_q11, _, _ = await _upload_streamed_file_via_http(
+            chat_upload_infra.client,
+            user_id=user_q["user_id"],
+            workspace_id=ws_q_id,
+            filename="ready_slot_11.bin",
+            mime_type="application/octet-stream",
+            total_bytes=64 * 1024,
+            seed_tag=b"slot-11",
+            tracked_keys=chat_upload_infra.tracked_keys,
+            tracked_multiparts=chat_upload_infra.tracked_multiparts,
+        )
+        ready_q_ids.append(str(up_q11["upload_id"]))
+
+        # Confirm durable acceptance on slot 2 -> leaves temporary upload pool and frees 1 slot
+        await confirm_request_chat_uploads(
+            [{"type": "chat_upload", "upload_id": ready_q_ids[2]}],
+            user_id=user_q["user_id"],
+            workspace_id=ws_q_id,
+        )
+        resp_after_confirm = await chat_upload_infra.client.post(
+            "/api/v1/dalton/chat-uploads",
+            headers=q_headers,
+            json={
+                "workspace_id": ws_q_id,
+                "filename": "allowed_after_confirm.bin",
+                "mime_type": "application/octet-stream",
+                "size_bytes": 64 * 1024,
+            },
+        )
+        assert resp_after_confirm.status_code == 200, resp_after_confirm.text
+        extra_uid = resp_after_confirm.json()["upload_id"]
+        extra_row = await chat_uploads_db.get_upload(extra_uid)
+        assert extra_row is not None
+        chat_upload_infra.tracked_keys.add(str(extra_row["object_key"]))
+        chat_upload_infra.tracked_multiparts.append(
+            (str(extra_row["object_key"]), str(extra_row["store_upload_id"]))
+        )
+        await chat_upload_infra.client.delete(
+            f"/api/v1/dalton/chat-uploads/{extra_uid}",
+            headers=q_headers,
+        )
+
+    @pytest.mark.asyncio
+    async def test_deferred_steers_ahead_project_isolation_transient_retry_and_history_separation(
+        self,
+        chat_upload_infra,
+        docker_ptc_sandbox: PTCSandbox,
+    ) -> None:
+        """Verify ahead-of-turn steers with current_project() == None materialize strictly inside
+        each workspace's own folder (two sibling workspaces + Home, zero computer-root copy),
+        transient storage failures stay retriable and deliver once on recovery, revoked/retired
+        uploads close permanently as dropped, and visible user content omits <system-reminder>
+        while supporting file-only steers."""
+        assert current_project() is None
+        uid_tag = uuid4().hex[:8]
+        user = await create_user(
+            user_id=f"u-steer-{uid_tag}",
+            email=f"steer-{uid_tag}@chat-upload-e2e.test",
+            name="Steer Isolation Tester",
+        )
+        working_dir = os.environ.get("DOCKER_SANDBOX_WORK_DIR", "/home/workspace")
+        comp = await create_computer(
+            user["user_id"],
+            kind="docker",
+            name=f"steer-comp-{uid_tag}",
+            is_primary=True,
+            status="stopped",
+            root_dir=working_dir,
+        )
+        computer_id = str(comp["computer_id"])
+        assert docker_ptc_sandbox.sandbox_id is not None
+        claimed_c = await try_claim_computer_for_start(
+            computer_id,
+            from_status="stopped",
+            expected_provider_ref=None,
+            require_provider_ref=True,
+        )
+        assert claimed_c is not None
+        bound_c = await try_bind_computer_provider_ref(
+            computer_id,
+            provider_ref=docker_ptc_sandbox.sandbox_id,
+            expected_previous_provider_ref=None,
+            platform_secret_version=0,
+        )
+        assert bound_c is not None
+
+        ws_alpha = await create_workspace_on_computer(
+            user["user_id"],
+            "alpha_desk",
+            computer_id,
+            description="Alpha workspace on shared computer",
+        )
+        ws_beta = await create_workspace_on_computer(
+            user["user_id"],
+            "beta_desk",
+            computer_id,
+            description="Beta workspace on shared computer",
+        )
+        assert ws_alpha is not None and ws_beta is not None
+        alpha_ws_id = str(ws_alpha["workspace_id"])
+        beta_ws_id = str(ws_beta["workspace_id"])
+        alpha_dir = str(ws_alpha["dir_name"])
+        beta_dir = str(ws_beta["dir_name"])
+
+        home_row = await get_or_create_home_workspace(user["user_id"])
+        home_ws_id = str(home_row["workspace_id"])
+        bound_home = await bind_workspace_to_computer(
+            home_ws_id,
+            computer_id,
+            expected_computer_id=None,
+            dir_name="Home",
+            primary_only=True,
+        )
+        assert bound_home is not None
+
+        await docker_ptc_sandbox._ensure_workspace_dirs(alpha_dir)
+        await docker_ptc_sandbox._ensure_workspace_dirs(beta_dir)
+        await docker_ptc_sandbox._ensure_workspace_dirs("Home")
+        await docker_ptc_sandbox.execute_bash_command(
+            f"rm -rf {shlex.quote(working_dir + '/work/uploads')}"
+        )
+
+        # Upload one ahead-of-turn attachment into ws_alpha, ws_beta, and Home
+        up_alpha, key_alpha, sha_alpha = await _upload_streamed_file_via_http(
+            chat_upload_infra.client,
+            user_id=user["user_id"],
+            workspace_id=alpha_ws_id,
+            filename="alpha_model.parquet",
+            mime_type="application/octet-stream",
+            total_bytes=256 * 1024,
+            seed_tag=b"ahead-alpha",
+            tracked_keys=chat_upload_infra.tracked_keys,
+            tracked_multiparts=chat_upload_infra.tracked_multiparts,
+        )
+        up_beta_ahead, _, sha_beta_ahead = await _upload_streamed_file_via_http(
+            chat_upload_infra.client,
+            user_id=user["user_id"],
+            workspace_id=beta_ws_id,
+            filename="beta_ledger.csv",
+            mime_type="text/csv",
+            total_bytes=256 * 1024,
+            seed_tag=b"ahead-beta",
+            tracked_keys=chat_upload_infra.tracked_keys,
+            tracked_multiparts=chat_upload_infra.tracked_multiparts,
+        )
+        up_home, _, sha_home = await _upload_streamed_file_via_http(
+            chat_upload_infra.client,
+            user_id=user["user_id"],
+            workspace_id="home",
+            filename="cos_brief.pdf",
+            mime_type="application/pdf",
+            total_bytes=256 * 1024,
+            seed_tag=b"ahead-home",
+            tracked_keys=chat_upload_infra.tracked_keys,
+            tracked_multiparts=chat_upload_infra.tracked_multiparts,
+        )
+
+        session_ns = SimpleNamespace(sandbox=docker_ptc_sandbox)
+        wm_stub = create_autospec(WorkspaceManager, instance=True)
+        wm_stub.get_session_for_workspace.return_value = session_ns
+
+        async def _run_ahead_for_workspace(
+            target_ws_id: str,
+            upload_body: dict,
+            *,
+            explicit_project: ProjectContext | None,
+            keep_second_run_open: bool = False,
+        ) -> tuple[str, str, RunScope, list[dict]]:
+            tid = str(uuid4())
+            await create_thread(tid, target_ws_id, "idle", user_id=user["user_id"])
+
+            # Admit a parked steer into run #1, then settle run #1 so run #2 opens with it ahead
+            r1_id = str(uuid4())
+            s1 = RunScope(user_id=user["user_id"], burst_slot_id=None)
+            await begin_run(
+                ChatRequest(
+                    messages=[ChatMessage(role="user", content="Turn 1")],
+                    workspace_id=target_ws_id,
+                    request_key=f"rk-r1-{tid[:8]}",
+                ),
+                scope=s1,
+                thread_id=tid,
+                run_id=r1_id,
+                workspace_id=target_ws_id,
+                user_id=user["user_id"],
+                is_byok=False,
+                query_content="Turn 1",
+                query_type="initial",
+                feedback_action=None,
+                query_metadata={},
+                fork=None,
+                is_checkpoint_replay=False,
+            )
+            chat_ctx = [
+                {
+                    "type": "chat_upload",
+                    "upload_id": upload_body["upload_id"],
+                    "name": upload_body["filename"],
+                    "mime_type": upload_body["mime_type"],
+                    "size": upload_body["size_bytes"],
+                }
+            ]
+            await validate_and_claim_request_attachments(
+                chat_ctx,
+                user_id=user["user_id"],
+                workspace_id=target_ws_id,
+                claim_key=f"req:ahead-{tid[:8]}",
+            )
+            ready_s, _ = await wait_or_steer(
+                LocalRunExecutor.get_instance(),
+                tid,
+                f"Parked steer for {upload_body['filename']}",
+                user["user_id"],
+                can_steer=True,
+                request_key=f"ahead-{tid[:8]}",
+                workspace_id=target_ws_id,
+                chat_uploads=chat_ctx,
+            )
+            assert ready_s is False
+            await s1.fail_open("turn-1-ended")
+
+            async with chat_upload_infra.db() as conn:
+                await conn.execute(
+                    """
+                    UPDATE hook_outbox
+                    SET created_at = NOW() - INTERVAL '10 seconds'
+                    WHERE conversation_thread_id = %s::uuid AND hook_type = 'steer'
+                    """,
+                    (tid,),
+                )
+
+            r2_id = str(uuid4())
+            s2 = RunScope(user_id=user["user_id"], burst_slot_id=None)
+            req_r2 = ChatRequest(
+                messages=[ChatMessage(role="user", content="Fresh turn 2")],
+                workspace_id=target_ws_id,
+                request_key=f"rk-r2-{tid[:8]}",
+            )
+            await begin_run(
+                req_r2,
+                scope=s2,
+                thread_id=tid,
+                run_id=r2_id,
+                workspace_id=target_ws_id,
+                user_id=user["user_id"],
+                is_byok=False,
+                query_content="Fresh turn 2",
+                query_type="follow_up",
+                feedback_action=None,
+                query_metadata={},
+                fork=None,
+                is_checkpoint_replay=False,
+            )
+            input_state = {
+                "messages": [
+                    {"role": "user", "id": f"msg-{tid[:8]}", "content": "Fresh turn 2"}
+                ]
+            }
+            try:
+                assert current_project() is None
+                input_id = await open_with_steers_ahead(
+                    tid,
+                    r2_id,
+                    req_r2,
+                    input_state,
+                    project=explicit_project,
+                    session=session_ns,
+                )
+                assert input_id == f"msg-{tid[:8]}"
+                assert len(input_state["messages"]) == 2
+                await SteeredReportInbox().confirm(
+                    r2_id,
+                    list(
+                        getattr(input_state["messages"][0], "additional_kwargs", {}).get(
+                            "steer_job_ids", []
+                        )
+                        or []
+                    ),
+                )
+            finally:
+                if not keep_second_run_open:
+                    await s2.fail_open("turn-2-cleanup")
+            return tid, r2_id, s2, input_state["messages"]
+
+        with patch.object(
+            WorkspaceManager,
+            "get_instance",
+            create_autospec(WorkspaceManager.get_instance, return_value=wm_stub),
+        ):
+            # Alpha uses explicit ProjectContext; Beta and Home pass project=None to test DB derivation!
+            await _run_ahead_for_workspace(
+                alpha_ws_id,
+                up_alpha,
+                explicit_project=ProjectContext(
+                    workspace_id=alpha_ws_id, dir_name=alpha_dir
+                ),
+            )
+            await _run_ahead_for_workspace(
+                home_ws_id,
+                up_home,
+                explicit_project=None,
+            )
+            beta_tid, beta_r2_id, beta_scope, _ = await _run_ahead_for_workspace(
+                beta_ws_id,
+                up_beta_ahead,
+                explicit_project=None,
+                keep_second_run_open=True,
+            )
+            try:
+                row_alpha = await chat_uploads_db.get_upload(up_alpha["upload_id"])
+                row_beta_ahead = await chat_uploads_db.get_upload(up_beta_ahead["upload_id"])
+                row_home = await chat_uploads_db.get_upload(up_home["upload_id"])
+                assert row_alpha is not None and row_beta_ahead is not None and row_home is not None
+
+                rel_alpha = build_sandbox_upload_rel_path(row_alpha)
+                rel_beta_ahead = build_sandbox_upload_rel_path(row_beta_ahead)
+                rel_home = build_sandbox_upload_rel_path(row_home)
+
+                abs_alpha = f"{working_dir}/{alpha_dir}/{rel_alpha}"
+                abs_beta_ahead = f"{working_dir}/{beta_dir}/{rel_beta_ahead}"
+                abs_home = f"{working_dir}/Home/{rel_home}"
+                root_uploads = f"{working_dir}/work/uploads"
+
+                check_paths_cmd = (
+                    "python3 -c '"
+                    "import hashlib, json, os, sys\n"
+                    "paths = sys.argv[1:4]\n"
+                    "root_u = sys.argv[4]\n"
+                    "out = {\"root_exists\": os.path.exists(root_u), \"shas\": []}\n"
+                    "for p in paths:\n"
+                    "    h = hashlib.sha256(open(p, \"rb\").read()).hexdigest()\n"
+                    "    out[\"shas\"].append(h)\n"
+                    "print(json.dumps(out))\n"
+                    f"' {shlex.quote(abs_alpha)} {shlex.quote(abs_beta_ahead)} "
+                    f"{shlex.quote(abs_home)} {shlex.quote(root_uploads)}"
+                )
+                probe_res = await docker_ptc_sandbox.execute_bash_command(check_paths_cmd)
+                assert probe_res.get("success") is True, probe_res
+                parsed_probe = json.loads(str(probe_res.get("stdout") or "").strip())
+                assert parsed_probe["root_exists"] is False
+                assert parsed_probe["shas"] == [sha_alpha, sha_beta_ahead, sha_home]
+
+                # Explicit delete in ws_alpha removes its single file and cleans MinIO object
+                await docker_ptc_sandbox.execute_bash_command(
+                    f"rm -f {shlex.quote(abs_alpha)}"
+                )
+                retired_alpha = await retire_deleted_workspace_chat_uploads(
+                    alpha_ws_id, [rel_alpha]
+                )
+                assert retired_alpha == 1
+                assert storage.object_size(key_alpha) is None
+
+                # Live steers on ws_beta: (1) text + file, (2) file-only (""), (3) permanently retired
+                up_s_text, _, _ = await _upload_streamed_file_via_http(
+                    chat_upload_infra.client,
+                    user_id=user["user_id"],
+                    workspace_id=beta_ws_id,
+                    filename="q4_margins.xlsx",
+                    mime_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    total_bytes=128 * 1024,
+                    seed_tag=b"steer-text",
+                    tracked_keys=chat_upload_infra.tracked_keys,
+                    tracked_multiparts=chat_upload_infra.tracked_multiparts,
+                )
+                up_s_file_only, _, _ = await _upload_streamed_file_via_http(
+                    chat_upload_infra.client,
+                    user_id=user["user_id"],
+                    workspace_id=beta_ws_id,
+                    filename="raw_audio_notes.wav",
+                    mime_type="audio/wav",
+                    total_bytes=128 * 1024,
+                    seed_tag=b"steer-file-only",
+                    tracked_keys=chat_upload_infra.tracked_keys,
+                    tracked_multiparts=chat_upload_infra.tracked_multiparts,
+                )
+
+                for rk, msg_text, up_item in (
+                    ("rk-beta-text", "Compare Q4 margins", up_s_text),
+                    ("rk-beta-empty", "", up_s_file_only),
+                ):
+                    ctx_s = [
+                        {
+                            "type": "chat_upload",
+                            "upload_id": up_item["upload_id"],
+                            "name": up_item["filename"],
+                            "mime_type": up_item["mime_type"],
+                            "size": 128 * 1024,
+                        }
+                    ]
+                    await validate_and_claim_request_attachments(
+                        ctx_s,
+                        user_id=user["user_id"],
+                        workspace_id=beta_ws_id,
+                        claim_key=f"req:{rk}",
+                    )
+                    r_flag, _ = await wait_or_steer(
+                        LocalRunExecutor.get_instance(),
+                        beta_tid,
+                        msg_text,
+                        user["user_id"],
+                        can_steer=True,
+                        request_key=rk,
+                        workspace_id=beta_ws_id,
+                        chat_uploads=ctx_s,
+                    )
+                    assert r_flag is False
+
+                # Transient MinIO outage: neither steer is checkpointed or closed; hold is released!
+                with (
+                    patch.object(
+                        storage,
+                        "sign_download_url",
+                        create_autospec(storage.sign_download_url, return_value=None),
+                    ),
+                    patch.object(
+                        storage,
+                        "iter_stored_object_chunks",
+                        create_autospec(
+                            storage.iter_stored_object_chunks,
+                            side_effect=RuntimeError("MinIO temporarily unreachable"),
+                        ),
+                    ),
+                ):
+                    taken_during_outage = await SteeredReportInbox().take(
+                        beta_tid, beta_r2_id
+                    )
+                assert taken_during_outage == []
+
+                async with chat_upload_infra.db() as conn:
+                    async with conn.cursor() as cur:
+                        await cur.execute(
+                            """
+                            SELECT status, payload
+                            FROM hook_outbox
+                            WHERE conversation_thread_id = %s::uuid
+                              AND idempotency_key IN ('steer:rk-beta-text', 'steer:rk-beta-empty')
+                            ORDER BY created_at ASC
+                            """,
+                            (beta_tid,),
+                        )
+                        outage_rows = await cur.fetchall()
+                assert len(outage_rows) == 2
+                for st_val, pl_val in outage_rows:
+                    assert st_val == "pending"
+                    assert pl_val.get("outcome") is None
+                    assert pl_val.get("steered_run_id") is None
+
+                # Storage recovers -> delivered once with clean shown user content + attachments
+                taken_recovered = await SteeredReportInbox().take(beta_tid, beta_r2_id)
+                assert len(taken_recovered) == 2
+                human_msg, delivered_payload = _steering_message(
+                    taken_recovered, beta_r2_id, 1700000000.0
+                )
+                await SteeredReportInbox().confirm(
+                    beta_r2_id, [s.job_id for s in taken_recovered]
+                )
+
+                assert "<system-reminder>" in str(human_msg.content)
+                assert "q4_margins.xlsx" in str(human_msg.content)
+                assert "raw_audio_notes.wav" in str(human_msg.content)
+
+                msgs_shown = delivered_payload["messages"]
+                assert len(msgs_shown) == 2
+                assert msgs_shown[0]["content"] == "Compare Q4 margins"
+                assert "<system-reminder>" not in msgs_shown[0]["content"]
+                assert len(msgs_shown[0].get("attachments") or []) == 1
+                assert msgs_shown[0]["attachments"][0]["name"] == "q4_margins.xlsx"
+
+                assert msgs_shown[1]["content"] == ""
+                assert len(msgs_shown[1].get("attachments") or []) == 1
+                assert msgs_shown[1]["attachments"][0]["name"] == "raw_audio_notes.wav"
+
+                # Subsequent poll delivers nothing (delivered exactly once)
+                assert await SteeredReportInbox().take(beta_tid, beta_r2_id) == []
+
+                # Permanently retired upload on a steer closes the outbox job as `dropped`
+                up_s_retired, _, _ = await _upload_streamed_file_via_http(
+                    chat_upload_infra.client,
+                    user_id=user["user_id"],
+                    workspace_id=beta_ws_id,
+                    filename="retired_before_take.bin",
+                    mime_type="application/octet-stream",
+                    total_bytes=64 * 1024,
+                    seed_tag=b"steer-retired",
+                    tracked_keys=chat_upload_infra.tracked_keys,
+                    tracked_multiparts=chat_upload_infra.tracked_multiparts,
+                )
+                ctx_ret = [
+                    {
+                        "type": "chat_upload",
+                        "upload_id": up_s_retired["upload_id"],
+                        "name": up_s_retired["filename"],
+                        "mime_type": up_s_retired["mime_type"],
+                        "size": 64 * 1024,
+                    }
+                ]
+                await validate_and_claim_request_attachments(
+                    ctx_ret,
+                    user_id=user["user_id"],
+                    workspace_id=beta_ws_id,
+                    claim_key="req:rk-beta-retired",
+                )
+                await wait_or_steer(
+                    LocalRunExecutor.get_instance(),
+                    beta_tid,
+                    "Steer whose upload is deleted before model step",
+                    user["user_id"],
+                    can_steer=True,
+                    request_key="rk-beta-retired",
+                    workspace_id=beta_ws_id,
+                    chat_uploads=ctx_ret,
+                )
+                row_ret = await chat_uploads_db.get_upload(up_s_retired["upload_id"])
+                assert row_ret is not None
+                await retire_deleted_workspace_chat_uploads(
+                    beta_ws_id, [build_sandbox_upload_rel_path(row_ret)]
+                )
+
+                assert await SteeredReportInbox().take(beta_tid, beta_r2_id) == []
+                dropped_job = await outbox_db.get_steer_job("steer:rk-beta-retired")
+                assert dropped_job is not None
+                assert dropped_job["status"] == "done"
+                assert dropped_job["payload"].get("outcome") == "dropped"
+                assert dropped_job["payload"].get("delivery_error")
+            finally:
+                await beta_scope.fail_open("beta-r2-cleanup")
+
+    @pytest.mark.asyncio
+    async def test_stalled_http_part_upload_deadlines_release_slots_and_recheck_expiry(
+        self,
+        chat_upload_infra,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Verify stalled HTTP part bodies time out with 408, release semaphore slots so
+        subsequent uploads succeed, and recheck durable row expiry (410) before MinIO PUT."""
+        monkeypatch.setenv("DALTON_CHAT_UPLOAD_PART_IDLE_TIMEOUT_S", "0.15")
+        monkeypatch.setenv("DALTON_CHAT_UPLOAD_PART_TOTAL_TIMEOUT_S", "0.45")
+        get_dalton_settings.cache_clear()
+
+        uid_tag = uuid4().hex[:8]
+        user = await create_user(
+            user_id=f"u-stall-{uid_tag}",
+            email=f"stall-{uid_tag}@chat-upload-e2e.test",
+            name="Stalled Part Tester",
+        )
+        ws = await create_workspace(
+            user_id=user["user_id"],
+            name="Stalled Part WS",
+            description="Part timeout E2E",
+            status="running",
+        )
+        workspace_id = str(ws["workspace_id"])
+        headers = {"x-test-user-id": user["user_id"]}
+
+        payload_bytes = b"valid-part-after-stall-" * 4096
+        part_sha = hashlib.sha256(payload_bytes).hexdigest()
+
+        init_resp = await chat_upload_infra.client.post(
+            "/api/v1/dalton/chat-uploads",
+            headers=headers,
+            json={
+                "workspace_id": workspace_id,
+                "filename": "stalled_then_resumed.bin",
+                "mime_type": "application/octet-stream",
+                "size_bytes": len(payload_bytes),
+            },
+        )
+        assert init_resp.status_code == 200, init_resp.text
+        upload_id = str(init_resp.json()["upload_id"])
+        row = await chat_uploads_db.get_upload(upload_id)
+        assert row is not None
+        chat_upload_infra.tracked_keys.add(str(row["object_key"]))
+        chat_upload_infra.tracked_multiparts.append(
+            (str(row["object_key"]), str(row["store_upload_id"]))
+        )
+
+        async def _stalled_http_stream():
+            yield b"x" * 1024
+            await asyncio.sleep(5.0)
+            yield b"y" * 1024
+
+        # Launch 6 concurrent stalled HTTP PUTs (> 4 relay slots) -> all must fail promptly with 408
+        stalled_resps = await asyncio.gather(
+            *(
+                chat_upload_infra.client.put(
+                    f"/api/v1/dalton/chat-uploads/{upload_id}/parts/1",
+                    headers={
+                        **headers,
+                        "content-type": "application/octet-stream",
+                    },
+                    content=_stalled_http_stream(),
+                )
+                for _ in range(6)
+            )
+        )
+        assert [r.status_code for r in stalled_resps] == [408] * 6
+
+        # Subsequent valid part upload + complete succeeds immediately because all slots were released
+        ok_put = await chat_upload_infra.client.put(
+            f"/api/v1/dalton/chat-uploads/{upload_id}/parts/1",
+            headers={
+                **headers,
+                "content-type": "application/octet-stream",
+                "x-part-sha256": part_sha,
+            },
+            content=payload_bytes,
+        )
+        assert ok_put.status_code == 200, ok_put.text
+        ok_complete = await chat_upload_infra.client.post(
+            f"/api/v1/dalton/chat-uploads/{upload_id}/complete",
+            headers=headers,
+            json={"sha256": part_sha},
+        )
+        assert ok_complete.status_code == 200, ok_complete.text
+        assert storage.compute_stored_object_digest(str(row["object_key"])) == (
+            len(payload_bytes),
+            part_sha,
+        )
+
+        # Expired upload rechecked after slot acquisition returns 410 without writing to MinIO
+        init_exp = await chat_upload_infra.client.post(
+            "/api/v1/dalton/chat-uploads",
+            headers=headers,
+            json={
+                "workspace_id": workspace_id,
+                "filename": "expired_before_put.bin",
+                "mime_type": "application/octet-stream",
+                "size_bytes": len(payload_bytes),
+            },
+        )
+        assert init_exp.status_code == 200, init_exp.text
+        exp_uid = str(init_exp.json()["upload_id"])
+        exp_row = await chat_uploads_db.get_upload(exp_uid)
+        assert exp_row is not None
+        exp_key = str(exp_row["object_key"])
+        exp_store_uid = str(exp_row["store_upload_id"])
+        chat_upload_infra.tracked_keys.add(exp_key)
+        chat_upload_infra.tracked_multiparts.append((exp_key, exp_store_uid))
+
+        async with chat_upload_infra.db() as conn:
+            await conn.execute(
+                """
+                UPDATE dalton_chat_file_uploads
+                SET expires_at = NOW() - INTERVAL '2 minutes'
+                WHERE upload_id = %s
+                """,
+                (exp_uid,),
+            )
+
+        exp_put = await chat_upload_infra.client.put(
+            f"/api/v1/dalton/chat-uploads/{exp_uid}/parts/1",
+            headers={
+                **headers,
+                "content-type": "application/octet-stream",
+                "x-part-sha256": part_sha,
+            },
+            content=payload_bytes,
+        )
+        assert exp_put.status_code == 410, exp_put.text
+        assert (storage.list_uploaded_parts(exp_key, exp_store_uid) or []) == []
+
+    @pytest.mark.asyncio
+    async def test_shared_workspace_accepted_file_recovers_for_owner_after_colleague_access_removal(
+        self,
+        chat_upload_infra,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Verify an accepted attachment uploaded by a collaborator in a shared workspace
+        remains recoverable for the workspace owner on cold sandbox recreation after the
+        collaborator's write/roster access is revoked, while denying new uploads by the
+        removed collaborator with 403."""
+        uid_tag = uuid4().hex[:8]
+        owner = await create_user(
+            user_id=f"u-share-owner-{uid_tag}",
+            email=f"share-owner-{uid_tag}@chat-upload-e2e.test",
+            name="Shared Workspace Owner",
+        )
+        colleague = await create_user(
+            user_id=f"u-share-colleague-{uid_tag}",
+            email=f"share-colleague-{uid_tag}@chat-upload-e2e.test",
+            name="Shared Workspace Colleague",
+        )
+
+        monkeypatch.setattr("src.config.settings.HOST_MODE", "oss")
+        monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
+        monkeypatch.setenv("DALTON_COLLEAGUE_DISPATCH_ENABLED", "true")
+        monkeypatch.setenv(
+            "DALTON_ALLOWED_EMAILS",
+            f"{owner['email']},{colleague['email']}",
+        )
+        get_dalton_settings.cache_clear()
+
+        working_dir = os.environ.get("DOCKER_SANDBOX_WORK_DIR", "/home/workspace")
+        comp = await create_computer(
+            owner["user_id"],
+            kind="docker",
+            name=f"shared-comp-{uid_tag}",
+            is_primary=True,
+            status="stopped",
+            root_dir=working_dir,
+        )
+        computer_id = str(comp["computer_id"])
+        ws_shared = await create_workspace_on_computer(
+            owner["user_id"],
+            "shared_deal_room",
+            computer_id,
+            description="Shared team workspace",
+        )
+        assert ws_shared is not None
+        ws_shared_id = str(ws_shared["workspace_id"])
+        dir_name = str(ws_shared["dir_name"])
+        project = ProjectContext(workspace_id=ws_shared_id, dir_name=dir_name)
+        layout = WorkspaceLayout(root=working_dir, dir_name=dir_name)
+
+        await dalton_sharing.upsert_workspace_sharing(
+            ws_shared_id,
+            cos_access="rw",
+            web_access="rw",
+            updated_by=owner["user_id"],
+        )
+
+        sandbox_1: PTCSandbox | None = None
+        sandbox_2: PTCSandbox | None = None
+        try:
+            claimed_1 = await try_claim_computer_for_start(
+                computer_id,
+                from_status="stopped",
+                expected_provider_ref=None,
+                require_provider_ref=True,
+            )
+            assert claimed_1 is not None
+            sandbox_1 = await _start_docker_sandbox(dir_name=dir_name)
+            assert sandbox_1.sandbox_id is not None
+            sandbox_1_id = sandbox_1.sandbox_id
+            bound_1 = await try_bind_computer_provider_ref(
+                computer_id,
+                provider_ref=sandbox_1_id,
+                expected_previous_provider_ref=None,
+                platform_secret_version=0,
+            )
+            assert bound_1 is not None
+
+            # Colleague uploads a multi-part file (~10 MiB) and turn durably accepts it
+            colleague_file_size = CHAT_UPLOAD_PART_SIZE + 2 * _MIB
+            up_col, key_col, sha_col = await _upload_streamed_file_via_http(
+                chat_upload_infra.client,
+                user_id=colleague["user_id"],
+                workspace_id=ws_shared_id,
+                filename="colleague_due_diligence.bin",
+                mime_type="application/octet-stream",
+                total_bytes=colleague_file_size,
+                seed_tag=b"colleague-shared-10m",
+                tracked_keys=chat_upload_infra.tracked_keys,
+                tracked_multiparts=chat_upload_infra.tracked_multiparts,
+            )
+            ctx_col = [
+                {
+                    "type": "chat_upload",
+                    "upload_id": up_col["upload_id"],
+                    "name": up_col["filename"],
+                    "mime_type": up_col["mime_type"],
+                    "size": colleague_file_size,
+                }
+            ]
+            await validate_and_claim_request_attachments(
+                ctx_col,
+                user_id=colleague["user_id"],
+                workspace_id=ws_shared_id,
+                claim_key="req:colleague-accepted",
+            )
+            await confirm_request_chat_uploads(
+                ctx_col,
+                user_id=colleague["user_id"],
+                workspace_id=ws_shared_id,
+                claim_key="req:colleague-accepted",
+            )
+            chat_req = ChatRequest(
+                messages=[ChatMessage(role="user", content="Uploaded DD model")],
+                workspace_id=ws_shared_id,
+                additional_context=ctx_col,
+            )
+            await attach_request_files(
+                [{"role": "user", "content": "Uploaded DD model"}],
+                chat_req,
+                SimpleNamespace(sandbox=sandbox_1),
+                "gpt-5",
+                SimpleNamespace(input_modalities=["text", "image", "pdf"]),
+                project=project,
+                user_id=colleague["user_id"],
+                workspace_id=ws_shared_id,
+            )
+
+            row_col = await chat_uploads_db.get_upload(up_col["upload_id"])
+            assert row_col is not None and row_col["used_at"] is not None
+            rel_col = build_sandbox_upload_rel_path(row_col)
+
+            # Owner revokes colleague write access (`web_access='ro'`) AND colleague later leaves allowlist
+            await dalton_sharing.upsert_workspace_sharing(
+                ws_shared_id,
+                cos_access="ro",
+                web_access="ro",
+                updated_by=owner["user_id"],
+            )
+            colleague_headers = {"x-test-user-id": colleague["user_id"]}
+            denied_ro = await chat_upload_infra.client.post(
+                "/api/v1/dalton/chat-uploads",
+                headers=colleague_headers,
+                json={
+                    "workspace_id": ws_shared_id,
+                    "filename": "unauthorized_after_revoke.bin",
+                    "mime_type": "application/octet-stream",
+                    "size_bytes": 4096,
+                },
+            )
+            assert denied_ro.status_code == 403, denied_ro.text
+
+            with pytest.raises(HTTPException) as denied_claim_exc:
+                await validate_and_claim_request_attachments(
+                    ctx_col,
+                    user_id=colleague["user_id"],
+                    workspace_id=ws_shared_id,
+                    claim_key="req:colleague-reuse-after-revoke",
+                )
+            assert denied_claim_exc.value.status_code == 403
+
+            monkeypatch.setenv("DALTON_ALLOWED_EMAILS", owner["email"])
+            get_dalton_settings.cache_clear()
+            denied_offboarded = await chat_upload_infra.client.post(
+                "/api/v1/dalton/chat-uploads",
+                headers=colleague_headers,
+                json={
+                    "workspace_id": ws_shared_id,
+                    "filename": "unauthorized_after_offboard.bin",
+                    "mime_type": "application/octet-stream",
+                    "size_bytes": 4096,
+                },
+            )
+            assert denied_offboarded.status_code in (403, 404), denied_offboarded.text
+
+            # Destroy sandbox #1, start cold sandbox #2, and verify owner recovers the accepted file
+            assert await update_computer_status(computer_id, "stopping", expected="running") is not None
+            await sandbox_1.cleanup()
+            sandbox_1 = None
+            assert await update_computer_status(computer_id, "stopped", expected="stopping") is not None
+
+            offline_tree = await FilePersistenceService.get_file_tree(ws_shared_id)
+            offline_by_path = {entry["path"]: entry for entry in offline_tree}
+            assert rel_col in offline_by_path
+            assert offline_by_path[rel_col]["size"] == colleague_file_size
+
+            sandbox_2 = await _start_docker_sandbox(dir_name=dir_name)
+            assert sandbox_2.sandbox_id is not None
+            assert await try_claim_computer_for_start(
+                computer_id,
+                from_status="stopped",
+                expected_provider_ref=sandbox_1_id,
+                require_provider_ref=True,
+            ) is not None
+            assert await try_bind_computer_provider_ref(
+                computer_id,
+                provider_ref=sandbox_2.sandbox_id,
+                expected_previous_provider_ref=sandbox_1_id,
+                platform_secret_version=0,
+            ) is not None
+
+            restored = await FilePersistenceService.maybe_restore(
+                ws_shared_id, sandbox_2, layout=layout
+            )
+            assert restored is True
+            assert storage.object_size(key_col) == colleague_file_size
+
+            abs_col_cold = sandbox_2.normalize_path(rel_col, project=project)
+            verify_res = await sandbox_2.execute_bash_command(
+                "python3 -c '"
+                "import hashlib, json, os, sys\n"
+                "p = sys.argv[1]\n"
+                "data = open(p, \"rb\").read()\n"
+                "print(json.dumps({\"size\": len(data), \"sha256\": hashlib.sha256(data).hexdigest()}))\n"
+                f"' {shlex.quote(abs_col_cold)}"
+            )
+            assert verify_res.get("success") is True, verify_res
+            cold_info = json.loads(str(verify_res.get("stdout") or "").strip())
+            assert cold_info == {"size": colleague_file_size, "sha256": sha_col}
+        finally:
+            if sandbox_1 is not None:
+                await sandbox_1.cleanup()
+            if sandbox_2 is not None:
+                await sandbox_2.cleanup()

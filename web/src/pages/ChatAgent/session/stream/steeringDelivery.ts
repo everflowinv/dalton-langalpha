@@ -69,7 +69,11 @@ export function deliveredEntryRow(
     });
   }
   // A comment send's note may be empty: its comments are the message.
-  if (!entry.content && !entry.artifact_comments) return null;
+  // DALTON-HOOK(chat-large-upload): render file-only steers and preserve verified attachment metadata
+  const attachments = Array.isArray(entry.attachments) && entry.attachments.length > 0
+    ? entry.attachments
+    : undefined;
+  if (!entry.content && !entry.artifact_comments && !attachments) return null;
   const provenance = senderProvenance({ origin: entry.origin, platform: entry.platform });
   return {
     id: rowId('user'),
@@ -83,6 +87,7 @@ export function deliveredEntryRow(
     ...(provenance ? { provenance } : {}),
     ...(entry.request_key ? { requestKey: entry.request_key } : {}),
     ...(entry.artifact_comments ? { artifactComments: entry.artifact_comments } : {}),
+    ...(attachments ? { attachments } : {}),
   };
 }
 
@@ -119,6 +124,11 @@ function claimDeliveredSteers(
     if (entry.artifact_comments) {
       claimed.content = entry.content;
       claimed.artifactComments = entry.artifact_comments;
+    }
+    // DALTON-HOOK(chat-large-upload): preserve original user text and verified attachments on claimed steers
+    if (Array.isArray(entry.attachments) && entry.attachments.length > 0) {
+      claimed.content = entry.content;
+      claimed.attachments = entry.attachments;
     }
     if (joinTurn && turn !== undefined) claimed.turnIndex = turn;
     if (next === messages) next = [...messages];

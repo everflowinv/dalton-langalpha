@@ -31,6 +31,7 @@ def upgrade() -> None:
             object_key TEXT NOT NULL,
             store_upload_id TEXT NOT NULL,
             uploaded_parts JSONB NOT NULL DEFAULT '{}'::jsonb,
+            pending_claims JSONB NOT NULL DEFAULT '{}'::jsonb,
             expected_sha256 TEXT,
             actual_sha256 TEXT,
             state TEXT NOT NULL CHECK (state IN ('uploading', 'completing', 'ready', 'aborted', 'failed')),
@@ -52,6 +53,13 @@ def upgrade() -> None:
         """
         ALTER TABLE dalton_chat_file_uploads
             ADD COLUMN IF NOT EXISTS claim_token TEXT;
+        """
+    )
+
+    op.execute(
+        """
+        ALTER TABLE dalton_chat_file_uploads
+            ADD COLUMN IF NOT EXISTS pending_claims JSONB NOT NULL DEFAULT '{}'::jsonb;
         """
     )
 

@@ -776,20 +776,52 @@ async def _handle_send_message(
         request = await inline_image_urls(request)
 
         # DALTON-HOOK(chat-large-upload): enforce 30/60 MiB inline budget, 5-attachment cap,
-        # and verify/claim server-stored chat_upload references before opening the SSE stream.
+        # and acquire bounded provisional claims before opening the SSE stream.
+        upload_claim_key: str | None = None
         if request.additional_context and not request.hitl_response:
             from src.dalton.services.chat_uploads import (
+                chat_upload_claim_key,
+                extract_chat_upload_contexts,
                 validate_and_claim_request_attachments,
             )
 
+            candidate_claim_key = chat_upload_claim_key(
+                request_key=request.request_key, run_id=run_id
+            )
             await validate_and_claim_request_attachments(
                 request.additional_context,
                 user_id=user_id,
                 workspace_id=workspace_id,
                 is_existing_colleague_thread=is_existing_colleague_thread,
+                claim_key=candidate_claim_key,
             )
+            if extract_chat_upload_contexts(request.additional_context):
+                upload_claim_key = candidate_claim_key
 
-        await route.bind(user_id, workspace)
+        try:
+            await route.bind(user_id, workspace)
+        except BaseException:
+            if upload_claim_key:
+                from src.dalton.services.chat_uploads import (
+                    release_request_chat_uploads,
+                )
+
+                try:
+                    await asyncio.shield(
+                        release_request_chat_uploads(
+                            user_id=user_id,
+                            claim_key=upload_claim_key,
+                            request_key=request.request_key,
+                            additional_context=request.additional_context,
+                        )
+                    )
+                except Exception:
+                    logger.warning(
+                        "Releasing provisional chat upload claim %s failed",
+                        upload_claim_key,
+                        exc_info=True,
+                    )
+            raise
 
     except BaseException:
         await scope.release_slot()
@@ -847,6 +879,8 @@ async def _handle_send_message(
         run_metadata=run_meta or None,
         extra_configurable=extra_cfg,
         setup_over=setup_over,
+        # DALTON-HOOK(chat-large-upload): transfer provisional claim ownership to workflow generator
+        upload_preclaimed=bool(upload_claim_key),
     )
 
     if not is_dispatch:
@@ -875,6 +909,7 @@ async def _handle_send_message(
         user_id=user_id,
         workspace_id=workspace_id,
         model=_model,
+        upload_claim_key=upload_claim_key,
     )
 
 
@@ -888,6 +923,8 @@ async def _prime_dispatch(
     user_id: str,
     workspace_id: str,
     model: str,
+    # DALTON-HOOK(chat-large-upload): release preclaimed uploads if priming exits before entering gen
+    upload_claim_key: str | None = None,
 ) -> JSONResponse:
     """Drive a background dispatch's turn to its START, answer with the run
     and the workspace the turn resolved to, then drain ``gen`` in the
@@ -945,12 +982,35 @@ async def _prime_dispatch(
             body["steer_id"] = steer_id
         return JSONResponse(body)
 
+    # DALTON-HOOK(chat-large-upload): release provisional claims if dispatch aborts before entering gen
+    async def _release_prestart_uploads() -> None:
+        if not upload_claim_key:
+            return
+        from src.dalton.services.chat_uploads import release_request_chat_uploads
+
+        try:
+            await asyncio.shield(
+                release_request_chat_uploads(
+                    user_id=user_id,
+                    claim_key=upload_claim_key,
+                    request_key=request.request_key,
+                    additional_context=request.additional_context,
+                )
+            )
+        except Exception:
+            logger.warning(
+                "Releasing pre-dispatch chat upload claim %s failed",
+                upload_claim_key,
+                exc_info=True,
+            )
+
     async with pointer.claim(
         rb_cache, thread_id, rb_ptc, run_id,
         request.origin_dispatch_gen,
         request.request_key,
     ) as rb_claim:
         if rb_claim.incumbent is not None:
+            await _release_prestart_uploads()
             await scope.release_slot()
             logger.info(
                 "[PTC_DISPATCH] Idempotent report-back: returning "
@@ -964,6 +1024,7 @@ async def _prime_dispatch(
                 "workspace_id": workspace_id,
             })
         if rb_claim.pair_gone:
+            await _release_prestart_uploads()
             await scope.release_slot()
             logger.warning(
                 f"[PTC_DISPATCH] Report-back pair for ptc={rb_ptc} on "
@@ -981,6 +1042,7 @@ async def _prime_dispatch(
                 ),
             )
         if rb_claim.in_flight:
+            await _release_prestart_uploads()
             await scope.release_slot()
             logger.info(
                 f"[PTC_DISPATCH] Report-back for ptc={rb_ptc} on "
@@ -1010,6 +1072,7 @@ async def _prime_dispatch(
         if gated_gen:
             admitted = await reserve.admit_dispatch_gen(thread_id, gated_gen, run_id)
             if not admitted:
+                await _release_prestart_uploads()
                 await scope.release_slot()
                 raise HTTPException(
                     status_code=503,

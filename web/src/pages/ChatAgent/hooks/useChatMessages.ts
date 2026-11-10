@@ -2283,6 +2283,10 @@ export function useChatMessages(
             // The comments the server took, which may be fewer than were
             // sent: one sent or deleted meanwhile is left out.
             const taken = readArtifactCommentsShown(event.artifact_comments);
+            // DALTON-HOOK(chat-large-upload): sync server-verified attachment metadata on steering_accepted
+            const acceptedAttachments = Array.isArray(event.attachments) && event.attachments.length > 0
+              ? (event.attachments as AttachmentMeta[])
+              : undefined;
             // Update the user message to reflect steering status
             setMessages((prev) =>
               updateMessage(prev,userMessage.id as string, (msg) => ({
@@ -2290,6 +2294,7 @@ export function useChatMessages(
                 steering: true,
                 queuePosition: event.position,
                 ...(taken ? { artifactComments: taken } : {}),
+                ...(acceptedAttachments ? { attachments: acceptedAttachments } : {}),
               }))
             );
             requestKeys.settle(requestKey, 'accepted');

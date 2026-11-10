@@ -270,6 +270,14 @@ class DaltonDataJobsConfig(BaseModel):
     min_free_mem_mb: int = Field(default=1280, ge=0)
 
 
+class DaltonChatUploadsConfig(BaseModel):
+    """Server-side streaming deadlines and sweeper toggle for chat composer uploads (`d033`)."""
+
+    part_read_idle_timeout_s: float = Field(default=30.0, gt=0)
+    part_read_total_timeout_s: float = Field(default=180.0, gt=0)
+    cleanup_enabled: bool = True
+
+
 # A fake-IP exemption may never reach these, whatever the config says: they are
 # the internal services and metadata endpoint the fetch guard exists to protect.
 NEVER_EXEMPT_NETWORKS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = tuple(
@@ -407,6 +415,9 @@ class DaltonConfig(BaseModel):
     )
     data_jobs: DaltonDataJobsConfig = Field(
         default_factory=DaltonDataJobsConfig
+    )
+    chat_uploads: DaltonChatUploadsConfig = Field(
+        default_factory=DaltonChatUploadsConfig
     )
     models: DaltonModelsConfig = Field(default_factory=DaltonModelsConfig)
     budget: DaltonBudgetDefaults = Field(default_factory=DaltonBudgetDefaults)
@@ -1189,6 +1200,50 @@ def get_dalton_trusted_proxies() -> tuple[str, ...]:
         return DEFAULT_TRUSTED_PROXIES
     parsed = tuple(item.strip() for item in raw.split(",") if item.strip())
     return parsed if parsed else DEFAULT_TRUSTED_PROXIES
+
+
+def _positive_float_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return float(default)
+    try:
+        parsed = float(raw.strip())
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; using %s", name, raw, default)
+        return float(default)
+    if parsed <= 0:
+        logger.warning("Ignoring non-positive %s=%r; using %s", name, raw, default)
+        return float(default)
+    return parsed
+
+
+def get_chat_upload_part_idle_timeout_s() -> float:
+    """Per-chunk body-read idle deadline in seconds for chat multipart part uploads."""
+    cfg = get_dalton_config()
+    return _positive_float_env(
+        "DALTON_CHAT_UPLOAD_PART_IDLE_TIMEOUT_S",
+        cfg.chat_uploads.part_read_idle_timeout_s,
+    )
+
+
+def get_chat_upload_part_total_timeout_s() -> float:
+    """Total wall-clock body-read deadline in seconds for one chat upload part."""
+    cfg = get_dalton_config()
+    return _positive_float_env(
+        "DALTON_CHAT_UPLOAD_PART_TOTAL_TIMEOUT_S",
+        cfg.chat_uploads.part_read_total_timeout_s,
+    )
+
+
+def is_chat_upload_cleanup_enabled() -> bool:
+    """Whether the periodic ``dalton_chat_file_uploads`` cleanup loop should run."""
+    cfg = get_dalton_config()
+    if not cfg.enabled or not cfg.chat_uploads.cleanup_enabled:
+        return False
+    raw = os.getenv("DALTON_CHAT_UPLOAD_CLEANUP_ENABLED")
+    if raw is None or not raw.strip():
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
 
