@@ -194,6 +194,16 @@ export class DeliveryService {
     }
 
     // `claim_status === "claimed"`
+    const deliveryAttempt =
+      typeof claim.delivery_attempt === "number" ? claim.delivery_attempt : undefined;
+    const recordProgress = (
+      body: Parameters<BackendClient["updateDeliveryProgress"]>[0],
+    ) =>
+      this.backend.updateDeliveryProgress(
+        deliveryAttempt === undefined
+          ? body
+          : { ...body, delivery_attempt: deliveryAttempt },
+      );
     // Note (`PROTOCOL.md` §9 I-6): `claim.recipient_id` is the platform recipient ID
     // (`platform_user_id` for DM or `chat_id` for group), whereas `options.userId` is the Dalton user UUID!
     const platformStr = (claim.platform ?? preliminaryPlat ?? "").toLowerCase();
@@ -217,7 +227,7 @@ export class DeliveryService {
         message: `Platform ${platformStr || "unknown"} is not supported or target address is missing.`,
         files: [],
       };
-      await this.backend.updateDeliveryProgress({
+      await recordProgress({
         delivery_key: options.deliveryKey,
         status: "failed",
         error_code: "unavailable",
@@ -238,7 +248,7 @@ export class DeliveryService {
         message: `The ${platformStr} channel adapter is not connected.`,
         files: [],
       };
-      await this.backend.updateDeliveryProgress({
+      await recordProgress({
         delivery_key: options.deliveryKey,
         status: "failed",
         error_code: "unavailable",
@@ -251,7 +261,7 @@ export class DeliveryService {
     const chunks = hasNonEmptyText ? adapter.splitTextChunks(rawText) : [];
     const totalChunks = chunks.length;
     if (totalChunks !== preliminaryChunks.length) {
-      await this.backend.updateDeliveryProgress({
+      await recordProgress({
         delivery_key: options.deliveryKey,
         total_chunks: totalChunks,
       });
@@ -296,6 +306,9 @@ export class DeliveryService {
           platformStr === "discord" &&
           options.newThread === true &&
           !reuseConfirmedThread;
+        if (i === 0 && reuseConfirmedThread) {
+          await this.authorizeDiscordBodyDispatch(options.deliveryKey, deliveryAttempt);
+        }
         const res = await adapter.sendTextChunk({
           targetAddress: finalAddress,
           recipientPlatformUserId,
@@ -313,8 +326,13 @@ export class DeliveryService {
                 await this.storeConfirmedDiscordThread(
                   options.deliveryKey,
                   confirmed.address,
+                  deliveryAttempt,
                 );
                 finalAddress = confirmed.address;
+                await this.authorizeDiscordBodyDispatch(
+                  options.deliveryKey,
+                  deliveryAttempt,
+                );
               }
             : undefined,
           weixinContextToken: claim.weixin_context_token ?? null,
@@ -324,7 +342,7 @@ export class DeliveryService {
         if (res.resolvedAddress) {
           finalAddress = res.resolvedAddress;
         }
-        await this.backend.updateDeliveryProgress({
+        await recordProgress({
           delivery_key: options.deliveryKey,
           sent_chunks: sentChunks,
           total_chunks: totalChunks,
@@ -431,7 +449,7 @@ export class DeliveryService {
             reason: sendRes.reason ?? null,
           });
           if (fileSucceeded) {
-            await this.backend.updateDeliveryProgress({
+            await recordProgress({
               delivery_key: options.deliveryKey,
               sent_chunks: sentChunks,
               total_chunks: totalChunks,
@@ -511,7 +529,7 @@ export class DeliveryService {
       files: fileOutcomes,
     };
 
-    await this.backend.updateDeliveryProgress({
+    await recordProgress({
       delivery_key: options.deliveryKey,
       sent_chunks: sentChunks,
       total_chunks: totalChunks,
@@ -528,36 +546,66 @@ export class DeliveryService {
 
   /**
    * Store a Discord thread that create or adoption already confirmed.
-   * A missing or failed acknowledgment does not send the message. The delivery
-   * stays unknown so a later claim cannot create a second thread.
+   * The same progress transaction records `before_body` when no body phase
+   * exists yet. A missing acknowledgment does not send. The caller writes one
+   * terminal status for this claim generation. A later claim can resume only
+   * when that stored phase is still `before_body`.
    */
   private async storeConfirmedDiscordThread(
     deliveryKey: string,
     address: string,
+    deliveryAttempt?: number,
   ): Promise<void> {
     let stored = false;
     try {
       const ack = await this.backend.updateDeliveryProgress({
         delivery_key: deliveryKey,
         confirmed_thread_address: address,
+        ...(typeof deliveryAttempt === "number"
+          ? { delivery_attempt: deliveryAttempt }
+          : {}),
       });
-      stored = ack.ok === true && ack.confirmed_thread_address === address;
+      const phase = ack.discord_body_phase;
+      stored =
+        ack.ok === true &&
+        ack.confirmed_thread_address === address &&
+        (phase === "before_body" || phase === "dispatching");
     } catch {
       stored = false;
     }
     if (stored) return;
-    try {
-      await this.backend.updateDeliveryProgress({
-        delivery_key: deliveryKey,
-        status: "unknown",
-        error_code: "unavailable",
-        error_message: "Discord confirmed thread was not stored",
-      });
-    } catch {
-      // Leave in_flight when this write is also lost. Startup marks that row
-      // unknown and keeps a thread address that did commit.
-    }
     throw new ChannelDeliveryError("Discord confirmed thread was not stored", {
+      outcome: "unknown",
+      code: "unavailable",
+    });
+  }
+
+  /**
+   * Authorize one Discord body POST.
+   * The POST runs only after this acknowledgment echoes `dispatching`.
+   * A lost acknowledgment does not send and does not write a second status.
+   * The caller writes one terminal status for this claim generation.
+   * `unknown` plus `dispatching` is not claimed again, including after startup.
+   */
+  private async authorizeDiscordBodyDispatch(
+    deliveryKey: string,
+    deliveryAttempt?: number,
+  ): Promise<void> {
+    let authorized = false;
+    try {
+      const ack = await this.backend.updateDeliveryProgress({
+        delivery_key: deliveryKey,
+        discord_body_phase: "dispatching",
+        ...(typeof deliveryAttempt === "number"
+          ? { delivery_attempt: deliveryAttempt }
+          : {}),
+      });
+      authorized = ack.ok === true && ack.discord_body_phase === "dispatching";
+    } catch {
+      authorized = false;
+    }
+    if (authorized) return;
+    throw new ChannelDeliveryError("Discord body dispatch was not acknowledged", {
       outcome: "unknown",
       code: "unavailable",
     });

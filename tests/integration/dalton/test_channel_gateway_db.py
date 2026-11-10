@@ -4681,6 +4681,7 @@ async def test_ch1_real_http_gateway_orchestrator_to_fastapi_and_postgres(
             "test/real-http-postgres.test.ts",
             "-t",
             "FeishuChannelAdapter",
+            "--reporter=verbose",
             "--pool=forks",
             "--poolOptions.forks.singleFork=true",
             cwd=str(gateway_dir),

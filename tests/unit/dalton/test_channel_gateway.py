@@ -1059,6 +1059,16 @@ class InMemoryChannelStore:
                 act_origin = "none"
                 replay_origin = False
             prev_dlv = self.deliveries.get(str(dkey))
+            raw_attempt = None if prev_dlv is None else prev_dlv.get("delivery_attempt")
+            if isinstance(raw_attempt, bool) or raw_attempt is None:
+                prev_attempt = 0
+            else:
+                try:
+                    prev_attempt = int(raw_attempt)
+                except (TypeError, ValueError):
+                    prev_attempt = 0
+            # Insert uses SQL literal 1. Conflict increments. Neither is a bind parameter.
+            next_attempt = 1 if prev_dlv is None else prev_attempt + 1
             stored_origin = str(act_origin or "none")
             if prev_dlv is not None:
                 prev_origin = str(prev_dlv.get("activity_origin") or "none")
@@ -1102,6 +1112,8 @@ class InMemoryChannelStore:
                 "confirmed_thread_address": (prev_dlv or {}).get(
                     "confirmed_thread_address"
                 ),
+                "discord_body_phase": (prev_dlv or {}).get("discord_body_phase"),
+                "delivery_attempt": next_attempt,
                 "error_code": None,
                 "error_message": None,
                 "created_at": (prev_dlv or {}).get("created_at") or now,
@@ -1121,6 +1133,29 @@ class InMemoryChannelStore:
                 and str(row.get("status") or "") == "in_flight"
             ):
                 row["confirmed_thread_address"] = str(requested)
+                if row.get("discord_body_phase") is None:
+                    row["discord_body_phase"] = "before_body"
+                row["updated_at"] = now
+                self.last_rowcount = 1
+            else:
+                self.last_rowcount = 0
+            return []
+
+        if "UPDATE dalton_channel_deliveries SET discord_body_phase = %s" in norm:
+            requested, dkey = params[0], params[1]
+            row = self.deliveries.get(str(dkey))
+            current = None if row is None else row.get("discord_body_phase")
+            status = "" if row is None else str(row.get("status") or "")
+            forward = (
+                row is not None
+                and status == "in_flight"
+                and (
+                    (current is None and requested in ("before_body", "dispatching"))
+                    or (current == "before_body" and requested == "dispatching")
+                )
+            )
+            if row is not None and forward:
+                row["discord_body_phase"] = str(requested)
                 row["updated_at"] = now
                 self.last_rowcount = 1
             else:
@@ -1146,7 +1181,7 @@ class InMemoryChannelStore:
             return []
 
         if "UPDATE dalton_channel_deliveries SET status = 'unknown', error_code = 'gateway_restarted'" in norm:
-            # Startup leaves confirmed_thread_address on the same row.
+            # Startup leaves confirmed_thread_address, discord_body_phase, and delivery_attempt.
             for r in self.deliveries.values():
                 if r["status"] == "in_flight":
                     r["status"] = "unknown"

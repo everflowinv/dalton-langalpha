@@ -510,7 +510,7 @@ async def test_d035_upgrade_from_d031_preserves_state_and_enforces_safe_downgrad
             """
         )
 
-    # Upgrade d031 -> head. d036 adds a nullable delivery column and does not
+    # Upgrade d031 -> head. d036 adds delivery columns and does not
     # change the company automation rows asserted below.
     await asyncio.to_thread(command.upgrade, dalton_cfg, "head")
 

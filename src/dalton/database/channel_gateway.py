@@ -1,7 +1,7 @@
 """Database persistence and transaction logic for CH-1 Channel Gateway (`I-1` ~ `I-9` & §1.5).
 
 All SQL for the 11 `dalton_channel_*` tables (migrations `d030`, `d031`, and the
-`d036` confirmed Discord thread column) lives here.
+`d036` confirmed Discord thread, body-phase, and claim-generation columns) lives here.
 
 Global lock order across transactions:
 0. Per-message / per-delivery advisory locks (`dalton_inbound:<platform>:<message_id>`, `dalton_delivery:<delivery_key>`)
@@ -3863,7 +3863,44 @@ def _delivery_confirmed_thread_address(row: dict[str, Any] | None) -> str | None
     return text or None
 
 
-def _reject_confirmed_thread(status_code: int, message: str) -> NoReturn:
+def _delivery_discord_body_phase(row: dict[str, Any] | None) -> str | None:
+    """Return the stored Discord body phase, or None when this delivery has none."""
+    if not row:
+        return None
+    raw = row.get("discord_body_phase")
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    return text or None
+
+
+def _delivery_attempt(row: dict[str, Any] | None) -> int:
+    """Return the stored claim generation, or 0 when this row has none."""
+    if not row:
+        return 0
+    raw = row.get("delivery_attempt")
+    if raw is None or isinstance(raw, bool):
+        return 0
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _requested_delivery_attempt(value: Any) -> int | None:
+    """Return a progress attempt token, or reject a value that is not an integer.
+
+    ``None`` means the caller did not name a generation. ``bool`` is rejected
+    because it is a subclass of ``int`` and is not a generation.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        _reject_delivery_update(400, "delivery_attempt must be an integer")
+    return value
+
+
+def _reject_delivery_update(status_code: int, message: str) -> NoReturn:
     raise HTTPException(
         status_code=status_code,
         detail={
@@ -3871,6 +3908,10 @@ def _reject_confirmed_thread(status_code: int, message: str) -> NoReturn:
             "message": message,
         },
     )
+
+
+def _reject_confirmed_thread(status_code: int, message: str) -> NoReturn:
+    _reject_delivery_update(status_code, message)
 
 
 async def _store_confirmed_discord_thread(
@@ -3925,6 +3966,10 @@ async def _store_confirmed_discord_thread(
         """
         UPDATE dalton_channel_deliveries
         SET confirmed_thread_address = %s,
+            discord_body_phase = CASE
+                WHEN discord_body_phase IS NULL THEN 'before_body'
+                ELSE discord_body_phase
+            END,
             updated_at = NOW()
         WHERE delivery_key = %s
           AND confirmed_thread_address IS NULL
@@ -3934,6 +3979,70 @@ async def _store_confirmed_discord_thread(
     )
     if getattr(cur, "rowcount", 0) != 1:
         _reject_confirmed_thread(409, "confirmed_thread_address was not stored")
+    row["confirmed_thread_address"] = requested
+    if _delivery_discord_body_phase(row) is None:
+        row["discord_body_phase"] = "before_body"
+    return requested
+
+
+async def _store_discord_body_phase(
+    cur: Any,
+    *,
+    row: dict[str, Any],
+    delivery_key: str,
+    requested: str,
+    prev_status: str,
+) -> str:
+    """Move the Discord body phase forward, or accept the same value again.
+
+    ``before_body`` proves no body request has been authorized. ``dispatching``
+    means a body POST may already have reached Discord. A later call cannot
+    return to ``before_body`` or clear the phase. A new value is written only
+    while the delivery is in flight; repeating the stored value changes nothing.
+    """
+    platform = str(row.get("platform") or "").strip().lower()
+    if platform != "discord":
+        _reject_delivery_update(
+            400, "discord_body_phase requires a Discord delivery"
+        )
+    if (
+        requested != requested.strip()
+        or requested not in ("before_body", "dispatching")
+    ):
+        _reject_delivery_update(
+            400, "discord_body_phase is not a recognized Discord body phase"
+        )
+    current = _delivery_discord_body_phase(row)
+    if current == requested:
+        return requested
+    if current == "dispatching" or (
+        current == "before_body" and requested != "dispatching"
+    ):
+        _reject_delivery_update(409, "discord_body_phase cannot move backwards")
+    if current not in (None, "before_body"):
+        _reject_delivery_update(409, "discord_body_phase cannot move backwards")
+    if prev_status != "in_flight":
+        _reject_delivery_update(
+            409,
+            "discord_body_phase can change only while the delivery is in flight",
+        )
+    await cur.execute(
+        """
+        UPDATE dalton_channel_deliveries
+        SET discord_body_phase = %s,
+            updated_at = NOW()
+        WHERE delivery_key = %s
+          AND status = 'in_flight'
+          AND (
+                discord_body_phase IS NULL
+                OR (discord_body_phase = 'before_body' AND %s = 'dispatching')
+              )
+        """,
+        (requested, delivery_key, requested),
+    )
+    if getattr(cur, "rowcount", 0) != 1:
+        _reject_delivery_update(409, "discord_body_phase was not stored")
+    row["discord_body_phase"] = requested
     return requested
 
 
@@ -4020,6 +4129,7 @@ async def authorize_and_claim_delivery(
                     ex_status = str(existing["status"])
                     ex_is_current = bool(existing.get("is_current", False))
                     stored_confirmed_thread = _delivery_confirmed_thread_address(existing)
+                    stored_body_phase = _delivery_discord_body_phase(existing)
                     ex_scope_key: str | None = None
                     scope_mismatch = (
                         eff_source_scope is not None and ex_scope != eff_source_scope
@@ -4109,6 +4219,8 @@ async def authorize_and_claim_delivery(
                             "platform": existing["platform"],
                             "target_address": existing["target_address"],
                             "confirmed_thread_address": stored_confirmed_thread,
+                            "discord_body_phase": stored_body_phase,
+                            "delivery_attempt": _delivery_attempt(existing),
                             "thread_scope_key": ex_scope_key,
                             "is_current": ex_is_current,
                         }
@@ -4129,17 +4241,25 @@ async def authorize_and_claim_delivery(
                             "platform": existing["platform"],
                             "target_address": existing["target_address"],
                             "confirmed_thread_address": stored_confirmed_thread,
+                            "discord_body_phase": stored_body_phase,
+                            "delivery_attempt": _delivery_attempt(existing),
                             "thread_scope_key": ex_scope_key,
                             "is_current": ex_is_current,
                         }
-                    # Startup rewrites in_flight to unknown and leaves this column.
-                    # A stored thread is reclaimed so the same delivery can post into
-                    # it. Unknown with no stored thread stays blocked: an ambiguous
-                    # create must not call Discord create again.
-                    reclaim_confirmed_thread = (
-                        ex_status == "unknown" and stored_confirmed_thread is not None
+                    # Startup rewrites in_flight to unknown and leaves the thread
+                    # address and body phase in place. A stored thread proves where
+                    # to send. It does not prove the body has not already reached
+                    # Discord. Unknown resumes only when the phase is before_body,
+                    # which is written with the thread before any body request is
+                    # authorized. A null phase or dispatching stays blocked, as does
+                    # unknown with no stored thread: an ambiguous create must not
+                    # call Discord create again.
+                    reclaim_before_body = (
+                        ex_status == "unknown"
+                        and stored_confirmed_thread is not None
+                        and stored_body_phase == "before_body"
                     )
-                    if ex_status in ("in_flight", "unknown") and not reclaim_confirmed_thread:
+                    if ex_status in ("in_flight", "unknown") and not reclaim_before_body:
                         return {
                             "claim_status": "in_flight_or_unknown",
                             "status": "unknown",
@@ -4148,6 +4268,8 @@ async def authorize_and_claim_delivery(
                             "platform": existing["platform"],
                             "target_address": existing["target_address"],
                             "confirmed_thread_address": stored_confirmed_thread,
+                            "discord_body_phase": stored_body_phase,
+                            "delivery_attempt": _delivery_attempt(existing),
                             "thread_scope_key": ex_scope_key,
                             "is_current": ex_is_current,
                         }
@@ -4801,7 +4923,8 @@ async def authorize_and_claim_delivery(
                         eff_source_gen = None
 
                 # Reclaim keeps the delivery key. A different user, platform, or destination
-                # is rejected and does not retarget the stored row.
+                # is rejected and does not retarget the stored row. The confirmed thread
+                # and body phase are omitted from the upsert so a reclaim keeps both.
                 if existing is not None:
                     ex_user = str(existing.get("user_id") or "").strip()
                     ex_plat = str(existing.get("platform") or "").strip().lower()
@@ -4822,16 +4945,21 @@ async def authorize_and_claim_delivery(
                             "confirmed_thread_address": _delivery_confirmed_thread_address(
                                 existing
                             ),
+                            "discord_body_phase": _delivery_discord_body_phase(existing),
+                            "delivery_attempt": _delivery_attempt(existing),
                         }
 
                 if resolved_user_id and not str(resolved_user_id).startswith("unlinked:"):
                     reject_company_system_auth(resolved_user_id)
 
                 # 3. Atomic claim. Scope and generation stay as first stored.
-                # confirmed_thread_address is omitted so a reclaim keeps the first
-                # confirmed Discord thread. A failed conversation delivery reclaimed
-                # as replay persists activity_origin='replay' so a later progress
-                # update does not extend last_conversation_activity_at.
+                # confirmed_thread_address and discord_body_phase are omitted so a
+                # reclaim keeps the first confirmed Discord thread and its body phase.
+                # delivery_attempt is a SQL literal on insert and an increment on
+                # conflict, not another bind parameter. A failed conversation
+                # delivery reclaimed as replay persists activity_origin='replay' so
+                # a later progress update does not extend last_conversation_activity_at.
+                next_attempt = 1 if existing is None else _delivery_attempt(existing) + 1
                 await cur.execute(
                     """
                     INSERT INTO dalton_channel_deliveries (
@@ -4839,6 +4967,7 @@ async def authorize_and_claim_delivery(
                         is_current, has_non_empty_text, platform, target_address,
                         status, total_chunks, sent_chunks, platform_message_ids,
                         files_status, source_scope_key, source_generation, activity_origin,
+                        delivery_attempt,
                         created_at, updated_at
                     )
                     VALUES (
@@ -4846,6 +4975,7 @@ async def authorize_and_claim_delivery(
                         %s, %s, %s, %s,
                         'in_flight', %s, 0, '[]'::jsonb,
                         '[]'::jsonb, %s, %s, %s,
+                        1,
                         NOW(), NOW()
                     )
                     ON CONFLICT (delivery_key) DO UPDATE SET
@@ -4857,6 +4987,7 @@ async def authorize_and_claim_delivery(
                         total_chunks = EXCLUDED.total_chunks,
                         error_code = NULL,
                         error_message = NULL,
+                        delivery_attempt = dalton_channel_deliveries.delivery_attempt + 1,
                         activity_origin = CASE
                             WHEN %s
                              AND dalton_channel_deliveries.status = 'failed'
@@ -4897,6 +5028,8 @@ async def authorize_and_claim_delivery(
                     "platform": resolved_platform,
                     "target_address": resolved_target_address,
                     "confirmed_thread_address": _delivery_confirmed_thread_address(existing),
+                    "discord_body_phase": _delivery_discord_body_phase(existing),
+                    "delivery_attempt": next_attempt,
                     "thread_scope_key": resolved_thread_scope_key,
                     "is_current": is_current,
                     "home_workspace_id": home_ws_id,
@@ -4932,6 +5065,8 @@ async def update_delivery_progress(
     error_code: str | None = None,
     error_message: str | None = None,
     confirmed_thread_address: str | None = None,
+    discord_body_phase: str | None = None,
+    delivery_attempt: int | None = None,
     conn: Any = None,
 ) -> dict[str, Any]:
     """I-7 (1): Update `dalton_channel_deliveries`, increment `sent_to_current_count`, and update conversation activity timestamp."""
@@ -4949,6 +5084,8 @@ async def update_delivery_progress(
             error_code=error_code,
             error_message=error_message,
             confirmed_thread_address=confirmed_thread_address,
+            discord_body_phase=discord_body_phase,
+            delivery_attempt=delivery_attempt,
             conn=c,
         ),
     )
@@ -4966,6 +5103,8 @@ async def _update_delivery_progress_once(
     error_code: str | None = None,
     error_message: str | None = None,
     confirmed_thread_address: str | None = None,
+    discord_body_phase: str | None = None,
+    delivery_attempt: int | None = None,
     conn: Any = None,
 ) -> dict[str, Any]:
     cleaned_key = str(delivery_key or "").strip()
@@ -5052,6 +5191,31 @@ async def _update_delivery_progress_once(
 
                 prev_status = str(row["status"])
                 new_status = str(status or prev_status)
+                # A named generation must still be the current one before any
+                # column changes. Omitted generations keep the previous update
+                # rules for callers that have not adopted the token.
+                current_attempt = _delivery_attempt(row)
+                requested_attempt = _requested_delivery_attempt(delivery_attempt)
+                if (
+                    requested_attempt is not None
+                    and requested_attempt != current_attempt
+                ):
+                    _reject_delivery_update(
+                        409, "delivery_attempt is no longer the current attempt"
+                    )
+                # Discord unknown stays unknown. A stale worker must not turn an
+                # uncertain Discord body into a retryable failed, sent, partial,
+                # or in_flight delivery. Feishu, Weixin, and data tasks keep the
+                # previous rule and can still record a later completion.
+                if (
+                    locked_plat == "discord"
+                    and prev_status == "unknown"
+                    and status is not None
+                    and str(status) != "unknown"
+                ):
+                    _reject_delivery_update(
+                        409, "Discord delivery status unknown cannot be changed"
+                    )
                 prev_sent_chunks = int(row.get("sent_chunks") or 0)
                 req_sent_chunks = (
                     int(sent_chunks)
@@ -5087,8 +5251,11 @@ async def _update_delivery_progress_once(
                     if first_response_json is not None
                     else row.get("first_response_json")
                 )
-                # Write the thread before the status update. A later replacement
-                # of first_response_json does not mention this column.
+                # Write the thread and body phase before the status update. A later
+                # replacement of first_response_json does not mention either column.
+                # The first confirmed thread also records before_body when no phase
+                # is stored yet. A rejected phase or status change rolls this
+                # transaction back, so neither column changes on its own.
                 stored_confirmed_thread = _delivery_confirmed_thread_address(row)
                 if confirmed_thread_address is not None:
                     stored_confirmed_thread = await _store_confirmed_discord_thread(
@@ -5096,6 +5263,15 @@ async def _update_delivery_progress_once(
                         row=row,
                         delivery_key=cleaned_key,
                         requested=confirmed_thread_address,
+                        prev_status=prev_status,
+                    )
+                stored_body_phase = _delivery_discord_body_phase(row)
+                if discord_body_phase is not None:
+                    stored_body_phase = await _store_discord_body_phase(
+                        cur,
+                        row=row,
+                        delivery_key=cleaned_key,
+                        requested=discord_body_phase,
                         prev_status=prev_status,
                     )
 
@@ -5214,6 +5390,8 @@ async def _update_delivery_progress_once(
                     "status": new_status,
                     "sent_to_current_count": updated_count,
                     "confirmed_thread_address": stored_confirmed_thread,
+                    "discord_body_phase": stored_body_phase,
+                    "delivery_attempt": current_attempt,
                 }
 
 
@@ -6334,7 +6512,8 @@ async def recover_channel_state(
                     }
 
                 # mode == "startup"
-                # ① Mark all lingering in_flight deliveries as unknown / gateway_restarted
+                # ① Mark all lingering in_flight deliveries as unknown / gateway_restarted.
+                # The confirmed thread, discord_body_phase, and delivery_attempt stay.
                 await cur.execute(
                     """
                     UPDATE dalton_channel_deliveries

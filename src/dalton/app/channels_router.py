@@ -213,6 +213,8 @@ class DeliveryProgressRequest(BaseModel):
     error_code: str | None = None
     error_message: str | None = None
     confirmed_thread_address: str | None = None
+    discord_body_phase: str | None = None
+    delivery_attempt: int | None = None
 
 
 class InboundProgressRequest(BaseModel):
@@ -514,6 +516,8 @@ async def internal_deliveries_progress_endpoint(
         error_code=body.error_code,
         error_message=body.error_message,
         confirmed_thread_address=body.confirmed_thread_address,
+        discord_body_phase=body.discord_body_phase,
+        delivery_attempt=body.delivery_attempt,
     )
 
 

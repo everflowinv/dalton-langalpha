@@ -1684,13 +1684,28 @@ def _create_real_http_test_app(
                 if delivery_key:
                     await cur.execute(
                         """
-                        SELECT EXISTS (
-                            SELECT 1
-                            FROM information_schema.columns
-                            WHERE table_schema = 'public'
-                              AND table_name = 'dalton_channel_deliveries'
-                              AND column_name = 'confirmed_thread_address'
-                        ) AS has_confirmed_thread_address
+                        SELECT
+                            EXISTS (
+                                SELECT 1
+                                FROM information_schema.columns
+                                WHERE table_schema = 'public'
+                                  AND table_name = 'dalton_channel_deliveries'
+                                  AND column_name = 'confirmed_thread_address'
+                            ) AS has_confirmed_thread_address,
+                            EXISTS (
+                                SELECT 1
+                                FROM information_schema.columns
+                                WHERE table_schema = 'public'
+                                  AND table_name = 'dalton_channel_deliveries'
+                                  AND column_name = 'discord_body_phase'
+                            ) AS has_discord_body_phase,
+                            EXISTS (
+                                SELECT 1
+                                FROM information_schema.columns
+                                WHERE table_schema = 'public'
+                                  AND table_name = 'dalton_channel_deliveries'
+                                  AND column_name = 'delivery_attempt'
+                            ) AS has_delivery_attempt
                         """
                     )
                     exists_row = await cur.fetchone()
@@ -1698,11 +1713,27 @@ def _create_real_http_test_app(
                         exists_row
                         and exists_row.get("has_confirmed_thread_address")
                     )
-                    # Constant chosen from the catalog check. Not user input.
+                    has_body_phase = bool(
+                        exists_row and exists_row.get("has_discord_body_phase")
+                    )
+                    has_attempt = bool(
+                        exists_row and exists_row.get("has_delivery_attempt")
+                    )
+                    # Constants chosen from the catalog check. Not user input.
                     confirmed_column_sql = (
                         "confirmed_thread_address"
                         if has_confirmed_thread
                         else "NULL::varchar AS confirmed_thread_address"
+                    )
+                    body_phase_column_sql = (
+                        "discord_body_phase"
+                        if has_body_phase
+                        else "NULL::varchar AS discord_body_phase"
+                    )
+                    attempt_column_sql = (
+                        "delivery_attempt"
+                        if has_attempt
+                        else "0::integer AS delivery_attempt"
                     )
                     await cur.execute(
                         f"""
@@ -1720,7 +1751,10 @@ def _create_real_http_test_app(
                                platform_message_ids,
                                files_status,
                                error_code,
-                               {confirmed_column_sql}
+                               first_response_json,
+                               {confirmed_column_sql},
+                               {body_phase_column_sql},
+                               {attempt_column_sql}
                         FROM dalton_channel_deliveries
                         WHERE delivery_key = %s
                         """,
@@ -2032,6 +2066,7 @@ async def test_real_http_discord_gateway_orchestrator_to_fastapi_and_postgres(
             "test/real-http-postgres.test.ts",
             "-t",
             "DiscordChannelAdapter",
+            "--reporter=verbose",
             "--pool=forks",
             "--poolOptions.forks.singleFork=true",
             cwd=str(gateway_dir),
