@@ -232,18 +232,9 @@ class PricingResolver:
             notional_card = resolve_notional_card(
                 model_name,
                 pricing_model_id=stamped_id,
+                pricing_provider=stamped_provider,
                 index=self._notional_index,
             )
-            if notional_card is None and stamped_id and stamped_provider:
-                from src.llms.pricing_utils import resolve_pricing_identity
-
-                if resolve_pricing_identity(model_name, billing_type=billing_type) == (
-                    stamped_provider,
-                    stamped_id,
-                ):
-                    notional_card = resolve_notional_card(
-                        model_name, index=self._notional_index
-                    )
 
         self._notional_resolved[cache_key] = (notional_card, is_sub)
         return self._notional_resolved[cache_key]
@@ -544,7 +535,8 @@ def calculate_cost_from_per_call_records(
                 call_notional_breakdown = copy.deepcopy(call_breakdown)
 
         # Store per-call cost record
-        # DALTON-HOOK(notional-pricing): persist per-call notional_cost alongside cash cost.
+        # DALTON-HOOK(notional-pricing): persist per-call notional_cost and stamped
+        # pricing identity alongside cash cost.
         call_cost_record = {
             "model_name": model_name,
             "served_model": record.get("served_model"),
@@ -559,6 +551,10 @@ def calculate_cost_from_per_call_records(
             "run_id": record.get("run_id"),
             "parent_run_id": record.get("parent_run_id"),
         }
+        if record.get("pricing_model_id"):
+            call_cost_record["pricing_model_id"] = record["pricing_model_id"]
+        if record.get("pricing_provider"):
+            call_cost_record["pricing_provider"] = record["pricing_provider"]
         if call_notional_breakdown:
             call_cost_record["notional_breakdown"] = call_notional_breakdown
         if window:

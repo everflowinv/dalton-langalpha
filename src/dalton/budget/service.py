@@ -74,9 +74,50 @@ def _notional_price_index() -> dict[str, dict[str, Any]]:
     return build_notional_price_index(overlay_loader=load_overlay_data)
 
 
-def _is_subscription_model(model_name: str, billing_type: str = "") -> bool:
-    """Return True when `model_name` or `billing_type` denotes a subscription/OAuth model."""
-    return is_subscription_model(model_name, billing_type, overlay_loader=load_overlay_data)
+def _is_subscription_model(
+    model_name: str,
+    billing_type: str = "",
+    *,
+    pricing_model_id: str | None = None,
+    pricing_provider: str | None = None,
+    cost: Any = None,
+    notional_cost: Any = None,
+) -> bool:
+    """Return True when `model_name`, `billing_type`, or stamped identity denotes a subscription/OAuth model."""
+    is_sub = is_subscription_model(
+        model_name,
+        billing_type,
+        pricing_model_id=pricing_model_id,
+        pricing_provider=pricing_provider,
+        overlay_loader=load_overlay_data,
+    )
+    if is_sub and billing_type != "oauth":
+        if (
+            cost is not None
+            and notional_cost is not None
+            and Decimal(str(cost or "0")) > Decimal("0")
+            and Decimal(str(notional_cost)) == Decimal("0")
+        ):
+            return False
+        if pricing_model_id and pricing_provider:
+            try:
+                from src.llms.llm import LLM
+                from src.llms.pricing_utils import find_model_pricing
+
+                provider_info = LLM.get_model_config().get_provider_info(pricing_provider)
+                access_type = provider_info.get("access_type", "api_key")
+                if (
+                    access_type not in ("oauth", "coding_plan")
+                    and pricing_provider != "z-ai-cn-coding"
+                ):
+                    card = find_model_pricing(
+                        pricing_model_id, provider=pricing_provider, _warn_on_miss=False
+                    )
+                    if card is not None and card.get("pricing_type") != "subscription":
+                        return False
+            except Exception:
+                pass
+    return is_sub
 
 
 def compute_subscription_notional_usd(token_usage_rows: list[dict[str, Any]]) -> Decimal:
@@ -94,7 +135,16 @@ def compute_subscription_notional_usd(token_usage_rows: list[dict[str, Any]]) ->
                     continue
                 m_name = str(c.get("model_name") or "unknown")
                 b_type = str(c.get("billing_type") or "platform")
-                if not _is_subscription_model(m_name, b_type):
+                stamped_id = c.get("pricing_model_id")
+                stamped_provider = c.get("pricing_provider")
+                if not _is_subscription_model(
+                    m_name,
+                    b_type,
+                    pricing_model_id=stamped_id,
+                    pricing_provider=stamped_provider,
+                    cost=c.get("cost"),
+                    notional_cost=c.get("notional_cost"),
+                ):
                     continue
                 if "notional_cost" in c and c["notional_cost"] is not None:
                     total += Decimal(str(c["notional_cost"]))
@@ -103,7 +153,12 @@ def compute_subscription_notional_usd(token_usage_rows: list[dict[str, Any]]) ->
                 if cost_dec > Decimal("0"):
                     total += cost_dec
                     continue
-                card = resolve_notional_card(m_name, index=idx)
+                card = resolve_notional_card(
+                    m_name,
+                    pricing_model_id=stamped_id,
+                    pricing_provider=stamped_provider,
+                    index=idx,
+                )
                 if card is not None:
                     usd, _ = calculate_notional_cost(
                         card,
@@ -157,7 +212,24 @@ def compute_subscription_notional_usd(token_usage_rows: list[dict[str, Any]]) ->
     return total.quantize(Decimal("0.000001"))
 
 
-def _resolve_provider_for_model(model_name: str, billing_type: str = "platform") -> str:
+def _resolve_provider_for_model(
+    model_name: str,
+    billing_type: str = "platform",
+    *,
+    pricing_model_id: str | None = None,
+    pricing_provider: str | None = None,
+) -> str:
+    if pricing_provider:
+        return str(pricing_provider)
+    if pricing_model_id:
+        resolved = _resolve_provider_for_model(str(pricing_model_id), billing_type)
+        if resolved != "unknown" and (
+            billing_type != "oauth"
+            or resolved == "z-ai-cn-coding"
+            or resolved == "openclaw-broker"
+            or resolved.endswith("-oauth")
+        ):
+            return resolved
     if model_name.startswith("grok-") and model_name.endswith("-oauth"):
         return "xai-oauth"
     try:
@@ -218,8 +290,22 @@ def compute_provider_breakdown(
                     continue
                 m_name = str(c.get("model_name") or "unknown")
                 b_type = str(c.get("billing_type") or "platform")
-                is_sub = _is_subscription_model(m_name, b_type)
-                prov = _resolve_provider_for_model(m_name, "oauth" if is_sub else b_type)
+                stamped_id = c.get("pricing_model_id")
+                stamped_provider = c.get("pricing_provider")
+                is_sub = _is_subscription_model(
+                    m_name,
+                    b_type,
+                    pricing_model_id=stamped_id,
+                    pricing_provider=stamped_provider,
+                    cost=c.get("cost"),
+                    notional_cost=c.get("notional_cost"),
+                )
+                prov = _resolve_provider_for_model(
+                    m_name,
+                    "oauth" if is_sub else b_type,
+                    pricing_model_id=stamped_id,
+                    pricing_provider=stamped_provider,
+                )
                 b = _ensure(prov)
                 b["calls"] += 1
                 cost_dec = Decimal(str(c.get("cost") or "0"))
@@ -229,7 +315,12 @@ def compute_provider_breakdown(
                     elif cost_dec > Decimal("0"):
                         b["notional_usd"] += cost_dec
                     else:
-                        card = resolve_notional_card(m_name, index=idx)
+                        card = resolve_notional_card(
+                            m_name,
+                            pricing_model_id=stamped_id,
+                            pricing_provider=stamped_provider,
+                            index=idx,
+                        )
                         if card is not None:
                             in_tok = int(c.get("input_tokens") or 0)
                             out_tok = int(c.get("output_tokens") or 0)
@@ -249,12 +340,23 @@ def compute_provider_breakdown(
             continue
         m_name = str(j.get("model_key") or "unknown")
         b_type = str(j.get("billing_type") or "platform")
-        is_sub = _is_subscription_model(m_name, b_type)
-        prov = str(j.get("provider") or _resolve_provider_for_model(m_name, "oauth" if is_sub else b_type))
-        b = _ensure(prov)
-        b["calls"] += 1
+        j_prov = str(j.get("provider") or "") or None
         cash_val = Decimal(str(j.get("cash_usd") or "0"))
         notional_val = Decimal(str(j.get("notional_usd") or "0"))
+        is_sub = _is_subscription_model(
+            m_name,
+            b_type,
+            pricing_provider=j_prov,
+            cost=cash_val,
+            notional_cost=notional_val if "notional_usd" in j else None,
+        )
+        prov = _resolve_provider_for_model(
+            m_name,
+            "oauth" if is_sub else b_type,
+            pricing_provider=j_prov,
+        )
+        b = _ensure(prov)
+        b["calls"] += 1
         if is_sub:
             b["notional_usd"] += notional_val if notional_val > Decimal("0") else cash_val
         else:

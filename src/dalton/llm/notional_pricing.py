@@ -243,11 +243,20 @@ def resolve_notional_card(
     model_name: str,
     *,
     pricing_model_id: str | None = None,
+    pricing_provider: str | None = None,
     index: dict[str, dict[str, Any]] | None = None,
     overlay_loader: Callable[..., dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """Resolve the normalized nominal pricing card for a model or stamped pricing id."""
     idx = index if index is not None else build_notional_price_index(overlay_loader=overlay_loader)
+    if pricing_model_id and pricing_provider:
+        from src.llms.pricing_utils import resolve_pricing_identity
+
+        identity = (pricing_provider, pricing_model_id)
+        for candidate, card in idx.items():
+            if resolve_pricing_identity(candidate, billing_type="byok") == identity:
+                return copy.deepcopy(card)
+        return None
     identity = pricing_model_id or model_name
     for candidate in (
         identity,
