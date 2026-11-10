@@ -6,6 +6,7 @@ import type {
   I9WeixinStateGetResponse,
   ThreadStatusInfo,
 } from "../src/backend-client.js";
+import { ChannelDeliveryError } from "../src/channels/adapter.js";
 import { makeInboundRequestKey } from "../src/uuid.js";
 import {
   createTestHarness,
@@ -14,6 +15,7 @@ import {
   makeSseEventsFromFixture,
   RUN_ID,
   TEST_SERVICE_TOKEN,
+  THREAD_ID,
   type TestHarness,
   USER_ID,
 } from "./helpers.js";
@@ -202,5 +204,140 @@ describe("Startup Recovery & Non-Blocking Server Start (§5.2, Codex r2 #17/#18,
     expect(claimKeys).toContain(
       "automation:33333333-4444-5555-6666-777777777777:feishu:notice",
     );
+  });
+
+  it("retries a real not_found ended notice on the same dispatched key, then does not send it again", async () => {
+    const recoverStartup = loadFixtureKey<I7RecoverResponse>(
+      "i7_progress_and_reconcile.json",
+      "recover_startup_populated",
+    );
+    const messageId = "m_rec_not_found_notice";
+    const noticeKey = `notice:feishu:${messageId}:rec_not_found`;
+    const endedText = 'The interrupted run ended with status "not_found".';
+    const dispatchedRow = {
+      ...structuredClone(recoverStartup.inbound_events![0]!),
+      platform: "feishu" as const,
+      message_id: messageId,
+      dalton_user_id: USER_ID,
+      chat_type: "dm" as const,
+      chat_address: "feishu:@me",
+      thread_scope_key: "dm:ou_alice",
+      event_kind: "message",
+      status: "dispatched" as "dispatched" | "failed",
+      thread_id: THREAD_ID,
+      run_id: "run_not_found_notice_1",
+      turn_index: 1,
+      fallback_pending: true,
+      command_reply_pending: false,
+      raw_payload: {
+        platform_user_id: "ou_alice",
+        text: "Where did the run go",
+      },
+    };
+    const recoveryOf = (
+      row: typeof dispatchedRow,
+    ): I7RecoverResponse => ({
+      mode: "startup",
+      inbound_events: [row],
+      background_runs: [],
+      thread_watches: [],
+      automation_runs: [],
+    });
+
+    vi.mocked(h.backend.getDispatchesLiveness).mockResolvedValue({});
+    vi.mocked(h.backend.getThreadStatus).mockResolvedValue({
+      status: "not_found",
+    });
+    vi.mocked(h.backend.recoverState)
+      .mockResolvedValueOnce(recoveryOf(dispatchedRow))
+      .mockResolvedValueOnce(recoveryOf(dispatchedRow))
+      .mockResolvedValueOnce(
+        recoveryOf({
+          ...dispatchedRow,
+          status: "failed",
+          fallback_pending: false,
+        }),
+      );
+
+    let failEndedNotice = true;
+    h.feishuAdapter.setSendTextBehavior((options) => {
+      if (failEndedNotice && options.text === endedText) {
+        throw new ChannelDeliveryError("ended notice failed", {
+          outcome: "failed",
+          code: "unavailable",
+        });
+      }
+      return { messageId: `om_ended_${options.chunkIndex}` };
+    });
+
+    const replayCallsBefore = vi.mocked(h.backend.replayThreadMessages).mock
+      .calls.length;
+    const appendCallsBefore = h.backend.appendCalls.length;
+    const noticeClaims = () =>
+      h.backend.deliveryClaims.filter((claim) => claim.delivery_key === noticeKey);
+    const inboundWrites = () =>
+      h.backend.progressUpdates.filter((update) => update.message_id === messageId);
+    const lastNoticeStatus = () =>
+      [...h.backend.deliveryUpdates]
+        .reverse()
+        .find(
+          (update) =>
+            update.delivery_key === noticeKey && update.status !== undefined,
+        )?.status;
+
+    await h.app.orchestrator.runStartupRecovery();
+
+    expect(h.feishuAdapter.sentTexts.map((item) => item.text)).not.toContain(
+      endedText,
+    );
+    expect(noticeClaims()).toHaveLength(1);
+    expect(noticeClaims()[0]).toMatchObject({
+      delivery_key: noticeKey,
+      kind: "notice",
+      activity_origin: "none",
+      source_scope_key: "dm:ou_alice",
+    });
+    expect(lastNoticeStatus()).toBe("failed");
+    expect(inboundWrites()).toEqual([]);
+    expect(vi.mocked(h.backend.replayThreadMessages).mock.calls).toHaveLength(
+      replayCallsBefore,
+    );
+    expect(h.backend.appendCalls).toHaveLength(appendCallsBefore);
+
+    failEndedNotice = false;
+    await h.app.orchestrator.runStartupRecovery();
+
+    expect(
+      h.feishuAdapter.sentTexts.filter((item) => item.text === endedText),
+    ).toHaveLength(1);
+    expect(noticeClaims()).toHaveLength(2);
+    expect(noticeClaims()[1]).toMatchObject({
+      delivery_key: noticeKey,
+      kind: "notice",
+      activity_origin: "none",
+      source_scope_key: "dm:ou_alice",
+    });
+    expect(lastNoticeStatus()).toBe("sent");
+    expect(inboundWrites()).toEqual([
+      expect.objectContaining({
+        platform: "feishu",
+        message_id: messageId,
+        status: "failed",
+        fallback_pending: false,
+      }),
+    ]);
+
+    await h.app.orchestrator.runStartupRecovery();
+
+    expect(
+      h.feishuAdapter.sentTexts.filter((item) => item.text === endedText),
+    ).toHaveLength(1);
+    expect(noticeClaims()).toHaveLength(2);
+    expect(lastNoticeStatus()).toBe("sent");
+    expect(inboundWrites()).toHaveLength(1);
+    expect(vi.mocked(h.backend.replayThreadMessages).mock.calls).toHaveLength(
+      replayCallsBefore,
+    );
+    expect(h.backend.appendCalls).toHaveLength(appendCallsBefore);
   });
 });
