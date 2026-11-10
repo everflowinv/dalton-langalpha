@@ -2215,8 +2215,10 @@ async def retry_failed_notify_deliveries(
     ``reason`` = ``toggle_off`` or ``target_removed``. Uncertain data-task rows are
     reconciled read-only against ``dalton_channel_deliveries`` (independent of
     ``attempt_count``) and excluded from send-retry selection so unresolved uncertain
-    rows never starve retryable work. Processes bounded batches within ``max_duration_s``
-    seconds. 会传播 ``CancelledError``，其他异常不抛出。
+    rows never starve retryable work. A saved automation report, including one still
+    pending on attempt 0, is sent with ``dispatch_automation_report``; an uncertain
+    report row stays on the reconciliation scan. Processes bounded batches within
+    ``max_duration_s`` seconds. 会传播 ``CancelledError``，其他异常不抛出。
     """
     sent_count = 0
     started_at = time.monotonic()
@@ -2271,10 +2273,17 @@ async def retry_failed_notify_deliveries(
                         (d.status = 'failed' AND d.attempt_count < %s)
                         OR (
                             d.status = 'pending'
+                            AND d.attempt_count = 0
+                            AND COALESCE(d.payload_json ->> 'source', '') = 'automation_report'
+                            AND (d.error_code IS NULL OR COALESCE(d.error_code, '') = '')
+                        )
+                        OR (
+                            d.status = 'pending'
                             AND (
                                 NOT (
                                     COALESCE(d.automation_id, '') LIKE 'data:%%'
                                     OR COALESCE(d.payload_json ->> 'route_key', '') LIKE 'data:%%'
+                                    OR COALESCE(d.payload_json ->> 'source', '') = 'automation_report'
                                 )
                                 OR COALESCE(d.error_code, '') <> ALL(%s)
                             )
@@ -2295,6 +2304,7 @@ async def retry_failed_notify_deliveries(
                 )
                 candidates = await cur.fetchall()
 
+        report_executions_seen: set[str] = set()
         for row in candidates or []:
             if time.monotonic() - started_at >= max_duration_s:
                 break
@@ -2346,6 +2356,62 @@ async def retry_failed_notify_deliveries(
             transport_outcome_uncertain_or_sent = False
             uncertain_error_code = "delivery_uncertain"
             try:
+                if str(payload.get("source") or "") == "automation_report":
+                    if is_uncertain_notify_error_code(row_error_code):
+                        continue
+                    if exec_id in report_executions_seen:
+                        continue
+                    if (
+                        _remaining_retry_request_budget_s(
+                            started_at, max_duration_s
+                        )
+                        < RETRY_MIN_REQUEST_TIMEOUT_S
+                    ):
+                        break
+                    report_executions_seen.add(exec_id)
+                    pending_targets: list[str] = []
+                    for cand in candidates or []:
+                        if str(cand.get("execution_id") or "").strip() != exec_id:
+                            continue
+                        cand_payload = (
+                            cand.get("payload_json")
+                            if isinstance(cand.get("payload_json"), Mapping)
+                            else {}
+                        )
+                        if str(cand_payload.get("source") or "") != "automation_report":
+                            continue
+                        if str(cand.get("status") or "").strip().lower() == "sent":
+                            continue
+                        cand_target = str(cand.get("target") or "").strip()
+                        if cand_target:
+                            pending_targets.append(cand_target)
+                    report_result = await dispatch_automation_report(
+                        exec_id,
+                        notify_fn=data_task_notify_fn,
+                        mark_fn=mark_delivery_fn,
+                        max_attempts=max_attempts,
+                        stale_pending_minutes=stale_pending_minutes,
+                        resolve_enabled_fn=resolve_enabled_fn,
+                        resolve_overrides_fn=resolve_overrides_fn,
+                        resolve_targets_fn=resolve_targets_fn,
+                        resolve_routes_fn=resolve_routes_fn,
+                        is_admin_fn=is_admin_fn,
+                        started_at=started_at,
+                        max_duration_s=max_duration_s,
+                    )
+                    result_rows = (
+                        report_result.get("results")
+                        if isinstance(report_result, Mapping)
+                        else None
+                    )
+                    sent_targets = {
+                        str(item.get("target") or "")
+                        for item in result_rows
+                        if isinstance(item, Mapping)
+                        and str(item.get("status") or "").strip().lower() == "sent"
+                    } if isinstance(result_rows, list) else set()
+                    sent_count += len(set(pending_targets) & sent_targets)
+                    continue
                 if is_data_task_row and is_uncertain_notify_error_code(row_error_code):
                     continue
                 if is_data_task_row and reconciler_used:
@@ -2844,6 +2910,9 @@ _REPORT_AUTH_SKIP_CODES = frozenset(
     }
 )
 _ACCEPTED_TRANSPORT_WORDS = frozenset({"accepted", "started", "queued"})
+_UNRESOLVED_ITEM_STATUSES = frozenset(
+    {"in_flight", "unknown", "partial", "gateway_restarted"}
+)
 
 
 def _kw_if_accepted(fn: Any, values: Mapping[str, Any]) -> dict[str, Any]:
@@ -2889,6 +2958,22 @@ def _report_dispatch_timeout_s(
     if remaining < RETRY_MIN_REQUEST_TIMEOUT_S:
         return None
     return min(base, remaining)
+
+
+def _unresolved_saved_item_code(auth: Mapping[str, Any]) -> str | None:
+    """Return the outer uncertain code when any saved item is still unresolved."""
+    items = auth.get("items")
+    if not isinstance(items, list):
+        return None
+    found = {
+        str(item.get("existing_status") or "").strip().lower()
+        for item in items
+        if isinstance(item, Mapping)
+    }
+    for code in ("in_flight", "unknown", "partial", "gateway_restarted"):
+        if code in found and code in _UNRESOLVED_ITEM_STATUSES:
+            return code
+    return None
 
 
 def _classify_native_target_result(
@@ -3136,6 +3221,7 @@ async def _dispatch_one_saved_report_target(
     )
     claimed_attempt: int | None = None
     send_started = False
+    post_send_uncertain = False
     try:
         auth = await authorizer(
             run_id=execution_id,
@@ -3164,6 +3250,22 @@ async def _dispatch_one_saved_report_target(
                 target,
                 status="skipped" if code in _REPORT_AUTH_SKIP_CODES else "failed",
                 error_code=code,
+                expected_status=loaded_status,
+                expected_attempt_count=attempt,
+            )
+            return False
+
+        unresolved_item = (
+            _unresolved_saved_item_code(auth) if isinstance(auth, Mapping) else None
+        )
+        if unresolved_item:
+            await _mark_saved_report_row(
+                marker,
+                execution_id,
+                channel,
+                target,
+                status="pending",
+                error_code=unresolved_item,
                 expected_status=loaded_status,
                 expected_attempt_count=attempt,
             )
@@ -3209,6 +3311,8 @@ async def _dispatch_one_saved_report_target(
             timeout=timeout_s + RETRY_CLIENT_CLASSIFY_SLACK_S,
         )
         kind, code = _classify_native_target_result(target, transport)
+        if kind in {"sent", "uncertain"}:
+            post_send_uncertain = True
         if kind == "uncertain":
             await _shielded_mark_uncertain(
                 marker,
@@ -3276,7 +3380,8 @@ async def _dispatch_one_saved_report_target(
         raise
     except Exception as exc:
         if send_started and (
-            _transport_exception_is_uncertain(exc)
+            post_send_uncertain
+            or _transport_exception_is_uncertain(exc)
             or is_uncertain_notify_error_code(getattr(exc, "code", None))
         ):
             uncertain_code = _exception_error_code(exc)
@@ -3347,8 +3452,11 @@ async def dispatch_automation_report(
     The body and recipients come from the saved rows. Each eligible target is
     authorized, claimed, and posted once as
     ``notify([target], run_id=execution_id, timeout_s=...)``. The claim
-    connection is released before that post. Durable confirmation is the saved
-    status view after every intended target's native items are ``sent``.
+    connection is released before that post. An item still ``in_flight``,
+    ``unknown``, ``partial``, or ``gateway_restarted`` is not claimed or
+    posted; the outer row stays pending with that uncertain code and the same
+    attempt. Durable confirmation is the saved status view after every
+    intended target's native items are ``sent``.
     """
     from src.dalton.database import automation_reports as automation_reports
     from src.dalton.database.data_task_notifications import (

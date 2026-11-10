@@ -1996,8 +1996,9 @@ async def reconcile_uncertain_data_task_deliveries(
 
     Remains active even after `attempt_count >= max_attempts` (including `pending` rows with
     `error_code IS NULL` or an uncertain code, and `failed` rows with `error_code = 'attempts_exhausted'`).
-    Never authorizes a claim, never invokes platform/gateway sends, never resets unknown items,
-    and never increments `attempt_count`. Marks the outer row `sent` iff all expected items for
+    Saved automation reports use the same scan. Never authorizes a claim, never invokes
+    platform/gateway sends, never resets unknown items, and never increments `attempt_count`.
+    Marks the outer row `sent` iff all expected items for
     the exact original `(run_id, owner_user_id, platform, canonical_target_address, recipient_id)`
     are durably `sent`.
     """
@@ -2033,6 +2034,7 @@ async def reconcile_uncertain_data_task_deliveries(
                       AND (
                           d.automation_id LIKE 'data:%%'
                           OR (d.payload_json ->> 'route_key') LIKE 'data:%%'
+                          OR COALESCE(d.payload_json ->> 'source', '') = 'automation_report'
                       )
                     ORDER BY
                         (
