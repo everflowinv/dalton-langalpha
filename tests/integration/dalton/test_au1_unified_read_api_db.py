@@ -123,9 +123,12 @@ def _session(user_id: str) -> principal_mod.Principal:
     return principal_mod.Principal(user_id=user_id, auth="session")
 
 
-def _computer(computer_id: str) -> principal_mod.Principal:
+def _computer(
+    computer_id: str,
+    user_id: str = INTERNAL,
+) -> principal_mod.Principal:
     return principal_mod.Principal(
-        user_id=INTERNAL,
+        user_id=user_id,
         auth="computer",
         scopes=("agent:read",),
         computer_id=computer_id,
@@ -220,16 +223,46 @@ async def _insert_execution(
     status: str,
     created_at: datetime,
     thread_id: str | None = None,
+    excerpt: str | None = None,
+    error_message: str | None = None,
 ) -> None:
     await conn.execute(
         """
         INSERT INTO automation_executions (
             automation_execution_id, automation_id, status,
-            conversation_thread_id, scheduled_at, created_at
+            conversation_thread_id, scheduled_at, created_at,
+            result_excerpt, error_message
         )
-        VALUES (%s::uuid, %s::uuid, %s, %s::uuid, %s, %s)
+        VALUES (%s::uuid, %s::uuid, %s, %s::uuid, %s, %s, %s, %s)
         """,
-        (execution_id, automation_id, status, thread_id, created_at, created_at),
+        (
+            execution_id,
+            automation_id,
+            status,
+            thread_id,
+            created_at,
+            created_at,
+            excerpt,
+            error_message,
+        ),
+    )
+
+
+async def _insert_thread(
+    conn: psycopg.AsyncConnection,
+    *,
+    thread_id: str,
+    workspace_id: str,
+    thread_index: int,
+) -> None:
+    await conn.execute(
+        """
+        INSERT INTO conversation_threads (
+            conversation_thread_id, workspace_id, current_status, thread_index
+        )
+        VALUES (%s::uuid, %s::uuid, 'completed', %s)
+        """,
+        (thread_id, workspace_id, thread_index),
     )
 
 
@@ -1222,3 +1255,413 @@ async def test_unified_read_api_real_db(
         )
         assert still_there["automation_id"] == _script(CN)
         assert still_there["status"] == "paused"
+
+
+def _run_ids(body: dict[str, Any]) -> list[str]:
+    return [item["automation_execution_id"] for item in body["executions"]]
+
+
+def _paged(url: str, *, limit: int, offset: int) -> str:
+    joiner = "&" if "?" in url else "?"
+    return f"{url}{joiner}limit={limit}&offset={offset}"
+
+
+async def _assert_execution_pages(
+    client: AsyncClient,
+    url: str,
+    ids: list[str],
+    banned: tuple[str, ...],
+) -> None:
+    """Pages are taken after the computer filter, so a forbidden newer row cannot occupy a slot."""
+    full = await _expect(await client.get(_paged(url, limit=20, offset=0)), 200)
+    assert _run_ids(full) == ids
+    assert full["has_more"] is False
+    rendered = str(full)
+    for secret in banned:
+        assert secret not in rendered
+    for index, execution_id in enumerate(ids):
+        page = await _expect(await client.get(_paged(url, limit=1, offset=index)), 200)
+        assert _run_ids(page) == [execution_id]
+        assert page["has_more"] is (index < len(ids) - 1)
+        rendered = str(page)
+        for secret in banned:
+            assert secret not in rendered
+    empty = await _expect(await client.get(_paged(url, limit=1, offset=len(ids))), 200)
+    assert empty == {"executions": [], "has_more": False}
+
+
+async def _execution_rows(pool: AsyncConnectionPool) -> list[dict[str, Any]]:
+    async with pool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT automation_execution_id::text AS automation_execution_id,
+                       automation_id::text AS automation_id,
+                       conversation_thread_id::text AS conversation_thread_id,
+                       result_excerpt, error_message, status, created_at
+                FROM automation_executions
+                ORDER BY created_at DESC, automation_execution_id DESC
+                """
+            )
+            return [dict(row) for row in await cur.fetchall()]
+
+
+async def _thread_places(pool: AsyncConnectionPool) -> list[tuple[str, str]]:
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT conversation_thread_id::text, workspace_id::text
+                FROM conversation_threads
+                ORDER BY conversation_thread_id
+                """
+            )
+            return [(row[0], row[1]) for row in await cur.fetchall()]
+
+
+async def _automation_version(
+    pool: AsyncConnectionPool,
+    automation_id: str,
+) -> dict[str, Any]:
+    async with pool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT workspace_id::text AS workspace_id, scope,
+                       config_version, active_version
+                FROM automations
+                WHERE automation_id = %s::uuid
+                """,
+                (automation_id,),
+            )
+            row = await cur.fetchone()
+    assert row is not None
+    return dict(row)
+
+
+@pytest.mark.asyncio
+async def test_moved_task_execution_reads_stay_on_the_token_computer(
+    au1_live_pool: AsyncConnectionPool,
+) -> None:
+    """A computer token does not read runs left on another computer after a move."""
+    owner = "u-move-owner"
+    comp_a = "a1111111-1111-4111-8111-111111111111"
+    comp_b = "b2222222-2222-4222-8222-222222222222"
+    ws_a = "a3333333-3333-4333-8333-333333333333"
+    ws_b = "b4444444-4444-4444-8444-444444444444"
+    personal_id = "c5555555-5555-4555-8555-555555555555"
+    research_id = "d6666666-6666-4666-8666-666666666666"
+    thread_a = "e7777777-7777-4777-8777-777777777771"
+    thread_home = "e7777777-7777-4777-8777-777777777772"
+    thread_a_mid = "e7777777-7777-4777-8777-777777777773"
+    thread_b_first = "e7777777-7777-4777-8777-777777777774"
+    thread_b_second = "e7777777-7777-4777-8777-777777777775"
+    thread_research_a = "e7777777-7777-4777-8777-777777777776"
+    thread_research_b = "e7777777-7777-4777-8777-777777777777"
+    run_research_a = "f1000000-0000-4000-8000-000000000001"
+    run_a_top = "f1000000-0000-4000-8000-000000000002"
+    run_research_b = "f1000000-0000-4000-8000-000000000003"
+    run_home = "f1000000-0000-4000-8000-000000000004"
+    run_research_none = "f1000000-0000-4000-8000-000000000005"
+    run_b_first = "f1000000-0000-4000-8000-000000000006"
+    run_a_mid = "f1000000-0000-4000-8000-000000000007"
+    run_b_second = "f1000000-0000-4000-8000-000000000008"
+    run_none = "f1000000-0000-4000-8000-000000000009"
+    old_a = "OLD-A-EXCERPT"
+    old_a_error = "OLD-A-ERROR"
+    old_home = "OLD-HOME-EXCERPT"
+    old_home_error = "OLD-HOME-ERROR"
+    old_mid = "OLD-A-MID-EXCERPT"
+    old_mid_error = "OLD-A-MID-ERROR"
+    old_research = "OLD-A-RESEARCH-EXCERPT"
+    old_research_error = "OLD-A-RESEARCH-ERROR"
+    banned = (
+        old_a,
+        old_a_error,
+        old_home,
+        old_home_error,
+        old_mid,
+        old_mid_error,
+        old_research,
+        old_research_error,
+        thread_a,
+        thread_home,
+        thread_a_mid,
+        thread_research_a,
+    )
+    day = datetime(2026, 11, 10, tzinfo=UTC)
+    home = get_home_workspace_id(owner)
+    feed = "/api/v1/automations/executions"
+    personal_feed = f"{feed}?scope=personal"
+    research_feed = f"{feed}?scope=research_tracking"
+    personal_history = f"/api/v1/automations/{personal_id}/executions"
+    research_history = f"/api/v1/automations/{research_id}/executions"
+    visible = [
+        run_research_b,
+        run_research_none,
+        run_b_first,
+        run_b_second,
+        run_none,
+    ]
+    personal_visible = [run_b_first, run_b_second, run_none]
+    research_visible = [run_research_b, run_research_none]
+    session_order = [
+        run_research_a,
+        run_a_top,
+        run_research_b,
+        run_home,
+        run_research_none,
+        run_b_first,
+        run_a_mid,
+        run_b_second,
+        run_none,
+    ]
+
+    async with au1_live_pool.connection() as conn:
+        await _insert_user(conn, owner, "move@dalton.test")
+        await _insert_computer(conn, comp_a, owner, "Move A")
+        await _insert_computer(conn, comp_b, owner, "Move B")
+        await _insert_workspace(
+            conn, home, owner, "Home", status="running", computer_id=comp_b
+        )
+        await _insert_workspace(
+            conn, ws_a, owner, "Move WS A", status="running", computer_id=comp_a
+        )
+        await _insert_workspace(
+            conn, ws_b, owner, "Move WS B", status="running", computer_id=comp_b
+        )
+        await _insert_automation(
+            conn,
+            automation_id=personal_id,
+            user_id=owner,
+            name="Moved Personal Task",
+            workspace_id=ws_a,
+            scope="personal",
+            created_by=owner,
+            created_at=day,
+            notify_storage_mode="legacy",
+        )
+        await _insert_automation(
+            conn,
+            automation_id=research_id,
+            user_id=owner,
+            name="dalton-earnings-calendar",
+            workspace_id=ws_a,
+            scope="research_tracking",
+            created_by=owner,
+            created_at=day,
+            notify_storage_mode="legacy",
+            description="research-before-move",
+        )
+        await _insert_thread(conn, thread_id=thread_a, workspace_id=ws_a, thread_index=1)
+        await _insert_thread(
+            conn, thread_id=thread_a_mid, workspace_id=ws_a, thread_index=2
+        )
+        await _insert_thread(
+            conn, thread_id=thread_research_a, workspace_id=ws_a, thread_index=3
+        )
+        await _insert_thread(
+            conn, thread_id=thread_home, workspace_id=home, thread_index=1
+        )
+        await _insert_execution(
+            conn,
+            execution_id=run_research_a,
+            automation_id=research_id,
+            status="completed",
+            created_at=day.replace(hour=19),
+            thread_id=thread_research_a,
+            excerpt=old_research,
+            error_message=old_research_error,
+        )
+        await _insert_execution(
+            conn,
+            execution_id=run_a_top,
+            automation_id=personal_id,
+            status="completed",
+            created_at=day.replace(hour=18, minute=30),
+            thread_id=thread_a,
+            excerpt=old_a,
+            error_message=old_a_error,
+        )
+        await _insert_execution(
+            conn,
+            execution_id=run_home,
+            automation_id=personal_id,
+            status="failed",
+            created_at=day.replace(hour=17, minute=30),
+            thread_id=thread_home,
+            excerpt=old_home,
+            error_message=old_home_error,
+        )
+        await _insert_execution(
+            conn,
+            execution_id=run_a_mid,
+            automation_id=personal_id,
+            status="completed",
+            created_at=day.replace(hour=15),
+            thread_id=thread_a_mid,
+            excerpt=old_mid,
+            error_message=old_mid_error,
+        )
+    before_move = await _execution_rows(au1_live_pool)
+    places_before = await _thread_places(au1_live_pool)
+
+    holder = {"principal": _session(owner)}
+    async with AsyncClient(
+        transport=ASGITransport(app=_client_app(holder)),
+        base_url="http://test",
+    ) as client:
+        for automation_id, scope in (
+            (personal_id, "personal"),
+            (research_id, "research_tracking"),
+        ):
+            moved = await _expect(
+                await client.patch(
+                    f"/api/v1/automations/{automation_id}",
+                    json={"workspace_id": ws_b},
+                ),
+                200,
+            )
+            assert moved["workspace_id"] == ws_b
+            assert moved["scope"] == scope
+        assert await _execution_rows(au1_live_pool) == before_move
+        assert await _thread_places(au1_live_pool) == places_before
+
+        async with au1_live_pool.connection() as conn:
+            await _insert_thread(
+                conn, thread_id=thread_b_first, workspace_id=ws_b, thread_index=1
+            )
+            await _insert_thread(
+                conn, thread_id=thread_b_second, workspace_id=ws_b, thread_index=2
+            )
+            await _insert_thread(
+                conn, thread_id=thread_research_b, workspace_id=ws_b, thread_index=3
+            )
+            await _insert_execution(
+                conn,
+                execution_id=run_research_b,
+                automation_id=research_id,
+                status="completed",
+                created_at=day.replace(hour=18),
+                thread_id=thread_research_b,
+                excerpt="B-RESEARCH-EXCERPT",
+            )
+            await _insert_execution(
+                conn,
+                execution_id=run_research_none,
+                automation_id=research_id,
+                status="completed",
+                created_at=day.replace(hour=17),
+                excerpt="B-RESEARCH-NOTHREAD",
+            )
+            await _insert_execution(
+                conn,
+                execution_id=run_b_first,
+                automation_id=personal_id,
+                status="completed",
+                created_at=day.replace(hour=16),
+                thread_id=thread_b_first,
+                excerpt="B-FIRST-EXCERPT",
+            )
+            await _insert_execution(
+                conn,
+                execution_id=run_b_second,
+                automation_id=personal_id,
+                status="completed",
+                created_at=day.replace(hour=14),
+                thread_id=thread_b_second,
+                excerpt="B-SECOND-EXCERPT",
+            )
+            await _insert_execution(
+                conn,
+                execution_id=run_none,
+                automation_id=personal_id,
+                status="completed",
+                created_at=day.replace(hour=13),
+                excerpt="B-NOTHREAD-EXCERPT",
+            )
+        stored_runs = await _execution_rows(au1_live_pool)
+        stored_threads = await _thread_places(au1_live_pool)
+        personal_version = await _automation_version(au1_live_pool, personal_id)
+        research_version = await _automation_version(au1_live_pool, research_id)
+        assert personal_version["workspace_id"] == ws_b
+        assert research_version["workspace_id"] == ws_b
+
+        holder["principal"] = _computer(comp_b, owner)
+        await _assert_execution_pages(client, feed, visible, banned)
+        await _assert_execution_pages(client, personal_feed, personal_visible, banned)
+        await _assert_execution_pages(client, research_feed, research_visible, banned)
+        await _assert_execution_pages(
+            client, personal_history, personal_visible, banned
+        )
+        await _assert_execution_pages(
+            client, research_history, research_visible, banned
+        )
+        opened = await _expect(await client.get(_paged(feed, limit=20, offset=0)), 200)
+        by_id = {item["automation_execution_id"]: item for item in opened["executions"]}
+        assert by_id[run_none]["conversation_thread_id"] is None
+        assert by_id[run_none]["workspace_id"] == ws_b
+        assert by_id[run_none]["excerpt"] == "B-NOTHREAD-EXCERPT"
+        assert by_id[run_b_first]["conversation_thread_id"] == thread_b_first
+        assert by_id[run_b_first]["workspace_id"] == ws_b
+        assert by_id[run_research_none]["conversation_thread_id"] is None
+
+        off_computer = await client.get(f"{feed}?thread_id={thread_a}")
+        assert off_computer.status_code == 403, off_computer.text
+        assert off_computer.json()["detail"]["message"] == (
+            "A computer's token reaches only what that computer holds"
+        )
+        home_thread = await client.get(f"{feed}?thread_id={thread_home}")
+        assert home_thread.status_code == 403, home_thread.text
+        assert home_thread.json()["detail"]["message"] == (
+            "A computer's token never reaches Home"
+        )
+        for secret in banned:
+            assert secret not in off_computer.text
+            assert secret not in home_thread.text
+
+        holder["principal"] = _computer(comp_a, owner)
+        for url in (feed, personal_feed, research_feed):
+            hidden = await _expect(await client.get(_paged(url, limit=20, offset=0)), 200)
+            assert hidden == {"executions": [], "has_more": False}
+        for url in (personal_history, research_history):
+            denied = await client.get(url)
+            assert denied.status_code == 403, denied.text
+            assert denied.json()["detail"]["message"] == (
+                "A computer's token reaches only what that computer holds"
+            )
+            for secret in banned:
+                assert secret not in denied.text
+
+        holder["principal"] = _session(owner)
+        own = await _expect(await client.get(_paged(feed, limit=20, offset=0)), 200)
+        assert _run_ids(own) == session_order
+        assert old_a in str(own)
+        assert old_home in str(own)
+        assert old_research in str(own)
+        personal_own = await _expect(
+            await client.get(_paged(personal_history, limit=20, offset=0)),
+            200,
+        )
+        assert _run_ids(personal_own) == [
+            run_a_top,
+            run_home,
+            run_b_first,
+            run_a_mid,
+            run_b_second,
+            run_none,
+        ]
+        research_own = await _expect(
+            await client.get(_paged(research_feed, limit=20, offset=0)),
+            200,
+        )
+        assert _run_ids(research_own) == [
+            run_research_a,
+            run_research_b,
+            run_research_none,
+        ]
+
+    assert await _execution_rows(au1_live_pool) == stored_runs
+    assert await _thread_places(au1_live_pool) == stored_threads
+    assert await _automation_version(au1_live_pool, personal_id) == personal_version
+    assert await _automation_version(au1_live_pool, research_id) == research_version

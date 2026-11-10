@@ -10,11 +10,12 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import create_autospec
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
 import pytest
 
 from src.dalton.company_identity import COMPANY_SYSTEM_USER_ID
+from src.dalton.database import company_data_tasks as company_data_db
 from src.dalton.data_jobs.container_runner import LOG_TAIL_MAX_BYTES
 from src.dalton.services import company_automations as company_auto_svc
 from src.dalton.services import company_task_read
@@ -668,3 +669,56 @@ async def test_feed_accepts_raw_script_status_and_default_list_stays_owner_scope
         )
         assert runs.status_code == 200, runs.text
         assert feed.await_args.kwargs["status"] == "succeeded"
+
+
+@pytest.mark.asyncio
+async def test_single_execution_history_passes_computer_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A computer token reaches the same execution predicate. A session does not."""
+    listed = create_autospec(
+        automations_app.exec_db.list_executions,
+        return_value=([], False),
+    )
+    owner_identity = company_data_db.get_automation_owner_identity
+    identity = create_autospec(owner_identity, return_value=None)
+    monkeypatch.setattr(automations_app.exec_db, "list_executions", listed)
+    monkeypatch.setattr(company_data_db, "get_automation_owner_identity", identity)
+
+    await automations_app.list_executions(AGENT_ID, _session(INTERNAL), limit=5, offset=1)
+    listed.assert_awaited_once_with(
+        INTERNAL, automation_id=AGENT_ID, limit=5, offset=1
+    )
+
+    listed.reset_mock()
+    await automations_app.list_executions(
+        AGENT_ID, _computer(INTERNAL), limit=5, offset=1
+    )
+    listed.assert_awaited_once_with(
+        INTERNAL,
+        automation_id=AGENT_ID,
+        limit=5,
+        offset=1,
+        computer_id=COMPUTER,
+    )
+
+    listed.reset_mock()
+    monkeypatch.setattr(
+        company_data_db,
+        "get_automation_owner_identity",
+        create_autospec(
+            owner_identity,
+            return_value={
+                "user_id": COMPANY_SYSTEM_USER_ID,
+                "scope": "company",
+                "deleted_at": None,
+            },
+        ),
+    )
+    with pytest.raises(HTTPException) as raised:
+        await automations_app.list_executions(
+            AGENT_ID, _computer(INTERNAL), limit=5, offset=0
+        )
+    assert raised.value.status_code == 403
+    assert raised.value.detail == "Forbidden"
+    listed.assert_not_awaited()

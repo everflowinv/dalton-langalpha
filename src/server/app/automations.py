@@ -569,12 +569,15 @@ async def list_executions(
             limit=limit,
             offset=offset,
         )
-    return await _runs_page(
-        principal.user_id,
-        automation_id=str(parsed.agent_id),
-        limit=limit,
-        offset=offset,
-    )
+    # DALTON-HOOK(company-automations): a computer token uses the same execution reach as the feed
+    filters: dict[str, Any] = {
+        "automation_id": str(parsed.agent_id),
+        "limit": limit,
+        "offset": offset,
+    }
+    if principal.computer_id is not None:
+        filters["computer_id"] = principal.computer_id
+    return await _runs_page(principal.user_id, **filters)
 
 
 # DALTON-HOOK(company-automations): read-only modification history endpoint (AU1 §3.5)
