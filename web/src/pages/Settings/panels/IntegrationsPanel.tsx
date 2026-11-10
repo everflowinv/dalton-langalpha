@@ -6,6 +6,7 @@ import { ConsoleLink } from '../components/ConsoleLink';
 import { SettingRow, SettingsGroup } from '../components/SettingsLayout';
 import { useSettingCopy } from '../components/useSettingCopy';
 import { SETTINGS } from '../sections';
+// DALTON-HOOK(settings-section): expose the dedicated account controls.
 import { DaltonWeixinChannelCard } from './dalton/DaltonWeixinChannelCard';
 
 /**
@@ -58,6 +59,7 @@ export function IntegrationsPanel() {
         </SettingRow>
       </SettingsGroup>
 
+      {/* DALTON-HOOK(settings-section): personal Weixin account controls. */}
       <DaltonWeixinChannelCard />
     </>
   );
