@@ -1,5 +1,10 @@
 import type { SessionCommandTargetKind } from "./commands.js";
 import type {
+  DataTaskAuthorizePlanResponse,
+  DataTaskDownloadedArtifact,
+  DataTaskNotificationRequest,
+} from "./data-task-notification-types.js";
+import type {
   AutomationRunTargetRecord,
   ChannelPlatform,
   ChatContentItem,
@@ -361,7 +366,13 @@ export interface I5SettingsPutResult {
 
 export interface I6AuthorizeAndClaimRequest {
   delivery_key: string;
-  kind: "agent_send" | "fallback" | "interrupt" | "automation" | "notice";
+  kind:
+    | "agent_send"
+    | "fallback"
+    | "interrupt"
+    | "automation"
+    | "notice"
+    | "data_task";
   user_id?: string | null;
   thread_id?: string | null;
   run_id?: string | null;
@@ -390,6 +401,7 @@ export interface I6AuthorizeAndClaimResponse {
     | "no_current_conversation"
     | "unknown_delivery_blocks_fallback"
     | "in_flight"
+    | string
     | null;
   message?: string;
   first_response_json?: Record<string, unknown> | null;
@@ -397,6 +409,24 @@ export interface I6AuthorizeAndClaimResponse {
   recipient_id?: string;
   platform?: string | null;
   target_address?: string | null;
+  /**
+   * Discord thread address confirmed before the first message.
+   * Null when this delivery has not confirmed a thread.
+   * Distinct from `target_address`, which stays the original parent.
+   */
+  confirmed_thread_address?: string | null;
+  /**
+   * `before_body` means no Discord body request has been authorized.
+   * `dispatching` means a body request may already have reached Discord.
+   * Null does not prove the body is unsent.
+   */
+  discord_body_phase?: "before_body" | "dispatching" | null;
+  /**
+   * Claim generation returned by I-6.
+   * A claimed response is the generation this attempt must send back.
+   * A blocked or completed response is the generation already stored.
+   */
+  delivery_attempt?: number;
   thread_scope_key?: string | null;
   is_current?: boolean;
   home_workspace_id?: string;
@@ -420,6 +450,18 @@ export interface I7DeliveriesProgressRequest {
   status?: "in_flight" | "sent" | "partial" | "failed" | "unknown";
   error_code?: string | null;
   error_message?: string | null;
+  /** Full Discord thread address. Omitted unless this call confirms a thread. */
+  confirmed_thread_address?: string | null;
+  /**
+   * Forward-only Discord body phase. Omitted when this call does not set one.
+   * `before_body` authorizes no message POST. `dispatching` does.
+   */
+  discord_body_phase?: "before_body" | "dispatching" | null;
+  /**
+   * Claim generation from I-6. Omitted by callers that have not adopted it.
+   * An older generation does not change the delivery.
+   */
+  delivery_attempt?: number;
 }
 
 export interface I7DeliveriesProgressResponse {
@@ -427,6 +469,12 @@ export interface I7DeliveriesProgressResponse {
   delivery_key: string;
   status: string;
   sent_to_current_count: number;
+  /** Echo of the stored Discord thread address, or null when none is stored. */
+  confirmed_thread_address?: string | null;
+  /** Echo of the stored Discord body phase, or null when none is stored. */
+  discord_body_phase?: "before_body" | "dispatching" | null;
+  /** Echo of the stored claim generation. Progress does not increment it. */
+  delivery_attempt?: number;
 }
 
 export type InboundEventStatus =
@@ -948,6 +996,16 @@ export interface BackendClient {
     workspaceId: string,
     workspacePath: string,
   ): Promise<{ content: Buffer; mimeType: string }>;
+
+  authorizeDataTaskNotificationPlan?(
+    req: DataTaskNotificationRequest,
+  ): Promise<DataTaskAuthorizePlanResponse>;
+
+  downloadDataTaskRunArtifact?(
+    runId: string,
+    artifactId: string,
+    maxBytes?: number,
+  ): Promise<DataTaskDownloadedArtifact>;
 }
 
 export class BackendHttpError extends Error {
@@ -996,6 +1054,11 @@ export class HttpBackendClient implements BackendClient {
       userId?: string | null;
       query?: Record<string, string | undefined | null>;
       body?: unknown;
+      timeoutMs?: number;
+      redirect?: RequestRedirect;
+      cache?: RequestCache;
+      strictJson?: boolean;
+      operationLabel?: string;
     },
   ): Promise<{ status: number; data: T }> {
     const url = new URL(`${this.baseUrl}${path}`);
@@ -1013,9 +1076,49 @@ export class HttpBackendClient implements BackendClient {
         options?.body !== undefined ? { "Content-Type": "application/json" } : undefined,
       ),
       ...(options?.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
+      ...(options?.redirect ? { redirect: options.redirect } : {}),
+      ...(options?.cache ? { cache: options.cache } : {}),
+      ...(typeof options?.timeoutMs === "number" && options.timeoutMs > 0
+        ? { signal: AbortSignal.timeout(options.timeoutMs) }
+        : {}),
     };
     const resp = await this.fetchImpl(url, init);
     const text = await resp.text();
+    if (options?.strictJson) {
+      const label = options.operationLabel ?? path;
+      if (resp.status >= 300 && resp.status < 400) {
+        throw new BackendHttpError(
+          `${label} redirect rejected (${resp.status})`,
+          resp.status,
+          null,
+        );
+      }
+      if (resp.status >= 400) {
+        throw new BackendHttpError(
+          `${label} failed (${resp.status})`,
+          resp.status,
+          null,
+        );
+      }
+      if (!text.trim()) {
+        throw new BackendHttpError(
+          `${label} returned an empty response body (${resp.status})`,
+          resp.status,
+          null,
+        );
+      }
+      let strictParsed: unknown;
+      try {
+        strictParsed = JSON.parse(text);
+      } catch {
+        throw new BackendHttpError(
+          `${label} returned malformed JSON (${resp.status})`,
+          resp.status,
+          null,
+        );
+      }
+      return { status: resp.status, data: strictParsed as T };
+    }
     let parsed: unknown = {};
     if (text) {
       try {
@@ -1200,6 +1303,22 @@ export class HttpBackendClient implements BackendClient {
   async authorizeAndClaimDelivery(
     req: I6AuthorizeAndClaimRequest,
   ): Promise<I6AuthorizeAndClaimResponse> {
+    if (req.kind === "data_task") {
+      const { data } = await this.jsonRequest<I6AuthorizeAndClaimResponse>(
+        "POST",
+        "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
+        {
+          userId: req.user_id,
+          body: req,
+          timeoutMs: 15_000,
+          redirect: "error",
+          cache: "no-store",
+          strictJson: true,
+          operationLabel: "I-6 authorize-and-claim",
+        },
+      );
+      return data;
+    }
     const { status, data } = await this.jsonRequest<I6AuthorizeAndClaimResponse>(
       "POST",
       "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
@@ -1215,6 +1334,24 @@ export class HttpBackendClient implements BackendClient {
   async updateDeliveryProgress(
     req: I7DeliveriesProgressRequest,
   ): Promise<I7DeliveriesProgressResponse> {
+    if (
+      typeof req.delivery_key === "string" &&
+      req.delivery_key.startsWith("data_task:")
+    ) {
+      const { data } = await this.jsonRequest<I7DeliveriesProgressResponse>(
+        "POST",
+        "/api/v1/dalton/channels/internal/deliveries/progress",
+        {
+          body: req,
+          timeoutMs: 15_000,
+          redirect: "error",
+          cache: "no-store",
+          strictJson: true,
+          operationLabel: "I-7 deliveries/progress",
+        },
+      );
+      return data;
+    }
     const { status, data } = await this.jsonRequest<I7DeliveriesProgressResponse>(
       "POST",
       "/api/v1/dalton/channels/internal/deliveries/progress",
@@ -1639,6 +1776,111 @@ export class HttpBackendClient implements BackendClient {
     return {
       content: Buffer.from(arrayBuffer),
       mimeType,
+    };
+  }
+
+  async authorizeDataTaskNotificationPlan(
+    req: DataTaskNotificationRequest,
+  ): Promise<DataTaskAuthorizePlanResponse> {
+    const { data } = await this.jsonRequest<DataTaskAuthorizePlanResponse>(
+      "POST",
+      "/api/v1/dalton/channels/internal/data-task-notifications/plan",
+      {
+        body: {
+          run_id: req.run_id,
+          target: req.target,
+        },
+        timeoutMs: 15_000,
+        redirect: "error",
+        cache: "no-store",
+        strictJson: true,
+        operationLabel: "authorizeDataTaskNotificationPlan",
+      },
+    );
+    return data;
+  }
+
+  async downloadDataTaskRunArtifact(
+    runId: string,
+    artifactId: string,
+    maxBytes = 20 * 1024 * 1024,
+  ): Promise<DataTaskDownloadedArtifact> {
+    const url = new URL(
+      `${this.baseUrl}/api/v1/dalton/channels/internal/data-task-notifications/runs/${encodeURIComponent(runId)}/artifacts/${encodeURIComponent(artifactId)}`,
+    );
+    const resp = await this.fetchImpl(url, {
+      method: "GET",
+      headers: this.headers(),
+      redirect: "error",
+      cache: "no-store",
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (resp.status >= 300 && resp.status < 400) {
+      void resp.body?.cancel().catch(() => undefined);
+      throw new BackendHttpError(
+        `downloadDataTaskRunArtifact redirect rejected (${resp.status})`,
+        resp.status,
+        null,
+      );
+    }
+    if (!resp.ok) {
+      void resp.body?.cancel().catch(() => undefined);
+      throw new BackendHttpError(
+        `downloadDataTaskRunArtifact failed (${resp.status})`,
+        resp.status,
+        null,
+      );
+    }
+
+    const declaredLengthRaw = resp.headers.get("content-length");
+    if (declaredLengthRaw) {
+      const declaredLength = Number.parseInt(declaredLengthRaw, 10);
+      if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+        throw new Error(
+          `Artifact exceeds maximum byte limit (${declaredLength} > ${maxBytes})`,
+        );
+      }
+    }
+
+    const chunks: Buffer[] = [];
+    let total = 0;
+    if (resp.body) {
+      for await (const rawChunk of resp.body as AsyncIterable<Uint8Array>) {
+        const buf = Buffer.from(rawChunk);
+        total += buf.byteLength;
+        if (total > maxBytes) {
+          throw new Error(
+            `Artifact stream exceeded maximum byte limit (${maxBytes})`,
+          );
+        }
+        chunks.push(buf);
+      }
+    } else {
+      const ab = await resp.arrayBuffer();
+      if (ab.byteLength > maxBytes) {
+        throw new Error(
+          `Artifact body exceeded maximum byte limit (${maxBytes})`,
+        );
+      }
+      chunks.push(Buffer.from(ab));
+    }
+
+    const content = Buffer.concat(chunks);
+    const mimeType = (
+      resp.headers.get("content-type") ?? "application/octet-stream"
+    )
+      .split(";")[0]!
+      .trim()
+      .toLowerCase();
+    const filename =
+      resp.headers.get("x-artifact-filename")?.trim() || artifactId;
+    const sha256Header = resp.headers.get("x-artifact-sha256")?.trim() ?? null;
+
+    return {
+      content,
+      mimeType,
+      filename,
+      sha256Header,
     };
   }
 }

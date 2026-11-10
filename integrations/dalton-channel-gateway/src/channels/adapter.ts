@@ -45,6 +45,16 @@ export interface SendTextChunkOptions {
    * is bound to this id, the parent channel, and the current bot.
    */
   deliveryKey?: string | null;
+  /**
+   * Thread address already stored for this delivery. When set, Discord posts
+   * into that thread and does not create another one.
+   */
+  confirmedThreadAddress?: string | null;
+  /**
+   * Called after Discord confirms a new thread and before the message POST.
+   * The send does not continue unless this resolves.
+   */
+  onConfirmedThread?: (confirmed: { address: string }) => Promise<void>;
   weixinContextToken?: string | null;
 }
 
@@ -68,6 +78,26 @@ export interface SendFileResult {
   messageId: string;
   status: "sent" | "linked";
   reason?: string | null;
+}
+
+export interface SendCardImageInput {
+  placeholder: string;
+  content: Buffer;
+  mimeType: string;
+  filename: string;
+}
+
+export interface SendCardOptions {
+  targetAddress: string;
+  recipientPlatformUserId?: string | null;
+  card: Record<string, unknown>;
+  images?: SendCardImageInput[];
+  replyToMessageId?: string | null;
+}
+
+export interface SendCardResult {
+  messageId: string;
+  resolvedAddress?: string;
 }
 
 export interface DownloadedAttachment {
@@ -124,6 +154,7 @@ export interface CheckTargetLiveResult {
   ok: boolean;
   address: string | null;
   name?: string | null;
+  code?: ChannelErrorCode | null;
   message: string | null;
 }
 
@@ -167,6 +198,12 @@ export interface ChannelAdapter {
   /** Whether the channel runtime/connection is currently healthy. */
   isConnected(): boolean;
 
+  /**
+   * Optional outbound-send readiness check separating credential readiness
+   * from an inbound WebSocket listener's health in outgoing-notification mode.
+   */
+  isReadyForOutbound?(): boolean;
+
   /** Start listening to the platform (no-op for unconfigured or test adapters). */
   start(): Promise<void>;
 
@@ -187,6 +224,9 @@ export interface ChannelAdapter {
 
   /** Send a single file attachment to the platform. */
   sendFile(options: SendFileOptions): Promise<SendFileResult>;
+
+  /** Optional structured card send (e.g. Feishu Card Schema 2.0 with uploaded images). */
+  sendCard?(options: SendCardOptions): Promise<SendCardResult>;
 
   /** Download an inbound attachment from the platform. */
   downloadAttachment(

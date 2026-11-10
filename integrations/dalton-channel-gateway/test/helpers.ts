@@ -151,25 +151,31 @@ export async function* makeAbortableOpenWatchSse(
   });
 }
 
-export type MockBackend = BackendClient & {
-  readonly progressUpdates: I7InboundProgressRequest[];
-  readonly deliveryClaims: I6AuthorizeAndClaimRequest[];
-  readonly deliveryUpdates: I7DeliveriesProgressRequest[];
-  readonly appendCalls: Array<{
-    userId: string;
-    threadId: string;
-    payload: ThreadMessageDispatchPayload;
-  }>;
-  readonly createCalls: Array<{
-    userId: string;
-    payload: ThreadMessageDispatchPayload;
-  }>;
-  readonly retryCalls: Array<{
-    userId: string;
-    threadId: string;
-    payload: ThreadRetryPayload;
-  }>;
-};
+export type MockBackend = BackendClient &
+  Required<
+    Pick<
+      BackendClient,
+      "authorizeDataTaskNotificationPlan" | "downloadDataTaskRunArtifact"
+    >
+  > & {
+    readonly progressUpdates: I7InboundProgressRequest[];
+    readonly deliveryClaims: I6AuthorizeAndClaimRequest[];
+    readonly deliveryUpdates: I7DeliveriesProgressRequest[];
+    readonly appendCalls: Array<{
+      userId: string;
+      threadId: string;
+      payload: ThreadMessageDispatchPayload;
+    }>;
+    readonly createCalls: Array<{
+      userId: string;
+      payload: ThreadMessageDispatchPayload;
+    }>;
+    readonly retryCalls: Array<{
+      userId: string;
+      threadId: string;
+      payload: ThreadRetryPayload;
+    }>;
+  };
 
 export function createMockBackend(): MockBackend {
   const defaultState = loadFixtureKey<I4StateResponse>(
@@ -270,6 +276,39 @@ export function createMockBackend(): MockBackend {
       raw_payload: req.raw_payload ?? {},
     }),
   );
+
+  const discordDeliveryMemory = new Map<
+    string,
+    { thread: string | null; phase: "before_body" | "dispatching" | null }
+  >();
+
+  function rememberDiscordProgress(req: I7DeliveriesProgressRequest): {
+    thread: string | null;
+    phase: "before_body" | "dispatching" | null;
+  } {
+    const prev = discordDeliveryMemory.get(req.delivery_key) ?? {
+      thread: null,
+      phase: null,
+    };
+    let thread = prev.thread;
+    let phase = prev.phase;
+    const requestedThread =
+      typeof req.confirmed_thread_address === "string"
+        ? req.confirmed_thread_address.trim()
+        : "";
+    if (requestedThread && !thread) {
+      thread = requestedThread;
+      if (phase === null) phase = "before_body";
+    }
+    if (req.discord_body_phase === "dispatching") {
+      phase = "dispatching";
+    } else if (req.discord_body_phase === "before_body" && phase !== "dispatching") {
+      phase = "before_body";
+    }
+    const next = { thread, phase };
+    discordDeliveryMemory.set(req.delivery_key, next);
+    return next;
+  }
 
   const authorizeAndClaimDelivery = vi.fn(
     async (
@@ -384,7 +423,15 @@ export function createMockBackend(): MockBackend {
         .find(
           (u) => u.delivery_key === req.delivery_key && u.status !== undefined,
         );
-      if (lastUpdate?.status === "unknown") {
+      const remembered = discordDeliveryMemory.get(req.delivery_key) ?? {
+        thread: null,
+        phase: null,
+      };
+      const storedThread = remembered.thread;
+      if (
+        lastUpdate?.status === "unknown" &&
+        !(storedThread && remembered.phase === "before_body")
+      ) {
         return {
           claim_status: "in_flight_or_unknown",
           status: "unknown",
@@ -393,6 +440,8 @@ export function createMockBackend(): MockBackend {
             "An earlier attempt of this same call is still delivering it.",
           platform: plat,
           target_address: targetAddr,
+          confirmed_thread_address: storedThread,
+          discord_body_phase: remembered.phase,
           thread_scope_key: resolvedThreadScopeKey,
           is_current: isCurrent,
         };
@@ -459,6 +508,8 @@ export function createMockBackend(): MockBackend {
         recipient_id: recipientId,
         platform: plat,
         target_address: targetAddr,
+        confirmed_thread_address: storedThread,
+        discord_body_phase: remembered.phase,
         thread_scope_key: resolvedThreadScopeKey,
         is_current: isCurrent,
         weixin_context_token: plat === "weixin" ? "ctx_tok_123" : null,
@@ -471,10 +522,18 @@ export function createMockBackend(): MockBackend {
       req: I7DeliveriesProgressRequest,
     ): Promise<I7DeliveriesProgressResponse> => ({
       ...structuredClone(defaultI7DeliverySent),
+      ok: true,
       delivery_key: req.delivery_key,
       status: req.status ?? "in_flight",
       sent_to_current_count:
         req.status === "sent" || req.status === "partial" ? 1 : 0,
+      ...(() => {
+        const remembered = rememberDiscordProgress(req);
+        return {
+          confirmed_thread_address: remembered.thread,
+          discord_body_phase: remembered.phase,
+        };
+      })(),
     }),
   );
 
@@ -886,6 +945,20 @@ export function createMockBackend(): MockBackend {
     downloadWorkspaceFile: vi.fn(async () => ({
       content: Buffer.from("PDF_REPORT_CONTENT", "utf8"),
       mimeType: "application/pdf",
+    })),
+
+    authorizeDataTaskNotificationPlan: vi.fn(async () => ({
+      authorized: false,
+      status: "failed" as const,
+      code: "run_not_found",
+      message: "Run not configured in mock backend",
+    })),
+
+    downloadDataTaskRunArtifact: vi.fn(async () => ({
+      content: Buffer.from("\x89PNG\r\n\x1a\n", "binary"),
+      mimeType: "image/png",
+      filename: "chart.png",
+      sha256Header: null,
     })),
   };
 
