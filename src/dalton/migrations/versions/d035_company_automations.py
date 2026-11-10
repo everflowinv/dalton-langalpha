@@ -1,7 +1,7 @@
 """Dalton d035: AU1 company automation schema, scope backfill, and company system identity.
 
 Revision ID: d035
-Revises: d030
+Revises: d031
 Create Date: 2026-11-09
 """
 
@@ -18,7 +18,7 @@ from src.dalton.company_identity import (
 )
 
 revision: str = "d035"
-down_revision: Union[str, None] = "d030"
+down_revision: Union[str, None] = "d031"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -33,6 +33,8 @@ _REQUIRED_DALTON_TABLES: tuple[str, ...] = (
     "public.dalton_coverage",
     "public.dalton_coverage_units",
     "public.dalton_data_task_defs",
+    "public.dalton_channel_session_generations",
+    "public.dalton_channel_inbound_events",
 )
 
 
@@ -66,7 +68,7 @@ def _assert_prerequisite_tables(bind: Any) -> None:
     missing_dalton = [t for t in _REQUIRED_DALTON_TABLES if not _table_exists(bind, t)]
     if missing_dalton:
         raise RuntimeError(
-            "Prior Dalton migrations (d001..d030) must run before d035; "
+            "Prior Dalton migrations (d001..d031) must run before d035; "
             f"missing tables: {', '.join(missing_dalton)}"
         )
 

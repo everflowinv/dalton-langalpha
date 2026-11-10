@@ -175,13 +175,31 @@ def _make_spec_async_conn(
 
 
 def test_d035_migration_revision_and_safety_contracts() -> None:
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
     import src.dalton.migrations.versions.d035_company_automations as d035
 
     assert d035.revision == "d035"
-    assert d035.down_revision == "d030"
+    assert d035.down_revision == "d031"
+    assert d035.branch_labels is None
+    assert d035.depends_on is None
+
+    dalton_root = D035_PATH.parents[2]
+    alembic_cfg = Config(str(dalton_root / "alembic.ini"))
+    alembic_cfg.set_main_option("script_location", str(dalton_root / "migrations"))
+    script_dir = ScriptDirectory.from_config(alembic_cfg)
+    assert script_dir.get_heads() == ["d035"]
+    assert script_dir.get_revision("d035").down_revision == "d031"
+    assert script_dir.get_revision("d031").down_revision == "d030"
+    assert [p.name for p in D035_PATH.parent.glob("d031*.py")] == [
+        "d031_channel_session_selection.py"
+    ]
 
     source = D035_PATH.read_text(encoding="utf-8")
-    for forbidden_rev in ("d031", "d032", "d033", "d034"):
+    assert "Revises: d031" in source
+    assert "d001..d031" in source
+    for forbidden_rev in ("d032", "d033", "d034"):
         assert forbidden_rev not in source
 
     for upstream_tbl in ("public.users", "public.workspaces", "public.automations"):

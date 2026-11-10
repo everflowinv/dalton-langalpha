@@ -6,11 +6,8 @@ import asyncio
 from contextlib import ExitStack, asynccontextmanager
 from datetime import UTC, datetime
 from decimal import Decimal
-import importlib
 import json
 from pathlib import Path
-import pkgutil
-import sys
 from typing import Any
 from unittest.mock import create_autospec, patch
 import uuid
@@ -19,6 +16,7 @@ from alembic import command
 from alembic.config import Config
 from alembic.operations import Operations
 from alembic.runtime.migration import MigrationContext
+from alembic.script import ScriptDirectory
 from fastapi import FastAPI, WebSocket, WebSocketException
 from httpx import ASGITransport, AsyncClient
 import psycopg
@@ -108,28 +106,32 @@ async def au1_live_pool(
     cleanup_dalton_tables,
     test_db_uri: str,
 ):
-    """Open a standard AsyncConnectionPool on the test's own live event loop and wire get_db_connection."""
-    import src.dalton.database as _dalton_db_pkg
-    import src.server.database as _server_db_pkg
-    from src.server.database import pool as pool_mod
-
-    orig_pool_gdc = pool_mod.get_db_connection
-    for pkg, prefix in (
-        (_server_db_pkg, "src.server.database."),
-        (_dalton_db_pkg, "src.dalton.database."),
-    ):
-        for info in pkgutil.walk_packages(pkg.__path__, prefix=prefix):
-            importlib.import_module(info.name)
+    """Open a tuple-default AsyncConnectionPool on the test's live loop matching production pool.py."""
+    from src.dalton import company_identity as company_identity_mod
+    from src.dalton.autonomy import schedule as dalton_schedule_mod
+    from src.dalton.database import (
+        budget as dalton_budget_db,
+        company_automations as company_auto_db,
+        members as dalton_members_db,
+    )
+    from src.dalton.notify import dispatch as dalton_notify_mod
+    from src.server.database import (
+        automation as server_auto_db,
+        automation_executions as server_exec_db,
+        computer as server_computer_db,
+        pool as pool_mod,
+        principal_reach as server_reach_db,
+        user as server_user_db,
+        workspace as server_workspace_db,
+    )
 
     local_pool = AsyncConnectionPool(
         conninfo=test_db_uri,
         min_size=1,
         max_size=5,
-        kwargs={
-            "autocommit": True,
-            "prepare_threshold": 0,
-            "row_factory": dict_row,
-        },
+        configure=pool_mod._configure_postgres_connection,
+        check=AsyncConnectionPool.check_connection,
+        kwargs=dict(pool_mod._CONNECTION_KWARGS),
         open=False,
     )
     await local_pool.open()
@@ -140,32 +142,46 @@ async def au1_live_pool(
         if conn is not None:
             yield conn
             return
-        async with local_pool.connection() as owned:
+        async with local_pool.connection(timeout=10) as owned:
             yield owned
 
     async def _live_session_connection():
-        return await psycopg.AsyncConnection.connect(
-            test_db_uri, autocommit=True, prepare_threshold=0
+        conn = await psycopg.AsyncConnection.connect(
+            test_db_uri, **pool_mod._CONNECTION_KWARGS
         )
+        await pool_mod._configure_postgres_connection(conn)
+        return conn
 
-    holders = [
-        module
-        for name, module in list(sys.modules.items())
-        if name.startswith(("src.", "ptc_agent."))
-        and getattr(module, "get_db_connection", None) is orig_pool_gdc
-    ]
+    db_call_sites = (
+        pool_mod,
+        company_identity_mod,
+        dalton_schedule_mod,
+        dalton_budget_db,
+        company_auto_db,
+        dalton_members_db,
+        dalton_notify_mod,
+        server_auto_db,
+        server_exec_db,
+        server_computer_db,
+        server_reach_db,
+        server_user_db,
+        server_workspace_db,
+    )
 
     with ExitStack() as stack:
         stack.enter_context(
-            patch.object(pool_mod, "get_db_connection", _live_get_db_connection)
+            patch.object(pool_mod, "get_db_connection_string", lambda: test_db_uri)
         )
-        for module in holders:
-            stack.enter_context(
-                patch.object(module, "get_db_connection", _live_get_db_connection)
-            )
+        stack.enter_context(
+            patch.object(pool_mod, "get_or_create_pool", lambda: local_pool)
+        )
         stack.enter_context(
             patch.object(pool_mod, "open_session_connection", _live_session_connection)
         )
+        for module in db_call_sites:
+            stack.enter_context(
+                patch.object(module, "get_db_connection", _live_get_db_connection)
+            )
         await close_shared_lock_session()
         try:
             async with local_pool.connection() as init_conn:
@@ -275,15 +291,56 @@ async def test_d035_missing_upstream_tables_fails_without_partial_schema(
     await asyncio.to_thread(_probe_missing_upstream)
 
 
+async def _dalton_alembic_versions(conn: psycopg.AsyncConnection) -> list[str]:
+    async with conn.cursor() as cur:
+        await cur.execute("SELECT version_num FROM alembic_version_dalton ORDER BY version_num")
+        return [str(r[0]) for r in await cur.fetchall()]
+
+
+async def _column_exists(
+    conn: psycopg.AsyncConnection,
+    table_name: str,
+    column_name: str,
+) -> bool:
+    async with conn.cursor() as cur:
+        await cur.execute(
+            """
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = %s
+              AND column_name = %s
+            """,
+            (table_name, column_name),
+        )
+        return (await cur.fetchone()) is not None
+
+
+async def _assert_d031_shared_command_columns(conn: psycopg.AsyncConnection) -> None:
+    for tbl, col in (
+        ("dalton_channel_session_generations", "selection_initialized_at"),
+        ("dalton_channel_session_generations", "last_conversation_activity_at"),
+        ("dalton_channel_inbound_events", "command_request"),
+        ("dalton_channel_inbound_events", "command_result"),
+        ("dalton_channel_deliveries", "activity_origin"),
+        ("dalton_channel_thread_watches", "pending_interrupt"),
+    ):
+        assert await _column_exists(conn, tbl, col), f"Missing d031 column {tbl}.{col}"
+
+
 @pytest.mark.asyncio
-async def test_d035_upgrade_from_d030_preserves_state_and_enforces_safe_downgrade(
+async def test_d035_upgrade_from_d031_preserves_state_and_enforces_safe_downgrade(
     test_db_uri: str,
     au1_live_pool: AsyncConnectionPool,
 ) -> None:
     dalton_cfg = _dalton_alembic_cfg(test_db_uri)
+    script_dir = ScriptDirectory.from_config(dalton_cfg)
+    assert script_dir.get_heads() == ["d035"]
+    assert script_dir.get_revision("d035").down_revision == "d031"
+    assert script_dir.get_revision("d031").down_revision == "d030"
 
-    # Downgrade cleanly from d035 back to d030, seed pre-d035 rows, then re-upgrade.
-    await asyncio.to_thread(command.downgrade, dalton_cfg, "d030")
+    # First establish current d031 schema (with d030 + d031 objects intact, pre-d035).
+    await asyncio.to_thread(command.downgrade, dalton_cfg, "d031")
 
     u1 = "u-mig-1"
     u2 = "u-mig-2"
@@ -350,6 +407,13 @@ async def test_d035_upgrade_from_d030_preserves_state_and_enforces_safe_downgrad
 
     id_by_label: dict[str, str] = {}
     async with au1_live_pool.connection() as db_conn:
+        assert await _dalton_alembic_versions(db_conn) == ["d031"]
+        await _assert_d031_shared_command_columns(db_conn)
+        assert not await _column_exists(db_conn, "automations", "scope")
+        assert not await _column_exists(
+            db_conn, "dalton_data_task_defs", "notify_storage_mode"
+        )
+
         await _insert_user(db_conn, u1, "u1@dalton.test")
         await _insert_user(db_conn, u2, "u2@dalton.test")
         await _insert_workspace(db_conn, ws_active, u1, "NVDA", status="running")
@@ -422,10 +486,13 @@ async def test_d035_upgrade_from_d030_preserves_state_and_enforces_safe_downgrad
             """
         )
 
-    # Upgrade d030 -> d035
+    # Upgrade d031 -> d035 (single Dalton head)
     await asyncio.to_thread(command.upgrade, dalton_cfg, "head")
 
     async with au1_live_pool.connection() as db_conn:
+        assert await _dalton_alembic_versions(db_conn) == ["d035"]
+        await _assert_d031_shared_command_columns(db_conn)
+
         async with db_conn.cursor(row_factory=dict_row) as cur:
             await cur.execute("SELECT * FROM dalton_notify_storage_state WHERE state_id = 1")
             notify_state = await cur.fetchone()
@@ -476,11 +543,24 @@ async def test_d035_upgrade_from_d030_preserves_state_and_enforces_safe_downgrad
                 "migration_state": {},
             }
 
-    # Clean downgrade -> re-upgrade succeeds when no company/deleted/task_row/migration rows exist.
-    await asyncio.to_thread(command.downgrade, dalton_cfg, "d030")
+    # Safe downgrade to d031 succeeds when no company/deleted/task_row/migration rows exist,
+    # without rolling back d031 shared command columns or d030 data-task definitions!
+    await asyncio.to_thread(command.downgrade, dalton_cfg, "d031")
+    async with au1_live_pool.connection() as db_conn:
+        assert await _dalton_alembic_versions(db_conn) == ["d031"]
+        await _assert_d031_shared_command_columns(db_conn)
+        assert not await _column_exists(db_conn, "automations", "scope")
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT job_key FROM dalton_data_task_defs WHERE job_key = 'cn-leverage-daily'"
+            )
+            assert await cur.fetchone() == {"job_key": "cn-leverage-daily"}
+
     await asyncio.to_thread(command.upgrade, dalton_cfg, "head")
 
     async with au1_live_pool.connection() as db_conn:
+        assert await _dalton_alembic_versions(db_conn) == ["d035"]
+
         # Verify DB CHECK constraints directly on PostgreSQL:
         # 1) scope='company' with non-company user_id -> CheckViolation
         with pytest.raises(pg_errors.CheckViolation):
@@ -546,7 +626,7 @@ async def test_d035_upgrade_from_d030_preserves_state_and_enforces_safe_downgrad
         )
 
     with pytest.raises(RuntimeError, match="company-scoped"):
-        await asyncio.to_thread(command.downgrade, dalton_cfg, "d030")
+        await asyncio.to_thread(command.downgrade, dalton_cfg, "d031")
 
     target_id = id_by_label["personal-note"]
     dup_active_id = str(uuid.uuid4())
@@ -573,7 +653,7 @@ async def test_d035_upgrade_from_d030_preserves_state_and_enforces_safe_downgrad
         )
 
     with pytest.raises(RuntimeError, match="duplicate \\(user_id, file_name\\)"):
-        await asyncio.to_thread(command.downgrade, dalton_cfg, "d030")
+        await asyncio.to_thread(command.downgrade, dalton_cfg, "d031")
 
     async with au1_live_pool.connection() as db_conn:
         await db_conn.execute(
@@ -591,7 +671,7 @@ async def test_d035_upgrade_from_d030_preserves_state_and_enforces_safe_downgrad
         )
 
     with pytest.raises(RuntimeError, match="row-level notify state"):
-        await asyncio.to_thread(command.downgrade, dalton_cfg, "d030")
+        await asyncio.to_thread(command.downgrade, dalton_cfg, "d031")
 
     async with au1_live_pool.connection() as db_conn:
         await db_conn.execute(
@@ -608,7 +688,7 @@ async def test_d035_upgrade_from_d030_preserves_state_and_enforces_safe_downgrad
         )
 
     with pytest.raises(RuntimeError, match="migration_state"):
-        await asyncio.to_thread(command.downgrade, dalton_cfg, "d030")
+        await asyncio.to_thread(command.downgrade, dalton_cfg, "d031")
 
     async with au1_live_pool.connection() as db_conn:
         await db_conn.execute(
@@ -738,7 +818,7 @@ async def test_company_budget_idempotency_and_external_auth_rejection_real_db(
                 "X-User-Id": human_uid,
             },
         )
-        assert allowed.status_code == 200
+        assert allowed.status_code == 200, allowed.text
         assert allowed.json()["total"] == 1
 
         # PAT, OAuth, and computer CLI tokens naming system:dalton-company are also rejected (401).
@@ -767,11 +847,10 @@ async def test_company_budget_idempotency_and_external_auth_rejection_real_db(
                 "/api/v1/automations", headers={"Authorization": "Bearer lapat_company"}
             )
         ).status_code == 401
-        assert (
-            await client.get(
-                "/api/v1/automations", headers={"Authorization": "Bearer lapat_human"}
-            )
-        ).status_code == 200
+        pat_ok = await client.get(
+            "/api/v1/automations", headers={"Authorization": "Bearer lapat_human"}
+        )
+        assert pat_ok.status_code == 200, pat_ok.text
 
         class _OAuthObj:
             def __init__(self, uid: str) -> None:
@@ -836,11 +915,10 @@ async def test_company_budget_idempotency_and_external_auth_rejection_real_db(
                 "/api/v1/automations", headers={"Authorization": "Bearer lac1.company"}
             )
         ).status_code == 401
-        assert (
-            await client.get(
-                "/api/v1/automations", headers={"Authorization": "Bearer lac1.human"}
-            )
-        ).status_code == 200
+        cli_ok = await client.get(
+            "/api/v1/automations", headers={"Authorization": "Bearer lac1.human"}
+        )
+        assert cli_ok.status_code == 200, cli_ok.text
 
     orig_decode_token = jwt_bearer._decode_token
 
@@ -1112,18 +1190,19 @@ async def test_http_scoped_listing_computer_isolation_and_readonly_history_real_
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         # 1. Empty company list before company rows are preset -> 200, total=0
         r_empty_comp = await client.get("/api/v1/automations?scope=company")
-        assert r_empty_comp.status_code == 200
+        assert r_empty_comp.status_code == 200, r_empty_comp.text
         assert r_empty_comp.json() == {"automations": [], "total": 0}
 
         # 2. Omitted scope returns all 4 tasks of internal_uid (never defaults to personal)
         r_all = await client.get("/api/v1/automations")
-        assert r_all.status_code == 200
+        assert r_all.status_code == 200, r_all.text
         assert r_all.json()["total"] == 4
 
         # 3. Deterministic tie-breaker pagination on equal created_at (automation_id DESC)
         p1 = await client.get("/api/v1/automations?scope=personal&limit=2&offset=0")
         p2 = await client.get("/api/v1/automations?scope=personal&limit=2&offset=2")
-        assert p1.status_code == 200 and p2.status_code == 200
+        assert p1.status_code == 200, p1.text
+        assert p2.status_code == 200, p2.text
         assert p1.json()["total"] == 3 and p2.json()["total"] == 3
         ordered_ids = [
             x["automation_id"] for x in p1.json()["automations"] + p2.json()["automations"]
@@ -1214,7 +1293,7 @@ async def test_http_scoped_listing_computer_isolation_and_readonly_history_real_
 
         # Internal member reads scope=company: gets row's task_row notify state, NOT caller prefs!
         r_comp = await client.get("/api/v1/automations?scope=company")
-        assert r_comp.status_code == 200
+        assert r_comp.status_code == 200, r_comp.text
         assert r_comp.json()["total"] == 1
         [comp_item] = r_comp.json()["automations"]
         assert comp_item["automation_id"] == comp_preset_id
@@ -1248,11 +1327,11 @@ async def test_http_scoped_listing_computer_isolation_and_readonly_history_real_
                 prefs_before = await cur.fetchone()
 
         r_hist_empty = await client.get(f"/api/v1/automations/{auto_comp_a_1}/history")
-        assert r_hist_empty.status_code == 200
+        assert r_hist_empty.status_code == 200, r_hist_empty.text
         assert r_hist_empty.json()["entries"] == []
 
         r_hist_comp = await client.get(f"/api/v1/automations/{comp_preset_id}/history")
-        assert r_hist_comp.status_code == 200
+        assert r_hist_comp.status_code == 200, r_hist_comp.text
         hist_body = r_hist_comp.json()
         assert [e["version"] for e in hist_body["entries"]] == [2, 1]
         for entry in hist_body["entries"]:
@@ -1307,7 +1386,7 @@ async def test_http_scoped_listing_computer_isolation_and_readonly_history_real_
             computer_id=comp_a,
         )
         r_comp_tok_pers = await client.get("/api/v1/automations?scope=personal")
-        assert r_comp_tok_pers.status_code == 200
+        assert r_comp_tok_pers.status_code == 200, r_comp_tok_pers.text
         assert r_comp_tok_pers.json()["total"] == 2
         assert {a["automation_id"] for a in r_comp_tok_pers.json()["automations"]} == {
             auto_comp_a_1,
@@ -1315,13 +1394,12 @@ async def test_http_scoped_listing_computer_isolation_and_readonly_history_real_
         }
 
         r_comp_tok_rt = await client.get("/api/v1/automations?scope=research_tracking")
-        assert r_comp_tok_rt.status_code == 200
+        assert r_comp_tok_rt.status_code == 200, r_comp_tok_rt.text
         assert r_comp_tok_rt.json() == {"automations": [], "total": 0}
 
         assert (await client.get("/api/v1/automations?scope=company")).status_code == 403
-        assert (
-            await client.get(f"/api/v1/automations/{auto_comp_a_1}/history")
-        ).status_code == 200
+        r_comp_tok_hist_ok = await client.get(f"/api/v1/automations/{auto_comp_a_1}/history")
+        assert r_comp_tok_hist_ok.status_code == 200, r_comp_tok_hist_ok.text
         assert (
             await client.get(f"/api/v1/automations/{auto_home_id}/history")
         ).status_code == 403
