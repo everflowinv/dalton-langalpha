@@ -26,8 +26,15 @@ This package (`@dalton/channel-gateway`) includes code adapted from the OpenClaw
 | `src/channels/discord/send.ts` | `discord/dist/.setup/send.outbound-_jx4Xpd3.mjs`, `discord/dist/.setup/send.shared-CjQ4jbMA.mjs` | `382–420`, `184–226`, `457–620` |
 | `src/channels/discord/threading.ts` | `discord/dist/.setup/send-DbILKgcm.mjs`, `discord/dist/.setup/threading-BWz5lW0p.mjs` | `267–378`, `113–193` |
 | `src/channels/discord/inbound.ts` | `discord/dist/.setup/transcripts-source-EMrQb132.mjs` | `1–22`, `135–429` |
+| `src/native-commands/manifest.ts`, `src/native-commands/discord-registrar.ts` | `openclaw/dist/commands-registry-list-BbUjmer4.mjs`, `@openclaw/discord/dist/.setup/provider-CbmXLYrW.mjs` | `1–30`, `3948–4026`, `6096–6121` |
 
 Discord code above is adapted under the same OpenClaw MIT license below; no full license copy is duplicated. Runtime/type dependencies `ws` and `discord-api-types` are used under their own package licenses as declared in `package.json`.
+
+## Referenced and Adapted Lark CLI Files
+
+| Target File in `@dalton/channel-gateway` | `larksuite/cli` Source (`7dbefd9cf17357545450ca53007d413212bc8aba`) | Referenced Lines |
+|---|---|---|
+| `src/native-commands/manifest.ts`, `src/native-commands/feishu-registrar.ts` | `shortcuts/application/slash_command_create.go`, `shortcuts/application/slash_command_update.go`, `shortcuts/application/slash_command_common.go`, `shortcuts/application/slash_command_resolve.go` | `1–113`, `1–95`, `1–105`, `1–54` |
 
 ---
 
@@ -37,6 +44,35 @@ Discord code above is adapted under the same OpenClaw MIT license below; no full
 MIT License
 
 Copyright (c) 2025 Peter Steinberger
+Copyright (c) 2026 OpenClaw Foundation
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+---
+
+## Lark CLI License (`larksuite/cli`)
+
+```text
+MIT License
+
+Copyright (c) 2026 Lark Technologies Pte. Ltd.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

@@ -2173,6 +2173,139 @@ describe("Real HTTP End-to-End: FeishuChannelAdapter -> GatewayOrchestrator -> H
           agedInterrupt.activity_epoch,
           3,
         );
+
+        // 11. A ledger run that is gone stays dispatched until the ended
+        // notice is confirmed. The first failure keeps the same key. The
+        // second recovery sends it once. The third does not send it again.
+        const missingToken = `MISSING${boot.prefix}`;
+        const mMissing = `${boot.prefix}_om_missing_run`;
+        await feishuInboundAdapter.receiveRawEvent({
+          sender: {
+            sender_id: { open_id: boot.puid_a },
+            sender_type: "user",
+          },
+          message: {
+            message_id: mMissing,
+            chat_id: "oc_dm_a",
+            chat_type: "p2p",
+            message_type: "text",
+            content: JSON.stringify({ text: missingToken }),
+          },
+        });
+        const snapMissing = await inspectDb({
+          scopeKey: dmScopeA,
+          userId: boot.user_a,
+          messageId: mMissing,
+        });
+        const missingThreadId = snapMissing.inbound?.thread_id ?? "";
+        const missingRunId = snapMissing.inbound?.run_id ?? "";
+        expect(snapMissing.inbound?.status).toBe("completed");
+        expect(missingThreadId).not.toBe("");
+        expect(missingRunId).not.toBe("");
+        expect(countSent(missingToken)).toBe(1);
+        await realBackendClient.updateInboundProgress({
+          platform: "feishu",
+          message_id: mMissing,
+          status: "dispatched",
+          fallback_pending: true,
+        });
+        const agedMissing = await ageSession({
+          scopeKey: dmScopeA,
+          userId: boot.user_a,
+          secondsAgo: 25200,
+        });
+        const dropRes = await fetch(`${baseUrl}/test-harness/drop-run`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            thread_id: missingThreadId,
+            run_id: missingRunId,
+          }),
+        });
+        expect(dropRes.status).toBe(200);
+        const endedText = 'The interrupted run ended with status "not_found".';
+        const missingNoticeKey = `notice:feishu:${mMissing}:rec_not_found`;
+        feishuOutbound.setSendTextBehavior((options) => {
+          if (options.text === endedText) {
+            throw new ChannelDeliveryError("ended notice failed", {
+              outcome: "failed",
+              code: "unavailable",
+            });
+          }
+          return { messageId: `om_missing_${options.chunkIndex}` };
+        });
+        await app2.orchestrator.runStartupRecovery();
+        const snapMissingFailed = await inspectDb({
+          scopeKey: dmScopeA,
+          userId: boot.user_a,
+          messageId: mMissing,
+          deliveryKey: missingNoticeKey,
+        });
+        expect(countSent(endedText)).toBe(0);
+        expect(countSent(missingToken)).toBe(1);
+        expect(snapMissingFailed.inbound?.status).toBe("dispatched");
+        expect(snapMissingFailed.inbound?.fallback_pending).toBe(true);
+        expect(snapMissingFailed.delivery).toMatchObject({
+          status: "failed",
+          activity_origin: "none",
+          source_scope_key: dmScopeA,
+        });
+        expect(snapMissingFailed.session?.generation).toBe(
+          agedMissing.generation,
+        );
+        expect(snapMissingFailed.session?.override_workspace_id).toBe(
+          agedMissing.override_workspace_id,
+        );
+        expect(snapMissingFailed.session?.activity_epoch).toBeCloseTo(
+          agedMissing.activity_epoch,
+          3,
+        );
+        feishuOutbound.setSendTextBehavior(null);
+
+        await app2.orchestrator.runStartupRecovery();
+        const snapMissingSent = await inspectDb({
+          scopeKey: dmScopeA,
+          userId: boot.user_a,
+          messageId: mMissing,
+          deliveryKey: missingNoticeKey,
+        });
+        expect(countSent(endedText)).toBe(1);
+        expect(countSent(missingToken)).toBe(1);
+        expect(snapMissingSent.inbound?.status).toBe("failed");
+        expect(snapMissingSent.inbound?.fallback_pending).toBe(false);
+        expect(snapMissingSent.delivery).toMatchObject({
+          status: "sent",
+          activity_origin: "none",
+          source_scope_key: dmScopeA,
+        });
+        expect(snapMissingSent.session?.generation).toBe(agedMissing.generation);
+        expect(snapMissingSent.session?.override_workspace_id).toBe(
+          agedMissing.override_workspace_id,
+        );
+        expect(snapMissingSent.session?.activity_epoch).toBeCloseTo(
+          agedMissing.activity_epoch,
+          3,
+        );
+
+        await app2.orchestrator.runStartupRecovery();
+        const snapMissingThird = await inspectDb({
+          scopeKey: dmScopeA,
+          userId: boot.user_a,
+          messageId: mMissing,
+          deliveryKey: missingNoticeKey,
+        });
+        expect(countSent(endedText)).toBe(1);
+        expect(countSent(missingToken)).toBe(1);
+        expect(snapMissingThird.inbound?.status).toBe("failed");
+        expect(snapMissingThird.inbound?.fallback_pending).toBe(false);
+        expect(snapMissingThird.delivery).toMatchObject({
+          status: "sent",
+          activity_origin: "none",
+        });
+        expect(snapMissingThird.session?.activity_epoch).toBeCloseTo(
+          agedMissing.activity_epoch,
+          3,
+        );
       } finally {
         if (app2) {
           await app2.stop();
@@ -2186,6 +2319,6 @@ describe("Real HTTP End-to-End: FeishuChannelAdapter -> GatewayOrchestrator -> H
         rmSync(tempDir, { recursive: true, force: true });
       }
     },
-    90_000,
+    120_000,
   );
 });

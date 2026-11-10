@@ -199,6 +199,10 @@ integrations/dalton-channel-gateway/src/channels/discord/
 integrations/dalton-channel-gateway/test/discord.test.ts
 integrations/dalton-channel-gateway/test/real-http-postgres.test.ts
 tests/integration/dalton/test_discord_gateway_db.py
+# Feishu & Discord native slash-command manifest, registration library, standalone CLI, README, and Vitest suite.
+integrations/dalton-channel-gateway/README.md
+integrations/dalton-channel-gateway/src/native-commands/
+integrations/dalton-channel-gateway/test/native-commands.test.ts
 
 scripts/dalton/openclaw_overlays/skills/sentiment-dashboard/scripts/run.sh
 scripts/dalton/openclaw_overlays/scripts/sentiment_dashboard_cos_upload.py
