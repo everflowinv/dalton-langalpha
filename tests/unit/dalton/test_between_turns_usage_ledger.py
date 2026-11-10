@@ -301,17 +301,20 @@ async def test_a_compact_call_lands_in_cash_or_notional_never_both(
     in the notional estimate."""
     from src.config.env import USD_TO_CREDITS_RATE
     from src.dalton.budget import service as budget_service
+    from src.dalton.llm import notional_pricing
 
+    nominal_cards = {
+        "claude-test": {
+            "input": 3_000_000.0,
+            "cached_input": 300_000.0,
+            "output": 15_000_000.0,
+        }
+    }
+    monkeypatch.setattr(budget_service, "_notional_price_index", lambda: nominal_cards)
     monkeypatch.setattr(
-        budget_service,
-        "_notional_price_index",
-        lambda: {
-            "claude-test": {
-                "input": 3_000_000.0,
-                "cached_input": 300_000.0,
-                "output": 15_000_000.0,
-            }
-        },
+        notional_pricing,
+        "build_notional_price_index",
+        create_autospec(notional_pricing.build_notional_price_index, return_value=nominal_cards),
     )
 
     await _compact_by_the_user(base_config, billing_type=billing_type)
