@@ -2831,6 +2831,619 @@ async def retry_failed_notify_deliveries(
     return sent_count
 
 
+_REPORT_AUTH_SKIP_CODES = frozenset(
+    {
+        "toggle_off",
+        "target_removed",
+        "target_revoked",
+        "target_not_routed",
+        "no_authorized_target",
+        "profile_invalid",
+        "task_disabled",
+        "dalton_disabled",
+    }
+)
+_ACCEPTED_TRANSPORT_WORDS = frozenset({"accepted", "started", "queued"})
+
+
+def _kw_if_accepted(fn: Any, values: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep only keyword arguments ``fn`` declares."""
+    accepted: dict[str, Any] = {}
+    for key, value in values.items():
+        if value is None:
+            continue
+        if _callable_accepts_kwarg(fn, str(key)):
+            accepted[str(key)] = value
+    return accepted
+
+
+def _coerce_claim_result(result: Any) -> tuple[bool, int | None]:
+    if isinstance(result, tuple):
+        claimed = bool(result[0]) if result else False
+        raw_attempt = result[1] if len(result) > 1 else None
+        if raw_attempt is None:
+            return claimed, None
+        try:
+            return claimed, int(raw_attempt)
+        except (TypeError, ValueError):
+            return claimed, None
+    return bool(result), None
+
+
+def _saved_report_attempt(row: Mapping[str, Any]) -> int:
+    try:
+        return int(row.get("attempt_count") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _report_dispatch_timeout_s(
+    started_at: float | None,
+    max_duration_s: float | None,
+) -> float | None:
+    """Bound one gateway call. ``None`` means the remaining budget is too small to start."""
+    base = float(get_notify_http_timeout_s())
+    if started_at is None or max_duration_s is None:
+        return base
+    remaining = _remaining_retry_request_budget_s(float(started_at), float(max_duration_s))
+    if remaining < RETRY_MIN_REQUEST_TIMEOUT_S:
+        return None
+    return min(base, remaining)
+
+
+def _classify_native_target_result(
+    target: str,
+    transport_res: Any,
+) -> tuple[str, str | None]:
+    """Classify one gateway response. Accepted, started, and queued are not sent."""
+    uncertain = extract_target_uncertain_code(target, transport_res)
+    if uncertain is not None:
+        return "uncertain", uncertain
+    if not isinstance(transport_res, Mapping):
+        return "failed", "target_failed"
+    top = str(transport_res.get("status") or "").strip().lower()
+    matched: Mapping[str, Any] | None = None
+    results = transport_res.get("results")
+    if isinstance(results, list):
+        for item in results:
+            if (
+                isinstance(item, Mapping)
+                and str(item.get("target") or "").strip() == str(target or "").strip()
+            ):
+                matched = item
+                break
+    item_status = (
+        str(matched.get("status") or "").strip().lower() if matched is not None else ""
+    )
+    if top in _ACCEPTED_TRANSPORT_WORDS or item_status in _ACCEPTED_TRANSPORT_WORDS:
+        word = item_status if item_status in _ACCEPTED_TRANSPORT_WORDS else top
+        return "failed", word
+    if top == "skipped":
+        code = str(
+            transport_res.get("error_code") or transport_res.get("code") or "skipped"
+        ).strip() or "skipped"
+        return "skipped", code
+    if top == "sent":
+        if matched is None or (
+            matched.get("ok") is not False and item_status in {"", "sent"}
+        ):
+            return "sent", None
+        code = str(
+            matched.get("error_code") or matched.get("error") or item_status or "target_failed"
+        ).strip() or "target_failed"
+        return "failed", code
+    if matched is not None:
+        code = str(
+            matched.get("error_code") or matched.get("error") or item_status or "target_failed"
+        ).strip() or "target_failed"
+    else:
+        code = str(
+            transport_res.get("error_code") or transport_res.get("error") or "target_failed"
+        ).strip() or "target_failed"
+    return "failed", code
+
+
+def _transport_exception_is_uncertain(exc: BaseException) -> bool:
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    if isinstance(exc, (httpx.ConnectTimeout, httpx.ConnectError)):
+        return False
+    return isinstance(exc, (httpx.TimeoutException, httpx.TransportError))
+
+
+def _exception_error_code(exc: BaseException) -> str:
+    code = getattr(exc, "code", None)
+    if is_uncertain_notify_error_code(code):
+        return str(code).strip().lower()
+    status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    if status_code:
+        return f"http_{status_code}"
+    return type(exc).__name__
+
+
+async def _load_saved_report_rows(
+    loader: Callable[..., Awaitable[Any]],
+    execution_id: str,
+    conn: Any,
+) -> list[dict[str, Any]]:
+    loaded = await loader(execution_id, **_kw_if_accepted(loader, {"conn": conn}))
+    if not isinstance(loaded, list):
+        return []
+    return [dict(row) for row in loaded if isinstance(row, Mapping)]
+
+
+async def claim_saved_report_delivery(
+    execution_id: str,
+    channel: str,
+    target: str,
+    *,
+    max_attempts: int = 3,
+    stale_pending_minutes: int = 10,
+    conn: Any = None,
+) -> tuple[bool, int | None]:
+    """Claim one saved report row. Does not insert a row and does not rewrite the payload.
+
+    Pending ``attempt_count = 0`` is claimable. Failed rows and stale pending rows
+    are claimable while ``attempt_count`` is below ``max_attempts``. Uncertain
+    native errors stay excluded. A missing report row is left missing.
+    """
+    exec_id = (execution_id or "").strip()
+    ch = (channel or "").strip().lower()
+    tgt = (target or "").strip()
+    if not (exec_id and ch and tgt):
+        return False, None
+    bounded_attempts = max(1, int(max_attempts))
+    connection_cm = get_db_connection(conn) if conn is not None else get_db_connection()
+    async with connection_cm as held:
+        async with held.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                UPDATE dalton_notify_deliveries
+                SET status = 'pending',
+                    error_code = NULL,
+                    attempt_count = attempt_count + 1,
+                    updated_at = NOW()
+                WHERE lower(execution_id) = lower(%s)
+                  AND channel = %s
+                  AND target = %s
+                  AND COALESCE(payload_json ->> 'source', '') = 'automation_report'
+                  AND attempt_count < %s
+                  AND (
+                      (
+                          status = 'pending'
+                          AND attempt_count = 0
+                          AND COALESCE(error_code, '') <> ALL(%s)
+                      )
+                      OR (
+                          status = 'failed'
+                          AND COALESCE(error_code, '') <> 'attempts_exhausted'
+                          AND COALESCE(error_code, '') <> ALL(%s)
+                      )
+                      OR (
+                          status = 'pending'
+                          AND attempt_count > 0
+                          AND COALESCE(error_code, '') <> ALL(%s)
+                          AND updated_at <= NOW() - make_interval(mins => %s)
+                      )
+                  )
+                RETURNING delivery_id, attempt_count
+                """,
+                (
+                    exec_id,
+                    ch,
+                    tgt,
+                    bounded_attempts,
+                    sorted(UNCERTAIN_NOTIFY_ERROR_CODES),
+                    sorted(UNCERTAIN_NOTIFY_ERROR_CODES),
+                    sorted(UNCERTAIN_NOTIFY_ERROR_CODES),
+                    int(stale_pending_minutes),
+                ),
+            )
+            row = await cur.fetchone()
+    if row is None:
+        return False, None
+    if isinstance(row, Mapping):
+        raw_attempt = row.get("attempt_count")
+        try:
+            return True, int(raw_attempt) if raw_attempt is not None else 1
+        except (TypeError, ValueError):
+            return True, 1
+    if isinstance(row, (tuple, list)) and len(row) >= 2 and row[1] is not None:
+        try:
+            return True, int(row[1])
+        except (TypeError, ValueError):
+            return True, 1
+    return True, 1
+
+
+async def _mark_saved_report_row(
+    marker: Callable[..., Awaitable[Any]],
+    execution_id: str,
+    channel: str,
+    target: str,
+    *,
+    status: str,
+    error_code: str | None,
+    expected_status: str | tuple[str, ...],
+    expected_attempt_count: int | None,
+) -> None:
+    await _invoke_mark_delivery(
+        marker,
+        execution_id,
+        channel,
+        target,
+        status=status,
+        error_code=error_code,
+        expected_status=expected_status,
+        expected_attempt_count=expected_attempt_count,
+    )
+
+
+async def _reconcile_saved_report_row(
+    reconciler: Callable[..., Awaitable[Any]],
+    row: Mapping[str, Any],
+    conn: Any,
+) -> bool:
+    kwargs = _kw_if_accepted(
+        reconciler,
+        {"conn": conn, "allow_retry_candidate_statuses": True},
+    )
+    return bool(await reconciler(row, **kwargs))
+
+
+async def _dispatch_one_saved_report_target(
+    execution_id: str,
+    row: Mapping[str, Any],
+    *,
+    loader: Callable[..., Awaitable[Any]],
+    authorizer: Callable[..., Awaitable[Any]],
+    claimer: Callable[..., Awaitable[Any]],
+    marker: Callable[..., Awaitable[Any]],
+    reconciler: Callable[..., Awaitable[Any]],
+    notifier: Callable[..., Awaitable[Any]],
+    conn: Any,
+    max_attempts: int,
+    stale_pending_minutes: int,
+    resolve_enabled_fn: Callable[[str | None], Awaitable[bool]] | None,
+    resolve_overrides_fn: Callable[[str | None], Awaitable[Mapping[str, bool]]] | None,
+    resolve_targets_fn: Callable[[str | None], Awaitable[Sequence[str]]] | None,
+    resolve_routes_fn: Callable[[str | None], Awaitable[Mapping[str, Sequence[str]]]] | None,
+    is_admin_fn: Callable[[str | None], Awaitable[bool]] | None,
+    started_at: float | None,
+    max_duration_s: float | None,
+) -> bool:
+    """Send one saved target. Returns True when the caller should stop the batch."""
+    status = str(row.get("status") or "").strip().lower()
+    error_code = str(row.get("error_code") or "").strip().lower()
+    attempt = _saved_report_attempt(row)
+    channel = str(row.get("channel") or "").strip().lower()
+    target = str(row.get("target") or "").strip()
+    if not channel or not target or status in {"sent", "skipped"}:
+        return False
+    if await _reconcile_saved_report_row(reconciler, row, conn):
+        return False
+    if (
+        is_uncertain_notify_error_code(error_code)
+        or error_code == "attempts_exhausted"
+        or attempt >= max_attempts
+    ):
+        return False
+    if _report_dispatch_timeout_s(started_at, max_duration_s) is None:
+        return True
+
+    loaded_status: str | tuple[str, ...] = (
+        status if status in {"pending", "failed"} else ("pending", "failed")
+    )
+    claimed_attempt: int | None = None
+    send_started = False
+    try:
+        auth = await authorizer(
+            run_id=execution_id,
+            target=target,
+            **_kw_if_accepted(
+                authorizer,
+                {
+                    "conn": conn,
+                    "resolve_enabled_fn": resolve_enabled_fn,
+                    "resolve_overrides_fn": resolve_overrides_fn,
+                    "resolve_targets_fn": resolve_targets_fn,
+                    "resolve_routes_fn": resolve_routes_fn,
+                    "is_admin_fn": is_admin_fn,
+                },
+            ),
+        )
+        authorized = bool(auth.get("authorized")) if isinstance(auth, Mapping) else False
+        if not authorized:
+            code = "not_allowed"
+            if isinstance(auth, Mapping):
+                code = str(auth.get("code") or code).strip() or code
+            await _mark_saved_report_row(
+                marker,
+                execution_id,
+                channel,
+                target,
+                status="skipped" if code in _REPORT_AUTH_SKIP_CODES else "failed",
+                error_code=code,
+                expected_status=loaded_status,
+                expected_attempt_count=attempt,
+            )
+            return False
+
+        timeout_s = _report_dispatch_timeout_s(started_at, max_duration_s)
+        if timeout_s is None:
+            return True
+        claimed, claimed_attempt = _coerce_claim_result(
+            await claimer(
+                execution_id,
+                channel,
+                target,
+                **_kw_if_accepted(
+                    claimer,
+                    {
+                        "max_attempts": max_attempts,
+                        "stale_pending_minutes": stale_pending_minutes,
+                    },
+                ),
+            )
+        )
+        if not claimed:
+            return False
+        timeout_s = _report_dispatch_timeout_s(started_at, max_duration_s)
+        if timeout_s is None:
+            await _release_unstarted_retry_claim(
+                execution_id,
+                channel,
+                target,
+                claimed_attempt_count=claimed_attempt,
+                restored_error_code="not_started",
+                mark_delivery_fn=marker,
+            )
+            return True
+
+        notify_kwargs: dict[str, Any] = {"run_id": execution_id}
+        if _callable_accepts_kwarg(notifier, "timeout_s"):
+            notify_kwargs["timeout_s"] = timeout_s
+        send_started = True
+        transport = await asyncio.wait_for(
+            notifier([target], **notify_kwargs),
+            timeout=timeout_s + RETRY_CLIENT_CLASSIFY_SLACK_S,
+        )
+        kind, code = _classify_native_target_result(target, transport)
+        if kind == "uncertain":
+            await _shielded_mark_uncertain(
+                marker,
+                execution_id,
+                channel,
+                target,
+                error_code=code or "delivery_uncertain",
+                expected_status="pending",
+                expected_attempt_count=claimed_attempt,
+            )
+            return False
+        if kind == "sent":
+            fresh_rows = await _load_saved_report_rows(loader, execution_id, conn)
+            fresh = next(
+                (
+                    item
+                    for item in fresh_rows
+                    if str(item.get("channel") or "").strip().lower() == channel
+                    and str(item.get("target") or "").strip() == target
+                ),
+                dict(row),
+            )
+            if not await _reconcile_saved_report_row(reconciler, fresh, conn):
+                await _shielded_mark_uncertain(
+                    marker,
+                    execution_id,
+                    channel,
+                    target,
+                    error_code="delivery_uncertain",
+                    expected_status="pending",
+                    expected_attempt_count=claimed_attempt,
+                )
+            return False
+        await _mark_saved_report_row(
+            marker,
+            execution_id,
+            channel,
+            target,
+            status="skipped" if kind == "skipped" else "failed",
+            error_code=code or ("skipped" if kind == "skipped" else "target_failed"),
+            expected_status="pending",
+            expected_attempt_count=claimed_attempt,
+        )
+        return False
+    except asyncio.CancelledError:
+        if send_started:
+            await _shielded_mark_uncertain(
+                marker,
+                execution_id,
+                channel,
+                target,
+                error_code="delivery_uncertain",
+                expected_status="pending",
+                expected_attempt_count=claimed_attempt,
+            )
+        elif claimed_attempt is not None:
+            await _release_unstarted_retry_claim(
+                execution_id,
+                channel,
+                target,
+                claimed_attempt_count=claimed_attempt,
+                restored_error_code="not_started",
+                mark_delivery_fn=marker,
+            )
+        raise
+    except Exception as exc:
+        if send_started and (
+            _transport_exception_is_uncertain(exc)
+            or is_uncertain_notify_error_code(getattr(exc, "code", None))
+        ):
+            uncertain_code = _exception_error_code(exc)
+            if not is_uncertain_notify_error_code(uncertain_code):
+                uncertain_code = "delivery_uncertain"
+            await _shielded_mark_uncertain(
+                marker,
+                execution_id,
+                channel,
+                target,
+                error_code=uncertain_code,
+                expected_status="pending",
+                expected_attempt_count=claimed_attempt,
+            )
+        elif claimed_attempt is not None:
+            await _mark_saved_report_row(
+                marker,
+                execution_id,
+                channel,
+                target,
+                status="failed",
+                error_code=_exception_error_code(exc),
+                expected_status="pending",
+                expected_attempt_count=claimed_attempt,
+            )
+        else:
+            await _mark_saved_report_row(
+                marker,
+                execution_id,
+                channel,
+                target,
+                status="failed",
+                error_code=_exception_error_code(exc),
+                expected_status=loaded_status,
+                expected_attempt_count=attempt,
+            )
+        logger.warning(
+            "[DALTON_NOTIFY] Report dispatch failed for execution_id=%s target=%s: error_type=%s",
+            execution_id,
+            target,
+            type(exc).__name__,
+        )
+        return False
+
+
+async def dispatch_automation_report(
+    execution_id: str,
+    *,
+    conn: Any = None,
+    notify_fn: Callable[..., Awaitable[Any]] | None = None,
+    reconcile_row_fn: Callable[..., Awaitable[Any]] | None = None,
+    claim_fn: Callable[..., Awaitable[Any]] | None = None,
+    mark_fn: Callable[..., Awaitable[Any]] | None = None,
+    authorize_fn: Callable[..., Awaitable[Any]] | None = None,
+    load_rows_fn: Callable[..., Awaitable[Any]] | None = None,
+    max_attempts: int = 3,
+    stale_pending_minutes: int = 10,
+    resolve_enabled_fn: Callable[[str | None], Awaitable[bool]] | None = None,
+    resolve_overrides_fn: Callable[[str | None], Awaitable[Mapping[str, bool]]] | None = None,
+    resolve_targets_fn: Callable[[str | None], Awaitable[Sequence[str]]] | None = None,
+    resolve_routes_fn: Callable[[str | None], Awaitable[Mapping[str, Sequence[str]]]] | None = None,
+    is_admin_fn: Callable[[str | None], Awaitable[bool]] | None = None,
+    started_at: float | None = None,
+    max_duration_s: float | None = None,
+) -> dict[str, Any]:
+    """Send the saved report for ``execution_id`` through the native gateway.
+
+    The body and recipients come from the saved rows. Each eligible target is
+    authorized, claimed, and posted once as
+    ``notify([target], run_id=execution_id, timeout_s=...)``. The claim
+    connection is released before that post. Durable confirmation is the saved
+    status view after every intended target's native items are ``sent``.
+    """
+    from src.dalton.database import automation_reports as automation_reports
+    from src.dalton.database.data_task_notifications import (
+        authorize_data_task_notification_plan,
+        reconcile_single_data_task_delivery_row,
+    )
+
+    exec_id = str(execution_id or "").strip()
+    loader = load_rows_fn or automation_reports.load_execution_report_rows
+    authorizer = authorize_fn or authorize_data_task_notification_plan
+    claimer = claim_fn or claim_saved_report_delivery
+    marker = mark_fn or mark_target_delivery
+    reconciler = reconcile_row_fn or reconcile_single_data_task_delivery_row
+    notifier = notify_fn or post_data_task_gateway_notify
+    bounded_attempts = max(1, int(max_attempts))
+
+    async def _saved_view() -> dict[str, Any]:
+        return automation_reports.report_status_view(
+            await _load_saved_report_rows(loader, exec_id, conn)
+        )
+
+    try:
+        rows = await _load_saved_report_rows(loader, exec_id, conn)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning(
+            "[DALTON_NOTIFY] Report dispatch could not load execution_id=%s",
+            exec_id,
+            exc_info=True,
+        )
+        return {
+            "ok": False,
+            "code": "dispatch_failed",
+            "delivery_confirmed": False,
+            "status": "pending",
+            "targets": [],
+            "results": [],
+        }
+    if not rows:
+        return await _saved_view()
+
+    for row in rows:
+        try:
+            stop = await _dispatch_one_saved_report_target(
+                exec_id,
+                row,
+                loader=loader,
+                authorizer=authorizer,
+                claimer=claimer,
+                marker=marker,
+                reconciler=reconciler,
+                notifier=notifier,
+                conn=conn,
+                max_attempts=bounded_attempts,
+                stale_pending_minutes=int(stale_pending_minutes),
+                resolve_enabled_fn=resolve_enabled_fn,
+                resolve_overrides_fn=resolve_overrides_fn,
+                resolve_targets_fn=resolve_targets_fn,
+                resolve_routes_fn=resolve_routes_fn,
+                is_admin_fn=is_admin_fn,
+                started_at=started_at,
+                max_duration_s=max_duration_s,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "[DALTON_NOTIFY] Report target failed for execution_id=%s",
+                exec_id,
+                exc_info=True,
+            )
+            continue
+        if stop:
+            break
+    try:
+        return await _saved_view()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning(
+            "[DALTON_NOTIFY] Report dispatch could not reload execution_id=%s",
+            exec_id,
+            exc_info=True,
+        )
+        return {
+            "ok": False,
+            "code": "dispatch_failed",
+            "delivery_confirmed": False,
+            "status": "pending",
+            "targets": [],
+            "results": [],
+        }
+
+
 async def on_automation_settled(
     *,
     automation: Mapping[str, Any],
@@ -2850,14 +3463,19 @@ async def on_automation_settled(
     claim_execution_fn: Callable[[str], Awaitable[bool]] | None = None,
     post_notify_fn: Callable[..., Awaitable[dict[str, Any]]] = post_bridge_notify,
     frontend_url_fn: Callable[[], str] = get_dalton_frontend_url,
+    report_status_fn: Callable[..., Awaitable[bool]] | None = None,
 ) -> bool:
-    """Send personal Feishu Card 2.0 / Discord DM notification when an eligible Dalton automation completes.
+    """Send a personal Feishu Card 2.0 / Discord DM when an eligible Dalton automation completes.
 
-    Dispatches one bridge ``/notify`` request per target and records per-target status in
-    ``dalton_notify_deliveries`` without touching ``automation_executions.delivery_result``.
-    Any failure after claiming a target marks all unfinalized claimed targets as ``failed``
-    so no row remains stuck in ``pending``. Returns ``True`` iff at least one target was
-    delivered successfully. Never raises.
+    A task with a validated report profile does not build that generic message.
+    The return value is whether this execution's saved report is fully sent.
+    A missing or quiet report is not sent.
+
+    Otherwise dispatches one bridge ``/notify`` request per target and records
+    per-target status in ``dalton_notify_deliveries`` without touching
+    ``automation_executions.delivery_result``. Any failure after claiming a
+    target marks all unfinalized claimed targets as ``failed``. Returns ``True``
+    iff at least one target was delivered successfully.
     """
     ws_for_verdict = (workspace_id or "").strip() or None
     pending_targets: list[tuple[str, str]] = []
@@ -2866,6 +3484,15 @@ async def on_automation_settled(
             automation
         ):
             return False
+
+        from src.dalton.database.automation_reports import (
+            automation_has_validated_report_profile,
+            read_execution_report_confirmed,
+        )
+
+        if automation_has_validated_report_profile(automation):
+            reader = report_status_fn or read_execution_report_confirmed
+            return bool(await reader(execution_id))
 
         classification = classify_automation_for_notify(automation)
 

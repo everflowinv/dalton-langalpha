@@ -1764,8 +1764,9 @@ async def reconcile_single_data_task_delivery_row(
 
     Read-only unless all expected items for the original persisted recipient identity are
     durably `sent` in `dalton_channel_deliveries`, in which case it atomically transitions
-    the outer row to `status = 'sent', error_code = NULL` and converges the run's
-    `notify_status` to `'dispatched'`.
+    the outer row to `status = 'sent', error_code = NULL`. A data-task payload then
+    converges that run's `notify_status` to `'dispatched'`. A saved automation report
+    does not update `dalton_data_task_runs`.
     """
     raw_exec_id = str(row.get("execution_id") or "").strip()
     owner_user_id = str(row.get("user_id") or "").strip()
@@ -1928,28 +1929,33 @@ async def reconcile_single_data_task_delivery_row(
                         )
                     if isinstance(tx_cur.rowcount, int) and tx_cur.rowcount > 0:
                         updated_outer = True
-                        await tx_cur.execute(
-                            """
-                            UPDATE dalton_data_task_runs r
-                            SET notify_status = 'dispatched',
-                                updated_at = NOW()
-                            WHERE r.run_id = %s::uuid
-                              AND r.notify_status = 'pending_dispatch'
-                              AND EXISTS (
-                                  SELECT 1
-                                  FROM dalton_notify_deliveries d
-                                  WHERE d.execution_id = %s
-                                    AND d.status = 'sent'
-                              )
-                              AND NOT EXISTS (
-                                  SELECT 1
-                                  FROM dalton_notify_deliveries d
-                                  WHERE d.execution_id = %s
-                                    AND d.status NOT IN ('sent', 'skipped')
-                              )
-                            """,
-                            (norm_run_id, raw_exec_id, raw_exec_id),
+                        from src.dalton.database.automation_reports import (
+                            is_automation_report_payload,
                         )
+
+                        if not is_automation_report_payload(payload):
+                            await tx_cur.execute(
+                                """
+                                UPDATE dalton_data_task_runs r
+                                SET notify_status = 'dispatched',
+                                    updated_at = NOW()
+                                WHERE r.run_id = %s::uuid
+                                  AND r.notify_status = 'pending_dispatch'
+                                  AND EXISTS (
+                                      SELECT 1
+                                      FROM dalton_notify_deliveries d
+                                      WHERE d.execution_id = %s
+                                        AND d.status = 'sent'
+                                  )
+                                  AND NOT EXISTS (
+                                      SELECT 1
+                                      FROM dalton_notify_deliveries d
+                                      WHERE d.execution_id = %s
+                                        AND d.status NOT IN ('sent', 'skipped')
+                                  )
+                                """,
+                                (norm_run_id, raw_exec_id, raw_exec_id),
+                            )
 
             if updated_outer:
                 if mark_delivery_fn is not None:

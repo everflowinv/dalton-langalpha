@@ -31,6 +31,8 @@ from src.dalton import access_tiers
 from src.dalton.database import automation_reports as reports
 from src.dalton.database import channel_gateway as cg_db
 from src.dalton.database import data_task_notifications as dtn
+from src.dalton.notify import dispatch as notify_dispatch
+from src.dalton.notify.channel_transport import post_data_task_gateway_notify
 from src.server.database import automation_executions as execution_db
 from src.server.database import pool as db_pool
 from src.server.database import user as user_db
@@ -1284,8 +1286,9 @@ def _plan_kwargs(world: World) -> dict[str, Any]:
 
 
 def _patch_native_db(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Route plan and claim through the fixture pool. Notifications stay enabled."""
+    """Route plan, claim, and dispatch through the fixture pool. Notifications stay enabled."""
     monkeypatch.setattr(dtn, "get_db_connection", reports.get_db_connection)
+    monkeypatch.setattr(notify_dispatch, "get_db_connection", reports.get_db_connection)
     monkeypatch.setattr(
         dtn,
         "get_dalton_settings",
@@ -1653,3 +1656,245 @@ async def test_failure_text_plan_claims_the_saved_discord_recipient(
     stored = next(row for row in await _rows(world) if row["execution_id"] == execution_id)
     assert stored["payload_json"]["failure_text"] == text
     assert stored["payload_json"]["reconcile_recipient_id"] == world.discord_id
+
+
+def _dispatch(world: World, notify: Any, execution_id: str | None = None):
+    return notify_dispatch.dispatch_automation_report(
+        execution_id or world.execution_id,
+        notify_fn=notify,
+        **_plan_kwargs(world),
+    )
+
+
+async def _write_sent_ledger(
+    world: World,
+    execution_id: str,
+    target: str,
+    *,
+    item_limit: int | None = None,
+) -> list[str]:
+    rows = await reports.load_execution_report_rows(execution_id)
+    row = next(item for item in rows if item["target"] == target)
+    payload = row["payload_json"]
+    keys = [str(key) for key in payload["reconcile_delivery_keys"]]
+    if item_limit is not None:
+        keys = keys[:item_limit]
+    async with world.pool.connection() as conn:
+        async with conn.cursor() as cur:
+            for key in keys:
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_channel_deliveries (
+                        delivery_key, kind, user_id, thread_id, run_id, execution_id,
+                        is_current, has_non_empty_text, platform, target_address,
+                        status, total_chunks, sent_chunks, platform_message_ids,
+                        files_status, created_at, updated_at
+                    )
+                    VALUES (
+                        %s, 'data_task', %s, NULL, %s, %s::uuid,
+                        FALSE, TRUE, %s, %s,
+                        'sent', 0, 0, '[]'::jsonb,
+                        '[]'::jsonb, NOW(), NOW()
+                    )
+                    ON CONFLICT (delivery_key) DO UPDATE
+                    SET status = 'sent', updated_at = NOW()
+                    """,
+                    (
+                        key,
+                        row["user_id"],
+                        row["execution_id"],
+                        row["execution_id"],
+                        payload["reconcile_platform"],
+                        payload["reconcile_canonical_target"],
+                    ),
+                )
+    return keys
+
+
+def _gateway(world: World, calls: list[dict[str, Any]], *, item_limit: int | None = None):
+    async def _notify(
+        targets: list[str],
+        text: str = "",
+        card: dict[str, Any] | None = None,
+        *,
+        images: list[dict[str, Any]] | None = None,
+        run_id: str | None = None,
+        gateway_url: str | None = None,
+        service_token: str | None = None,
+        timeout_s: float | None = None,
+        http_client: Any = None,
+    ) -> dict[str, Any]:
+        assert text == ""
+        assert card is None
+        assert images is None
+        assert gateway_url is None
+        assert service_token is None
+        assert http_client is None
+        assert len(targets) == 1
+        assert timeout_s is not None and timeout_s > 0
+        calls.append({"target": targets[0], "run_id": run_id, "timeout_s": timeout_s})
+        await asyncio.sleep(0.05)
+        await _write_sent_ledger(
+            world,
+            str(run_id),
+            targets[0],
+            item_limit=item_limit,
+        )
+        return {
+            "ok": True,
+            "status": "sent",
+            "results": [{"target": targets[0], "ok": True, "status": "sent"}],
+        }
+
+    return create_autospec(post_data_task_gateway_notify, side_effect=_notify)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_confirms_every_saved_card_once(
+    world: World,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_native_db(monkeypatch)
+    first = _card("First [10-K](https://example.com/msft/10k)")
+    second = _card("Second [10-Q](https://example.com/msft/10q)")
+    saved = await _submit(world, cards=[first, second])
+    assert saved["ok"] is True
+    original_cards = saved["payload"]["cards"]
+    digest = saved["payload"]["content_sha256"]
+    await _insert_data_run(world, world.execution_id, status="succeeded")
+    calls: list[dict[str, Any]] = []
+    notify = _gateway(world, calls)
+    sent = await _dispatch(world, notify)
+    assert sent["ok"] is True
+    assert sent["delivery_confirmed"] is True
+    assert sent["status"] == "sent"
+    assert sent["execution_id"] == world.execution_id
+    assert sent["payload"]["cards"] == original_cards
+    assert sent["payload"]["content_sha256"] == digest
+    assert {call["target"] for call in calls} == {world.chat_a, world.chat_b}
+    assert {call["run_id"] for call in calls} == {world.execution_id}
+    assert len(calls) == 2
+    rows = await _rows(world)
+    assert len(rows) == 2
+    assert all(row["status"] == "sent" and row["attempt_count"] == 1 for row in rows)
+    assert all(row["payload_json"]["cards"] == original_cards for row in rows)
+    assert all(row["payload_json"]["content_sha256"] == digest for row in rows)
+    assert all(row["error_code"] in (None, "") for row in rows)
+    ledger = await _channel_rows(world, world.execution_id)
+    assert len(ledger) == 4
+    assert all(row["kind"] == "data_task" and row["status"] == "sent" for row in ledger)
+    assert await _notify_status(world, world.execution_id) == "pending_dispatch"
+
+    again = await _dispatch(world, notify)
+    assert again["delivery_confirmed"] is True
+    assert len(calls) == 2
+    assert all(row["attempt_count"] == 1 for row in await _rows(world))
+
+
+@pytest.mark.asyncio
+async def test_dispatch_keeps_an_incomplete_ledger_unconfirmed_and_does_not_resend(
+    world: World,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_native_db(monkeypatch)
+    saved = await _submit(world, cards=[_card("First"), _card("Second")])
+    assert saved["ok"] is True
+    calls: list[dict[str, Any]] = []
+    notify = _gateway(world, calls, item_limit=1)
+    incomplete = await _dispatch(world, notify)
+    assert incomplete["delivery_confirmed"] is False
+    assert incomplete["status"] == "unknown"
+    assert len(calls) == 2
+    rows = await _rows(world)
+    assert all(row["status"] == "pending" for row in rows)
+    assert all(row["error_code"] == "delivery_uncertain" for row in rows)
+    assert all(row["attempt_count"] == 1 for row in rows)
+    again = await _dispatch(world, notify)
+    assert again["delivery_confirmed"] is False
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_quiet_and_missing_report_dispatch_does_not_send(
+    world: World,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_native_db(monkeypatch)
+    quiet = await _submit(world, material="no", cards=None)
+    assert quiet["quiet"] is True
+    calls: list[dict[str, Any]] = []
+    notify = _gateway(world, calls)
+    missing_id = str(uuid4())
+    world.execution_ids.append(missing_id)
+    missing = await _dispatch(world, notify, missing_id)
+    assert missing["ok"] is False
+    assert missing["code"] == "not_found"
+    assert missing["delivery_confirmed"] is False
+    quiet_view = await _dispatch(world, notify)
+    assert quiet_view["ok"] is False
+    assert quiet_view["delivery_confirmed"] is False
+    assert calls == []
+    assert await notify_dispatch.claim_saved_report_delivery(
+        world.execution_id,
+        "feishu",
+        "feishu:chat:oc_not_saved",
+    ) == (False, None)
+    assert await _rows(world) == []
+
+
+@pytest.mark.asyncio
+async def test_concurrent_dispatch_claims_each_saved_target_once(
+    world: World,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_native_db(monkeypatch)
+    saved = await _submit(world, cards=[_card("First"), _card("Second")])
+    assert saved["ok"] is True
+    calls: list[dict[str, Any]] = []
+    notify = _gateway(world, calls)
+    await asyncio.gather(_dispatch(world, notify), _dispatch(world, notify))
+    assert len(calls) == 2
+    assert {call["target"] for call in calls} == {world.chat_a, world.chat_b}
+    rows = await _rows(world)
+    assert {row["attempt_count"] for row in rows} == {1}
+    assert {row["status"] for row in rows} == {"sent"}
+    assert await reports.read_execution_report_confirmed(world.execution_id) is True
+
+
+@pytest.mark.asyncio
+async def test_report_profile_settlement_does_not_send_generic_text(
+    world: World,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_native_db(monkeypatch)
+    saved = await _submit(world, cards=[_card("First"), _card("Second")])
+    assert saved["delivery_confirmed"] is False
+    post = create_autospec(
+        notify_dispatch.post_bridge_notify,
+        side_effect=AssertionError("generic notification"),
+    )
+    automation = {
+        "automation_id": world.automation_id,
+        "user_id": world.owner,
+        "name": "AM digest",
+        "metadata": _profile(world.chat_a, world.chat_b, world.discord_target),
+    }
+    assert await notify_dispatch.on_automation_settled(
+        automation=automation,
+        execution_id=world.execution_id,
+        final_text="Generic completion text must not be sent.",
+        post_notify_fn=post,
+        **_plan_kwargs(world),
+    ) is False
+    calls: list[dict[str, Any]] = []
+    sent = await _dispatch(world, _gateway(world, calls))
+    assert sent["delivery_confirmed"] is True
+    assert await notify_dispatch.on_automation_settled(
+        automation=automation,
+        execution_id=world.execution_id,
+        final_text="Generic completion text must not be sent.",
+        post_notify_fn=post,
+        **_plan_kwargs(world),
+    ) is True
+    post.assert_not_called()
+    assert len(calls) == 2
