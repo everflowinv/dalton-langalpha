@@ -465,7 +465,8 @@ async def test_a_run_the_messaging_service_did_not_take_runs_as_before():
     dx.start.assert_awaited_once()
     args = _turn_args(fx)
     assert args["request"].additional_context is None
-    assert args["extra_configurable"] is None
+    # DALTON-HOOK(dalton-tools): Tools receive the server execution identity.
+    assert args["extra_configurable"] == {"automation_execution_id": _EXEC}
     assert args["run_metadata"] == {"automation_execution_id": _EXEC, "automation_id": "auto-1"}
     fx.started.assert_awaited_once()
 
@@ -479,7 +480,9 @@ async def test_a_start_the_service_did_not_take_leaves_the_run_to_the_webhook():
 
     args = _turn_args(fx)
     assert args["request"].additional_context is None
-    assert args["extra_configurable"] is None
+    # DALTON-HOOK(dalton-tools): Tools receive the server execution identity.
+    assert args["extra_configurable"] == {"automation_execution_id": _EXEC}
+    assert automation_delivery.DELIVERY_KEY not in args["extra_configurable"]
     assert args["run_metadata"] == {
         "automation_execution_id": _EXEC,
         "automation_id": "auto-1",
@@ -645,10 +648,14 @@ async def test_a_wait_that_outlasts_a_delivery_change_runs_with_the_new_one():
     assert [c.content for c in args["request"].additional_context] == [
         automation_delivery.reminder(_RESTARTED.targets)
     ]
+    # DALTON-HOOK(dalton-tools): A restarted held delivery retains its execution identity.
     assert args["extra_configurable"] == automation_delivery.turn_configurable(
         _RESTARTED
     )
     assert args["extra_configurable"]["automation_execution_id"] == f"{_EXEC}.2"
+    assert args["extra_configurable"][automation_delivery.DELIVERY_KEY]["targets"] == [
+        t.as_dict() for t in _RESTARTED.targets
+    ]
     assert args["run_metadata"] == {
         "automation_execution_id": _EXEC,
         "automation_id": "auto-1",
@@ -689,7 +696,8 @@ async def test_a_delivery_taken_off_during_the_wait_ends_nothing_with_the_servic
 
     args = _turn_args(fx)
     assert args["request"].additional_context is None
-    assert args["extra_configurable"] is None
+    # DALTON-HOOK(dalton-tools): Tools receive the server execution identity.
+    assert args["extra_configurable"] == {"automation_execution_id": _EXEC}
     assert _settled(fx)["to"] == "failed"
     dx.finish.assert_not_awaited()
 

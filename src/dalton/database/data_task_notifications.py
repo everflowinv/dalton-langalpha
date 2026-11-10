@@ -27,6 +27,7 @@ from src.dalton.data_jobs.container_runner import (
 from src.dalton.data_jobs.notification_payloads import (
     DataTaskArtifactError,
     DataTaskArtifactNotFoundError,
+    DataTaskDeliveryItem,
     DataTaskNotificationError,
     ResolvedDataTaskPlan,
     ValidatedArtifactBytes,
@@ -74,6 +75,7 @@ class AuthorizedDataTaskTarget:
     canonical_target_address: str = ""
     recipient_id: str = ""
     plan: ResolvedDataTaskPlan | None = None
+    create_outer_row: bool = True
 
 
 def build_data_task_item_delivery_key(
@@ -209,6 +211,168 @@ async def _target_matches_effective_routes(
     return False
 
 
+def _report_resolver_kwargs(
+    *,
+    resolve_enabled_fn: Callable[[str | None], Awaitable[bool]] | None = None,
+    resolve_overrides_fn: Callable[[str | None], Awaitable[dict[str, bool]]] | None = None,
+    resolve_targets_fn: Callable[[str | None], Awaitable[list[str]]] | None = None,
+    resolve_routes_fn: Callable[[str | None], Awaitable[dict[str, list[str]]]] | None = None,
+    is_admin_fn: Callable[[str | None], Awaitable[bool]] | None = None,
+) -> dict[str, Any]:
+    """Forward only resolvers the caller supplied. Production uses the real ones."""
+    kwargs: dict[str, Any] = {}
+    if resolve_enabled_fn is not None:
+        kwargs["resolve_enabled_fn"] = resolve_enabled_fn
+    if resolve_overrides_fn is not None:
+        kwargs["resolve_overrides_fn"] = resolve_overrides_fn
+    if resolve_targets_fn is not None:
+        kwargs["resolve_targets_fn"] = resolve_targets_fn
+    if resolve_routes_fn is not None:
+        kwargs["resolve_routes_fn"] = resolve_routes_fn
+    if is_admin_fn is not None:
+        kwargs["is_admin_fn"] = is_admin_fn
+    return kwargs
+
+
+def _resolved_plan_from_report_items(
+    *,
+    run_id: str,
+    job_key: str,
+    items: Sequence[Any],
+) -> ResolvedDataTaskPlan | None:
+    """Build an in-memory native plan from saved report items. No artifact files."""
+    built: list[DataTaskDeliveryItem] = []
+    for raw in items:
+        if not isinstance(raw, Mapping):
+            return None
+        kind = str(raw.get("kind") or "")
+        try:
+            index = int(raw.get("item_index"))
+        except (TypeError, ValueError):
+            return None
+        if isinstance(raw.get("item_index"), bool):
+            return None
+        if kind == "feishu_card":
+            card = raw.get("card")
+            images = raw.get("images")
+            if not isinstance(card, Mapping) or images not in (None, [], ()):
+                return None
+            if raw.get("artifact") not in (None, {}, []):
+                return None
+            built.append(
+                DataTaskDeliveryItem(
+                    item_index=index,
+                    kind="feishu_card",
+                    card=dict(card),
+                    images=(),
+                    artifact=None,
+                )
+            )
+        elif kind == "text":
+            text = raw.get("text")
+            if not isinstance(text, str) or not text or raw.get("artifact") not in (None, {}, []):
+                return None
+            built.append(
+                DataTaskDeliveryItem(
+                    item_index=index,
+                    kind="text",
+                    text=text,
+                )
+            )
+        else:
+            return None
+    if not built:
+        return None
+    return ResolvedDataTaskPlan(
+        run_id=run_id,
+        job_key=job_key,
+        items=tuple(built),
+        artifacts_by_id={},
+    )
+
+
+def _authorized_target_from_report(decision: Mapping[str, Any]) -> AuthorizedDataTaskTarget:
+    """Map a saved-report decision onto the existing plan target. Never a data run."""
+    if not decision.get("allowed"):
+        return AuthorizedDataTaskTarget(
+            allowed=False,
+            deny_status=str(decision.get("deny_status") or "failed"),
+            deny_code=str(decision.get("deny_code") or "not_allowed"),
+            deny_message=str(decision.get("deny_message") or ""),
+            create_outer_row=False,
+        )
+    plan = _resolved_plan_from_report_items(
+        run_id=str(decision.get("run_id") or ""),
+        job_key=str(decision.get("job_key") or ""),
+        items=decision.get("items") or [],
+    )
+    if plan is None or not plan.run_id or not plan.job_key:
+        return AuthorizedDataTaskTarget(
+            allowed=False,
+            deny_status="failed",
+            deny_code="payload_invalid",
+            deny_message="Saved report body is not a native card batch or failure text.",
+            create_outer_row=False,
+        )
+    owner_platform_user_id = decision.get("owner_platform_user_id")
+    if owner_platform_user_id is not None:
+        owner_platform_user_id = str(owner_platform_user_id)
+    return AuthorizedDataTaskTarget(
+        allowed=True,
+        run_id=plan.run_id,
+        job_key=plan.job_key,
+        owner_user_id=str(decision.get("owner_user_id") or ""),
+        owner_platform_user_id=owner_platform_user_id,
+        platform=str(decision.get("platform") or ""),
+        target_kind=str(decision.get("target_kind") or ""),
+        requested_target=str(decision.get("requested_target") or ""),
+        canonical_target_address=str(decision.get("canonical_target_address") or ""),
+        recipient_id=str(decision.get("recipient_id") or ""),
+        plan=plan,
+        create_outer_row=False,
+    )
+
+
+async def _authorize_saved_report_in_tx(
+    cur: Any,
+    conn: Any,
+    *,
+    execution_id: str,
+    target: str,
+    resolve_enabled_fn: Callable[[str | None], Awaitable[bool]] | None = None,
+    resolve_overrides_fn: Callable[[str | None], Awaitable[dict[str, bool]]] | None = None,
+    resolve_targets_fn: Callable[[str | None], Awaitable[list[str]]] | None = None,
+    resolve_routes_fn: Callable[[str | None], Awaitable[dict[str, list[str]]]] | None = None,
+    is_admin_fn: Callable[[str | None], Awaitable[bool]] | None = None,
+) -> AuthorizedDataTaskTarget | None:
+    """Return a report decision, or None when this execution saved no report."""
+    from src.dalton.database.automation_reports import authorize_saved_report_target
+
+    decision = await authorize_saved_report_target(
+        cur,
+        conn,
+        execution_id=execution_id,
+        target=target,
+        **_report_resolver_kwargs(
+            resolve_enabled_fn=resolve_enabled_fn,
+            resolve_overrides_fn=resolve_overrides_fn,
+            resolve_targets_fn=resolve_targets_fn,
+            resolve_routes_fn=resolve_routes_fn,
+            is_admin_fn=is_admin_fn,
+        ),
+    )
+    if str(decision.get("scope") or "") != "report":
+        return None
+    return _authorized_target_from_report(decision)
+
+
+async def _lock_saved_report_before_outer_identity(cur: Any, run_id: str) -> None:
+    """Share-lock the task before the outer-identity lock when a report was saved."""
+    from src.dalton.database.automation_reports import lock_saved_report_automation
+
+    await lock_saved_report_automation(cur, run_id)
+
+
 async def _authorize_run_and_target_in_tx(
     cur: Any,
     conn: Any,
@@ -217,6 +381,11 @@ async def _authorize_run_and_target_in_tx(
     target: str,
     path_map: DataTaskPathMap | None = None,
     require_plan: bool = True,
+    resolve_enabled_fn: Callable[[str | None], Awaitable[bool]] | None = None,
+    resolve_overrides_fn: Callable[[str | None], Awaitable[dict[str, bool]]] | None = None,
+    resolve_targets_fn: Callable[[str | None], Awaitable[list[str]]] | None = None,
+    resolve_routes_fn: Callable[[str | None], Awaitable[dict[str, list[str]]]] | None = None,
+    is_admin_fn: Callable[[str | None], Awaitable[bool]] | None = None,
 ) -> AuthorizedDataTaskTarget:
     if not get_dalton_settings().enabled:
         return AuthorizedDataTaskTarget(
@@ -246,6 +415,20 @@ async def _authorize_run_and_target_in_tx(
             deny_message="Target format or platform is not allowed for data-task notifications.",
         )
     platform, target_kind, raw_ident = parsed_target
+
+    report_auth = await _authorize_saved_report_in_tx(
+        cur,
+        conn,
+        execution_id=norm_run_id,
+        target=cleaned_target,
+        resolve_enabled_fn=resolve_enabled_fn,
+        resolve_overrides_fn=resolve_overrides_fn,
+        resolve_targets_fn=resolve_targets_fn,
+        resolve_routes_fn=resolve_routes_fn,
+        is_admin_fn=is_admin_fn,
+    )
+    if report_auth is not None:
+        return report_auth
 
     await cur.execute(
         """
@@ -595,6 +778,18 @@ def _is_candidate_outer_delivery_row(
 ) -> bool:
     """Return True when `row` in `dalton_notify_deliveries` represents the same logical target."""
     row_target = str(row.get("target") or "").strip()
+    row_payload = row.get("payload_json")
+    if isinstance(row_payload, str):
+        try:
+            parsed_payload = json.loads(row_payload)
+        except ValueError:
+            parsed_payload = None
+        row_payload = parsed_payload
+    if (
+        isinstance(row_payload, Mapping)
+        and str(row_payload.get("source") or "") == "automation_report"
+    ):
+        return row_target == requested_target.strip()
     if row_target in (requested_target.strip(), canonical_target_address.strip()):
         return True
 
@@ -653,6 +848,7 @@ async def _persist_reconcile_identity_on_outer_delivery(
     owner_user_id: str = "",
     target_kind: str = "",
     raw_ident: str = "",
+    create_missing: bool = True,
 ) -> OuterIdentityEnforcementResult:
     """Atomically verify and stamp original recipient and ordered item keys on `dalton_notify_deliveries`."""
     cleaned_recipient = str(recipient_id or "").strip()
@@ -745,6 +941,12 @@ async def _persist_reconcile_identity_on_outer_delivery(
     ]
 
     if not candidate_rows:
+        if not create_missing:
+            return OuterIdentityEnforcementResult(
+                ok=False,
+                code="outer_delivery_missing",
+                message="Saved report delivery row is not present for this target.",
+            )
         eff_job_key = str(job_key or "").strip()
         eff_owner_uid = str(owner_user_id or "").strip()
         if not eff_owner_uid:
@@ -895,11 +1097,17 @@ async def authorize_data_task_notification_plan(
     target: str,
     path_map: DataTaskPathMap | None = None,
     conn: Any = None,
+    resolve_enabled_fn: Callable[[str | None], Awaitable[bool]] | None = None,
+    resolve_overrides_fn: Callable[[str | None], Awaitable[dict[str, bool]]] | None = None,
+    resolve_targets_fn: Callable[[str | None], Awaitable[list[str]]] | None = None,
+    resolve_routes_fn: Callable[[str | None], Awaitable[dict[str, list[str]]]] | None = None,
+    is_admin_fn: Callable[[str | None], Awaitable[bool]] | None = None,
 ) -> dict[str, Any]:
     """Authorize ``(run_id, target)`` and return the validated, redacted delivery plan."""
     async with get_db_connection(conn) as owned_conn:
         async with owned_conn.transaction():
             async with owned_conn.cursor(row_factory=dict_row) as cur:
+                await _lock_saved_report_before_outer_identity(cur, run_id)
                 await _acquire_outer_identity_xact_lock(cur, run_id=run_id, target=target)
                 auth = await _authorize_run_and_target_in_tx(
                     cur,
@@ -908,6 +1116,11 @@ async def authorize_data_task_notification_plan(
                     target=target,
                     path_map=path_map,
                     require_plan=True,
+                    resolve_enabled_fn=resolve_enabled_fn,
+                    resolve_overrides_fn=resolve_overrides_fn,
+                    resolve_targets_fn=resolve_targets_fn,
+                    resolve_routes_fn=resolve_routes_fn,
+                    is_admin_fn=is_admin_fn,
                 )
                 if not auth.allowed or auth.plan is None:
                     return {
@@ -937,6 +1150,7 @@ async def authorize_data_task_notification_plan(
                     canonical_target_address=auth.canonical_target_address,
                     recipient_id=auth.recipient_id,
                     delivery_keys=delivery_keys,
+                    create_missing=auth.create_outer_row,
                 )
                 if not identity_outcome.ok:
                     return {
@@ -992,6 +1206,11 @@ async def authorize_and_claim_data_task_delivery(
     total_chunks: int = 0,
     path_map: DataTaskPathMap | None = None,
     conn: Any = None,
+    resolve_enabled_fn: Callable[[str | None], Awaitable[bool]] | None = None,
+    resolve_overrides_fn: Callable[[str | None], Awaitable[dict[str, bool]]] | None = None,
+    resolve_targets_fn: Callable[[str | None], Awaitable[list[str]]] | None = None,
+    resolve_routes_fn: Callable[[str | None], Awaitable[dict[str, list[str]]]] | None = None,
+    is_admin_fn: Callable[[str | None], Awaitable[bool]] | None = None,
 ) -> dict[str, Any]:
     """I-6 ``kind='data_task'`` path: serialize, check idempotency, re-authorize, and claim ``in_flight``."""
     cleaned_key = str(delivery_key or "").strip()
@@ -1008,6 +1227,7 @@ async def authorize_and_claim_data_task_delivery(
     async with get_db_connection(conn) as owned_conn:
         async with owned_conn.transaction():
             async with owned_conn.cursor(row_factory=dict_row) as cur:
+                await _lock_saved_report_before_outer_identity(cur, cleaned_rid)
                 await _acquire_outer_identity_xact_lock(
                     cur,
                     run_id=cleaned_rid,
@@ -1055,6 +1275,11 @@ async def authorize_and_claim_data_task_delivery(
                     target=cleaned_target,
                     path_map=path_map,
                     require_plan=True,
+                    resolve_enabled_fn=resolve_enabled_fn,
+                    resolve_overrides_fn=resolve_overrides_fn,
+                    resolve_targets_fn=resolve_targets_fn,
+                    resolve_routes_fn=resolve_routes_fn,
+                    is_admin_fn=is_admin_fn,
                 )
                 if not auth.allowed or auth.plan is None:
                     return {
@@ -1093,6 +1318,7 @@ async def authorize_and_claim_data_task_delivery(
                     canonical_target_address=auth.canonical_target_address,
                     recipient_id=auth.recipient_id,
                     delivery_keys=ordered_expected_keys,
+                    create_missing=auth.create_outer_row,
                 )
                 if not identity_outcome.ok:
                     return {
@@ -1538,8 +1764,9 @@ async def reconcile_single_data_task_delivery_row(
 
     Read-only unless all expected items for the original persisted recipient identity are
     durably `sent` in `dalton_channel_deliveries`, in which case it atomically transitions
-    the outer row to `status = 'sent', error_code = NULL` and converges the run's
-    `notify_status` to `'dispatched'`.
+    the outer row to `status = 'sent', error_code = NULL`. A data-task payload then
+    converges that run's `notify_status` to `'dispatched'`. A saved automation report
+    does not update `dalton_data_task_runs`.
     """
     raw_exec_id = str(row.get("execution_id") or "").strip()
     owner_user_id = str(row.get("user_id") or "").strip()
@@ -1702,28 +1929,33 @@ async def reconcile_single_data_task_delivery_row(
                         )
                     if isinstance(tx_cur.rowcount, int) and tx_cur.rowcount > 0:
                         updated_outer = True
-                        await tx_cur.execute(
-                            """
-                            UPDATE dalton_data_task_runs r
-                            SET notify_status = 'dispatched',
-                                updated_at = NOW()
-                            WHERE r.run_id = %s::uuid
-                              AND r.notify_status = 'pending_dispatch'
-                              AND EXISTS (
-                                  SELECT 1
-                                  FROM dalton_notify_deliveries d
-                                  WHERE d.execution_id = %s
-                                    AND d.status = 'sent'
-                              )
-                              AND NOT EXISTS (
-                                  SELECT 1
-                                  FROM dalton_notify_deliveries d
-                                  WHERE d.execution_id = %s
-                                    AND d.status NOT IN ('sent', 'skipped')
-                              )
-                            """,
-                            (norm_run_id, raw_exec_id, raw_exec_id),
+                        from src.dalton.database.automation_reports import (
+                            is_automation_report_payload,
                         )
+
+                        if not is_automation_report_payload(payload):
+                            await tx_cur.execute(
+                                """
+                                UPDATE dalton_data_task_runs r
+                                SET notify_status = 'dispatched',
+                                    updated_at = NOW()
+                                WHERE r.run_id = %s::uuid
+                                  AND r.notify_status = 'pending_dispatch'
+                                  AND EXISTS (
+                                      SELECT 1
+                                      FROM dalton_notify_deliveries d
+                                      WHERE d.execution_id = %s
+                                        AND d.status = 'sent'
+                                  )
+                                  AND NOT EXISTS (
+                                      SELECT 1
+                                      FROM dalton_notify_deliveries d
+                                      WHERE d.execution_id = %s
+                                        AND d.status NOT IN ('sent', 'skipped')
+                                  )
+                                """,
+                                (norm_run_id, raw_exec_id, raw_exec_id),
+                            )
 
             if updated_outer:
                 if mark_delivery_fn is not None:
@@ -1764,8 +1996,9 @@ async def reconcile_uncertain_data_task_deliveries(
 
     Remains active even after `attempt_count >= max_attempts` (including `pending` rows with
     `error_code IS NULL` or an uncertain code, and `failed` rows with `error_code = 'attempts_exhausted'`).
-    Never authorizes a claim, never invokes platform/gateway sends, never resets unknown items,
-    and never increments `attempt_count`. Marks the outer row `sent` iff all expected items for
+    Saved automation reports use the same scan. Never authorizes a claim, never invokes
+    platform/gateway sends, never resets unknown items, and never increments `attempt_count`.
+    Marks the outer row `sent` iff all expected items for
     the exact original `(run_id, owner_user_id, platform, canonical_target_address, recipient_id)`
     are durably `sent`.
     """
@@ -1801,6 +2034,7 @@ async def reconcile_uncertain_data_task_deliveries(
                       AND (
                           d.automation_id LIKE 'data:%%'
                           OR (d.payload_json ->> 'route_key') LIKE 'data:%%'
+                          OR COALESCE(d.payload_json ->> 'source', '') = 'automation_report'
                       )
                     ORDER BY
                         (
