@@ -19,13 +19,21 @@ import {
   steeringDeliveredEntries,
 } from '@/pages/ChatAgent/session/stream/steeringDelivery';
 import {
+  createStreamEventProcessor,
+  type StreamRouterDeps,
+} from '@/pages/ChatAgent/session/stream/processStreamEvent';
+import type { StreamRuntime } from '@/pages/ChatAgent/session/runtime';
+import { createAssistantMessage } from '@/pages/ChatAgent/hooks/utils/messageHelpers';
+import { createRequestKeyTracker } from '@/pages/ChatAgent/hooks/utils/requestKey';
+import { createSubagentHistoryStore } from '@/pages/ChatAgent/session/subagents/historyStore';
+import {
   handleHistorySteeringDelivered,
   handleHistorySteeringReturned,
   handleHistoryUserMessage,
 } from '@/pages/ChatAgent/session/history/historyHandlers';
 import type { ChatMessage, UserMessage } from '@/types/chat';
 import type { MessageRecord, SetMessages } from '@/pages/ChatAgent/hooks/utils/types';
-import type { PairState } from '@/pages/ChatAgent/session/types';
+import type { PairState, StreamProcessorRefs } from '@/pages/ChatAgent/session/types';
 
 const {
   apiPostMock,
@@ -895,7 +903,8 @@ describe('ChatInput large file uploads (up to 200 MiB)', () => {
       'pdf',
     ]);
 
-    // 2. Permanent steer attachment failure surfaces live on the optimistic bubble idempotently
+    // 2. Permanent steer attachment failure lacking turn_index surfaces live via createStreamEventProcessor
+    const assistantBubble = createAssistantMessage('assistant-turn-2', 2);
     const optimisticSteer: UserMessage = {
       id: 'user-optimistic-failed-steer',
       role: 'user',
@@ -905,9 +914,10 @@ describe('ChatInput large file uploads (up to 200 MiB)', () => {
       isStreaming: false,
       steering: true,
       requestKey: 'req-failed-steer-1',
-      turnIndex: 0,
+      turnIndex: 2,
     };
     const failedEvent = {
+      event: 'steering_returned' as const,
       reason: 'attachment_failed',
       error: 'Attachment has expired or was removed',
       error_code: 'http_410',
@@ -918,9 +928,104 @@ describe('ChatInput large file uploads (up to 200 MiB)', () => {
       job_id: 'job-failed-1',
     };
 
-    const afterLiveFail1 = foldFailedSteer([optimisticSteer], failedEvent, 0);
-    expect(afterLiveFail1).toHaveLength(1);
-    expect(afterLiveFail1[0]).toMatchObject({
+    let liveMessages: ChatMessage[] = [assistantBubble, optimisticSteer];
+    let capturedMessageError: unknown = null;
+    const requestKeyTracker = createRequestKeyTracker();
+    requestKeyTracker.take('send|thread-1|Use retired attachment', {
+      alongside: true,
+      key: 'req-failed-steer-1',
+    });
+
+    const streamRuntime: StreamRuntime = {
+      workspaceId: 'ws-1',
+      threadId: 'thread-1',
+      t: (key: string) => key,
+      updateSubagentCard: null,
+      onWorkspaceCreated: null,
+      onFileArtifact: null,
+      onPreviewUrl: null,
+      setMessages: (updater) => {
+        liveMessages = typeof updater === 'function' ? updater(liveMessages) : updater;
+      },
+      queueMessages: (updater) => {
+        liveMessages = updater(liveMessages);
+      },
+      flushMessages: () => {},
+      setIsLoading: vi.fn(),
+      setPendingInterrupt: vi.fn(),
+      setTokenUsage: vi.fn(),
+      setNextSummary: vi.fn(),
+      setMessageError: (updater) => {
+        capturedMessageError = typeof updater === 'function'
+          ? updater(capturedMessageError as string | null)
+          : updater;
+      },
+      setIsCompacting: vi.fn(),
+      setCompactionTokens: vi.fn(),
+      setFallbackSuggestion: vi.fn(),
+      setThreadId: vi.fn(),
+      setWorkspaceStarting: vi.fn(),
+      setTurnHeld: vi.fn(),
+      contentOrderCounterRef: { current: 0 },
+      currentReasoningIdRef: { current: null },
+      currentToolCallIdRef: { current: null },
+      currentMessageRef: { current: 'assistant-turn-2' },
+      currentRunIdRef: { current: 'run-turn-2' },
+      latestRunIdRef: { current: 'run-turn-2' },
+      latestRunEpochRef: { current: 1 },
+      steeringAtOrderRef: { current: null },
+      pendingPTCBackfillRef: { current: new Map() },
+      threadIdRef: { current: 'thread-1' },
+      lastEventIdRef: { current: null },
+      pendingInterruptIdsRef: { current: new Set() },
+      renderedInterruptIdsRef: { current: new Set() },
+      unresolvedHistoryInterruptRef: { current: [] },
+      terminalTaskOutcomesRef: { current: new Map() },
+      subagentHistory: createSubagentHistoryStore(),
+      subagentTokenUsageRef: { current: {} },
+      requestKeyRef: { current: requestKeyTracker },
+      offloadBatchRef: { current: { args: 0, reads: 0, timer: null } },
+      nextSummaryOwedRef: { current: false },
+    };
+
+    const routerDeps: StreamRouterDeps = {
+      applyFallbackSuggestion: vi.fn(),
+      applyModelStatus: vi.fn(),
+      clearModelStatus: vi.fn(),
+      insertNotification: vi.fn(),
+      releaseStreamOwnership: vi.fn(),
+      attachSubagentMux: vi.fn(),
+      setMarketWatch: vi.fn(),
+      refreshMarketWatch: vi.fn(),
+      refreshWakeups: vi.fn(),
+      refreshCommands: vi.fn(),
+      refreshWorkspaceFolder: null,
+      armReportBack: vi.fn(),
+      refreshWorkspaces: vi.fn(),
+      refreshClaudeCode: vi.fn(),
+    };
+
+    const processorRefs: StreamProcessorRefs = {
+      contentOrderCounterRef: streamRuntime.contentOrderCounterRef,
+      currentReasoningIdRef: streamRuntime.currentReasoningIdRef,
+      currentToolCallIdRef: streamRuntime.currentToolCallIdRef,
+      steeringAtOrderRef: streamRuntime.steeringAtOrderRef,
+    };
+
+    const processor = createStreamEventProcessor(
+      streamRuntime,
+      routerDeps,
+      'assistant-turn-2',
+      processorRefs,
+      () => null,
+    );
+
+    processor(failedEvent);
+    expect(capturedMessageError).toBe('Attachment has expired or was removed');
+
+    const liveFailedUsers1 = liveMessages.filter((m): m is UserMessage => m.role === 'user');
+    expect(liveFailedUsers1).toHaveLength(1);
+    expect(liveFailedUsers1[0]).toMatchObject({
       id: 'user-optimistic-failed-steer',
       role: 'user',
       content: 'Use retired attachment',
@@ -929,15 +1034,18 @@ describe('ChatInput large file uploads (up to 200 MiB)', () => {
       queueRefused: true,
       queueError: 'Attachment has expired or was removed',
       requestKey: 'req-failed-steer-1',
+      turnIndex: 2,
       attachments: [mixedAttachments[0]],
     });
 
     // Repeated live failure handling does not duplicate the bubble
-    const afterLiveFail2 = foldFailedSteer(afterLiveFail1, failedEvent, 0);
-    expect(afterLiveFail2).toHaveLength(1);
+    processor(failedEvent);
+    const liveFailedUsers2 = liveMessages.filter((m): m is UserMessage => m.role === 'user');
+    expect(liveFailedUsers2).toHaveLength(1);
+    expect(foldFailedSteer(liveFailedUsers2, failedEvent, 2)).toHaveLength(1);
 
     // 3. History reload replaces the live bubble and stays idempotent across repeated reloads
-    let historyMessages: MessageRecord[] = [...(afterLiveFail2 as unknown as MessageRecord[])];
+    let historyMessages: MessageRecord[] = [...(liveMessages as unknown as MessageRecord[])];
     const setMessages: SetMessages = (updater) => {
       historyMessages = typeof updater === 'function' ? updater(historyMessages) : updater;
     };
@@ -946,17 +1054,19 @@ describe('ChatInput large file uploads (up to 200 MiB)', () => {
 
     handleHistorySteeringReturned({
       event: failedEvent,
-      pairIndex: 0,
+      pairIndex: 2,
       refs: { newMessagesStartIndexRef },
       setMessages,
       onCopySettled: (key) => settledKeys.push(key),
     });
 
     expect(settledKeys).toEqual(['req-failed-steer-1']);
-    expect(historyMessages).toHaveLength(1);
-    expect(historyMessages[0]).toMatchObject({
-      id: 'history-steering-failed-0-req-failed-steer-1',
+    const historyFailedUsers1 = historyMessages.filter((m) => m.role === 'user');
+    expect(historyFailedUsers1).toHaveLength(1);
+    expect(historyFailedUsers1[0]).toMatchObject({
+      id: 'history-steering-failed-2-req-failed-steer-1',
       role: 'user',
+      content: 'Use retired attachment',
       isHistory: true,
       steering: false,
       steeringDelivered: false,
@@ -969,10 +1079,10 @@ describe('ChatInput large file uploads (up to 200 MiB)', () => {
     // Second reload with the same replayed event never duplicates the failed bubble
     handleHistorySteeringReturned({
       event: failedEvent,
-      pairIndex: 0,
+      pairIndex: 2,
       refs: { newMessagesStartIndexRef },
       setMessages,
     });
-    expect(historyMessages).toHaveLength(1);
+    expect(historyMessages.filter((m) => m.role === 'user')).toHaveLength(1);
   });
 });

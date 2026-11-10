@@ -40,6 +40,8 @@ from src.server.utils.api import get_current_user_id
 
 _REAL_COMPUTE_STORED_OBJECT_DIGEST = chat_upload_storage.compute_stored_object_digest
 _REAL_COMPLETE_MULTIPART_UPLOAD = chat_upload_storage.complete_multipart_upload
+_REAL_UPLOAD_PART_BYTES = chat_upload_storage.upload_part_bytes
+_REAL_PULL_DIRECT = svc.pull_direct
 
 
 # ---------------------------------------------------------------------------
@@ -2761,19 +2763,19 @@ async def test_ready_unused_uploads_count_toward_quota_until_cancelled_swept_or_
 
 
 # ---------------------------------------------------------------------------
-# 8. Round 9 regressions: mixed steer staging, provisional release isolation,
-#    live part permission rechecks, durable steer failure, and disk budget
+# 8. Mixed steer staging, provisional release isolation, live part permission
+#    rechecks, durable steer failure replay, and disk budget
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_r9_mixed_attachments_in_steers_ordered_staging_and_partial_failure_rollback(
+async def test_mixed_attachments_in_steers_ordered_staging_and_partial_failure_rollback(
     upload_env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """stage_request_attachments_for_steer persists mixed 200 MiB + inline PNG/PDF batches
     in exact order, supports inline-only and file-only batches, and rolls back newly staged
     inline blobs if any item or admission fails."""
-    user_id = "user-r9-mixed"
+    user_id = "user-mixed-steer"
     ws_id = str(uuid.uuid4())
     upload_env["workspaces"][ws_id] = {
         "workspace_id": ws_id,
@@ -2840,20 +2842,52 @@ async def test_r9_mixed_attachments_in_steers_ordered_staging_and_partial_failur
     with patch.object(
         chat_upload_storage,
         "upload_part_bytes",
-        create_autospec(chat_upload_storage.upload_part_bytes, side_effect=_fail_on_second_inline),
+        create_autospec(_REAL_UPLOAD_PART_BYTES, side_effect=_fail_on_second_inline),
     ):
         with pytest.raises(HTTPException) as stage_fail_exc:
             await svc.stage_request_attachments_for_steer(
                 mixed_batch,
                 user_id=user_id,
                 workspace_id=ws_id,
-                claim_key="req:r9-stage-fail",
+                claim_key="req:stage-fail",
             )
         assert stage_fail_exc.value.status_code == 503
 
-    # Caller's pre-existing upload stays ready; zero newly staged inline blobs remain in storage
+    # Caller's pre-existing upload stays ready; zero newly staged inline blobs or open uploads remain
     assert upload_env["ledger"].rows[uid_file]["state"] == "ready"
     assert len(upload_env["store"].objects) == 1
+    assert upload_env["store"].open_uploads == {}
+    for row_uid, row_val in upload_env["ledger"].rows.items():
+        if row_uid == uid_file:
+            continue
+        assert row_val["state"] in ("aborted", "failed")
+        assert row_val["cleaned_at"] is not None
+        assert row_val["claim_token"] is None
+        assert row_val["lease_until"] is None
+
+    # Post-claim verification failure inside _stage_single_inline_attachment marks failed and cleans up
+    with patch.object(
+        chat_upload_storage,
+        "compute_stored_object_digest",
+        create_autospec(_REAL_COMPUTE_STORED_OBJECT_DIGEST, return_value=None),
+    ):
+        with pytest.raises(HTTPException) as verify_fail_exc:
+            await svc.stage_request_attachments_for_steer(
+                [MultimodalContext(type="image", data=png_url, description="verify_fail.png")],
+                user_id=user_id,
+                workspace_id=ws_id,
+                claim_key="req:verify-fail",
+            )
+        assert verify_fail_exc.value.status_code == 503
+    assert len(upload_env["store"].objects) == 1
+    assert upload_env["store"].open_uploads == {}
+    for row_uid, row_val in upload_env["ledger"].rows.items():
+        if row_uid == uid_file:
+            continue
+        assert row_val["state"] in ("aborted", "failed")
+        assert row_val["cleaned_at"] is not None
+        assert row_val["claim_token"] is None
+        assert row_val["lease_until"] is None
 
     # 2. Full mixed staging succeeds in exact order [dataset_200m.parquet, chart_q4.png, summary_memo.pdf]
     claim_mixed = svc.chat_upload_claim_key(
@@ -2917,12 +2951,12 @@ async def test_r9_mixed_attachments_in_steers_ordered_staging_and_partial_failur
 
 
 @pytest.mark.asyncio
-async def test_r9_provisional_release_never_confirms_unrelated_uploads_on_same_request_key(
+async def test_provisional_release_never_confirms_unrelated_uploads_on_same_request_key(
     upload_env,
 ) -> None:
     """Duplicate/concurrent requests sharing request_key with different uploads must never
     confirm the rejected upload set on release_provisional_claims."""
-    user_id = "user-r9-dup-claim"
+    user_id = "user-dup-claim"
     ws_id = str(uuid.uuid4())
     upload_env["workspaces"][ws_id] = {
         "workspace_id": ws_id,
@@ -2997,13 +3031,13 @@ async def test_r9_provisional_release_never_confirms_unrelated_uploads_on_same_r
 
 
 @pytest.mark.asyncio
-async def test_r9_part_upload_rechecks_live_workspace_write_permission_before_slot_and_mid_stream(
+async def test_part_upload_rechecks_live_workspace_write_permission_before_slot_and_mid_stream(
     upload_env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """receive_chat_upload_part rejects workspace write revocation before reading, after
     waiting on _PART_UPLOAD_SEMAPHORE, and mid-stream before MinIO upload_part_bytes."""
-    owner_id = "user-r9-ws-owner"
-    colleague_id = "user-r9-ws-colleague"
+    owner_id = "user-ws-owner"
+    colleague_id = "user-ws-colleague"
     ws_id = str(uuid.uuid4())
     upload_env["workspaces"][ws_id] = {
         "workspace_id": ws_id,
@@ -3096,14 +3130,14 @@ async def test_r9_part_upload_rechecks_live_workspace_write_permission_before_sl
 
 
 @pytest.mark.asyncio
-async def test_r9_materialize_charges_disk_only_for_missing_or_corrupt_files(
+async def test_materialize_charges_disk_only_for_missing_or_corrupt_files(
     upload_env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """materialize_chat_uploads skips disk charges and MinIO pulls when the exact SHA-verified
     file is already on disk, but charges disk and rejects when the file is missing or corrupt."""
     from src.server.services.computer_disk import CRITICAL_FREE_BYTES
 
-    user_id = "user-r9-disk"
+    user_id = "user-disk-budget"
     ws_id = str(uuid.uuid4())
     upload_env["workspaces"][ws_id] = {
         "workspace_id": ws_id,
@@ -3111,9 +3145,8 @@ async def test_r9_materialize_charges_disk_only_for_missing_or_corrupt_files(
         "status": "running",
     }
 
-    exact_200m = svc.MAX_CHAT_UPLOAD_BYTES
     uid = str(uuid.uuid4())
-    sample_bytes = b"verified-content-digest"
+    sample_bytes = b"verified-content-digest" * 1024
     sha_hex = hashlib.sha256(sample_bytes).hexdigest()
     obj_key = chat_upload_storage.build_chat_upload_key(ws_id, uid, "big.bin")
     upload_env["store"].objects[obj_key] = sample_bytes
@@ -3197,11 +3230,10 @@ async def test_r9_materialize_charges_disk_only_for_missing_or_corrupt_files(
     assert len(notes_dup) == 2
     assert pull_calls == 1
     assert sandbox.files[abs_path] == sample_bytes
-    del exact_200m
 
 
 @pytest.mark.asyncio
-async def test_r9_replay_projects_table_sourced_steering_returned_for_failed_steers() -> None:
+async def test_replay_projects_table_sourced_steering_returned_for_failed_steers() -> None:
     """project_turn and stub_lines emit table-sourced steering_returned items for permanently
     failed main-thread steers and invalidate lines_key when failed_steers change."""
     from src.server.database.conversation.replay_rows import ThreadRows
@@ -3281,6 +3313,7 @@ async def test_r9_replay_projects_table_sourced_steering_returned_for_failed_ste
     inputs_without = Inputs.of(rows_without)
     inputs_with = Inputs.of(rows_with)
     anchor = TurnAnchor(
+        turn_ordinal=0,
         turn_index=0,
         input_checkpoint_id="cp-0",
         tail_checkpoint_id="cp-1",
@@ -3294,10 +3327,11 @@ async def test_r9_replay_projects_table_sourced_steering_returned_for_failed_ste
         anchor=anchor,
         messages=[],
         new_ui_records=[],
-        offload_events=[],
-        summarize_events=[],
     )
-    lane = run_lane.RunLane(None, tid, RunFacts.of([]))
+    from langgraph.checkpoint.memory import InMemorySaver
+    from src.server.services.history.reader import CheckpointHistoryReader
+
+    lane = run_lane.RunLane(CheckpointHistoryReader(InMemorySaver()), tid, RunFacts.of([]))
     projected_items, _ = project_turn(inputs_with, 0, turn_slice, resp_row, lane)
     returned_proj = [
         it for it in projected_items if it["event"] == "steering_returned"

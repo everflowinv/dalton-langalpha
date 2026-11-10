@@ -515,7 +515,6 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
     // DALTON-HOOK(chat-large-upload): surface permanently failed steer attachments live
     if (eventType === 'steering_returned' && !isSubagent) {
       if (event.reason === 'attachment_failed') {
-        const turn = event.turn_index ?? turnOf(rt.messagesRef.current, assistantMessageId);
         const errMsg = typeof event.error === 'string' && event.error.trim()
           ? event.error.trim()
           : 'Attachment could not be delivered.';
@@ -531,7 +530,10 @@ export const createStreamEventProcessor = (rt: StreamRuntime, deps: StreamRouter
         if (shownComments) {
           rt.requestKeyRef.current.returned(shownComments);
         }
-        rt.setMessages((prev) => foldFailedSteer(prev, event as Record<string, unknown>, turn));
+        rt.setMessages((prev) => {
+          const turn = event.turn_index ?? turnOf(prev, assistantMessageId);
+          return foldFailedSteer(prev, event as Record<string, unknown>, turn);
+        });
         rt.setMessageError(errMsg);
       }
       return;

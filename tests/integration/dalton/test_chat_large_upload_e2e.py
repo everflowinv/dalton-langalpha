@@ -3404,7 +3404,7 @@ class TestChatLargeUploadRealInfra:
                 await sandbox_2.cleanup()
 
     @pytest.mark.asyncio
-    async def test_r9_mixed_200mib_and_inline_steers_parked_promotion_and_partial_stage_cleanup(
+    async def test_mixed_200mib_and_inline_steers_parked_promotion_and_partial_stage_cleanup(
         self,
         chat_upload_infra,
         docker_ptc_sandbox: PTCSandbox,
@@ -3413,15 +3413,15 @@ class TestChatLargeUploadRealInfra:
         parked-steer turn promotion, and pre-acceptance rollback of staged inline blobs."""
         uid_tag = uuid4().hex[:8]
         user = await create_user(
-            user_id=f"u-r9-mixed-{uid_tag}",
-            email=f"r9-mixed-{uid_tag}@chat-upload-e2e.test",
+            user_id=f"u-mixed-{uid_tag}",
+            email=f"mixed-{uid_tag}@chat-upload-e2e.test",
             name="Mixed Steer Tester",
         )
         working_dir = os.environ.get("DOCKER_SANDBOX_WORK_DIR", "/home/workspace")
         comp = await create_computer(
             user["user_id"],
             kind="docker",
-            name=f"r9-mixed-comp-{uid_tag}",
+            name=f"mixed-comp-{uid_tag}",
             is_primary=True,
             status="stopped",
             root_dir=working_dir,
@@ -3465,7 +3465,7 @@ class TestChatLargeUploadRealInfra:
             filename="ledger_200m.bin",
             mime_type="application/octet-stream",
             total_bytes=_SIZE_200_MIB,
-            seed_tag=b"r9-mixed-200m",
+            seed_tag=b"mixed-200m",
             tracked_keys=chat_upload_infra.tracked_keys,
             tracked_multiparts=chat_upload_infra.tracked_multiparts,
         )
@@ -3491,7 +3491,7 @@ class TestChatLargeUploadRealInfra:
                 ChatRequest(
                     messages=[ChatMessage(role="user", content="Open live run")],
                     workspace_id=workspace_id,
-                    request_key=_rk(f"r9-mixed-open-{uid_tag}"),
+                    request_key=_rk(f"mixed-open-{uid_tag}"),
                 ),
                 scope=scope1,
                 thread_id=tid,
@@ -3552,13 +3552,13 @@ class TestChatLargeUploadRealInfra:
                         "Partial failure steer",
                         user["user_id"],
                         can_steer=True,
-                        request_key=_rk(f"r9-partial-fail-{uid_tag}"),
+                        request_key=_rk(f"partial-fail-{uid_tag}"),
                         workspace_id=workspace_id,
                         additional_context=mixed_ctx,
                     )
                 assert partial_exc.value.status_code == 503
 
-            # Caller's 200 MiB upload remains ready + intact, and zero orphan staged rows remain ready
+            # Caller's 200 MiB upload remains ready + intact, and zero orphan staged rows or leases remain
             row200_after_fail = await chat_uploads_db.get_upload(up200["upload_id"])
             assert row200_after_fail is not None and row200_after_fail["state"] == "ready"
             assert storage.object_size(key200) == _SIZE_200_MIB
@@ -3566,20 +3566,24 @@ class TestChatLargeUploadRealInfra:
                 async with conn.cursor() as cur:
                     await cur.execute(
                         """
-                        SELECT upload_id, state, cleaned_at, object_key
+                        SELECT upload_id, state, cleaned_at, lease_until, claim_token, object_key, store_upload_id
                         FROM dalton_chat_file_uploads
                         WHERE user_id = %s AND upload_id <> %s
                         """,
                         (user["user_id"], up200["upload_id"]),
                     )
                     staged_fail_rows = await cur.fetchall()
-            for _, st_val, cl_val, obj_k in staged_fail_rows:
+            assert len(staged_fail_rows) == 2
+            for _, st_val, cl_val, lease_val, tok_val, obj_k, mp_id in staged_fail_rows:
                 assert st_val in ("aborted", "failed")
                 assert cl_val is not None
+                assert lease_val is None
+                assert tok_val is None
                 assert storage.object_size(str(obj_k)) is None
+                assert (storage.list_uploaded_parts(str(obj_k), str(mp_id)) or []) == []
 
             # 2. Mixed 200 MiB + inline PNG + inline PDF live steer preserves exact order and zero base64 in DB
-            rk_mixed = _rk(f"r9-mixed-ok-{uid_tag}")
+            rk_mixed = _rk(f"mixed-ok-{uid_tag}")
             claim_mixed = chat_upload_claim_key(request_key=rk_mixed, run_id=str(uuid4()))
             await validate_and_claim_request_attachments(
                 mixed_ctx,
@@ -3619,8 +3623,8 @@ class TestChatLargeUploadRealInfra:
                 assert staged_row is not None and staged_row["used_at"] is not None
                 chat_upload_infra.tracked_keys.add(str(staged_row["object_key"]))
 
-            # 3. Small-only inline steer (no pre-uploaded chat_upload)
-            rk_small = _rk(f"r9-small-only-{uid_tag}")
+            # 3. Small-only inline steer (no pre-uploaded chat_upload) and file-only steer (empty text)
+            rk_small = _rk(f"small-only-{uid_tag}")
             ready_s, sse_s = await wait_or_steer(
                 LocalRunExecutor.get_instance(),
                 tid,
@@ -3641,13 +3645,34 @@ class TestChatLargeUploadRealInfra:
                 assert sr is not None
                 chat_upload_infra.tracked_keys.add(str(sr["object_key"]))
 
+            rk_file_only = _rk(f"file-only-{uid_tag}")
+            ready_fo, sse_fo = await wait_or_steer(
+                LocalRunExecutor.get_instance(),
+                tid,
+                "",
+                user["user_id"],
+                can_steer=True,
+                request_key=rk_file_only,
+                workspace_id=workspace_id,
+                additional_context=[
+                    {
+                        "type": "chat_upload",
+                        "upload_id": up200["upload_id"],
+                        "name": up200["filename"],
+                        "mime_type": up200["mime_type"],
+                        "size": _SIZE_200_MIB,
+                    }
+                ],
+            )
+            assert ready_fo is False and isinstance(sse_fo, str)
+
             with patch.object(
                 WorkspaceManager,
                 "get_instance",
                 create_autospec(WorkspaceManager.get_instance, return_value=wm_stub),
             ):
                 taken = await SteeredReportInbox().take(tid, run1_id)
-            assert len(taken) == 2
+            assert len(taken) == 3
             msg_live, delivered_live = _steering_message(
                 taken, run1_id, 1700000100.0
             )
@@ -3664,6 +3689,10 @@ class TestChatLargeUploadRealInfra:
             ]
             assert [a["name"] for a in delivered_live["messages"][1]["attachments"]] == [
                 "solo_shot.png"
+            ]
+            assert delivered_live["messages"][2]["content"] == ""
+            assert [a["name"] for a in delivered_live["messages"][2]["attachments"]] == [
+                "ledger_200m.bin"
             ]
 
             # Verify all 3 files from mixed steer exist in Docker sandbox with exact SHA-256
@@ -3698,7 +3727,7 @@ class TestChatLargeUploadRealInfra:
             ]
 
             # 4. Parked mixed steer promoted into its own turn via execute_steer
-            rk_parked = _rk(f"r9-parked-promo-{uid_tag}")
+            rk_parked = _rk(f"parked-promo-{uid_tag}")
             await wait_or_steer(
                 LocalRunExecutor.get_instance(),
                 tid,
@@ -3792,7 +3821,7 @@ class TestChatLargeUploadRealInfra:
         assert settled_parked["payload"].get("outcome") == "turn"
 
     @pytest.mark.asyncio
-    async def test_r9_duplicate_request_key_provisional_release_preserves_unused_expiry_and_quota(
+    async def test_duplicate_request_key_provisional_release_preserves_unused_expiry_and_quota(
         self,
         chat_upload_infra,
     ) -> None:
@@ -3801,8 +3830,8 @@ class TestChatLargeUploadRealInfra:
         counted toward quota while preserving accepted uploads across retries."""
         uid_tag = uuid4().hex[:8]
         user = await create_user(
-            user_id=f"u-r9-dup-{uid_tag}",
-            email=f"r9-dup-{uid_tag}@chat-upload-e2e.test",
+            user_id=f"u-dup-{uid_tag}",
+            email=f"dup-{uid_tag}@chat-upload-e2e.test",
             name="Duplicate Key Tester",
         )
         ws = await create_workspace(
@@ -3839,7 +3868,7 @@ class TestChatLargeUploadRealInfra:
 
         tid = str(uuid4())
         await create_thread(tid, workspace_id, "completed", user_id=user["user_id"])
-        shared_rk = _rk(f"r9-shared-rk-{uid_tag}")
+        shared_rk = _rk(f"shared-rk-{uid_tag}")
         run_win = str(uuid4())
         run_dup = str(uuid4())
 
@@ -3941,7 +3970,7 @@ class TestChatLargeUploadRealInfra:
         assert storage.object_size(key_rejected) is None
 
     @pytest.mark.asyncio
-    async def test_r9_part_upload_live_workspace_write_revocation_before_slot_and_mid_stream(
+    async def test_part_upload_live_workspace_write_revocation_before_slot_and_mid_stream(
         self,
         chat_upload_infra,
         monkeypatch: pytest.MonkeyPatch,
@@ -3952,13 +3981,13 @@ class TestChatLargeUploadRealInfra:
 
         uid_tag = uuid4().hex[:8]
         owner = await create_user(
-            user_id=f"u-r9-part-own-{uid_tag}",
-            email=f"r9-part-own-{uid_tag}@chat-upload-e2e.test",
+            user_id=f"u-part-own-{uid_tag}",
+            email=f"part-own-{uid_tag}@chat-upload-e2e.test",
             name="Part Owner",
         )
         colleague = await create_user(
-            user_id=f"u-r9-part-col-{uid_tag}",
-            email=f"r9-part-col-{uid_tag}@chat-upload-e2e.test",
+            user_id=f"u-part-col-{uid_tag}",
+            email=f"part-col-{uid_tag}@chat-upload-e2e.test",
             name="Part Colleague",
         )
         monkeypatch.setattr("src.config.settings.HOST_MODE", "oss")
@@ -4113,7 +4142,7 @@ class TestChatLargeUploadRealInfra:
             assert spy_upload_part.call_count == 1
 
     @pytest.mark.asyncio
-    async def test_r9_permanent_steer_attachment_failure_live_sse_and_replay_idempotency(
+    async def test_permanent_steer_attachment_failure_live_sse_and_replay_idempotency(
         self,
         chat_upload_infra,
     ) -> None:
@@ -4122,8 +4151,8 @@ class TestChatLargeUploadRealInfra:
         never reach model messages, and never revive retired files."""
         uid_tag = uuid4().hex[:8]
         user = await create_user(
-            user_id=f"u-r9-fail-{uid_tag}",
-            email=f"r9-fail-{uid_tag}@chat-upload-e2e.test",
+            user_id=f"u-fail-{uid_tag}",
+            email=f"fail-{uid_tag}@chat-upload-e2e.test",
             name="Failed Steer Replay Tester",
         )
         ws = await create_workspace(
@@ -4143,7 +4172,7 @@ class TestChatLargeUploadRealInfra:
             filename="deleted_mid_turn.csv",
             mime_type="text/csv",
             total_bytes=32 * 1024,
-            seed_tag=b"r9-fail-held",
+            seed_tag=b"fail-held",
             tracked_keys=chat_upload_infra.tracked_keys,
             tracked_multiparts=chat_upload_infra.tracked_multiparts,
         )
@@ -4154,22 +4183,22 @@ class TestChatLargeUploadRealInfra:
             filename="deleted_while_parked.csv",
             mime_type="text/csv",
             total_bytes=32 * 1024,
-            seed_tag=b"r9-fail-parked",
+            seed_tag=b"fail-parked",
             tracked_keys=chat_upload_infra.tracked_keys,
             tracked_multiparts=chat_upload_infra.tracked_multiparts,
         )
 
         run1_id = str(uuid4())
         scope1 = RunScope(user_id=user["user_id"], burst_slot_id=None)
-        rk_held = _rk(f"r9-held-fail-{uid_tag}")
-        rk_parked = _rk(f"r9-parked-fail-{uid_tag}")
+        rk_held = _rk(f"held-fail-{uid_tag}")
+        rk_parked = _rk(f"parked-fail-{uid_tag}")
 
         try:
             await begin_run(
                 ChatRequest(
                     messages=[ChatMessage(role="user", content="Turn 1 prompt")],
                     workspace_id=workspace_id,
-                    request_key=_rk(f"r9-fail-t1-{uid_tag}"),
+                    request_key=_rk(f"fail-t1-{uid_tag}"),
                 ),
                 scope=scope1,
                 thread_id=tid,
@@ -4277,7 +4306,7 @@ class TestChatLargeUploadRealInfra:
         assert [r["request_key"] for r in returned_2] == [rk_held, rk_parked]
 
     @pytest.mark.asyncio
-    async def test_r9_materialize_disk_budget_charges_only_missing_or_corrupt_files(
+    async def test_materialize_disk_budget_charges_only_missing_or_corrupt_files(
         self,
         chat_upload_infra,
         docker_ptc_sandbox: PTCSandbox,
@@ -4289,8 +4318,8 @@ class TestChatLargeUploadRealInfra:
 
         uid_tag = uuid4().hex[:8]
         user = await create_user(
-            user_id=f"u-r9-disk-{uid_tag}",
-            email=f"r9-disk-{uid_tag}@chat-upload-e2e.test",
+            user_id=f"u-disk-{uid_tag}",
+            email=f"disk-{uid_tag}@chat-upload-e2e.test",
             name="Disk Budget Tester",
         )
         ws = await create_workspace(
@@ -4310,7 +4339,7 @@ class TestChatLargeUploadRealInfra:
             filename="already_on_disk_200m.bin",
             mime_type="application/octet-stream",
             total_bytes=_SIZE_200_MIB,
-            seed_tag=b"r9-disk-200m",
+            seed_tag=b"disk-200m",
             tracked_keys=chat_upload_infra.tracked_keys,
             tracked_multiparts=chat_upload_infra.tracked_multiparts,
         )
@@ -4327,7 +4356,7 @@ class TestChatLargeUploadRealInfra:
             ctx200, user_id=user["user_id"], workspace_id=workspace_id
         )
 
-        # Step 1 (`ptc_run.py:829` equivalent): ensure_workspace_chat_uploads_present places 200 MiB on disk
+        # Step 1 (ensure_workspace_chat_uploads_present): places 200 MiB on disk
         ensured = await ensure_workspace_chat_uploads_present(
             workspace_id, docker_ptc_sandbox, project=project
         )

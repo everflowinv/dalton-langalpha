@@ -1328,7 +1328,7 @@ async def _stage_single_inline_attachment(
             )
         row_created = True
 
-        ordered_parts: list[dict[str, Any]] = []
+        ordered_parts: list[tuple[int, str]] = []
         for idx in range(part_count):
             part_num = idx + 1
             chunk = raw_bytes[idx * part_size : (idx + 1) * part_size]
@@ -1357,7 +1357,7 @@ async def _stage_single_inline_attachment(
                     status_code=503,
                     detail="Failed to record staged inline attachment part.",
                 )
-            ordered_parts.append({"part_number": part_num, "etag": etag})
+            ordered_parts.append((part_num, etag))
 
         claimed = await db.claim_complete(
             upload_id,
@@ -1419,9 +1419,8 @@ async def _stage_single_inline_attachment(
                 if claim_token:
                     failed_row = await db.mark_failed(
                         upload_id,
-                        error_code="stage_failed",
-                        error_detail="Inline attachment staging failed",
                         claim_token=claim_token,
+                        error="Inline attachment staging failed",
                     )
                     if failed_row is not None:
                         await _cleanup_storage_objects(
@@ -1437,7 +1436,7 @@ async def _stage_single_inline_attachment(
                 await asyncio.to_thread(
                     storage.abort_multipart_upload, object_key, store_upload_id
                 )
-                await asyncio.to_thread(storage.delete_stored_object, object_key)
+                await asyncio.to_thread(storage.delete_object, object_key)
         except Exception:
             logger.warning(
                 "Cleanup after failed inline steer staging failed for %s",

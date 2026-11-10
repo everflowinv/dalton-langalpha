@@ -35,6 +35,8 @@ export type SSEEventType =
   | 'model_retry'
   | 'model_fallback'
   | 'steering_delivered'
+  // DALTON-HOOK(chat-large-upload): live and replayed undelivered steer attachment failure event
+  | 'steering_returned'
   | 'task_steering_accepted'
   | 'interrupt'
   | 'finish';
@@ -524,6 +526,8 @@ export type SSEEvent =
   | ModelRetryEvent
   | ModelFallbackEvent
   | SteeringDeliveredEvent
+  // DALTON-HOOK(chat-large-upload): live and replayed undelivered steer attachment failure event
+  | SteeringReturnedEvent
   | TaskSteeringAcceptedEvent
   | UserMessageEvent
   | InterruptEvent
