@@ -197,8 +197,10 @@ integrations/dalton-channel-gateway/test/feishu.test.ts
 # CH-1 Phase 3 (Discord): Discord adapter, gateway/REST clients, and Vitest suite.
 integrations/dalton-channel-gateway/src/channels/discord/
 integrations/dalton-channel-gateway/test/discord.test.ts
+integrations/dalton-channel-gateway/test/discord-thread-persistence.test.ts
 integrations/dalton-channel-gateway/test/real-http-postgres.test.ts
 tests/integration/dalton/test_discord_gateway_db.py
+tests/integration/dalton/test_discord_thread_persistence_db.py
 # Feishu & Discord native slash-command manifest, registration library, standalone CLI, README, and Vitest suite.
 integrations/dalton-channel-gateway/README.md
 integrations/dalton-channel-gateway/src/native-commands/
@@ -216,6 +218,7 @@ tests/unit/dalton/test_sentiment_observation_dates.py
 # AU1 Batch 1: company automation schema (d035), system identity & budget seed,
 # unified scope classification, read-only scoped listing & modification history, and tests.
 src/dalton/migrations/versions/d035_company_automations.py
+src/dalton/migrations/versions/d036_discord_confirmed_thread.py
 src/dalton/company_identity.py
 src/dalton/autonomy/classification.py
 src/dalton/database/company_automations.py
