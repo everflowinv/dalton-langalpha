@@ -1,7 +1,7 @@
 """Chat composer large-file upload state table (d033).
 
 Revision ID: d033
-Revises: d030
+Revises: d031
 Create Date: 2026-11-09
 """
 

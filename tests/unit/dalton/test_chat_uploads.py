@@ -904,7 +904,7 @@ def upload_env(monkeypatch: pytest.MonkeyPatch):
 
 def test_migration_d033_contract() -> None:
     assert d033_chat_file_uploads.revision == "d033"
-    assert d033_chat_file_uploads.down_revision == "d030"
+    assert d033_chat_file_uploads.down_revision == "d031"
 
     executed_sql: list[str] = []
     with patch.object(
