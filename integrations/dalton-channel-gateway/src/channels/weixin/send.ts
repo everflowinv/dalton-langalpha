@@ -54,6 +54,18 @@ export function normalizeRecipientUserId(
   return trimmed;
 }
 
+export interface WeixinUploadedAccount {
+  botId: string;
+  botGeneration: number;
+}
+
+export interface WeixinRefreshedSendContext {
+  contextToken: string;
+  botToken: string;
+  botId: string;
+  botGeneration: number;
+}
+
 export interface WeixinSendContext {
   baseUrl: string;
   cdnBaseUrl: string;
@@ -68,6 +80,13 @@ export interface WeixinSendContext {
   resolveHostIps?: HostIpResolver;
   checkResolvedIps?: boolean;
   onSessionExpired?: (err: WeixinApiError) => Promise<void> | void;
+  /** Account that owned the CDN upload. Checked again before sendmessage. */
+  uploadedBy?: WeixinUploadedAccount;
+  /**
+   * Re-read the recipient after the CDN upload. Return null when that upload's
+   * bot id or generation is no longer the current account.
+   */
+  refreshAfterUpload?: () => Promise<WeixinRefreshedSendContext | null>;
 }
 
 function isUncertainDispatchedResult(err: WeixinApiError): boolean {
@@ -307,6 +326,40 @@ export async function sendWeixinMediaAttachment(
     return classifyAndThrowUploadStageError(err, ctx.onSessionExpired);
   }
 
+  let outboundContextToken = contextToken;
+  let outboundBotToken = botToken;
+  if (ctx.refreshAfterUpload) {
+    const refreshed = await ctx.refreshAfterUpload();
+    const uploadedBy = ctx.uploadedBy;
+    if (
+      !refreshed ||
+      (uploadedBy !== undefined &&
+        (refreshed.botId !== uploadedBy.botId ||
+          refreshed.botGeneration !== uploadedBy.botGeneration))
+    ) {
+      throw new ChannelDeliveryError(
+        "Weixin account changed during file upload; the uploaded file was not sent.",
+        {
+          outcome: "failed",
+          code: "unavailable",
+        },
+      );
+    }
+    const nextToken = refreshed.contextToken.trim();
+    const nextBotToken = refreshed.botToken.trim();
+    if (!nextToken || !nextBotToken) {
+      throw new ChannelDeliveryError(
+        "Missing active Weixin context_token for recipient",
+        {
+          outcome: "failed",
+          code: "unavailable",
+        },
+      );
+    }
+    outboundContextToken = nextToken;
+    outboundBotToken = nextBotToken;
+  }
+
   const mediaItem: MessageItem = isVerifiedImage
     ? {
         type: MessageItemType.IMAGE,
@@ -341,14 +394,14 @@ export async function sendWeixinMediaAttachment(
       message_type: MessageType.BOT,
       message_state: MessageState.FINISH,
       item_list: [mediaItem],
-      context_token: contextToken,
+      context_token: outboundContextToken,
     },
   };
 
   try {
     const resp = await sendWeixinMessage({
       baseUrl: ctx.baseUrl,
-      botToken,
+      botToken: outboundBotToken,
       body: req,
       timeoutMs: ctx.timeoutMs,
       signal: ctx.signal,

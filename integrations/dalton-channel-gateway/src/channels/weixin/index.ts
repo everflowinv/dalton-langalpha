@@ -809,6 +809,32 @@ export class WeixinChannelAdapter implements ChannelAdapter {
           onSessionExpired: async () => {
             await this.markSessionExpiredFromSend(capturedBotId, capturedGen);
           },
+          uploadedBy: {
+            botId: capturedBotId,
+            botGeneration: capturedGen,
+          },
+          refreshAfterUpload: async () => {
+            const freshToken = await this.resolveFreshContextToken(
+              toUserId,
+              options.weixinContextToken,
+              options.inboundMessageId,
+            );
+            if (
+              this.account.ilinkBotId !== capturedBotId ||
+              this.account.botGeneration !== capturedGen ||
+              this.account.status !== "active"
+            ) {
+              return null;
+            }
+            const currentBotToken = this.account.botToken.trim();
+            if (!currentBotToken) return null;
+            return {
+              contextToken: freshToken,
+              botToken: currentBotToken,
+              botId: this.account.ilinkBotId,
+              botGeneration: this.account.botGeneration,
+            };
+          },
         },
         {
           filename: options.filename,

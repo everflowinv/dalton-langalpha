@@ -3302,7 +3302,10 @@ async def _execute_session_command_once(
                                 payload_dict["platform_user_id"] = cleaned_puid
 
                 async def _deny_and_ignore_command(
-                    res_payload: dict[str, Any], *, uid_val: str | None
+                    res_payload: dict[str, Any],
+                    *,
+                    uid_val: str | None,
+                    reply_pending: bool = False,
                 ) -> dict[str, Any]:
                     if cleaned_msg_id:
                         await _upsert_command_inbound_row(
@@ -3323,10 +3326,110 @@ async def _execute_session_command_once(
                             command_request=cmd_req_dict,
                             command_result=res_payload,
                             command_effect_status="done",
-                            command_reply_pending=False,
+                            command_reply_pending=bool(reply_pending),
                             raw_payload=payload_dict,
                         )
+                    if reply_pending:
+                        return {**res_payload, "command_reply_pending": True}
                     return res_payload
+
+                def _private_weixin_command() -> bool:
+                    return (
+                        cleaned_platform == "weixin"
+                        and cleaned_chat_type != "group"
+                        and bool(cleaned_msg_id)
+                        and bool(cleaned_puid)
+                        and not _payload_marks_invalid_inbound(payload_dict)
+                        and not str(payload_dict.get("group_id") or "").strip()
+                        and not cleaned_scope.startswith("chat:")
+                        and not cleaned_address.startswith("weixin:group:")
+                    )
+
+                async def _save_unbound_private_weixin_context() -> bool:
+                    """Store a current-generation private token before not_linked.
+
+                    Invalid, group, and stale-generation input returns False and
+                    writes nothing. A matching token stays pending so I-6 can
+                    send the denial and startup recovery can retry it.
+                    """
+                    if not _private_weixin_command():
+                        return False
+                    plain_token = _plain_weixin_token(weixin_context_token)
+                    req_bot = str(weixin_bot_id or "").strip() or None
+                    req_gen = (
+                        int(weixin_bot_generation)
+                        if weixin_bot_generation is not None
+                        else None
+                    )
+                    if plain_token is None and req_bot is None and req_gen is None:
+                        return False
+                    active_bot_id, active_bot_gen, _active_status = (
+                        await _get_active_weixin_bot_in_tx(cur, lock_generation=True)
+                    )
+                    bot_mismatch = (
+                        not active_bot_id
+                        or (req_bot is not None and req_bot != active_bot_id)
+                        or (
+                            req_gen is not None
+                            and int(req_gen) != int(active_bot_gen)
+                        )
+                    )
+                    if bot_mismatch or not plain_token:
+                        return False
+                    order = _extract_weixin_context_order(
+                        payload_dict, weixin_context_seq
+                    )
+                    requested_source = _context_order_source(weixin_context_source)
+                    requested_value = _positive_context_seq(weixin_context_seq)
+                    if requested_source == "receive":
+                        order = None
+                    elif (
+                        requested_source in ("protocol", "platform_time")
+                        and requested_value is not None
+                    ):
+                        order = (requested_source, requested_value)
+                    enc_key = get_encryption_key()
+                    _accepted, stored_seq = await _upsert_weixin_context_token_in_tx(
+                        cur,
+                        enc_key=enc_key,
+                        bot_id=str(active_bot_id),
+                        bot_generation=int(active_bot_gen),
+                        platform_user_id=cleaned_puid,
+                        context_token=plain_token,
+                        incoming_seq=order[1] if order is not None else None,
+                        incoming_source=order[0] if order is not None else None,
+                    )
+                    await _deny_and_ignore_command(
+                        {
+                            "ok": False,
+                            "linked": False,
+                            "allowed": False,
+                            "deny_reason": "not_linked",
+                        },
+                        uid_val=None,
+                        reply_pending=True,
+                    )
+                    await cur.execute(
+                        """
+                        UPDATE dalton_channel_inbound_events
+                        SET encrypted_weixin_context_token = pgp_sym_encrypt(%s, %s),
+                            weixin_context_bot_id = %s,
+                            weixin_context_bot_generation = %s,
+                            weixin_context_seq = %s,
+                            updated_at = NOW()
+                        WHERE platform = %s AND message_id = %s
+                        """,
+                        (
+                            plain_token,
+                            enc_key,
+                            str(active_bot_id),
+                            int(active_bot_gen),
+                            int(stored_seq),
+                            cleaned_platform,
+                            cleaned_msg_id,
+                        ),
+                    )
+                    return True
 
                 if (
                     cleaned_platform == "weixin"
@@ -3364,6 +3467,41 @@ async def _execute_session_command_once(
                     )
                     identity = await cur.fetchone()
                     if not identity:
+                        stored_inbound = existing_inbound
+                        stored_res = (
+                            stored_inbound.get("command_result")
+                            if stored_inbound is not None
+                            else None
+                        )
+                        if (
+                            stored_inbound is not None
+                            and isinstance(stored_res, dict)
+                            and stored_res.get("ok") is False
+                            and stored_res.get("deny_reason") == "not_linked"
+                            and bool(
+                                stored_inbound.get("command_reply_pending", False)
+                            )
+                        ):
+                            return {
+                                **dict(stored_res),
+                                "duplicate": True,
+                                "command_effect_status": stored_inbound.get(
+                                    "command_effect_status"
+                                )
+                                or "done",
+                                "command_reply_pending": bool(
+                                    stored_inbound.get("command_reply_pending", False)
+                                ),
+                                "existing_status": stored_inbound.get("status"),
+                            }
+                        if await _save_unbound_private_weixin_context():
+                            return {
+                                "ok": False,
+                                "linked": False,
+                                "allowed": False,
+                                "deny_reason": "not_linked",
+                                "command_reply_pending": True,
+                            }
                         return await _deny_and_ignore_command(
                             {
                                 "ok": False,

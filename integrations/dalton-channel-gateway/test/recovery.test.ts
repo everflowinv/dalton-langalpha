@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
+  I2BindCodeConsumeResponse,
   I7RecoverResponse,
   I9WeixinStateGetResponse,
   RecoverInboundEventRow,
@@ -21,6 +22,43 @@ import {
   type TestHarness,
   USER_ID,
 } from "./helpers.js";
+
+function waitBounded<T>(promise: Promise<T>, label: string, ms = 2000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${ms}ms`));
+    }, ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+function installWatch(
+  orchestrator: TestHarness["app"]["orchestrator"],
+  threadId: string,
+  fields: {
+    userId: string;
+    platform: "feishu" | "discord" | "weixin";
+    scopeKey: string;
+    generation: number;
+  },
+): AbortController {
+  const abortController = new AbortController();
+  orchestrator.activeWatches.set(threadId, {
+    threadId,
+    userId: fields.userId,
+    platform: fields.platform,
+    targetAddress: `${fields.platform}:@me`,
+    scopeKey: fields.scopeKey,
+    generation: fields.generation,
+    lastSeenTurnIndex: 0,
+    abortController,
+    promise: Promise.resolve(),
+  });
+  return abortController;
+}
 
 describe("Startup Recovery & Non-Blocking Server Start (§5.2, Codex r2 #17/#18, Grok r2 #2)", () => {
   let h: TestHarness;
@@ -829,9 +867,611 @@ describe("Startup Recovery & Non-Blocking Server Start (§5.2, Codex r2 #17/#18,
     expect(h.feishuAdapter.sentTexts.filter((item) => item.text === unlinked)).toHaveLength(1);
     expect(h.app.orchestrator.activeWatches.has("watch-old-shape")).toBe(true);
     expect(oldWatch.signal.aborted).toBe(false);
-    expect(h.app.orchestrator.activeWatches.has("watch-new-unbind")).toBe(false);
-    expect(newWatch.signal.aborted).toBe(true);
+    expect(h.app.orchestrator.activeWatches.has("watch-new-unbind")).toBe(true);
+    expect(newWatch.signal.aborted).toBe(false);
     expect(vi.mocked(h.backend.consumeBindCode).mock.calls).toHaveLength(bindCalls);
     expect(vi.mocked(h.backend.sessionCommand).mock.calls).toHaveLength(sessionCalls);
+  });
+
+  it("sends an unbound Weixin shared-command denial after the first confirmation fails", async () => {
+    const messageId = "wx_unbound_new_1";
+    const sender = "wx_unbound_sender";
+    const denialText = "Your weixin account is not linked to Dalton yet.";
+    const previousSession = vi
+      .mocked(h.backend.sessionCommand)
+      .getMockImplementation();
+    if (!previousSession) throw new Error("sessionCommand mock is missing");
+    vi.mocked(h.backend.sessionCommand).mockImplementation(async (req) => {
+      if (req.message_id === messageId) {
+        return {
+          ok: false,
+          linked: false,
+          allowed: false,
+          deny_reason: "not_linked",
+          command_effect_status: "done",
+          command_reply_pending: true,
+        };
+      }
+      return previousSession(req);
+    });
+    let failConfirmation = true;
+    h.weixinAdapter.setSendTextBehavior((options) => {
+      if (failConfirmation && options.text.includes(denialText)) {
+        failConfirmation = false;
+        throw new ChannelDeliveryError("unbound confirmation failed", {
+          outcome: "failed",
+          code: "unavailable",
+        });
+      }
+      return { messageId: "wx_unbound_notice" };
+    });
+    const deliveryKey = `notice:weixin:${messageId}:deny_not_linked`;
+    const claims = () =>
+      h.backend.deliveryClaims.filter((claim) => claim.delivery_key === deliveryKey);
+    const failedUpdates = () =>
+      h.backend.deliveryUpdates.filter(
+        (update) => update.delivery_key === deliveryKey && update.status === "failed",
+      );
+
+    await waitBounded(
+      h.weixinAdapter.emitInbound({
+        platform: "weixin",
+        platformUserId: sender,
+        chatType: "dm",
+        chatAddress: "weixin:@me",
+        chatId: sender,
+        threadScopeKey: `dm:${sender}`,
+        messageId,
+        text: "/new",
+      }),
+      "unbound /new",
+    );
+
+    expect(h.weixinAdapter.sentTexts.map((item) => item.text)).not.toContain(
+      expect.stringContaining(denialText),
+    );
+    expect(failedUpdates()).toHaveLength(1);
+    expect(claims()).toEqual([
+      expect.objectContaining({
+        delivery_key: deliveryKey,
+        user_id: `unlinked:weixin:${sender}`,
+        inbound_message_id: messageId,
+      }),
+    ]);
+    expect(
+      h.backend.progressUpdates.filter(
+        (update) =>
+          update.message_id === messageId && update.command_reply_pending === false,
+      ),
+    ).toEqual([]);
+
+    const pendingRow: RecoverInboundEventRow = {
+      platform: "weixin",
+      message_id: messageId,
+      platform_user_id: sender,
+      dalton_user_id: null,
+      chat_type: "dm",
+      chat_address: "weixin:@me",
+      thread_scope_key: `dm:${sender}`,
+      request_key: "rk_wx_unbound_new",
+      retry_request_key: null,
+      resubmitted_request_key: null,
+      steered_into_run_id: null,
+      thread_id: null,
+      run_id: null,
+      turn_index: null,
+      workspace_id: null,
+      external_thread_id: null,
+      event_kind: "command",
+      command_request: { cmd: "new" },
+      command_result: {
+        ok: false,
+        linked: false,
+        allowed: false,
+        deny_reason: "not_linked",
+      },
+      command_effect_status: "done",
+      command_reply_pending: true,
+      status: "ignored",
+      fallback_pending: false,
+      sent_to_current_count: 0,
+      uploaded_attachments: [],
+      raw_payload: { platform_user_id: sender, text: "/new", command: "new" },
+    };
+    vi.mocked(h.backend.recoverState).mockResolvedValueOnce({
+      mode: "startup",
+      inbound_events: [pendingRow],
+      background_runs: [],
+      thread_watches: [],
+      automation_runs: [],
+    });
+
+    vi.mocked(h.backend.getWeixinState).mockResolvedValueOnce(
+      loadFixtureKey<I9WeixinStateGetResponse>("i9_weixin_state.json", "get_configured"),
+    );
+
+    await waitBounded(h.app.orchestrator.runStartupRecovery(), "unbound denial recovery");
+
+    expect(
+      h.weixinAdapter.sentTexts.filter((item) => item.text.includes(denialText)),
+    ).toHaveLength(1);
+    expect(claims()).toHaveLength(2);
+    expect(
+      h.backend.progressUpdates.filter((update) => update.message_id === messageId),
+    ).toEqual([
+      expect.objectContaining({ command_reply_pending: false }),
+    ]);
+  });
+
+  it("closes only older unbind watches for a stored scope generation", async () => {
+    const generations = {
+      "dm:old": 4,
+      "dm:new": 2,
+      "dm:bad": "5",
+      "dm:nan": Number.NaN,
+    };
+    const keyedId = "om_gen_unbind";
+    const legacyId = "om_legacy_unbind";
+    const missingId = "om_missing_generations";
+    const arrayId = "om_array_generations";
+    const settledId = "om_settled_unbind";
+    const row = (
+      messageId: string,
+      extras: Partial<RecoverInboundEventRow> = {},
+    ): RecoverInboundEventRow => ({
+      platform: "feishu",
+      message_id: messageId,
+      platform_user_id: "ou_gen",
+      dalton_user_id: USER_ID,
+      chat_type: "dm",
+      chat_address: "feishu:@me",
+      thread_scope_key: "dm:old",
+      request_key: `rk_${messageId}`,
+      retry_request_key: null,
+      resubmitted_request_key: null,
+      steered_into_run_id: null,
+      thread_id: null,
+      run_id: null,
+      turn_index: null,
+      workspace_id: null,
+      external_thread_id: null,
+      event_kind: "command",
+      command_request: { action: "unbind", is_group: false },
+      command_effect_status: "done",
+      command_reply_pending: true,
+      status: "completed",
+      fallback_pending: false,
+      sent_to_current_count: 0,
+      uploaded_attachments: [],
+      raw_payload: { platform_user_id: "ou_gen", text: "/unbind" },
+      ...extras,
+    });
+    const consumed = (
+      messageId: string,
+      value: Record<string, unknown>,
+    ): Record<string, unknown> => ({
+      ok: true,
+      action: "unbind",
+      user_id: USER_ID,
+      delivery_key: `notice:feishu:${messageId}:unbind_ok`,
+      ...value,
+    });
+    vi.mocked(h.backend.recoverState).mockResolvedValueOnce({
+      mode: "startup",
+      inbound_events: [
+        row(keyedId, {
+          consumed_bind_result: consumed(keyedId, { generations }),
+        }),
+        row(legacyId, {
+          command_result: {
+            ok: true,
+            user_id: USER_ID,
+            generations: { "dm:legacy": 5 },
+          },
+        }),
+        row(missingId, {
+          consumed_bind_result: consumed(missingId, {}),
+        }),
+        row(arrayId, {
+          consumed_bind_result: consumed(arrayId, { generations: [4] }),
+        }),
+        row(settledId, {
+          command_reply_pending: false,
+          consumed_bind_result: consumed(settledId, {
+            generations: { "dm:settled": 9 },
+          }),
+        }),
+      ],
+      background_runs: [],
+      thread_watches: [],
+      automation_runs: [],
+    });
+    const older = installWatch(h.app.orchestrator, "older-scope", {
+      userId: USER_ID,
+      platform: "feishu",
+      scopeKey: "dm:old",
+      generation: 3,
+    });
+    const same = installWatch(h.app.orchestrator, "same-generation", {
+      userId: USER_ID,
+      platform: "feishu",
+      scopeKey: "dm:old",
+      generation: 4,
+    });
+    const reused = installWatch(h.app.orchestrator, "reused-thread", {
+      userId: USER_ID,
+      platform: "feishu",
+      scopeKey: "dm:old",
+      generation: 5,
+    });
+    const newerScope = installWatch(h.app.orchestrator, "newer-scope-old-gen", {
+      userId: USER_ID,
+      platform: "feishu",
+      scopeKey: "dm:new",
+      generation: 1,
+    });
+    const newerScopeCurrent = installWatch(h.app.orchestrator, "newer-scope-current", {
+      userId: USER_ID,
+      platform: "feishu",
+      scopeKey: "dm:new",
+      generation: 2,
+    });
+    const otherScope = installWatch(h.app.orchestrator, "other-scope", {
+      userId: USER_ID,
+      platform: "feishu",
+      scopeKey: "dm:other",
+      generation: 1,
+    });
+    const otherUser = installWatch(h.app.orchestrator, "other-user", {
+      userId: "user_other",
+      platform: "feishu",
+      scopeKey: "dm:old",
+      generation: 1,
+    });
+    const otherPlatform = installWatch(h.app.orchestrator, "other-platform", {
+      userId: USER_ID,
+      platform: "discord",
+      scopeKey: "dm:old",
+      generation: 1,
+    });
+    const badValue = installWatch(h.app.orchestrator, "bad-value", {
+      userId: USER_ID,
+      platform: "feishu",
+      scopeKey: "dm:bad",
+      generation: 1,
+    });
+    const nanValue = installWatch(h.app.orchestrator, "nan-value", {
+      userId: USER_ID,
+      platform: "feishu",
+      scopeKey: "dm:nan",
+      generation: 1,
+    });
+    const legacy = installWatch(h.app.orchestrator, "legacy-command", {
+      userId: USER_ID,
+      platform: "feishu",
+      scopeKey: "dm:legacy",
+      generation: 1,
+    });
+    const missing = installWatch(h.app.orchestrator, "missing-generations", {
+      userId: USER_ID,
+      platform: "feishu",
+      scopeKey: "dm:missing",
+      generation: 1,
+    });
+    const arrayWatch = installWatch(h.app.orchestrator, "array-generations", {
+      userId: USER_ID,
+      platform: "feishu",
+      scopeKey: "0",
+      generation: 1,
+    });
+    const settled = installWatch(h.app.orchestrator, "settled-pending", {
+      userId: USER_ID,
+      platform: "feishu",
+      scopeKey: "dm:settled",
+      generation: 1,
+    });
+
+    await waitBounded(
+      h.app.orchestrator.runStartupRecovery(),
+      "generation-scoped unbind recovery",
+    );
+
+    expect(older.signal.aborted).toBe(true);
+    expect(h.app.orchestrator.activeWatches.has("older-scope")).toBe(false);
+    expect(newerScope.signal.aborted).toBe(true);
+    expect(h.app.orchestrator.activeWatches.has("newer-scope-old-gen")).toBe(false);
+    for (const [threadId, controller] of [
+      ["same-generation", same],
+      ["reused-thread", reused],
+      ["newer-scope-current", newerScopeCurrent],
+      ["other-scope", otherScope],
+      ["other-user", otherUser],
+      ["other-platform", otherPlatform],
+      ["bad-value", badValue],
+      ["nan-value", nanValue],
+      ["legacy-command", legacy],
+      ["missing-generations", missing],
+      ["array-generations", arrayWatch],
+      ["settled-pending", settled],
+    ] as const) {
+      expect(controller.signal.aborted).toBe(false);
+      expect(h.app.orchestrator.activeWatches.has(threadId)).toBe(true);
+    }
+    const claimsFor = (messageId: string) =>
+      h.backend.deliveryClaims.filter((claim) => claim.inbound_message_id === messageId);
+    expect(claimsFor(keyedId)).toEqual([
+      expect.objectContaining({
+        delivery_key: `notice:feishu:${keyedId}:unbind_ok`,
+      }),
+    ]);
+    expect(claimsFor(legacyId)).toEqual([
+      expect.objectContaining({
+        delivery_key: `notice:feishu:${legacyId}:command`,
+      }),
+    ]);
+    expect(claimsFor(missingId)).toEqual([
+      expect.objectContaining({
+        delivery_key: `notice:feishu:${missingId}:unbind_ok`,
+      }),
+    ]);
+    expect(claimsFor(arrayId)).toEqual([
+      expect.objectContaining({
+        delivery_key: `notice:feishu:${arrayId}:unbind_ok`,
+      }),
+    ]);
+    expect(claimsFor(settledId)).toEqual([]);
+  });
+
+  it("keeps a rebound watch when recovering a failed successful unbind", async () => {
+    const unbindId = "om_live_unbind";
+    const bindId = "om_live_rebind";
+    const sender = "ou_rebind";
+    const scopeKey = `dm:${sender}`;
+    const roomScope = "chat:room_old";
+    const unlinkedText = "Unlinked your feishu account from Dalton.";
+    const linkedText = "Successfully linked your feishu account to Dalton.";
+    const previousResolve = vi
+      .mocked(h.backend.registerAndResolveInbound)
+      .getMockImplementation();
+    const previousConsume = vi
+      .mocked(h.backend.consumeBindCode)
+      .getMockImplementation();
+    if (!previousResolve || !previousConsume) {
+      throw new Error("bind mocks are missing");
+    }
+    vi.mocked(h.backend.registerAndResolveInbound).mockImplementation(async (req) => {
+      const resolved = await previousResolve(req);
+      return {
+        ...resolved,
+        linked: true,
+        allowed: true,
+        dalton_user_id: USER_ID,
+        deny_reason: null,
+        existing_status: null,
+      };
+    });
+    let unbindResult: I2BindCodeConsumeResponse | null = null;
+    vi.mocked(h.backend.consumeBindCode).mockImplementation(async (req) => {
+      if (req.action === "unbind" && req.inbound_message_id === unbindId) {
+        unbindResult = {
+          ok: true,
+          user_id: USER_ID,
+          platform: req.platform,
+          platform_user_id: req.platform_user_id,
+          action: "unbind",
+          generations: {
+            [scopeKey]: 3,
+            [roomScope]: 8,
+          },
+          delivery_key: `notice:feishu:${unbindId}:unbind_ok`,
+          duplicate: false,
+          command_effect_status: "done",
+          command_reply_pending: true,
+        };
+        return unbindResult;
+      }
+      if (req.action === "bind" && req.inbound_message_id === bindId) {
+        return {
+          ok: true,
+          user_id: USER_ID,
+          platform: req.platform,
+          platform_user_id: req.platform_user_id,
+          action: "bind",
+          generation: 4,
+          delivery_key: `notice:feishu:${bindId}:bind_ok`,
+          duplicate: false,
+          command_effect_status: "done",
+          command_reply_pending: true,
+        };
+      }
+      return previousConsume(req);
+    });
+    let failUnbindSend = true;
+    h.feishuAdapter.setSendTextBehavior((options) => {
+      if (failUnbindSend && options.text === unlinkedText) {
+        failUnbindSend = false;
+        throw new ChannelDeliveryError("unbind confirmation failed", {
+          outcome: "failed",
+          code: "unavailable",
+        });
+      }
+      return { messageId: `confirm_${options.chunkIndex}` };
+    });
+    const oldWatch = installWatch(h.app.orchestrator, "pre-unbind", {
+      userId: USER_ID,
+      platform: "feishu",
+      scopeKey,
+      generation: 2,
+    });
+
+    await waitBounded(
+      h.feishuAdapter.emitInbound({
+        platform: "feishu",
+        platformUserId: sender,
+        chatType: "dm",
+        chatAddress: "feishu:@me",
+        chatId: sender,
+        threadScopeKey: scopeKey,
+        messageId: unbindId,
+        text: "/unbind",
+      }),
+      "live unbind",
+    );
+
+    expect(unbindResult).toMatchObject({
+      ok: true,
+      action: "unbind",
+      generations: { [scopeKey]: 3, [roomScope]: 8 },
+    });
+    const returnedGenerations = unbindResult!.generations!;
+    expect(oldWatch.signal.aborted).toBe(true);
+    expect(h.app.orchestrator.activeWatches.has("pre-unbind")).toBe(false);
+    expect(h.feishuAdapter.sentTexts.map((item) => item.text)).not.toContain(unlinkedText);
+    expect(
+      h.backend.deliveryUpdates.filter(
+        (update) =>
+          update.delivery_key === `notice:feishu:${unbindId}:unbind_ok` &&
+          update.status === "failed",
+      ),
+    ).toHaveLength(1);
+    expect(
+      h.backend.progressUpdates.filter(
+        (update) =>
+          update.message_id === unbindId && update.command_reply_pending === false,
+      ),
+    ).toEqual([]);
+
+    await waitBounded(
+      h.feishuAdapter.emitInbound({
+        platform: "feishu",
+        platformUserId: sender,
+        chatType: "dm",
+        chatAddress: "feishu:@me",
+        chatId: sender,
+        threadScopeKey: scopeKey,
+        messageId: bindId,
+        text: "/bind ABCD1234",
+      }),
+      "live rebind",
+    );
+    expect(h.feishuAdapter.sentTexts.filter((item) => item.text === linkedText)).toHaveLength(1);
+
+    const reboundGeneration = returnedGenerations[scopeKey]! + 1;
+    const reused = installWatch(h.app.orchestrator, "pre-unbind", {
+      userId: USER_ID,
+      platform: "feishu",
+      scopeKey,
+      generation: reboundGeneration,
+    });
+    const stillOld = installWatch(h.app.orchestrator, "still-old", {
+      userId: USER_ID,
+      platform: "feishu",
+      scopeKey,
+      generation: returnedGenerations[scopeKey]! - 1,
+    });
+    const otherScope = installWatch(h.app.orchestrator, "after-rebind-scope", {
+      userId: USER_ID,
+      platform: "feishu",
+      scopeKey: "dm:ou_after_rebind",
+      generation: 1,
+    });
+    const roomCurrent = installWatch(h.app.orchestrator, "room-current", {
+      userId: USER_ID,
+      platform: "feishu",
+      scopeKey: roomScope,
+      generation: returnedGenerations[roomScope]!,
+    });
+    const roomOld = installWatch(h.app.orchestrator, "room-old", {
+      userId: USER_ID,
+      platform: "feishu",
+      scopeKey: roomScope,
+      generation: returnedGenerations[roomScope]! - 1,
+    });
+    const otherUser = installWatch(h.app.orchestrator, "other-user-rebind", {
+      userId: "user_other",
+      platform: "feishu",
+      scopeKey,
+      generation: 1,
+    });
+    const pendingRow: RecoverInboundEventRow = {
+      platform: "feishu",
+      message_id: unbindId,
+      platform_user_id: sender,
+      dalton_user_id: USER_ID,
+      chat_type: "dm",
+      chat_address: "feishu:@me",
+      thread_scope_key: scopeKey,
+      request_key: "rk_live_unbind",
+      retry_request_key: null,
+      resubmitted_request_key: null,
+      steered_into_run_id: null,
+      thread_id: null,
+      run_id: null,
+      turn_index: null,
+      workspace_id: null,
+      external_thread_id: null,
+      event_kind: "command",
+      command_request: { action: "unbind", is_group: false },
+      command_result: unbindResult as unknown as RecoverInboundEventRow["command_result"],
+      consumed_bind_result: unbindResult as unknown as Record<string, unknown>,
+      command_effect_status: "done",
+      command_reply_pending: true,
+      status: "completed",
+      fallback_pending: false,
+      sent_to_current_count: 0,
+      uploaded_attachments: [],
+      raw_payload: { platform_user_id: sender, text: "/unbind" },
+    };
+    vi.mocked(h.backend.recoverState)
+      .mockResolvedValueOnce({
+        mode: "startup",
+        inbound_events: [pendingRow],
+        background_runs: [],
+        thread_watches: [],
+        automation_runs: [],
+      })
+      .mockResolvedValueOnce({
+        mode: "startup",
+        inbound_events: [{ ...pendingRow, command_reply_pending: false }],
+        background_runs: [],
+        thread_watches: [],
+        automation_runs: [],
+      });
+
+    await waitBounded(
+      h.app.orchestrator.runStartupRecovery(),
+      "old unbind confirmation recovery",
+    );
+
+    expect(h.feishuAdapter.sentTexts.filter((item) => item.text === unlinkedText)).toHaveLength(1);
+    expect(reused.signal.aborted).toBe(false);
+    expect(h.app.orchestrator.activeWatches.has("pre-unbind")).toBe(true);
+    expect(stillOld.signal.aborted).toBe(true);
+    expect(roomOld.signal.aborted).toBe(true);
+    expect(otherScope.signal.aborted).toBe(false);
+    expect(roomCurrent.signal.aborted).toBe(false);
+    expect(otherUser.signal.aborted).toBe(false);
+    expect(
+      h.backend.progressUpdates.filter((update) => update.message_id === unbindId),
+    ).toEqual([
+      expect.objectContaining({
+        status: "completed",
+        command_reply_pending: false,
+      }),
+    ]);
+
+    const afterRecovery = installWatch(h.app.orchestrator, "after-settled", {
+      userId: USER_ID,
+      platform: "feishu",
+      scopeKey,
+      generation: returnedGenerations[scopeKey]! - 1,
+    });
+    await waitBounded(
+      h.app.orchestrator.runStartupRecovery(),
+      "settled unbind confirmation",
+    );
+    expect(afterRecovery.signal.aborted).toBe(false);
+    expect(h.app.orchestrator.activeWatches.has("after-settled")).toBe(true);
+    expect(h.feishuAdapter.sentTexts.filter((item) => item.text === unlinkedText)).toHaveLength(1);
   });
 });

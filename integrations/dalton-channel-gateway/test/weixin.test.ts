@@ -307,6 +307,67 @@ function makeJsonResponse(
   });
 }
 
+function waitBounded<T>(promise: Promise<T>, label: string, ms = 2000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`${label} timed out after ${ms}ms`));
+    }, ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
+}
+
+function pausedCdnFetch(): {
+  fetchImpl: typeof fetch;
+  uploadEntered: ReturnType<typeof defer<void>>;
+  releaseUpload: ReturnType<typeof defer<void>>;
+  uploadAuthorizations: string[];
+  sendMessages: Array<{ body: string; authorization: string }>;
+  cdnCalls: number;
+} {
+  const uploadEntered = defer<void>();
+  const releaseUpload = defer<void>();
+  const uploadAuthorizations: string[] = [];
+  const sendMessages: Array<{ body: string; authorization: string }> = [];
+  let cdnCalls = 0;
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const url = String(input);
+    if (url.includes("getuploadurl")) {
+      uploadAuthorizations.push(headerValue(init, "authorization"));
+      return makeJsonResponse({ ret: 0, upload_param: "up_param_file" });
+    }
+    if (url.includes("novac2c.cdn.weixin.qq.com")) {
+      cdnCalls += 1;
+      uploadEntered.resolve();
+      await waitBounded(releaseUpload.promise, "cdn upload pause", 1500);
+      return new Response("", {
+        status: 200,
+        headers: { "x-encrypted-param": "cdn_enc_file" },
+      });
+    }
+    if (url.includes("sendmessage")) {
+      sendMessages.push({
+        body: String(init?.body ?? ""),
+        authorization: headerValue(init, "authorization"),
+      });
+      return makeJsonResponse({ ret: 0, message_id: "wx_file_sent" });
+    }
+    throw new Error(`Unexpected URL: ${url}`);
+  };
+  return {
+    fetchImpl,
+    uploadEntered,
+    releaseUpload,
+    uploadAuthorizations,
+    sendMessages,
+    get cdnCalls() {
+      return cdnCalls;
+    },
+  };
+}
+
 describe("Weixin iLink Adapter — Protocol, Crypto, Inbound, QR Concurrency & Lifecycle", () => {
   it("preserves lossless uint64 message_id, msg_id, and svr_id strings in parseWeixinApiJson", () => {
     const raw =
@@ -2290,6 +2351,133 @@ describe("Weixin iLink Adapter — Protocol, Crypto, Inbound, QR Concurrency & L
         }
       }
     } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("uses the newest Weixin context after a CDN upload when the account is unchanged", async () => {
+    const h = createTestHarness();
+    const paused = pausedCdnFetch();
+    let sending: Promise<unknown> | undefined;
+    try {
+      let current = weixinState({
+        ilink_bot_id: "bot_live_1",
+        bot_generation: 5,
+        bot_token: "bot_tok_same",
+        weixin_context_token: "ctx_before_upload",
+      });
+      vi.mocked(h.backend.getWeixinState).mockImplementation(async () => current);
+      const adapter = new WeixinChannelAdapter({
+        backend: h.backend,
+        botToken: "bot_tok_same",
+        ilinkBotId: "bot_live_1",
+        botGeneration: 5,
+        baseUrl: "https://ilinkai.weixin.qq.com",
+        cdnBaseUrl: "https://novac2c.cdn.weixin.qq.com/c2c",
+        allowedApiDomains: ["ilinkai.weixin.qq.com"],
+        allowedCdnDomains: ["novac2c.cdn.weixin.qq.com"],
+        checkResolvedIps: false,
+        fetchImpl: paused.fetchImpl,
+      });
+      sending = waitBounded(
+        adapter.sendFile({
+          targetAddress: "weixin:wx_file_user",
+          recipientPlatformUserId: "wx_file_user",
+          path: "notes/memo.pdf",
+          filename: "memo.pdf",
+          content: Buffer.from("Dalton file body", "utf8"),
+          mimeType: "application/pdf",
+          inboundMessageId: "wx_file_same_account",
+        }),
+        "unchanged account file send",
+      );
+      await waitBounded(paused.uploadEntered.promise, "cdn upload entered");
+      expect(paused.cdnCalls).toBe(1);
+      expect(paused.uploadAuthorizations).toEqual(["Bearer bot_tok_same"]);
+      expect(paused.sendMessages).toHaveLength(0);
+      current = weixinState({
+        ilink_bot_id: "bot_live_1",
+        bot_generation: 5,
+        bot_token: "bot_tok_same",
+        weixin_context_token: "ctx_after_upload",
+      });
+      paused.releaseUpload.resolve();
+      const sent = await sending;
+      expect(sent).toMatchObject({ status: "sent" });
+      expect(paused.sendMessages).toHaveLength(1);
+      expect(paused.sendMessages[0]?.authorization).toBe("Bearer bot_tok_same");
+      expect(paused.sendMessages[0]?.body).toContain('"context_token":"ctx_after_upload"');
+      expect(paused.sendMessages[0]?.body).not.toContain("ctx_before_upload");
+    } finally {
+      paused.releaseUpload.resolve();
+      if (sending) await Promise.allSettled([sending]);
+      await h.cleanup();
+    }
+  });
+
+  it("does not send a file uploaded by an account that changed during the upload", async () => {
+    const h = createTestHarness();
+    const paused = pausedCdnFetch();
+    let sending: Promise<unknown> | undefined;
+    try {
+      let current = weixinState({
+        ilink_bot_id: "bot_live_1",
+        bot_generation: 5,
+        bot_token: "bot_tok_old",
+        weixin_context_token: "ctx_old_account",
+      });
+      vi.mocked(h.backend.getWeixinState).mockImplementation(async () => current);
+      const adapter = new WeixinChannelAdapter({
+        backend: h.backend,
+        botToken: "bot_tok_old",
+        ilinkBotId: "bot_live_1",
+        botGeneration: 5,
+        baseUrl: "https://ilinkai.weixin.qq.com",
+        cdnBaseUrl: "https://novac2c.cdn.weixin.qq.com/c2c",
+        allowedApiDomains: ["ilinkai.weixin.qq.com"],
+        allowedCdnDomains: ["novac2c.cdn.weixin.qq.com"],
+        checkResolvedIps: false,
+        fetchImpl: paused.fetchImpl,
+      });
+      sending = waitBounded(
+        adapter.sendFile({
+          targetAddress: "weixin:wx_file_user",
+          recipientPlatformUserId: "wx_file_user",
+          path: "notes/memo.pdf",
+          filename: "memo.pdf",
+          content: Buffer.from("Dalton file body", "utf8"),
+          mimeType: "application/pdf",
+          inboundMessageId: "wx_file_switched_account",
+        }),
+        "switched account file send",
+      );
+      await waitBounded(paused.uploadEntered.promise, "cdn upload entered");
+      expect(paused.cdnCalls).toBe(1);
+      expect(paused.uploadAuthorizations).toEqual(["Bearer bot_tok_old"]);
+      expect(paused.sendMessages).toHaveLength(0);
+      current = weixinState({
+        ilink_bot_id: "bot_live_2",
+        bot_generation: 6,
+        bot_token: "bot_tok_new",
+        weixin_context_token: "ctx_new_account",
+        base_url: "https://ilinkai.weixin.qq.com",
+      });
+      paused.releaseUpload.resolve();
+      await expect(sending).rejects.toMatchObject({
+        outcome: "failed",
+        code: "unavailable",
+        message: expect.stringContaining("account changed"),
+      });
+      expect(paused.sendMessages).toHaveLength(0);
+      expect(paused.cdnCalls).toBe(1);
+      expect(adapter.getAccountStatus()).toMatchObject({
+        status: "active",
+        ilinkBotId: "bot_live_2",
+        botGeneration: 6,
+      });
+    } finally {
+      paused.releaseUpload.resolve();
+      if (sending) await Promise.allSettled([sending]);
       await h.cleanup();
     }
   });

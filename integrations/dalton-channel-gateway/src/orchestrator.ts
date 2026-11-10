@@ -654,7 +654,10 @@ export class ChannelGatewayOrchestrator {
    * keeps `notice:<platform>:<message>:command` on every attempt, so a later
    * duplicate does not become a second message. `closeWatchesOnSuccessfulUnbind`
    * is set by a fresh live unbind and by a consumed or keyed recovery; old
-   * production recovery leaves watches open.
+   * production recovery leaves watches open. A close uses `generations` from
+   * the unbind result: only a watch for that user, platform, and scope whose
+   * generation is lower than the stored post-unbind generation is aborted.
+   * A missing or invalid map does not close any watch.
    */
   private async deliverStoredCommandConfirmation(params: {
     event: InboundChannelEvent;
@@ -680,7 +683,11 @@ export class ChannelGatewayOrchestrator {
       fields.ok &&
       linkedUser
     ) {
-      this.closeWatchesForUserPlatform(linkedUser, params.event.platform);
+      this.closeWatchesOlderThanStoredUnbind(
+        linkedUser,
+        params.event.platform,
+        params.result,
+      );
     }
     let delivered = false;
     if (legacy && !linkedUser) {
@@ -8473,14 +8480,27 @@ export class ChannelGatewayOrchestrator {
     }
   }
 
-  private closeWatchesForUserPlatform(
+  private closeWatchesOlderThanStoredUnbind(
     userId: string,
     platform: ChannelPlatform,
+    result: object,
   ): void {
-    for (const [tid, handle] of this.activeWatches.entries()) {
-      if (handle.userId === userId && handle.platform === platform) {
+    const raw = recordField(result, "generations");
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return;
+    for (const [threadId, handle] of this.activeWatches.entries()) {
+      if (handle.userId !== userId || handle.platform !== platform) continue;
+      if (!Object.prototype.hasOwnProperty.call(raw, handle.scopeKey)) continue;
+      const stored = Reflect.get(raw, handle.scopeKey);
+      if (typeof stored !== "number" || !Number.isFinite(stored)) continue;
+      if (
+        typeof handle.generation !== "number" ||
+        !Number.isFinite(handle.generation)
+      ) {
+        continue;
+      }
+      if (handle.generation < stored) {
         handle.abortController.abort();
-        this.activeWatches.delete(tid);
+        this.activeWatches.delete(threadId);
       }
     }
   }
