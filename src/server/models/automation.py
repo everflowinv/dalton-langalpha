@@ -471,13 +471,23 @@ def _refuse_retired_agent_mode(value: Any) -> Any:
     # Any other value was refused while the field existed, so it still is.
     if not isinstance(value, dict):
         return value
-    # DALTON-HOOK(company-automations): refuse client attempts to set company scope or system user_id
+    # DALTON-HOOK(company-automations): refuse client attempts to forge scope, system user_id, or audit metadata
     from src.dalton.company_identity import is_company_system_user
 
     if str(value.get("scope") or "").strip().lower() == "company":
         raise ValueError("company scope cannot be set or transferred by client")
     if is_company_system_user(value.get("user_id")):
         raise ValueError("company system user_id cannot be set by client")
+    for forbidden_key in (
+        "created_by",
+        "updated_by",
+        "audit_history",
+        "config_version",
+        "active_version",
+        "notify_storage_mode",
+    ):
+        if forbidden_key in value:
+            raise ValueError(f"{forbidden_key} cannot be set by client")
     mode = value.get("agent_mode")
     if mode == "flash":
         raise ValueError(
@@ -592,6 +602,8 @@ class AutomationUpdate(_ScheduleFields):
         description="Delivery configuration: { methods: ['slack', ...] }",
     )
     metadata: Optional[Dict[str, Any]] = None
+    # DALTON-HOOK(company-automations): optional expected_config_version for optimistic concurrency check
+    expected_config_version: Any = Field(default=None, exclude=True)
 
     @model_validator(mode="before")
     @classmethod
@@ -610,6 +622,13 @@ class AutomationUpdate(_ScheduleFields):
             )
         self._refuse_other_kinds(kind)
         return self
+
+
+# DALTON-HOOK(company-automations): optional version body for pause/resume endpoints
+class AutomationVersionRequest(BaseModel):
+    """Optional request body for pause and resume endpoints carrying ``expected_config_version``."""
+
+    expected_config_version: Any = None
 
 
 # =============================================================================

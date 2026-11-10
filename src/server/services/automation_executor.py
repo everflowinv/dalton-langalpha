@@ -417,10 +417,16 @@ class AutomationExecutor:
             return place.thread_id
         thread_id = str(uuid4())
         if automation.get("thread_strategy") == "continue":
-            await auto_db.update_automation(
-                str(automation["automation_id"]), automation["user_id"],
-                conversation_thread_id=thread_id,
+            # DALTON-HOOK(company-automations): runtime thread write-back does not bump config_version or append history
+            from src.dalton.services.company_automations import (
+                automation_history_context,
             )
+
+            with automation_history_context(record_history=False):
+                await auto_db.update_automation(
+                    str(automation["automation_id"]), automation["user_id"],
+                    conversation_thread_id=thread_id,
+                )
         await self._precreate_titled_thread(automation, thread_id, workspace_id)
         return thread_id
 
