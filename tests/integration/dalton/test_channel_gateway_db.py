@@ -2887,8 +2887,11 @@ async def test_ch1_failed_conversation_delivery_replays_without_extending_activi
     """A failed conversation delivery can be reclaimed as replay on the same key.
 
     The same scope and generation are required. The stored origin becomes replay,
-    so the recovered send does not move last_conversation_activity_at. A different
-    scope or generation, another origin, or an in-flight or unknown row is not resent.
+    so the recovered send does not move last_conversation_activity_at. A sent or
+    partial row with the same user, platform, target, scope, and generation
+    returns already_completed and keeps its original origin. A different scope,
+    generation, user, platform, or target stays denied. Another origin, or an
+    in-flight or unknown row, is not resent.
     """
     prefix = db_env["prefix"]
     user_a = db_env["user_a"]
@@ -2998,7 +3001,8 @@ async def test_ch1_failed_conversation_delivery_replays_without_extending_activi
             async with conn.cursor() as cur:
                 await cur.execute(
                     """
-                    SELECT status, activity_origin, user_id, platform, target_address
+                    SELECT status, activity_origin, user_id, platform, target_address,
+                           source_scope_key, source_generation
                     FROM dalton_channel_deliveries
                     WHERE delivery_key = %s
                     """,
@@ -3087,7 +3091,8 @@ async def test_ch1_failed_conversation_delivery_replays_without_extending_activi
     await _deny_stays(notice_key, origin="notification")
 
     # Activity was checked above. This sent row is a separate current conversation
-    # delivery, so its own progress may move the activity clock.
+    # delivery, so its own progress may move the activity clock. Reclaiming it as
+    # replay reports the body already delivered and does not change its origin.
     sent_key = f"fallback:{run_id}:sent"
     assert (await _claim(sent_key, origin="conversation"))["claim_status"] == "claimed"
     await cg_db.update_delivery_progress(
@@ -3098,13 +3103,65 @@ async def test_ch1_failed_conversation_delivery_replays_without_extending_activi
         platform_message_ids=["om_replay_sent"],
     )
     replay_sent = await _claim(sent_key, origin="replay")
-    assert replay_sent["claim_status"] == "denied"
-    assert replay_sent["code"] == "not_allowed"
+    assert replay_sent["claim_status"] == "already_completed"
+    assert replay_sent["status"] == "sent"
     same_sent = await _claim(sent_key, origin="conversation")
     assert same_sent["claim_status"] == "already_completed"
     sent_row = await _row(sent_key)
     assert sent_row["status"] == "sent"
     assert sent_row["activity_origin"] == "conversation"
+    assert sent_row["target_address"] == "feishu:@me"
+
+    partial_key = f"fallback:{run_id}:partial"
+    assert (await _claim(partial_key, origin="conversation"))["claim_status"] == "claimed"
+    await cg_db.update_delivery_progress(
+        delivery_key=partial_key,
+        status="partial",
+        sent_chunks=1,
+        total_chunks=2,
+    )
+    partial_activity = (await _activity())["last_conversation_activity_at"]
+    replay_partial = await _claim(partial_key, origin="replay")
+    assert replay_partial["claim_status"] == "already_completed"
+    assert replay_partial["status"] == "partial"
+    partial_row = await _row(partial_key)
+    assert partial_row["status"] == "partial"
+    assert partial_row["activity_origin"] == "conversation"
+    assert partial_row["target_address"] == "feishu:@me"
+    assert partial_row["source_scope_key"] == scope
+    assert int(partial_row["source_generation"]) == 2
+    assert (await _activity())["last_conversation_activity_at"] == partial_activity
+
+    async def _deny_partial_stays(**claim_kwargs: Any) -> None:
+        denied = await cg_db.authorize_and_claim_delivery(
+            delivery_key=partial_key,
+            kind="fallback",
+            user_id=claim_kwargs.pop("user_id", user_a),
+            thread_id=tid,
+            run_id=run_id,
+            platform=claim_kwargs.pop("platform", "feishu"),
+            target=claim_kwargs.pop("target", "feishu:@me"),
+            inbound_message_id=f"{prefix}_replay_turn",
+            has_non_empty_text=True,
+            total_chunks=1,
+            source_scope_key=claim_kwargs.pop("source_scope", scope),
+            source_generation=claim_kwargs.pop("source_generation", 2),
+            activity_origin=claim_kwargs.pop("origin", "replay"),
+        )
+        assert denied["claim_status"] == "denied"
+        assert denied["code"] == "not_allowed"
+        stayed = await _row(partial_key)
+        assert stayed["status"] == "partial"
+        assert stayed["activity_origin"] == "conversation"
+        assert stayed["target_address"] == "feishu:@me"
+        assert stayed["user_id"] == user_a
+        assert (await _activity())["last_conversation_activity_at"] == partial_activity
+
+    await _deny_partial_stays(user_id=str(uuid4()))
+    await _deny_partial_stays(platform="weixin")
+    await _deny_partial_stays(target="feishu:other")
+    await _deny_partial_stays(source_scope=f"{scope}:other")
+    await _deny_partial_stays(source_generation=9)
 
     ident_key = f"fallback:{run_id}:ident"
     assert (await _claim(ident_key, origin="conversation"))["claim_status"] == "claimed"
@@ -3342,6 +3399,17 @@ def _create_real_http_test_app(
     app = FastAPI()
     app.include_router(channels_router, prefix="/api/v1/dalton")
     workspace_files: dict[tuple[str, str], tuple[bytes, str]] = {}
+    # One-shot turn script. Unscripted threads are not recorded, so their replay stays 404.
+    turn_scripts: dict[str, Any] = {"next": None}
+    scripted_replays: dict[str, str] = {}
+
+    def _format_sse_page(events: list[tuple[str, dict[str, Any]]]) -> str:
+        parts: list[str] = []
+        for event_id, (name, data) in enumerate(events, start=1):
+            parts.append(
+                f"id: {event_id}\nevent: {name}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+            )
+        return "".join(parts)
 
     async def _authorize_existing_thread_turn(
         thread_id: str, user_id: str, requested_ws_id: str | None
@@ -3473,6 +3541,14 @@ def _create_real_http_test_app(
         else:
             ws_id = requested_ws_id or cg_db.get_home_workspace_id(user_id)
 
+        # Read after authorization. A rejected turn leaves the one-shot script armed.
+        armed_script = turn_scripts.get("next")
+        script_kind = (
+            str(armed_script.get("kind") or "")
+            if isinstance(armed_script, dict)
+            else ""
+        )
+
         run_id = str(uuid4())
         turn_index = 1
 
@@ -3563,23 +3639,74 @@ def _create_real_http_test_app(
                         """,
                         (run_id, thread_id, turn_index, user_id),
                     )
+                    # interrupted is a legal one-step transition from in_progress.
+                    final_status = (
+                        "interrupted" if script_kind == "interrupt" else "completed"
+                    )
                     await cur.execute(
-                        "UPDATE conversation_responses SET status = 'completed' WHERE conversation_response_id = %s",
-                        (run_id,),
+                        """
+                        UPDATE conversation_responses
+                        SET status = %s
+                        WHERE conversation_response_id = %s
+                        """,
+                        (final_status, run_id),
                     )
 
         reply_text = f"[stub-reply ws={ws_id} thread={thread_id} turn={turn_index}] {user_text}".strip()
-
-        async def _sse_gen():
-            meta = {
+        meta = {
+            "thread_id": thread_id,
+            "run_id": run_id,
+            "turn_index": turn_index,
+            "workspace_id": ws_id,
+        }
+        user_message = {
+            "thread_id": thread_id,
+            "turn_index": turn_index,
+            "run_id": run_id,
+            "role": "user",
+            "content": user_text,
+            "run_completed_at": "2026-01-01T00:00:00Z",
+        }
+        replay_done = {
+            "has_more": False,
+            "latest_run_id": run_id,
+            "latest_turn_index": turn_index,
+        }
+        if script_kind == "interrupt" and isinstance(armed_script, dict):
+            interrupt_payload = {
                 "thread_id": thread_id,
                 "run_id": run_id,
-                "turn_index": turn_index,
-                "workspace_id": ws_id,
+                "interrupt_id": str(
+                    armed_script.get("interrupt_id") or "int_script_1"
+                ),
+                "action_requests": [
+                    {
+                        "type": "ask_user_question",
+                        "question": str(
+                            armed_script.get("question")
+                            or "Which benchmark index should we use?"
+                        ),
+                        "options": ["CSI 300", "S&P 500"],
+                    }
+                ],
             }
-            yield f"id: 1\nevent: metadata\ndata: {json.dumps(meta)}\n\n"
+            live_events = [
+                ("metadata", meta),
+                ("interrupt", interrupt_payload),
+            ]
+            scripted_replays[str(thread_id)] = _format_sse_page(
+                [
+                    ("user_message", user_message),
+                    ("interrupt", interrupt_payload),
+                    ("replay_done", replay_done),
+                ]
+            )
+            turn_scripts["next"] = None
+        elif script_kind == "record_replay":
             chunk = {
                 "thread_id": thread_id,
+                "turn_index": turn_index,
+                "run_id": run_id,
                 "agent": "main",
                 "id": f"msg_{run_id}",
                 "role": "assistant",
@@ -3587,13 +3714,58 @@ def _create_real_http_test_app(
                 "content_type": "text",
                 "finish_reason": "stop",
             }
-            yield f"id: 2\nevent: message_chunk\ndata: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-            end = {
-                "thread_id": thread_id,
-                "run_id": run_id,
-                "outcome": "completed",
-            }
-            yield f"id: 3\nevent: run_end\ndata: {json.dumps(end)}\n\n"
+            live_events = [
+                ("metadata", meta),
+                ("message_chunk", chunk),
+                (
+                    "run_end",
+                    {
+                        "thread_id": thread_id,
+                        "run_id": run_id,
+                        "outcome": "completed",
+                    },
+                ),
+            ]
+            scripted_replays[str(thread_id)] = _format_sse_page(
+                [
+                    ("user_message", user_message),
+                    ("message_chunk", chunk),
+                    ("replay_done", replay_done),
+                ]
+            )
+            turn_scripts["next"] = None
+        else:
+            live_events = [
+                ("metadata", meta),
+                (
+                    "message_chunk",
+                    {
+                        "thread_id": thread_id,
+                        "agent": "main",
+                        "id": f"msg_{run_id}",
+                        "role": "assistant",
+                        "content": reply_text,
+                        "content_type": "text",
+                        "finish_reason": "stop",
+                    },
+                ),
+                (
+                    "run_end",
+                    {
+                        "thread_id": thread_id,
+                        "run_id": run_id,
+                        "outcome": "completed",
+                    },
+                ),
+            ]
+
+        async def _sse_gen():
+            # enumerate yields (index, (name, data)); all three branches store that pair.
+            for event_id, (name, data) in enumerate(live_events, start=1):
+                yield (
+                    f"id: {event_id}\nevent: {name}\ndata: "
+                    f"{json.dumps(data, ensure_ascii=False)}\n\n"
+                )
 
         return StreamingResponse(_sse_gen(), media_type="text/event-stream")
 
@@ -3606,6 +3778,42 @@ def _create_real_http_test_app(
         thread_id: str, request: Request
     ) -> StreamingResponse:
         return await _handle_thread_turn(request, existing_thread_id=thread_id)
+
+    @app.get("/api/v1/threads/{thread_id}/messages/replay")
+    async def replay_thread_stub(thread_id: str, request: Request) -> StreamingResponse:
+        """Scripted first page only. Unscripted threads and before_turn stay 404."""
+        user_id = (request.headers.get("X-User-Id") or "").strip()
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        if request.query_params.get("before_turn") is not None:
+            raise HTTPException(status_code=404, detail="Replay page not scripted")
+        page = scripted_replays.get(thread_id)
+        if not page:
+            raise HTTPException(status_code=404, detail="Replay page not scripted")
+        await _authorize_thread_status(thread_id, user_id)
+
+        async def _replay_gen():
+            yield page
+
+        return StreamingResponse(_replay_gen(), media_type="text/event-stream")
+
+    @app.post("/test-harness/next-turn-script")
+    async def test_harness_next_turn_script(request: Request) -> dict[str, Any]:
+        body = await request.json()
+        kind = str(body.get("kind") or "")
+        if kind not in ("interrupt", "record_replay"):
+            raise HTTPException(
+                status_code=400,
+                detail="kind must be interrupt or record_replay",
+            )
+        turn_scripts["next"] = {
+            "kind": kind,
+            "interrupt_id": str(body.get("interrupt_id") or "int_script_1"),
+            "question": str(
+                body.get("question") or "Which benchmark index should we use?"
+            ),
+        }
+        return {"armed": True, "kind": kind}
 
     cancel_state: dict[str, Any] = {"next_status": 200, "calls": []}
 
@@ -3653,15 +3861,27 @@ def _create_real_http_test_app(
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
+                    "SELECT conversation_thread_id FROM conversation_threads "
+                    "WHERE conversation_thread_id = %s FOR UPDATE",
+                    (thread_id,),
+                )
+                await cur.execute(
                     """
                     INSERT INTO conversation_responses (
                         conversation_response_id, conversation_thread_id,
                         turn_index, status, user_id, created_at
                     )
-                    VALUES (%s, %s, 99, %s, %s, NOW())
-                    ON CONFLICT (conversation_response_id) DO UPDATE SET status = EXCLUDED.status
+                    SELECT %s, %s, COALESCE(MAX(turn_index), -1) + 1, 'in_progress', %s, NOW()
+                    FROM conversation_responses WHERE conversation_thread_id = %s
+                    ON CONFLICT (conversation_response_id) DO NOTHING
                     """,
-                    (run_id, thread_id, status, user_id),
+                    (run_id, thread_id, user_id, thread_id),
+                )
+                await cur.execute(
+                    "UPDATE conversation_responses SET status = %s "
+                    "WHERE conversation_response_id = %s "
+                    "AND conversation_thread_id = %s AND user_id = %s",
+                    (status, run_id, thread_id, user_id),
                 )
         return {"thread_id": thread_id, "run_id": run_id, "status": status}
 
@@ -3809,6 +4029,7 @@ def _create_real_http_test_app(
         dalton_user_id: str | None = None,
         message_id: str | None = None,
         workspace_id: str | None = None,
+        delivery_key: str | None = None,
     ) -> dict[str, Any]:
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
@@ -3845,7 +4066,8 @@ def _create_real_http_test_app(
                                command_request,
                                command_result,
                                command_effect_status,
-                               command_reply_pending
+                               command_reply_pending,
+                               fallback_pending
                         FROM dalton_channel_inbound_events
                         WHERE platform = %s AND message_id = %s
                         """,
@@ -3890,10 +4112,34 @@ def _create_real_http_test_app(
                             }
                         )
 
+                delivery_row = None
+                if delivery_key:
+                    await cur.execute(
+                        """
+                        SELECT delivery_key,
+                               kind,
+                               status,
+                               activity_origin,
+                               source_scope_key,
+                               source_generation
+                        FROM dalton_channel_deliveries
+                        WHERE delivery_key = %s
+                        """,
+                        (delivery_key,),
+                    )
+                    drow = await cur.fetchone()
+                    if drow:
+                        delivery_row = dict(drow)
+                        if delivery_row.get("source_generation") is not None:
+                            delivery_row["source_generation"] = int(
+                                delivery_row["source_generation"]
+                            )
+
         return {
             "session": session_row,
             "inbound": inbound_row,
             "threads": threads,
+            "delivery": delivery_row,
         }
 
     return app

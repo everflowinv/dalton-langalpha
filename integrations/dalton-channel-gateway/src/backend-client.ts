@@ -242,6 +242,8 @@ export interface I3SessionCommandResponse {
   run_id?: string | null;
   command_effect_status?: string | null;
   command_reply_pending?: boolean;
+  /** HTTP status from a permanent `/stop` cancel denial, kept with the command result. */
+  stop_cancel_status?: number | null;
   switched?: boolean;
 }
 
@@ -405,6 +407,8 @@ export interface I7InboundProgressRequest {
   fallback_pending?: boolean;
   command_effect_status?: string | null;
   command_reply_pending?: boolean;
+  /** Replaces the stored command result. A `/stop` cancel denial is recorded here. */
+  command_result?: I3SessionCommandResponse | null;
   uploaded_attachments?: UploadedAttachmentRecord[];
   raw_payload?: Record<string, unknown>;
   raw_payload_patch?: Record<string, unknown>;

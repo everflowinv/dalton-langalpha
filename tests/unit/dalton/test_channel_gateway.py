@@ -395,6 +395,10 @@ class InMemoryChannelStore:
                 if "command_reply_pending = %s" in norm:
                     row["command_reply_pending"] = bool(params[p_idx])
                     p_idx += 1
+                if "command_result = %s" in norm:
+                    val = params[p_idx].obj if hasattr(params[p_idx], "obj") else params[p_idx]
+                    row["command_result"] = dict(val)
+                    p_idx += 1
                 if "raw_payload = %s" in norm:
                     val = params[p_idx].obj if hasattr(params[p_idx], "obj") else params[p_idx]
                     row["raw_payload"] = dict(val)

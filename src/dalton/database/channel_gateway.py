@@ -3494,13 +3494,47 @@ async def authorize_and_claim_delivery(
                         and ex_origin != eff_activity_origin
                     )
                     # Absent scope or generation matches only another absent value.
-                    replay_recovery = (
-                        ex_status == "failed"
-                        and ex_origin == "conversation"
-                        and eff_activity_origin == "replay"
-                        and ex_scope == eff_source_scope
-                        and ex_gen == eff_source_gen
+                    # conversation -> replay is allowed only for this same scope and generation.
+                    # A failed row may be claimed again and stored as replay. A sent or partial
+                    # row is already delivered: return it unchanged and do not send the body again.
+                    same_scope_and_generation = (
+                        ex_scope == eff_source_scope and ex_gen == eff_source_gen
                     )
+                    conversation_to_replay = (
+                        ex_origin == "conversation"
+                        and eff_activity_origin == "replay"
+                        and same_scope_and_generation
+                    )
+                    replay_recovery = ex_status == "failed" and conversation_to_replay
+                    if (
+                        ex_status in ("sent", "partial")
+                        and conversation_to_replay
+                    ):
+                        ex_user = str(existing.get("user_id") or "").strip()
+                        ex_plat = str(existing.get("platform") or "").strip().lower()
+                        ex_target = str(existing.get("target_address") or "").strip()
+                        got_user = str(cleaned_uid or "").strip()
+                        got_plat = str(cleaned_platform or "").strip().lower()
+                        got_target = str(cleaned_target or "").strip()
+                        if (
+                            ex_user != got_user
+                            or ex_plat != got_plat
+                            or ex_target != got_target
+                        ):
+                            return {
+                                "claim_status": "denied",
+                                "status": "failed",
+                                "code": "not_allowed",
+                                "message": "Delivery identity or destination does not match the existing record.",
+                            }
+                        return {
+                            "claim_status": "already_completed",
+                            "status": ex_status,
+                            "first_response_json": existing.get("first_response_json"),
+                            "platform": existing["platform"],
+                            "target_address": existing["target_address"],
+                            "is_current": bool(existing.get("is_current", False)),
+                        }
                     if scope_mismatch or gen_mismatch or (
                         origin_differs and not replay_recovery
                     ):
@@ -4621,6 +4655,7 @@ async def update_inbound_progress(
     raw_payload_patch: dict[str, Any] | None = None,
     command_effect_status: str | None = None,
     command_reply_pending: bool | None = None,
+    command_result: dict[str, Any] | None = None,
     session_interrupt_update: dict[str, Any] | None = None,
     background_run: dict[str, Any] | None = None,
     thread_watch: dict[str, Any] | None = None,
@@ -4647,6 +4682,7 @@ async def update_inbound_progress(
             raw_payload_patch=raw_payload_patch,
             command_effect_status=command_effect_status,
             command_reply_pending=command_reply_pending,
+            command_result=command_result,
             session_interrupt_update=session_interrupt_update,
             background_run=background_run,
             thread_watch=thread_watch,
@@ -4673,6 +4709,7 @@ async def _update_inbound_progress_once(
     raw_payload_patch: dict[str, Any] | None = None,
     command_effect_status: str | None = None,
     command_reply_pending: bool | None = None,
+    command_result: dict[str, Any] | None = None,
     session_interrupt_update: dict[str, Any] | None = None,
     background_run: dict[str, Any] | None = None,
     thread_watch: dict[str, Any] | None = None,
@@ -5051,6 +5088,14 @@ async def _update_inbound_progress_once(
                     if command_reply_pending is not None:
                         sets.append("command_reply_pending = %s")
                         params.append(bool(command_reply_pending))
+                    if command_result is not None:
+                        if not isinstance(command_result, dict):
+                            raise HTTPException(
+                                status_code=400,
+                                detail="command_result must be an object",
+                            )
+                        sets.append("command_result = %s")
+                        params.append(Jsonb(command_result))
                     if raw_payload is not None:
                         sets.append("raw_payload = %s")
                         params.append(Jsonb(raw_payload))

@@ -550,6 +550,11 @@ export class ChannelGatewayOrchestrator {
 
     const userId = cmdRes.dalton_user_id ?? null;
 
+    if (cmd === "stop" && this.isStopCancelDenied(cmdRes)) {
+      await this.deliverPersistedStopCancelDenial({ event, cmdRes });
+      return;
+    }
+
     if (cmd === "stop" && cmdRes.ok) {
       if (cmdRes.command_effect_status !== "done") {
         if (!cmdRes.thread_id || !cmdRes.run_id) {
@@ -595,40 +600,34 @@ export class ChannelGatewayOrchestrator {
               message_id: event.messageId,
               command_effect_status: "done",
             });
-          } else if (isPermanentDenial) {
-            const failText = `Failed to stop the current run (status ${cancelStatus}).`;
-            if (cmdRes.command_reply_pending !== false) {
-              if (userId) {
-                await this.sendNoticeDelivery({
-                  deliveryKey: `notice:${event.platform}:${event.messageId}:command_err`,
-                  userId,
-                  threadId: cmdRes.thread_id,
-                  runId: cmdRes.run_id,
-                  platform: event.platform,
-                  target: event.chatAddress,
-                  inboundMessageId: event.messageId,
-                  text: failText,
-                  replyToMessageId: event.messageId,
-                  threadScopeKey: event.threadScopeKey,
-                  sourceScopeKey: event.threadScopeKey,
-                  sourceGeneration:
-                    typeof cmdRes.generation === "number"
-                      ? cmdRes.generation
-                      : null,
-                  activityOrigin: "none",
-                });
-              } else {
-                await this.sendDirectAdapterNotice(event, failText);
-              }
-            }
+          } else if (isPermanentDenial && cancelStatus !== null) {
+            const replyStillPending = cmdRes.command_reply_pending !== false;
+            const failureResult = this.stopCancelFailureResult(
+              cmdRes,
+              cancelStatus,
+              replyStillPending,
+            );
             await this.backend.updateInboundProgress({
               platform: event.platform,
               message_id: event.messageId,
               status: "failed",
               command_effect_status: "done",
-              command_reply_pending: false,
+              command_reply_pending: replyStillPending,
               fallback_pending: false,
+              command_result: {
+                ...failureResult,
+                dalton_user_id: userId ?? failureResult.dalton_user_id ?? null,
+              },
             });
+            if (replyStillPending) {
+              await this.deliverPersistedStopCancelDenial({
+                event,
+                cmdRes: {
+                  ...failureResult,
+                  dalton_user_id: userId ?? failureResult.dalton_user_id ?? null,
+                },
+              });
+            }
             return;
           } else {
             // Transient failure (5xx, 429, or network error): keep `pending_cancel` persisted for recovery
@@ -692,6 +691,79 @@ export class ChannelGatewayOrchestrator {
           : {}),
       });
     }
+  }
+
+  private isStopCancelDenied(cmdRes: {
+    deny_reason?: string | null;
+    stop_cancel_status?: number | null;
+  }): boolean {
+    return (
+      cmdRes.deny_reason === "stop_cancel_denied" ||
+      (typeof cmdRes.stop_cancel_status === "number" &&
+        Number.isFinite(cmdRes.stop_cancel_status))
+    );
+  }
+
+  private stopCancelFailureResult(
+    cmdRes: I3SessionCommandResponse,
+    cancelStatus: number,
+    replyStillPending: boolean,
+  ): I3SessionCommandResponse {
+    return {
+      ...cmdRes,
+      ok: false,
+      allowed: false,
+      deny_reason: "stop_cancel_denied",
+      stop_cancel_status: cancelStatus,
+      command_effect_status: "done",
+      command_reply_pending: replyStillPending,
+    };
+  }
+
+  private async deliverPersistedStopCancelDenial(params: {
+    event: InboundChannelEvent;
+    cmdRes: I3SessionCommandResponse;
+  }): Promise<void> {
+    const { event, cmdRes } = params;
+    if (cmdRes.command_reply_pending === false) {
+      return;
+    }
+    const cancelStatus =
+      typeof cmdRes.stop_cancel_status === "number"
+        ? cmdRes.stop_cancel_status
+        : null;
+    const failText = `Failed to stop the current run (status ${cancelStatus}).`;
+    const userId = cmdRes.dalton_user_id ?? null;
+    let delivered = false;
+    if (userId) {
+      delivered = await this.sendNoticeDelivery({
+        deliveryKey: `notice:${event.platform}:${event.messageId}:command_err`,
+        userId,
+        threadId: cmdRes.thread_id ?? null,
+        runId: cmdRes.run_id ?? null,
+        platform: event.platform,
+        target: event.chatAddress,
+        inboundMessageId: event.messageId,
+        text: failText,
+        replyToMessageId: event.messageId,
+        threadScopeKey: event.threadScopeKey,
+        sourceScopeKey: event.threadScopeKey,
+        sourceGeneration:
+          typeof cmdRes.generation === "number" ? cmdRes.generation : null,
+        activityOrigin: "none",
+      });
+    } else {
+      await this.sendDirectAdapterNotice(event, failText);
+      delivered = true;
+    }
+    if (!delivered) {
+      return;
+    }
+    await this.backend.updateInboundProgress({
+      platform: event.platform,
+      message_id: event.messageId,
+      command_reply_pending: false,
+    });
   }
 
   private formatSessionCommandReply(params: {
@@ -5362,10 +5434,15 @@ export class ChannelGatewayOrchestrator {
 
     const isStaleSessionInterrupt =
       prog.session_is_current_for_interrupt === false;
-    const hasCurrentGeneration =
-      !isStaleSessionInterrupt &&
-      typeof generation === "number" &&
-      generation > 0;
+    const hasKnownGeneration =
+      typeof generation === "number" && generation > 0;
+    // A failed prompt retried after /new or a workspace switch keeps the original
+    // scope and generation and uses replay. A live send still uses conversation.
+    const interruptActivityOrigin: DeliveryActivityOrigin = isStaleSessionInterrupt
+      ? "replay"
+      : hasKnownGeneration
+        ? "conversation"
+        : "none";
     const promptText = this.formatInterruptPrompt(
       pendingState,
       isStaleSessionInterrupt,
@@ -5382,8 +5459,8 @@ export class ChannelGatewayOrchestrator {
       text: promptText,
       threadScopeKey: scopeKey,
       sourceScopeKey: scopeKey,
-      sourceGeneration: hasCurrentGeneration ? generation : null,
-      activityOrigin: hasCurrentGeneration ? "conversation" : "none",
+      sourceGeneration: hasKnownGeneration ? generation : null,
+      activityOrigin: interruptActivityOrigin,
     });
     return deliveryRes.status === "sent" || deliveryRes.status === "partial";
   }
@@ -7147,16 +7224,40 @@ export class ChannelGatewayOrchestrator {
               cmdResRaw.thread_id.length > 0
             ? cmdResRaw.thread_id
             : null;
+      const storedStopCancelStatus =
+        typeof cmdResRaw.stop_cancel_status === "number" &&
+        Number.isFinite(cmdResRaw.stop_cancel_status)
+          ? cmdResRaw.stop_cancel_status
+          : null;
+      const reauthStopCancelStatus =
+        typeof reauthorizedRes.stop_cancel_status === "number" &&
+        Number.isFinite(reauthorizedRes.stop_cancel_status)
+          ? reauthorizedRes.stop_cancel_status
+          : null;
+      const stopCancelDenied =
+        cmd === "stop" &&
+        (cmdResRaw.deny_reason === "stop_cancel_denied" ||
+          reauthorizedRes.deny_reason === "stop_cancel_denied" ||
+          storedStopCancelStatus !== null ||
+          reauthStopCancelStatus !== null);
+      let recoveredGeneration = generation;
+      if (stopCancelDenied) {
+        recoveredGeneration =
+          typeof cmdResRaw.generation === "number"
+            ? cmdResRaw.generation
+            : generation;
+      } else if (
+        typeof reauthorizedRes.generation === "number" &&
+        reauthorizedRes.generation > 0
+      ) {
+        recoveredGeneration = reauthorizedRes.generation;
+      } else if (typeof cmdResRaw.generation === "number") {
+        recoveredGeneration = cmdResRaw.generation;
+      }
       const effectiveCmdRes: I3SessionCommandResponse = {
         ...(cmdResRaw as unknown as I3SessionCommandResponse),
         ...reauthorizedRes,
-        generation:
-          typeof reauthorizedRes.generation === "number" &&
-          reauthorizedRes.generation > 0
-            ? reauthorizedRes.generation
-            : typeof cmdResRaw.generation === "number"
-              ? cmdResRaw.generation
-              : generation,
+        generation: recoveredGeneration,
         external_thread_id:
           reauthorizedRes.external_thread_id ??
           (typeof cmdResRaw.external_thread_id === "string"
@@ -7176,24 +7277,35 @@ export class ChannelGatewayOrchestrator {
               (typeof cmdResRaw.run_id === "string"
                 ? cmdResRaw.run_id
                 : row.run_id)),
-        command_effect_status:
-          !reauthorizedRes.ok ||
-          (cmd === "stop" && (!persistedStopThreadId || !persistedStopRunId))
+        command_effect_status: stopCancelDenied
+          ? "done"
+          : !reauthorizedRes.ok ||
+              (cmd === "stop" && (!persistedStopThreadId || !persistedStopRunId))
             ? "done"
             : row.command_effect_status === "done"
               ? "done"
               : (reauthorizedRes.command_effect_status ??
                 row.command_effect_status ??
                 (cmd === "stop" ? "pending_cancel" : "done")),
-        command_reply_pending:
-          !reauthorizedRes.ok &&
-          reauthorizedRes.command_reply_pending === false
+        command_reply_pending: stopCancelDenied
+          ? row.command_reply_pending !== false
+          : !reauthorizedRes.ok &&
+              reauthorizedRes.command_reply_pending === false
             ? false
             : row.command_reply_pending === false
               ? false
               : (reauthorizedRes.command_reply_pending ??
                 row.command_reply_pending ??
                 true),
+        ...(stopCancelDenied
+          ? {
+              ok: false,
+              allowed: false,
+              deny_reason: "stop_cancel_denied",
+              stop_cancel_status:
+                reauthStopCancelStatus ?? storedStopCancelStatus,
+            }
+          : {}),
       };
       await this.completeSessionCommandExecution({
         event: syntheticEvent,
@@ -7453,13 +7565,7 @@ export class ChannelGatewayOrchestrator {
         return;
       }
 
-      await this.backend.updateInboundProgress({
-        platform: row.platform,
-        message_id: row.message_id,
-        status: "failed",
-        fallback_pending: false,
-      });
-      await this.sendNoticeDelivery({
+      const endedNoticeOk = await this.sendNoticeDelivery({
         deliveryKey: `notice:${row.platform}:${row.message_id}:rec_${runStatus}`,
         userId,
         threadId: row.thread_id,
@@ -7469,6 +7575,14 @@ export class ChannelGatewayOrchestrator {
         inboundMessageId: row.message_id,
         text: `The interrupted run ended with status "${runStatus}".`,
         threadScopeKey: row.thread_scope_key,
+        sourceScopeKey: row.thread_scope_key,
+        activityOrigin: "none",
+      });
+      await this.backend.updateInboundProgress({
+        platform: row.platform,
+        message_id: row.message_id,
+        status: "failed",
+        fallback_pending: !endedNoticeOk,
       });
       return;
     }
@@ -7880,7 +7994,10 @@ export class ChannelGatewayOrchestrator {
         if (ledgerStatus === "partial") {
           needsPartialNotice = true;
         }
-      } else if (claim.claim_status === "in_flight_or_unknown") {
+      } else if (
+        claim.claim_status === "in_flight_or_unknown" ||
+        claim.claim_status === "denied"
+      ) {
         return false;
       } else if (claim.claim_status === "claimed") {
         await this.backend.updateDeliveryProgress({

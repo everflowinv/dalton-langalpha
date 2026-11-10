@@ -98,6 +98,7 @@ interface InspectResponse {
     command_result: Record<string, unknown> | null;
     command_effect_status: string | null;
     command_reply_pending: boolean;
+    fallback_pending?: boolean;
   } | null;
   threads: Array<{
     thread_id: string;
@@ -105,6 +106,14 @@ interface InspectResponse {
     external_id: string | null;
     turn_indexes: number[];
   }>;
+  delivery?: {
+    delivery_key: string;
+    kind: string;
+    status: string;
+    activity_origin: string;
+    source_scope_key: string | null;
+    source_generation: number | null;
+  } | null;
 }
 
 async function startOrAttachRealBackend(): Promise<{
@@ -292,12 +301,14 @@ describe("Real HTTP End-to-End: FeishuChannelAdapter -> GatewayOrchestrator -> H
           userId?: string;
           messageId?: string;
           workspaceId?: string;
+          deliveryKey?: string;
         }): Promise<InspectResponse> => {
           const qs = new URLSearchParams({ platform: "feishu" });
           if (params.scopeKey) qs.set("scope_key", params.scopeKey);
           if (params.userId) qs.set("dalton_user_id", params.userId);
           if (params.messageId) qs.set("message_id", params.messageId);
           if (params.workspaceId) qs.set("workspace_id", params.workspaceId);
+          if (params.deliveryKey) qs.set("delivery_key", params.deliveryKey);
           const deadline = Date.now() + 5_000;
           while (true) {
             const r = await fetch(`${baseUrl}/test-harness/inspect?${qs.toString()}`);
@@ -1185,6 +1196,401 @@ describe("Real HTTP End-to-End: FeishuChannelAdapter -> GatewayOrchestrator -> H
           agedAfterStop.activity_epoch,
           3,
         );
+
+        const countSent = (needle: string): number =>
+          feishuOutbound.sentTexts.filter((item) => item.text.includes(needle))
+            .length;
+        const readCancelCalls = async (): Promise<
+          Array<{ thread_id: string; run_id: string | null; status: number }>
+        > => {
+          const response = await fetch(`${baseUrl}/test-harness/cancel-config`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({}),
+          });
+          expect(response.status).toBe(200);
+          const body = (await response.json()) as {
+            calls: Array<{
+              thread_id: string;
+              run_id: string | null;
+              status: number;
+            }>;
+          };
+          return body.calls;
+        };
+
+        // 8. /stop 403 persists the denial before the notice. A failed notice
+        // stays pending. Recovery resends only that notice. A second adapter
+        // does not cancel or deliver again.
+        const stoppedBefore403 = countSent("Stopped the current run.");
+        const active403Res = await fetch(`${baseUrl}/test-harness/set-active-run`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            thread_id: curThreadId,
+            user_id: boot.user_a,
+            status: "in_progress",
+          }),
+        });
+        const { run_id: deniedRunId } = (await active403Res.json()) as {
+          run_id: string;
+        };
+        await fetch(`${baseUrl}/test-harness/cancel-config`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ next_status: 403, clear_calls: true }),
+        });
+        feishuOutbound.setSendTextBehavior((options) => {
+          if (options.text.includes("Failed to stop the current run")) {
+            throw new ChannelDeliveryError("stop notice failed", {
+              outcome: "failed",
+              code: "unavailable",
+            });
+          }
+          return { messageId: `om_stop_notice_${options.chunkIndex}` };
+        });
+        const mStop403 = `${boot.prefix}_om_stop_403`;
+        await feishuInboundAdapter.receiveRawEvent({
+          sender: {
+            sender_id: { open_id: boot.puid_a },
+            sender_type: "user",
+          },
+          message: {
+            message_id: mStop403,
+            chat_id: "oc_dm_a",
+            chat_type: "p2p",
+            message_type: "text",
+            content: JSON.stringify({ text: "/stop" }),
+          },
+        });
+        const snapStop403 = await inspectDb({
+          scopeKey: dmScopeA,
+          userId: boot.user_a,
+          messageId: mStop403,
+        });
+        expect(snapStop403.inbound?.status).toBe("failed");
+        expect(snapStop403.inbound?.command_effect_status).toBe("done");
+        expect(snapStop403.inbound?.command_reply_pending).toBe(true);
+        expect(snapStop403.inbound?.command_result).toMatchObject({
+          ok: false,
+          allowed: false,
+          deny_reason: "stop_cancel_denied",
+          stop_cancel_status: 403,
+        });
+        expect(countSent("Failed to stop the current run (status 403).")).toBe(0);
+        expect(countSent("Stopped the current run.")).toBe(stoppedBefore403);
+        expect(await readCancelCalls()).toHaveLength(1);
+        feishuOutbound.setSendTextBehavior(null);
+
+        const agedStop403 = await ageSession({
+          scopeKey: dmScopeA,
+          userId: boot.user_a,
+          secondsAgo: 25200,
+        });
+        await app2.orchestrator.runStartupRecovery();
+        const snapStop403Recovered = await inspectDb({
+          scopeKey: dmScopeA,
+          userId: boot.user_a,
+          messageId: mStop403,
+        });
+        expect(
+          countSent("Failed to stop the current run (status 403)."),
+        ).toBe(1);
+        expect(countSent("Stopped the current run.")).toBe(stoppedBefore403);
+        expect(snapStop403Recovered.inbound?.command_reply_pending).toBe(false);
+        expect(snapStop403Recovered.inbound?.command_result).toMatchObject({
+          ok: false,
+          deny_reason: "stop_cancel_denied",
+          stop_cancel_status: 403,
+        });
+        expect(snapStop403Recovered.session?.generation).toBe(
+          agedStop403.generation,
+        );
+        expect(snapStop403Recovered.session?.override_workspace_id).toBe(
+          agedStop403.override_workspace_id,
+        );
+        expect(snapStop403Recovered.session?.activity_epoch).toBeCloseTo(
+          agedStop403.activity_epoch,
+          3,
+        );
+        expect(await readCancelCalls()).toHaveLength(1);
+
+        await feishuInboundAdapter2.receiveRawEvent({
+          sender: {
+            sender_id: { open_id: boot.puid_a },
+            sender_type: "user",
+          },
+          message: {
+            message_id: mStop403,
+            chat_id: "oc_dm_a",
+            chat_type: "p2p",
+            message_type: "text",
+            content: JSON.stringify({ text: "/stop" }),
+          },
+        });
+        const snapStop403Dup = await inspectDb({
+          scopeKey: dmScopeA,
+          userId: boot.user_a,
+          messageId: mStop403,
+        });
+        expect(
+          countSent("Failed to stop the current run (status 403)."),
+        ).toBe(1);
+        expect(countSent("Stopped the current run.")).toBe(stoppedBefore403);
+        expect(snapStop403Dup.inbound?.command_result?.ok).toBe(false);
+        expect(await readCancelCalls()).toHaveLength(1);
+        await fetch(`${baseUrl}/test-harness/set-active-run`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            thread_id: curThreadId,
+            user_id: boot.user_a,
+            run_id: deniedRunId,
+            status: "cancelled",
+          }),
+        });
+        await fetch(`${baseUrl}/test-harness/cancel-config`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ next_status: 200, clear_calls: true }),
+        });
+
+        // 9. A partial body stays partial across replay. Recovery sends only
+        // the short notice and does not repeat the body or extend activity.
+        const partialToken = "PARTIALBODY";
+        const partialUserText = `${partialToken}${"x".repeat(2100)}`;
+        const armRecord = await fetch(`${baseUrl}/test-harness/next-turn-script`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ kind: "record_replay" }),
+        });
+        expect(armRecord.status).toBe(200);
+        feishuOutbound.setSendTextBehavior((options) => {
+          if (
+            options.chunkIndex > 0 ||
+            options.text.includes("后续内容未能发送")
+          ) {
+            throw new ChannelDeliveryError("partial chunk failed", {
+              outcome: "failed",
+              code: "unavailable",
+            });
+          }
+          return { messageId: `om_partial_${options.chunkIndex}` };
+        });
+        const mPartial = `${boot.prefix}_om_partial_body`;
+        await feishuInboundAdapter.receiveRawEvent({
+          sender: {
+            sender_id: { open_id: boot.puid_a },
+            sender_type: "user",
+          },
+          message: {
+            message_id: mPartial,
+            chat_id: "oc_dm_a",
+            chat_type: "p2p",
+            message_type: "text",
+            content: JSON.stringify({ text: partialUserText }),
+          },
+        });
+        const snapPartial = await inspectDb({
+          scopeKey: dmScopeA,
+          userId: boot.user_a,
+          messageId: mPartial,
+        });
+        const partialRunId = snapPartial.inbound?.run_id ?? "";
+        const snapPartialDelivery = await inspectDb({
+          scopeKey: dmScopeA,
+          userId: boot.user_a,
+          messageId: mPartial,
+          deliveryKey: `fallback:${partialRunId}`,
+        });
+        expect(snapPartialDelivery.inbound?.status).toBe("completed");
+        expect(snapPartialDelivery.inbound?.fallback_pending).toBe(true);
+        expect(snapPartialDelivery.delivery).toMatchObject({
+          status: "partial",
+          activity_origin: "conversation",
+          source_scope_key: dmScopeA,
+        });
+        expect(countSent(partialToken)).toBe(1);
+        expect(countSent("后续内容未能发送")).toBe(0);
+        feishuOutbound.setSendTextBehavior(null);
+        const agedPartial = await ageSession({
+          scopeKey: dmScopeA,
+          userId: boot.user_a,
+          secondsAgo: 25200,
+        });
+        await app2.orchestrator.runStartupRecovery();
+        const snapPartialRecovered = await inspectDb({
+          scopeKey: dmScopeA,
+          userId: boot.user_a,
+          messageId: mPartial,
+          deliveryKey: `fallback:${partialRunId}`,
+        });
+        expect(countSent(partialToken)).toBe(1);
+        expect(countSent("后续内容未能发送")).toBe(1);
+        expect(snapPartialRecovered.inbound?.fallback_pending).toBe(false);
+        expect(snapPartialRecovered.delivery).toMatchObject({
+          status: "partial",
+          activity_origin: "conversation",
+          source_scope_key: dmScopeA,
+          source_generation: snapPartialDelivery.delivery?.source_generation,
+        });
+        expect(snapPartialRecovered.session?.generation).toBe(
+          agedPartial.generation,
+        );
+        expect(snapPartialRecovered.session?.override_workspace_id).toBe(
+          agedPartial.override_workspace_id,
+        );
+        expect(snapPartialRecovered.session?.activity_epoch).toBeCloseTo(
+          agedPartial.activity_epoch,
+          3,
+        );
+
+        // 10. A failed current interrupt keeps its scope and generation.
+        // After /new, recovery uses replay and does not send the prompt twice.
+        const interruptQuestion = "Which benchmark index should we use?";
+        const interruptId = "int_real_http_1";
+        const armInterrupt = await fetch(
+          `${baseUrl}/test-harness/next-turn-script`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              kind: "interrupt",
+              interrupt_id: interruptId,
+              question: interruptQuestion,
+            }),
+          },
+        );
+        expect(armInterrupt.status).toBe(200);
+        feishuOutbound.setSendTextBehavior((options) => {
+          if (options.text.includes(interruptQuestion)) {
+            throw new ChannelDeliveryError("interrupt prompt failed", {
+              outcome: "failed",
+              code: "unavailable",
+            });
+          }
+          return { messageId: `om_interrupt_${options.chunkIndex}` };
+        });
+        const mInterrupt = `${boot.prefix}_om_interrupt_recover`;
+        await feishuInboundAdapter.receiveRawEvent({
+          sender: {
+            sender_id: { open_id: boot.puid_a },
+            sender_type: "user",
+          },
+          message: {
+            message_id: mInterrupt,
+            chat_id: "oc_dm_a",
+            chat_type: "p2p",
+            message_type: "text",
+            content: JSON.stringify({ text: "Run benchmark comparison" }),
+          },
+        });
+        const snapInterrupt = await inspectDb({
+          scopeKey: dmScopeA,
+          userId: boot.user_a,
+          messageId: mInterrupt,
+        });
+        const interruptRunId = snapInterrupt.inbound?.run_id ?? "";
+        const interruptThreadId = snapInterrupt.inbound?.thread_id ?? "";
+        const snapInterruptDelivery = await inspectDb({
+          scopeKey: dmScopeA,
+          userId: boot.user_a,
+          messageId: mInterrupt,
+          deliveryKey: `interrupt:${interruptRunId}:${interruptId}`,
+        });
+        expect(snapInterruptDelivery.inbound?.status).toBe("completed");
+        expect(snapInterruptDelivery.inbound?.fallback_pending).toBe(true);
+        expect(snapInterruptDelivery.delivery).toMatchObject({
+          status: "failed",
+          activity_origin: "conversation",
+          source_scope_key: dmScopeA,
+          source_generation: snapInterrupt.session?.generation,
+        });
+        expect(countSent(interruptQuestion)).toBe(0);
+        expect(countSent("earlier conversation thread")).toBe(0);
+        feishuOutbound.setSendTextBehavior(null);
+
+        const mInterruptNew = `${boot.prefix}_om_interrupt_new`;
+        await feishuInboundAdapter.receiveRawEvent({
+          sender: {
+            sender_id: { open_id: boot.puid_a },
+            sender_type: "user",
+          },
+          message: {
+            message_id: mInterruptNew,
+            chat_id: "oc_dm_a",
+            chat_type: "p2p",
+            message_type: "text",
+            content: JSON.stringify({ text: "/new" }),
+          },
+        });
+        const agedInterrupt = await ageSession({
+          scopeKey: dmScopeA,
+          userId: boot.user_a,
+          secondsAgo: 25200,
+        });
+        await app2.orchestrator.runStartupRecovery();
+        const snapInterruptRecovered = await inspectDb({
+          scopeKey: dmScopeA,
+          userId: boot.user_a,
+          messageId: mInterrupt,
+          deliveryKey: `interrupt:${interruptRunId}:${interruptId}`,
+        });
+        const stalePrompts = feishuOutbound.sentTexts.filter((item) =>
+          item.text.includes("earlier conversation thread"),
+        );
+        expect(stalePrompts).toHaveLength(1);
+        expect(stalePrompts[0]?.text).toContain(interruptQuestion);
+        expect(stalePrompts[0]?.text).toContain(
+          `https://dalton.test/chat/t/${interruptThreadId}`,
+        );
+        expect(snapInterruptRecovered.inbound?.fallback_pending).toBe(false);
+        expect(snapInterruptRecovered.delivery).toMatchObject({
+          status: "sent",
+          activity_origin: "replay",
+          source_scope_key: dmScopeA,
+          source_generation: snapInterrupt.session?.generation,
+        });
+        expect(snapInterruptRecovered.session?.generation).toBe(
+          agedInterrupt.generation,
+        );
+        expect(snapInterruptRecovered.session?.override_workspace_id).toBe(
+          agedInterrupt.override_workspace_id,
+        );
+        expect(snapInterruptRecovered.session?.activity_epoch).toBeCloseTo(
+          agedInterrupt.activity_epoch,
+          3,
+        );
+        expect(agedInterrupt.generation).toBe(
+          (snapInterrupt.session?.generation ?? 0) + 1,
+        );
+
+        await realBackendClient.updateInboundProgress({
+          platform: "feishu",
+          message_id: mInterrupt,
+          fallback_pending: true,
+        });
+        await app2.orchestrator.runStartupRecovery();
+        expect(
+          feishuOutbound.sentTexts.filter((item) =>
+            item.text.includes("earlier conversation thread"),
+          ),
+        ).toHaveLength(1);
+        const snapInterruptSecond = await inspectDb({
+          scopeKey: dmScopeA,
+          userId: boot.user_a,
+          messageId: mInterrupt,
+          deliveryKey: `interrupt:${interruptRunId}:${interruptId}`,
+        });
+        expect(snapInterruptSecond.delivery).toMatchObject({
+          status: "sent",
+          activity_origin: "replay",
+          source_generation: snapInterrupt.session?.generation,
+        });
+        expect(snapInterruptSecond.session?.activity_epoch).toBeCloseTo(
+          agedInterrupt.activity_epoch,
+          3,
+        );
       } finally {
         if (app2) {
           await app2.stop();
@@ -1198,6 +1604,6 @@ describe("Real HTTP End-to-End: FeishuChannelAdapter -> GatewayOrchestrator -> H
         rmSync(tempDir, { recursive: true, force: true });
       }
     },
-    60_000,
+    90_000,
   );
 });

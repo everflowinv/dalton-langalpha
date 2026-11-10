@@ -5718,8 +5718,9 @@ describe("main.ts adapter registration & shared helpers", () => {
       expect(lastSent).toContain("earlier conversation thread");
       expect(lastSent).toContain(`/chat/t/${THREAD_ID}`);
       const staleInterruptClaim = h.backend.deliveryClaims.at(-1);
-      expect(staleInterruptClaim?.activity_origin).toBe("none");
-      expect(staleInterruptClaim?.source_generation).toBeNull();
+      expect(staleInterruptClaim?.activity_origin).toBe("replay");
+      expect(staleInterruptClaim?.source_scope_key).toBe("dm:ou_alice");
+      expect(staleInterruptClaim?.source_generation).toBe(1);
     } finally {
       await h.cleanup();
     }
@@ -5837,15 +5838,34 @@ describe("main.ts adapter registration & shared helpers", () => {
         messageId: "om_stop_403_1",
         text: "/stop",
       });
+      const stop403FailureIdx = h.backend.progressUpdates.findIndex(
+        (u) =>
+          u.message_id === "om_stop_403_1" &&
+          u.status === "failed" &&
+          u.command_effect_status === "done" &&
+          u.command_reply_pending === true &&
+          u.command_result?.ok === false &&
+          u.command_result?.allowed === false &&
+          u.command_result?.deny_reason === "stop_cancel_denied" &&
+          u.command_result?.stop_cancel_status === 403,
+      );
+      const stop403ClearIdx = h.backend.progressUpdates.findIndex(
+        (u, idx) =>
+          idx > stop403FailureIdx &&
+          u.message_id === "om_stop_403_1" &&
+          u.command_reply_pending === false,
+      );
+      expect(stop403FailureIdx).toBeGreaterThanOrEqual(0);
+      expect(stop403ClearIdx).toBeGreaterThan(stop403FailureIdx);
       expect(
-        h.backend.progressUpdates.some(
-          (u) =>
-            u.message_id === "om_stop_403_1" &&
-            u.status === "failed" &&
-            u.command_effect_status === "done" &&
-            u.command_reply_pending === false,
+        h.backend.deliveryClaims.find(
+          (claim) =>
+            claim.delivery_key === "notice:feishu:om_stop_403_1:command_err",
         ),
-      ).toBe(true);
+      ).toMatchObject({
+        kind: "notice",
+        activity_origin: "none",
+      });
       expect(h.feishuAdapter.sentTexts.at(-1)?.text).toContain(
         "Failed to stop the current run (status 403).",
       );

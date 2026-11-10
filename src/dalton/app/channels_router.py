@@ -191,6 +191,7 @@ class InboundProgressRequest(BaseModel):
     fallback_pending: bool | None = None
     command_effect_status: str | None = None
     command_reply_pending: bool | None = None
+    command_result: dict[str, Any] | None = None
     uploaded_attachments: list[Any] | None = None
     raw_payload: dict[str, Any] | None = None
     raw_payload_patch: dict[str, Any] | None = None
@@ -470,6 +471,7 @@ async def internal_inbound_progress_endpoint(
         fallback_pending=body.fallback_pending,
         command_effect_status=body.command_effect_status,
         command_reply_pending=body.command_reply_pending,
+        command_result=body.command_result,
         uploaded_attachments=body.uploaded_attachments,
         raw_payload=body.raw_payload,
         raw_payload_patch=body.raw_payload_patch,
