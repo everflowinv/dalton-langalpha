@@ -417,7 +417,6 @@ async def test_pm_dalton_reviewer_models_used_by_publish_run_review(
 ) -> None:
     """When PM sets dalton_reviewer_models, publish.review.run_review uses it end-to-end without mocking the preference/selection chain."""
     from src.dalton.llm import complete as complete_mod
-    from src.dalton.llm import overlay as overlay_mod
     from src.dalton.llm.complete import DaltonCompleteResult, dalton_complete
     from src.dalton.publish.review import ReviewBundle, ReviewVerdict, run_review
 
