@@ -2,8 +2,9 @@
 
 Reads the test database connection string from ``DALTON_CHANNEL_GATEWAY_TEST_DSN``
 (or ``DALTON_TEST_DB_DSN`` / ``TEST_DATABASE_URL``); skips cleanly when unset.
-A session-scoped fixture upgrades the test database to upstream head and Dalton ``d031``
-(skipping if already at head, never dropping ``public`` schema), and each test uses
+A session-scoped fixture upgrades the test database to upstream head and at least Dalton ``d036``
+when the Dalton revision is missing or older. A later revision is left
+in place. It never drops the ``public`` schema. Each test uses
 a unique prefix and cleans up its own rows on teardown.
 """
 
@@ -100,8 +101,31 @@ def _run_alembic_upgrade_sync(cfg: Config, revision: str) -> None:
     command.upgrade(cfg, revision)
 
 
-async def _ensure_alembic_upgraded_to_head(dsn: str) -> None:
-    """Upgrade upstream and Dalton Alembic chains to head/d031 only if not already there, without dropping schema."""
+def _revision_is_target_or_descendant(
+    script: ScriptDirectory, current: str, target: str
+) -> bool:
+    """True when ``current`` is ``target`` or a later revision on the same chain."""
+    seen: set[str] = set()
+    revision: str | None = current
+    while isinstance(revision, str) and revision not in seen:
+        if revision == target:
+            return True
+        seen.add(revision)
+        item = script.get_revision(revision)
+        if item is None:
+            return False
+        down = item.down_revision
+        revision = down if isinstance(down, str) else None
+    return False
+
+
+async def _ensure_alembic_upgraded_to_d036(dsn: str) -> None:
+    """Upgrade upstream to head and Dalton to at least d036.
+
+    Current I-6 reads ``delivery_attempt``, which d031 and d035 do not have.
+    A descendant of d036 is left in place. This does not downgrade. The Dalton
+    version table is ``alembic_version_dalton``.
+    """
     project_root = Path(__file__).resolve().parents[3]
     sa_url = dsn.replace("postgresql://", "postgresql+psycopg://", 1).replace("%", "%%")
 
@@ -115,10 +139,11 @@ async def _ensure_alembic_upgraded_to_head(dsn: str) -> None:
         "script_location", str(project_root / "src" / "dalton" / "migrations")
     )
     dalton_cfg.set_main_option("sqlalchemy.url", sa_url)
-    dalton_target = "d031"
+    dalton_script = ScriptDirectory.from_config(dalton_cfg)
+    dalton_target = "d036"
 
     current_upstream: str | None = None
-    current_dalton: str | None = None
+    dalton_versions: list[str] = []
     async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as conn:
         async with conn.cursor() as cur:
             await cur.execute("SELECT to_regclass('public.alembic_version')")
@@ -129,30 +154,39 @@ async def _ensure_alembic_upgraded_to_head(dsn: str) -> None:
                 if vrow:
                     current_upstream = str(vrow[0])
 
-            await cur.execute("SELECT to_regclass('public.dalton_alembic_version')")
+            await cur.execute(
+                "SELECT to_regclass('public.alembic_version_dalton')"
+            )
             drow = await cur.fetchone()
             if drow and drow[0] is not None:
                 await cur.execute(
-                    "SELECT version_num FROM dalton_alembic_version LIMIT 1"
+                    "SELECT version_num FROM alembic_version_dalton"
                 )
-                dvrow = await cur.fetchone()
-                if dvrow:
-                    current_dalton = str(dvrow[0])
+                dalton_versions = [
+                    str(item[0])
+                    for item in await cur.fetchall()
+                    if item and item[0]
+                ]
 
     if current_upstream != upstream_head:
         await asyncio.to_thread(_run_alembic_upgrade_sync, upstream_cfg, "head")
 
-    if current_dalton != dalton_target:
-        await asyncio.to_thread(_run_alembic_upgrade_sync, dalton_cfg, dalton_target)
+    if not any(
+        _revision_is_target_or_descendant(dalton_script, version, dalton_target)
+        for version in dalton_versions
+    ):
+        await asyncio.to_thread(
+            _run_alembic_upgrade_sync, dalton_cfg, dalton_target
+        )
 
 
 @pytest_asyncio.fixture(scope="session")
 async def channel_gateway_db_pool():
-    """Ensure upstream + Dalton (`d031`) migrations are applied and yield a connection pool."""
+    """Ensure upstream + Dalton (at least `d036`) migrations are applied and yield a connection pool."""
     dsn = _get_test_dsn()
     os.environ.setdefault("BYOK_ENCRYPTION_KEY", "test-channel-gateway-encryption-key-32b")
 
-    await _ensure_alembic_upgraded_to_head(dsn)
+    await _ensure_alembic_upgraded_to_d036(dsn)
 
     pool = AsyncConnectionPool(
         conninfo=dsn,
@@ -4647,6 +4681,7 @@ async def test_ch1_real_http_gateway_orchestrator_to_fastapi_and_postgres(
             "test/real-http-postgres.test.ts",
             "-t",
             "FeishuChannelAdapter",
+            "--reporter=verbose",
             "--pool=forks",
             "--poolOptions.forks.singleFork=true",
             cwd=str(gateway_dir),
@@ -4674,7 +4709,7 @@ async def _serve_cli_harness_main() -> None:
     os.environ.setdefault(
         "BYOK_ENCRYPTION_KEY", "test-channel-gateway-encryption-key-32b"
     )
-    await _ensure_alembic_upgraded_to_head(dsn)
+    await _ensure_alembic_upgraded_to_d036(dsn)
 
     pool = AsyncConnectionPool(
         conninfo=dsn,

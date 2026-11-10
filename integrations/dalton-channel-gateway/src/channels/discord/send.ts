@@ -11,6 +11,7 @@
 
 import { randomBytes } from "node:crypto";
 import { ChannelDeliveryError } from "../adapter.js";
+import { isDiscordThreadChannelType } from "./inbound.js";
 import { classifyDiscordDeliveryError, type DiscordFilePart, type RequestClient } from "./rest.js";
 import { createThreadDiscord, ensureThreadUnarchived, getDiscordChannel, sanitizeDiscordThreadName } from "./threading.js";
 
@@ -81,6 +82,10 @@ export interface SendMessageDiscordParams {
   deliveryKey?: string | null;
   /** Current bot user. A standalone thread is adopted only when this user owns it. */
   botUserId?: string | null;
+  /** Already stored thread. Skips creation and does not consult the active-thread list. */
+  confirmedThreadAddress?: string | null;
+  /** Persist a confirmed thread before the message POST. Failure skips the message. */
+  onConfirmedThread?: (confirmed: { address: string }) => Promise<void>;
   /** Resolves (and caches) a DM channel id for a recipient user id. */
   resolveDmChannelId?: (recipientUserId: string) => Promise<string>;
 }
@@ -90,6 +95,55 @@ export interface SendMessageDiscordResult {
   channelId: string;
   resolvedAddress: string;
   nonce: string;
+}
+
+/**
+ * Post into the thread this delivery already confirmed.
+ * The active-thread list is not a substitute for that stored id.
+ */
+async function routeConfirmedDiscordThread(
+  rest: RequestClient,
+  params: { confirmedAddress: string; authorized: ParsedDiscordTarget },
+): Promise<{ channelId: string; resolvedAddress: string }> {
+  const confirmed = parseDiscordTarget(params.confirmedAddress);
+  if (
+    !confirmed ||
+    confirmed.kind !== "thread" ||
+    !confirmed.threadId ||
+    !confirmed.guildId ||
+    !confirmed.parentChannelId
+  ) {
+    throw new ChannelDeliveryError(
+      "Stored Discord thread address is not a thread in the authorized channel",
+      { outcome: "failed", code: "unavailable" },
+    );
+  }
+  const authorized = params.authorized;
+  if (
+    authorized.kind !== "channel" ||
+    !authorized.guildId ||
+    authorized.guildId !== confirmed.guildId ||
+    authorized.channelId !== confirmed.parentChannelId
+  ) {
+    throw new ChannelDeliveryError(
+      "Stored Discord thread does not match the authorized parent channel",
+      { outcome: "failed", code: "not_allowed" },
+    );
+  }
+  const channel = await getDiscordChannel(rest, confirmed.threadId);
+  if (
+    channel.id !== confirmed.threadId ||
+    channel.guild_id !== confirmed.guildId ||
+    channel.parent_id !== confirmed.parentChannelId ||
+    !isDiscordThreadChannelType(channel.type)
+  ) {
+    throw new ChannelDeliveryError(
+      "Discord confirmed thread does not match the stored destination",
+      { outcome: "failed", code: "unavailable" },
+    );
+  }
+  await ensureThreadUnarchived(rest, channel);
+  return { channelId: confirmed.threadId, resolvedAddress: params.confirmedAddress };
 }
 
 export async function sendMessageDiscord(
@@ -103,10 +157,18 @@ export async function sendMessageDiscord(
     });
   }
   const scopeThreadId = threadIdFromScopeKey(params.threadScopeKey);
+  const confirmedAddress = params.confirmedThreadAddress?.trim() || "";
   let channelId: string;
   let resolvedAddress = params.targetAddress;
 
-  if (parsed.kind === "dm") {
+  if (confirmedAddress) {
+    const routed = await routeConfirmedDiscordThread(rest, {
+      confirmedAddress,
+      authorized: parsed,
+    });
+    channelId = routed.channelId;
+    resolvedAddress = routed.resolvedAddress;
+  } else if (parsed.kind === "dm") {
     const recipient = params.recipientPlatformUserId?.trim();
     if (!recipient) {
       throw new ChannelDeliveryError("Discord DM target requires a recipient user id", {
@@ -128,7 +190,13 @@ export async function sendMessageDiscord(
     channelId = parsed.channelId;
   }
 
-  if (params.newThread && parsed.kind !== "dm" && !scopeThreadId && parsed.kind !== "thread") {
+  if (
+    params.newThread &&
+    !confirmedAddress &&
+    parsed.kind !== "dm" &&
+    !scopeThreadId &&
+    parsed.kind !== "thread"
+  ) {
     const messageId = params.replyToMessageId?.trim() || null;
     const name = sanitizeDiscordThreadName(params.text, messageId ?? undefined);
     const thread = await createThreadDiscord(rest, {
@@ -144,6 +212,17 @@ export async function sendMessageDiscord(
       parentChannelId: thread.parent_id ?? parsed.channelId,
       threadId: thread.id,
     });
+    if (params.onConfirmedThread) {
+      try {
+        await params.onConfirmedThread({ address: resolvedAddress });
+      } catch (err) {
+        if (err instanceof ChannelDeliveryError) throw err;
+        throw new ChannelDeliveryError("Discord confirmed thread was not stored", {
+          outcome: "unknown",
+          code: "unavailable",
+        });
+      }
+    }
   }
 
   const nonce = createDiscordMessageNonce();
@@ -152,7 +231,7 @@ export async function sendMessageDiscord(
     nonce,
     allowed_mentions: { parse: [] },
   };
-  if (params.replyToMessageId && !params.newThread) {
+  if (params.replyToMessageId && !params.newThread && !confirmedAddress) {
     body.message_reference = { message_id: params.replyToMessageId };
   }
   let response: unknown;
