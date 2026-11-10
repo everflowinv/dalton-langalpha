@@ -24,6 +24,32 @@ const POLLABLE_QR_STATUSES: ReadonlySet<DaltonWeixinQrPublicStatus> = new Set([
   'scaned_but_redirect',
 ]);
 
+const TRANSIENT_RETRY_DELAYS_MS = [400, 800, 1600, 3200, 6400];
+
+function isTransientQrPollError(err: unknown): boolean {
+  const status = err instanceof ApiError
+    ? err.response?.status
+    : typeof err === 'object' && err !== null && 'response' in err
+      ? (err as { response?: { status?: number } }).response?.status
+      : undefined;
+  if (status === undefined) return true;
+  if (status === 408 || status === 429) return true;
+  return status >= 500;
+}
+
+function mergeSameSessionQr(
+  prev: DaltonWeixinQrPublicResponse | null,
+  sessionKey: string,
+  next: DaltonWeixinQrPublicResponse,
+): DaltonWeixinQrPublicResponse | null {
+  if (!prev || prev.session_key !== sessionKey) return prev;
+  return {
+    ...next,
+    qrcode_url: next.qrcode_url ?? prev.qrcode_url,
+    qrcode_img_content: next.qrcode_img_content ?? prev.qrcode_img_content,
+  };
+}
+
 function isBotActive(bot: DaltonWeixinBotPublicState | null | undefined): boolean {
   return bot?.configured === true && bot.status === 'active';
 }
@@ -145,13 +171,16 @@ export function DaltonWeixinChannelCard(): React.ReactElement | null {
     }
     let cancelled = false;
     let timerId: ReturnType<typeof setTimeout> | null = null;
+    let transientAttempts = 0;
 
     const pollOnce = async () => {
       if (cancelled || pollStoppedRef.current) return;
       try {
         const next = await waitDaltonWeixinQrLogin(sessionKey);
         if (cancelled || pollStoppedRef.current) return;
-        setQrState((prev) => (prev?.session_key === sessionKey ? next : prev));
+        transientAttempts = 0;
+        setActionError(null);
+        setQrState((prev) => mergeSameSessionQr(prev, sessionKey, next));
         if (isQrLoginConfirmed(next.status)) {
           void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.channelBindings() });
           return;
@@ -166,6 +195,13 @@ export function DaltonWeixinChannelCard(): React.ReactElement | null {
         if (cancelled || pollStoppedRef.current) return;
         const msg = err instanceof Error && err.message ? err.message : '查询扫码状态失败';
         setActionError(msg);
+        if (!isTransientQrPollError(err)) return;
+        const delay = TRANSIENT_RETRY_DELAYS_MS[transientAttempts];
+        if (delay === undefined || cancelled) return;
+        transientAttempts += 1;
+        timerId = setTimeout(() => {
+          void pollOnce();
+        }, delay);
       }
     };
 

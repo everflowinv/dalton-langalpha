@@ -145,7 +145,16 @@ export function shapePublicQrWaitResponse(params: {
   botGeneration?: number | null;
   expiresAt?: string | null;
   message?: string | null;
+  qrcodeImgContent?: string | null;
+  allowedDomains?: readonly string[];
 }): WeixinQrPublicWaitResponse {
+  const keepQr =
+    params.status === "wait" ||
+    params.status === "scaned" ||
+    params.status === "verify_code";
+  const safeQr = keepQr
+    ? sanitizeQrCodeImageContent(params.qrcodeImgContent, params.allowedDomains)
+    : "";
   return {
     session_key: params.sessionKey,
     status: params.status,
@@ -158,7 +167,20 @@ export function shapePublicQrWaitResponse(params: {
       : {}),
     ...(params.expiresAt ? { expires_at: params.expiresAt } : {}),
     ...(params.message ? { message: params.message } : {}),
+    ...(safeQr ? { qrcode_img_content: safeQr, qrcode_url: safeQr } : {}),
   };
+}
+
+function sessionQrImage(
+  state: {
+    login_session_key?: string | null;
+    login_qrcode?: string | null;
+    login_qrcode_img_content?: string | null;
+  },
+  sessionKey: string,
+): string | null {
+  if (state.login_session_key !== sessionKey) return null;
+  return state.login_qrcode_img_content || state.login_qrcode || null;
 }
 
 export class WeixinQrLoginError extends Error {
@@ -417,6 +439,7 @@ export class WeixinQrLoginManager {
         status: expired ? "expired" : "wait",
         connected: false,
         expiresAt: state.login_expires_at,
+        qrcodeImgContent: expired ? null : sessionQrImage(state, sessionKey),
         message: expired
           ? "QR code has expired."
           : "QR login is not confirmed yet.",
@@ -636,6 +659,7 @@ export class WeixinQrLoginManager {
         status: "wait",
         connected: false,
         expiresAt: initialState.login_expires_at,
+        qrcodeImgContent: sessionQrImage(initialState, sessionKey),
       });
     }
 
@@ -663,6 +687,7 @@ export class WeixinQrLoginManager {
         status: normalizedStatus,
         connected: false,
         expiresAt: initialState.login_expires_at,
+        qrcodeImgContent: sessionQrImage(initialState, sessionKey),
         message:
           normalizedStatus === "verify_code"
             ? "Please enter the verification code shown in WeChat."

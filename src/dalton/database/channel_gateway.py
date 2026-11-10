@@ -7,7 +7,7 @@ Global lock order across transactions:
 1. Personal settings advisory + row locks (`dalton_user_settings:<user_id>`, `dalton_channel_user_settings` `FOR UPDATE`; sorted by `user_id` when locking multiple users)
 2. Group chat advisory locks (`_acquire_group_chat_lock`; sorted by `platform`, `chat_address`)
 3. Weixin state singleton. Confirm, account switch, and cursor updates take `FOR UPDATE`. A registration or bind that reads the bot generation takes `FOR SHARE` after settings locks and before the sender lock.
-4. Weixin context-token advisory locks (`dalton_weixin_context:<bot>:<generation>:<sender>`), sorted by bot, generation, and sender when locking several. After the state lock and before identity or token row locks.
+4. Weixin context-token advisory locks (`dalton_weixin_context:<bot>:<generation>:<sender>`), sorted by bot, generation, and sender when locking several. After the state lock and before identity or token row locks. A Weixin bind re-reads the sender's owners after that lock. A larger set aborts before any identity change and does not take another settings lock.
 5. Chat binding rows (`dalton_channel_chat_bindings`) / identity rows (`dalton_channel_identities`) / session generation rows (`dalton_channel_session_generations` `FOR UPDATE`)
 6. Inbound event / thread watch / background run / delivery rows (`dalton_channel_inbound_events`, `dalton_channel_thread_watches`, `dalton_channel_background_runs`, `dalton_channel_deliveries` `FOR UPDATE`)
 """
@@ -153,9 +153,127 @@ async def _lock_or_create_session_row(
     return row, inserted_new, db_now
 
 
+class _WeixinSettingsLockSetChanged(Exception):
+    """The users that must be locked changed after the settings set was taken.
+
+    Callers lock the discovered set, then read it again before the singleton
+    lock and again after the Weixin sender lock. A larger set raises this
+    error instead of taking a new settings lock. `_run_tx_with_retry` runs the
+    transaction again only when the caller did not pass a connection.
+    """
+
+
+_weixin_settings_discovery_hook: Callable[[], Awaitable[None]] | None = None
+_weixin_before_sender_lock_hook: Callable[[], Awaitable[None]] | None = None
+
+
+def _sorted_user_ids(*groups: Any) -> list[str]:
+    found: set[str] = set()
+    for group in groups:
+        if group is None:
+            continue
+        items = [group] if isinstance(group, str) else list(group)
+        for item in items:
+            cleaned = str(item or "").strip()
+            if cleaned:
+                found.add(cleaned)
+    return sorted(found)
+
+
+async def _weixin_identity_user_ids_in_tx(
+    cur: Any, platform_user_id: str | None
+) -> set[str]:
+    cleaned = str(platform_user_id or "").strip()
+    if not cleaned:
+        return set()
+    await cur.execute(
+        """
+        SELECT user_id FROM dalton_channel_identities
+        WHERE platform = %s AND platform_user_id = %s
+        """,
+        ("weixin", cleaned),
+    )
+    return {
+        str(row["user_id"])
+        for row in await cur.fetchall()
+        if row.get("user_id")
+    }
+
+
+async def _weixin_saved_state_owner_ids_in_tx(cur: Any) -> set[str]:
+    await cur.execute(
+        """
+        SELECT owner_user_id, login_owner_user_id
+        FROM dalton_channel_weixin_state
+        WHERE singleton_id = 1
+        """
+    )
+    row = await cur.fetchone()
+    if not row:
+        return set()
+    return set(_sorted_user_ids(row.get("owner_user_id"), row.get("login_owner_user_id")))
+
+
+async def _lock_user_settings_rows_in_tx(cur: Any, user_ids: Any) -> frozenset[str]:
+    """Lock personal settings advisory and row locks in sorted user-id order."""
+    locked = _sorted_user_ids(user_ids)
+    for lock_uid in locked:
+        reject_company_system_auth(lock_uid)
+        await cur.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(%s))",
+            (f"dalton_user_settings:{lock_uid}",),
+        )
+        await cur.execute(
+            """
+            SELECT 1 FROM dalton_channel_user_settings
+            WHERE user_id = %s FOR UPDATE
+            """,
+            (lock_uid,),
+        )
+    return frozenset(locked)
+
+
+async def _preview_weixin_bind_settings_users(
+    cur: Any,
+    *,
+    owner_user_ids: Any = None,
+    platform_user_id: str | None = None,
+    include_saved_state_owners: bool = False,
+) -> set[str]:
+    """Read the users a bind will need, then let a test change that set.
+
+    The hook runs after the unlocked read and before any settings lock. The
+    returned set is the pre-hook set. The caller locks that set, takes the
+    singleton, and reads again.
+    """
+    found = set(_sorted_user_ids(owner_user_ids))
+    if include_saved_state_owners:
+        found.update(await _weixin_saved_state_owner_ids_in_tx(cur))
+    found.update(await _weixin_identity_user_ids_in_tx(cur, platform_user_id))
+    hook = _weixin_settings_discovery_hook
+    if hook is not None:
+        await hook()
+    return found
+
+
+async def _require_weixin_bind_settings_subset(
+    cur: Any,
+    *,
+    owner_user_id: str | None,
+    platform_user_id: str | None,
+    already_locked: frozenset[str],
+) -> None:
+    required = set(await _weixin_identity_user_ids_in_tx(cur, platform_user_id))
+    owner = str(owner_user_id or "").strip()
+    if owner:
+        required.add(owner)
+    if not required.issubset(already_locked):
+        raise _WeixinSettingsLockSetChanged()
+
+
 def _is_retryable_tx_error(exc: BaseException) -> bool:
-    """Return True for `DeadlockDetected` or `UniqueViolation` on `dalton_channel_user_settings_pkey`."""
-    if isinstance(exc, psycopg.errors.DeadlockDetected):
+    """Return True for deadlock, settings-lock-set change, or settings primary-key conflict."""
+    if isinstance(exc, (_WeixinSettingsLockSetChanged, psycopg.errors.DeadlockDetected)):
         return True
     if isinstance(exc, psycopg.errors.UniqueViolation):
         diag = getattr(exc, "diag", None)
@@ -1957,6 +2075,7 @@ async def _bind_identity_in_tx(
     weixin_bot_generation: int | None = None,
     weixin_context_seq: int | None = None,
     inbound_message_id: str | None = None,
+    settings_already_locked: frozenset[str] | None = None,
 ) -> int:
     """Bind `(user_id, platform)` to `platform_user_id`, advance existing generations, and initialize settings.
 
@@ -1964,13 +2083,14 @@ async def _bind_identity_in_tx(
     replaces the current token only when it is strictly newer in the same
     field. The identity then copies the current token and that token's source
     and value. An older message does not replace the current token.
+
+    Settings locks come before the Weixin singleton. A caller that already holds
+    the singleton passes `settings_already_locked` and this function does not
+    take another settings lock. After the sender lock, the bind reads the
+    owners again. A user who was not in the locked set raises
+    `_WeixinSettingsLockSetChanged` before any identity change.
     """
     reject_company_system_auth(user_id)
-    # Lock order (same as update_user_channel_settings): personal settings locks
-    # first, then session generation rows. Lock the binder's row and every
-    # displaced user's row, sorted, before touching any generation row; otherwise
-    # a concurrent settings save (settings row -> group lock -> generation rows)
-    # and this bind (generation rows -> settings row) deadlock.
     await cur.execute(
         """
         SELECT user_id FROM dalton_channel_identities
@@ -1978,20 +2098,29 @@ async def _bind_identity_in_tx(
         """,
         (platform, platform_user_id, user_id),
     )
-    lock_uids = sorted({user_id, *(str(r["user_id"]) for r in await cur.fetchall())})
-    for lock_uid in lock_uids:
-        reject_company_system_auth(lock_uid)
-        await cur.execute(
-            "SELECT pg_advisory_xact_lock(hashtext(%s))",
-            (f"dalton_user_settings:{lock_uid}",),
-        )
+    required_users = {user_id, *(str(r["user_id"]) for r in await cur.fetchall() if r.get("user_id"))}
+    if settings_already_locked is None:
+        hook = _weixin_settings_discovery_hook
+        if hook is not None:
+            await hook()
+        held_settings = await _lock_user_settings_rows_in_tx(cur, required_users)
         await cur.execute(
             """
-            SELECT 1 FROM dalton_channel_user_settings
-            WHERE user_id = %s FOR UPDATE
+            SELECT user_id FROM dalton_channel_identities
+            WHERE platform = %s AND platform_user_id = %s AND user_id != %s
             """,
-            (lock_uid,),
+            (platform, platform_user_id, user_id),
         )
+        required_after = {
+            user_id,
+            *(str(r["user_id"]) for r in await cur.fetchall() if r.get("user_id")),
+        }
+        if not required_after.issubset(held_settings):
+            raise _WeixinSettingsLockSetChanged()
+    else:
+        if not required_users.issubset(settings_already_locked):
+            raise _WeixinSettingsLockSetChanged()
+        held_settings = settings_already_locked
     if platform == "weixin":
         active_bot_id, active_bot_gen, _ = await _get_active_weixin_bot_in_tx(
             cur, lock_generation=True
@@ -2002,12 +2131,28 @@ async def _bind_identity_in_tx(
         else:
             lock_bot = str(weixin_bot_id or "default").strip() or "default"
             lock_gen = int(weixin_bot_generation or 1)
+        before_sender = _weixin_before_sender_lock_hook
+        if before_sender is not None:
+            await before_sender()
         await _lock_weixin_context_sender_in_tx(
             cur,
             bot_id=lock_bot,
             bot_generation=lock_gen,
             platform_user_id=platform_user_id,
         )
+        await cur.execute(
+            """
+            SELECT user_id FROM dalton_channel_identities
+            WHERE platform = %s AND platform_user_id = %s AND user_id != %s
+            """,
+            (platform, platform_user_id, user_id),
+        )
+        required_under_sender = {
+            user_id,
+            *(str(r["user_id"]) for r in await cur.fetchall() if r.get("user_id")),
+        }
+        if not required_under_sender.issubset(held_settings):
+            raise _WeixinSettingsLockSetChanged()
     # If another Dalton user was previously bound to this same (platform, platform_user_id), unbind them and bump their generation
     await cur.execute(
         """
@@ -2266,33 +2411,89 @@ async def _bind_identity_in_tx(
     return current_gen
 
 
+def _bind_confirmation_delivery_key(
+    platform: str,
+    message_id: str,
+    action: str,
+    result: dict[str, Any],
+) -> str:
+    reason = str(result.get("reason") or "")
+    ok = bool(result.get("ok"))
+    if action == "bind" and reason in ("missing_bind_code", "missing_argument"):
+        suffix = "bind_usage"
+    elif action == "bind":
+        suffix = "bind_ok" if ok else "bind_err"
+    else:
+        suffix = "unbind_ok" if ok else "unbind_err"
+    return f"notice:{platform}:{message_id}:{suffix}"
+
+
+def _public_consumed_bind_result(
+    action: str,
+    result: dict[str, Any],
+    *,
+    platform: str,
+    inbound_message_id: str | None,
+) -> dict[str, Any]:
+    """Saved bind/unbind result. The bind code is not part of this object."""
+    public = {
+        key: value
+        for key, value in result.items()
+        if key not in ("code", "bind_code", "arg")
+    }
+    public["action"] = action
+    if inbound_message_id:
+        public["delivery_key"] = _bind_confirmation_delivery_key(
+            platform, inbound_message_id, action, public
+        )
+    return public
+
+
 async def _record_consumed_bind_result_in_tx(
     cur: Any,
     *,
     platform: str,
     inbound_message_id: str | None,
     result: dict[str, Any],
+    action: str,
     dalton_user_id: str | None = None,
 ) -> dict[str, Any]:
+    """Save the bind or unbind effect and leave the reply pending.
+
+    Completion is recorded by the gateway only after the fixed delivery key
+    is durably sent. This update does not consume the code again on replay.
+    """
+    public = _public_consumed_bind_result(
+        action,
+        result,
+        platform=platform,
+        inbound_message_id=inbound_message_id,
+    )
     if not inbound_message_id:
-        return result
+        return public
+    command_request = {"action": action}
     await cur.execute(
         """
         UPDATE dalton_channel_inbound_events
         SET consumed_bind_result = %s,
             dalton_user_id = COALESCE(%s, dalton_user_id),
-            status = 'completed',
+            command_request = %s,
+            command_result = %s,
+            command_effect_status = 'done',
+            command_reply_pending = TRUE,
             updated_at = NOW()
         WHERE platform = %s AND message_id = %s
         """,
         (
-            Jsonb(result),
+            Jsonb(public),
             dalton_user_id,
+            Jsonb(command_request),
+            Jsonb(public),
             platform,
             inbound_message_id,
         ),
     )
-    return result
+    return public
 
 
 async def consume_bind_code_or_unbind(
@@ -2383,6 +2584,7 @@ async def _consume_bind_code_or_unbind_once(
                             platform=cleaned_platform,
                             inbound_message_id=cleaned_inbound_mid,
                             result=res,
+                            action=cleaned_action,
                         )
                     code_hash = hash_bind_code(cleaned_code)
 
@@ -2413,6 +2615,7 @@ async def _consume_bind_code_or_unbind_once(
                             platform=cleaned_platform,
                             inbound_message_id=cleaned_inbound_mid,
                             result=res,
+                            action=cleaned_action,
                         )
 
                     # 2. Private DM bind code consumption
@@ -2439,6 +2642,7 @@ async def _consume_bind_code_or_unbind_once(
                             platform=cleaned_platform,
                             inbound_message_id=cleaned_inbound_mid,
                             result=res,
+                            action=cleaned_action,
                         )
 
                     row_platform = str(row["platform"]).strip().lower()
@@ -2454,6 +2658,7 @@ async def _consume_bind_code_or_unbind_once(
                             platform=cleaned_platform,
                             inbound_message_id=cleaned_inbound_mid,
                             result=res,
+                            action=cleaned_action,
                         )
 
                     cleaned_puid = str(platform_user_id or "").strip()
@@ -2464,6 +2669,7 @@ async def _consume_bind_code_or_unbind_once(
                             platform=cleaned_platform,
                             inbound_message_id=cleaned_inbound_mid,
                             result=res,
+                            action=cleaned_action,
                         )
 
                     target_uid = str(row["user_id"])
@@ -2499,6 +2705,7 @@ async def _consume_bind_code_or_unbind_once(
                         platform=cleaned_platform,
                         inbound_message_id=cleaned_inbound_mid,
                         result=res,
+                        action=cleaned_action,
                         dalton_user_id=target_uid,
                     )
 
@@ -2526,6 +2733,7 @@ async def _consume_bind_code_or_unbind_once(
                             platform=cleaned_platform,
                             inbound_message_id=cleaned_inbound_mid,
                             result=res,
+                            action=cleaned_action,
                         )
                     reject_company_system_auth(target_uid)
 
@@ -2688,6 +2896,7 @@ async def _consume_bind_code_or_unbind_once(
                         platform=cleaned_platform,
                         inbound_message_id=cleaned_inbound_mid,
                         result=res,
+                        action=cleaned_action,
                         dalton_user_id=target_uid,
                     )
 
@@ -2764,6 +2973,10 @@ async def execute_session_command(
     request_key: str | None = None,
     raw_payload: dict[str, Any] | None = None,
     weixin_context_token: str | None = None,
+    weixin_bot_id: str | None = None,
+    weixin_bot_generation: int | None = None,
+    weixin_context_source: str | None = None,
+    weixin_context_seq: int | None = None,
     workspace_id: str | None = None,
     workspace_query: str | None = None,
     target_kind: str | None = None,
@@ -2790,6 +3003,10 @@ async def execute_session_command(
             request_key=request_key,
             raw_payload=raw_payload,
             weixin_context_token=weixin_context_token,
+            weixin_bot_id=weixin_bot_id,
+            weixin_bot_generation=weixin_bot_generation,
+            weixin_context_source=weixin_context_source,
+            weixin_context_seq=weixin_context_seq,
             workspace_id=workspace_id,
             workspace_query=workspace_query,
             target_kind=target_kind,
@@ -2894,6 +3111,10 @@ async def _execute_session_command_once(
     request_key: str | None = None,
     raw_payload: dict[str, Any] | None = None,
     weixin_context_token: str | None = None,
+    weixin_bot_id: str | None = None,
+    weixin_bot_generation: int | None = None,
+    weixin_context_source: str | None = None,
+    weixin_context_seq: int | None = None,
     workspace_id: str | None = None,
     workspace_query: str | None = None,
     target_kind: str | None = None,
@@ -2926,11 +3147,10 @@ async def _execute_session_command_once(
             else str(uuid5(DALTON_CHANNEL_NAMESPACE, f"{cleaned_platform}:{cleaned_scope}:{cleaned_cmd}"))
         )
     )
-    payload_dict = dict(raw_payload or {})
+    payload_dict = _strip_sensitive_from_raw_payload(dict(raw_payload or {}))
     if cleaned_puid:
         payload_dict["platform_user_id"] = cleaned_puid
-    if weixin_context_token and "weixin_context_token" not in payload_dict:
-        payload_dict["weixin_context_token"] = weixin_context_token
+    context_stamp: tuple[str, str, str, int, int] | None = None
 
     cmd_req_dict: dict[str, Any] = {
         "cmd": cleaned_cmd,
@@ -3000,6 +3220,20 @@ async def _execute_session_command_once(
                             raw_payload=payload_dict,
                         )
                     return res_payload
+
+                if (
+                    cleaned_platform == "weixin"
+                    and _payload_marks_invalid_inbound(payload_dict)
+                ):
+                    return await _deny_and_ignore_command(
+                        {
+                            "ok": False,
+                            "linked": False,
+                            "allowed": False,
+                            "deny_reason": "invalid_inbound_event",
+                        },
+                        uid_val=None,
+                    )
 
                 # 1. Identity verification (including re-authorization on redelivery / startup recovery)
                 if orig_puid and cleaned_puid and orig_puid != cleaned_puid:
@@ -3305,6 +3539,114 @@ async def _execute_session_command_once(
                             for wid, name in writable_names.items()
                         ],
                     }
+
+                async def _save_weixin_command_context() -> dict[str, Any] | None:
+                    """Encrypt the current-generation token before the session row changes.
+
+                    A replay and a read-only workspace list return before this runs.
+                    A request for a bot that is not the active generation is stored
+                    as ignored and does not roll the token back. An older value in
+                    the same generation leaves the current token in place and still
+                    stamps this inbound row with the stored order.
+                    """
+                    nonlocal context_stamp
+                    if cleaned_platform != "weixin" or not cleaned_msg_id:
+                        return None
+                    plain_token = _plain_weixin_token(weixin_context_token)
+                    req_bot = str(weixin_bot_id or "").strip() or None
+                    req_gen = (
+                        int(weixin_bot_generation)
+                        if weixin_bot_generation is not None
+                        else None
+                    )
+                    if plain_token is None and req_bot is None and req_gen is None:
+                        return None
+                    active_bot_id, active_bot_gen, _active_status = (
+                        await _get_active_weixin_bot_in_tx(cur, lock_generation=True)
+                    )
+                    bot_mismatch = (
+                        not active_bot_id
+                        or (req_bot is not None and req_bot != active_bot_id)
+                        or (
+                            req_gen is not None
+                            and int(req_gen) != int(active_bot_gen)
+                        )
+                    )
+                    if bot_mismatch:
+                        return await _deny_and_ignore_command(
+                            {
+                                "ok": False,
+                                "linked": True,
+                                "allowed": False,
+                                "dalton_user_id": cleaned_uid,
+                                "user_tier": user_tier,
+                                "deny_reason": (
+                                    "weixin_bot_unavailable"
+                                    if not active_bot_id
+                                    else "weixin_bot_generation_mismatch"
+                                ),
+                            },
+                            uid_val=cleaned_uid,
+                        )
+                    if not plain_token:
+                        return None
+                    sender = cleaned_puid
+                    if not sender:
+                        await cur.execute(
+                            """
+                            SELECT platform_user_id FROM dalton_channel_identities
+                            WHERE user_id = %s AND platform = %s
+                            """,
+                            (cleaned_uid, cleaned_platform),
+                        )
+                        sender_row = await cur.fetchone()
+                        if sender_row and sender_row.get("platform_user_id"):
+                            sender = str(sender_row["platform_user_id"])
+                    if not sender:
+                        return await _deny_and_ignore_command(
+                            {
+                                "ok": False,
+                                "linked": False,
+                                "allowed": False,
+                                "deny_reason": "not_linked",
+                            },
+                            uid_val=cleaned_uid,
+                        )
+                    order = _extract_weixin_context_order(
+                        payload_dict, weixin_context_seq
+                    )
+                    requested_source = _context_order_source(weixin_context_source)
+                    requested_value = _positive_context_seq(weixin_context_seq)
+                    if requested_source == "receive":
+                        order = None
+                    elif (
+                        requested_source in ("protocol", "platform_time")
+                        and requested_value is not None
+                    ):
+                        order = (requested_source, requested_value)
+                    enc_key = get_encryption_key()
+                    _accepted, stored_seq = await _upsert_weixin_context_token_in_tx(
+                        cur,
+                        enc_key=enc_key,
+                        bot_id=str(active_bot_id),
+                        bot_generation=int(active_bot_gen),
+                        platform_user_id=sender,
+                        context_token=plain_token,
+                        incoming_seq=order[1] if order is not None else None,
+                        incoming_source=order[0] if order is not None else None,
+                    )
+                    context_stamp = (
+                        plain_token,
+                        enc_key,
+                        str(active_bot_id),
+                        int(active_bot_gen),
+                        int(stored_seq),
+                    )
+                    return None
+
+                context_denial = await _save_weixin_command_context()
+                if context_denial is not None:
+                    return context_denial
 
                 if cleaned_chat_type == "group":
                     eff_chat_id = extract_chat_id(
@@ -3881,8 +4223,32 @@ async def _execute_session_command_once(
                         command_result=cmd_result,
                         command_effect_status=effect_status,
                         command_reply_pending=True,
-                        raw_payload=payload_dict,
+                        raw_payload=_strip_sensitive_from_raw_payload(payload_dict),
                     )
+                    if context_stamp is not None:
+                        stamp_token, stamp_key, stamp_bot, stamp_gen, stamp_seq = (
+                            context_stamp
+                        )
+                        await cur.execute(
+                            """
+                            UPDATE dalton_channel_inbound_events
+                            SET encrypted_weixin_context_token = pgp_sym_encrypt(%s, %s),
+                                weixin_context_bot_id = %s,
+                                weixin_context_bot_generation = %s,
+                                weixin_context_seq = %s,
+                                updated_at = NOW()
+                            WHERE platform = %s AND message_id = %s
+                            """,
+                            (
+                                stamp_token,
+                                stamp_key,
+                                stamp_bot,
+                                stamp_gen,
+                                stamp_seq,
+                                cleaned_platform,
+                                cleaned_msg_id,
+                            ),
+                        )
 
                 return {
                     **cmd_result,
@@ -7202,7 +7568,12 @@ def _json_safe_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 continue
             if isinstance(v, (bytes, bytearray, memoryview)):
                 continue
-            if k == "raw_payload" and isinstance(v, dict):
+            if k in (
+                "raw_payload",
+                "command_request",
+                "command_result",
+                "consumed_bind_result",
+            ) and isinstance(v, dict):
                 item[k] = _strip_sensitive_from_raw_payload(v)
             elif isinstance(v, UUID):
                 item[k] = str(v)
@@ -8124,34 +8495,17 @@ async def _upsert_weixin_state_once(
                 # ---------------------------------------------------------------
                 if cleaned_login_action == "confirm":
                     eff_skey = str(login_session_key or "").strip()
-                    confirm_lock_uids: set[str] = set()
-                    if str(eff_login_owner or "").strip():
-                        confirm_lock_uids.add(str(eff_login_owner).strip())
-                    early_ilink = str(ilink_user_id or "").strip()
-                    if early_ilink:
-                        await cur.execute(
-                            """
-                            SELECT user_id FROM dalton_channel_identities
-                            WHERE platform = 'weixin' AND platform_user_id = %s
-                            """,
-                            (early_ilink,),
+                    confirm_ilink = str(ilink_user_id or "").strip() or None
+                    confirm_settings_locked: frozenset[str] = frozenset()
+                    if confirm_ilink:
+                        confirm_preview = await _preview_weixin_bind_settings_users(
+                            cur,
+                            owner_user_ids=[eff_login_owner, owner_user_id],
+                            platform_user_id=confirm_ilink,
+                            include_saved_state_owners=True,
                         )
-                        confirm_lock_uids.update(
-                            str(found["user_id"])
-                            for found in await cur.fetchall()
-                            if found.get("user_id")
-                        )
-                    for lock_uid in sorted(confirm_lock_uids):
-                        await cur.execute(
-                            "SELECT pg_advisory_xact_lock(hashtext(%s))",
-                            (f"dalton_user_settings:{lock_uid}",),
-                        )
-                        await cur.execute(
-                            """
-                            SELECT 1 FROM dalton_channel_user_settings
-                            WHERE user_id = %s FOR UPDATE
-                            """,
-                            (lock_uid,),
+                        confirm_settings_locked = await _lock_user_settings_rows_in_tx(
+                            cur, confirm_preview
                         )
                     await cur.execute(
                         """
@@ -8398,6 +8752,12 @@ async def _upsert_weixin_state_once(
                     )
                     saved_row = await cur.fetchone()
                     if cleaned_ilink_uid:
+                        await _require_weixin_bind_settings_subset(
+                            cur,
+                            owner_user_id=eff_owner,
+                            platform_user_id=cleaned_ilink_uid,
+                            already_locked=confirm_settings_locked,
+                        )
                         await _bind_identity_in_tx(
                             cur,
                             user_id=eff_owner,
@@ -8406,6 +8766,7 @@ async def _upsert_weixin_state_once(
                             platform_username=cleaned_ilink_uname,
                             weixin_bot_id=cleaned_bot_id,
                             weixin_bot_generation=new_bot_gen,
+                            settings_already_locked=confirm_settings_locked,
                         )
                     updated_dt = (saved_row or {}).get("updated_at")
                     return {
@@ -8427,6 +8788,21 @@ async def _upsert_weixin_state_once(
                 # ---------------------------------------------------------------
                 # Branch 4: Standard State / Cursor / Expired Update
                 # ---------------------------------------------------------------
+                # A credential save that will bind locks settings before the
+                # singleton. Cursor-only updates and a token save without an
+                # ilink user do not take settings locks.
+                settings_locked: frozenset[str] = frozenset()
+                bind_ilink_preview = str(ilink_user_id or "").strip()
+                if bot_token is not None and bind_ilink_preview:
+                    save_preview = await _preview_weixin_bind_settings_users(
+                        cur,
+                        owner_user_ids=[owner_user_id, login_owner_user_id],
+                        platform_user_id=bind_ilink_preview,
+                        include_saved_state_owners=True,
+                    )
+                    settings_locked = await _lock_user_settings_rows_in_tx(
+                        cur, save_preview
+                    )
                 await cur.execute(
                     """
                     SELECT * FROM dalton_channel_weixin_state
@@ -8607,6 +8983,12 @@ async def _upsert_weixin_state_once(
                     )
                     saved = dict(await cur.fetchone())
                     if cleaned_ilink_uid:
+                        await _require_weixin_bind_settings_subset(
+                            cur,
+                            owner_user_id=cleaned_owner,
+                            platform_user_id=cleaned_ilink_uid,
+                            already_locked=settings_locked,
+                        )
                         await _bind_identity_in_tx(
                             cur,
                             user_id=cleaned_owner,
@@ -8615,6 +8997,7 @@ async def _upsert_weixin_state_once(
                             platform_username=cleaned_ilink_uname,
                             weixin_bot_id=cleaned_bot_id,
                             weixin_bot_generation=next_bot_gen,
+                            settings_already_locked=settings_locked,
                         )
                 else:
                     if current is None:

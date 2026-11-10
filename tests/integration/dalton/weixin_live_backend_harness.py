@@ -39,6 +39,7 @@ from src.dalton.app.router import router as dalton_router
 from src.dalton.database import channel_gateway as cg_db
 from src.server.database import pool as db_pool
 from src.server.database import user as user_db
+from src.server.database import workspace as workspace_db
 from src.server.database.home_workspace import get_home_workspace_id
 from src.server.utils.api import get_current_user_id
 from tests.integration.dalton.test_channel_gateway_db import (
@@ -178,11 +179,15 @@ class WeixinLiveBackendHarness:
                 async with pool_ref.connection() as conn:
                     yield conn
 
+            # These modules bind get_db_connection at import. Patching the
+            # pool module does not change that name. /workspace reads names
+            # through workspace_db.get_workspace_names.
             for mod_name, mod_obj in (
                 ("db_pool", db_pool),
                 ("cg_db", cg_db),
                 ("dalton_sharing", dalton_sharing),
                 ("user_db", user_db),
+                ("workspace_db", workspace_db),
             ):
                 self._orig_get_db_conns[mod_name] = getattr(
                     mod_obj, "get_db_connection"
@@ -300,6 +305,7 @@ class WeixinLiveBackendHarness:
                 "cg_db": cg_db,
                 "dalton_sharing": dalton_sharing,
                 "user_db": user_db,
+                "workspace_db": workspace_db,
             }[mod_name]
             setattr(mod_obj, "get_db_connection", orig_fn)
         self._orig_get_db_conns.clear()
@@ -399,9 +405,10 @@ class WeixinLiveBackendHarness:
                     await cur.execute(
                         """
                         SELECT platform, message_id, dalton_user_id, chat_type,
-                               chat_address, status, raw_payload, consumed_bind_result
+                               chat_address, status, raw_payload, consumed_bind_result,
+                               command_effect_status, command_reply_pending
                         FROM dalton_channel_inbound_events
-                        WHERE platform = 'weixin'
+                        WHERE platform IN ('weixin', 'discord')
                           AND (
                               dalton_user_id = ANY(%s)
                               OR message_id LIKE %s
@@ -429,7 +436,7 @@ class WeixinLiveBackendHarness:
                         SELECT delivery_key, kind, platform, target_address, status,
                                sent_chunks, total_chunks, error_message
                         FROM dalton_channel_deliveries
-                        WHERE platform = 'weixin'
+                        WHERE platform IN ('weixin', 'discord')
                           AND (
                               user_id = ANY(%s)
                               OR delivery_key LIKE %s

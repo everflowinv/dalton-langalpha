@@ -103,7 +103,12 @@ def _reject_nested_company_user_ids(*containers: dict[str, Any] | None) -> None:
 
     for item in containers:
         if isinstance(item, dict):
-            for key in ("user_id", "dalton_user_id", "owner_user_id"):
+            for key in (
+                "user_id",
+                "dalton_user_id",
+                "owner_user_id",
+                "login_owner_user_id",
+            ):
                 if key in item and item[key] is not None:
                     reject_company_system_auth(item[key])
 
@@ -167,6 +172,10 @@ class SessionCommandRequest(BaseModel):
     request_key: str | None = None
     raw_payload: dict[str, Any] | None = None
     weixin_context_token: str | None = None
+    weixin_bot_id: str | None = None
+    weixin_bot_generation: int | None = None
+    weixin_context_source: str | None = None
+    weixin_context_seq: int | None = None
     is_internal_query: bool = False
 
 
@@ -505,6 +514,10 @@ async def internal_session_command_endpoint(
         request_key=body.request_key,
         raw_payload=body.raw_payload,
         weixin_context_token=body.weixin_context_token,
+        weixin_bot_id=body.weixin_bot_id,
+        weixin_bot_generation=body.weixin_bot_generation,
+        weixin_context_source=body.weixin_context_source,
+        weixin_context_seq=body.weixin_context_seq,
         is_internal_query=body.is_internal_query,
     )
 
@@ -782,6 +795,7 @@ async def internal_weixin_state_put_endpoint(
     _resolve_optional_internal_user_id(
         request,
         body.owner_user_id,
+        body.login_owner_user_id,
         getattr(body, "user_id", None),
     )
     return await upsert_weixin_state(

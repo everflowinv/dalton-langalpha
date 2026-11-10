@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+import contextvars
 import json
 import os
 from pathlib import Path
@@ -6573,6 +6574,592 @@ async def test_weixin_first_context_token_concurrency_real_pg(
     assert fresh["seq"] == 1
     assert fresh["protocol_seq_high"] == 1
     assert fresh["context_token"] == "G1"
+
+
+@pytest.mark.asyncio
+async def test_weixin_settings_sender_lock_order_and_command_context_real_pg(
+    db_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Settings locks stay ahead of the singleton, and the sender lock rechecks that set.
+
+    A credential save, QR confirm, unbind, and replacement bind block on the
+    owner's settings lock while another sender's registration still finishes.
+    Two first binds of one unbound sender cannot mutate the winner's identity
+    until the loser restarts and locks that user's settings. Slash commands
+    persist encrypted context only, and a claim for another user does not
+    receive it.
+    """
+    prefix = db_env["prefix"]
+    user_a = db_env["user_a"]
+    user_b = db_env["user_b"]
+    pool: AsyncConnectionPool = db_env["pool"]
+    user_c = f"{prefix}_user_c"
+    db_env["cleanup_user_ids"].append(user_c)
+    monkeypatch.setenv("DALTON_PM_USER_IDS", user_a)
+    monkeypatch.setenv(
+        "DALTON_ALLOWED_EMAILS",
+        f"{user_a}@example.com,{user_b}@example.com,{user_c}@example.com",
+    )
+    enc_key = os.environ["BYOK_ENCRYPTION_KEY"]
+    bot = f"{prefix}_lock_bot@im.wechat"
+    new_bot = f"{prefix}_lock_bot_new@im.wechat"
+    confirm_bot = f"{prefix}_lock_bot_confirm@im.wechat"
+    scanner = f"{prefix}_wx_scanner"
+    new_sender = f"{prefix}_wx_new_sender"
+    confirm_sender = f"{prefix}_wx_confirm_sender"
+    repl_sender = f"{prefix}_wx_repl_sender"
+    hook_sender = f"{prefix}_wx_hook_sender"
+    race_sender = f"{prefix}_wx_race_sender"
+    reg_seq = {"n": 0}
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO users (user_id, email, name, created_at, updated_at)
+                VALUES (%s, %s, 'User C', NOW(), NOW())
+                """,
+                (user_c, f"{user_c}@example.com"),
+            )
+
+    async def reg_free() -> dict[str, Any]:
+        reg_seq["n"] += 1
+        number = reg_seq["n"]
+        return await cg_db.register_and_resolve_inbound(
+            platform="weixin",
+            platform_user_id=f"{prefix}_wx_free_{number}",
+            chat_type="dm",
+            chat_address="weixin:@me",
+            thread_scope_key=f"dm:{prefix}_wx_free_{number}",
+            message_id=f"{bot}:free-{number}",
+            weixin_context_token=f"FREE-{number}",
+            raw_payload={"ilink_bot_id": bot, "seq": number},
+        )
+
+    async def wait_blocked(cur: Any, task: asyncio.Task[Any], label: str) -> None:
+        deadline = asyncio.get_running_loop().time() + 8
+        while True:
+            if task.done():
+                error = task.exception()
+                raise AssertionError(f"{label} finished before settings blocked it: {error!r}")
+            await cur.execute(
+                """
+                SELECT pid
+                FROM pg_stat_activity
+                WHERE datname = current_database()
+                  AND pid <> pg_backend_pid()
+                  AND pg_backend_pid() = ANY(pg_blocking_pids(pid))
+                """
+            )
+            if await cur.fetchall():
+                return
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError(f"{label} did not block on the settings lock")
+            await asyncio.sleep(0.05)
+
+    async def run_blocked(owner: str, operation: Any) -> dict[str, Any]:
+        """Hold the settings lock, then start the operation on another connection.
+
+        The operation must observe the real lock wait. Starting it before the
+        coordinator acquires the lock lets it commit early and makes the wait
+        depend on scheduling.
+        """
+        task: asyncio.Task[Any] | None = None
+        async with pool.connection() as op_conn:
+            try:
+                async with pool.connection() as coord:
+                    async with coord.transaction():
+                        async with coord.cursor() as cur:
+                            await cur.execute(
+                                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                                (f"dalton_user_settings:{owner}",),
+                            )
+                            task = asyncio.create_task(operation(op_conn))
+                            await wait_blocked(cur, task, operation.__name__)
+                            registered = await asyncio.wait_for(reg_free(), 8)
+                            assert registered["deny_reason"] == "not_linked"
+                # The settings lock ends with the coordinator transaction.
+                # Release that connection before waiting for the operation.
+                return await asyncio.wait_for(task, 15)
+            finally:
+                if task is not None and not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+
+    started = await cg_db.upsert_weixin_state(
+        login_session_action="start",
+        login_session_key=f"{prefix}-lock-sess",
+        login_owner_user_id=user_a,
+        login_status="wait",
+    )
+    assert started["updated"] is True
+    confirmed = await cg_db.upsert_weixin_state(
+        login_session_action="confirm",
+        login_session_key=f"{prefix}-lock-sess",
+        login_owner_user_id=user_a,
+        expected_login_version=int(started["login_version"]),
+        expected_bot_generation=int(started["expected_bot_generation"]),
+        ilink_bot_id=bot,
+        owner_user_id=user_a,
+        bot_token="secret-lock-bot",
+        base_url="https://ilinkai.weixin.qq.com",
+        status="active",
+        ilink_user_id=scanner,
+        ilink_username="Lock Scanner",
+    )
+    assert confirmed["updated"] is True
+    generation = int(confirmed["bot_generation"])
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO dalton_channel_weixin_context_tokens (
+                    ilink_bot_id, bot_generation, platform_user_id,
+                    encrypted_context_token, seq, seq_source,
+                    protocol_seq_high, platform_time_high
+                )
+                VALUES
+                    (%s, %s, %s, pgp_sym_encrypt(%s, %s), 8, 'protocol', 8, 0),
+                    (%s, %s, %s, pgp_sym_encrypt(%s, %s), 2, 'protocol', 2, 0)
+                """,
+                (
+                    bot,
+                    generation,
+                    scanner,
+                    "OLD",
+                    enc_key,
+                    new_bot,
+                    generation + 1,
+                    new_sender,
+                    "NEW",
+                    enc_key,
+                ),
+            )
+
+    async def save_credentials(conn: Any) -> dict[str, Any]:
+        return await cg_db.upsert_weixin_state(
+            ilink_bot_id=new_bot,
+            owner_user_id=user_a,
+            bot_token="secret-save-token",
+            base_url="https://ilinkai.weixin.qq.com",
+            status="active",
+            ilink_user_id=new_sender,
+            ilink_username="New Sender",
+            conn=conn,
+        )
+
+    saved = await run_blocked(user_a, save_credentials)
+    assert saved["updated"] is True
+    assert int(saved["bot_generation"]) == generation + 1
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT COUNT(*) AS cnt
+                FROM dalton_channel_weixin_context_tokens
+                WHERE ilink_bot_id = %s AND bot_generation = %s AND platform_user_id = %s
+                """,
+                (bot, generation, scanner),
+            )
+            assert int((await cur.fetchone())["cnt"]) == 0
+            await cur.execute(
+                """
+                SELECT pgp_sym_decrypt(encrypted_context_token, %s) AS context_token
+                FROM dalton_channel_weixin_context_tokens
+                WHERE ilink_bot_id = %s AND bot_generation = %s AND platform_user_id = %s
+                """,
+                (enc_key, new_bot, generation + 1, new_sender),
+            )
+            assert (await cur.fetchone())["context_token"] == "NEW"
+            await cur.execute(
+                """
+                SELECT platform_user_id
+                FROM dalton_channel_identities
+                WHERE user_id = %s AND platform = 'weixin'
+                """,
+                (user_a,),
+            )
+            assert (await cur.fetchone())["platform_user_id"] == new_sender
+
+    async def slash(
+        message_id: str,
+        cmd: str,
+        *,
+        seq: int = 20,
+        token: str = f"ctx-i3-{prefix}",
+        bot_id: str = new_bot,
+        bot_generation: int = generation + 1,
+        chat_type: str = "dm",
+        raw_payload: dict[str, Any] | None = None,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        return await cg_db.execute_session_command(
+            cmd=cmd,
+            platform="weixin",
+            platform_user_id=new_sender,
+            chat_type=chat_type,
+            chat_address="weixin:@me" if chat_type == "dm" else "weixin:room",
+            scope_key=f"dm:{new_sender}",
+            message_id=message_id,
+            weixin_context_token=token,
+            weixin_bot_id=bot_id,
+            weixin_bot_generation=bot_generation,
+            weixin_context_source="protocol",
+            weixin_context_seq=seq,
+            raw_payload=raw_payload
+            or {
+                "weixin_context_token": token,
+                "context_token": token,
+                "bot_token": "secret-save-token",
+                "seq": seq,
+            },
+            **extra,
+        )
+
+    created = await slash(f"{prefix}-i3-new", "new")
+    assert created["ok"] is True
+    assert created["duplicate"] is False
+    secret = f"ctx-i3-{prefix}"
+    assert secret not in json.dumps(created)
+
+    async def inbound_secret(message_id: str) -> dict[str, Any]:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT raw_payload::text AS raw_text,
+                           pgp_sym_decrypt(encrypted_weixin_context_token, %s) AS context_token,
+                           weixin_context_seq
+                    FROM dalton_channel_inbound_events
+                    WHERE platform = 'weixin' AND message_id = %s
+                    """,
+                    (enc_key, message_id),
+                )
+                return dict(await cur.fetchone())
+
+    async def token_secret() -> dict[str, Any]:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT seq, pgp_sym_decrypt(encrypted_context_token, %s) AS context_token
+                    FROM dalton_channel_weixin_context_tokens
+                    WHERE ilink_bot_id = %s AND bot_generation = %s AND platform_user_id = %s
+                    """,
+                    (enc_key, new_bot, generation + 1, new_sender),
+                )
+                return dict(await cur.fetchone())
+
+    stored_in = await inbound_secret(f"{prefix}-i3-new")
+    assert secret not in stored_in["raw_text"]
+    assert "secret-save-token" not in stored_in["raw_text"]
+    assert stored_in["context_token"] == secret
+    assert int(stored_in["weixin_context_seq"]) == 20
+    assert (await token_secret())["context_token"] == secret
+    replay = await slash(
+        f"{prefix}-i3-new",
+        "new",
+        seq=1,
+        token="ctx-replay-must-not-apply",
+    )
+    assert replay["duplicate"] is True
+    assert replay["generation"] == created["generation"]
+    assert int((await token_secret())["seq"]) == 20
+    listed = await slash(f"{prefix}-i3-list", "workspace_list", seq=21, token="ctx-i3-21")
+    assert listed["ok"] is True
+    switched = await slash(
+        f"{prefix}-i3-main",
+        "workspace_switch",
+        seq=22,
+        token="ctx-i3-22",
+        target_kind="home",
+        workspace_query="home",
+    )
+    assert switched["ok"] is True
+    stopped = await slash(f"{prefix}-i3-stop", "stop", seq=23, token="ctx-i3-23")
+    assert stopped["ok"] is True
+    assert (await token_secret())["context_token"] == "ctx-i3-23"
+    older = await slash(
+        f"{prefix}-i3-older",
+        "new",
+        seq=4,
+        token="ctx-i3-older",
+        raw_payload={"weixin_context_token": "ctx-i3-older", "seq": 4},
+    )
+    assert older["ok"] is True
+    assert int((await token_secret())["seq"]) == 23
+    assert (await token_secret())["context_token"] == "ctx-i3-23"
+    older_row = await inbound_secret(f"{prefix}-i3-older")
+    assert int(older_row["weixin_context_seq"]) == 23
+    assert older_row["context_token"] == "ctx-i3-older"
+    assert "ctx-i3-older" not in older_row["raw_text"]
+    mismatched = await slash(
+        f"{prefix}-i3-old-bot",
+        "new",
+        seq=99,
+        token="ctx-old-bot",
+        bot_id=f"{prefix}_previous_bot@im.wechat",
+    )
+    assert mismatched["deny_reason"] == "weixin_bot_generation_mismatch"
+    assert (await token_secret())["context_token"] == "ctx-i3-23"
+    grouped = await slash(
+        f"{prefix}-i3-group",
+        "new",
+        chat_type="group",
+        token="ctx-group-secret",
+        raw_payload={"group_id": "room@chatroom", "weixin_context_token": "ctx-group-secret"},
+    )
+    assert grouped["ok"] is False
+    invalid = await slash(
+        f"{prefix}-i3-invalid",
+        "new",
+        token="ctx-invalid-secret",
+        raw_payload={"invalid_inbound": True, "weixin_context_token": "ctx-invalid-secret"},
+    )
+    assert invalid["deny_reason"] == "invalid_inbound_event"
+    before_internal = await token_secret()
+    internal = await cg_db.execute_session_command(
+        cmd="workspace_list",
+        platform="weixin",
+        platform_user_id=new_sender,
+        chat_type="dm",
+        scope_key=f"dm:{new_sender}",
+        is_internal_query=True,
+        weixin_context_token="ctx-readonly-secret",
+        weixin_bot_id=new_bot,
+        weixin_bot_generation=generation + 1,
+        weixin_context_source="protocol",
+        weixin_context_seq=100,
+    )
+    assert internal["ok"] is True
+    assert await token_secret() == before_internal
+    claim = await cg_db.authorize_and_claim_delivery(
+        delivery_key=f"notice:weixin:{prefix}-i3-stop:probe",
+        kind="notice",
+        user_id=user_a,
+        platform="weixin",
+        target="weixin:@me",
+        inbound_message_id=f"{prefix}-i3-stop",
+        has_non_empty_text=True,
+        total_chunks=1,
+    )
+    assert claim["claim_status"] == "claimed"
+    assert claim["weixin_context_token"] == "ctx-i3-23"
+    other_claim = await cg_db.authorize_and_claim_delivery(
+        delivery_key=f"notice:weixin:{prefix}-i3-stop:other",
+        kind="notice",
+        user_id=user_b,
+        platform="weixin",
+        target="weixin:@me",
+        inbound_message_id=f"{prefix}-i3-stop",
+        has_non_empty_text=True,
+        total_chunks=1,
+    )
+    assert other_claim["claim_status"] == "denied"
+    assert "ctx-i3-23" not in json.dumps(other_claim)
+
+    owner_session = await cg_db.upsert_weixin_state(
+        login_session_action="start",
+        login_session_key=f"{prefix}-saved-owner",
+        login_owner_user_id=user_a,
+        login_status="wait",
+    )
+    assert owner_session["updated"] is True
+
+    async def confirm_saved_owner(conn: Any) -> dict[str, Any]:
+        return await cg_db.upsert_weixin_state(
+            login_session_action="confirm",
+            login_session_key=f"{prefix}-saved-owner",
+            expected_login_version=int(owner_session["login_version"]),
+            expected_bot_generation=int(owner_session["expected_bot_generation"]),
+            ilink_bot_id=confirm_bot,
+            bot_token="secret-confirm-token",
+            base_url="https://ilinkai.weixin.qq.com",
+            status="active",
+            ilink_user_id=confirm_sender,
+            conn=conn,
+        )
+
+    confirmed_owner = await run_blocked(user_a, confirm_saved_owner)
+    assert confirmed_owner["updated"] is True
+    assert confirmed_owner["owner_user_id"] == user_a
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT platform_user_id FROM dalton_channel_identities
+                WHERE user_id = %s AND platform = 'weixin'
+                """,
+                (user_a,),
+            )
+            assert (await cur.fetchone())["platform_user_id"] == confirm_sender
+
+    async def unbind_owner(conn: Any) -> dict[str, Any]:
+        return await cg_db.consume_bind_code_or_unbind(
+            action="unbind",
+            platform="weixin",
+            user_id=user_a,
+            platform_user_id=confirm_sender,
+            conn=conn,
+        )
+
+    unbound = await run_blocked(user_a, unbind_owner)
+    assert unbound["ok"] is True
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT COUNT(*) AS cnt FROM dalton_channel_identities
+                WHERE user_id = %s AND platform = 'weixin'
+                """,
+                (user_a,),
+            )
+            assert int((await cur.fetchone())["cnt"]) == 0
+
+    first_code = await cg_db.create_bind_code(user_id=user_a, platform="weixin")
+    first_bind = await cg_db.consume_bind_code_or_unbind(
+        action="bind",
+        platform="weixin",
+        platform_user_id=repl_sender,
+        code=first_code["code"],
+        is_group=False,
+    )
+    assert first_bind["ok"] is True
+    second_code = await cg_db.create_bind_code(user_id=user_b, platform="weixin")
+
+    async def replace_bind(conn: Any) -> dict[str, Any]:
+        return await cg_db.consume_bind_code_or_unbind(
+            action="bind",
+            platform="weixin",
+            platform_user_id=repl_sender,
+            code=second_code["code"],
+            is_group=False,
+            conn=conn,
+        )
+
+    replaced = await run_blocked(user_a, replace_bind)
+    assert replaced["ok"] is True
+    assert replaced["user_id"] == user_b
+
+    inserted = {"done": False}
+
+    async def discover_displaced() -> None:
+        if inserted["done"]:
+            return
+        inserted["done"] = True
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_channel_identities (
+                        user_id, platform, platform_user_id
+                    )
+                    VALUES (%s, 'weixin', %s)
+                    """,
+                    (user_c, hook_sender),
+                )
+
+    monkeypatch.setattr(cg_db, "_weixin_settings_discovery_hook", discover_displaced)
+    hook_code = await cg_db.create_bind_code(user_id=user_a, platform="weixin")
+    try:
+        hooked = await cg_db.consume_bind_code_or_unbind(
+            action="bind",
+            platform="weixin",
+            platform_user_id=hook_sender,
+            code=hook_code["code"],
+            is_group=False,
+        )
+    finally:
+        monkeypatch.setattr(cg_db, "_weixin_settings_discovery_hook", None)
+    assert hooked["ok"] is True
+    assert hooked["user_id"] == user_a
+
+    bind_user_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+        "weixin_r11_bind_user", default=""
+    )
+    first_user = {"id": ""}
+    second_user = {"id": ""}
+    hook_calls = {"n": 0}
+    both_arrived = asyncio.Event()
+    first_committed = asyncio.Event()
+
+    async def before_sender_lock() -> None:
+        hook_calls["n"] += 1
+        if hook_calls["n"] > 2:
+            return
+        user = bind_user_var.get()
+        if hook_calls["n"] == 1:
+            first_user["id"] = user
+            await both_arrived.wait()
+            return
+        second_user["id"] = user
+        both_arrived.set()
+        await first_committed.wait()
+
+    async def bind_racer(user_id: str, code: str) -> dict[str, Any]:
+        bind_user_var.set(user_id)
+        try:
+            return await cg_db.consume_bind_code_or_unbind(
+                action="bind",
+                platform="weixin",
+                platform_user_id=race_sender,
+                code=code,
+                is_group=False,
+            )
+        finally:
+            if user_id == first_user["id"]:
+                first_committed.set()
+
+    race_code_a = await cg_db.create_bind_code(user_id=user_a, platform="weixin")
+    race_code_b = await cg_db.create_bind_code(user_id=user_b, platform="weixin")
+    monkeypatch.setattr(cg_db, "_weixin_before_sender_lock_hook", before_sender_lock)
+    task_a = asyncio.create_task(bind_racer(user_a, race_code_a["code"]))
+    task_b = asyncio.create_task(bind_racer(user_b, race_code_b["code"]))
+    try:
+        done, pending = await asyncio.wait({task_a, task_b}, timeout=15)
+        if pending:
+            raise AssertionError("concurrent first bind did not finish")
+        assert task_a.result()["ok"] is True
+        assert task_b.result()["ok"] is True
+        assert first_user["id"] and second_user["id"]
+        assert first_user["id"] != second_user["id"]
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT user_id FROM dalton_channel_identities
+                    WHERE platform = 'weixin' AND platform_user_id = %s
+                    """,
+                    (race_sender,),
+                )
+                assert (await cur.fetchone())["user_id"] == second_user["id"]
+                await cur.execute(
+                    """
+                    SELECT user_id, used_at, revoked_reason
+                    FROM dalton_channel_bind_codes
+                    WHERE code_hash = ANY(%s)
+                    """,
+                    (
+                        [
+                            cg_db.hash_bind_code(race_code_a["code"]),
+                            cg_db.hash_bind_code(race_code_b["code"]),
+                        ],
+                    ),
+                )
+                code_rows = await cur.fetchall()
+                assert len(code_rows) == 2
+                assert all(row["used_at"] is not None and row["revoked_reason"] is None for row in code_rows)
+    finally:
+        both_arrived.set()
+        first_committed.set()
+        monkeypatch.setattr(cg_db, "_weixin_before_sender_lock_hook", None)
+        for task in (task_a, task_b):
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(task_a, task_b, return_exceptions=True)
 
 
 if __name__ == "__main__" and "--serve-http-harness" in sys.argv:

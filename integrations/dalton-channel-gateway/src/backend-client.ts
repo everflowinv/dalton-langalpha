@@ -171,6 +171,7 @@ export interface I1RegisterAndResolveResponse {
   uploaded_attachments: UploadedAttachmentRecord[];
   raw_payload: Record<string, unknown>;
   pending_interrupt: PendingInterruptState | null;
+  consumed_bind_result?: Record<string, unknown> | null;
 }
 
 export interface I2BindCodeConsumeRequest {
@@ -204,6 +205,8 @@ export interface I2BindCodeConsumeResponse {
   platform_user_id?: string;
   generation?: number;
   generations?: Record<string, number>;
+  action?: "bind" | "unbind" | string;
+  delivery_key?: string;
 }
 
 export interface I3SessionCommandRequest {
@@ -224,6 +227,10 @@ export interface I3SessionCommandRequest {
   request_key?: string | null;
   raw_payload?: Record<string, unknown> | null;
   weixin_context_token?: string | null;
+  weixin_bot_id?: string | null;
+  weixin_bot_generation?: number | null;
+  weixin_context_source?: "protocol" | "platform_time" | "receive" | string | null;
+  weixin_context_seq?: number | null;
   is_internal_query?: boolean;
 }
 
@@ -515,6 +522,7 @@ export interface RecoverInboundEventRow {
   command_result?: I3SessionCommandResponse | null;
   command_effect_status?: string | null;
   command_reply_pending?: boolean;
+  consumed_bind_result?: Record<string, unknown> | null;
   pending_interrupt_snapshot?: PendingInterruptState | null;
   status: InboundEventStatus;
   fallback_pending: boolean;

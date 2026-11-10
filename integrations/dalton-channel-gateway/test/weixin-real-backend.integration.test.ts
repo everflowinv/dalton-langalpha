@@ -7,11 +7,15 @@ import { createInterface } from "node:readline";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { HttpBackendClient } from "../src/backend-client.js";
-import type { ChannelAdapter } from "../src/channels/adapter.js";
+import {
+  ChannelDeliveryError,
+  type ChannelAdapter,
+} from "../src/channels/adapter.js";
+import { FakeChannelAdapter } from "../src/channels/fake-adapter.js";
 import { WeixinChannelAdapter } from "../src/channels/weixin/index.js";
 import type { GatewayConfig } from "../src/config.js";
 import { createGatewayApp, type GatewayApp } from "../src/server.js";
-import type { ChannelPlatform } from "../src/types.js";
+import type { ChannelPlatform, InboundChannelEvent } from "../src/types.js";
 
 const EXPLICIT_BACKEND_URL = (
   process.env.GATEWAY_REAL_BACKEND_URL ?? ""
@@ -55,6 +59,21 @@ const ALLOWED_PUBLIC_BOT_KEYS = new Set([
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function requestAuthorization(init: RequestInit | undefined): string {
+  const headers = init?.headers;
+  if (!headers) return "";
+  if (headers instanceof Headers) return headers.get("authorization") ?? "";
+  if (Array.isArray(headers)) {
+    const found = headers.find(([key]) => key.toLowerCase() === "authorization");
+    return found ? String(found[1]) : "";
+  }
+  const record = headers as Record<string, string>;
+  const match = Object.entries(record).find(
+    ([key]) => key.toLowerCase() === "authorization",
+  );
+  return match ? String(match[1]) : "";
 }
 
 async function readJsonObject(
@@ -110,6 +129,9 @@ describe.skipIf(!SHOULD_RUN)(
     let gatewayBaseUrl = "";
     let backendClient: HttpBackendClient | null = null;
     let weixinAdapter: WeixinChannelAdapter | null = null;
+    let discordAdapter: FakeChannelAdapter | null = null;
+    const discordOutbound: Array<{ text: string; inboundMessageId: string | null }> = [];
+    let discordSendMode: "ok" | "unknown" | "rate_limited" = "ok";
 
     // Controllable iLink upstream state
     let qrCounter = 0;
@@ -131,6 +153,8 @@ describe.skipIf(!SHOULD_RUN)(
     const updatesQueue: Array<Record<string, unknown>> = [];
     const sentIlinkMessages: Array<Record<string, unknown>> = [];
     let failNextSendMessageWithNetworkDrop = false;
+    let nextSendMessageReturnsNull = false;
+    let nextSendMessageRateLimited = false;
 
     // Controllable fault injection on backend HTTP client (simulating lost HTTP response after server commit)
     let dropNextI1ResponseForMessageId: string | null = null;
@@ -247,11 +271,31 @@ describe.skipIf(!SHOULD_RUN)(
           typeof init?.body === "string" ? init.body : "{}";
         const parsedBody: unknown = JSON.parse(bodyText);
         if (isRecord(parsedBody)) {
-          sentIlinkMessages.push(parsedBody);
+          sentIlinkMessages.push({
+            ...parsedBody,
+            authorization: requestAuthorization(init),
+          });
         }
         if (failNextSendMessageWithNetworkDrop) {
           failNextSendMessageWithNetworkDrop = false;
           throw new Error("Simulated TCP connection reset after sendmessage");
+        }
+        if (nextSendMessageReturnsNull) {
+          nextSendMessageReturnsNull = false;
+          return new Response("null", {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        if (nextSendMessageRateLimited) {
+          nextSendMessageRateLimited = false;
+          return new Response(JSON.stringify({ error: "too many requests" }), {
+            status: 429,
+            headers: {
+              "content-type": "application/json",
+              "retry-after": "1",
+            },
+          });
         }
         return new Response(JSON.stringify({ ret: 0, errcode: 0 }), {
           status: 200,
@@ -379,8 +423,20 @@ describe.skipIf(!SHOULD_RUN)(
         fetchImpl: backendFetchWithFaultHooks,
       });
 
+      await startGatewayFromDatabase();
+    }, 45_000);
+
+    async function startGatewayFromDatabase(): Promise<void> {
+      if (gatewayApp) {
+        await gatewayApp.stop();
+        gatewayApp = null;
+      }
+      const backend = backendClient;
+      if (!backend) {
+        throw new Error("Backend client is not ready");
+      }
       weixinAdapter = new WeixinChannelAdapter({
-        backend: backendClient,
+        backend,
         baseUrl: "https://ilinkai.weixin.qq.com",
         cdnBaseUrl: "https://novac2c.cdn.weixin.qq.com/c2c",
         allowedApiDomains: ["ilinkai.weixin.qq.com"],
@@ -390,11 +446,33 @@ describe.skipIf(!SHOULD_RUN)(
         pollTimeoutMs: 120,
         retryDelayMs: 40,
       });
-
+      discordAdapter = new FakeChannelAdapter("discord");
+      discordAdapter.setSendTextBehavior(async (options) => {
+        discordOutbound.push({
+          text: options.text,
+          inboundMessageId: options.inboundMessageId ?? null,
+        });
+        if (discordSendMode === "unknown") {
+          discordSendMode = "ok";
+          throw new ChannelDeliveryError("discord response lost after dispatch", {
+            outcome: "unknown",
+            code: "unavailable",
+          });
+        }
+        if (discordSendMode === "rate_limited") {
+          discordSendMode = "ok";
+          throw new ChannelDeliveryError("discord rate limited", {
+            outcome: "rate_limited",
+            code: "rate_limited",
+            retryAfterMs: 1000,
+          });
+        }
+        return { messageId: `discord_out_${discordOutbound.length}` };
+      });
       const adapters = new Map<ChannelPlatform, ChannelAdapter>([
         ["weixin", weixinAdapter],
+        ["discord", discordAdapter],
       ]);
-
       const gatewayConfig: GatewayConfig = {
         host: "127.0.0.1",
         port: 0,
@@ -413,29 +491,28 @@ describe.skipIf(!SHOULD_RUN)(
           },
         },
       };
-
       gatewayApp = createGatewayApp({
         config: gatewayConfig,
-        backend: backendClient,
+        backend,
         adapters,
       });
-
       const liveGateway = gatewayApp;
       weixinAdapter.onInboundEvent(async (event) => {
         await liveGateway.orchestrator.handleInboundEvent(event);
       });
-
+      discordAdapter.onInboundEvent(async (event) => {
+        await liveGateway.orchestrator.handleInboundEvent(event);
+      });
       const listenAddr = await gatewayApp.start();
       gatewayBaseUrl = `http://${listenAddr.host}:${listenAddr.port}`;
-
-      // Wire FastAPI's CHANNEL_GATEWAY_URL to our live GatewayApp port
       const gwWireResp = await fetch(`${backendUrl}/test-control/gateway-url`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ gateway_url: gatewayBaseUrl }),
       });
       expect(gwWireResp.status).toBe(200);
-    }, 45_000);
+      await gatewayApp.orchestrator.waitForStartupRecovery();
+    }
 
     afterAll(async () => {
       if (gatewayApp) {
@@ -485,6 +562,112 @@ describe.skipIf(!SHOULD_RUN)(
       dropNextI1ResponseForMessageId = null;
       dropNextI9CursorCommitResponse = false;
       failNextSendMessageWithNetworkDrop = false;
+      nextSendMessageReturnsNull = false;
+      nextSendMessageRateLimited = false;
+      discordSendMode = "ok";
+    }
+
+    function ilinkMessageText(row: Record<string, unknown>): string {
+      const msg = isRecord(row.msg) ? row.msg : null;
+      if (!msg || !Array.isArray(msg.item_list)) return "";
+      return msg.item_list
+        .map((item) => {
+          if (!isRecord(item) || !isRecord(item.text_item)) return "";
+          return typeof item.text_item.text === "string" ? item.text_item.text : "";
+        })
+        .join("");
+    }
+
+    function countIlinkText(needle: string): number {
+      return sentIlinkMessages.filter((row) => ilinkMessageText(row).includes(needle)).length;
+    }
+
+    async function waitForCount(
+      read: () => number,
+      expected: number,
+      label: string,
+    ): Promise<void> {
+      const deadline = Date.now() + 6_000;
+      let seen = read();
+      while (Date.now() < deadline && seen < expected) {
+        await new Promise((resolveWait) => setTimeout(resolveWait, 40));
+        seen = read();
+      }
+      expect(seen, label).toBe(expected);
+    }
+
+    async function waitForCursor(cursor: string): Promise<void> {
+      const deadline = Date.now() + 6_000;
+      let current = "";
+      while (Date.now() < deadline) {
+        const state = await backendClient!.getWeixinState();
+        current = state.get_updates_buf ?? "";
+        if (current === cursor) return;
+        await new Promise((resolveWait) => setTimeout(resolveWait, 40));
+      }
+      expect(current).toBe(cursor);
+    }
+
+    function inboundEvent(params: {
+      platform: "weixin" | "discord";
+      platformUserId: string;
+      messageId: string;
+      text: string;
+    }): InboundChannelEvent {
+      return {
+        platform: params.platform,
+        platformUserId: params.platformUserId,
+        chatType: "dm",
+        chatAddress: `${params.platform}:@me`,
+        chatId: params.platformUserId,
+        threadScopeKey: `dm:${params.platformUserId}`,
+        messageId: params.messageId,
+        text: params.text,
+      };
+    }
+
+    function countScannerText(sender: string, needle: string): number {
+      return sentIlinkMessages.filter((row) => {
+        const msg = isRecord(row.msg) ? row.msg : null;
+        return msg?.to_user_id === sender && ilinkMessageText(row).includes(needle);
+      }).length;
+    }
+
+    async function waitForScannerText(
+      sender: string,
+      needles: readonly string[],
+    ): Promise<string> {
+      const deadline = Date.now() + 6_000;
+      while (Date.now() < deadline) {
+        for (const needle of needles) {
+          if (countScannerText(sender, needle) > 0) return needle;
+        }
+        await new Promise((resolveWait) => setTimeout(resolveWait, 40));
+      }
+      const seen = needles
+        .map((needle) => `${countScannerText(sender, needle)}:${needle}`)
+        .join(" | ");
+      expect(seen, `reply to ${sender}`).toBe("received");
+      return needles[0] ?? "";
+    }
+
+    async function createPlatformBindCode(
+      userId: string,
+      platform: "weixin" | "discord",
+    ): Promise<string> {
+      const resp = await fetch(`${backendUrl}/api/v1/dalton/channels/bind-codes`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "X-User-Id": userId,
+        },
+        body: JSON.stringify({ platform }),
+      });
+      expect(resp.status).toBe(200);
+      const body = await readJsonObject(resp);
+      const code = String(body.code ?? "");
+      expect(code).toMatch(/^DLT-/);
+      return code;
     }
 
     async function confirmBotViaVerify(params: {
@@ -1378,6 +1561,834 @@ describe.skipIf(!SHOULD_RUN)(
         resetOutboundFaults();
       }
     }, 30_000);
+
+    it("3e) persists an HTTP 200 JSON null send as unknown and does not send it again", async () => {
+      expect(backendClient).not.toBeNull();
+      expect(gatewayApp).not.toBeNull();
+      const backend = backendClient!;
+      const probe = `Alert probe null json ${runPrefix}`;
+      const deliveryKey = `agent_send:${runPrefix}:nullshape:null1`;
+      try {
+        sentIlinkMessages.length = 0;
+        resetOutboundFaults();
+        const botId = await ensureActiveWeixinBot(backend);
+        await ensureInternalUserHasContext(backend, botId);
+        nextSendMessageReturnsNull = true;
+        const body = {
+          thread_id: randomUUID(),
+          run_id: `agent_send:${runPrefix}:nullshape`,
+          tool_call_id: "null1",
+          turn_platform: "weixin",
+          target: "weixin:@me",
+          text: probe,
+        };
+        const first = await fetch(`${gatewayBaseUrl}/agent/send`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "X-Service-Token": serviceToken,
+            "X-User-Id": internalUser,
+          },
+          body: JSON.stringify(body),
+        });
+        expect(first.status).toBe(200);
+        const firstJson = await readJsonObject(first);
+        expect(firstJson.status).toBe("unknown");
+        expect(firstJson.code).toBe("unavailable");
+        expect(countIlinkText(probe)).toBe(1);
+
+        const second = await fetch(`${gatewayBaseUrl}/agent/send`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "X-Service-Token": serviceToken,
+            "X-User-Id": internalUser,
+          },
+          body: JSON.stringify(body),
+        });
+        expect(second.status).toBe(200);
+        const secondJson = await readJsonObject(second);
+        expect(secondJson.status).toBe("unknown");
+        await gatewayApp!.orchestrator.runStartupRecovery();
+        expect(countIlinkText(probe)).toBe(1);
+        const inspectJson = await loadInspect();
+        const unknownRow = getArrayField(inspectJson, "deliveries").find(
+          (row) => row.delivery_key === deliveryKey,
+        );
+        expect(unknownRow?.status).toBe("unknown");
+      } finally {
+        resetOutboundFaults();
+      }
+    }, 20_000);
+
+    it("3f) confirms an invalid Weixin bind and an unlinked unbind once across an unknown result and a 429", async () => {
+      expect(backendClient).not.toBeNull();
+      expect(gatewayApp).not.toBeNull();
+      const backend = backendClient!;
+      const bindCursor = `cursor_r11_bind_${runPrefix}`;
+      const bindReplayCursor = `cursor_r11_bind_replay_${runPrefix}`;
+      const unbindCursor = `cursor_r11_unbind_${runPrefix}`;
+      const bindSender = `wx_badbind_${runPrefix}@im.wechat`;
+      const unbindSender = `wx_unlinked_${runPrefix}@im.wechat`;
+      const bindText = "Bind code is invalid or expired.";
+      const unbindText = "Your weixin account is not currently linked.";
+      try {
+        updatesQueue.length = 0;
+        sentIlinkMessages.length = 0;
+        resetOutboundFaults();
+        const botId = await ensureActiveWeixinBot(backend);
+        const before = await loadInspect();
+        const internalIdentity = getArrayField(before, "identities").find(
+          (row) => String(row.user_id ?? "") === internalUser,
+        );
+
+        nextSendMessageReturnsNull = true;
+        updatesQueue.push({
+          ret: 0,
+          get_updates_buf: bindCursor,
+          msgs: [
+            {
+              message_id: "9100000000001001",
+              seq: 70,
+              from_user_id: bindSender,
+              context_token: `ctx_r11_bind_${runPrefix}`,
+              item_list: [{ type: 1, text_item: { text: "/bind NOTACODE" } }],
+            },
+          ],
+        });
+        await waitForCount(() => countIlinkText(bindText), 1, "invalid bind confirmation");
+        await waitForCursor(bindCursor);
+        const bindMessageId = `${botId}:9100000000001001`;
+        let inspectJson = await loadInspect();
+        const bindRow = getArrayField(inspectJson, "inbound_events").find(
+          (row) => row.message_id === bindMessageId,
+        );
+        const bindResult = isRecord(bindRow?.consumed_bind_result)
+          ? bindRow.consumed_bind_result
+          : {};
+        expect(bindResult.ok).toBe(false);
+        expect(bindResult.action).toBe("bind");
+        expect(bindResult.code).toBeUndefined();
+        expect(bindResult.bind_code).toBeUndefined();
+        expect(bindResult.delivery_key).toBe(`notice:weixin:${bindMessageId}:bind_err`);
+        expect(bindRow?.command_reply_pending).toBe(true);
+        expect(bindRow?.dalton_user_id ?? null).toBeNull();
+        const bindDelivery = getArrayField(inspectJson, "deliveries").find(
+          (row) => row.delivery_key === bindResult.delivery_key,
+        );
+        expect(bindDelivery?.status).toBe("unknown");
+
+        updatesQueue.push({
+          ret: 0,
+          get_updates_buf: bindReplayCursor,
+          msgs: [
+            {
+              message_id: "9100000000001001",
+              seq: 70,
+              from_user_id: bindSender,
+              context_token: `ctx_r11_bind_${runPrefix}`,
+              item_list: [{ type: 1, text_item: { text: "/bind NOTACODE" } }],
+            },
+          ],
+        });
+        await waitForCursor(bindReplayCursor);
+        expect(countIlinkText(bindText)).toBe(1);
+
+        nextSendMessageRateLimited = true;
+        updatesQueue.push({
+          ret: 0,
+          get_updates_buf: unbindCursor,
+          msgs: [
+            {
+              message_id: "9100000000001002",
+              seq: 71,
+              from_user_id: unbindSender,
+              context_token: `ctx_r11_unbind_${runPrefix}`,
+              item_list: [{ type: 1, text_item: { text: "/unbind" } }],
+            },
+          ],
+        });
+        await waitForCount(() => countIlinkText(unbindText), 1, "unlinked unbind 429");
+        await waitForCursor(unbindCursor);
+        const unbindMessageId = `${botId}:9100000000001002`;
+        inspectJson = await loadInspect();
+        const unbindRow = getArrayField(inspectJson, "inbound_events").find(
+          (row) => row.message_id === unbindMessageId,
+        );
+        const unbindResult = isRecord(unbindRow?.consumed_bind_result)
+          ? unbindRow.consumed_bind_result
+          : {};
+        expect(unbindResult.ok).toBe(false);
+        expect(unbindResult.action).toBe("unbind");
+        expect(unbindResult.delivery_key).toBe(
+          `notice:weixin:${unbindMessageId}:unbind_err`,
+        );
+        expect(unbindRow?.command_reply_pending).toBe(true);
+        const unbindDelivery = getArrayField(inspectJson, "deliveries").find(
+          (row) => row.delivery_key === unbindResult.delivery_key,
+        );
+        expect(unbindDelivery?.status).toBe("failed");
+
+        await gatewayApp!.orchestrator.runStartupRecovery();
+        await waitForCount(() => countIlinkText(unbindText), 2, "unlinked unbind recovery");
+        expect(countIlinkText(bindText)).toBe(1);
+        inspectJson = await loadInspect();
+        const unbindAfter = getArrayField(inspectJson, "inbound_events").find(
+          (row) => row.message_id === unbindMessageId,
+        );
+        expect(unbindAfter?.status).toBe("completed");
+        expect(unbindAfter?.command_reply_pending).toBe(false);
+        expect(unbindAfter?.command_effect_status).toBe("done");
+        const unbindSent = getArrayField(inspectJson, "deliveries").find(
+          (row) => row.delivery_key === unbindResult.delivery_key,
+        );
+        expect(unbindSent?.status).toBe("sent");
+        const bindAfter = getArrayField(inspectJson, "inbound_events").find(
+          (row) => row.message_id === bindMessageId,
+        );
+        expect(bindAfter?.command_reply_pending).toBe(true);
+        const identities = getArrayField(inspectJson, "identities");
+        expect(
+          identities.some((row) => String(row.platform_user_id ?? "") === bindSender),
+        ).toBe(false);
+        expect(
+          identities.some((row) => String(row.platform_user_id ?? "") === unbindSender),
+        ).toBe(false);
+        expect(
+          identities.find((row) => String(row.user_id ?? "") === internalUser),
+        ).toMatchObject({
+          platform_user_id: internalIdentity?.platform_user_id,
+        });
+      } finally {
+        removeQueuedCursor(bindCursor);
+        removeQueuedCursor(bindReplayCursor);
+        removeQueuedCursor(unbindCursor);
+        resetOutboundFaults();
+      }
+    }, 30_000);
+
+    it("3g) confirms an invalid Discord bind and an unlinked unbind through the shared delivery key", async () => {
+      expect(discordAdapter).not.toBeNull();
+      expect(gatewayApp).not.toBeNull();
+      const bindSender = `discord_badbind_${runPrefix}`;
+      const unbindSender = `discord_unlinked_${runPrefix}`;
+      const bindMessageId = `discord_bind_${runPrefix}`;
+      const unbindMessageId = `discord_unbind_${runPrefix}`;
+      const bindText = "Bind code is invalid or expired.";
+      const unbindText = "Your discord account is not currently linked.";
+      const beforeDiscord = discordOutbound.length;
+      try {
+        resetOutboundFaults();
+        discordSendMode = "unknown";
+        await discordAdapter!.emitInbound(
+          inboundEvent({
+            platform: "discord",
+            platformUserId: bindSender,
+            messageId: bindMessageId,
+            text: "/bind NOTACODE",
+          }),
+        );
+        const bindSends = discordOutbound.slice(beforeDiscord);
+        expect(bindSends).toHaveLength(1);
+        expect(bindSends[0]?.text).toContain(bindText);
+        expect(bindSends[0]?.inboundMessageId).toBe(bindMessageId);
+        let inspectJson = await loadInspect();
+        const bindRow = getArrayField(inspectJson, "inbound_events").find(
+          (row) => row.message_id === bindMessageId,
+        );
+        const bindResult = isRecord(bindRow?.consumed_bind_result)
+          ? bindRow.consumed_bind_result
+          : {};
+        expect(bindResult.ok).toBe(false);
+        expect(bindResult.delivery_key).toBe(`notice:discord:${bindMessageId}:bind_err`);
+        expect(bindResult.code).toBeUndefined();
+        expect(bindRow?.command_reply_pending).toBe(true);
+        expect(bindRow?.dalton_user_id ?? null).toBeNull();
+        expect(
+          getArrayField(inspectJson, "deliveries").find(
+            (row) => row.delivery_key === bindResult.delivery_key,
+          )?.status,
+        ).toBe("unknown");
+
+        await discordAdapter!.emitInbound(
+          inboundEvent({
+            platform: "discord",
+            platformUserId: bindSender,
+            messageId: bindMessageId,
+            text: "/bind NOTACODE",
+          }),
+        );
+        expect(discordOutbound.slice(beforeDiscord)).toHaveLength(1);
+
+        discordSendMode = "rate_limited";
+        await discordAdapter!.emitInbound(
+          inboundEvent({
+            platform: "discord",
+            platformUserId: unbindSender,
+            messageId: unbindMessageId,
+            text: "/unbind",
+          }),
+        );
+        const afterRateLimit = discordOutbound.slice(beforeDiscord);
+        expect(afterRateLimit).toHaveLength(2);
+        expect(afterRateLimit[1]?.text).toContain(unbindText);
+        inspectJson = await loadInspect();
+        const unbindRow = getArrayField(inspectJson, "inbound_events").find(
+          (row) => row.message_id === unbindMessageId,
+        );
+        const unbindResult = isRecord(unbindRow?.consumed_bind_result)
+          ? unbindRow.consumed_bind_result
+          : {};
+        expect(unbindResult.ok).toBe(false);
+        expect(unbindResult.delivery_key).toBe(
+          `notice:discord:${unbindMessageId}:unbind_err`,
+        );
+        expect(unbindRow?.command_reply_pending).toBe(true);
+        expect(
+          getArrayField(inspectJson, "deliveries").find(
+            (row) => row.delivery_key === unbindResult.delivery_key,
+          )?.status,
+        ).toBe("failed");
+
+        await gatewayApp!.orchestrator.runStartupRecovery();
+        const afterRecovery = discordOutbound.slice(beforeDiscord);
+        expect(afterRecovery.filter((row) => row.text.includes(bindText))).toHaveLength(1);
+        expect(afterRecovery.filter((row) => row.text.includes(unbindText))).toHaveLength(2);
+        inspectJson = await loadInspect();
+        const unbindAfter = getArrayField(inspectJson, "inbound_events").find(
+          (row) => row.message_id === unbindMessageId,
+        );
+        expect(unbindAfter?.status).toBe("completed");
+        expect(unbindAfter?.command_reply_pending).toBe(false);
+        expect(unbindAfter?.command_effect_status).toBe("done");
+        expect(
+          getArrayField(inspectJson, "deliveries").find(
+            (row) => row.delivery_key === unbindResult.delivery_key,
+          )?.status,
+        ).toBe("sent");
+        const bindAfter = getArrayField(inspectJson, "inbound_events").find(
+          (row) => row.message_id === bindMessageId,
+        );
+        expect(bindAfter?.command_reply_pending).toBe(true);
+        expect(bindAfter?.dalton_user_id ?? null).toBeNull();
+        expect(unbindAfter?.dalton_user_id ?? null).toBeNull();
+      } finally {
+        resetOutboundFaults();
+      }
+    }, 20_000);
+
+    it("3h) saves slash-command context on a fresh login and ignores a prior generation", async () => {
+      expect(backendClient).not.toBeNull();
+      expect(gatewayApp).not.toBeNull();
+      const backend = backendClient!;
+      const commands = [
+        { text: "/new", needles: ["Started a new conversation thread"], seq: 31 },
+        {
+          text: "/main",
+          needles: ["Keeping current conversation", "started a new thread"],
+          seq: 32,
+        },
+        { text: "/workspace", needles: ["Available workspaces:"], seq: 33 },
+        { text: "/stop", needles: ["No active conversation thread to stop."], seq: 34 },
+      ] as const;
+      const cursors: string[] = [];
+      let lastBotId = "";
+      let lastGeneration = 0;
+      let lastSender = "";
+      try {
+        updatesQueue.length = 0;
+        sentIlinkMessages.length = 0;
+        resetOutboundFaults();
+        for (let index = 0; index < commands.length; index += 1) {
+          const command = commands[index]!;
+          const botId = `wx_cmd${index}_${runPrefix}@im.wechat`;
+          const sender = `wx_cmd_sender${index}_${runPrefix}@im.wechat`;
+          const token = `ctx_cmd_${index}_${runPrefix}_secret`;
+          const replayToken = `ctx_cmd_replay_${index}_${runPrefix}_secret`;
+          const rawId = `930000000000${index}`;
+          const cursor = `cursor_cmd_${index}_${runPrefix}`;
+          const replayCursor = `cursor_cmd_replay_${index}_${runPrefix}`;
+          cursors.push(cursor, replayCursor);
+          await confirmBotViaVerify({
+            userId: admin1,
+            botId,
+            token: `secret_cmd_${index}_${runPrefix}`,
+            scannerId: sender,
+            username: `Cmd${index}`,
+          });
+          await gatewayApp!.orchestrator.syncWeixinStateCache();
+          const state = await backend.getWeixinState(false);
+          const generation = state.bot_generation ?? 0;
+          expect(state.ilink_bot_id).toBe(botId);
+          expect(state.status).toBe("active");
+          const before = await loadInspect();
+          expect(
+            getArrayField(before, "context_tokens").some(
+              (row) => row.ilink_bot_id === botId && row.platform_user_id === sender,
+            ),
+          ).toBe(false);
+
+          updatesQueue.push({
+            ret: 0,
+            get_updates_buf: cursor,
+            msgs: [
+              {
+                message_id: rawId,
+                seq: command.seq,
+                from_user_id: sender,
+                context_token: token,
+                item_list: [{ type: 1, text_item: { text: command.text } }],
+              },
+            ],
+          });
+          const needle = await waitForScannerText(sender, command.needles);
+          await waitForCursor(cursor);
+          expect(countScannerText(sender, needle)).toBe(1);
+          const messageId = `${botId}:${rawId}`;
+          let inspectJson = await loadInspect();
+          expect(JSON.stringify(inspectJson)).not.toContain(token);
+          const inbound = getArrayField(inspectJson, "inbound_events").find(
+            (row) => row.message_id === messageId,
+          );
+          expect(inbound?.dalton_user_id).toBe(admin1);
+          expect(inbound?.status).toBe("completed");
+          expect(inbound?.command_reply_pending).toBe(false);
+          expect(inbound?.command_effect_status).toBe("done");
+          expect(JSON.stringify(inbound?.raw_payload ?? {})).not.toContain(token);
+          const ctx = getArrayField(inspectJson, "context_tokens").find(
+            (row) => row.ilink_bot_id === botId && row.platform_user_id === sender,
+          );
+          expect(Number(ctx?.seq)).toBe(command.seq);
+          expect(Number(ctx?.bot_generation)).toBe(generation);
+          const identity = getArrayField(inspectJson, "identities").find(
+            (row) => row.platform_user_id === sender,
+          );
+          expect(identity?.user_id).toBe(admin1);
+          expect(identity?.has_encrypted_ctx).toBe(true);
+          expect(Number(identity?.weixin_context_seq)).toBe(command.seq);
+          expect(identity?.weixin_context_bot_id).toBe(botId);
+          expect(Number(identity?.weixin_context_bot_generation)).toBe(generation);
+          const ownerState = await backend.getChannelState({ user_id: admin1 });
+          expect(ownerState.identities.weixin?.weixin_context_token).toBe(token);
+          const otherState = await backend.getChannelState({ user_id: admin2 });
+          expect(JSON.stringify(otherState)).not.toContain(token);
+
+          updatesQueue.push({
+            ret: 0,
+            get_updates_buf: replayCursor,
+            msgs: [
+              {
+                message_id: rawId,
+                seq: 1,
+                from_user_id: sender,
+                context_token: replayToken,
+                item_list: [{ type: 1, text_item: { text: command.text } }],
+              },
+            ],
+          });
+          await waitForCursor(replayCursor);
+          expect(countScannerText(sender, needle)).toBe(1);
+          inspectJson = await loadInspect();
+          expect(JSON.stringify(inspectJson)).not.toContain(replayToken);
+          const replayCtx = getArrayField(inspectJson, "context_tokens").find(
+            (row) => row.ilink_bot_id === botId && row.platform_user_id === sender,
+          );
+          expect(Number(replayCtx?.seq)).toBe(command.seq);
+          const replayOwner = await backend.getChannelState({ user_id: admin1 });
+          expect(replayOwner.identities.weixin?.weixin_context_token).toBe(token);
+          lastBotId = botId;
+          lastGeneration = generation;
+          lastSender = sender;
+        }
+
+        const nextBotId = `wx_cmd_after_${runPrefix}@im.wechat`;
+        const staleToken = `stale_ctx_${runPrefix}_secret`;
+        await confirmBotViaVerify({
+          userId: admin1,
+          botId: nextBotId,
+          token: `secret_cmd_after_${runPrefix}`,
+          scannerId: lastSender,
+          username: "CmdAfter",
+        });
+        await gatewayApp!.orchestrator.syncWeixinStateCache();
+        const nextState = await backend.getWeixinState({
+          include_token: true,
+          recipient_platform_user_id: lastSender,
+        });
+        expect(nextState.ilink_bot_id).toBe(nextBotId);
+        expect(nextState.bot_generation).toBe(lastGeneration + 1);
+        expect(nextState.weixin_context_token ?? null).toBeNull();
+        const staleMessageId = `${lastBotId}:stale_${runPrefix}`;
+        await gatewayApp!.orchestrator.handleInboundEvent({
+          platform: "weixin",
+          platformUserId: lastSender,
+          chatType: "dm",
+          chatAddress: "weixin:@me",
+          chatId: lastSender,
+          threadScopeKey: `dm:${lastSender}`,
+          messageId: staleMessageId,
+          text: "/new",
+          commandText: "/new",
+          weixinContextToken: staleToken,
+          weixinBotId: lastBotId,
+          weixinBotGeneration: lastGeneration,
+          weixinContextSeq: 4,
+          rawPayload: {
+            platform_user_id: lastSender,
+            ilink_bot_id: lastBotId,
+            bot_generation: lastGeneration,
+            seq: 4,
+            text: "/new",
+          },
+        });
+        const afterStale = await backend.getWeixinState({
+          include_token: true,
+          recipient_platform_user_id: lastSender,
+        });
+        expect(afterStale.ilink_bot_id).toBe(nextBotId);
+        expect(afterStale.bot_generation).toBe(lastGeneration + 1);
+        expect(afterStale.weixin_context_token ?? null).toBeNull();
+        const inspectJson = await loadInspect();
+        expect(
+          getArrayField(inspectJson, "context_tokens").some(
+            (row) => row.platform_user_id === lastSender,
+          ),
+        ).toBe(false);
+        expect(JSON.stringify(inspectJson)).not.toContain(staleToken);
+        const staleRow = getArrayField(inspectJson, "inbound_events").find(
+          (row) => row.message_id === staleMessageId,
+        );
+        expect(staleRow?.status).toBe("ignored");
+        expect(staleRow?.command_reply_pending).toBe(false);
+        expect(countScannerText(lastSender, "Started a new conversation thread")).toBe(0);
+      } finally {
+        for (const cursor of cursors) removeQueuedCursor(cursor);
+        resetOutboundFaults();
+      }
+    }, 60_000);
+
+    it("3i) keeps one linked bind and unbind when confirmation delivery is interrupted", async () => {
+      expect(backendClient).not.toBeNull();
+      expect(gatewayApp).not.toBeNull();
+      expect(discordAdapter).not.toBeNull();
+      const backend = backendClient!;
+      const weixinSender = `wx_linked_${runPrefix}@im.wechat`;
+      const discordSender = `discord_linked_${runPrefix}`;
+      const weixinBindRawId = "9400000000001001";
+      const weixinUnbindRawId = "9400000000001002";
+      const bindCursor = `cursor_linked_bind_${runPrefix}`;
+      const bindReplayCursor = `cursor_linked_bind_replay_${runPrefix}`;
+      const unbindCursor = `cursor_linked_unbind_${runPrefix}`;
+      const weixinBindToken = `ctx_linked_bind_${runPrefix}`;
+      const weixinUnbindToken = `ctx_linked_unbind_${runPrefix}`;
+      const weixinBindText = "Successfully linked your weixin account to Dalton.";
+      const weixinUnbindText = "Unlinked your weixin account from Dalton.";
+      const discordBindText = "Successfully linked your discord account to Dalton.";
+      const discordUnbindText = "Unlinked your discord account from Dalton.";
+      const discordBindMessageId = `discord_linked_bind_${runPrefix}`;
+      const discordUnbindMessageId = `discord_linked_unbind_${runPrefix}`;
+      const discordStart = discordOutbound.length;
+      try {
+        updatesQueue.length = 0;
+        sentIlinkMessages.length = 0;
+        resetOutboundFaults();
+        const botId = await ensureActiveWeixinBot(backend);
+        await gatewayApp!.orchestrator.syncWeixinStateCache();
+        const weixinBindMessageId = `${botId}:${weixinBindRawId}`;
+        const weixinUnbindMessageId = `${botId}:${weixinUnbindRawId}`;
+        const weixinCode = await createPlatformBindCode(externalUser, "weixin");
+
+        nextSendMessageReturnsNull = true;
+        updatesQueue.push({
+          ret: 0,
+          get_updates_buf: bindCursor,
+          msgs: [
+            {
+              message_id: weixinBindRawId,
+              seq: 81,
+              from_user_id: weixinSender,
+              context_token: weixinBindToken,
+              item_list: [{ type: 1, text_item: { text: `/bind ${weixinCode}` } }],
+            },
+          ],
+        });
+        await waitForScannerText(weixinSender, [weixinBindText]);
+        await waitForCursor(bindCursor);
+        expect(countScannerText(weixinSender, weixinBindText)).toBe(1);
+        expect(ilinkMessageText(
+          sentIlinkMessages.find((row) => {
+            const msg = isRecord(row.msg) ? row.msg : null;
+            return msg?.to_user_id === weixinSender;
+          }) ?? {},
+        )).not.toContain(weixinCode);
+        let inspectJson = await loadInspect();
+        let bindRow = getArrayField(inspectJson, "inbound_events").find(
+          (row) => row.message_id === weixinBindMessageId,
+        );
+        let bindResult = isRecord(bindRow?.consumed_bind_result)
+          ? bindRow.consumed_bind_result
+          : {};
+        expect(bindResult.ok).toBe(true);
+        expect(bindResult.action).toBe("bind");
+        expect(bindResult.user_id).toBe(externalUser);
+        expect(bindResult.code).toBeUndefined();
+        expect(bindResult.bind_code).toBeUndefined();
+        expect(bindResult.delivery_key).toBe(
+          `notice:weixin:${weixinBindMessageId}:bind_ok`,
+        );
+        expect(bindRow?.command_reply_pending).toBe(true);
+        expect(bindRow?.dalton_user_id).toBe(externalUser);
+        expect(
+          getArrayField(inspectJson, "deliveries").find(
+            (row) => row.delivery_key === bindResult.delivery_key,
+          )?.status,
+        ).toBe("unknown");
+        let linkedState = await backend.getChannelState({ user_id: externalUser });
+        expect(linkedState.identities.weixin?.platform_user_id).toBe(weixinSender);
+
+        updatesQueue.push({
+          ret: 0,
+          get_updates_buf: bindReplayCursor,
+          msgs: [
+            {
+              message_id: weixinBindRawId,
+              seq: 81,
+              from_user_id: weixinSender,
+              context_token: weixinBindToken,
+              item_list: [{ type: 1, text_item: { text: `/bind ${weixinCode}` } }],
+            },
+          ],
+        });
+        await waitForCursor(bindReplayCursor);
+        expect(countScannerText(weixinSender, weixinBindText)).toBe(1);
+        linkedState = await backend.getChannelState({ user_id: externalUser });
+        expect(linkedState.identities.weixin?.platform_user_id).toBe(weixinSender);
+
+        nextSendMessageRateLimited = true;
+        updatesQueue.push({
+          ret: 0,
+          get_updates_buf: unbindCursor,
+          msgs: [
+            {
+              message_id: weixinUnbindRawId,
+              seq: 82,
+              from_user_id: weixinSender,
+              context_token: weixinUnbindToken,
+              item_list: [{ type: 1, text_item: { text: "/unbind" } }],
+            },
+          ],
+        });
+        await waitForScannerText(weixinSender, [weixinUnbindText]);
+        await waitForCursor(unbindCursor);
+        expect(countScannerText(weixinSender, weixinUnbindText)).toBe(1);
+        inspectJson = await loadInspect();
+        let unbindRow = getArrayField(inspectJson, "inbound_events").find(
+          (row) => row.message_id === weixinUnbindMessageId,
+        );
+        let unbindResult = isRecord(unbindRow?.consumed_bind_result)
+          ? unbindRow.consumed_bind_result
+          : {};
+        expect(unbindResult.ok).toBe(true);
+        expect(unbindResult.action).toBe("unbind");
+        expect(unbindResult.user_id).toBe(externalUser);
+        expect(unbindResult.delivery_key).toBe(
+          `notice:weixin:${weixinUnbindMessageId}:unbind_ok`,
+        );
+        expect(unbindRow?.command_reply_pending).toBe(true);
+        expect(
+          getArrayField(inspectJson, "deliveries").find(
+            (row) => row.delivery_key === unbindResult.delivery_key,
+          )?.status,
+        ).toBe("failed");
+        expect(
+          getArrayField(inspectJson, "identities").some(
+            (row) => row.platform_user_id === weixinSender,
+          ),
+        ).toBe(false);
+        linkedState = await backend.getChannelState({ user_id: externalUser });
+        expect(linkedState.identities.weixin ?? null).toBeNull();
+
+        const discordCode = await createPlatformBindCode(admin2, "discord");
+        discordSendMode = "unknown";
+        await discordAdapter!.emitInbound(
+          inboundEvent({
+            platform: "discord",
+            platformUserId: discordSender,
+            messageId: discordBindMessageId,
+            text: `/bind ${discordCode}`,
+          }),
+        );
+        let discordSends = discordOutbound.slice(discordStart);
+        expect(discordSends.filter((row) => row.text.includes(discordBindText))).toHaveLength(1);
+        expect(discordSends[0]?.text).not.toContain(discordCode);
+        expect(discordSends[0]?.inboundMessageId).toBe(discordBindMessageId);
+        inspectJson = await loadInspect();
+        bindRow = getArrayField(inspectJson, "inbound_events").find(
+          (row) => row.message_id === discordBindMessageId,
+        );
+        bindResult = isRecord(bindRow?.consumed_bind_result)
+          ? bindRow.consumed_bind_result
+          : {};
+        expect(bindResult.ok).toBe(true);
+        expect(bindResult.delivery_key).toBe(
+          `notice:discord:${discordBindMessageId}:bind_ok`,
+        );
+        expect(bindResult.code).toBeUndefined();
+        expect(bindRow?.command_reply_pending).toBe(true);
+        expect(bindRow?.dalton_user_id).toBe(admin2);
+        expect(
+          getArrayField(inspectJson, "deliveries").find(
+            (row) => row.delivery_key === bindResult.delivery_key,
+          )?.status,
+        ).toBe("unknown");
+        expect(
+          (await backend.getChannelState({ user_id: admin2 })).identities.discord
+            ?.platform_user_id,
+        ).toBe(discordSender);
+
+        await discordAdapter!.emitInbound(
+          inboundEvent({
+            platform: "discord",
+            platformUserId: discordSender,
+            messageId: discordBindMessageId,
+            text: `/bind ${discordCode}`,
+          }),
+        );
+        expect(
+          discordOutbound.slice(discordStart).filter((row) => row.text.includes(discordBindText)),
+        ).toHaveLength(1);
+
+        discordSendMode = "rate_limited";
+        await discordAdapter!.emitInbound(
+          inboundEvent({
+            platform: "discord",
+            platformUserId: discordSender,
+            messageId: discordUnbindMessageId,
+            text: "/unbind",
+          }),
+        );
+        discordSends = discordOutbound.slice(discordStart);
+        expect(discordSends.filter((row) => row.text.includes(discordUnbindText))).toHaveLength(1);
+        inspectJson = await loadInspect();
+        unbindRow = getArrayField(inspectJson, "inbound_events").find(
+          (row) => row.message_id === discordUnbindMessageId,
+        );
+        unbindResult = isRecord(unbindRow?.consumed_bind_result)
+          ? unbindRow.consumed_bind_result
+          : {};
+        expect(unbindResult.ok).toBe(true);
+        expect(unbindResult.delivery_key).toBe(
+          `notice:discord:${discordUnbindMessageId}:unbind_ok`,
+        );
+        expect(unbindRow?.command_reply_pending).toBe(true);
+        expect(
+          getArrayField(inspectJson, "deliveries").find(
+            (row) => row.delivery_key === unbindResult.delivery_key,
+          )?.status,
+        ).toBe("failed");
+        expect(
+          (await backend.getChannelState({ user_id: admin2 })).identities.discord ?? null,
+        ).toBeNull();
+
+        // A failed confirmation is reclaimable. Replaying it here would send the
+        // reply on this process and leave nothing for the restarted gateway.
+        resetOutboundFaults();
+        const activeBot = await backend.getWeixinState(true);
+        await startGatewayFromDatabase();
+        expect(countScannerText(weixinSender, weixinBindText)).toBe(1);
+        expect(countScannerText(weixinSender, weixinUnbindText)).toBe(2);
+        const recovered = sentIlinkMessages.filter((row) => {
+          const msg = isRecord(row.msg) ? row.msg : null;
+          return (
+            msg?.to_user_id === weixinSender &&
+            ilinkMessageText(row).includes(weixinUnbindText)
+          );
+        });
+        expect(recovered).toHaveLength(2);
+        expect(recovered[1]?.authorization).toBe(`Bearer ${activeBot.bot_token}`);
+        const recoveredMsg = isRecord(recovered[1]?.msg) ? recovered[1].msg : null;
+        expect(recoveredMsg?.to_user_id).toBe(weixinSender);
+        expect(recoveredMsg?.context_token).toBe(weixinUnbindToken);
+        discordSends = discordOutbound.slice(discordStart);
+        expect(discordSends.filter((row) => row.text.includes(discordBindText))).toHaveLength(1);
+        const discordUnbinds = discordSends.filter((row) =>
+          row.text.includes(discordUnbindText),
+        );
+        expect(discordUnbinds).toHaveLength(2);
+        expect(discordUnbinds[1]?.inboundMessageId).toBe(discordUnbindMessageId);
+
+        inspectJson = await loadInspect();
+        const weixinBindAfter = getArrayField(inspectJson, "inbound_events").find(
+          (row) => row.message_id === weixinBindMessageId,
+        );
+        const weixinUnbindAfter = getArrayField(inspectJson, "inbound_events").find(
+          (row) => row.message_id === weixinUnbindMessageId,
+        );
+        expect(weixinBindAfter?.command_reply_pending).toBe(true);
+        expect(weixinUnbindAfter?.status).toBe("completed");
+        expect(weixinUnbindAfter?.command_reply_pending).toBe(false);
+        expect(weixinUnbindAfter?.command_effect_status).toBe("done");
+        const weixinBindResultAfter = isRecord(weixinBindAfter?.consumed_bind_result)
+          ? weixinBindAfter.consumed_bind_result
+          : {};
+        const weixinUnbindResultAfter = isRecord(weixinUnbindAfter?.consumed_bind_result)
+          ? weixinUnbindAfter.consumed_bind_result
+          : {};
+        expect(weixinBindResultAfter.ok).toBe(true);
+        expect(weixinBindResultAfter.action).toBe("bind");
+        expect(weixinBindResultAfter.code).toBeUndefined();
+        expect(weixinUnbindResultAfter.ok).toBe(true);
+        expect(weixinUnbindResultAfter.action).toBe("unbind");
+        expect(
+          getArrayField(inspectJson, "deliveries").find(
+            (row) => row.delivery_key === `notice:weixin:${weixinBindMessageId}:bind_ok`,
+          )?.status,
+        ).toBe("unknown");
+        expect(
+          getArrayField(inspectJson, "deliveries").find(
+            (row) => row.delivery_key === `notice:weixin:${weixinUnbindMessageId}:unbind_ok`,
+          )?.status,
+        ).toBe("sent");
+        const discordBindAfter = getArrayField(inspectJson, "inbound_events").find(
+          (row) => row.message_id === discordBindMessageId,
+        );
+        const discordUnbindAfter = getArrayField(inspectJson, "inbound_events").find(
+          (row) => row.message_id === discordUnbindMessageId,
+        );
+        expect(discordBindAfter?.command_reply_pending).toBe(true);
+        expect(discordUnbindAfter?.status).toBe("completed");
+        expect(discordUnbindAfter?.command_reply_pending).toBe(false);
+        expect(discordUnbindAfter?.command_effect_status).toBe("done");
+        const discordBindResultAfter = isRecord(discordBindAfter?.consumed_bind_result)
+          ? discordBindAfter.consumed_bind_result
+          : {};
+        const discordUnbindResultAfter = isRecord(discordUnbindAfter?.consumed_bind_result)
+          ? discordUnbindAfter.consumed_bind_result
+          : {};
+        expect(discordBindResultAfter.ok).toBe(true);
+        expect(discordBindResultAfter.action).toBe("bind");
+        expect(discordBindResultAfter.code).toBeUndefined();
+        expect(discordUnbindResultAfter.ok).toBe(true);
+        expect(discordUnbindResultAfter.action).toBe("unbind");
+        expect(
+          (await backend.getChannelState({ user_id: externalUser })).identities.weixin ??
+            null,
+        ).toBeNull();
+        expect(
+          (await backend.getChannelState({ user_id: admin2 })).identities.discord ?? null,
+        ).toBeNull();
+        expect(
+          getArrayField(inspectJson, "identities").some(
+            (row) => row.platform_user_id === weixinSender,
+          ),
+        ).toBe(false);
+      } finally {
+        removeQueuedCursor(bindCursor);
+        removeQueuedCursor(bindReplayCursor);
+        removeQueuedCursor(unbindCursor);
+        resetOutboundFaults();
+      }
+    }, 45_000);
 
     it("4) switches Bot account with bot_generation advancement & context_token invalidation, durably marks -14 session expired for current generation while ignoring stale generation, and cancels cleanly on stop()", async () => {
       expect(backendClient).not.toBeNull();

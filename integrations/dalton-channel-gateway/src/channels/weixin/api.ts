@@ -377,6 +377,21 @@ async function executeIlinkJsonRequest<T extends { ret?: number; errcode?: numbe
     });
   }
 
+  if (
+    parsed === null ||
+    parsed === undefined ||
+    typeof parsed !== "object" ||
+    Array.isArray(parsed)
+  ) {
+    throw new WeixinApiError({
+      kind: "http_error",
+      endpoint: params.endpoint,
+      message: `${params.endpoint} returned a non-object JSON body`,
+      status: response.status,
+      requestSent: requestDispatched,
+    });
+  }
+
   assertIlinkBusinessOk(parsed, params.endpoint, requestDispatched);
   return parsed;
 }

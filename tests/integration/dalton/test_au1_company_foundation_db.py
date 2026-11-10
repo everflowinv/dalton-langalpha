@@ -584,7 +584,7 @@ async def test_d035_upgrade_from_d031_preserves_state_and_enforces_safe_downgrad
             )
             assert await cur.fetchone() == {"job_key": "cn-leverage-daily"}
 
-    await asyncio.to_thread(command.upgrade, dalton_cfg, "head")
+    await asyncio.to_thread(command.upgrade, dalton_cfg, "d035")
 
     async with au1_live_pool.connection() as db_conn:
         assert await _dalton_alembic_versions(db_conn) == ["d035"]

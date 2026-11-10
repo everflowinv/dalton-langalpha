@@ -527,6 +527,140 @@ export class ChannelGatewayOrchestrator {
   // §3.3 Slash Commands (`/bind`, `/unbind`, `/workspace`, `/main`, `/new`, `/stop`, `/<workspace_name>`)
   // =========================================================================
 
+  private bindConfirmationSuffix(
+    action: "bind" | "unbind",
+    ok: boolean,
+    reason: string | null,
+  ): string {
+    if (
+      action === "bind" &&
+      (reason === "missing_bind_code" || reason === "missing_argument")
+    ) {
+      return "bind_usage";
+    }
+    if (action === "bind") return ok ? "bind_ok" : "bind_err";
+    return ok ? "unbind_ok" : "unbind_err";
+  }
+
+  private bindConfirmationText(
+    event: InboundChannelEvent,
+    action: "bind" | "unbind",
+    result: Record<string, unknown>,
+  ): string {
+    const reason = typeof result.reason === "string" ? result.reason : "";
+    if (action === "bind" && !result.ok) {
+      if (
+        reason === "missing_bind_code" ||
+        reason === "missing_argument"
+      ) {
+        return "Usage: `/bind <6-CHAR-CODE>` (generate a bind code in Web Settings → Channels).";
+      }
+      if (reason === "revoked_in_group") {
+        return "For security, `/bind` cannot be used in a group chat. This code has been revoked; please generate a new code and send `/bind <CODE>` in a direct message.";
+      }
+      if (reason === "platform_mismatch") {
+        const expected =
+          typeof result.expected_platform === "string"
+            ? result.expected_platform
+            : "another platform";
+        return `This bind code was generated for ${expected}, not ${event.platform}.`;
+      }
+      return "Bind code is invalid or expired. Please generate a new code in Web Settings → Channels.";
+    }
+    if (action === "bind") {
+      return `Successfully linked your ${event.platform} account to Dalton.`;
+    }
+    if (!result.ok) {
+      return `Your ${event.platform} account is not currently linked.`;
+    }
+    return `Unlinked your ${event.platform} account from Dalton.`;
+  }
+
+  private storedBindingConfirmation(
+    row: {
+      consumed_bind_result?: Record<string, unknown> | null;
+      command_result?: Record<string, unknown> | null;
+    },
+  ): { action: "bind" | "unbind"; result: Record<string, unknown> } | null {
+    const consumed = row.consumed_bind_result;
+    if (consumed && typeof consumed === "object") {
+      return {
+        action: consumed.action === "unbind" ? "unbind" : "bind",
+        result: consumed,
+      };
+    }
+    const commandResult = row.command_result;
+    if (!commandResult || typeof commandResult !== "object") return null;
+    if (commandResult.action === "bind" || commandResult.action === "unbind") {
+      return { action: commandResult.action, result: commandResult };
+    }
+    if (commandResult.reason === "missing_bind_code") {
+      return { action: "bind", result: commandResult };
+    }
+    return null;
+  }
+
+  private async deliverStoredCommandConfirmation(params: {
+    event: InboundChannelEvent;
+    userId: string | null;
+    action: "bind" | "unbind";
+    result: Record<string, unknown>;
+  }): Promise<boolean> {
+    const ok = params.result.ok === true;
+    const reason =
+      typeof params.result.reason === "string" ? params.result.reason : null;
+    const deliveryKey =
+      typeof params.result.delivery_key === "string" &&
+      params.result.delivery_key.length > 0
+        ? params.result.delivery_key
+        : `notice:${params.event.platform}:${params.event.messageId}:${this.bindConfirmationSuffix(params.action, ok, reason)}`;
+    if (params.action === "unbind" && ok && params.userId) {
+      this.closeWatchesForUserPlatform(params.userId, params.event.platform);
+    }
+    const delivered = await this.sendInboundNotice(
+      params.event,
+      params.userId,
+      deliveryKey,
+      this.bindConfirmationText(params.event, params.action, params.result),
+    );
+    if (!delivered) return false;
+    await this.backend.updateInboundProgress({
+      platform: params.event.platform,
+      message_id: params.event.messageId,
+      status: "completed",
+      command_reply_pending: false,
+      command_effect_status: "done",
+      fallback_pending: false,
+    });
+    return true;
+  }
+
+  private async recoverStoredBindingConfirmation(
+    row: RecoverInboundEventRow,
+    event: InboundChannelEvent,
+  ): Promise<boolean> {
+    const stored = this.storedBindingConfirmation({
+      consumed_bind_result: row.consumed_bind_result ?? null,
+      command_result:
+        row.command_result && typeof row.command_result === "object"
+          ? (row.command_result as unknown as Record<string, unknown>)
+          : null,
+    });
+    if (!stored) return false;
+    if (row.command_reply_pending === false) return true;
+    const userId =
+      typeof stored.result.user_id === "string" && stored.result.user_id
+        ? stored.result.user_id
+        : row.dalton_user_id;
+    await this.deliverStoredCommandConfirmation({
+      event,
+      userId,
+      action: stored.action,
+      result: stored.result,
+    });
+    return true;
+  }
+
   private async tryHandleSlashCommand(
     event: InboundChannelEvent,
     parsedCmd: ParsedSlashCommand,
@@ -550,9 +684,6 @@ export class ChannelGatewayOrchestrator {
         raw_payload: {
           ...this.buildInboundRawPayload(event),
           command: parsedCmd.kind,
-          ...(parsedCmd.kind === "bind" && parsedCmd.code
-            ? { arg: parsedCmd.code }
-            : {}),
         },
         weixin_context_token: event.weixinContextToken ?? null,
         weixin_bot_id: event.weixinBotId ?? null,
@@ -581,19 +712,40 @@ export class ChannelGatewayOrchestrator {
       if (!resolved) {
         return true;
       }
+      if (resolved.consumed_bind_result) {
+        await this.deliverStoredCommandConfirmation({
+          event,
+          userId:
+            typeof resolved.consumed_bind_result.user_id === "string"
+              ? resolved.consumed_bind_result.user_id
+              : resolved.dalton_user_id,
+          action: "bind",
+          result: resolved.consumed_bind_result,
+        });
+        return true;
+      }
       const arg = parsedCmd.code;
       if (!arg) {
+        const deliveryKey = `notice:${event.platform}:${event.messageId}:bind_usage`;
+        const usageResult: Record<string, unknown> = {
+          ok: false,
+          action: "bind",
+          reason: "missing_bind_code",
+          delivery_key: deliveryKey,
+        };
         await this.backend.updateInboundProgress({
           platform: event.platform,
           message_id: event.messageId,
-          status: "completed",
+          command_effect_status: "done",
+          command_reply_pending: true,
+          command_result: usageResult as unknown as I3SessionCommandResponse,
         });
-        await this.sendInboundNotice(
+        await this.deliverStoredCommandConfirmation({
           event,
-          resolved.dalton_user_id,
-          `notice:${event.platform}:${event.messageId}:bind_usage`,
-          "Usage: `/bind <6-CHAR-CODE>` (generate a bind code in Web Settings → Channels).",
-        );
+          userId: resolved.dalton_user_id,
+          action: "bind",
+          result: usageResult,
+        });
         return true;
       }
       const res = await this.backend.consumeBindCode({
@@ -609,39 +761,31 @@ export class ChannelGatewayOrchestrator {
         code: arg,
         is_group: event.chatType === "group",
       });
-      await this.backend.updateInboundProgress({
-        platform: event.platform,
-        message_id: event.messageId,
-        status: "completed",
-      });
-      if (!res.ok) {
-        let errNotice =
-          "Bind code is invalid or expired. Please generate a new code in Web Settings → Channels.";
-        if (res.reason === "revoked_in_group") {
-          errNotice =
-            "For security, `/bind` cannot be used in a group chat. This code has been revoked; please generate a new code and send `/bind <CODE>` in a direct message.";
-        } else if (res.reason === "platform_mismatch") {
-          errNotice = `This bind code was generated for ${res.expected_platform ?? "another platform"}, not ${event.platform}.`;
-        }
-        await this.sendInboundNotice(
-          event,
-          resolved.dalton_user_id,
-          `notice:${event.platform}:${event.messageId}:bind_err`,
-          errNotice,
-        );
-        return true;
-      }
-      await this.sendInboundNotice(
+      await this.deliverStoredCommandConfirmation({
         event,
-        res.user_id ?? resolved.dalton_user_id,
-        `notice:${event.platform}:${event.messageId}:bind_ok`,
-        `Successfully linked your ${event.platform} account to Dalton.`,
-      );
+        userId: res.user_id ?? resolved.dalton_user_id,
+        action: "bind",
+        result: res as unknown as Record<string, unknown>,
+      });
       return true;
     }
 
     if (parsedCmd.kind === "unbind") {
       if (!resolved) {
+        return true;
+      }
+      if (resolved.consumed_bind_result) {
+        const savedAction =
+          resolved.consumed_bind_result.action === "unbind" ? "unbind" : "unbind";
+        await this.deliverStoredCommandConfirmation({
+          event,
+          userId:
+            typeof resolved.consumed_bind_result.user_id === "string"
+              ? resolved.consumed_bind_result.user_id
+              : resolved.dalton_user_id,
+          action: savedAction,
+          result: resolved.consumed_bind_result,
+        });
         return true;
       }
       const res = await this.backend.consumeBindCode({
@@ -654,29 +798,12 @@ export class ChannelGatewayOrchestrator {
         inbound_message_id: event.messageId,
         is_group: event.chatType === "group",
       });
-      await this.backend.updateInboundProgress({
-        platform: event.platform,
-        message_id: event.messageId,
-        status: "completed",
-      });
-      if (!res.ok) {
-        await this.sendInboundNotice(
-          event,
-          resolved.dalton_user_id,
-          `notice:${event.platform}:${event.messageId}:unbind_err`,
-          `Your ${event.platform} account is not currently linked.`,
-        );
-        return true;
-      }
-      if (res.user_id) {
-        this.closeWatchesForUserPlatform(res.user_id, event.platform);
-      }
-      await this.sendInboundNotice(
+      await this.deliverStoredCommandConfirmation({
         event,
-        res.user_id ?? resolved.dalton_user_id,
-        `notice:${event.platform}:${event.messageId}:unbind_ok`,
-        `Unlinked your ${event.platform} account from Dalton.`,
-      );
+        userId: res.user_id ?? resolved.dalton_user_id,
+        action: "unbind",
+        result: res as unknown as Record<string, unknown>,
+      });
       return true;
     }
 
@@ -698,6 +825,11 @@ export class ChannelGatewayOrchestrator {
         cmd: parsedCmd.cmd,
       },
       weixin_context_token: event.weixinContextToken ?? null,
+      weixin_bot_id: event.weixinBotId ?? null,
+      weixin_bot_generation: event.weixinBotGeneration ?? null,
+      weixin_context_seq: event.weixinContextSeq ?? null,
+      weixin_context_source:
+        event.weixinContextSeq != null ? "protocol" : null,
       target_kind: parsedCmd.targetKind ?? null,
       workspace_id: parsedCmd.workspaceId ?? null,
       workspace_query: parsedCmd.workspaceQuery ?? null,
@@ -733,13 +865,22 @@ export class ChannelGatewayOrchestrator {
       !cmdRes.ok &&
       (cmdRes.linked === false || cmdRes.deny_reason === "not_linked")
     ) {
-      await this.sendDirectAdapterNotice(
+      const delivered = await this.sendInboundNotice(
         event,
+        null,
+        `notice:${event.platform}:${event.messageId}:deny_not_linked`,
         this.formatDenyNotice(
           event.platform,
           cmdRes.deny_reason ?? "not_linked",
         ),
       );
+      if (delivered) {
+        await this.backend.updateInboundProgress({
+          platform: event.platform,
+          message_id: event.messageId,
+          command_reply_pending: false,
+        });
+      }
       return;
     }
 
@@ -874,7 +1015,13 @@ export class ChannelGatewayOrchestrator {
         });
       }
     } else {
-      await this.sendDirectAdapterNotice(event, replyText);
+      const delivered = await this.sendInboundNotice(
+        event,
+        null,
+        `notice:${event.platform}:${event.messageId}:command`,
+        replyText,
+      );
+      if (!delivered) return;
       await this.backend.updateInboundProgress({
         platform: event.platform,
         message_id: event.messageId,
@@ -948,8 +1095,12 @@ export class ChannelGatewayOrchestrator {
         activityOrigin: "none",
       });
     } else {
-      await this.sendDirectAdapterNotice(event, failText);
-      delivered = true;
+      delivered = await this.sendInboundNotice(
+        event,
+        null,
+        `notice:${event.platform}:${event.messageId}:command_err`,
+        failText,
+      );
     }
     if (!delivered) {
       return;
@@ -7384,6 +7535,10 @@ export class ChannelGatewayOrchestrator {
       return;
     }
 
+    if (await this.recoverStoredBindingConfirmation(row, syntheticEvent)) {
+      return;
+    }
+
     if (row.event_kind === "command") {
       const cmdReq = (row.command_request ?? {}) as Record<string, unknown>;
       const cmdResRaw = (row.command_result ?? {}) as Record<string, unknown>;
@@ -7427,6 +7582,11 @@ export class ChannelGatewayOrchestrator {
           makeInboundRequestKey(row.platform, row.message_id),
         raw_payload: row.raw_payload ?? {},
         weixin_context_token: syntheticEvent.weixinContextToken ?? null,
+        weixin_bot_id: syntheticEvent.weixinBotId ?? null,
+        weixin_bot_generation: syntheticEvent.weixinBotGeneration ?? null,
+        weixin_context_seq: syntheticEvent.weixinContextSeq ?? null,
+        weixin_context_source:
+          syntheticEvent.weixinContextSeq != null ? "protocol" : null,
         target_kind: targetKind,
         workspace_id: workspaceId,
         workspace_query: workspaceQuery,

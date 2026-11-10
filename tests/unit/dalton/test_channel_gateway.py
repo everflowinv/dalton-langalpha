@@ -8,6 +8,7 @@ All test doubles are constructed with `unittest.mock.create_autospec`.
 
 from __future__ import annotations
 
+import copy
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 import json
@@ -55,6 +56,11 @@ def _make_fake_db_from_handler(handler: Any) -> tuple[Any, Any]:
         else:
             state["rows"] = [res]
         state["idx"] = 0
+        # A rejected context-token insert reports integer rowcount 0. The
+        # caller then re-reads the stored seq. Other statements leave the
+        # autospec rowcount unset.
+        if "INSERT INTO dalton_channel_weixin_context_tokens" in " ".join(str(sql).split()):
+            cursor.rowcount = len(state["rows"])
 
     async def _fetchone() -> Any:
         rows = state["rows"]
@@ -377,7 +383,16 @@ class InMemoryChannelStore:
                 row["consumed_bind_result"] = dict(val)
                 if params[1] is not None:
                     row["dalton_user_id"] = str(params[1])
-                row["status"] = "completed"
+                request_val = params[2].obj if hasattr(params[2], "obj") else params[2]
+                result_val = params[3].obj if hasattr(params[3], "obj") else params[3]
+                row["command_request"] = (
+                    dict(request_val) if isinstance(request_val, dict) else request_val
+                )
+                row["command_result"] = (
+                    dict(result_val) if isinstance(result_val, dict) else result_val
+                )
+                row["command_effect_status"] = "done"
+                row["command_reply_pending"] = True
             elif "SET status = 'ignored', command_effect_status = 'done', command_reply_pending = FALSE" in norm:
                 row["status"] = "ignored"
                 row["command_effect_status"] = "done"
@@ -2248,7 +2263,12 @@ def test_bind_code_group_leak_revocation_dm_platform_mismatch_and_unbind_generat
         },
     )
     assert r_leak.status_code == 200
-    assert r_leak.json() == {"ok": False, "reason": "revoked_in_group"}
+    assert r_leak.json() == {
+        "ok": False,
+        "reason": "revoked_in_group",
+        "action": "bind",
+    }
+    assert code1 not in r_leak.text
     assert store.bind_codes[hash_bind_code(code1)]["revoked_reason"] == "sent_in_group"
 
     # Attempting to use leaked code1 in Feishu DM now fails
@@ -2263,7 +2283,11 @@ def test_bind_code_group_leak_revocation_dm_platform_mismatch_and_unbind_generat
             "is_group": False,
         },
     )
-    assert r_after_leak.json() == {"ok": False, "reason": "invalid_or_expired"}
+    assert r_after_leak.json() == {
+        "ok": False,
+        "reason": "invalid_or_expired",
+        "action": "bind",
+    }
 
     # 2. Create a second Feishu bind code; try consuming in Discord DM -> platform_mismatch, NOT revoked
     r2 = client.post(
@@ -2287,6 +2311,7 @@ def test_bind_code_group_leak_revocation_dm_platform_mismatch_and_unbind_generat
         "ok": False,
         "reason": "platform_mismatch",
         "expected_platform": "feishu",
+        "action": "bind",
     }
     assert store.bind_codes[hash_bind_code(code2)]["used_at"] is None
 
@@ -2310,6 +2335,7 @@ def test_bind_code_group_leak_revocation_dm_platform_mismatch_and_unbind_generat
         "platform": "feishu",
         "platform_user_id": "ou_alice",
         "generation": 1,
+        "action": "bind",
     }
 
     # 4. Unbind via Web DELETE /bindings/feishu -> generation increments to 2
@@ -4046,6 +4072,38 @@ async def test_round6_tx_retry_helper_and_unbind_lock_order_unit(
         await cg_db._run_tx_with_retry("test_3_fails_op", None, attempt_fn_5)
     assert exc_info.value is orig_exc
     assert attempt_fn_5.call_count == 3
+
+    # 5b. A changed Weixin settings set retries only when the caller did not pass a connection.
+    settings_calls = 0
+
+    async def _settings_set_then_ok(conn_arg: Any) -> str:
+        nonlocal settings_calls
+        settings_calls += 1
+        if settings_calls == 1:
+            raise cg_db._WeixinSettingsLockSetChanged()
+        return "settings-retried"
+
+    attempt_fn_settings = create_autospec(
+        _settings_set_then_ok, side_effect=_settings_set_then_ok
+    )
+    assert (
+        await cg_db._run_tx_with_retry("test_settings_set", None, attempt_fn_settings)
+        == "settings-retried"
+    )
+    assert attempt_fn_settings.call_count == 2
+
+    async def _settings_set_external(conn_arg: Any) -> None:
+        raise cg_db._WeixinSettingsLockSetChanged()
+
+    attempt_fn_settings_ext = create_autospec(
+        _settings_set_external, side_effect=_settings_set_external
+    )
+    held_conn = create_autospec(psycopg.AsyncConnection, instance=True)
+    with pytest.raises(cg_db._WeixinSettingsLockSetChanged):
+        await cg_db._run_tx_with_retry(
+            "test_settings_set_ext", held_conn, attempt_fn_settings_ext
+        )
+    assert attempt_fn_settings_ext.call_count == 1
 
     # 6. Unbind lock order: locks `dalton_channel_user_settings` FOR UPDATE BEFORE `DELETE FROM dalton_channel_identities`
     store = InMemoryChannelStore()
@@ -6561,3 +6619,493 @@ def test_ch1_stop_pinning_reauth_hitl_source_and_delivery_immutability_unit(
     ).json()
     assert r_spoof_gen["claim_status"] == "denied"
     assert r_spoof_gen["code"] == "not_allowed"
+
+
+def test_weixin_company_owner_rejected_before_state_write(
+    channel_test_env: dict[str, Any],
+) -> None:
+    """I-9 rejects both owner fields for the company system user before any state write."""
+    client: TestClient = channel_test_env["client"]
+    headers = channel_test_env["headers"]
+    store: InMemoryChannelStore = channel_test_env["store"]
+    assert store.weixin_state is None
+
+    owner_resp = client.put(
+        "/api/v1/dalton/channels/internal/weixin-state",
+        headers=headers,
+        json={
+            "ilink_bot_id": "wx_company_bot@im.wechat",
+            "owner_user_id": "system:dalton-company",
+            "bot_token": "should-not-persist",
+            "base_url": "https://ilinkai.weixin.qq.com",
+            "status": "active",
+            "ilink_user_id": "wx_company_sender@im.wechat",
+        },
+    )
+    assert owner_resp.status_code == 401
+    assert store.weixin_state is None
+
+    login_resp = client.put(
+        "/api/v1/dalton/channels/internal/weixin-state",
+        headers=headers,
+        json={
+            "login_session_action": "start",
+            "login_session_key": "company-login-sess",
+            "login_owner_user_id": "system:dalton-company",
+            "owner_user_id": "u-admin",
+            "login_status": "wait",
+            "login_qrcode": "qr-company",
+        },
+    )
+    assert login_resp.status_code == 401
+    assert store.weixin_state is None
+
+
+def test_weixin_session_command_encrypts_context_and_keeps_stored_seq(
+    channel_test_env: dict[str, Any],
+) -> None:
+    """I-3 stores the slash-command context encrypted, and an older value does not roll it back."""
+    client: TestClient = channel_test_env["client"]
+    headers = channel_test_env["headers"]
+    store: InMemoryChannelStore = channel_test_env["store"]
+    bot = "wx_cmd_bot@im.wechat"
+    sender = "wx_cmd_alice@im.wechat"
+    secret = "ctx-cmd-secret-20"
+    older = "ctx-cmd-secret-older"
+
+    start = client.put(
+        "/api/v1/dalton/channels/internal/weixin-state",
+        headers=headers,
+        json={
+            "login_session_action": "start",
+            "login_session_key": "sess-cmd-1",
+            "login_owner_user_id": "u-admin",
+            "login_status": "wait",
+            "login_qrcode": "qr-cmd-1",
+        },
+    )
+    assert start.status_code == 200
+    confirmed = client.put(
+        "/api/v1/dalton/channels/internal/weixin-state",
+        headers=headers,
+        json={
+            "login_session_action": "confirm",
+            "login_session_key": "sess-cmd-1",
+            "login_owner_user_id": "u-admin",
+            "expected_login_version": start.json()["login_version"],
+            "expected_bot_generation": start.json()["expected_bot_generation"],
+            "ilink_bot_id": bot,
+            "owner_user_id": "u-admin",
+            "bot_token": "secret-cmd-bot",
+            "base_url": "https://ilinkai.weixin.qq.com",
+            "status": "active",
+            "ilink_user_id": "wx_admin_cmd@im.wechat",
+        },
+    )
+    assert confirmed.status_code == 200
+    generation = int(confirmed.json()["bot_generation"])
+
+    channel_test_env["current_web_user"]["user_id"] = "u-alice"
+    code = client.post(
+        "/api/v1/dalton/channels/bind-codes", json={"platform": "weixin"}
+    ).json()["code"]
+    bound = client.post(
+        "/api/v1/dalton/channels/internal/bind-code/consume",
+        headers=headers,
+        json={
+            "action": "bind",
+            "platform": "weixin",
+            "platform_user_id": sender,
+            "code": code,
+            "is_group": False,
+        },
+    ).json()
+    assert bound["ok"] is True
+    scope = f"dm:{sender}"
+
+    def command(message_id: str, **extra: Any) -> dict[str, Any]:
+        body = {
+            "cmd": "new",
+            "platform": "weixin",
+            "platform_user_id": sender,
+            "chat_type": "dm",
+            "chat_address": "weixin:@me",
+            "scope_key": scope,
+            "message_id": message_id,
+            "weixin_context_token": secret,
+            "weixin_bot_id": bot,
+            "weixin_bot_generation": generation,
+            "weixin_context_source": "protocol",
+            "weixin_context_seq": 20,
+            "raw_payload": {
+                "weixin_context_token": secret,
+                "context_token": secret,
+                "bot_token": "secret-cmd-bot",
+                "seq": 20,
+            },
+        }
+        body.update(extra)
+        response = client.post(
+            "/api/v1/dalton/channels/internal/session/command",
+            headers=headers,
+            json=body,
+        )
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    created = command("wx-cmd-new")
+    assert created["ok"] is True
+    assert created["duplicate"] is False
+    assert secret not in json.dumps(created)
+    token_key = (bot, generation, sender)
+    assert store.weixin_context_tokens[token_key]["encrypted_context_token"] == secret
+    assert store.weixin_context_tokens[token_key]["seq"] == 20
+    new_row = store.inbound_events[("weixin", "wx-cmd-new")]
+    assert new_row["encrypted_weixin_context_token"] == secret
+    assert new_row["weixin_context_seq"] == 20
+    raw_text = json.dumps(new_row["raw_payload"])
+    assert secret not in raw_text
+    assert "secret-cmd-bot" not in raw_text
+    assert "weixin_context_token" not in new_row["raw_payload"]
+
+    replay = command("wx-cmd-new", weixin_context_token=older, weixin_context_seq=4)
+    assert replay["duplicate"] is True
+    assert replay["generation"] == created["generation"]
+    assert store.weixin_context_tokens[token_key]["seq"] == 20
+    assert store.weixin_context_tokens[token_key]["encrypted_context_token"] == secret
+
+    listed = command(
+        "wx-cmd-list",
+        cmd="workspace_list",
+        weixin_context_seq=21,
+        weixin_context_token="ctx-cmd-secret-21",
+    )
+    assert listed["ok"] is True
+    switched = command(
+        "wx-cmd-main",
+        cmd="workspace_switch",
+        target_kind="home",
+        workspace_query="home",
+        weixin_context_seq=22,
+        weixin_context_token="ctx-cmd-secret-22",
+    )
+    assert switched["ok"] is True
+    stopped = command(
+        "wx-cmd-stop",
+        cmd="stop",
+        weixin_context_seq=23,
+        weixin_context_token="ctx-cmd-secret-23",
+    )
+    assert stopped["ok"] is True
+    assert store.weixin_context_tokens[token_key]["seq"] == 23
+    assert (
+        store.weixin_context_tokens[token_key]["encrypted_context_token"]
+        == "ctx-cmd-secret-23"
+    )
+
+    stale = command(
+        "wx-cmd-older",
+        weixin_context_token=older,
+        weixin_context_seq=4,
+        raw_payload={"weixin_context_token": older, "seq": 4},
+    )
+    assert stale["ok"] is True
+    assert store.weixin_context_tokens[token_key]["seq"] == 23
+    assert (
+        store.weixin_context_tokens[token_key]["encrypted_context_token"]
+        == "ctx-cmd-secret-23"
+    )
+    older_row = store.inbound_events[("weixin", "wx-cmd-older")]
+    assert older_row["weixin_context_seq"] == 23
+    assert older_row["encrypted_weixin_context_token"] == older
+    assert older not in json.dumps(older_row["raw_payload"])
+
+    mismatched = command(
+        "wx-cmd-old-bot",
+        weixin_bot_id="wx_previous_bot@im.wechat",
+        weixin_bot_generation=generation,
+        weixin_context_seq=99,
+        weixin_context_token="ctx-previous-bot",
+    )
+    assert mismatched["ok"] is False
+    assert mismatched["deny_reason"] == "weixin_bot_generation_mismatch"
+    assert store.weixin_context_tokens[token_key]["seq"] == 23
+    assert ("wx_previous_bot@im.wechat", generation, sender) not in store.weixin_context_tokens
+    unavailable = command(
+        "wx-cmd-no-bot",
+        weixin_bot_id=bot,
+        weixin_bot_generation=generation + 7,
+        weixin_context_token="ctx-future-bot",
+    )
+    assert unavailable["deny_reason"] in (
+        "weixin_bot_generation_mismatch",
+        "weixin_bot_unavailable",
+    )
+    assert "ctx-future-bot" not in {
+        row["encrypted_context_token"] for row in store.weixin_context_tokens.values()
+    }
+
+    grouped = command(
+        "wx-cmd-group",
+        chat_type="group",
+        chat_address="weixin:room",
+        weixin_context_token="ctx-group-should-not-save",
+        raw_payload={"group_id": "room@chatroom", "weixin_context_token": "ctx-group-should-not-save"},
+    )
+    assert grouped["ok"] is False
+    assert "ctx-group-should-not-save" not in {
+        row["encrypted_context_token"] for row in store.weixin_context_tokens.values()
+    }
+    invalid = command(
+        "wx-cmd-invalid",
+        weixin_context_token="ctx-invalid-should-not-save",
+        raw_payload={"invalid_inbound": True, "weixin_context_token": "ctx-invalid-should-not-save"},
+    )
+    assert invalid["deny_reason"] == "invalid_inbound_event"
+    assert "ctx-invalid-should-not-save" not in {
+        row["encrypted_context_token"] for row in store.weixin_context_tokens.values()
+    }
+
+    before_tokens = dict(store.weixin_context_tokens)
+    internal = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_list",
+            "platform": "weixin",
+            "platform_user_id": sender,
+            "chat_type": "dm",
+            "scope_key": scope,
+            "is_internal_query": True,
+            "weixin_context_token": "ctx-readonly-should-not-save",
+            "weixin_bot_id": bot,
+            "weixin_bot_generation": generation,
+            "weixin_context_seq": 100,
+        },
+    )
+    assert internal.status_code == 200
+    assert internal.json()["ok"] is True
+    assert store.weixin_context_tokens == before_tokens
+
+    feishu_code = client.post(
+        "/api/v1/dalton/channels/bind-codes", json={"platform": "feishu"}
+    ).json()["code"]
+    feishu_bind = client.post(
+        "/api/v1/dalton/channels/internal/bind-code/consume",
+        headers=headers,
+        json={
+            "action": "bind",
+            "platform": "feishu",
+            "platform_user_id": "ou_cmd_alice",
+            "code": feishu_code,
+            "is_group": False,
+        },
+    ).json()
+    assert feishu_bind["ok"] is True
+    feishu_new = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "new",
+            "platform": "feishu",
+            "platform_user_id": "ou_cmd_alice",
+            "chat_type": "dm",
+            "scope_key": "dm:ou_cmd_alice",
+            "message_id": "om_cmd_feishu_new",
+        },
+    )
+    assert feishu_new.status_code == 200
+    assert feishu_new.json()["ok"] is True
+
+    claim = client.post(
+        "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
+        headers=headers,
+        json={
+            "delivery_key": "notice:weixin:wx-cmd-stop:probe",
+            "kind": "notice",
+            "user_id": "u-alice",
+            "platform": "weixin",
+            "target": "weixin:@me",
+            "inbound_message_id": "wx-cmd-stop",
+            "has_non_empty_text": True,
+            "total_chunks": 1,
+        },
+    ).json()
+    assert claim["claim_status"] == "claimed"
+    assert claim["weixin_context_token"] == "ctx-cmd-secret-23"
+    other = client.post(
+        "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
+        headers=headers,
+        json={
+            "delivery_key": "notice:weixin:wx-cmd-stop:other",
+            "kind": "notice",
+            "user_id": "u-bob",
+            "platform": "weixin",
+            "target": "weixin:@me",
+            "inbound_message_id": "wx-cmd-stop",
+            "has_non_empty_text": True,
+            "total_chunks": 1,
+        },
+    ).json()
+    assert other["claim_status"] == "denied"
+    assert "ctx-cmd-secret-23" not in json.dumps(other)
+
+
+@pytest.mark.asyncio
+async def test_weixin_sender_lock_rechecks_settings_before_identity_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sender owner discovered under the sender lock aborts before identity mutation.
+
+    The aborted attempt has already marked the bind code used. A real transaction
+    drops that write. The hook's identity row is a separate committed write and
+    stays visible, so the retry locks the new user before it changes identities.
+    """
+    store = InMemoryChannelStore()
+    executed: list[tuple[str, Any]] = []
+    hook_commits: dict[tuple[str, str], dict[str, Any]] = {}
+
+    async def _tracking(sql: str, params: Any) -> Any:
+        executed.append((" ".join(sql.split()), params))
+        return await store.handle_sql(sql, params)
+
+    def _snapshot_transaction_state() -> dict[str, Any]:
+        return {
+            "identities": copy.deepcopy(store.identities),
+            "bind_codes": copy.deepcopy(store.bind_codes),
+            "user_settings": copy.deepcopy(store.user_settings),
+            "session_generations": copy.deepcopy(store.session_generations),
+            "weixin_context_tokens": copy.deepcopy(store.weixin_context_tokens),
+            "weixin_state": copy.deepcopy(store.weixin_state),
+            "advisory_locks": list(store.advisory_locks),
+            "inbound_events": copy.deepcopy(store.inbound_events),
+        }
+
+    def _restore_transaction_state(snap: dict[str, Any]) -> None:
+        store.identities = snap["identities"]
+        store.bind_codes = snap["bind_codes"]
+        store.user_settings = snap["user_settings"]
+        store.session_generations = snap["session_generations"]
+        store.weixin_context_tokens = snap["weixin_context_tokens"]
+        store.weixin_state = snap["weixin_state"]
+        store.advisory_locks = snap["advisory_locks"]
+        store.inbound_events = snap["inbound_events"]
+        for key, row in hook_commits.items():
+            store.identities[key] = copy.deepcopy(row)
+
+    mocked_get_db, _cursor = _make_fake_db_from_handler(_tracking)
+    tx_installed = {"done": False}
+
+    @asynccontextmanager
+    async def _get_db_connection(existing_conn: Any = None):
+        async with mocked_get_db(existing_conn) as conn:
+            if not tx_installed["done"]:
+                real_tx = conn.transaction.side_effect
+
+                @asynccontextmanager
+                async def _transaction(*_args: Any, **_kwargs: Any):
+                    snap = _snapshot_transaction_state()
+                    try:
+                        async with real_tx(*_args, **_kwargs):
+                            yield
+                    except BaseException:
+                        _restore_transaction_state(snap)
+                        raise
+
+                conn.transaction.side_effect = _transaction
+                tx_installed["done"] = True
+            yield conn
+
+    monkeypatch.setattr(cg_db, "get_db_connection", _get_db_connection)
+    monkeypatch.setenv("BYOK_ENCRYPTION_KEY", "test-byok-secret-key-32chars!!")
+    sender = "wx_sender_lock@im.wechat"
+    armed = {"on": False}
+
+    async def _before_sender() -> None:
+        key = ("u-displaced", "weixin")
+        if not armed["on"] or key in store.identities:
+            return
+        row = {
+            "user_id": "u-displaced",
+            "platform": "weixin",
+            "platform_user_id": sender,
+        }
+        store.identities[key] = row
+        hook_commits[key] = copy.deepcopy(row)
+
+    monkeypatch.setattr(cg_db, "_weixin_before_sender_lock_hook", _before_sender)
+    store.weixin_state = {
+        "singleton_id": 1,
+        "ilink_bot_id": "bot-old@im.wechat",
+        "owner_user_id": "u-binder",
+        "bot_generation": 1,
+        "get_updates_buf": "cur",
+        "status": "active",
+        "base_url": "https://ilinkai.weixin.qq.com",
+    }
+    code = await cg_db.create_bind_code(user_id="u-binder", platform="weixin")
+    saved = await cg_db.upsert_weixin_state(
+        ilink_bot_id="bot-lock@im.wechat",
+        owner_user_id="u-binder",
+        bot_token="tok-lock",
+        base_url="https://ilinkai.weixin.qq.com",
+        status="active",
+        ilink_user_id="wx_owner_lock@im.wechat",
+    )
+    assert saved["updated"] is True
+    settings_idx = next(
+        i
+        for i, (sql, _params) in enumerate(executed)
+        if "FROM dalton_channel_user_settings WHERE user_id = %s FOR UPDATE" in sql
+    )
+    state_idx = next(
+        i
+        for i, (sql, _params) in enumerate(executed)
+        if "FROM dalton_channel_weixin_state WHERE singleton_id = 1" in sql
+        and "FOR UPDATE" in sql
+    )
+    assert settings_idx < state_idx
+
+    executed.clear()
+    store.advisory_locks.clear()
+    armed["on"] = True
+    bound = await cg_db.consume_bind_code_or_unbind(
+        action="bind",
+        platform="weixin",
+        platform_user_id=sender,
+        code=code["code"],
+        is_group=False,
+    )
+    assert bound["ok"] is True, bound
+    assert store.identities[("u-binder", "weixin")]["platform_user_id"] == sender
+    assert ("u-displaced", "weixin") not in store.identities
+
+    def _lock_key(params: Any) -> str:
+        return str(params[0]) if params else ""
+
+    displaced_idx = next(
+        i
+        for i, (_sql, params) in enumerate(executed)
+        if _lock_key(params) == "dalton_user_settings:u-displaced"
+    )
+    sender_idxs = [
+        i
+        for i, (_sql, params) in enumerate(executed)
+        if "dalton_weixin_context:" in _lock_key(params)
+    ]
+    assert any(i < displaced_idx for i in sender_idxs)
+    successful_sender = next(i for i in sender_idxs if i > displaced_idx)
+    assert any(
+        _lock_key(params) == "dalton_user_settings:u-binder"
+        for _sql, params in executed[:displaced_idx]
+    )
+    after_keys = [_lock_key(params) for _sql, params in executed[successful_sender + 1 :]]
+    assert not any(key.startswith("dalton_user_settings:") for key in after_keys)
+    identity_sql = [
+        i
+        for i, (sql, _params) in enumerate(executed)
+        if "DELETE FROM dalton_channel_identities" in sql
+        or "INSERT INTO dalton_channel_identities" in sql
+    ]
+    assert identity_sql
+    assert identity_sql[0] > successful_sender

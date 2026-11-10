@@ -98,6 +98,10 @@ export class WeixinChannelAdapter implements ChannelAdapter {
   private monitorGeneration = 0;
   private monitorDepth = 0;
   private accountEpoch = 0;
+  private admittedGeneration: number;
+  private monitorRestartPending = false;
+  private pendingRestartEpoch: number | null = null;
+  private monitorCompletionTask: Promise<void> | null = null;
   private readonly inFlightControllers = new Set<AbortController>();
   private qrManager: WeixinQrLoginManager | null = null;
 
@@ -123,6 +127,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       getUpdatesBuf: "",
       status: initialToken && initialBotId ? "active" : "unconfigured",
     };
+    this.admittedGeneration = this.account.botGeneration;
 
     if (this.backend) {
       this.initQrManager(this.backend);
@@ -224,6 +229,8 @@ export class WeixinChannelAdapter implements ChannelAdapter {
 
   async stop(): Promise<void> {
     this.started = false;
+    this.monitorRestartPending = false;
+    this.pendingRestartEpoch = null;
     await this.stopMonitorLoop();
     for (const ctrl of [...this.inFlightControllers]) {
       ctrl.abort();
@@ -254,6 +261,59 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     }
   }
 
+  private accountIsPollable(): boolean {
+    return (
+      this.started &&
+      this.account.status === "active" &&
+      Boolean(this.account.botToken && this.account.ilinkBotId && this.backend)
+    );
+  }
+
+  private beginAccountGeneration(incoming: number): number | null {
+    if (!Number.isFinite(incoming) || incoming < this.admittedGeneration) {
+      return null;
+    }
+    if (incoming > this.admittedGeneration) {
+      this.admittedGeneration = incoming;
+    }
+    return ++this.accountEpoch;
+  }
+
+  private armMonitorCompletion(task: Promise<void>): void {
+    if (this.monitorCompletionTask === task) return;
+    this.monitorCompletionTask = task;
+    void task.then(
+      () => {
+        this.finishMonitorTask(task);
+      },
+      () => {
+        this.finishMonitorTask(task);
+      },
+    );
+  }
+
+  private finishMonitorTask(task: Promise<void>): void {
+    if (this.monitorCompletionTask === task) {
+      this.monitorCompletionTask = null;
+    }
+    if (this.monitorTask === task) {
+      this.monitorTask = null;
+    }
+    if (this.monitorDepth > 0) return;
+    this.startPendingMonitor();
+  }
+
+  private startPendingMonitor(): void {
+    if (!this.monitorRestartPending) return;
+    if (this.monitorDepth > 0 || this.monitorTask !== null) return;
+    const epoch = this.pendingRestartEpoch;
+    this.monitorRestartPending = false;
+    this.pendingRestartEpoch = null;
+    if (!this.started || epoch === null || this.accountEpoch !== epoch) return;
+    if (!this.accountIsPollable()) return;
+    void this.ensureSingleMonitorLoop();
+  }
+
   private async ensureSingleMonitorLoop(): Promise<void> {
     const epoch = this.accountEpoch;
     if (!this.started || !this.inboundHandler) {
@@ -269,15 +329,13 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       return;
     }
 
-    if (this.monitorDepth > 0 && this.monitorTask) {
-      this.abortMonitorOnly();
-      const detached = this.monitorTask;
-      void detached.finally(() => {
-        if (this.monitorTask !== detached) return;
-        this.monitorTask = null;
-        if (this.accountEpoch !== epoch || !this.started) return;
-        void this.ensureSingleMonitorLoop();
-      });
+    if (this.monitorDepth > 0) {
+      if (this.monitorTask) {
+        this.abortMonitorOnly();
+        this.armMonitorCompletion(this.monitorTask);
+      }
+      this.monitorRestartPending = true;
+      this.pendingRestartEpoch = epoch;
       return;
     }
 
@@ -321,6 +379,9 @@ export class WeixinChannelAdapter implements ChannelAdapter {
           await this.inboundHandler(ev);
         } finally {
           this.monitorDepth -= 1;
+          if (this.monitorDepth === 0 && this.monitorTask === null) {
+            this.startPendingMonitor();
+          }
         }
       },
       onCursorCommitted: (newCursor) => {
@@ -341,7 +402,9 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       },
     });
 
-    this.monitorTask = monitor.start();
+    const task = monitor.start();
+    this.monitorTask = task;
+    this.armMonitorCompletion(task);
   }
 
   private async resolveSafeBaseUrl(
@@ -383,10 +446,8 @@ export class WeixinChannelAdapter implements ChannelAdapter {
   private async handleConfirmedAccount(
     confirmed: ConfirmedWeixinAccount,
   ): Promise<void> {
-    if (confirmed.botGeneration < this.account.botGeneration) {
-      return;
-    }
-    const epoch = ++this.accountEpoch;
+    const epoch = this.beginAccountGeneration(confirmed.botGeneration);
+    if (epoch === null) return;
     const sameAccount =
       this.account.ilinkBotId === confirmed.ilinkBotId &&
       this.account.botGeneration === confirmed.botGeneration;
@@ -417,13 +478,8 @@ export class WeixinChannelAdapter implements ChannelAdapter {
    */
   async applyPersistedState(state: I9WeixinStateGetResponse): Promise<void> {
     const incomingGen = state.bot_generation ?? 1;
-    if (
-      incomingGen < this.account.botGeneration &&
-      this.account.status !== "unconfigured"
-    ) {
-      return;
-    }
-    const epoch = ++this.accountEpoch;
+    const epoch = this.beginAccountGeneration(incomingGen);
+    if (epoch === null) return;
     const stillCurrent = (): boolean => this.accountEpoch === epoch;
 
     if (!state.configured || !state.ilink_bot_id) {
