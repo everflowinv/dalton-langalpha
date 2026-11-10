@@ -34,6 +34,7 @@ export interface GatewayConfig {
     discord: {
       enabled: boolean;
       botToken: string;
+      applicationId: string;
     };
     weixin: {
       enabled: boolean;
@@ -199,6 +200,7 @@ export function loadConfig(
       discord: {
         enabled: discordEnabled,
         botToken: discordBotToken,
+        applicationId: (mergedEnv.DALTON_DISCORD_APPLICATION_ID ?? "").trim(),
       },
       weixin: {
         enabled:

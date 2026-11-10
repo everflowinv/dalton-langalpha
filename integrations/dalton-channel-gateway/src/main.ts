@@ -1,6 +1,10 @@
 import { HttpBackendClient } from "./backend-client.js";
 import type { ChannelAdapter } from "./channels/adapter.js";
 import {
+  DiscordChannelAdapter,
+  type DiscordChannelAdapterOptions,
+} from "./channels/discord/index.js";
+import {
   FeishuChannelAdapter,
   type FeishuChannelAdapterOptions,
 } from "./channels/feishu/index.js";
@@ -25,6 +29,7 @@ export function buildConfiguredAdapters(
   config: GatewayConfig,
   overrides?: {
     feishu?: Partial<FeishuChannelAdapterOptions>;
+    discord?: Partial<DiscordChannelAdapterOptions>;
   },
 ): Map<ChannelPlatform, ChannelAdapter> {
   const adapters = new Map<ChannelPlatform, ChannelAdapter>();
@@ -49,6 +54,19 @@ export function buildConfiguredAdapters(
         appSecret: effectiveFeishuAppSecret,
         outgoingOnly:
           overrides?.feishu?.outgoingOnly ?? config.mode === "outgoing",
+      }),
+    );
+  }
+
+  if (config.channels.discord.enabled && config.channels.discord.botToken) {
+    adapters.set(
+      "discord",
+      new DiscordChannelAdapter({
+        botToken: config.channels.discord.botToken,
+        ...(config.channels.discord.applicationId
+          ? { applicationId: config.channels.discord.applicationId }
+          : {}),
+        ...overrides?.discord,
       }),
     );
   }

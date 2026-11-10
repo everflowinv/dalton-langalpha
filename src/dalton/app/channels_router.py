@@ -138,6 +138,11 @@ class BindCodeConsumeRequest(BaseModel):
     code: str | None = None
     is_group: bool = False
     user_id: str | None = None
+    message_id: str | None = None
+    chat_type: str | None = None
+    chat_address: str | None = None
+    scope_key: str | None = None
+    request_key: str | None = None
 
 
 class SessionCommandRequest(BaseModel):
@@ -342,6 +347,11 @@ async def internal_bind_code_consume_endpoint(
         code=body.code,
         is_group=body.is_group,
         user_id=eff_uid,
+        message_id=body.message_id,
+        chat_type=body.chat_type,
+        chat_address=body.chat_address,
+        scope_key=body.scope_key,
+        request_key=body.request_key,
     )
 
 

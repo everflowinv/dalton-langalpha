@@ -39,6 +39,11 @@ export interface SendTextChunkOptions {
   replyToMessageId?: string | null;
   newThread?: boolean;
   threadScopeKey?: string | null;
+  /**
+   * Stable delivery id from DeliveryService. Discord standalone thread recovery
+   * is bound to this id, the parent channel, and the current bot.
+   */
+  deliveryKey?: string | null;
   weixinContextToken?: string | null;
 }
 
@@ -94,6 +99,44 @@ export interface AvailableChatsResult {
   chats: AvailableChatItem[];
   complete: boolean;
   error: string | null;
+}
+
+export interface ListAvailableChatsOptions {
+  userId: string;
+  platformUserId: string;
+  /** Omitted tier fails closed: guild and channel names are not returned. */
+  userTier?: string | null;
+  /** Addresses the caller may see. Admins ignore this set. */
+  viewableAddresses?: ReadonlySet<string> | readonly string[] | null;
+}
+
+/**
+ * Membership for either a set or a readonly list. `instanceof Set` does not
+ * exclude `ReadonlySet`, so the check walks the values instead of calling
+ * `includes` on the union.
+ */
+function viewableListHas(viewable: Iterable<string>, address: string): boolean {
+  for (const item of viewable) {
+    if (item === address) return true;
+  }
+  return false;
+}
+
+/**
+ * Mirrors `_user_can_manage_or_view_group_chat`: admins see every address,
+ * external callers see none, and other callers see only an address in the
+ * viewable set. A missing tier or set hides the address.
+ */
+export function canViewPlatformChat(options: {
+  userTier?: string | null;
+  address: string;
+  viewableAddresses?: ReadonlySet<string> | readonly string[] | null;
+}): boolean {
+  if (options.userTier === "admin") return true;
+  if (options.userTier !== "internal") return false;
+  const viewable = options.viewableAddresses;
+  if (!viewable) return false;
+  return viewableListHas(viewable, options.address);
 }
 
 export interface CheckTargetLiveResult {
@@ -181,10 +224,7 @@ export interface ChannelAdapter {
    * List chats/groups available to the user on this platform
    * (`GET /agent/settings/available`, `GET /agent/automation-targets`).
    */
-  listAvailableChats(options: {
-    userId: string;
-    platformUserId: string;
-  }): Promise<AvailableChatsResult>;
+  listAvailableChats(options: ListAvailableChatsOptions): Promise<AvailableChatsResult>;
 
   /**
    * Optional live platform verification of a target address

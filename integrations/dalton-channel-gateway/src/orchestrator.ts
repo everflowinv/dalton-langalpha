@@ -95,6 +95,66 @@ export interface ActiveWatchHandle {
   pendingReplayFallbacks?: Map<string, PendingReplayFallbackEntry>;
 }
 
+function storedBindingAction(
+  request: unknown,
+): "bind" | "unbind" | null {
+  if (!request || typeof request !== "object" || Array.isArray(request)) {
+    return null;
+  }
+  const action = (request as Record<string, unknown>).action;
+  const cleaned = typeof action === "string" ? action.trim().toLowerCase() : "";
+  return cleaned === "bind" || cleaned === "unbind" ? cleaned : null;
+}
+
+function storedBindingResult(value: unknown): {
+  ok: boolean;
+  reason: string | null;
+  expectedPlatform: string | null;
+  userId: string | null;
+} | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (typeof record.ok !== "boolean") return null;
+  const userId =
+    typeof record.user_id === "string" && record.user_id.trim().length > 0
+      ? record.user_id.trim()
+      : null;
+  return {
+    ok: record.ok,
+    reason: typeof record.reason === "string" ? record.reason : null,
+    expectedPlatform:
+      typeof record.expected_platform === "string"
+        ? record.expected_platform
+        : null,
+    userId,
+  };
+}
+
+/** Same bind/unbind confirmation text for the live command and startup recovery. */
+function formatBindUnbindReply(params: {
+  action: "bind" | "unbind";
+  platform: string;
+  ok: boolean;
+  reason?: string | null;
+  expectedPlatform?: string | null;
+}): string {
+  if (params.action === "unbind") {
+    return params.ok
+      ? `Unlinked your ${params.platform} account from Dalton.`
+      : `Your ${params.platform} account is not currently linked.`;
+  }
+  if (!params.ok) {
+    if (params.reason === "revoked_in_group") {
+      return "For security, `/bind` cannot be used in a group chat. This code has been revoked; please generate a new code and send `/bind <CODE>` in a direct message.";
+    }
+    if (params.reason === "platform_mismatch") {
+      return `This bind code was generated for ${params.expectedPlatform ?? "another platform"}, not ${params.platform}.`;
+    }
+    return "Bind code is invalid or expired. Please generate a new code in Web Settings → Channels.";
+  }
+  return `Successfully linked your ${params.platform} account to Dalton.`;
+}
+
 export class ChannelGatewayOrchestrator {
   private readonly backend: BackendClient;
   private readonly adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
@@ -434,30 +494,25 @@ export class ChannelGatewayOrchestrator {
         weixin_context_token: event.weixinContextToken ?? null,
         code: arg,
         is_group: event.chatType === "group",
+        message_id: event.messageId,
+        chat_type: event.chatType,
+        chat_address: event.chatAddress,
+        scope_key: event.threadScopeKey,
+        request_key: makeInboundRequestKey(event.platform, event.messageId),
       });
-      if (!res.ok) {
-        if (res.reason === "revoked_in_group") {
-          await this.sendDirectAdapterNotice(
-            event,
-            "For security, `/bind` cannot be used in a group chat. This code has been revoked; please generate a new code and send `/bind <CODE>` in a direct message.",
-          );
-        } else if (res.reason === "platform_mismatch") {
-          await this.sendDirectAdapterNotice(
-            event,
-            `This bind code was generated for ${res.expected_platform ?? "another platform"}, not ${event.platform}.`,
-          );
-        } else {
-          await this.sendDirectAdapterNotice(
-            event,
-            "Bind code is invalid or expired. Please generate a new code in Web Settings → Channels.",
-          );
-        }
-        return true;
-      }
-      await this.sendDirectAdapterNotice(
-        event,
-        `Successfully linked your ${event.platform} account to Dalton.`,
-      );
+      const reply = formatBindUnbindReply({
+        action: "bind",
+        platform: event.platform,
+        ok: Boolean(res.ok),
+        reason: res.reason,
+        expectedPlatform: res.expected_platform,
+      });
+      await this.deliverStoredCommandConfirmation(event, {
+        userId: res.user_id?.trim() || null,
+        reply,
+        ok: Boolean(res.ok),
+        replyPending: res.command_reply_pending,
+      });
       return true;
     }
 
@@ -467,21 +522,25 @@ export class ChannelGatewayOrchestrator {
         platform: event.platform,
         platform_user_id: event.platformUserId,
         is_group: event.chatType === "group",
+        message_id: event.messageId,
+        chat_type: event.chatType,
+        chat_address: event.chatAddress,
+        scope_key: event.threadScopeKey,
+        request_key: makeInboundRequestKey(event.platform, event.messageId),
       });
-      if (!res.ok) {
-        await this.sendDirectAdapterNotice(
-          event,
-          `Your ${event.platform} account is not currently linked.`,
-        );
-        return true;
-      }
-      if (res.user_id) {
+      if (res.ok && res.user_id) {
         this.closeWatchesForUserPlatform(res.user_id, event.platform);
       }
-      await this.sendDirectAdapterNotice(
-        event,
-        `Unlinked your ${event.platform} account from Dalton.`,
-      );
+      await this.deliverStoredCommandConfirmation(event, {
+        userId: res.user_id?.trim() || null,
+        reply: formatBindUnbindReply({
+          action: "unbind",
+          platform: event.platform,
+          ok: Boolean(res.ok),
+        }),
+        ok: Boolean(res.ok),
+        replyPending: res.command_reply_pending,
+      });
       return true;
     }
 
@@ -7101,9 +7160,81 @@ export class ChannelGatewayOrchestrator {
     return attachments;
   }
 
+  private bindingRecoveryEvent(
+    row: RecoverInboundEventRow,
+  ): InboundChannelEvent {
+    const platformUserId =
+      (typeof row.platform_user_id === "string" &&
+      row.platform_user_id.trim().length > 0
+        ? row.platform_user_id.trim()
+        : typeof row.raw_payload?.platform_user_id === "string" &&
+            row.raw_payload.platform_user_id.trim().length > 0
+          ? row.raw_payload.platform_user_id.trim()
+          : typeof row.raw_payload?.sender_id === "string" &&
+              row.raw_payload.sender_id.trim().length > 0
+            ? row.raw_payload.sender_id.trim()
+            : "");
+    const chatId =
+      typeof row.raw_payload?.chat_id === "string" && row.raw_payload.chat_id
+        ? row.raw_payload.chat_id
+        : row.chat_address;
+    return {
+      platform: row.platform,
+      platformUserId,
+      ...(typeof row.raw_payload?.platform_username === "string" &&
+      row.raw_payload.platform_username
+        ? { platformUsername: row.raw_payload.platform_username }
+        : {}),
+      chatType: row.chat_type,
+      chatAddress: row.chat_address,
+      chatId,
+      ...(typeof row.raw_payload?.chat_name === "string" &&
+      row.raw_payload.chat_name
+        ? { chatName: row.raw_payload.chat_name }
+        : {}),
+      threadScopeKey: row.thread_scope_key,
+      messageId: row.message_id,
+      text: "",
+      rawPayload: row.raw_payload ?? {},
+    };
+  }
+
+  /**
+   * Delivers the stored bind/unbind confirmation. Does not consume a code,
+   * change identity, or run a workspace command.
+   */
+  private async recoverStoredBindingConfirmation(
+    row: RecoverInboundEventRow,
+    action: "bind" | "unbind",
+  ): Promise<void> {
+    const stored = storedBindingResult(row.command_result);
+    if (!stored) return;
+    const rowUserId =
+      typeof row.dalton_user_id === "string" && row.dalton_user_id.trim()
+        ? row.dalton_user_id.trim()
+        : null;
+    await this.deliverStoredCommandConfirmation(this.bindingRecoveryEvent(row), {
+      userId: stored.userId ?? rowUserId,
+      reply: formatBindUnbindReply({
+        action,
+        platform: row.platform,
+        ok: stored.ok,
+        reason: stored.reason,
+        expectedPlatform: stored.expectedPlatform,
+      }),
+      ok: stored.ok,
+      replyPending: row.command_reply_pending,
+    });
+  }
+
   private async recoverSingleInboundRow(
     row: RecoverInboundEventRow,
   ): Promise<void> {
+    const bindingAction = storedBindingAction(row.command_request);
+    if (bindingAction) {
+      await this.recoverStoredBindingConfirmation(row, bindingAction);
+      return;
+    }
     const userId = row.dalton_user_id;
     if (!userId) {
       await this.backend.updateInboundProgress({
@@ -7675,12 +7806,17 @@ export class ChannelGatewayOrchestrator {
     const recoveredWatch = recoveredWatches?.find(
       (w) => w.thread_id === bg.thread_id,
     );
+    const trimScope = (value: string | null | undefined): string | null => {
+      if (typeof value !== "string") return null;
+      const trimmed = value.trim();
+      return trimmed.length > 0 ? trimmed : null;
+    };
     const bgScopeKey =
-      (typeof bg.scope_key === "string" && bg.scope_key.length > 0
-        ? bg.scope_key
-        : undefined) ??
-      activeWatch?.scopeKey ??
-      recoveredWatch?.scope_key ??
+      trimScope(bg.thread_scope_key) ??
+      trimScope(bg.scope_key) ??
+      trimScope(activeWatch?.scopeKey) ??
+      trimScope(recoveredWatch?.thread_scope_key) ??
+      trimScope(recoveredWatch?.scope_key) ??
       bg.target_address;
     const bgGeneration =
       typeof bg.session_generation === "number" && bg.session_generation > 0
@@ -8036,6 +8172,56 @@ export class ChannelGatewayOrchestrator {
     }
 
     return true;
+  }
+
+  private async deliverStoredCommandConfirmation(
+    event: InboundChannelEvent,
+    params: {
+      userId: string | null;
+      reply: string;
+      ok: boolean;
+      replyPending?: boolean;
+    },
+  ): Promise<void> {
+    if (params.replyPending === false) {
+      return;
+    }
+    let delivered = false;
+    if (params.userId) {
+      delivered = await this.sendNoticeDelivery({
+        deliveryKey: `notice:${event.platform}:${event.messageId}:command`,
+        userId: params.userId,
+        platform: event.platform,
+        target: event.chatAddress,
+        inboundMessageId: event.messageId,
+        text: params.reply,
+        replyToMessageId: event.messageId,
+        threadScopeKey: event.threadScopeKey,
+        sourceScopeKey: event.threadScopeKey,
+        activityOrigin: "none",
+      });
+    } else {
+      const adapter = this.adapters.get(event.platform);
+      if (!adapter || !adapter.isConfigured() || !adapter.isConnected()) {
+        return;
+      }
+      try {
+        await this.sendDirectAdapterNotice(event, params.reply);
+        delivered = true;
+      } catch {
+        delivered = false;
+      }
+    }
+    if (!delivered) {
+      return;
+    }
+    await this.backend.updateInboundProgress({
+      platform: event.platform,
+      message_id: event.messageId,
+      status: params.ok ? "completed" : "failed",
+      command_reply_pending: false,
+      fallback_pending: false,
+    });
   }
 
   private async sendNoticeDelivery(options: {

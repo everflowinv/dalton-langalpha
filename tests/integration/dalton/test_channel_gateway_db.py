@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager
 import json
 import os
 from pathlib import Path
+import re
 import socket
 import sys
 from typing import Any
@@ -4578,6 +4579,26 @@ async def test_ch1_harness_thread_routes_keep_access_workspace_and_run_checks(
         assert settled_body["latest_turn_index"] == 2
 
 
+def _assert_one_selected_vitest_suite(output: str, *, suite_token: str) -> None:
+    """Fail unless Vitest passed exactly one test. A filter that matches nothing is not a pass."""
+    normalized = output.replace("\u00a0", " ").replace("\u202f", " ")
+    summaries = re.findall(r"(?m)^\s*Tests\s+(.+?)\s*$", normalized)
+    assert summaries, f"Vitest did not print a Tests summary:\n{output}"
+    body = summaries[-1]
+    passed_match = re.search(r"(\d+)\s+passed", body)
+    failed_match = re.search(r"(\d+)\s+failed", body)
+    passed_n = int(passed_match.group(1)) if passed_match else 0
+    failed_n = int(failed_match.group(1)) if failed_match else 0
+    assert failed_n == 0, f"Vitest reported {failed_n} failed test(s):\n{output}"
+    assert passed_n == 1, (
+        "Expected exactly 1 selected real HTTP suite to pass "
+        f"(got {passed_n}). A selector that matches nothing is not a pass:\n{output}"
+    )
+    assert suite_token in normalized, (
+        f"Vitest output did not include the selected suite {suite_token!r}:\n{output}"
+    )
+
+
 @pytest.mark.asyncio
 async def test_ch1_real_http_gateway_orchestrator_to_fastapi_and_postgres(
     db_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
@@ -4618,11 +4639,14 @@ async def test_ch1_real_http_gateway_orchestrator_to_fastapi_and_postgres(
             **os.environ,
             "DALTON_REAL_BACKEND_URL": base_url,
             "DALTON_REAL_SERVICE_TOKEN": bootstrap["service_token"],
+            "DALTON_REAL_HTTP_SUITE": "feishu",
         }
         proc = await asyncio.create_subprocess_exec(
             str(vitest_bin),
             "run",
             "test/real-http-postgres.test.ts",
+            "-t",
+            "FeishuChannelAdapter",
             "--pool=forks",
             "--poolOptions.forks.singleFork=true",
             cwd=str(gateway_dir),
@@ -4639,6 +4663,9 @@ async def test_ch1_real_http_gateway_orchestrator_to_fastapi_and_postgres(
 
         output = stdout_bytes.decode("utf-8", errors="replace")
         assert proc.returncode == 0, f"Vitest real HTTP test failed:\n{output}"
+        _assert_one_selected_vitest_suite(
+            output, suite_token="FeishuChannelAdapter"
+        )
 
 
 async def _serve_cli_harness_main() -> None:
