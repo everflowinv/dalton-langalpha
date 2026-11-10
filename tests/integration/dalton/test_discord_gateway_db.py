@@ -3,7 +3,7 @@
 Reads the isolated test database connection string from ``DALTON_CHANNEL_GATEWAY_TEST_DSN``
 (or ``DALTON_TEST_DB_DSN`` / ``TEST_DATABASE_URL``); skips cleanly when unset and unreachable.
 Enforces that the target database name ends with ``_test``, upgrades upstream Alembic to ``head``
-and Dalton Alembic to ``d031``, and exercises real permission checks, real FastAPI routes, and
+and Dalton Alembic to at least ``d036`` or leaves a later Dalton revision in place, and exercises real permission checks, real FastAPI routes, and
 real HTTP-to-FastAPI-to-PostgreSQL flows with ``DiscordChannelAdapter`` and ``GatewayOrchestrator``.
 """
 
@@ -114,8 +114,35 @@ def _run_alembic_upgrade_sync(cfg: Config, revision: str) -> None:
     command.upgrade(cfg, revision)
 
 
-async def _ensure_alembic_upgraded_to_d031(dsn: str) -> None:
-    """Upgrade upstream Alembic chain to head and Dalton Alembic chain to d031."""
+def _revision_is_target_or_descendant(
+    script: ScriptDirectory, current: str, target: str
+) -> bool:
+    """True when ``current`` is ``target`` or a later revision on the same chain."""
+    seen: set[str] = set()
+    revision: str | None = current
+    while isinstance(revision, str) and revision not in seen:
+        if revision == target:
+            return True
+        seen.add(revision)
+        item = script.get_revision(revision)
+        if item is None:
+            return False
+        down = item.down_revision
+        revision = down if isinstance(down, str) else None
+    return False
+
+
+async def _ensure_alembic_upgraded_to_d036(
+    dsn: str, *, minimum: str = "d036"
+) -> None:
+    """Upgrade upstream to head and Dalton to ``minimum`` when the database is behind it.
+
+    The default minimum is d036 because current I-6 reads ``delivery_attempt``.
+    A database already at ``minimum`` or a descendant is left alone. Alembic
+    cannot upgrade to an older revision, so this must not call
+    ``upgrade("d036")`` after a later revision has been applied. The Dalton
+    version table is ``alembic_version_dalton``.
+    """
     project_root = Path(__file__).resolve().parents[3]
     sa_url = dsn.replace("postgresql://", "postgresql+psycopg://", 1).replace(
         "%", "%%"
@@ -131,10 +158,10 @@ async def _ensure_alembic_upgraded_to_d031(dsn: str) -> None:
         "script_location", str(project_root / "src" / "dalton" / "migrations")
     )
     dalton_cfg.set_main_option("sqlalchemy.url", sa_url)
-    dalton_target = "d031"
+    dalton_script = ScriptDirectory.from_config(dalton_cfg)
 
     current_upstream: str | None = None
-    current_dalton: str | None = None
+    dalton_versions: list[str] = []
     async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as conn:
         async with conn.cursor() as cur:
             await cur.execute("SELECT to_regclass('public.alembic_version')")
@@ -145,34 +172,39 @@ async def _ensure_alembic_upgraded_to_d031(dsn: str) -> None:
                 if vrow:
                     current_upstream = str(vrow[0])
 
-            await cur.execute("SELECT to_regclass('public.dalton_alembic_version')")
+            await cur.execute(
+                "SELECT to_regclass('public.alembic_version_dalton')"
+            )
             drow = await cur.fetchone()
             if drow and drow[0] is not None:
                 await cur.execute(
-                    "SELECT version_num FROM dalton_alembic_version LIMIT 1"
+                    "SELECT version_num FROM alembic_version_dalton"
                 )
-                dvrow = await cur.fetchone()
-                if dvrow:
-                    current_dalton = str(dvrow[0])
+                dalton_versions = [
+                    str(item[0])
+                    for item in await cur.fetchall()
+                    if item and item[0]
+                ]
 
     if current_upstream != upstream_head:
         await asyncio.to_thread(_run_alembic_upgrade_sync, upstream_cfg, "head")
 
-    if current_dalton != dalton_target:
-        await asyncio.to_thread(
-            _run_alembic_upgrade_sync, dalton_cfg, dalton_target
-        )
+    if not any(
+        _revision_is_target_or_descendant(dalton_script, version, minimum)
+        for version in dalton_versions
+    ):
+        await asyncio.to_thread(_run_alembic_upgrade_sync, dalton_cfg, minimum)
 
 
 @pytest_asyncio.fixture(scope="session")
 async def channel_gateway_db_pool():
-    """Ensure upstream (`head`) + Dalton (`d031`) migrations are applied and yield a connection pool."""
+    """Ensure upstream (`head`) + Dalton (at least `d036`) migrations are applied and yield a connection pool."""
     dsn = _get_test_dsn()
     os.environ.setdefault(
         "BYOK_ENCRYPTION_KEY", "test-channel-gateway-encryption-key-32b"
     )
 
-    await _ensure_alembic_upgraded_to_d031(dsn)
+    await _ensure_alembic_upgraded_to_d036(dsn)
 
     pool = AsyncConnectionPool(
         conninfo=dsn,
@@ -1653,6 +1685,59 @@ def _create_real_http_test_app(
                 if delivery_key:
                     await cur.execute(
                         """
+                        SELECT
+                            EXISTS (
+                                SELECT 1
+                                FROM information_schema.columns
+                                WHERE table_schema = 'public'
+                                  AND table_name = 'dalton_channel_deliveries'
+                                  AND column_name = 'confirmed_thread_address'
+                            ) AS has_confirmed_thread_address,
+                            EXISTS (
+                                SELECT 1
+                                FROM information_schema.columns
+                                WHERE table_schema = 'public'
+                                  AND table_name = 'dalton_channel_deliveries'
+                                  AND column_name = 'discord_body_phase'
+                            ) AS has_discord_body_phase,
+                            EXISTS (
+                                SELECT 1
+                                FROM information_schema.columns
+                                WHERE table_schema = 'public'
+                                  AND table_name = 'dalton_channel_deliveries'
+                                  AND column_name = 'delivery_attempt'
+                            ) AS has_delivery_attempt
+                        """
+                    )
+                    exists_row = await cur.fetchone()
+                    has_confirmed_thread = bool(
+                        exists_row
+                        and exists_row.get("has_confirmed_thread_address")
+                    )
+                    has_body_phase = bool(
+                        exists_row and exists_row.get("has_discord_body_phase")
+                    )
+                    has_attempt = bool(
+                        exists_row and exists_row.get("has_delivery_attempt")
+                    )
+                    # Constants chosen from the catalog check. Not user input.
+                    confirmed_column_sql = (
+                        "confirmed_thread_address"
+                        if has_confirmed_thread
+                        else "NULL::varchar AS confirmed_thread_address"
+                    )
+                    body_phase_column_sql = (
+                        "discord_body_phase"
+                        if has_body_phase
+                        else "NULL::varchar AS discord_body_phase"
+                    )
+                    attempt_column_sql = (
+                        "delivery_attempt"
+                        if has_attempt
+                        else "0::integer AS delivery_attempt"
+                    )
+                    await cur.execute(
+                        f"""
                         SELECT delivery_key,
                                kind,
                                user_id,
@@ -1666,7 +1751,11 @@ def _create_real_http_test_app(
                                total_chunks,
                                platform_message_ids,
                                files_status,
-                               error_code
+                               error_code,
+                               first_response_json,
+                               {confirmed_column_sql},
+                               {body_phase_column_sql},
+                               {attempt_column_sql}
                         FROM dalton_channel_deliveries
                         WHERE delivery_key = %s
                         """,
@@ -1978,6 +2067,7 @@ async def test_real_http_discord_gateway_orchestrator_to_fastapi_and_postgres(
             "test/real-http-postgres.test.ts",
             "-t",
             "DiscordChannelAdapter",
+            "--reporter=verbose",
             "--pool=forks",
             "--poolOptions.forks.singleFork=true",
             cwd=str(gateway_dir),
@@ -2001,13 +2091,18 @@ async def test_real_http_discord_gateway_orchestrator_to_fastapi_and_postgres(
         )
 
 
-async def _serve_cli_harness_main() -> None:
-    """Standalone CLI entrypoint (`--serve-http-harness`) used when running Vitest directly with `DALTON_CHANNEL_GATEWAY_TEST_DSN`."""
+async def serve_discord_http_harness(*, dalton_revision: str = "d036") -> None:
+    """Serve the Discord HTTP harness until SIGINT or SIGTERM.
+
+    ``dalton_revision`` is the minimum Dalton revision. The default is d036
+    because current I-6 reads ``delivery_attempt``. A descendant already
+    applied is not downgraded. A caller that needs an older revision passes it.
+    """
     dsn = _get_test_dsn()
     os.environ.setdefault(
         "BYOK_ENCRYPTION_KEY", "test-channel-gateway-encryption-key-32b"
     )
-    await _ensure_alembic_upgraded_to_d031(dsn)
+    await _ensure_alembic_upgraded_to_d036(dsn, minimum=dalton_revision)
 
     pool = AsyncConnectionPool(
         conninfo=dsn,
@@ -2139,4 +2234,4 @@ async def _serve_cli_harness_main() -> None:
 
 
 if __name__ == "__main__" and "--serve-http-harness" in sys.argv:
-    asyncio.run(_serve_cli_harness_main())
+    asyncio.run(serve_discord_http_harness())
