@@ -2291,6 +2291,10 @@ async def retry_failed_notify_deliveries(
                         )
                     )
                       AND d.created_at >= NOW() - make_interval(hours => %s)
+                      AND (
+                          COALESCE(d.payload_json ->> 'source', '') <> 'automation_report'
+                          OR d.attempt_count < %s
+                      )
                     ORDER BY d.updated_at ASC, d.created_at ASC
                     LIMIT %s
                     """,
@@ -2299,6 +2303,7 @@ async def retry_failed_notify_deliveries(
                         uncertain_codes_list,
                         stale_pending_minutes,
                         lookback_hours,
+                        max_attempts,
                         limit,
                     ),
                 )
