@@ -254,6 +254,13 @@ async def verify_dalton_token(token: str) -> AuthInfo:
     if not isinstance(claim_sub, str) or not claim_sub.strip() or claim_sub != auth_info.user_id:
         raise HTTPException(status_code=401, detail="Token sub claim mismatch")
 
+    from src.dalton.company_identity import (
+        COMPANY_SYSTEM_EMAIL,
+        reject_company_system_auth,
+    )
+
+    reject_company_system_auth(auth_info.user_id)
+
     is_anonymous = claims.get("is_anonymous")
     if is_anonymous is True or (
         isinstance(is_anonymous, str) and is_anonymous.strip().lower() == "true"
@@ -262,6 +269,11 @@ async def verify_dalton_token(token: str) -> AuthInfo:
 
     raw_email = claims.get("email")
     email = raw_email.strip().lower() if isinstance(raw_email, str) else ""
+    if email == COMPANY_SYSTEM_EMAIL:
+        raise HTTPException(
+            status_code=401,
+            detail="Company system identity cannot authenticate externally",
+        )
 
     if not email or not await is_team_member(email):
         allowed_emails = get_dalton_allowed_emails()

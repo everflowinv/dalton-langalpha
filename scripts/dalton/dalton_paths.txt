@@ -213,3 +213,12 @@ tests/unit/dalton/test_t26_task_preview.py
 scripts/dalton/openclaw_overlays/skills/sentiment-dashboard/scripts/us_market_sections.py
 scripts/dalton/openclaw_overlays/skills/sentiment-dashboard/scripts/sentiment_dashboard_cli.py
 tests/unit/dalton/test_sentiment_observation_dates.py
+# AU1 Batch 1: company automation schema (d035), system identity & budget seed,
+# unified scope classification, read-only scoped listing & modification history, and tests.
+src/dalton/migrations/versions/d035_company_automations.py
+src/dalton/company_identity.py
+src/dalton/autonomy/classification.py
+src/dalton/database/company_automations.py
+src/dalton/services/company_automations.py
+tests/unit/dalton/test_au1_company_foundation.py
+tests/integration/dalton/test_au1_company_foundation_db.py
