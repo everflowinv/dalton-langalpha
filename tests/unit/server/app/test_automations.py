@@ -331,10 +331,17 @@ async def test_update_automation(client):
 @pytest.mark.asyncio
 async def test_update_automation_not_found(client):
     fake_id = str(uuid.uuid4())
-    with patch(
-        f"{HANDLER}.update_automation",
-        new_callable=AsyncMock,
-        return_value=None,
+    with (
+        patch(
+            f"{HANDLER}.update_automation",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+        patch(
+            "src.dalton.database.company_data_tasks.get_automation_owner_identity",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
     ):
         resp = await client.patch(
             f"/api/v1/automations/{fake_id}",
@@ -605,10 +612,17 @@ async def test_pause_automation(client):
 @pytest.mark.asyncio
 async def test_pause_automation_not_found(client):
     fake_id = str(uuid.uuid4())
-    with patch(
-        f"{HANDLER}.pause_automation",
-        new_callable=AsyncMock,
-        return_value=None,
+    with (
+        patch(
+            f"{HANDLER}.pause_automation",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+        patch(
+            "src.dalton.database.company_data_tasks.get_automation_owner_identity",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
     ):
         resp = await client.post(f"/api/v1/automations/{fake_id}/pause")
 
@@ -637,10 +651,17 @@ async def test_resume_automation(client):
 @pytest.mark.asyncio
 async def test_resume_automation_not_found(client):
     fake_id = str(uuid.uuid4())
-    with patch(
-        f"{HANDLER}.resume_automation",
-        new_callable=AsyncMock,
-        return_value=None,
+    with (
+        patch(
+            f"{HANDLER}.resume_automation",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
+        patch(
+            "src.dalton.database.company_data_tasks.get_automation_owner_identity",
+            new_callable=AsyncMock,
+            return_value=None,
+        ),
     ):
         resp = await client.post(f"/api/v1/automations/{fake_id}/resume")
 
