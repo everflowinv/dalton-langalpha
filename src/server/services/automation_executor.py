@@ -744,7 +744,13 @@ class AutomationExecutor:
                 "automation_execution_id": execution_id,
                 "automation_id": str(automation["automation_id"]),
             }
-            extra_configurable = None
+            # Every server-started run names its execution row. A held run
+            # then keeps that hold's stamp intact, including the id its
+            # sends use. On the first start that id is this execution; a
+            # restarted hold keeps the id it was filed under.
+            extra_configurable: dict[str, Any] = {
+                "automation_execution_id": execution_id,
+            }
             if firing.held:
                 additional_context = [
                     *(additional_context or []),
@@ -753,7 +759,9 @@ class AutomationExecutor:
                         "content": automation_delivery.reminder(firing.delivery.targets),
                     },
                 ]
-                extra_configurable = automation_delivery.turn_configurable(firing.delivery)
+                extra_configurable.update(
+                    automation_delivery.turn_configurable(firing.delivery)
+                )
             if firing.wake_context:  # DALTON-HOOK(preflight)
                 additional_context = [
                     *(additional_context or []),
