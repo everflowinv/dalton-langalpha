@@ -445,6 +445,10 @@ def read_dalton_yaml_archive_defaults(repo_root: Path | None = None) -> dict[str
     """Read `conversations.extractor_model`, `extractor_fallback_model`, and `models.assist_fallback_model`."""
     root = repo_root or _repo_root_default()
     yaml_path = root / "src" / "dalton" / "dalton.yaml"
+    if not yaml_path.is_file():
+        default_yaml = _repo_root_default() / "src" / "dalton" / "dalton.yaml"
+        if default_yaml.is_file():
+            yaml_path = default_yaml
     defaults: dict[str, Any] = {
         "extractor_model": "deepseek-flash",
         "extractor_fallback_model": "gemini-4-argon-medium-oauth",
@@ -542,6 +546,10 @@ def _load_catalog_maps(
 ) -> tuple[dict[str, str], dict[str, dict[str, Any]], set[str]]:
     """Return `(model_to_provider, provider_info, all_known_provider_env_keys)`."""
     root = repo_root or _repo_root_default()
+    if not (root / "src" / "llms" / "manifest" / "providers.json").is_file():
+        default_root = _repo_root_default()
+        if (default_root / "src" / "llms" / "manifest" / "providers.json").is_file():
+            root = default_root
     model_to_provider: dict[str, str] = {}
     provider_info: dict[str, dict[str, Any]] = {}
     all_provider_env_keys: set[str] = set(XAI_OAUTH_ALLOWED_ENV_KEYS)
@@ -750,6 +758,26 @@ def _extract_models_from_plan_file(
     return p_model, p_fb
 
 
+_ARCHIVE_NON_PROVIDER_CANDIDATE_KEYS: frozenset[str] = frozenset(
+    {"DALTON_ASSIST_FALLBACK_MODEL"}
+    | set(ARCHIVE_BASE_REQUIRED_KEYS)
+    | set(ARCHIVE_BASE_OPTIONAL_PROCESS_KEYS)
+    | set(ARCHIVE_DB_REQUIRED_KEYS)
+    | set(ARCHIVE_DB_OPTIONAL_KEYS)
+    | {"BYOK_ENCRYPTION_KEY"}
+    | set(ARCHIVE_OWNER_REQUIRED_KEYS)
+    | set(ARCHIVE_OWNER_OPTIONAL_MODE_KEYS)
+    | set(ARCHIVE_WORKSPACE_RUNTIME_KEYS)
+    | {
+        "DALTON_BRIDGE_ADMIN_TOKEN",
+        "DALTON_BRIDGE_EMBED_URL",
+        "no_proxy",
+        "DALTON_OCW_AGENTS_ROOT",
+        "DALTON_REEXTRACT_DSN",
+    }
+)
+
+
 def _read_and_close_candidates_fd(
     env: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
@@ -797,6 +825,145 @@ def _read_and_close_candidates_fd(
     return out
 
 
+def finalize_archive_subprocess_candidates(
+    caller_candidates: Mapping[str, str] | None,
+    final_env: Mapping[str, str],
+    *,
+    repo_root: Path | None = None,
+) -> dict[str, str]:
+    """Finalize candidate mapping against `final_env` before single-use pipe transfer.
+
+    Preserves deferred provider candidates from `caller_candidates` (classified via
+    `_load_catalog_maps` and `XAI_OAUTH_ALLOWED_ENV_KEYS`), updates transferable non-provider
+    values from `final_env` (including `DALTON_BRIDGE_ADMIN_TOKEN` and `DALTON_ASSIST_FALLBACK_MODEL`),
+    and removes non-provider values absent from `final_env`.
+    """
+    root = repo_root or _repo_root_default()
+    _, _, all_provider_keys = _load_catalog_maps(root)
+    provider_keys = (frozenset(all_provider_keys) | XAI_OAUTH_ALLOWED_ENV_KEYS) - {
+        "DALTON_ASSIST_FALLBACK_MODEL"
+    }
+    out: dict[str, str] = {}
+
+    if isinstance(caller_candidates, Mapping):
+        for raw_key, raw_val in caller_candidates.items():
+            key = str(raw_key)
+            if (
+                key not in provider_keys
+                or _is_stripped_credential_key(key)
+                or _is_shell_injection_key(key)
+                or key == "DALTON_BRIDGE_TOKEN"
+                or key == "_DALTON_ARCHIVE_CANDIDATES_FD"
+            ):
+                continue
+            val = str(raw_val or "").strip()
+            if val:
+                out[key] = val
+
+    for key in sorted(provider_keys | _ARCHIVE_NON_PROVIDER_CANDIDATE_KEYS):
+        if (
+            _is_stripped_credential_key(key)
+            or _is_shell_injection_key(key)
+            or key == "DALTON_BRIDGE_TOKEN"
+            or key == "_DALTON_ARCHIVE_CANDIDATES_FD"
+        ):
+            out.pop(key, None)
+            continue
+        final_val = str(final_env.get(key) or "").strip()
+        if final_val:
+            out[key] = final_val
+        elif key not in provider_keys:
+            out.pop(key, None)
+
+    return out
+
+
+def attach_archive_candidates_pipe(
+    target_env: MutableMapping[str, str],
+    candidates: Mapping[str, str] | None,
+) -> int | None:
+    """Write `candidates` JSON to a nonblocking one-shot pipe and set `_DALTON_ARCHIVE_CANDIDATES_FD`.
+
+    Requires the complete payload to be accepted in nonblocking mode; on `BlockingIOError`,
+    partial write, or any `OSError`, closes both descriptors, clears `_DALTON_ARCHIVE_CANDIDATES_FD`,
+    and raises `ArchiveEnvValidationError` containing no candidate values.
+    """
+    target_env.pop("_DALTON_ARCHIVE_CANDIDATES_FD", None)
+    if not candidates:
+        return None
+    clean = {
+        str(k): str(v).strip()
+        for k, v in candidates.items()
+        if isinstance(k, str)
+        and isinstance(v, str)
+        and v.strip()
+        and not _is_stripped_credential_key(k)
+        and not _is_shell_injection_key(k)
+        and k != "DALTON_BRIDGE_TOKEN"
+        and k != "_DALTON_ARCHIVE_CANDIDATES_FD"
+    }
+    if not clean:
+        return None
+    payload_bytes = json.dumps(clean, ensure_ascii=False).encode("utf-8")
+    rfd, wfd = os.pipe()
+    wfd_closed = False
+    try:
+        os.set_blocking(wfd, False)
+        written = os.write(wfd, payload_bytes)
+        if written != len(payload_bytes):
+            raise ArchiveEnvValidationError(
+                [
+                    f"archive candidate transfer partial write ({written} of {len(payload_bytes)} bytes fit in pipe buffer)"
+                ]
+            )
+        os.close(wfd)
+        wfd_closed = True
+        os.set_inheritable(rfd, True)
+        target_env["_DALTON_ARCHIVE_CANDIDATES_FD"] = str(rfd)
+        return rfd
+    except BaseException as exc:
+        target_env.pop("_DALTON_ARCHIVE_CANDIDATES_FD", None)
+        if not wfd_closed:
+            try:
+                os.close(wfd)
+            except OSError:
+                pass
+        try:
+            os.close(rfd)
+        except OSError:
+            pass
+        if isinstance(exc, ArchiveEnvValidationError):
+            raise
+        if isinstance(exc, BlockingIOError):
+            raise ArchiveEnvValidationError(
+                [
+                    f"archive candidate transfer exceeded nonblocking pipe capacity ({len(payload_bytes)} bytes)"
+                ]
+            ) from None
+        if isinstance(exc, OSError):
+            raise ArchiveEnvValidationError(
+                [
+                    f"archive candidate transfer failed ({type(exc).__name__}: errno={exc.errno})"
+                ]
+            ) from None
+        raise
+
+
+def finalize_and_attach_archive_candidates(
+    caller_candidates: Mapping[str, str] | None,
+    final_env: MutableMapping[str, str],
+    *,
+    repo_root: Path | None = None,
+) -> int | None:
+    """Finalize `caller_candidates` against `final_env` and attach a checked one-shot pipe."""
+    final_candidates = finalize_archive_subprocess_candidates(
+        caller_candidates,
+        final_env,
+        repo_root=repo_root,
+    )
+    return attach_archive_candidates_pipe(final_env, final_candidates)
+
+
 def capture_archive_provider_candidates(
     env: Mapping[str, str] | None = None,
     *,
@@ -808,47 +975,41 @@ def capture_archive_provider_candidates(
     root = repo_root or _repo_root_default()
     src = env if env is not None else os.environ
     pipe_candidates = _read_and_close_candidates_fd(src)
+    _, _, all_provider_keys = _load_catalog_maps(root)
+    candidate_keys = (
+        set(all_provider_keys)
+        | set(XAI_OAUTH_ALLOWED_ENV_KEYS)
+        | set(_ARCHIVE_NON_PROVIDER_CANDIDATE_KEYS)
+    )
+    captured: dict[str, str] = {}
+    if pipe_candidates:
+        for key in sorted(candidate_keys):
+            if (
+                _is_stripped_credential_key(key)
+                or _is_shell_injection_key(key)
+                or key == "DALTON_BRIDGE_TOKEN"
+            ):
+                continue
+            pipe_val = str(pipe_candidates.get(key) or "").strip()
+            if pipe_val:
+                if key == "DALTON_BRIDGE_EMBED_URL" and "host.docker.internal" in pipe_val:
+                    captured[key] = DEFAULT_HOST_EMBED_URL
+                else:
+                    captured[key] = pipe_val
+        return captured
+
     dotenv_vars = _resolve_dotenv_vars(
         src,
         repo_root=root,
         repo_env_path=repo_env_path,
         hydrate_from_dotenv=hydrate_from_dotenv,
     )
-    _, _, all_provider_keys = _load_catalog_maps(root)
-    candidate_keys = (
-        set(all_provider_keys)
-        | set(XAI_OAUTH_ALLOWED_ENV_KEYS)
-        | {"DALTON_ASSIST_FALLBACK_MODEL"}
-        | set(ARCHIVE_BASE_REQUIRED_KEYS)
-        | set(ARCHIVE_BASE_OPTIONAL_PROCESS_KEYS)
-        | set(ARCHIVE_DB_REQUIRED_KEYS)
-        | set(ARCHIVE_DB_OPTIONAL_KEYS)
-        | {"BYOK_ENCRYPTION_KEY"}
-        | set(ARCHIVE_OWNER_REQUIRED_KEYS)
-        | set(ARCHIVE_OWNER_OPTIONAL_MODE_KEYS)
-        | set(ARCHIVE_WORKSPACE_RUNTIME_KEYS)
-        | {
-            "DALTON_BRIDGE_ADMIN_TOKEN",
-            "DALTON_BRIDGE_EMBED_URL",
-            "no_proxy",
-            "DALTON_OCW_AGENTS_ROOT",
-            "DALTON_REEXTRACT_DSN",
-        }
-    )
-    captured: dict[str, str] = {}
     for key in sorted(candidate_keys):
         if (
             _is_stripped_credential_key(key)
             or _is_shell_injection_key(key)
             or key == "DALTON_BRIDGE_TOKEN"
         ):
-            continue
-        pipe_val = str(pipe_candidates.get(key) or "").strip()
-        if pipe_val:
-            if key == "DALTON_BRIDGE_EMBED_URL" and "host.docker.internal" in pipe_val:
-                captured[key] = DEFAULT_HOST_EMBED_URL
-            else:
-                captured[key] = pipe_val
             continue
         env_val = str(src.get(key) or "").strip()
         if env_val:
@@ -2157,6 +2318,8 @@ def _cmd_exec_nonarchive(args: argparse.Namespace) -> int:
         os.environ,
         drop_keys=(
             "DALTON_BRIDGE_ENV_FILTER_PY",
+            "DALTON_WIKI_EXPLICIT_RUN_SH",
+            "DALTON_MARKET_DIGEST_EXPLICIT_RUN_SH",
             "PYTHONPATH",
             "PYTHONHOME",
             "PYTHONUSERBASE",
@@ -2204,21 +2367,24 @@ def _cmd_exec_archive(args: argparse.Namespace) -> int:
             validate_required=True,
             defer_primary_model_validation=defer_primary,
         )
+        candidates_rfd = finalize_and_attach_archive_candidates(
+            caller_candidates,
+            env,
+            repo_root=repo_root,
+        )
     except ArchiveEnvValidationError as exc:
         print(f"[archive_env] ERROR: {exc}", file=sys.stderr)
         return 1
 
-    if caller_candidates:
-        payload_bytes = json.dumps(caller_candidates, ensure_ascii=False).encode("utf-8")
-        rfd, wfd = os.pipe()
-        try:
-            os.write(wfd, payload_bytes)
-        finally:
-            os.close(wfd)
-        os.set_inheritable(rfd, True)
-        env["_DALTON_ARCHIVE_CANDIDATES_FD"] = str(rfd)
-
-    os.execvpe(cmd[0], cmd, env)
+    try:
+        os.execvpe(cmd[0], cmd, env)
+    except BaseException:
+        if candidates_rfd is not None:
+            try:
+                os.close(candidates_rfd)
+            except OSError:
+                pass
+        raise
     return 127
 
 

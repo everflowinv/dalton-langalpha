@@ -11031,14 +11031,35 @@ class ResearchDataBridge:
             repo_env = Path(
                 os.environ.get("DALTON_REPO_ENV_FILE") or (repo_root / ".env")
             ).expanduser()
+            base_env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+            caller_candidates = bridge_subprocess_env.capture_archive_provider_candidates(
+                base_env,
+                repo_root=repo_root,
+                repo_env_path=repo_env,
+                hydrate_from_dotenv=True,
+            )
             env_vars = bridge_subprocess_env.build_archive_subprocess_env(
                 repo_env_path=repo_env,
                 bridge_env_path=self.cfg.env_path,
-                base_env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                base_env=base_env,
                 host_embed_url="http://127.0.0.1:8960/embed",
                 repo_root=repo_root,
                 validate_required=False,
+                defer_primary_model_validation=True,
             )
+            try:
+                candidates_rfd = bridge_subprocess_env.finalize_and_attach_archive_candidates(
+                    caller_candidates,
+                    env_vars,
+                    repo_root=repo_root,
+                )
+            except bridge_subprocess_env.ArchiveEnvValidationError as exc:
+                return 500, {
+                    "ok": False,
+                    "key": "conversation-archive",
+                    "status": "error",
+                    "error": str(exc),
+                }
 
             started_at = datetime.now(timezone.utc).isoformat()
             log_fh: Any = None
@@ -11062,15 +11083,24 @@ class ResearchDataBridge:
             watcher_registered = False
             startup_cancelled: asyncio.CancelledError | None = None
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    py_bin,
-                    str(script_path),
-                    "run",
-                    cwd=str(repo_root),
-                    env=env_vars,
-                    stdout=log_fh if log_fh is not None else asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.STDOUT if log_fh is not None else asyncio.subprocess.DEVNULL,
-                )
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        py_bin,
+                        str(script_path),
+                        "run",
+                        cwd=str(repo_root),
+                        env=env_vars,
+                        stdout=log_fh if log_fh is not None else asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.STDOUT if log_fh is not None else asyncio.subprocess.DEVNULL,
+                        pass_fds=(candidates_rfd,) if candidates_rfd is not None else (),
+                    )
+                finally:
+                    if candidates_rfd is not None:
+                        try:
+                            os.close(candidates_rfd)
+                        except OSError:
+                            pass
+                        candidates_rfd = None
                 self._archive_proc = proc
                 proc_pid = getattr(proc, "pid", None)
                 pid_status = self._write_archive_pid_file(proc_pid)
@@ -11143,6 +11173,12 @@ class ResearchDataBridge:
                 startup_cancelled = exc
                 raise
             finally:
+                if candidates_rfd is not None:
+                    try:
+                        os.close(candidates_rfd)
+                    except OSError:
+                        pass
+                    candidates_rfd = None
                 if not watcher_registered:
                     _, _, cleanup_cancelled = await self._terminate_and_cleanup_archive_proc(
                         proc,
@@ -12629,10 +12665,6 @@ class ResearchDataBridge:
             "DALTON_MARKET_DIGEST_SKILL_DIR": str(md_skill_dir),
             "DALTON_BRIDGE_ENV_FILTER_PY": str(_SCRIPT_DIR / "bridge_subprocess_env.py"),
         }
-        if isinstance(explicit_wiki_run_sh, Path) and explicit_wiki_run_sh.expanduser().is_file():
-            base_env["DALTON_WIKI_EXPLICIT_RUN_SH"] = str(explicit_wiki_run_sh.expanduser())
-        if isinstance(explicit_md_run_sh, Path) and explicit_md_run_sh.expanduser().is_file():
-            base_env["DALTON_MARKET_DIGEST_EXPLICIT_RUN_SH"] = str(explicit_md_run_sh.expanduser())
         for opt_key in ("DALTON_SKILL_PYTHON", "DALTON_SKILL_SHELL_RC"):
             opt_val = os.environ.get(opt_key, "").strip()
             if opt_val:

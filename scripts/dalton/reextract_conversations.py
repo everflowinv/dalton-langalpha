@@ -1059,39 +1059,45 @@ async def _build_shared_llm_service(
     provider_candidates: dict[str, str] | None = None,
 ) -> Any:
     """Same shared service the archive builds: one client, provider fallback chain disabled."""
-    try:
-        from ptc_agent.config import load_from_files
-        from src.server.services.llm.service import LLMService
+    from ptc_agent.config import load_from_files
+    from src.server.services.llm.service import LLMService
 
-        pre_load_candidates = bridge_subprocess_env.capture_archive_provider_candidates(
-            os.environ,
-            repo_root=REPO_ROOT,
-            hydrate_from_dotenv=False,
+    pre_load_candidates = bridge_subprocess_env.capture_archive_provider_candidates(
+        os.environ,
+        repo_root=REPO_ROOT,
+        hydrate_from_dotenv=False,
+    )
+    if isinstance(provider_candidates, dict):
+        for k, v in provider_candidates.items():
+            if str(v or "").strip():
+                pre_load_candidates[str(k)] = str(v).strip()
+    try:
+        default_cfg_file = (
+            REPO_ROOT / "agent_config.yaml"
+            if not os.environ.get("PTC_CONFIG_FILE")
+            and (REPO_ROOT / "agent_config.yaml").is_file()
+            else None
         )
-        if isinstance(provider_candidates, dict):
-            for k, v in provider_candidates.items():
-                if str(v or "").strip():
-                    pre_load_candidates[str(k)] = str(v).strip()
-        try:
-            agent_cfg = await load_from_files()
-        finally:
-            bridge_subprocess_env.enforce_reextract_process_env_in_place(
-                os.environ,
-                "extract",
-                explicit_model=model,
-                explicit_fallback_model=fallback_model,
-                provider_candidates=pre_load_candidates,
-                repo_root=REPO_ROOT,
-                hydrate_from_dotenv=False,
-                preserve_pytest=True,
-                validate_required=False,
-            )
+        agent_cfg = (
+            await load_from_files(default_cfg_file)
+            if default_cfg_file is not None
+            else await load_from_files()
+        )
         if getattr(agent_cfg, "llm", None) is not None and hasattr(agent_cfg.llm, "fallback"):
             agent_cfg.llm.fallback = []
         return LLMService(agent_config=agent_cfg, logger=logger)
-    except Exception as exc:
-        logger.debug("Shared LLMService init skipped: %s", type(exc).__name__)
-        return None
+    finally:
+        bridge_subprocess_env.enforce_reextract_process_env_in_place(
+            os.environ,
+            "extract",
+            explicit_model=model,
+            explicit_fallback_model=fallback_model,
+            provider_candidates=pre_load_candidates,
+            repo_root=REPO_ROOT,
+            hydrate_from_dotenv=False,
+            preserve_pytest=True,
+            validate_required=False,
+        )
 
 
 @dataclass

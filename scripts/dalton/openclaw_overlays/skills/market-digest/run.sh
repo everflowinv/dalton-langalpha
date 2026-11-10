@@ -44,24 +44,8 @@ else
 fi
 
 _PRESERVED_GEMINI_API_KEY="${GEMINI_API_KEY:-}"
-if [[ -n "${DALTON_MARKET_DIGEST_EXPLICIT_RUN_SH:-}" && -f "${DALTON_MARKET_DIGEST_EXPLICIT_RUN_SH}" && "${DALTON_MARKET_DIGEST_EXPLICIT_RUN_SH}" != "${SCRIPT_DIR}/run.sh" ]]; then
-    set -a
-    while IFS= read -r _cfg_line || [[ -n "${_cfg_line}" ]]; do
-        case "${_cfg_line}" in
-            *market_digest_cli.py*|*digest_cli.py*|*bridge_subprocess_env.py*|*"exec "*|*"python"*)
-                continue
-                ;;
-            [[:space:]]*\#*|\#*|"")
-                continue
-                ;;
-            *export\ *|[A-Za-z_]*=*|*source\ *|.\ *|*[[:space:]].\ *)
-                eval "${_cfg_line}" 2>/dev/null || true
-                ;;
-        esac
-    done < "${DALTON_MARKET_DIGEST_EXPLICIT_RUN_SH}"
-    set +a
-fi
-unset DALTON_MARKET_DIGEST_EXPLICIT_RUN_SH _cfg_line
+_PRESERVED_FILTER_PY="${DALTON_BRIDGE_ENV_FILTER_PY:-}"
+unset DALTON_WIKI_EXPLICIT_RUN_SH DALTON_MARKET_DIGEST_EXPLICIT_RUN_SH
 
 if [[ -n "${DALTON_SKILL_SHELL_RC:-}" && -f "${DALTON_SKILL_SHELL_RC}" ]]; then
     # shellcheck disable=SC1090
@@ -78,7 +62,11 @@ done
 if [[ -n "${_PRESERVED_GEMINI_API_KEY}" ]]; then
     export GEMINI_API_KEY="${_PRESERVED_GEMINI_API_KEY}"
 fi
-unset _PRESERVED_GEMINI_API_KEY _env_cand
+if [[ -n "${_PRESERVED_FILTER_PY}" ]]; then
+    DALTON_BRIDGE_ENV_FILTER_PY="${_PRESERVED_FILTER_PY}"
+fi
+unset _PRESERVED_GEMINI_API_KEY _PRESERVED_FILTER_PY _env_cand
+unset DALTON_WIKI_EXPLICIT_RUN_SH DALTON_MARKET_DIGEST_EXPLICIT_RUN_SH
 
 unset BASH_ENV ENV ZDOTDIR PROMPT_COMMAND PYTHONSTARTUP PYTHONINSPECT PYTHONPATH PYTHONHOME PYTHONUSERBASE PYTHONEXECUTABLE CDPATH GLOBIGNORE
 unset SEED_ASR_APP_ID SEED_ASR_ACCESS_KEY VOLC_TOS_AK VOLC_TOS_SK VOLC_TOS_BUCKET VOLC_TOS_REGION VOLC_TOS_ENDPOINT

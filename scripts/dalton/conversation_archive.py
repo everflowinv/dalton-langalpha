@@ -2825,6 +2825,53 @@ async def process_weekly_batch(
         raise
 
 
+async def _build_shared_llm_service(
+    *,
+    model: str | None = None,
+    fallback_model: str | None = None,
+    provider_candidates: dict[str, str] | None = None,
+) -> Any:
+    """Build shared `LLMService` for archive extraction, always re-filtering `os.environ` in `finally` and propagating errors."""
+    from ptc_agent.config import load_from_files
+    from src.server.services.llm.service import LLMService
+
+    pre_load_candidates = bridge_subprocess_env.capture_archive_provider_candidates(
+        os.environ,
+        repo_root=REPO_ROOT,
+        hydrate_from_dotenv=False,
+    )
+    if isinstance(provider_candidates, dict):
+        for k, v in provider_candidates.items():
+            if str(v or "").strip():
+                pre_load_candidates[str(k)] = str(v).strip()
+    try:
+        default_cfg_file = (
+            REPO_ROOT / "agent_config.yaml"
+            if not os.environ.get("PTC_CONFIG_FILE")
+            and (REPO_ROOT / "agent_config.yaml").is_file()
+            else None
+        )
+        agent_cfg = (
+            await load_from_files(default_cfg_file)
+            if default_cfg_file is not None
+            else await load_from_files()
+        )
+        if getattr(agent_cfg, "llm", None) is not None and hasattr(agent_cfg.llm, "fallback"):
+            agent_cfg.llm.fallback = []
+        return LLMService(agent_config=agent_cfg, logger=logger)
+    finally:
+        bridge_subprocess_env.enforce_archive_process_env_in_place(
+            os.environ,
+            explicit_model=model,
+            explicit_fallback_model=fallback_model,
+            provider_candidates=pre_load_candidates,
+            repo_root=REPO_ROOT,
+            hydrate_from_dotenv=False,
+            preserve_pytest=True,
+            validate_required=False,
+        )
+
+
 async def run_archive_pipeline(
     *,
     mode: str = "run",
@@ -2981,28 +3028,11 @@ async def run_archive_pipeline(
 
         shared_llm_service = llm_service
         if shared_llm_service is None and not dry_run and extract_fn is extract_segment_cards:
-            try:
-                from ptc_agent.config import load_from_files
-                from src.server.services.llm.service import LLMService
-
-                try:
-                    agent_cfg = await load_from_files()
-                finally:
-                    bridge_subprocess_env.enforce_archive_process_env_in_place(
-                        os.environ,
-                        explicit_model=eff_model,
-                        explicit_fallback_model=eff_fallback,
-                        provider_candidates=eff_Provider_cands,
-                        repo_root=REPO_ROOT,
-                        hydrate_from_dotenv=False,
-                        preserve_pytest=True,
-                        validate_required=False,
-                    )
-                if getattr(agent_cfg, "llm", None) is not None and hasattr(agent_cfg.llm, "fallback"):
-                    agent_cfg.llm.fallback = []
-                shared_llm_service = LLMService(agent_config=agent_cfg, logger=logger)
-            except Exception as exc:
-                logger.debug("Lazy shared LLMService init skipped: %s", exc)
+            shared_llm_service = await _build_shared_llm_service(
+                model=eff_model,
+                fallback_model=eff_fallback,
+                provider_candidates=eff_Provider_cands,
+            )
 
         batch_results: list[dict[str, Any]] = []
         all_incomplete_segments: list[dict[str, Any]] = []

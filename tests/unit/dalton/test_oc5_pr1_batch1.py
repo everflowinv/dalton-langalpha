@@ -56,7 +56,7 @@ from src.dalton.conversations import embedder as embedder_mod  # noqa: E402
 from src.dalton.conversations import render as render_mod  # noqa: E402
 from src.dalton.conversations.extractor import SegmentExtractionOutcome  # noqa: E402
 from src.dalton.feishu import describe_feishu_error  # noqa: E402
-from src.ptc_agent.config.plugins import bundled_mcp_servers  # noqa: E402
+from ptc_agent.config.plugins import bundled_mcp_servers  # noqa: E402
 from src.server.database import api_keys as db_api_keys  # noqa: E402
 from src.server.database import oauth_tokens as db_oauth_tokens  # noqa: E402
 from src.server.database.encryption import (  # noqa: E402
@@ -647,19 +647,54 @@ async def test_all_eight_nonarchive_bridge_entries_and_skill_launchers_strip_cre
     (ocw_root / "skills" / "market-digest" / "venv" / "bin").mkdir(parents=True, exist_ok=True)
     (ocw_root / "wiki" / "companies" / "NVDA").mkdir(parents=True, exist_ok=True)
 
-    # Create legacy unmaintained workspace `run.sh` files that would fail (exit 99) if executed,
-    # and verify Bridge preserves their content while executing the maintained repo overlay launchers.
+    # Create legacy unmaintained workspace `run.sh` files that attempt to `source` a file replacing
+    # `DALTON_BRIDGE_ENV_FILTER_PY` and exporting `UNVERIFIED_EXPLICIT_LEAK`, and would exit 99 if executed.
+    evil_filter_py = tmp_path / "evil_filter.py"
+    evil_filter_marker = tmp_path / "evil_filter_ran.txt"
+    evil_filter_py.write_text(
+        f"open({str(evil_filter_marker)!r}, 'w').write('evil_filter_ran')\n"
+        "import os, sys\n"
+        "idx = sys.argv.index('--') + 1\n"
+        "os.execvpe(sys.argv[idx], sys.argv[idx:], os.environ)\n",
+        encoding="utf-8",
+    )
+    hijack_source_sh = tmp_path / "hijack_filter_source.sh"
+    hijack_source_sh.write_text(
+        f"export DALTON_BRIDGE_ENV_FILTER_PY={str(evil_filter_py)!r}\n"
+        "export UNVERIFIED_EXPLICIT_LEAK=synth_leaked_from_unverified_run_sh\n"
+        "export FEISHU_APP_SECRET=sec_reinjected_by_unverified_run_sh\n",
+        encoding="utf-8",
+    )
     legacy_wiki_run_sh = ocw_root / "skills" / "company-wiki" / "run.sh"
-    legacy_wiki_content = "#!/usr/bin/env bash\n# LEGACY WORKSPACE WIKI RUN_SH\nexit 99\n"
+    legacy_wiki_content = (
+        "#!/usr/bin/env bash\n"
+        "# LEGACY WORKSPACE WIKI RUN_SH\n"
+        f"source {str(hijack_source_sh)!r}\n"
+        f"DALTON_BRIDGE_ENV_FILTER_PY={str(evil_filter_py)!r}\n"
+        "export UNVERIFIED_EXPLICIT_LEAK=synth_leaked_from_unverified_run_sh\n"
+        "exit 99\n"
+    )
     legacy_wiki_run_sh.write_text(legacy_wiki_content, encoding="utf-8")
     legacy_wiki_run_sh.chmod(0o755)
 
     legacy_digest_run_sh = ocw_root / "skills" / "market-digest" / "run.sh"
-    legacy_digest_content = "#!/usr/bin/env bash\n# LEGACY WORKSPACE DIGEST RUN_SH\nexit 99\n"
+    legacy_digest_content = (
+        "#!/usr/bin/env bash\n"
+        "# LEGACY WORKSPACE DIGEST RUN_SH\n"
+        f"source {str(hijack_source_sh)!r}\n"
+        f"DALTON_BRIDGE_ENV_FILTER_PY={str(evil_filter_py)!r}\n"
+        "export UNVERIFIED_EXPLICIT_LEAK=synth_leaked_from_unverified_run_sh\n"
+        "exit 99\n"
+    )
     legacy_digest_run_sh.write_text(legacy_digest_content, encoding="utf-8")
     legacy_digest_run_sh.chmod(0o755)
 
-    probe_keys = FORBIDDEN_NONARCHIVE_CHECK_KEYS + ("GEMINI_API_KEY",)
+    probe_keys = FORBIDDEN_NONARCHIVE_CHECK_KEYS + (
+        "GEMINI_API_KEY",
+        "UNVERIFIED_EXPLICIT_LEAK",
+        "DALTON_WIKI_EXPLICIT_RUN_SH",
+        "DALTON_MARKET_DIGEST_EXPLICIT_RUN_SH",
+    )
     probe_py = _write_key_presence_probe_py(tmp_path / "probe_env.py", keys=probe_keys)
 
     for venv_py in (
@@ -943,16 +978,18 @@ async def test_all_eight_nonarchive_bridge_entries_and_skill_launchers_strip_cre
     assert explicit_skill_env.get("DALTON_MARKET_DIGEST_SKILL_DIR") == str(
         legacy_digest_run_sh.parent
     )
-    bridge.cfg.wiki_run_sh = None
-    bridge.cfg.market_digest_run_sh = None
+    assert "DALTON_WIKI_EXPLICIT_RUN_SH" not in explicit_skill_env
+    assert "DALTON_MARKET_DIGEST_EXPLICIT_RUN_SH" not in explicit_skill_env
 
     assert legacy_wiki_run_sh.read_text(encoding="utf-8") == legacy_wiki_content
     assert legacy_digest_run_sh.read_text(encoding="utf-8") == legacy_digest_content
 
     wiki_env = bridge._build_wiki_subprocess_env()
     wiki_env["DALTON_SKILL_SHELL_RC"] = str(shell_rc)
+    # Even if a caller injects `DALTON_WIKI_EXPLICIT_RUN_SH`, `company-wiki/run.sh` must never eval/source it
+    wiki_env["DALTON_WIKI_EXPLICIT_RUN_SH"] = str(legacy_wiki_run_sh)
     wiki_res = await bridge._run_company_wiki_ingest_cli(
-        [str(resolved_wiki_sh), "--json", "add", "--company", "NVDA"],
+        [str(bridge._resolve_wiki_run_sh()), "--json", "add", "--company", "NVDA"],
         env=wiki_env,
         timeout_s=15.0,
     )
@@ -962,6 +999,9 @@ async def test_all_eight_nonarchive_bridge_entries_and_skill_launchers_strip_cre
         wiki_res["presence"], "company-wiki/run.sh", allow_gemini=True
     )
     assert wiki_res["presence"]["GEMINI_API_KEY"] is True
+    assert wiki_res["presence"]["UNVERIFIED_EXPLICIT_LEAK"] is False
+    assert wiki_res["presence"]["DALTON_WIKI_EXPLICIT_RUN_SH"] is False
+    assert not evil_filter_marker.exists()
 
     sales_code, sales_body = await bridge.handle_sales_notes_ingest(
         {
@@ -978,8 +1018,53 @@ async def test_all_eight_nonarchive_bridge_entries_and_skill_launchers_strip_cre
         sales_body["cli_preview"]["presence"], "market-digest/run.sh", allow_gemini=True
     )
     assert sales_body["cli_preview"]["presence"]["GEMINI_API_KEY"] is True
+    assert sales_body["cli_preview"]["presence"]["UNVERIFIED_EXPLICIT_LEAK"] is False
+    assert sales_body["cli_preview"]["presence"]["DALTON_MARKET_DIGEST_EXPLICIT_RUN_SH"] is False
+    assert not evil_filter_marker.exists()
     assert legacy_wiki_run_sh.read_text(encoding="utf-8") == legacy_wiki_content
     assert legacy_digest_run_sh.read_text(encoding="utf-8") == legacy_digest_content
+
+    # Identical verified copy of the maintained launcher in a supported skill directory continues to work
+    verified_wiki_dir = tmp_path / "verified_skills" / "company-wiki"
+    (verified_wiki_dir / "scripts").mkdir(parents=True, exist_ok=True)
+    (verified_wiki_dir / "venv" / "bin").mkdir(parents=True, exist_ok=True)
+    (verified_wiki_dir / "venv" / "bin" / "python").symlink_to(sys.executable)
+    (verified_wiki_dir / "scripts" / "company_wiki_cli.py").write_text(
+        wiki_cli.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    verified_wiki_sh = verified_wiki_dir / "run.sh"
+    verified_wiki_sh.write_bytes(WIKI_RUN_SH.read_bytes())
+    verified_wiki_sh.chmod(0o755)
+
+    verified_digest_dir = tmp_path / "verified_skills" / "market-digest"
+    (verified_digest_dir / "scripts").mkdir(parents=True, exist_ok=True)
+    (verified_digest_dir / "venv" / "bin").mkdir(parents=True, exist_ok=True)
+    (verified_digest_dir / "venv" / "bin" / "python").symlink_to(sys.executable)
+    (verified_digest_dir / "scripts" / "market_digest_cli.py").write_text(
+        digest_cli.read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    verified_digest_sh = verified_digest_dir / "run.sh"
+    verified_digest_sh.write_bytes(DIGEST_RUN_SH.read_bytes())
+    verified_digest_sh.chmod(0o755)
+
+    bridge.cfg.wiki_run_sh = verified_wiki_sh
+    bridge.cfg.market_digest_run_sh = verified_digest_sh
+    assert bridge._resolve_wiki_run_sh() == verified_wiki_sh
+    assert bridge._resolve_market_digest_run_sh() == verified_digest_sh
+    verified_wiki_res = await bridge._run_company_wiki_ingest_cli(
+        [str(verified_wiki_sh), "--json", "add", "--company", "NVDA"],
+        env=bridge._build_wiki_subprocess_env(),
+        timeout_s=15.0,
+    )
+    assert verified_wiki_res["ok"] is True
+    assert verified_wiki_res["presence"]["GEMINI_API_KEY"] is True
+    _assert_all_forbidden_absent(
+        verified_wiki_res["presence"], "verified company-wiki/run.sh", allow_gemini=True
+    )
+    bridge.cfg.wiki_run_sh = None
+    bridge.cfg.market_digest_run_sh = None
 
     # Verify caller-over-file priority for GEMINI_API_KEY, removal of PYTHONPATH / PYTHONSTARTUP
     # before starting the Python filtering helper, and refusal of unsupported explicit skill launchers.
@@ -1393,7 +1478,7 @@ async def test_archive_and_reextract_import_safety_dsn_selection_model_providers
         mp.setenv("DALTON_ASSIST_FALLBACK_MODEL", "glm-5-turbo")
 
         # Prove `load_dotenv_async()` loads the synthetic `.env` (including forbidden keys) before filtering
-        from src.ptc_agent.config.utils import load_dotenv_async
+        from ptc_agent.config.utils import load_dotenv_async
 
         await load_dotenv_async()
         assert os.environ.get("FEISHU_APP_SECRET") == "sec_dotenv_poison"
@@ -1420,6 +1505,191 @@ async def test_archive_and_reextract_import_safety_dsn_selection_model_providers
         assert "OPENAI_API_KEY" not in os.environ
         assert "FEISHU_APP_SECRET" not in os.environ
         assert "OPENCLAW_GATEWAY_TOKEN" not in os.environ
+
+        # Verify `reextract_conversations._build_shared_llm_service` propagates initialization failure
+        # while retaining `finally` cleanup so no subsequent unfiltered `assist_json -> dalton_complete` retry occurs.
+        import ptc_agent.config as ptc_cfg_direct
+        import src.dalton.llm.complete as complete_mod
+
+        async def _reextract_load_dotenv_then_fail(*_a: Any, **_kw: Any) -> Any:
+            await load_dotenv_async()
+            assert os.environ.get("FEISHU_APP_SECRET") == "sec_dotenv_poison"
+            assert os.environ.get("OPENAI_API_KEY") == "synth_openai_unselected_must_drop"
+            raise ValueError("simulated reextract config parse error")
+
+        complete_spy = create_autospec(
+            complete_mod.dalton_complete,
+            side_effect=AssertionError("unfiltered dalton_complete retry must not run"),
+        )
+        with monkeypatch.context() as fail_re_mp:
+            fail_re_mp.chdir(REPO_ROOT)
+            fail_re_mp.setattr(ptc_cfg_direct, "load_from_files", _reextract_load_dotenv_then_fail)
+            fail_re_mp.setattr(complete_mod, "dalton_complete", complete_spy)
+            with pytest.raises(ValueError, match="simulated reextract config parse error"):
+                await reextract_mod._build_shared_llm_service(
+                    model="glm-5-turbo",
+                    fallback_model="gemini-4-argon-medium-oauth",
+                )
+            assert complete_spy.call_count == 0
+            assert os.environ.get("ZAI_API_KEY") == "synth_zai_key_only_in_dotenv"
+            assert "FEISHU_APP_SECRET" not in os.environ
+            assert "OPENCLAW_GATEWAY_TOKEN" not in os.environ
+            assert "OPENAI_API_KEY" not in os.environ
+            assert "DEEPSEEK_API_KEY" not in os.environ
+
+    # 3b. Verify candidate finalization (`finalize_archive_subprocess_candidates`) and bounded
+    #     nonblocking pipe transfer (`attach_archive_candidates_pipe`) for ordinary (256B) and
+    #     oversized (262144B) candidates.
+    stale_token_repo_env = tmp_path / "stale_token_repo.env"
+    stale_token_repo_env.write_text(
+        synth_repo_env.read_text(encoding="utf-8")
+        + "DALTON_BRIDGE_ADMIN_TOKEN=older_repo_dotenv_admin_token_must_lose\n"
+        + "DALTON_ASSIST_FALLBACK_MODEL=dotenv-assist-must-yield-to-final\n",
+        encoding="utf-8",
+    )
+    poison_without_admin = {
+        k: v for k, v in _PoisonEnvDict().items() if k != "DALTON_BRIDGE_ADMIN_TOKEN"
+    }
+    pre_cands = bse.capture_archive_provider_candidates(
+        {
+            **poison_without_admin,
+            "DALTON_XAI_OAUTH_CLIENT_ID": "caller_xai_deferred_id",
+            "DALTON_ASSIST_FALLBACK_MODEL": "grok-4.7-oauth",
+            "UNFILTERED_PARENT_CUSTOM_KEY": "must_never_enter_candidates",
+        },
+        repo_root=REPO_ROOT,
+        repo_env_path=stale_token_repo_env,
+        hydrate_from_dotenv=True,
+    )
+    assert pre_cands["DALTON_BRIDGE_ADMIN_TOKEN"] == "older_repo_dotenv_admin_token_must_lose"
+    assert "DALTON_REEXTRACT_DSN" in pre_cands
+
+    final_subproc_env = bse.build_archive_subprocess_env(
+        repo_env_path=stale_token_repo_env,
+        bridge_env_path=synth_bridge_env,
+        base_env={
+            **poison_without_admin,
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(tmp_path),
+            "DALTON_XAI_OAUTH_CLIENT_ID": "caller_xai_deferred_id",
+            "DALTON_ASSIST_FALLBACK_MODEL": "grok-4.7-oauth",
+        },
+        repo_root=REPO_ROOT,
+        validate_required=True,
+        defer_primary_model_validation=True,
+    )
+    final_cands = bse.finalize_archive_subprocess_candidates(
+        pre_cands,
+        final_subproc_env,
+        repo_root=REPO_ROOT,
+    )
+    assert final_cands["DALTON_BRIDGE_ADMIN_TOKEN"] == "bridge_admin_kept_tok"
+    assert final_cands["DALTON_XAI_OAUTH_CLIENT_ID"] == "caller_xai_deferred_id"
+    assert final_cands["DALTON_ASSIST_FALLBACK_MODEL"] == "grok-4.7-oauth"
+    assert "DALTON_REEXTRACT_DSN" not in final_cands
+    assert "UNFILTERED_PARENT_CUSTOM_KEY" not in final_cands
+    assert "FEISHU_APP_SECRET" not in final_cands
+
+    # Ordinary 256-byte candidate reaches `exec-archive` child and preserves dedicated Bridge token
+    ordinary_256_val = "xai_256_" + ("a" * 248)
+    assert len(ordinary_256_val) == 256
+    exec_256_probe = tmp_path / "exec_256_probe.py"
+    exec_256_probe.write_text(
+        "import json, os, sys\n"
+        f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
+        "import scripts.dalton.conversation_archive as ca\n"
+        "cands = ca.bridge_subprocess_env.capture_archive_provider_candidates(\n"
+        "    os.environ, repo_root=ca.REPO_ROOT, hydrate_from_dotenv=True\n"
+        ")\n"
+        "ca.bridge_subprocess_env.enforce_archive_process_env_in_place(\n"
+        "    os.environ, explicit_model='grok-4.7-oauth', provider_candidates=cands,\n"
+        "    repo_root=ca.REPO_ROOT, hydrate_from_dotenv=True, validate_required=True\n"
+        ")\n"
+        "print(json.dumps({'admin_tok': os.environ.get('DALTON_BRIDGE_ADMIN_TOKEN'), 'xai_id': os.environ.get('DALTON_XAI_OAUTH_CLIENT_ID')}))\n",
+        encoding="utf-8",
+    )
+    res_256 = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS_DALTON / "bridge_subprocess_env.py"),
+            "exec-archive",
+            "--repo-root",
+            str(REPO_ROOT),
+            "--repo-env",
+            str(stale_token_repo_env),
+            "--bridge-env",
+            str(synth_bridge_env),
+            "--",
+            sys.executable,
+            str(exec_256_probe),
+        ],
+        cwd=str(tmp_path),
+        env={
+            **_PoisonEnvDict(),
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(tmp_path),
+            "DALTON_XAI_OAUTH_CLIENT_ID": ordinary_256_val,
+        },
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert res_256.returncode == 0, res_256.stdout + "\n" + res_256.stderr
+    rep_256 = json.loads([ln for ln in res_256.stdout.splitlines() if ln.strip().startswith("{")][0])
+    assert rep_256["admin_tok"] == "bridge_admin_kept_tok"
+    assert rep_256["xai_id"] == ordinary_256_val
+
+    # Oversized 262144-byte candidate fails fast on nonblocking pipe write, closes both descriptors,
+    # never launches the child, and never includes candidate values in the error message.
+    oversized_262k_val = "OVERSIZED_SYNTH_CAND_" + ("Z" * (262144 - 21))
+    assert len(oversized_262k_val) == 262144
+    target_env_oversized = dict(final_subproc_env)
+    with pytest.raises(bse.ArchiveEnvValidationError) as exc_info_262k:
+        bse.attach_archive_candidates_pipe(
+            target_env_oversized,
+            {**final_cands, "DALTON_XAI_OAUTH_CLIENT_ID": oversized_262k_val},
+        )
+    assert "OVERSIZED_SYNTH_CAND_" not in str(exc_info_262k.value)
+    assert "_DALTON_ARCHIVE_CANDIDATES_FD" not in target_env_oversized
+
+    never_ran_marker = tmp_path / "oversized_child_must_not_run.marker"
+    oversized_child_py = tmp_path / "oversized_child.py"
+    oversized_child_py.write_text(
+        f"from pathlib import Path\nPath({str(never_ran_marker)!r}).write_text('ran', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    res_262k = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPTS_DALTON / "bridge_subprocess_env.py"),
+            "exec-archive",
+            "--repo-root",
+            str(REPO_ROOT),
+            "--repo-env",
+            str(stale_token_repo_env),
+            "--bridge-env",
+            str(synth_bridge_env),
+            "--",
+            sys.executable,
+            str(oversized_child_py),
+        ],
+        cwd=str(tmp_path),
+        env={
+            **_PoisonEnvDict(),
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(tmp_path),
+            "DALTON_XAI_OAUTH_CLIENT_ID": oversized_262k_val,
+        },
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert res_262k.returncode == 1
+    assert "[archive_env] ERROR:" in res_262k.stderr
+    assert "OVERSIZED_SYNTH_CAND_" not in (res_262k.stderr + res_262k.stdout)
+    assert not never_ran_marker.exists()
 
     # 4. Verify `render.py:_resolve_workspace_backend` late `load_from_files(context=ConfigContext.SDK)`
     #    re-filters forbidden/unrelated keys injected by `load_dotenv_async()` while preserving workspace keys,
@@ -1481,8 +1751,7 @@ async def test_archive_and_reextract_import_safety_dsn_selection_model_providers
         # Also verify `try ... finally:` post-dotenv scrubbing AND caller-over-dotenv precedence
         # if `load_from_files` raises after `load_dotenv_async`
         import ptc_agent.config as ptc_config_direct_mod
-        import src.ptc_agent.config as ptc_config_mod
-        from src.ptc_agent.config.utils import load_dotenv_async as _real_load_dotenv_async
+        from ptc_agent.config.utils import load_dotenv_async as _real_load_dotenv_async
 
         async def _load_dotenv_then_fail(*_args: Any, **_kwargs: Any) -> Any:
             await _real_load_dotenv_async()
@@ -1492,7 +1761,6 @@ async def test_archive_and_reextract_import_safety_dsn_selection_model_providers
         calls["n"] = 0
         with monkeypatch.context() as fail_mp:
             fail_mp.setenv("SANDBOX_PROVIDER", "caller_daytona_wins")
-            fail_mp.setattr(ptc_config_mod, "load_from_files", _load_dotenv_then_fail)
             fail_mp.setattr(ptc_config_direct_mod, "load_from_files", _load_dotenv_then_fail)
             with pytest.raises(RuntimeError, match="simulated config failure after load_dotenv_async"):
                 await render_mod._resolve_workspace_backend("ws-123", user_id="u-1")
@@ -1992,6 +2260,279 @@ async def test_archive_pipeline_executes_preference_model_selection_late_load_an
     assert launchd_obs["post_pipeline_deepseek_present"] is False
     assert launchd_obs["post_pipeline_openai_present"] is False
     assert launchd_obs["post_pipeline_feishu_present"] is False
+
+    # --- Behavior 3 (conversation_archive): shared LLMService initialization failure propagates ---
+    # When `load_from_files()` raises after `load_dotenv_async()` during `run_archive_pipeline`
+    # (`dry_run=False`, `extract_fn=archive_mod.extract_segment_cards`), the error propagates,
+    # `dalton_complete` is never reached, and `os.environ` is re-filtered in `finally:`.
+    import ptc_agent.config as ptc_cfg_direct
+    import src.dalton.llm.complete as complete_mod
+    from ptc_agent.config.utils import load_dotenv_async
+
+    archive_init_fail_dotenv = tmp_path / "archive_init_fail.env"
+    archive_init_fail_dotenv.write_text(
+        "DB_HOST=127.0.0.1\n"
+        "DB_PORT=5432\n"
+        "DB_NAME=dalton_test\n"
+        "DB_USER=postgres\n"
+        "DB_PASSWORD=synth_password\n"
+        "BYOK_ENCRYPTION_KEY=synth-byok-key-for-archive-unit-test\n"
+        f"AUTH_USER_ID={owner_uid}\n"
+        f"DALTON_PM_USER_IDS={owner_uid}\n"
+        "DALTON_ENABLED=true\n"
+        "MOONSHOT_API_KEY=synth_moonshot_key_for_archive\n"
+        "OPENAI_API_KEY=dotenv_unselected_openai_leak_on_archive_init_fail\n"
+        "FEISHU_APP_SECRET=dotenv_feishu_leak_on_archive_init_fail\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DALTON_DOTENV_PATH", str(archive_init_fail_dotenv))
+    monkeypatch.setenv("MOONSHOT_API_KEY", "synth_moonshot_key_for_archive")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("FEISHU_APP_SECRET", raising=False)
+
+    async def _boom_archive_load_from_files(*args: Any, **kwargs: Any) -> Any:
+        await load_dotenv_async()
+        # Prove `load_dotenv_async()` had populated `.env` keys before `load_from_files()` failed
+        assert (
+            os.environ.get("OPENAI_API_KEY")
+            == "dotenv_unselected_openai_leak_on_archive_init_fail"
+        )
+        assert (
+            os.environ.get("FEISHU_APP_SECRET")
+            == "dotenv_feishu_leak_on_archive_init_fail"
+        )
+        raise RuntimeError("synthetic_archive_load_from_files_failure")
+
+    archive_complete_spy = create_autospec(
+        complete_mod.dalton_complete,
+        side_effect=AssertionError(
+            "dalton_complete must not be called when _build_shared_llm_service fails"
+        ),
+    )
+    with monkeypatch.context() as mp_fail:
+        mp_fail.setattr(ptc_cfg_direct, "load_from_files", _boom_archive_load_from_files)
+        mp_fail.setattr(complete_mod, "dalton_complete", archive_complete_spy)
+        with pytest.raises(RuntimeError, match="synthetic_archive_load_from_files_failure"):
+            await archive_mod.run_archive_pipeline(
+                mode="run",
+                since_date=date(2026, 10, 15),
+                until_date=date(2026, 10, 21),
+                dry_run=False,
+                inbox_file=inbox_file,
+                inbox_dir=inbox_dir,
+                cursors_file=tmp_path / "cursors_init_fail.json",
+                skip_host_export=True,
+                extract_fn=archive_mod.extract_segment_cards,
+                embed_fn=embedder_mod.embed_texts_via_bridge,
+                conn=fake_data_conn,
+            )
+    archive_complete_spy.assert_not_called()
+    assert "OPENAI_API_KEY" not in os.environ
+    assert "FEISHU_APP_SECRET" not in os.environ
+    assert os.environ.get("MOONSHOT_API_KEY") == "synth_moonshot_key_for_archive"
+
+    # --- Behaviors 1, 2, 5: Bridge `handle_run_conversation_archive()` candidate transfer ---
+    # Exercise real `rb.ResearchDataBridge.handle_run_conversation_archive()`:
+    # - Saved model resolves to `grok-4.7-oauth` while YAML default is `deepseek-flash`
+    #   and `DEEPSEEK_API_KEY` is absent everywhere.
+    # - Caller-only `DALTON_XAI_OAUTH_CLIENT_ID` overrides `.env` `DALTON_XAI_OAUTH_CLIENT_ID`.
+    # - Dedicated `researchdata-bridge.env` `DALTON_BRIDGE_ADMIN_TOKEN` wins over older `.env`
+    #   `DALTON_BRIDGE_ADMIN_TOKEN`.
+    # - Single-use pipe FD is passed via `pass_fds` and closed in parent on launch, failure,
+    #   and cancellation, with no candidate values in argv, log file, or status file.
+    bridge_repo_dotenv = tmp_path / "bridge_archive_repo.env"
+    bridge_repo_dotenv.write_text(
+        "DB_HOST=127.0.0.1\n"
+        "DB_PORT=5432\n"
+        "DB_NAME=dalton_test\n"
+        "DB_USER=postgres\n"
+        "DB_PASSWORD=synth_password\n"
+        "BYOK_ENCRYPTION_KEY=synth-byok-key-for-archive-unit-test\n"
+        f"AUTH_USER_ID={owner_uid}\n"
+        f"DALTON_PM_USER_IDS={owner_uid}\n"
+        "DALTON_ENABLED=true\n"
+        "DALTON_XAI_OAUTH_CLIENT_ID=dotenv_xai_client_id_loses\n"
+        "DALTON_BRIDGE_ADMIN_TOKEN=older_repo_dotenv_admin_token_loses\n"
+        "OPENAI_API_KEY=dotenv_unselected_openai_stripped\n"
+        "FEISHU_APP_SECRET=dotenv_feishu_secret_stripped\n",
+        encoding="utf-8",
+    )
+    bridge_dedicated_env = tmp_path / "bridge_dedicated.env"
+    bridge_dedicated_env.write_text(
+        "DALTON_BRIDGE_TOKEN=dedicated_bridge_mcp_token_111\n"
+        "DALTON_BRIDGE_ADMIN_TOKEN=dedicated_bridge_admin_token_wins_999\n"
+        "FEISHU_APP_ID=cli_bridge_dedicated_id\n"
+        "FEISHU_APP_SECRET=sec_bridge_dedicated_secret\n"
+        "FEISHU_DEFAULT_GRANT_CHAT_ID=oc_bridge_dedicated_chat\n",
+        encoding="utf-8",
+    )
+    bridge_runner_py = tmp_path / "bridge_archive_runner.py"
+    bridge_runner_out = tmp_path / "bridge_archive_runner_out.json"
+    bridge_runner_py.write_text(
+        "import json, os, sys\n"
+        "pre_main_has_xai = ('DALTON_XAI_OAUTH_CLIENT_ID' in os.environ)\n"
+        "pre_main_has_fd = ('_DALTON_ARCHIVE_CANDIDATES_FD' in os.environ)\n"
+        "pre_main_admin_token = os.environ.get('DALTON_BRIDGE_ADMIN_TOKEN')\n"
+        f"sys.path.insert(0, {str(REPO_ROOT)!r})\n"
+        "import scripts.dalton.conversation_archive as ca\n"
+        "observed = {'argv': list(sys.argv)}\n"
+        "async def _fake_resolve_model(uid):\n"
+        "    observed['during_resolve_xai_in_env'] = ('DALTON_XAI_OAUTH_CLIENT_ID' in os.environ)\n"
+        "    observed['during_resolve_fd_in_env'] = ('_DALTON_ARCHIVE_CANDIDATES_FD' in os.environ)\n"
+        "    observed['resolved_model'] = 'grok-4.7-oauth'\n"
+        "    return 'grok-4.7-oauth'\n"
+        "async def _fake_extract_cards(segment, *, extractor_model=None, **kwargs):\n"
+        "    observed['resolved_model'] = extractor_model\n"
+        "    return ca.SegmentExtractionOutcome(ok=True, model_used=str(extractor_model or ''), status='completed', cards=[])\n"
+        "ca.resolve_dalton_extract_model = _fake_resolve_model\n"
+        "ca.extract_segment_cards = _fake_extract_cards\n"
+        "rc = ca.main(['run', '--dry-run', '--skip-host-export', '--inbox-file', "
+        f"{str(inbox_file)!r}"
+        "], validate_env=True)\n"
+        "observed['rc'] = rc\n"
+        "observed['pre_main_has_xai'] = pre_main_has_xai\n"
+        "observed['pre_main_has_fd'] = pre_main_has_fd\n"
+        "observed['pre_main_admin_token'] = pre_main_admin_token\n"
+        "observed['post_xai_client_id'] = os.environ.get('DALTON_XAI_OAUTH_CLIENT_ID')\n"
+        "observed['post_admin_token'] = os.environ.get('DALTON_BRIDGE_ADMIN_TOKEN')\n"
+        "observed['post_openai_present'] = ('OPENAI_API_KEY' in os.environ)\n"
+        "observed['post_deepseek_present'] = ('DEEPSEEK_API_KEY' in os.environ)\n"
+        "observed['post_feishu_present'] = ('FEISHU_APP_SECRET' in os.environ)\n"
+        "observed['post_mcp_token_present'] = ('DALTON_BRIDGE_TOKEN' in os.environ)\n"
+        f"open({str(bridge_runner_out)!r}, 'w').write(json.dumps(observed))\n"
+        "sys.exit(rc)\n",
+        encoding="utf-8",
+    )
+
+    bridge_state_file = tmp_path / "bridge_archive_state.json"
+    bridge_state_file.write_text('{"enabled": true}\n', encoding="utf-8")
+    bridge_status_file = tmp_path / "bridge_archive_status.json"
+    bridge_log_file = tmp_path / "bridge_archive.log"
+    bridge_pid_file = tmp_path / "bridge_archive.pid"
+
+    with monkeypatch.context() as mp_bridge:
+        for k, v in _PoisonEnvDict().items():
+            mp_bridge.setenv(k, v)
+        mp_bridge.delenv("DEEPSEEK_API_KEY", raising=False)
+        mp_bridge.setenv("DALTON_XAI_OAUTH_CLIENT_ID", "caller_xai_client_id_wins")
+        mp_bridge.setenv("DALTON_REPO_ENV_FILE", str(bridge_repo_dotenv))
+        mp_bridge.setenv("DALTON_DOTENV_PATH", str(bridge_repo_dotenv))
+        mp_bridge.setenv("DALTON_BRIDGE_ENV_FILE", str(bridge_dedicated_env))
+        mp_bridge.setenv("DALTON_ARCHIVE_PID_FILE", str(bridge_pid_file))
+
+        b_cfg = rb.BridgeConfig()
+        b_cfg.env_path = bridge_dedicated_env
+        b_cfg.conversation_archive_py = bridge_runner_py
+        b_cfg.archive_state_file = bridge_state_file
+        b_cfg.archive_status_file = bridge_status_file
+        b_cfg.archive_log_file = bridge_log_file
+        b_cfg.archive_startup_probe_s = 0.05
+        bridge_inst = rb.ResearchDataBridge(b_cfg)
+        mp_bridge.setattr(bridge_inst, "_resolve_archive_python_bin", lambda: sys.executable)
+
+        recorded_pass_fds: list[tuple[int, ...]] = []
+        real_create_subproc = asyncio.create_subprocess_exec
+
+        async def _spy_create_subproc(*args: Any, **kwargs: Any) -> Any:
+            pfds = tuple(kwargs.get("pass_fds") or ())
+            recorded_pass_fds.append(pfds)
+            return await real_create_subproc(*args, **kwargs)
+
+        mp_bridge.setattr(rb.asyncio, "create_subprocess_exec", _spy_create_subproc)
+
+        code_run, body_run = await bridge_inst.handle_run_conversation_archive()
+        assert code_run == 200, body_run
+        assert body_run["ok"] is True
+        if bridge_inst._archive_watch_task is not None:
+            await asyncio.wait_for(bridge_inst._archive_watch_task, timeout=15.0)
+
+        assert len(recorded_pass_fds) == 1
+        assert len(recorded_pass_fds[0]) == 1
+        launched_rfd = recorded_pass_fds[0][0]
+        with pytest.raises(OSError):
+            os.fstat(launched_rfd)
+
+        bridge_obs = json.loads(bridge_runner_out.read_text(encoding="utf-8"))
+        assert bridge_obs["rc"] == 0
+        assert bridge_obs["pre_main_has_xai"] is False
+        assert bridge_obs["pre_main_has_fd"] is True
+        assert bridge_obs["pre_main_admin_token"] == "dedicated_bridge_admin_token_wins_999"
+        assert bridge_obs["during_resolve_xai_in_env"] is False
+        assert bridge_obs["during_resolve_fd_in_env"] is False
+        assert bridge_obs["resolved_model"] == "grok-4.7-oauth"
+        assert bridge_obs["post_xai_client_id"] == "caller_xai_client_id_wins"
+        assert bridge_obs["post_admin_token"] == "dedicated_bridge_admin_token_wins_999"
+        assert bridge_obs["post_openai_present"] is False
+        assert bridge_obs["post_deepseek_present"] is False
+        assert bridge_obs["post_feishu_present"] is False
+        assert bridge_obs["post_mcp_token_present"] is False
+
+        # Verify no candidate values appear in argv, log file, or status file
+        argv_joined = " ".join(bridge_obs["argv"])
+        log_text = bridge_log_file.read_text(encoding="utf-8") if bridge_log_file.exists() else ""
+        status_text = (
+            bridge_status_file.read_text(encoding="utf-8") if bridge_status_file.exists() else ""
+        )
+        for secret_val in (
+            "caller_xai_client_id_wins",
+            "dotenv_xai_client_id_loses",
+            "dedicated_bridge_admin_token_wins_999",
+            "older_repo_dotenv_admin_token_loses",
+            "dotenv_unselected_openai_stripped",
+        ):
+            assert secret_val not in argv_joined
+            assert secret_val not in log_text
+            assert secret_val not in status_text
+
+        # Failed launch (`OSError`) closes `candidates_rfd` in parent
+        failed_pfds: list[int] = []
+
+        async def _fail_create_subproc(*args: Any, **kwargs: Any) -> Any:
+            pfds = tuple(kwargs.get("pass_fds") or ())
+            failed_pfds.extend(pfds)
+            raise OSError("synthetic_create_subprocess_oserror")
+
+        mp_bridge.setattr(rb.asyncio, "create_subprocess_exec", _fail_create_subproc)
+        with pytest.raises(OSError, match="synthetic_create_subprocess_oserror"):
+            await bridge_inst.handle_run_conversation_archive()
+        assert len(failed_pfds) == 1
+        with pytest.raises(OSError):
+            os.fstat(failed_pfds[0])
+
+        # Cancelled launch (`asyncio.CancelledError`) closes `candidates_rfd` in parent
+        cancelled_pfds: list[int] = []
+
+        async def _cancel_create_subproc(*args: Any, **kwargs: Any) -> Any:
+            pfds = tuple(kwargs.get("pass_fds") or ())
+            cancelled_pfds.extend(pfds)
+            raise asyncio.CancelledError()
+
+        mp_bridge.setattr(rb.asyncio, "create_subprocess_exec", _cancel_create_subproc)
+        with pytest.raises(asyncio.CancelledError):
+            await bridge_inst.handle_run_conversation_archive()
+        assert len(cancelled_pfds) == 1
+        with pytest.raises(OSError):
+            os.fstat(cancelled_pfds[0])
+
+        # Oversized candidate (262144 bytes) fails nonblocking pipe write before child launch,
+        # closes descriptors, returns HTTP 500 without candidate values, and does not spawn child.
+        oversized_bridge_val = "B" * 262144
+        mp_bridge.setenv("DALTON_XAI_OAUTH_CLIENT_ID", oversized_bridge_val)
+        spawn_called_on_oversized = False
+
+        async def _unexpected_create_subproc(*args: Any, **kwargs: Any) -> Any:
+            nonlocal spawn_called_on_oversized
+            spawn_called_on_oversized = True
+            raise AssertionError("create_subprocess_exec must not be called on pipe write failure")
+
+        mp_bridge.setattr(rb.asyncio, "create_subprocess_exec", _unexpected_create_subproc)
+        code_over, body_over = await bridge_inst.handle_run_conversation_archive()
+        assert code_over == 500
+        assert body_over["ok"] is False
+        assert body_over["status"] == "error"
+        assert spawn_called_on_oversized is False
+        assert oversized_bridge_val not in json.dumps(body_over)
+        assert "BBBBBBBB" not in json.dumps(body_over)
 
 
 @pytest.mark.integration
