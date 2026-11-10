@@ -6326,7 +6326,19 @@ def test_discord_native_interactions_session_command_and_recovery_unit(channel_t
     assert alice_dm_main.json()["ok"] is True
     assert alice_dm_main.json()["is_home"] is True
 
-    # 4. Revoking Alice's write access to `ws_cn` scrubs `ws_cn` from `workspace_list` (both internal autocomplete and normal) and denies duplicate replay
+    # 4. Revoking Alice's write access to `ws_cn` scrubs `ws_cn` from `workspace_list` (both internal autocomplete and normal), denies duplicate replay, and transitions stateful no-arg `/workspace` back to Home with generation + 1 and cleared pending_interrupt
+    alice_sess_key = ("discord", guild_scope, "u-alice")
+    bob_sess_key = ("discord", guild_scope, "u-bob")
+    old_cn_ext_id = alice_text_new.json()["external_thread_id"]
+    store.session_generations[alice_sess_key]["pending_interrupt"] = {
+        "generation": 3,
+        "thread_id": str(uuid4()),
+        "run_id": "run-alice-cn-hitl",
+        "action_requests": [{"name": "bash"}],
+    }
+    bob_gen_before_revoke = store.session_generations[bob_sess_key]["generation"]
+    thread_gen_before_revoke = store.session_generations[("discord", thread_scope, "u-alice")]["generation"]
+
     channel_test_env["writable_by_user"]["u-alice"] = {ws_macro: "全球宏观对冲"}
     auto_after_revoke = client.post(
         "/api/v1/dalton/channels/internal/session/command",
@@ -6347,6 +6359,10 @@ def test_discord_native_interactions_session_command_and_recovery_unit(channel_t
     assert [w["name"] for w in auto_after_revoke.json()["workspaces"]] == ["全球宏观对冲"]
     assert auto_after_revoke.json()["is_home"] is True
     assert auto_after_revoke.json()["current_workspace_name"] == "Chief of Staff"
+    # Read-only autocomplete (`is_internal_query=True` without `message_id`) must NOT mutate the stored session row
+    assert store.session_generations[alice_sess_key]["generation"] == 3
+    assert store.session_generations[alice_sess_key]["override_workspace_id"] == ws_cn
+    assert store.session_generations[alice_sess_key]["pending_interrupt"] is not None
 
     dup_after_revoke = client.post(
         "/api/v1/dalton/channels/internal/session/command",
@@ -6372,6 +6388,145 @@ def test_discord_native_interactions_session_command_and_recovery_unit(channel_t
     assert dup_after_revoke.json()["allowed"] is False
     assert dup_after_revoke.json()["deny_reason"] == "workspace_write_denied"
     assert dup_after_revoke.json().get("workspace_name") is None
+    assert store.session_generations[alice_sess_key]["generation"] == 3
+    assert store.session_generations[alice_sess_key]["override_workspace_id"] == ws_cn
+    assert store.session_generations[alice_sess_key]["pending_interrupt"] is not None
+
+    # Stateful no-arg `/workspace` (`cmd="workspace_list"`) after `ws_cn` revocation returns Home, increments generation once (3 -> 4), clears override_workspace_id, and clears pending_interrupt
+    list_revoke_mid = "inter_alice_list_after_revoke"
+    list_revoke_rkey = str(uuid5(DALTON_CHANNEL_NAMESPACE, f"discord:{list_revoke_mid}"))
+    list_after_revoke = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_list",
+            "platform": "discord",
+            "platform_user_id": "dc_alice",
+            "chat_type": "group",
+            "chat_address": guild_addr,
+            "chat_id": guild_chat_id,
+            "scope_key": guild_scope,
+            "message_id": list_revoke_mid,
+            "request_key": list_revoke_rkey,
+            "native_interaction": True,
+            "native_ack_status": "acknowledged",
+        },
+    )
+    assert list_after_revoke.status_code == 200
+    list_revoke_body = list_after_revoke.json()
+    assert list_revoke_body["ok"] is True
+    assert list_revoke_body["is_home"] is True
+    assert list_revoke_body["current_workspace_id"] == str(get_home_workspace_id("u-alice"))
+    assert list_revoke_body["current_workspace_name"] == "Chief of Staff"
+    assert list_revoke_body["generation"] == 4
+    new_home_ext_id = list_revoke_body["external_thread_id"]
+    assert new_home_ext_id != old_cn_ext_id
+    assert store.session_generations[alice_sess_key]["generation"] == 4
+    assert store.session_generations[alice_sess_key]["override_workspace_id"] is None
+    assert store.session_generations[alice_sess_key]["pending_interrupt"] is None
+
+    # Replaying the same interaction, running another no-arg `/workspace`, or running `/main` in Home must NOT increment generation again or restore pending_interrupt
+    list_revoke_dup = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_list",
+            "platform": "discord",
+            "platform_user_id": "dc_alice",
+            "chat_type": "group",
+            "chat_address": guild_addr,
+            "chat_id": guild_chat_id,
+            "scope_key": guild_scope,
+            "message_id": list_revoke_mid,
+            "request_key": list_revoke_rkey,
+            "native_interaction": True,
+            "native_ack_status": "acknowledged",
+        },
+    )
+    assert list_revoke_dup.status_code == 200
+    assert list_revoke_dup.json()["duplicate"] is True
+    assert list_revoke_dup.json()["generation"] == 4
+    assert store.session_generations[alice_sess_key]["generation"] == 4
+    assert store.session_generations[alice_sess_key]["pending_interrupt"] is None
+
+    list_again_mid = "inter_alice_list_again_in_home"
+    list_again_res = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_list",
+            "platform": "discord",
+            "platform_user_id": "dc_alice",
+            "chat_type": "group",
+            "chat_address": guild_addr,
+            "chat_id": guild_chat_id,
+            "scope_key": guild_scope,
+            "message_id": list_again_mid,
+            "request_key": str(uuid5(DALTON_CHANNEL_NAMESPACE, f"discord:{list_again_mid}")),
+            "native_interaction": True,
+            "native_ack_status": "acknowledged",
+        },
+    )
+    assert list_again_res.status_code == 200
+    assert list_again_res.json()["is_home"] is True
+    assert list_again_res.json()["generation"] == 4
+    assert store.session_generations[alice_sess_key]["generation"] == 4
+    assert store.session_generations[alice_sess_key]["pending_interrupt"] is None
+
+    main_in_home_mid = "inter_alice_main_in_home"
+    main_in_home_res = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_switch",
+            "platform": "discord",
+            "platform_user_id": "dc_alice",
+            "chat_type": "group",
+            "chat_address": guild_addr,
+            "chat_id": guild_chat_id,
+            "scope_key": guild_scope,
+            "message_id": main_in_home_mid,
+            "request_key": str(uuid5(DALTON_CHANNEL_NAMESPACE, f"discord:{main_in_home_mid}")),
+            "target_kind": "home",
+            "workspace_query": "home",
+            "native_interaction": True,
+            "native_ack_status": "acknowledged",
+        },
+    )
+    assert main_in_home_res.status_code == 200
+    assert main_in_home_res.json()["is_home"] is True
+    assert main_in_home_res.json()["generation"] == 4
+    assert store.session_generations[alice_sess_key]["generation"] == 4
+    assert store.session_generations[alice_sess_key]["pending_interrupt"] is None
+
+    # Subsequent normal inbound message resolves to Home with generation 4, new external_thread_id, and no pending_interrupt
+    msg_after_revoke_mid = "msg_alice_home_after_revoke_1"
+    msg_after_revoke = client.post(
+        "/api/v1/dalton/channels/internal/inbound/register-and-resolve",
+        headers=headers,
+        json={
+            "platform": "discord",
+            "platform_user_id": "dc_alice",
+            "chat_type": "group",
+            "chat_address": guild_addr,
+            "thread_scope_key": guild_scope,
+            "message_id": msg_after_revoke_mid,
+            "request_key": str(uuid5(DALTON_CHANNEL_NAMESPACE, f"discord:{msg_after_revoke_mid}")),
+            "raw_payload": {"content": "hello home"},
+        },
+    )
+    assert msg_after_revoke.status_code == 200
+    msg_after_body = msg_after_revoke.json()
+    assert msg_after_body["allowed"] is True
+    assert msg_after_body["workspace_id"] == str(get_home_workspace_id("u-alice"))
+    assert msg_after_body["generation"] == 4
+    assert msg_after_body["external_thread_id"] == new_home_ext_id
+    assert msg_after_body.get("pending_interrupt") is None
+
+    # Other user (`dc_bob`) and other scope (`thread_scope`) remain unchanged
+    assert store.session_generations[bob_sess_key]["generation"] == bob_gen_before_revoke
+    assert store.session_generations[bob_sess_key]["override_workspace_id"] == ws_macro
+    assert store.session_generations[("discord", thread_scope, "u-alice")]["generation"] == thread_gen_before_revoke
 
     # 4b. `workspace_ambiguous` candidate visibility re-filtering on replay (revoke one vs revoke all) without auto-selecting
     ws_amb_1 = str(uuid4())
@@ -6772,9 +6927,14 @@ async def test_discord_native_interactions_real_postgres_concurrency_and_state(
     home_wid = str(get_home_workspace_id(alice_uid))
     active_tid = str(uuid4())
     active_rid = str(uuid4())
+    macro_thread_id = str(uuid4())
+    home_thread_id = str(uuid4())
     guild_chat_id = f"932170193180958741/14812560{prefix}"
     guild_addr = f"discord:{guild_chat_id}"
     guild_scope = f"chat:{guild_chat_id}"
+    revoke_chat_id = f"932170193180958741/14812569{prefix}"
+    revoke_addr = f"discord:{revoke_chat_id}"
+    revoke_scope = f"chat:{revoke_chat_id}"
 
     try:
         @asynccontextmanager
@@ -7433,6 +7593,361 @@ async def test_discord_native_interactions_real_postgres_concurrency_and_state(
         rec_after = await cg_db.recover_channel_state(mode="startup")
         assert stop_mid not in {r["message_id"] for r in rec_after["inbound_events"]}
 
+        # 7b. Deterministic 8-step colleague workspace revocation -> no-arg `/workspace` Home transition in isolated scope
+        from psycopg.types.json import Jsonb as PgJsonb
+        from src.server.database.conversation import lookup_thread_by_external_id
+
+        # Restore `ws_macro` sharing to writable (`rw`) for step 1, and establish Bob's session in `revoke_scope` for operator isolation checks
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE dalton_workspace_sharing
+                    SET web_access = 'rw', cos_access = 'rw', updated_at = NOW()
+                    WHERE workspace_id = %s
+                    """,
+                    (ws_macro,),
+                )
+
+        bob_iso_mid = f"inter_pg_bob_iso_{prefix}"
+        bob_iso_res = await cg_db.execute_session_command(
+            cmd="workspace_switch",
+            platform="discord",
+            platform_user_id=bob_puid,
+            chat_type="group",
+            chat_address=revoke_addr,
+            chat_id=revoke_chat_id,
+            scope_key=revoke_scope,
+            message_id=bob_iso_mid,
+            request_key=str(uuid5(DALTON_CHANNEL_NAMESPACE, f"discord:{bob_iso_mid}")),
+            target_kind="workspace_id",
+            workspace_id=ws_macro,
+            workspace_query=ws_macro,
+            native_interaction=True,
+            native_ack_status="acknowledged",
+        )
+        assert bob_iso_res["ok"] is True
+
+        # Step 1: Alice selects Bob's writable workspace `ws_macro` via real `execute_session_command`; save generation G and old external ID
+        step1_mid = f"inter_pg_step1_sw_macro_{prefix}"
+        step1_res = await cg_db.execute_session_command(
+            cmd="workspace_switch",
+            platform="discord",
+            platform_user_id=alice_puid,
+            chat_type="group",
+            chat_address=revoke_addr,
+            chat_id=revoke_chat_id,
+            scope_key=revoke_scope,
+            message_id=step1_mid,
+            request_key=str(uuid5(DALTON_CHANNEL_NAMESPACE, f"discord:{step1_mid}")),
+            target_kind="workspace_id",
+            workspace_id=ws_macro,
+            workspace_query=ws_macro,
+            native_interaction=True,
+            native_ack_status="acknowledged",
+        )
+        assert step1_res["ok"] is True
+        assert step1_res["is_home"] is False
+        assert step1_res["workspace_id"] == ws_macro
+        gen_g = int(step1_res["generation"])
+        old_macro_ext_id = str(step1_res["external_thread_id"])
+
+        # Step 2: Create Alice-owned real `conversation_threads` row in `ws_macro` with `old_macro_ext_id`, ensure Home workspace row exists, and write synthetic `pending_interrupt` for generation G with DB-fixed recent activity (< 6h)
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO workspaces (workspace_id, user_id, name, status)
+                    VALUES (%s, %s, 'Chief of Staff', 'running')
+                    ON CONFLICT (workspace_id) DO NOTHING
+                    """,
+                    (home_wid, alice_uid),
+                )
+                await cur.execute(
+                    """
+                    INSERT INTO conversation_threads (
+                        conversation_thread_id, workspace_id, user_id, msg_type,
+                        current_status, thread_index, external_id, platform
+                    )
+                    VALUES (%s, %s, %s, 'ptc', 'completed', 1, %s, 'discord')
+                    """,
+                    (macro_thread_id, ws_macro, alice_uid, old_macro_ext_id),
+                )
+                await cur.execute(
+                    """
+                    UPDATE dalton_channel_session_generations
+                    SET pending_interrupt = %s,
+                        last_conversation_activity_at = clock_timestamp() - INTERVAL '30 minutes'
+                    WHERE platform = 'discord' AND scope_key = %s AND dalton_user_id = %s
+                    """,
+                    (
+                        PgJsonb(
+                            {
+                                "generation": gen_g,
+                                "thread_id": macro_thread_id,
+                                "run_id": f"run_macro_hitl_{prefix}",
+                                "action_requests": [{"name": "bash"}],
+                            }
+                        ),
+                        revoke_scope,
+                        alice_uid,
+                    ),
+                )
+                await cur.execute(
+                    """
+                    SELECT generation, override_workspace_id, pending_interrupt,
+                           last_conversation_activity_at, updated_at
+                    FROM dalton_channel_session_generations
+                    WHERE platform = 'discord' AND scope_key = %s AND dalton_user_id = %s
+                    """,
+                    (revoke_scope, alice_uid),
+                )
+                session_before_step4 = dict(await cur.fetchone())
+                await cur.execute(
+                    """
+                    SELECT generation, override_workspace_id, pending_interrupt
+                    FROM dalton_channel_session_generations
+                    WHERE platform = 'discord' AND scope_key = %s AND dalton_user_id = %s
+                    """,
+                    (guild_scope, alice_uid),
+                )
+                alice_other_scope_before = dict(await cur.fetchone())
+                await cur.execute(
+                    """
+                    SELECT generation, override_workspace_id, pending_interrupt
+                    FROM dalton_channel_session_generations
+                    WHERE platform = 'discord' AND scope_key = %s AND dalton_user_id = %s
+                    """,
+                    (revoke_scope, bob_uid),
+                )
+                bob_same_scope_before = dict(await cur.fetchone())
+
+        # Step 3: Revoke write access on `ws_macro` (`web_access = 'hidden'`, `cos_access = 'hidden'`)
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE dalton_workspace_sharing
+                    SET web_access = 'hidden', cos_access = 'hidden', updated_at = NOW()
+                    WHERE workspace_id = %s
+                    """,
+                    (ws_macro,),
+                )
+
+        # Step 4: Run read-only `workspace_list` (`is_internal_query=True`, omitted `message_id`) and verify session row is untouched
+        step4_auto = await cg_db.execute_session_command(
+            cmd="workspace_list",
+            platform="discord",
+            platform_user_id=alice_puid,
+            chat_type="group",
+            chat_address=revoke_addr,
+            chat_id=revoke_chat_id,
+            scope_key=revoke_scope,
+            is_internal_query=True,
+            native_interaction=True,
+        )
+        assert step4_auto["ok"] is True
+        assert step4_auto["is_home"] is True
+        assert step4_auto["current_workspace_id"] == home_wid
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT generation, override_workspace_id, pending_interrupt,
+                           last_conversation_activity_at, updated_at
+                    FROM dalton_channel_session_generations
+                    WHERE platform = 'discord' AND scope_key = %s AND dalton_user_id = %s
+                    """,
+                    (revoke_scope, alice_uid),
+                )
+                session_after_step4 = dict(await cur.fetchone())
+                assert session_after_step4["generation"] == gen_g
+                assert str(session_after_step4["override_workspace_id"]) == ws_macro
+                assert session_after_step4["pending_interrupt"] == session_before_step4["pending_interrupt"]
+                assert session_after_step4["last_conversation_activity_at"] == session_before_step4["last_conversation_activity_at"]
+                assert session_after_step4["updated_at"] == session_before_step4["updated_at"]
+
+        # Step 5: Execute acknowledged native no-arg `/workspace` (`cmd='workspace_list'`); assert Home return, DB override=NULL, pending_interrupt=NULL, generation=G+1, and new external ID != old external ID
+        step5_mid = f"inter_pg_step5_ws_list_{prefix}"
+        step5_rkey = str(uuid5(DALTON_CHANNEL_NAMESPACE, f"discord:{step5_mid}"))
+        step5_res = await cg_db.execute_session_command(
+            cmd="workspace_list",
+            platform="discord",
+            platform_user_id=alice_puid,
+            chat_type="group",
+            chat_address=revoke_addr,
+            chat_id=revoke_chat_id,
+            scope_key=revoke_scope,
+            message_id=step5_mid,
+            request_key=step5_rkey,
+            native_interaction=True,
+            native_ack_status="acknowledged",
+        )
+        assert step5_res["ok"] is True
+        assert step5_res["is_home"] is True
+        assert step5_res["current_workspace_id"] == home_wid
+        assert step5_res["current_workspace_name"] == "Chief of Staff"
+        assert step5_res["generation"] == gen_g + 1
+        new_home_ext_id = str(step5_res["external_thread_id"])
+        assert new_home_ext_id != old_macro_ext_id
+
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT generation, override_workspace_id, pending_interrupt
+                    FROM dalton_channel_session_generations
+                    WHERE platform = 'discord' AND scope_key = %s AND dalton_user_id = %s
+                    """,
+                    (revoke_scope, alice_uid),
+                )
+                session_after_step5 = dict(await cur.fetchone())
+                assert session_after_step5["generation"] == gen_g + 1
+                assert session_after_step5["override_workspace_id"] is None
+                assert session_after_step5["pending_interrupt"] is None
+
+        # Step 6: Call real `register_and_resolve_inbound` for a new normal message; assert allowed into Home, generation=G+1, external_thread_id=new_home_ext_id, pending_interrupt=None
+        step6_msg_id = f"msg_pg_step6_normal_{prefix}"
+        step6_inbound = await cg_db.register_and_resolve_inbound(
+            platform="discord",
+            platform_user_id=alice_puid,
+            chat_type="group",
+            chat_address=revoke_addr,
+            thread_scope_key=revoke_scope,
+            message_id=step6_msg_id,
+            request_key=str(uuid5(DALTON_CHANNEL_NAMESPACE, f"discord:{step6_msg_id}")),
+            raw_payload={"content": "hello after revoke"},
+        )
+        assert step6_inbound["allowed"] is True
+        assert str(step6_inbound["workspace_id"]) == home_wid
+        assert step6_inbound["generation"] == gen_g + 1
+        assert step6_inbound["external_thread_id"] == new_home_ext_id
+        assert step6_inbound["pending_interrupt"] is None
+
+        # Step 7: Verify `lookup_thread_by_external_id(platform, external_id, user_id)` isolation between old colleague thread and new Home external ID
+        assert (
+            await lookup_thread_by_external_id("discord", old_macro_ext_id, alice_uid)
+            == macro_thread_id
+        )
+        assert (
+            await lookup_thread_by_external_id("discord", new_home_ext_id, alice_uid)
+            is None
+        )
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO conversation_threads (
+                        conversation_thread_id, workspace_id, user_id, msg_type,
+                        current_status, thread_index, external_id, platform
+                    )
+                    VALUES (%s, %s, %s, 'ptc', 'completed', 2, %s, 'discord')
+                    """,
+                    (home_thread_id, home_wid, alice_uid, new_home_ext_id),
+                )
+        assert (
+            await lookup_thread_by_external_id("discord", new_home_ext_id, alice_uid)
+            == home_thread_id
+        )
+        assert (
+            await lookup_thread_by_external_id("discord", old_macro_ext_id, alice_uid)
+            == macro_thread_id
+        )
+
+        # Step 8: Replay step 5 interaction, then run a new no-arg `/workspace`, then run `/main` (`cmd='workspace_switch', target_kind='home'`); verify generation stays G+1, pending_interrupt stays NULL, and other user/scope remain unchanged
+        step8_replay = await cg_db.execute_session_command(
+            cmd="workspace_list",
+            platform="discord",
+            platform_user_id=alice_puid,
+            chat_type="group",
+            chat_address=revoke_addr,
+            chat_id=revoke_chat_id,
+            scope_key=revoke_scope,
+            message_id=step5_mid,
+            request_key=step5_rkey,
+            native_interaction=True,
+            native_ack_status="acknowledged",
+        )
+        assert step8_replay["duplicate"] is True
+        assert step8_replay["generation"] == gen_g + 1
+
+        step8_list_mid = f"inter_pg_step8_ws_list_{prefix}"
+        step8_list = await cg_db.execute_session_command(
+            cmd="workspace_list",
+            platform="discord",
+            platform_user_id=alice_puid,
+            chat_type="group",
+            chat_address=revoke_addr,
+            chat_id=revoke_chat_id,
+            scope_key=revoke_scope,
+            message_id=step8_list_mid,
+            request_key=str(
+                uuid5(DALTON_CHANNEL_NAMESPACE, f"discord:{step8_list_mid}")
+            ),
+            native_interaction=True,
+            native_ack_status="acknowledged",
+        )
+        assert step8_list["ok"] is True
+        assert step8_list["is_home"] is True
+        assert step8_list["generation"] == gen_g + 1
+
+        step8_main_mid = f"inter_pg_step8_main_{prefix}"
+        step8_main = await cg_db.execute_session_command(
+            cmd="workspace_switch",
+            platform="discord",
+            platform_user_id=alice_puid,
+            chat_type="group",
+            chat_address=revoke_addr,
+            chat_id=revoke_chat_id,
+            scope_key=revoke_scope,
+            message_id=step8_main_mid,
+            request_key=str(
+                uuid5(DALTON_CHANNEL_NAMESPACE, f"discord:{step8_main_mid}")
+            ),
+            target_kind="home",
+            workspace_query="home",
+            native_interaction=True,
+            native_ack_status="acknowledged",
+        )
+        assert step8_main["ok"] is True
+        assert step8_main["is_home"] is True
+        assert step8_main["generation"] == gen_g + 1
+
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT generation, override_workspace_id, pending_interrupt
+                    FROM dalton_channel_session_generations
+                    WHERE platform = 'discord' AND scope_key = %s AND dalton_user_id = %s
+                    """,
+                    (revoke_scope, alice_uid),
+                )
+                session_after_step8 = dict(await cur.fetchone())
+                assert session_after_step8["generation"] == gen_g + 1
+                assert session_after_step8["override_workspace_id"] is None
+                assert session_after_step8["pending_interrupt"] is None
+
+                await cur.execute(
+                    """
+                    SELECT generation, override_workspace_id, pending_interrupt
+                    FROM dalton_channel_session_generations
+                    WHERE platform = 'discord' AND scope_key = %s AND dalton_user_id = %s
+                    """,
+                    (guild_scope, alice_uid),
+                )
+                assert dict(await cur.fetchone()) == alice_other_scope_before
+
+                await cur.execute(
+                    """
+                    SELECT generation, override_workspace_id, pending_interrupt
+                    FROM dalton_channel_session_generations
+                    WHERE platform = 'discord' AND scope_key = %s AND dalton_user_id = %s
+                    """,
+                    (revoke_scope, bob_uid),
+                )
+                assert dict(await cur.fetchone()) == bob_same_scope_before
+
         # 8. Verify complete absence of interaction/bot tokens across all PostgreSQL rows
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
@@ -7488,12 +8003,12 @@ async def test_discord_native_interactions_real_postgres_concurrency_and_state(
                         (alice_uid, bob_uid, ext_uid),
                     )
                     await cur.execute(
-                        "DELETE FROM conversation_responses WHERE conversation_thread_id = %s",
-                        (active_tid,),
+                        "DELETE FROM conversation_responses WHERE conversation_thread_id IN (%s, %s, %s)",
+                        (active_tid, macro_thread_id, home_thread_id),
                     )
                     await cur.execute(
-                        "DELETE FROM conversation_threads WHERE conversation_thread_id = %s",
-                        (active_tid,),
+                        "DELETE FROM conversation_threads WHERE conversation_thread_id IN (%s, %s, %s)",
+                        (active_tid, macro_thread_id, home_thread_id),
                     )
                     await cur.execute(
                         "DELETE FROM dalton_workspace_sharing WHERE workspace_id IN (%s, %s, %s, %s)",

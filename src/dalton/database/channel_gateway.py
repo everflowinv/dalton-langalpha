@@ -2660,6 +2660,8 @@ async def _execute_session_command_once(
                             )
                             if not ok or w_row is None:
                                 override_ws_id = None
+                                generation += 1
+                                pending_interrupt = None
                                 current_ws_name = CHIEF_OF_STAFF_DISPLAY_NAME
                             else:
                                 current_ws_name = (
