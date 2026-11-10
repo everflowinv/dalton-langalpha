@@ -7578,11 +7578,17 @@ export class ChannelGatewayOrchestrator {
         sourceScopeKey: row.thread_scope_key,
         activityOrigin: "none",
       });
+      // Only sent or partial confirms the notice. denied, unknown, and
+      // in_flight do not. Leave dispatched or streaming, and the existing
+      // fallback_pending flag, so the next recovery uses this same key.
+      if (!endedNoticeOk) {
+        return;
+      }
       await this.backend.updateInboundProgress({
         platform: row.platform,
         message_id: row.message_id,
         status: "failed",
-        fallback_pending: !endedNoticeOk,
+        fallback_pending: false,
       });
       return;
     }

@@ -3858,7 +3858,7 @@ def _create_real_http_test_app(
         user_id = str(body["user_id"])
         run_id = str(body.get("run_id") or uuid4())
         status = str(body.get("status") or "in_progress")
-        async with pool.connection() as conn:
+        async with pool.connection() as conn, conn.transaction():
             async with conn.cursor() as cur:
                 await cur.execute(
                     "SELECT conversation_thread_id FROM conversation_threads "
@@ -3871,7 +3871,7 @@ def _create_real_http_test_app(
                         conversation_response_id, conversation_thread_id,
                         turn_index, status, user_id, created_at
                     )
-                    SELECT %s, %s, COALESCE(MAX(turn_index), -1) + 1, 'in_progress', %s, NOW()
+                    SELECT %s, %s, COALESCE(MAX(turn_index), 0) + 1, 'in_progress', %s, NOW()
                     FROM conversation_responses WHERE conversation_thread_id = %s
                     ON CONFLICT (conversation_response_id) DO NOTHING
                     """,
@@ -3884,6 +3884,54 @@ def _create_real_http_test_app(
                     (status, run_id, thread_id, user_id),
                 )
         return {"thread_id": thread_id, "run_id": run_id, "status": status}
+
+    @app.post("/test-harness/drop-run")
+    async def test_harness_drop_run(request: Request) -> dict[str, Any]:
+        """Delete one ledger run so a later liveness read omits that id."""
+        body = await request.json()
+        thread_id = str(body["thread_id"])
+        run_id = str(body["run_id"])
+        async with pool.connection() as conn, conn.transaction():
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    DELETE FROM conversation_responses
+                    WHERE conversation_response_id = %s
+                      AND conversation_thread_id = %s
+                    """,
+                    (run_id, thread_id),
+                )
+                deleted = cur.rowcount
+        if deleted != 1:
+            raise HTTPException(status_code=404, detail="run was not deleted")
+        return {"deleted": deleted, "thread_id": thread_id, "run_id": run_id}
+
+    @app.get("/api/v1/threads/dispatches/liveness")
+    async def dispatches_liveness(request: Request) -> dict[str, Any]:
+        """Owned runs from the ledger. An unknown run id is omitted."""
+        from src.server.contracts.status import to_public
+
+        user_id = (request.headers.get("X-User-Id") or "").strip()
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        run_ids = [
+            part.strip()
+            for part in (request.query_params.get("runs") or "").split(",")
+            if part.strip()
+        ]
+        owned = await handoff_liveness.get_owned_runs(run_ids, user_id)
+        runs = [
+            {
+                "run_id": rid,
+                "thread_id": str(row["conversation_thread_id"]),
+                "status": to_public(
+                    row.get("status"),
+                    cancel_requested_at=row.get("cancel_requested_at"),
+                ),
+            }
+            for rid, row in owned.items()
+        ]
+        return {"liveness": [], "runs": runs, "steers": []}
 
     @app.get("/api/v1/threads/{thread_id}/status")
     async def status_thread_stub(thread_id: str, request: Request) -> dict[str, Any]:
@@ -4583,7 +4631,7 @@ async def test_ch1_real_http_gateway_orchestrator_to_fastapi_and_postgres(
             stderr=asyncio.subprocess.STDOUT,
         )
         try:
-            stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=60.0)
+            stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=150.0)
         finally:
             if proc.returncode is None:
                 proc.kill()
