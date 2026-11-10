@@ -301,6 +301,15 @@ export class DeliveryService {
     for (let i = 0; i < chunks.length; i++) {
       const chunkText = chunks[i]!;
       try {
+        const weixinContextToken =
+          platformStr === "weixin"
+            ? await this.resolveLatestWeixinContextToken({
+                recipientPlatformUserId,
+                inboundMessageId: options.inboundMessageId ?? null,
+                claimedToken: claim.weixin_context_token ?? null,
+              })
+            : (claim.weixin_context_token ?? null);
+
         const creatingDiscordThread =
           i === 0 &&
           platformStr === "discord" &&
@@ -319,6 +328,8 @@ export class DeliveryService {
           newThread: i === 0 ? Boolean(options.newThread) && !reuseConfirmedThread : false,
           threadScopeKey: effectiveThreadScopeKey,
           deliveryKey: options.deliveryKey,
+          weixinContextToken,
+          inboundMessageId: options.inboundMessageId ?? null,
           confirmedThreadAddress:
             i === 0 && reuseConfirmedThread ? confirmedThreadAddress : null,
           onConfirmedThread: creatingDiscordThread
@@ -335,7 +346,6 @@ export class DeliveryService {
                 );
               }
             : undefined,
-          weixinContextToken: claim.weixin_context_token ?? null,
         });
         sentChunks += 1;
         platformMessageIds.push(res.messageId);
@@ -425,6 +435,15 @@ export class DeliveryService {
         totalDownloadedBytes += byteLen;
 
         try {
+          const weixinContextToken =
+            platformStr === "weixin"
+              ? await this.resolveLatestWeixinContextToken({
+                  recipientPlatformUserId,
+                  inboundMessageId: options.inboundMessageId ?? null,
+                  claimedToken: claim.weixin_context_token ?? null,
+                })
+              : (claim.weixin_context_token ?? null);
+
           const sendRes = await adapter.sendFile({
             targetAddress: finalAddress,
             recipientPlatformUserId,
@@ -433,7 +452,8 @@ export class DeliveryService {
             content: downloaded.content,
             mimeType: downloaded.mimeType,
             threadScopeKey: effectiveThreadScopeKey,
-            weixinContextToken: claim.weixin_context_token ?? null,
+            weixinContextToken,
+            inboundMessageId: options.inboundMessageId ?? null,
           });
           const fileSucceeded =
             sendRes.status === "sent" || sendRes.status === "linked";
@@ -542,6 +562,58 @@ export class DeliveryService {
     });
 
     return responseObj;
+  }
+
+  private async resolveLatestWeixinContextToken(params: {
+    recipientPlatformUserId: string | null;
+    inboundMessageId: string | null;
+    claimedToken: string | null;
+  }): Promise<string> {
+    if (params.recipientPlatformUserId || params.inboundMessageId) {
+      try {
+        const wxState = await this.backend.getWeixinState({
+          include_token: false,
+          recipient_platform_user_id: params.recipientPlatformUserId,
+          inbound_message_id: params.inboundMessageId,
+        });
+        if (wxState.status === "expired") {
+          throw new ChannelDeliveryError(
+            "Weixin bot session has expired (-14); please re-scan QR code in settings.",
+            {
+              outcome: "failed",
+              code: "unavailable",
+            },
+          );
+        }
+        if (wxState.weixin_context_token && wxState.weixin_context_token.trim().length > 0) {
+          return wxState.weixin_context_token.trim();
+        }
+        if (wxState.configured && wxState.weixin_context_token === null) {
+          throw new ChannelDeliveryError(
+            "Missing active Weixin context_token for recipient",
+            {
+              outcome: "failed",
+              code: "unavailable",
+            },
+          );
+        }
+      } catch (err) {
+        if (err instanceof ChannelDeliveryError) {
+          throw err;
+        }
+      }
+    }
+    const fallback = (params.claimedToken ?? "").trim();
+    if (!fallback) {
+      throw new ChannelDeliveryError(
+        "Missing active Weixin context_token for recipient",
+        {
+          outcome: "failed",
+          code: "unavailable",
+        },
+      );
+    }
+    return fallback;
   }
 
   /**

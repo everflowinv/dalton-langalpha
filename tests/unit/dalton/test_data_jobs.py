@@ -7228,6 +7228,9 @@ async def test_pr12_bridge_handle_notify_feishu_cards_and_image_path_validation(
     (cfg.openclaw_workspace / "scripts").mkdir(parents=True, exist_ok=True)
     send_script = cfg.openclaw_workspace / "scripts" / "feishu_send_card.py"
     send_script.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    cfg.feishu_app_id = "cli_synth_pr12_app_id"
+    cfg.feishu_app_secret = "sec_synth_pr12_app_secret"
+    cfg.feishu_default_grant_chat_id = "oc_synth_pr12_grant_chat"
 
     bridge = bridge_mod.ResearchDataBridge(cfg)
 
@@ -7255,10 +7258,19 @@ async def test_pr12_bridge_handle_notify_feishu_cards_and_image_path_validation(
         receive_id_type: str = "open_id",
         timeout_s: float = 30.0,
         dry_run: bool = False,
+        feishu_app_id: str = "",
+        feishu_app_secret: str = "",
+        feishu_default_grant_chat_id: str = "",
     ) -> dict[str, Any]:
         _ = (script_path, receive_id_type, timeout_s, dry_run)
         captured_cards.append(
-            {"chat_id": receive_id, "card": json.loads(json.dumps(card))}
+            {
+                "chat_id": receive_id,
+                "card": json.loads(json.dumps(card)),
+                "feishu_app_id": feishu_app_id,
+                "feishu_app_secret": feishu_app_secret,
+                "feishu_default_grant_chat_id": feishu_default_grant_chat_id,
+            }
         )
         return {"ok": True, "exit_code": 0}
 
@@ -7299,6 +7311,12 @@ async def test_pr12_bridge_handle_notify_feishu_cards_and_image_path_validation(
     assert resp_ok["ok"] is True
     assert len(captured_cards) == 1
     assert captured_cards[0]["chat_id"] == "oc_target_1"
+    assert captured_cards[0]["feishu_app_id"] == "cli_synth_pr12_app_id"
+    assert captured_cards[0]["feishu_app_secret"] == "sec_synth_pr12_app_secret"
+    assert (
+        captured_cards[0]["feishu_default_grant_chat_id"]
+        == "oc_synth_pr12_grant_chat"
+    )
     rewritten_img_el = captured_cards[0]["card"]["body"]["elements"][1]
     assert rewritten_img_el["tag"] == "__img__"
     assert rewritten_img_el["path"] == str(valid_img.resolve())

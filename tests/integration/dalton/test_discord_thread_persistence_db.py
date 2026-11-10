@@ -1603,4 +1603,4 @@ async def test_current_attempt_finishes_after_startup_recovery_over_http(
 
 
 if __name__ == "__main__" and "--serve-http-harness" in sys.argv:
-    asyncio.run(serve_discord_http_harness(dalton_revision="d036"))
+    asyncio.run(serve_discord_http_harness(dalton_revision="head"))
