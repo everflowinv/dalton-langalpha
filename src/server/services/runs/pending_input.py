@@ -331,6 +331,7 @@ async def input_rerun_request(
         messages=[{"role": "user", "content": query["content"]}],
         **_stored_turn_fields(query),
         checkpoint_id=pending.checkpoint_id,
+        # DALTON-HOOK(chat-large-upload): pass recovered chat_upload context into retried request
         additional_context=resolved_context,
         locale=run_meta.get("locale"),
         timezone=run_meta.get("timezone"),

@@ -82,12 +82,13 @@ function dropLiveCopy(
   pairIndex: number,
   insertIndex: number,
 ): { rest: MessageRecord[]; removedAbove: number } {
-  // DALTON-HOOK(chat-large-upload): skip unadmitted sends when matching live copies of empty/file-only turns
+  // DALTON-HOOK(chat-large-upload): skip unadmitted attachment sends when matching live copies of empty/file-only turns
   let opener = -1;
   for (let i = prev.length - 1; i >= 0; i--) {
     const m = prev[i];
     if (
-      m.role === 'user' && !m.isHistory && !m.queued && !m.unadmitted && opensTurn(m)
+      m.role === 'user' && !m.isHistory && !m.queued && opensTurn(m)
+      && !(m.unadmitted && Array.isArray(m.attachments) && m.attachments.length > 0)
       && m.turnIndex === pairIndex && String(m.content ?? '').trim() === content
     ) {
       opener = i;

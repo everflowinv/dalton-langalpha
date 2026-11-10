@@ -339,6 +339,7 @@ export type WorkflowStatusResponse = Partial<ThreadReportBackStatus> & {
   // The user's steers an errored turn left queued, oldest first: the next
   // turn on the thread reads them. Absent on older backends.
   pending_steers?: HeldSteer[];
+  // DALTON-HOOK(chat-large-upload): durable failed_steers exposed on workflow status response
   // Permanently failed steers (e.g. revoked or deleted attachment on a parked steer).
   failed_steers?: Record<string, unknown>[];
   [key: string]: unknown;

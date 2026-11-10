@@ -1009,6 +1009,7 @@ async def _prime_dispatch(
         request.origin_dispatch_gen,
         request.request_key,
     ) as rb_claim:
+        # DALTON-HOOK(chat-large-upload): release pre-START upload claims when report-back claim exits early
         if rb_claim.incumbent is not None:
             await _release_prestart_uploads()
             await scope.release_slot()
@@ -1042,6 +1043,7 @@ async def _prime_dispatch(
                 ),
             )
         if rb_claim.in_flight:
+            # DALTON-HOOK(chat-large-upload): release pre-START upload claims on deferring or refused dispatch
             await _release_prestart_uploads()
             await scope.release_slot()
             logger.info(
@@ -1072,6 +1074,7 @@ async def _prime_dispatch(
         if gated_gen:
             admitted = await reserve.admit_dispatch_gen(thread_id, gated_gen, run_id)
             if not admitted:
+                # DALTON-HOOK(chat-large-upload): release pre-START upload claims when dispatch gate refuses
                 await _release_prestart_uploads()
                 await scope.release_slot()
                 raise HTTPException(

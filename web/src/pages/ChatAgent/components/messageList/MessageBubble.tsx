@@ -405,8 +405,8 @@ export const MessageBubble = memo(function MessageBubble({ message, contentProje
         original steering text in the agent's context. */}
     {/* Nor does a send of file comments: an edit sends text, and the
         comments it carried are no longer queued to go again. */}
-    {/* DALTON-HOOK(chat-large-upload): hide edit pencil on failed/unadmitted sends and steers */}
-    {isUser && onEditMessage && !isSteering && !artifactComments && !message.queueError && !message.unadmitted && (
+    {/* DALTON-HOOK(chat-large-upload): hide edit pencil on failed steers and unadmitted attachment sends */}
+    {isUser && onEditMessage && !isSteering && !artifactComments && !message.queueError && !(message.unadmitted && hasAttachments) && (
       <button
         onClick={handleStartEdit}
         className={ACTION_BUTTON}

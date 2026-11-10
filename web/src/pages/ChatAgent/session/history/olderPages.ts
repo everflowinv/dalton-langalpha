@@ -287,6 +287,7 @@ export function commitOlderHistoryPage(
 ): void {
   const steered = older.page.carry.steeredAgentIds;
   const messages = settleClosedTaskChips(rt, older.messages, deps.liveOutcome);
+  // DALTON-HOOK(chat-large-upload): deduplicate older-page failed steers by id or requestKey while keeping newMessagesStartIndexRef aligned
   const olderIds = new Set(messages.map((m) => m.id));
   const olderFailedKeys = new Set(
     messages

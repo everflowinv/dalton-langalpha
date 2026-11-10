@@ -749,6 +749,7 @@ async def push_direct(
     return out.get("results", {})
 
 
+# DALTON-HOOK(chat-large-upload): allow incremental attachment pulls to disable root-wide orphan sweeps
 async def pull_direct(
     sandbox: Any,
     items: list[dict[str, Any]],
@@ -775,6 +776,7 @@ async def pull_direct(
     }
     if defer_dir_modes:
         spec["defer_dir_modes"] = True
+    # DALTON-HOOK(chat-large-upload): forward sweep_orphans=False to sandbox transfer runtime
     if not sweep_orphans:
         spec["sweep_orphans"] = False
     out = await run_transfer_op(

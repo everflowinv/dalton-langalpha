@@ -187,6 +187,7 @@ export function ComposerAttachments({
             </button>
           </motion.div>
         )}
+        {/* DALTON-HOOK(chat-large-upload): wire per-card retry action for failed uploads */}
         {files.map((file) => (
           <FilePreviewCard
             key={file.id}

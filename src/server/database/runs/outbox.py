@@ -2787,6 +2787,7 @@ async def finish_claimed_steer(
 ) -> bool:
     """Close a steer its executor holds, fenced to the executor's lease: a
     live agent that took the row since leaves this a no-op."""
+    # DALTON-HOOK(chat-large-upload): persist durable failed_steers fact in the same transaction when closing a failed steer
     async with pool.get_db_connection() as conn:
         async with conn.transaction():
             async with conn.cursor(row_factory=dict_row) as cur:
@@ -2814,6 +2815,7 @@ async def finish_claimed_steer(
                         entry = _failed_steer_entry(closed[0])
                         await _record_durable_failed_steer(conn, closed[0], entry)
                     return True
+                # DALTON-HOOK(chat-large-upload): idempotently record failed_steers if steer row was already marked failed
                 if outcome == "failed":
                     await cur.execute(
                         """

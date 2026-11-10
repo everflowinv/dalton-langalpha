@@ -21,6 +21,7 @@ from src.server.utils.pg_sanitize import SafeJson
 
 LEGACY_KEY = "legacy"
 ARCHIVE_KEY = "archive"
+# DALTON-HOOK(chat-large-upload): replay_facts key for permanently failed steers
 FAILED_STEERS_KEY = "failed_steers"
 
 

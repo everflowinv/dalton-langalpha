@@ -119,6 +119,7 @@ def steer_payload(
     }
     if artifact_comments is not None:
         payload["artifact_comments"] = artifact_comments.model_dump(mode="json")
+    # DALTON-HOOK(chat-large-upload): store chat_uploads and attachments on steer outbox payload
     if chat_uploads:
         payload["chat_uploads"] = chat_uploads
     if attachments:

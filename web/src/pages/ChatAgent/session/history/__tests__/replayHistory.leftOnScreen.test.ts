@@ -265,6 +265,7 @@ describe('history replay: a turn opened hidden', () => {
 
     expect(ids(read())).toEqual(['history-assistant-0', 'history-user-1', 'history-assistant-1']);
     expect(read()[0]).toMatchObject({ hiddenOpener: true });
+    // DALTON-HOOK(chat-large-upload): attachment-only turns render a visible user row without hiddenOpener
     expect(read()[1]).toMatchObject({
       role: 'user',
       content: '',

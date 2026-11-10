@@ -905,6 +905,43 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     });
   };
 
+  /** Stages an attachment with a controlled FileReader whose completion the test drives. */
+  const attachFileWithControlledReader = (
+    view: ReturnType<typeof renderComposer>,
+    name = 'page.txt',
+    dataUrl = 'data:text/plain;base64,eA==',
+  ) => {
+    let finishRead!: () => void;
+    const OriginalFileReader = globalThis.FileReader;
+    class ControlledFileReader {
+      result: string | ArrayBuffer | null = null;
+      onload: ((this: FileReader, ev: ProgressEvent<FileReader>) => unknown) | null = null;
+      onerror: ((this: FileReader, ev: ProgressEvent<FileReader>) => unknown) | null = null;
+      readAsDataURL() {
+        finishRead = () => {
+          this.result = dataUrl;
+          this.onload?.call(this as unknown as FileReader, new ProgressEvent('load') as ProgressEvent<FileReader>);
+        };
+      }
+    }
+    globalThis.FileReader = ControlledFileReader as unknown as typeof FileReader;
+    try {
+      attachFile(view, name);
+    } finally {
+      globalThis.FileReader = OriginalFileReader;
+    }
+    return () => {
+      act(() => {
+        finishRead();
+      });
+    };
+  };
+
+  /** Stages an attachment and synchronously finishes its FileReader so it is ready to send. */
+  const attachReadyFile = (view: ReturnType<typeof renderComposer>, name = 'page.txt') => {
+    attachFileWithControlledReader(view, name)();
+  };
+
   beforeEach(() => {
     localStorage.clear();
     Element.prototype.scrollIntoView = vi.fn();
@@ -1034,7 +1071,7 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
 
     const reopened = renderComposer({ draftKey: 'thread:t-att-reset', onSend }, { userId: 'u-1' });
     expect(screen.getByTestId('attachments-lost-notice')).toBeTruthy();
-    attachFile(reopened, 'page-again.txt');
+    attachReadyFile(reopened, 'page-again.txt');
     fireEvent.click(screen.getByLabelText('Send message'));
     expect(onSend).toHaveBeenCalledTimes(1);
 
@@ -1095,7 +1132,7 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     expect(screen.getByTestId('attachments-lost-notice')).toBeTruthy();
   });
 
-  it('files still being read when the send went out are owed again when the host takes the send back', async () => {
+  it('files still being read block sending until read completes, then travel with the send and keep the draft notice after unmount', async () => {
     const resolvers: Array<(v: boolean) => void> = [];
     const onSend = vi.fn<ChatInputProps['onSend']>().mockImplementation(
       (send) => new Promise<boolean>((resolve) => {
@@ -1107,20 +1144,27 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     );
     const ref = createRef<ChatInputHandle>();
     const view = renderComposer({ draftKey: 'thread:t-host-unread', onSend }, { userId: 'u-1', ref });
-    attachFile(view, 'page.txt');
+    const finishRead = attachFileWithControlledReader(view, 'page.txt');
     fireEvent.change(view.getTextarea(), { target: { value: 'sent before the file was read', selectionStart: 29 } });
-    // At once: the FileReader has not finished, so the file goes unsent.
+    // While the FileReader has not finished, sending is blocked.
+    expect(screen.getByLabelText('Send message')).toBeDisabled();
     fireEvent.click(screen.getByLabelText('Send message'));
+    expect(onSend).not.toHaveBeenCalled();
+
+    // Once the FileReader completes, the send proceeds with the attachment.
+    finishRead();
+    expect(screen.getByLabelText('Send message')).not.toBeDisabled();
+    fireEvent.click(screen.getByLabelText('Send message'));
+    expect(onSend).toHaveBeenCalledTimes(1);
     const sent = onSend.mock.calls[0][0];
-    expect(sent.files).toHaveLength(0);
+    expect(sent.files).toHaveLength(1);
     await act(async () => {
       resolvers[0](false);
     });
     act(() => {
       ref.current!.giveBack(sent.text, sent.files);
     });
-    // Shown at once on this page, not only after a reload.
-    expect(screen.getByTestId('attachments-lost-notice')).toBeTruthy();
+    expect(screen.getByText('page.txt')).toBeTruthy();
     fireEvent.change(view.getTextarea(), { target: { value: 'sent before the file was read!', selectionStart: 30 } });
     view.unmount();
 
@@ -1191,7 +1235,7 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     fireEvent.change(view.getTextarea(), {
       target: { value: `${withToken}why?`, selectionStart: (withToken + 'why?').length },
     });
-    attachFile(view, 'exhibit.txt');
+    attachReadyFile(view, 'exhibit.txt');
     fireEvent.click(screen.getByLabelText('Send message'));
     expect(onSend).toHaveBeenCalledTimes(1);
 
@@ -1360,7 +1404,7 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
       ref.current!.addContext({ kind: 'quote', snippet: 'Margins slipped', from: ANALYST });
     });
     const withToken = view.getTextarea().value;
-    attachFile(view, 'exhibit.txt');
+    attachReadyFile(view, 'exhibit.txt');
     fireEvent.click(screen.getByLabelText('Send message'));
     expect(view.getTextarea().value).toBe('');
 
@@ -1444,7 +1488,7 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     fireEvent.change(view.getTextarea(), {
       target: { value: 'draft with a file', selectionStart: 16 },
     });
-    attachFile(view, 'page.txt');
+    attachReadyFile(view, 'page.txt');
     fireEvent.click(screen.getByLabelText('Send message'));
     expect(screen.getByTestId('attachments-lost-notice')).toBeTruthy();
 
@@ -1866,7 +1910,7 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
     fireEvent.change(view.getTextarea(), { target: { value: 'send A plain', selectionStart: 13 } });
     fireEvent.click(screen.getByLabelText('Send message'));
     fireEvent.change(view.getTextarea(), { target: { value: 'send B with file', selectionStart: 17 } });
-    attachFile(view, 'exhibit.txt');
+    attachReadyFile(view, 'exhibit.txt');
     fireEvent.click(screen.getByLabelText('Send message'));
 
     // B (newer) not taken: its words and its attachment notice come back.
@@ -2222,7 +2266,7 @@ describe('chatDrafts v2 — quotes and the attachments-lost notice', () => {
       fireEvent.change(view.getTextarea(), {
         target: { value: `${tokenB}quoted send B`, selectionStart: (tokenB + 'quoted send B').length },
       });
-      attachFile(view, 'exhibit.txt');
+      attachReadyFile(view, 'exhibit.txt');
       fireEvent.click(screen.getByLabelText('Send message'));
 
       // Settled newest-first while composing, matching settleQueued(false)

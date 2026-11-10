@@ -15,6 +15,7 @@ import base64
 import codecs
 import contextlib
 import errno
+# DALTON-HOOK(chat-large-upload): advisory flock coordination for staging and target publication
 try:
     import fcntl
 except ImportError:  # pragma: no cover
@@ -1032,6 +1033,7 @@ def push(spec: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+# DALTON-HOOK(chat-large-upload): flock-owned temp staging and sweep serialization across transfers
 _ACTIVE_TEMP_LOCK = threading.Lock()
 _ACTIVE_TEMP_FDS: dict[str, int] = {}
 _SWEEP_LOCK_NAME = ".wsfiles-sweep.lock"
@@ -1055,6 +1057,7 @@ def _hold_sweep_lock(parent: str, *, exclusive: bool):
             os.close(fd)
 
 
+# DALTON-HOOK(chat-large-upload): hold exclusive flock on active temp files until placement or unlink
 def _acquire_temp_ownership(path: str, *, expected_fd: int | None = None) -> None:
     """Hold an exclusive non-blocking flock on ``path`` until placement or unlink completes.
 
@@ -1089,6 +1092,7 @@ def _acquire_temp_ownership(path: str, *, expected_fd: int | None = None) -> Non
             os.close(prev)
 
 
+# DALTON-HOOK(chat-large-upload): create temp file and acquire ownership under shared sweep lock
 def _create_owned_temp_file(parent: str) -> Any:
     """Create a ``.wsfiles-*`` temp file and acquire its exclusive flock while holding the sweep lock."""
     with _hold_sweep_lock(parent, exclusive=False):
@@ -1114,6 +1118,7 @@ def _create_owned_temp_file(parent: str) -> Any:
         return tmp
 
 
+# DALTON-HOOK(chat-large-upload): release flock descriptor when temp file is placed or unlinked
 def _release_temp_ownership(path: str) -> None:
     with _ACTIVE_TEMP_LOCK:
         lock_fd = _ACTIVE_TEMP_FDS.pop(path, None)
@@ -1163,6 +1168,7 @@ def _unlink_quiet(path: str) -> None:
     except OSError:
         pass
     finally:
+        # DALTON-HOOK(chat-large-upload): release temp flock descriptor after unlink
         _release_temp_ownership(path)
 
 
@@ -1202,6 +1208,7 @@ def _verify(digest: str, n: int, item: dict[str, Any]) -> str | None:
     return None
 
 
+# DALTON-HOOK(chat-large-upload): serialize target publication against delete via per-target lock and restore grant
 def _pause_for_test_signal(spec: str | None, payload: str = "1") -> None:
     if not spec:
         return
@@ -1260,6 +1267,7 @@ def _place(
     item never leaves bytes under the transient prefix for the next sweep to
     find.
     """
+    # DALTON-HOOK(chat-large-upload): enforce target lock and revocable restore grant before publishing bytes
     lock_file = item.get("lock_file")
     grant_file = item.get("grant_file")
     tlock_fd: int | None = None
@@ -1293,6 +1301,7 @@ def _place(
         _unlink_quiet(tmp)
         return _result("failed", http, str(exc))
     finally:
+        # DALTON-HOOK(chat-large-upload): clean up restore grant, target lock fd, and temp ownership
         if grant_file:
             with contextlib.suppress(OSError):
                 os.unlink(grant_file)
@@ -1419,6 +1428,7 @@ def _pull_file(
         return last or _result("failed", error="exhausted retries")
 
 
+# DALTON-HOOK(chat-large-upload): skip locked temp files and target/grant markers during orphan sweeps
 def _unlink_orphan_if_unlocked(path: str) -> None:
     """Unlink a transient ``.wsfiles-*`` file only if no live process holds its flock."""
     with _ACTIVE_TEMP_LOCK:
@@ -1456,6 +1466,7 @@ def _unlink_orphan_if_unlocked(path: str) -> None:
             os.close(fd)
 
 
+# DALTON-HOOK(chat-large-upload): allow incremental pulls to skip root-wide orphan sweeps
 def _sweep_orphan_staging(
     root: str, items: list[dict[str, Any]], *, sweep_orphans: bool = True
 ) -> None:
@@ -1601,6 +1612,7 @@ def _extract_member(root: str, chunk: Any, member: dict[str, Any], http_status: 
         digest = hashlib.sha256(data).hexdigest()
         if digest != expected_sha:
             return _result("mismatch", http_status, f"got sha256={digest}")
+    # DALTON-HOOK(chat-large-upload): stage pack member through flock-owned temp file
     try:
         tmp = _create_owned_temp_file(root)
     except OSError as exc:
@@ -1743,6 +1755,7 @@ def pull(spec: dict[str, Any]) -> dict[str, Any]:
         int(spec.get("max_inflight_bytes") or _PULL_MAX_INFLIGHT_BYTES)
     )
     results: dict[str, dict[str, Any]] = {}
+    # DALTON-HOOK(chat-large-upload): honor per-pull sweep_orphans flag
     sweep_orphans = bool(spec.get("sweep_orphans", True))
     _sweep_orphan_staging(root, items, sweep_orphans=sweep_orphans)
     _inside.cache_clear()

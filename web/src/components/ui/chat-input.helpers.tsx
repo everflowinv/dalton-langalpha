@@ -3,7 +3,7 @@ import type { ChipContext, FileMention, QuoteContext, SlashCommand } from './cha
 import type { ModelMetadataEntry } from '@/hooks/useFilteredModels';
 import { TWEEN } from '@/lib/motion';
 // DALTON-HOOK(chat-large-upload): re-export large-upload limits alongside inline caps
-import { MAX_CHAT_UPLOAD_FILE_SIZE, MAX_TOTAL_CHAT_UPLOAD_BYTES } from '@/lib/dalton/chatUploadClient';
+import { MAX_CHAT_UPLOAD_FILE_SIZE, MAX_TOTAL_CHAT_UPLOAD_BYTES } from '@/lib/dalton/chatUploadConstants';
 
 /** Return the appropriate icon for a slash command. */
 export function getSlashCommandIcon(cmd: SlashCommand, className: string) {

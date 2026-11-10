@@ -1902,6 +1902,7 @@ async def delete_workspace_files(
                             workspace_id,
                             exc,
                         )
+                        # DALTON-HOOK(chat-large-upload): report retryable error when upload retirement fails after rm
                         for client_path in deleted:
                             errors.append(
                                 {

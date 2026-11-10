@@ -549,6 +549,7 @@ async def begin_run(
             },
             pending_input=executor_input_stamp(request),
             on_started=started.append,
+            # DALTON-HOOK(chat-large-upload): confirm chat_uploads inside the durable START transaction
             before_commit=(
                 partial(
                     _start_checks,

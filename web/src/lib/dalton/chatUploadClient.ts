@@ -1,9 +1,17 @@
 import { api, ApiError } from '@/api/client';
+import {
+  CHAT_UPLOAD_PART_SIZE,
+  MAX_CHAT_UPLOAD_FILE_SIZE,
+  MAX_PARALLEL_PARTS,
+  MAX_TOTAL_CHAT_UPLOAD_BYTES,
+} from './chatUploadConstants';
 
-export const MAX_CHAT_UPLOAD_FILE_SIZE = 200 * 1024 * 1024; // 200 MiB inclusive
-export const MAX_TOTAL_CHAT_UPLOAD_BYTES = 600 * 1024 * 1024; // 600 MiB per message
-export const CHAT_UPLOAD_PART_SIZE = 8 * 1024 * 1024; // 8 MiB per chunk
-export const MAX_PARALLEL_PARTS = 2;
+export {
+  CHAT_UPLOAD_PART_SIZE,
+  MAX_CHAT_UPLOAD_FILE_SIZE,
+  MAX_PARALLEL_PARTS,
+  MAX_TOTAL_CHAT_UPLOAD_BYTES,
+};
 
 const PART_REQUEST_TIMEOUT_MS = 120_000;
 const MAX_PART_ATTEMPTS = 3;

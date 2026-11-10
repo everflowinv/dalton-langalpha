@@ -64,6 +64,7 @@ export function useFileAttachments({
       genCounterRef.current += 1;
       const currentGen = genCounterRef.current;
       const controller = new AbortController();
+      // DALTON-HOOK(chat-large-upload): register generation-scoped AbortController for active upload
       const tracked: TrackedUpload = {
         controller,
         workspaceKey: targetWorkspaceKey,

@@ -492,6 +492,7 @@ def _steer_offer(
     if eff_attachments:
         shown["attachments"] = eff_attachments
 
+    # DALTON-HOOK(chat-large-upload): build SteeredReport with model reminder and user-visible attachment metadata
     return SteeredReport(
         job_id=str(job["hook_outbox_id"]),
         content=model_content,

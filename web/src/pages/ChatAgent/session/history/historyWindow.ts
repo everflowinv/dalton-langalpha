@@ -98,6 +98,7 @@ export function createHistoryWindow() {
       };
     },
     snapshot: (): OlderHistoryStatus => status,
+    // DALTON-HOOK(chat-large-upload): expose loaded turn window boundary for status failed_steers filtering
     /** The oldest turn index currently loaded for `tid` (or current thread), or null. */
     firstTurnIndex: (tid?: string | null): number | null =>
       (tid === undefined || tid === threadId) && page ? page.firstTurnIndex : null,
