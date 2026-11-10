@@ -4,17 +4,23 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type * as Lark from "@larksuiteoapi/node-sdk";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { HttpBackendClient } from "../src/backend-client.js";
-import { FakeChannelAdapter } from "../src/channels/fake-adapter.js";
-import { FeishuChannelAdapter } from "../src/channels/feishu/index.js";
-import { loadConfig } from "../src/config.js";
-import { createGatewayApp } from "../src/server.js";
 import {
   ChannelDeliveryError,
   type ChannelAdapter,
 } from "../src/channels/adapter.js";
+import {
+  DiscordChannelAdapter,
+  RequestClient,
+} from "../src/channels/discord/index.js";
+import { FakeChannelAdapter } from "../src/channels/fake-adapter.js";
+import { FeishuChannelAdapter } from "../src/channels/feishu/index.js";
+import { loadConfig } from "../src/config.js";
+import { createGatewayApp } from "../src/server.js";
 import type { ChannelPlatform } from "../src/types.js";
+import { makeInboundRequestKey } from "../src/uuid.js";
+import { fetchGatewayServer } from "./helpers.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(__dirname, "../../..");
@@ -69,16 +75,28 @@ interface BootstrapState {
   ws_dup_2: string;
   dup_name: string;
   ws_named_main: string;
+  ws_b_shared_rw: string;
   ws_b_private: string;
   puid_a: string;
   puid_b: string;
+  guild_id: string;
+  parent_cid: string;
+  thread_cid: string;
+  other_cid: string;
+  private_b_cid: string;
+  unauth_cid: string;
+  parent_addr: string;
+  other_allowed_addr: string;
+  private_b_addr: string;
+  unauthorized_addr: string;
+  thread_scope_key: string;
   grp_chat_id: string;
   grp_addr: string;
   grp_scope: string;
 }
 
 interface InspectResponse {
-  session: {
+  session?: {
     generation: number;
     override_workspace_id: string | null;
     activity_epoch: number | null;
@@ -86,21 +104,24 @@ interface InspectResponse {
   } | null;
   inbound: {
     message_id: string;
-    event_kind: string;
+    event_kind?: string;
     status: string;
     dalton_user_id: string | null;
+    chat_address?: string;
+    thread_scope_key?: string;
     workspace_id: string | null;
     external_thread_id: string | null;
-    session_generation: number | null;
+    session_generation?: number | null;
     thread_id: string | null;
     run_id: string | null;
-    command_request: Record<string, unknown> | null;
-    command_result: Record<string, unknown> | null;
-    command_effect_status: string | null;
-    command_reply_pending: boolean;
+    command_request?: Record<string, unknown> | null;
+    command_result?: Record<string, unknown> | null;
+    command_effect_status?: string | null;
+    command_reply_pending?: boolean;
     fallback_pending?: boolean;
+    sent_to_current_count?: number;
   } | null;
-  threads: Array<{
+  threads?: Array<{
     thread_id: string;
     thread_index: number;
     external_id: string | null;
@@ -109,14 +130,38 @@ interface InspectResponse {
   delivery?: {
     delivery_key: string;
     kind: string;
+    user_id?: string | null;
+    thread_id?: string | null;
+    run_id?: string | null;
+    is_current?: boolean;
+    platform?: string;
+    target_address?: string;
     status: string;
-    activity_origin: string;
-    source_scope_key: string | null;
-    source_generation: number | null;
+    sent_chunks?: number;
+    total_chunks?: number;
+    platform_message_ids?: string[];
+    files_status?: unknown;
+    error_code?: string | null;
+    activity_origin?: string;
+    source_scope_key?: string | null;
+    source_generation?: number | null;
+  } | null;
+  background_run?: {
+    run_id: string;
+    thread_id: string;
+    dalton_user_id: string;
+    platform: string;
+    target_address: string;
+    turn_index: number;
+    status: string;
+    fallback_pending: boolean;
+    sent_to_current_count: number;
   } | null;
 }
 
-async function startOrAttachRealBackend(): Promise<{
+async function startOrAttachRealBackend(
+  scriptRel = "tests/integration/dalton/test_channel_gateway_db.py",
+): Promise<{
   baseUrl: string;
   stop: () => Promise<void>;
 }> {
@@ -136,10 +181,7 @@ async function startOrAttachRealBackend(): Promise<{
   }
 
   const pyBin = resolvePythonBin();
-  const scriptPath = resolve(
-    REPO_ROOT,
-    "tests/integration/dalton/test_channel_gateway_db.py",
-  );
+  const scriptPath = resolve(REPO_ROOT, scriptRel);
 
   let proc: ChildProcess | null = null;
   try {
@@ -218,6 +260,21 @@ async function startOrAttachRealBackend(): Promise<{
   }
 }
 
+function jsonResponse(
+  body: unknown,
+  status = 200,
+  headers: Record<string, string> = {},
+): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "content-type": "application/json", ...headers },
+  });
+}
+
+function routeOf(url: string): string {
+  return new URL(url).pathname.replace(/^\/api\/v10/, "");
+}
+
 function createMinimalFakeLarkClient(): Lark.Client {
   let msgSeq = 1;
   return {
@@ -273,14 +330,684 @@ function createMinimalFakeLarkClient(): Lark.Client {
   } as unknown as Lark.Client;
 }
 
-const hasRealEnv = Boolean(
-  process.env.DALTON_REAL_BACKEND_URL?.trim() || resolveTestDsn(),
-);
+const REAL_HTTP_SUITE_NAMES = ["discord", "feishu"] as const;
+type RealHttpSuiteName = (typeof REAL_HTTP_SUITE_NAMES)[number];
 
-describe("Real HTTP End-to-End: FeishuChannelAdapter -> GatewayOrchestrator -> HttpBackendClient -> FastAPI channels_router -> Isolated Postgres", () => {
-  it.skipIf(!hasRealEnv)(
+function isRealHttpSuiteName(value: string): value is RealHttpSuiteName {
+  return value === "discord" || value === "feishu";
+}
+
+const externalRealBackendUrl = process.env.DALTON_REAL_BACKEND_URL?.trim() ?? "";
+const realHttpSuiteRaw = (process.env.DALTON_REAL_HTTP_SUITE ?? "")
+  .trim()
+  .toLowerCase();
+
+function realHttpSuiteGate(suite: RealHttpSuiteName): "run" | "skip" | "fail" {
+  if (isRealHttpSuiteName(realHttpSuiteRaw)) {
+    return realHttpSuiteRaw === suite ? "run" : "skip";
+  }
+  // No external backend and no selector: each describe starts its own harness.
+  // An external backend, or any selector that is not discord|feishu, must fail
+  // rather than run both suites against one backend or match zero tests.
+  if (externalRealBackendUrl || realHttpSuiteRaw) {
+    return "fail";
+  }
+  return "run";
+}
+
+function realHttpSuiteSelectionError(suite: RealHttpSuiteName): string {
+  const shown = realHttpSuiteRaw || "<unset>";
+  return (
+    `Refusing to run the ${suite} real HTTP suite against ${
+      externalRealBackendUrl ? "the supplied DALTON_REAL_BACKEND_URL" : "an invalid selector"
+    }. ` +
+    `DALTON_REAL_HTTP_SUITE=${shown}. Set it to "discord" or "feishu" so only that suite uses the external backend.`
+  );
+}
+
+const hasRealEnv = Boolean(
+  externalRealBackendUrl || resolveTestDsn(),
+);
+const discordSuiteGate = realHttpSuiteGate("discord");
+const feishuSuiteGate = realHttpSuiteGate("feishu");
+
+describe.skipIf(discordSuiteGate === "skip")("Real HTTP End-to-End: DiscordChannelAdapter -> GatewayOrchestrator -> POST /agent/send -> HttpBackendClient -> FastAPI channels_router -> Isolated Postgres (d030)", () => {
+  it.skipIf(!hasRealEnv && discordSuiteGate !== "fail")(
+    "delivers current-conversation text and files to the Discord thread channel via real I-6 claim, enforces real workspace permissions on explicit targets, skips fallback after current send, and recovers thread scope across retry claims and background/watch startup recovery",
+    async () => {
+      if (discordSuiteGate === "fail") {
+        throw new Error(realHttpSuiteSelectionError("discord"));
+      }
+      const BOT_ID = "999000111";
+      const tempDir = mkdtempSync(join(tmpdir(), "dalton-discord-real-http-"));
+      let backendHandle: { baseUrl: string; stop: () => Promise<void> } | null =
+        null;
+      let app: ReturnType<typeof createGatewayApp> | null = null;
+
+      try {
+        backendHandle = await startOrAttachRealBackend(
+          "tests/integration/dalton/test_discord_gateway_db.py",
+        );
+        const baseUrl = backendHandle.baseUrl;
+
+        const bootRes = await fetch(`${baseUrl}/test-harness/bootstrap`);
+        expect(bootRes.status).toBe(200);
+        const boot = (await bootRes.json()) as BootstrapState;
+
+        const inspectDb = async (params: {
+          messageId?: string;
+          deliveryKey?: string;
+          runId?: string;
+          waitCompleted?: boolean;
+        }): Promise<InspectResponse> => {
+          const qs = new URLSearchParams({ platform: "discord" });
+          if (params.messageId) qs.set("message_id", params.messageId);
+          if (params.deliveryKey) qs.set("delivery_key", params.deliveryKey);
+          if (params.runId) qs.set("run_id", params.runId);
+          const deadline = Date.now() + 5_000;
+          while (true) {
+            const r = await fetch(
+              `${baseUrl}/test-harness/inspect?${qs.toString()}`,
+            );
+            expect(r.status).toBe(200);
+            const snapshot = (await r.json()) as InspectResponse;
+            if (
+              !params.waitCompleted ||
+              !params.messageId ||
+              (snapshot.inbound &&
+                ["completed", "failed", "denied"].includes(
+                  snapshot.inbound.status,
+                )) ||
+              Date.now() >= deadline
+            ) {
+              return snapshot;
+            }
+            await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+          }
+        };
+
+        const controlTurnGate = async (
+          payload: Record<string, unknown>,
+        ): Promise<Record<string, unknown>> => {
+          const r = await fetch(`${baseUrl}/test-harness/turn-gate`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          });
+          expect(r.status).toBe(200);
+          return (await r.json()) as Record<string, unknown>;
+        };
+
+        // Stub ONLY the external Discord REST API; all Gateway -> Backend -> FastAPI -> Postgres calls use real HTTP & SQL
+        let failNextThreadPostWith400 = false;
+        const sentMessages: Array<{
+          route: string;
+          isMultipart: boolean;
+          bodyText: string;
+        }> = [];
+        const restCalls: Array<{ method: string; route: string }> = [];
+        const isParentRoute = (route: string) =>
+          route === `/channels/${boot.parent_cid}` ||
+          route.startsWith(`/channels/${boot.parent_cid}/`);
+        const messagePostRoutes = (
+          items: Array<{ method: string; route: string }>,
+        ) =>
+          items
+            .filter(
+              (call) => call.method === "POST" && call.route.endsWith("/messages"),
+            )
+            .map((call) => call.route);
+
+        const rest = new RequestClient("test-bot-token", {
+          fetchImpl: async (url, init) => {
+            const route = routeOf(String(url));
+            const method = (init?.method ?? "GET").toUpperCase();
+            restCalls.push({ method, route });
+            if (route === `/channels/${boot.thread_cid}` && method === "GET") {
+              return jsonResponse({
+                id: boot.thread_cid,
+                type: 11,
+                guild_id: boot.guild_id,
+                parent_id: boot.parent_cid,
+                name: "earnings-thread",
+                thread_metadata: { archived: false },
+              });
+            }
+            if (route === `/channels/${boot.parent_cid}` && method === "GET") {
+              return jsonResponse({
+                id: boot.parent_cid,
+                type: 0,
+                guild_id: boot.guild_id,
+                name: "Equities Channel",
+              });
+            }
+            if (route === `/channels/${boot.other_cid}` && method === "GET") {
+              return jsonResponse({
+                id: boot.other_cid,
+                type: 0,
+                guild_id: boot.guild_id,
+                name: "Alerts Channel",
+              });
+            }
+            if (route.endsWith("/messages") && method === "POST") {
+              if (
+                route === `/channels/${boot.thread_cid}/messages` &&
+                failNextThreadPostWith400
+              ) {
+                failNextThreadPostWith400 = false;
+                return jsonResponse(
+                  { code: 50035, message: "Invalid Form Body" },
+                  400,
+                );
+              }
+              const isMultipart = init?.body instanceof FormData;
+              const bodyText = isMultipart
+                ? String((init.body as FormData).get("payload_json") ?? "")
+                : String(init?.body ?? "");
+              sentMessages.push({ route, isMultipart, bodyText });
+              return jsonResponse({ id: `discord-msg-${sentMessages.length}` });
+            }
+            throw new Error(`Unexpected Discord REST ${method} ${route}`);
+          },
+        });
+
+        const discordAdapter = new DiscordChannelAdapter({
+          botToken: "test-bot-token",
+          botUserId: BOT_ID,
+          rest,
+        });
+        vi.spyOn(discordAdapter, "start").mockResolvedValue(undefined);
+        vi.spyOn(discordAdapter, "isConnected").mockReturnValue(true);
+
+        const config = loadConfig({
+          GATEWAY_HOST: "127.0.0.1",
+          GATEWAY_PORT: "0",
+          INTERNAL_SERVICE_TOKEN: boot.service_token,
+          DALTON_BACKEND_URL: baseUrl,
+          WEB_BASE_URL: "https://dalton.test",
+          DALTON_WEIXIN_CACHE_DIR: tempDir,
+          DALTON_DISCORD_ENABLED: "true",
+          DALTON_DISCORD_BOT_TOKEN: "test-bot-token",
+          DALTON_DISCORD_APPLICATION_ID: BOT_ID,
+        });
+
+        // Real HttpBackendClient with real global `fetch` (no mock fetchFn!)
+        const realBackendClient = new HttpBackendClient({
+          baseUrl,
+          serviceToken: boot.service_token,
+        });
+
+        // Select ws_a1 before the gateway starts. Startup recovery would otherwise
+        // resend a still-pending command confirmation and change later send counts.
+        const homeProbeId = `${boot.prefix}_msg_home_probe`;
+        const homeProbe = await realBackendClient.registerAndResolveInbound({
+          platform: "discord",
+          platform_user_id: boot.puid_a,
+          chat_type: "group",
+          chat_address: boot.parent_addr,
+          thread_scope_key: boot.thread_scope_key,
+          message_id: homeProbeId,
+          request_key: makeInboundRequestKey("discord", homeProbeId),
+          raw_payload: { platform_user_id: boot.puid_a },
+        });
+        expect(homeProbe.allowed).toBe(true);
+        expect(homeProbe.dalton_user_id).toBe(boot.user_a);
+        expect(homeProbe.workspace_id).toBe(boot.home_ws_a);
+        expect(homeProbe.workspace_id).not.toBe(boot.ws_a1);
+        expect(homeProbe.generation).toBe(1);
+        expect(homeProbe.external_thread_id).toBe(
+          `discord:${boot.thread_scope_key}:user:${boot.user_a}:gen:1`,
+        );
+        const snapHome = await inspectDb({ messageId: homeProbeId });
+        expect(snapHome.inbound?.workspace_id).toBe(boot.home_ws_a);
+        expect(snapHome.inbound?.thread_scope_key).toBe(boot.thread_scope_key);
+        expect(snapHome.inbound?.session_generation).toBe(1);
+        expect(snapHome.inbound?.event_kind).toBe("message");
+        await realBackendClient.updateInboundProgress({
+          platform: "discord",
+          message_id: homeProbeId,
+          status: "completed",
+          fallback_pending: false,
+        });
+
+        const switchMsgId = `${boot.prefix}_cmd_sw_ws_a1`;
+        const switchReq = {
+          cmd: "workspace_switch" as const,
+          platform: "discord" as const,
+          dalton_user_id: boot.user_a,
+          platform_user_id: boot.puid_a,
+          chat_type: "group" as const,
+          chat_address: boot.parent_addr,
+          scope_key: boot.thread_scope_key,
+          message_id: switchMsgId,
+          workspace_id: boot.ws_a1,
+          target_kind: "workspace_id" as const,
+        };
+        const switched = await realBackendClient.sessionCommand(switchReq);
+        expect(switched.ok).toBe(true);
+        expect(switched.duplicate).toBe(false);
+        expect(switched.switched).toBe(true);
+        expect(switched.workspace_id).toBe(boot.ws_a1);
+        expect(switched.override_workspace_id).toBe(boot.ws_a1);
+        expect(switched.is_home).toBe(false);
+        expect(switched.generation).toBe(2);
+        expect(switched.command_effect_status).toBe("done");
+        expect(switched.command_reply_pending).toBe(true);
+        const threadSessionGeneration = switched.generation ?? 0;
+        expect(switched.external_thread_id).toBe(
+          `discord:${boot.thread_scope_key}:user:${boot.user_a}:gen:${threadSessionGeneration}`,
+        );
+        const snapSwitch = await inspectDb({ messageId: switchMsgId });
+        expect(snapSwitch.inbound?.event_kind).toBe("command");
+        expect(snapSwitch.inbound?.status).toBe("accepted");
+        expect(snapSwitch.inbound?.workspace_id).toBe(boot.ws_a1);
+        expect(snapSwitch.inbound?.thread_scope_key).toBe(boot.thread_scope_key);
+        expect(snapSwitch.inbound?.session_generation).toBe(threadSessionGeneration);
+        expect(snapSwitch.inbound?.command_effect_status).toBe("done");
+        expect(snapSwitch.inbound?.command_reply_pending).toBe(true);
+
+        const replayed = await realBackendClient.sessionCommand(switchReq);
+        expect(replayed.ok).toBe(true);
+        expect(replayed.duplicate).toBe(true);
+        expect(replayed.generation).toBe(threadSessionGeneration);
+        expect(replayed.workspace_id).toBe(boot.ws_a1);
+        expect(replayed.override_workspace_id).toBe(boot.ws_a1);
+        expect(replayed.command_effect_status).toBe("done");
+        expect(replayed.command_reply_pending).toBe(true);
+        expect(replayed.external_thread_id).toBe(switched.external_thread_id);
+
+        await realBackendClient.updateInboundProgress({
+          platform: "discord",
+          message_id: switchMsgId,
+          status: "completed",
+          command_reply_pending: false,
+          fallback_pending: false,
+        });
+        const snapSwitchAck = await inspectDb({ messageId: switchMsgId });
+        expect(snapSwitchAck.inbound?.status).toBe("completed");
+        expect(snapSwitchAck.inbound?.session_generation).toBe(
+          threadSessionGeneration,
+        );
+        expect(snapSwitchAck.inbound?.command_effect_status).toBe("done");
+        expect(snapSwitchAck.inbound?.command_reply_pending).toBe(false);
+
+        const adapters = new Map<ChannelPlatform, ChannelAdapter>([
+          ["discord", discordAdapter],
+        ]);
+
+        app = createGatewayApp({
+          config,
+          backend: realBackendClient,
+          adapters,
+        });
+        const { host: gwHost, port: gwPort } = await app.start();
+
+        const postAgentSend = async (payload: Record<string, unknown>) => {
+          const res = await fetchGatewayServer(
+            app!,
+            `http://${gwHost}:${gwPort}/agent/send`,
+            {
+              method: "POST",
+              headers: {
+                "X-Service-Token": boot.service_token,
+                "X-User-Id": boot.user_a,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify(payload),
+            },
+          );
+          return {
+            statusCode: res.status,
+            body: (await res.json()) as Record<string, unknown>,
+          };
+        };
+
+        // -------------------------------------------------------------------
+        // 1. Arm turn SSE gate and dispatch a Discord guild thread message
+        // -------------------------------------------------------------------
+        await controlTurnGate({ action: "arm" });
+
+        const inboundMsgId = `${boot.prefix}_msg_thread_1`;
+        const inboundPromise = discordAdapter.dispatchMessage({
+          id: inboundMsgId,
+          channel_id: boot.thread_cid,
+          guild_id: boot.guild_id,
+          content: `<@${BOT_ID}> analyze Q4 margins and send the chart`,
+          author: {
+            id: boot.puid_a,
+            username: "alice",
+            global_name: "Alice",
+          },
+          mentions: [{ id: BOT_ID, username: "DaltonBot" }],
+          thread: {
+            id: boot.thread_cid,
+            type: 11,
+            guild_id: boot.guild_id,
+            parent_id: boot.parent_cid,
+            name: "earnings-thread",
+          },
+          attachments: [],
+        } as never);
+
+        const streamingState = await controlTurnGate({
+          action: "wait_streaming",
+          message_id: inboundMsgId,
+        });
+        const turnThreadId = String(streamingState.thread_id);
+        const turnRunId = String(streamingState.run_id);
+        expect(turnThreadId.length).toBeGreaterThan(10);
+        expect(turnRunId.length).toBeGreaterThan(10);
+
+        const snapStreaming = await inspectDb({ messageId: inboundMsgId });
+        expect(snapStreaming.inbound?.chat_address).toBe(boot.parent_addr);
+        expect(snapStreaming.inbound?.thread_scope_key).toBe(
+          boot.thread_scope_key,
+        );
+        expect(snapStreaming.inbound?.workspace_id).toBe(boot.ws_a1);
+        expect(snapStreaming.inbound?.session_generation).toBe(
+          threadSessionGeneration,
+        );
+        expect(snapStreaming.inbound?.external_thread_id).toBe(
+          `discord:${boot.thread_scope_key}:user:${boot.user_a}:gen:${threadSessionGeneration}`,
+        );
+
+        // -------------------------------------------------------------------
+        // 2. Current-conversation POST /agent/send (omitted `target`) delivers
+        //    both text and file to `thread_cid` and NEVER to `parent_cid`
+        // -------------------------------------------------------------------
+        const currentSendRes = await postAgentSend({
+          thread_id: turnThreadId,
+          run_id: turnRunId,
+          tool_call_id: "tc-real-http-cur-1",
+          turn_platform: "discord",
+          text: "Q4 gross margin expanded 180 bps.",
+          files: [{ workspace_id: boot.ws_a1, path: "reports/q4-margins.png" }],
+        });
+        expect(currentSendRes.statusCode).toBe(200);
+        expect(currentSendRes.body).toEqual({
+          status: "sent",
+          code: null,
+          address: boot.parent_addr,
+          current: true,
+          duplicate: false,
+          message: `Delivered to ${boot.parent_addr}.`,
+          files: [
+            { path: "reports/q4-margins.png", status: "sent", reason: null },
+          ],
+        });
+
+        expect(sentMessages).toHaveLength(2);
+        expect(sentMessages[0]!.route).toBe(
+          `/channels/${boot.thread_cid}/messages`,
+        );
+        expect(sentMessages[0]!.isMultipart).toBe(false);
+        expect(sentMessages[0]!.bodyText).toContain(
+          "Q4 gross margin expanded 180 bps.",
+        );
+        expect(sentMessages[1]!.route).toBe(
+          `/channels/${boot.thread_cid}/messages`,
+        );
+        expect(sentMessages[1]!.isMultipart).toBe(true);
+        expect(sentMessages[1]!.bodyText).toContain("q4-margins.png");
+        expect(
+          sentMessages.some(
+            (m) => m.route === `/channels/${boot.parent_cid}/messages`,
+          ),
+        ).toBe(false);
+        expect(messagePostRoutes(restCalls)).toEqual([
+          `/channels/${boot.thread_cid}/messages`,
+          `/channels/${boot.thread_cid}/messages`,
+        ]);
+        expect(restCalls.some((call) => isParentRoute(call.route))).toBe(false);
+        expect(
+          restCalls.some(
+            (call) =>
+              call.method === "GET" &&
+              call.route === `/channels/${boot.thread_cid}`,
+          ),
+        ).toBe(true);
+        const restCountBeforeExplicit = restCalls.length;
+
+        const snapAfterCurrentSend = await inspectDb({
+          messageId: inboundMsgId,
+          deliveryKey: `${turnRunId}:tc-real-http-cur-1`,
+        });
+        expect(snapAfterCurrentSend.inbound?.sent_to_current_count).toBe(1);
+        expect(snapAfterCurrentSend.delivery?.is_current).toBe(true);
+        expect(snapAfterCurrentSend.delivery?.status).toBe("sent");
+
+        // -------------------------------------------------------------------
+        // 3. Explicit `target` to `other_allowed_addr` (bound to colleague-shared
+        //    `ws_b_shared_rw` with `rw` access) succeeds with `current: false`
+        // -------------------------------------------------------------------
+        const explicitOtherRes = await postAgentSend({
+          thread_id: turnThreadId,
+          run_id: turnRunId,
+          tool_call_id: "tc-real-http-other-1",
+          turn_platform: "discord",
+          target: boot.other_allowed_addr,
+          text: "Cross-channel alert to shared workspace channel",
+        });
+        expect(explicitOtherRes.statusCode).toBe(200);
+        expect(explicitOtherRes.body).toMatchObject({
+          status: "sent",
+          address: boot.other_allowed_addr,
+          current: false,
+        });
+        expect(sentMessages).toHaveLength(3);
+        expect(sentMessages[2]!.route).toBe(
+          `/channels/${boot.other_cid}/messages`,
+        );
+        const explicitRoutes = restCalls.slice(restCountBeforeExplicit);
+        expect(messagePostRoutes(explicitRoutes)).toEqual([
+          `/channels/${boot.other_cid}/messages`,
+        ]);
+        expect(
+          explicitRoutes.some((call) => call.route.includes(boot.thread_cid)),
+        ).toBe(false);
+        expect(explicitRoutes.some((call) => isParentRoute(call.route))).toBe(
+          false,
+        );
+
+        // -------------------------------------------------------------------
+        // 4. Real permission checks reject explicit `target` to `private_b_addr`
+        //    (bound to User B's private workspace `ws_b_private`) and `unauthorized_addr`
+        // -------------------------------------------------------------------
+        const privateWsRes = await postAgentSend({
+          thread_id: turnThreadId,
+          run_id: turnRunId,
+          tool_call_id: "tc-real-http-priv-b-1",
+          turn_platform: "discord",
+          target: boot.private_b_addr,
+          text: "Should be blocked by real workspace write permission check",
+        });
+        expect(privateWsRes.statusCode).toBe(200);
+        expect(privateWsRes.body).toMatchObject({
+          status: "failed",
+          code: "not_allowed",
+          current: false,
+        });
+
+        const unauthTargetRes = await postAgentSend({
+          thread_id: turnThreadId,
+          run_id: turnRunId,
+          tool_call_id: "tc-real-http-unauth-1",
+          turn_platform: "discord",
+          target: boot.unauthorized_addr,
+          text: "Should be blocked by real allowed-target check",
+        });
+        expect(unauthTargetRes.statusCode).toBe(200);
+        expect(unauthTargetRes.body).toMatchObject({
+          status: "failed",
+          code: "not_allowed",
+          current: false,
+        });
+        expect(sentMessages).toHaveLength(3);
+        expect(messagePostRoutes(restCalls)).toEqual([
+          `/channels/${boot.thread_cid}/messages`,
+          `/channels/${boot.thread_cid}/messages`,
+          `/channels/${boot.other_cid}/messages`,
+        ]);
+        expect(restCalls.some((call) => isParentRoute(call.route))).toBe(false);
+        const restCountBeforeRetry = restCalls.length;
+
+        // -------------------------------------------------------------------
+        // 5. Retry claim after a failed delivery (HTTP 400) recovers
+        //    `thread_scope_key` from Postgres and delivers to `thread_cid`
+        // -------------------------------------------------------------------
+        failNextThreadPostWith400 = true;
+        const failedRetryRes = await postAgentSend({
+          thread_id: turnThreadId,
+          run_id: turnRunId,
+          tool_call_id: "tc-real-http-retry-1",
+          turn_platform: "discord",
+          text: "Retryable thread reply over real Postgres",
+        });
+        expect(failedRetryRes.body).toMatchObject({ status: "failed" });
+        expect(sentMessages).toHaveLength(3);
+
+        const snapFailedDlv = await inspectDb({
+          deliveryKey: `${turnRunId}:tc-real-http-retry-1`,
+        });
+        expect(snapFailedDlv.delivery?.status).toBe("failed");
+
+        const succeededRetryRes = await postAgentSend({
+          thread_id: turnThreadId,
+          run_id: turnRunId,
+          tool_call_id: "tc-real-http-retry-1",
+          turn_platform: "discord",
+          text: "Retryable thread reply over real Postgres",
+        });
+        expect(succeededRetryRes.body).toMatchObject({
+          status: "sent",
+          address: boot.parent_addr,
+          current: true,
+          message: `Delivered to ${boot.parent_addr}.`,
+        });
+        expect(sentMessages).toHaveLength(4);
+        expect(sentMessages[3]!.route).toBe(
+          `/channels/${boot.thread_cid}/messages`,
+        );
+        const retryRoutes = restCalls.slice(restCountBeforeRetry);
+        expect(messagePostRoutes(retryRoutes)).toEqual([
+          `/channels/${boot.thread_cid}/messages`,
+          `/channels/${boot.thread_cid}/messages`,
+        ]);
+        expect(retryRoutes.some((call) => isParentRoute(call.route))).toBe(false);
+        expect(
+          retryRoutes.some((call) => call.route.includes(boot.other_cid)),
+        ).toBe(false);
+
+        // -------------------------------------------------------------------
+        // 6. Release turn SSE stream: because `sent_to_current_count > 0` in
+        //    Postgres, final text fallback is skipped
+        // -------------------------------------------------------------------
+        await controlTurnGate({ action: "release" });
+        await inboundPromise;
+
+        const snapCompleted = await inspectDb({
+          messageId: inboundMsgId,
+          waitCompleted: true,
+        });
+        expect(snapCompleted.inbound?.status).toBe("completed");
+        expect(snapCompleted.inbound?.fallback_pending).toBe(false);
+        expect(snapCompleted.inbound?.sent_to_current_count).toBe(2);
+        expect(sentMessages).toHaveLength(4);
+        expect(
+          sentMessages.some(
+            (m) => m.route === `/channels/${boot.parent_cid}/messages`,
+          ),
+        ).toBe(false);
+
+        // -------------------------------------------------------------------
+        // 7. Background run & thread watch startup recovery over real HTTP +
+        //    Postgres recovers `thread_scope_key` and delivers to `thread_cid`
+        // -------------------------------------------------------------------
+        const bgRunId = `${boot.prefix}_bg_run_2`;
+        await realBackendClient.updateInboundProgress({
+          thread_watch: {
+            thread_id: turnThreadId,
+            dalton_user_id: boot.user_a,
+            platform: "discord",
+            target_address: boot.parent_addr,
+            scope_key: boot.thread_scope_key,
+            generation: threadSessionGeneration,
+            last_seen_turn_index: 1,
+            watch_active: false,
+          },
+          background_run: {
+            run_id: bgRunId,
+            thread_id: turnThreadId,
+            dalton_user_id: boot.user_a,
+            platform: "discord",
+            target_address: boot.parent_addr,
+            turn_index: 2,
+            status: "completed",
+            fallback_pending: true,
+          },
+        });
+
+        await controlTurnGate({
+          action: "configure_replay",
+          thread_id: turnThreadId,
+          run_id: bgRunId,
+          turn_index: 2,
+          text: "Recovered background thread analysis from Postgres.",
+        });
+
+        await app.orchestrator.runStartupRecovery();
+
+        expect(sentMessages).toHaveLength(5);
+        expect(sentMessages[4]!.route).toBe(
+          `/channels/${boot.thread_cid}/messages`,
+        );
+        expect(sentMessages[4]!.bodyText).toContain(
+          "Recovered background thread analysis from Postgres.",
+        );
+        expect(
+          sentMessages.some(
+            (m) => m.route === `/channels/${boot.parent_cid}/messages`,
+          ),
+        ).toBe(false);
+        expect(messagePostRoutes(restCalls)).toEqual([
+          `/channels/${boot.thread_cid}/messages`,
+          `/channels/${boot.thread_cid}/messages`,
+          `/channels/${boot.other_cid}/messages`,
+          `/channels/${boot.thread_cid}/messages`,
+          `/channels/${boot.thread_cid}/messages`,
+          `/channels/${boot.thread_cid}/messages`,
+        ]);
+        expect(restCalls.some((call) => isParentRoute(call.route))).toBe(false);
+
+        const snapBgAfter = await inspectDb({
+          runId: bgRunId,
+          deliveryKey: `fallback:${bgRunId}`,
+        });
+        expect(snapBgAfter.background_run?.fallback_pending).toBe(false);
+        expect(snapBgAfter.delivery?.status).toBe("sent");
+        expect(snapBgAfter.delivery?.is_current).toBe(true);
+      } finally {
+        if (app) {
+          await app.stop();
+        }
+        if (backendHandle) {
+          await backendHandle.stop();
+        }
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    },
+    60_000,
+  );
+});
+
+
+describe.skipIf(feishuSuiteGate === "skip")("Real HTTP End-to-End: FeishuChannelAdapter -> GatewayOrchestrator -> HttpBackendClient -> FastAPI channels_router -> Isolated Postgres", () => {
+  it.skipIf(!hasRealEnv && feishuSuiteGate !== "fail")(
     "verifies I-1/I-3/I-6/I-7 wire parameters, default Home, Chinese+space workspace, duplicate candidates, real permission check, /workspace main vs /main, /new idempotency, 6-hour expiry, group mention gating, per-user group isolation, and delivery activity guards",
     async () => {
+      if (feishuSuiteGate === "fail") {
+        throw new Error(realHttpSuiteSelectionError("feishu"));
+      }
       const BOT_OPEN_ID = "ou_bot_real_http";
       const tempDir = mkdtempSync(join(tmpdir(), "dalton-gw-real-http-"));
       let backendHandle: { baseUrl: string; stop: () => Promise<void> } | null =
@@ -382,7 +1109,6 @@ describe("Real HTTP End-to-End: FeishuChannelAdapter -> GatewayOrchestrator -> H
           backend: realBackendClient,
           adapters,
         });
-
         const feishuInboundAdapter = new FeishuChannelAdapter({
           appId: "cli_real_http",
           appSecret: "sec_real_http",

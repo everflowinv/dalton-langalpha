@@ -20,7 +20,15 @@ This package (`@dalton/channel-gateway`) includes code adapted from the OpenClaw
 | `src/channels/feishu/media.ts` | `feishu/dist/.setup/reply-delivery-result-iCCrdxE1.mjs` | `1709–2437` |
 | `src/channels/feishu/directory.ts` | `feishu/dist/.setup/channel.runtime-CC15v8AP.mjs`, `feishu/dist/.setup/chat-fC3dvxFs.mjs` | `91–183`, `46–101` |
 | `src/channels/feishu/monitor.ts` | `feishu/dist/.setup/monitor.account-UbN1RhlP.mjs` | `858–872`, `5215–5309`, `5343–5565`, `5622–5760`, `6228–6317` |
+| `src/channels/discord/rest.ts` | `discord/dist/.setup/discord-BGqgx-yd.mjs` | `1175–1845` |
+| `src/channels/discord/gateway.ts` | `discord/dist/.setup/provider-CbmXLYrW.mjs` | `4383–4461`, `4499–4592`, `4680–4978`, `8174–8191`, `8304–8314` |
+| `src/channels/discord/chunk.ts` | `discord/dist/.setup/send.receipt-BAlzXd8e.mjs`, `discord/dist/.setup/send.outbound-_jx4Xpd3.mjs` | `44–178`, `173–347` |
+| `src/channels/discord/send.ts` | `discord/dist/.setup/send.outbound-_jx4Xpd3.mjs`, `discord/dist/.setup/send.shared-CjQ4jbMA.mjs` | `382–420`, `184–226`, `457–620` |
+| `src/channels/discord/threading.ts` | `discord/dist/.setup/send-DbILKgcm.mjs`, `discord/dist/.setup/threading-BWz5lW0p.mjs` | `267–378`, `113–193` |
+| `src/channels/discord/inbound.ts` | `discord/dist/.setup/transcripts-source-EMrQb132.mjs` | `1–22`, `135–429` |
 | `src/native-commands/manifest.ts`, `src/native-commands/discord-registrar.ts` | `openclaw/dist/commands-registry-list-BbUjmer4.mjs`, `@openclaw/discord/dist/.setup/provider-CbmXLYrW.mjs` | `1–30`, `3948–4026`, `6096–6121` |
+
+Discord code above is adapted under the same OpenClaw MIT license below; no full license copy is duplicated. Runtime/type dependencies `ws` and `discord-api-types` are used under their own package licenses as declared in `package.json`.
 
 ## Referenced and Adapted Lark CLI Files
 

@@ -110,6 +110,8 @@ async def _resolve_caller_and_ticket(
     Never reads `X-Dalton-User`, `X-Dalton-Workspace`, or `X-Dalton-Thread` headers.
     """
     _require_dalton_enabled()
+    from src.dalton.company_identity import reject_company_system_auth
+
     has_ticket, raw_ticket = _extract_ticket_from_request(request, credentials)
     if has_ticket:
         claims = verify_transcription_ticket(
@@ -117,7 +119,9 @@ async def _resolve_caller_and_ticket(
             required_op=required_op,
             expected_job_id=expected_job_id,
         )
-        return str(claims["user_id"]), claims
+        ticket_uid = str(claims["user_id"])
+        reject_company_system_auth(ticket_uid)
+        return ticket_uid, claims
 
     override = request.app.dependency_overrides.get(get_current_user_id)
     if callable(override):
@@ -129,6 +133,7 @@ async def _resolve_caller_and_ticket(
         user_id = await get_current_user_id(request, credentials)
     if not user_id:
         raise HTTPException(status_code=401, detail="Authentication required")
+    reject_company_system_auth(user_id)
     return user_id, None
 
 

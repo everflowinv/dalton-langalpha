@@ -18,15 +18,30 @@ from __future__ import annotations
 import logging
 from typing import Literal
 
+from src.dalton.company_identity import (
+    COMPANY_SYSTEM_EMAIL,
+    COMPANY_SYSTEM_USER_ID,
+    is_company_system_user,
+)
 from src.dalton.invites import is_invite_pm
 from src.dalton.settings import get_dalton_allowed_emails
 
 logger = logging.getLogger(__name__)
 
-UserTier = Literal["admin", "internal", "external"]
+UserTier = Literal["admin", "internal", "external", "company"]
 # Strict owner-side classification: "unknown" means the roster lookup failed
 # or found no user row, so no isolation rule may be applied to the resource.
-OwnerTier = Literal["admin", "internal", "external", "unknown"]
+OwnerTier = Literal["admin", "internal", "external", "company", "unknown"]
+
+__all__ = [
+    "COMPANY_SYSTEM_EMAIL",
+    "COMPANY_SYSTEM_USER_ID",
+    "OwnerTier",
+    "UserTier",
+    "classify_owner_tier",
+    "get_user_tier",
+    "is_internal_or_admin",
+]
 
 
 async def get_user_tier(user_id: str | None) -> UserTier:
@@ -34,6 +49,8 @@ async def get_user_tier(user_id: str | None) -> UserTier:
     uid = str(user_id or "").strip()
     if not uid:
         return "external"
+    if is_company_system_user(uid):
+        return "company"
     try:
         if is_invite_pm(uid):
             return "admin"
@@ -97,6 +114,8 @@ async def classify_owner_tier(owner_id: str | None) -> OwnerTier:
     uid = str(owner_id or "").strip()
     if not uid:
         return "unknown"
+    if is_company_system_user(uid):
+        return "company"
     try:
         if is_invite_pm(uid):
             return "admin"

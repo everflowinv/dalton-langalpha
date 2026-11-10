@@ -130,6 +130,8 @@ class _InMemoryAutomationsStore:
         delivery_config: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
         status: str = "active",
+        scope: str | None = None,
+        created_by: str | None = None,
         conn: Any = None,
     ) -> dict[str, Any]:
         self.observed_conns["create"].append(conn)
@@ -160,6 +162,8 @@ class _InMemoryAutomationsStore:
             "disable_reason": None,
             "delivery_config": dict(delivery_config or {}),
             "metadata": dict(metadata or {}),
+            "scope": scope,
+            "created_by": created_by or user_id,
         }
         self.rows.append(row)
         return dict(row)

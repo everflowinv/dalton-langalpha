@@ -172,6 +172,11 @@ export interface I2BindCodeConsumeRequest {
   code?: string | null;
   is_group: boolean;
   user_id?: string | null;
+  message_id?: string | null;
+  chat_type?: "dm" | "group" | string | null;
+  chat_address?: string | null;
+  scope_key?: string | null;
+  request_key?: string | null;
 }
 
 export interface I2BindCodeConsumeResponse {
@@ -188,6 +193,9 @@ export interface I2BindCodeConsumeResponse {
   platform_user_id?: string;
   generation?: number;
   generations?: Record<string, number>;
+  duplicate?: boolean;
+  command_effect_status?: string | null;
+  command_reply_pending?: boolean;
 }
 
 export interface I3SessionCommandRequest {
@@ -247,6 +255,21 @@ export interface I3SessionCommandResponse {
   switched?: boolean;
 }
 
+/** Stored I-2 bind/unbind result. `user_id` may remain after the platform identity is removed. */
+export interface StoredBindingCommandResult {
+  ok: boolean;
+  reason?: string | null;
+  expected_platform?: string | null;
+  user_id?: string | null;
+  platform?: string | null;
+  platform_user_id?: string | null;
+  duplicate?: boolean;
+  command_effect_status?: string | null;
+  command_reply_pending?: boolean;
+  generation?: number | null;
+  generations?: Record<string, number> | null;
+}
+
 export interface I4StateResponse {
   user_id: string;
   user_tier: string;
@@ -280,6 +303,7 @@ export interface I4StateResponse {
     thread_id: string | null;
     run_id: string | null;
     external_thread_id: string | null;
+    thread_scope_key?: string | null;
   } | null;
   resolved_thread_id?: string | null;
 }
@@ -349,6 +373,7 @@ export interface I6AuthorizeAndClaimResponse {
   recipient_id?: string;
   platform?: string | null;
   target_address?: string | null;
+  thread_scope_key?: string | null;
   is_current?: boolean;
   home_workspace_id?: string;
   weixin_context_token?: string | null;
@@ -496,7 +521,10 @@ export interface RecoverInboundEventRow {
   session_generation?: number | null;
   event_kind?: "message" | "command" | string;
   command_request?: Record<string, unknown> | null;
-  command_result?: I3SessionCommandResponse | null;
+  command_result?:
+    | (I3SessionCommandResponse & Partial<StoredBindingCommandResult>)
+    | StoredBindingCommandResult
+    | null;
   command_effect_status?: string | null;
   command_reply_pending?: boolean;
   pending_interrupt_snapshot?: PendingInterruptState | null;
@@ -517,6 +545,7 @@ export interface RecoverBackgroundRunRow {
   platform: ChannelPlatform;
   target_address: string;
   scope_key?: string | null;
+  thread_scope_key?: string | null;
   generation?: number | null;
   session_generation?: number | null;
   turn_index: number | null;
@@ -531,6 +560,7 @@ export interface RecoverThreadWatchRow {
   platform: ChannelPlatform;
   target_address: string;
   scope_key: string;
+  thread_scope_key?: string | null;
   generation: number;
   last_seen_turn_index: number;
   watch_active: boolean;

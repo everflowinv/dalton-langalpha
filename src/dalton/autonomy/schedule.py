@@ -540,10 +540,42 @@ async def schedule_dalton_automation_helper(
     if not user_id or not str(user_id).strip():
         raise ValueError("user_id is required")
     user_id = str(user_id).strip()
+    from src.dalton.company_identity import is_company_system_user
+    from src.dalton.database.company_automations import resolve_automation_scope_for_write
     from src.server.database import automation as auto_db
     from src.server.database.home_workspace import is_home_row
 
+    if is_company_system_user(user_id):
+        raise ValueError("Company system identity cannot schedule automations via personal scheduler")
+
     merged_spec: dict[str, Any] = dict(spec or entry or {})
+    if str(merged_spec.get("scope") or "").strip().lower() == "company" or is_company_system_user(
+        merged_spec.get("user_id")
+    ):
+        return {
+            "ok": False,
+            "error": "forbidden_company_scope",
+            "message": "客户端不能通过提交 scope 或 user_id 将任务转到公司身份。",
+        }
+    if "user_id" in merged_spec and str(merged_spec.get("user_id") or "").strip() not in ("", user_id):
+        return {
+            "ok": False,
+            "error": "forbidden_owner_override",
+            "message": "禁止通过 spec 指定其他用户的 user_id。",
+        }
+    for _protected_key in (
+        "scope",
+        "user_id",
+        "created_by",
+        "updated_by",
+        "audit_history",
+        "config_version",
+        "active_version",
+        "notify_storage_mode",
+        "deleted_at",
+        "deleted_by",
+    ):
+        merged_spec.pop(_protected_key, None)
     resolved_action = str(action or merged_spec.get("action") or "upsert").strip().lower()
     resolved_name = str(name or merged_spec.get("name") or "").strip()
     raw_ws = workspace_id if workspace_id is not None else merged_spec.get("workspace_id")
@@ -814,6 +846,28 @@ async def schedule_dalton_automation_helper(
                 patch["metadata"] = merged_meta
             if explicit_status:
                 patch["status"] = explicit_status
+            saved_workspace_id = (
+                patch["workspace_id"]
+                if "workspace_id" in patch
+                else existing.get("workspace_id")
+            )
+            saved_name = (
+                str(patch["name"])
+                if "name" in patch and patch["name"] is not None
+                else str(existing.get("name") or resolved_name)
+            )
+            saved_metadata = (
+                patch["metadata"]
+                if "metadata" in patch
+                else existing.get("metadata")
+            )
+            patch["scope"] = await resolve_automation_scope_for_write(
+                user_id,
+                name=saved_name,
+                workspace_id=str(saved_workspace_id) if saved_workspace_id else None,
+                metadata=saved_metadata if isinstance(saved_metadata, dict) else None,
+                conn=active_conn,
+            )
             updated = await auto_db.update_automation(
                 str(existing["automation_id"]),
                 user_id,
@@ -828,6 +882,13 @@ async def schedule_dalton_automation_helper(
             }
 
         clean_meta = {k: v for k, v in meta.items() if v is not None}
+        resolved_scope = await resolve_automation_scope_for_write(
+            user_id,
+            name=resolved_name,
+            workspace_id=ws_id,
+            metadata=clean_meta,
+            conn=active_conn,
+        )
         create_kw: dict[str, Any] = dict(conn_kw)
         if explicit_status and explicit_status != "active":
             create_kw["status"] = explicit_status
@@ -848,6 +909,8 @@ async def schedule_dalton_automation_helper(
             conversation_thread_id=merged_spec.get("conversation_thread_id"),
             delivery_config=merged_spec.get("delivery_config"),
             metadata=clean_meta,
+            scope=resolved_scope,
+            created_by=user_id,
             **create_kw,
         )
         return {
