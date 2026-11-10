@@ -290,7 +290,7 @@ tasks:
 
   - task_code: "T27"
     job_key: "asia-leverage-crossview-daily"
-    title: "四地(CN/KR/JP/TW)杠杆拥挤度跨市场日频监控 v3.1: 拥挤度=主杠杆存量三视角加权(40/40/20); 卡片=结论与观察+定性判断+去杠杆进度对标+历史图内嵌, 发送到飞书 Eve tracking 群"
+    title: "亚洲四地（CN/KR/JP/TW）杠杆拥挤度日频计算，生成情绪看板使用的指标、历史数据和图表"
     batch_no: 3
     runner: "container"
     cron: "30 22 * * 1-5"
