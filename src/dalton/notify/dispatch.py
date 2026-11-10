@@ -2594,6 +2594,7 @@ async def retry_failed_notify_deliveries(
                         )
                         else "retry_budget_exhausted"
                     )
+                    row_claimed = False
                     await _release_unstarted_retry_claim(
                         exec_id,
                         ch,
@@ -2602,7 +2603,6 @@ async def retry_failed_notify_deliveries(
                         restored_error_code=restored_code,
                         mark_delivery_fn=mark_delivery_fn,
                     )
-                    row_claimed = False
                     break
 
                 text = str(payload.get("text") or "")

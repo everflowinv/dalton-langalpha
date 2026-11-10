@@ -5712,6 +5712,82 @@ async def test_retry_connect_budget_and_unstarted_claim_release_db(
             "item_count": 0,
         }
 
+        # A released attempt belongs to the worker that subsequently claims it.
+        await admin_conn.execute(
+            "UPDATE dalton_notify_deliveries SET status='failed', error_code='ConnectError', attempt_count=2 WHERE execution_id=%s",
+            (run_id,),
+        )
+        released_evt = asyncio.Event()
+        hold_release_evt = asyncio.Event()
+        original_release = notify_dispatch_mod._release_unstarted_retry_claim
+
+        async def _release_then_wait(*args: Any, **kwargs: Any) -> bool:
+            released = await original_release(*args, **kwargs)
+            assert released is True
+            released_evt.set()
+            await hold_release_evt.wait()
+            return released
+
+        clock["elapsed"] = 0.0
+        with monkeypatch.context() as cancel_patch:
+            cancel_patch.setattr(
+                notify_dispatch_mod,
+                "_remaining_retry_request_budget_s",
+                create_autospec(
+                    notify_dispatch_mod._remaining_retry_request_budget_s,
+                    side_effect=[26.5, 26.5, 0.1],
+                ),
+            )
+            cancel_patch.setattr(
+                notify_dispatch_mod,
+                "_release_unstarted_retry_claim",
+                create_autospec(original_release, side_effect=_release_then_wait),
+            )
+            old_worker = asyncio.create_task(
+                notify_dispatch_mod.retry_failed_notify_deliveries(
+                    resolve_enabled_fn=create_autospec(notify_dispatch_mod.resolve_dalton_notify_enabled, return_value=True),
+                    resolve_overrides_fn=create_autospec(notify_dispatch_mod.resolve_dalton_notify_overrides, return_value={}),
+                    resolve_targets_fn=create_autospec(notify_dispatch_mod.resolve_dalton_notify_targets, return_value=[target]),
+                    resolve_routes_fn=create_autospec(notify_dispatch_mod.resolve_dalton_notify_routes, return_value={"data:softbank-nav-monitor": [target]}),
+                    is_admin_fn=create_autospec(notify_dispatch_mod.resolve_dalton_notify_enabled, return_value=True),
+                    max_duration_s=30.0,
+                )
+            )
+            release_wait = asyncio.create_task(released_evt.wait())
+            try:
+                done, _ = await asyncio.wait({old_worker, release_wait}, timeout=5, return_when=asyncio.FIRST_COMPLETED)
+                if old_worker in done:
+                    await old_worker
+                    pytest.fail("Worker ended before releasing its unstarted attempt")
+                assert release_wait in done
+                async with _real_db_conn() as next_conn:
+                    async with next_conn.cursor(row_factory=dict_row) as cur:
+                        await cur.execute(
+                            "UPDATE dalton_notify_deliveries SET status='pending', error_code=NULL, attempt_count=attempt_count+1 WHERE execution_id=%s AND status='failed' AND attempt_count=2 RETURNING attempt_count",
+                            (run_id,),
+                        )
+                        assert await cur.fetchone() == {"attempt_count": 3}
+                old_worker.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(old_worker, timeout=5)
+                assert await _read_outer() == {
+                    "outer": {"status": "pending", "error_code": None, "attempt_count": 3},
+                    "item_count": 0,
+                }
+                await notify_dispatch_mod.mark_target_delivery(
+                    run_id, "feishu", target, status="sent", error_code=None,
+                    expected_status="pending", expected_attempt_count=3,
+                )
+                assert (await _read_outer())["outer"] == {
+                    "status": "sent", "error_code": None, "attempt_count": 3,
+                }
+            finally:
+                hold_release_evt.set()
+                for owned in (old_worker, release_wait):
+                    if not owned.done():
+                        owned.cancel()
+                await asyncio.gather(old_worker, release_wait, return_exceptions=True)
+
         # Reset row to `status='failed', attempt_count=1` for ConnectTimeout & ReadTimeout checks
         async with admin_conn.cursor() as cur:
             await cur.execute(
