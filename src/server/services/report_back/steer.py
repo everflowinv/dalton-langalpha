@@ -48,6 +48,8 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Sequence
+# DALTON-HOOK(chat-large-upload): type annotations for steered upload materialization and metadata
+from typing import Any
 
 from ptc_agent.agent.middleware.steering import ALL_KINDS, SteeredReport
 from src.server.services.market_targets import inline as market_inline

@@ -199,19 +199,24 @@ describe('history replay: the steers a dead stream left', () => {
 });
 
 describe('history replay: a turn opened hidden', () => {
-  // The onboarding kickoff's query is stored empty: its words were the model's.
+  // DALTON-HOOK(chat-large-upload): explicit onboarding kickoff stays hidden (even with attachments),
+  // while user-sent file-only turns draw their visible user row with attachment chips.
+  // The onboarding kickoff's query is stored empty with its `onboarding` skill named in additional_context.
   const hiddenOpener = (turn: number, runId?: string) => ({
     event: 'user_message',
     data: {
       thread_id: 'thread-1', turn_index: turn, content: '',
-      metadata: { attachments: [{ name: 'positions.png', type: 'image/png', size: 1024 }] },
+      metadata: {
+        additional_context: [{ type: 'skills', name: 'onboarding' }, { type: 'directive', content: '<market-brief>' }],
+        attachments: [{ name: 'positions.png', type: 'image/png', size: 1024 }],
+      },
       ...(runId ? { run_id: runId } : {}),
     },
   });
   const liveReply = (over: Record<string, unknown> = {}) =>
     ({ id: 'assistant-live', role: 'assistant', content: 'Welc', turnIndex: 0, isStreaming: false, hiddenOpener: true, contentSegments: [], ...over }) as unknown as ChatMessage;
 
-  it('draws no user row for it, attachments and all, so the reply opens the chat', async () => {
+  it('draws no user row for an explicit onboarding kickoff, attachments and all, so the reply opens the chat', async () => {
     const { rt, read } = buildRuntime();
     api.replayThreadHistory.mockImplementation(replayOf([
       hiddenOpener(0, 'run-0'), chunk(0, 'Welcome. Three places to start.'),
@@ -221,6 +226,8 @@ describe('history replay: a turn opened hidden', () => {
 
     expect(ids(read())).toEqual(['history-assistant-0', 'history-user-1', 'history-assistant-1']);
     expect(read()[0].content).toBe('Welcome. Three places to start.');
+    // DALTON-HOOK(chat-large-upload): onboarding kickoff keeps hiddenOpener even with attachments
+    expect(read()[0]).toMatchObject({ hiddenOpener: true });
   });
 
   it('gives its live copy way to the replay, as an opener with text would', async () => {
@@ -232,7 +239,8 @@ describe('history replay: a turn opened hidden', () => {
     expect(ids(read())).toEqual(['history-assistant-0']);
   });
 
-  it('flags its reply as the live one was, which a turn of attachments alone is not', async () => {
+  // DALTON-HOOK(chat-large-upload): user-sent file-only turns render visible user rows with chips
+  it('flags its reply as the live one was, while a turn of attachments alone draws its user row with chips and stays unflagged', async () => {
     const { rt, read } = buildRuntime();
     const kickoff = {
       event: 'user_message',
@@ -255,12 +263,17 @@ describe('history replay: a turn opened hidden', () => {
     ]));
     await loadConversationHistory(rt, makeDeps());
 
-    expect(ids(read())).toEqual(['history-assistant-0', 'history-assistant-1']);
+    expect(ids(read())).toEqual(['history-assistant-0', 'history-user-1', 'history-assistant-1']);
     expect(read()[0]).toMatchObject({ hiddenOpener: true });
-    expect((read()[1] as { hiddenOpener?: boolean }).hiddenOpener).toBeUndefined();
+    expect(read()[1]).toMatchObject({
+      role: 'user',
+      content: '',
+      attachments: [{ name: 'positions.png', type: 'image/png', size: 1024 }],
+    });
+    expect((read()[2] as { hiddenOpener?: boolean }).hiddenOpener).toBeUndefined();
   });
 
-  it('leaves unflagged a turn of attachments alone sent with Watch on, whose skill the user sent', async () => {
+  it('draws the visible user row and leaves unflagged a turn of attachments alone sent with Watch on, whose skill the user sent', async () => {
     const { rt, read } = buildRuntime();
     // The Watch toggle adds the `market-watch` skill to every send, so a turn
     // of files alone stores an empty query with a skill named beside them.
@@ -277,8 +290,69 @@ describe('history replay: a turn opened hidden', () => {
     api.replayThreadHistory.mockImplementation(replayOf([watchedAttachments, chunk(0, 'Two positions.')]));
     await loadConversationHistory(rt, makeDeps());
 
-    expect(ids(read())).toEqual(['history-assistant-0']);
-    expect((read()[0] as { hiddenOpener?: boolean }).hiddenOpener).toBeUndefined();
+    expect(ids(read())).toEqual(['history-user-0', 'history-assistant-0']);
+    expect(read()[0]).toMatchObject({
+      role: 'user',
+      content: '',
+      attachments: [{ name: 'positions.png', type: 'image', size: 1024 }],
+    });
+    expect((read()[1] as { hiddenOpener?: boolean }).hiddenOpener).toBeUndefined();
+  });
+
+  it('replaces a dead live file-only turn on reload and produces no duplicates across repeated replays', async () => {
+    const { rt, read } = buildRuntime();
+    // DALTON-HOOK(chat-large-upload): verify file-only user turn dedup against dead live bubble and across repeated replays
+    rt.setMessages(() => [
+      {
+        id: 'user-live-0',
+        role: 'user',
+        content: '',
+        turnIndex: 0,
+        isStreaming: false,
+        attachments: [{ name: 'model_200m.zip', type: 'application/zip', size: 209_715_200, upload_id: 'up-200m' }],
+      } as unknown as ChatMessage,
+      {
+        id: 'assistant-live-0',
+        role: 'assistant',
+        content: 'Analyzing archive...',
+        turnIndex: 0,
+        isStreaming: false,
+        contentSegments: [],
+      } as unknown as ChatMessage,
+    ]);
+    const fileOnlyTurn = {
+      event: 'user_message',
+      data: {
+        thread_id: 'thread-1', turn_index: 0, content: '', run_id: 'run-0',
+        metadata: {
+          attachments: [{
+            name: 'model_200m.zip',
+            type: 'file',
+            mime_type: 'application/zip',
+            size: 209_715_200,
+            upload_id: 'up-200m',
+          }],
+        },
+      },
+    };
+    api.replayThreadHistory.mockImplementation(replayOf([fileOnlyTurn, chunk(0, 'Archive verified.')]));
+
+    await loadConversationHistory(rt, makeDeps());
+    expect(ids(read())).toEqual(['history-user-0', 'history-assistant-0']);
+    expect(read()[0]).toMatchObject({
+      role: 'user',
+      content: '',
+      attachments: [{
+        name: 'model_200m.zip',
+        type: 'file',
+        mime_type: 'application/zip',
+        size: 209_715_200,
+        upload_id: 'up-200m',
+      }],
+    });
+
+    await loadConversationHistory(rt, makeDeps());
+    expect(ids(read())).toEqual(['history-user-0', 'history-assistant-0']);
   });
 
   it('keeps a reply the server refused, which holds no turn of the replay', async () => {

@@ -40,7 +40,8 @@ import { bumpThreadNavOrder } from './useNavigationData';
 import { invalidateNewWorkspace } from './workspaceRowActions';
 import { ensureThreadId } from '../session/threadCreation';
 export { removeStoredThreadId } from './utils/threadStorage';
-import { carriesContext, createUserMessage, createAssistantMessage, createNotificationMessage, appendMessage, updateMessage, type AttachmentMeta } from './utils/messageHelpers';
+// DALTON-HOOK(chat-large-upload): normalize server-verified and caller-owned steer attachments
+import { carriesContext, createUserMessage, createAssistantMessage, createNotificationMessage, appendMessage, updateMessage, mergeAcceptedAttachments, normalizeAttachments, type AttachmentMeta } from './utils/messageHelpers';
 import type { HitlResponseBody } from '@/types/api';
 import type { AssistantMessage, UserMessage, ChatMessage } from '@/types/chat';
 import type { ArtifactCommentsShown } from '@/types/api';
@@ -1498,7 +1499,10 @@ export function useChatMessages(
       // blanket completion of inline subagent cards: each is born with its real
       // status from the replayed task-artifact stamp, and one would clobber a
       // legitimately 'cancelled' card.
-      const pendingSteers = (status.pending_steers ?? []).filter((p) => p.content || p.artifact_comments);
+      // DALTON-HOOK(chat-large-upload): keep parked file-only steers and normalize attachment metadata
+      const pendingSteers = (status.pending_steers ?? []).filter(
+        (p) => p.content || p.artifact_comments || normalizeAttachments(p.attachments),
+      );
       const pendingKeys = new Set(pendingSteers.map((p) => p.request_key).filter((key): key is string => !!key));
       const settleEndedRun = (ok: boolean) => {
         if (cancelled || sessionEpochRef.current !== sessionEpochAtStart) return;
@@ -1535,6 +1539,8 @@ export function useChatMessages(
               .filter((p) => !p.request_key || !shown.has(p.request_key))
               .map((p, i): UserMessage => {
                 const shown = readArtifactCommentsShown(p.artifact_comments);
+                // DALTON-HOOK(chat-large-upload): attach normalized file metadata onto pending steer rows
+                const attachments = normalizeAttachments(p.attachments);
                 return {
                   id: `pending-steer-${p.request_key ?? i}`,
                   role: 'user',
@@ -1547,6 +1553,7 @@ export function useChatMessages(
                   ...(turn !== null && turn >= 0 ? { turnIndex: turn } : {}),
                   ...(p.request_key ? { requestKey: p.request_key } : {}),
                   ...(shown ? { artifactComments: shown } : {}),
+                  ...(attachments ? { attachments } : {}),
                 };
               });
             if (rows.length === 0) return prev;
@@ -2283,19 +2290,23 @@ export function useChatMessages(
             // The comments the server took, which may be fewer than were
             // sent: one sent or deleted meanwhile is left out.
             const taken = readArtifactCommentsShown(event.artifact_comments);
-            // DALTON-HOOK(chat-large-upload): sync server-verified attachment metadata on steering_accepted
-            const acceptedAttachments = Array.isArray(event.attachments) && event.attachments.length > 0
-              ? (event.attachments as AttachmentMeta[])
-              : undefined;
+            // DALTON-HOOK(chat-large-upload): normalize server-verified attachment metadata while preserving caller-owned blob fields
+            const hasServerAttachments = Array.isArray(event.attachments) && event.attachments.length > 0;
             // Update the user message to reflect steering status
             setMessages((prev) =>
-              updateMessage(prev,userMessage.id as string, (msg) => ({
-                ...msg,
-                steering: true,
-                queuePosition: event.position,
-                ...(taken ? { artifactComments: taken } : {}),
-                ...(acceptedAttachments ? { attachments: acceptedAttachments } : {}),
-              }))
+              updateMessage(prev, userMessage.id as string, (msg) => {
+                if (msg.role !== 'user') return msg;
+                const mergedAttachments = hasServerAttachments
+                  ? mergeAcceptedAttachments(msg.attachments, event.attachments)
+                  : undefined;
+                return {
+                  ...msg,
+                  steering: true,
+                  queuePosition: event.position,
+                  ...(taken ? { artifactComments: taken } : {}),
+                  ...(mergedAttachments ? { attachments: mergedAttachments } : {}),
+                };
+              })
             );
             requestKeys.settle(requestKey, 'accepted');
             return;

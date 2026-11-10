@@ -18,6 +18,8 @@ import type { PairState } from '../types';
 import type { StructuredError } from '@/utils/rateLimitError';
 import { wakeTurnOpener } from '../wakeupEvents';
 import { openerMatchText, readArtifactCommentsShown } from '../../components/artifactComments/artifactCommentSend';
+// DALTON-HOOK(chat-large-upload): normalize persisted attachment metadata on replayed turns
+import { normalizeAttachments } from '../../hooks/utils/messageHelpers';
 
 
 /** Shape of an SSE history event. */
@@ -79,11 +81,12 @@ function dropLiveCopy(
   pairIndex: number,
   insertIndex: number,
 ): { rest: MessageRecord[]; removedAbove: number } {
+  // DALTON-HOOK(chat-large-upload): skip unadmitted sends when matching live copies of empty/file-only turns
   let opener = -1;
   for (let i = prev.length - 1; i >= 0; i--) {
     const m = prev[i];
     if (
-      m.role === 'user' && !m.isHistory && !m.queued && opensTurn(m)
+      m.role === 'user' && !m.isHistory && !m.queued && !m.unadmitted && opensTurn(m)
       && m.turnIndex === pairIndex && String(m.content ?? '').trim() === content
     ) {
       opener = i;
@@ -143,7 +146,12 @@ function refusedBefore(m: MessageRecord, turn: number): boolean {
  * price alert or a wakeup that woke the agent is written for the model too,
  * and heads its turn as its row, which still draws when it names nothing.
  */
-function turnOpenerRow(event: HistoryEvent, pairIndex: number, text: string): MessageRecord | null {
+function turnOpenerRow(
+  event: HistoryEvent,
+  pairIndex: number,
+  text: string,
+  opensHidden = false,
+): MessageRecord | null {
   // Deterministic id keyed only on pairIndex (the server-side turn_index,
   // unique per turn). Earlier code suffixed `Date.now()` here as
   // speculative collision defense, but that made the same logical bubble
@@ -162,12 +170,14 @@ function turnOpenerRow(event: HistoryEvent, pairIndex: number, text: string): Me
       ...(event.report_run_id ? { runId: event.report_run_id } : {}),
     }) : null;
   }
-  // DALTON-HOOK(chat-large-upload): render user turn opener for file-only messages and parked steers
-  const hasAttachments = Array.isArray(event.metadata?.attachments) && event.metadata.attachments.length > 0;
-  if (!text && !hasAttachments) return null;
+  // DALTON-HOOK(chat-large-upload): keep explicit onboarding kickoffs hidden while rendering file-only user turns
+  if (opensHidden) return null;
+  const attachments = normalizeAttachments(event.metadata?.attachments);
+  if (!text && !attachments) return null;
   const row: MessageRecord = {
     id, role: 'user', content: event.content, contentType: 'text', timestamp,
     isStreaming: false, isHistory: true, turnIndex: pairIndex,
+    ...(attachments ? { attachments } : {}),
   };
   const provenance = senderProvenance(event.metadata);
   if (provenance) row.provenance = provenance;
@@ -280,12 +290,13 @@ export function handleHistoryUserMessage({
       steeringBatches: 0,
     });
 
-    const userMessage = turnOpenerRow(event, pairIndex, messageContent);
+    // DALTON-HOOK(chat-large-upload): pass opensHidden and normalize persisted attachments
+    const userMessage = turnOpenerRow(event, pairIndex, messageContent, opensHidden);
     if (userMessage) {
       // Restore attachment metadata from persisted query metadata
-      const attachments = event.metadata?.attachments as unknown[] | undefined;
-      if (attachments && attachments.length > 0) {
-        userMessage.attachments = event.metadata!.attachments;
+      const normalized = normalizeAttachments(event.metadata?.attachments);
+      if (normalized) {
+        userMessage.attachments = normalized;
       }
 
       // Restore widget snapshot metadata so the chip deck re-renders below

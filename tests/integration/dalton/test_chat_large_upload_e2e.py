@@ -1869,58 +1869,95 @@ class TestChatLargeUploadRealInfra:
                 return (size_2, "0" * 64)
             return real_digest(object_key)
 
-        with patch.object(
-            storage,
-            "compute_stored_object_digest",
-            create_autospec(real_digest, side_effect=_digest_fail_2b),
-        ):
-            task_2b_stale = asyncio.create_task(
-                chat_upload_infra.client.post(
-                    f"/api/v1/dalton/chat-uploads/{uid_2b}/complete",
-                    headers=headers,
-                    json={"sha256": sha_2b},
+        tid_2b = str(uuid4())
+        await create_thread(
+            tid_2b,
+            workspace_id,
+            "completed",
+            user_id=user["user_id"],
+        )
+        ctx_2b = [
+            {
+                "type": "chat_upload",
+                "upload_id": uid_2b,
+                "name": "stale_fail.bin",
+                "mime_type": "application/octet-stream",
+                "size": size_2,
+            }
+        ]
+        scope_2b = RunScope(user_id=user["user_id"], burst_slot_id=None)
+        try:
+            with patch.object(
+                storage,
+                "compute_stored_object_digest",
+                create_autospec(real_digest, side_effect=_digest_fail_2b),
+            ):
+                task_2b_stale = asyncio.create_task(
+                    chat_upload_infra.client.post(
+                        f"/api/v1/dalton/chat-uploads/{uid_2b}/complete",
+                        headers=headers,
+                        json={"sha256": sha_2b},
+                    )
                 )
-            )
-            assert await asyncio.to_thread(entered_2b_fail.wait, 10)
+                assert await asyncio.to_thread(entered_2b_fail.wait, 10)
 
-            async with chat_upload_infra.db() as conn:
-                await conn.execute(
-                    "UPDATE dalton_chat_file_uploads SET lease_until = NOW() - INTERVAL '5 seconds' WHERE upload_id = %s",
-                    (uid_2b,),
-                )
+                async with chat_upload_infra.db() as conn:
+                    await conn.execute(
+                        "UPDATE dalton_chat_file_uploads SET lease_until = NOW() - INTERVAL '5 seconds' WHERE upload_id = %s",
+                        (uid_2b,),
+                    )
 
-            try:
-                resp_2b_win = await chat_upload_infra.client.post(
-                    f"/api/v1/dalton/chat-uploads/{uid_2b}/complete",
-                    headers=headers,
-                    json={"sha256": sha_2b},
-                )
-                assert resp_2b_win.status_code == 200, resp_2b_win.text
-                await validate_and_claim_request_attachments(
-                    [
-                        {
-                            "type": "chat_upload",
-                            "upload_id": uid_2b,
-                            "name": "stale_fail.bin",
-                            "mime_type": "application/octet-stream",
-                            "size": size_2,
-                        }
-                    ],
-                    user_id=user["user_id"],
-                    workspace_id=workspace_id,
-                )
-            finally:
-                release_2b_fail.set()
+                try:
+                    resp_2b_win = await chat_upload_infra.client.post(
+                        f"/api/v1/dalton/chat-uploads/{uid_2b}/complete",
+                        headers=headers,
+                        json={"sha256": sha_2b},
+                    )
+                    assert resp_2b_win.status_code == 200, resp_2b_win.text
+                    prov_2b = await validate_and_claim_request_attachments(
+                        ctx_2b,
+                        user_id=user["user_id"],
+                        workspace_id=workspace_id,
+                        claim_key="req:rk-2b-accept",
+                    )
+                    assert prov_2b[0]["used_at"] is None
+                    assert "req:rk-2b-accept" in (prov_2b[0]["pending_claims"] or {})
 
-            resp_2b_stale = await task_2b_stale
-            assert resp_2b_stale.status_code == 200, resp_2b_stale.text
-            assert resp_2b_stale.json()["state"] == "ready"
-            assert resp_2b_stale.json()["sha256"] == sha_2b
+                    await begin_run(
+                        ChatRequest(
+                            messages=[ChatMessage(role="user", content="Accept 2b")],
+                            workspace_id=workspace_id,
+                            request_key="rk-2b-accept",
+                            additional_context=ctx_2b,
+                        ),
+                        scope=scope_2b,
+                        thread_id=tid_2b,
+                        run_id=str(uuid4()),
+                        workspace_id=workspace_id,
+                        user_id=user["user_id"],
+                        is_byok=False,
+                        query_content="Accept 2b",
+                        query_type="initial",
+                        feedback_action=None,
+                        query_metadata={},
+                        fork=None,
+                        is_checkpoint_replay=False,
+                    )
+                finally:
+                    release_2b_fail.set()
+
+                resp_2b_stale = await task_2b_stale
+                assert resp_2b_stale.status_code == 200, resp_2b_stale.text
+                assert resp_2b_stale.json()["state"] == "ready"
+                assert resp_2b_stale.json()["sha256"] == sha_2b
+        finally:
+            await scope_2b.fail_open("2b-cleanup")
 
         row_2b = await chat_uploads_db.get_upload(uid_2b)
         assert row_2b is not None
         assert row_2b["state"] == "ready"
         assert row_2b["used_at"] is not None
+        assert row_2b["expires_at"] is None
         assert row_2b["cleaned_at"] is None
         assert real_digest(key_2b) == (size_2, sha_2b)
 
@@ -2174,7 +2211,7 @@ class TestChatLargeUploadRealInfra:
         await create_thread(
             thread_id,
             workspace_id,
-            "idle",
+            "completed",
             user_id=user["user_id"],
         )
 
@@ -2235,9 +2272,11 @@ class TestChatLargeUploadRealInfra:
 
             with pytest.raises(HTTPException) as conflict_exc:
                 async with ChatUploadSendScope(
-                    upload_ids=[up_conflict["upload_id"]],
+                    additional_context=ctx_conflict,
                     user_id=user["user_id"],
+                    workspace_id=workspace_id,
                     request_key="rk-conflict",
+                    preclaimed=True,
                 ):
                     await wait_or_steer(
                         LocalRunExecutor.get_instance(),
@@ -2308,14 +2347,16 @@ class TestChatLargeUploadRealInfra:
 
             # Rejecting `rk-lose` AND releasing duplicate `rk-win` must NOT undo durable acceptance
             await release_request_chat_uploads(
-                [up_shared["upload_id"]],
                 user_id=user["user_id"],
+                claim_key="req:rk-lose",
                 request_key="rk-lose",
+                additional_context=ctx_shared,
             )
             await release_request_chat_uploads(
-                [up_shared["upload_id"]],
                 user_id=user["user_id"],
+                claim_key="req:rk-win",
                 request_key="rk-win",
+                additional_context=ctx_shared,
             )
             row_shared_final = await chat_uploads_db.get_upload(up_shared["upload_id"])
             assert row_shared_final is not None
@@ -2566,7 +2607,12 @@ class TestChatLargeUploadRealInfra:
             keep_second_run_open: bool = False,
         ) -> tuple[str, str, RunScope, list[dict]]:
             tid = str(uuid4())
-            await create_thread(tid, target_ws_id, "idle", user_id=user["user_id"])
+            await create_thread(
+                tid,
+                target_ws_id,
+                "completed",
+                user_id=user["user_id"],
+            )
 
             # Admit a parked steer into run #1, then settle run #1 so run #2 opens with it ahead
             r1_id = str(uuid4())
@@ -2616,7 +2662,7 @@ class TestChatLargeUploadRealInfra:
                 chat_uploads=chat_ctx,
             )
             assert ready_s is False
-            await s1.fail_open("turn-1-ended")
+            await s1.fail_open("turn-1-ended", status="completed")
 
             async with chat_upload_infra.db() as conn:
                 await conn.execute(
@@ -2667,15 +2713,19 @@ class TestChatLargeUploadRealInfra:
                 )
                 assert input_id == f"msg-{tid[:8]}"
                 assert len(input_state["messages"]) == 2
-                await SteeredReportInbox().confirm(
-                    r2_id,
-                    list(
-                        getattr(input_state["messages"][0], "additional_kwargs", {}).get(
-                            "steer_job_ids", []
-                        )
-                        or []
-                    ),
+                ahead_msg = input_state["messages"][0]
+                ahead_kwargs = getattr(ahead_msg, "additional_kwargs", {}) or {}
+                held_ids = list(
+                    (ahead_kwargs.get("held_jobs") or {}).get("job_ids") or []
                 )
+                assert len(held_ids) == 1
+                ahead_delivered = (
+                    ahead_kwargs.get("steering_delivered") or {}
+                ).get("messages") or []
+                assert len(ahead_delivered) == 1
+                assert "<system-reminder>" not in ahead_delivered[0]["content"]
+                assert len(ahead_delivered[0].get("attachments") or []) == 1
+                await SteeredReportInbox().confirm(r2_id, held_ids)
             finally:
                 if not keep_second_run_open:
                     await s2.fail_open("turn-2-cleanup")

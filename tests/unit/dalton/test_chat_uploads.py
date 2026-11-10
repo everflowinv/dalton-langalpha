@@ -1985,18 +1985,13 @@ async def test_recovery_rejects_unauthorized_owner_key_mismatch_and_deleted_work
     expected_colleague_rel = svc.build_sandbox_upload_rel_path(
         upload_env["ledger"].rows[colleague_accepted_uid]
     )
-    monkeypatch.setattr(
-        svc,
-        "pull_direct",
-        create_autospec(
-            svc.pull_direct,
-            return_value={expected_colleague_rel: {"status": "ok"}},
-        ),
-    )
+    pull_spy.reset_mock()
+    pull_spy.return_value = {expected_colleague_rel: {"status": "ok"}}
     res_owner_recover = await svc.rematerialize_workspace_chat_uploads(
         ws_alice, sbx, layout=WorkspaceLayout(root="/home/workspace", dir_name="Proj")
     )
     assert res_owner_recover == {"restored": 1, "errors": 0}
+    pull_spy.assert_awaited_once()
 
     with pytest.raises(HTTPException) as removed_colleague_exc:
         await svc.initiate_chat_upload(

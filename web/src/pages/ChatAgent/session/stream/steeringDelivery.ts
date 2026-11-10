@@ -12,6 +12,8 @@ import {
 import { deliveredNoticeRow } from '../wakeupEvents';
 import { reportRow, senderProvenance } from '../provenance';
 import { readArtifactCommentsShown } from '../../components/artifactComments/artifactCommentSend';
+// DALTON-HOOK(chat-large-upload): normalize attachment metadata on delivered steers
+import { mergeAcceptedAttachments, normalizeAttachments } from '../../hooks/utils/messageHelpers';
 
 /** A delivery's entries, typed once where the loose event shapes are read. A
  *  steer's file comments are read here too, and dropped when unreadable. A
@@ -69,10 +71,8 @@ export function deliveredEntryRow(
     });
   }
   // A comment send's note may be empty: its comments are the message.
-  // DALTON-HOOK(chat-large-upload): render file-only steers and preserve verified attachment metadata
-  const attachments = Array.isArray(entry.attachments) && entry.attachments.length > 0
-    ? entry.attachments
-    : undefined;
+  // DALTON-HOOK(chat-large-upload): render file-only steers and normalize verified attachment metadata
+  const attachments = normalizeAttachments(entry.attachments);
   if (!entry.content && !entry.artifact_comments && !attachments) return null;
   const provenance = senderProvenance({ origin: entry.origin, platform: entry.platform });
   return {
@@ -125,10 +125,13 @@ function claimDeliveredSteers(
       claimed.content = entry.content;
       claimed.artifactComments = entry.artifact_comments;
     }
-    // DALTON-HOOK(chat-large-upload): preserve original user text and verified attachments on claimed steers
-    if (Array.isArray(entry.attachments) && entry.attachments.length > 0) {
+    // DALTON-HOOK(chat-large-upload): preserve original user text, normalized server metadata, and caller-owned blob fields
+    const mergedAttachments = Array.isArray(entry.attachments) && entry.attachments.length > 0
+      ? mergeAcceptedAttachments(claimed.attachments, entry.attachments)
+      : undefined;
+    if (mergedAttachments) {
       claimed.content = entry.content;
-      claimed.attachments = entry.attachments;
+      claimed.attachments = mergedAttachments;
     }
     if (joinTurn && turn !== undefined) claimed.turnIndex = turn;
     if (next === messages) next = [...messages];
