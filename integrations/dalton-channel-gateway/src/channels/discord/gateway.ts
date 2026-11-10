@@ -13,6 +13,7 @@
 import type { APIGatewayBotInfo } from "discord-api-types/v10";
 import WebSocket from "ws";
 import { createSubsystemLogger, type SubsystemLogger } from "../../shared/logger.js";
+import { ChannelDeliveryError } from "../adapter.js";
 import { RequestClient } from "./rest.js";
 
 export const DISCORD_GATEWAY_URL = "wss://gateway.discord.gg/?v=10&encoding=json";
@@ -211,6 +212,10 @@ export class DiscordGatewayClient {
   private dispatchRetryTimer: ReturnType<typeof setTimeout> | undefined;
   private readonly activeWaitTimers = new Set<{ timer: ReturnType<typeof setTimeout>; cancel: () => void }>();
   private pendingDispatches: PendingDispatch[] = [];
+  /** Per-message handler failures. READY, RESUMED, and redelivery must not clear this. */
+  private readonly dispatchFailureAttempts = new Map<string, number>();
+  /** One resume is issued per message id after the retry cap; later failures only wait. */
+  private readonly dispatchReconnectIssued = new Set<string>();
   private isDrainingDispatches = false;
   private wakeDrainImmediately = false;
   private stopGeneration = 0;
@@ -519,9 +524,7 @@ export class DiscordGatewayClient {
 
     if (payload.t === "READY" && isRecord(payload.d)) {
       this.protocolSessionEpoch += 1;
-      for (const item of this.pendingDispatches) {
-        item.attempts = 0;
-      }
+      this.restoreDispatchAttempts();
       this.clearDispatchRetryTimer();
       if (this.isDrainingDispatches) {
         this.wakeDrainImmediately = true;
@@ -542,9 +545,7 @@ export class DiscordGatewayClient {
       this.reconnectAttempts = 0;
       this.consecutiveResumeFailures = 0;
       this.connected = true;
-      for (const item of this.pendingDispatches) {
-        item.attempts = 0;
-      }
+      this.restoreDispatchAttempts();
       this.clearDispatchRetryTimer();
       if (this.isDrainingDispatches) {
         this.wakeDrainImmediately = true;
@@ -576,7 +577,7 @@ export class DiscordGatewayClient {
         if (seq !== null && existing.sessionEpoch === currentEpoch) {
           existing.seq = seq;
         }
-        existing.attempts = 0;
+        existing.attempts = this.rememberedDispatchAttempts(existing.messageId);
         this.clearDispatchRetryTimer();
         if (this.isDrainingDispatches) {
           this.wakeDrainImmediately = true;
@@ -598,7 +599,7 @@ export class DiscordGatewayClient {
       seq,
       sessionEpoch: currentEpoch,
       messageId,
-      attempts: 0,
+      attempts: this.rememberedDispatchAttempts(messageId),
     });
 
     if (this.pendingDispatches[0] && this.pendingDispatches[0].sessionEpoch !== currentEpoch) {
@@ -621,15 +622,28 @@ export class DiscordGatewayClient {
         } catch (err) {
           if (!this.shouldReconnect || stopGen !== this.stopGeneration) return;
           this.emitError(err instanceof Error ? err : new Error(String(err)));
-          if (this.wakeDrainImmediately) {
-            this.wakeDrainImmediately = false;
-            current.attempts = 0;
+          if (isPermanentUnprocessableDispatch(err)) {
+            this.finishDispatch(current);
             continue;
           }
           current.attempts += 1;
+          this.rememberDispatchFailure(current);
+          if (this.wakeDrainImmediately) {
+            this.wakeDrainImmediately = false;
+            continue;
+          }
           if (current.attempts >= MAX_DISPATCH_RETRY_ATTEMPTS) {
-            current.attempts = 0;
-            this.scheduleReconnect({ preferResume: true, reason: "dispatch-retry-exhausted" });
+            if (!current.messageId) {
+              current.attempts = 0;
+              this.scheduleReconnect({ preferResume: true, reason: "dispatch-retry-exhausted" });
+              return;
+            }
+            if (!this.dispatchReconnectIssued.has(current.messageId)) {
+              this.dispatchReconnectIssued.add(current.messageId);
+              this.scheduleReconnect({ preferResume: true, reason: "dispatch-retry-exhausted" });
+              return;
+            }
+            this.scheduleDispatchRetry(DISPATCH_RETRY_MAX_DELAY_MS, stopGen);
             return;
           }
           const retryDelayMs = Math.min(
@@ -640,20 +654,48 @@ export class DiscordGatewayClient {
           return;
         }
         if (!this.shouldReconnect || stopGen !== this.stopGeneration) return;
-        if (this.pendingDispatches[0] === current) {
-          this.pendingDispatches.shift();
-        }
-        if (
-          current.sessionEpoch === this.protocolSessionEpoch &&
-          current.seq !== null &&
-          (this.ackedSequence === null || current.seq > this.ackedSequence)
-        ) {
-          this.ackedSequence = current.seq;
-        }
+        this.finishDispatch(current);
       }
     } finally {
       this.isDrainingDispatches = false;
     }
+  }
+
+  private rememberedDispatchAttempts(messageId: string | null): number {
+    if (!messageId) return 0;
+    return this.dispatchFailureAttempts.get(messageId) ?? 0;
+  }
+
+  private rememberDispatchFailure(item: PendingDispatch): void {
+    if (!item.messageId) return;
+    this.dispatchFailureAttempts.set(item.messageId, item.attempts);
+  }
+
+  private clearDispatchFailure(messageId: string | null): void {
+    if (!messageId) return;
+    this.dispatchFailureAttempts.delete(messageId);
+    this.dispatchReconnectIssued.delete(messageId);
+  }
+
+  /** Keeps a remembered per-message failure count; events without one start again at zero. */
+  private restoreDispatchAttempts(): void {
+    for (const item of this.pendingDispatches) {
+      item.attempts = this.rememberedDispatchAttempts(item.messageId);
+    }
+  }
+
+  private finishDispatch(current: PendingDispatch): void {
+    if (this.pendingDispatches[0] === current) {
+      this.pendingDispatches.shift();
+    }
+    if (
+      current.sessionEpoch === this.protocolSessionEpoch &&
+      current.seq !== null &&
+      (this.ackedSequence === null || current.seq > this.ackedSequence)
+    ) {
+      this.ackedSequence = current.seq;
+    }
+    this.clearDispatchFailure(current.messageId);
   }
 
   private scheduleDispatchRetry(delayMs: number, stopGen: number): void {
@@ -837,6 +879,13 @@ export class DiscordGatewayClient {
     try { this.onError?.(err); } catch { /* listener errors must not crash gateway */ }
     this.logger.error("Discord gateway error", { error: err });
   }
+}
+
+function isPermanentUnprocessableDispatch(err: unknown): boolean {
+  return (
+    err instanceof ChannelDeliveryError &&
+    (err.code === "target_not_found" || err.code === "not_allowed")
+  );
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {

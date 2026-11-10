@@ -10,9 +10,10 @@ import { createSubsystemLogger, type SubsystemLogger } from "../../shared/logger
 import type { SafeFetchOptions } from "../../shared/safe-fetch.js";
 import { MAX_ATTACHMENT_BYTES, type InboundChannelEvent } from "../../types.js";
 import {
+  canViewPlatformChat,
   type AvailableChatsResult, type ChannelAdapter, ChannelDeliveryError,
-  type CheckTargetLiveResult, type DownloadedAttachment, type SendFileOptions,
-  type SendFileResult, type SendTextChunkOptions, type SendTextChunkResult,
+  type CheckTargetLiveResult, type DownloadedAttachment, type ListAvailableChatsOptions,
+  type SendFileOptions, type SendFileResult, type SendTextChunkOptions, type SendTextChunkResult,
 } from "../adapter.js";
 import { chunkDiscordText, DISCORD_MAX_CHARS } from "./chunk.js";
 import {
@@ -25,7 +26,7 @@ import {
 } from "./inbound.js";
 import { classifyDiscordDeliveryError, RequestClient, type DiscordFetch } from "./rest.js";
 import { createDmChannelId, parseDiscordTarget, sendFileDiscord, sendMessageDiscord } from "./send.js";
-import { ensureThreadUnarchived, getDiscordChannel } from "./threading.js";
+import { ensureThreadUnarchived, getDiscordChannel, type DiscordChannelInfo } from "./threading.js";
 
 export * from "./chunk.js";
 export * from "./gateway.js";
@@ -260,17 +261,37 @@ export class DiscordChannelAdapter implements ChannelAdapter {
         (!ctx || ((isDiscordThreadChannelType(ctx.type) || hintThread) && !ctx.parentId));
 
       if (needsChannelLookup && guildId) {
-        const fetched = await getDiscordChannel(this.getRest(), channelId);
+        let fetched: DiscordChannelInfo;
+        try {
+          fetched = await getDiscordChannel(this.getRest(), channelId);
+        } catch (err) {
+          // 403/404 cannot be processed later. Acknowledge the event so it
+          // does not stay at the head of the gateway queue. Transport and 5xx
+          // errors still propagate and keep their retry.
+          if (
+            err instanceof ChannelDeliveryError &&
+            (err.code === "target_not_found" || err.code === "not_allowed")
+          ) {
+            this.logger.warn("Discord channel lookup cannot be processed; acknowledging the event", {
+              messageId,
+              channelId,
+              code: err.code,
+            });
+            return;
+          }
+          throw err;
+        }
         const resolvedChannelId =
           typeof fetched?.id === "string" && fetched.id.trim() ? fetched.id.trim() : channelId;
         const resolvedType = fetched?.type ?? ctx?.type;
         const resolvedParentId = fetched?.parent_id ?? ctx?.parentId ?? undefined;
         const isThread = isDiscordThreadChannelType(resolvedType) || hintThread;
         if (isThread && !resolvedParentId) {
-          throw classifyDiscordDeliveryError(
-            new Error(`Discord thread ${channelId} lookup did not return parent_id`),
-            { stage: "read", message: "Discord channel lookup failed" },
-          );
+          this.logger.warn("Discord thread lookup confirmed no parent channel; acknowledging the event", {
+            messageId,
+            channelId,
+          });
+          return;
         }
         ctx = {
           channelId: resolvedChannelId,
@@ -353,7 +374,7 @@ export class DiscordChannelAdapter implements ChannelAdapter {
     return { content: res.content, filename: res.filename, mimeType: res.mimeType };
   }
 
-  async listAvailableChats(_params: { userId: string; platformUserId: string }): Promise<AvailableChatsResult> {
+  async listAvailableChats(params: ListAvailableChatsOptions): Promise<AvailableChatsResult> {
     const rest = this.getRest();
     const chats: AvailableChatsResult["chats"] = [];
     let complete = true;
@@ -371,8 +392,16 @@ export class DiscordChannelAdapter implements ChannelAdapter {
             if (!ch.id) continue;
             this.cacheChannelPayload(ch, guild.id);
             if (ch.type === 0 || ch.type === 5) {
+              const address = `discord:${guild.id}/${ch.id}`;
+              if (!canViewPlatformChat({
+                userTier: params.userTier,
+                address,
+                viewableAddresses: params.viewableAddresses,
+              })) {
+                continue;
+              }
               chats.push({
-                address: `discord:${guild.id}/${ch.id}`,
+                address,
                 name: ch.name ? `#${ch.name}` : ch.id,
                 kind: "channel",
               });

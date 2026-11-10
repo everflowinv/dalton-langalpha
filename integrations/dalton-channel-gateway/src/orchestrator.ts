@@ -15,7 +15,7 @@ import {
   type ThreadStatusInfo,
   type ThreadWakeupItem,
 } from "./backend-client.js";
-import type { ChannelAdapter } from "./channels/adapter.js";
+import { ChannelDeliveryError, type ChannelAdapter } from "./channels/adapter.js";
 import type { DeliveryService } from "./delivery-service.js";
 import {
   ACTIVE_WAKEUP_STATES,
@@ -47,6 +47,57 @@ import {
 } from "./uuid.js";
 
 const BACKOFF_DELAYS_MS = [1000, 2000, 4000];
+/**
+ * Applied slash-command effect stored on the inbound row's existing
+ * `raw_payload`. This is not the commands-branch `command_result` column.
+ * Confirmation delivery uses a separate notice claim.
+ */
+const DISCORD_COMMAND_EFFECT_KEY = "discord_command_effect";
+
+interface DiscordCommandEffect {
+  cmd: string;
+  arg: string;
+  reply: string;
+  user_id: string | null;
+  applied: true;
+  reply_delivered: boolean;
+  terminal_status: "completed" | "failed";
+}
+
+function readDiscordCommandEffect(
+  raw: Record<string, unknown> | null | undefined,
+  cmd: string,
+  arg: string,
+): DiscordCommandEffect | null {
+  if (!raw) return null;
+  const value = raw[DISCORD_COMMAND_EFFECT_KEY];
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const effect = value as Record<string, unknown>;
+  if (effect.applied !== true || effect.cmd !== cmd) return null;
+  const storedArg = typeof effect.arg === "string" ? effect.arg : "";
+  if (storedArg !== arg) return null;
+  const userId =
+    typeof effect.user_id === "string" && effect.user_id.trim()
+      ? effect.user_id.trim()
+      : null;
+  return {
+    cmd,
+    arg,
+    reply: typeof effect.reply === "string" ? effect.reply : "",
+    user_id: userId,
+    applied: true,
+    reply_delivered: effect.reply_delivered === true,
+    terminal_status: effect.terminal_status === "failed" ? "failed" : "completed",
+  };
+}
+
+function isPermanentCommandNoticeError(err: unknown): boolean {
+  return (
+    err instanceof ChannelDeliveryError &&
+    err.outcome === "failed" &&
+    (err.code === "target_not_found" || err.code === "not_allowed")
+  );
+}
 const CAPACITY_BACKOFF_DELAYS_MS = [2000, 4000, 8000];
 export const DEFAULT_BUSY_THREAD_MAX_WAIT_MS = 30 * 60 * 1000;
 
@@ -400,6 +451,99 @@ export class ChannelGatewayOrchestrator {
   // §3.3 Slash Commands (`/bind`, `/unbind`, `/workspace`, `/new`, `/stop`)
   // =========================================================================
 
+  private async registerSlashCommand(
+    event: InboundChannelEvent,
+    cmd: string,
+    arg: string,
+  ): Promise<I1RegisterAndResolveResponse> {
+    return this.backend.registerAndResolveInbound({
+      platform: event.platform,
+      platform_user_id: event.platformUserId,
+      chat_type: event.chatType,
+      chat_address: event.chatAddress,
+      thread_scope_key: event.threadScopeKey,
+      message_id: event.messageId,
+      request_key: makeInboundRequestKey(event.platform, event.messageId),
+      raw_payload: { command: cmd, arg },
+      weixin_context_token: event.weixinContextToken ?? null,
+    });
+  }
+
+  private async storeDiscordCommandEffect(
+    event: InboundChannelEvent,
+    effect: DiscordCommandEffect,
+    status?: "completed" | "failed",
+  ): Promise<void> {
+    await this.backend.updateInboundProgress({
+      platform: event.platform,
+      message_id: event.messageId,
+      ...(status ? { status } : {}),
+      raw_payload_patch: {
+        [DISCORD_COMMAND_EFFECT_KEY]: effect,
+      },
+    });
+  }
+
+  private commandNoticeTarget(event: InboundChannelEvent): string {
+    return event.chatType === "dm" ? `${event.platform}:@me` : event.chatAddress;
+  }
+
+  /** Sends the stored reply. A Dalton user id uses the notice delivery row; otherwise the adapter is called directly. */
+  private async deliverDiscordCommandReply(
+    event: InboundChannelEvent,
+    effect: DiscordCommandEffect,
+  ): Promise<boolean> {
+    if (!effect.reply.trim()) return true;
+    if (effect.user_id) {
+      const res = await this.deliveryService.executeDelivery({
+        deliveryKey: `notice:${event.platform}:${event.messageId}:command`,
+        kind: "notice",
+        userId: effect.user_id,
+        platform: event.platform,
+        target: this.commandNoticeTarget(event),
+        inboundMessageId: event.messageId,
+        text: effect.reply,
+        replyToMessageId: event.messageId,
+        threadScopeKey: event.threadScopeKey,
+      });
+      return res.status === "sent" || res.status === "partial";
+    }
+    const adapter = this.adapters.get(event.platform);
+    if (!adapter || !adapter.isConfigured() || !adapter.isConnected()) {
+      throw new Error(`Channel adapter for ${event.platform} is not connected`);
+    }
+    try {
+      await this.sendDirectAdapterNotice(event, effect.reply);
+      return true;
+    } catch (err) {
+      if (isPermanentCommandNoticeError(err)) return false;
+      throw err;
+    }
+  }
+
+  /**
+   * Persists the effect before confirmation. The inbound row is marked only
+   * after the reply is sent. A stored effect that already records delivery is
+   * not sent again.
+   */
+  private async commitDiscordCommandEffect(
+    event: InboundChannelEvent,
+    effect: DiscordCommandEffect,
+  ): Promise<void> {
+    if (effect.reply_delivered) {
+      await this.storeDiscordCommandEffect(event, effect, effect.terminal_status);
+      return;
+    }
+    await this.storeDiscordCommandEffect(event, effect);
+    const delivered = await this.deliverDiscordCommandReply(event, effect);
+    if (!delivered) return;
+    await this.storeDiscordCommandEffect(
+      event,
+      { ...effect, reply_delivered: true },
+      effect.terminal_status,
+    );
+  }
+
   private async tryHandleSlashCommand(
     event: InboundChannelEvent,
     trimmedText: string,
@@ -421,6 +565,12 @@ export class ChannelGatewayOrchestrator {
         );
         return true;
       }
+      const resolved = await this.registerSlashCommand(event, cmdName, arg);
+      const existing = readDiscordCommandEffect(resolved.raw_payload, cmdName, arg);
+      if (existing) {
+        await this.commitDiscordCommandEffect(event, existing);
+        return true;
+      }
       const res = await this.backend.consumeBindCode({
         action: "bind",
         platform: event.platform,
@@ -431,112 +581,92 @@ export class ChannelGatewayOrchestrator {
         code: arg,
         is_group: event.chatType === "group",
       });
-      if (!res.ok) {
-        if (res.reason === "revoked_in_group") {
-          await this.sendDirectAdapterNotice(
-            event,
-            "For security, `/bind` cannot be used in a group chat. This code has been revoked; please generate a new code and send `/bind <CODE>` in a direct message.",
-          );
-        } else if (res.reason === "platform_mismatch") {
-          await this.sendDirectAdapterNotice(
-            event,
-            `This bind code was generated for ${res.expected_platform ?? "another platform"}, not ${event.platform}.`,
-          );
-        } else {
-          await this.sendDirectAdapterNotice(
-            event,
-            "Bind code is invalid or expired. Please generate a new code in Web Settings → Channels.",
-          );
-        }
-        return true;
-      }
-      await this.sendDirectAdapterNotice(
-        event,
-        `Successfully linked your ${event.platform} account to Dalton.`,
-      );
+      const reply = !res.ok
+        ? res.reason === "revoked_in_group"
+          ? "For security, `/bind` cannot be used in a group chat. This code has been revoked; please generate a new code and send `/bind <CODE>` in a direct message."
+          : res.reason === "platform_mismatch"
+            ? `This bind code was generated for ${res.expected_platform ?? "another platform"}, not ${event.platform}.`
+            : "Bind code is invalid or expired. Please generate a new code in Web Settings → Channels."
+        : `Successfully linked your ${event.platform} account to Dalton.`;
+      await this.commitDiscordCommandEffect(event, {
+        cmd: cmdName,
+        arg,
+        reply,
+        user_id: res.user_id?.trim() || null,
+        applied: true,
+        reply_delivered: false,
+        terminal_status: res.ok ? "completed" : "failed",
+      });
       return true;
     }
 
     if (cmdName === "unbind") {
+      const resolved = await this.registerSlashCommand(event, cmdName, arg);
+      const existing = readDiscordCommandEffect(resolved.raw_payload, cmdName, arg);
+      if (existing) {
+        await this.commitDiscordCommandEffect(event, existing);
+        return true;
+      }
       const res = await this.backend.consumeBindCode({
         action: "unbind",
         platform: event.platform,
         platform_user_id: event.platformUserId,
         is_group: event.chatType === "group",
       });
-      if (!res.ok) {
-        await this.sendDirectAdapterNotice(
-          event,
-          `Your ${event.platform} account is not currently linked.`,
-        );
-        return true;
-      }
-      if (res.user_id) {
+      if (res.ok && res.user_id) {
         this.closeWatchesForUserPlatform(res.user_id, event.platform);
       }
-      await this.sendDirectAdapterNotice(
-        event,
-        `Unlinked your ${event.platform} account from Dalton.`,
-      );
+      await this.commitDiscordCommandEffect(event, {
+        cmd: cmdName,
+        arg,
+        reply: res.ok
+          ? `Unlinked your ${event.platform} account from Dalton.`
+          : `Your ${event.platform} account is not currently linked.`,
+        user_id: res.user_id?.trim() || null,
+        applied: true,
+        reply_delivered: false,
+        terminal_status: res.ok ? "completed" : "failed",
+      });
       return true;
     }
 
-    // For `/workspace`, `/new`, `/stop`, resolve user identity via I-1
-    const reqKey = makeInboundRequestKey(event.platform, event.messageId);
-    const resolved = await this.backend.registerAndResolveInbound({
-      platform: event.platform,
-      platform_user_id: event.platformUserId,
-      chat_type: event.chatType,
-      chat_address: event.chatAddress,
-      thread_scope_key: event.threadScopeKey,
-      message_id: event.messageId,
-      request_key: reqKey,
-      raw_payload: { command: cmdName, arg },
-      weixin_context_token: event.weixinContextToken ?? null,
-    });
+    const resolved = await this.registerSlashCommand(event, cmdName, arg);
+    const existing = readDiscordCommandEffect(resolved.raw_payload, cmdName, arg);
+    if (existing) {
+      await this.commitDiscordCommandEffect(event, existing);
+      return true;
+    }
 
     if (!resolved.linked || !resolved.dalton_user_id) {
-      await this.backend.updateInboundProgress({
-        platform: event.platform,
-        message_id: event.messageId,
-        status: "failed",
+      await this.commitDiscordCommandEffect(event, {
+        cmd: cmdName,
+        arg,
+        reply: this.formatDenyNotice(event.platform, "not_linked"),
+        user_id: null,
+        applied: true,
+        reply_delivered: false,
+        terminal_status: "failed",
       });
-      await this.sendDirectAdapterNotice(
-        event,
-        this.formatDenyNotice(event.platform, "not_linked"),
-      );
       return true;
     }
 
     const userId = resolved.dalton_user_id;
+    const sessionBase = {
+      platform: event.platform,
+      dalton_user_id: userId,
+      chat_type: event.chatType,
+      chat_address: event.chatAddress,
+      chat_id: event.chatId,
+      chat_name: event.chatName ?? null,
+      scope_key: event.threadScopeKey,
+    };
 
     if (cmdName === "workspace") {
       if (!arg) {
         const listRes = await this.backend.sessionCommand({
           cmd: "workspace_list",
-          platform: event.platform,
-          dalton_user_id: userId,
-          chat_type: event.chatType,
-          chat_address: event.chatAddress,
-          chat_id: event.chatId,
-          chat_name: event.chatName ?? null,
-          scope_key: event.threadScopeKey,
+          ...sessionBase,
         });
-        await this.backend.updateInboundProgress({
-          platform: event.platform,
-          message_id: event.messageId,
-          status: "completed",
-        });
-        if (!listRes.ok) {
-          await this.sendDirectAdapterNotice(
-            event,
-            this.formatDenyNotice(
-              event.platform,
-              listRes.deny_reason ?? "workspace_write_denied",
-            ),
-          );
-          return true;
-        }
         const currentWs = listRes.current_workspace_id;
         const lines = [
           `Current workspace: ${currentWs ? `\`${currentWs}\`` : "Home (Chief of Staff)"}`,
@@ -548,119 +678,120 @@ export class ChannelGatewayOrchestrator {
           ),
           "Use `/workspace <name|id|home>` to switch.",
         ];
-        await this.sendDirectAdapterNotice(event, lines.join("\n"));
+        await this.commitDiscordCommandEffect(event, {
+          cmd: cmdName,
+          arg,
+          reply: listRes.ok
+            ? lines.join("\n")
+            : this.formatDenyNotice(
+                event.platform,
+                listRes.deny_reason ?? "workspace_write_denied",
+              ),
+          user_id: userId,
+          applied: true,
+          reply_delivered: false,
+          terminal_status: listRes.ok ? "completed" : "failed",
+        });
         return true;
       }
 
       const switchRes = await this.backend.sessionCommand({
         cmd: "workspace_switch",
-        platform: event.platform,
-        dalton_user_id: userId,
-        chat_type: event.chatType,
-        chat_address: event.chatAddress,
-        chat_id: event.chatId,
-        chat_name: event.chatName ?? null,
-        scope_key: event.threadScopeKey,
+        ...sessionBase,
         workspace_query: arg,
       });
-      await this.backend.updateInboundProgress({
-        platform: event.platform,
-        message_id: event.messageId,
-        status: "completed",
-      });
-      if (!switchRes.ok) {
-        await this.sendDirectAdapterNotice(
-          event,
-          this.formatDenyNotice(
-            event.platform,
-            switchRes.deny_reason ?? "workspace_not_found",
-          ),
-        );
-        return true;
-      }
       const targetLabel = switchRes.workspace_id
         ? `workspace \`${switchRes.workspace_id}\``
         : "Home (Chief of Staff)";
-      await this.sendDirectAdapterNotice(
-        event,
-        `Switched this conversation to ${targetLabel} and started a new thread.`,
-      );
+      await this.commitDiscordCommandEffect(event, {
+        cmd: cmdName,
+        arg,
+        reply: switchRes.ok
+          ? `Switched this conversation to ${targetLabel} and started a new thread.`
+          : this.formatDenyNotice(
+              event.platform,
+              switchRes.deny_reason ?? "workspace_not_found",
+            ),
+        user_id: userId,
+        applied: true,
+        reply_delivered: false,
+        terminal_status: switchRes.ok ? "completed" : "failed",
+      });
       return true;
     }
 
     if (cmdName === "new") {
       const newRes = await this.backend.sessionCommand({
         cmd: "new",
-        platform: event.platform,
-        dalton_user_id: userId,
-        chat_type: event.chatType,
-        chat_address: event.chatAddress,
-        chat_id: event.chatId,
-        chat_name: event.chatName ?? null,
-        scope_key: event.threadScopeKey,
+        ...sessionBase,
       });
-      await this.backend.updateInboundProgress({
-        platform: event.platform,
-        message_id: event.messageId,
-        status: "completed",
+      await this.commitDiscordCommandEffect(event, {
+        cmd: cmdName,
+        arg,
+        reply: newRes.ok
+          ? "Started a new conversation thread."
+          : this.formatDenyNotice(
+              event.platform,
+              newRes.deny_reason ?? "external_member_group_forbidden",
+            ),
+        user_id: userId,
+        applied: true,
+        reply_delivered: false,
+        terminal_status: newRes.ok ? "completed" : "failed",
       });
-      if (!newRes.ok) {
-        await this.sendDirectAdapterNotice(
-          event,
-          this.formatDenyNotice(
-            event.platform,
-            newRes.deny_reason ?? "external_member_group_forbidden",
-          ),
-        );
-        return true;
-      }
-      await this.sendDirectAdapterNotice(
-        event,
-        "Started a new conversation thread.",
-      );
       return true;
     }
 
     if (cmdName === "stop") {
       const stopRes = await this.backend.sessionCommand({
         cmd: "stop",
-        platform: event.platform,
-        dalton_user_id: userId,
-        chat_type: event.chatType,
-        chat_address: event.chatAddress,
-        chat_id: event.chatId,
-        chat_name: event.chatName ?? null,
-        scope_key: event.threadScopeKey,
+        ...sessionBase,
         external_thread_id: resolved.external_thread_id,
       });
-      await this.backend.updateInboundProgress({
-        platform: event.platform,
-        message_id: event.messageId,
-        status: "completed",
-      });
       if (!stopRes.ok) {
-        await this.sendDirectAdapterNotice(
-          event,
-          this.formatDenyNotice(
+        await this.commitDiscordCommandEffect(event, {
+          cmd: cmdName,
+          arg,
+          reply: this.formatDenyNotice(
             event.platform,
             stopRes.deny_reason ?? "external_member_group_forbidden",
           ),
-        );
+          user_id: userId,
+          applied: true,
+          reply_delivered: false,
+          terminal_status: "failed",
+        });
         return true;
       }
       if (!stopRes.thread_id) {
-        await this.sendDirectAdapterNotice(
-          event,
-          "No active conversation thread to stop.",
-        );
+        await this.commitDiscordCommandEffect(event, {
+          cmd: cmdName,
+          arg,
+          reply: "No active conversation thread to stop.",
+          user_id: userId,
+          applied: true,
+          reply_delivered: false,
+          terminal_status: "completed",
+        });
         return true;
       }
-      await this.backend.cancelThreadTurn(
+      const cancel = await this.backend.cancelThreadTurn(
         userId,
         stopRes.thread_id,
         stopRes.run_id,
       );
-      await this.sendDirectAdapterNotice(event, "Stopped the current run.");
+      if (![200, 202, 204, 404, 409].includes(cancel.status)) {
+        throw new Error(`Stop cancellation was not confirmed (${cancel.status})`);
+      }
+      await this.commitDiscordCommandEffect(event, {
+        cmd: cmdName,
+        arg,
+        reply: "Stopped the current run.",
+        user_id: userId,
+        applied: true,
+        reply_delivered: false,
+        terminal_status: "completed",
+      });
       return true;
     }
 

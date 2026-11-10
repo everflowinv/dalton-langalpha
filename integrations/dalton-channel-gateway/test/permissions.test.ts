@@ -3,6 +3,7 @@ import type {
   I1RegisterAndResolveResponse,
   I2BindCodeConsumeResponse,
 } from "../src/backend-client.js";
+import { ChannelDeliveryError } from "../src/channels/adapter.js";
 import { makeInboundRequestKey } from "../src/uuid.js";
 import {
   createTestHarness,
@@ -105,6 +106,125 @@ describe("Slash Commands, Attachment Upload (`uploads/...`), Multimodal Images &
       THREAD_ID,
       RUN_ID,
     );
+  });
+
+  it("keeps a stored command effect when confirmation delivery fails and does not run the command again", async () => {
+    const effects = new Map<string, Record<string, unknown>>();
+    const defaultRegister = vi.mocked(h.backend.registerAndResolveInbound).getMockImplementation()!;
+    vi.mocked(h.backend.registerAndResolveInbound).mockImplementation(async (req) => {
+      const base = await defaultRegister(req);
+      const stored = effects.get(`${req.platform}:${req.message_id}`);
+      return stored
+        ? { ...base, raw_payload: { ...(base.raw_payload ?? {}), ...stored } }
+        : base;
+    });
+    const defaultUpdate = vi.mocked(h.backend.updateInboundProgress).getMockImplementation()!;
+    vi.mocked(h.backend.updateInboundProgress).mockImplementation(async (req) => {
+      if (req.raw_payload_patch && req.platform && req.message_id) {
+        const key = `${req.platform}:${req.message_id}`;
+        effects.set(key, { ...(effects.get(key) ?? {}), ...req.raw_payload_patch });
+      }
+      return defaultUpdate(req);
+    });
+
+    const bindEvent = {
+      platform: "feishu" as const,
+      platformUserId: "ou_alice",
+      chatType: "dm" as const,
+      chatAddress: "feishu:@me",
+      chatId: "ou_alice",
+      threadScopeKey: "dm:ou_alice",
+      messageId: "m_bind_retry",
+      text: "/bind ABC123",
+    };
+    let sends = 0;
+    h.feishuAdapter.setSendTextBehavior(() => {
+      sends += 1;
+      throw new Error("confirmation socket hang up");
+    });
+    await h.feishuAdapter.emitInbound(bindEvent);
+    await h.feishuAdapter.emitInbound(bindEvent);
+    expect(vi.mocked(h.backend.consumeBindCode).mock.calls).toHaveLength(1);
+    expect(sends).toBe(1);
+    expect(effects.get("feishu:m_bind_retry")?.discord_command_effect).toMatchObject({
+      cmd: "bind",
+      applied: true,
+      reply_delivered: false,
+    });
+
+    const workspaceEvent = {
+      ...bindEvent,
+      messageId: "m_ws_retry",
+      text: "/workspace quant",
+    };
+    const sessionCallsBefore = vi.mocked(h.backend.sessionCommand).mock.calls.length;
+    await h.feishuAdapter.emitInbound(workspaceEvent);
+    await h.feishuAdapter.emitInbound(workspaceEvent);
+    const workspaceCalls = vi.mocked(h.backend.sessionCommand).mock.calls
+      .slice(sessionCallsBefore)
+      .filter(([req]) => req.cmd === "workspace_switch");
+    expect(workspaceCalls).toHaveLength(1);
+    expect(sends).toBe(2);
+
+    h.feishuAdapter.setSendTextBehavior(() => {
+      throw new ChannelDeliveryError("forbidden", {
+        outcome: "failed",
+        code: "not_allowed",
+      });
+    });
+    vi.mocked(h.backend.consumeBindCode).mockResolvedValueOnce({
+      ok: false,
+      reason: "revoked_in_group",
+    });
+    const groupBind = {
+      ...bindEvent,
+      chatType: "group" as const,
+      chatAddress: "feishu:oc_group1",
+      chatId: "oc_group1",
+      threadScopeKey: "chat:oc_group1",
+      messageId: "m_bind_group_retry",
+      text: "/bind ABC123",
+      isGroupTrigger: true,
+    };
+    const consumeBeforeGroup = vi.mocked(h.backend.consumeBindCode).mock.calls.length;
+    await h.feishuAdapter.emitInbound(groupBind);
+    await h.feishuAdapter.emitInbound(groupBind);
+    expect(vi.mocked(h.backend.consumeBindCode).mock.calls.length).toBe(consumeBeforeGroup + 1);
+    expect(effects.get("feishu:m_bind_group_retry")?.discord_command_effect).toMatchObject({
+      cmd: "bind",
+      applied: true,
+      reply_delivered: false,
+      terminal_status: "failed",
+    });
+
+    h.feishuAdapter.setSendTextBehavior(null);
+    const groupTextsBefore = h.feishuAdapter.sentTexts.length;
+    await h.feishuAdapter.emitInbound(groupBind);
+    expect(h.feishuAdapter.sentTexts.length).toBe(groupTextsBefore + 1);
+    expect(h.feishuAdapter.sentTexts.at(-1)?.text).toContain("revoked");
+    expect(vi.mocked(h.backend.consumeBindCode).mock.calls.length).toBe(consumeBeforeGroup + 1);
+    expect(effects.get("feishu:m_bind_group_retry")?.discord_command_effect).toMatchObject({
+      reply_delivered: true,
+    });
+    await h.feishuAdapter.emitInbound(groupBind);
+    expect(h.feishuAdapter.sentTexts.length).toBe(groupTextsBefore + 1);
+    expect(vi.mocked(h.backend.consumeBindCode).mock.calls.length).toBe(consumeBeforeGroup + 1);
+
+    vi.mocked(h.backend.cancelThreadTurn).mockResolvedValueOnce({ status: 503 });
+    const stopEvent = {
+      ...bindEvent,
+      messageId: "m_stop_retry",
+      text: "/stop",
+    };
+    await expect(h.feishuAdapter.emitInbound(stopEvent)).rejects.toThrow(/not confirmed/i);
+    expect(effects.has("feishu:m_stop_retry")).toBe(false);
+    expect(vi.mocked(h.backend.cancelThreadTurn).mock.calls).toHaveLength(1);
+    await h.feishuAdapter.emitInbound(stopEvent);
+    const sentAfterStop = h.feishuAdapter.sentTexts.length;
+    expect(h.feishuAdapter.sentTexts.at(-1)?.text).toContain("Stopped the current run.");
+    await h.feishuAdapter.emitInbound(stopEvent);
+    expect(h.feishuAdapter.sentTexts.length).toBe(sentAfterStop);
+    expect(vi.mocked(h.backend.cancelThreadTurn).mock.calls).toHaveLength(2);
   });
 
   it("uploads attachments to `uploads/{platform}/{message_id}/{filename}` (never `.agents/`) and formats inline images with `{ type: \"text\" }` first followed by `{ type: \"image\", image_url: \"data:...\" }` (Codex #4/#5, Grok #13)", async () => {

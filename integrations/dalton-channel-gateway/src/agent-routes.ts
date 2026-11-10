@@ -1,5 +1,5 @@
 import type { BackendClient, I4StateResponse } from "./backend-client.js";
-import type { ChannelAdapter } from "./channels/adapter.js";
+import { canViewPlatformChat, type ChannelAdapter } from "./channels/adapter.js";
 import { DeliveryService } from "./delivery-service.js";
 import {
   type AgentAutomationOutputPutRequest,
@@ -1080,17 +1080,32 @@ export class AgentRoutesHandler {
     const adapter = this.adapters.get(platform);
     let complete = true;
     let error: string | null = null;
+    const viewableAddresses = new Set<string>();
+    for (const binding of state.chat_bindings ?? []) {
+      if (binding.platform === platform && binding.chat_address) {
+        viewableAddresses.add(binding.chat_address);
+      }
+    }
 
     if (adapter && adapter.isConfigured() && adapter.isConnected()) {
       try {
         const live = await adapter.listAvailableChats({
           userId,
           platformUserId,
+          userTier: state.user_tier,
+          viewableAddresses,
         });
         complete = live.complete;
         error = live.error;
         for (const item of live.chats) {
-          if (item.address) {
+          if (
+            item.address &&
+            canViewPlatformChat({
+              userTier: state.user_tier,
+              address: item.address,
+              viewableAddresses,
+            })
+          ) {
             chatsMap.set(item.address, item);
           }
         }

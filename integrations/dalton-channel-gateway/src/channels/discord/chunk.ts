@@ -114,9 +114,35 @@ function splitOverlongGraphemeLine(line: string, step: number): string[] {
   return out;
 }
 
-function isFenceLine(line: string): boolean {
-  const trimmed = line.trimStart();
-  return trimmed.startsWith("```") || trimmed.startsWith("~~~");
+interface OpenDiscordFence {
+  openLine: string;
+  closeLine: string;
+  markerChar: string;
+  markerLen: number;
+}
+
+function parseFenceMarker(line: string): { marker: string; info: string } | null {
+  const match = /^\s*(`{3,}|~{3,})(.*)$/.exec(line);
+  if (!match) return null;
+  return { marker: match[1]!, info: match[2] ?? "" };
+}
+
+function openFenceFromLine(line: string, limit: number): OpenDiscordFence | null {
+  const parsed = parseFenceMarker(line);
+  if (!parsed) return null;
+  const markerChar = parsed.marker[0]!;
+  const markerLen = parsed.marker.length;
+  const closeLine = markerChar.repeat(markerLen);
+  const trimmed = line.trimEnd();
+  const openLine = trimmed.length + 1 + closeLine.length <= limit ? trimmed : closeLine;
+  return { openLine, closeLine, markerChar, markerLen };
+}
+
+/** A close must use the same character, be at least as long, and carry no info string. */
+function isSuitableFenceClose(line: string, open: OpenDiscordFence): boolean {
+  const parsed = parseFenceMarker(line);
+  if (!parsed || parsed.info.trim() !== "") return false;
+  return parsed.marker[0] === open.markerChar && parsed.marker.length >= open.markerLen;
 }
 
 /**
@@ -134,25 +160,25 @@ export function chunkDiscordText(text: string, opts: { maxChars?: number } = {})
   const lines = rendered.split("\n");
   const chunks: string[] = [];
   let buf = "";
-  let openFence: string | null = null;
-  let fenceMarker = "```";
+  let openFence: OpenDiscordFence | null = null;
 
-  const closeFence = (marker: string): string => `\n${marker}`;
+  const closeReserve = (fence: OpenDiscordFence | null): number =>
+    fence ? fence.closeLine.length + 1 : 0;
 
   const flush = (isFinal = false): void => {
     if (buf.length === 0) return;
     if (openFence !== null) {
-      if (!isFinal && buf === openFence) {
+      if (!isFinal && buf === openFence.openLine) {
         buf = "";
         return;
       }
-      if (!isFinal && buf.endsWith(`\n${openFence}`)) {
-        const prose = buf.slice(0, buf.length - openFence.length - 1);
+      if (!isFinal && buf.endsWith(`\n${openFence.openLine}`)) {
+        const prose = buf.slice(0, buf.length - openFence.openLine.length - 1);
         if (prose.length > 0) chunks.push(prose);
         buf = "";
         return;
       }
-      chunks.push(`${buf}${closeFence(fenceMarker)}`);
+      chunks.push(`${buf}\n${openFence.closeLine}`);
     } else {
       chunks.push(buf);
     }
@@ -160,22 +186,20 @@ export function chunkDiscordText(text: string, opts: { maxChars?: number } = {})
   };
 
   for (const line of lines) {
-    const togglesFence = isFenceLine(line);
-    const nextFence: string | null = togglesFence
-      ? openFence === null
-        ? line.trimEnd()
-        : null
-      : openFence;
-    if (togglesFence && openFence === null) {
-      fenceMarker = line.trimStart().startsWith("~~~") ? "~~~" : "```";
+    let nextFence: OpenDiscordFence | null = openFence;
+    if (openFence && isSuitableFenceClose(line, openFence)) {
+      nextFence = null;
+    } else if (!openFence) {
+      const opened = openFenceFromLine(line, limit);
+      if (opened) nextFence = opened;
     }
-    const reserve = nextFence !== null ? closeFence(fenceMarker).length : 0;
+    const reserve = closeReserve(nextFence);
     const candidate = buf.length === 0 ? line : `${buf}\n${line}`;
 
     if (candidate.length + reserve > limit) {
       if (buf.length > 0) flush(false);
-      const prefix = openFence !== null ? `${openFence}\n` : "";
-      const lineReserve = openFence !== null ? closeFence(fenceMarker).length : 0;
+      const prefix = openFence !== null ? `${openFence.openLine}\n` : "";
+      const lineReserve = closeReserve(openFence);
       if (prefix.length + lineReserve >= limit) {
         openFence = null;
         for (const piece of splitOverlong(line, limit)) {
@@ -187,8 +211,9 @@ export function chunkDiscordText(text: string, opts: { maxChars?: number } = {})
         const step = Math.max(1, limit - prefix.length - lineReserve);
         const pieces = splitOverlongGraphemeLine(line, step);
         if (openFence !== null) {
+          const closer = `\n${openFence.closeLine}`;
           for (let i = 0; i < pieces.length - 1; i++) {
-            chunks.push(`${prefix}${pieces[i]!}${closeFence(fenceMarker)}`);
+            chunks.push(`${prefix}${pieces[i]!}${closer}`);
           }
           if (pieces.length > 0) {
             buf = `${prefix}${pieces[pieces.length - 1]!}`;

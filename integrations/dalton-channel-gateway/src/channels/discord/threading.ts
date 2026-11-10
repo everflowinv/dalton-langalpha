@@ -8,8 +8,13 @@
  */
 
 import { truncateUtf16Safe } from "../../shared/text.js";
-import type { RequestClient } from "./rest.js";
-import { classifyDiscordDeliveryError } from "./rest.js";
+import { ChannelDeliveryError } from "../adapter.js";
+import {
+  classifyDiscordDeliveryError,
+  DiscordError,
+  RateLimitError,
+  type RequestClient,
+} from "./rest.js";
 
 export const DISCORD_THREAD_NAME_LIMIT = 100;
 export const DISCORD_THREAD_AUTO_ARCHIVE_MINUTES = 60;
@@ -53,6 +58,116 @@ export async function ensureThreadUnarchived(rest: RequestClient, channel: Disco
   return channel;
 }
 
+function threadRecordMatchesName(thread: DiscordChannelInfo, name: string): boolean {
+  return typeof thread.id === "string" && thread.id.trim().length > 0 && thread.name === name;
+}
+
+/**
+ * Lists active threads in the parent channel. One exact name match is adopted.
+ * Several matches, or a lookup that does not prove the thread is absent, throw
+ * `failed` and must not create another thread. A confirmed empty list returns null.
+ */
+async function findActiveThreadByExactName(
+  rest: RequestClient,
+  channelId: string,
+  name: string,
+): Promise<DiscordChannelInfo | null> {
+  let listed: unknown;
+  try {
+    listed = await rest.get(`/channels/${encodeURIComponent(channelId)}/threads/active`);
+  } catch (err) {
+    const classified = classifyDiscordDeliveryError(err, {
+      stage: "read",
+      message: "Discord thread lookup failed",
+    });
+    if (classified.code === "target_not_found" || classified.code === "not_allowed") {
+      throw classified;
+    }
+    throw new ChannelDeliveryError(
+      "Discord thread lookup did not confirm whether the thread exists",
+      { outcome: "failed", code: "unavailable" },
+    );
+  }
+  const threads =
+    listed && typeof listed === "object" && Array.isArray((listed as { threads?: unknown }).threads)
+      ? (listed as { threads: DiscordChannelInfo[] }).threads
+      : null;
+  if (!threads) {
+    throw new ChannelDeliveryError(
+      "Discord thread lookup did not confirm whether the thread exists",
+      { outcome: "failed", code: "unavailable" },
+    );
+  }
+  const matches = threads.filter((thread) => threadRecordMatchesName(thread, name));
+  if (matches.length > 1) {
+    throw new ChannelDeliveryError("Discord thread lookup matched more than one thread", {
+      outcome: "failed",
+      code: "unavailable",
+    });
+  }
+  return matches[0] ?? null;
+}
+
+async function postDiscordThread(
+  rest: RequestClient,
+  params: {
+    channelId: string;
+    messageId?: string | null;
+    name: string;
+    autoArchiveDuration?: number;
+  },
+): Promise<DiscordChannelInfo> {
+  const body = {
+    name: params.name,
+    auto_archive_duration: params.autoArchiveDuration ?? DISCORD_THREAD_AUTO_ARCHIVE_MINUTES,
+  };
+  if (params.messageId) {
+    return (await rest.post(
+      `/channels/${encodeURIComponent(params.channelId)}/messages/${encodeURIComponent(params.messageId)}/threads`,
+      body,
+    )) as DiscordChannelInfo;
+  }
+  return (await rest.post(`/channels/${encodeURIComponent(params.channelId)}/threads`, {
+    ...body,
+    type: 11, // PUBLIC_THREAD
+  })) as DiscordChannelInfo;
+}
+
+/** After an unconfirmed thread POST, adopt one verified active thread. Does not POST again. */
+async function adoptUnconfirmedThread(
+  rest: RequestClient,
+  channelId: string,
+  name: string,
+): Promise<DiscordChannelInfo> {
+  let found: DiscordChannelInfo | null;
+  try {
+    found = await findActiveThreadByExactName(rest, channelId, name);
+  } catch (err) {
+    if (
+      err instanceof ChannelDeliveryError &&
+      (err.code === "target_not_found" || err.code === "not_allowed")
+    ) {
+      throw err;
+    }
+    throw new ChannelDeliveryError("Discord thread creation was not confirmed", {
+      outcome: "failed",
+      code: "unavailable",
+    });
+  }
+  if (!found?.id) {
+    throw new ChannelDeliveryError("Discord thread creation was not confirmed", {
+      outcome: "failed",
+      code: "unavailable",
+    });
+  }
+  return found;
+}
+
+function isDefiniteThreadPostFailure(err: unknown): boolean {
+  if (err instanceof RateLimitError) return true;
+  return err instanceof DiscordError && err.status < 500;
+}
+
 export async function createThreadDiscord(
   rest: RequestClient,
   params: {
@@ -63,22 +178,22 @@ export async function createThreadDiscord(
     autoArchiveDuration?: number;
   },
 ): Promise<DiscordChannelInfo> {
-  const body = {
-    name: params.name,
-    auto_archive_duration: params.autoArchiveDuration ?? DISCORD_THREAD_AUTO_ARCHIVE_MINUTES,
-  };
+  const existing = await findActiveThreadByExactName(rest, params.channelId, params.name);
+  if (existing?.id) return existing;
   try {
-    if (params.messageId) {
-      return (await rest.post(
-        `/channels/${encodeURIComponent(params.channelId)}/messages/${encodeURIComponent(params.messageId)}/threads`,
-        body,
-      )) as DiscordChannelInfo;
-    }
-    return (await rest.post(`/channels/${encodeURIComponent(params.channelId)}/threads`, {
-      ...body,
-      type: 11, // PUBLIC_THREAD
-    })) as DiscordChannelInfo;
+    const created = await postDiscordThread(rest, params);
+    if (created?.id) return created;
   } catch (err) {
-    throw classifyDiscordDeliveryError(err, { stage: "send", message: "Discord thread creation failed" });
+    if (isDefiniteThreadPostFailure(err)) {
+      throw classifyDiscordDeliveryError(err, {
+        stage: "send",
+        message: "Discord thread creation failed",
+      });
+    }
+    // A timeout or 5xx can happen after Discord has already created the thread.
+    // That is not a message send: look the thread up instead of marking the
+    // claim unknown or posting a second thread.
+    return adoptUnconfirmedThread(rest, params.channelId, params.name);
   }
+  return adoptUnconfirmedThread(rest, params.channelId, params.name);
 }

@@ -23,6 +23,7 @@ import {
   type DiscordWebSocketLike,
 } from "../src/channels/discord/index.js";
 import { loadConfig } from "../src/config.js";
+import { DeliveryService } from "../src/delivery-service.js";
 import { buildConfiguredAdapters } from "../src/main.js";
 import { createGatewayApp } from "../src/server.js";
 import { SafeFetchError } from "../src/shared/safe-fetch.js";
@@ -129,6 +130,19 @@ async function flushMicrotasks(): Promise<void> {
   await Promise.resolve();
   await Promise.resolve();
   await Promise.resolve();
+}
+
+/** A missed heartbeat ACK reconnects. Ack while fake time moves so that reconnect is not the one under test. */
+function advanceAckingHeartbeats(timers: FakeTimers, socket: FakeWebSocket, ms: number): void {
+  let left = ms;
+  while (left > 0) {
+    const step = Math.min(500, left);
+    timers.advance(step);
+    if (socket.readyState === 1) {
+      socket.receive({ op: 11, d: null });
+    }
+    left -= step;
+  }
 }
 
 function makeGateway(timers: FakeTimers, sockets: FakeWebSocket[]) {
@@ -1055,6 +1069,185 @@ describe("DiscordGatewayClient", () => {
     await adapter.stop();
   });
 
+  it("acks one permanent dispatch failure and still delivers the following DM and guild event", async () => {
+    const timers = new FakeTimers();
+    const sockets: FakeWebSocket[] = [];
+    const seen: string[] = [];
+    const client = new DiscordGatewayClient({
+      token: "test-bot-token",
+      webSocketFactory: (url) => {
+        const socket = new FakeWebSocket(url);
+        sockets.push(socket);
+        return socket;
+      },
+      timerDeps: {
+        setTimeoutFn: timers.setTimeoutFn,
+        clearTimeoutFn: timers.clearTimeoutFn,
+        now: () => timers.nowMs,
+        random: () => 0,
+      },
+      onDispatch: async (name, data) => {
+        if (name !== "MESSAGE_CREATE") return;
+        const id = (data as { id: string }).id;
+        if (id === "perm-1") {
+          throw new ChannelDeliveryError("missing channel", {
+            outcome: "failed",
+            code: "target_not_found",
+          });
+        }
+        seen.push(id);
+      },
+      onError: () => {},
+    });
+    try {
+      await client.start();
+      const ws = sockets[0]!;
+      await helloAndReady(ws, 1);
+      ws.receive({ op: 0, s: 2, t: "MESSAGE_CREATE", d: { id: "perm-1" } });
+      ws.receive({ op: 0, s: 3, t: "MESSAGE_CREATE", d: { id: "dm-2" } });
+      ws.receive({ op: 0, s: 4, t: "MESSAGE_CREATE", d: { id: "guild-3" } });
+      for (let i = 0; i < 4; i++) await flushMicrotasks();
+      expect(seen).toEqual(["dm-2", "guild-3"]);
+      expect(client.getSequence()).toBe(4);
+      expect(client.isConnected()).toBe(true);
+      expect(sockets).toHaveLength(1);
+      advanceAckingHeartbeats(timers, sockets[0]!, 60_000);
+      await flushMicrotasks();
+      expect(sockets).toHaveLength(1);
+      expect(seen).toEqual(["dm-2", "guild-3"]);
+    } finally {
+      await client.stop();
+    }
+  });
+
+  it("retries a short 5xx without dropping the event or acknowledging it early", async () => {
+    const timers = new FakeTimers();
+    const sockets: FakeWebSocket[] = [];
+    let failuresLeft = 2;
+    const seen: string[] = [];
+    const client = new DiscordGatewayClient({
+      token: "test-bot-token",
+      webSocketFactory: (url) => {
+        const socket = new FakeWebSocket(url);
+        sockets.push(socket);
+        return socket;
+      },
+      timerDeps: {
+        setTimeoutFn: timers.setTimeoutFn,
+        clearTimeoutFn: timers.clearTimeoutFn,
+        now: () => timers.nowMs,
+        random: () => 0,
+      },
+      onDispatch: async (name, data) => {
+        if (name !== "MESSAGE_CREATE") return;
+        const id = (data as { id: string }).id;
+        if (id === "flaky" && failuresLeft > 0) {
+          failuresLeft -= 1;
+          throw new Error("temporary 503");
+        }
+        seen.push(id);
+      },
+      onError: () => {},
+    });
+    try {
+      await client.start();
+      const ws = sockets[0]!;
+      await helloAndReady(ws, 1);
+      ws.receive({ op: 0, s: 2, t: "MESSAGE_CREATE", d: { id: "flaky" } });
+      ws.receive({ op: 0, s: 3, t: "MESSAGE_CREATE", d: { id: "after" } });
+      await flushMicrotasks();
+      expect(seen).toEqual([]);
+      expect(failuresLeft).toBe(1);
+      expect(client.getSequence()).toBe(1);
+
+      advanceAckingHeartbeats(timers, ws, 500);
+      await flushMicrotasks();
+      expect(seen).toEqual([]);
+      expect(failuresLeft).toBe(0);
+      expect(client.getSequence()).toBe(1);
+
+      advanceAckingHeartbeats(timers, ws, 1000);
+      await flushMicrotasks();
+      await flushMicrotasks();
+      expect(seen).toEqual(["flaky", "after"]);
+      expect(client.getSequence()).toBe(3);
+      expect(sockets).toHaveLength(1);
+      expect(client.isConnected()).toBe(true);
+    } finally {
+      await client.stop();
+    }
+  });
+
+  it("does not give the same message a fresh retry budget after reconnect", async () => {
+    const timers = new FakeTimers();
+    const sockets: FakeWebSocket[] = [];
+    let calls = 0;
+    const client = new DiscordGatewayClient({
+      token: "test-bot-token",
+      webSocketFactory: (url) => {
+        const socket = new FakeWebSocket(url);
+        sockets.push(socket);
+        return socket;
+      },
+      timerDeps: {
+        setTimeoutFn: timers.setTimeoutFn,
+        clearTimeoutFn: timers.clearTimeoutFn,
+        now: () => timers.nowMs,
+        random: () => 0,
+      },
+      onDispatch: async (name) => {
+        if (name !== "MESSAGE_CREATE") return;
+        calls += 1;
+        throw new Error("inbound 503");
+      },
+      onError: () => {},
+    });
+    try {
+      await client.start();
+      const ws = sockets[0]!;
+      await helloAndReady(ws, 1);
+      ws.receive({ op: 0, s: 2, t: "MESSAGE_CREATE", d: { id: "stuck-message" } });
+      await flushMicrotasks();
+      expect(calls).toBe(1);
+
+      for (const delay of [500, 1000, 2000, 4000, 8000, 15_000, 15_000]) {
+        advanceAckingHeartbeats(timers, sockets[0]!, delay);
+        await flushMicrotasks();
+      }
+      expect(calls).toBe(8);
+      expect(client.getSequence()).toBe(1);
+      expect(sockets).toHaveLength(1);
+
+      advanceAckingHeartbeats(timers, sockets[0]!, 2000);
+      await flushMicrotasks();
+      expect(sockets).toHaveLength(2);
+      await helloAndReady(sockets[1]!, 1);
+      const resume = sockets[1]!.sent
+        .map((line) => JSON.parse(line) as { op: number; d?: { seq?: number } })
+        .find((payload) => payload.op === 6);
+      expect(resume?.d?.seq).toBe(1);
+      expect(calls).toBe(9);
+      expect(client.getSequence()).toBe(1);
+      expect(client.isConnected()).toBe(true);
+
+      advanceAckingHeartbeats(timers, sockets[1]!, 500);
+      await flushMicrotasks();
+      expect(calls).toBe(9);
+      expect(sockets).toHaveLength(2);
+
+      advanceAckingHeartbeats(timers, sockets[1]!, 14_499);
+      await flushMicrotasks();
+      expect(calls).toBe(9);
+      advanceAckingHeartbeats(timers, sockets[1]!, 1);
+      await flushMicrotasks();
+      expect(calls).toBe(10);
+      expect(client.getSequence()).toBe(1);
+      expect(sockets).toHaveLength(2);
+    } finally {
+      await client.stop();
+    }
+  });
+
   it("tracks the absolute session_start_limit reset deadline across long-lived sessions, mid-wait disconnects, and static quotas", async () => {
     // 1. Exhausted after initial Identify (remaining: 1 -> 0, reset_after: 10_000 at t=0), stays online past t=10_000,
     //    then loses session (InvalidSession(false)): must refresh quota and Identify immediately without waiting another 10_000ms.
@@ -1697,6 +1890,138 @@ describe("Discord inbound parsing", () => {
       },
     ]);
   });
+
+  it("acks a 404 and a thread with no parent, then recovers one 503 without losing the following DM", async () => {
+    const timers = new FakeTimers();
+    const sockets: FakeWebSocket[] = [];
+    const otherGuild = "700000009";
+    const otherChannel = "700000010";
+    const unavailableChannel = "700000020";
+    let unavailableReads = 0;
+    const { rest } = makeRest(async (call) => {
+      const route = routeOf(call.url);
+      if (route === "/users/@me") return jsonResponse({ id: BOT_ID });
+      if (route === `/channels/${CHANNEL_ID}`) {
+        return jsonResponse({ message: "Unknown Channel", code: 10003 }, 404);
+      }
+      if (route === `/channels/${THREAD_ID}`) {
+        return jsonResponse({ id: THREAD_ID, type: 11, guild_id: GUILD_ID, name: "orphan" });
+      }
+      if (route === `/channels/${otherChannel}`) {
+        return jsonResponse({ id: otherChannel, type: 0, guild_id: otherGuild, name: "other" });
+      }
+      if (route === `/channels/${unavailableChannel}`) {
+        unavailableReads += 1;
+        if (unavailableReads === 1) return jsonResponse({ message: "upstream" }, 503);
+        return jsonResponse({ id: unavailableChannel, type: 0, guild_id: GUILD_ID, name: "retry" });
+      }
+      return jsonResponse({});
+    });
+    const gatewayClient = new DiscordGatewayClient({
+      token: "test-bot-token",
+      gatewayInfo: {
+        url: "wss://gateway.discord.gg",
+        session_start_limit: { total: 1000, remaining: 100, reset_after: 60_000, max_concurrency: 1 },
+      },
+      webSocketFactory: (url) => {
+        const socket = new FakeWebSocket(url);
+        sockets.push(socket);
+        return socket;
+      },
+      timerDeps: {
+        setTimeoutFn: timers.setTimeoutFn,
+        clearTimeoutFn: timers.clearTimeoutFn,
+        now: () => timers.nowMs,
+        random: () => 0,
+      },
+      onError: () => {},
+    });
+    const adapter = new DiscordChannelAdapter({
+      botToken: "test-bot-token",
+      botUserId: BOT_ID,
+      rest,
+      gatewayClient,
+    });
+    const seen: string[] = [];
+    adapter.onInboundEvent(async (event) => {
+      seen.push(event.messageId);
+    });
+    await adapter.start();
+    try {
+      const ws = sockets[0]!;
+      await helloAndReady(ws, 1);
+      ws.receive({
+        op: 0, s: 2, t: "MESSAGE_CREATE",
+        d: guildMessage({ id: "m-404", channel_id: CHANNEL_ID }),
+      });
+      ws.receive({
+        op: 0, s: 3, t: "MESSAGE_CREATE",
+        d: guildMessage({ id: "m-orphan", channel_id: THREAD_ID }),
+      });
+      ws.receive({
+        op: 0, s: 4, t: "MESSAGE_CREATE",
+        d: {
+          id: "m-dm",
+          channel_id: "dm-1",
+          content: "hello dm",
+          author: { id: USER_ID, username: "alice" },
+        },
+      });
+      ws.receive({
+        op: 0, s: 5, t: "MESSAGE_CREATE",
+        d: guildMessage({
+          id: "m-other",
+          guild_id: otherGuild,
+          channel_id: otherChannel,
+          content: `<@${BOT_ID}> other`,
+        }),
+      });
+      // Each guild lookup waits on the REST scheduler, and the gateway
+      // dispatches the queue one event at a time. Wait until that chain
+      // finishes instead of counting microtasks.
+      await vi.waitFor(() => {
+        expect(seen).toEqual(["m-dm", "m-other"]);
+        expect(gatewayClient.getSequence()).toBe(5);
+      });
+      expect(adapter.isConnected()).toBe(true);
+      expect(sockets).toHaveLength(1);
+
+      const timersBeforeRetry = timers.pendingCount;
+      ws.receive({
+        op: 0, s: 6, t: "MESSAGE_CREATE",
+        d: guildMessage({
+          id: "m-503",
+          channel_id: unavailableChannel,
+          content: `<@${BOT_ID}> retry me`,
+        }),
+      });
+      ws.receive({
+        op: 0, s: 7, t: "MESSAGE_CREATE",
+        d: {
+          id: "m-dm-2",
+          channel_id: "dm-2",
+          content: "after",
+          author: { id: USER_ID, username: "alice" },
+        },
+      });
+      await vi.waitFor(() => {
+        expect(unavailableReads).toBe(1);
+        expect(seen).toEqual(["m-dm", "m-other"]);
+        expect(gatewayClient.getSequence()).toBe(5);
+        expect(timers.pendingCount).toBe(timersBeforeRetry + 1);
+      });
+
+      timers.advance(500);
+      await vi.waitFor(() => {
+        expect(unavailableReads).toBe(2);
+        expect(seen).toEqual(["m-dm", "m-other", "m-503", "m-dm-2"]);
+        expect(gatewayClient.getSequence()).toBe(7);
+        expect(sockets).toHaveLength(1);
+      });
+    } finally {
+      await adapter.stop();
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -2283,10 +2608,45 @@ describe("Discord outbound", () => {
     expect(smallLimitZwj.join("")).toBe(zwj);
   });
 
+  it("closes only a matching fence and reserves that fence's real length", () => {
+    const fourTick = "````markdown\n```short```\n" + "x".repeat(2500) + "\n````";
+    const fourChunks = chunkDiscordText(fourTick);
+    expect(fourChunks.length).toBeGreaterThan(1);
+    for (const chunk of fourChunks) {
+      expect(chunk.length).toBeLessThanOrEqual(2000);
+      expect(chunk.startsWith("````markdown\n")).toBe(true);
+      expect(chunk.endsWith("\n````")).toBe(true);
+    }
+    const holder = fourChunks.find((chunk) => chunk.includes("```short```"));
+    expect(holder).toBeTruthy();
+    expect(holder!.endsWith("\n````")).toBe(true);
+    expect(fourChunks[1]!.startsWith("````markdown\n")).toBe(true);
+
+    const tilde = "~~~py\n" + "y".repeat(2500) + "\n~~~";
+    const tildeChunks = chunkDiscordText(tilde);
+    expect(tildeChunks.length).toBeGreaterThan(1);
+    for (const chunk of tildeChunks) {
+      expect(chunk.length).toBeLessThanOrEqual(2000);
+      expect(chunk.startsWith("~~~py\n")).toBe(true);
+      expect(chunk.endsWith("\n~~~")).toBe(true);
+    }
+
+    const mixed = "```js\n~~~\n" + "z".repeat(2500) + "\n~~~\n```";
+    const mixedChunks = chunkDiscordText(mixed);
+    expect(mixedChunks.length).toBeGreaterThan(1);
+    expect(mixedChunks[0]!.includes("~~~")).toBe(true);
+    for (const chunk of mixedChunks) {
+      expect(chunk.length).toBeLessThanOrEqual(2000);
+      expect(chunk.endsWith("\n```")).toBe(true);
+      expect(chunk.endsWith("\n~~~")).toBe(false);
+    }
+  });
+
   it("resolves DM channels first, then sends; newThread address stays consistent for later chunks", async () => {
     const { rest, calls } = makeRest(async (call) => {
       const route = routeOf(call.url);
       if (route === "/users/@me/channels") return jsonResponse({ id: "dm-channel-1" });
+      if (route === `/channels/${CHANNEL_ID}/threads/active`) return jsonResponse({ threads: [], members: [] });
       if (route === `/channels/${CHANNEL_ID}/messages/msg-77/threads`) return jsonResponse({ id: THREAD_ID, guild_id: GUILD_ID });
       if (route === `/channels/${CHANNEL_ID}`) return jsonResponse({ id: CHANNEL_ID, type: 0, guild_id: GUILD_ID });
       if (route === `/channels/${THREAD_ID}`) return jsonResponse({ id: THREAD_ID, type: 11, guild_id: GUILD_ID, parent_id: CHANNEL_ID, thread_metadata: { archived: false } });
@@ -2312,6 +2672,142 @@ describe("Discord outbound", () => {
     expect(second.messageId).toBeTruthy();
     const messageRoutes = calls.map((c) => routeOf(c.url)).filter((r) => r.endsWith("/messages"));
     expect(messageRoutes[messageRoutes.length - 1]).toBe(`/channels/${THREAD_ID}/messages`);
+  });
+
+  it("adopts the thread Discord created when the create response is lost, and does not post a second thread", async () => {
+    const created: Array<{ id: string; name: string }> = [];
+    let activeGets = 0;
+    let threadPosts = 0;
+    let messagePosts = 0;
+    const { rest } = makeRest(async (call) => {
+      const route = routeOf(call.url);
+      const method = (call.init.method ?? "GET").toUpperCase();
+      if (route === `/channels/${CHANNEL_ID}/threads/active` && method === "GET") {
+        activeGets += 1;
+        return jsonResponse({
+          threads: created.map((thread) => ({
+            id: thread.id,
+            name: thread.name,
+            type: 11,
+            guild_id: GUILD_ID,
+            parent_id: CHANNEL_ID,
+          })),
+          members: [],
+        });
+      }
+      if (route === `/channels/${CHANNEL_ID}/threads` && method === "POST") {
+        threadPosts += 1;
+        const body = JSON.parse(String(call.init.body)) as { name: string };
+        created.push({ id: "thread-recovered-1", name: body.name });
+        throw new Error("socket hang up");
+      }
+      if (route === "/channels/thread-recovered-1/messages" && method === "POST") {
+        messagePosts += 1;
+        return jsonResponse({ id: "msg-recovered-1" });
+      }
+      throw new Error(`unexpected ${method} ${route}`);
+    });
+    const adapter = new DiscordChannelAdapter({ botToken: "t", botUserId: BOT_ID, rest });
+    const sent = await adapter.sendTextChunk({
+      targetAddress: `discord:${GUILD_ID}/${CHANNEL_ID}`,
+      text: "Thread title line\nbody",
+      chunkIndex: 0,
+      totalChunks: 1,
+      newThread: true,
+    });
+    expect(sent.resolvedAddress).toBe(`discord:${GUILD_ID}/${CHANNEL_ID}:thread:thread-recovered-1`);
+    expect(sent.messageId).toBe("msg-recovered-1");
+    expect(threadPosts).toBe(1);
+    expect(messagePosts).toBe(1);
+    expect(activeGets).toBeGreaterThanOrEqual(2);
+    expect(created).toHaveLength(1);
+  });
+
+  it("blocks a second message send when the messages POST response is lost, without creating another thread", async () => {
+    const timers = new FakeTimers();
+    const sockets: FakeWebSocket[] = [];
+    let threadPosts = 0;
+    let messagePosts = 0;
+    let activeGets = 0;
+    const { rest } = makeRest(async (call) => {
+      const route = routeOf(call.url);
+      const method = (call.init.method ?? "GET").toUpperCase();
+      if (route === "/users/@me") return jsonResponse({ id: BOT_ID });
+      if (route === `/channels/${CHANNEL_ID}/threads/active` && method === "GET") {
+        activeGets += 1;
+        return jsonResponse({ threads: [], members: [] });
+      }
+      if (route === `/channels/${CHANNEL_ID}/threads` && method === "POST") {
+        threadPosts += 1;
+        return jsonResponse({ id: THREAD_ID, guild_id: GUILD_ID, name: "Thread title line" });
+      }
+      if (route === `/channels/${THREAD_ID}/messages` && method === "POST") {
+        messagePosts += 1;
+        throw new Error("socket hang up");
+      }
+      throw new Error(`unexpected ${method} ${route}`);
+    });
+    const gatewayClient = new DiscordGatewayClient({
+      token: "test-bot-token",
+      gatewayInfo: {
+        url: "wss://gateway.discord.gg",
+        session_start_limit: { total: 1000, remaining: 100, reset_after: 60_000, max_concurrency: 1 },
+      },
+      webSocketFactory: (url) => {
+        const socket = new FakeWebSocket(url);
+        sockets.push(socket);
+        return socket;
+      },
+      timerDeps: {
+        setTimeoutFn: timers.setTimeoutFn,
+        clearTimeoutFn: timers.clearTimeoutFn,
+        now: () => timers.nowMs,
+        random: () => 0,
+      },
+      onError: () => {},
+    });
+    const adapter = new DiscordChannelAdapter({
+      botToken: "test-bot-token",
+      botUserId: BOT_ID,
+      rest,
+      gatewayClient,
+    });
+    const backend = createMockBackend();
+    const delivery = new DeliveryService({
+      backend,
+      adapters: new Map([["discord", adapter]]),
+    });
+    await adapter.start();
+    try {
+      const ws = sockets[0]!;
+      await helloAndReady(ws, 1);
+      expect(adapter.isConnected()).toBe(true);
+      const deliveryOptions = {
+        deliveryKey: "notice:discord:msg-lost:command",
+        kind: "notice" as const,
+        userId: "user_alice_123",
+        platform: "discord",
+        target: `discord:${GUILD_ID}/${CHANNEL_ID}`,
+        text: "Thread title line\nbody",
+        newThread: true,
+      };
+      const first = await delivery.executeDelivery(deliveryOptions);
+      expect(first.status).toBe("unknown");
+      expect(threadPosts).toBe(1);
+      expect(messagePosts).toBe(1);
+      expect(activeGets).toBe(1);
+      const callsAfterFirst = vi.mocked(backend.updateDeliveryProgress).mock.calls.length;
+
+      const second = await delivery.executeDelivery(deliveryOptions);
+      expect(second.status).toBe("unknown");
+      expect(second.code).toBe("in_flight");
+      expect(threadPosts).toBe(1);
+      expect(messagePosts).toBe(1);
+      expect(activeGets).toBe(1);
+      expect(vi.mocked(backend.updateDeliveryProgress).mock.calls.length).toBe(callsAfterFirst);
+    } finally {
+      await adapter.stop();
+    }
   });
 
   it("unarchives an archived thread before sending and uploads files as multipart", async () => {
@@ -2351,6 +2847,78 @@ describe("Discord outbound", () => {
     expect(listing.complete).toBe(false);
     expect(listing.error).toContain("channels unavailable");
     expect(listing.chats).toEqual([]);
+  });
+
+  it("returns only the guild channels the caller is allowed to see", async () => {
+    const guildA = "700000011";
+    const guildB = "700000012";
+    const channelA = "700000013";
+    const channelB = "700000014";
+    const addressA = `discord:${guildA}/${channelA}`;
+    const addressB = `discord:${guildB}/${channelB}`;
+    const { rest } = makeRest(async (call) => {
+      const route = routeOf(call.url);
+      if (route === "/users/@me/guilds") {
+        return jsonResponse([
+          { id: guildA, name: "Guild Alpha Secret" },
+          { id: guildB, name: "Guild Beta Secret" },
+        ]);
+      }
+      if (route === `/guilds/${guildA}/channels`) {
+        return jsonResponse([{ id: channelA, type: 0, name: "alpha-room", guild_id: guildA }]);
+      }
+      if (route === `/guilds/${guildB}/channels`) {
+        return jsonResponse([{ id: channelB, type: 0, name: "beta-room", guild_id: guildB }]);
+      }
+      throw new Error(`unexpected ${route}`);
+    });
+    const adapter = new DiscordChannelAdapter({ botToken: "t", botUserId: BOT_ID, rest });
+
+    const userA = await adapter.listAvailableChats({
+      userId: "user-a",
+      platformUserId: "p-a",
+      userTier: "internal",
+      viewableAddresses: new Set([addressA]),
+    });
+    expect(userA.chats.map((chat) => chat.address)).toEqual([addressA]);
+    expect(JSON.stringify(userA.chats)).not.toContain("beta-room");
+    expect(JSON.stringify(userA.chats)).not.toContain(guildB);
+    expect(JSON.stringify(userA.chats)).not.toContain("Guild Beta");
+
+    const userB = await adapter.listAvailableChats({
+      userId: "user-b",
+      platformUserId: "p-b",
+      userTier: "internal",
+      viewableAddresses: [addressB],
+    });
+    expect(userB.chats.map((chat) => chat.address)).toEqual([addressB]);
+    expect(JSON.stringify(userB.chats)).not.toContain("alpha-room");
+    expect(JSON.stringify(userB.chats)).not.toContain(guildA);
+
+    const none = await adapter.listAvailableChats({
+      userId: "user-c",
+      platformUserId: "p-c",
+      userTier: "internal",
+      viewableAddresses: new Set<string>(),
+    });
+    expect(none.chats).toEqual([]);
+    expect(JSON.stringify(none.chats)).not.toContain("Guild");
+
+    const omitted = await adapter.listAvailableChats({
+      userId: "user-d",
+      platformUserId: "p-d",
+    });
+    expect(omitted.chats).toEqual([]);
+    expect(JSON.stringify(omitted.chats)).not.toContain("alpha-room");
+    expect(JSON.stringify(omitted.chats)).not.toContain("beta-room");
+
+    const admin = await adapter.listAvailableChats({
+      userId: "admin",
+      platformUserId: "p-admin",
+      userTier: "admin",
+      viewableAddresses: new Set<string>(),
+    });
+    expect(admin.chats.map((chat) => chat.address).sort()).toEqual([addressA, addressB].sort());
   });
 
   it("checkTargetLive rejects a channel from the wrong guild", async () => {
