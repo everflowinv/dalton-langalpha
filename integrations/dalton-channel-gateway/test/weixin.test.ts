@@ -500,7 +500,7 @@ describe("Weixin iLink Adapter — Protocol, Crypto, Inbound, QR Concurrency & L
         "http://ilinkai.weixin.qq.com",
         allowedApi,
       ),
-    ).toThrow(/HTTPS/i);
+    ).toThrow(/Unsupported attachment URL protocol: http:/i);
 
     // Reject embedded credentials
     expect(() =>

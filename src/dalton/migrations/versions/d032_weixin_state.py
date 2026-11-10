@@ -1,10 +1,10 @@
 """d032 weixin login session, bot generation, and encrypted context tokens.
 
 Revision ID: d032
-Revises: d035
+Revises: d036
 Create Date: 2026-04-06
 
-Follows d035 company automation storage. Protocol sequence and platform time
+Follows d036 channel delivery state. Protocol sequence and platform time
 retain separate maximum values on the context-token row for each bot,
 generation, and sender.
 """
@@ -12,7 +12,7 @@ generation, and sender.
 from alembic import op
 
 revision = "d032"
-down_revision = "d035"
+down_revision = "d036"
 branch_labels = None
 depends_on = None
 

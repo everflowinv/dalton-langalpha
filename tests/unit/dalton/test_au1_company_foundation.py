@@ -184,11 +184,14 @@ def test_d035_migration_revision_and_safety_contracts() -> None:
     from alembic.script import ScriptDirectory
 
     import src.dalton.migrations.versions.d035_company_automations as d035
+    import src.dalton.migrations.versions.d036_discord_confirmed_thread as d036
 
     assert d035.revision == "d035"
     assert d035.down_revision == "d031"
     assert d035.branch_labels is None
     assert d035.depends_on is None
+    assert d036.revision == "d036"
+    assert d036.down_revision == "d035"
 
     dalton_root = D035_PATH.parents[2]
     alembic_cfg = Config(str(dalton_root / "alembic.ini"))
@@ -200,6 +203,7 @@ def test_d035_migration_revision_and_safety_contracts() -> None:
         rev.revision == "d035"
         for rev in script_dir.iterate_revisions(heads[0], "base")
     )
+    assert script_dir.get_revision("d036").down_revision == "d035"
     assert script_dir.get_revision("d035").down_revision == "d031"
     assert script_dir.get_revision("d031").down_revision == "d030"
     assert [p.name for p in D035_PATH.parent.glob("d031*.py")] == [

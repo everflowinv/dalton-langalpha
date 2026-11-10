@@ -271,6 +271,39 @@ export function createMockBackend(): MockBackend {
     }),
   );
 
+  const discordDeliveryMemory = new Map<
+    string,
+    { thread: string | null; phase: "before_body" | "dispatching" | null }
+  >();
+
+  function rememberDiscordProgress(req: I7DeliveriesProgressRequest): {
+    thread: string | null;
+    phase: "before_body" | "dispatching" | null;
+  } {
+    const prev = discordDeliveryMemory.get(req.delivery_key) ?? {
+      thread: null,
+      phase: null,
+    };
+    let thread = prev.thread;
+    let phase = prev.phase;
+    const requestedThread =
+      typeof req.confirmed_thread_address === "string"
+        ? req.confirmed_thread_address.trim()
+        : "";
+    if (requestedThread && !thread) {
+      thread = requestedThread;
+      if (phase === null) phase = "before_body";
+    }
+    if (req.discord_body_phase === "dispatching") {
+      phase = "dispatching";
+    } else if (req.discord_body_phase === "before_body" && phase !== "dispatching") {
+      phase = "before_body";
+    }
+    const next = { thread, phase };
+    discordDeliveryMemory.set(req.delivery_key, next);
+    return next;
+  }
+
   const authorizeAndClaimDelivery = vi.fn(
     async (
       req: I6AuthorizeAndClaimRequest,
@@ -384,7 +417,15 @@ export function createMockBackend(): MockBackend {
         .find(
           (u) => u.delivery_key === req.delivery_key && u.status !== undefined,
         );
-      if (lastUpdate?.status === "unknown") {
+      const remembered = discordDeliveryMemory.get(req.delivery_key) ?? {
+        thread: null,
+        phase: null,
+      };
+      const storedThread = remembered.thread;
+      if (
+        lastUpdate?.status === "unknown" &&
+        !(storedThread && remembered.phase === "before_body")
+      ) {
         return {
           claim_status: "in_flight_or_unknown",
           status: "unknown",
@@ -393,6 +434,8 @@ export function createMockBackend(): MockBackend {
             "An earlier attempt of this same call is still delivering it.",
           platform: plat,
           target_address: targetAddr,
+          confirmed_thread_address: storedThread,
+          discord_body_phase: remembered.phase,
           thread_scope_key: resolvedThreadScopeKey,
           is_current: isCurrent,
         };
@@ -459,6 +502,8 @@ export function createMockBackend(): MockBackend {
         recipient_id: recipientId,
         platform: plat,
         target_address: targetAddr,
+        confirmed_thread_address: storedThread,
+        discord_body_phase: remembered.phase,
         thread_scope_key: resolvedThreadScopeKey,
         is_current: isCurrent,
         weixin_context_token: plat === "weixin" ? "ctx_tok_123" : null,
@@ -471,10 +516,18 @@ export function createMockBackend(): MockBackend {
       req: I7DeliveriesProgressRequest,
     ): Promise<I7DeliveriesProgressResponse> => ({
       ...structuredClone(defaultI7DeliverySent),
+      ok: true,
       delivery_key: req.delivery_key,
       status: req.status ?? "in_flight",
       sent_to_current_count:
         req.status === "sent" || req.status === "partial" ? 1 : 0,
+      ...(() => {
+        const remembered = rememberDiscordProgress(req);
+        return {
+          confirmed_thread_address: remembered.thread,
+          discord_body_phase: remembered.phase,
+        };
+      })(),
     }),
   );
 

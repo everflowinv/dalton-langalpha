@@ -483,7 +483,7 @@ describe.skipIf(!SHOULD_RUN)(
         colleagueDispatchEnabled: true,
         channels: {
           feishu: { enabled: false, appId: "", appSecret: "" },
-          discord: { enabled: false, botToken: "" },
+          discord: { enabled: false, botToken: "", applicationId: "" },
           weixin: {
             enabled: true,
             apiBaseUrl: "https://ilinkai.weixin.qq.com",

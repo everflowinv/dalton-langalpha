@@ -364,6 +364,7 @@ async def test_d035_upgrade_from_d031_preserves_state_and_enforces_safe_downgrad
         rev.revision == "d035"
         for rev in script_dir.iterate_revisions(heads[0], "base")
     )
+    assert script_dir.get_revision("d036").down_revision == "d035"
     assert script_dir.get_revision("d035").down_revision == "d031"
     assert script_dir.get_revision("d031").down_revision == "d030"
 
@@ -514,11 +515,12 @@ async def test_d035_upgrade_from_d031_preserves_state_and_enforces_safe_downgrad
             """
         )
 
-    # Upgrade d031 -> d035
-    await asyncio.to_thread(command.upgrade, dalton_cfg, "d035")
+    # Upgrade d031 -> head. d036 adds delivery columns and does not
+    # change the company automation rows asserted below.
+    await asyncio.to_thread(command.upgrade, dalton_cfg, "head")
 
     async with au1_live_pool.connection() as db_conn:
-        assert await _dalton_alembic_versions(db_conn) == ["d035"]
+        assert await _dalton_alembic_versions(db_conn) == heads
         await _assert_d031_shared_command_columns(db_conn)
 
         async with db_conn.cursor(row_factory=dict_row) as cur:
