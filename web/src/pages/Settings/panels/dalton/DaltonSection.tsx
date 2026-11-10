@@ -8,6 +8,7 @@ import { DaltonHomeTeamMemoryCard } from './DaltonHomeTeamMemoryCard';
 import { DaltonInvitesCard } from './DaltonInvitesCard';
 import { DaltonNotifyTargetsCard } from './DaltonNotifyTargetsCard';
 import { DaltonSystemJobsCard } from './DaltonSystemJobsCard';
+import { DaltonChannelBindingsCard } from './DaltonChannelBindingsCard';
 import { DaltonWeixinChannelCard } from './DaltonWeixinChannelCard';
 import { FeishuReadScopesCard } from './FeishuReadScopesCard';
 import { ProviderStatusCard } from './ProviderStatusCard';
@@ -42,6 +43,7 @@ export function DaltonSection({ advanced = false }: { advanced?: boolean } = {})
       </div>
       {/* notify-routes: internal/admin group push (renders nothing on 403 for external members) */}
       <DaltonFeishuGroupsCard />
+      <DaltonChannelBindingsCard />
       <DaltonWeixinChannelCard />
       <div id="dalton-system-jobs">
         <DaltonSystemJobsCard scopes={baseScopes} />

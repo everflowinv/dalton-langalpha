@@ -35,6 +35,48 @@ export type ParsedSlashCommand =
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/** Settings entry where the signed-in user generates a Feishu or Discord bind code. */
+export const PERSONAL_CHANNEL_BINDINGS_PATH =
+  "/settings?tab=model#dalton-channel-bindings";
+
+/** English labels of that entry: Models section, then the Feishu and Discord card. */
+export const PERSONAL_CHANNEL_BINDINGS_PLACE =
+  "Settings → Models → Feishu and Discord accounts";
+
+/** Shape of the command `POST /channels/bind-codes` returns. The code is `DLT-` plus two groups of four. */
+export const PERSONAL_BIND_COMMAND_SHAPE = "/bind DLT-XXXX-XXXX";
+
+export function personalChannelBindingsUrl(webBaseUrl: string): string {
+  return `${webBaseUrl.replace(/\/+$/, "")}${PERSONAL_CHANNEL_BINDINGS_PATH}`;
+}
+
+function bindingsPlace(webBaseUrl?: string): string {
+  const url = webBaseUrl
+    ? personalChannelBindingsUrl(webBaseUrl)
+    : PERSONAL_CHANNEL_BINDINGS_PATH;
+  return `${PERSONAL_CHANNEL_BINDINGS_PLACE} (${url})`;
+}
+
+/** Help when `/bind` has no code. Without a host, the path is relative. */
+export function missingBindCodeUsage(webBaseUrl?: string): string {
+  return `Usage: \`${PERSONAL_BIND_COMMAND_SHAPE}\` (generate a bind code in ${bindingsPlace(webBaseUrl)}).`;
+}
+
+/** Help when a bind code is rejected. Pass the gateway host when one is known. */
+export function expiredBindCodeUsage(webBaseUrl?: string): string {
+  return `Bind code is invalid or expired. Please generate a new code in ${bindingsPlace(webBaseUrl)}.`;
+}
+
+/** Direct-message guidance for linking the caller's account. */
+export function notLinkedBindHelp(webBaseUrl: string, platform: string): string {
+  return `Your ${platform} account is not linked to Dalton yet. Open ${personalChannelBindingsUrl(webBaseUrl)} to generate a bind code, then send \`${PERSONAL_BIND_COMMAND_SHAPE}\` in a direct message.`;
+}
+
+/** `GET /agent/targets` copy for a platform with no identity. */
+export function notLinkedTargetMessage(webBaseUrl: string, platform: string): string {
+  return `Your ${platform} account is not linked. Open ${personalChannelBindingsUrl(webBaseUrl)} to link it.`;
+}
+
 /**
  * Trim outer whitespace from candidate command text after the channel adapter
  * has already removed any structured bot mention. Preserves all internal
@@ -110,8 +152,7 @@ export function parseSlashCommand(
       return {
         kind: "invalid",
         reason: "missing_bind_code",
-        message:
-          "Usage: `/bind <6-CHAR-CODE>` (generate a bind code in Web Settings → Channels).",
+        message: missingBindCodeUsage(),
       };
     }
     return {
