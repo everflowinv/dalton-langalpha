@@ -6,6 +6,7 @@ export * from "./backend-client.js";
 export * from "./channels/adapter.js";
 export * from "./channels/fake-adapter.js";
 export * from "./channels/feishu/index.js";
+export * from "./channels/discord/index.js";
 export * from "./delivery-service.js";
 export * from "./agent-routes.js";
 export * from "./orchestrator.js";

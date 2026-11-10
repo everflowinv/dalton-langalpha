@@ -275,24 +275,134 @@ export function createMockBackend(): MockBackend {
     async (
       req: I6AuthorizeAndClaimRequest,
     ): Promise<I6AuthorizeAndClaimResponse> => {
+      const matchedDiscordSource = (() => {
+        if (req.inbound_message_id) {
+          const foundIn = [...registerAndResolveInbound.mock.calls]
+            .map(([inReq]) => inReq)
+            .reverse()
+            .find(
+              (inReq) =>
+                inReq.message_id === req.inbound_message_id &&
+                (!req.platform || inReq.platform === req.platform),
+            );
+          if (foundIn && foundIn.platform === "discord") {
+            return {
+              platform: foundIn.platform,
+              targetAddress: foundIn.chat_address,
+              threadScopeKey: foundIn.thread_scope_key,
+            };
+          }
+        }
+        if (req.run_id || req.thread_id) {
+          for (const [inReq] of [...registerAndResolveInbound.mock.calls].reverse()) {
+            if (inReq.platform !== "discord") continue;
+            if (req.platform && inReq.platform !== req.platform) continue;
+            const progForMsg = [...updateInboundProgress.mock.calls]
+              .map(([u]) => u)
+              .reverse()
+              .find(
+                (u) =>
+                  u.platform === inReq.platform &&
+                  u.message_id === inReq.message_id &&
+                  (u.run_id || u.thread_id),
+              );
+            const effRunId = progForMsg?.run_id ?? RUN_ID;
+            const effThreadId = progForMsg?.thread_id ?? THREAD_ID;
+            if (
+              (!req.run_id || req.run_id === effRunId) &&
+              (!req.thread_id || req.thread_id === effThreadId)
+            ) {
+              return {
+                platform: inReq.platform,
+                targetAddress: inReq.chat_address,
+                threadScopeKey: inReq.thread_scope_key,
+              };
+            }
+          }
+          for (const [upd] of [...updateInboundProgress.mock.calls].reverse()) {
+            const tw = upd.thread_watch;
+            if (
+              tw &&
+              tw.platform === "discord" &&
+              (!req.thread_id || tw.thread_id === req.thread_id)
+            ) {
+              return {
+                platform: tw.platform,
+                targetAddress: tw.target_address,
+                threadScopeKey: tw.scope_key,
+              };
+            }
+            const bg = upd.background_run;
+            if (
+              bg &&
+              bg.platform === "discord" &&
+              (!req.run_id || bg.run_id === req.run_id) &&
+              (!req.thread_id || bg.thread_id === req.thread_id)
+            ) {
+              const matchingW = [...updateInboundProgress.mock.calls]
+                .map(([u]) => u.thread_watch)
+                .reverse()
+                .find((w) => w && w.thread_id === bg.thread_id);
+              const matchingIn = [...registerAndResolveInbound.mock.calls]
+                .map(([inReq]) => inReq)
+                .reverse()
+                .find((inReq) => inReq.platform === "discord");
+              return {
+                platform: bg.platform,
+                targetAddress: bg.target_address,
+                threadScopeKey:
+                  matchingW?.scope_key ??
+                  matchingIn?.thread_scope_key ??
+                  bg.target_address,
+              };
+            }
+          }
+        }
+        return null;
+      })();
+
       const plat = (
         req.platform ??
         req.target?.split(":")[0] ??
+        matchedDiscordSource?.platform ??
         "feishu"
       ).toLowerCase();
-      const targetAddr = req.target ?? `${plat}:@me`;
-      const isCurrent = !req.target || targetAddr === "feishu:@me";
+      const targetAddr =
+        req.target ?? matchedDiscordSource?.targetAddress ?? `${plat}:@me`;
+      const isCurrent =
+        !req.target ||
+        targetAddr === "feishu:@me" ||
+        (matchedDiscordSource !== null &&
+          targetAddr === matchedDiscordSource.targetAddress);
+      const resolvedThreadScopeKey =
+        isCurrent && matchedDiscordSource?.threadScopeKey
+          ? matchedDiscordSource.threadScopeKey
+          : null;
       const lastUpdate = [...updateDeliveryProgress.mock.calls]
         .map(([u]) => u)
         .reverse()
         .find(
           (u) => u.delivery_key === req.delivery_key && u.status !== undefined,
         );
+      if (lastUpdate?.status === "unknown") {
+        return {
+          claim_status: "in_flight_or_unknown",
+          status: "unknown",
+          code: "in_flight",
+          message:
+            "An earlier attempt of this same call is still delivering it.",
+          platform: plat,
+          target_address: targetAddr,
+          thread_scope_key: resolvedThreadScopeKey,
+          is_current: isCurrent,
+        };
+      }
       if (lastUpdate?.status === "partial") {
         return {
           ...structuredClone(defaultI6AlreadyCompletedPartial),
           platform: plat,
           target_address: targetAddr,
+          thread_scope_key: resolvedThreadScopeKey,
           is_current: isCurrent,
           ...(lastUpdate.first_response_json
             ? {
@@ -322,6 +432,7 @@ export function createMockBackend(): MockBackend {
           ...structuredClone(defaultI6AlreadyCompletedSent),
           platform: plat,
           target_address: targetAddr,
+          thread_scope_key: resolvedThreadScopeKey,
           is_current: isCurrent,
           ...(lastUpdate.first_response_json
             ? {
@@ -337,11 +448,18 @@ export function createMockBackend(): MockBackend {
         discord: "dc_alice",
         weixin: "wx_alice",
       };
+      const recipientId =
+        targetAddr.endsWith(":@me") || !targetAddr.includes(":")
+          ? (platformIdentityMap[plat] ?? "ou_alice")
+          : (targetAddr.split(":", 2)[1]?.split("/").at(-1) ??
+            platformIdentityMap[plat] ??
+            "ou_alice");
       return {
         ...structuredClone(defaultI6Claimed),
-        recipient_id: platformIdentityMap[plat] ?? "ou_alice",
+        recipient_id: recipientId,
         platform: plat,
         target_address: targetAddr,
+        thread_scope_key: resolvedThreadScopeKey,
         is_current: isCurrent,
         weixin_context_token: plat === "weixin" ? "ctx_tok_123" : null,
       };
@@ -381,10 +499,31 @@ export function createMockBackend(): MockBackend {
           (req.message_id ?? null) ===
             (lastFbClaim.inbound_message_id ?? null) &&
           (req.message_id ? true : effectiveRunId !== RUN_ID));
+      const hasCompletedDiscordCurrentSend = [
+        ...authorizeAndClaimDelivery.mock.calls,
+      ].some(([c]) => {
+        if (
+          c.kind !== "agent_send" ||
+          c.run_id !== effectiveRunId ||
+          !c.has_non_empty_text ||
+          c.target ||
+          c.platform !== "discord"
+        ) {
+          return false;
+        }
+        const upd = [...updateDeliveryProgress.mock.calls]
+          .map(([u]) => u)
+          .reverse()
+          .find(
+            (u) => u.delivery_key === c.delivery_key && u.status !== undefined,
+          );
+        return upd?.status === "sent" || upd?.status === "partial";
+      });
       return {
         ...structuredClone(defaultI7InboundProgress),
         run_id: effectiveRunId,
-        sent_to_current_count: hasCompletedCurrentFallback ? 1 : 0,
+        sent_to_current_count:
+          hasCompletedCurrentFallback || hasCompletedDiscordCurrentSend ? 1 : 0,
       };
     },
   );

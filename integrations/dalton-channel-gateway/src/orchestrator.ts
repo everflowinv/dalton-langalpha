@@ -95,6 +95,54 @@ export interface ActiveWatchHandle {
   pendingReplayFallbacks?: Map<string, PendingReplayFallbackEntry>;
 }
 
+function storedBindingAction(
+  request: unknown,
+): "bind" | "unbind" | null {
+  if (!request || typeof request !== "object" || Array.isArray(request)) {
+    return null;
+  }
+  const action = (request as Record<string, unknown>).action;
+  const cleaned = typeof action === "string" ? action.trim().toLowerCase() : "";
+  return cleaned === "bind" || cleaned === "unbind" ? cleaned : null;
+}
+
+function recordField(value: object, key: string): unknown {
+  if (!Object.prototype.hasOwnProperty.call(value, key)) return undefined;
+  return Reflect.get(value, key);
+}
+
+/** Fields shared by a stored bind result and an I-2 consume response. */
+function confirmationFields(value: object): {
+  ok: boolean;
+  reason: string | null;
+  expectedPlatform: string | null;
+  userId: string | null;
+  deliveryKey: string | null;
+  duplicate: boolean;
+  action: "bind" | "unbind" | null;
+} {
+  const reason = recordField(value, "reason");
+  const expected = recordField(value, "expected_platform");
+  const userId = recordField(value, "user_id");
+  const deliveryKey = recordField(value, "delivery_key");
+  const action = recordField(value, "action");
+  return {
+    ok: recordField(value, "ok") === true,
+    reason: typeof reason === "string" ? reason : null,
+    expectedPlatform: typeof expected === "string" ? expected : null,
+    userId:
+      typeof userId === "string" && userId.trim().length > 0
+        ? userId.trim()
+        : null,
+    deliveryKey:
+      typeof deliveryKey === "string" && deliveryKey.length > 0
+        ? deliveryKey
+        : null,
+    duplicate: recordField(value, "duplicate") === true,
+    action: action === "bind" || action === "unbind" ? action : null,
+  };
+}
+
 export class ChannelGatewayOrchestrator {
   private readonly backend: BackendClient;
   private readonly adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
@@ -527,28 +575,14 @@ export class ChannelGatewayOrchestrator {
   // §3.3 Slash Commands (`/bind`, `/unbind`, `/workspace`, `/main`, `/new`, `/stop`, `/<workspace_name>`)
   // =========================================================================
 
-  private bindConfirmationSuffix(
-    action: "bind" | "unbind",
-    ok: boolean,
-    reason: string | null,
-  ): string {
-    if (
-      action === "bind" &&
-      (reason === "missing_bind_code" || reason === "missing_argument")
-    ) {
-      return "bind_usage";
-    }
-    if (action === "bind") return ok ? "bind_ok" : "bind_err";
-    return ok ? "unbind_ok" : "unbind_err";
-  }
-
   private bindConfirmationText(
     event: InboundChannelEvent,
     action: "bind" | "unbind",
-    result: Record<string, unknown>,
+    result: object,
   ): string {
-    const reason = typeof result.reason === "string" ? result.reason : "";
-    if (action === "bind" && !result.ok) {
+    const fields = confirmationFields(result);
+    const reason = fields.reason ?? "";
+    if (action === "bind" && !fields.ok) {
       if (
         reason === "missing_bind_code" ||
         reason === "missing_argument"
@@ -559,10 +593,7 @@ export class ChannelGatewayOrchestrator {
         return "For security, `/bind` cannot be used in a group chat. This code has been revoked; please generate a new code and send `/bind <CODE>` in a direct message.";
       }
       if (reason === "platform_mismatch") {
-        const expected =
-          typeof result.expected_platform === "string"
-            ? result.expected_platform
-            : "another platform";
+        const expected = fields.expectedPlatform ?? "another platform";
         return `This bind code was generated for ${expected}, not ${event.platform}.`;
       }
       return "Bind code is invalid or expired. Please generate a new code in Web Settings → Channels.";
@@ -570,7 +601,7 @@ export class ChannelGatewayOrchestrator {
     if (action === "bind") {
       return `Successfully linked your ${event.platform} account to Dalton.`;
     }
-    if (!result.ok) {
+    if (!fields.ok) {
       return `Your ${event.platform} account is not currently linked.`;
     }
     return `Unlinked your ${event.platform} account from Dalton.`;
@@ -579,55 +610,106 @@ export class ChannelGatewayOrchestrator {
   private storedBindingConfirmation(
     row: {
       consumed_bind_result?: Record<string, unknown> | null;
-      command_result?: Record<string, unknown> | null;
+      command_result?: object | null;
+      command_request?: object | null;
     },
-  ): { action: "bind" | "unbind"; result: Record<string, unknown> } | null {
+  ): {
+    action: "bind" | "unbind";
+    result: object;
+    legacyCommandRecord: boolean;
+  } | null {
     const consumed = row.consumed_bind_result;
-    if (consumed && typeof consumed === "object") {
-      return {
-        action: consumed.action === "unbind" ? "unbind" : "bind",
-        result: consumed,
-      };
+    if (consumed && typeof consumed === "object" && !Array.isArray(consumed)) {
+      const action = confirmationFields(consumed).action ?? "bind";
+      return { action, result: consumed, legacyCommandRecord: false };
     }
     const commandResult = row.command_result;
-    if (!commandResult || typeof commandResult !== "object") return null;
-    if (commandResult.action === "bind" || commandResult.action === "unbind") {
-      return { action: commandResult.action, result: commandResult };
+    if (
+      !commandResult ||
+      typeof commandResult !== "object" ||
+      Array.isArray(commandResult)
+    ) {
+      return null;
     }
-    if (commandResult.reason === "missing_bind_code") {
-      return { action: "bind", result: commandResult };
+    const fields = confirmationFields(commandResult);
+    const requestAction = storedBindingAction(row.command_request);
+    let action: "bind" | "unbind" | null = fields.action;
+    if (!action && fields.reason === "missing_bind_code") action = "bind";
+    if (!action && requestAction && recordField(commandResult, "ok") !== undefined) {
+      const okValue = recordField(commandResult, "ok");
+      if (okValue === true || okValue === false) action = requestAction;
     }
-    return null;
+    if (!action) return null;
+    return {
+      action,
+      result: commandResult,
+      legacyCommandRecord: fields.deliveryKey == null,
+    };
   }
 
+  /**
+   * One confirmation entry for a live bind/unbind and for startup recovery.
+   * `replyPending === false` skips the send, the inbound update, and the
+   * watch close. A saved `delivery_key` is reused. A record without that key
+   * keeps `notice:<platform>:<message>:command` on every attempt, so a later
+   * duplicate does not become a second message. `closeWatchesOnSuccessfulUnbind`
+   * is set by a fresh live unbind and by a consumed or keyed recovery; old
+   * production recovery leaves watches open.
+   */
   private async deliverStoredCommandConfirmation(params: {
     event: InboundChannelEvent;
     userId: string | null;
     action: "bind" | "unbind";
-    result: Record<string, unknown>;
+    result: object;
+    replyPending?: boolean;
+    closeWatchesOnSuccessfulUnbind?: boolean;
   }): Promise<boolean> {
-    const ok = params.result.ok === true;
-    const reason =
-      typeof params.result.reason === "string" ? params.result.reason : null;
+    if (params.replyPending === false) return false;
+    const fields = confirmationFields(params.result);
+    const legacy = fields.deliveryKey == null;
     const deliveryKey =
-      typeof params.result.delivery_key === "string" &&
-      params.result.delivery_key.length > 0
-        ? params.result.delivery_key
-        : `notice:${params.event.platform}:${params.event.messageId}:${this.bindConfirmationSuffix(params.action, ok, reason)}`;
-    if (params.action === "unbind" && ok && params.userId) {
-      this.closeWatchesForUserPlatform(params.userId, params.event.platform);
+      fields.deliveryKey ??
+      `notice:${params.event.platform}:${params.event.messageId}:command`;
+    const linkedUser =
+      params.userId && params.userId.trim().length > 0
+        ? params.userId.trim()
+        : null;
+    if (
+      params.closeWatchesOnSuccessfulUnbind &&
+      params.action === "unbind" &&
+      fields.ok &&
+      linkedUser
+    ) {
+      this.closeWatchesForUserPlatform(linkedUser, params.event.platform);
     }
-    const delivered = await this.sendInboundNotice(
-      params.event,
-      params.userId,
-      deliveryKey,
-      this.bindConfirmationText(params.event, params.action, params.result),
-    );
+    let delivered = false;
+    if (legacy && !linkedUser) {
+      const adapter = this.adapters.get(params.event.platform);
+      if (!adapter || !adapter.isConfigured() || !adapter.isConnected()) {
+        return false;
+      }
+      try {
+        await this.sendDirectAdapterNotice(
+          params.event,
+          this.bindConfirmationText(params.event, params.action, params.result),
+        );
+        delivered = true;
+      } catch {
+        delivered = false;
+      }
+    } else {
+      delivered = await this.sendInboundNotice(
+        params.event,
+        linkedUser,
+        deliveryKey,
+        this.bindConfirmationText(params.event, params.action, params.result),
+      );
+    }
     if (!delivered) return false;
     await this.backend.updateInboundProgress({
       platform: params.event.platform,
       message_id: params.event.messageId,
-      status: "completed",
+      status: legacy ? (fields.ok ? "completed" : "failed") : "completed",
       command_reply_pending: false,
       command_effect_status: "done",
       fallback_pending: false,
@@ -643,20 +725,73 @@ export class ChannelGatewayOrchestrator {
       consumed_bind_result: row.consumed_bind_result ?? null,
       command_result:
         row.command_result && typeof row.command_result === "object"
-          ? (row.command_result as unknown as Record<string, unknown>)
+          ? row.command_result
+          : null,
+      command_request:
+        row.command_request && typeof row.command_request === "object"
+          ? row.command_request
           : null,
     });
     if (!stored) return false;
     if (row.command_reply_pending === false) return true;
-    const userId =
-      typeof stored.result.user_id === "string" && stored.result.user_id
-        ? stored.result.user_id
-        : row.dalton_user_id;
+    const storedUser = confirmationFields(stored.result).userId;
+    const rowUser =
+      typeof row.dalton_user_id === "string" && row.dalton_user_id.trim()
+        ? row.dalton_user_id.trim()
+        : null;
     await this.deliverStoredCommandConfirmation({
       event,
-      userId,
+      userId: storedUser ?? rowUser,
       action: stored.action,
       result: stored.result,
+      replyPending: row.command_reply_pending,
+      closeWatchesOnSuccessfulUnbind:
+        !stored.legacyCommandRecord && stored.action === "unbind",
+    });
+    return true;
+  }
+
+  /** Repeat a bind or unbind that I-1 already stored, without consuming again. */
+  private async replayRegisteredBinding(
+    event: InboundChannelEvent,
+    resolved: I1RegisterAndResolveResponse,
+    fallbackAction: "bind" | "unbind",
+  ): Promise<boolean> {
+    const consumed = resolved.consumed_bind_result;
+    if (consumed && typeof consumed === "object" && !Array.isArray(consumed)) {
+      const fields = confirmationFields(consumed);
+      const action = fields.action ?? fallbackAction;
+      await this.deliverStoredCommandConfirmation({
+        event,
+        userId: fields.userId ?? resolved.dalton_user_id,
+        action,
+        result: consumed,
+        replyPending: resolved.command_reply_pending,
+        closeWatchesOnSuccessfulUnbind: action === "unbind",
+      });
+      return true;
+    }
+    const requestAction = storedBindingAction(resolved.command_request);
+    const commandResult = resolved.command_result;
+    if (
+      !requestAction ||
+      !commandResult ||
+      typeof commandResult !== "object" ||
+      Array.isArray(commandResult)
+    ) {
+      return false;
+    }
+    const okValue = recordField(commandResult, "ok");
+    if (okValue !== true && okValue !== false) return false;
+    const fields = confirmationFields(commandResult);
+    await this.deliverStoredCommandConfirmation({
+      event,
+      userId: fields.userId ?? resolved.dalton_user_id,
+      action: requestAction,
+      result: commandResult,
+      replyPending: resolved.command_reply_pending,
+      closeWatchesOnSuccessfulUnbind:
+        requestAction === "unbind" && fields.deliveryKey != null,
     });
     return true;
   }
@@ -712,16 +847,7 @@ export class ChannelGatewayOrchestrator {
       if (!resolved) {
         return true;
       }
-      if (resolved.consumed_bind_result) {
-        await this.deliverStoredCommandConfirmation({
-          event,
-          userId:
-            typeof resolved.consumed_bind_result.user_id === "string"
-              ? resolved.consumed_bind_result.user_id
-              : resolved.dalton_user_id,
-          action: "bind",
-          result: resolved.consumed_bind_result,
-        });
+      if (await this.replayRegisteredBinding(event, resolved, "bind")) {
         return true;
       }
       const arg = parsedCmd.code;
@@ -760,12 +886,19 @@ export class ChannelGatewayOrchestrator {
         inbound_message_id: event.messageId,
         code: arg,
         is_group: event.chatType === "group",
+        message_id: event.messageId,
+        chat_type: event.chatType,
+        chat_address: event.chatAddress,
+        scope_key: event.threadScopeKey,
+        request_key: makeInboundRequestKey(event.platform, event.messageId),
       });
       await this.deliverStoredCommandConfirmation({
         event,
-        userId: res.user_id ?? resolved.dalton_user_id,
+        userId: res.user_id?.trim() || resolved.dalton_user_id,
         action: "bind",
-        result: res as unknown as Record<string, unknown>,
+        result: res,
+        replyPending: res.command_reply_pending,
+        closeWatchesOnSuccessfulUnbind: false,
       });
       return true;
     }
@@ -774,18 +907,7 @@ export class ChannelGatewayOrchestrator {
       if (!resolved) {
         return true;
       }
-      if (resolved.consumed_bind_result) {
-        const savedAction =
-          resolved.consumed_bind_result.action === "unbind" ? "unbind" : "unbind";
-        await this.deliverStoredCommandConfirmation({
-          event,
-          userId:
-            typeof resolved.consumed_bind_result.user_id === "string"
-              ? resolved.consumed_bind_result.user_id
-              : resolved.dalton_user_id,
-          action: savedAction,
-          result: resolved.consumed_bind_result,
-        });
+      if (await this.replayRegisteredBinding(event, resolved, "unbind")) {
         return true;
       }
       const res = await this.backend.consumeBindCode({
@@ -797,12 +919,22 @@ export class ChannelGatewayOrchestrator {
         weixin_bot_generation: event.weixinBotGeneration ?? null,
         inbound_message_id: event.messageId,
         is_group: event.chatType === "group",
+        message_id: event.messageId,
+        chat_type: event.chatType,
+        chat_address: event.chatAddress,
+        scope_key: event.threadScopeKey,
+        request_key: makeInboundRequestKey(event.platform, event.messageId),
       });
+      const legacyReplay =
+        res.duplicate === true &&
+        !(typeof res.delivery_key === "string" && res.delivery_key.length > 0);
       await this.deliverStoredCommandConfirmation({
         event,
-        userId: res.user_id ?? resolved.dalton_user_id,
+        userId: res.user_id?.trim() || resolved.dalton_user_id,
         action: "unbind",
-        result: res as unknown as Record<string, unknown>,
+        result: res,
+        replyPending: res.command_reply_pending,
+        closeWatchesOnSuccessfulUnbind: !legacyReplay,
       });
       return true;
     }
@@ -8104,12 +8236,17 @@ export class ChannelGatewayOrchestrator {
     const recoveredWatch = recoveredWatches?.find(
       (w) => w.thread_id === bg.thread_id,
     );
+    const trimScope = (value: string | null | undefined): string | null => {
+      if (typeof value !== "string") return null;
+      const trimmed = value.trim();
+      return trimmed.length > 0 ? trimmed : null;
+    };
     const bgScopeKey =
-      (typeof bg.scope_key === "string" && bg.scope_key.length > 0
-        ? bg.scope_key
-        : undefined) ??
-      activeWatch?.scopeKey ??
-      recoveredWatch?.scope_key ??
+      trimScope(bg.thread_scope_key) ??
+      trimScope(bg.scope_key) ??
+      trimScope(activeWatch?.scopeKey) ??
+      trimScope(recoveredWatch?.thread_scope_key) ??
+      trimScope(recoveredWatch?.scope_key) ??
       bg.target_address;
     const bgGeneration =
       typeof bg.session_generation === "number" && bg.session_generation > 0

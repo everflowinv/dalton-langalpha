@@ -406,6 +406,7 @@ export async function readStreamWithLimit(
 
 export interface SafeFetchOptions {
   allowedDomains?: readonly string[];
+  allowedProtocols?: readonly string[];
   requireHttps?: boolean;
   resolveHostIps?: HostIpResolver;
   checkResolvedIps?: boolean;
@@ -480,17 +481,18 @@ export function validateSafeFetchTargetUrl(
   targetUrl: URL,
   allowedDomains: readonly string[] | undefined,
   isRedirect: boolean,
-  requireHttps = false,
+  protocolOptions?: boolean | { allowedProtocols?: readonly string[]; requireHttps?: boolean },
 ): void {
   const prefix = isRedirect ? "Redirected attachment" : "Attachment";
-  if (requireHttps) {
-    if (targetUrl.protocol !== "https:") {
-      throw new SafeFetchError(
-        "invalid_url",
-        `${prefix} URL must use HTTPS: ${targetUrl.protocol}`,
-      );
-    }
-  } else if (targetUrl.protocol !== "https:" && targetUrl.protocol !== "http:") {
+  const protocols = typeof protocolOptions === "boolean"
+    ? { requireHttps: protocolOptions }
+    : protocolOptions;
+  const allowedProtocols = protocols?.requireHttps
+    ? ["https:"]
+    : protocols?.allowedProtocols && protocols.allowedProtocols.length > 0
+      ? protocols.allowedProtocols
+      : ["https:", "http:"];
+  if (!allowedProtocols.includes(targetUrl.protocol)) {
     throw new SafeFetchError(
       "invalid_url",
       `Unsupported ${prefix.toLowerCase()} URL protocol: ${targetUrl.protocol}`,
@@ -523,6 +525,7 @@ export async function validateSafeTargetUrlWithDns(
   targetUrl: URL,
   options: {
     allowedDomains?: readonly string[];
+    allowedProtocols?: readonly string[];
     requireHttps?: boolean;
     isRedirect?: boolean;
     resolveHostIps?: HostIpResolver;
@@ -534,7 +537,7 @@ export async function validateSafeTargetUrlWithDns(
     targetUrl,
     options.allowedDomains,
     isRedirect,
-    Boolean(options.requireHttps),
+    options,
   );
 
   const resolver =
@@ -757,6 +760,7 @@ export async function safeFetchBuffer(
 
   await validateSafeTargetUrlWithDns(currentUrl, {
     allowedDomains: options.allowedDomains,
+    allowedProtocols: options.allowedProtocols,
     requireHttps: options.requireHttps,
     isRedirect: false,
     resolveHostIps: options.resolveHostIps,
@@ -784,9 +788,10 @@ export async function safeFetchBuffer(
 
   const controller = new AbortController();
   const onParentAbort = (): void => controller.abort();
-  options.signal?.addEventListener("abort", onParentAbort, { once: true });
   if (options.signal?.aborted) {
     controller.abort();
+  } else {
+    options.signal?.addEventListener("abort", onParentAbort, { once: true });
   }
   const timer =
     timeoutMs > 0
@@ -798,6 +803,12 @@ export async function safeFetchBuffer(
     let redirectHops = 0;
 
     while (true) {
+      if (controller.signal.aborted) {
+        throw new SafeFetchError(
+          "timeout",
+          `Attachment download timed out after ${timeoutMs}ms`,
+        );
+      }
       const effectiveHeaders = stripSensitiveHeadersOnCrossOrigin(
         options.headers,
         initialOrigin,
@@ -852,6 +863,7 @@ export async function safeFetchBuffer(
 
         await validateSafeTargetUrlWithDns(nextUrl, {
           allowedDomains: options.allowedDomains,
+          allowedProtocols: options.allowedProtocols,
           requireHttps: options.requireHttps,
           isRedirect: true,
           resolveHostIps: options.resolveHostIps,

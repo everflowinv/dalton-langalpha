@@ -20,10 +20,13 @@
     "@larksuiteoapi/node-sdk": "1.74.0",
     "mdast-util-from-markdown": "2.0.3",
     "mdast-util-gfm-table": "2.0.0",
-    "micromark-extension-gfm-table": "2.1.2"
+    "micromark-extension-gfm-table": "2.1.2",
+    "ws": "8.22.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/ws": "^8.5.13",
+    "discord-api-types": "0.38.56",
     "esbuild": "^0.25.0",
     "typescript": "^5.8.0",
     "vitest": "^3.0.0"

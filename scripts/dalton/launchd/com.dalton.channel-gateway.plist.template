@@ -48,6 +48,8 @@
     <string>__DALTON_DISCORD_ENABLED__</string>
     <key>DALTON_DISCORD_BOT_TOKEN</key>
     <string>__DALTON_DISCORD_BOT_TOKEN__</string>
+    <key>DALTON_DISCORD_APPLICATION_ID</key>
+    <string>__DALTON_DISCORD_APPLICATION_ID__</string>
     <key>DALTON_WEIXIN_ENABLED</key>
     <string>__DALTON_WEIXIN_ENABLED__</string>
     <key>DALTON_WEIXIN_API_BASE_URL</key>

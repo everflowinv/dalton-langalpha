@@ -213,6 +213,50 @@ describe("Nine `/agent/*` Endpoints & Permission Enforcement (§1.2.1 ~ §1.2.7,
     ).toBe(false);
   });
 
+  it("does not show another Discord guild to an internal user, while an admin still sees the bot directory", async () => {
+    const baseState = await h.backend.getChannelState({ user_id: USER_ID });
+    const visible = "discord:700000011/700000013";
+    const hidden = "discord:700000012/700000014";
+    const internalState = {
+      ...baseState,
+      user_tier: "internal",
+      chat_bindings: [
+        ...baseState.chat_bindings,
+        {
+          platform: "discord",
+          chat_address: visible,
+          chat_name: "alpha-room",
+          workspace_id: WORKSPACE_ID,
+          bound_by_user_id: USER_ID,
+          last_used_at: null,
+        },
+      ],
+    };
+    vi.mocked(h.backend.getChannelState).mockResolvedValue(internalState);
+    h.discordAdapter.connected = true;
+    h.discordAdapter.setAvailableChats([
+      { address: visible, name: "#alpha-room", kind: "channel" },
+      { address: hidden, name: "#beta-secret-room", kind: "channel" },
+    ]);
+
+    const internalAvail = await h.app.agentRoutes.handleGetSettingsAvailable(USER_ID);
+    const internalChats = internalAvail.data.apps.discord?.chats ?? [];
+    expect(internalChats.map((chat) => chat.address)).toContain("discord:@me");
+    expect(internalChats.map((chat) => chat.address)).toContain(visible);
+    expect(internalChats.map((chat) => chat.address)).not.toContain(hidden);
+    expect(JSON.stringify(internalChats)).not.toContain("beta-secret");
+
+    vi.mocked(h.backend.getChannelState).mockResolvedValue({
+      ...internalState,
+      user_tier: "admin",
+    });
+    const adminAvail = await h.app.agentRoutes.handleGetSettingsAvailable(USER_ID);
+    const adminAddresses = (adminAvail.data.apps.discord?.chats ?? []).map((chat) => chat.address);
+    expect(adminAddresses).toContain(visible);
+    expect(adminAddresses).toContain(hidden);
+    expect(adminAddresses).toContain("discord:@me");
+  });
+
   it("POST /agent/check-target rejects unregistered/unauthorized group chats and non-writable workspaces; GET /agent/automation-targets returns `default` + `error` (Codex #22/#24)", async () => {
     // 1. Bare platform name resolves to `@me`
     const bareCheck = await h.app.agentRoutes.handleCheckTarget(USER_ID, {
