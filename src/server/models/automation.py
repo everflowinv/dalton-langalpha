@@ -471,6 +471,13 @@ def _refuse_retired_agent_mode(value: Any) -> Any:
     # Any other value was refused while the field existed, so it still is.
     if not isinstance(value, dict):
         return value
+    # DALTON-HOOK(company-automations): refuse client attempts to set company scope or system user_id
+    from src.dalton.company_identity import is_company_system_user
+
+    if str(value.get("scope") or "").strip().lower() == "company":
+        raise ValueError("company scope cannot be set or transferred by client")
+    if is_company_system_user(value.get("user_id")):
+        raise ValueError("company system user_id cannot be set by client")
     mode = value.get("agent_mode")
     if mode == "flash":
         raise ValueError(
@@ -479,6 +486,8 @@ def _refuse_retired_agent_mode(value: Any) -> Any:
         )
     if mode not in (None, "ptc"):
         raise ValueError("agent_mode was retired; remove it")
+    if "scope" in value or "user_id" in value:
+        return {k: v for k, v in value.items() if k not in ("scope", "user_id")}
     return value
 
 
@@ -686,6 +695,16 @@ class AutomationResponse(BaseModel):
     updated_at: datetime
 
     last_execution: Optional[AutomationExecutionResponse] = None
+    # DALTON-HOOK(company-automations): expose AU1 scope, engine_kind, version, actor, and notify storage mode
+    scope: str = "personal"
+    engine_kind: Literal["agent"] = "agent"
+    notify_storage_mode: str = "legacy"
+    notify_enabled: Optional[bool] = Field(default=None, exclude=True)
+    notify_routes: Optional[List[str]] = Field(default=None, exclude=True)
+    config_version: int = 1
+    active_version: int = 1
+    created_by: Optional[str] = None
+    updated_by: Optional[str] = None
     # DALTON-HOOK(dalton-notify): expose pushable category, effective toggle state, source, and custom route targets
     dalton_notify_category: Optional[str] = None
     dalton_notify_effective: Optional[bool] = None
@@ -694,6 +713,15 @@ class AutomationResponse(BaseModel):
 
     @model_validator(mode="after")
     def _populate_dalton_notify_category(self) -> "AutomationResponse":
+        from src.dalton.company_identity import is_company_system_user
+
+        if self.scope == "company" or is_company_system_user(self.user_id):
+            from src.dalton.services.company_automations import (
+                apply_company_notify_representation,
+            )
+
+            apply_company_notify_representation(self)
+            return self
         if self.dalton_notify_category is None:
             from src.dalton.notify.dispatch import resolve_automation_notify_state
 

@@ -183,6 +183,10 @@ async def _decode_token(token: str) -> AuthInfo:
         user_id: str = payload.get("sub", "")
         if not user_id:
             raise HTTPException(status_code=401, detail="Token missing sub claim")
+        # DALTON-HOOK(company-automations): refuse JWTs carrying system:dalton-company
+        from src.dalton.company_identity import reject_company_system_auth
+
+        reject_company_system_auth(user_id)
         auth_provider = payload.get("app_metadata", {}).get("provider")
         return AuthInfo(user_id=user_id, auth_provider=auth_provider)
     except jwt.ExpiredSignatureError:
@@ -204,13 +208,21 @@ async def verify_jwt_token(
     """
     # DALTON-HOOK(dalton-auth): verify Supabase JWT + allowlist when Dalton auth is enabled
     from src.dalton.auth import is_dalton_supabase_auth_enabled, verify_dalton_bearer
+    # DALTON-HOOK(company-automations): refuse company system identity on direct JWT dependencies
+    from src.dalton.company_identity import reject_company_system_auth
+
     if is_dalton_supabase_auth_enabled():
-        return (await verify_dalton_bearer(credentials)).user_id
+        resolved = (await verify_dalton_bearer(credentials)).user_id
+        reject_company_system_auth(resolved)
+        return resolved
     if HOST_MODE == "oss":
+        reject_company_system_auth(LOCAL_DEV_USER_ID)
         return LOCAL_DEV_USER_ID
     if credentials is None:
         raise HTTPException(status_code=401, detail="Missing Bearer token")
-    return (await _decode_token(credentials.credentials)).user_id
+    resolved = (await _decode_token(credentials.credentials)).user_id
+    reject_company_system_auth(resolved)
+    return resolved
 
 
 async def get_current_auth_info(
@@ -222,10 +234,18 @@ async def get_current_auth_info(
     """
     # DALTON-HOOK(dalton-auth): verify Supabase JWT + allowlist for /auth/sync when Dalton auth is enabled
     from src.dalton.auth import is_dalton_supabase_auth_enabled, verify_dalton_bearer
+    # DALTON-HOOK(company-automations): refuse company system identity on /auth/sync
+    from src.dalton.company_identity import reject_company_system_auth
+
     if is_dalton_supabase_auth_enabled():
-        return await verify_dalton_bearer(credentials)
+        info = await verify_dalton_bearer(credentials)
+        reject_company_system_auth(info.user_id)
+        return info
     if HOST_MODE == "oss":
+        reject_company_system_auth(LOCAL_DEV_USER_ID)
         return AuthInfo(user_id=LOCAL_DEV_USER_ID)
     if credentials is None:
         raise HTTPException(status_code=401, detail="Missing Bearer token")
-    return await _decode_token(credentials.credentials)
+    info = await _decode_token(credentials.credentials)
+    reject_company_system_auth(info.user_id)
+    return info

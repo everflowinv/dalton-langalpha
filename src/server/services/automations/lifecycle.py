@@ -381,6 +381,13 @@ async def create_automation(
         DeliveryRefused: a delivery chat that can't be used
         TargetRefused: a workspace or thread that isn't the user's
     """
+    # DALTON-HOOK(company-automations): refuse company system identity and compute canonical scope on create
+    from src.dalton.company_identity import is_company_system_user
+    from src.dalton.database.company_automations import resolve_automation_scope_for_write
+
+    if is_company_system_user(user_id):
+        raise ValueError("Company automations cannot be created via personal lifecycle")
+
     # A price trigger has no next_run_at: the price monitor fires it.
     next_run_at = (
         AutomationScheduler.calculate_first_run(data.cron_expression, data.timezone)
@@ -407,6 +414,15 @@ async def create_automation(
         delivery = DeliveryConfig(methods=methods)
         data = data.model_copy(update={"delivery_config": delivery})
 
+    # DALTON-HOOK(company-automations): resolve scope via shared classification rule
+    resolved_scope = await resolve_automation_scope_for_write(
+        user_id,
+        name=data.name,
+        workspace_id=workspace_id,
+        metadata=data.metadata,
+        conn=conn,
+    )
+
     automation = await auto_db.create_automation(
         user_id=user_id,
         name=data.name,
@@ -430,6 +446,8 @@ async def create_automation(
             data.delivery_config.model_dump() if data.delivery_config else None
         ),
         metadata=data.metadata,
+        scope=resolved_scope,  # DALTON-HOOK(company-automations)
+        created_by=user_id,
         conn=conn,
     )
 
@@ -572,6 +590,26 @@ async def update_automation(
 
     if not update_kwargs:
         return current
+
+    # DALTON-HOOK(company-automations): keep scope aligned when name, workspace, or metadata changes
+    from src.dalton.company_identity import is_company_system_user
+
+    if is_company_system_user(user_id):
+        raise ValueError("Company automations cannot be updated via personal lifecycle")
+    if any(k in update_kwargs for k in ("name", "workspace_id", "metadata")):
+        from src.dalton.database.company_automations import resolve_automation_scope_for_write
+
+        update_kwargs["scope"] = await resolve_automation_scope_for_write(
+            user_id,
+            name=str(update_kwargs.get("name") or current.get("name") or ""),
+            workspace_id=update_kwargs.get("workspace_id", stored_in),
+            metadata=(
+                update_kwargs.get("metadata")
+                if "metadata" in update_kwargs
+                else current.get("metadata")
+            ),
+            conn=conn,
+        )
 
     result = await auto_db.update_automation(
         automation_id, user_id, conn=conn, **update_kwargs

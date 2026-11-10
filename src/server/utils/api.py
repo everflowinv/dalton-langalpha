@@ -69,7 +69,12 @@ def _service_token_user_id(request: Request) -> tuple[bool, Optional[str]]:
         return False, None
     if not service_token_matches(token, _SERVICE_TOKEN):
         raise HTTPException(status_code=401, detail="Invalid service token")
-    return True, request.headers.get("X-User-Id")
+    # DALTON-HOOK(company-automations): refuse X-Service-Token impersonating system:dalton-company
+    from src.dalton.company_identity import reject_company_system_auth
+
+    service_user_id = request.headers.get("X-User-Id")
+    reject_company_system_auth(service_user_id)
+    return True, service_user_id
 
 
 async def get_current_user_id(
@@ -84,25 +89,34 @@ async def get_current_user_id(
 
     When auth is enabled, requires a valid Bearer JWT (Supabase).
     """
+    from src.dalton.company_identity import reject_company_system_auth
+
     # Service-to-service auth (only active if INTERNAL_SERVICE_TOKEN is set)
     matched, user_id = _service_token_user_id(request)
     if matched:
         if not user_id:
             raise HTTPException(status_code=401, detail="Missing X-User-Id")
+        reject_company_system_auth(user_id)
         return user_id
 
     # DALTON-HOOK(dalton-auth): verify Supabase JWT + allowlist when Dalton auth is enabled
     from src.dalton.auth import is_dalton_supabase_auth_enabled, verify_dalton_bearer
     if is_dalton_supabase_auth_enabled():
-        return (await verify_dalton_bearer(credentials, missing_detail="Missing authentication")).user_id
+        resolved = (await verify_dalton_bearer(credentials, missing_detail="Missing authentication")).user_id
+        reject_company_system_auth(resolved)
+        return resolved
 
     if HOST_MODE == "oss":
+        # DALTON-HOOK(company-automations): refuse company system identity even in local OSS mode
+        reject_company_system_auth(LOCAL_DEV_USER_ID)
         return LOCAL_DEV_USER_ID
 
     if credentials is None:
         raise HTTPException(status_code=401, detail="Missing authentication")
 
-    return (await _decode_token(credentials.credentials)).user_id
+    resolved = (await _decode_token(credentials.credentials)).user_id
+    reject_company_system_auth(resolved)
+    return resolved
 
 
 # Annotated type for cleaner endpoint signatures
@@ -120,18 +134,27 @@ async def get_optional_user_id(
     (e.g. the skills list). A *present but invalid* credential still 401s —
     only genuine absence is anonymous.
     """
+    # DALTON-HOOK(company-automations): reject company system identity on optional auth paths
+    from src.dalton.company_identity import reject_company_system_auth
+
     matched, user_id = _service_token_user_id(request)
     if matched:
+        reject_company_system_auth(user_id)
         return user_id
     # DALTON-HOOK(dalton-auth): verify optional Supabase JWT + allowlist when Dalton auth is enabled
     from src.dalton.auth import is_dalton_supabase_auth_enabled, verify_dalton_optional_bearer
     if is_dalton_supabase_auth_enabled():
-        return await verify_dalton_optional_bearer(credentials)
+        resolved = await verify_dalton_optional_bearer(credentials)
+        reject_company_system_auth(resolved)
+        return resolved
     if HOST_MODE == "oss":
+        reject_company_system_auth(LOCAL_DEV_USER_ID)
         return LOCAL_DEV_USER_ID
     if credentials is None:
         return None
-    return (await _decode_token(credentials.credentials)).user_id
+    resolved = (await _decode_token(credentials.credentials)).user_id
+    reject_company_system_auth(resolved)
+    return resolved
 
 
 # The resolved user id, or None for an anonymous caller.

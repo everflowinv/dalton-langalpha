@@ -64,12 +64,15 @@ def require_channel_service_token(request: Request) -> None:
 def _resolve_internal_user_id(
     request: Request, body_or_query_user_id: str | None
 ) -> str:
+    from src.dalton.company_identity import reject_company_system_auth
+
     uid = (
         str(body_or_query_user_id or "").strip()
         or str(request.headers.get("X-User-Id") or "").strip()
     )
     if not uid:
         raise HTTPException(status_code=400, detail="user_id or X-User-Id is required")
+    reject_company_system_auth(uid)
     return uid
 
 

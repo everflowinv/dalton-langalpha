@@ -35,9 +35,19 @@ async def authenticate_websocket(websocket: WebSocket) -> str:
     """
     # DALTON-HOOK(dalton-auth): verify WebSocket JWT + allowlist when Dalton auth is enabled
     from src.dalton.auth import authenticate_dalton_websocket, is_dalton_supabase_auth_enabled
+    # DALTON-HOOK(company-automations): refuse WebSocket login as system:dalton-company
+    from src.dalton.company_identity import is_company_system_user
+
     if is_dalton_supabase_auth_enabled():
-        return await authenticate_dalton_websocket(websocket)
+        ws_uid = await authenticate_dalton_websocket(websocket)
+        if is_company_system_user(ws_uid):
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid or expired token")
+            raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid or expired token")
+        return ws_uid
     if HOST_MODE == "oss":
+        if is_company_system_user(LOCAL_DEV_USER_ID):
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid or expired token")
+            raise WebSocketException(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid or expired token")
         return LOCAL_DEV_USER_ID
 
     # 1. Try Authorization header
