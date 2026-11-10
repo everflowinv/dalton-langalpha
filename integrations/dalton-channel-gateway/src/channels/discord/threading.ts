@@ -7,18 +7,21 @@
  * removed; the visible title is derived locally from the first line.
  *
  * Active threads are read with `GET /guilds/{guild.id}/threads/active`
- * (`RESTGetAPIGuildThreadsResult` / `Routes.guildActiveThreads`). A thread
- * started from a message uses that message's id as the thread id. A standalone
- * thread has no Discord idempotency field, so recovery uses a mark derived from
- * the delivery id, parent channel, and bot user, carried in the thread name.
+ * (`RESTGetAPIGuildThreadsResult` / `Routes.guildActiveThreads`). The parsed
+ * list is a locally narrowed value: a list that is not made of thread and
+ * member objects is rejected, and it is not cast to the official result type.
+ * A thread started from a message uses that message's id as the thread id. A
+ * standalone thread has no Discord idempotency field, so recovery uses a mark
+ * derived from the delivery id, parent channel, and bot user, carried in the
+ * thread name. A failed lookup before the create request is retryable and does
+ * not post. A well-formed empty list before that request is the signal to post
+ * once. After the request has been sent, only a positive match is reused. An
+ * empty or failed lookup then stays unknown, and the durable delivery record
+ * is what stops another create.
  */
 
 import { createHash } from "node:crypto";
-import type {
-  APIThreadMember,
-  ChannelType,
-  RESTGetAPIGuildThreadsResult,
-} from "discord-api-types/v10";
+import type { ChannelType } from "discord-api-types/v10";
 import { truncateUtf16Safe } from "../../shared/text.js";
 import { ChannelDeliveryError } from "../adapter.js";
 import {
@@ -153,14 +156,16 @@ function lookupNotConfirmed(): ChannelDeliveryError {
 
 function creationNotConfirmed(): ChannelDeliveryError {
   return new ChannelDeliveryError("Discord thread creation was not confirmed", {
-    outcome: "failed",
+    outcome: "unknown",
     code: "unavailable",
   });
 }
 
 /**
- * A 403/404 from a lookup is definite. Any other read failure, including a
- * timeout or 5xx, does not prove the thread is absent.
+ * A 403/404 from a lookup before a create request is definite. Any other read
+ * failure, including a timeout or 5xx, does not prove the thread is absent.
+ * After a create request, the lookup result is not classified here: an
+ * unconfirmed attempt stays unknown.
  */
 function throwThreadLookupFailure(err: unknown): never {
   const classified = classifyDiscordDeliveryError(err, {
@@ -209,13 +214,25 @@ function nameCarriesRequestMark(name: string | undefined, mark: string): boolean
   return typeof name === "string" && name.endsWith(mark);
 }
 
+interface ActiveGuildThreadMember {
+  id?: string;
+  user_id?: string;
+  join_timestamp: string;
+  flags: number;
+}
+
+interface ActiveGuildThreadList {
+  threads: DiscordChannelInfo[];
+  members: ActiveGuildThreadMember[];
+}
+
 function memberConfirmsBot(
   threadId: string,
   botUserId: string,
-  members: APIThreadMember[],
+  members: readonly ActiveGuildThreadMember[],
 ): boolean {
   return members.some((member) => {
-    if (!isRecord(member) || member.id !== threadId) return false;
+    if (member.id !== threadId) return false;
     const userId = member.user_id;
     return typeof userId !== "string" || userId.length === 0 || userId === botUserId;
   });
@@ -225,12 +242,78 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
-function parseActiveGuildThreads(listed: unknown): RESTGetAPIGuildThreadsResult | null {
+/** Copies one channel object. A missing id, or a present field of the wrong type, rejects the entry. */
+function parseDiscordThreadChannel(value: unknown): DiscordChannelInfo | null {
+  if (!isRecord(value)) return null;
+  const id = value.id;
+  if (typeof id !== "string" || id.length === 0) return null;
+  const type = value.type;
+  if (type !== undefined && typeof type !== "number") return null;
+  const guildId = value.guild_id;
+  if (guildId !== undefined && typeof guildId !== "string") return null;
+  const parentId = value.parent_id;
+  if (parentId !== undefined && parentId !== null && typeof parentId !== "string") return null;
+  const name = value.name;
+  if (name !== undefined && typeof name !== "string") return null;
+  const ownerId = value.owner_id;
+  if (ownerId !== undefined && ownerId !== null && typeof ownerId !== "string") return null;
+  const metadata = value.thread_metadata;
+  if (metadata !== undefined && !isRecord(metadata)) return null;
+  if (isRecord(metadata)) {
+    if (metadata.archived !== undefined && typeof metadata.archived !== "boolean") return null;
+    if (metadata.locked !== undefined && typeof metadata.locked !== "boolean") return null;
+  }
+  const thread: DiscordChannelInfo = { id };
+  if (typeof type === "number") thread.type = type;
+  if (typeof guildId === "string") thread.guild_id = guildId;
+  if (typeof parentId === "string" || parentId === null) thread.parent_id = parentId;
+  if (typeof name === "string") thread.name = name;
+  if (typeof ownerId === "string" || ownerId === null) thread.owner_id = ownerId;
+  if (isRecord(metadata)) {
+    const archived = metadata.archived;
+    const locked = metadata.locked;
+    thread.thread_metadata = {
+      ...(typeof archived === "boolean" ? { archived } : {}),
+      ...(typeof locked === "boolean" ? { locked } : {}),
+    };
+  }
+  return thread;
+}
+
+/** `join_timestamp` and integer `flags` are required. `id` and `user_id` stay optional. */
+function parseActiveThreadMember(value: unknown): ActiveGuildThreadMember | null {
+  if (!isRecord(value)) return null;
+  const joinTimestamp = value.join_timestamp;
+  const flags = value.flags;
+  if (typeof joinTimestamp !== "string" || joinTimestamp.length === 0) return null;
+  if (typeof flags !== "number" || !Number.isInteger(flags)) return null;
+  const id = value.id;
+  if (id !== undefined && typeof id !== "string") return null;
+  const userId = value.user_id;
+  if (userId !== undefined && typeof userId !== "string") return null;
+  const member: ActiveGuildThreadMember = { join_timestamp: joinTimestamp, flags };
+  if (typeof id === "string") member.id = id;
+  if (typeof userId === "string") member.user_id = userId;
+  return member;
+}
+
+function parseActiveGuildThreads(listed: unknown): ActiveGuildThreadList | null {
   if (!isRecord(listed)) return null;
   const { threads, members } = listed;
   if (!Array.isArray(threads) || !Array.isArray(members)) return null;
-  if (!threads.every(isRecord) || !members.every(isRecord)) return null;
-  return listed as RESTGetAPIGuildThreadsResult;
+  const parsedThreads: DiscordChannelInfo[] = [];
+  for (const entry of threads) {
+    const thread = parseDiscordThreadChannel(entry);
+    if (!thread) return null;
+    parsedThreads.push(thread);
+  }
+  const parsedMembers: ActiveGuildThreadMember[] = [];
+  for (const entry of members) {
+    const member = parseActiveThreadMember(entry);
+    if (!member) return null;
+    parsedMembers.push(member);
+  }
+  return { threads: parsedThreads, members: parsedMembers };
 }
 
 interface MarkedThreadQuery {
@@ -268,9 +351,7 @@ async function findMarkedActiveThread(
   }
   const parsed = parseActiveGuildThreads(listed);
   if (!parsed) throw lookupNotConfirmed();
-  const located = (parsed.threads as DiscordChannelInfo[]).filter((thread) =>
-    locatedMarkedThread(thread, query),
-  );
+  const located = parsed.threads.filter((thread) => locatedMarkedThread(thread, query));
   if (located.some((thread) => (thread.owner_id ?? "").trim().length === 0)) {
     throw lookupNotConfirmed();
   }
@@ -322,10 +403,8 @@ async function findThreadStartedFromMessage(
     if (classified.code === "not_allowed") throw classified;
     throw lookupNotConfirmed();
   }
-  const channel = listed as DiscordChannelInfo;
-  if (!channel || typeof channel !== "object" || typeof channel.id !== "string") {
-    throw lookupNotConfirmed();
-  }
+  const channel = parseDiscordThreadChannel(listed);
+  if (!channel) throw lookupNotConfirmed();
   if (!messageThreadMatches(channel, query)) {
     throw new ChannelDeliveryError("Discord thread lookup did not match the requested thread", {
       outcome: "failed",
@@ -343,21 +422,21 @@ async function postDiscordThread(
     name: string;
     autoArchiveDuration?: number;
   },
-): Promise<DiscordChannelInfo> {
+): Promise<DiscordChannelInfo | null> {
   const body = {
     name: params.name,
     auto_archive_duration: params.autoArchiveDuration ?? DISCORD_THREAD_AUTO_ARCHIVE_MINUTES,
   };
-  if (params.messageId) {
-    return (await rest.post(
+  const response = params.messageId
+    ? await rest.post(
       `/channels/${encodeURIComponent(params.channelId)}/messages/${encodeURIComponent(params.messageId)}/threads`,
       body,
-    )) as DiscordChannelInfo;
-  }
-  return (await rest.post(`/channels/${encodeURIComponent(params.channelId)}/threads`, {
-    ...body,
-    type: 11, // PUBLIC_THREAD
-  })) as DiscordChannelInfo;
+    )
+    : await rest.post(`/channels/${encodeURIComponent(params.channelId)}/threads`, {
+      ...body,
+      type: 11, // PUBLIC_THREAD
+    });
+  return parseDiscordThreadChannel(response);
 }
 
 function isDefiniteThreadPostFailure(err: unknown): boolean {
@@ -365,14 +444,18 @@ function isDefiniteThreadPostFailure(err: unknown): boolean {
   return err instanceof DiscordError && err.status < 500;
 }
 
+/**
+ * The create request was already sent. A positive match is the created thread.
+ * An empty list, a 403/404/5xx, or a malformed lookup does not prove the
+ * platform rejected the create, so the outcome stays unknown.
+ */
 async function adoptUnconfirmedThread(
   lookup: () => Promise<DiscordChannelInfo | null>,
 ): Promise<DiscordChannelInfo> {
-  let found: DiscordChannelInfo | null;
+  let found: DiscordChannelInfo | null = null;
   try {
     found = await lookup();
-  } catch (err) {
-    if (err instanceof ChannelDeliveryError) throw err;
+  } catch {
     throw creationNotConfirmed();
   }
   if (!found?.id) throw creationNotConfirmed();
@@ -423,7 +506,7 @@ export async function createThreadDiscord(
         name: postName,
         autoArchiveDuration: params.autoArchiveDuration,
       });
-      if (messageCreateConfirms(created, query)) return created;
+      if (created && messageCreateConfirms(created, query)) return created;
     } catch (err) {
       if (isDefiniteThreadPostFailure(err)) {
         throw classifyDiscordDeliveryError(err, {
@@ -431,9 +514,8 @@ export async function createThreadDiscord(
           message: "Discord thread creation failed",
         });
       }
-      // A timeout or 5xx can happen after Discord has already created the thread.
-      // That is not a message send: look the thread up instead of marking the
-      // claim unknown or posting a second thread.
+      // A timeout or 5xx can happen after Discord has created the thread.
+      // One lookup may reuse it. Anything short of a positive match stays unknown.
       return adoptUnconfirmedThread(() => findThreadStartedFromMessage(rest, query));
     }
     return adoptUnconfirmedThread(() => findThreadStartedFromMessage(rest, query));
@@ -467,7 +549,7 @@ export async function createThreadDiscord(
       name: postName,
       autoArchiveDuration: params.autoArchiveDuration,
     });
-    if (markedCreateConfirms(created, query)) return created;
+    if (created && markedCreateConfirms(created, query)) return created;
   } catch (err) {
     if (isDefiniteThreadPostFailure(err)) {
       throw classifyDiscordDeliveryError(err, {
@@ -475,6 +557,7 @@ export async function createThreadDiscord(
         message: "Discord thread creation failed",
       });
     }
+    // The request was sent. A later empty active-thread list is not absence.
     return adoptUnconfirmedThread(() => findMarkedActiveThread(rest, query));
   }
   return adoptUnconfirmedThread(() => findMarkedActiveThread(rest, query));

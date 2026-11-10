@@ -2932,6 +2932,445 @@ describe("Discord outbound", () => {
     }
   });
 
+  function progressStatuses(
+    backend: ReturnType<typeof createMockBackend>,
+    deliveryKey: string,
+  ): string[] {
+    const statuses: string[] = [];
+    for (const [req] of vi.mocked(backend.updateDeliveryProgress).mock.calls) {
+      if (req.delivery_key !== deliveryKey || typeof req.status !== "string") continue;
+      statuses.push(req.status);
+    }
+    return statuses;
+  }
+
+  function newThreadDelivery(deliveryKey: string, replyToMessageId?: string) {
+    return {
+      deliveryKey,
+      kind: "notice" as const,
+      userId: "user_alice_123",
+      platform: "discord",
+      target: `discord:${GUILD_ID}/${CHANNEL_ID}`,
+      text: "Thread title line\nbody",
+      newThread: true,
+      ...(replyToMessageId ? { replyToMessageId } : {}),
+    };
+  }
+
+  async function withDiscordDelivery(
+    handler: FetchHandler,
+    run: (ctx: {
+      delivery: DeliveryService;
+      backend: ReturnType<typeof createMockBackend>;
+      restartGateway: () => Promise<DeliveryService>;
+    }) => Promise<void>,
+  ): Promise<void> {
+    const timers = new FakeTimers();
+    const sockets: FakeWebSocket[] = [];
+    const { rest } = makeRest(handler);
+    const gatewayClient = new DiscordGatewayClient({
+      token: "test-bot-token",
+      gatewayInfo: {
+        url: "wss://gateway.discord.gg",
+        session_start_limit: { total: 1000, remaining: 100, reset_after: 60_000, max_concurrency: 1 },
+      },
+      webSocketFactory: (url) => {
+        const socket = new FakeWebSocket(url);
+        sockets.push(socket);
+        return socket;
+      },
+      timerDeps: {
+        setTimeoutFn: timers.setTimeoutFn,
+        clearTimeoutFn: timers.clearTimeoutFn,
+        now: () => timers.nowMs,
+        random: () => 0,
+      },
+      onError: () => {},
+    });
+    const adapter = new DiscordChannelAdapter({
+      botToken: "test-bot-token",
+      botUserId: BOT_ID,
+      rest,
+      gatewayClient,
+    });
+    const backend = createMockBackend();
+    const delivery = new DeliveryService({
+      backend,
+      adapters: new Map([["discord", adapter]]),
+    });
+    await adapter.start();
+    await helloAndReady(sockets[0]!, 1);
+    expect(adapter.isConnected()).toBe(true);
+    try {
+      await run({
+        delivery,
+        backend,
+        restartGateway: async () => {
+          await adapter.stop();
+          await adapter.start();
+          await helloAndReady(sockets[sockets.length - 1]!, 1);
+          expect(adapter.isConnected()).toBe(true);
+          return new DeliveryService({
+            backend,
+            adapters: new Map([["discord", adapter]]),
+          });
+        },
+      });
+    } finally {
+      await adapter.stop();
+    }
+  }
+
+  it("keeps one thread POST when a lost create is followed by an empty list, including after restart", async () => {
+    const deliveryKey = "notice:discord:thread-create-lost";
+    const mark = discordThreadRequestMark({
+      deliveryKey,
+      parentChannelId: CHANNEL_ID,
+      botUserId: BOT_ID,
+    });
+    let threadPosts = 0;
+    let messagePosts = 0;
+    let activeGets = 0;
+    const postedNames: string[] = [];
+    await withDiscordDelivery(async (call) => {
+      const route = routeOf(call.url);
+      const method = (call.init.method ?? "GET").toUpperCase();
+      if (route === "/users/@me") return jsonResponse({ id: BOT_ID });
+      if (route === `/channels/${CHANNEL_ID}/threads/active`) {
+        throw new Error("channel active-thread route is not a Discord v10 endpoint");
+      }
+      if (route === `/channels/${CHANNEL_ID}` && method === "GET") {
+        return jsonResponse({ id: CHANNEL_ID, type: 0, guild_id: GUILD_ID, parent_id: "category-1" });
+      }
+      if (route === `/guilds/${GUILD_ID}/threads/active` && method === "GET") {
+        activeGets += 1;
+        return jsonResponse({ threads: [], members: [], has_more: false });
+      }
+      if (route === `/channels/${CHANNEL_ID}/threads` && method === "POST") {
+        threadPosts += 1;
+        const body = JSON.parse(String(call.init.body)) as { name: string };
+        postedNames.push(body.name);
+        throw new Error("socket hang up");
+      }
+      if (method === "POST" && route.endsWith("/messages")) {
+        messagePosts += 1;
+        throw new Error("message sent without a confirmed thread");
+      }
+      throw new Error(`unexpected ${method} ${route}`);
+    }, async ({ delivery, backend, restartGateway }) => {
+      const options = newThreadDelivery(deliveryKey);
+      const first = await delivery.executeDelivery(options);
+      expect(first.status).toBe("unknown");
+      expect(first.code).toBe("unavailable");
+      expect(first.message).toMatch(/was not confirmed/i);
+      expect(threadPosts).toBe(1);
+      expect(messagePosts).toBe(0);
+      expect(activeGets).toBe(2);
+      expect(postedNames[0]!.endsWith(mark)).toBe(true);
+      expect(postedNames[0]).not.toBe("Thread title line");
+      expect(progressStatuses(backend, deliveryKey)).toEqual(["unknown"]);
+      const progressAfterFirst = vi.mocked(backend.updateDeliveryProgress).mock.calls.length;
+
+      const second = await delivery.executeDelivery(options);
+      expect(second.status).toBe("unknown");
+      expect(second.code).toBe("in_flight");
+      expect(threadPosts).toBe(1);
+      expect(messagePosts).toBe(0);
+      expect(activeGets).toBe(2);
+      expect(vi.mocked(backend.updateDeliveryProgress).mock.calls.length).toBe(progressAfterFirst);
+
+      const restarted = await restartGateway();
+      const third = await restarted.executeDelivery(options);
+      expect(third.status).toBe("unknown");
+      expect(third.code).toBe("in_flight");
+      expect(threadPosts).toBe(1);
+      expect(messagePosts).toBe(0);
+      expect(activeGets).toBe(2);
+      expect(progressStatuses(backend, deliveryKey)).toEqual(["unknown"]);
+      expect(vi.mocked(backend.updateDeliveryProgress).mock.calls.length).toBe(progressAfterFirst);
+    });
+  });
+
+  it("keeps a thread create unknown when recovery lookup fails after the attempt", async () => {
+    const cases = ["forbidden", "missing", "down", "malformed", "bad-response"] as const;
+    let threadPosts = 0;
+    let messagePosts = 0;
+    let listCalls = 0;
+    let current: (typeof cases)[number] = "forbidden";
+    await withDiscordDelivery(async (call) => {
+      const route = routeOf(call.url);
+      const method = (call.init.method ?? "GET").toUpperCase();
+      if (route === "/users/@me") return jsonResponse({ id: BOT_ID });
+      if (route === `/channels/${CHANNEL_ID}` && method === "GET") {
+        return jsonResponse({ id: CHANNEL_ID, type: 0, guild_id: GUILD_ID, parent_id: "category-1" });
+      }
+      if (route === `/guilds/${GUILD_ID}/threads/active` && method === "GET") {
+        listCalls += 1;
+        if (listCalls % 2 === 1) return jsonResponse({ threads: [], members: [] });
+        if (current === "forbidden") return jsonResponse({ message: "Missing Access" }, 403);
+        if (current === "missing") return jsonResponse({ message: "Unknown Guild" }, 404);
+        if (current === "down") return jsonResponse({ message: "down" }, 500);
+        if (current === "malformed") return jsonResponse({ threads: [{ id: 5 }], members: [] });
+        return jsonResponse({ threads: [], members: [] });
+      }
+      if (route === `/channels/${CHANNEL_ID}/threads` && method === "POST") {
+        threadPosts += 1;
+        if (current === "bad-response") return jsonResponse({ id: "not-a-thread", name: "no mark" });
+        throw new Error("socket hang up");
+      }
+      if (method === "POST" && route.endsWith("/messages")) {
+        messagePosts += 1;
+        throw new Error("message sent without a confirmed thread");
+      }
+      throw new Error(`unexpected ${method} ${route}`);
+    }, async ({ delivery, backend }) => {
+      for (const [index, label] of cases.entries()) {
+        current = label;
+        const deliveryKey = `notice:discord:thread-recovery-${label}`;
+        const options = newThreadDelivery(deliveryKey);
+        const first = await delivery.executeDelivery(options);
+        expect(first.status, label).toBe("unknown");
+        expect(first.code, label).toBe("unavailable");
+        expect(first.message, label).toMatch(/was not confirmed/i);
+        expect(threadPosts, label).toBe(index + 1);
+        expect(messagePosts, label).toBe(0);
+        expect(progressStatuses(backend, deliveryKey), label).toEqual(["unknown"]);
+        const progressAfter = vi.mocked(backend.updateDeliveryProgress).mock.calls.length;
+
+        const second = await delivery.executeDelivery(options);
+        expect(second.status, label).toBe("unknown");
+        expect(second.code, label).toBe("in_flight");
+        expect(threadPosts, label).toBe(index + 1);
+        expect(messagePosts, label).toBe(0);
+        expect(vi.mocked(backend.updateDeliveryProgress).mock.calls.length, label).toBe(progressAfter);
+      }
+    });
+  });
+
+  it("sends once when recovery finds the marked thread and does not adopt a title-only thread", async () => {
+    const recoveredKey = "notice:discord:thread-recovered:command";
+    const titleKey = "notice:discord:thread-title-only";
+    const recoveredMark = discordThreadRequestMark({
+      deliveryKey: recoveredKey,
+      parentChannelId: CHANNEL_ID,
+      botUserId: BOT_ID,
+    });
+    let threadPosts = 0;
+    let messagePosts = 0;
+    let listCalls = 0;
+    let mode: "marked" | "title-only" = "marked";
+    let postedName = "";
+    const titleOnly = {
+      id: "title-only",
+      name: "Thread title line",
+      type: 11,
+      guild_id: GUILD_ID,
+      parent_id: CHANNEL_ID,
+      owner_id: BOT_ID,
+    };
+    await withDiscordDelivery(async (call) => {
+      const route = routeOf(call.url);
+      const method = (call.init.method ?? "GET").toUpperCase();
+      if (route === "/users/@me") return jsonResponse({ id: BOT_ID });
+      if (route === `/channels/${CHANNEL_ID}` && method === "GET") {
+        return jsonResponse({ id: CHANNEL_ID, type: 0, guild_id: GUILD_ID, parent_id: "category-1" });
+      }
+      if (route === `/guilds/${GUILD_ID}/threads/active` && method === "GET") {
+        listCalls += 1;
+        if (listCalls % 2 === 1) return jsonResponse({ threads: [], members: [] });
+        const marked = {
+          id: "recovered-marked",
+          name: postedName,
+          type: 11,
+          guild_id: GUILD_ID,
+          parent_id: CHANNEL_ID,
+          owner_id: BOT_ID,
+        };
+        const threads = mode === "marked" ? [titleOnly, marked] : [titleOnly];
+        return jsonResponse({
+          threads,
+          members: threads.map((thread) => ({
+            id: thread.id,
+            user_id: BOT_ID,
+            join_timestamp: "2020-01-01T00:00:00.000Z",
+            flags: 0,
+          })),
+        });
+      }
+      if (route === `/channels/${CHANNEL_ID}/threads` && method === "POST") {
+        threadPosts += 1;
+        const body = JSON.parse(String(call.init.body)) as { name: string };
+        postedName = body.name;
+        throw new Error("socket hang up");
+      }
+      if (route === "/channels/recovered-marked/messages" && method === "POST") {
+        messagePosts += 1;
+        return jsonResponse({ id: "msg-recovered" });
+      }
+      if (method === "POST" && route.endsWith("/messages")) {
+        messagePosts += 1;
+        throw new Error("message sent without a confirmed thread");
+      }
+      throw new Error(`unexpected ${method} ${route}`);
+    }, async ({ delivery, backend }) => {
+      const recovered = newThreadDelivery(recoveredKey);
+      const first = await delivery.executeDelivery(recovered);
+      expect(first.status).toBe("sent");
+      expect(first.address).toBe(`discord:${GUILD_ID}/${CHANNEL_ID}:thread:recovered-marked`);
+      expect(postedName.endsWith(recoveredMark)).toBe(true);
+      expect(threadPosts).toBe(1);
+      expect(messagePosts).toBe(1);
+      expect(progressStatuses(backend, recoveredKey)).toEqual(["sent"]);
+
+      const again = await delivery.executeDelivery(recovered);
+      expect(again.duplicate).toBe(true);
+      expect(again.status).toBe("sent");
+      expect(threadPosts).toBe(1);
+      expect(messagePosts).toBe(1);
+
+      mode = "title-only";
+      const titleOnlyDelivery = newThreadDelivery(titleKey);
+      const missed = await delivery.executeDelivery(titleOnlyDelivery);
+      expect(missed.status).toBe("unknown");
+      expect(missed.code).toBe("unavailable");
+      expect(threadPosts).toBe(2);
+      expect(messagePosts).toBe(1);
+      expect(progressStatuses(backend, titleKey)).toEqual(["unknown"]);
+
+      const missedAgain = await delivery.executeDelivery(titleOnlyDelivery);
+      expect(missedAgain.code).toBe("in_flight");
+      expect(threadPosts).toBe(2);
+      expect(messagePosts).toBe(1);
+    });
+  });
+
+  it("retries a thread create after a pre-create failure or a definite rejection", async () => {
+    let threadPosts = 0;
+    let messagePosts = 0;
+    let listMode: "down" | "empty" = "down";
+    let rejectPost = false;
+    await withDiscordDelivery(async (call) => {
+      const route = routeOf(call.url);
+      const method = (call.init.method ?? "GET").toUpperCase();
+      if (route === "/users/@me") return jsonResponse({ id: BOT_ID });
+      if (route === `/channels/${CHANNEL_ID}` && method === "GET") {
+        return jsonResponse({ id: CHANNEL_ID, type: 0, guild_id: GUILD_ID, parent_id: "category-1" });
+      }
+      if (route === `/guilds/${GUILD_ID}/threads/active` && method === "GET") {
+        if (listMode === "down") return jsonResponse({ message: "down" }, 500);
+        return jsonResponse({ threads: [], members: [] });
+      }
+      if (route === `/channels/${CHANNEL_ID}/threads` && method === "POST") {
+        threadPosts += 1;
+        if (rejectPost) {
+          rejectPost = false;
+          return jsonResponse({ message: "bad request" }, 400);
+        }
+        const body = JSON.parse(String(call.init.body)) as { name: string };
+        return jsonResponse({
+          id: `thread-${threadPosts}`,
+          name: body.name,
+          type: 11,
+          guild_id: GUILD_ID,
+          parent_id: CHANNEL_ID,
+          owner_id: BOT_ID,
+        });
+      }
+      if (method === "POST" && route.endsWith("/messages")) {
+        messagePosts += 1;
+        return jsonResponse({ id: `msg-${messagePosts}` });
+      }
+      throw new Error(`unexpected ${method} ${route}`);
+    }, async ({ delivery, backend }) => {
+      const preKey = "notice:discord:thread-pre-retry:command";
+      const pre = newThreadDelivery(preKey);
+      const blocked = await delivery.executeDelivery(pre);
+      expect(blocked.status).toBe("failed");
+      expect(blocked.code).toBe("unavailable");
+      expect(blocked.message).toMatch(/did not confirm/i);
+      expect(threadPosts).toBe(0);
+      expect(messagePosts).toBe(0);
+      expect(progressStatuses(backend, preKey)).toEqual(["failed"]);
+
+      listMode = "empty";
+      const created = await delivery.executeDelivery(pre);
+      expect(created.status).toBe("sent");
+      expect(created.address).toBe(`discord:${GUILD_ID}/${CHANNEL_ID}:thread:thread-1`);
+      expect(threadPosts).toBe(1);
+      expect(messagePosts).toBe(1);
+      expect(progressStatuses(backend, preKey)).toEqual(["failed", "sent"]);
+
+      const createdAgain = await delivery.executeDelivery(pre);
+      expect(createdAgain.duplicate).toBe(true);
+      expect(threadPosts).toBe(1);
+      expect(messagePosts).toBe(1);
+
+      const rejectedKey = "notice:discord:thread-rejected:command";
+      const rejected = newThreadDelivery(rejectedKey);
+      rejectPost = true;
+      const denied = await delivery.executeDelivery(rejected);
+      expect(denied.status).toBe("failed");
+      expect(denied.message).toMatch(/creation failed/i);
+      expect(threadPosts).toBe(2);
+      expect(messagePosts).toBe(1);
+      expect(progressStatuses(backend, rejectedKey)).toEqual(["failed"]);
+
+      const retried = await delivery.executeDelivery(rejected);
+      expect(retried.status).toBe("sent");
+      expect(retried.address).toBe(`discord:${GUILD_ID}/${CHANNEL_ID}:thread:thread-3`);
+      expect(threadPosts).toBe(3);
+      expect(messagePosts).toBe(2);
+      expect(progressStatuses(backend, rejectedKey)).toEqual(["failed", "sent"]);
+    });
+  });
+
+  it("keeps a lost message-thread create unknown when the message channel is still missing", async () => {
+    const deliveryKey = "notice:discord:message-thread-lost";
+    let threadPosts = 0;
+    let messagePosts = 0;
+    let messageLookups = 0;
+    await withDiscordDelivery(async (call) => {
+      const route = routeOf(call.url);
+      const method = (call.init.method ?? "GET").toUpperCase();
+      if (route === "/users/@me") return jsonResponse({ id: BOT_ID });
+      if (route.endsWith("/threads/active")) {
+        throw new Error(`message thread lookup must not list ${route}`);
+      }
+      if (route === `/channels/${CHANNEL_ID}` && method === "GET") {
+        return jsonResponse({ id: CHANNEL_ID, type: 0, guild_id: GUILD_ID, parent_id: "category-1" });
+      }
+      if (route === "/channels/m-lost" && method === "GET") {
+        messageLookups += 1;
+        return jsonResponse({ message: "Unknown Channel" }, 404);
+      }
+      if (route === `/channels/${CHANNEL_ID}/messages/m-lost/threads` && method === "POST") {
+        threadPosts += 1;
+        throw new Error("socket hang up");
+      }
+      if (method === "POST" && route.endsWith("/messages")) {
+        messagePosts += 1;
+        throw new Error("message sent without a confirmed thread");
+      }
+      throw new Error(`unexpected ${method} ${route}`);
+    }, async ({ delivery, backend }) => {
+      const options = newThreadDelivery(deliveryKey, "m-lost");
+      const first = await delivery.executeDelivery(options);
+      expect(first.status).toBe("unknown");
+      expect(first.code).toBe("unavailable");
+      expect(first.message).toMatch(/was not confirmed/i);
+      expect(threadPosts).toBe(1);
+      expect(messagePosts).toBe(0);
+      expect(messageLookups).toBe(2);
+      expect(progressStatuses(backend, deliveryKey)).toEqual(["unknown"]);
+
+      const second = await delivery.executeDelivery(options);
+      expect(second.code).toBe("in_flight");
+      expect(threadPosts).toBe(1);
+      expect(messagePosts).toBe(0);
+      expect(messageLookups).toBe(2);
+    });
+  });
+
   it("identifies a thread by message id or delivery mark, never by display title", async () => {
     const otherParent = "700000088";
     const mark = discordThreadRequestMark({
@@ -3105,6 +3544,44 @@ describe("Discord outbound", () => {
         code: "unavailable",
         message: /did not confirm/i,
       },
+      {
+        label: "member-missing-flags",
+        body: {
+          threads: [],
+          members: [{ id: "x", user_id: BOT_ID, join_timestamp: "2020-01-01T00:00:00.000Z" }],
+        },
+        code: "unavailable",
+        message: /did not confirm/i,
+      },
+      {
+        label: "member-bad-flags",
+        body: {
+          threads: [],
+          members: [{
+            id: "x",
+            user_id: BOT_ID,
+            join_timestamp: "2020-01-01T00:00:00.000Z",
+            flags: 1.5,
+          }],
+        },
+        code: "unavailable",
+        message: /did not confirm/i,
+      },
+      {
+        label: "thread-missing-id",
+        body: {
+          threads: [{
+            type: 11,
+            guild_id: GUILD_ID,
+            parent_id: CHANNEL_ID,
+            name: `Same title ${mark}`,
+            owner_id: BOT_ID,
+          }],
+          members: [],
+        },
+        code: "unavailable",
+        message: /did not confirm/i,
+      },
     ];
     for (const item of cases) {
       let posts = 0;
@@ -3126,7 +3603,7 @@ describe("Discord outbound", () => {
         name: "Same title",
         deliveryKey: "delivery-thread-alpha",
         botUserId: BOT_ID,
-      })).rejects.toMatchObject({ code: item.code });
+      })).rejects.toMatchObject({ code: item.code, outcome: "failed" });
       await expect(createThreadDiscord(rest, {
         channelId: CHANNEL_ID,
         name: "Same title",
@@ -3175,7 +3652,7 @@ describe("Discord outbound", () => {
       name: "Same title",
       deliveryKey: "delivery-thread-alpha",
       botUserId: BOT_ID,
-    })).rejects.toMatchObject({ code: "not_allowed" });
+    })).rejects.toMatchObject({ code: "not_allowed", outcome: "failed" });
 
     const { rest: missingGuild } = makeRest(async (call) => {
       const route = routeOf(call.url);
@@ -3189,12 +3666,14 @@ describe("Discord outbound", () => {
       }
       return jsonResponse({ id: CHANNEL_ID, type: 0, parent_id: "category-1" });
     });
-    await expect(createThreadDiscord(missingGuild, {
+    const missingGuildAttempt = createThreadDiscord(missingGuild, {
       channelId: CHANNEL_ID,
       name: "Same title",
       deliveryKey: "delivery-thread-alpha",
       botUserId: BOT_ID,
-    })).rejects.toThrow(/did not confirm/i);
+    });
+    await expect(missingGuildAttempt).rejects.toMatchObject({ outcome: "failed", code: "unavailable" });
+    await expect(missingGuildAttempt).rejects.toThrow(/did not confirm/i);
     expect(blockedPosts).toBe(0);
   });
 
@@ -3257,7 +3736,7 @@ describe("Discord outbound", () => {
     expect(created.name?.endsWith(mark)).toBe(true);
   });
 
-  it("posts again only after a lost create is proven absent, and keeps the same mark", async () => {
+  it("reports a lost standalone create as unknown and adopts the same mark when a later lookup finds it", async () => {
     const mark = discordThreadRequestMark({
       deliveryKey: "delivery-thread-alpha",
       parentChannelId: CHANNEL_ID,
@@ -3267,7 +3746,7 @@ describe("Discord outbound", () => {
     const names: string[] = [];
     let posts = 0;
     let listCalls = 0;
-    let mode: "down-after-post" | "absent" | "stored" = "down-after-post";
+    let mode: "down-after-post" | "stored" = "down-after-post";
     const { rest } = makeRest(async (call) => {
       const route = routeOf(call.url);
       const method = (call.init.method ?? "GET").toUpperCase();
@@ -3312,22 +3791,22 @@ describe("Discord outbound", () => {
       botUserId: BOT_ID,
     };
 
-    await expect(createThreadDiscord(rest, params)).rejects.toThrow(/did not confirm/i);
+    const lost = createThreadDiscord(rest, params);
+    await expect(lost).rejects.toMatchObject({ outcome: "unknown", code: "unavailable" });
+    await expect(lost).rejects.toThrow(/was not confirmed/i);
     expect(posts).toBe(1);
     expect(names[0]!.endsWith(mark)).toBe(true);
-    await expect(createThreadDiscord(rest, params)).rejects.toThrow(/did not confirm/i);
+    // This second call has no delivery record. Its own lookup fails before it posts.
+    const lookupFailed = createThreadDiscord(rest, params);
+    await expect(lookupFailed).rejects.toMatchObject({ outcome: "failed", code: "unavailable" });
+    await expect(lookupFailed).rejects.toThrow(/did not confirm/i);
     expect(posts).toBe(1);
-
-    mode = "absent";
-    await expect(createThreadDiscord(rest, params)).rejects.toThrow(/was not confirmed/i);
-    expect(posts).toBe(2);
-    expect(names[1]).toBe(names[0]);
-    expect(listCalls).toBeGreaterThanOrEqual(4);
 
     mode = "stored";
     const adopted = await createThreadDiscord(rest, params);
     expect(adopted.id).toBe("stored-alpha");
-    expect(posts).toBe(2);
+    expect(posts).toBe(1);
+    expect(listCalls).toBeGreaterThanOrEqual(3);
   });
 
   it("uses the source message id as the thread id and ignores an equal title on another message", async () => {
@@ -3450,12 +3929,14 @@ describe("Discord outbound", () => {
       channelId: CHANNEL_ID,
       messageId: "m-forbidden",
       name: "Same title",
-    })).rejects.toMatchObject({ code: "not_allowed" });
-    await expect(createThreadDiscord(rest, {
+    })).rejects.toMatchObject({ code: "not_allowed", outcome: "failed" });
+    const messageLookupDown = createThreadDiscord(rest, {
       channelId: CHANNEL_ID,
       messageId: "m-down",
       name: "Same title",
-    })).rejects.toThrow(/did not confirm/i);
+    });
+    await expect(messageLookupDown).rejects.toMatchObject({ outcome: "failed", code: "unavailable" });
+    await expect(messageLookupDown).rejects.toThrow(/did not confirm/i);
     expect(posts).toHaveLength(2);
 
     const recovered = await createThreadDiscord(rest, {
@@ -3466,11 +3947,13 @@ describe("Discord outbound", () => {
     expect(recovered.id).toBe("m-hang");
     expect(posts.filter((route) => route.endsWith("/m-hang/threads"))).toHaveLength(1);
 
-    await expect(createThreadDiscord(rest, {
+    const wrongResponse = createThreadDiscord(rest, {
       channelId: CHANNEL_ID,
       messageId: "m-wrong-response",
       name: "Same title",
-    })).rejects.toThrow(/was not confirmed/i);
+    });
+    await expect(wrongResponse).rejects.toMatchObject({ outcome: "unknown", code: "unavailable" });
+    await expect(wrongResponse).rejects.toThrow(/was not confirmed/i);
     expect(posts.filter((route) => route.endsWith("/m-wrong-response/threads"))).toHaveLength(1);
   });
 
