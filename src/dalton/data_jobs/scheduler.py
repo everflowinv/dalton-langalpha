@@ -2780,6 +2780,23 @@ async def dispatch_data_task_run_notification(
                     payload=target_payload,
                 )
                 if isinstance(persisted_rec, Mapping):
+                    if persisted_rec.get("conflict") is True:
+                        conflict_code = str(
+                            persisted_rec.get("code") or "recipient_identity_conflict"
+                        )
+                        await _invoke_mark_delivery(
+                            mark_target_fn,
+                            str(run_id),
+                            ch,
+                            cleaned_tgt,
+                            status="failed",
+                            error_code=conflict_code,
+                            expected_status="pending",
+                        )
+                        local_by_target[(ch, cleaned_tgt)] = "failed"
+                        if (ch, cleaned_tgt) in pending_targets:
+                            pending_targets.remove((ch, cleaned_tgt))
+                        continue
                     target_payload.update(persisted_rec)
 
             await check_scheduler_lock(lock_conn)

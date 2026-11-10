@@ -1210,7 +1210,11 @@ async def claim_target_delivery(
                     ),
                     updated_at = NOW()
                 WHERE (
-                    dalton_notify_deliveries.status = 'failed'
+                    (
+                        dalton_notify_deliveries.status = 'pending'
+                        AND dalton_notify_deliveries.attempt_count = 0
+                    )
+                    OR dalton_notify_deliveries.status = 'failed'
                     OR (
                         dalton_notify_deliveries.status = 'pending'
                         AND (

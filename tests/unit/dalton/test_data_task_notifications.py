@@ -12,10 +12,12 @@ import io
 import json
 import os
 from pathlib import Path
+import struct
 import sys
 from typing import Any
 from unittest.mock import create_autospec
 from uuid import uuid4
+import zlib
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -57,6 +59,30 @@ SERVICE_TOKEN = "t" * 40
 def _make_synthetic_png(tag: bytes) -> bytes:
     """Build deterministic valid PNG header + synthetic payload bytes."""
     return b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + tag + b"\x00" * 32
+
+
+def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    crc = zlib.crc32(chunk_type + data) & 0xFFFFFFFF
+    return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", crc)
+
+
+def _make_valid_png_bytes(
+    *,
+    width: int = 8,
+    height: int = 8,
+    rgb: tuple[int, int, int] = (20, 90, 180),
+) -> bytes:
+    """Build a spec-compliant PNG with uncompressed deflate (`level=0`) so equal dimensions have equal byte length."""
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    row = b"\x00" + bytes(rgb) * width
+    raw_scanlines = row * height
+    idat = zlib.compress(raw_scanlines, level=0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", ihdr)
+        + _png_chunk(b"IDAT", idat)
+        + _png_chunk(b"IEND", b"")
+    )
 
 
 def _make_synthetic_t27_markdown(workspace_prefix: str = "/Users/everflow/.openclaw/workspace") -> str:
@@ -913,7 +939,7 @@ async def test_group_authorization_succeeds_without_personal_identity_while_dm_s
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """R2 §1: Administrator group report succeeds without `dalton_channel_identities`, omitting `owner_platform_user_id`, while personal DM without binding fails `not_linked`."""
+    """Administrator group report succeeds without `dalton_channel_identities`, omitting `owner_platform_user_id`, while personal DM without binding fails `not_linked`."""
     from contextlib import asynccontextmanager
     import psycopg
 
@@ -1017,7 +1043,7 @@ def test_dedicated_feishu_vault_credentials_endpoint_and_log_redaction(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """R2 §2: Narrow Vault startup endpoint enforces service auth, rejects caller overrides, sets no-store, and never logs secret values."""
+    """Narrow Vault startup endpoint enforces service auth, rejects caller overrides, sets no-store, and never logs secret values."""
     import logging
 
     import src.dalton.services.channel_vault_credentials as vault_creds_mod
@@ -1158,7 +1184,7 @@ def test_dedicated_feishu_vault_credentials_endpoint_and_log_redaction(
 
 
 def test_launchd_template_contains_no_plaintext_feishu_or_service_secrets() -> None:
-    """R2 §2: LaunchAgent plist template uses Vault credential source and owner-only env file, storing no plaintext credentials."""
+    """LaunchAgent plist template uses Vault credential source and owner-only env file, storing no plaintext credentials."""
     import plistlib
 
     project_root = Path(__file__).resolve().parents[3]
@@ -1188,7 +1214,7 @@ def test_launchd_template_contains_no_plaintext_feishu_or_service_secrets() -> N
 
 
 def test_artifact_fifo_rejected_promptly_without_blocking_in_isolated_subprocess() -> None:
-    """R3 §1: Writerless FIFO artifact leaf is rejected immediately via nonblocking open + fstat without stalling."""
+    """Writerless FIFO artifact leaf is rejected immediately via nonblocking open + fstat without stalling."""
     import shutil
     import subprocess
     import tempfile
@@ -1268,7 +1294,7 @@ def test_artifact_fifo_rejected_promptly_without_blocking_in_isolated_subprocess
 
 
 # ---------------------------------------------------------------------------
-# Round 4: Descriptor-Based Snapshot/Outbox Creation & Metadata Precedence
+# Descriptor-Based Snapshot/Outbox Creation & Metadata Precedence
 # ---------------------------------------------------------------------------
 
 
@@ -2155,12 +2181,13 @@ async def test_reconcile_uncertain_data_task_deliveries_expected_count_and_db_re
 def test_safe_atomic_write_bytes_rejects_temp_replacement_symlink_and_regular_file_preserving_destination(
     tmp_path: Path,
 ) -> None:
-    """R5 Part A #3: Temp-file identity verification rejects symlink or regular-file replacement before publish without unlinking replacement."""
+    """Temp-file identity verification rejects symlink or regular-file replacement before publish without unlinking replacement."""
     from src.dalton.data_jobs.safe_fs import SafeFsError, safe_atomic_write_bytes
 
     anchor = tmp_path / "anchor"
     anchor.mkdir(parents=True, exist_ok=True)
-    dest = anchor / "runs" / "r-temp-verify" / "outbox.json"
+    rel_parts = ("runs", "r-temp-verify", "outbox.json")
+    dest = anchor.joinpath(*rel_parts)
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(b"valid previous")
 
@@ -2170,14 +2197,16 @@ def test_safe_atomic_write_bytes_rejects_temp_replacement_symlink_and_regular_fi
     # 1. Replace temp file with an outside symlink before publish
     replaced_tmp_symlink: list[Path] = []
 
-    def _replace_with_symlink(dir_fd: int, tmp_name: str) -> None:
-        os.unlink(tmp_name, dir_fd=dir_fd)
-        os.symlink(str(outside_file), tmp_name, dir_fd=dir_fd)
-        replaced_tmp_symlink.append(dest.parent / tmp_name)
+    def _replace_with_symlink(tmp_name: str) -> None:
+        tmp_entry = dest.parent / tmp_name
+        tmp_entry.unlink()
+        os.symlink(outside_file, tmp_entry)
+        replaced_tmp_symlink.append(tmp_entry)
 
     with pytest.raises(SafeFsError) as exc_sym:
         safe_atomic_write_bytes(
-            dest,
+            anchor,
+            rel_parts,
             b"new payload 1",
             anchor_dir=anchor,
             _on_before_publish=_replace_with_symlink,
@@ -2187,35 +2216,28 @@ def test_safe_atomic_write_bytes_rejects_temp_replacement_symlink_and_regular_fi
     assert dest.is_symlink() is False
     assert dest.read_bytes() == b"valid previous"
     assert outside_file.read_bytes() == b"outside untouched"
-    # Cleanup must NOT unlink the attacker's replacement symlink
+    # Cleanup must NOT unlink the replacement symlink whose inode differs from tmp_fd
     assert replaced_tmp_symlink[0].is_symlink() is True
     replaced_tmp_symlink[0].unlink()
 
     # 2. Replace temp file with a different regular file (different inode) before publish
     replaced_tmp_regular: list[Path] = []
 
-    def _replace_with_other_regular_file(dir_fd: int, tmp_name: str) -> None:
-        os.unlink(tmp_name, dir_fd=dir_fd)
-        other_fd = os.open(
-            tmp_name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            0o644,
-            dir_fd=dir_fd,
-        )
-        try:
-            os.write(other_fd, b"attacker swapped regular file")
-        finally:
-            os.close(other_fd)
-        replaced_tmp_regular.append(dest.parent / tmp_name)
+    def _replace_with_other_regular_file(tmp_name: str) -> None:
+        tmp_entry = dest.parent / tmp_name
+        tmp_entry.unlink()
+        tmp_entry.write_bytes(b"attacker swapped regular file")
+        replaced_tmp_regular.append(tmp_entry)
 
     with pytest.raises(SafeFsError) as exc_reg:
         safe_atomic_write_bytes(
-            dest,
+            anchor,
+            rel_parts,
             b"new payload 2",
             anchor_dir=anchor,
             _on_before_publish=_replace_with_other_regular_file,
         )
-    assert exc_reg.value.code == "concurrent_directory_modification"
+    assert exc_reg.value.code == "symlink_rejected"
     assert len(replaced_tmp_regular) == 1
     assert dest.is_symlink() is False
     assert dest.read_bytes() == b"valid previous"
@@ -2225,7 +2247,7 @@ def test_safe_atomic_write_bytes_rejects_temp_replacement_symlink_and_regular_fi
     replaced_tmp_regular[0].unlink()
 
     # 3. Normal write still succeeds and atomically updates destination
-    safe_atomic_write_bytes(dest, b"valid updated", anchor_dir=anchor)
+    safe_atomic_write_bytes(anchor, rel_parts, b"valid updated", anchor_dir=anchor)
     assert dest.is_symlink() is False
     assert dest.read_bytes() == b"valid updated"
 
@@ -2235,12 +2257,13 @@ async def test_persisted_image_metadata_preparation_t52_t54_and_delivery_verific
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """R5 Part B §4 items 1, 2, 3, 4, 6, 7: Image size_bytes + sha256 persisted at run finalization and strictly verified on plan/download."""
+    """Image size_bytes + sha256 are persisted at run finalization and strictly verified on plan and artifact download."""
     from contextlib import asynccontextmanager
+    from datetime import datetime, timezone
 
     from src.dalton.data_jobs import scheduler as sched
-    from src.dalton.data_jobs.contracts import TaskEvaluationResult
-    from src.dalton.data_jobs.docker_runner import ContainerInspectionOutcome
+    from src.dalton.data_jobs.container_runner import ContainerInspectionOutcome
+    from src.dalton.data_jobs.evaluators import TaskEvaluationResult
     from src.dalton.data_jobs.notification_payloads import (
         DataTaskNotificationError,
         DataTaskNotificationPrepError,
@@ -2248,27 +2271,17 @@ async def test_persisted_image_metadata_preparation_t52_t54_and_delivery_verific
         prepare_run_outbox_image_metadata,
         read_validated_run_artifact,
     )
-    from src.dalton.data_jobs.path_map import DataTaskPathMap
 
-    data_root = tmp_path / "data"
-    path_map = DataTaskPathMap(
-        host_repo_root=tmp_path,
-        host_data_root=data_root,
-        backend_data_root=data_root,
-        container_data_root=Path("/data"),
-        container_out_dir=Path("/out"),
+    path_map = build_path_map(
+        host_var_dir=tmp_path / "host_var",
+        backend_var_dir=tmp_path / "backend_var",
     )
-    png_v1 = _make_test_png_bytes(width=18, height=18)
-    png_v2_diff_len = _make_test_png_bytes(width=32, height=24)
+    png_v1 = _make_valid_png_bytes(width=18, height=18, rgb=(20, 90, 180))
+    png_same_len_diff_sha = _make_valid_png_bytes(width=18, height=18, rgb=(200, 40, 60))
+    png_v2_diff_len = _make_valid_png_bytes(width=32, height=24, rgb=(40, 160, 80))
+    assert len(png_v1) == len(png_same_len_diff_sha)
     assert len(png_v1) != len(png_v2_diff_len)
-    # Construct a second valid PNG with the exact same byte length as png_v1 but different content/digest
-    ihdr_idx = png_v1.index(b"IHDR")
-    png_v1_same_len_mutated = bytearray(png_v1)
-    png_v1_same_len_mutated[-16] ^= 0x01
-    png_same_len_diff_sha = bytes(png_v1_same_len_mutated)
-    assert len(png_same_len_diff_sha) == len(png_v1)
     assert hashlib.sha256(png_same_len_diff_sha).hexdigest() != hashlib.sha256(png_v1).hexdigest()
-    assert ihdr_idx > 0
 
     # --- 1. Representative T52 and T54 finalization via `finalize_task_run` persists `size_bytes` and `sha256` ---
     executed_updates: list[dict[str, Any]] = []
@@ -2283,6 +2296,7 @@ async def test_persisted_image_metadata_preparation_t52_t54_and_delivery_verific
             return None
 
         async def execute(self, sql: str, params: Any = None) -> None:
+            _ = sql
             if isinstance(params, dict) and "terminal_status" in params:
                 executed_updates.append(dict(params))
 
@@ -2297,14 +2311,27 @@ async def test_persisted_image_metadata_preparation_t52_t54_and_delivery_verific
         def cursor(self, **_kw):
             return _FakeCur()
 
-    monkeypatch.setattr(sched, "check_scheduler_lock", AsyncMock(return_value=None))
-    monkeypatch.setattr(sched, "freeze_task_run_artifacts", lambda **_kw: None)
-    monkeypatch.setattr(sched, "cleanup_run_secrets_dir", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        sched,
+        "check_scheduler_lock",
+        create_autospec(sched.check_scheduler_lock, return_value=None),
+    )
+    monkeypatch.setattr(
+        sched,
+        "freeze_task_run_artifacts",
+        create_autospec(sched.freeze_task_run_artifacts, return_value=None),
+    )
+    monkeypatch.setattr(
+        sched,
+        "cleanup_run_secrets_dir",
+        create_autospec(sched.cleanup_run_secrets_dir, return_value=None),
+    )
 
+    slot_utc = datetime(2026, 4, 15, 12, 0, tzinfo=timezone.utc)
     for idx, (job_key, title) in enumerate(
         [
-            ("T52_us_Playwright_2310", "T52 盘前报告"),
-            ("T54_us_Playwright_0705", "T54 盘后报告"),
+            ("softbank-nav-monitor", "T52 SoftBank NAV 监控"),
+            ("tsmc-adr-premium", "T54 TSMC ADR 溢价监控"),
         ]
     ):
         run_id = f"00000000-0000-4000-8000-00000000050{idx}"
@@ -2319,7 +2346,7 @@ async def test_persisted_image_metadata_preparation_t52_t54_and_delivery_verific
             "body": {
                 "elements": [
                     {"tag": "markdown", "content": f"Section for {job_key}"},
-                    {"tag": "img", "img_key": "__FEISHU_IMG_0_0__"},
+                    {"tag": "__img__", "path": "__FEISHU_IMG_0_0__"},
                 ]
             },
         }
@@ -2345,15 +2372,18 @@ async def test_persisted_image_metadata_preparation_t52_t54_and_delivery_verific
         claimed = sched.ClaimedTaskRun(
             run_id=run_id,
             job_key=job_key,
-            trigger_source="schedule",
-            scheduled_slot_utc=datetime(2026, 4, 15, 12, 0, tzinfo=timezone.utc),
-            attempt_no=1,
-            tier="T2",
-            exec_class="container_playwright",
-            command_json=["python", "-m", "task"],
+            generation=1,
+            runner="container",
+            command_argv=["python", "-m", "task"],
+            workdir="/workspace",
             timeout_seconds=120,
             no_output_timeout_seconds=60,
+            required_secrets=[],
+            cos_mode="skip",
             notify_enabled=True,
+            scheduled_slot_utc=slot_utc,
+            deadline_utc=slot_utc,
+            trigger_source="cron",
             is_trial=False,
         )
         committed, _ = await sched.finalize_task_run(
@@ -2362,7 +2392,13 @@ async def test_persisted_image_metadata_preparation_t52_t54_and_delivery_verific
             docker_client=None,
             claimed=claimed,
             container_id=None,
-            outcome=ContainerInspectionOutcome(running=False, exit_code=0, oom_killed=False, log_tail="ok"),
+            outcome=ContainerInspectionOutcome(
+                container_id="cid-prep",
+                running=False,
+                exit_code=0,
+                oom_killed=False,
+                log_tail="ok",
+            ),
             evaluation=TaskEvaluationResult(ok=True, status="succeeded"),
             outbox_payload=raw_outbox,
             frozen_manifest={"job_key": job_key, "status": "ok"},
@@ -2384,21 +2420,28 @@ async def test_persisted_image_metadata_preparation_t52_t54_and_delivery_verific
             job_key=job_key,
             raw_outbox=persisted_outbox,
             run_artifacts_dir=run_dir,
-            platform="feishu",
         )
-        assert len(plan.feishu_cards) == 1
-        assert plan.feishu_cards[0].card == card_schema
+        assert len(plan.items) == 1
+        expected_plan_card = copy.deepcopy(card_schema)
+        expected_plan_card["body"]["elements"][1]["path"] = "artifact:card0-img0"
+        assert plan.items[0].card == expected_plan_card
+        assert len(plan.items[0].images) == 1
+        art_desc = plan.items[0].images[0]
+        assert art_desc.artifact_id == "card0-img0"
+        assert art_desc.size_bytes == len(png_v1)
+        assert art_desc.sha256 == hashlib.sha256(png_v1).hexdigest()
+
         art = read_validated_run_artifact(
             run_id=run_id,
-            job_key=job_key,
-            artifact_id=plan.artifacts[0].artifact_id,
-            raw_outbox=persisted_outbox,
+            artifact_id=art_desc.artifact_id,
+            plan=plan,
             run_artifacts_dir=run_dir,
         )
-        assert art.data == png_v1
+        assert art.content == png_v1
+        assert art.size_bytes == len(png_v1)
         assert art.sha256 == hashlib.sha256(png_v1).hexdigest()
 
-        # --- 2. Same-byte-length replacement PNG is rejected by both plan rebuild and artifact download ---
+        # --- 2. Same-byte-length valid replacement PNG is rejected by both plan rebuild and artifact download ---
         img_file.write_bytes(png_same_len_diff_sha)
         with pytest.raises(DataTaskNotificationError) as exc_same_len_plan:
             build_data_task_delivery_plan(
@@ -2406,21 +2449,19 @@ async def test_persisted_image_metadata_preparation_t52_t54_and_delivery_verific
                 job_key=job_key,
                 raw_outbox=persisted_outbox,
                 run_artifacts_dir=run_dir,
-                platform="feishu",
             )
         assert exc_same_len_plan.value.code == "artifact_sha256_mismatch"
 
         with pytest.raises(DataTaskNotificationError) as exc_same_len_dl:
             read_validated_run_artifact(
                 run_id=run_id,
-                job_key=job_key,
-                artifact_id=plan.artifacts[0].artifact_id,
-                raw_outbox=persisted_outbox,
+                artifact_id=art_desc.artifact_id,
+                plan=plan,
                 run_artifacts_dir=run_dir,
             )
         assert exc_same_len_dl.value.code == "artifact_sha256_mismatch"
 
-        # Different-byte-length replacement PNG is rejected with `artifact_size_mismatch`
+        # Different-byte-length valid replacement PNG is rejected with `artifact_size_mismatch`
         img_file.write_bytes(png_v2_diff_len)
         with pytest.raises(DataTaskNotificationError) as exc_diff_len_plan:
             build_data_task_delivery_plan(
@@ -2428,11 +2469,30 @@ async def test_persisted_image_metadata_preparation_t52_t54_and_delivery_verific
                 job_key=job_key,
                 raw_outbox=persisted_outbox,
                 run_artifacts_dir=run_dir,
-                platform="feishu",
             )
         assert exc_diff_len_plan.value.code == "artifact_size_mismatch"
 
-        # Restore original PNG for any subsequent checks
+        with pytest.raises(DataTaskNotificationError) as exc_diff_len_dl:
+            read_validated_run_artifact(
+                run_id=run_id,
+                artifact_id=art_desc.artifact_id,
+                plan=plan,
+                run_artifacts_dir=run_dir,
+            )
+        assert exc_diff_len_dl.value.code == "artifact_size_mismatch"
+
+        # Corrupt non-PNG bytes of identical length are rejected by MIME/header validation (`unsupported_media_type`)
+        img_file.write_bytes(b"NOT-A-VALID-PNG!" + b"x" * (len(png_v1) - 16))
+        with pytest.raises(DataTaskNotificationError) as exc_corrupt:
+            build_data_task_delivery_plan(
+                run_id=run_id,
+                job_key=job_key,
+                raw_outbox=persisted_outbox,
+                run_artifacts_dir=run_dir,
+            )
+        assert exc_corrupt.value.code == "unsupported_media_type"
+
+        # Restore original PNG for subsequent checks
         img_file.write_bytes(png_v1)
 
     # --- 3. Missing or malformed persisted metadata is rejected on plan/download without recomputing from disk ---
@@ -2471,7 +2531,10 @@ async def test_persisted_image_metadata_preparation_t52_t54_and_delivery_verific
             "text": "unprepared",
             "feishu_cards": [
                 {
-                    "card": {"schema": "2.0", "body": {"elements": [{"tag": "img", "img_key": "__FEISHU_IMG_0_0__"}]}},
+                    "card": {
+                        "schema": "2.0",
+                        "body": {"elements": [{"tag": "__img__", "path": "__FEISHU_IMG_0_0__"}]},
+                    },
                     "images": [bad_img_entry],
                 }
             ],
@@ -2479,10 +2542,9 @@ async def test_persisted_image_metadata_preparation_t52_t54_and_delivery_verific
         with pytest.raises(DataTaskNotificationError) as exc_bad_meta:
             build_data_task_delivery_plan(
                 run_id="00000000-0000-4000-8000-000000000500",
-                job_key="T52_us_Playwright_2310",
+                job_key="softbank-nav-monitor",
                 raw_outbox=unprepared_outbox,
                 run_artifacts_dir=t52_dir,
-                platform="feishu",
             )
         assert exc_bad_meta.value.code == expected_err_code
 
@@ -2527,7 +2589,10 @@ async def test_persisted_image_metadata_preparation_t52_t54_and_delivery_verific
             "text": "supplied mismatch",
             "feishu_cards": [
                 {
-                    "card": {"schema": "2.0", "body": {"elements": [{"tag": "img", "img_key": "__FEISHU_IMG_0_0__"}]}},
+                    "card": {
+                        "schema": "2.0",
+                        "body": {"elements": [{"tag": "__img__", "path": "__FEISHU_IMG_0_0__"}]},
+                    },
                     "images": [supplied_bad_entry],
                 }
             ],
@@ -2536,7 +2601,7 @@ async def test_persisted_image_metadata_preparation_t52_t54_and_delivery_verific
             prepare_run_outbox_image_metadata(
                 bad_supplied_outbox,
                 run_artifacts_dir=t52_dir,
-                job_key="T52_us_Playwright_2310",
+                job_key="softbank-nav-monitor",
             )
         assert exc_prep.value.code == expected_prep_code
 
@@ -2549,7 +2614,10 @@ async def test_persisted_image_metadata_preparation_t52_t54_and_delivery_verific
         "text": "mismatched digest",
         "feishu_cards": [
             {
-                "card": {"schema": "2.0", "body": {"elements": [{"tag": "img", "img_key": "__FEISHU_IMG_0_0__"}]}},
+                "card": {
+                    "schema": "2.0",
+                    "body": {"elements": [{"tag": "__img__", "path": "__FEISHU_IMG_0_0__"}]},
+                },
                 "images": [
                     {
                         "placeholder": "__FEISHU_IMG_0_0__",
@@ -2563,16 +2631,19 @@ async def test_persisted_image_metadata_preparation_t52_t54_and_delivery_verific
     }
     claimed_bad = sched.ClaimedTaskRun(
         run_id=bad_run_id,
-        job_key="T52_us_Playwright_2310",
-        trigger_source="schedule",
-        scheduled_slot_utc=datetime(2026, 4, 15, 13, 0, tzinfo=timezone.utc),
-        attempt_no=1,
-        tier="T2",
-        exec_class="container_playwright",
-        command_json=["python", "-m", "task"],
+        job_key="softbank-nav-monitor",
+        generation=1,
+        runner="container",
+        command_argv=["python", "-m", "task"],
+        workdir="/workspace",
         timeout_seconds=120,
         no_output_timeout_seconds=60,
+        required_secrets=[],
+        cos_mode="skip",
         notify_enabled=True,
+        scheduled_slot_utc=slot_utc,
+        deadline_utc=slot_utc,
+        trigger_source="cron",
         is_trial=False,
     )
     committed_bad, _ = await sched.finalize_task_run(
@@ -2581,10 +2652,16 @@ async def test_persisted_image_metadata_preparation_t52_t54_and_delivery_verific
         docker_client=None,
         claimed=claimed_bad,
         container_id=None,
-        outcome=ContainerInspectionOutcome(running=False, exit_code=0, oom_killed=False, log_tail="ok"),
+        outcome=ContainerInspectionOutcome(
+            container_id="cid-bad",
+            running=False,
+            exit_code=0,
+            oom_killed=False,
+            log_tail="ok",
+        ),
         evaluation=TaskEvaluationResult(ok=True, status="succeeded"),
         outbox_payload=mismatched_outbox,
-        frozen_manifest={"job_key": "T52_us_Playwright_2310", "status": "ok"},
+        frozen_manifest={"job_key": "softbank-nav-monitor", "status": "ok"},
         path_map=path_map,
     )
     assert committed_bad is True
@@ -2597,10 +2674,143 @@ async def test_persisted_image_metadata_preparation_t52_t54_and_delivery_verific
     # --- 5. Text-only records without images continue to build plans without image metadata ---
     text_only_plan = build_data_task_delivery_plan(
         run_id="00000000-0000-4000-8000-000000000500",
-        job_key="T27_us_sec_13f_holdings_diff",
-        raw_outbox={"text": "13F text-only summary", "items": [{"index": 0, "text": "item 0"}]},
+        job_key="softbank-nav-monitor",
+        raw_outbox={"text": "text-only summary", "items": [{"index": 0, "text": "item 0"}]},
         run_artifacts_dir=t52_dir,
-        platform="discord",
     )
     assert len(text_only_plan.items) == 1
-    assert len(text_only_plan.artifacts) == 0
+    assert len(text_only_plan.artifacts_by_id) == 0
+
+
+@pytest.mark.asyncio
+async def test_outer_reconcile_identity_inspection_and_enforcement_rejects_conflicts_and_partial_metadata() -> None:
+    """Persisted outer notification identity inspection rejects recipient/key conflicts, partial metadata, and disagreeing alias rows."""
+    import psycopg
+
+    run_id = "00000000-0000-4000-8000-000000000601"
+    keys_a = [
+        dtn_db.build_data_task_item_delivery_key(
+            run_id=run_id,
+            platform="feishu",
+            recipient_id="ou_recipient_a",
+            item_index=0,
+        ),
+        dtn_db.build_data_task_item_delivery_key(
+            run_id=run_id,
+            platform="feishu",
+            recipient_id="ou_recipient_a",
+            item_index=1,
+        ),
+    ]
+    expected_a = dtn_db.build_reconcile_identity_metadata(
+        platform="feishu",
+        recipient_id="ou_recipient_a",
+        canonical_target_address="feishu:@me",
+        delivery_keys=keys_a,
+    )
+
+    # 1. Unstamped payload without any reconcile_* keys
+    assert dtn_db._inspect_stored_reconcile_identity({"route_key": "data:sb"}, expected_meta=expected_a) == "unstamped"
+
+    # 2. Exact match on all 5 fields
+    assert (
+        dtn_db._inspect_stored_reconcile_identity(
+            {"route_key": "data:sb", **expected_a},
+            expected_meta=expected_a,
+        )
+        == "matches"
+    )
+
+    # 3. Partial or malformed stored metadata -> "malformed"
+    for malformed_payload in (
+        {"reconcile_recipient_id": "ou_recipient_a"},
+        {**expected_a, "expected_item_count": True},
+        {**expected_a, "expected_item_count": 1},
+        {**expected_a, "reconcile_delivery_keys": ["only_one"]},
+        {**expected_a, "reconcile_delivery_keys": ["", keys_a[1]]},
+    ):
+        assert (
+            dtn_db._inspect_stored_reconcile_identity(
+                malformed_payload,
+                expected_meta=expected_a,
+            )
+            == "malformed"
+        )
+
+    # 4. Recipient, canonical target, or ordered key mismatch -> "mismatch"
+    keys_b = [
+        dtn_db.build_data_task_item_delivery_key(
+            run_id=run_id,
+            platform="feishu",
+            recipient_id="ou_recipient_b",
+            item_index=0,
+        ),
+        dtn_db.build_data_task_item_delivery_key(
+            run_id=run_id,
+            platform="feishu",
+            recipient_id="ou_recipient_b",
+            item_index=1,
+        ),
+    ]
+    expected_b = dtn_db.build_reconcile_identity_metadata(
+        platform="feishu",
+        recipient_id="ou_recipient_b",
+        canonical_target_address="feishu:@me",
+        delivery_keys=keys_b,
+    )
+    assert dtn_db._inspect_stored_reconcile_identity(expected_a, expected_meta=expected_b) == "mismatch"
+    assert (
+        dtn_db._inspect_stored_reconcile_identity(
+            {**expected_a, "reconcile_delivery_keys": list(reversed(keys_a))},
+            expected_meta=expected_a,
+        )
+        == "mismatch"
+    )
+
+    # 5. Candidate outer rows where one is unstamped and an alias row has conflicting recipient B:
+    #    `_persist_reconcile_identity_on_outer_delivery` must reject BEFORE executing any UPDATE.
+    executed_queries: list[str] = []
+
+    async def _disagreeing_sql(sql: str, params: Any = None) -> None:
+        _ = params
+        norm = " ".join(sql.split())
+        executed_queries.append(norm)
+        if "FROM dalton_notify_deliveries" in norm:
+            cur.fetchall.return_value = [
+                {
+                    "delivery_id": str(uuid4()),
+                    "user_id": "pm_owner",
+                    "channel": "feishu",
+                    "target": "feishu:@me",
+                    "status": "pending",
+                    "payload_json": {"route_key": "data:sb"},
+                },
+                {
+                    "delivery_id": str(uuid4()),
+                    "user_id": "pm_owner",
+                    "channel": "feishu",
+                    "target": "feishu:user:ou_recipient_a",
+                    "status": "pending",
+                    "payload_json": {"route_key": "data:sb", **expected_b},
+                },
+            ]
+        elif "FROM dalton_channel_deliveries" in norm:
+            cur.fetchall.return_value = []
+
+    cur = create_autospec(psycopg.AsyncCursor, instance=True)
+    cur.execute.side_effect = _disagreeing_sql
+    outcome = await dtn_db._persist_reconcile_identity_on_outer_delivery(
+        cur,
+        run_id=run_id,
+        job_key="softbank-nav-monitor",
+        owner_user_id="pm_owner",
+        platform="feishu",
+        target_kind="dm",
+        requested_target="feishu:user:ou_recipient_a",
+        canonical_target_address="feishu:@me",
+        recipient_id="ou_recipient_a",
+        delivery_keys=keys_a,
+    )
+    assert outcome.ok is False
+    assert outcome.code == "recipient_identity_conflict"
+    assert not any(q.startswith("UPDATE dalton_notify_deliveries") for q in executed_queries)

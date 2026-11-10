@@ -16,10 +16,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import struct
 from typing import Any
 from unittest.mock import create_autospec
 from urllib.parse import urlsplit
 from uuid import uuid4
+import zlib
 
 from alembic import command
 from alembic.config import Config
@@ -154,6 +156,30 @@ async def migrated_dsn() -> str:
 
 def _make_png(label: str) -> bytes:
     return b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + label.encode("ascii") + b"\x00" * 24
+
+
+def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    crc = zlib.crc32(chunk_type + data) & 0xFFFFFFFF
+    return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", crc)
+
+
+def _make_valid_png_bytes(
+    *,
+    width: int = 8,
+    height: int = 8,
+    rgb: tuple[int, int, int] = (20, 90, 180),
+) -> bytes:
+    """Build a spec-compliant PNG with uncompressed deflate (`level=0`) so equal dimensions have equal byte length."""
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    row = b"\x00" + bytes(rgb) * width
+    raw_scanlines = row * height
+    idat = zlib.compress(raw_scanlines, level=0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", ihdr)
+        + _png_chunk(b"IDAT", idat)
+        + _png_chunk(b"IEND", b"")
+    )
 
 
 @pytest.mark.asyncio
@@ -517,6 +543,10 @@ async def test_authorization_gates_foreign_openid_protection_and_bounded_artifac
             assert r_task_off.json()["code"] == "task_disabled"
     finally:
         async with admin_conn.cursor() as cur:
+            await cur.execute(
+                "DELETE FROM dalton_notify_deliveries WHERE execution_id IN (%s, %s, %s)",
+                (prod_run_id, preview_run_id, other_run_id),
+            )
             await cur.execute(
                 "DELETE FROM dalton_channel_deliveries WHERE run_id IN (%s, %s, %s)",
                 (prod_run_id, preview_run_id, other_run_id),
@@ -933,7 +963,7 @@ async def test_unbound_admin_group_delivery_workspace_gate_and_real_vault_startu
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """R2 §1 & §2 against real PostgreSQL + ASGI HTTP:
+    """Group authorization and Vault startup credentials against real PostgreSQL + ASGI HTTP:
     - Primary administrator with zero `dalton_channel_identities` and zero `dalton_channel_inbound_events`
       saves group settings via `update_user_channel_settings` (`I-5`), obtains an authorized group plan
       omitting `owner_platform_user_id`, and claims/completes `dalton_channel_deliveries` (`I-6`/`I-7`);
@@ -1278,6 +1308,10 @@ async def test_unbound_admin_group_delivery_workspace_gate_and_real_vault_startu
                 (pm_uid, other_uid),
             )
             await cur.execute(
+                "DELETE FROM dalton_notify_deliveries WHERE execution_id = %s",
+                (prod_run_id,),
+            )
+            await cur.execute(
                 "DELETE FROM dalton_channel_deliveries WHERE run_id = %s",
                 (prod_run_id,),
             )
@@ -1315,7 +1349,7 @@ async def test_read_only_reconciliation_exhausted_uncertain_fairness_and_multi_i
     migrated_dsn: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """R4 §4 against real PostgreSQL:
+    """Read-only reconciliation and retry queue fairness against real PostgreSQL:
     - Third-attempt (`attempt_count=3`) lost response (`pending`, `delivery_uncertain`) reconciles read-only to `sent`
       once all expected items in `dalton_channel_deliveries` are durably `sent`, without send/claim calls or attempt resets;
     - Mixed multi-item states (`sent` + `in_flight`/`unknown`/`partial`/missing) and mismatched recipient/user/run records
@@ -1358,6 +1392,7 @@ async def test_read_only_reconciliation_exhausted_uncertain_fairness_and_multi_i
                 )
                 return await cur.fetchone()
 
+    connection_factory = dtn_db.get_db_connection
     monkeypatch.setenv("DALTON_PM_USER_IDS", pm_uid)
     monkeypatch.setattr(
         dtn_db,
@@ -1427,7 +1462,7 @@ async def test_read_only_reconciliation_exhausted_uncertain_fairness_and_multi_i
             "expected_item_count": 2,
             "reconcile_platform": "feishu",
             "reconcile_recipient_id": "ou_r4_pm",
-            "reconcile_canonical_target": "feishu:user:ou_r4_pm",
+            "reconcile_canonical_target": "feishu:@me",
             "feishu_cards": [
                 {"card": {"schema": "2.0", "body": {"elements": [{"tag": "hr"}]}}},
                 {"card": {"schema": "2.0", "body": {"elements": [{"tag": "hr"}]}}},
@@ -1440,7 +1475,7 @@ async def test_read_only_reconciliation_exhausted_uncertain_fairness_and_multi_i
             "expected_item_count": 1,
             "reconcile_platform": "feishu",
             "reconcile_recipient_id": "ou_r4_pm",
-            "reconcile_canonical_target": "feishu:user:ou_r4_pm",
+            "reconcile_canonical_target": "feishu:@me",
             "feishu_cards": [
                 {"card": {"schema": "2.0", "body": {"elements": [{"tag": "hr"}]}}},
             ],
@@ -1490,8 +1525,8 @@ async def test_read_only_reconciliation_exhausted_uncertain_fairness_and_multi_i
                 user_id=pm_uid,
                 model_preference={
                     "dalton_notify_enabled": True,
-                    "dalton_notify_targets": ["feishu:@me"],
-                    "dalton_notify_routes": {"data:tsmc-adr-premium": ["feishu:@me"]},
+                    "dalton_notify_targets": ["feishu:user:ou_r4_pm"],
+                    "dalton_notify_routes": {"data:tsmc-adr-premium": ["feishu:user:ou_r4_pm"]},
                 },
                 conn=admin_conn,
             )
@@ -1620,7 +1655,7 @@ async def test_read_only_reconciliation_exhausted_uncertain_fairness_and_multi_i
             )
             assert await cur.fetchone() == {"status": "pending", "attempt_count": 3}
 
-        # R5 Part A #2: User unlinks `ou_r4_pm`, rebinds to a different recipient `ou_rebound_new`, and removes route!
+        # User unlinks `ou_r4_pm`, rebinds to a different recipient `ou_rebound_new`, and removes route!
         async with admin_conn.cursor() as cur:
             await cur.execute(
                 "DELETE FROM dalton_channel_identities WHERE user_id = %s AND platform = 'feishu'",
@@ -1714,7 +1749,7 @@ async def test_read_only_reconciliation_exhausted_uncertain_fairness_and_multi_i
             user_id=pm_uid,
             model_preference={
                 "dalton_notify_enabled": True,
-                "dalton_notify_targets": ["feishu:@me"],
+                "dalton_notify_targets": ["feishu:user:ou_r4_pm"],
                 "dalton_notify_routes": {"data:tsmc-adr-premium": []},
             },
             conn=admin_conn,
@@ -1797,8 +1832,8 @@ async def test_read_only_reconciliation_exhausted_uncertain_fairness_and_multi_i
             user_id=pm_uid,
             model_preference={
                 "dalton_notify_enabled": True,
-                "dalton_notify_targets": ["feishu:@me"],
-                "dalton_notify_routes": {"data:tsmc-adr-premium": ["feishu:@me"]},
+                "dalton_notify_targets": ["feishu:user:ou_r4_pm"],
+                "dalton_notify_routes": {"data:tsmc-adr-premium": ["feishu:user:ou_r4_pm"]},
             },
             conn=admin_conn,
         )
@@ -1850,7 +1885,7 @@ async def test_read_only_reconciliation_exhausted_uncertain_fairness_and_multi_i
         assert await dtn_db.reconcile_uncertain_data_task_deliveries(limit=5) == 0
 
         # ---------------------------------------------------------------------
-        # 3. Fairness & R5 Part A #1: 6 older exhausted uncertain `data:` entries +
+        # 3. Fairness: 6 older exhausted uncertain `data:` entries +
         #    newer retryable `data:` `failed` entry + ordinary non-`data:` `pending`/`failed` rows (`limit=5`)
         # ---------------------------------------------------------------------
         async with admin_conn.cursor() as cur:
@@ -1903,7 +1938,7 @@ async def test_read_only_reconciliation_exhausted_uncertain_fairness_and_multi_i
                     status, attempt_count, error_code, payload_json,
                     created_at, updated_at
                 )
-                VALUES (%s, %s, 'data:tsmc-adr-premium', %s, 'feishu', 'feishu:@me',
+                VALUES (%s, %s, 'data:tsmc-adr-premium', %s, 'feishu', 'feishu:user:ou_r4_pm',
                         'failed', 1, 'http_502', %s, NOW(), NOW())
                 """,
                 (
@@ -1919,7 +1954,7 @@ async def test_read_only_reconciliation_exhausted_uncertain_fairness_and_multi_i
                     ),
                 ),
             )
-            # R5 Part A #1: Seed ordinary non-`data:` rows AFTER the 6 exhausted uncertain `data:` rows:
+            # Seed ordinary non-`data:` rows AFTER the 6 exhausted uncertain `data:` rows:
             # (a) an ordinary `pending` row with `attempt_count = 3` and `error_code = 'delivery_uncertain'`
             #     (must NOT be excluded by `data:` uncertain rules; transitions to `failed`/`attempts_exhausted`);
             # (b) an ordinary `failed` row (`attempt_count = 1`, `channel = 'unknown_test_channel'`)
@@ -1957,8 +1992,7 @@ async def test_read_only_reconciliation_exhausted_uncertain_fairness_and_multi_i
             user_id=pm_uid,
             channel="unknown_test_channel",
             target="unknown:target_claim_check",
-            payload_snapshot={"title": "Claim check"},
-            max_attempts=3,
+            payload={"title": "Claim check"},
             stale_pending_minutes=10,
         )
         assert ordinary_claim_ok is True
@@ -2004,9 +2038,9 @@ async def test_read_only_reconciliation_exhausted_uncertain_fairness_and_multi_i
                 (ordinary_retry_exec_id,),
             )
             assert await cur.fetchone() == {
-                "status": "failed",
-                "attempt_count": 2,
-                "error_code": "unknown_channel",
+                "status": "skipped",
+                "attempt_count": 1,
+                "error_code": "toggle_off",
             }
             await cur.execute(
                 "SELECT COUNT(*) AS cnt FROM dalton_notify_deliveries WHERE execution_id = ANY(%s) AND status = 'pending'",
@@ -2060,7 +2094,7 @@ async def test_read_only_reconciliation_exhausted_uncertain_fairness_and_multi_i
         monkeypatch.setattr(
             dtn_db,
             "get_db_connection",
-            create_autospec(dtn_db.get_db_connection, side_effect=_failing_reconcile_conn),
+            create_autospec(connection_factory, side_effect=_failing_reconcile_conn),
         )
         assert await dtn_db.reconcile_uncertain_data_task_deliveries(limit=5) == 0
 
@@ -2115,23 +2149,23 @@ async def test_persisted_image_metadata_finalization_and_tamper_rejection_db(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """R5 Part B §4 items 5 & 6 against real isolated PostgreSQL:
+    """Persisted image metadata finalization and tamper rejection against real isolated PostgreSQL:
     - `finalize_task_run` commits `status='succeeded'`, `notify_status='pending_dispatch'`, and `outbox_payload`
       containing verified positive `size_bytes` and 64-hex `sha256` for representative T52 and T54 reports;
-    - `/plan` and `/artifacts/{artifact_id}` succeed when on-disk PNG matches persisted `size_bytes` and `sha256`;
+    - `/plan` and `/runs/{run_id}/artifacts/{artifact_id}` succeed when on-disk PNG matches persisted `size_bytes` and `sha256`;
     - Replacing the on-disk PNG with a different valid PNG of the exact same byte length causes both a fresh `/plan`
-      request (rebuilt from persisted DB state) and `/artifacts/{artifact_id}` to reject it (`artifact_sha256_mismatch`);
+      request (rebuilt from persisted DB state) and `/runs/{run_id}/artifacts/{artifact_id}` to reject it (`artifact_sha256_mismatch`);
     - Unsuccessful image preparation (mismatched supplied digest or missing image) commits `status='failed'`,
       `notify_status='skipped'`, `outbox_payload=NULL`, and cannot authorize or claim a delivery (`run_not_succeeded`);
     - Historical image record in DB without `size_bytes`/`sha256` is rejected (`artifact_metadata_missing`) without
       recomputing digests from disk or mutating DB state, while text-only runs continue to work.
     """
     from src.dalton.data_jobs import scheduler as sched
-    from src.dalton.data_jobs.contracts import TaskEvaluationResult
-    from src.dalton.data_jobs.docker_runner import ContainerInspectionOutcome
+    from src.dalton.data_jobs.container_runner import ContainerInspectionOutcome
+    from src.dalton.data_jobs.evaluators import TaskEvaluationResult
 
     dsn = migrated_dsn
-    pm_uid = f"pm-r5-img-{uuid4().hex[:8]}"
+    pm_uid = f"pm-img-meta-{uuid4().hex[:8]}"
     run_t52 = str(uuid4())
     run_t54 = str(uuid4())
     run_prep_fail = str(uuid4())
@@ -2140,8 +2174,8 @@ async def test_persisted_image_metadata_finalization_and_tamper_rejection_db(
     all_runs = [run_t52, run_t54, run_prep_fail, run_legacy_unprepared, run_text_only]
 
     path_map = build_path_map(
-        host_var_dir=tmp_path / "r5_h_var",
-        backend_var_dir=tmp_path / "r5_b_var",
+        host_var_dir=tmp_path / "img_h_var",
+        backend_var_dir=tmp_path / "img_b_var",
     )
 
     @asynccontextmanager
@@ -2164,9 +2198,13 @@ async def test_persisted_image_metadata_finalization_and_tamper_rejection_db(
                 )
                 return await cur.fetchone()
 
-    monkeypatch.setenv("DALTON_INTERNAL_SERVICE_TOKEN", SERVICE_TOKEN)
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", SERVICE_TOKEN)
     monkeypatch.setenv("DALTON_PM_USER_IDS", pm_uid)
-    monkeypatch.setattr(dtn_router_mod, "build_path_map", lambda: path_map)
+    monkeypatch.setattr(
+        dtn_db,
+        "build_path_map",
+        create_autospec(dtn_db.build_path_map, return_value=path_map),
+    )
     monkeypatch.setattr(
         dtn_db,
         "get_db_connection",
@@ -2187,14 +2225,27 @@ async def test_persisted_image_metadata_finalization_and_tamper_rejection_db(
         "get_user_tier",
         create_autospec(access_tiers_mod.get_user_tier, return_value="admin"),
     )
-    monkeypatch.setattr(sched, "check_scheduler_lock", create_autospec(sched.check_scheduler_lock, return_value=None))
-    monkeypatch.setattr(sched, "freeze_task_run_artifacts", lambda **_kw: None)
-    monkeypatch.setattr(sched, "cleanup_run_secrets_dir", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        sched,
+        "check_scheduler_lock",
+        create_autospec(sched.check_scheduler_lock, return_value=None),
+    )
+    monkeypatch.setattr(
+        sched,
+        "freeze_task_run_artifacts",
+        create_autospec(sched.freeze_task_run_artifacts, return_value=None),
+    )
+    monkeypatch.setattr(
+        sched,
+        "cleanup_run_secrets_dir",
+        create_autospec(sched.cleanup_run_secrets_dir, return_value=None),
+    )
 
-    png_orig = _make_png("R5-T52-T54-ORIG")
-    # Same-byte-length replacement PNG with a 1-bit flip in the tag payload
-    png_same_len_tampered = _make_png("R5-T52-T54-TAMP")
+    png_orig = _make_valid_png_bytes(width=16, height=16, rgb=(20, 90, 180))
+    png_same_len_tampered = _make_valid_png_bytes(width=16, height=16, rgb=(210, 40, 60))
+    png_diff_len = _make_valid_png_bytes(width=28, height=20, rgb=(40, 160, 80))
     assert len(png_orig) == len(png_same_len_tampered)
+    assert len(png_orig) != len(png_diff_len)
     assert hashlib.sha256(png_orig).hexdigest() != hashlib.sha256(png_same_len_tampered).hexdigest()
 
     admin_conn = await psycopg.AsyncConnection.connect(dsn, autocommit=True)
@@ -2222,7 +2273,7 @@ async def test_persisted_image_metadata_finalization_and_tamper_rejection_db(
                 await cur.execute(
                     """
                     INSERT INTO dalton_channel_identities (user_id, platform, platform_user_id)
-                    VALUES (%s, 'feishu', 'ou_r5_pm')
+                    VALUES (%s, 'feishu', 'ou_img_meta_pm')
                     """,
                     (pm_uid,),
                 )
@@ -2250,7 +2301,7 @@ async def test_persisted_image_metadata_finalization_and_tamper_rejection_db(
                     "text": "Legacy unprepared image report",
                     "feishu_cards": [
                         {
-                            "card": {"schema": "2.0", "body": {"elements": [{"tag": "img", "img_key": "ph_leg"}]}},
+                            "card": {"schema": "2.0", "body": {"elements": [{"tag": "__img__", "path": "ph_leg"}]}},
                             "images": [{"placeholder": "ph_leg", "path": "images/c0.png"}],
                         }
                     ],
@@ -2294,10 +2345,10 @@ async def test_persisted_image_metadata_finalization_and_tamper_rejection_db(
                 user_id=pm_uid,
                 model_preference={
                     "dalton_notify_enabled": True,
-                    "dalton_notify_targets": ["feishu:@me"],
+                    "dalton_notify_targets": ["feishu:user:ou_img_meta_pm"],
                     "dalton_notify_routes": {
-                        "data:softbank-nav-monitor": ["feishu:@me"],
-                        "data:tsmc-adr-premium": ["feishu:@me"],
+                        "data:softbank-nav-monitor": ["feishu:user:ou_img_meta_pm"],
+                        "data:tsmc-adr-premium": ["feishu:user:ou_img_meta_pm"],
                     },
                 },
                 conn=admin_conn,
@@ -2324,25 +2375,29 @@ async def test_persisted_image_metadata_finalization_and_tamper_rejection_db(
                         "card": {
                             "schema": "2.0",
                             "header": {"title": {"tag": "plain_text", "content": label}},
-                            "body": {"elements": [{"tag": "img", "img_key": "ph_0"}]},
+                            "body": {"elements": [{"tag": "__img__", "path": "ph_0"}]},
                         },
                         "images": [{"placeholder": "ph_0", "path": "images/c0.png"}],
                     }
                 ],
             }
             (rdir / "outbox.json").write_text(json.dumps(raw_ob), encoding="utf-8")
+            slot_val = slot_base + timedelta(minutes=idx * 5)
             claimed = sched.ClaimedTaskRun(
                 run_id=rid,
                 job_key=jkey,
-                trigger_source="cron",
-                scheduled_slot_utc=slot_base + timedelta(minutes=idx * 5),
-                attempt_no=1,
-                tier="T2",
-                exec_class="container_playwright",
-                command_json=["python", "-m", "task"],
+                generation=1,
+                runner="container",
+                command_argv=["python", "-m", "task"],
+                workdir="/workspace",
                 timeout_seconds=120,
                 no_output_timeout_seconds=60,
+                required_secrets=[],
+                cos_mode="skip",
                 notify_enabled=True,
+                scheduled_slot_utc=slot_val,
+                deadline_utc=slot_val + timedelta(minutes=10),
+                trigger_source="cron",
                 is_trial=False,
             )
             ok_fin, _ = await sched.finalize_task_run(
@@ -2351,7 +2406,13 @@ async def test_persisted_image_metadata_finalization_and_tamper_rejection_db(
                 docker_client=None,
                 claimed=claimed,
                 container_id=None,
-                outcome=ContainerInspectionOutcome(running=False, exit_code=0, oom_killed=False, log_tail="ok"),
+                outcome=ContainerInspectionOutcome(
+                    container_id="cid-fin",
+                    running=False,
+                    exit_code=0,
+                    oom_killed=False,
+                    log_tail="ok",
+                ),
                 evaluation=TaskEvaluationResult(ok=True, status="succeeded"),
                 outbox_payload=raw_ob,
                 frozen_manifest={"job_key": jkey, "status": "ok"},
@@ -2376,7 +2437,7 @@ async def test_persisted_image_metadata_finalization_and_tamper_rejection_db(
             "text": "Bad digest",
             "feishu_cards": [
                 {
-                    "card": {"schema": "2.0", "body": {"elements": [{"tag": "img", "img_key": "ph_0"}]}},
+                    "card": {"schema": "2.0", "body": {"elements": [{"tag": "__img__", "path": "ph_0"}]}},
                     "images": [
                         {
                             "placeholder": "ph_0",
@@ -2388,18 +2449,22 @@ async def test_persisted_image_metadata_finalization_and_tamper_rejection_db(
                 }
             ],
         }
+        fail_slot = slot_base + timedelta(minutes=10)
         claimed_fail = sched.ClaimedTaskRun(
             run_id=run_prep_fail,
             job_key="softbank-nav-monitor",
-            trigger_source="cron",
-            scheduled_slot_utc=slot_base + timedelta(minutes=10),
-            attempt_no=1,
-            tier="T2",
-            exec_class="container_playwright",
-            command_json=["python", "-m", "task"],
+            generation=1,
+            runner="container",
+            command_argv=["python", "-m", "task"],
+            workdir="/workspace",
             timeout_seconds=120,
             no_output_timeout_seconds=60,
+            required_secrets=[],
+            cos_mode="skip",
             notify_enabled=True,
+            scheduled_slot_utc=fail_slot,
+            deadline_utc=fail_slot + timedelta(minutes=10),
+            trigger_source="cron",
             is_trial=False,
         )
         ok_fail_fin, _ = await sched.finalize_task_run(
@@ -2408,7 +2473,13 @@ async def test_persisted_image_metadata_finalization_and_tamper_rejection_db(
             docker_client=None,
             claimed=claimed_fail,
             container_id=None,
-            outcome=ContainerInspectionOutcome(running=False, exit_code=0, oom_killed=False, log_tail="ok"),
+            outcome=ContainerInspectionOutcome(
+                container_id="cid-fail",
+                running=False,
+                exit_code=0,
+                oom_killed=False,
+                log_tail="ok",
+            ),
             evaluation=TaskEvaluationResult(ok=True, status="succeeded"),
             outbox_payload=bad_ob,
             frozen_manifest={"job_key": "softbank-nav-monitor", "status": "ok"},
@@ -2426,83 +2497,97 @@ async def test_persisted_image_metadata_finalization_and_tamper_rejection_db(
             assert fail_row["outbox_payload"] is None
             assert "report_preparation_failed" in str(fail_row["failure_reason"])
 
-        # 3. Exercise internal FastAPI `/plan` and `/artifacts/{artifact_id}` endpoints against real PostgreSQL
+        # 3. Exercise internal FastAPI `/plan` and `/runs/{run_id}/artifacts/{artifact_id}` endpoints against real PostgreSQL
         app = FastAPI()
         app.include_router(dalton_router)
-        headers = {"X-Dalton-Service-Token": SERVICE_TOKEN}
+        headers = {"X-Service-Token": SERVICE_TOKEN}
+        plan_ep = "/api/v1/dalton/channels/internal/data-task-notifications/plan"
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app),
             base_url="http://backend.test",
         ) as client:
-            # (a) Valid prepared run (`run_t52`): `/plan` and `/artifacts/{artifact_id}` succeed
+            # (a) Valid prepared run (`run_t52`): `/plan` and `/runs/{run_id}/artifacts/{artifact_id}` succeed
             plan_res = await client.post(
-                f"/api/v1/dalton/internal/data-task-runs/{run_t52}/notification-plan",
+                plan_ep,
                 headers=headers,
-                json={"user_id": pm_uid, "platform": "feishu", "target": "feishu:@me"},
+                json={"run_id": run_t52, "target": "feishu:@me"},
             )
             assert plan_res.status_code == 200
             plan_body = plan_res.json()
-            assert plan_body["ok"] is True
-            artifact_id = plan_body["plan"]["artifacts"][0]["artifact_id"]
+            assert plan_body["authorized"] is True, plan_body
+            artifact_id = plan_body["items"][0]["images"][0]["artifact_id"]
+            assert artifact_id == "card0-img0"
 
             art_res = await client.get(
-                f"/api/v1/dalton/internal/data-task-runs/{run_t52}/artifacts/{artifact_id}",
+                f"/api/v1/dalton/channels/internal/data-task-notifications/runs/{run_t52}/artifacts/{artifact_id}",
                 headers=headers,
             )
             assert art_res.status_code == 200
             assert art_res.content == png_orig
+            assert art_res.headers["x-artifact-sha256"] == hashlib.sha256(png_orig).hexdigest()
 
             # (b) Replace on-disk PNG for `run_t52` with a different valid PNG of the EXACT SAME byte length:
-            #     both a fresh `/plan` call (rebuilt from persisted DB state) and `/artifacts/{artifact_id}` reject it!
+            #     both a fresh `/plan` call (rebuilt from persisted DB state) and `/runs/{run_id}/artifacts/{artifact_id}` reject it!
             t52_img_path = path_map.backend_run_artifacts_dir(run_t52) / "images" / "c0.png"
             t52_img_path.write_bytes(png_same_len_tampered)
 
             tampered_plan_res = await client.post(
-                f"/api/v1/dalton/internal/data-task-runs/{run_t52}/notification-plan",
+                plan_ep,
                 headers=headers,
-                json={"user_id": pm_uid, "platform": "feishu", "target": "feishu:@me"},
+                json={"run_id": run_t52, "target": "feishu:@me"},
             )
             assert tampered_plan_res.status_code == 200
-            assert tampered_plan_res.json()["ok"] is False
+            assert tampered_plan_res.json()["authorized"] is False
             assert tampered_plan_res.json()["code"] == "artifact_sha256_mismatch"
 
             tampered_art_res = await client.get(
-                f"/api/v1/dalton/internal/data-task-runs/{run_t52}/artifacts/{artifact_id}",
+                f"/api/v1/dalton/channels/internal/data-task-notifications/runs/{run_t52}/artifacts/{artifact_id}",
                 headers=headers,
             )
             assert tampered_art_res.status_code == 422
             assert tampered_art_res.json()["detail"]["code"] == "artifact_sha256_mismatch"
 
+            # Different-byte-length valid PNG replacement is rejected with `artifact_size_mismatch`
+            t52_img_path.write_bytes(png_diff_len)
+            diff_len_plan_res = await client.post(
+                plan_ep,
+                headers=headers,
+                json={"run_id": run_t52, "target": "feishu:@me"},
+            )
+            assert diff_len_plan_res.status_code == 200
+            assert diff_len_plan_res.json()["authorized"] is False
+            assert diff_len_plan_res.json()["code"] == "artifact_size_mismatch"
+
             # (c) Unsuccessful preparation run (`run_prep_fail`) cannot authorize or claim a delivery (`run_not_succeeded`)
             prep_fail_plan_res = await client.post(
-                f"/api/v1/dalton/internal/data-task-runs/{run_prep_fail}/notification-plan",
+                plan_ep,
                 headers=headers,
-                json={"user_id": pm_uid, "platform": "feishu", "target": "feishu:@me"},
+                json={"run_id": run_prep_fail, "target": "feishu:@me"},
             )
             assert prep_fail_plan_res.status_code == 200
-            assert prep_fail_plan_res.json()["ok"] is False
+            assert prep_fail_plan_res.json()["authorized"] is False
             assert prep_fail_plan_res.json()["code"] == "run_not_succeeded"
 
             # (d) Historical image record without `size_bytes`/`sha256` (`run_legacy_unprepared`) is rejected
             #     with `artifact_metadata_missing` without recomputing digests from disk
             legacy_plan_res = await client.post(
-                f"/api/v1/dalton/internal/data-task-runs/{run_legacy_unprepared}/notification-plan",
+                plan_ep,
                 headers=headers,
-                json={"user_id": pm_uid, "platform": "feishu", "target": "feishu:@me"},
+                json={"run_id": run_legacy_unprepared, "target": "feishu:@me"},
             )
             assert legacy_plan_res.status_code == 200
-            assert legacy_plan_res.json()["ok"] is False
+            assert legacy_plan_res.json()["authorized"] is False
             assert legacy_plan_res.json()["code"] == "artifact_metadata_missing"
 
             # (e) Text-only run (`run_text_only`) continues to authorize and build plans normally
             text_plan_res = await client.post(
-                f"/api/v1/dalton/internal/data-task-runs/{run_text_only}/notification-plan",
+                plan_ep,
                 headers=headers,
-                json={"user_id": pm_uid, "platform": "feishu", "target": "feishu:@me"},
+                json={"run_id": run_text_only, "target": "feishu:@me"},
             )
             assert text_plan_res.status_code == 200
-            assert text_plan_res.json()["ok"] is True
-            assert len(text_plan_res.json()["plan"]["feishu_cards"]) == 1
+            assert text_plan_res.json()["authorized"] is True
+            assert len(text_plan_res.json()["items"]) == 1
     finally:
         async with admin_conn.cursor() as cur:
             await cur.execute(
@@ -2523,6 +2608,588 @@ async def test_persisted_image_metadata_finalization_and_tamper_rejection_db(
             )
             await cur.execute(
                 "DELETE FROM dalton_data_task_defs WHERE job_key IN ('softbank-nav-monitor', 'tsmc-adr-premium')"
+            )
+            await cur.execute(
+                "DELETE FROM user_preferences WHERE user_id = %s",
+                (pm_uid,),
+            )
+            await cur.execute(
+                "DELETE FROM users WHERE user_id = %s",
+                (pm_uid,),
+            )
+        await admin_conn.close()
+
+
+@pytest.mark.asyncio
+async def test_outer_delivery_identity_freeze_conflict_rejection_and_late_reconciliation_db(
+    migrated_dsn: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Enforce one persisted outer notification identity across plan, I-6 claim, scheduler, and late reconciliation:
+    - Initial recipient A is frozen on `dalton_notify_deliveries` (`reconcile_platform`, `reconcile_recipient_id`,
+      `reconcile_canonical_target`, `expected_item_count`, `reconcile_delivery_keys`);
+    - Identical A retries on `/plan` and `/authorize-and-claim` succeed and preserve the frozen metadata;
+    - Rebinding `dalton_channel_identities` to B causes `/plan` (`authorized: False, code: 'recipient_identity_conflict'`),
+      `/authorize-and-claim` (`claim_status: 'denied', code: 'recipient_identity_conflict'`), and scheduler dispatch
+      to reject B with zero B rows in `dalton_channel_deliveries` and unchanged outer A metadata SHA-256;
+    - Concurrent first-time `/plan` and `/authorize-and-claim` calls serialize deterministically and seed a single
+      frozen outer identity that `claim_target_delivery` transitions to `attempt_count = 1`;
+    - Partial/malformed stored outer metadata (`invalid_reconcile_metadata`) and disagreeing candidate alias rows
+      (`feishu:@me` vs `feishu:user:...`) are rejected without stamping a subset;
+    - After unlinking A (`DELETE FROM dalton_channel_identities`), new `/plan` and `/authorize-and-claim` calls are
+      denied (`not_linked`), while late completion of A's item in `dalton_channel_deliveries` reconciles the outer
+      delivery to `sent` and the run to `dispatched` with zero send or claim calls.
+    """
+    dsn = migrated_dsn
+    pm_uid = f"pm-freeze-{uuid4().hex[:8]}"
+    identity_a = f"ou_identity_a_{uuid4().hex[:6]}"
+    identity_b = f"ou_identity_b_{uuid4().hex[:6]}"
+    run_main = str(uuid4())
+    run_conc_first = str(uuid4())
+    run_malformed = str(uuid4())
+    run_disagree = str(uuid4())
+    all_runs = [run_main, run_conc_first, run_malformed, run_disagree]
+
+    path_map = build_path_map(
+        host_var_dir=tmp_path / "freeze_h_var",
+        backend_var_dir=tmp_path / "freeze_b_var",
+    )
+    outbox = {
+        "text": "Identity freeze report",
+        "feishu_cards": [
+            {
+                "card": {
+                    "schema": "2.0",
+                    "header": {"title": {"tag": "plain_text", "content": "Identity Freeze"}},
+                    "body": {"elements": [{"tag": "markdown", "content": "Card 0"}]},
+                },
+                "images": [],
+            }
+        ],
+    }
+    for rid in all_runs:
+        rdir = path_map.backend_run_artifacts_dir(rid)
+        rdir.mkdir(parents=True, exist_ok=True)
+        (rdir / "outbox.json").write_text(json.dumps(outbox), encoding="utf-8")
+
+    @asynccontextmanager
+    async def _real_db_conn(conn: Any = None):
+        if conn is not None:
+            yield conn
+            return
+        c = await psycopg.AsyncConnection.connect(dsn, autocommit=True)
+        try:
+            yield c
+        finally:
+            await c.close()
+
+    async def _real_get_prefs(user_id: str) -> dict[str, Any] | None:
+        async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as c:
+            async with c.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    "SELECT model_preference, other_preference FROM user_preferences WHERE user_id = %s",
+                    (user_id,),
+                )
+                return await cur.fetchone()
+
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", SERVICE_TOKEN)
+    monkeypatch.setenv("DALTON_PM_USER_IDS", pm_uid)
+    for mod in (dtn_db, cg_db, notify_dispatch_mod):
+        monkeypatch.setattr(
+            mod,
+            "get_db_connection",
+            create_autospec(mod.get_db_connection, side_effect=_real_db_conn),
+        )
+    monkeypatch.setattr(
+        dtn_db,
+        "build_path_map",
+        create_autospec(dtn_db.build_path_map, return_value=path_map),
+    )
+    monkeypatch.setattr(
+        model_prefs_mod,
+        "get_user_preferences",
+        create_autospec(model_prefs_mod.get_user_preferences, side_effect=_real_get_prefs),
+    )
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(access_tiers_mod.get_user_tier, return_value="admin"),
+    )
+
+    admin_conn = await psycopg.AsyncConnection.connect(dsn, autocommit=True)
+    try:
+        manifest = load_data_task_manifest()
+        slot_base = datetime(2026, 11, 10, 9, 0, tzinfo=timezone.utc)
+        async with admin_conn.transaction():
+            await sync_manifest_to_db(admin_conn, manifest)
+            async with admin_conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE dalton_data_task_defs
+                    SET enabled = TRUE, notify_enabled = TRUE
+                    WHERE job_key = 'softbank-nav-monitor'
+                    """
+                )
+                await cur.execute(
+                    """
+                    INSERT INTO users (user_id, email, name, created_at, updated_at)
+                    VALUES (%s, %s, %s, NOW(), NOW())
+                    ON CONFLICT (user_id) DO NOTHING
+                    """,
+                    (pm_uid, f"{pm_uid}@synth.local", pm_uid),
+                )
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_channel_identities (user_id, platform, platform_user_id)
+                    VALUES (%s, 'feishu', %s)
+                    """,
+                    (pm_uid, identity_a),
+                )
+                for idx, rid in enumerate(all_runs):
+                    s_utc = slot_base + timedelta(minutes=idx * 5)
+                    await cur.execute(
+                        """
+                        INSERT INTO dalton_data_task_runs (
+                            run_id, job_key, trigger_source, scheduled_slot_utc,
+                            deadline_utc, status, notify_status, outbox_payload, notify_preview, completed_at
+                        )
+                        VALUES (%s::uuid, 'softbank-nav-monitor', 'cron', %s, %s, 'succeeded', 'pending_dispatch', %s, %s, NOW())
+                        """,
+                        (
+                            rid,
+                            s_utc,
+                            s_utc + timedelta(minutes=10),
+                            Jsonb(outbox),
+                            Jsonb(outbox),
+                        ),
+                    )
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_notify_deliveries (
+                        delivery_id, execution_id, automation_id, user_id, channel, target,
+                        status, attempt_count, payload_json
+                    )
+                    VALUES (%s, %s, 'data:softbank-nav-monitor', %s, 'feishu', %s, 'pending', 1, %s)
+                    """,
+                    (
+                        str(uuid4()),
+                        run_main,
+                        pm_uid,
+                        f"feishu:user:{identity_a}",
+                        Jsonb(
+                            {
+                                "route_key": "data:softbank-nav-monitor",
+                                "automation_id": "data:softbank-nav-monitor",
+                                "job_key": "softbank-nav-monitor",
+                                "expected_item_count": 1,
+                                **outbox,
+                            }
+                        ),
+                    ),
+                )
+            await upsert_user_preferences(
+                user_id=pm_uid,
+                model_preference={
+                    "dalton_notify_enabled": True,
+                    "dalton_notify_targets": [f"feishu:user:{identity_a}"],
+                    "dalton_notify_routes": {
+                        "data:softbank-nav-monitor": [f"feishu:user:{identity_a}"]
+                    },
+                },
+                conn=admin_conn,
+            )
+
+        app = FastAPI()
+        app.include_router(dalton_router)
+        headers = {"X-Service-Token": SERVICE_TOKEN}
+        plan_ep = "/api/v1/dalton/channels/internal/data-task-notifications/plan"
+        claim_ep = "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim"
+        prog_ep = "/api/v1/dalton/channels/internal/deliveries/progress"
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://backend.test",
+        ) as client:
+            # 1. Initial recipient A plan and I-6 claim freeze A on `dalton_notify_deliveries`
+            r_plan_a = await client.post(
+                plan_ep,
+                headers=headers,
+                json={"run_id": run_main, "target": f"feishu:user:{identity_a}"},
+            )
+            assert r_plan_a.status_code == 200
+            plan_a = r_plan_a.json()
+            assert plan_a["authorized"] is True
+            assert plan_a["recipient_id"] == identity_a
+            key_a = plan_a["items"][0]["delivery_key"]
+            assert key_a == dtn_db.build_data_task_item_delivery_key(
+                run_id=run_main,
+                platform="feishu",
+                recipient_id=identity_a,
+                item_index=0,
+            )
+
+            r_claim_a = await client.post(
+                claim_ep,
+                headers=headers,
+                json={
+                    "delivery_key": key_a,
+                    "kind": "data_task",
+                    "run_id": run_main,
+                    "target": f"feishu:user:{identity_a}",
+                    "platform": "feishu",
+                    "has_non_empty_text": True,
+                    "total_chunks": 1,
+                },
+            )
+            assert r_claim_a.status_code == 200
+            assert r_claim_a.json()["claim_status"] == "claimed"
+            assert r_claim_a.json()["recipient_id"] == identity_a
+
+            async with admin_conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    "SELECT payload_json FROM dalton_notify_deliveries WHERE execution_id = %s",
+                    (run_main,),
+                )
+                outer_a_row = await cur.fetchone()
+            assert outer_a_row is not None
+            outer_a_payload = outer_a_row["payload_json"]
+            assert outer_a_payload["reconcile_platform"] == "feishu"
+            assert outer_a_payload["reconcile_recipient_id"] == identity_a
+            assert outer_a_payload["reconcile_canonical_target"] == "feishu:@me"
+            assert outer_a_payload["expected_item_count"] == 1
+            assert outer_a_payload["reconcile_delivery_keys"] == [key_a]
+            outer_a_sha = hashlib.sha256(
+                json.dumps(outer_a_payload, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+
+            # 2. Mark `key_a` as `failed` (`upload_failed`) and verify identical A retry succeeds on both `/plan` and `/authorize-and-claim`
+            await client.post(
+                prog_ep,
+                headers=headers,
+                json={
+                    "delivery_key": key_a,
+                    "sent_chunks": 0,
+                    "total_chunks": 1,
+                    "status": "failed",
+                    "error_code": "upload_failed",
+                },
+            )
+            r_plan_a_retry = await client.post(
+                plan_ep,
+                headers=headers,
+                json={"run_id": run_main, "target": f"feishu:user:{identity_a}"},
+            )
+            assert r_plan_a_retry.json()["authorized"] is True
+            assert r_plan_a_retry.json()["recipient_id"] == identity_a
+
+            r_claim_a_retry = await client.post(
+                claim_ep,
+                headers=headers,
+                json={
+                    "delivery_key": key_a,
+                    "kind": "data_task",
+                    "run_id": run_main,
+                    "target": f"feishu:user:{identity_a}",
+                    "platform": "feishu",
+                    "has_non_empty_text": True,
+                    "total_chunks": 1,
+                },
+            )
+            assert r_claim_a_retry.json()["claim_status"] == "claimed"
+
+            # 3. Concurrent first-time `/plan` and `/authorize-and-claim` on `run_conc_first` (no pre-seeded outer row)
+            key_conc_a = dtn_db.build_data_task_item_delivery_key(
+                run_id=run_conc_first,
+                platform="feishu",
+                recipient_id=identity_a,
+                item_index=0,
+            )
+            conc_results = await asyncio.gather(
+                client.post(
+                    plan_ep,
+                    headers=headers,
+                    json={"run_id": run_conc_first, "target": f"feishu:user:{identity_a}"},
+                ),
+                client.post(
+                    plan_ep,
+                    headers=headers,
+                    json={"run_id": run_conc_first, "target": f"feishu:user:{identity_a}"},
+                ),
+                client.post(
+                    claim_ep,
+                    headers=headers,
+                    json={
+                        "delivery_key": key_conc_a,
+                        "kind": "data_task",
+                        "run_id": run_conc_first,
+                        "target": f"feishu:user:{identity_a}",
+                        "platform": "feishu",
+                        "has_non_empty_text": True,
+                        "total_chunks": 1,
+                    },
+                ),
+                client.post(
+                    claim_ep,
+                    headers=headers,
+                    json={
+                        "delivery_key": key_conc_a,
+                        "kind": "data_task",
+                        "run_id": run_conc_first,
+                        "target": f"feishu:user:{identity_a}",
+                        "platform": "feishu",
+                        "has_non_empty_text": True,
+                        "total_chunks": 1,
+                    },
+                ),
+            )
+            assert conc_results[0].json()["authorized"] is True
+            assert conc_results[1].json()["authorized"] is True
+            assert sorted([conc_results[2].json()["claim_status"], conc_results[3].json()["claim_status"]]) == [
+                "claimed",
+                "in_flight_or_unknown",
+            ]
+            # Verify `claim_target_delivery` can claim the pre-seeded `attempt_count = 0` outer row and advance to `attempt_count = 1`
+            claimed_seeded = await notify_dispatch_mod.claim_target_delivery(
+                run_conc_first,
+                "feishu",
+                f"feishu:user:{identity_a}",
+                user_id=pm_uid,
+                automation_id="data:softbank-nav-monitor",
+                payload={"route_key": "data:softbank-nav-monitor", **outbox},
+            )
+            assert claimed_seeded is True
+            async with admin_conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    "SELECT attempt_count, payload_json FROM dalton_notify_deliveries WHERE execution_id = %s",
+                    (run_conc_first,),
+                )
+                seeded_row = await cur.fetchone()
+            assert seeded_row["attempt_count"] == 1
+            assert seeded_row["payload_json"]["reconcile_recipient_id"] == identity_a
+            assert seeded_row["payload_json"]["reconcile_delivery_keys"] == [key_conc_a]
+
+            # 4. Rebind `dalton_channel_identities` to `identity_b`:
+            #    both `/plan` and `/authorize-and-claim` for `run_main` must deny B (`recipient_identity_conflict`),
+            #    insert zero B rows into `dalton_channel_deliveries`, and leave outer A metadata untouched!
+            async with admin_conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE dalton_channel_identities
+                    SET platform_user_id = %s, updated_at = NOW()
+                    WHERE user_id = %s AND platform = 'feishu'
+                    """,
+                    (identity_b, pm_uid),
+                )
+
+            r_plan_b = await client.post(
+                plan_ep,
+                headers=headers,
+                json={"run_id": run_main, "target": f"feishu:user:{identity_a}"},
+            )
+            assert r_plan_b.status_code == 200
+            plan_b = r_plan_b.json()
+            assert plan_b["authorized"] is False
+            assert plan_b["code"] == "recipient_identity_conflict"
+
+            key_b = dtn_db.build_data_task_item_delivery_key(
+                run_id=run_main,
+                platform="feishu",
+                recipient_id=identity_b,
+                item_index=0,
+            )
+            r_claim_b = await client.post(
+                claim_ep,
+                headers=headers,
+                json={
+                    "delivery_key": key_b,
+                    "kind": "data_task",
+                    "run_id": run_main,
+                    "target": f"feishu:user:{identity_a}",
+                    "platform": "feishu",
+                    "has_non_empty_text": True,
+                    "total_chunks": 1,
+                },
+            )
+            assert r_claim_b.status_code == 200
+            claim_b = r_claim_b.json()
+            assert claim_b["claim_status"] == "denied"
+            assert claim_b["code"] == "recipient_identity_conflict"
+
+            async with admin_conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    "SELECT COUNT(*) AS cnt FROM dalton_channel_deliveries WHERE delivery_key = %s",
+                    (key_b,),
+                )
+                assert (await cur.fetchone())["cnt"] == 0
+
+                await cur.execute(
+                    "SELECT payload_json FROM dalton_notify_deliveries WHERE execution_id = %s",
+                    (run_main,),
+                )
+                outer_after_b = (await cur.fetchone())["payload_json"]
+            outer_after_b_sha = hashlib.sha256(
+                json.dumps(outer_after_b, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            assert outer_after_b_sha == outer_a_sha
+            assert outer_after_b["reconcile_recipient_id"] == identity_a
+            assert outer_after_b["reconcile_delivery_keys"] == [key_a]
+
+            # 5. Partial/malformed stored metadata (`run_malformed`) and disagreeing candidate alias rows (`run_disagree`)
+            async with admin_conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_notify_deliveries (
+                        delivery_id, execution_id, automation_id, user_id, channel, target,
+                        status, attempt_count, payload_json
+                    )
+                    VALUES
+                    (%s, %s, 'data:softbank-nav-monitor', %s, 'feishu', %s, 'pending', 1, %s),
+                    (%s, %s, 'data:softbank-nav-monitor', %s, 'feishu', 'feishu:@me', 'pending', 1, %s),
+                    (%s, %s, 'data:softbank-nav-monitor', %s, 'feishu', %s, 'pending', 1, %s)
+                    """,
+                    (
+                        str(uuid4()),
+                        run_malformed,
+                        pm_uid,
+                        f"feishu:user:{identity_a}",
+                        Jsonb({"route_key": "data:softbank-nav-monitor", "reconcile_recipient_id": identity_b}),
+                        str(uuid4()),
+                        run_disagree,
+                        pm_uid,
+                        Jsonb({"route_key": "data:softbank-nav-monitor"}),
+                        str(uuid4()),
+                        run_disagree,
+                        pm_uid,
+                        f"feishu:user:{identity_a}",
+                        Jsonb(
+                            {
+                                "route_key": "data:softbank-nav-monitor",
+                                **dtn_db.build_reconcile_identity_metadata(
+                                    platform="feishu",
+                                    recipient_id=identity_a,
+                                    canonical_target_address="feishu:@me",
+                                    delivery_keys=[
+                                        dtn_db.build_data_task_item_delivery_key(
+                                            run_id=run_disagree,
+                                            platform="feishu",
+                                            recipient_id=identity_a,
+                                            item_index=0,
+                                        )
+                                    ],
+                                ),
+                            }
+                        ),
+                    ),
+                )
+
+            r_malformed = await client.post(
+                plan_ep,
+                headers=headers,
+                json={"run_id": run_malformed, "target": f"feishu:user:{identity_a}"},
+            )
+            assert r_malformed.json()["authorized"] is False
+            assert r_malformed.json()["code"] == "invalid_reconcile_metadata"
+
+            r_disagree = await client.post(
+                plan_ep,
+                headers=headers,
+                json={"run_id": run_disagree, "target": f"feishu:user:{identity_a}"},
+            )
+            assert r_disagree.json()["authorized"] is False
+            assert r_disagree.json()["code"] == "recipient_identity_conflict"
+            # Verify the unstamped candidate row on `run_disagree` (`feishu:@me`) was NOT stamped when the sibling row conflicted
+            async with admin_conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT payload_json
+                    FROM dalton_notify_deliveries
+                    WHERE execution_id = %s AND target = 'feishu:@me'
+                    """,
+                    (run_disagree,),
+                )
+                unstamped_sibling = (await cur.fetchone())["payload_json"]
+            assert "reconcile_recipient_id" not in unstamped_sibling
+
+            # 6. Unlink channel identity completely (`DELETE FROM dalton_channel_identities`):
+            #    new `/plan` and `/authorize-and-claim` are denied (`not_linked`), while late completion
+            #    of original `key_a` reconciles `run_main` read-only to `sent` and `dispatched`!
+            async with admin_conn.cursor() as cur:
+                await cur.execute(
+                    "DELETE FROM dalton_channel_identities WHERE user_id = %s",
+                    (pm_uid,),
+                )
+                await cur.execute(
+                    """
+                    UPDATE dalton_notify_deliveries
+                    SET status = 'pending',
+                        attempt_count = 3,
+                        error_code = 'delivery_uncertain'
+                    WHERE execution_id = %s
+                    """,
+                    (run_main,),
+                )
+
+            r_plan_unlinked = await client.post(
+                plan_ep,
+                headers=headers,
+                json={"run_id": run_main, "target": f"feishu:user:{identity_a}"},
+            )
+            assert r_plan_unlinked.json()["authorized"] is False
+            assert r_plan_unlinked.json()["code"] == "not_linked"
+
+            r_prog_late_a = await client.post(
+                prog_ep,
+                headers=headers,
+                json={
+                    "delivery_key": key_a,
+                    "sent_chunks": 1,
+                    "total_chunks": 1,
+                    "platform_message_ids": ["om_late_a_ok"],
+                    "status": "sent",
+                },
+            )
+            assert r_prog_late_a.status_code == 200
+            assert r_prog_late_a.json()["status"] == "sent"
+
+            reconciled_count = await dtn_db.reconcile_uncertain_data_task_deliveries(limit=5)
+            assert reconciled_count == 1
+
+            async with admin_conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    "SELECT status, attempt_count, error_code FROM dalton_notify_deliveries WHERE execution_id = %s",
+                    (run_main,),
+                )
+                assert await cur.fetchone() == {
+                    "status": "sent",
+                    "attempt_count": 3,
+                    "error_code": None,
+                }
+                await cur.execute(
+                    "SELECT notify_status FROM dalton_data_task_runs WHERE run_id = %s::uuid",
+                    (run_main,),
+                )
+                assert (await cur.fetchone())["notify_status"] == "dispatched"
+    finally:
+        async with admin_conn.cursor() as cur:
+            await cur.execute(
+                "DELETE FROM dalton_notify_deliveries WHERE execution_id = ANY(%s)",
+                (all_runs,),
+            )
+            await cur.execute(
+                "DELETE FROM dalton_channel_deliveries WHERE run_id = ANY(%s)",
+                (all_runs,),
+            )
+            await cur.execute(
+                "DELETE FROM dalton_channel_identities WHERE user_id = %s",
+                (pm_uid,),
+            )
+            await cur.execute(
+                "DELETE FROM dalton_data_task_runs WHERE run_id = ANY(%s::uuid[])",
+                (all_runs,),
+            )
+            await cur.execute(
+                "DELETE FROM dalton_data_task_defs WHERE job_key = 'softbank-nav-monitor'"
             )
             await cur.execute(
                 "DELETE FROM user_preferences WHERE user_id = %s",

@@ -14,7 +14,8 @@ import json
 import logging
 import re
 import time
-from typing import Any
+from typing import Any, Literal
+from uuid import uuid4
 
 from psycopg.rows import dict_row
 
@@ -478,6 +479,24 @@ async def _authorize_run_and_target_in_tx(
     )
 
 
+_RECONCILE_REQUIRED_KEYS: tuple[str, ...] = (
+    "reconcile_platform",
+    "reconcile_recipient_id",
+    "reconcile_canonical_target",
+    "reconcile_delivery_keys",
+)
+
+
+@dataclass(frozen=True)
+class OuterIdentityEnforcementResult:
+    """Checked outcome of enforcing and persisting outer notification delivery identity."""
+
+    ok: bool
+    code: str = "ok"
+    message: str = ""
+    metadata: dict[str, Any] | None = None
+
+
 def build_reconcile_identity_metadata(
     *,
     platform: str,
@@ -495,6 +514,132 @@ def build_reconcile_identity_metadata(
     }
 
 
+def _inspect_stored_reconcile_identity(
+    payload: Any,
+    *,
+    expected_meta: Mapping[str, Any],
+) -> Literal["unstamped", "matches", "mismatch", "malformed"]:
+    """Classify stored outer `payload_json` against `expected_meta`."""
+    if payload is None:
+        return "unstamped"
+    if not isinstance(payload, Mapping):
+        return "malformed"
+
+    present_reconcile_keys = [k for k in _RECONCILE_REQUIRED_KEYS if k in payload]
+    raw_expected_count = payload.get("expected_item_count")
+
+    if not present_reconcile_keys:
+        if raw_expected_count is not None:
+            if (
+                isinstance(raw_expected_count, bool)
+                or not isinstance(raw_expected_count, int)
+                or raw_expected_count <= 0
+            ):
+                return "malformed"
+            if raw_expected_count != int(expected_meta["expected_item_count"]):
+                return "mismatch"
+        return "unstamped"
+
+    if len(present_reconcile_keys) != len(_RECONCILE_REQUIRED_KEYS):
+        return "malformed"
+
+    raw_platform = payload.get("reconcile_platform")
+    raw_recipient = payload.get("reconcile_recipient_id")
+    raw_canon = payload.get("reconcile_canonical_target")
+    raw_keys = payload.get("reconcile_delivery_keys")
+
+    if not isinstance(raw_platform, str) or not raw_platform.strip():
+        return "malformed"
+    if not isinstance(raw_recipient, str) or not raw_recipient.strip():
+        return "malformed"
+    if not isinstance(raw_canon, str) or not raw_canon.strip():
+        return "malformed"
+    if not isinstance(raw_keys, list) or not raw_keys:
+        return "malformed"
+
+    cleaned_keys: list[str] = []
+    for k in raw_keys:
+        if not isinstance(k, str) or not k.strip():
+            return "malformed"
+        cleaned_keys.append(k.strip())
+
+    if raw_expected_count is not None:
+        if (
+            isinstance(raw_expected_count, bool)
+            or not isinstance(raw_expected_count, int)
+            or raw_expected_count <= 0
+            or raw_expected_count != len(cleaned_keys)
+        ):
+            return "malformed"
+
+    if (
+        raw_platform.strip().lower() != str(expected_meta["reconcile_platform"]).strip().lower()
+        or raw_recipient.strip() != str(expected_meta["reconcile_recipient_id"]).strip()
+        or raw_canon.strip() != str(expected_meta["reconcile_canonical_target"]).strip()
+        or len(cleaned_keys) != int(expected_meta["expected_item_count"])
+        or cleaned_keys != list(expected_meta["reconcile_delivery_keys"])
+    ):
+        return "mismatch"
+
+    return "matches"
+
+
+def _is_candidate_outer_delivery_row(
+    row: Mapping[str, Any],
+    *,
+    platform: str,
+    target_kind: str,
+    raw_ident: str,
+    requested_target: str,
+    canonical_target_address: str,
+) -> bool:
+    """Return True when `row` in `dalton_notify_deliveries` represents the same logical target."""
+    row_target = str(row.get("target") or "").strip()
+    if row_target in (requested_target.strip(), canonical_target_address.strip()):
+        return True
+
+    row_payload = row.get("payload_json")
+    if isinstance(row_payload, Mapping):
+        rec_canon = str(row_payload.get("reconcile_canonical_target") or "").strip()
+        if rec_canon and rec_canon == canonical_target_address.strip():
+            return True
+
+    parsed_row_target = _parse_requested_notify_target(row_target)
+    if parsed_row_target is not None:
+        r_plat, r_kind, r_ident = parsed_row_target
+        if r_plat == platform and r_kind == target_kind:
+            if target_kind == "dm":
+                return True
+            if r_ident == raw_ident:
+                return True
+
+    return False
+
+
+async def _acquire_outer_identity_xact_lock(
+    cur: Any,
+    *,
+    run_id: str,
+    target: str,
+) -> None:
+    """Acquire deterministic transaction-scoped lock for `(run_id, platform, canonical_target)`."""
+    try:
+        norm_run_id = normalize_run_uuid(run_id)
+    except DataTaskArtifactError:
+        return
+    parsed = _parse_requested_notify_target(target)
+    if parsed is None:
+        return
+    platform, target_kind, raw_ident = parsed
+    canonical_lock_target = (
+        f"{platform}:@me" if target_kind == "dm" else f"{platform}:{raw_ident}"
+    )
+    await cur.execute(
+        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+        (f"dalton_outer_identity:{norm_run_id}:{platform}:{canonical_lock_target}",),
+    )
+
+
 async def _persist_reconcile_identity_on_outer_delivery(
     cur: Any,
     *,
@@ -504,42 +649,244 @@ async def _persist_reconcile_identity_on_outer_delivery(
     canonical_target_address: str,
     recipient_id: str,
     delivery_keys: list[str],
-) -> None:
-    """Stamp immutable original recipient and expected keys on the outer `dalton_notify_deliveries` row before external send."""
-    if not delivery_keys or not recipient_id:
-        return
-    meta = build_reconcile_identity_metadata(
-        platform=platform,
-        recipient_id=recipient_id,
-        canonical_target_address=canonical_target_address,
+    job_key: str = "",
+    owner_user_id: str = "",
+    target_kind: str = "",
+    raw_ident: str = "",
+) -> OuterIdentityEnforcementResult:
+    """Atomically verify and stamp original recipient and ordered item keys on `dalton_notify_deliveries`."""
+    cleaned_recipient = str(recipient_id or "").strip()
+    cleaned_canon = str(canonical_target_address or "").strip()
+    cleaned_req = str(requested_target or "").strip()
+    cleaned_platform = str(platform or "").strip().lower()
+    if not delivery_keys or not cleaned_recipient or not cleaned_canon or not cleaned_platform:
+        return OuterIdentityEnforcementResult(
+            ok=False,
+            code="invalid_reconcile_metadata",
+            message="Recipient identity and ordered delivery keys are required.",
+        )
+
+    parsed_req = _parse_requested_notify_target(cleaned_req or cleaned_canon)
+    eff_target_kind = target_kind or (parsed_req[1] if parsed_req else ("dm" if cleaned_canon.endswith(":@me") else "group"))
+    eff_raw_ident = raw_ident or (parsed_req[2] if parsed_req else "")
+
+    expected_meta = build_reconcile_identity_metadata(
+        platform=cleaned_platform,
+        recipient_id=cleaned_recipient,
+        canonical_target_address=cleaned_canon,
         delivery_keys=delivery_keys,
     )
-    candidate_targets = list(
-        dict.fromkeys(
-            t for t in (requested_target.strip(), canonical_target_address.strip()) if t
-        )
+
+    await cur.execute(
+        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+        (f"dalton_outer_identity:{run_id}:{cleaned_platform}:{cleaned_canon}",),
     )
-    if not candidate_targets:
-        return
+
     await cur.execute(
         """
-        UPDATE dalton_notify_deliveries
-        SET payload_json = COALESCE(payload_json, '{}'::jsonb) || %s::jsonb
+        SELECT delivery_id::text AS delivery_id,
+               user_id,
+               channel,
+               target,
+               status,
+               payload_json
+        FROM dalton_notify_deliveries
         WHERE execution_id = %s
           AND channel = %s
-          AND target = ANY(%s)
-          AND NOT (
-              COALESCE(payload_json, '{}'::jsonb) ? 'reconcile_recipient_id'
-              AND COALESCE(payload_json, '{}'::jsonb) ? 'reconcile_delivery_keys'
-          )
+        ORDER BY target ASC, delivery_id ASC
+        FOR UPDATE
         """,
-        (
-             json.dumps(meta, ensure_ascii=False),
-            run_id,
-            platform,
-            candidate_targets,
-        ),
+        (run_id, cleaned_platform),
     )
+    fetched_rows = await cur.fetchall()
+    if not isinstance(fetched_rows, list):
+        return OuterIdentityEnforcementResult(ok=True, metadata=expected_meta)
+
+    await cur.execute(
+        """
+        SELECT delivery_key, user_id
+        FROM dalton_channel_deliveries
+        WHERE kind = 'data_task'
+          AND run_id = %s
+          AND platform = %s
+          AND target_address = %s
+        """,
+        (run_id, cleaned_platform, cleaned_canon),
+    )
+    existing_item_rows = await cur.fetchall()
+    if isinstance(existing_item_rows, list):
+        allowed_key_set = set(delivery_keys)
+        for ir in existing_item_rows:
+            if not isinstance(ir, Mapping):
+                continue
+            ir_uid = str(ir.get("user_id") or "").strip()
+            ir_key = str(ir.get("delivery_key") or "").strip()
+            if (owner_user_id and ir_uid and ir_uid != owner_user_id) or (
+                ir_key and ir_key not in allowed_key_set
+            ):
+                return OuterIdentityEnforcementResult(
+                    ok=False,
+                    code="recipient_identity_conflict",
+                    message="Existing item delivery records conflict with the current recipient identity.",
+                )
+
+    candidate_rows = [
+        r
+        for r in fetched_rows
+        if isinstance(r, Mapping)
+        and _is_candidate_outer_delivery_row(
+            r,
+            platform=cleaned_platform,
+            target_kind=eff_target_kind,
+            raw_ident=eff_raw_ident,
+            requested_target=cleaned_req,
+            canonical_target_address=cleaned_canon,
+        )
+    ]
+
+    if not candidate_rows:
+        eff_job_key = str(job_key or "").strip()
+        eff_owner_uid = str(owner_user_id or "").strip()
+        if not eff_owner_uid:
+            pm_ids = get_configured_pm_user_ids()
+            eff_owner_uid = str(pm_ids[0]).strip() if pm_ids else ""
+        route_key = f"data:{eff_job_key}" if eff_job_key else "data:unknown"
+        initial_payload: dict[str, Any] = {
+            "route_key": route_key,
+            "automation_id": route_key,
+            **({"job_key": eff_job_key} if eff_job_key else {}),
+            **expected_meta,
+        }
+        await cur.execute(
+            """
+            INSERT INTO dalton_notify_deliveries (
+                delivery_id, execution_id, automation_id, user_id,
+                channel, target, status, attempt_count, payload_json
+            )
+            VALUES (%s::uuid, %s, %s, %s, %s, %s, 'pending', 0, %s::jsonb)
+            ON CONFLICT (execution_id, channel, target) DO NOTHING
+            """,
+            (
+                str(uuid4()),
+                run_id,
+                route_key,
+                eff_owner_uid,
+                cleaned_platform,
+                cleaned_req or cleaned_canon,
+                json.dumps(initial_payload, ensure_ascii=False),
+            ),
+        )
+        await cur.execute(
+            """
+            SELECT delivery_id::text AS delivery_id,
+                   user_id,
+                   channel,
+                   target,
+                   status,
+                   payload_json
+            FROM dalton_notify_deliveries
+            WHERE execution_id = %s
+              AND channel = %s
+            ORDER BY target ASC, delivery_id ASC
+            FOR UPDATE
+            """,
+            (run_id, cleaned_platform),
+        )
+        refetched_rows = await cur.fetchall()
+        if not isinstance(refetched_rows, list) or type(getattr(cur, "rowcount", None)) is not int:
+            return OuterIdentityEnforcementResult(ok=True, metadata=expected_meta)
+        candidate_rows = [
+            r
+            for r in refetched_rows
+            if isinstance(r, Mapping)
+            and _is_candidate_outer_delivery_row(
+                r,
+                platform=cleaned_platform,
+                target_kind=eff_target_kind,
+                raw_ident=eff_raw_ident,
+                requested_target=cleaned_req,
+                canonical_target_address=cleaned_canon,
+            )
+        ]
+        if not candidate_rows:
+            return OuterIdentityEnforcementResult(
+                ok=False,
+                code="outer_delivery_missing",
+                message="Unable to persist or lock outer notification delivery record.",
+            )
+
+    unstamped_delivery_ids: list[str] = []
+    for crow in candidate_rows:
+        crow_uid = str(crow.get("user_id") or "").strip()
+        if owner_user_id and crow_uid and crow_uid != owner_user_id:
+            return OuterIdentityEnforcementResult(
+                ok=False,
+                code="recipient_identity_conflict",
+                message="Outer notification record belongs to a different user.",
+            )
+        state = _inspect_stored_reconcile_identity(
+            crow.get("payload_json"),
+            expected_meta=expected_meta,
+        )
+        if state == "malformed":
+            return OuterIdentityEnforcementResult(
+                ok=False,
+                code="invalid_reconcile_metadata",
+                message="Persisted outer notification identity metadata is partial or malformed.",
+            )
+        if state == "mismatch":
+            return OuterIdentityEnforcementResult(
+                ok=False,
+                code="recipient_identity_conflict",
+                message="Current recipient or delivery plan does not match the persisted identity for this notification.",
+            )
+        if state == "unstamped":
+            did = str(crow.get("delivery_id") or "").strip()
+            if not did:
+                return OuterIdentityEnforcementResult(
+                    ok=False,
+                    code="invalid_reconcile_metadata",
+                    message="Outer notification record is missing delivery_id.",
+                )
+            unstamped_delivery_ids.append(did)
+
+    if unstamped_delivery_ids:
+        await cur.execute(
+            """
+            UPDATE dalton_notify_deliveries
+            SET payload_json = COALESCE(payload_json, '{}'::jsonb) || %s::jsonb,
+                updated_at = NOW()
+            WHERE delivery_id = ANY(%s::uuid[])
+              AND NOT (
+                  COALESCE(payload_json, '{}'::jsonb) ? 'reconcile_platform'
+                  OR COALESCE(payload_json, '{}'::jsonb) ? 'reconcile_recipient_id'
+                  OR COALESCE(payload_json, '{}'::jsonb) ? 'reconcile_canonical_target'
+                  OR COALESCE(payload_json, '{}'::jsonb) ? 'reconcile_delivery_keys'
+              )
+            RETURNING delivery_id::text AS delivery_id, payload_json
+            """,
+            (
+                json.dumps(expected_meta, ensure_ascii=False),
+                unstamped_delivery_ids,
+            ),
+        )
+        updated_rows = await cur.fetchall()
+        if not isinstance(updated_rows, list) or len(updated_rows) != len(unstamped_delivery_ids):
+            return OuterIdentityEnforcementResult(
+                ok=False,
+                code="recipient_identity_conflict",
+                message="Concurrent outer notification identity update prevented stamping all candidate records.",
+            )
+        for urow in updated_rows:
+            upayload = urow.get("payload_json") if isinstance(urow, Mapping) else None
+            if _inspect_stored_reconcile_identity(upayload, expected_meta=expected_meta) != "matches":
+                return OuterIdentityEnforcementResult(
+                    ok=False,
+                    code="invalid_reconcile_metadata",
+                    message="Updated outer notification identity metadata failed post-write verification.",
+                )
+
+    return OuterIdentityEnforcementResult(ok=True, metadata=expected_meta)
 
 
 async def authorize_data_task_notification_plan(
@@ -553,6 +900,7 @@ async def authorize_data_task_notification_plan(
     async with get_db_connection(conn) as owned_conn:
         async with owned_conn.transaction():
             async with owned_conn.cursor(row_factory=dict_row) as cur:
+                await _acquire_outer_identity_xact_lock(cur, run_id=run_id, target=target)
                 auth = await _authorize_run_and_target_in_tx(
                     cur,
                     owned_conn,
@@ -578,15 +926,25 @@ async def authorize_data_task_notification_plan(
                     )
                     for item in auth.plan.items
                 ]
-                await _persist_reconcile_identity_on_outer_delivery(
+                identity_outcome = await _persist_reconcile_identity_on_outer_delivery(
                     cur,
                     run_id=auth.run_id,
+                    job_key=auth.job_key,
+                    owner_user_id=auth.owner_user_id,
                     platform=auth.platform,
+                    target_kind=auth.target_kind,
                     requested_target=auth.requested_target,
                     canonical_target_address=auth.canonical_target_address,
                     recipient_id=auth.recipient_id,
                     delivery_keys=delivery_keys,
                 )
+                if not identity_outcome.ok:
+                    return {
+                        "authorized": False,
+                        "status": "failed",
+                        "code": identity_outcome.code,
+                        "message": identity_outcome.message,
+                    }
                 existing_by_key: dict[str, dict[str, Any]] = {}
                 if delivery_keys:
                     await cur.execute(
@@ -650,6 +1008,11 @@ async def authorize_and_claim_data_task_delivery(
     async with get_db_connection(conn) as owned_conn:
         async with owned_conn.transaction():
             async with owned_conn.cursor(row_factory=dict_row) as cur:
+                await _acquire_outer_identity_xact_lock(
+                    cur,
+                    run_id=cleaned_rid,
+                    target=cleaned_target,
+                )
                 await cur.execute(
                     "SELECT pg_advisory_xact_lock(hashtext(%s))",
                     (f"dalton_delivery:{cleaned_key}",),
@@ -719,15 +1082,25 @@ async def authorize_and_claim_data_task_delivery(
                         "message": "delivery_key does not match an authorized item for this run and target.",
                     }
 
-                await _persist_reconcile_identity_on_outer_delivery(
+                identity_outcome = await _persist_reconcile_identity_on_outer_delivery(
                     cur,
                     run_id=auth.run_id,
+                    job_key=auth.job_key,
+                    owner_user_id=auth.owner_user_id,
                     platform=auth.platform,
+                    target_kind=auth.target_kind,
                     requested_target=auth.requested_target,
                     canonical_target_address=auth.canonical_target_address,
                     recipient_id=auth.recipient_id,
                     delivery_keys=ordered_expected_keys,
                 )
+                if not identity_outcome.ok:
+                    return {
+                        "claim_status": "denied",
+                        "status": "failed",
+                        "code": identity_outcome.code,
+                        "message": identity_outcome.message,
+                    }
 
                 await cur.execute(
                     """
@@ -922,40 +1295,11 @@ async def ensure_outer_reconcile_identity_persisted(
         async with get_db_connection(conn) as owned_conn:
             async with owned_conn.transaction():
                 async with owned_conn.cursor(row_factory=dict_row) as cur:
-                    await cur.execute(
-                        """
-                        SELECT payload_json
-                        FROM dalton_notify_deliveries
-                        WHERE execution_id = %s
-                          AND channel = %s
-                          AND target = %s
-                        FOR UPDATE
-                        """,
-                        (norm_run_id, platform, target),
+                    await _acquire_outer_identity_xact_lock(
+                        cur,
+                        run_id=norm_run_id,
+                        target=target,
                     )
-                    existing_row = await cur.fetchone()
-                    existing_payload = (
-                        existing_row.get("payload_json")
-                        if existing_row and isinstance(existing_row.get("payload_json"), Mapping)
-                        else None
-                    )
-                    if (
-                        isinstance(existing_payload, Mapping)
-                        and str(existing_payload.get("reconcile_recipient_id") or "").strip()
-                        and isinstance(existing_payload.get("reconcile_delivery_keys"), list)
-                    ):
-                        return {
-                            "reconcile_platform": str(existing_payload.get("reconcile_platform") or platform),
-                            "reconcile_recipient_id": str(existing_payload["reconcile_recipient_id"]).strip(),
-                            "reconcile_canonical_target": str(
-                                existing_payload.get("reconcile_canonical_target") or target
-                            ).strip(),
-                            "expected_item_count": int(
-                                existing_payload.get("expected_item_count") or expected_count
-                            ),
-                            "reconcile_delivery_keys": list(existing_payload["reconcile_delivery_keys"]),
-                        }
-
                     if target_kind == "group":
                         canonical_target_address = f"{platform}:{raw_ident}"
                         recipient_id = raw_ident
@@ -982,7 +1326,11 @@ async def ensure_outer_reconcile_identity_persisted(
                                 recipient_id = bound_uid
                             else:
                                 if bound_uid and bound_uid != raw_ident:
-                                    return None
+                                    return {
+                                        "conflict": True,
+                                        "code": "recipient_identity_conflict",
+                                        "message": "Discord identity binding does not match the target recipient.",
+                                    }
                                 recipient_id = raw_ident
                         else:
                             if raw_ident == "@me":
@@ -1003,21 +1351,30 @@ async def ensure_outer_reconcile_identity_persisted(
                         )
                         for idx in range(expected_count)
                     ]
-                    await _persist_reconcile_identity_on_outer_delivery(
+                    payload_job_key = (
+                        str(payload.get("job_key") or "").strip()
+                        if isinstance(payload, Mapping)
+                        else ""
+                    )
+                    identity_outcome = await _persist_reconcile_identity_on_outer_delivery(
                         cur,
                         run_id=norm_run_id,
+                        job_key=payload_job_key,
+                        owner_user_id=owner_user_id,
                         platform=platform,
+                        target_kind=target_kind,
                         requested_target=target,
                         canonical_target_address=canonical_target_address,
                         recipient_id=recipient_id,
                         delivery_keys=delivery_keys,
                     )
-                    return build_reconcile_identity_metadata(
-                        platform=platform,
-                        recipient_id=recipient_id,
-                        canonical_target_address=canonical_target_address,
-                        delivery_keys=delivery_keys,
-                    )
+                    if not identity_outcome.ok:
+                        return {
+                            "conflict": True,
+                            "code": identity_outcome.code,
+                            "message": identity_outcome.message,
+                        }
+                    return dict(identity_outcome.metadata or {})
     except Exception:
         logger.debug(
             "Unable to persist initial reconcile identity for run_id=%s target=%s",
@@ -1071,7 +1428,8 @@ async def _resolve_reconcile_recipient_identity(
                 canonical_target_address = expected_canon
             else:
                 expected_canon = f"{platform}:@me"
-                if persisted_canon and persisted_canon != expected_canon:
+                legacy_dm_canon = f"{platform}:user:{persisted_recipient}"
+                if persisted_canon and persisted_canon not in (expected_canon, legacy_dm_canon):
                     return None
                 canonical_target_address = expected_canon
 
