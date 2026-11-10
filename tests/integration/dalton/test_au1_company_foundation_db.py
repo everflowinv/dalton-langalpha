@@ -3766,9 +3766,12 @@ async def test_au1_batch_a_notify_snapshot_parity_and_transactional_preference_l
 ) -> None:
     from unittest.mock import MagicMock
 
+    import psycopg
+    from psycopg_pool import PoolTimeout
     from ptc_agent.agent.backends.automations import AutomationsBackend
     from ptc_agent.core.sandbox.livefs_mount import CallContext
-    from src.server.database import user as user_db
+    from src.dalton import invites as dalton_invites, settings as dalton_settings
+    from src.server.database import pool as pool_mod, user as user_db
     from src.server.database.user_lock import lock_user_profile
 
     uid = "u-hist-notify-lock"
@@ -3779,7 +3782,13 @@ async def test_au1_batch_a_notify_snapshot_parity_and_transactional_preference_l
         await _insert_user(conn, uid, "notify-lock@dalton.test")
         await _insert_workspace(conn, ws_id, uid, "Notify-Lock-WS")
 
-    monkeypatch.setattr(access_tiers, "is_internal_or_admin", lambda _u: _coro(True))
+    # Configure uid as an internal owner OUTSIDE the configured admin list (DALTON_PM_USER_IDS is empty).
+    monkeypatch.setattr(dalton_invites, "get_configured_pm_user_ids", lambda: ())
+    monkeypatch.setattr(
+        dalton_settings,
+        "get_dalton_allowed_emails",
+        lambda: frozenset({"notify-lock@dalton.test"}),
+    )
 
     # 1. User initially has NO user_preferences row.
     #    Open a preference transaction on conn_pref holding lock_user_profile(cur, uid),
@@ -3971,3 +3980,96 @@ async def test_au1_batch_a_notify_snapshot_parity_and_transactional_preference_l
         "old": snap_v2["instruction"],
         "new": snap_v3["instruction"],
     }
+
+    # 4. Single available pool connection + internal owner outside admin list + valid group route:
+    #    Write holds the single connection; snapshot retains group route without additional acquisition.
+    #    Lookup failure rolls back the transaction completely.
+    slot_state = {"in_use": False, "additional_acquisitions": 0}
+
+    @asynccontextmanager
+    async def _single_slot_db_conn(conn: Any = None):
+        if conn is not None:
+            yield conn
+            return
+        if slot_state["in_use"]:
+            slot_state["additional_acquisitions"] += 1
+            raise PoolTimeout("pool exhausted: nested acquisition attempted while holding transaction connection")
+        slot_state["in_use"] = True
+        try:
+            async with au1_live_pool.connection(timeout=5) as owned:
+                yield owned
+        finally:
+            slot_state["in_use"] = False
+
+    for mod in (pool_mod, company_auto_db, auto_db, user_db):
+        monkeypatch.setattr(mod, "get_db_connection", _single_slot_db_conn)
+
+    await auto_db.update_automation(
+        auto_id,
+        uid,
+        description="Updated under single pool connection",
+    )
+    assert slot_state["additional_acquisitions"] == 0
+    hist_v4 = await company_auto_db.get_automation_history_row(auto_id)
+    assert hist_v4 is not None
+    assert hist_v4["config_version"] == 4
+    snap_v4 = hist_v4["audit_history"][-1]["snapshot"]
+    assert snap_v4["description"] == "Updated under single pool connection"
+    assert snap_v4["notify_routes"] == [
+        "feishu:chat:oc_0123456789abcdef0123456789abcdef"
+    ]
+
+    # Missing user row resolves to "external" without error on existing conn
+    async with _single_slot_db_conn() as held_conn:
+        assert (
+            await company_auto_db.resolve_owner_tier_for_snapshot(
+                "u-missing-no-row-in-users", conn=held_conn
+            )
+            == "external"
+        )
+    assert slot_state["additional_acquisitions"] == 0
+
+    # Lookup failure aborts and rolls back both update_automation and create_automation!
+    async def _failing_owner_tier(_uid: str | None, *, conn: Any = None) -> str:
+        raise psycopg.OperationalError("simulated owner tier lookup failure")
+
+    monkeypatch.setattr(
+        company_auto_db, "resolve_owner_tier_for_snapshot", _failing_owner_tier
+    )
+    with pytest.raises(psycopg.OperationalError, match="simulated owner tier lookup failure"):
+        await auto_db.update_automation(
+            auto_id,
+            uid,
+            description="Must be rolled back in PG",
+        )
+    after_failed_update = await company_auto_db.get_automation_history_row(auto_id)
+    assert after_failed_update is not None
+    assert after_failed_update["config_version"] == 4
+    assert after_failed_update["active_version"] == 4
+    assert len(after_failed_update["audit_history"]) == 4
+    assert (
+        after_failed_update["audit_history"][-1]["snapshot"]["description"]
+        == "Updated under single pool connection"
+    )
+    persisted_row = await auto_db.get_automation(auto_id, uid)
+    assert persisted_row is not None
+    assert persisted_row["description"] == "Updated under single pool connection"
+
+    with pytest.raises(psycopg.OperationalError, match="simulated owner tier lookup failure"):
+        await auto_db.create_automation(
+            user_id=uid,
+            name="dalton-nvda-rollback-probe",
+            trigger_type="cron",
+            cron_expression="0 9 * * 1-5",
+            timezone="Asia/Shanghai",
+            instruction="Should rollback on create",
+            workspace_id=ws_id,
+        )
+    async with au1_live_pool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT COUNT(*) AS cnt FROM automations WHERE user_id = %s AND name = 'dalton-nvda-rollback-probe'",
+                (uid,),
+            )
+            cnt_row = await cur.fetchone()
+            assert int(cnt_row["cnt"]) == 0

@@ -2384,8 +2384,15 @@ async def test_au1_notify_snapshot_parity_with_model_prefs_and_dispatch(
 
 
 @pytest.mark.asyncio
-async def test_au1_once_coalesced_update_pause_and_timezone_offset_normalization() -> None:
+async def test_au1_once_coalesced_update_pause_and_timezone_offset_normalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     from datetime import timezone
+
+    monkeypatch.setattr(
+        "src.dalton.invites.is_invite_pm",
+        lambda uid: uid == INTERNAL_UID,
+    )
 
     t_old = datetime(2035, 6, 15, 10, 0, tzinfo=UTC)
     t_new = datetime(2035, 6, 16, 11, 0, tzinfo=UTC)
@@ -2470,3 +2477,307 @@ async def test_au1_once_coalesced_update_pause_and_timezone_offset_normalization
         "desired_status": {"old": "active", "new": "paused"},
         "once_run_at": {"old": t_old.isoformat(), "new": t_new.isoformat()},
     }
+
+
+@pytest.mark.asyncio
+async def test_au1_owner_tier_single_connection_and_lookup_failure_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import psycopg
+    from psycopg_pool import PoolTimeout
+
+    from src.dalton import invites as dalton_invites, settings as dalton_settings
+    from src.server.database import pool as pool_mod, user as user_db
+
+    group_target = "feishu:chat:oc_0123456789abcdef0123456789abcdef"
+    missing_uid = "user-missing-from-users-table"
+
+    # Internal owner (INTERNAL_UID) is OUTSIDE configured admin list (only ADMIN_UID is PM).
+    monkeypatch.setattr(
+        dalton_invites,
+        "get_configured_pm_user_ids",
+        lambda: (ADMIN_UID,),
+    )
+    monkeypatch.setattr(
+        dalton_settings,
+        "get_dalton_allowed_emails",
+        lambda: frozenset({"internal@dalton.test", "admin@dalton.test"}),
+    )
+
+    users_table: dict[str, dict[str, Any]] = {
+        INTERNAL_UID: {"user_id": INTERNAL_UID, "email": "internal@dalton.test"},
+        ADMIN_UID: {"user_id": ADMIN_UID, "email": "admin@dalton.test"},
+        EXTERNAL_UID: {"user_id": EXTERNAL_UID, "email": "guest@client.test"},
+    }
+    pref_row = {
+        "model_preference": {
+            "dalton_notify_enabled": True,
+            "dalton_notify_routes": {
+                "dalton-earnings-calendar": [group_target],
+            },
+        },
+        "other_preference": {},
+    }
+    automations_store: dict[str, dict[str, Any]] = {}
+    pool_state = {
+        "in_use": False,
+        "additional_acquisitions": 0,
+        "users_queries": 0,
+        "fail_users_lookup": False,
+    }
+
+    class _SingleTxCursor:
+        def __init__(self, conn: "_SingleTxConn") -> None:
+            self._conn = conn
+            self._one: Any = None
+
+        async def __aenter__(self) -> "_SingleTxCursor":
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            norm_sql = " ".join(sql.split())
+            self._conn.executed_sql.append(norm_sql)
+            if "FROM users WHERE user_id = %s" in norm_sql:
+                pool_state["users_queries"] += 1
+                if pool_state["fail_users_lookup"]:
+                    raise psycopg.OperationalError("simulated users lookup failure")
+                uid = str(params[0]) if params else ""
+                self._one = users_table.get(uid)
+            elif "FROM user_preferences WHERE user_id = %s" in norm_sql:
+                self._one = dict(pref_row)
+            elif "FROM automations WHERE user_id = %s" in norm_sql and "file_name" in norm_sql:
+                self._one = None
+            elif "SELECT" in norm_sql and "FROM automations" in norm_sql and "FOR UPDATE" in norm_sql:
+                aid = str(params[0])
+                row = self._conn.working_store.get(aid)
+                self._one = dict(row) if row is not None else None
+            elif norm_sql.startswith("INSERT INTO automations"):
+                # Persist into working_store inside transaction; rolled back if transaction fails
+                aid = str(params[0])
+                uid = str(params[1])
+                name = str(params[2])
+                audit_val = params[-1]
+                audit_list = (
+                    audit_val.obj
+                    if hasattr(audit_val, "obj")
+                    else list(audit_val or [])
+                )
+                created = {
+                    **_sample_automation_row(
+                        automation_id=aid,
+                        user_id=uid,
+                        name=name,
+                        scope="research_tracking",
+                        config_version=int(params[-3]),
+                        active_version=int(params[-2]),
+                        created_by=params[-5],
+                        updated_by=params[-4],
+                    ),
+                    "audit_history": audit_list,
+                }
+                self._conn.working_store[aid] = created
+                self._one = created
+            elif "UPDATE automations SET" in norm_sql:
+                aid = str(params[-2])
+                existing = dict(self._conn.working_store[aid])
+                # Extract updated fields from parameters
+                for idx, token in enumerate(norm_sql.split(",")):
+                    if "description =" in token:
+                        existing["description"] = params[0]
+                for p in params:
+                    if hasattr(p, "obj") and isinstance(p.obj, list):
+                        existing["audit_history"] = list(p.obj)
+                        existing["config_version"] = int(p.obj[-1]["version"])
+                        existing["active_version"] = int(p.obj[-1]["version"])
+                self._conn.working_store[aid] = existing
+                self._one = existing
+            else:
+                self._one = None
+
+        async def fetchone(self) -> Any:
+            return self._one
+
+        async def fetchall(self) -> list[Any]:
+            return []
+
+    class _SingleTxConn:
+        info = object()
+
+        def __init__(self) -> None:
+            self.executed_sql: list[str] = []
+            self.working_store: dict[str, dict[str, Any]] = dict(automations_store)
+            self.tx_depth = 0
+            self.rollbacks = 0
+
+        def cursor(self, **kwargs: Any) -> _SingleTxCursor:
+            return _SingleTxCursor(self)
+
+        @asynccontextmanager
+        async def transaction(self):
+            snap = {k: dict(v) for k, v in self.working_store.items()}
+            self.tx_depth += 1
+            try:
+                yield
+            except BaseException:
+                self.working_store = snap
+                self.rollbacks += 1
+                raise
+            finally:
+                self.tx_depth -= 1
+                if self.tx_depth == 0:
+                    automations_store.clear()
+                    automations_store.update(self.working_store)
+
+    single_conn = _SingleTxConn()
+
+    @asynccontextmanager
+    async def _single_slot_get_db_connection(conn: Any = None):
+        if conn is not None:
+            yield conn
+            return
+        if pool_state["in_use"]:
+            pool_state["additional_acquisitions"] += 1
+            raise PoolTimeout("pool exhausted: nested connection acquisition while holding transaction lock")
+        pool_state["in_use"] = True
+        try:
+            yield single_conn
+        finally:
+            pool_state["in_use"] = False
+
+    monkeypatch.setattr(pool_mod, "get_db_connection", _single_slot_get_db_connection)
+    monkeypatch.setattr(company_auto_db, "get_db_connection", _single_slot_get_db_connection)
+    monkeypatch.setattr(auto_db, "get_db_connection", _single_slot_get_db_connection)
+    monkeypatch.setattr(user_db, "get_db_connection", _single_slot_get_db_connection)
+
+    # 1. Create automation while holding the ONLY pool connection for INTERNAL_UID (outside admin list):
+    #    retains group route and makes 0 additional pool acquisitions.
+    created_row = await auto_db.create_automation(
+        user_id=INTERNAL_UID,
+        name="dalton-earnings-calendar",
+        trigger_type="cron",
+        cron_expression="0 8 * * 1-5",
+        timezone="Asia/Shanghai",
+        instruction="Check earnings calendar",
+        scope="research_tracking",
+    )
+    auto_id = str(created_row["automation_id"])
+    assert pool_state["additional_acquisitions"] == 0
+    assert pool_state["users_queries"] == 1
+    v1_snap = automations_store[auto_id]["audit_history"][0]["snapshot"]
+    assert v1_snap["notify_enabled"] is True
+    assert v1_snap["notify_routes"] == [group_target]
+
+    # 2. Update automation while holding the ONLY pool connection:
+    #    pre_snapshot and post_snapshot share the single owner-tier lookup on conn,
+    #    retain the group route, and make 0 additional pool acquisitions.
+    pool_state["users_queries"] = 0
+    updated_row = await auto_db.update_automation(
+        auto_id,
+        INTERNAL_UID,
+        description="Updated calendar description",
+    )
+    assert updated_row is not None
+    assert pool_state["additional_acquisitions"] == 0
+    assert pool_state["users_queries"] == 1
+    assert len(automations_store[auto_id]["audit_history"]) == 2
+    v2_snap = automations_store[auto_id]["audit_history"][-1]["snapshot"]
+    assert v2_snap["notify_enabled"] is True
+    assert v2_snap["notify_routes"] == [group_target]
+
+    # 3. Verify admin, external, missing user row, and company/task_row semantics on conn:
+    async with _single_slot_get_db_connection() as held_conn:
+        # Admin user in DALTON_PM_USER_IDS -> "admin" without querying users table
+        q_before = pool_state["users_queries"]
+        assert (
+            await company_auto_db.resolve_owner_tier_for_snapshot(
+                ADMIN_UID, conn=held_conn
+            )
+            == "admin"
+        )
+        assert pool_state["users_queries"] == q_before
+
+        # External user -> "external", group route dropped
+        assert (
+            await company_auto_db.resolve_owner_tier_for_snapshot(
+                EXTERNAL_UID, conn=held_conn
+            )
+            == "external"
+        )
+        ext_en, ext_routes = await company_auto_db.resolve_snapshot_notify_fields(
+            {**created_row, "user_id": EXTERNAL_UID},
+            pref_row=pref_row,
+            conn=held_conn,
+        )
+        assert (ext_en, ext_routes) == (True, [])
+
+        # Missing user row -> explicit existing semantics ("external", no error), group route dropped
+        assert (
+            await company_auto_db.resolve_owner_tier_for_snapshot(
+                missing_uid, conn=held_conn
+            )
+            == "external"
+        )
+        miss_en, miss_routes = await company_auto_db.resolve_snapshot_notify_fields(
+            {**created_row, "user_id": missing_uid},
+            pref_row=pref_row,
+            conn=held_conn,
+        )
+        assert (miss_en, miss_routes) == (True, [])
+
+        # Company identity -> "company" without querying users
+        q_before_comp = pool_state["users_queries"]
+        assert (
+            await company_auto_db.resolve_owner_tier_for_snapshot(
+                COMPANY_SYSTEM_USER_ID, conn=held_conn
+            )
+            == "company"
+        )
+        assert pool_state["users_queries"] == q_before_comp
+
+        # task_row mode -> independent of legacy preferences and owner tier lookup (even when lookup fails)
+        pool_state["fail_users_lookup"] = True
+        tr_en, tr_routes = await company_auto_db.resolve_snapshot_notify_fields(
+            {
+                **created_row,
+                "user_id": COMPANY_SYSTEM_USER_ID,
+                "scope": "company",
+                "notify_storage_mode": "task_row",
+                "notify_enabled": True,
+                "notify_routes": [group_target],
+            },
+            conn=held_conn,
+        )
+        assert (tr_en, tr_routes) == (True, [group_target])
+    assert pool_state["additional_acquisitions"] == 0
+
+    # 4. Lookup failure during create_automation and update_automation aborts & rolls back the write!
+    pool_state["fail_users_lookup"] = True
+    pre_failure_store = {k: dict(v) for k, v in automations_store.items()}
+    rollbacks_before = single_conn.rollbacks
+
+    with pytest.raises(psycopg.OperationalError, match="simulated users lookup failure"):
+        await auto_db.update_automation(
+            auto_id,
+            INTERNAL_UID,
+            description="Must be rolled back on lookup failure",
+        )
+    assert single_conn.rollbacks == rollbacks_before + 1
+    assert automations_store[auto_id]["config_version"] == 2
+    assert automations_store[auto_id]["description"] == "Updated calendar description"
+    assert len(automations_store[auto_id]["audit_history"]) == 2
+
+    with pytest.raises(psycopg.OperationalError, match="simulated users lookup failure"):
+        await auto_db.create_automation(
+            user_id=INTERNAL_UID,
+            name="dalton-earnings-calendar-v2",
+            trigger_type="cron",
+            cron_expression="0 9 * * 1-5",
+            timezone="Asia/Shanghai",
+            instruction="Should not be created",
+            scope="research_tracking",
+        )
+    assert single_conn.rollbacks == rollbacks_before + 2
+    assert set(automations_store.keys()) == set(pre_failure_store.keys())

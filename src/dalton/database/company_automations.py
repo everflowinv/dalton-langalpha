@@ -10,6 +10,8 @@ import uuid
 
 from psycopg.rows import dict_row
 
+from src.dalton import access_tiers as _access_tiers
+from src.dalton.access_tiers import UserTier
 from src.dalton.autonomy.classification import (
     AutomationScope,
     classify_automation_scope,
@@ -20,6 +22,9 @@ from src.dalton.autonomy.classification import (
 from src.dalton.company_identity import COMPANY_SYSTEM_USER_ID
 from src.server.database.home_workspace import get_home_workspace_id
 from src.server.database.pool import get_db_connection
+
+_DEFAULT_IS_INTERNAL_OR_ADMIN = _access_tiers.is_internal_or_admin
+_DEFAULT_GET_USER_TIER = _access_tiers.get_user_tier
 
 
 def _valid_uuid(raw: Any) -> str | None:
@@ -408,37 +413,92 @@ async def fetch_user_preferences_unlocked(
     clean_uid = normalize_scope_text(user_id)
     if not clean_uid or isinstance(conn, NonCallableMock):
         return {}
-    try:
-        async with get_db_connection(conn) as db_conn:
-            if isinstance(db_conn, NonCallableMock):
-                return {}
-            async with db_conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    """
-                    SELECT model_preference, other_preference
-                    FROM user_preferences
-                    WHERE user_id = %s
-                    """,
-                    (clean_uid,),
-                )
-                row = await cur.fetchone()
-                return dict(row) if isinstance(row, Mapping) else {}
-    except Exception:
-        return {}
+    async with get_db_connection(conn) as db_conn:
+        if isinstance(db_conn, NonCallableMock):
+            return {}
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT model_preference, other_preference
+                FROM user_preferences
+                WHERE user_id = %s
+                """,
+                (clean_uid,),
+            )
+            row = await cur.fetchone()
+            return dict(row) if isinstance(row, Mapping) else {}
+
+
+async def resolve_owner_tier_for_snapshot(
+    user_id: str | None,
+    *,
+    conn: Any = None,
+) -> UserTier:
+    """Resolve an automation owner's tier on ``conn`` without suppressing lookup errors.
+
+    Preserves ``admin`` (``DALTON_PM_USER_IDS``), ``internal`` (``users.email`` in
+    ``DALTON_ALLOWED_EMAILS``), ``external`` (including missing ``users`` row), and
+    ``company`` identity rules on the caller's existing transaction connection so
+    snapshot construction never checks out a second pool connection or falls back to
+    ``external`` on a failed database read.
+    """
+    from src.dalton.company_identity import is_company_system_user
+    from src.dalton.invites import is_invite_pm
+    from src.dalton.settings import get_dalton_allowed_emails
+
+    uid = normalize_scope_text(user_id)
+    if not uid:
+        return "external"
+    if is_company_system_user(uid):
+        return "company"
+    if _access_tiers.is_internal_or_admin is not _DEFAULT_IS_INTERNAL_OR_ADMIN:
+        return (
+            "internal"
+            if bool(await _access_tiers.is_internal_or_admin(uid))
+            else "external"
+        )
+    if _access_tiers.get_user_tier is not _DEFAULT_GET_USER_TIER:
+        return await _access_tiers.get_user_tier(uid)
+    if is_invite_pm(uid):
+        return "admin"
+    if isinstance(conn, NonCallableMock):
+        return "external"
+
+    async with get_db_connection(conn) as db_conn:
+        if isinstance(db_conn, NonCallableMock):
+            return "external"
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT email FROM users WHERE user_id = %s",
+                (uid,),
+            )
+            row = await cur.fetchone()
+
+    raw_email = (
+        row.get("email")
+        if isinstance(row, Mapping)
+        else (row[0] if isinstance(row, (tuple, list)) and row else "")
+    )
+    email = str(raw_email or "").strip().lower()
+    if email and email in get_dalton_allowed_emails():
+        return "internal"
+    return "external"
 
 
 async def resolve_snapshot_notify_fields(
     row: Mapping[str, Any],
     *,
     pref_row: Mapping[str, Any] | None = None,
+    include_chat_targets: bool | None = None,
     conn: Any = None,
 ) -> tuple[bool, list[str]]:
     """Resolve ``(notify_enabled, notify_routes)`` for an automation snapshot.
 
     Uses ``row['notify_storage_mode']`` as the sole selector:
     - ``'task_row'``: read ``notify_enabled`` and ``notify_routes`` from ``row``.
-    - ``'legacy'``: resolve from owner's ``user_preferences`` using the exact
-      same defaults and route intersection rules as ``model_prefs`` and ``dispatch``.
+    - ``'legacy'``: resolve from owner's ``user_preferences`` and owner tier on ``conn``
+      using the exact same defaults and route intersection rules as ``model_prefs``
+      and ``dispatch``.
     """
     storage_mode = str(row.get("notify_storage_mode") or "legacy").strip() or "legacy"
     if storage_mode == "task_row":
@@ -456,7 +516,6 @@ async def resolve_snapshot_notify_fields(
         )
         return enabled, routes
 
-    from src.dalton.access_tiers import is_internal_or_admin
     from src.dalton.llm.model_prefs import (
         DALTON_NOTIFY_ENABLED_KEY,
         DALTON_NOTIFY_OVERRIDES_KEY,
@@ -524,9 +583,12 @@ async def resolve_snapshot_notify_fields(
         row, overrides, routes_map
     )
 
-    try:
-        include_chats = await is_internal_or_admin(owner_id) if owner_id else False
-    except Exception:
+    if include_chat_targets is not None:
+        include_chats = bool(include_chat_targets)
+    elif owner_id:
+        owner_tier = await resolve_owner_tier_for_snapshot(owner_id, conn=conn)
+        include_chats = owner_tier in ("admin", "internal")
+    else:
         include_chats = False
 
     routed = resolve_notify_route_targets(
@@ -611,6 +673,7 @@ async def prepare_update_history_columns(
 
     Returns ``(history_update_columns, is_noop_config)``.
     """
+    from src.dalton.notify.dispatch import is_excluded_automation_for_notify
     from src.dalton.services.company_automations import (
         AutomationVersionConflictError,
         build_automation_config_snapshot,
@@ -631,17 +694,45 @@ async def prepare_update_history_columns(
     if base_pre_row is not None:
         validate_existing_history_state(pre_row)
 
-    eff_pref_row = (
-        dict(pref_row)
-        if isinstance(pref_row, Mapping)
-        else await fetch_user_preferences_unlocked(
-            str(pre_row.get("user_id") or ""), conn=conn
-        )
+    post_row: dict[str, Any] = dict(locked_row)
+    post_row.update(update_fields)
+
+    pre_storage_mode = (
+        str(pre_row.get("notify_storage_mode") or "legacy").strip() or "legacy"
     )
+    post_storage_mode = (
+        str(post_row.get("notify_storage_mode") or "legacy").strip() or "legacy"
+    )
+    pre_needs_legacy = (
+        pre_storage_mode != "task_row" and not is_excluded_automation_for_notify(pre_row)
+    )
+    post_needs_legacy = (
+        post_storage_mode != "task_row" and not is_excluded_automation_for_notify(post_row)
+    )
+
+    owner_id = normalize_scope_text(pre_row.get("user_id") or post_row.get("user_id"))
+    if pre_needs_legacy or post_needs_legacy:
+        eff_pref_row = (
+            dict(pref_row)
+            if isinstance(pref_row, Mapping)
+            else await fetch_user_preferences_unlocked(owner_id, conn=conn)
+        )
+        owner_include_chats: bool | None = (
+            (await resolve_owner_tier_for_snapshot(owner_id, conn=conn))
+            in ("admin", "internal")
+            if owner_id
+            else False
+        )
+    else:
+        eff_pref_row = dict(pref_row) if isinstance(pref_row, Mapping) else {}
+        owner_include_chats = None
 
     pre_once_run_at = await _resolve_effective_once_run_at(pre_row, conn=conn)
     pre_notify_enabled, pre_notify_routes = await resolve_snapshot_notify_fields(
-        pre_row, pref_row=eff_pref_row, conn=conn
+        pre_row,
+        pref_row=eff_pref_row,
+        include_chat_targets=owner_include_chats,
+        conn=conn,
     )
     pre_desired_status = resolve_desired_status_for_snapshot(pre_row)
     pre_snapshot = build_automation_config_snapshot(
@@ -651,9 +742,6 @@ async def prepare_update_history_columns(
         notify_enabled=pre_notify_enabled,
         notify_routes=pre_notify_routes,
     )
-
-    post_row: dict[str, Any] = dict(locked_row)
-    post_row.update(update_fields)
 
     post_trigger_type = str(post_row.get("trigger_type") or "cron").strip() or "cron"
     if post_trigger_type != "once":
@@ -680,7 +768,10 @@ async def prepare_update_history_columns(
         post_desired_status = pre_desired_status
 
     post_notify_enabled, post_notify_routes = await resolve_snapshot_notify_fields(
-        post_row, pref_row=eff_pref_row, conn=conn
+        post_row,
+        pref_row=eff_pref_row,
+        include_chat_targets=owner_include_chats,
+        conn=conn,
     )
     post_snapshot = build_automation_config_snapshot(
         post_row,
