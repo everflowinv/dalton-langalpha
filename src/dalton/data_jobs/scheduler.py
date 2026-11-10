@@ -269,6 +269,35 @@ def _extract_field(row: Any, key: str, index: int = 0) -> Any:
     return row[index]
 
 
+def _locked_def_matches_slot(locked: Any, slot_utc: datetime) -> bool:
+    """True when the locked definition is still due for this cron slot.
+
+    The candidate scan does not lock the row. The enqueue transaction locks it
+    and skips the insert when a pause or schedule change committed after the scan.
+    """
+    if locked is None:
+        return False
+    if not bool(_extract_field(locked, "enabled", 0)):
+        return False
+    if bool(_extract_field(locked, "paused_by_user", 1)):
+        return False
+    runner = str(_extract_field(locked, "runner", 5) or "")
+    if runner not in ("container", "host"):
+        return False
+    cron_expr = str(_extract_field(locked, "cron_expr", 2) or "")
+    tz_name = str(_extract_field(locked, "timezone", 3) or "")
+    try:
+        tz = ZoneInfo(tz_name)
+        return bool(croniter.match(cron_expr, slot_utc.astimezone(tz)))
+    except Exception:
+        logger.error(
+            "Skipping data task enqueue; locked schedule is not usable cron=%r tz=%r",
+            cron_expr,
+            tz_name,
+        )
+        return False
+
+
 async def enqueue_due_cron_tasks(
     conn: Any,
     *,
@@ -299,8 +328,6 @@ async def enqueue_due_cron_tasks(
         job_key = str(task_def["job_key"])
         cron_expr = str(task_def["cron_expr"])
         tz_name = str(task_def["timezone"])
-        timeout_s = task_def.get("timeout_seconds")
-        effective_timeout = int(timeout_s) if timeout_s is not None else DEFAULT_TIMEOUT_SECONDS
 
         try:
             tz = ZoneInfo(tz_name)
@@ -312,11 +339,32 @@ async def enqueue_due_cron_tasks(
         if not croniter.match(cron_expr, local_slot):
             continue
 
-        deadline_utc = slot_utc + timedelta(seconds=effective_timeout)
         new_run_id = str(uuid4())
 
         async with conn.transaction():
             async with conn.cursor(row_factory=dict_row) as cur:
+                # Lock the definition before any run update so this cannot deadlock
+                # with a pause or schedule write, which locks the definition first.
+                await cur.execute(
+                    """
+                    SELECT enabled, paused_by_user, cron_expr, timezone,
+                           timeout_seconds, runner
+                    FROM dalton_data_task_defs
+                    WHERE job_key = %(job_key)s
+                    FOR UPDATE
+                    """,
+                    {"job_key": job_key},
+                )
+                locked = await cur.fetchone()
+                if not _locked_def_matches_slot(locked, slot_utc):
+                    continue
+                locked_timeout = _extract_field(locked, "timeout_seconds", 4)
+                effective_timeout = (
+                    int(locked_timeout)
+                    if locked_timeout is not None
+                    else DEFAULT_TIMEOUT_SECONDS
+                )
+                deadline_utc = slot_utc + timedelta(seconds=effective_timeout)
                 # §2.2.3.A & §3.2.2: if a prior period's queued cron row has not started yet,
                 # mark it skipped_superseded (does NOT increment consecutive_failures)
                 # before inserting the new cycle's queued row.

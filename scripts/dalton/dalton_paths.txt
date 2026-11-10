@@ -265,3 +265,8 @@ tests/integration/dalton/test_au1_company_foundation_db.py
 
 # Computer-scoped automation execution visibility tests.
 tests/unit/server/database/test_last_execution_reach.py
+
+# Company script schedule writes: locked definition update, pause, and resume.
+src/dalton/services/company_script_writes.py
+tests/unit/dalton/test_company_script_writes.py
+tests/integration/dalton/test_company_script_writes_db.py

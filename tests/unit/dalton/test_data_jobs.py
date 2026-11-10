@@ -587,9 +587,20 @@ async def test_queued_slot_wait_vs_low_memory_separation_and_superseded() -> Non
                     }
                 ]
             },
-            # 2. UPDATE old queued run SET status = 'skipped_superseded'
+            # 2. Lock the definition and confirm it is still due
+            {
+                "fetchone": {
+                    "enabled": True,
+                    "paused_by_user": False,
+                    "cron_expr": "*/5 9-16 * * 1-5",
+                    "timezone": "America/New_York",
+                    "timeout_seconds": 240,
+                    "runner": "container",
+                }
+            },
+            # 3. UPDATE old queued run SET status = 'skipped_superseded'
             {"rowcount": 1},
-            # 3. INSERT new queued run
+            # 4. INSERT new queued run
             {"rowcount": 1, "fetchone": {"run_id": "run-new-slot"}},
         ]
     )
@@ -597,10 +608,13 @@ async def test_queued_slot_wait_vs_low_memory_separation_and_superseded() -> Non
     tick_utc = datetime(2026, 11, 6, 15, 5, 10, tzinfo=timezone.utc)
     enqueued = await enqueue_due_cron_tasks(conn_sup, now_utc=tick_utc)
     assert enqueued == ["run-new-slot"]
-    sup_sql, _ = state_sup["executed"][1]
+    lock_sql, _ = state_sup["executed"][1]
+    assert "FOR UPDATE" in lock_sql
+    assert "dalton_data_task_defs" in lock_sql
+    sup_sql, _ = state_sup["executed"][2]
     assert "status = 'skipped_superseded'" in sup_sql
     assert "trigger_source = 'cron'" in sup_sql
-    assert "%(run_id)s::uuid" in state_sup["executed"][2][0]
+    assert "%(run_id)s::uuid" in state_sup["executed"][3][0]
     assert not any("consecutive_failures" in sql for sql, _ in state_sup["executed"])
 
 
@@ -1408,6 +1422,16 @@ async def test_host_runner_tasks_enqueued_and_claimed() -> None:
                     }
                 ]
             },
+            {
+                "fetchone": {
+                    "enabled": True,
+                    "paused_by_user": False,
+                    "cron_expr": "0 10 * * 1-5",
+                    "timezone": "America/New_York",
+                    "timeout_seconds": 900,
+                    "runner": "host",
+                }
+            },
             {"rowcount": 0},  # UPDATE old queued SET skipped_superseded
             {"rowcount": 1, "fetchone": {"run_id": "run-host-enq-1"}},  # INSERT new queued run
         ]
@@ -1456,6 +1480,41 @@ async def test_host_runner_tasks_enqueued_and_claimed() -> None:
     assert claimed.host_mode == "run"
     assert claimed.generation == 2
     assert state_claim["tx_commits"] == 1
+
+
+@pytest.mark.asyncio
+async def test_enqueue_due_cron_skips_when_locked_def_is_paused_or_rescheduled() -> None:
+    """A stale candidate must not enqueue after the locked row is paused or moved."""
+    tick = datetime(2026, 11, 6, 15, 5, tzinfo=timezone.utc)
+    candidate = {
+        "job_key": T18_JOB_KEY,
+        "cron_expr": "*/5 9-16 * * 1-5",
+        "timezone": "America/New_York",
+        "timeout_seconds": 240,
+        "enabled": True,
+        "paused_by_user": False,
+        "runner": "container",
+    }
+    paused, paused_state = _make_autospec_db(
+        [
+            {"fetchall": [candidate]},
+            {"fetchone": {**candidate, "paused_by_user": True, "enabled": True}},
+        ]
+    )
+    assert await enqueue_due_cron_tasks(paused, now_utc=tick) == []
+    assert "FOR UPDATE" in paused_state["executed"][1][0]
+    assert not any("INSERT INTO dalton_data_task_runs" in sql for sql, _ in paused_state["executed"])
+    assert not any("skipped_superseded" in sql for sql, _ in paused_state["executed"])
+
+    moved, moved_state = _make_autospec_db(
+        [
+            {"fetchall": [candidate]},
+            {"fetchone": {**candidate, "cron_expr": "0 0 1 1 *"}},
+        ]
+    )
+    assert await enqueue_due_cron_tasks(moved, now_utc=tick) == []
+    assert "FOR UPDATE" in moved_state["executed"][1][0]
+    assert not any("INSERT INTO dalton_data_task_runs" in sql for sql, _ in moved_state["executed"])
 
 
 @pytest.mark.asyncio
@@ -5611,6 +5670,16 @@ async def test_pr11_manual_run_enqueue_claim_when_disabled_and_preview_only_noti
                     }
                 ]
             },
+            {
+                "fetchone": {
+                    "enabled": True,
+                    "paused_by_user": False,
+                    "cron_expr": "*/5 9-16 * * 1-5",
+                    "timezone": "America/New_York",
+                    "timeout_seconds": 240,
+                    "runner": "container",
+                }
+            },
             {"rowcount": 1},  # UPDATE prior queued cron run -> skipped_superseded
             {"rowcount": 1, "fetchone": {"run_id": "cron-slot-run-1"}},
         ]
@@ -5618,7 +5687,8 @@ async def test_pr11_manual_run_enqueue_claim_when_disabled_and_preview_only_noti
     tick_utc = datetime(2026, 11, 6, 15, 5, 10, tzinfo=timezone.utc)
     enqueued_cron = await enqueue_due_cron_tasks(conn_cron_sup, now_utc=tick_utc)
     assert enqueued_cron == ["cron-slot-run-1"]
-    sup_sql, _ = state_cron_sup["executed"][1]
+    assert "FOR UPDATE" in state_cron_sup["executed"][1][0]
+    sup_sql, _ = state_cron_sup["executed"][2]
     assert "status = 'skipped_superseded'" in sup_sql
     assert "trigger_source = 'cron'" in sup_sql
     assert "trigger_source = 'manual'" not in sup_sql
