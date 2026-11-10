@@ -358,16 +358,17 @@ async def test_per_target_bridge_requests_and_second_claim_failure_marks_first_f
         automation_id: str | None = None,
         payload: dict | None = None,
         stale_pending_minutes: int = 10,
-    ) -> bool:
+        return_attempt_count: bool = False,
+    ) -> bool | tuple[bool, int | None]:
         _ = (user_id, automation_id, payload, stale_pending_minutes)
         if fail_second_claim and target == "discord:user:222222":
             raise RuntimeError("db error on second target claim")
         key = (execution_id, channel, target)
         state = ledger.get(key)
         if state in ("pending", "sent"):
-            return False
+            return (False, None) if return_attempt_count else False
         ledger[key] = "pending"
-        return True
+        return (True, 1) if return_attempt_count else True
 
     async def _fake_mark_target(
         execution_id: str,
@@ -377,9 +378,18 @@ async def test_per_target_bridge_requests_and_second_claim_failure_marks_first_f
         status: str,
         error_code: str | None = None,
         reason: str | None = None,
-        expected_status: str | None = None,
+        expected_status: Any = None,
+        expected_attempt_count: int | None = None,
+        expected_updated_at: Any = None,
+        exclude_uncertain_data_task: bool = False,
     ) -> None:
-        _ = (error_code, reason)
+        _ = (
+            error_code,
+            reason,
+            expected_attempt_count,
+            expected_updated_at,
+            exclude_uncertain_data_task,
+        )
         key = (execution_id, channel, target)
         if expected_status is not None and ledger.get(key) != expected_status:
             return
@@ -394,8 +404,11 @@ async def test_per_target_bridge_requests_and_second_claim_failure_marks_first_f
         targets: list[str],
         text: str,
         card: dict[str, Any] | None = None,
+        images: list[dict[str, Any]] | None = None,
+        *,
+        run_id: str | None = None,
     ) -> dict[str, Any]:
-        _ = (text, card)
+        _ = (text, card, images, run_id)
         post_calls.append(list(targets))
         return {
             "ok": True,
@@ -460,7 +473,10 @@ async def test_per_target_bridge_requests_and_second_claim_failure_marks_first_f
         status: str,
         error_code: str | None = None,
         reason: str | None = None,
-        expected_status: str | None = None,
+        expected_status: Any = None,
+        expected_attempt_count: int | None = None,
+        expected_updated_at: Any = None,
+        exclude_uncertain_data_task: bool = False,
     ) -> None:
         mark_call_idx["n"] += 1
         if mark_call_idx["n"] == 1:
@@ -474,6 +490,9 @@ async def test_per_target_bridge_requests_and_second_claim_failure_marks_first_f
             error_code=error_code,
             reason=reason,
             expected_status=expected_status,
+            expected_attempt_count=expected_attempt_count,
+            expected_updated_at=expected_updated_at,
+            exclude_uncertain_data_task=exclude_uncertain_data_task,
         )
 
     cancellable_mark_fn = create_autospec(
@@ -643,7 +662,15 @@ async def test_retry_failed_notify_deliveries_rechecks_toggles_targets_and_scans
         error_code: str | None = None,
         reason: str | None = None,
         expected_status: Any = None,
+        expected_attempt_count: int | None = None,
+        expected_updated_at: Any = None,
+        exclude_uncertain_data_task: bool = False,
     ) -> bool:
+        _ = (
+            expected_attempt_count,
+            expected_updated_at,
+            exclude_uncertain_data_task,
+        )
         if reason != "attempts_exhausted":
             updated = await mark_target_delivery(
                 execution_id,
@@ -869,8 +896,11 @@ async def test_retry_failed_notify_deliveries_rechecks_toggles_targets_and_scans
         targets: list[str],
         text: str,
         card: dict[str, Any] | None = None,
+        images: list[dict[str, Any]] | None = None,
+        *,
+        run_id: str | None = None,
     ) -> dict[str, Any]:
-        _ = (targets, text, card)
+        _ = (targets, text, card, images, run_id)
         post_started.set()
         return await never_done
 
@@ -941,8 +971,16 @@ async def test_retry_failed_notify_deliveries_rechecks_toggles_targets_and_scans
         status: str,
         error_code: str | None = None,
         reason: str | None = None,
-        expected_status: str | None = None,
+        expected_status: Any = None,
+        expected_attempt_count: int | None = None,
+        expected_updated_at: Any = None,
+        exclude_uncertain_data_task: bool = False,
     ) -> None:
+        _ = (
+            expected_attempt_count,
+            expected_updated_at,
+            exclude_uncertain_data_task,
+        )
         mark_attempts["count"] += 1
         if mark_attempts["count"] == 1:
             mark_entered.set()
