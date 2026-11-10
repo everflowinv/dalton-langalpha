@@ -1,8 +1,19 @@
 {
   "workspace_list": {
     "ok": true,
+    "linked": true,
+    "allowed": true,
+    "dalton_user_id": "user_alice_123",
+    "user_tier": "internal",
     "current_workspace_id": "99999999-8888-7777-6666-555555555555",
+    "current_workspace_name": "Quant Workspace",
+    "is_home": false,
     "home_workspace_id": "00000000-0000-0000-0000-000000000001",
+    "generation": 1,
+    "external_thread_id": "feishu:dm:ou_alice:gen:1",
+    "duplicate": false,
+    "command_effect_status": "done",
+    "command_reply_pending": true,
     "workspaces": [
       {
         "workspace_id": "00000000-0000-0000-0000-000000000001",
@@ -16,20 +27,52 @@
   },
   "workspace_switch_dm": {
     "ok": true,
+    "linked": true,
+    "allowed": true,
+    "dalton_user_id": "user_alice_123",
+    "user_tier": "internal",
     "workspace_id": "99999999-8888-7777-6666-555555555555",
+    "workspace_name": "Quant Workspace",
+    "is_home": false,
     "override_workspace_id": "99999999-8888-7777-6666-555555555555",
+    "home_workspace_id": "00000000-0000-0000-0000-000000000001",
     "generation": 2,
-    "external_thread_id": "feishu:dm:ou_alice:gen:2"
+    "external_thread_id": "feishu:dm:ou_alice:gen:2",
+    "duplicate": false,
+    "command_effect_status": "done",
+    "command_reply_pending": true
   },
   "new_session": {
     "ok": true,
+    "linked": true,
+    "allowed": true,
+    "dalton_user_id": "user_alice_123",
+    "user_tier": "internal",
+    "workspace_id": "00000000-0000-0000-0000-000000000001",
+    "workspace_name": "Chief of Staff",
+    "is_home": true,
+    "override_workspace_id": null,
+    "home_workspace_id": "00000000-0000-0000-0000-000000000001",
     "generation": 2,
-    "external_thread_id": "feishu:dm:ou_alice:gen:2"
+    "external_thread_id": "feishu:dm:ou_alice:gen:2",
+    "duplicate": false,
+    "command_effect_status": "done",
+    "command_reply_pending": true
   },
   "stop_session": {
     "ok": true,
+    "linked": true,
+    "allowed": true,
+    "dalton_user_id": "user_alice_123",
+    "user_tier": "internal",
+    "workspace_id": "99999999-8888-7777-6666-555555555555",
+    "is_home": false,
     "thread_id": "11111111-2222-3333-4444-555555555555",
     "run_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
-    "external_thread_id": "feishu:dm:ou_alice:gen:1"
+    "generation": 1,
+    "external_thread_id": "feishu:dm:ou_alice:gen:1",
+    "duplicate": false,
+    "command_effect_status": "pending_cancel",
+    "command_reply_pending": true
   }
 }

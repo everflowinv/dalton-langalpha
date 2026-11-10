@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
   I1RegisterAndResolveResponse,
   I2BindCodeConsumeResponse,
+  I3SessionCommandResponse,
 } from "../src/backend-client.js";
 import { ChannelDeliveryError } from "../src/channels/adapter.js";
 import { makeInboundRequestKey } from "../src/uuid.js";
@@ -108,21 +109,102 @@ describe("Slash Commands, Attachment Upload (`uploads/...`), Multimodal Images &
     );
   });
 
-  it("keeps a stored command effect when confirmation delivery fails and does not run the command again", async () => {
-    const effects = new Map<string, Record<string, unknown>>();
-    const defaultRegister = vi.mocked(h.backend.registerAndResolveInbound).getMockImplementation()!;
-    vi.mocked(h.backend.registerAndResolveInbound).mockImplementation(async (req) => {
-      const base = await defaultRegister(req);
-      const stored = effects.get(`${req.platform}:${req.message_id}`);
-      return stored
-        ? { ...base, raw_payload: { ...(base.raw_payload ?? {}), ...stored } }
-        : base;
+  it("keeps a stored command result when confirmation delivery fails and does not apply the command again", async () => {
+    type StoredCommand = {
+      applies: number;
+      command_effect_status: string;
+      command_reply_pending: boolean;
+      command_result: I2BindCodeConsumeResponse | I3SessionCommandResponse;
+    };
+    const stored = new Map<string, StoredCommand>();
+    const rowKey = (platform: string, messageId: string) =>
+      `${platform}:${messageId}`;
+
+    const defaultConsume = vi
+      .mocked(h.backend.consumeBindCode)
+      .getMockImplementation()!;
+    vi.mocked(h.backend.consumeBindCode).mockImplementation(async (req) => {
+      const id = req.message_id ? rowKey(req.platform, req.message_id) : null;
+      const existing = id ? stored.get(id) : undefined;
+      if (existing) {
+        return {
+          ...existing.command_result,
+          duplicate: true,
+          command_effect_status: existing.command_effect_status,
+          command_reply_pending: existing.command_reply_pending,
+        };
+      }
+      const fresh: I2BindCodeConsumeResponse =
+        req.action === "bind" && req.is_group
+          ? loadFixtureKey<I2BindCodeConsumeResponse>(
+              "i2_bind_code_consume.json",
+              "bind_revoked_in_group",
+            )
+          : await defaultConsume(req);
+      const persisted: I2BindCodeConsumeResponse = {
+        ...fresh,
+        duplicate: false,
+        command_effect_status: "done",
+        command_reply_pending: true,
+      };
+      if (id) {
+        stored.set(id, {
+          applies: 1,
+          command_effect_status: "done",
+          command_reply_pending: true,
+          command_result: persisted,
+        });
+      }
+      return persisted;
     });
-    const defaultUpdate = vi.mocked(h.backend.updateInboundProgress).getMockImplementation()!;
+
+    const defaultSession = vi
+      .mocked(h.backend.sessionCommand)
+      .getMockImplementation()!;
+    let workspaceApplies = 0;
+    vi.mocked(h.backend.sessionCommand).mockImplementation(async (req) => {
+      const id = req.message_id ? rowKey(req.platform, req.message_id) : null;
+      const existing = id ? stored.get(id) : undefined;
+      if (existing) {
+        return {
+          ...existing.command_result,
+          duplicate: true,
+          command_effect_status: existing.command_effect_status,
+          command_reply_pending: existing.command_reply_pending,
+        };
+      }
+      const fresh = await defaultSession(req);
+      if (req.cmd === "workspace_switch") {
+        workspaceApplies += 1;
+      }
+      if (id) {
+        stored.set(id, {
+          applies: 1,
+          command_effect_status: fresh.command_effect_status ?? "done",
+          command_reply_pending: fresh.command_reply_pending !== false,
+          command_result: fresh,
+        });
+      }
+      return fresh;
+    });
+
+    const defaultUpdate = vi
+      .mocked(h.backend.updateInboundProgress)
+      .getMockImplementation()!;
     vi.mocked(h.backend.updateInboundProgress).mockImplementation(async (req) => {
-      if (req.raw_payload_patch && req.platform && req.message_id) {
-        const key = `${req.platform}:${req.message_id}`;
-        effects.set(key, { ...(effects.get(key) ?? {}), ...req.raw_payload_patch });
+      if (req.platform && req.message_id) {
+        const row = stored.get(rowKey(req.platform, req.message_id));
+        if (row) {
+          if (req.command_effect_status) {
+            row.command_effect_status = req.command_effect_status;
+          }
+          if (req.command_reply_pending !== undefined) {
+            row.command_reply_pending = req.command_reply_pending;
+          }
+          if (req.command_result) {
+            row.command_result = req.command_result;
+          }
+        }
       }
       return defaultUpdate(req);
     });
@@ -144,12 +226,13 @@ describe("Slash Commands, Attachment Upload (`uploads/...`), Multimodal Images &
     });
     await h.feishuAdapter.emitInbound(bindEvent);
     await h.feishuAdapter.emitInbound(bindEvent);
-    expect(vi.mocked(h.backend.consumeBindCode).mock.calls).toHaveLength(1);
+    expect(vi.mocked(h.backend.consumeBindCode).mock.calls).toHaveLength(2);
+    expect(stored.get("feishu:m_bind_retry")?.applies).toBe(1);
     expect(sends).toBe(1);
-    expect(effects.get("feishu:m_bind_retry")?.discord_command_effect).toMatchObject({
-      cmd: "bind",
-      applied: true,
-      reply_delivered: false,
+    expect(stored.get("feishu:m_bind_retry")).toMatchObject({
+      command_effect_status: "done",
+      command_reply_pending: true,
+      command_result: { ok: true, duplicate: false },
     });
 
     const workspaceEvent = {
@@ -157,13 +240,20 @@ describe("Slash Commands, Attachment Upload (`uploads/...`), Multimodal Images &
       messageId: "m_ws_retry",
       text: "/workspace quant",
     };
-    const sessionCallsBefore = vi.mocked(h.backend.sessionCommand).mock.calls.length;
+    const sessionCallsBefore = vi.mocked(h.backend.sessionCommand).mock.calls
+      .length;
     await h.feishuAdapter.emitInbound(workspaceEvent);
     await h.feishuAdapter.emitInbound(workspaceEvent);
-    const workspaceCalls = vi.mocked(h.backend.sessionCommand).mock.calls
-      .slice(sessionCallsBefore)
+    const workspaceCalls = vi
+      .mocked(h.backend.sessionCommand)
+      .mock.calls.slice(sessionCallsBefore)
       .filter(([req]) => req.cmd === "workspace_switch");
-    expect(workspaceCalls).toHaveLength(1);
+    expect(workspaceCalls).toHaveLength(2);
+    expect(workspaceApplies).toBe(1);
+    expect(stored.get("feishu:m_ws_retry")).toMatchObject({
+      command_effect_status: "done",
+      command_reply_pending: true,
+    });
     expect(sends).toBe(2);
 
     h.feishuAdapter.setSendTextBehavior(() => {
@@ -171,10 +261,6 @@ describe("Slash Commands, Attachment Upload (`uploads/...`), Multimodal Images &
         outcome: "failed",
         code: "not_allowed",
       });
-    });
-    vi.mocked(h.backend.consumeBindCode).mockResolvedValueOnce({
-      ok: false,
-      reason: "revoked_in_group",
     });
     const groupBind = {
       ...bindEvent,
@@ -186,15 +272,20 @@ describe("Slash Commands, Attachment Upload (`uploads/...`), Multimodal Images &
       text: "/bind ABC123",
       isGroupTrigger: true,
     };
-    const consumeBeforeGroup = vi.mocked(h.backend.consumeBindCode).mock.calls.length;
+    const consumeBeforeGroup = vi.mocked(h.backend.consumeBindCode).mock.calls
+      .length;
+    const groupTextsBeforeFail = h.feishuAdapter.sentTexts.length;
     await h.feishuAdapter.emitInbound(groupBind);
     await h.feishuAdapter.emitInbound(groupBind);
-    expect(vi.mocked(h.backend.consumeBindCode).mock.calls.length).toBe(consumeBeforeGroup + 1);
-    expect(effects.get("feishu:m_bind_group_retry")?.discord_command_effect).toMatchObject({
-      cmd: "bind",
-      applied: true,
-      reply_delivered: false,
-      terminal_status: "failed",
+    expect(vi.mocked(h.backend.consumeBindCode).mock.calls.length).toBe(
+      consumeBeforeGroup + 2,
+    );
+    expect(stored.get("feishu:m_bind_group_retry")?.applies).toBe(1);
+    expect(h.feishuAdapter.sentTexts.length).toBe(groupTextsBeforeFail);
+    expect(stored.get("feishu:m_bind_group_retry")).toMatchObject({
+      command_effect_status: "done",
+      command_reply_pending: true,
+      command_result: { ok: false, reason: "revoked_in_group" },
     });
 
     h.feishuAdapter.setSendTextBehavior(null);
@@ -202,13 +293,17 @@ describe("Slash Commands, Attachment Upload (`uploads/...`), Multimodal Images &
     await h.feishuAdapter.emitInbound(groupBind);
     expect(h.feishuAdapter.sentTexts.length).toBe(groupTextsBefore + 1);
     expect(h.feishuAdapter.sentTexts.at(-1)?.text).toContain("revoked");
-    expect(vi.mocked(h.backend.consumeBindCode).mock.calls.length).toBe(consumeBeforeGroup + 1);
-    expect(effects.get("feishu:m_bind_group_retry")?.discord_command_effect).toMatchObject({
-      reply_delivered: true,
+    expect(vi.mocked(h.backend.consumeBindCode).mock.calls.length).toBe(
+      consumeBeforeGroup + 3,
+    );
+    expect(stored.get("feishu:m_bind_group_retry")).toMatchObject({
+      command_reply_pending: false,
     });
     await h.feishuAdapter.emitInbound(groupBind);
     expect(h.feishuAdapter.sentTexts.length).toBe(groupTextsBefore + 1);
-    expect(vi.mocked(h.backend.consumeBindCode).mock.calls.length).toBe(consumeBeforeGroup + 1);
+    expect(vi.mocked(h.backend.consumeBindCode).mock.calls.length).toBe(
+      consumeBeforeGroup + 4,
+    );
 
     vi.mocked(h.backend.cancelThreadTurn).mockResolvedValueOnce({ status: 503 });
     const stopEvent = {
@@ -216,12 +311,21 @@ describe("Slash Commands, Attachment Upload (`uploads/...`), Multimodal Images &
       messageId: "m_stop_retry",
       text: "/stop",
     };
-    await expect(h.feishuAdapter.emitInbound(stopEvent)).rejects.toThrow(/not confirmed/i);
-    expect(effects.has("feishu:m_stop_retry")).toBe(false);
+    await h.feishuAdapter.emitInbound(stopEvent);
+    expect(stored.get("feishu:m_stop_retry")).toMatchObject({
+      command_effect_status: "pending_cancel",
+      command_reply_pending: true,
+    });
     expect(vi.mocked(h.backend.cancelThreadTurn).mock.calls).toHaveLength(1);
     await h.feishuAdapter.emitInbound(stopEvent);
     const sentAfterStop = h.feishuAdapter.sentTexts.length;
-    expect(h.feishuAdapter.sentTexts.at(-1)?.text).toContain("Stopped the current run.");
+    expect(h.feishuAdapter.sentTexts.at(-1)?.text).toContain(
+      "Stopped the current run.",
+    );
+    expect(stored.get("feishu:m_stop_retry")).toMatchObject({
+      command_effect_status: "done",
+      command_reply_pending: false,
+    });
     await h.feishuAdapter.emitInbound(stopEvent);
     expect(h.feishuAdapter.sentTexts.length).toBe(sentAfterStop);
     expect(vi.mocked(h.backend.cancelThreadTurn).mock.calls).toHaveLength(2);

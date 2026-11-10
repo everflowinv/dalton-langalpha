@@ -145,6 +145,39 @@ describe("Protocol Contract & Wire Payloads (PROTOCOL.md)", () => {
         });
       }
 
+      if (url.includes("/internal/session/command")) {
+        const cmdFixture = loadFixtureKey<Record<string, unknown>>(
+          "i3_session_command.json",
+          "workspace_switch_dm",
+        );
+        return new Response(JSON.stringify(cmdFixture), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      if (url.includes("/internal/deliveries/authorize-and-claim")) {
+        const claimFixture = loadFixtureKey<Record<string, unknown>>(
+          "i6_authorize_and_claim.json",
+          "claimed_feishu_dm",
+        );
+        return new Response(JSON.stringify(claimFixture), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
+      if (url.includes("/internal/inbound/progress")) {
+        const progFixture = loadFixtureKey<Record<string, unknown>>(
+          "i7_progress_and_reconcile.json",
+          "inbound_progress_default",
+        );
+        return new Response(JSON.stringify(progFixture), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+
       return new Response("event: replay_done\ndata: {\"has_more\":false}\n\n", {
         status: 200,
         headers: { "Content-Type": "text/event-stream" },
@@ -219,6 +252,92 @@ describe("Protocol Contract & Wire Payloads (PROTOCOL.md)", () => {
       "dispatches_liveness_running",
     ).runs[0];
     expect(livenessMap[RUN_ID]).toEqual(expectedRun);
+
+    // 7. `I-3 sessionCommand` forwards atomic command fields (`platform_user_id`, `message_id`, `request_key`, `target_kind`, `workspace_query`, `is_internal_query`)
+    await client.sessionCommand({
+      cmd: "workspace_switch",
+      platform: "feishu",
+      platform_user_id: "ou_alice",
+      chat_type: "dm",
+      chat_address: "feishu:@me",
+      chat_id: "oc_dm_1",
+      scope_key: "dm:ou_alice",
+      message_id: "om_cmd_wire_1",
+      request_key: "rk_cmd_wire_1",
+      raw_payload: { command: "/量化研究 A组" },
+      target_kind: "shortcut_name",
+      workspace_query: "量化研究 A组",
+    });
+    expect(capturedCalls[6]?.url).toBe(
+      "http://127.0.0.1:8000/api/v1/dalton/channels/internal/session/command",
+    );
+    expect(capturedCalls[6]?.body).toMatchObject({
+      cmd: "workspace_switch",
+      platform: "feishu",
+      platform_user_id: "ou_alice",
+      message_id: "om_cmd_wire_1",
+      request_key: "rk_cmd_wire_1",
+      target_kind: "shortcut_name",
+      workspace_query: "量化研究 A组",
+    });
+
+    // 8. `I-6 authorizeAndClaimDelivery` forwards `source_scope_key`, `source_generation`, `activity_origin`
+    await client.authorizeAndClaimDelivery({
+      delivery_key: "fallback:run_wire_1",
+      kind: "fallback",
+      user_id: USER_ID,
+      thread_id: THREAD_ID,
+      run_id: RUN_ID,
+      platform: "feishu",
+      target: "feishu:@me",
+      inbound_message_id: "om_wire_1",
+      has_non_empty_text: true,
+      total_chunks: 1,
+      source_scope_key: "dm:ou_alice",
+      source_generation: 3,
+      activity_origin: "conversation",
+    });
+    expect(capturedCalls[7]?.body).toMatchObject({
+      delivery_key: "fallback:run_wire_1",
+      source_scope_key: "dm:ou_alice",
+      source_generation: 3,
+      activity_origin: "conversation",
+    });
+
+    // 9. `I-7 updateInboundProgress` forwards `command_effect_status`, `command_reply_pending`, and `session_interrupt_update` fields
+    await client.updateInboundProgress({
+      platform: "feishu",
+      message_id: "om_cmd_wire_1",
+      status: "completed",
+      command_effect_status: "done",
+      command_reply_pending: false,
+      session_interrupt_update: {
+        platform: "feishu",
+        scope_key: "dm:ou_alice",
+        dalton_user_id: USER_ID,
+        generation: 3,
+        thread_id: THREAD_ID,
+        run_id: RUN_ID,
+        interrupt_id: "int_wire_1",
+        pending_interrupt: null,
+      },
+    });
+    expect(capturedCalls[8]?.body).toMatchObject({
+      platform: "feishu",
+      message_id: "om_cmd_wire_1",
+      command_effect_status: "done",
+      command_reply_pending: false,
+      session_interrupt_update: {
+        platform: "feishu",
+        scope_key: "dm:ou_alice",
+        dalton_user_id: USER_ID,
+        generation: 3,
+        thread_id: THREAD_ID,
+        run_id: RUN_ID,
+        interrupt_id: "int_wire_1",
+        pending_interrupt: null,
+      },
+    });
   });
 
   it("DeliveryService uses I-6 recipient_id as platform recipient while keeping Dalton userId as X-User-Id for workspace file download", async () => {

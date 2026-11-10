@@ -59,6 +59,11 @@ export class AgentRoutesHandler {
     body: AgentSendRequest,
   ): Promise<{ status: number; data: AgentSendResponse }> {
     const deliveryKey = DeliveryService.makeAgentSendDeliveryKey(body);
+    const hasExplicitTarget =
+      typeof body.target === "string" && body.target.trim().length > 0;
+    const isAutomationSend =
+      typeof body.automation_execution_id === "string" &&
+      body.automation_execution_id.trim().length > 0;
     const result = await this.deliveryService.executeDelivery({
       deliveryKey,
       kind: "agent_send",
@@ -72,6 +77,8 @@ export class AgentRoutesHandler {
       files: body.files ?? [],
       replyToMessageId: null,
       newThread: Boolean(body.new_thread),
+      activityOrigin:
+        isAutomationSend || hasExplicitTarget ? "notification" : "conversation",
     });
     return { status: 200, data: result };
   }
@@ -976,6 +983,7 @@ export class AgentRoutesHandler {
         dalton_user_id: userId,
         chat_type: "dm",
         scope_key: "dm:targets",
+        is_internal_query: true,
       });
       if (wsList.home_workspace_id) {
         ids.add(wsList.home_workspace_id);

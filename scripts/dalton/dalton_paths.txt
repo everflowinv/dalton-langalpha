@@ -175,6 +175,7 @@ tests/integration/dalton/test_data_jobs_db.py
 # CH-1 Phase 1: channel gateway schema (d030), internal persistence APIs (I-1..I-9),
 # frontend channel management APIs, and unit/integration tests.
 src/dalton/migrations/versions/d030_channel_gateway.py
+src/dalton/migrations/versions/d031_channel_session_selection.py
 src/dalton/database/channel_gateway.py
 src/dalton/app/channels_router.py
 tests/unit/dalton/test_channel_gateway.py
@@ -182,6 +183,7 @@ tests/integration/dalton/test_channel_gateway_db.py
 # CH-1 Phase 2: channel gateway core framework, 9 /agent/* endpoints, recovery state machine,
 # channel adapter contract & fake adapter, launchd template, and Vitest suite.
 integrations/dalton-channel-gateway/
+integrations/dalton-channel-gateway/src/commands.ts
 scripts/dalton/launchd/com.dalton.channel-gateway.plist.template
 scripts/dalton/gen_channel_gateway_fixtures.py
 # JPX market-wide and Kioxia daily margin monitor CLI overlay and offline regression tests.
@@ -201,3 +203,9 @@ tests/integration/dalton/test_discord_gateway_db.py
 scripts/dalton/openclaw_overlays/skills/sentiment-dashboard/scripts/run.sh
 scripts/dalton/openclaw_overlays/scripts/sentiment_dashboard_cos_upload.py
 scripts/dalton/openclaw_overlays/scripts/bbg_remote_refresh.sh
+scripts/dalton/openclaw_overlays/scripts/cron_command_tasks.py
+tests/unit/dalton/test_t26_task_preview.py
+# Sentiment dashboard: per-series observation dates and the missing-volume note.
+scripts/dalton/openclaw_overlays/skills/sentiment-dashboard/scripts/us_market_sections.py
+scripts/dalton/openclaw_overlays/skills/sentiment-dashboard/scripts/sentiment_dashboard_cli.py
+tests/unit/dalton/test_sentiment_observation_dates.py

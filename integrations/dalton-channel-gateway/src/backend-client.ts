@@ -1,3 +1,4 @@
+import type { SessionCommandTargetKind } from "./commands.js";
 import type {
   AutomationRunTargetRecord,
   ChannelPlatform,
@@ -5,6 +6,15 @@ import type {
   PendingInterruptState,
   UploadedAttachmentRecord,
 } from "./types.js";
+
+export type { SessionCommandTargetKind };
+
+export type DeliveryActivityOrigin =
+  | "conversation"
+  | "replay"
+  | "notification"
+  | "command"
+  | "none";
 
 // ---------------------------------------------------------------------------
 // SSE Stream Parser
@@ -162,6 +172,11 @@ export interface I2BindCodeConsumeRequest {
   code?: string | null;
   is_group: boolean;
   user_id?: string | null;
+  message_id?: string | null;
+  chat_type?: "dm" | "group" | string | null;
+  chat_address?: string | null;
+  scope_key?: string | null;
+  request_key?: string | null;
 }
 
 export interface I2BindCodeConsumeResponse {
@@ -178,12 +193,16 @@ export interface I2BindCodeConsumeResponse {
   platform_user_id?: string;
   generation?: number;
   generations?: Record<string, number>;
+  duplicate?: boolean;
+  command_effect_status?: string | null;
+  command_reply_pending?: boolean;
 }
 
 export interface I3SessionCommandRequest {
   cmd: "workspace_list" | "workspace_switch" | "new" | "stop";
   platform: ChannelPlatform;
-  dalton_user_id: string;
+  dalton_user_id?: string | null;
+  platform_user_id?: string | null;
   chat_type: "dm" | "group";
   chat_address?: string;
   chat_id?: string;
@@ -191,27 +210,49 @@ export interface I3SessionCommandRequest {
   scope_key: string;
   workspace_id?: string | null;
   workspace_query?: string | null;
+  target_kind?: SessionCommandTargetKind | null;
   external_thread_id?: string | null;
+  message_id?: string | null;
+  request_key?: string | null;
+  raw_payload?: Record<string, unknown> | null;
+  weixin_context_token?: string | null;
+  is_internal_query?: boolean;
 }
 
 export interface I3SessionCommandResponse {
   ok: boolean;
+  linked?: boolean;
+  allowed?: boolean;
+  dalton_user_id?: string | null;
+  user_tier?: string | null;
+  duplicate?: boolean;
+  is_home?: boolean;
   deny_reason?:
+    | "not_linked"
     | "external_member_group_forbidden"
     | "workspace_not_found"
+    | "workspace_ambiguous"
     | "workspace_write_denied"
     | "colleague_dispatch_disabled"
     | string;
+  candidates?: Array<{ workspace_id: string; name: string }>;
   current_workspace_id?: string | null;
+  current_workspace_name?: string | null;
   home_workspace_id?: string | null;
   workspaces?: Array<{ workspace_id: string; name: string }>;
   workspace_id?: string | null;
+  workspace_name?: string | null;
   override_workspace_id?: string | null;
   bound_workspace_id?: string | null;
   generation?: number;
   external_thread_id?: string | null;
   thread_id?: string | null;
   run_id?: string | null;
+  command_effect_status?: string | null;
+  command_reply_pending?: boolean;
+  /** HTTP status from a permanent `/stop` cancel denial, kept with the command result. */
+  stop_cancel_status?: number | null;
+  switched?: boolean;
 }
 
 export interface I4StateResponse {
@@ -292,6 +333,9 @@ export interface I6AuthorizeAndClaimRequest {
   inbound_message_id?: string | null;
   has_non_empty_text: boolean;
   total_chunks: number;
+  source_scope_key?: string | null;
+  source_generation?: number | null;
+  activity_origin?: DeliveryActivityOrigin | null;
 }
 
 export interface I6AuthorizeAndClaimResponse {
@@ -318,6 +362,9 @@ export interface I6AuthorizeAndClaimResponse {
   is_current?: boolean;
   home_workspace_id?: string;
   weixin_context_token?: string | null;
+  source_scope_key?: string | null;
+  source_generation?: number | null;
+  activity_origin?: string | null;
 }
 
 export interface I7DeliveriesProgressRequest {
@@ -368,6 +415,10 @@ export interface I7InboundProgressRequest {
   resubmitted_request_key?: string | null;
   steered_into_run_id?: string | null;
   fallback_pending?: boolean;
+  command_effect_status?: string | null;
+  command_reply_pending?: boolean;
+  /** Replaces the stored command result. A `/stop` cancel denial is recorded here. */
+  command_result?: I3SessionCommandResponse | null;
   uploaded_attachments?: UploadedAttachmentRecord[];
   raw_payload?: Record<string, unknown>;
   raw_payload_patch?: Record<string, unknown>;
@@ -375,6 +426,10 @@ export interface I7InboundProgressRequest {
     platform: string;
     scope_key: string;
     dalton_user_id: string;
+    generation?: number | null;
+    thread_id?: string | null;
+    run_id?: string | null;
+    interrupt_id?: string | null;
     pending_interrupt: PendingInterruptState | null;
   };
   background_run?: {
@@ -396,6 +451,7 @@ export interface I7InboundProgressRequest {
     generation?: number;
     last_seen_turn_index?: number;
     watch_active?: boolean;
+    pending_interrupt?: PendingInterruptState | null;
   };
 }
 
@@ -406,6 +462,7 @@ export interface I7InboundProgressResponse {
   has_unknown_current_text: boolean;
   has_in_flight_or_unknown_current_text: boolean;
   sent_to_current_count: number;
+  session_is_current_for_interrupt?: boolean | null;
 }
 
 export interface I7SteersReconcileRequest {
@@ -446,6 +503,13 @@ export interface RecoverInboundEventRow {
   workspace_id: string | null;
   external_thread_id: string | null;
   generation?: number;
+  session_generation?: number | null;
+  event_kind?: "message" | "command" | string;
+  command_request?: Record<string, unknown> | null;
+  command_result?: I3SessionCommandResponse | null;
+  command_effect_status?: string | null;
+  command_reply_pending?: boolean;
+  pending_interrupt_snapshot?: PendingInterruptState | null;
   status: InboundEventStatus;
   fallback_pending: boolean;
   sent_to_current_count: number;
@@ -464,7 +528,8 @@ export interface RecoverBackgroundRunRow {
   target_address: string;
   scope_key?: string | null;
   thread_scope_key?: string | null;
-  generation?: number;
+  generation?: number | null;
+  session_generation?: number | null;
   turn_index: number | null;
   status: "streaming" | "running" | "completed" | "failed";
   fallback_pending: boolean;
@@ -481,6 +546,7 @@ export interface RecoverThreadWatchRow {
   generation: number;
   last_seen_turn_index: number;
   watch_active: boolean;
+  pending_interrupt?: PendingInterruptState | null;
 }
 
 export interface RecoverAutomationRunRow {
