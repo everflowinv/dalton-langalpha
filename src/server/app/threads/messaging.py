@@ -775,6 +775,20 @@ async def _handle_send_message(
 
         request = await inline_image_urls(request)
 
+        # DALTON-HOOK(chat-large-upload): enforce 30/60 MiB inline budget, 5-attachment cap,
+        # and verify/claim server-stored chat_upload references before opening the SSE stream.
+        if request.additional_context and not request.hitl_response:
+            from src.dalton.services.chat_uploads import (
+                validate_and_claim_request_attachments,
+            )
+
+            await validate_and_claim_request_attachments(
+                request.additional_context,
+                user_id=user_id,
+                workspace_id=workspace_id,
+                is_existing_colleague_thread=is_existing_colleague_thread,
+            )
+
         await route.bind(user_id, workspace)
 
     except BaseException:

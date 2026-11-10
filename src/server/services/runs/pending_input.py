@@ -297,18 +297,41 @@ async def input_rerun_request(
     """
     from src.server.database.conversation.queries import get_query_at_turn
 
-    if pending.resend or (pending.context and not (body and body.additional_context)):
+    if pending.resend:
         raise _resend_required()
     query = await get_query_at_turn(thread_id, failed_run["turn_index"])
     if query is None:
         raise _message_gone()
+    resolved_context = body.additional_context if body and body.additional_context else None
+    # DALTON-HOOK(chat-large-upload): recover server-stored chat_upload references from query metadata on retry after reload
+    if pending.context and not resolved_context:
+        qmeta = query.get("metadata") or {}
+        stored_ctx = qmeta.get("additional_context") or []
+        stored_atts = qmeta.get("attachments") or []
+        has_chat_upload = any(
+            isinstance(c, dict) and c.get("type") == "chat_upload"
+            for c in stored_ctx
+        )
+        only_stored_atts = all(
+            isinstance(a, dict) and bool(a.get("upload_id"))
+            for a in stored_atts
+        )
+        if (
+            has_chat_upload
+            and only_stored_atts
+            and not qmeta.get("widget_contexts")
+            and not qmeta.get("chart_selections")
+        ):
+            resolved_context = stored_ctx
+        else:
+            raise _resend_required()
     run_meta = failed_run.get("metadata") or {}
     return ChatRequest(
         workspace_id=workspace_id,
         messages=[{"role": "user", "content": query["content"]}],
         **_stored_turn_fields(query),
         checkpoint_id=pending.checkpoint_id,
-        additional_context=body.additional_context if body else None,
+        additional_context=resolved_context,
         locale=run_meta.get("locale"),
         timezone=run_meta.get("timezone"),
         subagents_enabled=run_meta.get("subagents_enabled"),

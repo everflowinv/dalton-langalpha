@@ -130,6 +130,7 @@ async def execute_steer(job: dict) -> None:
         return
 
     if sender == "user":
+        # DALTON-HOOK(chat-large-upload): preserve server-stored chat_upload references when a parked steer becomes a turn
         body = {
             "messages": [{"role": "user", "content": payload.get("content") or ""}],
             "workspace_id": workspace_id,
@@ -139,6 +140,7 @@ async def execute_steer(job: dict) -> None:
             "request_key": payload.get("request_key") or steer_request_key(job_id),
             "steer_job_id": job_id,
             "artifact_comments": payload.get("artifact_comments"),
+            "additional_context": payload.get("chat_uploads") or None,
         }
     else:
         body = await _agent_steer_body(payload, job_id, workspace_id, thread_id)

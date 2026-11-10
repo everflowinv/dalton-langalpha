@@ -40,7 +40,7 @@ async def get_file_tree(workspace_id: str) -> list[dict[str, Any]]:
     Returns flat list of file metadata (no content).
     """
     files = await get_files_for_workspace(workspace_id, include_content=False)
-    return [
+    entries = [
         {
             "path": f["file_path"],
             "name": f["file_name"],
@@ -51,6 +51,17 @@ async def get_file_tree(workspace_id: str) -> list[dict[str, Any]]:
         }
         for f in files
     ]
+    # DALTON-HOOK(chat-large-upload): include retained >100 MiB chat uploads in offline file tree
+    from src.dalton.services.chat_uploads import (
+        list_retained_workspace_file_tree_entries,
+    )
+
+    known_paths = {item["path"] for item in entries}
+    for extra in await list_retained_workspace_file_tree_entries(workspace_id):
+        if extra["path"] not in known_paths:
+            entries.append(extra)
+            known_paths.add(extra["path"])
+    return entries
 
 
 async def get_file_content(

@@ -1,6 +1,7 @@
 import { useState } from 'react'; // DALTON-HOOK(composer-attachment-preview)
 import type { ButtonHTMLAttributes, CSSProperties, ReactNode, Ref } from 'react';
-import { FileText, X } from 'lucide-react';
+// DALTON-HOOK(chat-large-upload): RotateCcw icon for failed upload retry
+import { FileText, RotateCcw, X } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Loader } from '@/components/ui/loader';
@@ -26,10 +27,25 @@ const formatFileSize = (bytes: number): string => {
 /* --- FILE PREVIEW CARD ---
  * Its root is a motion element: rendered as a child of an AnimatePresence, it
  * plays CHIP_PRESENCE on the way in and on the way out. */
-export const FilePreviewCard = ({ file, onRemove }: { file: FileAttachment; onRemove: (id: string) => void }) => {
+// DALTON-HOOK(chat-large-upload): show chunked upload progress, cancel/remove, and failure + retry
+export const FilePreviewCard = ({
+  file,
+  onRemove,
+  onRetry,
+}: {
+  file: FileAttachment;
+  onRemove: (id: string) => void;
+  onRetry?: (id: string) => void;
+}) => {
   const { t } = useTranslation();
   const isMobilePreview = useIsMobile();
   const isImage = file.type.startsWith('image/') && file.preview;
+  const isError = file.uploadStatus === 'error';
+  const isUploading = file.uploadStatus === 'uploading';
+  const progressPct =
+    typeof file.uploadProgress === 'number'
+      ? Math.max(0, Math.min(100, Math.round(file.uploadProgress)))
+      : null;
   // DALTON-HOOK(composer-attachment-preview): the thumbnail opens the shared
   // ImageLightbox, the one workspace images already use — the 96px card alone
   // gave no way to look at an attached image again. A double click re-sets the
@@ -39,7 +55,12 @@ export const FilePreviewCard = ({ file, onRemove }: { file: FileAttachment; onRe
   return (
     <motion.div
       {...CHIP_PRESENCE}
-      className="relative group shrink-0 w-24 h-24 rounded-xl overflow-hidden border border-(--color-border-muted) bg-(--color-bg-elevated) transition-colors hover:border-(--color-border-default)"
+      className={cn(
+        'relative group shrink-0 w-24 h-24 rounded-xl overflow-hidden border bg-(--color-bg-elevated) transition-colors',
+        isError
+          ? 'border-(--color-border-loss)'
+          : 'border-(--color-border-muted) hover:border-(--color-border-default)',
+      )}
     >
       {isImage ? (
         <button
@@ -91,16 +112,63 @@ export const FilePreviewCard = ({ file, onRemove }: { file: FileAttachment; onRe
         type="button"
         onClick={(e) => { e.stopPropagation(); onRemove(file.id); }}
         aria-label={t('chat.composer.remove')}
-        className={`absolute top-1 right-1 p-1 bg-black/50 hover:bg-black/70 rounded-full text-white transition-opacity ${isMobilePreview ? 'opacity-60' : 'opacity-0 group-hover:opacity-100'}`}
+        className={`z-20 absolute top-1 right-1 p-1 bg-black/60 hover:bg-black/80 rounded-full text-white transition-opacity ${
+          isMobilePreview || isUploading || isError ? 'opacity-100' : 'opacity-0 group-hover:opacity-100'
+        }`}
       >
         <X className="w-3 h-3" />
       </button>
 
-      {/* Upload Status — pointer-events-none so the preview and remove clicks
-          stay live mid-upload (the preview is allowed while uploading). */}
-      {file.uploadStatus === 'uploading' && (
-        <div className="absolute inset-0 bg-black/40 flex items-center justify-center pointer-events-none">
-          <Loader size={20} label={t('chat.composer.uploading')} className="text-white" />
+      {/* DALTON-HOOK(chat-large-upload): Upload progress & error retry overlays */}
+      {isUploading && (
+        <div
+          data-testid="attachment-uploading"
+          className="absolute inset-0 z-10 bg-black/55 flex flex-col items-center justify-center gap-1 pointer-events-none"
+        >
+          <Loader size={18} label={t('chat.composer.uploading')} className="text-white" />
+          {progressPct !== null && (
+            <span className="text-[0.625rem] font-medium tabular-nums text-white">
+              {progressPct}%
+            </span>
+          )}
+          {progressPct !== null && (
+            <div className="absolute inset-x-0 bottom-0 h-1 bg-white/20">
+              <div
+                className="h-full transition-[width]"
+                style={{
+                  width: `${progressPct}%`,
+                  background: 'var(--color-accent-primary)',
+                }}
+              />
+            </div>
+          )}
+        </div>
+      )}
+
+      {isError && (
+        <div
+          data-testid="attachment-upload-error"
+          title={file.errorMessage || t('chat.composer.uploadFailed')}
+          className="absolute inset-0 z-10 bg-black/75 flex flex-col items-center justify-center gap-1.5 px-1.5 text-center"
+        >
+          <span className="text-[0.625rem] font-medium leading-tight text-(--color-loss) line-clamp-2">
+            {t('chat.composer.uploadFailed')}
+          </span>
+          {onRetry && (
+            <button
+              type="button"
+              data-testid="attachment-retry-upload"
+              onClick={(e) => {
+                e.stopPropagation();
+                onRetry(file.id);
+              }}
+              aria-label={t('chat.composer.retryUpload')}
+              className="inline-flex items-center gap-1 rounded-md bg-white/15 hover:bg-white/25 px-2 py-0.5 text-[0.625rem] font-medium text-white transition-colors"
+            >
+              <RotateCcw className="w-2.5 h-2.5" />
+              <span>{t('chat.composer.retryUpload')}</span>
+            </button>
+          )}
         </div>
       )}
 

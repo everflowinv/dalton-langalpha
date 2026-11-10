@@ -2155,8 +2155,9 @@
     "changeFailed": "Couldn't change sharing. Please try again."
   },
   "chat": {
-    "attachmentTooLarge": "{{name}} is over {{max}} MB and was not attached. Upload larger files from the file panel.",
-    "attachmentsTotalTooLarge": "{{name}} was not attached: this message's attachments would exceed {{max}} MB in total. Upload more files from the file panel.",
+    "attachmentEmpty": "{{name}} is empty and was not attached.",
+    "attachmentTooLarge": "{{name}} exceeds the {{max}} MB limit and was not attached.",
+    "attachmentsTotalTooLarge": "{{name}} was not attached: attachments in one message cannot exceed {{max}} MB in total.",
     "artifactComments": {
       "sendFailed": "These did not send, so they are still queued.",
       "message": {
@@ -2236,6 +2237,8 @@
       "messageLabel": "Message to the agent",
       "dropFiles": "Drop files to upload",
       "uploading": "Uploading",
+      "uploadFailed": "Upload failed",
+      "retryUpload": "Retry",
       "inFlightDraftRestored": "Your last send may already have gone through. Check the conversation before sending it again.",
       "draftAttachmentsRestored": "Attachments are not kept in drafts — add them again before sending.",
       "inFlightDraftRestore": "Put back into the message box",

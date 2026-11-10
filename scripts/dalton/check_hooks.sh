@@ -356,6 +356,9 @@ ALLOWED_HOOKS=(
   "ui-model-pick"
   # Forked replies keep a unique bubble identifier throughout checkpoint loading.
   "fork-message-identifiers"
+  # Chat composer large-file multipart uploads (<=200 MiB) stored under chat-uploads/
+  # and materialized into sandbox work/uploads/ without inline base64 payloads.
+  "chat-large-upload"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

@@ -352,6 +352,9 @@ async def astream_ptc_workflow(
             )
             # Admit a fresh turn, steer the running one, or 409 — see
             # ``wait_or_steer``; who may steer at all is ``steer_allowed``.
+            # DALTON-HOOK(chat-large-upload): carry validated chat_upload descriptors on steers
+            from src.dalton.services.chat_uploads import extract_chat_upload_contexts
+
             admit = partial(
                 wait_or_steer,
                 manager,
@@ -370,6 +373,8 @@ async def astream_ptc_workflow(
                     request, dispatched=dispatched, steerable=steerable
                 ),
                 artifact_comments=request.artifact_comments,
+                chat_uploads=extract_chat_upload_contexts(request.additional_context)
+                or None,
             )
             if held_by is None:
                 ready, steering_event = await admit()
@@ -489,12 +494,33 @@ async def astream_ptc_workflow(
             )
             if request.additional_context and not request.hitl_response:
                 multimodal_ctxs = parse_multimodal_contexts(request.additional_context)
+                # DALTON-HOOK(chat-large-upload): record history attachment metadata for server-stored chat_upload items
+                from src.dalton.services.chat_uploads import (
+                    build_chat_upload_history_metadata,
+                    extract_chat_upload_contexts,
+                )
+
+                chat_upload_ctxs = extract_chat_upload_contexts(
+                    request.additional_context
+                )
                 # A retry writes no query row, so a second upload would be
                 # stored for nothing.
-                if multimodal_ctxs and not request.retry_of_run_id:
-                    query_metadata["attachments"] = await build_attachment_metadata(
-                        multimodal_ctxs, thread_id
-                    )
+                if (multimodal_ctxs or chat_upload_ctxs) and not request.retry_of_run_id:
+                    att_meta: list[dict] = []
+                    if multimodal_ctxs:
+                        att_meta.extend(
+                            await build_attachment_metadata(multimodal_ctxs, thread_id)
+                        )
+                    if chat_upload_ctxs:
+                        att_meta.extend(
+                            await build_chat_upload_history_metadata(
+                                request.additional_context,
+                                user_id=user_id,
+                                workspace_id=workspace_id,
+                            )
+                        )
+                    if att_meta:
+                        query_metadata["attachments"] = att_meta
                 if widget_ctxs:
                     query_metadata["widget_contexts"] = (
                         serialize_widget_contexts_for_metadata(widget_ctxs)
@@ -776,6 +802,18 @@ async def astream_ptc_workflow(
         # One relay session per directly bound server, held for the run.
         direct_mcp = inputs.direct_mcp
 
+        # DALTON-HOOK(chat-large-upload): ensure retained chat uploads exist on disk for future turns
+        if session and session.sandbox:
+            from src.dalton.services.chat_uploads import (
+                ensure_workspace_chat_uploads_present,
+            )
+
+            await ensure_workspace_chat_uploads_present(
+                workspace_id,
+                session.sandbox,
+                project=project,
+            )
+
         # The user's other computers this turn's calls run on, which its end
         # backs up beside its own.
         reached_computers: set[str] = set()
@@ -877,8 +915,17 @@ async def astream_ptc_workflow(
         )
 
         # Multimodal Context Injection
+        # DALTON-HOOK(chat-large-upload): pass caller and workspace identity for verified chat_upload materialization
         messages = await attach_request_files(
-            messages, request, session, effective_model, config, project=project
+            messages,
+            request,
+            session,
+            effective_model,
+            config,
+            project=project,
+            user_id=user_id,
+            workspace_id=workspace_id,
+            is_existing_colleague_thread=(workspace_owner_id != str(user_id)),
         )
 
         # Build input state or resume command

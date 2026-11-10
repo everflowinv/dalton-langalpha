@@ -2189,8 +2189,9 @@
     "changeFailed": "无法更改分享设置，请重试。"
   },
   "chat": {
-    "attachmentTooLarge": "{{name}} 超过 {{max}} MB，没有添加。更大的文件请从文件面板上传。",
-    "attachmentsTotalTooLarge": "{{name}} 没有添加：单条消息的附件总大小不能超过 {{max}} MB。更多文件请从文件面板上传。",
+    "attachmentEmpty": "{{name}} 是空文件，未添加。",
+    "attachmentTooLarge": "{{name}} 超过 {{max}} MB 上限，未添加。",
+    "attachmentsTotalTooLarge": "{{name}} 未添加：单条消息的附件总大小不能超过 {{max}} MB。",
     "artifactComments": {
       "sendFailed": "这些评论未能发送，仍在待发送中。",
       "message": {
@@ -2265,6 +2266,8 @@
       "messageLabel": "发给 Agent 的消息",
       "dropFiles": "拖放文件以上传",
       "uploading": "上传中",
+      "uploadFailed": "上传失败",
+      "retryUpload": "重试",
       "inFlightDraftRestored": "上次发送可能已被受理，发送前请先确认对话里是否已经有这条消息。",
       "draftAttachmentsRestored": "草稿不保留附件，重新发送前请重新添加。",
       "inFlightDraftRestore": "放回输入框",

@@ -352,7 +352,24 @@ async def _take_steers(
             f"[REPORT_STEER] Taking steers for {thread_id} failed", exc_info=True
         )
         return []
-    steers = [_steer_offer(job) for job in jobs if str(job["hook_outbox_id"]) in held]
+    # DALTON-HOOK(chat-large-upload): materialize chat_uploads on held steers before handing to live turn
+    from src.dalton.services.chat_uploads import materialize_steered_chat_uploads
+
+    steers: list[SteeredReport] = []
+    for job in jobs:
+        if str(job["hook_outbox_id"]) not in held:
+            continue
+        payload = job.get("payload") or {}
+        reminder = ""
+        if payload.get("chat_uploads"):
+            try:
+                reminder = await materialize_steered_chat_uploads(payload)
+            except Exception:
+                logger.warning(
+                    f"[REPORT_STEER] Materializing steered chat_uploads for {thread_id} failed",
+                    exc_info=True,
+                )
+        steers.append(_steer_offer(job, extra_content=reminder))
     if steers:
         logger.info(
             f"[REPORT_STEER] Thread {thread_id} run {run_id} took {len(steers)} "
@@ -361,12 +378,13 @@ async def _take_steers(
     return steers
 
 
-def _steer_offer(job: dict) -> SteeredReport:
+def _steer_offer(job: dict, *, extra_content: str = "") -> SteeredReport:
     payload = job.get("payload") or {}
     artifact_comments = payload.get("artifact_comments")
+    base_content = payload.get("content") or ""
     return SteeredReport(
         job_id=str(job["hook_outbox_id"]),
-        content=payload.get("content") or "",
+        content=f"{base_content}{extra_content}" if extra_content else base_content,
         kind="steer",
         shown={"artifact_comments": artifact_comments} if artifact_comments else {},
         sender=payload.get("sender") or "user",

@@ -196,6 +196,8 @@ async def wait_or_steer(
     steer_job_id: str | None = None,
     agent: AgentSteer | None = None,
     artifact_comments: ShownSend | None = None,
+    # DALTON-HOOK(chat-large-upload): carry validated chat_upload descriptors on steers
+    chat_uploads: list[dict] | None = None,
 ) -> tuple[bool, str | HandOffSteered | None]:
     """Admit a new turn, steer the running one, or 409.
 
@@ -268,6 +270,7 @@ async def wait_or_steer(
             )
 
         active_run_id = str(active_row["conversation_response_id"])
+        # DALTON-HOOK(chat-large-upload): persist chat_upload descriptors in steer outbox payload
         payload = steer_payload(
             user_input,
             user_id,
@@ -277,6 +280,7 @@ async def wait_or_steer(
             request_key=request_key,
             origin=agent.origin if agent else None,
             artifact_comments=artifact_comments,
+            chat_uploads=chat_uploads,
         )
         if agent is not None:
             idempotency_key = agent.idempotency_key

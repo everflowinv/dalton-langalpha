@@ -2,6 +2,8 @@ import { Bot, HardDriveDownload, Shrink, Terminal } from 'lucide-react';
 import type { ChipContext, FileMention, QuoteContext, SlashCommand } from './chat-input.types';
 import type { ModelMetadataEntry } from '@/hooks/useFilteredModels';
 import { TWEEN } from '@/lib/motion';
+// DALTON-HOOK(chat-large-upload): re-export large-upload limits alongside inline caps
+import { MAX_CHAT_UPLOAD_FILE_SIZE, MAX_TOTAL_CHAT_UPLOAD_BYTES } from '@/lib/dalton/chatUploadClient';
 
 /** Return the appropriate icon for a slash command. */
 export function getSlashCommandIcon(cmd: SlashCommand, className: string) {
@@ -70,6 +72,9 @@ export const MAX_FILE_SIZE = 30 * 1024 * 1024;
 // payload — a single file may pass MAX_FILE_SIZE yet push the total past what
 // the request can carry. Files past the budget are not added.
 export const MAX_TOTAL_ATTACHMENTS_BYTES = 60 * 1024 * 1024;
+// DALTON-HOOK(chat-large-upload): per-file (200 MiB) and per-message (600 MiB) caps for stored uploads;
+// MAX_FILE_SIZE (30 MiB) and MAX_TOTAL_ATTACHMENTS_BYTES (60 MiB) remain the inline base64 budget.
+export { MAX_CHAT_UPLOAD_FILE_SIZE, MAX_TOTAL_CHAT_UPLOAD_BYTES };
 export const MAX_FILES = 5;
 export const PASTE_PILL_MIN_CHARS = 1500;
 export const PASTE_PILL_MIN_LINES = 15;

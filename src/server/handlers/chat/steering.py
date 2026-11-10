@@ -84,6 +84,8 @@ def steer_payload(
     request_key: str | None = None,
     origin: dict | None = None,
     artifact_comments: ShownSend | None = None,
+    # DALTON-HOOK(chat-large-upload): carry lightweight chat_upload references (never file bytes)
+    chat_uploads: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """A main-thread steer job's payload, before any lifecycle key.
 
@@ -107,6 +109,8 @@ def steer_payload(
     }
     if artifact_comments is not None:
         payload["artifact_comments"] = artifact_comments.model_dump(mode="json")
+    if chat_uploads:
+        payload["chat_uploads"] = chat_uploads
     return payload
 
 

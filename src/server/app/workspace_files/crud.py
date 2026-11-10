@@ -1827,4 +1827,16 @@ async def delete_workspace_files(
                                 }
                             )
 
+        # DALTON-HOOK(chat-large-upload): retire and clean retained chat uploads when explicitly deleted
+        if deleted:
+            from src.dalton.services.chat_uploads import (
+                retire_deleted_workspace_chat_uploads,
+            )
+
+            await retire_deleted_workspace_chat_uploads(
+                workspace_id=workspace_id,
+                caller_user_id=x_user_id,
+                deleted_client_paths=deleted,
+            )
+
     return {"deleted": deleted, "errors": errors}

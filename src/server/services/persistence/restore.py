@@ -265,6 +265,15 @@ async def _restore_locked(
         logger.info(f"No files to restore for workspace {workspace_id}")
         result = {"restored": 0, "errors": 0}
 
+    # DALTON-HOOK(chat-large-upload): rematerialize >100 MiB chat uploads missing after cold recreate
+    from src.dalton.services.chat_uploads import rematerialize_workspace_chat_uploads
+
+    chat_upload_res = await rematerialize_workspace_chat_uploads(
+        workspace_id, sandbox, layout=layout, conn=conn
+    )
+    result["restored"] += chat_upload_res["restored"]
+    result["errors"] += chat_upload_res["errors"]
+
     complete = result["errors"] == 0
 
     # The marker only claims "this sandbox has been populated", so it
@@ -931,9 +940,17 @@ async def folder_waits_on_owner(
         return False
     if offered:
         return True
-    if not await workspace_has_backup(
+    # DALTON-HOOK(chat-large-upload): retained chat uploads count alongside workspace_files backups
+    from src.dalton.services.chat_uploads import has_retained_workspace_chat_uploads
+
+    has_db_backup = await workspace_has_backup(workspace_id, conn=conn)
+    has_chat_uploads = await has_retained_workspace_chat_uploads(
         workspace_id, conn=conn
-    ) or await _folder_keeps_backed_up_files(workspace_id, sandbox, layout, conn):
+    )
+    if not (has_db_backup or has_chat_uploads) or (
+        not has_chat_uploads
+        and await _folder_keeps_backed_up_files(workspace_id, sandbox, layout, conn)
+    ):
         # Nothing to restore, or only the marker went (a ``git clean``, a stray
         # delete): the folder is still the owner's, so it is mirrored again.
         await sandbox.aupload_file_bytes(
@@ -1006,7 +1023,11 @@ async def maybe_restore(
         raise RestoreGuardUnavailable(
             f"Could not read the manifest for workspace {workspace_id}: {e}"
         ) from e
-    if not files:
+    # DALTON-HOOK(chat-large-upload): run restore_to_sandbox when retained >100 MiB chat uploads exist
+    from src.dalton.services.chat_uploads import has_retained_workspace_chat_uploads
+
+    has_chat_uploads = await has_retained_workspace_chat_uploads(workspace_id)
+    if not files and not has_chat_uploads:
         # Nothing to restore, so the sandbox trivially matches the
         # manifest — record it, or every start repeats this check.
         # The flag goes first: it is the half that gates deletion, and

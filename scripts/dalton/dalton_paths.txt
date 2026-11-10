@@ -196,3 +196,13 @@ integrations/dalton-channel-gateway/test/feishu.test.ts
 scripts/dalton/openclaw_overlays/skills/sentiment-dashboard/scripts/run.sh
 scripts/dalton/openclaw_overlays/scripts/sentiment_dashboard_cos_upload.py
 scripts/dalton/openclaw_overlays/scripts/bbg_remote_refresh.sh
+# Chat composer large-file multipart uploads (<=200 MiB) and sandbox materialization.
+src/dalton/migrations/versions/d033_chat_file_uploads.py
+src/dalton/chat_upload_storage.py
+src/dalton/database/chat_uploads.py
+src/dalton/services/chat_uploads.py
+src/dalton/app/chat_uploads.py
+web/src/lib/dalton/chatUploadClient.ts
+web/src/components/ui/__tests__/chat-input.largeUpload.test.tsx
+tests/unit/dalton/test_chat_uploads.py
+tests/integration/dalton/test_chat_large_upload_e2e.py

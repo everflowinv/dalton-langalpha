@@ -417,6 +417,10 @@ Docker（colima，数据盘在 EveSSD）
   - **仅在发送成功时删除**：`ChatInput.onSend` 支持返回 `false` 或 Promise；返回 `false` 或 reject 时（如 `MarketView` 或仪表盘 `useChatInput.handleSend` 未解析出工作区或发送抛错），原文本连同发送等待期间新输入的文本一并恢复并保存（`settleSendResult`）。发出新对话后、线程 ID 落定前继续输入的文本会从已实际发送的 `ws:<id>:new` 迁移到新线程 key；行情面板显式点「新对话」时清空对应草稿。
 - **文件面板与 Memo 面板批量上传**（`web/src/pages/ChatAgent/components/FilePanel.tsx`、`web/src/pages/ChatAgent/components/MemoPanel.tsx`、`web/src/pages/ChatAgent/components/filePanel/useFileUpload.ts`，钩子 `multi-file-upload`）：
   - 文件选择器（`multiple`）与拖拽支持一次添加多个文件，按每面板单一队列串行上传，中途新加入的文件排入队尾并立即更新总文件数，界面展示「第 i / n 个文件」、文件名与进度百分比；单个文件失败（Memo 面板逐文件校验类型与 5 MB 上限）记录后继续上传其余文件，结束时汇总展示全部失败项（`uploadFailedSummary`），整批完成后仅刷新一次文件列表（Memo 面板直接调 `uploadUserMemo`）。切换工作区或组件卸载时通过代数守卫（`processingGenRef`）丢弃未开始项，已在途的上传完成后仅刷新其启动时所属的工作区列表，新工作区的文件立即启动新循环而不必等待旧请求结束。
+- **聊天输入框大文件分片上传**（`src/dalton/app/chat_uploads.py`、`src/dalton/services/chat_uploads.py`、`src/dalton/database/chat_uploads.py`、`src/dalton/chat_upload_storage.py`、`web/src/lib/dalton/chatUploadClient.ts`，迁移 `src/dalton/migrations/versions/d033_chat_file_uploads.py`，钩子 `chat-large-upload`）：
+  - 输入框的选择文件、拖拽与粘贴支持单文件最高 **200 MiB**（界面文案标为 `200 MB`；单条消息总上限 600 MiB，最多 5 个文件；0 字节空文件与超限文件在前后端均显式拒绝）。小于等于 30 MiB（整条消息内联预算 60 MiB）的图片、PDF 等小附件保持既有内联行为；超出内联预算的大文件在输入框内展示上传进度、取消/移除、失败重试，且所有已选附件完成前禁用发送。
+  - **独立存储前缀与有界分片中继**：不开启上游全局 `STORAGE_*`（`STORAGE_PROVIDER` 仍为 `none`），复用 `DALTON_ASR_STORAGE_*` MinIO 连接但固定隔离在 `chat-uploads/<workspace_id>/<upload_id>/<safe_name>` 前缀下（不触碰 `transcriptions/` 下的 ASR 对象）。浏览器按 8 MiB 分片（最多 2 片并发、附分片 SHA-256）经 `/api/v1/dalton/chat-uploads*` 流式中继至 MinIO，避免暴露私有 MinIO 端口或公网 CORS，前后端均不将整份 200 MiB 文件读入内存。
+  - **归属校验、沙箱落盘、冷启动自动恢复与生命周期清理**：跨 worker 状态持久化于 `dalton_chat_file_uploads`。发送时聊天请求、历史记录、Redis 队列与 checkpoint 仅保存 `{type: "chat_upload", upload_id, name, mime_type, size}` 元数据；轮次执行（含 `/retry` 与中途 steer）在 `path_write_lock` 内二次核验用户与目标工作区（含 Chief of Staff 解析出的真实 Home 工作区），由沙箱经 `DALTON_ASR_STORAGE_SIGNING_ENDPOINT_URL` 执行 `pull_direct`（校验字节数与 SHA-256）落盘至 `work/uploads/`，仅向模型注入路径说明。由于全局 `STORAGE_PROVIDER` 为 `none` 时工作区数据库备份上限为 100 MiB（`INLINE_MAX_BYTES`），已随对话采纳的附件对象（`used_at IS NOT NULL`，`expires_at` 置空）随文件/工作区生命周期持久保留，并在沙箱冷重建/恢复（`persistence/restore.py` 的 `maybe_restore` / `_restore_locked`）及后续轮次启动（`ptc_run.py`）时经归属与工作区权限校验后自动回填缺失的 `work/uploads/` 文件（离线文件树亦合并展示）。仅显式删除工作区文件（`DELETE /api/v1/workspaces/{id}/files`）、删除工作区（`WorkspaceManager.delete_workspace`），以及取消、失败或超时未使用的上传（上传中 6 小时、已完成未发送 24 小时）会清理对应的 `chat-uploads/` 对象与分片（后台循环按 `FOR UPDATE SKIP LOCKED` 兜底回收）。
 
 ## 11. 开发规范
 
@@ -472,7 +476,8 @@ Docker（colima，数据盘在 EveSSD）
 - `d016_members_and_invites`（`src/dalton/migrations/versions/d016_members_and_invites.py`）：团队成员表 `dalton_members` 与 PM 单次邀请链接表 `dalton_invites`；
 - `d017_wiki_ingests`（`src/dalton/migrations/versions/d017_wiki_ingests.py`）：公司 Wiki 入库审计与状态账本 `dalton_wiki_ingests`；
 - `d018_workspace_sharing`（`src/dalton/migrations/versions/d018_workspace_sharing.py`）：按工作区、按通道（`cos_access` 与 `web_access`）配置的团队共享权限表 `dalton_workspace_sharing`；
-- `d019_feishu_read_scopes`（`src/dalton/migrations/versions/d019_feishu_read_scopes.py`）：对外部成员开放读取的飞书知识空间白名单表 `dalton_feishu_read_scopes`。
+- `d019_feishu_read_scopes`（`src/dalton/migrations/versions/d019_feishu_read_scopes.py`）：对外部成员开放读取的飞书知识空间白名单表 `dalton_feishu_read_scopes`；
+- `d033_chat_file_uploads`（`src/dalton/migrations/versions/d033_chat_file_uploads.py`）：聊天输入框大文件分片上传跨 worker 状态与生命周期表 `dalton_chat_file_uploads`。
 
 **健康检查**：
 
