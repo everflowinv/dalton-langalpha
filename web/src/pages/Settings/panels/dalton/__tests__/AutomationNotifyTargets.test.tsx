@@ -424,7 +424,7 @@ describe('AutomationNotifyTargets', () => {
       fireEvent.click(triggerButton());
     });
     // Discovered groups plus the stale one, marked as left.
-    expect(screen.getByText('核心投研群')).toBeInTheDocument();
+    expect(await screen.findByText('核心投研群')).toBeInTheDocument();
     const stale = screen.getByRole('checkbox', { name: '飞书群 oc_old' });
     expect(stale).toHaveAttribute('aria-checked', 'true');
     expect(screen.getByText(`oc_old（bot no longer in this group）`)).toBeInTheDocument();

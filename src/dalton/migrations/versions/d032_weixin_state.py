@@ -1,14 +1,19 @@
-"""d032 weixin login session, bot generation, and encrypted context tokens
+"""d032 weixin login session, bot generation, and encrypted context tokens.
 
 Revision ID: d032
-Revises: d030
+Revises: d031
 Create Date: 2026-04-06
+
+Follows d031 channel session selection. A database already stamped d032
+does not re-run this revision, so the context-order columns are also added
+with ADD COLUMN IF NOT EXISTS. Protocol seq and platform time each keep a
+high-water on the context-token row for that bot, generation, and sender.
 """
 
 from alembic import op
 
 revision = "d032"
-down_revision = "d030"
+down_revision = "d031"
 branch_labels = None
 depends_on = None
 
@@ -63,12 +68,24 @@ def upgrade() -> None:
             encrypted_context_token BYTEA NOT NULL,
             seq BIGINT NOT NULL DEFAULT 0,
             seq_source VARCHAR(32) NOT NULL DEFAULT 'protocol',
+            protocol_seq_high BIGINT NOT NULL DEFAULT 0,
+            platform_time_high BIGINT NOT NULL DEFAULT 0,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             PRIMARY KEY (ilink_bot_id, bot_generation, platform_user_id)
         );
 
         ALTER TABLE dalton_channel_weixin_context_tokens
-            ADD COLUMN IF NOT EXISTS seq_source VARCHAR(32) NOT NULL DEFAULT 'protocol';
+            ADD COLUMN IF NOT EXISTS seq_source VARCHAR(32) NOT NULL DEFAULT 'protocol',
+            ADD COLUMN IF NOT EXISTS protocol_seq_high BIGINT NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS platform_time_high BIGINT NOT NULL DEFAULT 0;
+
+        UPDATE dalton_channel_weixin_context_tokens
+        SET protocol_seq_high = GREATEST(protocol_seq_high, seq)
+        WHERE seq_source = 'protocol';
+
+        UPDATE dalton_channel_weixin_context_tokens
+        SET platform_time_high = GREATEST(platform_time_high, seq)
+        WHERE seq_source = 'platform_time';
 
         CREATE INDEX IF NOT EXISTS idx_dalton_channel_wx_ctx_tokens_lookup
             ON dalton_channel_weixin_context_tokens (platform_user_id, ilink_bot_id, bot_generation);

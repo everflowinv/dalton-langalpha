@@ -9,7 +9,7 @@ All test doubles are constructed with `unittest.mock.create_autospec`.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from typing import Any
 from unittest.mock import create_autospec
@@ -113,14 +113,19 @@ class InMemoryChannelStore:
         self.weixin_state: dict[str, Any] | None = None
         self.weixin_context_tokens: dict[tuple[str, int, str], dict[str, Any]] = {}
         self.workspaces: dict[str, dict[str, Any]] = {}
+        self.conversation_threads: dict[str, dict[str, Any]] = {}
         self.hook_outbox: dict[str, dict[str, Any]] = {}
         self.conversation_responses: dict[str, dict[str, Any]] = {}
         self.conversation_queries: list[dict[str, Any]] = []
         self.advisory_locks: list[str] = []
+        self.current_time: datetime | None = None
 
     async def handle_sql(self, sql: str, params: Any) -> Any:
         norm = " ".join(sql.split())
-        now = datetime.now(timezone.utc)
+        now = self.current_time or datetime.now(timezone.utc)
+
+        if "SELECT clock_timestamp() AS db_now" in norm:
+            return [{"db_now": now}]
 
         if "pg_advisory_xact_lock" in norm:
             if params:
@@ -135,8 +140,75 @@ class InMemoryChannelStore:
                 return [dict(ws)]
             return []
 
-        # Inbound events insert (I-1)
+        if "FROM conversation_threads WHERE conversation_thread_id = %s" in norm:
+            tid = str(params[0])
+            th = self.conversation_threads.get(tid)
+            return [dict(th)] if th else []
+
+        # Inbound events insert (I-1 message or I-3 command)
         if "INSERT INTO dalton_channel_inbound_events" in norm:
+            if "event_kind, command_request, command_result" in norm:
+                (
+                    plat,
+                    mid,
+                    req_k,
+                    ctype,
+                    caddr,
+                    scope,
+                    uid,
+                    ws_id,
+                    ext_tid,
+                    sess_gen,
+                    tid,
+                    rid,
+                    st,
+                    raw_p_arg,
+                    cmd_req_arg,
+                    cmd_res_arg,
+                    eff_st,
+                    reply_pend,
+                ) = params
+                plat_s = str(plat)
+                mid_s = str(mid)
+                key = (plat_s, mid_s)
+                raw_p = raw_p_arg.obj if hasattr(raw_p_arg, "obj") else raw_p_arg
+                cmd_req = cmd_req_arg.obj if hasattr(cmd_req_arg, "obj") else cmd_req_arg
+                cmd_res = cmd_res_arg.obj if hasattr(cmd_res_arg, "obj") else cmd_res_arg
+                existing = self.inbound_events.get(key)
+                row = {
+                    "platform": plat_s,
+                    "message_id": mid_s,
+                    "request_key": UUID(str(req_k)),
+                    "retry_request_key": (existing or {}).get("retry_request_key"),
+                    "resubmitted_request_key": (existing or {}).get("resubmitted_request_key"),
+                    "steered_into_run_id": (existing or {}).get("steered_into_run_id"),
+                    "dalton_user_id": str(uid) if uid is not None else (existing or {}).get("dalton_user_id"),
+                    "chat_type": str(ctype),
+                    "chat_address": str(caddr),
+                    "thread_scope_key": str(scope),
+                    "external_thread_id": str(ext_tid) if ext_tid is not None else (existing or {}).get("external_thread_id"),
+                    "session_generation": int(sess_gen) if sess_gen is not None else (existing or {}).get("session_generation"),
+                    "workspace_id": UUID(str(ws_id)) if ws_id is not None else (existing or {}).get("workspace_id"),
+                    "thread_id": UUID(str(tid)) if tid is not None else (existing or {}).get("thread_id"),
+                    "run_id": str(rid) if rid is not None else (existing or {}).get("run_id"),
+                    "turn_index": (existing or {}).get("turn_index"),
+                    "status": str(st),
+                    "fallback_pending": False,
+                    "sent_to_current_count": (existing or {}).get("sent_to_current_count", 0),
+                    "raw_payload": dict(raw_p or {}),
+                    "uploaded_attachments": (existing or {}).get("uploaded_attachments"),
+                    "event_kind": "command",
+                    "command_request": dict(cmd_req or {}),
+                    "command_result": dict(cmd_res or {}),
+                    "command_effect_status": str(eff_st),
+                    "command_reply_pending": bool(reply_pend),
+                    "pending_interrupt_snapshot": (existing or {}).get("pending_interrupt_snapshot"),
+                    "created_at": (existing or {}).get("created_at") or now,
+                    "updated_at": now,
+                }
+                self.inbound_events[key] = row
+                return [dict(row)]
+
             plat, mid, req_k, ctype, caddr, scope, raw_p = (
                 str(params[0]),
                 str(params[1]),
@@ -161,6 +233,7 @@ class InMemoryChannelStore:
                 "chat_address": caddr,
                 "thread_scope_key": scope,
                 "external_thread_id": None,
+                "session_generation": None,
                 "workspace_id": None,
                 "thread_id": None,
                 "run_id": None,
@@ -170,6 +243,12 @@ class InMemoryChannelStore:
                 "sent_to_current_count": 0,
                 "raw_payload": dict(raw_p),
                 "uploaded_attachments": None,
+                "event_kind": "message",
+                "command_request": None,
+                "command_result": None,
+                "command_effect_status": "done",
+                "command_reply_pending": False,
+                "pending_interrupt_snapshot": None,
                 "created_at": now,
                 "updated_at": now,
             }
@@ -177,8 +256,9 @@ class InMemoryChannelStore:
             return [dict(row)]
 
         if (
-            "SELECT * FROM dalton_channel_inbound_events WHERE platform = %s AND message_id = %s"
+            "FROM dalton_channel_inbound_events WHERE platform = %s AND message_id = %s"
             in norm
+            and "SELECT" in norm
         ):
             key = (str(params[0]), str(params[1]))
             row = self.inbound_events.get(key)
@@ -230,12 +310,51 @@ class InMemoryChannelStore:
                 and row.get("weixin_context_bot_id") == bot_id
                 and int(row.get("weixin_context_bot_generation") or 0) == bot_gen
             ):
+                payload = row.get("raw_payload") or {}
                 return [
                     {
                         "context_token": row["encrypted_weixin_context_token"],
                         "seq": int(row.get("weixin_context_seq") or 0),
+                        "raw_payload": dict(payload) if isinstance(payload, dict) else payload,
                     }
                 ]
+            return []
+
+        if "SELECT thread_id FROM dalton_channel_inbound_events WHERE platform = %s AND dalton_user_id = %s AND external_thread_id = %s" in norm:
+            plat, uid, ext_tid = str(params[0]), str(params[1]), str(params[2])
+            for r in reversed(list(self.inbound_events.values())):
+                if (
+                    r.get("platform") == plat
+                    and r.get("dalton_user_id") == uid
+                    and r.get("external_thread_id") == ext_tid
+                    and r.get("thread_id") is not None
+                ):
+                    return [{"thread_id": r["thread_id"]}]
+            return []
+
+        if "SELECT run_id FROM dalton_channel_inbound_events WHERE thread_id = %s AND status IN" in norm:
+            tid = str(params[0])
+            for r in reversed(list(self.inbound_events.values())):
+                if (
+                    str(r.get("thread_id") or "") == tid
+                    and r.get("status") in ("accepted", "streaming", "dispatched")
+                    and r.get("run_id") is not None
+                ):
+                    return [{"run_id": r["run_id"]}]
+            return []
+
+        if (
+            "UPDATE dalton_channel_inbound_events SET command_effect_status = 'done'" in norm
+            and "WHERE event_kind = 'command' AND command_effect_status = 'pending_cancel' AND run_id IS NULL" in norm
+        ):
+            for r in self.inbound_events.values():
+                if (
+                    r.get("event_kind") == "command"
+                    and r.get("command_effect_status") == "pending_cancel"
+                    and r.get("run_id") is None
+                ):
+                    r["command_effect_status"] = "done"
+                    r["updated_at"] = now
             return []
 
         if "UPDATE dalton_channel_inbound_events" in norm and "WHERE platform = %s AND message_id = %s" in norm:
@@ -259,6 +378,15 @@ class InMemoryChannelStore:
                 if params[1] is not None:
                     row["dalton_user_id"] = str(params[1])
                 row["status"] = "completed"
+            elif "SET status = 'ignored', command_effect_status = 'done', command_reply_pending = FALSE" in norm:
+                row["status"] = "ignored"
+                row["command_effect_status"] = "done"
+                row["command_reply_pending"] = False
+            elif "SET command_result = %s, updated_at = NOW()" in norm:
+                val = params[0].obj if hasattr(params[0], "obj") else params[0]
+                row["command_result"] = dict(val)
+            elif "SET command_effect_status = 'done', updated_at = NOW()" in norm and len(params) == 2:
+                row["command_effect_status"] = "done"
             elif "SET status = 'ignored'" in norm and len(params) == 2:
                 row["status"] = "ignored"
             elif "SET dalton_user_id = %s, status = 'ignored'" in norm:
@@ -268,7 +396,17 @@ class InMemoryChannelStore:
                 row["dalton_user_id"] = str(params[0])
                 row["workspace_id"] = UUID(str(params[1]))
                 row["external_thread_id"] = str(params[2])
-                if len(params) >= 6:
+                if "session_generation = %s" in norm:
+                    row["session_generation"] = (
+                        int(params[3]) if params[3] is not None else None
+                    )
+                    p_snap = (
+                        params[4].obj if hasattr(params[4], "obj") else params[4]
+                    )
+                    row["pending_interrupt_snapshot"] = p_snap
+                    val = params[5].obj if hasattr(params[5], "obj") else params[5]
+                    row["raw_payload"] = dict(val)
+                elif len(params) >= 6:
                     val = params[3].obj if hasattr(params[3], "obj") else params[3]
                     row["raw_payload"] = dict(val)
             elif "SET resubmitted_request_key = %s, status = 'pending_resubmit'" in norm:
@@ -324,6 +462,16 @@ class InMemoryChannelStore:
                     val = params[p_idx].obj if hasattr(params[p_idx], "obj") else params[p_idx]
                     row["uploaded_attachments"] = val
                     p_idx += 1
+                if "command_effect_status = %s" in norm:
+                    row["command_effect_status"] = str(params[p_idx])
+                    p_idx += 1
+                if "command_reply_pending = %s" in norm:
+                    row["command_reply_pending"] = bool(params[p_idx])
+                    p_idx += 1
+                if "command_result = %s" in norm:
+                    val = params[p_idx].obj if hasattr(params[p_idx], "obj") else params[p_idx]
+                    row["command_result"] = dict(val)
+                    p_idx += 1
                 if "raw_payload = %s" in norm:
                     val = params[p_idx].obj if hasattr(params[p_idx], "obj") else params[p_idx]
                     row["raw_payload"] = dict(val)
@@ -336,6 +484,24 @@ class InMemoryChannelStore:
             return [dict(row)]
 
         # Weixin context tokens (d032)
+        if (
+            "protocol_seq_high" in norm
+            and "SELECT seq, seq_source" in norm
+            and "FROM dalton_channel_weixin_context_tokens" in norm
+        ):
+            key = (str(params[0]), int(params[1]), str(params[2]))
+            row = self.weixin_context_tokens.get(key)
+            if not row:
+                return []
+            return [
+                {
+                    "seq": row["seq"],
+                    "seq_source": row.get("seq_source") or "protocol",
+                    "protocol_seq_high": int(row.get("protocol_seq_high") or 0),
+                    "platform_time_high": int(row.get("platform_time_high") or 0),
+                }
+            ]
+
         if "SELECT seq, seq_source FROM dalton_channel_weixin_context_tokens" in norm:
             key = (str(params[0]), int(params[1]), str(params[2]))
             row = self.weixin_context_tokens.get(key)
@@ -358,14 +524,23 @@ class InMemoryChannelStore:
                 int(params[5]),
                 str(params[6]),
             )
+            protocol_high = int(params[7]) if len(params) > 7 else 0
+            platform_high = int(params[8]) if len(params) > 8 else 0
             key = (bot_id, bot_gen, puid)
             prev = self.weixin_context_tokens.get(key)
             prev_seq = int(prev.get("seq") or 0) if prev is not None else 0
             prev_source = (
-                str(prev.get("seq_source") or "protocol") if prev is not None else ""
+                str(prev.get("seq_source") or "") if prev is not None else ""
             )
+            prev_protocol_high = int(prev.get("protocol_seq_high") or 0) if prev else 0
+            prev_platform_high = int(prev.get("platform_time_high") or 0) if prev else 0
             if prev is None or cg_db._context_order_supersedes(
-                seq_source, seq_val, prev_source, prev_seq
+                seq_source,
+                seq_val,
+                prev_source,
+                prev_seq,
+                protocol_high=prev_protocol_high,
+                platform_time_high=prev_platform_high,
             ):
                 self.weixin_context_tokens[key] = {
                     "ilink_bot_id": bot_id,
@@ -374,6 +549,8 @@ class InMemoryChannelStore:
                     "encrypted_context_token": ctok,
                     "seq": seq_val,
                     "seq_source": seq_source,
+                    "protocol_seq_high": protocol_high,
+                    "platform_time_high": platform_high,
                     "updated_at": now,
                 }
             return []
@@ -481,6 +658,7 @@ class InMemoryChannelStore:
                             "context_token": row.get("encrypted_weixin_context_token")
                             or row.get("weixin_context_token"),
                             "seq": int(row.get("weixin_context_seq") or 0),
+                            "seq_source": row.get("weixin_context_seq_source") or "",
                         }
                     ]
             return []
@@ -684,6 +862,7 @@ class InMemoryChannelStore:
             key = (plat, scope, uid)
             if "ON CONFLICT (platform, scope_key, dalton_user_id) DO NOTHING" in norm:
                 if key not in self.session_generations:
+                    has_init = "selection_initialized_at" in norm
                     self.session_generations[key] = {
                         "platform": plat,
                         "scope_key": scope,
@@ -691,8 +870,11 @@ class InMemoryChannelStore:
                         "generation": 1,
                         "override_workspace_id": None,
                         "pending_interrupt": None,
+                        "selection_initialized_at": now if has_init else None,
+                        "last_conversation_activity_at": now if has_init else None,
                         "updated_at": now,
                     }
+                    return [{"platform": plat}] if "RETURNING" in norm else []
                 return []
             if "override_workspace_id, pending_interrupt, updated_at" in norm:
                 ov_ws = params[3]
@@ -704,12 +886,18 @@ class InMemoryChannelStore:
                         "generation": 2,
                         "override_workspace_id": ov_ws,
                         "pending_interrupt": None,
+                        "selection_initialized_at": now,
+                        "last_conversation_activity_at": now,
                         "updated_at": now,
                     }
                 else:
                     self.session_generations[key]["generation"] += 1
                     self.session_generations[key]["override_workspace_id"] = ov_ws
                     self.session_generations[key]["pending_interrupt"] = None
+                    self.session_generations[key]["selection_initialized_at"] = (
+                        self.session_generations[key].get("selection_initialized_at") or now
+                    )
+                    self.session_generations[key]["last_conversation_activity_at"] = now
                     self.session_generations[key]["updated_at"] = now
                 return [{"generation": self.session_generations[key]["generation"]}]
             if "pending_interrupt = EXCLUDED.pending_interrupt" in norm:
@@ -722,6 +910,8 @@ class InMemoryChannelStore:
                         "generation": 1,
                         "override_workspace_id": None,
                         "pending_interrupt": p_int,
+                        "selection_initialized_at": None,
+                        "last_conversation_activity_at": None,
                         "updated_at": now,
                     }
                 else:
@@ -737,11 +927,17 @@ class InMemoryChannelStore:
                     "generation": 2,
                     "override_workspace_id": None,
                     "pending_interrupt": None,
+                    "selection_initialized_at": now,
+                    "last_conversation_activity_at": now,
                     "updated_at": now,
                 }
             else:
                 self.session_generations[key]["generation"] += 1
                 self.session_generations[key]["pending_interrupt"] = None
+                self.session_generations[key]["selection_initialized_at"] = (
+                    self.session_generations[key].get("selection_initialized_at") or now
+                )
+                self.session_generations[key]["last_conversation_activity_at"] = now
                 self.session_generations[key]["updated_at"] = now
             return [{"generation": self.session_generations[key]["generation"]}]
 
@@ -754,6 +950,10 @@ class InMemoryChannelStore:
                         row["generation"] += 1
                         row["override_workspace_id"] = None
                         row["pending_interrupt"] = None
+                        row["selection_initialized_at"] = now
+                        row["last_conversation_activity_at"] = (
+                            now if "last_conversation_activity_at = NOW()" in norm else None
+                        )
                         row["updated_at"] = now
                         updated.append({"scope_key": s, "generation": row["generation"]})
                 return updated
@@ -775,6 +975,62 @@ class InMemoryChannelStore:
                             }
                         )
                 return updated
+
+        if "UPDATE dalton_channel_session_generations SET generation = %s" in norm:
+            plat = str(params[-3])
+            scope = str(params[-2])
+            uid = str(params[-1])
+            key = (plat, scope, uid)
+            row = self.session_generations.get(key)
+            if not row:
+                return []
+            row["generation"] = int(params[0])
+            row["override_workspace_id"] = params[1]
+            if "pending_interrupt = NULL" in norm:
+                row["pending_interrupt"] = None
+                init_ts = params[2]
+                act_ts = params[3]
+                upd_ts = params[4]
+            else:
+                p_int = params[2].obj if hasattr(params[2], "obj") else params[2]
+                row["pending_interrupt"] = p_int
+                init_ts = params[3]
+                act_ts = params[4]
+                upd_ts = params[5]
+            if row.get("selection_initialized_at") is None:
+                row["selection_initialized_at"] = init_ts
+            row["last_conversation_activity_at"] = act_ts
+            row["updated_at"] = upd_ts
+            return []
+
+        if "UPDATE dalton_channel_session_generations SET last_conversation_activity_at = %s" in norm:
+            act_ts = params[0]
+            upd_ts = params[1]
+            plat = str(params[2])
+            scope = str(params[3])
+            uid = str(params[4])
+            gen_expected = int(params[5]) if len(params) >= 6 else None
+            row = self.session_generations.get((plat, scope, uid))
+            if row:
+                if gen_expected is None or int(row.get("generation") or 0) == gen_expected:
+                    if (
+                        "selection_initialized_at IS NOT NULL" not in norm
+                        or row.get("selection_initialized_at") is not None
+                    ):
+                        row["last_conversation_activity_at"] = act_ts
+                        row["updated_at"] = upd_ts
+            return []
+
+        if "UPDATE dalton_channel_session_generations SET pending_interrupt = %s" in norm:
+            p_int = params[0].obj if hasattr(params[0], "obj") else params[0]
+            plat = str(params[1])
+            scope = str(params[2])
+            uid = str(params[3])
+            row = self.session_generations.get((plat, scope, uid))
+            if row:
+                row["pending_interrupt"] = p_int
+                row["updated_at"] = now
+            return []
 
         if "FROM dalton_channel_session_generations WHERE platform = %s AND scope_key = %s AND dalton_user_id = %s" in norm:
             key = (str(params[0]), str(params[1]), str(params[2]))
@@ -869,20 +1125,50 @@ class InMemoryChannelStore:
                 bool(params[7]),
             )
             prev = self.thread_watches.get(tid)
+            if len(params) >= 9:
+                p_int_arg = params[8]
+                p_int = p_int_arg.obj if hasattr(p_int_arg, "obj") else p_int_arg
+            else:
+                p_int = (prev or {}).get("pending_interrupt")
+            prev_scope = str((prev or {}).get("scope_key") or "")
+            prev_gen = int((prev or {}).get("generation") or 0)
+            eff_scope = (
+                prev_scope
+                if prev
+                and (
+                    scope == ""
+                    or (
+                        scope == addr
+                        and prev_scope != ""
+                        and prev_scope != addr
+                    )
+                )
+                else scope
+            )
+            eff_gen = prev_gen if (prev and gen <= 0 and prev_gen > 0) else gen
             self.thread_watches[tid] = {
                 "thread_id": UUID(tid),
                 "dalton_user_id": uid,
                 "platform": plat,
                 "target_address": addr,
-                "scope_key": scope,
-                "generation": gen,
+                "scope_key": eff_scope,
+                "generation": eff_gen,
                 "last_seen_turn_index": max(
                     last_turn, int((prev or {}).get("last_seen_turn_index") or 0)
                 ),
                 "watch_active": active,
+                "pending_interrupt": p_int,
                 "created_at": (prev or {}).get("created_at") or now,
                 "updated_at": now,
             }
+            return []
+
+        if "UPDATE dalton_channel_thread_watches SET pending_interrupt = %s" in norm:
+            p_int = params[0].obj if hasattr(params[0], "obj") else params[0]
+            tid = str(params[1])
+            if tid in self.thread_watches:
+                self.thread_watches[tid]["pending_interrupt"] = p_int
+                self.thread_watches[tid]["updated_at"] = now
             return []
 
         if "UPDATE dalton_channel_thread_watches SET last_seen_turn_index = %s" in norm:
@@ -969,6 +1255,16 @@ class InMemoryChannelStore:
             and "SELECT" in norm
             and "SELECT COALESCE(MAX(sent_to_current_count)" not in norm
         ):
+            if "WHERE thread_id = %s AND status IN ('running', 'streaming')" in norm:
+                tid = str(params[0])
+                for r in reversed(list(self.background_runs.values())):
+                    if (
+                        str(r.get("thread_id") or "") == tid
+                        and r.get("status") in ("running", "streaming")
+                        and r.get("run_id") is not None
+                    ):
+                        return [{"run_id": r["run_id"]}]
+                return []
             if "WHERE thread_id = %s AND fallback_pending = TRUE" in norm:
                 tid = str(params[0])
                 return [
@@ -985,25 +1281,63 @@ class InMemoryChannelStore:
             return [dict(r) for r in self.background_runs.values()]
 
         # Deliveries
-        if "SELECT * FROM dalton_channel_deliveries WHERE delivery_key = %s" in norm:
+        if "FROM dalton_channel_deliveries WHERE delivery_key = %s" in norm and "SELECT" in norm:
             dkey = str(params[0])
             r = self.deliveries.get(dkey)
             return [dict(r)] if r else []
 
         if "INSERT INTO dalton_channel_deliveries" in norm:
-            (
-                dkey,
-                kind,
-                uid,
-                tid,
-                rid,
-                exec_id,
-                is_cur,
-                has_txt,
-                plat,
-                taddr,
-                tchunks,
-            ) = params
+            if len(params) >= 14:
+                # The product conflict update may append a flag that rewrites a failed
+                # conversation origin to replay. Scope and generation stay on the first row.
+                replay_origin = bool(params[14]) if len(params) >= 15 else False
+                (
+                    dkey,
+                    kind,
+                    uid,
+                    tid,
+                    rid,
+                    exec_id,
+                    is_cur,
+                    has_txt,
+                    plat,
+                    taddr,
+                    tchunks,
+                    src_scope,
+                    src_gen,
+                    act_origin,
+                ) = params[:14]
+            else:
+                (
+                    dkey,
+                    kind,
+                    uid,
+                    tid,
+                    rid,
+                    exec_id,
+                    is_cur,
+                    has_txt,
+                    plat,
+                    taddr,
+                    tchunks,
+                ) = params
+                src_scope = None
+                src_gen = None
+                act_origin = "none"
+                replay_origin = False
+            prev_dlv = self.deliveries.get(str(dkey))
+            stored_origin = str(act_origin or "none")
+            if prev_dlv is not None:
+                prev_origin = str(prev_dlv.get("activity_origin") or "none")
+                prev_status = str(prev_dlv.get("status") or "")
+                if (
+                    replay_origin
+                    and prev_status == "failed"
+                    and prev_origin == "conversation"
+                ):
+                    stored_origin = "replay"
+                else:
+                    stored_origin = prev_origin
             self.deliveries[str(dkey)] = {
                 "delivery_key": str(dkey),
                 "kind": str(kind),
@@ -1017,13 +1351,24 @@ class InMemoryChannelStore:
                 "target_address": str(taddr),
                 "status": "in_flight",
                 "total_chunks": int(tchunks),
-                "sent_chunks": 0,
-                "platform_message_ids": [],
-                "files_status": [],
-                "first_response_json": None,
+                "sent_chunks": int((prev_dlv or {}).get("sent_chunks") or 0),
+                "platform_message_ids": list((prev_dlv or {}).get("platform_message_ids") or []),
+                "files_status": list((prev_dlv or {}).get("files_status") or []),
+                "first_response_json": (prev_dlv or {}).get("first_response_json"),
+                "source_scope_key": (
+                    prev_dlv.get("source_scope_key")
+                    if prev_dlv is not None
+                    else (str(src_scope) if src_scope else None)
+                ),
+                "source_generation": (
+                    prev_dlv.get("source_generation")
+                    if prev_dlv is not None
+                    else (int(src_gen) if src_gen is not None else None)
+                ),
+                "activity_origin": stored_origin,
                 "error_code": None,
                 "error_message": None,
-                "created_at": now,
+                "created_at": (prev_dlv or {}).get("created_at") or now,
                 "updated_at": now,
             }
             return []
@@ -1105,14 +1450,23 @@ class InMemoryChannelStore:
         if "FROM dalton_channel_inbound_events WHERE dalton_user_id = %s" in norm or (
             "SELECT dalton_user_id, platform, chat_address AS target_address" in norm
         ):
+            param_strs = {str(p) for p in params if p is not None}
             for r in reversed(list(self.inbound_events.values())):
-                if r.get("run_id") and r.get("run_id") in params:
+                rid_val = str(r.get("run_id") or "")
+                tid_val = str(r.get("thread_id") or "")
+                if (rid_val and rid_val in param_strs) or (
+                    tid_val and tid_val in param_strs
+                ):
                     return [
                         {
                             "dalton_user_id": r["dalton_user_id"],
                             "platform": r["platform"],
                             "target_address": r["chat_address"],
                             "chat_address": r["chat_address"],
+                            "thread_scope_key": r.get("thread_scope_key"),
+                            "workspace_id": r.get("workspace_id"),
+                            "session_generation": r.get("session_generation"),
+                            "raw_payload": r.get("raw_payload"),
                             "thread_id": r.get("thread_id"),
                             "run_id": r.get("run_id"),
                             "external_thread_id": r.get("external_thread_id"),
@@ -1152,6 +1506,8 @@ class InMemoryChannelStore:
                     "pending_resubmit",
                 )
                 or r.get("fallback_pending")
+                or r.get("command_reply_pending")
+                or r.get("command_effect_status") == "pending_cancel"
             ]
 
         # Hook outbox & conversation_responses (steers/reconcile & watch backfill)
@@ -1159,6 +1515,13 @@ class InMemoryChannelStore:
             ikey = str(params[0])
             row = self.hook_outbox.get(ikey)
             return [dict(row)] if row else []
+
+        if "SELECT conversation_response_id FROM conversation_responses WHERE conversation_thread_id = %s AND status = 'in_progress'" in norm:
+            tid = str(params[0])
+            for rid, r in reversed(list(self.conversation_responses.items())):
+                if str(r.get("conversation_thread_id") or "") == tid and r.get("status") == "in_progress":
+                    return [{"conversation_response_id": rid}]
+            return []
 
         if "SELECT status FROM conversation_responses WHERE conversation_response_id = %s" in norm:
             rid = str(params[0])
@@ -2162,17 +2525,21 @@ def test_inbound_register_resolve_and_session_commands_and_state_and_settings(
     assert r_wswitch_grp.json()["ok"] is True
     assert r_wswitch_grp.json()["generation"] == 2
     assert (
-        store.session_generations[("feishu", "chat:oc_semi:thread:t1", "u-bob")][
-            "generation"
-        ]
-        == 5
-    )
-    assert (
-        store.session_generations[("feishu", "chat:oc_semi:thread:t1", "u-bob")][
+        store.session_generations[("feishu", "chat:oc_semi", "u-alice")][
             "pending_interrupt"
         ]
         is None
     )
+    # Per-member group isolation: u-bob's session row in the same group is untouched
+    assert (
+        store.session_generations[("feishu", "chat:oc_semi:thread:t1", "u-bob")][
+            "generation"
+        ]
+        == 4
+    )
+    assert store.session_generations[("feishu", "chat:oc_semi:thread:t1", "u-bob")][
+        "pending_interrupt"
+    ] == {"interrupt_id": "int_2"}
 
     # I-3 /new advances only operator's row
     r_new = client.post(
@@ -2192,7 +2559,7 @@ def test_inbound_register_resolve_and_session_commands_and_state_and_settings(
         store.session_generations[("feishu", "chat:oc_semi:thread:t1", "u-bob")][
             "generation"
         ]
-        == 5
+        == 4
     )
 
     # 5. I-5 PUT /internal/settings validation & CAS
@@ -2802,8 +3169,8 @@ def test_round2_review_fixes_group_permissions_generations_locks_unknown_and_cre
     )
     assert r_bob_forbidden.status_code == 403
 
-    # Decision 2 (1) & Decision 3 (1): Member u-alice binds feishu:oc_grp1 for the FIRST time via Web PUT /settings -> 200,
-    # and advances generations for ALL users in chat:oc_grp1 (1 -> 2) and chat:oc_grp1:thread:sub1 (2 -> 3)!
+    # Decision 2 (1) & CH-1 Requirement #3: Member u-alice binds feishu:oc_grp1 for the FIRST time via Web PUT /settings -> 200,
+    # updates dalton_channel_chat_bindings, and keeps personal session generations independent!
     channel_test_env["current_web_user"]["user_id"] = "u-alice"
     alice_ver = r_web_bindings.json()["settings"]["version"]
     r_alice_first_bind = client.put(
@@ -2821,22 +3188,20 @@ def test_round2_review_fixes_group_permissions_generations_locks_unknown_and_cre
         },
     )
     assert r_alice_first_bind.status_code == 200
+    assert str(store.chat_bindings[("feishu", "feishu:oc_grp1")]["workspace_id"]) == ws_a
     assert (
         store.session_generations[("feishu", "chat:oc_grp1", "u-alice")]["generation"]
-        == 2
+        == 1
     )
     assert (
         store.session_generations[("feishu", "chat:oc_grp1:thread:sub1", "u-bob")][
             "generation"
         ]
-        == 3
+        == 2
     )
-    assert (
-        store.session_generations[("feishu", "chat:oc_grp1:thread:sub1", "u-bob")][
-            "pending_interrupt"
-        ]
-        is None
-    )
+    assert store.session_generations[("feishu", "chat:oc_grp1:thread:sub1", "u-bob")][
+        "pending_interrupt"
+    ] == {"interrupt_id": "i1"}
 
     # Decision 2 (2): GET /bindings visibility:
     # - u-bob (non-member) does NOT see feishu:oc_grp1 in chat_bindings;
@@ -2870,7 +3235,7 @@ def test_round2_review_fixes_group_permissions_generations_locks_unknown_and_cre
     assert r_i8_bob.status_code == 200
     assert r_i8_bob.json()["targets"][0]["ok"] is False
 
-    # Decision 3 (2): Changing group workspace (ws_a -> ws_b) advances all group generations (2 -> 3 and 3 -> 4)
+    # Changing group notification workspace (ws_a -> ws_b) updates chat_bindings without advancing personal generations
     channel_test_env["current_web_user"]["user_id"] = "u-alice"
     r_alice_change_ws = client.put(
         "/api/v1/dalton/channels/settings",
@@ -2887,19 +3252,19 @@ def test_round2_review_fixes_group_permissions_generations_locks_unknown_and_cre
         },
     )
     assert r_alice_change_ws.status_code == 200
+    assert str(store.chat_bindings[("feishu", "feishu:oc_grp1")]["workspace_id"]) == ws_b
     assert (
         store.session_generations[("feishu", "chat:oc_grp1", "u-alice")]["generation"]
-        == 3
+        == 1
     )
     assert (
         store.session_generations[("feishu", "chat:oc_grp1:thread:sub1", "u-bob")][
             "generation"
         ]
-        == 4
+        == 2
     )
 
-    # Decision 3 (3): Deleting group from settings removes dalton_channel_chat_bindings row
-    # AND advances all group generations (3 -> 4 and 4 -> 5)
+    # Deleting group from settings removes dalton_channel_chat_bindings row without advancing personal generations
     r_alice_del_grp = client.put(
         "/api/v1/dalton/channels/settings",
         json={
@@ -2918,13 +3283,13 @@ def test_round2_review_fixes_group_permissions_generations_locks_unknown_and_cre
     assert ("feishu", "feishu:oc_grp1") not in store.chat_bindings
     assert (
         store.session_generations[("feishu", "chat:oc_grp1", "u-alice")]["generation"]
-        == 4
+        == 1
     )
     assert (
         store.session_generations[("feishu", "chat:oc_grp1:thread:sub1", "u-bob")][
             "generation"
         ]
-        == 5
+        == 2
     )
 
     # Decision 5: `unknown` current-turn text delivery is reported by I-7 and blocks `fallback:<run_id>` in I-6
@@ -3134,7 +3499,7 @@ def test_round3_review_fixes_unit(channel_test_env):
         assert r_in.status_code == 200
         assert r_in.json()["generation"] == 1
 
-    # Alice binds feishu:oc_r3_grp -> ws_1 via Web PUT /settings (generation advances 1 -> 2)
+    # Alice binds feishu:oc_r3_grp -> ws_1 via Web PUT /settings (updates chat_bindings; personal generations stay 1)
     channel_test_env["current_web_user"]["user_id"] = "u-alice"
     v_alice_0 = client.get("/api/v1/dalton/channels/bindings").json()["settings"]["version"]
     r_alice_bind = client.put(
@@ -3152,12 +3517,32 @@ def test_round3_review_fixes_unit(channel_test_env):
         },
     )
     assert r_alice_bind.status_code == 200
+    assert str(store.chat_bindings[("feishu", "feishu:oc_r3_grp")]["workspace_id"]) == ws_1
     assert (
         store.session_generations[("feishu", "chat:oc_r3_grp", "u-alice")]["generation"]
-        == 2
+        == 1
     )
     assert (
         store.session_generations[("feishu", "chat:oc_r3_grp", "u-bob")]["generation"]
+        == 1
+    )
+
+    # Alice advances her personal generation in chat:oc_r3_grp (1 -> 2) via /new
+    r_alice_new = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "new",
+            "platform": "feishu",
+            "dalton_user_id": "u-alice",
+            "chat_type": "group",
+            "chat_address": "feishu:oc_r3_grp",
+            "scope_key": "chat:oc_r3_grp",
+        },
+    )
+    assert r_alice_new.status_code == 200
+    assert (
+        store.session_generations[("feishu", "chat:oc_r3_grp", "u-alice")]["generation"]
         == 2
     )
 
@@ -3213,13 +3598,15 @@ def test_round3_review_fixes_unit(channel_test_env):
     assert r_bob_same_ws.status_code == 200
     assert (
         store.session_generations[("feishu", "chat:oc_r3_grp", "u-bob")]["generation"]
-        == 2
+        == 1
     )
     assert store.session_generations[("feishu", "chat:oc_r3_grp", "u-bob")][
         "pending_interrupt"
     ] == {"interrupt_id": "int_keep"}
 
-    # Decision 2 (b): Bob switches the group to ws_2 via I-3 `/workspace` (generation advances 2 -> 3, global binding is now ws_2,
+    # Decision 2 (b): Bob switches his personal session in chat:oc_r3_grp to ws_2 via I-3 `/workspace`
+    # (advances ONLY Bob's personal generation 1 -> 2, leaving Alice's generation at 2 and global chat_bindings at ws_1),
+    # and then Bob updates group notification binding to ws_2 via PUT /settings (updating global chat_bindings to ws_2
     # while Alice's saved settings still have feishu:oc_r3_grp -> ws_1).
     r_slash_sw = client.post(
         "/api/v1/dalton/channels/internal/session/command",
@@ -3237,11 +3624,32 @@ def test_round3_review_fixes_unit(channel_test_env):
     )
     assert r_slash_sw.status_code == 200
     assert r_slash_sw.json()["ok"] is True
-    assert str(store.chat_bindings[("feishu", "feishu:oc_r3_grp")]["workspace_id"]) == ws_2
+    assert (
+        store.session_generations[("feishu", "chat:oc_r3_grp", "u-bob")]["generation"]
+        == 2
+    )
     assert (
         store.session_generations[("feishu", "chat:oc_r3_grp", "u-alice")]["generation"]
-        == 3
+        == 2
     )
+    assert str(store.chat_bindings[("feishu", "feishu:oc_r3_grp")]["workspace_id"]) == ws_1
+
+    r_bob_grp_ws2 = client.put(
+        "/api/v1/dalton/channels/settings",
+        json={
+            "version": r_bob_same_ws.json()["version"],
+            "settings": {
+                "feishu": {
+                    "preferred": "feishu:@me",
+                    "chats": {"feishu:oc_r3_grp": {"workspace_id": ws_2, "name": "R3 Grp"}},
+                    "automation_output": {},
+                    "agent_messages": {"enabled": True, "allowed": ["feishu:@me"]},
+                }
+            },
+        },
+    )
+    assert r_bob_grp_ws2.status_code == 200
+    assert str(store.chat_bindings[("feishu", "feishu:oc_r3_grp")]["workspace_id"]) == ws_2
 
     # Alice updates automation_output only (her chats still has feishu:oc_r3_grp -> ws_1 unchanged relative to her last save).
     # Must NOT overwrite global binding back to ws_1 and must NOT advance generations!
@@ -3258,11 +3666,11 @@ def test_round3_review_fixes_unit(channel_test_env):
     assert str(store.chat_bindings[("feishu", "feishu:oc_r3_grp")]["workspace_id"]) == ws_2
     assert (
         store.session_generations[("feishu", "chat:oc_r3_grp", "u-alice")]["generation"]
-        == 3
+        == 2
     )
 
     # Decision 2 (c): Alice now deletes feishu:oc_r3_grp from her own settings.
-    # Because global binding is ws_2 (switched by Bob), NOT ws_1 (Alice's old setting),
+    # Because global binding is ws_2 (updated by Bob), NOT ws_1 (Alice's old setting),
     # deleting from Alice's settings only removes it from Alice's settings and does NOT delete global binding ws_2 or advance generations!
     r_alice_del_stale = client.put(
         "/api/v1/dalton/channels/settings",
@@ -3283,7 +3691,7 @@ def test_round3_review_fixes_unit(channel_test_env):
     assert str(store.chat_bindings[("feishu", "feishu:oc_r3_grp")]["workspace_id"]) == ws_2
     assert (
         store.session_generations[("feishu", "chat:oc_r3_grp", "u-alice")]["generation"]
-        == 3
+        == 2
     )
 
     # Decision 1: Alice unbinds ou_alice and binds a new Feishu account ou_alice_2 that has NEVER spoken in feishu:oc_r3_grp.
@@ -3407,7 +3815,8 @@ def test_round4_lock_order_and_readonly_name_unit(channel_test_env):
         )
         assert r_init.status_code == 200
 
-    # Bob switches G1 to ws_2 via `/workspace` (so global binding for G1 is ws_2, while Alice's saved settings still have G1 -> ws_1 with name="Group 1")
+    # Bob switches his personal session in G1 to ws_2 via `/workspace` (advancing only Bob's personal generation),
+    # and global binding for G1 is ws_2 while Alice's and Bob's saved settings still have G1 -> ws_1 with name="Group 1"
     r_sw = client.post(
         "/api/v1/dalton/channels/internal/session/command",
         headers=headers,
@@ -3423,6 +3832,7 @@ def test_round4_lock_order_and_readonly_name_unit(channel_test_env):
         },
     )
     assert r_sw.status_code == 200
+    store.chat_bindings[("feishu", "feishu:oc_g1")]["workspace_id"] = UUID(ws_2)
     gen_g1_before = store.session_generations[("feishu", "chat:oc_g1", "u-alice")][
         "generation"
     ]
@@ -4215,12 +4625,12 @@ def test_weixin_context_order_source_and_invalid_inbound_unit(
 ) -> None:
     """Context order comes from the field name, and a missing message id stays ignored.
 
-    `seq` / `weixin_context_seq` is protocol and advances only when the value is
-    greater. `create_time_ms` is platform time and is used only when no protocol
-    seq is present. A message with neither field takes the next receive ordinal
-    while the saved source is receive. A higher-priority field replaces a lower
-    one even when its number is smaller. The same message id never rolls the
-    token back. Binding an older message copies the current token.
+    Protocol seq and platform time each keep a high-water for this bot
+    generation and sender, including while another field is current. A new
+    message id may still install a different field, and a message with neither
+    field takes a receive revision. An older value, a replayed message id, or
+    binding that older message does not replace the current token. I-6 and I-9
+    keep that current token when the caller names the older message id.
     """
     client: TestClient = channel_test_env["client"]
     headers = channel_test_env["headers"]
@@ -4299,6 +4709,42 @@ def test_weixin_context_order_source_and_invalid_inbound_unit(
     assert saved(alice)["seq"] == 8
     assert saved(alice)["encrypted_context_token"] == "T_seq8"
     assert store.inbound_events[("weixin", time_mid)]["weixin_context_seq"] == 1_700_000_000_000
+    assert store.inbound_events[("weixin", time_mid)]["encrypted_weixin_context_token"] == "T_time"
+
+    def current_token() -> str:
+        response = client.get(
+            "/api/v1/dalton/channels/internal/weixin-state",
+            headers=headers,
+            params={
+                "include_token": "true",
+                "recipient_platform_user_id": alice,
+                "inbound_message_id": time_mid,
+            },
+        )
+        assert response.status_code == 200
+        return str(response.json()["weixin_context_token"])
+
+    def notice_token(delivery_key: str) -> str:
+        response = client.post(
+            "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
+            headers=headers,
+            json={
+                "delivery_key": delivery_key,
+                "kind": "notice",
+                "platform": "weixin",
+                "target": f"weixin:{alice}",
+                "inbound_message_id": time_mid,
+                "has_non_empty_text": True,
+                "total_chunks": 1,
+            },
+        )
+        assert response.status_code == 200
+        body = response.json()
+        assert body["claim_status"] == "claimed"
+        return str(body["weixin_context_token"])
+
+    assert current_token() == "T_seq8"
+    assert notice_token("notice:order:time-while-seq8") == "T_seq8"
 
     post(alice, f"{bot_id}:seq8-again", "T_seq8_same", {"seq": 8})
     post(alice, f"{bot_id}:seq3", "T_seq3", {"seq": 3})
@@ -4310,11 +4756,21 @@ def test_weixin_context_order_source_and_invalid_inbound_unit(
     assert saved(alice)["encrypted_context_token"] == "T_big"
 
     post(alice, f"{bot_id}:later-time", "T_later_time", {"create_time_ms": 1_800_000_000_000})
+    assert saved(alice)["seq_source"] == "platform_time"
+    assert saved(alice)["seq"] == 1_800_000_000_000
+    assert saved(alice)["encrypted_context_token"] == "T_later_time"
     post(alice, f"{bot_id}:no-order", "T_receive", {})
+    assert saved(alice)["seq_source"] == "receive"
+    assert saved(alice)["seq"] == 1
+    assert saved(alice)["encrypted_context_token"] == "T_receive"
     post(alice, time_mid, "T_replay", {"create_time_ms": 1_900_000_000_000})
-    assert saved(alice)["seq_source"] == "protocol"
-    assert saved(alice)["seq"] == 1_700_000_000_000
-    assert saved(alice)["encrypted_context_token"] == "T_big"
+    assert saved(alice)["seq_source"] == "receive"
+    assert saved(alice)["seq"] == 1
+    assert saved(alice)["encrypted_context_token"] == "T_receive"
+    assert store.inbound_events[("weixin", time_mid)]["weixin_context_seq"] == 1_700_000_000_000
+    assert store.inbound_events[("weixin", time_mid)]["encrypted_weixin_context_token"] == "T_time"
+    assert current_token() == "T_receive"
+    assert notice_token("notice:order:time-while-receive") == "T_receive"
 
     channel_test_env["current_web_user"]["user_id"] = "u-alice"
     code = client.post("/api/v1/dalton/channels/bind-codes", json={"platform": "weixin"}).json()["code"]
@@ -4334,11 +4790,13 @@ def test_weixin_context_order_source_and_invalid_inbound_unit(
     )
     assert bound.status_code == 200
     assert bound.json()["ok"] is True
-    assert saved(alice)["encrypted_context_token"] == "T_big"
+    assert saved(alice)["seq_source"] == "receive"
+    assert saved(alice)["seq"] == 1
+    assert saved(alice)["encrypted_context_token"] == "T_receive"
     identity = store.identities[("u-alice", "weixin")]
-    assert identity["weixin_context_seq"] == 1_700_000_000_000
-    assert identity["weixin_context_seq_source"] == "protocol"
-    assert identity["encrypted_weixin_context_token"] == "T_big"
+    assert identity["weixin_context_seq"] == 1
+    assert identity["weixin_context_seq_source"] == "receive"
+    assert identity["encrypted_weixin_context_token"] == "T_receive"
 
     post(bob, f"{bot_id}:recv1", "R1", {})
     assert saved(bob)["seq_source"] == "receive"
@@ -4361,8 +4819,9 @@ def test_weixin_context_order_source_and_invalid_inbound_unit(
     assert saved(bob)["seq"] == 4
     assert saved(bob)["encrypted_context_token"] == "R5"
     post(bob, f"{bot_id}:ptime-after", "R6", {"create_time_ms": 999_999})
-    assert saved(bob)["seq_source"] == "protocol"
-    assert saved(bob)["encrypted_context_token"] == "R5"
+    assert saved(bob)["seq_source"] == "platform_time"
+    assert saved(bob)["seq"] == 999_999
+    assert saved(bob)["encrypted_context_token"] == "R6"
 
     post(
         carol,
@@ -4380,6 +4839,72 @@ def test_weixin_context_order_source_and_invalid_inbound_unit(
     assert saved(carol)["seq_source"] == "protocol"
     assert saved(carol)["seq"] == 2
     assert saved(carol)["encrypted_context_token"] == "P2"
+    assert saved(carol)["platform_time_high"] == 50
+    assert saved(carol)["protocol_seq_high"] == 2
+
+    dave = "wx_order_dave@im.wechat"
+    post(dave, f"{bot_id}:seq10", "D10", {"seq": 10})
+    assert saved(dave)["seq_source"] == "protocol"
+    assert saved(dave)["seq"] == 10
+    assert saved(dave)["protocol_seq_high"] == 10
+    post(dave, f"{bot_id}:noseq", "Drecv", {})
+    assert saved(dave)["seq_source"] == "receive"
+    assert saved(dave)["seq"] == 1
+    assert saved(dave)["encrypted_context_token"] == "Drecv"
+    assert saved(dave)["protocol_seq_high"] == 10
+    post(dave, f"{bot_id}:seq5", "D5", {"seq": 5})
+    assert saved(dave)["encrypted_context_token"] == "Drecv"
+    assert saved(dave)["protocol_seq_high"] == 10
+    post(dave, f"{bot_id}:seq11", "D11", {"seq": 11})
+    assert saved(dave)["seq_source"] == "protocol"
+    assert saved(dave)["seq"] == 11
+    assert saved(dave)["encrypted_context_token"] == "D11"
+    assert saved(dave)["protocol_seq_high"] == 11
+    post(dave, f"{bot_id}:noseq2", "Drecv2", {})
+    assert saved(dave)["seq_source"] == "receive"
+    assert saved(dave)["encrypted_context_token"] == "Drecv2"
+    assert saved(dave)["protocol_seq_high"] == 11
+    post(dave, f"{bot_id}:seq10", "D10replay", {"seq": 10})
+    assert saved(dave)["encrypted_context_token"] == "Drecv2"
+
+    erin = "wx_order_erin@im.wechat"
+    post(erin, f"{bot_id}:ptime-8000", "E8000", {"create_time_ms": 8000})
+    post(erin, f"{bot_id}:ptime-noseq", "Erecv", {})
+    assert saved(erin)["seq_source"] == "receive"
+    assert saved(erin)["encrypted_context_token"] == "Erecv"
+    assert saved(erin)["platform_time_high"] == 8000
+    post(erin, f"{bot_id}:ptime-7000", "E7000", {"create_time_ms": 7000})
+    assert saved(erin)["encrypted_context_token"] == "Erecv"
+    post(erin, f"{bot_id}:ptime-9000", "E9000", {"create_time_ms": 9000})
+    assert saved(erin)["seq_source"] == "platform_time"
+    assert saved(erin)["seq"] == 9000
+    assert saved(erin)["encrypted_context_token"] == "E9000"
+
+    frank = "wx_order_frank@im.wechat"
+    post(frank, f"{bot_id}:mix-time", "Ftime", {"create_time_ms": 1_700_000_000_000})
+    post(frank, f"{bot_id}:mix-seq4", "Fseq4", {"seq": 4})
+    assert saved(frank)["seq_source"] == "protocol"
+    assert saved(frank)["seq"] == 4
+    assert saved(frank)["encrypted_context_token"] == "Fseq4"
+    assert saved(frank)["platform_time_high"] == 1_700_000_000_000
+    post(frank, f"{bot_id}:mix-old-time", "Foldtime", {"create_time_ms": 1_600_000_000_000})
+    post(frank, f"{bot_id}:mix-seq3", "Fseq3", {"seq": 3})
+    assert saved(frank)["encrypted_context_token"] == "Fseq4"
+    post(frank, f"{bot_id}:mix-seq9", "Fseq9", {"seq": 9})
+    assert saved(frank)["seq"] == 9
+    assert saved(frank)["encrypted_context_token"] == "Fseq9"
+    post(frank, f"{bot_id}:mix-later-time", "Flater", {"create_time_ms": 1_800_000_000_000})
+    assert saved(frank)["seq_source"] == "platform_time"
+    assert saved(frank)["seq"] == 1_800_000_000_000
+    assert saved(frank)["encrypted_context_token"] == "Flater"
+    assert saved(frank)["protocol_seq_high"] == 9
+
+    greg = "wx_order_greg@im.wechat"
+    post(greg, f"{bot_id}:greg-seq1", "G1", {"seq": 1})
+    assert saved(greg)["seq_source"] == "protocol"
+    assert saved(greg)["seq"] == 1
+    assert saved(greg)["encrypted_context_token"] == "G1"
+    assert saved(dave)["protocol_seq_high"] == 11
 
     workspaces_before = len(store.workspaces)
     invalid_mid = f"{bot_id}:invalid:missing-message-id"
@@ -4461,3 +4986,1558 @@ def test_weixin_context_order_source_and_invalid_inbound_unit(
     assert store.inbound_events[("weixin", valid_mid)]["status"] == "pending"
     assert invalid_mid not in recovered_ids
 
+    restarted = client.put(
+        "/api/v1/dalton/channels/internal/weixin-state",
+        headers=headers,
+        json={
+            "login_session_action": "start",
+            "login_session_key": "sess-order-2",
+            "login_owner_user_id": "u-admin",
+            "login_status": "wait",
+            "login_qrcode": "qr-order-2",
+            "login_qrcode_img_content": "data:image/png;base64,AAAA",
+            "login_expires_in_seconds": 300,
+        },
+    )
+    assert restarted.status_code == 200
+    reconfirmed = client.put(
+        "/api/v1/dalton/channels/internal/weixin-state",
+        headers=headers,
+        json={
+            "login_session_action": "confirm",
+            "login_session_key": "sess-order-2",
+            "login_owner_user_id": "u-admin",
+            "expected_login_version": restarted.json()["login_version"],
+            "expected_bot_generation": restarted.json()["expected_bot_generation"],
+            "ilink_bot_id": bot_id,
+            "owner_user_id": "u-admin",
+            "bot_token": "secret-bot-token-order-2",
+            "base_url": "https://ilinkai.weixin.qq.com",
+            "status": "active",
+            "ilink_user_id": "wx_admin_order@im.wechat",
+            "ilink_username": "Order Admin",
+        },
+    )
+    assert reconfirmed.status_code == 200
+    assert reconfirmed.json()["updated"] is True
+    gen2 = int(reconfirmed.json()["bot_generation"])
+    assert gen2 == gen + 1
+    assert (bot_id, gen, dave) not in store.weixin_context_tokens
+    post(dave, f"{bot_id}:seq1-newgen", "D1", {"seq": 1})
+    fresh = store.weixin_context_tokens[(bot_id, gen2, dave)]
+    assert fresh["seq_source"] == "protocol"
+    assert fresh["seq"] == 1
+    assert fresh["protocol_seq_high"] == 1
+    assert fresh["encrypted_context_token"] == "D1"
+
+
+def test_ch1_dm_default_home_switch_new_main_and_ambiguous_or_denied_unit(
+    channel_test_env: dict[str, Any],
+) -> None:
+    """Verify CH-1 workspace command flows:
+    - DM defaults to Chief of Staff (Home);
+    - exact outer-trimmed name switch (including Chinese and spaces), /new within workspace, /main back to Chief of Staff;
+    - duplicate workspace names return `workspace_ambiguous` + `candidates` without changing session;
+    - reserved name workspace ('home') can be selected via UUID while `/main` (`target_kind='home'`) selects Chief of Staff;
+    - unauthorized/non-existent workspace keeps current selection;
+    - user who lost write permission on selected workspace is denied on I-1 (not silently rerouted to Home) but can still `/main` or switch to a writable workspace.
+    """
+    client: TestClient = channel_test_env["client"]
+    headers = channel_test_env["headers"]
+    store: InMemoryChannelStore = channel_test_env["store"]
+    writable_by_user = channel_test_env["writable_by_user"]
+
+    ws_cn = str(uuid4())
+    ws_dup_1 = str(uuid4())
+    ws_dup_2 = str(uuid4())
+    ws_reserved_home = str(uuid4())
+    ws_revoked = str(uuid4())
+
+    for wid, wname in (
+        (ws_cn, "半导体 深度研究"),
+        (ws_dup_1, "量化策略"),
+        (ws_dup_2, "量化策略"),
+        (ws_reserved_home, "home"),
+        (ws_revoked, "Revoked WS"),
+    ):
+        store.workspaces[wid] = {
+            "workspace_id": UUID(wid),
+            "user_id": "u-bob",
+            "name": wname,
+            "status": "running",
+            "is_home": False,
+        }
+    writable_by_user["u-alice"] = {
+        ws_cn: "半导体 深度研究",
+        ws_dup_1: "量化策略",
+        ws_dup_2: "量化策略",
+        ws_reserved_home: "home",
+        ws_revoked: "Revoked WS",
+    }
+
+    channel_test_env["current_web_user"]["user_id"] = "u-alice"
+    code = client.post(
+        "/api/v1/dalton/channels/bind-codes", json={"platform": "feishu"}
+    ).json()["code"]
+    client.post(
+        "/api/v1/dalton/channels/internal/bind-code/consume",
+        headers=headers,
+        json={
+            "action": "bind",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_ch1",
+            "code": code,
+            "is_group": False,
+        },
+    )
+
+    home_id = get_home_workspace_id("u-alice")
+    dm_scope = "dm:ou_alice_ch1"
+
+    # 1. Default DM inbound resolves to Chief of Staff (Home) at generation 1
+    r_dm_init = client.post(
+        "/api/v1/dalton/channels/internal/inbound/register-and-resolve",
+        headers=headers,
+        json={
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_ch1",
+            "chat_type": "dm",
+            "chat_address": "feishu:@me",
+            "thread_scope_key": dm_scope,
+            "message_id": "om_ch1_dm_1",
+        },
+    ).json()
+    assert r_dm_init["allowed"] is True
+    assert r_dm_init["workspace_id"] == home_id
+    assert r_dm_init["generation"] == 1
+
+    # 2. Switch by Chinese name with internal spaces (`target_kind='shortcut_name'`) -> gen 2
+    r_sw_cn = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_switch",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_ch1",
+            "chat_type": "dm",
+            "chat_address": "feishu:@me",
+            "scope_key": dm_scope,
+            "message_id": "om_ch1_cmd_cn",
+            "workspace_query": "  半导体 深度研究  ",
+            "target_kind": "shortcut_name",
+        },
+    ).json()
+    assert r_sw_cn["ok"] is True
+    assert r_sw_cn["workspace_id"] == ws_cn
+    assert r_sw_cn["workspace_name"] == "半导体 深度研究"
+    assert r_sw_cn["is_home"] is False
+    assert r_sw_cn["generation"] == 2
+
+    # 3. /new inside ws_cn advances generation once (2 -> 3) while keeping ws_cn
+    store.session_generations[("feishu", dm_scope, "u-alice")]["pending_interrupt"] = {
+        "interrupt_id": "int_old",
+        "generation": 2,
+    }
+    r_new_ws = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "new",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_ch1",
+            "chat_type": "dm",
+            "chat_address": "feishu:@me",
+            "scope_key": dm_scope,
+            "message_id": "om_ch1_cmd_new1",
+        },
+    ).json()
+    assert r_new_ws["ok"] is True
+    assert r_new_ws["workspace_id"] == ws_cn
+    assert r_new_ws["workspace_name"] == "半导体 深度研究"
+    assert r_new_ws["is_home"] is False
+    assert r_new_ws["generation"] == 3
+    assert (
+        store.session_generations[("feishu", dm_scope, "u-alice")]["pending_interrupt"]
+        is None
+    )
+
+    # 4. Duplicate workspace name returns workspace_ambiguous + candidates and keeps gen 3 & ws_cn
+    r_sw_dup = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_switch",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_ch1",
+            "chat_type": "dm",
+            "chat_address": "feishu:@me",
+            "scope_key": dm_scope,
+            "message_id": "om_ch1_cmd_dup",
+            "workspace_query": "量化策略",
+            "target_kind": "shortcut_name",
+        },
+    ).json()
+    assert r_sw_dup["ok"] is False
+    assert r_sw_dup["deny_reason"] == "workspace_ambiguous"
+    assert {c["workspace_id"] for c in r_sw_dup["candidates"]} == {ws_dup_1, ws_dup_2}
+    assert (
+        store.session_generations[("feishu", dm_scope, "u-alice")]["generation"] == 3
+    )
+    assert (
+        str(
+            store.session_generations[("feishu", dm_scope, "u-alice")][
+                "override_workspace_id"
+            ]
+        )
+        == ws_cn
+    )
+
+    # Disambiguate via explicit UUID -> gen 4
+    r_sw_uuid = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_switch",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_ch1",
+            "chat_type": "dm",
+            "chat_address": "feishu:@me",
+            "scope_key": dm_scope,
+            "message_id": "om_ch1_cmd_uuid",
+            "workspace_id": ws_dup_2,
+            "target_kind": "workspace_id",
+        },
+    ).json()
+    assert r_sw_uuid["ok"] is True
+    assert r_sw_uuid["workspace_id"] == ws_dup_2
+    assert r_sw_uuid["generation"] == 4
+
+    # 5. Reserved name workspace ('home') can be selected via `target_kind='exact_name'` (`/workspace home`) or `target_kind='workspace_id'` -> gen 5,
+    # while `/main` (`target_kind='home'`) returns to Chief of Staff -> gen 6
+    r_sw_res_home = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_switch",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_ch1",
+            "chat_type": "dm",
+            "chat_address": "feishu:@me",
+            "scope_key": dm_scope,
+            "message_id": "om_ch1_cmd_res_home",
+            "workspace_query": "home",
+            "target_kind": "exact_name",
+        },
+    ).json()
+    assert r_sw_res_home["ok"] is True
+    assert r_sw_res_home["workspace_id"] == ws_reserved_home
+    assert r_sw_res_home["override_workspace_id"] == ws_reserved_home
+    assert r_sw_res_home["is_home"] is False
+    assert r_sw_res_home["generation"] == 5
+
+    r_main = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_switch",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_ch1",
+            "chat_type": "dm",
+            "chat_address": "feishu:@me",
+            "scope_key": dm_scope,
+            "message_id": "om_ch1_cmd_main",
+            "workspace_id": "home",
+            "target_kind": "home",
+        },
+    ).json()
+    assert r_main["ok"] is True
+    assert r_main["workspace_id"] == home_id
+    assert r_main["workspace_name"] == "Chief of Staff"
+    assert r_main["is_home"] is True
+    assert r_main["generation"] == 6
+
+    # 6. Switch to ws_revoked -> gen 7, then revoke write access:
+    # Normal I-1 message is denied with workspace_write_denied (not silently rerouted to Home),
+    # while `/main` still succeeds and switches to Chief of Staff (gen 8)!
+    r_sw_rev = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_switch",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_ch1",
+            "chat_type": "dm",
+            "chat_address": "feishu:@me",
+            "scope_key": dm_scope,
+            "message_id": "om_ch1_cmd_rev",
+            "workspace_id": ws_revoked,
+        },
+    ).json()
+    assert r_sw_rev["ok"] is True
+    assert r_sw_rev["generation"] == 7
+
+    writable_by_user["u-alice"].pop(ws_revoked, None)
+
+    r_in_denied = client.post(
+        "/api/v1/dalton/channels/internal/inbound/register-and-resolve",
+        headers=headers,
+        json={
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_ch1",
+            "chat_type": "dm",
+            "chat_address": "feishu:@me",
+            "thread_scope_key": dm_scope,
+            "message_id": "om_ch1_dm_revoked",
+        },
+    ).json()
+    assert r_in_denied["allowed"] is False
+    assert r_in_denied["deny_reason"] == "workspace_write_denied"
+
+    r_recover_main = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_switch",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_ch1",
+            "chat_type": "dm",
+            "chat_address": "feishu:@me",
+            "scope_key": dm_scope,
+            "message_id": "om_ch1_cmd_recover_main",
+            "workspace_id": "home",
+            "target_kind": "home",
+        },
+    ).json()
+    assert r_recover_main["ok"] is True
+    assert r_recover_main["is_home"] is True
+    assert r_recover_main["generation"] == 8
+
+
+def test_ch1_six_hour_inactivity_expiry_and_activity_updates_unit(
+    channel_test_env: dict[str, Any],
+) -> None:
+    """Verify CH-1 6-hour inactivity rules & activity timestamp updates:
+    - `< 6h` keeps workspace and extends `last_conversation_activity_at`;
+    - `== 6h` and `> 6h` reset to Chief of Staff (Home) and advance generation once on next message;
+    - already in Home at `>= 6h` does NOT advance generation;
+    - historical I-1 replay after `>= 6h` returns original persisted workspace/generation/external_thread_id;
+    - `/new` after `>= 6h` resets to Home and advances generation only once;
+    - explicit `/workspace` switch after `>= 6h` switches directly to target and advances generation only once;
+    - `/stop` after `>= 6h` targets effective Home session and does not cancel old workspace's run;
+    - `I-7 deliveries/progress` extends activity only on new chunk/file with `activity_origin='conversation'` and matching non-expired generation;
+    - `is_internal_query=True` on `workspace_list` does not extend activity.
+    """
+    client: TestClient = channel_test_env["client"]
+    headers = channel_test_env["headers"]
+    store: InMemoryChannelStore = channel_test_env["store"]
+    writable_by_user = channel_test_env["writable_by_user"]
+
+    ws_a = str(uuid4())
+    ws_b = str(uuid4())
+    for wid, wname in ((ws_a, "Alpha WS"), (ws_b, "Beta WS")):
+        store.workspaces[wid] = {
+            "workspace_id": UUID(wid),
+            "user_id": "u-alice",
+            "name": wname,
+            "status": "running",
+            "is_home": False,
+        }
+    writable_by_user["u-alice"] = {ws_a: "Alpha WS", ws_b: "Beta WS"}
+
+    t0 = datetime(2026, 11, 9, 0, 0, 0, tzinfo=timezone.utc)
+    store.current_time = t0
+
+    channel_test_env["current_web_user"]["user_id"] = "u-alice"
+    code = client.post(
+        "/api/v1/dalton/channels/bind-codes", json={"platform": "feishu"}
+    ).json()["code"]
+    client.post(
+        "/api/v1/dalton/channels/internal/bind-code/consume",
+        headers=headers,
+        json={
+            "action": "bind",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_6h",
+            "code": code,
+            "is_group": False,
+        },
+    )
+    home_id = get_home_workspace_id("u-alice")
+    dm_scope = "dm:ou_alice_6h"
+
+    # Switch to ws_a at t0 -> gen 2
+    r_sw1 = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_switch",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_6h",
+            "chat_type": "dm",
+            "scope_key": dm_scope,
+            "message_id": "om_6h_sw1",
+            "workspace_id": ws_a,
+        },
+    ).json()
+    assert r_sw1["generation"] == 2
+    assert r_sw1["workspace_id"] == ws_a
+
+    # 1. Before 6 hours (5h59m59s): stays in ws_a at gen 2 and updates activity to t1
+    t1 = t0 + timedelta(hours=5, minutes=59, seconds=59)
+    store.current_time = t1
+    r_before = client.post(
+        "/api/v1/dalton/channels/internal/inbound/register-and-resolve",
+        headers=headers,
+        json={
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_6h",
+            "chat_type": "dm",
+            "chat_address": "feishu:@me",
+            "thread_scope_key": dm_scope,
+            "message_id": "om_6h_msg_before",
+        },
+    ).json()
+    assert r_before["workspace_id"] == ws_a
+    assert r_before["generation"] == 2
+    assert (
+        store.session_generations[("feishu", dm_scope, "u-alice")][
+            "last_conversation_activity_at"
+        ]
+        == t1
+    )
+
+    # Internal workspace_list query at t1 + 3h does NOT extend last_conversation_activity_at
+    store.current_time = t1 + timedelta(hours=3)
+    r_internal_list = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_list",
+            "platform": "feishu",
+            "dalton_user_id": "u-alice",
+            "chat_type": "dm",
+            "scope_key": dm_scope,
+            "is_internal_query": True,
+        },
+    ).json()
+    assert r_internal_list["ok"] is True
+    assert r_internal_list["current_workspace_id"] == ws_a
+    assert (
+        store.session_generations[("feishu", dm_scope, "u-alice")][
+            "last_conversation_activity_at"
+        ]
+        == t1
+    )
+
+    # 2. Exact 6-hour boundary (`t1 + 6h`): next message resets to Home and advances gen 2 -> 3
+    t2 = t1 + timedelta(hours=6)
+    store.current_time = t2
+    r_boundary = client.post(
+        "/api/v1/dalton/channels/internal/inbound/register-and-resolve",
+        headers=headers,
+        json={
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_6h",
+            "chat_type": "dm",
+            "chat_address": "feishu:@me",
+            "thread_scope_key": dm_scope,
+            "message_id": "om_6h_msg_boundary",
+        },
+    ).json()
+    assert r_boundary["workspace_id"] == home_id
+    assert r_boundary["generation"] == 3
+
+    # Replaying `om_6h_msg_before` AFTER 6-hour expiry still returns original ws_a and generation 2!
+    r_replay_old = client.post(
+        "/api/v1/dalton/channels/internal/inbound/register-and-resolve",
+        headers=headers,
+        json={
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_6h",
+            "chat_type": "dm",
+            "chat_address": "feishu:@me",
+            "thread_scope_key": dm_scope,
+            "message_id": "om_6h_msg_before",
+        },
+    ).json()
+    assert r_replay_old["existing_status"] == "pending"
+    assert r_replay_old["workspace_id"] == ws_a
+    assert r_replay_old["generation"] == 2
+    assert r_replay_old["external_thread_id"] == "feishu:dm:ou_alice_6h:gen:2"
+
+    # 3. Already in Home: after another 6h01m, next message stays in Home at gen 3 (no extra generation bump)
+    t3 = t2 + timedelta(hours=6, minutes=1)
+    store.current_time = t3
+    r_home_stay = client.post(
+        "/api/v1/dalton/channels/internal/inbound/register-and-resolve",
+        headers=headers,
+        json={
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_6h",
+            "chat_type": "dm",
+            "chat_address": "feishu:@me",
+            "thread_scope_key": dm_scope,
+            "message_id": "om_6h_msg_home_stay",
+        },
+    ).json()
+    assert r_home_stay["workspace_id"] == home_id
+    assert r_home_stay["generation"] == 3
+
+    # 4. Switch to ws_a (gen 4), wait > 6h, then `/new` -> resets to Home and advances generation ONLY ONCE (4 -> 5)
+    client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_switch",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_6h",
+            "chat_type": "dm",
+            "scope_key": dm_scope,
+            "message_id": "om_6h_sw2",
+            "workspace_id": ws_a,
+        },
+    )
+    t4 = t3 + timedelta(hours=6, minutes=5)
+    store.current_time = t4
+    r_new_expired = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "new",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_6h",
+            "chat_type": "dm",
+            "scope_key": dm_scope,
+            "message_id": "om_6h_new_exp",
+        },
+    ).json()
+    assert r_new_expired["ok"] is True
+    assert r_new_expired["is_home"] is True
+    assert r_new_expired["workspace_id"] == home_id
+    assert r_new_expired["generation"] == 5
+
+    # 5. Switch to ws_a (gen 6), wait > 6h, then explicit `/workspace ws_b` -> goes directly to ws_b at gen 7
+    client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_switch",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_6h",
+            "chat_type": "dm",
+            "scope_key": dm_scope,
+            "message_id": "om_6h_sw3",
+            "workspace_id": ws_a,
+        },
+    )
+    t5 = t4 + timedelta(hours=6, minutes=10)
+    store.current_time = t5
+    r_sw_direct = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_switch",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_6h",
+            "chat_type": "dm",
+            "scope_key": dm_scope,
+            "message_id": "om_6h_sw_direct",
+            "workspace_id": ws_b,
+        },
+    ).json()
+    assert r_sw_direct["ok"] is True
+    assert r_sw_direct["workspace_id"] == ws_b
+    assert r_sw_direct["generation"] == 7
+
+    # 6. Active run in ws_b (gen 7): after > 6h, `/stop` resets to Home (gen 8) and does NOT target ws_b's thread/run
+    old_tid = str(uuid4())
+    old_rid = str(uuid4())
+    client.post(
+        "/api/v1/dalton/channels/internal/inbound/register-and-resolve",
+        headers=headers,
+        json={
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_6h",
+            "chat_type": "dm",
+            "chat_address": "feishu:@me",
+            "thread_scope_key": dm_scope,
+            "message_id": "om_6h_wsb_turn",
+        },
+    )
+    client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=headers,
+        json={
+            "platform": "feishu",
+            "message_id": "om_6h_wsb_turn",
+            "status": "streaming",
+            "thread_id": old_tid,
+            "run_id": old_rid,
+            "turn_index": 1,
+        },
+    )
+    store.conversation_responses[old_rid] = {
+        "conversation_thread_id": old_tid,
+        "status": "in_progress",
+    }
+
+    # Incremental delivery progress at t5 + 2h with activity_origin='conversation' extends activity to t5 + 2h
+    t_dlv = t5 + timedelta(hours=2)
+    store.current_time = t_dlv
+    dkey_conv = f"fallback:{old_rid}"
+    client.post(
+        "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
+        headers=headers,
+        json={
+            "delivery_key": dkey_conv,
+            "kind": "fallback",
+            "user_id": "u-alice",
+            "thread_id": old_tid,
+            "run_id": old_rid,
+            "platform": "feishu",
+            "has_non_empty_text": True,
+            "total_chunks": 2,
+            "source_scope_key": dm_scope,
+            "source_generation": 7,
+            "activity_origin": "conversation",
+        },
+    )
+    client.post(
+        "/api/v1/dalton/channels/internal/deliveries/progress",
+        headers=headers,
+        json={
+            "delivery_key": dkey_conv,
+            "sent_chunks": 1,
+            "total_chunks": 2,
+            "status": "in_flight",
+        },
+    )
+    assert (
+        store.session_generations[("feishu", dm_scope, "u-alice")][
+            "last_conversation_activity_at"
+        ]
+        == t_dlv
+    )
+
+    # Duplicate chunk progress (sent_chunks still 1) at t_dlv + 1h does NOT extend activity
+    store.current_time = t_dlv + timedelta(hours=1)
+    client.post(
+        "/api/v1/dalton/channels/internal/deliveries/progress",
+        headers=headers,
+        json={
+            "delivery_key": dkey_conv,
+            "sent_chunks": 1,
+            "total_chunks": 2,
+            "status": "in_flight",
+        },
+    )
+    assert (
+        store.session_generations[("feishu", dm_scope, "u-alice")][
+            "last_conversation_activity_at"
+        ]
+        == t_dlv
+    )
+
+    # Replay delivery (activity_origin='replay') at t_dlv + 2h does NOT extend activity
+    store.current_time = t_dlv + timedelta(hours=2)
+    dkey_replay = f"tool:{old_rid}:replay1"
+    client.post(
+        "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
+        headers=headers,
+        json={
+            "delivery_key": dkey_replay,
+            "kind": "agent_send",
+            "user_id": "u-alice",
+            "thread_id": old_tid,
+            "run_id": old_rid,
+            "platform": "feishu",
+            "has_non_empty_text": True,
+            "total_chunks": 1,
+            "source_scope_key": dm_scope,
+            "source_generation": 7,
+            "activity_origin": "replay",
+        },
+    )
+    client.post(
+        "/api/v1/dalton/channels/internal/deliveries/progress",
+        headers=headers,
+        json={
+            "delivery_key": dkey_replay,
+            "sent_chunks": 1,
+            "total_chunks": 1,
+            "status": "sent",
+        },
+    )
+    assert (
+        store.session_generations[("feishu", dm_scope, "u-alice")][
+            "last_conversation_activity_at"
+        ]
+        == t_dlv
+    )
+
+    # Late chunk arriving AFTER 6 hours (`t_dlv + 6h01m`) does NOT re-activate expired session
+    t_expired = t_dlv + timedelta(hours=6, minutes=1)
+    store.current_time = t_expired
+    client.post(
+        "/api/v1/dalton/channels/internal/deliveries/progress",
+        headers=headers,
+        json={
+            "delivery_key": dkey_conv,
+            "sent_chunks": 2,
+            "total_chunks": 2,
+            "status": "sent",
+        },
+    )
+    assert (
+        store.session_generations[("feishu", dm_scope, "u-alice")][
+            "last_conversation_activity_at"
+        ]
+        == t_dlv
+    )
+
+    # `/stop` at `t_expired` sees the expired session, resets to Home (gen 8), and returns thread_id=None
+    r_stop_exp = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "stop",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_6h",
+            "chat_type": "dm",
+            "scope_key": dm_scope,
+            "message_id": "om_6h_stop_exp",
+        },
+    ).json()
+    assert r_stop_exp["ok"] is True
+    assert r_stop_exp["is_home"] is True
+    assert r_stop_exp["generation"] == 8
+    assert r_stop_exp["thread_id"] is None
+    assert r_stop_exp["run_id"] is None
+
+
+def test_ch1_atomic_command_idempotency_recovery_and_hitl_isolation_unit(
+    channel_test_env: dict[str, Any],
+) -> None:
+    """Verify CH-1 command idempotency, startup recovery of command rows, HITL generation isolation, and I-6 source thread workspace permission."""
+    client: TestClient = channel_test_env["client"]
+    headers = channel_test_env["headers"]
+    store: InMemoryChannelStore = channel_test_env["store"]
+    writable_by_user = channel_test_env["writable_by_user"]
+
+    ws_1 = str(uuid4())
+    ws_2 = str(uuid4())
+    for wid, wname in ((ws_1, "WS One"), (ws_2, "WS Two")):
+        store.workspaces[wid] = {
+            "workspace_id": UUID(wid),
+            "user_id": "u-bob",
+            "name": wname,
+            "status": "running",
+            "is_home": False,
+        }
+    writable_by_user["u-alice"] = {ws_1: "WS One", ws_2: "WS Two"}
+
+    channel_test_env["current_web_user"]["user_id"] = "u-alice"
+    code = client.post(
+        "/api/v1/dalton/channels/bind-codes", json={"platform": "feishu"}
+    ).json()["code"]
+    client.post(
+        "/api/v1/dalton/channels/internal/bind-code/consume",
+        headers=headers,
+        json={
+            "action": "bind",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_idem",
+            "code": code,
+            "is_group": False,
+        },
+    )
+    dm_scope = "dm:ou_alice_idem"
+
+    # 1. Command idempotency: repeating `/new` with the same message_id returns duplicate=True and same generation (2)
+    r_new_1 = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "new",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_idem",
+            "chat_type": "dm",
+            "chat_address": "feishu:@me",
+            "scope_key": dm_scope,
+            "message_id": "om_idem_new_1",
+        },
+    ).json()
+    assert r_new_1["ok"] is True
+    assert r_new_1["duplicate"] is False
+    assert r_new_1["generation"] == 2
+    assert r_new_1["command_reply_pending"] is True
+
+    r_new_2 = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "new",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_idem",
+            "chat_type": "dm",
+            "chat_address": "feishu:@me",
+            "scope_key": dm_scope,
+            "message_id": "om_idem_new_1",
+        },
+    ).json()
+    assert r_new_2["ok"] is True
+    assert r_new_2["duplicate"] is True
+    assert r_new_2["generation"] == 2
+
+    # 2. Startup recovery includes the pending-reply command row (`event_kind='command'`)
+    r_rec_1 = client.get(
+        "/api/v1/dalton/channels/internal/recover",
+        headers=headers,
+        params={"mode": "startup"},
+    ).json()
+    cmd_rows = [
+        r for r in r_rec_1["inbound_events"] if r["message_id"] == "om_idem_new_1"
+    ]
+    assert len(cmd_rows) == 1
+    assert cmd_rows[0]["event_kind"] == "command"
+    assert cmd_rows[0]["command_reply_pending"] is True
+
+    # Mark command reply completed via I-7 inbound/progress -> no longer in startup recovery
+    client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=headers,
+        json={
+            "platform": "feishu",
+            "message_id": "om_idem_new_1",
+            "status": "completed",
+            "command_effect_status": "done",
+            "command_reply_pending": False,
+        },
+    )
+    r_rec_2 = client.get(
+        "/api/v1/dalton/channels/internal/recover",
+        headers=headers,
+        params={"mode": "startup"},
+    ).json()
+    assert all(
+        r["message_id"] != "om_idem_new_1" for r in r_rec_2["inbound_events"]
+    )
+
+    # 3. HITL isolation across generations:
+    # Switch to ws_1 (gen 3), start thread_1, record interrupt for gen 3 -> sets both session and thread_watch pending_interrupt
+    client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_switch",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_idem",
+            "chat_type": "dm",
+            "scope_key": dm_scope,
+            "message_id": "om_idem_sw_ws1",
+            "workspace_id": ws_1,
+        },
+    )
+    tid_1 = str(uuid4())
+    rid_1 = str(uuid4())
+    int_gen3 = {
+        "interrupt_id": "int_g3",
+        "thread_id": tid_1,
+        "run_id": rid_1,
+        "generation": 3,
+    }
+    r_int_cur = client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=headers,
+        json={
+            "session_interrupt_update": {
+                "platform": "feishu",
+                "scope_key": dm_scope,
+                "dalton_user_id": "u-alice",
+                "generation": 3,
+                "thread_id": tid_1,
+                "run_id": rid_1,
+                "interrupt_id": "int_g3",
+                "pending_interrupt": int_gen3,
+            },
+            "thread_watch": {
+                "thread_id": tid_1,
+                "dalton_user_id": "u-alice",
+                "platform": "feishu",
+                "target_address": "feishu:@me",
+                "scope_key": dm_scope,
+                "generation": 3,
+                "last_seen_turn_index": 1,
+                "watch_active": True,
+                "pending_interrupt": int_gen3,
+            },
+        },
+    ).json()
+    assert r_int_cur["session_is_current_for_interrupt"] is True
+    assert (
+        store.session_generations[("feishu", dm_scope, "u-alice")]["pending_interrupt"]
+        == int_gen3
+    )
+    assert store.thread_watches[tid_1]["pending_interrupt"] == int_gen3
+
+    # Switch to ws_2 (gen 4) -> clears session pending_interrupt while preserving thread_watches[tid_1]["pending_interrupt"]!
+    client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_switch",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_idem",
+            "chat_type": "dm",
+            "scope_key": dm_scope,
+            "message_id": "om_idem_sw_ws2",
+            "workspace_id": ws_2,
+        },
+    )
+    assert (
+        store.session_generations[("feishu", dm_scope, "u-alice")]["pending_interrupt"]
+        is None
+    )
+    assert store.thread_watches[tid_1]["pending_interrupt"] == int_gen3
+
+    # Late interrupt from gen 3 thread_1 updates thread_watch but MUST NOT pollute gen 4 session!
+    late_int_gen3 = {
+        "interrupt_id": "int_g3_late",
+        "thread_id": tid_1,
+        "run_id": rid_1,
+        "generation": 3,
+    }
+    r_int_late = client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=headers,
+        json={
+            "session_interrupt_update": {
+                "platform": "feishu",
+                "scope_key": dm_scope,
+                "dalton_user_id": "u-alice",
+                "generation": 3,
+                "thread_id": tid_1,
+                "run_id": rid_1,
+                "interrupt_id": "int_g3_late",
+                "pending_interrupt": late_int_gen3,
+            },
+        },
+    ).json()
+    assert r_int_late["session_is_current_for_interrupt"] is False
+    assert (
+        store.session_generations[("feishu", dm_scope, "u-alice")]["pending_interrupt"]
+        is None
+    )
+    assert store.thread_watches[tid_1]["pending_interrupt"] == late_int_gen3
+
+    # 4. I-6 Scenario A2 verifies write permission on the source thread's actual workspace (ws_1),
+    # even in a group chat that has NO dalton_channel_chat_bindings row!
+    grp_in = client.post(
+        "/api/v1/dalton/channels/internal/inbound/register-and-resolve",
+        headers=headers,
+        json={
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_idem",
+            "chat_type": "group",
+            "chat_address": "feishu:oc_unbound_grp",
+            "thread_scope_key": "chat:oc_unbound_grp",
+            "message_id": "om_grp_unbound_1",
+        },
+    ).json()
+    assert grp_in["allowed"] is True
+    client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_switch",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_idem",
+            "chat_type": "group",
+            "chat_address": "feishu:oc_unbound_grp",
+            "scope_key": "chat:oc_unbound_grp",
+            "message_id": "om_grp_sw_ws1",
+            "workspace_id": ws_1,
+        },
+    )
+    client.post(
+        "/api/v1/dalton/channels/internal/inbound/register-and-resolve",
+        headers=headers,
+        json={
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_idem",
+            "chat_type": "group",
+            "chat_address": "feishu:oc_unbound_grp",
+            "thread_scope_key": "chat:oc_unbound_grp",
+            "message_id": "om_grp_turn_ws1",
+        },
+    )
+    grp_tid = str(uuid4())
+    grp_rid = str(uuid4())
+    client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=headers,
+        json={
+            "platform": "feishu",
+            "message_id": "om_grp_turn_ws1",
+            "status": "streaming",
+            "thread_id": grp_tid,
+            "run_id": grp_rid,
+            "turn_index": 1,
+        },
+    )
+
+    # While u-alice has write access to ws_1, Scenario A2 claim in `feishu:oc_unbound_grp` succeeds
+    r_claim_ok = client.post(
+        "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
+        headers=headers,
+        json={
+            "delivery_key": f"fallback:{grp_rid}",
+            "kind": "fallback",
+            "user_id": "u-alice",
+            "thread_id": grp_tid,
+            "run_id": grp_rid,
+            "platform": "feishu",
+            "has_non_empty_text": True,
+            "total_chunks": 1,
+        },
+    ).json()
+    assert r_claim_ok["claim_status"] == "claimed"
+
+    # Once u-alice loses write access to ws_1, Scenario A2 claim for that turn is denied!
+    writable_by_user["u-alice"].pop(ws_1, None)
+    r_claim_denied = client.post(
+        "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
+        headers=headers,
+        json={
+            "delivery_key": f"tool:{grp_rid}:after_revoke",
+            "kind": "agent_send",
+            "user_id": "u-alice",
+            "thread_id": grp_tid,
+            "run_id": grp_rid,
+            "platform": "feishu",
+            "has_non_empty_text": True,
+            "total_chunks": 1,
+        },
+    ).json()
+    assert r_claim_denied["claim_status"] == "denied"
+    assert r_claim_denied["code"] == "not_allowed"
+
+
+def test_ch1_stop_pinning_reauth_hitl_source_and_delivery_immutability_unit(
+    channel_test_env: dict[str, Any],
+) -> None:
+    """Verify CH-1 persistent recovery & security invariants:
+    - `/stop` pins concrete active `run_id` at command execution time; if no active run exists on the thread, `command_effect_status='done'` and `run_id=None` immediately, and startup recovery heals any `pending_cancel` row without `run_id`;
+    - same-workspace switch (`switched=False`) preserves `generation` and `pending_interrupt`, and case-sensitive workspace match takes priority before case-insensitive fallback;
+    - command redelivery/recovery re-verifies identity binding and workspace write access, filters `workspace_list` against current writable workspaces, and never leaks old results or re-applies `new`/`workspace_switch` side effects;
+    - `session_interrupt_update` rejects `generation=None` unless backed by a persisted source matching the current generation, and clearing `pending_interrupt` requires a matching `interrupt_id`/`run_id`/`thread_id`;
+    - `I-6` derives `source_scope_key` and `source_generation` from the persisted source row, rejects spoofed mismatches, and keeps delivery source fields immutable across conflict retries;
+    - `I-7` `command_effect_status='done'` extends `last_conversation_activity_at` only on the first transition from `pending_cancel` to `done`.
+    """
+    client: TestClient = channel_test_env["client"]
+    headers = channel_test_env["headers"]
+    store: InMemoryChannelStore = channel_test_env["store"]
+    writable_by_user = channel_test_env["writable_by_user"]
+
+    ws_upper = str(uuid4())
+    ws_lower = str(uuid4())
+    ws_extra = str(uuid4())
+    for wid, wname in (
+        (ws_upper, "Alpha"),
+        (ws_lower, "alpha"),
+        (ws_extra, "Beta"),
+    ):
+        store.workspaces[wid] = {
+            "workspace_id": UUID(wid),
+            "user_id": "u-owner",
+            "name": wname,
+            "status": "running",
+            "is_home": False,
+        }
+    writable_by_user["u-alice"] = {
+        ws_upper: "Alpha",
+        ws_lower: "alpha",
+        ws_extra: "Beta",
+    }
+    writable_by_user["u-bob"] = {ws_extra: "Beta"}
+
+    t0 = datetime(2026, 11, 9, 8, 0, 0, tzinfo=timezone.utc)
+    store.current_time = t0
+
+    channel_test_env["current_web_user"]["user_id"] = "u-alice"
+    code = client.post(
+        "/api/v1/dalton/channels/bind-codes", json={"platform": "feishu"}
+    ).json()["code"]
+    client.post(
+        "/api/v1/dalton/channels/internal/bind-code/consume",
+        headers=headers,
+        json={
+            "action": "bind",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_sec",
+            "code": code,
+            "is_group": False,
+        },
+    )
+    dm_scope = "dm:ou_alice_sec"
+
+    # 1. Exact case-sensitive workspace match takes priority over case-insensitive match (`Alpha` vs `alpha`)
+    r_sw_upper = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_switch",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_sec",
+            "chat_type": "dm",
+            "scope_key": dm_scope,
+            "message_id": "om_sec_sw_upper",
+            "workspace_query": "Alpha",
+            "target_kind": "shortcut_name",
+        },
+    ).json()
+    assert r_sw_upper["ok"] is True
+    assert r_sw_upper["workspace_id"] == ws_upper
+    assert r_sw_upper["switched"] is True
+    assert r_sw_upper["generation"] == 2
+
+    # 2. Switching to the SAME workspace (`Alpha`) while not expired preserves generation (2) and `pending_interrupt` (`switched=False`)
+    store.session_generations[("feishu", dm_scope, "u-alice")]["pending_interrupt"] = {
+        "interrupt_id": "int_keep",
+        "generation": 2,
+    }
+    r_sw_same = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_switch",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_sec",
+            "chat_type": "dm",
+            "scope_key": dm_scope,
+            "message_id": "om_sec_sw_same",
+            "workspace_query": "Alpha",
+            "target_kind": "shortcut_name",
+        },
+    ).json()
+    assert r_sw_same["ok"] is True
+    assert r_sw_same["workspace_id"] == ws_upper
+    assert r_sw_same["switched"] is False
+    assert r_sw_same["generation"] == 2
+    assert store.session_generations[("feishu", dm_scope, "u-alice")][
+        "pending_interrupt"
+    ] == {"interrupt_id": "int_keep", "generation": 2}
+
+    # 3. `/stop` when thread exists but has NO active run: `run_id=None`, `command_effect_status='done'`
+    r_in_g2 = client.post(
+        "/api/v1/dalton/channels/internal/inbound/register-and-resolve",
+        headers=headers,
+        json={
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_sec",
+            "chat_type": "dm",
+            "chat_address": "feishu:@me",
+            "thread_scope_key": dm_scope,
+            "message_id": "om_sec_turn_1",
+        },
+    ).json()
+    assert r_in_g2["generation"] == 2
+    tid_g2 = str(uuid4())
+    rid_g2_done = str(uuid4())
+    client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=headers,
+        json={
+            "platform": "feishu",
+            "message_id": "om_sec_turn_1",
+            "status": "completed",
+            "thread_id": tid_g2,
+            "run_id": rid_g2_done,
+            "turn_index": 1,
+        },
+    )
+    store.conversation_responses[rid_g2_done] = {
+        "conversation_thread_id": tid_g2,
+        "status": "completed",
+    }
+
+    r_stop_idle = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "stop",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_sec",
+            "chat_type": "dm",
+            "scope_key": dm_scope,
+            "message_id": "om_sec_stop_idle",
+        },
+    ).json()
+    assert r_stop_idle["ok"] is True
+    assert r_stop_idle["thread_id"] == tid_g2
+    assert r_stop_idle["run_id"] is None
+    assert r_stop_idle["command_effect_status"] == "done"
+    assert (
+        store.inbound_events[("feishu", "om_sec_stop_idle")]["command_effect_status"]
+        == "done"
+    )
+
+    # 4. `/stop` when an active run IS in progress: pins `run_id = rid_g2_active` and `command_effect_status = 'pending_cancel'`
+    rid_g2_active = str(uuid4())
+    store.conversation_responses[rid_g2_active] = {
+        "conversation_thread_id": tid_g2,
+        "status": "in_progress",
+    }
+    r_stop_active = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "stop",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_sec",
+            "chat_type": "dm",
+            "scope_key": dm_scope,
+            "message_id": "om_sec_stop_active",
+        },
+    ).json()
+    assert r_stop_active["ok"] is True
+    assert r_stop_active["thread_id"] == tid_g2
+    assert r_stop_active["run_id"] == rid_g2_active
+    assert r_stop_active["command_effect_status"] == "pending_cancel"
+
+    # 5. Idempotent `command_effect_status='done'` activity timestamp update:
+    # First transition from `pending_cancel` -> `done` at t0 + 10m advances `last_conversation_activity_at`,
+    # but repeating `command_effect_status='done'` at t0 + 20m does NOT advance it again!
+    t_done_1 = t0 + timedelta(minutes=10)
+    store.current_time = t_done_1
+    client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=headers,
+        json={
+            "platform": "feishu",
+            "message_id": "om_sec_stop_active",
+            "status": "completed",
+            "command_effect_status": "done",
+            "command_reply_pending": False,
+        },
+    )
+    assert (
+        store.session_generations[("feishu", dm_scope, "u-alice")][
+            "last_conversation_activity_at"
+        ]
+        == t_done_1
+    )
+
+    t_done_2 = t0 + timedelta(minutes=20)
+    store.current_time = t_done_2
+    client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=headers,
+        json={
+            "platform": "feishu",
+            "message_id": "om_sec_stop_active",
+            "status": "completed",
+            "command_effect_status": "done",
+            "command_reply_pending": False,
+        },
+    )
+    assert (
+        store.session_generations[("feishu", dm_scope, "u-alice")][
+            "last_conversation_activity_at"
+        ]
+        == t_done_1
+    )
+
+    # 6. Command redelivery & recovery authorization:
+    # Execute `workspace_list` while u-alice has access to Alpha, alpha, Beta
+    r_list_1 = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_list",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_sec",
+            "chat_type": "dm",
+            "scope_key": dm_scope,
+            "message_id": "om_sec_list_1",
+        },
+    ).json()
+    assert r_list_1["ok"] is True
+    assert {w["workspace_id"] for w in r_list_1["workspaces"]} == {
+        ws_upper,
+        ws_lower,
+        ws_extra,
+    }
+
+    # Revoke `ws_extra` from u-alice -> replaying `om_sec_list_1` filters out `ws_extra`!
+    writable_by_user["u-alice"].pop(ws_extra, None)
+    r_list_replay = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_list",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_sec",
+            "chat_type": "dm",
+            "scope_key": dm_scope,
+            "message_id": "om_sec_list_1",
+        },
+    ).json()
+    assert r_list_replay["ok"] is True
+    assert r_list_replay["duplicate"] is True
+    assert {w["workspace_id"] for w in r_list_replay["workspaces"]} == {
+        ws_upper,
+        ws_lower,
+    }
+
+    # Rebind `ou_alice_sec` to `u-bob` -> replaying `om_sec_list_1` (originally executed by `u-alice`)
+    # MUST fail with `not_linked` and mark the command row ignored/done without leaking u-alice's workspaces!
+    channel_test_env["current_web_user"]["user_id"] = "u-bob"
+    code_bob = client.post(
+        "/api/v1/dalton/channels/bind-codes", json={"platform": "feishu"}
+    ).json()["code"]
+    client.post(
+        "/api/v1/dalton/channels/internal/bind-code/consume",
+        headers=headers,
+        json={
+            "action": "bind",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_sec",
+            "code": code_bob,
+            "is_group": False,
+        },
+    )
+    r_list_hijack = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_list",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_sec",
+            "chat_type": "dm",
+            "scope_key": dm_scope,
+            "message_id": "om_sec_list_1",
+        },
+    ).json()
+    assert r_list_hijack["ok"] is False
+    assert r_list_hijack["linked"] is False
+    assert r_list_hijack["deny_reason"] == "not_linked"
+    assert "workspaces" not in r_list_hijack
+    assert "command_reply_pending" not in r_list_hijack
+    hijack_row = store.inbound_events[("feishu", "om_sec_list_1")]
+    assert hijack_row["status"] == "ignored"
+    assert hijack_row["command_effect_status"] == "done"
+    assert hijack_row["command_reply_pending"] is False
+    assert hijack_row["dalton_user_id"] == "u-alice"
+    assert "workspaces" not in (hijack_row.get("command_result") or {})
+
+    # Bind `ou_alice_sec_2` for u-alice to test HITL & I-6 spoofing protection
+    channel_test_env["current_web_user"]["user_id"] = "u-alice"
+    code_a2 = client.post(
+        "/api/v1/dalton/channels/bind-codes", json={"platform": "feishu"}
+    ).json()["code"]
+    client.post(
+        "/api/v1/dalton/channels/internal/bind-code/consume",
+        headers=headers,
+        json={
+            "action": "bind",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_sec_2",
+            "code": code_a2,
+            "is_group": False,
+        },
+    )
+    dm_scope_2 = "dm:ou_alice_sec_2"
+    r_in_s2 = client.post(
+        "/api/v1/dalton/channels/internal/inbound/register-and-resolve",
+        headers=headers,
+        json={
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_sec_2",
+            "chat_type": "dm",
+            "chat_address": "feishu:@me",
+            "thread_scope_key": dm_scope_2,
+            "message_id": "om_s2_g1",
+        },
+    ).json()
+    assert r_in_s2["generation"] == 1
+    tid_s2_g1 = str(uuid4())
+    rid_s2_g1 = str(uuid4())
+    client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=headers,
+        json={
+            "platform": "feishu",
+            "message_id": "om_s2_g1",
+            "status": "streaming",
+            "thread_id": tid_s2_g1,
+            "run_id": rid_s2_g1,
+            "turn_index": 1,
+            "thread_watch": {
+                "thread_id": tid_s2_g1,
+                "dalton_user_id": "u-alice",
+                "platform": "feishu",
+                "target_address": "feishu:@me",
+                "scope_key": dm_scope_2,
+                "generation": 1,
+                "last_seen_turn_index": 1,
+                "watch_active": True,
+            },
+        },
+    )
+
+    # Advance session to gen 2 via `/new` and set an active pending_interrupt on gen 2
+    client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "new",
+            "platform": "feishu",
+            "platform_user_id": "ou_alice_sec_2",
+            "chat_type": "dm",
+            "scope_key": dm_scope_2,
+            "message_id": "om_s2_new_g2",
+        },
+    )
+    tid_s2_g2 = str(uuid4())
+    rid_s2_g2 = str(uuid4())
+    int_g2 = {
+        "interrupt_id": "int_g2_active",
+        "thread_id": tid_s2_g2,
+        "run_id": rid_s2_g2,
+        "generation": 2,
+    }
+    r_set_int_g2 = client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=headers,
+        json={
+            "session_interrupt_update": {
+                "platform": "feishu",
+                "scope_key": dm_scope_2,
+                "dalton_user_id": "u-alice",
+                "generation": 2,
+                "thread_id": tid_s2_g2,
+                "run_id": rid_s2_g2,
+                "interrupt_id": "int_g2_active",
+                "pending_interrupt": int_g2,
+            },
+            "thread_watch": {
+                "thread_id": tid_s2_g2,
+                "dalton_user_id": "u-alice",
+                "platform": "feishu",
+                "target_address": "feishu:@me",
+                "scope_key": dm_scope_2,
+                "generation": 2,
+                "last_seen_turn_index": 1,
+                "watch_active": True,
+                "pending_interrupt": int_g2,
+            },
+        },
+    ).json()
+    assert r_set_int_g2["session_is_current_for_interrupt"] is True
+    assert (
+        store.session_generations[("feishu", dm_scope_2, "u-alice")][
+            "pending_interrupt"
+        ]
+        == int_g2
+    )
+    g1_source = store.inbound_events[("feishu", "om_s2_g1")]
+    assert g1_source["session_generation"] == 1
+    assert str(g1_source["thread_id"]) == tid_s2_g1
+    assert g1_source["run_id"] == rid_s2_g1
+
+    # 7. `generation: None` sourced from stale gen-1 `tid_s2_g1` must not clear gen 2.
+    # A clear whose interrupt_id, run_id, and thread_id do not match the current
+    # interrupt is refused even when generation 2 is the current session.
+    r_stale_none_gen = client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=headers,
+        json={
+            "session_interrupt_update": {
+                "platform": "feishu",
+                "scope_key": dm_scope_2,
+                "dalton_user_id": "u-alice",
+                "generation": None,
+                "thread_id": tid_s2_g1,
+                "run_id": rid_s2_g1,
+                "pending_interrupt": None,
+            },
+        },
+    ).json()
+    assert r_stale_none_gen["session_is_current_for_interrupt"] is False
+    assert (
+        store.session_generations[("feishu", dm_scope_2, "u-alice")][
+            "pending_interrupt"
+        ]
+        == int_g2
+    )
+
+    r_wrong_clear = client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=headers,
+        json={
+            "session_interrupt_update": {
+                "platform": "feishu",
+                "scope_key": dm_scope_2,
+                "dalton_user_id": "u-alice",
+                "generation": 2,
+                "thread_id": str(uuid4()),
+                "run_id": str(uuid4()),
+                "interrupt_id": "wrong_int_id",
+                "pending_interrupt": None,
+            },
+        },
+    ).json()
+    assert r_wrong_clear["session_is_current_for_interrupt"] is True
+    assert (
+        store.session_generations[("feishu", dm_scope_2, "u-alice")][
+            "pending_interrupt"
+        ]
+        == int_g2
+    )
+
+    # Clearing with matching generation=2 AND matching interrupt_id succeeds
+    client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=headers,
+        json={
+            "session_interrupt_update": {
+                "platform": "feishu",
+                "scope_key": dm_scope_2,
+                "dalton_user_id": "u-alice",
+                "generation": 2,
+                "thread_id": tid_s2_g2,
+                "run_id": rid_s2_g2,
+                "interrupt_id": "int_g2_active",
+                "pending_interrupt": None,
+            },
+        },
+    )
+    assert (
+        store.session_generations[("feishu", dm_scope_2, "u-alice")][
+            "pending_interrupt"
+        ]
+        is None
+    )
+
+    # 8. `I-6` (`authorize_and_claim_delivery`) rejects spoofed `source_generation` / `source_scope_key`
+    # when they disagree with the persisted `dalton_channel_inbound_events` row (`tid_s2_g1`, gen 1, `dm_scope_2`)
+    r_spoof_gen = client.post(
+        "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
+        headers=headers,
+        json={
+            "delivery_key": f"fallback:{rid_s2_g1}:spoof",
+            "kind": "fallback",
+            "user_id": "u-alice",
+            "thread_id": tid_s2_g1,
+            "run_id": rid_s2_g1,
+            "platform": "feishu",
+            "has_non_empty_text": True,
+            "total_chunks": 1,
+            "source_scope_key": dm_scope_2,
+            "source_generation": 2,
+            "activity_origin": "conversation",
+        },
+    ).json()
+    assert r_spoof_gen["claim_status"] == "denied"
+    assert r_spoof_gen["code"] == "not_allowed"

@@ -513,7 +513,8 @@ describe("Weixin iLink Adapter — Protocol, Crypto, Inbound, QR Concurrency & L
     expect(missingId1.rawPayload?.invalid_inbound_event).toBe(true);
     expect(missingId1.messageId).toBe(missingId2.messageId);
     expect(missingId1.weixinContextSeq).toBeUndefined();
-    expect(missingId1.rawPayload?.create_time_ms).toBe(1700000000000);
+    // Ordering fields are not kept on a rejected event, so it cannot move the context token.
+    expect(missingId1.rawPayload?.create_time_ms).toBeUndefined();
     expect(missingId1.rawPayload?.seq).toBeUndefined();
 
     const protocolAndTime = parseWeixinInboundMessage(
@@ -1512,6 +1513,7 @@ describe("Weixin iLink Adapter — Protocol, Crypto, Inbound, QR Concurrency & L
           });
         },
       });
+      adapter.onInboundEvent(async () => {});
       await adapter.start();
       await entered.promise;
       await adapter.applyPersistedState(
