@@ -7,8 +7,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
-from uuid import UUID
+from typing import Any, Literal
 
 from fastapi import HTTPException
 from pydantic import BaseModel, ConfigDict, Field
@@ -318,8 +317,9 @@ class AutomationHistoryResponse(BaseModel):
 
     model_config = ConfigDict(extra="ignore")
 
-    automation_id: UUID
+    automation_id: str
     scope: str
+    engine_kind: Literal["agent", "script"] = "agent"
     config_version: int
     active_version: int
     entries: list[AutomationHistoryEntryResponse] = Field(default_factory=list)
@@ -765,6 +765,14 @@ async def list_automations_for_scope(
 
     if scope == "company":
         await require_company_scope_read_access(principal)
+        from src.dalton.services.company_task_read import list_company_automations
+
+        return await list_company_automations(
+            principal,
+            status=status,
+            limit=limit,
+            offset=offset,
+        )
 
     rows, total = await company_auto_db.list_automations_for_scope_db(
         scope=scope,
@@ -775,13 +783,7 @@ async def list_automations_for_scope(
         computer_id=principal.computer_id,
     )
     items = [AutomationResponse.model_validate(r) for r in rows]
-
-    if scope == "company":
-        for resp, raw_row in zip(items, rows):
-            apply_company_notify_representation(resp, raw_row)
-    else:
-        await populate_automation_notify_state(principal.user_id, items)
-
+    await populate_automation_notify_state(principal.user_id, items)
     return AutomationsListResponse(automations=items, total=total)
 
 
@@ -793,6 +795,24 @@ async def get_automation_modification_history(
     offset: int = 0,
 ) -> AutomationHistoryResponse:
     """Read-only version history for an automation; never seeds or mutates DB state."""
+    from src.dalton.services.company_task_read import (
+        InvalidAutomationId,
+        get_script_modification_history,
+        parse_automation_read_id,
+    )
+
+    try:
+        parsed = parse_automation_read_id(automation_id)
+    except InvalidAutomationId as exc:
+        raise HTTPException(status_code=422, detail="Invalid automation id") from exc
+    if parsed.kind == "script":
+        return await get_script_modification_history(
+            principal,
+            str(parsed.job_key),
+            limit=limit,
+            offset=offset,
+        )
+
     row = await company_auto_db.get_automation_history_row(automation_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Automation not found")
@@ -826,8 +846,9 @@ async def get_automation_modification_history(
     page_entries = parsed_entries[offset : offset + limit]
 
     return AutomationHistoryResponse(
-        automation_id=UUID(str(row["automation_id"])),
+        automation_id=str(row["automation_id"]),
         scope=row_scope,
+        engine_kind="agent",
         config_version=int(row.get("config_version") or 1),
         active_version=int(row.get("active_version") or 1),
         entries=page_entries,

@@ -45,13 +45,13 @@ from src.server.services.automations import lifecycle as handler
 from src.server.services.automations import delivery
 from src.server.models.automation import (
     AutomationCreate,
+    AutomationReadResponse,
     AutomationResponse,
     AutomationRunResponse,
     AutomationRunsListResponse,
     AutomationsListResponse,
     AutomationUpdate,
     DeliveryDefaultUpdate,
-    ExecutionStatus,
 )
 from src.server.dependencies.principal import (
     ReadPrincipal,
@@ -115,7 +115,16 @@ async def list_automations(
         None,
         description="Optional scope filter: personal, research_tracking, or company",
     ),
-    status: str | None = Query(None, description="Filter by status"),
+    status: str | None = Query(
+        None,
+        description=(
+            "Filter by configuration status. Agent rows match automations.status "
+            "exactly. Script rows match enabled and paused_by_user: paused when "
+            "paused_by_user is true, active when enabled and not paused, disabled "
+            "when not enabled and not paused. A run status such as succeeded is "
+            "not a list filter."
+        ),
+    ),
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
 ):
@@ -155,16 +164,63 @@ async def list_automations(
 @router.get("/automations/executions", response_model=AutomationRunsListResponse)
 @handle_api_exceptions("list automation runs", logger)
 async def list_automation_runs(
-    user_id: CurrentUserId,
+    principal: ReadPrincipal,
+    scope: Literal["personal", "research_tracking", "company"] | None = Query(
+        None,
+        description="Optional scope filter: personal, research_tracking, or company",
+    ),
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     thread_id: Optional[UUID] = Query(None),
-    status: Optional[ExecutionStatus] = Query(None),
+    status: Optional[str] = Query(
+        None,
+        description=(
+            "Exact stored execution status. Agent rows use pending, waiting, "
+            "running, completed, failed, timeout, or skipped. Script rows use "
+            "queued, starting, running, succeeded, failed, timed_out, aborted, "
+            "skipped_low_memory, skipped_superseded, or cancelled. succeeded "
+            "does not match completed, and a thread_id matches only a real "
+            "agent thread."
+        ),
+    ),
 ):
-    """List executions across all of the current user's automations."""
+    """List executions. Omitted scope stays the caller's own agent runs."""
+    # DALTON-HOOK(company-automations): company feed merges agent runs and script runs
+    thread_filter = str(thread_id) if thread_id else None
+    if scope == "company":
+        from src.dalton.services.company_task_read import list_company_execution_feed
+
+        return await list_company_execution_feed(
+            principal,
+            thread_id=thread_filter,
+            status=status,
+            limit=limit,
+            offset=offset,
+        )
+    if scope is not None:
+        filters: dict[str, Any] = {
+            "thread_id": thread_filter,
+            "status": status,
+            "limit": limit,
+            "offset": offset,
+            "scope": scope,
+        }
+        if principal.computer_id is not None:
+            filters["computer_id"] = principal.computer_id
+        return await _runs_page(principal.user_id, **filters)
+    if principal.computer_id is not None:
+        return await _runs_page(
+            principal.user_id,
+            thread_id=thread_filter,
+            status=status,
+            limit=limit,
+            offset=offset,
+            computer_id=principal.computer_id,
+        )
+    # DALTON-HOOK(company-automations): retain the principal owner for the default execution feed
     return await _runs_page(
-        user_id,
-        thread_id=str(thread_id) if thread_id else None,
+        principal.user_id,
+        thread_id=thread_filter,
         status=status,
         limit=limit,
         offset=offset,
@@ -251,22 +307,49 @@ async def set_delivery_default(
         raise _unavailable(str(e))
 
 
-@router.get("/automations/{automation_id}", response_model=AutomationResponse)
+@router.get("/automations/{automation_id}", response_model=AutomationReadResponse)
 @handle_api_exceptions("get automation", logger)
 async def get_automation(
-    automation_id: UUID,
-    user_id: ReadUserId,
+    automation_id: str,
+    principal: ReadPrincipal,
 ):
-    """Get a specific automation."""
-    automation = await auto_db.get_automation(str(automation_id), user_id)
-    if not automation:
-        raise_not_found("Automation")
-    resp = AutomationResponse.model_validate(automation)
-    # DALTON-HOOK(dalton-notify): populate user-specific notify effective value and source
-    from src.dalton.notify.dispatch import populate_automation_notify_state
+    """Get one automation by UUID, or one manifest script by ``data:<job_key>``."""
+    # DALTON-HOOK(company-automations): parse the id, then apply owner or company access
+    parsed = _parse_read_id(automation_id)
+    if parsed.kind == "script":
+        from src.dalton.services.company_task_read import get_script_automation
 
-    await populate_automation_notify_state(user_id, [resp])
-    return resp
+        return await get_script_automation(principal, str(parsed.job_key))
+    # DALTON-HOOK(company-automations): a computer token's detail uses the same run reach as the list
+    detail_kwargs: dict[str, Any] = {}
+    if principal.computer_id is not None:
+        detail_kwargs["computer_id"] = principal.computer_id
+    automation = await auto_db.get_automation(
+        str(parsed.agent_id), principal.user_id, **detail_kwargs
+    )
+    if automation:
+        resp = AutomationResponse.model_validate(automation)
+        # DALTON-HOOK(dalton-notify): populate user-specific notify effective value and source
+        from src.dalton.notify.dispatch import populate_automation_notify_state
+
+        await populate_automation_notify_state(principal.user_id, [resp])
+        return resp
+    from src.dalton.database import company_data_tasks as company_data_db
+    from src.dalton.services.company_automations import (
+        apply_company_notify_representation,
+        require_company_scope_read_access,
+    )
+    from src.dalton.services.company_task_read import scrub_company_agent_row
+
+    company_row = await company_data_db.get_company_agent_detail(str(parsed.agent_id))
+    if company_row is None:
+        raise_not_found("Automation")
+    await require_company_scope_read_access(principal)
+    if company_row.get("deleted_at") is not None:
+        raise_not_found("Automation")
+    company_resp = AutomationResponse.model_validate(scrub_company_agent_row(company_row))
+    apply_company_notify_representation(company_resp, company_row)
+    return company_resp
 
 
 @router.patch("/automations/{automation_id}", response_model=AutomationResponse)
@@ -454,15 +537,53 @@ async def dismiss_execution(
 )
 @handle_api_exceptions("list executions", logger)
 async def list_executions(
-    automation_id: UUID,
-    user_id: ReadUserId,
+    automation_id: str,
+    principal: ReadPrincipal,
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
 ):
-    """List execution history for an automation."""
-    return await _runs_page(
-        user_id, automation_id=str(automation_id), limit=limit, offset=offset,
+    """List execution history for one agent or one manifest script."""
+    # DALTON-HOOK(company-automations): company rows are shared; other rows stay owner-scoped
+    parsed = _parse_read_id(automation_id)
+    if parsed.kind == "script":
+        from src.dalton.services.company_task_read import list_script_executions
+
+        return await list_script_executions(
+            principal,
+            str(parsed.job_key),
+            limit=limit,
+            offset=offset,
+        )
+    from src.dalton.database import company_data_tasks as company_data_db
+    from src.dalton.services.company_task_read import (
+        is_shared_company_agent,
+        list_company_agent_executions,
     )
+
+    identity = await company_data_db.get_automation_owner_identity(str(parsed.agent_id))
+    if is_shared_company_agent(identity):
+        from src.dalton.services.company_automations import (
+            require_company_scope_read_access,
+        )
+
+        await require_company_scope_read_access(principal)
+        if identity is not None and identity.get("deleted_at") is not None:
+            raise_not_found("Automation")
+        return await list_company_agent_executions(
+            principal,
+            str(parsed.agent_id),
+            limit=limit,
+            offset=offset,
+        )
+    # DALTON-HOOK(company-automations): a computer token uses the same execution reach as the feed
+    filters: dict[str, Any] = {
+        "automation_id": str(parsed.agent_id),
+        "limit": limit,
+        "offset": offset,
+    }
+    if principal.computer_id is not None:
+        filters["computer_id"] = principal.computer_id
+    return await _runs_page(principal.user_id, **filters)
 
 
 # DALTON-HOOK(company-automations): read-only modification history endpoint (AU1 §3.5)
@@ -472,12 +593,12 @@ async def list_executions(
 )
 @handle_api_exceptions("list automation modification history", logger)
 async def list_automation_history(
-    automation_id: UUID,
+    automation_id: str,
     principal: ReadPrincipal,
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
 ):
-    """List stored version modification history for an automation."""
+    """List stored version history for an agent UUID or a ``data:<job_key>``."""
     from src.dalton.services.company_automations import (
         get_automation_modification_history,
     )
@@ -488,6 +609,20 @@ async def list_automation_history(
         limit=limit,
         offset=offset,
     )
+
+
+def _parse_read_id(automation_id: str):
+    """Return a parsed read id, or 422 before any database call."""
+    from src.dalton.services.company_task_read import (
+        InvalidAutomationId,
+        parse_automation_read_id,
+    )
+
+    # DALTON-HOOK(company-automations): normalize public task identifiers before reads
+    try:
+        return parse_automation_read_id(automation_id)
+    except InvalidAutomationId as exc:
+        raise HTTPException(status_code=422, detail="Invalid automation id") from exc
 
 
 async def _runs_page(user_id: str, **filters) -> AutomationRunsListResponse:

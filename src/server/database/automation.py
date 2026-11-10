@@ -66,7 +66,41 @@ def not_a_server_skip(alias: str) -> str:
     )
 
 
-def _last_execution_join(outer: str) -> str:
+def _reached_execution_probe(outer: str, alias: str, predicate: str) -> str:
+    """One last-run probe limited to the token computer before LIMIT.
+
+    The effective workspace is the run thread's workspace, or ``outer``'s
+    current workspace when the run has no thread. Home and any other computer
+    drop out of this probe, so a later probe cannot fall back to them.
+    """
+    # DALTON-HOOK(company-automations): computer tokens read each last-run probe on that computer only
+    effective = f"COALESCE(reach_thread.workspace_id, {outer}.workspace_id)"
+    narrowed = f" AND {predicate}" if predicate else ""
+    return (
+        f"(SELECT {alias}.automation_execution_id\n"
+        f"                     FROM automation_executions {alias}\n"
+        f"                     LEFT JOIN conversation_threads reach_thread\n"
+        f"                       ON reach_thread.conversation_thread_id = {alias}.conversation_thread_id\n"
+        f"                     WHERE {alias}.automation_id = {outer}.automation_id"
+        f"{narrowed}\n"
+        f"                       AND {effective} <> %s::uuid\n"
+        f"                       AND EXISTS (SELECT 1 FROM workspaces execution_workspace\n"
+        f"                            WHERE execution_workspace.workspace_id = {effective}\n"
+        f"                              AND execution_workspace.computer_id = %s::uuid)\n"
+        f"                     ORDER BY {alias}.created_at DESC, {alias}.automation_execution_id DESC\n"
+        f"                     LIMIT 1)"
+    )
+
+
+def _last_execution_computer_params(
+    user_id: str, computer_id: str
+) -> tuple[str, str, str, str, str, str]:
+    """Binds for the three probes, in unsettled, non-skip, newest order."""
+    home_id = get_home_workspace_id(user_id)
+    return (home_id, computer_id, home_id, computer_id, home_id, computer_id)
+
+
+def _last_execution_join(outer: str, *, computer_id: Optional[str] = None) -> str:
     """A LEFT JOIN LATERAL giving the automation row ``outer`` its
     ``last_execution``: the newest firing still in flight, else the newest
     that is not a skip the user never chose, else the newest.
@@ -76,8 +110,18 @@ def _last_execution_join(outer: str) -> str:
     made (its thread stayed busy, or it stopped) hide the failed run before
     it, which is what asks the user for attention. COALESCE runs each probe
     only when the ones before it find nothing, and each is one index descent.
+    DALTON-HOOK(company-automations): limit last-run selection to the token computer.
+    When every probe is empty, the id comparison matches nothing and
+    ``last_execution`` is null.
+
+    ``computer_id`` only switches on computer-token reach. The value is not
+    written into SQL. Set, each probe applies Home exclusion and that
+    computer to the run's effective workspace before LIMIT, and the caller
+    binds ``_last_execution_computer_params``. Omitted, the SQL is the
+    user-wide selection and has no extra placeholders.
     """
-    return f"""
+    if computer_id is None:
+        return f"""
         LEFT JOIN LATERAL (
             SELECT to_jsonb(le_row) AS last_execution
             FROM (
@@ -101,6 +145,26 @@ def _last_execution_join(outer: str) -> str:
                      WHERE n.automation_id = {outer}.automation_id
                      ORDER BY n.created_at DESC, n.automation_execution_id DESC
                      LIMIT 1)
+                )
+            ) le_row
+        ) le ON TRUE
+    """
+    # DALTON-HOOK(company-automations): same precedence, with computer reach inside each probe
+    unsettled = _reached_execution_probe(
+        outer, "u", f"u.status IN {UNSETTLED_STATUSES}"
+    )
+    eligible = _reached_execution_probe(outer, "c", not_a_server_skip("c"))
+    newest = _reached_execution_probe(outer, "n", "")
+    return f"""
+        LEFT JOIN LATERAL (
+            SELECT to_jsonb(le_row) AS last_execution
+            FROM (
+                SELECT {EXECUTION_COLUMNS}
+                FROM automation_executions e
+                WHERE e.automation_execution_id = COALESCE(
+                    {unsettled},
+                    {eligible},
+                    {newest}
                 )
             ) le_row
         ) le ON TRUE
@@ -359,19 +423,28 @@ async def get_automation(
     automation_id: str,
     user_id: str,
     *,
+    computer_id: Optional[str] = None,
     conn=None,
 ) -> Optional[Dict[str, Any]]:
     """Get a single automation by ID, verifying ownership, with its newest
-    run and ``owns_thread``."""
+    run and ``owns_thread``.
+
+    ``computer_id`` limits ``last_execution`` to a run on that computer,
+    outside Home. Omitted, the newest run stays the user-wide one.
+    """
+    # DALTON-HOOK(company-automations): optional computer reach for last_execution; omitted stays user-wide
+    reach_params: tuple[str, ...] = ()
+    if computer_id is not None:
+        reach_params = _last_execution_computer_params(user_id, computer_id)
     async with get_db_connection(conn) as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             # DALTON-HOOK(company-automations): hide soft-deleted rows and order deterministically
             await cur.execute(f"""
                 SELECT {AUTOMATION_COLUMNS}, le.last_execution, {_OWNS_THREAD}
                 FROM automations
-                {_last_execution_join("automations")}
+                {_last_execution_join("automations", computer_id=computer_id)}
                 WHERE automation_id = %s AND user_id = %s AND deleted_at IS NULL
-            """, (automation_id, user_id))
+            """, (*reach_params, automation_id, user_id))
 
             result = await cur.fetchone()
             return dict(result) if result else None
@@ -389,7 +462,8 @@ async def list_automations(
 
     ``computer_id`` keeps the page to what that computer's token reaches:
     the automations that run in a workspace on it, never one in Home, which
-    is out of a computer's reach wherever it sits.
+    is out of a computer's reach wherever it sits. ``last_execution`` uses
+    that same Home and computer rule on each run's effective workspace.
 
     Returns:
         Tuple of (list of automation dicts, total count).
@@ -411,6 +485,10 @@ async def list_automations(
         params += [get_home_workspace_id(user_id), computer_id]
 
     where_clause = " AND ".join(where_parts)
+    # DALTON-HOOK(company-automations): last_execution reach binds before the task WHERE placeholders
+    reach_params: tuple[str, ...] = ()
+    if computer_id is not None:
+        reach_params = _last_execution_computer_params(user_id, computer_id)
 
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
@@ -427,11 +505,11 @@ async def list_automations(
             await cur.execute(f"""
                 SELECT {AUTOMATION_COLUMNS}, le.last_execution
                 FROM automations
-                {_last_execution_join("automations")}
+                {_last_execution_join("automations", computer_id=computer_id)}
                 WHERE {where_clause}
                 ORDER BY created_at DESC, automation_id DESC
                 LIMIT %s OFFSET %s
-            """, (*params, limit, offset))
+            """, (*reach_params, *params, limit, offset))
 
             results = await cur.fetchall()
             return [dict(row) for row in results], total

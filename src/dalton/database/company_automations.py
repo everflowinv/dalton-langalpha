@@ -171,7 +171,11 @@ async def list_automations_for_scope_db(
     conn: Any = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """Read paginated automations and matching total count for an explicit ``scope``."""
-    from src.server.database.automation import AUTOMATION_COLUMNS, _last_execution_join
+    from src.server.database.automation import (
+        AUTOMATION_COLUMNS,
+        _last_execution_computer_params,
+        _last_execution_join,
+    )
 
     where_parts: list[str] = ["automations.deleted_at IS NULL"]
     params: list[Any] = []
@@ -198,6 +202,10 @@ async def list_automations_for_scope_db(
         params.append(status)
 
     where_clause = " AND ".join(where_parts)
+    # DALTON-HOOK(company-automations): same last-run computer reach as the default list
+    reach_params: tuple[Any, ...] = ()
+    if computer_id is not None:
+        reach_params = _last_execution_computer_params(caller_user_id, computer_id)
 
     async with get_db_connection(conn) as db_conn:
         async with db_conn.cursor(row_factory=dict_row) as cur:
@@ -212,12 +220,12 @@ async def list_automations_for_scope_db(
                 f"""
                 SELECT {AUTOMATION_COLUMNS}, le.last_execution
                 FROM automations
-                {_last_execution_join("automations")}
+                {_last_execution_join("automations", computer_id=computer_id)}
                 WHERE {where_clause}
                 ORDER BY automations.created_at DESC, automations.automation_id DESC
                 LIMIT %s OFFSET %s
                 """,
-                (*params, limit, offset),
+                (*reach_params, *params, limit, offset),
             )
             rows = await cur.fetchall()
             return [dict(r) for r in rows], total
