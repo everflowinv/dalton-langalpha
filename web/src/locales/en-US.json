@@ -721,6 +721,7 @@
       "channelBindingsDesc": "Link your own Feishu or Discord account. Generate a one-time code here, then send the /bind command in a private message to the Dalton bot. Do not send the code in a group chat.",
       "channelBindingsLoading": "Loading your Feishu and Discord links…",
       "channelBindingsLoadError": "Could not load your Feishu and Discord links. Your links were not changed.",
+      "channelBindingsRefreshError": "Could not refresh your account links. Showing the last retrieved status.",
       "channelBindingsForbidden": "This account cannot view Feishu and Discord links.",
       "channelBindingsRetry": "Try loading Feishu and Discord links again",
       "channelBindingsRefresh": "Refresh Feishu and Discord accounts",

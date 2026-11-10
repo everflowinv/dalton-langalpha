@@ -164,6 +164,14 @@ export function DaltonChannelBindingsCard(): React.ReactElement {
     inflight.current[platform] = true;
     setPending((prev) => ({ ...prev, [platform]: true }));
     setActionError((prev) => ({ ...prev, [platform]: null }));
+    // The server revokes the previous code when it accepts this request, even if the new response is lost.
+    setCodes((prev) => {
+      if (!prev[platform]) return prev;
+      const next = { ...prev };
+      delete next[platform];
+      return next;
+    });
+    setCopyState((prev) => ({ ...prev, [platform]: null }));
     createCode.mutate(platform);
   };
 
@@ -177,6 +185,7 @@ export function DaltonChannelBindingsCard(): React.ReactElement {
 
   const loadStatus = apiErrorStatus(bindingsQuery.error);
   const loadFailed = bindingsQuery.isError && !bindingsQuery.data;
+  const refreshFailed = bindingsQuery.isError && Boolean(bindingsQuery.data);
   const loadMessage = loadStatus === 401 || loadStatus === 403
     ? t('settings.dalton.channelBindingsForbidden')
     : t('settings.dalton.channelBindingsLoadError');
@@ -219,6 +228,13 @@ export function DaltonChannelBindingsCard(): React.ReactElement {
           >
             {t('settings.dalton.channelBindingsRetry')}
           </Button>
+        </SettingsCardBody>
+      )}
+      {refreshFailed && (
+        <SettingsCardBody>
+          <p role="alert" className="m-0 text-xs" style={{ color: 'var(--color-loss)' }}>
+            {t('settings.dalton.channelBindingsRefreshError')}
+          </p>
         </SettingsCardBody>
       )}
       {bindingsQuery.data && BIND_PLATFORMS.map((platform) => {

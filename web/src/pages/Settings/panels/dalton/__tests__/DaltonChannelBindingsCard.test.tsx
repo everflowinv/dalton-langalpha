@@ -241,9 +241,16 @@ describe('DaltonChannelBindingsCard', () => {
     expect(await screen.findAllByText('Not linked')).toHaveLength(2);
     fireEvent.click(screen.getByRole('button', { name: 'Refresh Feishu and Discord accounts' }));
     await waitFor(() => expect(h.fetchBindings).toHaveBeenCalledTimes(2));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Could not refresh your account links. Showing the last retrieved status.',
+    );
+    expect(h.fetchBindings).toHaveBeenCalledTimes(2);
     expect(screen.getAllByText('Not linked')).toHaveLength(2);
     expect(screen.queryByText('Could not load your Feishu and Discord links. Your links were not changed.')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Try loading Feishu and Discord links again' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Generate Feishu code' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Generate Discord code' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Refresh Feishu and Discord accounts' })).toBeEnabled();
   });
 
   it.each(['admin', 'internal', 'external'])('lets a %s user generate their own code', async (tier) => {
@@ -356,6 +363,51 @@ describe('DaltonChannelBindingsCard', () => {
     h.copyText.mockRejectedValueOnce(new Error('refused'));
     fireEvent.click(screen.getByRole('button', { name: 'Copy Feishu command' }));
     expect(await screen.findByText('Could not copy the Feishu command. Select the command and copy it yourself.')).toBeInTheDocument();
+  });
+
+  it('hides the previous code as soon as a replacement starts and keeps it hidden when that response is lost', async () => {
+    let rejectReplacement: ((reason: unknown) => void) | undefined;
+    h.createCode
+      .mockResolvedValueOnce(created('feishu', 'DLT-FE11-SHU1'))
+      .mockResolvedValueOnce(created('discord', 'DLT-DI22-SCD2'))
+      .mockImplementationOnce(() => new Promise<DaltonChannelBindCodeCreateResponse>((_resolve, reject) => {
+        rejectReplacement = reject;
+      }));
+    renderCard();
+    fireEvent.click(await screen.findByRole('button', { name: 'Generate Feishu code' }));
+    expect(await screen.findByTestId('channel-bind-command-feishu')).toHaveTextContent('/bind DLT-FE11-SHU1');
+    fireEvent.click(screen.getByRole('button', { name: 'Copy Feishu command' }));
+    expect(await screen.findByText('Feishu command copied')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Generate Discord code' }));
+    expect(await screen.findByTestId('channel-bind-command-discord')).toHaveTextContent('/bind DLT-DI22-SCD2');
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'Generate Feishu code' }));
+    });
+    expect(screen.queryByTestId('channel-bind-command-feishu')).not.toBeInTheDocument();
+    expect(screen.queryByText('/bind DLT-FE11-SHU1')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Copy Feishu command' })).not.toBeInTheDocument();
+    expect(screen.queryByText('Feishu command copied')).not.toBeInTheDocument();
+    expect(screen.queryByText('This Feishu code has expired. Generate a new one to continue.')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Generating Feishu code…' })).toBeDisabled();
+    expect(screen.getByTestId('channel-bind-command-discord')).toHaveTextContent('/bind DLT-DI22-SCD2');
+    expect(screen.getByRole('button', { name: 'Copy Discord command' })).toBeEnabled();
+
+    await act(async () => {
+      rejectReplacement?.(new Error('Network Error'));
+    });
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not generate a Feishu code. Try again.');
+    expect(screen.getByRole('alert')).toHaveTextContent('Network Error');
+    expect(screen.queryByTestId('channel-bind-command-feishu')).not.toBeInTheDocument();
+    expect(screen.queryByText('/bind DLT-FE11-SHU1')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Copy Feishu command' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Generate Feishu code' })).toBeEnabled();
+    expect(screen.getByTestId('channel-bind-command-discord')).toHaveTextContent('/bind DLT-DI22-SCD2');
+    expect(screen.getByRole('button', { name: 'Copy Discord command' })).toBeEnabled();
+    expect(h.createCode).toHaveBeenCalledTimes(3);
+    expect(h.createCode).toHaveBeenNthCalledWith(1, 'feishu');
+    expect(h.createCode).toHaveBeenNthCalledWith(2, 'discord');
+    expect(h.createCode).toHaveBeenNthCalledWith(3, 'feishu');
   });
 
   it('starts a code from the keyboard and shows a readable generate error', async () => {

@@ -759,6 +759,7 @@
       "channelBindingsDesc": "绑定你自己的飞书或 Discord 账号。在这里生成一次性绑定码，再把 /bind 命令私聊发给 Dalton 机器人。不要把绑定码发到群聊。",
       "channelBindingsLoading": "正在读取你的飞书和 Discord 绑定状态…",
       "channelBindingsLoadError": "没能读到你的飞书和 Discord 绑定状态。绑定没有改变。",
+      "channelBindingsRefreshError": "无法刷新账号绑定状态，当前显示上次获取的结果。",
       "channelBindingsForbidden": "当前账号无法查看飞书和 Discord 绑定。",
       "channelBindingsRetry": "重新读取飞书和 Discord 绑定",
       "channelBindingsRefresh": "刷新飞书与 Discord 账号",
