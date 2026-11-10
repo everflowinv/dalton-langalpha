@@ -30,7 +30,14 @@ from src.dalton.database.budget import (
     verify_task_cap_scope_owner,
 )
 from src.dalton.database.llm_journal import fetch_journal_rows_in_window
-from src.dalton.llm.overlay import NATIVE_OVERLAY_PATH, load_dalton_meta, load_overlay_data
+from src.dalton.llm.notional_pricing import (
+    build_notional_price_index,
+    calculate_notional_cost,
+    extract_flat_rates_from_card,
+    is_subscription_model,
+    resolve_notional_card,
+)
+from src.dalton.llm.overlay import load_overlay_data
 from src.dalton.settings import get_dalton_settings, is_dalton_budget_gate_enabled
 from src.server.database.pool import get_db_connection
 
@@ -59,116 +66,17 @@ def _local_day_bounds(tz_name: str, now_utc: datetime | None = None) -> tuple[da
 
 
 def _extract_rates_from_card(np: dict[str, Any]) -> dict[str, float]:
-    in_rate = float(np.get("input", 0.0) or 0.0)
-    out_rate = float(np.get("output", 0.0) or 0.0)
-    cache_rate = float(np.get("cached_input", 0.0) or 0.0)
-    if not in_rate and isinstance(np.get("input_tiers"), list) and np["input_tiers"]:
-        in_rate = float(np["input_tiers"][0].get("rate", 0.0) or 0.0)
-        cache_rate = float(np["input_tiers"][0].get("cached_input", cache_rate) or 0.0)
-    if not out_rate and isinstance(np.get("output_tiers"), list) and np["output_tiers"]:
-        out_rate = float(np["output_tiers"][0].get("rate", 0.0) or 0.0)
-    return {"input": in_rate, "output": out_rate, "cached_input": cache_rate}
+    return extract_flat_rates_from_card(np)
 
 
-def _notional_price_index() -> dict[str, dict[str, float]]:
-    """Build `{model_key_or_ref: {'input': x, 'output': y, 'cached_input': z}}` for subscription/OAuth models."""
-    out: dict[str, dict[str, float]] = {}
-    overlay = load_overlay_data() or {}
-    models_map = overlay.get("models") or {}
-    prov_models = ((overlay.get("providers") or {}).get("models") or {}).get(
-        "openclaw-broker", []
-    )
-    by_ref: dict[str, dict[str, Any]] = {}
-    for pm in prov_models:
-        if isinstance(pm, dict) and pm.get("id"):
-            by_ref[str(pm["id"])] = pm
-
-    for key, mcfg in models_map.items():
-        if not isinstance(mcfg, dict):
-            continue
-        ref = str(mcfg.get("model_id") or "")
-        pm = by_ref.get(ref) or {}
-        np = pm.get("notional_pricing")
-        if isinstance(np, dict):
-            rates = _extract_rates_from_card(np)
-            out[str(key)] = rates
-            if ref:
-                out[ref] = rates
-
-    # P0N.6 §4: Also read load_dalton_meta() for subscription models (notional_pricing / notional_ref)
-    try:
-        from src.llms.pricing_utils import find_model_pricing, resolve_pricing_identity
-
-        dalton_meta = load_dalton_meta() or {}
-        native_overlay = load_overlay_data(NATIVE_OVERLAY_PATH) or {}
-        native_models = native_overlay.get("models") or {}
-
-        for key, meta_entry in dalton_meta.items():
-            if not isinstance(meta_entry, dict):
-                continue
-            rates: dict[str, float] | None = None
-            np = meta_entry.get("notional_pricing")
-            if isinstance(np, dict):
-                rates = _extract_rates_from_card(np)
-            elif meta_entry.get("notional_ref"):
-                ref_id = str(meta_entry["notional_ref"])
-                if ref_id in out:
-                    rates = out[ref_id]
-                else:
-                    ref_prov, ref_pricing_id = resolve_pricing_identity(ref_id)
-                    card = find_model_pricing(ref_pricing_id, provider=ref_prov)
-                    if card is None and ref_pricing_id != ref_id:
-                        card = find_model_pricing(ref_id)
-                    if isinstance(card, dict):
-                        rates = _extract_rates_from_card(card)
-            if rates is not None:
-                out[str(key)] = rates
-                m_entry = native_models.get(key) if isinstance(native_models, dict) else None
-                if isinstance(m_entry, dict) and m_entry.get("model_id"):
-                    mid = str(m_entry["model_id"])
-                    if (dalton_meta.get(mid) or {}).get("billing") != "cash":
-                        out.setdefault(mid, rates)
-    except Exception as exc:
-        logger.debug("[DaltonBudget] _notional_price_index dalton_meta lookup skipped: %s", exc)
-
-    # Fallback nominal rates for common OAuth models when upstream card is absent
-    out.setdefault(
-        "claude-opus-5-5-oauth",
-        {"input": 5.0, "output": 25.0, "cached_input": 0.5},
-    )
-    out.setdefault(
-        "claude-opus-5-5-high-oauth",
-        {"input": 5.0, "output": 25.0, "cached_input": 0.5},
-    )
-    out.setdefault(
-        "gpt-6-astra-oauth",
-        {"input": 10.0, "output": 50.0, "cached_input": 1.0},
-    )
-    out.setdefault(
-        "gpt-6.1-sol-oauth",
-        {"input": 2.0, "output": 10.0, "cached_input": 0.1},
-    )
-    out.setdefault(
-        "gemini-4-argon-high-oauth",
-        {"input": 2.0, "output": 10.0, "cached_input": 0.1},
-    )
-    out.setdefault(
-        "gemini-3.8-flash-medium-oauth",
-        {"input": 0.75, "output": 3.75, "cached_input": 0.075},
-    )
-    out.setdefault(
-        "gemini-3.8-flash-low-oauth",
-        {"input": 0.75, "output": 3.75, "cached_input": 0.075},
-    )
-    return out
+def _notional_price_index() -> dict[str, dict[str, Any]]:
+    """Build `{model_key_or_ref: normalized_notional_card}` for subscription/OAuth models."""
+    return build_notional_price_index(overlay_loader=load_overlay_data)
 
 
 def _is_subscription_model(model_name: str, billing_type: str = "") -> bool:
     """Return True when `model_name` or `billing_type` denotes a subscription/OAuth model."""
-    if billing_type == "oauth" or model_name.endswith("-oauth"):
-        return True
-    meta = (load_dalton_meta() or {}).get(model_name)
-    return isinstance(meta, dict) and str(meta.get("billing") or "") == "subscription"
+    return is_subscription_model(model_name, billing_type, overlay_loader=load_overlay_data)
 
 
 def compute_subscription_notional_usd(token_usage_rows: list[dict[str, Any]]) -> Decimal:
@@ -179,6 +87,33 @@ def compute_subscription_notional_usd(token_usage_rows: list[dict[str, Any]]) ->
         tu = row.get("token_usage")
         if not isinstance(tu, dict):
             continue
+        per_call = tu.get("per_call_costs")
+        if isinstance(per_call, list) and per_call:
+            for c in per_call:
+                if not isinstance(c, dict):
+                    continue
+                m_name = str(c.get("model_name") or "unknown")
+                b_type = str(c.get("billing_type") or "platform")
+                if not _is_subscription_model(m_name, b_type):
+                    continue
+                if "notional_cost" in c and c["notional_cost"] is not None:
+                    total += Decimal(str(c["notional_cost"]))
+                    continue
+                cost_dec = Decimal(str(c.get("cost") or "0"))
+                if cost_dec > Decimal("0"):
+                    total += cost_dec
+                    continue
+                card = resolve_notional_card(m_name, index=idx)
+                if card is not None:
+                    usd, _ = calculate_notional_cost(
+                        card,
+                        input_tokens=int(c.get("input_tokens") or 0),
+                        output_tokens=int(c.get("output_tokens") or 0),
+                        cached_tokens=int(c.get("cached_tokens") or 0),
+                    )
+                    total += Decimal(str(usd))
+            continue
+
         by_model = tu.get("by_model")
         if not isinstance(by_model, dict):
             continue
@@ -192,22 +127,31 @@ def compute_subscription_notional_usd(token_usage_rows: list[dict[str, Any]]) ->
                 for r in rates_list
             )
             is_sub = _is_subscription_model(m_name, "oauth" if has_oauth_rate else "")
+            if (
+                "notional_cost" in stats
+                and stats["notional_cost"] is not None
+                and (is_sub or Decimal(str(stats["notional_cost"])) > Decimal("0"))
+            ):
+                total += Decimal(str(stats["notional_cost"]))
+                continue
             if has_oauth_rate and stats.get("total_cost"):
                 total += Decimal(str(stats["total_cost"]))
                 continue
 
-            card = idx.get(m_name)
+            card = resolve_notional_card(m_name, index=idx)
             if card is not None and (is_sub or float(stats.get("total_cost") or 0.0) == 0.0):
                 in_tok = int(stats.get("input_tokens") or 0)
                 out_tok = int(stats.get("output_tokens") or 0)
                 cached_tok = int(stats.get("cached_tokens") or 0)
-                uncached_in = max(0, in_tok - cached_tok)
-                usd = (
-                    uncached_in * card["input"]
-                    + cached_tok * card["cached_input"]
-                    + out_tok * card["output"]
-                ) / 1_000_000.0
-                total += Decimal(f"{usd:.6f}")
+                call_count = int(stats.get("call_count") or 1)
+                usd, _ = calculate_notional_cost(
+                    card,
+                    input_tokens=in_tok,
+                    output_tokens=out_tok,
+                    cached_tokens=cached_tok,
+                    legacy_aggregate_call_count=call_count,
+                )
+                total += Decimal(str(usd))
             elif is_sub and stats.get("total_cost"):
                 total += Decimal(str(stats["total_cost"]))
     return total.quantize(Decimal("0.000001"))
@@ -280,20 +224,23 @@ def compute_provider_breakdown(
                 b["calls"] += 1
                 cost_dec = Decimal(str(c.get("cost") or "0"))
                 if is_sub:
-                    if cost_dec > Decimal("0"):
+                    if "notional_cost" in c and c["notional_cost"] is not None:
+                        b["notional_usd"] += Decimal(str(c["notional_cost"]))
+                    elif cost_dec > Decimal("0"):
                         b["notional_usd"] += cost_dec
-                    elif m_name in idx:
-                        card = idx[m_name]
-                        in_tok = int(c.get("input_tokens") or 0)
-                        out_tok = int(c.get("output_tokens") or 0)
-                        cached_tok = int(c.get("cached_tokens") or 0)
-                        uncached = max(0, in_tok - cached_tok)
-                        est = (
-                            uncached * card["input"]
-                            + cached_tok * card["cached_input"]
-                            + out_tok * card["output"]
-                        ) / 1_000_000.0
-                        b["notional_usd"] += Decimal(f"{est:.6f}")
+                    else:
+                        card = resolve_notional_card(m_name, index=idx)
+                        if card is not None:
+                            in_tok = int(c.get("input_tokens") or 0)
+                            out_tok = int(c.get("output_tokens") or 0)
+                            cached_tok = int(c.get("cached_tokens") or 0)
+                            est, _ = calculate_notional_cost(
+                                card,
+                                input_tokens=in_tok,
+                                output_tokens=out_tok,
+                                cached_tokens=cached_tok,
+                            )
+                            b["notional_usd"] += Decimal(str(est))
                 else:
                     b["cash_usd"] += cost_dec
 

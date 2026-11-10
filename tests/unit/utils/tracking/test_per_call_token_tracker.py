@@ -464,3 +464,43 @@ def test_a_response_with_no_response_metadata_still_bills():
     (record,) = tracker.get_per_call_records()
     assert record["model_name"] == "vendor-model"
     assert record["usage"]["input_tokens"] == 10
+
+
+# DALTON-HOOK(notional-pricing): verify per-call notional_cost tracking on subscription models.
+class TestNotionalCostTracking:
+    """Verify per-call notional_cost is recorded for subscription models without affecting cash cost."""
+
+    def test_muse_ember_per_call_notional_cost_and_zero_platform_cost(self):
+        from src.utils.tracking.core import calculate_cost_from_per_call_records
+
+        records = [
+            _make_per_call_record(
+                model_name="muse-ember-1.0-oauth",
+                input_tokens=150_000,
+                output_tokens=1_000,
+                billing_type="oauth",
+            ),
+            _make_per_call_record(
+                model_name="muse-ember-1.0-oauth",
+                input_tokens=200_001,
+                output_tokens=1_000,
+                billing_type="platform",
+            ),
+        ]
+        result = calculate_cost_from_per_call_records(records)
+
+        assert result["total_cost"] == 0.0
+        assert result["platform_cost"] == 0.0
+        # Call 1 (<=200k): 150k*0.10/1M + 1k*0.50/1M = 0.0155
+        # Call 2 (>200k): 200,001*0.30/1M + 1k*1.50/1M = 0.0615003
+        assert result["per_call_costs"][0]["cost"] == 0.0
+        assert result["per_call_costs"][0]["notional_cost"] == pytest.approx(0.0155, rel=1e-9)
+        assert result["per_call_costs"][1]["cost"] == 0.0
+        assert result["per_call_costs"][1]["notional_cost"] == pytest.approx(0.0615003, rel=1e-9)
+        assert result["notional_cost"] == pytest.approx(0.0155 + 0.0615003, rel=1e-9)
+
+        model_entry = result["by_model"]["muse-ember-1.0-oauth"]
+        assert model_entry["total_cost"] == 0.0
+        assert model_entry["notional_cost"] == pytest.approx(0.0155 + 0.0615003, rel=1e-9)
+        assert len(model_entry.get("notional_rates") or []) == 2
+

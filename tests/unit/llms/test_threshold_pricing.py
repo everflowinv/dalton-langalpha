@@ -123,3 +123,102 @@ class TestRawPromptTierSelection:
             input_tokens=100_000, output_tokens=10_000, pricing=THRESHOLD_PRICING
         )
         assert result["total_cost"] == pytest.approx(100_000 / 1e6 * 5.0 + 10_000 / 1e6 * 30.0)
+
+
+# DALTON-HOOK(notional-pricing): pin Muse Ember 1.0's 200K threshold nominal pricing.
+class TestMuseEmberNominalThresholdPricing:
+    """Pin Meta Muse Ember 1.0's 200K whole-request threshold nominal pricing."""
+
+    @pytest.fixture
+    def ember_card(self):
+        from src.dalton.llm.notional_pricing import resolve_notional_card
+
+        card = resolve_notional_card("muse-ember-1.0-oauth")
+        assert card is not None
+        return card
+
+    @pytest.mark.parametrize(
+        "input_tokens,cached_tokens,output_tokens,expected_usd",
+        [
+            (199_999, 0, 1_000, 0.0204999),
+            (200_000, 0, 1_000, 0.0205),
+            (200_001, 0, 1_000, 0.0615003),
+            (200_000, 150_000, 1_000, 0.0061),
+            (200_001, 150_001, 1_000, 0.018300012),
+            (200_000, 200_000, 0, 0.0008),
+            (200_001, 200_001, 0, 0.002400012),
+            (100, 0, 300_000, 0.15001),
+        ],
+    )
+    def test_muse_ember_threshold_boundary_and_cached_cases(
+        self,
+        ember_card,
+        input_tokens: int,
+        cached_tokens: int,
+        output_tokens: int,
+        expected_usd: float,
+    ):
+        from src.dalton.llm.notional_pricing import calculate_notional_cost
+
+        total_cost, _ = calculate_notional_cost(
+            ember_card,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_tokens=cached_tokens,
+        )
+        assert total_cost == pytest.approx(expected_usd, rel=1e-9, abs=1e-12)
+
+        raw = calculate_total_cost(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            cached_tokens=cached_tokens,
+            pricing=ember_card,
+        )
+        assert raw["total_cost"] == pytest.approx(expected_usd, rel=1e-9, abs=1e-12)
+
+    def test_two_150k_calls_vs_single_300k_call(self, ember_card):
+        from src.dalton.llm.notional_pricing import calculate_notional_cost
+
+        call_1, _ = calculate_notional_cost(
+            ember_card, input_tokens=150_000, output_tokens=0, cached_tokens=0
+        )
+        call_2, _ = calculate_notional_cost(
+            ember_card, input_tokens=150_000, output_tokens=0, cached_tokens=0
+        )
+        assert call_1 == pytest.approx(0.015, rel=1e-9)
+        assert call_1 + call_2 == pytest.approx(0.03, rel=1e-9)
+
+        single_300k, _ = calculate_notional_cost(
+            ember_card, input_tokens=300_000, output_tokens=0, cached_tokens=0
+        )
+        assert single_300k == pytest.approx(0.09, rel=1e-9)
+
+    def test_reasoning_tokens_in_output_counted_once(self, ember_card):
+        """Responses API includes reasoning tokens inside output_tokens; they must be billed once."""
+        from langchain_core.messages import AIMessage
+        from src.dalton.llm.notional_pricing import calculate_notional_cost
+        from src.llms.token_counter import extract_token_usage
+
+        msg = AIMessage(
+            content="result",
+            usage_metadata={
+                "input_tokens": 200_000,
+                "output_tokens": 1_000,
+                "total_tokens": 201_000,
+                "output_token_details": {"reasoning": 600},
+            },
+        )
+        usage = extract_token_usage(msg)
+        assert usage["input_tokens"] == 200_000
+        assert usage["output_tokens"] == 1_000
+        assert usage.get("reasoning_tokens") == 600
+
+        cost_usd, _ = calculate_notional_cost(
+            ember_card,
+            input_tokens=usage["input_tokens"],
+            output_tokens=usage["output_tokens"],
+            cached_tokens=usage.get("cached_tokens", 0),
+        )
+        # 200k * 0.10/1M + 1k * 0.50/1M = 0.0205 (reasoning 600 is part of 1k output, not added again)
+        assert cost_usd == pytest.approx(0.0205, rel=1e-9)
+

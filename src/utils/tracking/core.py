@@ -83,6 +83,38 @@ def _stamp_applied_rates(
     rates.append(applied)
 
 
+# DALTON-HOOK(notional-pricing): Record the nominal rate card applied to a
+# subscription/OAuth call so later overlay edits do not restate historical rows.
+def _stamp_applied_notional_rates(
+    entry: Dict[str, Any],
+    pricing: Optional[Dict[str, Any]],
+    notional_cost: float,
+    billing_type: str = "platform",
+) -> None:
+    """Record on the model summary which nominal rate card was applied."""
+    if not pricing:
+        return
+
+    notional_rates = entry.setdefault("notional_rates", [])
+    for applied in notional_rates:
+        if (
+            applied.get("billing_type") == billing_type
+            and applied.get("pricing") == pricing
+        ):
+            applied["call_count"] += 1
+            applied["notional_cost"] += notional_cost
+            return
+
+    notional_rates.append(
+        {
+            "call_count": 1,
+            "notional_cost": notional_cost,
+            "billing_type": billing_type,
+            "pricing": copy.deepcopy(pricing),
+        }
+    )
+
+
 def empty_usage_payload() -> Dict[str, Any]:
     """The zero-usage row, in the same shape a priced turn produces.
 
@@ -96,6 +128,8 @@ def empty_usage_payload() -> Dict[str, Any]:
         "model_key_shape": KEY_SHAPE_MANIFEST,
         "total_cost": 0.0,
         "platform_cost": 0.0,
+        # DALTON-HOOK(notional-pricing): parallel nominal total for subscription models.
+        "notional_cost": 0.0,
         # The populated path drops zero components, so an empty turn names none.
         "cost_breakdown": {},
         "per_call_costs": [],
@@ -146,6 +180,50 @@ class PricingResolver:
 
     def __init__(self) -> None:
         self._resolved: Dict[_ResolutionKey, Tuple[Optional[Dict[str, Any]], bool]] = {}
+        # DALTON-HOOK(notional-pricing): memoize nominal subscription cards per turn.
+        self._notional_index: Optional[Dict[str, Dict[str, Any]]] = None
+        self._notional_resolved: Dict[
+            _ResolutionKey, Tuple[Optional[Dict[str, Any]], bool]
+        ] = {}
+
+    # DALTON-HOOK(notional-pricing): resolve full nominal card (including tiers)
+    # alongside the cash card without turning subscription models into cash models.
+    def notional_card_for(
+        self, record: CallRecord
+    ) -> Tuple[Optional[Dict[str, Any]], bool]:
+        """Return `(notional_card, is_subscription)` for a call record."""
+        from src.dalton.llm.notional_pricing import (
+            build_notional_price_index,
+            is_subscription_model,
+            resolve_notional_card,
+        )
+
+        model_name = record["model_name"]
+        billing_type = record.get("billing_type", "platform")
+        stamped_id = record.get("pricing_model_id")
+        stamped_provider = record.get("pricing_provider")
+        cache_key = (model_name, billing_type, stamped_id, stamped_provider)
+        if cache_key in self._notional_resolved:
+            return self._notional_resolved[cache_key]
+
+        is_sub = is_subscription_model(
+            model_name,
+            billing_type,
+            pricing_model_id=stamped_id,
+            pricing_provider=stamped_provider,
+        )
+        notional_card: Optional[Dict[str, Any]] = None
+        if is_sub:
+            if self._notional_index is None:
+                self._notional_index = build_notional_price_index()
+            notional_card = resolve_notional_card(
+                model_name,
+                pricing_model_id=stamped_id,
+                index=self._notional_index,
+            )
+
+        self._notional_resolved[cache_key] = (notional_card, is_sub)
+        return self._notional_resolved[cache_key]
 
     def card_for(self, record: CallRecord) -> Tuple[Optional[Dict[str, Any]], bool]:
         """The billable card for the record's call, and whether one was listed."""
@@ -380,7 +458,11 @@ def calculate_cost_from_per_call_records(
     if not per_call_records:
         return empty_usage_payload()
 
+    from src.dalton.llm.notional_pricing import calculate_notional_cost
+
     total_cost = 0.0
+    # DALTON-HOOK(notional-pricing): track nominal subscription cost separately from cash cost.
+    total_notional_cost = 0.0
     aggregated_breakdown = {
         "input_cost": 0.0,
         "output_cost": 0.0,
@@ -412,12 +494,34 @@ def calculate_cost_from_per_call_records(
         if record.get("pricing_model_id"):
             stamped_records += 1
         card, window, straddled, call_cost, call_breakdown, _ = price_call(record, resolve)
+        # DALTON-HOOK(notional-pricing): evaluate per-call nominal cost for subscription/OAuth
+        # models using the full tiered card while keeping cash cost = 0.0 on subscription cards.
+        notional_card, is_sub = resolve.notional_card_for(record)
 
         input_tokens = usage.get('input_tokens', 0)
         output_tokens = usage.get('output_tokens', 0)
         cached_tokens = usage.get('cached_tokens', 0)
+        cache_5m_tokens = usage.get('cache_5m_tokens', 0)
+        cache_1h_tokens = usage.get('cache_1h_tokens', 0)
+
+        call_notional_cost = 0.0
+        call_notional_breakdown: Dict[str, Any] = {}
+        if is_sub:
+            if notional_card is not None:
+                call_notional_cost, call_notional_breakdown = calculate_notional_cost(
+                    notional_card,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    cached_tokens=cached_tokens,
+                    cache_5m_tokens=cache_5m_tokens,
+                    cache_1h_tokens=cache_1h_tokens,
+                )
+            elif call_cost > 0.0:
+                call_notional_cost = call_cost
+                call_notional_breakdown = copy.deepcopy(call_breakdown)
 
         # Store per-call cost record
+        # DALTON-HOOK(notional-pricing): persist per-call notional_cost alongside cash cost.
         call_cost_record = {
             "model_name": model_name,
             "served_model": record.get("served_model"),
@@ -425,12 +529,15 @@ def calculate_cost_from_per_call_records(
             "output_tokens": output_tokens,
             "cached_tokens": cached_tokens,
             "cost": call_cost,
+            "notional_cost": call_notional_cost,
             "breakdown": call_breakdown,
             "billing_type": record.get("billing_type", "platform"),
             "timestamp": record.get("timestamp"),
             "run_id": record.get("run_id"),
             "parent_run_id": record.get("parent_run_id"),
         }
+        if call_notional_breakdown:
+            call_cost_record["notional_breakdown"] = call_notional_breakdown
         if window:
             # Only for models priced by the hour, so the row does not carry a
             # window and a second stamp on every call of every other model.
@@ -442,6 +549,7 @@ def calculate_cost_from_per_call_records(
 
         # Aggregate total cost
         total_cost += call_cost
+        total_notional_cost += call_notional_cost
 
         # Aggregate breakdown across all calls
         if 'input' in call_breakdown:
@@ -458,6 +566,7 @@ def calculate_cost_from_per_call_records(
             aggregated_breakdown['cache_1h_cost'] += call_breakdown['cache_1h_creation']['cost']
 
         # Aggregate usage by model (for reporting)
+        # DALTON-HOOK(notional-pricing): aggregate per-model notional_cost and notional_rates.
         if model_name not in by_model:
             by_model[model_name] = {
                 'input_tokens': 0,
@@ -466,6 +575,7 @@ def calculate_cost_from_per_call_records(
                 'cached_tokens': 0,
                 'call_count': 0,
                 'total_cost': 0.0,
+                'notional_cost': 0.0,
             }
 
         by_model[model_name]['input_tokens'] += input_tokens
@@ -474,8 +584,12 @@ def calculate_cost_from_per_call_records(
         by_model[model_name]['cached_tokens'] += cached_tokens
         by_model[model_name]['call_count'] += 1
         by_model[model_name]['total_cost'] += call_cost
+        by_model[model_name]['notional_cost'] += call_notional_cost
         _stamp_applied_rates(
             by_model[model_name], card, window, call_cost, billing_type, straddled
+        )
+        _stamp_applied_notional_rates(
+            by_model[model_name], notional_card, call_notional_cost, billing_type
         )
 
     # Clean up zero-value breakdown entries
@@ -494,11 +608,13 @@ def calculate_cost_from_per_call_records(
     else:
         model_key_shape = KEY_SHAPE_MIXED
 
+    # DALTON-HOOK(notional-pricing): include notional_cost alongside cash total_cost and platform_cost.
     return {
         "by_model": by_model,
         "model_key_shape": model_key_shape,
         "total_cost": total_cost,
         "platform_cost": platform_cost,
+        "notional_cost": total_notional_cost,
         "cost_breakdown": cost_breakdown,
         "per_call_costs": per_call_costs,
     }

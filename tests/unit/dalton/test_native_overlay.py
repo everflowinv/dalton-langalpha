@@ -42,7 +42,7 @@ def test_native_overlay_does_not_collide_with_upstream():
     assert native is not None
 
     native_models = native.get("models") or {}
-    assert len(native_models) == 26
+    assert len(native_models) == 27
     overlap = set(native_models) & set(upstream_models)
     # The Grok subscription keys are Dalton's pinned routes: upstream grew
     # same-named entries on its own grok-oauth (api.x.ai) line, and the
@@ -1330,3 +1330,237 @@ async def test_glm_coding_plan_only_accepts_own_key(
     assert rc_env.credential_source == CredentialSource.PLATFORM
     assert rc_env.client.anthropic_api_key.get_secret_value() == env_coding_token
     assert rc_env.client.anthropic_api_url == "https://open.bigmodel.cn/api/anthropic"
+
+
+def test_muse_ember_registration_metadata_and_role_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify Muse Ember 1.0 registration, metadata, reasoning efforts, role policy, and unchanged defaults."""
+    from src.dalton.llm.role_policy import (
+        _load_default_agent_config,
+        check_roles,
+        family_of,
+        is_forbidden_for_roles,
+        is_text_only,
+    )
+
+    monkeypatch.setattr(LLM, "_model_config", None)
+    mc = ModelConfig()
+
+    entry = mc.get_model_config("muse-ember-1.0-oauth")
+    assert entry is not None
+    assert entry["model_id"] == "muse-ember-1.0"
+    assert entry["provider"] == "muse-oauth"
+    assert entry["display_name"] == "Muse Ember 1.0"
+    assert entry["visible"] is True
+    assert entry["context"] == 1048576
+    assert entry["input_modalities"] == ["text", "image"]
+    assert "speed" not in entry
+    assert "intelligence" not in entry
+
+    params = entry.get("parameters") or {}
+    assert params["max_tokens"] == 524288
+    assert params["reasoning"] == {"summary": "auto"}
+    assert params["include"] == ["reasoning.encrypted_content"]
+    assert params["store"] is False
+
+    reasoning = entry.get("reasoning") or {}
+    expected_efforts = ["minimal", "low", "medium", "high", "xhigh", "max"]
+    assert reasoning["efforts"] == expected_efforts
+    assert reasoning["default"] == "max"
+    assert reasoning["write"] == "parameters.reasoning.effort"
+
+    # Standard only: no Contributor variant or duplicate cash model
+    assert mc.get_model_config("muse-ember-1.0-contributor-oauth") is None
+    assert mc.get_model_config("muse-ember-1.0") is None
+
+    # Existing Muse models remain intact
+    for existing_muse in (
+        "muse-spark-1.3-oauth",
+        "muse-spark-1.3-contributor-oauth",
+        "muse-wonder-full-1.0-oauth",
+        "muse-wonder-full-1.0-contributor-oauth",
+    ):
+        assert mc.get_model_config(existing_muse) is not None
+
+    # Listed models & metadata surfaced to frontend catalog/tuning
+    listed = dict(mc.listed_models())
+    assert "muse-ember-1.0-oauth" in listed
+    assert "muse-ember-1.0-contributor-oauth" not in listed
+
+    all_metadata = mc.get_model_metadata()
+    assert "muse-ember-1.0-oauth" in all_metadata
+    metadata = all_metadata["muse-ember-1.0-oauth"]
+    assert metadata["display_name"] == "Muse Ember 1.0"
+    assert metadata["provider"] == "muse-oauth"
+    assert metadata["access_type"] == "oauth"
+    assert metadata["model_id"] == "muse-ember-1.0"
+    assert metadata["context"] == 1048576
+    assert metadata["input_modalities"] == ["text", "image"]
+    assert metadata["reasoning_efforts"] == expected_efforts
+    assert metadata["reasoning_effort_default"] == "max"
+    assert metadata["prompt_guidance"] == "lean"
+    assert "speed" not in metadata
+    assert "intelligence" not in metadata
+
+    # Dalton meta & nominal price card
+    dalton_meta = load_dalton_meta()
+    ember_meta = dalton_meta["muse-ember-1.0-oauth"]
+    assert ember_meta["family"] == "meta-muse"
+    assert ember_meta["billing"] == "subscription"
+    assert ember_meta["tool_calling"] is True
+    assert "notional_ref" not in ember_meta
+    assert not ember_meta.get("forbidden_for_roles")
+
+    np = ember_meta["notional_pricing"]
+    assert np["input_pricing_mode"] == "input_dependent"
+    assert np["output_pricing_mode"] == "input_dependent"
+    assert "cached_input" not in np
+    assert np["input_tiers"] == [
+        {"max_tokens": 200000, "rate": 0.1, "cached_input": 0.004},
+        {"max_tokens": None, "rate": 0.3, "cached_input": 0.012},
+    ]
+    assert np["output_tiers"] == [
+        {"max_tokens": 200000, "rate": 0.5},
+        {"max_tokens": None, "rate": 1.5},
+    ]
+    assert np["source"] == "https://dev.meta.ai/docs/pricing-rate-limits"
+    assert np["verified_at"] == "2026-11-10"
+
+    # Role policy helpers & check_roles validation
+    assert family_of("muse-ember-1.0-oauth") == "meta-muse"
+    assert is_forbidden_for_roles("muse-ember-1.0-oauth") is False
+    assert is_text_only("muse-ember-1.0-oauth") is False
+
+    warnings = check_roles(
+        {"llm": {"name": "muse-ember-1.0-oauth"}},
+        assist_model="glm-5.3-flash-plan",
+        assist_fallback_models=["glm-5.3-plan"],
+        reviewer_models=["claude-opus-5-5-oauth"],
+        available_models={
+            "muse-ember-1.0-oauth",
+            "glm-5.3-flash-plan",
+            "glm-5.3-plan",
+            "claude-opus-5-5-oauth",
+        },
+    )
+    warning_codes = {w["code"] for w in warnings}
+    assert "role_forbidden_model" not in warning_codes
+    assert "lead_text_only" not in warning_codes
+    assert "reviewer_same_family" not in warning_codes
+
+    # Default role configuration remains unchanged
+    default_cfg = _load_default_agent_config()
+    default_llm = default_cfg.get("llm") or {}
+    assert default_llm.get("name") != "muse-ember-1.0-oauth"
+
+
+@pytest.mark.asyncio
+async def test_muse_ember_client_wire_payload_contributor_zero_and_tool_calling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify ChatMuseOpenAI built for muse-ember-1.0-oauth sends model='muse-ember-1.0',
+    max_output_tokens=524288, reasoning effort, x-tbh-contributor-mode='0', and tools over the wire."""
+    import httpx
+    from langchain_core.tools import tool
+    from src.dalton.llm.providers.muse.client import ChatMuseOpenAI
+
+    monkeypatch.setattr(LLM, "_model_config", None)
+
+    captured_requests: list[httpx.Request] = []
+    sse_text_body = (
+        'event: response.output_text.delta\n'
+        'data: {"type":"response.output_text.delta","delta":"OK"}\n\n'
+        'event: response.completed\n'
+        'data: {"type":"response.completed","response":{"id":"resp_ember_1","object":"response","status":"completed",'
+        '"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"OK"}]}],'
+        '"usage":{"input_tokens":12,"output_tokens":4,"total_tokens":16}}}\n\n'
+    )
+    sse_tool_body = (
+        'event: response.output_item.added\n'
+        'data: {"type":"response.output_item.added","output_index":0,"item":{"id":"fc_1","type":"function_call","status":"in_progress","call_id":"call_add_1","name":"add_numbers","arguments":""}}\n\n'
+        'event: response.function_call_arguments.delta\n'
+        'data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","output_index":0,"delta":"{\\"a\\":2,\\"b\\":3}"}\n\n'
+        'event: response.output_item.done\n'
+        'data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_1","type":"function_call","status":"completed","call_id":"call_add_1","name":"add_numbers","arguments":"{\\"a\\":2,\\"b\\":3}"}}\n\n'
+        'event: response.completed\n'
+        'data: {"type":"response.completed","response":{"id":"resp_ember_2","object":"response","status":"completed",'
+        '"output":[{"type":"function_call","id":"fc_1","call_id":"call_add_1","name":"add_numbers","arguments":"{\\"a\\":2,\\"b\\":3}"}],'
+        '"usage":{"input_tokens":20,"output_tokens":8,"total_tokens":28}}}\n\n'
+    )
+
+    async def _mock_handler(request: httpx.Request) -> httpx.Response:
+        captured_requests.append(request)
+        req_body = json.loads(request.content.decode("utf-8"))
+        body_bytes = (
+            sse_tool_body.encode("utf-8")
+            if req_body.get("tools")
+            else sse_text_body.encode("utf-8")
+        )
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=body_bytes,
+        )
+
+    transport = httpx.MockTransport(_mock_handler)
+    async with httpx.AsyncClient(transport=transport) as async_http_client:
+        llm_default = LLM(
+            "muse-ember-1.0-oauth",
+            api_key="fake-muse-token",
+            http_async_client=async_http_client,
+        )
+        client = llm_default.get_llm()
+        assert isinstance(client, ChatMuseOpenAI)
+        assert client.model == "muse-ember-1.0"
+        assert client.max_tokens == 524288
+        assert client.profile["max_input_tokens"] == 1048576
+        assert client.profile["max_output_tokens"] == 524288
+        assert (client.default_headers or {})["x-tbh-contributor-mode"] == "0"
+
+        # 1. Default invocation over MockTransport verifies merged wire headers and body
+        resp_1 = await client.ainvoke([HumanMessage(content="hello")])
+        assert resp_1.usage_metadata["input_tokens"] == 12
+        assert resp_1.usage_metadata["output_tokens"] == 4
+        assert len(captured_requests) == 1
+        req_1 = captured_requests[0]
+        assert req_1.headers["x-tbh-contributor-mode"] == "0"
+        assert "x-tbh-session-id" in req_1.headers
+        assert req_1.headers["x-tbh-session-id"] == req_1.headers["x-meta-ai-gateway-session-id"]
+        body_1 = json.loads(req_1.content.decode("utf-8"))
+        assert body_1["model"] == "muse-ember-1.0"
+        assert body_1["max_output_tokens"] == 524288
+        assert body_1["store"] is False
+        assert "reasoning.encrypted_content" in body_1["include"]
+        assert body_1["reasoning"] == {"summary": "auto", "effort": "max"}
+
+        # 2. Explicit reasoning effort overrides (all 6 supported levels)
+        for effort in ("minimal", "low", "medium", "high", "xhigh", "max"):
+            client_eff = LLM(
+                "muse-ember-1.0-oauth",
+                api_key="fake-muse-token",
+                reasoning_effort=effort,
+                http_async_client=async_http_client,
+            ).get_llm()
+            eff_payload = client_eff._get_request_payload([HumanMessage(content="hi")])
+            assert eff_payload["reasoning"] == {"summary": "auto", "effort": effort}
+
+        # 3. Tool binding invoked over MockTransport verifies tools & tool_choice="auto" on wire
+        @tool
+        def add_numbers(a: int, b: int) -> int:
+            """Add two integers."""
+            return a + b
+
+        bound_client = client.bind_tools([add_numbers], tool_choice="auto")
+        resp_tool = await bound_client.ainvoke([HumanMessage(content="add 2 and 3")])
+        assert len(captured_requests) == 2
+        req_2 = captured_requests[1]
+        assert req_2.headers["x-tbh-contributor-mode"] == "0"
+        body_2 = json.loads(req_2.content.decode("utf-8"))
+        assert body_2["model"] == "muse-ember-1.0"
+        assert body_2["max_output_tokens"] == 524288
+        assert body_2["reasoning"] == {"summary": "auto", "effort": "max"}
+        assert body_2.get("tool_choice") == "auto"
+        assert isinstance(body_2.get("tools"), list) and len(body_2["tools"]) == 1
+        assert body_2["tools"][0]["name"] == "add_numbers"
+        assert resp_tool.tool_calls and resp_tool.tool_calls[0]["name"] == "add_numbers"
+        assert resp_tool.tool_calls[0]["args"] == {"a": 2, "b": 3}
+

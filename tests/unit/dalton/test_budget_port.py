@@ -1446,4 +1446,199 @@ async def test_glm_coding_subscription_budget_and_provider_status(
     assert sentinel[:6] not in serialized
 
 
+def test_muse_ember_nominal_pricing_tracking_budget_breakdown_and_journal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify Muse Ember 1.0 per-call threshold nominal pricing across tracking, budget,
+    provider breakdown, and journal cost helpers while keeping cash/platform cost zero."""
+    from src.dalton.budget.service import (
+        _notional_price_index,
+        _resolve_provider_for_model,
+        compute_provider_breakdown,
+        compute_subscription_notional_usd,
+    )
+    from src.dalton.llm.complete import (
+        compute_call_costs,
+        resolve_model_billing_and_provider,
+    )
+    from src.llms.llm import LLM
+    from src.llms.pricing_utils import find_model_pricing
+    from src.utils.tracking.core import calculate_cost_from_per_call_records
+
+    monkeypatch.setattr(LLM, "_model_config", None)
+
+    b_type, prov = resolve_model_billing_and_provider("muse-ember-1.0-oauth")
+    assert b_type == "oauth"
+    assert prov == "muse-oauth"
+    assert _resolve_provider_for_model("muse-ember-1.0-oauth", "oauth") == "muse-oauth"
+    assert _resolve_provider_for_model("muse-ember-1.0-oauth", "platform") == "muse-oauth"
+
+    # Cash pricing remains subscription ($0.00 cash)
+    cash_card = find_model_pricing("muse-ember-1.0", provider="muse-oauth")
+    assert cash_card == {"pricing_type": "subscription"}
+
+    # Notional index preserves the full tiered card
+    idx = _notional_price_index()
+    assert "muse-ember-1.0-oauth" in idx
+    assert "muse-ember-1.0" in idx
+    ember_card = idx["muse-ember-1.0-oauth"]
+    assert ember_card["input_pricing_mode"] == "input_dependent"
+    assert ember_card["output_pricing_mode"] == "input_dependent"
+    assert "cached_input" not in ember_card
+
+    # 1. Exact threshold cases via compute_call_costs (both oauth and platform billing_type)
+    cases = [
+        (199_999, 0, 1_000, Decimal("0.020500"), 0.0204999),
+        (200_000, 0, 1_000, Decimal("0.020500"), 0.0205),
+        (200_001, 0, 1_000, Decimal("0.061500"), 0.0615003),
+        (200_000, 150_000, 1_000, Decimal("0.006100"), 0.0061),
+        (200_001, 150_001, 1_000, Decimal("0.018300"), 0.018300012),
+        (200_000, 200_000, 0, Decimal("0.000800"), 0.0008),
+        (200_001, 200_001, 0, Decimal("0.002400"), 0.002400012),
+        (100, 0, 300_000, Decimal("0.150010"), 0.15001),
+    ]
+    for in_tok, cache_tok, out_tok, expected_dec, expected_float in cases:
+        for bt in ("oauth", "platform"):
+            cash_usd, notional_usd = compute_call_costs(
+                "muse-ember-1.0-oauth",
+                bt,
+                {
+                    "input_tokens": in_tok,
+                    "output_tokens": out_tok,
+                    "cached_tokens": cache_tok,
+                },
+            )
+            assert cash_usd == Decimal("0")
+            assert notional_usd == expected_dec
+
+            tracked = calculate_cost_from_per_call_records(
+                [
+                    {
+                        "model_name": "muse-ember-1.0-oauth",
+                        "billing_type": bt,
+                        "usage": {
+                            "input_tokens": in_tok,
+                            "output_tokens": out_tok,
+                            "cached_tokens": cache_tok,
+                        },
+                    }
+                ]
+            )
+            assert tracked["total_cost"] == 0.0
+            assert tracked["platform_cost"] == 0.0
+            assert tracked["notional_cost"] == pytest.approx(expected_float, rel=1e-9, abs=1e-12)
+            assert tracked["per_call_costs"][0]["cost"] == 0.0
+            assert tracked["per_call_costs"][0]["notional_cost"] == pytest.approx(
+                expected_float, rel=1e-9, abs=1e-12
+            )
+            assert tracked["by_model"]["muse-ember-1.0-oauth"]["total_cost"] == 0.0
+            assert tracked["by_model"]["muse-ember-1.0-oauth"]["notional_cost"] == pytest.approx(
+                expected_float, rel=1e-9, abs=1e-12
+            )
+
+            row_list = [{"token_usage": tracked}]
+            assert compute_subscription_notional_usd(row_list) == expected_dec
+            bd = compute_provider_breakdown(row_list, journal_rows=[])
+            assert bd["muse-oauth"]["cash_usd"] == 0.0
+            assert bd["muse-oauth"]["notional_usd"] == float(expected_dec)
+            assert bd["muse-oauth"]["calls"] == 1
+
+    # 2. Two 150K requests in one turn vs one 300K request:
+    # Two 150K requests stay in the <=200K tier ($0.015 + $0.015 = $0.030000),
+    # never promoted to the >200K tier ($0.090000) and never double-counted with by_model.
+    two_short_calls = calculate_cost_from_per_call_records(
+        [
+            {
+                "model_name": "muse-ember-1.0-oauth",
+                "billing_type": "oauth",
+                "usage": {"input_tokens": 150_000, "output_tokens": 0, "cached_tokens": 0},
+            },
+            {
+                "model_name": "muse-ember-1.0-oauth",
+                "billing_type": "platform",
+                "usage": {"input_tokens": 150_000, "output_tokens": 0, "cached_tokens": 0},
+            },
+        ]
+    )
+    assert two_short_calls["total_cost"] == 0.0
+    assert two_short_calls["platform_cost"] == 0.0
+    assert two_short_calls["notional_cost"] == pytest.approx(0.03, rel=1e-9)
+    assert [c["notional_cost"] for c in two_short_calls["per_call_costs"]] == [
+        pytest.approx(0.015, rel=1e-9),
+        pytest.approx(0.015, rel=1e-9),
+    ]
+    assert two_short_calls["by_model"]["muse-ember-1.0-oauth"]["input_tokens"] == 300_000
+    assert two_short_calls["by_model"]["muse-ember-1.0-oauth"]["notional_cost"] == pytest.approx(
+        0.03, rel=1e-9
+    )
+
+    short_rows = [{"token_usage": two_short_calls}]
+    assert compute_subscription_notional_usd(short_rows) == Decimal("0.030000")
+    bd_short = compute_provider_breakdown(short_rows, journal_rows=[])
+    assert bd_short["muse-oauth"]["cash_usd"] == 0.0
+    assert bd_short["muse-oauth"]["notional_usd"] == 0.03
+    assert bd_short["muse-oauth"]["calls"] == 2
+
+    one_long_call = calculate_cost_from_per_call_records(
+        [
+            {
+                "model_name": "muse-ember-1.0-oauth",
+                "billing_type": "oauth",
+                "usage": {"input_tokens": 300_000, "output_tokens": 0, "cached_tokens": 0},
+            }
+        ]
+    )
+    assert one_long_call["total_cost"] == 0.0
+    assert one_long_call["platform_cost"] == 0.0
+    assert one_long_call["notional_cost"] == pytest.approx(0.09, rel=1e-9)
+    long_rows = [{"token_usage": one_long_call}]
+    assert compute_subscription_notional_usd(long_rows) == Decimal("0.090000")
+    bd_long = compute_provider_breakdown(long_rows, journal_rows=[])
+    assert bd_long["muse-oauth"]["cash_usd"] == 0.0
+    assert bd_long["muse-oauth"]["notional_usd"] == 0.09
+    assert bd_long["muse-oauth"]["calls"] == 1
+
+    # 3. Zero-token call with notional_cost=0.0 is respected and not re-estimated
+    zero_row = [
+        {
+            "token_usage": {
+                "per_call_costs": [
+                    {
+                        "model_name": "muse-ember-1.0-oauth",
+                        "billing_type": "oauth",
+                        "input_tokens": 100_000,
+                        "output_tokens": 10_000,
+                        "cached_tokens": 0,
+                        "cost": 0.0,
+                        "notional_cost": 0.0,
+                    }
+                ]
+            }
+        }
+    ]
+    assert compute_subscription_notional_usd(zero_row) == Decimal("0.000000")
+    bd_zero = compute_provider_breakdown(zero_row, journal_rows=[])
+    assert bd_zero["muse-oauth"]["notional_usd"] == 0.0
+
+    # 4. Legacy by_model-only row with call_count > 1 uses tier-0 fallback rather than
+    # falsely selecting the >200K long tier from the sum of two 150K calls.
+    legacy_multi_call_row = [
+        {
+            "token_usage": {
+                "by_model": {
+                    "muse-ember-1.0-oauth": {
+                        "input_tokens": 300_000,
+                        "output_tokens": 0,
+                        "cached_tokens": 0,
+                        "call_count": 2,
+                        "total_cost": 0.0,
+                    }
+                }
+            }
+        }
+    ]
+    assert compute_subscription_notional_usd(legacy_multi_call_row) == Decimal("0.030000")
+
+
+
 
