@@ -27,16 +27,21 @@ import pytest
 import pytest_asyncio
 from sqlalchemy import create_engine, pool
 
-from src.dalton import access_tiers, auth as dalton_auth
-from src.dalton.autonomy.classification import classify_automation_scope
+from src.dalton import access_tiers, auth as dalton_auth, sharing as dalton_sharing
+from src.dalton.app import channels_router as ch_router_mod
+from src.dalton.autonomy.classification import (
+    build_scope_case_sql,
+    classify_automation_scope,
+    needs_workspace_tracking_lookup,
+)
 from src.dalton.autonomy.schedule import schedule_dalton_automation_helper
 from src.dalton.budget.service import resolve_user_budget_config
 from src.dalton.company_identity import (
     COMPANY_SYSTEM_EMAIL,
     COMPANY_SYSTEM_USER_ID,
     ensure_company_system_identity,
-    reject_company_system_auth,
 )
+from src.dalton.database.channel_gateway import hash_bind_code
 from src.dalton.migrations.versions import d035_company_automations as d035_mod
 from src.dalton.services import company_automations as company_auto_svc
 from src.dalton.settings import DaltonBudgetDefaults, get_dalton_settings
@@ -69,6 +74,18 @@ async def _reset_au1_test_rows(conn: psycopg.AsyncConnection) -> None:
     await conn.execute(
         """
         TRUNCATE TABLE
+            dalton_channel_weixin_state,
+            dalton_channel_automation_runs,
+            dalton_channel_deliveries,
+            dalton_channel_background_runs,
+            dalton_channel_inbound_events,
+            dalton_channel_thread_watches,
+            dalton_channel_session_generations,
+            dalton_channel_chat_bindings,
+            dalton_channel_user_settings,
+            dalton_channel_bind_codes,
+            dalton_channel_identities,
+            dalton_workspace_sharing,
             automation_executions,
             automations,
             dalton_coverage_units,
@@ -107,10 +124,14 @@ async def au1_live_pool(
     test_db_uri: str,
 ):
     """Open a tuple-default AsyncConnectionPool on the test's live loop matching production pool.py."""
-    from src.dalton import company_identity as company_identity_mod
+    from src.dalton import (
+        company_identity as company_identity_mod,
+        sharing as dalton_sharing_mod,
+    )
     from src.dalton.autonomy import schedule as dalton_schedule_mod
     from src.dalton.database import (
         budget as dalton_budget_db,
+        channel_gateway as dalton_channel_gw_db,
         company_automations as company_auto_db,
         members as dalton_members_db,
     )
@@ -155,8 +176,10 @@ async def au1_live_pool(
     db_call_sites = (
         pool_mod,
         company_identity_mod,
+        dalton_sharing_mod,
         dalton_schedule_mod,
         dalton_budget_db,
+        dalton_channel_gw_db,
         company_auto_db,
         dalton_members_db,
         dalton_notify_mod,
@@ -690,10 +713,41 @@ async def test_d035_upgrade_from_d031_preserves_state_and_enforces_safe_downgrad
     with pytest.raises(RuntimeError, match="migration_state"):
         await asyncio.to_thread(command.downgrade, dalton_cfg, "d031")
 
+    company_comp_id = str(uuid.uuid4())
     async with au1_live_pool.connection() as db_conn:
         await db_conn.execute(
             "UPDATE dalton_data_task_defs SET migration_state = '{}'::jsonb WHERE job_key = 'cn-leverage-daily'"
         )
+        # E) Company-owned computer WITHOUT any company workspace (computers.user_id ON DELETE CASCADE)
+        #    MUST block downgrade so DELETE FROM users never cascade-deletes the company computer!
+        await _insert_computer(
+            db_conn, company_comp_id, COMPANY_SYSTEM_USER_ID, "Company Standalone Box"
+        )
+        async with db_conn.cursor() as cur:
+            await cur.execute(
+                "SELECT COUNT(*) FROM workspaces WHERE user_id = %s",
+                (COMPANY_SYSTEM_USER_ID,),
+            )
+            assert (await cur.fetchone())[0] == 0
+
+    with pytest.raises(RuntimeError, match="computers still references system:dalton-company"):
+        await asyncio.to_thread(command.downgrade, dalton_cfg, "d031")
+
+    async with au1_live_pool.connection() as db_conn:
+        async with db_conn.cursor() as cur:
+            await cur.execute(
+                "SELECT COUNT(*) FROM computers WHERE computer_id = %s::uuid AND user_id = %s",
+                (company_comp_id, COMPANY_SYSTEM_USER_ID),
+            )
+            assert (await cur.fetchone())[0] == 1
+        # Removing only the isolated test computer row allows clean downgrade to d031, then re-upgrade!
+        await db_conn.execute(
+            "DELETE FROM computers WHERE computer_id = %s::uuid",
+            (company_comp_id,),
+        )
+
+    await asyncio.to_thread(command.downgrade, dalton_cfg, "d031")
+    await asyncio.to_thread(command.upgrade, dalton_cfg, "head")
 
 
 # ---------------------------------------------------------------------------
@@ -920,24 +974,55 @@ async def test_company_budget_idempotency_and_external_auth_rejection_real_db(
         )
         assert cli_ok.status_code == 200, cli_ok.text
 
-    orig_decode_token = jwt_bearer._decode_token
-
-    async def _decode_company(_tok: str) -> jwt_bearer.AuthInfo:
-        reject_company_system_auth(COMPANY_SYSTEM_USER_ID)
-        return jwt_bearer.AuthInfo(user_id=COMPANY_SYSTEM_USER_ID)
+        # Session Bearer JWT via real jwt_bearer._decode_token / api_utils._decode_token
+        monkeypatch.setattr(api_utils, "HOST_MODE", "saas")
+        monkeypatch.setattr(jwt_bearer, "HOST_MODE", "saas")
+        monkeypatch.setattr(
+            jwt_bearer.jwt,
+            "get_unverified_header",
+            create_autospec(
+                jwt_bearer.jwt.get_unverified_header,
+                return_value={"kid": "real-db-kid"},
+            ),
+        )
+        monkeypatch.setattr(
+            jwt_bearer._signing_keys,
+            "get",
+            create_autospec(jwt_bearer._signing_keys.get, return_value="fake-jwk-key"),
+        )
+        monkeypatch.setattr(
+            jwt_bearer.jwt,
+            "decode",
+            create_autospec(
+                jwt_bearer.jwt.decode,
+                side_effect=lambda tok, *a, **kw: {
+                    "sub": COMPANY_SYSTEM_USER_ID if "company" in tok else human_uid,
+                    "app_metadata": {"provider": "email"},
+                },
+            ),
+        )
+        assert (
+            await client.get(
+                "/api/v1/automations", headers={"Authorization": "Bearer jwt_company"}
+            )
+        ).status_code == 401
+        jwt_ok = await client.get(
+            "/api/v1/automations", headers={"Authorization": "Bearer jwt_human"}
+        )
+        assert jwt_ok.status_code == 200, jwt_ok.text
 
     monkeypatch.setattr(ws_auth, "HOST_MODE", "saas")
-    monkeypatch.setattr(
-        ws_auth,
-        "_decode_token",
-        create_autospec(orig_decode_token, side_effect=_decode_company),
-    )
     ws = create_autospec(WebSocket, instance=True)
-    ws.headers = {"authorization": "Bearer company_jwt"}
+    ws.headers = {"authorization": "Bearer jwt_company"}
     ws.query_params = {}
     with pytest.raises(WebSocketException) as ws_exc:
         await ws_auth.authenticate_websocket(ws)
     assert ws_exc.value.code == 1008
+
+    ws_human_sock = create_autospec(WebSocket, instance=True)
+    ws_human_sock.headers = {"authorization": "Bearer jwt_human"}
+    ws_human_sock.query_params = {}
+    assert await ws_auth.authenticate_websocket(ws_human_sock) == human_uid
 
 
 @pytest.mark.asyncio
@@ -1409,3 +1494,1041 @@ async def test_http_scoped_listing_computer_isolation_and_readonly_history_real_
         assert (
             await client.get(f"/api/v1/automations/{comp_preset_id}/history")
         ).status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# 4. R4 Real PostgreSQL + ASGI Channel Gateway company-identity refusal
+#    and human session / unlinked / workspace-revocation preservation
+# ---------------------------------------------------------------------------
+
+
+async def _channel_table_counts(conn: psycopg.AsyncConnection) -> dict[str, int]:
+    tables = (
+        "dalton_channel_identities",
+        "dalton_channel_bind_codes",
+        "dalton_channel_user_settings",
+        "dalton_channel_chat_bindings",
+        "dalton_channel_session_generations",
+        "dalton_channel_thread_watches",
+        "dalton_channel_inbound_events",
+        "dalton_channel_background_runs",
+        "dalton_channel_deliveries",
+        "dalton_channel_automation_runs",
+        "dalton_channel_weixin_state",
+    )
+    counts: dict[str, int] = {}
+    async with conn.cursor() as cur:
+        for tbl in tables:
+            await cur.execute(f"SELECT COUNT(*) FROM {tbl}")
+            counts[tbl] = int((await cur.fetchone())[0])
+    return counts
+
+
+async def _raw_asgi_request_status(
+    app: FastAPI,
+    *,
+    method: str,
+    path: str,
+    headers: list[tuple[bytes, bytes]],
+    body: bytes = b"",
+) -> int:
+    sent_events: list[dict[str, Any]] = []
+    body_delivered = False
+
+    async def _receive() -> dict[str, Any]:
+        nonlocal body_delivered
+        if not body_delivered:
+            body_delivered = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return {"type": "http.disconnect"}
+
+    async def _send(message: dict[str, Any]) -> None:
+        sent_events.append(message)
+
+    await app(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": method,
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode("ascii"),
+            "query_string": b"",
+            "headers": headers,
+            "client": ("127.0.0.1", 12345),
+            "server": ("test", 80),
+        },
+        _receive,
+        _send,
+    )
+    return int(sent_events[0]["status"])
+
+
+@pytest.mark.asyncio
+async def test_channels_endpoints_reject_company_identity_and_preserve_human_flows_real_db(
+    au1_live_pool: AsyncConnectionPool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    svc_token = "k" * 40
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", svc_token)
+    monkeypatch.setattr(api_utils, "_SERVICE_TOKEN", svc_token)
+    monkeypatch.setenv("DALTON_AUTH_MODE", "supabase")
+    monkeypatch.setenv(
+        "DALTON_ALLOWED_EMAILS",
+        "chan-human@dalton.test,chan-colleague@dalton.test",
+    )
+    monkeypatch.setenv("DALTON_COLLEAGUE_DISPATCH_ENABLED", "1")
+
+    human_uid = "u-chan-human"
+    colleague_uid = "u-chan-colleague"
+    ws_colleague = str(uuid.uuid4())
+    home_human = get_home_workspace_id(human_uid)
+
+    async with au1_live_pool.connection() as db_conn:
+        await _insert_user(db_conn, human_uid, "chan-human@dalton.test")
+        await _insert_user(db_conn, colleague_uid, "chan-colleague@dalton.test")
+        await _insert_workspace(db_conn, home_human, human_uid, "Home", status="running")
+        await _insert_workspace(
+            db_conn, ws_colleague, colleague_uid, "NVDA Colleague", status="running"
+        )
+        before_counts = await _channel_table_counts(db_conn)
+
+    await dalton_sharing.upsert_workspace_sharing(
+        ws_colleague,
+        cos_access="rw",
+        web_access="rw",
+        updated_by=colleague_uid,
+    )
+
+    app = FastAPI()
+    app.include_router(ch_router_mod.channels_router, prefix="/api/v1/dalton")
+    svc_headers = {"X-Service-Token": svc_token}
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        # 1. Exact required probe: cmd="new", platform="feishu", dalton_user_id="system:dalton-company",
+        #    scope_key="dm:test", omitting message_id and platform_user_id -> 401 and ZERO DB writes!
+        r_exact = await client.post(
+            "/api/v1/dalton/channels/internal/session/command",
+            headers=svc_headers,
+            json={
+                "cmd": "new",
+                "platform": "feishu",
+                "dalton_user_id": COMPANY_SYSTEM_USER_ID,
+                "scope_key": "dm:test",
+            },
+        )
+        assert r_exact.status_code == 401
+
+        # 2a. Body/query identity variants (exact + mixed case + ASCII/Unicode whitespace) across endpoints
+        for sys_variant in (
+            COMPANY_SYSTEM_USER_ID,
+            " \tSyStEm:DaLtOn-CoMpAnY\n\u3000",
+        ):
+            assert (
+                await client.post(
+                    "/api/v1/dalton/channels/internal/session/command",
+                    headers=svc_headers,
+                    json={
+                        "cmd": "new",
+                        "platform": "feishu",
+                        "dalton_user_id": sys_variant,
+                        "scope_key": "dm:test",
+                    },
+                )
+            ).status_code == 401
+            assert (
+                await client.post(
+                    "/api/v1/dalton/channels/internal/session/command",
+                    headers=svc_headers,
+                    json={
+                        "cmd": "workspace_list",
+                        "platform": "feishu",
+                        "dalton_user_id": sys_variant,
+                        "scope_key": "dm:test",
+                        "is_internal_query": True,
+                    },
+                )
+            ).status_code == 401
+            assert (
+                await client.post(
+                    "/api/v1/dalton/channels/internal/bind-code/consume",
+                    headers=svc_headers,
+                    json={"action": "unbind", "platform": "feishu", "user_id": sys_variant},
+                )
+            ).status_code == 401
+            assert (
+                await client.post(
+                    "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
+                    headers=svc_headers,
+                    json={
+                        "delivery_key": "tool:comp:1",
+                        "kind": "agent_send",
+                        "user_id": sys_variant,
+                        "target": "feishu:@me",
+                    },
+                )
+            ).status_code == 401
+            assert (
+                await client.get(
+                    "/api/v1/dalton/channels/internal/state",
+                    headers=svc_headers,
+                    params={"user_id": sys_variant},
+                )
+            ).status_code == 401
+            assert (
+                await client.put(
+                    "/api/v1/dalton/channels/internal/settings",
+                    headers=svc_headers,
+                    json={"user_id": sys_variant, "settings": {}},
+                )
+            ).status_code == 401
+            assert (
+                await client.post(
+                    "/api/v1/dalton/channels/internal/automation-runs",
+                    headers=svc_headers,
+                    json={
+                        "execution_id": str(uuid.uuid4()),
+                        "user_id": sys_variant,
+                        "entries": ["feishu"],
+                    },
+                )
+            ).status_code == 401
+
+        # 2b. X-User-Id header variants (exact + mixed case via httpx, plus raw ASGI header with whitespace)
+        for hdr_variant in (COMPANY_SYSTEM_USER_ID, "SyStEm:DaLtOn-CoMpAnY"):
+            assert (
+                await client.post(
+                    "/api/v1/dalton/channels/internal/session/command",
+                    headers={**svc_headers, "X-User-Id": hdr_variant},
+                    json={"cmd": "new", "platform": "feishu", "scope_key": "dm:test"},
+                )
+            ).status_code == 401
+            assert (
+                await client.post(
+                    "/api/v1/dalton/channels/internal/bind-code/consume",
+                    headers={**svc_headers, "X-User-Id": hdr_variant},
+                    json={"action": "unbind", "platform": "feishu"},
+                )
+            ).status_code == 401
+            assert (
+                await client.get(
+                    "/api/v1/dalton/channels/internal/state",
+                    headers={**svc_headers, "X-User-Id": hdr_variant},
+                )
+            ).status_code == 401
+
+        assert (
+            await _raw_asgi_request_status(
+                app,
+                method="POST",
+                path="/api/v1/dalton/channels/internal/session/command",
+                headers=[
+                    (b"content-type", b"application/json"),
+                    (b"x-service-token", svc_token.encode("ascii")),
+                    (b"x-user-id", b" \tSyStEm:DaLtOn-CoMpAnY\t "),
+                ],
+                body=b'{"cmd":"new","platform":"feishu","scope_key":"dm:test"}',
+            )
+            == 401
+        )
+        assert (
+            await _raw_asgi_request_status(
+                app,
+                method="GET",
+                path="/api/v1/dalton/channels/internal/state",
+                headers=[
+                    (b"x-service-token", svc_token.encode("ascii")),
+                    (b"x-user-id", b" \tSyStEm:DaLtOn-CoMpAnY\t "),
+                ],
+            )
+            == 401
+        )
+
+        async with au1_live_pool.connection() as db_conn:
+            assert await _channel_table_counts(db_conn) == before_counts
+
+        # 3. Seed DB-level platform binding, bind code, and inbound record associated with system:dalton-company
+        #    (testing both canonical and mixed-case/whitespace DB values) to verify real DB resolution paths
+        #    reject BEFORE creating or mutating any rows!
+        for db_sys_uid in (COMPANY_SYSTEM_USER_ID, " \tSyStEm:DaLtOn-CoMpAnY\n\u3000"):
+            comp_code_plain = "DLT-COMP-0001"
+            comp_code_hash = hash_bind_code(comp_code_plain)
+            comp_in_req_key = str(uuid.uuid4())
+            async with au1_live_pool.connection() as db_conn:
+                await db_conn.execute(
+                    """
+                    INSERT INTO dalton_channel_identities (
+                        user_id, platform, platform_user_id, platform_username
+                    )
+                    VALUES (%s, 'feishu', 'ou_company_bound', 'comp-bot')
+                    """,
+                    (db_sys_uid,),
+                )
+                await db_conn.execute(
+                    """
+                    INSERT INTO dalton_channel_bind_codes (
+                        code_hash, user_id, platform, expires_at
+                    )
+                    VALUES (%s, %s, 'feishu', NOW() + INTERVAL '10 minutes')
+                    """,
+                    (comp_code_hash, db_sys_uid),
+                )
+                await db_conn.execute(
+                    """
+                    INSERT INTO dalton_channel_inbound_events (
+                        platform, message_id, request_key, dalton_user_id,
+                        chat_type, chat_address, thread_scope_key, run_id,
+                        status, raw_payload
+                    )
+                    VALUES (
+                        'feishu', 'om_company_inbound', %s::uuid, %s,
+                        'dm', 'feishu:@me', 'dm:ou_company_bound', 'run-company-01',
+                        'accepted', '{"platform_user_id": "ou_company_bound"}'::jsonb
+                    )
+                    """,
+                    (comp_in_req_key, db_sys_uid),
+                )
+                seeded_counts = await _channel_table_counts(db_conn)
+
+            # Platform binding lookup -> 401 across inbound, session/command, and unbind (no user_id in request!)
+            assert (
+                await client.post(
+                    "/api/v1/dalton/channels/internal/inbound/register-and-resolve",
+                    headers=svc_headers,
+                    json={
+                        "platform": "feishu",
+                        "platform_user_id": "ou_company_bound",
+                        "chat_type": "dm",
+                        "chat_address": "feishu:@me",
+                        "thread_scope_key": "dm:ou_company_bound",
+                        "message_id": "om_company_new_try",
+                    },
+                )
+            ).status_code == 401
+            assert (
+                await client.post(
+                    "/api/v1/dalton/channels/internal/session/command",
+                    headers=svc_headers,
+                    json={
+                        "cmd": "new",
+                        "platform": "feishu",
+                        "platform_user_id": "ou_company_bound",
+                        "scope_key": "dm:ou_company_bound",
+                    },
+                )
+            ).status_code == 401
+            assert (
+                await client.post(
+                    "/api/v1/dalton/channels/internal/bind-code/consume",
+                    headers=svc_headers,
+                    json={
+                        "action": "unbind",
+                        "platform": "feishu",
+                        "platform_user_id": "ou_company_bound",
+                    },
+                )
+            ).status_code == 401
+
+            # Bind code lookup -> 401 on both group leak and DM consume; used_at remains NULL!
+            assert (
+                await client.post(
+                    "/api/v1/dalton/channels/internal/bind-code/consume",
+                    headers=svc_headers,
+                    json={
+                        "action": "bind",
+                        "platform": "feishu",
+                        "code": comp_code_plain,
+                        "is_group": True,
+                    },
+                )
+            ).status_code == 401
+            assert (
+                await client.post(
+                    "/api/v1/dalton/channels/internal/bind-code/consume",
+                    headers=svc_headers,
+                    json={
+                        "action": "bind",
+                        "platform": "feishu",
+                        "platform_user_id": "ou_human_try",
+                        "code": comp_code_plain,
+                        "is_group": False,
+                    },
+                )
+            ).status_code == 401
+
+            # Existing inbound record lookup -> 401 across command replay, deliveries claim, inbound progress, steer reconcile!
+            assert (
+                await client.post(
+                    "/api/v1/dalton/channels/internal/session/command",
+                    headers=svc_headers,
+                    json={
+                        "cmd": "stop",
+                        "platform": "feishu",
+                        "platform_user_id": "ou_company_bound",
+                        "scope_key": "dm:ou_company_bound",
+                        "message_id": "om_company_inbound",
+                    },
+                )
+            ).status_code == 401
+            assert (
+                await client.post(
+                    "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
+                    headers=svc_headers,
+                    json={
+                        "delivery_key": "notice:comp:1",
+                        "kind": "notice",
+                        "platform": "feishu",
+                        "inbound_message_id": "om_company_inbound",
+                    },
+                )
+            ).status_code == 401
+            assert (
+                await client.post(
+                    "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
+                    headers=svc_headers,
+                    json={
+                        "delivery_key": "fallback:run-company-01",
+                        "kind": "fallback",
+                        "run_id": "run-company-01",
+                    },
+                )
+            ).status_code == 401
+            assert (
+                await client.post(
+                    "/api/v1/dalton/channels/internal/inbound/progress",
+                    headers=svc_headers,
+                    json={
+                        "platform": "feishu",
+                        "message_id": "om_company_inbound",
+                        "status": "completed",
+                    },
+                )
+            ).status_code == 401
+            assert (
+                await client.post(
+                    "/api/v1/dalton/channels/internal/steers/reconcile",
+                    headers=svc_headers,
+                    json={"platform": "feishu", "message_id": "om_company_inbound"},
+                )
+            ).status_code == 401
+
+            async with au1_live_pool.connection() as db_conn:
+                assert await _channel_table_counts(db_conn) == seeded_counts
+                async with db_conn.cursor(row_factory=dict_row) as cur:
+                    await cur.execute(
+                        "SELECT used_at FROM dalton_channel_bind_codes WHERE code_hash = %s",
+                        (comp_code_hash,),
+                    )
+                    assert (await cur.fetchone())["used_at"] is None
+                    await cur.execute(
+                        "SELECT status FROM dalton_channel_inbound_events WHERE platform = 'feishu' AND message_id = 'om_company_inbound'"
+                    )
+                    assert (await cur.fetchone())["status"] == "accepted"
+
+                await db_conn.execute(
+                    "DELETE FROM dalton_channel_identities WHERE platform_user_id = 'ou_company_bound'"
+                )
+                await db_conn.execute(
+                    "DELETE FROM dalton_channel_bind_codes WHERE code_hash = %s",
+                    (comp_code_hash,),
+                )
+                await db_conn.execute(
+                    "DELETE FROM dalton_channel_inbound_events WHERE platform = 'feishu' AND message_id = 'om_company_inbound'"
+                )
+
+        # 4. Human user positive flows + unlinked user denial + colleague workspace revocation!
+        r_unlinked = await client.post(
+            "/api/v1/dalton/channels/internal/session/command",
+            headers=svc_headers,
+            json={
+                "cmd": "new",
+                "platform": "feishu",
+                "platform_user_id": "ou_unlinked_visitor",
+                "scope_key": "dm:ou_unlinked_visitor",
+            },
+        )
+        assert r_unlinked.status_code == 200, r_unlinked.text
+        assert r_unlinked.json()["ok"] is False
+        assert r_unlinked.json()["deny_reason"] == "not_linked"
+
+        r_create_code = await client.post(
+            "/api/v1/dalton/channels/bind-codes",
+            headers={**svc_headers, "X-User-Id": human_uid},
+            json={"platform": "feishu"},
+        )
+        assert r_create_code.status_code == 200, r_create_code.text
+        human_code = r_create_code.json()["code"]
+
+        r_consume_human = await client.post(
+            "/api/v1/dalton/channels/internal/bind-code/consume",
+            headers=svc_headers,
+            json={
+                "action": "bind",
+                "platform": "feishu",
+                "platform_user_id": "ou_human_ok",
+                "platform_username": "Human Analyst",
+                "code": human_code,
+            },
+        )
+        assert r_consume_human.status_code == 200, r_consume_human.text
+        assert r_consume_human.json()["ok"] is True
+        assert r_consume_human.json()["user_id"] == human_uid
+
+        r_human_new = await client.post(
+            "/api/v1/dalton/channels/internal/session/command",
+            headers=svc_headers,
+            json={
+                "cmd": "new",
+                "platform": "feishu",
+                "dalton_user_id": human_uid,
+                "scope_key": "dm:ou_human_ok",
+            },
+        )
+        assert r_human_new.status_code == 200, r_human_new.text
+        assert r_human_new.json()["ok"] is True
+        assert r_human_new.json()["generation"] == 2
+
+        r_switch = await client.post(
+            "/api/v1/dalton/channels/internal/session/command",
+            headers=svc_headers,
+            json={
+                "cmd": "workspace_switch",
+                "platform": "feishu",
+                "platform_user_id": "ou_human_ok",
+                "scope_key": "dm:ou_human_ok",
+                "workspace_id": ws_colleague,
+            },
+        )
+        assert r_switch.status_code == 200, r_switch.text
+        assert r_switch.json()["ok"] is True
+        assert r_switch.json()["workspace_id"] == ws_colleague
+
+        r_recover_session = await client.post(
+            "/api/v1/dalton/channels/internal/session/command",
+            headers=svc_headers,
+            json={
+                "cmd": "workspace_list",
+                "platform": "feishu",
+                "dalton_user_id": human_uid,
+                "scope_key": "dm:ou_human_ok",
+                "is_internal_query": True,
+            },
+        )
+        assert r_recover_session.status_code == 200, r_recover_session.text
+        assert r_recover_session.json()["current_workspace_id"] == ws_colleague
+
+        # Revoke colleague write sharing -> inbound message on overridden workspace is denied!
+        await dalton_sharing.upsert_workspace_sharing(
+            ws_colleague,
+            cos_access="ro",
+            web_access="ro",
+            updated_by=colleague_uid,
+        )
+
+        r_revoked = await client.post(
+            "/api/v1/dalton/channels/internal/inbound/register-and-resolve",
+            headers=svc_headers,
+            json={
+                "platform": "feishu",
+                "platform_user_id": "ou_human_ok",
+                "chat_type": "dm",
+                "chat_address": "feishu:@me",
+                "thread_scope_key": "dm:ou_human_ok",
+                "message_id": "om_human_after_revoke",
+            },
+        )
+        assert r_revoked.status_code == 200, r_revoked.text
+        assert r_revoked.json()["allowed"] is False
+        assert r_revoked.json()["deny_reason"] == "workspace_write_denied"
+
+
+# ---------------------------------------------------------------------------
+# 5. R4 Shared SQL / Python / Create / Update classification matrix &
+#    PM chief_of_staff upsert on legacy null-workspace rows
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sql_python_create_update_scope_parity_and_null_ws_pm_upsert_real_db(
+    test_db_uri: str,
+    au1_live_pool: AsyncConnectionPool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dalton_cfg = _dalton_alembic_cfg(test_db_uri)
+    uid = "u-parity-r4"
+    other_uid = "u-parity-other"
+    ws_active = str(uuid.uuid4())
+    ws_unit_sector = str(uuid.uuid4())
+    ws_other_owner = str(uuid.uuid4())
+    ws_deleted = str(uuid.uuid4())
+    ws_unbound = str(uuid.uuid4())
+    ws_archived_unit = str(uuid.uuid4())
+    ws_plain = str(uuid.uuid4())
+    home_id = get_home_workspace_id(uid)
+    fixed_ts = datetime(2026, 10, 15, 9, 0, tzinfo=UTC)
+
+    # Same shared input matrix tested across:
+    # (1) Python classify_automation_scope, (2) SQL d035 migration backfill,
+    # (3) SQL build_scope_case_sql, (4) lifecycle.create_automation, and (5) lifecycle.update_automation!
+    shared_matrix: list[tuple[str, str, str | None, dict[str, Any], str]] = [
+        ("cal-spaces", "  dalton-earnings-calendar  ", ws_plain, {}, "research_tracking"),
+        ("cal-tab-nl", "\tdalton-earnings-calendar\n", None, {}, "research_tracking"),
+        ("cal-unicode", "\u00a0dalton-earnings-calendar\u3000", ws_plain, {}, "research_tracking"),
+        (
+            "kind-ws-case",
+            "Custom Kind Note",
+            ws_plain,
+            {"dalton_kind": " \t\u3000Company_Watch\n"},
+            "research_tracking",
+        ),
+        (
+            "kind-sector-upper",
+            "Sector Review",
+            None,
+            {"dalton_kind": "SECTOR_DELTA"},
+            "research_tracking",
+        ),
+        (
+            "kind-unknown",
+            "Unknown Kind Task",
+            ws_active,
+            {"dalton_kind": " \tunknown_kind\u3000"},
+            "personal",
+        ),
+        (
+            "kind-empty-ws",
+            "Blank Kind Task",
+            ws_active,
+            {"dalton_kind": " \t\n\u00a0\u3000"},
+            "personal",
+        ),
+        ("kind-null", "Null Kind Task", ws_active, {"dalton_kind": None}, "personal"),
+        (
+            "ticker-mixed-ws",
+            " \tdalton-nvda-CustomProbe\u3000\n",
+            ws_active,
+            {},
+            "research_tracking",
+        ),
+        (
+            "ticker-dot-case",
+            "\u3000dalton-brk.b-FilingCheck ",
+            ws_active,
+            {},
+            "research_tracking",
+        ),
+        (
+            "active-sector-unit",
+            " \tdalton-semi-supply-chain\n",
+            ws_unit_sector,
+            {},
+            "research_tracking",
+        ),
+        (
+            "director-daily-ws",
+            " \tdalton-director-daily\u3000",
+            ws_active,
+            {"dalton_kind": " \tdirector_daily\n"},
+            "personal",
+        ),
+        (
+            "director-weekly-ws",
+            "\u00a0dalton-director-weekly\t",
+            ws_active,
+            {"dalton_kind": "director_weekly"},
+            "personal",
+        ),
+        (
+            "data-health-ws",
+            " dalton-data-health\n",
+            ws_active,
+            {"dalton_kind": "data_health"},
+            "personal",
+        ),
+        (
+            "alphaengine-pers",
+            "AlphaEngine 机构会议增量整理入库（每日 09:00 / 18:00）",
+            ws_active,
+            {},
+            "personal",
+        ),
+        ("upper-prefix", "DALTON-NVDA-check", ws_active, {}, "personal"),
+        ("other-owner", "dalton-nvda-other-owner", ws_other_owner, {}, "personal"),
+        ("deleted-ws", "dalton-nvda-deleted-ws", ws_deleted, {}, "personal"),
+        ("unbound-ws", "dalton-nvda-unbound-ws", ws_unbound, {}, "personal"),
+        ("archived-unit", "dalton-msft-archived-unit", ws_archived_unit, {}, "personal"),
+        ("null-ws-no-kind", "dalton-nvda-null-ws", None, {}, "personal"),
+    ]
+
+    ws_map = {
+        ws_active: {"workspace_id": ws_active, "user_id": uid, "status": "running"},
+        ws_unit_sector: {"workspace_id": ws_unit_sector, "user_id": uid, "status": "running"},
+        ws_other_owner: {"workspace_id": ws_other_owner, "user_id": other_uid, "status": "running"},
+        ws_deleted: {"workspace_id": ws_deleted, "user_id": uid, "status": "deleted"},
+        ws_unbound: {"workspace_id": ws_unbound, "user_id": uid, "status": "unbound"},
+        ws_archived_unit: {"workspace_id": ws_archived_unit, "user_id": uid, "status": "running"},
+        ws_plain: {"workspace_id": ws_plain, "user_id": uid, "status": "running"},
+        home_id: {"workspace_id": home_id, "user_id": uid, "status": "running"},
+    }
+    units_all = [
+        {
+            "workspace_id": ws_unit_sector,
+            "owner_user_id": uid,
+            "kind": "sector",
+            "status": "active",
+        },
+        {
+            "workspace_id": ws_archived_unit,
+            "owner_user_id": uid,
+            "kind": "company",
+            "status": "archived",
+        },
+    ]
+    covered_raw = [" \tnVdA\u3000", "  BrK.b\n", " \t\u3000"]
+
+    # 1. Verify Python classify_automation_scope & needs_workspace_tracking_lookup on every matrix item
+    for label, name, ws_id, meta, exp_scope in shared_matrix:
+        row_probe = {"user_id": uid, "name": name, "workspace_id": ws_id, "metadata": meta}
+        got_py = classify_automation_scope(
+            row_probe,
+            ws_map.get(ws_id or ""),
+            coverage_units=[u for u in units_all if u["workspace_id"] == ws_id],
+            covered_tickers=covered_raw,
+        )
+        assert got_py == exp_scope, f"Python mismatch on {label}: {got_py} != {exp_scope}"
+        if not needs_workspace_tracking_lookup(
+            uid, name=name, workspace_id=ws_id, metadata=meta
+        ):
+            assert classify_automation_scope(row_probe) == exp_scope, label
+
+    # 2. Downgrade to d031, seed the exact matrix (with padded/mixed-case tickers), upgrade to d035,
+    #    and verify migration backfill + live build_scope_case_sql + preserved name/metadata/updated_at!
+    await asyncio.to_thread(command.downgrade, dalton_cfg, "d031")
+
+    backfill_ids: dict[str, str] = {}
+    async with au1_live_pool.connection() as db_conn:
+        await _insert_user(db_conn, uid, "parity@dalton.test")
+        await _insert_user(db_conn, other_uid, "parity-other@dalton.test")
+        for wid, winfo in ws_map.items():
+            await _insert_workspace(
+                db_conn, wid, winfo["user_id"], f"WS-{wid[:6]}", status=winfo["status"]
+            )
+        await db_conn.execute(
+            """
+            INSERT INTO dalton_coverage (user_id, ticker, name, tier)
+            VALUES (%s, %s, 'NVIDIA', 'core'), (%s, %s, 'Berkshire', 'watch')
+            """,
+            (uid, " \tnVdA\u3000", uid, "  BrK.b\n"),
+        )
+        await db_conn.execute(
+            """
+            INSERT INTO dalton_coverage_units (
+                unit_id, kind, owner_user_id, slug, display_name, workspace_id, ticker, status
+            )
+            VALUES
+                (%s::uuid, 'sector', %s, 'semi', 'Semiconductors', %s::uuid, NULL, 'active'),
+                (%s::uuid, 'company', %s, 'msft', 'Microsoft', %s::uuid, 'MSFT', 'archived')
+            """,
+            (str(uuid.uuid4()), uid, ws_unit_sector, str(uuid.uuid4()), uid, ws_archived_unit),
+        )
+
+        for label, name, ws_id, meta, _exp_scope in shared_matrix:
+            aid = str(uuid.uuid4())
+            backfill_ids[label] = aid
+            await db_conn.execute(
+                """
+                INSERT INTO automations (
+                    automation_id, user_id, name, file_name, trigger_type,
+                    cron_expression, timezone, instruction, workspace_id,
+                    status, metadata, created_at, updated_at
+                )
+                VALUES (
+                    %s::uuid, %s, %s, %s, 'cron',
+                    '0 9 * * *', 'Asia/Shanghai', 'Run parity', %s::uuid,
+                    'active', %s::jsonb, %s, %s
+                )
+                """,
+                (aid, uid, name, f"bf-{label}.json", ws_id, json.dumps(meta), fixed_ts, fixed_ts),
+            )
+            await db_conn.execute(
+                "ALTER TABLE automations DISABLE TRIGGER trg_automations_updated_at"
+            )
+            await db_conn.execute(
+                "UPDATE automations SET updated_at = %s WHERE automation_id = %s::uuid",
+                (fixed_ts, aid),
+            )
+            await db_conn.execute(
+                "ALTER TABLE automations ENABLE TRIGGER trg_automations_updated_at"
+            )
+
+    await asyncio.to_thread(command.upgrade, dalton_cfg, "head")
+
+    case_sql = build_scope_case_sql("a")
+    async with au1_live_pool.connection() as db_conn:
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            for label, orig_name, _ws_id, orig_meta, exp_scope in shared_matrix:
+                await cur.execute(
+                    f"""
+                    SELECT a.name, a.metadata, a.scope, a.notify_storage_mode,
+                           a.audit_history, a.updated_at,
+                           ({case_sql}) AS computed_sql_scope
+                    FROM automations a
+                    WHERE a.automation_id = %s::uuid
+                    """,
+                    (backfill_ids[label],),
+                )
+                r = await cur.fetchone()
+                assert r is not None, label
+                assert r["scope"] == exp_scope, f"Backfill mismatch {label}: {r['scope']} != {exp_scope}"
+                assert r["computed_sql_scope"] == exp_scope, f"Case SQL mismatch {label}"
+                # Stored name, metadata, legacy notify mode, empty history, and updated_at preserved!
+                assert r["name"] == orig_name, label
+                assert r["metadata"] == orig_meta, label
+                assert r["notify_storage_mode"] == "legacy", label
+                assert r["audit_history"] == [], label
+                assert r["updated_at"] == fixed_ts, label
+
+        # Clear backfilled rows so we test create + update + HTTP list totals on the same matrix!
+        await db_conn.execute("DELETE FROM automations WHERE user_id = %s", (uid,))
+
+    # 3. Create every assignable workspace case via lifecycle.create_automation and verify parity + HTTP totals!
+    created_by_label: dict[str, dict[str, Any]] = {}
+    expected_pers = 0
+    expected_rt = 0
+    for label, name, ws_id, meta, _exp_scope in shared_matrix:
+        if ws_id in (ws_other_owner, ws_deleted, ws_unbound):
+            continue
+        target_ws = uuid.UUID(ws_id) if ws_id else uuid.UUID(home_id)
+        # When ws_id is None in shared_matrix, lifecycle.create_automation places it in Home (not NULL);
+        # recompute expected scope for target_ws so we test exact parity!
+        exp_create_scope = classify_automation_scope(
+            {"user_id": uid, "name": name, "workspace_id": str(target_ws), "metadata": meta},
+            ws_map[str(target_ws)],
+            coverage_units=[u for u in units_all if u["workspace_id"] == str(target_ws)],
+            covered_tickers=covered_raw,
+        )
+        created = await lifecycle_mod.create_automation(
+            uid,
+            AutomationCreate(
+                name=name,
+                trigger_type="cron",
+                cron_expression="0 9 * * *",
+                instruction="Run created parity",
+                workspace_id=target_ws,
+                metadata=meta,
+            ),
+        )
+        assert created["scope"] == exp_create_scope, f"Create mismatch {label}"
+        assert created["name"] == name, f"Create mutated name on {label}"
+        assert created["metadata"] == meta, f"Create mutated metadata on {label}"
+        assert created["notify_storage_mode"] == "legacy"
+        created_by_label[label] = created
+        if exp_create_scope == "personal":
+            expected_pers += 1
+        else:
+            expected_rt += 1
+
+    # 4. Verify lifecycle.update_automation flips scope identically to SQL & Python without altering notify mode!
+    flip_target = created_by_label["kind-unknown"]
+    assert flip_target["scope"] == "personal"
+    flipped_to_rt = await lifecycle_mod.update_automation(
+        flip_target["automation_id"],
+        uid,
+        {"name": " \tdalton-nvda-FlippedCheck\u3000", "metadata": {}},
+    )
+    assert flipped_to_rt is not None
+    assert flipped_to_rt["scope"] == "research_tracking"
+    assert flipped_to_rt["name"] == " \tdalton-nvda-FlippedCheck\u3000"
+    assert flipped_to_rt["notify_storage_mode"] == "legacy"
+    expected_pers -= 1
+    expected_rt += 1
+
+    # Moving sector-unit task from ws_unit_sector to ws_plain ('semi' is not in dalton_coverage) flips to personal!
+    sector_target = created_by_label["active-sector-unit"]
+    assert sector_target["scope"] == "research_tracking"
+    moved_sector = await lifecycle_mod.update_automation(
+        sector_target["automation_id"],
+        uid,
+        {"workspace_id": uuid.UUID(ws_plain)},
+    )
+    assert moved_sector is not None
+    assert moved_sector["scope"] == "personal"
+    assert moved_sector["notify_storage_mode"] == "legacy"
+    expected_rt -= 1
+    expected_pers += 1
+
+    # Confirm every stored row's scope equals live SQL CASE expression on PostgreSQL!
+    async with au1_live_pool.connection() as db_conn:
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"SELECT a.automation_id, a.scope, ({case_sql}) AS sql_scope FROM automations a WHERE a.user_id = %s",
+                (uid,),
+            )
+            for row_chk in await cur.fetchall():
+                assert row_chk["scope"] == row_chk["sql_scope"], row_chk
+
+    # Verify HTTP scoped listing & totals match Python and SQL counts!
+    app = FastAPI()
+    app.include_router(automations_app.router)
+    app.dependency_overrides[principal_mod.get_principal] = lambda: principal_mod.Principal(
+        user_id=uid, auth="session"
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        r_pers = await client.get("/api/v1/automations?scope=personal&limit=100")
+        r_rt = await client.get("/api/v1/automations?scope=research_tracking&limit=100")
+        assert r_pers.status_code == 200, r_pers.text
+        assert r_rt.status_code == 200, r_rt.text
+        assert r_pers.json()["total"] == expected_pers
+        assert r_rt.json()["total"] == expected_rt
+        assert len(r_pers.json()["automations"]) == expected_pers
+        assert len(r_rt.json()["automations"]) == expected_rt
+
+    # 5. PM chief_of_staff upsert on legacy NULL-workspace row vs analyst/non-PM refusal vs non-null workspace!
+    legacy_null_id = str(uuid.uuid4())
+    bound_cov_id = str(uuid.uuid4())
+    async with au1_live_pool.connection() as db_conn:
+        await db_conn.execute(
+            """
+            INSERT INTO automations (
+                automation_id, user_id, name, file_name, trigger_type,
+                cron_expression, timezone, instruction, workspace_id,
+                status, scope, metadata
+            )
+            VALUES
+                (%s::uuid, %s, 'dalton-nvda-legacy-null-ws', 'legacy-null.json', 'cron',
+                 '0 8 * * *', 'Asia/Shanghai', 'Legacy v1', NULL, 'active', 'personal', '{}'::jsonb),
+                (%s::uuid, %s, 'dalton-nvda-bound-cov-ws', 'bound-cov.json', 'cron',
+                 '0 8 * * *', 'Asia/Shanghai', 'Bound v1', %s::uuid, 'active', 'research_tracking', '{}'::jsonb)
+            """,
+            (legacy_null_id, uid, bound_cov_id, uid, ws_active),
+        )
+
+    # Analyst creation stays in the caller's workspace and leaves the Home task intact.
+    monkeypatch.setattr(
+        "src.dalton.autonomy.tracking._resolve_workspace_ticker",
+        lambda _w: _coro("NVDA"),
+    )
+    analyst_created = await schedule_dalton_automation_helper(
+        name="dalton-nvda-legacy-null-ws",
+        workspace_id=ws_active,
+        caller_workspace_id=ws_active,
+        spec={"instruction": "Workspace analysis", "cron": "0 9 * * *"},
+        user_id=uid,
+        role="analyst",
+    )
+    assert analyst_created["ok"] is True
+    assert analyst_created["action"] == "created"
+    assert analyst_created["automation_id"] != legacy_null_id
+    async with au1_live_pool.connection() as db_conn:
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT workspace_id, instruction FROM automations WHERE automation_id = %s::uuid",
+                (legacy_null_id,),
+            )
+            untouched = await cur.fetchone()
+            assert untouched["workspace_id"] is None
+            assert untouched["instruction"] == "Legacy v1"
+            await cur.execute(
+                "DELETE FROM automations WHERE automation_id = %s::uuid AND workspace_id = %s::uuid RETURNING automation_id",
+                (analyst_created["automation_id"], ws_active),
+            )
+            assert await cur.fetchone() is not None
+
+    # 5b. Non-PM chief_of_staff cannot update legacy null-workspace row -> forbidden_pm
+    monkeypatch.setattr("src.dalton.autonomy.system_jobs.is_pm_user", lambda _u: False)
+    refused_non_pm = await schedule_dalton_automation_helper(
+        name="dalton-nvda-legacy-null-ws",
+        workspace_id=ws_active,
+        spec={"instruction": "Non-PM attempt", "cron": "0 9 * * *"},
+        user_id=uid,
+        role="chief_of_staff",
+    )
+    assert refused_non_pm["ok"] is False
+    assert refused_non_pm["error"] == "forbidden_pm"
+
+    # 5c. PM chief_of_staff updates legacy null-workspace row while passing covered ws_active:
+    #     patch does NOT change workspace_id, so workspace_id stays NULL and scope stays 'personal'!
+    monkeypatch.setattr("src.dalton.autonomy.system_jobs.is_pm_user", lambda u: u == uid)
+    pm_upd_null_ws = await schedule_dalton_automation_helper(
+        name="dalton-nvda-legacy-null-ws",
+        workspace_id=ws_active,
+        spec={"instruction": "PM updated legacy", "cron": "0 10 * * *"},
+        user_id=uid,
+        role="chief_of_staff",
+    )
+    assert pm_upd_null_ws["ok"] is True
+    assert pm_upd_null_ws["action"] == "updated"
+    assert pm_upd_null_ws["automation_id"] == legacy_null_id
+
+    async with au1_live_pool.connection() as db_conn:
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                SELECT a.*, ({case_sql}) AS sql_scope
+                FROM automations a
+                WHERE a.automation_id = %s::uuid
+                """,
+                (legacy_null_id,),
+            )
+            saved_null_row = await cur.fetchone()
+            assert saved_null_row is not None
+            assert saved_null_row["workspace_id"] is None
+            assert saved_null_row["instruction"] == "PM updated legacy"
+            assert saved_null_row["scope"] == "personal"
+            assert saved_null_row["sql_scope"] == "personal"
+            assert (
+                classify_automation_scope(
+                    saved_null_row,
+                    covered_tickers=covered_raw,
+                )
+                == "personal"
+            )
+
+    # The PM updates the selected covered workspace's existing task.
+    pm_upd_bound = await schedule_dalton_automation_helper(
+        name="dalton-nvda-bound-cov-ws",
+        workspace_id=ws_active,
+        spec={"instruction": "PM updated bound", "cron": "0 11 * * *"},
+        user_id=uid,
+        role="chief_of_staff",
+    )
+    assert pm_upd_bound["ok"] is True
+    assert pm_upd_bound["action"] == "updated"
+
+    # 5e. PM chief_of_staff adds research dalton_kind on null-workspace row -> scope becomes 'research_tracking'!
+    pm_upd_null_rt = await schedule_dalton_automation_helper(
+        name="dalton-nvda-legacy-null-ws",
+        spec={
+            "instruction": "PM watch kind",
+            "cron": "0 12 * * *",
+            "metadata": {"dalton_kind": " \tCOMPANY_WATCH\u3000"},
+        },
+        user_id=uid,
+        role="chief_of_staff",
+    )
+    assert pm_upd_null_rt["ok"] is True
+
+    async with au1_live_pool.connection() as db_conn:
+        async with db_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"SELECT a.workspace_id, a.scope, ({case_sql}) AS sql_scope FROM automations a WHERE a.automation_id = %s::uuid",
+                (bound_cov_id,),
+            )
+            r_bound = await cur.fetchone()
+            assert str(r_bound["workspace_id"]) == ws_active
+            assert r_bound["scope"] == "research_tracking"
+            assert r_bound["sql_scope"] == "research_tracking"
+
+            await cur.execute(
+                f"SELECT a.workspace_id, a.scope, ({case_sql}) AS sql_scope FROM automations a WHERE a.automation_id = %s::uuid",
+                (legacy_null_id,),
+            )
+            r_null_rt = await cur.fetchone()
+            assert r_null_rt["workspace_id"] is None
+            assert r_null_rt["scope"] == "research_tracking"
+            assert r_null_rt["sql_scope"] == "research_tracking"
+
+
+async def _coro(val: Any) -> Any:
+    return val

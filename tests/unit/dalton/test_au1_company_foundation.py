@@ -21,8 +21,13 @@ from src.dalton.app import router as dalton_router_mod
 from src.dalton.autonomy.classification import (
     AUTOMATION_SCOPES,
     RESEARCH_TRACKING_KINDS,
+    SCOPE_TRIM_WHITESPACE,
     build_research_tracking_sql_predicate,
+    build_scope_case_sql,
     classify_automation_scope,
+    needs_workspace_tracking_lookup,
+    normalize_dalton_kind,
+    normalize_scope_text,
 )
 from src.dalton.autonomy import schedule as schedule_mod
 from src.dalton.budget.service import resolve_user_budget_config
@@ -218,6 +223,8 @@ def test_d035_migration_revision_and_safety_contracts() -> None:
     assert "WHERE deleted_at IS NULL" in source
     assert "build_research_tracking_sql_predicate" in source
     assert "_assert_safe_downgrade" in source
+    assert "public.computers" in source
+    assert "pg_constraint" in source
 
 
 ALLOWED_SCOPES_EXPECTED = ("personal", "research_tracking", "company")
@@ -624,25 +631,32 @@ async def test_company_identity_rejected_across_all_http_and_ws_auth_paths(
         assert cli_ok.status_code == 200
         assert cli_ok.json() == {"user_id": INTERNAL_UID, "auth": "computer"}
 
-        # 3e. Session Bearer JWT path (capture original callable before patching!)
-        orig_decode_token = jwt_bearer._decode_token
+        # 3e. Session Bearer JWT path (exercises real jwt_bearer._decode_token rejection!)
         monkeypatch.setattr(api_utils, "HOST_MODE", "saas")
         monkeypatch.setattr(jwt_bearer, "HOST_MODE", "saas")
-
-        async def _fake_decode(tok: str) -> jwt_bearer.AuthInfo:
-            uid = COMPANY_SYSTEM_USER_ID if "company" in tok else INTERNAL_UID
-            reject_company_system_auth(uid)
-            return jwt_bearer.AuthInfo(user_id=uid, auth_provider="email")
-
         monkeypatch.setattr(
-            api_utils,
-            "_decode_token",
-            create_autospec(orig_decode_token, side_effect=_fake_decode),
+            jwt_bearer.jwt,
+            "get_unverified_header",
+            create_autospec(
+                jwt_bearer.jwt.get_unverified_header,
+                return_value={"kid": "test-kid"},
+            ),
         )
         monkeypatch.setattr(
-            jwt_bearer,
-            "_decode_token",
-            create_autospec(orig_decode_token, side_effect=_fake_decode),
+            jwt_bearer._signing_keys,
+            "get",
+            create_autospec(jwt_bearer._signing_keys.get, return_value="fake-jwk-key"),
+        )
+        monkeypatch.setattr(
+            jwt_bearer.jwt,
+            "decode",
+            create_autospec(
+                jwt_bearer.jwt.decode,
+                side_effect=lambda tok, *a, **kw: {
+                    "sub": COMPANY_SYSTEM_USER_ID if "company" in tok else INTERNAL_UID,
+                    "app_metadata": {"provider": "email"},
+                },
+            ),
         )
         sess_bad = await client.get(
             "/probe-principal", headers={"Authorization": "Bearer jwt_company"}
@@ -654,13 +668,8 @@ async def test_company_identity_rejected_across_all_http_and_ws_auth_paths(
         assert sess_ok.status_code == 200
         assert sess_ok.json() == {"user_id": INTERNAL_UID, "auth": "session"}
 
-    # 3f. WebSocket auth path: company token closes with 1008 + WebSocketException; normal user succeeds.
+    # 3f. WebSocket auth path: real ws_auth.authenticate_websocket -> real _decode_token
     monkeypatch.setattr(ws_auth, "HOST_MODE", "saas")
-    monkeypatch.setattr(
-        ws_auth,
-        "_decode_token",
-        create_autospec(orig_decode_token, side_effect=_fake_decode),
-    )
 
     ws_bad = create_autospec(WebSocket, instance=True)
     ws_bad.headers = {"authorization": "Bearer jwt_company"}
@@ -1412,3 +1421,458 @@ async def test_automation_history_endpoint_sanitization_pagination_and_permissio
             f"/api/v1/automations/{AUTO_COMPANY_ID}/history"
         )
         assert refused_company.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# 6. R4 Hardening: whitespace/case normalization parity, saved-row scope on update,
+#    and channel gateway company identity rejection across all entrypoints
+# ---------------------------------------------------------------------------
+
+
+def test_scope_normalization_whitespace_case_and_sql_contract() -> None:
+    for ws_ch in (" ", "\t", "\n", "\r", "\x0b", "\x0c", "\u00a0", "\u2003", "\u3000"):
+        assert ws_ch in SCOPE_TRIM_WHITESPACE
+        assert normalize_scope_text(f"{ws_ch}dalton-earnings-calendar{ws_ch}") == (
+            "dalton-earnings-calendar"
+        )
+
+    assert normalize_scope_text(None) == ""
+    assert normalize_scope_text(True) == ""
+    assert normalize_scope_text({"a": 1}) == ""
+    assert normalize_dalton_kind(None) == ""
+    assert normalize_dalton_kind({"dalton_kind": None}) == ""
+    assert normalize_dalton_kind({"dalton_kind": 123}) == ""
+    assert normalize_dalton_kind({"dalton_kind": ["company_watch"]}) == ""
+    assert (
+        normalize_dalton_kind({"dalton_kind": " \t\n\u00a0\u3000Company_Watch \r"})
+        == "company_watch"
+    )
+
+    active_ws = {
+        "workspace_id": f" \t{WS_ON_COMP_A}\u3000",
+        "user_id": f" {INTERNAL_UID}\n",
+        "status": " \tRUNNING\u00a0",
+    }
+    active_unit = {
+        "workspace_id": WS_ON_COMP_A,
+        "owner_user_id": f"\u3000{INTERNAL_UID} ",
+        "kind": " COMPANY\t",
+        "status": "\nACTIVE ",
+    }
+
+    cases: list[tuple[dict[str, Any], bool, str]] = [
+        (
+            {"user_id": " \tSyStEm:DaLtOn-CoMpAnY\n\u3000", "name": "any"},
+            False,
+            "company",
+        ),
+        (
+            {
+                "user_id": INTERNAL_UID,
+                "name": " \t\u00a0dalton-earnings-calendar\u3000\n",
+                "metadata": {},
+            },
+            False,
+            "research_tracking",
+        ),
+        (
+            {
+                "user_id": INTERNAL_UID,
+                "name": "Custom Watch",
+                "metadata": {"dalton_kind": " \t\u3000PRICE_MOVE\n"},
+            },
+            False,
+            "research_tracking",
+        ),
+        (
+            {
+                "user_id": INTERNAL_UID,
+                "name": "Custom Unknown",
+                "workspace_id": WS_ON_COMP_A,
+                "metadata": {"dalton_kind": " \tunknown_kind\u3000"},
+            },
+            False,
+            "personal",
+        ),
+        (
+            {
+                "user_id": INTERNAL_UID,
+                "name": " \t\u3000dalton-nvda-ChannelCheck\u00a0\n",
+                "workspace_id": WS_ON_COMP_A,
+                "metadata": {"dalton_kind": " \t\u3000"},
+            },
+            True,
+            "research_tracking",
+        ),
+        (
+            {
+                "user_id": INTERNAL_UID,
+                "name": " \tdalton-director-daily\u3000\n",
+                "workspace_id": WS_ON_COMP_A,
+                "metadata": {"dalton_kind": " \tdirector_daily\n"},
+            },
+            False,
+            "personal",
+        ),
+        (
+            {
+                "user_id": INTERNAL_UID,
+                "name": " \t\n\u00a0\u3000",
+                "workspace_id": WS_ON_COMP_A,
+                "metadata": None,
+            },
+            False,
+            "personal",
+        ),
+    ]
+
+    for row, exp_lookup, exp_scope in cases:
+        assert (
+            needs_workspace_tracking_lookup(
+                row.get("user_id"),
+                name=row.get("name"),
+                workspace_id=row.get("workspace_id"),
+                metadata=row.get("metadata"),
+            )
+            is exp_lookup
+        ), row
+        assert (
+            classify_automation_scope(
+                row,
+                active_ws,
+                coverage_unit=active_unit,
+                covered_tickers=[" \tnVdA\u3000"],
+            )
+            == exp_scope
+        ), row
+
+    case_sql = build_scope_case_sql("a")
+    assert "BTRIM(COALESCE(a.name, ''), E'" in case_sql
+    assert "\\u3000" in case_sql
+    assert "\\u00a0" in case_sql
+    assert "jsonb_typeof(a.metadata->'dalton_kind') = 'string'" in case_sql
+
+
+@pytest.mark.asyncio
+async def test_schedule_upsert_uses_saved_workspace_for_legacy_null_ws_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home_id = get_home_workspace_id(ADMIN_UID)
+    legacy_null_ws_row = _sample_automation_row(
+        automation_id=AUTO_PERSONAL_ID,
+        user_id=ADMIN_UID,
+        name="dalton-nvda-legacy-custom",
+        scope="personal",
+        workspace_id=None,
+        metadata={},
+    )
+    covered_ws_row = _sample_automation_row(
+        automation_id=AUTO_TRACKING_ID,
+        user_id=ADMIN_UID,
+        name="dalton-nvda-covered-custom",
+        scope="research_tracking",
+        workspace_id=WS_ON_COMP_A,
+        metadata={},
+    )
+
+    @asynccontextmanager
+    async def _noop_lock(uid: str, *, conn: Any = None):
+        yield conn
+
+    monkeypatch.setattr(schedule_mod, "user_automations_lock", _noop_lock)
+    monkeypatch.setattr(
+        schedule_mod,
+        "resolve_caller_home_workspace_id",
+        create_autospec(schedule_mod.resolve_caller_home_workspace_id, return_value=home_id),
+    )
+    monkeypatch.setattr(
+        schedule_mod,
+        "verify_workspace_access",
+        create_autospec(
+            schedule_mod.verify_workspace_access,
+            return_value={"workspace_id": WS_ON_COMP_A, "user_id": ADMIN_UID, "status": "running"},
+        ),
+    )
+
+    stored_rows = [legacy_null_ws_row]
+    monkeypatch.setattr(
+        schedule_mod,
+        "list_all_user_automations",
+        create_autospec(
+            schedule_mod.list_all_user_automations,
+            side_effect=lambda uid, name_prefix=None, conn=None: list(stored_rows),
+        ),
+    )
+
+    captured_scope_calls: list[dict[str, Any]] = []
+
+    async def _fake_resolve_scope(
+        uid: str,
+        *,
+        name: str,
+        workspace_id: str | None,
+        metadata: Any,
+        conn: Any = None,
+    ) -> str:
+        captured_scope_calls.append(
+            {"user_id": uid, "name": name, "workspace_id": workspace_id, "metadata": metadata}
+        )
+        return classify_automation_scope(
+            {"user_id": uid, "name": name, "workspace_id": workspace_id, "metadata": metadata},
+            {"workspace_id": WS_ON_COMP_A, "user_id": ADMIN_UID, "status": "running"}
+            if workspace_id == WS_ON_COMP_A
+            else None,
+            covered_tickers=["NVDA"],
+        )
+
+    monkeypatch.setattr(
+        company_auto_db,
+        "resolve_automation_scope_for_write",
+        create_autospec(
+            company_auto_db.resolve_automation_scope_for_write,
+            side_effect=_fake_resolve_scope,
+        ),
+    )
+
+    captured_updates: list[dict[str, Any]] = []
+
+    async def _fake_db_update(automation_id: str, uid: str, *, conn: Any = None, **kwargs: Any) -> dict[str, Any]:
+        captured_updates.append({"automation_id": automation_id, **kwargs})
+        return {**stored_rows[0], **kwargs}
+
+    monkeypatch.setattr(
+        auto_db,
+        "update_automation",
+        create_autospec(auto_db.update_automation, side_effect=_fake_db_update),
+    )
+
+    # Analyst creation stays in the caller's workspace and leaves the Home task intact.
+    created_id = str(uuid.uuid4())
+    create_spy = create_autospec(
+        auto_db.create_automation,
+        return_value={"automation_id": created_id},
+    )
+    monkeypatch.setattr(auto_db, "create_automation", create_spy)
+    monkeypatch.setattr(
+        "src.dalton.autonomy.tracking._resolve_workspace_ticker",
+        lambda _ws: _async_val("NVDA"),
+    )
+    analyst_created = await schedule_mod.schedule_dalton_automation_helper(
+        name="dalton-nvda-legacy-custom",
+        workspace_id=WS_ON_COMP_A,
+        caller_workspace_id=WS_ON_COMP_A,
+        spec={"instruction": "updated", "cron": "0 9 * * *"},
+        user_id=INTERNAL_UID,
+        role="analyst",
+    )
+    assert analyst_created["ok"] is True
+    assert analyst_created["action"] == "created"
+    assert analyst_created["automation_id"] == created_id
+    create_spy.assert_awaited_once()
+    assert create_spy.await_args.kwargs["workspace_id"] == WS_ON_COMP_A
+    assert create_spy.await_args.kwargs["user_id"] == INTERNAL_UID
+    assert not captured_updates
+
+    # 2. Non-PM chief_of_staff cannot touch legacy null-workspace row -> forbidden_pm
+    monkeypatch.setattr("src.dalton.autonomy.system_jobs.is_pm_user", lambda _u: False)
+    non_pm_refused = await schedule_mod.schedule_dalton_automation_helper(
+        name="dalton-nvda-legacy-custom",
+        workspace_id=WS_ON_COMP_A,
+        spec={"instruction": "updated", "cron": "0 9 * * *"},
+        user_id=INTERNAL_UID,
+        role="chief_of_staff",
+    )
+    assert non_pm_refused["ok"] is False
+    assert non_pm_refused["error"] == "forbidden_pm"
+    assert not captured_updates
+
+    # 3. PM chief_of_staff upserts legacy null-workspace row (even passing covered WS_ON_COMP_A):
+    #    patch does NOT modify workspace_id, so scope uses existing None workspace -> personal!
+    monkeypatch.setattr("src.dalton.autonomy.system_jobs.is_pm_user", lambda u: u == ADMIN_UID)
+    pm_ok = await schedule_mod.schedule_dalton_automation_helper(
+        name="dalton-nvda-legacy-custom",
+        workspace_id=WS_ON_COMP_A,
+        spec={"instruction": "updated by pm", "cron": "0 10 * * *"},
+        user_id=ADMIN_UID,
+        role="chief_of_staff",
+    )
+    assert pm_ok["ok"] is True
+    assert pm_ok["action"] == "updated"
+    assert captured_scope_calls[-1]["workspace_id"] is None
+    assert "workspace_id" not in captured_updates[-1]
+    assert captured_updates[-1]["scope"] == "personal"
+
+    # 4. PM chief_of_staff upserts legacy null-workspace row WITH research dalton_kind -> research_tracking
+    pm_rt = await schedule_mod.schedule_dalton_automation_helper(
+        name="dalton-nvda-legacy-custom",
+        spec={
+            "instruction": "watch",
+            "cron": "0 10 * * *",
+            "metadata": {"dalton_kind": "company_watch"},
+        },
+        user_id=ADMIN_UID,
+        role="chief_of_staff",
+    )
+    assert pm_rt["ok"] is True
+    assert captured_scope_calls[-1]["workspace_id"] is None
+    assert captured_updates[-1]["scope"] == "research_tracking"
+
+    # 5. Existing row with non-null covered workspace keeps workspace_id=WS_ON_COMP_A -> research_tracking
+    stored_rows[:] = [covered_ws_row]
+    pm_cov = await schedule_mod.schedule_dalton_automation_helper(
+        name="dalton-nvda-covered-custom",
+        workspace_id=WS_ON_COMP_A,
+        spec={"instruction": "keep covered ws", "cron": "0 11 * * *"},
+        user_id=ADMIN_UID,
+        role="chief_of_staff",
+    )
+    assert pm_cov["ok"] is True
+    assert pm_cov["action"] == "updated"
+    assert captured_scope_calls[-1]["workspace_id"] == WS_ON_COMP_A
+    assert captured_updates[-1]["scope"] == "research_tracking"
+
+
+async def _async_val(val: Any) -> Any:
+    return val
+
+
+@pytest.mark.asyncio
+async def test_channels_router_and_gateway_reject_company_identity_before_db_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.dalton.app import channels_router as ch_router_mod
+    from src.dalton.database import channel_gateway as cg_db
+
+    svc_secret = "c" * 40
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", svc_secret)
+
+    # Guard that router-level rejections never even open a DB connection!
+    conn_opened = {"count": 0}
+
+    @asynccontextmanager
+    async def _fail_if_opened(_existing: Any = None):
+        conn_opened["count"] += 1
+        raise AssertionError("DB connection should not be opened on direct company identity!")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(cg_db.db_pool, "get_db_connection", _fail_if_opened)
+
+    app = FastAPI()
+    app.include_router(ch_router_mod.channels_router, prefix="/api/v1/dalton")
+    headers = {"X-Service-Token": svc_secret}
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        for variant in (
+            COMPANY_SYSTEM_USER_ID,
+            " \tSyStEm:DaLtOn-CoMpAnY\n\u3000",
+        ):
+            # Exact prompt scenario: cmd="new", platform="feishu", dalton_user_id=company, scope_key="dm:test"
+            r_cmd = await client.post(
+                "/api/v1/dalton/channels/internal/session/command",
+                headers=headers,
+                json={
+                    "cmd": "new",
+                    "platform": "feishu",
+                    "dalton_user_id": variant,
+                    "scope_key": "dm:test",
+                },
+            )
+            assert r_cmd.status_code == 401
+
+            r_state_q = await client.get(
+                "/api/v1/dalton/channels/internal/state",
+                headers=headers,
+                params={"user_id": variant},
+            )
+            assert r_state_q.status_code == 401
+
+            r_bind = await client.post(
+                "/api/v1/dalton/channels/internal/bind-code/consume",
+                headers=headers,
+                json={"action": "unbind", "platform": "feishu", "user_id": variant},
+            )
+            assert r_bind.status_code == 401
+
+            r_claim = await client.post(
+                "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
+                headers=headers,
+                json={
+                    "delivery_key": "tool:r1:c1",
+                    "kind": "agent_send",
+                    "user_id": variant,
+                    "target": "feishu:@me",
+                },
+            )
+            assert r_claim.status_code == 401
+
+            r_in_prog = await client.post(
+                "/api/v1/dalton/channels/internal/inbound/progress",
+                headers=headers,
+                json={
+                    "thread_watch": {
+                        "thread_id": str(uuid.uuid4()),
+                        "dalton_user_id": variant,
+                        "platform": "feishu",
+                        "target_address": "feishu:@me",
+                    }
+                },
+            )
+            assert r_in_prog.status_code == 401
+
+            r_wx = await client.put(
+                "/api/v1/dalton/channels/internal/weixin-state",
+                headers=headers,
+                json={
+                    "ilink_bot_id": "bot1",
+                    "owner_user_id": variant,
+                    "bot_token": "tok",
+                },
+            )
+            assert r_wx.status_code == 401
+
+        for hdr_variant in (COMPANY_SYSTEM_USER_ID, "SyStEm:DaLtOn-CoMpAnY"):
+            r_cmd_hdr = await client.post(
+                "/api/v1/dalton/channels/internal/session/command",
+                headers={**headers, "X-User-Id": hdr_variant},
+                json={"cmd": "new", "platform": "feishu", "scope_key": "dm:test"},
+            )
+            assert r_cmd_hdr.status_code == 401
+
+    # Also test raw ASGI X-User-Id header carrying leading/trailing whitespace + mixed case
+    raw_body = b'{"cmd":"new","platform":"feishu","scope_key":"dm:test"}'
+    sent_events: list[dict[str, Any]] = []
+    body_delivered = False
+
+    async def _receive() -> dict[str, Any]:
+        nonlocal body_delivered
+        if not body_delivered:
+            body_delivered = True
+            return {"type": "http.request", "body": raw_body, "more_body": False}
+        return {"type": "http.disconnect"}
+
+    async def _send(message: dict[str, Any]) -> None:
+        sent_events.append(message)
+
+    await app(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/api/v1/dalton/channels/internal/session/command",
+            "raw_path": b"/api/v1/dalton/channels/internal/session/command",
+            "query_string": b"",
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"x-service-token", svc_secret.encode("ascii")),
+                (b"x-user-id", b" \tSyStEm:DaLtOn-CoMpAnY\t "),
+            ],
+            "client": ("127.0.0.1", 12345),
+            "server": ("test", 80),
+        },
+        _receive,
+        _send,
+    )
+    assert sent_events[0]["status"] == 401
+    assert conn_opened["count"] == 0

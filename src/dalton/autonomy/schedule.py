@@ -846,11 +846,26 @@ async def schedule_dalton_automation_helper(
                 patch["metadata"] = merged_meta
             if explicit_status:
                 patch["status"] = explicit_status
+            saved_workspace_id = (
+                patch["workspace_id"]
+                if "workspace_id" in patch
+                else existing.get("workspace_id")
+            )
+            saved_name = (
+                str(patch["name"])
+                if "name" in patch and patch["name"] is not None
+                else str(existing.get("name") or resolved_name)
+            )
+            saved_metadata = (
+                patch["metadata"]
+                if "metadata" in patch
+                else existing.get("metadata")
+            )
             patch["scope"] = await resolve_automation_scope_for_write(
                 user_id,
-                name=resolved_name,
-                workspace_id=str(ws_id or existing.get("workspace_id") or "") or None,
-                metadata=merged_meta,
+                name=saved_name,
+                workspace_id=str(saved_workspace_id) if saved_workspace_id else None,
+                metadata=saved_metadata if isinstance(saved_metadata, dict) else None,
                 conn=active_conn,
             )
             updated = await auto_db.update_automation(

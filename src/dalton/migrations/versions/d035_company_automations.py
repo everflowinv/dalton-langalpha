@@ -7,6 +7,7 @@ Create Date: 2026-11-09
 
 from __future__ import annotations
 
+import re
 from typing import Any, Sequence, Union
 
 from alembic import op
@@ -516,22 +517,59 @@ def _assert_safe_downgrade(bind: Any) -> None:
             "preventing unique index restoration"
         )
 
-    user_ref_tables = (
+    _safe_ident_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+    user_ref_tables: list[tuple[str, str, str]] = [
+        ("public.computers", "computers", "user_id"),
         ("public.workspaces", "workspaces", "user_id"),
+        ("public.watchlists", "watchlists", "user_id"),
+        ("public.watchlist_items", "watchlist_items", "user_id"),
+        ("public.user_portfolios", "user_portfolios", "user_id"),
+        ("public.user_preferences", "user_preferences", "user_id"),
+        ("public.user_api_keys", "user_api_keys", "user_id"),
+        ("public.user_oauth_tokens", "user_oauth_tokens", "user_id"),
+        ("public.user_vault_secrets", "user_vault_secrets", "user_id"),
+        ("public.user_mcp_servers", "user_mcp_servers", "user_id"),
+        ("public.user_mcp_builtin_disables", "user_mcp_builtin_disables", "user_id"),
+        ("public.user_skills", "user_skills", "user_id"),
+        ("public.user_plugins", "user_plugins", "user_id"),
         ("public.dalton_budget_reservations", "dalton_budget_reservations", "user_id"),
         ("public.dalton_budget_task_caps", "dalton_budget_task_caps", "user_id"),
         ("public.dalton_notify_deliveries", "dalton_notify_deliveries", "user_id"),
-        ("public.user_vault_secrets", "user_vault_secrets", "user_id"),
-        ("public.user_api_keys", "user_api_keys", "user_id"),
-        ("public.user_preferences", "user_preferences", "user_id"),
         ("public.dalton_channel_automation_runs", "dalton_channel_automation_runs", "user_id"),
-    )
+    ]
+    checked_pairs: set[tuple[str, str]] = {
+        ("automations", "user_id"),
+        ("dalton_budget_config", "user_id"),
+        *{(tbl, col) for _, tbl, col in user_ref_tables},
+    }
+    fk_rows = bind.exec_driver_sql(
+        """
+        SELECT c.relname, a.attname
+        FROM pg_constraint con
+        JOIN pg_class c ON c.oid = con.conrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = con.conkey[1]
+        WHERE con.contype = 'f'
+          AND con.confrelid = to_regclass('public.users')
+          AND array_length(con.conkey, 1) = 1
+          AND n.nspname = 'public'
+        ORDER BY c.relname, a.attname
+        """
+    ).fetchall()
+    for fk_tbl, fk_col in fk_rows:
+        tbl_s, col_s = str(fk_tbl), str(fk_col)
+        if (tbl_s, col_s) not in checked_pairs and _safe_ident_re.match(tbl_s) and _safe_ident_re.match(col_s):
+            checked_pairs.add((tbl_s, col_s))
+            user_ref_tables.append((f"public.{tbl_s}", tbl_s, col_s))
+
     for reg_name, table_name, col_name in user_ref_tables:
         if not _table_exists(bind, reg_name):
             continue
+        if not (_safe_ident_re.match(table_name) and _safe_ident_re.match(col_name)):
+            continue
         ref_cnt = int(
             bind.exec_driver_sql(
-                f"SELECT COUNT(*) FROM {table_name} WHERE {col_name} = %s",
+                f'SELECT COUNT(*) FROM "{table_name}" WHERE "{col_name}" = %s',
                 (COMPANY_SYSTEM_USER_ID,),
             ).scalar()
             or 0

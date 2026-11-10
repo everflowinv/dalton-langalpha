@@ -599,15 +599,26 @@ async def update_automation(
     if any(k in update_kwargs for k in ("name", "workspace_id", "metadata")):
         from src.dalton.database.company_automations import resolve_automation_scope_for_write
 
+        saved_name = (
+            str(update_kwargs["name"])
+            if update_kwargs.get("name") is not None
+            else str(current.get("name") or "")
+        )
+        saved_ws = (
+            update_kwargs["workspace_id"]
+            if update_kwargs.get("workspace_id") is not None
+            else stored_in
+        )
+        saved_meta = (
+            update_kwargs["metadata"]
+            if update_kwargs.get("metadata") is not None
+            else current.get("metadata")
+        )
         update_kwargs["scope"] = await resolve_automation_scope_for_write(
             user_id,
-            name=str(update_kwargs.get("name") or current.get("name") or ""),
-            workspace_id=update_kwargs.get("workspace_id", stored_in),
-            metadata=(
-                update_kwargs.get("metadata")
-                if "metadata" in update_kwargs
-                else current.get("metadata")
-            ),
+            name=saved_name,
+            workspace_id=saved_ws,
+            metadata=saved_meta,
             conn=conn,
         )
 

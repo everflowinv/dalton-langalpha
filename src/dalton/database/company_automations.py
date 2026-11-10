@@ -13,6 +13,8 @@ from src.dalton.autonomy.classification import (
     AutomationScope,
     classify_automation_scope,
     needs_workspace_tracking_lookup,
+    normalize_scope_text,
+    sql_trim_scope_text,
 )
 from src.dalton.company_identity import COMPANY_SYSTEM_USER_ID
 from src.server.database.home_workspace import get_home_workspace_id
@@ -20,10 +22,11 @@ from src.server.database.pool import get_db_connection
 
 
 def _valid_uuid(raw: Any) -> str | None:
-    if not raw:
+    cleaned = normalize_scope_text(raw)
+    if not cleaned:
         return None
     try:
-        return str(uuid.UUID(str(raw).strip()))
+        return str(uuid.UUID(cleaned))
     except (ValueError, TypeError, AttributeError):
         return None
 
@@ -36,15 +39,19 @@ async def fetch_scope_classification_context(
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], list[str]]:
     """Fetch workspace ownership, coverage units, and covered tickers in one read."""
     clean_ws = _valid_uuid(workspace_id)
-    clean_uid = str(user_id or "").strip()
+    clean_uid = normalize_scope_text(user_id)
     if not clean_ws or not clean_uid:
         return None, [], []
+
+    trimmed_unit_owner = sql_trim_scope_text("u.owner_user_id")
+    trimmed_cov_owner = sql_trim_scope_text("c.user_id")
+    trimmed_cov_ticker = sql_trim_scope_text("c.ticker")
 
     try:
         async with get_db_connection(conn) as db_conn:
             async with db_conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute(
-                    """
+                    f"""
                     SELECT
                         (
                             SELECT to_jsonb(w_sub)
@@ -65,7 +72,7 @@ async def fetch_scope_classification_context(
                                         u.status
                                     FROM dalton_coverage_units u
                                     WHERE u.workspace_id = %s::uuid
-                                      AND u.owner_user_id = %s
+                                      AND {trimmed_unit_owner} = %s
                                 ) u_sub
                             ),
                             '[]'::jsonb
@@ -74,8 +81,8 @@ async def fetch_scope_classification_context(
                             (
                                 SELECT jsonb_agg(c.ticker)
                                 FROM dalton_coverage c
-                                WHERE c.user_id = %s
-                                  AND NULLIF(BTRIM(c.ticker), '') IS NOT NULL
+                                WHERE {trimmed_cov_owner} = %s
+                                  AND {trimmed_cov_ticker} <> ''
                             ),
                             '[]'::jsonb
                         ) AS covered_tickers
@@ -100,7 +107,11 @@ async def fetch_scope_classification_context(
         else []
     )
     tickers_list = (
-        [str(t) for t in raw_tickers if isinstance(t, str) and t.strip()]
+        [
+            normalize_scope_text(t)
+            for t in raw_tickers
+            if isinstance(t, str) and normalize_scope_text(t)
+        ]
         if isinstance(raw_tickers, list)
         else []
     )
