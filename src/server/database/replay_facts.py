@@ -21,6 +21,7 @@ from src.server.utils.pg_sanitize import SafeJson
 
 LEGACY_KEY = "legacy"
 ARCHIVE_KEY = "archive"
+FAILED_STEERS_KEY = "failed_steers"
 
 
 def archived_stream(
@@ -119,3 +120,78 @@ RUN_FACTS_SQL = """
     WHERE s.thread_id = %s AND s.replay_facts IS NOT NULL
     ORDER BY s.task_run_id
 """
+
+
+# DALTON-HOOK(chat-large-upload): persist failed steer metadata on conversation_responses.replay_facts
+async def append_failed_steer(
+    thread_id: str,
+    entry: Dict[str, Any],
+    *,
+    target_run_id: Optional[str] = None,
+    conn=None,
+) -> Optional[Dict[str, Any]]:
+    """Persist a permanently failed steer onto its turn's ``conversation_responses.replay_facts``.
+
+    Written inside the transaction that settles the outbox row so the failed
+    steer survives ``purge_terminal_jobs`` without retaining terminal outbox
+    rows forever or touching LangGraph checkpoints outside ``WriterGuard``.
+    Deduplicated by ``job_id`` and ``request_key`` so retries are idempotent.
+    """
+    if not thread_id or not entry:
+        return None
+    job_id = str(entry.get("job_id") or "").strip()
+    request_key = str(entry.get("request_key") or "").strip()
+    clean_run_id = str(target_run_id or entry.get("failed_run_id") or "").strip()
+    async with pool.get_db_connection(conn) as owned:
+        async with owned.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                WITH target AS (
+                    SELECT conversation_response_id, turn_index
+                    FROM conversation_responses
+                    WHERE conversation_thread_id = %(thread_id)s::uuid
+                    ORDER BY
+                        CASE
+                            WHEN %(run_id)s <> ''
+                             AND conversation_response_id::text = %(run_id)s
+                            THEN 0
+                            ELSE 1
+                        END,
+                        turn_index DESC,
+                        attempt_no DESC
+                    LIMIT 1
+                    FOR UPDATE
+                )
+                UPDATE conversation_responses AS r
+                SET replay_facts = jsonb_set(
+                    COALESCE(r.replay_facts, '{}'::jsonb),
+                    '{failed_steers}',
+                    COALESCE(
+                        (
+                            SELECT jsonb_agg(elem)
+                            FROM jsonb_array_elements(
+                                COALESCE(r.replay_facts -> 'failed_steers', '[]'::jsonb)
+                            ) AS elem
+                            WHERE (%(job_id)s = '' OR COALESCE(elem ->> 'job_id', '') <> %(job_id)s)
+                              AND (%(request_key)s = '' OR COALESCE(elem ->> 'request_key', '') <> %(request_key)s)
+                        ),
+                        '[]'::jsonb
+                    ) || jsonb_build_array(
+                        %(entry)s::jsonb || jsonb_build_object('turn_index', target.turn_index)
+                    ),
+                    true
+                )
+                FROM target
+                WHERE r.conversation_response_id = target.conversation_response_id
+                RETURNING r.conversation_response_id, r.turn_index, r.replay_facts
+                """,
+                {
+                    "thread_id": thread_id,
+                    "run_id": clean_run_id,
+                    "job_id": job_id,
+                    "request_key": request_key,
+                    "entry": SafeJson(entry),
+                },
+            )
+            row = await cur.fetchone()
+            return dict(row) if row else None

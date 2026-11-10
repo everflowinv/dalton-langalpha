@@ -321,6 +321,20 @@ export function foldFailedSteer(
 
   if (matched.length > 0) {
     const keep = matched[0];
+    if (matched.length === 1) {
+      const existing = prev[keep] as UserMessage;
+      const nextTurn = turnIndex !== undefined ? turnIndex : existing.turnIndex;
+      if (
+        existing.queueRefused === true &&
+        existing.queueError === row.queueError &&
+        !existing.steering &&
+        !existing.steeringDelivered &&
+        existing.turnIndex === nextTurn &&
+        existing.content === (row.content || existing.content)
+      ) {
+        return prev;
+      }
+    }
     const drop = new Set(matched.slice(1));
     return prev.flatMap((m, i) => {
       if (drop.has(i)) return [];

@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 import hashlib
 import inspect
+import os
 import threading
 import time
 from typing import Any
@@ -524,9 +525,33 @@ class InMemoryChatUploadLedger:
     ) -> bool:
         return len(await self.list_retained_workspace_uploads(workspace_id, conn=conn)) > 0
 
+    async def is_upload_retained_for_recovery(
+        self,
+        upload_id: str,
+        workspace_id: str,
+        *,
+        conn: Any = None,
+    ) -> bool:
+        del conn
+        async with self._lock:
+            row = self.rows.get(upload_id)
+            return bool(
+                row
+                and row["workspace_id"] == workspace_id
+                and row["state"] == "ready"
+                and row["used_at"] is not None
+                and row["cleaned_at"] is None
+                and (row.get("error") or "") != "explicit_delete_pending"
+            )
+
     async def list_retained_workspace_uploads(
-        self, workspace_id: str, *, conn: Any = None
+        self,
+        workspace_id: str,
+        *,
+        include_delete_pending: bool = False,
+        conn: Any = None,
     ) -> list[dict[str, Any]]:
+        del conn
         async with self._lock:
             rows = [
                 dict(r)
@@ -535,9 +560,54 @@ class InMemoryChatUploadLedger:
                 and r["state"] == "ready"
                 and r["used_at"] is not None
                 and r["cleaned_at"] is None
+                and (
+                    include_delete_pending
+                    or (r.get("error") or "") != "explicit_delete_pending"
+                )
             ]
         rows.sort(key=lambda r: (r["created_at"], r["upload_id"]))
         return rows
+
+    async def mark_uploads_delete_pending(
+        self, upload_ids: Sequence[str], *, workspace_id: str
+    ) -> list[str]:
+        now = datetime.now(timezone.utc)
+        wanted = [str(u) for u in dict.fromkeys(upload_ids) if u]
+        marked: list[str] = []
+        async with self._lock:
+            for uid in wanted:
+                row = self.rows.get(uid)
+                if (
+                    row
+                    and row["workspace_id"] == workspace_id
+                    and row["state"] == "ready"
+                    and row["used_at"] is not None
+                    and row["cleaned_at"] is None
+                ):
+                    row["error"] = "explicit_delete_pending"
+                    row["updated_at"] = now
+                    marked.append(uid)
+        return marked
+
+    async def clear_uploads_delete_pending(
+        self, upload_ids: Sequence[str], *, workspace_id: str
+    ) -> int:
+        now = datetime.now(timezone.utc)
+        wanted = [str(u) for u in dict.fromkeys(upload_ids) if u]
+        cleared = 0
+        async with self._lock:
+            for uid in wanted:
+                row = self.rows.get(uid)
+                if (
+                    row
+                    and row["workspace_id"] == workspace_id
+                    and row["state"] == "ready"
+                    and row.get("error") == "explicit_delete_pending"
+                ):
+                    row["error"] = None
+                    row["updated_at"] = now
+                    cleared += 1
+        return cleared
 
     async def retire_uploads_by_ids(
         self, upload_ids: Sequence[str], *, workspace_id: str
@@ -818,7 +888,10 @@ def upload_env(monkeypatch: pytest.MonkeyPatch):
         "confirm_provisional_claims",
         "release_provisional_claims",
         "has_retained_workspace_uploads",
+        "is_upload_retained_for_recovery",
         "list_retained_workspace_uploads",
+        "mark_uploads_delete_pending",
+        "clear_uploads_delete_pending",
         "retire_uploads_by_ids",
         "retire_workspace_uploads",
         "claim_cleanup_batch",
@@ -1470,9 +1543,9 @@ class _FakeSandboxProvider:
 
 
 class _FakeExecResult:
-    def __init__(self, stdout: str = "", exit_code: int = 0) -> None:
+    def __init__(self, stdout: str = "", exit_code: int = 0, stderr: str = "") -> None:
         self.stdout = stdout
-        self.stderr = ""
+        self.stderr = stderr
         self.exit_code = exit_code
 
 
@@ -1529,9 +1602,33 @@ class _FakeSandbox:
         return True
 
     async def _runtime_call(self, fn: Any, *args: Any, **kwargs: Any) -> _FakeExecResult:
+        import json as _json
         import shlex as _shlex
 
         cmd = str(args[0]) if args else ""
+        if "parent, lock_p, grant_d, grant_p = sys.argv[1]" in cmd:
+            parts = _shlex.split(cmd)
+            lock_p, grant_p = parts[-3], parts[-1]
+            self.files.setdefault(lock_p, b"")
+            self.files[grant_p] = b"1"
+            return _FakeExecResult(stdout="", exit_code=0)
+        if "grant_p = sys.argv[1]" in cmd and "os.unlink(grant_p)" in cmd:
+            parts = _shlex.split(cmd)
+            grant_p = parts[-1]
+            self.files.pop(grant_p, None)
+            return _FakeExecResult(stdout="", exit_code=0)
+        if "items, unlink_tgt = json.loads(sys.argv[1])" in cmd:
+            parts = _shlex.split(cmd)
+            items = _json.loads(parts[-2])
+            unlink_tgt = parts[-1] == "1"
+            for parent, lock_p, grant_d, g_pref, abs_p in items:
+                self.files.setdefault(lock_p, b"")
+                for k in list(self.files):
+                    if k.startswith(f"{grant_d}/") or k.startswith(f"{parent}/{g_pref}"):
+                        self.files.pop(k, None)
+                if unlink_tgt:
+                    self.files.pop(abs_p, None)
+            return _FakeExecResult(stdout="", exit_code=0)
         if "for p in " in cmd:
             # Missing-path probe from _probe_missing_sandbox_paths
             prefix = cmd.split("for p in ", 1)[1].split("; do ", 1)[0]
@@ -1592,8 +1689,15 @@ async def test_attach_request_files_materializes_via_pull_direct_without_base64_
     pulled_entries: list[dict[str, Any]] = []
 
     async def _fake_pull_direct(
-        sandbox: Any, entries: list[dict[str, Any]], *, layout: WorkspaceLayout
+        sandbox: Any,
+        entries: list[dict[str, Any]],
+        *,
+        layout: WorkspaceLayout,
+        defer_dir_modes: bool = False,
+        sweep_orphans: bool = True,
     ) -> dict[str, dict[str, Any]]:
+        del defer_dir_modes
+        assert sweep_orphans is False
         pulled_entries.extend(entries)
         return {entries[0]["path"]: {"status": "ok"}}
 
@@ -1773,8 +1877,15 @@ async def test_cold_workspace_restore_and_future_turn_rematerialize_200mib_beyon
     pulled_paths: list[str] = []
 
     async def _fake_pull_direct(
-        sandbox: Any, entries: list[dict[str, Any]], *, layout: WorkspaceLayout
+        sandbox: Any,
+        entries: list[dict[str, Any]],
+        *,
+        layout: WorkspaceLayout,
+        defer_dir_modes: bool = False,
+        sweep_orphans: bool = True,
     ) -> dict[str, dict[str, Any]]:
+        del defer_dir_modes
+        assert sweep_orphans is False
         for entry in entries:
             pulled_paths.append(entry["path"])
             sandbox.files[f"{layout.workspace}/{entry['path']}"] = b"restored-header"
@@ -3191,8 +3302,15 @@ async def test_materialize_charges_disk_only_for_missing_or_corrupt_files(
     pull_calls = 0
 
     async def _spy_pull_direct(
-        sbx: Any, entries: list[dict[str, Any]], *, layout: WorkspaceLayout
+        sbx: Any,
+        entries: list[dict[str, Any]],
+        *,
+        layout: WorkspaceLayout,
+        defer_dir_modes: bool = False,
+        sweep_orphans: bool = True,
     ) -> dict[str, dict[str, Any]]:
+        del sbx, layout, defer_dir_modes
+        assert sweep_orphans is False
         nonlocal pull_calls
         pull_calls += 1
         sandbox.files[abs_path] = sample_bytes
@@ -3346,3 +3464,1890 @@ async def test_replay_projects_table_sourced_steering_returned_for_failed_steers
     returned_stub = [it for it in stub_out if it["event"] == "steering_returned"]
     assert len(returned_stub) == 1
     assert returned_stub[0]["data"]["request_key"] == rk
+
+
+# ---------------------------------------------------------------------------
+# 9. Concurrency isolation (chunked fallback, direct transfer, explicit delete)
+#    and durable failed steer retention / post-run_end status reconciliation
+# ---------------------------------------------------------------------------
+
+
+class _RealFsExecSandbox:
+    """Sandbox double that executes real shell/python commands and file writes on ``tmp_path``."""
+
+    class _Runtime:
+        @staticmethod
+        def exec(cmd: str, *args: Any, **kwargs: Any) -> _FakeExecResult:
+            del args, kwargs
+            import subprocess
+
+            proc = subprocess.run(
+                ["/bin/sh", "-c", cmd],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            res = _FakeExecResult(stdout=proc.stdout, exit_code=proc.returncode)
+            res.stderr = proc.stderr
+            return res
+
+        @staticmethod
+        def upload_file(chunk: bytes, dst: str, *args: Any, **kwargs: Any) -> bool:
+            del args, kwargs
+            import os
+
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            with open(dst, "wb") as f:
+                f.write(chunk)
+            return True
+
+    runtime = _Runtime()
+
+    async def _runtime_call(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
+        kwargs.pop("timeout", None)
+        kwargs.pop("total_timeout", None)
+        kwargs.pop("retry_policy", None)
+        return await asyncio.to_thread(fn, *args, **kwargs)
+
+
+@pytest.mark.asyncio
+async def test_chunked_stream_fallback_isolates_temp_files_and_verifies_descriptor_identity(
+    upload_env, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two overlapping _materialize_via_chunked_stream transfers of the same upload_id
+    use per-invocation temp files, never delete each other's stage/part files, and
+    reject any inode replacement between validation and publication."""
+    import os
+
+    uid = str(uuid.uuid4())
+    ws_id = str(uuid.uuid4())
+    raw_bytes = (b"CHUNK_A_" * (512 * 1024)) + (b"CHUNK_B_" * (256 * 1024))  # 6 MiB (2 chunks)
+    expected_sha = hashlib.sha256(raw_bytes).hexdigest()
+    obj_key = chat_upload_storage.build_chat_upload_key(ws_id, uid, "overlap.bin")
+    upload_env["store"].objects[obj_key] = raw_bytes
+
+    def _iter_chunks(key: str, *, chunk_size: int = 4 * 1024 * 1024):
+        buf = upload_env["store"].objects[key]
+        for idx in range(0, len(buf), chunk_size):
+            yield buf[idx : idx + chunk_size]
+
+    monkeypatch.setattr(
+        chat_upload_storage,
+        "iter_stored_object_chunks",
+        create_autospec(
+            chat_upload_storage.iter_stored_object_chunks, side_effect=_iter_chunks
+        ),
+    )
+
+    sbx = _RealFsExecSandbox()
+    uploads_dir = tmp_path / "work" / "uploads"
+    target_file = uploads_dir / f"overlap_{uid.replace('-', '')[:8]}.bin"
+
+    # Synchronize Transfer 1 inside finalize_script right between fd validation and os.replace
+    ready_file = tmp_path / "w1_validated.flag"
+    release_file = tmp_path / "w1_release.flag"
+    pause_expr = (
+        f"import time; open({ repr(str(ready_file)) }, 'w').write(stage); "
+        f"deadline = time.time() + 10.0\n"
+        f"    while not os.path.exists({ repr(str(release_file)) }) and time.time() < deadline:\n"
+        f"        time.sleep(0.02)"
+    )
+
+    t1 = asyncio.create_task(
+        svc._materialize_via_chunked_stream(
+            sbx,
+            object_key=obj_key,
+            abs_target_path=str(target_file),
+            expected_size=len(raw_bytes),
+            expected_sha256=expected_sha,
+            upload_id=uid,
+            pause_hook_expr=pause_expr,
+        )
+    )
+
+    for _ in range(200):
+        if ready_file.exists():
+            break
+        await asyncio.sleep(0.02)
+    assert ready_file.exists(), "Transfer 1 did not reach validation pause point"
+    w1_stage_path = ready_file.read_text().strip()
+    assert os.path.exists(w1_stage_path)
+
+    # Run Transfer 2 while Transfer 1 is paused between validation and publication;
+    # force Transfer 2 to stream by temporarily unlinking target if needed (target does not exist yet!)
+    assert not target_file.exists()
+    t2_ok = await svc._materialize_via_chunked_stream(
+        sbx,
+        object_key=obj_key,
+        abs_target_path=str(target_file),
+        expected_size=len(raw_bytes),
+        expected_sha256=expected_sha,
+        upload_id=uid,
+    )
+    assert t2_ok is True
+    # Transfer 2 must NOT have deleted Transfer 1's active stage file!
+    assert os.path.exists(w1_stage_path)
+    assert target_file.exists()
+    assert target_file.stat().st_size == len(raw_bytes)
+    assert hashlib.sha256(target_file.read_bytes()).hexdigest() == expected_sha
+
+    # Release Transfer 1 -> completes cleanly, target remains exact
+    release_file.write_text("go")
+    t1_ok = await t1
+    assert t1_ok is True
+    assert not os.path.exists(w1_stage_path)
+    assert target_file.read_bytes() == raw_bytes
+    leftover_temps = [p.name for p in uploads_dir.iterdir() if p.name.startswith(".wsfiles-")]
+    assert leftover_temps == []
+
+    # 2. Prove descriptor-identity check: if stage_path is unlinked and replaced by a partial
+    # file while paused between validation and os.replace, finalize_script exits 3 and refuses publication!
+    target_swap = uploads_dir / "inode_swap_target.bin"
+    swap_ready = tmp_path / "swap_ready.flag"
+    swap_release = tmp_path / "swap_release.flag"
+    swap_pause = (
+        f"import time; open({ repr(str(swap_ready)) }, 'w').write(stage); "
+        f"deadline = time.time() + 10.0\n"
+        f"    while not os.path.exists({ repr(str(swap_release)) }) and time.time() < deadline:\n"
+        f"        time.sleep(0.02)"
+    )
+    t_swap = asyncio.create_task(
+        svc._materialize_via_chunked_stream(
+            sbx,
+            object_key=obj_key,
+            abs_target_path=str(target_swap),
+            expected_size=len(raw_bytes),
+            expected_sha256=expected_sha,
+            upload_id=uid,
+            pause_hook_expr=swap_pause,
+        )
+    )
+    for _ in range(200):
+        if swap_ready.exists():
+            break
+        await asyncio.sleep(0.02)
+    swap_stage = swap_ready.read_text().strip()
+    os.unlink(swap_stage)
+    with open(swap_stage, "wb") as f:
+        f.write(b"partial-corrupt-bytes")
+    swap_release.write_text("go")
+    with pytest.raises(RuntimeError, match="verification failed"):
+        await t_swap
+    assert not target_swap.exists()
+
+
+@pytest.mark.asyncio
+async def test_direct_transfer_concurrent_downloads_and_restore_orphan_sweep_isolation(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two concurrent wsfiles_transfer_runtime.pull downloads in the same workspace
+    never delete each other's .wsfiles-* temp files, a concurrent full restore
+    (sweep_orphans=True) preserves active flock-held downloads while cleaning unlocked orphans,
+    and an independent OS process running _sweep_orphan_staging while _download_to_temp or
+    _extract_member is paused between NamedTemporaryFile creation and flock acquisition
+    cannot unlink the newly created temp file."""
+    import io
+    import subprocess
+    import sys
+    from pathlib import Path
+    from ptc_agent.core.sandbox import wsfiles_transfer_runtime as rt
+
+    blob_slow = b"SLOW_DIRECT_ATTACHMENT_" * (64 * 1024)
+    blob_fast = b"FAST_DIRECT_ATTACHMENT_" * (32 * 1024)
+    blob_restore = b"RESTORED_WORKSPACE_FILE_" * (16 * 1024)
+    sha_slow = hashlib.sha256(blob_slow).hexdigest()
+    sha_fast = hashlib.sha256(blob_fast).hexdigest()
+    sha_restore = hashlib.sha256(blob_restore).hexdigest()
+
+    slow_half_sent = threading.Event()
+    release_slow = threading.Event()
+
+    class _InMemoryBlobResponse:
+        def __init__(self, body: bytes, *, pause_midway: bool = False) -> None:
+            self._body = body
+            self._offset = 0
+            self._pause_midway = pause_midway
+            self._paused_once = False
+            self.status = 200
+
+        def getheader(self, name: str, default: str | None = None) -> str | None:
+            if name.lower() == "content-length":
+                return str(len(self._body))
+            return default
+
+        def read(self, amt: int = 1048576) -> bytes:
+            if self._offset >= len(self._body):
+                return b""
+            if self._pause_midway and not self._paused_once:
+                half = max(1, len(self._body) // 2)
+                chunk = self._body[self._offset : half]
+                self._offset = half
+                self._paused_once = True
+                slow_half_sent.set()
+                release_slow.wait(timeout=10.0)
+                return chunk
+            chunk = self._body[self._offset : self._offset + amt]
+            self._offset += len(chunk)
+            return chunk
+
+        def close(self) -> None:
+            pass
+
+    def _fake_request(method: str, url: str, timeout_s: float) -> Any:
+        del method, timeout_s
+        if url.endswith("/slow.bin"):
+            return _InMemoryBlobResponse(blob_slow, pause_midway=True)
+        if url.endswith("/fast.bin"):
+            return _InMemoryBlobResponse(blob_fast)
+        if url.endswith("/restore.bin"):
+            return _InMemoryBlobResponse(blob_restore)
+        raise RuntimeError(f"Unexpected URL: {url}")
+
+    monkeypatch.setattr(
+        rt, "_request", create_autospec(rt._request, side_effect=_fake_request)
+    )
+
+    ws_root = tmp_path / "ws"
+    ws_root.mkdir(parents=True, exist_ok=True)
+    abandoned_orphan = ws_root / ".wsfiles-abandoned-orphan"
+    abandoned_orphan.write_bytes(b"stale-unclaimed-temp")
+
+    try:
+        slow_spec = {
+            "root": str(ws_root),
+            "concurrency": 2,
+            "timeout_s": 30,
+            "sweep_orphans": False,
+            "items": [
+                {
+                    "kind": "file",
+                    "path": "work/uploads/slow.bin",
+                    "size": len(blob_slow),
+                    "mode": 0o644,
+                    "sha256": sha_slow,
+                    "url": "https://blob.local/slow.bin",
+                }
+            ],
+        }
+        fast_spec = {
+            "root": str(ws_root),
+            "concurrency": 2,
+            "timeout_s": 30,
+            "sweep_orphans": False,
+            "items": [
+                {
+                    "kind": "file",
+                    "path": "work/uploads/fast.bin",
+                    "size": len(blob_fast),
+                    "mode": 0o644,
+                    "sha256": sha_fast,
+                    "url": "https://blob.local/fast.bin",
+                }
+            ],
+        }
+        restore_spec = {
+            "root": str(ws_root),
+            "concurrency": 2,
+            "timeout_s": 30,
+            "sweep_orphans": True,
+            "items": [
+                {
+                    "kind": "file",
+                    "path": "notes/restore.bin",
+                    "size": len(blob_restore),
+                    "mode": 0o644,
+                    "sha256": sha_restore,
+                    "url": "https://blob.local/restore.bin",
+                }
+            ],
+        }
+
+        slow_fut = asyncio.create_task(asyncio.to_thread(rt.pull, slow_spec))
+        assert await asyncio.to_thread(slow_half_sent.wait, 5.0)
+
+        # While slow.bin is mid-download in ws_root, run both incremental fast_spec
+        # (sweep_orphans=False) AND regular workspace restore_spec (sweep_orphans=True)!
+        fast_out = await asyncio.to_thread(rt.pull, fast_spec)
+        assert fast_out["results"]["work/uploads/fast.bin"]["status"] == "ok"
+        assert abandoned_orphan.exists()
+
+        restore_out = await asyncio.to_thread(rt.pull, restore_spec)
+        assert restore_out["results"]["notes/restore.bin"]["status"] == "ok"
+        assert not abandoned_orphan.exists()
+
+        release_slow.set()
+        slow_out = await slow_fut
+        assert slow_out["results"]["work/uploads/slow.bin"]["status"] == "ok"
+
+        p_slow = ws_root / "work" / "uploads" / "slow.bin"
+        p_fast = ws_root / "work" / "uploads" / "fast.bin"
+        p_rest = ws_root / "notes" / "restore.bin"
+        assert p_slow.read_bytes() == blob_slow
+        assert hashlib.sha256(p_slow.read_bytes()).hexdigest() == sha_slow
+        assert p_fast.read_bytes() == blob_fast
+        assert hashlib.sha256(p_fast.read_bytes()).hexdigest() == sha_fast
+        assert p_rest.read_bytes() == blob_restore
+        assert hashlib.sha256(p_rest.read_bytes()).hexdigest() == sha_restore
+        assert [
+            p.name
+            for p in ws_root.iterdir()
+            if p.name.startswith(".wsfiles-") and p.name != rt._SWEEP_LOCK_NAME
+        ] == []
+
+        # Cross-process test: pause _download_to_temp AND _extract_member right after
+        # NamedTemporaryFile creation and BEFORE _acquire_temp_ownership acquires the per-file
+        # flock, while an independent OS process runs _sweep_orphan_staging!
+        rt_file = str(Path(rt.__file__).resolve())
+        for mode in ("download", "extract"):
+            created_evt = threading.Event()
+            resume_create_evt = threading.Event()
+            created_paths: list[str] = []
+
+            def _on_temp_created(temp_path: str) -> None:
+                created_paths.append(temp_path)
+                created_evt.set()
+                resume_create_evt.wait(timeout=5.0)
+
+            monkeypatch.setattr(rt, "_TEMP_CREATED_BEFORE_LOCK_HOOK", _on_temp_created)
+            stale_for_subproc = ws_root / f".wsfiles-stale-{mode}"
+            stale_for_subproc.write_bytes(b"stale")
+
+            if mode == "download":
+                op_fut = asyncio.create_task(
+                    asyncio.to_thread(
+                        rt._download_to_temp, "https://blob.local/fast.bin", str(ws_root), 10.0
+                    )
+                )
+            else:
+                member_bytes = b"PACK_MEMBER_PAYLOAD_" * 128
+                member_spec = {
+                    "path": "notes/from_pack.bin",
+                    "offset": 0,
+                    "size": len(member_bytes),
+                    "sha256": hashlib.sha256(member_bytes).hexdigest(),
+                    "mode": 0o644,
+                }
+                op_fut = asyncio.create_task(
+                    asyncio.to_thread(
+                        rt._extract_member,
+                        str(ws_root),
+                        io.BytesIO(member_bytes),
+                        member_spec,
+                        200,
+                    )
+                )
+
+            assert await asyncio.to_thread(created_evt.wait, 5.0)
+            assert len(created_paths) == 1
+            assert os.path.exists(created_paths[0])
+
+            sub_code = (
+                "import importlib.util, sys\n"
+                "spec = importlib.util.spec_from_file_location('rt', sys.argv[1])\n"
+                "mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)\n"
+                "mod._sweep_orphan_staging(sys.argv[2], [], sweep_orphans=True)\n"
+            )
+            sweep_proc = subprocess.Popen(
+                [sys.executable, "-c", sub_code, rt_file, str(ws_root)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            await asyncio.sleep(0.08)
+            assert os.path.exists(created_paths[0])
+            resume_create_evt.set()
+
+            op_res = await op_fut
+            _, stderr_bytes = await asyncio.to_thread(sweep_proc.communicate, 5.0)
+            assert sweep_proc.returncode == 0, stderr_bytes.decode("utf-8", "replace")
+            assert not stale_for_subproc.exists()
+            if mode == "download":
+                tmp_name, got_sha, got_n, got_status = op_res
+                assert os.path.exists(tmp_name)
+                assert got_sha == sha_fast and got_n == len(blob_fast) and got_status == 200
+                rt._unlink_quiet(tmp_name)
+            else:
+                assert op_res["status"] == "ok"
+                assert (ws_root / "notes" / "from_pack.bin").read_bytes() == member_bytes
+            monkeypatch.setattr(rt, "_TEMP_CREATED_BEFORE_LOCK_HOOK", None)
+
+        with pytest.raises(OSError):
+            rt._acquire_temp_ownership(str(ws_root / ".wsfiles-nonexistent-temp"))
+    finally:
+        release_slow.set()
+        monkeypatch.setattr(rt, "_TEMP_CREATED_BEFORE_LOCK_HOOK", None)
+
+
+@pytest.mark.asyncio
+async def test_failed_steer_durable_replay_survives_outbox_retention_purge() -> None:
+    """Failed steer user content, ordered attachments, request_key, turn_index, and error
+    survive purge_terminal_jobs via conversation_responses.replay_facts without duplicate entries."""
+    from src.server.database.conversation.replay_rows import ThreadRows
+    from src.server.database.runs.outbox import (
+        _failed_steer_entry,
+        merge_failed_steer_entries,
+    )
+    from src.server.services.history.reader import CheckpointHistoryReader, TurnAnchor
+    from src.server.services.history.replay import run_lane
+    from src.server.services.history.replay.facts import RunFacts
+    from src.server.services.history.replay.keys import lines_key
+    from src.server.services.history.replay.turn import Inputs, project_turn
+    from src.server.services.history.slices import TurnSlice
+    from langgraph.checkpoint.memory import InMemorySaver
+
+    tid = str(uuid.uuid4())
+    run_0 = str(uuid.uuid4())
+    run_1 = str(uuid.uuid4())
+    job_held = str(uuid.uuid4())
+    job_parked = str(uuid.uuid4())
+    rk_held = str(uuid.uuid4())
+    rk_parked = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+
+    outbox_row_held = {
+        "hook_outbox_id": job_held,
+        "run_id": run_0,
+        "created_at": now,
+        "turn_index": 0,
+        "payload": {
+            "content": "Live held steer with 200MiB + inline PNG",
+            "request_key": rk_held,
+            "timestamp": 1700001000.0,
+            "failed_run_id": run_0,
+            "delivery_error": {
+                "code": "http_403",
+                "message": "Workspace write access was revoked",
+            },
+            "attachments": [
+                {"name": "model_200m.bin", "type": "file", "size": 209715200, "status": "uploaded", "upload_id": "u-1"},
+                {"name": "inline_chart.png", "type": "image", "size": 4096, "status": "uploaded", "upload_id": "u-2"},
+            ],
+        },
+    }
+    outbox_row_parked = {
+        "hook_outbox_id": job_parked,
+        "run_id": run_0,
+        "created_at": now + timedelta(seconds=5),
+        "turn_index": 0,
+        "payload": {
+            "content": "Parked steer failed after run_end",
+            "request_key": rk_parked,
+            "timestamp": 1700001005.0,
+            "failed_run_id": run_0,
+            "delivery_error": {
+                "code": "http_410",
+                "message": "Attachment has expired or was removed",
+            },
+            "attachments": [
+                {"name": "deleted_doc.pdf", "type": "pdf", "size": 65536, "status": "uploaded", "upload_id": "u-3"},
+            ],
+        },
+    }
+
+    durable_entry_held = {**_failed_steer_entry(outbox_row_held), "turn_index": 0}
+    durable_entry_parked = {**_failed_steer_entry(outbox_row_parked), "turn_index": 0}
+    durable_rows = [
+        {
+            "turn_index": 0,
+            # Include duplicate entry to verify idempotency deduplication by job_id / request_key
+            "failed_steers": [durable_entry_held, durable_entry_held, durable_entry_parked],
+        }
+    ]
+
+    # 1. Before outbox purge (both durable replay_facts AND hook_outbox rows exist): deduplicated to 2
+    merged_before_purge = merge_failed_steer_entries(
+        durable_rows, [outbox_row_held, outbox_row_parked]
+    )
+    assert len(merged_before_purge) == 2
+    assert [m["request_key"] for m in merged_before_purge] == [rk_held, rk_parked]
+
+    # 2. After purge_terminal_jobs deletes hook_outbox rows (outbox_rows = []): identical 2 entries!
+    merged_after_purge = merge_failed_steer_entries(durable_rows, [])
+    assert merged_after_purge == merged_before_purge
+
+    # 3. Verify turn association stays on turn 0 even after turn 1 completes later
+    q0 = {
+        "conversation_query_id": str(uuid.uuid4()),
+        "turn_index": 0,
+        "content": "Turn 0 question",
+        "type": "user",
+        "created_at": now,
+        "metadata": {},
+        "xmin": 1,
+    }
+    q1 = {
+        "conversation_query_id": str(uuid.uuid4()),
+        "turn_index": 1,
+        "content": "Turn 1 follow-up",
+        "type": "user",
+        "created_at": now + timedelta(minutes=1),
+        "metadata": {},
+        "xmin": 2,
+    }
+    r0 = {
+        "conversation_response_id": run_0,
+        "turn_index": 0,
+        "status": "completed",
+        "created_at": now,
+        "metadata": {},
+        "version": "10",
+    }
+    r1 = {
+        "conversation_response_id": run_1,
+        "turn_index": 1,
+        "status": "completed",
+        "created_at": now + timedelta(minutes=1),
+        "metadata": {},
+        "version": "11",
+    }
+    t_rows = ThreadRows(
+        thread_id=tid,
+        owner_id="u-owner",
+        thread={"latest_checkpoint_id": "cp-2"},
+        queries=[q0, q1],
+        responses_by_turn={0: r0, 1: r1},
+        usages=[],
+        provenance=[],
+        run_facts=[],
+        open_runs={},
+        failed_steers=merged_after_purge,
+    )
+    inputs = Inputs.of(t_rows)
+    assert len(inputs.failed_steers_by_turn.get(0, [])) == 2
+    assert inputs.failed_steers_by_turn.get(1, []) == []
+
+    anchor0 = TurnAnchor(0, 0, "cp-0", "cp-1", [])
+    anchor1 = TurnAnchor(1, 1, "cp-1", "cp-2", [])
+    lane = run_lane.RunLane(CheckpointHistoryReader(InMemorySaver()), tid, RunFacts.of([]))
+    items0, _ = project_turn(inputs, 0, TurnSlice(anchor=anchor0), r0, lane)
+    items1, _ = project_turn(inputs, 1, TurnSlice(anchor=anchor1), r1, lane)
+    ret0 = [it["data"] for it in items0 if it["event"] == "steering_returned"]
+    ret1 = [it["data"] for it in items1 if it["event"] == "steering_returned"]
+    assert [d["request_key"] for d in ret0] == [rk_held, rk_parked]
+    assert [len(d["attachments"]) for d in ret0] == [2, 1]
+    assert ret1 == []
+    assert lines_key(inputs, 0, anchor0, r0) == lines_key(
+        Inputs.of(
+            ThreadRows(
+                thread_id=tid,
+                owner_id="u-owner",
+                thread={"latest_checkpoint_id": "cp-2"},
+                queries=[q0, q1],
+                responses_by_turn={0: r0, 1: r1},
+                usages=[],
+                provenance=[],
+                run_facts=[],
+                open_runs={},
+                failed_steers=merged_before_purge,
+            )
+        ),
+        0,
+        anchor0,
+        r0,
+    )
+
+
+@pytest.mark.asyncio
+async def test_parked_steer_failure_after_run_end_surfaces_via_status_and_wakes_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When execute_steer fails verify_steered_chat_uploads with SteerAttachmentPermanentError
+    after run_end, it settles outcome='failed', wakes the thread, and /status returns failed_steers
+    for the owner while hiding them from non-owner readers."""
+    from src.server.app.threads import messaging as messaging_app
+    from src.server.database.runs import lifecycle as tl_db
+    from src.server.database.runs import outbox as outbox_db
+    from src.server.services.report_back import steer_executor
+
+    tid = str(uuid.uuid4())
+    ended_run_id = str(uuid.uuid4())
+    job_id = str(uuid.uuid4())
+    req_key = str(uuid.uuid4())
+    owner_id = "user-steer-owner"
+    ws_id = str(uuid.uuid4())
+
+    job_row = {
+        "hook_outbox_id": job_id,
+        "idempotency_key": f"steer:{req_key}",
+        "conversation_thread_id": tid,
+        "run_id": ended_run_id,
+        "status": "claimed",
+        "attempts": 1,
+        "payload": {
+            "sender": "user",
+            "target": "thread",
+            "user_id": owner_id,
+            "workspace_id": ws_id,
+            "request_key": req_key,
+            "content": "Please inspect the revoked file",
+            "timestamp": 1700002000.0,
+            "chat_uploads": [{"type": "chat_upload", "upload_id": str(uuid.uuid4()), "name": "revoked.bin", "size": 1024}],
+            "attachments": [{"name": "revoked.bin", "type": "file", "size": 1024, "status": "uploaded"}],
+        },
+    }
+
+    finished_calls: list[tuple[str, int, str, dict[str, Any] | None]] = []
+    woken_threads: list[str] = []
+
+    async def _fake_finish_claimed(
+        jid: str, *, attempts: int, outcome: str, patch: dict[str, Any] | None = None
+    ) -> bool:
+        finished_calls.append((jid, attempts, outcome, patch))
+        return True
+
+    async def _fake_wake(thread_id: str) -> None:
+        woken_threads.append(thread_id)
+
+    monkeypatch.setattr(
+        outbox_db,
+        "get_steer_job",
+        create_autospec(outbox_db.get_steer_job, return_value=job_row),
+    )
+    monkeypatch.setattr(
+        outbox_db,
+        "finish_claimed_steer",
+        create_autospec(outbox_db.finish_claimed_steer, side_effect=_fake_finish_claimed),
+    )
+    orig_get_latest_attempt = tl_db.get_latest_attempt
+    monkeypatch.setattr(
+        tl_db,
+        "get_latest_attempt",
+        create_autospec(
+            orig_get_latest_attempt,
+            return_value={"conversation_response_id": ended_run_id, "status": "completed"},
+        ),
+    )
+    monkeypatch.setattr(
+        steer_executor,
+        "_owner",
+        create_autospec(steer_executor._owner, return_value=(owner_id, ws_id)),
+    )
+    monkeypatch.setattr(
+        svc,
+        "verify_steered_chat_uploads",
+        create_autospec(
+            svc.verify_steered_chat_uploads,
+            side_effect=svc.SteerAttachmentPermanentError(
+                "http_410", "Attachment has expired or was removed"
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        steer_executor,
+        "publish_cleared_wake",
+        create_autospec(steer_executor.publish_cleared_wake, side_effect=_fake_wake),
+    )
+
+    await steer_executor.execute_steer(
+        {
+            "hook_outbox_id": job_id,
+            "idempotency_key": f"steer:{req_key}",
+            "conversation_thread_id": tid,
+            "attempts": 1,
+        }
+    )
+
+    assert len(finished_calls) == 1
+    assert finished_calls[0][0] == job_id
+    assert finished_calls[0][2] == "failed"
+    assert finished_calls[0][3] == {
+        "failed_run_id": ended_run_id,
+        "delivery_error": {
+            "code": "http_410",
+            "message": "Attachment has expired or was removed",
+        },
+    }
+    assert woken_threads == [tid]
+
+    # Verify GET /api/v1/threads/{thread_id}/status exposes failed_steers to owner and [] to non-owner
+    expected_failed = [
+        {
+            "job_id": job_id,
+            "request_key": req_key,
+            "content": "Please inspect the revoked file",
+            "reason": "attachment_failed",
+            "error": "Attachment has expired or was removed",
+            "error_code": "http_410",
+            "failed_run_id": ended_run_id,
+            "turn_index": 0,
+            "attachments": [{"name": "revoked.bin", "type": "file", "size": 1024, "status": "uploaded"}],
+        }
+    ]
+    monkeypatch.setattr(
+        outbox_db,
+        "list_pending_steers",
+        create_autospec(outbox_db.list_pending_steers, return_value=[]),
+    )
+    monkeypatch.setattr(
+        outbox_db,
+        "list_failed_steers_for_status",
+        create_autospec(
+            outbox_db.list_failed_steers_for_status, return_value=expected_failed
+        ),
+    )
+    from src.dalton import settings as dalton_settings
+    from src.dalton import sharing as dalton_sharing
+    from src.server.database import conversation as conv_db
+    from src.server.services import thread_status as ts_mod
+
+    orig_get_thread_auth_meta = conv_db.get_thread_auth_meta
+    monkeypatch.setattr(
+        conv_db,
+        "get_thread_auth_meta",
+        create_autospec(
+            orig_get_thread_auth_meta,
+            return_value={"user_id": owner_id, "is_shared": False, "workspace_owner_id": owner_id, "workspace_id": str(uuid.uuid4())},
+        ),
+    )
+    monkeypatch.setattr(
+        dalton_settings,
+        "is_dalton_supabase_auth_enabled",
+        create_autospec(dalton_settings.is_dalton_supabase_auth_enabled, return_value=True),
+    )
+    monkeypatch.setattr(
+        dalton_sharing,
+        "require_thread_reader",
+        create_autospec(dalton_sharing.require_thread_reader, return_value=None),
+    )
+    monkeypatch.setattr(
+        ts_mod,
+        "read_thread_runtime_status",
+        create_autospec(
+            ts_mod.read_thread_runtime_status,
+            return_value={"thread_id": tid, "can_reconnect": False, "status": "completed", "latest_turn_index": 0},
+        ),
+    )
+    owner_status = await messaging_app.get_thread_status(tid, x_user_id=owner_id, fields=None)
+    assert owner_status["failed_steers"] == expected_failed
+
+    monkeypatch.setattr(
+        conv_db,
+        "get_thread_auth_meta",
+        create_autospec(
+            orig_get_thread_auth_meta,
+            return_value={"user_id": owner_id, "is_shared": True, "workspace_owner_id": owner_id, "workspace_id": str(uuid.uuid4())},
+        ),
+    )
+    monkeypatch.setattr(
+        tl_db,
+        "get_latest_attempt",
+        create_autospec(
+            orig_get_latest_attempt,
+            return_value={"status": "completed", "created_at": datetime.now(timezone.utc)},
+        ),
+    )
+    monkeypatch.setattr(
+        conv_db,
+        "get_latest_turn_index",
+        create_autospec(conv_db.get_latest_turn_index, return_value=0),
+    )
+    non_owner_status = await messaging_app.get_thread_status(tid, x_user_id="colleague-viewer", fields=None)
+    assert non_owner_status["failed_steers"] == []
+
+
+@pytest.mark.asyncio
+async def test_explicit_file_delete_interleaved_with_recovery_never_resurrects_deleted_upload(
+    upload_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Explicit file deletion interleaved with rematerialize_workspace_chat_uploads (both when
+    recovery reads ready before delete acquires path_write_lock and when delete pauses right
+    after rm) never resurrects the deleted file, while failed rm preserves recoverability."""
+    from src.server.app.workspace_files import crud as ws_crud
+
+    owner = "user-del-race"
+    ws_id = str(uuid.uuid4())
+    upload_env["workspaces"][ws_id] = {
+        "workspace_id": ws_id,
+        "user_id": owner,
+        "status": "running",
+    }
+
+    async def _seed_accepted(filename: str, content: bytes) -> tuple[str, str]:
+        created = await svc.initiate_chat_upload(
+            user_id=owner, workspace_id=ws_id, filename=filename, size_bytes=len(content)
+        )
+        uid = created["upload_id"]
+        await svc.receive_chat_upload_part(
+            upload_id=uid, part_number=1, user_id=owner, stream=_bytes_stream(content)
+        )
+        await svc.complete_chat_upload(upload_id=uid, user_id=owner)
+        await svc.confirm_request_chat_uploads(
+            [ChatUploadContext(upload_id=uid, name=filename, size=len(content))],
+            user_id=owner,
+            workspace_id=ws_id,
+        )
+        row = upload_env["ledger"].rows[uid]
+        return uid, svc.build_sandbox_upload_rel_path(row)
+
+    uid_a, rel_a = await _seed_accepted("race_a.bin", b"A" * 4096)
+    uid_b, rel_b = await _seed_accepted("race_b.bin", b"B" * 4096)
+    uid_fail_rm, rel_fail_rm = await _seed_accepted("keep_on_rm_fail.bin", b"K" * 4096)
+
+    layout = WorkspaceLayout(root="/home/workspace", dir_name="RaceWS")
+    abs_a = f"{layout.workspace}/{rel_a}"
+    abs_b = f"{layout.workspace}/{rel_b}"
+    abs_fail = f"{layout.workspace}/{rel_fail_rm}"
+
+    class _CoordinatedSandbox(_FakeSandbox):
+        def __init__(self) -> None:
+            super().__init__(sandbox_id="sbx-race")
+            self._path_locks: dict[str, asyncio.Lock] = {}
+            self.rm_should_fail: set[str] = set()
+            self.pause_after_rm_for: str | None = None
+            self.paused_after_rm = asyncio.Event()
+            self.resume_after_rm = asyncio.Event()
+
+        @asynccontextmanager
+        async def path_write_lock(self, normalized_path: str):
+            lock = self._path_locks.setdefault(normalized_path, asyncio.Lock())
+            self.locked_paths.append(normalized_path)
+            async with lock:
+                yield
+
+        async def execute_bash_command(self, cmd: str) -> dict[str, Any]:
+            import shlex as _shlex
+
+            tokens = _shlex.split(cmd)
+            targets = [t for t in tokens[2:] if not t.startswith("-")]
+            for t in targets:
+                if t in self.rm_should_fail:
+                    return {"success": False, "stderr": "permission denied"}
+            for t in targets:
+                self.files.pop(t, None)
+            if self.pause_after_rm_for and self.pause_after_rm_for in targets:
+                self.paused_after_rm.set()
+                await self.resume_after_rm.wait()
+            return {"success": True, "stdout": "", "stderr": ""}
+
+    sbx = _CoordinatedSandbox()
+    sbx.files[abs_a] = b"A" * 4096
+    sbx.files[abs_b] = b"B" * 4096
+    sbx.files[abs_fail] = b"K" * 4096
+
+    async def _pull_into_fake_sbx(
+        sandbox: Any,
+        entries: list[dict[str, Any]],
+        *,
+        layout: WorkspaceLayout,
+        defer_dir_modes: bool = False,
+        sweep_orphans: bool = True,
+    ) -> dict[str, dict[str, Any]]:
+        del defer_dir_modes, sweep_orphans
+        for e in entries:
+            grant_file = e.get("grant_file")
+            if grant_file and grant_file not in sandbox.files:
+                return {e["path"]: {"status": "superseded"}}
+            if grant_file:
+                sandbox.files.pop(grant_file, None)
+            p = f"{layout.workspace}/{e['path']}"
+            sandbox.files[p] = b"RESTORED"
+        return {entries[0]["path"]: {"status": "ok"}}
+
+    monkeypatch.setattr(
+        svc,
+        "pull_direct",
+        create_autospec(_REAL_PULL_DIRECT, side_effect=_pull_into_fake_sbx),
+    )
+
+    # Scenario A: Recovery reads list_retained_workspace_uploads(ready) and probes missing BEFORE
+    # acquiring path_write_lock; while recovery waits on path_write_lock, explicit delete removes
+    # abs_a and retires uid_a; recovery resumes and must NOT restore abs_a!
+    del sbx.files[abs_a]  # simulate missing on disk when recovery probes
+    lock_a = sbx._path_locks.setdefault(abs_a, asyncio.Lock())
+    await lock_a.acquire()
+
+    orig_probe_missing = svc._probe_missing_sandbox_paths
+    probe_done = asyncio.Event()
+
+    async def _notify_probe_missing(sandbox: Any, abs_paths: list[str]) -> set[str]:
+        res = await orig_probe_missing(sandbox, abs_paths)
+        probe_done.set()
+        return res
+
+    monkeypatch.setattr(
+        svc,
+        "_probe_missing_sandbox_paths",
+        create_autospec(orig_probe_missing, side_effect=_notify_probe_missing),
+    )
+
+    rec_task_a = asyncio.create_task(
+        svc.rematerialize_workspace_chat_uploads(ws_id, sbx, layout=layout)
+    )
+    await asyncio.wait_for(probe_done.wait(), timeout=2.0)
+
+    # Explicit delete of rel_a runs while recovery is blocked waiting for lock_a
+    await svc.begin_delete_workspace_chat_uploads(
+        workspace_id=ws_id, caller_user_id=owner, candidate_client_paths=[rel_a]
+    )
+    sbx.files.pop(abs_a, None)
+    await svc.retire_deleted_workspace_chat_uploads(
+        workspace_id=ws_id, caller_user_id=owner, deleted_client_paths=[rel_a]
+    )
+    lock_a.release()
+
+    res_a = await rec_task_a
+    assert res_a == {"restored": 0, "errors": 0}
+    assert abs_a not in sbx.files
+    assert upload_env["ledger"].rows[uid_a]["state"] == "aborted"
+    assert upload_env["ledger"].rows[uid_a]["object_key"] not in upload_env["store"].objects
+
+    # Scenario B: Explicit delete fences uid_b, runs rm (removing abs_b), and pauses IMMEDIATELY
+    # after rm before retire_deleted_workspace_chat_uploads; a second worker runs recovery (even
+    # with lock fallback) and must NOT recreate abs_b!
+    sbx.pause_after_rm_for = abs_b
+
+    async def _run_delete_b() -> None:
+        await svc.begin_delete_workspace_chat_uploads(
+            workspace_id=ws_id, caller_user_id=owner, candidate_client_paths=[rel_b]
+        )
+        res = await sbx.execute_bash_command(f"rm -f {abs_b}")
+        assert res["success"] is True
+        await svc.retire_deleted_workspace_chat_uploads(
+            workspace_id=ws_id, caller_user_id=owner, deleted_client_paths=[rel_b]
+        )
+
+    del_task_b = asyncio.create_task(_run_delete_b())
+    await asyncio.wait_for(sbx.paused_after_rm.wait(), timeout=2.0)
+    assert abs_b not in sbx.files
+    assert upload_env["ledger"].rows[uid_b]["error"] == "explicit_delete_pending"
+
+    # Worker 2 runs recovery while Worker 1 is paused right after rm
+    res_during_pause = await svc.rematerialize_workspace_chat_uploads(
+        ws_id, sbx, layout=layout
+    )
+    assert res_during_pause == {"restored": 0, "errors": 0}
+    assert abs_b not in sbx.files
+
+    sbx.resume_after_rm.set()
+    await del_task_b
+    assert abs_b not in sbx.files
+    assert upload_env["ledger"].rows[uid_b]["state"] == "aborted"
+    assert upload_env["ledger"].rows[uid_b]["object_key"] not in upload_env["store"].objects
+
+    # Scenario C: Failed rm clears the fence via abort_delete_workspace_chat_uploads so the upload
+    # remains recoverable when later missing on disk!
+    await svc.begin_delete_workspace_chat_uploads(
+        workspace_id=ws_id, caller_user_id=owner, candidate_client_paths=[rel_fail_rm]
+    )
+    assert upload_env["ledger"].rows[uid_fail_rm]["error"] == "explicit_delete_pending"
+    await svc.abort_delete_workspace_chat_uploads(
+        workspace_id=ws_id, caller_user_id=owner, failed_client_paths=[rel_fail_rm]
+    )
+    assert upload_env["ledger"].rows[uid_fail_rm]["error"] is None
+    del sbx.files[abs_fail]
+    res_after_abort = await svc.rematerialize_workspace_chat_uploads(
+        ws_id, sbx, layout=layout
+    )
+    assert res_after_abort == {"restored": 1, "errors": 0}
+    assert abs_fail in sbx.files
+    assert ws_crud is not None
+
+    # Scenario D: Restore pauses AFTER its final is_upload_retained_for_recovery DB check
+    # and BEFORE remote publication while explicit delete completes (and without any post-copy rm):
+    # the grant revocation prevents target publication so abs_fail is NOT recreated!
+    del sbx.files[abs_fail]
+    after_db_check_evt = asyncio.Event()
+    resume_publication_evt = asyncio.Event()
+
+    async def _pause_after_final_db_check(_uid: str, _abs_target: str) -> None:
+        after_db_check_evt.set()
+        await resume_publication_evt.wait()
+
+    monkeypatch.setattr(svc, "_AFTER_FINAL_RECOVERY_DB_CHECK_HOOK", _pause_after_final_db_check)
+    try:
+        paused_restore_task = asyncio.create_task(
+            svc.rematerialize_workspace_chat_uploads(ws_id, sbx, layout=layout)
+        )
+        await asyncio.wait_for(after_db_check_evt.wait(), timeout=2.0)
+
+        # While restore is paused AFTER its final DB check, explicit delete runs and retires uid_fail_rm
+        await svc.begin_delete_workspace_chat_uploads(
+            workspace_id=ws_id,
+            caller_user_id=owner,
+            candidate_client_paths=[rel_fail_rm],
+            sandbox=sbx,
+            layout=layout,
+        )
+        sbx.files.pop(abs_fail, None)
+        await svc.retire_deleted_workspace_chat_uploads(
+            workspace_id=ws_id,
+            caller_user_id=owner,
+            deleted_client_paths=[rel_fail_rm],
+            sandbox=sbx,
+            layout=layout,
+        )
+        resume_publication_evt.set()
+
+        paused_res = await paused_restore_task
+        assert paused_res == {"restored": 0, "errors": 0}
+        assert abs_fail not in sbx.files
+        assert upload_env["ledger"].rows[uid_fail_rm]["state"] == "aborted"
+    finally:
+        resume_publication_evt.set()
+        monkeypatch.setattr(svc, "_AFTER_FINAL_RECOVERY_DB_CHECK_HOOK", None)
+
+
+class _RealPosixSandbox:
+    """Sandbox double backed by a real local POSIX directory executing actual shell/python commands."""
+
+    provider = _FakeSandboxProvider()
+
+    def __init__(self, root_dir: str, dir_name: str = "PosixWS") -> None:
+        self.sandbox_id = "sbx-real-posix"
+        self.root_dir = os.path.realpath(root_dir)
+        self.dir_name = dir_name
+        self.config = type(
+            "Cfg",
+            (),
+            {"filesystem": type("FS", (), {"working_directory": self.root_dir})()},
+        )()
+        self._path_locks: dict[str, asyncio.Lock] = {}
+        self.exec_interceptor: Any = None
+        parent_sbx = self
+
+        class _BoundRuntime:
+            @staticmethod
+            async def exec(cmd: str, **kwargs: Any) -> _FakeExecResult:
+                return await parent_sbx._runtime_call("exec", cmd, **kwargs)
+
+            @staticmethod
+            async def upload_file(data: bytes, dest: str, **kwargs: Any) -> _FakeExecResult:
+                return await parent_sbx._runtime_call("upload_file", data, dest, **kwargs)
+
+        self.runtime = _BoundRuntime()
+
+    def workspace(self, project: ProjectContext | None = None) -> WorkspaceLayout:
+        dn = (project.dir_name if project is not None else None) or self.dir_name
+        return WorkspaceLayout(root=self.root_dir, dir_name=dn)
+
+    def normalize_path(self, path: str, project: ProjectContext | None = None) -> str:
+        ws_root = self.workspace(project).workspace
+        if path == ws_root or path.startswith(f"{ws_root}/"):
+            return path
+        if path == self.root_dir or path.startswith(f"{self.root_dir}/"):
+            return path
+        return f"{ws_root}/{path.lstrip('/')}"
+
+    def validate_path(self, filepath: str, project: ProjectContext | None = None) -> bool:
+        ws_root = self.workspace(project).workspace
+        target = (
+            filepath
+            if filepath.startswith(f"{ws_root}/")
+            else self.normalize_path(filepath, project)
+        )
+        return target.startswith(f"{ws_root}/") and ".." not in target.split("/")
+
+    @asynccontextmanager
+    async def path_write_lock(self, normalized_path: str):
+        lock = self._path_locks.setdefault(normalized_path, asyncio.Lock())
+        async with lock:
+            yield
+
+    async def execute_bash_command(self, cmd: str, **_kwargs: Any) -> dict[str, Any]:
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out_b, err_b = await proc.communicate()
+        return {
+            "success": proc.returncode == 0,
+            "stdout": out_b.decode("utf-8", errors="replace"),
+            "stderr": err_b.decode("utf-8", errors="replace"),
+            "exit_code": proc.returncode or 0,
+        }
+
+    async def _runtime_call(self, fn: Any, *args: Any, **kwargs: Any) -> _FakeExecResult:
+        del kwargs
+        if callable(self.exec_interceptor):
+            intercepted = await self.exec_interceptor(fn, *args)
+            if intercepted is not None:
+                return intercepted
+        if fn == getattr(self.runtime, "upload_file", None) or (
+            len(args) == 2 and isinstance(args[0], (bytes, bytearray))
+        ):
+            data, dest = bytes(args[0]), str(args[1])
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with open(dest, "wb") as f:
+                f.write(data)
+            return _FakeExecResult(stdout="", stderr="", exit_code=0)
+        cmd = str(args[0]) if args else ""
+        if cmd.startswith("df -Pk"):
+            avail_kb = (20 * 1024 * 1024 * 1024) // 1024
+            df_out = (
+                "Filesystem 1024-blocks Used Available Capacity Mounted on\n"
+                f"overlay 52428800 1048576 {avail_kb} 5% {self.root_dir}\n"
+            )
+            return _FakeExecResult(stdout=df_out, stderr="", exit_code=0)
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out_b, err_b = await proc.communicate()
+        return _FakeExecResult(
+            stdout=out_b.decode("utf-8", errors="replace"),
+            stderr=err_b.decode("utf-8", errors="replace"),
+            exit_code=int(proc.returncode if proc.returncode is not None else 1),
+        )
+
+
+async def _wait_for_flag(path: Any, timeout: float = 10.0) -> str:
+    p = str(path)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if os.path.exists(p):
+            content = open(p, "r", encoding="utf-8").read().strip()
+            if content:
+                return content
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"Timed out waiting for coordination flag {p}")
+
+
+@pytest.mark.asyncio
+async def test_target_lock_inode_stability_and_multiprocess_flock_coordination(
+    tmp_path,
+) -> None:
+    """Verify across independent OS processes using real flock and real publication/revocation scripts:
+    1. A single stable .wsfiles-tlock-* inode is preserved across _create_restore_grant,
+       _cleanup_restore_grant, _revoke_restore_grants_in_sandbox, _build_stream_finalize_script,
+       and wsfiles_transfer_runtime._place (attempt cleanup never unlinks the shared target lock).
+    2. Concrete ordering: Restore A opens the target lock; Restore B's _cleanup_restore_grant runs;
+       Restore A acquires LOCK_EX on the unchanged inode, checks its valid grant, and pauses before
+       publication; explicit deletion and overlapping Restore C both block on the same lock inode;
+       independent Target 2 remains usable and publishes while Target 1's lock is held;
+       competing critical sections never overlap; completed delete leaves Target 1 absent after
+       all surviving attempts exit.
+    3. Termination (SIGKILL) of an attempt while holding LOCK_EX releases the kernel lock on the
+       stable inode so subsequent revocation/restore operations proceed cleanly."""
+    import json
+    import signal
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    repo_root = str(Path(__file__).resolve().parents[3])
+    src_dir = os.path.join(repo_root, "src")
+    subproc_env_base = {
+        **os.environ,
+        "PYTHONPATH": f"{src_dir}:{repo_root}",
+    }
+
+    direct_worker_code = (
+        "import json, os, sys\n"
+        "from ptc_agent.core.sandbox import wsfiles_transfer_runtime as rt\n"
+        "tmp_p, final_p, item_json, out_p = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]\n"
+        "item = json.loads(item_json)\n"
+        "res = rt._place(tmp_p, final_p, item, 200)\n"
+        "with open(out_p, 'w', encoding='utf-8') as f:\n"
+        "    json.dump(res, f)\n"
+        "sys.exit(0 if res.get('status') == 'ok' else (5 if res.get('status') == 'superseded' else 1))\n"
+    )
+
+    for mode in ("direct", "stream"):
+        mode_dir = tmp_path / f"lock_coord_{mode}"
+        mode_dir.mkdir(parents=True, exist_ok=True)
+        sbx = _RealPosixSandbox(str(mode_dir), dir_name="ws")
+        layout = sbx.workspace()
+        os.makedirs(f"{layout.workspace}/work/uploads", exist_ok=True)
+
+        uid_1 = str(uuid.uuid4())
+        uid_2 = str(uuid.uuid4())
+        row_1 = {"upload_id": uid_1, "filename": "model_1.bin"}
+        row_2 = {"upload_id": uid_2, "filename": "model_2.bin"}
+        rel_1 = svc.build_sandbox_upload_rel_path(row_1)
+        rel_2 = svc.build_sandbox_upload_rel_path(row_2)
+        abs_1 = f"{layout.workspace}/{rel_1}"
+        abs_2 = f"{layout.workspace}/{rel_2}"
+
+        payload_1 = f"PAYLOAD_ONE_{mode}_".encode("utf-8") * 512
+        payload_2 = f"PAYLOAD_TWO_{mode}_".encode("utf-8") * 512
+        sha_1 = hashlib.sha256(payload_1).hexdigest()
+        sha_2 = hashlib.sha256(payload_2).hexdigest()
+
+        # Establish 3 overlapping restore grants for Target 1 (A, B, C) and 1 for Target 2
+        grant_a, lock_1 = await svc._create_restore_grant(sbx, abs_1, uid_1, "att-a")
+        grant_b, lock_1_b = await svc._create_restore_grant(sbx, abs_1, uid_1, "att-b")
+        grant_c, lock_1_c = await svc._create_restore_grant(sbx, abs_1, uid_1, "att-c")
+        grant_t2, lock_2 = await svc._create_restore_grant(sbx, abs_2, uid_2, "att-t2")
+
+        assert lock_1 == lock_1_b == lock_1_c
+        assert lock_1 != lock_2
+        assert os.path.exists(lock_1)
+        initial_lock_ino = os.stat(lock_1).st_ino
+        assert os.path.exists(grant_a) and os.path.exists(grant_b) and os.path.exists(grant_c)
+
+        def _spawn_publish(
+            tag: str,
+            target_abs: str,
+            payload: bytes,
+            sha_hex: str,
+            grant_p: str,
+            lock_p: str,
+            extra_env: dict[str, str],
+        ) -> tuple[subprocess.Popen, str]:
+            stage_p = str(mode_dir / f"stage_{tag}.bin")
+            with open(stage_p, "wb") as f:
+                f.write(payload)
+            out_json = str(mode_dir / f"out_{tag}.json")
+            env = {**subproc_env_base, **extra_env}
+            if mode == "direct":
+                item = {
+                    "kind": "file",
+                    "size": len(payload),
+                    "mode": 0o644,
+                    "sha256": sha_hex,
+                    "grant_file": grant_p,
+                    "lock_file": lock_p,
+                }
+                proc = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        direct_worker_code,
+                        stage_p,
+                        target_abs,
+                        json.dumps(item),
+                        out_json,
+                    ],
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            else:
+                fin_cmd = svc._build_stream_finalize_script(
+                    stage_p,
+                    target_abs,
+                    len(payload),
+                    sha_hex,
+                    grant_path=grant_p,
+                    lock_path=lock_p,
+                )
+                proc = subprocess.Popen(
+                    fin_cmd,
+                    shell=True,
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+            return proc, stage_p
+
+        open_ready_a = mode_dir / "open_ready_a.flag"
+        open_resume_a = mode_dir / "open_resume_a.flag"
+        grant_ready_a = mode_dir / "grant_ready_a.flag"
+        grant_resume_a = mode_dir / "grant_resume_a.flag"
+
+        proc_a, stage_a = _spawn_publish(
+            "a",
+            abs_1,
+            payload_1,
+            sha_1,
+            grant_a,
+            lock_1,
+            {
+                "WSFILES_TEST_PAUSE_AFTER_LOCK_OPEN": f"{open_ready_a}:{open_resume_a}",
+                "WSFILES_TEST_PAUSE_AFTER_GRANT_CHECK": f"{grant_ready_a}:{grant_resume_a}",
+            },
+        )
+        try:
+            # 1. Restore A has opened the target lock (before flock)
+            open_info_a = await _wait_for_flag(open_ready_a)
+            assert int(open_info_a.split(":")[1]) == initial_lock_ino
+
+            # 2. Another attempt's cleanup (Attempt B) runs while A has the lock open
+            await svc._cleanup_restore_grant(sbx, grant_b, lock_1)
+            assert not os.path.exists(grant_b)
+            assert os.path.exists(grant_a)
+            assert os.path.exists(grant_c)
+            # Lock pathname and inode MUST remain unchanged
+            assert os.path.exists(lock_1)
+            assert os.stat(lock_1).st_ino == initial_lock_ino
+
+            # 3. Restore A acquires the lock, checks its valid grant, and pauses before publication
+            open_resume_a.write_text("go", encoding="utf-8")
+            await _wait_for_flag(grant_ready_a)
+            a_cs_Active_ns = time.monotonic_ns()
+            assert not os.path.exists(grant_a)  # consumed under LOCK_EX
+
+            # 4. Start explicit deletion (revocation + unlink_target) in an independent OS process:
+            #    it must open the SAME lock inode and block on LOCK_EX while A is paused!
+            del_in_lock_ready = mode_dir / "del_in_lock_ready.flag"
+            del_in_lock_resume = mode_dir / "del_in_lock_resume.flag"
+            del_task = asyncio.create_task(
+                svc._revoke_restore_grants_in_sandbox(
+                    sbx,
+                    layout,
+                    [row_1],
+                    unlink_target=True,
+                    pause_in_lock_expr=(
+                        f"open({str(del_in_lock_ready)!r}, 'w').write(f'{{os.getpid()}}:{{os.fstat(fd).st_ino}}:{time.monotonic_ns()}'); "
+                        f"dl = time.monotonic() + 15.0\n"
+                        f"        while not os.path.exists({str(del_in_lock_resume)!r}) and time.monotonic() < dl:\n"
+                        f"            time.sleep(0.01)"
+                    ),
+                )
+            )
+            await asyncio.sleep(0.08)
+            assert not del_in_lock_ready.exists(), "Delete entered critical section while Restore A held LOCK_EX!"
+            assert not del_task.done()
+
+            # 5. While Target 1's lock is held by Restore A and contended by Delete,
+            #    independent Target 2 restores and publishes immediately without blocking!
+            proc_t2, _ = _spawn_publish(
+                "t2", abs_2, payload_2, sha_2, grant_t2, lock_2, {}
+            )
+            rc_t2 = await asyncio.to_thread(proc_t2.wait, 5.0)
+            assert rc_t2 == 0
+            assert os.path.isfile(abs_2)
+            assert open(abs_2, "rb").read() == payload_2
+            assert not del_in_lock_ready.exists()
+
+            # 6. Resume Restore A -> Restore A publishes and releases LOCK_EX -> Delete immediately
+            #    acquires the SAME lock inode (non-overlapping critical section!)
+            a_release_ns = time.monotonic_ns()
+            grant_resume_a.write_text("go", encoding="utf-8")
+            rc_a = await asyncio.to_thread(proc_a.wait, 5.0)
+            assert rc_a == 0
+
+            del_info = await _wait_for_flag(del_in_lock_ready)
+            del_entered_ns = time.monotonic_ns()
+            del_parts = del_info.split(":")
+            assert int(del_parts[1]) == initial_lock_ino
+            assert del_entered_ns >= a_release_ns > a_cs_Active_ns
+
+            # 7. While Delete holds LOCK_EX, overlapping Restore Attempt C starts and blocks on LOCK_EX
+            grant_ready_c = mode_dir / "grant_ready_c.flag"
+            proc_c, stage_c = _spawn_publish(
+                "c",
+                abs_1,
+                payload_1,
+                sha_1,
+                grant_c,
+                lock_1,
+                {"WSFILES_TEST_PAUSE_AFTER_GRANT_CHECK": f"{grant_ready_c}:{grant_resume_a}"},
+            )
+            await asyncio.sleep(0.08)
+            assert proc_c.poll() is None, "Restore C did not block on Delete's LOCK_EX!"
+
+            # Release Delete: it revokes grant_c and unlinks abs_1 (which A had just published)
+            del_in_lock_resume.write_text("go", encoding="utf-8")
+            await del_task
+
+            # Restore C now acquires LOCK_EX, sees grant_c was revoked, and exits superseded (5)
+            rc_c = await asyncio.to_thread(proc_c.wait, 5.0)
+            assert rc_c == 5
+            assert not os.path.exists(stage_c)
+
+            # After every surviving attempt (A, B, C) and Delete have exited, Target 1 MUST be absent!
+            assert not os.path.exists(abs_1)
+            assert os.path.isfile(abs_2)
+            assert os.stat(lock_1).st_ino == initial_lock_ino
+
+            # 8. Termination (SIGKILL) of an attempt while holding LOCK_EX on the stable inode:
+            grant_kill, _ = await svc._create_restore_grant(sbx, abs_1, uid_1, "att-kill")
+            kill_ready = mode_dir / "kill_ready.flag"
+            kill_never = mode_dir / "kill_never.flag"
+            proc_kill, stage_kill = _spawn_publish(
+                "kill",
+                abs_1,
+                payload_1,
+                sha_1,
+                grant_kill,
+                lock_1,
+                {"WSFILES_TEST_PAUSE_AFTER_GRANT_CHECK": f"{kill_ready}:{kill_never}"},
+            )
+            await _wait_for_flag(kill_ready)
+            os.kill(proc_kill.pid, signal.SIGKILL)
+            await asyncio.to_thread(proc_kill.wait, 5.0)
+            if os.path.exists(stage_kill):
+                os.unlink(stage_kill)
+
+            # Kernel releases flock on SIGKILL; subsequent delete revocation acquires LOCK_EX cleanly
+            await svc._revoke_restore_grants_in_sandbox(
+                sbx, layout, [row_1], unlink_target=True
+            )
+            assert not os.path.exists(abs_1)
+            assert os.stat(lock_1).st_ino == initial_lock_ino
+        finally:
+            for p in (proc_a,):
+                if p.poll() is None:
+                    p.kill()
+
+
+@pytest.mark.asyncio
+async def test_crud_delete_requires_remote_grant_revocation_and_retries_cleanly_across_processes(
+    tmp_path,
+    upload_env,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify the actual CRUD delete_workspace_files handler with an independent restore process
+    already past its final DB check:
+    1. Nonzero revocation command exit in begin_delete_workspace_chat_uploads reports path in errors
+       (not deleted) and preserves explicit_delete_pending while ordinary rm remains available.
+    2. Transport failure on revocation reports path in errors (not deleted) and preserves
+       explicit_delete_pending without clearing the restriction on uncertain timeout.
+    3. Real POSIX unlink PermissionError (chmod 0500 on .wsfiles-grants-*) while ordinary rm in
+       work/uploads remains available causes revocation to fail, reporting path in errors (not deleted)
+       and preserving explicit_delete_pending.
+    4. Retire-stage failure after rm reports path in errors (not deleted), preserves
+       explicit_delete_pending, and does not prematurely delete the stored S3 object.
+    5. Subsequent retry of delete_workspace_files succeeds, leaves the file absent after the
+       restore process exits, retires the DB row, and deletes the S3 object."""
+    import json
+    import shlex
+    import subprocess
+    from pathlib import Path
+    from src.server.app.workspace_files import crud as ws_crud
+
+    owner = "user-crud-revoke"
+    ws_id = str(uuid.uuid4())
+    upload_env["workspaces"][ws_id] = {
+        "workspace_id": ws_id,
+        "user_id": owner,
+        "status": "running",
+        "dir_name": "CrudWS",
+    }
+
+    payload = b"CRUD_DELETE_REVOKE_SAFETY_" * 512
+    sha_hex = hashlib.sha256(payload).hexdigest()
+    created = await svc.initiate_chat_upload(
+        user_id=owner,
+        workspace_id=ws_id,
+        filename="protected_dataset.bin",
+        size_bytes=len(payload),
+    )
+    uid = created["upload_id"]
+    await svc.receive_chat_upload_part(
+        upload_id=uid, part_number=1, user_id=owner, stream=_bytes_stream(payload)
+    )
+    await svc.complete_chat_upload(upload_id=uid, user_id=owner)
+    await svc.confirm_request_chat_uploads(
+        [ChatUploadContext(upload_id=uid, name="protected_dataset.bin", size=len(payload))],
+        user_id=owner,
+        workspace_id=ws_id,
+    )
+    row = upload_env["ledger"].rows[uid]
+    obj_key = row["object_key"]
+    rel_path = svc.build_sandbox_upload_rel_path(row)
+
+    sbx = _RealPosixSandbox(str(tmp_path), dir_name="CrudWS")
+    layout = sbx.workspace()
+    abs_path = f"{layout.workspace}/{rel_path}"
+    os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+    with open(abs_path, "wb") as f:
+        f.write(payload)
+
+    # Wire ws_crud.delete_workspace_files dependencies to our workspace and real POSIX sandbox
+    ws_meta = {
+        "workspace_id": ws_id,
+        "user_id": owner,
+        "status": "running",
+        "dir_name": "CrudWS",
+        "computer_root_dir": str(tmp_path),
+    }
+
+    @asynccontextmanager
+    async def _fake_acquire_sandbox(_ws_id: str, _owner_id: str):
+        yield sbx, ws_meta
+
+    monkeypatch.setattr(
+        ws_crud,
+        "owned_workspace_on_computer",
+        create_autospec(ws_crud.owned_workspace_on_computer, return_value=ws_meta),
+    )
+    monkeypatch.setattr(
+        ws_crud,
+        "acquire_sandbox_to_change",
+        create_autospec(ws_crud.acquire_sandbox_to_change, side_effect=_fake_acquire_sandbox),
+    )
+    monkeypatch.setattr(
+        ws_crud,
+        "owner_work_dir",
+        create_autospec(ws_crud.owner_work_dir, return_value=layout.workspace),
+    )
+    monkeypatch.setattr(
+        ws_crud,
+        "owner_layout",
+        create_autospec(ws_crud.owner_layout, return_value=layout),
+    )
+
+    del_body = ws_crud.DeleteFilesRequest(paths=[rel_path])
+
+    # Start an independent restore process that has ALREADY passed its final DB check
+    # (holding a valid grant on disk in .wsfiles-grants-<uid_hex>) and is paused before acquiring
+    # the target lock to publish!
+    assert await db_chat_uploads.is_upload_retained_for_recovery(uid, ws_id) is True
+    grant_path, lock_path = await svc._create_restore_grant(sbx, abs_path, uid, "crud-restore-1")
+    grant_dir = os.path.dirname(grant_path)
+    assert os.path.exists(grant_path)
+
+    repo_root = str(Path(__file__).resolve().parents[3])
+    src_dir = os.path.join(repo_root, "src")
+    stage_path = str(tmp_path / "crud_restore_stage.bin")
+    with open(stage_path, "wb") as f:
+        f.write(payload)
+    restore_ready = tmp_path / "crud_restore_ready.flag"
+    restore_resume = tmp_path / "crud_restore_resume.flag"
+
+    fin_cmd = svc._build_stream_finalize_script(
+        stage_path,
+        abs_path,
+        len(payload),
+        sha_hex,
+        grant_path=grant_path,
+        lock_path=lock_path,
+    )
+    restore_proc = subprocess.Popen(
+        fin_cmd,
+        shell=True,
+        env={
+            **os.environ,
+            "PYTHONPATH": f"{src_dir}:{repo_root}",
+            "WSFILES_TEST_PAUSE_AFTER_LOCK_OPEN": f"{restore_ready}:{restore_resume}",
+        },
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        await _wait_for_flag(restore_ready)
+
+        # 1. Inject nonzero revocation command exit while ordinary rm remains available
+        async def _fail_revoke_nonzero(_fn: Any, *args: Any) -> _FakeExecResult | None:
+            cmd = str(args[0]) if args else ""
+            if "items, unlink_tgt = json.loads(sys.argv[1])" in cmd:
+                return _FakeExecResult(stdout="", stderr="injected revoke nonzero", exit_code=1)
+            return None
+
+        sbx.exec_interceptor = _fail_revoke_nonzero
+        res_nonzero = await ws_crud.delete_workspace_files(
+            workspace_id=ws_id, x_user_id=owner, body=del_body
+        )
+        assert res_nonzero["deleted"] == []
+        assert len(res_nonzero["errors"]) == 1
+        assert res_nonzero["errors"][0]["path"] == rel_path
+        # DB deletion restriction MUST be preserved!
+        assert upload_env["ledger"].rows[uid]["error"] == "explicit_delete_pending"
+        assert await db_chat_uploads.is_upload_retained_for_recovery(uid, ws_id) is False
+        assert os.path.exists(grant_path)
+        assert obj_key in upload_env["store"].objects
+
+        # 2. Inject transport timeout/exception on revocation while ordinary rm remains available
+        async def _fail_revoke_transport(_fn: Any, *args: Any) -> _FakeExecResult | None:
+            cmd = str(args[0]) if args else ""
+            if "items, unlink_tgt = json.loads(sys.argv[1])" in cmd:
+                raise TimeoutError("sandbox exec transport timeout")
+            return None
+
+        sbx.exec_interceptor = _fail_revoke_transport
+        res_transport = await ws_crud.delete_workspace_files(
+            workspace_id=ws_id, x_user_id=owner, body=del_body
+        )
+        assert res_transport["deleted"] == []
+        assert len(res_transport["errors"]) == 1
+        assert res_transport["errors"][0]["path"] == rel_path
+        # Uncertain remote timeout MUST NOT clear explicit_delete_pending!
+        assert upload_env["ledger"].rows[uid]["error"] == "explicit_delete_pending"
+        assert await db_chat_uploads.is_upload_retained_for_recovery(uid, ws_id) is False
+        assert os.path.exists(grant_path)
+        assert obj_key in upload_env["store"].objects
+        sbx.exec_interceptor = None
+
+        # 3. Real POSIX unlink PermissionError on grant_dir (chmod 0500) while ordinary rm in
+        #    work/uploads (0755) remains completely available!
+        os.chmod(grant_dir, 0o500)
+        try:
+            # Prove ordinary rm in work/uploads is available right now
+            probe_rm_file = f"{os.path.dirname(abs_path)}/ordinary_rm_ok.tmp"
+            with open(probe_rm_file, "wb") as f:
+                f.write(b"ok")
+            rm_probe = await sbx.execute_bash_command(f"rm -f {shlex.quote(probe_rm_file)}")
+            assert rm_probe["success"] is True and not os.path.exists(probe_rm_file)
+
+            res_perm = await ws_crud.delete_workspace_files(
+                workspace_id=ws_id, x_user_id=owner, body=del_body
+            )
+            assert res_perm["deleted"] == []
+            assert len(res_perm["errors"]) == 1
+            assert res_perm["errors"][0]["path"] == rel_path
+            assert "Permission denied" in res_perm["errors"][0]["detail"] or "PermissionError" in res_perm["errors"][0]["detail"]
+            assert upload_env["ledger"].rows[uid]["error"] == "explicit_delete_pending"
+            assert os.path.exists(grant_path)
+            assert os.path.exists(abs_path)
+            assert obj_key in upload_env["store"].objects
+        finally:
+            os.chmod(grant_dir, 0o700)
+
+        # 4. Retire-stage failure: begin_delete revokes grant_path and rm removes abs_path,
+        #    but retire_deleted_workspace_chat_uploads fails on its unlink_target=True pass!
+        async def _fail_retire_stage(_fn: Any, *args: Any) -> _FakeExecResult | None:
+            cmd = str(args[0]) if args else ""
+            if "items, unlink_tgt = json.loads(sys.argv[1])" in cmd and cmd.rstrip().endswith(" 1"):
+                return _FakeExecResult(stdout="", stderr="injected retire revocation failure", exit_code=1)
+            return None
+
+        sbx.exec_interceptor = _fail_retire_stage
+        res_retire_fail = await ws_crud.delete_workspace_files(
+            workspace_id=ws_id, x_user_id=owner, body=del_body
+        )
+        assert res_retire_fail["deleted"] == []
+        assert len(res_retire_fail["errors"]) == 1
+        assert res_retire_fail["errors"][0]["path"] == rel_path
+        # Grant was revoked during begin_delete, DB row stays ready + explicit_delete_pending
+        # (not prematurely retired or deleted from S3!)
+        assert not os.path.exists(grant_path)
+        assert upload_env["ledger"].rows[uid]["state"] == "ready"
+        assert upload_env["ledger"].rows[uid]["error"] == "explicit_delete_pending"
+        assert obj_key in upload_env["store"].objects
+
+        # Release the paused restore process: because its grant was revoked, it exits 5 (superseded)
+        # and cannot recreate abs_path!
+        restore_resume.write_text("go", encoding="utf-8")
+        rc_restore = await asyncio.to_thread(restore_proc.wait, 5.0)
+        assert rc_restore == 5
+        assert not os.path.exists(abs_path)
+
+        # 5. Subsequent retry of delete_workspace_files succeeds and retires DB row + S3 object!
+        sbx.exec_interceptor = None
+        res_retry_ok = await ws_crud.delete_workspace_files(
+            workspace_id=ws_id, x_user_id=owner, body=del_body
+        )
+        assert res_retry_ok == {"deleted": [rel_path], "errors": []}
+        assert not os.path.exists(abs_path)
+        assert upload_env["ledger"].rows[uid]["state"] == "aborted"
+        assert upload_env["ledger"].rows[uid]["cleaned_at"] is not None
+        assert obj_key not in upload_env["store"].objects
+    finally:
+        if os.path.exists(grant_dir):
+            os.chmod(grant_dir, 0o700)
+        if restore_proc.poll() is None:
+            restore_proc.kill()
+
+    # 6. Independent backend subprocess running rematerialize_workspace_chat_uploads with explicit
+    #    sandbox/layout against a shared file-backed DB state while parent backend process runs
+    #    ws_crud.delete_workspace_files (covering failed revocation -> restore recreates file while
+    #    API returned error, then successful retry -> file absent after all restore processes exit).
+    import sys
+
+    created_2 = await svc.initiate_chat_upload(
+        user_id=owner,
+        workspace_id=ws_id,
+        filename="multiprocess_backend.bin",
+        size_bytes=len(payload),
+    )
+    uid_2 = created_2["upload_id"]
+    await svc.receive_chat_upload_part(
+        upload_id=uid_2, part_number=1, user_id=owner, stream=_bytes_stream(payload)
+    )
+    await svc.complete_chat_upload(upload_id=uid_2, user_id=owner)
+    await svc.confirm_request_chat_uploads(
+        [ChatUploadContext(upload_id=uid_2, name="multiprocess_backend.bin", size=len(payload))],
+        user_id=owner,
+        workspace_id=ws_id,
+    )
+    row_2 = upload_env["ledger"].rows[uid_2]
+    obj_key_2 = row_2["object_key"]
+    rel_2 = svc.build_sandbox_upload_rel_path(row_2)
+    abs_2 = f"{layout.workspace}/{rel_2}"
+    del_body_2 = ws_crud.DeleteFilesRequest(paths=[rel_2])
+
+    shared_db_file = tmp_path / "shared_db_state.json"
+
+    def _sync_shared_db_to_disk() -> None:
+        r = upload_env["ledger"].rows[uid_2]
+        shared_db_file.write_text(
+            json.dumps(
+                {
+                    "upload_id": uid_2,
+                    "user_id": r["user_id"],
+                    "workspace_id": r["workspace_id"],
+                    "filename": r["filename"],
+                    "mime_type": r["mime_type"],
+                    "size_bytes": r["size_bytes"],
+                    "actual_sha256": r["actual_sha256"],
+                    "object_key": r["object_key"],
+                    "state": r["state"],
+                    "error": r.get("error"),
+                    "used_at": r["used_at"].isoformat() if r.get("used_at") else None,
+                    "cleaned_at": r["cleaned_at"].isoformat() if r.get("cleaned_at") else None,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    _sync_shared_db_to_disk()
+    orig_mark_pending = db_chat_uploads.mark_uploads_delete_pending
+    orig_clear_pending = db_chat_uploads.clear_uploads_delete_pending
+    orig_retire_by_ids = db_chat_uploads.retire_uploads_by_ids
+
+    async def _synced_mark_pending(upload_ids: Sequence[str], *, workspace_id: str) -> list[str]:
+        out = await orig_mark_pending(upload_ids, workspace_id=workspace_id)
+        _sync_shared_db_to_disk()
+        return out
+
+    async def _synced_clear_pending(upload_ids: Sequence[str], *, workspace_id: str) -> int:
+        out = await orig_clear_pending(upload_ids, workspace_id=workspace_id)
+        _sync_shared_db_to_disk()
+        return out
+
+    async def _synced_retire_by_ids(
+        upload_ids: Sequence[str], *, workspace_id: str
+    ) -> list[dict[str, Any]]:
+        out = await orig_retire_by_ids(upload_ids, workspace_id=workspace_id)
+        _sync_shared_db_to_disk()
+        return out
+
+    monkeypatch.setattr(db_chat_uploads, "mark_uploads_delete_pending", _synced_mark_pending)
+    monkeypatch.setattr(db_chat_uploads, "clear_uploads_delete_pending", _synced_clear_pending)
+    monkeypatch.setattr(db_chat_uploads, "retire_uploads_by_ids", _synced_retire_by_ids)
+
+    backend_worker_script = (
+        "import asyncio, json, os, shlex, sys\n"
+        "from ptc_agent.core.paths import WorkspaceLayout\n"
+        "from ptc_agent.core.project_context import ProjectContext\n"
+        "from src.dalton import chat_upload_storage\n"
+        "from src.dalton.database import chat_uploads as db\n"
+        "from src.dalton.services import chat_uploads as svc\n"
+        "root_dir, ws_id, owner, db_file, ready_f, resume_f, out_f, payload_hex = sys.argv[1:9]\n"
+        "payload = bytes.fromhex(payload_hex)\n"
+        "def _read_row(): return json.loads(open(db_file, 'r', encoding='utf-8').read())\n"
+        "class _SubprocSandbox:\n"
+        "    provider = type('P', (), {'direct_blob_transfer': False})()\n"
+        "    def __init__(self):\n"
+        "        self.config = type('C', (), {'filesystem': type('F', (), {'working_directory': root_dir})()})()\n"
+        "        s = self\n"
+        "        class _R:\n"
+        "            @staticmethod\n"
+        "            async def exec(cmd, **kw): return await s._runtime_call('exec', cmd, **kw)\n"
+        "            @staticmethod\n"
+        "            async def upload_file(data, dest, **kw): return await s._runtime_call('upload_file', data, dest, **kw)\n"
+        "        self.runtime = _R()\n"
+        "    def workspace(self, project=None):\n"
+        "        return WorkspaceLayout(root=root_dir, dir_name='CrudWS')\n"
+        "    def validate_path(self, fp, project=None): return True\n"
+        "    def path_write_lock(self, p):\n"
+        "        from contextlib import asynccontextmanager\n"
+        "        @asynccontextmanager\n"
+        "        async def _lk(): yield\n"
+        "        return _lk()\n"
+        "    async def _runtime_call(self, fn, *args, **kw):\n"
+        "        if fn == self.runtime.upload_file or (len(args) == 2 and isinstance(args[0], (bytes, bytearray))):\n"
+        "            os.makedirs(os.path.dirname(args[1]), exist_ok=True)\n"
+        "            open(args[1], 'wb').write(args[0])\n"
+        "            return type('Res', (), {'stdout': '', 'stderr': '', 'exit_code': 0})()\n"
+        "        cmd = str(args[0])\n"
+        "        if cmd.startswith('df -Pk'):\n"
+        "            return type('Res', (), {'stdout': f'Filesystem 1024-blocks Used Available Capacity Mounted on\\noverlay 52428800 1048576 20971520 5% {root_dir}\\n', 'stderr': '', 'exit_code': 0})()\n"
+        "        p = await asyncio.create_subprocess_shell(cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)\n"
+        "        o, e = await p.communicate()\n"
+        "        return type('Res', (), {'stdout': o.decode(), 'stderr': e.decode(), 'exit_code': p.returncode or 0})()\n"
+        "svc.get_dalton_settings = lambda: type('S', (), {'enabled': True})()\n"
+        "chat_upload_storage.is_chat_upload_storage_configured = lambda: True\n"
+        "chat_upload_storage.iter_stored_object_chunks = lambda k, chunk_size=4194304: iter([payload])\n"
+        "async def _list_ret(w, *, conn=None):\n"
+        "    r = _read_row()\n"
+        "    return [r] if r['state'] == 'ready' and not r.get('error') else []\n"
+        "async def _is_ret(u, w, *, conn=None):\n"
+        "    r = _read_row()\n"
+        "    return r['upload_id'] == u and r['state'] == 'ready' and not r.get('error')\n"
+        "async def _ws_perm(w, *, conn=None):\n"
+        "    return {'workspace_id': ws_id, 'user_id': owner, 'status': 'running'}\n"
+        "db.list_retained_workspace_uploads = _list_ret\n"
+        "db.is_upload_retained_for_recovery = _is_ret\n"
+        "db.get_workspace_permission_row = _ws_perm\n"
+        "async def _hook(u, abs_t):\n"
+        "    open(ready_f, 'w').write(u)\n"
+        "    while not os.path.exists(resume_f): await asyncio.sleep(0.01)\n"
+        "svc._AFTER_FINAL_RECOVERY_DB_CHECK_HOOK = _hook\n"
+        "async def _main():\n"
+        "    sbx = _SubprocSandbox()\n"
+        "    res = await svc.rematerialize_workspace_chat_uploads(ws_id, sbx, layout=sbx.workspace())\n"
+        "    open(out_f, 'w').write(json.dumps(res))\n"
+        "asyncio.run(_main())\n"
+    )
+
+    b1_ready = tmp_path / "b1_ready.flag"
+    b1_resume = tmp_path / "b1_resume.flag"
+    b1_out = tmp_path / "b1_out.json"
+    b2_ready = tmp_path / "b2_ready.flag"
+    b2_resume = tmp_path / "b2_resume.flag"
+    b2_out = tmp_path / "b2_out.json"
+
+    proc_b1 = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            backend_worker_script,
+            sbx.root_dir,
+            ws_id,
+            owner,
+            str(shared_db_file),
+            str(b1_ready),
+            str(b1_resume),
+            str(b1_out),
+            payload.hex(),
+        ],
+        env={**os.environ, "PYTHONPATH": f"{src_dir}:{repo_root}"},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    proc_b2 = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            backend_worker_script,
+            sbx.root_dir,
+            ws_id,
+            owner,
+            str(shared_db_file),
+            str(b2_ready),
+            str(b2_resume),
+            str(b2_out),
+            payload.hex(),
+        ],
+        env={**os.environ, "PYTHONPATH": f"{src_dir}:{repo_root}"},
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        await _wait_for_flag(b1_ready)
+        await _wait_for_flag(b2_ready)
+
+        # Both independent backend processes have created their grants and passed their final DB checks!
+        # Inject nonzero revocation failure in parent CRUD delete:
+        sbx.exec_interceptor = _fail_revoke_nonzero
+        res_b_fail = await ws_crud.delete_workspace_files(
+            workspace_id=ws_id, x_user_id=owner, body=del_body_2
+        )
+        assert res_b_fail["deleted"] == []
+        assert len(res_b_fail["errors"]) == 1
+        assert upload_env["ledger"].rows[uid_2]["error"] == "explicit_delete_pending"
+
+        # Allow Backend Process 1 to resume while revocation had failed:
+        # Process 1 recreates abs_2, proving why res_b_fail MUST NOT have reported deleted=[rel_2]!
+        sbx.exec_interceptor = None
+        b1_resume.write_text("go", encoding="utf-8")
+        rc_b1 = await asyncio.to_thread(proc_b1.wait, 5.0)
+        assert rc_b1 == 0
+        assert json.loads(b1_out.read_text(encoding="utf-8")) == {"restored": 1, "errors": 0}
+        assert os.path.exists(abs_2)
+
+        # Now retry ws_crud.delete_workspace_files while Backend Process 2 is still paused after its
+        # final DB check: the retry revokes Backend Process 2's grant, removes abs_2, and retires uid_2!
+        res_b_ok = await ws_crud.delete_workspace_files(
+            workspace_id=ws_id, x_user_id=owner, body=del_body_2
+        )
+        assert res_b_ok == {"deleted": [rel_2], "errors": []}
+
+        # Resume Backend Process 2: its grant was revoked, so it exits with restored=0 and abs_2 stays absent!
+        b2_resume.write_text("go", encoding="utf-8")
+        rc_b2 = await asyncio.to_thread(proc_b2.wait, 5.0)
+        assert rc_b2 == 0
+        assert json.loads(b2_out.read_text(encoding="utf-8")) == {"restored": 0, "errors": 0}
+        assert not os.path.exists(abs_2)
+        assert upload_env["ledger"].rows[uid_2]["state"] == "aborted"
+        assert obj_key_2 not in upload_env["store"].objects
+    finally:
+        for p in (proc_b1, proc_b2):
+            if p.poll() is None:
+                p.kill()

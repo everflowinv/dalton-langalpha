@@ -2519,6 +2519,87 @@ def _failed_steer_entry(row: Dict[str, Any]) -> Dict[str, Any]:
     return entry
 
 
+async def _record_durable_failed_steer(
+    conn, row: Dict[str, Any], entry: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Persist ``entry`` onto the turn's ``conversation_responses.replay_facts`` in ``conn``."""
+    from src.server.database import replay_facts as facts_db
+
+    payload = row.get("payload") or {}
+    if (
+        str(payload.get("target") or "thread") != "thread"
+        or bool(payload.get("chat_app"))
+    ):
+        return entry
+    thread_id = str(row.get("conversation_thread_id") or "")
+    target_run_id = str(
+        payload.get("failed_run_id") or row.get("run_id") or ""
+    )
+    updated = await facts_db.append_failed_steer(
+        thread_id,
+        entry,
+        target_run_id=target_run_id or None,
+        conn=conn,
+    )
+    if updated and updated.get("turn_index") is not None:
+        return {**entry, "turn_index": updated["turn_index"]}
+    return entry
+
+
+def merge_failed_steer_entries(
+    durable_rows: List[Dict[str, Any]],
+    outbox_rows: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Merge durable ``replay_facts -> 'failed_steers'`` rows with live/recent ``hook_outbox`` rows."""
+    merged: List[Dict[str, Any]] = []
+    seen_jobs: set[str] = set()
+    seen_reqs: set[str] = set()
+
+    for r in durable_rows:
+        turn_index = r.get("turn_index")
+        raw_items = r.get("failed_steers")
+        if not isinstance(raw_items, list):
+            continue
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            jid = str(item.get("job_id") or "").strip()
+            rkey = str(item.get("request_key") or "").strip()
+            if (jid and jid in seen_jobs) or (rkey and rkey in seen_reqs):
+                continue
+            if jid:
+                seen_jobs.add(jid)
+            if rkey:
+                seen_reqs.add(rkey)
+            entry = dict(item)
+            if entry.get("turn_index") is None and turn_index is not None:
+                entry["turn_index"] = turn_index
+            merged.append(entry)
+
+    for r in outbox_rows:
+        entry = {
+            **_failed_steer_entry(dict(r)),
+            "turn_index": r.get("turn_index"),
+        }
+        jid = str(entry.get("job_id") or "").strip()
+        rkey = str(entry.get("request_key") or "").strip()
+        if (jid and jid in seen_jobs) or (rkey and rkey in seen_reqs):
+            continue
+        if jid:
+            seen_jobs.add(jid)
+        if rkey:
+            seen_reqs.add(rkey)
+        merged.append(entry)
+
+    merged.sort(
+        key=lambda e: (
+            str(e.get("created_at") or e.get("timestamp") or ""),
+            str(e.get("job_id") or ""),
+        )
+    )
+    return merged
+
+
 async def fail_held_steer_job(
     job_id: str,
     *,
@@ -2552,7 +2633,8 @@ async def fail_held_steer_job(
                       AND o.status = 'pending'
                       AND o.payload->>'steered_run_id' = %(owner)s::text
                       AND {_steer_sql(_LIVE_STEER_SQL)}
-                    RETURNING o.hook_outbox_id, o.payload, o.created_at
+                    RETURNING o.hook_outbox_id, o.conversation_thread_id,
+                              o.run_id, o.payload, o.created_at
                     """,
                     {
                         "job_id": job_id,
@@ -2563,7 +2645,29 @@ async def fail_held_steer_job(
                 closed = [dict(r) for r in await cur.fetchall()]
                 if closed:
                     await _give_back_comments(conn, closed)
-                    return _failed_steer_entry(closed[0])
+                    entry = _failed_steer_entry(closed[0])
+                    return await _record_durable_failed_steer(
+                        conn, closed[0], entry
+                    )
+                await cur.execute(
+                    """
+                    SELECT o.hook_outbox_id, o.conversation_thread_id,
+                           o.run_id, o.payload, o.created_at
+                    FROM hook_outbox o
+                    WHERE o.hook_outbox_id = %(job_id)s::uuid
+                      AND o.status = 'done'
+                      AND o.payload->>'outcome' = 'failed'
+                      AND o.payload->>'failed_run_id' = %(owner)s::text
+                    """,
+                    {"job_id": job_id, "owner": owner_id},
+                )
+                existing = await cur.fetchone()
+                if existing:
+                    row_dict = dict(existing)
+                    entry = _failed_steer_entry(row_dict)
+                    return await _record_durable_failed_steer(
+                        conn, row_dict, entry
+                    )
                 return None
 
 
@@ -2684,23 +2788,51 @@ async def finish_claimed_steer(
     """Close a steer its executor holds, fenced to the executor's lease: a
     live agent that took the row since leaves this a no-op."""
     async with pool.get_db_connection() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                f"""
-                UPDATE hook_outbox o
-                SET {_closed_steer_set()} || %(patch)s::jsonb
-                WHERE o.hook_outbox_id = %(job_id)s::uuid
-                  AND o.status = 'claimed' AND o.attempts = %(attempts)s
-                  AND {_steer_sql(_LIVE_STEER_SQL)}
-                """,
-                {
-                    "job_id": job_id,
-                    "attempts": attempts,
-                    "outcome": outcome,
-                    "patch": SafeJson(patch or {}),
-                },
-            )
-            return cur.rowcount > 0
+        async with conn.transaction():
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    f"""
+                    UPDATE hook_outbox o
+                    SET {_closed_steer_set()} || %(patch)s::jsonb
+                    WHERE o.hook_outbox_id = %(job_id)s::uuid
+                      AND o.status = 'claimed' AND o.attempts = %(attempts)s
+                      AND {_steer_sql(_LIVE_STEER_SQL)}
+                    RETURNING o.hook_outbox_id, o.conversation_thread_id,
+                              o.run_id, o.payload, o.created_at
+                    """,
+                    {
+                        "job_id": job_id,
+                        "attempts": attempts,
+                        "outcome": outcome,
+                        "patch": SafeJson(patch or {}),
+                    },
+                )
+                closed = [dict(r) for r in await cur.fetchall()]
+                if closed:
+                    if outcome == "failed":
+                        await _give_back_comments(conn, closed)
+                        entry = _failed_steer_entry(closed[0])
+                        await _record_durable_failed_steer(conn, closed[0], entry)
+                    return True
+                if outcome == "failed":
+                    await cur.execute(
+                        """
+                        SELECT o.hook_outbox_id, o.conversation_thread_id,
+                               o.run_id, o.payload, o.created_at
+                        FROM hook_outbox o
+                        WHERE o.hook_outbox_id = %(job_id)s::uuid
+                          AND o.status = 'done'
+                          AND o.payload->>'outcome' = 'failed'
+                        """,
+                        {"job_id": job_id},
+                    )
+                    existing = await cur.fetchone()
+                    if existing:
+                        row_dict = dict(existing)
+                        entry = _failed_steer_entry(row_dict)
+                        await _record_durable_failed_steer(conn, row_dict, entry)
+                        return True
+                return False
 
 
 # A thread's steers, for settling at its run's ending or stop.
@@ -3166,6 +3298,49 @@ async def list_pending_steers(thread_id: str) -> List[Dict[str, Any]]:
                 {"okey": steer_ordering_key(thread_id)},
             )
             return [_returned_entry(dict(r)) for r in await cur.fetchall()]
+
+
+# DALTON-HOOK(chat-large-upload): durable failed steers for /status reconciliation and post-run_end parked failures
+async def list_failed_steers_for_status(thread_id: str) -> List[Dict[str, Any]]:
+    """Return permanently failed main-thread steers for ``thread_id`` from durable facts + outbox."""
+    async with pool.get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT r.turn_index,
+                       r.replay_facts -> 'failed_steers' AS failed_steers
+                FROM conversation_responses r
+                WHERE r.conversation_thread_id = %s::uuid
+                  AND r.replay_facts ? 'failed_steers'
+                ORDER BY r.turn_index ASC, r.attempt_no ASC
+                """,
+                (thread_id,),
+            )
+            durable_rows = [dict(r) for r in await cur.fetchall()]
+
+            await cur.execute(
+                """
+                SELECT o.hook_outbox_id, o.run_id, o.payload, o.created_at,
+                       COALESCE(
+                           (SELECT r.turn_index FROM conversation_responses r
+                            WHERE r.conversation_response_id = NULLIF(o.payload->>'failed_run_id', '')::uuid),
+                           (SELECT r.turn_index FROM conversation_responses r
+                            WHERE r.conversation_response_id = o.run_id)
+                       ) AS turn_index
+                FROM hook_outbox o
+                WHERE o.conversation_thread_id = %s::uuid
+                  AND o.hook_type = 'steer'
+                  AND o.status = 'done'
+                  AND o.payload->>'outcome' = 'failed'
+                  AND COALESCE(o.payload->>'target', 'thread') = 'thread'
+                  AND NOT COALESCE((o.payload->>'chat_app')::boolean, false)
+                ORDER BY o.created_at ASC, o.hook_outbox_id ASC
+                """,
+                (thread_id,),
+            )
+            outbox_rows = [dict(r) for r in await cur.fetchall()]
+
+    return merge_failed_steer_entries(durable_rows, outbox_rows)
 
 
 async def list_taken_hand_offs(thread_id: str, run_ids: List[str]) -> List[str]:

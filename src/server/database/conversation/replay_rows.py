@@ -191,8 +191,19 @@ async def get_replay_thread_data(thread_id: str) -> ThreadRows | None:
             await cur.execute(RUN_FACTS_SQL, (thread_id,))
             run_facts = [dict(r) for r in await cur.fetchall()]
 
-            # 8. DALTON-HOOK(chat-large-upload): permanently failed main-thread steers
-            from src.server.database.runs.outbox import _failed_steer_entry
+            # 8. DALTON-HOOK(chat-large-upload): permanently failed main-thread steers (durable replay_facts + outbox)
+            from src.server.database.runs.outbox import merge_failed_steer_entries
+
+            await cur.execute(
+                """SELECT r.turn_index,
+                          r.replay_facts -> 'failed_steers' AS failed_steers
+                   FROM conversation_responses r
+                   WHERE r.conversation_thread_id = %s::uuid
+                     AND r.replay_facts ? 'failed_steers'
+                   ORDER BY r.turn_index ASC, r.attempt_no ASC""",
+                (thread_id,),
+            )
+            durable_failed_rows = [dict(r) for r in await cur.fetchall()]
 
             await cur.execute(
                 """SELECT o.hook_outbox_id, o.run_id, o.payload, o.created_at,
@@ -212,10 +223,10 @@ async def get_replay_thread_data(thread_id: str) -> ThreadRows | None:
                    ORDER BY o.created_at ASC, o.hook_outbox_id ASC""",
                 (thread_id,),
             )
-            failed_steers = [
-                {**_failed_steer_entry(dict(r)), "turn_index": r.get("turn_index")}
-                for r in await cur.fetchall()
-            ]
+            outbox_failed_rows = [dict(r) for r in await cur.fetchall()]
+            failed_steers = merge_failed_steer_entries(
+                durable_failed_rows, outbox_failed_rows
+            )
 
     return ThreadRows(
         thread_id=thread_id,

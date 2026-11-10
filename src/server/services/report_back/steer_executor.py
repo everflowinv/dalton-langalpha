@@ -13,6 +13,8 @@ import asyncio
 import logging
 import uuid
 
+from src.server.services.report_back.subagent import publish_cleared_wake
+
 logger = logging.getLogger(__name__)
 
 _LOG = "[STEER]"
@@ -159,6 +161,7 @@ async def execute_steer(job: dict) -> None:
                         thread_id=thread_id,
                         request_key=payload["request_key"],
                     )
+                await publish_cleared_wake(thread_id)
                 return
             except SteerAttachmentTransientError:
                 await repark()

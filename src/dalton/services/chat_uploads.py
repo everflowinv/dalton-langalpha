@@ -11,11 +11,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import AsyncExitStack
 from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
+import json
 import logging
 import math
 import posixpath
@@ -933,11 +934,20 @@ async def _cleanup_storage_objects(
         return False
 
     aborted = True
-    if store_upload_id:
-        aborted = await asyncio.to_thread(
-            storage.abort_multipart_upload, object_key, store_upload_id
+    try:
+        if store_upload_id:
+            aborted = await asyncio.to_thread(
+                storage.abort_multipart_upload, object_key, store_upload_id
+            )
+        deleted = await asyncio.to_thread(storage.delete_object, object_key)
+    except Exception as exc:
+        logger.warning(
+            "Storage cleanup error for chat upload %s (%s): %s",
+            uid,
+            object_key,
+            exc,
         )
-    deleted = await asyncio.to_thread(storage.delete_object, object_key)
+        return False
     if not (aborted and deleted):
         return False
 
@@ -1921,20 +1931,349 @@ async def _probe_sandbox_file_matches(
     return getattr(probe, "exit_code", 1) == 0
 
 
+_AFTER_FINAL_RECOVERY_DB_CHECK_HOOK: Any = None
+
+
+async def _create_restore_grant(
+    sandbox: Any, abs_target_path: str, upload_id: str, attempt_id: str
+) -> tuple[str, str]:
+    """Create a per-attempt target restore grant file under a target-scoped flock before the final DB check."""
+    uid_hex = upload_id.replace("-", "")[:12]
+    parent_dir = posixpath.dirname(abs_target_path)
+    grant_dir = f"{parent_dir}/.wsfiles-grants-{uid_hex}"
+    grant_path = f"{grant_dir}/{attempt_id}"
+    lock_path = f"{parent_dir}/.wsfiles-tlock-{uid_hex}"
+    runtime = getattr(sandbox, "runtime", None)
+    if runtime is None or not hasattr(sandbox, "_runtime_call"):
+        raise RuntimeError("Sandbox runtime unavailable for restore grant creation")
+    script = (
+        "import fcntl, os, pathlib, sys\n"
+        "parent, lock_p, grant_d, grant_p = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]\n"
+        "os.makedirs(parent, exist_ok=True)\n"
+        "flags = os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0)\n"
+        "while True:\n"
+        "    fd = os.open(lock_p, flags, 0o600)\n"
+        "    try:\n"
+        "        fcntl.flock(fd, fcntl.LOCK_EX)\n"
+        "        try:\n"
+        "            st_fd = os.fstat(fd)\n"
+        "            st_path = os.lstat(lock_p)\n"
+        "        except FileNotFoundError:\n"
+        "            continue\n"
+        "        if (st_fd.st_dev, st_fd.st_ino) != (st_path.st_dev, st_path.st_ino):\n"
+        "            continue\n"
+        "        os.makedirs(grant_d, exist_ok=True)\n"
+        "        pathlib.Path(grant_p).write_bytes(b'1')\n"
+        "        break\n"
+        "    finally:\n"
+        "        try: os.close(fd)\n"
+        "        except OSError: pass\n"
+    )
+    res = await sandbox._runtime_call(
+        runtime.exec,
+        f"python3 -c {shlex.quote(script)} {shlex.quote(parent_dir)} "
+        f"{shlex.quote(lock_path)} {shlex.quote(grant_dir)} {shlex.quote(grant_path)}",
+        timeout=15,
+        retry_policy=RetryPolicy.SAFE,
+    )
+    if getattr(res, "exit_code", 1) != 0:
+        detail = getattr(res, "stderr", None) or getattr(res, "stdout", None) or getattr(res, "exit_code", 1)
+        raise RuntimeError(f"Failed to create restore grant for {abs_target_path}: {detail}")
+    return grant_path, lock_path
+
+
+async def _cleanup_restore_grant(
+    sandbox: Any, grant_path: str, lock_path: str = ""
+) -> None:
+    """Remove only this attempt's disposable restore grant without unlinking the shared target lock."""
+    del lock_path
+    if not grant_path:
+        return
+    runtime = getattr(sandbox, "runtime", None)
+    if runtime is None or not hasattr(sandbox, "_runtime_call"):
+        raise RuntimeError("Sandbox runtime unavailable for restore grant cleanup")
+    script = (
+        "import os, sys\n"
+        "grant_p = sys.argv[1]\n"
+        "try:\n"
+        "    os.unlink(grant_p)\n"
+        "except FileNotFoundError:\n"
+        "    pass\n"
+        "grant_d = os.path.dirname(grant_p)\n"
+        "if os.path.basename(grant_d).startswith('.wsfiles-grants-'):\n"
+        "    try:\n"
+        "        os.rmdir(grant_d)\n"
+        "    except OSError:\n"
+        "        pass\n"
+    )
+    res = await sandbox._runtime_call(
+        runtime.exec,
+        f"python3 -c {shlex.quote(script)} {shlex.quote(grant_path)}",
+        timeout=15,
+        retry_policy=RetryPolicy.SAFE,
+    )
+    if getattr(res, "exit_code", 1) != 0:
+        detail = getattr(res, "stderr", None) or getattr(res, "stdout", None) or getattr(res, "exit_code", 1)
+        raise RuntimeError(f"Failed to clean up restore grant {grant_path}: {detail}")
+
+
+async def _revoke_restore_grants_in_sandbox(
+    sandbox: Any,
+    layout: WorkspaceLayout,
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    unlink_target: bool = False,
+    pause_in_lock_expr: str = "",
+) -> None:
+    """Under per-target flock, revoke in-flight restore grants (and optionally unlink target)."""
+    if not rows or sandbox is None:
+        return
+    targets: list[tuple[str, str, str, str, str]] = []
+    for row in rows:
+        uid = str(row.get("upload_id") or "")
+        if not uid:
+            continue
+        uid_hex = uid.replace("-", "")[:12]
+        rel_path = build_sandbox_upload_rel_path(row)
+        abs_path = posixpath.join(layout.workspace, rel_path)
+        parent_dir = posixpath.dirname(abs_path)
+        lock_path = f"{parent_dir}/.wsfiles-tlock-{uid_hex}"
+        grant_dir = f"{parent_dir}/.wsfiles-grants-{uid_hex}"
+        grant_prefix = f".wsfiles-grant-{uid_hex}-"
+        targets.append((parent_dir, lock_path, grant_dir, grant_prefix, abs_path))
+    if not targets:
+        return
+    runtime = getattr(sandbox, "runtime", None)
+    if runtime is None or not hasattr(sandbox, "_runtime_call"):
+        raise RuntimeError("Sandbox runtime unavailable for restore grant revocation")
+    hook_block = f"        {pause_in_lock_expr}\n" if pause_in_lock_expr else ""
+    script = (
+        "import fcntl, json, os, sys, time\n"
+        "items, unlink_tgt = json.loads(sys.argv[1]), sys.argv[2] == '1'\n"
+        "flags = os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0)\n"
+        "for parent, lock_p, grant_d, g_pref, abs_p in items:\n"
+        "    if not os.path.isdir(parent):\n"
+        "        continue\n"
+        "    while True:\n"
+        "        fd = os.open(lock_p, flags, 0o600)\n"
+        "        try:\n"
+        "            fcntl.flock(fd, fcntl.LOCK_EX)\n"
+        "            try:\n"
+        "                st_fd = os.fstat(fd)\n"
+        "                st_path = os.lstat(lock_p)\n"
+        "            except FileNotFoundError:\n"
+        "                os.close(fd)\n"
+        "                continue\n"
+        "            if (st_fd.st_dev, st_fd.st_ino) != (st_path.st_dev, st_path.st_ino):\n"
+        "                os.close(fd)\n"
+        "                continue\n"
+        "            break\n"
+        "        except BaseException:\n"
+        "            try: os.close(fd)\n"
+        "            except OSError: pass\n"
+        "            raise\n"
+        "    try:\n"
+        "        pause_env = os.environ.get('WSFILES_TEST_PAUSE_IN_REVOKE_LOCK')\n"
+        "        if pause_env:\n"
+        "            r_f, g_f = pause_env.split(':', 1)\n"
+        "            with open(r_f, 'w', encoding='utf-8') as rf:\n"
+        "                rf.write(f'{os.getpid()}:{os.fstat(fd).st_ino}')\n"
+        "            dl = time.monotonic() + 15.0\n"
+        "            while not os.path.exists(g_f) and time.monotonic() < dl:\n"
+        "                time.sleep(0.01)\n"
+        f"{hook_block}"
+        "        if os.path.lexists(grant_d):\n"
+        "            for g_name in list(os.listdir(grant_d)):\n"
+        "                try:\n"
+        "                    os.unlink(os.path.join(grant_d, g_name))\n"
+        "                except FileNotFoundError:\n"
+        "                    pass\n"
+        "            try:\n"
+        "                os.rmdir(grant_d)\n"
+        "            except OSError:\n"
+        "                pass\n"
+        "        for name in list(os.listdir(parent)):\n"
+        "            if name.startswith(g_pref):\n"
+        "                try:\n"
+        "                    os.unlink(os.path.join(parent, name))\n"
+        "                except FileNotFoundError:\n"
+        "                    pass\n"
+        "        if unlink_tgt:\n"
+        "            try:\n"
+        "                os.unlink(abs_p)\n"
+        "            except FileNotFoundError:\n"
+        "                pass\n"
+        "    finally:\n"
+        "        os.close(fd)\n"
+    )
+    res = await sandbox._runtime_call(
+        runtime.exec,
+        f"python3 -c {shlex.quote(script)} {shlex.quote(json.dumps(targets))} "
+        f"{'1' if unlink_target else '0'}",
+        timeout=20,
+        retry_policy=RetryPolicy.SAFE,
+    )
+    if getattr(res, "exit_code", 1) != 0:
+        detail = getattr(res, "stderr", None) or getattr(res, "stdout", None) or getattr(res, "exit_code", 1)
+        raise RuntimeError(f"Failed to revoke restore grants in sandbox: {detail}")
+
+
+def _build_stream_finalize_script(
+    stage_path: str,
+    abs_target_path: str = "",
+    expected_size: int = 0,
+    expected_sha256: str = "",
+    *,
+    abs_path: str = "",
+    part_path: str = "",
+    pause_hook_expr: str = "",
+    lock_open_hook_expr: str = "",
+    grant_path: str = "",
+    lock_path: str = "",
+) -> str:
+    """Build descriptor-pinned verification and publication script for a streamed stage file."""
+    del part_path
+    target_path = abs_target_path or abs_path
+    open_hook_block = f"            {lock_open_hook_expr}\n" if lock_open_hook_expr else ""
+    hook_block = f"    {pause_hook_expr}\n" if pause_hook_expr else ""
+    body = (
+        "import fcntl, hashlib, os, stat, sys, time\n"
+        "stage, target, exp_sz, exp_sha = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]\n"
+        "grant_p = sys.argv[5] if len(sys.argv) > 5 else ''\n"
+        "lock_p = sys.argv[6] if len(sys.argv) > 6 else ''\n"
+        "flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)\n"
+        "try:\n"
+        "    fd = os.open(stage, flags)\n"
+        "except OSError:\n"
+        "    sys.exit(2)\n"
+        "tlock_fd = None\n"
+        "try:\n"
+        "    st0 = os.fstat(fd)\n"
+        "    if not stat.S_ISREG(st0.st_mode) or st0.st_size != exp_sz:\n"
+        "        try: os.unlink(stage)\n"
+        "        except OSError: pass\n"
+        "        sys.exit(2)\n"
+        "    h = hashlib.sha256(); n = 0\n"
+        "    while True:\n"
+        "        b = os.read(fd, 1048576)\n"
+        "        if not b: break\n"
+        "        n += len(b); h.update(b)\n"
+        "    if n != exp_sz or h.hexdigest() != exp_sha:\n"
+        "        try: os.unlink(stage)\n"
+        "        except OSError: pass\n"
+        "        sys.exit(2)\n"
+        "    if lock_p:\n"
+        "        os.makedirs(os.path.dirname(lock_p), exist_ok=True)\n"
+        "        lflags = os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0)\n"
+        "        paused_open = False\n"
+        "        while True:\n"
+        "            tlock_fd = os.open(lock_p, lflags, 0o600)\n"
+        "            if not paused_open:\n"
+        "                paused_open = True\n"
+        "                open_env = os.environ.get('WSFILES_TEST_PAUSE_AFTER_LOCK_OPEN')\n"
+        "                if open_env:\n"
+        "                    r_f, g_f = open_env.split(':', 1)\n"
+        "                    with open(r_f, 'w', encoding='utf-8') as rf:\n"
+        "                        rf.write(f'{os.getpid()}:{os.fstat(tlock_fd).st_ino}')\n"
+        "                    dl = time.monotonic() + 15.0\n"
+        "                    while not os.path.exists(g_f) and time.monotonic() < dl:\n"
+        "                        time.sleep(0.01)\n"
+        f"{open_hook_block}"
+        "            fcntl.flock(tlock_fd, fcntl.LOCK_EX)\n"
+        "            try:\n"
+        "                st_tfd = os.fstat(tlock_fd)\n"
+        "                st_tlp = os.lstat(lock_p)\n"
+        "            except FileNotFoundError:\n"
+        "                os.close(tlock_fd)\n"
+        "                tlock_fd = None\n"
+        "                continue\n"
+        "            if (st_tfd.st_dev, st_tfd.st_ino) != (st_tlp.st_dev, st_tlp.st_ino):\n"
+        "                os.close(tlock_fd)\n"
+        "                tlock_fd = None\n"
+        "                continue\n"
+        "            break\n"
+        "    if grant_p:\n"
+        "        if not os.path.exists(grant_p):\n"
+        "            try: os.unlink(stage)\n"
+        "            except OSError: pass\n"
+        "            sys.exit(5)\n"
+        "        try: os.unlink(grant_p)\n"
+        "        except OSError: pass\n"
+        "        grant_d = os.path.dirname(grant_p)\n"
+        "        if os.path.basename(grant_d).startswith('.wsfiles-grants-'):\n"
+        "            try: os.rmdir(grant_d)\n"
+        "            except OSError: pass\n"
+        "    grant_env = os.environ.get('WSFILES_TEST_PAUSE_AFTER_GRANT_CHECK')\n"
+        "    if grant_env:\n"
+        "        r_f, g_f = grant_env.split(':', 1)\n"
+        "        with open(r_f, 'w', encoding='utf-8') as rf:\n"
+        "            rf.write(f'{os.getpid()}:{target}')\n"
+        "        dl = time.monotonic() + 15.0\n"
+        "        while not os.path.exists(g_f) and time.monotonic() < dl:\n"
+        "            time.sleep(0.01)\n"
+        f"{hook_block}"
+        "    st1 = os.fstat(fd)\n"
+        "    try:\n"
+        "        st_link = os.lstat(stage)\n"
+        "    except OSError:\n"
+        "        sys.stderr.write('Staging descriptor identity changed before publication\\n')\n"
+        "        sys.exit(3)\n"
+        "    if (\n"
+        "        not stat.S_ISREG(st_link.st_mode)\n"
+        "        or (st_link.st_dev, st_link.st_ino) != (st0.st_dev, st0.st_ino)\n"
+        "        or (st1.st_dev, st1.st_ino) != (st0.st_dev, st0.st_ino)\n"
+        "        or st_link.st_size != exp_sz\n"
+        "        or st1.st_size != exp_sz\n"
+        "    ):\n"
+        "        sys.stderr.write('Staging descriptor identity changed before publication\\n')\n"
+        "        sys.exit(3)\n"
+        "    try:\n"
+        "        os.fchmod(fd, 0o644)\n"
+        "    except (AttributeError, OSError):\n"
+        "        os.chmod(stage, 0o644)\n"
+        "    os.replace(stage, target)\n"
+        "    st_out = os.lstat(target)\n"
+        "    if not stat.S_ISREG(st_out.st_mode) or st_out.st_size != exp_sz:\n"
+        "        sys.exit(4)\n"
+        "finally:\n"
+        "    if tlock_fd is not None:\n"
+        "        try: os.close(tlock_fd)\n"
+        "        except OSError: pass\n"
+        "    os.close(fd)\n"
+    )
+    return (
+        f"python3 -c {shlex.quote(body)} "
+        f"{shlex.quote(stage_path)} {shlex.quote(target_path)} "
+        f"{int(expected_size)} {shlex.quote(expected_sha256)} "
+        f"{shlex.quote(grant_path)} {shlex.quote(lock_path)}"
+    )
+
+
 async def _materialize_via_chunked_stream(
     sandbox: Any,
     *,
     object_key: str,
-    abs_target_path: str,
+    abs_target_path: str = "",
+    abs_path: str = "",
     expected_size: int,
     expected_sha256: str,
-    upload_id: str,
-) -> None:
+    upload_id: str = "",
+    verify_retained_workspace_id: str | None = None,
+    pause_hook_expr: str = "",
+    lock_open_hook_expr: str = "",
+    grant_path: str = "",
+    lock_path: str = "",
+) -> bool:
     """Fallback streaming writer (4 MiB chunks) when ``pull_direct`` cannot reach MinIO."""
+    abs_target_path = abs_target_path or abs_path
+    upload_id = upload_id or uuid.uuid4().hex
     uid_hex = upload_id.replace("-", "")[:12]
+    attempt_id = uuid.uuid4().hex[:16]
     parent_dir = posixpath.dirname(abs_target_path)
-    stage_path = f"{parent_dir}/.wsfiles-stage-{uid_hex}"
-    part_path = f"{parent_dir}/.wsfiles-part-{uid_hex}"
+    stage_path = f"{parent_dir}/.wsfiles-stage-{uid_hex}-{attempt_id}"
+    part_path = f"{parent_dir}/.wsfiles-part-{uid_hex}-{attempt_id}"
+    if verify_retained_workspace_id and not lock_path:
+        lock_path = f"{parent_dir}/.wsfiles-tlock-{uid_hex}"
 
     # Fast-path idempotency check if target already holds the exact bytes.
     if await _probe_sandbox_file_matches(
@@ -1943,7 +2282,7 @@ async def _materialize_via_chunked_stream(
         expected_size=expected_size,
         expected_sha256=expected_sha256,
     ):
-        return
+        return True
 
     prep = await sandbox._runtime_call(
         sandbox.runtime.exec,
@@ -1980,23 +2319,34 @@ async def _materialize_via_chunked_stream(
             if getattr(append_res, "exit_code", 1) != 0:
                 raise RuntimeError("Failed to append streamed chunk in sandbox")
 
-        finalize_script = (
-            "python3 -c '"
-            "import hashlib, os, sys; "
-            "stage, target, exp_sz, exp_sha = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]; "
-            "h = hashlib.sha256(); n = 0;\n"
-            "with open(stage, \"rb\") as f:\n"
-            "    while True:\n"
-            "        b = f.read(1048576)\n"
-            "        if not b: break\n"
-            "        n += len(b); h.update(b)\n"
-            "if n != exp_sz or h.hexdigest() != exp_sha:\n"
-            "    os.unlink(stage); sys.exit(2)\n"
-            "os.chmod(stage, 0o644)\n"
-            "os.replace(stage, target)\n"
-            "' "
-            f"{shlex.quote(stage_path)} {shlex.quote(abs_target_path)} "
-            f"{int(expected_size)} {shlex.quote(expected_sha256)}"
+        if verify_retained_workspace_id:
+            grant_path, lock_path = await _create_restore_grant(
+                sandbox, abs_target_path, upload_id, attempt_id
+            )
+            if not await db.is_upload_retained_for_recovery(
+                upload_id, verify_retained_workspace_id
+            ):
+                await _cleanup_restore_grant(sandbox, grant_path, lock_path)
+                await sandbox._runtime_call(
+                    sandbox.runtime.exec,
+                    f"rm -f -- {shlex.quote(stage_path)} {shlex.quote(part_path)}",
+                    timeout=15,
+                    retry_policy=RetryPolicy.SAFE,
+                )
+                return False
+            hook = _AFTER_FINAL_RECOVERY_DB_CHECK_HOOK
+            if callable(hook):
+                await hook(upload_id, abs_target_path)
+
+        finalize_script = _build_stream_finalize_script(
+            stage_path,
+            abs_target_path,
+            expected_size,
+            expected_sha256,
+            pause_hook_expr=pause_hook_expr,
+            lock_open_hook_expr=lock_open_hook_expr,
+            grant_path=grant_path,
+            lock_path=lock_path,
         )
         fin_timeout = max(30, transfer_timeout_s(expected_size))
         fin_res = await sandbox._runtime_call(
@@ -2006,10 +2356,15 @@ async def _materialize_via_chunked_stream(
             total_timeout=max(120.0, float(fin_timeout) + 30.0),
             retry_policy=RetryPolicy.SAFE,
         )
-        if getattr(fin_res, "exit_code", 1) != 0:
+        exit_code = getattr(fin_res, "exit_code", 1)
+        if exit_code == 5:
+            return False
+        if exit_code != 0:
             raise RuntimeError("Streamed sandbox upload verification failed")
+        return True
     except Exception:
         try:
+            await _cleanup_restore_grant(sandbox, grant_path, lock_path)
             await sandbox._runtime_call(
                 sandbox.runtime.exec,
                 f"rm -f -- {shlex.quote(stage_path)} {shlex.quote(part_path)}",
@@ -2034,12 +2389,19 @@ async def _place_row_in_sandbox(
     abs_path: str,
     rel_path: str,
     can_direct: bool,
-) -> None:
+    verify_retained: bool = False,
+) -> bool:
     """Place one verified ``dalton_chat_file_uploads`` row at ``abs_path``."""
     size_bytes = int(row["size_bytes"])
     sha256_hex = str(row["actual_sha256"] or "")
     object_key = str(row["object_key"])
     uid = str(row["upload_id"])
+    row_ws_id = str(row["workspace_id"])
+
+    if verify_retained and not await db.is_upload_retained_for_recovery(
+        uid, row_ws_id
+    ):
+        return False
 
     placed = False
     if can_direct and sha256_hex:
@@ -2049,39 +2411,72 @@ async def _place_row_in_sandbox(
             expires_in=transfer_timeout_s(size_bytes) + 300,
         )
         if signed_url:
-            results = await pull_direct(
-                sandbox,
-                [
-                    {
-                        "kind": "file",
-                        "path": rel_path,
-                        "size": size_bytes,
-                        "mode": 0o644,
-                        "sha256": sha256_hex,
-                        "url": signed_url,
-                    }
-                ],
-                layout=layout,
-            )
+            grant_path = ""
+            lock_path = ""
+            attempt_id = uuid.uuid4().hex[:16]
+            if verify_retained:
+                grant_path, lock_path = await _create_restore_grant(
+                    sandbox, abs_path, uid, attempt_id
+                )
+                if not await db.is_upload_retained_for_recovery(uid, row_ws_id):
+                    await _cleanup_restore_grant(sandbox, grant_path, lock_path)
+                    return False
+                hook = _AFTER_FINAL_RECOVERY_DB_CHECK_HOOK
+                if callable(hook):
+                    await hook(uid, abs_path)
+
+            item_spec: dict[str, Any] = {
+                "kind": "file",
+                "path": rel_path,
+                "size": size_bytes,
+                "mode": 0o644,
+                "sha256": sha256_hex,
+                "url": signed_url,
+            }
+            if grant_path:
+                item_spec["grant_file"] = grant_path
+                item_spec["lock_file"] = lock_path
+            try:
+                results = await pull_direct(
+                    sandbox,
+                    [item_spec],
+                    layout=layout,
+                    sweep_orphans=False,
+                )
+            except Exception:
+                await _cleanup_restore_grant(sandbox, grant_path, lock_path)
+                raise
             res = results.get(rel_path) or {}
             status_val = res.get("status")
             if status_val == "ok":
+                await _cleanup_restore_grant(sandbox, grant_path, lock_path)
                 placed = True
+            elif status_val == "superseded":
+                await _cleanup_restore_grant(sandbox, grant_path, lock_path)
+                return False
             elif status_val != "unreachable":
+                await _cleanup_restore_grant(sandbox, grant_path, lock_path)
                 raise RuntimeError(
                     f"Failed to materialize chat attachment {row['filename']}: "
                     f"{res.get('error') or status_val}"
                 )
+            else:
+                await _cleanup_restore_grant(sandbox, grant_path, lock_path)
 
     if not placed:
-        await _materialize_via_chunked_stream(
+        streamed = await _materialize_via_chunked_stream(
             sandbox,
             object_key=object_key,
             abs_target_path=abs_path,
             expected_size=size_bytes,
             expected_sha256=sha256_hex,
             upload_id=uid,
+            verify_retained_workspace_id=row_ws_id if verify_retained else None,
         )
+        if not streamed:
+            return False
+
+    return True
 
 
 def _sandbox_layout(sandbox: Any, project: ProjectContext | None) -> WorkspaceLayout:
@@ -2511,7 +2906,8 @@ async def rematerialize_workspace_chat_uploads(
     workspace_id: str,
     sandbox: Any | None,
     *,
-    layout: WorkspaceLayout,
+    layout: WorkspaceLayout | None = None,
+    project: ProjectContext | None = None,
     conn: Any = None,
 ) -> dict[str, int]:
     """Rematerialize missing accepted chat uploads into ``layout`` on cold restore or turn start."""
@@ -2522,6 +2918,10 @@ async def rematerialize_workspace_chat_uploads(
         or not storage.is_chat_upload_storage_configured()
     ):
         return {"restored": 0, "errors": 0}
+
+    if layout is None:
+        eff_project = project if project is not None else current_project()
+        layout = _sandbox_layout(sandbox, eff_project)
 
     try:
         normalized_ws = _validate_uuid(workspace_id, field_name="workspace_id")
@@ -2601,6 +3001,10 @@ async def rematerialize_workspace_chat_uploads(
     for row, rel_path, abs_path in sorted(missing_entries, key=lambda e: e[2]):
         try:
             async with sandbox.path_write_lock(abs_path):
+                if not await db.is_upload_retained_for_recovery(
+                    str(row["upload_id"]), normalized_ws, conn=conn
+                ):
+                    continue
                 if await _probe_sandbox_file_matches(
                     sandbox,
                     abs_path,
@@ -2608,14 +3012,17 @@ async def rematerialize_workspace_chat_uploads(
                     expected_sha256=str(row.get("actual_sha256") or ""),
                 ):
                     continue
-                await _place_row_in_sandbox(
+                placed_ok = await _place_row_in_sandbox(
                     sandbox,
                     row,
                     layout=layout,
                     abs_path=abs_path,
                     rel_path=rel_path,
                     can_direct=can_direct,
+                    verify_retained=True,
                 )
+                if not placed_ok:
+                    continue
             restored += 1
         except Exception as exc:
             errors += 1
@@ -2688,11 +3095,119 @@ async def list_retained_workspace_file_tree_entries(
     return out
 
 
+async def _match_retained_uploads_by_client_paths(
+    canonical_ws: str,
+    client_paths: Sequence[str],
+    *,
+    include_delete_pending: bool = True,
+) -> list[dict[str, Any]]:
+    normalized_targets: set[str] = set()
+    for raw_p in client_paths:
+        cleaned = str(raw_p or "").strip().lstrip("/")
+        if not cleaned:
+            continue
+        try:
+            normalized_targets.add(lexical_path(cleaned))
+        except Exception:
+            continue
+    if not normalized_targets:
+        return []
+
+    retained = await db.list_retained_workspace_uploads(
+        canonical_ws, include_delete_pending=include_delete_pending
+    )
+    if not retained:
+        return []
+
+    matched_rows: list[dict[str, Any]] = []
+    for row in retained:
+        rel_path = build_sandbox_upload_rel_path(row)
+        if rel_path in normalized_targets or any(
+            rel_path.startswith(f"{d}/") for d in normalized_targets
+        ):
+            matched_rows.append(row)
+    return matched_rows
+
+
+async def _match_retained_upload_ids_by_client_paths(
+    canonical_ws: str,
+    client_paths: Sequence[str],
+    *,
+    include_delete_pending: bool = True,
+) -> list[str]:
+    rows = await _match_retained_uploads_by_client_paths(
+        canonical_ws, client_paths, include_delete_pending=include_delete_pending
+    )
+    return [str(r["upload_id"]) for r in rows]
+
+
+async def begin_delete_workspace_chat_uploads(
+    *,
+    workspace_id: str,
+    caller_user_id: str,
+    candidate_client_paths: Sequence[str] = (),
+    target_client_paths: Sequence[str] = (),
+    sandbox: Any | None = None,
+    layout: WorkspaceLayout | None = None,
+) -> list[str]:
+    """Fence retained chat uploads matching ``candidate_client_paths`` before sandbox ``rm``."""
+    paths = candidate_client_paths or target_client_paths
+    if not paths or not get_dalton_settings().enabled:
+        return []
+    canonical_ws = await resolve_and_verify_upload_workspace(
+        caller_user_id, workspace_id
+    )
+    matched_rows = await _match_retained_uploads_by_client_paths(
+        canonical_ws, paths, include_delete_pending=True
+    )
+    if not matched_rows:
+        return []
+    matched_ids = [str(r["upload_id"]) for r in matched_rows]
+    fenced = await db.mark_uploads_delete_pending(
+        matched_ids, workspace_id=canonical_ws
+    )
+    if sandbox is not None:
+        eff_layout = layout or _sandbox_layout(sandbox, current_project())
+        await _revoke_restore_grants_in_sandbox(
+            sandbox,
+            eff_layout,
+            matched_rows,
+            unlink_target=False,
+        )
+    return fenced
+
+
+async def abort_delete_workspace_chat_uploads(
+    *,
+    workspace_id: str,
+    caller_user_id: str,
+    failed_client_paths: Sequence[str] = (),
+    aborted_client_paths: Sequence[str] = (),
+) -> int:
+    """Clear the delete fence for uploads whose sandbox ``rm`` failed."""
+    paths = failed_client_paths or aborted_client_paths
+    if not paths or not get_dalton_settings().enabled:
+        return 0
+    canonical_ws = await resolve_and_verify_upload_workspace(
+        caller_user_id, workspace_id
+    )
+    matched_ids = await _match_retained_upload_ids_by_client_paths(
+        canonical_ws, paths, include_delete_pending=True
+    )
+    if not matched_ids:
+        return 0
+    return await db.clear_uploads_delete_pending(
+        matched_ids, workspace_id=canonical_ws
+    )
+
+
 async def retire_deleted_workspace_chat_uploads(
     *,
     workspace_id: str,
     caller_user_id: str,
     deleted_client_paths: Sequence[str],
+    sandbox: Any | None = None,
+    layout: WorkspaceLayout | None = None,
 ) -> int:
     """Retire and clean retained chat uploads whose ``work/uploads/...`` file was deleted."""
     if not deleted_client_paths or not get_dalton_settings().enabled:
@@ -2701,32 +3216,24 @@ async def retire_deleted_workspace_chat_uploads(
     canonical_ws = await resolve_and_verify_upload_workspace(
         caller_user_id, workspace_id
     )
-    normalized_deleted: set[str] = set()
-    for raw_p in deleted_client_paths:
-        cleaned = str(raw_p or "").strip().lstrip("/")
-        if not cleaned:
-            continue
-        try:
-            normalized_deleted.add(lexical_path(cleaned))
-        except Exception:
-            continue
-    if not normalized_deleted:
+    matched_rows = await _match_retained_uploads_by_client_paths(
+        canonical_ws, deleted_client_paths, include_delete_pending=True
+    )
+    if not matched_rows:
         return 0
+    matched_ids = [str(r["upload_id"]) for r in matched_rows]
 
-    retained = await db.list_retained_workspace_uploads(canonical_ws)
-    if not retained:
-        return 0
-
-    matched_ids: list[str] = []
-    for row in retained:
-        rel_path = build_sandbox_upload_rel_path(row)
-        if rel_path in normalized_deleted or any(
-            rel_path.startswith(f"{d}/") for d in normalized_deleted
-        ):
-            matched_ids.append(str(row["upload_id"]))
-
-    if not matched_ids:
-        return 0
+    await db.mark_uploads_delete_pending(
+        matched_ids, workspace_id=canonical_ws
+    )
+    if sandbox is not None:
+        eff_layout = layout or _sandbox_layout(sandbox, current_project())
+        await _revoke_restore_grants_in_sandbox(
+            sandbox,
+            eff_layout,
+            matched_rows,
+            unlink_target=True,
+        )
 
     retired_rows = await db.retire_uploads_by_ids(
         matched_ids, workspace_id=canonical_ws

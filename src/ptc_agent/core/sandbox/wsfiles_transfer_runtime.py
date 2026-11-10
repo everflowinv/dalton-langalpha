@@ -15,6 +15,10 @@ import base64
 import codecs
 import contextlib
 import errno
+try:
+    import fcntl
+except ImportError:  # pragma: no cover
+    fcntl = None  # type: ignore[assignment]
 import functools
 import hashlib
 import http.client
@@ -1028,9 +1032,99 @@ def push(spec: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+_ACTIVE_TEMP_LOCK = threading.Lock()
+_ACTIVE_TEMP_FDS: dict[str, int] = {}
+_SWEEP_LOCK_NAME = ".wsfiles-sweep.lock"
+_TEMP_CREATED_BEFORE_LOCK_HOOK: Any = None
+
+
+@contextlib.contextmanager
+def _hold_sweep_lock(parent: str, *, exclusive: bool):
+    """Serialize temp creation + flock acquisition against orphan sweeps across processes."""
+    if fcntl is None:
+        yield
+        return
+    lock_path = os.path.join(parent, _SWEEP_LOCK_NAME)
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(lock_path, flags, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+def _acquire_temp_ownership(path: str, *, expected_fd: int | None = None) -> None:
+    """Hold an exclusive non-blocking flock on ``path`` until placement or unlink completes.
+
+    Fails closed (raises ``OSError``) if the file cannot be opened, is already
+    locked by another process, or changed inode before the lock was acquired.
+    """
+    if fcntl is None:
+        return
+    lock_fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        st_lock = os.fstat(lock_fd)
+        st_path = os.lstat(path)
+        if not stat.S_ISREG(st_lock.st_mode) or (
+            st_lock.st_dev,
+            st_lock.st_ino,
+        ) != (st_path.st_dev, st_path.st_ino):
+            raise OSError(errno.ESTALE, f"Temp file identity changed before lock: {path}")
+        if expected_fd is not None:
+            st_exp = os.fstat(expected_fd)
+            if (st_lock.st_dev, st_lock.st_ino) != (st_exp.st_dev, st_exp.st_ino):
+                raise OSError(errno.ESTALE, f"Temp file descriptor mismatch: {path}")
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.close(lock_fd)
+        raise
+    with _ACTIVE_TEMP_LOCK:
+        prev = _ACTIVE_TEMP_FDS.get(path)
+        _ACTIVE_TEMP_FDS[path] = lock_fd
+    if prev is not None and prev != lock_fd:
+        with contextlib.suppress(OSError):
+            os.close(prev)
+
+
+def _create_owned_temp_file(parent: str) -> Any:
+    """Create a ``.wsfiles-*`` temp file and acquire its exclusive flock while holding the sweep lock."""
+    with _hold_sweep_lock(parent, exclusive=False):
+        tmp = tempfile.NamedTemporaryFile(dir=parent, prefix=_TEMP_PREFIX, delete=False)
+        try:
+            hook = _TEMP_CREATED_BEFORE_LOCK_HOOK
+            if callable(hook):
+                hook(tmp.name)
+            pause_env = os.environ.get("WSFILES_TEST_PAUSE_ON_TEMP_CREATE")
+            if pause_env:
+                ready_file, resume_file = pause_env.split(":", 1)
+                with open(ready_file, "w", encoding="utf-8") as rf:
+                    rf.write(tmp.name)
+                deadline = time.monotonic() + 10.0
+                while not os.path.exists(resume_file) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+            _acquire_temp_ownership(tmp.name, expected_fd=tmp.fileno())
+        except BaseException:
+            with contextlib.suppress(OSError):
+                tmp.close()
+            _unlink_quiet(tmp.name)
+            raise
+        return tmp
+
+
+def _release_temp_ownership(path: str) -> None:
+    with _ACTIVE_TEMP_LOCK:
+        lock_fd = _ACTIVE_TEMP_FDS.pop(path, None)
+    if lock_fd is not None:
+        with contextlib.suppress(OSError):
+            os.close(lock_fd)
+
+
 def _download_to_temp(url: str, parent: str, timeout_s: float) -> tuple[str, str, int, int]:
     """GET ``url`` into a temp file beside the target; returns (temp, sha256, bytes, http)."""
-    tmp = tempfile.NamedTemporaryFile(dir=parent, prefix=_TEMP_PREFIX, delete=False)
+    tmp = _create_owned_temp_file(parent)
     try:
         h = hashlib.sha256()
         n = 0
@@ -1068,6 +1162,8 @@ def _unlink_quiet(path: str) -> None:
         os.unlink(path)
     except OSError:
         pass
+    finally:
+        _release_temp_ownership(path)
 
 
 def _populated_directory(final: str) -> bool:
@@ -1106,6 +1202,49 @@ def _verify(digest: str, n: int, item: dict[str, Any]) -> str | None:
     return None
 
 
+def _pause_for_test_signal(spec: str | None, payload: str = "1") -> None:
+    if not spec:
+        return
+    ready_file, resume_file = spec.split(":", 1)
+    with open(ready_file, "w", encoding="utf-8") as rf:
+        rf.write(payload)
+    deadline = time.monotonic() + 15.0
+    while not os.path.exists(resume_file) and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
+def _acquire_target_lock(lock_file: str, item: dict[str, Any]) -> int:
+    """Acquire an exclusive flock on a stable per-target lock inode, verifying path identity."""
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    os.makedirs(os.path.dirname(lock_file), exist_ok=True)
+    paused_open = False
+    while True:
+        fd = os.open(lock_file, flags, 0o600)
+        try:
+            if not paused_open:
+                paused_open = True
+                _pause_for_test_signal(
+                    item.get("pause_after_lock_open")
+                    or os.environ.get("WSFILES_TEST_PAUSE_AFTER_LOCK_OPEN"),
+                    payload=f"{os.getpid()}:{os.fstat(fd).st_ino}",
+                )
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                st_fd = os.fstat(fd)
+                st_path = os.lstat(lock_file)
+            except FileNotFoundError:
+                os.close(fd)
+                continue
+            if (st_fd.st_dev, st_fd.st_ino) != (st_path.st_dev, st_path.st_ino):
+                os.close(fd)
+                continue
+            return fd
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            raise
+
+
 def _place(
     tmp: str, final: str, item: dict[str, Any], http: int | None = None
 ) -> dict[str, Any]:
@@ -1121,8 +1260,28 @@ def _place(
     item never leaves bytes under the transient prefix for the next sweep to
     find.
     """
+    lock_file = item.get("lock_file")
+    grant_file = item.get("grant_file")
+    tlock_fd: int | None = None
     try:
         _stamp(tmp, item)
+        if lock_file and fcntl is not None:
+            tlock_fd = _acquire_target_lock(lock_file, item)
+        if grant_file:
+            if not os.path.exists(grant_file):
+                _unlink_quiet(tmp)
+                return _result("superseded", http, "restore grant revoked by delete")
+            with contextlib.suppress(OSError):
+                os.unlink(grant_file)
+            grant_parent = os.path.dirname(grant_file)
+            if os.path.basename(grant_parent).startswith(".wsfiles-grants-"):
+                with contextlib.suppress(OSError):
+                    os.rmdir(grant_parent)
+        _pause_for_test_signal(
+            item.get("pause_after_grant_check")
+            or os.environ.get("WSFILES_TEST_PAUSE_AFTER_GRANT_CHECK"),
+            payload=f"{os.getpid()}:{final}",
+        )
         if item.get("keep_existing"):
             if not _link_new(tmp, final):
                 _unlink_quiet(tmp)
@@ -1133,6 +1292,18 @@ def _place(
     except OSError as exc:
         _unlink_quiet(tmp)
         return _result("failed", http, str(exc))
+    finally:
+        if grant_file:
+            with contextlib.suppress(OSError):
+                os.unlink(grant_file)
+            grant_parent = os.path.dirname(grant_file)
+            if os.path.basename(grant_parent).startswith(".wsfiles-grants-"):
+                with contextlib.suppress(OSError):
+                    os.rmdir(grant_parent)
+        if tlock_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(tlock_fd)
+        _release_temp_ownership(tmp)
     return _result("ok", http)
 
 
@@ -1248,24 +1419,73 @@ def _pull_file(
         return last or _result("failed", error="exhausted retries")
 
 
-def _sweep_orphan_staging(root: str, items: list[dict[str, Any]]) -> None:
+def _unlink_orphan_if_unlocked(path: str) -> None:
+    """Unlink a transient ``.wsfiles-*`` file only if no live process holds its flock."""
+    with _ACTIVE_TEMP_LOCK:
+        if path in _ACTIVE_TEMP_FDS:
+            return
+    if fcntl is None or os.path.islink(path):
+        _unlink_quiet(path)
+        return
+    try:
+        st_path = os.lstat(path)
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                return
+            return
+        try:
+            st_fd = os.fstat(fd)
+            st_now = os.lstat(path)
+        except OSError:
+            return
+        if (st_fd.st_dev, st_fd.st_ino) != (st_path.st_dev, st_path.st_ino) or (
+            st_now.st_dev,
+            st_now.st_ino,
+        ) != (st_path.st_dev, st_path.st_ino):
+            return
+        with contextlib.suppress(OSError):
+            os.unlink(path)
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(fd)
+
+
+def _sweep_orphan_staging(
+    root: str, items: list[dict[str, Any]], *, sweep_orphans: bool = True
+) -> None:
     """Remove root-level transient entries no item of this op claims.
 
     A relay upload the file API cut short, or a download the runtime died
     in, leaves its partial bytes under the prefix, and the scan skips it
-    there, so nothing else would ever see them. Restores are serialized per
-    workspace, so any entry this op does not claim is a leftover of an
-    earlier one.
+    there, so nothing else would ever see them. Incremental direct transfers
+    pass ``sweep_orphans=False`` and clean only their own temp files; full
+    restores skip any transient file still locked by an active transfer.
     """
+    if not sweep_orphans:
+        return
     claimed = {os.path.basename(i["file"]) for i in items if i.get("file")}
-    for name in os.listdir(root):
-        if not name.startswith(_TEMP_PREFIX) or name in claimed:
-            continue
-        path = os.path.join(root, name)
-        if os.path.isdir(path) and not os.path.islink(path):
-            _rmtree_quiet(path)
-        else:
-            _unlink_quiet(path)
+    with _hold_sweep_lock(root, exclusive=True):
+        for name in os.listdir(root):
+            if (
+                not name.startswith(_TEMP_PREFIX)
+                or name == _SWEEP_LOCK_NAME
+                or name.startswith(".wsfiles-tlock-")
+                or name.startswith(".wsfiles-grant-")
+                or name.startswith(".wsfiles-grants-")
+                or name in claimed
+            ):
+                continue
+            path = os.path.join(root, name)
+            if os.path.isdir(path) and not os.path.islink(path):
+                _rmtree_quiet(path)
+            else:
+                _unlink_orphan_if_unlocked(path)
 
 
 def _place_staged(root: str, final: str, item: dict[str, Any]) -> dict[str, Any]:
@@ -1381,7 +1601,10 @@ def _extract_member(root: str, chunk: Any, member: dict[str, Any], http_status: 
         digest = hashlib.sha256(data).hexdigest()
         if digest != expected_sha:
             return _result("mismatch", http_status, f"got sha256={digest}")
-    tmp = tempfile.NamedTemporaryFile(dir=root, prefix=_TEMP_PREFIX, delete=False)
+    try:
+        tmp = _create_owned_temp_file(root)
+    except OSError as exc:
+        return _result("failed", http_status, str(exc))
     try:
         tmp.write(data)
     except OSError as exc:
@@ -1520,7 +1743,8 @@ def pull(spec: dict[str, Any]) -> dict[str, Any]:
         int(spec.get("max_inflight_bytes") or _PULL_MAX_INFLIGHT_BYTES)
     )
     results: dict[str, dict[str, Any]] = {}
-    _sweep_orphan_staging(root, items)
+    sweep_orphans = bool(spec.get("sweep_orphans", True))
+    _sweep_orphan_staging(root, items, sweep_orphans=sweep_orphans)
     _inside.cache_clear()
 
     files: list[dict[str, Any]] = []

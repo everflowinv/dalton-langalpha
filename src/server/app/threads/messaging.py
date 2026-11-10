@@ -1498,6 +1498,7 @@ async def get_thread_status(
             "recent_report_back_run_ids": [],
             "owed_threads": [],
             "pending_steers": [],
+            "failed_steers": [],
         }
     # --- DALTON-HOOK(team-sharing): end ---
     if fields == "report_back":
@@ -1517,6 +1518,8 @@ async def get_thread_status(
     # left parked: the next turn reads them, and the view shows them queued
     # until it does.
     status["pending_steers"] = await outbox_db.list_pending_steers(thread_id)
+    # DALTON-HOOK(chat-large-upload): expose durable failed steers so open clients reconcile post-run_end parked failures
+    status["failed_steers"] = await outbox_db.list_failed_steers_for_status(thread_id)
     return status
 
 

@@ -720,6 +720,7 @@ async def has_retained_workspace_uploads(
                       AND state = 'ready'
                       AND used_at IS NOT NULL
                       AND cleaned_at IS NULL
+                      AND COALESCE(error, '') <> 'explicit_delete_pending'
                 ) AS present
                 """,
                 (workspace_id,),
@@ -728,12 +729,46 @@ async def has_retained_workspace_uploads(
             return bool(row and row.get("present"))
 
 
-async def list_retained_workspace_uploads(
+async def is_upload_retained_for_recovery(
+    upload_id: str,
     workspace_id: str,
     *,
     conn: Any = None,
+) -> bool:
+    """Return True iff ``upload_id`` remains an active retained upload eligible for recovery."""
+    async with get_db_connection(conn) as owned:
+        async with owned.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM dalton_chat_file_uploads
+                    WHERE upload_id = %s
+                      AND workspace_id = %s
+                      AND state = 'ready'
+                      AND used_at IS NOT NULL
+                      AND cleaned_at IS NULL
+                      AND COALESCE(error, '') <> 'explicit_delete_pending'
+                ) AS present
+                """,
+                (upload_id, workspace_id),
+            )
+            row = await cur.fetchone()
+            return bool(row and row.get("present"))
+
+
+async def list_retained_workspace_uploads(
+    workspace_id: str,
+    *,
+    include_delete_pending: bool = False,
+    conn: Any = None,
 ) -> list[dict[str, Any]]:
     """Return active accepted chat uploads for ``workspace_id`` ordered chronologically."""
+    delete_guard = (
+        ""
+        if include_delete_pending
+        else "AND COALESCE(error, '') <> 'explicit_delete_pending'"
+    )
     async with get_db_connection(conn) as owned:
         async with owned.cursor(row_factory=dict_row) as cur:
             await cur.execute(
@@ -744,11 +779,66 @@ async def list_retained_workspace_uploads(
                   AND state = 'ready'
                   AND used_at IS NOT NULL
                   AND cleaned_at IS NULL
+                  {delete_guard}
                 ORDER BY created_at ASC, upload_id ASC
                 """,
                 (workspace_id,),
             )
             return list(await cur.fetchall())
+
+
+async def mark_uploads_delete_pending(
+    upload_ids: Sequence[str],
+    *,
+    workspace_id: str,
+) -> list[str]:
+    """Fence retained uploads before sandbox ``rm`` so concurrent recovery cannot restore them."""
+    unique_ids = [str(uid) for uid in dict.fromkeys(upload_ids) if uid]
+    if not unique_ids:
+        return []
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                UPDATE dalton_chat_file_uploads
+                SET error = 'explicit_delete_pending',
+                    updated_at = NOW()
+                WHERE upload_id = ANY(%s)
+                  AND workspace_id = %s
+                  AND state = 'ready'
+                  AND used_at IS NOT NULL
+                  AND cleaned_at IS NULL
+                RETURNING upload_id
+                """,
+                (unique_ids, workspace_id),
+            )
+            return [str(r["upload_id"]) for r in await cur.fetchall()]
+
+
+async def clear_uploads_delete_pending(
+    upload_ids: Sequence[str],
+    *,
+    workspace_id: str,
+) -> int:
+    """Clear the ``explicit_delete_pending`` fence when sandbox ``rm`` fails."""
+    unique_ids = [str(uid) for uid in dict.fromkeys(upload_ids) if uid]
+    if not unique_ids:
+        return 0
+    async with get_db_connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE dalton_chat_file_uploads
+                SET error = NULL,
+                    updated_at = NOW()
+                WHERE upload_id = ANY(%s)
+                  AND workspace_id = %s
+                  AND state = 'ready'
+                  AND error = 'explicit_delete_pending'
+                """,
+                (unique_ids, workspace_id),
+            )
+            return int(cur.rowcount or 0)
 
 
 async def retire_uploads_by_ids(
@@ -861,6 +951,11 @@ async def claim_cleanup_batch(
                                   AND u.expires_at IS NOT NULL
                                   AND u.expires_at <= {now_expr}
                                   AND NOT {_live_provisional_sql("u", now_expr)}
+                              )
+                              OR (
+                                  u.state = 'ready'
+                                  AND u.error = 'explicit_delete_pending'
+                                  AND u.updated_at <= {now_expr} - INTERVAL '5 minutes'
                               )
                               OR EXISTS (
                                   SELECT 1

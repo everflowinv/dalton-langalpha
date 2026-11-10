@@ -4244,7 +4244,7 @@ class TestChatLargeUploadRealInfra:
             assert live_failed[0]["attachments"][0]["name"] == "deleted_mid_turn.csv"
             assert await SteeredReportInbox().take_failed(tid, run1_id) == []
 
-            # Admit second steer, let run 1 complete so steer parks, then retire its attachment
+            # Admit second steer, let run 1 finalize with ProducerRecord(reasoning_ms=...) so steer parks
             await wait_or_steer(
                 LocalRunExecutor.get_instance(),
                 tid,
@@ -4257,8 +4257,26 @@ class TestChatLargeUploadRealInfra:
                     {"type": "chat_upload", "upload_id": up_parked["upload_id"]}
                 ],
             )
+            fin1 = await tl_db.finalize_run(
+                run_id=run1_id,
+                thread_id=tid,
+                outcome=tl_db.RunOutcome(
+                    status="completed",
+                    execution_time=1.25,
+                    record=tl_db.ProducerRecord(reasoning_ms=1450),
+                ),
+            )
+            assert fin1.applied is True
         finally:
             await scope1.fail_open("turn-1-completed", status="completed")
+
+        # Verify finalize_run preserved replay_facts['failed_steers'] alongside reasoning_ms
+        r1_row = await tl_db.get_latest_attempt(tid)
+        assert r1_row is not None
+        r1_facts = r1_row.get("replay_facts") or {}
+        assert r1_facts.get("reasoning_ms") == 1450
+        assert len(r1_facts.get("failed_steers") or []) == 1
+        assert r1_facts["failed_steers"][0]["request_key"] == rk_held
 
         row_p = await chat_uploads_db.get_upload(up_parked["upload_id"])
         assert row_p is not None
@@ -4275,12 +4293,31 @@ class TestChatLargeUploadRealInfra:
         parked_claimed = next(
             j for j in due_jobs if j.get("idempotency_key") == f"steer:{rk_parked}"
         )
-        await execute_steer(parked_claimed)
+        from src.server.services.report_back import steer_executor
+
+        wake_calls: list[str] = []
+
+        async def _spy_wake(thread_id: str) -> None:
+            wake_calls.append(thread_id)
+
+        with patch.object(
+            steer_executor,
+            "publish_cleared_wake",
+            create_autospec(steer_executor.publish_cleared_wake, side_effect=_spy_wake),
+        ):
+            await execute_steer(parked_claimed)
+        assert wake_calls == [tid]
 
         parked_after = await outbox_db.get_steer_job(f"steer:{rk_parked}")
         assert parked_after is not None
         assert parked_after["status"] == "done"
         assert parked_after["payload"].get("outcome") == "failed"
+
+        status_failed_before_purge = await outbox_db.list_failed_steers_for_status(tid)
+        assert [f["request_key"] for f in status_failed_before_purge] == [
+            rk_held,
+            rk_parked,
+        ]
 
         # Replay thread data & stub_page surface BOTH failed steers deterministically across reloads
         rows_1 = await get_replay_thread_data(tid)
@@ -4294,7 +4331,24 @@ class TestChatLargeUploadRealInfra:
         assert [r["request_key"] for r in returned_1] == [rk_held, rk_parked]
         assert all(r["reason"] == "attachment_failed" and r.get("error") for r in returned_1)
 
-        # Second reload produces the exact same two events without duplication
+        # Purge terminal hook_outbox rows completely (simulating >24h outbox retention sweep)
+        purged = await outbox_db.purge_terminal_jobs(
+            retention_seconds=-1.0, batch_size=100
+        )
+        assert purged >= 2
+        assert await outbox_db.get_steer_job(f"steer:{rk_held}") is None
+        assert await outbox_db.get_steer_job(f"steer:{rk_parked}") is None
+
+        # Durable conversation_responses.replay_facts['failed_steers'] preserves both failed steers
+        # for /status AND history replay even after hook_outbox rows are gone!
+        status_failed_after_purge = await outbox_db.list_failed_steers_for_status(tid)
+        assert [f["request_key"] for f in status_failed_after_purge] == [
+            rk_held,
+            rk_parked,
+        ]
+        assert status_failed_after_purge[0]["attachments"][0]["name"] == "deleted_mid_turn.csv"
+        assert status_failed_after_purge[1]["attachments"][0]["name"] == "deleted_while_parked.csv"
+
         rows_2 = await get_replay_thread_data(tid)
         assert rows_2 is not None
         page_2 = await stub_page(rows_2)
@@ -4304,6 +4358,8 @@ class TestChatLargeUploadRealInfra:
             if line.item()["event"] == "steering_returned"
         ]
         assert [r["request_key"] for r in returned_2] == [rk_held, rk_parked]
+        assert returned_2[0]["content"] == "Please check deleted_mid_turn.csv"
+        assert returned_2[1]["content"] == "Please check deleted_while_parked.csv"
 
     @pytest.mark.asyncio
     async def test_materialize_disk_budget_charges_only_missing_or_corrupt_files(
@@ -4455,3 +4511,688 @@ class TestChatLargeUploadRealInfra:
             _SIZE_200_MIB,
             sha200,
         ]
+
+    @pytest.mark.asyncio
+    async def test_concurrent_transfer_isolation_and_delete_vs_restore_coordination(
+        self,
+        chat_upload_infra,
+        docker_ptc_sandbox: PTCSandbox,
+    ) -> None:
+        """Verify per-invocation chunked stream temp files + descriptor identity check,
+        flock-protected orphan staging sweep during direct HTTP transfers, and explicit delete
+        coordination with rematerialize_workspace_chat_uploads in real PG + MinIO + Docker."""
+        from src.dalton.services import chat_uploads as cu_svc
+        from src.dalton.services.chat_uploads import (
+            _build_stream_finalize_script,
+            _materialize_via_chunked_stream,
+            abort_delete_workspace_chat_uploads,
+            begin_delete_workspace_chat_uploads,
+            rematerialize_workspace_chat_uploads,
+        )
+        from src.server.services.persistence.transfer import pull_direct
+
+        uid_tag = uuid4().hex[:8]
+        user = await create_user(
+            user_id=f"u-conc-{uid_tag}",
+            email=f"conc-{uid_tag}@chat-upload-e2e.test",
+            name="Concurrency & Delete Tester",
+        )
+        ws = await create_workspace(
+            user_id=user["user_id"],
+            name="Concurrency WS",
+            description="Transfer isolation and delete vs restore",
+            status="running",
+        )
+        workspace_id = str(ws["workspace_id"])
+        project = ProjectContext(workspace_id=workspace_id, dir_name=f"conc_{uid_tag}")
+        await docker_ptc_sandbox._ensure_workspace_dirs(project.dir_name)
+
+        up_a, key_a, sha_a = await _upload_streamed_file_via_http(
+            chat_upload_infra.client,
+            user_id=user["user_id"],
+            workspace_id=workspace_id,
+            filename="stream_iso_a.bin",
+            mime_type="application/octet-stream",
+            total_bytes=2 * _MIB,
+            seed_tag=b"conc-stream-a",
+            tracked_keys=chat_upload_infra.tracked_keys,
+            tracked_multiparts=chat_upload_infra.tracked_multiparts,
+        )
+        up_b, key_b, sha_b = await _upload_streamed_file_via_http(
+            chat_upload_infra.client,
+            user_id=user["user_id"],
+            workspace_id=workspace_id,
+            filename="stream_iso_b.bin",
+            mime_type="application/octet-stream",
+            total_bytes=2 * _MIB,
+            seed_tag=b"conc-stream-b",
+            tracked_keys=chat_upload_infra.tracked_keys,
+            tracked_multiparts=chat_upload_infra.tracked_multiparts,
+        )
+        ctx_both = [
+            {"type": "chat_upload", "upload_id": up_a["upload_id"]},
+            {"type": "chat_upload", "upload_id": up_b["upload_id"]},
+        ]
+        await confirm_request_chat_uploads(
+            ctx_both, user_id=user["user_id"], workspace_id=workspace_id
+        )
+        row_a = await chat_uploads_db.get_upload(up_a["upload_id"])
+        row_b = await chat_uploads_db.get_upload(up_b["upload_id"])
+        assert row_a is not None and row_b is not None
+        rel_a = build_sandbox_upload_rel_path(row_a)
+        rel_b = build_sandbox_upload_rel_path(row_b)
+        abs_a = docker_ptc_sandbox.normalize_path(rel_a, project=project)
+        abs_b = docker_ptc_sandbox.normalize_path(rel_b, project=project)
+        layout = cu_svc._sandbox_layout(docker_ptc_sandbox, project)
+        ws_root_dir = layout.workspace
+
+        # 1. Two concurrent chunked stream fallbacks for the same upload isolate temp files
+        await asyncio.gather(
+            _materialize_via_chunked_stream(
+                docker_ptc_sandbox,
+                object_key=key_a,
+                abs_target_path=abs_a,
+                expected_size=2 * _MIB,
+                expected_sha256=sha_a,
+                upload_id=up_a["upload_id"],
+            ),
+            _materialize_via_chunked_stream(
+                docker_ptc_sandbox,
+                object_key=key_a,
+                abs_target_path=abs_a,
+                expected_size=2 * _MIB,
+                expected_sha256=sha_a,
+                upload_id=up_a["upload_id"],
+            ),
+        )
+        assert await cu_svc._probe_sandbox_file_matches(
+            docker_ptc_sandbox,
+            abs_a,
+            expected_size=2 * _MIB,
+            expected_sha256=sha_a,
+        )
+
+        # Tampering with staging path between digest read and publication is rejected inside Docker
+        tampered_stage = f"{abs_a}.wsfiles-stage-tamper"
+        prep_tamper = await docker_ptc_sandbox.execute_bash_command(
+            f"python3 -c 'import pathlib; pathlib.Path({shlex.quote(tampered_stage)}).write_bytes(b\"good\")'"
+        )
+        assert prep_tamper.get("success") is True
+        good_sha = hashlib.sha256(b"good").hexdigest()
+        tamper_cmd = _build_stream_finalize_script(
+            tampered_stage,
+            f"{abs_a}.tamper-target",
+            4,
+            good_sha,
+            pause_hook_expr=(
+                f"open({tampered_stage!r} + '.evil', 'wb').write(b'evil'); "
+                f"os.replace({tampered_stage!r} + '.evil', {tampered_stage!r})"
+            ),
+        )
+        tamper_res = await docker_ptc_sandbox.execute_bash_command(tamper_cmd)
+        assert tamper_res.get("success") is False
+        assert "Staging descriptor identity changed before publication" in (
+            (tamper_res.get("stderr") or "") + (tamper_res.get("stdout") or "")
+        )
+        await docker_ptc_sandbox.execute_bash_command(
+            f"rm -f {shlex.quote(tampered_stage)} {shlex.quote(f'{abs_a}.tamper-target')}"
+        )
+
+        # 2. Direct transfer concurrency + flock-protected orphan staging sweep in Docker
+        await docker_ptc_sandbox.execute_bash_command(
+            f"rm -f {shlex.quote(abs_a)} {shlex.quote(abs_b)}"
+        )
+        active_locked_tmp = f"{ws_root_dir}/.wsfiles-get-live-locked"
+        stale_unlocked_tmp = f"{ws_root_dir}/.wsfiles-get-abandoned"
+        ready_flag = f"{ws_root_dir}/.flock-ready"
+        release_flag = f"{ws_root_dir}/.flock-release"
+
+        holder_task = asyncio.create_task(
+            docker_ptc_sandbox.execute_bash_command(
+                "python3 -c 'import fcntl, os, pathlib, time\n"
+                f"fd = os.open({active_locked_tmp!r}, os.O_CREAT | os.O_WRONLY, 0o600)\n"
+                "fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+                f"pathlib.Path({stale_unlocked_tmp!r}).write_bytes(b\"stale\")\n"
+                f"pathlib.Path({ready_flag!r}).write_text(\"1\")\n"
+                f"while not os.path.exists({release_flag!r}): time.sleep(0.05)\n"
+                "os.close(fd)\n'",
+                timeout=30,
+            )
+        )
+        try:
+            for _ in range(40):
+                chk = await docker_ptc_sandbox.execute_bash_command(
+                    f"test -f {shlex.quote(ready_flag)} && echo ok"
+                )
+                if "ok" in (chk.get("stdout") or ""):
+                    break
+                await asyncio.sleep(0.05)
+
+            url_a = await asyncio.to_thread(
+                storage.sign_download_url, key_a, expires_in=600
+            )
+            url_b = await asyncio.to_thread(
+                storage.sign_download_url, key_b, expires_in=600
+            )
+            assert url_a and url_b
+            # Incremental transfers with sweep_orphans=False leave both temp files untouched
+            res_inc_a, res_inc_b = await asyncio.gather(
+                pull_direct(
+                    docker_ptc_sandbox,
+                    [
+                        {
+                            "kind": "file",
+                            "path": rel_a,
+                            "url": url_a,
+                            "size": 2 * _MIB,
+                            "mode": 0o644,
+                            "sha256": sha_a,
+                        }
+                    ],
+                    layout=layout,
+                    sweep_orphans=False,
+                ),
+                pull_direct(
+                    docker_ptc_sandbox,
+                    [
+                        {
+                            "kind": "file",
+                            "path": rel_b,
+                            "url": url_b,
+                            "size": 2 * _MIB,
+                            "mode": 0o644,
+                            "sha256": sha_b,
+                        }
+                    ],
+                    layout=layout,
+                    sweep_orphans=False,
+                ),
+            )
+            assert res_inc_a[rel_a]["status"] == "ok"
+            assert res_inc_b[rel_b]["status"] == "ok"
+
+            both_still_there = await docker_ptc_sandbox.execute_bash_command(
+                f"python3 -c 'import json, os; print(json.dumps([os.path.exists({active_locked_tmp!r}), os.path.exists({stale_unlocked_tmp!r})]))'"
+            )
+            assert json.loads((both_still_there.get("stdout") or "").strip().splitlines()[-1]) == [
+                True,
+                True,
+            ]
+
+            # Full restore with sweep_orphans=True removes unlocked stale temp file while preserving flock-held live temp file
+            url_a_sweep = await asyncio.to_thread(
+                storage.sign_download_url, key_a, expires_in=600
+            )
+            assert url_a_sweep
+            res_sweep = await pull_direct(
+                docker_ptc_sandbox,
+                [
+                    {
+                        "kind": "file",
+                        "path": rel_a,
+                        "url": url_a_sweep,
+                        "size": 2 * _MIB,
+                        "mode": 0o644,
+                        "sha256": sha_a,
+                    }
+                ],
+                layout=layout,
+                sweep_orphans=True,
+            )
+            assert res_sweep[rel_a]["status"] == "ok"
+
+            after_sweep = await docker_ptc_sandbox.execute_bash_command(
+                f"python3 -c 'import json, os; print(json.dumps([os.path.exists({active_locked_tmp!r}), os.path.exists({stale_unlocked_tmp!r})]))'"
+            )
+            assert json.loads((after_sweep.get("stdout") or "").strip().splitlines()[-1]) == [
+                True,
+                False,
+            ]
+        finally:
+            await docker_ptc_sandbox.execute_bash_command(
+                f"touch {shlex.quote(release_flag)}"
+            )
+            await holder_task
+            await docker_ptc_sandbox.execute_bash_command(
+                f"rm -f {shlex.quote(active_locked_tmp)} {shlex.quote(stale_unlocked_tmp)} "
+                f"{shlex.quote(ready_flag)} {shlex.quote(release_flag)}"
+            )
+
+        # 3. Failed rm aborts delete fence -> recovery still restores the file
+        fenced_b = await begin_delete_workspace_chat_uploads(
+            workspace_id=workspace_id,
+            caller_user_id=user["user_id"],
+            candidate_client_paths=[rel_b],
+            sandbox=docker_ptc_sandbox,
+            layout=layout,
+        )
+        assert fenced_b == [up_b["upload_id"]]
+        assert not await chat_uploads_db.is_upload_retained_for_recovery(
+            up_b["upload_id"], workspace_id
+        )
+        await abort_delete_workspace_chat_uploads(
+            workspace_id=workspace_id,
+            caller_user_id=user["user_id"],
+            failed_client_paths=[rel_b],
+        )
+        assert await chat_uploads_db.is_upload_retained_for_recovery(
+            up_b["upload_id"], workspace_id
+        )
+
+        # 4. Explicit delete fenced before rm prevents concurrent rematerialize from recreating deleted file
+        fenced_a = await begin_delete_workspace_chat_uploads(
+            workspace_id=workspace_id,
+            caller_user_id=user["user_id"],
+            candidate_client_paths=[rel_a],
+            sandbox=docker_ptc_sandbox,
+            layout=layout,
+        )
+        assert fenced_a == [up_a["upload_id"]]
+        await docker_ptc_sandbox.execute_bash_command(f"rm -f {shlex.quote(abs_a)}")
+
+        # Recovery runs after rm but BEFORE retire_deleted_workspace_chat_uploads finishes
+        mid_delete_restore = await rematerialize_workspace_chat_uploads(
+            workspace_id, docker_ptc_sandbox, layout=layout
+        )
+        assert mid_delete_restore["errors"] == 0
+        exists_a_mid = await docker_ptc_sandbox.execute_bash_command(
+            f"python3 -c 'import json, os; print(json.dumps(os.path.exists({abs_a!r})))'"
+        )
+        assert json.loads((exists_a_mid.get("stdout") or "").strip().splitlines()[-1]) is False
+
+        retired_a = await retire_deleted_workspace_chat_uploads(
+            workspace_id=workspace_id,
+            caller_user_id=user["user_id"],
+            deleted_client_paths=[rel_a],
+            sandbox=docker_ptc_sandbox,
+            layout=layout,
+        )
+        assert retired_a == 1
+        row_a_retired = await chat_uploads_db.get_upload(up_a["upload_id"])
+        assert row_a_retired is not None
+        assert row_a_retired["state"] == "aborted"
+        assert row_a_retired["cleaned_at"] is not None
+        assert storage.object_size(key_a) is None
+
+        # Non-deleted file B remains intact and verified
+        assert await cu_svc._probe_sandbox_file_matches(
+            docker_ptc_sandbox,
+            abs_b,
+            expected_size=2 * _MIB,
+            expected_sha256=sha_b,
+        )
+
+        # 5. Restore paused AFTER final is_upload_retained_for_recovery DB check and BEFORE
+        # remote publication in Docker while explicit delete completes: grant revocation under
+        # per-target flock prevents publication without relying on post-copy compensating rm!
+        await docker_ptc_sandbox.execute_bash_command(f"rm -f {shlex.quote(abs_b)}")
+        after_final_db_evt = asyncio.Event()
+        allow_publish_evt = asyncio.Event()
+
+        async def _pause_after_final_db(uid: str, _abs_target: str) -> None:
+            if uid == up_b["upload_id"] and not after_final_db_evt.is_set():
+                after_final_db_evt.set()
+                await allow_publish_evt.wait()
+
+        with patch.object(
+            cu_svc, "_AFTER_FINAL_RECOVERY_DB_CHECK_HOOK", _pause_after_final_db
+        ):
+            restore_task = asyncio.create_task(
+                rematerialize_workspace_chat_uploads(
+                    workspace_id, docker_ptc_sandbox, layout=layout
+                )
+            )
+            await asyncio.wait_for(after_final_db_evt.wait(), timeout=10.0)
+            await begin_delete_workspace_chat_uploads(
+                workspace_id=workspace_id,
+                caller_user_id=user["user_id"],
+                candidate_client_paths=[rel_b],
+                sandbox=docker_ptc_sandbox,
+                layout=layout,
+            )
+            await docker_ptc_sandbox.execute_bash_command(f"rm -f {shlex.quote(abs_b)}")
+            await retire_deleted_workspace_chat_uploads(
+                workspace_id=workspace_id,
+                caller_user_id=user["user_id"],
+                deleted_client_paths=[rel_b],
+                sandbox=docker_ptc_sandbox,
+                layout=layout,
+            )
+            allow_publish_evt.set()
+            restore_res = await restore_task
+            assert restore_res == {"restored": 0, "errors": 0}
+
+        exists_b_after = await docker_ptc_sandbox.execute_bash_command(
+            f"python3 -c 'import json, os; print(json.dumps(os.path.exists({abs_b!r})))'"
+        )
+        assert json.loads((exists_b_after.get("stdout") or "").strip().splitlines()[-1]) is False
+        row_b_retired = await chat_uploads_db.get_upload(up_b["upload_id"])
+        assert row_b_retired is not None
+        assert row_b_retired["state"] == "aborted"
+        assert row_b_retired["cleaned_at"] is not None
+        assert storage.object_size(key_b) is None
+
+        # 6. Stable target lock inode + deterministic multi-process flock coordination inside Docker
+        #    (Attempt 1 opens lock -> Attempt 2 cleanup runs without unlinking lock -> Attempt 1
+        #    acquires lock, checks grant, and pauses before publication -> Delete revocation blocks
+        #    on same inode while independent Target D publishes -> Attempt 1 finishes, Delete unlinks,
+        #    overlapping Attempt 3 exits superseded, SIGKILL releases flock, Target C stays absent).
+        up_c, key_c, sha_c = await _upload_streamed_file_via_http(
+            chat_upload_infra.client,
+            user_id=user["user_id"],
+            workspace_id=workspace_id,
+            filename="stable_lock_c.bin",
+            mime_type="application/octet-stream",
+            total_bytes=1 * _MIB,
+            seed_tag=b"conc-lock-c",
+            tracked_keys=chat_upload_infra.tracked_keys,
+            tracked_multiparts=chat_upload_infra.tracked_multiparts,
+        )
+        up_d, key_d, sha_d = await _upload_streamed_file_via_http(
+            chat_upload_infra.client,
+            user_id=user["user_id"],
+            workspace_id=workspace_id,
+            filename="independent_d.bin",
+            mime_type="application/octet-stream",
+            total_bytes=1 * _MIB,
+            seed_tag=b"conc-lock-d",
+            tracked_keys=chat_upload_infra.tracked_keys,
+            tracked_multiparts=chat_upload_infra.tracked_multiparts,
+        )
+        await confirm_request_chat_uploads(
+            [
+                {"type": "chat_upload", "upload_id": up_c["upload_id"]},
+                {"type": "chat_upload", "upload_id": up_d["upload_id"]},
+            ],
+            user_id=user["user_id"],
+            workspace_id=workspace_id,
+        )
+        row_c = await chat_uploads_db.get_upload(up_c["upload_id"])
+        row_d = await chat_uploads_db.get_upload(up_d["upload_id"])
+        assert row_c is not None and row_d is not None
+        rel_c = build_sandbox_upload_rel_path(row_c)
+        rel_d = build_sandbox_upload_rel_path(row_d)
+        abs_c = docker_ptc_sandbox.normalize_path(rel_c, project=project)
+        abs_d = docker_ptc_sandbox.normalize_path(rel_d, project=project)
+
+        grant_c1, lock_c = await cu_svc._create_restore_grant(
+            docker_ptc_sandbox, abs_c, up_c["upload_id"], "att-c1"
+        )
+        grant_c2, lock_c2 = await cu_svc._create_restore_grant(
+            docker_ptc_sandbox, abs_c, up_c["upload_id"], "att-c2"
+        )
+        grant_c3, _ = await cu_svc._create_restore_grant(
+            docker_ptc_sandbox, abs_c, up_c["upload_id"], "att-c3"
+        )
+        assert lock_c == lock_c2
+
+        ino_res = await docker_ptc_sandbox.execute_bash_command(
+            f"python3 -c 'import json, os; print(json.dumps(os.stat({lock_c!r}).st_ino))'"
+        )
+        initial_c_ino = int(json.loads((ino_res.get("stdout") or "").strip().splitlines()[-1]))
+
+        stage_c1 = f"{ws_root_dir}/.stage-c1"
+        stage_c3 = f"{ws_root_dir}/.stage-c3"
+        open_r_c1 = f"{ws_root_dir}/.open-r-c1"
+        open_go_c1 = f"{ws_root_dir}/.open-go-c1"
+        grant_r_c1 = f"{ws_root_dir}/.grant-r-c1"
+        grant_go_c1 = f"{ws_root_dir}/.grant-go-c1"
+        del_r_c = f"{ws_root_dir}/.del-r-c"
+        del_go_c = f"{ws_root_dir}/.del-go-c"
+
+        payload_c = b"".join(
+            chunk for _, chunk, _ in _iter_deterministic_parts(1 * _MIB, seed_tag=b"conc-lock-c")
+        )
+        await docker_ptc_sandbox.aupload_file_bytes(stage_c1, payload_c)
+        await docker_ptc_sandbox.aupload_file_bytes(stage_c3, payload_c)
+
+        fin_c1_cmd = cu_svc._build_stream_finalize_script(
+            stage_c1,
+            abs_c,
+            1 * _MIB,
+            sha_c,
+            grant_path=grant_c1,
+            lock_path=lock_c,
+        )
+        c1_task = asyncio.create_task(
+            docker_ptc_sandbox.execute_bash_command(
+                f"WSFILES_TEST_PAUSE_AFTER_LOCK_OPEN={shlex.quote(f'{open_r_c1}:{open_go_c1}')} "
+                f"WSFILES_TEST_PAUSE_AFTER_GRANT_CHECK={shlex.quote(f'{grant_r_c1}:{grant_go_c1}')} "
+                f"{fin_c1_cmd}",
+                timeout=30,
+            )
+        )
+        for _ in range(50):
+            chk = await docker_ptc_sandbox.execute_bash_command(
+                f"test -f {shlex.quote(open_r_c1)} && cat {shlex.quote(open_r_c1)}"
+            )
+            if (chk.get("stdout") or "").strip():
+                break
+            await asyncio.sleep(0.05)
+        assert int((chk.get("stdout") or "").strip().split(":")[1]) == initial_c_ino
+
+        # Attempt 2 cleanup runs while Attempt 1 has opened lock_c before flock: lock inode stays stable!
+        await cu_svc._cleanup_restore_grant(docker_ptc_sandbox, grant_c2, lock_c)
+        ino_after_clean = await docker_ptc_sandbox.execute_bash_command(
+            f"python3 -c 'import json, os; print(json.dumps([os.path.exists({grant_c2!r}), os.stat({lock_c!r}).st_ino]))'"
+        )
+        assert json.loads((ino_after_clean.get("stdout") or "").strip().splitlines()[-1]) == [
+            False,
+            initial_c_ino,
+        ]
+
+        # Let Attempt 1 acquire LOCK_EX, check grant_c1, and pause before os.replace
+        await docker_ptc_sandbox.execute_bash_command(f"touch {shlex.quote(open_go_c1)}")
+        for _ in range(50):
+            chk_g = await docker_ptc_sandbox.execute_bash_command(
+                f"test -f {shlex.quote(grant_r_c1)} && echo ready"
+            )
+            if "ready" in (chk_g.get("stdout") or ""):
+                break
+            await asyncio.sleep(0.05)
+
+        # Start explicit delete revocation while Attempt 1 holds LOCK_EX -> must block!
+        revoke_task = asyncio.create_task(
+            cu_svc._revoke_restore_grants_in_sandbox(
+                docker_ptc_sandbox,
+                layout,
+                [row_c],
+                unlink_target=True,
+                pause_in_lock_expr=(
+                    f"open({del_r_c!r}, 'w').write(str(os.fstat(fd).st_ino)); "
+                    f"dl = time.monotonic() + 15.0\n"
+                    f"        while not os.path.exists({del_go_c!r}) and time.monotonic() < dl:\n"
+                    f"            time.sleep(0.02)"
+                ),
+            )
+        )
+        await asyncio.sleep(0.15)
+        assert not revoke_task.done()
+
+        # Meanwhile, independent Target D restores and publishes without blocking!
+        remat_d = await rematerialize_workspace_chat_uploads(
+            workspace_id, docker_ptc_sandbox, layout=layout
+        )
+        assert remat_d["restored"] >= 1
+        assert await cu_svc._probe_sandbox_file_matches(
+            docker_ptc_sandbox, abs_d, expected_size=1 * _MIB, expected_sha256=sha_d
+        )
+
+        # Release Attempt 1 -> it publishes and exits -> revoke_task acquires LOCK_EX on same inode!
+        await docker_ptc_sandbox.execute_bash_command(f"touch {shlex.quote(grant_go_c1)}")
+        c1_res = await c1_task
+        assert c1_res.get("success") is True
+
+        for _ in range(50):
+            chk_d = await docker_ptc_sandbox.execute_bash_command(
+                f"test -f {shlex.quote(del_r_c)} && cat {shlex.quote(del_r_c)}"
+            )
+            if (chk_d.get("stdout") or "").strip():
+                break
+            await asyncio.sleep(0.05)
+        assert int((chk_d.get("stdout") or "").strip()) == initial_c_ino
+
+        # Overlapping Attempt 3 starts while revoke_task holds LOCK_EX, then exits superseded (5)
+        fin_c3_cmd = cu_svc._build_stream_finalize_script(
+            stage_c3,
+            abs_c,
+            1 * _MIB,
+            sha_c,
+            grant_path=grant_c3,
+            lock_path=lock_c,
+        )
+        c3_task = asyncio.create_task(
+            docker_ptc_sandbox.execute_bash_command(fin_c3_cmd, timeout=30)
+        )
+        await asyncio.sleep(0.1)
+        await docker_ptc_sandbox.execute_bash_command(f"touch {shlex.quote(del_go_c)}")
+        await revoke_task
+        c3_res = await c3_task
+        assert c3_res.get("success") is False
+
+        # Target C is absent after all attempts and delete complete, while Target D remains intact
+        c_exists = await docker_ptc_sandbox.execute_bash_command(
+            f"python3 -c 'import json, os; print(json.dumps([os.path.exists({abs_c!r}), os.path.exists({abs_d!r}), os.stat({lock_c!r}).st_ino]))'"
+        )
+        assert json.loads((c_exists.get("stdout") or "").strip().splitlines()[-1]) == [
+            False,
+            True,
+            initial_c_ino,
+        ]
+        await docker_ptc_sandbox.execute_bash_command(
+            f"rm -f {shlex.quote(open_r_c1)} {shlex.quote(open_go_c1)} "
+            f"{shlex.quote(grant_r_c1)} {shlex.quote(grant_go_c1)} "
+            f"{shlex.quote(del_r_c)} {shlex.quote(del_go_c)}"
+        )
+
+        # 7. Actual CRUD delete_workspace_files path with restore past final DB check:
+        #    nonzero revocation, transport failure, unlink error while ordinary rm works,
+        #    retire-stage failure, and subsequent successful retry!
+        from contextlib import asynccontextmanager
+        from src.server.app.workspace_files import crud as ws_crud
+
+        ws_meta = {
+            "workspace_id": workspace_id,
+            "user_id": user["user_id"],
+            "status": "running",
+            "dir_name": project.dir_name,
+            "computer_root_dir": layout.root,
+        }
+
+        @asynccontextmanager
+        async def _acquire_docker_sbx(_ws_id: str, _owner_id: str):
+            yield docker_ptc_sandbox, ws_meta
+
+        grant_d_active, lock_d = await cu_svc._create_restore_grant(
+            docker_ptc_sandbox, abs_d, up_d["upload_id"], "crud-e2e-1"
+        )
+        grant_d_dir = os.path.dirname(grant_d_active)
+        del_body_d = ws_crud.DeleteFilesRequest(paths=[rel_d])
+        orig_rt_call = docker_ptc_sandbox._runtime_call
+
+        with (
+            patch.object(
+                ws_crud,
+                "owned_workspace_on_computer",
+                create_autospec(ws_crud.owned_workspace_on_computer, return_value=ws_meta),
+            ),
+            patch.object(
+                ws_crud,
+                "acquire_sandbox_to_change",
+                create_autospec(ws_crud.acquire_sandbox_to_change, side_effect=_acquire_docker_sbx),
+            ),
+            patch.object(
+                ws_crud,
+                "owner_work_dir",
+                create_autospec(ws_crud.owner_work_dir, return_value=layout.workspace),
+            ),
+            patch.object(
+                ws_crud,
+                "owner_layout",
+                create_autospec(ws_crud.owner_layout, return_value=layout),
+            ),
+        ):
+            # (a) Nonzero revocation exit code -> reported in errors, not deleted; explicit_delete_pending preserved
+            async def _rt_nonzero(fn, *args, **kwargs):
+                cmd = str(args[0]) if args else ""
+                if "items, unlink_tgt = json.loads(sys.argv[1])" in cmd:
+                    return SimpleNamespace(stdout="", stderr="injected revoke nonzero", exit_code=1)
+                return await orig_rt_call(fn, *args, **kwargs)
+
+            with patch.object(docker_ptc_sandbox, "_runtime_call", side_effect=_rt_nonzero):
+                res_nz = await ws_crud.delete_workspace_files(
+                    workspace_id=workspace_id, x_user_id=user["user_id"], body=del_body_d
+                )
+            assert res_nz["deleted"] == []
+            assert len(res_nz["errors"]) == 1 and res_nz["errors"][0]["path"] == rel_d
+            assert not await chat_uploads_db.is_upload_retained_for_recovery(
+                up_d["upload_id"], workspace_id
+            )
+
+            # (b) Transport timeout on revocation -> reported in errors, not deleted; restriction NOT cleared
+            async def _rt_timeout(fn, *args, **kwargs):
+                cmd = str(args[0]) if args else ""
+                if "items, unlink_tgt = json.loads(sys.argv[1])" in cmd:
+                    raise TimeoutError("sandbox exec transport timeout")
+                return await orig_rt_call(fn, *args, **kwargs)
+
+            with patch.object(docker_ptc_sandbox, "_runtime_call", side_effect=_rt_timeout):
+                res_to = await ws_crud.delete_workspace_files(
+                    workspace_id=workspace_id, x_user_id=user["user_id"], body=del_body_d
+                )
+            assert res_to["deleted"] == []
+            assert len(res_to["errors"]) == 1 and res_to["errors"][0]["path"] == rel_d
+            assert not await chat_uploads_db.is_upload_retained_for_recovery(
+                up_d["upload_id"], workspace_id
+            )
+
+            # (c) Unlink failure inside grant_d_dir while ordinary rm in work/uploads remains available
+            await docker_ptc_sandbox.execute_bash_command(
+                f"mkdir -p {shlex.quote(grant_d_dir + '/unremovable_dir_entry')} && chmod 0500 {shlex.quote(grant_d_dir)}"
+            )
+            try:
+                res_ul = await ws_crud.delete_workspace_files(
+                    workspace_id=workspace_id, x_user_id=user["user_id"], body=del_body_d
+                )
+                assert res_ul["deleted"] == []
+                assert len(res_ul["errors"]) == 1 and res_ul["errors"][0]["path"] == rel_d
+                assert not await chat_uploads_db.is_upload_retained_for_recovery(
+                    up_d["upload_id"], workspace_id
+                )
+            finally:
+                await docker_ptc_sandbox.execute_bash_command(
+                    f"chmod 0700 {shlex.quote(grant_d_dir)} && rmdir {shlex.quote(grant_d_dir + '/unremovable_dir_entry')}"
+                )
+
+            # (d) Retire-stage failure -> reported in errors, not deleted; S3 object preserved until retry
+            async def _rt_retire_fail(fn, *args, **kwargs):
+                cmd = str(args[0]) if args else ""
+                if "items, unlink_tgt = json.loads(sys.argv[1])" in cmd and cmd.rstrip().endswith(" 1"):
+                    return SimpleNamespace(stdout="", stderr="injected retire failure", exit_code=1)
+                return await orig_rt_call(fn, *args, **kwargs)
+
+            with patch.object(docker_ptc_sandbox, "_runtime_call", side_effect=_rt_retire_fail):
+                res_rf = await ws_crud.delete_workspace_files(
+                    workspace_id=workspace_id, x_user_id=user["user_id"], body=del_body_d
+                )
+            assert res_rf["deleted"] == []
+            assert len(res_rf["errors"]) == 1 and res_rf["errors"][0]["path"] == rel_d
+            assert storage.object_size(key_d) == 1 * _MIB
+
+            # (e) Subsequent retry succeeds -> file absent, DB row aborted, S3 object removed
+            res_ok = await ws_crud.delete_workspace_files(
+                workspace_id=workspace_id, x_user_id=user["user_id"], body=del_body_d
+            )
+            assert res_ok == {"deleted": [rel_d], "errors": []}
+            row_d_retired = await chat_uploads_db.get_upload(up_d["upload_id"])
+            assert row_d_retired is not None and row_d_retired["state"] == "aborted"
+            assert storage.object_size(key_d) is None
+
+            # Clean up up_c as well
+            await retire_deleted_workspace_chat_uploads(
+                workspace_id=workspace_id,
+                caller_user_id=user["user_id"],
+                deleted_client_paths=[rel_c],
+                sandbox=docker_ptc_sandbox,
+                layout=layout,
+            )

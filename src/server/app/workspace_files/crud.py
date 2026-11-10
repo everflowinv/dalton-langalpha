@@ -1799,6 +1799,14 @@ async def delete_workspace_files(
 
         deleted: list[str] = []
         if valid_paths:
+            from src.dalton.services.chat_uploads import (
+                abort_delete_workspace_chat_uploads,
+                begin_delete_workspace_chat_uploads,
+                retire_deleted_workspace_chat_uploads,
+            )
+
+            candidate_client_paths = [cp for _, cp in valid_paths]
+            failed_client_paths: list[str] = []
             # ``rm -f`` through the shell bypasses the write path, so it has to take
             # the same per-path locks an upload takes or it can land between another
             # writer's read and write. Acquired in sorted order, and only ever in
@@ -1807,36 +1815,100 @@ async def delete_workspace_files(
                 for normalized, _ in sorted(valid_paths):
                     await locks.enter_async_context(sandbox.path_write_lock(normalized))
 
-                rm_args = " ".join(shlex.quote(p) for p, _ in valid_paths)
-                result = await sandbox.execute_bash_command(f"rm -f {rm_args}")
-                if result.get("success"):
-                    deleted = [cp for _, cp in valid_paths]
-                else:
-                    # Batch failed: fall back to per-file delete
-                    for normalized, client_path in valid_paths:
-                        r = await sandbox.execute_bash_command(
-                            f"rm -f {shlex.quote(normalized)}"
+                ws_layout = owner_layout(workspace)
+                # DALTON-HOOK(chat-large-upload): fence and retire retained chat uploads under path_write_lock
+                try:
+                    await begin_delete_workspace_chat_uploads(
+                        workspace_id=workspace_id,
+                        caller_user_id=x_user_id,
+                        candidate_client_paths=candidate_client_paths,
+                        sandbox=sandbox,
+                        layout=ws_layout,
+                    )
+                except HTTPException:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to establish chat upload delete safety for workspace %s: %s",
+                        workspace_id,
+                        exc,
+                    )
+                    for _, client_path in valid_paths:
+                        errors.append(
+                            {
+                                "path": client_path,
+                                "detail": f"Delete retryable; failed to revoke active restore grant: {exc}",
+                            }
                         )
-                        if r.get("success"):
-                            deleted.append(client_path)
-                        else:
+                    return {"deleted": deleted, "errors": errors}
+                try:
+                    rm_args = " ".join(shlex.quote(p) for p, _ in valid_paths)
+                    result = await sandbox.execute_bash_command(f"rm -f {rm_args}")
+                    if result.get("success"):
+                        deleted = list(candidate_client_paths)
+                    else:
+                        # Batch failed: fall back to per-file delete
+                        for normalized, client_path in valid_paths:
+                            r = await sandbox.execute_bash_command(
+                                f"rm -f {shlex.quote(normalized)}"
+                            )
+                            if r.get("success"):
+                                deleted.append(client_path)
+                            else:
+                                failed_client_paths.append(client_path)
+                                errors.append(
+                                    {
+                                        "path": client_path,
+                                        "detail": r.get("stderr", "Delete failed"),
+                                    }
+                                )
+                except Exception as exc:
+                    logger.warning(
+                        "Uncertain sandbox rm failure for workspace %s: %s",
+                        workspace_id,
+                        exc,
+                    )
+                    for _, client_path in valid_paths:
+                        if client_path not in failed_client_paths:
                             errors.append(
                                 {
                                     "path": client_path,
-                                    "detail": r.get("stderr", "Delete failed"),
+                                    "detail": f"Delete retryable; remote rm failed or timed out: {exc}",
                                 }
                             )
+                    deleted = []
+                    return {"deleted": deleted, "errors": errors}
 
-        # DALTON-HOOK(chat-large-upload): retire and clean retained chat uploads when explicitly deleted
-        if deleted:
-            from src.dalton.services.chat_uploads import (
-                retire_deleted_workspace_chat_uploads,
-            )
-
-            await retire_deleted_workspace_chat_uploads(
-                workspace_id=workspace_id,
-                caller_user_id=x_user_id,
-                deleted_client_paths=deleted,
-            )
+                if failed_client_paths:
+                    await abort_delete_workspace_chat_uploads(
+                        workspace_id=workspace_id,
+                        caller_user_id=x_user_id,
+                        failed_client_paths=failed_client_paths,
+                    )
+                if deleted:
+                    try:
+                        await retire_deleted_workspace_chat_uploads(
+                            workspace_id=workspace_id,
+                            caller_user_id=x_user_id,
+                            deleted_client_paths=deleted,
+                            sandbox=sandbox,
+                            layout=ws_layout,
+                        )
+                    except HTTPException:
+                        raise
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to retire deleted chat uploads for workspace %s: %s",
+                            workspace_id,
+                            exc,
+                        )
+                        for client_path in deleted:
+                            errors.append(
+                                {
+                                    "path": client_path,
+                                    "detail": f"Delete incomplete (retryable); failed to finalize upload retirement: {exc}",
+                                }
+                            )
+                        deleted = []
 
     return {"deleted": deleted, "errors": errors}

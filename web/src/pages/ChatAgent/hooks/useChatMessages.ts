@@ -91,6 +91,7 @@ import { loadConversationHistory as replayConversationHistory } from '../session
 import { loadOlderHistoryPage, commitOlderHistoryPage } from '../session/history/olderPages';
 import { createHistoryWindow, HISTORY_PAGE_TURNS } from '../session/history/historyWindow';
 import { createStreamEventProcessor, type StreamRouterDeps } from '../session/stream/processStreamEvent';
+import { foldFailedSteer } from '../session/stream/steeringDelivery';
 import { DROPPED_BEFORE_RUN, forkRequest, retryRequest, retryRequestFor, sendRequest, settleRetryNotice, type HeldRetry, type RetryNotice, type TurnRequest } from '../session/stream/autoRetry';
 import { createLiveTranscript, type LiveMessages } from '../session/stream/liveMessages';
 // DALTON-HOOK(provenance-batch): frame-batched live provenance buffer
@@ -1389,6 +1390,57 @@ export function useChatMessages(
     return true;
   };
 
+  // DALTON-HOOK(chat-large-upload): fold durable failed steers from /status and surface error on waiting steer bubbles
+  const applyStatusFailedSteers = (status: WorkflowStatusResponse): boolean => {
+    const failedSteers = Array.isArray(status.failed_steers) ? status.failed_steers : [];
+    if (failedSteers.length === 0) return false;
+    const fallbackTurn = typeof status.latest_turn_index === 'number'
+      ? status.latest_turn_index
+      : (lastRenderedTurnIndexRef.current ?? undefined);
+    let surfacedError: string | null = null;
+    const currentMsgs = liveMessages.get();
+    for (const entry of failedSteers) {
+      if (!entry || typeof entry !== 'object') continue;
+      const reqKey = typeof entry.request_key === 'string' && entry.request_key ? entry.request_key : undefined;
+      const jobId = typeof entry.job_id === 'string' && entry.job_id ? entry.job_id : undefined;
+      if (reqKey) {
+        requestKeys.spend(reqKey);
+        if (entry.artifact_comments !== undefined) {
+          const shownComments = readArtifactCommentsShown(entry.artifact_comments);
+          if (shownComments) requestKeys.returned(shownComments);
+        }
+      }
+      const hadWaitingSteer = currentMsgs.some(
+        (m) =>
+          m.role === 'user' &&
+          Boolean((m as UserMessage).steering) &&
+          !m.steeringDelivered &&
+          !(m as UserMessage).queueError &&
+          ((reqKey && (m as UserMessage).requestKey === reqKey) ||
+            (!reqKey && (!jobId || m.id === `failed-steer-${jobId}`))),
+      );
+      if (hadWaitingSteer) {
+        surfacedError =
+          typeof entry.error === 'string' && entry.error.trim()
+            ? entry.error.trim()
+            : 'Attachment could not be delivered.';
+      }
+    }
+    setMessages((prev) => {
+      let next = prev;
+      for (const entry of failedSteers) {
+        if (!entry || typeof entry !== 'object') continue;
+        const entryTurn = typeof entry.turn_index === 'number' ? entry.turn_index : fallbackTurn;
+        next = foldFailedSteer(next, entry, entryTurn);
+      }
+      return next;
+    });
+    if (surfacedError) {
+      setMessageError(surfacedError);
+    }
+    return Boolean(surfacedError);
+  };
+
   // Load history when workspace or threadId changes, then check for reconnection
   useEffect(() => {
     const reloadAsked = reloadTrigger !== reloadSeenRef.current;
@@ -1504,8 +1556,18 @@ export function useChatMessages(
         (p) => p.content || p.artifact_comments || normalizeAttachments(p.attachments),
       );
       const pendingKeys = new Set(pendingSteers.map((p) => p.request_key).filter((key): key is string => !!key));
+      const failedSteers = Array.isArray(status.failed_steers) ? status.failed_steers : [];
+      const failedKeys = new Set(
+        failedSteers
+          .map((f) => (typeof f?.request_key === 'string' && f.request_key ? f.request_key : null))
+          .filter((key): key is string => !!key),
+      );
       const settleEndedRun = (ok: boolean) => {
         if (cancelled || sessionEpochRef.current !== sessionEpochAtStart) return;
+        // DALTON-HOOK(chat-large-upload): fold permanently failed parked steers before pruning queued bubbles
+        if (ok && failedSteers.length > 0) {
+          applyStatusFailedSteers(status);
+        }
         // A steer a give-up kept queued, in a run that ended without the
         // replay delivering it, is queued no more unless the status still
         // lists it: the server made it a turn of its own, which shows when it
@@ -1513,7 +1575,8 @@ export function useChatMessages(
         if (ok && !status.can_reconnect && status.status !== 'error') {
           const queued = new Set(liveMessages.get()
             .filter((m) => m.role === 'user' && !m.isHistory && (m as { steering?: boolean }).steering
-              && !pendingKeys.has((m as { requestKey?: string }).requestKey ?? ''))
+              && !pendingKeys.has((m as { requestKey?: string }).requestKey ?? '')
+              && !failedKeys.has((m as { requestKey?: string }).requestKey ?? ''))
             .map((m) => m.id));
           if (queued.size > 0) setMessages((prev) => prev.filter((m) => !queued.has(m.id)));
         }
@@ -1774,6 +1837,121 @@ export function useChatMessages(
     // Note: loadConversationHistory is not in deps because it uses workspaceId and threadId from closure
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspaceId, threadId, reloadTrigger]);
+
+  // DALTON-HOOK(chat-large-upload): reconcile accepted steers still waiting after run_end until each reaches a terminal state
+  const isWaitingAcceptedSteer = (m: ChatMessage): m is UserMessage =>
+    m.role === 'user' &&
+    Boolean((m as UserMessage).steering) &&
+    !m.steeringDelivered &&
+    !(m as UserMessage).queueError;
+
+  const hasWaitingAcceptedSteer = messages.some(isWaitingAcceptedSteer);
+  useEffect(() => {
+    if (
+      isLoading ||
+      isCompacting ||
+      !hasWaitingAcceptedSteer ||
+      !workspaceId ||
+      !threadId ||
+      threadId === '__default__'
+    ) {
+      return;
+    }
+    let stopped = false;
+    let inFlight = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let attempts = 0;
+    let missingReads = 0;
+    const epochAtStart = sessionEpochRef.current;
+
+    const scheduleNext = (delayMs: number) => {
+      if (stopped) return;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = null;
+        void pollParkedSteer();
+      }, delayMs);
+    };
+
+    const pollParkedSteer = async () => {
+      if (stopped || inFlight || isStreamingRef.current || sessionEpochRef.current !== epochAtStart) {
+        return;
+      }
+      inFlight = true;
+      attempts += 1;
+      try {
+        const status = await getWorkflowStatus(threadId);
+        if (stopped || isStreamingRef.current || sessionEpochRef.current !== epochAtStart) return;
+        applyStatusFailedSteers(status);
+
+        const waitingMessages = liveMessages.get().filter(isWaitingAcceptedSteer);
+        if (waitingMessages.length === 0) {
+          return;
+        }
+        const waitingKeys = new Set(
+          waitingMessages
+            .map((m) => m.requestKey)
+            .filter((k): k is string => Boolean(k)),
+        );
+        if (status.can_reconnect && status.run_id && status.run_id !== currentRunIdRef.current) {
+          setReloadTrigger((n) => n + 1);
+          return;
+        }
+        if (
+          typeof status.latest_turn_index === 'number' &&
+          lastRenderedTurnIndexRef.current !== null &&
+          status.latest_turn_index > lastRenderedTurnIndexRef.current
+        ) {
+          setReloadTrigger((n) => n + 1);
+          return;
+        }
+        const pendingSet = new Set(
+          (status.pending_steers ?? [])
+            .map((p) => p.request_key)
+            .filter((k): k is string => Boolean(k)),
+        );
+        const stillPending =
+          waitingKeys.size === 0 || [...waitingKeys].some((k) => pendingSet.has(k));
+        if (!stillPending && !status.can_reconnect && status.status !== 'error') {
+          missingReads += 1;
+          if (missingReads >= 2) {
+            setReloadTrigger((n) => n + 1);
+            return;
+          }
+        } else {
+          missingReads = 0;
+        }
+      } catch {
+        // Transient status/network error: keep reconciling across backoff or online recovery.
+      } finally {
+        inFlight = false;
+      }
+      if (!stopped && liveMessages.get().some(isWaitingAcceptedSteer)) {
+        const nextDelayMs =
+          attempts <= 3 ? 60 : attempts <= 10 ? 150 : attempts <= 25 ? 300 : 600;
+        scheduleNext(nextDelayMs);
+      }
+    };
+
+    const handleOnline = () => {
+      if (stopped || isStreamingRef.current) return;
+      scheduleNext(10);
+    };
+    if (typeof window !== 'undefined') {
+      window.addEventListener('online', handleOnline);
+    }
+
+    scheduleNext(40);
+
+    return () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('online', handleOnline);
+      }
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isLoading, isCompacting, hasWaitingAcceptedSteer, workspaceId, threadId]);
 
   // Opening a thread while offline fails its history load and tells the user it
   // will catch up when the link returns. Nothing else makes that true: the

@@ -34,6 +34,7 @@ import {
 import type { ChatMessage, UserMessage } from '@/types/chat';
 import type { MessageRecord, SetMessages } from '@/pages/ChatAgent/hooks/utils/types';
 import type { PairState, StreamProcessorRefs } from '@/pages/ChatAgent/session/types';
+import { useChatMessages } from '@/pages/ChatAgent/hooks/useChatMessages';
 
 const {
   apiPostMock,
@@ -41,12 +42,24 @@ const {
   apiGetMock,
   apiDeleteMock,
   toastSpy,
+  getWorkflowStatusMock,
+  replayThreadHistoryMock,
+  sendChatMessageStreamMock,
+  fetchThreadTurnsMock,
+  getThreadFeedbackMock,
+  watchThreadMock,
 } = vi.hoisted(() => ({
   apiPostMock: vi.fn(),
   apiPutMock: vi.fn(),
   apiGetMock: vi.fn(),
   apiDeleteMock: vi.fn(),
   toastSpy: vi.fn(),
+  getWorkflowStatusMock: vi.fn(),
+  replayThreadHistoryMock: vi.fn(),
+  sendChatMessageStreamMock: vi.fn(),
+  fetchThreadTurnsMock: vi.fn(),
+  getThreadFeedbackMock: vi.fn(),
+  watchThreadMock: vi.fn(),
 }));
 
 vi.mock('@/api/client', async (importOriginal) => {
@@ -63,10 +76,20 @@ vi.mock('@/api/client', async (importOriginal) => {
   };
 });
 
-vi.mock('@/pages/ChatAgent/utils/api', () => ({
-  getSkills: vi.fn().mockResolvedValue([]),
-  getModelMetadata: vi.fn().mockResolvedValue({}),
-}));
+vi.mock('@/pages/ChatAgent/utils/api', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/pages/ChatAgent/utils/api')>();
+  return {
+    ...actual,
+    getSkills: vi.fn().mockResolvedValue([]),
+    getModelMetadata: vi.fn().mockResolvedValue({}),
+    getWorkflowStatus: getWorkflowStatusMock,
+    replayThreadHistory: replayThreadHistoryMock,
+    sendChatMessageStream: sendChatMessageStreamMock,
+    fetchThreadTurns: fetchThreadTurnsMock,
+    getThreadFeedback: getThreadFeedbackMock,
+    watchThread: watchThreadMock,
+  };
+});
 
 vi.mock('@/hooks/usePreferences', () => ({
   usePreferences: () => ({ data: undefined, isLoading: false }),
@@ -1084,5 +1107,479 @@ describe('ChatInput large file uploads (up to 200 MiB)', () => {
       setMessages,
     });
     expect(historyMessages.filter((m) => m.role === 'user')).toHaveLength(1);
+  });
+
+  it('surfaces parked steer failure after run_end in the already-open useChatMessages client without starting another model run or manual reload', async () => {
+    const parkedAttachment = {
+      name: 'revoked_parked_200m.parquet',
+      type: 'file',
+      mime_type: 'application/octet-stream',
+      size: 200 * 1024 * 1024,
+      status: 'uploaded',
+      upload_id: 'up-parked-403',
+    };
+
+    let statusFailedSteers: Array<Record<string, unknown>> = [];
+    let statusPendingSteers: Array<{
+      content: string;
+      timestamp?: number;
+      request_key?: string;
+      attachments?: Array<Record<string, unknown>>;
+    }> = [];
+    let statusLatestTurn = -1;
+
+    getWorkflowStatusMock.mockImplementation(async () => ({
+      can_reconnect: false,
+      status: 'completed',
+      latest_turn_index: statusLatestTurn,
+      pending_steers: statusPendingSteers,
+      failed_steers: statusFailedSteers,
+    }));
+    replayThreadHistoryMock.mockImplementation(
+      async (_tid: string, onEvent: (ev: Record<string, unknown>) => void) => {
+        onEvent({ event: 'replay_done', thread_id: 'thread-parked-1' });
+        return { completed: true, aborted: false, disconnected: false };
+      },
+    );
+    fetchThreadTurnsMock.mockResolvedValue({ turns: [] });
+    getThreadFeedbackMock.mockResolvedValue([]);
+    watchThreadMock.mockReturnValue({ abort: vi.fn() });
+
+    let mainStreamOnEvent: ((ev: Record<string, unknown>) => void) | null = null;
+    let resolveMainStream:
+      | ((res: { completed: boolean; aborted: boolean; disconnected: boolean }) => void)
+      | null = null;
+    let steeredRequestKey: string | undefined;
+
+    sendChatMessageStreamMock.mockImplementation(
+      (
+        _msg: string,
+        _wsId: string,
+        _tId: string,
+        opts: {
+          onEvent: (ev: Record<string, unknown>) => void;
+          onThreadIdResolved?: (tid: string) => void;
+          onRunIdResolved?: (rid: string) => void;
+          requestKey?: string;
+          steerOnly?: boolean;
+        },
+      ) => {
+        if (opts.steerOnly) {
+          steeredRequestKey = opts.requestKey;
+          opts.onRunIdResolved?.('run-turn-0');
+          opts.onEvent({
+            event: 'steering_accepted',
+            position: 1,
+            content: 'Check revoked_parked_200m.parquet',
+            attachments: [parkedAttachment],
+          });
+          return Promise.resolve({ completed: true, aborted: false, disconnected: false });
+        }
+        mainStreamOnEvent = opts.onEvent;
+        opts.onThreadIdResolved?.('thread-parked-1');
+        opts.onRunIdResolved?.('run-turn-0');
+        opts.onEvent({
+          event: 'user_message',
+          role: 'user',
+          content: 'Analyze Q4 baseline',
+          turn_index: 0,
+        });
+        opts.onEvent({
+          event: 'message_chunk',
+          role: 'assistant',
+          content_type: 'text',
+          content: 'Working on Q4 baseline...',
+          turn_index: 0,
+        });
+        return new Promise((resolve) => {
+          resolveMainStream = resolve;
+        });
+      },
+    );
+
+    let hookState: ReturnType<typeof useChatMessages> | null = null;
+    function HookHarness() {
+      hookState = useChatMessages('ws-1', 'thread-parked-1');
+      return null;
+    }
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter>
+          <HookHarness />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    await waitFor(() => {
+      expect(hookState).not.toBeNull();
+      expect(hookState!.isLoadingThread).toBe(false);
+    });
+
+    // 1. Start Turn 0 live stream
+    act(() => {
+      void hookState!.handleSendMessage('Analyze Q4 baseline', null, null);
+    });
+    await waitFor(() => {
+      expect(hookState!.isLoading).toBe(true);
+      expect(mainStreamOnEvent).not.toBeNull();
+    });
+
+    // 2. While Turn 0 is active, send a steer with 200 MiB attachment; it is accepted and parked
+    await act(async () => {
+      const accepted = await hookState!.handleSendMessage(
+        'Check revoked_parked_200m.parquet',
+        [
+          {
+            type: 'chat_upload',
+            upload_id: 'up-parked-403',
+            name: parkedAttachment.name,
+            mime_type: parkedAttachment.mime_type,
+            size: parkedAttachment.size,
+          },
+        ],
+        [parkedAttachment],
+      );
+      expect(accepted).toBe(true);
+    });
+    expect(steeredRequestKey).toBeTruthy();
+
+    const waitingBeforeEnd = hookState!.messages.filter(
+      (m): m is UserMessage => m.role === 'user' && m.requestKey === steeredRequestKey,
+    );
+    expect(waitingBeforeEnd).toHaveLength(1);
+    expect(waitingBeforeEnd[0]).toMatchObject({
+      content: 'Check revoked_parked_200m.parquet',
+      steering: true,
+      queuePosition: 1,
+      attachments: [parkedAttachment],
+    });
+    expect(waitingBeforeEnd[0].queueError).toBeUndefined();
+
+    // 3. Turn 0 emits run_end and closes; parked steer then fails in outbox (e.g., 403 permission revoked)
+    statusLatestTurn = 0;
+    statusPendingSteers = [];
+    statusFailedSteers = [
+      {
+        reason: 'attachment_failed',
+        error: 'Workspace write permission required for attachment upload.',
+        error_code: 'http_403',
+        request_key: steeredRequestKey,
+        content: 'Check revoked_parked_200m.parquet',
+        attachments: [parkedAttachment],
+        timestamp: 1700000300,
+        job_id: 'job-parked-403',
+        turn_index: 0,
+      },
+    ];
+
+    await act(async () => {
+      mainStreamOnEvent!({
+        event: 'run_end',
+        thread_id: 'thread-parked-1',
+        run_id: 'run-turn-0',
+      });
+      resolveMainStream!({ completed: true, aborted: false, disconnected: false });
+    });
+
+    // 4. Open client automatically reconciles after run_end without starting another model run or manual reload
+    await waitFor(() => {
+      const steerAfter = hookState!.messages.find(
+        (m): m is UserMessage => m.role === 'user' && m.requestKey === steeredRequestKey,
+      );
+      expect(steerAfter).toBeDefined();
+      expect(steerAfter).toMatchObject({
+        content: 'Check revoked_parked_200m.parquet',
+        steering: false,
+        steeringDelivered: false,
+        queueRefused: true,
+        queueError: 'Workspace write permission required for attachment upload.',
+        requestKey: steeredRequestKey,
+        attachments: [parkedAttachment],
+      });
+      expect(hookState!.messageError).toBe(
+        'Workspace write permission required for attachment upload.',
+      );
+    });
+
+    // No extra model run was started (only Turn 0 + the steer POST)
+    expect(sendChatMessageStreamMock).toHaveBeenCalledTimes(2);
+    // User bubbles are never duplicated
+    const allSteerBubbles = hookState!.messages.filter(
+      (m): m is UserMessage => m.role === 'user' && m.requestKey === steeredRequestKey,
+    );
+    expect(allSteerBubbles).toHaveLength(1);
+  });
+
+  it('reconciles multiple waiting steers failing at different times, across transient offline errors, and past 6 seconds after run_end', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const att1 = {
+        name: 'first_revoked_200m.bin',
+        type: 'file',
+        mime_type: 'application/octet-stream',
+        size: 200 * 1024 * 1024,
+        status: 'uploaded',
+        upload_id: 'up-multi-1',
+      };
+      const att2 = {
+        name: 'second_delayed_fail.pdf',
+        type: 'pdf',
+        mime_type: 'application/pdf',
+        size: 4 * 1024 * 1024,
+        status: 'uploaded',
+        upload_id: 'up-multi-2',
+      };
+
+      let statusFailedSteers: Array<Record<string, unknown>> = [];
+      let statusPendingSteers: Array<{
+        content: string;
+        timestamp?: number;
+        request_key?: string;
+        attachments?: Array<Record<string, unknown>>;
+      }> = [];
+      let statusLatestTurn = -1;
+      let shouldThrowNetworkError = false;
+
+      getWorkflowStatusMock.mockImplementation(async () => {
+        if (shouldThrowNetworkError) {
+          throw new Error('Network offline');
+        }
+        return {
+          can_reconnect: false,
+          status: 'completed',
+          latest_turn_index: statusLatestTurn,
+          pending_steers: statusPendingSteers,
+          failed_steers: statusFailedSteers,
+        };
+      });
+      replayThreadHistoryMock.mockImplementation(
+        async (_tid: string, onEvent: (ev: Record<string, unknown>) => void) => {
+          onEvent({ event: 'replay_done', thread_id: 'thread-parked-multi' });
+          return { completed: true, aborted: false, disconnected: false };
+        },
+      );
+      fetchThreadTurnsMock.mockResolvedValue({ turns: [] });
+      getThreadFeedbackMock.mockResolvedValue([]);
+      watchThreadMock.mockReturnValue({ abort: vi.fn() });
+
+      let mainStreamOnEvent: ((ev: Record<string, unknown>) => void) | null = null;
+      let resolveMainStream:
+        | ((res: { completed: boolean; aborted: boolean; disconnected: boolean }) => void)
+        | null = null;
+      const steeredKeys: string[] = [];
+
+      sendChatMessageStreamMock.mockImplementation(
+        (
+          msg: string,
+          _wsId: string,
+          _tId: string,
+          opts: {
+            onEvent: (ev: Record<string, unknown>) => void;
+            onThreadIdResolved?: (tid: string) => void;
+            onRunIdResolved?: (rid: string) => void;
+            requestKey?: string;
+            steerOnly?: boolean;
+          },
+        ) => {
+          if (opts.steerOnly) {
+            if (opts.requestKey) steeredKeys.push(opts.requestKey);
+            opts.onRunIdResolved?.('run-multi-0');
+            const isFirst = steeredKeys.length === 1;
+            opts.onEvent({
+              event: 'steering_accepted',
+              position: steeredKeys.length,
+              content: msg,
+              attachments: [isFirst ? att1 : att2],
+            });
+            return Promise.resolve({ completed: true, aborted: false, disconnected: false });
+          }
+          mainStreamOnEvent = opts.onEvent;
+          opts.onThreadIdResolved?.('thread-parked-multi');
+          opts.onRunIdResolved?.('run-multi-0');
+          opts.onEvent({
+            event: 'user_message',
+            role: 'user',
+            content: 'Run multi-steer baseline',
+            turn_index: 0,
+          });
+          opts.onEvent({
+            event: 'message_chunk',
+            role: 'assistant',
+            content_type: 'text',
+            content: 'Processing baseline...',
+            turn_index: 0,
+          });
+          return new Promise((resolve) => {
+            resolveMainStream = resolve;
+          });
+        },
+      );
+
+      let hookState: ReturnType<typeof useChatMessages> | null = null;
+      function HookHarness() {
+        hookState = useChatMessages('ws-1', 'thread-parked-multi');
+        return null;
+      }
+
+      const queryClient = new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      });
+      render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <HookHarness />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+
+      await waitFor(() => {
+        expect(hookState).not.toBeNull();
+        expect(hookState!.isLoadingThread).toBe(false);
+      });
+
+      act(() => {
+        void hookState!.handleSendMessage('Run multi-steer baseline', null, null);
+      });
+      await waitFor(() => {
+        expect(hookState!.isLoading).toBe(true);
+        expect(mainStreamOnEvent).not.toBeNull();
+      });
+
+      // Admit two steers while Turn 0 is active
+      await act(async () => {
+        await hookState!.handleSendMessage(
+          'First parked steer',
+          [{ type: 'chat_upload', upload_id: 'up-multi-1', name: att1.name, size: att1.size }],
+          [att1],
+        );
+        await hookState!.handleSendMessage(
+          'Second delayed parked steer',
+          [{ type: 'chat_upload', upload_id: 'up-multi-2', name: att2.name, size: att2.size }],
+          [att2],
+        );
+      });
+      expect(steeredKeys).toHaveLength(2);
+      const [rk1, rk2] = steeredKeys;
+
+      // Turn 0 ends while client is temporarily offline; both steers are still parked
+      statusLatestTurn = 0;
+      shouldThrowNetworkError = true;
+      statusPendingSteers = [
+        { content: 'First parked steer', request_key: rk1, attachments: [att1] },
+        { content: 'Second delayed parked steer', request_key: rk2, attachments: [att2] },
+      ];
+
+      await act(async () => {
+        mainStreamOnEvent!({
+          event: 'run_end',
+          thread_id: 'thread-parked-multi',
+          run_id: 'run-multi-0',
+        });
+        resolveMainStream!({ completed: true, aborted: false, disconnected: false });
+      });
+
+      // Advance past initial poll (which rejects with Network offline)
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(80);
+      });
+
+      // Network recovers and Steer 1 fails first while Steer 2 remains parked in pending_steers
+      shouldThrowNetworkError = false;
+      statusPendingSteers = [
+        { content: 'Second delayed parked steer', request_key: rk2, attachments: [att2] },
+      ];
+      statusFailedSteers = [
+        {
+          reason: 'attachment_failed',
+          error: 'First attachment failed (403).',
+          error_code: 'http_403',
+          request_key: rk1,
+          content: 'First parked steer',
+          attachments: [att1],
+          timestamp: 1700000401,
+          job_id: 'job-multi-1',
+          turn_index: 0,
+        },
+      ];
+
+      await act(async () => {
+        window.dispatchEvent(new Event('online'));
+        await vi.advanceTimersByTimeAsync(50);
+      });
+
+      await waitFor(() => {
+        const b1 = hookState!.messages.find(
+          (m): m is UserMessage => m.role === 'user' && m.requestKey === rk1,
+        );
+        const b2 = hookState!.messages.find(
+          (m): m is UserMessage => m.role === 'user' && m.requestKey === rk2,
+        );
+        expect(b1).toMatchObject({
+          steering: false,
+          queueRefused: true,
+          queueError: 'First attachment failed (403).',
+        });
+        // Steer 2 is still waiting
+        expect(b2).toMatchObject({
+          steering: true,
+        });
+        expect(b2?.queueError).toBeUndefined();
+      });
+
+      // Advance 8,000 ms (> 6s!) while Steer 2 is still parked and being verified by outbox drainer
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(8000);
+      });
+
+      // Now at t > 8s after run_end, Steer 2 fails permanently
+      statusPendingSteers = [];
+      statusFailedSteers = [
+        ...statusFailedSteers,
+        {
+          reason: 'attachment_failed',
+          error: 'Second attachment expired after 8s (410).',
+          error_code: 'http_410',
+          request_key: rk2,
+          content: 'Second delayed parked steer',
+          attachments: [att2],
+          timestamp: 1700000409,
+          job_id: 'job-multi-2',
+          turn_index: 0,
+        },
+      ];
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(700);
+      });
+
+      await waitFor(() => {
+        const b2After = hookState!.messages.find(
+          (m): m is UserMessage => m.role === 'user' && m.requestKey === rk2,
+        );
+        expect(b2After).toMatchObject({
+          content: 'Second delayed parked steer',
+          steering: false,
+          steeringDelivered: false,
+          queueRefused: true,
+          queueError: 'Second attachment expired after 8s (410).',
+          requestKey: rk2,
+          attachments: [att2],
+        });
+        expect(hookState!.messageError).toBe('Second attachment expired after 8s (410).');
+      });
+
+      // Once all waiting steers have settled, reconciliation stops polling
+      const callsAfterAllSettled = getWorkflowStatusMock.mock.calls.length;
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5000);
+      });
+      expect(getWorkflowStatusMock.mock.calls.length).toBe(callsAfterAllSettled);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

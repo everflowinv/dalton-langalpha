@@ -339,6 +339,8 @@ export type WorkflowStatusResponse = Partial<ThreadReportBackStatus> & {
   // The user's steers an errored turn left queued, oldest first: the next
   // turn on the thread reads them. Absent on older backends.
   pending_steers?: HeldSteer[];
+  // Permanently failed steers (e.g. revoked or deleted attachment on a parked steer).
+  failed_steers?: Record<string, unknown>[];
   [key: string]: unknown;
 };
 

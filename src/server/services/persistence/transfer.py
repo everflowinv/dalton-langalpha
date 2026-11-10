@@ -755,6 +755,7 @@ async def pull_direct(
     *,
     layout: WorkspaceLayout,
     defer_dir_modes: bool = False,
+    sweep_orphans: bool = True,
 ) -> dict[str, dict[str, Any]]:
     """Materialize ``items`` in the sandbox. Returns per-path results.
 
@@ -774,6 +775,8 @@ async def pull_direct(
     }
     if defer_dir_modes:
         spec["defer_dir_modes"] = True
+    if not sweep_orphans:
+        spec["sweep_orphans"] = False
     out = await run_transfer_op(
         sandbox, "pull", spec, timeout_s=transfer_timeout_s(total)
     )
