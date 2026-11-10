@@ -288,7 +288,7 @@ async def _ensure_migrations_applied(dsn: str) -> None:
             assert verified[1] is not None, "Dalton migration d033 did not create dalton_chat_file_uploads"
             assert verified[2] is not None, "alembic_version_dalton table missing after d033 upgrade"
             if not (verified[3] and verified[4]):
-                await asyncio.to_thread(command.downgrade, dalton_cfg, "d031")
+                await asyncio.to_thread(command.downgrade, dalton_cfg, "d035")
                 await asyncio.to_thread(command.upgrade, dalton_cfg, "d033")
 
             await cur.execute(

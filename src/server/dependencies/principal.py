@@ -140,10 +140,14 @@ async def get_principal(
     bearer of a token kind is that kind's alone, so a refused one never falls
     through to the session check.
     """
+    from src.dalton.company_identity import reject_company_system_auth
+
     matched, service_user = _service_token_user_id(request)
     if matched:
         if not service_user:
             raise HTTPException(status_code=401, detail="Missing X-User-Id")
+        # DALTON-HOOK(company-automations): refuse external auth as system:dalton-company
+        reject_company_system_auth(service_user)
         return Principal(user_id=service_user, auth="service")
     token = credentials.credentials if credentials is not None else ""
     if cli_tokens.is_cli_token(token):
@@ -155,18 +159,22 @@ async def get_principal(
         # sandbox from when the switch was on reaches nothing either.
         if not is_computer_cli_tokens_enabled():
             raise _invalid_token("Computer CLI tokens are disabled")
-        return await _computer_principal(request, token)
-    if pats.is_pat(token):
+        principal = await _computer_principal(request, token)
+    elif pats.is_pat(token):
         key = await pats.verify_pat(token)
-        return Principal(user_id=key.user_id, auth="pat", scopes=key.scopes)
-    if token and oauth_resource.from_resource_issuer(token):
+        principal = Principal(user_id=key.user_id, auth="pat", scopes=key.scopes)
+    elif token and oauth_resource.from_resource_issuer(token):
         app = await oauth_resource.verify_access_token(token)
-        return Principal(
+        principal = Principal(
             user_id=app.user_id, auth="oauth", client_id=app.client_id, scopes=app.scopes
         )
-    return Principal(
-        user_id=await get_current_user_id(request, credentials), auth="session"
-    )
+    else:
+        principal = Principal(
+            user_id=await get_current_user_id(request, credentials), auth="session"
+        )
+    # DALTON-HOOK(company-automations): shared company system identity rejection across all Principal kinds
+    reject_company_system_auth(principal.user_id)
+    return principal
 
 
 CurrentPrincipal = Annotated[Principal, Depends(get_principal)]
@@ -305,6 +313,10 @@ def require_scopes(
     async def dependency(
         request: Request, principal: Principal = Depends(get_principal)
     ) -> Principal:
+        # DALTON-HOOK(company-automations): defense-in-depth rejection even when get_principal is overridden
+        from src.dalton.company_identity import reject_company_system_auth
+
+        reject_company_system_auth(principal.user_id)
         if principal.unlimited:
             return principal
         missing = [s for s in scopes if s not in principal.scopes]

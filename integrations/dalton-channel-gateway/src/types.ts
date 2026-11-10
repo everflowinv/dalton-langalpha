@@ -174,6 +174,14 @@ export interface InboundAttachmentDescriptor {
   filename: string;
   mimeType: string;
   sizeBytes?: number;
+  /** Signed download URL when the platform provides one (Discord CDN). */
+  url?: string;
+  /** Fallback/proxy download URL when the platform provides one. */
+  proxyUrl?: string;
+  /** Platform channel id the attachment's message lives in, for re-fetching a fresh URL. */
+  channelId?: string;
+  /** Platform message id carrying this attachment, for re-fetching a fresh URL. */
+  messageId?: string;
 }
 
 export interface UploadedAttachmentRecord {

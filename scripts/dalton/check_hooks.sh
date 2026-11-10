@@ -359,6 +359,9 @@ ALLOWED_HOOKS=(
   # Chat composer large-file multipart uploads (<=200 MiB) stored under chat-uploads/
   # and materialized into sandbox work/uploads/ without inline base64 payloads.
   "chat-large-upload"
+  # AU1 Batch 1: company system identity external auth refusal, automation scope
+  # classification/backfill, scoped read-only listing, and modification history.
+  "company-automations"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)

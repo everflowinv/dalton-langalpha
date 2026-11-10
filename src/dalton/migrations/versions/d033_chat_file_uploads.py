@@ -1,7 +1,7 @@
 """Chat composer large-file upload state table (d033).
 
 Revision ID: d033
-Revises: d031
+Revises: d035
 Create Date: 2026-11-09
 """
 
@@ -10,7 +10,7 @@ from __future__ import annotations
 from alembic import op
 
 revision = "d033"
-down_revision = "d031"
+down_revision = "d035"
 branch_labels = None
 depends_on = None
 

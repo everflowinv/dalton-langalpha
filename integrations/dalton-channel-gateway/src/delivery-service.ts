@@ -199,6 +199,12 @@ export class DeliveryService {
     const platformStr = (claim.platform ?? preliminaryPlat ?? "").toLowerCase();
     const targetAddress = claim.target_address ?? options.target ?? null;
     const isCurrent = Boolean(claim.is_current);
+    const effectiveThreadScopeKey =
+      claim.thread_scope_key && claim.thread_scope_key.trim().length > 0
+        ? claim.thread_scope_key.trim()
+        : options.target && !isCurrent
+          ? null
+          : (options.threadScopeKey ?? null);
     const daltonUserId = (options.userId ?? "").trim();
 
     if (!isSupportedPlatform(platformStr) || !targetAddress) {
@@ -290,7 +296,8 @@ export class DeliveryService {
           totalChunks,
           replyToMessageId: i === 0 ? options.replyToMessageId : null,
           newThread: i === 0 ? options.newThread : false,
-          threadScopeKey: options.threadScopeKey ?? null,
+          threadScopeKey: effectiveThreadScopeKey,
+          deliveryKey: options.deliveryKey,
           weixinContextToken: claim.weixin_context_token ?? null,
         });
         sentChunks += 1;
@@ -388,7 +395,7 @@ export class DeliveryService {
             filename: basename(fileRef.path) || "attachment",
             content: downloaded.content,
             mimeType: downloaded.mimeType,
-            threadScopeKey: options.threadScopeKey ?? null,
+            threadScopeKey: effectiveThreadScopeKey,
             weixinContextToken: claim.weixin_context_token ?? null,
           });
           const fileSucceeded =
