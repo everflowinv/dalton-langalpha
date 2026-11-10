@@ -705,10 +705,6 @@ def _make_bridge(
     else:
         monkeypatch.delenv("FEISHU_APP_ID", raising=False)
         monkeypatch.delenv("FEISHU_APP_SECRET", raising=False)
-    # BridgeConfig falls back to ~/.openclaw/openclaw.json when the env vars
-    # are unset; a machine with real credentials there must not leak into the
-    # "not configured" case, so the fallback is pinned to empty here.
-    monkeypatch.setattr(rb, "_read_openclaw_feishu_credentials", lambda: ("", ""))
     return rb.ResearchDataBridge(rb.BridgeConfig())
 
 

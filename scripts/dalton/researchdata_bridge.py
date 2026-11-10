@@ -54,6 +54,7 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 import asr_jobs  # noqa: E402
+import bridge_subprocess_env  # noqa: E402
 import seed_asr_client  # noqa: E402
 import log_redaction as _log_redaction  # noqa: E402
 import source_identity  # noqa: E402
@@ -1423,16 +1424,17 @@ class BridgeConfig:
             )
         except ValueError:
             self.wiki_ingest_timeout_s = WIKI_INGEST_TIMEOUT_S
-        # Feishu doc read/write proxy (DALTON-HOOK(feishu-docs)): credentials live on
-        # the host only — env first, else a read-only lookup of the OpenClaw channel
-        # account. Never logged, never returned by any route.
+        # Feishu doc read/write proxy (DALTON-HOOK(feishu-docs)): dedicated Bridge
+        # app credentials loaded from DALTON_BRIDGE_ENV_FILE / process environment.
+        # Never logged, never returned by any route.
         env_feishu_app_id = os.environ.get("FEISHU_APP_ID", "").strip()
         env_feishu_app_secret = os.environ.get("FEISHU_APP_SECRET", "").strip()
         if env_feishu_app_id and env_feishu_app_secret:
             self.feishu_app_id = env_feishu_app_id
             self.feishu_app_secret = env_feishu_app_secret
         else:
-            self.feishu_app_id, self.feishu_app_secret = _read_openclaw_feishu_credentials()
+            self.feishu_app_id = ""
+            self.feishu_app_secret = ""
         try:
             self.feishu_http_timeout_s: float = max(
                 5.0,
@@ -6139,6 +6141,10 @@ def _is_empty_community_output(route: str, operation: str, parsed: Any) -> bool:
     return False
 
 
+class UnsupportedSkillLauncherError(ValueError):
+    """Raised when an explicit skill `run.sh` path is not a verified launcher for the target skill."""
+
+
 class ResearchDataBridge:
     """HTTP-to-stdio MCP bridge for OpenClaw `researchdata`.
 
@@ -6256,7 +6262,7 @@ class ResearchDataBridge:
         self, requests: list[dict[str, Any]], timeout_s: float
     ) -> list[dict[str, Any]]:
         """Spawn a single `researchdata_mcp.py` subprocess, send JSON-RPC lines, and read responses."""
-        subproc_env = seed_asr_client.strip_asr_credentials_from_env(os.environ)
+        subproc_env = bridge_subprocess_env.build_nonarchive_subprocess_env(os.environ)
         proc = await asyncio.create_subprocess_exec(
             self.cfg.python_bin,
             str(self.cfg.mcp_script),
@@ -7756,10 +7762,10 @@ class ResearchDataBridge:
         }
 
     def _build_community_subprocess_env(self) -> dict[str, str]:
-        """Build subprocess environment with CLAUDECODE/CLAUDE_CODE_* and ASR/TOS credentials stripped and optional proxy applied."""
+        """Build subprocess environment with CLAUDECODE/CLAUDE_CODE_*, bridge tokens, Feishu/gateway, and ASR/TOS credentials stripped and optional proxy applied."""
         env: dict[str, str] = {
             k: v
-            for k, v in seed_asr_client.strip_asr_credentials_from_env(
+            for k, v in bridge_subprocess_env.build_nonarchive_subprocess_env(
                 os.environ
             ).items()
             if k != "CLAUDECODE" and not k.startswith("CLAUDE_CODE_")
@@ -7856,7 +7862,7 @@ class ResearchDataBridge:
             }
         else:
             try:
-                subproc_env = seed_asr_client.strip_asr_credentials_from_env(
+                subproc_env = bridge_subprocess_env.build_nonarchive_subprocess_env(
                     os.environ
                 )
                 proc = await asyncio.create_subprocess_exec(
@@ -10334,13 +10340,13 @@ class ResearchDataBridge:
         )
 
         cmd = [py_bin, "-B", "-W", "ignore", "-c", driver_code]
-        subproc_env = seed_asr_client.strip_asr_credentials_from_env(
-            {
-                **os.environ,
-                **env_file_vars,
+        subproc_env = bridge_subprocess_env.build_nonarchive_subprocess_env(
+            os.environ,
+            extra_env={
                 "GEMINI_API_KEY": gemini_api_key,
                 "PYTHONDONTWRITEBYTECODE": "1",
-            }
+            },
+            allow_keys=("GEMINI_API_KEY",),
         )
 
         proc = await asyncio.create_subprocess_exec(
@@ -11022,23 +11028,38 @@ class ResearchDataBridge:
             py_bin = self._resolve_archive_python_bin()
             script_path = self.cfg.conversation_archive_py
             repo_root = script_path.parents[2] if len(script_path.parents) >= 3 else _SCRIPT_DIR.parent
-            env_vars = seed_asr_client.strip_asr_credentials_from_env(
-                {
-                    **os.environ,
-                    **_read_env_file_dict(self.cfg.env_path),
-                    "PYTHONDONTWRITEBYTECODE": "1",
+            repo_env = Path(
+                os.environ.get("DALTON_REPO_ENV_FILE") or (repo_root / ".env")
+            ).expanduser()
+            base_env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+            caller_candidates = bridge_subprocess_env.capture_archive_provider_candidates(
+                base_env,
+                repo_root=repo_root,
+                repo_env_path=repo_env,
+                hydrate_from_dotenv=True,
+            )
+            env_vars = bridge_subprocess_env.build_archive_subprocess_env(
+                repo_env_path=repo_env,
+                bridge_env_path=self.cfg.env_path,
+                base_env=base_env,
+                host_embed_url="http://127.0.0.1:8960/embed",
+                repo_root=repo_root,
+                validate_required=False,
+                defer_primary_model_validation=True,
+            )
+            try:
+                candidates_rfd = bridge_subprocess_env.finalize_and_attach_archive_candidates(
+                    caller_candidates,
+                    env_vars,
+                    repo_root=repo_root,
+                )
+            except bridge_subprocess_env.ArchiveEnvValidationError as exc:
+                return 500, {
+                    "ok": False,
+                    "key": "conversation-archive",
+                    "status": "error",
+                    "error": str(exc),
                 }
-            )
-            repo_env = repo_root / ".env"
-            if repo_env.is_file():
-                for k, v in seed_asr_client.strip_asr_credentials_from_env(
-                    _read_env_file_dict(repo_env)
-                ).items():
-                    env_vars.setdefault(k, v)
-            env_vars["DALTON_BRIDGE_EMBED_URL"] = "http://127.0.0.1:8960/embed"
-            env_vars["no_proxy"] = (
-                f"localhost,127.0.0.1,::1,host.docker.internal,{env_vars.get('no_proxy', '')}"
-            )
 
             started_at = datetime.now(timezone.utc).isoformat()
             log_fh: Any = None
@@ -11062,15 +11083,24 @@ class ResearchDataBridge:
             watcher_registered = False
             startup_cancelled: asyncio.CancelledError | None = None
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    py_bin,
-                    str(script_path),
-                    "run",
-                    cwd=str(repo_root),
-                    env=env_vars,
-                    stdout=log_fh if log_fh is not None else asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.STDOUT if log_fh is not None else asyncio.subprocess.DEVNULL,
-                )
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        py_bin,
+                        str(script_path),
+                        "run",
+                        cwd=str(repo_root),
+                        env=env_vars,
+                        stdout=log_fh if log_fh is not None else asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.STDOUT if log_fh is not None else asyncio.subprocess.DEVNULL,
+                        pass_fds=(candidates_rfd,) if candidates_rfd is not None else (),
+                    )
+                finally:
+                    if candidates_rfd is not None:
+                        try:
+                            os.close(candidates_rfd)
+                        except OSError:
+                            pass
+                        candidates_rfd = None
                 self._archive_proc = proc
                 proc_pid = getattr(proc, "pid", None)
                 pid_status = self._write_archive_pid_file(proc_pid)
@@ -11143,6 +11173,12 @@ class ResearchDataBridge:
                 startup_cancelled = exc
                 raise
             finally:
+                if candidates_rfd is not None:
+                    try:
+                        os.close(candidates_rfd)
+                    except OSError:
+                        pass
+                    candidates_rfd = None
                 if not watcher_registered:
                     _, _, cleanup_cancelled = await self._terminate_and_cleanup_archive_proc(
                         proc,
@@ -11160,7 +11196,7 @@ class ResearchDataBridge:
         """Return ``'on'`` if ``launchctl print gui/<uid>/<label>`` succeeds, ``'off'`` on non-zero exit, else ``'unknown'``."""
         try:
             uid = os.getuid()
-            subproc_env = seed_asr_client.strip_asr_credentials_from_env(os.environ)
+            subproc_env = bridge_subprocess_env.build_nonarchive_subprocess_env(os.environ)
             res = subprocess.run(
                 ["launchctl", "print", f"gui/{uid}/{label}"],
                 env=subproc_env,
@@ -11540,6 +11576,9 @@ class ResearchDataBridge:
                             card=prepared_card,
                             receive_id_type=receive_id_type,
                             timeout_s=self.cfg.feishu_send_card_timeout_s,
+                            feishu_app_id=self.cfg.feishu_app_id,
+                            feishu_app_secret=self.cfg.feishu_app_secret,
+                            feishu_default_grant_chat_id=self.cfg.feishu_default_grant_chat_id,
                         )
                         last_exit_code = card_res.get("exit_code")
                         if card_res.get("ok") is not True:
@@ -11686,11 +11725,68 @@ class ResearchDataBridge:
         all_ok = bool(results) and all(bool(item.get("ok")) for item in results)
         return 200, {"ok": all_ok, "results": results}
 
+    @staticmethod
+    def _is_verified_skill_launcher_file(
+        explicit: Path,
+        cli_names: tuple[str, ...],
+        overlay: Path,
+    ) -> bool:
+        """Accept an installed copy of the maintained launcher in a supported skill directory."""
+        exp = explicit.expanduser()
+        if not exp.is_file():
+            return False
+        skill_dir = exp.parent
+        if not any((skill_dir / "scripts" / name).is_file() for name in cli_names):
+            return False
+        try:
+            return exp.read_bytes() == overlay.read_bytes()
+        except OSError:
+            return False
+
+    @classmethod
+    def _should_use_overlay_for_skill_run_sh(
+        cls,
+        explicit: Path,
+        overlay: Path,
+        cli_names: tuple[str, ...],
+    ) -> bool:
+        """Return True when `explicit` targets a supported skill directory that should execute through `overlay`."""
+        if not overlay.is_file():
+            return False
+        exp = explicit.expanduser()
+        try:
+            if exp.resolve() == overlay.resolve():
+                return True
+        except OSError:
+            pass
+        if cls._is_verified_skill_launcher_file(exp, cli_names, overlay):
+            return False
+        skill_dir = exp.parent
+        if any((skill_dir / "scripts" / name).is_file() for name in cli_names):
+            return True
+        return False
+
     def _resolve_wiki_run_sh(self) -> Path:
-        """Locate the OpenClaw company-wiki `run.sh` entrypoint without modifying it."""
+        """Locate the company-wiki `run.sh` entrypoint, using the maintained repo overlay launcher for supported skill directories and refusing unsupported explicit launchers."""
+        overlay = (
+            _SCRIPT_DIR / "openclaw_overlays" / "skills" / "company-wiki" / "run.sh"
+        )
+        cli_names = ("company_wiki_cli.py", "wiki_cli.py")
         explicit = getattr(self.cfg, "wiki_run_sh", None)
         if isinstance(explicit, Path):
-            return explicit
+            if self._should_use_overlay_for_skill_run_sh(
+                explicit,
+                overlay,
+                cli_names,
+            ):
+                return overlay
+            if self._is_verified_skill_launcher_file(explicit, cli_names, overlay):
+                return explicit.expanduser()
+            raise UnsupportedSkillLauncherError(
+                f"Unsupported company-wiki launcher {explicit}: target skill directory must contain scripts/company_wiki_cli.py or scripts/wiki_cli.py"
+            )
+        if overlay.is_file():
+            return overlay
         return self.cfg.ocw_root / "skills" / "company-wiki" / "run.sh"
 
     def _load_company_wiki_config(self) -> dict[str, Any]:
@@ -12538,13 +12634,25 @@ class ResearchDataBridge:
         )
 
     def _build_wiki_subprocess_env(self) -> dict[str, str]:
-        """Construct minimal environment for `company-wiki/run.sh` without leaking bridge tokens."""
+        """Construct minimal environment for `company-wiki/run.sh` and `market-digest/run.sh` without leaking bridge, Feishu, gateway, ASR, or unrelated provider credentials."""
         env_file_vars = _read_env_file_dict(self.cfg.env_path)
         gemini_api_key = (
-            env_file_vars.get("GEMINI_API_KEY", "").strip()
-            or os.environ.get("GEMINI_API_KEY", "").strip()
+            os.environ.get("GEMINI_API_KEY", "").strip()
+            or env_file_vars.get("GEMINI_API_KEY", "").strip()
         )
-        env: dict[str, str] = {
+        explicit_wiki_run_sh = getattr(self.cfg, "wiki_run_sh", None)
+        wiki_skill_dir = (
+            explicit_wiki_run_sh.expanduser().parent
+            if isinstance(explicit_wiki_run_sh, Path)
+            else self.cfg.ocw_root / "skills" / "company-wiki"
+        )
+        explicit_md_run_sh = getattr(self.cfg, "market_digest_run_sh", None)
+        md_skill_dir = (
+            explicit_md_run_sh.expanduser().parent
+            if isinstance(explicit_md_run_sh, Path)
+            else self.cfg.ocw_root / "skills" / "market-digest"
+        )
+        base_env: dict[str, str] = {
             "PATH": os.environ.get("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"),
             "HOME": os.environ.get("HOME", os.path.expanduser("~")),
             "LANG": os.environ.get("LANG", "en_US.UTF-8"),
@@ -12552,13 +12660,31 @@ class ResearchDataBridge:
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONIOENCODING": "utf-8",
             "SKILL_WARNINGS": "ignore",
+            "DALTON_OCW_ROOT": str(self.cfg.ocw_root),
+            "DALTON_WIKI_SKILL_DIR": str(wiki_skill_dir),
+            "DALTON_MARKET_DIGEST_SKILL_DIR": str(md_skill_dir),
+            "DALTON_BRIDGE_ENV_FILTER_PY": str(_SCRIPT_DIR / "bridge_subprocess_env.py"),
         }
+        for opt_key in ("DALTON_SKILL_PYTHON", "DALTON_SKILL_SHELL_RC"):
+            opt_val = os.environ.get(opt_key, "").strip()
+            if opt_val:
+                base_env[opt_key] = opt_val
         if gemini_api_key:
-            env["GEMINI_API_KEY"] = gemini_api_key
+            base_env["GEMINI_API_KEY"] = gemini_api_key
         if self.cfg.subprocess_proxy:
-            env["HTTP_PROXY"] = self.cfg.subprocess_proxy
-            env["HTTPS_PROXY"] = self.cfg.subprocess_proxy
-        return env
+            base_env["HTTP_PROXY"] = self.cfg.subprocess_proxy
+            base_env["HTTPS_PROXY"] = self.cfg.subprocess_proxy
+        return bridge_subprocess_env.build_nonarchive_subprocess_env(
+            base_env,
+            allow_keys=("GEMINI_API_KEY",),
+        )
+
+    @staticmethod
+    def _build_skill_exec_argv(cmd: list[str]) -> list[str]:
+        """Normalize skill launcher argv so mode-0644 overlay `.sh` scripts execute via `/bin/bash`."""
+        if cmd and str(cmd[0]).endswith(".sh") and not os.access(str(cmd[0]), os.X_OK):
+            return ["/bin/bash", *[str(x) for x in cmd]]
+        return [str(x) for x in cmd]
 
     async def _run_company_wiki_ingest_cli(
         self,
@@ -12567,9 +12693,10 @@ class ResearchDataBridge:
         env: dict[str, str],
         timeout_s: float,
     ) -> dict[str, Any]:
-        """Run `company-wiki/run.sh --json add|add-file` as an argv list without a shell."""
+        """Run `company-wiki/run.sh --json add|add-file` as an argv list without an interactive shell."""
+        exec_cmd = self._build_skill_exec_argv(cmd)
         proc = await asyncio.create_subprocess_exec(
-            *cmd,
+            *exec_cmd,
             cwd=str(self.cfg.ocw_root),
             env=env,
             stdin=asyncio.subprocess.DEVNULL,
@@ -13193,7 +13320,15 @@ class ResearchDataBridge:
 
         # Built before any lock is taken: these touch the filesystem and can
         # raise, and only the try/finally below releases the claim locks.
-        run_sh = self._resolve_wiki_run_sh()
+        try:
+            run_sh = self._resolve_wiki_run_sh()
+        except UnsupportedSkillLauncherError as exc:
+            return 400, {
+                "ok": False,
+                "status": "unsupported_launcher",
+                "error_code": "unsupported_launcher",
+                "error": str(exc),
+            }
         subproc_env = self._build_wiki_subprocess_env()
 
         # Kernel file locks (`fcntl.flock`) across duplicate check + CLI write + idempotency/audit persistence
@@ -13587,9 +13722,26 @@ class ResearchDataBridge:
         return raw_doc_key, document_id
 
     def _resolve_market_digest_run_sh(self) -> Path:
+        """Locate the market-digest `run.sh` entrypoint, using the maintained repo overlay launcher for supported skill directories and refusing unsupported explicit launchers."""
+        overlay = (
+            _SCRIPT_DIR / "openclaw_overlays" / "skills" / "market-digest" / "run.sh"
+        )
+        cli_names = ("market_digest_cli.py", "digest_cli.py")
         explicit = getattr(self.cfg, "market_digest_run_sh", None)
         if isinstance(explicit, Path):
-            return explicit
+            if self._should_use_overlay_for_skill_run_sh(
+                explicit,
+                overlay,
+                cli_names,
+            ):
+                return overlay
+            if self._is_verified_skill_launcher_file(explicit, cli_names, overlay):
+                return explicit.expanduser()
+            raise UnsupportedSkillLauncherError(
+                f"Unsupported market-digest launcher {explicit}: target skill directory must contain scripts/market_digest_cli.py or scripts/digest_cli.py"
+            )
+        if overlay.is_file():
+            return overlay
         return self.cfg.ocw_root / "skills" / "market-digest" / "run.sh"
 
     def _sales_notes_audit_path(self) -> Path:
@@ -13842,7 +13994,15 @@ class ResearchDataBridge:
                     prior_out["document_id"] = replay_doc_id
                 return 200, prior_out
 
-        run_sh = self._resolve_market_digest_run_sh()
+        try:
+            run_sh = self._resolve_market_digest_run_sh()
+        except UnsupportedSkillLauncherError as exc:
+            return 400, {
+                "ok": False,
+                "status": "unsupported_launcher",
+                "error_code": "unsupported_launcher",
+                "error": str(exc),
+            }
         env = self._build_wiki_subprocess_env()
 
         cmd: list[str] = [str(run_sh), "--json", "add-note"]
@@ -13886,8 +14046,9 @@ class ResearchDataBridge:
                     os.close(fd)
                 cmd.extend(["--content", f"@{tmp_payload}"])
 
+            exec_cmd = self._build_skill_exec_argv(cmd)
             proc = await asyncio.create_subprocess_exec(
-                *cmd,
+                *exec_cmd,
                 cwd=str(self.cfg.ocw_root),
                 env=env,
                 stdin=asyncio.subprocess.DEVNULL,
@@ -15187,7 +15348,9 @@ class ResearchDataBridge:
                     "cwd": str(data_root),
                 }
 
-            child_env = seed_asr_client.strip_asr_credentials_from_env(dict(os.environ))
+            child_env = bridge_subprocess_env.build_nonarchive_subprocess_env(
+                dict(os.environ)
+            )
             run_outbox_file = data_root / ".dalton-runs" / str(run_id) / "outbox.json"
             run_outbox_file.parent.mkdir(parents=True, exist_ok=True)
             child_env["DALTON_RUN_ID"] = str(run_id)
@@ -15808,11 +15971,15 @@ def _run_feishu_send_card(
     receive_id_type: str = "open_id",
     timeout_s: float = FEISHU_SEND_CARD_TIMEOUT_S,
     dry_run: bool = False,
+    feishu_app_id: str = "",
+    feishu_app_secret: str = "",
+    feishu_default_grant_chat_id: str = "",
 ) -> dict[str, Any]:
-    """Invoke ``feishu_send_card.py`` with a temporary ``--card-json-file``.
+    """Invoke ``feishu_send_card.py`` with a temporary ``--card-json-file`` for Feishu card delivery.
 
-    Never logs or returns subprocess stdout/stderr (which could contain credentials).
-    Only reports ``ok`` and ``exit_code``.
+    Supplies only the explicit Bridge Feishu sending credentials while stripping
+    all unrelated ASR/TOS, gateway, broker, and Bridge tokens. Never logs or
+    returns subprocess stdout/stderr. Only reports ``ok`` and ``exit_code``.
     """
     tmp_path: Path | None = None
     try:
@@ -15833,8 +16000,17 @@ def _run_feishu_send_card(
             receive_id_type=receive_id_type,
             dry_run=dry_run,
         )
-        subproc_env = seed_asr_client.strip_asr_credentials_from_env(os.environ)
-        subproc_env.pop("DALTON_NO_DIRECT_SEND", None)
+        eff_app_id = feishu_app_id or os.environ.get("FEISHU_APP_ID", "")
+        eff_app_secret = feishu_app_secret or os.environ.get("FEISHU_APP_SECRET", "")
+        eff_grant_chat_id = feishu_default_grant_chat_id or os.environ.get(
+            "FEISHU_DEFAULT_GRANT_CHAT_ID", ""
+        )
+        subproc_env = bridge_subprocess_env.build_feishu_card_send_subprocess_env(
+            os.environ,
+            feishu_app_id=eff_app_id,
+            feishu_app_secret=eff_app_secret,
+            feishu_default_grant_chat_id=eff_grant_chat_id,
+        )
         proc = subprocess.run(
             cmd,
             env=subproc_env,
@@ -15902,9 +16078,9 @@ def _post_openclaw_tools_invoke(
 # Feishu OpenAPI proxy (DALTON-HOOK(feishu-docs))
 #
 # All Feishu calls run here on the host with app identity
-# (tenant_access_token). Credentials come from FEISHU_APP_ID/FEISHU_APP_SECRET
-# or a read-only lookup of ~/.openclaw/openclaw.json; they are never logged
-# and never appear in any route response.
+# (tenant_access_token). Credentials come from dedicated Bridge configuration
+# (FEISHU_APP_ID / FEISHU_APP_SECRET in DALTON_BRIDGE_ENV_FILE); they are never
+# logged and never appear in any route response.
 # ---------------------------------------------------------------------------
 
 FEISHU_API_BASE = "https://open.feishu.cn"
@@ -16398,37 +16574,9 @@ def _feishu_outcome_unknown(error_code: str) -> bool:
     )
 
 
-#: OpenClaw's Eve tracking group (internal team), the default share target for
-#: docs the bot creates; override with FEISHU_DEFAULT_GRANT_CHAT_ID.
+#: Default share target for docs the bot creates; override with
+#: FEISHU_DEFAULT_GRANT_CHAT_ID (set empty string to disable).
 FEISHU_DEFAULT_GRANT_CHAT_ID = "oc_397207208fb52a0b09969794ef3cd421"
-
-
-def _read_openclaw_feishu_credentials() -> tuple[str, str]:
-    """Return ``(appId, appSecret)`` from ``~/.openclaw/openclaw.json`` (read-only, empty on any failure).
-
-    Reads ``channels.feishu.accounts.<defaultAccount or "default">``.
-    """
-    ocw_home = Path(
-        os.environ.get("DALTON_OCW_HOME", os.path.expanduser("~/.openclaw"))
-    ).expanduser()
-    config_path = ocw_home / "openclaw.json"
-    try:
-        raw = config_path.read_text(encoding="utf-8")
-        data = json.loads(raw)
-    except Exception as exc:
-        logger.info("Feishu credentials not available from %s (%s)", config_path, type(exc).__name__)
-        return "", ""
-    try:
-        feishu = ((data or {}).get("channels") or {}).get("feishu") or {}
-        accounts = feishu.get("accounts") or {}
-        account_key = str(feishu.get("defaultAccount") or "default")
-        account = accounts.get(account_key) or accounts.get("default") or {}
-        app_id = str(account.get("appId") or "").strip()
-        app_secret = str(account.get("appSecret") or "").strip()
-        return app_id, app_secret
-    except Exception as exc:
-        logger.info("Feishu account lookup failed in %s (%s)", config_path, type(exc).__name__)
-        return "", ""
 
 
 def parse_feishu_token(raw: str) -> tuple[str, str]:
@@ -17627,7 +17775,9 @@ def _list_host_processes_ps() -> list[tuple[int, int, str, str]] | None:
             check=False,
             # LC_ALL=C: lstart is locale-formatted (zh_CN prints "四 11/15 …", four
             # tokens), and the split below needs the fixed five-token C form.
-            env={**seed_asr_client.strip_asr_credentials_from_env(dict(os.environ)), "LC_ALL": "C", "LANG": "C"},
+            env=bridge_subprocess_env.build_nonarchive_subprocess_env(
+                dict(os.environ), extra_env={"LC_ALL": "C", "LANG": "C"}
+            ),
         )
         if res.returncode != 0:
             return None
@@ -18434,7 +18584,7 @@ def _run_host_task_gate_cli(argv: list[str]) -> int:
         cwd=cwd,
         stdin=subprocess.DEVNULL,
         start_new_session=False,
-        env=seed_asr_client.strip_asr_credentials_from_env(dict(os.environ)),
+        env=bridge_subprocess_env.build_nonarchive_subprocess_env(dict(os.environ)),
     )
 
     def _forward_term(signum: int, _frame: Any) -> None:

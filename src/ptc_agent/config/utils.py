@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -28,10 +29,20 @@ async def load_dotenv_async(env_file: Path | None = None) -> None:
     """Load environment variables from .env file asynchronously.
 
     Args:
-        env_file: Optional path to .env file. If None, searches default locations.
+        env_file: Optional path to .env file. If None, respects DALTON_DOTENV_PATH /
+            DALTON_REPO_ENV_FILE when set, otherwise searches default locations.
     """
-    if env_file:
-        await asyncio.to_thread(load_dotenv, env_file)
+    # DALTON-HOOK(conversation-archive): bind explicit dotenv file when configured
+    target_file = env_file
+    if target_file is None:
+        explicit = (
+            os.environ.get("DALTON_DOTENV_PATH", "").strip()
+            or os.environ.get("DALTON_REPO_ENV_FILE", "").strip()
+        )
+        if explicit:
+            target_file = Path(explicit).expanduser()
+    if target_file is not None:
+        await asyncio.to_thread(load_dotenv, target_file)
     else:
         await asyncio.to_thread(load_dotenv)
 
