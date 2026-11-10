@@ -706,6 +706,7 @@ def safe_atomic_write_bytes(
     dest_dir_fd = chain.leaf_fd
     tmp_fd: int | None = None
     created_tmp_name: str | None = None
+    tmp_identity: tuple[int, int] | None = None
 
     try:
         if _on_dir_verified is not None:
@@ -778,6 +779,7 @@ def safe_atomic_write_bytes(
                 "Opened temporary descriptor is not an unlinked-safe regular file",
                 code="symlink_rejected",
             )
+        tmp_identity = (tmp_stat.st_dev, tmp_stat.st_ino)
 
         view = memoryview(content)
         total_len = len(view)
@@ -800,9 +802,6 @@ def safe_atomic_write_bytes(
                 code="write_failed",
             ) from exc
 
-        os.close(tmp_fd)
-        tmp_fd = None
-
         if _on_before_publish is not None:
             try:
                 _on_before_publish(created_tmp_name)
@@ -810,6 +809,42 @@ def safe_atomic_write_bytes(
                 _on_before_publish()
 
         chain.verify_intact()
+
+        fd_st_before = os.fstat(tmp_fd)
+        if (
+            not stat.S_ISREG(fd_st_before.st_mode)
+            or (fd_st_before.st_dev, fd_st_before.st_ino) != tmp_identity
+        ):
+            raise SafeFsError(
+                "Temporary descriptor identity changed before publish",
+                code="symlink_rejected",
+            )
+
+        try:
+            tmp_entry_st = os.stat(
+                created_tmp_name,
+                dir_fd=dest_dir_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError as exc:
+            raise SafeFsError(
+                "Temporary file disappeared before publish",
+                code="write_failed",
+            ) from exc
+        if stat.S_ISLNK(tmp_entry_st.st_mode):
+            raise SafeFsError(
+                "Temporary file was replaced with a symlink before publish",
+                code="symlink_rejected",
+            )
+        if (
+            not stat.S_ISREG(tmp_entry_st.st_mode)
+            or (tmp_entry_st.st_dev, tmp_entry_st.st_ino) != tmp_identity
+            or tmp_entry_st.st_nlink != 1
+        ):
+            raise SafeFsError(
+                "Temporary file was replaced before publish",
+                code="symlink_rejected",
+            )
 
         # Re-check destination immediately before descriptor-relative atomic replace.
         try:
@@ -849,10 +884,20 @@ def safe_atomic_write_bytes(
         # Ownership moved to `leaf_name`; do not unlink `created_tmp_name` in `finally`.
         created_tmp_name = None
 
+        fd_st_after = os.fstat(tmp_fd)
+        os.close(tmp_fd)
+        tmp_fd = None
+
         final_st = os.stat(leaf_name, dir_fd=dest_dir_fd, follow_symlinks=False)
-        if stat.S_ISLNK(final_st.st_mode) or not stat.S_ISREG(final_st.st_mode):
+        if (
+            stat.S_ISLNK(final_st.st_mode)
+            or not stat.S_ISREG(final_st.st_mode)
+            or not stat.S_ISREG(fd_st_after.st_mode)
+            or (fd_st_after.st_dev, fd_st_after.st_ino) != tmp_identity
+            or (final_st.st_dev, final_st.st_ino) != tmp_identity
+        ):
             raise SafeFsError(
-                "Published artifact is not a regular file",
+                "Published artifact is not the verified regular temporary file",
                 code="symlink_rejected",
             )
 
@@ -874,9 +919,19 @@ def safe_atomic_write_bytes(
                 os.close(tmp_fd)
             except OSError:
                 pass
-        if created_tmp_name is not None:
+        if created_tmp_name is not None and tmp_identity is not None:
             try:
-                os.unlink(created_tmp_name, dir_fd=dest_dir_fd)
+                cleanup_st = os.stat(
+                    created_tmp_name,
+                    dir_fd=dest_dir_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISLNK(cleanup_st.st_mode)
+                    and stat.S_ISREG(cleanup_st.st_mode)
+                    and (cleanup_st.st_dev, cleanup_st.st_ino) == tmp_identity
+                ):
+                    os.unlink(created_tmp_name, dir_fd=dest_dir_fd)
             except OSError:
                 pass
         chain.close()

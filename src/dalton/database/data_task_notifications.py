@@ -478,6 +478,70 @@ async def _authorize_run_and_target_in_tx(
     )
 
 
+def build_reconcile_identity_metadata(
+    *,
+    platform: str,
+    recipient_id: str,
+    canonical_target_address: str,
+    delivery_keys: list[str],
+) -> dict[str, Any]:
+    """Build immutable recipient and item-key metadata for outer notification reconciliation."""
+    return {
+        "reconcile_platform": str(platform).strip().lower(),
+        "reconcile_recipient_id": str(recipient_id).strip(),
+        "reconcile_canonical_target": str(canonical_target_address).strip(),
+        "expected_item_count": len(delivery_keys),
+        "reconcile_delivery_keys": list(delivery_keys),
+    }
+
+
+async def _persist_reconcile_identity_on_outer_delivery(
+    cur: Any,
+    *,
+    run_id: str,
+    platform: str,
+    requested_target: str,
+    canonical_target_address: str,
+    recipient_id: str,
+    delivery_keys: list[str],
+) -> None:
+    """Stamp immutable original recipient and expected keys on the outer `dalton_notify_deliveries` row before external send."""
+    if not delivery_keys or not recipient_id:
+        return
+    meta = build_reconcile_identity_metadata(
+        platform=platform,
+        recipient_id=recipient_id,
+        canonical_target_address=canonical_target_address,
+        delivery_keys=delivery_keys,
+    )
+    candidate_targets = list(
+        dict.fromkeys(
+            t for t in (requested_target.strip(), canonical_target_address.strip()) if t
+        )
+    )
+    if not candidate_targets:
+        return
+    await cur.execute(
+        """
+        UPDATE dalton_notify_deliveries
+        SET payload_json = COALESCE(payload_json, '{}'::jsonb) || %s::jsonb
+        WHERE execution_id = %s
+          AND channel = %s
+          AND target = ANY(%s)
+          AND NOT (
+              COALESCE(payload_json, '{}'::jsonb) ? 'reconcile_recipient_id'
+              AND COALESCE(payload_json, '{}'::jsonb) ? 'reconcile_delivery_keys'
+          )
+        """,
+        (
+             json.dumps(meta, ensure_ascii=False),
+            run_id,
+            platform,
+            candidate_targets,
+        ),
+    )
+
+
 async def authorize_data_task_notification_plan(
     *,
     run_id: str,
@@ -487,68 +551,78 @@ async def authorize_data_task_notification_plan(
 ) -> dict[str, Any]:
     """Authorize ``(run_id, target)`` and return the validated, redacted delivery plan."""
     async with get_db_connection(conn) as owned_conn:
-        async with owned_conn.cursor(row_factory=dict_row) as cur:
-            auth = await _authorize_run_and_target_in_tx(
-                cur,
-                owned_conn,
-                run_id=run_id,
-                target=target,
-                path_map=path_map,
-                require_plan=True,
-            )
-            if not auth.allowed or auth.plan is None:
-                return {
-                    "authorized": False,
-                    "status": auth.deny_status,
-                    "code": auth.deny_code,
-                    "message": auth.deny_message,
-                }
+        async with owned_conn.transaction():
+            async with owned_conn.cursor(row_factory=dict_row) as cur:
+                auth = await _authorize_run_and_target_in_tx(
+                    cur,
+                    owned_conn,
+                    run_id=run_id,
+                    target=target,
+                    path_map=path_map,
+                    require_plan=True,
+                )
+                if not auth.allowed or auth.plan is None:
+                    return {
+                        "authorized": False,
+                        "status": auth.deny_status,
+                        "code": auth.deny_code,
+                        "message": auth.deny_message,
+                    }
 
-            delivery_keys = [
-                build_data_task_item_delivery_key(
+                delivery_keys = [
+                    build_data_task_item_delivery_key(
+                        run_id=auth.run_id,
+                        platform=auth.platform,
+                        recipient_id=auth.recipient_id,
+                        item_index=item.item_index,
+                    )
+                    for item in auth.plan.items
+                ]
+                await _persist_reconcile_identity_on_outer_delivery(
+                    cur,
                     run_id=auth.run_id,
                     platform=auth.platform,
+                    requested_target=auth.requested_target,
+                    canonical_target_address=auth.canonical_target_address,
                     recipient_id=auth.recipient_id,
-                    item_index=item.item_index,
+                    delivery_keys=delivery_keys,
                 )
-                for item in auth.plan.items
-            ]
-            existing_by_key: dict[str, dict[str, Any]] = {}
-            if delivery_keys:
-                await cur.execute(
-                    """
-                    SELECT delivery_key, status, sent_chunks, total_chunks, error_code
-                    FROM dalton_channel_deliveries
-                    WHERE delivery_key = ANY(%s)
-                    """,
-                    (delivery_keys,),
-                )
-                for row in await cur.fetchall():
-                    existing_by_key[str(row["delivery_key"])] = dict(row)
+                existing_by_key: dict[str, dict[str, Any]] = {}
+                if delivery_keys:
+                    await cur.execute(
+                        """
+                        SELECT delivery_key, status, sent_chunks, total_chunks, error_code
+                        FROM dalton_channel_deliveries
+                        WHERE delivery_key = ANY(%s)
+                        """,
+                        (delivery_keys,),
+                    )
+                    for row in await cur.fetchall():
+                        existing_by_key[str(row["delivery_key"])] = dict(row)
 
-            wire_items: list[dict[str, Any]] = []
-            for item, d_key in zip(auth.plan.items, delivery_keys, strict=True):
-                item_dict = item.to_wire_dict(delivery_key=d_key)
-                ex = existing_by_key.get(d_key)
-                item_dict["existing_status"] = str(ex["status"]) if ex else None
-                wire_items.append(item_dict)
+                wire_items: list[dict[str, Any]] = []
+                for item, d_key in zip(auth.plan.items, delivery_keys, strict=True):
+                    item_dict = item.to_wire_dict(delivery_key=d_key)
+                    ex = existing_by_key.get(d_key)
+                    item_dict["existing_status"] = str(ex["status"]) if ex else None
+                    wire_items.append(item_dict)
 
-            plan_payload: dict[str, Any] = {
-                "authorized": True,
-                "status": "authorized",
-                "run_id": auth.run_id,
-                "job_key": auth.job_key,
-                "owner_user_id": auth.owner_user_id,
-                "platform": auth.platform,
-                "target_kind": auth.target_kind,
-                "requested_target": auth.requested_target,
-                "canonical_target_address": auth.canonical_target_address,
-                "recipient_id": auth.recipient_id,
-                "items": wire_items,
-            }
-            if auth.owner_platform_user_id is not None:
-                plan_payload["owner_platform_user_id"] = auth.owner_platform_user_id
-            return plan_payload
+                plan_payload: dict[str, Any] = {
+                    "authorized": True,
+                    "status": "authorized",
+                    "run_id": auth.run_id,
+                    "job_key": auth.job_key,
+                    "owner_user_id": auth.owner_user_id,
+                    "platform": auth.platform,
+                    "target_kind": auth.target_kind,
+                    "requested_target": auth.requested_target,
+                    "canonical_target_address": auth.canonical_target_address,
+                    "recipient_id": auth.recipient_id,
+                    "items": wire_items,
+                }
+                if auth.owner_platform_user_id is not None:
+                    plan_payload["owner_platform_user_id"] = auth.owner_platform_user_id
+                return plan_payload
 
 
 async def authorize_and_claim_data_task_delivery(
@@ -627,7 +701,7 @@ async def authorize_and_claim_data_task_delivery(
                         "message": auth.deny_message,
                     }
 
-                expected_keys = {
+                ordered_expected_keys = [
                     build_data_task_item_delivery_key(
                         run_id=auth.run_id,
                         platform=auth.platform,
@@ -635,7 +709,8 @@ async def authorize_and_claim_data_task_delivery(
                         item_index=item.item_index,
                     )
                     for item in auth.plan.items
-                }
+                ]
+                expected_keys = set(ordered_expected_keys)
                 if cleaned_key not in expected_keys:
                     return {
                         "claim_status": "denied",
@@ -643,6 +718,16 @@ async def authorize_and_claim_data_task_delivery(
                         "code": "not_allowed",
                         "message": "delivery_key does not match an authorized item for this run and target.",
                     }
+
+                await _persist_reconcile_identity_on_outer_delivery(
+                    cur,
+                    run_id=auth.run_id,
+                    platform=auth.platform,
+                    requested_target=auth.requested_target,
+                    canonical_target_address=auth.canonical_target_address,
+                    recipient_id=auth.recipient_id,
+                    delivery_keys=ordered_expected_keys,
+                )
 
                 await cur.execute(
                     """
@@ -807,60 +892,280 @@ def _derive_expected_item_count_from_persisted_payload(
     return None
 
 
+async def ensure_outer_reconcile_identity_persisted(
+    *,
+    run_id: str,
+    channel: str,
+    target: str,
+    owner_user_id: str,
+    payload: Mapping[str, Any] | None = None,
+    conn: Any = None,
+) -> dict[str, Any] | None:
+    """Resolve and persist immutable recipient/item-key identity on the outer notification before external send."""
+    try:
+        norm_run_id = normalize_run_uuid(run_id)
+    except DataTaskArtifactError:
+        return None
+
+    parsed_target = _parse_requested_notify_target(target)
+    if parsed_target is None:
+        return None
+    platform, target_kind, raw_ident = parsed_target
+    if platform != str(channel or "").strip().lower():
+        return None
+
+    expected_count = _derive_expected_item_count_from_persisted_payload(payload)
+    if expected_count is None or expected_count <= 0:
+        return None
+
+    try:
+        async with get_db_connection(conn) as owned_conn:
+            async with owned_conn.transaction():
+                async with owned_conn.cursor(row_factory=dict_row) as cur:
+                    await cur.execute(
+                        """
+                        SELECT payload_json
+                        FROM dalton_notify_deliveries
+                        WHERE execution_id = %s
+                          AND channel = %s
+                          AND target = %s
+                        FOR UPDATE
+                        """,
+                        (norm_run_id, platform, target),
+                    )
+                    existing_row = await cur.fetchone()
+                    existing_payload = (
+                        existing_row.get("payload_json")
+                        if existing_row and isinstance(existing_row.get("payload_json"), Mapping)
+                        else None
+                    )
+                    if (
+                        isinstance(existing_payload, Mapping)
+                        and str(existing_payload.get("reconcile_recipient_id") or "").strip()
+                        and isinstance(existing_payload.get("reconcile_delivery_keys"), list)
+                    ):
+                        return {
+                            "reconcile_platform": str(existing_payload.get("reconcile_platform") or platform),
+                            "reconcile_recipient_id": str(existing_payload["reconcile_recipient_id"]).strip(),
+                            "reconcile_canonical_target": str(
+                                existing_payload.get("reconcile_canonical_target") or target
+                            ).strip(),
+                            "expected_item_count": int(
+                                existing_payload.get("expected_item_count") or expected_count
+                            ),
+                            "reconcile_delivery_keys": list(existing_payload["reconcile_delivery_keys"]),
+                        }
+
+                    if target_kind == "group":
+                        canonical_target_address = f"{platform}:{raw_ident}"
+                        recipient_id = raw_ident
+                    else:
+                        canonical_target_address = f"{platform}:@me"
+                        await cur.execute(
+                            """
+                            SELECT platform_user_id
+                            FROM dalton_channel_identities
+                            WHERE user_id = %s AND platform = %s
+                            """,
+                            (owner_user_id, platform),
+                        )
+                        id_row = await cur.fetchone()
+                        bound_uid = (
+                            str(id_row.get("platform_user_id") or "").strip()
+                            if id_row
+                            else ""
+                        )
+                        if platform == "discord":
+                            if raw_ident == "@me":
+                                if not bound_uid:
+                                    return None
+                                recipient_id = bound_uid
+                            else:
+                                if bound_uid and bound_uid != raw_ident:
+                                    return None
+                                recipient_id = raw_ident
+                        else:
+                            if raw_ident == "@me":
+                                if not bound_uid:
+                                    return None
+                                recipient_id = bound_uid
+                            elif bound_uid:
+                                recipient_id = bound_uid
+                            else:
+                                recipient_id = raw_ident
+
+                    delivery_keys = [
+                        build_data_task_item_delivery_key(
+                            run_id=norm_run_id,
+                            platform=platform,
+                            recipient_id=recipient_id,
+                            item_index=idx,
+                        )
+                        for idx in range(expected_count)
+                    ]
+                    await _persist_reconcile_identity_on_outer_delivery(
+                        cur,
+                        run_id=norm_run_id,
+                        platform=platform,
+                        requested_target=target,
+                        canonical_target_address=canonical_target_address,
+                        recipient_id=recipient_id,
+                        delivery_keys=delivery_keys,
+                    )
+                    return build_reconcile_identity_metadata(
+                        platform=platform,
+                        recipient_id=recipient_id,
+                        canonical_target_address=canonical_target_address,
+                        delivery_keys=delivery_keys,
+                    )
+    except Exception:
+        logger.debug(
+            "Unable to persist initial reconcile identity for run_id=%s target=%s",
+            run_id,
+            target,
+            exc_info=True,
+        )
+        return None
+
+
 async def _resolve_reconcile_recipient_identity(
     cur: Any,
     *,
+    norm_run_id: str,
     owner_user_id: str,
     platform: str,
     target_kind: str,
     raw_ident: str,
-) -> tuple[str, str] | None:
-    """Resolve `(canonical_target_address, recipient_id)` for read-only ledger reconciliation."""
-    if target_kind == "group":
-        return f"{platform}:{raw_ident}", raw_ident
+    expected_count: int,
+    payload: Mapping[str, Any] | None = None,
+) -> tuple[str, str, list[str]] | None:
+    """Resolve immutable `(canonical_target_address, recipient_id, expected_keys)` without querying current bindings.
 
-    canonical_target_address = f"{platform}:@me"
-    if raw_ident != "@me":
-        await cur.execute(
-            """
-            SELECT user_id
-            FROM dalton_channel_identities
-            WHERE platform = %s AND platform_user_id = %s
-            """,
-            (platform, raw_ident),
-        )
-        other_row = await cur.fetchone()
-        if other_row and str(other_row.get("user_id") or "").strip() != owner_user_id:
+    Never consults `dalton_channel_identities` or current routes/preferences.
+    1. Uses the persisted `reconcile_*` identity recorded on the outer `dalton_notify_deliveries.payload_json`
+       before the first external effect.
+    2. For group targets, uses the deterministic group target `(f"{platform}:{raw_ident}", raw_ident)`.
+    3. For legacy DM rows lacking `reconcile_*` in `payload_json`, inspects `dalton_channel_deliveries`
+       for `(kind='data_task', run_id=norm_run_id, user_id=owner_user_id, platform=platform)` and
+       accepts only a single unambiguous recipient matching the legacy target, refusing to guess
+       when zero or multiple recipients exist.
+    """
+    if isinstance(payload, Mapping):
+        persisted_platform = str(payload.get("reconcile_platform") or "").strip().lower()
+        persisted_recipient = str(payload.get("reconcile_recipient_id") or "").strip()
+        persisted_canon = str(payload.get("reconcile_canonical_target") or "").strip()
+        persisted_keys = payload.get("reconcile_delivery_keys")
+
+        if persisted_platform and persisted_platform != platform:
             return None
 
+        if persisted_recipient or persisted_keys is not None:
+            if not persisted_recipient:
+                return None
+            if target_kind == "group":
+                expected_canon = f"{platform}:{raw_ident}"
+                if persisted_recipient != raw_ident:
+                    return None
+                if persisted_canon and persisted_canon != expected_canon:
+                    return None
+                canonical_target_address = expected_canon
+            else:
+                expected_canon = f"{platform}:@me"
+                if persisted_canon and persisted_canon != expected_canon:
+                    return None
+                canonical_target_address = expected_canon
+
+            computed_keys = [
+                build_data_task_item_delivery_key(
+                    run_id=norm_run_id,
+                    platform=platform,
+                    recipient_id=persisted_recipient,
+                    item_index=idx,
+                )
+                for idx in range(expected_count)
+            ]
+            if persisted_keys is not None:
+                if not isinstance(persisted_keys, list) or len(persisted_keys) != expected_count:
+                    return None
+                cleaned_persisted_keys = [str(k or "").strip() for k in persisted_keys]
+                if cleaned_persisted_keys != computed_keys:
+                    return None
+            return canonical_target_address, persisted_recipient, computed_keys
+
+    if target_kind == "group":
+        canonical_target_address = f"{platform}:{raw_ident}"
+        recipient_id = raw_ident
+        computed_keys = [
+            build_data_task_item_delivery_key(
+                run_id=norm_run_id,
+                platform=platform,
+                recipient_id=recipient_id,
+                item_index=idx,
+            )
+            for idx in range(expected_count)
+        ]
+        return canonical_target_address, recipient_id, computed_keys
+
+    # Legacy DM row without persisted `reconcile_*` metadata in `payload_json`:
+    # Derive strictly from persisted `dalton_channel_deliveries` rows for this run/owner/platform,
+    # never from current `dalton_channel_identities`, and refuse if zero or multiple recipients exist.
+    canonical_target_address = f"{platform}:@me"
     await cur.execute(
         """
-        SELECT platform_user_id
-        FROM dalton_channel_identities
-        WHERE user_id = %s AND platform = %s
+        SELECT delivery_key, target_address
+        FROM dalton_channel_deliveries
+        WHERE kind = 'data_task'
+          AND run_id = %s
+          AND user_id = %s
+          AND platform = %s
         """,
-        (owner_user_id, platform),
+        (norm_run_id, owner_user_id, platform),
     )
-    id_row = await cur.fetchone()
-    bound_uid = str(id_row.get("platform_user_id") or "").strip() if id_row else ""
+    ledger_rows = await cur.fetchall()
+    if not ledger_rows:
+        return None
 
-    if platform == "discord":
-        if raw_ident == "@me":
-            if not bound_uid:
-                return None
-            return canonical_target_address, bound_uid
-        if bound_uid and bound_uid != raw_ident:
+    key_prefix = f"data_task:{norm_run_id}:{platform}:"
+    distinct_recipients: set[str] = set()
+    for lrow in ledger_rows:
+        row_taddr = str(lrow.get("target_address") or "").strip()
+        if row_taddr != canonical_target_address:
+            continue
+        dkey = str(lrow.get("delivery_key") or "").strip()
+        if not dkey.startswith(key_prefix):
             return None
-        return canonical_target_address, raw_ident
+        remainder = dkey[len(key_prefix) :]
+        if ":item:" not in remainder:
+            return None
+        rec_part, idx_part = remainder.rsplit(":item:", 1)
+        rec_clean = rec_part.strip()
+        if not rec_clean or ":" in rec_clean:
+            return None
+        try:
+            idx_int = int(idx_part)
+        except (TypeError, ValueError):
+            return None
+        if idx_int < 0 or idx_int >= expected_count:
+            return None
+        distinct_recipients.add(rec_clean)
 
-    # Feishu DM
-    if raw_ident == "@me":
-        if not bound_uid:
-            return None
-        return canonical_target_address, bound_uid
-    if bound_uid:
-        return canonical_target_address, bound_uid
-    return canonical_target_address, raw_ident
+    if len(distinct_recipients) != 1:
+        return None
+
+    ledger_recipient = next(iter(distinct_recipients))
+    if raw_ident != "@me" and ledger_recipient != raw_ident:
+        return None
+
+    computed_keys = [
+        build_data_task_item_delivery_key(
+            run_id=norm_run_id,
+            platform=platform,
+            recipient_id=ledger_recipient,
+            item_index=idx,
+        )
+        for idx in range(expected_count)
+    ]
+    return canonical_target_address, ledger_recipient, computed_keys
 
 
 async def reconcile_uncertain_data_task_deliveries(
@@ -968,23 +1273,17 @@ async def reconcile_uncertain_data_task_deliveries(
                     async with row_conn.cursor(row_factory=dict_row) as cur:
                         resolved_ident = await _resolve_reconcile_recipient_identity(
                             cur,
+                            norm_run_id=norm_run_id,
                             owner_user_id=owner_user_id,
                             platform=platform,
                             target_kind=target_kind,
                             raw_ident=raw_ident,
+                            expected_count=expected_count,
+                            payload=payload,
                         )
                         if resolved_ident is None:
                             continue
-                        canonical_target_address, recipient_id = resolved_ident
-                        expected_keys = [
-                            build_data_task_item_delivery_key(
-                                run_id=norm_run_id,
-                                platform=platform,
-                                recipient_id=recipient_id,
-                                item_index=idx,
-                            )
-                            for idx in range(expected_count)
-                        ]
+                        canonical_target_address, _recipient_id, expected_keys = resolved_ident
 
                         await cur.execute(
                             """

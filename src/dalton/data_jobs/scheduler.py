@@ -51,9 +51,11 @@ from src.dalton.data_jobs.manifest import (
     sync_manifest_to_db,
 )
 from src.dalton.data_jobs.notification_payloads import (
+    DataTaskNotificationError,
     DataTaskNotificationPrepError,
     T27_JOB_KEY,
     is_t27_outbox_prepared,
+    prepare_run_outbox_image_metadata,
     prepare_t27_run_outbox,
 )
 from src.dalton.data_jobs.runner_wrapper import (
@@ -1286,6 +1288,38 @@ async def finalize_task_run(
                 )
         return False, None
 
+    if (
+        evaluation.ok
+        and evaluation.status == "succeeded"
+        and isinstance(outbox_payload, Mapping)
+    ):
+        run_art_dir = paths.backend_run_artifacts_dir(claimed.run_id)
+        try:
+            prepared_outbox = prepare_run_outbox_image_metadata(
+                outbox_payload,
+                run_artifacts_dir=run_art_dir,
+                job_key=claimed.job_key,
+            )
+            if prepared_outbox is not None and prepared_outbox != outbox_payload:
+                outbox_file = run_art_dir / "outbox.json"
+                if outbox_file.exists():
+                    atomic_write_json(
+                        outbox_file,
+                        prepared_outbox,
+                        anchor_dir=paths.backend_data_root,
+                    )
+                outbox_payload = prepared_outbox
+        except (DataTaskNotificationPrepError, DataTaskNotificationError, SafeFsError) as prep_exc:
+            outbox_payload = None
+            prep_code = getattr(prep_exc, "code", "report_preparation_failed")
+            evaluation = TaskEvaluationResult(
+                ok=False,
+                status="failed",
+                failure_reason=f"report_preparation_failed: {prep_exc}",
+                warnings=list(evaluation.warnings),
+                details={**evaluation.details, "report_prep_code": prep_code},
+            )
+
     terminal_status = evaluation.status
     has_outbox = outbox_payload is not None
     notify_status = resolve_notify_status(
@@ -1902,6 +1936,36 @@ async def execute_claimed_container_run(
                 failure_reason=f"report_preparation_failed: {prep_exc}",
                 warnings=list(evaluation.warnings),
                 details={**evaluation.details, "report_prep_code": prep_exc.code},
+            )
+    if (
+        evaluation.ok
+        and evaluation.status == "succeeded"
+        and isinstance(outbox_payload, Mapping)
+    ):
+        run_art_dir = paths.backend_run_artifacts_dir(claimed.run_id)
+        try:
+            prepared_outbox = prepare_run_outbox_image_metadata(
+                outbox_payload,
+                run_artifacts_dir=run_art_dir,
+                job_key=claimed.job_key,
+            )
+            if prepared_outbox is not None and prepared_outbox != outbox_payload:
+                if (run_art_dir / "outbox.json").exists():
+                    atomic_write_json(
+                        run_art_dir / "outbox.json",
+                        prepared_outbox,
+                        anchor_dir=paths.backend_data_root,
+                    )
+                outbox_payload = prepared_outbox
+        except (DataTaskNotificationPrepError, DataTaskNotificationError, SafeFsError) as prep_exc:
+            outbox_payload = None
+            prep_code = getattr(prep_exc, "code", "report_preparation_failed")
+            evaluation = TaskEvaluationResult(
+                ok=False,
+                status="failed",
+                failure_reason=f"report_preparation_failed: {prep_exc}",
+                warnings=list(evaluation.warnings),
+                details={**evaluation.details, "report_prep_code": prep_code},
             )
     return await finalize_task_run(
         conn,
@@ -2677,8 +2741,18 @@ async def dispatch_data_task_run_notification(
                 continue
             target_payload = dict(payload_with_route_key)
             prev_payload = existing_payload_by_target.get((ch, cleaned_tgt))
-            if isinstance(prev_payload, Mapping) and "cards_sent" in prev_payload:
-                target_payload["cards_sent"] = prev_payload["cards_sent"]
+            if isinstance(prev_payload, Mapping):
+                if "cards_sent" in prev_payload:
+                    target_payload["cards_sent"] = prev_payload["cards_sent"]
+                for rec_key in (
+                    "reconcile_platform",
+                    "reconcile_recipient_id",
+                    "reconcile_canonical_target",
+                    "expected_item_count",
+                    "reconcile_delivery_keys",
+                ):
+                    if rec_key in prev_payload:
+                        target_payload[rec_key] = prev_payload[rec_key]
             await check_scheduler_lock(lock_conn)
             claimed_ok = await claim_target_fn(
                 str(run_id),
@@ -2692,6 +2766,21 @@ async def dispatch_data_task_run_notification(
                 continue
             local_by_target[(ch, cleaned_tgt)] = "pending"
             pending_targets.append((ch, cleaned_tgt))
+
+            if claim_target_fn is claim_target_delivery:
+                from src.dalton.database.data_task_notifications import (
+                    ensure_outer_reconcile_identity_persisted,
+                )
+
+                persisted_rec = await ensure_outer_reconcile_identity_persisted(
+                    run_id=str(run_id),
+                    channel=ch,
+                    target=cleaned_tgt,
+                    owner_user_id=pm_user_id,
+                    payload=target_payload,
+                )
+                if isinstance(persisted_rec, Mapping):
+                    target_payload.update(persisted_rec)
 
             await check_scheduler_lock(lock_conn)
             try:

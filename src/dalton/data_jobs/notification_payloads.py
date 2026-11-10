@@ -834,6 +834,203 @@ def _upgrade_card_envelope_if_needed(raw_card: Mapping[str, Any]) -> dict[str, A
     return card
 
 
+def prepare_run_outbox_image_metadata(
+    raw_outbox: Mapping[str, Any] | None,
+    *,
+    run_artifacts_dir: Path,
+    job_key: str = "",
+) -> dict[str, Any] | None:
+    """Validate staged report images and persist `size_bytes` and `sha256` before run success is committed.
+
+    Preserves card structure, schema, fields, table rows, image order, placeholders, and report text.
+    Validates any already-supplied byte counts or digests against the actual staged image bytes and
+    rejects malformed or mismatched supplied metadata rather than overwriting it.
+    """
+    _ = job_key
+    if raw_outbox is None:
+        return None
+    if not isinstance(raw_outbox, Mapping):
+        raise DataTaskNotificationPrepError(
+            "Run outbox payload must be a JSON object",
+            code="invalid_notification_payload",
+        )
+    if not raw_outbox:
+        return {}
+
+    prepared: dict[str, Any] = copy.deepcopy(dict(raw_outbox))
+
+    raw_feishu_cards = prepared.get("feishu_cards")
+    if raw_feishu_cards is not None:
+        if not isinstance(raw_feishu_cards, list) or not raw_feishu_cards:
+            raise DataTaskNotificationPrepError(
+                "feishu_cards must be a non-empty list",
+                code="invalid_notification_payload",
+            )
+        for card_idx, entry in enumerate(raw_feishu_cards):
+            if not isinstance(entry, Mapping) or not isinstance(entry.get("card"), Mapping):
+                raise DataTaskNotificationPrepError(
+                    f"feishu_cards[{card_idx}] is missing a valid card object",
+                    code="invalid_notification_payload",
+                )
+            raw_images = entry.get("images")
+            if raw_images is None:
+                continue
+            if not isinstance(raw_images, list):
+                raise DataTaskNotificationPrepError(
+                    f"feishu_cards[{card_idx}].images must be a list",
+                    code="invalid_notification_payload",
+                )
+            for img_idx, img_entry in enumerate(raw_images):
+                if not isinstance(img_entry, Mapping):
+                    raise DataTaskNotificationPrepError(
+                        f"feishu_cards[{card_idx}].images[{img_idx}] must be an object",
+                        code="invalid_notification_payload",
+                    )
+                ph = str(img_entry.get("placeholder") or "").strip()
+                rel_p = str(img_entry.get("path") or "").strip()
+                if not ph or not rel_p:
+                    raise DataTaskNotificationPrepError(
+                        "Card image entry requires placeholder and run-relative path",
+                        code="artifact_invalid",
+                    )
+                try:
+                    norm_rel = "/".join(_normalize_strict_relative_parts(rel_p))
+                    data = _safe_read_contained_regular_file(run_artifacts_dir, norm_rel)
+                    fname = sanitize_artifact_filename(
+                        str(img_entry.get("filename") or PurePosixPath(norm_rel).name)
+                    )
+                    _detect_validated_image_mime(data, fname)
+                except DataTaskNotificationError as exc:
+                    raise DataTaskNotificationPrepError(str(exc), code=exc.code) from exc
+
+                actual_size = len(data)
+                actual_sha256 = hashlib.sha256(data).hexdigest()
+
+                if "size_bytes" in img_entry and img_entry.get("size_bytes") is not None:
+                    raw_sz = img_entry.get("size_bytes")
+                    if isinstance(raw_sz, bool):
+                        raise DataTaskNotificationPrepError(
+                            "Supplied image size_bytes is invalid",
+                            code="artifact_size_invalid",
+                        )
+                    try:
+                        supplied_size = int(raw_sz)
+                    except (TypeError, ValueError) as exc:
+                        raise DataTaskNotificationPrepError(
+                            "Supplied image size_bytes is invalid",
+                            code="artifact_size_invalid",
+                        ) from exc
+                    if supplied_size <= 0:
+                        raise DataTaskNotificationPrepError(
+                            "Supplied image size_bytes must be positive",
+                            code="artifact_size_invalid",
+                        )
+                    if supplied_size != actual_size:
+                        raise DataTaskNotificationPrepError(
+                            f"Supplied image size_bytes mismatch: expected {supplied_size}, got {actual_size}",
+                            code="artifact_size_mismatch",
+                        )
+
+                if "sha256" in img_entry and img_entry.get("sha256") is not None:
+                    raw_sha = img_entry.get("sha256")
+                    if not isinstance(raw_sha, str):
+                        raise DataTaskNotificationPrepError(
+                            "Supplied image sha256 is invalid",
+                            code="artifact_sha256_invalid",
+                        )
+                    supplied_sha = raw_sha.strip().lower()
+                    if not SHA256_HEX_RE.match(supplied_sha):
+                        raise DataTaskNotificationPrepError(
+                            "Supplied image sha256 is malformed",
+                            code="artifact_sha256_invalid",
+                        )
+                    if supplied_sha != actual_sha256:
+                        raise DataTaskNotificationPrepError(
+                            "Supplied image sha256 does not match staged image bytes",
+                            code="artifact_sha256_mismatch",
+                        )
+
+                img_entry["size_bytes"] = actual_size
+                img_entry["sha256"] = actual_sha256
+
+    raw_items = prepared.get("items")
+    if raw_items is not None:
+        if not isinstance(raw_items, list) or not raw_items:
+            raise DataTaskNotificationPrepError(
+                "items must be a non-empty list",
+                code="invalid_notification_payload",
+            )
+        for pos, item_obj in enumerate(raw_items):
+            if not isinstance(item_obj, Mapping):
+                raise DataTaskNotificationPrepError(
+                    f"items[{pos}] must be an object",
+                    code="invalid_notification_payload",
+                )
+            raw_media = item_obj.get("media")
+            has_media = isinstance(raw_media, str) and bool(raw_media.strip())
+            if not has_media:
+                continue
+            try:
+                norm_rel = "/".join(_normalize_strict_relative_parts(str(raw_media).strip()))
+                data = _safe_read_contained_regular_file(run_artifacts_dir, norm_rel)
+                fname = sanitize_artifact_filename(PurePosixPath(norm_rel).name)
+                _detect_validated_image_mime(data, fname)
+            except DataTaskNotificationError as exc:
+                raise DataTaskNotificationPrepError(str(exc), code=exc.code) from exc
+
+            actual_size = len(data)
+            actual_sha256 = hashlib.sha256(data).hexdigest()
+
+            if "chart_bytes" in item_obj and item_obj.get("chart_bytes") is not None:
+                raw_sz = item_obj.get("chart_bytes")
+                if isinstance(raw_sz, bool):
+                    raise DataTaskNotificationPrepError(
+                        "Supplied item chart_bytes is invalid",
+                        code="artifact_size_invalid",
+                    )
+                try:
+                    supplied_size = int(raw_sz)
+                except (TypeError, ValueError) as exc:
+                    raise DataTaskNotificationPrepError(
+                        "Supplied item chart_bytes is invalid",
+                        code="artifact_size_invalid",
+                    ) from exc
+                if supplied_size <= 0:
+                    raise DataTaskNotificationPrepError(
+                        "Supplied item chart_bytes must be positive",
+                        code="artifact_size_invalid",
+                    )
+                if supplied_size != actual_size:
+                    raise DataTaskNotificationPrepError(
+                        f"Supplied item chart_bytes mismatch: expected {supplied_size}, got {actual_size}",
+                        code="artifact_size_mismatch",
+                    )
+
+            if "chart_sha256" in item_obj and item_obj.get("chart_sha256") is not None:
+                raw_sha = item_obj.get("chart_sha256")
+                if not isinstance(raw_sha, str):
+                    raise DataTaskNotificationPrepError(
+                        "Supplied item chart_sha256 is invalid",
+                        code="artifact_sha256_invalid",
+                    )
+                supplied_sha = raw_sha.strip().lower()
+                if not SHA256_HEX_RE.match(supplied_sha):
+                    raise DataTaskNotificationPrepError(
+                        "Supplied item chart_sha256 is malformed",
+                        code="artifact_sha256_invalid",
+                    )
+                if supplied_sha != actual_sha256:
+                    raise DataTaskNotificationPrepError(
+                        "Supplied item chart_sha256 does not match staged image bytes",
+                        code="artifact_sha256_mismatch",
+                    )
+
+            item_obj["chart_bytes"] = actual_size
+            item_obj["chart_sha256"] = actual_sha256
+
+    return prepared
+
+
 def _validate_and_register_run_artifact(
     *,
     artifact_id: str,
@@ -854,33 +1051,62 @@ def _validate_and_register_run_artifact(
     actual_size = len(data)
     actual_sha256 = hashlib.sha256(data).hexdigest()
 
-    if expected_size_bytes is not None:
-        try:
-            exp_size = int(expected_size_bytes)
-        except (TypeError, ValueError) as exc:
-            raise DataTaskArtifactError("Recorded artifact size_bytes is invalid") from exc
-        if exp_size <= 0 or actual_size != exp_size:
-            raise DataTaskArtifactError(
-                f"Artifact size mismatch for {artifact_id}: expected {exp_size}, got {actual_size}",
-                code="artifact_size_mismatch",
-            )
+    if expected_size_bytes is None:
+        raise DataTaskArtifactError(
+            f"Artifact {artifact_id} is missing persisted size_bytes metadata",
+            code="artifact_metadata_missing",
+        )
+    if isinstance(expected_size_bytes, bool):
+        raise DataTaskArtifactError(
+            "Recorded artifact size_bytes is invalid",
+            code="artifact_size_invalid",
+        )
+    try:
+        exp_size = int(expected_size_bytes)
+    except (TypeError, ValueError) as exc:
+        raise DataTaskArtifactError(
+            "Recorded artifact size_bytes is invalid",
+            code="artifact_size_invalid",
+        ) from exc
+    if exp_size <= 0:
+        raise DataTaskArtifactError(
+            "Recorded artifact size_bytes must be positive",
+            code="artifact_size_invalid",
+        )
+    if actual_size != exp_size:
+        raise DataTaskArtifactError(
+            f"Artifact size mismatch for {artifact_id}: expected {exp_size}, got {actual_size}",
+            code="artifact_size_mismatch",
+        )
 
-    if expected_sha256 is not None:
-        exp_sha = str(expected_sha256).strip().lower()
-        if not SHA256_HEX_RE.match(exp_sha):
-            raise DataTaskArtifactError("Recorded artifact sha256 is malformed")
-        if actual_sha256 != exp_sha:
-            raise DataTaskArtifactError(
-                f"Artifact sha256 mismatch for {artifact_id}",
-                code="artifact_sha256_mismatch",
-            )
+    if expected_sha256 is None:
+        raise DataTaskArtifactError(
+            f"Artifact {artifact_id} is missing persisted sha256 metadata",
+            code="artifact_metadata_missing",
+        )
+    if not isinstance(expected_sha256, str):
+        raise DataTaskArtifactError(
+            "Recorded artifact sha256 is invalid",
+            code="artifact_sha256_invalid",
+        )
+    exp_sha = expected_sha256.strip().lower()
+    if not SHA256_HEX_RE.match(exp_sha):
+        raise DataTaskArtifactError(
+            "Recorded artifact sha256 is malformed",
+            code="artifact_sha256_invalid",
+        )
+    if actual_sha256 != exp_sha:
+        raise DataTaskArtifactError(
+            f"Artifact sha256 mismatch for {artifact_id}",
+            code="artifact_sha256_mismatch",
+        )
 
     descriptor = PlanArtifactDescriptor(
         artifact_id=artifact_id,
         filename=filename,
         mime_type=mime_type,
-        size_bytes=actual_size,
-        sha256=actual_sha256,
+        size_bytes=exp_size,
+        sha256=exp_sha,
         placeholder=placeholder,
     )
     internal_ref = InternalArtifactRef(
@@ -888,8 +1114,8 @@ def _validate_and_register_run_artifact(
         rel_path=norm_rel,
         filename=filename,
         mime_type=mime_type,
-        size_bytes=actual_size,
-        sha256=actual_sha256,
+        size_bytes=exp_size,
+        sha256=exp_sha,
     )
     return descriptor, internal_ref
 

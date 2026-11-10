@@ -37,6 +37,7 @@ from src.dalton.app import data_task_notifications_router as dtn_router_mod
 from src.dalton.app.router import router as dalton_router
 from src.dalton.data_jobs.container_runner import DataTaskPathMap, build_path_map
 from src.dalton.data_jobs.manifest import load_data_task_manifest, sync_manifest_to_db
+from src.dalton.data_jobs.notification_payloads import prepare_run_outbox_image_metadata
 from src.dalton.data_jobs.scheduler import (
     dispatch_pending_data_task_notifications,
     open_dedicated_lock_connection,
@@ -187,26 +188,29 @@ async def test_authorization_gates_foreign_openid_protection_and_bounded_artifac
         (rdir / "images").mkdir(parents=True, exist_ok=True)
         b_data = chart_bytes if rid != other_run_id else _make_png("OTHER-RUN-IMG")
         (rdir / "images" / "c0.png").write_bytes(b_data)
-        (rdir / "outbox.json").write_text(
-            json.dumps(
-                {
-                    "feishu_cards": [
-                        {
-                            "card": {
-                                "schema": "2.0",
-                                "header": {"title": {"tag": "plain_text", "content": "SoftBank NAV"}},
-                                "body": {
-                                    "elements": [
-                                        {"tag": "markdown", "content": "Synthetic body"},
-                                        {"tag": "__img__", "path": "ph_0"},
-                                    ]
-                                },
+        prepared_ob = prepare_run_outbox_image_metadata(
+            {
+                "feishu_cards": [
+                    {
+                        "card": {
+                            "schema": "2.0",
+                            "header": {"title": {"tag": "plain_text", "content": "SoftBank NAV"}},
+                            "body": {
+                                "elements": [
+                                    {"tag": "markdown", "content": "Synthetic body"},
+                                    {"tag": "__img__", "path": "ph_0"},
+                                ]
                             },
-                            "images": [{"placeholder": "ph_0", "path": "images/c0.png"}],
-                        }
-                    ]
-                }
-            ),
+                        },
+                        "images": [{"placeholder": "ph_0", "path": "images/c0.png"}],
+                    }
+                ]
+            },
+            run_artifacts_dir=rdir,
+            job_key="softbank-nav-monitor",
+        )
+        (rdir / "outbox.json").write_text(
+            json.dumps(prepared_ob),
             encoding="utf-8",
         )
 
@@ -572,21 +576,24 @@ async def test_concurrent_claim_multi_item_resume_and_uncertain_ledger_protectio
         (rdir / "images").mkdir(parents=True, exist_ok=True)
         (rdir / "images" / "0.png").write_bytes(_make_png("CARD0"))
         (rdir / "images" / "1.png").write_bytes(_make_png("CARD1"))
+        prepared_two_cards = prepare_run_outbox_image_metadata(
+            {
+                "feishu_cards": [
+                    {
+                        "card": {"schema": "2.0", "body": {"elements": [{"tag": "__img__", "path": "p0"}]}},
+                        "images": [{"placeholder": "p0", "path": "images/0.png"}],
+                    },
+                    {
+                        "card": {"schema": "2.0", "body": {"elements": [{"tag": "__img__", "path": "p1"}]}},
+                        "images": [{"placeholder": "p1", "path": "images/1.png"}],
+                    },
+                ]
+            },
+            run_artifacts_dir=rdir,
+            job_key="tsmc-adr-premium",
+        )
         (rdir / "outbox.json").write_text(
-            json.dumps(
-                {
-                    "feishu_cards": [
-                        {
-                            "card": {"schema": "2.0", "body": {"elements": [{"tag": "__img__", "path": "p0"}]}},
-                            "images": [{"placeholder": "p0", "path": "images/0.png"}],
-                        },
-                        {
-                            "card": {"schema": "2.0", "body": {"elements": [{"tag": "__img__", "path": "p1"}]}},
-                            "images": [{"placeholder": "p1", "path": "images/1.png"}],
-                        },
-                    ]
-                }
-            ),
+            json.dumps(prepared_two_cards),
             encoding="utf-8",
         )
 
@@ -954,20 +961,23 @@ async def test_unbound_admin_group_delivery_workspace_gate_and_real_vault_startu
     rdir = path_map.backend_run_artifacts_dir(prod_run_id)
     (rdir / "images").mkdir(parents=True, exist_ok=True)
     (rdir / "images" / "c0.png").write_bytes(_make_png("R2-GROUP-CARD"))
+    prepared_r2_ob = prepare_run_outbox_image_metadata(
+        {
+            "feishu_cards": [
+                {
+                    "card": {
+                        "schema": "2.0",
+                        "body": {"elements": [{"tag": "__img__", "path": "ph0"}]},
+                    },
+                    "images": [{"placeholder": "ph0", "path": "images/c0.png"}],
+                }
+            ]
+        },
+        run_artifacts_dir=rdir,
+        job_key="softbank-nav-monitor",
+    )
     (rdir / "outbox.json").write_text(
-        json.dumps(
-            {
-                "feishu_cards": [
-                    {
-                        "card": {
-                            "schema": "2.0",
-                            "body": {"elements": [{"tag": "__img__", "path": "ph0"}]},
-                        },
-                        "images": [{"placeholder": "ph0", "path": "images/c0.png"}],
-                    }
-                ]
-            }
-        ),
+        json.dumps(prepared_r2_ob),
         encoding="utf-8",
     )
 
@@ -1320,9 +1330,13 @@ async def test_read_only_reconciliation_exhausted_uncertain_fairness_and_multi_i
     run_3rd = str(uuid4())
     run_conc = str(uuid4())
     run_other = str(uuid4())
+    run_ambiguous = str(uuid4())
     retry_run_id = str(uuid4())
+    ordinary_exhausted_exec_id = f"ord-exh-{uuid4().hex[:8]}"
+    ordinary_retry_exec_id = f"ord-ret-{uuid4().hex[:8]}"
     exhausted_uncertain_runs = [str(uuid4()) for _ in range(6)]
-    all_run_ids = [run_3rd, run_conc, run_other, retry_run_id, *exhausted_uncertain_runs]
+    all_run_ids = [run_3rd, run_conc, run_other, run_ambiguous, retry_run_id, *exhausted_uncertain_runs]
+    all_notify_exec_ids = [*all_run_ids, ordinary_exhausted_exec_id, ordinary_retry_exec_id]
 
     @asynccontextmanager
     async def _real_db_conn(conn: Any = None):
@@ -1411,6 +1425,9 @@ async def test_read_only_reconciliation_exhausted_uncertain_fairness_and_multi_i
             "automation_id": "data:tsmc-adr-premium",
             "job_key": "tsmc-adr-premium",
             "expected_item_count": 2,
+            "reconcile_platform": "feishu",
+            "reconcile_recipient_id": "ou_r4_pm",
+            "reconcile_canonical_target": "feishu:user:ou_r4_pm",
             "feishu_cards": [
                 {"card": {"schema": "2.0", "body": {"elements": [{"tag": "hr"}]}}},
                 {"card": {"schema": "2.0", "body": {"elements": [{"tag": "hr"}]}}},
@@ -1421,6 +1438,9 @@ async def test_read_only_reconciliation_exhausted_uncertain_fairness_and_multi_i
             "automation_id": "data:tsmc-adr-premium",
             "job_key": "tsmc-adr-premium",
             "expected_item_count": 1,
+            "reconcile_platform": "feishu",
+            "reconcile_recipient_id": "ou_r4_pm",
+            "reconcile_canonical_target": "feishu:user:ou_r4_pm",
             "feishu_cards": [
                 {"card": {"schema": "2.0", "body": {"elements": [{"tag": "hr"}]}}},
             ],
@@ -1495,15 +1515,20 @@ async def test_read_only_reconciliation_exhausted_uncertain_fairness_and_multi_i
             await cur.execute(
                 """
                 INSERT INTO dalton_notify_deliveries (
-                    execution_id, automation_id, user_id, channel, target,
+                    delivery_id, execution_id, automation_id, user_id, channel, target,
                     status, attempt_count, error_code, payload_json,
                     created_at, updated_at
                 )
-                VALUES (%s, 'data:tsmc-adr-premium', %s, 'feishu', 'feishu:@me',
+                VALUES (%s, %s, 'data:tsmc-adr-premium', %s, 'feishu', 'feishu:@me',
                         'pending', 3, 'delivery_uncertain', %s,
                         NOW() - INTERVAL '45 minutes', NOW() - INTERVAL '45 minutes')
                 """,
-                (run_3rd, pm_uid, Jsonb(two_card_payload)),
+                (
+                    str(uuid4()),
+                    run_3rd,
+                    pm_uid,
+                    Jsonb({**two_card_payload, "reconcile_delivery_keys": [k0_3rd, k1_3rd]}),
+                ),
             )
             # Item 0 is `sent`; Item 1 is still `in_flight` (mixed multi-item state).
             # Also insert decoy `sent` rows for another run, another user, and another target!
@@ -1595,6 +1620,95 @@ async def test_read_only_reconciliation_exhausted_uncertain_fairness_and_multi_i
             )
             assert await cur.fetchone() == {"status": "pending", "attempt_count": 3}
 
+        # R5 Part A #2: User unlinks `ou_r4_pm`, rebinds to a different recipient `ou_rebound_new`, and removes route!
+        async with admin_conn.cursor() as cur:
+            await cur.execute(
+                "DELETE FROM dalton_channel_identities WHERE user_id = %s AND platform = 'feishu'",
+                (pm_uid,),
+            )
+            await cur.execute(
+                """
+                INSERT INTO dalton_channel_identities (user_id, platform, platform_user_id)
+                VALUES (%s, 'feishu', 'ou_rebound_new')
+                """,
+                (pm_uid,),
+            )
+            # Insert `sent` item 0 and item 1 for the NEW rebound recipient `ou_rebound_new` on `run_3rd`.
+            # Reconciliation must NOT use today's `dalton_channel_identities` binding (`ou_rebound_new`)!
+            k0_rebound = dtn_db.build_data_task_item_delivery_key(
+                run_id=run_3rd,
+                platform="feishu",
+                recipient_id="ou_rebound_new",
+                item_index=0,
+            )
+            k1_rebound = dtn_db.build_data_task_item_delivery_key(
+                run_id=run_3rd,
+                platform="feishu",
+                recipient_id="ou_rebound_new",
+                item_index=1,
+            )
+            await cur.execute(
+                """
+                INSERT INTO dalton_channel_deliveries (
+                    delivery_key, kind, user_id, run_id, execution_id,
+                    is_current, has_non_empty_text, platform, target_address,
+                    status, total_chunks, sent_chunks, created_at, updated_at
+                )
+                VALUES
+                (%s, 'data_task', %s, %s, %s::uuid, FALSE, TRUE, 'feishu', 'feishu:@me', 'sent', 1, 1, NOW(), NOW()),
+                (%s, 'data_task', %s, %s, %s::uuid, FALSE, TRUE, 'feishu', 'feishu:@me', 'sent', 1, 1, NOW(), NOW())
+                """,
+                (k0_rebound, pm_uid, run_3rd, run_3rd, k1_rebound, pm_uid, run_3rd, run_3rd),
+            )
+            # Also seed an ambiguous legacy row (`run_ambiguous`, without `reconcile_recipient_id` in `payload_json`)
+            # that has `sent` records for two conflicting recipients (`ou_r4_pm` and `ou_rebound_new`).
+            legacy_ambig_payload = {
+                "route_key": "data:tsmc-adr-premium",
+                "automation_id": "data:tsmc-adr-premium",
+                "job_key": "tsmc-adr-premium",
+                "expected_item_count": 1,
+                "feishu_cards": [{"card": {"schema": "2.0", "body": {"elements": [{"tag": "hr"}]}}}],
+            }
+            await cur.execute(
+                """
+                INSERT INTO dalton_notify_deliveries (
+                    delivery_id, execution_id, automation_id, user_id, channel, target,
+                    status, attempt_count, error_code, payload_json,
+                    created_at, updated_at
+                )
+                VALUES (%s, %s, 'data:tsmc-adr-premium', %s, 'feishu', 'feishu:@me',
+                        'pending', 3, 'delivery_uncertain', %s,
+                        NOW() - INTERVAL '40 minutes', NOW() - INTERVAL '40 minutes')
+                """,
+                (str(uuid4()), run_ambiguous, pm_uid, Jsonb(legacy_ambig_payload)),
+            )
+            await cur.execute(
+                """
+                INSERT INTO dalton_channel_deliveries (
+                    delivery_key, kind, user_id, run_id, execution_id,
+                    is_current, has_non_empty_text, platform, target_address,
+                    status, total_chunks, sent_chunks, created_at, updated_at
+                )
+                VALUES
+                (%s, 'data_task', %s, %s, %s::uuid, FALSE, TRUE, 'feishu', 'feishu:@me', 'sent', 1, 1, NOW(), NOW()),
+                (%s, 'data_task', %s, %s, %s::uuid, FALSE, TRUE, 'feishu', 'feishu:@me', 'sent', 1, 1, NOW(), NOW())
+                """,
+                (
+                    dtn_db.build_data_task_item_delivery_key(
+                        run_id=run_ambiguous, platform="feishu", recipient_id="ou_r4_pm", item_index=0
+                    ),
+                    pm_uid,
+                    run_ambiguous,
+                    run_ambiguous,
+                    dtn_db.build_data_task_item_delivery_key(
+                        run_id=run_ambiguous, platform="feishu", recipient_id="ou_rebound_new", item_index=0
+                    ),
+                    pm_uid,
+                    run_ambiguous,
+                    run_ambiguous,
+                ),
+            )
+
         # Remove route in preferences to confirm reconciliation matches original persisted target/items, not current routes!
         await upsert_user_preferences(
             user_id=pm_uid,
@@ -1605,8 +1719,33 @@ async def test_read_only_reconciliation_exhausted_uncertain_fairness_and_multi_i
             },
             conn=admin_conn,
         )
-        # Late durable item completion arrives for item 1 -> read-only reconciliation marks outer `sent` & run `dispatched`!
+
+        # Verify that neither the new rebound recipient's `sent` rows nor the ambiguous legacy row reconcile!
+        assert await notify_dispatch_mod.retry_failed_notify_deliveries(
+            limit=5,
+            max_attempts=3,
+            stale_pending_minutes=10,
+            data_task_notify_fn=gw_spy,
+        ) == 0
+        async with admin_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT execution_id, status FROM dalton_notify_deliveries WHERE execution_id IN (%s, %s)",
+                (run_3rd, run_ambiguous),
+            )
+            statuses_before = {r["execution_id"]: r["status"] for r in await cur.fetchall()}
+            assert statuses_before == {run_3rd: "pending", run_ambiguous: "pending"}
+
+        # Now also unlink the user completely (`DELETE FROM dalton_channel_identities`) before the original recipient's
+        # delayed item 1 (`k1_3rd` for `ou_r4_pm`) completes -> reconciliation still succeeds using persisted recipient!
         async with admin_conn.cursor() as cur:
+            await cur.execute(
+                "DELETE FROM dalton_channel_identities WHERE user_id = %s",
+                (pm_uid,),
+            )
+            await cur.execute(
+                "DELETE FROM dalton_notify_deliveries WHERE execution_id = %s",
+                (run_ambiguous,),
+            )
             await cur.execute(
                 """
                 INSERT INTO dalton_channel_deliveries (
@@ -1644,6 +1783,14 @@ async def test_read_only_reconciliation_exhausted_uncertain_fairness_and_multi_i
                 (run_3rd,),
             )
             assert (await cur.fetchone())["notify_status"] == "dispatched"
+            # Restore original identity `ou_r4_pm` for subsequent steps
+            await cur.execute(
+                """
+                INSERT INTO dalton_channel_identities (user_id, platform, platform_user_id)
+                VALUES (%s, 'feishu', 'ou_r4_pm')
+                """,
+                (pm_uid,),
+            )
 
         # Restore route for subsequent retry queue progress check
         await upsert_user_preferences(
@@ -1669,15 +1816,20 @@ async def test_read_only_reconciliation_exhausted_uncertain_fairness_and_multi_i
             await cur.execute(
                 """
                 INSERT INTO dalton_notify_deliveries (
-                    execution_id, automation_id, user_id, channel, target,
+                    delivery_id, execution_id, automation_id, user_id, channel, target,
                     status, attempt_count, error_code, payload_json,
                     created_at, updated_at
                 )
-                VALUES (%s, 'data:tsmc-adr-premium', %s, 'feishu', 'feishu:@me',
+                VALUES (%s, %s, 'data:tsmc-adr-premium', %s, 'feishu', 'feishu:@me',
                         'pending', 3, 'in_flight', %s,
                         NOW() - INTERVAL '30 minutes', NOW() - INTERVAL '30 minutes')
                 """,
-                (run_conc, pm_uid, Jsonb(one_card_payload)),
+                (
+                    str(uuid4()),
+                    run_conc,
+                    pm_uid,
+                    Jsonb({**one_card_payload, "reconcile_delivery_keys": [k0_conc]}),
+                ),
             )
             await cur.execute(
                 """
@@ -1698,7 +1850,8 @@ async def test_read_only_reconciliation_exhausted_uncertain_fairness_and_multi_i
         assert await dtn_db.reconcile_uncertain_data_task_deliveries(limit=5) == 0
 
         # ---------------------------------------------------------------------
-        # 3. Fairness: 6 older exhausted uncertain entries + 1 newer retryable `failed` entry (`limit=5`)
+        # 3. Fairness & R5 Part A #1: 6 older exhausted uncertain `data:` entries +
+        #    newer retryable `data:` `failed` entry + ordinary non-`data:` `pending`/`failed` rows (`limit=5`)
         # ---------------------------------------------------------------------
         async with admin_conn.cursor() as cur:
             for idx, urid in enumerate(exhausted_uncertain_runs):
@@ -1712,16 +1865,23 @@ async def test_read_only_reconciliation_exhausted_uncertain_fairness_and_multi_i
                 await cur.execute(
                     """
                     INSERT INTO dalton_notify_deliveries (
-                        execution_id, automation_id, user_id, channel, target,
+                        delivery_id, execution_id, automation_id, user_id, channel, target,
                         status, attempt_count, error_code, payload_json,
                         created_at, updated_at
                     )
-                    VALUES (%s, 'data:tsmc-adr-premium', %s, 'feishu', 'feishu:@me',
+                    VALUES (%s, %s, 'data:tsmc-adr-premium', %s, 'feishu', 'feishu:@me',
                             'pending', 3, 'delivery_uncertain', %s,
                             NOW() - make_interval(mins => %s),
                             NOW() - make_interval(mins => %s))
                     """,
-                    (urid, pm_uid, Jsonb(one_card_payload), age_mins, age_mins),
+                    (
+                        str(uuid4()),
+                        urid,
+                        pm_uid,
+                        Jsonb({**one_card_payload, "reconcile_delivery_keys": [ukey]}),
+                        age_mins,
+                        age_mins,
+                    ),
                 )
                 await cur.execute(
                     """
@@ -1735,18 +1895,19 @@ async def test_read_only_reconciliation_exhausted_uncertain_fairness_and_multi_i
                     (ukey, pm_uid, urid, urid),
                 )
 
-            # Newer retryable `failed` row (`attempt_count = 1`) placed AFTER all 6 old uncertain rows
+            # Newer retryable `data:` `failed` row (`attempt_count = 1`) placed AFTER all 6 old uncertain rows
             await cur.execute(
                 """
                 INSERT INTO dalton_notify_deliveries (
-                    execution_id, automation_id, user_id, channel, target,
+                    delivery_id, execution_id, automation_id, user_id, channel, target,
                     status, attempt_count, error_code, payload_json,
                     created_at, updated_at
                 )
-                VALUES (%s, 'data:tsmc-adr-premium', %s, 'feishu', 'feishu:@me',
+                VALUES (%s, %s, 'data:tsmc-adr-premium', %s, 'feishu', 'feishu:@me',
                         'failed', 1, 'http_502', %s, NOW(), NOW())
                 """,
                 (
+                    str(uuid4()),
                     retry_run_id,
                     pm_uid,
                     Jsonb(
@@ -1758,6 +1919,54 @@ async def test_read_only_reconciliation_exhausted_uncertain_fairness_and_multi_i
                     ),
                 ),
             )
+            # R5 Part A #1: Seed ordinary non-`data:` rows AFTER the 6 exhausted uncertain `data:` rows:
+            # (a) an ordinary `pending` row with `attempt_count = 3` and `error_code = 'delivery_uncertain'`
+            #     (must NOT be excluded by `data:` uncertain rules; transitions to `failed`/`attempts_exhausted`);
+            # (b) an ordinary `failed` row (`attempt_count = 1`, `channel = 'unknown_test_channel'`)
+            #     (must be claimed and processed by `retry_failed_notify_deliveries` within `limit=5`!).
+            await cur.execute(
+                """
+                INSERT INTO dalton_notify_deliveries (
+                    delivery_id, execution_id, automation_id, user_id, channel, target,
+                    status, attempt_count, error_code, payload_json,
+                    created_at, updated_at
+                )
+                VALUES
+                (%s, %s, 'briefing:morning', %s, 'feishu', 'feishu:oc_ord_1',
+                 'pending', 3, 'delivery_uncertain', %s,
+                 NOW() - INTERVAL '25 minutes', NOW() - INTERVAL '25 minutes'),
+                (%s, %s, 'briefing:evening', %s, 'unknown_test_channel', 'unknown:target_1',
+                 'failed', 1, 'http_502', %s, NOW(), NOW())
+                """,
+                (
+                    str(uuid4()),
+                    ordinary_exhausted_exec_id,
+                    pm_uid,
+                    Jsonb({"title": "Morning Briefing", "summary": "Ordinary non-data pending row"}),
+                    str(uuid4()),
+                    ordinary_retry_exec_id,
+                    pm_uid,
+                    Jsonb({"title": "Evening Briefing", "summary": "Ordinary non-data retryable row"}),
+                ),
+            )
+
+        # Also verify `claim_target_delivery` still claims an ordinary non-`data:` row even if its `error_code` was `delivery_uncertain`
+        ordinary_claim_ok = await notify_dispatch_mod.claim_target_delivery(
+            execution_id=ordinary_retry_exec_id,
+            automation_id="briefing:evening",
+            user_id=pm_uid,
+            channel="unknown_test_channel",
+            target="unknown:target_claim_check",
+            payload_snapshot={"title": "Claim check"},
+            max_attempts=3,
+            stale_pending_minutes=10,
+        )
+        assert ordinary_claim_ok is True
+        async with admin_conn.cursor() as cur:
+            await cur.execute(
+                "DELETE FROM dalton_notify_deliveries WHERE execution_id = %s AND target = 'unknown:target_claim_check'",
+                (ordinary_retry_exec_id,),
+            )
 
         progressed = await notify_dispatch_mod.retry_failed_notify_deliveries(
             limit=5,
@@ -1766,7 +1975,8 @@ async def test_read_only_reconciliation_exhausted_uncertain_fairness_and_multi_i
             data_task_notify_fn=gw_spy,
         )
         assert progressed == 1
-        # Only the newer retryable `failed` row was sent; zero send/claim calls for the 6 uncertain rows!
+        # Only the newer retryable `data:` `failed` row was sent via `data_task_notify_fn`;
+        # zero send/claim calls for the 6 uncertain `data:` rows, and both ordinary non-`data:` rows were processed!
         assert observed_send_run_ids == [retry_run_id]
         assert claim_spy.call_count == 0
 
@@ -1779,6 +1989,24 @@ async def test_read_only_reconciliation_exhausted_uncertain_fairness_and_multi_i
                 "status": "sent",
                 "attempt_count": 2,
                 "error_code": None,
+            }
+            await cur.execute(
+                "SELECT status, attempt_count, error_code FROM dalton_notify_deliveries WHERE execution_id = %s",
+                (ordinary_exhausted_exec_id,),
+            )
+            assert await cur.fetchone() == {
+                "status": "failed",
+                "attempt_count": 3,
+                "error_code": "attempts_exhausted",
+            }
+            await cur.execute(
+                "SELECT status, attempt_count, error_code FROM dalton_notify_deliveries WHERE execution_id = %s",
+                (ordinary_retry_exec_id,),
+            )
+            assert await cur.fetchone() == {
+                "status": "failed",
+                "attempt_count": 2,
+                "error_code": "unknown_channel",
             }
             await cur.execute(
                 "SELECT COUNT(*) AS cnt FROM dalton_notify_deliveries WHERE execution_id = ANY(%s) AND status = 'pending'",
@@ -1853,7 +2081,7 @@ async def test_read_only_reconciliation_exhausted_uncertain_fairness_and_multi_i
         async with admin_conn.cursor() as cur:
             await cur.execute(
                 "DELETE FROM dalton_notify_deliveries WHERE execution_id = ANY(%s)",
-                (all_run_ids,),
+                (all_notify_exec_ids,),
             )
             await cur.execute(
                 "DELETE FROM dalton_channel_deliveries WHERE run_id = ANY(%s)",
@@ -1877,5 +2105,431 @@ async def test_read_only_reconciliation_exhausted_uncertain_fairness_and_multi_i
             await cur.execute(
                 "DELETE FROM users WHERE user_id IN (%s, %s)",
                 (pm_uid, other_uid),
+            )
+        await admin_conn.close()
+
+
+@pytest.mark.asyncio
+async def test_persisted_image_metadata_finalization_and_tamper_rejection_db(
+    migrated_dsn: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R5 Part B §4 items 5 & 6 against real isolated PostgreSQL:
+    - `finalize_task_run` commits `status='succeeded'`, `notify_status='pending_dispatch'`, and `outbox_payload`
+      containing verified positive `size_bytes` and 64-hex `sha256` for representative T52 and T54 reports;
+    - `/plan` and `/artifacts/{artifact_id}` succeed when on-disk PNG matches persisted `size_bytes` and `sha256`;
+    - Replacing the on-disk PNG with a different valid PNG of the exact same byte length causes both a fresh `/plan`
+      request (rebuilt from persisted DB state) and `/artifacts/{artifact_id}` to reject it (`artifact_sha256_mismatch`);
+    - Unsuccessful image preparation (mismatched supplied digest or missing image) commits `status='failed'`,
+      `notify_status='skipped'`, `outbox_payload=NULL`, and cannot authorize or claim a delivery (`run_not_succeeded`);
+    - Historical image record in DB without `size_bytes`/`sha256` is rejected (`artifact_metadata_missing`) without
+      recomputing digests from disk or mutating DB state, while text-only runs continue to work.
+    """
+    from src.dalton.data_jobs import scheduler as sched
+    from src.dalton.data_jobs.contracts import TaskEvaluationResult
+    from src.dalton.data_jobs.docker_runner import ContainerInspectionOutcome
+
+    dsn = migrated_dsn
+    pm_uid = f"pm-r5-img-{uuid4().hex[:8]}"
+    run_t52 = str(uuid4())
+    run_t54 = str(uuid4())
+    run_prep_fail = str(uuid4())
+    run_legacy_unprepared = str(uuid4())
+    run_text_only = str(uuid4())
+    all_runs = [run_t52, run_t54, run_prep_fail, run_legacy_unprepared, run_text_only]
+
+    path_map = build_path_map(
+        host_var_dir=tmp_path / "r5_h_var",
+        backend_var_dir=tmp_path / "r5_b_var",
+    )
+
+    @asynccontextmanager
+    async def _real_db_conn(conn: Any = None):
+        if conn is not None:
+            yield conn
+            return
+        c = await psycopg.AsyncConnection.connect(dsn, autocommit=True)
+        try:
+            yield c
+        finally:
+            await c.close()
+
+    async def _real_get_prefs(user_id: str) -> dict[str, Any] | None:
+        async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as c:
+            async with c.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    "SELECT model_preference, other_preference FROM user_preferences WHERE user_id = %s",
+                    (user_id,),
+                )
+                return await cur.fetchone()
+
+    monkeypatch.setenv("DALTON_INTERNAL_SERVICE_TOKEN", SERVICE_TOKEN)
+    monkeypatch.setenv("DALTON_PM_USER_IDS", pm_uid)
+    monkeypatch.setattr(dtn_router_mod, "build_path_map", lambda: path_map)
+    monkeypatch.setattr(
+        dtn_db,
+        "get_db_connection",
+        create_autospec(dtn_db.get_db_connection, side_effect=_real_db_conn),
+    )
+    monkeypatch.setattr(
+        cg_db,
+        "get_db_connection",
+        create_autospec(cg_db.get_db_connection, side_effect=_real_db_conn),
+    )
+    monkeypatch.setattr(
+        model_prefs_mod,
+        "get_user_preferences",
+        create_autospec(model_prefs_mod.get_user_preferences, side_effect=_real_get_prefs),
+    )
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(access_tiers_mod.get_user_tier, return_value="admin"),
+    )
+    monkeypatch.setattr(sched, "check_scheduler_lock", create_autospec(sched.check_scheduler_lock, return_value=None))
+    monkeypatch.setattr(sched, "freeze_task_run_artifacts", lambda **_kw: None)
+    monkeypatch.setattr(sched, "cleanup_run_secrets_dir", lambda *_a, **_kw: None)
+
+    png_orig = _make_png("R5-T52-T54-ORIG")
+    # Same-byte-length replacement PNG with a 1-bit flip in the tag payload
+    png_same_len_tampered = _make_png("R5-T52-T54-TAMP")
+    assert len(png_orig) == len(png_same_len_tampered)
+    assert hashlib.sha256(png_orig).hexdigest() != hashlib.sha256(png_same_len_tampered).hexdigest()
+
+    admin_conn = await psycopg.AsyncConnection.connect(dsn, autocommit=True)
+    try:
+        manifest = load_data_task_manifest()
+        slot_base = datetime(2026, 11, 10, 8, 0, tzinfo=timezone.utc)
+        async with admin_conn.transaction():
+            await sync_manifest_to_db(admin_conn, manifest)
+            async with admin_conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE dalton_data_task_defs
+                    SET enabled = TRUE, notify_enabled = TRUE
+                    WHERE job_key IN ('softbank-nav-monitor', 'tsmc-adr-premium')
+                    """
+                )
+                await cur.execute(
+                    """
+                    INSERT INTO users (user_id, email, name, created_at, updated_at)
+                    VALUES (%s, %s, %s, NOW(), NOW())
+                    ON CONFLICT (user_id) DO NOTHING
+                    """,
+                    (pm_uid, f"{pm_uid}@synth.local", pm_uid),
+                )
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_channel_identities (user_id, platform, platform_user_id)
+                    VALUES (%s, 'feishu', 'ou_r5_pm')
+                    """,
+                    (pm_uid,),
+                )
+                # Insert `running` rows for `run_t52`, `run_t54`, and `run_prep_fail` to finalize via `finalize_task_run`
+                for idx, (rid, jkey) in enumerate(
+                    [
+                        (run_t52, "softbank-nav-monitor"),
+                        (run_t54, "tsmc-adr-premium"),
+                        (run_prep_fail, "softbank-nav-monitor"),
+                    ]
+                ):
+                    s_utc = slot_base + timedelta(minutes=idx * 5)
+                    await cur.execute(
+                        """
+                        INSERT INTO dalton_data_task_runs (
+                            run_id, job_key, trigger_source, scheduled_slot_utc,
+                            deadline_utc, status, notify_status
+                        )
+                        VALUES (%s::uuid, %s, 'cron', %s, %s, 'running', 'skipped')
+                        """,
+                        (rid, jkey, s_utc, s_utc + timedelta(minutes=10)),
+                    )
+                # Insert historical image record without `size_bytes`/`sha256` and a text-only record
+                legacy_unprepared_outbox = {
+                    "text": "Legacy unprepared image report",
+                    "feishu_cards": [
+                        {
+                            "card": {"schema": "2.0", "body": {"elements": [{"tag": "img", "img_key": "ph_leg"}]}},
+                            "images": [{"placeholder": "ph_leg", "path": "images/c0.png"}],
+                        }
+                    ],
+                }
+                text_only_outbox = {
+                    "text": "Text-only report summary",
+                    "feishu_cards": [
+                        {
+                            "card": {
+                                "schema": "2.0",
+                                "body": {"elements": [{"tag": "markdown", "content": "Text only"}]},
+                            },
+                            "images": [],
+                        }
+                    ],
+                }
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_data_task_runs (
+                        run_id, job_key, trigger_source, scheduled_slot_utc,
+                        deadline_utc, status, notify_status, outbox_payload, notify_preview, completed_at
+                    )
+                    VALUES
+                    (%s::uuid, 'softbank-nav-monitor', 'cron', %s, %s, 'succeeded', 'pending_dispatch', %s, %s, NOW()),
+                    (%s::uuid, 'tsmc-adr-premium', 'cron', %s, %s, 'succeeded', 'pending_dispatch', %s, %s, NOW())
+                    """,
+                    (
+                        run_legacy_unprepared,
+                        slot_base + timedelta(minutes=30),
+                        slot_base + timedelta(minutes=40),
+                        Jsonb(legacy_unprepared_outbox),
+                        Jsonb(legacy_unprepared_outbox),
+                        run_text_only,
+                        slot_base + timedelta(minutes=45),
+                        slot_base + timedelta(minutes=55),
+                        Jsonb(text_only_outbox),
+                        Jsonb(text_only_outbox),
+                    ),
+                )
+            await upsert_user_preferences(
+                user_id=pm_uid,
+                model_preference={
+                    "dalton_notify_enabled": True,
+                    "dalton_notify_targets": ["feishu:@me"],
+                    "dalton_notify_routes": {
+                        "data:softbank-nav-monitor": ["feishu:@me"],
+                        "data:tsmc-adr-premium": ["feishu:@me"],
+                    },
+                },
+                conn=admin_conn,
+            )
+
+        # Stage artifacts on disk for `run_t52`, `run_t54`, `run_prep_fail`, and `run_legacy_unprepared`
+        for rid in (run_t52, run_t54, run_prep_fail, run_legacy_unprepared):
+            rdir = path_map.backend_run_artifacts_dir(rid)
+            (rdir / "images").mkdir(parents=True, exist_ok=True)
+            (rdir / "images" / "c0.png").write_bytes(png_orig)
+
+        # 1. Finalize `run_t52` and `run_t54` via `finalize_task_run` against real PostgreSQL
+        for idx, (rid, jkey, label) in enumerate(
+            [
+                (run_t52, "softbank-nav-monitor", "T52 Pre-Market"),
+                (run_t54, "tsmc-adr-premium", "T54 Post-Market"),
+            ]
+        ):
+            rdir = path_map.backend_run_artifacts_dir(rid)
+            raw_ob = {
+                "text": f"{label} summary",
+                "feishu_cards": [
+                    {
+                        "card": {
+                            "schema": "2.0",
+                            "header": {"title": {"tag": "plain_text", "content": label}},
+                            "body": {"elements": [{"tag": "img", "img_key": "ph_0"}]},
+                        },
+                        "images": [{"placeholder": "ph_0", "path": "images/c0.png"}],
+                    }
+                ],
+            }
+            (rdir / "outbox.json").write_text(json.dumps(raw_ob), encoding="utf-8")
+            claimed = sched.ClaimedTaskRun(
+                run_id=rid,
+                job_key=jkey,
+                trigger_source="cron",
+                scheduled_slot_utc=slot_base + timedelta(minutes=idx * 5),
+                attempt_no=1,
+                tier="T2",
+                exec_class="container_playwright",
+                command_json=["python", "-m", "task"],
+                timeout_seconds=120,
+                no_output_timeout_seconds=60,
+                notify_enabled=True,
+                is_trial=False,
+            )
+            ok_fin, _ = await sched.finalize_task_run(
+                admin_conn,
+                lock_conn=object(),
+                docker_client=None,
+                claimed=claimed,
+                container_id=None,
+                outcome=ContainerInspectionOutcome(running=False, exit_code=0, oom_killed=False, log_tail="ok"),
+                evaluation=TaskEvaluationResult(ok=True, status="succeeded"),
+                outbox_payload=raw_ob,
+                frozen_manifest={"job_key": jkey, "status": "ok"},
+                path_map=path_map,
+            )
+            assert ok_fin is True
+
+            async with admin_conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    "SELECT status, notify_status, outbox_payload FROM dalton_data_task_runs WHERE run_id = %s::uuid",
+                    (rid,),
+                )
+                row_db = await cur.fetchone()
+                assert row_db["status"] == "succeeded"
+                assert row_db["notify_status"] == "pending_dispatch"
+                img_db = row_db["outbox_payload"]["feishu_cards"][0]["images"][0]
+                assert img_db["size_bytes"] == len(png_orig)
+                assert img_db["sha256"] == hashlib.sha256(png_orig).hexdigest()
+
+        # 2. Finalize `run_prep_fail` with mismatched supplied sha256 -> commits `failed`, `skipped`, `outbox_payload=NULL`
+        bad_ob = {
+            "text": "Bad digest",
+            "feishu_cards": [
+                {
+                    "card": {"schema": "2.0", "body": {"elements": [{"tag": "img", "img_key": "ph_0"}]}},
+                    "images": [
+                        {
+                            "placeholder": "ph_0",
+                            "path": "images/c0.png",
+                            "size_bytes": len(png_orig),
+                            "sha256": "0" * 64,
+                        }
+                    ],
+                }
+            ],
+        }
+        claimed_fail = sched.ClaimedTaskRun(
+            run_id=run_prep_fail,
+            job_key="softbank-nav-monitor",
+            trigger_source="cron",
+            scheduled_slot_utc=slot_base + timedelta(minutes=10),
+            attempt_no=1,
+            tier="T2",
+            exec_class="container_playwright",
+            command_json=["python", "-m", "task"],
+            timeout_seconds=120,
+            no_output_timeout_seconds=60,
+            notify_enabled=True,
+            is_trial=False,
+        )
+        ok_fail_fin, _ = await sched.finalize_task_run(
+            admin_conn,
+            lock_conn=object(),
+            docker_client=None,
+            claimed=claimed_fail,
+            container_id=None,
+            outcome=ContainerInspectionOutcome(running=False, exit_code=0, oom_killed=False, log_tail="ok"),
+            evaluation=TaskEvaluationResult(ok=True, status="succeeded"),
+            outbox_payload=bad_ob,
+            frozen_manifest={"job_key": "softbank-nav-monitor", "status": "ok"},
+            path_map=path_map,
+        )
+        assert ok_fail_fin is True
+        async with admin_conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT status, notify_status, outbox_payload, failure_reason FROM dalton_data_task_runs WHERE run_id = %s::uuid",
+                (run_prep_fail,),
+            )
+            fail_row = await cur.fetchone()
+            assert fail_row["status"] == "failed"
+            assert fail_row["notify_status"] == "skipped"
+            assert fail_row["outbox_payload"] is None
+            assert "report_preparation_failed" in str(fail_row["failure_reason"])
+
+        # 3. Exercise internal FastAPI `/plan` and `/artifacts/{artifact_id}` endpoints against real PostgreSQL
+        app = FastAPI()
+        app.include_router(dalton_router)
+        headers = {"X-Dalton-Service-Token": SERVICE_TOKEN}
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://backend.test",
+        ) as client:
+            # (a) Valid prepared run (`run_t52`): `/plan` and `/artifacts/{artifact_id}` succeed
+            plan_res = await client.post(
+                f"/api/v1/dalton/internal/data-task-runs/{run_t52}/notification-plan",
+                headers=headers,
+                json={"user_id": pm_uid, "platform": "feishu", "target": "feishu:@me"},
+            )
+            assert plan_res.status_code == 200
+            plan_body = plan_res.json()
+            assert plan_body["ok"] is True
+            artifact_id = plan_body["plan"]["artifacts"][0]["artifact_id"]
+
+            art_res = await client.get(
+                f"/api/v1/dalton/internal/data-task-runs/{run_t52}/artifacts/{artifact_id}",
+                headers=headers,
+            )
+            assert art_res.status_code == 200
+            assert art_res.content == png_orig
+
+            # (b) Replace on-disk PNG for `run_t52` with a different valid PNG of the EXACT SAME byte length:
+            #     both a fresh `/plan` call (rebuilt from persisted DB state) and `/artifacts/{artifact_id}` reject it!
+            t52_img_path = path_map.backend_run_artifacts_dir(run_t52) / "images" / "c0.png"
+            t52_img_path.write_bytes(png_same_len_tampered)
+
+            tampered_plan_res = await client.post(
+                f"/api/v1/dalton/internal/data-task-runs/{run_t52}/notification-plan",
+                headers=headers,
+                json={"user_id": pm_uid, "platform": "feishu", "target": "feishu:@me"},
+            )
+            assert tampered_plan_res.status_code == 200
+            assert tampered_plan_res.json()["ok"] is False
+            assert tampered_plan_res.json()["code"] == "artifact_sha256_mismatch"
+
+            tampered_art_res = await client.get(
+                f"/api/v1/dalton/internal/data-task-runs/{run_t52}/artifacts/{artifact_id}",
+                headers=headers,
+            )
+            assert tampered_art_res.status_code == 422
+            assert tampered_art_res.json()["detail"]["code"] == "artifact_sha256_mismatch"
+
+            # (c) Unsuccessful preparation run (`run_prep_fail`) cannot authorize or claim a delivery (`run_not_succeeded`)
+            prep_fail_plan_res = await client.post(
+                f"/api/v1/dalton/internal/data-task-runs/{run_prep_fail}/notification-plan",
+                headers=headers,
+                json={"user_id": pm_uid, "platform": "feishu", "target": "feishu:@me"},
+            )
+            assert prep_fail_plan_res.status_code == 200
+            assert prep_fail_plan_res.json()["ok"] is False
+            assert prep_fail_plan_res.json()["code"] == "run_not_succeeded"
+
+            # (d) Historical image record without `size_bytes`/`sha256` (`run_legacy_unprepared`) is rejected
+            #     with `artifact_metadata_missing` without recomputing digests from disk
+            legacy_plan_res = await client.post(
+                f"/api/v1/dalton/internal/data-task-runs/{run_legacy_unprepared}/notification-plan",
+                headers=headers,
+                json={"user_id": pm_uid, "platform": "feishu", "target": "feishu:@me"},
+            )
+            assert legacy_plan_res.status_code == 200
+            assert legacy_plan_res.json()["ok"] is False
+            assert legacy_plan_res.json()["code"] == "artifact_metadata_missing"
+
+            # (e) Text-only run (`run_text_only`) continues to authorize and build plans normally
+            text_plan_res = await client.post(
+                f"/api/v1/dalton/internal/data-task-runs/{run_text_only}/notification-plan",
+                headers=headers,
+                json={"user_id": pm_uid, "platform": "feishu", "target": "feishu:@me"},
+            )
+            assert text_plan_res.status_code == 200
+            assert text_plan_res.json()["ok"] is True
+            assert len(text_plan_res.json()["plan"]["feishu_cards"]) == 1
+    finally:
+        async with admin_conn.cursor() as cur:
+            await cur.execute(
+                "DELETE FROM dalton_notify_deliveries WHERE execution_id = ANY(%s)",
+                (all_runs,),
+            )
+            await cur.execute(
+                "DELETE FROM dalton_channel_deliveries WHERE run_id = ANY(%s)",
+                (all_runs,),
+            )
+            await cur.execute(
+                "DELETE FROM dalton_channel_identities WHERE user_id = %s",
+                (pm_uid,),
+            )
+            await cur.execute(
+                "DELETE FROM dalton_data_task_runs WHERE run_id = ANY(%s::uuid[])",
+                (all_runs,),
+            )
+            await cur.execute(
+                "DELETE FROM dalton_data_task_defs WHERE job_key IN ('softbank-nav-monitor', 'tsmc-adr-premium')"
+            )
+            await cur.execute(
+                "DELETE FROM user_preferences WHERE user_id = %s",
+                (pm_uid,),
+            )
+            await cur.execute(
+                "DELETE FROM users WHERE user_id = %s",
+                (pm_uid,),
             )
         await admin_conn.close()

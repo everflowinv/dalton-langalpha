@@ -228,10 +228,32 @@ def test_t13_card_schema2_structure_nested_placeholders_and_chat_id_stripping(
         ]
     }
 
+    from src.dalton.data_jobs.notification_payloads import (
+        prepare_run_outbox_image_metadata,
+    )
+
+    prepared_outbox = prepare_run_outbox_image_metadata(
+        raw_outbox,
+        run_artifacts_dir=run_dir,
+        job_key="sentiment-dashboard-digest",
+    )
+    assert prepared_outbox is not None
+    assert prepared_outbox["feishu_cards"][0]["card"] == original_card
+    assert prepared_outbox["feishu_cards"][0]["images"][0]["size_bytes"] == len(img_main_bytes)
+    assert (
+        prepared_outbox["feishu_cards"][0]["images"][0]["sha256"]
+        == hashlib.sha256(img_main_bytes).hexdigest()
+    )
+    assert prepared_outbox["feishu_cards"][0]["images"][1]["size_bytes"] == len(img_nested_bytes)
+    assert (
+        prepared_outbox["feishu_cards"][0]["images"][1]["sha256"]
+        == hashlib.sha256(img_nested_bytes).hexdigest()
+    )
+
     plan = build_data_task_delivery_plan(
         run_id=run_id,
         job_key="sentiment-dashboard-digest",
-        raw_outbox=raw_outbox,
+        raw_outbox=prepared_outbox,
         run_artifacts_dir=run_dir,
     )
     assert len(plan.items) == 1
@@ -254,7 +276,7 @@ def test_t13_card_schema2_structure_nested_placeholders_and_chat_id_stripping(
     assert wire_item["images"][1]["sha256"] == hashlib.sha256(img_nested_bytes).hexdigest()
 
     # Unresolved __img__ placeholder must be rejected before any send
-    broken_outbox = copy.deepcopy(raw_outbox)
+    broken_outbox = copy.deepcopy(prepared_outbox)
     broken_outbox["feishu_cards"][0]["images"].pop()
     with pytest.raises(DataTaskArtifactError, match="Unresolved __img__ placeholder"):
         build_data_task_delivery_plan(
@@ -586,12 +608,14 @@ def test_artifact_security_containment_symlinks_urls_oversized_and_router_auth(
         _safe_read_contained_regular_file(run_dir, "images/oversized.png", max_bytes=32)
     assert over_exc.value.code == "artifact_too_large"
 
+    from src.dalton.data_jobs.notification_payloads import (
+        prepare_run_outbox_image_metadata,
+    )
+
     valid_img = _make_synthetic_png(b"VALID-IMG")
     (run_dir / "images" / "ok.png").write_bytes(valid_img)
-    ok_plan = build_data_task_delivery_plan(
-        run_id=run_id,
-        job_key="softbank-nav-monitor",
-        raw_outbox={
+    ok_outbox = prepare_run_outbox_image_metadata(
+        {
             "feishu_cards": [
                 {
                     "card": {"schema": "2.0", "body": {"elements": [{"tag": "__img__", "path": "p0"}]}},
@@ -599,6 +623,13 @@ def test_artifact_security_containment_symlinks_urls_oversized_and_router_auth(
                 }
             ]
         },
+        run_artifacts_dir=run_dir,
+        job_key="softbank-nav-monitor",
+    )
+    ok_plan = build_data_task_delivery_plan(
+        run_id=run_id,
+        job_key="softbank-nav-monitor",
+        raw_outbox=ok_outbox,
         run_artifacts_dir=run_dir,
     )
     with pytest.raises(DataTaskArtifactError) as cross_exc:
@@ -1399,8 +1430,11 @@ def test_snapshot_writer_rejects_run_root_symlinks_and_deterministic_directory_r
     # 2. Deterministic directory swap AFTER directory verification, BEFORE temp creation
     swap1_run = real_storage / ".dalton-runs" / str(uuid4())
     (swap1_run / "images").mkdir(parents=True, exist_ok=True)
+    swap1_called = False
 
     def _swap_after_verify() -> None:
+        nonlocal swap1_called
+        swap1_called = True
         moved = swap1_run / "images_moved_1"
         os.rename(swap1_run / "images", moved)
         os.symlink(outside_dir, swap1_run / "images")
@@ -1410,8 +1444,10 @@ def test_snapshot_writer_rejects_run_root_symlinks_and_deterministic_directory_r
             configured_root_symlink,
             (".dalton-runs", swap1_run.name, "images", "chart.png"),
             b"swap-before-open",
+            anchor_dir=configured_root_symlink,
             _on_dir_verified=_swap_after_verify,
         )
+    assert swap1_called is True
     assert exc_swap1.value.code in ("directory_changed", "symlink_rejected")
     assert list(outside_dir.iterdir()) == []
     assert list((swap1_run / "images_moved_1").iterdir()) == []
@@ -1419,8 +1455,11 @@ def test_snapshot_writer_rejects_run_root_symlinks_and_deterministic_directory_r
     # 3. Deterministic directory swap AFTER temp write/fsync, BEFORE atomic replace
     swap2_run = real_storage / ".dalton-runs" / str(uuid4())
     (swap2_run / "images").mkdir(parents=True, exist_ok=True)
+    swap2_called = False
 
     def _swap_before_publish() -> None:
+        nonlocal swap2_called
+        swap2_called = True
         moved = swap2_run / "images_moved_2"
         os.rename(swap2_run / "images", moved)
         os.symlink(outside_dir, swap2_run / "images")
@@ -1430,8 +1469,10 @@ def test_snapshot_writer_rejects_run_root_symlinks_and_deterministic_directory_r
             configured_root_symlink,
             (".dalton-runs", swap2_run.name, "images", "chart.png"),
             b"swap-before-replace",
+            anchor_dir=configured_root_symlink,
             _on_before_publish=_swap_before_publish,
         )
+    assert swap2_called is True
     assert exc_swap2.value.code in ("directory_changed", "symlink_rejected")
     assert list(outside_dir.iterdir()) == []
     # Temp file created inside the verified descriptor was cleaned up via `dir_fd`
@@ -1948,14 +1989,10 @@ async def test_bounded_run_metadata_and_database_precedence_across_scheduler_and
     )
     monkeypatch.setattr(
         dtn_db,
-        "load_owner_notify_preferences",
+        "evaluate_user_notify_eligibility",
         create_autospec(
-            dtn_db.load_owner_notify_preferences,
-            return_value={
-                "dalton_notify_enabled": True,
-                "dalton_notify_targets": ["feishu:@me"],
-                "dalton_notify_routes": {"data:softbank-nav-monitor": ["feishu:@me"]},
-            },
+            dtn_db.evaluate_user_notify_eligibility,
+            return_value=(True, None, ["feishu:@me"]),
         ),
     )
     app = FastAPI()
@@ -2113,3 +2150,457 @@ async def test_reconcile_uncertain_data_task_deliveries_expected_count_and_db_re
     assert reconciled_count == 0
     assert len(executed_statements) == 1
     assert "UPDATE " not in executed_statements[0]
+
+
+def test_safe_atomic_write_bytes_rejects_temp_replacement_symlink_and_regular_file_preserving_destination(
+    tmp_path: Path,
+) -> None:
+    """R5 Part A #3: Temp-file identity verification rejects symlink or regular-file replacement before publish without unlinking replacement."""
+    from src.dalton.data_jobs.safe_fs import SafeFsError, safe_atomic_write_bytes
+
+    anchor = tmp_path / "anchor"
+    anchor.mkdir(parents=True, exist_ok=True)
+    dest = anchor / "runs" / "r-temp-verify" / "outbox.json"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(b"valid previous")
+
+    outside_file = tmp_path / "outside_target.txt"
+    outside_file.write_bytes(b"outside untouched")
+
+    # 1. Replace temp file with an outside symlink before publish
+    replaced_tmp_symlink: list[Path] = []
+
+    def _replace_with_symlink(dir_fd: int, tmp_name: str) -> None:
+        os.unlink(tmp_name, dir_fd=dir_fd)
+        os.symlink(str(outside_file), tmp_name, dir_fd=dir_fd)
+        replaced_tmp_symlink.append(dest.parent / tmp_name)
+
+    with pytest.raises(SafeFsError) as exc_sym:
+        safe_atomic_write_bytes(
+            dest,
+            b"new payload 1",
+            anchor_dir=anchor,
+            _on_before_publish=_replace_with_symlink,
+        )
+    assert exc_sym.value.code == "symlink_rejected"
+    assert len(replaced_tmp_symlink) == 1
+    assert dest.is_symlink() is False
+    assert dest.read_bytes() == b"valid previous"
+    assert outside_file.read_bytes() == b"outside untouched"
+    # Cleanup must NOT unlink the attacker's replacement symlink
+    assert replaced_tmp_symlink[0].is_symlink() is True
+    replaced_tmp_symlink[0].unlink()
+
+    # 2. Replace temp file with a different regular file (different inode) before publish
+    replaced_tmp_regular: list[Path] = []
+
+    def _replace_with_other_regular_file(dir_fd: int, tmp_name: str) -> None:
+        os.unlink(tmp_name, dir_fd=dir_fd)
+        other_fd = os.open(
+            tmp_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o644,
+            dir_fd=dir_fd,
+        )
+        try:
+            os.write(other_fd, b"attacker swapped regular file")
+        finally:
+            os.close(other_fd)
+        replaced_tmp_regular.append(dest.parent / tmp_name)
+
+    with pytest.raises(SafeFsError) as exc_reg:
+        safe_atomic_write_bytes(
+            dest,
+            b"new payload 2",
+            anchor_dir=anchor,
+            _on_before_publish=_replace_with_other_regular_file,
+        )
+    assert exc_reg.value.code == "concurrent_directory_modification"
+    assert len(replaced_tmp_regular) == 1
+    assert dest.is_symlink() is False
+    assert dest.read_bytes() == b"valid previous"
+    # Cleanup must NOT unlink another writer's regular file whose inode differs from tmp_fd
+    assert replaced_tmp_regular[0].is_file() is True
+    assert replaced_tmp_regular[0].read_bytes() == b"attacker swapped regular file"
+    replaced_tmp_regular[0].unlink()
+
+    # 3. Normal write still succeeds and atomically updates destination
+    safe_atomic_write_bytes(dest, b"valid updated", anchor_dir=anchor)
+    assert dest.is_symlink() is False
+    assert dest.read_bytes() == b"valid updated"
+
+
+@pytest.mark.asyncio
+async def test_persisted_image_metadata_preparation_t52_t54_and_delivery_verification_rejects_modified_or_unprepared_images(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R5 Part B §4 items 1, 2, 3, 4, 6, 7: Image size_bytes + sha256 persisted at run finalization and strictly verified on plan/download."""
+    from contextlib import asynccontextmanager
+
+    from src.dalton.data_jobs import scheduler as sched
+    from src.dalton.data_jobs.contracts import TaskEvaluationResult
+    from src.dalton.data_jobs.docker_runner import ContainerInspectionOutcome
+    from src.dalton.data_jobs.notification_payloads import (
+        DataTaskNotificationError,
+        DataTaskNotificationPrepError,
+        build_data_task_delivery_plan,
+        prepare_run_outbox_image_metadata,
+        read_validated_run_artifact,
+    )
+    from src.dalton.data_jobs.path_map import DataTaskPathMap
+
+    data_root = tmp_path / "data"
+    path_map = DataTaskPathMap(
+        host_repo_root=tmp_path,
+        host_data_root=data_root,
+        backend_data_root=data_root,
+        container_data_root=Path("/data"),
+        container_out_dir=Path("/out"),
+    )
+    png_v1 = _make_test_png_bytes(width=18, height=18)
+    png_v2_diff_len = _make_test_png_bytes(width=32, height=24)
+    assert len(png_v1) != len(png_v2_diff_len)
+    # Construct a second valid PNG with the exact same byte length as png_v1 but different content/digest
+    ihdr_idx = png_v1.index(b"IHDR")
+    png_v1_same_len_mutated = bytearray(png_v1)
+    png_v1_same_len_mutated[-16] ^= 0x01
+    png_same_len_diff_sha = bytes(png_v1_same_len_mutated)
+    assert len(png_same_len_diff_sha) == len(png_v1)
+    assert hashlib.sha256(png_same_len_diff_sha).hexdigest() != hashlib.sha256(png_v1).hexdigest()
+    assert ihdr_idx > 0
+
+    # --- 1. Representative T52 and T54 finalization via `finalize_task_run` persists `size_bytes` and `sha256` ---
+    executed_updates: list[dict[str, Any]] = []
+
+    class _FakeCur:
+        rowcount = 1
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_a):
+            return None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            if isinstance(params, dict) and "terminal_status" in params:
+                executed_updates.append(dict(params))
+
+        async def fetchone(self):
+            return {"consecutive_failures": 0}
+
+    class _FakeConn:
+        @asynccontextmanager
+        async def transaction(self):
+            yield
+
+        def cursor(self, **_kw):
+            return _FakeCur()
+
+    monkeypatch.setattr(sched, "check_scheduler_lock", AsyncMock(return_value=None))
+    monkeypatch.setattr(sched, "freeze_task_run_artifacts", lambda **_kw: None)
+    monkeypatch.setattr(sched, "cleanup_run_secrets_dir", lambda *_a, **_kw: None)
+
+    for idx, (job_key, title) in enumerate(
+        [
+            ("T52_us_Playwright_2310", "T52 盘前报告"),
+            ("T54_us_Playwright_0705", "T54 盘后报告"),
+        ]
+    ):
+        run_id = f"00000000-0000-4000-8000-00000000050{idx}"
+        run_dir = path_map.backend_run_artifacts_dir(run_id)
+        (run_dir / "images").mkdir(parents=True, exist_ok=True)
+        img_file = run_dir / "images" / "card_0_img_0.png"
+        img_file.write_bytes(png_v1)
+
+        card_schema = {
+            "schema": "2.0",
+            "header": {"title": {"tag": "plain_text", "content": title}},
+            "body": {
+                "elements": [
+                    {"tag": "markdown", "content": f"Section for {job_key}"},
+                    {"tag": "img", "img_key": "__FEISHU_IMG_0_0__"},
+                ]
+            },
+        }
+        raw_outbox = {
+            "text": f"{title} summary",
+            "feishu_cards": [
+                {
+                    "card": copy.deepcopy(card_schema),
+                    "images": [
+                        {
+                            "placeholder": "__FEISHU_IMG_0_0__",
+                            "path": "images/card_0_img_0.png",
+                        }
+                    ],
+                }
+            ],
+        }
+        (run_dir / "outbox.json").write_text(
+            json.dumps(raw_outbox, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        claimed = sched.ClaimedTaskRun(
+            run_id=run_id,
+            job_key=job_key,
+            trigger_source="schedule",
+            scheduled_slot_utc=datetime(2026, 4, 15, 12, 0, tzinfo=timezone.utc),
+            attempt_no=1,
+            tier="T2",
+            exec_class="container_playwright",
+            command_json=["python", "-m", "task"],
+            timeout_seconds=120,
+            no_output_timeout_seconds=60,
+            notify_enabled=True,
+            is_trial=False,
+        )
+        committed, _ = await sched.finalize_task_run(
+            _FakeConn(),
+            lock_conn=object(),
+            docker_client=None,
+            claimed=claimed,
+            container_id=None,
+            outcome=ContainerInspectionOutcome(running=False, exit_code=0, oom_killed=False, log_tail="ok"),
+            evaluation=TaskEvaluationResult(ok=True, status="succeeded"),
+            outbox_payload=raw_outbox,
+            frozen_manifest={"job_key": job_key, "status": "ok"},
+            path_map=path_map,
+        )
+        assert committed is True
+        last_update = executed_updates[-1]
+        assert last_update["terminal_status"] == "succeeded"
+        assert last_update["notify_status"] == "pending_dispatch"
+        persisted_outbox = json.loads(last_update["outbox_payload"])
+        assert persisted_outbox["feishu_cards"][0]["card"] == card_schema
+        img_meta = persisted_outbox["feishu_cards"][0]["images"][0]
+        assert img_meta["size_bytes"] == len(png_v1)
+        assert img_meta["sha256"] == hashlib.sha256(png_v1).hexdigest()
+
+        # Plan and artifact download succeed with intact image bytes
+        plan = build_data_task_delivery_plan(
+            run_id=run_id,
+            job_key=job_key,
+            raw_outbox=persisted_outbox,
+            run_artifacts_dir=run_dir,
+            platform="feishu",
+        )
+        assert len(plan.feishu_cards) == 1
+        assert plan.feishu_cards[0].card == card_schema
+        art = read_validated_run_artifact(
+            run_id=run_id,
+            job_key=job_key,
+            artifact_id=plan.artifacts[0].artifact_id,
+            raw_outbox=persisted_outbox,
+            run_artifacts_dir=run_dir,
+        )
+        assert art.data == png_v1
+        assert art.sha256 == hashlib.sha256(png_v1).hexdigest()
+
+        # --- 2. Same-byte-length replacement PNG is rejected by both plan rebuild and artifact download ---
+        img_file.write_bytes(png_same_len_diff_sha)
+        with pytest.raises(DataTaskNotificationError) as exc_same_len_plan:
+            build_data_task_delivery_plan(
+                run_id=run_id,
+                job_key=job_key,
+                raw_outbox=persisted_outbox,
+                run_artifacts_dir=run_dir,
+                platform="feishu",
+            )
+        assert exc_same_len_plan.value.code == "artifact_sha256_mismatch"
+
+        with pytest.raises(DataTaskNotificationError) as exc_same_len_dl:
+            read_validated_run_artifact(
+                run_id=run_id,
+                job_key=job_key,
+                artifact_id=plan.artifacts[0].artifact_id,
+                raw_outbox=persisted_outbox,
+                run_artifacts_dir=run_dir,
+            )
+        assert exc_same_len_dl.value.code == "artifact_sha256_mismatch"
+
+        # Different-byte-length replacement PNG is rejected with `artifact_size_mismatch`
+        img_file.write_bytes(png_v2_diff_len)
+        with pytest.raises(DataTaskNotificationError) as exc_diff_len_plan:
+            build_data_task_delivery_plan(
+                run_id=run_id,
+                job_key=job_key,
+                raw_outbox=persisted_outbox,
+                run_artifacts_dir=run_dir,
+                platform="feishu",
+            )
+        assert exc_diff_len_plan.value.code == "artifact_size_mismatch"
+
+        # Restore original PNG for any subsequent checks
+        img_file.write_bytes(png_v1)
+
+    # --- 3. Missing or malformed persisted metadata is rejected on plan/download without recomputing from disk ---
+    t52_dir = path_map.backend_run_artifacts_dir("00000000-0000-4000-8000-000000000500")
+    for bad_img_entry, expected_err_code in [
+        ({"placeholder": "__FEISHU_IMG_0_0__", "path": "images/card_0_img_0.png"}, "artifact_metadata_missing"),
+        (
+            {
+                "placeholder": "__FEISHU_IMG_0_0__",
+                "path": "images/card_0_img_0.png",
+                "size_bytes": 0,
+                "sha256": hashlib.sha256(png_v1).hexdigest(),
+            },
+            "artifact_size_invalid",
+        ),
+        (
+            {
+                "placeholder": "__FEISHU_IMG_0_0__",
+                "path": "images/card_0_img_0.png",
+                "size_bytes": True,
+                "sha256": hashlib.sha256(png_v1).hexdigest(),
+            },
+            "artifact_size_invalid",
+        ),
+        (
+            {
+                "placeholder": "__FEISHU_IMG_0_0__",
+                "path": "images/card_0_img_0.png",
+                "size_bytes": len(png_v1),
+                "sha256": "not-a-valid-sha256",
+            },
+            "artifact_sha256_invalid",
+        ),
+    ]:
+        unprepared_outbox = {
+            "text": "unprepared",
+            "feishu_cards": [
+                {
+                    "card": {"schema": "2.0", "body": {"elements": [{"tag": "img", "img_key": "__FEISHU_IMG_0_0__"}]}},
+                    "images": [bad_img_entry],
+                }
+            ],
+        }
+        with pytest.raises(DataTaskNotificationError) as exc_bad_meta:
+            build_data_task_delivery_plan(
+                run_id="00000000-0000-4000-8000-000000000500",
+                job_key="T52_us_Playwright_2310",
+                raw_outbox=unprepared_outbox,
+                run_artifacts_dir=t52_dir,
+                platform="feishu",
+            )
+        assert exc_bad_meta.value.code == expected_err_code
+
+    # --- 4. Already-supplied mismatched or malformed metadata is rejected during preparation and fails the run ---
+    for supplied_bad_entry, expected_prep_code in [
+        (
+            {
+                "placeholder": "__FEISHU_IMG_0_0__",
+                "path": "images/card_0_img_0.png",
+                "size_bytes": len(png_v1) + 5,
+                "sha256": hashlib.sha256(png_v1).hexdigest(),
+            },
+            "artifact_size_mismatch",
+        ),
+        (
+            {
+                "placeholder": "__FEISHU_IMG_0_0__",
+                "path": "images/card_0_img_0.png",
+                "size_bytes": len(png_v1),
+                "sha256": "0" * 64,
+            },
+            "artifact_sha256_mismatch",
+        ),
+        (
+            {
+                "placeholder": "__FEISHU_IMG_0_0__",
+                "path": "images/card_0_img_0.png",
+                "size_bytes": -10,
+            },
+            "artifact_size_invalid",
+        ),
+        (
+            {
+                "placeholder": "__FEISHU_IMG_0_0__",
+                "path": "images/card_0_img_0.png",
+                "sha256": "bad-digest",
+            },
+            "artifact_sha256_invalid",
+        ),
+    ]:
+        bad_supplied_outbox = {
+            "text": "supplied mismatch",
+            "feishu_cards": [
+                {
+                    "card": {"schema": "2.0", "body": {"elements": [{"tag": "img", "img_key": "__FEISHU_IMG_0_0__"}]}},
+                    "images": [supplied_bad_entry],
+                }
+            ],
+        }
+        with pytest.raises(DataTaskNotificationPrepError) as exc_prep:
+            prepare_run_outbox_image_metadata(
+                bad_supplied_outbox,
+                run_artifacts_dir=t52_dir,
+                job_key="T52_us_Playwright_2310",
+            )
+        assert exc_prep.value.code == expected_prep_code
+
+    # Verify `finalize_task_run` marks run `failed` with `outbox_payload=None` and `notify_status='skipped'` on prep error
+    bad_run_id = "00000000-0000-4000-8000-000000000599"
+    bad_run_dir = path_map.backend_run_artifacts_dir(bad_run_id)
+    (bad_run_dir / "images").mkdir(parents=True, exist_ok=True)
+    (bad_run_dir / "images" / "card_0_img_0.png").write_bytes(png_v1)
+    mismatched_outbox = {
+        "text": "mismatched digest",
+        "feishu_cards": [
+            {
+                "card": {"schema": "2.0", "body": {"elements": [{"tag": "img", "img_key": "__FEISHU_IMG_0_0__"}]}},
+                "images": [
+                    {
+                        "placeholder": "__FEISHU_IMG_0_0__",
+                        "path": "images/card_0_img_0.png",
+                        "size_bytes": len(png_v1),
+                        "sha256": "f" * 64,
+                    }
+                ],
+            }
+        ],
+    }
+    claimed_bad = sched.ClaimedTaskRun(
+        run_id=bad_run_id,
+        job_key="T52_us_Playwright_2310",
+        trigger_source="schedule",
+        scheduled_slot_utc=datetime(2026, 4, 15, 13, 0, tzinfo=timezone.utc),
+        attempt_no=1,
+        tier="T2",
+        exec_class="container_playwright",
+        command_json=["python", "-m", "task"],
+        timeout_seconds=120,
+        no_output_timeout_seconds=60,
+        notify_enabled=True,
+        is_trial=False,
+    )
+    committed_bad, _ = await sched.finalize_task_run(
+        _FakeConn(),
+        lock_conn=object(),
+        docker_client=None,
+        claimed=claimed_bad,
+        container_id=None,
+        outcome=ContainerInspectionOutcome(running=False, exit_code=0, oom_killed=False, log_tail="ok"),
+        evaluation=TaskEvaluationResult(ok=True, status="succeeded"),
+        outbox_payload=mismatched_outbox,
+        frozen_manifest={"job_key": "T52_us_Playwright_2310", "status": "ok"},
+        path_map=path_map,
+    )
+    assert committed_bad is True
+    failed_update = executed_updates[-1]
+    assert failed_update["terminal_status"] == "failed"
+    assert failed_update["notify_status"] == "skipped"
+    assert failed_update["outbox_payload"] is None
+    assert "report_preparation_failed" in str(failed_update["failure_reason"])
+
+    # --- 5. Text-only records without images continue to build plans without image metadata ---
+    text_only_plan = build_data_task_delivery_plan(
+        run_id="00000000-0000-4000-8000-000000000500",
+        job_key="T27_us_sec_13f_holdings_diff",
+        raw_outbox={"text": "13F text-only summary", "items": [{"index": 0, "text": "item 0"}]},
+        run_artifacts_dir=t52_dir,
+        platform="discord",
+    )
+    assert len(text_only_plan.items) == 1
+    assert len(text_only_plan.artifacts) == 0

@@ -1178,21 +1178,48 @@ async def claim_target_delivery(
                 ON CONFLICT (execution_id, channel, target) DO UPDATE
                 SET status = 'pending',
                     attempt_count = dalton_notify_deliveries.attempt_count + 1,
-                    payload_json = CASE
-                        WHEN dalton_notify_deliveries.payload_json ? 'cards_sent'
-                             AND NOT (EXCLUDED.payload_json ? 'cards_sent')
-                        THEN EXCLUDED.payload_json || jsonb_build_object(
-                            'cards_sent',
-                            dalton_notify_deliveries.payload_json -> 'cards_sent'
-                        )
-                        ELSE EXCLUDED.payload_json
-                    END,
+                    payload_json = (
+                        CASE
+                            WHEN dalton_notify_deliveries.payload_json ? 'cards_sent'
+                                 AND NOT (EXCLUDED.payload_json ? 'cards_sent')
+                            THEN EXCLUDED.payload_json || jsonb_build_object(
+                                'cards_sent',
+                                dalton_notify_deliveries.payload_json -> 'cards_sent'
+                            )
+                            ELSE EXCLUDED.payload_json
+                        END
+                    ) || (
+                        CASE
+                            WHEN dalton_notify_deliveries.payload_json ? 'reconcile_recipient_id'
+                            THEN jsonb_strip_nulls(
+                                jsonb_build_object(
+                                    'reconcile_platform',
+                                    dalton_notify_deliveries.payload_json -> 'reconcile_platform',
+                                    'reconcile_recipient_id',
+                                    dalton_notify_deliveries.payload_json -> 'reconcile_recipient_id',
+                                    'reconcile_canonical_target',
+                                    dalton_notify_deliveries.payload_json -> 'reconcile_canonical_target',
+                                    'expected_item_count',
+                                    dalton_notify_deliveries.payload_json -> 'expected_item_count',
+                                    'reconcile_delivery_keys',
+                                    dalton_notify_deliveries.payload_json -> 'reconcile_delivery_keys'
+                                )
+                            )
+                            ELSE '{}'::jsonb
+                        END
+                    ),
                     updated_at = NOW()
                 WHERE (
                     dalton_notify_deliveries.status = 'failed'
                     OR (
                         dalton_notify_deliveries.status = 'pending'
-                        AND COALESCE(dalton_notify_deliveries.error_code, '') <> ALL(%s)
+                        AND (
+                            NOT (
+                                COALESCE(dalton_notify_deliveries.automation_id, '') LIKE 'data:%%'
+                                OR COALESCE(dalton_notify_deliveries.payload_json ->> 'route_key', '') LIKE 'data:%%'
+                            )
+                            OR COALESCE(dalton_notify_deliveries.error_code, '') <> ALL(%s)
+                        )
                         AND dalton_notify_deliveries.updated_at
                             <= NOW() - make_interval(mins => %s)
                     )
@@ -1944,7 +1971,13 @@ async def retry_failed_notify_deliveries(
                         (d.status = 'failed' AND d.attempt_count < %s)
                         OR (
                             d.status = 'pending'
-                            AND COALESCE(d.error_code, '') <> ALL(%s)
+                            AND (
+                                NOT (
+                                    COALESCE(d.automation_id, '') LIKE 'data:%%'
+                                    OR COALESCE(d.payload_json ->> 'route_key', '') LIKE 'data:%%'
+                                )
+                                OR COALESCE(d.error_code, '') <> ALL(%s)
+                            )
                             AND d.updated_at <= NOW() - make_interval(mins => %s)
                         )
                     )
@@ -1983,11 +2016,24 @@ async def retry_failed_notify_deliveries(
             if not (exec_id and ch and tgt):
                 continue
 
+            automation_info = _reconstruct_automation_from_delivery_row(
+                row, payload
+            )
+            raw_auto_id = str(row.get("automation_id") or "").strip()
+            raw_route_key = (
+                str(automation_info.get("route_key") or "").strip()
+                if isinstance(automation_info, Mapping)
+                else ""
+            )
+            is_data_task_row = raw_auto_id.lower().startswith(
+                "data:"
+            ) or raw_route_key.lower().startswith("data:")
+
             row_claimed = False
             try:
+                if is_data_task_row and is_uncertain_notify_error_code(row_error_code):
+                    continue
                 if attempt_count >= max_attempts:
-                    if is_uncertain_notify_error_code(row_error_code):
-                        continue
                     async with get_db_connection() as conn:
                         async with conn.cursor(row_factory=dict_row) as cur:
                             await cur.execute(
@@ -2000,7 +2046,13 @@ async def retry_failed_notify_deliveries(
                                   AND channel = %s
                                   AND target = %s
                                   AND status = 'pending'
-                                  AND COALESCE(error_code, '') <> ALL(%s)
+                                  AND (
+                                      NOT (
+                                          COALESCE(automation_id, '') LIKE 'data:%%'
+                                          OR COALESCE(payload_json ->> 'route_key', '') LIKE 'data:%%'
+                                      )
+                                      OR COALESCE(error_code, '') <> ALL(%s)
+                                  )
                                   AND attempt_count >= %s
                                   AND updated_at <= NOW() - make_interval(mins => %s)
                                 """,
@@ -2034,19 +2086,7 @@ async def retry_failed_notify_deliveries(
                         )
                     continue
 
-                automation_info = _reconstruct_automation_from_delivery_row(
-                    row, payload
-                )
                 # DALTON-HOOK(data-jobs): skip retry when data task is disabled in dalton_data_task_defs
-                raw_auto_id = str(row.get("automation_id") or "").strip()
-                raw_route_key = (
-                    str(automation_info.get("route_key") or "").strip()
-                    if isinstance(automation_info, Mapping)
-                    else ""
-                )
-                is_data_task_row = raw_auto_id.lower().startswith(
-                    "data:"
-                ) or raw_route_key.lower().startswith("data:")
                 if is_data_task_row:
                     dt_enabled = row.get("data_task_enabled")
                     dt_notify_enabled = row.get("data_task_notify_enabled")
@@ -2129,7 +2169,13 @@ async def retry_failed_notify_deliveries(
                                   status = 'failed'
                                   OR (
                                       status = 'pending'
-                                      AND COALESCE(error_code, '') <> ALL(%s)
+                                      AND (
+                                          NOT (
+                                              COALESCE(automation_id, '') LIKE 'data:%%'
+                                              OR COALESCE(payload_json ->> 'route_key', '') LIKE 'data:%%'
+                                          )
+                                          OR COALESCE(error_code, '') <> ALL(%s)
+                                      )
                                       AND updated_at <= NOW() - make_interval(mins => %s)
                                   )
                               )
