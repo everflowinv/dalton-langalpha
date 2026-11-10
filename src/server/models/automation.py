@@ -16,6 +16,7 @@ from croniter import croniter
 from market_protocol import display_spelling
 from pydantic import (
     BaseModel,
+    ConfigDict,
     Field,
     ValidationError,
     ValidationInfo,
@@ -646,6 +647,68 @@ class AutomationVersionRequest(BaseModel):
     """Optional request body for pause and resume endpoints carrying ``expected_config_version``."""
 
     expected_config_version: Any = None
+
+
+def _strict_positive_config_version(value: Any) -> int:
+    """Script writes require a real positive integer. Bool, float, and text are refused."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError("expected_config_version must be a positive integer")
+    return value
+
+
+# DALTON-HOOK(company-automations): script schedule body; agent models stay unchanged
+class CompanyScriptUpdate(BaseModel):
+    """Schedule change for one ``data:<job_key>``. Unknown fields are refused."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    cron_expression: Optional[str] = None
+    timezone: Optional[str] = None
+    expected_config_version: Any
+
+    @field_validator("expected_config_version", mode="before")
+    @classmethod
+    def _version(cls, value: Any) -> int:
+        return _strict_positive_config_version(value)
+
+    @field_validator("cron_expression", mode="before")
+    @classmethod
+    def _cron(cls, value: Any) -> str:
+        if not isinstance(value, str):
+            raise ValueError("cron_expression must be a 5-field cron expression")
+        # Lazy import: system_jobs loads the automation models through lifecycle.
+        from src.dalton.autonomy.system_jobs import _validate_data_task_cron_expr
+
+        return _validate_data_task_cron_expr(value)
+
+    @field_validator("timezone", mode="before")
+    @classmethod
+    def _zone(cls, value: Any) -> str:
+        if not isinstance(value, str):
+            raise ValueError("timezone must be an IANA timezone name")
+        from src.dalton.autonomy.system_jobs import _validate_data_task_timezone
+
+        return _validate_data_task_timezone(value)
+
+    @model_validator(mode="after")
+    def _one_schedule_field(self) -> "CompanyScriptUpdate":
+        if self.cron_expression is None and self.timezone is None:
+            raise ValueError("at least one of cron_expression or timezone is required")
+        return self
+
+
+# DALTON-HOOK(company-automations): required script pause/resume version; agent body stays optional
+class CompanyScriptVersionRequest(BaseModel):
+    """Required ``expected_config_version`` for pausing or resuming a script."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_config_version: Any
+
+    @field_validator("expected_config_version", mode="before")
+    @classmethod
+    def _version(cls, value: Any) -> int:
+        return _strict_positive_config_version(value)
 
 
 # =============================================================================
