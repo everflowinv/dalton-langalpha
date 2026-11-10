@@ -4614,8 +4614,9 @@ class TestChatLargeUploadRealInfra:
 
         # Tampering with staging path between digest read and publication is rejected inside Docker
         tampered_stage = f"{abs_a}.wsfiles-stage-tamper"
+        prep_script = f"import pathlib; pathlib.Path({tampered_stage!r}).write_bytes(b'good')"
         prep_tamper = await docker_ptc_sandbox.execute_bash_command(
-            f"python3 -c 'import pathlib; pathlib.Path({shlex.quote(tampered_stage)}).write_bytes(b\"good\")'"
+            f"python3 -c {shlex.quote(prep_script)}"
         )
         assert prep_tamper.get("success") is True
         good_sha = hashlib.sha256(b"good").hexdigest()
@@ -4647,15 +4648,18 @@ class TestChatLargeUploadRealInfra:
         ready_flag = f"{ws_root_dir}/.flock-ready"
         release_flag = f"{ws_root_dir}/.flock-release"
 
+        holder_script = (
+            "import fcntl, os, pathlib, time\n"
+            f"fd = os.open({active_locked_tmp!r}, os.O_CREAT | os.O_WRONLY, 0o600)\n"
+            "fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            f"pathlib.Path({stale_unlocked_tmp!r}).write_bytes(b'stale')\n"
+            f"pathlib.Path({ready_flag!r}).write_text('1')\n"
+            f"while not os.path.exists({release_flag!r}): time.sleep(0.05)\n"
+            "os.close(fd)\n"
+        )
         holder_task = asyncio.create_task(
             docker_ptc_sandbox.execute_bash_command(
-                "python3 -c 'import fcntl, os, pathlib, time\n"
-                f"fd = os.open({active_locked_tmp!r}, os.O_CREAT | os.O_WRONLY, 0o600)\n"
-                "fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
-                f"pathlib.Path({stale_unlocked_tmp!r}).write_bytes(b\"stale\")\n"
-                f"pathlib.Path({ready_flag!r}).write_text(\"1\")\n"
-                f"while not os.path.exists({release_flag!r}): time.sleep(0.05)\n"
-                "os.close(fd)\n'",
+                f"python3 -c {shlex.quote(holder_script)}",
                 timeout=30,
             )
         )
@@ -4712,7 +4716,7 @@ class TestChatLargeUploadRealInfra:
             assert res_inc_b[rel_b]["status"] == "ok"
 
             both_still_there = await docker_ptc_sandbox.execute_bash_command(
-                f"python3 -c 'import json, os; print(json.dumps([os.path.exists({active_locked_tmp!r}), os.path.exists({stale_unlocked_tmp!r})]))'"
+                "python3 -c " + shlex.quote(f"import json, os; print(json.dumps([os.path.exists({active_locked_tmp!r}), os.path.exists({stale_unlocked_tmp!r})]))")
             )
             assert json.loads((both_still_there.get("stdout") or "").strip().splitlines()[-1]) == [
                 True,
@@ -4742,7 +4746,7 @@ class TestChatLargeUploadRealInfra:
             assert res_sweep[rel_a]["status"] == "ok"
 
             after_sweep = await docker_ptc_sandbox.execute_bash_command(
-                f"python3 -c 'import json, os; print(json.dumps([os.path.exists({active_locked_tmp!r}), os.path.exists({stale_unlocked_tmp!r})]))'"
+                "python3 -c " + shlex.quote(f"import json, os; print(json.dumps([os.path.exists({active_locked_tmp!r}), os.path.exists({stale_unlocked_tmp!r})]))")
             )
             assert json.loads((after_sweep.get("stdout") or "").strip().splitlines()[-1]) == [
                 True,
@@ -4796,7 +4800,7 @@ class TestChatLargeUploadRealInfra:
         )
         assert mid_delete_restore["errors"] == 0
         exists_a_mid = await docker_ptc_sandbox.execute_bash_command(
-            f"python3 -c 'import json, os; print(json.dumps(os.path.exists({abs_a!r})))'"
+            "python3 -c " + shlex.quote(f"import json, os; print(json.dumps(os.path.exists({abs_a!r})))")
         )
         assert json.loads((exists_a_mid.get("stdout") or "").strip().splitlines()[-1]) is False
 
@@ -4863,7 +4867,7 @@ class TestChatLargeUploadRealInfra:
             assert restore_res == {"restored": 0, "errors": 0}
 
         exists_b_after = await docker_ptc_sandbox.execute_bash_command(
-            f"python3 -c 'import json, os; print(json.dumps(os.path.exists({abs_b!r})))'"
+            "python3 -c " + shlex.quote(f"import json, os; print(json.dumps(os.path.exists({abs_b!r})))")
         )
         assert json.loads((exists_b_after.get("stdout") or "").strip().splitlines()[-1]) is False
         row_b_retired = await chat_uploads_db.get_upload(up_b["upload_id"])
@@ -4927,7 +4931,7 @@ class TestChatLargeUploadRealInfra:
         assert lock_c == lock_c2
 
         ino_res = await docker_ptc_sandbox.execute_bash_command(
-            f"python3 -c 'import json, os; print(json.dumps(os.stat({lock_c!r}).st_ino))'"
+            "python3 -c " + shlex.quote(f"import json, os; print(json.dumps(os.stat({lock_c!r}).st_ino))")
         )
         initial_c_ino = int(json.loads((ino_res.get("stdout") or "").strip().splitlines()[-1]))
 
@@ -4974,7 +4978,7 @@ class TestChatLargeUploadRealInfra:
         # Attempt 2 cleanup runs while Attempt 1 has opened lock_c before flock: lock inode stays stable!
         await cu_svc._cleanup_restore_grant(docker_ptc_sandbox, grant_c2, lock_c)
         ino_after_clean = await docker_ptc_sandbox.execute_bash_command(
-            f"python3 -c 'import json, os; print(json.dumps([os.path.exists({grant_c2!r}), os.stat({lock_c!r}).st_ino]))'"
+            "python3 -c " + shlex.quote(f"import json, os; print(json.dumps([os.path.exists({grant_c2!r}), os.stat({lock_c!r}).st_ino]))")
         )
         assert json.loads((ino_after_clean.get("stdout") or "").strip().splitlines()[-1]) == [
             False,
@@ -5052,7 +5056,7 @@ class TestChatLargeUploadRealInfra:
 
         # Target C is absent after all attempts and delete complete, while Target D remains intact
         c_exists = await docker_ptc_sandbox.execute_bash_command(
-            f"python3 -c 'import json, os; print(json.dumps([os.path.exists({abs_c!r}), os.path.exists({abs_d!r}), os.stat({lock_c!r}).st_ino]))'"
+            "python3 -c " + shlex.quote(f"import json, os; print(json.dumps([os.path.exists({abs_c!r}), os.path.exists({abs_d!r}), os.stat({lock_c!r}).st_ino]))")
         )
         assert json.loads((c_exists.get("stdout") or "").strip().splitlines()[-1]) == [
             False,

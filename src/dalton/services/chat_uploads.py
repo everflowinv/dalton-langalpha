@@ -3025,6 +3025,14 @@ async def rematerialize_workspace_chat_uploads(
                     continue
             restored += 1
         except Exception as exc:
+            try:
+                retained = await db.is_upload_retained_for_recovery(
+                    str(row["upload_id"]), normalized_ws, conn=conn
+                )
+            except Exception:
+                retained = True
+            if not retained:
+                continue
             errors += 1
             logger.warning(
                 "Failed to rematerialize chat upload %s (%s) in workspace %s: %s",
