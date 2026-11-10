@@ -18,6 +18,10 @@ from src.dalton.autonomy.schedule import (
     user_automations_lock,
 )
 from src.dalton.coverage import get_user_tier, set_user_coverage_tier
+from src.dalton.services.company_automations import (
+    automation_history_context,
+    get_current_history_context,
+)
 from src.server.database import automation as auto_db
 from src.server.database import workspace as ws_db
 from src.server.database.pool import get_db_connection
@@ -677,6 +681,8 @@ async def _pause_stale_sector_rows(
     unit_id: str,
     current_workspace_id: str,
     *,
+    rows: list[dict[str, Any]] | None = None,
+    actor_user_id: str | None = None,
     conn: Any = None,
 ) -> list[str]:
     """Pause this unit's rows that sit on a workspace it is no longer bound to.
@@ -688,27 +694,48 @@ async def _pause_stale_sector_rows(
     """
     uid = str(user_id or "").strip()
     ws_str = str(current_workspace_id or "").strip()
-    rows = await _load_sector_automations(uid, unit_id, conn=conn)
+    effective_rows = (
+        list(rows)
+        if rows is not None
+        else await _load_sector_automations(uid, unit_id, conn=conn)
+    )
     paused: list[str] = []
     conn_kw = {"conn": conn} if conn is not None else {}
-    for r in rows:
-        row_ws = str(r.get("workspace_id") or "").strip()
-        if not row_ws or row_ws == ws_str:
-            continue
-        auto_id = r.get("automation_id")
-        if not auto_id:
-            continue
-        new_meta = dict(r.get("metadata") or {})
-        new_meta["stale_unit_binding"] = True
-        await auto_db.update_automation(
-            str(auto_id),
-            uid,
-            status="paused",
-            next_run_at=None,
-            metadata=new_meta,
-            **conn_kw,
+    outer_ctx = get_current_history_context()
+    resolved_actor = (
+        str(actor_user_id).strip()
+        if actor_user_id is not None and str(actor_user_id).strip()
+        else (
+            str(outer_ctx.actor_user_id).strip()
+            if outer_ctx is not None
+            and outer_ctx.has_explicit_actor
+            and outer_ctx.actor_user_id
+            else None
         )
-        paused.append(str(r.get("name") or auto_id))
+    )
+    with automation_history_context(
+        actor_user_id=resolved_actor,
+        action="maintenance_pause_stale_binding",
+        skip_if_unchanged=True,
+    ):
+        for r in effective_rows:
+            row_ws = str(r.get("workspace_id") or "").strip()
+            if not row_ws or row_ws == ws_str:
+                continue
+            auto_id = r.get("automation_id")
+            if not auto_id:
+                continue
+            new_meta = dict(r.get("metadata") or {})
+            new_meta["stale_unit_binding"] = True
+            await auto_db.update_automation(
+                str(auto_id),
+                uid,
+                status="paused",
+                next_run_at=None,
+                metadata=new_meta,
+                **conn_kw,
+            )
+            paused.append(str(r.get("name") or auto_id))
     return paused
 
 
@@ -836,22 +863,47 @@ async def _enable_sector_tracking(
         workspace_id=ws_id,
         timezone_name=sector["tz"],
     )
+    outer_ctx = get_current_history_context()
+    effective_actor = (
+        str(outer_ctx.actor_user_id).strip()
+        if outer_ctx is not None
+        and outer_ctx.has_explicit_actor
+        and outer_ctx.actor_user_id
+        else uid
+    )
+    by_name_current: dict[str, dict[str, Any]] = {}
+    for r in sector_rows:
+        if isinstance(r, dict) and r.get("name"):
+            row_ws = str(r.get("workspace_id") or "").strip()
+            if not row_ws or row_ws == ws_id:
+                by_name_current[str(r["name"]).strip()] = r
+
     for spec in specs:
         spec_copy = dict(spec)
         spec_meta = dict(spec_copy.get("metadata") or {})
         spec_meta["paused_by_user"] = None
         spec_copy["metadata"] = spec_meta
         spec_copy["status"] = "active"
-        await schedule_dalton_automation_helper(
-            str(spec_copy["name"]),
-            spec_copy,
-            user_id=uid,
-            workspace_id=ws_id,
-            ticker=None,
-            role="chief_of_staff",
-            action="upsert",
-            conn=conn,
+        s_name = str(spec_copy["name"])
+        existing_s = by_name_current.get(s_name)
+        was_paused = bool(
+            existing_s and str(existing_s.get("status") or "").strip().lower() == "paused"
         )
+        with automation_history_context(
+            actor_user_id=effective_actor,
+            action="resume" if was_paused else "update",
+            skip_if_unchanged=True,
+        ):
+            await schedule_dalton_automation_helper(
+                s_name,
+                spec_copy,
+                user_id=uid,
+                workspace_id=ws_id,
+                ticker=None,
+                role="chief_of_staff",
+                action="upsert",
+                conn=conn,
+            )
 
     updated_rows = await _load_sector_automations(uid, unit_id, conn=conn)
     result = _derive_sector_status_and_details(
@@ -900,24 +952,37 @@ async def _disable_sector_tracking(
 
     paused_names: list[str] = []
     conn_kw = {"conn": conn} if conn is not None else {}
-    for r in sector_rows:
-        auto_id = r.get("automation_id")
-        if not auto_id:
-            continue
-        row_ws = str(r.get("workspace_id") or "").strip()
-        new_meta = dict(r.get("metadata") or {})
-        new_meta["paused_by_user"] = True
-        if row_ws and row_ws != ws_id:
-            new_meta["stale_unit_binding"] = True
-        await auto_db.update_automation(
-            str(auto_id),
-            uid,
-            status="paused",
-            next_run_at=None,
-            metadata=new_meta,
-            **conn_kw,
-        )
-        paused_names.append(str(r.get("name") or auto_id))
+    outer_ctx = get_current_history_context()
+    effective_actor = (
+        str(outer_ctx.actor_user_id).strip()
+        if outer_ctx is not None
+        and outer_ctx.has_explicit_actor
+        and outer_ctx.actor_user_id
+        else uid
+    )
+    with automation_history_context(
+        actor_user_id=effective_actor,
+        action="pause",
+        skip_if_unchanged=True,
+    ):
+        for r in sector_rows:
+            auto_id = r.get("automation_id")
+            if not auto_id:
+                continue
+            row_ws = str(r.get("workspace_id") or "").strip()
+            new_meta = dict(r.get("metadata") or {})
+            new_meta["paused_by_user"] = True
+            if row_ws and row_ws != ws_id:
+                new_meta["stale_unit_binding"] = True
+            await auto_db.update_automation(
+                str(auto_id),
+                uid,
+                status="paused",
+                next_run_at=None,
+                metadata=new_meta,
+                **conn_kw,
+            )
+            paused_names.append(str(r.get("name") or auto_id))
 
     specs = build_sector_watch_specs(
         unit_id=unit_id,
@@ -926,26 +991,31 @@ async def _disable_sector_tracking(
         workspace_id=ws_id,
         timezone_name=sector["tz"],
     )
-    for spec in specs:
-        s_name = str(spec["name"])
-        if s_name in by_name_current:
-            continue
-        spec_copy = dict(spec)
-        spec_meta = dict(spec_copy.get("metadata") or {})
-        spec_meta["paused_by_user"] = True
-        spec_copy["metadata"] = spec_meta
-        spec_copy["status"] = "paused"
-        await schedule_dalton_automation_helper(
-            s_name,
-            spec_copy,
-            user_id=uid,
-            workspace_id=ws_id,
-            ticker=None,
-            role="chief_of_staff",
-            action="upsert",
-            conn=conn,
-        )
-        paused_names.append(s_name)
+    with automation_history_context(
+        actor_user_id=effective_actor,
+        action="create",
+        skip_if_unchanged=True,
+    ):
+        for spec in specs:
+            s_name = str(spec["name"])
+            if s_name in by_name_current:
+                continue
+            spec_copy = dict(spec)
+            spec_meta = dict(spec_copy.get("metadata") or {})
+            spec_meta["paused_by_user"] = True
+            spec_copy["metadata"] = spec_meta
+            spec_copy["status"] = "paused"
+            await schedule_dalton_automation_helper(
+                s_name,
+                spec_copy,
+                user_id=uid,
+                workspace_id=ws_id,
+                ticker=None,
+                role="chief_of_staff",
+                action="upsert",
+                conn=conn,
+            )
+            paused_names.append(s_name)
 
     updated_rows = await _load_sector_automations(uid, unit_id, conn=conn)
     status_payload = _derive_sector_status_and_details(
@@ -1017,6 +1087,19 @@ async def enable_tracking(
         )
         delta_cron, delta_tz = resolve_delta_schedule(resolved_tier)
         expected_names = {str(s["name"]) for s in specs}
+        outer_ctx = get_current_history_context()
+        effective_actor = (
+            str(outer_ctx.actor_user_id).strip()
+            if outer_ctx is not None
+            and outer_ctx.has_explicit_actor
+            and outer_ctx.actor_user_id
+            else uid
+        )
+        by_name_company = {
+            str(r.get("name") or "").strip(): r
+            for r in company_rows
+            if isinstance(r, dict) and r.get("name")
+        }
 
         for spec in specs:
             spec_copy = dict(spec)
@@ -1028,33 +1111,48 @@ async def enable_tracking(
                 spec_copy["timezone"] = delta_tz
             spec_copy["metadata"] = spec_meta
             spec_copy["status"] = "active"
-            await schedule_dalton_automation_helper(
-                str(spec_copy["name"]),
-                spec_copy,
-                user_id=uid,
-                workspace_id=ws_id,
-                ticker=ticker,
-                role="chief_of_staff",
-                action="upsert",
-                conn=conn,
+            s_name = str(spec_copy["name"])
+            existing_c = by_name_company.get(s_name)
+            was_paused = bool(
+                existing_c and str(existing_c.get("status") or "").strip().lower() == "paused"
             )
+            with automation_history_context(
+                actor_user_id=effective_actor,
+                action="resume" if was_paused else "update",
+                skip_if_unchanged=True,
+            ):
+                await schedule_dalton_automation_helper(
+                    s_name,
+                    spec_copy,
+                    user_id=uid,
+                    workspace_id=ws_id,
+                    ticker=ticker,
+                    role="chief_of_staff",
+                    action="upsert",
+                    conn=conn,
+                )
 
         # Also resume any paused one-shot earnings tasks (`dalton-<t>-earn-*`) when re-enabling
         conn_kw = {"conn": conn} if conn is not None else {}
-        for r in company_rows:
-            r_name = str(r.get("name") or "").strip()
-            if r_name in expected_names:
-                continue
-            if str(r.get("status") or "").lower() == "paused" and r.get("automation_id"):
-                cleaned_meta = dict(r.get("metadata") or {})
-                cleaned_meta.pop("paused_by_user", None)
-                await auto_db.update_automation(
-                    str(r["automation_id"]),
-                    uid,
-                    status="active",
-                    metadata=cleaned_meta,
-                    **conn_kw,
-                )
+        with automation_history_context(
+            actor_user_id=effective_actor,
+            action="resume",
+            skip_if_unchanged=True,
+        ):
+            for r in company_rows:
+                r_name = str(r.get("name") or "").strip()
+                if r_name in expected_names:
+                    continue
+                if str(r.get("status") or "").lower() == "paused" and r.get("automation_id"):
+                    cleaned_meta = dict(r.get("metadata") or {})
+                    cleaned_meta.pop("paused_by_user", None)
+                    await auto_db.update_automation(
+                        str(r["automation_id"]),
+                        uid,
+                        status="active",
+                        metadata=cleaned_meta,
+                        **conn_kw,
+                    )
 
         _, updated_rows = await _load_company_automations(
             uid, ws_id, ticker=ticker, conn=conn
@@ -1102,46 +1200,64 @@ async def disable_tracking(user_id: str, workspace_id: str) -> dict[str, Any]:
 
         paused_names: list[str] = []
         conn_kw = {"conn": conn} if conn is not None else {}
-        for r in company_rows:
-            auto_id = r.get("automation_id")
-            if not auto_id:
-                continue
-            new_meta = dict(r.get("metadata") or {})
-            new_meta["paused_by_user"] = True
-            await auto_db.update_automation(
-                str(auto_id),
-                uid,
-                status="paused",
-                metadata=new_meta,
-                **conn_kw,
-            )
-            paused_names.append(str(r.get("name") or auto_id))
+        outer_ctx = get_current_history_context()
+        effective_actor = (
+            str(outer_ctx.actor_user_id).strip()
+            if outer_ctx is not None
+            and outer_ctx.has_explicit_actor
+            and outer_ctx.actor_user_id
+            else uid
+        )
+        with automation_history_context(
+            actor_user_id=effective_actor,
+            action="pause",
+            skip_if_unchanged=True,
+        ):
+            for r in company_rows:
+                auto_id = r.get("automation_id")
+                if not auto_id:
+                    continue
+                new_meta = dict(r.get("metadata") or {})
+                new_meta["paused_by_user"] = True
+                await auto_db.update_automation(
+                    str(auto_id),
+                    uid,
+                    status="paused",
+                    metadata=new_meta,
+                    **conn_kw,
+                )
+                paused_names.append(str(r.get("name") or auto_id))
 
         delta_cron, delta_tz = resolve_delta_schedule(resolved_tier)
-        for spec in specs:
-            s_name = str(spec["name"])
-            if s_name in by_name:
-                continue
-            spec_copy = dict(spec)
-            spec_meta = dict(spec_copy.get("metadata") or {})
-            spec_meta["paused_by_user"] = True
-            spec_meta["tier"] = resolved_tier
-            if s_name.endswith("-delta"):
-                spec_copy["cron_expression"] = delta_cron
-                spec_copy["timezone"] = delta_tz
-            spec_copy["metadata"] = spec_meta
-            spec_copy["status"] = "paused"
-            await schedule_dalton_automation_helper(
-                s_name,
-                spec_copy,
-                user_id=uid,
-                workspace_id=ws_id,
-                ticker=ticker,
-                role="chief_of_staff",
-                action="upsert",
-                conn=conn,
-            )
-            paused_names.append(s_name)
+        with automation_history_context(
+            actor_user_id=effective_actor,
+            action="create",
+            skip_if_unchanged=True,
+        ):
+            for spec in specs:
+                s_name = str(spec["name"])
+                if s_name in by_name:
+                    continue
+                spec_copy = dict(spec)
+                spec_meta = dict(spec_copy.get("metadata") or {})
+                spec_meta["paused_by_user"] = True
+                spec_meta["tier"] = resolved_tier
+                if s_name.endswith("-delta"):
+                    spec_copy["cron_expression"] = delta_cron
+                    spec_copy["timezone"] = delta_tz
+                spec_copy["metadata"] = spec_meta
+                spec_copy["status"] = "paused"
+                await schedule_dalton_automation_helper(
+                    s_name,
+                    spec_copy,
+                    user_id=uid,
+                    workspace_id=ws_id,
+                    ticker=ticker,
+                    role="chief_of_staff",
+                    action="upsert",
+                    conn=conn,
+                )
+                paused_names.append(s_name)
 
         _, updated_rows = await _load_company_automations(
             uid, ws_id, ticker=ticker, conn=conn
@@ -1218,51 +1334,64 @@ async def resync_delta_schedule(
         new_next_run_iso = _iso_or_none(new_next_run_at)
         conn_kw = {"conn": conn} if conn is not None else {}
 
+        outer_ctx = get_current_history_context()
+        effective_actor = (
+            str(outer_ctx.actor_user_id).strip()
+            if outer_ctx is not None
+            and outer_ctx.has_explicit_actor
+            and outer_ctx.actor_user_id
+            else uid
+        )
         changes: list[dict[str, Any]] = []
-        for row in delta_rows:
-            auto_id = str(row["automation_id"])
-            old_cron = row.get("cron_expression")
-            old_tz = row.get("timezone")
-            old_next_run = _iso_or_none(row.get("next_run_at"))
-            old_meta = (
-                dict(row.get("metadata") or {})
-                if isinstance(row.get("metadata"), dict)
-                else {}
-            )
-            old_tier = old_meta.get("tier")
-            new_meta = dict(old_meta)
-            new_meta["ticker"] = t_upper
-            new_meta["tier"] = resolved_tier
+        with automation_history_context(
+            actor_user_id=effective_actor,
+            action="update",
+            skip_if_unchanged=True,
+        ):
+            for row in delta_rows:
+                auto_id = str(row["automation_id"])
+                old_cron = row.get("cron_expression")
+                old_tz = row.get("timezone")
+                old_next_run = _iso_or_none(row.get("next_run_at"))
+                old_meta = (
+                    dict(row.get("metadata") or {})
+                    if isinstance(row.get("metadata"), dict)
+                    else {}
+                )
+                old_tier = old_meta.get("tier")
+                new_meta = dict(old_meta)
+                new_meta["ticker"] = t_upper
+                new_meta["tier"] = resolved_tier
 
-            updated_row = await auto_db.update_automation(
-                auto_id,
-                uid,
-                cron_expression=new_cron,
-                timezone=new_tz,
-                next_run_at=new_next_run_at,
-                metadata=new_meta,
-                **conn_kw,
-            )
-            effective_row = updated_row if isinstance(updated_row, dict) else row
-            effective_status = str(
-                effective_row.get("status") or row.get("status") or "active"
-            )
-            changes.append(
-                {
-                    "automation_id": auto_id,
-                    "name": delta_name,
-                    "status": effective_status,
-                    "paused_by_user": bool(new_meta.get("paused_by_user")),
-                    "old_tier": old_tier,
-                    "new_tier": resolved_tier,
-                    "old_cron_expression": old_cron,
-                    "new_cron_expression": new_cron,
-                    "old_timezone": old_tz,
-                    "new_timezone": new_tz,
-                    "old_next_run_at": old_next_run,
-                    "new_next_run_at": new_next_run_iso,
-                }
-            )
+                updated_row = await auto_db.update_automation(
+                    auto_id,
+                    uid,
+                    cron_expression=new_cron,
+                    timezone=new_tz,
+                    next_run_at=new_next_run_at,
+                    metadata=new_meta,
+                    **conn_kw,
+                )
+                effective_row = updated_row if isinstance(updated_row, dict) else row
+                effective_status = str(
+                    effective_row.get("status") or row.get("status") or "active"
+                )
+                changes.append(
+                    {
+                        "automation_id": auto_id,
+                        "name": delta_name,
+                        "status": effective_status,
+                        "paused_by_user": bool(new_meta.get("paused_by_user")),
+                        "old_tier": old_tier,
+                        "new_tier": resolved_tier,
+                        "old_cron_expression": old_cron,
+                        "new_cron_expression": new_cron,
+                        "old_timezone": old_tz,
+                        "new_timezone": new_tz,
+                        "old_next_run_at": old_next_run,
+                        "new_next_run_at": new_next_run_iso,
+                    }
+                )
 
         primary = changes[0]
         return {

@@ -895,25 +895,44 @@ class AutomationFile(DbJsonFile[dict[str, Any] | None, Document, FilePlan]):
                 problems.add("", f"a value breaks {named} on its column ({type(exc).__name__})")
             return _REFUSED
 
+        # DALTON-HOOK(company-automations): coalesce file create+pause and update+action into single version
+        from src.dalton.services.company_automations import (
+            coalesce_file_create_pause,
+            coalesce_file_update_with_action,
+        )
+
         if delete := plan.delete:
             await auto_db.delete_automation(delete.automation_id, user_id, conn=conn)
             report = f'Deleted "{delete.name}" ({self.file_name}), with its run history'
 
         if update := plan.update:
             row = update.row
-            if update.fields:
-                row = await step(
-                    lifecycle.update_automation,
-                    update.automation_id,
-                    user_id,
-                    update.fields,
-                    model_pref=plan.model_pref,
-                    current=row,
-                    delivery_checked=True,
-                )
-            if update.action and row is not _REFUSED:
-                control = lifecycle.pause_automation if update.action == "pause" else lifecycle.resume_automation
-                row = await step(control, update.automation_id, user_id, current=row)
+            with coalesce_file_update_with_action(
+                has_fields=bool(update.fields),
+                has_action=bool(update.action),
+            ):
+                if update.fields:
+                    row = await step(
+                        lifecycle.update_automation,
+                        update.automation_id,
+                        user_id,
+                        update.fields,
+                        model_pref=plan.model_pref,
+                        current=row,
+                        delivery_checked=True,
+                    )
+                if update.action and row is not _REFUSED:
+                    control = (
+                        lifecycle.pause_automation
+                        if update.action == "pause"
+                        else lifecycle.resume_automation
+                    )
+                    row = await step(
+                        control, update.automation_id, user_id, current=row
+                    )
+                    if row is None:
+                        problems.add("status", "not found")
+                        row = _REFUSED
             if row is not _REFUSED:
                 changed = update.changed
                 if (
@@ -933,20 +952,29 @@ class AutomationFile(DbJsonFile[dict[str, Any] | None, Document, FilePlan]):
                 warning = lifecycle.delivery_warning((update.fields.get("delivery_config") or {}).get("methods"))
 
         if create := plan.create:
-            row = await step(
-                lifecycle.create_automation,
-                user_id,
-                create.data,
-                model_pref=plan.model_pref,
-                file_name=self.file_name,
-                delivery_checked=True,
-            )
-            if row is not _REFUSED and create.pause:
-                row = await step(lifecycle.pause_automation, str(row["automation_id"]), user_id, current=row)
-                if row is not _REFUSED:
-                    report = f'Saved {self.file_name}: created "{row["name"]}", paused'
-            elif row is not _REFUSED:
-                report = f'Saved {self.file_name}: created "{row["name"]}"{_next_run(row)}'
+            with coalesce_file_create_pause(pause=bool(create.pause)):
+                row = await step(
+                    lifecycle.create_automation,
+                    user_id,
+                    create.data,
+                    model_pref=plan.model_pref,
+                    file_name=self.file_name,
+                    delivery_checked=True,
+                )
+                if row is not _REFUSED and create.pause:
+                    row = await step(
+                        lifecycle.pause_automation,
+                        str(row["automation_id"]),
+                        user_id,
+                        current=row,
+                    )
+                    if row is None:
+                        problems.add("status", "not found")
+                        row = _REFUSED
+                    if row is not _REFUSED:
+                        report = f'Saved {self.file_name}: created "{row["name"]}", paused'
+                elif row is not _REFUSED:
+                    report = f'Saved {self.file_name}: created "{row["name"]}"{_next_run(row)}'
             delivery = create.data.delivery_config
             warning = lifecycle.delivery_warning(delivery.methods if delivery else None)
 

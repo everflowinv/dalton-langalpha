@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -1876,3 +1877,357 @@ async def test_channels_router_and_gateway_reject_company_identity_before_db_wri
     )
     assert sent_events[0]["status"] == 401
     assert conn_opened["count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 8. AU1 Batch A: Config History, Snapshot, Once Schedule & Expected Version
+# ---------------------------------------------------------------------------
+
+
+def test_au1_expected_config_version_validation_and_protected_fields() -> None:
+    # Omitted -> None
+    assert company_auto_svc.validate_expected_config_version(None, provided=False) is None
+    assert company_auto_svc.extract_expected_config_version(None) is None
+    assert company_auto_svc.extract_expected_config_version({}) is None
+
+    # Valid positive integers
+    assert company_auto_svc.validate_expected_config_version(1, provided=True) == 1
+    assert company_auto_svc.extract_expected_config_version({"expected_config_version": 7}) == 7
+
+    # Invalid values -> 400 HTTPException
+    for bad_val in (0, -1, -99, True, False, "1", "0", 1.5, None, [], {}):
+        with pytest.raises(HTTPException) as exc_info:
+            company_auto_svc.validate_expected_config_version(bad_val, provided=True)
+        assert exc_info.value.status_code == 400
+
+        with pytest.raises(HTTPException) as exc_info2:
+            company_auto_svc.extract_expected_config_version({"expected_config_version": bad_val})
+        assert exc_info2.value.status_code == 400
+
+    # AutomationUpdate excludes expected_config_version from model_dump so fields stays clean
+    upd = AutomationUpdate.model_validate(
+        {"description": "new desc", "expected_config_version": 3}
+    )
+    assert upd.expected_config_version == 3
+    dumped = upd.model_dump(exclude_unset=True)
+    assert dumped == {"description": "new desc"}
+
+    # Protected audit/version fields are rejected on AutomationCreate and AutomationUpdate
+    for protected_field, val in (
+        ("created_by", "other-user"),
+        ("updated_by", "other-user"),
+        ("audit_history", []),
+        ("config_version", 99),
+        ("active_version", 99),
+        ("notify_storage_mode", "task_row"),
+    ):
+        with pytest.raises(ValueError, match=protected_field):
+            AutomationCreate.model_validate(
+                {
+                    "name": "Test",
+                    "trigger_type": "cron",
+                    "cron_expression": "0 8 * * *",
+                    "instruction": "run",
+                    protected_field: val,
+                }
+            )
+        with pytest.raises(ValueError, match=protected_field):
+            AutomationUpdate.model_validate({protected_field: val})
+
+
+def test_au1_snapshot_builder_desired_status_and_corrupt_history_validation() -> None:
+    base_row = {
+        **_sample_automation_row(
+            metadata={"dalton_kind": "company_watch", "api_key": "k-secret"},
+        ),
+        "status": "executing",
+        "trigger_type": "price",
+        "cron_expression": None,
+        "delivery_config": {"methods": ["feishu"], "webhook_secret": "sec-123"},
+    }
+    active_hist = [
+        {
+            "version": 1,
+            "snapshot": {"desired_status": "active"},
+        }
+    ]
+    paused_hist = [
+        {
+            "version": 1,
+            "snapshot": {"desired_status": "paused"},
+        }
+    ]
+    # Price/executing row (claimed from active) and executing + active history -> active
+    assert company_auto_svc.resolve_desired_status_for_snapshot(base_row) == "active"
+    assert (
+        company_auto_svc.resolve_desired_status_for_snapshot(
+            {**base_row, "active_version": 1, "audit_history": active_hist}
+        )
+        == "active"
+    )
+    # Explicitly paused configuration -> paused
+    assert (
+        company_auto_svc.resolve_desired_status_for_snapshot(
+            {**base_row, "status": "paused"}
+        )
+        == "paused"
+    )
+    # Once/price runtime completion with active history or no history -> active
+    assert (
+        company_auto_svc.resolve_desired_status_for_snapshot(
+            {**base_row, "trigger_type": "once", "status": "completed", "audit_history": []}
+        )
+        == "active"
+    )
+    assert (
+        company_auto_svc.resolve_desired_status_for_snapshot(
+            {
+                **base_row,
+                "trigger_type": "once",
+                "status": "completed",
+                "active_version": 1,
+                "audit_history": active_hist,
+            }
+        )
+        == "active"
+    )
+    # Runtime status (completed/disabled) whose active_version history is paused -> paused
+    assert (
+        company_auto_svc.resolve_desired_status_for_snapshot(
+            {**base_row, "status": "completed", "active_version": 1, "audit_history": paused_hist}
+        )
+        == "paused"
+    )
+
+    snap = company_auto_svc.build_automation_config_snapshot(
+        base_row,
+        notify_enabled=True,
+        notify_routes=["feishu:dm"],
+    )
+    assert set(snap.keys()) == set(company_auto_svc.ALLOWED_AUTOMATION_SNAPSHOT_FIELDS)
+    assert "metadata" not in snap
+    assert snap["desired_status"] == "active"
+    assert snap["notify_enabled"] is True
+    assert snap["notify_routes"] == ["feishu:dm"]
+    assert "webhook_secret" not in snap["delivery_config"]
+
+    # Corrupt history state validation
+    assert (
+        company_auto_svc.validate_existing_history_state(
+            {"config_version": 1, "active_version": 1, "audit_history": []}
+        )
+        is None
+    )
+    with pytest.raises(company_auto_svc.AutomationHistoryCorruptError):
+        company_auto_svc.validate_existing_history_state(
+            {"config_version": 3, "active_version": 3, "audit_history": []}
+        )
+    with pytest.raises(company_auto_svc.AutomationHistoryCorruptError):
+        company_auto_svc.validate_existing_history_state(
+            {
+                "config_version": 2,
+                "active_version": 2,
+                "audit_history": [{"version": 1, "snapshot": snap}],
+            }
+        )
+    with pytest.raises(company_auto_svc.AutomationHistoryCorruptError):
+        company_auto_svc.validate_existing_history_state(
+            {
+                "config_version": 2,
+                "active_version": 2,
+                "audit_history": [{"version": 2, "snapshot": None}],
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_au1_automation_history_context_invariants_and_concurrency_isolation() -> None:
+    assert company_auto_svc.get_current_history_context() is None
+
+    # 1. Implicit actor / action vs explicit human actor vs explicit None system actor
+    with company_auto_svc.automation_history_context() as ctx_implicit:
+        assert ctx_implicit.has_explicit_actor is False
+        assert ctx_implicit.has_explicit_action is False
+        assert ctx_implicit.action is None
+
+    with company_auto_svc.automation_history_context(
+        actor_user_id="pm-actor-1",
+        action="resume",
+        expected_config_version=4,
+    ) as ctx_outer:
+        assert ctx_outer.has_explicit_actor is True
+        assert ctx_outer.actor_user_id == "pm-actor-1"
+        assert ctx_outer.has_explicit_action is True
+        assert ctx_outer.action == "resume"
+        assert ctx_outer.expected_config_version == 4
+
+        # Nested context without actor/action/expected_config_version inherits parent values
+        with company_auto_svc.automation_history_context(
+            skip_if_unchanged=True,
+        ) as ctx_inner_inherit:
+            assert ctx_inner_inherit.has_explicit_actor is True
+            assert ctx_inner_inherit.actor_user_id == "pm-actor-1"
+            assert ctx_inner_inherit.has_explicit_action is True
+            assert ctx_inner_inherit.action == "resume"
+            assert ctx_inner_inherit.expected_config_version == 4
+            assert ctx_inner_inherit.skip_if_unchanged is True
+
+        # Nested context with explicit None actor (maintenance/system origin) overrides parent
+        with pytest.raises(RuntimeError, match="inner boom"):
+            with company_auto_svc.automation_history_context(
+                actor_user_id=None,
+                action="maintenance_pause_stale_binding",
+            ) as ctx_sys:
+                assert ctx_sys.has_explicit_actor is True
+                assert ctx_sys.actor_user_id is None
+                assert ctx_sys.has_explicit_action is True
+                assert ctx_sys.action == "maintenance_pause_stale_binding"
+                raise RuntimeError("inner boom")
+
+        # Outer context is restored after inner exit / exception
+        restored = company_auto_svc.get_current_history_context()
+        assert restored is ctx_outer
+        assert restored.actor_user_id == "pm-actor-1"
+        assert restored.action == "resume"
+
+    assert company_auto_svc.get_current_history_context() is None
+
+    # 2. Concurrent coroutine isolation (no ContextVar leakage across asyncio.gather tasks)
+    barrier = asyncio.Event()
+
+    async def _worker_a() -> tuple[str | None, str | None]:
+        with company_auto_svc.automation_history_context(
+            actor_user_id="actor-a",
+            action="pause",
+        ):
+            await barrier.wait()
+            cur = company_auto_svc.get_current_history_context()
+            assert cur is not None
+            return str(cur.actor_user_id), cur.action
+
+    async def _worker_b() -> tuple[bool, str | None, str | None]:
+        with company_auto_svc.automation_history_context(
+            actor_user_id=None,
+            action="maintenance_pause_stale_binding",
+        ):
+            barrier.set()
+            await asyncio.sleep(0)
+            cur = company_auto_svc.get_current_history_context()
+            assert cur is not None
+            return cur.has_explicit_actor, cur.actor_user_id, cur.action
+
+    res_a, res_b = await asyncio.gather(_worker_a(), _worker_b())
+    assert res_a == ("actor-a", "pause")
+    assert res_b == (True, None, "maintenance_pause_stale_binding")
+    assert company_auto_svc.get_current_history_context() is None
+
+
+@pytest.mark.asyncio
+async def test_au1_resolve_effective_once_run_at_precedence_and_legacy_fallback() -> None:
+    t1 = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    t2 = datetime(2026, 6, 2, 12, 0, tzinfo=UTC)
+    t3 = datetime(2026, 6, 3, 12, 0, tzinfo=UTC)
+
+    # 1. target_snapshot wins
+    row = {
+        "automation_id": AUTO_PERSONAL_ID,
+        "trigger_type": "once",
+        "next_run_at": t2,
+        "audit_history": [],
+        "metadata": {"once_schedule_at": t3.isoformat()},
+    }
+    assert (
+        await company_auto_db._resolve_effective_once_run_at(
+            row, target_snapshot={"once_run_at": t1.isoformat()}
+        )
+        == t1.isoformat()
+    )
+
+    # 2. row.next_run_at wins when target_snapshot is None
+    assert (
+        await company_auto_db._resolve_effective_once_run_at(row)
+        == t2.isoformat()
+    )
+
+    # 3. When next_run_at is None and audit_history is non-empty, active_version snapshot wins
+    #    and never falls back to automation_executions even if once_run_at is None in history.
+    row_with_hist = {
+        "automation_id": AUTO_PERSONAL_ID,
+        "trigger_type": "once",
+        "next_run_at": None,
+        "active_version": 1,
+        "audit_history": [
+            {"version": 1, "snapshot": {"once_run_at": t1.isoformat()}},
+        ],
+        "metadata": {"once_schedule_at": t3.isoformat()},
+    }
+    assert (
+        await company_auto_db._resolve_effective_once_run_at(row_with_hist)
+        == t1.isoformat()
+    )
+
+    # 4a. Empty audit_history + metadata.once_schedule_at wins without DB query
+    row_empty_hist_meta = {
+        "automation_id": AUTO_PERSONAL_ID,
+        "trigger_type": "once",
+        "next_run_at": None,
+        "audit_history": [],
+        "metadata": {"once_schedule_at": t3.isoformat()},
+    }
+    assert (
+        await company_auto_db._resolve_effective_once_run_at(row_empty_hist_meta)
+        == t3.isoformat()
+    )
+
+    # 4b. Empty audit_history + no once_schedule_at -> queries automation_executions
+    exec_rows_state: list[dict[str, Any]] = [{"scheduled_at": t1}]
+
+    class _FakeExecCursor:
+        async def __aenter__(self) -> "_FakeExecCursor":
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            self.sql = sql
+            self.params = params
+
+        async def fetchall(self) -> list[dict[str, Any]]:
+            return list(exec_rows_state)
+
+    class _FakeExecConn:
+        def cursor(self, **kwargs: Any) -> _FakeExecCursor:
+            return _FakeExecCursor()
+
+    row_legacy_claimed = {
+        "automation_id": AUTO_PERSONAL_ID,
+        "trigger_type": "once",
+        "next_run_at": None,
+        "last_run_at": t1,
+        "audit_history": [],
+        "metadata": {},
+    }
+    # Exactly 1 matching execution -> returns scheduled_at ISO
+    assert (
+        await company_auto_db._resolve_effective_once_run_at(
+            row_legacy_claimed, conn=_FakeExecConn()
+        )
+        == t1.isoformat()
+    )
+    # 0 matching executions -> None
+    exec_rows_state[:] = []
+    assert (
+        await company_auto_db._resolve_effective_once_run_at(
+            row_legacy_claimed, conn=_FakeExecConn()
+        )
+        is None
+    )
+    # >1 matching executions -> refuses to guess -> None
+    exec_rows_state[:] = [{"scheduled_at": t1}, {"scheduled_at": t2}]
+    assert (
+        await company_auto_db._resolve_effective_once_run_at(
+            row_legacy_claimed, conn=_FakeExecConn()
+        )
+        is None
+    )

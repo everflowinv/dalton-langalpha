@@ -26,8 +26,12 @@ _PLAIN = {
     "name", "description", "cron_expression", "timezone", "instruction", "workspace_id",
     "llm_model", "thread_strategy", "conversation_thread_id", "status",
     "max_failures", "failure_count", "disable_reason", "next_run_at", "last_run_at",
+    "scope", "updated_by",
 }
-_NULLABLE = {"next_run_at", "last_run_at", "conversation_thread_id", "disable_reason", "description", "llm_model"}
+_NULLABLE = {
+    "next_run_at", "last_run_at", "conversation_thread_id", "disable_reason",
+    "description", "llm_model", "updated_by",
+}
 _JSON = {"trigger_config", "additional_context", "delivery_config", "metadata"}
 _UUID_COLUMNS = {"workspace_id", "conversation_thread_id"}
 
@@ -182,6 +186,9 @@ class FakeAutomationsDb:
         delivery_config: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
         file_name: str | None = None,
+        status: str = "active",
+        scope: str | None = None,
+        created_by: str | None = None,
         conn: Any = None,
     ) -> dict[str, Any]:
         # Derived as the database module derives it, from the names taken.
@@ -201,7 +208,7 @@ class FakeAutomationsDb:
             "name": name,
             "file_name": file_name,
             "description": description,
-            "status": "active",
+            "status": status or "active",
             "trigger_type": trigger_type,
             "cron_expression": cron_expression,
             "next_run_at": next_run_at,
@@ -215,6 +222,9 @@ class FakeAutomationsDb:
             "additional_context": additional_context,
             "delivery_config": delivery_config or {},
             "metadata": metadata or {},
+            "scope": scope or "personal",
+            "created_by": created_by if created_by is not None else user_id,
+            "updated_by": created_by if created_by is not None else user_id,
             "max_failures": max_failures,
             "failure_count": 0,
             "disable_reason": None,

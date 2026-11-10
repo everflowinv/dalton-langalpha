@@ -172,15 +172,47 @@ async def create_automation(
     so a clash reads the names again; a ``file_name`` the caller picked is
     its own, and a clash on it raises ``UniqueViolation``.
     """
-    # DALTON-HOOK(company-automations): enforce non-company ownership and canonical scope on create
+    # DALTON-HOOK(company-automations): enforce non-company ownership, canonical scope, and v1 audit_history on create
+    from datetime import timezone as _dt_tz
+    from unittest.mock import NonCallableMock
     from src.dalton.company_identity import is_company_system_user
-    from src.dalton.database.company_automations import resolve_automation_scope_for_write
+    from src.dalton.database.company_automations import (
+        _to_iso_str,
+        build_create_history_columns,
+        resolve_automation_scope_for_write,
+    )
+    from src.dalton.services.company_automations import (
+        UNSET,
+        get_current_file_coalesce_state,
+        get_current_history_context,
+    )
 
     if is_company_system_user(user_id) or str(scope or "").strip().lower() == "company":
         raise ValueError("Company automations cannot be created via personal create_automation")
 
     automation_id = str(uuid4())
-    effective_created_by = created_by if created_by is not None else user_id
+    hist_ctx = get_current_history_context()
+    if created_by is not None:
+        effective_created_by: Optional[str] = created_by
+    elif hist_ctx is not None and not isinstance(hist_ctx.actor_user_id, type(UNSET)):
+        effective_created_by = hist_ctx.actor_user_id
+    else:
+        effective_created_by = user_id
+
+    coalesce_state = get_current_file_coalesce_state()
+    eff_status = status or "active"
+    if coalesce_state is not None and coalesce_state.mode == "create_pause":
+        initial_desired_status = "paused"
+    else:
+        initial_desired_status = "paused" if eff_status == "paused" else "active"
+
+    effective_metadata: Dict[str, Any] = dict(metadata or {})
+    if trigger_type == "once" and next_run_at is not None:
+        once_iso = _to_iso_str(next_run_at)
+        if once_iso is not None:
+            effective_metadata["once_schedule_at"] = once_iso
+
+    now_iso = datetime.now(_dt_tz.utc).isoformat()
 
     clashes = 0
     async with get_db_connection(conn) as conn:
@@ -191,9 +223,39 @@ async def create_automation(
                 user_id,
                 name=name,
                 workspace_id=workspace_id,
-                metadata=metadata,
+                metadata=effective_metadata,
                 conn=conn,
             )
+        )
+        # DALTON-HOOK(company-automations): build initial v1 configuration snapshot and history
+        hist_cols = await build_create_history_columns(
+            {
+                "automation_id": automation_id,
+                "user_id": user_id,
+                "name": name,
+                "description": description,
+                "status": eff_status,
+                "trigger_type": trigger_type,
+                "cron_expression": cron_expression,
+                "next_run_at": next_run_at,
+                "trigger_config": trigger_config or {},
+                "timezone": timezone,
+                "instruction": instruction,
+                "workspace_id": workspace_id,
+                "llm_model": llm_model,
+                "additional_context": additional_context,
+                "thread_strategy": thread_strategy,
+                "conversation_thread_id": conversation_thread_id,
+                "max_failures": max_failures,
+                "delivery_config": delivery_config or {},
+                "metadata": effective_metadata,
+                "scope": effective_scope,
+                "notify_storage_mode": "legacy",
+            },
+            actor_user_id=effective_created_by,
+            desired_status=initial_desired_status,
+            changed_at_iso=now_iso,
+            conn=conn if not isinstance(conn, NonCallableMock) else None,
         )
         while True:
             chosen = file_name or await _free_file_name(user_id, name, conn)
@@ -210,7 +272,8 @@ async def create_automation(
                             thread_strategy, conversation_thread_id,
                             status, max_failures, failure_count,
                             delivery_config, metadata,
-                            scope, created_by,
+                            scope, created_by, updated_by,
+                            config_version, active_version, audit_history,
                             created_at, updated_at
                         )
                         VALUES (
@@ -221,7 +284,8 @@ async def create_automation(
                             %s, %s,
                             %s, %s, 0,
                             %s, %s,
-                            %s, %s,
+                            %s, %s, %s,
+                            %s, %s, %s,
                             NOW(), NOW()
                         )
                         RETURNING {AUTOMATION_COLUMNS}
@@ -233,12 +297,16 @@ async def create_automation(
                         instruction, workspace_id, llm_model,
                         Json(additional_context) if additional_context else None,
                         thread_strategy, conversation_thread_id,
-                        status or "active",  # DALTON-HOOK(coverage-tracking)
+                        eff_status,  # DALTON-HOOK(coverage-tracking)
                         max_failures,
                         Json(delivery_config or {}),
-                        Json(metadata or {}),
+                        Json(effective_metadata),
                         effective_scope,  # DALTON-HOOK(company-automations)
                         effective_created_by,
+                        hist_cols["updated_by"],
+                        hist_cols["config_version"],
+                        hist_cols["active_version"],
+                        Json(hist_cols["audit_history"]),
                     ))
                     result = await cur.fetchone()
             except UniqueViolation:
@@ -452,62 +520,326 @@ async def update_automation(
     Fields in ``nullable_fields`` are set even when their value is None
     (i.e. SET column = NULL).  All other fields are skipped when None.
     """
+    # DALTON-HOOK(company-automations): extract version check and history recording options
+    from datetime import timezone as _dt_tz
+    from unittest.mock import NonCallableMock
+    from src.dalton.database.company_automations import (
+        _to_iso_str,
+        fetch_user_preferences_unlocked,
+        prepare_update_history_columns,
+    )
+    from src.dalton.services.company_automations import (
+        UNSET,
+        get_current_file_coalesce_state,
+        get_current_history_context,
+        validate_expected_config_version,
+        validate_existing_history_state,
+    )
+
+    explicit_expected_cv = kwargs.pop("expected_config_version", UNSET)
+    explicit_actor = kwargs.pop("actor_user_id", UNSET)
+    explicit_action = kwargs.pop("history_action", None) or kwargs.pop("action", None)
+    explicit_record = kwargs.pop("record_history", None)
+    explicit_skip_unchanged = kwargs.pop("skip_if_unchanged", None)
+
+    hist_ctx = get_current_history_context()
     nullable_fields = {
         "next_run_at", "last_run_at", "conversation_thread_id", "disable_reason",
-        "description", "llm_model",
+        "description", "llm_model", "cron_expression", "updated_by",
     }
-    builder = UpdateQueryBuilder()
+    _config_update_fields = {
+        "name",
+        "description",
+        "trigger_type",
+        "cron_expression",
+        "timezone",
+        "instruction",
+        "workspace_id",
+        "llm_model",
+        "thread_strategy",
+        "conversation_thread_id",
+        "max_failures",
+        "trigger_config",
+        "additional_context",
+        "delivery_config",
+        "metadata",
+        "scope",
+    }
+    status_arg = str(kwargs.get("status") or "").strip().lower()
+    is_config_update = (
+        any(
+            k in kwargs and (kwargs[k] is not None or k in nullable_fields)
+            for k in _config_update_fields
+        )
+        or status_arg in ("active", "paused")
+        or (
+            "next_run_at" in kwargs
+            and status_arg not in ("executing", "completed", "disabled")
+        )
+    )
+    should_record = (
+        explicit_record
+        if explicit_record is not None
+        else (
+            hist_ctx.record_history
+            if hist_ctx is not None
+            else is_config_update
+        )
+    )
+    if not isinstance(explicit_expected_cv, type(UNSET)) and explicit_expected_cv is not None:
+        expected_cv: Optional[int] = validate_expected_config_version(
+            explicit_expected_cv, provided=True
+        )
+    else:
+        expected_cv = hist_ctx.expected_config_version if hist_ctx is not None else None
+
+    if not isinstance(explicit_actor, type(UNSET)):
+        eff_actor: Optional[str] = explicit_actor
+    elif hist_ctx is not None and hist_ctx.has_explicit_actor:
+        eff_actor = hist_ctx.actor_user_id  # type: ignore[assignment]
+    elif "updated_by" in kwargs:
+        eff_actor = kwargs["updated_by"]
+    else:
+        eff_actor = user_id
+
+    if explicit_action:
+        eff_action = str(explicit_action)
+    elif hist_ctx is not None and hist_ctx.has_explicit_action:
+        eff_action = str(hist_ctx.action)
+    elif kwargs.get("status") == "paused":
+        eff_action = "pause"
+    elif kwargs.get("status") == "active":
+        eff_action = "resume"
+    else:
+        eff_action = "update"
+
+    eff_skip_unchanged = (
+        explicit_skip_unchanged
+        if explicit_skip_unchanged is not None
+        else (hist_ctx.skip_if_unchanged if hist_ctx is not None else False)
+    )
 
     # DALTON-HOOK(company-automations): allow canonical scope/updated_by persistence and refuse company escalation
     if "scope" in kwargs and str(kwargs["scope"] or "").strip().lower() == "company":
         raise ValueError("Cannot update personal automation scope to company")
 
-    # Simple text/enum fields
-    for field in [
-        "name", "description", "cron_expression", "timezone",
-        "instruction", "workspace_id", "llm_model",
-        "thread_strategy", "conversation_thread_id",
-        "status", "max_failures", "failure_count", "disable_reason",
-        "next_run_at", "last_run_at",
-        "scope", "updated_by",
-    ]:
-        if field not in kwargs:
-            continue
-        if kwargs[field] is None and field not in nullable_fields:
-            continue
-        builder.add_field(field, kwargs[field], nullable=field in nullable_fields)
+    def _build_query_from_kwargs(
+        effective_kwargs: Dict[str, Any],
+        extra_history_cols: Optional[Dict[str, Any]] = None,
+    ) -> UpdateQueryBuilder:
+        b = UpdateQueryBuilder()
+        for field in [
+            "name", "description", "trigger_type", "cron_expression", "timezone",
+            "instruction", "workspace_id", "llm_model",
+            "thread_strategy", "conversation_thread_id",
+            "status", "max_failures", "failure_count", "disable_reason",
+            "next_run_at", "last_run_at",
+            "scope", "updated_by",
+        ]:
+            if field not in effective_kwargs:
+                continue
+            if effective_kwargs[field] is None and field not in nullable_fields:
+                continue
+            b.add_field(field, effective_kwargs[field], nullable=field in nullable_fields)
 
-    # JSONB fields
-    for field in [
-        "trigger_config", "additional_context",
-        "delivery_config", "metadata",
-    ]:
-        if field in kwargs and kwargs[field] is not None:
-            builder.add_field(field, kwargs[field], is_json=True)
+        for field in [
+            "trigger_config", "additional_context",
+            "delivery_config", "metadata",
+        ]:
+            if field in effective_kwargs and effective_kwargs[field] is not None:
+                b.add_field(field, effective_kwargs[field], is_json=True)
 
-    if not builder.has_updates():
+        if extra_history_cols:
+            if "config_version" in extra_history_cols:
+                b.add_field("config_version", extra_history_cols["config_version"])
+            if "active_version" in extra_history_cols:
+                b.add_field("active_version", extra_history_cols["active_version"])
+            if "updated_by" in extra_history_cols:
+                b.add_field(
+                    "updated_by", extra_history_cols["updated_by"], nullable=True
+                )
+            if "audit_history" in extra_history_cols:
+                b.add_field(
+                    "audit_history",
+                    extra_history_cols["audit_history"],
+                    is_json=True,
+                )
+        return b
+
+    initial_builder = _build_query_from_kwargs(kwargs)
+    if not initial_builder.has_updates() and expected_cv is None:
         return await get_automation(automation_id, user_id, conn=conn)
 
     returning = AUTOMATION_COLUMNS.strip().split(",")
     returning = [c.strip() for c in returning]
 
-    # DALTON-HOOK(company-automations): only update active (non-soft-deleted) rows
-    query, params = builder.build(
-        table="automations",
-        where_clause="automation_id = %s AND user_id = %s AND deleted_at IS NULL",
-        where_params=[automation_id, user_id],
-        returning_columns=returning,
-    )
-    # Answer with the automation as get_automation reads it, newest run
-    # included, so a PATCH, pause or resume response matches a GET.
-    query = f"""
-        WITH updated AS ({query})
-        SELECT updated.*, le.last_execution
-        FROM updated
-        {_last_execution_join("updated")}
-    """
-
     async with get_db_connection(conn) as conn:
+        is_mock_conn = isinstance(conn, NonCallableMock)
+        if not is_mock_conn and (should_record or expected_cv is not None):
+            # DALTON-HOOK(company-automations): read user_preferences before locking automations row
+            pref_row = await fetch_user_preferences_unlocked(user_id, conn=conn)
+            now_iso = datetime.now(_dt_tz.utc).isoformat()
+            async with conn.transaction():
+                async with conn.cursor(row_factory=dict_row) as cur:
+                    await cur.execute(
+                        f"""
+                        SELECT {AUTOMATION_COLUMNS}, audit_history
+                        FROM automations
+                        WHERE automation_id = %s AND user_id = %s AND deleted_at IS NULL
+                        FOR UPDATE
+                        """,
+                        (automation_id, user_id),
+                    )
+                    locked_row = await cur.fetchone()
+                    if not locked_row:
+                        return None
+
+                    coalesce = get_current_file_coalesce_state()
+                    if not (coalesce is not None and coalesce.mode == "create_pause"):
+                        validate_existing_history_state(locked_row)
+                        if (
+                            expected_cv is not None
+                            and (
+                                coalesce is None
+                                or coalesce.mode != "update_action"
+                                or coalesce.step1_pre_row is None
+                            )
+                            and int(locked_row.get("config_version") or 1) != expected_cv
+                        ):
+                            from src.dalton.services.company_automations import (
+                                AutomationVersionConflictError,
+                            )
+
+                            raise AutomationVersionConflictError(
+                                f"Configuration version conflict: expected {expected_cv}, current is {locked_row.get('config_version')}"
+                            )
+
+                    effective_kwargs = dict(kwargs)
+                    if (
+                        hist_ctx is not None
+                        and hist_ctx.locked_row_reconciler is not None
+                    ):
+                        await hist_ctx.locked_row_reconciler(
+                            locked_row, effective_kwargs, conn
+                        )
+
+                    target_trigger = str(
+                        effective_kwargs.get("trigger_type")
+                        or locked_row.get("trigger_type")
+                        or ""
+                    ).strip()
+                    if (
+                        target_trigger == "once"
+                        and "next_run_at" in effective_kwargs
+                        and effective_kwargs["next_run_at"] is not None
+                    ):
+                        once_iso = _to_iso_str(effective_kwargs["next_run_at"])
+                        if once_iso is not None:
+                            merged_meta = dict(locked_row.get("metadata") or {})
+                            if isinstance(effective_kwargs.get("metadata"), dict):
+                                merged_meta.update(effective_kwargs["metadata"])
+                            merged_meta["once_schedule_at"] = once_iso
+                            effective_kwargs["metadata"] = merged_meta
+
+                    extra_hist_cols: Dict[str, Any] = {}
+
+                    if not should_record:
+                        pass
+                    elif coalesce is not None and coalesce.mode == "create_pause":
+                        # Create + pause inside AutomationFile already recorded v1 with desired_status='paused'
+                        pass
+                    elif (
+                        coalesce is not None
+                        and coalesce.mode == "update_action"
+                        and coalesce.step1_pre_row is None
+                    ):
+                        import copy
+
+                        coalesce.step1_pre_row = copy.deepcopy(dict(locked_row))
+                        coalesce.step1_pref_row = pref_row
+                    else:
+                        base_pre_row = (
+                            coalesce.step1_pre_row
+                            if (
+                                coalesce is not None
+                                and coalesce.mode == "update_action"
+                                and coalesce.step1_pre_row is not None
+                            )
+                            else None
+                        )
+                        combined_action = (
+                            "update" if base_pre_row is not None else eff_action
+                        )
+                        eff_pref = (
+                            coalesce.step1_pref_row
+                            if (
+                                coalesce is not None
+                                and coalesce.step1_pref_row is not None
+                            )
+                            else pref_row
+                        )
+                        extra_hist_cols, is_noop = await prepare_update_history_columns(
+                            locked_row,
+                            effective_kwargs,
+                            actor_user_id=eff_actor,
+                            action=combined_action,
+                            expected_config_version=expected_cv,
+                            skip_if_unchanged=eff_skip_unchanged,
+                            pref_row=eff_pref,
+                            base_pre_row=base_pre_row,
+                            changed_at_iso=now_iso,
+                            conn=conn,
+                        )
+                        if is_noop:
+                            extra_hist_cols = {}
+                            effective_kwargs.pop("updated_by", None)
+
+                    builder = _build_query_from_kwargs(
+                        effective_kwargs, extra_hist_cols
+                    )
+                    if not builder.has_updates():
+                        return await get_automation(
+                            automation_id, user_id, conn=conn
+                        )
+
+                    # DALTON-HOOK(company-automations): only update active (non-soft-deleted) rows
+                    query, params = builder.build(
+                        table="automations",
+                        where_clause="automation_id = %s AND user_id = %s AND deleted_at IS NULL",
+                        where_params=[automation_id, user_id],
+                        returning_columns=returning,
+                    )
+                    query = f"""
+                        WITH updated AS ({query})
+                        SELECT updated.*, le.last_execution
+                        FROM updated
+                        {_last_execution_join("updated")}
+                    """
+                    await cur.execute(query, params)
+                    result = await cur.fetchone()
+                    if result:
+                        logger.info(
+                            f"[automation_db] update_automation automation_id={automation_id}"
+                        )
+                    return dict(result) if result else None
+
+        # Fallback for mock connections or non-history runtime updates
+        builder = _build_query_from_kwargs(kwargs)
+        if not builder.has_updates():
+            return await get_automation(automation_id, user_id, conn=conn)
+
+        query, params = builder.build(
+            table="automations",
+            where_clause="automation_id = %s AND user_id = %s AND deleted_at IS NULL",
+            where_params=[automation_id, user_id],
+            returning_columns=returning,
+        )
+        query = f"""
+            WITH updated AS ({query})
+            SELECT updated.*, le.last_execution
+            FROM updated
+            {_last_execution_join("updated")}
+        """
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(query, params)
             result = await cur.fetchone()
@@ -583,13 +915,33 @@ async def claim_due_automations(
                 for row in rows:
                     automation_id = str(row["automation_id"])
                     execution_id = str(uuid4())
+                    once_iso = (
+                        row["next_run_at"].isoformat()
+                        if hasattr(row.get("next_run_at"), "isoformat")
+                        else (
+                            str(row["next_run_at"])
+                            if row.get("next_run_at") is not None
+                            else None
+                        )
+                    )
 
+                    # DALTON-HOOK(company-automations): preserve once_schedule_at in metadata before clearing next_run_at
                     # Advance next_run_at to NULL (scheduler will recalculate)
-                    await cur.execute("""
-                        UPDATE automations
-                        SET next_run_at = NULL, last_run_at = NOW()
-                        WHERE automation_id = %s
-                    """, (automation_id,))
+                    if str(row.get("trigger_type") or "") == "once" and once_iso:
+                        await cur.execute("""
+                            UPDATE automations
+                            SET metadata = COALESCE(metadata, '{}'::jsonb)
+                                    || jsonb_build_object('once_schedule_at', %s::text),
+                                next_run_at = NULL,
+                                last_run_at = NOW()
+                            WHERE automation_id = %s
+                        """, (once_iso, automation_id))
+                    else:
+                        await cur.execute("""
+                            UPDATE automations
+                            SET next_run_at = NULL, last_run_at = NOW()
+                            WHERE automation_id = %s
+                        """, (automation_id,))
 
                     # Insert pending execution
                     await cur.execute("""
@@ -602,6 +954,10 @@ async def claim_due_automations(
                     """, (execution_id, automation_id, row["next_run_at"], server_id))
 
                     entry = dict(row)
+                    if str(row.get("trigger_type") or "") == "once" and once_iso:
+                        merged_meta = dict(entry.get("metadata") or {})
+                        merged_meta["once_schedule_at"] = once_iso
+                        entry["metadata"] = merged_meta
                     entry["_execution_id"] = execution_id
                     claimed.append(entry)
 

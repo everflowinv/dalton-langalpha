@@ -18,6 +18,10 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from src.dalton.access_tiers import get_user_tier
+from src.dalton.services.company_automations import (
+    automation_history_context,
+    get_current_history_context,
+)
 from src.dalton.autonomy.schedule import (
     build_global_director_specs,
     list_all_user_automations,
@@ -1662,6 +1666,7 @@ async def _enable_single_home_job(
     *,
     force: bool = True,
     respect_user_pause: bool = False,
+    actor_user_id: str | None = None,
     conn: Any = None,
 ) -> None:
     if existing_row and not force and respect_user_pause:
@@ -1674,15 +1679,36 @@ async def _enable_single_home_job(
     spec_meta["paused_by_user"] = None
     spec_copy["metadata"] = spec_meta
     spec_copy["status"] = "active"
-    await schedule_dalton_automation_helper(
-        str(spec_copy["name"]),
-        spec_copy,
-        user_id=user_id,
-        workspace_id="home",
-        role="chief_of_staff",
-        action="upsert",
-        conn=conn,
+    outer_ctx = get_current_history_context()
+    effective_actor = (
+        str(actor_user_id).strip()
+        if actor_user_id is not None and str(actor_user_id).strip()
+        else (
+            str(outer_ctx.actor_user_id).strip()
+            if outer_ctx is not None
+            and outer_ctx.has_explicit_actor
+            and outer_ctx.actor_user_id
+            else user_id
+        )
     )
+    was_paused = bool(
+        existing_row
+        and str(existing_row.get("status") or "").strip().lower() == "paused"
+    )
+    with automation_history_context(
+        actor_user_id=effective_actor,
+        action="resume" if was_paused else "update",
+        skip_if_unchanged=True,
+    ):
+        await schedule_dalton_automation_helper(
+            str(spec_copy["name"]),
+            spec_copy,
+            user_id=user_id,
+            workspace_id="home",
+            role="chief_of_staff",
+            action="upsert",
+            conn=conn,
+        )
 
 
 async def _disable_single_home_job(
@@ -1690,20 +1716,38 @@ async def _disable_single_home_job(
     spec: dict[str, Any],
     existing_row: dict[str, Any] | None,
     *,
+    actor_user_id: str | None = None,
     conn: Any = None,
 ) -> None:
     conn_kw = {"conn": conn} if conn is not None else {}
+    outer_ctx = get_current_history_context()
+    effective_actor = (
+        str(actor_user_id).strip()
+        if actor_user_id is not None and str(actor_user_id).strip()
+        else (
+            str(outer_ctx.actor_user_id).strip()
+            if outer_ctx is not None
+            and outer_ctx.has_explicit_actor
+            and outer_ctx.actor_user_id
+            else user_id
+        )
+    )
     if existing_row and existing_row.get("automation_id"):
         new_meta = dict(existing_row.get("metadata") or {})
         new_meta["paused_by_user"] = True
-        await auto_db.update_automation(
-            str(existing_row["automation_id"]),
-            user_id,
-            status="paused",
-            next_run_at=None,
-            metadata=new_meta,
-            **conn_kw,
-        )
+        with automation_history_context(
+            actor_user_id=effective_actor,
+            action="pause",
+            skip_if_unchanged=True,
+        ):
+            await auto_db.update_automation(
+                str(existing_row["automation_id"]),
+                user_id,
+                status="paused",
+                next_run_at=None,
+                metadata=new_meta,
+                **conn_kw,
+            )
         return
 
     # Create directly in paused state with paused_by_user=True so user choice is persisted
@@ -1712,21 +1756,27 @@ async def _disable_single_home_job(
     spec_meta["paused_by_user"] = True
     spec_copy["metadata"] = spec_meta
     spec_copy["status"] = "paused"
-    await schedule_dalton_automation_helper(
-        str(spec_copy["name"]),
-        spec_copy,
-        user_id=user_id,
-        workspace_id="home",
-        role="chief_of_staff",
-        action="upsert",
-        conn=conn,
-    )
+    with automation_history_context(
+        actor_user_id=effective_actor,
+        action="create",
+        skip_if_unchanged=True,
+    ):
+        await schedule_dalton_automation_helper(
+            str(spec_copy["name"]),
+            spec_copy,
+            user_id=user_id,
+            workspace_id="home",
+            role="chief_of_staff",
+            action="upsert",
+            conn=conn,
+        )
 
 
 async def _create_paused_home_job_for_run_now(
     user_id: str,
     spec: dict[str, Any],
     *,
+    actor_user_id: str | None = None,
     conn: Any = None,
 ) -> None:
     """Create a missing Home automation directly in ``paused`` state without ``paused_by_user``."""
@@ -1735,15 +1785,32 @@ async def _create_paused_home_job_for_run_now(
     spec_meta.pop("paused_by_user", None)
     spec_copy["metadata"] = spec_meta
     spec_copy["status"] = "paused"
-    await schedule_dalton_automation_helper(
-        str(spec_copy["name"]),
-        spec_copy,
-        user_id=user_id,
-        workspace_id="home",
-        role="chief_of_staff",
-        action="upsert",
-        conn=conn,
+    outer_ctx = get_current_history_context()
+    effective_actor = (
+        str(actor_user_id).strip()
+        if actor_user_id is not None and str(actor_user_id).strip()
+        else (
+            str(outer_ctx.actor_user_id).strip()
+            if outer_ctx is not None
+            and outer_ctx.has_explicit_actor
+            and outer_ctx.actor_user_id
+            else user_id
+        )
     )
+    with automation_history_context(
+        actor_user_id=effective_actor,
+        action="create",
+        skip_if_unchanged=True,
+    ):
+        await schedule_dalton_automation_helper(
+            str(spec_copy["name"]),
+            spec_copy,
+            user_id=user_id,
+            workspace_id="home",
+            role="chief_of_staff",
+            action="upsert",
+            conn=conn,
+        )
 
 
 async def toggle_system_job(
@@ -2069,6 +2136,19 @@ async def toggle_system_job(
         job = await _fetch_host_conversation_archive_job()
         return {"ok": True, "job": job}
 
+    outer_ctx = get_current_history_context()
+    actor_uid = (
+        str(actor_user_id).strip()
+        if actor_user_id is not None and str(actor_user_id).strip()
+        else (
+            str(outer_ctx.actor_user_id).strip()
+            if outer_ctx is not None
+            and outer_ctx.has_explicit_actor
+            and outer_ctx.actor_user_id
+            else uid
+        )
+    )
+
     if scope == "home":
         specs = build_global_director_specs()
         spec = next((s for s in specs if str(s["name"]) == target), None)
@@ -2093,22 +2173,26 @@ async def toggle_system_job(
             if enabled and not force and respect_user_pause and paused_by_user:
                 return {"ok": True, "job": _build_home_job_entry(spec, existing_row)}
 
-            if enabled:
-                await _enable_single_home_job(
-                    uid,
-                    spec,
-                    existing_row,
-                    force=force,
-                    respect_user_pause=respect_user_pause,
-                    conn=conn,
-                )
-            else:
-                await _disable_single_home_job(
-                    uid,
-                    spec,
-                    existing_row,
-                    conn=conn,
-                )
+            with automation_history_context(
+                actor_user_id=actor_uid,
+                skip_if_unchanged=True,
+            ):
+                if enabled:
+                    await _enable_single_home_job(
+                        uid,
+                        spec,
+                        existing_row,
+                        force=force,
+                        respect_user_pause=respect_user_pause,
+                        conn=conn,
+                    )
+                else:
+                    await _disable_single_home_job(
+                        uid,
+                        spec,
+                        existing_row,
+                        conn=conn,
+                    )
             updated_rows = await list_all_user_automations(
                 uid,
                 name_prefix=target,
@@ -2123,10 +2207,14 @@ async def toggle_system_job(
     if scope == "sector":
         s_unit = await _resolve_sector_unit_for_key(uid, target)
         s_ws = str(s_unit.get("workspace_id"))
-        if enabled:
-            await enable_tracking(uid, s_ws, force=force, respect_user_pause=respect_user_pause)
-        else:
-            await disable_tracking(uid, s_ws)
+        with automation_history_context(
+            actor_user_id=actor_uid,
+            skip_if_unchanged=True,
+        ):
+            if enabled:
+                await enable_tracking(uid, s_ws, force=force, respect_user_pause=respect_user_pause)
+            else:
+                await disable_tracking(uid, s_ws)
         rows_after = await list_all_user_automations(uid, name_prefix="dalton-")
         s_tracking = await get_tracking_status(uid, s_ws)
         if str(s_tracking.get("subject_kind") or "") != "sector":
@@ -2134,15 +2222,19 @@ async def toggle_system_job(
         return {"ok": True, "job": _build_sector_job_entry(uid, s_unit, rows_after, s_tracking)}
 
     ws_id = await _resolve_company_workspace_id(uid, target)
-    if enabled:
-        await enable_tracking(
-            uid,
-            ws_id,
-            force=force,
-            respect_user_pause=respect_user_pause,
-        )
-    else:
-        await disable_tracking(uid, ws_id)
+    with automation_history_context(
+        actor_user_id=actor_uid,
+        skip_if_unchanged=True,
+    ):
+        if enabled:
+            await enable_tracking(
+                uid,
+                ws_id,
+                force=force,
+                respect_user_pause=respect_user_pause,
+            )
+        else:
+            await disable_tracking(uid, ws_id)
     rows_after = await list_all_user_automations(uid, name_prefix="dalton-")
     entry = await _build_company_job_entry(uid, ws_id, rows_after)
     if not entry:
@@ -2324,7 +2416,13 @@ async def run_system_job_now(
             )
             if row is None:
                 # Create the row paused without paused_by_user so running once does not silently enable cron or mark user-paused
-                await _create_paused_home_job_for_run_now(uid, spec, conn=conn)
+                actor_uid_home = str(actor_user_id if actor_user_id is not None else uid).strip() or uid
+                with automation_history_context(
+                    actor_user_id=actor_uid_home,
+                    action="create",
+                    skip_if_unchanged=True,
+                ):
+                    await _create_paused_home_job_for_run_now(uid, spec, conn=conn)
                 rows = await list_all_user_automations(
                     uid,
                     name_prefix=target,

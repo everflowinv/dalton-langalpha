@@ -529,6 +529,7 @@ async def schedule_dalton_automation_helper(
     ticker: str | None = None,
     role: str = "chief_of_staff",
     action: str | None = None,
+    actor_user_id: str | None = None,
     conn: Any = None,
 ) -> dict[str, Any]:
     """Idempotently create, update, pause, resume, or list Dalton (`dalton-*`) automations (G4.5).
@@ -759,16 +760,39 @@ async def schedule_dalton_automation_helper(
                         "message": "只有 PM 用户可以修改或启停 Home 全局任务。",
                     }
 
+        from src.dalton.services.company_automations import (
+            automation_history_context,
+            get_current_history_context,
+        )
+
+        outer_hist_ctx = get_current_history_context()
+        effective_actor_id = (
+            str(actor_user_id).strip()
+            if actor_user_id is not None and str(actor_user_id).strip()
+            else (
+                str(outer_hist_ctx.actor_user_id).strip()
+                if outer_hist_ctx is not None
+                and outer_hist_ctx.has_explicit_actor
+                and outer_hist_ctx.actor_user_id
+                else user_id
+            )
+        )
+
         if resolved_action in ("pause", "resume"):
             if not existing:
                 return {"ok": False, "error": f"未找到任务 `{resolved_name}`"}
             new_status = "paused" if resolved_action == "pause" else "active"
-            updated = await auto_db.update_automation(
-                str(existing["automation_id"]),
-                user_id,
-                status=new_status,
-                **conn_kw,
-            )
+            with automation_history_context(
+                actor_user_id=effective_actor_id,
+                action=resolved_action,
+                skip_if_unchanged=True,
+            ):
+                updated = await auto_db.update_automation(
+                    str(existing["automation_id"]),
+                    user_id,
+                    status=new_status,
+                    **conn_kw,
+                )
             return {
                 "ok": True,
                 "action": resolved_action,
@@ -868,12 +892,22 @@ async def schedule_dalton_automation_helper(
                 metadata=saved_metadata if isinstance(saved_metadata, dict) else None,
                 conn=active_conn,
             )
-            updated = await auto_db.update_automation(
-                str(existing["automation_id"]),
-                user_id,
-                **conn_kw,
-                **patch,
+            effective_update_action = (
+                str(outer_hist_ctx.action)
+                if outer_hist_ctx is not None and outer_hist_ctx.has_explicit_action
+                else "update"
             )
+            with automation_history_context(
+                actor_user_id=effective_actor_id,
+                action=effective_update_action,
+                skip_if_unchanged=True,
+            ):
+                updated = await auto_db.update_automation(
+                    str(existing["automation_id"]),
+                    user_id,
+                    **conn_kw,
+                    **patch,
+                )
             return {
                 "ok": True,
                 "action": "updated",
@@ -910,7 +944,7 @@ async def schedule_dalton_automation_helper(
             delivery_config=merged_spec.get("delivery_config"),
             metadata=clean_meta,
             scope=resolved_scope,
-            created_by=user_id,
+            created_by=effective_actor_id,
             **create_kw,
         )
         return {

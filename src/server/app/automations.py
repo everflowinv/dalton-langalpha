@@ -27,12 +27,14 @@ import logging
 from typing import Any, Literal, Optional  # DALTON-HOOK(company-automations)
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi import APIRouter, Body, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import ValidationError
 
 from src.dalton.services.company_automations import (  # DALTON-HOOK(company-automations)
     AutomationHistoryResponse,
+    automation_history_context,
+    extract_expected_config_version,
 )
 from src.server.database import automation as auto_db
 from src.server.database import automation_executions as exec_db
@@ -284,15 +286,22 @@ async def update_automation(
         thread_id=request.conversation_thread_id,
     )
     try:
+        # DALTON-HOOK(company-automations): validate optional expected_config_version and propagate via context
+        expected_cv = extract_expected_config_version(request)
         fields = request.model_dump(exclude_none=True)
         # DALTON-HOOK(automation-model): allow explicit null llm_model to clear model override
         if "llm_model" in request.model_fields_set and request.llm_model is None:
             fields["llm_model"] = None
-        automation = await handler.update_automation(
-            automation_id=str(automation_id),
-            user_id=user_id,
-            fields=fields,
-        )
+        with automation_history_context(
+            actor_user_id=user_id,
+            action="update",
+            expected_config_version=expected_cv,
+        ):
+            automation = await handler.update_automation(
+                automation_id=str(automation_id),
+                user_id=user_id,
+                fields=fields,
+            )
     except handler.DeliveryRefused as e:
         return _delivery_refused(e)
     except ValidationError as e:
@@ -346,9 +355,17 @@ async def trigger_automation(
 async def pause_automation(
     automation_id: UUID,
     user_id: WorkspaceWriteUserId,
+    body: Any = Body(default=None),
 ):
     """Pause an active automation."""
-    automation = await handler.pause_automation(str(automation_id), user_id)
+    # DALTON-HOOK(company-automations): validate optional expected_config_version on pause
+    expected_cv = extract_expected_config_version(body)
+    with automation_history_context(
+        actor_user_id=user_id,
+        action="pause",
+        expected_config_version=expected_cv,
+    ):
+        automation = await handler.pause_automation(str(automation_id), user_id)
     if not automation:
         raise_not_found("Automation")
     resp = AutomationResponse.model_validate(automation)
@@ -365,9 +382,17 @@ async def resume_automation(
     automation_id: UUID,
     # Re-arms runs into the automation's thread, so not the call's own.
     user_id: WorkspaceSendUserId,
+    body: Any = Body(default=None),
 ):
     """Resume a paused or disabled automation."""
-    automation = await handler.resume_automation(str(automation_id), user_id)
+    # DALTON-HOOK(company-automations): validate optional expected_config_version on resume
+    expected_cv = extract_expected_config_version(body)
+    with automation_history_context(
+        actor_user_id=user_id,
+        action="resume",
+        expected_config_version=expected_cv,
+    ):
+        automation = await handler.resume_automation(str(automation_id), user_id)
     if not automation:
         raise_not_found("Automation")
     resp = AutomationResponse.model_validate(automation)

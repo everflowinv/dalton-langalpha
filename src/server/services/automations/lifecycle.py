@@ -475,6 +475,7 @@ async def update_automation(
     model_pref: dict[str, Any] | None = None,
     current: Dict[str, Any] | None = None,
     delivery_checked: bool = False,
+    expected_config_version: Any = None,
 ) -> Optional[Dict[str, Any]]:
     """Update an automation with validation and next_run_at recalculation.
 
@@ -501,6 +502,26 @@ async def update_automation(
         DeliveryRefused: a delivery chat not already saved that can't be used
         TargetRefused: a workspace or thread that isn't the user's
     """
+    # DALTON-HOOK(company-automations): validate optional expected_config_version before mutating
+    from src.dalton.services.company_automations import (
+        automation_history_context,
+        extract_expected_config_version,
+        get_current_history_context,
+        validate_expected_config_version,
+    )
+
+    if expected_config_version is not None:
+        resolved_expected_cv: Optional[int] = validate_expected_config_version(
+            expected_config_version, provided=True
+        )
+    elif isinstance(fields, dict) and "expected_config_version" in fields:
+        resolved_expected_cv = extract_expected_config_version(fields)
+    else:
+        hist_ctx = get_current_history_context()
+        resolved_expected_cv = (
+            hist_ctx.expected_config_version if hist_ctx is not None else None
+        )
+
     current = await _current(automation_id, user_id, conn, current)
     if not current:
         return None
@@ -508,7 +529,9 @@ async def update_automation(
     update = AutomationUpdate.model_validate(
         fields, context={"trigger_type": current["trigger_type"]}
     )
-    update_kwargs = update.model_dump(exclude_unset=True, exclude={"trigger_type"})
+    update_kwargs = update.model_dump(
+        exclude_unset=True, exclude={"trigger_type", "expected_config_version"}
+    )
     for field in ("workspace_id", "conversation_thread_id"):
         if update_kwargs.get(field) is not None:
             update_kwargs[field] = str(update_kwargs[field])
@@ -589,12 +612,23 @@ async def update_automation(
         )
 
     if not update_kwargs:
+        if resolved_expected_cv is not None:
+            with automation_history_context(
+                actor_user_id=user_id,
+                action="update",
+                expected_config_version=resolved_expected_cv,
+                record_history=False,
+            ):
+                return await auto_db.update_automation(
+                    automation_id, user_id, conn=conn
+                )
         return current
 
     # DALTON-HOOK(company-automations): keep scope aligned when name, workspace, or metadata changes
     from src.dalton.company_identity import is_company_system_user
 
-    if is_company_system_user(user_id):
+    current_scope = str(current.get("scope") or "personal").strip() or "personal"
+    if is_company_system_user(user_id) or current_scope == "company":
         raise ValueError("Company automations cannot be updated via personal lifecycle")
     if any(k in update_kwargs for k in ("name", "workspace_id", "metadata")):
         from src.dalton.database.company_automations import resolve_automation_scope_for_write
@@ -614,17 +648,171 @@ async def update_automation(
             if update_kwargs.get("metadata") is not None
             else current.get("metadata")
         )
-        update_kwargs["scope"] = await resolve_automation_scope_for_write(
+        resolved_scope = await resolve_automation_scope_for_write(
             user_id,
             name=saved_name,
             workspace_id=saved_ws,
             metadata=saved_meta,
             conn=conn,
         )
+        if resolved_scope != current_scope:
+            update_kwargs["scope"] = resolved_scope
 
-    result = await auto_db.update_automation(
-        automation_id, user_id, conn=conn, **update_kwargs
+    # DALTON-HOOK(company-automations): record update history, verify expected_config_version, and reconcile derived fields under row lock
+    from src.server.services.claude_code.hosted import checks_automations as _checks_cc_automations
+
+    pref_for_lock = model_pref
+    if pref_for_lock is None and _checks_cc_automations():
+        pref_for_lock = await user_models.get_model_preference(user_id)
+
+    async def _reconcile_locked_update(
+        locked_row: Any,
+        effective_kwargs: Dict[str, Any],
+        locked_conn: Any,
+    ) -> None:
+        locked_scope = str(locked_row.get("scope") or "personal").strip() or "personal"
+        if is_company_system_user(user_id) or locked_scope == "company":
+            raise ValueError("Company automations cannot be updated via personal lifecycle")
+
+        locked_stored_in = normalize_uuid(locked_row.get("workspace_id"))
+        locked_stored_pin = normalize_uuid(locked_row.get("conversation_thread_id"))
+
+        if "workspace_id" in update.model_fields_set:
+            if (
+                locked_row.get("conversation_thread_id")
+                and "conversation_thread_id" not in update.model_fields_set
+                and effective_kwargs.get("workspace_id") != locked_stored_in
+            ):
+                effective_kwargs["conversation_thread_id"] = None
+            elif "conversation_thread_id" not in update.model_fields_set:
+                effective_kwargs.pop("conversation_thread_id", None)
+
+        pin_locked = effective_kwargs.get("conversation_thread_id", locked_stored_pin)
+        if pin_locked:
+            runs_in_locked = effective_kwargs.get("workspace_id") or locked_stored_in
+            continues_locked = (
+                update.thread_strategy == "continue"
+                and locked_row.get("thread_strategy") != "continue"
+            )
+            if (
+                pin_locked != locked_stored_pin
+                or runs_in_locked != locked_stored_in
+                or continues_locked
+            ):
+                if runs_in_locked is None:
+                    raise AutomationRefusal(_NO_WORKSPACE, field="workspace_id")
+                if (
+                    locked_stored_in != stored_in
+                    or locked_stored_pin != stored_pin
+                    or locked_row.get("thread_strategy") != current.get("thread_strategy")
+                ):
+                    await _require_pin_in(user_id, pin_locked, runs_in_locked, locked_conn)
+
+        moved_to_locked = normalize_uuid(effective_kwargs.get("workspace_id")) or locked_stored_in
+        runs_on_locked = effective_kwargs.get("llm_model", locked_row.get("llm_model"))
+        if (
+            runs_on_locked != locked_row.get("llm_model")
+            or moved_to_locked != locked_stored_in
+        ):
+            _check_home_model(user_id, runs_on_locked, moved_to_locked)
+            if (
+                locked_stored_in != stored_in
+                or locked_row.get("llm_model") != current.get("llm_model")
+            ):
+                await _check_claude_code_hosted(
+                    user_id, runs_on_locked, moved_to_locked, locked_conn, pref_for_lock
+                )
+
+        pinned_locked = effective_kwargs.get("conversation_thread_id", locked_stored_pin)
+        strategy_locked = update.thread_strategy or locked_row.get("thread_strategy")
+        if (
+            strategy_locked == "continue"
+            and (runs_on_locked, pinned_locked, strategy_locked)
+            != (
+                locked_row.get("llm_model"),
+                locked_stored_pin,
+                locked_row.get("thread_strategy"),
+            )
+            and (
+                locked_row.get("llm_model") != current.get("llm_model")
+                or locked_stored_pin != stored_pin
+                or locked_row.get("thread_strategy") != current.get("thread_strategy")
+            )
+        ):
+            await _check_claude_code_continues(runs_on_locked, pinned_locked)
+
+        if new_cron or new_tz:
+            locked_cron = new_cron or locked_row.get("cron_expression")
+            locked_tz = new_tz or locked_row.get("timezone")
+            if (
+                locked_row.get("trigger_type") == "cron"
+                and locked_row.get("status") == "active"
+                and locked_cron
+            ):
+                effective_kwargs["next_run_at"] = AutomationScheduler.calculate_first_run(
+                    locked_cron, locked_tz
+                )
+            else:
+                effective_kwargs.pop("next_run_at", None)
+
+        if any(k in effective_kwargs for k in ("name", "workspace_id", "metadata")) or (
+            locked_row.get("name") != current.get("name")
+            or locked_stored_in != stored_in
+            or locked_row.get("metadata") != current.get("metadata")
+            or locked_scope != current_scope
+        ):
+            if (
+                locked_row.get("name") != current.get("name")
+                or locked_stored_in != stored_in
+                or locked_row.get("metadata") != current.get("metadata")
+                or locked_scope != current_scope
+            ):
+                from src.dalton.database.company_automations import (
+                    resolve_automation_scope_for_write,
+                )
+
+                saved_name_locked = (
+                    str(effective_kwargs["name"])
+                    if effective_kwargs.get("name") is not None
+                    else str(locked_row.get("name") or "")
+                )
+                saved_ws_locked = (
+                    effective_kwargs["workspace_id"]
+                    if effective_kwargs.get("workspace_id") is not None
+                    else locked_stored_in
+                )
+                saved_meta_locked = (
+                    effective_kwargs["metadata"]
+                    if effective_kwargs.get("metadata") is not None
+                    else locked_row.get("metadata")
+                )
+                resolved_scope_locked = await resolve_automation_scope_for_write(
+                    user_id,
+                    name=saved_name_locked,
+                    workspace_id=saved_ws_locked,
+                    metadata=saved_meta_locked,
+                    conn=locked_conn,
+                )
+                if resolved_scope_locked != locked_scope:
+                    effective_kwargs["scope"] = resolved_scope_locked
+                else:
+                    effective_kwargs.pop("scope", None)
+
+    outer_ctx = get_current_history_context()
+    eff_actor_for_ctx = (
+        outer_ctx.actor_user_id
+        if outer_ctx is not None and outer_ctx.has_explicit_actor
+        else user_id
     )
+    with automation_history_context(
+        actor_user_id=eff_actor_for_ctx,
+        action="update",
+        expected_config_version=resolved_expected_cv,
+        locked_row_reconciler=_reconcile_locked_update,
+    ):
+        result = await auto_db.update_automation(
+            automation_id, user_id, conn=conn, **update_kwargs
+        )
     if result:
         logger.info(
             f"[AUTOMATION] Updated automation {automation_id} "
@@ -639,6 +827,7 @@ async def pause_automation(
     *,
     conn=None,
     current: Dict[str, Any] | None = None,
+    expected_config_version: Any = None,
 ) -> Optional[Dict[str, Any]]:
     """Pause an active automation; ``current`` as ``update_automation``
     takes it.
@@ -648,9 +837,36 @@ async def pause_automation(
     because the scheduler claims only 'active' rows. A cron's is recomputed
     on resume, so it is cleared.
     """
+    # DALTON-HOOK(company-automations): validate expected_config_version and record pause history
+    from src.dalton.services.company_automations import (
+        AutomationVersionConflictError,
+        automation_history_context,
+        get_current_history_context,
+        validate_expected_config_version,
+    )
+
+    if expected_config_version is not None:
+        resolved_expected_cv: Optional[int] = validate_expected_config_version(
+            expected_config_version, provided=True
+        )
+    else:
+        hist_ctx = get_current_history_context()
+        resolved_expected_cv = (
+            hist_ctx.expected_config_version if hist_ctx is not None else None
+        )
+
     current = await _current(automation_id, user_id, conn, current)
     if not current:
         return None
+
+    if (
+        resolved_expected_cv is not None
+        and current.get("config_version") is not None
+        and int(current["config_version"]) != resolved_expected_cv
+    ):
+        raise AutomationVersionConflictError(
+            f"Configuration version conflict: expected {resolved_expected_cv}, current is {current.get('config_version')}"
+        )
 
     if current["status"] != "active":
         raise AutomationRefusal(
@@ -659,12 +875,40 @@ async def pause_automation(
             field="status",
         )
 
+    async def _reconcile_locked_pause(
+        locked_row: Any,
+        effective_kwargs: Dict[str, Any],
+        _locked_conn: Any,
+    ) -> None:
+        if locked_row.get("status") != "active":
+            raise AutomationRefusal(
+                f"Cannot pause automation in '{locked_row.get('status')}' status "
+                f"(must be 'active')",
+                field="status",
+            )
+        if locked_row.get("trigger_type") != "once":
+            effective_kwargs["next_run_at"] = None
+        else:
+            effective_kwargs.pop("next_run_at", None)
+
     update_kwargs: Dict[str, Any] = {"status": "paused"}
     if current["trigger_type"] != "once":
         update_kwargs["next_run_at"] = None
-    return await auto_db.update_automation(
-        automation_id, user_id, conn=conn, **update_kwargs
+    outer_ctx = get_current_history_context()
+    eff_actor_for_ctx = (
+        outer_ctx.actor_user_id
+        if outer_ctx is not None and outer_ctx.has_explicit_actor
+        else user_id
     )
+    with automation_history_context(
+        actor_user_id=eff_actor_for_ctx,
+        action="pause",
+        expected_config_version=resolved_expected_cv,
+        locked_row_reconciler=_reconcile_locked_pause,
+    ):
+        return await auto_db.update_automation(
+            automation_id, user_id, conn=conn, **update_kwargs
+        )
 
 
 async def resume_automation(
@@ -673,12 +917,40 @@ async def resume_automation(
     *,
     conn=None,
     current: Dict[str, Any] | None = None,
+    expected_config_version: Any = None,
 ) -> Optional[Dict[str, Any]]:
     """Resume a paused/disabled automation (recalculates next_run_at, resets
     failures); ``current`` as ``update_automation`` takes it."""
+    # DALTON-HOOK(company-automations): validate expected_config_version and record resume history
+    from src.dalton.services.company_automations import (
+        AutomationVersionConflictError,
+        automation_history_context,
+        get_current_history_context,
+        validate_expected_config_version,
+    )
+
+    if expected_config_version is not None:
+        resolved_expected_cv: Optional[int] = validate_expected_config_version(
+            expected_config_version, provided=True
+        )
+    else:
+        hist_ctx = get_current_history_context()
+        resolved_expected_cv = (
+            hist_ctx.expected_config_version if hist_ctx is not None else None
+        )
+
     current = await _current(automation_id, user_id, conn, current)
     if not current:
         return None
+
+    if (
+        resolved_expected_cv is not None
+        and current.get("config_version") is not None
+        and int(current["config_version"]) != resolved_expected_cv
+    ):
+        raise AutomationVersionConflictError(
+            f"Configuration version conflict: expected {resolved_expected_cv}, current is {current.get('config_version')}"
+        )
 
     if current["status"] not in ("paused", "disabled"):
         raise AutomationRefusal(
@@ -716,9 +988,55 @@ async def resume_automation(
             )
     # A price trigger has no next_run_at: it is only re-activated.
 
-    return await auto_db.update_automation(
-        automation_id, user_id, conn=conn, **update_kwargs
+    async def _reconcile_locked_resume(
+        locked_row: Any,
+        effective_kwargs: Dict[str, Any],
+        _locked_conn: Any,
+    ) -> None:
+        if locked_row.get("status") not in ("paused", "disabled"):
+            raise AutomationRefusal(
+                f"Cannot resume automation in '{locked_row.get('status')}' status "
+                f"(must be 'paused' or 'disabled')",
+                field="status",
+            )
+        if locked_row.get("trigger_type") == "cron" and locked_row.get("cron_expression"):
+            effective_kwargs["next_run_at"] = AutomationScheduler.calculate_first_run(
+                locked_row["cron_expression"],
+                locked_row.get("timezone", "UTC"),
+            )
+        elif locked_row.get("trigger_type") == "once":
+            when_locked = locked_row.get("next_run_at")
+            if when_locked and when_locked > datetime.now(timezone.utc):
+                effective_kwargs["next_run_at"] = when_locked
+            elif locked_row.get("status") == "disabled":
+                effective_kwargs["next_run_at"] = None
+            else:
+                passed_locked = (
+                    f" ({on_clock(when_locked, locked_row.get('timezone'))})"
+                    if when_locked
+                    else ""
+                )
+                raise AutomationRefusal(
+                    f"Cannot resume a one-time automation whose scheduled time has passed{passed_locked}; "
+                    "set next_run_at to a future time first",
+                    field="status",
+                )
+
+    outer_ctx = get_current_history_context()
+    eff_actor_for_ctx = (
+        outer_ctx.actor_user_id
+        if outer_ctx is not None and outer_ctx.has_explicit_actor
+        else user_id
     )
+    with automation_history_context(
+        actor_user_id=eff_actor_for_ctx,
+        action="resume",
+        expected_config_version=resolved_expected_cv,
+        locked_row_reconciler=_reconcile_locked_resume,
+    ):
+        return await auto_db.update_automation(
+            automation_id, user_id, conn=conn, **update_kwargs
+        )
 
 
 async def trigger_automation(

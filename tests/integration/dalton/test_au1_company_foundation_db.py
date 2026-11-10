@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import ExitStack, asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import json
 from pathlib import Path
@@ -17,7 +17,7 @@ from alembic.config import Config
 from alembic.operations import Operations
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
-from fastapi import FastAPI, WebSocket, WebSocketException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketException
 from httpx import ASGITransport, AsyncClient
 import psycopg
 from psycopg import errors as pg_errors
@@ -41,6 +41,7 @@ from src.dalton.company_identity import (
     COMPANY_SYSTEM_USER_ID,
     ensure_company_system_identity,
 )
+from src.dalton.database import company_automations as company_auto_db
 from src.dalton.database.channel_gateway import hash_bind_code
 from src.dalton.migrations.versions import d035_company_automations as d035_mod
 from src.dalton.services import company_automations as company_auto_svc
@@ -124,18 +125,26 @@ async def au1_live_pool(
     test_db_uri: str,
 ):
     """Open a tuple-default AsyncConnectionPool on the test's live loop matching production pool.py."""
+    from ptc_agent.agent.backends import db_json_route as ptc_db_json_route
     from src.dalton import (
         company_identity as company_identity_mod,
         sharing as dalton_sharing_mod,
     )
-    from src.dalton.autonomy import schedule as dalton_schedule_mod
+    from src.dalton.autonomy import (
+        schedule as dalton_schedule_mod,
+        system_jobs as dalton_system_jobs_mod,
+        tracking as dalton_tracking_mod,
+    )
     from src.dalton.database import (
         budget as dalton_budget_db,
         channel_gateway as dalton_channel_gw_db,
         company_automations as company_auto_db,
+        coverage as dalton_coverage_db,
+        coverage_units as dalton_coverage_units_db,
         members as dalton_members_db,
     )
     from src.dalton.notify import dispatch as dalton_notify_mod
+    from src.ptc_agent.agent.backends import db_json_route as src_db_json_route
     from src.server.database import (
         automation as server_auto_db,
         automation_executions as server_exec_db,
@@ -175,12 +184,18 @@ async def au1_live_pool(
 
     db_call_sites = (
         pool_mod,
+        ptc_db_json_route,
+        src_db_json_route,
         company_identity_mod,
         dalton_sharing_mod,
         dalton_schedule_mod,
+        dalton_system_jobs_mod,
+        dalton_tracking_mod,
         dalton_budget_db,
         dalton_channel_gw_db,
         company_auto_db,
+        dalton_coverage_db,
+        dalton_coverage_units_db,
         dalton_members_db,
         dalton_notify_mod,
         server_auto_db,
@@ -2532,3 +2547,1055 @@ async def test_sql_python_create_update_scope_parity_and_null_ws_pm_upsert_real_
 
 async def _coro(val: Any) -> Any:
     return val
+
+
+# ---------------------------------------------------------------------------
+# 6. AU1 Batch A: Config History, Seed v1+v2, Expected Config Version & Concurrency
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_au1_batch_a_create_seed_expected_version_and_concurrency_real_db(
+    au1_live_pool: AsyncConnectionPool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    uid = "u-hist-batch-a"
+    actor2 = "u-hist-actor-2"
+    ws_id = str(uuid.uuid4())
+    legacy_patch_id = str(uuid.uuid4())
+    legacy_pause_id = str(uuid.uuid4())
+    legacy_resume_id = str(uuid.uuid4())
+    corrupt_empty_id = str(uuid.uuid4())
+    corrupt_missing_id = str(uuid.uuid4())
+
+    async with au1_live_pool.connection() as conn:
+        await _insert_user(conn, uid, "hist-a@dalton.test")
+        await _insert_user(conn, actor2, "hist-actor2@dalton.test")
+        await _insert_workspace(conn, ws_id, uid, "Hist-WS")
+        # Seed user_preferences.model_preference with legacy notify routes so snapshot resolution is verified against real DB
+        await conn.execute(
+            """
+            INSERT INTO user_preferences (user_id, model_preference)
+            VALUES (%s, %s::jsonb)
+            ON CONFLICT (user_id) DO UPDATE SET model_preference = EXCLUDED.model_preference
+            """,
+            (
+                uid,
+                json.dumps(
+                    {
+                        "dalton_notify_enabled": True,
+                        "dalton_notify_targets": ["feishu:user:ou_hist_user_1"],
+                        "dalton_notify_overrides": {
+                            f"automation:{legacy_patch_id}": True,
+                        },
+                        "dalton_notify_routes": {
+                            "default": ["feishu:user:ou_hist_user_1"],
+                            f"automation:{legacy_patch_id}": ["feishu:user:ou_hist_user_1"],
+                        },
+                    }
+                ),
+            ),
+        )
+        # Seed 3 legacy empty-history rows (config_version=1, active_version=1, audit_history=[])
+        # and 2 corrupt-history rows
+        await conn.execute(
+            """
+            INSERT INTO automations (
+                automation_id, user_id, name, file_name, description, trigger_type,
+                cron_expression, timezone, instruction, workspace_id,
+                status, scope, config_version, active_version, audit_history, metadata
+            )
+            VALUES
+                (%s::uuid, %s, 'Legacy Patch Task', 'leg-patch.json', 'Old desc', 'cron',
+                 '0 8 * * 1-5', 'Asia/Shanghai', 'Old instruction', %s::uuid,
+                 'active', 'personal', 1, 1, '[]'::jsonb, '{"k": 1}'::jsonb),
+                (%s::uuid, %s, 'Legacy Pause Task', 'leg-pause.json', 'Pause desc', 'cron',
+                 '0 9 * * 1-5', 'Asia/Shanghai', 'Pause instruction', %s::uuid,
+                 'active', 'personal', 1, 1, '[]'::jsonb, '{}'::jsonb),
+                (%s::uuid, %s, 'Legacy Resume Task', 'leg-resume.json', 'Resume desc', 'cron',
+                 '0 10 * * 1-5', 'Asia/Shanghai', 'Resume instruction', %s::uuid,
+                 'paused', 'personal', 1, 1, '[]'::jsonb, '{}'::jsonb),
+                (%s::uuid, %s, 'Corrupt Empty History', 'corrupt-empty.json', 'Corrupt', 'cron',
+                 '0 11 * * 1-5', 'Asia/Shanghai', 'Corrupt inst', %s::uuid,
+                 'active', 'personal', 3, 3, '[]'::jsonb, '{}'::jsonb),
+                (%s::uuid, %s, 'Corrupt Missing Active', 'corrupt-miss.json', 'Corrupt2', 'cron',
+                 '0 12 * * 1-5', 'Asia/Shanghai', 'Corrupt inst2', %s::uuid,
+                 'active', 'personal', 2, 2, '[{"version": 1, "snapshot": {"name": "v1"}}]'::jsonb, '{}'::jsonb)
+            """,
+            (
+                legacy_patch_id,
+                uid,
+                ws_id,
+                legacy_pause_id,
+                uid,
+                ws_id,
+                legacy_resume_id,
+                uid,
+                ws_id,
+                corrupt_empty_id,
+                uid,
+                ws_id,
+                corrupt_missing_id,
+                uid,
+                ws_id,
+            ),
+        )
+
+    app = FastAPI()
+    app.include_router(automations_app.router)
+    app.dependency_overrides[principal_mod.get_principal] = lambda: principal_mod.Principal(
+        user_id=uid, auth="session"
+    )
+    app.dependency_overrides[api_utils.get_current_user_id] = lambda: uid
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        # 1. Create new automation via POST /api/v1/automations -> v1 history created immediately
+        r_create = await client.post(
+            "/api/v1/automations",
+            json={
+                "name": "Fresh Personal Task",
+                "description": "Created via API",
+                "trigger_type": "cron",
+                "cron_expression": "30 8 * * 1-5",
+                "timezone": "Asia/Shanghai",
+                "instruction": "Summarize morning news",
+                "workspace_id": ws_id,
+                "metadata": {"tag": "morning"},
+            },
+        )
+        assert r_create.status_code == 201, r_create.text
+        created_body = r_create.json()
+        new_id = created_body["automation_id"]
+        assert created_body["config_version"] == 1
+        assert created_body["active_version"] == 1
+        assert created_body["created_by"] == uid
+        assert created_body["updated_by"] == uid
+
+        r_hist1 = await client.get(f"/api/v1/automations/{new_id}/history")
+        assert r_hist1.status_code == 200, r_hist1.text
+        hist1 = r_hist1.json()
+        assert hist1["config_version"] == 1
+        assert hist1["active_version"] == 1
+        assert hist1["total"] == 1
+        [v1_item] = hist1["entries"]
+        assert v1_item["version"] == 1
+        assert v1_item["action"] == "create"
+        assert v1_item["actor_user_id"] == uid
+        assert v1_item["prev_version"] is None
+        assert v1_item["changes"] == {}
+        assert set(v1_item["snapshot"].keys()) == set(
+            company_auto_svc.ALLOWED_AUTOMATION_SNAPSHOT_FIELDS
+        )
+        assert "metadata" not in v1_item["snapshot"]
+        assert v1_item["snapshot"]["name"] == "Fresh Personal Task"
+        assert v1_item["snapshot"]["desired_status"] == "active"
+        assert v1_item["snapshot"]["notify_enabled"] is False
+        assert v1_item["snapshot"]["notify_routes"] == []
+
+        # 2. First modification on legacy empty-history task via PATCH -> seeds v1 + writes v2 atomically
+        r_patch_leg = await client.patch(
+            f"/api/v1/automations/{legacy_patch_id}",
+            json={"instruction": "New instruction v2", "description": "New desc v2"},
+        )
+        assert r_patch_leg.status_code == 200, r_patch_leg.text
+        patched_leg = r_patch_leg.json()
+        assert patched_leg["config_version"] == 2
+        assert patched_leg["active_version"] == 2
+        assert patched_leg["updated_by"] == uid
+
+        r_leg_hist = await client.get(f"/api/v1/automations/{legacy_patch_id}/history")
+        assert r_leg_hist.status_code == 200
+        leg_items = r_leg_hist.json()["entries"]
+        assert [it["version"] for it in leg_items] == [2, 1]
+        v2_entry, v1_seed = leg_items[0], leg_items[1]
+        assert v1_seed["action"] == "seed"
+        assert v1_seed["prev_version"] is None
+        assert v1_seed["changes"] == {}
+        assert v1_seed["snapshot"]["instruction"] == "Old instruction"
+        assert v1_seed["snapshot"]["description"] == "Old desc"
+        assert v1_seed["snapshot"]["notify_enabled"] is True
+        assert v1_seed["snapshot"]["notify_routes"] == ["feishu:user:ou_hist_user_1"]
+
+        assert v2_entry["action"] == "update"
+        assert v2_entry["prev_version"] == 1
+        assert v2_entry["actor_user_id"] == uid
+        assert v2_entry["changes"] == {
+            "instruction": {"old": "Old instruction", "new": "New instruction v2"},
+            "description": {"old": "Old desc", "new": "New desc v2"},
+        }
+        assert v2_entry["snapshot"]["instruction"] == "New instruction v2"
+
+        # 2b. Legacy callers without expected_config_version updating different fields do not overwrite each other
+        r_leg_f1, r_leg_f2 = await asyncio.gather(
+            client.patch(
+                f"/api/v1/automations/{legacy_patch_id}",
+                json={"description": "Desc updated without expected_config_version"},
+            ),
+            client.patch(
+                f"/api/v1/automations/{legacy_patch_id}",
+                json={"instruction": "Instruction updated without expected_config_version"},
+            ),
+        )
+        assert r_leg_f1.status_code == 200, r_leg_f1.text
+        assert r_leg_f2.status_code == 200, r_leg_f2.text
+        leg_after_both = (await client.get(f"/api/v1/automations/{legacy_patch_id}")).json()
+        assert leg_after_both["config_version"] == 4
+        assert leg_after_both["description"] == "Desc updated without expected_config_version"
+        assert leg_after_both["instruction"] == "Instruction updated without expected_config_version"
+
+        # 2c. Deterministic concurrent schedule edits without expected_config_version:
+        #     Both read v1 (cron='0 9 * * *', timezone='UTC'); cron edit commits first, timezone second;
+        #     persisted next_run_at MUST be derived from the locked row ('0 10 * * *' in 'Asia/Shanghai').
+        from src.server.services.automation_scheduler import AutomationScheduler
+
+        r_sched_create = await client.post(
+            "/api/v1/automations",
+            json={
+                "name": "Concurrent Schedule Task",
+                "trigger_type": "cron",
+                "cron_expression": "0 9 * * *",
+                "timezone": "UTC",
+                "instruction": "Run daily schedule test",
+                "workspace_id": ws_id,
+            },
+        )
+        assert r_sched_create.status_code == 201, r_sched_create.text
+        sched_conc_id = r_sched_create.json()["automation_id"]
+
+        orig_current_fn = lifecycle_mod._current
+        both_read_evt = asyncio.Event()
+        cron_read_evt = asyncio.Event()
+        first_committed_evt = asyncio.Event()
+        read_snapshots: list[tuple[int, str, str]] = []
+
+        async def _coordinated_current(
+            a_id: str, u_id: str, c_conn: Any, cur_row: dict[str, Any] | None
+        ) -> dict[str, Any] | None:
+            row = await orig_current_fn(a_id, u_id, c_conn, cur_row)
+            if a_id == sched_conc_id and row is not None:
+                idx = len(read_snapshots)
+                read_snapshots.append(
+                    (
+                        int(row.get("config_version") or 1),
+                        str(row.get("cron_expression") or ""),
+                        str(row.get("timezone") or ""),
+                    )
+                )
+                if idx == 0:
+                    cron_read_evt.set()
+                if len(read_snapshots) >= 2:
+                    both_read_evt.set()
+                await both_read_evt.wait()
+                if idx == 1:
+                    await first_committed_evt.wait()
+            return row
+
+        monkeypatch.setattr(lifecycle_mod, "_current", _coordinated_current)
+
+        async def _patch_cron_first() -> Any:
+            try:
+                return await client.patch(
+                    f"/api/v1/automations/{sched_conc_id}",
+                    json={"cron_expression": "0 10 * * *"},
+                )
+            finally:
+                first_committed_evt.set()
+
+        async def _patch_tz_second() -> Any:
+            await asyncio.wait_for(cron_read_evt.wait(), timeout=10)
+            return await client.patch(
+                f"/api/v1/automations/{sched_conc_id}",
+                json={"timezone": "Asia/Shanghai"},
+            )
+
+        r_cron_conc, r_tz_conc = await asyncio.wait_for(
+            asyncio.gather(_patch_cron_first(), _patch_tz_second()),
+            timeout=30,
+        )
+        monkeypatch.setattr(lifecycle_mod, "_current", orig_current_fn)
+        assert r_cron_conc.status_code == 200, r_cron_conc.text
+        assert r_tz_conc.status_code == 200, r_tz_conc.text
+        assert read_snapshots == [
+            (1, "0 9 * * *", "UTC"),
+            (1, "0 9 * * *", "UTC"),
+        ]
+        sched_final_row = await auto_db.get_automation(sched_conc_id, uid)
+        sched_final_hist = await company_auto_db.get_automation_history_row(sched_conc_id)
+        assert sched_final_row is not None and sched_final_hist is not None
+        assert sched_final_row["config_version"] == 3
+        assert sched_final_row["cron_expression"] == "0 10 * * *"
+        assert sched_final_row["timezone"] == "Asia/Shanghai"
+        expected_final_next = AutomationScheduler.calculate_first_run(
+            "0 10 * * *", "Asia/Shanghai"
+        )
+        assert sched_final_row["next_run_at"] == expected_final_next
+        assert len(sched_final_hist["audit_history"]) == 3
+
+        # Also verify seed + v2 on first POST /pause and first POST /resume
+        r_pause_leg = await client.post(f"/api/v1/automations/{legacy_pause_id}/pause")
+        assert r_pause_leg.status_code == 200, r_pause_leg.text
+        assert r_pause_leg.json()["config_version"] == 2
+        pause_hist = (await client.get(f"/api/v1/automations/{legacy_pause_id}/history")).json()["entries"]
+        assert [it["action"] for it in pause_hist] == ["pause", "seed"]
+        assert pause_hist[0]["changes"] == {
+            "desired_status": {"old": "active", "new": "paused"}
+        }
+
+        r_resume_leg = await client.post(f"/api/v1/automations/{legacy_resume_id}/resume")
+        assert r_resume_leg.status_code == 200, r_resume_leg.text
+        assert r_resume_leg.json()["config_version"] == 2
+        resume_hist = (await client.get(f"/api/v1/automations/{legacy_resume_id}/history")).json()["entries"]
+        assert [it["action"] for it in resume_hist] == ["resume", "seed"]
+        assert resume_hist[0]["changes"] == {
+            "desired_status": {"old": "paused", "new": "active"}
+        }
+
+        # 3. expected_config_version: matching -> 200, mismatched -> 409, invalid -> 400 across PATCH/pause/resume
+        r_match_patch = await client.patch(
+            f"/api/v1/automations/{new_id}",
+            json={"description": "v2 matched", "expected_config_version": 1},
+        )
+        assert r_match_patch.status_code == 200
+        assert r_match_patch.json()["config_version"] == 2
+
+        r_conflict_patch = await client.patch(
+            f"/api/v1/automations/{new_id}",
+            json={"description": "stale write", "expected_config_version": 1},
+        )
+        assert r_conflict_patch.status_code == 409
+
+        r_conflict_pause = await client.post(
+            f"/api/v1/automations/{new_id}/pause",
+            json={"expected_config_version": 1},
+        )
+        assert r_conflict_pause.status_code == 409
+
+        r_match_pause = await client.post(
+            f"/api/v1/automations/{new_id}/pause",
+            json={"expected_config_version": 2},
+        )
+        assert r_match_pause.status_code == 200
+        assert r_match_pause.json()["config_version"] == 3
+
+        r_conflict_resume = await client.post(
+            f"/api/v1/automations/{new_id}/resume",
+            json={"expected_config_version": 2},
+        )
+        assert r_conflict_resume.status_code == 409
+
+        r_match_resume = await client.post(
+            f"/api/v1/automations/{new_id}/resume",
+            json={"expected_config_version": 3},
+        )
+        assert r_match_resume.status_code == 200
+        assert r_match_resume.json()["config_version"] == 4
+
+        # Invalid expected_config_version values -> 400 on PATCH, pause, resume; DB version stays 4
+        for invalid_ver in (0, -1, "4", True, False, 1.5, None):
+            assert (
+                await client.patch(
+                    f"/api/v1/automations/{new_id}",
+                    json={"description": "bad ver", "expected_config_version": invalid_ver},
+                )
+            ).status_code == 400
+            assert (
+                await client.post(
+                    f"/api/v1/automations/{new_id}/pause",
+                    json={"expected_config_version": invalid_ver},
+                )
+            ).status_code == 400
+            assert (
+                await client.post(
+                    f"/api/v1/automations/{new_id}/resume",
+                    json={"expected_config_version": invalid_ver},
+                )
+            ).status_code == 400
+
+        # 4. Concurrent updates carrying the same expected_config_version=4:
+        #    SELECT ... FOR UPDATE serializes them so exactly one succeeds (v5) and one fails (409)!
+        res_a, res_b = await asyncio.gather(
+            client.patch(
+                f"/api/v1/automations/{new_id}",
+                json={"description": "Concurrent A", "expected_config_version": 4},
+            ),
+            client.patch(
+                f"/api/v1/automations/{new_id}",
+                json={"description": "Concurrent B", "expected_config_version": 4},
+            ),
+        )
+        statuses = sorted([res_a.status_code, res_b.status_code])
+        assert statuses == [200, 409], (res_a.text, res_b.text)
+
+        after_conc = (await client.get(f"/api/v1/automations/{new_id}/history")).json()
+        assert after_conc["config_version"] == 5
+        assert after_conc["active_version"] == 5
+        assert after_conc["total"] == 5
+
+        # 4b. If history preparation raises an exception, transaction rolls back and row stays at v5
+        orig_prep = company_auto_db.prepare_update_history_columns
+
+        async def _boom_prep(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("Simulated history snapshot failure")
+
+        monkeypatch.setattr(company_auto_db, "prepare_update_history_columns", _boom_prep)
+        failed_update = await client.patch(
+            f"/api/v1/automations/{new_id}",
+            json={"description": "Should rollback on history failure"},
+        )
+        assert failed_update.status_code == 500, failed_update.text
+        monkeypatch.setattr(company_auto_db, "prepare_update_history_columns", orig_prep)
+        after_boom = (await client.get(f"/api/v1/automations/{new_id}/history")).json()
+        assert after_boom["config_version"] == 5
+        assert after_boom["total"] == 5
+
+        # 5. Corrupt history rows refuse PATCH, pause, resume with 409 without overwriting DB state
+        for cid, exp_ver in ((corrupt_empty_id, 3), (corrupt_missing_id, 2)):
+            assert (
+                await client.patch(
+                    f"/api/v1/automations/{cid}",
+                    json={"description": "should fail"},
+                )
+            ).status_code == 409
+            assert (await client.post(f"/api/v1/automations/{cid}/pause")).status_code == 409
+            assert (await client.post(f"/api/v1/automations/{cid}/resume")).status_code == 409
+
+            async with au1_live_pool.connection() as conn:
+                async with conn.cursor(row_factory=dict_row) as cur:
+                    await cur.execute(
+                        "SELECT config_version, description FROM automations WHERE automation_id = %s::uuid",
+                        (cid,),
+                    )
+                    unchanged_row = await cur.fetchone()
+                    assert unchanged_row["config_version"] == exp_ver
+                    assert unchanged_row["description"] != "should fail"
+
+
+@pytest.mark.asyncio
+async def test_au1_batch_a_once_schedule_preservation_and_automation_file_coalescing_real_db(
+    au1_live_pool: AsyncConnectionPool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import MagicMock
+
+    from ptc_agent.agent.backends.automations import AutomationsBackend
+    from ptc_agent.agent.backends.db_json_route import UserDataValidationError
+    from ptc_agent.core.sandbox.livefs_mount import CallContext
+    from src.server.services.automations import file as file_mod
+
+    uid = "u-hist-once-file"
+    ws_id = str(uuid.uuid4())
+    thread_id = str(uuid.uuid4())
+    due_once_dt = datetime(2026, 5, 1, 14, 30, tzinfo=UTC)
+    future_once_dt = datetime(2030, 6, 15, 10, 0, tzinfo=UTC)
+    legacy_claimed_dt = datetime(2026, 4, 10, 9, 0, tzinfo=UTC)
+    legacy_sched_dt = datetime(2026, 4, 10, 8, 59, 58, tzinfo=UTC)
+    legacy_once_single_id = str(uuid.uuid4())
+    legacy_once_ambig_id = str(uuid.uuid4())
+
+    async def _hist_row(automation_id: str) -> dict[str, Any]:
+        row = await company_auto_db.get_automation_history_row(automation_id)
+        assert row is not None
+        return row
+
+    async with au1_live_pool.connection() as conn:
+        await _insert_user(conn, uid, "once-file@dalton.test")
+        await _insert_workspace(conn, ws_id, uid, "Once-File-WS")
+
+        # Seed two legacy pre-upgrade once tasks already claimed before d035 (next_run_at IS NULL, audit_history=[])
+        await conn.execute(
+            """
+            INSERT INTO automations (
+                automation_id, user_id, name, file_name, description, trigger_type,
+                timezone, next_run_at, last_run_at, instruction, workspace_id,
+                status, scope, config_version, active_version, audit_history, metadata
+            )
+            VALUES
+                (%s::uuid, %s, 'Legacy Claimed Once Single', 'leg-once-1.json', 'Before edit', 'once',
+                 'Asia/Shanghai', NULL, %s, 'Run once', %s::uuid,
+                 'completed', 'personal', 1, 1, '[]'::jsonb, '{}'::jsonb),
+                (%s::uuid, %s, 'Legacy Claimed Once Ambiguous', 'leg-once-2.json', 'Before edit', 'once',
+                 'Asia/Shanghai', NULL, %s, 'Run once ambig', %s::uuid,
+                 'completed', 'personal', 1, 1, '[]'::jsonb, '{}'::jsonb)
+            """,
+            (
+                legacy_once_single_id,
+                uid,
+                legacy_claimed_dt,
+                ws_id,
+                legacy_once_ambig_id,
+                uid,
+                legacy_claimed_dt,
+                ws_id,
+            ),
+        )
+        # 1 matching execution row for legacy_once_single_id; 2 matching execution rows for legacy_once_ambig_id
+        await conn.execute(
+            """
+            INSERT INTO automation_executions (
+                automation_execution_id, automation_id, status, scheduled_at, started_at, created_at
+            )
+            VALUES
+                (%s::uuid, %s::uuid, 'completed', %s, %s, %s),
+                (%s::uuid, %s::uuid, 'completed', %s, %s, %s),
+                (%s::uuid, %s::uuid, 'completed', %s, %s, %s)
+            """,
+            (
+                str(uuid.uuid4()),
+                legacy_once_single_id,
+                legacy_sched_dt,
+                legacy_claimed_dt,
+                legacy_claimed_dt,
+                str(uuid.uuid4()),
+                legacy_once_ambig_id,
+                legacy_sched_dt,
+                legacy_claimed_dt,
+                legacy_claimed_dt,
+                str(uuid.uuid4()),
+                legacy_once_ambig_id,
+                datetime(2026, 4, 10, 8, 59, 59, tzinfo=UTC),
+                legacy_claimed_dt,
+                legacy_claimed_dt,
+            ),
+        )
+
+    # 1. Create a new once automation and claim it via claim_due_automations
+    once_created = await auto_db.create_automation(
+        user_id=uid,
+        name="New Due Once Task",
+        trigger_type="once",
+        next_run_at=due_once_dt,
+        instruction="Execute one-time analysis",
+        workspace_id=ws_id,
+        timezone="Asia/Shanghai",
+    )
+    once_id = str(once_created["automation_id"])
+    assert once_created["config_version"] == 1
+    assert once_created["active_version"] == 1
+    assert once_created["metadata"]["once_schedule_at"] == due_once_dt.isoformat()
+    once_hist_1 = await _hist_row(once_id)
+    assert once_hist_1["audit_history"][0]["snapshot"]["once_run_at"] == due_once_dt.isoformat()
+
+    claimed_rows = await auto_db.claim_due_automations(
+        now=due_once_dt + timedelta(seconds=1),
+        server_id="test-server",
+        limit=10,
+    )
+    claimed_target = next(r for r in claimed_rows if str(r["automation_id"]) == once_id)
+    assert claimed_target["_execution_id"]
+    assert claimed_target["status"] == "active"
+    assert claimed_target["next_run_at"] == due_once_dt
+    assert claimed_target["metadata"]["once_schedule_at"] == due_once_dt.isoformat()
+    # Claiming MUST NOT increment config_version or append history!
+    assert claimed_target["config_version"] == 1
+    assert claimed_target["active_version"] == 1
+
+    persisted_after_claim = await auto_db.get_automation(once_id, uid)
+    assert persisted_after_claim is not None
+    assert persisted_after_claim["status"] == "active"
+    assert persisted_after_claim["next_run_at"] is None
+    assert persisted_after_claim["last_run_at"] is not None
+    assert persisted_after_claim["metadata"]["once_schedule_at"] == due_once_dt.isoformat()
+    assert persisted_after_claim["config_version"] == 1
+    assert persisted_after_claim["active_version"] == 1
+    once_hist_claimed = await _hist_row(once_id)
+    assert len(once_hist_claimed["audit_history"]) == 1
+
+    async with au1_live_pool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                """
+                SELECT status, scheduled_at, server_id
+                FROM automation_executions
+                WHERE automation_execution_id = %s::uuid
+                """,
+                (claimed_target["_execution_id"],),
+            )
+            claimed_exec = await cur.fetchone()
+            assert claimed_exec is not None
+            assert claimed_exec["status"] == "pending"
+            assert claimed_exec["scheduled_at"] == due_once_dt
+            assert claimed_exec["server_id"] == "test-server"
+
+    # 2. Non-schedule edit after claim keeps next_run_at IS NULL in DB while snapshot once_run_at is preserved!
+    updated_once = await lifecycle_mod.update_automation(
+        once_id,
+        uid,
+        {"description": "Edited after claim"},
+    )
+    assert updated_once is not None
+    assert updated_once["next_run_at"] is None
+    assert updated_once["config_version"] == 2
+    once_hist_2 = await _hist_row(once_id)
+    assert len(once_hist_2["audit_history"]) == 2
+    v2_once = once_hist_2["audit_history"][-1]
+    assert v2_once["action"] == "update"
+    assert v2_once["changes"] == {"description": {"old": None, "new": "Edited after claim"}}
+    assert v2_once["snapshot"]["once_run_at"] == due_once_dt.isoformat()
+
+    # 3. Legacy empty-history once task claimed before d035:
+    #    - 1 matching execution row -> seed v1 and v2 recover scheduled_at!
+    #    - 2 matching execution rows -> refuses to guess -> once_run_at is None!
+    upd_leg_single = await lifecycle_mod.update_automation(
+        legacy_once_single_id,
+        uid,
+        {"description": "After edit single"},
+    )
+    assert upd_leg_single is not None
+    assert upd_leg_single["config_version"] == 2
+    leg_single_hist = await _hist_row(legacy_once_single_id)
+    assert [e["action"] for e in leg_single_hist["audit_history"]] == ["seed", "update"]
+    assert leg_single_hist["audit_history"][0]["snapshot"]["once_run_at"] == legacy_sched_dt.isoformat()
+    assert leg_single_hist["audit_history"][1]["snapshot"]["once_run_at"] == legacy_sched_dt.isoformat()
+
+    upd_leg_ambig = await lifecycle_mod.update_automation(
+        legacy_once_ambig_id,
+        uid,
+        {"description": "After edit ambig"},
+    )
+    assert upd_leg_ambig is not None
+    assert upd_leg_ambig["config_version"] == 2
+    leg_ambig_hist = await _hist_row(legacy_once_ambig_id)
+    assert leg_ambig_hist["audit_history"][0]["snapshot"]["once_run_at"] is None
+    assert leg_ambig_hist["audit_history"][1]["snapshot"]["once_run_at"] is None
+
+    # 4. AutomationFile create with status="paused" -> single v1 entry (desired_status="paused", config_version=1)
+    root_prefix = "/home/workspace/.agents/user/automations"
+    backend = AutomationsBackend(
+        user_id=uid,
+        call=CallContext(workspace_id=ws_id, thread_id=thread_id, timezone="Asia/Shanghai"),
+        sandbox_backend=MagicMock(),
+        root_prefix=root_prefix,
+    )
+
+    async def _livefs_save(file_name: str, doc: dict[str, Any]) -> dict[str, Any]:
+        path = f"{root_prefix}/{file_name}"
+        await backend.aread_range(path, 0, 2000)
+        return await backend.awrite_text(path, json.dumps(doc))
+
+    res_file_create = await _livefs_save(
+        "file-created-paused.json",
+        {
+            "name": "File Created Paused",
+            "description": "Created paused from livefs",
+            "trigger_type": "cron",
+            "cron_expression": "0 9 * * 1-5",
+            "timezone": "Asia/Shanghai",
+            "status": "paused",
+            "instruction": "Do paused check",
+        },
+    )
+    assert "created" in res_file_create["message"].lower()
+    async with au1_live_pool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT * FROM automations WHERE user_id = %s AND file_name = 'file-created-paused.json'",
+                (uid,),
+            )
+            file_paused_row = await cur.fetchone()
+            assert file_paused_row is not None
+            assert file_paused_row["status"] == "paused"
+            assert file_paused_row["config_version"] == 1
+            assert file_paused_row["active_version"] == 1
+            assert len(file_paused_row["audit_history"]) == 1
+            assert file_paused_row["audit_history"][0]["action"] == "create"
+            assert file_paused_row["audit_history"][0]["snapshot"]["desired_status"] == "paused"
+
+    # 4b. AutomationFile create with status="paused" rolls back create_automation if pause_automation fails
+    orig_pause = lifecycle_mod.pause_automation
+
+    async def _boom_pause(*args: Any, **kwargs: Any) -> Any:
+        raise HTTPException(status_code=409, detail="Simulated pause failure")
+
+    monkeypatch.setattr(file_mod.lifecycle, "pause_automation", _boom_pause)
+    with pytest.raises(UserDataValidationError):
+        await _livefs_save(
+            "file-rollback-create.json",
+            {
+                "name": "Should Rollback Create",
+                "trigger_type": "cron",
+                "cron_expression": "0 9 * * 1-5",
+                "timezone": "Asia/Shanghai",
+                "status": "paused",
+                "instruction": "Never persisted",
+            },
+        )
+    monkeypatch.setattr(file_mod.lifecycle, "pause_automation", orig_pause)
+
+    async with au1_live_pool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT COUNT(*) AS cnt FROM automations WHERE user_id = %s AND file_name = 'file-rollback-create.json'",
+                (uid,),
+            )
+            assert (await cur.fetchone())["cnt"] == 0
+
+    # 5. AutomationFile simultaneous field edit + status change -> single version bump (v1 -> v2)
+    res_file_upd = await _livefs_save(
+        "file-created-paused.json",
+        {
+            "name": "File Created Paused",
+            "description": "Updated desc + resumed in one save",
+            "trigger_type": "cron",
+            "cron_expression": "0 9 * * 1-5",
+            "timezone": "Asia/Shanghai",
+            "status": "active",
+            "instruction": "Do resumed check",
+        },
+    )
+    assert "updated" in res_file_upd["message"].lower() or "resumed" in res_file_upd["message"].lower()
+    async with au1_live_pool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT * FROM automations WHERE automation_id = %s::uuid",
+                (str(file_paused_row["automation_id"]),),
+            )
+            coalesced_row = await cur.fetchone()
+            assert coalesced_row["status"] == "active"
+            assert coalesced_row["config_version"] == 2
+            assert coalesced_row["active_version"] == 2
+            assert len(coalesced_row["audit_history"]) == 2
+            v2_coal = coalesced_row["audit_history"][1]
+            assert v2_coal["version"] == 2
+            assert v2_coal["prev_version"] == 1
+            assert v2_coal["changes"] == {
+                "description": {
+                    "old": "Created paused from livefs",
+                    "new": "Updated desc + resumed in one save",
+                },
+                "instruction": {
+                    "old": "Do paused check",
+                    "new": "Do resumed check",
+                },
+                "desired_status": {
+                    "old": "paused",
+                    "new": "active",
+                },
+            }
+
+    # 6. AutomationFile simultaneous field edit + Step 2 failure in commit():
+    #    Step 2 raises 409, and outer transaction rolls back Step 1's field edit + history completely!
+    paused_future_once = await auto_db.create_automation(
+        user_id=uid,
+        name="Paused Future Once",
+        file_name="paused-future-once.json",
+        description="Original description",
+        trigger_type="once",
+        next_run_at=future_once_dt,
+        instruction="Original instruction",
+        workspace_id=ws_id,
+        timezone="Asia/Shanghai",
+        status="paused",
+    )
+    future_once_id = str(paused_future_once["automation_id"])
+    assert paused_future_once["config_version"] == 1
+
+    orig_resume = lifecycle_mod.resume_automation
+
+    async def _boom_resume(*args: Any, **kwargs: Any) -> Any:
+        raise HTTPException(status_code=409, detail="Simulated resume failure after field update")
+
+    monkeypatch.setattr(file_mod.lifecycle, "resume_automation", _boom_resume)
+    with pytest.raises(UserDataValidationError) as exc_info:
+        await _livefs_save(
+            "paused-future-once.json",
+            {
+                "name": "Paused Future Once",
+                "description": "Mutated description that MUST rollback",
+                "trigger_type": "once",
+                "next_run_at": "2030-06-15T18:00:00+08:00",
+                "timezone": "Asia/Shanghai",
+                "status": "active",
+                "instruction": "Mutated instruction that MUST rollback",
+            },
+        )
+    assert "Simulated resume failure" in str(exc_info.value)
+    monkeypatch.setattr(file_mod.lifecycle, "resume_automation", orig_resume)
+
+    async with au1_live_pool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT * FROM automations WHERE automation_id = %s::uuid",
+                (future_once_id,),
+            )
+            after_rb = await cur.fetchone()
+            assert after_rb["status"] == "paused"
+            assert after_rb["description"] == "Original description"
+            assert after_rb["instruction"] == "Original instruction"
+            assert after_rb["config_version"] == 1
+            assert after_rb["active_version"] == 1
+            assert len(after_rb["audit_history"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_au1_batch_a_dalton_schedule_system_jobs_tracking_and_runtime_isolation_real_db(
+    au1_live_pool: AsyncConnectionPool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.dalton.autonomy import (
+        system_jobs as sys_jobs_mod,
+        tracking as tracking_mod,
+    )
+    from src.server.services.automation_scheduler import AutomationScheduler
+
+    uid = "u-hist-dalton-paths"
+    pm_actor = "u-hist-pm-actor"
+    ws_nvda = str(uuid.uuid4())
+    ws_sector_old = str(uuid.uuid4())
+    ws_sector_new = str(uuid.uuid4())
+    sector_unit_id = str(uuid.uuid4())
+    home_id = get_home_workspace_id(uid)
+
+    async def _hist_row(automation_id: str) -> dict[str, Any]:
+        row = await company_auto_db.get_automation_history_row(automation_id)
+        assert row is not None
+        return row
+
+    async with au1_live_pool.connection() as conn:
+        await _insert_user(conn, uid, "dalton-paths@dalton.test")
+        await _insert_user(conn, pm_actor, "pm-actor@dalton.test")
+        await _insert_workspace(conn, home_id, uid, "Home")
+        await _insert_workspace(conn, ws_nvda, uid, "NVDA")
+        await _insert_workspace(conn, ws_sector_old, uid, "Old Sector WS")
+        await _insert_workspace(conn, ws_sector_new, uid, "New Sector WS")
+        await conn.execute(
+            """
+            INSERT INTO dalton_coverage (user_id, ticker, name, tier)
+            VALUES (%s, 'NVDA', 'NVIDIA', 'core')
+            """,
+            (uid,),
+        )
+        await conn.execute(
+            """
+            INSERT INTO dalton_coverage_units (
+                unit_id, kind, owner_user_id, slug, display_name, workspace_id, ticker, status
+            )
+            VALUES (%s::uuid, 'sector', %s, 'semi', 'Semiconductors', %s::uuid, NULL, 'active')
+            """,
+            (sector_unit_id, uid, ws_sector_new),
+        )
+
+    # 1. schedule_dalton_automation_helper: create -> idempotent repeat -> update -> pause -> resume
+    c_res = await schedule_dalton_automation_helper(
+        name="dalton-nvda-custom-scan",
+        workspace_id=ws_nvda,
+        spec={
+            "description": "Custom scan v1",
+            "instruction": "Scan NVDA supply chain v1",
+            "cron": "0 9 * * 1-5",
+            "timezone": "America/New_York",
+        },
+        user_id=uid,
+        role="chief_of_staff",
+    )
+    assert c_res["ok"] is True
+    assert c_res["action"] == "created"
+    custom_id = c_res["automation_id"]
+
+    # Repeat identical upsert -> skip_if_unchanged=True keeps config_version=1!
+    c_repeat = await schedule_dalton_automation_helper(
+        name="dalton-nvda-custom-scan",
+        workspace_id=ws_nvda,
+        spec={
+            "description": "Custom scan v1",
+            "instruction": "Scan NVDA supply chain v1",
+            "cron": "0 9 * * 1-5",
+            "timezone": "America/New_York",
+        },
+        user_id=uid,
+        role="chief_of_staff",
+    )
+    assert c_repeat["ok"] is True
+    row_after_repeat = await _hist_row(custom_id)
+    assert row_after_repeat["config_version"] == 1
+    assert len(row_after_repeat["audit_history"]) == 1
+
+    # Upsert with changed instruction -> v2 (action="update")
+    await schedule_dalton_automation_helper(
+        name="dalton-nvda-custom-scan",
+        workspace_id=ws_nvda,
+        spec={
+            "description": "Custom scan v1",
+            "instruction": "Scan NVDA supply chain v2",
+            "cron": "0 9 * * 1-5",
+            "timezone": "America/New_York",
+        },
+        user_id=uid,
+        role="chief_of_staff",
+    )
+    # Pause -> v3; repeat pause -> stays v3; Resume -> v4; repeat resume -> stays v4
+    await schedule_dalton_automation_helper(
+        name="dalton-nvda-custom-scan",
+        workspace_id=ws_nvda,
+        action="pause",
+        user_id=uid,
+        role="chief_of_staff",
+    )
+    await schedule_dalton_automation_helper(
+        name="dalton-nvda-custom-scan",
+        workspace_id=ws_nvda,
+        action="pause",
+        user_id=uid,
+        role="chief_of_staff",
+    )
+    await schedule_dalton_automation_helper(
+        name="dalton-nvda-custom-scan",
+        workspace_id=ws_nvda,
+        action="resume",
+        user_id=uid,
+        role="chief_of_staff",
+    )
+    await schedule_dalton_automation_helper(
+        name="dalton-nvda-custom-scan",
+        workspace_id=ws_nvda,
+        action="resume",
+        user_id=uid,
+        role="chief_of_staff",
+    )
+    row_custom = await _hist_row(custom_id)
+    assert row_custom["config_version"] == 4
+    assert [e["action"] for e in row_custom["audit_history"]] == [
+        "create",
+        "update",
+        "pause",
+        "resume",
+    ]
+
+    # 2. toggle_system_job on Home job (`dalton-earnings-calendar`) + idempotent repeat calls
+    await sys_jobs_mod.toggle_system_job(
+        uid, "dalton-earnings-calendar", enabled=True, actor_user_id=pm_actor
+    )
+    await sys_jobs_mod.toggle_system_job(
+        uid, "dalton-earnings-calendar", enabled=True, actor_user_id=pm_actor
+    )
+    await sys_jobs_mod.toggle_system_job(
+        uid, "dalton-earnings-calendar", enabled=False, actor_user_id=uid
+    )
+    await sys_jobs_mod.toggle_system_job(
+        uid, "dalton-earnings-calendar", enabled=False, actor_user_id=uid
+    )
+    await sys_jobs_mod.toggle_system_job(
+        uid, "dalton-earnings-calendar", enabled=True, actor_user_id=pm_actor
+    )
+    async with au1_live_pool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT * FROM automations WHERE user_id = %s AND name = 'dalton-earnings-calendar'",
+                (uid,),
+            )
+            cal_row = await cur.fetchone()
+            assert cal_row is not None
+            assert cal_row["created_by"] == pm_actor
+            assert cal_row["updated_by"] == pm_actor
+            assert cal_row["config_version"] == 3
+            assert [e["action"] for e in cal_row["audit_history"]] == [
+                "create",
+                "pause",
+                "resume",
+            ]
+            assert [e["actor_user_id"] for e in cal_row["audit_history"]] == [
+                pm_actor,
+                uid,
+                pm_actor,
+            ]
+
+    # 3. enable_tracking / disable_tracking / resync_delta_schedule / _pause_stale_sector_rows
+    monkeypatch.setattr(tracking_mod, "_resolve_workspace_ticker", lambda _w, _r=None: _coro("NVDA"))
+    await tracking_mod.enable_tracking(uid, ws_nvda, tier="core", force=True)
+    # Repeat enable_tracking with same tier -> no version bump!
+    await tracking_mod.enable_tracking(uid, ws_nvda, tier="core", force=True)
+    await tracking_mod.disable_tracking(uid, ws_nvda)
+    # Repeat disable_tracking -> no version bump!
+    await tracking_mod.disable_tracking(uid, ws_nvda)
+    await tracking_mod.enable_tracking(uid, ws_nvda, tier="core", force=True)
+    # Resync delta schedule to watch -> bumps delta task to v4; repeat with watch -> stays v4!
+    await tracking_mod.resync_delta_schedule(uid, "NVDA", tier="watch")
+    await tracking_mod.resync_delta_schedule(uid, "NVDA", tier="watch")
+
+    async with au1_live_pool.connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT * FROM automations WHERE user_id = %s AND name = 'dalton-nvda-delta'",
+                (uid,),
+            )
+            delta_row = await cur.fetchone()
+            assert delta_row is not None
+            assert delta_row["config_version"] == 4
+            assert [e["action"] for e in delta_row["audit_history"]] == [
+                "create",
+                "pause",
+                "resume",
+                "update",
+            ]
+
+    # Test _pause_stale_sector_rows: records action="maintenance_pause_stale_binding" and actor_user_id=None
+    stale_sector_created = await auto_db.create_automation(
+        user_id=uid,
+        name="dalton-sector-semi-agenda",
+        trigger_type="cron",
+        cron_expression="0 */2 * * 1-5",
+        timezone="Asia/Shanghai",
+        instruction="Old workspace sector agenda",
+        workspace_id=ws_sector_old,
+        metadata={
+            "dalton_managed": True,
+            "dalton_kind": "sector_watch",
+            "subject_kind": "sector",
+            "unit_id": sector_unit_id,
+            "sector_slug": "semi",
+        },
+        scope="research_tracking",
+        created_by=uid,
+    )
+    stale_id = str(stale_sector_created["automation_id"])
+    paused_stale = await tracking_mod._pause_stale_sector_rows(
+        uid, sector_unit_id, ws_sector_new
+    )
+    assert paused_stale == ["dalton-sector-semi-agenda"]
+    stale_row = await auto_db.get_automation(stale_id, uid)
+    assert stale_row is not None
+    assert stale_row["status"] == "paused"
+    assert stale_row["config_version"] == 2
+    assert stale_row["updated_by"] is None
+    stale_after = await _hist_row(stale_id)
+    assert stale_after["config_version"] == 2
+    assert stale_after["audit_history"][-1]["action"] == "maintenance_pause_stale_binding"
+    assert stale_after["audit_history"][-1]["actor_user_id"] is None
+    assert stale_after["audit_history"][-1]["snapshot"]["desired_status"] == "paused"
+
+    # 4. Runtime execution paths (trigger_automation + executor thread write-back + failure_count/last_run_at) DO NOT bump config_version!
+    fake_sched = create_autospec(AutomationScheduler, instance=True)
+    fake_sched.server_id = "srv-test"
+    monkeypatch.setattr(AutomationScheduler, "get_instance", lambda: fake_sched)
+
+    before_runtime = await _hist_row(custom_id)
+    assert before_runtime is not None
+    trig_res = await lifecycle_mod.trigger_automation(custom_id, uid)
+    assert trig_res["status"] == "triggered"
+
+    # Simulate AutomationExecutor._resolve_thread writing conversation_thread_id with record_history=False
+    runtime_thread_id = str(uuid.uuid4())
+    with company_auto_svc.automation_history_context(record_history=False):
+        await auto_db.update_automation(
+            custom_id,
+            uid,
+            conversation_thread_id=runtime_thread_id,
+        )
+
+    # Simulate runtime failure_count / last_run_at update without history context
+    await auto_db.update_automation(
+        custom_id,
+        uid,
+        failure_count=1,
+        last_run_at=datetime.now(UTC),
+    )
+
+    after_runtime_row = await auto_db.get_automation(custom_id, uid)
+    assert after_runtime_row is not None
+    assert str(after_runtime_row["conversation_thread_id"]) == runtime_thread_id
+    assert after_runtime_row["failure_count"] == 1
+    assert after_runtime_row["config_version"] == before_runtime["config_version"]
+    assert after_runtime_row["active_version"] == before_runtime["active_version"]
+    after_runtime = await _hist_row(custom_id)
+    assert after_runtime["config_version"] == before_runtime["config_version"]
+    assert after_runtime["active_version"] == before_runtime["active_version"]
+    assert after_runtime["audit_history"] == before_runtime["audit_history"]
