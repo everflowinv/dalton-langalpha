@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -134,6 +135,19 @@ async def _ensure_alembic_upgraded_to_head(dsn: str) -> None:
 
     if current_dalton != dalton_target:
         await asyncio.to_thread(_run_alembic_upgrade_sync, dalton_cfg, dalton_target)
+
+    # d032 is edited in place. A database already stamped d032 does not re-run
+    # that revision, so the context-order columns are added when missing.
+    async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                ALTER TABLE dalton_channel_weixin_context_tokens
+                    ADD COLUMN IF NOT EXISTS seq_source VARCHAR(32) NOT NULL DEFAULT 'protocol';
+                ALTER TABLE dalton_channel_identities
+                    ADD COLUMN IF NOT EXISTS weixin_context_seq_source VARCHAR(32) NOT NULL DEFAULT '';
+                """
+            )
 
 
 @pytest_asyncio.fixture(scope="session")
@@ -2109,3 +2123,311 @@ async def test_d032_weixin_login_sessions_context_tokens_and_group_rejection_rea
             thread_ids=[],
             session_keys=[ctrl_sess_key],
         )
+
+
+@pytest.mark.asyncio
+async def test_weixin_context_order_source_and_invalid_inbound_real_pg(
+    db_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Real Postgres context-order rules and durable invalid inbound rejection.
+
+    Protocol `seq` advances only above the saved protocol value. Platform time
+    is `create_time_ms` and applies only when the message has no protocol seq.
+    A message with neither field uses the next receive ordinal. A later protocol
+    seq replaces either fallback. Replaying one message id does not roll back.
+    Binding the older message keeps the current token. A missing message id is
+    ignored on the first insert, on a pending replay, and on startup recovery,
+    without replacing a completed row.
+    """
+    prefix = db_env["prefix"]
+    user_a = db_env["user_a"]
+    pool: AsyncConnectionPool = db_env["pool"]
+    monkeypatch.setenv("DALTON_PM_USER_IDS", user_a)
+    monkeypatch.setenv("DALTON_ALLOWED_EMAILS", f"{user_a}@example.com")
+    bot = f"{prefix}_wx_bot_order@im.wechat"
+    alice = f"{prefix}_wx_order_alice"
+    bob = f"{prefix}_wx_order_bob"
+    carol = f"{prefix}_wx_order_carol"
+    enc_key = os.environ["BYOK_ENCRYPTION_KEY"]
+
+    async def reg(
+        puid: str,
+        mid: str,
+        token: str,
+        payload: dict[str, Any],
+        *,
+        context_seq: int | None = None,
+    ) -> dict[str, Any]:
+        return await cg_db.register_and_resolve_inbound(
+            platform="weixin",
+            platform_user_id=puid,
+            chat_type="dm",
+            chat_address="weixin:@me",
+            thread_scope_key=f"dm:{puid}",
+            message_id=mid,
+            weixin_context_token=token,
+            weixin_context_seq=context_seq,
+            raw_payload={"ilink_bot_id": bot, **payload},
+        )
+
+    async def token_row(puid: str) -> dict[str, Any]:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT seq, seq_source,
+                           pgp_sym_decrypt(encrypted_context_token, %s) AS context_token
+                    FROM dalton_channel_weixin_context_tokens
+                    WHERE ilink_bot_id = %s
+                      AND bot_generation = %s
+                      AND platform_user_id = %s
+                    """,
+                    (enc_key, bot, gen, puid),
+                )
+                return dict(await cur.fetchone())
+
+    started = await cg_db.upsert_weixin_state(
+        login_session_action="start",
+        login_session_key=f"{prefix}-order-sess",
+        login_owner_user_id=user_a,
+        login_status="wait",
+        login_qrcode=f"{prefix}-order-qr",
+        login_qrcode_img_content="data:image/png;base64,AAAA",
+        login_expires_in_seconds=300,
+    )
+    assert started["updated"] is True
+    confirmed = await cg_db.upsert_weixin_state(
+        login_session_action="confirm",
+        login_session_key=f"{prefix}-order-sess",
+        login_owner_user_id=user_a,
+        expected_login_version=int(started["login_version"]),
+        expected_bot_generation=int(started["expected_bot_generation"]),
+        ilink_bot_id=bot,
+        owner_user_id=user_a,
+        bot_token="secret-pg-token-order",
+        base_url="https://ilinkai.weixin.qq.com",
+        status="active",
+        ilink_user_id=f"{prefix}_wx_admin_order",
+        ilink_username="Order Admin",
+    )
+    assert confirmed["updated"] is True
+    gen = int(confirmed["bot_generation"])
+
+    time_mid = f"{bot}:time"
+    await reg(alice, time_mid, "T_time", {"create_time_ms": 1_700_000_000_000})
+    stored = await token_row(alice)
+    assert stored["seq_source"] == "platform_time"
+    assert stored["seq"] == 1_700_000_000_000
+    assert stored["context_token"] == "T_time"
+
+    await reg(alice, f"{bot}:seq8", "T_seq8", {"seq": 8})
+    stored = await token_row(alice)
+    assert stored["seq_source"] == "protocol"
+    assert stored["seq"] == 8
+    assert stored["context_token"] == "T_seq8"
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT weixin_context_seq,
+                       pgp_sym_decrypt(encrypted_weixin_context_token, %s) AS context_token
+                FROM dalton_channel_inbound_events
+                WHERE platform = 'weixin' AND message_id = %s
+                """,
+                (enc_key, time_mid),
+            )
+            older = dict(await cur.fetchone())
+    assert older["weixin_context_seq"] == 1_700_000_000_000
+    assert older["context_token"] == "T_time"
+
+    await reg(alice, f"{bot}:seq8-again", "T_seq8_same", {"seq": 8})
+    await reg(alice, f"{bot}:seq3", "T_seq3", {"seq": 3})
+    assert (await token_row(alice))["context_token"] == "T_seq8"
+
+    await reg(alice, f"{bot}:seq-big", "T_big", {"seq": 1_700_000_000_000})
+    stored = await token_row(alice)
+    assert stored["seq_source"] == "protocol"
+    assert stored["seq"] == 1_700_000_000_000
+    assert stored["context_token"] == "T_big"
+
+    await reg(alice, f"{bot}:later-time", "T_later_time", {"create_time_ms": 1_800_000_000_000})
+    await reg(alice, f"{bot}:no-order", "T_receive", {})
+    await reg(alice, time_mid, "T_replay", {"create_time_ms": 1_900_000_000_000})
+    stored = await token_row(alice)
+    assert stored["seq_source"] == "protocol"
+    assert stored["seq"] == 1_700_000_000_000
+    assert stored["context_token"] == "T_big"
+
+    code = await cg_db.create_bind_code(user_id=user_a, platform="weixin")
+    bound = await cg_db.consume_bind_code_or_unbind(
+        action="bind",
+        platform="weixin",
+        platform_user_id=alice,
+        platform_username="Alice Order",
+        code=code["code"],
+        is_group=False,
+        inbound_message_id=time_mid,
+        weixin_context_token="T_time",
+    )
+    assert bound["ok"] is True
+    assert bound["user_id"] == user_a
+    stored = await token_row(alice)
+    assert stored["context_token"] == "T_big"
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT weixin_context_seq, weixin_context_seq_source,
+                       pgp_sym_decrypt(encrypted_weixin_context_token, %s) AS context_token
+                FROM dalton_channel_identities
+                WHERE user_id = %s AND platform = 'weixin'
+                """,
+                (enc_key, user_a),
+            )
+            identity = dict(await cur.fetchone())
+    assert identity["weixin_context_seq"] == 1_700_000_000_000
+    assert identity["weixin_context_seq_source"] == "protocol"
+    assert identity["context_token"] == "T_big"
+
+    await reg(bob, f"{bot}:recv1", "R1", {})
+    stored = await token_row(bob)
+    assert stored["seq_source"] == "receive"
+    assert stored["seq"] == 1
+    await reg(bob, f"{bot}:recv2", "R2", {})
+    stored = await token_row(bob)
+    assert stored["seq_source"] == "receive"
+    assert stored["seq"] == 2
+    assert stored["context_token"] == "R2"
+    await reg(bob, f"{bot}:ptime", "R3", {"create_time_ms": 5000})
+    assert (await token_row(bob))["seq_source"] == "platform_time"
+    assert (await token_row(bob))["seq"] == 5000
+    await reg(bob, f"{bot}:ptime-old", "R3_old", {"create_time_ms": 4000})
+    await reg(bob, f"{bot}:ptime-new", "R4", {"create_time_ms": 6000})
+    stored = await token_row(bob)
+    assert stored["seq"] == 6000
+    assert stored["context_token"] == "R4"
+    await reg(bob, f"{bot}:recv1", "R1_replay", {})
+    assert (await token_row(bob))["context_token"] == "R4"
+    await reg(bob, f"{bot}:proto", "R5", {"seq": 4})
+    stored = await token_row(bob)
+    assert stored["seq_source"] == "protocol"
+    assert stored["seq"] == 4
+    assert stored["context_token"] == "R5"
+    await reg(bob, f"{bot}:ptime-after", "R6", {"create_time_ms": 999_999})
+    stored = await token_row(bob)
+    assert stored["seq_source"] == "protocol"
+    assert stored["context_token"] == "R5"
+
+    await reg(carol, f"{bot}:explicit", "P1", {"create_time_ms": 50})
+    await reg(
+        carol,
+        f"{bot}:explicit-seq",
+        "P2",
+        {"create_time_ms": 9_999_999_999_999},
+        context_seq=2,
+    )
+    stored = await token_row(carol)
+    assert stored["seq_source"] == "protocol"
+    assert stored["seq"] == 2
+    assert stored["context_token"] == "P2"
+
+    invalid_mid = f"{bot}:invalid:missing-message-id"
+    invalid_first = await reg(
+        alice,
+        invalid_mid,
+        "T_invalid",
+        {"invalid_inbound_event": True, "rejected_reason": "invalid_inbound_event"},
+    )
+    assert invalid_first["allowed"] is False
+    assert invalid_first["deny_reason"] == "invalid_inbound_event"
+    assert invalid_first["workspace_id"] is None
+    assert invalid_first["thread_id"] is None
+    invalid_replay = await reg(
+        alice,
+        invalid_mid,
+        "T_invalid_replay",
+        {"invalid_inbound_event": True, "rejected_reason": "invalid_inbound_event"},
+    )
+    assert invalid_replay["existing_status"] == "ignored"
+    assert invalid_replay["deny_reason"] == "invalid_inbound_event"
+    assert invalid_replay["workspace_id"] is None
+
+    pending_mid = f"{bot}:pending-invalid"
+    completed_mid = f"{bot}:completed-row"
+    recover_mid = f"{bot}:recover-invalid"
+    valid_mid = f"{bot}:recover-valid"
+
+    async def seed(mid: str, status: str, payload: dict[str, Any]) -> None:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_channel_inbound_events (
+                        platform, message_id, request_key, dalton_user_id,
+                        chat_type, chat_address, thread_scope_key, status,
+                        fallback_pending, raw_payload
+                    )
+                    VALUES (
+                        'weixin', %s, %s, NULL,
+                        'dm', 'weixin:@me', %s, %s,
+                        FALSE, %s::jsonb
+                    )
+                    """,
+                    (mid, str(uuid4()), f"dm:{alice}", status, json.dumps(payload)),
+                )
+
+    await seed(pending_mid, "pending", {"invalid_inbound_event": True, "marker": "pending-invalid"})
+    await seed(completed_mid, "completed", {"marker": "keep-completed"})
+    await seed(recover_mid, "pending", {"invalid_inbound_event": True, "marker": "recover-invalid"})
+    await seed(valid_mid, "pending", {"marker": "still-valid"})
+
+    pending_again = await reg(
+        alice,
+        pending_mid,
+        "T_pending",
+        {"invalid_inbound_event": True, "marker": "pending-again"},
+    )
+    assert pending_again["deny_reason"] == "invalid_inbound_event"
+    completed_again = await reg(
+        alice,
+        completed_mid,
+        "T_completed",
+        {"invalid_inbound_event": True, "marker": "should-not-replace"},
+    )
+    assert completed_again["existing_status"] == "completed"
+
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT message_id, status, workspace_id, raw_payload->>'marker' AS marker
+                FROM dalton_channel_inbound_events
+                WHERE message_id = ANY(%s)
+                """,
+                ([invalid_mid, pending_mid, completed_mid],),
+            )
+            rows = {row["message_id"]: dict(row) for row in await cur.fetchall()}
+    assert rows[invalid_mid]["status"] == "ignored"
+    assert rows[invalid_mid]["workspace_id"] is None
+    assert rows[pending_mid]["status"] == "ignored"
+    assert rows[completed_mid]["status"] == "completed"
+    assert rows[completed_mid]["marker"] == "keep-completed"
+
+    recovered = await cg_db.recover_channel_state(mode="startup")
+    recovered_ids = {row["message_id"] for row in recovered["inbound_events"]}
+    assert recover_mid not in recovered_ids
+    assert valid_mid in recovered_ids
+    assert invalid_mid not in recovered_ids
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT message_id, status
+                FROM dalton_channel_inbound_events
+                WHERE message_id = ANY(%s)
+                """,
+                ([recover_mid, valid_mid],),
+            )
+            recover_rows = {row["message_id"]: row["status"] for row in await cur.fetchall()}
+    assert recover_rows[recover_mid] == "ignored"
+    assert recover_rows[valid_mid] == "pending"

@@ -218,7 +218,7 @@ export interface InboundChannelEvent {
   weixinBotId?: string;
   /** Active Weixin `bot_generation` when `platform === "weixin"`. */
   weixinBotGeneration?: number;
-  /** Monotonic sequence/timestamp for Weixin context token ordering. */
+  /** Protocol `seq` for Weixin context ordering. Platform time stays on `create_time_ms`. */
   weixinContextSeq?: number;
   /** True when a Weixin voice message had no server-side text transcription. */
   voiceWithoutTranscription?: boolean;

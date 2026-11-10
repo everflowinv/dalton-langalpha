@@ -554,11 +554,14 @@ export class ChannelGatewayOrchestrator {
       weixin_context_seq: event.weixinContextSeq ?? null,
     });
 
-    if (
-      resolved.existing_status === "ignored" ||
+    const hardDeny =
       resolved.deny_reason === "weixin_group_unsupported" ||
-      resolved.deny_reason === "invalid_inbound_event"
-    ) {
+      resolved.deny_reason === "invalid_inbound_event";
+    if (hardDeny) {
+      return true;
+    }
+    // An ignored unlinked message can still run /bind. Every other ignored command stays closed.
+    if (resolved.existing_status === "ignored" && cmdName !== "bind") {
       return true;
     }
 
@@ -7799,6 +7802,7 @@ export class ChannelGatewayOrchestrator {
         replyToMessageId: i === 0 ? event.messageId : null,
         threadScopeKey: event.threadScopeKey,
         weixinContextToken: event.weixinContextToken ?? null,
+        inboundMessageId: event.messageId,
       });
     }
   }

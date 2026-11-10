@@ -26,9 +26,108 @@ import { sanitizePublicWeixinQrResponse } from "../src/server.js";
 import {
   MAX_CIPHERTEXT_ATTACHMENT_BYTES,
   SafeFetchError,
+  safeFetchResponse,
 } from "../src/shared/safe-fetch.js";
 import { MAX_ATTACHMENT_BYTES } from "../src/types.js";
+import type {
+  I1RegisterAndResolveRequest,
+  I1RegisterAndResolveResponse,
+  I9WeixinStateGetResponse,
+  I9WeixinStatePutResponse,
+} from "../src/backend-client.js";
+import type { InboundChannelEvent } from "../src/types.js";
 import { createTestHarness, USER_ID } from "./helpers.js";
+
+function defer<T = void>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
+function emptyInbound(
+  req: I1RegisterAndResolveRequest,
+): I1RegisterAndResolveResponse {
+  return {
+    existing_status: null,
+    linked: false,
+    allowed: false,
+    deny_reason: null,
+    dalton_user_id: null,
+    request_key: req.request_key,
+    retry_request_key: null,
+    resubmitted_request_key: null,
+    steered_into_run_id: null,
+    thread_id: null,
+    run_id: null,
+    turn_index: null,
+    workspace_id: null,
+    external_thread_id: null,
+    generation: 1,
+    fallback_pending: false,
+    sent_to_current_count: 0,
+    uploaded_attachments: [],
+    raw_payload: req.raw_payload ?? {},
+    pending_interrupt: null,
+  };
+}
+
+function weixinDm(
+  messageId: string,
+  text: string,
+  extra: Partial<InboundChannelEvent> = {},
+): InboundChannelEvent {
+  return {
+    platform: "weixin",
+    platformUserId: "wx_alice",
+    chatType: "dm",
+    chatAddress: "weixin:@me",
+    chatId: "wx_alice",
+    threadScopeKey: "dm:wx_alice",
+    messageId,
+    text,
+    ...extra,
+  };
+}
+
+function weixinState(
+  overrides: Partial<I9WeixinStateGetResponse> = {},
+): I9WeixinStateGetResponse {
+  return {
+    configured: true,
+    status: "active",
+    bot_token: "bot_tok_live",
+    ilink_bot_id: "bot_live_1",
+    ilink_user_id: "wx_owner",
+    owner_user_id: USER_ID,
+    base_url: "https://ilinkai.weixin.qq.com",
+    get_updates_buf: "buf_0",
+    bot_generation: 5,
+    updated_at: "2026-01-01T00:00:00.000Z",
+    weixin_context_token: "ctx_live",
+    ...overrides,
+  };
+}
+
+function weixinPut(
+  overrides: Partial<I9WeixinStatePutResponse> = {},
+): I9WeixinStatePutResponse {
+  return {
+    ok: true,
+    updated: true,
+    ilink_bot_id: "bot_live_1",
+    owner_user_id: USER_ID,
+    base_url: "https://ilinkai.weixin.qq.com",
+    get_updates_buf: "buf_0",
+    status: "active",
+    updated_at: "2026-01-01T00:00:00.000Z",
+    ...overrides,
+  };
+}
 
 function makeJsonResponse(
   body: unknown,
@@ -413,6 +512,36 @@ describe("Weixin iLink Adapter — Protocol, Crypto, Inbound, QR Concurrency & L
     );
     expect(missingId1.rawPayload?.invalid_inbound_event).toBe(true);
     expect(missingId1.messageId).toBe(missingId2.messageId);
+    expect(missingId1.weixinContextSeq).toBeUndefined();
+    expect(missingId1.rawPayload?.create_time_ms).toBe(1700000000000);
+    expect(missingId1.rawPayload?.seq).toBeUndefined();
+
+    const protocolAndTime = parseWeixinInboundMessage(
+      {
+        message_id: "100",
+        seq: 1700000000000,
+        from_user_id: "wx_user_alice",
+        create_time_ms: 1800000000000,
+        item_list: [{ type: 1, text_item: { text: "ordered" } }],
+      },
+      { ilinkBotId: "ilink_bot_1", botGeneration: 3, batchSeq: Date.now() * 1000 },
+    );
+    expect(protocolAndTime.weixinContextSeq).toBe(1700000000000);
+    expect(protocolAndTime.rawPayload?.seq).toBe(1700000000000);
+    expect(protocolAndTime.rawPayload?.create_time_ms).toBe(1800000000000);
+
+    const timeOnly = parseWeixinInboundMessage(
+      {
+        message_id: "101",
+        from_user_id: "wx_user_alice",
+        create_time_ms: 1800000000000,
+        item_list: [{ type: 1, text_item: { text: "timed" } }],
+      },
+      { ilinkBotId: "ilink_bot_1", botGeneration: 3, batchSeq: 999 },
+    );
+    expect(timeOnly.weixinContextSeq).toBeUndefined();
+    expect(timeOnly.rawPayload?.seq).toBeUndefined();
+    expect(timeOnly.rawPayload?.create_time_ms).toBe(1800000000000);
   });
 
   it("handles concurrent admin QR logins, stale confirmation rejection, duplicate wait idempotency, redirect_host validation, and public field whitelisting", async () => {
@@ -611,15 +740,53 @@ describe("Weixin iLink Adapter — Protocol, Crypto, Inbound, QR Concurrency & L
       const wait2 = await qrManager.waitQrLogin("admin_2", start2.session_key);
       expect(wait2.status).toBe("confirmed");
       expect(wait2.connected).toBe(true);
+      expect(wait2).not.toHaveProperty("bot_token");
       expect(activatedStates).toHaveLength(1);
 
-      // Duplicate wait on Admin 2's confirmed session is idempotent (no second activation)
+      // A repeated wait reads the confirmed account again and applies the same generation.
       const wait2Dup = await qrManager.waitQrLogin(
         "admin_2",
         start2.session_key,
       );
       expect(wait2Dup.status).toBe("confirmed");
-      expect(activatedStates).toHaveLength(1);
+      expect(wait2Dup).not.toHaveProperty("bot_token");
+      expect(activatedStates).toHaveLength(2);
+      expect(activatedStates[1]).toMatchObject({
+        ilinkBotId: (activatedStates[0] as { ilinkBotId: string }).ilinkBotId,
+        botGeneration: (activatedStates[0] as { botGeneration: number })
+          .botGeneration,
+      });
+
+      const savedBotId = (activatedStates[0] as { ilinkBotId: string }).ilinkBotId;
+      vi.mocked(h.backend.getWeixinState).mockImplementation(async () => ({
+        configured: true,
+        status: "active",
+        bot_token: "tok_replaced",
+        ilink_bot_id: "bot_replaced",
+        ilink_user_id: "wx_admin_2",
+        owner_user_id: "admin_2",
+        base_url: "https://ilinkai.weixin.qq.com",
+        get_updates_buf: "",
+        bot_generation: currentBotGen + 1,
+        updated_at: new Date().toISOString(),
+        login_session_key: activeSessionKey,
+        login_owner_user_id: activeOwnerUserId,
+        login_version: activeLoginVersion,
+        login_expected_bot_generation: currentBotGen,
+        login_status: "confirmed",
+        login_qrcode: activeQrcode,
+        login_redirect_base_url: "https://ilinkai.weixin.qq.com",
+        login_expires_at: activeExpiresAt,
+        login_confirmed_result: confirmedResult,
+      }));
+      const waitReplaced = await qrManager.waitQrLogin(
+        "admin_2",
+        start2.session_key,
+      );
+      expect(waitReplaced.status).toBe("expired");
+      expect(waitReplaced).not.toHaveProperty("bot_token");
+      expect(activatedStates).toHaveLength(2);
+      expect(savedBotId).toBe("bot_admin_2");
 
       // Verify sanitizePublicWeixinQrResponse strips bot_token, context_token, and URL query/credentials
       const sanitized = sanitizePublicWeixinQrResponse({
@@ -819,6 +986,109 @@ describe("Weixin iLink Adapter — Protocol, Crypto, Inbound, QR Concurrency & L
       retryAfterMs: 7000,
     });
 
+    const bodyError = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.error(new Error("body read failed"));
+      },
+    });
+    await expect(
+      sendWeixinTextMessage(
+        {
+          baseUrl: "https://ilinkai.weixin.qq.com",
+          cdnBaseUrl: "https://novac2c.cdn.weixin.qq.com/c2c",
+          allowedApiDomains: ["ilinkai.weixin.qq.com"],
+          botToken: "bot_tok",
+          toUserId: "wx_u1",
+          contextToken: "ctx_valid",
+          fetchImpl: async () =>
+            new Response(bodyError, {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            }),
+          checkResolvedIps: false,
+        },
+        "Hello",
+      ),
+    ).rejects.toMatchObject({ outcome: "unknown" });
+
+    await expect(
+      sendWeixinTextMessage(
+        {
+          baseUrl: "https://ilinkai.weixin.qq.com",
+          cdnBaseUrl: "https://novac2c.cdn.weixin.qq.com/c2c",
+          allowedApiDomains: ["ilinkai.weixin.qq.com"],
+          botToken: "bot_tok",
+          toUserId: "wx_u1",
+          contextToken: "ctx_valid",
+          fetchImpl: async () =>
+            new Response("not-json", {
+              status: 200,
+              headers: { "content-type": "application/json" },
+            }),
+          checkResolvedIps: false,
+        },
+        "Hello",
+      ),
+    ).rejects.toMatchObject({ outcome: "unknown" });
+
+    await expect(
+      sendWeixinTextMessage(
+        {
+          baseUrl: "https://ilinkai.weixin.qq.com",
+          cdnBaseUrl: "https://novac2c.cdn.weixin.qq.com/c2c",
+          allowedApiDomains: ["ilinkai.weixin.qq.com"],
+          botToken: "bot_tok",
+          toUserId: "wx_u1",
+          contextToken: "ctx_valid",
+          fetchImpl: async () => makeJsonResponse({ error: "down" }, 500),
+          checkResolvedIps: false,
+        },
+        "Hello",
+      ),
+    ).rejects.toMatchObject({ outcome: "unknown" });
+
+    await expect(
+      sendWeixinTextMessage(
+        {
+          baseUrl: "https://ilinkai.weixin.qq.com",
+          cdnBaseUrl: "https://novac2c.cdn.weixin.qq.com/c2c",
+          allowedApiDomains: ["ilinkai.weixin.qq.com"],
+          botToken: "bot_tok",
+          toUserId: "wx_u1",
+          contextToken: "ctx_valid",
+          fetchImpl: async () => makeJsonResponse({ ret: -2, errmsg: "no" }),
+          checkResolvedIps: false,
+        },
+        "Hello",
+      ),
+    ).rejects.toMatchObject({ outcome: "failed" });
+
+    const uploadUrls: string[] = [];
+    await expect(
+      sendWeixinMediaAttachment(
+        {
+          baseUrl: "https://ilinkai.weixin.qq.com",
+          cdnBaseUrl: "https://novac2c.cdn.weixin.qq.com/c2c",
+          allowedApiDomains: ["ilinkai.weixin.qq.com"],
+          allowedCdnDomains: ["novac2c.cdn.weixin.qq.com"],
+          botToken: "bot_tok",
+          toUserId: "wx_u1",
+          contextToken: "ctx_valid",
+          fetchImpl: async (input) => {
+            uploadUrls.push(String(input));
+            return makeJsonResponse({ ret: -2, errmsg: "upload refused" });
+          },
+          checkResolvedIps: false,
+        },
+        {
+          filename: "memo.pdf",
+          mimeType: "application/pdf",
+          content: Buffer.from("memo", "utf8"),
+        },
+      ),
+    ).rejects.toMatchObject({ outcome: "failed" });
+    expect(uploadUrls.some((url) => url.includes("sendmessage"))).toBe(false);
+
     // 4. CDN upload retry reuses the same filekey, aeskey, and ciphertext
     const getUploadBodies: Array<Record<string, unknown>> = [];
     const cdnPutBodies: Buffer[] = [];
@@ -885,6 +1155,599 @@ describe("Weixin iLink Adapter — Protocol, Crypto, Inbound, QR Concurrency & L
       "utf8",
     ).toString("base64");
     expect(serializedMsg).toContain(`"aes_key":"${expectedOutboundKeyBase64}"`);
+  });
+
+  it("retries /bind after the first I-1 response is lost, and still refuses group and invalid rows", async () => {
+    const h = createTestHarness();
+    try {
+      const bindId = "bot_live_1:bind_lost";
+      const seen = new Set<string>();
+      vi.mocked(h.backend.registerAndResolveInbound).mockImplementation(
+        async (req) => {
+          if (req.message_id.endsWith(":group")) {
+            return {
+              ...emptyInbound(req),
+              existing_status: "ignored",
+              deny_reason: "weixin_group_unsupported",
+            };
+          }
+          if (req.message_id.endsWith(":invalid")) {
+            return {
+              ...emptyInbound(req),
+              deny_reason: "invalid_inbound_event",
+            };
+          }
+          const first = !seen.has(req.message_id);
+          seen.add(req.message_id);
+          return {
+            ...emptyInbound(req),
+            existing_status: first ? null : "ignored",
+            deny_reason: "not_linked",
+          };
+        },
+      );
+
+      let bindConsumes = 0;
+      vi.mocked(h.backend.consumeBindCode).mockImplementation(async (req) => {
+        bindConsumes += 1;
+        return {
+          ok: true,
+          idempotent: bindConsumes > 1,
+          user_id: USER_ID,
+          platform: "weixin",
+          platform_user_id: req.platform_user_id,
+          generation: 2,
+        };
+      });
+
+      const previousClaim = vi
+        .mocked(h.backend.authorizeAndClaimDelivery)
+        .getMockImplementation();
+      if (!previousClaim) {
+        throw new Error("authorizeAndClaimDelivery mock is missing");
+      }
+      let bindOkClaims = 0;
+      vi.mocked(h.backend.authorizeAndClaimDelivery).mockImplementation(
+        async (req) => {
+          const claimed = await previousClaim(req);
+          if (req.delivery_key.includes(":bind_ok")) {
+            bindOkClaims += 1;
+            if (bindOkClaims > 1) {
+              return {
+                ...claimed,
+                claim_status: "already_completed",
+                status: "sent",
+              };
+            }
+          }
+          return claimed;
+        },
+      );
+
+      await h.weixinAdapter.emitInbound(
+        weixinDm(bindId, "/bind ABC123", { weixinContextToken: "ctx_bind" }),
+      );
+      await h.weixinAdapter.emitInbound(
+        weixinDm(bindId, "/bind ABC123", { weixinContextToken: "ctx_bind" }),
+      );
+      const consumesAfterBind = bindConsumes;
+      await h.weixinAdapter.emitInbound(
+        weixinDm("bot_live_1:group", "/bind ABC123", {
+          chatType: "group",
+          chatAddress: "weixin:room1",
+          chatId: "room1",
+          threadScopeKey: "chat:room1",
+        }),
+      );
+      await h.weixinAdapter.emitInbound(
+        weixinDm("bot_live_1:invalid", "/bind ABC123"),
+      );
+
+      expect(consumesAfterBind).toBe(2);
+      expect(bindConsumes).toBe(2);
+      expect(
+        vi.mocked(h.backend.consumeBindCode).mock.calls.map(([req]) => req.inbound_message_id),
+      ).toEqual([bindId, bindId]);
+      expect(h.weixinAdapter.sentTexts).toHaveLength(1);
+      expect(h.weixinAdapter.sentTexts[0]?.text).toBe(
+        "Successfully linked your weixin account to Dalton.",
+      );
+      expect(h.weixinAdapter.sentTexts[0]?.inboundMessageId).toBe(bindId);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("finishes an in-poll command reply when sendmessage returns -14 and records expired once", async () => {
+    const h = createTestHarness();
+    try {
+      let pollCount = 0;
+      const expired = defer<void>();
+      vi.mocked(h.backend.getWeixinState).mockResolvedValue(weixinState());
+      vi.mocked(h.backend.putWeixinState).mockImplementation(async (req) => {
+        if (req.status === "expired") {
+          expired.resolve();
+        }
+        return weixinPut({
+          status: req.status ?? "active",
+          get_updates_buf: req.get_updates_buf ?? "buf_0",
+          updated: true,
+        });
+      });
+      const fakeFetch: typeof fetch = vi.fn(async (input) => {
+        const url = String(input);
+        if (url.includes("getupdates")) {
+          pollCount += 1;
+          if (pollCount === 1) {
+            return makeJsonResponse({
+              ret: 0,
+              get_updates_buf: "buf_1",
+              msgs: [
+                {
+                  message_id: "1001",
+                  from_user_id: "wx_u1",
+                  context_token: "ctx_1",
+                  item_list: [{ type: 1, text_item: { text: "/new" } }],
+                },
+              ],
+            });
+          }
+          return makeJsonResponse({ ret: 0, msgs: [], get_updates_buf: "buf_1" });
+        }
+        if (url.includes("sendmessage")) {
+          return makeJsonResponse({ ret: -14, errcode: -14, errmsg: "session expired" });
+        }
+        throw new Error(`Unexpected URL: ${url}`);
+      });
+      const adapter = new WeixinChannelAdapter({
+        backend: h.backend,
+        baseUrl: "https://ilinkai.weixin.qq.com",
+        allowedApiDomains: ["ilinkai.weixin.qq.com"],
+        fetchImpl: fakeFetch,
+        checkResolvedIps: false,
+        retryDelayMs: 5,
+      });
+      adapter.onInboundEvent(async () => {
+        await adapter.sendTextChunk({
+          targetAddress: "weixin:@me",
+          recipientPlatformUserId: "wx_u1",
+          text: "Started a new conversation.",
+          chunkIndex: 0,
+          totalChunks: 1,
+          inboundMessageId: "bot_live_1:1001",
+        });
+      });
+      await adapter.start();
+      await expired.promise;
+      expect(pollCount).toBe(1);
+      expect(adapter.getAccountStatus()).toMatchObject({
+        status: "expired",
+        ilinkBotId: "bot_live_1",
+        botGeneration: 5,
+      });
+      const expiredPuts = vi
+        .mocked(h.backend.putWeixinState)
+        .mock.calls.filter(([req]) => req.status === "expired");
+      expect(expiredPuts).toHaveLength(1);
+      expect(expiredPuts[0]?.[0]).toMatchObject({
+        expected_ilink_bot_id: "bot_live_1",
+        expected_bot_generation: 5,
+      });
+      await adapter.stop();
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("keeps a replacement account active when an older sendmessage returns -14", async () => {
+    const h = createTestHarness();
+    try {
+      const entered = defer<void>();
+      const release = defer<void>();
+      vi.mocked(h.backend.getWeixinState).mockResolvedValue(
+        weixinState({
+          ilink_bot_id: "bot_old",
+          bot_generation: 1,
+          bot_token: "tok_old",
+          weixin_context_token: "ctx_old",
+          get_updates_buf: "cur_old",
+        }),
+      );
+      vi.mocked(h.backend.putWeixinState).mockImplementation(async (req) =>
+        weixinPut({
+          ilink_bot_id: req.expected_ilink_bot_id ?? "bot_old",
+          status: req.status ?? "active",
+          get_updates_buf: req.get_updates_buf ?? "cur_old",
+          bot_generation: req.expected_bot_generation ?? 1,
+        }),
+      );
+      const adapter = new WeixinChannelAdapter({
+        backend: h.backend,
+        baseUrl: "https://ilinkai.weixin.qq.com",
+        allowedApiDomains: ["ilinkai.weixin.qq.com"],
+        checkResolvedIps: false,
+        fetchImpl: async (input) => {
+          const url = String(input);
+          if (!url.includes("sendmessage")) {
+            throw new Error(`Unexpected URL: ${url}`);
+          }
+          entered.resolve();
+          await release.promise;
+          return makeJsonResponse({ ret: -14, errcode: -14, errmsg: "session expired" });
+        },
+      });
+      await adapter.applyPersistedState(
+        weixinState({
+          ilink_bot_id: "bot_old",
+          bot_generation: 1,
+          bot_token: "tok_old",
+          get_updates_buf: "cur_old",
+        }),
+      );
+      const sending = adapter.sendTextChunk({
+        targetAddress: "weixin:@me",
+        recipientPlatformUserId: "wx_u1",
+        text: "old reply",
+        chunkIndex: 0,
+        totalChunks: 1,
+        inboundMessageId: "bot_old:1",
+        weixinContextToken: "ctx_fallback_unused",
+      });
+      await entered.promise;
+      await adapter.applyPersistedState(
+        weixinState({
+          ilink_bot_id: "bot_new",
+          bot_generation: 2,
+          bot_token: "tok_new",
+          get_updates_buf: "cur_new",
+        }),
+      );
+      release.resolve();
+      await expect(sending).rejects.toMatchObject({ outcome: "failed" });
+      expect(adapter.getAccountStatus()).toMatchObject({
+        status: "active",
+        ilinkBotId: "bot_new",
+        botGeneration: 2,
+        getUpdatesBuf: "cur_new",
+      });
+      expect(
+        vi.mocked(h.backend.putWeixinState).mock.calls.filter(([req]) => req.status === "expired"),
+      ).toHaveLength(0);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("lets the later account generation win when two persisted states overlap", async () => {
+    const releases: Array<() => void> = [];
+    const firstEntered = defer<void>();
+    const secondEntered = defer<void>();
+    const adapter = new WeixinChannelAdapter({
+      baseUrl: "https://ilinkai.weixin.qq.com",
+      allowedApiDomains: ["ilinkai.weixin.qq.com"],
+      checkResolvedIps: true,
+      resolveHostIps: () =>
+        new Promise((resolve) => {
+          releases.push(() => resolve(["1.1.1.1"]));
+          if (releases.length === 1) firstEntered.resolve();
+          if (releases.length === 2) secondEntered.resolve();
+        }),
+    });
+    const older = adapter.applyPersistedState(
+      weixinState({
+        ilink_bot_id: "bot_old",
+        bot_generation: 2,
+        bot_token: "tok_old",
+        get_updates_buf: "cur_old",
+      }),
+    );
+    await firstEntered.promise;
+    const newer = adapter.applyPersistedState(
+      weixinState({
+        ilink_bot_id: "bot_new",
+        bot_generation: 4,
+        bot_token: "tok_new",
+        get_updates_buf: "cur_new",
+      }),
+    );
+    await secondEntered.promise;
+    for (const release of releases) release();
+    await Promise.all([older, newer]);
+    expect(adapter.getAccountStatus()).toMatchObject({
+      status: "active",
+      ilinkBotId: "bot_new",
+      botGeneration: 4,
+      getUpdatesBuf: "cur_new",
+    });
+  });
+
+  it("keeps one poll and the committed cursor when the same generation is applied with an empty cursor", async () => {
+    const h = createTestHarness();
+    try {
+      let pollCount = 0;
+      const entered = defer<void>();
+      let releaseFirst: ((response: Response) => void) | undefined;
+      vi.mocked(h.backend.getWeixinState).mockResolvedValue(
+        weixinState({
+          ilink_bot_id: "bot_same",
+          bot_generation: 4,
+          bot_token: "tok_same",
+          get_updates_buf: "committed",
+        }),
+      );
+      const adapter = new WeixinChannelAdapter({
+        backend: h.backend,
+        baseUrl: "https://ilinkai.weixin.qq.com",
+        allowedApiDomains: ["ilinkai.weixin.qq.com"],
+        checkResolvedIps: false,
+        retryDelayMs: 5,
+        fetchImpl: async (input, init) => {
+          const url = String(input);
+          if (!url.includes("getupdates")) {
+            throw new Error(`Unexpected URL: ${url}`);
+          }
+          pollCount += 1;
+          if (pollCount === 1) {
+            entered.resolve();
+            return await new Promise<Response>((resolve, reject) => {
+              const onAbort = () => reject(new Error("aborted"));
+              if (init?.signal?.aborted) {
+                onAbort();
+                return;
+              }
+              init?.signal?.addEventListener("abort", onAbort, { once: true });
+              releaseFirst = (response) => {
+                init?.signal?.removeEventListener("abort", onAbort);
+                resolve(response);
+              };
+            });
+          }
+          return await new Promise<Response>((_resolve, reject) => {
+            const onAbort = () => reject(new Error("aborted"));
+            if (init?.signal?.aborted) {
+              onAbort();
+              return;
+            }
+            init?.signal?.addEventListener("abort", onAbort, { once: true });
+          });
+        },
+      });
+      await adapter.start();
+      await entered.promise;
+      await adapter.applyPersistedState(
+        weixinState({
+          ilink_bot_id: "bot_same",
+          bot_generation: 4,
+          bot_token: "tok_same",
+          get_updates_buf: "",
+        }),
+      );
+      expect(pollCount).toBe(1);
+      expect(adapter.getAccountStatus().getUpdatesBuf).toBe("committed");
+      releaseFirst?.(
+        makeJsonResponse({ ret: 0, msgs: [], get_updates_buf: "committed" }),
+      );
+      await adapter.stop();
+      expect(adapter.getAccountStatus().getUpdatesBuf).toBe("committed");
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("cancels a body that arrives after the headers when the timeout or caller aborts", async () => {
+    const stalled = (flag: { cancelled: boolean }): ReadableStream<Uint8Array> =>
+      new ReadableStream({
+        start() {},
+        cancel() {
+          flag.cancelled = true;
+        },
+      });
+    const timedOut = { cancelled: false };
+    await expect(
+      safeFetchResponse("https://ilinkai.weixin.qq.com/ilink/bot/getupdates", {
+        timeoutMs: 30,
+        checkResolvedIps: false,
+        allowedDomains: ["ilinkai.weixin.qq.com"],
+        fetchImpl: async () =>
+          new Response(stalled(timedOut), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+      }),
+    ).rejects.toMatchObject({ name: "SafeFetchError", code: "timeout" });
+    expect(timedOut.cancelled).toBe(true);
+
+    const aborted = { cancelled: false };
+    const parent = new AbortController();
+    const pending = safeFetchResponse(
+      "https://ilinkai.weixin.qq.com/ilink/bot/getupdates",
+      {
+        timeoutMs: 10_000,
+        signal: parent.signal,
+        checkResolvedIps: false,
+        allowedDomains: ["ilinkai.weixin.qq.com"],
+        fetchImpl: async () => {
+          queueMicrotask(() => parent.abort());
+          return new Response(stalled(aborted), { status: 200 });
+        },
+      },
+    );
+    await expect(pending).rejects.toMatchObject({
+      name: "SafeFetchError",
+      code: "timeout",
+    });
+    expect(aborted.cancelled).toBe(true);
+
+    const completed = await safeFetchResponse(
+      "https://ilinkai.weixin.qq.com/ilink/bot/getupdates",
+      {
+        timeoutMs: 1000,
+        checkResolvedIps: false,
+        allowedDomains: ["ilinkai.weixin.qq.com"],
+        fetchImpl: async () =>
+          new Response('{"ret":0}', {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          }),
+      },
+    );
+    expect(await completed.text()).toBe('{"ret":0}');
+  });
+
+  it("passes the current inbound id on /unbind text and file delivery, and does not send with another generation's token", async () => {
+    const h = createTestHarness();
+    try {
+      await h.weixinAdapter.emitInbound(weixinDm("m_unbind", "/unbind"));
+      expect(h.weixinAdapter.sentTexts.at(-1)?.text).toBe(
+        "Unlinked your weixin account from Dalton.",
+      );
+      expect(h.weixinAdapter.sentTexts.at(-1)?.inboundMessageId).toBe("m_unbind");
+
+      const delivered = await h.app.deliveryService.executeDelivery({
+        deliveryKey: "notice:weixin:m_file:send",
+        kind: "notice",
+        userId: USER_ID,
+        platform: "weixin",
+        target: "weixin:@me",
+        inboundMessageId: "m_file_in",
+        text: "report",
+        files: [{ path: "report.pdf", workspace_id: "ws_1" }],
+      });
+      expect(delivered.status).toBe("sent");
+      expect(
+        h.weixinAdapter.sentTexts.find((row) => row.inboundMessageId === "m_file_in"),
+      ).toMatchObject({ inboundMessageId: "m_file_in" });
+      expect(h.weixinAdapter.sentFiles[0]?.inboundMessageId).toBe("m_file_in");
+
+      const urls: string[] = [];
+      vi.mocked(h.backend.getWeixinState).mockImplementation(async (includeTokenOrOptions) => {
+        const opts =
+          includeTokenOrOptions && typeof includeTokenOrOptions === "object"
+            ? includeTokenOrOptions
+            : undefined;
+        const inboundMessageId = opts?.inbound_message_id ?? "";
+        return weixinState({
+          ilink_bot_id: inboundMessageId ? "bot_old" : "bot_live_1",
+          bot_generation: 5,
+          weixin_context_token: inboundMessageId ? null : "ctx_live",
+        });
+      });
+      const adapter = new WeixinChannelAdapter({
+        backend: h.backend,
+        ilinkBotId: "bot_live_1",
+        botToken: "tok_current",
+        botGeneration: 5,
+        baseUrl: "https://ilinkai.weixin.qq.com",
+        allowedApiDomains: ["ilinkai.weixin.qq.com"],
+        checkResolvedIps: false,
+        fetchImpl: async (input) => {
+          urls.push(String(input));
+          return makeJsonResponse({ ret: 0 });
+        },
+      });
+      await expect(
+        adapter.sendTextChunk({
+          targetAddress: "weixin:@me",
+          recipientPlatformUserId: "wx_alice",
+          text: "stale",
+          chunkIndex: 0,
+          totalChunks: 1,
+          inboundMessageId: "bot_old:msg",
+          weixinContextToken: "ctx_fallback_unused",
+        }),
+      ).rejects.toMatchObject({ outcome: "failed" });
+      expect(urls.some((url) => url.includes("sendmessage"))).toBe(false);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("retries only the cursor commit after registration, and a completed row does not open another model turn", async () => {
+    const h = createTestHarness();
+    try {
+      let pollCount = 0;
+      let inboundCount = 0;
+      const pollsAtCommit: number[] = [];
+      let commitAttempts = 0;
+      const secondPoll = defer<void>();
+      vi.mocked(h.backend.getWeixinState).mockResolvedValue(weixinState());
+      vi.mocked(h.backend.putWeixinState).mockImplementation(async (req) => {
+        if (typeof req.get_updates_buf === "string" && req.get_updates_buf.length > 0) {
+          commitAttempts += 1;
+          pollsAtCommit.push(pollCount);
+          const updated = commitAttempts >= 3;
+          return weixinPut({
+            updated,
+            get_updates_buf: updated ? req.get_updates_buf : "buf_0",
+          });
+        }
+        return weixinPut({ status: req.status ?? "active" });
+      });
+      const adapter = new WeixinChannelAdapter({
+        backend: h.backend,
+        baseUrl: "https://ilinkai.weixin.qq.com",
+        allowedApiDomains: ["ilinkai.weixin.qq.com"],
+        checkResolvedIps: false,
+        retryDelayMs: 5,
+        fetchImpl: async (input, init) => {
+          const url = String(input);
+          if (!url.includes("getupdates")) {
+            throw new Error(`Unexpected URL: ${url}`);
+          }
+          pollCount += 1;
+          if (pollCount === 1) {
+            return makeJsonResponse({
+              ret: 0,
+              get_updates_buf: "buf_1",
+              msgs: [
+                {
+                  message_id: "2001",
+                  from_user_id: "wx_u1",
+                  context_token: "ctx_1",
+                  item_list: [{ type: 1, text_item: { text: "hello" } }],
+                },
+              ],
+            });
+          }
+          if (pollCount === 2) {
+            secondPoll.resolve();
+            return makeJsonResponse({ ret: 0, msgs: [], get_updates_buf: "buf_1" });
+          }
+          return await new Promise<Response>((_resolve, reject) => {
+            const onAbort = () => reject(new Error("aborted"));
+            if (init?.signal?.aborted) {
+              onAbort();
+              return;
+            }
+            init?.signal?.addEventListener("abort", onAbort, { once: true });
+          });
+        },
+      });
+      adapter.onInboundEvent(async () => {
+        inboundCount += 1;
+      });
+      await adapter.start();
+      await secondPoll.promise;
+      expect(inboundCount).toBe(1);
+      expect(commitAttempts).toBe(3);
+      expect(pollsAtCommit).toEqual([1, 1, 1]);
+      await adapter.stop();
+
+      vi.mocked(h.backend.registerAndResolveInbound).mockImplementation(async (req) => ({
+        ...emptyInbound(req),
+        existing_status: "completed",
+        linked: true,
+        allowed: true,
+        dalton_user_id: USER_ID,
+        fallback_pending: false,
+        thread_id: "thread_done",
+        run_id: "run_done",
+      }));
+      await h.weixinAdapter.emitInbound(weixinDm("m_done", "hello again"));
+      expect(h.backend.createThreadMessages).not.toHaveBeenCalled();
+    } finally {
+      await h.cleanup();
+    }
   });
 
   it("strips unsupported Markdown syntax cleanly via filterWeixinMarkdown", () => {

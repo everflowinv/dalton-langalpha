@@ -295,6 +295,7 @@ export class DeliveryService {
           newThread: i === 0 ? options.newThread : false,
           threadScopeKey: options.threadScopeKey ?? null,
           weixinContextToken,
+          inboundMessageId: options.inboundMessageId ?? null,
         });
         sentChunks += 1;
         platformMessageIds.push(res.messageId);
@@ -402,6 +403,7 @@ export class DeliveryService {
             mimeType: downloaded.mimeType,
             threadScopeKey: options.threadScopeKey ?? null,
             weixinContextToken,
+            inboundMessageId: options.inboundMessageId ?? null,
           });
           platformMessageIds.push(sendRes.messageId);
           anyFileSucceeded = true;

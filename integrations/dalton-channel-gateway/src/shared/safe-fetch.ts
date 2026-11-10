@@ -310,9 +310,18 @@ export async function readStreamWithLimit(
     await cancelSource();
   };
 
+  let abortedBySignal = Boolean(options.signal?.aborted);
+  const onAbort = (): void => {
+    abortedBySignal = true;
+    void safeCancel();
+  };
+  if (options.signal && !options.signal.aborted) {
+    options.signal.addEventListener("abort", onAbort);
+  }
+
   try {
     while (true) {
-      if (options.signal?.aborted) {
+      if (options.signal?.aborted || abortedBySignal) {
         await safeCancel();
         throw new SafeFetchError("timeout", "Attachment stream aborted");
       }
@@ -350,6 +359,11 @@ export async function readStreamWithLimit(
         await safeCancel();
       }
 
+      if (options.signal?.aborted || abortedBySignal) {
+        await safeCancel();
+        throw new SafeFetchError("timeout", "Attachment stream aborted");
+      }
+
       if (raced.done) {
         exhausted = true;
         break;
@@ -368,8 +382,19 @@ export async function readStreamWithLimit(
     }
   } catch (err) {
     await safeCancel();
+    if (options.signal?.aborted || abortedBySignal) {
+      if (err instanceof SafeFetchError && err.code === "timeout") {
+        throw err;
+      }
+      throw new SafeFetchError("timeout", "Attachment stream aborted", {
+        cause: err,
+      });
+    }
     throw err;
   } finally {
+    if (options.signal) {
+      options.signal.removeEventListener("abort", onAbort);
+    }
     if (!exhausted && !cancelled) {
       await safeCancel();
     }
@@ -406,6 +431,7 @@ export interface SafeFetchRequestOptions {
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
   maxRedirects?: number;
+  maxBytes?: number;
 }
 
 export interface SafeFetchResult {
@@ -672,7 +698,38 @@ export async function safeFetchResponse(
         continue;
       }
 
-      return response;
+      const maxBytes = Math.min(
+        MAX_CIPHERTEXT_ATTACHMENT_BYTES,
+        Math.max(1, options.maxBytes ?? MAX_CIPHERTEXT_ATTACHMENT_BYTES),
+      );
+      let payload: Buffer;
+      try {
+        payload = response.body
+          ? await readStreamWithLimit(response.body, {
+              maxBytes,
+              chunkIdleTimeoutMs: 0,
+              signal: controller.signal,
+            })
+          : Buffer.alloc(0);
+      } catch (error) {
+        await cancelResponseBody(response);
+        if (error instanceof SafeFetchError) {
+          throw error;
+        }
+        if (controller.signal.aborted) {
+          throw new SafeFetchError(
+            "timeout",
+            `Request timed out or aborted after ${timeoutMs}ms`,
+            { cause: error },
+          );
+        }
+        throw error;
+      }
+      return new Response(new Uint8Array(payload), {
+        status: response.status,
+        statusText: response.statusText,
+        headers: new Headers(response.headers),
+      });
     }
   } finally {
     if (timer !== undefined) {

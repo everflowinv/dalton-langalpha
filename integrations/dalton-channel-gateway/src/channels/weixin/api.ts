@@ -328,7 +328,19 @@ async function executeIlinkJsonRequest<T extends { ret?: number; errcode?: numbe
     });
   }
 
-  const rawText = await response.text();
+  let rawText: string;
+  try {
+    rawText = await response.text();
+  } catch (err) {
+    throw new WeixinApiError({
+      kind: "network_error",
+      endpoint: params.endpoint,
+      message: `${params.endpoint} response body read failed: ${err instanceof Error ? err.message : String(err)}`,
+      status: response.status,
+      requestSent: requestDispatched,
+      cause: err,
+    });
+  }
   if (response.status === 429) {
     const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));
     throw new WeixinApiError({

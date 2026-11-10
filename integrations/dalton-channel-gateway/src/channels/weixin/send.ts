@@ -70,6 +70,24 @@ export interface WeixinSendContext {
   onSessionExpired?: (err: WeixinApiError) => Promise<void> | void;
 }
 
+function isUncertainDispatchedResult(err: WeixinApiError): boolean {
+  if (!err.requestSent) return false;
+  if (
+    err.kind === "business_error" ||
+    err.kind === "rate_limited" ||
+    err.kind === "session_expired"
+  ) {
+    return false;
+  }
+  if (err.kind === "network_error") return true;
+  if (err.kind === "http_error") {
+    const status = err.status ?? 0;
+    if (status >= 500) return true;
+    if (status >= 200 && status < 300) return true;
+  }
+  return false;
+}
+
 async function classifyAndThrowSendMessageError(
   err: unknown,
   onSessionExpired?: (err: WeixinApiError) => Promise<void> | void,
@@ -95,11 +113,7 @@ async function classifyAndThrowSendMessageError(
         retryAfterMs: err.retryAfterMs,
       });
     }
-    if (
-      err.requestSent &&
-      (err.kind === "network_error" ||
-        (err.kind === "http_error" && (err.status ?? 0) >= 500))
-    ) {
+    if (isUncertainDispatchedResult(err)) {
       throw new ChannelDeliveryError(
         `Weixin sendmessage response lost after dispatch: ${err.message}`,
         {

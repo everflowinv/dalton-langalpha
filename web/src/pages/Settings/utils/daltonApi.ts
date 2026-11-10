@@ -786,17 +786,15 @@ export interface DaltonChannelIdentityItem {
   last_active_at: string | null;
 }
 
+/** Public Weixin bot fields returned by the bindings API. */
 export interface DaltonWeixinBotPublicState {
-  connected: boolean;
-  status: 'unconfigured' | 'connected' | 'expired' | 'error';
+  configured: boolean;
+  status: 'unconfigured' | 'active' | 'expired' | 'error' | string;
   ilink_bot_id: string | null;
+  owner_user_id?: string | null;
   ilink_user_id: string | null;
-  base_url: string | null;
+  ilink_username?: string | null;
   bot_generation?: number;
-  bound_user_id?: string | null;
-  bound_user_tier?: string | null;
-  bound_user_is_active?: boolean | null;
-  bound_is_self?: boolean;
   updated_at?: string | null;
 }
 
@@ -829,31 +827,27 @@ export interface DaltonChannelUnbindResponse {
   platform: 'feishu' | 'weixin' | string;
 }
 
+/** QR statuses the login API returns after normalization. */
 export type DaltonWeixinQrPublicStatus =
   | 'wait'
   | 'scaned'
-  | 'need_verifycode'
   | 'scaned_but_redirect'
-  | 'verify_code_blocked'
-  | 'expired'
-  | 'binded_redirect'
-  | 'saving'
+  | 'verify_code'
   | 'confirmed'
-  | 'error'
-  | 'superseded';
+  | 'expired'
+  | 'error';
 
 export interface DaltonWeixinQrPublicResponse {
   session_key: string;
   status: DaltonWeixinQrPublicStatus;
   connected?: boolean;
   qrcode_url?: string | null;
+  qrcode_img_content?: string | null;
   expires_at?: string | null;
   ilink_bot_id?: string | null;
   ilink_user_id?: string | null;
-  base_url?: string | null;
+  ilink_username?: string | null;
   bot_generation?: number | null;
-  bound_user_id?: string | null;
-  verify_code_accepted?: boolean | null;
   message?: string | null;
 }
 

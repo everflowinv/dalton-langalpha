@@ -336,29 +336,44 @@ class InMemoryChannelStore:
             return [dict(row)]
 
         # Weixin context tokens (d032)
-        if "SELECT seq FROM dalton_channel_weixin_context_tokens" in norm:
+        if "SELECT seq, seq_source FROM dalton_channel_weixin_context_tokens" in norm:
             key = (str(params[0]), int(params[1]), str(params[2]))
             row = self.weixin_context_tokens.get(key)
-            return [{"seq": row["seq"]}] if row else []
+            if not row:
+                return []
+            return [
+                {
+                    "seq": row["seq"],
+                    "seq_source": row.get("seq_source") or "protocol",
+                }
+            ]
 
         if "INSERT INTO dalton_channel_weixin_context_tokens" in norm:
-            bot_id, bot_gen, puid, ctok, _enc_key, seq_val = (
+            bot_id, bot_gen, puid, ctok, _enc_key, seq_val, seq_source = (
                 str(params[0]),
                 int(params[1]),
                 str(params[2]),
                 str(params[3]),
                 str(params[4]),
                 int(params[5]),
+                str(params[6]),
             )
             key = (bot_id, bot_gen, puid)
             prev = self.weixin_context_tokens.get(key)
-            if prev is None or seq_val >= int(prev.get("seq") or 0):
+            prev_seq = int(prev.get("seq") or 0) if prev is not None else 0
+            prev_source = (
+                str(prev.get("seq_source") or "protocol") if prev is not None else ""
+            )
+            if prev is None or cg_db._context_order_supersedes(
+                seq_source, seq_val, prev_source, prev_seq
+            ):
                 self.weixin_context_tokens[key] = {
                     "ilink_bot_id": bot_id,
                     "bot_generation": bot_gen,
                     "platform_user_id": puid,
                     "encrypted_context_token": ctok,
                     "seq": seq_val,
+                    "seq_source": seq_source,
                     "updated_at": now,
                 }
             return []
@@ -376,6 +391,7 @@ class InMemoryChannelStore:
                     {
                         "context_token": row["encrypted_context_token"],
                         "seq": int(row.get("seq") or 0),
+                        "seq_source": row.get("seq_source") or "protocol",
                     }
                 ]
             return []
@@ -497,26 +513,32 @@ class InMemoryChannelStore:
             "UPDATE dalton_channel_identities SET weixin_context_token = NULL, encrypted_weixin_context_token = pgp_sym_encrypt"
             in norm
         ):
-            tok, _enc_key, bot_id, bot_gen, seq_val, puid = (
+            tok, _enc_key, bot_id, bot_gen, seq_val, seq_source, puid = (
                 str(params[0]),
                 str(params[1]),
                 str(params[2]),
                 int(params[3]),
                 int(params[4]),
                 str(params[5]),
+                str(params[6]),
             )
             for row in self.identities.values():
                 if row["platform"] == "weixin" and row["platform_user_id"] == puid:
+                    existing_seq = int(row.get("weixin_context_seq") or 0)
+                    existing_source = str(row.get("weixin_context_seq_source") or "")
                     if (
                         row.get("weixin_context_bot_id") != bot_id
                         or int(row.get("weixin_context_bot_generation") or 0) != bot_gen
-                        or int(row.get("weixin_context_seq") or 0) <= seq_val
+                        or cg_db._context_order_supersedes(
+                            seq_source, seq_val, existing_source, existing_seq
+                        )
                     ):
                         row["weixin_context_token"] = tok
                         row["encrypted_weixin_context_token"] = tok
                         row["weixin_context_bot_id"] = bot_id
                         row["weixin_context_bot_generation"] = bot_gen
                         row["weixin_context_seq"] = seq_val
+                        row["weixin_context_seq_source"] = seq_source
                         row["updated_at"] = now
             return []
 
@@ -543,6 +565,7 @@ class InMemoryChannelStore:
                 row["weixin_context_bot_id"] = None
                 row["weixin_context_bot_generation"] = None
                 row["weixin_context_seq"] = 0
+                row["weixin_context_seq_source"] = ""
                 row["weixin_context_updated_at"] = None
                 row["updated_at"] = now
             return []
@@ -576,16 +599,19 @@ class InMemoryChannelStore:
                 w_bot_id = str(params[7])
                 w_bot_gen = int(params[8])
                 w_seq = int(params[9])
+                w_source = str(params[10]) if len(params) > 10 else "protocol"
             elif len(params) >= 6:
                 wtok = params[5]
                 w_bot_id = (existing or {}).get("weixin_context_bot_id")
                 w_bot_gen = (existing or {}).get("weixin_context_bot_generation")
                 w_seq = int((existing or {}).get("weixin_context_seq") or 0)
+                w_source = str((existing or {}).get("weixin_context_seq_source") or "")
             else:
                 wtok = None
                 w_bot_id = None
                 w_bot_gen = None
                 w_seq = 0
+                w_source = ""
             row = {
                 "id": existing["id"] if existing else uuid4(),
                 "user_id": uid,
@@ -598,6 +624,7 @@ class InMemoryChannelStore:
                 "weixin_context_bot_id": w_bot_id,
                 "weixin_context_bot_generation": w_bot_gen,
                 "weixin_context_seq": w_seq,
+                "weixin_context_seq_source": w_source,
                 "created_at": existing["created_at"] if existing else now,
                 "updated_at": now,
             }
@@ -1091,6 +1118,25 @@ class InMemoryChannelStore:
                             "external_thread_id": r.get("external_thread_id"),
                         }
                     ]
+            return []
+
+        if (
+            "UPDATE dalton_channel_inbound_events" in norm
+            and "invalid_inbound_event" in norm
+            and "status = 'pending'" in norm
+        ):
+            for row in self.inbound_events.values():
+                if row.get("status") != "pending":
+                    continue
+                payload = row.get("raw_payload") or {}
+                if not cg_db._payload_marks_invalid_inbound(payload):
+                    continue
+                merged = dict(payload)
+                merged["invalid_inbound_event"] = True
+                merged["deny_reason"] = "invalid_inbound_event"
+                row["status"] = "ignored"
+                row["raw_payload"] = merged
+                row["updated_at"] = now
             return []
 
         if "SELECT * FROM dalton_channel_inbound_events WHERE status IN" in norm:
@@ -4162,4 +4208,256 @@ def test_weixin_group_rejection_context_token_monotonic_seq_and_qr_login_concurr
     assert "context_token" not in shaped_qr
     assert "secret123" not in (shaped_qr.get("qrcode_url") or "")
     assert "signature" not in (shaped_qr.get("qrcode_url") or "")
+
+
+def test_weixin_context_order_source_and_invalid_inbound_unit(
+    channel_test_env: dict[str, Any],
+) -> None:
+    """Context order comes from the field name, and a missing message id stays ignored.
+
+    `seq` / `weixin_context_seq` is protocol and advances only when the value is
+    greater. `create_time_ms` is platform time and is used only when no protocol
+    seq is present. A message with neither field takes the next receive ordinal
+    while the saved source is receive. A higher-priority field replaces a lower
+    one even when its number is smaller. The same message id never rolls the
+    token back. Binding an older message copies the current token.
+    """
+    client: TestClient = channel_test_env["client"]
+    headers = channel_test_env["headers"]
+    store: InMemoryChannelStore = channel_test_env["store"]
+
+    started = client.put(
+        "/api/v1/dalton/channels/internal/weixin-state",
+        headers=headers,
+        json={
+            "login_session_action": "start",
+            "login_session_key": "sess-order-1",
+            "login_owner_user_id": "u-admin",
+            "login_status": "wait",
+            "login_qrcode": "qr-order-1",
+            "login_qrcode_img_content": "data:image/png;base64,AAAA",
+            "login_expires_in_seconds": 300,
+        },
+    )
+    assert started.status_code == 200
+    confirmed = client.put(
+        "/api/v1/dalton/channels/internal/weixin-state",
+        headers=headers,
+        json={
+            "login_session_action": "confirm",
+            "login_session_key": "sess-order-1",
+            "login_owner_user_id": "u-admin",
+            "expected_login_version": started.json()["login_version"],
+            "expected_bot_generation": started.json()["expected_bot_generation"],
+            "ilink_bot_id": "wx_bot_order@im.wechat",
+            "owner_user_id": "u-admin",
+            "bot_token": "secret-bot-token-order",
+            "base_url": "https://ilinkai.weixin.qq.com",
+            "status": "active",
+            "ilink_user_id": "wx_admin_order@im.wechat",
+            "ilink_username": "Order Admin",
+        },
+    )
+    assert confirmed.status_code == 200
+    assert confirmed.json()["updated"] is True
+    bot_id = "wx_bot_order@im.wechat"
+    gen = int(confirmed.json()["bot_generation"])
+    alice = "wx_order_alice@im.wechat"
+    bob = "wx_order_bob@im.wechat"
+    carol = "wx_order_carol@im.wechat"
+
+    def post(puid: str, mid: str, token: str, payload: dict[str, Any], **extra: Any) -> dict[str, Any]:
+        response = client.post(
+            "/api/v1/dalton/channels/internal/inbound/register-and-resolve",
+            headers=headers,
+            json={
+                "platform": "weixin",
+                "platform_user_id": puid,
+                "chat_type": "dm",
+                "chat_address": "weixin:@me",
+                "thread_scope_key": f"dm:{puid}",
+                "message_id": mid,
+                "weixin_context_token": token,
+                "raw_payload": {"ilink_bot_id": bot_id, **payload},
+                **extra,
+            },
+        )
+        assert response.status_code == 200
+        return response.json()
+
+    def saved(puid: str) -> dict[str, Any]:
+        return store.weixin_context_tokens[(bot_id, gen, puid)]
+
+    time_mid = f"{bot_id}:time"
+    post(alice, time_mid, "T_time", {"create_time_ms": 1_700_000_000_000})
+    assert saved(alice)["seq_source"] == "platform_time"
+    assert saved(alice)["seq"] == 1_700_000_000_000
+    assert saved(alice)["encrypted_context_token"] == "T_time"
+
+    post(alice, f"{bot_id}:seq8", "T_seq8", {"seq": 8})
+    assert saved(alice)["seq_source"] == "protocol"
+    assert saved(alice)["seq"] == 8
+    assert saved(alice)["encrypted_context_token"] == "T_seq8"
+    assert store.inbound_events[("weixin", time_mid)]["weixin_context_seq"] == 1_700_000_000_000
+
+    post(alice, f"{bot_id}:seq8-again", "T_seq8_same", {"seq": 8})
+    post(alice, f"{bot_id}:seq3", "T_seq3", {"seq": 3})
+    assert saved(alice)["encrypted_context_token"] == "T_seq8"
+
+    post(alice, f"{bot_id}:seq-big", "T_big", {"seq": 1_700_000_000_000})
+    assert saved(alice)["seq_source"] == "protocol"
+    assert saved(alice)["seq"] == 1_700_000_000_000
+    assert saved(alice)["encrypted_context_token"] == "T_big"
+
+    post(alice, f"{bot_id}:later-time", "T_later_time", {"create_time_ms": 1_800_000_000_000})
+    post(alice, f"{bot_id}:no-order", "T_receive", {})
+    post(alice, time_mid, "T_replay", {"create_time_ms": 1_900_000_000_000})
+    assert saved(alice)["seq_source"] == "protocol"
+    assert saved(alice)["seq"] == 1_700_000_000_000
+    assert saved(alice)["encrypted_context_token"] == "T_big"
+
+    channel_test_env["current_web_user"]["user_id"] = "u-alice"
+    code = client.post("/api/v1/dalton/channels/bind-codes", json={"platform": "weixin"}).json()["code"]
+    bound = client.post(
+        "/api/v1/dalton/channels/internal/bind-code/consume",
+        headers=headers,
+        json={
+            "action": "bind",
+            "platform": "weixin",
+            "platform_user_id": alice,
+            "platform_username": "Alice Order",
+            "code": code,
+            "is_group": False,
+            "inbound_message_id": time_mid,
+            "weixin_context_token": "T_time",
+        },
+    )
+    assert bound.status_code == 200
+    assert bound.json()["ok"] is True
+    assert saved(alice)["encrypted_context_token"] == "T_big"
+    identity = store.identities[("u-alice", "weixin")]
+    assert identity["weixin_context_seq"] == 1_700_000_000_000
+    assert identity["weixin_context_seq_source"] == "protocol"
+    assert identity["encrypted_weixin_context_token"] == "T_big"
+
+    post(bob, f"{bot_id}:recv1", "R1", {})
+    assert saved(bob)["seq_source"] == "receive"
+    assert saved(bob)["seq"] == 1
+    post(bob, f"{bot_id}:recv2", "R2", {})
+    assert saved(bob)["seq_source"] == "receive"
+    assert saved(bob)["seq"] == 2
+    assert saved(bob)["encrypted_context_token"] == "R2"
+    post(bob, f"{bot_id}:ptime", "R3", {"create_time_ms": 5000})
+    assert saved(bob)["seq_source"] == "platform_time"
+    assert saved(bob)["seq"] == 5000
+    post(bob, f"{bot_id}:ptime-old", "R3_old", {"create_time_ms": 4000})
+    post(bob, f"{bot_id}:ptime-new", "R4", {"create_time_ms": 6000})
+    assert saved(bob)["seq"] == 6000
+    assert saved(bob)["encrypted_context_token"] == "R4"
+    post(bob, f"{bot_id}:recv1", "R1_replay", {})
+    assert saved(bob)["encrypted_context_token"] == "R4"
+    post(bob, f"{bot_id}:proto", "R5", {"seq": 4})
+    assert saved(bob)["seq_source"] == "protocol"
+    assert saved(bob)["seq"] == 4
+    assert saved(bob)["encrypted_context_token"] == "R5"
+    post(bob, f"{bot_id}:ptime-after", "R6", {"create_time_ms": 999_999})
+    assert saved(bob)["seq_source"] == "protocol"
+    assert saved(bob)["encrypted_context_token"] == "R5"
+
+    post(
+        carol,
+        f"{bot_id}:explicit",
+        "P1",
+        {"create_time_ms": 50},
+    )
+    post(
+        carol,
+        f"{bot_id}:explicit-seq",
+        "P2",
+        {"create_time_ms": 9_999_999_999_999},
+        weixin_context_seq=2,
+    )
+    assert saved(carol)["seq_source"] == "protocol"
+    assert saved(carol)["seq"] == 2
+    assert saved(carol)["encrypted_context_token"] == "P2"
+
+    workspaces_before = len(store.workspaces)
+    invalid_mid = f"{bot_id}:invalid:missing-message-id"
+    invalid_first = post(
+        alice,
+        invalid_mid,
+        "T_invalid",
+        {"invalid_inbound_event": True, "rejected_reason": "invalid_inbound_event"},
+    )
+    assert invalid_first["allowed"] is False
+    assert invalid_first["deny_reason"] == "invalid_inbound_event"
+    assert invalid_first["workspace_id"] is None
+    assert store.inbound_events[("weixin", invalid_mid)]["status"] == "ignored"
+    invalid_replay = post(
+        alice,
+        invalid_mid,
+        "T_invalid_replay",
+        {"invalid_inbound_event": True, "rejected_reason": "invalid_inbound_event"},
+    )
+    assert invalid_replay["existing_status"] == "ignored"
+    assert invalid_replay["deny_reason"] == "invalid_inbound_event"
+    assert invalid_replay["workspace_id"] is None
+    assert len(store.workspaces) == workspaces_before
+
+    def seed(mid: str, status: str, payload: dict[str, Any]) -> None:
+        store.inbound_events[("weixin", mid)] = {
+            "platform": "weixin",
+            "message_id": mid,
+            "request_key": uuid4(),
+            "dalton_user_id": "u-alice" if status == "completed" else None,
+            "chat_type": "dm",
+            "chat_address": "weixin:@me",
+            "thread_scope_key": f"dm:{alice}",
+            "status": status,
+            "fallback_pending": False,
+            "workspace_id": None,
+            "raw_payload": dict(payload),
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+        }
+
+    pending_mid = f"{bot_id}:pending-invalid"
+    completed_mid = f"{bot_id}:completed-row"
+    recover_mid = f"{bot_id}:recover-invalid"
+    valid_mid = f"{bot_id}:recover-valid"
+    seed(pending_mid, "pending", {"invalid_inbound_event": True, "marker": "pending-invalid"})
+    seed(completed_mid, "completed", {"marker": "keep-completed"})
+    seed(recover_mid, "pending", {"invalid_inbound_event": True, "marker": "recover-invalid"})
+    seed(valid_mid, "pending", {"marker": "still-valid"})
+
+    pending_again = post(
+        alice,
+        pending_mid,
+        "T_pending",
+        {"invalid_inbound_event": True, "marker": "pending-again"},
+    )
+    assert pending_again["deny_reason"] == "invalid_inbound_event"
+    assert store.inbound_events[("weixin", pending_mid)]["status"] == "ignored"
+    completed_again = post(
+        alice,
+        completed_mid,
+        "T_completed",
+        {"invalid_inbound_event": True, "marker": "should-not-replace"},
+    )
+    assert completed_again["existing_status"] == "completed"
+    assert store.inbound_events[("weixin", completed_mid)]["status"] == "completed"
+    assert store.inbound_events[("weixin", completed_mid)]["raw_payload"]["marker"] == "keep-completed"
+
+    recovered = client.get(
+        "/api/v1/dalton/channels/internal/recover",
+        headers=headers,
+        params={"mode": "startup"},
+    )
+    assert recovered.status_code == 200
+    recovered_ids = {row["message_id"] for row in recovered.json()["inbound_events"]}
+    assert recover_mid not in recovered_ids
+    assert valid_mid in recovered_ids
+    assert store.inbound_events[("weixin", recover_mid)]["status"] == "ignored"
+    assert store.inbound_events[("weixin", valid_mid)]["status"] == "pending"
+    assert invalid_mid not in recovered_ids
 

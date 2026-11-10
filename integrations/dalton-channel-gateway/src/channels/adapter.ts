@@ -44,6 +44,7 @@ export interface SendTextChunkOptions {
   newThread?: boolean;
   threadScopeKey?: string | null;
   weixinContextToken?: string | null;
+  inboundMessageId?: string | null;
 }
 
 export interface SendTextChunkResult {
@@ -60,6 +61,7 @@ export interface SendFileOptions {
   mimeType: string;
   threadScopeKey?: string | null;
   weixinContextToken?: string | null;
+  inboundMessageId?: string | null;
 }
 
 export interface SendFileResult {

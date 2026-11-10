@@ -237,6 +237,7 @@ function hasCdnReference(media: CDNMedia | undefined): media is CDNMedia {
 export interface ParseWeixinInboundOptions {
   ilinkBotId: string;
   botGeneration: number;
+  /** Context order is `msg.seq` only. This field is not a sequence. */
   batchSeq?: number;
 }
 
@@ -252,11 +253,9 @@ export function parseWeixinInboundMessage(
     typeof msg.from_user_id === "string" ? msg.from_user_id.trim() : "";
   const rawMessageId = getWeixinRawMessageId(msg);
 
-  const explicitSeq =
-    parseNumericSize(msg.seq) ??
-    parseNumericSize(msg.create_time_ms) ??
-    opts.batchSeq ??
-    Date.now();
+  const protocolSeq = parseNumericSize(msg.seq);
+  const contextSeq =
+    protocolSeq !== undefined && protocolSeq > 0 ? protocolSeq : undefined;
 
   if (isWeixinGroupMessage(msg)) {
     const groupId =
@@ -279,7 +278,7 @@ export function parseWeixinInboundMessage(
       attachments: [],
       weixinBotId: ilinkBotId,
       weixinBotGeneration: botGeneration,
-      weixinContextSeq: explicitSeq,
+      ...(contextSeq !== undefined ? { weixinContextSeq: contextSeq } : {}),
       rawPayload: {
         platform_user_id: fromUserId || "unknown_user",
         ilink_bot_id: ilinkBotId,
@@ -306,7 +305,7 @@ export function parseWeixinInboundMessage(
       attachments: [],
       weixinBotId: ilinkBotId,
       weixinBotGeneration: botGeneration,
-      weixinContextSeq: explicitSeq,
+      ...(contextSeq !== undefined ? { weixinContextSeq: contextSeq } : {}),
       rawPayload: {
         platform_user_id: fromUserId,
         ilink_bot_id: ilinkBotId,
@@ -478,14 +477,16 @@ export function parseWeixinInboundMessage(
     ...(contextToken ? { weixinContextToken: contextToken } : {}),
     weixinBotId: ilinkBotId,
     weixinBotGeneration: botGeneration,
-    weixinContextSeq: explicitSeq,
+    ...(contextSeq !== undefined ? { weixinContextSeq: contextSeq } : {}),
     ...(voiceWithoutTranscription ? { voiceWithoutTranscription: true } : {}),
     rawPayload: {
       platform_user_id: fromUserId,
       ilink_bot_id: ilinkBotId,
       bot_generation: botGeneration,
       raw_message_id: rawMessageId,
-      weixin_context_seq: explicitSeq,
+      ...(contextSeq !== undefined
+        ? { seq: contextSeq, weixin_context_seq: contextSeq }
+        : {}),
       ...(msg.create_time_ms !== undefined
         ? { create_time_ms: msg.create_time_ms }
         : {}),

@@ -347,35 +347,6 @@ export class WeixinQrLoginManager {
       );
     }
 
-    if (state.login_status === "confirmed") {
-      const confirmed = state.login_confirmed_result;
-      return {
-        valid: false,
-        response: shapePublicQrWaitResponse({
-          sessionKey,
-          status: "confirmed",
-          connected: true,
-          ilinkBotId:
-            (typeof confirmed?.ilink_bot_id === "string"
-              ? confirmed.ilink_bot_id
-              : null) ?? state.ilink_bot_id,
-          ilinkUserId:
-            (typeof confirmed?.ilink_user_id === "string"
-              ? confirmed.ilink_user_id
-              : null) ?? state.ilink_user_id,
-          ilinkUsername:
-            (typeof confirmed?.ilink_username === "string"
-              ? confirmed.ilink_username
-              : null) ?? state.ilink_username,
-          botGeneration:
-            (typeof confirmed?.bot_generation === "number"
-              ? confirmed.bot_generation
-              : null) ?? state.bot_generation,
-          expiresAt: state.login_expires_at,
-        }),
-      };
-    }
-
     if (state.login_status === "expired") {
       return {
         valid: false,
@@ -420,12 +391,107 @@ export class WeixinQrLoginManager {
     return { valid: true };
   }
 
+  private async finishConfirmedSession(
+    userId: string,
+    sessionKey: string,
+  ): Promise<WeixinQrPublicWaitResponse> {
+    const state = await this.backend.getWeixinState({ include_token: true });
+    if (!state.login_session_key || state.login_session_key !== sessionKey) {
+      return shapePublicQrWaitResponse({
+        sessionKey,
+        status: "expired",
+        connected: false,
+        message: "QR login session has been superseded or expired.",
+      });
+    }
+    if (state.login_owner_user_id && state.login_owner_user_id !== userId) {
+      throw new WeixinQrLoginError(
+        "QR login session belongs to a different user",
+        403,
+      );
+    }
+    if (state.login_status !== "confirmed") {
+      const expired = state.login_status === "expired";
+      return shapePublicQrWaitResponse({
+        sessionKey,
+        status: expired ? "expired" : "wait",
+        connected: false,
+        expiresAt: state.login_expires_at,
+        message: expired
+          ? "QR code has expired."
+          : "QR login is not confirmed yet.",
+      });
+    }
+
+    const confirmed = state.login_confirmed_result;
+    const botId = state.ilink_bot_id?.trim() ?? "";
+    const token = state.bot_token?.trim() ?? "";
+    const generation = state.bot_generation;
+    const confirmedBotId =
+      typeof confirmed?.ilink_bot_id === "string"
+        ? confirmed.ilink_bot_id.trim()
+        : botId;
+    const confirmedGeneration =
+      typeof confirmed?.bot_generation === "number"
+        ? confirmed.bot_generation
+        : generation;
+    const currentAccount =
+      state.configured === true &&
+      state.status === "active" &&
+      botId.length > 0 &&
+      token.length > 0 &&
+      typeof generation === "number" &&
+      confirmedBotId === botId &&
+      confirmedGeneration === generation;
+
+    if (!currentAccount || typeof generation !== "number") {
+      return shapePublicQrWaitResponse({
+        sessionKey,
+        status: "expired",
+        connected: false,
+        message:
+          "QR login session was superseded or expired before confirmation.",
+      });
+    }
+
+    if (this.onAccountConfirmed) {
+      await this.onAccountConfirmed({
+        ilinkBotId: botId,
+        botToken: token,
+        baseUrl: state.base_url,
+        cdnBaseUrl: state.cdn_base_url?.trim() || this.cdnBaseUrl,
+        botGeneration: generation,
+        getUpdatesBuf: state.get_updates_buf ?? "",
+        ownerUserId: state.owner_user_id?.trim() || userId,
+        ilinkUserId: state.ilink_user_id ?? null,
+        ilinkUsername: state.ilink_username ?? null,
+      });
+    }
+
+    return shapePublicQrWaitResponse({
+      sessionKey,
+      status: "confirmed",
+      connected: true,
+      ilinkBotId: botId,
+      ilinkUserId: state.ilink_user_id ?? null,
+      ilinkUsername: state.ilink_username ?? null,
+      botGeneration: generation,
+      expiresAt: state.login_expires_at,
+    });
+  }
+
   private async executeWaitQrLogin(
     userId: string,
     sessionKey: string,
     opts?: { signal?: AbortSignal; timeoutMs?: number },
   ): Promise<WeixinQrPublicWaitResponse> {
     const state = await this.backend.getWeixinState({ include_token: false });
+    if (
+      state.login_session_key === sessionKey &&
+      state.login_status === "confirmed"
+    ) {
+      return this.finishConfirmedSession(userId, sessionKey);
+    }
     const check = this.validateSessionState(state, userId, sessionKey);
     if (!check.valid) {
       return check.response;
@@ -476,6 +542,12 @@ export class WeixinQrLoginManager {
     }
 
     const state = await this.backend.getWeixinState({ include_token: false });
+    if (
+      state.login_session_key === cleanSessionKey &&
+      state.login_status === "confirmed"
+    ) {
+      return this.finishConfirmedSession(cleanUserId, cleanSessionKey);
+    }
     const check = this.validateSessionState(state, cleanUserId, cleanSessionKey);
     if (!check.valid) {
       return check.response;
@@ -670,45 +742,6 @@ export class WeixinQrLoginManager {
       });
     }
 
-    const botGeneration =
-      confirmRes.bot_generation ?? (initialState.bot_generation ?? 1) + 1;
-    if (confirmRes.updated && this.onAccountConfirmed) {
-      await this.onAccountConfirmed({
-        ilinkBotId,
-        botToken,
-        baseUrl: confirmedBaseUrl,
-        cdnBaseUrl: this.cdnBaseUrl,
-        botGeneration,
-        getUpdatesBuf: "",
-        ownerUserId: userId,
-        ilinkUserId: statusResp.ilink_user_id?.trim() || null,
-        ilinkUsername: statusResp.ilink_username?.trim() || null,
-      });
-    }
-
-    const confirmedPayload = confirmRes.confirmed_result;
-    return shapePublicQrWaitResponse({
-      sessionKey,
-      status: "confirmed",
-      connected: true,
-      ilinkBotId:
-        (typeof confirmedPayload?.ilink_bot_id === "string"
-          ? confirmedPayload.ilink_bot_id
-          : null) ?? ilinkBotId,
-      ilinkUserId:
-        (typeof confirmedPayload?.ilink_user_id === "string"
-          ? confirmedPayload.ilink_user_id
-          : null) ??
-        statusResp.ilink_user_id?.trim() ??
-        null,
-      ilinkUsername:
-        (typeof confirmedPayload?.ilink_username === "string"
-          ? confirmedPayload.ilink_username
-          : null) ??
-        statusResp.ilink_username?.trim() ??
-        null,
-      botGeneration,
-      expiresAt: initialState.login_expires_at,
-    });
+    return this.finishConfirmedSession(userId, sessionKey);
   }
 }

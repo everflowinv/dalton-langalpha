@@ -13,6 +13,7 @@ import {
   verifyDaltonWeixinQrCode,
   waitDaltonWeixinQrLogin,
   type DaltonChannelBindCodeCreateResponse,
+  type DaltonWeixinBotPublicState,
   type DaltonWeixinQrPublicResponse,
   type DaltonWeixinQrPublicStatus,
 } from '@/pages/Settings/utils/daltonApi';
@@ -21,47 +22,42 @@ const POLLABLE_QR_STATUSES: ReadonlySet<DaltonWeixinQrPublicStatus> = new Set([
   'wait',
   'scaned',
   'scaned_but_redirect',
-  'saving',
 ]);
 
-function formatBotStatusLabel(status: string | undefined, connected: boolean | undefined): string {
-  if (connected || status === 'connected') return '已连接';
-  if (status === 'expired') return '登录已过期（请重新扫码）';
-  if (status === 'error') return '连接异常';
+function isBotActive(bot: DaltonWeixinBotPublicState | null | undefined): boolean {
+  return bot?.configured === true && bot.status === 'active';
+}
+
+function formatBotStatusLabel(bot: DaltonWeixinBotPublicState | null | undefined): string {
+  if (!bot || bot.configured !== true) return '未连接';
+  if (bot.status === 'active') return '已连接';
+  if (bot.status === 'expired' || bot.status === 'session_expired') return '登录已过期（请重新扫码）';
+  if (bot.status === 'error') return '连接异常';
   return '未连接';
 }
 
-function formatQrStatusLabel(
-  qr: DaltonWeixinQrPublicResponse,
-  verifyAccepted: boolean,
-): string {
+function formatQrStatusLabel(qr: DaltonWeixinQrPublicResponse): string {
   switch (qr.status) {
     case 'wait':
       return '请使用个人微信扫描二维码';
     case 'scaned':
     case 'scaned_but_redirect':
       return '已扫码，请在手机微信上确认登录';
-    case 'need_verifycode':
-      return verifyAccepted
-        ? '验证码已提交，正在等待手机微信确认…'
-        : '手机端要求输入验证码，请在下方输入后提交';
-    case 'verify_code_blocked':
-      return '验证码尝试次数过多已被限制，请重新生成二维码';
-    case 'saving':
-      return '正在保存微信连接状态…';
+    case 'verify_code':
+      return '手机端要求输入验证码，请在下方输入后提交';
     case 'confirmed':
       return '微信扫码连接成功';
-    case 'binded_redirect':
-      return qr.connected ? '已连接到现有微信账号' : '请重新生成二维码完成绑定';
     case 'expired':
       return '二维码已过期，请重新生成二维码';
-    case 'superseded':
-      return '当前扫码会话已被新的扫码请求替换';
     case 'error':
       return qr.message || '扫码过程发生错误，请重新生成二维码';
     default:
       return qr.message || qr.status;
   }
+}
+
+function isQrLoginConfirmed(status: DaltonWeixinQrPublicStatus): boolean {
+  return status === 'confirmed';
 }
 
 export function DaltonWeixinChannelCard(): React.ReactElement | null {
@@ -126,7 +122,7 @@ export function DaltonWeixinChannelCard(): React.ReactElement | null {
       setActionError(null);
       setVerifyCodeInput('');
       setQrState(res);
-      if (res.status === 'confirmed' || (res.status === 'binded_redirect' && res.connected)) {
+      if (isQrLoginConfirmed(res.status)) {
         void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.channelBindings() });
       }
     },
@@ -138,11 +134,10 @@ export function DaltonWeixinChannelCard(): React.ReactElement | null {
 
   const sessionKey = qrState?.session_key ?? null;
   const qrStatus = qrState?.status ?? null;
-  const verifyAccepted = qrState?.verify_code_accepted === true;
   const shouldPollQr =
     Boolean(sessionKey) &&
     qrStatus !== null &&
-    (POLLABLE_QR_STATUSES.has(qrStatus) || (qrStatus === 'need_verifycode' && verifyAccepted));
+    POLLABLE_QR_STATUSES.has(qrStatus);
 
   useEffect(() => {
     if (!sessionKey || !shouldPollQr) {
@@ -157,13 +152,11 @@ export function DaltonWeixinChannelCard(): React.ReactElement | null {
         const next = await waitDaltonWeixinQrLogin(sessionKey);
         if (cancelled || pollStoppedRef.current) return;
         setQrState((prev) => (prev?.session_key === sessionKey ? next : prev));
-        if (next.status === 'confirmed' || (next.status === 'binded_redirect' && next.connected)) {
+        if (isQrLoginConfirmed(next.status)) {
           void queryClient.invalidateQueries({ queryKey: queryKeys.dalton.channelBindings() });
           return;
         }
-        const keepPolling =
-          POLLABLE_QR_STATUSES.has(next.status) ||
-          (next.status === 'need_verifycode' && next.verify_code_accepted === true);
+        const keepPolling = POLLABLE_QR_STATUSES.has(next.status);
         if (keepPolling && !cancelled) {
           timerId = setTimeout(() => {
             void pollOnce();
@@ -325,7 +318,7 @@ export function DaltonWeixinChannelCard(): React.ReactElement | null {
           <div className="flex items-center justify-between gap-2">
             <div className="flex flex-col gap-0.5">
               <span className="text-xs font-semibold" style={{ color: 'var(--color-text-primary)' }}>
-                微信机器人连接状态：{formatBotStatusLabel(weixinBot?.status, weixinBot?.connected)}
+                微信机器人连接状态：{formatBotStatusLabel(weixinBot)}
               </span>
               {weixinBot?.ilink_bot_id && (
                 <span className="font-mono text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
@@ -343,7 +336,7 @@ export function DaltonWeixinChannelCard(): React.ReactElement | null {
                 <QrCode className="mr-1 h-3.5 w-3.5" />
                 {startQrMutation.isPending
                   ? '获取二维码…'
-                  : qrState || weixinBot?.connected
+                  : qrState || isBotActive(weixinBot)
                     ? '重新扫码连接'
                     : '管理员扫码连接'}
               </Button>
@@ -361,7 +354,7 @@ export function DaltonWeixinChannelCard(): React.ReactElement | null {
                 style={{ color: 'var(--color-text-primary)' }}
                 data-testid="dalton-weixin-qr-status"
               >
-                {formatQrStatusLabel(qrState, verifyAccepted)}
+                {formatQrStatusLabel(qrState)}
               </span>
 
               {qrState.qrcode_url &&
@@ -391,7 +384,7 @@ export function DaltonWeixinChannelCard(): React.ReactElement | null {
                   </div>
                 )}
 
-              {qrState.status === 'need_verifycode' && !verifyAccepted && (
+              {qrState.status === 'verify_code' && (
                 <form
                   onSubmit={handleVerifySubmit}
                   className="flex items-center gap-2 pt-1"

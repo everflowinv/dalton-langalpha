@@ -42,6 +42,7 @@ def upgrade() -> None:
             ADD COLUMN IF NOT EXISTS weixin_context_bot_id VARCHAR(255),
             ADD COLUMN IF NOT EXISTS weixin_context_bot_generation BIGINT,
             ADD COLUMN IF NOT EXISTS weixin_context_seq BIGINT NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS weixin_context_seq_source VARCHAR(32) NOT NULL DEFAULT '',
             ADD COLUMN IF NOT EXISTS weixin_context_updated_at TIMESTAMPTZ;
 
         UPDATE dalton_channel_identities
@@ -61,9 +62,13 @@ def upgrade() -> None:
             platform_user_id VARCHAR(255) NOT NULL,
             encrypted_context_token BYTEA NOT NULL,
             seq BIGINT NOT NULL DEFAULT 0,
+            seq_source VARCHAR(32) NOT NULL DEFAULT 'protocol',
             updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             PRIMARY KEY (ilink_bot_id, bot_generation, platform_user_id)
         );
+
+        ALTER TABLE dalton_channel_weixin_context_tokens
+            ADD COLUMN IF NOT EXISTS seq_source VARCHAR(32) NOT NULL DEFAULT 'protocol';
 
         CREATE INDEX IF NOT EXISTS idx_dalton_channel_wx_ctx_tokens_lookup
             ON dalton_channel_weixin_context_tokens (platform_user_id, ilink_bot_id, bot_generation);
@@ -85,6 +90,7 @@ def downgrade() -> None:
 
         ALTER TABLE dalton_channel_identities
             DROP COLUMN IF EXISTS weixin_context_updated_at,
+            DROP COLUMN IF EXISTS weixin_context_seq_source,
             DROP COLUMN IF EXISTS weixin_context_seq,
             DROP COLUMN IF EXISTS weixin_context_bot_generation,
             DROP COLUMN IF EXISTS weixin_context_bot_id,

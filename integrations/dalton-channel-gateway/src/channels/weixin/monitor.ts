@@ -59,7 +59,6 @@ export class WeixinMonitor {
   private currentCursor: string;
   private pollTimeoutMs: number;
   private runningPromise: Promise<void> | null = null;
-  private seqCounter = 0;
 
   constructor(opts: WeixinMonitorOptions) {
     this.opts = opts;
@@ -132,6 +131,27 @@ export class WeixinMonitor {
     }
   }
 
+  private async commitCursorUntilSettled(
+    nextBuf: string,
+  ): Promise<"committed" | "stale" | "stopped"> {
+    const baseRetryMs = this.opts.retryDelayMs ?? BASE_RETRY_DELAY_MS;
+    let attempt = 0;
+    while (!this.opts.signal.aborted) {
+      const status = await this.commitCursorWithRecovery(nextBuf);
+      if (status === "committed" || status === "stale") {
+        return status;
+      }
+      attempt += 1;
+      const delayMs = Math.min(
+        baseRetryMs * Math.pow(2, Math.min(attempt - 1, 4)),
+        MAX_RETRY_DELAY_MS,
+      );
+      const ok = await sleepWithAbort(delayMs, this.opts.signal);
+      if (!ok) return "stopped";
+    }
+    return "stopped";
+  }
+
   private async markExpiredInBackend(err: WeixinApiError): Promise<void> {
     const { backend, botGeneration, ilinkBotId } = this.opts;
     try {
@@ -200,11 +220,9 @@ export class WeixinMonitor {
             batchAllRegistered = false;
             break;
           }
-          this.seqCounter += 1;
           const event = parseWeixinInboundMessage(msg, {
             ilinkBotId,
             botGeneration,
-            batchSeq: Date.now() * 1000 + (this.seqCounter % 1000),
           });
           try {
             await this.opts.onInboundEvent(event);
@@ -230,8 +248,8 @@ export class WeixinMonitor {
             : "";
 
         if (nextBuf && nextBuf !== this.currentCursor) {
-          const commitStatus = await this.commitCursorWithRecovery(nextBuf);
-          if (commitStatus === "stale") {
+          const commitStatus = await this.commitCursorUntilSettled(nextBuf);
+          if (commitStatus === "stale" || commitStatus === "stopped") {
             break;
           }
         }

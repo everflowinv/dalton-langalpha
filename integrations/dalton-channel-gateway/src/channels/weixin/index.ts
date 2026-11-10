@@ -26,7 +26,6 @@ import {
 import {
   normalizeAndValidateIlinkBaseUrl,
   resolveValidatedRedirectBaseUrl,
-  WeixinApiError,
 } from "./api.js";
 import { downloadWeixinCdnAttachment } from "./cdn.js";
 import { resolvePersistedAttachmentMeta } from "./inbound.js";
@@ -97,6 +96,8 @@ export class WeixinChannelAdapter implements ChannelAdapter {
   private monitorController: AbortController | null = null;
   private monitorTask: Promise<void> | null = null;
   private monitorGeneration = 0;
+  private monitorDepth = 0;
+  private accountEpoch = 0;
   private readonly inFlightControllers = new Set<AbortController>();
   private qrManager: WeixinQrLoginManager | null = null;
 
@@ -230,14 +231,20 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     this.inFlightControllers.clear();
   }
 
-  private async stopMonitorLoop(): Promise<void> {
+  private abortMonitorOnly(): void {
     const ctrl = this.monitorController;
-    const task = this.monitorTask;
     this.monitorController = null;
-    this.monitorTask = null;
-    if (ctrl) {
-      ctrl.abort();
+    ctrl?.abort();
+  }
+
+  private async stopMonitorLoop(): Promise<void> {
+    const task = this.monitorTask;
+    this.abortMonitorOnly();
+    // The poll is awaiting this call stack. Abort it and let the loop exit on its own.
+    if (this.monitorDepth > 0) {
+      return;
     }
+    this.monitorTask = null;
     if (task) {
       try {
         await task;
@@ -248,6 +255,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
   }
 
   private async ensureSingleMonitorLoop(): Promise<void> {
+    const epoch = this.accountEpoch;
     if (!this.started || !this.inboundHandler) {
       return;
     }
@@ -261,7 +269,30 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       return;
     }
 
+    if (this.monitorDepth > 0 && this.monitorTask) {
+      this.abortMonitorOnly();
+      const detached = this.monitorTask;
+      void detached.finally(() => {
+        if (this.monitorTask !== detached) return;
+        this.monitorTask = null;
+        if (this.accountEpoch !== epoch || !this.started) return;
+        void this.ensureSingleMonitorLoop();
+      });
+      return;
+    }
+
     await this.stopMonitorLoop();
+    if (this.accountEpoch !== epoch || !this.started || !this.inboundHandler) {
+      return;
+    }
+    if (
+      this.account.status !== "active" ||
+      !this.account.botToken ||
+      !this.account.ilinkBotId ||
+      !this.backend
+    ) {
+      return;
+    }
 
     const controller = new AbortController();
     this.monitorController = controller;
@@ -285,7 +316,12 @@ export class WeixinChannelAdapter implements ChannelAdapter {
       signal: controller.signal,
       onInboundEvent: async (ev) => {
         if (!this.inboundHandler) return;
-        await this.inboundHandler(ev);
+        this.monitorDepth += 1;
+        try {
+          await this.inboundHandler(ev);
+        } finally {
+          this.monitorDepth -= 1;
+        }
       },
       onCursorCommitted: (newCursor) => {
         if (
@@ -334,14 +370,31 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     }
   }
 
+  private cursorAfterAccountSwitch(
+    sameAccount: boolean,
+    incomingCursor: string,
+  ): string {
+    if (sameAccount) {
+      return incomingCursor || this.account.getUpdatesBuf;
+    }
+    return incomingCursor;
+  }
+
   private async handleConfirmedAccount(
     confirmed: ConfirmedWeixinAccount,
   ): Promise<void> {
     if (confirmed.botGeneration < this.account.botGeneration) {
       return;
     }
+    const epoch = ++this.accountEpoch;
+    const sameAccount =
+      this.account.ilinkBotId === confirmed.ilinkBotId &&
+      this.account.botGeneration === confirmed.botGeneration;
+    const incomingCursor = confirmed.getUpdatesBuf ?? "";
     await this.stopMonitorLoop();
+    if (this.accountEpoch !== epoch) return;
     const safeBaseUrl = await this.resolveSafeBaseUrl(confirmed.baseUrl);
+    if (this.accountEpoch !== epoch) return;
     this.account = {
       ilinkBotId: confirmed.ilinkBotId,
       botToken: confirmed.botToken,
@@ -352,7 +405,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
         ILINK_DEFAULT_CDN_BASE_URL
       ).trim(),
       botGeneration: confirmed.botGeneration,
-      getUpdatesBuf: "",
+      getUpdatesBuf: this.cursorAfterAccountSwitch(sameAccount, incomingCursor),
       status: "active",
     };
     await this.ensureSingleMonitorLoop();
@@ -370,9 +423,12 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     ) {
       return;
     }
+    const epoch = ++this.accountEpoch;
+    const stillCurrent = (): boolean => this.accountEpoch === epoch;
 
     if (!state.configured || !state.ilink_bot_id) {
       await this.stopMonitorLoop();
+      if (!stillCurrent()) return;
       this.account = {
         ...this.account,
         ilinkBotId: "",
@@ -393,11 +449,18 @@ export class WeixinChannelAdapter implements ChannelAdapter {
 
     if (normalizedStatus === "expired") {
       await this.stopMonitorLoop();
+      if (!stillCurrent()) return;
+      const sameAccount =
+        this.account.ilinkBotId === state.ilink_bot_id &&
+        this.account.botGeneration === incomingGen;
       this.account = {
         ...this.account,
         ilinkBotId: state.ilink_bot_id,
         botGeneration: incomingGen,
-        getUpdatesBuf: state.get_updates_buf ?? this.account.getUpdatesBuf,
+        getUpdatesBuf: this.cursorAfterAccountSwitch(
+          sameAccount,
+          state.get_updates_buf ?? "",
+        ),
         status: "expired",
       };
       return;
@@ -406,6 +469,7 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     const nextToken = (state.bot_token ?? this.account.botToken).trim();
     if (!nextToken) {
       await this.stopMonitorLoop();
+      if (!stillCurrent()) return;
       this.account = {
         ...this.account,
         ilinkBotId: state.ilink_bot_id,
@@ -416,12 +480,19 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     }
 
     const nextBaseUrl = await this.resolveSafeBaseUrl(state.base_url);
+    if (!stillCurrent()) return;
     const nextCdnBaseUrl = (
       state.cdn_base_url ||
       this.opts.cdnBaseUrl ||
       ILINK_DEFAULT_CDN_BASE_URL
     ).trim();
-    const nextCursor = state.get_updates_buf ?? "";
+    const sameAccount =
+      this.account.ilinkBotId === state.ilink_bot_id &&
+      this.account.botGeneration === incomingGen;
+    const nextCursor = this.cursorAfterAccountSwitch(
+      sameAccount,
+      state.get_updates_buf ?? "",
+    );
 
     const needsMonitorRestart =
       this.account.status !== "active" ||
@@ -447,89 +518,117 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     }
   }
 
-  private async markSessionExpiredFromSend(_err: WeixinApiError): Promise<void> {
-    const capturedGen = this.account.botGeneration;
-    const capturedBotId = this.account.ilinkBotId;
+  private async markSessionExpiredFromSend(
+    capturedBotId: string,
+    capturedGen: number,
+  ): Promise<void> {
+    if (
+      this.account.ilinkBotId !== capturedBotId ||
+      this.account.botGeneration !== capturedGen
+    ) {
+      return;
+    }
+    const epoch = this.accountEpoch;
     this.account.status = "expired";
-    await this.stopMonitorLoop();
-    if (this.backend && capturedBotId) {
-      try {
-        await this.backend.putWeixinState({
-          status: "expired",
-          expected_bot_generation: capturedGen,
-          expected_ilink_bot_id: capturedBotId,
-        });
-      } catch {
-        // Best-effort backend status update.
-      }
+    this.abortMonitorOnly();
+    if (!this.backend || !capturedBotId) return;
+    try {
+      await this.backend.putWeixinState({
+        status: "expired",
+        expected_bot_generation: capturedGen,
+        expected_ilink_bot_id: capturedBotId,
+      });
+    } catch {
+      return;
+    }
+    if (
+      this.accountEpoch !== epoch ||
+      this.account.ilinkBotId !== capturedBotId ||
+      this.account.botGeneration !== capturedGen
+    ) {
+      return;
     }
   }
 
   private async resolveFreshContextToken(
     recipientUserId: string,
     fallbackToken?: string | null,
+    inboundMessageId?: string | null,
   ): Promise<string> {
-    if (this.backend) {
-      const state = await this.backend.getWeixinState({
-        include_token: false,
-        recipient_platform_user_id: recipientUserId,
+    const missingToken = (message: string): ChannelDeliveryError =>
+      new ChannelDeliveryError(message, {
+        outcome: "failed",
+        code: "unavailable",
       });
-      if (state.status === "expired") {
-        this.account.status = "expired";
-        await this.stopMonitorLoop();
-        throw new ChannelDeliveryError(
-          "Weixin bot session has expired (-14); please re-scan QR code in settings.",
-          {
-            outcome: "failed",
-            code: "unavailable",
-          },
-        );
+
+    if (!this.backend) {
+      const trimmedFallback = fallbackToken?.trim();
+      if (!trimmedFallback) {
+        throw missingToken("Missing active Weixin context_token for recipient");
       }
-      if (
-        typeof state.bot_generation === "number" &&
-        state.bot_generation > this.account.botGeneration
-      ) {
-        const fullState = await this.backend.getWeixinState({
-          include_token: true,
-          recipient_platform_user_id: recipientUserId,
-        });
-        await this.applyPersistedState(fullState);
-        if (fullState.weixin_context_token?.trim()) {
-          return fullState.weixin_context_token.trim();
-        }
-        throw new ChannelDeliveryError(
-          "Missing active Weixin context_token for current bot generation",
-          {
-            outcome: "failed",
-            code: "unavailable",
-          },
-        );
-      }
-      if (state.weixin_context_token?.trim()) {
-        return state.weixin_context_token.trim();
-      }
-      if (state.configured && state.weixin_context_token === null) {
-        throw new ChannelDeliveryError(
-          "Missing active Weixin context_token for recipient",
-          {
-            outcome: "failed",
-            code: "unavailable",
-          },
-        );
-      }
+      return trimmedFallback;
     }
 
-    const trimmedFallback = fallbackToken?.trim();
-    if (!trimmedFallback) {
+    const state = await this.backend.getWeixinState({
+      include_token: false,
+      recipient_platform_user_id: recipientUserId,
+      inbound_message_id: inboundMessageId ?? null,
+    });
+    if (state.status === "expired") {
+      const stateBot = state.ilink_bot_id ?? "";
+      const stateGen = state.bot_generation;
+      const matchesLocal =
+        (!stateBot || stateBot === this.account.ilinkBotId) &&
+        (typeof stateGen !== "number" || stateGen === this.account.botGeneration);
+      if (matchesLocal) {
+        this.account.status = "expired";
+        this.abortMonitorOnly();
+      }
       throw new ChannelDeliveryError(
-        "Missing active Weixin context_token for recipient",
+        "Weixin bot session has expired (-14); please re-scan QR code in settings.",
         {
           outcome: "failed",
           code: "unavailable",
         },
       );
     }
-    return trimmedFallback;
+    if (
+      typeof state.bot_generation === "number" &&
+      state.bot_generation > this.account.botGeneration
+    ) {
+      const fullState = await this.backend.getWeixinState({
+        include_token: true,
+        recipient_platform_user_id: recipientUserId,
+        inbound_message_id: inboundMessageId ?? null,
+      });
+      if (
+        typeof fullState.bot_generation === "number" &&
+        fullState.bot_generation > this.account.botGeneration
+      ) {
+        await this.applyPersistedState(fullState);
+      }
+      const switchedToken = fullState.weixin_context_token?.trim();
+      if (
+        switchedToken &&
+        fullState.ilink_bot_id === this.account.ilinkBotId &&
+        fullState.bot_generation === this.account.botGeneration
+      ) {
+        return switchedToken;
+      }
+      throw missingToken(
+        "Missing active Weixin context_token for current bot generation",
+      );
+    }
+    const currentToken = state.weixin_context_token?.trim();
+    const stateBot = state.ilink_bot_id ?? "";
+    const stateGen = state.bot_generation;
+    const tokenMatchesAccount =
+      (!stateBot || stateBot === this.account.ilinkBotId) &&
+      (typeof stateGen !== "number" || stateGen === this.account.botGeneration);
+    if (currentToken && tokenMatchesAccount) {
+      return currentToken;
+    }
+    throw missingToken("Missing active Weixin context_token for recipient");
   }
 
   async sendTextChunk(
@@ -565,14 +664,20 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     const contextToken = await this.resolveFreshContextToken(
       toUserId,
       options.weixinContextToken,
+      options.inboundMessageId,
     );
+    const capturedBotId = this.account.ilinkBotId;
+    const capturedGen = this.account.botGeneration;
+    const capturedBaseUrl = this.account.baseUrl;
+    const capturedCdnBaseUrl = this.account.cdnBaseUrl;
+    const capturedBotToken = this.account.botToken;
     const { signal, release } = this.createOperationSignal();
     try {
       return await sendWeixinTextMessage(
         {
-          baseUrl: this.account.baseUrl,
-          cdnBaseUrl: this.account.cdnBaseUrl,
-          botToken: this.account.botToken,
+          baseUrl: capturedBaseUrl,
+          cdnBaseUrl: capturedCdnBaseUrl,
+          botToken: capturedBotToken,
           contextToken,
           toUserId,
           signal,
@@ -581,8 +686,8 @@ export class WeixinChannelAdapter implements ChannelAdapter {
           allowedCdnDomains: this.opts.allowedCdnDomains,
           resolveHostIps: this.opts.resolveHostIps,
           checkResolvedIps: this.opts.checkResolvedIps,
-          onSessionExpired: async (err) => {
-            await this.markSessionExpiredFromSend(err);
+          onSessionExpired: async () => {
+            await this.markSessionExpiredFromSend(capturedBotId, capturedGen);
           },
         },
         options.text,
@@ -623,14 +728,20 @@ export class WeixinChannelAdapter implements ChannelAdapter {
     const contextToken = await this.resolveFreshContextToken(
       toUserId,
       options.weixinContextToken,
+      options.inboundMessageId,
     );
+    const capturedBotId = this.account.ilinkBotId;
+    const capturedGen = this.account.botGeneration;
+    const capturedBaseUrl = this.account.baseUrl;
+    const capturedCdnBaseUrl = this.account.cdnBaseUrl;
+    const capturedBotToken = this.account.botToken;
     const { signal, release } = this.createOperationSignal();
     try {
       return await sendWeixinMediaAttachment(
         {
-          baseUrl: this.account.baseUrl,
-          cdnBaseUrl: this.account.cdnBaseUrl,
-          botToken: this.account.botToken,
+          baseUrl: capturedBaseUrl,
+          cdnBaseUrl: capturedCdnBaseUrl,
+          botToken: capturedBotToken,
           contextToken,
           toUserId,
           signal,
@@ -639,8 +750,8 @@ export class WeixinChannelAdapter implements ChannelAdapter {
           allowedCdnDomains: this.opts.allowedCdnDomains,
           resolveHostIps: this.opts.resolveHostIps,
           checkResolvedIps: this.opts.checkResolvedIps,
-          onSessionExpired: async (err) => {
-            await this.markSessionExpiredFromSend(err);
+          onSessionExpired: async () => {
+            await this.markSessionExpiredFromSend(capturedBotId, capturedGen);
           },
         },
         {

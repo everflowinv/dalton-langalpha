@@ -406,26 +406,74 @@ def _normalize_weixin_status(status: str | None, *, configured: bool = True) -> 
     return s
 
 
-def _extract_weixin_context_seq(
+_CONTEXT_ORDER_RANK = {"receive": 1, "platform_time": 2, "protocol": 3}
+
+
+def _context_order_supersedes(
+    incoming_source: str,
+    incoming_value: int,
+    existing_source: str,
+    existing_value: int,
+) -> bool:
+    """A higher-priority field wins. The same field advances only when the value is greater.
+
+    `protocol` is `seq`. `platform_time` is `create_time_ms`. `receive` is the
+    registration order assigned to a new message that has neither. Values from
+    different fields are never compared with each other.
+    """
+    incoming_rank = _CONTEXT_ORDER_RANK.get(incoming_source, 0)
+    existing_rank = _CONTEXT_ORDER_RANK.get(existing_source, 0)
+    if incoming_rank != existing_rank:
+        return incoming_rank > existing_rank
+    return incoming_value > existing_value
+
+
+def _positive_context_seq(raw_val: Any) -> int | None:
+    if isinstance(raw_val, bool) or raw_val is None:
+        return None
+    if isinstance(raw_val, (int, float)):
+        parsed = int(raw_val)
+        return parsed if parsed > 0 else None
+    if isinstance(raw_val, str) and raw_val.strip().isdigit():
+        parsed = int(raw_val.strip())
+        return parsed if parsed > 0 else None
+    return None
+
+
+def _extract_weixin_context_order(
     raw_payload: dict[str, Any] | None,
     explicit_seq: int | None = None,
-) -> int | None:
-    """Extract monotonic sequence/timestamp ordering for a Weixin inbound message if present."""
-    if explicit_seq is not None:
-        try:
-            val = int(explicit_seq)
-            if val >= 0:
-                return val
-        except (TypeError, ValueError):
-            pass
-    if isinstance(raw_payload, dict):
-        for key in ("weixin_context_seq", "seq", "create_time_ms"):
-            raw_val = raw_payload.get(key)
-            if isinstance(raw_val, (int, float)) and int(raw_val) > 0:
-                return int(raw_val)
-            if isinstance(raw_val, str) and raw_val.strip().isdigit() and int(raw_val.strip()) > 0:
-                return int(raw_val.strip())
+) -> tuple[str, int] | None:
+    """Return `(source, value)` for this message, or None when both fields are absent.
+
+    The explicit argument and payload `seq` / `weixin_context_seq` are protocol
+    order. `create_time_ms` is platform time and is used only when no protocol
+    seq is present. A missing pair is receive order, assigned in the token
+    transaction. The numeric size does not choose the source.
+    """
+    explicit = _positive_context_seq(explicit_seq)
+    if explicit is not None:
+        return ("protocol", explicit)
+    if not isinstance(raw_payload, dict):
+        return None
+    protocol = _positive_context_seq(raw_payload.get("seq"))
+    if protocol is None:
+        protocol = _positive_context_seq(raw_payload.get("weixin_context_seq"))
+    if protocol is not None:
+        return ("protocol", protocol)
+    platform_time = _positive_context_seq(raw_payload.get("create_time_ms"))
+    if platform_time is not None:
+        return ("platform_time", platform_time)
     return None
+
+
+def _payload_marks_invalid_inbound(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("invalid_inbound") or payload.get("invalid_inbound_event"):
+        return True
+    reason = payload.get("rejected_reason") or payload.get("deny_reason")
+    return reason == "invalid_inbound_event"
 
 
 async def _get_active_weixin_bot_in_tx(cur: Any) -> tuple[str | None, int, str]:
@@ -455,8 +503,14 @@ async def _upsert_weixin_context_token_in_tx(
     platform_user_id: str,
     context_token: str,
     incoming_seq: int | None = None,
+    incoming_source: str | None = None,
 ) -> tuple[bool, int]:
-    """Monotonically store encrypted Weixin context_token per `(bot_id, bot_generation, platform_user_id)`."""
+    """Store the context token when this message's order field outranks the saved one.
+
+    The comparison uses `seq_source`, not the size of the number. A new message
+    with neither protocol seq nor platform time takes the next receive ordinal
+    for this account. The same ordinal does not replace the saved token.
+    """
     cleaned_bot_id = str(bot_id or "").strip()
     cleaned_puid = str(platform_user_id or "").strip()
     cleaned_token = str(context_token or "").strip()
@@ -465,33 +519,68 @@ async def _upsert_weixin_context_token_in_tx(
 
     await cur.execute(
         """
-        SELECT seq FROM dalton_channel_weixin_context_tokens
+        SELECT seq, seq_source FROM dalton_channel_weixin_context_tokens
         WHERE ilink_bot_id = %s AND bot_generation = %s AND platform_user_id = %s
         FOR UPDATE
         """,
         (cleaned_bot_id, int(bot_generation), cleaned_puid),
     )
     existing = await cur.fetchone()
+    source = str(incoming_source or "").strip()
+    if source not in _CONTEXT_ORDER_RANK:
+        source = ""
+    value = _positive_context_seq(incoming_seq) if source in ("protocol", "platform_time") else None
+    if source in ("protocol", "platform_time") and value is None:
+        source = ""
+
     if existing is not None:
         existing_seq = int(existing.get("seq") or 0)
-        if incoming_seq is not None and int(incoming_seq) < existing_seq:
+        existing_source = str(existing.get("seq_source") or "protocol")
+        if not source:
+            if existing_source != "receive":
+                return False, existing_seq
+            source = "receive"
+            value = existing_seq + 1
+        elif not _context_order_supersedes(source, int(value or 0), existing_source, existing_seq):
             return False, existing_seq
-        effective_seq = int(incoming_seq) if incoming_seq is not None else (existing_seq + 1)
+        effective_seq = int(value or 0)
     else:
-        effective_seq = int(incoming_seq) if incoming_seq is not None else 1
+        if not source:
+            source = "receive"
+            value = 1
+        effective_seq = int(value or 1)
 
     await cur.execute(
         """
         INSERT INTO dalton_channel_weixin_context_tokens (
             ilink_bot_id, bot_generation, platform_user_id,
-            encrypted_context_token, seq, updated_at
+            encrypted_context_token, seq, seq_source, updated_at
         )
-        VALUES (%s, %s, %s, pgp_sym_encrypt(%s, %s), %s, NOW())
+        VALUES (%s, %s, %s, pgp_sym_encrypt(%s, %s), %s, %s, NOW())
         ON CONFLICT (ilink_bot_id, bot_generation, platform_user_id) DO UPDATE SET
             encrypted_context_token = EXCLUDED.encrypted_context_token,
             seq = EXCLUDED.seq,
+            seq_source = EXCLUDED.seq_source,
             updated_at = NOW()
-        WHERE EXCLUDED.seq >= dalton_channel_weixin_context_tokens.seq
+        WHERE (
+                CASE COALESCE(dalton_channel_weixin_context_tokens.seq_source, '')
+                    WHEN 'protocol' THEN 3
+                    WHEN 'platform_time' THEN 2
+                    WHEN 'receive' THEN 1
+                    ELSE 0
+                END
+                <
+                CASE COALESCE(EXCLUDED.seq_source, '')
+                    WHEN 'protocol' THEN 3
+                    WHEN 'platform_time' THEN 2
+                    WHEN 'receive' THEN 1
+                    ELSE 0
+                END
+              )
+           OR (
+                dalton_channel_weixin_context_tokens.seq_source = EXCLUDED.seq_source
+                AND EXCLUDED.seq > dalton_channel_weixin_context_tokens.seq
+              )
         """,
         (
             cleaned_bot_id,
@@ -500,6 +589,7 @@ async def _upsert_weixin_context_token_in_tx(
             cleaned_token,
             enc_key,
             effective_seq,
+            source,
         ),
     )
 
@@ -511,6 +601,7 @@ async def _upsert_weixin_context_token_in_tx(
             weixin_context_bot_id = %s,
             weixin_context_bot_generation = %s,
             weixin_context_seq = %s,
+            weixin_context_seq_source = %s,
             weixin_context_updated_at = NOW(),
             updated_at = NOW()
         WHERE platform = 'weixin'
@@ -518,7 +609,25 @@ async def _upsert_weixin_context_token_in_tx(
           AND (
               weixin_context_bot_id IS DISTINCT FROM %s
               OR weixin_context_bot_generation IS DISTINCT FROM %s
-              OR COALESCE(weixin_context_seq, 0) <= %s
+              OR (
+                  CASE COALESCE(weixin_context_seq_source, '')
+                      WHEN 'protocol' THEN 3
+                      WHEN 'platform_time' THEN 2
+                      WHEN 'receive' THEN 1
+                      ELSE 0
+                  END
+                  <
+                  CASE %s
+                      WHEN 'protocol' THEN 3
+                      WHEN 'platform_time' THEN 2
+                      WHEN 'receive' THEN 1
+                      ELSE 0
+                  END
+              )
+              OR (
+                  weixin_context_seq_source = %s
+                  AND COALESCE(weixin_context_seq, 0) < %s
+              )
           )
         """,
         (
@@ -527,9 +636,12 @@ async def _upsert_weixin_context_token_in_tx(
             cleaned_bot_id,
             int(bot_generation),
             effective_seq,
+            source,
             cleaned_puid,
             cleaned_bot_id,
             int(bot_generation),
+            source,
+            source,
             effective_seq,
         ),
     )
@@ -729,7 +841,9 @@ async def _register_and_resolve_inbound_once(
         if weixin_context_token
         else str((raw_payload or {}).get("weixin_context_token") or "").strip() or None
     )
-    incoming_seq = _extract_weixin_context_seq(raw_payload, weixin_context_seq)
+    incoming_order = _extract_weixin_context_order(raw_payload, weixin_context_seq)
+    incoming_seq = incoming_order[1] if incoming_order is not None else None
+    incoming_source = incoming_order[0] if incoming_order is not None else None
     payload_dict = _strip_sensitive_from_raw_payload(raw_payload)
     if cleaned_puid:
         payload_dict["platform_user_id"] = cleaned_puid
@@ -741,10 +855,14 @@ async def _register_and_resolve_inbound_once(
         or cleaned_scope.startswith("chat:")
     )
     is_invalid_inbound = (
-        bool(payload_dict.get("invalid_inbound"))
+        _payload_marks_invalid_inbound(payload_dict)
         or not cleaned_puid
         or cleaned_puid == "__invalid__"
     )
+    if is_invalid_inbound:
+        payload_dict["invalid_inbound_event"] = True
+        payload_dict["deny_reason"] = "invalid_inbound_event"
+        payload_dict.setdefault("rejected_reason", "invalid_inbound_event")
 
     async with get_db_connection(conn) as owned_conn:
         async with owned_conn.transaction():
@@ -785,6 +903,39 @@ async def _register_and_resolve_inbound_once(
                         (cleaned_platform, cleaned_msg_id),
                     )
                     existing = dict(await cur.fetchone())
+                    existing_payload_for_reject = existing.get("raw_payload")
+                    if existing.get("status") == "pending" and (
+                        is_invalid_inbound
+                        or _payload_marks_invalid_inbound(existing_payload_for_reject)
+                    ):
+                        rejected_payload = (
+                            dict(existing_payload_for_reject)
+                            if isinstance(existing_payload_for_reject, dict)
+                            else {}
+                        )
+                        rejected_payload.update(payload_dict)
+                        rejected_payload["invalid_inbound_event"] = True
+                        rejected_payload["deny_reason"] = "invalid_inbound_event"
+                        rejected_payload.setdefault(
+                            "rejected_reason", "invalid_inbound_event"
+                        )
+                        await cur.execute(
+                            """
+                            UPDATE dalton_channel_inbound_events
+                            SET status = 'ignored', raw_payload = %s, updated_at = NOW()
+                            WHERE platform = %s AND message_id = %s
+                            RETURNING *
+                            """,
+                            (Jsonb(rejected_payload), cleaned_platform, cleaned_msg_id),
+                        )
+                        rejected_row = dict(await cur.fetchone())
+                        return _serialize_inbound_row(
+                            rejected_row,
+                            existing_status="ignored",
+                            linked=bool(rejected_row.get("dalton_user_id")),
+                            allowed=False,
+                            deny_reason="invalid_inbound_event",
+                        )
                     ex_uid = existing.get("dalton_user_id")
                     ex_ws_id = existing.get("workspace_id")
                     ws_status = None
@@ -914,6 +1065,7 @@ async def _register_and_resolve_inbound_once(
                             platform_user_id=cleaned_puid,
                             context_token=eff_ctx_token,
                             incoming_seq=incoming_seq,
+                            incoming_source=incoming_source,
                         )
                         await cur.execute(
                             """
@@ -1266,9 +1418,9 @@ async def _saved_weixin_bind_message_in_tx(
 ) -> dict[str, Any] | None:
     """Load one inbound when its bot id and generation match the active bot.
 
-    The message's own seq is in `raw_payload`. `weixin_context_seq` on the
-    same row can name a later token already stored for this bot generation,
-    while the row's ciphertext is still this message.
+    The message order comes from that payload's `seq` or `create_time_ms`.
+    `weixin_context_seq` on the row can name a later token already stored for
+    this bot generation, so it is not this message's order.
     """
     cleaned_mid = str(inbound_message_id or "").strip()
     if not cleaned_mid:
@@ -1303,17 +1455,10 @@ async def _saved_weixin_bind_message_in_tx(
         raw_payload = parsed if isinstance(parsed, dict) else None
     elif not isinstance(raw_payload, dict):
         raw_payload = None
-    seq = _extract_weixin_context_seq(raw_payload)
-    if seq is None:
-        column_seq = row.get("weixin_context_seq")
-        try:
-            parsed_seq = int(column_seq) if column_seq is not None else None
-        except (TypeError, ValueError):
-            parsed_seq = None
-        if parsed_seq is not None and parsed_seq > 0:
-            seq = parsed_seq
+    order = _extract_weixin_context_order(raw_payload)
     return {
-        "seq": seq,
+        "seq": order[1] if order is not None else None,
+        "seq_source": order[0] if order is not None else None,
         "context_token": _plain_weixin_token(row.get("inbound_context_token")),
     }
 
@@ -1334,10 +1479,10 @@ async def _bind_identity_in_tx(
 ) -> int:
     """Bind `(user_id, platform)` to `platform_user_id` and advance session generations.
 
-    A Weixin bind checks the saved inbound against the active bot generation.
-    The identity keeps the latest context token for that generation and that
-    token's original seq. The message seq replaces the stored token only when
-    it is strictly newer.
+    A Weixin bind reads the saved message's own order fields and checks them
+    against the active bot generation. The identity then copies the current
+    context token and that token's original source and value. The bind message
+    replaces the token only when its field outranks the saved order.
     """
     # Lock order (same as update_user_channel_settings): personal settings rows
     # first, then session generation rows. Lock the binder's row and every
@@ -1388,6 +1533,7 @@ async def _bind_identity_in_tx(
     eff_wx_bot_id: str | None = None
     eff_wx_bot_gen: int | None = None
     eff_wx_seq = 0
+    eff_wx_source = "protocol"
 
     if platform == "weixin":
         active_bot_id, active_bot_gen, _ = await _get_active_weixin_bot_in_tx(cur)
@@ -1406,7 +1552,9 @@ async def _bind_identity_in_tx(
         )
         enc_key = get_encryption_key()
         bind_token = _plain_weixin_token(weixin_context_token)
-        bind_seq = weixin_context_seq
+        bind_order = _extract_weixin_context_order(None, weixin_context_seq)
+        bind_seq = bind_order[1] if bind_order is not None else None
+        bind_source = bind_order[0] if bind_order is not None else None
         if bot_matches:
             saved_message = await _saved_weixin_bind_message_in_tx(
                 cur,
@@ -1417,14 +1565,15 @@ async def _bind_identity_in_tx(
                 bot_generation=int(eff_wx_bot_gen),
             )
             if saved_message is not None:
-                if saved_message["seq"] is not None:
-                    bind_seq = saved_message["seq"]
+                if saved_message["seq"] is not None and saved_message["seq_source"]:
+                    bind_seq = int(saved_message["seq"])
+                    bind_source = str(saved_message["seq_source"])
                 if bind_token is None and saved_message["context_token"]:
                     bind_token = saved_message["context_token"]
         if bind_token and bot_matches:
             await cur.execute(
                 """
-                SELECT seq FROM dalton_channel_weixin_context_tokens
+                SELECT seq, seq_source FROM dalton_channel_weixin_context_tokens
                 WHERE ilink_bot_id = %s AND bot_generation = %s AND platform_user_id = %s
                 FOR UPDATE
                 """,
@@ -1433,7 +1582,13 @@ async def _bind_identity_in_tx(
             existing_token = await cur.fetchone()
             store_message_token = existing_token is None or (
                 bind_seq is not None
-                and int(bind_seq) > int(existing_token.get("seq") or 0)
+                and bind_source is not None
+                and _context_order_supersedes(
+                    bind_source,
+                    int(bind_seq),
+                    str(existing_token.get("seq_source") or "protocol"),
+                    int(existing_token.get("seq") or 0),
+                )
             )
             if store_message_token:
                 _, eff_wx_seq = await _upsert_weixin_context_token_in_tx(
@@ -1444,12 +1599,14 @@ async def _bind_identity_in_tx(
                     platform_user_id=platform_user_id,
                     context_token=bind_token,
                     incoming_seq=bind_seq,
+                    incoming_source=bind_source,
                 )
         if bot_matches:
             await cur.execute(
                 """
                 SELECT pgp_sym_decrypt(encrypted_context_token, %s) AS context_token,
-                       COALESCE(seq, 0) AS seq
+                       COALESCE(seq, 0) AS seq,
+                       seq_source
                 FROM dalton_channel_weixin_context_tokens
                 WHERE ilink_bot_id = %s AND bot_generation = %s AND platform_user_id = %s
                 """,
@@ -1462,9 +1619,11 @@ async def _bind_identity_in_tx(
             if ctx_row and plain_token:
                 eff_wx_token = plain_token
                 eff_wx_seq = int(ctx_row.get("seq") or 0)
+                eff_wx_source = str(ctx_row.get("seq_source") or "protocol")
             elif bind_token:
                 eff_wx_token = bind_token
                 eff_wx_seq = int(bind_seq or 1)
+                eff_wx_source = bind_source or "receive"
 
     if platform == "weixin" and eff_wx_token:
         enc_key = get_encryption_key()
@@ -1475,11 +1634,12 @@ async def _bind_identity_in_tx(
                 platform_tenant_key, weixin_context_token,
                 encrypted_weixin_context_token, weixin_context_bot_id,
                 weixin_context_bot_generation, weixin_context_seq,
+                weixin_context_seq_source,
                 weixin_context_updated_at, created_at, updated_at
             )
             VALUES (
                 %s, %s, %s, %s, %s, NULL,
-                pgp_sym_encrypt(%s, %s), %s, %s, %s, NOW(), NOW(), NOW()
+                pgp_sym_encrypt(%s, %s), %s, %s, %s, %s, NOW(), NOW(), NOW()
             )
             ON CONFLICT (user_id, platform) DO UPDATE SET
                 platform_user_id = EXCLUDED.platform_user_id,
@@ -1490,6 +1650,7 @@ async def _bind_identity_in_tx(
                 weixin_context_bot_id = EXCLUDED.weixin_context_bot_id,
                 weixin_context_bot_generation = EXCLUDED.weixin_context_bot_generation,
                 weixin_context_seq = EXCLUDED.weixin_context_seq,
+                weixin_context_seq_source = EXCLUDED.weixin_context_seq_source,
                 weixin_context_updated_at = NOW(),
                 updated_at = NOW()
             """,
@@ -1504,6 +1665,7 @@ async def _bind_identity_in_tx(
                 eff_wx_bot_id,
                 eff_wx_bot_gen,
                 eff_wx_seq,
+                eff_wx_source,
             ),
         )
     else:
@@ -1514,9 +1676,10 @@ async def _bind_identity_in_tx(
                 platform_tenant_key, weixin_context_token,
                 encrypted_weixin_context_token, weixin_context_bot_id,
                 weixin_context_bot_generation, weixin_context_seq,
+                weixin_context_seq_source,
                 weixin_context_updated_at, created_at, updated_at
             )
-            VALUES (%s, %s, %s, %s, %s, NULL, NULL, NULL, NULL, 0, NULL, NOW(), NOW())
+            VALUES (%s, %s, %s, %s, %s, NULL, NULL, NULL, NULL, 0, '', NULL, NOW(), NOW())
             ON CONFLICT (user_id, platform) DO UPDATE SET
                 platform_user_id = EXCLUDED.platform_user_id,
                 platform_username = COALESCE(EXCLUDED.platform_username, dalton_channel_identities.platform_username),
@@ -1526,6 +1689,7 @@ async def _bind_identity_in_tx(
                 weixin_context_bot_id = NULL,
                 weixin_context_bot_generation = NULL,
                 weixin_context_seq = 0,
+                weixin_context_seq_source = '',
                 weixin_context_updated_at = NULL,
                 updated_at = NOW()
             """,
@@ -4520,6 +4684,26 @@ async def recover_channel_state(
                 active_watches = [dict(r) for r in await cur.fetchall()]
                 await _backfill_watch_notification_runs_in_tx(cur, active_watches)
 
+                await cur.execute(
+                    """
+                    UPDATE dalton_channel_inbound_events
+                    SET status = 'ignored',
+                        raw_payload = COALESCE(raw_payload, '{}'::jsonb)
+                            || jsonb_build_object(
+                                'invalid_inbound_event', TRUE,
+                                'deny_reason', 'invalid_inbound_event'
+                            ),
+                        updated_at = NOW()
+                    WHERE status = 'pending'
+                      AND (
+                        COALESCE(raw_payload->>'invalid_inbound_event', '') IN ('true', 'True')
+                        OR COALESCE(raw_payload->>'invalid_inbound', '') IN ('true', 'True')
+                        OR raw_payload->>'rejected_reason' = 'invalid_inbound_event'
+                        OR raw_payload->>'deny_reason' = 'invalid_inbound_event'
+                      )
+                    """
+                )
+
                 # ③ Fetch all 4 recovery sets
                 await cur.execute(
                     """
@@ -4529,7 +4713,11 @@ async def recover_channel_state(
                     ORDER BY created_at ASC
                     """
                 )
-                inbound_events = [dict(r) for r in await cur.fetchall()]
+                inbound_events = [
+                    dict(r)
+                    for r in await cur.fetchall()
+                    if not _payload_marks_invalid_inbound(r.get("raw_payload"))
+                ]
 
                 await cur.execute(
                     """
@@ -5666,6 +5854,7 @@ async def _upsert_weixin_state_once(
                                 weixin_context_bot_id = NULL,
                                 weixin_context_bot_generation = NULL,
                                 weixin_context_seq = 0,
+                                weixin_context_seq_source = '',
                                 weixin_context_updated_at = NULL,
                                 updated_at = NOW()
                             WHERE platform = 'weixin'
