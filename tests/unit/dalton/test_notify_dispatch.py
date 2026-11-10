@@ -71,9 +71,6 @@ def _make_bridge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> rb.Research
     monkeypatch.setenv("DALTON_BRIDGE_ENV_FILE", str(empty_env))
     monkeypatch.setenv("OPENCLAW_GATEWAY_URL", "http://127.0.0.1:18789")
     monkeypatch.setenv("OPENCLAW_GATEWAY_TOKEN", "secret-gateway-token-xyz987")
-    # Keep the host machine's real Feishu credentials (the openclaw.json
-    # fallback BridgeConfig reads) out of the test config.
-    monkeypatch.setattr(rb, "_read_openclaw_feishu_credentials", lambda: ("", ""))
     return rb.ResearchDataBridge(rb.BridgeConfig())
 
 

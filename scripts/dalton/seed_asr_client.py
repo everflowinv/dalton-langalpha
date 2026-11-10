@@ -33,6 +33,11 @@ import uuid
 
 import httpx
 
+try:
+    import bridge_subprocess_env as _bridge_subprocess_env
+except ImportError:
+    from scripts.dalton import bridge_subprocess_env as _bridge_subprocess_env
+
 logger = logging.getLogger("researchdata-bridge")
 
 API_SUBMIT = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/submit"
@@ -59,28 +64,12 @@ DEFAULT_MAX_RETRIES = 3
 DEFAULT_INITIAL_BACKOFF_S = 0.5
 DEFAULT_MAX_BACKOFF_S = 8.0
 
-ASR_CREDENTIAL_ENV_KEYS: frozenset[str] = frozenset(
-    {
-        "SEED_ASR_APP_ID",
-        "SEED_ASR_ACCESS_KEY",
-        "VOLC_TOS_AK",
-        "VOLC_TOS_SK",
-        "VOLC_TOS_BUCKET",
-        "VOLC_TOS_REGION",
-        "VOLC_TOS_ENDPOINT",
-    }
-)
+ASR_CREDENTIAL_ENV_KEYS: frozenset[str] = _bridge_subprocess_env.ASR_CREDENTIAL_ENV_KEYS
 
-ASR_STORAGE_ENV_KEYS: frozenset[str] = frozenset(
-    {
-        "DALTON_ASR_STORAGE_ENDPOINT_URL",
-        "DALTON_ASR_STORAGE_BUCKET_NAME",
-        "DALTON_ASR_STORAGE_ACCESS_KEY_ID",
-        "DALTON_ASR_STORAGE_SECRET_ACCESS_KEY",
-        "DALTON_ASR_STORAGE_REGION",
-        "DALTON_ASR_STORAGE_ADDRESSING_STYLE",
-        "DALTON_ASR_STORAGE_KEY_PREFIX",
-    }
+ASR_STORAGE_ENV_KEYS: frozenset[str] = _bridge_subprocess_env.ASR_STORAGE_ENV_KEYS
+
+STRIPPED_CREDENTIAL_ENV_PREFIXES: tuple[str, ...] = (
+    _bridge_subprocess_env.STRIPPED_CREDENTIAL_ENV_PREFIXES
 )
 
 ASR_SUBPROCESS_ENV_ALLOWLIST: tuple[str, ...] = (
@@ -192,39 +181,15 @@ def build_asr_subprocess_env(
 def has_asr_credentials_in_env(
     env: Mapping[str, str] | None = None,
 ) -> bool:
-    """Return True if `env` contains any `SEED_ASR_*`, `VOLC_TOS_*`, or `DALTON_ASR_STORAGE_*` variable."""
-    src = env if env is not None else os.environ
-    for k in src:
-        upper = k.upper()
-        if (
-            k in ASR_CREDENTIAL_ENV_KEYS
-            or k in ASR_STORAGE_ENV_KEYS
-            or upper.startswith("SEED_ASR_")
-            or upper.startswith("VOLC_TOS_")
-            or upper.startswith("DALTON_ASR_STORAGE_")
-        ):
-            return True
-    return False
+    """Return True if `env` contains any stripped ASR, TOS, Feishu, gateway, or broker variable."""
+    return _bridge_subprocess_env.has_asr_credentials_in_env(env)
 
 
 def strip_asr_credentials_from_env(
     env: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
-    """Return a copy of `env` with all Seed-ASR, Volcengine TOS, and ASR storage variables removed."""
-    src = env if env is not None else os.environ
-    out: dict[str, str] = {}
-    for k, v in src.items():
-        upper = k.upper()
-        if (
-            k in ASR_CREDENTIAL_ENV_KEYS
-            or k in ASR_STORAGE_ENV_KEYS
-            or upper.startswith("SEED_ASR_")
-            or upper.startswith("VOLC_TOS_")
-            or upper.startswith("DALTON_ASR_STORAGE_")
-        ):
-            continue
-        out[k] = v
-    return out
+    """Return a copy of `env` with Seed-ASR, TOS, ASR storage, Feishu, gateway, and broker variables removed."""
+    return _bridge_subprocess_env.strip_asr_credentials_from_env(env)
 
 
 @dataclass(frozen=True)
@@ -346,6 +311,14 @@ def redact_asr_secrets(
         "STORAGE_SECRET_ACCESS_KEY",
         "DALTON_BRIDGE_TOKEN",
         "DALTON_BRIDGE_ADMIN_TOKEN",
+        "FEISHU_APP_SECRET",
+        "DALTON_FEISHU_APP_SECRET",
+        "OPENCLAW_FEISHU_APP_SECRET",
+        "LARK_APP_SECRET",
+        "OPENCLAW_GATEWAY_TOKEN",
+        "DALTON_OPENCLAW_GATEWAY_TOKEN",
+        "DALTON_BROKER_TOKEN",
+        "DALTON_WEB_SEARCH_BRIDGE_TOKEN",
     ):
         val = str(env.get(key) or "").strip()
         if val:

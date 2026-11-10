@@ -48,10 +48,14 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+_PRE_IMPORT_ENV: dict[str, str] = dict(os.environ)
+
 from psycopg.rows import dict_row  # noqa: E402
 from psycopg.types.json import Jsonb  # noqa: E402
 
+from scripts.dalton import bridge_subprocess_env  # noqa: E402
 from scripts.dalton.conversation_archive import (  # noqa: E402
+    EXIT_CODE_FATAL,
     EXIT_CODE_INCOMPLETE,
     EXIT_CODE_LOCK_HELD,
     EXIT_CODE_OK,
@@ -68,6 +72,7 @@ from scripts.dalton.conversations.export_openclaw import (  # noqa: E402
     DEFAULT_AGENTS,
     DEFAULT_OCW_AGENTS_ROOT,
     is_operational_or_chitchat,
+    resolve_default_ocw_agents_root,
     run_export,
 )
 from src.dalton.conversations.embedder import embed_texts_via_bridge  # noqa: E402
@@ -86,6 +91,15 @@ from src.dalton.conversations.render import (  # noqa: E402
 )
 from src.dalton.database import conversations as db_conv  # noqa: E402
 from src.dalton.settings import get_dalton_settings  # noqa: E402
+
+# Re-filter `os.environ` immediately after `src.*` imports (which trigger `load_dotenv()`)
+# and restore the host `DALTON_BRIDGE_EMBED_URL` and `no_proxy` (§2.6.1.4).
+bridge_subprocess_env.scrub_post_dotenv_import_env(
+    os.environ,
+    pre_import_env=_PRE_IMPORT_ENV,
+    repo_root=REPO_ROOT,
+    include_reextract_dsn=True,
+)
 
 logger = logging.getLogger("dalton.reextract_conversations")
 
@@ -2275,6 +2289,15 @@ async def _cmd_extract(args: argparse.Namespace) -> int:
         raise RunStateError(
             f"--fallback-model {fallback!r} does not match the plan's {plan.get('fallback_model')!r}"
         )
+    bridge_subprocess_env.enforce_reextract_process_env_in_place(
+        os.environ,
+        "extract",
+        explicit_model=str(model),
+        explicit_fallback_model=str(fallback or ""),
+        repo_root=REPO_ROOT,
+        preserve_pytest=True,
+        validate_required=False,
+    )
     from src.dalton.llm.complete import resolve_model_billing_and_provider
 
     billing, _provider = resolve_model_billing_and_provider(model)
@@ -2446,7 +2469,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p_plan.add_argument("--since", default=None, help="Override export start (default: min date_et - 1)")
     p_plan.add_argument("--until", default=None, help="Override export end (default: max date_et + 1)")
     p_plan.add_argument("--agents", default=",".join(DEFAULT_AGENTS))
-    p_plan.add_argument("--ocw-agents-root", default=str(DEFAULT_OCW_AGENTS_ROOT))
+    p_plan.add_argument("--ocw-agents-root", default=str(resolve_default_ocw_agents_root()))
     p_plan.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
     p_plan.add_argument("--p50-seconds", type=float, default=DEFAULT_P50_SECONDS)
     p_plan.add_argument("--model", default=DEFAULT_MODEL, help="Extractor model recorded in the plan")
@@ -2501,11 +2524,51 @@ COMMANDS: dict[str, Callable[[argparse.Namespace], Awaitable[int]]] = {
 }
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    validate_env: bool | None = None,
+) -> int:
     configure_archive_logging()
     args = build_arg_parser().parse_args(argv)
+    eff_model = getattr(args, "model", None)
+    eff_fallback = getattr(args, "fallback_model", None)
+    if args.subcommand == "extract" and getattr(args, "run_id", None):
+        try:
+            plan_preview = load_plan(run_dir_for(args.run_id))
+            if not eff_model and plan_preview.get("model"):
+                eff_model = str(plan_preview["model"])
+            if eff_fallback is None and "fallback_model" in plan_preview:
+                eff_fallback = str(plan_preview.get("fallback_model") or "")
+        except Exception:
+            pass
+
+    cond_required = bridge_subprocess_env.enforce_reextract_process_env_in_place(
+        os.environ,
+        args.subcommand,
+        explicit_model=eff_model,
+        explicit_fallback_model=eff_fallback,
+        explicit_dsn=getattr(args, "dsn", None),
+        repo_root=REPO_ROOT,
+        preserve_pytest=(validate_env is not True),
+        validate_required=False,
+    )
     try:
+        if args.subcommand in ("apply", "render", "rollback"):
+            live_pid = find_running_archive_pid()
+            if live_pid is not None:
+                raise ArchiveBusyError(f"conversation archive pid {live_pid} is alive")
+        if validate_env is True:
+            bridge_subprocess_env.validate_reextract_required_env(
+                os.environ,
+                args.subcommand,
+                conditional_required_keys=cond_required,
+                explicit_dsn=getattr(args, "dsn", None),
+            )
         return asyncio.run(COMMANDS[args.subcommand](args))
+    except bridge_subprocess_env.ArchiveEnvValidationError as exc:
+        print(f"[reextract_conversations] ERROR: {exc}", file=sys.stderr)
+        return EXIT_CODE_FATAL
     except ArchiveBusyError as exc:
         print(f"refused: {exc}\n\n{PAUSE_HINT}", file=sys.stderr)
         return EXIT_CODE_LOCK_HELD
@@ -2515,4 +2578,4 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(validate_env=True))

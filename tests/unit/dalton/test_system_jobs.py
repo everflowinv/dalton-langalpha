@@ -2502,6 +2502,24 @@ async def test_archive_disconnects_only_owned_builtin_mcp_registry_and_archive_d
     pid_file = tmp_path / "archive.pid"
     count_file = tmp_path / "attempts.txt"
     fake_py_script = tmp_path / "fake_archive_retry.py"
+    synth_repo_env = tmp_path / "repo.env"
+    synth_bridge_env = tmp_path / "bridge.env"
+    synth_repo_env.write_text(
+        "DB_HOST=127.0.0.1\n"
+        "DB_PORT=5432\n"
+        "DB_NAME=dalton_test\n"
+        "DB_USER=postgres\n"
+        "DB_PASSWORD=synth_db_pw\n"
+        "BYOK_ENCRYPTION_KEY=c3ludGgtYnlvay1rZXktMzItYnl0ZXMtbG9uZy0wMDA=\n"
+        "AUTH_USER_ID=11111111-1111-4111-8111-111111111111\n"
+        "DALTON_PM_USER_IDS=11111111-1111-4111-8111-111111111111\n"
+        "DALTON_ENABLED=true\n",
+        encoding="utf-8",
+    )
+    synth_bridge_env.write_text(
+        "DALTON_BRIDGE_ADMIN_TOKEN=synth_bridge_admin_tok_123\n",
+        encoding="utf-8",
+    )
     state_file.write_text('{"enabled": true}\n', encoding="utf-8")
     fake_py_script.write_text(
         "import os, sys\n"
@@ -2518,6 +2536,8 @@ async def test_archive_disconnects_only_owned_builtin_mcp_registry_and_archive_d
         ["/bin/bash", str(script_path)],
         env={
             **os.environ,
+            "DALTON_REPO_ENV_FILE": str(synth_repo_env),
+            "DALTON_BRIDGE_ENV_FILE": str(synth_bridge_env),
             "DALTON_ARCHIVE_STATE_FILE": str(state_file),
             "DALTON_ARCHIVE_STATUS_FILE": str(status_file),
             "DALTON_ARCHIVE_PID_FILE": str(pid_file),
@@ -2557,6 +2577,8 @@ async def test_archive_disconnects_only_owned_builtin_mcp_registry_and_archive_d
         ["/bin/bash", str(script_path)],
         env={
             **os.environ,
+            "DALTON_REPO_ENV_FILE": str(synth_repo_env),
+            "DALTON_BRIDGE_ENV_FILE": str(synth_bridge_env),
             "DALTON_ARCHIVE_STATE_FILE": str(state_file),
             "DALTON_ARCHIVE_STATUS_FILE": str(status_file),
             "DALTON_ARCHIVE_PID_FILE": str(pid_file),

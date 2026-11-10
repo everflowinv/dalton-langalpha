@@ -40,12 +40,6 @@ def _make_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> rb.BridgeCo
     monkeypatch.setenv("DALTON_BRIDGE_USAGE_FILE", str(tmp_path / "usage.json"))
     monkeypatch.delenv("FEISHU_APP_ID", raising=False)
     monkeypatch.delenv("FEISHU_APP_SECRET", raising=False)
-    # Deterministic regardless of the developer's ~/.openclaw: never read real credentials.
-    monkeypatch.setattr(
-        rb,
-        "_read_openclaw_feishu_credentials",
-        create_autospec(rb._read_openclaw_feishu_credentials, return_value=("", "")),
-    )
     return rb.BridgeConfig()
 
 
@@ -1112,3 +1106,81 @@ def test_request_empty_error_body_is_an_unknown_outcome(
         client._request("POST", "/open-apis/docx/v1/documents/d/blocks/d/descendant", json_body={})
     assert excinfo.value.error_code == "feishu_empty_error_response"
     assert rb._feishu_outcome_unknown(excinfo.value.error_code)
+
+
+@pytest.mark.asyncio
+async def test_bridge_feishu_dedicated_config_never_falls_back_to_openclaw_or_gateway_vars(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Bridge loads FEISHU_APP_ID / FEISHU_APP_SECRET / FEISHU_DEFAULT_GRANT_CHAT_ID strictly
+    from DALTON_BRIDGE_ENV_FILE / process env, never reading ~/.openclaw/openclaw.json or
+    DALTON_FEISHU_* when credentials are missing or partial.
+    """
+    from src.dalton.feishu import describe_feishu_error
+
+    assert not hasattr(rb, "_read_openclaw_feishu_credentials")
+
+    ocw_home = tmp_path / "fake_openclaw"
+    ocw_home.mkdir(parents=True, exist_ok=True)
+    (ocw_home / "openclaw.json").write_text(
+        json.dumps(
+            {
+                "channels": {
+                    "feishu": {
+                        "defaultAccount": "default",
+                        "accounts": {
+                            "default": {
+                                "appId": "cli_legacy_openclaw_should_not_be_read",
+                                "appSecret": "sec_legacy_openclaw_should_not_be_read",
+                            }
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DALTON_OCW_HOME", str(ocw_home))
+    monkeypatch.setenv("DALTON_FEISHU_APP_ID", "cli_gateway_only_id")
+    monkeypatch.setenv("DALTON_FEISHU_APP_SECRET", "sec_gateway_only_secret")
+
+    # 1. Missing FEISHU_APP_ID / FEISHU_APP_SECRET -> stays unconfigured despite openclaw.json and DALTON_FEISHU_*
+    bridge_missing = _make_bridge(monkeypatch, tmp_path)
+    code_503, body_503 = await bridge_missing.handle_feishu_doc_read({"token": "doccn123"})
+    assert code_503 == 503
+    assert body_503 == {
+        "ok": False,
+        "error_code": "feishu_not_configured",
+        "message": "FEISHU_APP_ID / FEISHU_APP_SECRET not configured on host",
+    }
+
+    # 2. Partial credentials (only FEISHU_APP_ID set) -> still unconfigured
+    partial_env = tmp_path / "partial_bridge.env"
+    partial_env.write_text("FEISHU_APP_ID=cli_dedicated_partial\n", encoding="utf-8")
+    monkeypatch.setenv("DALTON_BRIDGE_ENV_FILE", str(partial_env))
+    monkeypatch.delenv("FEISHU_APP_ID", raising=False)
+    monkeypatch.delenv("FEISHU_APP_SECRET", raising=False)
+    cfg_partial = rb.BridgeConfig()
+    assert cfg_partial.feishu_app_id == ""
+    assert cfg_partial.feishu_app_secret == ""
+
+    # 3. Dedicated DALTON_BRIDGE_ENV_FILE credentials load cleanly
+    dedicated_env = tmp_path / "dedicated_bridge.env"
+    dedicated_env.write_text(
+        "FEISHU_APP_ID='cli_dedicated_dalton_app'\n"
+        'FEISHU_APP_SECRET="sec_dedicated_dalton_secret"\n'
+        "FEISHU_DEFAULT_GRANT_CHAT_ID=oc_dedicated_team_chat\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DALTON_BRIDGE_ENV_FILE", str(dedicated_env))
+    monkeypatch.delenv("FEISHU_APP_ID", raising=False)
+    monkeypatch.delenv("FEISHU_APP_SECRET", raising=False)
+    monkeypatch.delenv("FEISHU_DEFAULT_GRANT_CHAT_ID", raising=False)
+    cfg_ok = rb.BridgeConfig()
+    assert cfg_ok.feishu_app_id == "cli_dedicated_dalton_app"
+    assert cfg_ok.feishu_app_secret == "sec_dedicated_dalton_secret"
+    assert cfg_ok.feishu_default_grant_chat_id == "oc_dedicated_team_chat"
+
+    err_msg = describe_feishu_error("feishu_not_configured")
+    assert "FEISHU_APP_ID" in err_msg and "FEISHU_APP_SECRET" in err_msg
+    assert "openclaw.json" not in err_msg

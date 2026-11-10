@@ -45,6 +45,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+_PRE_IMPORT_ENV: dict[str, str] = dict(os.environ)
+
+from scripts.dalton import bridge_subprocess_env  # noqa: E402
 from scripts.dalton.conversations.export_openclaw import (  # noqa: E402
     DEFAULT_AGENTS,
     DEFAULT_CURSORS_FILE,
@@ -53,6 +56,7 @@ from scripts.dalton.conversations.export_openclaw import (  # noqa: E402
     DEFAULT_OCW_AGENTS_ROOT,
     SessionCursor,
     is_operational_or_chitchat,
+    resolve_default_ocw_agents_root,
     run_export,
     save_cursors_file,
 )
@@ -83,6 +87,14 @@ from src.dalton.llm.model_prefs import resolve_dalton_extract_model  # noqa: E40
 from src.dalton.settings import get_dalton_settings  # noqa: E402
 from src.server.database import pool as _db_pool_mod  # noqa: E402
 from src.server.database.pool import get_or_create_pool, open_session_connection  # noqa: E402
+
+# Re-filter `os.environ` immediately after `src.*` imports (which trigger `load_dotenv()`)
+# and restore the host `DALTON_BRIDGE_EMBED_URL` and `no_proxy` (§2.6.1.4).
+bridge_subprocess_env.scrub_post_dotenv_import_env(
+    os.environ,
+    pre_import_env=_PRE_IMPORT_ENV,
+    repo_root=REPO_ROOT,
+)
 
 _orig_open_session_connection = open_session_connection
 
@@ -2862,6 +2874,14 @@ async def run_archive_pipeline(
     eff_model = (extractor_model or "").strip()
     if not eff_model:
         eff_model = (await resolve_dalton_extract_model(archive_billing_user_id())).strip()
+    bridge_subprocess_env.enforce_archive_process_env_in_place(
+        os.environ,
+        explicit_model=eff_model,
+        explicit_fallback_model=str(cfg.extractor_fallback_model or DEFAULT_FALLBACK_MODEL),
+        repo_root=REPO_ROOT,
+        preserve_pytest=True,
+        validate_required=False,
+    )
     eff_budget = int(hourly_token_budget or cfg.hourly_token_budget)
     eff_concurrency = max(
         1,
@@ -3185,7 +3205,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     common.add_argument("--inbox-file", type=Path, default=None, help="Specific exported inbox .jsonl file")
     common.add_argument("--inbox-dir", type=Path, default=DEFAULT_INBOX_DIR)
     common.add_argument("--cursors-file", type=Path, default=DEFAULT_CURSORS_FILE)
-    common.add_argument("--ocw-agents-root", type=Path, default=DEFAULT_OCW_AGENTS_ROOT)
+    common.add_argument("--ocw-agents-root", type=Path, default=resolve_default_ocw_agents_root())
     common.add_argument("--agents", default=",".join(DEFAULT_AGENTS))
     common.add_argument("--model", default=None, help="Override extractor LLM model key")
     common.add_argument("--hourly-token-budget", type=int, default=None, help="Override hourly token budget")
@@ -3335,10 +3355,27 @@ def main(
     *,
     exit_fn: Callable[[int], Any] | None = None,
     on_finally: Callable[[], Any] | None = None,
+    validate_env: bool | None = None,
 ) -> int:
     configure_archive_logging()
     parser = build_arg_parser()
     args = parser.parse_args(argv)
+    cond_required = bridge_subprocess_env.enforce_archive_process_env_in_place(
+        os.environ,
+        explicit_model=args.model,
+        repo_root=REPO_ROOT,
+        preserve_pytest=(validate_env is not True),
+        validate_required=False,
+    )
+    if validate_env is True:
+        try:
+            bridge_subprocess_env.validate_archive_required_env(
+                os.environ,
+                conditional_required_keys=cond_required,
+            )
+        except bridge_subprocess_env.ArchiveEnvValidationError as exc:
+            print(f"[conversation_archive] ERROR: {exc}", file=sys.stderr)
+            return EXIT_CODE_FATAL
     _ABANDONED_EXTRACTION_TASKS.clear()
     loop = asyncio.new_event_loop()
     exit_code: int = EXIT_CODE_OK
@@ -3470,4 +3507,4 @@ def main(
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(validate_env=True))

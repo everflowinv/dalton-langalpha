@@ -209,3 +209,8 @@ tests/unit/dalton/test_t26_task_preview.py
 scripts/dalton/openclaw_overlays/skills/sentiment-dashboard/scripts/us_market_sections.py
 scripts/dalton/openclaw_overlays/skills/sentiment-dashboard/scripts/sentiment_dashboard_cli.py
 tests/unit/dalton/test_sentiment_observation_dates.py
+# OC5 PR1 Batch 1: dedicated Bridge Feishu config, atomic installer merge, subprocess env filtering, and archive allowlist.
+scripts/dalton/bridge_subprocess_env.py
+scripts/dalton/openclaw_overlays/skills/company-wiki/run.sh
+scripts/dalton/openclaw_overlays/skills/market-digest/run.sh
+tests/unit/dalton/test_oc5_pr1_batch1.py
