@@ -3,6 +3,7 @@ import type {
   I7RecoverResponse,
   ThreadStatusInfo,
 } from "../src/backend-client.js";
+import { ChannelDeliveryError } from "../src/channels/adapter.js";
 import {
   createTestHarness,
   loadFixtureKey,
@@ -1122,13 +1123,22 @@ describe("Unbounded `/messages/replay` Pagination, Reasoning/Subagent Filter & T
     vi.spyOn(h.feishuAdapter, "sendTextChunk").mockImplementation(
       async (params) => {
         if (failSecondChunk && params.chunkIndex === 1) {
-          throw new Error("Feishu rate limit on chunk 2");
+          throw new ChannelDeliveryError("Feishu rate limit on chunk 2", {
+            code: "rate_limited",
+            outcome: "failed",
+          });
         }
         if (
           failPartialNotice &&
           params.text.includes("后续内容未能发送，请在网页查看：")
         ) {
-          throw new Error("Transient error sending partial notice");
+          throw new ChannelDeliveryError(
+            "Transient error sending partial notice",
+            {
+              code: "unavailable",
+              outcome: "failed",
+            },
+          );
         }
         return origSendTextChunk(params);
       },
@@ -1150,6 +1160,7 @@ describe("Unbounded `/messages/replay` Pagination, Reasoning/Subagent Filter & T
     });
 
     expect(settledFirst).toBe(false);
+    expect(h.feishuAdapter.sendTextChunk).toHaveBeenCalledTimes(3);
     expect(h.feishuAdapter.sentTexts).toHaveLength(1);
     expect(h.feishuAdapter.sentTexts[0]?.text).toBe(chunk0Text);
     expect(
@@ -1216,6 +1227,7 @@ describe("Unbounded `/messages/replay` Pagination, Reasoning/Subagent Filter & T
       (c) => c.delivery_key === `fallback:${RUN_ID}`,
     ).length;
     expect(fallbackClaimsAfterRecovery).toBe(fallbackClaimsBeforeRecovery + 1);
+    expect(h.feishuAdapter.sendTextChunk).toHaveBeenCalledTimes(4);
     expect(h.feishuAdapter.sentTexts).toHaveLength(2);
     expect(h.feishuAdapter.sentTexts[0]?.text).toBe(chunk0Text);
     expect(h.feishuAdapter.sentTexts[1]?.text).toBe(
@@ -1249,7 +1261,13 @@ describe("Unbounded `/messages/replay` Pagination, Reasoning/Subagent Filter & T
     vi.spyOn(h.feishuAdapter, "sendTextChunk").mockImplementation(
       async (params) => {
         if (failCancelNotice) {
-          throw new Error("Feishu outage while sending cancelled notice");
+          throw new ChannelDeliveryError(
+            "Feishu outage while sending cancelled notice",
+            {
+              code: "unavailable",
+              outcome: "failed",
+            },
+          );
         }
         return origSendTextChunk(params);
       },
@@ -1268,6 +1286,7 @@ describe("Unbounded `/messages/replay` Pagination, Reasoning/Subagent Filter & T
     });
 
     expect(settledFirst).toBe(false);
+    expect(h.feishuAdapter.sendTextChunk).toHaveBeenCalledTimes(1);
     expect(h.feishuAdapter.sentTexts).toHaveLength(0);
     expect(
       h.backend.progressUpdates.some(
@@ -1312,6 +1331,7 @@ describe("Unbounded `/messages/replay` Pagination, Reasoning/Subagent Filter & T
 
     await h.app.orchestrator.runStartupRecovery();
 
+    expect(h.feishuAdapter.sendTextChunk).toHaveBeenCalledTimes(2);
     expect(h.feishuAdapter.sentTexts).toHaveLength(1);
     expect(h.feishuAdapter.sentTexts[0]?.text).toContain(
       'The run ended with status "cancelled".',
@@ -1384,13 +1404,22 @@ describe("Unbounded `/messages/replay` Pagination, Reasoning/Subagent Filter & T
     vi.spyOn(h.feishuAdapter, "sendTextChunk").mockImplementation(
       async (params) => {
         if (failSecondChunk && params.chunkIndex === 1) {
-          throw new Error("Feishu rate limit on chunk 2");
+          throw new ChannelDeliveryError("Feishu rate limit on chunk 2", {
+            code: "rate_limited",
+            outcome: "failed",
+          });
         }
         if (
           failPartialNotice &&
           params.text.includes("后续内容未能发送，请在网页查看：")
         ) {
-          throw new Error("Transient error sending partial notice");
+          throw new ChannelDeliveryError(
+            "Transient error sending partial notice",
+            {
+              code: "unavailable",
+              outcome: "failed",
+            },
+          );
         }
         return origSendTextChunk(params);
       },
@@ -1412,6 +1441,7 @@ describe("Unbounded `/messages/replay` Pagination, Reasoning/Subagent Filter & T
       });
 
     expect(bgSettledBeforeRestart).toBe(false);
+    expect(h.feishuAdapter.sendTextChunk).toHaveBeenCalledTimes(3);
     expect(h.feishuAdapter.sentTexts).toHaveLength(1);
     expect(h.feishuAdapter.sentTexts[0]?.text).toBe(chunk0Text);
     expect(
@@ -1459,6 +1489,7 @@ describe("Unbounded `/messages/replay` Pagination, Reasoning/Subagent Filter & T
       (c) => c.delivery_key === `fallback:${bgRunId}`,
     ).length;
     expect(bgFallbackClaimsAfter).toBe(bgFallbackClaimsBefore + 1);
+    expect(h.feishuAdapter.sendTextChunk).toHaveBeenCalledTimes(4);
     expect(h.feishuAdapter.sentTexts).toHaveLength(2);
     expect(h.feishuAdapter.sentTexts[1]?.text).toBe(
       `后续内容未能发送，请在网页查看：https://app.ginlix.ai/chat/t/${THREAD_ID}`,
@@ -1500,6 +1531,7 @@ describe("Unbounded `/messages/replay` Pagination, Reasoning/Subagent Filter & T
       rawPayload: {},
     });
 
+    expect(h.feishuAdapter.sendTextChunk).toHaveBeenCalledTimes(7);
     expect(
       h.backend.progressUpdates.some(
         (u) =>
@@ -1528,6 +1560,13 @@ describe("Unbounded `/messages/replay` Pagination, Reasoning/Subagent Filter & T
     const chunk0Text = "A".repeat(h.feishuAdapter.maxChunkChars);
     const chunk1Text = "B".repeat(600);
     const bgRunId = "bg_snap_partial_retry_1";
+    const noticeText = `后续内容未能发送，请在网页查看：https://app.ginlix.ai/chat/t/${THREAD_ID}`;
+    const sendLog: Array<{
+      deliveryKey: string | null;
+      chunkIndex: number;
+      text: string;
+      outcome: "failed" | "sent" | "unknown";
+    }> = [];
     const twoChunkBgPage = defaultPage.map((evt) => {
       if (evt.event === "user_message") {
         return {
@@ -1573,16 +1612,39 @@ describe("Unbounded `/messages/replay` Pagination, Reasoning/Subagent Filter & T
     let failPartialNotice = true;
     vi.spyOn(h.feishuAdapter, "sendTextChunk").mockImplementation(
       async (params) => {
+        const claims = h.backend.deliveryClaims;
+        const deliveryKey = claims[claims.length - 1]?.delivery_key ?? null;
+        const record = (outcome: "failed" | "sent") => {
+          sendLog.push({
+            deliveryKey,
+            chunkIndex: params.chunkIndex,
+            text: params.text,
+            outcome,
+          });
+        };
         if (failSecondChunk && params.chunkIndex === 1) {
-          throw new Error("Feishu rate limit on chunk 2");
+          record("failed");
+          throw new ChannelDeliveryError("Feishu rate limit on chunk 2", {
+            code: "rate_limited",
+            outcome: "failed",
+          });
         }
         if (
           failPartialNotice &&
           params.text.includes("后续内容未能发送，请在网页查看：")
         ) {
-          throw new Error("Transient error sending partial notice");
+          record("failed");
+          throw new ChannelDeliveryError(
+            "Transient error sending partial notice",
+            {
+              code: "unavailable",
+              outcome: "failed",
+            },
+          );
         }
-        return origSendTextChunk(params);
+        const sent = await origSendTextChunk(params);
+        record("sent");
+        return sent;
       },
     );
 
@@ -1599,6 +1661,7 @@ describe("Unbounded `/messages/replay` Pagination, Reasoning/Subagent Filter & T
       isBackgroundRun: true,
     });
     expect(settledInitial).toBe(false);
+    expect(h.feishuAdapter.sendTextChunk).toHaveBeenCalledTimes(3);
     expect(h.feishuAdapter.sentTexts).toHaveLength(1);
     expect(h.feishuAdapter.sentTexts[0]?.text).toBe(chunk0Text);
 
@@ -1683,6 +1746,7 @@ describe("Unbounded `/messages/replay` Pagination, Reasoning/Subagent Filter & T
 
     // Run startup recovery (where `failPartialNotice` is still `true` -> `fallback_pending` remains `true`)
     await h.app.orchestrator.runStartupRecovery();
+    expect(h.feishuAdapter.sendTextChunk).toHaveBeenCalledTimes(4);
     expect(
       h.backend.progressUpdates.some(
         (u) =>
@@ -1704,19 +1768,105 @@ describe("Unbounded `/messages/replay` Pagination, Reasoning/Subagent Filter & T
     });
     await handle.promise;
 
-    expect(h.feishuAdapter.sentTexts).toHaveLength(2);
-    expect(h.feishuAdapter.sentTexts[0]?.text).toBe(chunk0Text);
-    expect(h.feishuAdapter.sentTexts[1]?.text).toBe(
-      `后续内容未能发送，请在网页查看：https://app.ginlix.ai/chat/t/${THREAD_ID}`,
+    // Eight adapter sends, and only two succeed: chunk 0 once, then the partial
+    // notice once. Chunk 1 fails and is not retried. The notice fails five times
+    // (initial fallback, startup recovery, the first watch snapshot, that
+    // snapshot's reconnect sync, and the post-EOF sync) and is sent on the
+    // second snapshot. Confirmed failures may be retried; each successful
+    // message is delivered once.
+    expect(h.feishuAdapter.sendTextChunk).toHaveBeenCalledTimes(8);
+    expect(sendLog).toEqual([
+      {
+        deliveryKey: `fallback:${bgRunId}`,
+        chunkIndex: 0,
+        text: chunk0Text,
+        outcome: "sent",
+      },
+      {
+        deliveryKey: `fallback:${bgRunId}`,
+        chunkIndex: 1,
+        text: chunk1Text,
+        outcome: "failed",
+      },
+      {
+        deliveryKey: `notice:partial:${bgRunId}`,
+        chunkIndex: 0,
+        text: noticeText,
+        outcome: "failed",
+      },
+      {
+        deliveryKey: `notice:partial:${bgRunId}`,
+        chunkIndex: 0,
+        text: noticeText,
+        outcome: "failed",
+      },
+      {
+        deliveryKey: `notice:partial:${bgRunId}`,
+        chunkIndex: 0,
+        text: noticeText,
+        outcome: "failed",
+      },
+      {
+        deliveryKey: `notice:partial:${bgRunId}`,
+        chunkIndex: 0,
+        text: noticeText,
+        outcome: "failed",
+      },
+      {
+        deliveryKey: `notice:partial:${bgRunId}`,
+        chunkIndex: 0,
+        text: noticeText,
+        outcome: "failed",
+      },
+      {
+        deliveryKey: `notice:partial:${bgRunId}`,
+        chunkIndex: 0,
+        text: noticeText,
+        outcome: "sent",
+      },
+    ]);
+    expect(h.feishuAdapter.sentTexts.map((item) => item.text)).toEqual([
+      chunk0Text,
+      noticeText,
+    ]);
+    expect(
+      sendLog.filter((entry) => entry.outcome === "sent").map((entry) => entry.text),
+    ).toEqual([chunk0Text, noticeText]);
+    expect(sendLog.filter((entry) => entry.outcome === "unknown")).toHaveLength(0);
+    expect(
+      h.backend.deliveryUpdates
+        .filter(
+          (update) => update.delivery_key === `fallback:${bgRunId}` && update.status != null,
+        )
+        .map((update) => update.status),
+    ).toEqual(["partial"]);
+    expect(
+      h.backend.deliveryUpdates
+        .filter(
+          (update) =>
+            update.delivery_key === `notice:partial:${bgRunId}` && update.status != null,
+        )
+        .map((update) => update.status),
+    ).toEqual(["failed", "failed", "failed", "failed", "failed", "sent"]);
+    expect(h.backend.deliveryUpdates.some((update) => update.status === "unknown")).toBe(
+      false,
     );
     expect(
-      h.backend.progressUpdates.some(
-        (u) =>
-          u.background_run?.run_id === bgRunId &&
-          u.background_run?.status === "completed" &&
-          u.background_run?.fallback_pending === false,
+      h.backend.deliveryClaims.filter((claim) => claim.delivery_key === `fallback:${bgRunId}`),
+    ).toHaveLength(6);
+    expect(
+      h.backend.deliveryClaims.filter(
+        (claim) => claim.delivery_key === `notice:partial:${bgRunId}`,
       ),
-    ).toBe(true);
+    ).toHaveLength(6);
+    expect(
+      h.backend.progressUpdates.filter(
+        (update) =>
+          update.background_run?.run_id === bgRunId &&
+          update.background_run?.status === "completed" &&
+          update.background_run?.fallback_pending === false,
+      ),
+    ).toHaveLength(1);
   });
 
   it("does NOT falsely send `notice:partial:{run_id}` when a background turn's full text is delivered as `status: 'sent'` via `pendingReplayFallbacks` before `syncWatchReconnectState` processes the snapshot's `background_runs` row (Codex r10 #2)", async () => {
@@ -1890,13 +2040,25 @@ describe("Unbounded `/messages/replay` Pagination, Reasoning/Subagent Filter & T
     vi.spyOn(h.feishuAdapter, "sendTextChunk").mockImplementation(
       async (params) => {
         if (failSecondChunk && params.chunkIndex === 1) {
-          throw new Error("Feishu rate limit on Turn A chunk 2");
+          throw new ChannelDeliveryError(
+            "Feishu rate limit on Turn A chunk 2",
+            {
+              code: "rate_limited",
+              outcome: "failed",
+            },
+          );
         }
         if (
           failPartialNotice &&
           params.text.includes("后续内容未能发送，请在网页查看：")
         ) {
-          throw new Error("Transient error sending Turn A partial notice");
+          throw new ChannelDeliveryError(
+            "Transient error sending Turn A partial notice",
+            {
+              code: "unavailable",
+              outcome: "failed",
+            },
+          );
         }
         return origSendTextChunk(params);
       },
@@ -1915,6 +2077,7 @@ describe("Unbounded `/messages/replay` Pagination, Reasoning/Subagent Filter & T
       scopeKey: "dm:ou_alice",
     });
     expect(settledTurnAFirst).toBe(false);
+    expect(h.feishuAdapter.sendTextChunk).toHaveBeenCalledTimes(3);
     expect(h.feishuAdapter.sentTexts).toHaveLength(1);
     expect(h.feishuAdapter.sentTexts[0]?.text).toBe(chunk0Text);
 
@@ -1956,6 +2119,7 @@ describe("Unbounded `/messages/replay` Pagination, Reasoning/Subagent Filter & T
 
     await h.app.orchestrator.runStartupRecovery();
 
+    expect(h.feishuAdapter.sendTextChunk).toHaveBeenCalledTimes(5);
     const sentTextsAfter = h.feishuAdapter.sentTexts.map((t) => t.text);
     expect(sentTextsAfter).toContain(
       `后续内容未能发送，请在网页查看：https://app.ginlix.ai/chat/t/${THREAD_ID}`,
