@@ -2083,6 +2083,114 @@ async def _fetch_data_task_def_notify_state(job_key: str) -> dict[str, Any] | No
         return None
 
 
+RETRY_MIN_REQUEST_TIMEOUT_S = 1.0
+RETRY_CLIENT_CLASSIFY_SLACK_S = 0.5
+RETRY_DB_FINALIZE_RESERVE_S = 3.0
+
+
+def _remaining_retry_request_budget_s(
+    started_at: float,
+    max_duration_s: float,
+) -> float:
+    """Return remaining seconds available for a retry HTTP request after reserving client classification slack and DB finalization."""
+    raw_remaining_s = float(max_duration_s) - (time.monotonic() - started_at)
+    return raw_remaining_s - (
+        RETRY_DB_FINALIZE_RESERVE_S + RETRY_CLIENT_CLASSIFY_SLACK_S
+    )
+
+
+def _extract_retry_target_error_code(
+    target: str,
+    bridge_res: Any,
+    batch_err: str | None,
+    *,
+    use_gateway_transport: bool = False,
+) -> str:
+    """Extract the target-specific error code from ``bridge_res`` when available, falling back to ``batch_err``."""
+    if isinstance(bridge_res, Mapping):
+        results = bridge_res.get("results")
+        if isinstance(results, list):
+            for item in results:
+                if (
+                    isinstance(item, Mapping)
+                    and str(item.get("target") or "").strip() == target
+                ):
+                    err = str(
+                        item.get("error") or item.get("error_code") or ""
+                    ).strip()
+                    if err:
+                        return err
+        if use_gateway_transport:
+            top_err = str(
+                bridge_res.get("error_code") or bridge_res.get("error") or ""
+            ).strip()
+            if top_err:
+                return top_err
+    return batch_err or "target_failed"
+
+
+async def _release_unstarted_retry_claim(
+    execution_id: str,
+    channel: str,
+    target: str,
+    *,
+    claimed_attempt_count: int | None,
+    restored_error_code: str,
+    mark_delivery_fn: Callable[..., Awaitable[Any]] = mark_target_delivery,
+    timeout_s: float = RETRY_DB_FINALIZE_RESERVE_S,
+) -> bool:
+    """Restore an unstarted retry claim to retryable ``failed`` with ``attempt_count - 1`` under a conditional guard."""
+    if claimed_attempt_count is None:
+        return False
+
+    released = False
+
+    async def _do_release() -> None:
+        nonlocal released
+        async with get_db_connection() as conn:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    UPDATE dalton_notify_deliveries
+                    SET status = 'failed',
+                        error_code = %s,
+                        attempt_count = GREATEST(0, attempt_count - 1),
+                        updated_at = NOW()
+                    WHERE execution_id = %s
+                      AND channel = %s
+                      AND target = %s
+                      AND status = 'pending'
+                      AND error_code IS NULL
+                      AND attempt_count = %s
+                    """,
+                    (
+                        restored_error_code,
+                        execution_id,
+                        channel,
+                        target,
+                        int(claimed_attempt_count),
+                    ),
+                )
+                updated_rows = (
+                    cur.rowcount if isinstance(cur.rowcount, int) else 0
+                )
+                released = updated_rows > 0
+        if released and mark_delivery_fn is not mark_target_delivery:
+            await _invoke_mark_delivery(
+                mark_delivery_fn,
+                execution_id,
+                channel,
+                target,
+                status="failed",
+                error_code=restored_error_code,
+                expected_status="pending",
+                expected_attempt_count=claimed_attempt_count,
+            )
+
+    await _run_shielded_mark(_do_release(), timeout_s=timeout_s)
+    return released
+
+
 async def retry_failed_notify_deliveries(
     *,
     post_notify_fn: Callable[..., Awaitable[dict[str, Any]]] = post_bridge_notify,
@@ -2390,7 +2498,23 @@ async def retry_failed_notify_deliveries(
                         )
                     continue
 
+                request_timeout_s = _remaining_retry_request_budget_s(
+                    started_at, max_duration_s
+                )
+                if request_timeout_s < RETRY_MIN_REQUEST_TIMEOUT_S:
+                    break
+
+                use_gateway_transport = (
+                    is_data_task_row and post_notify_fn is post_bridge_notify
+                )
                 async with get_db_connection() as conn:
+                    if (
+                        _remaining_retry_request_budget_s(
+                            started_at, max_duration_s
+                        )
+                        < RETRY_MIN_REQUEST_TIMEOUT_S
+                    ):
+                        break
                     async with conn.cursor(row_factory=dict_row) as cur:
                         claim_sql = """
                             UPDATE dalton_notify_deliveries
@@ -2456,21 +2580,50 @@ async def retry_failed_notify_deliveries(
                 if not row_claimed:
                     continue
 
+                request_timeout_s = _remaining_retry_request_budget_s(
+                    started_at, max_duration_s
+                )
+                if request_timeout_s < RETRY_MIN_REQUEST_TIMEOUT_S:
+                    restored_code = (
+                        row_error_code
+                        if (
+                            row_error_code
+                            and not is_uncertain_notify_error_code(
+                                row_error_code
+                            )
+                        )
+                        else "retry_budget_exhausted"
+                    )
+                    await _release_unstarted_retry_claim(
+                        exec_id,
+                        ch,
+                        tgt,
+                        claimed_attempt_count=claimed_attempt_count,
+                        restored_error_code=restored_code,
+                        mark_delivery_fn=mark_delivery_fn,
+                    )
+                    row_claimed = False
+                    break
+
                 text = str(payload.get("text") or "")
                 card = (
                     payload.get("card")
                     if isinstance(payload.get("card"), dict)
                     else None
                 )
-                remaining_s = max(0.1, max_duration_s - (time.monotonic() - started_at))
-                use_gateway_transport = (
-                    is_data_task_row and post_notify_fn is post_bridge_notify
+                wait_for_timeout_s = (
+                    request_timeout_s + RETRY_CLIENT_CLASSIFY_SLACK_S
                 )
                 if use_gateway_transport:
                     native_send_started = True
+                    gateway_kwargs: dict[str, Any] = {"run_id": exec_id}
+                    if _callable_accepts_kwarg(
+                        data_task_notify_fn, "timeout_s"
+                    ):
+                        gateway_kwargs["timeout_s"] = request_timeout_s
                     bridge_res = await asyncio.wait_for(
-                        data_task_notify_fn([tgt], run_id=exec_id),
-                        timeout=remaining_s,
+                        data_task_notify_fn([tgt], **gateway_kwargs),
+                        timeout=wait_for_timeout_s,
                     )
                 else:
                     bridge_res = await asyncio.wait_for(
@@ -2483,7 +2636,7 @@ async def retry_failed_notify_deliveries(
                             run_id=exec_id,
                             channel=ch,
                         ),
-                        timeout=remaining_s,
+                        timeout=wait_for_timeout_s,
                     )
                 uncertain_code = extract_target_uncertain_code(tgt, bridge_res)
                 if uncertain_code is not None:
@@ -2544,13 +2697,19 @@ async def retry_failed_notify_deliveries(
                 else:
                     native_send_started = False
                     transport_outcome_uncertain_or_sent = False
+                    fail_error_code = _extract_retry_target_error_code(
+                        tgt,
+                        bridge_res,
+                        batch_err,
+                        use_gateway_transport=use_gateway_transport,
+                    )
                     await _invoke_mark_delivery(
                         mark_delivery_fn,
                         exec_id,
                         ch,
                         tgt,
                         status="failed",
-                        error_code=batch_err or "target_failed",
+                        error_code=fail_error_code,
                         expected_status="pending",
                         expected_attempt_count=claimed_attempt_count,
                     )

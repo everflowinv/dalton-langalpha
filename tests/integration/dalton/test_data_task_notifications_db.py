@@ -958,6 +958,7 @@ async def test_concurrent_claim_multi_item_resume_and_uncertain_ledger_protectio
 
 
 
+
 @pytest.mark.asyncio
 async def test_unbound_admin_group_delivery_workspace_gate_and_real_vault_startup_db(
     migrated_dsn: str,
@@ -2622,6 +2623,7 @@ async def test_persisted_image_metadata_finalization_and_tamper_rejection_db(
 
 
 
+
 @pytest.mark.asyncio
 async def test_outer_delivery_identity_freeze_conflict_rejection_and_late_reconciliation_db(
     migrated_dsn: str,
@@ -3202,6 +3204,7 @@ async def test_outer_delivery_identity_freeze_conflict_rejection_and_late_reconc
                 (pm_uid,),
             )
         await admin_conn.close()
+
 
 
 
@@ -4891,6 +4894,7 @@ async def test_recover_completed_items_without_uncertainty_marker_and_after_atte
         await admin_conn.close()
 
 
+
 @pytest.mark.asyncio
 async def test_scheduler_cancel_with_concurrent_retry_attempt_protection_db(
     migrated_dsn: str,
@@ -5345,6 +5349,522 @@ async def test_scheduler_cancel_with_concurrent_retry_attempt_protection_db(
         for t in owned_tasks:
             if not t.done():
                 t.cancel()
+        async with admin_conn.cursor() as cur:
+            await cur.execute(
+                "DELETE FROM dalton_notify_deliveries WHERE execution_id = ANY(%s)",
+                (all_runs,),
+            )
+            await cur.execute(
+                "DELETE FROM dalton_channel_deliveries WHERE run_id = ANY(%s)",
+                (all_runs,),
+            )
+            await cur.execute(
+                "DELETE FROM dalton_channel_identities WHERE user_id = %s",
+                (pm_uid,),
+            )
+            await cur.execute(
+                "DELETE FROM dalton_data_task_runs WHERE run_id = ANY(%s::uuid[])",
+                (all_runs,),
+            )
+            await cur.execute(
+                "DELETE FROM dalton_data_task_defs WHERE job_key = 'softbank-nav-monitor'"
+            )
+            await cur.execute(
+                "DELETE FROM user_preferences WHERE user_id = %s",
+                (pm_uid,),
+            )
+            await cur.execute(
+                "DELETE FROM users WHERE user_id = %s",
+                (pm_uid,),
+            )
+        await admin_conn.close()
+
+
+@pytest.mark.asyncio
+async def test_retry_connect_budget_and_unstarted_claim_release_db(
+    migrated_dsn: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real PostgreSQL verification for Stage C:
+    1. Remaining budget exhausted during eligibility resolution (`29.95s / 30.0s`):
+       row is not claimed, transport is not called, `status='failed'` and `attempt_count` stay unchanged.
+    2. Remaining budget exhausted during DB claim (including on 3rd attempt `attempt_count: 2 -> 3`):
+       transport is not called, row is restored to `status='failed', attempt_count=2` (not left `uncertain` or `attempts_exhausted`),
+       and `_release_unstarted_retry_claim` with `claimed_attempt_count=2` never overwrites a concurrent `attempt_count=3`.
+    3. Real `post_data_task_gateway_notify` + synthetic `ConnectTimeout`:
+       receives remaining `timeout_s` budget, completes `ConnectTimeout` classification without 0.1s preemption,
+       and persists retryable `status='failed', error_code='ConnectTimeout'` with `dalton_channel_deliveries` count 0.
+    4. Real `post_data_task_gateway_notify` + synthetic `ReadTimeout`:
+       persists `status='pending', error_code='delivery_uncertain'` and is not auto-resent on subsequent retry scan.
+    """
+    import time
+
+    dsn = migrated_dsn
+    pm_uid = f"pm-stage-c-{uuid4().hex[:8]}"
+    run_id = str(uuid4())
+    all_runs = [run_id]
+    open_id = "ou_" + uuid4().hex
+    target = f"feishu:user:{open_id}"
+
+    path_map = build_path_map(
+        host_var_dir=tmp_path / "stage_c_h_var",
+        backend_var_dir=tmp_path / "stage_c_b_var",
+    )
+
+    @asynccontextmanager
+    async def _real_db_conn(conn: Any = None):
+        if conn is not None:
+            yield conn
+            return
+        c = await psycopg.AsyncConnection.connect(dsn, autocommit=True)
+        try:
+            yield c
+        finally:
+            await c.close()
+
+    async def _real_get_prefs(user_id: str) -> dict[str, Any] | None:
+        async with await psycopg.AsyncConnection.connect(
+            dsn, autocommit=True
+        ) as c:
+            async with c.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    "SELECT model_preference, other_preference FROM user_preferences WHERE user_id = %s",
+                    (user_id,),
+                )
+                return await cur.fetchone()
+
+    monkeypatch.setenv("CHANNEL_GATEWAY_URL", "http://synthetic.invalid")
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", SERVICE_TOKEN)
+    monkeypatch.setenv("DALTON_PM_USER_IDS", pm_uid)
+    monkeypatch.setattr(
+        dtn_db,
+        "build_path_map",
+        create_autospec(dtn_db.build_path_map, return_value=path_map),
+    )
+    for mod in (dtn_db, cg_db, notify_dispatch_mod):
+        monkeypatch.setattr(
+            mod,
+            "get_db_connection",
+            create_autospec(mod.get_db_connection, side_effect=_real_db_conn),
+        )
+    monkeypatch.setattr(
+        model_prefs_mod,
+        "get_user_preferences",
+        create_autospec(
+            model_prefs_mod.get_user_preferences, side_effect=_real_get_prefs
+        ),
+    )
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(access_tiers_mod.get_user_tier, return_value="admin"),
+    )
+
+    from types import SimpleNamespace
+
+    base_mono = time.monotonic()
+    clock = {"elapsed": 0.0}
+    monkeypatch.setattr(
+        notify_dispatch_mod,
+        "time",
+        SimpleNamespace(monotonic=lambda: base_mono + clock["elapsed"]),
+    )
+
+    admin_conn = await psycopg.AsyncConnection.connect(dsn, autocommit=True)
+    try:
+        manifest = load_data_task_manifest()
+        slot_utc = datetime(2026, 11, 10, 14, 0, tzinfo=timezone.utc)
+        outbox_doc = {"items": [{"index": 0, "text": "Stage C diagnostic item"}]}
+        async with admin_conn.transaction():
+            await sync_manifest_to_db(admin_conn, manifest)
+            async with admin_conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE dalton_data_task_defs
+                    SET enabled = TRUE, notify_enabled = TRUE
+                    WHERE job_key = 'softbank-nav-monitor'
+                    """
+                )
+                await cur.execute(
+                    """
+                    INSERT INTO users (user_id, email, name, created_at, updated_at)
+                    VALUES (%s, %s, %s, NOW(), NOW())
+                    ON CONFLICT (user_id) DO NOTHING
+                    """,
+                    (pm_uid, f"{pm_uid}@synth.local", pm_uid),
+                )
+                await cur.execute(
+                    """
+                    INSERT INTO user_preferences (user_id, model_preference, other_preference, created_at, updated_at)
+                    VALUES (%s, %s::jsonb, '{}'::jsonb, NOW(), NOW())
+                    """,
+                    (
+                        pm_uid,
+                        json.dumps(
+                            {
+                                "dalton_notify_enabled": True,
+                                "dalton_notify_targets": [target],
+                                "dalton_notify_routes": {
+                                    "data:softbank-nav-monitor": [target]
+                                },
+                            }
+                        ),
+                    ),
+                )
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_channel_identities (user_id, platform, platform_user_id)
+                    VALUES (%s, 'feishu', %s)
+                    """,
+                    (pm_uid, open_id),
+                )
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_data_task_runs (
+                        run_id, job_key, trigger_source, scheduled_slot_utc,
+                        deadline_utc, status, notify_status, outbox_payload
+                    )
+                    VALUES (%s::uuid, 'softbank-nav-monitor', 'cron', %s, %s, 'succeeded', 'pending_dispatch', %s::jsonb)
+                    """,
+                    (
+                        run_id,
+                        slot_utc,
+                        slot_utc + timedelta(minutes=10),
+                        json.dumps(outbox_doc),
+                    ),
+                )
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_notify_deliveries (
+                        delivery_id, execution_id, automation_id, user_id, channel, target,
+                        status, error_code, attempt_count, payload_json, created_at, updated_at
+                    )
+                    VALUES (%s::uuid, %s, 'data:softbank-nav-monitor', %s, 'feishu', %s, 'failed', 'ConnectError', 1, %s::jsonb, NOW(), NOW())
+                    """,
+                    (
+                        str(uuid4()),
+                        run_id,
+                        pm_uid,
+                        target,
+                        json.dumps(
+                            {
+                                "route_key": "data:softbank-nav-monitor",
+                                "job_key": "softbank-nav-monitor",
+                                "run_id": run_id,
+                                "expected_item_count": 1,
+                            }
+                        ),
+                    ),
+                )
+
+        async def _read_outer() -> dict[str, Any]:
+            async with admin_conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    """
+                    SELECT status, error_code, attempt_count
+                    FROM dalton_notify_deliveries
+                    WHERE execution_id = %s AND channel = 'feishu' AND target = %s
+                    """,
+                    (run_id, target),
+                )
+                row = await cur.fetchone()
+                await cur.execute(
+                    "SELECT COUNT(*) AS cnt FROM dalton_channel_deliveries WHERE run_id = %s",
+                    (run_id,),
+                )
+                cnt = (await cur.fetchone())["cnt"]
+                return {"outer": dict(row) if row else None, "item_count": cnt}
+
+        # ---------------------------------------------------------------------
+        # 1. Remaining budget exhausted during eligibility (`29.95s / 30.0s`):
+        #    No claim, no transport call, `attempt_count=1` and `status='failed'` preserved.
+        # ---------------------------------------------------------------------
+        clock["elapsed"] = 0.0
+        connect_record: dict[str, Any] = {
+            "started": False,
+            "cancelled": False,
+            "timeout": None,
+        }
+
+        class _SlowConnectTransport(httpx.AsyncBaseTransport):
+            async def handle_async_request(
+                self, request: httpx.Request
+            ) -> httpx.Response:
+                connect_record["started"] = True
+                connect_record["timeout"] = dict(
+                    request.extensions.get("timeout") or {}
+                )
+                try:
+                    await asyncio.sleep(0.25)
+                except asyncio.CancelledError:
+                    connect_record["cancelled"] = True
+                    raise
+                raise httpx.ConnectTimeout("connect timed out", request=request)
+
+        orig_build_ephemeral_client = ct_mod._build_ephemeral_client
+
+        monkeypatch.setattr(
+            ct_mod,
+            "_build_ephemeral_client",
+            create_autospec(
+                orig_build_ephemeral_client,
+                side_effect=lambda: httpx.AsyncClient(
+                    transport=_SlowConnectTransport()
+                ),
+            ),
+        )
+
+        async def _routes_exhausting_budget(_uid: str | None) -> dict[str, list[str]]:
+            clock["elapsed"] = 29.95
+            return {"data:softbank-nav-monitor": [target]}
+
+        sent_1 = await notify_dispatch_mod.retry_failed_notify_deliveries(
+            data_task_notify_fn=ct_mod.post_data_task_gateway_notify,
+            resolve_enabled_fn=create_autospec(
+                notify_dispatch_mod.resolve_dalton_notify_enabled,
+                return_value=True,
+            ),
+            resolve_overrides_fn=create_autospec(
+                notify_dispatch_mod.resolve_dalton_notify_overrides,
+                return_value={},
+            ),
+            resolve_targets_fn=create_autospec(
+                notify_dispatch_mod.resolve_dalton_notify_targets,
+                return_value=[target],
+            ),
+            resolve_routes_fn=create_autospec(
+                notify_dispatch_mod.resolve_dalton_notify_routes,
+                side_effect=_routes_exhausting_budget,
+            ),
+            is_admin_fn=create_autospec(
+                notify_dispatch_mod.resolve_dalton_notify_enabled,
+                return_value=True,
+            ),
+            max_duration_s=30.0,
+        )
+        assert sent_1 == 0
+        assert connect_record["started"] is False
+        assert connect_record["cancelled"] is False
+        assert await _read_outer() == {
+            "outer": {
+                "status": "failed",
+                "error_code": "ConnectError",
+                "attempt_count": 1,
+            },
+            "item_count": 0,
+        }
+
+        # ---------------------------------------------------------------------
+        # 2. Post-claim release on attempt 3 (`attempt_count = 2 -> 3`) and concurrent attempt protection:
+        # ---------------------------------------------------------------------
+        async with admin_conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE dalton_notify_deliveries
+                SET status = 'pending', error_code = NULL, attempt_count = 3, updated_at = NOW()
+                WHERE execution_id = %s AND channel = 'feishu' AND target = %s
+                """,
+                (run_id, target),
+            )
+        released_att3 = await notify_dispatch_mod._release_unstarted_retry_claim(
+            run_id,
+            "feishu",
+            target,
+            claimed_attempt_count=3,
+            restored_error_code="ConnectError",
+        )
+        assert released_att3 is True
+        assert await _read_outer() == {
+            "outer": {
+                "status": "failed",
+                "error_code": "ConnectError",
+                "attempt_count": 2,
+            },
+            "item_count": 0,
+        }
+
+        # Simulate concurrent worker advancing row to `status='pending', attempt_count=3`:
+        # releasing stale `claimed_attempt_count=2` must NOT overwrite `attempt_count=3`!
+        async with admin_conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE dalton_notify_deliveries
+                SET status = 'pending', error_code = NULL, attempt_count = 3, updated_at = NOW()
+                WHERE execution_id = %s AND channel = 'feishu' AND target = %s
+                """,
+                (run_id, target),
+            )
+        released_stale = await notify_dispatch_mod._release_unstarted_retry_claim(
+            run_id,
+            "feishu",
+            target,
+            claimed_attempt_count=2,
+            restored_error_code="ConnectError",
+        )
+        assert released_stale is False
+        assert await _read_outer() == {
+            "outer": {
+                "status": "pending",
+                "error_code": None,
+                "attempt_count": 3,
+            },
+            "item_count": 0,
+        }
+
+        # Reset row to `status='failed', attempt_count=1` for ConnectTimeout & ReadTimeout checks
+        async with admin_conn.cursor() as cur:
+            await cur.execute(
+                """
+                UPDATE dalton_notify_deliveries
+                SET status = 'failed', error_code = 'ConnectError', attempt_count = 1, updated_at = NOW()
+                WHERE execution_id = %s AND channel = 'feishu' AND target = %s
+                """,
+                (run_id, target),
+            )
+
+        # ---------------------------------------------------------------------
+        # 3. Real `post_data_task_gateway_notify` + synthetic `ConnectTimeout`:
+        #    When 24.0s elapsed out of 30.0s, `request_timeout_s = 2.5s` is passed to client,
+        #    `ConnectTimeout` is classified without cancellation, and outer row stays `failed/ConnectTimeout`.
+        # ---------------------------------------------------------------------
+        clock["elapsed"] = 0.0
+
+        async def _routes_leaving_2_5s(_uid: str | None) -> dict[str, list[str]]:
+            clock["elapsed"] = 24.0
+            return {"data:softbank-nav-monitor": [target]}
+
+        sent_3 = await notify_dispatch_mod.retry_failed_notify_deliveries(
+            data_task_notify_fn=ct_mod.post_data_task_gateway_notify,
+            resolve_enabled_fn=create_autospec(
+                notify_dispatch_mod.resolve_dalton_notify_enabled,
+                return_value=True,
+            ),
+            resolve_overrides_fn=create_autospec(
+                notify_dispatch_mod.resolve_dalton_notify_overrides,
+                return_value={},
+            ),
+            resolve_targets_fn=create_autospec(
+                notify_dispatch_mod.resolve_dalton_notify_targets,
+                return_value=[target],
+            ),
+            resolve_routes_fn=create_autospec(
+                notify_dispatch_mod.resolve_dalton_notify_routes,
+                side_effect=_routes_leaving_2_5s,
+            ),
+            is_admin_fn=create_autospec(
+                notify_dispatch_mod.resolve_dalton_notify_enabled,
+                return_value=True,
+            ),
+            max_duration_s=30.0,
+        )
+        assert sent_3 == 0
+        assert connect_record["started"] is True
+        assert connect_record["cancelled"] is False
+        assert connect_record["timeout"] == {
+            "connect": pytest.approx(2.5),
+            "read": pytest.approx(2.5),
+            "write": pytest.approx(2.5),
+            "pool": pytest.approx(2.5),
+        }
+        assert await _read_outer() == {
+            "outer": {
+                "status": "failed",
+                "error_code": "ConnectTimeout",
+                "attempt_count": 2,
+            },
+            "item_count": 0,
+        }
+
+        # ---------------------------------------------------------------------
+        # 4. Real `post_data_task_gateway_notify` + synthetic `ReadTimeout`:
+        #    Persists `status='pending', error_code='delivery_uncertain', attempt_count=3`
+        #    and is excluded from subsequent retry send attempts.
+        # ---------------------------------------------------------------------
+        clock["elapsed"] = 0.0
+        read_timeout_calls = {"count": 0}
+
+        class _ReadTimeoutTransport(httpx.AsyncBaseTransport):
+            async def handle_async_request(
+                self, request: httpx.Request
+            ) -> httpx.Response:
+                read_timeout_calls["count"] += 1
+                raise httpx.ReadTimeout("read timed out", request=request)
+
+        monkeypatch.setattr(
+            ct_mod,
+            "_build_ephemeral_client",
+            create_autospec(
+                orig_build_ephemeral_client,
+                side_effect=lambda: httpx.AsyncClient(
+                    transport=_ReadTimeoutTransport()
+                ),
+            ),
+        )
+
+        sent_4 = await notify_dispatch_mod.retry_failed_notify_deliveries(
+            data_task_notify_fn=ct_mod.post_data_task_gateway_notify,
+            resolve_enabled_fn=create_autospec(
+                notify_dispatch_mod.resolve_dalton_notify_enabled,
+                return_value=True,
+            ),
+            resolve_overrides_fn=create_autospec(
+                notify_dispatch_mod.resolve_dalton_notify_overrides,
+                return_value={},
+            ),
+            resolve_targets_fn=create_autospec(
+                notify_dispatch_mod.resolve_dalton_notify_targets,
+                return_value=[target],
+            ),
+            resolve_routes_fn=create_autospec(
+                notify_dispatch_mod.resolve_dalton_notify_routes,
+                return_value={"data:softbank-nav-monitor": [target]},
+            ),
+            is_admin_fn=create_autospec(
+                notify_dispatch_mod.resolve_dalton_notify_enabled,
+                return_value=True,
+            ),
+            max_duration_s=30.0,
+        )
+        assert sent_4 == 0
+        assert read_timeout_calls["count"] == 1
+        assert await _read_outer() == {
+            "outer": {
+                "status": "pending",
+                "error_code": "delivery_uncertain",
+                "attempt_count": 3,
+            },
+            "item_count": 0,
+        }
+
+        # Next retry scan must not auto-resend uncertain row
+        sent_4_again = await notify_dispatch_mod.retry_failed_notify_deliveries(
+            data_task_notify_fn=ct_mod.post_data_task_gateway_notify,
+            resolve_enabled_fn=create_autospec(
+                notify_dispatch_mod.resolve_dalton_notify_enabled,
+                return_value=True,
+            ),
+            resolve_overrides_fn=create_autospec(
+                notify_dispatch_mod.resolve_dalton_notify_overrides,
+                return_value={},
+            ),
+            resolve_targets_fn=create_autospec(
+                notify_dispatch_mod.resolve_dalton_notify_targets,
+                return_value=[target],
+            ),
+            resolve_routes_fn=create_autospec(
+                notify_dispatch_mod.resolve_dalton_notify_routes,
+                return_value={"data:softbank-nav-monitor": [target]},
+            ),
+            is_admin_fn=create_autospec(
+                notify_dispatch_mod.resolve_dalton_notify_enabled,
+                return_value=True,
+            ),
+            max_duration_s=30.0,
+        )
+        assert sent_4_again == 0
+        assert read_timeout_calls["count"] == 1
+    finally:
         async with admin_conn.cursor() as cur:
             await cur.execute(
                 "DELETE FROM dalton_notify_deliveries WHERE execution_id = ANY(%s)",

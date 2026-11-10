@@ -4400,3 +4400,534 @@ async def test_claim_target_delivery_with_attempt_and_scheduler_expected_attempt
         "error_code": None,
     }
 
+
+@pytest.mark.asyncio
+async def test_retry_remaining_budget_and_native_request_timeout_classification(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Verify Stage C retry remaining-budget guards, native `timeout_s` propagation, and `preflight.decide` headroom:
+    1. Eligibility resolution consumes remaining budget: row is not claimed, transport is not called, `attempt_count` unchanged.
+    2. DB claim consumes remaining budget: transport is not called (`native_send_started` stays False), row is restored to
+       retryable `failed` with `attempt_count - 1` (never left `uncertain` or `attempts_exhausted`, including on attempt 3),
+       and conditional recovery never overwrites a newer `attempt_count = 3`.
+    3. Real `post_data_task_gateway_notify` + synthetic `ConnectTimeout`: receives `timeout_s` budget, completes `ConnectTimeout`
+       classification without outer 0.1s preemption, and persists retryable `failed` (`error_code='ConnectTimeout'`).
+    4. Real `post_data_task_gateway_notify` + synthetic `ReadTimeout` or explicit `unknown`: persists `pending/delivery_uncertain`
+       and is excluded from auto-resend.
+    5. `preflight.decide` passes `max_duration_s=26.0` inside `timeout=30.0`, leaving 4.0s headroom for DB finalization.
+    """
+    from contextlib import asynccontextmanager
+    from datetime import datetime, timezone
+
+    from src.dalton.autonomy import preflight as preflight_mod
+    from src.dalton.llm.model_prefs import (
+        resolve_dalton_notify_enabled,
+        resolve_dalton_notify_overrides,
+        resolve_dalton_notify_routes,
+        resolve_dalton_notify_targets,
+    )
+
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", SERVICE_TOKEN)
+    monkeypatch.setattr(
+        dtn_db,
+        "reconcile_uncertain_data_task_deliveries",
+        create_autospec(
+            dtn_db.reconcile_uncertain_data_task_deliveries, return_value=0
+        ),
+    )
+    monkeypatch.setattr(
+        dtn_db,
+        "reconcile_single_data_task_delivery_row",
+        create_autospec(
+            dtn_db.reconcile_single_data_task_delivery_row, return_value=False
+        ),
+    )
+
+    from types import SimpleNamespace
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(
+        notify_dispatch_mod,
+        "time",
+        SimpleNamespace(monotonic=lambda: clock["t"]),
+    )
+
+    observed_ts = datetime(2026, 4, 15, 13, 0, tzinfo=timezone.utc)
+    target = "feishu:@me"
+    run_id = str(uuid4())
+
+    db_row: dict[str, Any] = {
+        "execution_id": run_id,
+        "automation_id": "data:softbank-nav-monitor",
+        "user_id": "pm-budget-1",
+        "channel": "feishu",
+        "target": target,
+        "status": "failed",
+        "attempt_count": 1,
+        "error_code": "ConnectError",
+        "updated_at": observed_ts,
+        "payload_json": {
+            "route_key": "data:softbank-nav-monitor",
+            "text": "SoftBank NAV",
+        },
+        "automation_name": None,
+        "automation_metadata": None,
+        "data_task_enabled": True,
+        "data_task_notify_enabled": True,
+    }
+    executed_sql: list[tuple[str, Any]] = []
+    advance_clock_on_claim_to: float | None = None
+    concurrent_attempt_on_release: int | None = None
+
+    class _BudgetCursor:
+        def __init__(self) -> None:
+            self.rowcount = 0
+            self._claimed_row: dict[str, Any] | None = None
+            self._select_rows: list[dict[str, Any]] = []
+
+        async def __aenter__(self) -> _BudgetCursor:
+            return self
+
+        async def __aexit__(self, *_a: Any) -> None:
+            return None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            norm = " ".join(sql.split())
+            executed_sql.append((norm, params))
+            self._claimed_row = None
+            self._select_rows = []
+            self.rowcount = 0
+            if "SELECT d.execution_id" in norm:
+                is_uncertain = (
+                    db_row["status"] == "pending"
+                    and db_row["error_code"] == "delivery_uncertain"
+                )
+                if not is_uncertain and (
+                    (db_row["status"] == "failed" and db_row["attempt_count"] < 3)
+                    or db_row["status"] == "pending"
+                ):
+                    self._select_rows = [dict(db_row)]
+            elif "RETURNING attempt_count, payload_json" in norm:
+                db_row["status"] = "pending"
+                db_row["error_code"] = None
+                db_row["attempt_count"] = int(db_row["attempt_count"]) + 1
+                self.rowcount = 1
+                self._claimed_row = {
+                    "attempt_count": db_row["attempt_count"],
+                    "payload_json": dict(db_row["payload_json"]),
+                }
+                if advance_clock_on_claim_to is not None:
+                    clock["t"] = advance_clock_on_claim_to
+            elif "attempt_count = GREATEST(0, attempt_count - 1)" in norm:
+                if concurrent_attempt_on_release is not None:
+                    db_row["attempt_count"] = concurrent_attempt_on_release
+                expected_att = int(params[4])
+                if (
+                    db_row["status"] == "pending"
+                    and db_row["error_code"] is None
+                    and int(db_row["attempt_count"]) == expected_att
+                ):
+                    db_row["status"] = "failed"
+                    db_row["error_code"] = params[0]
+                    db_row["attempt_count"] = max(
+                        0, int(db_row["attempt_count"]) - 1
+                    )
+                    self.rowcount = 1
+            elif "UPDATE dalton_notify_deliveries SET status = %s" in norm:
+                new_status = params[0]
+                new_code = params[1]
+                expected_att = int(params[-1])
+                if (
+                    db_row["status"] == "pending"
+                    and int(db_row["attempt_count"]) == expected_att
+                ):
+                    db_row["status"] = new_status
+                    db_row["error_code"] = new_code
+                    self.rowcount = 1
+
+        async def fetchall(self) -> list[dict[str, Any]]:
+            return list(self._select_rows)
+
+        async def fetchone(self) -> dict[str, Any] | None:
+            return self._claimed_row
+
+    class _BudgetConn:
+        def cursor(self, **_kw: Any) -> _BudgetCursor:
+            return _BudgetCursor()
+
+    @asynccontextmanager
+    async def _budget_conn_cm(_c: Any = None):
+        yield _BudgetConn()
+
+    monkeypatch.setattr(
+        notify_dispatch_mod,
+        "get_db_connection",
+        create_autospec(
+            notify_dispatch_mod.get_db_connection, side_effect=_budget_conn_cm
+        ),
+    )
+
+    async def _is_admin(_uid: str | None) -> bool:
+        return True
+
+    # -------------------------------------------------------------------------
+    # 1. Eligibility resolution consumes remaining budget (e.g. 29.95s of 30.0s):
+    #    No DB claim, no transport call, `attempt_count` stays 1 and `status` stays 'failed'.
+    # -------------------------------------------------------------------------
+    clock["t"] = 1000.0
+    executed_sql.clear()
+
+    async def _slow_routes(_uid: str | None) -> dict[str, list[str]]:
+        clock["t"] = 1029.95
+        return {"data:softbank-nav-monitor": [target]}
+
+    transport_spy = create_autospec(ct_mod.post_data_task_gateway_notify)
+    sent_1 = await notify_dispatch_mod.retry_failed_notify_deliveries(
+        data_task_notify_fn=transport_spy,
+        resolve_enabled_fn=create_autospec(
+            resolve_dalton_notify_enabled, return_value=True
+        ),
+        resolve_overrides_fn=create_autospec(
+            resolve_dalton_notify_overrides, return_value={}
+        ),
+        resolve_targets_fn=create_autospec(
+            resolve_dalton_notify_targets, return_value=[target]
+        ),
+        resolve_routes_fn=create_autospec(
+            resolve_dalton_notify_routes, side_effect=_slow_routes
+        ),
+        is_admin_fn=create_autospec(_is_admin, return_value=True),
+        max_duration_s=30.0,
+    )
+    assert sent_1 == 0
+    transport_spy.assert_not_awaited()
+    assert not any(
+        "RETURNING attempt_count" in q for q, _ in executed_sql
+    )
+    assert db_row["status"] == "failed"
+    assert db_row["error_code"] == "ConnectError"
+    assert db_row["attempt_count"] == 1
+
+    # -------------------------------------------------------------------------
+    # 2. DB claim consumes remaining budget (including on 3rd attempt `attempt_count: 2 -> 3`):
+    #    Transport is NOT called, row is restored to `failed` with `attempt_count = 2` (never left
+    #    `uncertain` or `attempts_exhausted`), and conditional recovery never overwrites a newer `attempt_count = 3`.
+    # -------------------------------------------------------------------------
+    clock["t"] = 2000.0
+    db_row.update(
+        {
+            "status": "failed",
+            "attempt_count": 2,
+            "error_code": "ConnectError",
+        }
+    )
+    advance_clock_on_claim_to = 2029.95
+    executed_sql.clear()
+
+    sent_2 = await notify_dispatch_mod.retry_failed_notify_deliveries(
+        data_task_notify_fn=transport_spy,
+        resolve_enabled_fn=create_autospec(
+            resolve_dalton_notify_enabled, return_value=True
+        ),
+        resolve_overrides_fn=create_autospec(
+            resolve_dalton_notify_overrides, return_value={}
+        ),
+        resolve_targets_fn=create_autospec(
+            resolve_dalton_notify_targets, return_value=[target]
+        ),
+        resolve_routes_fn=create_autospec(
+            resolve_dalton_notify_routes,
+            return_value={"data:softbank-nav-monitor": [target]},
+        ),
+        is_admin_fn=create_autospec(_is_admin, return_value=True),
+        max_duration_s=30.0,
+    )
+    assert sent_2 == 0
+    transport_spy.assert_not_awaited()
+    assert db_row["status"] == "failed"
+    assert db_row["error_code"] == "ConnectError"
+    assert db_row["attempt_count"] == 2
+
+    # Sub-case 2b: Concurrent worker already advanced row to `attempt_count = 3` while this worker's
+    # claim was `claimed_attempt_count = 2` -> conditional recovery (`AND attempt_count = 2`) leaves `attempt_count = 3` intact!
+    clock["t"] = 3000.0
+    db_row.update(
+        {
+            "status": "failed",
+            "attempt_count": 1,
+            "error_code": "ConnectError",
+        }
+    )
+    advance_clock_on_claim_to = 3029.95
+    concurrent_attempt_on_release = 3
+    executed_sql.clear()
+
+    sent_2b = await notify_dispatch_mod.retry_failed_notify_deliveries(
+        data_task_notify_fn=transport_spy,
+        resolve_enabled_fn=create_autospec(
+            resolve_dalton_notify_enabled, return_value=True
+        ),
+        resolve_overrides_fn=create_autospec(
+            resolve_dalton_notify_overrides, return_value={}
+        ),
+        resolve_targets_fn=create_autospec(
+            resolve_dalton_notify_targets, return_value=[target]
+        ),
+        resolve_routes_fn=create_autospec(
+            resolve_dalton_notify_routes,
+            return_value={"data:softbank-nav-monitor": [target]},
+        ),
+        is_admin_fn=create_autospec(_is_admin, return_value=True),
+        max_duration_s=30.0,
+    )
+    assert sent_2b == 0
+    transport_spy.assert_not_awaited()
+    assert db_row["status"] == "pending"
+    assert db_row["error_code"] is None
+    assert db_row["attempt_count"] == 3
+    advance_clock_on_claim_to = None
+    concurrent_attempt_on_release = None
+
+    # -------------------------------------------------------------------------
+    # 3. Real `post_data_task_gateway_notify` + synthetic `ConnectTimeout`:
+    #    Client receives `timeout_s` budget (e.g. 2.5s when 24.0s elapsed out of 30.0s),
+    #    completes `ConnectTimeout` classification without being cancelled at 0.1s,
+    #    and outer row is persisted as retryable `failed` (`error_code='ConnectTimeout'`).
+    # -------------------------------------------------------------------------
+    clock["t"] = 4000.0
+    db_row.update(
+        {
+            "status": "failed",
+            "attempt_count": 1,
+            "error_code": "ConnectError",
+        }
+    )
+    connect_record: dict[str, Any] = {
+        "started": False,
+        "cancelled": False,
+        "timeout": None,
+    }
+
+    class _ConnectTimeoutTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(
+            self, request: httpx.Request
+        ) -> httpx.Response:
+            connect_record["started"] = True
+            connect_record["timeout"] = dict(request.extensions.get("timeout") or {})
+            try:
+                await asyncio.sleep(0.05)
+            except asyncio.CancelledError:
+                connect_record["cancelled"] = True
+                raise
+            raise httpx.ConnectTimeout("connect timed out", request=request)
+
+    orig_build_ephemeral_client = ct_mod._build_ephemeral_client
+
+    def _make_connect_timeout_client() -> httpx.AsyncClient:
+        return httpx.AsyncClient(transport=_ConnectTimeoutTransport())
+
+    monkeypatch.setattr(
+        ct_mod,
+        "_build_ephemeral_client",
+        create_autospec(
+            orig_build_ephemeral_client,
+            side_effect=_make_connect_timeout_client,
+        ),
+    )
+
+    async def _routes_leaving_2_5s(_uid: str | None) -> dict[str, list[str]]:
+        # 30.0 - 24.0 - 3.5 = 2.5s request_timeout_s
+        clock["t"] = 4024.0
+        return {"data:softbank-nav-monitor": [target]}
+
+    sent_3 = await notify_dispatch_mod.retry_failed_notify_deliveries(
+        data_task_notify_fn=ct_mod.post_data_task_gateway_notify,
+        resolve_enabled_fn=create_autospec(
+            resolve_dalton_notify_enabled, return_value=True
+        ),
+        resolve_overrides_fn=create_autospec(
+            resolve_dalton_notify_overrides, return_value={}
+        ),
+        resolve_targets_fn=create_autospec(
+            resolve_dalton_notify_targets, return_value=[target]
+        ),
+        resolve_routes_fn=create_autospec(
+            resolve_dalton_notify_routes, side_effect=_routes_leaving_2_5s
+        ),
+        is_admin_fn=create_autospec(_is_admin, return_value=True),
+        max_duration_s=30.0,
+    )
+    assert sent_3 == 0
+    assert connect_record["started"] is True
+    assert connect_record["cancelled"] is False
+    assert connect_record["timeout"] == {
+        "connect": pytest.approx(2.5),
+        "read": pytest.approx(2.5),
+        "write": pytest.approx(2.5),
+        "pool": pytest.approx(2.5),
+    }
+    assert db_row["status"] == "failed"
+    assert db_row["error_code"] == "ConnectTimeout"
+    assert db_row["attempt_count"] == 2
+
+    # -------------------------------------------------------------------------
+    # 4. Real `post_data_task_gateway_notify` + synthetic `ReadTimeout` and explicit `unknown`:
+    #    Persists `status='pending', error_code='delivery_uncertain'` and is NOT auto-resent on subsequent scan.
+    # -------------------------------------------------------------------------
+    clock["t"] = 5000.0
+    read_timeout_calls = {"count": 0}
+
+    class _ReadTimeoutTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(
+            self, request: httpx.Request
+        ) -> httpx.Response:
+            read_timeout_calls["count"] += 1
+            raise httpx.ReadTimeout("read timed out", request=request)
+
+    monkeypatch.setattr(
+        ct_mod,
+        "_build_ephemeral_client",
+        create_autospec(
+            orig_build_ephemeral_client,
+            side_effect=lambda: httpx.AsyncClient(
+                transport=_ReadTimeoutTransport()
+            ),
+        ),
+    )
+
+    sent_4a = await notify_dispatch_mod.retry_failed_notify_deliveries(
+        data_task_notify_fn=ct_mod.post_data_task_gateway_notify,
+        resolve_enabled_fn=create_autospec(
+            resolve_dalton_notify_enabled, return_value=True
+        ),
+        resolve_overrides_fn=create_autospec(
+            resolve_dalton_notify_overrides, return_value={}
+        ),
+        resolve_targets_fn=create_autospec(
+            resolve_dalton_notify_targets, return_value=[target]
+        ),
+        resolve_routes_fn=create_autospec(
+            resolve_dalton_notify_routes,
+            return_value={"data:softbank-nav-monitor": [target]},
+        ),
+        is_admin_fn=create_autospec(_is_admin, return_value=True),
+        max_duration_s=30.0,
+    )
+    assert sent_4a == 0
+    assert read_timeout_calls["count"] == 1
+    assert db_row["status"] == "pending"
+    assert db_row["error_code"] == "delivery_uncertain"
+    assert db_row["attempt_count"] == 3
+
+    # Subsequent retry scan does NOT auto-resend uncertain row
+    sent_4b = await notify_dispatch_mod.retry_failed_notify_deliveries(
+        data_task_notify_fn=ct_mod.post_data_task_gateway_notify,
+        resolve_enabled_fn=create_autospec(
+            resolve_dalton_notify_enabled, return_value=True
+        ),
+        resolve_overrides_fn=create_autospec(
+            resolve_dalton_notify_overrides, return_value={}
+        ),
+        resolve_targets_fn=create_autospec(
+            resolve_dalton_notify_targets, return_value=[target]
+        ),
+        resolve_routes_fn=create_autospec(
+            resolve_dalton_notify_routes,
+            return_value={"data:softbank-nav-monitor": [target]},
+        ),
+        is_admin_fn=create_autospec(_is_admin, return_value=True),
+        max_duration_s=30.0,
+    )
+    assert sent_4b == 0
+    assert read_timeout_calls["count"] == 1
+
+    # Explicit gateway `unknown` response also persists `pending/delivery_uncertain`
+    db_row.update(
+        {
+            "status": "failed",
+            "attempt_count": 1,
+            "error_code": "ConnectTimeout",
+        }
+    )
+
+    class _UnknownResponseTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(
+            self, request: httpx.Request
+        ) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={"ok": False, "status": "unknown", "code": "delivery_uncertain"},
+                request=request,
+            )
+
+    monkeypatch.setattr(
+        ct_mod,
+        "_build_ephemeral_client",
+        create_autospec(
+            orig_build_ephemeral_client,
+            side_effect=lambda: httpx.AsyncClient(
+                transport=_UnknownResponseTransport()
+            ),
+        ),
+    )
+    sent_4c = await notify_dispatch_mod.retry_failed_notify_deliveries(
+        data_task_notify_fn=ct_mod.post_data_task_gateway_notify,
+        resolve_enabled_fn=create_autospec(
+            resolve_dalton_notify_enabled, return_value=True
+        ),
+        resolve_overrides_fn=create_autospec(
+            resolve_dalton_notify_overrides, return_value={}
+        ),
+        resolve_targets_fn=create_autospec(
+            resolve_dalton_notify_targets, return_value=[target]
+        ),
+        resolve_routes_fn=create_autospec(
+            resolve_dalton_notify_routes,
+            return_value={"data:softbank-nav-monitor": [target]},
+        ),
+        is_admin_fn=create_autospec(_is_admin, return_value=True),
+        max_duration_s=30.0,
+    )
+    assert sent_4c == 0
+    assert db_row["status"] == "pending"
+    assert db_row["error_code"] == "delivery_uncertain"
+    assert db_row["attempt_count"] == 2
+
+    # -------------------------------------------------------------------------
+    # 5. `preflight.decide` reserves explicit headroom (`max_duration_s=26.0` inside `timeout=30.0`)
+    # -------------------------------------------------------------------------
+    assert preflight_mod.PREFLIGHT_RETRY_NOTIFY_TIMEOUT_S == 30.0
+    assert preflight_mod.PREFLIGHT_RETRY_NOTIFY_MAX_DURATION_S == 26.0
+    assert (
+        preflight_mod.PREFLIGHT_RETRY_NOTIFY_TIMEOUT_S
+        - preflight_mod.PREFLIGHT_RETRY_NOTIFY_MAX_DURATION_S
+        >= notify_dispatch_mod.RETRY_DB_FINALIZE_RESERVE_S
+    )
+
+    observed_retry_kwargs: list[dict[str, Any]] = []
+
+    async def _spy_retry(**kwargs: Any) -> int:
+        observed_retry_kwargs.append(dict(kwargs))
+        return 0
+
+    monkeypatch.setattr(
+        notify_dispatch_mod,
+        "retry_failed_notify_deliveries",
+        create_autospec(
+            notify_dispatch_mod.retry_failed_notify_deliveries,
+            side_effect=_spy_retry,
+        ),
+    )
+    res_preflight = await preflight_mod.decide(
+        {"name": "dalton-googl-watch", "user_id": ""},
+        execution_id="exec-preflight-budget",
+    )
+    assert res_preflight is not None
+    assert res_preflight.reason == "missing_user_id"
+    assert observed_retry_kwargs == [
+        {
+            "limit": 5,
+            "max_duration_s": 26.0,
+        }
+    ]
+
