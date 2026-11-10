@@ -42,7 +42,7 @@ def test_native_overlay_does_not_collide_with_upstream():
     assert native is not None
 
     native_models = native.get("models") or {}
-    assert len(native_models) == 27
+    assert len(native_models) == 30
     overlap = set(native_models) & set(upstream_models)
     # The Grok subscription keys are Dalton's pinned routes: upstream grew
     # same-named entries on its own grok-oauth (api.x.ai) line, and the
@@ -1563,3 +1563,186 @@ async def test_muse_ember_client_wire_payload_contributor_zero_and_tool_calling(
         assert body_2["tools"][0]["name"] == "add_numbers"
         assert resp_tool.tool_calls and resp_tool.tool_calls[0]["name"] == "add_numbers"
         assert resp_tool.tool_calls[0]["args"] == {"a": 2, "b": 3}
+
+
+_CARBON_SOURCE = (
+    "https://blog.google/innovation-and-ai/models-and-research/"
+    "gemini-models/introducing-gemini-4-carbon/"
+)
+_CARBON_BY_EFFORT = {
+    "low": "Gemini 4 Carbon (Low)",
+    "medium": "Gemini 4 Carbon (Medium)",
+    "high": "Gemini 4 Carbon (High)",
+}
+# 2M prompt with 1M cached, plus 1M output: fresh input $2, cache $0.10, output $10.
+_CARBON_USAGE = {
+    "input_tokens": 2_000_000,
+    "output_tokens": 1_000_000,
+    "cached_tokens": 1_000_000,
+}
+_CARBON_NOTIONAL_USD = 12.1
+
+
+def test_gemini_4_carbon_client_request_and_introductory_notional_price(monkeypatch):
+    """Carbon is three Antigravity identities. The factory writes each effort
+    onto thinkingLevel, and nominal cost is the current introductory card."""
+    from src.dalton.llm.notional_pricing import resolve_notional_card
+    from src.dalton.llm.role_policy import family_of, is_text_only
+    from src.utils.tracking.core import calculate_cost_from_per_call_records
+
+    monkeypatch.setattr(LLM, "_model_config", None)
+    mc = LLM.get_model_config()
+    meta = load_dalton_meta()
+    listed = dict(mc.listed_models())
+    catalog = mc.get_model_metadata()
+
+    argon = LLM("gemini-4-argon-high-oauth", api_key="fake-ag-token")
+    argon_client = argon.get_llm()
+    assert isinstance(argon_client, ChatAntigravity)
+    assert argon_client.model == "gemini-4-argon-high"
+    assert argon_client.max_output_tokens == 65536
+    assert argon_client.thinking_level == "high"
+    assert meta["gemini-4-argon-high-oauth"]["notional_ref"] == "gemini-4-argon"
+    assert "notional_pricing" not in meta["gemini-4-argon-high-oauth"]
+    argon_cash = find_model_pricing("gemini-4-argon", provider="gemini")
+    assert argon_cash is not None
+    argon_billed = calculate_cost_from_per_call_records(
+        [
+            {
+                "model_name": "gemini-4-argon-high-oauth",
+                "pricing_model_id": argon_client.metadata["pricing_model_id"],
+                "pricing_provider": argon_client.metadata["pricing_provider"],
+                "billing_type": argon_client.metadata["billing_type"],
+                "usage": dict(_CARBON_USAGE),
+            }
+        ]
+    )
+    assert argon_billed["total_cost"] == 0.0
+    assert argon_billed["platform_cost"] == 0.0
+    expected_argon = (
+        1_000_000 / 1_000_000 * float(argon_cash["input"])
+        + 1_000_000 / 1_000_000 * float(argon_cash["output"])
+        + 1_000_000 / 1_000_000 * float(argon_cash["cached_input"])
+    )
+    assert argon_billed["notional_cost"] == pytest.approx(expected_argon)
+    argon_payload = argon_client._build_payload([HumanMessage(content="ping")])
+
+    for effort, display_name in _CARBON_BY_EFFORT.items():
+        key = f"gemini-4-carbon-{effort}-oauth"
+        model_id = f"gemini-4-carbon-{effort}"
+        assert key in listed
+        entry = mc.get_model_config(key)
+        assert entry["provider"] == "antigravity-oauth"
+        assert entry["model_id"] == model_id
+        assert entry["context"] == 1_048_576
+        assert entry["parameters"]["max_output_tokens"] == 262144
+        assert entry["reasoning"]["efforts"] == [effort]
+        assert entry["reasoning"]["default"] == effort
+        assert entry["reasoning"]["write"] == "parameters.thinking_level"
+
+        assert mc.get_input_modalities(key) == ["text", "image", "pdf", "video"]
+        assert mc.get_prompt_guidance(key) == "lean"
+        assert mc.get_reasoning_efforts(key) == [effort]
+        assert mc.get_reasoning_effort_default(key) == effort
+        surfaced = catalog[key]
+        assert surfaced["display_name"] == display_name
+        assert surfaced["context"] == 1_048_576
+        assert "speed" not in surfaced
+        assert "intelligence" not in surfaced
+        assert family_of(key) == "google-gemini"
+        assert is_text_only(key) is False
+
+        carbon_meta = meta[key]
+        assert carbon_meta["billing"] == "subscription"
+        assert carbon_meta["tool_calling"] is True
+        assert "notional_ref" not in carbon_meta
+        stored = carbon_meta["notional_pricing"]
+        assert stored["estimated"] is False
+        assert stored["verified_at"] == "2026-11-10"
+        assert stored["source"] == _CARBON_SOURCE
+        assert resolve_notional_card(key) == {
+            "input": 2.0,
+            "output": 10.0,
+            "cached_input": 0.1,
+        }
+
+        factory = LLM(key, api_key="fake-ag-token")
+        assert factory.model == model_id
+        assert factory.provider == "antigravity-oauth"
+        assert factory.resolved_reasoning_effort == effort
+        assert factory.parameters["thinking_level"] == effort
+        assert factory.parameters["max_output_tokens"] == 262144
+        assert factory.parameters["include_thoughts"] is True
+
+        client = factory.get_llm()
+        assert isinstance(client, ChatAntigravity)
+        assert client.model == model_id
+        assert client.max_output_tokens == 262144
+        assert client.include_thoughts is True
+        assert client.thinking_level == effort
+        assert client.metadata["billing_type"] == "oauth"
+        assert client.metadata["pricing_model_id"] == model_id
+        assert client.metadata["pricing_provider"] == "antigravity-oauth"
+        assert client.profile["max_input_tokens"] == 1_048_576
+        assert client.profile["text_inputs"] is True
+        assert client.profile["image_inputs"] is True
+        assert client.profile["video_inputs"] is True
+        assert client.profile["audio_inputs"] is False
+
+        payload = client._build_payload([HumanMessage(content="ping")])
+        assert payload["model"] == model_id
+        assert set(payload) == set(argon_payload)
+        assert set(payload["request"]) == set(argon_payload["request"])
+        generation = payload["request"]["generationConfig"]
+        assert set(generation) == set(argon_payload["request"]["generationConfig"])
+        assert generation["maxOutputTokens"] == 262144
+        assert generation["thinkingConfig"] == {
+            "includeThoughts": True,
+            "thinkingLevel": effort.upper(),
+        }
+
+        billed = calculate_cost_from_per_call_records(
+            [
+                {
+                    "model_name": key,
+                    "pricing_model_id": client.metadata["pricing_model_id"],
+                    "pricing_provider": client.metadata["pricing_provider"],
+                    "billing_type": client.metadata["billing_type"],
+                    "usage": dict(_CARBON_USAGE),
+                }
+            ]
+        )
+        assert billed["total_cost"] == 0.0
+        assert billed["platform_cost"] == 0.0
+        assert billed["notional_cost"] == pytest.approx(_CARBON_NOTIONAL_USD)
+
+    clamped = LLM(
+        "gemini-4-carbon-low-oauth",
+        api_key="fake-ag-token",
+        reasoning_effort="high",
+    )
+    assert clamped.resolved_reasoning_effort == "low"
+    assert clamped.get_llm().thinking_level == "low"
+
+    high = LLM("gemini-4-carbon-high-oauth", api_key="fake-ag-token").get_llm()
+    bound = high.bind_tools(
+        [
+            {
+                "type": "function",
+                "function": {
+                    "name": "ping_tool",
+                    "description": "Echo text.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"text": {"type": "string"}},
+                        "required": ["text"],
+                    },
+                },
+            }
+        ]
+    )
+    tool_payload = bound._build_payload([HumanMessage(content="ping")])
+    declarations = tool_payload["request"]["tools"][0]["functionDeclarations"]
+    assert declarations[0]["name"] == "ping_tool"
+    assert tool_payload["model"] == "gemini-4-carbon-high"
+    assert tool_payload["request"]["generationConfig"]["thinkingConfig"]["thinkingLevel"] == "HIGH"

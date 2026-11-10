@@ -224,6 +224,7 @@ Docker（colima，数据盘在 EveSSD）
   - 剩余不足 0.25 美元时拒绝新请求，返回 HTTP 429。
   - 额度按每块 1 美元预留，租期 300 秒。
 - **只有现金花费计入额度。** `*-oauth` 模型和标记为 `subscription` 的模型只记名义成本。Coding Plan 的 GLM 配了价格为 0 的价格卡，这样每条计费路径算出来的现金都是 0。
+- Gemini 4 Carbon（`gemini-4-carbon-low-oauth`、`gemini-4-carbon-medium-oauth`、`gemini-4-carbon-high-oauth`）的订阅现金花费为 0。当前名义费率是每百万 token 输入 2 美元、输出 10 美元、缓存输入 0.1 美元，2026-11-10 核对。这是推广期价格，其后为输入 4 美元、输出 20 美元，结束日期未给出。来源是 2026-10-28 的发布说明：<https://blog.google/innovation-and-ai/models-and-research/gemini-models/introducing-gemini-4-carbon/>。
 - 预检发现额度用完时，跳过本次唤醒；一次性任务顺延一天。
 - 相关代码：钩子 `budget-gate`、`budget-admission`；接口 `/api/v1/dalton/budget*`；设置页的 `DaltonBudgetCard`。
 

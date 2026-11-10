@@ -332,7 +332,13 @@ async def get_automation(
         from src.dalton.services.company_task_read import get_script_automation
 
         return await get_script_automation(principal, str(parsed.job_key))
-    automation = await auto_db.get_automation(str(parsed.agent_id), principal.user_id)
+    # DALTON-HOOK(company-automations): a computer token's detail uses the same run reach as the list
+    detail_kwargs: dict[str, Any] = {}
+    if principal.computer_id is not None:
+        detail_kwargs["computer_id"] = principal.computer_id
+    automation = await auto_db.get_automation(
+        str(parsed.agent_id), principal.user_id, **detail_kwargs
+    )
     if automation:
         resp = AutomationResponse.model_validate(automation)
         # DALTON-HOOK(dalton-notify): populate user-specific notify effective value and source
@@ -664,6 +670,7 @@ def _parse_read_id(automation_id: str):
         parse_automation_read_id,
     )
 
+    # DALTON-HOOK(company-automations): normalize public task identifiers before reads
     try:
         return parse_automation_read_id(automation_id)
     except InvalidAutomationId as exc:
