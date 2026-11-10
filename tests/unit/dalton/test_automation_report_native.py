@@ -9,6 +9,7 @@ from typing import Any
 from unittest.mock import create_autospec
 from uuid import uuid4
 
+import psycopg
 import pytest
 
 from src.dalton.database import automation_reports as reports
@@ -699,6 +700,73 @@ async def test_dispatch_does_not_confirm_accepted_or_uncertain_transport() -> No
     assert result["delivery_confirmed"] is False
     assert result["status"] == "unknown"
     uncertain_bundle["notify_fn"].assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_post_send_status_read_failure_stays_pending_uncertain() -> None:
+    target = "feishu:chat:oc_alpha"
+    state = [
+        _saved_row(
+            target,
+            status="failed",
+            attempt_count=2,
+            error_code="ConnectError",
+        )
+    ]
+    bundle = _injection_bundle(state, ledger_ready=False)
+    reads = 0
+
+    async def load(execution_id_arg: str, *, conn: Any = None) -> list[dict[str, Any]]:
+        nonlocal reads
+        assert execution_id_arg == state[0]["execution_id"]
+        assert conn is None
+        reads += 1
+        if reads == 2:
+            raise psycopg.OperationalError(
+                "Synthetic saved-status read failure after successful send"
+            )
+        return [dict(row) for row in state]
+
+    async def claim(
+        execution_id_arg: str,
+        channel: str,
+        target_arg: str,
+        *,
+        max_attempts: int = 3,
+        stale_pending_minutes: int = 10,
+        conn: Any = None,
+    ) -> tuple[bool, int | None]:
+        _ = (max_attempts, stale_pending_minutes, conn)
+        assert execution_id_arg == state[0]["execution_id"]
+        assert channel == state[0]["channel"]
+        assert target_arg == target
+        assert state[0]["status"] == "failed"
+        assert state[0]["attempt_count"] == 2
+        state[0]["status"] = "pending"
+        state[0]["attempt_count"] = 3
+        state[0]["error_code"] = None
+        return True, 3
+
+    bundle["load_rows_fn"] = create_autospec(
+        reports.load_execution_report_rows,
+        side_effect=load,
+    )
+    bundle["claim_fn"] = create_autospec(
+        notify_dispatch.claim_saved_report_delivery,
+        side_effect=claim,
+    )
+    value = await notify_dispatch.dispatch_automation_report(
+        state[0]["execution_id"],
+        **bundle,
+    )
+    assert reads == 3
+    assert value["ok"] is True
+    assert value["delivery_confirmed"] is False
+    assert value["status"] == "unknown"
+    assert state[0]["status"] == "pending"
+    assert state[0]["error_code"] == "delivery_uncertain"
+    assert state[0]["attempt_count"] == 3
+    bundle["notify_fn"].assert_called_once()
 
 
 @pytest.mark.asyncio
