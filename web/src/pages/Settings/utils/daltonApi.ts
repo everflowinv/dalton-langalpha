@@ -779,11 +779,31 @@ export async function fetchDaltonFeishuGroups(): Promise<DaltonFeishuGroupsRespo
   return data;
 }
 
-export interface DaltonChannelIdentityItem {
+/** Platforms supported by personal channel binding. */
+export type DaltonChannelPlatform = 'feishu' | 'discord' | 'weixin';
+
+/**
+ * One identity row from `GET /channels/bindings`.
+ * The route loads identities with `include_secrets=False` and then drops
+ * `weixin_context_token` and `encrypted_weixin_context_token`.
+ * Unlinked platforms are omitted; they are not sent as null.
+ */
+export interface DaltonChannelIdentityPublic {
+  platform: string;
   platform_user_id: string;
-  platform_display_name: string | null;
-  bound_at: string | null;
-  last_active_at: string | null;
+  platform_username: string | null;
+  platform_tenant_key: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+/** Normalized `bindings[platform]` from the same response. */
+export interface DaltonChannelBindingState {
+  linked: boolean;
+  platform: string;
+  platform_user_id: string | null;
+  platform_username: string | null;
+  updated_at: string | null;
 }
 
 /** Public Weixin bot fields returned by the bindings API. */
@@ -801,30 +821,34 @@ export interface DaltonWeixinBotPublicState {
 export interface DaltonChannelBindingsResponse {
   user_id: string;
   user_tier: 'admin' | 'internal' | 'external' | string;
-  identities: {
-    feishu: DaltonChannelIdentityItem | null;
-    weixin: DaltonChannelIdentityItem | null;
+  home_workspace_id: string;
+  /** Always includes feishu, discord, and weixin. Read status from here. */
+  bindings: Record<DaltonChannelPlatform, DaltonChannelBindingState>;
+  identities: Partial<Record<string, DaltonChannelIdentityPublic>>;
+  settings: {
+    version: string;
+    apps: Record<string, unknown>;
   };
-  active_bind_codes: Array<{
-    platform: 'feishu' | 'weixin' | string;
-    expires_at: string | null;
-    created_at: string | null;
-  }>;
+  chat_bindings: unknown;
   weixin_bot: DaltonWeixinBotPublicState | null;
-  feishu_bot_configured: boolean;
 }
 
+/**
+ * `POST /channels/bind-codes`.
+ * The body is `{ platform }` for the signed-in user. The response is
+ * `command` (`/bind DLT-XXXX-XXXX`) and `expires_in_seconds` (600).
+ */
 export interface DaltonChannelBindCodeCreateResponse {
   code: string;
-  platform: 'feishu' | 'weixin';
-  expires_at: string | null;
-  ttl_seconds: number;
-  instruction: string;
+  platform: DaltonChannelPlatform;
+  expires_at: string;
+  expires_in_seconds: number;
+  command: string;
 }
 
 export interface DaltonChannelUnbindResponse {
   unbound: boolean;
-  platform: 'feishu' | 'weixin' | string;
+  platform: DaltonChannelPlatform | string;
 }
 
 /** QR statuses the login API returns after normalization. */
@@ -859,7 +883,7 @@ export async function fetchDaltonChannelBindings(): Promise<DaltonChannelBinding
 }
 
 export async function createDaltonChannelBindCode(
-  platform: 'feishu' | 'weixin',
+  platform: DaltonChannelPlatform,
 ): Promise<DaltonChannelBindCodeCreateResponse> {
   const { data } = await api.post<DaltonChannelBindCodeCreateResponse>(
     '/api/v1/dalton/channels/bind-codes',
@@ -869,7 +893,7 @@ export async function createDaltonChannelBindCode(
 }
 
 export async function unbindDaltonChannel(
-  platform: 'feishu' | 'weixin',
+  platform: DaltonChannelPlatform,
 ): Promise<DaltonChannelUnbindResponse> {
   const { data } = await api.delete<DaltonChannelUnbindResponse>(
     `/api/v1/dalton/channels/bindings/${encodeURIComponent(platform)}`,

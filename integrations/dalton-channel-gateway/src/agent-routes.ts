@@ -26,6 +26,10 @@ import {
   MAX_AUTOMATION_FINAL_TEXT_CHARS,
   SUPPORTED_PLATFORMS,
 } from "./types.js";
+import {
+  notLinkedTargetMessage,
+  personalChannelBindingsUrl,
+} from "./commands.js";
 
 export class AgentRoutesHandler {
   private readonly backend: BackendClient;
@@ -116,7 +120,7 @@ export class AgentRoutesHandler {
         unavailable.push({
           platform,
           reason: "not_linked",
-          message: `Your ${platform} account is not linked. Open ${this.webBaseUrl}/settings/channels to link it.`,
+          message: notLinkedTargetMessage(this.webBaseUrl, platform),
         });
         continue;
       }
@@ -215,7 +219,7 @@ export class AgentRoutesHandler {
         current,
         targets,
         unavailable,
-        settings_url: `${this.webBaseUrl}/settings/channels`,
+        settings_url: personalChannelBindingsUrl(this.webBaseUrl),
       },
     };
   }

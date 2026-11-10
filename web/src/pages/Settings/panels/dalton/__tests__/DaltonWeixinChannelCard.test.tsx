@@ -12,21 +12,30 @@ import type {
   DaltonWeixinQrPublicResponse,
 } from '@/pages/Settings/utils/daltonApi';
 
-const h = vi.hoisted(() => ({
-  bindings: {
+const h = vi.hoisted(() => {
+  const unboundBindings = (): DaltonChannelBindingsResponse => ({
     user_id: 'user-1',
     user_tier: 'internal',
-    identities: { feishu: null, weixin: null },
-    active_bind_codes: [],
+    home_workspace_id: 'home-1',
+    bindings: {
+      feishu: { linked: false, platform: 'feishu', platform_user_id: null, platform_username: null, updated_at: null },
+      discord: { linked: false, platform: 'discord', platform_user_id: null, platform_username: null, updated_at: null },
+      weixin: { linked: false, platform: 'weixin', platform_user_id: null, platform_username: null, updated_at: null },
+    },
+    identities: {},
+    settings: { version: '1', apps: {} },
+    chat_bindings: [],
     weixin_bot: null,
-    feishu_bot_configured: true,
-  } as DaltonChannelBindingsResponse,
+  });
+  return {
+  bindings: unboundBindings(),
+  unboundBindings,
   createBindCode: vi.fn<() => Promise<DaltonChannelBindCodeCreateResponse>>(async () => ({
     code: 'WX123456',
     platform: 'weixin',
     expires_at: '2026-12-01T00:00:00Z',
-    ttl_seconds: 600,
-    instruction: 'Send `/bind WX123456` to the Weixin bot within 10 minutes.',
+    expires_in_seconds: 600,
+    command: '/bind WX123456',
   })),
   unbindChannel: vi.fn<() => Promise<DaltonChannelUnbindResponse>>(async () => ({
     unbound: true,
@@ -55,7 +64,8 @@ const h = vi.hoisted(() => ({
       bot_generation: 2,
     }),
   ),
-}));
+  };
+});
 
 vi.mock('@/pages/Settings/utils/daltonApi', () => ({
   fetchDaltonChannelBindings: async (): Promise<DaltonChannelBindingsResponse> => h.bindings,
@@ -73,18 +83,31 @@ function adminBindings(bot: DaltonChannelBindingsResponse['weixin_bot']): Dalton
   return {
     user_id: 'admin-1',
     user_tier: 'admin',
-    identities: {
-      feishu: null,
+    home_workspace_id: 'home-admin',
+    bindings: {
+      feishu: { linked: false, platform: 'feishu', platform_user_id: null, platform_username: null, updated_at: null },
+      discord: { linked: false, platform: 'discord', platform_user_id: null, platform_username: null, updated_at: null },
       weixin: {
+        linked: true,
+        platform: 'weixin',
         platform_user_id: 'wx-admin-1',
-        platform_display_name: 'Admin WX',
-        bound_at: '2026-11-01T00:00:00Z',
-        last_active_at: null,
+        platform_username: 'Admin WX',
+        updated_at: '2026-11-01T00:00:00Z',
       },
     },
-    active_bind_codes: [],
+    identities: {
+      weixin: {
+        platform: 'weixin',
+        platform_user_id: 'wx-admin-1',
+        platform_username: 'Admin WX',
+        platform_tenant_key: null,
+        created_at: '2026-11-01T00:00:00Z',
+        updated_at: '2026-11-01T00:00:00Z',
+      },
+    },
+    settings: { version: '1', apps: {} },
+    chat_bindings: [],
     weixin_bot: bot,
-    feishu_bot_configured: true,
   };
 }
 
@@ -132,14 +155,7 @@ async function advance(ms: number) {
 describe('DaltonWeixinChannelCard', () => {
   beforeEach(() => {
     vi.useRealTimers();
-    h.bindings = {
-      user_id: 'user-1',
-      user_tier: 'internal',
-      identities: { feishu: null, weixin: null },
-      active_bind_codes: [],
-      weixin_bot: null,
-      feishu_bot_configured: true,
-    };
+    h.bindings = h.unboundBindings();
     h.createBindCode.mockClear();
     h.unbindChannel.mockClear();
     h.startQr.mockClear();

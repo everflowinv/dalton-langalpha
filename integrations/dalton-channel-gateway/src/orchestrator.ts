@@ -19,7 +19,13 @@ import {
   type ThreadWakeupItem,
 } from "./backend-client.js";
 import type { ChannelAdapter } from "./channels/adapter.js";
-import { parseSlashCommand, type ParsedSlashCommand } from "./commands.js";
+import {
+  expiredBindCodeUsage,
+  missingBindCodeUsage,
+  notLinkedBindHelp,
+  parseSlashCommand,
+  type ParsedSlashCommand,
+} from "./commands.js";
 import type { DeliveryService } from "./delivery-service.js";
 import {
   ACTIVE_WAKEUP_STATES,
@@ -595,7 +601,7 @@ export class ChannelGatewayOrchestrator {
         reason === "missing_bind_code" ||
         reason === "missing_argument"
       ) {
-        return "Usage: `/bind <6-CHAR-CODE>` (generate a bind code in Web Settings → Channels).";
+        return missingBindCodeUsage(this.webBaseUrl);
       }
       if (reason === "revoked_in_group") {
         return "For security, `/bind` cannot be used in a group chat. This code has been revoked; please generate a new code and send `/bind <CODE>` in a direct message.";
@@ -604,7 +610,7 @@ export class ChannelGatewayOrchestrator {
         const expected = fields.expectedPlatform ?? "another platform";
         return `This bind code was generated for ${expected}, not ${event.platform}.`;
       }
-      return "Bind code is invalid or expired. Please generate a new code in Web Settings → Channels.";
+      return expiredBindCodeUsage(this.webBaseUrl);
     }
     if (action === "bind") {
       return `Successfully linked your ${event.platform} account to Dalton.`;
@@ -9103,7 +9109,7 @@ export class ChannelGatewayOrchestrator {
   ): string {
     switch (denyReason) {
       case "not_linked":
-        return `Your ${platform} account is not linked to Dalton yet. Open ${this.webBaseUrl}/settings/channels to generate a bind code, then send \`/bind <CODE>\` in a direct message.`;
+        return notLinkedBindHelp(this.webBaseUrl, platform);
       case "external_member_group_forbidden":
         return "External accounts can use Dalton in direct messages only, not in group chats.";
       case "workspace_write_denied":

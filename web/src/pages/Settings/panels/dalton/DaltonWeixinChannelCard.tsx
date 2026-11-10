@@ -295,7 +295,7 @@ export function DaltonWeixinChannelCard(): React.ReactElement | null {
           >
             <div className="flex flex-col gap-0.5 min-w-0">
               <span className="font-mono truncate" style={{ color: 'var(--color-text-primary)' }}>
-                {weixinIdentity.platform_display_name || weixinIdentity.platform_user_id}
+                {weixinIdentity.platform_username || weixinIdentity.platform_user_id}
               </span>
               <span className="text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
                 已绑定微信标识：{weixinIdentity.platform_user_id}
@@ -332,11 +332,8 @@ export function DaltonWeixinChannelCard(): React.ReactElement | null {
                 style={{ backgroundColor: 'var(--color-bg-tag)' }}
                 data-testid="dalton-weixin-bind-code-box"
               >
-                <span className="font-mono font-semibold" style={{ color: 'var(--color-text-primary)' }}>
-                  /bind {bindCodeResult.code}
-                </span>
-                <span className="text-[11px]" style={{ color: 'var(--color-text-tertiary)' }}>
-                  {bindCodeResult.instruction}
+                <span className="break-all font-mono font-semibold" style={{ color: 'var(--color-text-primary)' }}>
+                  {bindCodeResult.command.trim() || `/bind ${bindCodeResult.code}`}
                 </span>
               </div>
             )}
