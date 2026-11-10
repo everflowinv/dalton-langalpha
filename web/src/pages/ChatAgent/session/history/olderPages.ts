@@ -287,9 +287,30 @@ export function commitOlderHistoryPage(
 ): void {
   const steered = older.page.carry.steeredAgentIds;
   const messages = settleClosedTaskChips(rt, older.messages, deps.liveOutcome);
+  const olderIds = new Set(messages.map((m) => m.id));
+  const olderFailedKeys = new Set(
+    messages
+      .filter((m) => m.role === 'user' && Boolean((m as { queueError?: unknown }).queueError))
+      .map((m) => (m as { requestKey?: string }).requestKey)
+      .filter((k): k is string => Boolean(k)),
+  );
   rt.setMessages((prev) => {
-    rt.newMessagesStartIndexRef.current += messages.length;
-    return markSteeredResumeCards([...messages, ...prev], steered);
+    let removedBeforeBoundary = 0;
+    const filteredPrev = prev.filter((m, idx) => {
+      const reqKey = m.role === 'user' ? (m as { requestKey?: string }).requestKey : undefined;
+      const isDup =
+        olderIds.has(m.id) ||
+        (m.role === 'user' &&
+          Boolean((m as { queueError?: unknown }).queueError) &&
+          Boolean(reqKey && olderFailedKeys.has(reqKey)));
+      if (isDup && idx < rt.newMessagesStartIndexRef.current) {
+        removedBeforeBoundary += 1;
+      }
+      return !isDup;
+    });
+    rt.newMessagesStartIndexRef.current =
+      rt.newMessagesStartIndexRef.current - removedBeforeBoundary + messages.length;
+    return markSteeredResumeCards([...messages, ...filteredPrev], steered);
   });
   for (const id of older.renderedInterruptIds) rt.renderedInterruptIdsRef.current.add(id);
   const { input, output } = older.tokens;

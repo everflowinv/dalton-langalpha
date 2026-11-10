@@ -98,6 +98,12 @@ export function createHistoryWindow() {
       };
     },
     snapshot: (): OlderHistoryStatus => status,
+    /** The oldest turn index currently loaded for `tid` (or current thread), or null. */
+    firstTurnIndex: (tid?: string | null): number | null =>
+      (tid === undefined || tid === threadId) && page ? page.firstTurnIndex : null,
+    /** Whether older unloaded turns remain before the currently loaded window. */
+    hasMore: (tid?: string | null): boolean =>
+      Boolean((tid === undefined || tid === threadId) && page?.hasMore),
 
     /** The limit for the newest load of `tid`: one page, or for a reload or a
      *  return to a thread left mid-way, every turn back to where it reached. */

@@ -76,7 +76,7 @@ export function projectTurns<M extends TurnLike>(messages: readonly M[]): Projec
       // A steering bubble sits inside the turn it steered, so it names its
       // turn without opening one.
       turnIndex = stamp;
-      if (!isSteeringUserMessage(message)) c = stamp;
+      if (opensTurn(message)) c = stamp;
     } else {
       // User bubbles initiate turn `c`; notifications carry no turn of their
       // own and ride the turn they were inserted into.

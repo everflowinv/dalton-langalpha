@@ -1397,6 +1397,7 @@ export function useChatMessages(
     const fallbackTurn = typeof status.latest_turn_index === 'number'
       ? status.latest_turn_index
       : (lastRenderedTurnIndexRef.current ?? undefined);
+    const minLoadedTurn = historyWindow.firstTurnIndex(threadIdRef.current);
     let surfacedError: string | null = null;
     const currentMsgs = liveMessages.get();
     for (const entry of failedSteers) {
@@ -1431,7 +1432,11 @@ export function useChatMessages(
       for (const entry of failedSteers) {
         if (!entry || typeof entry !== 'object') continue;
         const entryTurn = typeof entry.turn_index === 'number' ? entry.turn_index : fallbackTurn;
-        next = foldFailedSteer(next, entry, entryTurn);
+        next = foldFailedSteer(next, entry, entryTurn, {
+          minLoadedTurn,
+          isHistory: true,
+          newMessagesStartIndexRef,
+        });
       }
       return next;
     });

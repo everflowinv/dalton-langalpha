@@ -1723,6 +1723,19 @@ async def test_attach_request_files_materializes_via_pull_direct_without_base64_
     )
     messages = [{"role": "user", "content": "Audit the DCF sheet"}]
 
+    await svc.validate_and_claim_request_attachments(
+        req.additional_context,
+        user_id=user_id,
+        workspace_id=ws_id,
+        claim_key="req:test-mat-direct",
+    )
+    await svc.confirm_request_chat_uploads(
+        req.additional_context,
+        user_id=user_id,
+        workspace_id=ws_id,
+        claim_key="req:test-mat-direct",
+    )
+
     out_messages = await attach_request_files(
         messages,
         req,
@@ -1738,6 +1751,8 @@ async def test_attach_request_files_materializes_via_pull_direct_without_base64_
     assert pulled_entries[0]["size"] == len(raw_bytes)
     assert pulled_entries[0]["sha256"] == completed["sha256"]
     assert pulled_entries[0]["path"].startswith("work/uploads/valuation_model_")
+    assert ".wsfiles-grants-" in pulled_entries[0]["grant_file"]
+    assert ".wsfiles-tlock-" in pulled_entries[0]["lock_file"]
     assert sandbox.locked_paths == [f"/home/workspace/NVDA/{pulled_entries[0]['path']}"]
 
     rendered = str(out_messages[0]["content"])
@@ -1975,7 +1990,7 @@ async def test_cold_workspace_restore_and_future_turn_rematerialize_200mib_beyon
     assert restored_ok is True
     assert pulled_paths == [expected_rel]
     assert f"/home/workspace/AlphaProj/{expected_rel}" in cold_sandbox.files
-    assert f"/home/workspace/AlphaProj/.file_sync_marker" in cold_sandbox.files
+    assert "/home/workspace/AlphaProj/.file_sync_marker" in cold_sandbox.files
     assert upload_env["workspaces"][ws_id]["files_restore_incomplete"] is False
 
     # Subsequent future turn on warm sandbox sees the file already on disk and pulls 0 times
@@ -4899,6 +4914,7 @@ async def test_crud_delete_requires_remote_grant_revocation_and_retries_cleanly_
     import subprocess
     from pathlib import Path
     from src.server.app.workspace_files import crud as ws_crud
+    from src.server.database import workspace as ws_db
 
     owner = "user-crud-revoke"
     ws_id = str(uuid.uuid4())
@@ -4970,6 +4986,11 @@ async def test_crud_delete_requires_remote_grant_revocation_and_retries_cleanly_
         ws_crud,
         "owner_layout",
         create_autospec(ws_crud.owner_layout, return_value=layout),
+    )
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(ws_db.get_workspace, return_value=ws_meta),
     )
 
     del_body = ws_crud.DeleteFilesRequest(paths=[rel_path])
@@ -5351,3 +5372,298 @@ async def test_crud_delete_requires_remote_grant_revocation_and_retries_cleanly_
         for p in (proc_b1, proc_b2):
             if p.poll() is None:
                 p.kill()
+
+
+@pytest.mark.asyncio
+async def test_materialize_chat_uploads_direct_and_chunked_revoked_after_bytes_read_raises_410_without_recreating_file(
+    upload_env, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify materialize_chat_uploads (via attach_request_files and materialize_steered_chat_uploads)
+    for both direct (pull_direct) and chunked (_materialize_via_chunked_stream) transfers:
+    when a transfer has already verified DB retention and read all bytes from storage into staging,
+    pauses before target publication, and a concurrent file deletion completes before resume,
+    the transfer aborts with HTTP 410 / SteerAttachmentPermanentError('http_410'), never recreates
+    the target file on disk, cleans up staging/grant files, and emits no saved-file reminder."""
+    import json
+    import sys
+    from contextlib import suppress
+    from pathlib import Path
+
+    from src.server.app.workspace_files import crud as ws_crud
+    from src.server.database import workspace as ws_db
+
+    owner = "user-mat-revoke"
+    ws_id = str(uuid.uuid4())
+    upload_env["workspaces"][ws_id] = {
+        "workspace_id": ws_id,
+        "user_id": owner,
+        "status": "running",
+    }
+
+    root_dir = str(tmp_path / "posix_mat_revoke_root")
+    sbx_place = _RealPosixSandbox(root_dir, dir_name="MatRevokeWS")
+    sbx_delete = _RealPosixSandbox(root_dir, dir_name="MatRevokeWS")
+    project = ProjectContext(workspace_id=ws_id, dir_name="MatRevokeWS")
+    layout = sbx_place.workspace(project)
+    ws_meta = {
+        "workspace_id": ws_id,
+        "user_id": owner,
+        "status": "running",
+        "dir_name": "MatRevokeWS",
+    }
+
+    @asynccontextmanager
+    async def _fake_acquire_sandbox(_ws_id: str, _owner_id: str):
+        yield sbx_delete, ws_meta
+
+    monkeypatch.setattr(
+        ws_crud,
+        "owned_workspace_on_computer",
+        create_autospec(ws_crud.owned_workspace_on_computer, return_value=ws_meta),
+    )
+    monkeypatch.setattr(
+        ws_crud,
+        "acquire_sandbox_to_change",
+        create_autospec(ws_crud.acquire_sandbox_to_change, side_effect=_fake_acquire_sandbox),
+    )
+    monkeypatch.setattr(
+        ws_crud,
+        "owner_work_dir",
+        create_autospec(ws_crud.owner_work_dir, return_value=layout.workspace),
+    )
+    monkeypatch.setattr(
+        ws_crud,
+        "owner_layout",
+        create_autospec(ws_crud.owner_layout, return_value=layout),
+    )
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(ws_db.get_workspace, return_value=ws_meta),
+    )
+
+    repo_root = str(Path(__file__).resolve().parents[3])
+    src_dir = os.path.join(repo_root, "src")
+
+    direct_worker_code = (
+        "import json, os, sys\n"
+        "from ptc_agent.core.sandbox import wsfiles_transfer_runtime as rt\n"
+        "stage_p, target_p, item_json, out_p = sys.argv[1:5]\n"
+        "item = json.loads(item_json)\n"
+        "res = rt._place(stage_p, target_p, item, 200)\n"
+        "with open(out_p, 'w', encoding='utf-8') as f:\n"
+        "    json.dump(res, f)\n"
+    )
+
+    for mode in ("direct", "chunked"):
+        for entrypoint in ("attach_request_files", "materialize_steered_chat_uploads"):
+            payload = f"PAYLOAD_{mode}_{entrypoint}_".encode("utf-8") * 512
+            filename = f"model_{mode}_{entrypoint}.bin"
+            created = await svc.initiate_chat_upload(
+                user_id=owner,
+                workspace_id=ws_id,
+                filename=filename,
+                size_bytes=len(payload),
+                mime_type="application/octet-stream",
+            )
+            uid = created["upload_id"]
+            await svc.receive_chat_upload_part(
+                upload_id=uid,
+                part_number=1,
+                user_id=owner,
+                stream=_bytes_stream(payload),
+            )
+            await svc.complete_chat_upload(upload_id=uid, user_id=owner)
+            ctx_item = ChatUploadContext(
+                upload_id=uid,
+                name=filename,
+                mime_type="application/octet-stream",
+                size=len(payload),
+            )
+            claim_key = f"req:{mode}:{entrypoint}:{uid}"
+            await svc.validate_and_claim_request_attachments(
+                [ctx_item],
+                user_id=owner,
+                workspace_id=ws_id,
+                claim_key=claim_key,
+            )
+            await svc.confirm_request_chat_uploads(
+                [ctx_item],
+                user_id=owner,
+                workspace_id=ws_id,
+                claim_key=claim_key,
+            )
+
+            row = upload_env["ledger"].rows[uid]
+            obj_key = str(row["object_key"])
+            rel_path = svc.build_sandbox_upload_rel_path(row)
+            abs_path = f"{layout.workspace}/{rel_path}"
+
+            ready_flag = tmp_path / f"mat_{mode}_{entrypoint}_ready.flag"
+            resume_flag = tmp_path / f"mat_{mode}_{entrypoint}_resume.flag"
+            bytes_read_count = 0
+
+            if mode == "direct":
+                sbx_place.provider.direct_blob_transfer = True
+
+                async def _real_posix_pull_direct(
+                    sandbox: Any,
+                    entries: list[dict[str, Any]],
+                    *,
+                    layout: WorkspaceLayout,
+                    defer_dir_modes: bool = False,
+                    sweep_orphans: bool = True,
+                    _obj_key: str = obj_key,
+                    _uid: str = uid,
+                    _ready_flag: Path = ready_flag,
+                    _resume_flag: Path = resume_flag,
+                ) -> dict[str, dict[str, Any]]:
+                    nonlocal bytes_read_count
+                    del sandbox, defer_dir_modes, sweep_orphans
+                    item = dict(entries[0])
+                    assert item.get("grant_file"), "materialize_chat_uploads must supply grant_file"
+                    assert item.get("lock_file"), "materialize_chat_uploads must supply lock_file"
+                    target_abs = f"{layout.workspace}/{item['path']}"
+                    parent_dir = os.path.dirname(target_abs)
+                    os.makedirs(parent_dir, exist_ok=True)
+                    # Read bytes from storage into a staging temp file before pausing
+                    raw_blob = upload_env["store"].objects[_obj_key]
+                    bytes_read_count += len(raw_blob)
+                    stage_file = f"{parent_dir}/.wsfiles-tmp-direct-{_uid[:8]}"
+                    with open(stage_file, "wb") as sf:
+                        sf.write(raw_blob)
+                    out_file = str(tmp_path / f"direct_out_{_uid[:8]}.json")
+                    proc = await asyncio.create_subprocess_exec(
+                        sys.executable,
+                        "-c",
+                        direct_worker_code,
+                        stage_file,
+                        target_abs,
+                        json.dumps(item),
+                        out_file,
+                        env={
+                            **os.environ,
+                            "PYTHONPATH": f"{src_dir}:{repo_root}",
+                            "WSFILES_TEST_PAUSE_AFTER_LOCK_OPEN": f"{_ready_flag}:{_resume_flag}",
+                        },
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    await proc.communicate()
+                    res_obj = json.loads(Path(out_file).read_text(encoding="utf-8"))
+                    return {item["path"]: res_obj}
+
+                monkeypatch.setattr(svc, "pull_direct", _real_posix_pull_direct)
+            else:
+                sbx_place.provider.direct_blob_transfer = False
+
+                def _tracked_iter_chunks(key: str, chunk_size: int = 4194304):
+                    nonlocal bytes_read_count
+                    raw_blob = upload_env["store"].objects[key]
+                    for idx in range(0, len(raw_blob), chunk_size):
+                        piece = raw_blob[idx : idx + chunk_size]
+                        bytes_read_count += len(piece)
+                        yield piece
+
+                monkeypatch.setattr(
+                    svc.storage, "iter_stored_object_chunks", _tracked_iter_chunks
+                )
+                monkeypatch.setenv(
+                    "WSFILES_TEST_PAUSE_AFTER_LOCK_OPEN", f"{ready_flag}:{resume_flag}"
+                )
+
+            if entrypoint == "attach_request_files":
+                req = ChatRequest(
+                    messages=[{"role": "user", "content": "Inspect attachment"}],
+                    additional_context=[ctx_item],
+                )
+                in_messages = [{"role": "user", "content": "Inspect attachment"}]
+                mat_task = asyncio.create_task(
+                    attach_request_files(
+                        in_messages,
+                        req,
+                        _FakeSession(sbx_place),
+                        effective_model="claude-sonnet-4-5",
+                        config=type(
+                            "Cfg",
+                            (),
+                            {"input_modalities": ["text", "image"], "llm_client": None},
+                        )(),
+                        project=project,
+                        user_id=owner,
+                        workspace_id=ws_id,
+                    )
+                )
+            else:
+                steer_payload = {
+                    "content": "Steer with attachment",
+                    "user_id": owner,
+                    "workspace_id": ws_id,
+                    "is_colleague": False,
+                    "chat_uploads": [ctx_item.model_dump()],
+                }
+                mat_task = asyncio.create_task(
+                    svc.materialize_steered_chat_uploads(
+                        steer_payload,
+                        session=_FakeSession(sbx_place),
+                        project=project,
+                    )
+                )
+
+            try:
+                # Wait until all bytes have been read from storage into staging and the
+                # transfer is paused at WSFILES_TEST_PAUSE_AFTER_LOCK_OPEN before publication.
+                await _wait_for_flag(ready_flag)
+                assert bytes_read_count == len(payload)
+                assert not os.path.exists(abs_path)
+
+                # Concurrent explicit file deletion runs and completes while transfer is paused.
+                del_res = await ws_crud.delete_workspace_files(
+                    workspace_id=ws_id,
+                    x_user_id=owner,
+                    body=ws_crud.DeleteFilesRequest(paths=[rel_path]),
+                )
+                assert del_res == {"deleted": [rel_path], "errors": []}
+                assert upload_env["ledger"].rows[uid]["state"] == "aborted"
+                assert upload_env["ledger"].rows[uid]["cleaned_at"] is not None
+                assert obj_key not in upload_env["store"].objects
+
+                # Resume the paused transfer: it must abort with HTTP 410 / SteerAttachmentPermanentError('http_410')
+                # without recreating abs_path or generating any saved-file reminder!
+                resume_flag.write_text("go", encoding="utf-8")
+
+                if entrypoint == "attach_request_files":
+                    with pytest.raises(HTTPException) as exc_info:
+                        await mat_task
+                    assert exc_info.value.status_code == 410
+                    assert "expired or was removed" in str(exc_info.value.detail)
+                    assert in_messages == [{"role": "user", "content": "Inspect attachment"}]
+                else:
+                    with pytest.raises(svc.SteerAttachmentPermanentError) as exc_info:
+                        await mat_task
+                    assert exc_info.value.code == "http_410"
+                    assert "expired or was removed" in str(exc_info.value.message)
+
+                assert not os.path.exists(abs_path)
+                uploads_dir = os.path.dirname(abs_path)
+                if os.path.isdir(uploads_dir):
+                    leftover = [
+                        n
+                        for n in os.listdir(uploads_dir)
+                        if n.startswith(
+                            (
+                                ".wsfiles-tmp-",
+                                ".wsfiles-stage-",
+                                ".wsfiles-part-",
+                                ".wsfiles-grants-",
+                            )
+                        )
+                    ]
+                    assert leftover == []
+            finally:
+                monkeypatch.delenv("WSFILES_TEST_PAUSE_AFTER_LOCK_OPEN", raising=False)
+                if not resume_flag.exists():
+                    resume_flag.write_text("go", encoding="utf-8")
+                if not mat_task.done():
+                    with suppress(Exception):
+                        await mat_task

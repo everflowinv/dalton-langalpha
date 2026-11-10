@@ -1582,4 +1582,290 @@ describe('ChatInput large file uploads (up to 200 MiB)', () => {
       vi.useRealTimers();
     }
   });
+
+  it('reconciles /status failed_steers against the loaded 20-turn page window without duplicating older turns on loadOlderHistory', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const attOld = {
+        name: 'turn2_expired.bin',
+        type: 'file' as const,
+        mime_type: 'application/octet-stream',
+        size: 16 * 1024 * 1024,
+        status: 'uploaded' as const,
+        upload_id: 'up-paged-old',
+      };
+      const attMid = {
+        name: 'turn10_revoked.pdf',
+        type: 'pdf' as const,
+        mime_type: 'application/pdf',
+        size: 64 * 1024,
+        status: 'uploaded' as const,
+        upload_id: 'up-paged-mid',
+      };
+      const attCur = {
+        name: 'turn24_parked.png',
+        type: 'image' as const,
+        mime_type: 'image/png',
+        size: 8192,
+        status: 'uploaded' as const,
+        upload_id: 'up-paged-cur',
+      };
+
+      const failOld = {
+        reason: 'attachment_failed',
+        error: 'Turn 2 attachment expired (410).',
+        error_code: 'http_410',
+        request_key: 'rk-paged-turn-2',
+        job_id: 'job-paged-turn-2',
+        turn_index: 2,
+        content: 'Old failed steer at turn 2',
+        attachments: [attOld],
+        timestamp: 1700000502,
+      };
+      const failMid = {
+        reason: 'attachment_failed',
+        error: 'Turn 10 attachment revoked (403).',
+        error_code: 'http_403',
+        request_key: 'rk-paged-turn-10',
+        job_id: 'job-paged-turn-10',
+        turn_index: 10,
+        content: 'In-window failed steer at turn 10',
+        attachments: [attMid],
+        timestamp: 1700000510,
+      };
+      const failCur = {
+        reason: 'attachment_failed',
+        error: 'Turn 24 attachment expired (410).',
+        error_code: 'http_410',
+        request_key: 'rk-paged-turn-24',
+        job_id: 'job-paged-turn-24',
+        turn_index: 24,
+        content: 'Current turn 24 parked steer',
+        attachments: [attCur],
+        timestamp: 1700000524,
+      };
+
+      let statusPendingSteers: Array<Record<string, unknown>> = [
+        {
+          content: 'Current turn 24 parked steer',
+          request_key: 'rk-paged-turn-24',
+          attachments: [attCur],
+          timestamp: 1700000520,
+        },
+      ];
+      let statusFailedSteers: Array<Record<string, unknown>> = [failOld, failMid];
+
+      getWorkflowStatusMock.mockImplementation(async () => ({
+        status: 'completed',
+        can_reconnect: false,
+        latest_turn_index: 24,
+        pending_steers: statusPendingSteers,
+        failed_steers: statusFailedSteers,
+        active_tasks: [],
+      }));
+
+      replayThreadHistoryMock.mockImplementation(
+        async (
+          _tid: string,
+          onEvent: (ev: Record<string, unknown>) => void,
+          opts?: { limit?: number; beforeTurn?: number },
+        ) => {
+          if (opts?.beforeTurn === 5) {
+            onEvent({
+              event: 'history_page',
+              first_turn_index: 0,
+              has_more: false,
+            });
+            for (let t = 0; t <= 4; t++) {
+              onEvent({
+                event: 'user_message',
+                role: 'user',
+                content: `Question turn ${t}`,
+                turn_index: t,
+                run_id: `run-paged-${t}`,
+              });
+              onEvent({
+                event: 'message_chunk',
+                role: 'assistant',
+                content_type: 'text',
+                content: `Answer turn ${t}`,
+                turn_index: t,
+                finish_reason: 'stop',
+              });
+              if (t === 2) {
+                onEvent({
+                  event: 'steering_returned',
+                  ...failOld,
+                });
+              }
+            }
+            onEvent({
+              event: 'replay_done',
+              thread_id: 'thread-paged-steers',
+              latest_run_id: 'run-paged-4',
+            });
+            return { completed: true, aborted: false, disconnected: false };
+          }
+
+          // Initial newest 20-turn page: turns 5..24
+          onEvent({
+            event: 'history_page',
+            first_turn_index: 5,
+            has_more: true,
+          });
+          for (let t = 5; t <= 24; t++) {
+            onEvent({
+              event: 'user_message',
+              role: 'user',
+              content: `Question turn ${t}`,
+              turn_index: t,
+              run_id: `run-paged-${t}`,
+            });
+            onEvent({
+              event: 'message_chunk',
+              role: 'assistant',
+              content_type: 'text',
+              content: `Answer turn ${t}`,
+              turn_index: t,
+              finish_reason: 'stop',
+            });
+          }
+          onEvent({
+            event: 'replay_done',
+            thread_id: 'thread-paged-steers',
+            latest_run_id: 'run-paged-24',
+          });
+          return { completed: true, aborted: false, disconnected: false };
+        },
+      );
+
+      let hookState: ReturnType<typeof useChatMessages> | null = null;
+      function PagedHookHarness() {
+        hookState = useChatMessages('ws-1', 'thread-paged-steers');
+        return null;
+      }
+
+      const queryClient = new QueryClient({
+        defaultOptions: { queries: { retry: false } },
+      });
+      render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <PagedHookHarness />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+
+      await waitFor(() => {
+        expect(hookState).not.toBeNull();
+        expect(hookState!.isLoadingThread).toBe(false);
+        expect(hookState!.olderHistory.status).toBe('idle');
+      });
+
+      // 1. While only turns 5..24 are loaded:
+      //    - Turn 2's failed steer (outside the [5..24] window) is NOT rendered or appended at the bottom.
+      //    - Turn 10's failed steer (inside [5..24]) is inserted right after history-assistant-10 and before history-user-11.
+      //    - Turn 24's pending steer is waiting at the end of turn 24.
+      const msgsInitial = hookState!.messages;
+      expect(
+        msgsInitial.filter(
+          (m) => m.role === 'user' && (m as UserMessage).requestKey === 'rk-paged-turn-2',
+        ),
+      ).toHaveLength(0);
+
+      const idxAss10 = msgsInitial.findIndex((m) => m.id === 'history-assistant-10');
+      const idxUser11 = msgsInitial.findIndex((m) => m.id === 'history-user-11');
+      const idxFail10 = msgsInitial.findIndex(
+        (m) => m.role === 'user' && (m as UserMessage).requestKey === 'rk-paged-turn-10',
+      );
+      expect(idxAss10).toBeGreaterThan(-1);
+      expect(idxFail10).toBe(idxAss10 + 1);
+      expect(idxUser11).toBe(idxFail10 + 1);
+
+      const pending24 = msgsInitial.find(
+        (m): m is UserMessage => m.role === 'user' && m.requestKey === 'rk-paged-turn-24',
+      );
+      expect(pending24).toMatchObject({
+        content: 'Current turn 24 parked steer',
+        steering: true,
+        turnIndex: 24,
+      });
+
+      // 2. Turn 24's pending steer fails on the next /status poll while turns 0..4 are still unloaded:
+      statusPendingSteers = [];
+      statusFailedSteers = [failOld, failMid, failCur];
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(120);
+      });
+
+      await waitFor(() => {
+        const curBubble = hookState!.messages.find(
+          (m): m is UserMessage => m.role === 'user' && m.requestKey === 'rk-paged-turn-24',
+        );
+        expect(curBubble).toMatchObject({
+          steering: false,
+          queueRefused: true,
+          queueError: 'Turn 24 attachment expired (410).',
+          turnIndex: 24,
+        });
+      });
+
+      // Turn 2's failed steer is STILL not appended while turns 0..4 are unloaded
+      expect(
+        hookState!.messages.filter(
+          (m) => m.role === 'user' && (m as UserMessage).requestKey === 'rk-paged-turn-2',
+        ),
+      ).toHaveLength(0);
+
+      // 3. Now load the older history page (turns 0..4) via olderHistory.load():
+      await act(async () => {
+        hookState!.olderHistory.load();
+      });
+
+      await waitFor(() => {
+        expect(hookState!.olderHistory.status).toBe('end');
+      });
+
+      // Turn 2's failed steer now appears EXACTLY ONCE, positioned at turn 2 (after history-assistant-2, before history-user-3)!
+      const msgsAfterOlder = hookState!.messages;
+      const matchesTurn2 = msgsAfterOlder.filter(
+        (m) =>
+          m.role === 'user' &&
+          ((m as UserMessage).requestKey === 'rk-paged-turn-2' ||
+            m.content === 'Old failed steer at turn 2'),
+      );
+      expect(matchesTurn2).toHaveLength(1);
+      expect(matchesTurn2[0]).toMatchObject({
+        id: 'history-steering-failed-2-rk-paged-turn-2',
+        content: 'Old failed steer at turn 2',
+        queueRefused: true,
+        queueError: 'Turn 2 attachment expired (410).',
+        turnIndex: 2,
+        requestKey: 'rk-paged-turn-2',
+      });
+
+      const idxAss2 = msgsAfterOlder.findIndex((m) => m.id === 'history-assistant-2');
+      const idxFail2 = msgsAfterOlder.findIndex(
+        (m) => m.id === 'history-steering-failed-2-rk-paged-turn-2',
+      );
+      const idxUser3 = msgsAfterOlder.findIndex((m) => m.id === 'history-user-3');
+      expect(idxAss2).toBeGreaterThan(-1);
+      expect(idxFail2).toBe(idxAss2 + 1);
+      expect(idxUser3).toBe(idxFail2 + 1);
+
+      // Turn 10 and Turn 24 failed steers also appear exactly once in their respective positions
+      expect(
+        msgsAfterOlder.filter(
+          (m) => m.role === 'user' && (m as UserMessage).requestKey === 'rk-paged-turn-10',
+        ),
+      ).toHaveLength(1);
+      expect(
+        msgsAfterOlder.filter(
+          (m) => m.role === 'user' && (m as UserMessage).requestKey === 'rk-paged-turn-24',
+        ),
+      ).toHaveLength(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

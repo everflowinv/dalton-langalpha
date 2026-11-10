@@ -5200,3 +5200,113 @@ class TestChatLargeUploadRealInfra:
                 sandbox=docker_ptc_sandbox,
                 layout=layout,
             )
+
+            # (f) Accepted message / live steer materialize_chat_uploads (both direct and chunked):
+            #     pause after bytes are read into staging (WSFILES_TEST_PAUSE_AFTER_LOCK_OPEN),
+            #     complete delete_workspace_files while paused, resume transfer -> raises HTTP 410
+            #     without recreating the file or returning a saved-file reminder!
+            for mat_mode in ("direct", "chunked"):
+                up_m, key_m, _ = await _upload_streamed_file_via_http(
+                    chat_upload_infra.client,
+                    user_id=user["user_id"],
+                    workspace_id=workspace_id,
+                    filename=f"mat_revoke_{mat_mode}.bin",
+                    mime_type="application/octet-stream",
+                    total_bytes=1 * _MIB,
+                    seed_tag=f"mat-revoke-{mat_mode}".encode("utf-8"),
+                    tracked_keys=chat_upload_infra.tracked_keys,
+                    tracked_multiparts=chat_upload_infra.tracked_multiparts,
+                )
+                ctx_m = {
+                    "type": "chat_upload",
+                    "upload_id": up_m["upload_id"],
+                    "name": f"mat_revoke_{mat_mode}.bin",
+                    "mime_type": "application/octet-stream",
+                    "size": 1 * _MIB,
+                }
+                claim_m = f"req:mat-revoke:{mat_mode}:{up_m['upload_id']}"
+                await validate_and_claim_request_attachments(
+                    [ctx_m],
+                    user_id=user["user_id"],
+                    workspace_id=workspace_id,
+                    claim_key=claim_m,
+                )
+                await confirm_request_chat_uploads(
+                    [ctx_m],
+                    user_id=user["user_id"],
+                    workspace_id=workspace_id,
+                    claim_key=claim_m,
+                )
+                row_m = await chat_uploads_db.get_upload(up_m["upload_id"])
+                assert row_m is not None
+                rel_m = build_sandbox_upload_rel_path(row_m)
+                abs_m = f"{layout.workspace}/{rel_m}"
+                m_ready = f"/tmp/mat_rev_{mat_mode}_{uid_tag}_ready"
+                m_go = f"/tmp/mat_rev_{mat_mode}_{uid_tag}_go"
+                await docker_ptc_sandbox.execute_bash_command(
+                    f"rm -f {shlex.quote(m_ready)} {shlex.quote(m_go)} {shlex.quote(abs_m)}"
+                )
+
+                @asynccontextmanager
+                async def _noop_path_lock(_p: str):
+                    yield
+
+                async def _rt_inject_pause_env(fn, *args, **kwargs):
+                    if args and isinstance(args[0], str) and (
+                        "wsfiles_transfer_runtime.py" in args[0]
+                        or "WSFILES_TEST_PAUSE_AFTER_LOCK_OPEN" in args[0]
+                    ):
+                        patched_cmd = (
+                            f"WSFILES_TEST_PAUSE_AFTER_LOCK_OPEN={shlex.quote(f'{m_ready}:{m_go}')} "
+                            + args[0]
+                        )
+                        return await orig_rt_call(fn, patched_cmd, *args[1:], **kwargs)
+                    return await orig_rt_call(fn, *args, **kwargs)
+
+                orig_direct_flag = getattr(docker_ptc_sandbox.provider, "direct_blob_transfer", True)
+                docker_ptc_sandbox.provider.direct_blob_transfer = mat_mode == "direct"
+                try:
+                    with (
+                        patch.object(docker_ptc_sandbox, "path_write_lock", side_effect=_noop_path_lock),
+                        patch.object(docker_ptc_sandbox, "_runtime_call", side_effect=_rt_inject_pause_env),
+                    ):
+                        mat_task = asyncio.create_task(
+                            materialize_chat_uploads(
+                                [ctx_m],
+                                sandbox=docker_ptc_sandbox,
+                                user_id=user["user_id"],
+                                workspace_id=workspace_id,
+                                project=project,
+                            )
+                        )
+                        for _ in range(100):
+                            chk_m = await docker_ptc_sandbox.execute_bash_command(
+                                f"test -f {shlex.quote(m_ready)} && cat {shlex.quote(m_ready)}"
+                            )
+                            if (chk_m.get("stdout") or "").strip():
+                                break
+                            await asyncio.sleep(0.05)
+                        assert (chk_m.get("stdout") or "").strip(), f"{mat_mode} did not reach lock-open pause"
+
+                        del_m = await ws_crud.delete_workspace_files(
+                            workspace_id=workspace_id,
+                            x_user_id=user["user_id"],
+                            body=ws_crud.DeleteFilesRequest(paths=[rel_m]),
+                        )
+                        assert del_m == {"deleted": [rel_m], "errors": []}
+
+                        await docker_ptc_sandbox.execute_bash_command(f"touch {shlex.quote(m_go)}")
+                        with pytest.raises(HTTPException) as exc_m:
+                            await mat_task
+                        assert exc_m.value.status_code == 410
+
+                    m_probe = await docker_ptc_sandbox.execute_bash_command(
+                        f"test ! -e {shlex.quote(abs_m)} && echo absent"
+                    )
+                    assert "absent" in (m_probe.get("stdout") or "")
+                    assert storage.object_size(key_m) is None
+                finally:
+                    docker_ptc_sandbox.provider.direct_blob_transfer = orig_direct_flag
+                    await docker_ptc_sandbox.execute_bash_command(
+                        f"rm -f {shlex.quote(m_ready)} {shlex.quote(m_go)}"
+                    )

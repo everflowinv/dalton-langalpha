@@ -12,6 +12,8 @@ import {
 import { deliveredNoticeRow } from '../wakeupEvents';
 import { reportRow, senderProvenance } from '../provenance';
 import { readArtifactCommentsShown } from '../../components/artifactComments/artifactCommentSend';
+import { opensTurn } from '../../components/messageList/messagePredicates';
+import { projectTurns } from '../../components/messageList/turnProjection';
 // DALTON-HOOK(chat-large-upload): normalize attachment metadata on delivered steers
 import { mergeAcceptedAttachments, normalizeAttachments } from '../../hooks/utils/messageHelpers';
 
@@ -295,10 +297,51 @@ export function failedSteerRow(
   };
 }
 
+export interface FoldFailedSteerOptions {
+  /** Oldest turn index currently loaded in the paged transcript window, if known. */
+  minLoadedTurn?: number | null;
+  /** Mark newly inserted durable rows as history bubbles so reloads/pagination reconcile cleanly. */
+  isHistory?: boolean;
+  /** Keep the history/live boundary ref aligned when inserting a history bubble before it. */
+  newMessagesStartIndexRef?: { current: number };
+}
+
+function matchesFailedSteerBubble(
+  m: ChatMessage,
+  requestKey: string | undefined,
+  jobId: string | undefined,
+  fallbackId: string,
+): boolean {
+  const id = typeof m.id === 'string' ? m.id : '';
+  if (id === fallbackId) return true;
+  if (requestKey) {
+    if (m.role === 'user' && (m as { requestKey?: string }).requestKey === requestKey) {
+      return true;
+    }
+    if (
+      id === `pending-steer-${requestKey}` ||
+      id === `failed-steer-${requestKey}` ||
+      (id.startsWith('history-steering-failed-') && id.endsWith(`-${requestKey}`))
+    ) {
+      return true;
+    }
+  }
+  if (jobId) {
+    if (
+      id === `failed-steer-${jobId}` ||
+      (id.startsWith('history-steering-failed-') && id.endsWith(`-${jobId}`))
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function foldFailedSteer(
   prev: ChatMessage[],
   event: Record<string, unknown>,
   turnIndex: number | undefined,
+  options?: FoldFailedSteerOptions,
 ): ChatMessage[] {
   const requestKey = typeof event.request_key === 'string' && event.request_key
     ? event.request_key
@@ -306,15 +349,17 @@ export function foldFailedSteer(
   const jobId = typeof event.job_id === 'string' && event.job_id
     ? event.job_id
     : undefined;
-  const fallbackId = `failed-steer-${requestKey || jobId || String(turnIndex ?? 0)}`;
-  const row = failedSteerRow(event, fallbackId, turnIndex);
-  if (!row) return prev;
+  const keyOrJob = requestKey || jobId || String(event.timestamp ?? turnIndex ?? 0);
+  const fallbackId = options?.isHistory && turnIndex !== undefined
+    ? `history-steering-failed-${turnIndex}-${keyOrJob}`
+    : `failed-steer-${requestKey || jobId || String(turnIndex ?? 0)}`;
+  const baseRow = failedSteerRow(event, fallbackId, turnIndex);
+  if (!baseRow) return prev;
+  const row: UserMessage = options?.isHistory ? { ...baseRow, isHistory: true } : baseRow;
 
   const matched: number[] = [];
   prev.forEach((m, i) => {
-    if (m.id === fallbackId) {
-      matched.push(i);
-    } else if (requestKey && m.role === 'user' && m.requestKey === requestKey) {
+    if (matchesFailedSteerBubble(m, requestKey, jobId, fallbackId)) {
       matched.push(i);
     }
   });
@@ -351,6 +396,7 @@ export function foldFailedSteer(
         queueRefused: true,
         queueError: row.queueError,
         ...(turnIndex !== undefined ? { turnIndex } : {}),
+        ...(requestKey && !existing.requestKey ? { requestKey } : {}),
         ...(row.artifactComments ? { artifactComments: row.artifactComments } : {}),
         ...(mergedAtts ? { attachments: mergedAtts } : {}),
       };
@@ -358,5 +404,47 @@ export function foldFailedSteer(
     });
   }
 
-  return [...prev, row];
+  const projected = projectTurns(prev);
+  let minProjectedTurn: number | null = null;
+  for (const p of projected) {
+    if (p.turnIndex !== null && (opensTurn(p.message) || p.message.role === 'assistant')) {
+      minProjectedTurn = minProjectedTurn === null ? p.turnIndex : Math.min(minProjectedTurn, p.turnIndex);
+    }
+  }
+  const effectiveMinTurn = typeof options?.minLoadedTurn === 'number'
+    ? options.minLoadedTurn
+    : minProjectedTurn;
+
+  if (turnIndex !== undefined && effectiveMinTurn !== null && turnIndex < effectiveMinTurn) {
+    return prev;
+  }
+
+  let insertAt = prev.length;
+  if (turnIndex !== undefined && projected.length > 0) {
+    let lastInTurn = -1;
+    let firstAfterTurn = -1;
+    for (const p of projected) {
+      if (p.turnIndex === null) continue;
+      if (p.turnIndex === turnIndex) {
+        lastInTurn = p.rawIndex;
+      } else if (p.turnIndex > turnIndex && firstAfterTurn === -1) {
+        firstAfterTurn = p.rawIndex;
+      }
+    }
+    if (lastInTurn !== -1) {
+      insertAt = lastInTurn + 1;
+    } else if (firstAfterTurn !== -1) {
+      insertAt = firstAfterTurn;
+    }
+  }
+
+  if (
+    options?.isHistory &&
+    options?.newMessagesStartIndexRef &&
+    insertAt <= options.newMessagesStartIndexRef.current
+  ) {
+    options.newMessagesStartIndexRef.current += 1;
+  }
+
+  return [...prev.slice(0, insertAt), row, ...prev.slice(insertAt)];
 }

@@ -1244,7 +1244,11 @@ async def _validate_attachment_batch(
                 status_code=409,
                 detail="Attachment is still uploading. Wait for it to finish before sending.",
             )
-        if state != "ready" or row.get("cleaned_at") is not None:
+        if (
+            state != "ready"
+            or row.get("cleaned_at") is not None
+            or str(row.get("error") or "") == "explicit_delete_pending"
+        ):
             raise HTTPException(
                 status_code=410,
                 detail="Attachment has expired or was removed",
@@ -2275,6 +2279,11 @@ async def _materialize_via_chunked_stream(
     if verify_retained_workspace_id and not lock_path:
         lock_path = f"{parent_dir}/.wsfiles-tlock-{uid_hex}"
 
+    if verify_retained_workspace_id and not await db.is_upload_retained_for_recovery(
+        upload_id, verify_retained_workspace_id
+    ):
+        return False
+
     # Fast-path idempotency check if target already holds the exact bytes.
     if await _probe_sandbox_file_matches(
         sandbox,
@@ -2282,6 +2291,10 @@ async def _materialize_via_chunked_stream(
         expected_size=expected_size,
         expected_sha256=expected_sha256,
     ):
+        if verify_retained_workspace_id and not await db.is_upload_retained_for_recovery(
+            upload_id, verify_retained_workspace_id
+        ):
+            return False
         return True
 
     prep = await sandbox._runtime_call(
@@ -2292,6 +2305,16 @@ async def _materialize_via_chunked_stream(
     )
     if getattr(prep, "exit_code", 1) != 0:
         raise RuntimeError("Failed to prepare upload directory in sandbox")
+
+    if verify_retained_workspace_id and not grant_path:
+        grant_path, lock_path = await _create_restore_grant(
+            sandbox, abs_target_path, upload_id, attempt_id
+        )
+        if not await db.is_upload_retained_for_recovery(
+            upload_id, verify_retained_workspace_id
+        ):
+            await _cleanup_restore_grant(sandbox, grant_path, lock_path)
+            return False
 
     def _open_iterator():
         return storage.iter_stored_object_chunks(
@@ -2320,9 +2343,6 @@ async def _materialize_via_chunked_stream(
                 raise RuntimeError("Failed to append streamed chunk in sandbox")
 
         if verify_retained_workspace_id:
-            grant_path, lock_path = await _create_restore_grant(
-                sandbox, abs_target_path, upload_id, attempt_id
-            )
             if not await db.is_upload_retained_for_recovery(
                 upload_id, verify_retained_workspace_id
             ):
@@ -2358,9 +2378,11 @@ async def _materialize_via_chunked_stream(
         )
         exit_code = getattr(fin_res, "exit_code", 1)
         if exit_code == 5:
+            await _cleanup_restore_grant(sandbox, grant_path, lock_path)
             return False
         if exit_code != 0:
             raise RuntimeError("Streamed sandbox upload verification failed")
+        await _cleanup_restore_grant(sandbox, grant_path, lock_path)
         return True
     except Exception:
         try:
@@ -2520,6 +2542,15 @@ async def materialize_chat_uploads(
         is_existing_colleague_thread=is_existing_colleague_thread,
     )
 
+    for row in verified_rows:
+        if not await db.is_upload_retained_for_recovery(
+            str(row["upload_id"]), str(row["workspace_id"])
+        ):
+            raise HTTPException(
+                status_code=410,
+                detail="Attachment has expired or was removed",
+            )
+
     eff_project = project if project is not None else current_project()
     notes: list[str] = []
 
@@ -2563,6 +2594,13 @@ async def materialize_chat_uploads(
         missing_or_mismatched: list[tuple[dict[str, Any], str, str, int]] = []
         for abs_path in sorted(unique_by_abs):
             t_row, t_rel, t_abs, t_size = unique_by_abs[abs_path]
+            t_uid = str(t_row["upload_id"])
+            t_ws = str(t_row["workspace_id"])
+            if not await db.is_upload_retained_for_recovery(t_uid, t_ws):
+                raise HTTPException(
+                    status_code=410,
+                    detail="Attachment has expired or was removed",
+                )
             exp_sha = str(
                 t_row.get("actual_sha256") or t_row.get("expected_sha256") or ""
             )
@@ -2573,6 +2611,11 @@ async def materialize_chat_uploads(
                 expected_sha256=exp_sha,
             ):
                 missing_or_mismatched.append((t_row, t_rel, t_abs, t_size))
+            elif not await db.is_upload_retained_for_recovery(t_uid, t_ws):
+                raise HTTPException(
+                    status_code=410,
+                    detail="Attachment has expired or was removed",
+                )
 
         if missing_or_mismatched:
             total_needed = sum(t_size for _, _, _, t_size in missing_or_mismatched)
@@ -2591,14 +2634,20 @@ async def materialize_chat_uploads(
                     workspace_id,
                     is_existing_colleague_thread=is_existing_colleague_thread,
                 )
-                await _place_row_in_sandbox(
+                placed_ok = await _place_row_in_sandbox(
                     sandbox,
                     t_row,
                     layout=layout,
                     abs_path=t_abs,
                     rel_path=t_rel,
                     can_direct=can_direct,
+                    verify_retained=True,
                 )
+                if not placed_ok:
+                    raise HTTPException(
+                        status_code=410,
+                        detail="Attachment has expired or was removed",
+                    )
 
     for row, rel_path, _, size_bytes in ordered_targets:
         mime = str(row.get("mime_type") or "")

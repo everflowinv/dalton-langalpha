@@ -873,9 +873,24 @@ export function handleHistorySteeringReturned({
   const userMessage: MessageRecord = { ...row, isHistory: true };
 
   setMessages((prev: MessageRecord[]) => {
+    const rawJobId = typeof event.job_id === 'string' && event.job_id ? event.job_id : null;
     const lost = prev.flatMap((m, i) => {
-      if (m.id === rowId) return [i];
-      if (reqKey && m.role === 'user' && (m as { requestKey?: string }).requestKey === reqKey) {
+      const id = typeof m.id === 'string' ? m.id : '';
+      if (id === rowId) return [i];
+      if (
+        reqKey &&
+        ((m.role === 'user' && (m as { requestKey?: string }).requestKey === reqKey) ||
+          id === `failed-steer-${reqKey}` ||
+          id === `pending-steer-${reqKey}` ||
+          (id.startsWith('history-steering-failed-') && id.endsWith(`-${reqKey}`)))
+      ) {
+        return [i];
+      }
+      if (
+        rawJobId &&
+        (id === `failed-steer-${rawJobId}` ||
+          (id.startsWith('history-steering-failed-') && id.endsWith(`-${rawJobId}`)))
+      ) {
         return [i];
       }
       return [];
