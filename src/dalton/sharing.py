@@ -20,6 +20,7 @@ from psycopg.rows import dict_row
 
 from src.dalton.access_tiers import classify_owner_tier, get_user_tier
 from src.dalton.auth import _verified_token_identity
+from src.dalton.company_identity import is_company_system_user
 from src.dalton.invites import (
     get_team_member_emails,
     is_invite_pm,
@@ -75,6 +76,8 @@ def _classify_owner_row_tier(owner_id: str | None, owner_email: Any) -> str:
     uid = str(owner_id or "").strip()
     if not uid:
         return "unknown"
+    if is_company_system_user(uid):
+        return "company"
     try:
         if is_invite_pm(uid):
             return "admin"
@@ -124,6 +127,8 @@ def can_edit_workspace_sharing(
     ):
         return False
     owner_id = str(workspace.get("user_id") or "").strip()
+    if is_company_system_user(uid) or is_company_system_user(owner_id):
+        return False
     if owner_id and uid == owner_id:
         return True
     pm_ids = get_dalton_settings().pm_user_ids
@@ -861,10 +866,14 @@ async def require_workspace_access(
     caller_tier = await get_user_tier(uid)
     if caller_tier == "external":
         raise HTTPException(status_code=404, detail="Workspace not found")
+    if caller_tier == "company":
+        raise HTTPException(status_code=403, detail="Forbidden")
 
     owner_tier = await classify_owner_tier(owner_id)
     if owner_tier == "unknown":
         raise HTTPException(status_code=404, detail="Workspace not found")
+    if owner_tier == "company":
+        raise HTTPException(status_code=403, detail="Forbidden")
     if owner_tier == "external":
         if (
             is_home_row(ws)
@@ -2058,7 +2067,7 @@ async def list_team_workspaces(current_user_id: str) -> list[dict[str, Any]]:
     uid = await require_team_reader(current_user_id)
     # Fully isolated environment: external members see no colleague workspace.
     caller_tier = await get_user_tier(uid)
-    if caller_tier == "external":
+    if caller_tier in ("external", "company"):
         return []
     allowed_emails = sorted(await get_team_member_emails())
 
@@ -2156,13 +2165,14 @@ async def list_team_workspaces(current_user_id: str) -> list[dict[str, Any]]:
         if owner_tier is None:
             owner_tier = _classify_owner_row_tier(owner_uid, row.get("owner_email"))
             owner_tiers[owner_uid] = owner_tier
-        if owner_tier == "unknown":
-            logger.warning(
-                "Skipping workspace row with unresolvable owner tier "
-                "(owner_user_id=%s, workspace_id=%s)",
-                owner_uid,
-                row.get("workspace_id"),
-            )
+        if owner_tier in ("unknown", "company"):
+            if owner_tier == "unknown":
+                logger.warning(
+                    "Skipping workspace row with unresolvable owner tier "
+                    "(owner_user_id=%s, workspace_id=%s)",
+                    owner_uid,
+                    row.get("workspace_id"),
+                )
             continue
         external_owned = owner_tier == "external"
         raw_web_access = row.get("web_access")
@@ -2243,7 +2253,7 @@ async def list_colleague_cos_workspaces(
 
     # Fully isolated environment: external members see no colleague workspace.
     caller_tier = await get_user_tier(uid)
-    if caller_tier == "external":
+    if caller_tier in ("external", "company"):
         return []
     allowed_emails = sorted(await get_team_member_emails())
 
@@ -2342,13 +2352,14 @@ async def list_colleague_cos_workspaces(
         if owner_tier is None:
             owner_tier = _classify_owner_row_tier(owner_uid, row.get("owner_email"))
             owner_tiers[owner_uid] = owner_tier
-        if owner_tier == "unknown":
-            logger.warning(
-                "Skipping colleague CoS workspace row with unresolvable owner "
-                "tier (owner_user_id=%s, workspace_id=%s)",
-                owner_uid,
-                row.get("workspace_id"),
-            )
+        if owner_tier in ("unknown", "company"):
+            if owner_tier == "unknown":
+                logger.warning(
+                    "Skipping colleague CoS workspace row with unresolvable owner "
+                    "tier (owner_user_id=%s, workspace_id=%s)",
+                    owner_uid,
+                    row.get("workspace_id"),
+                )
             continue
         external_owned = owner_tier == "external"
         if external_owned:

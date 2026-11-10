@@ -1285,9 +1285,25 @@ async def put_dalton_automation_endpoint(
     _require_dalton_enabled()
     from src.dalton.auth import resolve_caller_home_workspace_id
     from src.dalton.autonomy.schedule import AutomationLockError
+    from src.dalton.company_identity import is_company_system_user
     from src.dalton.tools.director_tools import schedule_dalton_automation_helper
 
+    raw_body_dict = body.model_dump(exclude_none=True)
     spec = body.entry or body.spec or body.model_dump(exclude={"workspace_id", "entry", "spec"}, exclude_none=True)
+    for payload in (raw_body_dict, spec if isinstance(spec, dict) else {}):
+        if str(payload.get("scope") or "").strip().lower() == "company":
+            raise HTTPException(
+                status_code=403,
+                detail="Company automations cannot be created or transferred via this endpoint",
+            )
+        if "user_id" in payload and (
+            is_company_system_user(payload.get("user_id"))
+            or str(payload.get("user_id") or "").strip() not in ("", user_id)
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Cannot override automation owner user_id",
+            )
     raw_ws = body.workspace_id if body.workspace_id is not None else (spec or {}).get("workspace_id")
     ws_str = str(raw_ws or "").strip()
     if not ws_str or ws_str.lower() == "home":

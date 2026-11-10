@@ -221,6 +221,8 @@ async def test_automation_naming_templates_and_schedule_helper(monkeypatch):
         max_failures: int = 3,
         delivery_config: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
+        scope: str | None = None,
+        created_by: str | None = None,
         conn=None,
     ):
         row = {
@@ -236,6 +238,8 @@ async def test_automation_naming_templates_and_schedule_helper(monkeypatch):
             "workspace_id": workspace_id,
             "description": description,
             "metadata": metadata or {},
+            "scope": scope,
+            "created_by": created_by or user_id,
         }
         store.append(row)
         return row
@@ -253,6 +257,7 @@ async def test_automation_naming_templates_and_schedule_helper(monkeypatch):
         next_run_at: datetime | None = None,
         metadata: dict[str, Any] | None = None,
         status: str | None = None,
+        scope: str | None = None,
     ):
         for r in store:
             if r["automation_id"] == automation_id:
@@ -272,6 +277,8 @@ async def test_automation_naming_templates_and_schedule_helper(monkeypatch):
                     r["metadata"] = metadata
                 if status is not None:
                     r["status"] = status
+                if scope is not None:
+                    r["scope"] = scope
                 return r
         return None
 
