@@ -1478,6 +1478,10 @@ async def preflight_check(
         )
 
 
+PREFLIGHT_RETRY_NOTIFY_TIMEOUT_S = 30.0
+PREFLIGHT_RETRY_NOTIFY_MAX_DURATION_S = 26.0
+
+
 async def decide(
     automation: dict[str, Any],
     execution_id: str,
@@ -1494,8 +1498,11 @@ async def decide(
             from src.dalton.notify.dispatch import retry_failed_notify_deliveries
 
             await asyncio.wait_for(
-                retry_failed_notify_deliveries(limit=5, max_duration_s=30.0),
-                timeout=30.0,
+                retry_failed_notify_deliveries(
+                    limit=5,
+                    max_duration_s=PREFLIGHT_RETRY_NOTIFY_MAX_DURATION_S,
+                ),
+                timeout=PREFLIGHT_RETRY_NOTIFY_TIMEOUT_S,
             )
         except Exception:
             pass
