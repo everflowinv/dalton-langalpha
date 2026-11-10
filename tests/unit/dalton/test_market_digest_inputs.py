@@ -1749,3 +1749,358 @@ def test_digest_output_file_must_name_the_expected_file(tmp_path: Path) -> None:
     assert via_alias["preparation_status"] == "ready"
     assert mod.read_inputs(linked.state, "AM", date=DATE, now=NOW)["emails"] == [linked_email]
     assert "LINKED-DIR-BODY" in (linked.state / "batches" / "AM" / DATE / "emails.json").read_text(encoding="utf-8")
+
+
+def test_fresh_tmtb_without_durable_outcome_is_unconfirmed(tmp_path: Path) -> None:
+    layout = _layout(tmp_path)
+    runner = RecordingRunner()
+    docs = [{"doc_id": "d1", "text": "UNCONFIRMED-DOC"}]
+    pending = [{"doc_id": "p1", "text": "UNCONFIRMED-PENDING"}]
+    emails = [_mail(body="UNCONFIRMED-MAIL")]
+
+    def digest(_argv: list[str]) -> mod.ChildResult:
+        _write_json(layout.digest_path(), _digest_document(emails))
+        return _child(_digest_stdout(output_file=str(layout.digest_path())))
+
+    def tmtb(_argv: list[str]) -> mod.ChildResult:
+        _write_json(layout.tmtb_path(), _tmtb_document(docs, pending))
+        return _child(
+            _tmtb_stdout(
+                status="new_docs",
+                output_file=str(layout.tmtb_path()),
+                count=1,
+                new_count=1,
+                pending_count=1,
+            )
+        )
+
+    runner.digest = digest
+    runner.tmtb = tmtb
+    with patch.object(mod, "_capture_tmtb", side_effect=RuntimeError("capture_interrupted")):
+        with pytest.raises(RuntimeError, match="capture_interrupted"):
+            _prepare(layout, runner)
+    stored = json.loads(layout.attempt_path().read_text(encoding="utf-8"))
+    assert stored["tmtb"]["claimed"] is True
+    assert "record" not in stored["tmtb"]
+    recovered = _prepare(layout, runner)
+    saved = mod.read_inputs(layout.state, "AM", date=DATE, now=NOW)
+    again = _prepare(layout, runner)
+    assert recovered["preparation_status"] == "ready_degraded"
+    assert recovered["usable"] is True
+    assert recovered["tmtb"]["status"] == "unconfirmed"
+    assert recovered["tmtb"]["degraded"] is True
+    assert recovered["tmtb"]["reason"] == "unconfirmed"
+    assert recovered["tmtb"]["count"] == 1
+    assert recovered["tmtb"]["pending_snippets_count"] == 1
+    assert recovered["tmtb"]["new_count"] is None
+    assert recovered["tmtb"]["quota_hit"] is False
+    assert recovered["tmtb"]["failure_count"] == 0
+    assert recovered["tmtb"]["summary_only"] is False
+    assert saved["tmtb_docs"] == docs
+    assert saved["pending_snippets"] == pending
+    assert saved["emails"] == emails
+    assert again["reused"] is True
+    assert again["tmtb_invoked"] is False
+    assert _kinds(runner) == ["digest", "tmtb"]
+
+
+def test_invalid_or_truncated_tmtb_stdout_is_unconfirmed(tmp_path: Path) -> None:
+    docs = [{"doc_id": "d1", "text": "KEPT-DOC"}]
+    pending = [{"doc_id": "p1", "text": "KEPT-PENDING"}]
+    quota_stdout = _tmtb_stdout(
+        status="new_docs",
+        ok=False,
+        quota_hit=True,
+        count=1,
+        new_count=1,
+        pending_count=1,
+        failures=[{"error": "STDOUT-QUOTA-SECRET"}],
+    )
+    variants = {
+        "invalid": _child("not-json STDOUT-QUOTA-SECRET", returncode=1),
+        "truncated": _child(quota_stdout, truncated=True),
+    }
+    for name, child in variants.items():
+        layout = _layout(tmp_path / name)
+        runner = RecordingRunner()
+        emails = [_mail(body=f"MAIL-{name}")]
+
+        def digest(_argv: list[str], bound: Layout = layout, bound_emails: list[dict[str, Any]] = emails) -> mod.ChildResult:
+            _write_json(bound.digest_path(), _digest_document(bound_emails))
+            return _child(_digest_stdout(output_file=str(bound.digest_path())))
+
+        def tmtb(_argv: list[str], bound: Layout = layout, bound_child: mod.ChildResult = child) -> mod.ChildResult:
+            _write_json(bound.tmtb_path(), _tmtb_document(docs, pending))
+            return bound_child
+
+        runner.digest = digest
+        runner.tmtb = tmtb
+        first = _prepare(layout, runner)
+        saved = mod.read_inputs(layout.state, "AM", date=DATE, now=NOW)
+        again = _prepare(layout, runner)
+        assert first["preparation_status"] == "ready_degraded"
+        assert first["usable"] is True
+        assert first["tmtb"]["status"] == "unconfirmed"
+        assert first["tmtb"]["degraded"] is True
+        assert first["tmtb"]["reason"] == "unconfirmed"
+        assert first["tmtb"]["count"] == 1
+        assert first["tmtb"]["pending_snippets_count"] == 1
+        assert first["tmtb"]["new_count"] is None
+        assert first["tmtb"]["quota_hit"] is False
+        assert first["tmtb"]["failure_count"] == 0
+        assert first["tmtb"]["summary_only"] is False
+        assert saved["tmtb_docs"] == docs
+        assert saved["pending_snippets"] == pending
+        assert "STDOUT-QUOTA-SECRET" not in json.dumps(first)
+        assert "STDOUT-QUOTA-SECRET" not in _tree_text(layout.state)
+        assert again["reused"] is True
+        assert again["tmtb"]["status"] == "unconfirmed"
+        assert again["tmtb"]["quota_hit"] is False
+        assert again["tmtb"]["summary_only"] is False
+        assert again["tmtb_invoked"] is False
+        assert _kinds(runner) == ["digest", "tmtb"]
+
+
+def test_unavailable_stdout_without_batch_identity_is_not_adopted(tmp_path: Path) -> None:
+    shapes: dict[str, dict[str, Any]] = {
+        "auth": {
+            "ok": False,
+            "status": "alphaengine_unavailable",
+            "auth_status": "app_not_running",
+            "hint": "AUTH-HINT-DO-NOT-COPY",
+        },
+        "search": {
+            "ok": False,
+            "status": "alphaengine_unavailable",
+            "auth_status": "search_failed",
+            "reason": "SEARCH-FAILED-SECRET",
+            "hint": "SEARCH-HINT-DO-NOT-COPY",
+        },
+        "date_conflict": {
+            "ok": False,
+            "status": "alphaengine_unavailable",
+            "date": "2026-01-01",
+            "auth_status": "app_not_running",
+            "hint": "DATE-HINT-DO-NOT-COPY",
+        },
+        "period_conflict": {
+            "ok": False,
+            "status": "alphaengine_unavailable",
+            "period": "PM",
+            "auth_status": "search_failed",
+            "reason": "PERIOD-REASON-SECRET",
+            "hint": "PERIOD-HINT-DO-NOT-COPY",
+        },
+    }
+    for name, payload in shapes.items():
+        layout = _layout(tmp_path / name)
+        runner = RecordingRunner()
+        secret = f"SOURCE-DOC-{name}"
+        emails = [_mail(body=f"MAIL-{name}")]
+
+        def digest(_argv: list[str], bound: Layout = layout, bound_emails: list[dict[str, Any]] = emails) -> mod.ChildResult:
+            _write_json(bound.digest_path(), _digest_document(bound_emails))
+            return _child(_digest_stdout(output_file=str(bound.digest_path())))
+
+        def tmtb(
+            _argv: list[str],
+            bound: Layout = layout,
+            bound_payload: dict[str, Any] = payload,
+            bound_secret: str = secret,
+        ) -> mod.ChildResult:
+            _write_json(bound.tmtb_path(), _tmtb_document([{"doc_id": "d1", "text": bound_secret}]))
+            stdout = dict(bound_payload)
+            stdout["output_file"] = str(bound.tmtb_path())
+            return _child(json.dumps(stdout), returncode=1)
+
+        runner.digest = digest
+        runner.tmtb = tmtb
+        first = _prepare(layout, runner)
+        second = _prepare(layout, runner)
+        saved = mod.read_inputs(layout.state, "AM", date=DATE, now=NOW)
+        public = json.dumps(first)
+        state_text = _tree_text(layout.state)
+        assert first["preparation_status"] == "ready_degraded"
+        assert first["tmtb"]["degraded"] is True
+        assert first["tmtb"]["count"] == 0
+        assert first["tmtb"]["pending_snippets_count"] == 0
+        assert first["tmtb"]["summary_only"] is False
+        assert saved["tmtb_docs"] == []
+        assert saved["emails"] == emails
+        assert secret not in state_text
+        assert secret in layout.tmtb_path().read_text(encoding="utf-8")
+        assert payload["hint"] not in public
+        assert payload["hint"] not in state_text
+        leaked_reason = payload.get("reason")
+        if isinstance(leaked_reason, str):
+            assert leaked_reason not in public
+            assert leaked_reason not in state_text
+        assert payload["auth_status"] not in public
+        if name in {"auth", "search"}:
+            assert first["tmtb"]["status"] == "alphaengine_unavailable"
+            assert first["tmtb"]["reason"] == "alphaengine_unavailable"
+        else:
+            assert first["tmtb"]["status"] == "tmtb_identity_conflict"
+            assert first["tmtb"]["reason"] == "tmtb_identity_conflict"
+            assert first["reason"] == "tmtb_identity_conflict"
+        assert second["reused"] is True
+        assert _kinds(runner) == ["digest", "tmtb"]
+
+
+def test_read_max_bytes_matches_emitted_response(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    layout = _layout(tmp_path)
+    runner = RecordingRunner()
+    _successful_pair(layout, runner)
+    prepared = _prepare(layout, runner)
+    payload = mod.read_inputs(layout.state, "AM", date=DATE, now=NOW)
+    mod._emit(payload)
+    emitted = capsys.readouterr().out
+    assert payload["ok"] is True
+    assert payload["bytes"] == len(emitted.encode("utf-8"))
+    assert json.loads(emitted)["bytes"] == payload["bytes"]
+    exact = mod.read_inputs(layout.state, "AM", date=DATE, now=NOW, max_bytes=payload["bytes"])
+    assert exact["ok"] is True
+    assert exact["bytes"] == payload["bytes"]
+    assert exact["emails"] == payload["emails"]
+    code = mod.main(
+        ["read", "--period", "AM", "--state-root", str(layout.state), "--date", DATE, "--max-bytes", str(payload["bytes"])],
+        now=NOW,
+    )
+    cli_out = capsys.readouterr().out
+    assert code == 0
+    assert len(cli_out.encode("utf-8")) == payload["bytes"]
+    assert json.loads(cli_out)["bytes"] == payload["bytes"]
+    short = mod.read_inputs(layout.state, "AM", date=DATE, now=NOW, max_bytes=payload["bytes"] - 1)
+    assert short["ok"] is False
+    assert short["preparation_status"] == "content_exceeds_bound"
+    assert short["emails"] is None
+    assert short["tmtb_docs"] is None
+    assert short["pending_snippets"] is None
+    assert short["truncated"] is True
+    assert short["hashes"] == prepared["hashes"]
+    assert BODY not in json.dumps(short)
+    short_code = mod.main(
+        [
+            "read",
+            "--period",
+            "AM",
+            "--state-root",
+            str(layout.state),
+            "--date",
+            DATE,
+            "--max-bytes",
+            str(payload["bytes"] - 1),
+        ],
+        now=NOW,
+    )
+    short_out = capsys.readouterr().out
+    assert short_code == 2
+    assert json.loads(short_out)["preparation_status"] == "content_exceeds_bound"
+    assert BODY not in short_out
+    assert "TMTB-FULL-TEXT" not in short_out
+
+
+def test_unrestorable_tmtb_record_is_not_replaced(tmp_path: Path) -> None:
+    docs = [{"doc_id": "d1", "text": "RECORDED-DOC"}]
+    pending = [{"doc_id": "p1", "text": "RECORDED-PENDING"}]
+    for name in ("missing", "invalid", "mismatch"):
+        layout = _layout(tmp_path / name)
+        runner = RecordingRunner()
+        emails = [_mail(body=f"MAIL-{name}")]
+
+        def digest(_argv: list[str], bound: Layout = layout, bound_emails: list[dict[str, Any]] = emails) -> mod.ChildResult:
+            _write_json(bound.digest_path(), _digest_document(bound_emails))
+            return _child(_digest_stdout(output_file=str(bound.digest_path())))
+
+        def tmtb(_argv: list[str], bound: Layout = layout) -> mod.ChildResult:
+            _write_json(bound.tmtb_path(), _tmtb_document(docs, pending))
+            return _child(
+                _tmtb_stdout(
+                    status="new_docs",
+                    output_file=str(bound.tmtb_path()),
+                    count=1,
+                    new_count=1,
+                    pending_count=1,
+                )
+            )
+
+        runner.digest = digest
+        runner.tmtb = tmtb
+        with patch.object(mod, "_write_snapshots", side_effect=RuntimeError("snapshot_interrupted")):
+            with pytest.raises(RuntimeError, match="snapshot_interrupted"):
+                _prepare(layout, runner)
+        digest_bytes = layout.digest_path().read_bytes()
+        record = json.loads(layout.attempt_path().read_text(encoding="utf-8"))["tmtb"]["record"]
+        assert record["count"] == 1
+        assert record["pending_snippets_count"] == 1
+        assert record["new_count"] == 1
+        if name == "missing":
+            layout.tmtb_path().unlink()
+        elif name == "invalid":
+            layout.tmtb_path().write_text("{", encoding="utf-8")
+        else:
+            _write_json(layout.tmtb_path(), _tmtb_document([], []))
+        source_bytes = layout.tmtb_path().read_bytes() if layout.tmtb_path().exists() else None
+        recovered = _prepare(layout, runner)
+        again = _prepare(layout, runner)
+        persisted = json.loads(layout.attempt_path().read_text(encoding="utf-8"))
+        assert recovered["preparation_status"] == "unresolved"
+        assert recovered["ok"] is False
+        assert recovered["usable"] is False
+        assert recovered["reason"] == "tmtb_input_not_restored"
+        assert recovered["emails_count"] == 1
+        assert recovered["tmtb"]["status"] == "new_docs"
+        assert recovered["tmtb"]["count"] == 1
+        assert recovered["tmtb"]["pending_snippets_count"] == 1
+        assert recovered["tmtb"]["new_count"] == 1
+        assert persisted["tmtb"]["record"] == record
+        assert persisted["phase"] != "complete"
+        assert not (layout.state / "batches" / "AM" / DATE / "manifest.json").exists()
+        assert layout.digest_path().read_bytes() == digest_bytes
+        if source_bytes is None:
+            assert not layout.tmtb_path().exists()
+        else:
+            assert layout.tmtb_path().read_bytes() == source_bytes
+        withheld = mod.read_inputs(layout.state, "AM", date=DATE, now=NOW)
+        assert withheld["emails"] is None
+        assert withheld["preparation_status"] == "unresolved"
+        assert again["preparation_status"] == "unresolved"
+        assert again["tmtb_invoked"] is False
+        assert _kinds(runner) == ["digest", "tmtb"]
+
+    empty = _layout(tmp_path / "empty")
+    empty_runner = RecordingRunner()
+    stale = "STALE-NO-NEW-DOC"
+    _write_json(empty.tmtb_path(), _tmtb_document([{"doc_id": "old", "text": stale}]))
+    os.utime(empty.tmtb_path(), (1, 1))
+
+    def empty_digest(_argv: list[str]) -> mod.ChildResult:
+        _write_json(empty.digest_path(), _digest_document([_mail(body="EMPTY-MAIL")]))
+        return _child(_digest_stdout(output_file=str(empty.digest_path())))
+
+    def empty_tmtb(_argv: list[str]) -> mod.ChildResult:
+        return _child(_tmtb_stdout(status="no_new_docs", output_file=None, ok=True))
+
+    empty_runner.digest = empty_digest
+    empty_runner.tmtb = empty_tmtb
+    with patch.object(mod, "_write_snapshots", side_effect=RuntimeError("snapshot_interrupted")):
+        with pytest.raises(RuntimeError, match="snapshot_interrupted"):
+            _prepare(empty, empty_runner)
+    original_tmtb = empty.tmtb_path().read_bytes()
+    restored = _prepare(empty, empty_runner)
+    reused = _prepare(empty, empty_runner)
+    saved = mod.read_inputs(empty.state, "AM", date=DATE, now=NOW)
+    assert restored["preparation_status"] == "ready"
+    assert restored["usable"] is True
+    assert restored["tmtb"]["status"] == "no_new_docs"
+    assert restored["tmtb"]["count"] == 0
+    assert restored["tmtb"]["pending_snippets_count"] == 0
+    assert restored["tmtb"]["degraded"] is False
+    assert saved["tmtb_docs"] == []
+    assert stale not in _tree_text(empty.state)
+    assert empty.tmtb_path().read_bytes() == original_tmtb
+    assert reused["reused"] is True
+    assert _kinds(empty_runner) == ["digest", "tmtb"]

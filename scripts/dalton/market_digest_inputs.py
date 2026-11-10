@@ -1558,15 +1558,40 @@ def _capture_digest(
     return "stop"
 
 
+def _supplied_batch_conflicts(doc: Mapping[str, Any], period: str, date_value: str) -> bool:
+    """True when stdout names a different batch. Omitted date and period do not conflict."""
+
+    supplied_period = doc.get("period")
+    supplied_date = doc.get("date")
+    if supplied_period is not None and supplied_period != period:
+        return True
+    return supplied_date is not None and supplied_date != date_value
+
+
+def _explicit_unavailable_stdout(child: ChildResult | None) -> dict[str, Any] | None:
+    """Reference unavailable stdout: ok false, status alphaengine_unavailable, no hint copy."""
+
+    if child is None or child.timed_out or child.stdout_truncated or child.still_running:
+        return None
+    doc = _parse_json_object(child.stdout)
+    if doc is None or doc.get("ok") is not False or doc.get("status") != TMTB_UNAVAILABLE:
+        return None
+    return doc
+
+
 def _confirmed_tmtb_stdout(child: ChildResult, period: str, date_value: str) -> dict[str, Any] | None:
     if child.timed_out or child.stdout_truncated or child.still_running:
         return None
     doc = _parse_json_object(child.stdout)
-    if doc is None or doc.get("period") != period or doc.get("date") != date_value:
+    if doc is None:
         return None
     status = doc.get("status")
     if status == TMTB_UNAVAILABLE and doc.get("ok") is False:
+        if _supplied_batch_conflicts(doc, period, date_value):
+            return None
         return doc
+    if doc.get("period") != period or doc.get("date") != date_value:
+        return None
     if child.returncode not in {0, None} and status != TMTB_UNAVAILABLE:
         if status not in TMTB_STATUSES:
             return None
@@ -1778,6 +1803,20 @@ def _restore_tmtb_inputs(
     return docs, pending, loaded_raw
 
 
+def _restored_tmtb_matches(record: Mapping[str, Any], docs: list[Any], pending: list[Any]) -> bool:
+    """Empty recorded input may restore empty. A nonempty record must match both lengths."""
+
+    count = record.get("count")
+    pending_count = record.get("pending_snippets_count")
+    if isinstance(count, bool) or not isinstance(count, int):
+        return False
+    if isinstance(pending_count, bool) or not isinstance(pending_count, int):
+        return False
+    if count == 0 and pending_count == 0:
+        return True
+    return len(docs) == count and len(pending) == pending_count
+
+
 def _capture_tmtb(
     config: PrepareConfig,
     state_root: Path,
@@ -1789,9 +1828,12 @@ def _capture_tmtb(
     A validated expected file is adopted for ``new_docs`` and ``reused_existing``
     even when it is older than this claim. ``no_new_docs`` adopts a file only
     when it is fresh or stdout names that exact path. ``alphaengine_unavailable``
-    never copies an older file. Reported paths are compared, never opened.
+    never copies a file, including a fresh one. Reported paths are compared, never opened.
     Sanitized outcome facts are stored on the attempt before snapshots so a
-    crash in that window can reuse them without another TMTB call.
+    crash in that window can reuse them without another TMTB call. A fresh file
+    with no confirmed stdout and no confirmed prior outcome stays ``unconfirmed``
+    and degraded, including invalid or truncated stdout. A nonempty
+    durable record that cannot be restored to the same counts is left unchanged.
     """
 
     date_value = str(attempt["authoritative_date"])
@@ -1819,6 +1861,26 @@ def _capture_tmtb(
         saved = _load_tmtb_record(attempt)
         if saved is not None:
             docs, pending, source_raw = _restore_tmtb_inputs(config, date_value, period, saved)
+            if not _restored_tmtb_matches(saved, docs, pending):
+                mail = attempt.get("mail") if isinstance(attempt.get("mail"), dict) else {}
+                _set_result(
+                    attempt,
+                    ok=False,
+                    usable=False,
+                    preparation_status="unresolved",
+                    reason="tmtb_input_not_restored",
+                    authoritative_date=date_value,
+                    digest_outcome=attempt["digest"].get("outcome"),
+                    emails_count=mail.get("emails_count"),
+                    priority_senders=mail.get("priority_senders"),
+                    funda=mail.get("funda"),
+                    image_backlog=mail.get("image_backlog"),
+                    tmtb=saved,
+                    hashes=None,
+                    batch_id=None,
+                )
+                _persist(state_root, attempt)
+                return "stop"
             new_count = saved.get("new_count")
             _assign_tmtb(
                 attempt,
@@ -1838,6 +1900,11 @@ def _capture_tmtb(
             _persist(state_root, attempt)
             return "ready"
     stdout = _confirmed_tmtb_stdout(child, period, date_value) if child is not None else None
+    explicit_unavailable = _explicit_unavailable_stdout(child)
+    identity_conflict = bool(
+        explicit_unavailable is not None
+        and _supplied_batch_conflicts(explicit_unavailable, period, date_value)
+    )
     loaded_doc, loaded_raw, loaded_path, loaded_error = _load_tmtb_file(config, date_value, period)
     claimed_unix = float(attempt.get("tmtb_claimed_unix") or attempt["started_unix"])
     file_ok = loaded_error is None and loaded_doc is not None and loaded_path is not None
@@ -1847,7 +1914,7 @@ def _capture_tmtb(
     prior = attempt["tmtb"].get("outcome")
     prior_name = prior if isinstance(prior, str) else None
     use_file = False
-    if file_ok and status_name != TMTB_UNAVAILABLE:
+    if file_ok and status_name != TMTB_UNAVAILABLE and not identity_conflict:
         if status_name in {"new_docs", "reused_existing"}:
             use_file = True
         elif status_name == "no_new_docs" and (fresh or matched):
@@ -1859,7 +1926,7 @@ def _capture_tmtb(
             and prior_name in {"new_docs", "reused_existing", "recovered", "recovered_after_timeout"}
         ):
             use_file = True
-    if status_name == TMTB_UNAVAILABLE:
+    if status_name == TMTB_UNAVAILABLE or identity_conflict:
         use_file = False
     docs: list[dict[str, Any]] = []
     pending: list[Any] = []
@@ -1885,7 +1952,17 @@ def _capture_tmtb(
         quota_hit = True
     degraded = False
     reason: str | None = None
-    if status_name == TMTB_UNAVAILABLE:
+    if identity_conflict:
+        status = "tmtb_identity_conflict"
+        degraded = True
+        reason = "tmtb_identity_conflict"
+        docs = []
+        pending = []
+        source_raw = None
+        quota_hit = False
+        failure_count = 0
+        new_count = None
+    elif status_name == TMTB_UNAVAILABLE:
         status = TMTB_UNAVAILABLE
         degraded = True
         reason = TMTB_UNAVAILABLE
@@ -1923,13 +2000,22 @@ def _capture_tmtb(
             else:
                 reason = "failed"
     elif use_file:
-        status = prior_name if prior_name in {"recovered", "recovered_after_timeout", "new_docs", "reused_existing"} else "recovered"
-        if status == "recovered_after_timeout":
+        confirmed_prior = prior_name in {"recovered", "recovered_after_timeout", "new_docs", "reused_existing"}
+        if not confirmed_prior:
+            status = "unconfirmed"
             degraded = True
-            reason = "timeout"
-        elif quota_hit:
-            degraded = True
-            reason = "quota"
+            reason = "unconfirmed"
+            quota_hit = False
+            failure_count = 0
+            new_count = None
+        else:
+            status = prior_name
+            if status == "recovered_after_timeout":
+                degraded = True
+                reason = "timeout"
+            elif quota_hit:
+                degraded = True
+                reason = "quota"
     else:
         kept = prior_name if prior_name in {"timeout", "no_new_docs", TMTB_UNAVAILABLE, "unresolved_no_output"} else None
         status = kept or "unresolved_no_output"
@@ -1938,7 +2024,10 @@ def _capture_tmtb(
         docs = []
         pending = []
         source_raw = None
-    summary_only = bool(pending) and (quota_hit or stdout is None)
+    if status == "unconfirmed":
+        summary_only = False
+    else:
+        summary_only = bool(pending) and (quota_hit or stdout is None)
     _assign_tmtb(
         attempt,
         date_value=date_value,
@@ -2475,7 +2564,7 @@ def read_inputs(
     now: datetime | None = None,
     max_bytes: int = DEFAULT_READ_MAX_BYTES,
 ) -> dict[str, Any]:
-    """Return one saved batch. ``max_bytes`` bounds the JSON payload, not a path."""
+    """Return one saved batch. ``max_bytes`` bounds the pretty JSON ``_emit`` writes."""
 
     if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or not 1 <= max_bytes <= HARD_READ_MAX_BYTES:
         raise PrepareConfigError("max_bytes is outside 1..67108864")
@@ -2535,8 +2624,8 @@ def read_inputs(
     payload["tmtb_docs"] = docs if isinstance(docs, list) else []
     payload["pending_snippets"] = pending if isinstance(pending, list) else []
     payload["truncated"] = False
-    encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    if len(encoded) > max_bytes:
+    size = _fit_response_bytes(payload)
+    if size > max_bytes:
         withheld = dict(public)
         withheld["ok"] = False
         withheld["usable"] = False
@@ -2546,15 +2635,37 @@ def read_inputs(
         withheld["tmtb_docs"] = None
         withheld["pending_snippets"] = None
         withheld["truncated"] = True
-        withheld["bytes"] = len(encoded)
+        withheld["bytes"] = size
         return withheld
-    payload["bytes"] = len(encoded)
     return payload
 
 
+def _serialized_response(payload: Mapping[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+
+
+def _fit_response_bytes(payload: dict[str, Any]) -> int:
+    """Set ``bytes`` to the UTF-8 length of the exact ``_emit`` text that contains it."""
+
+    size = 0
+    for _ in range(8):
+        payload["bytes"] = size
+        measured = len(_serialized_response(payload).encode("utf-8"))
+        if measured == size:
+            return size
+        size = measured
+    payload["bytes"] = size
+    measured = len(_serialized_response(payload).encode("utf-8"))
+    if measured != size:
+        payload["bytes"] = measured
+        measured = len(_serialized_response(payload).encode("utf-8"))
+        if measured == payload["bytes"]:
+            return measured
+    return int(payload["bytes"])
+
+
 def _emit(payload: Mapping[str, Any]) -> None:
-    sys.stdout.write(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
-    sys.stdout.write("\n")
+    sys.stdout.write(_serialized_response(payload))
 
 
 def _build_parser() -> argparse.ArgumentParser:
