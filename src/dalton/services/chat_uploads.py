@@ -2718,18 +2718,28 @@ async def materialize_chat_uploads(
                         detail="Attachment has expired or was removed",
                     )
 
-    for row, rel_path, _, size_bytes in ordered_targets:
-        mime = str(row.get("mime_type") or "")
-        hint = (
-            "Read it directly or use Python to inspect it."
-            if mime == "application/pdf" or mime.startswith("image/")
-            else "Use Python to process it."
-        )
-        notes.append(
-            f"The user attached a file ({row['filename']}, {mime}, "
-            f"{_format_human_bytes(size_bytes)}). It has been saved to {rel_path}. "
-            f"{hint}"
-        )
+        for abs_path in sorted(unique_by_abs):
+            t_row, _, _, _ = unique_by_abs[abs_path]
+            if not await db.is_upload_retained_for_recovery(
+                str(t_row["upload_id"]), str(t_row["workspace_id"])
+            ):
+                raise HTTPException(
+                    status_code=410,
+                    detail="Attachment has expired or was removed",
+                )
+
+        for row, rel_path, _, size_bytes in ordered_targets:
+            mime = str(row.get("mime_type") or "")
+            hint = (
+                "Read it directly or use Python to inspect it."
+                if mime == "application/pdf" or mime.startswith("image/")
+                else "Use Python to process it."
+            )
+            notes.append(
+                f"The user attached a file ({row['filename']}, {mime}, "
+                f"{_format_human_bytes(size_bytes)}). It has been saved to {rel_path}. "
+                f"{hint}"
+            )
 
     return notes
 

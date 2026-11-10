@@ -6247,3 +6247,222 @@ async def test_materialize_placement_errors_recheck_retained_state_and_preserve_
             project=project,
         )
 
+
+@pytest.mark.asyncio
+async def test_materialize_multi_target_sibling_deleted_during_later_transfer_raises_410_without_reminders(
+    upload_env, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify R5-1: in a multi-attachment batch (A sorting before B), if earlier target A
+    (either already present on disk matching probe or newly placed by this invocation) is
+    deleted by another worker while later target B is transferring, materialize_chat_uploads
+    rechecks retained state for all unique targets inside AsyncExitStack before building
+    reminders, raising HTTP 410 / SteerAttachmentPermanentError('http_410') with no reminders."""
+    from contextlib import suppress
+    from pathlib import Path
+
+    from src.server.app.workspace_files import crud as ws_crud
+    from src.server.database import workspace as ws_db
+
+    owner = "user-r18-sibling"
+    ws_id = str(uuid.uuid4())
+    ws_meta = {
+        "workspace_id": ws_id,
+        "user_id": owner,
+        "status": "running",
+        "dir_name": "SiblingWS",
+    }
+    upload_env["workspaces"][ws_id] = ws_meta
+
+    root_dir = str(tmp_path / "r18_sibling_root")
+    sbx_place = _RealPosixSandbox(root_dir, dir_name="SiblingWS")
+    sbx_delete = _RealPosixSandbox(root_dir, dir_name="SiblingWS")
+    sbx_place.provider.direct_blob_transfer = False
+    project = ProjectContext(workspace_id=ws_id, dir_name="SiblingWS")
+    layout = sbx_place.workspace(project)
+
+    @asynccontextmanager
+    async def _fake_acquire_sandbox(_ws_id: str, _owner_id: str):
+        yield sbx_delete, ws_meta
+
+    monkeypatch.setattr(
+        ws_crud,
+        "owned_workspace_on_computer",
+        create_autospec(ws_crud.owned_workspace_on_computer, return_value=ws_meta),
+    )
+    monkeypatch.setattr(
+        ws_crud,
+        "acquire_sandbox_to_change",
+        create_autospec(ws_crud.acquire_sandbox_to_change, side_effect=_fake_acquire_sandbox),
+    )
+    monkeypatch.setattr(
+        ws_crud,
+        "owner_work_dir",
+        create_autospec(ws_crud.owner_work_dir, return_value=layout.workspace),
+    )
+    monkeypatch.setattr(
+        ws_crud,
+        "owner_layout",
+        create_autospec(ws_crud.owner_layout, return_value=layout),
+    )
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(ws_db.get_workspace, return_value=ws_meta),
+    )
+
+    real_iter_chunks = chat_upload_storage.iter_stored_object_chunks
+
+    def _iter_store_chunks(object_key: str, *, chunk_size: int = 4194304):
+        raw_blob = upload_env["store"].objects[object_key]
+        for idx in range(0, len(raw_blob), chunk_size):
+            yield raw_blob[idx : idx + chunk_size]
+
+    monkeypatch.setattr(
+        chat_upload_storage,
+        "iter_stored_object_chunks",
+        create_autospec(real_iter_chunks, side_effect=_iter_store_chunks),
+    )
+
+    async def _make_retained_upload(
+        stem: str, tag: str, *, preexisting_on_disk: bool
+    ) -> tuple[str, ChatUploadContext, str, str]:
+        filename = f"{stem}_{tag}.bin"
+        payload = f"R18_{stem.upper()}_{tag}_".encode() * 128
+        created = await svc.initiate_chat_upload(
+            user_id=owner,
+            workspace_id=ws_id,
+            filename=filename,
+            size_bytes=len(payload),
+        )
+        uid = created["upload_id"]
+        await svc.receive_chat_upload_part(
+            upload_id=uid, part_number=1, user_id=owner, stream=_bytes_stream(payload)
+        )
+        await svc.complete_chat_upload(upload_id=uid, user_id=owner)
+        ctx = ChatUploadContext(
+            upload_id=uid,
+            name=filename,
+            mime_type="application/octet-stream",
+            size=len(payload),
+        )
+        await svc.confirm_request_chat_uploads([ctx], user_id=owner, workspace_id=ws_id)
+        row = upload_env["ledger"].rows[uid]
+        rel = svc.build_sandbox_upload_rel_path(row)
+        abs_p = f"{layout.workspace}/{rel}"
+        if preexisting_on_disk:
+            os.makedirs(os.path.dirname(abs_p), exist_ok=True)
+            Path(abs_p).write_bytes(payload)
+        else:
+            assert not os.path.exists(abs_p)
+        return uid, ctx, rel, abs_p
+
+    for a_preexisting in (True, False):
+        for entrypoint in ("materialize_chat_uploads", "materialize_steered_chat_uploads"):
+            tag = f"{'pre' if a_preexisting else 'placed'}_{entrypoint}"
+            uid_a, ctx_a, rel_a, abs_a = await _make_retained_upload(
+                "alpha_a", tag, preexisting_on_disk=a_preexisting
+            )
+            uid_b, ctx_b, _rel_b, abs_b = await _make_retained_upload(
+                "zeta_b", tag, preexisting_on_disk=False
+            )
+            assert abs_a < abs_b
+
+            b_paused_evt = asyncio.Event()
+            b_resume_evt = asyncio.Event()
+
+            async def _pause_b_after_final_check(
+                uid: str,
+                _abs_target: str,
+                _target_b: str = uid_b,
+                _paused: asyncio.Event = b_paused_evt,
+                _resume: asyncio.Event = b_resume_evt,
+            ) -> None:
+                if uid == _target_b:
+                    _paused.set()
+                    await _resume.wait()
+
+            monkeypatch.setattr(svc, "_AFTER_FINAL_RECOVERY_DB_CHECK_HOOK", _pause_b_after_final_check)
+            mat_task: asyncio.Task[Any] | None = None
+            try:
+                if entrypoint == "materialize_chat_uploads":
+                    mat_task = asyncio.create_task(
+                        svc.materialize_chat_uploads(
+                            [ctx_a, ctx_b],
+                            sandbox=sbx_place,
+                            user_id=owner,
+                            workspace_id=ws_id,
+                            project=project,
+                        )
+                    )
+                else:
+                    mat_task = asyncio.create_task(
+                        svc.materialize_steered_chat_uploads(
+                            {
+                                "content": "Steer multi",
+                                "user_id": owner,
+                                "workspace_id": ws_id,
+                                "chat_uploads": [ctx_a.model_dump(), ctx_b.model_dump()],
+                            },
+                            session=_FakeSession(sbx_place),
+                            project=project,
+                        )
+                    )
+
+                await asyncio.wait_for(b_paused_evt.wait(), timeout=5.0)
+                # By the time B reaches its final DB check, A has either matched the probe
+                # or finished its own placement and cleaned up its grant.
+                assert os.path.exists(abs_a)
+
+                # Another worker deletes A via ws_crud.delete_workspace_files while B is paused.
+                del_res = await ws_crud.delete_workspace_files(
+                    workspace_id=ws_id,
+                    x_user_id=owner,
+                    body=ws_crud.DeleteFilesRequest(paths=[rel_a]),
+                )
+                assert del_res == {"deleted": [rel_a], "errors": []}
+                assert upload_env["ledger"].rows[uid_a]["state"] == "aborted"
+                assert not os.path.exists(abs_a)
+
+                b_resume_evt.set()
+                if entrypoint == "materialize_chat_uploads":
+                    with pytest.raises(HTTPException) as exc_info:
+                        await mat_task
+                    assert exc_info.value.status_code == 410
+                    assert "expired or was removed" in str(exc_info.value.detail)
+                else:
+                    with pytest.raises(svc.SteerAttachmentPermanentError) as exc_steer:
+                        await mat_task
+                    assert exc_steer.value.code == "http_410"
+                assert not os.path.exists(abs_a)
+            finally:
+                b_resume_evt.set()
+                if mat_task is not None and not mat_task.done():
+                    try:
+                        await asyncio.wait_for(asyncio.shield(mat_task), timeout=5.0)
+                    except BaseException:
+                        if not mat_task.done():
+                            mat_task.cancel()
+                            with suppress(BaseException):
+                                await mat_task
+                monkeypatch.setattr(svc, "_AFTER_FINAL_RECOVERY_DB_CHECK_HOOK", None)
+
+    # Success assertion: two retained targets succeed and return reminders in descriptor order
+    _uid_a_ok, ctx_a_ok, rel_a_ok, abs_a_ok = await _make_retained_upload(
+        "alpha_a", "success", preexisting_on_disk=False
+    )
+    _uid_b_ok, ctx_b_ok, rel_b_ok, abs_b_ok = await _make_retained_upload(
+        "zeta_b", "success", preexisting_on_disk=False
+    )
+    assert abs_a_ok < abs_b_ok
+    notes = await svc.materialize_chat_uploads(
+        [ctx_b_ok, ctx_a_ok],
+        sandbox=sbx_place,
+        user_id=owner,
+        workspace_id=ws_id,
+        project=project,
+    )
+    assert os.path.exists(abs_a_ok)
+    assert os.path.exists(abs_b_ok)
+    assert len(notes) == 2
+    assert rel_b_ok in notes[0]
+    assert rel_a_ok in notes[1]

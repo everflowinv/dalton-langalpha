@@ -5575,3 +5575,115 @@ class TestChatLargeUploadRealInfra:
                                 with suppress(BaseException):
                                     await pre_task
                     docker_ptc_sandbox.provider.direct_blob_transfer = orig_direct_p
+
+            # (h) Multi-attachment sibling deletion while later attachment B is transferring:
+            #     A (alpha_a_multi.bin) finishes placement before B (zeta_b_multi.bin) pauses
+            #     at _AFTER_FINAL_RECOVERY_DB_CHECK_HOOK; another worker deletes A via
+            #     ws_crud.delete_workspace_files; B resumes and post-placement recheck raises
+            #     SteerAttachmentPermanentError('http_410') with A retired and absent.
+            up_a, key_a, _ = await _upload_streamed_file_via_http(
+                chat_upload_infra.client,
+                user_id=user["user_id"],
+                workspace_id=workspace_id,
+                filename="alpha_a_multi.bin",
+                mime_type="application/octet-stream",
+                total_bytes=1 * _MIB,
+                seed_tag=b"multi-sibling-a",
+                tracked_keys=chat_upload_infra.tracked_keys,
+                tracked_multiparts=chat_upload_infra.tracked_multiparts,
+            )
+            up_b, _, _ = await _upload_streamed_file_via_http(
+                chat_upload_infra.client,
+                user_id=user["user_id"],
+                workspace_id=workspace_id,
+                filename="zeta_b_multi.bin",
+                mime_type="application/octet-stream",
+                total_bytes=1 * _MIB,
+                seed_tag=b"multi-sibling-b",
+                tracked_keys=chat_upload_infra.tracked_keys,
+                tracked_multiparts=chat_upload_infra.tracked_multiparts,
+            )
+            ctx_a = {
+                "type": "chat_upload",
+                "upload_id": up_a["upload_id"],
+                "name": "alpha_a_multi.bin",
+                "mime_type": "application/octet-stream",
+                "size": 1 * _MIB,
+            }
+            ctx_b = {
+                "type": "chat_upload",
+                "upload_id": up_b["upload_id"],
+                "name": "zeta_b_multi.bin",
+                "mime_type": "application/octet-stream",
+                "size": 1 * _MIB,
+            }
+            await confirm_request_chat_uploads(
+                [ctx_a, ctx_b], user_id=user["user_id"], workspace_id=workspace_id
+            )
+            row_a = await chat_uploads_db.get_upload(up_a["upload_id"])
+            row_b = await chat_uploads_db.get_upload(up_b["upload_id"])
+            assert row_a is not None and row_b is not None
+            rel_a = build_sandbox_upload_rel_path(row_a)
+            rel_b = build_sandbox_upload_rel_path(row_b)
+            abs_a = f"{layout.workspace}/{rel_a}"
+            abs_b = f"{layout.workspace}/{rel_b}"
+            assert abs_a < abs_b
+
+            @asynccontextmanager
+            async def _noop_multi_lock(_p: str):
+                yield
+
+            multi_b_ready = asyncio.Event()
+            multi_b_go = asyncio.Event()
+
+            async def _pause_multi_b(uid: str, _abs_t: str) -> None:
+                if uid == up_b["upload_id"]:
+                    multi_b_ready.set()
+                    await multi_b_go.wait()
+
+            with (
+                patch.object(docker_ptc_sandbox, "path_write_lock", side_effect=_noop_multi_lock),
+                patch.object(cu_svc, "_AFTER_FINAL_RECOVERY_DB_CHECK_HOOK", _pause_multi_b),
+            ):
+                multi_task = asyncio.create_task(
+                    materialize_steered_chat_uploads(
+                        {
+                            "content": "Steer multi sibling",
+                            "user_id": user["user_id"],
+                            "workspace_id": workspace_id,
+                            "chat_uploads": [ctx_a, ctx_b],
+                        },
+                        session=SimpleNamespace(sandbox=docker_ptc_sandbox),
+                        project=project,
+                    )
+                )
+                try:
+                    await asyncio.wait_for(multi_b_ready.wait(), timeout=15.0)
+                    del_a = await ws_crud.delete_workspace_files(
+                        workspace_id=workspace_id,
+                        x_user_id=user["user_id"],
+                        body=ws_crud.DeleteFilesRequest(paths=[rel_a]),
+                    )
+                    assert del_a == {"deleted": [rel_a], "errors": []}
+                    multi_b_go.set()
+                    with pytest.raises(SteerAttachmentPermanentError) as exc_multi:
+                        await multi_task
+                    assert exc_multi.value.code == "http_410"
+                finally:
+                    multi_b_go.set()
+                    if not multi_task.done():
+                        try:
+                            await asyncio.wait_for(asyncio.shield(multi_task), timeout=5.0)
+                        except BaseException:
+                            if not multi_task.done():
+                                multi_task.cancel()
+                                with suppress(BaseException):
+                                    await multi_task
+
+            row_a_after = await chat_uploads_db.get_upload(up_a["upload_id"])
+            assert row_a_after is not None and row_a_after["state"] == "aborted"
+            a_probe = await docker_ptc_sandbox.execute_bash_command(
+                f"test ! -e {shlex.quote(abs_a)} && echo absent"
+            )
+            assert "absent" in (a_probe.get("stdout") or "")
+            assert storage.object_size(key_a) is None
