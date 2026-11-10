@@ -371,6 +371,29 @@ describe("Settings: the user's instructions", () => {
     expect(readSection(new URLSearchParams(), '#dalton-reviewer-models')).toBe('model');
   });
 
+  // DALTON-HOOK(settings-section): Feishu and Discord bind codes stay on Models in platform and self-hosted modes
+  it('opens Feishu and Discord account bindings from the model settings hash', () => {
+    for (const platformMode of [false, true]) {
+      h.platformMode = platformMode;
+      expect(sectionShown('model')).toBe(true);
+      expect(readSection(new URLSearchParams('tab=model'), '#dalton-channel-bindings')).toBe('model');
+      expect(readSection(new URLSearchParams('tab=integrations'), '#dalton-channel-bindings')).toBe('model');
+      const entry = searchableSettings(true).find((item) => item.anchor === 'dalton-channel-bindings');
+      expect(entry?.section).toBe('model');
+      expect(entry?.labelKey).toBe('settings.dalton.channelBindingsLabel');
+      expect(entry?.advanced).toBeUndefined();
+      expect(entry?.visibleWhen).toBeUndefined();
+      expect(searchableSettings(false).some((item) => item.anchor === 'dalton-channel-bindings')).toBe(true);
+    }
+  });
+
+  it('finds Feishu and Discord accounts when search asks for a bind code', async () => {
+    setupAndRender();
+    const searchInput = await screen.findByRole('combobox', { name: /Search settings/i });
+    fireEvent.change(searchInput, { target: { value: '绑定码' } });
+    expect(await screen.findByText('Feishu and Discord accounts')).toBeInTheDocument();
+  });
+
   it('finds Dalton settings in search by Chinese keywords ("预算", "审稿", "研究总监")', async () => {
     const client = new QueryClient({
       defaultOptions: { queries: { retry: false }, mutations: { retry: false } },

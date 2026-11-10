@@ -10,6 +10,7 @@ import type {
   ThreadStatusInfo,
 } from "../src/backend-client.js";
 import { ChannelDeliveryError } from "../src/channels/adapter.js";
+import { expiredBindCodeUsage, notLinkedBindHelp } from "../src/commands.js";
 import { makeInboundRequestKey } from "../src/uuid.js";
 import {
   createTestHarness,
@@ -387,7 +388,7 @@ describe("Startup Recovery & Non-Blocking Server Start (§5.2, Codex r2 #17/#18,
     const linked = "Successfully linked your feishu account to Dalton.";
     const unlinked = "Unlinked your feishu account from Dalton.";
     const invalid =
-      "Bind code is invalid or expired. Please generate a new code in Web Settings → Channels.";
+      expiredBindCodeUsage("https://app.ginlix.ai");
     const revoked =
       "For security, `/bind` cannot be used in a group chat. This code has been revoked; please generate a new code and send `/bind <CODE>` in a direct message.";
     const mismatch =
@@ -700,7 +701,7 @@ describe("Startup Recovery & Non-Blocking Server Start (§5.2, Codex r2 #17/#18,
   it("recovers a keyed confirmation and an old command confirmation with their own keys", async () => {
     const linked = "Successfully linked your feishu account to Dalton.";
     const invalid =
-      "Bind code is invalid or expired. Please generate a new code in Web Settings → Channels.";
+      expiredBindCodeUsage("https://app.ginlix.ai");
     const unlinked = "Unlinked your feishu account from Dalton.";
     const bobId = "user_bob_456";
     const base = (
@@ -992,9 +993,10 @@ describe("Startup Recovery & Non-Blocking Server Start (§5.2, Codex r2 #17/#18,
 
     await waitBounded(h.app.orchestrator.runStartupRecovery(), "unbound denial recovery");
 
-    expect(
-      h.weixinAdapter.sentTexts.filter((item) => item.text.includes(denialText)),
-    ).toHaveLength(1);
+    const unboundNotices = h.weixinAdapter.sentTexts.filter((item) => item.text.includes(denialText));
+    expect(unboundNotices).toHaveLength(1);
+    expect(unboundNotices[0]?.text).toBe(notLinkedBindHelp("https://app.ginlix.ai", "weixin"));
+    expect(unboundNotices[0]?.text).not.toContain("/settings/channels");
     expect(claims()).toHaveLength(2);
     expect(
       h.backend.progressUpdates.filter((update) => update.message_id === messageId),

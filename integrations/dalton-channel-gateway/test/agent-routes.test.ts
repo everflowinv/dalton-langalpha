@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ChannelDeliveryError } from "../src/channels/adapter.js";
+import { notLinkedTargetMessage, personalChannelBindingsUrl } from "../src/commands.js";
 import { DeliveryService } from "../src/delivery-service.js";
 import { MAX_AUTOMATION_FINAL_TEXT_CHARS } from "../src/types.js";
 import {
@@ -131,6 +132,7 @@ describe("Nine `/agent/*` Endpoints & Permission Enforcement (§1.2.1 ~ §1.2.7,
       turn_platform: "feishu",
     });
     expect(res.status).toBe(200);
+    expect(res.data.settings_url).toBe(personalChannelBindingsUrl("https://app.ginlix.ai"));
     expect(res.data.current).toEqual({ address: "feishu:@me" });
     expect(res.data.targets.map((t) => t.address)).toEqual([
       "feishu:@me",
@@ -183,6 +185,14 @@ describe("Nine `/agent/*` Endpoints & Permission Enforcement (§1.2.1 ~ §1.2.7,
         (u) => u.platform === "weixin" && u.reason === "not_linked",
       ),
     ).toBe(true);
+    expect(unlinkedRes.data.settings_url).toBe(personalChannelBindingsUrl("https://app.ginlix.ai"));
+    const unlinked = unlinkedRes.data.unavailable.filter((u) => u.reason === "not_linked");
+    expect(unlinked.length).toBeGreaterThan(0);
+    for (const row of unlinked) {
+      expect(row.message).toBe(notLinkedTargetMessage("https://app.ginlix.ai", row.platform));
+      expect(row.message).not.toContain("/settings/channels");
+      expect(row.message).not.toContain("6-CHAR");
+    }
   });
 
   it("GET /agent/targets returns no targets for a platform when agent_messages.allowed is an empty array [] (channel_gateway.py:2598, 2610, Codex r5 #7)", async () => {
