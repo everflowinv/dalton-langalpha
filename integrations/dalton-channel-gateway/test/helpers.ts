@@ -730,6 +730,20 @@ export function createMockBackend(): MockBackend {
       async (
         req: I3SessionCommandRequest,
       ): Promise<I3SessionCommandResponse> => {
+        if (
+          req.native_interaction &&
+          (req.native_ack_status === "unknown" ||
+            req.native_ack_status === "failed")
+        ) {
+          return {
+            ok: false,
+            allowed: true,
+            duplicate: false,
+            not_executed: true,
+            command_effect_status: "done",
+            command_reply_pending: false,
+          };
+        }
         if (req.cmd === "stop") {
           return structuredClone(defaultI3StopSession);
         }

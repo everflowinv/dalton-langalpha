@@ -230,24 +230,15 @@ PY
 }
 trap cleanup_pid_file EXIT
 
-# Load runtime environment files if present
-if [[ -f "${REPO_ROOT}/.env" ]]; then
-    set -a
-    # shellcheck disable=SC1091
-    source "${REPO_ROOT}/.env" 2>/dev/null || true
-    set +a
-fi
+# Step 1: Controlled base process runtime defaults (§2.6.1.4)
+export PATH="${PATH:-/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin}"
+export HOME="${HOME:-$(cd ~ && pwd)}"
+export LANG="${LANG:-en_US.UTF-8}"
+export TZ="${TZ:-America/New_York}"
 
+REPO_ENV="${DALTON_REPO_ENV_FILE:-${REPO_ROOT}/.env}"
 BRIDGE_ENV="${DALTON_BRIDGE_ENV_FILE:-${HOME}/.config/dalton/researchdata-bridge.env}"
-if [[ -f "${BRIDGE_ENV}" ]]; then
-    set -a
-    # shellcheck disable=SC1090
-    source "${BRIDGE_ENV}" 2>/dev/null || true
-    set +a
-fi
-
-export DALTON_BRIDGE_EMBED_URL=http://127.0.0.1:8960/embed
-export no_proxy="localhost,127.0.0.1,::1,host.docker.internal,${no_proxy:-}"
+ENV_FILTER_HELPER="${DALTON_BRIDGE_ENV_FILTER_PY:-${SCRIPT_DIR}/../bridge_subprocess_env.py}"
 
 STARTED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 EXIT_CODE=1
@@ -255,7 +246,12 @@ EXIT_CODE=1
 # unless the archive was switched off in the meantime.
 for attempt in 1 2; do
     echo "--- $(date '+%F %T %Z') attempt ${attempt}"
-    "${PYTHON_BIN}" "${ARCHIVE_SCRIPT}" run "$@"
+    "${PYTHON_BIN}" "${ENV_FILTER_HELPER}" exec-archive \
+        --repo-env "${REPO_ENV}" \
+        --bridge-env "${BRIDGE_ENV}" \
+        --repo-root "${REPO_ROOT}" \
+        --embed-url "http://127.0.0.1:8960/embed" \
+        -- "${PYTHON_BIN}" "${ARCHIVE_SCRIPT}" run "$@"
     EXIT_CODE=$?
     echo "--- attempt ${attempt} exit ${EXIT_CODE}"
     if [[ "${EXIT_CODE}" -eq 3 && "${attempt}" -eq 1 ]]; then

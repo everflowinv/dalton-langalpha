@@ -36,15 +36,29 @@ Discord code above is adapted under the same OpenClaw MIT license below; no full
 |---|---|---|
 | `src/native-commands/manifest.ts`, `src/native-commands/feishu-registrar.ts` | `shortcuts/application/slash_command_create.go`, `shortcuts/application/slash_command_update.go`, `shortcuts/application/slash_command_common.go`, `shortcuts/application/slash_command_resolve.go` | `1–113`, `1–95`, `1–105`, `1–54` |
 
+## Referenced and Adapted Tencent Weixin iLink Files (`@tencent-weixin/openclaw-weixin`, v2.1.5)
+
+| Target File in `@dalton/channel-gateway` | Reference Source (`.agy/ref_openclaw_weixin/src/`) |
+|---|---|
+| `src/channels/weixin/types.ts` | `api/types.ts` |
+| `src/channels/weixin/api.ts` | `api/api.ts`, `api/session-guard.ts` |
+| `src/channels/weixin/cdn.ts` | `cdn/aes-ecb.ts`, `cdn/pic-decrypt.ts`, `cdn/cdn-url.ts`, `cdn/cdn-upload.ts`, `cdn/upload.ts`, `media/mime.ts` |
+| `src/channels/weixin/markdown-filter.ts` | `messaging/markdown-filter.ts` |
+| `src/channels/weixin/inbound.ts` | `messaging/inbound.ts`, `messaging/partial-quote.ts`, `messaging/process-message.ts` |
+| `src/channels/weixin/send.ts` | `messaging/send.ts`, `messaging/send-media.ts` |
+| `src/channels/weixin/login-qr.ts` | `auth/login-qr.ts` |
+| `src/channels/weixin/monitor.ts` | `monitor/monitor.ts` |
+
 ---
 
-## OpenClaw License
+## OpenClaw & Tencent Weixin Plugin Licenses
 
 ```text
 MIT License
 
 Copyright (c) 2025 Peter Steinberger
 Copyright (c) 2026 OpenClaw Foundation
+Copyright (c) 2026 Tencent
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

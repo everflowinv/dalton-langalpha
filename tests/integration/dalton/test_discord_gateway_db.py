@@ -133,11 +133,11 @@ def _revision_is_target_or_descendant(
 
 
 async def _ensure_alembic_upgraded_to_d036(
-    dsn: str, *, minimum: str = "d036"
+    dsn: str, *, minimum: str = "head"
 ) -> None:
     """Upgrade upstream to head and Dalton to ``minimum`` when the database is behind it.
 
-    The default minimum is d036 because current I-6 reads ``delivery_attempt``.
+    The default selects the current migration head required by the gateway.
     A database already at ``minimum`` or a descendant is left alone. Alembic
     cannot upgrade to an older revision, so this must not call
     ``upgrade("d036")`` after a later revision has been applied. The Dalton
@@ -159,6 +159,9 @@ async def _ensure_alembic_upgraded_to_d036(
     )
     dalton_cfg.set_main_option("sqlalchemy.url", sa_url)
     dalton_script = ScriptDirectory.from_config(dalton_cfg)
+    if minimum == "head":
+        minimum = dalton_script.get_current_head()
+        assert minimum is not None
 
     current_upstream: str | None = None
     dalton_versions: list[str] = []
@@ -2091,11 +2094,10 @@ async def test_real_http_discord_gateway_orchestrator_to_fastapi_and_postgres(
         )
 
 
-async def serve_discord_http_harness(*, dalton_revision: str = "d036") -> None:
+async def serve_discord_http_harness(*, dalton_revision: str = "head") -> None:
     """Serve the Discord HTTP harness until SIGINT or SIGTERM.
 
-    ``dalton_revision`` is the minimum Dalton revision. The default is d036
-    because current I-6 reads ``delivery_attempt``. A descendant already
+    ``dalton_revision`` is the minimum Dalton revision, defaulting to head. A descendant already
     applied is not downgraded. A caller that needs an older revision passes it.
     """
     dsn = _get_test_dsn()

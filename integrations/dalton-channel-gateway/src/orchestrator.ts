@@ -1,5 +1,4 @@
-import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
-import { basename, resolve } from "node:path";
+import { basename } from "node:path";
 import type { AgentRoutesHandler } from "./agent-routes.js";
 import {
   type BackendClient,
@@ -7,6 +6,7 @@ import {
   type DeliveryActivityOrigin,
   type I1RegisterAndResolveResponse,
   type I3SessionCommandResponse,
+  type I9WeixinStateGetResponse,
   type RecoverAutomationRunRow,
   type RecoverBackgroundRunRow,
   type RecoverInboundEventRow,
@@ -36,6 +36,11 @@ import {
   MAX_ATTACHMENT_COUNT,
   MAX_INLINE_IMAGE_BYTES,
   MAX_TOTAL_ATTACHMENT_BYTES,
+  type NativeAutocompleteChoice,
+  type NativeAutocompleteInteractionEvent,
+  type NativeCommandInteractionEvent,
+  type NativeCommandResponder,
+  type NativeInteractionEvent,
   type PendingInterruptState,
   PUBLIC_LIVE_STATUSES,
   PUBLIC_REPLAY_NEEDED_STATUSES,
@@ -106,53 +111,41 @@ function storedBindingAction(
   return cleaned === "bind" || cleaned === "unbind" ? cleaned : null;
 }
 
-function storedBindingResult(value: unknown): {
+function recordField(value: object, key: string): unknown {
+  if (!Object.prototype.hasOwnProperty.call(value, key)) return undefined;
+  return Reflect.get(value, key);
+}
+
+/** Fields shared by a stored bind result and an I-2 consume response. */
+function confirmationFields(value: object): {
   ok: boolean;
   reason: string | null;
   expectedPlatform: string | null;
   userId: string | null;
-} | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const record = value as Record<string, unknown>;
-  if (typeof record.ok !== "boolean") return null;
-  const userId =
-    typeof record.user_id === "string" && record.user_id.trim().length > 0
-      ? record.user_id.trim()
-      : null;
+  deliveryKey: string | null;
+  duplicate: boolean;
+  action: "bind" | "unbind" | null;
+} {
+  const reason = recordField(value, "reason");
+  const expected = recordField(value, "expected_platform");
+  const userId = recordField(value, "user_id");
+  const deliveryKey = recordField(value, "delivery_key");
+  const action = recordField(value, "action");
   return {
-    ok: record.ok,
-    reason: typeof record.reason === "string" ? record.reason : null,
-    expectedPlatform:
-      typeof record.expected_platform === "string"
-        ? record.expected_platform
+    ok: recordField(value, "ok") === true,
+    reason: typeof reason === "string" ? reason : null,
+    expectedPlatform: typeof expected === "string" ? expected : null,
+    userId:
+      typeof userId === "string" && userId.trim().length > 0
+        ? userId.trim()
         : null,
-    userId,
+    deliveryKey:
+      typeof deliveryKey === "string" && deliveryKey.length > 0
+        ? deliveryKey
+        : null,
+    duplicate: recordField(value, "duplicate") === true,
+    action: action === "bind" || action === "unbind" ? action : null,
   };
-}
-
-/** Same bind/unbind confirmation text for the live command and startup recovery. */
-function formatBindUnbindReply(params: {
-  action: "bind" | "unbind";
-  platform: string;
-  ok: boolean;
-  reason?: string | null;
-  expectedPlatform?: string | null;
-}): string {
-  if (params.action === "unbind") {
-    return params.ok
-      ? `Unlinked your ${params.platform} account from Dalton.`
-      : `Your ${params.platform} account is not currently linked.`;
-  }
-  if (!params.ok) {
-    if (params.reason === "revoked_in_group") {
-      return "For security, `/bind` cannot be used in a group chat. This code has been revoked; please generate a new code and send `/bind <CODE>` in a direct message.";
-    }
-    if (params.reason === "platform_mismatch") {
-      return `This bind code was generated for ${params.expectedPlatform ?? "another platform"}, not ${params.platform}.`;
-    }
-    return "Bind code is invalid or expired. Please generate a new code in Web Settings → Channels.";
-  }
-  return `Successfully linked your ${params.platform} account to Dalton.`;
 }
 
 export class ChannelGatewayOrchestrator {
@@ -200,6 +193,9 @@ export class ChannelGatewayOrchestrator {
       adapter.onInboundEvent(async (event) => {
         await this.handleInboundEvent(event);
       });
+      adapter.onNativeInteraction?.(async (event) => {
+        await this.handleNativeInteraction(event);
+      });
     }
   }
 
@@ -208,7 +204,52 @@ export class ChannelGatewayOrchestrator {
   // =========================================================================
 
   async handleInboundEvent(event: InboundChannelEvent): Promise<void> {
-    // Group chats require explicit structured mention trigger (`isGroupTrigger === true`)
+    if (
+      event.platform === "weixin" &&
+      (event.chatType === "group" ||
+        Boolean(
+          typeof event.rawPayload?.group_id === "string" &&
+            event.rawPayload.group_id.trim(),
+        ))
+    ) {
+      const requestKey = makeInboundRequestKey(event.platform, event.messageId);
+      await this.backend.registerAndResolveInbound({
+        platform: event.platform,
+        platform_user_id: event.platformUserId,
+        chat_type: "group",
+        chat_address: event.chatAddress,
+        thread_scope_key: event.threadScopeKey,
+        message_id: event.messageId,
+        request_key: requestKey,
+        raw_payload: this.buildInboundRawPayload(event),
+        weixin_context_token: null,
+        weixin_bot_id: event.weixinBotId ?? null,
+        weixin_bot_generation: event.weixinBotGeneration ?? null,
+        weixin_context_seq: event.weixinContextSeq ?? null,
+      });
+      return;
+    }
+
+    if (event.rawPayload?.invalid_inbound_event === true) {
+      const requestKey = makeInboundRequestKey(event.platform, event.messageId);
+      await this.backend.registerAndResolveInbound({
+        platform: event.platform,
+        platform_user_id: event.platformUserId,
+        chat_type: event.chatType,
+        chat_address: event.chatAddress,
+        thread_scope_key: event.threadScopeKey,
+        message_id: event.messageId,
+        request_key: requestKey,
+        raw_payload: this.buildInboundRawPayload(event),
+        weixin_context_token: null,
+        weixin_bot_id: event.weixinBotId ?? null,
+        weixin_bot_generation: event.weixinBotGeneration ?? null,
+        weixin_context_seq: event.weixinContextSeq ?? null,
+      });
+      return;
+    }
+
+    // Group chats require an explicit structured mention trigger (`isGroupTrigger === true`).
     if (event.chatType === "group" && event.isGroupTrigger !== true) {
       return;
     }
@@ -234,6 +275,9 @@ export class ChannelGatewayOrchestrator {
       request_key: requestKey,
       raw_payload: this.buildInboundRawPayload(event),
       weixin_context_token: event.weixinContextToken ?? null,
+      weixin_bot_id: event.weixinBotId ?? null,
+      weixin_bot_generation: event.weixinBotGeneration ?? null,
+      weixin_context_seq: event.weixinContextSeq ?? null,
     });
 
     await this.launchInboundTurn(event, () =>
@@ -248,16 +292,39 @@ export class ChannelGatewayOrchestrator {
       ...(event.rawPayload ?? {}),
       platform_user_id: event.platformUserId,
       text: event.text,
+      ...(event.commandText !== undefined
+        ? { command_text: event.commandText }
+        : {}),
+      ...(event.voiceWithoutTranscription
+        ? { voice_without_transcription: true }
+        : {}),
       chat_id: event.chatId,
       chat_name: event.chatName ?? null,
-      attachments: (event.attachments ?? []).map((attachment) => ({
-        id: attachment.id,
-        filename: attachment.filename,
-        mimeType: attachment.mimeType,
-        ...(attachment.sizeBytes !== undefined
-          ? { sizeBytes: attachment.sizeBytes }
-          : {}),
-      })),
+      attachments: (event.attachments ?? []).map((attachment) => {
+        const extra = attachment as InboundAttachmentDescriptor &
+          Record<string, unknown>;
+        return {
+          id: attachment.id,
+          filename: attachment.filename,
+          mimeType: attachment.mimeType,
+          ...(attachment.sizeBytes !== undefined
+            ? { sizeBytes: attachment.sizeBytes }
+            : {}),
+          ...(typeof extra.kind === "string" ? { kind: extra.kind } : {}),
+          ...(typeof extra.encryptQueryParam === "string"
+            ? { encryptQueryParam: extra.encryptQueryParam }
+            : {}),
+          ...(typeof extra.fullUrl === "string"
+            ? { fullUrl: extra.fullUrl }
+            : {}),
+          ...(typeof extra.aesKeyHex === "string"
+            ? { aesKeyHex: extra.aesKeyHex }
+            : {}),
+          ...(typeof extra.aesKeyBase64 === "string"
+            ? { aesKeyBase64: extra.aesKeyBase64 }
+            : {}),
+        };
+      }),
     };
   }
 
@@ -275,6 +342,9 @@ export class ChannelGatewayOrchestrator {
       request_key: requestKey,
       raw_payload: this.buildInboundRawPayload(event),
       weixin_context_token: event.weixinContextToken ?? null,
+      weixin_bot_id: event.weixinBotId ?? null,
+      weixin_bot_generation: event.weixinBotGeneration ?? null,
+      weixin_context_seq: event.weixinContextSeq ?? null,
     });
     await this.executeRegisteredInboundTurn(event, reresolved);
   }
@@ -314,6 +384,21 @@ export class ChannelGatewayOrchestrator {
     event: InboundChannelEvent,
     resolved: I1RegisterAndResolveResponse,
   ): Promise<void> {
+    // Group and invalid rows stay silent. Any other persisted denial, such as
+    // `not_linked`, still sends its notice on a later register of the same
+    // message. The delivery key does not change, so a notice that already
+    // completed is not sent again.
+    if (resolved.existing_status === "ignored") {
+      const persistedReason = resolved.deny_reason ?? "";
+      if (
+        persistedReason === "weixin_group_unsupported" ||
+        persistedReason === "invalid_inbound_event" ||
+        persistedReason.length === 0
+      ) {
+        return;
+      }
+    }
+
     // Step 1: Deduplication check on existing_status
     if (
       resolved.existing_status === "completed" ||
@@ -375,21 +460,52 @@ export class ChannelGatewayOrchestrator {
 
     // Step 2: Check link & permission status
     if (!resolved.linked || !resolved.allowed || !resolved.dalton_user_id) {
+      const denyReason =
+        resolved.deny_reason ??
+        (resolved.linked ? "workspace_write_denied" : "not_linked");
+      if (
+        denyReason === "weixin_group_unsupported" ||
+        denyReason === "invalid_inbound_event"
+      ) {
+        return;
+      }
       await this.backend.updateInboundProgress({
         platform: event.platform,
         message_id: event.messageId,
         status: "failed",
       });
-      const denyNotice = this.formatDenyNotice(
-        event.platform,
-        resolved.deny_reason ??
-          (resolved.linked ? "workspace_write_denied" : "not_linked"),
+      const denyNotice = this.formatDenyNotice(event.platform, denyReason);
+      await this.sendInboundNotice(
+        event,
+        resolved.dalton_user_id,
+        `notice:${event.platform}:${event.messageId}:deny_${denyReason}`,
+        denyNotice,
       );
-      await this.sendDirectAdapterNotice(event, denyNotice);
       return;
     }
 
     const userId = resolved.dalton_user_id;
+
+    // Step 2b: Voice message without transcription and without attachments
+    if (
+      (event.voiceWithoutTranscription === true ||
+        event.rawPayload?.voice_without_transcription === true) &&
+      event.text.trim().length === 0 &&
+      (event.attachments ?? []).length === 0
+    ) {
+      await this.backend.updateInboundProgress({
+        platform: event.platform,
+        message_id: event.messageId,
+        status: "completed",
+      });
+      await this.sendInboundNotice(
+        event,
+        userId,
+        `notice:${event.platform}:${event.messageId}:voice_no_text`,
+        "无法读取这条语音消息的文字内容（当前未包含语音转写）。请在微信中开启语音转文字后重试，或直接发送文字消息。",
+      );
+      return;
+    }
 
     // Step 3: Upload attachments to workspace if present (§1.3.1)
     let uploadedAttachments: UploadedAttachmentRecord[] =
@@ -467,6 +583,234 @@ export class ChannelGatewayOrchestrator {
   // §3.3 Slash Commands (`/bind`, `/unbind`, `/workspace`, `/main`, `/new`, `/stop`, `/<workspace_name>`)
   // =========================================================================
 
+  private bindConfirmationText(
+    event: InboundChannelEvent,
+    action: "bind" | "unbind",
+    result: object,
+  ): string {
+    const fields = confirmationFields(result);
+    const reason = fields.reason ?? "";
+    if (action === "bind" && !fields.ok) {
+      if (
+        reason === "missing_bind_code" ||
+        reason === "missing_argument"
+      ) {
+        return "Usage: `/bind <6-CHAR-CODE>` (generate a bind code in Web Settings → Channels).";
+      }
+      if (reason === "revoked_in_group") {
+        return "For security, `/bind` cannot be used in a group chat. This code has been revoked; please generate a new code and send `/bind <CODE>` in a direct message.";
+      }
+      if (reason === "platform_mismatch") {
+        const expected = fields.expectedPlatform ?? "another platform";
+        return `This bind code was generated for ${expected}, not ${event.platform}.`;
+      }
+      return "Bind code is invalid or expired. Please generate a new code in Web Settings → Channels.";
+    }
+    if (action === "bind") {
+      return `Successfully linked your ${event.platform} account to Dalton.`;
+    }
+    if (!fields.ok) {
+      return `Your ${event.platform} account is not currently linked.`;
+    }
+    return `Unlinked your ${event.platform} account from Dalton.`;
+  }
+
+  private storedBindingConfirmation(
+    row: {
+      consumed_bind_result?: Record<string, unknown> | null;
+      command_result?: object | null;
+      command_request?: object | null;
+    },
+  ): {
+    action: "bind" | "unbind";
+    result: object;
+    legacyCommandRecord: boolean;
+  } | null {
+    const consumed = row.consumed_bind_result;
+    if (consumed && typeof consumed === "object" && !Array.isArray(consumed)) {
+      const action = confirmationFields(consumed).action ?? "bind";
+      return { action, result: consumed, legacyCommandRecord: false };
+    }
+    const commandResult = row.command_result;
+    if (
+      !commandResult ||
+      typeof commandResult !== "object" ||
+      Array.isArray(commandResult)
+    ) {
+      return null;
+    }
+    const fields = confirmationFields(commandResult);
+    const requestAction = storedBindingAction(row.command_request);
+    let action: "bind" | "unbind" | null = fields.action;
+    if (!action && fields.reason === "missing_bind_code") action = "bind";
+    if (!action && requestAction && recordField(commandResult, "ok") !== undefined) {
+      const okValue = recordField(commandResult, "ok");
+      if (okValue === true || okValue === false) action = requestAction;
+    }
+    if (!action) return null;
+    return {
+      action,
+      result: commandResult,
+      legacyCommandRecord: fields.deliveryKey == null,
+    };
+  }
+
+  /**
+   * One confirmation entry for a live bind/unbind and for startup recovery.
+   * `replyPending === false` skips the send, the inbound update, and the
+   * watch close. A saved `delivery_key` is reused. A record without that key
+   * keeps `notice:<platform>:<message>:command` on every attempt, so a later
+   * duplicate does not become a second message. `closeWatchesOnSuccessfulUnbind`
+   * is set by a fresh live unbind and by a consumed or keyed recovery; old
+   * production recovery leaves watches open. A close uses `generations` from
+   * the unbind result: only a watch for that user, platform, and scope whose
+   * generation is lower than the stored post-unbind generation is aborted.
+   * A missing or invalid map does not close any watch.
+   */
+  private async deliverStoredCommandConfirmation(params: {
+    event: InboundChannelEvent;
+    userId: string | null;
+    action: "bind" | "unbind";
+    result: object;
+    replyPending?: boolean;
+    closeWatchesOnSuccessfulUnbind?: boolean;
+  }): Promise<boolean> {
+    if (params.replyPending === false) return false;
+    const fields = confirmationFields(params.result);
+    const legacy = fields.deliveryKey == null;
+    const deliveryKey =
+      fields.deliveryKey ??
+      `notice:${params.event.platform}:${params.event.messageId}:command`;
+    const linkedUser =
+      params.userId && params.userId.trim().length > 0
+        ? params.userId.trim()
+        : null;
+    if (
+      params.closeWatchesOnSuccessfulUnbind &&
+      params.action === "unbind" &&
+      fields.ok &&
+      linkedUser
+    ) {
+      this.closeWatchesOlderThanStoredUnbind(
+        linkedUser,
+        params.event.platform,
+        params.result,
+      );
+    }
+    let delivered = false;
+    if (legacy && !linkedUser) {
+      const adapter = this.adapters.get(params.event.platform);
+      if (!adapter || !adapter.isConfigured() || !adapter.isConnected()) {
+        return false;
+      }
+      try {
+        await this.sendDirectAdapterNotice(
+          params.event,
+          this.bindConfirmationText(params.event, params.action, params.result),
+        );
+        delivered = true;
+      } catch {
+        delivered = false;
+      }
+    } else {
+      delivered = await this.sendInboundNotice(
+        params.event,
+        linkedUser,
+        deliveryKey,
+        this.bindConfirmationText(params.event, params.action, params.result),
+      );
+    }
+    if (!delivered) return false;
+    await this.backend.updateInboundProgress({
+      platform: params.event.platform,
+      message_id: params.event.messageId,
+      status: legacy ? (fields.ok ? "completed" : "failed") : "completed",
+      command_reply_pending: false,
+      command_effect_status: "done",
+      fallback_pending: false,
+    });
+    return true;
+  }
+
+  private async recoverStoredBindingConfirmation(
+    row: RecoverInboundEventRow,
+    event: InboundChannelEvent,
+  ): Promise<boolean> {
+    const stored = this.storedBindingConfirmation({
+      consumed_bind_result: row.consumed_bind_result ?? null,
+      command_result:
+        row.command_result && typeof row.command_result === "object"
+          ? row.command_result
+          : null,
+      command_request:
+        row.command_request && typeof row.command_request === "object"
+          ? row.command_request
+          : null,
+    });
+    if (!stored) return false;
+    if (row.command_reply_pending === false) return true;
+    const storedUser = confirmationFields(stored.result).userId;
+    const rowUser =
+      typeof row.dalton_user_id === "string" && row.dalton_user_id.trim()
+        ? row.dalton_user_id.trim()
+        : null;
+    await this.deliverStoredCommandConfirmation({
+      event,
+      userId: storedUser ?? rowUser,
+      action: stored.action,
+      result: stored.result,
+      replyPending: row.command_reply_pending,
+      closeWatchesOnSuccessfulUnbind:
+        !stored.legacyCommandRecord && stored.action === "unbind",
+    });
+    return true;
+  }
+
+  /** Repeat a bind or unbind that I-1 already stored, without consuming again. */
+  private async replayRegisteredBinding(
+    event: InboundChannelEvent,
+    resolved: I1RegisterAndResolveResponse,
+    fallbackAction: "bind" | "unbind",
+  ): Promise<boolean> {
+    const consumed = resolved.consumed_bind_result;
+    if (consumed && typeof consumed === "object" && !Array.isArray(consumed)) {
+      const fields = confirmationFields(consumed);
+      const action = fields.action ?? fallbackAction;
+      await this.deliverStoredCommandConfirmation({
+        event,
+        userId: fields.userId ?? resolved.dalton_user_id,
+        action,
+        result: consumed,
+        replyPending: resolved.command_reply_pending,
+        closeWatchesOnSuccessfulUnbind: action === "unbind",
+      });
+      return true;
+    }
+    const requestAction = storedBindingAction(resolved.command_request);
+    const commandResult = resolved.command_result;
+    if (
+      !requestAction ||
+      !commandResult ||
+      typeof commandResult !== "object" ||
+      Array.isArray(commandResult)
+    ) {
+      return false;
+    }
+    const okValue = recordField(commandResult, "ok");
+    if (okValue !== true && okValue !== false) return false;
+    const fields = confirmationFields(commandResult);
+    await this.deliverStoredCommandConfirmation({
+      event,
+      userId: fields.userId ?? resolved.dalton_user_id,
+      action: requestAction,
+      result: commandResult,
+      replyPending: resolved.command_reply_pending,
+      closeWatchesOnSuccessfulUnbind:
+        requestAction === "unbind" && fields.deliveryKey != null,
+    });
+    return true;
+  }
+
   private async tryHandleSlashCommand(
     event: InboundChannelEvent,
     parsedCmd: ParsedSlashCommand,
@@ -476,13 +820,73 @@ export class ChannelGatewayOrchestrator {
       return true;
     }
 
+    let resolved: I1RegisterAndResolveResponse | undefined;
+    if (parsedCmd.kind === "bind" || parsedCmd.kind === "unbind") {
+      const reqKey = makeInboundRequestKey(event.platform, event.messageId);
+      resolved = await this.backend.registerAndResolveInbound({
+        platform: event.platform,
+        platform_user_id: event.platformUserId,
+        chat_type: event.chatType,
+        chat_address: event.chatAddress,
+        thread_scope_key: event.threadScopeKey,
+        message_id: event.messageId,
+        request_key: reqKey,
+        raw_payload: {
+          ...this.buildInboundRawPayload(event),
+          command: parsedCmd.kind,
+        },
+        weixin_context_token: event.weixinContextToken ?? null,
+        weixin_bot_id: event.weixinBotId ?? null,
+        weixin_bot_generation: event.weixinBotGeneration ?? null,
+        weixin_context_seq: event.weixinContextSeq ?? null,
+      });
+      if (
+        resolved.deny_reason === "weixin_group_unsupported" ||
+        resolved.deny_reason === "invalid_inbound_event"
+      ) {
+        return true;
+      }
+      if (resolved.existing_status === "ignored" && parsedCmd.kind !== "bind") {
+        const reason = resolved.deny_reason ?? "";
+        if (
+          reason === "weixin_group_unsupported" ||
+          reason === "invalid_inbound_event" ||
+          reason.length === 0
+        ) {
+          return true;
+        }
+      }
+    }
+
     if (parsedCmd.kind === "bind") {
+      if (!resolved) {
+        return true;
+      }
+      if (await this.replayRegisteredBinding(event, resolved, "bind")) {
+        return true;
+      }
       const arg = parsedCmd.code;
       if (!arg) {
-        await this.sendDirectAdapterNotice(
+        const deliveryKey = `notice:${event.platform}:${event.messageId}:bind_usage`;
+        const usageResult: Record<string, unknown> = {
+          ok: false,
+          action: "bind",
+          reason: "missing_bind_code",
+          delivery_key: deliveryKey,
+        };
+        await this.backend.updateInboundProgress({
+          platform: event.platform,
+          message_id: event.messageId,
+          command_effect_status: "done",
+          command_reply_pending: true,
+          command_result: usageResult as unknown as I3SessionCommandResponse,
+        });
+        await this.deliverStoredCommandConfirmation({
           event,
-          "Usage: `/bind <6-CHAR-CODE>` (generate a bind code in Web Settings → Channels).",
-        );
+          userId: resolved.dalton_user_id,
+          action: "bind",
+          result: usageResult,
+        });
         return true;
       }
       const res = await this.backend.consumeBindCode({
@@ -492,6 +896,9 @@ export class ChannelGatewayOrchestrator {
         platform_username: event.platformUsername ?? null,
         platform_tenant_key: event.platformTenantKey ?? null,
         weixin_context_token: event.weixinContextToken ?? null,
+        weixin_bot_id: event.weixinBotId ?? null,
+        weixin_bot_generation: event.weixinBotGeneration ?? null,
+        inbound_message_id: event.messageId,
         code: arg,
         is_group: event.chatType === "group",
         message_id: event.messageId,
@@ -500,27 +907,32 @@ export class ChannelGatewayOrchestrator {
         scope_key: event.threadScopeKey,
         request_key: makeInboundRequestKey(event.platform, event.messageId),
       });
-      const reply = formatBindUnbindReply({
+      await this.deliverStoredCommandConfirmation({
+        event,
+        userId: res.user_id?.trim() || resolved.dalton_user_id,
         action: "bind",
-        platform: event.platform,
-        ok: Boolean(res.ok),
-        reason: res.reason,
-        expectedPlatform: res.expected_platform,
-      });
-      await this.deliverStoredCommandConfirmation(event, {
-        userId: res.user_id?.trim() || null,
-        reply,
-        ok: Boolean(res.ok),
+        result: res,
         replyPending: res.command_reply_pending,
+        closeWatchesOnSuccessfulUnbind: false,
       });
       return true;
     }
 
     if (parsedCmd.kind === "unbind") {
+      if (!resolved) {
+        return true;
+      }
+      if (await this.replayRegisteredBinding(event, resolved, "unbind")) {
+        return true;
+      }
       const res = await this.backend.consumeBindCode({
         action: "unbind",
         platform: event.platform,
         platform_user_id: event.platformUserId,
+        weixin_context_token: event.weixinContextToken ?? null,
+        weixin_bot_id: event.weixinBotId ?? null,
+        weixin_bot_generation: event.weixinBotGeneration ?? null,
+        inbound_message_id: event.messageId,
         is_group: event.chatType === "group",
         message_id: event.messageId,
         chat_type: event.chatType,
@@ -528,18 +940,16 @@ export class ChannelGatewayOrchestrator {
         scope_key: event.threadScopeKey,
         request_key: makeInboundRequestKey(event.platform, event.messageId),
       });
-      if (res.ok && res.user_id) {
-        this.closeWatchesForUserPlatform(res.user_id, event.platform);
-      }
-      await this.deliverStoredCommandConfirmation(event, {
-        userId: res.user_id?.trim() || null,
-        reply: formatBindUnbindReply({
-          action: "unbind",
-          platform: event.platform,
-          ok: Boolean(res.ok),
-        }),
-        ok: Boolean(res.ok),
+      const legacyReplay =
+        res.duplicate === true &&
+        !(typeof res.delivery_key === "string" && res.delivery_key.length > 0);
+      await this.deliverStoredCommandConfirmation({
+        event,
+        userId: res.user_id?.trim() || resolved.dalton_user_id,
+        action: "unbind",
+        result: res,
         replyPending: res.command_reply_pending,
+        closeWatchesOnSuccessfulUnbind: !legacyReplay,
       });
       return true;
     }
@@ -562,6 +972,11 @@ export class ChannelGatewayOrchestrator {
         cmd: parsedCmd.cmd,
       },
       weixin_context_token: event.weixinContextToken ?? null,
+      weixin_bot_id: event.weixinBotId ?? null,
+      weixin_bot_generation: event.weixinBotGeneration ?? null,
+      weixin_context_seq: event.weixinContextSeq ?? null,
+      weixin_context_source:
+        event.weixinContextSeq != null ? "protocol" : null,
       target_kind: parsedCmd.targetKind ?? null,
       workspace_id: parsedCmd.workspaceId ?? null,
       workspace_query: parsedCmd.workspaceQuery ?? null,
@@ -577,14 +992,313 @@ export class ChannelGatewayOrchestrator {
     return true;
   }
 
+  // =========================================================================
+  // Discord Native Interactions (`INTERACTION_CREATE`)
+  // =========================================================================
+
+  async handleNativeInteraction(event: NativeInteractionEvent): Promise<void> {
+    if (event.kind === "autocomplete") {
+      await this.handleNativeAutocompleteInteraction(event);
+      return;
+    }
+    await this.handleNativeCommandInteraction(event);
+  }
+
+  private async handleNativeAutocompleteInteraction(
+    event: NativeAutocompleteInteractionEvent,
+  ): Promise<void> {
+    const deadlineMs = event.deadlineMs ?? event.responder.receivedAtMs + 1_800;
+    const remainingMs = deadlineMs - this.nowFn();
+    if (remainingMs <= 0) {
+      await event.responder.respondChoices([]);
+      return;
+    }
+    const budgetMs = Math.min(1_800, remainingMs);
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const queryPromise = this.backend.sessionCommand({
+        cmd: "workspace_list",
+        platform: event.platform,
+        platform_user_id: event.platformUserId,
+        chat_type: event.chatType,
+        chat_address: event.chatAddress,
+        chat_id: event.chatId,
+        chat_name: event.chatName ?? null,
+        scope_key: event.threadScopeKey,
+        is_internal_query: true,
+      });
+      const timeoutPromise = new Promise<null>((resolve) => {
+        timeoutHandle = setTimeout(() => resolve(null), budgetMs);
+        (timeoutHandle as { unref?: () => void }).unref?.();
+      });
+      const res = await Promise.race([queryPromise, timeoutPromise]);
+      if (
+        !res ||
+        !res.ok ||
+        res.allowed === false ||
+        res.linked === false ||
+        !Array.isArray(res.workspaces)
+      ) {
+        await event.responder.respondChoices([]);
+        return;
+      }
+
+      const rawQuery = (event.query ?? "").trim().toLowerCase();
+      const prefixMatches: NativeAutocompleteChoice[] = [];
+      const substringMatches: NativeAutocompleteChoice[] = [];
+      for (const ws of res.workspaces) {
+        const wsId = typeof ws.workspace_id === "string" ? ws.workspace_id.trim() : "";
+        const wsName = typeof ws.name === "string" ? ws.name.trim() : "";
+        if (!wsId || !wsName) continue;
+        if (!rawQuery) {
+          prefixMatches.push({ name: wsName, value: wsId });
+          continue;
+        }
+        const lowerName = wsName.toLowerCase();
+        const lowerId = wsId.toLowerCase();
+        if (lowerName.startsWith(rawQuery) || lowerId.startsWith(rawQuery)) {
+          prefixMatches.push({ name: wsName, value: wsId });
+        } else if (lowerName.includes(rawQuery) || lowerId.includes(rawQuery)) {
+          substringMatches.push({ name: wsName, value: wsId });
+        }
+      }
+      const choices = [...prefixMatches, ...substringMatches].slice(0, 25);
+      await event.responder.respondChoices(choices);
+    } catch {
+      await event.responder.respondChoices([]);
+    } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+    }
+  }
+
+  private async handleNativeCommandInteraction(
+    event: NativeCommandInteractionEvent,
+  ): Promise<void> {
+    const ackOutcome = event.responder.ackResult.outcome;
+    const rawPayload: Record<string, unknown> = {
+      ...event.rawPayload,
+      platform_user_id: event.platformUserId,
+      ...(event.platformUsername
+        ? { platform_username: event.platformUsername }
+        : {}),
+      chat_id: event.chatId,
+      ...(event.chatName ? { chat_name: event.chatName } : {}),
+      command: `/${event.commandName}`,
+      cmd: event.cmd,
+      native_interaction: true,
+      native_ack_status: ackOutcome,
+      native_reply_status:
+        ackOutcome === "acknowledged" ? "pending" : "not_applicable",
+    };
+
+    if (ackOutcome !== "acknowledged") {
+      // Initial callback failed or had an unknown outcome: record the unexecuted
+      // interaction in the ledger without executing the command or touching session state.
+      await this.backend.sessionCommand({
+        cmd: event.cmd,
+        platform: event.platform,
+        platform_user_id: event.platformUserId,
+        chat_type: event.chatType,
+        chat_address: event.chatAddress,
+        chat_id: event.chatId,
+        chat_name: event.chatName ?? null,
+        scope_key: event.threadScopeKey,
+        message_id: event.interactionId,
+        request_key: event.requestKey,
+        raw_payload: rawPayload,
+        target_kind: event.targetKind ?? null,
+        workspace_id: event.workspaceId ?? null,
+        workspace_query: event.workspaceQuery ?? null,
+        native_interaction: true,
+        native_ack_status: ackOutcome,
+        native_reply_status: "not_applicable",
+      });
+      return;
+    }
+
+    const cmdRes = await this.backend.sessionCommand({
+      cmd: event.cmd,
+      platform: event.platform,
+      platform_user_id: event.platformUserId,
+      chat_type: event.chatType,
+      chat_address: event.chatAddress,
+      chat_id: event.chatId,
+      chat_name: event.chatName ?? null,
+      scope_key: event.threadScopeKey,
+      message_id: event.interactionId,
+      request_key: event.requestKey,
+      raw_payload: rawPayload,
+      target_kind: event.targetKind ?? null,
+      workspace_id: event.workspaceId ?? null,
+      workspace_query: event.workspaceQuery ?? null,
+      native_interaction: true,
+      native_ack_status: "acknowledged",
+      native_reply_status: "pending",
+    });
+
+    if (cmdRes.not_executed === true) {
+      return;
+    }
+
+    const syntheticEvent: InboundChannelEvent = {
+      platform: event.platform,
+      platformUserId: event.platformUserId,
+      ...(event.platformUsername
+        ? { platformUsername: event.platformUsername }
+        : {}),
+      chatType: event.chatType,
+      chatAddress: event.chatAddress,
+      chatId: event.chatId,
+      ...(event.chatName ? { chatName: event.chatName } : {}),
+      threadScopeKey: event.threadScopeKey,
+      messageId: event.interactionId,
+      text: "",
+      rawPayload,
+    };
+
+    await this.completeSessionCommandExecution({
+      event: syntheticEvent,
+      cmd: event.cmd,
+      targetKind: event.targetKind ?? null,
+      workspaceQuery: event.workspaceQuery ?? null,
+      cmdRes,
+      nativeResponder: event.responder,
+    });
+  }
+
+  private isNativeInteractionEvent(
+    rawPayload?: Record<string, unknown> | null,
+    cmdRes?: I3SessionCommandResponse | null,
+  ): boolean {
+    if (cmdRes?.native_interaction === true) return true;
+    if (!rawPayload || typeof rawPayload !== "object") return false;
+    return (
+      rawPayload.native_interaction === true ||
+      Boolean(
+        rawPayload.discord_interaction &&
+          typeof rawPayload.discord_interaction === "object" &&
+          !Array.isArray(rawPayload.discord_interaction),
+      )
+    );
+  }
+
+  private async deliverNativeCommandReply(params: {
+    event: InboundChannelEvent;
+    cmd: "workspace_list" | "workspace_switch" | "new" | "stop";
+    cmdRes: I3SessionCommandResponse;
+    replyText: string;
+    nativeResponder?: NativeCommandResponder;
+  }): Promise<void> {
+    const { event, cmd, cmdRes, replyText, nativeResponder } = params;
+    const terminalStatus = cmdRes.ok ? "completed" : "failed";
+    const effectDonePatch =
+      cmd === "stop" && cmdRes.ok ? { command_effect_status: "done" } : {};
+
+    if (!nativeResponder) {
+      // Process restarted and the short-lived interaction token is no longer available:
+      // preserve the command result, close out the reply attempt, and never fall back to public channel send.
+      await this.backend.updateInboundProgress({
+        platform: event.platform,
+        message_id: event.messageId,
+        status: terminalStatus,
+        command_reply_pending: false,
+        fallback_pending: false,
+        ...effectDonePatch,
+        raw_payload_patch: {
+          native_interaction: true,
+          native_reply_status: "abandoned_on_restart",
+        },
+      });
+      return;
+    }
+
+    if (nativeResponder.isExpired()) {
+      await this.backend.updateInboundProgress({
+        platform: event.platform,
+        message_id: event.messageId,
+        status: terminalStatus,
+        command_reply_pending: false,
+        fallback_pending: false,
+        ...effectDonePatch,
+        raw_payload_patch: {
+          native_interaction: true,
+          native_reply_status: "expired",
+        },
+      });
+      return;
+    }
+
+    const editOutcome = await nativeResponder.sendPrivateReply(replyText);
+    if (editOutcome.outcome === "sent") {
+      await this.backend.updateInboundProgress({
+        platform: event.platform,
+        message_id: event.messageId,
+        status: terminalStatus,
+        command_reply_pending: false,
+        fallback_pending: false,
+        ...effectDonePatch,
+        raw_payload_patch: {
+          native_interaction: true,
+          native_reply_status: "sent",
+        },
+      });
+      return;
+    }
+
+    if (editOutcome.outcome === "expired" || editOutcome.outcome === "failed") {
+      await this.backend.updateInboundProgress({
+        platform: event.platform,
+        message_id: event.messageId,
+        status: terminalStatus,
+        command_reply_pending: false,
+        fallback_pending: false,
+        ...effectDonePatch,
+        raw_payload_patch: {
+          native_interaction: true,
+          native_reply_status:
+            editOutcome.outcome === "expired" ? "expired" : "failed",
+        },
+      });
+      return;
+    }
+
+    // Transient / unknown webhook PATCH outcome within the 15-minute token window:
+    // keep `command_reply_pending: true` so a retry with the valid token can still update `@original`
+    // without re-executing the command.
+    await this.backend.updateInboundProgress({
+      platform: event.platform,
+      message_id: event.messageId,
+      ...effectDonePatch,
+      raw_payload_patch: {
+        native_interaction: true,
+        native_reply_status: "failed",
+      },
+    });
+  }
+
   private async completeSessionCommandExecution(params: {
     event: InboundChannelEvent;
     cmd: "workspace_list" | "workspace_switch" | "new" | "stop";
     targetKind?: SessionCommandTargetKind | null;
     workspaceQuery?: string | null;
     cmdRes: I3SessionCommandResponse;
+    nativeResponder?: NativeCommandResponder;
   }): Promise<void> {
-    const { event, cmd, targetKind, workspaceQuery, cmdRes } = params;
+    const {
+      event,
+      cmd,
+      targetKind,
+      workspaceQuery,
+      cmdRes,
+      nativeResponder,
+    } = params;
+    const isNative =
+      Boolean(nativeResponder) ||
+      this.isNativeInteractionEvent(event.rawPayload, cmdRes);
+
+    if (cmdRes.not_executed === true) {
+      return;
+    }
 
     if (
       cmdRes.command_reply_pending === false &&
@@ -597,20 +1311,46 @@ export class ChannelGatewayOrchestrator {
       !cmdRes.ok &&
       (cmdRes.linked === false || cmdRes.deny_reason === "not_linked")
     ) {
-      await this.sendDirectAdapterNotice(
-        event,
-        this.formatDenyNotice(
-          event.platform,
-          cmdRes.deny_reason ?? "not_linked",
-        ),
+      const denyText = this.formatDenyNotice(
+        event.platform,
+        cmdRes.deny_reason ?? "not_linked",
       );
+      if (isNative) {
+        if (cmdRes.command_reply_pending !== false) {
+          await this.deliverNativeCommandReply({
+            event,
+            cmd,
+            cmdRes,
+            replyText: denyText,
+            nativeResponder,
+          });
+        }
+        return;
+      }
+      const delivered = await this.sendInboundNotice(
+        event,
+        null,
+        `notice:${event.platform}:${event.messageId}:deny_not_linked`,
+        denyText,
+      );
+      if (delivered) {
+        await this.backend.updateInboundProgress({
+          platform: event.platform,
+          message_id: event.messageId,
+          command_reply_pending: false,
+        });
+      }
       return;
     }
 
     const userId = cmdRes.dalton_user_id ?? null;
 
     if (cmd === "stop" && this.isStopCancelDenied(cmdRes)) {
-      await this.deliverPersistedStopCancelDenial({ event, cmdRes });
+      await this.deliverPersistedStopCancelDenial({
+        event,
+        cmdRes,
+        nativeResponder,
+      });
       return;
     }
 
@@ -685,6 +1425,7 @@ export class ChannelGatewayOrchestrator {
                   ...failureResult,
                   dalton_user_id: userId ?? failureResult.dalton_user_id ?? null,
                 },
+                nativeResponder,
               });
             }
             return;
@@ -707,6 +1448,17 @@ export class ChannelGatewayOrchestrator {
       workspaceQuery: workspaceQuery ?? null,
       cmdRes,
     });
+
+    if (isNative) {
+      await this.deliverNativeCommandReply({
+        event,
+        cmd,
+        cmdRes,
+        replyText,
+        nativeResponder,
+      });
+      return;
+    }
 
     if (userId) {
       const delivered = await this.sendNoticeDelivery({
@@ -738,7 +1490,13 @@ export class ChannelGatewayOrchestrator {
         });
       }
     } else {
-      await this.sendDirectAdapterNotice(event, replyText);
+      const delivered = await this.sendInboundNotice(
+        event,
+        null,
+        `notice:${event.platform}:${event.messageId}:command`,
+        replyText,
+      );
+      if (!delivered) return;
       await this.backend.updateInboundProgress({
         platform: event.platform,
         message_id: event.messageId,
@@ -782,8 +1540,9 @@ export class ChannelGatewayOrchestrator {
   private async deliverPersistedStopCancelDenial(params: {
     event: InboundChannelEvent;
     cmdRes: I3SessionCommandResponse;
+    nativeResponder?: NativeCommandResponder;
   }): Promise<void> {
-    const { event, cmdRes } = params;
+    const { event, cmdRes, nativeResponder } = params;
     if (cmdRes.command_reply_pending === false) {
       return;
     }
@@ -792,6 +1551,19 @@ export class ChannelGatewayOrchestrator {
         ? cmdRes.stop_cancel_status
         : null;
     const failText = `Failed to stop the current run (status ${cancelStatus}).`;
+    const isNative =
+      Boolean(nativeResponder) ||
+      this.isNativeInteractionEvent(event.rawPayload, cmdRes);
+    if (isNative) {
+      await this.deliverNativeCommandReply({
+        event,
+        cmd: "stop",
+        cmdRes,
+        replyText: failText,
+        nativeResponder,
+      });
+      return;
+    }
     const userId = cmdRes.dalton_user_id ?? null;
     let delivered = false;
     if (userId) {
@@ -812,8 +1584,12 @@ export class ChannelGatewayOrchestrator {
         activityOrigin: "none",
       });
     } else {
-      await this.sendDirectAdapterNotice(event, failText);
-      delivered = true;
+      delivered = await this.sendInboundNotice(
+        event,
+        null,
+        `notice:${event.platform}:${event.messageId}:command_err`,
+        failText,
+      );
     }
     if (!delivered) {
       return;
@@ -875,6 +1651,9 @@ export class ChannelGatewayOrchestrator {
       if (!cmdRes.ok) {
         if (cmdRes.deny_reason === "workspace_ambiguous") {
           const candidates = cmdRes.candidates ?? [];
+          if (candidates.length === 0) {
+            return this.formatDenyNotice(platform, "workspace_write_denied");
+          }
           const candidateLines = candidates.map(
             (c) => `- \`${c.name}\` (\`${c.workspace_id}\`)`,
           );
@@ -7051,36 +7830,15 @@ export class ChannelGatewayOrchestrator {
   async syncWeixinStateCache(): Promise<void> {
     try {
       const wxState = await this.backend.getWeixinState(true);
-      if (wxState.configured) {
-        mkdirSync(this.weixinCacheDir, { recursive: true, mode: 0o700 });
-        try {
-          chmodSync(this.weixinCacheDir, 0o700);
-        } catch {
-          // Ignore chmod errors on non-POSIX filesystems
-        }
-        const stateFilePath = resolve(this.weixinCacheDir, "state.json");
-        writeFileSync(
-          stateFilePath,
-          JSON.stringify(
-            {
-              ilink_bot_id: wxState.ilink_bot_id,
-              owner_user_id: wxState.owner_user_id,
-              bot_token: wxState.bot_token ?? null,
-              base_url: wxState.base_url,
-              get_updates_buf: wxState.get_updates_buf,
-              status: wxState.status,
-              updated_at: wxState.updated_at,
-            },
-            null,
-            2,
-          ),
-          { mode: 0o600 },
-        );
-        try {
-          chmodSync(stateFilePath, 0o600);
-        } catch {
-          // Ignore chmod errors on non-POSIX filesystems
-        }
+      const wxAdapter = this.adapters.get("weixin") as
+        | (ChannelAdapter & {
+            applyPersistedState?: (
+              state: I9WeixinStateGetResponse,
+            ) => Promise<void> | void;
+          })
+        | undefined;
+      if (wxAdapter?.applyPersistedState) {
+        await wxAdapter.applyPersistedState(wxState);
       }
     } catch {
       // Do not fail startup if Weixin is unconfigured or encryption key is absent
@@ -7103,7 +7861,7 @@ export class ChannelGatewayOrchestrator {
   }
 
   async runStartupRecovery(): Promise<void> {
-    // Step 1: Sync Weixin credentials & get_updates_buf from `I-9` to local 0700/0600 cache
+    // Step 1: Load Weixin credentials & get_updates_buf from `I-9` into adapter memory
     await this.syncWeixinStateCache();
 
     // Step 2: Call `I-7` `GET /api/v1/dalton/channels/internal/recover?mode=startup`
@@ -7128,12 +7886,16 @@ export class ChannelGatewayOrchestrator {
 
   private parseRecoveredAttachments(
     value: unknown,
+    fallbackWeixinValue?: unknown,
   ): InboundAttachmentDescriptor[] {
-    if (!Array.isArray(value)) {
-      return [];
-    }
+    const source =
+      Array.isArray(value) && value.length > 0
+        ? value
+        : Array.isArray(fallbackWeixinValue)
+          ? fallbackWeixinValue
+          : [];
     const attachments: InboundAttachmentDescriptor[] = [];
-    for (const entry of value) {
+    for (const entry of source) {
       if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
         continue;
       }
@@ -7146,106 +7908,40 @@ export class ChannelGatewayOrchestrator {
       if (!id || !filename || !mimeType) {
         continue;
       }
-      attachments.push({
-        id,
-        filename,
-        mimeType,
-        ...(typeof record.sizeBytes === "number" &&
-        Number.isFinite(record.sizeBytes) &&
-        record.sizeBytes >= 0
-          ? { sizeBytes: record.sizeBytes }
-          : {}),
-      });
+      const descriptor: InboundAttachmentDescriptor & Record<string, unknown> =
+        {
+          id,
+          filename,
+          mimeType,
+          ...(typeof record.sizeBytes === "number" &&
+          Number.isFinite(record.sizeBytes) &&
+          record.sizeBytes >= 0
+            ? { sizeBytes: record.sizeBytes }
+            : {}),
+        };
+      if (typeof record.kind === "string") {
+        descriptor.kind = record.kind;
+      }
+      if (typeof record.encryptQueryParam === "string") {
+        descriptor.encryptQueryParam = record.encryptQueryParam;
+      }
+      if (typeof record.fullUrl === "string") {
+        descriptor.fullUrl = record.fullUrl;
+      }
+      if (typeof record.aesKeyHex === "string") {
+        descriptor.aesKeyHex = record.aesKeyHex;
+      }
+      if (typeof record.aesKeyBase64 === "string") {
+        descriptor.aesKeyBase64 = record.aesKeyBase64;
+      }
+      attachments.push(descriptor);
     }
     return attachments;
-  }
-
-  private bindingRecoveryEvent(
-    row: RecoverInboundEventRow,
-  ): InboundChannelEvent {
-    const platformUserId =
-      (typeof row.platform_user_id === "string" &&
-      row.platform_user_id.trim().length > 0
-        ? row.platform_user_id.trim()
-        : typeof row.raw_payload?.platform_user_id === "string" &&
-            row.raw_payload.platform_user_id.trim().length > 0
-          ? row.raw_payload.platform_user_id.trim()
-          : typeof row.raw_payload?.sender_id === "string" &&
-              row.raw_payload.sender_id.trim().length > 0
-            ? row.raw_payload.sender_id.trim()
-            : "");
-    const chatId =
-      typeof row.raw_payload?.chat_id === "string" && row.raw_payload.chat_id
-        ? row.raw_payload.chat_id
-        : row.chat_address;
-    return {
-      platform: row.platform,
-      platformUserId,
-      ...(typeof row.raw_payload?.platform_username === "string" &&
-      row.raw_payload.platform_username
-        ? { platformUsername: row.raw_payload.platform_username }
-        : {}),
-      chatType: row.chat_type,
-      chatAddress: row.chat_address,
-      chatId,
-      ...(typeof row.raw_payload?.chat_name === "string" &&
-      row.raw_payload.chat_name
-        ? { chatName: row.raw_payload.chat_name }
-        : {}),
-      threadScopeKey: row.thread_scope_key,
-      messageId: row.message_id,
-      text: "",
-      rawPayload: row.raw_payload ?? {},
-    };
-  }
-
-  /**
-   * Delivers the stored bind/unbind confirmation. Does not consume a code,
-   * change identity, or run a workspace command.
-   */
-  private async recoverStoredBindingConfirmation(
-    row: RecoverInboundEventRow,
-    action: "bind" | "unbind",
-  ): Promise<void> {
-    const stored = storedBindingResult(row.command_result);
-    if (!stored) return;
-    const rowUserId =
-      typeof row.dalton_user_id === "string" && row.dalton_user_id.trim()
-        ? row.dalton_user_id.trim()
-        : null;
-    await this.deliverStoredCommandConfirmation(this.bindingRecoveryEvent(row), {
-      userId: stored.userId ?? rowUserId,
-      reply: formatBindUnbindReply({
-        action,
-        platform: row.platform,
-        ok: stored.ok,
-        reason: stored.reason,
-        expectedPlatform: stored.expectedPlatform,
-      }),
-      ok: stored.ok,
-      replyPending: row.command_reply_pending,
-    });
   }
 
   private async recoverSingleInboundRow(
     row: RecoverInboundEventRow,
   ): Promise<void> {
-    const bindingAction = storedBindingAction(row.command_request);
-    if (bindingAction) {
-      await this.recoverStoredBindingConfirmation(row, bindingAction);
-      return;
-    }
-    const userId = row.dalton_user_id;
-    if (!userId) {
-      await this.backend.updateInboundProgress({
-        platform: row.platform,
-        message_id: row.message_id,
-        status: "failed",
-        fallback_pending: false,
-      });
-      return;
-    }
-
     const platformUserId =
       (typeof row.platform_user_id === "string" &&
       row.platform_user_id.length > 0
@@ -7267,7 +7963,19 @@ export class ChannelGatewayOrchestrator {
 
     const recoveredAttachments = this.parseRecoveredAttachments(
       row.raw_payload?.attachments,
+      row.raw_payload?.weixin_attachments,
     );
+    const recoveredCommandText =
+      typeof row.raw_payload?.command_text === "string"
+        ? row.raw_payload.command_text
+        : typeof row.raw_payload?.command === "string"
+          ? `/${row.raw_payload.command}${
+              typeof row.raw_payload.arg === "string" &&
+              row.raw_payload.arg.length > 0
+                ? ` ${row.raw_payload.arg}`
+                : ""
+            }`
+          : undefined;
     const syntheticEvent: InboundChannelEvent = {
       platform: row.platform,
       platformUserId,
@@ -7290,11 +7998,38 @@ export class ChannelGatewayOrchestrator {
       messageId: row.message_id,
       text:
         typeof row.raw_payload?.text === "string" ? row.raw_payload.text : "",
+      ...(recoveredCommandText !== undefined
+        ? { commandText: recoveredCommandText }
+        : {}),
+      ...(row.raw_payload?.voice_without_transcription === true
+        ? { voiceWithoutTranscription: true }
+        : {}),
       ...(recoveredAttachments.length > 0
         ? { attachments: recoveredAttachments }
         : {}),
+      ...(typeof row.raw_payload?.ilink_bot_id === "string"
+        ? { weixinBotId: row.raw_payload.ilink_bot_id }
+        : {}),
+      ...(typeof row.raw_payload?.bot_generation === "number"
+        ? { weixinBotGeneration: row.raw_payload.bot_generation }
+        : {}),
+      ...(typeof row.raw_payload?.seq === "number"
+        ? { weixinContextSeq: row.raw_payload.seq }
+        : {}),
       rawPayload: row.raw_payload ?? {},
     };
+
+    if (
+      row.raw_payload?.invalid_inbound_event === true ||
+      row.raw_payload?.rejected_reason === "invalid_inbound_event" ||
+      row.raw_payload?.rejected_reason === "weixin_group_unsupported"
+    ) {
+      return;
+    }
+
+    if (await this.recoverStoredBindingConfirmation(row, syntheticEvent)) {
+      return;
+    }
 
     if (row.event_kind === "command") {
       const cmdReq = (row.command_request ?? {}) as Record<string, unknown>;
@@ -7311,7 +8046,7 @@ export class ChannelGatewayOrchestrator {
         rawCmd === "stop"
           ? rawCmd
           : "workspace_list";
-      const targetKind =
+      const targetKind: SessionCommandTargetKind | null =
         cmdReq.target_kind === "home" ||
         cmdReq.target_kind === "workspace_id" ||
         cmdReq.target_kind === "exact_name" ||
@@ -7324,6 +8059,26 @@ export class ChannelGatewayOrchestrator {
         typeof cmdReq.workspace_query === "string"
           ? cmdReq.workspace_query
           : null;
+      const isNativeCmd =
+        this.isNativeInteractionEvent(row.raw_payload) ||
+        cmdReq.native_interaction === true ||
+        cmdResRaw.native_interaction === true;
+      const nativeAckStatus:
+        | "acknowledged"
+        | "unknown"
+        | "failed"
+        | undefined =
+        cmdReq.native_ack_status === "acknowledged" ||
+        cmdReq.native_ack_status === "unknown" ||
+        cmdReq.native_ack_status === "failed"
+          ? cmdReq.native_ack_status
+          : row.raw_payload?.native_ack_status === "acknowledged" ||
+              row.raw_payload?.native_ack_status === "unknown" ||
+              row.raw_payload?.native_ack_status === "failed"
+            ? row.raw_payload.native_ack_status
+            : isNativeCmd
+              ? "acknowledged"
+              : undefined;
       const reauthorizedRes = await this.backend.sessionCommand({
         cmd,
         platform: row.platform,
@@ -7338,9 +8093,21 @@ export class ChannelGatewayOrchestrator {
           row.request_key ||
           makeInboundRequestKey(row.platform, row.message_id),
         raw_payload: row.raw_payload ?? {},
+        weixin_context_token: syntheticEvent.weixinContextToken ?? null,
+        weixin_bot_id: syntheticEvent.weixinBotId ?? null,
+        weixin_bot_generation: syntheticEvent.weixinBotGeneration ?? null,
+        weixin_context_seq: syntheticEvent.weixinContextSeq ?? null,
+        weixin_context_source:
+          syntheticEvent.weixinContextSeq != null ? "protocol" : null,
         target_kind: targetKind,
         workspace_id: workspaceId,
         workspace_query: workspaceQuery,
+        ...(isNativeCmd
+          ? {
+              native_interaction: true,
+              ...(nativeAckStatus ? { native_ack_status: nativeAckStatus } : {}),
+            }
+          : {}),
       });
       const persistedStopRunId =
         typeof row.run_id === "string" && row.run_id.length > 0
@@ -7428,6 +8195,7 @@ export class ChannelGatewayOrchestrator {
               : (reauthorizedRes.command_reply_pending ??
                 row.command_reply_pending ??
                 true),
+        ...(isNativeCmd ? { native_interaction: true } : {}),
         ...(stopCancelDenied
           ? {
               ok: false,
@@ -7445,6 +8213,67 @@ export class ChannelGatewayOrchestrator {
         workspaceQuery,
         cmdRes: effectiveCmdRes,
       });
+      return;
+    }
+
+    const commandCandidate = (
+      syntheticEvent.commandText ??
+      syntheticEvent.text ??
+      ""
+    ).trim();
+    if (
+      (row.status === "received" ||
+        row.status === "pending" ||
+        row.status === "accepted") &&
+      commandCandidate.startsWith("/")
+    ) {
+      const parsedRecoveryCommand = parseSlashCommand(
+        commandCandidate,
+        syntheticEvent.chatType,
+      );
+      if (parsedRecoveryCommand) {
+        const handled = await this.tryHandleSlashCommand(
+          syntheticEvent,
+          parsedRecoveryCommand,
+        );
+        if (handled) {
+          return;
+        }
+      }
+    }
+
+    const userId = row.dalton_user_id;
+    if (!userId) {
+      const isNative = this.isNativeInteractionEvent(row.raw_payload);
+      await this.backend.updateInboundProgress({
+        platform: row.platform,
+        message_id: row.message_id,
+        status: "failed",
+        fallback_pending: false,
+        ...(isNative
+          ? {
+              command_reply_pending: false,
+              command_effect_status: "done",
+              raw_payload_patch: {
+                native_interaction: true,
+                native_reply_status: "abandoned_on_restart",
+              },
+            }
+          : {}),
+      });
+      if (
+        !isNative &&
+        row.chat_type === "dm" &&
+        row.raw_payload?.invalid_inbound_event !== true &&
+        row.raw_payload?.rejected_reason !== "weixin_group_unsupported"
+      ) {
+        await this.sendInboundNotice(
+          syntheticEvent,
+          null,
+          `notice:${row.platform}:${row.message_id}:deny_not_linked`,
+          this.formatDenyNotice(row.platform, "not_linked"),
+        );
+      }
       return;
     }
 
@@ -8043,14 +8872,27 @@ export class ChannelGatewayOrchestrator {
     }
   }
 
-  private closeWatchesForUserPlatform(
+  private closeWatchesOlderThanStoredUnbind(
     userId: string,
     platform: ChannelPlatform,
+    result: object,
   ): void {
-    for (const [tid, handle] of this.activeWatches.entries()) {
-      if (handle.userId === userId && handle.platform === platform) {
+    const raw = recordField(result, "generations");
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return;
+    for (const [threadId, handle] of this.activeWatches.entries()) {
+      if (handle.userId !== userId || handle.platform !== platform) continue;
+      if (!Object.prototype.hasOwnProperty.call(raw, handle.scopeKey)) continue;
+      const stored = Reflect.get(raw, handle.scopeKey);
+      if (typeof stored !== "number" || !Number.isFinite(stored)) continue;
+      if (
+        typeof handle.generation !== "number" ||
+        !Number.isFinite(handle.generation)
+      ) {
+        continue;
+      }
+      if (handle.generation < stored) {
         handle.abortController.abort();
-        this.activeWatches.delete(tid);
+        this.activeWatches.delete(threadId);
       }
     }
   }
@@ -8174,53 +9016,26 @@ export class ChannelGatewayOrchestrator {
     return true;
   }
 
-  private async deliverStoredCommandConfirmation(
+  private async sendInboundNotice(
     event: InboundChannelEvent,
-    params: {
-      userId: string | null;
-      reply: string;
-      ok: boolean;
-      replyPending?: boolean;
-    },
-  ): Promise<void> {
-    if (params.replyPending === false) {
-      return;
-    }
-    let delivered = false;
-    if (params.userId) {
-      delivered = await this.sendNoticeDelivery({
-        deliveryKey: `notice:${event.platform}:${event.messageId}:command`,
-        userId: params.userId,
-        platform: event.platform,
-        target: event.chatAddress,
-        inboundMessageId: event.messageId,
-        text: params.reply,
-        replyToMessageId: event.messageId,
-        threadScopeKey: event.threadScopeKey,
-        sourceScopeKey: event.threadScopeKey,
-        activityOrigin: "none",
-      });
-    } else {
-      const adapter = this.adapters.get(event.platform);
-      if (!adapter || !adapter.isConfigured() || !adapter.isConnected()) {
-        return;
-      }
-      try {
-        await this.sendDirectAdapterNotice(event, params.reply);
-        delivered = true;
-      } catch {
-        delivered = false;
-      }
-    }
-    if (!delivered) {
-      return;
-    }
-    await this.backend.updateInboundProgress({
+    userId: string | null | undefined,
+    deliveryKey: string,
+    text: string,
+  ): Promise<boolean> {
+    const targetAddress =
+      event.chatType === "dm" ? `${event.platform}:@me` : event.chatAddress;
+    return await this.sendNoticeDelivery({
+      deliveryKey,
+      userId:
+        userId && userId.trim().length > 0
+          ? userId
+          : `unlinked:${event.platform}:${event.platformUserId}`,
       platform: event.platform,
-      message_id: event.messageId,
-      status: params.ok ? "completed" : "failed",
-      command_reply_pending: false,
-      fallback_pending: false,
+      target: targetAddress,
+      inboundMessageId: event.messageId,
+      text,
+      replyToMessageId: event.messageId,
+      threadScopeKey: event.threadScopeKey,
     });
   }
 
@@ -8277,6 +9092,7 @@ export class ChannelGatewayOrchestrator {
         replyToMessageId: i === 0 ? event.messageId : null,
         threadScopeKey: event.threadScopeKey,
         weixinContextToken: event.weixinContextToken ?? null,
+        inboundMessageId: event.messageId,
       });
     }
   }

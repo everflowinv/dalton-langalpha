@@ -201,7 +201,12 @@ def test_d035_migration_revision_and_safety_contracts() -> None:
     alembic_cfg = Config(str(dalton_root / "alembic.ini"))
     alembic_cfg.set_main_option("script_location", str(dalton_root / "migrations"))
     script_dir = ScriptDirectory.from_config(alembic_cfg)
-    assert script_dir.get_heads() == ["d036"]
+    heads = script_dir.get_heads()
+    assert len(heads) == 1
+    assert any(
+        rev.revision == "d035"
+        for rev in script_dir.iterate_revisions(heads[0], "base")
+    )
     assert script_dir.get_revision("d036").down_revision == "d035"
     assert script_dir.get_revision("d035").down_revision == "d031"
     assert script_dir.get_revision("d031").down_revision == "d030"

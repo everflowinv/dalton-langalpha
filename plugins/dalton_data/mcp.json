@@ -3,7 +3,10 @@
   "mcpServers": {
     "researchdata": {
       "type": "streamable-http",
-      "url": "${DALTON_RESEARCHDATA_URL}"
+      "url": "${DALTON_RESEARCHDATA_URL}",
+      "headers": {
+        "Authorization": "Bearer ${DALTON_BRIDGE_TOKEN}"
+      }
     },
     "dalton_sec": {
       "type": "stdio",

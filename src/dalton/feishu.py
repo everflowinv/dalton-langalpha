@@ -50,7 +50,7 @@ class FeishuBridgeError(RuntimeError):
 
 
 _ERROR_MESSAGES: dict[str, str] = {
-    "feishu_not_configured": "宿主机未配置飞书应用凭据（FEISHU_APP_ID / FEISHU_APP_SECRET 或 ~/.openclaw/openclaw.json）",
+    "feishu_not_configured": "宿主机未配置 Bridge 专用飞书应用凭据（请在 ~/.config/dalton/researchdata-bridge.env 中配置 FEISHU_APP_ID / FEISHU_APP_SECRET）",
     "feishu_network_error": "无法连接飞书开放平台",
     "feishu_auth_failed": "飞书应用凭据无效",
     "wiki_node_not_found": "飞书 wiki 节点不存在",

@@ -41,7 +41,17 @@ logger = logging.getLogger("dalton.export_openclaw")
 ET_TZ = ZoneInfo("America/New_York")
 
 DEFAULT_AGENTS: tuple[str, ...] = ("main", "chem", "marco")
-DEFAULT_OCW_AGENTS_ROOT = Path(os.path.expanduser("~/.openclaw/agents"))
+
+
+def resolve_default_ocw_agents_root() -> Path:
+    """Resolve OpenClaw agents SQLite root, honoring `DALTON_OCW_AGENTS_ROOT` when set."""
+    raw = os.environ.get("DALTON_OCW_AGENTS_ROOT", "").strip()
+    if raw:
+        return Path(os.path.expanduser(raw))
+    return Path(os.path.expanduser("~/.openclaw/agents"))
+
+
+DEFAULT_OCW_AGENTS_ROOT = resolve_default_ocw_agents_root()
 DEFAULT_INBOX_DIR = Path("var/dalton/conversations/inbox")
 DEFAULT_CURSORS_FILE = Path("var/dalton/conversations/cursors.json")
 DEFAULT_EXPORT_CURSORS_FILE = Path("var/dalton/conversations/export_cursors.json")
