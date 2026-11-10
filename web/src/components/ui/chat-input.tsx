@@ -295,7 +295,23 @@ function ChatInput({
     getDraftParts: () => draftPartsRef.current,
     onSendReturned: (sentText, parts) => returnSendRef.current?.(sentText, parts),
   });
-  const { attachedFiles, setAttachedFiles, isDragging, handleFiles, restoreFiles, removeFile, onDragEnter, onDragOver, onDragLeave, onDrop, handlePaste } = useFileAttachments({ disabled });
+  // DALTON-HOOK(chat-large-upload): scope multipart uploads to Home or the active workspace
+  const uploadWorkspaceKey = inHome || scope === 'all' ? 'home' : (selectedWorkspaceId || 'home');
+  const {
+    attachedFiles,
+    isDragging,
+    handleFiles,
+    restoreFiles,
+    removeFile,
+    retryFile,
+    consumeSentFiles,
+    clearFiles,
+    onDragEnter,
+    onDragOver,
+    onDragLeave,
+    onDrop,
+    handlePaste,
+  } = useFileAttachments({ disabled, workspaceId: uploadWorkspaceKey });
   const [watchMode, setWatchMode] = useState(false);
   // The toggle state survives the feature going off (the pill just hides), so
   // every payload derives from this gated value.
@@ -814,9 +830,11 @@ function ChatInput({
 
   // --- Send ---
   const hasContent = message.trim() || attachedFiles.length > 0 || !!chartImage || chips.length > 0 || widgetSnapshots.length > 0 || hasExternalContext;
+  // DALTON-HOOK(chat-large-upload): hold send until all selected attachments finish uploading
+  const hasIncompleteUploads = attachedFiles.some((f) => f.uploadStatus !== 'complete');
 
   const handleSend = useCallback(() => {
-    if (!hasContent || disabled) return;
+    if (!hasContent || disabled || hasIncompleteUploads) return;
 
     // System action commands (/compact, /offload) are standalone: they run on
     // send rather than starting a chat turn. If any are present, fire them and
@@ -829,8 +847,8 @@ function ChatInput({
       // DALTON-HOOK(composer-drafts): clear stored composer draft on successful send
       clearCurrentDraft();
       resetSlash();
-      attachedFiles.forEach((f) => { if (f.preview) URL.revokeObjectURL(f.preview); });
-      setAttachedFiles([]);
+      // DALTON-HOOK(chat-large-upload): cancel any unsent server uploads on standalone action commands
+      clearFiles();
       resetMentions();
       if (widgetSnapshots.length > 0) {
         ContextBus.clear();
@@ -840,13 +858,15 @@ function ChatInput({
       return;
     }
 
+    // DALTON-HOOK(chat-large-upload): carry either inline dataUrl or server uploadId
     const readyAttachments = attachedFiles
-      .filter((f) => f.dataUrl)
+      .filter((f) => f.uploadStatus === 'complete' && (f.dataUrl || f.uploadId))
       .map((f) => ({
         file: f.file,
         dataUrl: f.dataUrl,
         type: f.type,
-        preview: f.preview,
+        preview: f.uploadId ? null : f.preview,
+        ...(f.uploadId ? { uploadId: f.uploadId } : {}),
       }));
     // Quotes go where they sit among the typed words. Chips' blocks trail.
     let finalMessage = spellOutQuotes(message, quotes);
@@ -888,8 +908,8 @@ function ChatInput({
       // DALTON-HOOK(composer-drafts): files still being read go unsent and leave the box
       { filesWithheld: readyAttachments.length < attachedFiles.length },
     );
-    attachedFiles.forEach(f => { if (f.preview) URL.revokeObjectURL(f.preview); });
-    setAttachedFiles([]);
+    // DALTON-HOOK(chat-large-upload): mark sent uploadIds so unmount cleanup keeps them intact
+    consumeSentFiles();
     resetSlash();
     // Clear widget deck on send. Other mounted chat inputs hear the same
     // clear via ContextBus so the deck empties everywhere — single source
@@ -900,16 +920,16 @@ function ChatInput({
     setDeckFanned(false);
     settleAfterSend(textareaRef.current);
     // DALTON-HOOK(composer-drafts): include draft helpers in handleSend deps
-  }, [hasContent, disabled, message, effectiveMarketWatch, draftSubagents, attachedFiles, setAttachedFiles, onSend, onAction,
+  }, [hasContent, disabled, hasIncompleteUploads, message, effectiveMarketWatch, draftSubagents, attachedFiles, clearFiles, consumeSentFiles, onSend, onAction,
     heldMentions, quotes, chips, resetMentions, slashCommands, resetSlash,
     pillModel, sentEffort, resolvedFastMode, ownOverrides, widgetSnapshots, t, clearCurrentDraft, submitWithDraft]);
   useEffect(() => {
     sendRef.current = () => {
-      if (!hasContent || disabled) return false;
+      if (!hasContent || disabled || hasIncompleteUploads) return false;
       handleSend();
       return true;
     };
-  }, [hasContent, disabled, handleSend]);
+  }, [hasContent, disabled, hasIncompleteUploads, handleSend]);
 
   // --- Keyboard & Language Detection ---
   const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -1116,11 +1136,13 @@ function ChatInput({
             />
           )}
 
+          {/* DALTON-HOOK(chat-large-upload): pass retry handler for failed chunked uploads */}
           <ComposerAttachments
             chartImage={chartImage}
             onRemoveChartImage={onRemoveChartImage}
             files={attachedFiles}
             onRemoveFile={removeFile}
+            onRetryFile={retryFile}
             isMobile={isMobile}
           />
 
@@ -1367,9 +1389,10 @@ function ChatInput({
                   onToggle={toggleListening}
                 />
               )}
+              {/* DALTON-HOOK(chat-large-upload): disable send button while uploads are in flight or failed */}
               <SendStopButton
                 running={isLoading || isCompacting}
-                canSend={!!hasContent && !disabled}
+                canSend={!!hasContent && !disabled && !hasIncompleteUploads}
                 onSend={handleSend}
                 onStop={onStop}
               />

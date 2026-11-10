@@ -5,7 +5,12 @@ export interface FileAttachment {
   file: File;
   type: string;
   preview: string | null;
-  uploadStatus: 'pending' | 'uploading' | 'complete';
+  // DALTON-HOOK(chat-large-upload): multipart upload progress, error state and server upload id
+  uploadStatus: 'pending' | 'uploading' | 'complete' | 'error';
+  uploadProgress?: number;
+  uploadId?: string;
+  uploadWorkspaceKey?: string;
+  errorMessage?: string;
   dataUrl: string | null;
 }
 
@@ -136,6 +141,8 @@ export interface ReadyAttachment {
   dataUrl: string | null;
   type: string;
   preview: string | null;
+  // DALTON-HOOK(chat-large-upload): server-issued upload_id for stored attachments
+  uploadId?: string;
 }
 
 /**

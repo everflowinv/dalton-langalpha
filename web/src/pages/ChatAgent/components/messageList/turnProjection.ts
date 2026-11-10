@@ -75,8 +75,9 @@ export function projectTurns<M extends TurnLike>(messages: readonly M[]): Projec
     } else if (stamp !== null && message.role === 'user') {
       // A steering bubble sits inside the turn it steered, so it names its
       // turn without opening one.
+      // DALTON-HOOK(chat-large-upload): failed steers (queueError) keep their turnIndex without advancing turn counter
       turnIndex = stamp;
-      if (!isSteeringUserMessage(message)) c = stamp;
+      if (opensTurn(message)) c = stamp;
     } else {
       // User bubbles initiate turn `c`; notifications carry no turn of their
       // own and ride the turn they were inserted into.

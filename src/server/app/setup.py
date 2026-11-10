@@ -232,6 +232,8 @@ _dalton_health_startup_task: asyncio.Task | None = None
 _dalton_transcription_reconcile_task: asyncio.Task | None = None
 # DALTON-HOOK(data-jobs): hold strong reference to OC-1 data task scheduler task
 _dalton_data_task_scheduler_task: asyncio.Task | None = None
+# DALTON-HOOK(chat-large-upload): hold strong reference to periodic chat upload cleanup task
+_dalton_chat_upload_cleanup_task: asyncio.Task | None = None
 
 
 @asynccontextmanager
@@ -246,7 +248,8 @@ async def lifespan(app: FastAPI):
         llm_service, \
         _dalton_health_startup_task, \
         _dalton_transcription_reconcile_task, \
-        _dalton_data_task_scheduler_task
+        _dalton_data_task_scheduler_task, \
+        _dalton_chat_upload_cleanup_task
 
     # Configure logging based on environment settings (first thing on startup)
     configure_logging()
@@ -860,6 +863,17 @@ async def lifespan(app: FastAPI):
             name="dalton-data-task-scheduler",
         )
 
+    # DALTON-HOOK(chat-large-upload): start bounded chat upload expiry/abort cleanup loop
+    from src.dalton.chat_upload_storage import is_chat_upload_storage_configured
+    from src.dalton.services.chat_uploads import run_chat_upload_cleanup_loop
+    from src.dalton.settings import get_dalton_settings
+
+    if get_dalton_settings().enabled and is_chat_upload_storage_configured():
+        _dalton_chat_upload_cleanup_task = asyncio.create_task(
+            run_chat_upload_cleanup_loop(),
+            name="dalton-chat-upload-cleanup",
+        )
+
     # A built-in remote server still down after boot's retry budget is retried
     # in the background, so this worker heals when it answers instead of
     # serving without its tools until a restart. Last, so nothing above can
@@ -904,6 +918,11 @@ async def lifespan(app: FastAPI):
         _dalton_data_task_scheduler_task.cancel()
         await asyncio.gather(_dalton_data_task_scheduler_task, return_exceptions=True)
         _dalton_data_task_scheduler_task = None
+    # DALTON-HOOK(chat-large-upload): cancel periodic chat upload cleanup task on shutdown
+    if _dalton_chat_upload_cleanup_task is not None:
+        _dalton_chat_upload_cleanup_task.cancel()
+        await asyncio.gather(_dalton_chat_upload_cleanup_task, return_exceptions=True)
+        _dalton_chat_upload_cleanup_task = None
     # Awaited, so a warm-up stopped midway releases its lock while Redis is
     # still open; a lock left to expire skips the warm-up of a quick restart.
     # The refreshes go after it, since the warm-up can start them.

@@ -529,6 +529,18 @@ class WorkspaceManager(ComputerManager):
         # removed computer's workspaces), so the next thread write reads the row.
         await forget_workspace_exists(workspace_id)
 
+        # DALTON-HOOK(chat-large-upload): retire and clean retained chat upload objects on workspace deletion
+        from src.dalton.services.chat_uploads import (
+            cleanup_deleted_workspace_chat_uploads,
+        )
+
+        try:
+            await cleanup_deleted_workspace_chat_uploads(workspace_id)
+        except Exception as exc:
+            logger.warning(
+                f"Deferred chat upload cleanup after deleting workspace {workspace_id}: {exc}"
+            )
+
         if not retired:
             # Its proxied previews stop now rather than at expiry; a retired
             # machine's teardown already ended them. Revocation is per sandbox,

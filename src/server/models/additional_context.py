@@ -140,6 +140,21 @@ class ChartSelectionContext(AdditionalContextBase):
         return self
 
 
+# DALTON-HOOK(chat-large-upload): server-stored multipart upload reference (zero inline file bytes)
+class ChatUploadContext(AdditionalContextBase):
+    """Context referencing a completed server-side multipart chat file upload."""
+
+    type: Literal["chat_upload"] = "chat_upload"
+    upload_id: str = Field(..., min_length=1, max_length=64, description="Server-issued upload UUID")
+    name: Optional[str] = Field(None, max_length=512, description="Display filename")
+    mime_type: Optional[str] = Field(None, max_length=256, description="Declared MIME type")
+    size: Optional[int] = Field(None, ge=0, description="File size in bytes")
+    source_kind: Optional[Literal["image", "pdf", "file", "chat_upload"]] = Field(
+        None,
+        description="Original attachment kind when staged from inline attachments",
+    )
+
+
 AdditionalContext = Annotated[
     Union[
         Annotated[SkillContext, Tag("skills")],
@@ -149,6 +164,7 @@ AdditionalContext = Annotated[
         Annotated[DirectiveContext, Tag("directive")],
         Annotated[WidgetContext, Tag("widget")],
         Annotated[ChartSelectionContext, Tag("chart_selection")],
+        Annotated[ChatUploadContext, Tag("chat_upload")],
     ],
     Discriminator(lambda v: v.get("type") if isinstance(v, dict) else getattr(v, "type", None)),
 ]

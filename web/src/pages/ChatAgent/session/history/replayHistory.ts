@@ -31,6 +31,8 @@ import {
   handleHistoryTodoUpdate,
   handleHistoryHtmlWidget,
   handleHistorySteeringDelivered,
+  // DALTON-HOOK(chat-large-upload): replay permanently failed main-thread steers
+  handleHistorySteeringReturned,
   handleHistoryTaskArtifactStatus,
   handleHistoryError,
   isSubagentHistoryEvent,
@@ -366,6 +368,21 @@ export async function loadConversationHistory(
           refs: { newMessagesStartIndexRef: rt.newMessagesStartIndexRef },
           setMessages: setMessagesForHandlers,
           onCopyDelivered: (key) => rt.requestKeyRef.current.settle(key, 'accepted'),
+        });
+        return;
+      }
+
+      // DALTON-HOOK(chat-large-upload): replay permanently failed main-thread steers
+      if (eventType === 'steering_returned' && !isSubagent && event.reason === 'attachment_failed') {
+        handleHistorySteeringReturned({
+          event: event as Record<string, unknown>,
+          pairIndex: hasPairIndex ? event.turn_index! : (currentActivePairIndex ?? 0),
+          refs: { newMessagesStartIndexRef: rt.newMessagesStartIndexRef },
+          setMessages: setMessagesForHandlers,
+          onCopySettled: (key, comments) => {
+            if (key) rt.requestKeyRef.current.spend(key);
+            if (comments) rt.requestKeyRef.current.returned(comments);
+          },
         });
         return;
       }

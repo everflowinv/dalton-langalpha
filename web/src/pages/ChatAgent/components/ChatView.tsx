@@ -794,12 +794,14 @@ function ChatView({ workspaceId, threadId, initialTaskId, onBack, workspaceName:
     // Image/PDF contexts from attachments
     if (attachments && attachments.length > 0) {
       contexts.push(...(attachmentsToContexts(attachments) as unknown as Record<string, unknown>[]));
+      // DALTON-HOOK(chat-large-upload): carry upload_id alongside caller-owned preview/blob fields
       attachmentMeta = attachments.map((a) => ({
         name: a.file.name,
         type: a.type,
         size: a.file.size,
         preview: null,
         dataUrl: a.dataUrl,
+        ...(a.uploadId ? { upload_id: a.uploadId } : {}),
       }));
     }
 

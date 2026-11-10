@@ -17,6 +17,7 @@ from ptc_agent.core.sandbox.ptc_sandbox import PTCSandbox
 from src.config import settings as app_settings
 from src.dalton import sharing as dalton_sharing
 from src.dalton.app import router as dalton_router
+from src.dalton.database import chat_uploads as db_chat_uploads
 from src.dalton.database import knowledge as db_knowledge
 from src.dalton.database import verdicts as db_verdicts
 from src.dalton.knowledge import service as knowledge_service
@@ -733,7 +734,10 @@ class TestWebChannelEndpoints:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _enable_dalton_auth(monkeypatch)
-        ws = _sample_workspace(user_id="u-richard", status="running")
+        ws = {
+            **_sample_workspace(user_id="u-richard", status="running"),
+            "computer_root_dir": "/home/workspace",
+        }
         shared_get_ws_mock = create_autospec(
             ws_files_service.db_get_workspace, return_value=ws
         )
@@ -741,6 +745,20 @@ class TestWebChannelEndpoints:
             ws_files_service,
             "db_get_workspace",
             shared_get_ws_mock,
+        )
+        monkeypatch.setattr(
+            db_chat_uploads,
+            "get_workspace_permission_row",
+            create_autospec(
+                db_chat_uploads.get_workspace_permission_row, return_value=ws
+            ),
+        )
+        monkeypatch.setattr(
+            db_chat_uploads,
+            "list_retained_workspace_uploads",
+            create_autospec(
+                db_chat_uploads.list_retained_workspace_uploads, return_value=[]
+            ),
         )
         monkeypatch.setattr(
             ws_files_crud,

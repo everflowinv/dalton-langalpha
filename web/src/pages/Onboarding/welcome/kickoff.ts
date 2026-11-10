@@ -33,6 +33,7 @@ interface AttachmentMeta {
   type: string;
   size: number;
   preview: string | null;
+  // DALTON-HOOK(chat-large-upload): stored uploads carry uploadId without inline dataUrl
   dataUrl: string | null;
 }
 
@@ -88,7 +89,8 @@ export function kickoffSend(kickoff: OnboardingKickoff, language: string, title:
   // as a dashboard snapshot does.
   const reminder = brief ? [{ type: 'directive', content: `${BRIEF_PREAMBLE}\n<market-brief>\n${brief}\n</market-brief>` }] : [];
   // A file still being read has nothing to send yet.
-  const ready = kickoff.attachments.filter((a) => a.dataUrl != null);
+  // DALTON-HOOK(chat-large-upload): admit completed stored uploads alongside inline dataUrls
+  const ready = kickoff.attachments.filter((a) => a.dataUrl != null || a.uploadId != null);
   return {
     initialMessage: kickoff.task,
     // Attached the way the composer attaches a file, so the agent sees them

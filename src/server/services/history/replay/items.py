@@ -356,6 +356,29 @@ def _stamp_row_kind(frame: dict[str, Any], row: dict[str, Any]) -> None:
         frame["error"] = _sanitize_error_text(frame["error"])
 
 
+# DALTON-HOOK(chat-large-upload): table-sourced replay item for permanently failed steer attachments
+def _failed_steer_item(thread_id: str, entry: dict[str, Any]) -> dict[str, Any]:
+    data: dict[str, Any] = {
+        "thread_id": thread_id,
+        "reason": str(entry.get("reason") or "attachment_failed"),
+        "error": _sanitize_error_text(
+            str(entry.get("error") or "Attachment could not be delivered.")
+        ),
+    }
+    for key in (
+        "error_code",
+        "request_key",
+        "content",
+        "attachments",
+        "artifact_comments",
+        "timestamp",
+        "job_id",
+    ):
+        if entry.get(key) is not None:
+            data[key] = entry[key]
+    return {"event": "steering_returned", "data": data}
+
+
 def _enrich(
     item: dict[str, Any],
     thread_id: str,

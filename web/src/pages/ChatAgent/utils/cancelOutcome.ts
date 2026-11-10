@@ -29,6 +29,8 @@ export interface HeldSteer {
   timestamp?: number;
   /** A send carrying file comments: `content` is its note, this its comments. */
   artifact_comments?: unknown;
+  // DALTON-HOOK(chat-large-upload): attachment metadata on parked or returned steers
+  attachments?: unknown;
 }
 
 export interface CancelOutcome {
