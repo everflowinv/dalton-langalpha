@@ -373,6 +373,12 @@ export interface I6AuthorizeAndClaimResponse {
   recipient_id?: string;
   platform?: string | null;
   target_address?: string | null;
+  /**
+   * Discord thread address confirmed before the first message.
+   * Null when this delivery has not confirmed a thread.
+   * Distinct from `target_address`, which stays the original parent.
+   */
+  confirmed_thread_address?: string | null;
   thread_scope_key?: string | null;
   is_current?: boolean;
   home_workspace_id?: string;
@@ -396,6 +402,8 @@ export interface I7DeliveriesProgressRequest {
   status?: "in_flight" | "sent" | "partial" | "failed" | "unknown";
   error_code?: string | null;
   error_message?: string | null;
+  /** Full Discord thread address. Omitted unless this call confirms a thread. */
+  confirmed_thread_address?: string | null;
 }
 
 export interface I7DeliveriesProgressResponse {
@@ -403,6 +411,8 @@ export interface I7DeliveriesProgressResponse {
   delivery_key: string;
   status: string;
   sent_to_current_count: number;
+  /** Echo of the stored Discord thread address, or null when none is stored. */
+  confirmed_thread_address?: string | null;
 }
 
 export type InboundEventStatus =

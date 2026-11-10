@@ -279,6 +279,9 @@ export class DeliveryService {
     const platformMessageIds: string[] = [];
     let sentChunks = 0;
     let finalAddress = targetAddress;
+    const confirmedThreadAddress = (claim.confirmed_thread_address ?? "").trim();
+    const reuseConfirmedThread =
+      platformStr === "discord" && confirmedThreadAddress.length > 0;
     let chunkFailure: {
       outcome: "failed" | "unknown";
       code: AgentSendResponse["code"];
@@ -288,6 +291,11 @@ export class DeliveryService {
     for (let i = 0; i < chunks.length; i++) {
       const chunkText = chunks[i]!;
       try {
+        const creatingDiscordThread =
+          i === 0 &&
+          platformStr === "discord" &&
+          options.newThread === true &&
+          !reuseConfirmedThread;
         const res = await adapter.sendTextChunk({
           targetAddress: finalAddress,
           recipientPlatformUserId,
@@ -295,9 +303,20 @@ export class DeliveryService {
           chunkIndex: i,
           totalChunks,
           replyToMessageId: i === 0 ? options.replyToMessageId : null,
-          newThread: i === 0 ? options.newThread : false,
+          newThread: i === 0 ? Boolean(options.newThread) && !reuseConfirmedThread : false,
           threadScopeKey: effectiveThreadScopeKey,
           deliveryKey: options.deliveryKey,
+          confirmedThreadAddress:
+            i === 0 && reuseConfirmedThread ? confirmedThreadAddress : null,
+          onConfirmedThread: creatingDiscordThread
+            ? async (confirmed) => {
+                await this.storeConfirmedDiscordThread(
+                  options.deliveryKey,
+                  confirmed.address,
+                );
+                finalAddress = confirmed.address;
+              }
+            : undefined,
           weixinContextToken: claim.weixin_context_token ?? null,
         });
         sentChunks += 1;
@@ -505,6 +524,43 @@ export class DeliveryService {
     });
 
     return responseObj;
+  }
+
+  /**
+   * Store a Discord thread that create or adoption already confirmed.
+   * A missing or failed acknowledgment does not send the message. The delivery
+   * stays unknown so a later claim cannot create a second thread.
+   */
+  private async storeConfirmedDiscordThread(
+    deliveryKey: string,
+    address: string,
+  ): Promise<void> {
+    let stored = false;
+    try {
+      const ack = await this.backend.updateDeliveryProgress({
+        delivery_key: deliveryKey,
+        confirmed_thread_address: address,
+      });
+      stored = ack.ok === true && ack.confirmed_thread_address === address;
+    } catch {
+      stored = false;
+    }
+    if (stored) return;
+    try {
+      await this.backend.updateDeliveryProgress({
+        delivery_key: deliveryKey,
+        status: "unknown",
+        error_code: "unavailable",
+        error_message: "Discord confirmed thread was not stored",
+      });
+    } catch {
+      // Leave in_flight when this write is also lost. Startup marks that row
+      // unknown and keeps a thread address that did commit.
+    }
+    throw new ChannelDeliveryError("Discord confirmed thread was not stored", {
+      outcome: "unknown",
+      code: "unavailable",
+    });
   }
 
   private inferPlatform(

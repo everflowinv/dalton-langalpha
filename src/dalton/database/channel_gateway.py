@@ -1,6 +1,7 @@
 """Database persistence and transaction logic for CH-1 Channel Gateway (`I-1` ~ `I-9` & §1.5).
 
-All SQL for the 11 `dalton_channel_*` tables (migrations `d030`, `d031`) lives here.
+All SQL for the 11 `dalton_channel_*` tables (migrations `d030`, `d031`, and the
+`d036` confirmed Discord thread column) lives here.
 
 Global lock order across transactions:
 0. Per-message / per-delivery advisory locks (`dalton_inbound:<platform>:<message_id>`, `dalton_delivery:<delivery_key>`)
@@ -19,8 +20,9 @@ import hashlib
 import json
 import logging
 import random
+import re
 import secrets
-from typing import Any
+from typing import Any, NoReturn
 from uuid import UUID, uuid5
 
 from fastapi import HTTPException
@@ -3842,6 +3844,99 @@ async def _find_current_conversation_source(
     return source_row
 
 
+_DISCORD_GROUP_PARENT = re.compile(
+    r"^discord:(?P<guild>[0-9]{1,32})/(?P<parent>[0-9]{1,32})$"
+)
+_DISCORD_CONFIRMED_THREAD = re.compile(
+    r"^discord:(?P<guild>[0-9]{1,32})/(?P<parent>[0-9]{1,32}):thread:(?P<thread>[0-9]{1,32})$"
+)
+
+
+def _delivery_confirmed_thread_address(row: dict[str, Any] | None) -> str | None:
+    """Return the stored Discord thread address, or None when this delivery has none."""
+    if not row:
+        return None
+    raw = row.get("confirmed_thread_address")
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    return text or None
+
+
+def _reject_confirmed_thread(status_code: int, message: str) -> NoReturn:
+    raise HTTPException(
+        status_code=status_code,
+        detail={
+            "code": "invalid" if status_code < 409 else "conflict",
+            "message": message,
+        },
+    )
+
+
+async def _store_confirmed_discord_thread(
+    cur: Any,
+    *,
+    row: dict[str, Any],
+    delivery_key: str,
+    requested: str,
+    prev_status: str,
+) -> str:
+    """Persist the first confirmed Discord thread for an in-flight group delivery.
+
+    The same address may be repeated. A different address, a DM, or a guild or
+    parent other than the original target is rejected and does not overwrite.
+    """
+    if requested != requested.strip() or not requested or len(requested) > 255:
+        _reject_confirmed_thread(
+            400, "confirmed_thread_address is not a Discord thread address"
+        )
+    platform = str(row.get("platform") or "").strip().lower()
+    target = str(row.get("target_address") or "").strip()
+    if platform != "discord" or _is_dm_address(platform, target):
+        _reject_confirmed_thread(
+            400,
+            "confirmed_thread_address requires a Discord group parent target",
+        )
+    parent = _DISCORD_GROUP_PARENT.fullmatch(target)
+    confirmed = _DISCORD_CONFIRMED_THREAD.fullmatch(requested)
+    if (
+        parent is None
+        or confirmed is None
+        or parent.group("guild") != confirmed.group("guild")
+        or parent.group("parent") != confirmed.group("parent")
+    ):
+        _reject_confirmed_thread(
+            400,
+            "confirmed_thread_address does not match the original Discord guild and parent",
+        )
+    current = _delivery_confirmed_thread_address(row)
+    if current == requested:
+        return requested
+    if current is not None:
+        _reject_confirmed_thread(
+            409, "confirmed_thread_address is already set and cannot be changed"
+        )
+    if prev_status != "in_flight":
+        _reject_confirmed_thread(
+            409,
+            "confirmed_thread_address can be stored only while the delivery is in flight",
+        )
+    await cur.execute(
+        """
+        UPDATE dalton_channel_deliveries
+        SET confirmed_thread_address = %s,
+            updated_at = NOW()
+        WHERE delivery_key = %s
+          AND confirmed_thread_address IS NULL
+          AND status = 'in_flight'
+        """,
+        (requested, delivery_key),
+    )
+    if getattr(cur, "rowcount", 0) != 1:
+        _reject_confirmed_thread(409, "confirmed_thread_address was not stored")
+    return requested
+
+
 async def authorize_and_claim_delivery(
     *,
     delivery_key: str,
@@ -3924,6 +4019,7 @@ async def authorize_and_claim_delivery(
                     )
                     ex_status = str(existing["status"])
                     ex_is_current = bool(existing.get("is_current", False))
+                    stored_confirmed_thread = _delivery_confirmed_thread_address(existing)
                     ex_scope_key: str | None = None
                     scope_mismatch = (
                         eff_source_scope is not None and ex_scope != eff_source_scope
@@ -4012,6 +4108,7 @@ async def authorize_and_claim_delivery(
                             "first_response_json": existing.get("first_response_json"),
                             "platform": existing["platform"],
                             "target_address": existing["target_address"],
+                            "confirmed_thread_address": stored_confirmed_thread,
                             "thread_scope_key": ex_scope_key,
                             "is_current": ex_is_current,
                         }
@@ -4031,10 +4128,18 @@ async def authorize_and_claim_delivery(
                             "first_response_json": existing.get("first_response_json"),
                             "platform": existing["platform"],
                             "target_address": existing["target_address"],
+                            "confirmed_thread_address": stored_confirmed_thread,
                             "thread_scope_key": ex_scope_key,
                             "is_current": ex_is_current,
                         }
-                    if ex_status in ("in_flight", "unknown"):
+                    # Startup rewrites in_flight to unknown and leaves this column.
+                    # A stored thread is reclaimed so the same delivery can post into
+                    # it. Unknown with no stored thread stays blocked: an ambiguous
+                    # create must not call Discord create again.
+                    reclaim_confirmed_thread = (
+                        ex_status == "unknown" and stored_confirmed_thread is not None
+                    )
+                    if ex_status in ("in_flight", "unknown") and not reclaim_confirmed_thread:
                         return {
                             "claim_status": "in_flight_or_unknown",
                             "status": "unknown",
@@ -4042,6 +4147,7 @@ async def authorize_and_claim_delivery(
                             "message": "An earlier attempt of this same call is still delivering it.",
                             "platform": existing["platform"],
                             "target_address": existing["target_address"],
+                            "confirmed_thread_address": stored_confirmed_thread,
                             "thread_scope_key": ex_scope_key,
                             "is_current": ex_is_current,
                         }
@@ -4713,14 +4819,19 @@ async def authorize_and_claim_delivery(
                             "status": "failed",
                             "code": "not_allowed",
                             "message": "Delivery identity or destination does not match the existing record.",
+                            "confirmed_thread_address": _delivery_confirmed_thread_address(
+                                existing
+                            ),
                         }
 
                 if resolved_user_id and not str(resolved_user_id).startswith("unlinked:"):
                     reject_company_system_auth(resolved_user_id)
 
                 # 3. Atomic claim. Scope and generation stay as first stored.
-                # A failed conversation delivery reclaimed as replay persists activity_origin='replay'
-                # so a later progress update does not extend last_conversation_activity_at.
+                # confirmed_thread_address is omitted so a reclaim keeps the first
+                # confirmed Discord thread. A failed conversation delivery reclaimed
+                # as replay persists activity_origin='replay' so a later progress
+                # update does not extend last_conversation_activity_at.
                 await cur.execute(
                     """
                     INSERT INTO dalton_channel_deliveries (
@@ -4785,6 +4896,7 @@ async def authorize_and_claim_delivery(
                     "recipient_id": resolved_recipient_id,
                     "platform": resolved_platform,
                     "target_address": resolved_target_address,
+                    "confirmed_thread_address": _delivery_confirmed_thread_address(existing),
                     "thread_scope_key": resolved_thread_scope_key,
                     "is_current": is_current,
                     "home_workspace_id": home_ws_id,
@@ -4819,6 +4931,7 @@ async def update_delivery_progress(
     status: str | None = None,
     error_code: str | None = None,
     error_message: str | None = None,
+    confirmed_thread_address: str | None = None,
     conn: Any = None,
 ) -> dict[str, Any]:
     """I-7 (1): Update `dalton_channel_deliveries`, increment `sent_to_current_count`, and update conversation activity timestamp."""
@@ -4835,6 +4948,7 @@ async def update_delivery_progress(
             status=status,
             error_code=error_code,
             error_message=error_message,
+            confirmed_thread_address=confirmed_thread_address,
             conn=c,
         ),
     )
@@ -4851,6 +4965,7 @@ async def _update_delivery_progress_once(
     status: str | None = None,
     error_code: str | None = None,
     error_message: str | None = None,
+    confirmed_thread_address: str | None = None,
     conn: Any = None,
 ) -> dict[str, Any]:
     cleaned_key = str(delivery_key or "").strip()
@@ -4972,6 +5087,17 @@ async def _update_delivery_progress_once(
                     if first_response_json is not None
                     else row.get("first_response_json")
                 )
+                # Write the thread before the status update. A later replacement
+                # of first_response_json does not mention this column.
+                stored_confirmed_thread = _delivery_confirmed_thread_address(row)
+                if confirmed_thread_address is not None:
+                    stored_confirmed_thread = await _store_confirmed_discord_thread(
+                        cur,
+                        row=row,
+                        delivery_key=cleaned_key,
+                        requested=confirmed_thread_address,
+                        prev_status=prev_status,
+                    )
 
                 await cur.execute(
                     """
@@ -5087,6 +5213,7 @@ async def _update_delivery_progress_once(
                     "delivery_key": cleaned_key,
                     "status": new_status,
                     "sent_to_current_count": updated_count,
+                    "confirmed_thread_address": stored_confirmed_thread,
                 }
 
 

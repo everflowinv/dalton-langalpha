@@ -384,7 +384,17 @@ export function createMockBackend(): MockBackend {
         .find(
           (u) => u.delivery_key === req.delivery_key && u.status !== undefined,
         );
-      if (lastUpdate?.status === "unknown") {
+      const storedThread =
+        [...updateDeliveryProgress.mock.calls]
+          .map(([update]) => update)
+          .find(
+            (update) =>
+              update.delivery_key === req.delivery_key &&
+              typeof update.confirmed_thread_address === "string" &&
+              update.confirmed_thread_address.trim().length > 0,
+          )
+          ?.confirmed_thread_address?.trim() ?? null;
+      if (lastUpdate?.status === "unknown" && !storedThread) {
         return {
           claim_status: "in_flight_or_unknown",
           status: "unknown",
@@ -393,6 +403,7 @@ export function createMockBackend(): MockBackend {
             "An earlier attempt of this same call is still delivering it.",
           platform: plat,
           target_address: targetAddr,
+          confirmed_thread_address: null,
           thread_scope_key: resolvedThreadScopeKey,
           is_current: isCurrent,
         };
@@ -459,6 +470,7 @@ export function createMockBackend(): MockBackend {
         recipient_id: recipientId,
         platform: plat,
         target_address: targetAddr,
+        confirmed_thread_address: storedThread,
         thread_scope_key: resolvedThreadScopeKey,
         is_current: isCurrent,
         weixin_context_token: plat === "weixin" ? "ctx_tok_123" : null,
@@ -471,10 +483,15 @@ export function createMockBackend(): MockBackend {
       req: I7DeliveriesProgressRequest,
     ): Promise<I7DeliveriesProgressResponse> => ({
       ...structuredClone(defaultI7DeliverySent),
+      ok: true,
       delivery_key: req.delivery_key,
       status: req.status ?? "in_flight",
       sent_to_current_count:
         req.status === "sent" || req.status === "partial" ? 1 : 0,
+      confirmed_thread_address:
+        typeof req.confirmed_thread_address === "string"
+          ? req.confirmed_thread_address
+          : null,
     }),
   );
 

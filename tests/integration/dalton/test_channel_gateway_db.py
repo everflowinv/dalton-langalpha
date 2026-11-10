@@ -3,7 +3,8 @@
 Reads the test database connection string from ``DALTON_CHANNEL_GATEWAY_TEST_DSN``
 (or ``DALTON_TEST_DB_DSN`` / ``TEST_DATABASE_URL``); skips cleanly when unset.
 A session-scoped fixture upgrades the test database to upstream head and Dalton ``d031``
-(skipping if already at head, never dropping ``public`` schema), and each test uses
+when the Dalton revision is missing or older. A later revision such as ``d036`` is left
+in place. It never drops the ``public`` schema. Each test uses
 a unique prefix and cleans up its own rows on teardown.
 """
 
@@ -100,8 +101,31 @@ def _run_alembic_upgrade_sync(cfg: Config, revision: str) -> None:
     command.upgrade(cfg, revision)
 
 
+def _revision_is_target_or_descendant(
+    script: ScriptDirectory, current: str, target: str
+) -> bool:
+    """True when ``current`` is ``target`` or a later revision on the same chain."""
+    seen: set[str] = set()
+    revision: str | None = current
+    while isinstance(revision, str) and revision not in seen:
+        if revision == target:
+            return True
+        seen.add(revision)
+        item = script.get_revision(revision)
+        if item is None:
+            return False
+        down = item.down_revision
+        revision = down if isinstance(down, str) else None
+    return False
+
+
 async def _ensure_alembic_upgraded_to_head(dsn: str) -> None:
-    """Upgrade upstream and Dalton Alembic chains to head/d031 only if not already there, without dropping schema."""
+    """Upgrade upstream to head and Dalton to d031 or leave a later Dalton revision in place.
+
+    The Dalton version table is ``alembic_version_dalton``. d035 and d036 are
+    descendants of d031, so this fixture must not call ``upgrade("d031")``
+    after either of them has been applied.
+    """
     project_root = Path(__file__).resolve().parents[3]
     sa_url = dsn.replace("postgresql://", "postgresql+psycopg://", 1).replace("%", "%%")
 
@@ -115,10 +139,11 @@ async def _ensure_alembic_upgraded_to_head(dsn: str) -> None:
         "script_location", str(project_root / "src" / "dalton" / "migrations")
     )
     dalton_cfg.set_main_option("sqlalchemy.url", sa_url)
+    dalton_script = ScriptDirectory.from_config(dalton_cfg)
     dalton_target = "d031"
 
     current_upstream: str | None = None
-    current_dalton: str | None = None
+    dalton_versions: list[str] = []
     async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as conn:
         async with conn.cursor() as cur:
             await cur.execute("SELECT to_regclass('public.alembic_version')")
@@ -129,21 +154,30 @@ async def _ensure_alembic_upgraded_to_head(dsn: str) -> None:
                 if vrow:
                     current_upstream = str(vrow[0])
 
-            await cur.execute("SELECT to_regclass('public.dalton_alembic_version')")
+            await cur.execute(
+                "SELECT to_regclass('public.alembic_version_dalton')"
+            )
             drow = await cur.fetchone()
             if drow and drow[0] is not None:
                 await cur.execute(
-                    "SELECT version_num FROM dalton_alembic_version LIMIT 1"
+                    "SELECT version_num FROM alembic_version_dalton"
                 )
-                dvrow = await cur.fetchone()
-                if dvrow:
-                    current_dalton = str(dvrow[0])
+                dalton_versions = [
+                    str(item[0])
+                    for item in await cur.fetchall()
+                    if item and item[0]
+                ]
 
     if current_upstream != upstream_head:
         await asyncio.to_thread(_run_alembic_upgrade_sync, upstream_cfg, "head")
 
-    if current_dalton != dalton_target:
-        await asyncio.to_thread(_run_alembic_upgrade_sync, dalton_cfg, dalton_target)
+    if not any(
+        _revision_is_target_or_descendant(dalton_script, version, dalton_target)
+        for version in dalton_versions
+    ):
+        await asyncio.to_thread(
+            _run_alembic_upgrade_sync, dalton_cfg, dalton_target
+        )
 
 
 @pytest_asyncio.fixture(scope="session")

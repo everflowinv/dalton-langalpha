@@ -47,6 +47,10 @@ def _make_fake_db_from_handler(handler: Any) -> tuple[Any, Any]:
 
     async def _execute(sql: str, params: Any = None) -> None:
         res = await handler(sql, params)
+        owner = getattr(handler, "__self__", None)
+        if owner is not None and getattr(owner, "last_rowcount", None) is not None:
+            cursor.rowcount = owner.last_rowcount
+            owner.last_rowcount = None
         if res is None:
             state["rows"] = []
         elif isinstance(res, list):
@@ -108,6 +112,7 @@ class InMemoryChannelStore:
         self.inbound_events: dict[tuple[str, str], dict[str, Any]] = {}
         self.background_runs: dict[str, dict[str, Any]] = {}
         self.deliveries: dict[str, dict[str, Any]] = {}
+        self.last_rowcount: int | None = None
         self.automation_runs: dict[str, dict[str, Any]] = {}
         self.weixin_state: dict[str, Any] | None = None
         self.workspaces: dict[str, dict[str, Any]] = {}
@@ -1094,11 +1099,32 @@ class InMemoryChannelStore:
                     else (int(src_gen) if src_gen is not None else None)
                 ),
                 "activity_origin": stored_origin,
+                "confirmed_thread_address": (prev_dlv or {}).get(
+                    "confirmed_thread_address"
+                ),
                 "error_code": None,
                 "error_message": None,
                 "created_at": (prev_dlv or {}).get("created_at") or now,
                 "updated_at": now,
             }
+            return []
+
+        if (
+            "UPDATE dalton_channel_deliveries SET confirmed_thread_address = %s"
+            in norm
+        ):
+            requested, dkey = params[0], params[1]
+            row = self.deliveries.get(str(dkey))
+            if (
+                row is not None
+                and row.get("confirmed_thread_address") is None
+                and str(row.get("status") or "") == "in_flight"
+            ):
+                row["confirmed_thread_address"] = str(requested)
+                row["updated_at"] = now
+                self.last_rowcount = 1
+            else:
+                self.last_rowcount = 0
             return []
 
         if "UPDATE dalton_channel_deliveries SET sent_chunks = %s" in norm:
@@ -1120,6 +1146,7 @@ class InMemoryChannelStore:
             return []
 
         if "UPDATE dalton_channel_deliveries SET status = 'unknown', error_code = 'gateway_restarted'" in norm:
+            # Startup leaves confirmed_thread_address on the same row.
             for r in self.deliveries.values():
                 if r["status"] == "in_flight":
                     r["status"] = "unknown"
