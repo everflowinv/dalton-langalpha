@@ -79,6 +79,22 @@ function retainingClient() {
   return client;
 }
 
+/** Production retries once. The delay is zero so the retry window is gated by a deferred response. */
+function retryingClient() {
+  const client = createTestQueryClient();
+  client.setDefaultOptions({
+    queries: {
+      retry: 1,
+      retryDelay: 0,
+      gcTime: Infinity,
+      staleTime: Infinity,
+      refetchOnWindowFocus: false,
+      refetchOnReconnect: false,
+    },
+  });
+  return client;
+}
+
 /** Props come from `rerender`, so a filter change is a new input. Mutating one
  *  object and rendering again keeps the first value under the React Compiler. */
 function renderRead<TProps, TResult>(
@@ -1016,5 +1032,230 @@ describe('useAutomationReads requests', () => {
     expect(feedView.result.current.data).not.toEqual(feed);
     expect(runsView.result.current.data).not.toEqual(runs);
     expect(historyView.result.current.data).not.toEqual(history);
+  });
+
+  it('keeps a newer success when a canceled read later returns 403', async () => {
+    const cached = listPage(4);
+    const fresh = listPage(1);
+    const client = retainingClient();
+    const canceled = deferred();
+    const replacement = deferred();
+    let calls = 0;
+    let canceledRejected = false;
+    vi.mocked(api.listAutomationReads).mockImplementation(async () => {
+      calls += 1;
+      if (calls === 1) return ok(cached);
+      if (calls === 2) {
+        await canceled.promise;
+        canceledRejected = true;
+        throw httpError(403);
+      }
+      if (calls === 3) {
+        await replacement.promise;
+        return ok(fresh);
+      }
+      throw new Error(`unexpected list read ${calls}`);
+    });
+    const view = renderRead(
+      (props: { scope: 'company' }) => useAutomationReadList(props),
+      { scope: 'company' },
+      client,
+    );
+    await waitFor(() => expect(view.result.current.data).toEqual(cached));
+
+    let older!: Promise<AutomationReadFetchResult<AutomationReadList>>;
+    let newer!: Promise<AutomationReadFetchResult<AutomationReadList>>;
+    await act(async () => {
+      older = view.result.current.refetch();
+    });
+    await waitFor(() => expect(calls).toBe(2));
+    await act(async () => {
+      newer = view.result.current.refetch();
+    });
+    await waitFor(() => expect(calls).toBe(3));
+
+    let settled: AutomationReadFetchResult<AutomationReadList> | undefined;
+    await act(async () => {
+      replacement.resolve();
+      settled = await newer;
+      await older;
+    });
+    expect(settled?.data).toEqual(fresh);
+    expect(settled?.isSuccess).toBe(true);
+    expect(settled?.error).toBeNull();
+    await waitFor(() => {
+      expect(view.result.current.data).toEqual(fresh);
+      expect(view.result.current.isSuccess).toBe(true);
+    });
+
+    await act(async () => {
+      canceled.resolve();
+    });
+    await waitFor(() => expect(canceledRejected).toBe(true));
+    const stored = client.getQueryCache().find({ queryKey: listKey('company'), exact: true });
+    expect(stored?.state.data).toEqual(fresh);
+    expect(stored?.state.status).toBe('success');
+    expect(stored?.state.error).toBeNull();
+    await waitFor(() => {
+      expect(view.result.current.data).toEqual(fresh);
+      expect(view.result.current.isSuccess).toBe(true);
+      expect(view.result.current.isError).toBe(false);
+      expect(view.result.current.error).toBeNull();
+    });
+    expect(calls).toBe(3);
+  });
+
+  it('does not clear the cached page when a canceled read returns 403 while its replacement is pending', async () => {
+    const cached = listPage(4);
+    const fresh = listPage(1);
+    const client = retainingClient();
+    const canceled = deferred();
+    const replacement = deferred();
+    let calls = 0;
+    let canceledRejected = false;
+    vi.mocked(api.listAutomationReads).mockImplementation(async () => {
+      calls += 1;
+      if (calls === 1) return ok(cached);
+      if (calls === 2) {
+        await canceled.promise;
+        canceledRejected = true;
+        throw httpError(403);
+      }
+      if (calls === 3) {
+        await replacement.promise;
+        return ok(fresh);
+      }
+      throw new Error(`unexpected list read ${calls}`);
+    });
+    const view = renderRead(
+      (props: { scope: 'company' }) => useAutomationReadList(props),
+      { scope: 'company' },
+      client,
+    );
+    await waitFor(() => expect(view.result.current.data).toEqual(cached));
+
+    let older!: Promise<AutomationReadFetchResult<AutomationReadList>>;
+    let newer!: Promise<AutomationReadFetchResult<AutomationReadList>>;
+    await act(async () => {
+      older = view.result.current.refetch();
+    });
+    await waitFor(() => expect(calls).toBe(2));
+    await act(async () => {
+      newer = view.result.current.refetch();
+    });
+    await waitFor(() => expect(calls).toBe(3));
+    expect(client.getQueryData(listKey('company'))).toEqual(cached);
+
+    await act(async () => {
+      canceled.resolve();
+    });
+    await waitFor(() => expect(canceledRejected).toBe(true));
+    const pending = client.getQueryCache().find({ queryKey: listKey('company'), exact: true });
+    expect(pending?.state.data).toEqual(cached);
+    expect(pending?.state.status).toBe('success');
+    expect(pending?.state.error).toBeNull();
+    expect(pending?.state.fetchStatus).toBe('fetching');
+    await waitFor(() => {
+      expect(view.result.current.data).toEqual(cached);
+      expect(view.result.current.isSuccess).toBe(true);
+      expect(view.result.current.isFetching).toBe(true);
+      expect(view.result.current.error).toBeNull();
+    });
+    expect(calls).toBe(3);
+
+    let settled: AutomationReadFetchResult<AutomationReadList> | undefined;
+    await act(async () => {
+      replacement.resolve();
+      settled = await newer;
+      await older;
+    });
+    expect(settled?.data).toEqual(fresh);
+    expect(settled?.isSuccess).toBe(true);
+    expect(settled?.error).toBeNull();
+    await waitFor(() => {
+      expect(view.result.current.data).toEqual(fresh);
+      expect(view.result.current.isSuccess).toBe(true);
+      expect(view.result.current.isError).toBe(false);
+    });
+    expect(client.getQueryData(listKey('company'))).toEqual(fresh);
+    expect(calls).toBe(3);
+  });
+
+  it('hides the cached page on an active 403 while retry is pending, then keeps it hidden after 503', async () => {
+    const cached = listPage(4);
+    const fresh = listPage(1);
+    const client = retryingClient();
+    const attempt = deferred();
+    const retryHold = deferred();
+    let calls = 0;
+    vi.mocked(api.listAutomationReads).mockImplementation(async () => {
+      calls += 1;
+      if (calls === 1) return ok(cached);
+      if (calls === 2) {
+        await attempt.promise;
+        throw httpError(403);
+      }
+      if (calls === 3) {
+        await retryHold.promise;
+        throw httpError(503);
+      }
+      if (calls === 4) return ok(fresh);
+      throw new Error(`unexpected list read ${calls}`);
+    });
+    const view = renderRead(
+      (props: { scope: 'company' }) => useAutomationReadList(props),
+      { scope: 'company' },
+      client,
+    );
+    await waitFor(() => expect(view.result.current.data).toEqual(cached));
+
+    let pending!: Promise<AutomationReadFetchResult<AutomationReadList>>;
+    await act(async () => {
+      pending = view.result.current.refetch();
+    });
+    await waitFor(() => expect(calls).toBe(2));
+    await act(async () => {
+      attempt.resolve();
+    });
+    await waitFor(() => {
+      expect(calls).toBe(3);
+      expect(view.result.current.data).toBeUndefined();
+      expect(view.result.current.isSuccess).toBe(false);
+      expect(view.result.current.isError).toBe(true);
+      expect(view.result.current.isFetching).toBe(true);
+      expect(apiErrorStatus(view.result.current.error)).toBe(403);
+    });
+    expect(client.getQueryData(listKey('company'))).toBeUndefined();
+    expect(view.result.current.data).not.toEqual(cached);
+
+    let failed: AutomationReadFetchResult<AutomationReadList> | undefined;
+    await act(async () => {
+      retryHold.resolve();
+      failed = await pending;
+    });
+    expect(failed?.data).toBeUndefined();
+    expect(failed?.isSuccess).toBe(false);
+    expect(failed?.isError).toBe(true);
+    expect(apiErrorStatus(failed?.error)).toBe(503);
+    await waitFor(() => {
+      expect(view.result.current.data).toBeUndefined();
+      expect(view.result.current.isSuccess).toBe(false);
+      expect(view.result.current.isError).toBe(true);
+      expect(apiErrorStatus(view.result.current.error)).toBe(503);
+    });
+    expect(view.result.current.data).not.toEqual(cached);
+    expect(client.getQueryData(listKey('company'))).toBeUndefined();
+    expect(calls).toBe(3);
+
+    const restored = await readRefetch(view.result.current.refetch);
+    expect(restored.data).toEqual(fresh);
+    expect(restored.isSuccess).toBe(true);
+    expect(restored.error).toBeNull();
+    await waitFor(() => {
+      expect(view.result.current.data).toEqual(fresh);
+      expect(view.result.current.isSuccess).toBe(true);
+      expect(view.result.current.isError).toBe(false);
+    });
+    expect(calls).toBe(4);
   });
 });

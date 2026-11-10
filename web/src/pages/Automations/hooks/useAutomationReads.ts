@@ -77,9 +77,10 @@ function presentRefetch<T>(result: QueryObserverResult<T, Error>): AutomationRea
 
 /**
  * A new scope, id, user, or page is a different key, so the previous page is
- * not kept. A 403 drops this query's cached page before the error is recorded,
- * so a later 503 cannot hand that page back. The rendered page and `refetch`
- * both omit it. A later success stores a new page.
+ * not kept. A 403 clears this query only while the rejected read is still
+ * that query's active request: the cached page is dropped and the status is
+ * the original 403. A canceled read that rejects later leaves the replacement
+ * in place. A later success stores a new page.
  */
 function useAutomationReadQuery<T>(
   queryKey: readonly unknown[],
@@ -91,13 +92,28 @@ function useAutomationReadQuery<T>(
     queryKey,
     enabled,
     queryFn: async () => {
+      // `Query.fetch` assigns the retryer before this function runs, so the
+      // promise here is this attempt. Do not read the query context `signal`:
+      // that marks the abort as consumed and changes unmount rollback.
+      const activeQuery = queryClient.getQueryCache().find({ queryKey, exact: true });
+      const request = activeQuery?.promise;
       try {
         return await read();
       } catch (error) {
-        if (isForbidden(error)) {
-          queryClient.getQueryCache().find({ queryKey, exact: true })?.setState({
+        const current = queryClient.getQueryCache().find({ queryKey, exact: true });
+        if (
+          isForbidden(error) &&
+          error instanceof Error &&
+          activeQuery &&
+          request &&
+          current === activeQuery &&
+          activeQuery.promise === request
+        ) {
+          activeQuery.setState({
             data: undefined,
             dataUpdatedAt: 0,
+            status: 'error',
+            error,
           });
         }
         throw error;
