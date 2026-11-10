@@ -31,8 +31,10 @@ from src.dalton.autonomy.probes.cnhk import probe_cnhk_filings
 from src.dalton.autonomy.probes.director import probe_director
 from src.dalton.autonomy.probes.earnings import probe_earnings
 from src.dalton.autonomy.probes.sec import probe_sec
+from src.dalton.company_identity import is_company_system_user
 from src.dalton.coverage import (
     refresh_due_coverage_groups_for_preflight,
+    render_company_coverage_yaml,
     render_coverage_yaml,
     sync_user_coverage_to_home,
 )
@@ -615,7 +617,12 @@ async def _sync_home_coverage_for_preflight(
     persist: bool = True,
     sync_timeout_s: float = HOME_COVERAGE_SYNC_TIMEOUT_S,
 ) -> Optional[str]:
-    """Render `coverage.yaml` into Home (and refresh due quarterly groups on `calendar`) with a dedicated short timeout before any step that could time out and wake."""
+    """Render `coverage.yaml` into Home before any step that could time out and wake.
+
+    Company execution renders the internal/admin union and does not refresh
+    member groups or create member calendar tasks. Personal calendar refresh
+    is unchanged. Both paths keep the existing sync timeout.
+    """
     # 行业自动化（P3）没有 ticker，但它是工作区级任务而非 Home 任务，
     # 不能落进 "not ticker ⇒ home" 的旧判据里去刷 Home 的 coverage.yaml。
     is_home_dalton = (
@@ -624,9 +631,11 @@ async def _sync_home_coverage_for_preflight(
     if not is_home_dalton or not persist:
         return None
 
+    company_execution = is_company_system_user(user_id)
     eff_sync_timeout = max(0.05, float(sync_timeout_s or HOME_COVERAGE_SYNC_TIMEOUT_S))
     group_refresh_summary: Optional[str] = None
-    if kind == "calendar":
+    # Company execution must not refresh member groups or create member calendar tasks.
+    if kind == "calendar" and not company_execution:
         try:
             refresh_res = await asyncio.wait_for(
                 refresh_due_coverage_groups_for_preflight(
@@ -647,7 +656,10 @@ async def _sync_home_coverage_for_preflight(
             logger.warning("[DALTON_PREFLIGHT] refresh_due_coverage_groups_for_preflight failed: %s", e)
 
     async def _render_and_sync() -> None:
-        yaml_text = await render_coverage_yaml(user_id)
+        if company_execution:
+            yaml_text = await render_company_coverage_yaml()
+        else:
+            yaml_text = await render_coverage_yaml(user_id)
         await sync_user_coverage_to_home(user_id, yaml_text=yaml_text)
 
     try:
