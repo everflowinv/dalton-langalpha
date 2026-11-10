@@ -534,7 +534,11 @@ class InMemoryChannelStore:
             )
             prev_protocol_high = int(prev.get("protocol_seq_high") or 0) if prev else 0
             prev_platform_high = int(prev.get("platform_time_high") or 0) if prev else 0
-            if prev is None or cg_db._context_order_supersedes(
+            if prev_source == "protocol":
+                prev_protocol_high = max(prev_protocol_high, prev_seq)
+            elif prev_source == "platform_time":
+                prev_platform_high = max(prev_platform_high, prev_seq)
+            if prev is not None and not cg_db._context_order_supersedes(
                 seq_source,
                 seq_val,
                 prev_source,
@@ -542,17 +546,33 @@ class InMemoryChannelStore:
                 protocol_high=prev_protocol_high,
                 platform_time_high=prev_platform_high,
             ):
-                self.weixin_context_tokens[key] = {
-                    "ilink_bot_id": bot_id,
-                    "bot_generation": bot_gen,
-                    "platform_user_id": puid,
-                    "encrypted_context_token": ctok,
-                    "seq": seq_val,
-                    "seq_source": seq_source,
-                    "protocol_seq_high": protocol_high,
-                    "platform_time_high": platform_high,
-                    "updated_at": now,
-                }
+                return []
+            stored_seq = seq_val
+            if prev is not None and seq_source == "receive":
+                stored_seq = prev_seq + 1 if prev_source == "receive" else 1
+            stored_protocol = max(
+                prev_protocol_high,
+                protocol_high,
+                stored_seq if seq_source == "protocol" else 0,
+            )
+            stored_platform = max(
+                prev_platform_high,
+                platform_high,
+                stored_seq if seq_source == "platform_time" else 0,
+            )
+            self.weixin_context_tokens[key] = {
+                "ilink_bot_id": bot_id,
+                "bot_generation": bot_gen,
+                "platform_user_id": puid,
+                "encrypted_context_token": ctok,
+                "seq": stored_seq,
+                "seq_source": seq_source,
+                "protocol_seq_high": stored_protocol,
+                "platform_time_high": stored_platform,
+                "updated_at": now,
+            }
+            if "RETURNING" in norm:
+                return [{"seq": stored_seq, "seq_source": seq_source}]
             return []
 
         if "FROM dalton_channel_weixin_context_tokens WHERE ilink_bot_id = %s" in norm:

@@ -6,8 +6,10 @@ Global lock order across transactions:
 0. Per-message / per-delivery advisory locks (`dalton_inbound:<platform>:<message_id>`, `dalton_delivery:<delivery_key>`)
 1. Personal settings advisory + row locks (`dalton_user_settings:<user_id>`, `dalton_channel_user_settings` `FOR UPDATE`; sorted by `user_id` when locking multiple users)
 2. Group chat advisory locks (`_acquire_group_chat_lock`; sorted by `platform`, `chat_address`)
-3. Chat binding rows (`dalton_channel_chat_bindings`) / identity rows (`dalton_channel_identities`) / session generation rows (`dalton_channel_session_generations` `FOR UPDATE`)
-4. Inbound event / thread watch / background run / delivery rows (`dalton_channel_inbound_events`, `dalton_channel_thread_watches`, `dalton_channel_background_runs`, `dalton_channel_deliveries` `FOR UPDATE`)
+3. Weixin state singleton. Confirm, account switch, and cursor updates take `FOR UPDATE`. A registration or bind that reads the bot generation takes `FOR SHARE` after settings locks and before the sender lock.
+4. Weixin context-token advisory locks (`dalton_weixin_context:<bot>:<generation>:<sender>`), sorted by bot, generation, and sender when locking several. After the state lock and before identity or token row locks.
+5. Chat binding rows (`dalton_channel_chat_bindings`) / identity rows (`dalton_channel_identities`) / session generation rows (`dalton_channel_session_generations` `FOR UPDATE`)
+6. Inbound event / thread watch / background run / delivery rows (`dalton_channel_inbound_events`, `dalton_channel_thread_watches`, `dalton_channel_background_runs`, `dalton_channel_deliveries` `FOR UPDATE`)
 """
 
 from __future__ import annotations
@@ -606,13 +608,88 @@ def _payload_marks_invalid_inbound(payload: Any) -> bool:
     return reason == "invalid_inbound_event"
 
 
-async def _get_active_weixin_bot_in_tx(cur: Any) -> tuple[str | None, int, str]:
-    """Return `(ilink_bot_id, bot_generation, normalized_status)` for the singleton Weixin bot."""
+def _weixin_context_lock_key(
+    bot_id: str, bot_generation: int, platform_user_id: str
+) -> str:
+    """Advisory-lock name for one bot generation and sender."""
+    return (
+        "dalton_weixin_context:"
+        f"{str(bot_id).strip()}:{int(bot_generation)}:{str(platform_user_id).strip()}"
+    )
+
+
+async def _lock_weixin_context_sender_in_tx(
+    cur: Any,
+    *,
+    bot_id: str,
+    bot_generation: int,
+    platform_user_id: str,
+) -> None:
+    """Serialize first-row creation and later updates for one sender.
+
+    Reentrant in the same transaction. Callers that lock several senders
+    pass them in `(bot, generation, sender)` order.
+    """
     await cur.execute(
-        """
+        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+        (_weixin_context_lock_key(bot_id, bot_generation, platform_user_id),),
+    )
+
+
+async def _lock_weixin_context_token_rows_in_tx(
+    cur: Any,
+    *,
+    bot_ids: list[str] | None = None,
+    keep_bot_id: str | None = None,
+    keep_generation: int | None = None,
+    platform_user_id: str | None = None,
+) -> None:
+    """Lock token rows before a generation reset or unbind deletes them."""
+    if platform_user_id:
+        await cur.execute(
+            """
+            SELECT ilink_bot_id, bot_generation, platform_user_id
+            FROM dalton_channel_weixin_context_tokens
+            WHERE platform_user_id = %s
+            ORDER BY ilink_bot_id, bot_generation, platform_user_id
+            """,
+            (str(platform_user_id).strip(),),
+        )
+    else:
+        await cur.execute(
+            """
+            SELECT ilink_bot_id, bot_generation, platform_user_id
+            FROM dalton_channel_weixin_context_tokens
+            WHERE ilink_bot_id = ANY(%s)
+              AND NOT (ilink_bot_id = %s AND bot_generation = %s)
+            ORDER BY ilink_bot_id, bot_generation, platform_user_id
+            """,
+            (list(bot_ids or []), keep_bot_id or "", int(keep_generation or 0)),
+        )
+    for row in await cur.fetchall():
+        await _lock_weixin_context_sender_in_tx(
+            cur,
+            bot_id=str(row["ilink_bot_id"]),
+            bot_generation=int(row["bot_generation"]),
+            platform_user_id=str(row["platform_user_id"]),
+        )
+
+
+async def _get_active_weixin_bot_in_tx(
+    cur: Any, *, lock_generation: bool = False
+) -> tuple[str | None, int, str]:
+    """Return `(ilink_bot_id, bot_generation, normalized_status)` for the singleton Weixin bot.
+
+    `lock_generation` takes `FOR SHARE` so a confirm or account switch that
+    holds `FOR UPDATE` cannot publish a new generation until this transaction
+    finishes writing the generation it read.
+    """
+    share = " FOR SHARE" if lock_generation else ""
+    await cur.execute(
+        f"""
         SELECT ilink_bot_id, bot_generation, status
         FROM dalton_channel_weixin_state
-        WHERE singleton_id = 1
+        WHERE singleton_id = 1{share}
         """
     )
     row = await cur.fetchone()
@@ -639,8 +716,10 @@ async def _upsert_weixin_context_token_in_tx(
 
     Protocol seq and platform time each keep a high-water on this bot
     generation and sender, including while the other field is current. A
-    message with neither field still takes the next receive revision. Replay
-    of an existing message never reaches this function.
+    message with neither field still takes the next receive revision. The
+    sender advisory lock covers the first row, and the conflict update never
+    stores a smaller high. Replay of an existing message never reaches this
+    function.
     """
     cleaned_bot_id = str(bot_id or "").strip()
     cleaned_puid = str(platform_user_id or "").strip()
@@ -648,6 +727,12 @@ async def _upsert_weixin_context_token_in_tx(
     if not cleaned_bot_id or not cleaned_puid or not cleaned_token:
         return False, 0
 
+    await _lock_weixin_context_sender_in_tx(
+        cur,
+        bot_id=cleaned_bot_id,
+        bot_generation=int(bot_generation),
+        platform_user_id=cleaned_puid,
+    )
     await cur.execute(
         """
         SELECT seq, seq_source, protocol_seq_high, platform_time_high
@@ -708,10 +793,42 @@ async def _upsert_weixin_context_token_in_tx(
         VALUES (%s, %s, %s, pgp_sym_encrypt(%s, %s), %s, %s, %s, %s, NOW())
         ON CONFLICT (ilink_bot_id, bot_generation, platform_user_id) DO UPDATE SET
             encrypted_context_token = EXCLUDED.encrypted_context_token,
-            seq = EXCLUDED.seq,
+            seq = CASE
+                WHEN EXCLUDED.seq_source = 'receive' THEN
+                    CASE
+                        WHEN dalton_channel_weixin_context_tokens.seq_source = 'receive'
+                        THEN dalton_channel_weixin_context_tokens.seq + 1
+                        ELSE 1
+                    END
+                ELSE EXCLUDED.seq
+            END,
             seq_source = EXCLUDED.seq_source,
-            protocol_seq_high = EXCLUDED.protocol_seq_high,
-            platform_time_high = EXCLUDED.platform_time_high,
+            protocol_seq_high = GREATEST(
+                dalton_channel_weixin_context_tokens.protocol_seq_high,
+                CASE
+                    WHEN dalton_channel_weixin_context_tokens.seq_source = 'protocol'
+                    THEN dalton_channel_weixin_context_tokens.seq
+                    ELSE 0
+                END,
+                EXCLUDED.protocol_seq_high,
+                CASE
+                    WHEN EXCLUDED.seq_source = 'protocol' THEN EXCLUDED.seq
+                    ELSE 0
+                END
+            ),
+            platform_time_high = GREATEST(
+                dalton_channel_weixin_context_tokens.platform_time_high,
+                CASE
+                    WHEN dalton_channel_weixin_context_tokens.seq_source = 'platform_time'
+                    THEN dalton_channel_weixin_context_tokens.seq
+                    ELSE 0
+                END,
+                EXCLUDED.platform_time_high,
+                CASE
+                    WHEN EXCLUDED.seq_source = 'platform_time' THEN EXCLUDED.seq
+                    ELSE 0
+                END
+            ),
             updated_at = NOW()
         WHERE EXCLUDED.seq_source = 'receive'
            OR (
@@ -736,6 +853,7 @@ async def _upsert_weixin_context_token_in_tx(
                     END
                 )
               )
+        RETURNING seq, seq_source
         """,
         (
             cleaned_bot_id,
@@ -750,8 +868,27 @@ async def _upsert_weixin_context_token_in_tx(
         ),
     )
     wrote = getattr(cur, "rowcount", None)
-    if existing is not None and isinstance(wrote, int) and wrote == 0:
-        return False, int(existing.get("seq") or 0)
+    if isinstance(wrote, int) and wrote == 0:
+        await cur.execute(
+            """
+            SELECT seq, seq_source, protocol_seq_high, platform_time_high
+            FROM dalton_channel_weixin_context_tokens
+            WHERE ilink_bot_id = %s AND bot_generation = %s AND platform_user_id = %s
+            """,
+            (cleaned_bot_id, int(bot_generation), cleaned_puid),
+        )
+        current = await cur.fetchone()
+        if existing is not None:
+            fallback_seq = int(existing.get("seq") or 0)
+        else:
+            fallback_seq = 0
+        return False, int(current["seq"]) if current else fallback_seq
+
+    stored = await cur.fetchone()
+    if isinstance(stored, dict) and stored.get("seq") is not None:
+        effective_seq = int(stored["seq"])
+        if stored.get("seq_source"):
+            source = str(stored["seq_source"])
 
     await cur.execute(
         """
@@ -1347,7 +1484,9 @@ async def _register_and_resolve_inbound_once(
 
                 # 1c. For valid Weixin DM messages, persist encrypted context_token with Bot & monotonic seq guard
                 if cleaned_platform == "weixin" and eff_ctx_token:
-                    active_bot_id, active_bot_gen, _ = await _get_active_weixin_bot_in_tx(cur)
+                    active_bot_id, active_bot_gen, _ = await _get_active_weixin_bot_in_tx(
+                        cur, lock_generation=True
+                    )
                     req_bot_id = str(weixin_bot_id or payload_dict.get("ilink_bot_id") or "").strip() or None
                     req_bot_gen = (
                         int(weixin_bot_generation)
@@ -1816,6 +1955,22 @@ async def _bind_identity_in_tx(
             WHERE user_id = %s FOR UPDATE
             """,
             (lock_uid,),
+        )
+    if platform == "weixin":
+        active_bot_id, active_bot_gen, _ = await _get_active_weixin_bot_in_tx(
+            cur, lock_generation=True
+        )
+        if active_bot_id:
+            lock_bot = active_bot_id
+            lock_gen = int(active_bot_gen)
+        else:
+            lock_bot = str(weixin_bot_id or "default").strip() or "default"
+            lock_gen = int(weixin_bot_generation or 1)
+        await _lock_weixin_context_sender_in_tx(
+            cur,
+            bot_id=lock_bot,
+            bot_generation=lock_gen,
+            platform_user_id=platform_user_id,
         )
     # If another Dalton user was previously bound to this same (platform, platform_user_id), unbind them and bump their generation
     await cur.execute(
@@ -2335,6 +2490,25 @@ async def _consume_bind_code_or_unbind_once(
                     )
                     s_row = await cur.fetchone()
 
+                    sender_puid = cleaned_puid
+                    if cleaned_platform == "weixin" and not sender_puid:
+                        await cur.execute(
+                            """
+                            SELECT platform_user_id FROM dalton_channel_identities
+                            WHERE user_id = %s AND platform = %s
+                            """,
+                            (target_uid, cleaned_platform),
+                        )
+                        pre_id = await cur.fetchone()
+                        if pre_id and pre_id.get("platform_user_id"):
+                            sender_puid = str(pre_id["platform_user_id"])
+                    if cleaned_platform == "weixin" and sender_puid:
+                        # Lock the sender before the identity row. The high-water
+                        # lives on the token rows deleted below.
+                        await _lock_weixin_context_token_rows_in_tx(
+                            cur, platform_user_id=sender_puid
+                        )
+
                     await cur.execute(
                         """
                         DELETE FROM dalton_channel_identities
@@ -2350,7 +2524,6 @@ async def _consume_bind_code_or_unbind_once(
                         else cleaned_puid
                     )
                     if cleaned_platform == "weixin" and eff_deleted_puid:
-                        # This sender's protocol and platform-time high-water lives on these rows.
                         await cur.execute(
                             """
                             DELETE FROM dalton_channel_weixin_context_tokens
@@ -7854,6 +8027,35 @@ async def _upsert_weixin_state_once(
                 # ---------------------------------------------------------------
                 if cleaned_login_action == "confirm":
                     eff_skey = str(login_session_key or "").strip()
+                    confirm_lock_uids: set[str] = set()
+                    if str(eff_login_owner or "").strip():
+                        confirm_lock_uids.add(str(eff_login_owner).strip())
+                    early_ilink = str(ilink_user_id or "").strip()
+                    if early_ilink:
+                        await cur.execute(
+                            """
+                            SELECT user_id FROM dalton_channel_identities
+                            WHERE platform = 'weixin' AND platform_user_id = %s
+                            """,
+                            (early_ilink,),
+                        )
+                        confirm_lock_uids.update(
+                            str(found["user_id"])
+                            for found in await cur.fetchall()
+                            if found.get("user_id")
+                        )
+                    for lock_uid in sorted(confirm_lock_uids):
+                        await cur.execute(
+                            "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                            (f"dalton_user_settings:{lock_uid}",),
+                        )
+                        await cur.execute(
+                            """
+                            SELECT 1 FROM dalton_channel_user_settings
+                            WHERE user_id = %s FOR UPDATE
+                            """,
+                            (lock_uid,),
+                        )
                     await cur.execute(
                         """
                         SELECT * FROM dalton_channel_weixin_state
@@ -8015,6 +8217,12 @@ async def _upsert_weixin_state_once(
                         b for b in {prev_bot_id, cleaned_bot_id} if b
                     ]
                     if bots_to_clear:
+                        await _lock_weixin_context_token_rows_in_tx(
+                            cur,
+                            bot_ids=bots_to_clear,
+                            keep_bot_id=cleaned_bot_id,
+                            keep_generation=new_bot_gen,
+                        )
                         await cur.execute(
                             """
                             DELETE FROM dalton_channel_weixin_context_tokens
@@ -8221,6 +8429,12 @@ async def _upsert_weixin_state_once(
                                 b for b in {prev_bot_id, cleaned_bot_id} if b
                             ]
                             if bots_to_clear:
+                                await _lock_weixin_context_token_rows_in_tx(
+                                    cur,
+                                    bot_ids=bots_to_clear,
+                                    keep_bot_id=cleaned_bot_id,
+                                    keep_generation=next_bot_gen,
+                                )
                                 await cur.execute(
                                     """
                                     DELETE FROM dalton_channel_weixin_context_tokens
