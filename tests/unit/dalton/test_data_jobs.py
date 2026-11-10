@@ -1112,25 +1112,80 @@ async def test_t27_and_t32_stdout_notification_payload_extraction(tmp_path: Path
     secret_val = "SECRET-KEY-99999"
     (secrets_dir / "API_TOKEN").write_text(secret_val, encoding="utf-8")
 
-    # T27: Markdown stdout -> outbox.json
+    charts_dir = tmp_path / "temp" / "asia-leverage-crossview" / "charts"
+    charts_dir.mkdir(parents=True, exist_ok=True)
+    for code in ("cn", "kr", "jp", "tw"):
+        (charts_dir / f"{code}_latest.png").write_bytes(
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + code.upper().encode("ascii") + b"\x00" * 24
+        )
+
+    t27_script = tmp_path / "emit_t27.py"
+    t27_script.write_text(
+        "\n".join(
+            [
+                "import os",
+                "tok = os.environ['API_TOKEN']",
+                "print('# 四地杠杆日报')",
+                "print('## 🇨🇳 中国A股')",
+                "print('- A股融资余额: 正常 ' + tok)",
+                "print('IMG:temp/asia-leverage-crossview/charts/cn_latest.png')",
+                "print('## 🇰🇷 韩国')",
+                "print('- 韩国融券监控: 正常')",
+                "print('IMG:temp/asia-leverage-crossview/charts/kr_latest.png')",
+                "print('## 🇯🇵 日本')",
+                "print('- 日本信用倍率: 正常')",
+                "print('IMG:temp/asia-leverage-crossview/charts/jp_latest.png')",
+                "print('## 🇹🇼 台湾')",
+                "print('- 台湾融资维持率: 正常')",
+                "print('IMG:temp/asia-leverage-crossview/charts/tw_latest.png')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    # T27: 4-market Markdown stdout + 4 charts -> finalized Card 2.0 outbox.json + snapshotted images
+    t27_run_id = "11111111-2222-4333-8444-555555555555"
     t27_res = await run_wrapped_command(
-        [
-            sys.executable,
-            "-c",
-            "import os; print('# 四地杠杆日报\\n\\n- A股: 正常 ' + os.environ['API_TOKEN'])",
-        ],
-        run_id="run-t27",
+        [sys.executable, str(t27_script)],
+        run_id=t27_run_id,
         job_key="asia-leverage-crossview-daily",
         workdir=str(tmp_path),
         workspace_dir=str(tmp_path),
         secrets_dir=secrets_dir,
         outbox_tmp_dir=tmp_path / "tmp_t27",
     )
+    assert t27_res.exit_code == 0
     assert t27_res.outbox_payload is not None
-    assert t27_res.outbox_payload["format"] == "markdown"
-    assert "# 四地杠杆日报" in t27_res.outbox_payload["text"]
-    assert secret_val not in t27_res.outbox_payload["text"]
-    assert "[REDACTED]" in t27_res.outbox_payload["text"]
+    assert t27_res.outbox_payload["summary"] == "四地杠杆日报"
+    assert len(t27_res.outbox_payload["feishu_cards"]) == 1
+    t27_card_entry = t27_res.outbox_payload["feishu_cards"][0]
+    assert t27_card_entry["card"]["schema"] == "2.0"
+    assert [img["filename"] for img in t27_card_entry["images"]] == [
+        "cn_latest.png",
+        "kr_latest.png",
+        "jp_latest.png",
+        "tw_latest.png",
+    ]
+    serialized_t27 = json.dumps(t27_res.outbox_payload, ensure_ascii=False)
+    assert secret_val not in serialized_t27
+    assert "[REDACTED]" in serialized_t27
+
+    # T27 incomplete output (missing the 4 required IMG: chart markers) fails closed with exit_code=1
+    t27_incomplete = await run_wrapped_command(
+        [
+            sys.executable,
+            "-c",
+            "print('# 四地杠杆日报\\n\\n- 缺失图表标记')",
+        ],
+        run_id="22222222-2222-4333-8444-555555555555",
+        job_key="asia-leverage-crossview-daily",
+        workdir=str(tmp_path),
+        workspace_dir=str(tmp_path),
+        secrets_dir=secrets_dir,
+        outbox_tmp_dir=tmp_path / "tmp_t27_incomplete",
+    )
+    assert t27_incomplete.exit_code == 1
+    assert t27_incomplete.outbox_payload is None
 
     # T32: Plain-text stdout -> outbox.json
     t32_res = await run_wrapped_command(

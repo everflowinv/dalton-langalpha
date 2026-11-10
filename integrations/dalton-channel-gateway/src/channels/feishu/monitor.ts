@@ -57,6 +57,7 @@ import {
   assertFeishuChatMember,
   getChatInfo,
   listFeishuDirectoryGroupsDetailed,
+  MAX_FEISHU_DIRECTORY_PAGES,
 } from "./directory.js";
 import {
   assertFeishuCardWithinEnvelope,
@@ -339,6 +340,7 @@ export interface FeishuChannelAdapterOptions {
   outgoingOnly?: boolean;
   maxChunkChars?: number;
   client?: Lark.Client;
+  clientFactory?: (creds: FeishuCredentials) => Lark.Client;
   wsClientFactory?: (creds: FeishuWSClientOptions) => FeishuWSClientLike;
   eventDispatcherFactory?: (
     creds: Pick<FeishuCredentials, "encryptKey" | "verificationToken">,
@@ -427,6 +429,7 @@ export class FeishuChannelAdapter implements ChannelAdapter {
   private readonly outgoingOnly: boolean;
   private botOpenId?: string;
   private clientInstance?: Lark.Client;
+  private readonly clientFactory?: (creds: FeishuCredentials) => Lark.Client;
   private readonly wsClientFactory?: (
     creds: FeishuWSClientOptions,
   ) => FeishuWSClientLike;
@@ -451,6 +454,7 @@ export class FeishuChannelAdapter implements ChannelAdapter {
     this.botOpenId = options.botOpenId?.trim() || undefined;
     this.maxChunkChars = options.maxChunkChars ?? 4000;
     this.clientInstance = options.client;
+    this.clientFactory = options.clientFactory;
     this.wsClientFactory = options.wsClientFactory;
     this.eventDispatcherFactory = options.eventDispatcherFactory;
     this.logger = options.logger ?? createSubsystemLogger("feishu");
@@ -492,14 +496,17 @@ export class FeishuChannelAdapter implements ChannelAdapter {
         code: "unavailable",
       });
     }
-    this.clientInstance = createFeishuClient({
+    const creds: FeishuCredentials = {
       appId: this.appId,
       appSecret: this.appSecret,
       domain: this.domain,
       encryptKey: this.encryptKey,
       verificationToken: this.verificationToken,
       logger: this.logger,
-    });
+    };
+    this.clientInstance = this.clientFactory
+      ? this.clientFactory(creds)
+      : createFeishuClient(creds);
     return this.clientInstance;
   }
 
@@ -928,12 +935,60 @@ export class FeishuChannelAdapter implements ChannelAdapter {
     }
 
     const client = this.getClient();
+    const senderOpenId = params.platformUserId?.trim();
+    if (params.purpose === "data_task_notification" || !senderOpenId) {
+      try {
+        const listing = await listFeishuDirectoryGroupsDetailed(client, {
+          limit: MAX_FEISHU_DIRECTORY_PAGES * 100,
+          pageSize: 100,
+          maxPages: MAX_FEISHU_DIRECTORY_PAGES,
+        });
+        if (!listing.complete || listing.error !== null) {
+          return {
+            ok: false,
+            address: null,
+            code: "unavailable",
+            message:
+              listing.error ??
+              "Feishu bot group enumeration was incomplete; refusing unconfirmed group access.",
+          };
+        }
+        const matchedGroup = listing.groups.find(
+          (group) => group.id === chatId,
+        );
+        if (!matchedGroup) {
+          return {
+            ok: false,
+            address: null,
+            code: "not_allowed",
+            message: `Dedicated Feishu bot is not a member of group ${chatId}.`,
+          };
+        }
+        const chatInfo = await getChatInfo(client, chatId);
+        return {
+          ok: true,
+          address: `feishu:${chatId}`,
+          name: chatInfo.name || matchedGroup.name || chatId,
+          message: null,
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const isNotAllowed =
+          /permission denied|not a member|not exist|not found|no permission/i.test(
+            msg,
+          );
+        return {
+          ok: false,
+          address: null,
+          code: isNotAllowed ? "not_allowed" : "unavailable",
+          message: msg,
+        };
+      }
+    }
+
     try {
       const chatInfo = await getChatInfo(client, chatId);
-      const senderOpenId = params.platformUserId?.trim();
-      if (senderOpenId) {
-        await assertFeishuChatMember(client, chatId, senderOpenId);
-      }
+      await assertFeishuChatMember(client, chatId, senderOpenId);
       return {
         ok: true,
         address: `feishu:${chatId}`,

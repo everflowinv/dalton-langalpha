@@ -964,6 +964,9 @@ export class HttpBackendClient implements BackendClient {
       userId?: string | null;
       query?: Record<string, string | undefined | null>;
       body?: unknown;
+      timeoutMs?: number;
+      redirect?: RequestRedirect;
+      cache?: RequestCache;
     },
   ): Promise<{ status: number; data: T }> {
     const url = new URL(`${this.baseUrl}${path}`);
@@ -981,6 +984,11 @@ export class HttpBackendClient implements BackendClient {
         options?.body !== undefined ? { "Content-Type": "application/json" } : undefined,
       ),
       ...(options?.body !== undefined ? { body: JSON.stringify(options.body) } : {}),
+      ...(options?.redirect ? { redirect: options.redirect } : {}),
+      ...(options?.cache ? { cache: options.cache } : {}),
+      ...(typeof options?.timeoutMs === "number" && options.timeoutMs > 0
+        ? { signal: AbortSignal.timeout(options.timeoutMs) }
+        : {}),
     };
     const resp = await this.fetchImpl(url, init);
     const text = await resp.text();
@@ -1587,7 +1595,7 @@ export class HttpBackendClient implements BackendClient {
   async authorizeDataTaskNotificationPlan(
     req: DataTaskNotificationRequest,
   ): Promise<DataTaskAuthorizePlanResponse> {
-    const { status, data } = await this.requestJson<DataTaskAuthorizePlanResponse>(
+    const { status, data } = await this.jsonRequest<DataTaskAuthorizePlanResponse>(
       "POST",
       "/api/v1/dalton/channels/internal/data-task-notifications/plan",
       {
@@ -1595,9 +1603,12 @@ export class HttpBackendClient implements BackendClient {
           run_id: req.run_id,
           target: req.target,
         },
+        timeoutMs: 15_000,
+        redirect: "error",
+        cache: "no-store",
       },
     );
-    if (status >= 400) {
+    if (status >= 300) {
       throw new BackendHttpError(
         `authorizeDataTaskNotificationPlan failed (${status})`,
         status,
@@ -1618,7 +1629,17 @@ export class HttpBackendClient implements BackendClient {
     const resp = await this.fetchImpl(url, {
       method: "GET",
       headers: this.headers(),
+      redirect: "error",
+      cache: "no-store",
+      signal: AbortSignal.timeout(30_000),
     });
+    if (resp.status >= 300 && resp.status < 400) {
+      throw new BackendHttpError(
+        `downloadDataTaskRunArtifact redirect rejected (${resp.status})`,
+        resp.status,
+        null,
+      );
+    }
     if (!resp.ok) {
       let body: unknown = null;
       try {

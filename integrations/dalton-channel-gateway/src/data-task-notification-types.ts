@@ -59,7 +59,8 @@ export interface DataTaskAuthorizePlanResponse {
   run_id?: string;
   job_key?: string;
   owner_user_id?: string;
-  owner_platform_user_id?: string;
+  /** Present on authorized DM plans; omitted (`undefined`) on administrator group plans. */
+  owner_platform_user_id?: string | null;
   platform?: ChannelPlatform;
   target_kind?: "dm" | "group";
   requested_target?: string;

@@ -59,7 +59,7 @@ class AuthorizedDataTaskTarget:
     run_id: str = ""
     job_key: str = ""
     owner_user_id: str = ""
-    owner_platform_user_id: str = ""
+    owner_platform_user_id: str | None = None
     platform: str = ""
     target_kind: str = ""  # "dm" | "group"
     requested_target: str = ""
@@ -325,26 +325,28 @@ async def _authorize_run_and_target_in_tx(
             deny_message="Requested target is not authorized by the task's current notification route.",
         )
 
-    # Resolve dedicated Dalton app binding for owner_user_id on `platform`
-    await cur.execute(
-        """
-        SELECT platform_user_id
-        FROM dalton_channel_identities
-        WHERE user_id = %s AND platform = %s
-        """,
-        (owner_user_id, platform),
-    )
-    id_row = await cur.fetchone()
-    bound_platform_uid = str(id_row.get("platform_user_id") or "").strip() if id_row else ""
-    if not bound_platform_uid:
-        return AuthorizedDataTaskTarget(
-            allowed=False,
-            deny_status="failed",
-            deny_code="not_linked",
-            deny_message=f"Owner account has no dedicated Dalton {platform} binding.",
-        )
-
+    bound_platform_uid: str | None = None
     if target_kind == "dm":
+        # Resolve dedicated Dalton app binding for owner_user_id on `platform`
+        await cur.execute(
+            """
+            SELECT platform_user_id
+            FROM dalton_channel_identities
+            WHERE user_id = %s AND platform = %s
+            """,
+            (owner_user_id, platform),
+        )
+        id_row = await cur.fetchone()
+        resolved_uid = str(id_row.get("platform_user_id") or "").strip() if id_row else ""
+        if not resolved_uid:
+            return AuthorizedDataTaskTarget(
+                allowed=False,
+                deny_status="failed",
+                deny_code="not_linked",
+                deny_message=f"Owner account has no dedicated Dalton {platform} binding.",
+            )
+        bound_platform_uid = resolved_uid
+
         if platform == "feishu":
             if raw_ident != "@me" and raw_ident != bound_platform_uid:
                 # Never reuse another user's Dalton open_id or a foreign Feishu app's open_id!
@@ -503,13 +505,12 @@ async def authorize_data_task_notification_plan(
                 item_dict["existing_status"] = str(ex["status"]) if ex else None
                 wire_items.append(item_dict)
 
-            return {
+            plan_payload: dict[str, Any] = {
                 "authorized": True,
                 "status": "authorized",
                 "run_id": auth.run_id,
                 "job_key": auth.job_key,
                 "owner_user_id": auth.owner_user_id,
-                "owner_platform_user_id": auth.owner_platform_user_id,
                 "platform": auth.platform,
                 "target_kind": auth.target_kind,
                 "requested_target": auth.requested_target,
@@ -517,6 +518,9 @@ async def authorize_data_task_notification_plan(
                 "recipient_id": auth.recipient_id,
                 "items": wire_items,
             }
+            if auth.owner_platform_user_id is not None:
+                plan_payload["owner_platform_user_id"] = auth.owner_platform_user_id
+            return plan_payload
 
 
 async def authorize_and_claim_data_task_delivery(

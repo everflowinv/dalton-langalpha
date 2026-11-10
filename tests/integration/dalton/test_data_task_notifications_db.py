@@ -454,6 +454,7 @@ async def test_authorization_gates_foreign_openid_protection_and_bounded_artifac
                 json={"run_id": prod_run_id, "target": "feishu:chat:oc_synth_group_1"},
             )
             assert r_grp_ok.json()["authorized"] is True
+            assert "owner_platform_user_id" not in r_grp_ok.json()
             assert r_grp_ok.json()["recipient_id"] == "oc_synth_group_1"
             assert r_grp_ok.json()["canonical_target_address"] == "feishu:oc_synth_group_1"
 
@@ -915,5 +916,385 @@ async def test_concurrent_claim_multi_item_resume_and_uncertain_ledger_protectio
             await cur.execute(
                 "DELETE FROM users WHERE user_id = %s",
                 (pm_uid,),
+            )
+        await admin_conn.close()
+
+
+@pytest.mark.asyncio
+async def test_unbound_admin_group_delivery_workspace_gate_and_real_vault_startup_db(
+    migrated_dsn: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R2 §1 & §2 against real PostgreSQL + ASGI HTTP:
+    - Primary administrator with zero `dalton_channel_identities` and zero `dalton_channel_inbound_events`
+      saves group settings via `update_user_channel_settings` (`I-5`), obtains an authorized group plan
+      omitting `owner_platform_user_id`, and claims/completes `dalton_channel_deliveries` (`I-6`/`I-7`);
+    - Personal DM targets for that unbound administrator remain denied (`not_linked`);
+    - Group bound to an inaccessible workspace is denied (`not_allowed`);
+    - Internal Vault startup endpoint decrypts only the primary administrator's two dedicated Feishu keys
+      from real `user_vault_secrets` (`pgcrypto`) and reflects rotated values on subsequent startup reads.
+    """
+    from src.server.database import user_vault_secrets as vault_db
+
+    dsn = migrated_dsn
+    pm_uid = f"pm-r2-unbound-{uuid4().hex[:8]}"
+    other_uid = f"other-r2-{uuid4().hex[:8]}"
+    prod_run_id = str(uuid4())
+    inaccessible_ws_id = str(uuid4())
+
+    synth_app_id = "cli_synth_r2_pg_app"
+    synth_secret_v1 = "sec_synth_r2_pg_secret_v1"
+    synth_secret_v2 = "sec_synth_r2_pg_secret_v2"
+
+    path_map = build_path_map(
+        host_var_dir=tmp_path / "r2_h_var",
+        backend_var_dir=tmp_path / "r2_b_var",
+    )
+    rdir = path_map.backend_run_artifacts_dir(prod_run_id)
+    (rdir / "images").mkdir(parents=True, exist_ok=True)
+    (rdir / "images" / "c0.png").write_bytes(_make_png("R2-GROUP-CARD"))
+    (rdir / "outbox.json").write_text(
+        json.dumps(
+            {
+                "feishu_cards": [
+                    {
+                        "card": {
+                            "schema": "2.0",
+                            "body": {"elements": [{"tag": "__img__", "path": "ph0"}]},
+                        },
+                        "images": [{"placeholder": "ph0", "path": "images/c0.png"}],
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    @asynccontextmanager
+    async def _real_db_conn(conn: Any = None):
+        if conn is not None:
+            yield conn
+            return
+        c = await psycopg.AsyncConnection.connect(dsn, autocommit=True)
+        try:
+            yield c
+        finally:
+            await c.close()
+
+    async def _real_get_prefs(user_id: str) -> dict[str, Any] | None:
+        async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as c:
+            async with c.cursor(row_factory=dict_row) as cur:
+                await cur.execute(
+                    "SELECT model_preference, other_preference FROM user_preferences WHERE user_id = %s",
+                    (user_id,),
+                )
+                return await cur.fetchone()
+
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", SERVICE_TOKEN)
+    monkeypatch.setenv("DALTON_PM_USER_IDS", pm_uid)
+    monkeypatch.setenv("DALTON_COLLEAGUE_DISPATCH_ENABLED", "false")
+    for mod in (dtn_db, cg_db, vault_db):
+        monkeypatch.setattr(
+            mod,
+            "get_db_connection",
+            create_autospec(mod.get_db_connection, side_effect=_real_db_conn),
+        )
+    monkeypatch.setattr(
+        dtn_db,
+        "build_path_map",
+        create_autospec(dtn_db.build_path_map, return_value=path_map),
+    )
+    monkeypatch.setattr(
+        model_prefs_mod,
+        "get_user_preferences",
+        create_autospec(model_prefs_mod.get_user_preferences, side_effect=_real_get_prefs),
+    )
+    monkeypatch.setattr(
+        access_tiers_mod,
+        "get_user_tier",
+        create_autospec(access_tiers_mod.get_user_tier, return_value="admin"),
+    )
+    monkeypatch.setattr(
+        cg_db,
+        "get_user_tier",
+        create_autospec(cg_db.get_user_tier, return_value="admin"),
+    )
+
+    admin_conn = await psycopg.AsyncConnection.connect(dsn, autocommit=True)
+    try:
+        manifest = load_data_task_manifest()
+        async with admin_conn.transaction():
+            await sync_manifest_to_db(admin_conn, manifest)
+            async with admin_conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE dalton_data_task_defs
+                    SET enabled = TRUE, notify_enabled = TRUE
+                    WHERE job_key = 'softbank-nav-monitor'
+                    """
+                )
+                for uid in (pm_uid, other_uid):
+                    await cur.execute(
+                        """
+                        INSERT INTO users (user_id, email, name, created_at, updated_at)
+                        VALUES (%s, %s, %s, NOW(), NOW())
+                        ON CONFLICT (user_id) DO NOTHING
+                        """,
+                        (uid, f"{uid}@synth.local", uid),
+                    )
+                await cur.execute(
+                    """
+                    INSERT INTO workspaces (workspace_id, user_id, name, status, created_at, updated_at)
+                    VALUES (%s::uuid, %s, 'Other Private WS', 'stopped', NOW(), NOW())
+                    """,
+                    (inaccessible_ws_id, other_uid),
+                )
+                slot = datetime(2026, 11, 9, 12, 0, tzinfo=timezone.utc)
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_data_task_runs (
+                        run_id, job_key, trigger_source, scheduled_slot_utc,
+                        deadline_utc, status, notify_status, completed_at
+                    ) VALUES (
+                        %s::uuid, 'softbank-nav-monitor', 'cron', %s, %s,
+                        'succeeded', 'pending_dispatch', NOW()
+                    )
+                    """,
+                    (prod_run_id, slot, slot + timedelta(minutes=10)),
+                )
+            await upsert_user_preferences(
+                user_id=pm_uid,
+                model_preference={
+                    "dalton_notify_enabled": True,
+                    "dalton_notify_targets": [],
+                    "dalton_notify_routes": {
+                        "data:softbank-nav-monitor": [
+                            "feishu:chat:oc_synth_admin_only",
+                            "feishu:chat:oc_synth_denied_ws",
+                        ]
+                    },
+                },
+                conn=admin_conn,
+            )
+
+        # Save explicit group settings as admin via `update_user_channel_settings` WITHOUT any personal binding or inbound event
+        saved_settings = await cg_db.update_user_channel_settings(
+            user_id=pm_uid,
+            version="v1",
+            settings={
+                "feishu": {
+                    "preferred": None,
+                    "chats": {
+                        "feishu:oc_synth_admin_only": {
+                            "name": "Synth Admin Group",
+                            "workspace_id": None,
+                        }
+                    },
+                    "automation_output": {},
+                    "agent_messages": {
+                        "enabled": True,
+                        "allowed": ["feishu:oc_synth_admin_only"],
+                    },
+                }
+            },
+        )
+        assert saved_settings["version"] == "v2"
+
+        # Insert a group bound to `other_uid`'s inaccessible workspace to verify workspace write check
+        async with admin_conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO dalton_channel_chat_bindings (platform, chat_address, chat_name, workspace_id, bound_by_user_id)
+                VALUES ('feishu', 'feishu:oc_synth_denied_ws', 'Denied WS Group', %s::uuid, %s)
+                """,
+                (inaccessible_ws_id, other_uid),
+            )
+            await cur.execute(
+                """
+                UPDATE dalton_channel_user_settings
+                SET apps = jsonb_set(
+                    apps,
+                    '{feishu,chats,feishu:oc_synth_denied_ws}',
+                    %s::jsonb
+                )
+                WHERE user_id = %s
+                """,
+                (
+                    json.dumps({"name": "Denied WS Group", "workspace_id": inaccessible_ws_id}),
+                    pm_uid,
+                ),
+            )
+
+        app = FastAPI()
+        app.include_router(dalton_router)
+        transport = httpx.ASGITransport(app=app)
+        headers = {"X-Service-Token": SERVICE_TOKEN}
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://backend.local") as client:
+            # 1. Group target succeeds without personal binding; `owner_platform_user_id` is omitted
+            r_grp = await client.post(
+                "/api/v1/dalton/channels/internal/data-task-notifications/plan",
+                headers=headers,
+                json={"run_id": prod_run_id, "target": "feishu:chat:oc_synth_admin_only"},
+            )
+            assert r_grp.status_code == 200
+            grp_data = r_grp.json()
+            assert grp_data["authorized"] is True
+            assert grp_data["owner_user_id"] == pm_uid
+            assert "owner_platform_user_id" not in grp_data
+            assert grp_data["target_kind"] == "group"
+            assert grp_data["canonical_target_address"] == "feishu:oc_synth_admin_only"
+            assert grp_data["recipient_id"] == "oc_synth_admin_only"
+            d_key = grp_data["items"][0]["delivery_key"]
+            assert d_key == f"data_task:{prod_run_id}:feishu:oc_synth_admin_only:item:0"
+
+            # 2. Group bound to inaccessible workspace is denied (`not_allowed`)
+            r_denied_ws = await client.post(
+                "/api/v1/dalton/channels/internal/data-task-notifications/plan",
+                headers=headers,
+                json={"run_id": prod_run_id, "target": "feishu:chat:oc_synth_denied_ws"},
+            )
+            assert r_denied_ws.json()["authorized"] is False
+            assert r_denied_ws.json()["code"] == "not_allowed"
+
+            # 3. Personal DM target for the same unbound administrator remains denied (`not_linked`)
+            await upsert_user_preferences(
+                user_id=pm_uid,
+                model_preference={
+                    "dalton_notify_enabled": True,
+                    "dalton_notify_targets": ["feishu:user:ou_synth_unbound"],
+                    "dalton_notify_routes": {
+                        "data:softbank-nav-monitor": [
+                            "feishu:user:ou_synth_unbound",
+                            "feishu:chat:oc_synth_admin_only",
+                        ]
+                    },
+                },
+                conn=admin_conn,
+            )
+            r_dm = await client.post(
+                "/api/v1/dalton/channels/internal/data-task-notifications/plan",
+                headers=headers,
+                json={"run_id": prod_run_id, "target": "feishu:user:ou_synth_unbound"},
+            )
+            assert r_dm.json()["authorized"] is False
+            assert r_dm.json()["code"] == "not_linked"
+
+            # 4. I-6 claim + I-7 completion for the unbound admin's group target succeeds cleanly
+            r_claim = await client.post(
+                "/api/v1/dalton/channels/internal/deliveries/authorize-and-claim",
+                headers=headers,
+                json={
+                    "delivery_key": d_key,
+                    "kind": "data_task",
+                    "run_id": prod_run_id,
+                    "target": "feishu:chat:oc_synth_admin_only",
+                    "platform": "feishu",
+                    "has_non_empty_text": True,
+                    "total_chunks": 1,
+                },
+            )
+            assert r_claim.status_code == 200
+            assert r_claim.json()["claim_status"] == "claimed"
+            assert r_claim.json()["recipient_id"] == "oc_synth_admin_only"
+            assert r_claim.json()["target_address"] == "feishu:oc_synth_admin_only"
+
+            r_prog = await client.post(
+                "/api/v1/dalton/channels/internal/deliveries/progress",
+                headers=headers,
+                json={
+                    "delivery_key": d_key,
+                    "sent_chunks": 1,
+                    "total_chunks": 1,
+                    "platform_message_ids": ["om_synth_grp_msg_1"],
+                    "status": "sent",
+                },
+            )
+            assert r_prog.status_code == 200
+            assert r_prog.json()["status"] == "sent"
+
+            # Confirm zero personal identity rows and zero inbound events were ever created
+            async with admin_conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT COUNT(*) FROM dalton_channel_identities WHERE user_id = %s",
+                    (pm_uid,),
+                )
+                assert (await cur.fetchone())[0] == 0
+                await cur.execute(
+                    "SELECT COUNT(*) FROM dalton_channel_inbound_events WHERE dalton_user_id = %s",
+                    (pm_uid,),
+                )
+                assert (await cur.fetchone())[0] == 0
+
+            # 5. Real PostgreSQL `user_vault_secrets` (`pgp_sym_encrypt` / `pgp_sym_decrypt`) startup fetch & rotation
+            vault_ep = "/api/v1/dalton/channels/internal/data-task-notifications/feishu-credentials"
+            r_vault_empty = await client.post(vault_ep, headers=headers, json={})
+            assert r_vault_empty.status_code == 503
+            assert r_vault_empty.headers.get("cache-control") == "no-store"
+            assert r_vault_empty.json()["code"] == "vault_credentials_missing"
+            assert r_vault_empty.json()["missing"] == [
+                "DALTON_FEISHU_APP_ID",
+                "DALTON_FEISHU_APP_SECRET",
+            ]
+
+            await vault_db.create_user_secret(pm_uid, "DALTON_FEISHU_APP_ID", synth_app_id)
+            await vault_db.create_user_secret(pm_uid, "DALTON_FEISHU_APP_SECRET", synth_secret_v1)
+            await vault_db.create_user_secret(pm_uid, "UNRELATED_VAULT_TOKEN", "unrelated_secret_val")
+            await vault_db.create_user_secret(other_uid, "DALTON_FEISHU_APP_SECRET", "other_user_secret")
+
+            r_vault_v1 = await client.post(vault_ep, headers=headers, json={})
+            assert r_vault_v1.status_code == 200
+            assert r_vault_v1.headers.get("cache-control") == "no-store"
+            assert r_vault_v1.json() == {
+                "credentials": {
+                    "DALTON_FEISHU_APP_ID": synth_app_id,
+                    "DALTON_FEISHU_APP_SECRET": synth_secret_v1,
+                }
+            }
+
+            await vault_db.update_user_secret(
+                pm_uid,
+                "DALTON_FEISHU_APP_SECRET",
+                value=synth_secret_v2,
+            )
+            r_vault_v2 = await client.post(vault_ep, headers=headers, json={})
+            assert r_vault_v2.status_code == 200
+            assert r_vault_v2.json()["credentials"]["DALTON_FEISHU_APP_SECRET"] == synth_secret_v2
+    finally:
+        async with admin_conn.cursor() as cur:
+            await cur.execute(
+                "DELETE FROM user_vault_secrets WHERE user_id IN (%s, %s)",
+                (pm_uid, other_uid),
+            )
+            await cur.execute(
+                "DELETE FROM dalton_channel_deliveries WHERE run_id = %s",
+                (prod_run_id,),
+            )
+            await cur.execute(
+                "DELETE FROM dalton_channel_chat_bindings WHERE chat_address IN ('feishu:oc_synth_admin_only', 'feishu:oc_synth_denied_ws')"
+            )
+            await cur.execute(
+                "DELETE FROM dalton_channel_user_settings WHERE user_id IN (%s, %s)",
+                (pm_uid, other_uid),
+            )
+            await cur.execute(
+                "DELETE FROM dalton_data_task_runs WHERE run_id = %s::uuid",
+                (prod_run_id,),
+            )
+            await cur.execute(
+                "DELETE FROM dalton_data_task_defs WHERE job_key = 'softbank-nav-monitor'"
+            )
+            await cur.execute(
+                "DELETE FROM workspaces WHERE workspace_id = %s::uuid",
+                (inaccessible_ws_id,),
+            )
+            await cur.execute(
+                "DELETE FROM user_preferences WHERE user_id IN (%s, %s)",
+                (pm_uid, other_uid),
+            )
+            await cur.execute(
+                "DELETE FROM users WHERE user_id IN (%s, %s)",
+                (pm_uid, other_uid),
             )
         await admin_conn.close()

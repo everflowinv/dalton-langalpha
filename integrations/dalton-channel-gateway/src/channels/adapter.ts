@@ -100,6 +100,7 @@ export interface CheckTargetLiveResult {
   ok: boolean;
   address: string | null;
   name?: string | null;
+  code?: ChannelErrorCode | null;
   message: string | null;
 }
 

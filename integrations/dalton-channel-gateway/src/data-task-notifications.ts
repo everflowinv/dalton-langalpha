@@ -66,6 +66,14 @@ export interface DataTaskNotificationServiceOptions {
   queueTaskTimeoutMs?: number;
 }
 
+interface ExecutionStateTracker {
+  claimedAnyItem: boolean;
+  resolvedPlatform: ChannelPlatform | null;
+  itemsTotal: number;
+  itemsSent: number;
+  outcomes: DataTaskItemDeliveryOutcome[];
+}
+
 export class DataTaskNotificationService {
   private readonly backend: BackendClient;
   private readonly adapters: ReadonlyMap<ChannelPlatform, ChannelAdapter>;
@@ -215,14 +223,73 @@ export class DataTaskNotificationService {
 
     const normalizedRunId = runId.toLowerCase();
     const queueKey = `${normalizedRunId}::${target}`;
-    return await this.queue.enqueue(queueKey, async () =>
-      this.executeAuthorizedPlan(normalizedRunId, target),
-    );
+    const tracker: ExecutionStateTracker = {
+      claimedAnyItem: false,
+      resolvedPlatform: null,
+      itemsTotal: 0,
+      itemsSent: 0,
+      outcomes: [],
+    };
+    let capturedResult:
+      | { status: number; data: DataTaskNotificationResponse }
+      | undefined;
+
+    try {
+      const queueOutcome = await this.queue.enqueue(queueKey, async () => {
+        capturedResult = await this.executeAuthorizedPlan(
+          normalizedRunId,
+          target,
+          tracker,
+        );
+      });
+
+      if (queueOutcome === "completed" && capturedResult !== undefined) {
+        return capturedResult;
+      }
+
+      const isUncertain = tracker.claimedAnyItem || tracker.itemsSent > 0;
+      return {
+        status: 200,
+        data: {
+          ok: false,
+          status: isUncertain ? "unknown" : "failed",
+          code: isUncertain ? "delivery_uncertain" : "unavailable",
+          message: isUncertain
+            ? "Data-task notification timed out after claiming delivery; state is uncertain."
+            : "Data-task notification timed out before claiming any item.",
+          run_id: normalizedRunId,
+          target,
+          platform: tracker.resolvedPlatform,
+          items_total: tracker.itemsTotal,
+          items_sent: tracker.itemsSent,
+          items: [...tracker.outcomes],
+        },
+      };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const isUncertain = tracker.claimedAnyItem || tracker.itemsSent > 0;
+      return {
+        status: 200,
+        data: {
+          ok: false,
+          status: isUncertain ? "unknown" : "failed",
+          code: isUncertain ? "delivery_uncertain" : "unavailable",
+          message: msg,
+          run_id: normalizedRunId,
+          target,
+          platform: tracker.resolvedPlatform,
+          items_total: tracker.itemsTotal,
+          items_sent: tracker.itemsSent,
+          items: [...tracker.outcomes],
+        },
+      };
+    }
   }
 
   private async executeAuthorizedPlan(
     runId: string,
     target: string,
+    tracker: ExecutionStateTracker,
   ): Promise<{ status: number; data: DataTaskNotificationResponse }> {
     if (typeof this.backend.authorizeDataTaskNotificationPlan !== "function") {
       throw new Error(
@@ -265,6 +332,8 @@ export class DataTaskNotificationService {
 
     const platform = plan.platform;
     const planItems: DataTaskPlanItem[] = plan.items;
+    tracker.resolvedPlatform = platform;
+    tracker.itemsTotal = planItems.length;
     if (planItems.length === 0) {
       return {
         status: 200,
@@ -322,11 +391,66 @@ export class DataTaskNotificationService {
       };
     }
 
-    const itemOutcomes: DataTaskItemDeliveryOutcome[] = [];
+    if (
+      plan.target_kind === "group" &&
+      typeof readyAdapter.checkTargetLive !== "function"
+    ) {
+      return {
+        status: 200,
+        data: {
+          ok: false,
+          status: "failed",
+          code: "unavailable",
+          message: `Adapter ${platform} cannot verify live group target ${plan.canonical_target_address} before sending.`,
+          run_id: runId,
+          target,
+          platform,
+          items_total: planItems.length,
+          items_sent: 0,
+          items: [],
+        },
+      };
+    }
+
+    const itemOutcomes: DataTaskItemDeliveryOutcome[] = tracker.outcomes;
     let itemsSent = 0;
     let groupLiveVerified = false;
 
     for (const item of planItems) {
+      if (
+        plan.target_kind === "group" &&
+        !groupLiveVerified &&
+        item.existing_status !== "sent"
+      ) {
+        const preClaimLiveCheck = await readyAdapter.checkTargetLive!({
+          userId: plan.owner_user_id ?? "",
+          address: plan.canonical_target_address,
+          purpose: "data_task_notification",
+        });
+        if (!preClaimLiveCheck.ok) {
+          const failCode = preClaimLiveCheck.code ?? "not_allowed";
+          const denyMsg =
+            preClaimLiveCheck.message ??
+            `Group target ${plan.canonical_target_address} is not accessible.`;
+          return {
+            status: 200,
+            data: {
+              ok: false,
+              status: "failed",
+              code: failCode,
+              message: denyMsg,
+              run_id: runId,
+              target,
+              platform,
+              items_total: planItems.length,
+              items_sent: itemsSent,
+              items: itemOutcomes,
+            },
+          };
+        }
+        groupLiveVerified = true;
+      }
+
       const textChunks =
         item.kind === "feishu_card"
           ? []
@@ -337,6 +461,8 @@ export class DataTaskNotificationService {
       const hasNonEmptyText =
         item.kind === "feishu_card" ? true : textChunks.length > 0;
 
+      const hadPriorClaim = tracker.claimedAnyItem;
+      tracker.claimedAnyItem = true;
       const claim = await this.backend.authorizeAndClaimDelivery({
         delivery_key: item.delivery_key,
         kind: "data_task",
@@ -349,7 +475,9 @@ export class DataTaskNotificationService {
 
       if (claim.claim_status === "already_completed") {
         if (claim.status === "sent") {
+          tracker.claimedAnyItem = hadPriorClaim;
           itemsSent += 1;
+          tracker.itemsSent = itemsSent;
           itemOutcomes.push({
             item_index: item.item_index,
             delivery_key: item.delivery_key,
@@ -419,6 +547,7 @@ export class DataTaskNotificationService {
       }
 
       if (claim.claim_status === "denied") {
+        tracker.claimedAnyItem = hadPriorClaim;
         const denyCode = claim.code ?? "not_allowed";
         itemOutcomes.push({
           item_index: item.item_index,
@@ -451,20 +580,18 @@ export class DataTaskNotificationService {
       const targetAddress =
         claim.target_address ?? plan.canonical_target_address;
       const recipientId = claim.recipient_id ?? plan.recipient_id;
+      const recipientPlatformUserId =
+        plan.target_kind === "dm" ? recipientId : undefined;
 
-      // Verify live group membership once before sending the first unsent item to a group.
-      if (
-        plan.target_kind === "group" &&
-        !groupLiveVerified &&
-        typeof readyAdapter.checkTargetLive === "function"
-      ) {
-        const liveCheck = await readyAdapter.checkTargetLive({
+      // Safety fallback if `existing_status` was stale and `claim` transitioned to `claimed`.
+      if (plan.target_kind === "group" && !groupLiveVerified) {
+        const liveCheck = await readyAdapter.checkTargetLive!({
           userId: plan.owner_user_id ?? "",
-          platformUserId: plan.owner_platform_user_id ?? null,
           address: targetAddress,
           purpose: "data_task_notification",
         });
         if (!liveCheck.ok) {
+          const failCode = liveCheck.code ?? "not_allowed";
           const denyMsg =
             liveCheck.message ?? `Group target ${targetAddress} is no longer accessible.`;
           await this.backend.updateDeliveryProgress({
@@ -472,7 +599,7 @@ export class DataTaskNotificationService {
             sent_chunks: 0,
             total_chunks: totalChunks,
             status: "failed",
-            error_code: "not_allowed",
+            error_code: failCode,
             error_message: denyMsg,
           });
           itemOutcomes.push({
@@ -481,7 +608,7 @@ export class DataTaskNotificationService {
             status: "failed",
             duplicate: false,
             platform_message_ids: [],
-            code: "not_allowed",
+            code: failCode,
             message: denyMsg,
           });
           return {
@@ -489,7 +616,7 @@ export class DataTaskNotificationService {
             data: {
               ok: false,
               status: "failed",
-              code: "not_allowed",
+              code: failCode,
               message: denyMsg,
               run_id: runId,
               target,
@@ -560,7 +687,7 @@ export class DataTaskNotificationService {
         try {
           const sendRes = await readyAdapter.sendCard!({
             targetAddress,
-            recipientPlatformUserId: recipientId,
+            recipientPlatformUserId,
             card: item.card,
             images: cardImages,
           });
@@ -614,6 +741,7 @@ export class DataTaskNotificationService {
           }
 
           itemsSent += 1;
+          tracker.itemsSent = itemsSent;
           itemOutcomes.push({
             item_index: item.item_index,
             delivery_key: item.delivery_key,
@@ -738,7 +866,7 @@ export class DataTaskNotificationService {
         try {
           const chunkRes = await readyAdapter.sendTextChunk({
             targetAddress,
-            recipientPlatformUserId: recipientId,
+            recipientPlatformUserId,
             text: textChunks[i]!,
             chunkIndex: i,
             totalChunks: textChunks.length,
@@ -824,7 +952,7 @@ export class DataTaskNotificationService {
         try {
           const fileRes = await readyAdapter.sendFile({
             targetAddress,
-            recipientPlatformUserId: recipientId,
+            recipientPlatformUserId,
             path: verifiedAttachment.filename,
             filename: verifiedAttachment.filename,
             content: verifiedAttachment.content,
@@ -995,6 +1123,7 @@ export class DataTaskNotificationService {
       }
 
       itemsSent += 1;
+      tracker.itemsSent = itemsSent;
       itemOutcomes.push({
         item_index: item.item_index,
         delivery_key: item.delivery_key,

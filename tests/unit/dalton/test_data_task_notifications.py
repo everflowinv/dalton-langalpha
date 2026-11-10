@@ -769,6 +769,7 @@ async def test_gateway_transport_and_wrapping_layers_preserve_uncertain_state_an
     cursor = create_autospec(psycopg.AsyncCursor, instance=True)
     cursor.fetchone.return_value = (1,)
     conn = create_autospec(psycopg.AsyncConnection, instance=True)
+    conn.closed = False
 
     @asynccontextmanager
     async def _cur_cm(*args: Any, **kwargs: Any):
@@ -827,19 +828,299 @@ def test_channel_gateway_url_container_to_host_loopback_rewrite(
     """Verify backend container rewrites loopback CHANNEL_GATEWAY_URL to HOST_IP while host tests keep 127.0.0.1."""
     import src.dalton.settings as settings_mod
 
+    orig_exists = os.path.exists
     monkeypatch.setenv("CHANNEL_GATEWAY_URL", "http://127.0.0.1:8962")
     monkeypatch.setattr(settings_mod, "HOST_IP", "host.docker.internal")
 
     monkeypatch.setattr(
         settings_mod.os.path,
         "exists",
-        create_autospec(os.path.exists, side_effect=lambda p: p == "/.dockerenv"),
+        create_autospec(orig_exists, side_effect=lambda p: p == "/.dockerenv"),
     )
     assert get_dalton_channel_gateway_url() == "http://host.docker.internal:8962"
 
     monkeypatch.setattr(
         settings_mod.os.path,
         "exists",
-        create_autospec(os.path.exists, return_value=False),
+        create_autospec(orig_exists, return_value=False),
     )
     assert get_dalton_channel_gateway_url() == "http://127.0.0.1:8962"
+
+
+@pytest.mark.asyncio
+async def test_group_authorization_succeeds_without_personal_identity_while_dm_stays_denied(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R2 §1: Administrator group report succeeds without `dalton_channel_identities`, omitting `owner_platform_user_id`, while personal DM without binding fails `not_linked`."""
+    from contextlib import asynccontextmanager
+    import psycopg
+
+    run_id = str(uuid4())
+    pm_uid = "pm-unbound-synth"
+    group_target = "feishu:chat:oc_synth_admin_group"
+
+    path_map = build_path_map(host_var_dir=tmp_path / "h", backend_var_dir=tmp_path / "b")
+    rdir = path_map.backend_run_artifacts_dir(run_id)
+    rdir.mkdir(parents=True, exist_ok=True)
+    (rdir / "outbox.json").write_text(
+        json.dumps({"feishu_message": "Synthetic group report"}),
+        encoding="utf-8",
+    )
+
+    executed_sql: list[str] = []
+
+    async def _sql_handler(sql: str, params: Any = None) -> None:
+        _ = params
+        norm = " ".join(sql.split())
+        executed_sql.append(norm)
+        if "FROM dalton_data_task_runs r" in norm:
+            cursor.fetchone.return_value = {
+                "run_id": run_id,
+                "job_key": "megacap-relative-signal-monitor",
+                "status": "succeeded",
+                "notify_status": "pending_dispatch",
+                "outbox_payload": None,
+                "log_tail": None,
+                "def_job_key": "megacap-relative-signal-monitor",
+                "task_enabled": True,
+                "task_notify_enabled": True,
+            }
+        elif "FROM dalton_channel_identities" in norm:
+            cursor.fetchone.return_value = None
+        elif "FROM dalton_channel_deliveries WHERE delivery_key = ANY" in norm:
+            cursor.fetchall.return_value = []
+        else:
+            cursor.fetchone.return_value = None
+
+    cursor = create_autospec(psycopg.AsyncCursor, instance=True)
+    cursor.execute.side_effect = _sql_handler
+    conn = create_autospec(psycopg.AsyncConnection, instance=True)
+    conn.closed = False
+
+    @asynccontextmanager
+    async def _cur_cm(*args: Any, **kwargs: Any):
+        yield cursor
+
+    conn.cursor.side_effect = _cur_cm
+
+    monkeypatch.setenv("DALTON_PM_USER_IDS", pm_uid)
+    monkeypatch.setattr(
+        dtn_db,
+        "evaluate_user_notify_eligibility",
+        create_autospec(
+            dtn_db.evaluate_user_notify_eligibility,
+            return_value=(True, None, [group_target, "feishu:user:ou_unlinked_legacy"]),
+        ),
+    )
+    monkeypatch.setattr(
+        dtn_db,
+        "_verify_group_target_deliverable",
+        create_autospec(
+            dtn_db._verify_group_target_deliverable,
+            return_value=(True, None, "Synth Admin Group"),
+        ),
+    )
+
+    # 1. Group target succeeds with ZERO `dalton_channel_identities` queries and omits `owner_platform_user_id`
+    grp_plan = await dtn_db.authorize_data_task_notification_plan(
+        run_id=run_id,
+        target=group_target,
+        path_map=path_map,
+        conn=conn,
+    )
+    assert grp_plan["authorized"] is True
+    assert grp_plan["owner_user_id"] == pm_uid
+    assert "owner_platform_user_id" not in grp_plan
+    assert grp_plan["target_kind"] == "group"
+    assert grp_plan["canonical_target_address"] == "feishu:oc_synth_admin_group"
+    assert grp_plan["recipient_id"] == "oc_synth_admin_group"
+    assert grp_plan["items"][0]["delivery_key"] == (
+        f"data_task:{run_id}:feishu:oc_synth_admin_group:item:0"
+    )
+    assert not any("dalton_channel_identities" in q for q in executed_sql)
+
+    # 2. Personal DM target for the same unbound administrator is still denied with `not_linked`
+    dm_plan = await dtn_db.authorize_data_task_notification_plan(
+        run_id=run_id,
+        target="feishu:user:ou_unlinked_legacy",
+        path_map=path_map,
+        conn=conn,
+    )
+    assert dm_plan["authorized"] is False
+    assert dm_plan["code"] == "not_linked"
+    assert any("dalton_channel_identities" in q for q in executed_sql)
+
+
+def test_dedicated_feishu_vault_credentials_endpoint_and_log_redaction(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """R2 §2: Narrow Vault startup endpoint enforces service auth, rejects caller overrides, sets no-store, and never logs secret values."""
+    import logging
+
+    import src.dalton.services.channel_vault_credentials as vault_creds_mod
+
+    pm_uid = "pm-vault-admin-synth"
+    synth_app_id = "cli_synth_vault_app_9001"
+    synth_app_secret = "sec_synth_vault_secret_never_logged_9001"
+
+    monkeypatch.setenv("INTERNAL_SERVICE_TOKEN", SERVICE_TOKEN)
+    monkeypatch.setenv("DALTON_PM_USER_IDS", pm_uid)
+
+    orig_get_secrets = vault_creds_mod.get_user_secrets_decrypted
+    secrets_calls: list[tuple[str, tuple[str, ...]]] = []
+
+    async def _fake_get_secrets_ok(
+        user_id: str,
+        names: Any = None,
+    ) -> dict[str, str]:
+        secrets_calls.append((user_id, tuple(names or ())))
+        return {
+            "DALTON_FEISHU_APP_ID": synth_app_id,
+            "DALTON_FEISHU_APP_SECRET": synth_app_secret,
+            "UNREQUESTED_EXTRA_KEY": "should_never_be_returned",
+        }
+
+    monkeypatch.setattr(
+        vault_creds_mod,
+        "get_user_secrets_decrypted",
+        create_autospec(orig_get_secrets, side_effect=_fake_get_secrets_ok),
+    )
+
+    app = FastAPI()
+    app.include_router(dalton_router)
+    client = TestClient(app)
+    endpoint = "/api/v1/dalton/channels/internal/data-task-notifications/feishu-credentials"
+
+    # 1. Invalid or missing service token -> 401/403
+    assert client.post(endpoint, json={}).status_code in (401, 403)
+    assert (
+        client.post(endpoint, headers={"X-Service-Token": "wrong"}, json={}).status_code
+        in (401, 403)
+    )
+
+    # 2. Caller-supplied query params, X-User-Id header, or body fields (`user_id`, `names`) -> rejected without reading Vault
+    assert (
+        client.post(
+            f"{endpoint}?user_id=other_user",
+            headers={"X-Service-Token": SERVICE_TOKEN},
+            json={},
+        ).status_code
+        == 400
+    )
+    assert (
+        client.post(
+            endpoint,
+            headers={"X-Service-Token": SERVICE_TOKEN, "X-User-Id": "other_user"},
+            json={},
+        ).status_code
+        == 400
+    )
+    for bad_body in (
+        {"user_id": "other_user"},
+        {"names": ["DALTON_FEISHU_APP_ID", "OTHER_SECRET"]},
+    ):
+        assert (
+            client.post(
+                endpoint,
+                headers={"X-Service-Token": SERVICE_TOKEN},
+                json=bad_body,
+            ).status_code
+            == 422
+        )
+    assert secrets_calls == []
+
+    # 3. Valid empty-body request loads strictly the 2 keys for configured primary admin with `Cache-Control: no-store`
+    with caplog.at_level(logging.DEBUG):
+        ok_res = client.post(
+            endpoint,
+            headers={"X-Service-Token": SERVICE_TOKEN},
+            json={},
+        )
+    assert ok_res.status_code == 200
+    assert ok_res.headers.get("cache-control") == "no-store"
+    assert ok_res.json() == {
+        "credentials": {
+            "DALTON_FEISHU_APP_ID": synth_app_id,
+            "DALTON_FEISHU_APP_SECRET": synth_app_secret,
+        }
+    }
+    assert secrets_calls == [
+        (pm_uid, ("DALTON_FEISHU_APP_ID", "DALTON_FEISHU_APP_SECRET"))
+    ]
+    assert synth_app_secret not in caplog.text
+
+    # 4. Missing credential returns 503 naming only the missing key, never returning partial values
+    monkeypatch.setattr(
+        vault_creds_mod,
+        "get_user_secrets_decrypted",
+        create_autospec(
+            orig_get_secrets,
+            return_value={"DALTON_FEISHU_APP_ID": synth_app_id},
+        ),
+    )
+    with caplog.at_level(logging.DEBUG):
+        miss_res = client.post(
+            endpoint,
+            headers={"X-Service-Token": SERVICE_TOKEN},
+            json={},
+        )
+    assert miss_res.status_code == 503
+    assert miss_res.headers.get("cache-control") == "no-store"
+    assert miss_res.json()["code"] == "vault_credentials_missing"
+    assert miss_res.json()["missing"] == ["DALTON_FEISHU_APP_SECRET"]
+    assert synth_app_id not in miss_res.text
+    assert synth_app_id not in caplog.text
+
+    # 5. Vault decryption error whose exception text contains a secret never leaks into HTTP body or logs
+    async def _failing_decrypt(user_id: str, names: Any = None) -> dict[str, str]:
+        _ = (user_id, names)
+        raise RuntimeError(f"pgcrypto failure near {synth_app_secret}")
+
+    monkeypatch.setattr(
+        vault_creds_mod,
+        "get_user_secrets_decrypted",
+        create_autospec(orig_get_secrets, side_effect=_failing_decrypt),
+    )
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG):
+        err_res = client.post(
+            endpoint,
+            headers={"X-Service-Token": SERVICE_TOKEN},
+            json={},
+        )
+    assert err_res.status_code == 503
+    assert err_res.json()["code"] == "vault_unavailable"
+    assert synth_app_secret not in err_res.text
+    assert synth_app_secret not in caplog.text
+
+
+def test_launchd_template_contains_no_plaintext_feishu_or_service_secrets() -> None:
+    """R2 §2: LaunchAgent plist template uses Vault credential source and owner-only env file, storing no plaintext credentials."""
+    import plistlib
+
+    project_root = Path(__file__).resolve().parents[3]
+    plist_path = (
+        project_root
+        / "scripts"
+        / "dalton"
+        / "launchd"
+        / "com.dalton.channel-gateway.plist.template"
+    )
+    raw_bytes = plist_path.read_bytes()
+    parsed = plistlib.loads(raw_bytes)
+    env_vars = parsed["EnvironmentVariables"]
+
+    assert env_vars["GATEWAY_HOST"] == "127.0.0.1"
+    assert env_vars["DALTON_FEISHU_CREDENTIAL_SOURCE"] == "vault"
+    assert env_vars["DALTON_CHANNEL_GATEWAY_ENV_FILE"] == (
+        "__HOME__/.config/dalton/channel-gateway.env"
+    )
+    for forbidden_key in (
+        "DALTON_FEISHU_APP_ID",
+        "DALTON_FEISHU_APP_SECRET",
+        "DALTON_DISCORD_BOT_TOKEN",
+        "INTERNAL_SERVICE_TOKEN",
+    ):
+        assert forbidden_key not in env_vars

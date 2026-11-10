@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from src.dalton.app.channels_router import require_channel_service_token
@@ -17,6 +18,15 @@ from src.dalton.database.data_task_notifications import (
     authorize_data_task_notification_plan,
     load_authorized_data_task_artifact,
 )
+from src.dalton.services.channel_vault_credentials import (
+    ChannelVaultCredentialError,
+    load_dedicated_feishu_vault_credentials,
+)
+
+_NO_STORE_HEADERS: dict[str, str] = {
+    "Cache-Control": "no-store",
+    "Pragma": "no-cache",
+}
 
 data_task_notifications_router = APIRouter(
     prefix="/channels/internal/data-task-notifications",
@@ -32,6 +42,57 @@ class DataTaskNotificationPlanRequest(BaseModel):
 
     run_id: str = Field(..., min_length=1, max_length=64)
     target: str = Field(..., min_length=1, max_length=255)
+
+
+class DedicatedFeishuVaultCredentialsRequest(BaseModel):
+    """Empty body schema rejecting caller-supplied ``user_id`` or secret-name lists."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+@data_task_notifications_router.post("/feishu-credentials")
+async def internal_dedicated_feishu_vault_credentials_endpoint(
+    request: Request,
+    _body: DedicatedFeishuVaultCredentialsRequest | None = Body(default=None),
+) -> JSONResponse:
+    """Return the primary administrator's two dedicated Feishu Vault credentials for gateway startup."""
+    if request.query_params:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "code": "invalid_request",
+                "message": "Query parameters are not permitted.",
+            },
+            headers=_NO_STORE_HEADERS,
+        )
+    if request.headers.get("x-user-id") is not None:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "code": "invalid_request",
+                "message": "Caller user identity override is not permitted.",
+            },
+            headers=_NO_STORE_HEADERS,
+        )
+
+    try:
+        credentials = await load_dedicated_feishu_vault_credentials()
+    except ChannelVaultCredentialError as exc:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "code": exc.code,
+                "message": exc.message,
+                "missing": list(exc.missing),
+            },
+            headers=_NO_STORE_HEADERS,
+        )
+
+    return JSONResponse(
+        status_code=200,
+        content={"credentials": credentials},
+        headers=_NO_STORE_HEADERS,
+    )
 
 
 @data_task_notifications_router.post("/plan")

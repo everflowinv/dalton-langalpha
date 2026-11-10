@@ -2,10 +2,16 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
   LaunchAgent template for Dalton Channel Gateway (127.0.0.1:8962).
+  Zero plaintext platform credentials are stored in this plist or in any env file:
+    - Dedicated Feishu credentials (DALTON_FEISHU_APP_ID, DALTON_FEISHU_APP_SECRET) are loaded
+      in memory from the primary administrator's Dalton Vault at startup (DALTON_FEISHU_CREDENTIAL_SOURCE=vault).
+    - INTERNAL_SERVICE_TOKEN is read from an owner-only (chmod 0600) regular file at
+      __HOME__/.config/dalton/channel-gateway.env via DALTON_CHANNEL_GATEWAY_ENV_FILE.
   Install to ~/Library/LaunchAgents/com.dalton.channel-gateway.plist:
     1. Build the bundle: cd integrations/dalton-channel-gateway && pnpm install && pnpm build
-    2. Replace __PROJECT_DIR__, __NODE_BIN__, __LOG_DIR__, and environment placeholders.
-    3. Load with: launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dalton.channel-gateway.plist
+    2. Create ~/.config/dalton/channel-gateway.env (mode 0600) containing INTERNAL_SERVICE_TOKEN.
+    3. Replace __PROJECT_DIR__, __NODE_BIN__, __HOME__, __LOG_DIR__, __WEB_BASE_URL__, and boolean switches.
+    4. Load with: launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.dalton.channel-gateway.plist
 -->
 <plist version="1.0">
 <dict>
@@ -29,28 +35,24 @@
     <string>127.0.0.1</string>
     <key>GATEWAY_PORT</key>
     <string>8962</string>
-    <!-- Startup mode: "incoming" (default, full inbound + outbound) or "outgoing" (notification-only, no WS listeners/Weixin/startup recovery). -->
+    <!-- Startup mode: "outgoing" (notification-only, no WS listeners/Weixin/startup recovery) or "incoming" (full inbound + outbound). -->
     <key>DALTON_GATEWAY_MODE</key>
-    <string>incoming</string>
+    <string>__DALTON_GATEWAY_MODE__</string>
     <key>DALTON_BACKEND_URL</key>
     <string>http://127.0.0.1:8000</string>
     <key>WEB_BASE_URL</key>
     <string>__WEB_BASE_URL__</string>
-    <key>INTERNAL_SERVICE_TOKEN</key>
-    <string>__INTERNAL_SERVICE_TOKEN__</string>
+    <key>DALTON_CHANNEL_GATEWAY_ENV_FILE</key>
+    <string>__HOME__/.config/dalton/channel-gateway.env</string>
     <key>DALTON_COLLEAGUE_DISPATCH_ENABLED</key>
     <string>true</string>
-    <!-- Feishu Bot Credentials: set DALTON_FEISHU_ENABLED=true and both DALTON_FEISHU_APP_ID and DALTON_FEISHU_APP_SECRET to enable Feishu long-connection (WSClient). -->
+    <!-- Feishu credentials are loaded exclusively in memory from Dalton Vault at startup (never placed in files or args). -->
     <key>DALTON_FEISHU_ENABLED</key>
     <string>__DALTON_FEISHU_ENABLED__</string>
-    <key>DALTON_FEISHU_APP_ID</key>
-    <string>__DALTON_FEISHU_APP_ID__</string>
-    <key>DALTON_FEISHU_APP_SECRET</key>
-    <string>__DALTON_FEISHU_APP_SECRET__</string>
+    <key>DALTON_FEISHU_CREDENTIAL_SOURCE</key>
+    <string>vault</string>
     <key>DALTON_DISCORD_ENABLED</key>
     <string>__DALTON_DISCORD_ENABLED__</string>
-    <key>DALTON_DISCORD_BOT_TOKEN</key>
-    <string>__DALTON_DISCORD_BOT_TOKEN__</string>
     <key>DALTON_WEIXIN_ENABLED</key>
     <string>__DALTON_WEIXIN_ENABLED__</string>
     <key>DALTON_WEIXIN_API_BASE_URL</key>
