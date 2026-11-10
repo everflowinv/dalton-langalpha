@@ -528,6 +528,40 @@
         "write": "parameters.reasoning.effort"
       }
     },
+    "muse-ember-1.0-oauth": {
+      "model_id": "muse-ember-1.0",
+      "provider": "muse-oauth",
+      "display_name": "Muse Ember 1.0",
+      "visible": true,
+      "context": 1048576,
+      "input_modalities": [
+        "text",
+        "image"
+      ],
+      "prompt_guidance": "lean",
+      "parameters": {
+        "max_tokens": 524288,
+        "reasoning": {
+          "summary": "auto"
+        },
+        "include": [
+          "reasoning.encrypted_content"
+        ],
+        "store": false
+      },
+      "reasoning": {
+        "efforts": [
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "default": "max",
+        "write": "parameters.reasoning.effort"
+      }
+    },
     "grok-build-0.1": {
       "model_id": "grok-build-0.1",
       "provider": "xai",
@@ -961,6 +995,40 @@
       },
       "tool_calling": true,
       "forbidden_for_roles": true
+    },
+    "muse-ember-1.0-oauth": {
+      "family": "meta-muse",
+      "billing": "subscription",
+      "notional_pricing": {
+        "input_pricing_mode": "input_dependent",
+        "output_pricing_mode": "input_dependent",
+        "input_tiers": [
+          {
+            "max_tokens": 200000,
+            "rate": 0.1,
+            "cached_input": 0.004
+          },
+          {
+            "max_tokens": null,
+            "rate": 0.3,
+            "cached_input": 0.012
+          }
+        ],
+        "output_tiers": [
+          {
+            "max_tokens": 200000,
+            "rate": 0.5
+          },
+          {
+            "max_tokens": null,
+            "rate": 1.5
+          }
+        ],
+        "unit": "per_1m_tokens",
+        "source": "https://dev.meta.ai/docs/pricing-rate-limits",
+        "verified_at": "2026-11-10"
+      },
+      "tool_calling": true
     },
     "grok-4.7": {
       "family": "xai-grok",
