@@ -166,6 +166,9 @@ class SessionCommandRequest(BaseModel):
     raw_payload: dict[str, Any] | None = None
     weixin_context_token: str | None = None
     is_internal_query: bool = False
+    native_interaction: bool = False
+    native_ack_status: str | None = None
+    native_reply_status: str | None = None
 
 
 class ChannelSettingsPutRequest(BaseModel):
@@ -394,6 +397,9 @@ async def internal_session_command_endpoint(
         raw_payload=body.raw_payload,
         weixin_context_token=body.weixin_context_token,
         is_internal_query=body.is_internal_query,
+        native_interaction=body.native_interaction,
+        native_ack_status=body.native_ack_status,
+        native_reply_status=body.native_reply_status,
     )
 
 

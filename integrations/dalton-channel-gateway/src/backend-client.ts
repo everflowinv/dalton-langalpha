@@ -217,6 +217,16 @@ export interface I3SessionCommandRequest {
   raw_payload?: Record<string, unknown> | null;
   weixin_context_token?: string | null;
   is_internal_query?: boolean;
+  native_interaction?: boolean;
+  native_ack_status?: "acknowledged" | "failed" | "unknown" | null;
+  native_reply_status?:
+    | "pending"
+    | "sent"
+    | "failed"
+    | "expired"
+    | "abandoned_on_restart"
+    | "not_applicable"
+    | null;
 }
 
 export interface I3SessionCommandResponse {
@@ -227,6 +237,18 @@ export interface I3SessionCommandResponse {
   user_tier?: string | null;
   duplicate?: boolean;
   is_home?: boolean;
+  not_executed?: boolean;
+  native_interaction?: boolean;
+  native_ack_status?: "acknowledged" | "failed" | "unknown" | string | null;
+  native_reply_status?:
+    | "pending"
+    | "sent"
+    | "failed"
+    | "expired"
+    | "abandoned_on_restart"
+    | "not_applicable"
+    | string
+    | null;
   deny_reason?:
     | "not_linked"
     | "external_member_group_forbidden"
@@ -234,6 +256,8 @@ export interface I3SessionCommandResponse {
     | "workspace_ambiguous"
     | "workspace_write_denied"
     | "colleague_dispatch_disabled"
+    | "interaction_ack_unknown"
+    | "interaction_ack_failed"
     | string;
   candidates?: Array<{ workspace_id: string; name: string }>;
   current_workspace_id?: string | null;
@@ -1098,10 +1122,36 @@ export class HttpBackendClient implements BackendClient {
   async sessionCommand(
     req: I3SessionCommandRequest,
   ): Promise<I3SessionCommandResponse> {
+    const sanitizedBody: I3SessionCommandRequest & Record<string, unknown> = {
+      ...req,
+    };
+    delete sanitizedBody.token;
+    delete sanitizedBody.interaction_token;
+    delete sanitizedBody.interactionToken;
+    if (sanitizedBody.raw_payload && typeof sanitizedBody.raw_payload === "object") {
+      const cleanedRaw: Record<string, unknown> = { ...sanitizedBody.raw_payload };
+      delete cleanedRaw.token;
+      delete cleanedRaw.interaction_token;
+      delete cleanedRaw.interactionToken;
+      if (
+        cleanedRaw.discord_interaction &&
+        typeof cleanedRaw.discord_interaction === "object" &&
+        !Array.isArray(cleanedRaw.discord_interaction)
+      ) {
+        const cleanedInteraction: Record<string, unknown> = {
+          ...(cleanedRaw.discord_interaction as Record<string, unknown>),
+        };
+        delete cleanedInteraction.token;
+        delete cleanedInteraction.interaction_token;
+        delete cleanedInteraction.interactionToken;
+        cleanedRaw.discord_interaction = cleanedInteraction;
+      }
+      sanitizedBody.raw_payload = cleanedRaw;
+    }
     const { status, data } = await this.jsonRequest<I3SessionCommandResponse>(
       "POST",
       "/api/v1/dalton/channels/internal/session/command",
-      { userId: req.dalton_user_id, body: req },
+      { userId: req.dalton_user_id, body: sanitizedBody },
     );
     if (status >= 400) {
       throw new Error(`I-3 session/command failed (${status}): ${JSON.stringify(data)}`);

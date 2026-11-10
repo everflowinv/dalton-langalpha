@@ -46,8 +46,13 @@ export function redactCredentialString(
       /\b([a-z][a-z0-9+.-]*:\/\/)([^/\s:@]+:[^/\s@]+)@/gi,
       "$1[REDACTED]@",
     )
-    // Authorization: Bearer <token>
-    .replace(/\b(Bearer\s+)[A-Za-z0-9._~+/=-]+/gi, "$1[REDACTED]")
+    // Authorization: Bearer / Bot <token>
+    .replace(/\b((?:Bearer|Bot)\s+)[A-Za-z0-9._~+/=-]+/gi, "$1[REDACTED]")
+    // Discord interaction/webhook URL tokens: /interactions/<id>/<token> or /webhooks/<id>/<token>
+    .replace(
+      /(\/(?:interactions|webhooks)\/[^/\s?#]+\/)(?!\[REDACTED\]|\[redacted\])[^/\s?#"']+/gi,
+      "$1[REDACTED]",
+    )
     // JSON key-value pairs for sensitive keys
     .replace(
       /("(?:app_secret|appSecret|app_id|appId|tenant_access_token|user_access_token|access_token|refresh_token|client_secret|api_key|apiKey|password|secret|token|authorization)"\s*:\s*)"[^"]*"/gi,

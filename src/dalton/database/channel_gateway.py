@@ -1717,6 +1717,35 @@ async def _advance_group_chat_generations_in_tx(
     return int(rows[0]["generation"]) if rows else None
 
 
+def _sanitize_native_payload_dict(
+    raw_payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Strip any interaction or bot credentials from persisted raw_payload."""
+    if not isinstance(raw_payload, dict):
+        return {}
+    cleaned = dict(raw_payload)
+    for forbidden_key in (
+        "token",
+        "interaction_token",
+        "interactionToken",
+        "bot_token",
+        "botToken",
+    ):
+        cleaned.pop(forbidden_key, None)
+    if isinstance(cleaned.get("discord_interaction"), dict):
+        di = dict(cleaned["discord_interaction"])
+        for forbidden_key in (
+            "token",
+            "interaction_token",
+            "interactionToken",
+            "bot_token",
+            "botToken",
+        ):
+            di.pop(forbidden_key, None)
+        cleaned["discord_interaction"] = di
+    return cleaned
+
+
 async def execute_session_command(
     *,
     cmd: str,
@@ -1737,6 +1766,9 @@ async def execute_session_command(
     target_kind: str | None = None,
     external_thread_id: str | None = None,
     is_internal_query: bool = False,
+    native_interaction: bool = False,
+    native_ack_status: str | None = None,
+    native_reply_status: str | None = None,
     conn: Any = None,
 ) -> dict[str, Any]:
     """I-3: Atomically execute `workspace_list`, `workspace_switch`, `new`, and `stop` with inbound idempotency."""
@@ -1763,6 +1795,9 @@ async def execute_session_command(
             target_kind=target_kind,
             external_thread_id=external_thread_id,
             is_internal_query=is_internal_query,
+            native_interaction=native_interaction,
+            native_ack_status=native_ack_status,
+            native_reply_status=native_reply_status,
             conn=attempt_conn,
         ),
     )
@@ -1867,6 +1902,9 @@ async def _execute_session_command_once(
     target_kind: str | None = None,
     external_thread_id: str | None = None,
     is_internal_query: bool = False,
+    native_interaction: bool = False,
+    native_ack_status: str | None = None,
+    native_reply_status: str | None = None,
     conn: Any = None,
 ) -> dict[str, Any]:
     cleaned_cmd = str(cmd or "").strip().lower()
@@ -1894,7 +1932,7 @@ async def _execute_session_command_once(
             else str(uuid5(DALTON_CHANNEL_NAMESPACE, f"{cleaned_platform}:{cleaned_scope}:{cleaned_cmd}"))
         )
     )
-    payload_dict = dict(raw_payload or {})
+    payload_dict = _sanitize_native_payload_dict(raw_payload)
     if cleaned_puid:
         payload_dict["platform_user_id"] = cleaned_puid
     if weixin_context_token and "weixin_context_token" not in payload_dict:
@@ -1934,17 +1972,190 @@ async def _execute_session_command_once(
                         ).strip()
                         reject_company_system_auth(orig_uid)
                         if isinstance(existing_inbound.get("raw_payload"), dict):
+                            existing_raw = _sanitize_native_payload_dict(
+                                existing_inbound["raw_payload"]
+                            )
                             orig_puid = str(
-                                existing_inbound["raw_payload"].get("platform_user_id")
-                                or ""
+                                existing_raw.get("platform_user_id") or ""
                             ).strip()
+                            payload_dict = {**existing_raw, **payload_dict}
                             if not cleaned_puid and orig_puid:
                                 cleaned_puid = orig_puid
                                 payload_dict["platform_user_id"] = cleaned_puid
 
+                is_native = bool(
+                    native_interaction
+                    or payload_dict.get("native_interaction") is True
+                    or isinstance(payload_dict.get("discord_interaction"), dict)
+                )
+                eff_ack_status = (
+                    str(
+                        native_ack_status
+                        or payload_dict.get("native_ack_status")
+                        or ""
+                    )
+                    .strip()
+                    .lower()
+                    or None
+                )
+                eff_reply_status = (
+                    str(
+                        native_reply_status
+                        or payload_dict.get("native_reply_status")
+                        or ""
+                    )
+                    .strip()
+                    .lower()
+                    or None
+                )
+                if is_native:
+                    payload_dict["native_interaction"] = True
+                    eff_ack_status = eff_ack_status or "acknowledged"
+                    payload_dict["native_ack_status"] = eff_ack_status
+
+                if (
+                    existing_inbound is not None
+                    and isinstance(existing_inbound.get("command_result"), dict)
+                    and existing_inbound["command_result"].get("not_executed") is True
+                ):
+                    stored_unexec = dict(existing_inbound["command_result"])
+                    return {
+                        **stored_unexec,
+                        "duplicate": True,
+                        "command_effect_status": "done",
+                        "command_reply_pending": False,
+                        "existing_status": existing_inbound.get("status") or "failed",
+                        **(
+                            {
+                                "native_interaction": True,
+                                "native_ack_status": payload_dict.get(
+                                    "native_ack_status"
+                                )
+                                or "unknown",
+                                "native_reply_status": payload_dict.get(
+                                    "native_reply_status"
+                                )
+                                or "not_applicable",
+                            }
+                            if is_native
+                            else {}
+                        ),
+                    }
+
+                if (
+                    is_native
+                    and eff_ack_status in ("unknown", "failed")
+                    and existing_inbound is None
+                ):
+                    resolved_unexec_uid: str | None = cleaned_uid or None
+                    if not resolved_unexec_uid and cleaned_puid:
+                        await cur.execute(
+                            """
+                            SELECT user_id FROM dalton_channel_identities
+                            WHERE platform = %s AND platform_user_id = %s
+                            """,
+                            (cleaned_platform, cleaned_puid),
+                        )
+                        id_row = await cur.fetchone()
+                        if id_row and id_row.get("user_id"):
+                            candidate_uid = str(id_row["user_id"]).strip()
+                            reject_company_system_auth(candidate_uid)
+                            resolved_unexec_uid = candidate_uid
+                    unexec_reason = (
+                        "interaction_ack_unknown"
+                        if eff_ack_status == "unknown"
+                        else "interaction_ack_failed"
+                    )
+                    payload_dict["native_reply_status"] = "not_applicable"
+                    unexec_res: dict[str, Any] = {
+                        "ok": False,
+                        "linked": bool(resolved_unexec_uid),
+                        "allowed": False,
+                        "deny_reason": unexec_reason,
+                        "not_executed": True,
+                    }
+                    if resolved_unexec_uid:
+                        unexec_res["dalton_user_id"] = resolved_unexec_uid
+                    if cleaned_msg_id:
+                        await _upsert_command_inbound_row(
+                            cur,
+                            platform=cleaned_platform,
+                            message_id=cleaned_msg_id,
+                            request_key=req_uuid,
+                            chat_type=cleaned_chat_type,
+                            chat_address=cleaned_address,
+                            scope_key=cleaned_scope,
+                            dalton_user_id=resolved_unexec_uid,
+                            workspace_id=None,
+                            external_thread_id=None,
+                            session_generation=None,
+                            thread_id=None,
+                            run_id=None,
+                            status="failed",
+                            command_request=cmd_req_dict,
+                            command_result=unexec_res,
+                            command_effect_status="done",
+                            command_reply_pending=False,
+                            raw_payload=payload_dict,
+                        )
+                    return {
+                        **unexec_res,
+                        "duplicate": False,
+                        "command_effect_status": "done",
+                        "command_reply_pending": False,
+                        "native_interaction": True,
+                        "native_ack_status": eff_ack_status,
+                        "native_reply_status": "not_applicable",
+                    }
+
                 async def _deny_and_ignore_command(
                     res_payload: dict[str, Any], *, uid_val: str | None
                 ) -> dict[str, Any]:
+                    if is_native and cleaned_msg_id and not is_internal_query:
+                        reply_pending = (
+                            bool(existing_inbound.get("command_reply_pending", False))
+                            if existing_inbound is not None
+                            else (eff_ack_status == "acknowledged")
+                        )
+                        payload_dict["native_reply_status"] = (
+                            eff_reply_status
+                            or (
+                                payload_dict.get("native_reply_status")
+                                if existing_inbound is not None
+                                else None
+                            )
+                            or ("pending" if reply_pending else "not_applicable")
+                        )
+                        await _upsert_command_inbound_row(
+                            cur,
+                            platform=cleaned_platform,
+                            message_id=cleaned_msg_id,
+                            request_key=req_uuid,
+                            chat_type=cleaned_chat_type,
+                            chat_address=cleaned_address,
+                            scope_key=cleaned_scope,
+                            dalton_user_id=uid_val,
+                            workspace_id=None,
+                            external_thread_id=None,
+                            session_generation=None,
+                            thread_id=None,
+                            run_id=None,
+                            status="ignored",
+                            command_request=cmd_req_dict,
+                            command_result=res_payload,
+                            command_effect_status="done",
+                            command_reply_pending=reply_pending,
+                            raw_payload=payload_dict,
+                        )
+                        return {
+                            **res_payload,
+                            "duplicate": existing_inbound is not None,
+                            "command_effect_status": "done",
+                            "command_reply_pending": reply_pending,
+                            "native_interaction": True,
+                            "native_ack_status": eff_ack_status or "acknowledged",
+                            "native_reply_status": payload_dict["native_reply_status"],
+                        }
                     if cleaned_msg_id:
                         await _upsert_command_inbound_row(
                             cur,
@@ -2157,7 +2368,7 @@ async def _execute_session_command_once(
                             if target_ws_id and normalize_uuid(
                                 target_ws_id
                             ) != normalize_uuid(home_ws_id):
-                                ok, perm_deny, _ = (
+                                ok, perm_deny, ws_row = (
                                     await _verify_workspace_write_permission(
                                         cur,
                                         str(target_ws_id),
@@ -2166,6 +2377,11 @@ async def _execute_session_command_once(
                                     )
                                 )
                                 if not ok:
+                                    was_reply_pending = bool(
+                                        existing_inbound.get(
+                                            "command_reply_pending", False
+                                        )
+                                    )
                                     denied_dup = await _deny_and_ignore_command(
                                         {
                                             "ok": False,
@@ -2182,9 +2398,13 @@ async def _execute_session_command_once(
                                         **denied_dup,
                                         "duplicate": True,
                                         "command_effect_status": "done",
-                                        "command_reply_pending": False,
+                                        "command_reply_pending": (
+                                            was_reply_pending if is_native else False
+                                        ),
                                         "existing_status": "ignored",
                                     }
+                                if ws_row and ws_row.get("name"):
+                                    stored_res["workspace_name"] = str(ws_row["name"])
 
                         eff_stored_status = (
                             existing_inbound.get("command_effect_status") or "done"
@@ -2203,21 +2423,92 @@ async def _execute_session_command_once(
                                     """,
                                     (cleaned_platform, cleaned_msg_id),
                                 )
+                        dup_reply_pending = bool(
+                            existing_inbound.get("command_reply_pending", False)
+                        )
                         return {
                             **stored_res,
                             "dalton_user_id": cleaned_uid,
                             "user_tier": user_tier,
                             "duplicate": True,
                             "command_effect_status": eff_stored_status,
-                            "command_reply_pending": bool(
-                                existing_inbound.get("command_reply_pending", False)
-                            ),
+                            "command_reply_pending": dup_reply_pending,
                             "existing_status": existing_inbound.get("status"),
+                            **(
+                                {
+                                    "native_interaction": True,
+                                    "native_ack_status": payload_dict.get(
+                                        "native_ack_status"
+                                    )
+                                    or "acknowledged",
+                                    "native_reply_status": payload_dict.get(
+                                        "native_reply_status"
+                                    )
+                                    or ("pending" if dup_reply_pending else "sent"),
+                                }
+                                if is_native
+                                else {}
+                            ),
                         }
 
                     # A stored denial or other non-success is final for this message_id.
                     # Resending it restores an unsent reply and does not run the command again,
                     # so a later rename or workspace switch cannot turn the old event into a new selection.
+                    # Re-filter any stored ambiguous candidates against current write permissions and
+                    # live workspace names so revoked workspaces are never disclosed on replay.
+                    stored_res.pop("workspace_name", None)
+                    stored_res.pop("workspaces", None)
+                    raw_candidates = stored_res.get("candidates")
+                    if isinstance(raw_candidates, list):
+                        writable_names = await _get_writable_workspace_names(
+                            cleaned_uid
+                        )
+                        visible_candidates: list[dict[str, Any]] = []
+                        for cand in raw_candidates:
+                            if not isinstance(cand, dict):
+                                continue
+                            c_wid = normalize_uuid(cand.get("workspace_id"))
+                            if not c_wid:
+                                continue
+                            ok_cand, _, cand_row = (
+                                await _verify_workspace_write_permission(
+                                    cur,
+                                    c_wid,
+                                    cleaned_uid,
+                                    conn=owned_conn,
+                                )
+                            )
+                            if not ok_cand or cand_row is None:
+                                continue
+                            live_name = writable_names.get(c_wid) or str(
+                                cand_row.get("name") or cand.get("name") or c_wid
+                            )
+                            visible_candidates.append(
+                                {
+                                    "workspace_id": c_wid,
+                                    "name": live_name,
+                                }
+                            )
+                        stored_res["candidates"] = visible_candidates
+                        if (
+                            not visible_candidates
+                            and stored_res.get("deny_reason") == "workspace_ambiguous"
+                        ):
+                            stored_res["deny_reason"] = "workspace_write_denied"
+                        if cleaned_msg_id:
+                            await cur.execute(
+                                """
+                                UPDATE dalton_channel_inbound_events
+                                SET command_result = %s,
+                                    updated_at = NOW()
+                                WHERE platform = %s AND message_id = %s
+                                """,
+                                (Json(stored_res), cleaned_platform, cleaned_msg_id),
+                            )
+
+                    dup_reply_pending = bool(
+                        existing_inbound.get("command_reply_pending", False)
+                    )
                     return {
                         **stored_res,
                         "dalton_user_id": cleaned_uid,
@@ -2227,10 +2518,23 @@ async def _execute_session_command_once(
                             "command_effect_status"
                         )
                         or "done",
-                        "command_reply_pending": bool(
-                            existing_inbound.get("command_reply_pending", False)
-                        ),
+                        "command_reply_pending": dup_reply_pending,
                         "existing_status": existing_inbound.get("status"),
+                        **(
+                            {
+                                "native_interaction": True,
+                                "native_ack_status": payload_dict.get(
+                                    "native_ack_status"
+                                )
+                                or "acknowledged",
+                                "native_reply_status": payload_dict.get(
+                                    "native_reply_status"
+                                )
+                                or ("pending" if dup_reply_pending else "sent"),
+                            }
+                            if is_native
+                            else {}
+                        ),
                     }
 
                 # Read-only internal query path (e.g. GET /agent/session when message_id is omitted)
@@ -2260,6 +2564,16 @@ async def _execute_session_command_once(
                         act_at = g_row.get("last_conversation_activity_at")
                         if init_at is not None and not _is_session_expired(act_at, db_now):
                             eff_override_ws = raw_ov
+                    if (
+                        eff_override_ws is not None
+                        and eff_override_ws not in writable_names
+                        and normalize_uuid(eff_override_ws) != normalize_uuid(home_ws_id)
+                    ):
+                        ok, _, ws_row = await _verify_workspace_write_permission(
+                            cur, eff_override_ws, cleaned_uid, conn=owned_conn
+                        )
+                        if not ok or ws_row is None:
+                            eff_override_ws = None
                     current_ws_id = eff_override_ws or home_ws_id
                     current_ws_name = (
                         CHIEF_OF_STAFF_DISPLAY_NAME
@@ -2277,6 +2591,8 @@ async def _execute_session_command_once(
                         "is_home": eff_override_ws is None,
                         "home_workspace_id": home_ws_id,
                         "generation": gen_val,
+                        "command_effect_status": "done",
+                        "command_reply_pending": False,
                         "workspaces": [
                             {"workspace_id": wid, "name": name}
                             for wid, name in writable_names.items()
@@ -2333,6 +2649,23 @@ async def _execute_session_command_once(
                             generation += 1
                             pending_interrupt = None
 
+                    current_ws_name = CHIEF_OF_STAFF_DISPLAY_NAME
+                    if override_ws_id is not None:
+                        current_ws_name = writable_names.get(override_ws_id) or ""
+                        if not current_ws_name:
+                            ok, _, w_row = await _verify_workspace_write_permission(
+                                cur, override_ws_id, cleaned_uid, conn=owned_conn
+                            )
+                            if not ok or w_row is None:
+                                override_ws_id = None
+                                current_ws_name = CHIEF_OF_STAFF_DISPLAY_NAME
+                            else:
+                                current_ws_name = (
+                                    str(w_row["name"])
+                                    if w_row and w_row.get("name")
+                                    else override_ws_id
+                                )
+
                     await cur.execute(
                         """
                         UPDATE dalton_channel_session_generations
@@ -2359,17 +2692,6 @@ async def _execute_session_command_once(
                         ),
                     )
                     current_ws_id = override_ws_id or home_ws_id
-                    if override_ws_id is None:
-                        current_ws_name = CHIEF_OF_STAFF_DISPLAY_NAME
-                    else:
-                        current_ws_name = writable_names.get(override_ws_id)
-                        if not current_ws_name:
-                            w_row = await _fetch_workspace_row(cur, override_ws_id)
-                            current_ws_name = (
-                                str(w_row["name"])
-                                if w_row and w_row.get("name")
-                                else override_ws_id
-                            )
                     ext_id = format_external_thread_id(
                         cleaned_platform,
                         cleaned_scope,
@@ -2836,6 +3158,12 @@ async def _execute_session_command_once(
                             "external_thread_id": ext_id,
                         }
 
+                if is_native:
+                    payload_dict["native_reply_status"] = (
+                        eff_reply_status
+                        or ("pending" if cleaned_msg_id else "not_applicable")
+                    )
+
                 if cleaned_msg_id:
                     await _upsert_command_inbound_row(
                         cur,
@@ -2866,6 +3194,19 @@ async def _execute_session_command_once(
                     "duplicate": False,
                     "command_effect_status": effect_status,
                     "command_reply_pending": bool(cleaned_msg_id),
+                    **(
+                        {
+                            "native_interaction": True,
+                            "native_ack_status": payload_dict.get("native_ack_status")
+                            or "acknowledged",
+                            "native_reply_status": payload_dict.get(
+                                "native_reply_status"
+                            )
+                            or ("pending" if cleaned_msg_id else "not_applicable"),
+                        }
+                        if is_native
+                        else {}
+                    ),
                 }
 
 
@@ -5565,12 +5906,16 @@ async def _update_inbound_progress_once(
                         params.append(Jsonb(command_result))
                     if raw_payload is not None:
                         sets.append("raw_payload = %s")
-                        params.append(Jsonb(raw_payload))
+                        params.append(
+                            Jsonb(_sanitize_native_payload_dict(raw_payload))
+                        )
                     elif raw_payload_patch is not None:
                         sets.append(
                             "raw_payload = COALESCE(raw_payload, '{}'::jsonb) || %s"
                         )
-                        params.append(Jsonb(raw_payload_patch))
+                        params.append(
+                            Jsonb(_sanitize_native_payload_dict(raw_payload_patch))
+                        )
 
                     params.extend([cleaned_p, cleaned_mid])
                     await cur.execute(

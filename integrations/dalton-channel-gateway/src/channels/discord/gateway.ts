@@ -168,7 +168,12 @@ export interface DiscordGatewayClientOptions {
   identifyLimiter?: GatewayIdentifyLimiter;
   logger?: SubsystemLogger;
   onDispatch?: (eventName: string, data: unknown, seq: number | null) => Promise<void> | void;
-  onReady?: (data: { sessionId: string; resumeGatewayUrl: string | null; botUserId?: string }) => void;
+  onReady?: (data: {
+    sessionId: string;
+    resumeGatewayUrl: string | null;
+    botUserId?: string;
+    applicationId?: string;
+  }) => void;
   onError?: (err: Error) => void;
   timerDeps?: GatewayTimerDeps;
 }
@@ -185,7 +190,7 @@ interface PendingDispatch {
 }
 
 function extractDispatchMessageId(eventName: string, data: unknown): string | null {
-  if (eventName !== "MESSAGE_CREATE" || !isRecord(data)) return null;
+  if ((eventName !== "MESSAGE_CREATE" && eventName !== "INTERACTION_CREATE") || !isRecord(data)) return null;
   return typeof data.id === "string" && data.id.trim().length > 0 ? data.id.trim() : null;
 }
 
@@ -536,10 +541,12 @@ export class DiscordGatewayClient {
       this.consecutiveResumeFailures = 0;
       this.connected = true;
       const user = isRecord(payload.d.user) ? payload.d.user : undefined;
+      const app = isRecord(payload.d.application) ? payload.d.application : undefined;
       this.onReady?.({
         sessionId: this.sessionId ?? "",
         resumeGatewayUrl: this.resumeGatewayUrl,
         botUserId: user && typeof user.id === "string" ? user.id : undefined,
+        applicationId: app && typeof app.id === "string" ? app.id : undefined,
       });
     } else if (payload.t === "RESUMED") {
       this.reconnectAttempts = 0;
@@ -585,6 +592,20 @@ export class DiscordGatewayClient {
         await this.drainPendingDispatches();
         return;
       }
+    }
+
+    if (
+      payload.t === "INTERACTION_CREATE" &&
+      (this.isDrainingDispatches ||
+        this.dispatchRetryTimer !== undefined ||
+        this.pendingDispatches.length > 0)
+    ) {
+      try {
+        await this.onDispatch?.(payload.t, payload.d, seq ?? this.ackedSequence);
+      } catch (err) {
+        this.emitError(err instanceof Error ? err : new Error(String(err)));
+      }
+      return;
     }
 
     if (this.pendingDispatches.length >= MAX_PENDING_DISPATCHES) {

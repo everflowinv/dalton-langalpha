@@ -3,6 +3,7 @@ import type {
   ChannelPlatform,
   InboundAttachmentDescriptor,
   InboundChannelEvent,
+  NativeInteractionEvent,
 } from "../types.js";
 
 export type ChannelErrorOutcome = "failed" | "unknown" | "rate_limited";
@@ -174,6 +175,9 @@ export interface ChannelAdapter {
 
   /** Register the gateway's inbound event handler. */
   onInboundEvent(handler: (event: InboundChannelEvent) => Promise<void>): void;
+
+  /** Register the gateway's native interaction handler (e.g. Discord INTERACTION_CREATE). */
+  onNativeInteraction?(handler: (event: NativeInteractionEvent) => Promise<void>): void;
 
   /** Split markdown/text into platform-sized chunks. */
   splitTextChunks(text: string): string[];

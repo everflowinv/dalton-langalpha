@@ -1,20 +1,38 @@
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
 import { describe, expect, it, vi } from "vitest";
+import { HttpBackendClient } from "../src/backend-client.js";
 import { ChannelDeliveryError, type ChannelAdapter } from "../src/channels/adapter.js";
 import {
   chunkDiscordText,
   classifyDiscordDeliveryError,
   createDiscordMessageNonce,
+  createRouteKey,
+  DISCORD_AUTOCOMPLETE_MAX_CHOICES,
+  DISCORD_EPHEMERAL_MESSAGE_FLAG,
+  DISCORD_INTERACTION_INITIAL_CALLBACK_TIMEOUT_MS,
+  DISCORD_INTERACTION_MAX_CALLBACK_DEADLINE_MS,
+  DISCORD_INTERACTION_MAX_RESPONSE_BODY_BYTES,
+  DISCORD_INTERACTION_ORIGINAL_EDIT_TIMEOUT_MS,
+  DISCORD_INTERACTION_TOKEN_TTL_MS,
+  DISCORD_INTERACTION_TYPE_APPLICATION_COMMAND,
+  DISCORD_INTERACTION_TYPE_APPLICATION_COMMAND_AUTOCOMPLETE,
   DISCORD_MAX_NONCE_CHARS,
   DiscordChannelAdapter,
   DiscordError,
   DiscordGatewayClient,
+  DiscordInteractionHttpClient,
   DiscordQueueError,
   downloadDiscordAttachment,
   fetchDiscordGatewayInfo,
+  formatDiscordAutocompleteChoices,
+  mapDiscordNativeCommandToSlashCommand,
   normalizeDiscordBold,
   parseDiscordInboundMessage,
+  parseDiscordInteractionCreate,
   parseDiscordTarget,
   RateLimitError,
+  redactDiscordInteractionText,
   renderDiscordMarkdown,
   RequestClient,
   RESUMABLE_GATEWAY_CLOSE_CODE,
@@ -31,6 +49,7 @@ import { loadConfig } from "../src/config.js";
 import { DeliveryService } from "../src/delivery-service.js";
 import { buildConfiguredAdapters } from "../src/main.js";
 import { createGatewayApp } from "../src/server.js";
+import { redactCredentialString } from "../src/shared/logger.js";
 import { SafeFetchError } from "../src/shared/safe-fetch.js";
 import type { ChannelPlatform, InboundChannelEvent } from "../src/types.js";
 import { makeInboundRequestKey } from "../src/uuid.js";
@@ -5025,3 +5044,1401 @@ describe("Discord outbound", () => {
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// Native Discord interactions (INTERACTION_CREATE, private callbacks & shared commands)
+// ---------------------------------------------------------------------------
+
+describe("Discord native interactions (INTERACTION_CREATE)", () => {
+  const APP_ID = "123456789012345678";
+  const USER_ALICE = "111222333444555666";
+  const USER_BOB = "777888999000111222";
+  const DM_CHANNEL_ID = "800000009";
+  const WS_CHINA_UUID = "99999999-8888-4777-8666-555555555555";
+  const WS_MACRO_UUID = "88888888-7777-4666-8555-444444444444";
+  const WS_READONLY_UUID = "77777777-6666-4555-8444-333333333333";
+
+  it("parses and maps native commands and rejects malformed or mismatched interaction payloads", async () => {
+    expect(DISCORD_INTERACTION_INITIAL_CALLBACK_TIMEOUT_MS).toBeLessThan(3_000);
+    expect(DISCORD_INTERACTION_MAX_CALLBACK_DEADLINE_MS).toBeLessThan(3_000);
+    expect(DISCORD_INTERACTION_ORIGINAL_EDIT_TIMEOUT_MS).toBeGreaterThan(0);
+    expect(
+      formatDiscordAutocompleteChoices([
+        { name: "A股量化研究 (active)", value: WS_CHINA_UUID },
+      ]),
+    ).toEqual([{ name: "A股量化研究 (active)", value: WS_CHINA_UUID }]);
+    expect(mapDiscordNativeCommandToSlashCommand("main")).toEqual({
+      kind: "session",
+      cmd: "workspace_switch",
+      canonicalCommand: "/main",
+      targetKind: "home",
+      workspaceQuery: "home",
+    });
+    expect(mapDiscordNativeCommandToSlashCommand("workspace")).toEqual({
+      kind: "session",
+      cmd: "workspace_list",
+      canonicalCommand: "/workspace",
+    });
+    expect(mapDiscordNativeCommandToSlashCommand("workspace", WS_CHINA_UUID)).toEqual({
+      kind: "session",
+      cmd: "workspace_switch",
+      canonicalCommand: `/workspace ${WS_CHINA_UUID}`,
+      targetKind: "workspace_id",
+      workspaceId: WS_CHINA_UUID,
+      workspaceQuery: WS_CHINA_UUID,
+    });
+    expect(mapDiscordNativeCommandToSlashCommand("workspace", "A股量化研究")).toEqual({
+      kind: "session",
+      cmd: "workspace_switch",
+      canonicalCommand: "/workspace A股量化研究",
+      targetKind: "exact_name",
+      workspaceQuery: "A股量化研究",
+    });
+    expect(mapDiscordNativeCommandToSlashCommand("workspace", "A股量化研究\ninjected")).toBeNull();
+    expect(mapDiscordNativeCommandToSlashCommand("new")?.cmd).toBe("new");
+    expect(mapDiscordNativeCommandToSlashCommand("stop")?.cmd).toBe("stop");
+
+    // Reject missing verifiedApplicationId or mismatched payload application_id
+    const validGuildCmdPayload = {
+      id: "inter-100",
+      application_id: APP_ID,
+      type: DISCORD_INTERACTION_TYPE_APPLICATION_COMMAND,
+      token: "secret_interaction_token_abc123",
+      guild_id: GUILD_ID,
+      channel_id: THREAD_ID,
+      channel: {
+        id: THREAD_ID,
+        type: 11,
+        guild_id: GUILD_ID,
+        parent_id: CHANNEL_ID,
+      },
+      member: {
+        user: { id: USER_ALICE, username: "alice" },
+      },
+      data: {
+        id: "cmd-id-1",
+        name: "workspace",
+        type: 1,
+        options: [{ name: "workspace", type: 3, value: WS_CHINA_UUID }],
+      },
+    };
+
+    expect(
+      await parseDiscordInteractionCreate(validGuildCmdPayload, {
+        verifiedApplicationId: null,
+      }),
+    ).toMatchObject({
+      ok: false,
+      reason: "unverified_application_identity",
+    });
+
+    expect(
+      await parseDiscordInteractionCreate(validGuildCmdPayload, {
+        verifiedApplicationId: "other-app-id",
+      }),
+    ).toMatchObject({
+      ok: false,
+      reason: "application_id_mismatch",
+    });
+
+    // Guild thread scope key and sanitized raw_payload (no token!)
+    const parsedThread = await parseDiscordInteractionCreate(validGuildCmdPayload, {
+      verifiedApplicationId: APP_ID,
+    });
+    expect(parsedThread.ok).toBe(true);
+    if (parsedThread.ok && parsedThread.interaction.kind === "command") {
+      expect(parsedThread.interaction.chatType).toBe("group");
+      expect(parsedThread.interaction.chatAddress).toBe(`discord:${GUILD_ID}/${CHANNEL_ID}`);
+      expect(parsedThread.interaction.threadScopeKey).toBe(
+        `chat:${GUILD_ID}/${CHANNEL_ID}:thread:${THREAD_ID}`,
+      );
+      expect(parsedThread.interaction.requestKey).toBe(
+        makeInboundRequestKey("discord", "inter-100"),
+      );
+      expect(parsedThread.interaction.parsedCommand.targetKind).toBe("workspace_id");
+      expect(JSON.stringify(parsedThread.interaction.sanitizedRawPayload)).not.toContain(
+        "secret_interaction_token_abc123",
+      );
+      expect(parsedThread.interaction.sanitizedRawPayload.native_interaction).toBe(true);
+    }
+
+    // DM scope key
+    const parsedDm = await parseDiscordInteractionCreate(
+      {
+        id: "inter-dm-1",
+        application_id: APP_ID,
+        type: DISCORD_INTERACTION_TYPE_APPLICATION_COMMAND,
+        token: "secret_dm_token_xyz",
+        channel_id: DM_CHANNEL_ID,
+        channel: { id: DM_CHANNEL_ID, type: 1 },
+        user: { id: USER_ALICE, username: "alice" },
+        data: { id: "cmd-main", name: "main", type: 1 },
+      },
+      { verifiedApplicationId: APP_ID },
+    );
+    expect(parsedDm.ok).toBe(true);
+    if (parsedDm.ok && parsedDm.interaction.kind === "command") {
+      expect(parsedDm.interaction.chatType).toBe("dm");
+      expect(parsedDm.interaction.chatAddress).toBe("discord:@me");
+      expect(parsedDm.interaction.threadScopeKey).toBe(`dm:${USER_ALICE}`);
+    }
+
+    // Reject guild interaction without member.user, thread without parent_id, mismatched channel.guild_id, unknown command, multiline workspace option, or invalid option type
+    expect(
+      await parseDiscordInteractionCreate(
+        {
+          ...validGuildCmdPayload,
+          member: undefined,
+          user: { id: USER_ALICE },
+        },
+        { verifiedApplicationId: APP_ID },
+      ),
+    ).toMatchObject({ ok: false, reason: "missing_guild_member" });
+
+    expect(
+      await parseDiscordInteractionCreate(
+        {
+          ...validGuildCmdPayload,
+          channel: { id: THREAD_ID, type: 11, guild_id: GUILD_ID },
+        },
+        { verifiedApplicationId: APP_ID },
+      ),
+    ).toMatchObject({ ok: false, reason: "missing_thread_parent" });
+
+    // Stage-1 allowUnresolvedThreadParent accepts missing thread parent with needsChannelResolution=true
+    const stage1Thread = await parseDiscordInteractionCreate(
+      {
+        ...validGuildCmdPayload,
+        channel: { id: THREAD_ID, type: 11, guild_id: GUILD_ID },
+      },
+      { verifiedApplicationId: APP_ID, allowUnresolvedThreadParent: true },
+    );
+    expect(stage1Thread.ok).toBe(true);
+    if (stage1Thread.ok) {
+      expect(stage1Thread.interaction.needsChannelResolution).toBe(true);
+    }
+
+    expect(
+      await parseDiscordInteractionCreate(
+        {
+          ...validGuildCmdPayload,
+          channel: { id: CHANNEL_ID, type: 0, guild_id: "wrong-guild" },
+        },
+        { verifiedApplicationId: APP_ID },
+      ),
+    ).toMatchObject({ ok: false, reason: "channel_guild_mismatch" });
+
+    expect(
+      await parseDiscordInteractionCreate(
+        {
+          ...validGuildCmdPayload,
+          data: { id: "cmd-unknown", name: "delete", type: 1 },
+        },
+        { verifiedApplicationId: APP_ID },
+      ),
+    ).toMatchObject({ ok: false, reason: "unsupported_command_name" });
+
+    expect(
+      await parseDiscordInteractionCreate(
+        {
+          ...validGuildCmdPayload,
+          data: {
+            id: "cmd-ws",
+            name: "workspace",
+            type: 1,
+            options: [{ name: "workspace", type: 4, value: 123 }],
+          },
+        },
+        { verifiedApplicationId: APP_ID },
+      ),
+    ).toMatchObject({ ok: false, reason: "invalid_command_options" });
+
+    expect(
+      await parseDiscordInteractionCreate(
+        {
+          ...validGuildCmdPayload,
+          data: {
+            id: "cmd-ws",
+            name: "workspace",
+            type: 1,
+            options: [{ name: "workspace", type: 3, value: "line1\nline2" }],
+          },
+        },
+        { verifiedApplicationId: APP_ID },
+      ),
+    ).toMatchObject({ ok: false, reason: "invalid_command_options" });
+  });
+
+  it("verifies application identity via /oauth2/applications/@me without falling back to botUserId, rejecting native interactions on mismatch while preserving normal MESSAGE_CREATE", async () => {
+    const interactionCalls: FetchCall[] = [];
+    const restCalls: FetchCall[] = [];
+    let oauthAppIdResponse = "999999999999999999"; // Mismatches APP_ID first
+
+    const { rest } = makeRest(async (call) => {
+      restCalls.push(call);
+      const route = routeOf(call.url);
+      if (route === "/oauth2/applications/@me") {
+        return jsonResponse({ id: oauthAppIdResponse, name: "Dalton Bot" });
+      }
+      if (route === `/channels/${CHANNEL_ID}`) {
+        return jsonResponse({ id: CHANNEL_ID, type: 0, guild_id: GUILD_ID, name: "general" });
+      }
+      throw new Error(`Unexpected REST route: ${route}`);
+    });
+
+    const interactionFetch = async (url: string, init: RequestInit): Promise<Response> => {
+      interactionCalls.push({ url, init });
+      return new Response(null, { status: 204 });
+    };
+
+    // 1) Adapter without explicit applicationId (only botUserId): must NOT use botUserId fallback for native interactions
+    const adapterWithoutAppId = new DiscordChannelAdapter({
+      botToken: "bot-secret-token",
+      botUserId: BOT_ID,
+      rest,
+      fetchImpl: interactionFetch,
+    });
+    expect(adapterWithoutAppId.getApplicationId()).toBeUndefined();
+    const nativeEventsNoAppId: unknown[] = [];
+    adapterWithoutAppId.onNativeInteraction(async (ev) => {
+      nativeEventsNoAppId.push(ev);
+    });
+    await adapterWithoutAppId.handleDispatch("INTERACTION_CREATE", {
+      id: "inter-no-appid",
+      application_id: BOT_ID,
+      type: 2,
+      token: "tok-no-appid",
+      guild_id: GUILD_ID,
+      channel_id: CHANNEL_ID,
+      channel: { id: CHANNEL_ID, type: 0, guild_id: GUILD_ID },
+      member: { user: { id: USER_ALICE } },
+      data: { id: "c1", name: "main", type: 1 },
+    });
+    expect(nativeEventsNoAppId).toHaveLength(0);
+    expect(interactionCalls).toHaveLength(0);
+
+    // 2) Adapter with applicationId, but /oauth2/applications/@me returns a different application ID
+    const adapterMismatch = new DiscordChannelAdapter({
+      botToken: "bot-secret-token",
+      botUserId: BOT_ID,
+      applicationId: APP_ID,
+      rest,
+      fetchImpl: interactionFetch,
+    });
+    const inboundMessages: InboundChannelEvent[] = [];
+    const nativeEventsMismatch: unknown[] = [];
+    adapterMismatch.onInboundEvent(async (ev) => {
+      inboundMessages.push(ev);
+    });
+    adapterMismatch.onNativeInteraction(async (ev) => {
+      nativeEventsMismatch.push(ev);
+    });
+
+    await adapterMismatch.handleDispatch("INTERACTION_CREATE", {
+      id: "inter-mismatch-1",
+      application_id: APP_ID,
+      type: 2,
+      token: "tok-mismatch-1",
+      guild_id: GUILD_ID,
+      channel_id: CHANNEL_ID,
+      channel: { id: CHANNEL_ID, type: 0, guild_id: GUILD_ID },
+      member: { user: { id: USER_ALICE } },
+      data: { id: "c1", name: "main", type: 1 },
+    });
+    expect(nativeEventsMismatch).toHaveLength(0);
+    expect(interactionCalls).toHaveLength(0);
+
+    // Ordinary mentioned MESSAGE_CREATE still works when native identity fails, while unmentioned guild message is ignored
+    await adapterMismatch.handleDispatch("MESSAGE_CREATE", {
+      id: "msg-unmentioned",
+      channel_id: CHANNEL_ID,
+      guild_id: GUILD_ID,
+      content: "/workspace",
+      author: { id: USER_ALICE, username: "alice" },
+      mentions: [],
+    });
+    expect(inboundMessages).toHaveLength(0);
+
+    await adapterMismatch.handleDispatch("MESSAGE_CREATE", {
+      id: "msg-mentioned",
+      channel_id: CHANNEL_ID,
+      guild_id: GUILD_ID,
+      content: `<@${BOT_ID}> hello`,
+      author: { id: USER_ALICE, username: "alice" },
+      mentions: [{ id: BOT_ID }],
+    });
+    expect(inboundMessages).toHaveLength(1);
+    expect(inboundMessages[0]!.messageId).toBe("msg-mentioned");
+    expect(inboundMessages[0]!.isGroupTrigger).toBe(true);
+
+    // 3) Now /oauth2/applications/@me returns matching APP_ID
+    oauthAppIdResponse = APP_ID;
+    const adapterVerified = new DiscordChannelAdapter({
+      botToken: "bot-secret-token",
+      botUserId: BOT_ID,
+      applicationId: APP_ID,
+      rest,
+      fetchImpl: interactionFetch,
+    });
+    expect(await adapterVerified.ensureApplicationIdentityVerified()).toBe(APP_ID);
+    expect(adapterVerified.getVerifiedApplicationId()).toBe(APP_ID);
+  });
+
+  it("exercises real local HTTP server for callback/webhook paths, no Bot Authorization, 429 retry/abort, delayed headers, stalled response body, and oversized response body cap", async () => {
+    interface CapturedHttpRequest {
+      method: string;
+      url: string;
+      authorization: string | undefined;
+      bodyText: string;
+    }
+    const capturedRequests: CapturedHttpRequest[] = [];
+    let routeMode:
+      | "normal"
+      | "rate_limit_once"
+      | "rate_limit_over_budget"
+      | "delayed_headers"
+      | "stalled_body_callback"
+      | "stalled_body_webhook"
+      | "oversized_body_callback"
+      | "oversized_body_webhook"
+      | "already_acknowledged_40060" = "normal";
+    let rateLimitCalls = 0;
+    const openServerTimers = new Set<ReturnType<typeof setTimeout>>();
+
+    const httpServer: Server = createServer((req: IncomingMessage, res: ServerResponse) => {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () => {
+        const bodyText = Buffer.concat(chunks).toString("utf8");
+        capturedRequests.push({
+          method: req.method ?? "GET",
+          url: req.url ?? "",
+          authorization: typeof req.headers.authorization === "string"
+            ? req.headers.authorization
+            : undefined,
+          bodyText,
+        });
+
+        if (routeMode === "delayed_headers") {
+          const t = setTimeout(() => {
+            openServerTimers.delete(t);
+            if (!res.writableEnded) {
+              res.writeHead(204);
+              res.end();
+            }
+          }, 500);
+          openServerTimers.add(t);
+          return;
+        }
+
+        if (
+          (routeMode === "stalled_body_callback" && (req.url ?? "").endsWith("/callback")) ||
+          (routeMode === "stalled_body_webhook" && (req.url ?? "").endsWith("/messages/@original"))
+        ) {
+          res.writeHead(400, {
+            "content-type": "application/json",
+            "transfer-encoding": "chunked",
+          });
+          res.write('{"code":10062,"message":"partial');
+          const t = setTimeout(() => {
+            openServerTimers.delete(t);
+            if (!res.writableEnded) {
+              res.end('"}');
+            }
+          }, 500);
+          openServerTimers.add(t);
+          return;
+        }
+
+        if (
+          (routeMode === "oversized_body_callback" && (req.url ?? "").endsWith("/callback")) ||
+          (routeMode === "oversized_body_webhook" && (req.url ?? "").endsWith("/messages/@original"))
+        ) {
+          res.writeHead(500, { "content-type": "text/plain" });
+          res.end("X".repeat(DISCORD_INTERACTION_MAX_RESPONSE_BODY_BYTES + 16_384));
+          return;
+        }
+
+        if (routeMode === "already_acknowledged_40060" && (req.url ?? "").endsWith("/callback")) {
+          res.writeHead(400, { "content-type": "application/json" });
+          res.end(JSON.stringify({ code: 40060, message: "Interaction has already been acknowledged." }));
+          return;
+        }
+
+        if (routeMode === "rate_limit_once" && (req.url ?? "").endsWith("/callback")) {
+          rateLimitCalls += 1;
+          if (rateLimitCalls === 1) {
+            res.writeHead(429, {
+              "content-type": "application/json",
+              "retry-after": "0.02",
+            });
+            res.end(JSON.stringify({ retry_after: 0.02 }));
+            return;
+          }
+        }
+
+        if (routeMode === "rate_limit_over_budget" && (req.url ?? "").endsWith("/callback")) {
+          res.writeHead(429, {
+            "content-type": "application/json",
+            "retry-after": "5",
+          });
+          res.end(JSON.stringify({ retry_after: 5 }));
+          return;
+        }
+
+        if ((req.url ?? "").endsWith("/callback")) {
+          res.writeHead(204);
+          res.end();
+          return;
+        }
+
+        if ((req.url ?? "").endsWith("/messages/@original")) {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ id: "orig-msg-1" }));
+          return;
+        }
+
+        res.writeHead(404);
+        res.end();
+      });
+    });
+
+    await new Promise<void>((resolve) => httpServer.listen(0, "127.0.0.1", () => resolve()));
+    const port = (httpServer.address() as AddressInfo).port;
+    const baseApiUrl = `http://127.0.0.1:${port}/api/v10`;
+
+    try {
+      const client = new DiscordInteractionHttpClient({
+        apiBaseUrl: baseApiUrl,
+        callbackTimeoutMs: 120,
+        editTimeoutMs: 120,
+      });
+
+      // 1) Normal callback + webhook edit over real HTTP: verify paths, no Authorization header, private flags, allowed_mentions
+      routeMode = "normal";
+      const ackNormal = await client.deferEphemeralCommand({
+        interactionId: "inter-http-1",
+        interactionToken: "SECRET_HTTP_TOK_1",
+        receivedAtMs: Date.now(),
+      });
+      expect(ackNormal.outcome).toBe("acknowledged");
+      expect(capturedRequests.at(-1)).toMatchObject({
+        method: "POST",
+        url: "/api/v10/interactions/inter-http-1/SECRET_HTTP_TOK_1/callback",
+        authorization: undefined,
+      });
+      expect(JSON.parse(capturedRequests.at(-1)!.bodyText)).toEqual({
+        type: 5,
+        data: { flags: DISCORD_EPHEMERAL_MESSAGE_FLAG },
+      });
+
+      const editNormal = await client.editOriginalEphemeralResponse({
+        applicationId: APP_ID,
+        interactionId: "inter-http-1",
+        interactionToken: "SECRET_HTTP_TOK_1",
+        content: "**Private** result",
+        expiresAtMs: Date.now() + 60_000,
+      });
+      expect(editNormal.outcome).toBe("sent");
+      expect(capturedRequests.at(-1)).toMatchObject({
+        method: "PATCH",
+        url: `/api/v10/webhooks/${APP_ID}/SECRET_HTTP_TOK_1/messages/@original`,
+        authorization: undefined,
+      });
+      expect(JSON.parse(capturedRequests.at(-1)!.bodyText)).toEqual({
+        content: "**Private** result",
+        flags: DISCORD_EPHEMERAL_MESSAGE_FLAG,
+        allowed_mentions: { parse: [] },
+      });
+
+      // 2) 429 retry within budget succeeds
+      routeMode = "rate_limit_once";
+      rateLimitCalls = 0;
+      const ackRetryOk = await client.deferEphemeralCommand({
+        interactionId: "inter-http-429-ok",
+        interactionToken: "SECRET_HTTP_TOK_429",
+        receivedAtMs: Date.now(),
+      });
+      expect(ackRetryOk.outcome).toBe("acknowledged");
+      expect(rateLimitCalls).toBe(1);
+
+      // 3) 429 retry exceeding callback budget aborts immediately
+      routeMode = "rate_limit_over_budget";
+      const ackRetryOver = await client.deferEphemeralCommand({
+        interactionId: "inter-http-429-over",
+        interactionToken: "SECRET_HTTP_TOK_429_OVER",
+        receivedAtMs: Date.now(),
+      });
+      expect(ackRetryOver.outcome).toBe("failed");
+      expect(ackRetryOver.reason).toContain("rate_limited_exceeds_deadline");
+
+      // 4) 400 with Discord code 40060 is classified as unknown outcome
+      routeMode = "already_acknowledged_40060";
+      const ack40060 = await client.deferEphemeralCommand({
+        interactionId: "inter-http-40060",
+        interactionToken: "SECRET_HTTP_TOK_40060",
+        receivedAtMs: Date.now(),
+      });
+      expect(ack40060.outcome).toBe("unknown");
+      expect(ack40060.discordCode).toBe(40060);
+
+      // 5) Delayed headers abort within bounded deadline
+      routeMode = "delayed_headers";
+      const startDelayed = Date.now();
+      const ackDelayed = await client.deferEphemeralCommand({
+        interactionId: "inter-http-delayed",
+        interactionToken: "SECRET_HTTP_TOK_DELAYED",
+        receivedAtMs: startDelayed,
+      });
+      expect(Date.now() - startDelayed).toBeLessThan(350);
+      expect(ackDelayed.outcome).toBe("unknown");
+      expect(ackDelayed.reason).toContain("timeout_or_network_error");
+
+      // 6) Stalled response body after headers arrives aborts within the SAME bounded deadline for both callback and webhook
+      routeMode = "stalled_body_callback";
+      const startStalledCb = Date.now();
+      const ackStalledBody = await client.deferEphemeralCommand({
+        interactionId: "inter-http-stalled-cb",
+        interactionToken: "SECRET_HTTP_TOK_STALLED_CB",
+        receivedAtMs: startStalledCb,
+      });
+      expect(Date.now() - startStalledCb).toBeLessThan(350);
+      expect(ackStalledBody.outcome).toBe("unknown");
+
+      routeMode = "stalled_body_webhook";
+      const startStalledWh = Date.now();
+      const editStalledBody = await client.editOriginalEphemeralResponse({
+        applicationId: APP_ID,
+        interactionId: "inter-http-stalled-wh",
+        interactionToken: "SECRET_HTTP_TOK_STALLED_WH",
+        content: "Private",
+        expiresAtMs: startStalledWh + 60_000,
+      });
+      expect(Date.now() - startStalledWh).toBeLessThan(350);
+      expect(editStalledBody.outcome).toBe("unknown");
+
+      // 7) Oversized response body (> 64 KiB) is capped and aborted without reading unlimited data
+      routeMode = "oversized_body_callback";
+      const ackOversized = await client.deferEphemeralCommand({
+        interactionId: "inter-http-oversized-cb",
+        interactionToken: "SECRET_HTTP_TOK_OVERSIZED_CB",
+        receivedAtMs: Date.now(),
+      });
+      expect(ackOversized.outcome).toBe("unknown");
+
+      routeMode = "oversized_body_webhook";
+      const editOversized = await client.editOriginalEphemeralResponse({
+        applicationId: APP_ID,
+        interactionId: "inter-http-oversized-wh",
+        interactionToken: "SECRET_HTTP_TOK_OVERSIZED_WH",
+        content: "Private",
+        expiresAtMs: Date.now() + 60_000,
+      });
+      expect(editOversized.outcome).toBe("unknown");
+
+      // 8) Token redaction checks across logger, route key, error messages, and HttpBackendClient
+      const leakedText =
+        "POST https://discord.com/api/v10/interactions/12345/SECRET_TOK_ABC/callback and https://discord.com/api/v10/webhooks/999/SECRET_TOK_DEF/messages/@original Authorization: Bot BOT_SECRET_XYZ";
+      const scrubbed = redactCredentialString(leakedText);
+      expect(scrubbed).not.toContain("SECRET_TOK_ABC");
+      expect(scrubbed).not.toContain("SECRET_TOK_DEF");
+      expect(scrubbed).not.toContain("BOT_SECRET_XYZ");
+      expect(redactDiscordInteractionText(leakedText, "SECRET_TOK_ABC")).not.toContain(
+        "SECRET_TOK_ABC",
+      );
+      expect(createRouteKey("POST", "/interactions/12345/SECRET_TOK_ABC/callback")).toBe(
+        "POST /interactions/12345/[redacted]/callback",
+      );
+
+      let capturedBackendBody = "";
+      const httpBackend = new HttpBackendClient({
+        baseUrl: "http://127.0.0.1:8000",
+        serviceToken: TEST_SERVICE_TOKEN,
+        fetchImpl: async (_url, init) => {
+          capturedBackendBody = String(init?.body ?? "");
+          return jsonResponse({ ok: true, allowed: true, duplicate: false });
+        },
+      });
+      await httpBackend.sessionCommand({
+        cmd: "workspace_list",
+        platform: "discord",
+        platform_user_id: USER_ALICE,
+        chat_type: "group",
+        chat_address: `discord:${GUILD_ID}/${CHANNEL_ID}`,
+        chat_id: `${GUILD_ID}/${CHANNEL_ID}`,
+        scope_key: `chat:${GUILD_ID}/${CHANNEL_ID}`,
+        message_id: "inter-scrub-1",
+        request_key: makeInboundRequestKey("discord", "inter-scrub-1"),
+        native_interaction: true,
+        native_ack_status: "acknowledged",
+        raw_payload: {
+          native_interaction: true,
+          token: "LEAKED_TOP_TOKEN",
+          discord_interaction: {
+            id: "inter-scrub-1",
+            token: "LEAKED_NESTED_TOKEN",
+            interaction_token: "LEAKED_NESTED_TOKEN_2",
+          },
+        },
+      });
+      expect(capturedBackendBody).not.toContain("LEAKED_TOP_TOKEN");
+      expect(capturedBackendBody).not.toContain("LEAKED_NESTED_TOKEN");
+      expect(capturedBackendBody).not.toContain("LEAKED_NESTED_TOKEN_2");
+    } finally {
+      for (const timer of openServerTimers) {
+        clearTimeout(timer);
+      }
+      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    }
+  });
+
+  it("defers before channel REST lookup, session queue, or DB work, deduplicates concurrent callbacks, enforces shared autocomplete deadline, and handles /stop, unknown ack, token expiry, and restart recovery without public fallback", async () => {
+    const DALTON_ALICE = "11111111-1111-4111-8111-111111111111";
+    const DALTON_BOB = "22222222-2222-4222-8222-222222222222";
+    const ACTIVE_THREAD_ID = "33333333-3333-4333-8333-333333333333";
+    const ACTIVE_RUN_ID = "44444444-4444-4444-8444-444444444444";
+
+    let nowMs = 1_700_000_000_000;
+    const timeline: string[] = [];
+    const publicChannelMessages: Array<{ route: string; body: string }> = [];
+    const interactionHttpLog: Array<{
+      method: string;
+      url: string;
+      hasAuthHeader: boolean;
+      body: Record<string, unknown>;
+    }> = [];
+
+    let nextAckMode: "ok" | "unknown_500" | "failed_400" = "ok";
+    let nextEditMode: "ok" | "expired_10015" = "ok";
+    let unparentedThreadLatencyMs = 0;
+
+    const { rest } = makeRest(async (call) => {
+      const route = routeOf(call.url);
+      if (route === "/oauth2/applications/@me") {
+        return jsonResponse({ id: APP_ID, name: "Dalton Dedicated Bot" });
+      }
+      if (route === `/channels/${CHANNEL_ID}` && call.init.method === "GET") {
+        timeline.push("rest:get_channel");
+        return jsonResponse({ id: CHANNEL_ID, type: 0, guild_id: GUILD_ID, name: "research" });
+      }
+      if (route === `/channels/${THREAD_ID}` && call.init.method === "GET") {
+        timeline.push("rest:get_thread");
+        if (unparentedThreadLatencyMs > 0) {
+          nowMs += unparentedThreadLatencyMs;
+        }
+        return jsonResponse({
+          id: THREAD_ID,
+          type: 11,
+          guild_id: GUILD_ID,
+          parent_id: CHANNEL_ID,
+          name: "subthread",
+        });
+      }
+      if (route.endsWith("/messages") && call.init.method === "POST") {
+        publicChannelMessages.push({
+          route,
+          body: String(call.init.body ?? ""),
+        });
+        return jsonResponse({ id: `pub-msg-${publicChannelMessages.length}` });
+      }
+      throw new Error(`Unexpected Bot REST call: ${call.init.method} ${route}`);
+    });
+
+    const interactionFetch = async (url: string, init: RequestInit): Promise<Response> => {
+      const headers = new Headers(init.headers);
+      const hasAuthHeader = headers.has("authorization");
+      const body = init.body ? (JSON.parse(String(init.body)) as Record<string, unknown>) : {};
+      interactionHttpLog.push({
+        method: String(init.method ?? "GET").toUpperCase(),
+        url,
+        hasAuthHeader,
+        body,
+      });
+
+      if (url.endsWith("/callback")) {
+        timeline.push(`interaction:callback:type=${String(body.type)}`);
+        if (nextAckMode === "unknown_500") {
+          nextAckMode = "ok";
+          return jsonResponse({ message: "Internal Server Error" }, 500);
+        }
+        if (nextAckMode === "failed_400") {
+          nextAckMode = "ok";
+          return jsonResponse({ code: 10062, message: "Unknown interaction" }, 400);
+        }
+        return new Response(null, { status: 204 });
+      }
+
+      if (url.endsWith("/messages/@original")) {
+        timeline.push("interaction:edit_original");
+        if (nextEditMode === "expired_10015") {
+          nextEditMode = "ok";
+          return jsonResponse({ code: 10015, message: "Unknown Webhook" }, 404);
+        }
+        return jsonResponse({ id: "@original" }, 200);
+      }
+
+      throw new Error(`Unexpected interaction URL: ${url}`);
+    };
+
+    const backend = createMockBackend();
+    const sessionState = new Map<
+      string,
+      { overrideWorkspaceId: string | null; generation: number; threadId: string | null; runId: string | null }
+    >();
+    const userBindings = new Map<string, { daltonUserId: string; external?: boolean; revokedWs?: Set<string> }>([
+      [USER_ALICE, { daltonUserId: DALTON_ALICE, revokedWs: new Set() }],
+      [USER_BOB, { daltonUserId: DALTON_BOB, revokedWs: new Set() }],
+    ]);
+
+    const extraWorkspaces = Array.from({ length: 28 }, (_, idx) => ({
+      workspace_id: `00000000-0000-4000-8000-${String(idx + 10).padStart(12, "0")}`,
+      name: idx === 0 ? "A股量化研究" : idx === 1 ? "港股宏观策略" : `Workspace-${idx + 1}`,
+      status: "running",
+      role: "analyst",
+      is_writable: true,
+    }));
+    const allWorkspaces = [
+      {
+        workspace_id: WS_CHINA_UUID,
+        name: "A股量化研究",
+        status: "running",
+        role: "analyst",
+        is_writable: true,
+      },
+      {
+        workspace_id: WS_MACRO_UUID,
+        name: "全球宏观对冲",
+        status: "running",
+        role: "analyst",
+        is_writable: true,
+      },
+      {
+        workspace_id: WS_READONLY_UUID,
+        name: "只读归档工作区",
+        status: "running",
+        role: "viewer",
+        is_writable: false,
+      },
+      ...extraWorkspaces.slice(2),
+    ];
+
+    vi.spyOn(backend, "sessionCommand").mockImplementation(async (req) => {
+      timeline.push(`backend:sessionCommand:${req.cmd}:internal=${Boolean(req.is_internal_query)}:ack=${req.native_ack_status ?? "none"}`);
+      if (
+        req.native_interaction &&
+        (req.native_ack_status === "unknown" || req.native_ack_status === "failed")
+      ) {
+        return {
+          ok: false,
+          allowed: true,
+          duplicate: false,
+          not_executed: true,
+          command_effect_status: "done",
+          command_reply_pending: false,
+        };
+      }
+
+      const binding = userBindings.get(req.platform_user_id);
+      if (!binding) {
+        return {
+          ok: false,
+          allowed: false,
+          deny_reason: "not_linked",
+          duplicate: false,
+          command_effect_status: "done",
+          command_reply_pending: Boolean(req.native_interaction),
+        };
+      }
+      if (binding.external && req.chat_type === "group") {
+        return {
+          ok: false,
+          allowed: false,
+          deny_reason: "external_member_group_forbidden",
+          duplicate: false,
+          command_effect_status: "done",
+          command_reply_pending: Boolean(req.native_interaction),
+        };
+      }
+
+      const sessionKey = `${binding.daltonUserId}::${req.scope_key}`;
+      const current = sessionState.get(sessionKey) ?? {
+        overrideWorkspaceId: null,
+        generation: 0,
+        threadId: ACTIVE_THREAD_ID,
+        runId: ACTIVE_RUN_ID,
+      };
+
+      const writableWorkspaces = allWorkspaces.filter(
+        (w) => w.is_writable && !binding.revokedWs?.has(w.workspace_id),
+      );
+
+      if (req.cmd === "workspace_list") {
+        const activeOverride =
+          current.overrideWorkspaceId &&
+          writableWorkspaces.some((w) => w.workspace_id === current.overrideWorkspaceId)
+            ? current.overrideWorkspaceId
+            : null;
+        const activeName =
+          writableWorkspaces.find((w) => w.workspace_id === activeOverride)?.name ??
+          "Chief of Staff";
+        return {
+          ok: true,
+          allowed: true,
+          duplicate: false,
+          dalton_user_id: binding.daltonUserId,
+          workspaces: writableWorkspaces,
+          current_workspace_id: activeOverride ?? HOME_WS_ID,
+          current_workspace_name: activeName,
+          home_workspace_id: HOME_WS_ID,
+          override_workspace_id: activeOverride,
+          is_home: activeOverride === null,
+          workspace_name: activeName,
+          command_effect_status: "done",
+          command_reply_pending: !req.is_internal_query,
+        };
+      }
+
+      if (req.cmd === "workspace_switch") {
+        if (req.target_kind === "home") {
+          current.overrideWorkspaceId = null;
+          current.generation += 1;
+          sessionState.set(sessionKey, current);
+          return {
+            ok: true,
+            allowed: true,
+            duplicate: false,
+            dalton_user_id: binding.daltonUserId,
+            workspace_id: HOME_WS_ID,
+            home_workspace_id: HOME_WS_ID,
+            override_workspace_id: null,
+            is_home: true,
+            workspace_name: "Chief of Staff",
+            generation: current.generation,
+            command_effect_status: "done",
+            command_reply_pending: true,
+          };
+        }
+        const target = allWorkspaces.find(
+          (w) =>
+            w.workspace_id === req.workspace_id ||
+            w.name.toLowerCase() === (req.workspace_query ?? "").toLowerCase(),
+        );
+        if (!target || !target.is_writable || binding.revokedWs?.has(target.workspace_id)) {
+          return {
+            ok: false,
+            allowed: false,
+            deny_reason: "workspace_write_denied",
+            duplicate: false,
+            dalton_user_id: binding.daltonUserId,
+            command_effect_status: "done",
+            command_reply_pending: true,
+          };
+        }
+        current.overrideWorkspaceId = target.workspace_id;
+        current.generation += 1;
+        sessionState.set(sessionKey, current);
+        return {
+          ok: true,
+          allowed: true,
+          duplicate: false,
+          dalton_user_id: binding.daltonUserId,
+          workspace_id: target.workspace_id,
+          home_workspace_id: HOME_WS_ID,
+          override_workspace_id: target.workspace_id,
+          is_home: false,
+          workspace_name: target.name,
+          generation: current.generation,
+          command_effect_status: "done",
+          command_reply_pending: true,
+        };
+      }
+
+      if (req.cmd === "new") {
+        current.generation += 1;
+        sessionState.set(sessionKey, current);
+        return {
+          ok: true,
+          allowed: true,
+          duplicate: false,
+          dalton_user_id: binding.daltonUserId,
+          generation: current.generation,
+          override_workspace_id: current.overrideWorkspaceId,
+          is_home: current.overrideWorkspaceId === null,
+          workspace_name:
+            writableWorkspaces.find((w) => w.workspace_id === current.overrideWorkspaceId)?.name ??
+            "Chief of Staff",
+          command_effect_status: "done",
+          command_reply_pending: true,
+        };
+      }
+
+      if (req.cmd === "stop") {
+        return {
+          ok: true,
+          allowed: true,
+          duplicate: false,
+          dalton_user_id: binding.daltonUserId,
+          thread_id: current.threadId,
+          run_id: current.runId,
+          command_effect_status: "pending_cancel",
+          command_reply_pending: true,
+        };
+      }
+
+      throw new Error(`Unsupported command: ${req.cmd}`);
+    });
+
+    const adapter = new DiscordChannelAdapter({
+      botToken: "bot-secret-token",
+      botUserId: BOT_ID,
+      applicationId: APP_ID,
+      rest,
+      fetchImpl: interactionFetch,
+      interactionHttpOptions: {
+        now: () => nowMs,
+      },
+    });
+    vi.spyOn(adapter, "start").mockResolvedValue(undefined);
+    vi.spyOn(adapter, "isConnected").mockReturnValue(true);
+
+    const app = createGatewayApp({
+      config: loadConfig({
+        GATEWAY_HOST: "127.0.0.1",
+        GATEWAY_PORT: "0",
+        INTERNAL_SERVICE_TOKEN: TEST_SERVICE_TOKEN,
+        DALTON_BACKEND_URL: "http://127.0.0.1:8000",
+        WEB_BASE_URL: "https://app.dalton.test",
+        DALTON_WEIXIN_CACHE_DIR: "/tmp/dalton-wx-native-test",
+        DALTON_DISCORD_ENABLED: "true",
+        DALTON_DISCORD_BOT_TOKEN: "bot-secret-token",
+        DALTON_DISCORD_APPLICATION_ID: APP_ID,
+      }),
+      backend,
+      adapters: new Map<ChannelPlatform, ChannelAdapter>([["discord", adapter]]),
+      nowFn: () => nowMs,
+    });
+
+    try {
+      await app.start();
+      await adapter.ensureApplicationIdentityVerified();
+
+      // 1. Verify initial callback (type=5, flags=64) fires BEFORE channel REST lookup / session queue / DB sessionCommand,
+      // including when a thread interaction payload omits `parent_id`!
+      await adapter.handleDispatch("INTERACTION_CREATE", {
+        id: "inter-alice-ws-1",
+        application_id: APP_ID,
+        type: DISCORD_INTERACTION_TYPE_APPLICATION_COMMAND,
+        token: "tok_alice_ws_1",
+        guild_id: GUILD_ID,
+        channel_id: CHANNEL_ID,
+        member: { user: { id: USER_ALICE, username: "alice" } },
+        data: {
+          id: "cmd-ws",
+          name: "workspace",
+          type: 1,
+          options: [{ name: "workspace", type: 3, value: WS_CHINA_UUID }],
+        },
+      });
+
+      expect(timeline.slice(0, 4)).toEqual([
+        "interaction:callback:type=5",
+        "rest:get_channel",
+        "backend:sessionCommand:workspace_switch:internal=false:ack=acknowledged",
+        "interaction:edit_original",
+      ]);
+
+      // Also verify a thread interaction whose payload has `type: 11` but omits `parent_id` defers BEFORE `rest:get_thread`!
+      timeline.length = 0;
+      await adapter.handleDispatch("INTERACTION_CREATE", {
+        id: "inter-alice-thread-missing-parent",
+        application_id: APP_ID,
+        type: DISCORD_INTERACTION_TYPE_APPLICATION_COMMAND,
+        token: "tok_alice_thread_mp",
+        guild_id: GUILD_ID,
+        channel_id: THREAD_ID,
+        channel: { id: THREAD_ID, type: 11, guild_id: GUILD_ID },
+        member: { user: { id: USER_ALICE, username: "alice" } },
+        data: { id: "cmd-new", name: "new", type: 1 },
+      });
+      expect(timeline).toEqual([
+        "interaction:callback:type=5",
+        "rest:get_thread",
+        "backend:sessionCommand:new:internal=false:ack=acknowledged",
+        "interaction:edit_original",
+      ]);
+
+      const firstCallback = interactionHttpLog[0]!;
+      expect(firstCallback.hasAuthHeader).toBe(false);
+      expect(firstCallback.body).toEqual({
+        type: 5,
+        data: { flags: DISCORD_EPHEMERAL_MESSAGE_FLAG },
+      });
+
+      const firstOriginalEdit = interactionHttpLog[1]!;
+      expect(firstOriginalEdit.hasAuthHeader).toBe(false);
+      expect(firstOriginalEdit.url).toContain(`/webhooks/${APP_ID}/tok_alice_ws_1/messages/@original`);
+      expect(firstOriginalEdit.body).toMatchObject({
+        flags: DISCORD_EPHEMERAL_MESSAGE_FLAG,
+        allowed_mentions: { parse: [] },
+      });
+      expect(String(firstOriginalEdit.body.content)).toContain("A股量化研究");
+      expect(publicChannelMessages).toHaveLength(0);
+
+      // 2. Two users in the same guild channel maintain independent workspace selection
+      await adapter.handleDispatch("INTERACTION_CREATE", {
+        id: "inter-bob-ws-list",
+        application_id: APP_ID,
+        type: DISCORD_INTERACTION_TYPE_APPLICATION_COMMAND,
+        token: "tok_bob_ws_list",
+        guild_id: GUILD_ID,
+        channel_id: CHANNEL_ID,
+        channel: { id: CHANNEL_ID, type: 0, guild_id: GUILD_ID },
+        member: { user: { id: USER_BOB, username: "bob" } },
+        data: { id: "cmd-ws", name: "workspace", type: 1 },
+      });
+      const bobListEdit = interactionHttpLog.at(-1)!;
+      expect(String(bobListEdit.body.content)).toContain("Current workspace: Home (Chief of Staff)");
+
+      // Alice's session in the same channel is still on A股量化研究
+      await adapter.handleDispatch("INTERACTION_CREATE", {
+        id: "inter-alice-ws-list",
+        application_id: APP_ID,
+        type: DISCORD_INTERACTION_TYPE_APPLICATION_COMMAND,
+        token: "tok_alice_ws_list",
+        guild_id: GUILD_ID,
+        channel_id: CHANNEL_ID,
+        channel: { id: CHANNEL_ID, type: 0, guild_id: GUILD_ID },
+        member: { user: { id: USER_ALICE, username: "alice" } },
+        data: { id: "cmd-ws", name: "workspace", type: 1 },
+      });
+      const aliceListEdit = interactionHttpLog.at(-1)!;
+      expect(String(aliceListEdit.body.content)).toContain(`Current workspace: \`A股量化研究\` (\`${WS_CHINA_UUID}\`)`);
+
+      // 3. Autocomplete (type=4 -> type=8): <= 25 choices, Chinese names, UUID values, omits message_id, no defer
+      await adapter.handleDispatch("INTERACTION_CREATE", {
+        id: "inter-alice-auto-all",
+        application_id: APP_ID,
+        type: DISCORD_INTERACTION_TYPE_APPLICATION_COMMAND_AUTOCOMPLETE,
+        token: "tok_alice_auto_1",
+        guild_id: GUILD_ID,
+        channel_id: CHANNEL_ID,
+        channel: { id: CHANNEL_ID, type: 0, guild_id: GUILD_ID },
+        member: { user: { id: USER_ALICE, username: "alice" } },
+        data: {
+          id: "cmd-ws",
+          name: "workspace",
+          type: 1,
+          options: [{ name: "workspace", type: 3, value: "", focused: true }],
+        },
+      });
+      const autoCallback = interactionHttpLog.at(-1)!;
+      expect(autoCallback.url).toContain("/interactions/inter-alice-auto-all/tok_alice_auto_1/callback");
+      expect(autoCallback.body.type).toBe(8);
+      const choices = (autoCallback.body.data as { choices: Array<{ name: string; value: string }> }).choices;
+      expect(choices.length).toBe(DISCORD_AUTOCOMPLETE_MAX_CHOICES);
+      expect(choices[0]).toEqual({
+        name: "A股量化研究",
+        value: WS_CHINA_UUID,
+      });
+      expect(choices.some((c) => c.value === WS_READONLY_UUID)).toBe(false);
+
+      const lastSessionCall = vi.mocked(backend.sessionCommand).mock.calls.at(-1)![0];
+      expect(lastSessionCall.is_internal_query).toBe(true);
+      expect(lastSessionCall.message_id).toBeUndefined();
+
+      // Autocomplete with Chinese query filter
+      await adapter.handleDispatch("INTERACTION_CREATE", {
+        id: "inter-alice-auto-cn",
+        application_id: APP_ID,
+        type: DISCORD_INTERACTION_TYPE_APPLICATION_COMMAND_AUTOCOMPLETE,
+        token: "tok_alice_auto_cn",
+        guild_id: GUILD_ID,
+        channel_id: CHANNEL_ID,
+        channel: { id: CHANNEL_ID, type: 0, guild_id: GUILD_ID },
+        member: { user: { id: USER_ALICE, username: "alice" } },
+        data: {
+          id: "cmd-ws",
+          name: "workspace",
+          type: 1,
+          options: [{ name: "workspace", type: 3, value: "宏观", focused: true }],
+        },
+      });
+      const cnChoices = (
+        interactionHttpLog.at(-1)!.body.data as { choices: Array<{ name: string; value: string }> }
+      ).choices;
+      expect(cnChoices).toEqual([{ name: "全球宏观对冲", value: WS_MACRO_UUID }]);
+
+      // Autocomplete for unlinked user returns empty choices without leaking workspace names
+      await adapter.handleDispatch("INTERACTION_CREATE", {
+        id: "inter-unlinked-auto",
+        application_id: APP_ID,
+        type: DISCORD_INTERACTION_TYPE_APPLICATION_COMMAND_AUTOCOMPLETE,
+        token: "tok_unlinked_auto",
+        guild_id: GUILD_ID,
+        channel_id: CHANNEL_ID,
+        channel: { id: CHANNEL_ID, type: 0, guild_id: GUILD_ID },
+        member: { user: { id: "999888777666", username: "stranger" } },
+        data: {
+          id: "cmd-ws",
+          name: "workspace",
+          type: 1,
+          options: [{ name: "workspace", type: 3, value: "", focused: true }],
+        },
+      });
+      expect(
+        (interactionHttpLog.at(-1)!.body.data as { choices: unknown[] }).choices,
+      ).toEqual([]);
+
+      // Autocomplete shared deadline: if channel lookup consumes the deadline budget, returns [] immediately without calling backend
+      const sessionCallsBeforeSlowAuto = vi.mocked(backend.sessionCommand).mock.calls.length;
+      unparentedThreadLatencyMs = 2_000;
+      await adapter.handleDispatch("INTERACTION_CREATE", {
+        id: "inter-slow-channel-auto",
+        application_id: APP_ID,
+        type: DISCORD_INTERACTION_TYPE_APPLICATION_COMMAND_AUTOCOMPLETE,
+        token: "tok_slow_auto",
+        guild_id: GUILD_ID,
+        channel_id: "700009999",
+        channel: { id: "700009999", type: 11, guild_id: GUILD_ID },
+        member: { user: { id: USER_ALICE, username: "alice" } },
+        data: {
+          id: "cmd-ws",
+          name: "workspace",
+          type: 1,
+          options: [{ name: "workspace", type: 3, value: "", focused: true }],
+        },
+      });
+      unparentedThreadLatencyMs = 0;
+      expect(vi.mocked(backend.sessionCommand).mock.calls.length).toBe(sessionCallsBeforeSlowAuto);
+
+      // 4. Revoked workspace write permission returns private denial and scrubs revoked workspace from list
+      userBindings.get(USER_ALICE)!.revokedWs!.add(WS_CHINA_UUID);
+      await adapter.handleDispatch("INTERACTION_CREATE", {
+        id: "inter-alice-revoked-switch",
+        application_id: APP_ID,
+        type: DISCORD_INTERACTION_TYPE_APPLICATION_COMMAND,
+        token: "tok_alice_revoked",
+        guild_id: GUILD_ID,
+        channel_id: CHANNEL_ID,
+        channel: { id: CHANNEL_ID, type: 0, guild_id: GUILD_ID },
+        member: { user: { id: USER_ALICE, username: "alice" } },
+        data: {
+          id: "cmd-ws",
+          name: "workspace",
+          type: 1,
+          options: [{ name: "workspace", type: 3, value: WS_CHINA_UUID }],
+        },
+      });
+      const revokedEdit = interactionHttpLog.at(-1)!;
+      expect(String(revokedEdit.body.content)).toContain("write access");
+      expect(String(revokedEdit.body.content)).not.toContain("A股量化研究");
+
+      // 5. Native /stop cancels active turn and responds privately via @original
+      await adapter.handleDispatch("INTERACTION_CREATE", {
+        id: "inter-alice-stop",
+        application_id: APP_ID,
+        type: DISCORD_INTERACTION_TYPE_APPLICATION_COMMAND,
+        token: "tok_alice_stop",
+        guild_id: GUILD_ID,
+        channel_id: THREAD_ID,
+        channel: { id: THREAD_ID, type: 11, guild_id: GUILD_ID, parent_id: CHANNEL_ID },
+        member: { user: { id: USER_ALICE, username: "alice" } },
+        data: { id: "cmd-stop", name: "stop", type: 1 },
+      });
+      expect(backend.cancelThreadTurn).toHaveBeenCalledWith(
+        DALTON_ALICE,
+        ACTIVE_THREAD_ID,
+        ACTIVE_RUN_ID,
+      );
+      const stopEdit = interactionHttpLog.at(-1)!;
+      expect(String(stopEdit.body.content)).toContain("Stopped the current run.");
+      expect(publicChannelMessages).toHaveLength(0);
+
+      // 6. Initial callback unknown (500) or failed (400) records not_executed without executing command or sending @original
+      const bobGenBefore = sessionState.get(`${DALTON_BOB}::chat:${GUILD_ID}/${CHANNEL_ID}`)?.generation ?? 0;
+      nextAckMode = "unknown_500";
+      await adapter.handleDispatch("INTERACTION_CREATE", {
+        id: "inter-bob-ack-unknown",
+        application_id: APP_ID,
+        type: DISCORD_INTERACTION_TYPE_APPLICATION_COMMAND,
+        token: "tok_bob_ack_unknown",
+        guild_id: GUILD_ID,
+        channel_id: CHANNEL_ID,
+        channel: { id: CHANNEL_ID, type: 0, guild_id: GUILD_ID },
+        member: { user: { id: USER_BOB, username: "bob" } },
+        data: { id: "cmd-new", name: "new", type: 1 },
+      });
+      const bobGenAfter = sessionState.get(`${DALTON_BOB}::chat:${GUILD_ID}/${CHANNEL_ID}`)?.generation ?? 0;
+      expect(bobGenAfter).toBe(bobGenBefore);
+      expect(
+        interactionHttpLog.some((c) => c.url.includes("tok_bob_ack_unknown") && c.url.endsWith("/messages/@original")),
+      ).toBe(false);
+
+      // Duplicate delivery of the same unknown-ack interaction does NOT repeat the callback or execute
+      const callbackCountBeforeDup = interactionHttpLog.filter((c) =>
+        c.url.includes("inter-bob-ack-unknown"),
+      ).length;
+      await adapter.handleDispatch("INTERACTION_CREATE", {
+        id: "inter-bob-ack-unknown",
+        application_id: APP_ID,
+        type: DISCORD_INTERACTION_TYPE_APPLICATION_COMMAND,
+        token: "tok_bob_ack_unknown",
+        guild_id: GUILD_ID,
+        channel_id: CHANNEL_ID,
+        channel: { id: CHANNEL_ID, type: 0, guild_id: GUILD_ID },
+        member: { user: { id: USER_BOB, username: "bob" } },
+        data: { id: "cmd-new", name: "new", type: 1 },
+      });
+      const callbackCountAfterDup = interactionHttpLog.filter((c) =>
+        c.url.includes("inter-bob-ack-unknown"),
+      ).length;
+      expect(callbackCountAfterDup).toBe(callbackCountBeforeDup);
+
+      // Concurrent duplicate dispatch of the same interactionId shares in-flight callback (only 1 POST /callback)
+      const dupPayload = {
+        id: "inter-bob-concurrent-dup",
+        application_id: APP_ID,
+        type: DISCORD_INTERACTION_TYPE_APPLICATION_COMMAND,
+        token: "tok_bob_concurrent_dup",
+        guild_id: GUILD_ID,
+        channel_id: CHANNEL_ID,
+        channel: { id: CHANNEL_ID, type: 0, guild_id: GUILD_ID },
+        member: { user: { id: USER_BOB, username: "bob" } },
+        data: { id: "cmd-main", name: "main", type: 1 },
+      };
+      await Promise.all([
+        adapter.handleDispatch("INTERACTION_CREATE", dupPayload),
+        adapter.handleDispatch("INTERACTION_CREATE", dupPayload),
+      ]);
+      const concurrentCallbackCalls = interactionHttpLog.filter(
+        (c) => c.url.includes("inter-bob-concurrent-dup") && c.url.endsWith("/callback"),
+      );
+      expect(concurrentCallbackCalls).toHaveLength(1);
+
+      // 7. Token expiry (> 15m or 10015 Unknown Webhook) marks command_reply_pending=false ("expired") and never sends public message
+      nextEditMode = "expired_10015";
+      await adapter.handleDispatch("INTERACTION_CREATE", {
+        id: "inter-bob-expired-token",
+        application_id: APP_ID,
+        type: DISCORD_INTERACTION_TYPE_APPLICATION_COMMAND,
+        token: "tok_bob_expired",
+        guild_id: GUILD_ID,
+        channel_id: CHANNEL_ID,
+        channel: { id: CHANNEL_ID, type: 0, guild_id: GUILD_ID },
+        member: { user: { id: USER_BOB, username: "bob" } },
+        data: { id: "cmd-main", name: "main", type: 1 },
+      });
+      const expiredProgress = backend.progressUpdates.find(
+        (u) => u.message_id === "inter-bob-expired-token",
+      );
+      expect(expiredProgress).toMatchObject({
+        platform: "discord",
+        message_id: "inter-bob-expired-token",
+        command_reply_pending: false,
+        raw_payload_patch: {
+          native_interaction: true,
+          native_reply_status: "expired",
+        },
+      });
+      expect(publicChannelMessages).toHaveLength(0);
+
+      // Also test local 15-minute TTL check before HTTP call
+      const ttlClient = new DiscordInteractionHttpClient({
+        now: () => nowMs + DISCORD_INTERACTION_TOKEN_TTL_MS + 1000,
+        fetchImpl: async () => {
+          throw new Error("Should not call fetch when 15-minute interaction token TTL has elapsed");
+        },
+      });
+      const ttlEditRes = await ttlClient.editOriginalEphemeralResponse({
+        applicationId: APP_ID,
+        interactionId: "inter-ttl-expired",
+        interactionToken: "tok_ttl_expired",
+        expiresAtMs: nowMs + DISCORD_INTERACTION_TOKEN_TTL_MS,
+        content: "Private reply",
+      });
+      expect(ttlEditRes.outcome).toBe("expired");
+
+      // 8. Startup recovery recognizes pending native interaction rows, closes them out with abandoned_on_restart, and NEVER calls public sendMessageDiscord
+      vi.spyOn(backend, "recoverState").mockResolvedValueOnce({
+        inbound_events: [
+          {
+            platform: "discord",
+            message_id: "inter-recover-native-1",
+            request_key: makeInboundRequestKey("discord", "inter-recover-native-1"),
+            event_kind: "command",
+            dalton_user_id: DALTON_ALICE,
+            chat_type: "group",
+            chat_address: `discord:${GUILD_ID}/${CHANNEL_ID}`,
+            thread_scope_key: `chat:${GUILD_ID}/${CHANNEL_ID}`,
+            status: "completed",
+            run_id: null,
+            thread_id: null,
+            command_effect_status: "done",
+            command_reply_pending: true,
+            fallback_pending: false,
+            command_request: {
+              cmd: "workspace_switch",
+              platform: "discord",
+              platform_user_id: USER_ALICE,
+              chat_type: "group",
+              chat_address: `discord:${GUILD_ID}/${CHANNEL_ID}`,
+              chat_id: `${GUILD_ID}/${CHANNEL_ID}`,
+              scope_key: `chat:${GUILD_ID}/${CHANNEL_ID}`,
+              message_id: "inter-recover-native-1",
+              request_key: makeInboundRequestKey("discord", "inter-recover-native-1"),
+              target_kind: "home",
+              workspace_query: "home",
+              native_interaction: true,
+              native_ack_status: "acknowledged",
+            },
+            command_result: {
+              ok: true,
+              allowed: true,
+              is_home: true,
+              workspace_name: "Chief of Staff",
+              generation: 2,
+              command_effect_status: "done",
+              command_reply_pending: true,
+            },
+            raw_payload: {
+              native_interaction: true,
+              native_ack_status: "acknowledged",
+              native_reply_status: "pending",
+              platform_user_id: USER_ALICE,
+              chat_id: `${GUILD_ID}/${CHANNEL_ID}`,
+              discord_interaction: {
+                id: "inter-recover-native-1",
+                application_id: APP_ID,
+                type: 2,
+                command_name: "main",
+              },
+            },
+          },
+        ],
+        background_runs: [],
+        thread_watches: [],
+        automation_runs: [],
+      });
+
+      await app.orchestrator.runStartupRecovery();
+      const recoveryProgress = backend.progressUpdates.find(
+        (u) => u.message_id === "inter-recover-native-1",
+      );
+      expect(recoveryProgress).toMatchObject({
+        platform: "discord",
+        message_id: "inter-recover-native-1",
+        status: "completed",
+        command_reply_pending: false,
+        raw_payload_patch: {
+          native_interaction: true,
+          native_reply_status: "abandoned_on_restart",
+        },
+      });
+      expect(publicChannelMessages).toHaveLength(0);
+    } finally {
+      await app.stop();
+    }
+  });
+});
+
+

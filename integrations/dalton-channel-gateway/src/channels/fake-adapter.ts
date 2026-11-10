@@ -3,6 +3,7 @@ import type {
   ChannelPlatform,
   InboundAttachmentDescriptor,
   InboundChannelEvent,
+  NativeInteractionEvent,
 } from "../types.js";
 import {
   type AvailableChatsResult,
@@ -44,6 +45,9 @@ export class FakeChannelAdapter implements ChannelAdapter {
   readonly sentFiles: FakeSentFileRecord[] = [];
 
   private inboundHandler: ((event: InboundChannelEvent) => Promise<void>) | null = null;
+  private nativeInteractionHandler:
+    | ((event: NativeInteractionEvent) => Promise<void>)
+    | null = null;
   private msgCounter = 0;
 
   private readonly attachments = new Map<string, DownloadedAttachment>();
@@ -109,12 +113,28 @@ export class FakeChannelAdapter implements ChannelAdapter {
     this.inboundHandler = handler;
   }
 
+  onNativeInteraction(
+    handler: (event: NativeInteractionEvent) => Promise<void>,
+  ): void {
+    this.nativeInteractionHandler = handler;
+  }
+
   /** Emit a simulated inbound message into the gateway orchestrator. */
   async emitInbound(event: InboundChannelEvent): Promise<void> {
     if (!this.inboundHandler) {
       throw new Error(`No inbound handler registered on FakeChannelAdapter(${this.platform})`);
     }
     await this.inboundHandler(event);
+  }
+
+  /** Emit a simulated native interaction into the gateway orchestrator. */
+  async emitNativeInteraction(event: NativeInteractionEvent): Promise<void> {
+    if (!this.nativeInteractionHandler) {
+      throw new Error(
+        `No native interaction handler registered on FakeChannelAdapter(${this.platform})`,
+      );
+    }
+    await this.nativeInteractionHandler(event);
   }
 
   setAttachment(id: string, attachment: DownloadedAttachment): void {

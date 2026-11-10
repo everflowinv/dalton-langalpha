@@ -5973,3 +5973,1109 @@ def test_discord_thread_current_conversation_delivery_claim_and_recovery(
     assert rec_bg_list[0]["run_id"] == bg_rid
     assert rec_bg_list[0]["scope_key"] == thread_scope_key
     assert rec_bg_list[0]["thread_scope_key"] == thread_scope_key
+
+
+def test_discord_native_interactions_session_command_and_recovery_unit(channel_test_env):
+    """Covers Discord native interactions (INTERACTION_CREATE) backend contract:
+    1. Shared `(platform='discord', scope_key, dalton_user_id)` session state across native and text commands in DM (`dm:<user>`), guild channel (`chat:<guild>/<channel>`), and guild subthread (`chat:<guild>/<parent>:thread:<thread>`), plus two users (`u-alice`, `u-bob`) independently selecting workspaces in the same channel;
+    2. Unexecuted native interactions (`native_ack_status in ('unknown', 'failed')`) record `not_executed=True`, `command_effect_status='done'`, `command_reply_pending=False` without touching session generations or activity timestamps, and remain `not_executed=True` on duplicate replay;
+    3. Read-only autocomplete (`is_internal_query=True`, omitted `message_id`) returns writable Chinese/UUID workspaces with zero session creation and zero activity timestamp update;
+    4. Unlinked user, external group member, and revoked workspace write permission return `allowed=False` with `command_reply_pending=True` on acknowledged native commands and scrub revoked workspace names from `workspace_list` and duplicate/recovery re-verification;
+    5. 6-hour inactivity rule resets to Chief of Staff after 6h without activity, while autocomplete, denials, duplicates, and progress updates do not extend `last_conversation_activity_at`;
+    6. Interaction and bot tokens are scrubbed from `raw_payload` and `raw_payload_patch`, and closing out `command_reply_pending=False` (`native_reply_status='abandoned_on_restart'`) removes the row from startup recovery.
+    """
+    client = channel_test_env["client"]
+    store: InMemoryChannelStore = channel_test_env["store"]
+    headers = channel_test_env["headers"]
+
+    ws_cn = str(uuid4())
+    ws_macro = str(uuid4())
+    store.workspaces[ws_cn] = {
+        "workspace_id": UUID(ws_cn),
+        "user_id": "u-alice",
+        "name": "A股量化研究",
+        "status": "running",
+    }
+    store.workspaces[ws_macro] = {
+        "workspace_id": UUID(ws_macro),
+        "user_id": "u-bob",
+        "name": "全球宏观对冲",
+        "status": "running",
+    }
+    channel_test_env["writable_by_user"]["u-alice"] = {
+        ws_cn: "A股量化研究",
+        ws_macro: "全球宏观对冲",
+    }
+    channel_test_env["writable_by_user"]["u-bob"] = {
+        ws_cn: "A股量化研究",
+        ws_macro: "全球宏观对冲",
+    }
+    channel_test_env["tiers"]["u-alice"] = "internal"
+    channel_test_env["tiers"]["u-bob"] = "internal"
+
+    guild_id = "932170193180958741"
+    channel_id = "1481256083589697566"
+    subthread_id = "1481256083589699999"
+    guild_chat_id = f"{guild_id}/{channel_id}"
+    guild_addr = f"discord:{guild_chat_id}"
+    guild_scope = f"chat:{guild_chat_id}"
+    thread_scope = f"chat:{guild_chat_id}:thread:{subthread_id}"
+    dm_scope_alice = "dm:dc_alice"
+
+    # Bind dc_alice -> u-alice and dc_bob -> u-bob
+    for uid, pid in [("u-alice", "dc_alice"), ("u-bob", "dc_bob")]:
+        channel_test_env["current_web_user"]["user_id"] = uid
+        code_res = client.post(
+            "/api/v1/dalton/channels/bind-codes",
+            json={"platform": "discord"},
+        )
+        assert code_res.status_code == 200
+        consume_res = client.post(
+            "/api/v1/dalton/channels/internal/bind-code/consume",
+            headers=headers,
+            json={
+                "action": "bind",
+                "platform": "discord",
+                "platform_user_id": pid,
+                "code": code_res.json()["code"],
+                "is_group": False,
+            },
+        )
+        assert consume_res.status_code == 200
+        assert consume_res.json()["ok"] is True
+    channel_test_env["current_web_user"]["user_id"] = "u-alice"
+
+    # 1. Autocomplete (`is_internal_query=True`, omitted `message_id`) before any session exists -> zero session row created
+    auto_res = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_list",
+            "platform": "discord",
+            "platform_user_id": "dc_alice",
+            "chat_type": "group",
+            "chat_address": guild_addr,
+            "chat_id": guild_chat_id,
+            "scope_key": guild_scope,
+            "is_internal_query": True,
+            "native_interaction": True,
+        },
+    )
+    assert auto_res.status_code == 200
+    auto_body = auto_res.json()
+    assert auto_body["ok"] is True
+    assert auto_body["allowed"] is True
+    assert auto_body["command_reply_pending"] is False
+    assert {w["name"] for w in auto_body["workspaces"]} == {"A股量化研究", "全球宏观对冲"}
+    assert ("discord", guild_scope, "u-alice") not in store.session_generations
+
+    # 2. Unknown initial callback (`native_ack_status="unknown"`) records `not_executed=True` and creates NO session row
+    unk_mid = "inter_ack_unknown_1"
+    unk_rkey = str(uuid5(DALTON_CHANNEL_NAMESPACE, f"discord:{unk_mid}"))
+    unk_res = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_switch",
+            "platform": "discord",
+            "platform_user_id": "dc_alice",
+            "chat_type": "group",
+            "chat_address": guild_addr,
+            "chat_id": guild_chat_id,
+            "scope_key": guild_scope,
+            "message_id": unk_mid,
+            "request_key": unk_rkey,
+            "target_kind": "workspace_id",
+            "workspace_id": ws_cn,
+            "workspace_query": ws_cn,
+            "native_interaction": True,
+            "native_ack_status": "unknown",
+            "raw_payload": {
+                "native_interaction": True,
+                "token": "SHOULD_BE_SCRUBBED_1",
+                "discord_interaction": {
+                    "id": unk_mid,
+                    "token": "SHOULD_BE_SCRUBBED_2",
+                    "interaction_token": "SHOULD_BE_SCRUBBED_3",
+                },
+            },
+        },
+    )
+    assert unk_res.status_code == 200
+    unk_body = unk_res.json()
+    assert unk_body["ok"] is False
+    assert unk_body["not_executed"] is True
+    assert unk_body["command_reply_pending"] is False
+    assert ("discord", guild_scope, "u-alice") not in store.session_generations
+    stored_unk_raw = store.inbound_events[("discord", unk_mid)]["raw_payload"]
+    assert "SHOULD_BE_SCRUBBED" not in str(stored_unk_raw)
+    assert stored_unk_raw["native_ack_status"] == "unknown"
+    assert stored_unk_raw["native_reply_status"] == "not_applicable"
+
+    # Duplicate replay of the unknown-ack interaction still returns not_executed=True without executing
+    unk_dup = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_switch",
+            "platform": "discord",
+            "platform_user_id": "dc_alice",
+            "chat_type": "group",
+            "chat_address": guild_addr,
+            "chat_id": guild_chat_id,
+            "scope_key": guild_scope,
+            "message_id": unk_mid,
+            "request_key": unk_rkey,
+            "target_kind": "workspace_id",
+            "workspace_id": ws_cn,
+            "workspace_query": ws_cn,
+            "native_interaction": True,
+            "native_ack_status": "acknowledged",
+        },
+    )
+    assert unk_dup.status_code == 200
+    assert unk_dup.json()["duplicate"] is True
+    assert unk_dup.json()["not_executed"] is True
+    assert ("discord", guild_scope, "u-alice") not in store.session_generations
+
+    # 3. Two users (`dc_alice` and `dc_bob`) independently select workspaces in the same guild channel, sharing state with text commands
+    alice_sw_mid = "inter_alice_sw_cn"
+    alice_sw_res = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_switch",
+            "platform": "discord",
+            "platform_user_id": "dc_alice",
+            "chat_type": "group",
+            "chat_address": guild_addr,
+            "chat_id": guild_chat_id,
+            "scope_key": guild_scope,
+            "message_id": alice_sw_mid,
+            "request_key": str(uuid5(DALTON_CHANNEL_NAMESPACE, f"discord:{alice_sw_mid}")),
+            "target_kind": "workspace_id",
+            "workspace_id": ws_cn,
+            "workspace_query": ws_cn,
+            "native_interaction": True,
+            "native_ack_status": "acknowledged",
+            "raw_payload": {"native_interaction": True},
+        },
+    )
+    assert alice_sw_res.status_code == 200
+    assert alice_sw_res.json()["ok"] is True
+    assert alice_sw_res.json()["workspace_id"] == ws_cn
+    assert alice_sw_res.json()["workspace_name"] == "A股量化研究"
+    assert alice_sw_res.json()["command_reply_pending"] is True
+
+    bob_sw_mid = "inter_bob_sw_macro"
+    bob_sw_res = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_switch",
+            "platform": "discord",
+            "platform_user_id": "dc_bob",
+            "chat_type": "group",
+            "chat_address": guild_addr,
+            "chat_id": guild_chat_id,
+            "scope_key": guild_scope,
+            "message_id": bob_sw_mid,
+            "request_key": str(uuid5(DALTON_CHANNEL_NAMESPACE, f"discord:{bob_sw_mid}")),
+            "target_kind": "exact_name",
+            "workspace_query": "全球宏观对冲",
+            "native_interaction": True,
+            "native_ack_status": "acknowledged",
+            "raw_payload": {"native_interaction": True},
+        },
+    )
+    assert bob_sw_res.status_code == 200
+    assert bob_sw_res.json()["ok"] is True
+    assert bob_sw_res.json()["workspace_id"] == ws_macro
+    assert bob_sw_res.json()["workspace_name"] == "全球宏观对冲"
+
+    # Text command `/new` from Alice in the same guild channel sees Alice's native workspace (`ws_cn`) and advances generation
+    alice_text_new_mid = "msg_alice_text_new_1"
+    alice_text_new = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "new",
+            "platform": "discord",
+            "platform_user_id": "dc_alice",
+            "chat_type": "group",
+            "chat_address": guild_addr,
+            "chat_id": guild_chat_id,
+            "scope_key": guild_scope,
+            "message_id": alice_text_new_mid,
+            "request_key": str(uuid5(DALTON_CHANNEL_NAMESPACE, f"discord:{alice_text_new_mid}")),
+        },
+    )
+    assert alice_text_new.status_code == 200
+    assert alice_text_new.json()["ok"] is True
+    assert alice_text_new.json()["override_workspace_id"] == ws_cn
+    assert alice_text_new.json()["workspace_name"] == "A股量化研究"
+    assert alice_text_new.json()["generation"] == 2
+
+    # Subthread scope (`chat:<guild>/<parent>:thread:<thread>`) and DM scope (`dm:dc_alice`) are isolated from parent guild channel scope
+    alice_thread_mid = "inter_alice_subthread_list"
+    alice_thread_list = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_list",
+            "platform": "discord",
+            "platform_user_id": "dc_alice",
+            "chat_type": "group",
+            "chat_address": guild_addr,
+            "chat_id": guild_chat_id,
+            "scope_key": thread_scope,
+            "message_id": alice_thread_mid,
+            "request_key": str(uuid5(DALTON_CHANNEL_NAMESPACE, f"discord:{alice_thread_mid}")),
+            "native_interaction": True,
+            "native_ack_status": "acknowledged",
+        },
+    )
+    assert alice_thread_list.status_code == 200
+    assert alice_thread_list.json()["is_home"] is True
+    assert alice_thread_list.json()["current_workspace_name"] == "Chief of Staff"
+
+    alice_dm_mid = "inter_alice_dm_main"
+    alice_dm_main = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_switch",
+            "platform": "discord",
+            "platform_user_id": "dc_alice",
+            "chat_type": "dm",
+            "chat_address": "discord:@me",
+            "chat_id": "@me",
+            "scope_key": dm_scope_alice,
+            "message_id": alice_dm_mid,
+            "request_key": str(uuid5(DALTON_CHANNEL_NAMESPACE, f"discord:{alice_dm_mid}")),
+            "target_kind": "home",
+            "workspace_query": "home",
+            "native_interaction": True,
+            "native_ack_status": "acknowledged",
+        },
+    )
+    assert alice_dm_main.status_code == 200
+    assert alice_dm_main.json()["ok"] is True
+    assert alice_dm_main.json()["is_home"] is True
+
+    # 4. Revoking Alice's write access to `ws_cn` scrubs `ws_cn` from `workspace_list` (both internal autocomplete and normal) and denies duplicate replay
+    channel_test_env["writable_by_user"]["u-alice"] = {ws_macro: "全球宏观对冲"}
+    auto_after_revoke = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_list",
+            "platform": "discord",
+            "platform_user_id": "dc_alice",
+            "chat_type": "group",
+            "chat_address": guild_addr,
+            "chat_id": guild_chat_id,
+            "scope_key": guild_scope,
+            "is_internal_query": True,
+            "native_interaction": True,
+        },
+    )
+    assert auto_after_revoke.status_code == 200
+    assert [w["name"] for w in auto_after_revoke.json()["workspaces"]] == ["全球宏观对冲"]
+    assert auto_after_revoke.json()["is_home"] is True
+    assert auto_after_revoke.json()["current_workspace_name"] == "Chief of Staff"
+
+    dup_after_revoke = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_switch",
+            "platform": "discord",
+            "platform_user_id": "dc_alice",
+            "chat_type": "group",
+            "chat_address": guild_addr,
+            "chat_id": guild_chat_id,
+            "scope_key": guild_scope,
+            "message_id": alice_sw_mid,
+            "request_key": str(uuid5(DALTON_CHANNEL_NAMESPACE, f"discord:{alice_sw_mid}")),
+            "target_kind": "workspace_id",
+            "workspace_id": ws_cn,
+            "workspace_query": ws_cn,
+            "native_interaction": True,
+            "native_ack_status": "acknowledged",
+        },
+    )
+    assert dup_after_revoke.status_code == 200
+    assert dup_after_revoke.json()["allowed"] is False
+    assert dup_after_revoke.json()["deny_reason"] == "workspace_write_denied"
+    assert dup_after_revoke.json().get("workspace_name") is None
+
+    # 4b. `workspace_ambiguous` candidate visibility re-filtering on replay (revoke one vs revoke all) without auto-selecting
+    ws_amb_1 = str(uuid4())
+    ws_amb_2 = str(uuid4())
+    store.workspaces[ws_amb_1] = {
+        "workspace_id": UUID(ws_amb_1),
+        "user_id": "u-alice",
+        "name": "量化研究",
+        "status": "running",
+    }
+    store.workspaces[ws_amb_2] = {
+        "workspace_id": UUID(ws_amb_2),
+        "user_id": "u-bob",
+        "name": "量化研究",
+        "status": "running",
+    }
+    channel_test_env["writable_by_user"]["u-alice"] = {
+        ws_macro: "全球宏观对冲",
+        ws_amb_1: "量化研究",
+        ws_amb_2: "量化研究",
+    }
+    amb_mid = "inter_alice_ambiguous_1"
+    amb_rkey = str(uuid5(DALTON_CHANNEL_NAMESPACE, f"discord:{amb_mid}"))
+    amb_res = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_switch",
+            "platform": "discord",
+            "platform_user_id": "dc_alice",
+            "chat_type": "group",
+            "chat_address": guild_addr,
+            "chat_id": guild_chat_id,
+            "scope_key": guild_scope,
+            "message_id": amb_mid,
+            "request_key": amb_rkey,
+            "target_kind": "exact_name",
+            "workspace_query": "量化研究",
+            "native_interaction": True,
+            "native_ack_status": "acknowledged",
+        },
+    )
+    assert amb_res.status_code == 200
+    assert amb_res.json()["ok"] is False
+    assert amb_res.json()["deny_reason"] == "workspace_ambiguous"
+    assert {c["workspace_id"] for c in amb_res.json()["candidates"]} == {ws_amb_1, ws_amb_2}
+
+    # Revoke one candidate (`ws_amb_2`) and rename `ws_amb_1`: replay removes `ws_amb_2`, updates live name of `ws_amb_1`, and does NOT auto-select `ws_amb_1`
+    store.workspaces[ws_amb_1]["name"] = "量化研究-主仓"
+    channel_test_env["writable_by_user"]["u-alice"] = {
+        ws_macro: "全球宏观对冲",
+        ws_amb_1: "量化研究-主仓",
+    }
+    amb_replay_1 = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_switch",
+            "platform": "discord",
+            "platform_user_id": "dc_alice",
+            "chat_type": "group",
+            "chat_address": guild_addr,
+            "chat_id": guild_chat_id,
+            "scope_key": guild_scope,
+            "message_id": amb_mid,
+            "request_key": amb_rkey,
+            "target_kind": "exact_name",
+            "workspace_query": "量化研究",
+            "native_interaction": True,
+            "native_ack_status": "acknowledged",
+        },
+    )
+    assert amb_replay_1.status_code == 200
+    assert amb_replay_1.json()["duplicate"] is True
+    assert amb_replay_1.json()["ok"] is False
+    assert amb_replay_1.json()["deny_reason"] == "workspace_ambiguous"
+    assert amb_replay_1.json()["candidates"] == [
+        {"workspace_id": ws_amb_1, "name": "量化研究-主仓"}
+    ]
+
+    # Revoke all candidates (`ws_amb_1` and `ws_amb_2`): replay returns `candidates=[]` and `deny_reason="workspace_write_denied"`
+    channel_test_env["writable_by_user"]["u-alice"] = {ws_macro: "全球宏观对冲"}
+    amb_replay_all_revoked = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_switch",
+            "platform": "discord",
+            "platform_user_id": "dc_alice",
+            "chat_type": "group",
+            "chat_address": guild_addr,
+            "chat_id": guild_chat_id,
+            "scope_key": guild_scope,
+            "message_id": amb_mid,
+            "request_key": amb_rkey,
+            "target_kind": "exact_name",
+            "workspace_query": "量化研究",
+            "native_interaction": True,
+            "native_ack_status": "acknowledged",
+        },
+    )
+    assert amb_replay_all_revoked.status_code == 200
+    assert amb_replay_all_revoked.json()["duplicate"] is True
+    assert amb_replay_all_revoked.json()["ok"] is False
+    assert amb_replay_all_revoked.json()["deny_reason"] == "workspace_write_denied"
+    assert amb_replay_all_revoked.json()["candidates"] == []
+    assert "量化研究" not in str(amb_replay_all_revoked.json())
+
+    # Unlinked user native command gets `not_linked` with `command_reply_pending=True` so private ephemeral denial is delivered
+    unlinked_mid = "inter_stranger_1"
+    unlinked_res = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_list",
+            "platform": "discord",
+            "platform_user_id": "dc_stranger",
+            "chat_type": "group",
+            "chat_address": guild_addr,
+            "chat_id": guild_chat_id,
+            "scope_key": guild_scope,
+            "message_id": unlinked_mid,
+            "request_key": str(uuid5(DALTON_CHANNEL_NAMESPACE, f"discord:{unlinked_mid}")),
+            "native_interaction": True,
+            "native_ack_status": "acknowledged",
+        },
+    )
+    assert unlinked_res.status_code == 200
+    assert unlinked_res.json()["allowed"] is False
+    assert unlinked_res.json()["deny_reason"] == "not_linked"
+    assert unlinked_res.json()["command_reply_pending"] is True
+
+    # 5. 6-hour inactivity rule: autocomplete, denials, and duplicates do NOT extend `last_conversation_activity_at`; after >6h, `/new` resets to Chief of Staff
+    bob_sess_key = ("discord", guild_scope, "u-bob")
+    expired_ts = datetime.now(timezone.utc) - timedelta(hours=6, minutes=5)
+    store.session_generations[bob_sess_key]["last_conversation_activity_at"] = expired_ts
+
+    # Autocomplete does not touch `last_conversation_activity_at`
+    client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "workspace_list",
+            "platform": "discord",
+            "platform_user_id": "dc_bob",
+            "chat_type": "group",
+            "chat_address": guild_addr,
+            "chat_id": guild_chat_id,
+            "scope_key": guild_scope,
+            "is_internal_query": True,
+            "native_interaction": True,
+        },
+    )
+    assert store.session_generations[bob_sess_key]["last_conversation_activity_at"] == expired_ts
+
+    # Next `/new` after >6h resets Bob's session to Chief of Staff (`override_workspace_id=None`)
+    bob_new_after_6h_mid = "inter_bob_new_after_6h"
+    bob_new_res = client.post(
+        "/api/v1/dalton/channels/internal/session/command",
+        headers=headers,
+        json={
+            "cmd": "new",
+            "platform": "discord",
+            "platform_user_id": "dc_bob",
+            "chat_type": "group",
+            "chat_address": guild_addr,
+            "chat_id": guild_chat_id,
+            "scope_key": guild_scope,
+            "message_id": bob_new_after_6h_mid,
+            "request_key": str(uuid5(DALTON_CHANNEL_NAMESPACE, f"discord:{bob_new_after_6h_mid}")),
+            "native_interaction": True,
+            "native_ack_status": "acknowledged",
+        },
+    )
+    assert bob_new_res.status_code == 200
+    assert bob_new_res.json()["ok"] is True
+    assert bob_new_res.json()["is_home"] is True
+    assert bob_new_res.json()["override_workspace_id"] is None
+    assert bob_new_res.json()["workspace_name"] == "Chief of Staff"
+    assert store.session_generations[bob_sess_key]["last_conversation_activity_at"] > expired_ts
+
+    # 6. Startup recovery & `inbound/progress` token scrubbing: closing out `command_reply_pending=False` with `abandoned_on_restart` removes the row from `/recover`
+    prog_res = client.post(
+        "/api/v1/dalton/channels/internal/inbound/progress",
+        headers=headers,
+        json={
+            "platform": "discord",
+            "message_id": bob_new_after_6h_mid,
+            "status": "completed",
+            "command_effect_status": "done",
+            "command_reply_pending": False,
+            "raw_payload_patch": {
+                "native_interaction": True,
+                "native_reply_status": "abandoned_on_restart",
+                "token": "PATCH_SECRET_TOKEN_999",
+            },
+        },
+    )
+    assert prog_res.status_code == 200
+    patched_raw = store.inbound_events[("discord", bob_new_after_6h_mid)]["raw_payload"]
+    assert "PATCH_SECRET_TOKEN_999" not in str(patched_raw)
+    assert patched_raw["native_reply_status"] == "abandoned_on_restart"
+
+    rec_startup = client.get(
+        "/api/v1/dalton/channels/internal/recover",
+        headers=headers,
+        params={"mode": "startup"},
+    )
+    assert rec_startup.status_code == 200
+    recovered_mids = {row["message_id"] for row in rec_startup.json()["inbound_events"]}
+    assert bob_new_after_6h_mid not in recovered_mids
+    assert unk_mid not in recovered_mids
+
+
+@pytest.mark.asyncio
+async def test_discord_native_interactions_real_postgres_concurrency_and_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real PostgreSQL test exercising actual Alembic migrations, two concurrent connections,
+    row locking (`ON CONFLICT (platform, message_id)` / `SELECT ... FOR UPDATE`), and real SQL for:
+    1) Concurrent same-interaction `/new` across two connections advancing `generation` only once;
+    2) Uncertain/failed ACK (`native_ack_status in ('unknown', 'failed')`) producing zero session/activity changes and blocking later replay;
+    3) Duplicate replay producing zero `last_conversation_activity_at` changes;
+    4) 6-hour inactivity boundary (`> 6h` resets `/new` to Chief of Staff; `< 6h` keeps active workspace);
+    5) Autocomplete (`is_internal_query=True`, omitted `message_id`) performing zero DB writes;
+    6) Unlinked user, external group member denial, workspace write revocation, and `workspace_ambiguous` candidate revocation (revoke 1 vs revoke all);
+    7) `/stop` durable `pending_cancel` -> `done` transition and startup recovery;
+    8) Private reply failure/expiry/restart abandonment preserving command result without public fallback;
+    9) Complete absence of interaction/bot tokens in PostgreSQL columns.
+    """
+    import asyncio
+    from pathlib import Path
+    from urllib.parse import quote_plus
+    from alembic import command
+    from alembic.config import Config
+    from psycopg.rows import dict_row
+    from psycopg_pool import AsyncConnectionPool
+    import os
+
+    host = os.getenv("DB_HOST", "localhost")
+    port = os.getenv("DB_PORT", "5432")
+    user = os.getenv("DB_USER", "postgres")
+    password = os.getenv("DB_PASSWORD", "postgres")
+    dbname = os.getenv("TEST_DB_NAME", "langalpha_test")
+    db_uri = (
+        f"postgresql://{quote_plus(user)}:{quote_plus(password)}@{host}:{port}/{dbname}"
+    )
+
+    try:
+        async with await psycopg.AsyncConnection.connect(db_uri, autocommit=True) as conn:
+            await conn.execute("DROP SCHEMA public CASCADE")
+            await conn.execute("CREATE SCHEMA public")
+            await conn.execute("GRANT ALL ON SCHEMA public TO CURRENT_USER")
+            await conn.execute("GRANT ALL ON SCHEMA public TO public")
+    except psycopg.OperationalError as exc:
+        pytest.skip(f"PostgreSQL test database unreachable at {host}:{port}/{dbname}: {exc}")
+
+    repo_root = Path(__file__).resolve().parents[3]
+
+    def _upgrade() -> None:
+        cfg = Config(str(repo_root / "alembic.ini"))
+        cfg.set_main_option("script_location", str(repo_root / "alembic"))
+        cfg.set_main_option("sqlalchemy.url", db_uri)
+        command.upgrade(cfg, "head")
+
+    await asyncio.to_thread(_upgrade)
+
+    pool = AsyncConnectionPool(
+        conninfo=db_uri,
+        min_size=2,
+        max_size=5,
+        open=False,
+        kwargs={"autocommit": True, "row_factory": dict_row},
+    )
+    await pool.open()
+
+    try:
+        @asynccontextmanager
+        async def _real_get_db_connection(existing_conn: Any = None):
+            if existing_conn is not None:
+                yield existing_conn
+            else:
+                async with pool.connection() as c:
+                    yield c
+
+        monkeypatch.setattr(db_pool, "get_db_connection", _real_get_db_connection)
+        monkeypatch.setattr(cg_db, "get_db_connection", _real_get_db_connection)
+
+        tiers: dict[str, str] = {
+            "u-pg-alice": "internal",
+            "u-pg-bob": "internal",
+            "u-pg-ext": "external",
+        }
+        writable_by_user: dict[str, dict[str, str]] = {
+            "u-pg-alice": {},
+            "u-pg-bob": {},
+            "u-pg-ext": {},
+        }
+
+        async def _fake_get_user_tier(user_id: str) -> str:
+            return tiers.get(user_id, "external")
+
+        async def _fake_writable_names(user_id: str) -> dict[str, str]:
+            return dict(writable_by_user.get(user_id, {}))
+
+        async def _fake_require_ws_access(
+            workspace_id: str,
+            user_id: str,
+            *,
+            minimum_role: str = "viewer",
+            allow_admin_bypass: bool = True,
+            allow_anonymous_public: bool = False,
+            conn: Any = None,
+        ) -> dict[str, Any]:
+            wmap = writable_by_user.get(user_id, {})
+            if workspace_id not in wmap:
+                raise HTTPException(status_code=403, detail="Workspace write access denied")
+            return {"role": "editor", "workspace_id": workspace_id}
+
+        monkeypatch.setattr(cg_db, "get_user_tier", _fake_get_user_tier)
+        monkeypatch.setattr(cg_db, "_get_writable_workspace_names", _fake_writable_names)
+        monkeypatch.setattr(dalton_sharing, "require_workspace_access", _fake_require_ws_access)
+
+        ws_cn = str(uuid4())
+        ws_macro = str(uuid4())
+        ws_amb_1 = str(uuid4())
+        ws_amb_2 = str(uuid4())
+        active_tid = str(uuid4())
+        active_rid = f"run-pg-{uuid4().hex[:8]}"
+
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                for uid in ["u-pg-alice", "u-pg-bob", "u-pg-ext"]:
+                    await cur.execute(
+                        """
+                        INSERT INTO users (user_id, email, name)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (user_id) DO NOTHING
+                        """,
+                        (uid, f"{uid}@dalton.test", uid),
+                    )
+                for wid, owner, wname in [
+                    (ws_cn, "u-pg-alice", "A股量化研究"),
+                    (ws_macro, "u-pg-bob", "全球宏观对冲"),
+                    (ws_amb_1, "u-pg-alice", "量化研究"),
+                    (ws_amb_2, "u-pg-bob", "量化研究"),
+                ]:
+                    await cur.execute(
+                        """
+                        INSERT INTO workspaces (workspace_id, user_id, name, status)
+                        VALUES (%s, %s, %s, 'running')
+                        """,
+                        (wid, owner, wname),
+                    )
+                for uid, puid in [
+                    ("u-pg-alice", "dc_pg_alice"),
+                    ("u-pg-bob", "dc_pg_bob"),
+                    ("u-pg-ext", "dc_pg_ext"),
+                ]:
+                    await cur.execute(
+                        """
+                        INSERT INTO dalton_channel_identities (user_id, platform, platform_user_id, platform_username)
+                        VALUES (%s, 'discord', %s, %s)
+                        """,
+                        (uid, puid, puid),
+                    )
+
+        writable_by_user["u-pg-alice"] = {
+            ws_cn: "A股量化研究",
+            ws_macro: "全球宏观对冲",
+            ws_amb_1: "量化研究",
+            ws_amb_2: "量化研究",
+        }
+        writable_by_user["u-pg-bob"] = {
+            ws_cn: "A股量化研究",
+            ws_macro: "全球宏观对冲",
+        }
+
+        guild_chat_id = "932170193180958741/1481256083589697566"
+        guild_addr = f"discord:{guild_chat_id}"
+        guild_scope = f"chat:{guild_chat_id}"
+
+        # 1. Autocomplete (`is_internal_query=True`, omitted `message_id`) performs zero DB writes
+        auto_pg = await cg_db.execute_session_command(
+            cmd="workspace_list",
+            platform="discord",
+            platform_user_id="dc_pg_alice",
+            chat_type="group",
+            chat_address=guild_addr,
+            chat_id=guild_chat_id,
+            scope_key=guild_scope,
+            is_internal_query=True,
+            native_interaction=True,
+        )
+        assert auto_pg["ok"] is True
+        assert auto_pg["command_reply_pending"] is False
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT COUNT(*) AS cnt FROM dalton_channel_session_generations WHERE dalton_user_id = 'u-pg-alice'"
+                )
+                assert (await cur.fetchone())["cnt"] == 0
+                await cur.execute(
+                    "SELECT COUNT(*) AS cnt FROM dalton_channel_inbound_events WHERE dalton_user_id = 'u-pg-alice'"
+                )
+                assert (await cur.fetchone())["cnt"] == 0
+
+        # 2. Uncertain (`unknown`) and `failed` initial callbacks produce zero session/activity writes and block replay
+        for idx, bad_ack in enumerate(["unknown", "failed"], start=1):
+            bad_mid = f"inter_pg_bad_ack_{idx}"
+            bad_rkey = str(uuid5(DALTON_CHANNEL_NAMESPACE, f"discord:{bad_mid}"))
+            bad_res = await cg_db.execute_session_command(
+                cmd="new",
+                platform="discord",
+                platform_user_id="dc_pg_alice",
+                chat_type="group",
+                chat_address=guild_addr,
+                chat_id=guild_chat_id,
+                scope_key=guild_scope,
+                message_id=bad_mid,
+                request_key=bad_rkey,
+                native_interaction=True,
+                native_ack_status=bad_ack,
+                raw_payload={
+                    "native_interaction": True,
+                    "token": f"PG_SECRET_TOK_{idx}",
+                    "discord_interaction": {"id": bad_mid, "token": f"PG_SECRET_TOK_NESTED_{idx}"},
+                },
+            )
+            assert bad_res["ok"] is False
+            assert bad_res["not_executed"] is True
+            assert bad_res["command_reply_pending"] is False
+
+            # Replay even with `acknowledged` is still blocked (`not_executed=True`)
+            replay_bad = await cg_db.execute_session_command(
+                cmd="new",
+                platform="discord",
+                platform_user_id="dc_pg_alice",
+                chat_type="group",
+                chat_address=guild_addr,
+                chat_id=guild_chat_id,
+                scope_key=guild_scope,
+                message_id=bad_mid,
+                request_key=bad_rkey,
+                native_interaction=True,
+                native_ack_status="acknowledged",
+            )
+            assert replay_bad["duplicate"] is True
+            assert replay_bad["not_executed"] is True
+
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT COUNT(*) AS cnt FROM dalton_channel_session_generations WHERE dalton_user_id = 'u-pg-alice'"
+                )
+                assert (await cur.fetchone())["cnt"] == 0
+
+        # 3. Concurrent same-interaction `/new` across two real PostgreSQL connections advances generation only once!
+        conc_mid = "inter_pg_conc_new_1"
+        conc_rkey = str(uuid5(DALTON_CHANNEL_NAMESPACE, f"discord:{conc_mid}"))
+        res_a, res_b = await asyncio.gather(
+            cg_db.execute_session_command(
+                cmd="new",
+                platform="discord",
+                platform_user_id="dc_pg_alice",
+                chat_type="group",
+                chat_address=guild_addr,
+                chat_id=guild_chat_id,
+                scope_key=guild_scope,
+                message_id=conc_mid,
+                request_key=conc_rkey,
+                native_interaction=True,
+                native_ack_status="acknowledged",
+                raw_payload={"native_interaction": True, "token": "CONC_SECRET_TOKEN_777"},
+            ),
+            cg_db.execute_session_command(
+                cmd="new",
+                platform="discord",
+                platform_user_id="dc_pg_alice",
+                chat_type="group",
+                chat_address=guild_addr,
+                chat_id=guild_chat_id,
+                scope_key=guild_scope,
+                message_id=conc_mid,
+                request_key=conc_rkey,
+                native_interaction=True,
+                native_ack_status="acknowledged",
+                raw_payload={"native_interaction": True, "token": "CONC_SECRET_TOKEN_777"},
+            ),
+        )
+        assert res_a["ok"] is True and res_b["ok"] is True
+        assert res_a["generation"] == 2 and res_b["generation"] == 2
+        assert sorted([bool(res_a.get("duplicate")), bool(res_b.get("duplicate"))]) == [False, True]
+
+        # 4. Switch Alice to `ws_cn` and verify duplicate replay does NOT update `last_conversation_activity_at`
+        sw_mid = "inter_pg_alice_sw_cn"
+        sw_rkey = str(uuid5(DALTON_CHANNEL_NAMESPACE, f"discord:{sw_mid}"))
+        sw_res = await cg_db.execute_session_command(
+            cmd="workspace_switch",
+            platform="discord",
+            platform_user_id="dc_pg_alice",
+            chat_type="group",
+            chat_address=guild_addr,
+            chat_id=guild_chat_id,
+            scope_key=guild_scope,
+            message_id=sw_mid,
+            request_key=sw_rkey,
+            target_kind="workspace_id",
+            workspace_id=ws_cn,
+            workspace_query=ws_cn,
+            native_interaction=True,
+            native_ack_status="acknowledged",
+        )
+        assert sw_res["ok"] is True
+        assert sw_res["generation"] == 3
+
+        backdated_ts = datetime.now(timezone.utc) - timedelta(hours=2)
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE dalton_channel_session_generations
+                    SET last_conversation_activity_at = %s
+                    WHERE platform = 'discord' AND scope_key = %s AND dalton_user_id = 'u-pg-alice'
+                    """,
+                    (backdated_ts, guild_scope),
+                )
+
+        # Duplicate replay of `sw_mid` must NOT change `last_conversation_activity_at` or `generation`
+        sw_dup = await cg_db.execute_session_command(
+            cmd="workspace_switch",
+            platform="discord",
+            platform_user_id="dc_pg_alice",
+            chat_type="group",
+            chat_address=guild_addr,
+            chat_id=guild_chat_id,
+            scope_key=guild_scope,
+            message_id=sw_mid,
+            request_key=sw_rkey,
+            target_kind="workspace_id",
+            workspace_id=ws_cn,
+            workspace_query=ws_cn,
+            native_interaction=True,
+            native_ack_status="acknowledged",
+        )
+        assert sw_dup["duplicate"] is True
+        assert sw_dup["generation"] == 3
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT generation, last_conversation_activity_at
+                    FROM dalton_channel_session_generations
+                    WHERE platform = 'discord' AND scope_key = %s AND dalton_user_id = 'u-pg-alice'
+                    """,
+                    (guild_scope,),
+                )
+                srow = await cur.fetchone()
+                assert srow["generation"] == 3
+                assert srow["last_conversation_activity_at"] == backdated_ts
+
+        # 5. 6-hour boundary in PostgreSQL: > 6h resets `/new` to Chief of Staff (`override_workspace_id=NULL`)
+        expired_6h_ts = datetime.now(timezone.utc) - timedelta(hours=6, minutes=5)
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    UPDATE dalton_channel_session_generations
+                    SET last_conversation_activity_at = %s
+                    WHERE platform = 'discord' AND scope_key = %s AND dalton_user_id = 'u-pg-alice'
+                    """,
+                    (expired_6h_ts, guild_scope),
+                )
+        new_6h_mid = "inter_pg_new_after_6h"
+        new_6h_res = await cg_db.execute_session_command(
+            cmd="new",
+            platform="discord",
+            platform_user_id="dc_pg_alice",
+            chat_type="group",
+            chat_address=guild_addr,
+            chat_id=guild_chat_id,
+            scope_key=guild_scope,
+            message_id=new_6h_mid,
+            request_key=str(uuid5(DALTON_CHANNEL_NAMESPACE, f"discord:{new_6h_mid}")),
+            native_interaction=True,
+            native_ack_status="acknowledged",
+        )
+        assert new_6h_res["ok"] is True
+        assert new_6h_res["is_home"] is True
+        assert new_6h_res["override_workspace_id"] is None
+
+        # 6. Unlinked user, external group member denial, and `workspace_ambiguous` candidate revocation in PostgreSQL
+        ext_grp_mid = "inter_pg_ext_grp_1"
+        ext_grp_res = await cg_db.execute_session_command(
+            cmd="workspace_list",
+            platform="discord",
+            platform_user_id="dc_pg_ext",
+            chat_type="group",
+            chat_address=guild_addr,
+            chat_id=guild_chat_id,
+            scope_key=guild_scope,
+            message_id=ext_grp_mid,
+            request_key=str(uuid5(DALTON_CHANNEL_NAMESPACE, f"discord:{ext_grp_mid}")),
+            native_interaction=True,
+            native_ack_status="acknowledged",
+        )
+        assert ext_grp_res["allowed"] is False
+        assert ext_grp_res["deny_reason"] == "external_member_group_forbidden"
+        assert ext_grp_res["command_reply_pending"] is True
+
+        amb_pg_mid = "inter_pg_amb_1"
+        amb_pg_rkey = str(uuid5(DALTON_CHANNEL_NAMESPACE, f"discord:{amb_pg_mid}"))
+        amb_pg_res = await cg_db.execute_session_command(
+            cmd="workspace_switch",
+            platform="discord",
+            platform_user_id="dc_pg_alice",
+            chat_type="group",
+            chat_address=guild_addr,
+            chat_id=guild_chat_id,
+            scope_key=guild_scope,
+            message_id=amb_pg_mid,
+            request_key=amb_pg_rkey,
+            target_kind="exact_name",
+            workspace_query="量化研究",
+            native_interaction=True,
+            native_ack_status="acknowledged",
+        )
+        assert amb_pg_res["ok"] is False
+        assert amb_pg_res["deny_reason"] == "workspace_ambiguous"
+        assert {c["workspace_id"] for c in amb_pg_res["candidates"]} == {ws_amb_1, ws_amb_2}
+
+        # Revoke 1 candidate (`ws_amb_2`) -> replay keeps only `ws_amb_1` without auto-switching
+        writable_by_user["u-pg-alice"] = {
+            ws_cn: "A股量化研究",
+            ws_macro: "全球宏观对冲",
+            ws_amb_1: "量化研究",
+        }
+        amb_pg_replay_1 = await cg_db.execute_session_command(
+            cmd="workspace_switch",
+            platform="discord",
+            platform_user_id="dc_pg_alice",
+            chat_type="group",
+            chat_address=guild_addr,
+            chat_id=guild_chat_id,
+            scope_key=guild_scope,
+            message_id=amb_pg_mid,
+            request_key=amb_pg_rkey,
+            target_kind="exact_name",
+            workspace_query="量化研究",
+            native_interaction=True,
+            native_ack_status="acknowledged",
+        )
+        assert amb_pg_replay_1["duplicate"] is True
+        assert amb_pg_replay_1["ok"] is False
+        assert amb_pg_replay_1["deny_reason"] == "workspace_ambiguous"
+        assert amb_pg_replay_1["candidates"] == [{"workspace_id": ws_amb_1, "name": "量化研究"}]
+
+        # Revoke both candidates (`ws_amb_1` and `ws_amb_2`) -> replay returns `candidates=[]` and `workspace_write_denied`
+        writable_by_user["u-pg-alice"] = {
+            ws_cn: "A股量化研究",
+            ws_macro: "全球宏观对冲",
+        }
+        amb_pg_replay_0 = await cg_db.execute_session_command(
+            cmd="workspace_switch",
+            platform="discord",
+            platform_user_id="dc_pg_alice",
+            chat_type="group",
+            chat_address=guild_addr,
+            chat_id=guild_chat_id,
+            scope_key=guild_scope,
+            message_id=amb_pg_mid,
+            request_key=amb_pg_rkey,
+            target_kind="exact_name",
+            workspace_query="量化研究",
+            native_interaction=True,
+            native_ack_status="acknowledged",
+        )
+        assert amb_pg_replay_0["duplicate"] is True
+        assert amb_pg_replay_0["ok"] is False
+        assert amb_pg_replay_0["deny_reason"] == "workspace_write_denied"
+        assert amb_pg_replay_0["candidates"] == []
+
+        # 7. `/stop` durable `pending_cancel` -> `done` and startup recovery in PostgreSQL
+        home_wid = str(get_home_workspace_id("u-pg-alice"))
+        ext_tid = f"discord:{guild_scope}:gen:4"
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    INSERT INTO workspaces (workspace_id, user_id, name, status)
+                    VALUES (%s, 'u-pg-alice', 'Chief of Staff', 'running')
+                    ON CONFLICT (workspace_id) DO NOTHING
+                    """,
+                    (home_wid,),
+                )
+                await cur.execute(
+                    """
+                    INSERT INTO conversation_threads (conversation_thread_id, workspace_id, external_thread_id, current_status)
+                    VALUES (%s, %s, %s, 'in_progress')
+                    """,
+                    (active_tid, home_wid, ext_tid),
+                )
+                await cur.execute(
+                    """
+                    INSERT INTO dalton_channel_background_runs (run_id, thread_id, dalton_user_id, platform, target_address, turn_index, status, fallback_pending)
+                    VALUES (%s, %s, 'u-pg-alice', 'discord', %s, 0, 'streaming', TRUE)
+                    """,
+                    (active_rid, active_tid, guild_addr),
+                )
+
+        stop_mid = "inter_pg_stop_1"
+        stop_res = await cg_db.execute_session_command(
+            cmd="stop",
+            platform="discord",
+            platform_user_id="dc_pg_alice",
+            chat_type="group",
+            chat_address=guild_addr,
+            chat_id=guild_chat_id,
+            scope_key=guild_scope,
+            message_id=stop_mid,
+            request_key=str(uuid5(DALTON_CHANNEL_NAMESPACE, f"discord:{stop_mid}")),
+            native_interaction=True,
+            native_ack_status="acknowledged",
+        )
+        assert stop_res["ok"] is True
+        assert stop_res["thread_id"] == active_tid
+        assert stop_res["run_id"] == active_rid
+        assert stop_res["command_effect_status"] == "pending_cancel"
+        assert stop_res["command_reply_pending"] is True
+
+        rec_before = await cg_db.recover_gateway_state(mode="startup")
+        assert stop_mid in {r["message_id"] for r in rec_before["inbound_events"]}
+
+        await cg_db.update_inbound_progress(
+            platform="discord",
+            message_id=stop_mid,
+            status="completed",
+            command_effect_status="done",
+            command_reply_pending=False,
+            raw_payload_patch={
+                "native_interaction": True,
+                "native_reply_status": "abandoned_on_restart",
+                "token": "LEAKED_PATCH_TOK_PG",
+            },
+        )
+        rec_after = await cg_db.recover_gateway_state(mode="startup")
+        assert stop_mid not in {r["message_id"] for r in rec_after["inbound_events"]}
+
+        # 8. Verify complete absence of interaction/bot tokens across all PostgreSQL rows
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    """
+                    SELECT message_id,
+                           raw_payload::text AS raw_txt,
+                           command_request::text AS req_txt,
+                           command_result::text AS res_txt
+                    FROM dalton_channel_inbound_events
+                    WHERE platform = 'discord'
+                    """
+                )
+                for row in await cur.fetchall():
+                    combined = f"{row['raw_txt']} {row['req_txt']} {row['res_txt']}"
+                    assert "PG_SECRET_TOK" not in combined
+                    assert "CONC_SECRET_TOKEN" not in combined
+                    assert "LEAKED_PATCH_TOK_PG" not in combined
+    finally:
+        await pool.close()
+
+
