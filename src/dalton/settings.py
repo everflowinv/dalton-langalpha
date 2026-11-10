@@ -1020,6 +1020,39 @@ def get_dalton_bridge_base_url(host: str | None = None) -> str:
     return f"http://{resolved_host}:{port}"
 
 
+def get_dalton_channel_gateway_url(host: str | None = None) -> str:
+    """Return the Dalton channel gateway base URL, rewriting container loopback to ``HOST_IP``.
+
+    ``dalton-channel-gateway`` binds host loopback (``127.0.0.1:8962`` by default), so a
+    backend container whose ``.env`` sets ``CHANNEL_GATEWAY_URL=http://127.0.0.1:8962``
+    reaches the host service through ``HOST_IP`` (``host.docker.internal``).
+    """
+    from urllib.parse import urlparse, urlunparse
+
+    in_docker = os.path.exists("/.dockerenv")
+    default_host = host or (HOST_IP if in_docker else "127.0.0.1") or "127.0.0.1"
+    explicit = os.getenv("CHANNEL_GATEWAY_URL", "").strip()
+    if explicit:
+        expanded = explicit.replace("{HOST_IP}", default_host).rstrip("/")
+        parsed = urlparse(expanded)
+        if parsed.scheme and parsed.hostname:
+            if host is not None:
+                target_host = host
+            elif in_docker and parsed.hostname.lower() in ("127.0.0.1", "localhost", "::1"):
+                target_host = HOST_IP or "host.docker.internal"
+            else:
+                target_host = None
+            if target_host:
+                host_part = f"[{target_host}]" if ":" in target_host and not target_host.startswith("[") else target_host
+                netloc = f"{host_part}:{parsed.port}" if parsed.port else host_part
+                return urlunparse(
+                    (parsed.scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment)
+                ).rstrip("/")
+        return expanded
+    port = os.getenv("GATEWAY_PORT", "8962").strip() or "8962"
+    return f"http://{default_host}:{port}"
+
+
 FEISHU_SEND_CARD_TIMEOUT_S: float = 15.0
 
 

@@ -1112,25 +1112,80 @@ async def test_t27_and_t32_stdout_notification_payload_extraction(tmp_path: Path
     secret_val = "SECRET-KEY-99999"
     (secrets_dir / "API_TOKEN").write_text(secret_val, encoding="utf-8")
 
-    # T27: Markdown stdout -> outbox.json
+    charts_dir = tmp_path / "temp" / "asia-leverage-crossview" / "charts"
+    charts_dir.mkdir(parents=True, exist_ok=True)
+    for code in ("cn", "kr", "jp", "tw"):
+        (charts_dir / f"{code}_latest.png").write_bytes(
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + code.upper().encode("ascii") + b"\x00" * 24
+        )
+
+    t27_script = tmp_path / "emit_t27.py"
+    t27_script.write_text(
+        "\n".join(
+            [
+                "import os",
+                "tok = os.environ['API_TOKEN']",
+                "print('# 四地杠杆日报')",
+                "print('## 🇨🇳 中国A股')",
+                "print('- A股融资余额: 正常 ' + tok)",
+                "print('IMG:temp/asia-leverage-crossview/charts/cn_latest.png')",
+                "print('## 🇰🇷 韩国')",
+                "print('- 韩国融券监控: 正常')",
+                "print('IMG:temp/asia-leverage-crossview/charts/kr_latest.png')",
+                "print('## 🇯🇵 日本')",
+                "print('- 日本信用倍率: 正常')",
+                "print('IMG:temp/asia-leverage-crossview/charts/jp_latest.png')",
+                "print('## 🇹🇼 台湾')",
+                "print('- 台湾融资维持率: 正常')",
+                "print('IMG:temp/asia-leverage-crossview/charts/tw_latest.png')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    # T27: 4-market Markdown stdout + 4 charts -> finalized Card 2.0 outbox.json + snapshotted images
+    t27_run_id = "11111111-2222-4333-8444-555555555555"
     t27_res = await run_wrapped_command(
-        [
-            sys.executable,
-            "-c",
-            "import os; print('# 四地杠杆日报\\n\\n- A股: 正常 ' + os.environ['API_TOKEN'])",
-        ],
-        run_id="run-t27",
+        [sys.executable, str(t27_script)],
+        run_id=t27_run_id,
         job_key="asia-leverage-crossview-daily",
         workdir=str(tmp_path),
         workspace_dir=str(tmp_path),
         secrets_dir=secrets_dir,
         outbox_tmp_dir=tmp_path / "tmp_t27",
     )
+    assert t27_res.exit_code == 0
     assert t27_res.outbox_payload is not None
-    assert t27_res.outbox_payload["format"] == "markdown"
-    assert "# 四地杠杆日报" in t27_res.outbox_payload["text"]
-    assert secret_val not in t27_res.outbox_payload["text"]
-    assert "[REDACTED]" in t27_res.outbox_payload["text"]
+    assert t27_res.outbox_payload["summary"] == "四地杠杆日报"
+    assert len(t27_res.outbox_payload["feishu_cards"]) == 1
+    t27_card_entry = t27_res.outbox_payload["feishu_cards"][0]
+    assert t27_card_entry["card"]["schema"] == "2.0"
+    assert [img["filename"] for img in t27_card_entry["images"]] == [
+        "cn_latest.png",
+        "kr_latest.png",
+        "jp_latest.png",
+        "tw_latest.png",
+    ]
+    serialized_t27 = json.dumps(t27_res.outbox_payload, ensure_ascii=False)
+    assert secret_val not in serialized_t27
+    assert "[REDACTED]" in serialized_t27
+
+    # T27 incomplete output (missing the 4 required IMG: chart markers) fails closed with exit_code=1
+    t27_incomplete = await run_wrapped_command(
+        [
+            sys.executable,
+            "-c",
+            "print('# 四地杠杆日报\\n\\n- 缺失图表标记')",
+        ],
+        run_id="22222222-2222-4333-8444-555555555555",
+        job_key="asia-leverage-crossview-daily",
+        workdir=str(tmp_path),
+        workspace_dir=str(tmp_path),
+        secrets_dir=secrets_dir,
+        outbox_tmp_dir=tmp_path / "tmp_t27_incomplete",
+    )
+    assert t27_incomplete.exit_code == 1
+    assert t27_incomplete.outbox_payload is None
 
     # T32: Plain-text stdout -> outbox.json
     t32_res = await run_wrapped_command(
@@ -4285,12 +4340,13 @@ async def test_pr04_scheduler_notify_dispatch_target_transitions_and_terminal_st
         automation_id: str | None = None,
         payload: Any = None,
         stale_pending_minutes: int = 10,
-    ) -> bool:
+        return_attempt_count: bool = False,
+    ) -> bool | tuple[bool, int]:
         _ = (user_id, automation_id, payload, stale_pending_minutes)
         delivery_ledger.setdefault((execution_id, channel, target), []).append(
             ("pending", None)
         )
-        return True
+        return (True, 1) if return_attempt_count else True
 
     async def _fake_mark(
         execution_id: str,
@@ -4301,6 +4357,9 @@ async def test_pr04_scheduler_notify_dispatch_target_transitions_and_terminal_st
         error_code: str | None = None,
         reason: str | None = None,
         expected_status: Any = None,
+        expected_attempt_count: int | None = None,
+        expected_updated_at: Any = None,
+        exclude_uncertain_data_task: bool = False,
     ) -> bool:
         _ = expected_status
         delivery_ledger.setdefault((execution_id, channel, target), []).append(
@@ -4611,10 +4670,11 @@ async def test_pr04_scheduler_notify_dispatch_target_transitions_and_terminal_st
         automation_id: str | None = None,
         payload: Any = None,
         stale_pending_minutes: int = 10,
-    ) -> bool:
+        return_attempt_count: bool = False,
+    ) -> bool | tuple[bool, int]:
         _ = (execution_id, user_id, automation_id, payload, stale_pending_minutes)
         persisted_rows_7[(channel, target)] = "pending"
-        return True
+        return (True, 1) if return_attempt_count else True
 
     async def _mark_and_update_7b(
         execution_id: str,
@@ -4625,6 +4685,9 @@ async def test_pr04_scheduler_notify_dispatch_target_transitions_and_terminal_st
         error_code: str | None = None,
         reason: str | None = None,
         expected_status: Any = None,
+        expected_attempt_count: int | None = None,
+        expected_updated_at: Any = None,
+        exclude_uncertain_data_task: bool = False,
     ) -> bool:
         _ = (execution_id, error_code, reason, expected_status)
         persisted_rows_7[(channel, target)] = status
@@ -4876,6 +4939,7 @@ async def test_pr04_retry_failed_notify_deliveries_reconstructs_data_task_on_nul
         status="sent",
         error_code=None,
         expected_status="pending",
+        expected_attempt_count=2,
     )
 
     # 4. Item 2: When data task is disabled (enabled=False or notify_enabled=False), retry marks delivery 'skipped' (error_code='task_disabled') and does NOT re-send
@@ -4934,6 +4998,8 @@ async def test_pr04_retry_failed_notify_deliveries_reconstructs_data_task_on_nul
         error_code="task_disabled",
         reason="task_disabled",
         expected_status=("failed", "pending"),
+        expected_attempt_count=1,
+        exclude_uncertain_data_task=True,
     )
 
 
@@ -8055,3 +8121,80 @@ def test_sentiment_dashboard_cos_upload_skip_never_reads_credentials(tmp_path, m
         captured = capsys.readouterr()
         assert json.loads(captured.out if expected == 0 else captured.err)["ok"] is (expected == 0)
         assert credential_reads == []
+
+
+@pytest.mark.asyncio
+async def test_runner_wrapper_safe_atomic_writes_preserve_json_format_and_reject_symlinks(
+    tmp_path: Path,
+) -> None:
+    """Runner `atomic_write_json`, `atomic_write_text`, and `persist_redacted_outbox` reject symlinks and preserve format."""
+    from src.dalton.data_jobs.runner_wrapper import (
+        SecretRedactor,
+        atomic_write_json,
+        atomic_write_text,
+        persist_redacted_outbox,
+        run_wrapped_command,
+    )
+    from src.dalton.data_jobs.safe_fs import SafeFsError
+
+    data_root = tmp_path / "data_root"
+    artifacts_dir = data_root / ".dalton-runs" / "run-1"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir(parents=True, exist_ok=True)
+    outside_file = outside_dir / "external.json"
+    outside_file.write_text('{"untouched": true}\n', encoding="utf-8")
+
+    # 1. Exact JSON formatting (`ensure_ascii=False, indent=2`) and text formatting preserved
+    json_path = artifacts_dir / "outbox.json"
+    sample_obj = {"status": "ok", "title": "亚洲杠杆监控", "count": 4}
+    atomic_write_json(json_path, sample_obj, anchor_dir=data_root)
+    assert json_path.read_text(encoding="utf-8") == json.dumps(
+        sample_obj, ensure_ascii=False, indent=2
+    )
+
+    txt_path = artifacts_dir / "note.txt"
+    atomic_write_text(txt_path, "hello-world\n", anchor_dir=data_root)
+    assert txt_path.read_text(encoding="utf-8") == "hello-world\n"
+
+    # 2. Dangling `.tmp.outbox.json.<pid>` symlink in artifacts_dir cannot create external file
+    dangling_target = outside_dir / "never_created.json"
+    os.symlink(dangling_target, artifacts_dir / f".tmp.outbox.json.{os.getpid()}")
+    atomic_write_json(
+        json_path,
+        {"status": "updated", "secret": "s"},
+        anchor_dir=data_root,
+    )
+    assert not dangling_target.exists()
+    assert json.loads(json_path.read_text(encoding="utf-8"))["status"] == "updated"
+
+    # 3. Destination `outbox.json` symlink (both existing and dangling) is refused by `atomic_write_json` and `persist_redacted_outbox`
+    json_path.unlink()
+    os.symlink(outside_file, json_path)
+    with pytest.raises(SafeFsError) as exc_sym:
+        atomic_write_json(json_path, {"hijack": True}, anchor_dir=data_root)
+    assert exc_sym.value.code == "symlink_rejected"
+    assert outside_file.read_text(encoding="utf-8") == '{"untouched": true}\n'
+
+    redactor = SecretRedactor(["SECRET_VAL_123"])
+    with pytest.raises(SafeFsError):
+        persist_redacted_outbox(
+            outbox_path=json_path,
+            explicit_payload={"hijack": True},
+            redactor=redactor,
+        )
+    assert outside_file.read_text(encoding="utf-8") == '{"untouched": true}\n'
+
+    # 4. `run_wrapped_command` encountering a symlink `outbox.json` fails safely and does NOT unlink external target
+    wrap_res = await run_wrapped_command(
+        [sys.executable, "-c", "print('{\"feishu_message\": \"hi\"}')"],
+        run_id="run-1",
+        job_key="ah-premium-am",
+        workdir=str(data_root),
+        workspace_dir=str(data_root),
+        secrets_dir=str(tmp_path / "empty_secrets"),
+        outbox_tmp_dir=str(tmp_path / "tmp_outbox"),
+    )
+    assert wrap_res.exit_code == 1
+    assert outside_file.exists()
+    assert outside_file.read_text(encoding="utf-8") == '{"untouched": true}\n'
