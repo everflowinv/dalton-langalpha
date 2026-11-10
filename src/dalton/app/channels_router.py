@@ -64,13 +64,47 @@ def require_channel_service_token(request: Request) -> None:
 def _resolve_internal_user_id(
     request: Request, body_or_query_user_id: str | None
 ) -> str:
-    uid = (
-        str(body_or_query_user_id or "").strip()
-        or str(request.headers.get("X-User-Id") or "").strip()
-    )
+    from src.dalton.company_identity import reject_company_system_auth
+
+    header_uid = str(request.headers.get("X-User-Id") or "").strip()
+    body_uid = str(body_or_query_user_id or "").strip()
+    if header_uid:
+        reject_company_system_auth(header_uid)
+    if body_uid:
+        reject_company_system_auth(body_uid)
+    uid = body_uid or header_uid
     if not uid:
         raise HTTPException(status_code=400, detail="user_id or X-User-Id is required")
     return uid
+
+
+def _resolve_optional_internal_user_id(
+    request: Request,
+    *candidate_user_ids: str | None,
+) -> str | None:
+    from src.dalton.company_identity import reject_company_system_auth
+
+    header_uid = str(request.headers.get("X-User-Id") or "").strip() or None
+    if header_uid is not None:
+        reject_company_system_auth(header_uid)
+    for raw_uid in candidate_user_ids:
+        if raw_uid is not None:
+            reject_company_system_auth(raw_uid)
+    for raw_uid in (*candidate_user_ids, header_uid):
+        cleaned = str(raw_uid or "").strip() or None
+        if cleaned is not None:
+            return cleaned
+    return None
+
+
+def _reject_nested_company_user_ids(*containers: dict[str, Any] | None) -> None:
+    from src.dalton.company_identity import reject_company_system_auth
+
+    for item in containers:
+        if isinstance(item, dict):
+            for key in ("user_id", "dalton_user_id", "owner_user_id"):
+                if key in item and item[key] is not None:
+                    reject_company_system_auth(item[key])
 
 
 # ---------------------------------------------------------------------------
@@ -262,8 +296,15 @@ class WeixinVerifyCodeRequest(BaseModel):
 )
 async def internal_inbound_register_and_resolve_endpoint(
     body: InboundRegisterResolveRequest,
+    request: Request,
 ) -> dict[str, Any]:
     """I-1: Idempotently register inbound event and resolve user, tier, workspace, and generation."""
+    _resolve_optional_internal_user_id(
+        request,
+        getattr(body, "user_id", None),
+        getattr(body, "dalton_user_id", None),
+    )
+    _reject_nested_company_user_ids(body.raw_payload)
     return await register_and_resolve_inbound(
         platform=body.platform,
         platform_user_id=body.platform_user_id,
@@ -286,7 +327,11 @@ async def internal_bind_code_consume_endpoint(
     request: Request,
 ) -> dict[str, Any]:
     """I-2: Consume a bind code (or revoke on group leak) or unbind a platform."""
-    eff_uid = body.user_id or (request.headers.get("X-User-Id") or "").strip() or None
+    eff_uid = _resolve_optional_internal_user_id(
+        request,
+        body.user_id,
+        getattr(body, "dalton_user_id", None),
+    )
     return await consume_bind_code_or_unbind(
         action=body.action,
         platform=body.platform,
@@ -309,11 +354,12 @@ async def internal_session_command_endpoint(
     request: Request,
 ) -> dict[str, Any]:
     """I-3: Execute `/workspace`, `/main`, `/<workspace>`, `/new`, or `/stop` session command."""
-    eff_uid = (
-        str(body.dalton_user_id or "").strip()
-        or str(request.headers.get("X-User-Id") or "").strip()
-        or None
+    eff_uid = _resolve_optional_internal_user_id(
+        request,
+        body.dalton_user_id,
+        getattr(body, "user_id", None),
     )
+    _reject_nested_company_user_ids(body.raw_payload)
     if not eff_uid and not str(body.platform_user_id or "").strip():
         raise HTTPException(
             status_code=400,
@@ -408,7 +454,11 @@ async def internal_deliveries_authorize_and_claim_endpoint(
     request: Request,
 ) -> dict[str, Any]:
     """I-6: Authorize outbound delivery target and atomically claim `in_flight` slot."""
-    eff_uid = body.user_id or (request.headers.get("X-User-Id") or "").strip() or None
+    eff_uid = _resolve_optional_internal_user_id(
+        request,
+        body.user_id,
+        getattr(body, "dalton_user_id", None),
+    )
     return await authorize_and_claim_delivery(
         delivery_key=body.delivery_key,
         kind=body.kind,
@@ -434,8 +484,14 @@ async def internal_deliveries_authorize_and_claim_endpoint(
 )
 async def internal_deliveries_progress_endpoint(
     body: DeliveryProgressRequest,
+    request: Request,
 ) -> dict[str, Any]:
     """I-7 (1): Update chunk/file progress and status on `dalton_channel_deliveries`."""
+    _resolve_optional_internal_user_id(
+        request,
+        getattr(body, "user_id", None),
+        getattr(body, "dalton_user_id", None),
+    )
     return await update_delivery_progress(
         delivery_key=body.delivery_key,
         sent_chunks=body.sent_chunks,
@@ -455,8 +511,21 @@ async def internal_deliveries_progress_endpoint(
 )
 async def internal_inbound_progress_endpoint(
     body: InboundProgressRequest,
+    request: Request,
 ) -> dict[str, Any]:
     """I-7 (2): Update inbound event progress, pending_interrupt, background_runs, and thread_watches."""
+    _resolve_optional_internal_user_id(
+        request,
+        getattr(body, "user_id", None),
+        getattr(body, "dalton_user_id", None),
+    )
+    _reject_nested_company_user_ids(
+        body.session_interrupt_update,
+        body.background_run,
+        body.thread_watch,
+        body.raw_payload,
+        body.raw_payload_patch,
+    )
     return await update_inbound_progress(
         platform=body.platform,
         message_id=body.message_id,
@@ -487,8 +556,14 @@ async def internal_inbound_progress_endpoint(
 )
 async def internal_steers_reconcile_endpoint(
     body: SteerReconcileRequest,
+    request: Request,
 ) -> dict[str, Any]:
     """I-7 (3): Reconcile `hook_outbox` steer outcome with `conversation_responses.status`."""
+    _resolve_optional_internal_user_id(
+        request,
+        getattr(body, "user_id", None),
+        getattr(body, "dalton_user_id", None),
+    )
     return await reconcile_steer(
         platform=body.platform,
         message_id=body.message_id,
@@ -501,10 +576,12 @@ async def internal_steers_reconcile_endpoint(
     dependencies=[Depends(require_channel_service_token)],
 )
 async def internal_recover_endpoint(
+    request: Request,
     mode: str = Query(default="startup"),
     thread_id: str | None = Query(default=None),
 ) -> dict[str, Any]:
     """I-7 (4): Recover channel gateway state on `startup` or `watch_reconnect`."""
+    _resolve_optional_internal_user_id(request)
     return await recover_channel_state(mode=mode, thread_id=thread_id)
 
 
@@ -535,8 +612,13 @@ async def internal_automation_runs_register_endpoint(
 async def internal_automation_runs_finish_endpoint(
     execution_id: str,
     body: AutomationRunFinishRequest,
+    request: Request,
 ) -> dict[str, Any]:
     """I-8 (2): Claim or finalize automation run delivery settlement."""
+    _resolve_optional_internal_user_id(
+        request,
+        getattr(body, "user_id", None),
+    )
     return await finish_automation_run(
         execution_id=execution_id,
         status=body.status,
@@ -551,8 +633,11 @@ async def internal_automation_runs_finish_endpoint(
     "/internal/weixin-state",
     dependencies=[Depends(require_channel_service_token)],
 )
-async def internal_weixin_state_get_endpoint() -> dict[str, Any]:
+async def internal_weixin_state_get_endpoint(
+    request: Request,
+) -> dict[str, Any]:
     """I-9 (1): Read singleton Weixin state with decrypted `bot_token`."""
+    _resolve_optional_internal_user_id(request)
     return await get_weixin_state(include_token=True)
 
 
@@ -562,8 +647,14 @@ async def internal_weixin_state_get_endpoint() -> dict[str, Any]:
 )
 async def internal_weixin_state_put_endpoint(
     body: WeixinStatePutRequest,
+    request: Request,
 ) -> dict[str, Any]:
     """I-9 (2): Upsert singleton Weixin state with `pgp_sym_encrypt`."""
+    _resolve_optional_internal_user_id(
+        request,
+        body.owner_user_id,
+        getattr(body, "user_id", None),
+    )
     return await upsert_weixin_state(
         ilink_bot_id=body.ilink_bot_id,
         owner_user_id=body.owner_user_id,
@@ -642,6 +733,10 @@ async def web_put_channel_settings_endpoint(
     user_id: CurrentUserId,
 ) -> Any:
     """Web group workspace & channel settings update (reuses `I-5` validation and generation advancement)."""
+    if body.user_id is not None:
+        from src.dalton.company_identity import reject_company_system_auth
+
+        reject_company_system_auth(body.user_id)
     auto_upd = body.automation_output_update
     if (
         auto_upd is None

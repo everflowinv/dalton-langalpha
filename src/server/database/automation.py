@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 
+# DALTON-HOOK(company-automations): include scope, notify storage, versioning, actor, and soft-delete columns
 AUTOMATION_COLUMNS = """
     automation_id, user_id, name, file_name, description,
     trigger_type, cron_expression, timezone, trigger_config,
@@ -37,6 +38,8 @@ AUTOMATION_COLUMNS = """
     thread_strategy, conversation_thread_id,
     status, max_failures, failure_count, disable_reason,
     delivery_config, metadata,
+    scope, notify_enabled, notify_routes, notify_storage_mode,
+    config_version, active_version, created_by, updated_by, deleted_at,
     created_at, updated_at
 """
 
@@ -121,10 +124,11 @@ def file_name_stem(name: str) -> str:
 async def _free_file_name(user_id: str, name: str, conn) -> str:
     stem = file_name_stem(name)
     async with conn.cursor() as cur:
+        # DALTON-HOOK(company-automations): match partial unique index (deleted_at IS NULL)
         await cur.execute(
             """
             SELECT file_name FROM automations
-            WHERE user_id = %s AND (file_name = %s OR file_name LIKE %s)
+            WHERE user_id = %s AND deleted_at IS NULL AND (file_name = %s OR file_name LIKE %s)
             """,
             (user_id, f"{stem}.json", f"{stem}-%.json"),
         )
@@ -157,6 +161,8 @@ async def create_automation(
     delivery_config: Optional[Dict[str, Any]] = None,
     metadata: Optional[Dict[str, Any]] = None,
     status: str = "active",  # DALTON-HOOK(coverage-tracking)
+    scope: Optional[str] = None,  # DALTON-HOOK(company-automations)
+    created_by: Optional[str] = None,
     conn=None,
 ) -> Dict[str, Any]:
     """Create a new automation.
@@ -166,10 +172,29 @@ async def create_automation(
     so a clash reads the names again; a ``file_name`` the caller picked is
     its own, and a clash on it raises ``UniqueViolation``.
     """
+    # DALTON-HOOK(company-automations): enforce non-company ownership and canonical scope on create
+    from src.dalton.company_identity import is_company_system_user
+    from src.dalton.database.company_automations import resolve_automation_scope_for_write
+
+    if is_company_system_user(user_id) or str(scope or "").strip().lower() == "company":
+        raise ValueError("Company automations cannot be created via personal create_automation")
+
     automation_id = str(uuid4())
+    effective_created_by = created_by if created_by is not None else user_id
 
     clashes = 0
     async with get_db_connection(conn) as conn:
+        effective_scope = (
+            scope
+            if scope in ("personal", "research_tracking")
+            else await resolve_automation_scope_for_write(
+                user_id,
+                name=name,
+                workspace_id=workspace_id,
+                metadata=metadata,
+                conn=conn,
+            )
+        )
         while True:
             chosen = file_name or await _free_file_name(user_id, name, conn)
             try:
@@ -185,6 +210,7 @@ async def create_automation(
                             thread_strategy, conversation_thread_id,
                             status, max_failures, failure_count,
                             delivery_config, metadata,
+                            scope, created_by,
                             created_at, updated_at
                         )
                         VALUES (
@@ -194,6 +220,7 @@ async def create_automation(
                             %s, %s, %s, %s,
                             %s, %s,
                             %s, %s, 0,
+                            %s, %s,
                             %s, %s,
                             NOW(), NOW()
                         )
@@ -210,6 +237,8 @@ async def create_automation(
                         max_failures,
                         Json(delivery_config or {}),
                         Json(metadata or {}),
+                        effective_scope,  # DALTON-HOOK(company-automations)
+                        effective_created_by,
                     ))
                     result = await cur.fetchone()
             except UniqueViolation:
@@ -247,11 +276,12 @@ async def get_automation(
     run and ``owns_thread``."""
     async with get_db_connection(conn) as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
+            # DALTON-HOOK(company-automations): hide soft-deleted rows and order deterministically
             await cur.execute(f"""
                 SELECT {AUTOMATION_COLUMNS}, le.last_execution, {_OWNS_THREAD}
                 FROM automations
                 {_last_execution_join("automations")}
-                WHERE automation_id = %s AND user_id = %s
+                WHERE automation_id = %s AND user_id = %s AND deleted_at IS NULL
             """, (automation_id, user_id))
 
             result = await cur.fetchone()
@@ -275,7 +305,8 @@ async def list_automations(
     Returns:
         Tuple of (list of automation dicts, total count).
     """
-    where_parts = ["user_id = %s"]
+    # DALTON-HOOK(company-automations): exclude soft-deleted rows and stabilize tie-break order
+    where_parts = ["user_id = %s", "deleted_at IS NULL"]
     params: list = [user_id]
 
     if status:
@@ -303,12 +334,13 @@ async def list_automations(
 
             # Get page. The lateral exposes only ``last_execution``, so the
             # automation columns stay unambiguous without a prefix.
+            # DALTON-HOOK(company-automations): deterministic primary-key tiebreaker on pagination
             await cur.execute(f"""
                 SELECT {AUTOMATION_COLUMNS}, le.last_execution
                 FROM automations
                 {_last_execution_join("automations")}
                 WHERE {where_clause}
-                ORDER BY created_at DESC
+                ORDER BY created_at DESC, automation_id DESC
                 LIMIT %s OFFSET %s
             """, (*params, limit, offset))
 
@@ -321,11 +353,12 @@ async def list_all_automations(user_id: str, *, conn=None) -> List[Dict[str, Any
     ``owns_thread``: the automations folder, one file per row."""
     async with get_db_connection(conn) as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
+            # DALTON-HOOK(company-automations): exclude soft-deleted rows from livefs listing
             await cur.execute(f"""
                 SELECT {AUTOMATION_COLUMNS}, le.last_execution, {_OWNS_THREAD}
                 FROM automations
                 {_last_execution_join("automations")}
-                WHERE user_id = %s
+                WHERE user_id = %s AND deleted_at IS NULL
                 ORDER BY file_name
             """, (user_id,))
             return [dict(row) for row in await cur.fetchall()]
@@ -339,11 +372,12 @@ async def get_automation_file(
     transaction."""
     async with get_db_connection(conn) as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
+            # DALTON-HOOK(company-automations): exclude soft-deleted rows from livefs file read
             await cur.execute(f"""
                 SELECT {AUTOMATION_COLUMNS}, le.last_execution, {_OWNS_THREAD}
                 FROM automations
                 {_last_execution_join("automations")}
-                WHERE user_id = %s AND file_name = %s
+                WHERE user_id = %s AND file_name = %s AND deleted_at IS NULL
                 {"FOR UPDATE OF automations" if lock else ""}
             """, (user_id, file_name))
             row = await cur.fetchone()
@@ -353,8 +387,9 @@ async def get_automation_file(
 async def list_automation_file_names(user_id: str) -> List[str]:
     async with get_db_connection() as conn:
         async with conn.cursor() as cur:
+            # DALTON-HOOK(company-automations): exclude soft-deleted rows from file name list
             await cur.execute(
-                "SELECT file_name FROM automations WHERE user_id = %s ORDER BY file_name",
+                "SELECT file_name FROM automations WHERE user_id = %s AND deleted_at IS NULL ORDER BY file_name",
                 (user_id,),
             )
             return [row[0] for row in await cur.fetchall()]
@@ -423,6 +458,10 @@ async def update_automation(
     }
     builder = UpdateQueryBuilder()
 
+    # DALTON-HOOK(company-automations): allow canonical scope/updated_by persistence and refuse company escalation
+    if "scope" in kwargs and str(kwargs["scope"] or "").strip().lower() == "company":
+        raise ValueError("Cannot update personal automation scope to company")
+
     # Simple text/enum fields
     for field in [
         "name", "description", "cron_expression", "timezone",
@@ -430,6 +469,7 @@ async def update_automation(
         "thread_strategy", "conversation_thread_id",
         "status", "max_failures", "failure_count", "disable_reason",
         "next_run_at", "last_run_at",
+        "scope", "updated_by",
     ]:
         if field not in kwargs:
             continue
@@ -451,9 +491,10 @@ async def update_automation(
     returning = AUTOMATION_COLUMNS.strip().split(",")
     returning = [c.strip() for c in returning]
 
+    # DALTON-HOOK(company-automations): only update active (non-soft-deleted) rows
     query, params = builder.build(
         table="automations",
-        where_clause="automation_id = %s AND user_id = %s",
+        where_clause="automation_id = %s AND user_id = %s AND deleted_at IS NULL",
         where_params=[automation_id, user_id],
         returning_columns=returning,
     )

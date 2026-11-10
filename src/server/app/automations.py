@@ -24,13 +24,16 @@ Endpoints (/api/v1/automations):
 """
 
 import logging
-from typing import Any, Optional
+from typing import Any, Literal, Optional  # DALTON-HOOK(company-automations)
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import ValidationError
 
+from src.dalton.services.company_automations import (  # DALTON-HOOK(company-automations)
+    AutomationHistoryResponse,
+)
 from src.server.database import automation as auto_db
 from src.server.database import automation_executions as exec_db
 from src.server.database.home_workspace import is_home_row
@@ -106,11 +109,26 @@ async def create_automation(
 @handle_api_exceptions("list automations", logger)
 async def list_automations(
     principal: ReadPrincipal,
+    scope: Literal["personal", "research_tracking", "company"] | None = Query(
+        None,
+        description="Optional scope filter: personal, research_tracking, or company",
+    ),
     status: str | None = Query(None, description="Filter by status"),
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
 ):
     """List automations for the current user, each with its newest execution."""
+    # DALTON-HOOK(company-automations): delegate explicit scope queries to AU1 read-only service
+    if scope is not None:
+        from src.dalton.services.company_automations import list_automations_for_scope
+
+        return await list_automations_for_scope(
+            principal,
+            scope=scope,
+            status=status,
+            limit=limit,
+            offset=offset,
+        )
     user_id = principal.user_id
     automations, total = await auto_db.list_automations(
         principal.user_id,
@@ -419,6 +437,31 @@ async def list_executions(
     """List execution history for an automation."""
     return await _runs_page(
         user_id, automation_id=str(automation_id), limit=limit, offset=offset,
+    )
+
+
+# DALTON-HOOK(company-automations): read-only modification history endpoint (AU1 §3.5)
+@router.get(
+    "/automations/{automation_id}/history",
+    response_model=AutomationHistoryResponse,
+)
+@handle_api_exceptions("list automation modification history", logger)
+async def list_automation_history(
+    automation_id: UUID,
+    principal: ReadPrincipal,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """List stored version modification history for an automation."""
+    from src.dalton.services.company_automations import (
+        get_automation_modification_history,
+    )
+
+    return await get_automation_modification_history(
+        principal,
+        str(automation_id),
+        limit=limit,
+        offset=offset,
     )
 
 

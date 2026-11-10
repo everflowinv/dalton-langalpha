@@ -356,6 +356,9 @@ ALLOWED_HOOKS=(
   "ui-model-pick"
   # Forked replies keep a unique bubble identifier throughout checkpoint loading.
   "fork-message-identifiers"
+  # AU1 Batch 1: company system identity external auth refusal, automation scope
+  # classification/backfill, scoped read-only listing, and modification history.
+  "company-automations"
 )
 
 # P0 / P0-D hooks that must exist once P0 & P0-D are complete (--strict mode)
