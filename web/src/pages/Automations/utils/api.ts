@@ -2,8 +2,16 @@ import { api, type ApiResponse, type QueryParams } from '@/api/client';
 import type {
   Automation,
   AutomationExecution,
+  AutomationHistory,
   AutomationPayload,
+  AutomationRead,
+  AutomationReadList,
+  AutomationReadListQuery,
+  AutomationReadPageQuery,
   AutomationRun,
+  AutomationRunReadList,
+  AutomationRunReadQuery,
+  AutomationScope,
   AutomationUpdatePayload,
   DeliveryOptions,
 } from '@/types/automation';
@@ -78,3 +86,130 @@ export const setDeliveryDefault = (
   data: DeliveryDefaultPayload,
 ): Promise<ApiResponse<{ address: string | null; name: string | null }>> =>
   api.put('/api/v1/automations/delivery-default', data);
+
+// DALTON-HOOK(company-automations): scoped agent and script reads. listAutomations,
+// listExecutions, and listRecentRuns stay the agent reads the current pages use.
+
+const READ_LIST_LIMIT = 50;
+const READ_LIST_OFFSET = 0;
+const RUN_READ_LIMIT = 20;
+const RUN_READ_OFFSET = 0;
+const HISTORY_LIMIT = 50;
+const HISTORY_OFFSET = 0;
+
+/** Filters `GET /api/v1/automations` actually accepts. */
+export interface AutomationReadListParams {
+  scope?: AutomationScope;
+  status?: string;
+  limit?: number;
+  offset?: number;
+}
+
+/** Filters `GET /api/v1/automations/executions` actually accepts. */
+export interface AutomationRunReadParams {
+  scope?: AutomationScope;
+  status?: string;
+  thread_id?: string;
+  limit?: number;
+  offset?: number;
+}
+
+/** `limit` and `offset` for one task's runs or its modification history. */
+export interface AutomationReadPageParams {
+  limit?: number;
+  offset?: number;
+}
+
+/** List key. An omitted scope or status is null here and left off the request. */
+export function automationReadListQuery(params: AutomationReadListParams = {}): AutomationReadListQuery {
+  return {
+    scope: params.scope ?? null,
+    status: params.status ?? null,
+    limit: params.limit ?? READ_LIST_LIMIT,
+    offset: params.offset ?? READ_LIST_OFFSET,
+  };
+}
+
+/** Feed key. Defaults match `listAutomationRunReads`. */
+export function automationRunReadQuery(params: AutomationRunReadParams = {}): AutomationRunReadQuery {
+  return {
+    scope: params.scope ?? null,
+    status: params.status ?? null,
+    thread_id: params.thread_id ?? null,
+    limit: params.limit ?? RUN_READ_LIMIT,
+    offset: params.offset ?? RUN_READ_OFFSET,
+  };
+}
+
+/** One task's run page. Defaults match `listAutomationExecutionReads`. */
+export function automationExecutionReadQuery(params: AutomationReadPageParams = {}): AutomationReadPageQuery {
+  return {
+    limit: params.limit ?? RUN_READ_LIMIT,
+    offset: params.offset ?? RUN_READ_OFFSET,
+  };
+}
+
+/** Modification-history page. Defaults match `listAutomationHistory`. */
+export function automationHistoryQuery(params: AutomationReadPageParams = {}): AutomationReadPageQuery {
+  return {
+    limit: params.limit ?? HISTORY_LIMIT,
+    offset: params.offset ?? HISTORY_OFFSET,
+  };
+}
+
+/** Null and undefined stay off the query string. An empty status is sent as given. */
+function readParams(
+  page: AutomationReadPageQuery,
+  filters: { scope?: AutomationScope | null; status?: string | null; thread_id?: string | null } = {},
+): QueryParams {
+  const params: QueryParams = { limit: page.limit, offset: page.offset };
+  if (filters.scope != null) params.scope = filters.scope;
+  if (filters.status != null) params.status = filters.status;
+  if (filters.thread_id != null) params.thread_id = filters.thread_id;
+  return params;
+}
+
+/** A UUID or a full `data:<job_key>`. The path is encoded, not checked. */
+function automationReadPath(id: string, suffix = ''): string {
+  if (!id) throw new Error('Missing automation id');
+  return `/api/v1/automations/${encodeURIComponent(id)}${suffix}`;
+}
+
+/** Scoped task list. Omitted scope keeps the caller's own agent rows. */
+export function listAutomationReads(
+  params: AutomationReadListParams = {},
+): Promise<ApiResponse<AutomationReadList>> {
+  const query = automationReadListQuery(params);
+  return api.get('/api/v1/automations', { params: readParams(query, query) });
+}
+
+/** Scoped run feed. Script statuses such as `succeeded` are sent unchanged. */
+export function listAutomationRunReads(
+  params: AutomationRunReadParams = {},
+): Promise<ApiResponse<AutomationRunReadList>> {
+  const query = automationRunReadQuery(params);
+  return api.get('/api/v1/automations/executions', { params: readParams(query, query) });
+}
+
+/** One agent UUID or one full `data:<job_key>`. The route takes no scope. */
+export function getAutomationRead(id: string): Promise<ApiResponse<AutomationRead>> {
+  return api.get(automationReadPath(id));
+}
+
+/** One task's run page. The route takes no scope, status, or thread. */
+export function listAutomationExecutionReads(
+  id: string,
+  params: AutomationReadPageParams = {},
+): Promise<ApiResponse<AutomationRunReadList>> {
+  const query = automationExecutionReadQuery(params);
+  return api.get(automationReadPath(id, '/executions'), { params: readParams(query) });
+}
+
+/** One task's modification history. The route takes no scope. */
+export function listAutomationHistory(
+  id: string,
+  params: AutomationReadPageParams = {},
+): Promise<ApiResponse<AutomationHistory>> {
+  const query = automationHistoryQuery(params);
+  return api.get(automationReadPath(id, '/history'), { params: readParams(query) });
+}

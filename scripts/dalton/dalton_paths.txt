@@ -265,3 +265,7 @@ tests/integration/dalton/test_au1_company_foundation_db.py
 
 # Computer-scoped automation execution visibility tests.
 tests/unit/server/database/test_last_execution_reach.py
+# Unified task read hooks: agent and script list, detail, runs, and history.
+web/src/pages/Automations/hooks/useAutomationReads.ts
+web/src/pages/Automations/hooks/__tests__/useAutomationReads.test.tsx
+web/src/pages/Automations/utils/__tests__/api.reads.test.ts

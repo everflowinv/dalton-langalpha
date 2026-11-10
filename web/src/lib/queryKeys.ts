@@ -1,4 +1,9 @@
 import type { QueryMeta } from '@tanstack/react-query';
+import type {
+  AutomationReadListQuery,
+  AutomationReadPageQuery,
+  AutomationRunReadQuery,
+} from '@/types/automation';
 
 /**
  * Hierarchical query key factory for React Query, plus the query `meta`
@@ -352,6 +357,18 @@ export const queryKeys = {
     executions: (automationId: string) => [...queryKeys.automations.all, 'executions', automationId],
     runs:       () => [...queryKeys.automations.all, 'runs'],
     waiting:    (threadId: string) => [...queryKeys.automations.all, 'waiting', threadId],
+    // DALTON-HOOK(company-automations): agent and script reads share the write
+    // invalidation prefix and stay off the agent-only list, history, and feed keys.
+    readList: (userId: string | null, params: AutomationReadListQuery) =>
+      [...queryKeys.automations.all, 'read', 'list', userId, params],
+    readDetail: (userId: string | null, automationId: string) =>
+      [...queryKeys.automations.all, 'read', 'detail', userId, automationId],
+    readRuns: (userId: string | null, params: AutomationRunReadQuery) =>
+      [...queryKeys.automations.all, 'read', 'runs', userId, params],
+    readExecutions: (userId: string | null, automationId: string, params: AutomationReadPageQuery) =>
+      [...queryKeys.automations.all, 'read', 'executions', userId, automationId, params],
+    readHistory: (userId: string | null, automationId: string, params: AutomationReadPageQuery) =>
+      [...queryKeys.automations.all, 'read', 'history', userId, automationId, params],
   },
   // The chats an automation can deliver to, per workspace (null: an
   // automation with no workspace). Its own root: an
