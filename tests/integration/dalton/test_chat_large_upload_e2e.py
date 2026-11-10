@@ -27,8 +27,9 @@ import shlex
 import shutil
 import sys
 import tempfile
+import threading
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import create_autospec, patch
 from urllib.parse import quote_plus, urlsplit, urlunsplit
 from uuid import uuid4
 
@@ -234,7 +235,14 @@ async def _ensure_migrations_applied(dsn: str) -> None:
                 SELECT
                     current_database(),
                     to_regclass('public.dalton_chat_file_uploads'),
-                    to_regclass('public.alembic_version_dalton')
+                    to_regclass('public.alembic_version_dalton'),
+                    EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = 'public'
+                          AND table_name = 'dalton_chat_file_uploads'
+                          AND column_name = 'claim_token'
+                    )
                 """
             )
             verified = await cur.fetchone()
@@ -242,6 +250,29 @@ async def _ensure_migrations_applied(dsn: str) -> None:
             assert str(verified[0]).endswith("_test")
             assert verified[1] is not None, "Dalton migration d033 did not create dalton_chat_file_uploads"
             assert verified[2] is not None, "alembic_version_dalton table missing after d033 upgrade"
+            if not verified[3]:
+                await asyncio.to_thread(command.downgrade, dalton_cfg, "d030")
+                await asyncio.to_thread(command.upgrade, dalton_cfg, "d033")
+
+            await cur.execute(
+                """
+                SELECT
+                    EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = 'public'
+                          AND table_name = 'dalton_chat_file_uploads'
+                          AND column_name = 'claim_token'
+                    ),
+                    EXISTS (
+                        SELECT 1
+                        FROM pg_constraint
+                        WHERE conname = 'chk_dalton_chat_file_uploads_cleaned_terminal'
+                    )
+                """
+            )
+            schema_flags = await cur.fetchone()
+            assert schema_flags == (True, True), f"Incomplete d033 schema on _test DB: {schema_flags!r}"
 
 
 @pytest_asyncio.fixture(scope="session")
@@ -668,6 +699,60 @@ async def _upload_streamed_file_via_http(
     assert retry_complete.json()["sha256"] == expected_sha256
 
     return complete_body, object_key, expected_sha256
+
+
+async def _stage_parts_without_completing(
+    client: httpx.AsyncClient,
+    *,
+    user_id: str,
+    workspace_id: str,
+    filename: str,
+    mime_type: str,
+    total_bytes: int,
+    seed_tag: bytes,
+    tracked_keys: set[str],
+    tracked_multiparts: list[tuple[str, str]],
+) -> tuple[str, str, str, str]:
+    """Initiate a chat upload and PUT all parts into MinIO without calling /complete."""
+    headers = {"x-test-user-id": user_id}
+    init_resp = await client.post(
+        "/api/v1/dalton/chat-uploads",
+        headers=headers,
+        json={
+            "workspace_id": workspace_id,
+            "filename": filename,
+            "mime_type": mime_type,
+            "size_bytes": total_bytes,
+        },
+    )
+    assert init_resp.status_code == 200, init_resp.text
+    init_body = init_resp.json()
+    upload_id = str(init_body["upload_id"])
+
+    row = await chat_uploads_db.get_upload(upload_id)
+    assert row is not None
+    object_key = str(row["object_key"])
+    store_upload_id = str(row["store_upload_id"])
+    tracked_keys.add(object_key)
+    tracked_multiparts.append((object_key, store_upload_id))
+
+    whole_hasher = hashlib.sha256()
+    for part_number, chunk_bytes, part_sha in _iter_deterministic_parts(
+        total_bytes, seed_tag=seed_tag
+    ):
+        whole_hasher.update(chunk_bytes)
+        put_resp = await client.put(
+            f"/api/v1/dalton/chat-uploads/{upload_id}/parts/{part_number}",
+            headers={
+                **headers,
+                "content-type": "application/octet-stream",
+                "x-part-sha256": part_sha,
+            },
+            content=chunk_bytes,
+        )
+        assert put_resp.status_code == 200, put_resp.text
+
+    return upload_id, object_key, store_upload_id, whole_hasher.hexdigest()
 
 
 @pytest.mark.asyncio
@@ -1392,3 +1477,451 @@ class TestChatLargeUploadRealInfra:
                 await sandbox_1.cleanup()
             if sandbox_2 is not None:
                 await sandbox_2.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_completion_lease_ownership_stale_errors_and_late_cancel_cleanup(
+        self,
+        chat_upload_infra,
+        docker_ptc_sandbox: PTCSandbox,
+    ) -> None:
+        """Verify PostgreSQL claim_token ownership across expired-lease recovery, stale
+        reopen/mark_failed errors, and late-object assembly after cancellation."""
+        uid_tag = uuid4().hex[:8]
+        user = await create_user(
+            user_id=f"u-lease-e2e-{uid_tag}",
+            email=f"lease-e2e-{uid_tag}@chat-upload-e2e.test",
+            name="Completion Lease Tester",
+        )
+        ws = await create_workspace(
+            user_id=user["user_id"],
+            name="Lease Recovery Workspace",
+            description="Completion lease ownership E2E",
+            status="running",
+        )
+        workspace_id = str(ws["workspace_id"])
+        headers = {"x-test-user-id": user["user_id"]}
+        project = ProjectContext(workspace_id=workspace_id, dir_name="lease_recovery")
+        await docker_ptc_sandbox._ensure_workspace_dirs(project.dir_name)
+
+        real_digest = storage.compute_stored_object_digest
+        real_complete_mp = storage.complete_multipart_upload
+
+        # ------------------------------------------------------------------
+        # 1. Stale Worker A / Successor Worker B completion + used materialization
+        # ------------------------------------------------------------------
+        size_1 = CHAT_UPLOAD_PART_SIZE + 65536
+        uid_1, key_1, _, sha_1 = await _stage_parts_without_completing(
+            chat_upload_infra.client,
+            user_id=user["user_id"],
+            workspace_id=workspace_id,
+            filename="lease_winner.bin",
+            mime_type="application/octet-stream",
+            total_bytes=size_1,
+            seed_tag=b"lease-race-1",
+            tracked_keys=chat_upload_infra.tracked_keys,
+            tracked_multiparts=chat_upload_infra.tracked_multiparts,
+        )
+
+        entered_1 = threading.Event()
+        release_1 = threading.Event()
+        calls_1 = 0
+
+        def _digest_race_1(object_key: str) -> tuple[int, str] | None:
+            nonlocal calls_1
+            calls_1 += 1
+            res = real_digest(object_key)
+            if calls_1 == 1:
+                entered_1.set()
+                if not release_1.wait(15):
+                    raise TimeoutError("release_1 timed out")
+            return res
+
+        with patch.object(
+            storage,
+            "compute_stored_object_digest",
+            create_autospec(real_digest, side_effect=_digest_race_1),
+        ):
+            task_1a = asyncio.create_task(
+                chat_upload_infra.client.post(
+                    f"/api/v1/dalton/chat-uploads/{uid_1}/complete",
+                    headers=headers,
+                    json={"sha256": sha_1},
+                )
+            )
+            assert await asyncio.to_thread(entered_1.wait, 10)
+
+            async with chat_upload_infra.db() as conn:
+                await conn.execute(
+                    "UPDATE dalton_chat_file_uploads SET lease_until = NOW() - INTERVAL '5 seconds' WHERE upload_id = %s",
+                    (uid_1,),
+                )
+
+            try:
+                resp_1b = await chat_upload_infra.client.post(
+                    f"/api/v1/dalton/chat-uploads/{uid_1}/complete",
+                    headers=headers,
+                    json={"sha256": sha_1},
+                )
+                assert resp_1b.status_code == 200, resp_1b.text
+                assert resp_1b.json()["state"] == "ready"
+                assert resp_1b.json()["sha256"] == sha_1
+
+                claimed_1 = await validate_and_claim_request_attachments(
+                    [
+                        {
+                            "type": "chat_upload",
+                            "upload_id": uid_1,
+                            "name": "lease_winner.bin",
+                            "mime_type": "application/octet-stream",
+                            "size": size_1,
+                        }
+                    ],
+                    user_id=user["user_id"],
+                    workspace_id=workspace_id,
+                )
+                assert len(claimed_1) == 1 and claimed_1[0]["used_at"] is not None
+            finally:
+                release_1.set()
+
+            resp_1a = await task_1a
+            assert resp_1a.status_code == 200, resp_1a.text
+            assert resp_1a.json()["state"] == "ready"
+            assert resp_1a.json()["sha256"] == sha_1
+
+        row_1 = await chat_uploads_db.get_upload(uid_1)
+        assert row_1 is not None
+        assert row_1["state"] == "ready"
+        assert row_1["used_at"] is not None
+        assert row_1["cleaned_at"] is None
+        assert row_1["claim_token"] is None
+        assert real_digest(key_1) == (size_1, sha_1)
+
+        # DB CHECK constraint rejects marking a ready row cleaned_at
+        async with chat_upload_infra.db() as conn:
+            with pytest.raises(psycopg.errors.CheckViolation):
+                async with conn.transaction():
+                    await conn.execute(
+                        "UPDATE dalton_chat_file_uploads SET cleaned_at = NOW() WHERE upload_id = %s",
+                        (uid_1,),
+                    )
+
+        # Used upload remains readable and materializes cleanly into the Docker sandbox
+        chat_req_1 = ChatRequest(
+            messages=[ChatMessage(role="user", content="Verify reclaimed upload")],
+            workspace_id=workspace_id,
+            additional_context=[
+                {
+                    "type": "chat_upload",
+                    "upload_id": uid_1,
+                    "name": "lease_winner.bin",
+                    "mime_type": "application/octet-stream",
+                    "size": size_1,
+                }
+            ],
+        )
+        await attach_request_files(
+            [{"role": "user", "content": "Verify reclaimed upload"}],
+            chat_req_1,
+            SimpleNamespace(sandbox=docker_ptc_sandbox),
+            "gpt-5",
+            SimpleNamespace(input_modalities=["text", "image", "pdf"]),
+            project=project,
+            user_id=user["user_id"],
+            workspace_id=workspace_id,
+        )
+        rel_1 = build_sandbox_upload_rel_path(row_1)
+        abs_1 = docker_ptc_sandbox.normalize_path(rel_1, project=project)
+        verify_1 = await docker_ptc_sandbox.execute_bash_command(
+            "python3 -c 'import hashlib, json, sys; p=sys.argv[1]; b=open(p,\"rb\").read(); "
+            "print(json.dumps([len(b), hashlib.sha256(b).hexdigest()]))' "
+            f"{shlex.quote(abs_1)}",
+            timeout=60,
+        )
+        assert verify_1.get("success") is True, verify_1
+        assert json.loads((verify_1.get("stdout") or "").strip().splitlines()[-1]) == [
+            size_1,
+            sha_1,
+        ]
+
+        # ------------------------------------------------------------------
+        # 2a. Stale Worker A transient reopen error while Worker B holds completing
+        # ------------------------------------------------------------------
+        size_2 = 512 * 1024
+        uid_2a, key_2a, _, sha_2a = await _stage_parts_without_completing(
+            chat_upload_infra.client,
+            user_id=user["user_id"],
+            workspace_id=workspace_id,
+            filename="stale_reopen.bin",
+            mime_type="application/octet-stream",
+            total_bytes=size_2,
+            seed_tag=b"lease-reopen-2a",
+            tracked_keys=chat_upload_infra.tracked_keys,
+            tracked_multiparts=chat_upload_infra.tracked_multiparts,
+        )
+
+        entered_2a = threading.Event()
+        release_2a = threading.Event()
+        entered_2b = threading.Event()
+        release_2b = threading.Event()
+        calls_2a = 0
+
+        def _digest_reopen_2a(object_key: str) -> tuple[int, str] | None:
+            nonlocal calls_2a
+            calls_2a += 1
+            if calls_2a == 1:
+                entered_2a.set()
+                if not release_2a.wait(15):
+                    raise TimeoutError("release_2a timed out")
+                return None
+            entered_2b.set()
+            if not release_2b.wait(15):
+                raise TimeoutError("release_2b timed out")
+            return real_digest(object_key)
+
+        with patch.object(
+            storage,
+            "compute_stored_object_digest",
+            create_autospec(real_digest, side_effect=_digest_reopen_2a),
+        ):
+            task_2a = asyncio.create_task(
+                chat_upload_infra.client.post(
+                    f"/api/v1/dalton/chat-uploads/{uid_2a}/complete",
+                    headers=headers,
+                    json={"sha256": sha_2a},
+                )
+            )
+            assert await asyncio.to_thread(entered_2a.wait, 10)
+
+            async with chat_upload_infra.db() as conn:
+                await conn.execute(
+                    "UPDATE dalton_chat_file_uploads SET lease_until = NOW() - INTERVAL '5 seconds' WHERE upload_id = %s",
+                    (uid_2a,),
+                )
+
+            task_2b = asyncio.create_task(
+                chat_upload_infra.client.post(
+                    f"/api/v1/dalton/chat-uploads/{uid_2a}/complete",
+                    headers=headers,
+                    json={"sha256": sha_2a},
+                )
+            )
+            assert await asyncio.to_thread(entered_2b.wait, 10)
+            active_2b_row = await chat_uploads_db.get_upload(uid_2a)
+            assert active_2b_row is not None and active_2b_row["state"] == "completing"
+            b_claim_token = active_2b_row["claim_token"]
+            assert b_claim_token is not None
+
+            try:
+                release_2a.set()
+                resp_2a = await task_2a
+                assert resp_2a.status_code == 409, resp_2a.text
+                assert resp_2a.json()["detail"]["code"] == "completing_in_progress"
+
+                after_stale_reopen = await chat_uploads_db.get_upload(uid_2a)
+                assert after_stale_reopen is not None
+                assert after_stale_reopen["state"] == "completing"
+                assert after_stale_reopen["claim_token"] == b_claim_token
+            finally:
+                release_2b.set()
+
+            resp_2b = await task_2b
+            assert resp_2b.status_code == 200, resp_2b.text
+            assert resp_2b.json()["state"] == "ready"
+
+        assert real_digest(key_2a) == (size_2, sha_2a)
+
+        # ------------------------------------------------------------------
+        # 2b. Stale Worker A checksum mismatch mark_failed after B marked ready + used
+        # ------------------------------------------------------------------
+        uid_2b, key_2b, _, sha_2b = await _stage_parts_without_completing(
+            chat_upload_infra.client,
+            user_id=user["user_id"],
+            workspace_id=workspace_id,
+            filename="stale_fail.bin",
+            mime_type="application/octet-stream",
+            total_bytes=size_2,
+            seed_tag=b"lease-fail-2b",
+            tracked_keys=chat_upload_infra.tracked_keys,
+            tracked_multiparts=chat_upload_infra.tracked_multiparts,
+        )
+
+        entered_2b_fail = threading.Event()
+        release_2b_fail = threading.Event()
+        calls_2b = 0
+
+        def _digest_fail_2b(object_key: str) -> tuple[int, str] | None:
+            nonlocal calls_2b
+            calls_2b += 1
+            if calls_2b == 1:
+                entered_2b_fail.set()
+                if not release_2b_fail.wait(15):
+                    raise TimeoutError("release_2b_fail timed out")
+                return (size_2, "0" * 64)
+            return real_digest(object_key)
+
+        with patch.object(
+            storage,
+            "compute_stored_object_digest",
+            create_autospec(real_digest, side_effect=_digest_fail_2b),
+        ):
+            task_2b_stale = asyncio.create_task(
+                chat_upload_infra.client.post(
+                    f"/api/v1/dalton/chat-uploads/{uid_2b}/complete",
+                    headers=headers,
+                    json={"sha256": sha_2b},
+                )
+            )
+            assert await asyncio.to_thread(entered_2b_fail.wait, 10)
+
+            async with chat_upload_infra.db() as conn:
+                await conn.execute(
+                    "UPDATE dalton_chat_file_uploads SET lease_until = NOW() - INTERVAL '5 seconds' WHERE upload_id = %s",
+                    (uid_2b,),
+                )
+
+            try:
+                resp_2b_win = await chat_upload_infra.client.post(
+                    f"/api/v1/dalton/chat-uploads/{uid_2b}/complete",
+                    headers=headers,
+                    json={"sha256": sha_2b},
+                )
+                assert resp_2b_win.status_code == 200, resp_2b_win.text
+                await validate_and_claim_request_attachments(
+                    [
+                        {
+                            "type": "chat_upload",
+                            "upload_id": uid_2b,
+                            "name": "stale_fail.bin",
+                            "mime_type": "application/octet-stream",
+                            "size": size_2,
+                        }
+                    ],
+                    user_id=user["user_id"],
+                    workspace_id=workspace_id,
+                )
+            finally:
+                release_2b_fail.set()
+
+            resp_2b_stale = await task_2b_stale
+            assert resp_2b_stale.status_code == 200, resp_2b_stale.text
+            assert resp_2b_stale.json()["state"] == "ready"
+            assert resp_2b_stale.json()["sha256"] == sha_2b
+
+        row_2b = await chat_uploads_db.get_upload(uid_2b)
+        assert row_2b is not None
+        assert row_2b["state"] == "ready"
+        assert row_2b["used_at"] is not None
+        assert row_2b["cleaned_at"] is None
+        assert real_digest(key_2b) == (size_2, sha_2b)
+
+        # ------------------------------------------------------------------
+        # 3a. Cancellation during finalization with late object assembly (cooperative)
+        # ------------------------------------------------------------------
+        uid_3a, key_3a, store_uid_3a, sha_3a = await _stage_parts_without_completing(
+            chat_upload_infra.client,
+            user_id=user["user_id"],
+            workspace_id=workspace_id,
+            filename="cancel_late_coop.bin",
+            mime_type="application/octet-stream",
+            total_bytes=size_2,
+            seed_tag=b"cancel-late-3a",
+            tracked_keys=chat_upload_infra.tracked_keys,
+            tracked_multiparts=chat_upload_infra.tracked_multiparts,
+        )
+        late_bytes = b"late-assembled-minio-object-" * 1024
+        assembling_3a = threading.Event()
+        finish_3a = threading.Event()
+
+        def _late_complete_3a(
+            object_key: str, store_upload_id: str, parts: list[tuple[int, str]]
+        ) -> bool:
+            assembling_3a.set()
+            if not finish_3a.wait(15):
+                raise TimeoutError("finish_3a timed out")
+            # Simulate S3/MinIO committing CompleteMultipartUpload right after DELETE ran
+            asr_store._get_client().put_object(
+                Bucket=asr_store._bucket_name(),
+                Key=asr_store.resolve_full_key(object_key),
+                Body=late_bytes,
+            )
+            return True
+
+        with patch.object(
+            storage,
+            "complete_multipart_upload",
+            create_autospec(real_complete_mp, side_effect=_late_complete_3a),
+        ):
+            task_3a = asyncio.create_task(
+                chat_upload_infra.client.post(
+                    f"/api/v1/dalton/chat-uploads/{uid_3a}/complete",
+                    headers=headers,
+                    json={"sha256": sha_3a},
+                )
+            )
+            assert await asyncio.to_thread(assembling_3a.wait, 10)
+
+            try:
+                del_3a = await chat_upload_infra.client.delete(
+                    f"/api/v1/dalton/chat-uploads/{uid_3a}",
+                    headers=headers,
+                )
+                assert del_3a.status_code == 200, del_3a.text
+                assert del_3a.json()["state"] == "aborted"
+                mid_3a = await chat_uploads_db.get_upload(uid_3a)
+                assert mid_3a is not None
+                assert mid_3a["state"] == "aborted"
+                assert mid_3a["cleaned_at"] is None
+            finally:
+                finish_3a.set()
+
+            resp_3a = await task_3a
+            assert resp_3a.status_code == 409, resp_3a.text
+
+        final_3a = await chat_uploads_db.get_upload(uid_3a)
+        assert final_3a is not None
+        assert final_3a["state"] == "aborted"
+        assert final_3a["cleaned_at"] is not None
+        assert storage.list_uploaded_parts(key_3a, store_uid_3a) is None
+        assert storage.object_size(key_3a) is None
+
+        # ------------------------------------------------------------------
+        # 3b. Cancellation during finalization when completion worker crashes (sweeper fallback)
+        # ------------------------------------------------------------------
+        uid_3b, key_3b, store_uid_3b, _ = await _stage_parts_without_completing(
+            chat_upload_infra.client,
+            user_id=user["user_id"],
+            workspace_id=workspace_id,
+            filename="cancel_late_crash.bin",
+            mime_type="application/octet-stream",
+            total_bytes=size_2,
+            seed_tag=b"cancel-late-3b",
+            tracked_keys=chat_upload_infra.tracked_keys,
+            tracked_multiparts=chat_upload_infra.tracked_multiparts,
+        )
+        claimed_3b = await chat_uploads_db.claim_complete(
+            uid_3b, lease=timedelta(minutes=5)
+        )
+        assert claimed_3b is not None and claimed_3b["state"] == "completing"
+
+        del_3b = await chat_upload_infra.client.delete(
+            f"/api/v1/dalton/chat-uploads/{uid_3b}",
+            headers=headers,
+        )
+        assert del_3b.status_code == 200, del_3b.text
+        mid_3b = await chat_uploads_db.get_upload(uid_3b)
+        assert mid_3b is not None and mid_3b["cleaned_at"] is None
+
+        # Simulate MinIO writing late assembled object right as worker died before cooperative cleanup
+        asr_store._get_client().put_object(
+            Bucket=asr_store._bucket_name(),
+            Key=asr_store.resolve_full_key(key_3b),
+            Body=late_bytes,
+        )
+        assert storage.object_size(key_3b) == len(late_bytes)
+
+        swept_3b = await sweep_expired_chat_uploads_once()
+        assert swept_3b >= 1
+        final_3b = await chat_uploads_db.get_upload(uid_3b)
+        assert final_3b is not None and final_3b["cleaned_at"] is not None
+        assert storage.list_uploaded_parts(key_3b, store_uid_3b) is None
+        assert storage.object_size(key_3b) is None

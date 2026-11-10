@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 import hashlib
 import inspect
+import threading
 import time
 from typing import Any
 from unittest.mock import create_autospec, patch
@@ -37,6 +39,7 @@ from src.server.services.runs.pending_input import PendingInput, input_rerun_req
 from src.server.utils.api import get_current_user_id
 
 _REAL_COMPUTE_STORED_OBJECT_DIGEST = chat_upload_storage.compute_stored_object_digest
+_REAL_COMPLETE_MULTIPART_UPLOAD = chat_upload_storage.complete_multipart_upload
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +105,7 @@ class InMemoryChatUploadLedger:
                 "uploaded_parts": {},
                 "state": "uploading",
                 "error": None,
+                "claim_token": None,
                 "lease_until": None,
                 "expires_at": now + ttl,
                 "used_at": None,
@@ -163,11 +167,18 @@ class InMemoryChatUploadLedger:
         *,
         lease: timedelta,
         expected_sha256: str | None = None,
+        claim_token: str | None = None,
     ) -> dict[str, Any] | None:
         now = datetime.now(timezone.utc)
+        token = str(claim_token).strip() if claim_token else str(uuid.uuid4())
         async with self._lock:
             row = self.rows.get(upload_id)
-            if not row or row["expires_at"] is None or row["expires_at"] <= now:
+            if (
+                not row
+                or row["cleaned_at"] is not None
+                or row["expires_at"] is None
+                or row["expires_at"] <= now
+            ):
                 return None
             can_claim = row["state"] == "uploading" or (
                 row["state"] == "completing"
@@ -176,19 +187,34 @@ class InMemoryChatUploadLedger:
             if not can_claim:
                 return None
             row["state"] = "completing"
+            row["claim_token"] = token
             row["lease_until"] = now + lease
-            if expected_sha256:
+            if row["expected_sha256"] is None and expected_sha256:
                 row["expected_sha256"] = expected_sha256
             row["updated_at"] = now
             return dict(row)
 
-    async def reopen_uploading(self, upload_id: str) -> dict[str, Any] | None:
+    async def reopen_uploading(
+        self,
+        upload_id: str,
+        *,
+        claim_token: str,
+    ) -> dict[str, Any] | None:
+        token = str(claim_token or "").strip()
+        if not token:
+            return None
         now = datetime.now(timezone.utc)
         async with self._lock:
             row = self.rows.get(upload_id)
-            if not row or row["state"] != "completing":
+            if (
+                not row
+                or row["state"] != "completing"
+                or row.get("claim_token") != token
+                or row["cleaned_at"] is not None
+            ):
                 return None
             row["state"] = "uploading"
+            row["claim_token"] = None
             row["lease_until"] = None
             row["updated_at"] = now
             return dict(row)
@@ -197,30 +223,54 @@ class InMemoryChatUploadLedger:
         self,
         upload_id: str,
         *,
+        claim_token: str,
         actual_sha256: str,
         ready_ttl: timedelta,
     ) -> dict[str, Any] | None:
+        token = str(claim_token or "").strip()
+        if not token:
+            return None
         now = datetime.now(timezone.utc)
         async with self._lock:
             row = self.rows.get(upload_id)
-            if not row or row["state"] != "completing":
+            if (
+                not row
+                or row["state"] != "completing"
+                or row.get("claim_token") != token
+                or row["cleaned_at"] is not None
+            ):
                 return None
             row["state"] = "ready"
             row["actual_sha256"] = actual_sha256
+            row["claim_token"] = None
             row["lease_until"] = None
             row["error"] = None
             row["expires_at"] = max(row["expires_at"] or now, now + ready_ttl)
             row["updated_at"] = now
             return dict(row)
 
-    async def mark_failed(self, upload_id: str, *, error: str) -> dict[str, Any] | None:
+    async def mark_failed(
+        self,
+        upload_id: str,
+        *,
+        claim_token: str,
+        error: str,
+    ) -> dict[str, Any] | None:
+        token = str(claim_token or "").strip()
+        if not token:
+            return None
         now = datetime.now(timezone.utc)
         async with self._lock:
             row = self.rows.get(upload_id)
-            if not row or row["state"] not in ("uploading", "completing"):
+            if (
+                not row
+                or row["state"] != "completing"
+                or row.get("claim_token") != token
+            ):
                 return None
             row["state"] = "failed"
             row["error"] = error[:500]
+            row["claim_token"] = None
             row["lease_until"] = None
             row["expires_at"] = min(row["expires_at"] or now, now)
             row["updated_at"] = now
@@ -237,9 +287,24 @@ class InMemoryChatUploadLedger:
             )
             if not allowed:
                 return None
+            had_completing = row["state"] == "completing"
             row["state"] = "aborted"
+            row["claim_token"] = None
             row["lease_until"] = None
+            row["cleaned_at"] = None
             row["expires_at"] = min(row["expires_at"] or now, now)
+            row["updated_at"] = now
+            return {**row, "had_completing": had_completing}
+
+    async def reopen_terminal_cleanup(self, upload_id: str) -> dict[str, Any] | None:
+        now = datetime.now(timezone.utc)
+        async with self._lock:
+            row = self.rows.get(upload_id)
+            if not row or row["state"] not in ("aborted", "failed"):
+                return None
+            row["cleaned_at"] = None
+            row["claim_token"] = None
+            row["lease_until"] = None
             row["updated_at"] = now
             return dict(row)
 
@@ -292,20 +357,23 @@ class InMemoryChatUploadLedger:
         return rows
 
     async def retire_uploads_by_ids(
-        self, upload_ids: Any, *, workspace_id: str
+        self, upload_ids: Sequence[str], *, workspace_id: str
     ) -> list[dict[str, Any]]:
         now = datetime.now(timezone.utc)
-        wanted = {str(u) for u in upload_ids}
+        wanted = {str(u) for u in upload_ids if u}
         retired: list[dict[str, Any]] = []
         async with self._lock:
             for uid in wanted:
                 row = self.rows.get(uid)
                 if row and row["workspace_id"] == workspace_id and row["cleaned_at"] is None:
+                    had_completing = row["state"] == "completing"
                     row["state"] = "aborted"
+                    row["claim_token"] = None
                     row["lease_until"] = None
+                    row["cleaned_at"] = None
                     row["expires_at"] = now
                     row["updated_at"] = now
-                    retired.append(dict(row))
+                    retired.append({**row, "had_completing": had_completing})
         return retired
 
     async def retire_workspace_uploads(self, workspace_id: str) -> list[dict[str, Any]]:
@@ -314,11 +382,14 @@ class InMemoryChatUploadLedger:
         async with self._lock:
             for row in self.rows.values():
                 if row["workspace_id"] == workspace_id and row["cleaned_at"] is None:
+                    had_completing = row["state"] == "completing"
                     row["state"] = "aborted"
+                    row["claim_token"] = None
                     row["lease_until"] = None
+                    row["cleaned_at"] = None
                     row["expires_at"] = now
                     row["updated_at"] = now
-                    retired.append(dict(row))
+                    retired.append({**row, "had_completing": had_completing})
         return retired
 
     async def claim_cleanup_batch(
@@ -327,8 +398,10 @@ class InMemoryChatUploadLedger:
         limit: int = 25,
         claim_lease: timedelta = timedelta(minutes=5),
         now: datetime | None = None,
+        claim_token: str | None = None,
     ) -> list[dict[str, Any]]:
         eff_now = now or datetime.now(timezone.utc)
+        token = str(claim_token).strip() if claim_token else str(uuid.uuid4())
         claimed: list[dict[str, Any]] = []
         async with self._lock:
             candidates = sorted(
@@ -363,30 +436,58 @@ class InMemoryChatUploadLedger:
                     continue
                 if row["state"] in ("uploading", "completing", "ready"):
                     row["state"] = "aborted"
+                row["claim_token"] = token
                 row["lease_until"] = eff_now + claim_lease
                 row["updated_at"] = eff_now
                 claimed.append(dict(row))
         return claimed
 
-    async def mark_cleaned(self, upload_id: str) -> bool:
+    async def mark_cleaned(
+        self,
+        upload_id: str,
+        *,
+        claim_token: str | None = None,
+    ) -> bool:
         now = datetime.now(timezone.utc)
         async with self._lock:
             row = self.rows.get(upload_id)
-            if row and row["cleaned_at"] is None:
-                row["cleaned_at"] = now
-                row["lease_until"] = None
-                row["updated_at"] = now
-                return True
-            return False
+            if (
+                not row
+                or row["state"] not in ("aborted", "failed")
+                or row["cleaned_at"] is not None
+            ):
+                return False
+            if claim_token is not None:
+                token = str(claim_token).strip()
+                if not token or row.get("claim_token") != token:
+                    return False
+            row["cleaned_at"] = now
+            row["claim_token"] = None
+            row["lease_until"] = None
+            row["updated_at"] = now
+            return True
 
     async def release_cleanup_claim(
-        self, upload_id: str, *, retry_after: timedelta = timedelta(minutes=2)
+        self,
+        upload_id: str,
+        *,
+        claim_token: str,
+        retry_after: timedelta = timedelta(minutes=2),
     ) -> None:
+        token = str(claim_token or "").strip()
+        if not token:
+            return
         now = datetime.now(timezone.utc)
         async with self._lock:
             if row := self.rows.get(upload_id):
-                if row["cleaned_at"] is None:
+                if (
+                    row["state"] in ("aborted", "failed")
+                    and row["cleaned_at"] is None
+                    and row.get("claim_token") == token
+                ):
+                    row["claim_token"] = None
                     row["lease_until"] = now + retry_after
+                    row["updated_at"] = now
 
     async def prune_cleaned_rows(
         self,
@@ -524,6 +625,7 @@ def upload_env(monkeypatch: pytest.MonkeyPatch):
         "mark_ready",
         "mark_failed",
         "abort_upload",
+        "reopen_terminal_cleanup",
         "mark_used",
         "has_retained_workspace_uploads",
         "list_retained_workspace_uploads",
@@ -615,16 +717,40 @@ def test_migration_d033_contract() -> None:
     ):
         d033_chat_file_uploads.upgrade()
         assert any("CREATE TABLE IF NOT EXISTS dalton_chat_file_uploads" in s for s in executed_sql)
+        assert any("claim_token TEXT" in s for s in executed_sql)
+        assert any("chk_dalton_chat_file_uploads_cleaned_terminal" in s for s in executed_sql)
         assert any("idx_dalton_chat_file_uploads_cleanup" in s for s in executed_sql)
 
         executed_sql.clear()
         d033_chat_file_uploads.downgrade()
         assert any("DROP TABLE IF EXISTS dalton_chat_file_uploads" in s for s in executed_sql)
 
-    # Guard against AmbiguousColumn in CTE UPDATE ... FROM due RETURNING:
-    assert "RETURNING {_U_COLUMNS}" in inspect.getsource(db_chat_uploads.claim_cleanup_batch)
+    # Guard against AmbiguousColumn in CTE UPDATE ... FROM ... RETURNING:
+    for cte_fn in (
+        db_chat_uploads.abort_upload,
+        db_chat_uploads.retire_uploads_by_ids,
+        db_chat_uploads.retire_workspace_uploads,
+        db_chat_uploads.claim_cleanup_batch,
+    ):
+        assert "RETURNING {_U_COLUMNS}" in inspect.getsource(cte_fn)
     for col_expr in db_chat_uploads._U_COLUMNS.split(","):
         assert col_expr.strip().startswith("u.")
+
+    # Ensure InMemoryChatUploadLedger mirrors every public async helper in db_chat_uploads
+    for name, member in inspect.getmembers(db_chat_uploads, inspect.iscoroutinefunction):
+        if member.__module__ != db_chat_uploads.__name__:
+            continue
+        ledger_fn = getattr(InMemoryChatUploadLedger, name, None)
+        assert ledger_fn is not None, f"Missing {name} on InMemoryChatUploadLedger"
+        real_params = [
+            (p.name, p.kind)
+            for p in inspect.signature(member).parameters.values()
+        ]
+        fake_params = [
+            (p.name, p.kind)
+            for p in list(inspect.signature(ledger_fn).parameters.values())[1:]
+        ]
+        assert fake_params == real_params, f"Signature mismatch on {name}: {fake_params} != {real_params}"
 
 
 def test_storage_key_isolation_never_touches_asr_prefix() -> None:
@@ -1380,6 +1506,7 @@ async def test_cold_workspace_restore_and_future_turn_rematerialize_200mib_beyon
         "uploaded_parts": {},
         "state": "ready",
         "error": None,
+        "claim_token": None,
         "lease_until": None,
         "expires_at": None,
         "used_at": now,
@@ -1560,6 +1687,7 @@ async def test_recovery_rejects_unauthorized_owner_key_mismatch_and_deleted_work
         "uploaded_parts": {},
         "state": "ready",
         "error": None,
+        "claim_token": None,
         "lease_until": None,
         "expires_at": None,
         "used_at": now,
@@ -1761,3 +1889,322 @@ async def test_router_handle_api_exceptions_logger_and_real_sandbox_signatures(
     assert resp.json()["detail"] == "Failed to get chat upload status"
     log_exc.assert_called_once()
 
+
+# ---------------------------------------------------------------------------
+# 6. Lease-recovery completion ownership & late-assembly cancellation tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_completion_lease_expiry_and_reclaim_preserves_ready_and_used_upload(
+    upload_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When Worker A stalls past lease_until after assembly, Worker B reclaims and marks
+    ready (+ used); Worker A resuming must return idempotently without deleting B's object."""
+    user_id = "user-lease-ready"
+    ws_id = str(uuid.uuid4())
+    upload_env["workspaces"][ws_id] = {
+        "workspace_id": ws_id,
+        "user_id": user_id,
+        "status": "running",
+    }
+
+    payload = b"durable-lease-payload-" * 256
+    expected_sha = hashlib.sha256(payload).hexdigest()
+    created = await svc.initiate_chat_upload(
+        user_id=user_id,
+        workspace_id=ws_id,
+        filename="lease_race.bin",
+        size_bytes=len(payload),
+        expected_sha256=expected_sha,
+    )
+    uid = created["upload_id"]
+    row = upload_env["ledger"].rows[uid]
+    await svc.receive_chat_upload_part(
+        upload_id=uid, part_number=1, user_id=user_id, stream=_bytes_stream(payload)
+    )
+
+    entered_a = threading.Event()
+    release_a = threading.Event()
+    call_count = 0
+    store_digest = upload_env["store"].compute_stored_object_digest
+
+    def _controlled_digest(object_key: str) -> tuple[int, str] | None:
+        nonlocal call_count
+        call_count += 1
+        res = store_digest(object_key)
+        if call_count == 1:
+            entered_a.set()
+            if not release_a.wait(5):
+                raise TimeoutError("Worker A release timed out")
+        return res
+
+    monkeypatch.setattr(
+        chat_upload_storage,
+        "compute_stored_object_digest",
+        create_autospec(_REAL_COMPUTE_STORED_OBJECT_DIGEST, side_effect=_controlled_digest),
+    )
+
+    worker_a = asyncio.create_task(
+        svc.complete_chat_upload(upload_id=uid, user_id=user_id, expected_sha256=expected_sha)
+    )
+    assert await asyncio.to_thread(entered_a.wait, 3)
+
+    # Expire Worker A's completion lease; Worker B reclaims, completes, and chat turn marks used_at
+    row["lease_until"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+    try:
+        second = await svc.complete_chat_upload(
+            upload_id=uid, user_id=user_id, expected_sha256=expected_sha
+        )
+        assert second["state"] == "ready"
+        assert second["sha256"] == expected_sha
+
+        claimed_turn = await svc.validate_and_claim_request_attachments(
+            [ChatUploadContext(upload_id=uid, name="lease_race.bin", size=len(payload))],
+            user_id=user_id,
+            workspace_id=ws_id,
+        )
+        assert claimed_turn[0]["used_at"] is not None
+    finally:
+        release_a.set()
+
+    first = await worker_a
+    assert first["state"] == "ready"
+    assert first["sha256"] == expected_sha
+    assert row["state"] == "ready"
+    assert row["used_at"] is not None
+    assert row["cleaned_at"] is None
+    assert upload_env["store"].objects.get(row["object_key"]) == payload
+
+
+@pytest.mark.asyncio
+async def test_stale_completion_errors_cannot_reopen_fail_or_delete_successor(
+    upload_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Stale Worker A hitting transient reopen or checksum-mismatch mark_failed cannot
+    clobber active Worker B or delete B's ready/used object."""
+    user_id = "user-stale-err"
+    ws_id = str(uuid.uuid4())
+    upload_env["workspaces"][ws_id] = {
+        "workspace_id": ws_id,
+        "user_id": user_id,
+        "status": "running",
+    }
+    store_digest = upload_env["store"].compute_stored_object_digest
+
+    # 1. Stale Worker A gets transient None digest while Worker B actively holds completing
+    payload_1 = b"reopen-guard-" * 128
+    up_1 = await svc.initiate_chat_upload(
+        user_id=user_id, workspace_id=ws_id, filename="reopen_guard.bin", size_bytes=len(payload_1)
+    )
+    uid_1 = up_1["upload_id"]
+    row_1 = upload_env["ledger"].rows[uid_1]
+    await svc.receive_chat_upload_part(
+        upload_id=uid_1, part_number=1, user_id=user_id, stream=_bytes_stream(payload_1)
+    )
+
+    entered_1a = threading.Event()
+    release_1a = threading.Event()
+    entered_1b = threading.Event()
+    release_1b = threading.Event()
+    seq_1 = 0
+
+    def _digest_reopen_race(object_key: str) -> tuple[int, str] | None:
+        nonlocal seq_1
+        seq_1 += 1
+        if seq_1 == 1:
+            entered_1a.set()
+            if not release_1a.wait(5):
+                raise TimeoutError("1a timeout")
+            return None
+        entered_1b.set()
+        if not release_1b.wait(5):
+            raise TimeoutError("1b timeout")
+        return store_digest(object_key)
+
+    monkeypatch.setattr(
+        chat_upload_storage,
+        "compute_stored_object_digest",
+        create_autospec(_REAL_COMPUTE_STORED_OBJECT_DIGEST, side_effect=_digest_reopen_race),
+    )
+
+    task_1a = asyncio.create_task(svc.complete_chat_upload(upload_id=uid_1, user_id=user_id))
+    assert await asyncio.to_thread(entered_1a.wait, 3)
+    row_1["lease_until"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+    task_1b = asyncio.create_task(svc.complete_chat_upload(upload_id=uid_1, user_id=user_id))
+    assert await asyncio.to_thread(entered_1b.wait, 3)
+    b_token = row_1["claim_token"]
+    assert b_token is not None
+
+    # Release stale A while B is still completing: A cannot reopen B and gets 409 completing_in_progress
+    release_1a.set()
+    with pytest.raises(HTTPException) as stale_reopen_exc:
+        await task_1a
+    assert stale_reopen_exc.value.status_code == 409
+    assert stale_reopen_exc.value.detail["code"] == "completing_in_progress"
+    assert row_1["state"] == "completing"
+    assert row_1["claim_token"] == b_token
+
+    release_1b.set()
+    done_1b = await task_1b
+    assert done_1b["state"] == "ready"
+    assert row_1["cleaned_at"] is None
+    assert upload_env["store"].objects.get(row_1["object_key"]) == payload_1
+
+    # 2. Stale Worker A gets mismatched digest after Worker B marked ready + used_at
+    payload_2 = b"fail-guard-" * 128
+    sha_2 = hashlib.sha256(payload_2).hexdigest()
+    up_2 = await svc.initiate_chat_upload(
+        user_id=user_id,
+        workspace_id=ws_id,
+        filename="fail_guard.bin",
+        size_bytes=len(payload_2),
+        expected_sha256=sha_2,
+    )
+    uid_2 = up_2["upload_id"]
+    row_2 = upload_env["ledger"].rows[uid_2]
+    await svc.receive_chat_upload_part(
+        upload_id=uid_2, part_number=1, user_id=user_id, stream=_bytes_stream(payload_2)
+    )
+
+    entered_2a = threading.Event()
+    release_2a = threading.Event()
+    seq_2 = 0
+
+    def _digest_fail_race(object_key: str) -> tuple[int, str] | None:
+        nonlocal seq_2
+        seq_2 += 1
+        if seq_2 == 1:
+            entered_2a.set()
+            if not release_2a.wait(5):
+                raise TimeoutError("2a timeout")
+            return (len(payload_2), "0" * 64)
+        return store_digest(object_key)
+
+    monkeypatch.setattr(
+        chat_upload_storage,
+        "compute_stored_object_digest",
+        create_autospec(_REAL_COMPUTE_STORED_OBJECT_DIGEST, side_effect=_digest_fail_race),
+    )
+
+    task_2a = asyncio.create_task(
+        svc.complete_chat_upload(upload_id=uid_2, user_id=user_id, expected_sha256=sha_2)
+    )
+    assert await asyncio.to_thread(entered_2a.wait, 3)
+    row_2["lease_until"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+    try:
+        done_2b = await svc.complete_chat_upload(
+            upload_id=uid_2, user_id=user_id, expected_sha256=sha_2
+        )
+        assert done_2b["state"] == "ready"
+        await svc.validate_and_claim_request_attachments(
+            [ChatUploadContext(upload_id=uid_2, name="fail_guard.bin", size=len(payload_2))],
+            user_id=user_id,
+            workspace_id=ws_id,
+        )
+    finally:
+        release_2a.set()
+
+    done_2a = await task_2a
+    assert done_2a["state"] == "ready"
+    assert done_2a["sha256"] == sha_2
+    assert row_2["state"] == "ready"
+    assert row_2["used_at"] is not None
+    assert row_2["cleaned_at"] is None
+    assert upload_env["store"].objects.get(row_2["object_key"]) == payload_2
+
+    # Direct defense-in-depth check: _cleanup_storage_objects refuses non-terminal rows
+    assert await svc._cleanup_storage_objects(row_2) is False
+    assert upload_env["store"].objects.get(row_2["object_key"]) == payload_2
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_finalization_cleans_late_assembled_object_and_sweeper_fallback(
+    upload_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancellation during complete_multipart_upload removes late-assembled objects both
+    cooperatively when the completion worker resumes and durably via the sweeper on crash."""
+    user_id = "user-cancel-finalizing"
+    ws_id = str(uuid.uuid4())
+    upload_env["workspaces"][ws_id] = {
+        "workspace_id": ws_id,
+        "user_id": user_id,
+        "status": "running",
+    }
+    payload = b"late-assembly-bytes-" * 200
+
+    # 1. Cooperative cleanup when CompleteMultipartUpload lands right after cancel_chat_upload
+    up_1 = await svc.initiate_chat_upload(
+        user_id=user_id, workspace_id=ws_id, filename="late_coop.bin", size_bytes=len(payload)
+    )
+    uid_1 = up_1["upload_id"]
+    row_1 = upload_env["ledger"].rows[uid_1]
+    key_1 = row_1["object_key"]
+    await svc.receive_chat_upload_part(
+        upload_id=uid_1, part_number=1, user_id=user_id, stream=_bytes_stream(payload)
+    )
+
+    assembling_1 = threading.Event()
+    finish_assembly_1 = threading.Event()
+
+    def _late_complete_1(
+        object_key: str, store_upload_id: str, parts: list[tuple[int, str]]
+    ) -> bool:
+        assembling_1.set()
+        if not finish_assembly_1.wait(5):
+            raise TimeoutError("finish_assembly_1 timeout")
+        # Simulate S3/MinIO committing CompleteMultipartUpload just after Abort/Delete ran
+        upload_env["store"].objects[object_key] = payload
+        return True
+
+    monkeypatch.setattr(
+        chat_upload_storage,
+        "complete_multipart_upload",
+        create_autospec(_REAL_COMPLETE_MULTIPART_UPLOAD, side_effect=_late_complete_1),
+    )
+
+    comp_task_1 = asyncio.create_task(svc.complete_chat_upload(upload_id=uid_1, user_id=user_id))
+    assert await asyncio.to_thread(assembling_1.wait, 3)
+
+    try:
+        cancelled_1 = await svc.cancel_chat_upload(upload_id=uid_1, user_id=user_id)
+        assert cancelled_1["state"] == "aborted"
+        # While in-flight completion was active, cleaned_at stays unset until late assembly resolves
+        assert row_1["cleaned_at"] is None
+    finally:
+        finish_assembly_1.set()
+
+    with pytest.raises(HTTPException) as cancel_race_exc:
+        await comp_task_1
+    assert cancel_race_exc.value.status_code == 409
+    assert key_1 not in upload_env["store"].objects
+    assert row_1["state"] == "aborted"
+    assert row_1["cleaned_at"] is not None
+
+    # 2. Sweeper fallback if completion worker crashes right after MinIO writes late object
+    up_2 = await svc.initiate_chat_upload(
+        user_id=user_id, workspace_id=ws_id, filename="late_crash.bin", size_bytes=len(payload)
+    )
+    uid_2 = up_2["upload_id"]
+    row_2 = upload_env["ledger"].rows[uid_2]
+    key_2 = row_2["object_key"]
+    await svc.receive_chat_upload_part(
+        upload_id=uid_2, part_number=1, user_id=user_id, stream=_bytes_stream(payload)
+    )
+
+    claimed_2 = await db_chat_uploads.claim_complete(uid_2, lease=svc.COMPLETE_LEASE)
+    assert claimed_2 is not None and claimed_2["state"] == "completing"
+
+    await svc.cancel_chat_upload(upload_id=uid_2, user_id=user_id)
+    assert row_2["state"] == "aborted"
+    assert row_2["cleaned_at"] is None
+
+    # Simulate MinIO finishing late object creation right as the worker process died
+    upload_env["store"].objects[key_2] = payload
+    assert key_2 in upload_env["store"].objects
+
+    swept = await svc.sweep_expired_chat_uploads_once()
+    assert swept == 1
+    assert key_2 not in upload_env["store"].objects
+    assert row_2["cleaned_at"] is not None

@@ -420,7 +420,11 @@ async def receive_chat_upload_part(
     if updated is None:
         current = await db.get_upload(str(row["upload_id"]))
         if current and current.get("state") in ("aborted", "failed"):
-            await _cleanup_storage_objects(current)
+            if current.get("cleaned_at") is not None:
+                current = (
+                    await db.reopen_terminal_cleanup(str(row["upload_id"])) or current
+                )
+            await _cleanup_storage_objects(current, mark_cleaned_on_success=True)
         raise HTTPException(
             status_code=409,
             detail="Upload is no longer accepting parts",
@@ -435,6 +439,57 @@ async def receive_chat_upload_part(
     }
 
 
+async def _handle_lost_completion_claim(
+    upload_id: str,
+    *,
+    normalized_sha: str | None,
+    assembled_in_this_attempt: bool = False,
+    had_prior_claim: bool = False,
+) -> dict[str, Any]:
+    """Resolve a completion attempt whose claim was not acquired or was superseded."""
+    latest = await db.get_upload(upload_id)
+    if not latest:
+        raise HTTPException(status_code=404, detail="Upload not found")
+
+    latest_state = str(latest["state"])
+    if latest_state == "ready" and latest.get("cleaned_at") is None:
+        if normalized_sha and not hmac.compare_digest(
+            str(latest.get("actual_sha256") or ""), normalized_sha
+        ):
+            raise HTTPException(status_code=400, detail="File checksum mismatch")
+        return _serialize_upload_row(latest)
+
+    if latest_state == "completing":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "completing_in_progress",
+                "message": "Upload completion is already in progress",
+            },
+        )
+
+    if latest_state in ("aborted", "failed"):
+        if assembled_in_this_attempt or latest.get("cleaned_at") is None:
+            target = latest
+            if assembled_in_this_attempt and latest.get("cleaned_at") is not None:
+                target = await db.reopen_terminal_cleanup(upload_id) or latest
+            await _cleanup_storage_objects(target, mark_cleaned_on_success=True)
+        detail = (
+            "Upload was cancelled before completion finished"
+            if latest_state == "aborted"
+            else f"Upload cannot be completed (state={latest_state})"
+        )
+        raise HTTPException(status_code=409, detail=detail)
+
+    if had_prior_claim and latest_state == "uploading":
+        raise HTTPException(
+            status_code=503,
+            detail="Upload finalization was superseded. Please retry.",
+        )
+
+    raise HTTPException(status_code=409, detail="Upload is no longer active")
+
+
 async def complete_chat_upload(
     *,
     upload_id: str,
@@ -447,8 +502,10 @@ async def complete_chat_upload(
     row = await _require_owned_upload(upload_id, user_id)
     uid = str(row["upload_id"])
 
-    if row["state"] == "ready":
-        if normalized_sha and row.get("actual_sha256") != normalized_sha:
+    if row["state"] == "ready" and row.get("cleaned_at") is None:
+        if normalized_sha and not hmac.compare_digest(
+            str(row.get("actual_sha256") or ""), normalized_sha
+        ):
             raise HTTPException(status_code=400, detail="File checksum mismatch")
         return _serialize_upload_row(row)
 
@@ -457,6 +514,13 @@ async def complete_chat_upload(
             status_code=409,
             detail=f"Upload cannot be completed (state={row['state']})",
         )
+
+    if (
+        normalized_sha
+        and row.get("expected_sha256")
+        and not hmac.compare_digest(str(row["expected_sha256"]), normalized_sha)
+    ):
+        raise HTTPException(status_code=400, detail="File checksum mismatch")
 
     # Re-verify workspace write permission before finalizing.
     await resolve_and_verify_upload_workspace(user_id, str(row["workspace_id"]))
@@ -467,28 +531,26 @@ async def complete_chat_upload(
         expected_sha256=normalized_sha,
     )
     if claimed is None:
-        latest = await db.get_upload(uid)
-        if latest and latest["state"] == "ready":
-            if normalized_sha and latest.get("actual_sha256") != normalized_sha:
-                raise HTTPException(status_code=400, detail="File checksum mismatch")
-            return _serialize_upload_row(latest)
-        if latest and latest["state"] == "completing":
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "completing_in_progress",
-                    "message": "Upload completion is already in progress",
-                },
-            )
-        raise HTTPException(
-            status_code=409,
-            detail="Upload is no longer active",
+        return await _handle_lost_completion_claim(
+            uid,
+            normalized_sha=normalized_sha,
+            had_prior_claim=False,
         )
+
+    claim_token = str(claimed.get("claim_token") or "")
+    if (
+        normalized_sha
+        and claimed.get("expected_sha256")
+        and not hmac.compare_digest(str(claimed["expected_sha256"]), normalized_sha)
+    ):
+        await db.reopen_uploading(uid, claim_token=claim_token)
+        raise HTTPException(status_code=400, detail="File checksum mismatch")
 
     object_key = str(claimed["object_key"])
     store_upload_id = str(claimed["store_upload_id"])
     expected_total = int(claimed["size_bytes"])
     part_count = int(claimed["part_count"])
+    assembled_here = False
 
     try:
         parts = await asyncio.to_thread(
@@ -498,7 +560,14 @@ async def complete_chat_upload(
             # A prior attempt may have assembled the object right before losing its lease.
             held_size = await asyncio.to_thread(storage.object_size, object_key)
             if held_size is None:
-                await db.reopen_uploading(uid)
+                reopened = await db.reopen_uploading(uid, claim_token=claim_token)
+                if reopened is None:
+                    return await _handle_lost_completion_claim(
+                        uid,
+                        normalized_sha=normalized_sha,
+                        assembled_in_this_attempt=assembled_here,
+                        had_prior_claim=True,
+                    )
                 raise HTTPException(
                     status_code=503,
                     detail="Could not verify uploaded parts. Please retry.",
@@ -512,7 +581,14 @@ async def complete_chat_upload(
                 or int(by_num[n]["size"]) != expected_part_size(claimed, n)
             ]
             if missing:
-                await db.reopen_uploading(uid)
+                reopened = await db.reopen_uploading(uid, claim_token=claim_token)
+                if reopened is None:
+                    return await _handle_lost_completion_claim(
+                        uid,
+                        normalized_sha=normalized_sha,
+                        assembled_in_this_attempt=assembled_here,
+                        had_prior_claim=True,
+                    )
                 raise HTTPException(
                     status_code=409,
                     detail={
@@ -521,6 +597,20 @@ async def complete_chat_upload(
                         "message": "Some upload parts are missing",
                     },
                 )
+
+            current = await db.get_upload(uid)
+            if (
+                not current
+                or str(current.get("state") or "") != "completing"
+                or current.get("claim_token") != claim_token
+            ):
+                return await _handle_lost_completion_claim(
+                    uid,
+                    normalized_sha=normalized_sha,
+                    assembled_in_this_attempt=False,
+                    had_prior_claim=True,
+                )
+
             numbered = [(n, str(by_num[n]["etag"])) for n in range(1, part_count + 1)]
             completed = await asyncio.to_thread(
                 storage.complete_multipart_upload,
@@ -528,20 +618,49 @@ async def complete_chat_upload(
                 store_upload_id,
                 numbered,
             )
-            if not completed:
+            if completed:
+                assembled_here = True
+            else:
                 held_size = await asyncio.to_thread(storage.object_size, object_key)
                 if held_size != expected_total:
-                    await db.reopen_uploading(uid)
+                    reopened = await db.reopen_uploading(uid, claim_token=claim_token)
+                    if reopened is None:
+                        return await _handle_lost_completion_claim(
+                            uid,
+                            normalized_sha=normalized_sha,
+                            assembled_in_this_attempt=assembled_here,
+                            had_prior_claim=True,
+                        )
                     raise HTTPException(
                         status_code=503,
                         detail="Could not finalize upload. Please retry.",
                     )
 
+            current = await db.get_upload(uid)
+            if (
+                not current
+                or str(current.get("state") or "") != "completing"
+                or current.get("claim_token") != claim_token
+            ):
+                return await _handle_lost_completion_claim(
+                    uid,
+                    normalized_sha=normalized_sha,
+                    assembled_in_this_attempt=assembled_here,
+                    had_prior_claim=True,
+                )
+
         verified = await asyncio.to_thread(
             storage.compute_stored_object_digest, object_key
         )
         if verified is None:
-            await db.reopen_uploading(uid)
+            reopened = await db.reopen_uploading(uid, claim_token=claim_token)
+            if reopened is None:
+                return await _handle_lost_completion_claim(
+                    uid,
+                    normalized_sha=normalized_sha,
+                    assembled_in_this_attempt=assembled_here,
+                    had_prior_claim=True,
+                )
             raise HTTPException(
                 status_code=503,
                 detail="Could not verify uploaded file. Please retry.",
@@ -551,18 +670,36 @@ async def complete_chat_upload(
         want_sha = claimed.get("expected_sha256")
         if actual_size != expected_total or actual_size > MAX_CHAT_UPLOAD_BYTES:
             failed_row = await db.mark_failed(
-                uid, error="Assembled file size did not match declared size"
+                uid,
+                claim_token=claim_token,
+                error="Assembled file size did not match declared size",
             )
-            await _cleanup_storage_objects(failed_row or claimed)
+            if failed_row is None:
+                return await _handle_lost_completion_claim(
+                    uid,
+                    normalized_sha=normalized_sha,
+                    assembled_in_this_attempt=assembled_here,
+                    had_prior_claim=True,
+                )
+            await _cleanup_storage_objects(failed_row)
             raise HTTPException(
                 status_code=400,
                 detail="Uploaded file size mismatch",
             )
         if want_sha and not hmac.compare_digest(actual_sha256, str(want_sha)):
             failed_row = await db.mark_failed(
-                uid, error="Assembled file checksum mismatch"
+                uid,
+                claim_token=claim_token,
+                error="Assembled file checksum mismatch",
             )
-            await _cleanup_storage_objects(failed_row or claimed)
+            if failed_row is None:
+                return await _handle_lost_completion_claim(
+                    uid,
+                    normalized_sha=normalized_sha,
+                    assembled_in_this_attempt=assembled_here,
+                    had_prior_claim=True,
+                )
+            await _cleanup_storage_objects(failed_row)
             raise HTTPException(
                 status_code=400,
                 detail="Uploaded file checksum mismatch",
@@ -570,29 +707,70 @@ async def complete_chat_upload(
 
         ready_row = await db.mark_ready(
             uid,
+            claim_token=claim_token,
             actual_sha256=actual_sha256,
             ready_ttl=READY_UNUSED_TTL,
         )
         if ready_row is None:
-            # Concurrently aborted on another worker while completing; clean up object.
-            await _cleanup_storage_objects(claimed)
-            raise HTTPException(
-                status_code=409,
-                detail="Upload was cancelled before completion finished",
+            return await _handle_lost_completion_claim(
+                uid,
+                normalized_sha=normalized_sha,
+                assembled_in_this_attempt=assembled_here,
+                had_prior_claim=True,
             )
         return _serialize_upload_row(ready_row)
     except HTTPException:
         raise
     except Exception:
-        await db.reopen_uploading(uid)
+        reopened = await db.reopen_uploading(uid, claim_token=claim_token)
+        if reopened is None:
+            latest = await db.get_upload(uid)
+            if latest and str(latest.get("state") or "") != "uploading":
+                return await _handle_lost_completion_claim(
+                    uid,
+                    normalized_sha=normalized_sha,
+                    assembled_in_this_attempt=assembled_here,
+                    had_prior_claim=True,
+                )
         raise
 
 
-async def _cleanup_storage_objects(row: dict[str, Any]) -> bool:
+async def _cleanup_storage_objects(
+    row: dict[str, Any],
+    *,
+    claim_token: str | None = None,
+    mark_cleaned_on_success: bool = True,
+) -> bool:
+    uid = str(row.get("upload_id") or "")
+    row_state = str(row.get("state") or "")
+    if not uid or row_state not in ("aborted", "failed"):
+        logger.warning(
+            "Refusing storage cleanup for non-terminal chat upload %r (state=%r)",
+            uid,
+            row_state,
+        )
+        return False
+
     object_key = str(row.get("object_key") or "")
     store_upload_id = str(row.get("store_upload_id") or "")
     if not storage.is_chat_upload_key(object_key):
         logger.error("Skipping cleanup of non-chat-upload key %r", object_key)
+        return False
+
+    # Re-verify durable terminal state right before touching object storage.
+    fresh = await db.get_upload(uid)
+    if not fresh or str(fresh.get("state") or "") not in ("aborted", "failed"):
+        logger.warning(
+            "Skipping storage cleanup for chat upload %s; durable state is %r",
+            uid,
+            fresh.get("state") if fresh else None,
+        )
+        return False
+    if claim_token is not None and fresh.get("claim_token") != claim_token:
+        logger.info(
+            "Skipping storage cleanup for chat upload %s; cleanup claim token changed",
+            uid,
+        )
         return False
 
     aborted = True
@@ -601,10 +779,18 @@ async def _cleanup_storage_objects(row: dict[str, Any]) -> bool:
             storage.abort_multipart_upload, object_key, store_upload_id
         )
     deleted = await asyncio.to_thread(storage.delete_object, object_key)
-    if aborted and deleted:
-        await db.mark_cleaned(str(row["upload_id"]))
+    if not (aborted and deleted):
+        return False
+
+    if not mark_cleaned_on_success:
         return True
-    return False
+
+    if claim_token is not None:
+        return await db.mark_cleaned(uid, claim_token=claim_token)
+
+    if fresh.get("cleaned_at") is not None:
+        return True
+    return await db.mark_cleaned(uid)
 
 
 async def cancel_chat_upload(*, upload_id: str, user_id: str) -> dict[str, Any]:
@@ -615,7 +801,7 @@ async def cancel_chat_upload(*, upload_id: str, user_id: str) -> dict[str, Any]:
 
     if row["state"] == "aborted":
         if row.get("cleaned_at") is None:
-            await _cleanup_storage_objects(row)
+            await _cleanup_storage_objects(row, mark_cleaned_on_success=True)
         return {"upload_id": uid, "state": "aborted"}
 
     if row["state"] == "ready" and row.get("used_at") is not None:
@@ -629,14 +815,20 @@ async def cancel_chat_upload(*, upload_id: str, user_id: str) -> dict[str, Any]:
         latest = await db.get_upload(uid)
         if latest and latest["state"] == "aborted":
             if latest.get("cleaned_at") is None:
-                await _cleanup_storage_objects(latest)
+                await _cleanup_storage_objects(latest, mark_cleaned_on_success=True)
             return {"upload_id": uid, "state": "aborted"}
         raise HTTPException(
             status_code=409,
             detail="Attachment can no longer be cancelled",
         )
 
-    await _cleanup_storage_objects(aborted)
+    # When an in-flight completion worker held 'completing', delete visible parts/objects
+    # immediately while leaving cleaned_at unset so either the exiting completion worker
+    # or the background sweeper cleans any late-assembled object and stamps cleaned_at.
+    had_completing = bool(aborted.get("had_completing"))
+    await _cleanup_storage_objects(
+        aborted, mark_cleaned_on_success=not had_completing
+    )
     return {"upload_id": uid, "state": "aborted"}
 
 
@@ -1540,7 +1732,10 @@ async def retire_deleted_workspace_chat_uploads(
                 str(row.get("object_key") or ""), canonical_ws
             ):
                 continue
-            if await _cleanup_storage_objects(row):
+            had_completing = bool(row.get("had_completing"))
+            if await _cleanup_storage_objects(
+                row, mark_cleaned_on_success=not had_completing
+            ):
                 cleaned_count += 1
     return cleaned_count
 
@@ -1571,7 +1766,10 @@ async def cleanup_deleted_workspace_chat_uploads(
                 str(row.get("object_key") or ""), normalized_ws
             ):
                 continue
-            if await _cleanup_storage_objects(row):
+            had_completing = bool(row.get("had_completing"))
+            if await _cleanup_storage_objects(
+                row, mark_cleaned_on_success=not had_completing
+            ):
                 cleaned_count += 1
     return cleaned_count
 
@@ -1591,15 +1789,21 @@ async def sweep_expired_chat_uploads_once(
     cleaned_count = 0
     for row in claimed:
         uid = str(row["upload_id"])
+        row_claim_token = str(row.get("claim_token") or "")
         try:
-            ok = await _cleanup_storage_objects(row)
+            ok = await _cleanup_storage_objects(
+                row,
+                claim_token=row_claim_token or None,
+                mark_cleaned_on_success=True,
+            )
             if ok:
                 cleaned_count += 1
-            else:
-                await db.release_cleanup_claim(uid)
+            elif row_claim_token:
+                await db.release_cleanup_claim(uid, claim_token=row_claim_token)
         except Exception as exc:
             logger.warning("Cleanup failed for chat upload %s: %s", uid, exc)
-            await db.release_cleanup_claim(uid)
+            if row_claim_token:
+                await db.release_cleanup_claim(uid, claim_token=row_claim_token)
 
     await db.prune_cleaned_rows(now=now)
     return cleaned_count

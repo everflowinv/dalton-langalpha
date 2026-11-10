@@ -12,6 +12,7 @@ from collections.abc import Sequence
 from datetime import datetime, timedelta
 import json
 from typing import Any
+import uuid
 
 from psycopg.rows import dict_row
 
@@ -36,6 +37,7 @@ _COLUMN_NAMES = (
     "actual_sha256",
     "state",
     "error",
+    "claim_token",
     "lease_until",
     "used_at",
     "expires_at",
@@ -230,45 +232,59 @@ async def claim_complete(
     *,
     lease: timedelta,
     expected_sha256: str | None = None,
+    claim_token: str | None = None,
 ) -> dict[str, Any] | None:
-    """Transition ``uploading`` (or an expired ``completing`` lease) to ``completing``."""
+    """Transition ``uploading`` (or an expired ``completing`` lease) to ``completing`` with a unique claim token."""
+    token = str(claim_token).strip() if claim_token else str(uuid.uuid4())
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 f"""
                 UPDATE dalton_chat_file_uploads
                 SET state = 'completing',
+                    claim_token = %s,
                     lease_until = NOW() + %s::interval,
-                    expected_sha256 = COALESCE(%s, expected_sha256),
+                    expected_sha256 = COALESCE(expected_sha256, %s),
                     updated_at = NOW()
                 WHERE upload_id = %s
                   AND expires_at > NOW()
+                  AND cleaned_at IS NULL
                   AND (
                       state = 'uploading'
                       OR (state = 'completing' AND (lease_until IS NULL OR lease_until < NOW()))
                   )
                 RETURNING {_COLUMNS}
                 """,
-                (lease, expected_sha256, upload_id),
+                (token, lease, expected_sha256, upload_id),
             )
             return await cur.fetchone()
 
 
-async def reopen_uploading(upload_id: str) -> dict[str, Any] | None:
-    """Return a ``completing`` row back to ``uploading`` when parts are missing or transient."""
+async def reopen_uploading(
+    upload_id: str,
+    *,
+    claim_token: str,
+) -> dict[str, Any] | None:
+    """Return a ``completing`` row back to ``uploading`` only when ``claim_token`` still owns it."""
+    token = str(claim_token or "").strip()
+    if not token:
+        return None
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 f"""
                 UPDATE dalton_chat_file_uploads
                 SET state = 'uploading',
+                    claim_token = NULL,
                     lease_until = NULL,
                     updated_at = NOW()
                 WHERE upload_id = %s
                   AND state = 'completing'
+                  AND claim_token = %s
+                  AND cleaned_at IS NULL
                 RETURNING {_COLUMNS}
                 """,
-                (upload_id,),
+                (upload_id, token),
             )
             return await cur.fetchone()
 
@@ -276,10 +292,14 @@ async def reopen_uploading(upload_id: str) -> dict[str, Any] | None:
 async def mark_ready(
     upload_id: str,
     *,
+    claim_token: str,
     actual_sha256: str,
     ready_ttl: timedelta,
 ) -> dict[str, Any] | None:
-    """Finalize a ``completing`` upload into ``ready`` with its verified SHA-256."""
+    """Finalize a ``completing`` upload into ``ready`` only when ``claim_token`` still owns it."""
+    token = str(claim_token or "").strip()
+    if not token:
+        return None
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
@@ -287,15 +307,18 @@ async def mark_ready(
                 UPDATE dalton_chat_file_uploads
                 SET state = 'ready',
                     actual_sha256 = %s,
+                    claim_token = NULL,
                     lease_until = NULL,
                     error = NULL,
                     expires_at = GREATEST(COALESCE(expires_at, NOW()), NOW() + %s::interval),
                     updated_at = NOW()
                 WHERE upload_id = %s
                   AND state = 'completing'
+                  AND claim_token = %s
+                  AND cleaned_at IS NULL
                 RETURNING {_COLUMNS}
                 """,
-                (actual_sha256, ready_ttl, upload_id),
+                (actual_sha256, ready_ttl, upload_id, token),
             )
             return await cur.fetchone()
 
@@ -303,8 +326,13 @@ async def mark_ready(
 async def mark_failed(
     upload_id: str,
     *,
+    claim_token: str,
     error: str,
 ) -> dict[str, Any] | None:
+    """Transition a ``completing`` upload into ``failed`` only when ``claim_token`` still owns it."""
+    token = str(claim_token or "").strip()
+    if not token:
+        return None
     async with get_db_connection() as conn:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
@@ -312,14 +340,16 @@ async def mark_failed(
                 UPDATE dalton_chat_file_uploads
                 SET state = 'failed',
                     error = %s,
+                    claim_token = NULL,
                     lease_until = NULL,
                     expires_at = LEAST(COALESCE(expires_at, NOW()), NOW()),
                     updated_at = NOW()
                 WHERE upload_id = %s
-                  AND state IN ('uploading', 'completing')
+                  AND state = 'completing'
+                  AND claim_token = %s
                 RETURNING {_COLUMNS}
                 """,
-                (error[:500], upload_id),
+                (error[:500], upload_id, token),
             )
             return await cur.fetchone()
 
@@ -334,20 +364,49 @@ async def abort_upload(
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 f"""
-                UPDATE dalton_chat_file_uploads
+                WITH prior AS (
+                    SELECT upload_id, state AS prev_state
+                    FROM dalton_chat_file_uploads
+                    WHERE upload_id = %s
+                      AND user_id = %s
+                      AND (
+                          state IN ('uploading', 'completing', 'failed')
+                          OR (state = 'ready' AND used_at IS NULL)
+                      )
+                    FOR UPDATE
+                )
+                UPDATE dalton_chat_file_uploads AS u
                 SET state = 'aborted',
+                    claim_token = NULL,
                     lease_until = NULL,
-                    expires_at = LEAST(COALESCE(expires_at, NOW()), NOW()),
+                    cleaned_at = NULL,
+                    expires_at = LEAST(COALESCE(u.expires_at, NOW()), NOW()),
                     updated_at = NOW()
-                WHERE upload_id = %s
-                  AND user_id = %s
-                  AND (
-                      state IN ('uploading', 'completing', 'failed')
-                      OR (state = 'ready' AND used_at IS NULL)
-                  )
-                RETURNING {_COLUMNS}
+                FROM prior
+                WHERE u.upload_id = prior.upload_id
+                RETURNING {_U_COLUMNS}, (prior.prev_state = 'completing') AS had_completing
                 """,
                 (upload_id, user_id),
+            )
+            return await cur.fetchone()
+
+
+async def reopen_terminal_cleanup(upload_id: str) -> dict[str, Any] | None:
+    """Clear ``cleaned_at`` on a terminal row so late-assembled storage is re-swept if needed."""
+    async with get_db_connection() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                f"""
+                UPDATE dalton_chat_file_uploads
+                SET cleaned_at = NULL,
+                    claim_token = NULL,
+                    lease_until = NULL,
+                    updated_at = NOW()
+                WHERE upload_id = %s
+                  AND state IN ('aborted', 'failed')
+                RETURNING {_COLUMNS}
+                """,
+                (upload_id,),
             )
             return await cur.fetchone()
 
@@ -445,15 +504,24 @@ async def retire_uploads_by_ids(
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 f"""
-                UPDATE dalton_chat_file_uploads
+                WITH prior AS (
+                    SELECT upload_id, state AS prev_state
+                    FROM dalton_chat_file_uploads
+                    WHERE upload_id = ANY(%s)
+                      AND workspace_id = %s
+                      AND cleaned_at IS NULL
+                    FOR UPDATE
+                )
+                UPDATE dalton_chat_file_uploads AS u
                 SET state = 'aborted',
+                    claim_token = NULL,
                     lease_until = NULL,
+                    cleaned_at = NULL,
                     expires_at = NOW(),
                     updated_at = NOW()
-                WHERE upload_id = ANY(%s)
-                  AND workspace_id = %s
-                  AND cleaned_at IS NULL
-                RETURNING {_COLUMNS}
+                FROM prior
+                WHERE u.upload_id = prior.upload_id
+                RETURNING {_U_COLUMNS}, (prior.prev_state = 'completing') AS had_completing
                 """,
                 (unique_ids, workspace_id),
             )
@@ -466,14 +534,23 @@ async def retire_workspace_uploads(workspace_id: str) -> list[dict[str, Any]]:
         async with conn.cursor(row_factory=dict_row) as cur:
             await cur.execute(
                 f"""
-                UPDATE dalton_chat_file_uploads
+                WITH prior AS (
+                    SELECT upload_id, state AS prev_state
+                    FROM dalton_chat_file_uploads
+                    WHERE workspace_id = %s
+                      AND cleaned_at IS NULL
+                    FOR UPDATE
+                )
+                UPDATE dalton_chat_file_uploads AS u
                 SET state = 'aborted',
+                    claim_token = NULL,
                     lease_until = NULL,
+                    cleaned_at = NULL,
                     expires_at = NOW(),
                     updated_at = NOW()
-                WHERE workspace_id = %s
-                  AND cleaned_at IS NULL
-                RETURNING {_COLUMNS}
+                FROM prior
+                WHERE u.upload_id = prior.upload_id
+                RETURNING {_U_COLUMNS}, (prior.prev_state = 'completing') AS had_completing
                 """,
                 (workspace_id,),
             )
@@ -485,6 +562,7 @@ async def claim_cleanup_batch(
     limit: int = 25,
     claim_lease: timedelta = timedelta(minutes=5),
     now: datetime | None = None,
+    claim_token: str | None = None,
 ) -> list[dict[str, Any]]:
     """Claim a bounded batch of aborted, failed, expired-unused, or deleted-workspace rows.
 
@@ -493,6 +571,7 @@ async def claim_cleanup_batch(
     cold sandbox recreation until explicit file or workspace deletion.
     """
     capped = max(1, min(int(limit), 100))
+    token = str(claim_token).strip() if claim_token else str(uuid.uuid4())
     async with get_db_connection() as conn:
         async with conn.transaction():
             async with conn.cursor(row_factory=dict_row) as cur:
@@ -535,48 +614,88 @@ async def claim_cleanup_batch(
                             WHEN u.state IN ('uploading', 'completing', 'ready') THEN 'aborted'
                             ELSE u.state
                         END,
+                        claim_token = %(claim_token)s,
                         lease_until = COALESCE(%(now)s::timestamptz, NOW()) + %(claim_lease)s::interval,
                         updated_at = COALESCE(%(now)s::timestamptz, NOW())
                     FROM due
                     WHERE u.upload_id = due.upload_id
                     RETURNING {_U_COLUMNS}
                     """,
-                    {"now": now, "limit": capped, "claim_lease": claim_lease},
+                    {
+                        "now": now,
+                        "limit": capped,
+                        "claim_lease": claim_lease,
+                        "claim_token": token,
+                    },
                 )
                 return list(await cur.fetchall())
 
 
-async def mark_cleaned(upload_id: str) -> bool:
+async def mark_cleaned(
+    upload_id: str,
+    *,
+    claim_token: str | None = None,
+) -> bool:
     async with get_db_connection() as conn:
         async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                UPDATE dalton_chat_file_uploads
-                SET cleaned_at = NOW(),
-                    lease_until = NULL,
-                    updated_at = NOW()
-                WHERE upload_id = %s
-                  AND cleaned_at IS NULL
-                """,
-                (upload_id,),
-            )
+            if claim_token is not None:
+                token = str(claim_token).strip()
+                if not token:
+                    return False
+                await cur.execute(
+                    """
+                    UPDATE dalton_chat_file_uploads
+                    SET cleaned_at = NOW(),
+                        claim_token = NULL,
+                        lease_until = NULL,
+                        updated_at = NOW()
+                    WHERE upload_id = %s
+                      AND state IN ('aborted', 'failed')
+                      AND cleaned_at IS NULL
+                      AND claim_token = %s
+                    """,
+                    (upload_id, token),
+                )
+            else:
+                await cur.execute(
+                    """
+                    UPDATE dalton_chat_file_uploads
+                    SET cleaned_at = NOW(),
+                        claim_token = NULL,
+                        lease_until = NULL,
+                        updated_at = NOW()
+                    WHERE upload_id = %s
+                      AND state IN ('aborted', 'failed')
+                      AND cleaned_at IS NULL
+                    """,
+                    (upload_id,),
+                )
             return cur.rowcount > 0
 
 
 async def release_cleanup_claim(
-    upload_id: str, *, retry_after: timedelta = timedelta(minutes=2)
+    upload_id: str,
+    *,
+    claim_token: str,
+    retry_after: timedelta = timedelta(minutes=2),
 ) -> None:
+    token = str(claim_token or "").strip()
+    if not token:
+        return
     async with get_db_connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
                 """
                 UPDATE dalton_chat_file_uploads
-                SET lease_until = NOW() + %s::interval,
+                SET claim_token = NULL,
+                    lease_until = NOW() + %s::interval,
                     updated_at = NOW()
                 WHERE upload_id = %s
+                  AND state IN ('aborted', 'failed')
                   AND cleaned_at IS NULL
+                  AND claim_token = %s
                 """,
-                (retry_after, upload_id),
+                (retry_after, upload_id, token),
             )
 
 

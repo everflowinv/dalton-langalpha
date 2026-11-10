@@ -35,12 +35,15 @@ def upgrade() -> None:
             actual_sha256 TEXT,
             state TEXT NOT NULL CHECK (state IN ('uploading', 'completing', 'ready', 'aborted', 'failed')),
             error TEXT,
+            claim_token TEXT,
             lease_until TIMESTAMPTZ,
             used_at TIMESTAMPTZ,
             expires_at TIMESTAMPTZ,
             cleaned_at TIMESTAMPTZ,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT chk_dalton_chat_file_uploads_cleaned_terminal
+                CHECK (cleaned_at IS NULL OR state IN ('aborted', 'failed'))
         );
         """
     )
@@ -48,7 +51,31 @@ def upgrade() -> None:
     op.execute(
         """
         ALTER TABLE dalton_chat_file_uploads
+            ADD COLUMN IF NOT EXISTS claim_token TEXT;
+        """
+    )
+
+    op.execute(
+        """
+        ALTER TABLE dalton_chat_file_uploads
             ALTER COLUMN expires_at DROP NOT NULL;
+        """
+    )
+
+    op.execute(
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1
+                FROM pg_constraint
+                WHERE conname = 'chk_dalton_chat_file_uploads_cleaned_terminal'
+            ) THEN
+                ALTER TABLE dalton_chat_file_uploads
+                    ADD CONSTRAINT chk_dalton_chat_file_uploads_cleaned_terminal
+                    CHECK (cleaned_at IS NULL OR state IN ('aborted', 'failed'));
+            END IF;
+        END $$;
         """
     )
 
