@@ -395,8 +395,9 @@ export async function parseDiscordInteractionCreate(
     };
   }
 
+  const channelGuildId =
+    channelObj && typeof channelObj.guild_id === "string" ? channelObj.guild_id.trim() : "";
   if (channelObj && channelObj.guild_id !== undefined && channelObj.guild_id !== null) {
-    const channelGuildId = typeof channelObj.guild_id === "string" ? channelObj.guild_id.trim() : "";
     if (!isGuild || channelGuildId !== guildId) {
       return {
         ok: false,
@@ -442,11 +443,30 @@ export async function parseDiscordInteractionCreate(
     if (needsLookup && options.resolveChannelInfo) {
       resolvedInfo = await options.resolveChannelInfo(channelId);
       if (resolvedInfo) {
-        if (resolvedInfo.guildId && resolvedInfo.guildId !== guildId) {
+        if (resolvedInfo.channelId && resolvedInfo.channelId !== channelId) {
+          return {
+            ok: false,
+            reason: "missing_channel_id",
+            detail: "Resolved channelId does not match interaction channel_id",
+          };
+        }
+        if ((resolvedInfo.guildId || !channelGuildId) && resolvedInfo.guildId !== guildId) {
           return {
             ok: false,
             reason: "channel_guild_mismatch",
             detail: "Resolved channel guildId does not match interaction guild_id",
+          };
+        }
+        if (
+          parentId &&
+          resolvedInfo.parentId &&
+          resolvedInfo.parentId.trim() &&
+          resolvedInfo.parentId.trim() !== parentId
+        ) {
+          return {
+            ok: false,
+            reason: "missing_thread_parent",
+            detail: "Resolved thread parentId does not match embedded parent_id",
           };
         }
         if (isDiscordThreadChannelType(resolvedInfo.type)) {
@@ -461,6 +481,17 @@ export async function parseDiscordInteractionCreate(
       }
     }
 
+    const effectiveChannelType =
+      embeddedChannelType ??
+      (typeof resolvedInfo?.type === "number" ? resolvedInfo.type : undefined);
+    if (effectiveChannelType === 1 || effectiveChannelType === 3) {
+      return {
+        ok: false,
+        reason: "channel_guild_mismatch",
+        detail: "Guild interaction channel cannot have DM channel type",
+      };
+    }
+
     if (isThread) {
       if (!parentId || parentId === channelId) {
         if (options.allowUnresolvedThreadParent && !parentId) {
@@ -473,8 +504,17 @@ export async function parseDiscordInteractionCreate(
           };
         }
       }
-    } else if (embeddedChannelType === undefined && !resolvedInfo) {
-      needsChannelResolution = true;
+    }
+    if (effectiveChannelType === undefined) {
+      if (options.allowUnresolvedThreadParent) {
+        needsChannelResolution = true;
+      } else {
+        return {
+          ok: false,
+          reason: "missing_channel_id",
+          detail: "Guild interaction channel type could not be resolved",
+        };
+      }
     }
   }
 

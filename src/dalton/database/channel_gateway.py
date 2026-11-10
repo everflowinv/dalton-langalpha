@@ -2505,7 +2505,7 @@ async def _execute_session_command_once(
                                     updated_at = NOW()
                                 WHERE platform = %s AND message_id = %s
                                 """,
-                                (Json(stored_res), cleaned_platform, cleaned_msg_id),
+                                (Jsonb(stored_res), cleaned_platform, cleaned_msg_id),
                             )
 
                     dup_reply_pending = bool(

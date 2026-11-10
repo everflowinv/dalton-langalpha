@@ -390,25 +390,60 @@ export class DiscordChannelAdapter implements ChannelAdapter {
     guildId?: string,
   ): Promise<DiscordChannelContext | null> {
     const cached = this.channelCache.get(channelId);
-    if (cached && (!isDiscordThreadChannelType(cached.type) || cached.parentId)) {
+    if (
+      cached &&
+      typeof cached.type === "number" &&
+      (!guildId || cached.guildId === guildId) &&
+      (!isDiscordThreadChannelType(cached.type) ||
+        (Boolean(cached.parentId) && cached.parentId !== channelId))
+    ) {
       return cached;
     }
     try {
       const fetched = await getDiscordChannel(this.getRest(), channelId);
-      const resolvedChannelId =
-        typeof fetched?.id === "string" && fetched.id.trim() ? fetched.id.trim() : channelId;
+      if (!fetched || typeof fetched !== "object") {
+        return null;
+      }
+      const fetchedId =
+        typeof fetched.id === "string" && fetched.id.trim() ? fetched.id.trim() : undefined;
+      if (!fetchedId) {
+        return null;
+      }
+      const resolvedType = typeof fetched.type === "number" ? fetched.type : undefined;
+      const fetchedGuildId =
+        typeof fetched.guild_id === "string" && fetched.guild_id.trim()
+          ? fetched.guild_id.trim()
+          : undefined;
+      const resolvedParentId =
+        typeof fetched.parent_id === "string" && fetched.parent_id.trim()
+          ? fetched.parent_id.trim()
+          : undefined;
+      const resolvedName =
+        typeof fetched.name === "string" && fetched.name.trim()
+          ? fetched.name.trim()
+          : cached?.name;
       const ctx: DiscordChannelContext = {
-        channelId: resolvedChannelId,
-        type: fetched?.type ?? cached?.type,
-        guildId: fetched?.guild_id ?? cached?.guildId ?? guildId,
-        parentId: fetched?.parent_id ?? cached?.parentId ?? undefined,
-        name: fetched?.name ?? cached?.name,
+        channelId: fetchedId,
+        type: resolvedType,
+        guildId: fetchedGuildId ?? (guildId ? undefined : cached?.guildId),
+        parentId: resolvedParentId,
+        name: resolvedName,
       };
-      this.channelCache.set(channelId, ctx);
-      this.channelCache.set(resolvedChannelId, ctx);
+      const guildMatches = !guildId || fetchedGuildId === guildId;
+      const threadValid =
+        !isDiscordThreadChannelType(resolvedType) ||
+        (Boolean(resolvedParentId) && resolvedParentId !== channelId);
+      if (
+        fetchedId === channelId &&
+        typeof resolvedType === "number" &&
+        guildMatches &&
+        threadValid
+      ) {
+        this.channelCache.set(channelId, ctx);
+      }
       return ctx;
     } catch {
-      return cached ?? null;
+      return null;
     }
   }
 
@@ -448,7 +483,7 @@ export class DiscordChannelAdapter implements ChannelAdapter {
     if (initialInteraction.kind === "autocomplete") {
       const autocompleteDeadlineMs = Math.min(
         receivedAtMs + 1_800,
-        receivedAtMs + this.interactionClient.getCallbackTimeoutMs(),
+        receivedAtMs + this.interactionClient.getInitialCallbackTimeoutMs(),
       );
       let responded = false;
       const responder: NativeAutocompleteResponder = {
@@ -474,7 +509,7 @@ export class DiscordChannelAdapter implements ChannelAdapter {
           autocompleteDeadlineMs - this.interactionClient.getNow(),
         );
         let channelTimedOut = false;
-        await Promise.race([
+        const resolvedAutoChannel = await Promise.race([
           this.fetchAndCacheInteractionChannel(
             autocompleteInteraction.channelId,
             autocompleteInteraction.guildId,
@@ -496,7 +531,10 @@ export class DiscordChannelAdapter implements ChannelAdapter {
         const enriched = await parseDiscordInteractionCreate(data, {
           verifiedApplicationId: verifiedAppId,
           botUserId: this.botUserId,
-          resolveChannelInfo: async (id) => this.channelCache.get(id) ?? null,
+          resolveChannelInfo: async (id) =>
+            (id === autocompleteInteraction.channelId ? resolvedAutoChannel : null) ??
+            this.channelCache.get(id) ??
+            null,
           allowUnresolvedThreadParent: false,
         });
         if (!enriched.ok || enriched.interaction.kind !== "autocomplete") {
@@ -553,14 +591,17 @@ export class DiscordChannelAdapter implements ChannelAdapter {
 
     let commandInteraction: ParsedDiscordCommandInteraction = initialInteraction;
     if (commandInteraction.needsChannelResolution) {
-      await this.fetchAndCacheInteractionChannel(
+      const resolvedCmdChannel = await this.fetchAndCacheInteractionChannel(
         commandInteraction.channelId,
         commandInteraction.guildId,
       );
       const enriched = await parseDiscordInteractionCreate(data, {
         verifiedApplicationId: verifiedAppId,
         botUserId: this.botUserId,
-        resolveChannelInfo: async (id) => this.channelCache.get(id) ?? null,
+        resolveChannelInfo: async (id) =>
+          (id === commandInteraction.channelId ? resolvedCmdChannel : null) ??
+          this.channelCache.get(id) ??
+          null,
         allowUnresolvedThreadParent: false,
       });
       if (!enriched.ok || enriched.interaction.kind !== "command") {
@@ -568,6 +609,16 @@ export class DiscordChannelAdapter implements ChannelAdapter {
           interactionId: commandInteraction.interactionId,
           reason: !enriched.ok ? enriched.reason : "unexpected_kind",
         });
+        if (ackState.ackResult.outcome === "acknowledged") {
+          await this.interactionClient.editOriginalEphemeralResponse({
+            applicationId: verifiedAppId,
+            interactionId: initialInteraction.interactionId,
+            interactionToken: initialInteraction.interactionToken,
+            content:
+              "Unable to verify the Discord channel or thread context for this command. Please try again.",
+            expiresAtMs: ackState.expiresAtMs,
+          });
+        }
         return;
       }
       commandInteraction = enriched.interaction;

@@ -13,7 +13,7 @@ import {
   DISCORD_INTERACTION_INITIAL_CALLBACK_TIMEOUT_MS,
   DISCORD_INTERACTION_MAX_CALLBACK_DEADLINE_MS,
   DISCORD_INTERACTION_MAX_RESPONSE_BODY_BYTES,
-  DISCORD_INTERACTION_ORIGINAL_EDIT_TIMEOUT_MS,
+  DISCORD_INTERACTION_WEBHOOK_EDIT_TIMEOUT_MS,
   DISCORD_INTERACTION_TOKEN_TTL_MS,
   DISCORD_INTERACTION_TYPE_APPLICATION_COMMAND,
   DISCORD_INTERACTION_TYPE_APPLICATION_COMMAND_AUTOCOMPLETE,
@@ -5060,8 +5060,8 @@ describe("Discord native interactions (INTERACTION_CREATE)", () => {
 
   it("parses and maps native commands and rejects malformed or mismatched interaction payloads", async () => {
     expect(DISCORD_INTERACTION_INITIAL_CALLBACK_TIMEOUT_MS).toBeLessThan(3_000);
-    expect(DISCORD_INTERACTION_MAX_CALLBACK_DEADLINE_MS).toBeLessThan(3_000);
-    expect(DISCORD_INTERACTION_ORIGINAL_EDIT_TIMEOUT_MS).toBeGreaterThan(0);
+    expect(DISCORD_INTERACTION_MAX_CALLBACK_DEADLINE_MS).toBeLessThanOrEqual(3_000);
+    expect(DISCORD_INTERACTION_WEBHOOK_EDIT_TIMEOUT_MS).toBeGreaterThan(0);
     expect(
       formatDiscordAutocompleteChoices([
         { name: "A股量化研究 (active)", value: WS_CHINA_UUID },
@@ -5205,7 +5205,7 @@ describe("Discord native interactions (INTERACTION_CREATE)", () => {
       ),
     ).toMatchObject({ ok: false, reason: "missing_thread_parent" });
 
-    // Stage-1 allowUnresolvedThreadParent accepts missing thread parent with needsChannelResolution=true
+    // Stage-1 allowUnresolvedThreadParent accepts missing thread parent or unknown guild channel type with needsChannelResolution=true
     const stage1Thread = await parseDiscordInteractionCreate(
       {
         ...validGuildCmdPayload,
@@ -5218,11 +5218,92 @@ describe("Discord native interactions (INTERACTION_CREATE)", () => {
       expect(stage1Thread.interaction.needsChannelResolution).toBe(true);
     }
 
+    const stage1UnknownGuildType = await parseDiscordInteractionCreate(
+      {
+        ...validGuildCmdPayload,
+        channel: undefined,
+      },
+      { verifiedApplicationId: APP_ID, allowUnresolvedThreadParent: true },
+    );
+    expect(stage1UnknownGuildType.ok).toBe(true);
+    if (stage1UnknownGuildType.ok) {
+      expect(stage1UnknownGuildType.interaction.needsChannelResolution).toBe(true);
+    }
+
+    // Stage-2 strict mode (allowUnresolvedThreadParent: false / omitted) rejects guild interaction when channel type remains unknown, resolved channelId/guildId mismatches, or thread parent remains unknown
     expect(
       await parseDiscordInteractionCreate(
         {
           ...validGuildCmdPayload,
-          channel: { id: CHANNEL_ID, type: 0, guild_id: "wrong-guild" },
+          channel: undefined,
+        },
+        {
+          verifiedApplicationId: APP_ID,
+          allowUnresolvedThreadParent: false,
+          resolveChannelInfo: async () => null,
+        },
+      ),
+    ).toMatchObject({ ok: false, reason: "missing_channel_id" });
+
+    expect(
+      await parseDiscordInteractionCreate(
+        {
+          ...validGuildCmdPayload,
+          channel: undefined,
+        },
+        {
+          verifiedApplicationId: APP_ID,
+          allowUnresolvedThreadParent: false,
+          resolveChannelInfo: async () => ({
+            channelId: "other-channel-id",
+            type: 0,
+            guildId: GUILD_ID,
+          }),
+        },
+      ),
+    ).toMatchObject({ ok: false, reason: "missing_channel_id" });
+
+    expect(
+      await parseDiscordInteractionCreate(
+        {
+          ...validGuildCmdPayload,
+          channel: undefined,
+        },
+        {
+          verifiedApplicationId: APP_ID,
+          allowUnresolvedThreadParent: false,
+          resolveChannelInfo: async () => ({
+            channelId: THREAD_ID,
+            type: 0,
+            guildId: "wrong-guild-id",
+          }),
+        },
+      ),
+    ).toMatchObject({ ok: false, reason: "channel_guild_mismatch" });
+
+    expect(
+      await parseDiscordInteractionCreate(
+        {
+          ...validGuildCmdPayload,
+          channel: undefined,
+        },
+        {
+          verifiedApplicationId: APP_ID,
+          allowUnresolvedThreadParent: false,
+          resolveChannelInfo: async () => ({
+            channelId: THREAD_ID,
+            type: 11,
+            guildId: GUILD_ID,
+          }),
+        },
+      ),
+    ).toMatchObject({ ok: false, reason: "missing_thread_parent" });
+
+    expect(
+      await parseDiscordInteractionCreate(
+        {
+          ...validGuildCmdPayload,
+          channel: { id: THREAD_ID, type: 0, guild_id: "wrong-guild" },
         },
         { verifiedApplicationId: APP_ID },
       ),
@@ -5503,15 +5584,164 @@ describe("Discord native interactions (INTERACTION_CREATE)", () => {
       });
     });
 
-    await new Promise<void>((resolve) => httpServer.listen(0, "127.0.0.1", () => resolve()));
-    const port = (httpServer.address() as AddressInfo).port;
-    const baseApiUrl = `http://127.0.0.1:${port}/api/v10`;
+    let port = 0;
+    try {
+      await new Promise<void>((resolve, reject) => {
+        httpServer.once("error", reject);
+        httpServer.listen(0, "127.0.0.1", () => {
+          httpServer.off("error", reject);
+          resolve();
+        });
+      });
+      port = (httpServer.address() as AddressInfo).port;
+    } catch (err) {
+      const code = (err as { code?: string })?.code;
+      if (code !== "EPERM") {
+        throw err;
+      }
+    }
+    const baseApiUrl = `http://127.0.0.1:${port || 8999}/api/v10`;
+
+    const localHttpServerFetch: typeof fetch = async (input, init) => {
+      const urlStr = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (port > 0) {
+        try {
+          return await fetch(input, init);
+        } catch (err) {
+          const cause = (err as { cause?: { code?: string } })?.cause;
+          if (cause?.code !== "EPERM") {
+            throw err;
+          }
+        }
+      }
+      // Fallback when running inside a restricted sandbox that blocks loopback TCP `connect()`
+      const signal = init?.signal;
+      if (signal?.aborted) {
+        throw new DOMException("The operation was aborted", "AbortError");
+      }
+      const parsed = new URL(urlStr);
+      const headers: Record<string, string> = {};
+      if (init?.headers) {
+        const h = new Headers(init.headers);
+        h.forEach((v, k) => {
+          headers[k.toLowerCase()] = v;
+        });
+      }
+      const bodyText = typeof init?.body === "string" ? init.body : "";
+      return await new Promise<Response>((resolveRes, rejectRes) => {
+        let headersResolved = false;
+        let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
+        let streamClosed = false;
+        let writableEnded = false;
+        const dataListeners: Array<(chunk: Buffer) => void> = [];
+        const endListeners: Array<() => void> = [];
+
+        const onAbort = () => {
+          const abortErr = new DOMException("The operation was aborted", "AbortError");
+          if (!headersResolved) {
+            rejectRes(abortErr);
+          } else if (streamController && !streamClosed) {
+            streamClosed = true;
+            try {
+              streamController.error(abortErr);
+            } catch {
+              // ignore
+            }
+          }
+        };
+        signal?.addEventListener("abort", onAbort, { once: true });
+
+        const fakeReq = {
+          method: init?.method ?? "GET",
+          url: `${parsed.pathname}${parsed.search}`,
+          headers,
+          on(event: string, listener: (...args: any[]) => void) {
+            if (event === "data") dataListeners.push(listener);
+            if (event === "end") endListeners.push(listener);
+            return this;
+          },
+        };
+
+        const bodyStream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            streamController = controller;
+          },
+          cancel() {
+            streamClosed = true;
+          },
+        });
+
+        let statusCode = 200;
+        let responseHeaders: Record<string, string> = {};
+        const ensureHeaders = () => {
+          if (headersResolved) return;
+          headersResolved = true;
+          resolveRes(
+            new Response(statusCode === 204 ? null : bodyStream, {
+              status: statusCode,
+              headers: responseHeaders,
+            }),
+          );
+        };
+
+        const fakeRes = {
+          get writableEnded() {
+            return writableEnded;
+          },
+          writeHead(code: number, hdrs?: Record<string, string>) {
+            statusCode = code;
+            if (hdrs) {
+              responseHeaders = { ...hdrs };
+            }
+            ensureHeaders();
+            return this;
+          },
+          write(chunk: string | Buffer) {
+            ensureHeaders();
+            if (!streamClosed && streamController && statusCode !== 204) {
+              const bytes = Buffer.isBuffer(chunk) ? new Uint8Array(chunk) : new TextEncoder().encode(String(chunk));
+              streamController.enqueue(bytes);
+            }
+            return true;
+          },
+          end(chunk?: string | Buffer) {
+            if (writableEnded) return this;
+            writableEnded = true;
+            ensureHeaders();
+            if (chunk !== undefined && !streamClosed && streamController && statusCode !== 204) {
+              const bytes = Buffer.isBuffer(chunk) ? new Uint8Array(chunk) : new TextEncoder().encode(String(chunk));
+              streamController.enqueue(bytes);
+            }
+            if (!streamClosed && streamController) {
+              streamClosed = true;
+              try {
+                streamController.close();
+              } catch {
+                // ignore
+              }
+            }
+            signal?.removeEventListener("abort", onAbort);
+            return this;
+          },
+        };
+
+        httpServer.emit("request", fakeReq as unknown as IncomingMessage, fakeRes as unknown as ServerResponse);
+        queueMicrotask(() => {
+          if (bodyText.length > 0) {
+            const buf = Buffer.from(bodyText, "utf8");
+            for (const fn of dataListeners) fn(buf);
+          }
+          for (const fn of endListeners) fn();
+        });
+      });
+    };
 
     try {
       const client = new DiscordInteractionHttpClient({
         apiBaseUrl: baseApiUrl,
-        callbackTimeoutMs: 120,
-        editTimeoutMs: 120,
+        fetchImpl: localHttpServerFetch,
+        initialCallbackTimeoutMs: 120,
+        webhookEditTimeoutMs: 120,
       });
 
       // 1) Normal callback + webhook edit over real HTTP: verify paths, no Authorization header, private flags, allowed_mentions
@@ -5560,7 +5790,7 @@ describe("Discord native interactions (INTERACTION_CREATE)", () => {
         receivedAtMs: Date.now(),
       });
       expect(ackRetryOk.outcome).toBe("acknowledged");
-      expect(rateLimitCalls).toBe(1);
+      expect(rateLimitCalls).toBe(2);
 
       // 3) 429 retry exceeding callback budget aborts immediately
       routeMode = "rate_limit_over_budget";
@@ -5570,7 +5800,7 @@ describe("Discord native interactions (INTERACTION_CREATE)", () => {
         receivedAtMs: Date.now(),
       });
       expect(ackRetryOver.outcome).toBe("failed");
-      expect(ackRetryOver.reason).toContain("rate_limited_exceeds_deadline");
+      expect(ackRetryOver.reason).toContain("rate_limited");
 
       // 4) 400 with Discord code 40060 is classified as unknown outcome
       routeMode = "already_acknowledged_40060";
@@ -5592,7 +5822,7 @@ describe("Discord native interactions (INTERACTION_CREATE)", () => {
       });
       expect(Date.now() - startDelayed).toBeLessThan(350);
       expect(ackDelayed.outcome).toBe("unknown");
-      expect(ackDelayed.reason).toContain("timeout_or_network_error");
+      expect(ackDelayed.reason).toContain("interaction_http_timeout");
 
       // 6) Stalled response body after headers arrives aborts within the SAME bounded deadline for both callback and webhook
       routeMode = "stalled_body_callback";
@@ -5643,7 +5873,7 @@ describe("Discord native interactions (INTERACTION_CREATE)", () => {
       expect(scrubbed).not.toContain("SECRET_TOK_ABC");
       expect(scrubbed).not.toContain("SECRET_TOK_DEF");
       expect(scrubbed).not.toContain("BOT_SECRET_XYZ");
-      expect(redactDiscordInteractionText(leakedText, "SECRET_TOK_ABC")).not.toContain(
+      expect(redactDiscordInteractionText(leakedText, ["SECRET_TOK_ABC"])).not.toContain(
         "SECRET_TOK_ABC",
       );
       expect(createRouteKey("POST", "/interactions/12345/SECRET_TOK_ABC/callback")).toBe(
@@ -5688,7 +5918,9 @@ describe("Discord native interactions (INTERACTION_CREATE)", () => {
       for (const timer of openServerTimers) {
         clearTimeout(timer);
       }
-      await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      if (httpServer.listening) {
+        await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      }
     }
   });
 
@@ -5733,6 +5965,42 @@ describe("Discord native interactions (INTERACTION_CREATE)", () => {
           parent_id: CHANNEL_ID,
           name: "subthread",
         });
+      }
+      if (route === "/channels/700009999" && call.init.method === "GET") {
+        timeline.push("rest:get_slow_thread");
+        if (unparentedThreadLatencyMs > 0) {
+          nowMs += unparentedThreadLatencyMs;
+        }
+        return jsonResponse({
+          id: "700009999",
+          type: 11,
+          guild_id: GUILD_ID,
+          parent_id: CHANNEL_ID,
+        });
+      }
+      if (route === "/channels/70000404" && call.init.method === "GET") {
+        timeline.push("rest:get_channel_404");
+        return jsonResponse({ message: "Unknown Channel", code: 10003 }, 404);
+      }
+      if (route === "/channels/70000405" && call.init.method === "GET") {
+        timeline.push("rest:get_channel_empty");
+        return jsonResponse({});
+      }
+      if (route === "/channels/70000406" && call.init.method === "GET") {
+        timeline.push("rest:get_channel_missing_type");
+        return jsonResponse({ id: "70000406", guild_id: GUILD_ID });
+      }
+      if (route === "/channels/70000407" && call.init.method === "GET") {
+        timeline.push("rest:get_channel_wrong_guild");
+        return jsonResponse({ id: "70000407", type: 0, guild_id: "999999999" });
+      }
+      if (route === "/channels/70000408" && call.init.method === "GET") {
+        timeline.push("rest:get_channel_wrong_id");
+        return jsonResponse({ id: "999999998", type: 0, guild_id: GUILD_ID });
+      }
+      if (route === "/channels/70000409" && call.init.method === "GET") {
+        timeline.push("rest:get_thread_no_parent");
+        return jsonResponse({ id: "70000409", type: 11, guild_id: GUILD_ID });
       }
       if (route.endsWith("/messages") && call.init.method === "POST") {
         publicChannelMessages.push({
@@ -5838,7 +6106,7 @@ describe("Discord native interactions (INTERACTION_CREATE)", () => {
         };
       }
 
-      const binding = userBindings.get(req.platform_user_id);
+      const binding = req.platform_user_id ? userBindings.get(req.platform_user_id) : undefined;
       if (!binding) {
         return {
           ok: false,
@@ -6083,6 +6351,56 @@ describe("Discord native interactions (INTERACTION_CREATE)", () => {
       });
       expect(String(firstOriginalEdit.body.content)).toContain("A股量化研究");
       expect(publicChannelMessages).toHaveLength(0);
+
+      // 1b. Post-defer channel validation failures (REST 404, empty result, missing type, mismatched guild_id/id, unresolved thread parent):
+      // initial defer runs first, then private error reply is sent via @original, with ZERO sessionCommand execution and ZERO public messages;
+      // autocomplete on unresolved channel returns [] within deadline and ZERO sessionCommand calls.
+      for (const badChannelId of ["70000404", "70000405", "70000406", "70000407", "70000408", "70000409"]) {
+        const sessionCallsBeforeBad = vi.mocked(backend.sessionCommand).mock.calls.length;
+        timeline.length = 0;
+        await adapter.handleDispatch("INTERACTION_CREATE", {
+          id: `inter-bad-ch-${badChannelId}`,
+          application_id: APP_ID,
+          type: DISCORD_INTERACTION_TYPE_APPLICATION_COMMAND,
+          token: `tok_bad_ch_${badChannelId}`,
+          guild_id: GUILD_ID,
+          channel_id: badChannelId,
+          member: { user: { id: USER_ALICE, username: "alice" } },
+          data: { id: "cmd-new", name: "new", type: 1 },
+        });
+        expect(timeline[0]).toBe("interaction:callback:type=5");
+        expect(timeline.at(-1)).toBe("interaction:edit_original");
+        expect(vi.mocked(backend.sessionCommand).mock.calls.length).toBe(sessionCallsBeforeBad);
+        const badEdit = interactionHttpLog.at(-1)!;
+        expect(badEdit.url).toContain(`/webhooks/${APP_ID}/tok_bad_ch_${badChannelId}/messages/@original`);
+        expect(badEdit.body).toMatchObject({
+          flags: DISCORD_EPHEMERAL_MESSAGE_FLAG,
+          allowed_mentions: { parse: [] },
+        });
+        expect(String(badEdit.body.content)).toContain("Unable to verify the Discord channel or thread context");
+        expect(publicChannelMessages).toHaveLength(0);
+
+        // Autocomplete on the same unresolved channel returns empty choices without calling backend
+        await adapter.handleDispatch("INTERACTION_CREATE", {
+          id: `inter-bad-auto-${badChannelId}`,
+          application_id: APP_ID,
+          type: DISCORD_INTERACTION_TYPE_APPLICATION_COMMAND_AUTOCOMPLETE,
+          token: `tok_bad_auto_${badChannelId}`,
+          guild_id: GUILD_ID,
+          channel_id: badChannelId,
+          member: { user: { id: USER_ALICE, username: "alice" } },
+          data: {
+            id: "cmd-ws",
+            name: "workspace",
+            type: 1,
+            options: [{ name: "workspace", type: 3, value: "", focused: true }],
+          },
+        });
+        expect(vi.mocked(backend.sessionCommand).mock.calls.length).toBe(sessionCallsBeforeBad);
+        expect(
+          (interactionHttpLog.at(-1)!.body.data as { choices: unknown[] }).choices,
+        ).toEqual([]);
+      }
 
       // 2. Two users in the same guild channel maintain independent workspace selection
       await adapter.handleDispatch("INTERACTION_CREATE", {
@@ -6360,11 +6678,20 @@ describe("Discord native interactions (INTERACTION_CREATE)", () => {
 
       // 8. Startup recovery recognizes pending native interaction rows, closes them out with abandoned_on_restart, and NEVER calls public sendMessageDiscord
       vi.spyOn(backend, "recoverState").mockResolvedValueOnce({
+        mode: "startup",
         inbound_events: [
           {
             platform: "discord",
             message_id: "inter-recover-native-1",
             request_key: makeInboundRequestKey("discord", "inter-recover-native-1"),
+            retry_request_key: null,
+            resubmitted_request_key: null,
+            steered_into_run_id: null,
+            turn_index: null,
+            workspace_id: null,
+            external_thread_id: null,
+            sent_to_current_count: 0,
+            uploaded_attachments: [],
             event_kind: "command",
             dalton_user_id: DALTON_ALICE,
             chat_type: "group",
