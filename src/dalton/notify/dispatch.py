@@ -334,6 +334,20 @@ async def populate_automation_notify_state(
     """Populate ``dalton_notify_category``, ``dalton_notify_effective``, and ``dalton_notify_source`` on response models."""
     if not responses:
         return
+    from src.dalton.company_identity import is_company_system_user
+    from src.dalton.services.company_automations import apply_company_notify_representation
+
+    personal_responses: list[Any] = []
+    for resp in responses:
+        if getattr(resp, "scope", None) == "company" or is_company_system_user(
+            getattr(resp, "user_id", None)
+        ):
+            apply_company_notify_representation(resp)
+        else:
+            personal_responses.append(resp)
+    if not personal_responses:
+        return
+    responses = personal_responses
     try:
         overrides = await resolve_overrides_fn(user_id) if user_id else {}
     except Exception:

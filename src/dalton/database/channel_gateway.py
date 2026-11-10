@@ -32,6 +32,7 @@ from psycopg.types.json import Jsonb
 
 from src.dalton import sharing as dalton_sharing
 from src.dalton.access_tiers import get_user_tier
+from src.dalton.company_identity import reject_company_system_auth
 from src.dalton.settings import is_colleague_dispatch_enabled
 from src.server.database import pool as db_pool
 from src.server.database.conversation.threads_read import lookup_thread_by_external_id
@@ -1220,6 +1221,34 @@ async def _register_and_resolve_inbound_once(
                     "SELECT pg_advisory_xact_lock(hashtext(%s))",
                     (f"dalton_inbound:{cleaned_platform}:{cleaned_msg_id}",),
                 )
+                await cur.execute(
+                    """
+                    SELECT dalton_user_id, raw_payload
+                    FROM dalton_channel_inbound_events
+                    WHERE platform = %s AND message_id = %s
+                    """,
+                    (cleaned_platform, cleaned_msg_id),
+                )
+                pre_inbound = await cur.fetchone()
+                if pre_inbound:
+                    reject_company_system_auth(pre_inbound.get("dalton_user_id"))
+                probe_puid = cleaned_puid or (
+                    str((pre_inbound.get("raw_payload") or {}).get("platform_user_id") or "").strip()
+                    if pre_inbound and isinstance(pre_inbound.get("raw_payload"), dict)
+                    else ""
+                )
+                if probe_puid:
+                    await cur.execute(
+                        """
+                        SELECT user_id FROM dalton_channel_identities
+                        WHERE platform = %s AND platform_user_id = %s
+                        """,
+                        (cleaned_platform, probe_puid),
+                    )
+                    pre_identity = await cur.fetchone()
+                    if pre_identity:
+                        reject_company_system_auth(pre_identity.get("user_id"))
+
                 # 1. Idempotent insert into dalton_channel_inbound_events
                 await cur.execute(
                     """
@@ -1329,6 +1358,7 @@ async def _register_and_resolve_inbound_once(
 
                     # Re-verify identity on replay
                     ex_uid = existing.get("dalton_user_id")
+                    reject_company_system_auth(ex_uid)
                     if eff_puid:
                         await cur.execute(
                             """
@@ -1338,6 +1368,8 @@ async def _register_and_resolve_inbound_once(
                             (cleaned_platform, eff_puid),
                         )
                         id_replay = await cur.fetchone()
+                        if id_replay:
+                            reject_company_system_auth(id_replay.get("user_id"))
                         if not id_replay or (
                             ex_uid and str(id_replay["user_id"]) != str(ex_uid)
                         ):
@@ -1566,6 +1598,7 @@ async def _register_and_resolve_inbound_once(
                     )
 
                 dalton_user_id = str(identity["user_id"])
+                reject_company_system_auth(dalton_user_id)
 
                 # 3. External member group chat veto
                 user_tier = await get_user_tier(dalton_user_id)
@@ -1767,6 +1800,7 @@ async def create_bind_code(
     cleaned_platform = str(platform or "").strip().lower()
     if not cleaned_uid:
         raise HTTPException(status_code=401, detail="Authentication required")
+    reject_company_system_auth(cleaned_uid)
     if cleaned_platform not in SUPPORTED_PLATFORMS:
         raise HTTPException(status_code=400, detail=f"Unsupported platform: {platform!r}")
 
@@ -1931,6 +1965,7 @@ async def _bind_identity_in_tx(
     field. The identity then copies the current token and that token's source
     and value. An older message does not replace the current token.
     """
+    reject_company_system_auth(user_id)
     # Lock order (same as update_user_channel_settings): personal settings locks
     # first, then session generation rows. Lock the binder's row and every
     # displaced user's row, sorted, before touching any generation row; otherwise
@@ -1945,6 +1980,7 @@ async def _bind_identity_in_tx(
     )
     lock_uids = sorted({user_id, *(str(r["user_id"]) for r in await cur.fetchall())})
     for lock_uid in lock_uids:
+        reject_company_system_auth(lock_uid)
         await cur.execute(
             "SELECT pg_advisory_xact_lock(hashtext(%s))",
             (f"dalton_user_settings:{lock_uid}",),
@@ -2316,6 +2352,8 @@ async def _consume_bind_code_or_unbind_once(
     cleaned_action = str(action or "bind").strip().lower()
     cleaned_platform = str(platform or "").strip().lower()
     cleaned_inbound_mid = str(inbound_message_id or "").strip() or None
+    if user_id is not None:
+        reject_company_system_auth(user_id)
 
     async with get_db_connection(conn) as owned_conn:
         async with owned_conn.transaction():
@@ -2352,6 +2390,17 @@ async def _consume_bind_code_or_unbind_once(
                     if is_group:
                         await cur.execute(
                             """
+                            SELECT user_id FROM dalton_channel_bind_codes
+                            WHERE code_hash = %s
+                            FOR UPDATE
+                            """,
+                            (code_hash,),
+                        )
+                        grp_code_row = await cur.fetchone()
+                        if grp_code_row:
+                            reject_company_system_auth(grp_code_row.get("user_id"))
+                        await cur.execute(
+                            """
                             UPDATE dalton_channel_bind_codes
                             SET used_at = NOW(), revoked_reason = 'sent_in_group'
                             WHERE code_hash = %s AND used_at IS NULL
@@ -2377,6 +2426,8 @@ async def _consume_bind_code_or_unbind_once(
                         (code_hash,),
                     )
                     row = await cur.fetchone()
+                    if row:
+                        reject_company_system_auth(row.get("user_id"))
                     if (
                         not row
                         or row.get("used_at") is not None
@@ -2453,6 +2504,8 @@ async def _consume_bind_code_or_unbind_once(
 
                 if cleaned_action == "unbind":
                     target_uid = str(user_id or "").strip() or None
+                    if target_uid:
+                        reject_company_system_auth(target_uid)
                     cleaned_puid = str(platform_user_id or "").strip() or None
                     if not target_uid and cleaned_puid:
                         await cur.execute(
@@ -2474,6 +2527,7 @@ async def _consume_bind_code_or_unbind_once(
                             inbound_message_id=cleaned_inbound_mid,
                             result=res,
                         )
+                    reject_company_system_auth(target_uid)
 
                     # Lock personal settings row FIRST (matching bind & update_user_channel_settings lock order)
                     # before deleting identity row or touching session generation rows.
@@ -2854,6 +2908,8 @@ async def _execute_session_command_once(
         )
 
     cleaned_platform = str(platform or "").strip().lower()
+    if dalton_user_id is not None:
+        reject_company_system_auth(dalton_user_id)
     cleaned_uid = str(dalton_user_id or "").strip()
     cleaned_puid = str(platform_user_id or "").strip()
     cleaned_chat_type = str(chat_type or "dm").strip().lower()
@@ -2908,6 +2964,7 @@ async def _execute_session_command_once(
                         orig_uid = str(
                             existing_inbound.get("dalton_user_id") or ""
                         ).strip()
+                        reject_company_system_auth(orig_uid)
                         if isinstance(existing_inbound.get("raw_payload"), dict):
                             orig_puid = str(
                                 existing_inbound["raw_payload"].get("platform_user_id")
@@ -2976,6 +3033,7 @@ async def _execute_session_command_once(
                             uid_val=None,
                         )
                     resolved_identity_uid = str(identity["user_id"])
+                    reject_company_system_auth(resolved_identity_uid)
                     if (orig_uid and orig_uid != resolved_identity_uid) or (
                         cleaned_uid and cleaned_uid != resolved_identity_uid
                     ):
@@ -2991,6 +3049,7 @@ async def _execute_session_command_once(
                     cleaned_uid = resolved_identity_uid
                 elif cleaned_msg_id or existing_inbound is not None:
                     check_uid = cleaned_uid or orig_uid
+                    reject_company_system_auth(check_uid)
                     if not check_uid or (
                         orig_uid and cleaned_uid and orig_uid != cleaned_uid
                     ):
@@ -3011,6 +3070,8 @@ async def _execute_session_command_once(
                         (check_uid, cleaned_platform),
                     )
                     identity = await cur.fetchone()
+                    if identity:
+                        reject_company_system_auth(identity.get("user_id"))
                     if not identity:
                         return await _deny_and_ignore_command(
                             {
@@ -3044,6 +3105,7 @@ async def _execute_session_command_once(
                         "allowed": False,
                         "deny_reason": "not_linked",
                     }
+                reject_company_system_auth(cleaned_uid)
 
                 # 2. Tier & group chat check
                 user_tier = await get_user_tier(cleaned_uid)
@@ -3849,6 +3911,7 @@ async def get_channel_internal_state(
     cleaned_uid = str(user_id or "").strip()
     if not cleaned_uid:
         raise HTTPException(status_code=400, detail="user_id is required")
+    reject_company_system_auth(cleaned_uid)
 
     user_tier = await get_user_tier(cleaned_uid)
     home_ws_id = get_home_workspace_id(cleaned_uid)
@@ -4126,6 +4189,7 @@ async def _update_user_channel_settings_once(
     cleaned_uid = str(user_id or "").strip()
     if not cleaned_uid:
         raise HTTPException(status_code=400, detail="user_id is required")
+    reject_company_system_auth(cleaned_uid)
 
     user_tier = await get_user_tier(cleaned_uid)
 
@@ -4616,6 +4680,8 @@ async def authorize_and_claim_delivery(
     if not cleaned_key:
         raise HTTPException(status_code=400, detail="delivery_key is required")
     cleaned_kind = str(kind or "agent_send").strip().lower()
+    if user_id is not None:
+        reject_company_system_auth(user_id)
     cleaned_uid = str(user_id or "").strip() or None
     cleaned_platform = str(platform or "").strip().lower() or None
     cleaned_target = str(target).strip() if target is not None and str(target).strip() else None
@@ -4656,6 +4722,7 @@ async def authorize_and_claim_delivery(
                 # True only when this claim may persist activity_origin conversation -> replay.
                 replay_recovery = False
                 if existing:
+                    reject_company_system_auth(existing.get("user_id"))
                     ex_scope = (
                         str(existing.get("source_scope_key") or "").strip() or None
                     )
@@ -4805,6 +4872,7 @@ async def authorize_and_claim_delivery(
                             "code": "no_current_conversation",
                             "message": "Inbound event not found.",
                         }
+                    reject_company_system_auth(in_row.get("dalton_user_id"))
                     persisted_scope = (
                         str(in_row.get("thread_scope_key") or "").strip() or None
                     )
@@ -4954,6 +5022,7 @@ async def authorize_and_claim_delivery(
                             "message": "Automation run not found.",
                         }
                     owner_uid = str(auto_row["user_id"])
+                    reject_company_system_auth(owner_uid)
                     if cleaned_uid and cleaned_uid != owner_uid:
                         return {
                             "claim_status": "denied",
@@ -5115,6 +5184,7 @@ async def authorize_and_claim_delivery(
                         }
 
                     resolved_user_id = str(source_row["dalton_user_id"])
+                    reject_company_system_auth(resolved_user_id)
                     resolved_platform = str(source_row["platform"]).lower()
                     resolved_target_address = str(source_row["target_address"])
                     is_current = True
@@ -5499,6 +5569,8 @@ async def authorize_and_claim_delivery(
                             "message": "Delivery identity or destination does not match the existing record.",
                         }
 
+                if resolved_user_id and not str(resolved_user_id).startswith("unlinked:"):
+                    reject_company_system_auth(resolved_user_id)
                 # Weixin uses the current encrypted context token. A historical inbound
                 # row does not replace it by numeric size.
                 if resolved_platform == "weixin":
@@ -5687,6 +5759,7 @@ async def _update_delivery_progress_once(
                     raise HTTPException(
                         status_code=404, detail="Delivery record not found"
                     )
+                reject_company_system_auth(pre_row.get("user_id"))
 
                 locked_session_row: dict[str, Any] | None = None
                 db_now: datetime | None = None
@@ -5732,6 +5805,7 @@ async def _update_delivery_progress_once(
                     raise HTTPException(
                         status_code=404, detail="Delivery record not found"
                     )
+                reject_company_system_auth(row.get("user_id"))
 
                 locked_uid = str(row.get("user_id") or "").strip()
                 locked_plat = str(row.get("platform") or "").strip().lower()
@@ -5995,6 +6069,7 @@ async def _update_inbound_progress_once(
                     si_plat = str(session_interrupt_update["platform"]).strip().lower()
                     si_scope = str(session_interrupt_update["scope_key"]).strip()
                     si_uid = str(session_interrupt_update["dalton_user_id"]).strip()
+                    reject_company_system_auth(si_uid)
                     si_val = session_interrupt_update.get("pending_interrupt")
                     si_expected_gen = session_interrupt_update.get("generation")
                     if (
@@ -6095,6 +6170,7 @@ async def _update_inbound_progress_once(
                     src_scope_ok = True
                     persisted_gen_val: int | None = None
                     if persisted_src is not None:
+                        reject_company_system_auth(persisted_src.get("dalton_user_id"))
                         p_plat = str(persisted_src.get("platform") or "").strip().lower()
                         p_uid = str(persisted_src.get("dalton_user_id") or "").strip()
                         p_scope = str(
@@ -6275,6 +6351,8 @@ async def _update_inbound_progress_once(
                         (cleaned_p, cleaned_mid),
                     )
                     cmd_pre = await cur.fetchone()
+                    if cmd_pre:
+                        reject_company_system_auth(cmd_pre.get("dalton_user_id"))
                     if (
                         cmd_pre
                         and cmd_pre.get("event_kind") == "command"
@@ -6309,6 +6387,16 @@ async def _update_inbound_progress_once(
 
                 # 2. Update dalton_channel_inbound_events
                 if cleaned_p and cleaned_mid:
+                    await cur.execute(
+                        """
+                        SELECT dalton_user_id FROM dalton_channel_inbound_events
+                        WHERE platform = %s AND message_id = %s
+                        """,
+                        (cleaned_p, cleaned_mid),
+                    )
+                    pre_in_upd = await cur.fetchone()
+                    if pre_in_upd:
+                        reject_company_system_auth(pre_in_upd.get("dalton_user_id"))
                     sets: list[str] = ["updated_at = NOW()"]
                     params: list[Any] = []
                     if status is not None:
@@ -6384,6 +6472,7 @@ async def _update_inbound_progress_once(
                 if thread_watch:
                     tw_tid = normalize_uuid(thread_watch["thread_id"])
                     tw_uid = str(thread_watch["dalton_user_id"]).strip()
+                    reject_company_system_auth(tw_uid)
                     tw_plat = str(thread_watch["platform"]).strip().lower()
                     tw_addr = str(thread_watch["target_address"]).strip()
                     tw_scope = str(thread_watch.get("scope_key") or "").strip()
@@ -6510,6 +6599,7 @@ async def _update_inbound_progress_once(
                     bg_rid = str(background_run["run_id"]).strip()
                     bg_tid = normalize_uuid(background_run["thread_id"])
                     bg_uid = str(background_run["dalton_user_id"]).strip()
+                    reject_company_system_auth(bg_uid)
                     bg_plat = str(background_run["platform"]).strip().lower()
                     bg_addr = str(background_run["target_address"]).strip()
                     bg_tidx = background_run.get("turn_index")
@@ -6646,6 +6736,7 @@ async def _reconcile_steer_once(
                     raise HTTPException(
                         status_code=404, detail="Inbound event not found"
                     )
+                reject_company_system_auth(in_row.get("dalton_user_id"))
 
                 raw_p = dict(in_row.get("raw_payload") or {})
                 credit_steer_key = raw_p.get("credit_steer_request_key")
@@ -7147,6 +7238,7 @@ async def register_automation_run(
     cleaned_uid = str(user_id or "").strip()
     if not cleaned_uid:
         raise HTTPException(status_code=400, detail="user_id is required")
+    reject_company_system_auth(cleaned_uid)
     norm_ws_id = normalize_uuid(workspace_id) if workspace_id else None
     norm_tid = normalize_uuid(thread_id) if thread_id else None
     user_tier = await get_user_tier(cleaned_uid)
@@ -7331,6 +7423,7 @@ async def finish_automation_run(
                 row = await cur.fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail="Unknown execution_id")
+                reject_company_system_auth(row.get("user_id"))
 
                 prev_db_status = str(row["status"])
                 if prev_db_status == "finished" and not mark_finished:
@@ -7744,6 +7837,10 @@ async def _upsert_weixin_state_once(
         else login_version
     )
 
+    if owner_user_id is not None:
+        reject_company_system_auth(owner_user_id)
+    if login_owner_user_id is not None:
+        reject_company_system_auth(login_owner_user_id)
     async with get_db_connection(conn) as owned_conn:
         async with owned_conn.transaction():
             async with owned_conn.cursor(row_factory=dict_row) as cur:
