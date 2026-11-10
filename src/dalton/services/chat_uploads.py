@@ -225,6 +225,59 @@ async def resolve_and_verify_upload_workspace(
     return route.workspace_id
 
 
+async def resolve_and_verify_file_delete_workspace(
+    user_id: str,
+    workspace_id: str | None,
+) -> str:
+    """Resolve ``workspace_id`` (including ``'home'``) and verify caller file-delete write access.
+
+    Uses the file-access permission path (``channel="web"``, ``need="write"`` via
+    ``require_workspace_access``, matching ``owned_workspace_on_computer(..., need="write")``)
+    so shared writers (``web_access='rw'``) can delete files even when colleague
+    conversation dispatch is disabled, while read-only or no-access users are denied.
+    """
+    from src.dalton.settings import is_dalton_supabase_auth_enabled
+    from src.dalton.sharing import require_team_reader, require_workspace_access
+    from src.server.utils.api import require_workspace_owner
+
+    uid = str(user_id or "").strip()
+    if not uid:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    raw_ws = str(workspace_id or "").strip()
+    if not raw_ws or raw_ws.lower() == "home":
+        target_ws = get_home_workspace_id(uid)
+    else:
+        target_ws = _validate_uuid(raw_ws, field_name="workspace_id")
+
+    ws_row = await db.get_workspace_permission_row(target_ws)
+    if ws_row is not None and ws_row.get("status") == "deleted":
+        ws_row = None
+
+    if ws_row is None and is_home_id(uid, target_ws):
+        if is_dalton_supabase_auth_enabled():
+            await require_team_reader(uid)
+        return get_home_workspace_id(uid)
+
+    if ws_row is None:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+
+    if is_dalton_supabase_auth_enabled():
+        verified_ws = await require_workspace_access(
+            target_ws,
+            uid,
+            channel="web",
+            need="write",
+            workspace=ws_row,
+        )
+    else:
+        require_workspace_owner(ws_row, user_id=uid)
+        verified_ws = ws_row
+
+    route = turn_route(uid, verified_ws)
+    return route.workspace_id
+
+
 async def initiate_chat_upload(
     *,
     user_id: str,
@@ -3211,7 +3264,7 @@ async def begin_delete_workspace_chat_uploads(
     paths = candidate_client_paths or target_client_paths
     if not paths or not get_dalton_settings().enabled:
         return []
-    canonical_ws = await resolve_and_verify_upload_workspace(
+    canonical_ws = await resolve_and_verify_file_delete_workspace(
         caller_user_id, workspace_id
     )
     matched_rows = await _match_retained_uploads_by_client_paths(
@@ -3245,7 +3298,7 @@ async def abort_delete_workspace_chat_uploads(
     paths = failed_client_paths or aborted_client_paths
     if not paths or not get_dalton_settings().enabled:
         return 0
-    canonical_ws = await resolve_and_verify_upload_workspace(
+    canonical_ws = await resolve_and_verify_file_delete_workspace(
         caller_user_id, workspace_id
     )
     matched_ids = await _match_retained_upload_ids_by_client_paths(
@@ -3270,7 +3323,7 @@ async def retire_deleted_workspace_chat_uploads(
     if not deleted_client_paths or not get_dalton_settings().enabled:
         return 0
 
-    canonical_ws = await resolve_and_verify_upload_workspace(
+    canonical_ws = await resolve_and_verify_file_delete_workspace(
         caller_user_id, workspace_id
     )
     matched_rows = await _match_retained_uploads_by_client_paths(

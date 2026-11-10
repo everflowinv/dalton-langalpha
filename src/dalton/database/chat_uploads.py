@@ -952,11 +952,6 @@ async def claim_cleanup_batch(
                                   AND u.expires_at <= {now_expr}
                                   AND NOT {_live_provisional_sql("u", now_expr)}
                               )
-                              OR (
-                                  u.state = 'ready'
-                                  AND u.error = 'explicit_delete_pending'
-                                  AND u.updated_at <= {now_expr} - INTERVAL '5 minutes'
-                              )
                               OR EXISTS (
                                   SELECT 1
                                   FROM workspaces AS w

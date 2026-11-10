@@ -5183,10 +5183,95 @@ class TestChatLargeUploadRealInfra:
             assert len(res_rf["errors"]) == 1 and res_rf["errors"][0]["path"] == rel_d
             assert storage.object_size(key_d) == 1 * _MIB
 
-            # (e) Subsequent retry succeeds -> file absent, DB row aborted, S3 object removed
-            res_ok = await ws_crud.delete_workspace_files(
-                workspace_id=workspace_id, x_user_id=user["user_id"], body=del_body_d
+            # (d.2) Real PostgreSQL sweep_expired_chat_uploads_once +10 minutes past updated_at:
+            #       ready row with error='explicit_delete_pending' MUST NOT be claimed, aborted,
+            #       or deleted from MinIO while recovery remains blocked until confirmed deletion!
+            await sweep_expired_chat_uploads_once(
+                now=datetime.now(timezone.utc) + timedelta(minutes=10)
             )
+            row_d_pending = await chat_uploads_db.get_upload(up_d["upload_id"])
+            assert row_d_pending is not None
+            assert row_d_pending["state"] == "ready"
+            assert row_d_pending["error"] == "explicit_delete_pending"
+            assert row_d_pending["cleaned_at"] is None
+            assert storage.object_size(key_d) == 1 * _MIB
+            assert not await chat_uploads_db.is_upload_retained_for_recovery(
+                up_d["upload_id"], workspace_id
+            )
+
+            # (e) Route-level delete_workspace_files with Dalton Supabase auth enabled and
+            #     colleague dispatch disabled: read-only colleague is denied (403), while
+            #     shared writer (web_access='rw') deletes both an ordinary file and rel_d,
+            #     retiring the DB row to aborted and removing the MinIO object!
+            from src.dalton import settings as dalton_settings
+            from src.dalton import sharing as dalton_sharing
+            from src.server.services import workspace_files
+
+            colleague_rw = await create_user(
+                user_id=f"u-col-rw-{uid_tag}",
+                email=f"col-rw-{uid_tag}@chat-upload-e2e.test",
+                name="Colleague RW",
+            )
+            colleague_ro = await create_user(
+                user_id=f"u-col-ro-{uid_tag}",
+                email=f"col-ro-{uid_tag}@chat-upload-e2e.test",
+                name="Colleague RO",
+            )
+            ordinary_rel = "work/shared_writer_note.txt"
+            ordinary_abs = f"{layout.workspace}/{ordinary_rel}"
+            await docker_ptc_sandbox.execute_bash_command(
+                f"mkdir -p {shlex.quote(os.path.dirname(ordinary_abs))} "
+                f"&& printf 'hello' > {shlex.quote(ordinary_abs)} "
+                f"&& printf 'placeholder' > {shlex.quote(abs_d)}"
+            )
+            sharing_mode = "ro"
+
+            async def _e2e_team_reader(uid: str | None) -> str:
+                if uid in (user["user_id"], colleague_rw["user_id"], colleague_ro["user_id"]):
+                    return str(uid)
+                raise HTTPException(status_code=403, detail="Forbidden")
+
+            async def _e2e_ws_sharing(target_ws_id: str, *, conn=None):
+                del conn
+                return {"workspace_id": target_ws_id, "web_access": sharing_mode, "cos_access": "ro"}
+
+            with (
+                patch.object(
+                    ws_crud,
+                    "owned_workspace_on_computer",
+                    wraps=workspace_files.owned_workspace_on_computer,
+                ),
+                patch.object(dalton_settings, "is_dalton_supabase_auth_enabled", return_value=True),
+                patch.object(dalton_sharing, "is_dalton_supabase_auth_enabled", return_value=True),
+                patch.object(dalton_settings, "is_colleague_dispatch_enabled", return_value=False),
+                patch.object(dalton_sharing, "is_colleague_dispatch_enabled", return_value=False),
+                patch.object(dalton_sharing, "require_team_reader", side_effect=_e2e_team_reader),
+                patch.object(dalton_sharing, "get_user_tier", return_value="internal"),
+                patch.object(dalton_sharing, "classify_owner_tier", return_value="internal"),
+                patch.object(dalton_sharing, "get_workspace_sharing", side_effect=_e2e_ws_sharing),
+            ):
+                with pytest.raises(HTTPException) as ro_del_exc:
+                    await ws_crud.delete_workspace_files(
+                        workspace_id=workspace_id,
+                        x_user_id=colleague_ro["user_id"],
+                        body=ws_crud.DeleteFilesRequest(paths=[ordinary_rel, rel_d]),
+                    )
+                assert ro_del_exc.value.status_code == 403
+                assert storage.object_size(key_d) == 1 * _MIB
+
+                sharing_mode = "rw"
+                res_ord_ok = await ws_crud.delete_workspace_files(
+                    workspace_id=workspace_id,
+                    x_user_id=colleague_rw["user_id"],
+                    body=ws_crud.DeleteFilesRequest(paths=[ordinary_rel]),
+                )
+                assert res_ord_ok == {"deleted": [ordinary_rel], "errors": []}
+
+                res_ok = await ws_crud.delete_workspace_files(
+                    workspace_id=workspace_id,
+                    x_user_id=colleague_rw["user_id"],
+                    body=del_body_d,
+                )
             assert res_ok == {"deleted": [rel_d], "errors": []}
             row_d_retired = await chat_uploads_db.get_upload(up_d["upload_id"])
             assert row_d_retired is not None and row_d_retired["state"] == "aborted"
@@ -5205,6 +5290,11 @@ class TestChatLargeUploadRealInfra:
             #     pause after bytes are read into staging (WSFILES_TEST_PAUSE_AFTER_LOCK_OPEN),
             #     complete delete_workspace_files while paused, resume transfer -> raises HTTP 410
             #     without recreating the file or returning a saved-file reminder!
+            from contextlib import suppress
+            from ptc_agent.core.sandbox._shared import TRANSFER_RUNTIME_SANDBOX_NAME
+            from src.server.services.persistence.transfer import _script_path
+
+            transfer_script = _script_path(docker_ptc_sandbox)
             for mat_mode in ("direct", "chunked"):
                 up_m, key_m, _ = await _upload_streamed_file_via_http(
                     chat_upload_infra.client,
@@ -5252,17 +5342,28 @@ class TestChatLargeUploadRealInfra:
                     yield
 
                 async def _rt_inject_pause_env(fn, *args, **kwargs):
-                    if args and isinstance(args[0], str) and (
-                        "wsfiles_transfer_runtime.py" in args[0]
-                        or "WSFILES_TEST_PAUSE_AFTER_LOCK_OPEN" in args[0]
+                    cmd_str = args[0] if args and isinstance(args[0], str) else ""
+                    is_direct_pull = (
+                        TRANSFER_RUNTIME_SANDBOX_NAME in cmd_str
+                        and (
+                            transfer_script in cmd_str
+                            or f"_internal/src/{TRANSFER_RUNTIME_SANDBOX_NAME}" in cmd_str
+                        )
+                        and f"{shlex.quote(transfer_script)} pull " in cmd_str
+                    )
+                    is_chunked_finalize = "WSFILES_TEST_PAUSE_AFTER_LOCK_OPEN" in cmd_str
+                    if (
+                        (is_direct_pull or is_chunked_finalize)
+                        and not cmd_str.startswith("WSFILES_TEST_PAUSE_AFTER_LOCK_OPEN=")
                     ):
                         patched_cmd = (
                             f"WSFILES_TEST_PAUSE_AFTER_LOCK_OPEN={shlex.quote(f'{m_ready}:{m_go}')} "
-                            + args[0]
+                            + cmd_str
                         )
                         return await orig_rt_call(fn, patched_cmd, *args[1:], **kwargs)
                     return await orig_rt_call(fn, *args, **kwargs)
 
+                mat_task: asyncio.Task[list[str]] | None = None
                 orig_direct_flag = getattr(docker_ptc_sandbox.provider, "direct_blob_transfer", True)
                 docker_ptc_sandbox.provider.direct_blob_transfer = mat_mode == "direct"
                 try:
@@ -5270,35 +5371,65 @@ class TestChatLargeUploadRealInfra:
                         patch.object(docker_ptc_sandbox, "path_write_lock", side_effect=_noop_path_lock),
                         patch.object(docker_ptc_sandbox, "_runtime_call", side_effect=_rt_inject_pause_env),
                     ):
-                        mat_task = asyncio.create_task(
-                            materialize_chat_uploads(
-                                [ctx_m],
-                                sandbox=docker_ptc_sandbox,
-                                user_id=user["user_id"],
+                        try:
+                            mat_task = asyncio.create_task(
+                                materialize_chat_uploads(
+                                    [ctx_m],
+                                    sandbox=docker_ptc_sandbox,
+                                    user_id=user["user_id"],
+                                    workspace_id=workspace_id,
+                                    project=project,
+                                )
+                            )
+                            paused_info = ""
+                            for _ in range(100):
+                                chk_m = await docker_ptc_sandbox.execute_bash_command(
+                                    f"test -f {shlex.quote(m_ready)} && cat {shlex.quote(m_ready)}"
+                                )
+                                paused_info = (chk_m.get("stdout") or "").strip()
+                                if paused_info:
+                                    break
+                                if mat_task.done():
+                                    try:
+                                        early_res = await mat_task
+                                    except Exception as early_exc:
+                                        pytest.fail(
+                                            f"{mat_mode} materialize_chat_uploads failed before reaching lock-open pause: {early_exc!r}"
+                                        )
+                                    pytest.fail(
+                                        f"{mat_mode} materialize_chat_uploads completed early without pausing at lock-open: {early_res!r}"
+                                    )
+                                await asyncio.sleep(0.05)
+                            assert paused_info, f"{mat_mode} did not reach lock-open pause"
+
+                            del_m = await ws_crud.delete_workspace_files(
                                 workspace_id=workspace_id,
-                                project=project,
+                                x_user_id=user["user_id"],
+                                body=ws_crud.DeleteFilesRequest(paths=[rel_m]),
                             )
-                        )
-                        for _ in range(100):
-                            chk_m = await docker_ptc_sandbox.execute_bash_command(
-                                f"test -f {shlex.quote(m_ready)} && cat {shlex.quote(m_ready)}"
-                            )
-                            if (chk_m.get("stdout") or "").strip():
-                                break
-                            await asyncio.sleep(0.05)
-                        assert (chk_m.get("stdout") or "").strip(), f"{mat_mode} did not reach lock-open pause"
+                            assert del_m == {"deleted": [rel_m], "errors": []}
 
-                        del_m = await ws_crud.delete_workspace_files(
-                            workspace_id=workspace_id,
-                            x_user_id=user["user_id"],
-                            body=ws_crud.DeleteFilesRequest(paths=[rel_m]),
-                        )
-                        assert del_m == {"deleted": [rel_m], "errors": []}
-
-                        await docker_ptc_sandbox.execute_bash_command(f"touch {shlex.quote(m_go)}")
-                        with pytest.raises(HTTPException) as exc_m:
-                            await mat_task
-                        assert exc_m.value.status_code == 410
+                            await docker_ptc_sandbox.execute_bash_command(f"touch {shlex.quote(m_go)}")
+                            with pytest.raises(HTTPException) as exc_m:
+                                await mat_task
+                            assert exc_m.value.status_code == 410
+                        finally:
+                            if mat_task is not None:
+                                if not mat_task.done():
+                                    with suppress(Exception):
+                                        await docker_ptc_sandbox.execute_bash_command(
+                                            f"touch {shlex.quote(m_go)}"
+                                        )
+                                    try:
+                                        await asyncio.wait_for(asyncio.shield(mat_task), timeout=5.0)
+                                    except BaseException:
+                                        if not mat_task.done():
+                                            mat_task.cancel()
+                                            with suppress(BaseException):
+                                                await mat_task
+                                elif not mat_task.cancelled():
+                                    with suppress(BaseException):
+                                        _ = mat_task.exception()
 
                     m_probe = await docker_ptc_sandbox.execute_bash_command(
                         f"test ! -e {shlex.quote(abs_m)} && echo absent"
@@ -5306,7 +5437,10 @@ class TestChatLargeUploadRealInfra:
                     assert "absent" in (m_probe.get("stdout") or "")
                     assert storage.object_size(key_m) is None
                 finally:
-                    docker_ptc_sandbox.provider.direct_blob_transfer = orig_direct_flag
-                    await docker_ptc_sandbox.execute_bash_command(
-                        f"rm -f {shlex.quote(m_ready)} {shlex.quote(m_go)}"
-                    )
+                    try:
+                        with suppress(Exception):
+                            await docker_ptc_sandbox.execute_bash_command(
+                                f"rm -f {shlex.quote(m_ready)} {shlex.quote(m_go)}"
+                            )
+                    finally:
+                        docker_ptc_sandbox.provider.direct_blob_transfer = orig_direct_flag

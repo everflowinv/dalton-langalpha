@@ -43,6 +43,7 @@ _REAL_COMPUTE_STORED_OBJECT_DIGEST = chat_upload_storage.compute_stored_object_d
 _REAL_COMPLETE_MULTIPART_UPLOAD = chat_upload_storage.complete_multipart_upload
 _REAL_UPLOAD_PART_BYTES = chat_upload_storage.upload_part_bytes
 _REAL_PULL_DIRECT = svc.pull_direct
+_REAL_CLAIM_CLEANUP_BATCH = db_chat_uploads.claim_cleanup_batch
 
 
 # ---------------------------------------------------------------------------
@@ -5667,3 +5668,333 @@ async def test_materialize_chat_uploads_direct_and_chunked_revoked_after_bytes_r
                 if not mat_task.done():
                     with suppress(Exception):
                         await mat_task
+
+
+@pytest.mark.asyncio
+async def test_delete_pending_not_swept_by_time_and_shared_writer_deletes_with_colleague_dispatch_disabled(
+    upload_env, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify:
+    1. claim_cleanup_batch SQL and sweep_expired_chat_uploads_once never select or delete a ready
+       upload solely because error='explicit_delete_pending' and >5 minutes elapsed; recovery stays
+       blocked until confirmed deletion retires the upload.
+    2. With Dalton Supabase auth enabled and colleague dispatch disabled, a shared writer
+       (web_access='rw') can delete both ordinary workspace files and retained chat attachments via
+       delete_workspace_files (and clear fences via abort_delete_workspace_chat_uploads on rm failure),
+       while read-only (web_access='ro') and hidden (web_access='hidden') callers are denied and
+       upload admission / conversation dispatch remain blocked for non-owners."""
+    from pathlib import Path
+
+    from src.dalton import settings as dalton_settings
+    from src.dalton import sharing as dalton_sharing
+    from src.server.app.workspace_files import crud as ws_crud
+    from src.server.database import workspace as ws_db
+    from src.server.services import turn_runtime, workspace_files
+
+    # ------------------------------------------------------------------
+    # Part 1: Real claim_cleanup_batch SQL check + sweeper time-advance check
+    # ------------------------------------------------------------------
+    captured_sql: list[str] = []
+
+    class _CaptureCursor:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            del params
+            captured_sql.append(sql)
+
+        async def fetchall(self) -> list[dict[str, Any]]:
+            return []
+
+    class _CaptureConn:
+        @asynccontextmanager
+        async def transaction(self):
+            yield
+
+        def cursor(self, **_kwargs):
+            return _CaptureCursor()
+
+    @asynccontextmanager
+    async def _fake_db_conn():
+        yield _CaptureConn()
+
+    with patch.object(db_chat_uploads, "get_db_connection", _fake_db_conn):
+        await _REAL_CLAIM_CLEANUP_BATCH(limit=10, now=datetime.now(timezone.utc))
+
+    assert len(captured_sql) == 1
+    sql_text = captured_sql[0]
+    assert "explicit_delete_pending" not in sql_text
+    assert "u.state IN ('aborted', 'failed')" in sql_text
+    assert "w.status = 'deleted'" in sql_text
+
+    owner = "user-owner-r15"
+    colleague_rw = "user-colleague-rw-r15"
+    colleague_ro = "user-colleague-ro-r15"
+    ws_id = str(uuid.uuid4())
+    ws_meta = {
+        "workspace_id": ws_id,
+        "user_id": owner,
+        "name": "SharedWriteWS",
+        "status": "running",
+        "dir_name": "SharedWriteWS",
+        "computer_id": "comp-r15",
+    }
+    upload_env["workspaces"][ws_id] = ws_meta
+
+    root_dir = str(tmp_path / "r15_posix_root")
+    sbx = _RealPosixSandbox(root_dir, dir_name="SharedWriteWS")
+    project = ProjectContext(workspace_id=ws_id, dir_name="SharedWriteWS")
+    layout = sbx.workspace(project)
+
+    # Create a retained used attachment + an unused expired attachment
+    payload = b"RETENTION_SAFE_DURING_DELETE_PENDING_" * 128
+    created_retained = await svc.initiate_chat_upload(
+        user_id=owner,
+        workspace_id=ws_id,
+        filename="keep_until_confirmed.bin",
+        size_bytes=len(payload),
+    )
+    uid_retained = created_retained["upload_id"]
+    await svc.receive_chat_upload_part(
+        upload_id=uid_retained,
+        part_number=1,
+        user_id=owner,
+        stream=_bytes_stream(payload),
+    )
+    await svc.complete_chat_upload(upload_id=uid_retained, user_id=owner)
+    ctx_retained = ChatUploadContext(
+        upload_id=uid_retained,
+        name="keep_until_confirmed.bin",
+        size=len(payload),
+    )
+    await svc.confirm_request_chat_uploads(
+        [ctx_retained], user_id=owner, workspace_id=ws_id
+    )
+    row_retained = upload_env["ledger"].rows[uid_retained]
+    key_retained = str(row_retained["object_key"])
+    rel_retained = svc.build_sandbox_upload_rel_path(row_retained)
+    abs_retained = f"{layout.workspace}/{rel_retained}"
+    os.makedirs(os.path.dirname(abs_retained), exist_ok=True)
+    Path(abs_retained).write_bytes(payload)
+
+    created_unused = await svc.initiate_chat_upload(
+        user_id=owner,
+        workspace_id=ws_id,
+        filename="expired_unused.bin",
+        size_bytes=len(payload),
+    )
+    uid_unused = created_unused["upload_id"]
+    await svc.receive_chat_upload_part(
+        upload_id=uid_unused,
+        part_number=1,
+        user_id=owner,
+        stream=_bytes_stream(payload),
+    )
+    await svc.complete_chat_upload(upload_id=uid_unused, user_id=owner)
+    row_unused = upload_env["ledger"].rows[uid_unused]
+    key_unused = str(row_unused["object_key"])
+    base_now = datetime.now(timezone.utc)
+    row_unused["expires_at"] = base_now + timedelta(minutes=2)
+
+    # Fence the retained upload as explicit_delete_pending (e.g. after uncertain rm / grant revoke failure)
+    fenced_ids = await db_chat_uploads.mark_uploads_delete_pending(
+        [uid_retained], workspace_id=ws_id
+    )
+    assert fenced_ids == [uid_retained]
+    row_retained["updated_at"] = base_now - timedelta(minutes=20)
+    assert await db_chat_uploads.is_upload_retained_for_recovery(uid_retained, ws_id) is False
+
+    # Advance sweeper 30 minutes past updated_at: unused upload is cleaned, but explicit_delete_pending
+    # retained upload MUST remain ready with its storage object intact while recovery stays blocked!
+    swept = await svc.sweep_expired_chat_uploads_once(
+        now=base_now + timedelta(minutes=30)
+    )
+    assert swept == 1
+    assert key_unused not in upload_env["store"].objects
+    assert upload_env["ledger"].rows[uid_unused]["state"] == "aborted"
+    assert upload_env["ledger"].rows[uid_unused]["cleaned_at"] is not None
+
+    assert upload_env["ledger"].rows[uid_retained]["state"] == "ready"
+    assert upload_env["ledger"].rows[uid_retained]["error"] == "explicit_delete_pending"
+    assert upload_env["ledger"].rows[uid_retained]["cleaned_at"] is None
+    assert key_retained in upload_env["store"].objects
+    assert await db_chat_uploads.is_upload_retained_for_recovery(uid_retained, ws_id) is False
+
+    # ------------------------------------------------------------------
+    # Part 2: Route-level delete_workspace_files with Dalton Supabase auth enabled
+    #         and colleague dispatch disabled (is_colleague_dispatch_enabled() == False)
+    # ------------------------------------------------------------------
+    @asynccontextmanager
+    async def _fake_acquire_sandbox(_ws_id: str, _owner_id: str):
+        yield sbx, ws_meta
+
+    monkeypatch.setattr(
+        ws_crud,
+        "acquire_sandbox_to_change",
+        create_autospec(ws_crud.acquire_sandbox_to_change, side_effect=_fake_acquire_sandbox),
+    )
+    monkeypatch.setattr(
+        ws_crud,
+        "owner_work_dir",
+        create_autospec(ws_crud.owner_work_dir, return_value=layout.workspace),
+    )
+    monkeypatch.setattr(
+        ws_crud,
+        "owner_layout",
+        create_autospec(ws_crud.owner_layout, return_value=layout),
+    )
+    monkeypatch.setattr(
+        ws_db,
+        "get_workspace",
+        create_autospec(ws_db.get_workspace, return_value=ws_meta),
+    )
+    monkeypatch.setattr(
+        workspace_files,
+        "db_get_workspace",
+        create_autospec(workspace_files.db_get_workspace, return_value=ws_meta),
+    )
+
+    # Enable Dalton Supabase auth while keeping colleague_dispatch disabled!
+    monkeypatch.setattr(
+        dalton_settings,
+        "is_dalton_supabase_auth_enabled",
+        create_autospec(dalton_settings.is_dalton_supabase_auth_enabled, return_value=True),
+    )
+    monkeypatch.setattr(
+        dalton_sharing,
+        "is_dalton_supabase_auth_enabled",
+        create_autospec(dalton_sharing.is_dalton_supabase_auth_enabled, return_value=True),
+    )
+    monkeypatch.setattr(
+        dalton_settings,
+        "is_colleague_dispatch_enabled",
+        create_autospec(dalton_settings.is_colleague_dispatch_enabled, return_value=False),
+    )
+    monkeypatch.setattr(
+        dalton_sharing,
+        "is_colleague_dispatch_enabled",
+        create_autospec(dalton_sharing.is_colleague_dispatch_enabled, return_value=False),
+    )
+
+    async def _fake_team_reader(uid: str | None) -> str:
+        if uid in (owner, colleague_rw, colleague_ro):
+            return str(uid)
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    monkeypatch.setattr(
+        dalton_sharing,
+        "require_team_reader",
+        create_autospec(dalton_sharing.require_team_reader, side_effect=_fake_team_reader),
+    )
+    monkeypatch.setattr(
+        dalton_sharing,
+        "get_user_tier",
+        create_autospec(dalton_sharing.get_user_tier, return_value="internal"),
+    )
+    monkeypatch.setattr(
+        dalton_sharing,
+        "classify_owner_tier",
+        create_autospec(dalton_sharing.classify_owner_tier, return_value="internal"),
+    )
+
+    current_web_access = "rw"
+
+    async def _fake_get_ws_sharing(target_ws_id: str, *, conn: Any = None) -> dict[str, Any]:
+        del conn
+        assert target_ws_id == ws_id
+        return {"workspace_id": ws_id, "web_access": current_web_access, "cos_access": "ro"}
+
+    monkeypatch.setattr(
+        dalton_sharing,
+        "get_workspace_sharing",
+        create_autospec(dalton_sharing.get_workspace_sharing, side_effect=_fake_get_ws_sharing),
+    )
+
+    # Restore real requested_workspace on svc to verify upload admission / conversation dispatch
+    # still blocks non-owners when colleague dispatch is disabled!
+    monkeypatch.setattr(svc, "requested_workspace", turn_runtime.requested_workspace)
+    with pytest.raises(HTTPException) as dispatch_disabled_exc:
+        await svc.initiate_chat_upload(
+            user_id=colleague_rw,
+            workspace_id=ws_id,
+            filename="blocked_upload.bin",
+            size_bytes=128,
+        )
+    assert dispatch_disabled_exc.value.status_code == 403
+    assert dispatch_disabled_exc.value.detail == "该功能尚未开放"
+
+    # Create an ordinary workspace file alongside the retained chat attachment
+    ordinary_rel = "work/notes/summary.md"
+    ordinary_abs = f"{layout.workspace}/{ordinary_rel}"
+    os.makedirs(os.path.dirname(ordinary_abs), exist_ok=True)
+    Path(ordinary_abs).write_text("shared notes", encoding="utf-8")
+
+    # 1. Read-only caller (web_access='ro') is denied (403) on delete_workspace_files
+    current_web_access = "ro"
+    with pytest.raises(HTTPException) as ro_exc:
+        await ws_crud.delete_workspace_files(
+            workspace_id=ws_id,
+            x_user_id=colleague_ro,
+            body=ws_crud.DeleteFilesRequest(paths=[ordinary_rel, rel_retained]),
+        )
+    assert ro_exc.value.status_code == 403
+    with pytest.raises(HTTPException) as ro_svc_exc:
+        await svc.begin_delete_workspace_chat_uploads(
+            workspace_id=ws_id,
+            caller_user_id=colleague_ro,
+            candidate_client_paths=[rel_retained],
+        )
+    assert ro_svc_exc.value.status_code == 403
+    assert os.path.exists(ordinary_abs)
+    assert os.path.exists(abs_retained)
+    assert key_retained in upload_env["store"].objects
+
+    # 2. Hidden workspace access (web_access='hidden') is denied with 404
+    current_web_access = "hidden"
+    with pytest.raises(HTTPException) as hidden_exc:
+        await svc.retire_deleted_workspace_chat_uploads(
+            workspace_id=ws_id,
+            caller_user_id=colleague_ro,
+            deleted_client_paths=[rel_retained],
+        )
+    assert hidden_exc.value.status_code == 404
+
+    # 3. Shared writer (web_access='rw') with colleague dispatch disabled:
+    #    First verify abort_delete_workspace_chat_uploads clears the fence when rm fails
+    current_web_access = "rw"
+    cleared_count = await svc.abort_delete_workspace_chat_uploads(
+        workspace_id=ws_id,
+        caller_user_id=colleague_rw,
+        failed_client_paths=[rel_retained],
+    )
+    assert cleared_count == 1
+    assert upload_env["ledger"].rows[uid_retained]["error"] is None
+    assert await db_chat_uploads.is_upload_retained_for_recovery(uid_retained, ws_id) is True
+
+    #    Next, shared writer deletes ordinary file via delete_workspace_files -> succeeds!
+    del_ordinary = await ws_crud.delete_workspace_files(
+        workspace_id=ws_id,
+        x_user_id=colleague_rw,
+        body=ws_crud.DeleteFilesRequest(paths=[ordinary_rel]),
+    )
+    assert del_ordinary == {"deleted": [ordinary_rel], "errors": []}
+    assert not os.path.exists(ordinary_abs)
+    assert os.path.exists(abs_retained)
+    assert key_retained in upload_env["store"].objects
+
+    #    Finally, shared writer deletes retained chat attachment via delete_workspace_files -> succeeds,
+    #    removes file from sandbox, retires DB row to aborted, and deletes S3 object!
+    del_attachment = await ws_crud.delete_workspace_files(
+        workspace_id=ws_id,
+        x_user_id=colleague_rw,
+        body=ws_crud.DeleteFilesRequest(paths=[rel_retained]),
+    )
+    assert del_attachment == {"deleted": [rel_retained], "errors": []}
+    assert not os.path.exists(abs_retained)
+    assert upload_env["ledger"].rows[uid_retained]["state"] == "aborted"
+    assert upload_env["ledger"].rows[uid_retained]["cleaned_at"] is not None
+    assert key_retained not in upload_env["store"].objects
