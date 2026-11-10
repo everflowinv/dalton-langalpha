@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from contextlib import asynccontextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import inspect
 from pathlib import Path
@@ -1880,3 +1881,903 @@ async def test_channels_router_and_gateway_reject_company_identity_before_db_wri
     )
     assert sent_events[0]["status"] == 401
     assert conn_opened["count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 8. AU1 Batch A: Config History, Snapshot, Once Schedule & Expected Version
+# ---------------------------------------------------------------------------
+
+
+def test_au1_expected_config_version_validation_and_protected_fields() -> None:
+    # Omitted -> None
+    assert company_auto_svc.validate_expected_config_version(None, provided=False) is None
+    assert company_auto_svc.extract_expected_config_version(None) is None
+    assert company_auto_svc.extract_expected_config_version({}) is None
+
+    # Valid positive integers
+    assert company_auto_svc.validate_expected_config_version(1, provided=True) == 1
+    assert company_auto_svc.extract_expected_config_version({"expected_config_version": 7}) == 7
+
+    # Invalid values -> 400 HTTPException
+    for bad_val in (0, -1, -99, True, False, "1", "0", 1.5, None, [], {}):
+        with pytest.raises(HTTPException) as exc_info:
+            company_auto_svc.validate_expected_config_version(bad_val, provided=True)
+        assert exc_info.value.status_code == 400
+
+        with pytest.raises(HTTPException) as exc_info2:
+            company_auto_svc.extract_expected_config_version({"expected_config_version": bad_val})
+        assert exc_info2.value.status_code == 400
+
+    # AutomationUpdate excludes expected_config_version from model_dump so fields stays clean
+    upd = AutomationUpdate.model_validate(
+        {"description": "new desc", "expected_config_version": 3}
+    )
+    assert upd.expected_config_version == 3
+    dumped = upd.model_dump(exclude_unset=True)
+    assert dumped == {"description": "new desc"}
+
+    # Protected audit/version fields are rejected on AutomationCreate and AutomationUpdate
+    for protected_field, val in (
+        ("created_by", "other-user"),
+        ("updated_by", "other-user"),
+        ("audit_history", []),
+        ("config_version", 99),
+        ("active_version", 99),
+        ("notify_storage_mode", "task_row"),
+    ):
+        with pytest.raises(ValueError, match=protected_field):
+            AutomationCreate.model_validate(
+                {
+                    "name": "Test",
+                    "trigger_type": "cron",
+                    "cron_expression": "0 8 * * *",
+                    "instruction": "run",
+                    protected_field: val,
+                }
+            )
+        with pytest.raises(ValueError, match=protected_field):
+            AutomationUpdate.model_validate({protected_field: val})
+
+
+def test_au1_snapshot_builder_desired_status_and_corrupt_history_validation() -> None:
+    base_row = {
+        **_sample_automation_row(
+            metadata={"dalton_kind": "company_watch", "api_key": "k-secret"},
+        ),
+        "status": "executing",
+        "trigger_type": "price",
+        "cron_expression": None,
+        "delivery_config": {"methods": ["feishu"], "webhook_secret": "sec-123"},
+    }
+    active_hist = [
+        {
+            "version": 1,
+            "snapshot": {"desired_status": "active"},
+        }
+    ]
+    paused_hist = [
+        {
+            "version": 1,
+            "snapshot": {"desired_status": "paused"},
+        }
+    ]
+    # Price/executing row (claimed from active) and executing + active history -> active
+    assert company_auto_svc.resolve_desired_status_for_snapshot(base_row) == "active"
+    assert (
+        company_auto_svc.resolve_desired_status_for_snapshot(
+            {**base_row, "active_version": 1, "audit_history": active_hist}
+        )
+        == "active"
+    )
+    # Explicitly paused configuration -> paused
+    assert (
+        company_auto_svc.resolve_desired_status_for_snapshot(
+            {**base_row, "status": "paused"}
+        )
+        == "paused"
+    )
+    # Once/price runtime completion with active history or no history -> active
+    assert (
+        company_auto_svc.resolve_desired_status_for_snapshot(
+            {**base_row, "trigger_type": "once", "status": "completed", "audit_history": []}
+        )
+        == "active"
+    )
+    assert (
+        company_auto_svc.resolve_desired_status_for_snapshot(
+            {
+                **base_row,
+                "trigger_type": "once",
+                "status": "completed",
+                "active_version": 1,
+                "audit_history": active_hist,
+            }
+        )
+        == "active"
+    )
+    # Runtime status (completed/disabled) whose active_version history is paused -> paused
+    assert (
+        company_auto_svc.resolve_desired_status_for_snapshot(
+            {**base_row, "status": "completed", "active_version": 1, "audit_history": paused_hist}
+        )
+        == "paused"
+    )
+
+    snap = company_auto_svc.build_automation_config_snapshot(
+        base_row,
+        notify_enabled=True,
+        notify_routes=["feishu:dm"],
+    )
+    assert set(snap.keys()) == set(company_auto_svc.ALLOWED_AUTOMATION_SNAPSHOT_FIELDS)
+    assert "metadata" not in snap
+    assert snap["desired_status"] == "active"
+    assert snap["notify_enabled"] is True
+    assert snap["notify_routes"] == ["feishu:dm"]
+    assert "webhook_secret" not in snap["delivery_config"]
+
+    # Corrupt history state validation
+    assert (
+        company_auto_svc.validate_existing_history_state(
+            {"config_version": 1, "active_version": 1, "audit_history": []}
+        )
+        is None
+    )
+    with pytest.raises(company_auto_svc.AutomationHistoryCorruptError):
+        company_auto_svc.validate_existing_history_state(
+            {"config_version": 3, "active_version": 3, "audit_history": []}
+        )
+    with pytest.raises(company_auto_svc.AutomationHistoryCorruptError):
+        company_auto_svc.validate_existing_history_state(
+            {
+                "config_version": 2,
+                "active_version": 2,
+                "audit_history": [{"version": 1, "snapshot": snap}],
+            }
+        )
+    with pytest.raises(company_auto_svc.AutomationHistoryCorruptError):
+        company_auto_svc.validate_existing_history_state(
+            {
+                "config_version": 2,
+                "active_version": 2,
+                "audit_history": [{"version": 2, "snapshot": None}],
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_au1_automation_history_context_invariants_and_concurrency_isolation() -> None:
+    assert company_auto_svc.get_current_history_context() is None
+
+    # 1. Implicit actor / action vs explicit human actor vs explicit None system actor
+    with company_auto_svc.automation_history_context() as ctx_implicit:
+        assert ctx_implicit.has_explicit_actor is False
+        assert ctx_implicit.has_explicit_action is False
+        assert ctx_implicit.action is None
+
+    with company_auto_svc.automation_history_context(
+        actor_user_id="pm-actor-1",
+        action="resume",
+        expected_config_version=4,
+    ) as ctx_outer:
+        assert ctx_outer.has_explicit_actor is True
+        assert ctx_outer.actor_user_id == "pm-actor-1"
+        assert ctx_outer.has_explicit_action is True
+        assert ctx_outer.action == "resume"
+        assert ctx_outer.expected_config_version == 4
+
+        # Nested context without actor/action/expected_config_version inherits parent values
+        with company_auto_svc.automation_history_context(
+            skip_if_unchanged=True,
+        ) as ctx_inner_inherit:
+            assert ctx_inner_inherit.has_explicit_actor is True
+            assert ctx_inner_inherit.actor_user_id == "pm-actor-1"
+            assert ctx_inner_inherit.has_explicit_action is True
+            assert ctx_inner_inherit.action == "resume"
+            assert ctx_inner_inherit.expected_config_version == 4
+            assert ctx_inner_inherit.skip_if_unchanged is True
+
+        # Nested context with explicit None actor (maintenance/system origin) overrides parent
+        with pytest.raises(RuntimeError, match="inner boom"):
+            with company_auto_svc.automation_history_context(
+                actor_user_id=None,
+                action="maintenance_pause_stale_binding",
+            ) as ctx_sys:
+                assert ctx_sys.has_explicit_actor is True
+                assert ctx_sys.actor_user_id is None
+                assert ctx_sys.has_explicit_action is True
+                assert ctx_sys.action == "maintenance_pause_stale_binding"
+                raise RuntimeError("inner boom")
+
+        # Outer context is restored after inner exit / exception
+        restored = company_auto_svc.get_current_history_context()
+        assert restored is ctx_outer
+        assert restored.actor_user_id == "pm-actor-1"
+        assert restored.action == "resume"
+
+    assert company_auto_svc.get_current_history_context() is None
+
+    # 2. Concurrent coroutine isolation (no ContextVar leakage across asyncio.gather tasks)
+    barrier = asyncio.Event()
+
+    async def _worker_a() -> tuple[str | None, str | None]:
+        with company_auto_svc.automation_history_context(
+            actor_user_id="actor-a",
+            action="pause",
+        ):
+            await barrier.wait()
+            cur = company_auto_svc.get_current_history_context()
+            assert cur is not None
+            return str(cur.actor_user_id), cur.action
+
+    async def _worker_b() -> tuple[bool, str | None, str | None]:
+        with company_auto_svc.automation_history_context(
+            actor_user_id=None,
+            action="maintenance_pause_stale_binding",
+        ):
+            barrier.set()
+            await asyncio.sleep(0)
+            cur = company_auto_svc.get_current_history_context()
+            assert cur is not None
+            return cur.has_explicit_actor, cur.actor_user_id, cur.action
+
+    res_a, res_b = await asyncio.gather(_worker_a(), _worker_b())
+    assert res_a == ("actor-a", "pause")
+    assert res_b == (True, None, "maintenance_pause_stale_binding")
+    assert company_auto_svc.get_current_history_context() is None
+
+
+@pytest.mark.asyncio
+async def test_au1_resolve_effective_once_run_at_precedence_and_legacy_fallback() -> None:
+    t1 = datetime(2026, 6, 1, 12, 0, tzinfo=UTC)
+    t2 = datetime(2026, 6, 2, 12, 0, tzinfo=UTC)
+    t3 = datetime(2026, 6, 3, 12, 0, tzinfo=UTC)
+
+    # 1. target_snapshot wins
+    row = {
+        "automation_id": AUTO_PERSONAL_ID,
+        "trigger_type": "once",
+        "next_run_at": t2,
+        "audit_history": [],
+        "metadata": {"once_schedule_at": t3.isoformat()},
+    }
+    assert (
+        await company_auto_db._resolve_effective_once_run_at(
+            row, target_snapshot={"once_run_at": t1.isoformat()}
+        )
+        == t1.isoformat()
+    )
+
+    # 2. row.next_run_at wins when target_snapshot is None
+    assert (
+        await company_auto_db._resolve_effective_once_run_at(row)
+        == t2.isoformat()
+    )
+
+    # 3. When next_run_at is None and audit_history is non-empty, active_version snapshot wins
+    #    and never falls back to automation_executions even if once_run_at is None in history.
+    row_with_hist = {
+        "automation_id": AUTO_PERSONAL_ID,
+        "trigger_type": "once",
+        "next_run_at": None,
+        "active_version": 1,
+        "audit_history": [
+            {"version": 1, "snapshot": {"once_run_at": t1.isoformat()}},
+        ],
+        "metadata": {"once_schedule_at": t3.isoformat()},
+    }
+    assert (
+        await company_auto_db._resolve_effective_once_run_at(row_with_hist)
+        == t1.isoformat()
+    )
+
+    # 4a. Empty audit_history + metadata.once_schedule_at wins without DB query
+    row_empty_hist_meta = {
+        "automation_id": AUTO_PERSONAL_ID,
+        "trigger_type": "once",
+        "next_run_at": None,
+        "audit_history": [],
+        "metadata": {"once_schedule_at": t3.isoformat()},
+    }
+    assert (
+        await company_auto_db._resolve_effective_once_run_at(row_empty_hist_meta)
+        == t3.isoformat()
+    )
+
+    # 4b. Empty audit_history + no once_schedule_at -> queries automation_executions
+    exec_rows_state: list[dict[str, Any]] = [{"scheduled_at": t1}]
+
+    class _FakeExecCursor:
+        async def __aenter__(self) -> "_FakeExecCursor":
+            return self
+
+        async def __aexit__(self, *args: Any) -> None:
+            return None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            self.sql = sql
+            self.params = params
+
+        async def fetchall(self) -> list[dict[str, Any]]:
+            return list(exec_rows_state)
+
+    class _FakeExecConn:
+        def cursor(self, **kwargs: Any) -> _FakeExecCursor:
+            return _FakeExecCursor()
+
+    row_legacy_claimed = {
+        "automation_id": AUTO_PERSONAL_ID,
+        "trigger_type": "once",
+        "next_run_at": None,
+        "last_run_at": t1,
+        "audit_history": [],
+        "metadata": {},
+    }
+    # Exactly 1 matching execution -> returns scheduled_at ISO
+    assert (
+        await company_auto_db._resolve_effective_once_run_at(
+            row_legacy_claimed, conn=_FakeExecConn()
+        )
+        == t1.isoformat()
+    )
+    # 0 matching executions -> None
+    exec_rows_state[:] = []
+    assert (
+        await company_auto_db._resolve_effective_once_run_at(
+            row_legacy_claimed, conn=_FakeExecConn()
+        )
+        is None
+    )
+    # >1 matching executions -> refuses to guess -> None
+    exec_rows_state[:] = [{"scheduled_at": t1}, {"scheduled_at": t2}]
+    assert (
+        await company_auto_db._resolve_effective_once_run_at(
+            row_legacy_claimed, conn=_FakeExecConn()
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_au1_notify_snapshot_parity_with_model_prefs_and_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.dalton.llm import model_prefs
+    from src.dalton.notify import dispatch
+
+    row = {
+        "automation_id": AUTO_TRACKING_ID,
+        "user_id": INTERNAL_UID,
+        "name": "dalton-earnings-calendar",
+        "metadata": {},
+        "scope": "research_tracking",
+        "notify_storage_mode": "legacy",
+    }
+
+    cases: list[tuple[str, dict[str, Any], bool, tuple[bool, list[str]]]] = [
+        ("missing_master_and_missing_targets", {}, True, (False, [])),
+        (
+            "explicit_master_false_with_targets",
+            {
+                "dalton_notify_enabled": False,
+                "dalton_notify_targets": [
+                    "feishu:user:ou_0123456789abcdef0123456789abcdef"
+                ],
+            },
+            True,
+            (False, ["feishu:user:ou_0123456789abcdef0123456789abcdef"]),
+        ),
+        (
+            "explicit_master_true_personal_targets",
+            {
+                "dalton_notify_enabled": True,
+                "dalton_notify_targets": [
+                    "feishu:user:ou_0123456789abcdef0123456789abcdef"
+                ],
+            },
+            True,
+            (True, ["feishu:user:ou_0123456789abcdef0123456789abcdef"]),
+        ),
+        (
+            "routes_have_personal_but_targets_missing",
+            {
+                "dalton_notify_enabled": True,
+                "dalton_notify_routes": {
+                    "dalton-earnings-calendar": [
+                        "feishu:user:ou_0123456789abcdef0123456789abcdef"
+                    ]
+                },
+            },
+            True,
+            (True, []),
+        ),
+        (
+            "routes_have_personal_but_targets_empty",
+            {
+                "dalton_notify_enabled": True,
+                "dalton_notify_targets": [],
+                "dalton_notify_routes": {
+                    "dalton-earnings-calendar": [
+                        "feishu:user:ou_0123456789abcdef0123456789abcdef"
+                    ]
+                },
+            },
+            True,
+            (True, []),
+        ),
+        (
+            "routes_have_group_only_internal_user",
+            {
+                "dalton_notify_enabled": True,
+                "dalton_notify_routes": {
+                    "dalton-earnings-calendar": [
+                        "feishu:chat:oc_0123456789abcdef0123456789abcdef"
+                    ]
+                },
+            },
+            True,
+            (True, ["feishu:chat:oc_0123456789abcdef0123456789abcdef"]),
+        ),
+        (
+            "routes_have_group_only_external_user",
+            {
+                "dalton_notify_enabled": True,
+                "dalton_notify_routes": {
+                    "dalton-earnings-calendar": [
+                        "feishu:chat:oc_0123456789abcdef0123456789abcdef"
+                    ]
+                },
+            },
+            False,
+            (True, []),
+        ),
+    ]
+
+    for label, model_pref, allow_groups, expected in cases:
+        pref_row = {"model_preference": model_pref, "other_preference": {}}
+
+        async def _fake_get_prefs(_uid: str, _pr: dict[str, Any] = pref_row) -> dict[str, Any]:
+            return _pr
+
+        async def _fake_is_admin(_uid: str | None = None, _ag: bool = allow_groups) -> bool:
+            return _ag
+
+        monkeypatch.setattr(model_prefs, "get_user_preferences", _fake_get_prefs)
+        monkeypatch.setattr(access_tiers, "is_internal_or_admin", _fake_is_admin)
+
+        snap_enabled, snap_routes = await company_auto_db.resolve_snapshot_notify_fields(
+            row, pref_row=pref_row
+        )
+        assert (snap_enabled, snap_routes) == expected, label
+
+        master = await model_prefs.resolve_dalton_notify_enabled(INTERNAL_UID)
+        personal_targets = await model_prefs.resolve_dalton_notify_targets(INTERNAL_UID)
+        overrides = await model_prefs.resolve_dalton_notify_overrides(INTERNAL_UID)
+        routes = await model_prefs.resolve_dalton_notify_routes(INTERNAL_UID)
+        classification = dispatch.classify_automation_for_notify(row)
+        _cat, task_eff, _src = dispatch.resolve_automation_notify_state(
+            row, overrides, routes
+        )
+        routed = dispatch.resolve_notify_route_targets(
+            row, routes, personal_targets, include_chat_targets=allow_groups
+        )
+        prod_routes = (
+            routed
+            if routed is not None
+            else (list(personal_targets) if classification is not None else [])
+        )
+        prod_enabled = bool(master and task_eff)
+        assert (snap_enabled, snap_routes) == (prod_enabled, prod_routes), label
+
+    # task_row mode reads directly from row without consulting user_preferences
+    task_row_probe = {
+        **row,
+        "scope": "company",
+        "notify_storage_mode": "task_row",
+        "notify_enabled": True,
+        "notify_routes": ["feishu:chat:oc_company_1"],
+    }
+    tr_enabled, tr_routes = await company_auto_db.resolve_snapshot_notify_fields(
+        task_row_probe
+    )
+    assert tr_enabled is True
+    assert tr_routes == ["feishu:chat:oc_company_1"]
+
+
+@pytest.mark.asyncio
+async def test_au1_once_coalesced_update_pause_and_timezone_offset_normalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import timezone
+
+    monkeypatch.setattr(
+        "src.dalton.invites.is_invite_pm",
+        lambda uid: uid == INTERNAL_UID,
+    )
+
+    t_old = datetime(2035, 6, 15, 10, 0, tzinfo=UTC)
+    t_new = datetime(2035, 6, 16, 11, 0, tzinfo=UTC)
+
+    # 1. Equivalent instant with +08:00 vs +00:00 normalizes to canonical UTC ISO and produces no false diff
+    tz_plus8 = timezone(timedelta(hours=8))
+    dt_plus8 = datetime(2035, 6, 15, 18, 0, tzinfo=tz_plus8)
+    assert company_auto_db._to_iso_str(dt_plus8) == "2035-06-15T10:00:00+00:00"
+    assert (
+        company_auto_db._to_iso_str("2035-06-15T18:00:00+08:00")
+        == "2035-06-15T10:00:00+00:00"
+    )
+    assert (
+        company_auto_db._to_iso_str("2035-06-15T10:00:00Z")
+        == "2035-06-15T10:00:00+00:00"
+    )
+
+    v1_cols = await company_auto_db.build_create_history_columns(
+        {
+            **_sample_automation_row(),
+            "trigger_type": "once",
+            "cron_expression": None,
+            "next_run_at": dt_plus8,
+        },
+        actor_user_id=INTERNAL_UID,
+        desired_status="active",
+        pref_row={},
+        changed_at_iso="2026-11-10T00:00:00+00:00",
+    )
+    v1_snap = v1_cols["audit_history"][0]["snapshot"]
+    assert v1_snap["once_run_at"] == "2035-06-15T10:00:00+00:00"
+
+    # Legacy snapshot with +08:00 compared against +00:00 equivalent instant produces no false diff
+    legacy_snap_plus8 = {**v1_snap, "once_run_at": "2035-06-15T18:00:00+08:00"}
+    assert company_auto_svc.compute_snapshot_changes(legacy_snap_plus8, v1_snap) == {}
+    assert legacy_snap_plus8["once_run_at"] == "2035-06-15T18:00:00+08:00"
+
+    # 2. Coalesced AutomationFile save: Step 1 updates next_run_at (t_old -> t_new), Step 2 pauses (status='paused')
+    base_pre_row = {
+        **_sample_automation_row(
+            config_version=1,
+            active_version=1,
+        ),
+        "trigger_type": "once",
+        "cron_expression": None,
+        "audit_history": [
+            {
+                "version": 1,
+                "prev_version": None,
+                "restored_from_version": None,
+                "actor_user_id": INTERNAL_UID,
+                "changed_at": "2026-11-10T00:00:00+00:00",
+                "action": "create",
+                "changes": {},
+                "snapshot": {**v1_snap, "once_run_at": t_old.isoformat()},
+            }
+        ],
+        "status": "active",
+        "next_run_at": t_old,
+        "metadata": {"once_schedule_at": t_old.isoformat()},
+    }
+    locked_row_step2 = {
+        **base_pre_row,
+        "next_run_at": t_new,
+        "metadata": {"once_schedule_at": t_new.isoformat()},
+    }
+    hist_cols_v2, is_noop = await company_auto_db.prepare_update_history_columns(
+        locked_row_step2,
+        {"status": "paused"},
+        actor_user_id=INTERNAL_UID,
+        action="update",
+        pref_row={},
+        base_pre_row=base_pre_row,
+        changed_at_iso="2026-11-10T01:00:00+00:00",
+    )
+    assert is_noop is False
+    assert hist_cols_v2["config_version"] == 2
+    v2_entry = hist_cols_v2["audit_history"][-1]
+    assert v2_entry["snapshot"]["desired_status"] == "paused"
+    assert v2_entry["snapshot"]["once_run_at"] == t_new.isoformat()
+    assert v2_entry["changes"] == {
+        "desired_status": {"old": "active", "new": "paused"},
+        "once_run_at": {"old": t_old.isoformat(), "new": t_new.isoformat()},
+    }
+
+
+@pytest.mark.asyncio
+async def test_au1_owner_tier_single_connection_and_lookup_failure_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import psycopg
+    from psycopg_pool import PoolTimeout
+
+    from src.dalton import invites as dalton_invites, settings as dalton_settings
+    from src.server.database import pool as pool_mod, user as user_db
+
+    group_target = "feishu:chat:oc_0123456789abcdef0123456789abcdef"
+    missing_uid = "user-missing-from-users-table"
+
+    # Internal owner (INTERNAL_UID) is OUTSIDE configured admin list (only ADMIN_UID is PM).
+    monkeypatch.setattr(
+        dalton_invites,
+        "get_configured_pm_user_ids",
+        lambda: (ADMIN_UID,),
+    )
+    monkeypatch.setattr(
+        dalton_settings,
+        "get_dalton_allowed_emails",
+        lambda: frozenset({"internal@dalton.test", "admin@dalton.test"}),
+    )
+
+    users_table: dict[str, dict[str, Any]] = {
+        INTERNAL_UID: {"user_id": INTERNAL_UID, "email": "internal@dalton.test"},
+        ADMIN_UID: {"user_id": ADMIN_UID, "email": "admin@dalton.test"},
+        EXTERNAL_UID: {"user_id": EXTERNAL_UID, "email": "guest@client.test"},
+    }
+    pref_row = {
+        "model_preference": {
+            "dalton_notify_enabled": True,
+            "dalton_notify_routes": {
+                "dalton-earnings-calendar": [group_target],
+            },
+        },
+        "other_preference": {},
+    }
+    automations_store: dict[str, dict[str, Any]] = {}
+    pool_state = {
+        "in_use": False,
+        "additional_acquisitions": 0,
+        "users_queries": 0,
+        "fail_users_lookup": False,
+    }
+
+    class _SingleTxCursor:
+        def __init__(self, conn: "_SingleTxConn") -> None:
+            self._conn = conn
+            self._one: Any = None
+
+        async def __aenter__(self) -> "_SingleTxCursor":
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+        async def execute(self, sql: str, params: Any = None) -> None:
+            norm_sql = " ".join(sql.split())
+            self._conn.executed_sql.append(norm_sql)
+            if "FROM users WHERE user_id = %s" in norm_sql:
+                pool_state["users_queries"] += 1
+                if pool_state["fail_users_lookup"]:
+                    raise psycopg.OperationalError("simulated users lookup failure")
+                uid = str(params[0]) if params else ""
+                self._one = users_table.get(uid)
+            elif "FROM user_preferences WHERE user_id = %s" in norm_sql:
+                self._one = dict(pref_row)
+            elif "FROM automations WHERE user_id = %s" in norm_sql and "file_name" in norm_sql:
+                self._one = None
+            elif "SELECT" in norm_sql and "FROM automations" in norm_sql and "FOR UPDATE" in norm_sql:
+                aid = str(params[0])
+                row = self._conn.working_store.get(aid)
+                self._one = dict(row) if row is not None else None
+            elif norm_sql.startswith("INSERT INTO automations"):
+                # Persist into working_store inside transaction; rolled back if transaction fails
+                aid = str(params[0])
+                uid = str(params[1])
+                name = str(params[2])
+                audit_val = params[-1]
+                audit_list = (
+                    audit_val.obj
+                    if hasattr(audit_val, "obj")
+                    else list(audit_val or [])
+                )
+                created = {
+                    **_sample_automation_row(
+                        automation_id=aid,
+                        user_id=uid,
+                        name=name,
+                        scope="research_tracking",
+                        config_version=int(params[-3]),
+                        active_version=int(params[-2]),
+                        created_by=params[-5],
+                        updated_by=params[-4],
+                    ),
+                    "audit_history": audit_list,
+                }
+                self._conn.working_store[aid] = created
+                self._one = created
+            elif "UPDATE automations SET" in norm_sql:
+                aid = str(params[-2])
+                existing = dict(self._conn.working_store[aid])
+                # Extract updated fields from parameters
+                for idx, token in enumerate(norm_sql.split(",")):
+                    if "description =" in token:
+                        existing["description"] = params[0]
+                for p in params:
+                    if hasattr(p, "obj") and isinstance(p.obj, list):
+                        existing["audit_history"] = list(p.obj)
+                        existing["config_version"] = int(p.obj[-1]["version"])
+                        existing["active_version"] = int(p.obj[-1]["version"])
+                self._conn.working_store[aid] = existing
+                self._one = existing
+            else:
+                self._one = None
+
+        async def fetchone(self) -> Any:
+            return self._one
+
+        async def fetchall(self) -> list[Any]:
+            return []
+
+    class _SingleTxConn:
+        info = object()
+
+        def __init__(self) -> None:
+            self.executed_sql: list[str] = []
+            self.working_store: dict[str, dict[str, Any]] = dict(automations_store)
+            self.tx_depth = 0
+            self.rollbacks = 0
+
+        def cursor(self, **kwargs: Any) -> _SingleTxCursor:
+            return _SingleTxCursor(self)
+
+        @asynccontextmanager
+        async def transaction(self):
+            snap = {k: dict(v) for k, v in self.working_store.items()}
+            self.tx_depth += 1
+            try:
+                yield
+            except BaseException:
+                self.working_store = snap
+                self.rollbacks += 1
+                raise
+            finally:
+                self.tx_depth -= 1
+                if self.tx_depth == 0:
+                    automations_store.clear()
+                    automations_store.update(self.working_store)
+
+    single_conn = _SingleTxConn()
+
+    @asynccontextmanager
+    async def _single_slot_get_db_connection(conn: Any = None):
+        if conn is not None:
+            yield conn
+            return
+        if pool_state["in_use"]:
+            pool_state["additional_acquisitions"] += 1
+            raise PoolTimeout("pool exhausted: nested connection acquisition while holding transaction lock")
+        pool_state["in_use"] = True
+        try:
+            yield single_conn
+        finally:
+            pool_state["in_use"] = False
+
+    monkeypatch.setattr(pool_mod, "get_db_connection", _single_slot_get_db_connection)
+    monkeypatch.setattr(company_auto_db, "get_db_connection", _single_slot_get_db_connection)
+    monkeypatch.setattr(auto_db, "get_db_connection", _single_slot_get_db_connection)
+    monkeypatch.setattr(user_db, "get_db_connection", _single_slot_get_db_connection)
+
+    # 1. Create automation while holding the ONLY pool connection for INTERNAL_UID (outside admin list):
+    #    retains group route and makes 0 additional pool acquisitions.
+    created_row = await auto_db.create_automation(
+        user_id=INTERNAL_UID,
+        name="dalton-earnings-calendar",
+        trigger_type="cron",
+        cron_expression="0 8 * * 1-5",
+        timezone="Asia/Shanghai",
+        instruction="Check earnings calendar",
+        scope="research_tracking",
+    )
+    auto_id = str(created_row["automation_id"])
+    assert pool_state["additional_acquisitions"] == 0
+    assert pool_state["users_queries"] == 1
+    v1_snap = automations_store[auto_id]["audit_history"][0]["snapshot"]
+    assert v1_snap["notify_enabled"] is True
+    assert v1_snap["notify_routes"] == [group_target]
+
+    # 2. Update automation while holding the ONLY pool connection:
+    #    pre_snapshot and post_snapshot share the single owner-tier lookup on conn,
+    #    retain the group route, and make 0 additional pool acquisitions.
+    pool_state["users_queries"] = 0
+    updated_row = await auto_db.update_automation(
+        auto_id,
+        INTERNAL_UID,
+        description="Updated calendar description",
+    )
+    assert updated_row is not None
+    assert pool_state["additional_acquisitions"] == 0
+    assert pool_state["users_queries"] == 1
+    assert len(automations_store[auto_id]["audit_history"]) == 2
+    v2_snap = automations_store[auto_id]["audit_history"][-1]["snapshot"]
+    assert v2_snap["notify_enabled"] is True
+    assert v2_snap["notify_routes"] == [group_target]
+
+    # 3. Verify admin, external, missing user row, and company/task_row semantics on conn:
+    async with _single_slot_get_db_connection() as held_conn:
+        # Admin user in DALTON_PM_USER_IDS -> "admin" without querying users table
+        q_before = pool_state["users_queries"]
+        assert (
+            await company_auto_db.resolve_owner_tier_for_snapshot(
+                ADMIN_UID, conn=held_conn
+            )
+            == "admin"
+        )
+        assert pool_state["users_queries"] == q_before
+
+        # External user -> "external", group route dropped
+        assert (
+            await company_auto_db.resolve_owner_tier_for_snapshot(
+                EXTERNAL_UID, conn=held_conn
+            )
+            == "external"
+        )
+        ext_en, ext_routes = await company_auto_db.resolve_snapshot_notify_fields(
+            {**created_row, "user_id": EXTERNAL_UID},
+            pref_row=pref_row,
+            conn=held_conn,
+        )
+        assert (ext_en, ext_routes) == (True, [])
+
+        # Missing user row -> explicit existing semantics ("external", no error), group route dropped
+        assert (
+            await company_auto_db.resolve_owner_tier_for_snapshot(
+                missing_uid, conn=held_conn
+            )
+            == "external"
+        )
+        miss_en, miss_routes = await company_auto_db.resolve_snapshot_notify_fields(
+            {**created_row, "user_id": missing_uid},
+            pref_row=pref_row,
+            conn=held_conn,
+        )
+        assert (miss_en, miss_routes) == (True, [])
+
+        # Company identity -> "company" without querying users
+        q_before_comp = pool_state["users_queries"]
+        assert (
+            await company_auto_db.resolve_owner_tier_for_snapshot(
+                COMPANY_SYSTEM_USER_ID, conn=held_conn
+            )
+            == "company"
+        )
+        assert pool_state["users_queries"] == q_before_comp
+
+        # task_row mode -> independent of legacy preferences and owner tier lookup (even when lookup fails)
+        pool_state["fail_users_lookup"] = True
+        tr_en, tr_routes = await company_auto_db.resolve_snapshot_notify_fields(
+            {
+                **created_row,
+                "user_id": COMPANY_SYSTEM_USER_ID,
+                "scope": "company",
+                "notify_storage_mode": "task_row",
+                "notify_enabled": True,
+                "notify_routes": [group_target],
+            },
+            conn=held_conn,
+        )
+        assert (tr_en, tr_routes) == (True, [group_target])
+    assert pool_state["additional_acquisitions"] == 0
+
+    # 4. Lookup failure during create_automation and update_automation aborts & rolls back the write!
+    pool_state["fail_users_lookup"] = True
+    pre_failure_store = {k: dict(v) for k, v in automations_store.items()}
+    rollbacks_before = single_conn.rollbacks
+
+    with pytest.raises(psycopg.OperationalError, match="simulated users lookup failure"):
+        await auto_db.update_automation(
+            auto_id,
+            INTERNAL_UID,
+            description="Must be rolled back on lookup failure",
+        )
+    assert single_conn.rollbacks == rollbacks_before + 1
+    assert automations_store[auto_id]["config_version"] == 2
+    assert automations_store[auto_id]["description"] == "Updated calendar description"
+    assert len(automations_store[auto_id]["audit_history"]) == 2
+
+    with pytest.raises(psycopg.OperationalError, match="simulated users lookup failure"):
+        await auto_db.create_automation(
+            user_id=INTERNAL_UID,
+            name="dalton-earnings-calendar-v2",
+            trigger_type="cron",
+            cron_expression="0 9 * * 1-5",
+            timezone="Asia/Shanghai",
+            instruction="Should not be created",
+            scope="research_tracking",
+        )
+    assert single_conn.rollbacks == rollbacks_before + 2
+    assert set(automations_store.keys()) == set(pre_failure_store.keys())
