@@ -133,6 +133,8 @@ def lines_key(
         inputs.usage_by_response.get(response_id),
         anchor.ending_interrupts,
         inputs.run_facts.for_turn(turn_index),
+        # DALTON-HOOK(chat-large-upload): re-project turn lines when a parked/held steer fails on it
+        inputs.failed_steers_by_turn.get(turn_index) or [],
     ):
         digest.update(json.dumps(source, default=str, sort_keys=True).encode())
         digest.update(b"\x1e")

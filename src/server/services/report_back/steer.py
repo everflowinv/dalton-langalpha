@@ -48,6 +48,8 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Sequence
+# DALTON-HOOK(chat-large-upload): type annotations for steered upload materialization and metadata
+from typing import Any
 
 from ptc_agent.agent.middleware.steering import ALL_KINDS, SteeredReport
 from src.server.services.market_targets import inline as market_inline
@@ -92,6 +94,20 @@ class SteeredReportInbox:
         reports = await self._take_reports(thread_id, run_id) if "report" in kinds else []
         steers = await _take_steers(thread_id, run_id) if "steer" in kinds else []
         return reports + steers
+
+    # DALTON-HOOK(chat-large-upload): claim once-only live stream notices for permanently failed steers
+    async def take_failed(self, thread_id: str, run_id: str) -> list[dict[str, Any]]:
+        """Claim unannounced permanent steer attachment failures for ``run_id``."""
+        from src.server.database.runs import outbox as outbox_db
+
+        try:
+            return await outbox_db.claim_unannounced_failed_steers(thread_id, run_id)
+        except Exception:
+            logger.warning(
+                f"[REPORT_STEER] Claiming failed steers for {thread_id} run {run_id} failed",
+                exc_info=True,
+            )
+            return []
 
     def render_group(self, kind: str, contents: list[str]) -> str:
         """The one block the reports of ``kind`` one model call takes in read as."""
@@ -318,15 +334,29 @@ class SteeredReportInbox:
             )
 
 
-async def take_steers_ahead(thread_id: str, run_id: str) -> list[SteeredReport]:
+# DALTON-HOOK(chat-large-upload): thread explicit project and session into steer attachment materialization
+async def take_steers_ahead(
+    thread_id: str,
+    run_id: str,
+    *,
+    project: Any = None,
+    session: Any = None,
+) -> list[SteeredReport]:
     """Hold the steers sent before ``run_id``'s input, for its turn to open
     with them ahead of that input. A failed read or hold leaves them to the
     turn's first model call, which reads them after the input instead."""
-    return await _take_steers(thread_id, run_id, ahead_only=True)
+    return await _take_steers(
+        thread_id, run_id, ahead_only=True, project=project, session=session
+    )
 
 
 async def _take_steers(
-    thread_id: str, run_id: str, *, ahead_only: bool = False
+    thread_id: str,
+    run_id: str,
+    *,
+    ahead_only: bool = False,
+    project: Any = None,
+    session: Any = None,
 ) -> list[SteeredReport]:
     """Hold the thread steers no live agent holds, oldest first. A failed
     read or hold leaves them parked for the next call or the run's end."""
@@ -352,7 +382,78 @@ async def _take_steers(
             f"[REPORT_STEER] Taking steers for {thread_id} failed", exc_info=True
         )
         return []
-    steers = [_steer_offer(job) for job in jobs if str(job["hook_outbox_id"]) in held]
+    # DALTON-HOOK(chat-large-upload): materialize chat_uploads on held steers with retry/permanent-failure fencing
+    from src.dalton.services.chat_uploads import (
+        SteerAttachmentPermanentError,
+        materialize_steered_chat_uploads,
+    )
+
+    owner = ("run", run_id)
+    steers: list[SteeredReport] = []
+    for job in jobs:
+        job_id = str(job["hook_outbox_id"])
+        if job_id not in held:
+            continue
+        payload = job.get("payload") or {}
+        reminder = ""
+        attachments: list[dict[str, Any]] | None = None
+        if payload.get("chat_uploads"):
+            if not await outbox_db.is_job_held_by(job_id, owner=owner):
+                continue
+            try:
+                reminder, attachments = await materialize_steered_chat_uploads(
+                    payload,
+                    project=project,
+                    session=session,
+                )
+            except SteerAttachmentPermanentError as exc:
+                logger.warning(
+                    "[REPORT_STEER] Closing steered attachment job %s on thread %s (%s): %s",
+                    job_id,
+                    thread_id,
+                    exc.code,
+                    exc.message,
+                )
+                try:
+                    await outbox_db.fail_held_steer_job(
+                        job_id,
+                        owner=owner,
+                        error_code=exc.code,
+                        error_message=exc.message,
+                    )
+                except Exception:
+                    logger.warning(
+                        "[REPORT_STEER] Failing held steer %s on thread %s errored",
+                        job_id,
+                        thread_id,
+                        exc_info=True,
+                    )
+                continue
+            except Exception:
+                logger.warning(
+                    "[REPORT_STEER] Materializing steered chat_uploads for job %s on thread %s failed; releasing hold for retry",
+                    job_id,
+                    thread_id,
+                    exc_info=True,
+                )
+                try:
+                    await outbox_db.release_jobs([job_id], owner=owner)
+                except Exception:
+                    logger.warning(
+                        "[REPORT_STEER] Releasing steer %s after transient attachment failure errored",
+                        job_id,
+                         exc_info=True,
+                    )
+                continue
+            if not await outbox_db.is_job_held_by(job_id, owner=owner):
+                continue
+        steers.append(
+            _steer_offer(
+                job,
+                model_reminder=reminder,
+                attachments=attachments,
+            )
+        )
     if steers:
         logger.info(
             f"[REPORT_STEER] Thread {thread_id} run {run_id} took {len(steers)} "
@@ -361,14 +462,42 @@ async def _take_steers(
     return steers
 
 
-def _steer_offer(job: dict) -> SteeredReport:
+# DALTON-HOOK(chat-large-upload): separate model-facing file instructions from displayed user message and carry attachments
+def _steer_offer(
+    job: dict,
+    *,
+    model_reminder: str = "",
+    attachments: list[dict[str, Any]] | None = None,
+) -> SteeredReport:
     payload = job.get("payload") or {}
     artifact_comments = payload.get("artifact_comments")
+    base_content = payload.get("content") or ""
+    eff_attachments = (
+        attachments if attachments is not None else payload.get("attachments")
+    )
+    if model_reminder:
+        model_content = (
+            f"{base_content}{model_reminder}"
+            if base_content
+            else model_reminder.lstrip("\n")
+        )
+    else:
+        model_content = base_content
+
+    shown: dict[str, Any] = {}
+    if model_reminder:
+        shown["content"] = base_content
+    if artifact_comments:
+        shown["artifact_comments"] = artifact_comments
+    if eff_attachments:
+        shown["attachments"] = eff_attachments
+
+    # DALTON-HOOK(chat-large-upload): build SteeredReport with model reminder and user-visible attachment metadata
     return SteeredReport(
         job_id=str(job["hook_outbox_id"]),
-        content=payload.get("content") or "",
+        content=model_content,
         kind="steer",
-        shown={"artifact_comments": artifact_comments} if artifact_comments else {},
+        shown=shown,
         sender=payload.get("sender") or "user",
         platform=payload.get("platform") or None,
         request_key=payload.get("request_key") or None,

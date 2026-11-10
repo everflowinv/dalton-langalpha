@@ -261,12 +261,14 @@ class _ColdRead:
         its answer, which is logged as an error: the user sees it missing."""
         inputs = self._inputs
         turns = [ti for ti, _ in batch]
+        # DALTON-HOOK(chat-large-upload): forward failed_steers_by_turn when falling back to stubs
         lines, lost = await stub_lines(
             inputs.thread_id,
             turns,
             inputs.queries_by_turn,
             inputs.responses_by_turn,
             inputs.open_runs,
+            inputs.failed_steers_by_turn,
         )
         self._finish(batch)
         if lost:

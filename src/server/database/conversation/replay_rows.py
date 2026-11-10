@@ -39,6 +39,8 @@ class ThreadRows:
     open_runs: dict[Any, str] = field(default_factory=dict)
     # DALTON-HOOK(colleague-dispatch): workspace owner (B) when distinct from thread owner (A).
     workspace_owner_id: str | None = None
+    # DALTON-HOOK(chat-large-upload): permanently failed main-thread steers for replay surfacing.
+    failed_steers: list[dict[str, Any]] = field(default_factory=list)
 
 
 async def get_branch_pointer(thread_id: str) -> tuple[str, list[Any]] | None:
@@ -189,6 +191,43 @@ async def get_replay_thread_data(thread_id: str) -> ThreadRows | None:
             await cur.execute(RUN_FACTS_SQL, (thread_id,))
             run_facts = [dict(r) for r in await cur.fetchall()]
 
+            # 8. DALTON-HOOK(chat-large-upload): permanently failed main-thread steers (durable replay_facts + outbox)
+            from src.server.database.runs.outbox import merge_failed_steer_entries
+
+            await cur.execute(
+                """SELECT r.turn_index,
+                          r.replay_facts -> 'failed_steers' AS failed_steers
+                   FROM conversation_responses r
+                   WHERE r.conversation_thread_id = %s::uuid
+                     AND r.replay_facts ? 'failed_steers'
+                   ORDER BY r.turn_index ASC, r.attempt_no ASC""",
+                (thread_id,),
+            )
+            durable_failed_rows = [dict(r) for r in await cur.fetchall()]
+
+            await cur.execute(
+                """SELECT o.hook_outbox_id, o.run_id, o.payload, o.created_at,
+                          COALESCE(
+                              (SELECT r.turn_index FROM conversation_responses r
+                               WHERE r.conversation_response_id = NULLIF(o.payload->>'failed_run_id', '')::uuid),
+                              (SELECT r.turn_index FROM conversation_responses r
+                               WHERE r.conversation_response_id = o.run_id)
+                          ) AS turn_index
+                   FROM hook_outbox o
+                   WHERE o.conversation_thread_id = %s::uuid
+                     AND o.hook_type = 'steer'
+                     AND o.status = 'done'
+                     AND o.payload->>'outcome' = 'failed'
+                     AND COALESCE(o.payload->>'target', 'thread') = 'thread'
+                     AND NOT COALESCE((o.payload->>'chat_app')::boolean, false)
+                   ORDER BY o.created_at ASC, o.hook_outbox_id ASC""",
+                (thread_id,),
+            )
+            outbox_failed_rows = [dict(r) for r in await cur.fetchall()]
+            failed_steers = merge_failed_steer_entries(
+                durable_failed_rows, outbox_failed_rows
+            )
+
     return ThreadRows(
         thread_id=thread_id,
         owner_id=owner_id,
@@ -201,6 +240,8 @@ async def get_replay_thread_data(thread_id: str) -> ThreadRows | None:
         open_runs=open_runs,
         # DALTON-HOOK(colleague-dispatch): pass workspace_owner_id alongside thread owner_id.
         workspace_owner_id=workspace_owner_id,
+        # DALTON-HOOK(chat-large-upload): pass failed_steers for replay surfacing.
+        failed_steers=failed_steers,
     )
 
 

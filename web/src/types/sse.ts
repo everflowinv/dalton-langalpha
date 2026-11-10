@@ -35,6 +35,8 @@ export type SSEEventType =
   | 'model_retry'
   | 'model_fallback'
   | 'steering_delivered'
+  // DALTON-HOOK(chat-large-upload): live and replayed undelivered steer attachment failure event
+  | 'steering_returned'
   | 'task_steering_accepted'
   | 'interrupt'
   | 'finish';
@@ -268,6 +270,8 @@ export interface DeliveredSteer {
   origin?: ThreadOrigin;
   /** On a steer that sent file comments, what the chat shows for it. */
   artifact_comments?: ArtifactCommentsShown;
+  // DALTON-HOOK(chat-large-upload): verified attachment metadata carried on steered deliveries
+  attachments?: Attachment[];
   report_source?: never;
   market_alert?: never;
   wakeup?: never;
@@ -334,6 +338,20 @@ export function isDeliveredSteer(entry: SteeringDeliveredEntry): entry is Delive
 export interface SteeringDeliveredEvent extends BaseSSEEvent {
   event: 'steering_delivered';
   messages: SteeringDeliveredEntry[];
+}
+
+// DALTON-HOOK(chat-large-upload): live and replayed undelivered steer attachment failure event
+export interface SteeringReturnedEvent extends BaseSSEEvent {
+  event: 'steering_returned';
+  reason?: string;
+  error?: string;
+  error_code?: string;
+  request_key?: string;
+  content?: string;
+  attachments?: Attachment[];
+  artifact_comments?: ArtifactCommentsShown;
+  timestamp?: number;
+  job_id?: string;
 }
 
 export interface TaskSteeringAcceptedEvent extends BaseSSEEvent {
@@ -508,6 +526,8 @@ export type SSEEvent =
   | ModelRetryEvent
   | ModelFallbackEvent
   | SteeringDeliveredEvent
+  // DALTON-HOOK(chat-large-upload): live and replayed undelivered steer attachment failure event
+  | SteeringReturnedEvent
   | TaskSteeringAcceptedEvent
   | UserMessageEvent
   | InterruptEvent

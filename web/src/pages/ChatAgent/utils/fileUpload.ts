@@ -6,13 +6,23 @@ export interface Attachment {
   file: File;
   dataUrl: string | null;
   type: string;
+  // DALTON-HOOK(chat-large-upload): server-issued upload reference for stored attachments
+  uploadId?: string;
 }
 
-export interface AttachmentContext {
-  type: string;
-  data: string;
-  description: string;
-}
+export type AttachmentContext =
+  | {
+      type: string;
+      data: string;
+      description: string;
+    }
+  | {
+      type: 'chat_upload';
+      upload_id: string;
+      name: string;
+      mime_type: string;
+      size: number;
+    };
 
 export function readFileAsDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -25,18 +35,36 @@ export function readFileAsDataUrl(file: File): Promise<string> {
 
 /**
  * Convert attachments to additional_context format with accurate type tags.
- * Images → "image", PDFs → "pdf", everything else → "file".
+ * Stored uploads → "chat_upload" reference (no inline bytes);
+ * inline images → "image", PDFs → "pdf", everything else → "file".
  */
+// DALTON-HOOK(chat-large-upload): serialize stored uploads by upload_id without base64 payloads
 export function attachmentsToContexts(attachments: Attachment[]): AttachmentContext[] {
-  return attachments
-    .filter((a) => a.dataUrl != null)
-    .map((a) => ({
-      type: a.type.startsWith('image/') ? 'image'
-          : a.type === 'application/pdf' ? 'pdf'
-          : 'file',
-      data: a.dataUrl!,
-      description: a.file.name,
-    }));
+  const result: AttachmentContext[] = [];
+  for (const a of attachments) {
+    if (a.uploadId) {
+      result.push({
+        type: 'chat_upload',
+        upload_id: a.uploadId,
+        name: a.file.name,
+        mime_type: a.type || 'application/octet-stream',
+        size: a.file.size,
+      });
+      continue;
+    }
+    if (a.dataUrl != null) {
+      result.push({
+        type: a.type.startsWith('image/')
+          ? 'image'
+          : a.type === 'application/pdf'
+            ? 'pdf'
+            : 'file',
+        data: a.dataUrl,
+        description: a.file.name,
+      });
+    }
+  }
+  return result;
 }
 
 /**

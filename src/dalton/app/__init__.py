@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
+from src.dalton.app.chat_uploads import router as _chat_uploads_router
 from src.dalton.app.oauth_native import router as _oauth_native_router
 from src.dalton.app.router import router as _dalton_api_router
 from src.dalton.app.transcriptions import router as _transcriptions_router
@@ -15,5 +16,6 @@ dalton_router = APIRouter()
 dalton_router.include_router(_dalton_api_router)
 dalton_router.include_router(_oauth_native_router)
 dalton_router.include_router(_transcriptions_router)
+dalton_router.include_router(_chat_uploads_router)
 
 __all__ = ["dalton_router"]

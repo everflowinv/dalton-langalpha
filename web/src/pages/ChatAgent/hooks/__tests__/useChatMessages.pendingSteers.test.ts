@@ -181,4 +181,116 @@ describe('useChatMessages — pending_steers on the status', () => {
     expect(copies).toHaveLength(1);
     expect(copies[0]).toMatchObject({ requestKey: steerKey, steering: true, isHistory: true });
   });
+
+  // DALTON-HOOK(chat-large-upload): verify steering_accepted normalizes server attachment metadata,
+  // preserves caller-owned blob fields, and carries file-only steers through pending_steers & history replay.
+  it('normalizes steering_accepted attachment metadata while preserving caller blob fields, including file-only uploads', async () => {
+    const hook = await mount(threadStatus({ can_reconnect: false, status: 'completed', latest_turn_index: 1 }));
+    let steerKey = '';
+    let finishTurn: (r: unknown) => void = () => {};
+    mockSendStream.mockImplementation(async (_msg: string, _ws: string, _tid: string | null,
+      opts: { onEvent: Emit; requestKey: string; steerOnly?: boolean }) => {
+      if (opts.steerOnly) {
+        steerKey = opts.requestKey;
+        opts.onEvent({
+          event: 'steering_accepted',
+          position: 1,
+          attachments: [
+            {
+              filename: 'deck_50m.pdf',
+              type: 'pdf',
+              mime_type: 'application/pdf',
+              size: 52_428_800,
+              status: 'uploaded',
+              upload_id: 'up-50m-pdf',
+            },
+          ],
+        });
+        return { disconnected: false };
+      }
+      opts.onEvent({ event: 'metadata', thread_id: 'th-1', run_id: 'run-2', _eventId: 1 });
+      return new Promise((resolve) => { finishTurn = resolve; });
+    });
+
+    await act(async () => {
+      void hook.result.current.handleSendMessage('question 2');
+      await flush();
+    });
+    await waitFor(() => expect(hook.result.current.isLoading).toBe(true));
+
+    const localFile = new File(['%PDF-1.7'], 'deck_50m.pdf', { type: 'application/pdf' });
+    const inlineThumb = new File(['png'], 'thumb.png', { type: 'image/png' });
+    await act(async () => {
+      await hook.result.current.handleSendMessage(
+        '',
+        [{ type: 'chat_upload', upload_id: 'up-50m-pdf', name: 'deck_50m.pdf', mime_type: 'application/pdf', size: 52_428_800 }],
+        [
+          { file: localFile, name: 'deck_50m.pdf', type: 'application/pdf', size: 52_428_800, dataUrl: 'blob:local-pdf', upload_id: 'up-50m-pdf' },
+          { file: inlineThumb, type: 'image/png', dataUrl: 'data:image/png;base64,AAAA' },
+        ],
+      );
+    });
+
+    expect(steerKey).not.toBe('');
+    const acceptedSteers = steerBubbles(hook);
+    expect(acceptedSteers).toHaveLength(1);
+    expect(acceptedSteers[0].content).toBe('');
+    expect(acceptedSteers[0].attachments).toEqual([
+      expect.objectContaining({
+        name: 'deck_50m.pdf',
+        type: 'pdf',
+        mime_type: 'application/pdf',
+        size: 52_428_800,
+        status: 'uploaded',
+        upload_id: 'up-50m-pdf',
+        dataUrl: 'blob:local-pdf',
+        file: localFile,
+      }),
+      expect.objectContaining({
+        name: 'thumb.png',
+        type: 'image/png',
+        dataUrl: 'data:image/png;base64,AAAA',
+        file: inlineThumb,
+      }),
+    ]);
+
+    // If the run ends with error leaving the file-only steer in pending_steers on another tab's status,
+    // a fresh mount renders the parked file-only steer with normalized attachments.
+    await act(async () => {
+      finishTurn({ disconnected: false });
+      await flush();
+    });
+    hook.unmount();
+
+    const reloaded = await mount(threadStatus({
+      can_reconnect: false,
+      status: 'error',
+      latest_turn_index: 1,
+      pending_steers: [{
+        content: '',
+        request_key: steerKey,
+        timestamp: 1_700_000_010,
+        attachments: [{
+          name: 'deck_50m.pdf',
+          type: 'pdf',
+          mime_type: 'application/pdf',
+          size: 52_428_800,
+          upload_id: 'up-50m-pdf',
+        }],
+      }],
+    }));
+    await waitFor(() => expect(steerBubbles(reloaded)).toHaveLength(1));
+    expect(steerBubbles(reloaded)[0]).toMatchObject({
+      content: '',
+      requestKey: steerKey,
+      attachments: [{
+        name: 'deck_50m.pdf',
+        type: 'pdf',
+        mime_type: 'application/pdf',
+        size: 52_428_800,
+        upload_id: 'up-50m-pdf',
+      }],
+    });
+    reloaded.unmount();
+  });
 });

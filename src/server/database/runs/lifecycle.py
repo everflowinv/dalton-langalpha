@@ -778,7 +778,12 @@ async def finalize_run(
                             -- never here — a tail-draining child keeps counting
                             -- on its own row after this parent settles.
                             usage_settled_at = NOW(),
-                            replay_facts = COALESCE(%s::jsonb, replay_facts)
+                            -- DALTON-HOOK(chat-large-upload): merge replay_facts so mid-turn failed_steers survive finalize_run
+                            replay_facts = NULLIF(
+                                COALESCE(replay_facts, '{}'::jsonb)
+                                || COALESCE(%s::jsonb, '{}'::jsonb),
+                                '{}'::jsonb
+                            )
                         WHERE conversation_response_id = %s AND status = 'in_progress'
                         RETURNING """
                         + _FINALIZE_ROW_COLUMNS,

@@ -87,7 +87,8 @@ from src.server.services.history.replay.errors import (
 from src.server.services.history.replay.keys import lines_epoch, lines_key
 from src.server.services.history.replay.lines import Line, line_of
 from src.server.services.history.replay.stubs import stub_lines
-from src.server.services.history.replay.turn import Inputs, group_queries
+# DALTON-HOOK(chat-large-upload): group failed steers onto stub fallback pages
+from src.server.services.history.replay.turn import Inputs, group_failed_steers, group_queries
 from src.server.utils.checkpoint_helpers import CheckpointBranchTipNotFound
 
 __all__ = [
@@ -196,12 +197,14 @@ async def build_replay_page(
         lines_by_turn, tip_interrupts = results
     else:
         lines_by_turn = await lines
+    # DALTON-HOOK(chat-large-upload): forward failed_steers_by_turn onto unanchored/in-progress stubs
     stubs, lost = await stub_lines(
         rows.thread_id,
         [turn_index for turn_index, anchor in page if anchor is None],
         inputs.queries_by_turn,
         inputs.responses_by_turn,
         rows.open_runs,
+        inputs.failed_steers_by_turn,
     )
     if lost:
         logger.error(
@@ -299,18 +302,19 @@ async def stub_page(
     ``cause``, the failure that sent the read here: a thread whose turns
     cannot pair is logged only at info, as older threads legitimately are."""
     queries_by_turn = group_queries(rows.queries)
-    turns = sorted(
-        ti
-        for ti in queries_by_turn
-        if ti is not None and (before_turn is None or ti < before_turn)
-    )
+    all_turns = sorted(ti for ti in queries_by_turn if ti is not None)
+    turns = [
+        ti for ti in all_turns if before_turn is None or ti < before_turn
+    ]
     page_turns = turns[-limit:] if limit is not None else turns
+    # DALTON-HOOK(chat-large-upload): forward failed steers onto stub fallback pages
     lines, lost = await stub_lines(
         rows.thread_id,
         page_turns,
         queries_by_turn,
         rows.responses_by_turn,
         rows.open_runs,
+        group_failed_steers(rows.failed_steers, all_turns),
     )
     if lost:
         logger.error(
