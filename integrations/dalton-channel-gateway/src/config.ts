@@ -39,6 +39,7 @@ export interface GatewayConfig {
     weixin: {
       enabled: boolean;
       apiBaseUrl: string;
+      cdnBaseUrl?: string;
     };
   };
 }
@@ -210,6 +211,11 @@ export function loadConfig(
         apiBaseUrl: (
           mergedEnv.DALTON_WEIXIN_API_BASE_URL ??
           "https://ilinkai.weixin.qq.com"
+        )
+          .trim()
+          .replace(/\/+$/, ""),
+        cdnBaseUrl: (
+          env.DALTON_WEIXIN_CDN_BASE_URL ?? "https://novac2c.cdn.weixin.qq.com/c2c"
         )
           .trim()
           .replace(/\/+$/, ""),
