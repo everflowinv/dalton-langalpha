@@ -1,3 +1,4 @@
+// DALTON-HOOK(company-automations): scoped agent and script read types.
 import { api, type ApiResponse, type QueryParams } from '@/api/client';
 import type {
   Automation,

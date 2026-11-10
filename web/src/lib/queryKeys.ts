@@ -1,3 +1,4 @@
+// DALTON-HOOK(company-automations): scoped agent and script read types.
 import type { QueryMeta } from '@tanstack/react-query';
 import type {
   AutomationReadListQuery,
